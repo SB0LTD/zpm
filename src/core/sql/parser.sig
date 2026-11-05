@@ -1335,7 +1335,7 @@ pub fn Parser(comptime config: types.Config) type {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
-                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml => true,
+                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath => true,
                 else => false,
             };
         }
@@ -1499,6 +1499,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .point => .{ .ty = .point },
                 .box => .{ .ty = .box },
                 .xml => .{ .ty = .xml },
+                .jsonpath => .{ .ty = .jsonpath },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -3303,6 +3304,11 @@ pub fn Parser(comptime config: types.Config) type {
                     .contains_eq => .contains_eq,
                     .distance => .distance,
                     .same => .same,
+                    .question_pipe => .exists_any,
+                    .question_amp => .exists_all,
+                    .hash_minus => .delete_path,
+                    .at_question => .path_exists,
+                    .at_at => .path_match,
                     else => break,
                 };
                 try self.advance();

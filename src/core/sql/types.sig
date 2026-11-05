@@ -12,6 +12,7 @@ const array_module = @import("array.sig");
 const range_module = @import("range.sig");
 const network = @import("network.sig");
 const geometric = @import("geometric.sig");
+const jsonpath_module = @import("jsonpath.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -193,6 +194,12 @@ pub const Config = struct {
     /// PL/pgSQL variables per routine frame (parameters, DECLAREd
     /// variables, FOUND, loop variables, TG_*); more are ColumnCapacity.
     routine_variables: usize = 24,
+    /// SQL/JSON path (B11 json-agg lane): parsed nodes of one jsonpath
+    /// (more is StatementTooComplex, 54001) and the items one evaluation
+    /// holds at once for predicate operands and subscripts (more is
+    /// ProgramLimitExceeded, 54000).
+    jsonpath_nodes: usize = 128,
+    jsonpath_items: usize = 128,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -431,6 +438,30 @@ pub const Error = error{
     NullValueNotAllowed,
     /// SQLSTATE 22005: assignment to a CONSTANT PL/pgSQL variable.
     ErrorInAssignment,
+    // SQL/JSON path errors (B11 json-agg lane, jsonpath_exec.c).
+    /// SQLSTATE 22039: an array accessor or .size() on a non-array (strict).
+    SqlJsonArrayNotFound,
+    /// SQLSTATE 2203A: a missing key or a member accessor on a non-object (strict).
+    SqlJsonMemberNotFound,
+    /// SQLSTATE 2203C: a wildcard member accessor on a non-object (strict).
+    SqlJsonObjectNotFound,
+    /// SQLSTATE 22033: an invalid or out-of-bounds array subscript.
+    InvalidSqlJsonSubscript,
+    /// SQLSTATE 22038: an operand that is not a single numeric item, or a
+    /// jsonb_path_match result that is not a single boolean.
+    SingletonSqlJsonItemRequired,
+    /// SQLSTATE 22036: an item method over a value of the wrong type.
+    NonNumericSqlJsonItem,
+    /// SQLSTATE 2203B: a unary operator over a non-numeric item.
+    SqlJsonNumberNotFound,
+    /// SQLSTATE 2203F: a JSON_TABLE column needs a scalar.
+    SqlJsonScalarRequired,
+    /// SQLSTATE 2203G: a SQL/JSON item cannot be cast to the column type.
+    SqlJsonItemCannotBeCast,
+    /// SQLSTATE 22034: a column path returned more than one item.
+    MoreThanOneSqlJsonItem,
+    /// SQLSTATE 22035: a column path returned no item (ERROR ON EMPTY).
+    NoSqlJsonItem,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -491,12 +522,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -604,6 +635,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .point => .point,
         .box => .box,
         .xml => .xml,
+        .jsonpath => .jsonpath,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -649,6 +681,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .point => .point,
         .box => .box,
         .xml => .xml,
+        .jsonpath => .jsonpath,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -722,6 +755,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .point => .{ .oid = 600, .name = "point", .len = 16, .category = 'G', .array = 1017 },
         .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020 },
         .xml => .{ .oid = 142, .name = "xml", .len = -1, .category = 'U', .array = 143 },
+        .jsonpath => .{ .oid = 4072, .name = "jsonpath", .len = -1, .category = 'U', .array = 4073 },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -779,6 +813,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .point => "point",
         .box => "box",
         .xml => "xml",
+        .jsonpath => "jsonpath",
         _ => "",
     };
 }
@@ -820,6 +855,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .point => "point_in",
         .box => "box_in",
         .xml => "xml_in",
+        .jsonpath => "jsonpath_in",
         _ => "array_in",
     };
 }
@@ -1038,7 +1074,7 @@ pub fn Values(comptime config: Config) type {
             return switch (data_type) {
                 .integer, .integer32, .smallint, .oid => .integer,
                 .boolean => .boolean,
-                .text, .name, .json, .varchar => .text,
+                .text, .name, .json, .varchar, .jsonpath => .text,
                 .real => .float4,
                 .double => .float8,
                 .numeric => .numeric,
@@ -1256,6 +1292,8 @@ pub fn Values(comptime config: Config) type {
                 .bit, .varbit => {
                     _ = try bit_string.coercedLength(value.bits.len, column.typmod, column.data_type == .bit, .implicit);
                 },
+                // A stored jsonpath is its own canonical text (B11).
+                .jsonpath => if (!jsonpath_module.Engine(config).validStored(value.text.slice())) return error.InvalidTextRepresentation,
                 else => {},
             }
             if (value.* == .integer) {

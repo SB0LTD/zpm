@@ -47,7 +47,10 @@ pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, n
     // Network <<= and >>=.
     within_eq, contains_eq,
     // Geometric <-> (distance) and ~= (same as).
-    distance, same };
+    distance, same,
+    // JSONB #- ?| ?& and SQL/JSON path @? @@ (B11 json-agg lane); the
+    // binder rewrites them into calls of the *_op functions.
+    delete_path, exists_any, exists_all, path_exists, path_match };
 
 /// Built-in functions bound by name.
 pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
@@ -98,7 +101,18 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // keys or several arguments: `b` -> next lists the value arguments, then
     // the sort keys; `integer` is an AggregateInput layout. Exec reads its
     // members directly; evaluating it as a value is 0A000.
-    aggregate_input };
+    aggregate_input,
+    // JSONB modification, conversion and SQL/JSON path functions (B11
+    // json-agg lane, json_eval.sig); *_op are the operator forms
+    // (jsonb - x, #-, ?|, ?&, @?, @@), named ?column?.
+    jsonb_set, jsonb_set_lax, jsonb_insert, jsonb_delete_path, jsonb_strip_nulls, jsonb_pretty, to_json, to_jsonb,
+    jsonb_path_exists, jsonb_path_match, jsonb_path_query_array, jsonb_path_query_first, jsonb_exists_any, jsonb_exists_all,
+    jsonb_minus_op, jsonb_delete_path_op, jsonb_exists_any_op, jsonb_exists_all_op, jsonb_path_exists_op, jsonb_path_match_op };
+
+/// The JSONB / SQL/JSON path functions of json_eval.sig.
+pub fn jsonFunction(func: Func) bool {
+    return @intFromEnum(func) >= @intFromEnum(Func.jsonb_set);
+}
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -136,7 +150,9 @@ pub fn immutableBuiltin(func: Func) bool {
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
         .xmlparse, .xmlserialize, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
-        else => false,
+        // to_json / to_jsonb are STABLE (timestamptz output).
+        .to_json, .to_jsonb => false,
+        else => jsonFunction(func),
     };
 }
 
@@ -158,7 +174,9 @@ pub fn strictFunction(func: Func) bool {
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
         .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
-        else => false,
+        // jsonb_set_lax reads NULL arguments itself.
+        .jsonb_set_lax => false,
+        else => jsonFunction(func),
     };
 }
 

@@ -15,7 +15,7 @@
 const std = @import("std");
 const sql = @import("sql");
 
-const DB = sql.Database(.{ .tables = 10, .columns = 16, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 256, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 8, .expr_nodes = 2048, .work_rows = 128, .result_rows = 64, .relations = 6 });
+const DB = sql.Database(.{ .tables = 10, .columns = 16, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 256, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 8, .expr_nodes = 2048, .work_rows = 128, .result_rows = 64, .relations = 6, .jsonpath_items = 16 });
 const Small = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 8, .text_bytes = 128, .work_rows = 1, .result_rows = 8, .nulls_first_ascending = false, .integer_bits = 32 });
 
 var assertions: usize = 0;
@@ -330,11 +330,228 @@ fn orderedSetAggregates() !void {
     try controlled("SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v),PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY v),MODE() WITHIN GROUP (ORDER BY g) FROM tdd_a", "20|20|1");
 }
 
+// ---- PG.JSONB.MODIFY ----------------------------------------------------------
+
+fn jsonbModify() !void {
+    // oracle
+    try expectTyped("SELECT jsonb_set('{\"a\":1}'::jsonb,'{a}','2'::jsonb),'{\"a\":1}'::jsonb||'{\"b\":2}'::jsonb", "jsonb_set:3802,?column?:3802", "{\"a\": 2}|{\"a\": 1, \"b\": 2}");
+    // jsonb_set: replace, create (sorted into place), create_if_missing
+    // false, nested paths, array indexes (negative, past either end).
+    try expect("SELECT jsonb_set('{\"a\":1}', '{b}', '[1]'), jsonb_set('{\"a\":1}', '{b}', '2', false), jsonb_set('{\"b\":1}', '{a}', 'null')", "{\"a\": 1, \"b\": [1]}|{\"a\": 1}|{\"a\": null, \"b\": 1}");
+    try expect("SELECT jsonb_set('{\"a\":{\"b\":[1,2,3]}}', '{a,b,1}', '\"x\"'), jsonb_set('{\"a\":1}', '{x,y}', '2'), jsonb_set('{\"a\":1}', '{}', '2')", "{\"a\": {\"b\": [1, \"x\", 3]}}|{\"a\": 1}|{\"a\": 1}");
+    try expect("SELECT jsonb_set('[1,2]', '{5}', '3'), jsonb_set('[1,2]', '{-5}', '0'), jsonb_set('[1,2]', '{-1}', '9'), jsonb_set('[1,2]', '{ 0}', '7'), jsonb_set('[]', '{3}', '1')", "[1, 2, 3]|[0, 1, 2]|[1, 9]|[7, 2]|[1]");
+    try expect("SELECT jsonb_set('{}', '{a}', '1', false), jsonb_set('{}', '{a}', '1'), jsonb_set('{\"a\":1}', '{a}', NULL), jsonb_set(NULL, '{a}', '1')", "{}|{\"a\": 1}|NULL|NULL");
+    try expect("SELECT jsonb_set('{\"a\":1}', '{a,b}', '2'), jsonb_set('[[1]]', '{0,0}', '{\"k\":1}')", "{\"a\": 1}|[[{\"k\": 1}]]");
+    // jsonb_insert: before (default) or after an array element; a new key;
+    // an existing key is 22023.
+    try expect("SELECT jsonb_insert('{\"a\":[0,1,2]}', '{a,1}', '\"new\"'), jsonb_insert('{\"a\":[0,1,2]}', '{a,1}', '\"new\"', true), jsonb_insert('{\"a\":1}', '{b}', '2'), jsonb_insert('[1]', '{-9}', '0')", "{\"a\": [0, \"new\", 1, 2]}|{\"a\": [0, 1, \"new\", 2]}|{\"a\": 1, \"b\": 2}|[0, 1]");
+    try rejects("SELECT jsonb_insert('{\"a\":1}', '{a}', '2')", error.InvalidParameterValue);
+    // jsonb_set_lax: NULL values by treatment.
+    try expect("SELECT jsonb_set_lax('{\"a\":1,\"b\":2}', '{b}', NULL), jsonb_set_lax('{\"a\":1,\"b\":2}', '{b}', NULL, true, 'delete_key'), jsonb_set_lax('{\"a\":1,\"b\":2}', '{b}', NULL, true, 'return_target'), jsonb_set_lax('{\"a\":1}', '{a}', '5')", "{\"a\": 1, \"b\": null}|{\"a\": 1}|{\"a\": 1, \"b\": 2}|{\"a\": 5}");
+    try expect("SELECT jsonb_set_lax(NULL, '{a}', '1'), jsonb_set_lax('{}', '{a}', '1', NULL)", "NULL|NULL");
+    try rejects("SELECT jsonb_set_lax('{\"a\":1}', '{a}', NULL, true, 'raise_exception')", error.NullValueNotAllowed);
+    try rejects("SELECT jsonb_set_lax('{\"a\":1}', '{a}', NULL, true, 'bogus')", error.InvalidParameterValue);
+    try rejects("SELECT jsonb_set_lax('{\"a\":1}', '{a}', '1', true, NULL)", error.InvalidParameterValue);
+    // Deletion: - text | integer | text[], #- and jsonb_delete_path.
+    try expectTyped("SELECT '{\"a\":1,\"b\":2}'::jsonb - 'a', '[\"a\",\"b\",\"a\"]'::jsonb - 'a', '{\"a\":1,\"b\":2,\"c\":3}'::jsonb - '{a,c}'::text[]", "?column?:3802,?column?:3802,?column?:3802", "{\"b\": 2}|[\"b\"]|{\"b\": 2}");
+    try expect("SELECT '[1,2,3]'::jsonb - 1, '[1,2,3]'::jsonb - -1, '[1,2,3]'::jsonb - 9, '[1,2,3]'::jsonb - -9, '{\"a\":1}'::jsonb - '{}'::text[]", "[1, 3]|[1, 2]|[1, 2, 3]|[1, 2, 3]|{\"a\": 1}");
+    try expect("SELECT '{\"a\":{\"b\":1,\"c\":2}}'::jsonb #- '{a,b}', '[1,[2,3]]'::jsonb #- '{1,0}', jsonb_delete_path('{\"a\":1}', '{x}'), '{}'::jsonb #- '{a}'", "{\"a\": {\"c\": 2}}|[1, [3]]|{\"a\": 1}|{}");
+    try rejects("SELECT '{\"a\":1}'::jsonb - 0", error.InvalidParameterValue);
+    try rejects("SELECT '1'::jsonb - 'a'", error.InvalidParameterValue);
+    try rejects("SELECT '\"x\"'::jsonb #- '{a}'", error.InvalidParameterValue);
+    try rejects("SELECT '{}'::jsonb - 1::bigint", error.UndefinedFunction);
+    // ?| and ?& (NULL keys skipped).
+    try expectTyped("SELECT '{\"a\":1,\"b\":2}'::jsonb ?| ARRAY['b','x'], '{\"a\":1,\"b\":2}'::jsonb ?& ARRAY['a','b'], '{\"a\":1}'::jsonb ?& '{a,x}', '{\"a\":1}'::jsonb ?& '{}', '{\"a\":1}'::jsonb ?| '{}'", "?column?:16,?column?:16,?column?:16,?column?:16,?column?:16", "t|t|f|t|f");
+    try expect("SELECT '[\"a\",1]'::jsonb ?| ARRAY[NULL,'a'], '\"a\"'::jsonb ?& ARRAY['a'], jsonb_exists_any('{\"k\":1}', '{k}')", "t|t|t");
+    // jsonb_strip_nulls (strip_in_arrays) and jsonb_pretty.
+    try expect("SELECT jsonb_strip_nulls('{\"a\":null,\"b\":[1,null],\"c\":{\"d\":null}}'), jsonb_strip_nulls('{\"a\":null,\"b\":[1,null]}', true), jsonb_strip_nulls('null')", "{\"b\": [1, null], \"c\": {}}|{\"b\": [1]}|null");
+    try expectTyped("SELECT jsonb_pretty('{\"a\":1,\"b\":[1,{\"c\":2}],\"d\":{}}')", "jsonb_pretty:25", "{\n    \"a\": 1,\n    \"b\": [\n        1,\n        {\n            \"c\": 2\n        }\n    ],\n    \"d\": {\n    }\n}");
+    try expect("SELECT jsonb_pretty('[]'), jsonb_pretty('\"s\"')", "[\n]|\"s\"");
+    // to_json / to_jsonb.
+    try expectTyped("SELECT to_json('x\"y'::text), to_jsonb(ARRAY[1,2]), to_json(1.50), to_jsonb(NULL::int), to_json(DATE '2024-01-02')", "to_json:114,to_jsonb:3802,to_json:114,to_jsonb:3802,to_json:114", "\"x\\\"y\"|[1, 2]|1.50|NULL|\"2024-01-02\"");
+    // Errors: scalar targets (22023), NULL path elements (22004),
+    // non-integer array steps (22P02), two-dimensional paths (2202E),
+    // argument types (42883 / 42804), the result past text_bytes (54000).
+    try rejects("SELECT jsonb_set('1', '{a}', '2')", error.InvalidParameterValue);
+    try rejects("SELECT jsonb_set('{\"a\":1}', ARRAY[NULL::text], '2')", error.NullValueNotAllowed);
+    try rejects("SELECT jsonb_set('[1]', '{x}', '2')", error.InvalidTextRepresentation);
+    try rejects("SELECT jsonb_set('[1]', '{1x}', '2')", error.InvalidTextRepresentation);
+    try rejects("SELECT jsonb_set('{\"a\":1}', '{{a},{b}}', '2')", error.ArraySubscriptError);
+    try rejects("SELECT jsonb_set('{}'::json, '{a}', '1')", error.UndefinedFunction);
+    try rejects("SELECT jsonb_set('{}', '{a}')", error.UndefinedFunction);
+    try rejects("SELECT to_json('a')", error.TypeMismatch);
+    try rejects("SELECT jsonb_set('{}', '{a}', to_jsonb(repeat('x', 250)))", error.TextCapacity);
+    try controlled("SELECT jsonb_set('{\"a\":1}'::jsonb,'{a}','2'::jsonb),'{\"a\":1}'::jsonb||'{\"b\":2}'::jsonb", "{\"a\": 2}|{\"a\": 1, \"b\": 2}");
+    try controlled("SELECT jsonb_set('{\"a\":{\"b\":[1,2,3]}}', '{a,b,-1}', '\"x\"', true), jsonb_pretty('{\"a\":[1]}')", "{\"a\": {\"b\": [1, 2, \"x\"]}}|{\n    \"a\": [\n        1\n    ]\n}");
+}
+
+// ---- PG.JSON.PATH ---------------------------------------------------------------
+
+fn jsonPath() !void {
+    // oracle
+    try expectTyped("SELECT jsonb_path_exists('{\"a\":1}'::jsonb,'$.a')", "jsonb_path_exists:16", "t");
+    // The jsonpath type: canonical output (jsonpath_out).
+    try expectTyped("SELECT '$.a'::jsonpath", "jsonpath:4072", "$.\"a\"");
+    try expect("SELECT 'strict $.a[*] ? (@ > 1 && @ < 5).b'::jsonpath, '$.a + 1'::jsonpath, '-$.a'::jsonpath, '-1'::jsonpath", "strict $.\"a\"[*]?(@ > 1 && @ < 5).\"b\"|($.\"a\" + 1)|(-$.\"a\")|-1");
+    try expect("SELECT '$[0 to 2, last]'::jsonpath, '$.**{1 to last}'::jsonpath, '$.**'::jsonpath, '$.**{2}'::jsonpath, 'lax $.size()'::jsonpath", "$[0 to 2,last]|$.**{1 to last}|$.**|$.**{2}|$.size()");
+    try expect("SELECT 'exists($.a)'::jsonpath, '$ ? (@.a starts with \"x\")'::jsonpath, '$.a == 1'::jsonpath, '$.\"a b\"'::jsonpath, '$var.x'::jsonpath", "exists ($.\"a\")|$?(@.\"a\" starts with \"x\")|($.\"a\" == 1)|$.\"a b\"|$\"var\".\"x\"");
+    try expect("SELECT '(1 + 2) * 3'::jsonpath, '1.50'::jsonpath, '$ ? (!(@ == 1))'::jsonpath, '$ ? ((@ == 1) is unknown)'::jsonpath, '$.a.type()'::jsonpath, '$.*[*]'::jsonpath", "((1 + 2) * 3)|1.50|$?(!(@ == 1))|$?((@ == 1) is unknown)|$.\"a\".type()|$.*[*]");
+    try expect("SELECT '$ <> 1'::jsonpath, '$.decimal(4,2)'::jsonpath, '$ ? (@ like_regex \"^a\" flag \"i\")'::jsonpath, '0x1F'::jsonpath, '$.a ? (@ == \"\\\"\")'::jsonpath", "($ != 1)|$.decimal(4,2)|$?(@ like_regex \"^a\" flag \"i\")|31|$.\"a\"?(@ == \"\\\"\")");
+    try rejects("SELECT '$.'::jsonpath", error.Syntax);
+    try rejects("SELECT '@'::jsonpath", error.Syntax);
+    try rejects("SELECT 'last'::jsonpath", error.Syntax);
+    try rejects("SELECT '$ ? (@)'::jsonpath", error.Syntax);
+    try rejects("SELECT '$.a.nosuch()'::jsonpath", error.Syntax);
+    try rejects("SELECT '1a'::jsonpath", error.Syntax);
+    try rejects("SELECT '$'::jsonpath = '$'::jsonpath", error.UndefinedFunction);
+    try rejects("SELECT jsonb_path_exists('{}', 'x'::text)", error.UndefinedFunction);
+    // Functions: query_array / query_first / match / exists and @? @@.
+    try expectTyped("SELECT jsonb_path_query_array('{\"a\":[1,2,3,4,5]}', '$.a[*] ? (@ > 2)'), jsonb_path_query_first('{\"a\":[1,2]}', '$.a[*]'), jsonb_path_query_first('{}', '$.x'), jsonb_path_match('{\"a\":1}', '$.a == 1')", "jsonb_path_query_array:3802,jsonb_path_query_first:3802,jsonb_path_query_first:3802,jsonb_path_match:16", "[3, 4, 5]|1|NULL|t");
+    try expectTyped("SELECT '{\"a\":1}'::jsonb @? '$.a', '{\"a\":1}'::jsonb @@ '$.a == 2', '{\"a\":1}'::jsonb @? 'strict $.b', '{\"a\":1}'::jsonb @@ '$.a'", "?column?:16,?column?:16,?column?:16,?column?:16", "t|f|NULL|NULL");
+    try expect("SELECT jsonb_path_exists('{\"a\":1}', 'strict $.b', '{}', true), jsonb_path_match('{\"a\":1}', '$.a', '{}', true), jsonb_path_exists('{\"a\":1}', '$.b'), jsonb_path_match('{}', '$.x == 1')", "NULL|NULL|f|f");
+    // Variables.
+    try expect("SELECT jsonb_path_query_array('[1,2,3]', '$[*] ? (@ >= $min)', '{\"min\":2}'), jsonb_path_query_array('[1,2,3]', '$[*] ? (@ == $\"m n\")', '{\"m n\":3}')", "[2, 3]|[3]");
+    try rejects("SELECT jsonb_path_exists('[1]', '$[*] ? (@ == $x)')", error.UndefinedObject);
+    try rejects("SELECT jsonb_path_exists('[1]', '$', '[1]')", error.InvalidParameterValue);
+    // Lax unwrapping / wrapping and strict errors.
+    try expect("SELECT jsonb_path_query_array('{\"a\":[{\"b\":1},{\"b\":2},{\"c\":3}]}', '$.a.b'), jsonb_path_query_array('{\"a\":1}', '$.a[0]'), jsonb_path_query_array('{\"a\":1}', '$.a[*]'), jsonb_path_query_array('[1,[2]]', '$.*')", "[1, 2]|[1]|[1]|[]");
+    try rejects("SELECT jsonb_path_query_array('{\"a\":[{\"b\":1}]}', 'strict $.a.b')", error.SqlJsonMemberNotFound);
+    try rejects("SELECT jsonb_path_query_array('{\"a\":{}}', 'strict $.a.b')", error.SqlJsonMemberNotFound);
+    try rejects("SELECT jsonb_path_query_array('{\"a\":1}', 'strict $.a[0]')", error.SqlJsonArrayNotFound);
+    try rejects("SELECT jsonb_path_query_array('{\"a\":1}', 'strict $.a.*')", error.SqlJsonObjectNotFound);
+    try rejects("SELECT jsonb_path_query_array('{\"a\":1}', 'strict $.a.size()')", error.SqlJsonArrayNotFound);
+    try rejects("SELECT jsonb_path_query_array('[1]', 'strict $[3]')", error.InvalidSqlJsonSubscript);
+    try rejects("SELECT jsonb_path_query_array('[1]', '$[\"x\"]')", error.InvalidSqlJsonSubscript);
+    // Subscripts with ranges and last.
+    try expect("SELECT jsonb_path_query_array('[0,1,2,3,4]', '$[1 to 2, last, last - 1]'), jsonb_path_query_array('[0,1]', '$[10]'), jsonb_path_query_array('[0,1,2]', '$[1.7]'), jsonb_path_query_array('[0,1,2]', '$[-5 to 1]')", "[1, 2, 4, 3]|[]|[1]|[0, 1]");
+    // Arithmetic and unary operators (numeric).
+    try expect("SELECT jsonb_path_query_first('{\"a\":2}', '$.a * 3 + 1'), jsonb_path_query_first('{\"a\":7}', '$.a / 2'), jsonb_path_query_first('{\"a\":7}', '$.a % 4'), jsonb_path_query_array('[1,-2]', '-$[*]')", "7|3.5000000000000000|3|[-1, 2]");
+    try rejects("SELECT jsonb_path_query_first('{\"a\":2}', '$.a / 0')", error.DivisionByZero);
+    try rejects("SELECT jsonb_path_query_first('{\"a\":2}', '$.x + 1')", error.SingletonSqlJsonItemRequired);
+    try rejects("SELECT jsonb_path_query_first('{\"a\":\"s\"}', '-$.a')", error.SqlJsonNumberNotFound);
+    try expect("SELECT jsonb_path_query_first('{\"a\":2}', '$.a / 0', '{}', true)", "NULL");
+    // Item methods.
+    try expect("SELECT jsonb_path_query_array('[1.5,-2.5]', '$[*].abs()'), jsonb_path_query_array('[1.5,-2.5]', '$[*].floor()'), jsonb_path_query_array('[1.5,-2.5]', '$[*].ceiling()'), jsonb_path_query_array('[1,\"a\",null,[],{}]', '$[*].type()')", "[1.5, 2.5]|[1, -3]|[2, -2]|[\"number\", \"string\", \"null\", \"array\", \"object\"]");
+    try expect("SELECT jsonb_path_query_first('[1,2,3]', '$.size()'), jsonb_path_query_first('\"3.5\"', '$.double()'), jsonb_path_query_first('\"42\"', '$.integer()'), jsonb_path_query_first('2.5', '$.integer()'), jsonb_path_query_first('12', '$.string()'), jsonb_path_query_first('\"yes\"', '$.boolean()')", "3|3.5|42|3|\"12\"|true");
+    try expect("SELECT jsonb_path_query_first('\"1.50\"', '$.number()'), jsonb_path_query_first('1.256', '$.decimal(4,2)'), jsonb_path_query_first('true', '$.string()'), jsonb_path_query_first('[\"9\"]', '$.bigint()')", "1.50|1.26|\"true\"|9");
+    try rejects("SELECT jsonb_path_query_first('\"x\"', '$.abs()')", error.NonNumericSqlJsonItem);
+    try rejects("SELECT jsonb_path_query_first('\"x\"', '$.double()')", error.NonNumericSqlJsonItem);
+    try rejects("SELECT jsonb_path_query_first('\"NaN\"', '$.double()')", error.NonNumericSqlJsonItem);
+    try rejects("SELECT jsonb_path_query_first('2.5', '$.boolean()')", error.NonNumericSqlJsonItem);
+    try rejects("SELECT jsonb_path_query_first('{}', '$.keyvalue()')", error.UnsupportedStatement);
+    try rejects("SELECT jsonb_path_query_first('\"2024-01-01\"', '$.datetime()')", error.UnsupportedStatement);
+    // .** levels, filters, exists, starts with, comparison semantics.
+    try expect("SELECT jsonb_path_query_array('{\"a\":{\"b\":{\"c\":1}}}', '$.**.c'), jsonb_path_query_array('{\"a\":{\"b\":{\"c\":1}}}', '$.**{2}'), jsonb_path_query_array('{\"a\":{\"b\":{\"c\":1}}}', '$.**{last}')", "[1]|[{\"c\": 1}]|[1]");
+    try expect("SELECT jsonb_path_query_array('{\"a\":{\"b\":1}}', '$.**'), jsonb_path_query_array('{\"a\":[1,{\"b\":2}]}', '$.**{1 to 2}')", "[{\"a\": {\"b\": 1}}, {\"b\": 1}, 1]|[[1, {\"b\": 2}], 1, {\"b\": 2}]");
+    try expect("SELECT jsonb_path_query_array('[{\"a\":1},{\"b\":2}]', '$[*] ? (exists(@.a))'), jsonb_path_query_array('[\"abc\",\"xbc\",1]', '$[*] ? (@ starts with \"ab\")'), jsonb_path_query_array('[1,\"a\",null]', '$[*] ? (@ != 1)'), jsonb_path_query_array('[\"a\",\"c\"]', '$[*] ? (@ < \"b\")')", "[{\"a\": 1}]|[\"abc\"]|[null]|[\"a\"]");
+    try expect("SELECT jsonb_path_query_array('[1,2,3]', '$[*] ? (@ > 1 || @ == null)'), jsonb_path_query_array('[1,\"x\"]', '$[*] ? ((@ > 0) is unknown)'), jsonb_path_query_first('[1,2]', '$[*] > 1'), jsonb_path_query_first('[\"x\"]', 'strict $[*] > 1')", "[2, 3]|[\"x\"]|true|null");
+    try expect("SELECT jsonb_path_match('[1,2]', 'exists($[*] ? (@ == 2))'), jsonb_path_match('{\"a\":[true]}', '$.a[0]'), jsonb_path_query_first('{\"a\":1}', '$.a == 1'), jsonb_path_query_first('{\"a\":\"1\"}', '$.a == 1')", "t|t|true|null");
+    try rejects("SELECT jsonb_path_exists('\"abc\"', '$ ? (@ like_regex \"a\")')", error.UnsupportedStatement);
+    try rejects("SELECT jsonb_path_match('[true,false]', '$[*]')", error.SingletonSqlJsonItemRequired);
+    try expect("SELECT jsonb_path_match('[1,2]', '$[*] > 0'), jsonb_path_match('[]', '$[*] > 0')", "t|f");
+    // Capacities: parsed nodes (54001) and held items (54000).
+    try rejects("SELECT '$[" ++ "1," ** 70 ++ "1]'::jsonpath", error.StatementTooComplex);
+    try rejects("SELECT jsonb_path_exists('[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]', 'strict $ ? (@[*] > 100)')", error.ProgramLimitExceeded);
+    try controlled("SELECT jsonb_path_exists('{\"a\":1}'::jsonb,'$.a')", "t");
+    try controlled("SELECT jsonb_path_query_array('{\"a\":[1,2,3,4,5],\"b\":{\"c\":[{\"d\":3}]}}', 'strict $.**{1 to last} ? (@.type() == \"number\" && @ > 2)'), '$.a[*]'::jsonpath", "[3, 4, 5, 3]|$.\"a\"[*]");
+}
+
+// ---- replay ---------------------------------------------------------------------
+
+var replay_scratch: DB.ReplayScratch = .{};
+
+fn sameResult(a: *const DB.Result, b: *const DB.Result) !bool {
+    if (a.column_count != b.column_count or a.row_count != b.row_count) return false;
+    for (0..a.column_count) |column| {
+        if (a.column_types[column] != b.column_types[column] or a.column_typmods[column] != b.column_typmods[column] or
+            !std.mem.eql(u8, a.column_names[column].slice(), b.column_names[column].slice())) return false;
+    }
+    for (0..a.row_count) |index| for (0..a.column_count) |column| {
+        const x = &a.rows[index].cells[column];
+        const y = &b.rows[index].cells[column];
+        if (std.meta.activeTag(x.*) != std.meta.activeTag(y.*) or DB.compareCells(x, y) != 0) return false;
+        if (x.* == .null_value) continue;
+        var p: [DB.Io.format_bytes]u8 = undefined;
+        var q: [DB.Io.format_bytes]u8 = undefined;
+        if (!std.mem.eql(u8, try DB.Io.format(x, false, DB.Result.default_session, &p), try DB.Io.format(y, false, DB.Result.default_session, &q))) return false;
+    };
+    return true;
+}
+
+fn sameQuery(a: *DB, b: *DB, source: []const u8) !bool {
+    var x: DB.Result = .{};
+    var y: DB.Result = .{};
+    try a.execute(source, &x);
+    try b.execute(source, &y);
+    return sameResult(&x, &y);
+}
+
+var replay_primary: DB = .{};
+var replay_replica: DB = .{};
+var record: [8192]u8 = undefined;
+var last_record: [8192]u8 = undefined;
+var last_len: usize = 0;
+
+/// Autocommit on the replay primary; its change record goes to the replica.
+fn replicated(source: []const u8) !void {
+    var used: usize = 0;
+    replay_primary.executeChanges(source, &result, &record, &used, null, null) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+    @memcpy(last_record[0..used], record[0..used]);
+    last_len = used;
+    if (used != 0) try replay_replica.applyChangeRecord(record[0..used], &replay_scratch);
+}
+
+fn primaryOnly(source: []const u8) !usize {
+    var used: usize = 0;
+    try replay_primary.executeChanges(source, &result, &record, &used, null, null);
+    return used;
+}
+
+fn replay() !void {
+    try replicated("CREATE TABLE tdd_a(id INT PRIMARY KEY,g INT,v INT)");
+    try replicated("INSERT INTO tdd_a VALUES(1,1,10),(2,1,20),(3,2,30),(4,2,NULL)");
+    // Values produced by this lane's aggregates and functions, stored in
+    // jsonb, json, jsonpath (and jsonpath[]) columns, replay exactly.
+    try replicated("CREATE TABLE r(id INT PRIMARY KEY, a INT[], s TEXT, j JSON, b JSONB, p JSONPATH, ps JSONPATH[], f FLOAT8)");
+    try replicated("INSERT INTO r SELECT 1, (SELECT array_agg(v ORDER BY id) FROM tdd_a), (SELECT string_agg(id::text, ',') FROM tdd_a), (SELECT json_agg(id ORDER BY id) FROM tdd_a), (SELECT jsonb_object_agg(id, v) FROM tdd_a), 'strict $.a[*] ? (@ > 1)', ARRAY['$'::jsonpath, '$.b'], (SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY v) FROM tdd_a)");
+    try replicated("INSERT INTO tdd_a VALUES (9, 9, 90)");
+    try replicated("INSERT INTO r SELECT 2, NULL, NULL, NULL, jsonb_set(b, '{9}', '90'), p, NULL, NULL FROM r WHERE id = 1");
+    try replicated("UPDATE r SET b = b - '1' #- '{2}', p = '$.size()' WHERE id = 2");
+    for ([_][]const u8{ "SELECT * FROM r ORDER BY id", "SELECT * FROM tdd_a ORDER BY id", "SELECT jsonb_path_query_array(b, '$.*'), b @? p FROM r ORDER BY id" }) |query|
+        try check(try sameQuery(&replay_primary, &replay_replica, query));
+    try check(replay_primary.tableCount() == replay_replica.tableCount() and replay_primary.oid_counter == replay_replica.oid_counter);
+    try replay_replica.execute("SELECT a, s, j, b, p, ps, f FROM r WHERE id = 1", &result);
+    try same(try render(&result), "{10,20,30,NULL}|1,2,3,4|[1, 2, 3, 4]|{\"1\": 10, \"2\": 20, \"3\": 30, \"4\": null}|strict $.\"a\"[*]?(@ > 1)|{$,\"$.\\\"b\\\"\"}|15");
+    try replay_replica.execute("SELECT b, p FROM r WHERE id = 2", &result);
+    try same(try render(&result), "{\"3\": 30, \"4\": null, \"9\": 90}|$.size()");
+    // A stored jsonpath must be its own canonical text: corrupt or
+    // non-canonical bytes in a record are InvalidChangeRecord (XX001) and
+    // nothing of the record applies.
+    const length = try primaryOnly("INSERT INTO r(id, p) VALUES (3, '$.\"a\"')");
+    var corrupt: [8192]u8 = undefined;
+    @memcpy(corrupt[0..length], record[0..length]);
+    const at = std.mem.indexOf(u8, corrupt[0..length], "$.\"a\"") orelse return error.JsonAggContractFailed;
+    corrupt[at] = '!';
+    try check(replay_replica.applyChangeRecord(corrupt[0..length], &replay_scratch) == error.InvalidChangeRecord);
+    @memcpy(corrupt[at..][0..5], "$.a  ");
+    try check(replay_replica.applyChangeRecord(corrupt[0..length], &replay_scratch) == error.InvalidChangeRecord);
+    try replay_replica.execute("SELECT COUNT(*) FROM r", &result);
+    try same(try render(&result), "2");
+    try replay_replica.applyChangeRecord(record[0..length], &replay_scratch);
+    try check(try sameQuery(&replay_primary, &replay_replica, "SELECT * FROM r ORDER BY id"));
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try collectionAggregates();
     try jsonAggregates();
     try orderedSetAggregates();
+    try jsonbModify();
+    try jsonPath();
+    try replay();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-json-agg\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

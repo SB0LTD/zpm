@@ -227,6 +227,8 @@ pub const Keyword = enum {
     point,
     box,
     xml,
+    // SQL/JSON path type (B11 json-agg lane).
+    jsonpath,
 };
 
 /// Words that cannot be unquoted identifiers.
@@ -318,6 +320,12 @@ pub const Symbol = enum {
     // Geometric <-> and ~=.
     distance,
     same,
+    // JSONB ?| ?& #- and SQL/JSON path @? @@ (B11 json-agg lane).
+    question_pipe,
+    question_amp,
+    hash_minus,
+    at_question,
+    at_at,
 };
 
 pub const Token = struct {
@@ -585,7 +593,13 @@ pub const Tokenizer = struct {
             '/' => .slash,
             '%' => .percent,
             '=' => .eq,
-            '?' => .question,
+            '?' => if (following == '|') blk: {
+                width = 2;
+                break :blk Symbol.question_pipe;
+            } else if (following == '&') blk: {
+                width = 2;
+                break :blk Symbol.question_amp;
+            } else .question,
             '-' => if (following == '>') blk: {
                 width = if (third == '>') 3 else 2;
                 break :blk if (third == '>') Symbol.arrow_text else Symbol.arrow;
@@ -647,10 +661,19 @@ pub const Tokenizer = struct {
             '#' => if (following == '>') blk: {
                 width = if (third == '>') 3 else 2;
                 break :blk if (third == '>') Symbol.path_text else Symbol.path;
+            } else if (following == '-') blk: {
+                width = 2;
+                break :blk Symbol.hash_minus;
             } else .hash,
             '@' => if (following == '>') blk: {
                 width = 2;
                 break :blk Symbol.contains;
+            } else if (following == '?') blk: {
+                width = 2;
+                break :blk Symbol.at_question;
+            } else if (following == '@') blk: {
+                width = 2;
+                break :blk Symbol.at_at;
             } else return error.Syntax,
             else => return error.Syntax,
         };

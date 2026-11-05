@@ -775,7 +775,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             if (left == .unknown) return coerce(context, a.*, right);
             if (right == .unknown) return coerce(context, b.*, left);
-            if (left == .json or right == .json) return error.UndefinedFunction;
+            if (left == .json or right == .json or left == .jsonpath or right == .jsonpath) return error.UndefinedFunction;
             // point and box have no ordinary comparison operators here.
             if (geometricType(left) or geometricType(right) or left == .xml or right == .xml) return error.UndefinedFunction;
             if (left == right) return;
@@ -1087,6 +1087,76 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
+        /// A JSONB operator (B11 json-agg lane) as a call of its *_op
+        /// function over the already typed operands.
+        fn jsonOperatorCall(context: *const Context, n: *ast.Node, func: ast.Func) Error!void {
+            const left = n.a;
+            const right = n.b;
+            context.node(left).next = right;
+            context.node(right).next = none;
+            n.kind = .function;
+            n.func = func;
+            n.a = none;
+            n.b = left;
+            n.name = .{};
+            try typeJsonFunction(context, n, 2);
+        }
+
+        /// pg_proc signatures of the JSONB / SQL/JSON path functions; the
+        /// optional trailing arguments default as in PostgreSQL (create /
+        /// insert_after / vars '{}' / silent false / strip_in_arrays false).
+        fn typeJsonFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            const text_array = types.arrayType(.text).?;
+            switch (n.func) {
+                .jsonb_set, .jsonb_insert => switch (count) {
+                    3 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb }, .jsonb, true),
+                    4 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb, .boolean }, .jsonb, true),
+                    else => return error.UndefinedFunction,
+                },
+                .jsonb_set_lax => switch (count) {
+                    3 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb }, .jsonb, false),
+                    4 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb, .boolean }, .jsonb, false),
+                    5 => try bindSignature(context, n, &[_]T{ .jsonb, text_array, .jsonb, .boolean, .text }, .jsonb, false),
+                    else => return error.UndefinedFunction,
+                },
+                .jsonb_delete_path, .jsonb_delete_path_op => try bindSignature(context, n, &[_]T{ .jsonb, text_array }, .jsonb, true),
+                .jsonb_exists_any, .jsonb_exists_all, .jsonb_exists_any_op, .jsonb_exists_all_op => try bindSignature(context, n, &[_]T{ .jsonb, text_array }, .boolean, true),
+                .jsonb_strip_nulls => switch (count) {
+                    1 => try bindSignature(context, n, &[_]T{.jsonb}, .jsonb, true),
+                    2 => try bindSignature(context, n, &[_]T{ .jsonb, .boolean }, .jsonb, true),
+                    else => return error.UndefinedFunction,
+                },
+                .jsonb_pretty => try bindSignature(context, n, &[_]T{.jsonb}, .text, true),
+                .to_json, .to_jsonb => {
+                    if (count != 1) return error.UndefinedFunction;
+                    // anyelement: an untyped literal is 42804.
+                    if (context.node(n.b).ty == .unknown) return error.TypeMismatch;
+                    n.ty = if (n.func == .to_json) .json else .jsonb;
+                    n.constant = isConstant(context, n.b);
+                    n.planned_null = knownNull(context, n.b);
+                    if (n.planned_null) context.pool.planned_nulls = true;
+                },
+                .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first => {
+                    const result: T = if (n.func == .jsonb_path_exists or n.func == .jsonb_path_match) .boolean else .jsonb;
+                    switch (count) {
+                        2 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath }, result, true),
+                        3 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath, .jsonb }, result, true),
+                        4 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath, .jsonb, .boolean }, result, true),
+                        else => return error.UndefinedFunction,
+                    }
+                },
+                .jsonb_path_exists_op, .jsonb_path_match_op => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath }, .boolean, true),
+                .jsonb_minus_op => {
+                    // jsonb - text | int4 | text[]; an untyped operand is text.
+                    const right = context.node(context.node(n.b).next).ty;
+                    const target: T = if (right == .unknown or value.stringType(right)) .text else if (right == .int2 or right == .int4) .int4 else if (types.elementType(right)) |element| (if (value.stringType(element)) text_array else return error.UndefinedFunction) else return error.UndefinedFunction;
+                    try bindSignature(context, n, &[_]T{ .jsonb, target }, .jsonb, true);
+                },
+                else => return error.UndefinedFunction,
+            }
+        }
+
         fn functionName(context: *const Context, n: *const ast.Node) ast.Func {
             const name = toName(context, n.name);
             const table = [_]struct { name: []const u8, func: ast.Func }{
@@ -1195,6 +1265,14 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_advisory_unlock", .func = .pg_advisory_unlock },
                 .{ .name = "pg_advisory_unlock_shared", .func = .pg_advisory_unlock_shared },
                 .{ .name = "pg_backend_pid", .func = .pg_backend_pid },
+                // JSONB and SQL/JSON path functions (B11 json-agg lane).
+                .{ .name = "jsonb_set", .func = .jsonb_set },       .{ .name = "jsonb_set_lax", .func = .jsonb_set_lax },
+                .{ .name = "jsonb_insert", .func = .jsonb_insert }, .{ .name = "jsonb_delete_path", .func = .jsonb_delete_path },
+                .{ .name = "jsonb_strip_nulls", .func = .jsonb_strip_nulls }, .{ .name = "jsonb_pretty", .func = .jsonb_pretty },
+                .{ .name = "to_json", .func = .to_json },           .{ .name = "to_jsonb", .func = .to_jsonb },
+                .{ .name = "jsonb_path_exists", .func = .jsonb_path_exists }, .{ .name = "jsonb_path_match", .func = .jsonb_path_match },
+                .{ .name = "jsonb_path_query_array", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first", .func = .jsonb_path_query_first },
+                .{ .name = "jsonb_exists_any", .func = .jsonb_exists_any }, .{ .name = "jsonb_exists_all", .func = .jsonb_exists_all },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1898,6 +1976,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .routine, .routine_param => {},
                 .none => return bindRoutineCall(context, n, count),
                 .aggregate_input => return,
+                .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => try typeJsonFunction(context, n, count),
                 .greatest, .least => {
                     if (count == 0) return error.Syntax;
                     var target: ast.Type = .unknown;
@@ -3466,7 +3545,12 @@ pub fn Binder(comptime config: types.Config) type {
                             try comparable(context, &n.a, &n.b);
                             n.ty = .boolean;
                         },
-                        .add, .sub, .mul, .div, .mod => try arithmeticType(context, n),
+                        .add, .sub, .mul, .div, .mod => if (n.op == .sub and context.node(n.a).ty == .jsonb) try jsonOperatorCall(context, n, .jsonb_minus_op) else try arithmeticType(context, n),
+                        .delete_path => try jsonOperatorCall(context, n, .jsonb_delete_path_op),
+                        .exists_any => try jsonOperatorCall(context, n, .jsonb_exists_any_op),
+                        .exists_all => try jsonOperatorCall(context, n, .jsonb_exists_all_op),
+                        .path_exists => try jsonOperatorCall(context, n, .jsonb_path_exists_op),
+                        .path_match => try jsonOperatorCall(context, n, .jsonb_path_match_op),
                         .concat => {
                             const left_ty = context.node(n.a).ty;
                             const right_ty = context.node(n.b).ty;
@@ -3838,6 +3922,7 @@ pub fn Binder(comptime config: types.Config) type {
                         .array_constructor => break :blk .{ .name = "array", .strength = 2 },
                         .array_subscript => break :blk figure(context, n.b, buffer),
                         .array_any => break :blk .{ .name = "?column?", .strength = 0 },
+                        .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => break :blk .{ .name = "?column?", .strength = 0 },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);
@@ -5237,7 +5322,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (ty == .json) return error.UndefinedFunction;
             // No btree or hash operator classes (could not identify an
             // ordering/equality operator: 42883).
-            if (ty == .point or ty == .box or ty == .xml) return error.UndefinedFunction;
+            if (ty == .point or ty == .box or ty == .xml or ty == .jsonpath) return error.UndefinedFunction;
         }
 
         fn bindSetOp(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {

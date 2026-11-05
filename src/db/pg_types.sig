@@ -93,7 +93,11 @@ pub fn Types(comptime Result: type) type {
                     else => try putInt(i64, out, &at, value),
                 },
                 .boolean => |value| try put(out, &at, &.{@intFromBool(value)}),
-                .text => |*value| try put(out, &at, value.slice()),
+                .text => |*value| {
+                    // jsonpath_send: version 1, then the text (B11).
+                    if (data_type == .jsonpath) try put(out, &at, &.{1});
+                    try put(out, &at, value.slice());
+                },
                 .float4 => |value| try putInt(u32, out, &at, @bitCast(value)),
                 .float8 => |value| try putInt(u64, out, &at, @bitCast(value)),
                 .numeric => |*value| {
@@ -250,7 +254,7 @@ pub fn Types(comptime Result: type) type {
         pub fn receiveText(bytes: []const u8, data_type: DataType, out: []u8) Error![]const u8 {
             switch (data_type) {
                 .text, .name, .json, .varchar, .bpchar, .xml => return bytes,
-                .jsonb => {
+                .jsonb, .jsonpath => {
                     if (bytes.len == 0 or bytes[0] != 1) return error.ProtocolViolation;
                     return bytes[1..];
                 },

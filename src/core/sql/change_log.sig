@@ -1311,7 +1311,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 const value = try decodeValue(reader);
                 row.cells[index] = value.cell;
                 // Stored values are already typed; integers must fit int4 columns.
-                V.validate(&table.columns[index], &row.cells[index]) catch return error.ChangeRecordConflict;
+                // A jsonpath that is not its own canonical text is corrupt
+                // bytes (InvalidChangeRecord); other mismatches conflict.
+                V.validate(&table.columns[index], &row.cells[index]) catch |err| return if (err == error.InvalidTextRepresentation) error.InvalidChangeRecord else error.ChangeRecordConflict;
                 if (table.primary == index) key_offset.* = value.offset;
             }
         }
