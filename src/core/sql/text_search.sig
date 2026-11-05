@@ -1094,6 +1094,22 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
             return std.math.order(a.len, b.len);
         }
 
+        /// Stable insertion sort of positions, by position value (weight bits
+        /// ignored) or by the whole u16. Written by hand because std.sort
+        /// passes its context struct (slice plus context) by value, which
+        /// the native SB0 backend cannot decompose into registers.
+        fn sortPositions(items: []u16, by_value: bool) void {
+            var sorted: usize = 1;
+            while (sorted < items.len) : (sorted += 1) {
+                var at = sorted;
+                while (at > 0) : (at -= 1) {
+                    const less = if (by_value) positionValue(items[at]) < positionValue(items[at - 1]) else items[at] < items[at - 1];
+                    if (!less) break;
+                    std.mem.swap(u16, &items[at], &items[at - 1]);
+                }
+            }
+        }
+
         fn positionValue(position: u16) u16 {
             return position & 0x3fff;
         }
@@ -1102,16 +1118,24 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
         /// merging duplicate lexemes and their positions (uniqueentry,
         /// uniquePos: sorted, equal positions keep the highest weight, at
         /// most 256 per lexeme).
+        /// tsvector entry order: lexeme bytes, then original position.
+        fn entryLess(vector: *const Vector, a: Entry, b: Entry) bool {
+            const order = compareLexemes(vector.lexeme(a), vector.lexeme(b));
+            if (order != .eq) return order == .lt;
+            return a.pos_start < b.pos_start;
+        }
+
         pub fn writeVector(vector: *Vector, out: *Out, cap: usize) Error!void {
-            const Context = struct {
-                v: *const Vector,
-                pub fn lessThan(ctx: @This(), a: Entry, b: Entry) bool {
-                    const order = compareLexemes(ctx.v.lexeme(a), ctx.v.lexeme(b));
-                    if (order != .eq) return order == .lt;
-                    return a.pos_start < b.pos_start;
+            // Insertion sort by hand: std.sort passes its context (the slice
+            // plus this vector pointer, 24 bytes) by value, which the native
+            // SB0 backend cannot decompose into registers.
+            var sorted: usize = 1;
+            while (sorted < vector.count) : (sorted += 1) {
+                var at = sorted;
+                while (at > 0 and entryLess(vector, vector.entries[at], vector.entries[at - 1])) : (at -= 1) {
+                    std.mem.swap(Entry, &vector.entries[at], &vector.entries[at - 1]);
                 }
-            };
-            std.sort.insertion(Entry, vector.entries[0..vector.count], Context{ .v = vector }, Context.lessThan);
+            }
             out.len = 0;
             var index: usize = 0;
             var first = true;
@@ -1133,11 +1157,7 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
                     merged[count] = position;
                     count += 1;
                 };
-                std.sort.insertion(u16, merged[0..count], {}, struct {
-                    fn less(_: void, a: u16, b: u16) bool {
-                        return positionValue(a) < positionValue(b);
-                    }
-                }.less);
+                sortPositions(merged[0..count], true);
                 var kept: usize = 0;
                 for (merged[0..count]) |position| {
                     // uniquePos stops after position 16383.
@@ -1760,7 +1780,7 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
                     if (out.count != 0) {
                         // Prefix matches merge positions: sorted, unique.
                         const list = self.arena[out.start..][0..out.count];
-                        std.sort.insertion(u16, list, {}, std.sort.asc(u16));
+                        sortPositions(list, false);
                         var kept: usize = 0;
                         for (list) |position| {
                             if (kept != 0 and list[kept - 1] == position) continue;
