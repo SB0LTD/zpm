@@ -669,6 +669,109 @@ fn recursiveSearch() !void {
     try controlled(graph ++ "SEARCH DEPTH FIRST BY node SET ord CYCLE node SET looped USING trail SELECT node,looped FROM r ORDER BY ord", "1|f;2|f;3|f;1|t;4|f;5|f");
 }
 
+// ---- PG.QUERY.MODIFYING_CTE -----------------------------------------------
+
+var replay_primary: DB = .{};
+var replay_replica: DB = .{};
+var replay_scratch: DB.ReplayScratch = .{};
+var record: [65536]u8 = undefined;
+
+/// Autocommit on the replay primary; its change record goes to the replica.
+fn replicated(source: []const u8) ![]const u8 {
+    var used: usize = 0;
+    replay_primary.executeChanges(source, &result, &record, &used, null, null) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+    if (used != 0) try replay_replica.applyChangeRecord(record[0..used], &replay_scratch);
+    return render(&result);
+}
+
+fn statementRows(slot: u16, source: []const u8, options: sql.StatementOptions) ![]const u8 {
+    db.statement(slot, source, &result, options) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+    return render(&result);
+}
+
+fn modifyingCtes() !void {
+    // oracle, in one transaction as the conformance driver runs it.
+    const tx = try db.begin();
+    _ = try statementRows(tx, "WITH changed AS (UPDATE tdd_a SET v=v+1 WHERE id=1 RETURNING id,v) SELECT * FROM changed", .{});
+    try same(try metadata(&result), "id:23,v:23");
+    try same(try render(&result), "1|11");
+    try same(try statementRows(tx, "SELECT v FROM tdd_a WHERE id=1", .{}), "11");
+    db.abort(tx);
+    try expect("SELECT v FROM tdd_a WHERE id=1", "10");
+    try run("CREATE TABLE m(id INT PRIMARY KEY,v INT)");
+    try run("INSERT INTO m VALUES(1,10),(2,20),(3,30)");
+    // The main query and every entry read the statement snapshot.
+    try expect("WITH u AS (UPDATE m SET v=v+1 RETURNING id,v) SELECT m.id,m.v,u.v FROM m JOIN u USING (id) ORDER BY id", "1|10|11;2|20|21;3|30|31");
+    try expect("SELECT v FROM m ORDER BY id", "11;21;31");
+    try expect("WITH d AS (DELETE FROM m WHERE id=3 RETURNING *) SELECT (SELECT COUNT(*) FROM m),(SELECT COUNT(*) FROM d)", "3|1");
+    try expect("SELECT COUNT(*) FROM m", "2");
+    // INSERT with RETURNING expressions, and INSERT ... SELECT.
+    try expectTyped("WITH i AS (INSERT INTO m VALUES (10,100),(11,110) RETURNING id,v*2 AS w) SELECT * FROM i ORDER BY id", "id:23,w:23", "10|200;11|220");
+    try expect("WITH i AS (INSERT INTO m SELECT id+20,v FROM m WHERE id<3 RETURNING id) SELECT id FROM i ORDER BY id", "21;22");
+    try expect("WITH i(n) AS (INSERT INTO m VALUES (12,0) RETURNING id) SELECT n FROM i", "12");
+    // An unread entry runs exactly once, with or without RETURNING.
+    try expect("WITH d AS (DELETE FROM m WHERE id=10) SELECT 1", "1");
+    try expect("SELECT COUNT(*) FROM m WHERE id=10", "0");
+    try expect("WITH d AS (DELETE FROM m WHERE id IN (11,12) RETURNING id) SELECT 2", "2");
+    try expect("SELECT COUNT(*) FROM m WHERE id IN (11,12)", "0");
+    // Several entries, two on one table, each with its own rows.
+    try expect("WITH a AS (INSERT INTO m VALUES (30,1) RETURNING id),b AS (INSERT INTO m VALUES (31,2) RETURNING id) SELECT (SELECT id FROM a),(SELECT id FROM b)", "30|31");
+    try expect("WITH u AS (UPDATE m SET v=0 WHERE id=30 RETURNING id),d AS (DELETE FROM m WHERE id=31 RETURNING id) SELECT (SELECT COUNT(*) FROM u),(SELECT COUNT(*) FROM d)", "1|1");
+    // The same row twice in one statement: one modification takes place.
+    try expect("WITH u1 AS (UPDATE m SET v=v+1 WHERE id=30 RETURNING v),u2 AS (UPDATE m SET v=v+10 WHERE id=30 RETURNING v) SELECT (SELECT COUNT(*) FROM u1)+(SELECT COUNT(*) FROM u2)", "1");
+    try expect("WITH d AS (DELETE FROM m WHERE id<0 RETURNING id) SELECT COUNT(*) FROM d", "0");
+    try expect("SELECT id,v FROM m ORDER BY id", "1|11;2|21;21|11;22|21;30|1");
+    // Atomicity: a failing main query or a failing entry undoes every entry.
+    try rejects("WITH d AS (DELETE FROM m RETURNING id) SELECT 1/(SELECT COUNT(*)-COUNT(*) FROM d)", error.DivisionByZero);
+    try rejects("WITH i AS (INSERT INTO m VALUES (40,0) RETURNING id),j AS (INSERT INTO m VALUES (1,0) RETURNING id) SELECT 1", error.PrimaryKeyViolation);
+    try expect("SELECT id,v FROM m ORDER BY id", "1|11;2|21;21|11;22|21;30|1");
+    // Errors.
+    try rejects("WITH d AS (DELETE FROM m WHERE false) SELECT * FROM d", error.UnsupportedStatement);
+    try rejects("SELECT (WITH d AS (DELETE FROM m WHERE false RETURNING id) SELECT COUNT(*) FROM d)", error.UnsupportedStatement);
+    try rejects("SELECT * FROM (WITH d AS (DELETE FROM m RETURNING id) SELECT * FROM d) x", error.UnsupportedStatement);
+    try rejects("WITH d AS (DELETE FROM missing RETURNING 1) SELECT 1", error.TableNotFound);
+    try rejects("WITH d AS (UPDATE m SET nope=1 RETURNING id) SELECT 1", error.ColumnNotFound);
+    try rejects("WITH d AS (DELETE FROM m RETURNING id; SELECT 1", error.Syntax);
+    try rejects("WITH RECURSIVE d AS (DELETE FROM m RETURNING id) CYCLE id SET c USING p SELECT 1", error.Syntax);
+    // A caller that forbids writes, and detached reads, cannot run entries.
+    const reader_tx = try db.begin();
+    if (db.statement(reader_tx, "WITH u AS (UPDATE m SET v=v RETURNING id) SELECT COUNT(*) FROM u", &result, .{ .writes = false })) |_| return error.ExpectedReadOnly else |err| try check(err == error.ReadOnlyTransaction);
+    db.abort(reader_tx);
+    var reader: DB.ReadContext = .{};
+    if (reader.prepare(&db, "WITH u AS (UPDATE m SET v=v RETURNING id) SELECT COUNT(*) FROM u", .{ .csn = db.csn })) |_| return error.ExpectedReadOnly else |err| try check(err == error.UnsupportedStatement);
+    // Row locks: the entry waits for a concurrent writer, then resumes
+    // with each write exactly once and the committed value (EvalPlanQual).
+    const writer = try db.begin();
+    _ = try statementRows(writer, "UPDATE m SET v=5 WHERE id=2", .{});
+    const waiter = try db.begin();
+    const wait_query = "WITH u AS (UPDATE m SET v=v+1 WHERE id IN (1,2) RETURNING id,v) SELECT * FROM u ORDER BY id";
+    if (db.statement(waiter, wait_query, &result, .{})) |_| return error.ExpectedWait else |err| try check(err == error.WouldBlock);
+    try check(db.parked(waiter));
+    db.publishCommit(writer);
+    try same(try statementRows(waiter, wait_query, .{ .@"resume" = true }), "1|12;2|6");
+    try same(try statementRows(waiter, "SELECT id,v FROM m WHERE id<3 ORDER BY id", .{}), "1|12;2|6");
+    db.publishCommit(waiter);
+    try expect("SELECT id,v FROM m WHERE id<3 ORDER BY id", "1|12;2|6");
+    try check(db.usage().transactions == 0 and db.usage().row_locks == 0);
+    // Replay: the committed records reproduce the primary.
+    _ = try replicated("CREATE TABLE r(id INT PRIMARY KEY,v INT)");
+    _ = try replicated("INSERT INTO r VALUES(1,1),(2,2)");
+    try same(try replicated("WITH u AS (UPDATE r SET v=v*10 WHERE id=1 RETURNING id),i AS (INSERT INTO r VALUES (3,3) RETURNING id),d AS (DELETE FROM r WHERE id=2 RETURNING id) SELECT (SELECT COUNT(*) FROM u)+(SELECT COUNT(*) FROM i)+(SELECT COUNT(*) FROM d)"), "3");
+    var replica_result: DB.Result = .{};
+    try replay_replica.execute("SELECT id,v FROM r ORDER BY id", &replica_result);
+    try same(try render(&replica_result), "1|10;3|3");
+    try same(try replicated("SELECT id,v FROM r ORDER BY id"), "1|10;3|3");
+    // Exhausted work and cancellation roll every entry back.
+    try controlled("WITH u AS (UPDATE m SET v=v WHERE id<=2 RETURNING id) SELECT COUNT(*) FROM u", "2");
+    try expect("SELECT id,v FROM m WHERE id<3 ORDER BY id", "1|12;2|6");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
@@ -682,6 +785,7 @@ pub fn main(init: std.process.Init) !void {
     try lateralJoins();
     try tableFunctions();
     try recursiveSearch();
+    try modifyingCtes();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

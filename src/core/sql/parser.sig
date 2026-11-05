@@ -52,6 +52,8 @@ pub fn Parser(comptime config: types.Config) type {
         source: []const u8,
         mode: Mode = .standard,
         recursion: usize = 0,
+        /// Inside a data-modifying WITH entry: the statement ends at `)`.
+        nested: usize = 0,
 
         /// Parses exactly one statement. The pool is reset first.
         pub fn parse(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Ast.Statement {
@@ -116,6 +118,10 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn finish(self: *Self) Error!void {
+            if (self.nested != 0) {
+                if (!self.isSymbol(.rparen)) return error.Syntax;
+                return;
+            }
             _ = try self.takeSymbol(.semicolon);
             if (self.current.kind != .end) return error.Syntax;
         }
@@ -163,6 +169,18 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))
                 return try self.identifier();
             return null;
+        }
+
+        /// The INSERT / UPDATE / DELETE of a data-modifying WITH entry, which
+        /// starts at offset `start` of `source` (B11). Parsed into the pool
+        /// without resetting it; the statement ends before the entry's `)`.
+        pub fn parseNested(source: []const u8, start: usize, pool: *Ast.Pool) Error!Ast.Statement {
+            var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes, .position = start }, .pool = pool, .source = source, .mode = .standard, .nested = 1 };
+            try self.advance();
+            if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
+            if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
+            if (try self.takeWord("DELETE")) return .{ .delete = try self.delete() };
+            return error.Syntax;
         }
 
         /// A standalone expression (column DEFAULT / generation text) parsed
@@ -1872,7 +1890,24 @@ pub fn Parser(comptime config: types.Config) type {
                         cte.materialized = 2;
                     }
                     try self.expectSymbol(.lparen);
-                    cte.query = try self.query();
+                    if (self.mode == .standard and (self.isWord("INSERT") or self.isWord("UPDATE") or self.isWord("DELETE"))) {
+                        // Data-modifying WITH entry (B11): checked here, bound
+                        // again from its offset. PostgreSQL: only at the top
+                        // level of the statement (0A000).
+                        if (self.recursion != 1) return error.UnsupportedStatement;
+                        cte.dml_start = self.tokenStart();
+                        cte.dml = if (self.isWord("INSERT")) .insert else if (self.isWord("UPDATE")) .update else .delete;
+                        try self.advance();
+                        self.nested += 1;
+                        defer self.nested -= 1;
+                        switch (cte.dml) {
+                            .insert => _ = try self.insert(),
+                            .update => _ = try self.update(),
+                            .delete => _ = try self.delete(),
+                            .none => return error.Syntax,
+                        }
+                        self.pool.complex = true;
+                    } else cte.query = try self.query();
                     try self.expectSymbol(.rparen);
                     if (self.mode == .standard) try self.searchCycle(&cte);
                     ctes[cte_count] = cte;

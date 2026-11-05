@@ -320,6 +320,9 @@ pub fn Binder(comptime config: types.Config) type {
             planning_plan:?*const Plan=null,
             constant_dependencies:?*[config.ctes]bool=null,
             describe_only:bool=false,
+            /// Binding a data-modifying WITH entry (B11): plans of the
+            /// enclosing statement stay in place.
+            nested_dml: bool = false,
 
             fn node(self: *const Context, id: u16) *ast.Node {
                 return &self.pool.nodes[id];
@@ -495,6 +498,8 @@ pub fn Binder(comptime config: types.Config) type {
             function: u16 = none,
             series: Series = .none,
             ordinality: bool = false,
+            /// The RETURNING rows of data-modifying WITH entry `dml` (B11).
+            dml: u8 = no_dml,
             with_ties: bool = false,
             ties_limit: u64 = 0xffffffffffffffff,
             tie_keys: [config.columns]SortKey = undefined,
@@ -529,7 +534,16 @@ pub fn Binder(comptime config: types.Config) type {
             self_column: u16 = none,
             mark_value: V.Cell = .null_value,
             mark_default: V.Cell = .null_value,
+            /// Data-modifying entry (B11): index into Plans.dml, and whether
+            /// it has RETURNING (needed to read it).
+            dml: u8 = no_dml,
+            returning: bool = false,
         };
+
+        pub const no_dml: u8 = 0xff;
+
+        /// The bound statement of a data-modifying WITH entry.
+        pub const DmlBound = union(enum) { insert: Insert, update: Update, delete: Delete };
 
         /// Statement-scoped plans (inside Database.workspace).
         pub const Plans = struct {
@@ -537,10 +551,14 @@ pub fn Binder(comptime config: types.Config) type {
             len: usize = 0,
             ctes: [config.ctes]CteDef = undefined,
             cte_len: usize = 0,
+            /// Data-modifying WITH entries in statement order (B11).
+            dml: [config.ctes]DmlBound = undefined,
+            dml_len: usize = 0,
 
             pub fn reset(self: *Plans) void {
                 self.len = 0;
                 self.cte_len = 0;
+                self.dml_len = 0;
             }
 
             fn add(self: *Plans) Error!u16 {
@@ -3825,7 +3843,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// type (PostgreSQL does not resolve unknowns in an INSERT's SELECT).
         fn bindInsertQuery(context: *const Context, entry: *const S.Table, query_index: u16, out: *Insert, overriding: ast.Overriding) Error!void {
             const plans = context.plans orelse return error.UnsupportedStatement;
-            plans.reset();
+            if (!context.nested_dml) plans.reset();
             const root = try bindPlan(context, query_index, null, null, true);
             const p = &plans.items[root];
             if (p.count != out.count) return error.Syntax;
@@ -4266,6 +4284,13 @@ pub fn Binder(comptime config: types.Config) type {
             const id: u8 = @intCast(plans.cte_len);
             plans.cte_len += 1;
             plans.ctes[id] = .{ .name = name };
+            if (cte.dml != .none) {
+                if (cte.search.present or cte.cycle.present) return error.Syntax;
+                try bindModifyingCte(context, cte, id);
+                local.ids[local.count] = id;
+                local.count += 1;
+                return;
+            }
             const body = &context.pool.queries[cte.query];
             if (q.recursive and body.set_op == .@"union" and body.cte_count == 0) {
                 if (body.order_count != 0 or body.limit != 0xffffffffffffffff or body.offset != 0) return error.UnsupportedStatement;
@@ -4316,6 +4341,50 @@ pub fn Binder(comptime config: types.Config) type {
             }
             local.ids[local.count] = id;
             local.count += 1;
+        }
+
+        /// A data-modifying WITH entry (B11): its INSERT / UPDATE / DELETE is
+        /// parsed again from its offset and bound like the statement; the
+        /// CTE reads its RETURNING rows, which the Database captures when it
+        /// runs every entry once, before the main query, under the same
+        /// snapshot (Database.modifyingCtes). Reading an entry without
+        /// RETURNING is 0A000.
+        fn bindModifyingCte(context: *const Context, cte: *const Ast.Cte, id: u8) Error!void {
+            const plans = plansOf(context);
+            if (plans.dml_len == config.ctes) return error.StatementTooComplex;
+            const statement = try P.parseNested(context.source, cte.dml_start, context.pool);
+            var nested = context.*;
+            nested.nested_dml = true;
+            const bound = try bindStatement(&nested, &statement);
+            const k = plans.dml_len;
+            plans.dml[k] = switch (bound) {
+                .insert => |insert| .{ .insert = insert },
+                .update => |update| .{ .update = update },
+                .delete => |delete| .{ .delete = delete },
+                else => return error.UnsupportedStatement,
+            };
+            plans.dml_len += 1;
+            const returning: *const Returning = switch (plans.dml[k]) {
+                .insert => |*insert| &insert.returning,
+                .update => |*update| &update.returning,
+                .delete => |*delete| &delete.returning,
+            };
+            const plan_id = try plans.add();
+            const p = &plans.items[plan_id];
+            p.dml = @intCast(k);
+            for (0..returning.count) |column| {
+                const ty = types.typeOfData(returning.types[column]);
+                p.targets[column] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                p.names[column] = returning.names[column];
+                p.tys[column] = ty;
+                p.typmods[column] = returning.typmods[column];
+            }
+            p.count = returning.count;
+            p.width = p.count;
+            try applyAliases(context, plan_id, cte);
+            plans.ctes[id].plan = plan_id;
+            plans.ctes[id].dml = @intCast(k);
+            plans.ctes[id].returning = returning.count != 0;
         }
 
         /// The output column of `p` named by `node` (a name-only column node).
@@ -5376,6 +5445,8 @@ pub fn Binder(comptime config: types.Config) type {
                     source.cte = cte;
                     source.plan = rel.plan;
                     plans.ctes[cte].referenced = true;plans.ctes[cte].references+=1;
+                    // PostgreSQL: WITH query "x" does not have a RETURNING clause.
+                    if (plans.ctes[cte].dml != no_dml and !plans.ctes[cte].returning) return error.UnsupportedStatement;
                     if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
                 } else if (viewOf(context, item.schema, item.name)) |view| {
                     rel.view = view;
@@ -5879,7 +5950,7 @@ pub fn Binder(comptime config: types.Config) type {
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
             // B11 composition plans keep every output (no demand pruning).
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none or p.function!=none;
-            for(plans.ctes[0..plans.cte_len]) |*def| conservative=conservative or def.search or def.cycle;
+            for(plans.ctes[0..plans.cte_len]) |*def| conservative=conservative or def.search or def.cycle or def.dml!=no_dml;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
             var cte_references:[config.ctes]usize=@splat(0);
@@ -6099,7 +6170,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn bindStatement(context: *const Context, statement: *const Ast.Statement) Error!Bound {
-            if (context.plans) |plans| plans.reset();
+            if (context.plans) |plans| if (!context.nested_dml) plans.reset();
             switch (statement.*) {
                 .create_table => |*create| {
                     const table_name = toName(context, create.name);

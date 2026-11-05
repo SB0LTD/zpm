@@ -117,12 +117,17 @@ pub fn Exec(comptime config: types.Config) type {
             /// System-view rows (catalog.sig View) for this statement; set by
             /// the Database before it runs a query (kept across resets).
             views: ?ViewHook = null,
+            /// RETURNING rows of data-modifying WITH entries (B11), held at
+            /// the top of the workspace across resets until the statement ends.
+            pinned_cells: usize = 0,
+            pinned_refs: usize = 0,
+            dml_rows: [config.ctes]List = undefined,
 
             fn reset(self: *Work) void {
                 self.cell_low = 0;
-                self.cell_high = self.cells.len;
+                self.cell_high = self.cells.len - self.pinned_cells;
                 self.ref_low = 0;
-                self.ref_high = self.refs.len;
+                self.ref_high = self.refs.len - self.pinned_refs;
                 self.stream_stats = .{};
                 self.read_stats = .{};
                 for (&self.ctes) |*cte| cte.* = .{};
@@ -3653,6 +3658,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// a non-terminating recursion ends in WorkspaceCapacity.
             fn materializeCte(self: *Query, id: u8, outer: ?*const E.Context) Error!List {
                 const state = &self.work.ctes[id];
+                if (self.plans.ctes[id].dml != B.no_dml) return self.work.dml_rows[self.plans.ctes[id].dml];
                 switch (state.state) {
                     .done => return state.rows,
                     .iterating => return state.working,
