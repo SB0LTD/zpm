@@ -402,6 +402,29 @@ pub fn Database(comptime config: Config) type {
             return out;
         }
 
+        /// The namespace OID of a schema name (public when null).
+        fn namespaceFor(catalog: *const K, schema: ?[]const u8, snap: Snapshot) ?u32 {
+            const wanted = schema orelse return catalog_module.public_namespace;
+            for (catalog_module.namespaces) |known| if (types.same(known.name, wanted)) return known.oid;
+            return if (catalog.findSchema(wanted, snap)) |found| found.oid else null;
+        }
+
+        /// Appends a stored query text to the workspace copy of the statement
+        /// (copying the statement first) and parses it with absolute spans.
+        fn appendQuery(workspace: *Workspace, length: *usize, source: []const u8, text: []const u8) Error!u16 {
+            if (length.* == 0) {
+                if (source.len > workspace.expansion.len) return error.TextCapacity;
+                @memcpy(workspace.expansion[0..source.len], source);
+                length.* = source.len;
+            }
+            if (text.len + 1 > workspace.expansion.len - length.*) return error.TextCapacity;
+            workspace.expansion[length.*] = ' ';
+            const start = length.* + 1;
+            @memcpy(workspace.expansion[start..][0..text.len], text);
+            length.* = start + text.len;
+            return P.parseQueryAt(workspace.expansion[0..length.*], start, length.*, &workspace.nodes);
+        }
+
         /// Views are stored definitions expanded at bind time: every FROM
         /// item naming a view (not a CTE or system view) becomes a derived
         /// table over the view's text, appended to the statement text in
@@ -412,6 +435,16 @@ pub fn Database(comptime config: Config) type {
             workspace.expanded_count = 0;
             const pool = &workspace.nodes;
             var length: usize = 0;
+            // REFRESH MATERIALIZED VIEW reads the stored query the same way.
+            if (bound_statement.* == .refresh_view) {
+                const refresh = &bound_statement.refresh_view;
+                const schema_name = if (refresh.name.schema) |qualifier| identName(source, qualifier) else Name{};
+                if (namespaceFor(catalog, if (refresh.name.schema != null) schema_name.slice() else null, snap)) |namespace| {
+                    if (catalog.findIn(namespace, identName(source, refresh.name.name).slice(), snap)) |found| {
+                        if (found.kind == 'm') refresh.query = try appendQuery(workspace, &length, source, tables[found.slot].query.slice());
+                    }
+                }
+            }
             var block: usize = 0;
             while (block < pool.query_len) : (block += 1) {
                 const q = &pool.queries[block];
@@ -428,29 +461,11 @@ pub fn Database(comptime config: Config) type {
                     }
                     const schema_name = if (item.schema) |qualifier| identName(text, qualifier) else Name{};
                     if (catalog_module.findView(if (item.schema != null) schema_name.slice() else null, name.slice()) != null) continue;
-                    var namespace: u32 = catalog_module.public_namespace;
-                    if (item.schema != null) {
-                        namespace = 0;
-                        for (catalog_module.namespaces) |known| if (types.same(known.name, schema_name.slice())) {
-                            namespace = known.oid;
-                        };
-                        if (namespace == 0) namespace = if (catalog.findSchema(schema_name.slice(), snap)) |found| found.oid else continue;
-                    }
+                    const namespace = namespaceFor(catalog, if (item.schema != null) schema_name.slice() else null, snap) orelse continue;
                     const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
                     if (found.kind != 'v') continue;
                     const view = &tables[found.slot];
-                    if (length == 0) {
-                        if (source.len > workspace.expansion.len) return error.TextCapacity;
-                        @memcpy(workspace.expansion[0..source.len], source);
-                        length = source.len;
-                    }
-                    const body_text = view.query.slice();
-                    if (body_text.len + 1 > workspace.expansion.len - length) return error.TextCapacity;
-                    workspace.expansion[length] = ' ';
-                    const start = length + 1;
-                    @memcpy(workspace.expansion[start..][0..body_text.len], body_text);
-                    length = start + body_text.len;
-                    const parsed = try P.parseQueryAt(workspace.expansion[0..length], start, length, pool);
+                    const parsed = try appendQuery(workspace, &length, source, view.query.slice());
                     // View columns keep the names CREATE VIEW gave them.
                     const top = &pool.queries[parsed];
                     if (top.set_op == .none) {
@@ -1475,7 +1490,8 @@ pub fn Database(comptime config: Config) type {
                     try self.setConstraints(slot, set);
                     break :blk 0;
                 },
-                .refresh_view, .merge => return error.UnsupportedStatement,
+                .refresh_view => |*refresh| try self.refreshView(slot, refresh, source, snap),
+                .merge => return error.UnsupportedStatement,
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -2356,8 +2372,10 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn createTable(self: *Self, slot: u16, create: *const B.Create, snap: Snapshot, source: []const u8) Error!usize {
-            _ = source;
             const tx = &self.txs[slot];
+            // CREATE TABLE AS / MATERIALIZED VIEW read their sources first,
+            // so a lock wait parks before anything is written.
+            if (create.plan != ast.none) try self.lockSources(slot);
             if (self.catalog.creator(create.name.slice(), snap)) |owner| {
                 var waits: L.Set = .{};
                 waits.add(owner);
@@ -2413,7 +2431,67 @@ pub fn Database(comptime config: Config) type {
             for (table.depends[0..table.depend_count]) |oid| {
                 if (self.visibleTableSlot(oid, snap)) |read| try self.lockTable(slot, read, .access_share);
             }
+            // Indexes copied by LIKE ... INCLUDING INDEXES take their OIDs.
+            for (table.indexes[0..table.index_count]) |*created| if (created.oid == 0) {
+                if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
+                created.oid = change_log.first_oid + self.oid_counter;
+                self.oid_counter += 1;
+            };
+            if (create.plan != ast.none) return self.fillFromPlan(slot, index, source, create.plan, snap);
             return 0;
+        }
+
+        /// Inserts the rows of a bound query into table `index` (CREATE
+        /// TABLE AS, CREATE / REFRESH MATERIALIZED VIEW); returns the count.
+        fn fillFromPlan(self: *Self, slot: u16, index: usize, source: []const u8, root: u16, snap: Snapshot) Error!usize {
+            const work = &self.workspace.query;
+            const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, root, snap, &self.session, work);
+            const table = &self.tables[index];
+            for (0..list.count) |position| {
+                try self.session.checkpoint();
+                const row = X.rowAt(work, list, position);
+                var cells: E.Row = @splat(.null_value);
+                for (table.columns[0..table.column_count], 0..) |*column, column_index| cells[column_index] = try D.store(column, row[column_index], &self.session);
+                try self.appendRow(slot, index, &cells, snap);
+            }
+            return list.count;
+        }
+
+        /// REFRESH MATERIALIZED VIEW: AccessExclusive, every row marked
+        /// deleted in place (one truncate entry), then the query's rows under
+        /// the statement snapshot. A change of populated state rewrites the
+        /// definition first (ALTER TABLE copy, durable op 12).
+        fn refreshView(self: *Self, slot: u16, refresh: *const B.Refresh, source: []const u8, snap: Snapshot) Error!usize {
+            try self.lockTable(slot, refresh.slot, .access_exclusive);
+            if (refresh.with_data) try self.lockSources(slot);
+            var index = refresh.slot;
+            if (self.tables[index].populated != refresh.with_data) {
+                const context = self.bindContext("", .standard, snap);
+                var alter = B.identityAlter(&context, index);
+                alter.extras.populated = refresh.with_data;
+                alter.command = .refresh_materialized_view;
+                try self.alterTable(slot, &alter, snap);
+                index = self.visibleTableSlot(self.tables[index].oid, .{ .csn = snap.csn, .slot = snap.slot, .epoch = snap.epoch, .cid = snap.cid +% 1 }) orelse return error.TableNotFound;
+            }
+            try self.truncateSlot(slot, index, snap);
+            if (!refresh.with_data) return 0;
+            return self.fillFromPlan(slot, index, source, refresh.plan, snap);
+        }
+
+        /// Marks every row version of `index` visible to `snap` deleted in
+        /// place with one truncate write entry (the caller locked it).
+        fn truncateSlot(self: *Self, slot: u16, index: usize, snap: Snapshot) Error!void {
+            try self.reserveWrites(slot, 1);
+            const tx = &self.txs[slot];
+            const table = &self.tables[index];
+            for (0..table.row_high) |row| {
+                if (table.rows[row].newest == 0) continue;
+                const version = S.visibleAt(table, row, snap) orelse continue;
+                const entry = &table.versions[version];
+                entry.xmax = tx.ref(slot);
+                entry.xmax_cid = snap.cid;
+            }
+            tx.push(.{ .kind = .truncate, .table = @intCast(index), .old = snap.cid }) catch unreachable;
         }
 
         fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {

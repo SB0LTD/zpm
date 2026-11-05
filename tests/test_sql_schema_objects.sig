@@ -777,6 +777,142 @@ fn viewCapacity() !void {
     try check(small.usage().transactions == 0);
 }
 
+// ---- materialized views (PG.VIEW.MATERIALIZED) ------------------------------
+
+const matview_probes = [_][]const u8{
+    "SELECT * FROM mv ORDER BY g",
+    "SELECT matviewname, ispopulated, definition FROM pg_matviews ORDER BY matviewname",
+    "SELECT relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY oid",
+};
+
+fn materializedViews() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
+    try run("INSERT INTO a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL)");
+    // The oracle program in one transaction.
+    const tx = try db.begin();
+    try statement(tx, "CREATE MATERIALIZED VIEW tdd_mv AS SELECT g,SUM(v) AS total FROM a GROUP BY g");
+    try statement(tx, "REFRESH MATERIALIZED VIEW tdd_mv");
+    try same(try rows(tx, "SELECT * FROM tdd_mv ORDER BY g"), "1|30;2|30");
+    db.abort(tx);
+    // The rows are stored: they change only at REFRESH.
+    const created = try replicate("CREATE MATERIALIZED VIEW mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM a WHERE g < 9 GROUP BY g");
+    try check(created.command == .create_materialized_view and created.affected_rows == 2);
+    try expect(matview_probes[0], "1|30|2;2|30|2");
+    try run("INSERT INTO a VALUES (5, 3, 50)");
+    try run("UPDATE a SET v = 11 WHERE id = 1");
+    try expect(matview_probes[0], "1|30|2;2|30|2");
+    const refreshed = try replicate("REFRESH MATERIALIZED VIEW mv");
+    try check(refreshed.command == .refresh_materialized_view);
+    try expect(matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    try expect("SELECT relkind FROM pg_class WHERE relname = 'mv'", "m");
+    try expect(matview_probes[1], "mv|t|SELECT g, SUM(v) AS total, COUNT(*) AS n FROM a WHERE g < 9 GROUP BY g");
+    try expect("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'mv'", "0");
+    try sameState(&matview_probes);
+    // WITH NO DATA: unpopulated until REFRESH (55000); REFRESH WITH NO DATA
+    // empties it again. Both change the durable definition.
+    try run("CREATE MATERIALIZED VIEW later AS SELECT id FROM a WITH NO DATA");
+    try rejects("SELECT * FROM later", error.ObjectNotInPrerequisiteState, matview_probes[1], "later|f|SELECT id FROM a;mv|t|SELECT g, SUM(v) AS total, COUNT(*) AS n FROM a WHERE g < 9 GROUP BY g");
+    try run("REFRESH MATERIALIZED VIEW later");
+    try expect("SELECT COUNT(*) FROM later", "5");
+    try run("REFRESH MATERIALIZED VIEW later WITH NO DATA");
+    try rejects("SELECT * FROM later", error.ObjectNotInPrerequisiteState, "SELECT COUNT(*) FROM a", "5");
+    try sameState(&[_][]const u8{ matview_probes[0], matview_probes[1], matview_probes[2] });
+    // Writes are 42809; REFRESH of a table 42809; dependents 2BP01.
+    try rejects("INSERT INTO mv VALUES (9, 9, 9)", error.WrongObjectType, matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    try rejects("UPDATE mv SET n = 0", error.WrongObjectType, matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    try rejects("DELETE FROM mv", error.WrongObjectType, matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    try rejects("TRUNCATE mv", error.WrongObjectType, matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    try rejects("REFRESH MATERIALIZED VIEW a", error.WrongObjectType, matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    try rejects("REFRESH MATERIALIZED VIEW CONCURRENTLY mv", error.UnsupportedStatement, matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    try rejects("DROP TABLE a", error.DependentObjects, matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    try rejects("DROP VIEW mv", error.WrongObjectType, matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    // A view over a materialized view, and an index on one.
+    try run("CREATE VIEW mvv AS SELECT g FROM mv WHERE n > 1");
+    try expect("SELECT g FROM mvv ORDER BY g", "1;2");
+    try rejects("DROP MATERIALIZED VIEW mv", error.DependentObjects, "SELECT g FROM mvv ORDER BY g", "1;2");
+    try run("CREATE INDEX mv_g ON mv (g)");
+    try run("REFRESH MATERIALIZED VIEW mv");
+    try check(db.indexConsistent("mv").?);
+    try sameState(&matview_probes);
+    // REFRESH reads committed rows only: a live writer of the base table
+    // neither blocks it nor shows up until the next REFRESH.
+    const writer = try db.begin();
+    try statement(writer, "INSERT INTO a VALUES (6, 1, 1)");
+    const refresher = try db.begin();
+    try statement(refresher, "REFRESH MATERIALIZED VIEW mv");
+    try commit(refresher);
+    try commit(writer);
+    try expect(matview_probes[0], "1|31|2;2|30|2;3|50|1");
+    try run("REFRESH MATERIALIZED VIEW mv");
+    try expect(matview_probes[0], "1|32|3;2|30|2;3|50|1");
+    try run("DROP MATERIALIZED VIEW mv CASCADE");
+    try expect("SELECT relname FROM pg_class WHERE relkind IN ('m', 'v') ORDER BY relname", "later");
+    try sameState(matview_probes[1..]);
+}
+
+// ---- CREATE TABLE variants (PG.DDL.CREATE_VARIANTS) -------------------------
+
+fn createVariants() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, g INT NOT NULL DEFAULT 7 CHECK (g > 0), v INT, label TEXT GENERATED ALWAYS AS ('v' || CAST(v AS TEXT)) STORED, UNIQUE (v))");
+    try run("CREATE INDEX a_g ON a (g)");
+    try run("INSERT INTO a (id, g, v) VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL)");
+    // The oracle program in one transaction.
+    const tx = try db.begin();
+    try statement(tx, "CREATE TEMP TABLE tmp AS SELECT id FROM a");
+    try statement(tx, "CREATE TABLE tdd_like (LIKE a INCLUDING ALL)");
+    try same(try rows(tx, "SELECT * FROM tmp ORDER BY id"), "1;2;3;4");
+    db.abort(tx);
+    // CREATE TABLE AS: columns from the query (names, types, typmods), a
+    // column list, WITH NO DATA; the rows are an ordinary insert.
+    const copied = try replicate("CREATE TABLE ctas (k, doubled) AS SELECT id, v * 2 FROM a WHERE v IS NOT NULL");
+    try check(copied.command == .create_table_as and copied.affected_rows == 3);
+    try expect("SELECT k, doubled FROM ctas ORDER BY k", "1|20;2|40;3|60");
+    try expect("SELECT attname, atttypid, attnotnull FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'ctas' ORDER BY attnum", "k|23|f;doubled|23|f");
+    try run("CREATE TABLE empty_copy AS SELECT id, label FROM a WITH NO DATA");
+    try expect("SELECT COUNT(*) FROM empty_copy", "0");
+    try run("CREATE TEMPORARY TABLE tmp AS SELECT id FROM a WHERE id > 2");
+    try expect("SELECT * FROM tmp ORDER BY id", "3;4");
+    try rejects("CREATE TABLE ctas AS SELECT 1 AS one", error.TableExists, "SELECT COUNT(*) FROM ctas", "3");
+    try rejects("CREATE TABLE bad AS SELECT id, v AS id FROM a", error.DuplicateColumn, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (x, y, z) AS SELECT id FROM a", error.Syntax, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad AS SELECT id FROM missing", error.TableNotFound, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    // LIKE: columns and NOT NULL always; defaults, generation, CHECK,
+    // primary key, UNIQUE and indexes with INCLUDING ALL (new names).
+    try run("CREATE TABLE plain (LIKE a)");
+    try expect("SELECT attname, attnotnull, atthasdef, attgenerated FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'plain' ORDER BY attnum", "id|t|f|;g|t|f|;v|f|f|;label|f|f|");
+    try expect("SELECT COUNT(*) FROM pg_indexes WHERE tablename = 'plain'", "0");
+    try run("CREATE TABLE full_copy (extra INT, LIKE a INCLUDING ALL, tail TEXT)");
+    try expect("SELECT attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'full_copy' ORDER BY attnum", "extra;id;g;v;label;tail");
+    try expect("SELECT indexname FROM pg_indexes WHERE tablename = 'full_copy' ORDER BY indexname", "full_copy_g_idx;full_copy_pkey;full_copy_v_key");
+    try run("INSERT INTO full_copy (extra, id, v) VALUES (0, 1, 5)");
+    try expect("SELECT extra, id, g, v, label, tail FROM full_copy", "0|1|7|5|v5|NULL");
+    try rejects("INSERT INTO full_copy (id, v) VALUES (1, 6)", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM full_copy", "1");
+    try rejects("INSERT INTO full_copy (id, g, v) VALUES (2, 0, 6)", error.CheckViolation, "SELECT COUNT(*) FROM full_copy", "1");
+    try rejects("INSERT INTO full_copy (id, v) VALUES (2, 5)", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM full_copy", "1");
+    try rejects("CREATE TABLE bad (LIKE missing)", error.TableNotFound, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (id INT, LIKE a)", error.DuplicateColumn, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try sameState(&[_][]const u8{
+        "SELECT k, doubled FROM ctas ORDER BY k",
+        "SELECT * FROM tmp ORDER BY id",
+        "SELECT extra, id, g, v, label, tail FROM full_copy",
+        "SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY tablename, indexname",
+        "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_schema = 'public' ORDER BY constraint_name",
+        "SELECT relname, relnatts FROM pg_class WHERE relnamespace = 2200 ORDER BY oid",
+    });
+    // CREATE TABLE AS beside a live writer of its source (AccessShare and
+    // RowExclusive are compatible) reads the committed rows only.
+    const writer = try db.begin();
+    try statement(writer, "INSERT INTO a (id, g, v) VALUES (9, 9, 90)");
+    const reader = try db.begin();
+    try statement(reader, "CREATE TABLE snap_copy AS SELECT id FROM a");
+    try commit(writer);
+    try commit(reader);
+    try expect("SELECT COUNT(*) FROM snap_copy", "4");
+    try sameState(&[_][]const u8{"SELECT id FROM snap_copy ORDER BY id"});
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -785,5 +921,7 @@ pub fn main() !void {
     try deferredConstraints();
     try views();
     try viewCapacity();
+    try materializedViews();
+    try createVariants();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

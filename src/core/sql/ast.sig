@@ -500,6 +500,10 @@ pub fn Ast(comptime config: types.Config) type {
             when_count: usize = 0,
         };
 
+        /// REFRESH MATERIALIZED VIEW name [WITH [NO] DATA]; `query` is the
+        /// stored definition parsed into the statement pool by the facade.
+        pub const Refresh = struct { name: TableRef = .{}, with_data: bool = true, query: u16 = none };
+
         /// SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }.
         pub const SetConstraints = struct {
             all: bool = false,
@@ -752,7 +756,7 @@ pub fn Ast(comptime config: types.Config) type {
             create_view: CreateView,
             /// DROP VIEW / DROP MATERIALIZED VIEW (`materialized`).
             drop_view: struct { drop: Drop, materialized: bool },
-            refresh_view: struct { name: TableRef, with_data: bool = true },
+            refresh_view: Refresh,
             merge: Merge,
             set_constraints: SetConstraints,
         };
