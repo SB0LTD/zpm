@@ -13,6 +13,19 @@ fn entry(_: ?*anyopaque) void {
     while (go.load(.acquire) == 0) workers.waitForChange(&go, 0, 1000);
     for (0..20000) |_| { mutex.lock(); count += 1; mutex.unlock(); }
 }
+var deep_sum: std.atomic.Value(u64) = .init(0);
+/// Uses all but 1 MiB of the reserved stack, writing one byte per page. It
+/// overflows unless the worker really received `stack_bytes`.
+fn deep(_: ?*anyopaque) void {
+    var frame: [workers.stack_bytes - 1024 * 1024]u8 = undefined;
+    var at: usize = 0;
+    while (at < frame.len) : (at += 4096) frame[at] = @truncate(at >> 12);
+    std.mem.doNotOptimizeAway(&frame);
+    var sum: u64 = 0;
+    at = 0;
+    while (at < frame.len) : (at += 4096) sum += frame[at];
+    deep_sum.store(sum, .release);
+}
 pub fn main(init: std.process.Init) !void {
     try check(mutex.tryLock());
     try check(!mutex.tryLock());
@@ -46,6 +59,15 @@ pub fn main(init: std.process.Init) !void {
         signal.notify();
         signal.wait(before, 1000); // already changed: must not sleep for timeout.
         try check(signal.epoch.load(.acquire) != before);
+        // Debug workers get the 16 MiB main-thread default; optimized builds 4 MiB.
+        try check(workers.stack_bytes == if (@import("builtin").mode == .debug) 16 * 1024 * 1024 else 4 * 1024 * 1024);
+        var deep_thread: workers.Thread = .{};
+        try deep_thread.start(&deep, null);
+        try deep_thread.join();
+        var expected: u64 = 0;
+        var at: usize = 0;
+        while (at < workers.stack_bytes - 1024 * 1024) : (at += 4096) expected += @as(u8, @truncate(at >> 12));
+        try check(deep_sum.load(.acquire) == expected);
     }
     var buffer: [128]u8 = undefined;
     const message = try std.fmt.bufPrint(&buffer, "PASS native worker ownership/mutex/signal: {d} assertions\n", .{assertions});
