@@ -772,6 +772,61 @@ fn modifyingCtes() !void {
     try expect("SELECT id,v FROM m WHERE id<3 ORDER BY id", "1|12;2|6");
 }
 
+// ---- PG.QUERY.SAMPLE ------------------------------------------------------
+
+var sample_buffer: [4096]u8 = undefined;
+
+fn tableSample() !void {
+    // oracle
+    try expectTyped("SELECT COUNT(*) FROM tdd_a TABLESAMPLE SYSTEM(100) REPEATABLE(1)", "count:20", "4");
+    // 0 and 100 percent are exact for both methods, with or without a seed.
+    try expect("SELECT COUNT(*) FROM tdd_a TABLESAMPLE BERNOULLI(100) REPEATABLE(1)", "4");
+    try expect("SELECT COUNT(*) FROM tdd_a TABLESAMPLE SYSTEM(0) REPEATABLE(1)", "0");
+    try expect("SELECT COUNT(*) FROM tdd_a TABLESAMPLE BERNOULLI(0)", "0");
+    try expect("SELECT COUNT(*) FROM tdd_a TABLESAMPLE SYSTEM(100)", "4");
+    try expect("SELECT s.id FROM tdd_a AS s TABLESAMPLE BERNOULLI (100) ORDER BY s.id", "1;2;3;4");
+    try expect("SELECT x FROM tdd_a a(x) TABLESAMPLE SYSTEM (100) WHERE x>2 ORDER BY x", "3;4");
+    try expect("SELECT COUNT(*) FROM tdd_a TABLESAMPLE BERNOULLI('100') REPEATABLE('1')", "4");
+    try expect("SELECT COUNT(*) FROM tdd_a a JOIN tdd_b b TABLESAMPLE SYSTEM(100) ON a.id=b.id", "2");
+    // A REPEATABLE seed makes a partial sample deterministic; it is a
+    // subset of the visible rows (exact rows: pending native verification).
+    try run("CREATE TABLE sampled(id INT PRIMARY KEY)");
+    try run("INSERT INTO sampled SELECT x FROM generate_series(1,30) AS g(x)");
+    const partial = "SELECT COUNT(*),SUM(id) FROM sampled TABLESAMPLE BERNOULLI(50) REPEATABLE(7)";
+    try run(partial);
+    const first = try render(&result);
+    @memcpy(sample_buffer[0..first.len], first);
+    const kept = sample_buffer[0..first.len];
+    for (0..3) |_| try expect(partial, kept);
+    try run("SELECT COUNT(*) FROM sampled TABLESAMPLE BERNOULLI(50) REPEATABLE(7)");
+    try check(result.rows[0].cells[0].integer > 0 and result.rows[0].cells[0].integer < 30);
+    try run("SELECT COUNT(*) FROM (SELECT id FROM sampled TABLESAMPLE BERNOULLI(50) REPEATABLE(7)) s JOIN sampled t USING (id)");
+    try check(result.rows[0].cells[0].integer > 0 and result.rows[0].cells[0].integer < 30);
+    // SYSTEM samples whole blocks: one modeled block holds every row here.
+    try run("SELECT COUNT(*) FROM sampled TABLESAMPLE SYSTEM(50) REPEATABLE(7)");
+    try check(result.rows[0].cells[0].integer == 0 or result.rows[0].cells[0].integer == 30);
+    // Own uncommitted rows are visible to the sample; aborted ones are not.
+    const tx = try db.begin();
+    _ = try statementRows(tx, "INSERT INTO tdd_a VALUES (9,9,9)", .{});
+    try same(try statementRows(tx, "SELECT COUNT(*) FROM tdd_a TABLESAMPLE BERNOULLI(100)", .{}), "5");
+    db.abort(tx);
+    try expect("SELECT COUNT(*) FROM tdd_a TABLESAMPLE BERNOULLI(100)", "4");
+    // Errors (PostgreSQL tsm_bernoulli / tsm_system and parse analysis).
+    try rejects("SELECT * FROM tdd_a TABLESAMPLE SYSTEM(101)", error.InvalidTablesampleArgument);
+    try rejects("SELECT * FROM tdd_a TABLESAMPLE BERNOULLI(-1)", error.InvalidTablesampleArgument);
+    try rejects("SELECT * FROM tdd_a TABLESAMPLE BERNOULLI(NULL)", error.InvalidTablesampleArgument);
+    try rejects("SELECT * FROM tdd_a TABLESAMPLE SYSTEM(10,20)", error.InvalidTablesampleArgument);
+    try rejects("SELECT * FROM tdd_a TABLESAMPLE SYSTEM(10) REPEATABLE(NULL)", error.InvalidTablesampleRepeat);
+    try rejects("SELECT * FROM tdd_a TABLESAMPLE SYSTEM(10::float8)", error.TypeMismatch);
+    try rejects("SELECT * FROM tdd_a TABLESAMPLE SYSTEM('x')", error.InvalidTextRepresentation);
+    try rejects("SELECT * FROM tdd_a TABLESAMPLE NOSUCH(10)", error.UndefinedObject);
+    try rejects("SELECT * FROM tdd_a TABLESAMPLE SYSTEM()", error.Syntax);
+    try rejects("SELECT * FROM (SELECT 1) s TABLESAMPLE SYSTEM(10)", error.Syntax);
+    try rejects("WITH w AS (SELECT 1) SELECT * FROM w TABLESAMPLE SYSTEM(10)", error.WrongObjectType);
+    try rejects("SELECT * FROM pg_class TABLESAMPLE SYSTEM(10)", error.WrongObjectType);
+    try controlled("SELECT COUNT(*) FROM tdd_a TABLESAMPLE SYSTEM(100) REPEATABLE(1)", "4");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
@@ -786,6 +841,7 @@ pub fn main(init: std.process.Init) !void {
     try tableFunctions();
     try recursiveSearch();
     try modifyingCtes();
+    try tableSample();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

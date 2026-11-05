@@ -13,6 +13,7 @@ const sort_module = @import("sort.sig");
 const catalog = @import("catalog.sig");
 const aggregate_stats = @import("aggregates_stat.sig");
 const numeric_module = @import("numeric.sig");
+const tablesample = @import("tablesample.sig");
 const builtin = @import("builtin");
 const Error = types.Error;
 const none = ast.none;
@@ -375,6 +376,7 @@ pub fn Exec(comptime config: types.Config) type {
             // ---- FROM items and joins ----------------------------------
 
             fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context) Error!List {
+                if (source.sample_method != 0) return self.sampledRows(source, outer);
                 if (source.table) |index| {
                     const table = &self.tables[index];
                     var list: List = .{ .start = @intCast(self.work.ref_low) };
@@ -393,6 +395,37 @@ pub fn Exec(comptime config: types.Config) type {
                     return sink.list;
                 }
                 return self.run(source.plan, outer);
+            }
+
+            /// TABLESAMPLE BERNOULLI / SYSTEM over the snapshot-visible rows
+            /// (tablesample.sig). Arguments are evaluated once per scan: NULL
+            /// or out-of-range percentages are 2202H, a NULL seed 2202G.
+            /// Without REPEATABLE the seed comes from the statement snapshot.
+            fn sampledRows(self: *Query, source: *const B.Source, outer: ?*const E.Context) Error!List {
+                const index = source.table orelse return error.UnsupportedStatement;
+                var ctx = self.context(outer);
+                const percent_cell = try E.eval(&ctx, source.sample_percent);
+                if (percent_cell != .float4) return error.InvalidTablesampleArgument;
+                const percent = percent_cell.float4;
+                if (!(percent >= 0 and percent <= 100)) return error.InvalidTablesampleArgument;
+                var seed: u32 = undefined;
+                if (source.sample_seed != none) {
+                    const seed_cell = try E.eval(&ctx, source.sample_seed);
+                    if (seed_cell != .float8) return error.InvalidTablesampleRepeat;
+                    seed = tablesample.hashFloat8(seed_cell.float8);
+                } else {
+                    seed = tablesample.hash3(@truncate(self.snap.csn), @truncate(self.snap.csn >> 32), @truncate(@as(u64, self.snap.cid) ^ @as(u64, self.snap.slot)));
+                }
+                const threshold = tablesample.cutoff(percent);
+                const table = &self.tables[index];
+                var list: List = .{ .start = @intCast(self.work.ref_low) };
+                for (0..table.row_high) |slot| {
+                    try self.session.checkpoint();
+                    if (!tablesample.keep(source.sample_method, slot, seed, threshold)) continue;
+                    const version = S.visibleAt(table, slot, self.snap) orelse continue;
+                    try self.push(&list, version);
+                }
+                return list;
             }
 
             fn rowOf(self: *const Query, source: *const B.Source, handle: u32) [*]const V.Cell {

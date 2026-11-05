@@ -2516,7 +2516,7 @@ pub fn Parser(comptime config: types.Config) type {
                     if (self.mode == .standard and !item.only) _ = try self.takeSymbol(.star);
                 }
             }
-            item.alias = try self.bareAlias();
+            item.alias = if (self.mode == .standard and self.rawWord("tablesample")) null else try self.bareAlias();
             // `alias (column, ...)`: column aliases (B11).
             if (self.mode == .standard and item.alias != null and self.isSymbol(.lparen)) {
                 try self.advance();
@@ -2528,6 +2528,29 @@ pub fn Parser(comptime config: types.Config) type {
                     if (!try self.takeSymbol(.comma)) break;
                 }
                 try self.expectSymbol(.rparen);
+                self.pool.complex = true;
+            }
+            // TABLESAMPLE method (argument, ...) [REPEATABLE (seed)] (B11).
+            if (self.mode == .standard and self.rawWord("tablesample")) {
+                if (item.query != none or item.function != none or item.lateral) return error.Syntax;
+                try self.advance();
+                if (self.rawWord("bernoulli")) {
+                    item.sample_method = 1;
+                } else if (self.isWord("SYSTEM") or self.rawWord("system")) {
+                    item.sample_method = 2;
+                } else {
+                    _ = try self.identifier();
+                    // PostgreSQL: tablesample method does not exist (42704).
+                    return error.UndefinedObject;
+                }
+                try self.advance();
+                // The argument list; the binder checks the count (2202H).
+                item.sample_percent = try self.arguments(.function, false);
+                if (try self.takeWord("REPEATABLE")) {
+                    try self.expectSymbol(.lparen);
+                    item.sample_seed = try self.expression();
+                    try self.expectSymbol(.rparen);
+                }
                 self.pool.complex = true;
             }
             out.items[out.item_count] = item;

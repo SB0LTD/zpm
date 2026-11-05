@@ -403,6 +403,11 @@ pub fn Binder(comptime config: types.Config) type {
             /// This item starts a parenthesized right operand ending at item
             /// group_end; its `on` joins the whole operand.
             group_end: u16 = none,
+            /// TABLESAMPLE on this table (1 BERNOULLI, 2 SYSTEM): the float4
+            /// percentage and float8 REPEATABLE seed expressions (B11).
+            sample_method: u8 = 0,
+            sample_percent: u16 = none,
+            sample_seed: u16 = none,
         };
 
         pub const Window=struct {
@@ -5344,6 +5349,45 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
+        /// TABLESAMPLE (B11): only on a table (PostgreSQL 42809 otherwise),
+        /// with exactly one argument (2202H). The percentage is real and the
+        /// REPEATABLE seed double precision, both by implicit coercion
+        /// (42804); they may reference enclosing queries only. The sampled
+        /// table becomes a projection plan of its own whose scan applies the
+        /// sample, so no fast path reads the table directly.
+        fn bindSample(context: *const Context, parent: ?*const Scope, env: ?*const CteEnv, item: *const Ast.FromItem, rel: *Relation, source: *Source) Error!void {
+            if (rel.table == null) return error.WrongObjectType;
+            const call = context.node(item.sample_percent);
+            const percent = call.b;
+            if (percent == none or context.node(percent).next != none) return error.InvalidTablesampleArgument;
+            var scope: Scope = .{ .parent = parent, .ctes = env };
+            const args = [2]u16{ percent, item.sample_seed };
+            for (args, 0..) |arg, index| {
+                if (arg == none) continue;
+                try typeExpr(context, &scope, arg);
+                const want: ast.Type = if (index == 0) .float4 else .float8;
+                const ty = context.node(arg).ty;
+                if (ty == .unknown) {
+                    try coerce(context, arg, want);
+                } else if (ty != want) {
+                    if (!value.castable(ty, want, .implicit)) return error.TypeMismatch;
+                }
+            }
+            const typed_percent = if (context.node(percent).ty == .float4) percent else try convert(context, percent, .float4, -1, .implicit);
+            const typed_seed = if (item.sample_seed == none or context.node(item.sample_seed).ty == .float8) item.sample_seed else try convert(context, item.sample_seed, .float8, -1, .implicit);
+            const wrapper = try wrapRelation(context, rel, source.*);
+            const p = &plansOf(context).items[wrapper];
+            p.sources[0].sample_method = item.sample_method;
+            p.sources[0].sample_percent = typed_percent;
+            p.sources[0].sample_seed = typed_seed;
+            // References to an enclosing query re-run the scan per outer row.
+            for ([_]u16{ typed_percent, typed_seed }) |arg| if (arg != none and (correlatedSublink(context, arg) or referencesLevel(context, arg, 1) or referencesLevel(context, arg, 2))) {
+                p.correlated = true;
+            };
+            rel.* = .{ .name = rel.name, .plan = wrapper };
+            source.* = .{ .join = source.join, .plan = wrapper, .group_end = source.group_end };
+        }
+
         /// `SELECT *` over one relation as a plan of its own.
         fn wrapRelation(context: *const Context, rel: *const Relation, source: Source) Error!u16 {
             const plans = plansOf(context);
@@ -5459,6 +5503,10 @@ pub fn Binder(comptime config: types.Config) type {
                     source.table = table;
                 }
                 if (item.alias) |alias| rel.name = toName(context, alias);
+                if (item.sample_method != 0) {
+                    try bindSample(context, parent, env, item, &rel, &source);
+                    if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
+                }
                 if (item.column_aliases != none) try applyColumnAliases(context, item, &rel, &source);
                 scope.rels[index] = rel;
                 scope.rel_count = index + 1;
@@ -5949,7 +5997,7 @@ pub fn Binder(comptime config: types.Config) type {
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
             // B11 composition plans keep every output (no demand pruning).
-            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none or p.function!=none;
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none or p.function!=none or (p.source_count!=0 and p.sources[0].sample_method!=0);
             for(plans.ctes[0..plans.cte_len]) |*def| conservative=conservative or def.search or def.cycle or def.dml!=no_dml;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
