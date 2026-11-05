@@ -6311,14 +6311,25 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
+        /// EXCLUDE [USING gist | btree | hash] (column WITH op, ...): `=` over
+        /// any comparable type, `&&` over range columns (42883 otherwise).
         fn bindExclusion(context: *const Context, definition: *const Ast.ConstraintDef, out: *Create, entry: *S.Constraint, name2: *[256]u8, name2_len: *usize) Error!void {
             _ = context;
-            _ = definition;
-            _ = out;
-            _ = entry;
-            _ = name2;
-            _ = name2_len;
-            return error.UnsupportedStatement;
+            for (entry.keyColumns(), definition.operators[0..definition.column_count], 0..) |column, operator, position| {
+                if (position != 0 and name2_len.* < name2.len) {
+                    name2[name2_len.*] = '_';
+                    name2_len.* += 1;
+                }
+                const column_name = out.columns[column].name.slice();
+                const take = @min(column_name.len, name2.len - name2_len.*);
+                @memcpy(name2[name2_len.*..][0..take], column_name[0..take]);
+                name2_len.* += take;
+                if (out.columns[column].virtual) return error.UnsupportedStatement;
+                if (operator == 2) {
+                    if (types.rangeSubtype(types.typeOfData(out.columns[column].data_type)) == null) return error.UndefinedFunction;
+                    entry.operators[position] = .overlap;
+                } else entry.operators[position] = .equal;
+            }
         }
 
         /// CREATE VIEW / CREATE MATERIALIZED VIEW: the query is bound now

@@ -627,7 +627,7 @@ pub fn Storage(comptime config: types.Config) type {
         /// One candidate of a unique check (PostgreSQL's dirty snapshot):
         /// a committed live row or a version this transaction still holds
         /// takes the key; another live transaction's version means waiting.
-        fn classify(version: *const Version, index: usize, snap: Snapshot, waiting: *?u16) ?KeyState {
+        pub fn classify(version: *const Version, index: usize, snap: Snapshot, waiting: *?u16) ?KeyState {
             const marked = version.xmax.epoch != 0;
             if (version.xmin_csn == 0) {
                 if (snap.own(version.xmin)) {

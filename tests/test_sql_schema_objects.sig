@@ -1198,6 +1198,73 @@ fn partitions() !void {
     try sameState(&[_][]const u8{ partition_probes[0], partition_probes[4] });
 }
 
+// ---- exclusion constraints (PG.CONSTRAINT.EXCLUSION) ------------------------
+
+const exclusion_probes = [_][]const u8{
+    "SELECT room, during FROM booking ORDER BY note",
+    "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'booking' ORDER BY indexname",
+};
+
+fn exclusionConstraints() !void {
+    reset();
+    // The oracle program in one transaction.
+    const tx = try db.begin();
+    try statement(tx, "CREATE TABLE tdd_ex(v INT4RANGE,EXCLUDE USING gist(v WITH &&))");
+    try statement(tx, "INSERT INTO tdd_ex VALUES('[1,3)')");
+    try same(try rows(tx, "SELECT v FROM tdd_ex"), "[1,3)");
+    try statementFails(tx, "INSERT INTO tdd_ex VALUES('[2,4)')", error.ExclusionViolation);
+    db.abort(tx);
+    // Equality and overlap elements together; adjacent ranges and NULLs
+    // never conflict; UPDATE re-checks the changed row only.
+    try run("CREATE TABLE booking (room INT, during INT4RANGE, note TEXT, EXCLUDE USING gist (room WITH =, during WITH &&))");
+    try expect(exclusion_probes[1], "booking_room_during_excl|CREATE INDEX booking_room_during_excl ON public.booking USING gist (room, during)");
+    try run("INSERT INTO booking VALUES (1, '[1,5)', 'a'), (1, '[5,9)', 'b'), (2, '[1,5)', 'c'), (1, NULL, 'd'), (NULL, '[1,9)', 'e')");
+    const listed = "1|[1,5);1|[5,9);2|[1,5);1|NULL;NULL|[1,9)";
+    try rejects("INSERT INTO booking VALUES (1, '[4,6)', 'x')", error.ExclusionViolation, exclusion_probes[0], listed);
+    try rejects("INSERT INTO booking VALUES (2, '[0,2)', 'x'), (3, '[0,2)', 'y')", error.ExclusionViolation, exclusion_probes[0], listed);
+    try rejects("UPDATE booking SET during = '[3,7)' WHERE note = 'c' OR note = 'a'", error.ExclusionViolation, exclusion_probes[0], listed);
+    try run("UPDATE booking SET note = note || '!' WHERE room = 1");
+    try run("UPDATE booking SET during = '[0,1)' WHERE note = 'c'");
+    try expect(exclusion_probes[0], "1|[1,5);1|[5,9);2|[0,1);1|NULL;NULL|[1,9)");
+    // A WITH && element needs a range column (42883); a table-wide check of
+    // existing rows rejects an added constraint (23P01).
+    try rejects("CREATE TABLE bad (n INT, EXCLUDE USING gist (n WITH &&))", error.UndefinedFunction, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try run("CREATE TABLE plain (k INT, r INT4RANGE)");
+    try run("INSERT INTO plain VALUES (1, '[1,3)'), (1, '[2,4)')");
+    try rejects("ALTER TABLE plain ADD CONSTRAINT plain_excl EXCLUDE (k WITH =, r WITH &&)", error.ExclusionViolation, "SELECT COUNT(*) FROM pg_indexes WHERE tablename = 'plain'", "0");
+    try run("DELETE FROM plain WHERE r = '[2,4)'");
+    try run("ALTER TABLE plain ADD CONSTRAINT plain_excl EXCLUDE (k WITH =, r WITH &&)");
+    try rejects("INSERT INTO plain VALUES (1, '[0,2)')", error.ExclusionViolation, "SELECT COUNT(*) FROM plain", "1");
+    try sameState(&exclusion_probes);
+    // Concurrency: an overlapping insert waits for the live writer, then
+    // fails after its commit or succeeds after its abort.
+    const first = try db.begin();
+    const second = try db.begin();
+    try statement(first, "INSERT INTO booking VALUES (3, '[1,4)', 'f')");
+    try parks(second, "INSERT INTO booking VALUES (3, '[2,3)', 'g')");
+    try commit(first);
+    try resumeFails(second, "INSERT INTO booking VALUES (3, '[2,3)', 'g')", error.ExclusionViolation);
+    db.abort(second);
+    const third = try db.begin();
+    const fourth = try db.begin();
+    try statement(third, "INSERT INTO booking VALUES (4, '[1,4)', 'h')");
+    try parks(fourth, "INSERT INTO booking VALUES (4, '[2,3)', 'i')");
+    db.abort(third);
+    _ = try resumed(fourth, "INSERT INTO booking VALUES (4, '[2,3)', 'i')");
+    try commit(fourth);
+    // DEFERRABLE: overlap allowed until COMMIT, then 23P01.
+    try run("CREATE TABLE later (r INT4RANGE, EXCLUDE (r WITH &&) DEFERRABLE INITIALLY DEFERRED)");
+    const deferred = try db.begin();
+    try statement(deferred, "INSERT INTO later VALUES ('[1,5)'), ('[2,3)')");
+    try commitFails(deferred, error.ExclusionViolation);
+    const resolved = try db.begin();
+    try statement(resolved, "INSERT INTO later VALUES ('[1,5)'), ('[2,3)')");
+    try statement(resolved, "DELETE FROM later WHERE r = '[2,3)'");
+    try commit(resolved);
+    try expect("SELECT r FROM later", "[1,5)");
+    try sameState(&[_][]const u8{ exclusion_probes[0], exclusion_probes[1], "SELECT r FROM later", "SELECT k, r FROM plain" });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1211,6 +1278,7 @@ pub fn main() !void {
     try mergeStatement();
     try inheritance();
     try partitions();
+    try exclusionConstraints();
     try advancedIndexes();
     try virtualColumns();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });

@@ -105,6 +105,7 @@ const float_module = @import("sql/float_text.sig");
 const sort_module = @import("sql/sort.sig");
 const sequence_module = @import("sql/sequence.sig");
 const deparse_module = @import("sql/deparse.sig");
+const range_eval_module = @import("sql/range_eval.sig");
 
 /// The canonical SQL tokenizer, also used by wire parameter binding.
 /// Source and token spans remain caller-owned; tokenization allocates nothing.
@@ -2190,6 +2191,23 @@ pub fn Database(comptime config: Config) type {
                             for (table.indexes[0..table.index_count]) |*index| {
                                 try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(index.name.slice()), .null_value, nameCell(secondaryDefinition(table, schema_name, index, &text)) });
                             }
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind != .exclusion) continue;
+                                var definition: Writer512 = .{ .out = &text };
+                                definition.add("CREATE INDEX ");
+                                definition.add(constraint.name.slice());
+                                definition.add(" ON ");
+                                definition.add(schema_name);
+                                definition.add(".");
+                                definition.add(name);
+                                definition.add(" USING gist (");
+                                for (constraint.keyColumns(), 0..) |column, position| {
+                                    if (position != 0) definition.add(", ");
+                                    definition.add(table.columns[column].name.slice());
+                                }
+                                definition.add(")");
+                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(constraint.name.slice()), .null_value, nameCell(definition.slice()) });
+                            }
                         },
                         .pg_views => if (table.relkind == 'v') {
                             try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), nameCell(table.query.slice()) });
@@ -2787,6 +2805,14 @@ pub fn Database(comptime config: Config) type {
                     if (alter.check_not_null[column] and cells[column] == .null_value) return error.NotNullViolation;
                 }
                 try D.checkRow(&ctx, table, &checks, cells);
+                // An added EXCLUDE constraint over the existing rows.
+                for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                    if (constraint.kind != .exclusion or !alter.check_constraint[position]) continue;
+                    switch (try exclusionCheck(table, constraint, cells, @intCast(row), snap)) {
+                        .free, .wait => {},
+                        .taken => return error.ExclusionViolation,
+                    }
+                }
                 // An added FOREIGN KEY: every existing row must reference a row.
                 for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
                     if (constraint.kind != .foreign or !alter.check_constraint[position]) continue;
@@ -2914,9 +2940,61 @@ pub fn Database(comptime config: Config) type {
                 },
             };
             if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| return error.PrimaryKeyViolation;
+            try self.exclusionTaken(slot, table_index, &cells, 0xffffffff, null, snap);
             try self.checkReferences(slot, table_index, &cells, null, snap);
             try self.appendRow(slot, table_index, &cells, snap);
             return 1;
+        }
+
+        // ---- exclusion constraints -----------------------------------------
+
+        /// EXCLUDE constraints of a new or updated row (23P01) with the
+        /// dirty-snapshot rules of UNIQUE: a committed or own row matching
+        /// every element conflicts; another live writer's is waited for.
+        /// NULL elements never conflict; deferrable ones are checked later.
+        fn exclusionTaken(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, own_slot: u32, old: ?*const E.Row, snap: Snapshot) Error!void {
+            const table = &self.tables[table_index];
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind != .exclusion) continue;
+                if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
+                if (constraint.deferrable) {
+                    self.txs[slot].deferred_checks = true;
+                    continue;
+                }
+                switch (try exclusionCheck(table, constraint, cells, own_slot, snap)) {
+                    .free => {},
+                    .taken => return error.ExclusionViolation,
+                    .wait => |owner| {
+                        var waits: L.Set = .{};
+                        waits.add(owner);
+                        return self.park(slot, waits);
+                    },
+                }
+            }
+        }
+
+        fn exclusionCheck(table: *const S.Table, constraint: *const S.Constraint, cells: *const E.Row, own_slot: u32, snap: Snapshot) Error!S.KeyState {
+            for (constraint.keyColumns()) |column| if (cells[column] == .null_value) return .free;
+            var waiting: ?u16 = null;
+            for (table.versions[0..table.version_high], 0..) |*version, index| {
+                if (version.row == 0 or version.row - 1 == own_slot) continue;
+                var all = true;
+                for (constraint.keyColumns(), constraint.operators[0..constraint.column_count]) |column, operator| {
+                    if (!all) break;
+                    all = try exclusionMatch(operator, &version.cells[column], &cells[column]);
+                }
+                if (!all) continue;
+                if (S.classify(version, index, snap, &waiting)) |state| return state;
+            }
+            return if (waiting) |owner| .{ .wait = owner } else .free;
+        }
+
+        fn exclusionMatch(operator: S.ExclusionOperator, left: *const V.Cell, right: *const V.Cell) Error!bool {
+            if (left.* == .null_value or right.* == .null_value) return false;
+            return switch (operator) {
+                .equal => V.compare(left, right) == 0,
+                .overlap => range_eval_module.RangeEval(config, E).predicate(.overlap, left, right),
+            };
         }
 
         // ---- foreign keys -------------------------------------------------
@@ -3146,6 +3224,7 @@ pub fn Database(comptime config: Config) type {
                 },
             };
             if ((try self.uniqueTaken(slot, table_index, cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
+            try self.exclusionTaken(slot, table_index, cells, row, &table.versions[old].cells, snap);
             if (check != .none) try self.checkReferences(slot, table_index, cells, if (check == .all) null else &table.versions[old].cells, snap);
             try self.referencedChange(slot, table_index, &table.versions[old].cells, cells, snap);
             if (table.versions[old].xmax.epoch != 0) return;
@@ -3234,6 +3313,10 @@ pub fn Database(comptime config: Config) type {
                 switch (constraint.kind) {
                     .unique, .primary => switch (S.uniqueCheck(table, constraint, cells, row, snap)) {
                         .taken => return error.PrimaryKeyViolation,
+                        .free, .wait => {},
+                    },
+                    .exclusion => switch (try exclusionCheck(table, constraint, cells, row, snap)) {
+                        .taken => return error.ExclusionViolation,
                         .free, .wait => {},
                     },
                     .foreign => {
@@ -3745,6 +3828,10 @@ pub fn Database(comptime config: Config) type {
                 if (err == error.WouldBlock) tx.pin = snap;
                 return err;
             }
+            self.exclusionTaken(slot, table_index, &row.cells, 0xffffffff, null, snap) catch |err| {
+                if (err == error.WouldBlock) tx.pin = snap;
+                return err;
+            };
             self.checkReferences(slot, table_index, &row.cells, null, snap) catch |err| {
                 if (err == error.WouldBlock) tx.pin = snap;
                 return err;
@@ -3979,6 +4066,7 @@ pub fn Database(comptime config: Config) type {
                 };
             }
             if ((try self.uniqueTaken(slot, update.table, &cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
+            try self.exclusionTaken(slot, update.table, &cells, row, &table.versions[old].cells, snap);
             try self.checkReferences(slot, update.table, &cells, &table.versions[old].cells, snap);
             try self.referencedChange(slot, update.table, &table.versions[old].cells, &cells, snap);
             // A referential action of this statement may have replaced it.

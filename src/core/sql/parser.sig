@@ -1372,9 +1372,7 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectWord("WITH");
                     if (try self.takeSymbol(.eq)) {
                         out.operators[out.column_count] = 1;
-                    } else if (try self.takeSymbol(.ampersand)) {
-                        // `&&` tokenizes as two `&`.
-                        try self.expectSymbol(.ampersand);
+                    } else if (try self.takeSymbol(.overlap)) {
                         out.operators[out.column_count] = 2;
                     } else return error.UnsupportedStatement;
                     out.column_count += 1;
