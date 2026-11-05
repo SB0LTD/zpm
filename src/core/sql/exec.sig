@@ -245,7 +245,28 @@ pub fn Exec(comptime config: types.Config) type {
                 // must not start an aggregate, sort, window or set input at runtime.
                 if(p.limit==0) {try self.session.checkpoint();return .{};}
                 if (p.set_op != .none) return self.setOperation(p, outer);
+                if (p.values != none) return self.valuesRows(p, outer);
                 return self.core(p, outer);
+            }
+
+            /// A VALUES block: each row's items in order, then ORDER BY /
+            /// OFFSET / LIMIT (B11).
+            fn valuesRows(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                var ctx = self.context(outer);
+                var out: List = .{ .start = @intCast(self.work.ref_low) };
+                var values_row = p.values;
+                while (values_row != none) : (values_row = self.pool.nodes[values_row].next) {
+                    const at = try self.cells(p.width);
+                    var item = self.pool.nodes[values_row].b;
+                    var column: usize = 0;
+                    while (item != none) : (item = self.pool.nodes[item].next) {
+                        if (column == p.width) return error.UnsupportedStatement;
+                        self.work.cells[at + column] = if (p.required[column]) try E.eval(&ctx, item) else .null_value;
+                        column += 1;
+                    }
+                    try self.push(&out, at);
+                }
+                return self.finish(p, out);
             }
 
             // ---- FROM items and joins ----------------------------------

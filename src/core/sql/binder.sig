@@ -471,6 +471,9 @@ pub fn Binder(comptime config: types.Config) type {
             /// LATERAL items or parenthesized right operands: the nested-loop
             /// join tree runs in Exec.joinGeneral (no probes, no fast paths).
             general_join: bool = false,
+            /// Standalone VALUES rows (values_row nodes linked by `next`),
+            /// each item already converted to its column's common type.
+            values: u16 = none,
         };
 
         pub const CteDef = struct {
@@ -4069,12 +4072,118 @@ pub fn Binder(comptime config: types.Config) type {
                 for (q.ctes[0..q.cte_count]) |*cte| try bindCte(context, q, cte, parent, &local);
                 visible = &local;
             }
+            if (q.values != none) return bindValuesBlock(context, q, parent, visible);
             if (q.set_op != .none) {
                 const id = try bindSetOp(context, q, parent, visible);
                 if (!branch) try resolveUnknown(context, id);
                 return id;
             }
             return bindCore(context, q, parent, visible, branch);
+        }
+
+        /// `columnN`, PostgreSQL's VALUES output column name.
+        fn valuesName(number: usize) Error!V.Name {
+            var digits: [20]u8 = undefined;
+            var used: usize = 0;
+            var rest = number;
+            while (true) {
+                digits[used] = @intCast('0' + rest % 10);
+                used += 1;
+                rest /= 10;
+                if (rest == 0) break;
+            }
+            var name: V.Name = .{};
+            const prefix = "column";
+            if (prefix.len + used > name.bytes.len) return error.NameCapacity;
+            @memcpy(name.bytes[0..prefix.len], prefix);
+            for (0..used) |index| name.bytes[prefix.len + index] = digits[used - 1 - index];
+            name.len = prefix.len + used;
+            return name;
+        }
+
+        /// A VALUES block (PostgreSQL transformValuesClause): every column
+        /// takes the common type of its items (text when all are untyped)
+        /// and is named columnN. Items may be correlated; aggregates and
+        /// window calls are not allowed (42803 / 42P20). ORDER BY names
+        /// output columns or positions.
+        fn bindValuesBlock(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {
+            const plans = plansOf(context);
+            const id = try plans.add();
+            var scope: Scope = .{ .parent = parent, .plan = id, .ctes = env };
+            const width = q.count;
+            var targets: [config.columns]ast.Type = @splat(.unknown);
+            var typmods: [config.columns]i32 = @splat(-1);
+            var row = q.values;
+            var first = true;
+            while (row != none) : (row = context.node(row).next) {
+                var item = context.node(row).b;
+                var column: usize = 0;
+                while (item != none) : (item = context.node(item).next) {
+                    try typeExpr(context, &scope, item);
+                    const ty = context.node(item).ty;
+                    try unifyInto(&targets[column], ty);
+                    const typmod = outputTypmod(context, item);
+                    if (first) typmods[column] = typmod else if (typmods[column] != typmod) typmods[column] = -1;
+                    column += 1;
+                }
+                first = false;
+            }
+            const p = &plans.items[id];
+            p.values = q.values;
+            row = q.values;
+            while (row != none) : (row = context.node(row).next) {
+                var previous: u16 = none;
+                var item = context.node(row).b;
+                var column: usize = 0;
+                while (item != none) {
+                    const next = context.node(item).next;
+                    if (targets[column] == .unknown) targets[column] = .text;
+                    const target = targets[column];
+                    const ty = context.node(item).ty;
+                    var converted = item;
+                    if (ty == .unknown) {
+                        try coerce(context, item, target);
+                        typmods[column] = -1;
+                    } else if (ty != target) {
+                        typmods[column] = -1;
+                        if (!(value.integral(ty) and value.integral(target))) converted = try convert(context, item, target, -1, .implicit);
+                    }
+                    context.node(converted).next = next;
+                    if (previous == none) context.node(row).b = converted else context.node(previous).next = converted;
+                    if (column == 0) p.targets[0] = converted;
+                    previous = converted;
+                    item = next;
+                    column += 1;
+                }
+            }
+            p.count = width;
+            p.width = width;
+            for (0..width) |column| {
+                p.names[column] = try valuesName(column + 1);
+                p.tys[column] = targets[column];
+                p.typmods[column] = typmods[column];
+            }
+            for (q.order[0..q.order_count]) |*key| {
+                const n = context.node(key.expr);
+                var column: ?usize = null;
+                if (n.kind == .int_literal) {
+                    if (n.integer < 1 or n.integer > width) return error.InvalidColumnReference;
+                    column = @intCast(n.integer - 1);
+                } else if (n.kind == .column and n.qualifier.len == 0 and !n.star) {
+                    const wanted = toName(context, n.name);
+                    for (p.names[0..width], 0..) |*name, index| if (types.same(name.slice(), wanted.slice())) {
+                        column = index;
+                        break;
+                    };
+                    if (column == null) return error.ColumnNotFound;
+                }
+                const index = column orelse return error.UnsupportedStatement;
+                try sortableType(p.tys[index]);
+                p.order[p.order_count] = .{ .column = @intCast(index), .descending = key.descending, .nulls_first = nullsFirst(key) };
+                p.order_count += 1;
+            }
+            try checkCounts(q, p);
+            return id;
         }
 
         fn applyAliases(context: *const Context, plan_id: u16, cte: *const Ast.Cte) Error!void {
@@ -5255,6 +5364,8 @@ pub fn Binder(comptime config: types.Config) type {
             // width, column numbering, bags or row cardinality.
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
+            // B11 composition plans keep every output (no demand pruning).
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
             var cte_references:[config.ctes]usize=@splat(0);

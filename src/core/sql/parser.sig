@@ -228,7 +228,7 @@ pub fn Parser(comptime config: types.Config) type {
                 return if (sequence_kind) .{ .drop_sequence = drop } else .{ .drop_table = drop };
             }
             if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
-            if (self.isWord("SELECT") or (self.mode == .standard and self.isWord("WITH"))) return self.topQuery();
+            if (self.isWord("SELECT") or (self.mode == .standard and (self.isWord("WITH") or self.isWord("VALUES") or self.isWord("TABLE")))) return self.topQuery();
             if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
             if (try self.takeWord("DELETE")) return .{ .delete = try self.delete() };
             if (self.mode == .standard and self.rawWord("copy")) {
@@ -1966,6 +1966,11 @@ pub fn Parser(comptime config: types.Config) type {
             return index;
         }
 
+        /// A token that starts a query block: SELECT, WITH, VALUES, TABLE.
+        fn queryWord(self: *const Self) bool {
+            return self.isWord("SELECT") or (self.mode == .standard and (self.isWord("WITH") or self.isWord("VALUES") or self.isWord("TABLE")));
+        }
+
         fn setPrimary(self: *Self) Error!u16 {
             if (self.mode == .standard and try self.takeSymbol(.lparen)) {
                 const inner = try self.query();
@@ -1973,8 +1978,67 @@ pub fn Parser(comptime config: types.Config) type {
                 self.pool.complex = true;
                 return inner;
             }
+            if (self.mode == .standard and self.isWord("VALUES")) return self.valuesBlock();
+            if (self.mode == .standard and self.isWord("TABLE")) return self.tableBlock();
             try self.expectWord("SELECT");
             return self.core();
+        }
+
+        /// VALUES (e, ...) [, (e, ...)] ...: a query block of literal rows
+        /// whose columns are column1..columnN. Every row has the same width
+        /// (42601 otherwise); DEFAULT belongs to INSERT only.
+        fn valuesBlock(self: *Self) Error!u16 {
+            try self.expectWord("VALUES");
+            self.pool.complex = true;
+            const index = try self.pool.newQuery();
+            var width: usize = 0;
+            var previous: u16 = none;
+            while (true) {
+                try self.expectSymbol(.lparen);
+                const row = try self.pool.add(.{ .kind = .values_row });
+                var count: usize = 0;
+                var last: u16 = none;
+                while (true) {
+                    if (count == config.columns) return error.ColumnCapacity;
+                    const item = try self.expression();
+                    if (last == none) self.pool.nodes[row].b = item else self.pool.nodes[last].next = item;
+                    try self.pool.raise(row, item);
+                    last = item;
+                    count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+                if (previous == none) {
+                    self.pool.queries[index].values = row;
+                    width = count;
+                } else {
+                    if (count != width) return error.Syntax;
+                    self.pool.nodes[previous].next = row;
+                }
+                previous = row;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            self.pool.queries[index].count = width;
+            return index;
+        }
+
+        /// TABLE [ONLY] name: SELECT * FROM name.
+        fn tableBlock(self: *Self) Error!u16 {
+            try self.expectWord("TABLE");
+            _ = try self.takeWord("ONLY");
+            const index = try self.pool.newQuery();
+            const out = &self.pool.queries[index];
+            var item: Ast.FromItem = .{ .join = .first, .name = try self.identifier() };
+            if (try self.takeSymbol(.dot)) {
+                item.schema = item.name;
+                item.name = try self.identifier();
+            }
+            out.items[0] = item;
+            out.item_count = 1;
+            out.targets[0] = .{ .star = true };
+            out.count = 1;
+            out.from = .{ .schema = item.schema, .name = item.name };
+            return index;
         }
 
         /// SELECT [DISTINCT [ON (exprs)] | ALL] targets [FROM items] [WHERE]
@@ -2153,7 +2217,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (out.item_count == config.relations) return error.StatementTooComplex;
             var item: Ast.FromItem = .{ .join = kind };
             if (self.mode == .standard and try self.takeSymbol(.lparen)) {
-                if (!self.isWord("SELECT") and !self.isWord("WITH")) return self.joinGroup(out, kind);
+                if (!self.queryWord()) return self.joinGroup(out, kind);
                 item.query = try self.query();
                 try self.expectSymbol(.rparen);
                 self.pool.complex = true;
@@ -2494,7 +2558,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (try self.takeWord("IN")) {
                 try self.expectSymbol(.lparen);
-                if (self.mode == .standard and (self.isWord("SELECT") or self.isWord("WITH"))) {
+                if (self.mode == .standard and self.queryWord()) {
                     const inner = try self.query();
                     try self.expectSymbol(.rparen);
                     self.pool.complex = true;
@@ -3027,7 +3091,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .symbol => {
                     if (token.symbol != .lparen) return error.Syntax;
                     try self.advance();
-                    if (self.mode == .standard and (self.isWord("SELECT") or self.isWord("WITH"))) {
+                    if (self.mode == .standard and self.queryWord()) {
                         const query_index = try self.query();
                         try self.expectSymbol(.rparen);
                         self.pool.complex = true;
@@ -3167,7 +3231,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and token.kind == .word and self.isWord("EXISTS") and lparenNext(try self.peek())) {
                 try self.advance();
                 try self.advance();
-                if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.Syntax;
+                if (!self.queryWord()) return error.Syntax;
                 const query_index = try self.query();
                 try self.expectSymbol(.rparen);
                 self.pool.complex = true;

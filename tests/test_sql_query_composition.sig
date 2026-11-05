@@ -281,10 +281,60 @@ fn joinTrees() !void {
     try controlled("SELECT a.id,b.id,c.id FROM tdd_a a LEFT JOIN (tdd_b b JOIN tdd_b c ON c.id=b.id) ON b.id=a.id ORDER BY a.id", "1|1|1;2|NULL|NULL;3|3|3;4|NULL|NULL");
 }
 
+// ---- PG.QUERY.VALUES_TABLE ------------------------------------------------
+
+fn valuesAndTable() !void {
+    // oracle
+    try expectTyped("VALUES (1),(2)", "column1:23", "1;2");
+    try expectTyped("TABLE tdd_a ORDER BY id", "id:23,g:23,v:23", "1|1|10;2|1|20;3|2|30;4|2|NULL");
+    // Each column takes its items' common type; untyped literals are text.
+    try expectTyped("VALUES (1,'a',NULL),(2.5,'b',NULL)", "column1:1700,column2:25,column3:25", "1|a|NULL;2.5|b|NULL");
+    try expectTyped("VALUES (1),(20000000000)", "column1:20", "1;20000000000");
+    try expectTyped("VALUES (NULL),(NULL)", "column1:25", "NULL;NULL");
+    try expectTyped("VALUES (1::smallint,'x'::text)", "column1:21,column2:25", "1|x");
+    // Duplicates and row order are preserved; ORDER BY / OFFSET / LIMIT apply.
+    try expect("VALUES (2),(1),(2)", "2;1;2");
+    try expect("VALUES (2,'x'),(1,'y'),(2,'w') ORDER BY 1,column2", "1|y;2|w;2|x");
+    try expect("VALUES (3),(1),(2) ORDER BY column1 DESC LIMIT 2 OFFSET 1", "2;1");
+    try expect("VALUES (1) LIMIT 0", "");
+    // In FROM, CTEs, set operations and subqueries, also correlated.
+    try expect("SELECT column1+1 FROM (VALUES (1),(2)) v ORDER BY 1", "2;3");
+    try expect("WITH w AS (VALUES (1,'a'),(2,'b')) SELECT column2 FROM w WHERE column1=2", "b");
+    try expect("VALUES (1) UNION ALL SELECT 2 UNION ALL VALUES (3) ORDER BY 1", "1;2;3");
+    try expect("VALUES (1),(1) UNION VALUES (1)", "1");
+    try expect("SELECT id FROM tdd_a WHERE id IN (VALUES (2),(4)) ORDER BY id", "2;4");
+    try expectTyped("SELECT (VALUES (7))", "column1:23", "7");
+    try expect("SELECT EXISTS (VALUES (1))", "t");
+    try expect("SELECT a.id,(VALUES (a.v)) FROM tdd_a a ORDER BY a.id", "1|10;2|20;3|30;4|NULL");
+    try expect("TABLE nb ORDER BY k NULLS FIRST,y", "NULL|n;1|p;2|q;2|r;4|s");
+    try expect("SELECT COUNT(*) FROM (TABLE tdd_b) t", "3");
+    try expect("TABLE tdd_b UNION ALL TABLE tdd_b ORDER BY 1 LIMIT 3", "1|11;1|11;3|33");
+    try expect("TABLE ONLY tdd_b ORDER BY id DESC LIMIT 1", "5|55");
+    // Volatile items are evaluated once per row, in row order.
+    try run("CREATE SEQUENCE vs");
+    try expect("VALUES (nextval('vs')),(nextval('vs')),(nextval('vs'))", "1;2;3");
+    // Errors.
+    try rejects("VALUES (1),(2,3)", error.Syntax);
+    try rejects("VALUES (DEFAULT)", error.Syntax);
+    try rejects("VALUES ()", error.Syntax);
+    try rejects("VALUES (1),('a')", error.InvalidTextRepresentation);
+    try rejects("VALUES (1),(true)", error.TypeMismatch);
+    try rejects("VALUES (1/0)", error.DivisionByZero);
+    try rejects("VALUES (COUNT(*))", error.GroupingError);
+    try rejects("VALUES (1) ORDER BY column2", error.ColumnNotFound);
+    try rejects("VALUES (1) ORDER BY 2", error.InvalidColumnReference);
+    try rejects("VALUES (1) ORDER BY column1+1", error.UnsupportedStatement);
+    try rejects("TABLE missing", error.TableNotFound);
+    try rejects("VALUES (1) LIMIT -1", error.InvalidRowCountInLimit);
+    try controlled("VALUES (3),(1),(2),(1) ORDER BY 1", "1;1;2;3");
+    try controlled("TABLE tdd_a ORDER BY id", "1|1|10;2|1|20;3|2|30;4|2|NULL");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
     try joinTrees();
+    try valuesAndTable();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
