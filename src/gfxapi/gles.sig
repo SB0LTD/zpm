@@ -1,0 +1,1602 @@
+//! @zpm/gfxapi gles — OpenGL ES 3.0's objects and state, over the engine:
+//! what libgles.sig's C entry points call, and what EGL makes current.
+//!
+//! This stage has the part of ES 3.0 that needs no shaders: errors as Mesa
+//! keeps them (the first one, until glGetError), the enable bits, the
+//! clear state and masks, viewport and scissor, pixel store state; buffer
+//! objects; 2D textures (level 0, RGBA8 and BGRA8); renderbuffers (RGBA8,
+//! BGRA8, depth, stencil, depth-stencil); framebuffer objects with four
+//! color attachments, draw and read buffers and ES 3.0's completeness;
+//! glClear and glClearBuffer*, glReadPixels (pack buffers too),
+//! glTexImage2D, glTexSubImage2D, glTexStorage2D (unpack buffers too),
+//! glCopyTexSubImage2D, glCopyTexImage2D. Draws, shaders, vertex arrays,
+//! samplers, queries and sync objects come with the rasterizer.
+//!
+//! Objects (textures, buffers, renderbuffers) live in an Objects table a
+//! share group's contexts hold; framebuffers are each context's. A name is
+//! its slot plus one; a name glGen* gave is named, and bound once it is
+//! made (glIs* say true). An image attached to a framebuffer that is not
+//! bound stays until it is detached, though its name is deleted (refs,
+//! orphan), as GL says.
+//!
+//! The default framebuffer is the EGL surface's: setSurface gives its
+//! images (a window's buffer is top-down: the engine flips rows).
+//!
+//! Allocation-free: every table is fixed (MAX_*), in memory the caller
+//! owns (a context and its Objects, each at a fixed address).
+
+const std = @import("std");
+const engine = @import("engine.sig");
+const g = @import("glenum.sig");
+const Engine = engine.Engine;
+const Image = engine.Image;
+const Format = engine.Format;
+const Rect = engine.Rect;
+
+pub const MAX_TEXTURES = 4096;
+pub const MAX_BUFFERS = 4096;
+pub const MAX_RENDERBUFFERS = 512;
+pub const MAX_FRAMEBUFFERS = 512;
+/// The largest texture, renderbuffer and viewport side.
+pub const MAX_SIZE = 8192;
+pub const MAX_UNITS = 32;
+pub const MAX_COLOR = 4;
+
+pub const VENDOR_STRING: [:0]const u8 = "Galaxy";
+pub const VERSION_STRING: [:0]const u8 = "OpenGL ES 3.0 Galaxy 0.1";
+pub const GLSL_STRING: [:0]const u8 = "OpenGL ES GLSL ES 3.00";
+pub const EXTENSIONS = [_][:0]const u8{
+    "GL_EXT_read_format_bgra",
+    "GL_EXT_texture_format_BGRA8888",
+};
+pub const EXTENSIONS_STRING: [:0]const u8 = blk: {
+    var s: [:0]const u8 = "";
+    for (EXTENSIONS, 0..) |e, i| s = s ++ (if (i == 0) "" else " ") ++ e;
+    break :blk s;
+};
+
+pub const TexParams = struct {
+    min: u32 = g.NEAREST_MIPMAP_LINEAR,
+    mag: u32 = g.LINEAR,
+    wrap_s: u32 = g.REPEAT,
+    wrap_t: u32 = g.REPEAT,
+    wrap_r: u32 = g.REPEAT,
+    base_level: i32 = 0,
+    max_level: i32 = 1000,
+};
+
+pub const Tex = struct {
+    named: bool = false,
+    made: bool = false,
+    /// deleted while attached somewhere: freed at the last detach
+    orphan: bool = false,
+    refs: u32 = 0,
+    target: u32 = 0,
+    img: Image = .{},
+    internal: u32 = 0,
+    levels: u32 = 0,
+    immutable: bool = false,
+    params: TexParams = .{},
+};
+
+pub const Buf = struct {
+    named: bool = false,
+    made: bool = false,
+    store: Image = .{},
+    size: usize = 0,
+    usage: u32 = g.STATIC_DRAW,
+};
+
+pub const Rb = struct {
+    named: bool = false,
+    made: bool = false,
+    orphan: bool = false,
+    refs: u32 = 0,
+    img: Image = .{},
+    internal: u32 = g.RGBA4,
+    samples: u32 = 0,
+};
+
+/// A share group's objects (every context created sharing with another
+/// holds the same Objects).
+pub const Objects = struct {
+    tex: [MAX_TEXTURES]Tex = undefined,
+    bufs: [MAX_BUFFERS]Buf = undefined,
+    rbs: [MAX_RENDERBUFFERS]Rb = undefined,
+    /// contexts holding it
+    users: u32 = 0,
+
+    pub fn init(o: *Objects) void {
+        for (&o.tex) |*t| t.* = .{};
+        for (&o.bufs) |*b| b.* = .{};
+        for (&o.rbs) |*b| b.* = .{};
+        o.users = 0;
+    }
+
+    /// Every object's memory goes back (the last context left).
+    fn release(o: *Objects, eng: *Engine) void {
+        for (&o.tex) |*t| eng.freeImage(&t.img);
+        for (&o.bufs) |*b| eng.freeImage(&b.store);
+        for (&o.rbs) |*b| eng.freeImage(&b.img);
+        o.init();
+    }
+};
+
+pub const Attach = struct {
+    pub const Kind = enum(u8) { none, tex, rb };
+    kind: Kind = .none,
+    name: u32 = 0,
+};
+
+pub const Fbo = struct {
+    named: bool = false,
+    made: bool = false,
+    color: [MAX_COLOR]Attach = [_]Attach{.{}} ** MAX_COLOR,
+    depth: Attach = .{},
+    stencil: Attach = .{},
+    draw: [MAX_COLOR]u32 = .{ g.COLOR_ATTACHMENT0, g.NONE, g.NONE, g.NONE },
+    read: u32 = g.COLOR_ATTACHMENT0,
+};
+
+/// A framebuffer as an operation sees it.
+const View = struct {
+    status: u32 = g.FRAMEBUFFER_COMPLETE,
+    /// by draw buffer
+    color: [MAX_COLOR]?*Image = [_]?*Image{null} ** MAX_COLOR,
+    read: ?*Image = null,
+    depth: ?*Image = null,
+    stencil: ?*Image = null,
+    width: u32 = 0,
+    height: u32 = 0,
+
+    fn bounds(v: *const View) Rect {
+        return .{ .x0 = 0, .y0 = 0, .x1 = v.width, .y1 = v.height };
+    }
+};
+
+/// glPixelStorei's state, for packing or unpacking.
+const Store = struct {
+    alignment: i32 = 4,
+    row_length: i32 = 0,
+    skip_rows: i32 = 0,
+    skip_pixels: i32 = 0,
+    image_height: i32 = 0,
+    skip_images: i32 = 0,
+
+    /// Bytes from one row to the next, and to the first pixel, of w
+    /// pixels of 4 bytes.
+    fn layout(s: Store, w: u32) struct { row: usize, first: usize } {
+        const len: usize = if (s.row_length > 0) @intCast(s.row_length) else w;
+        const a: usize = @intCast(s.alignment);
+        const row = std.mem.alignForward(usize, len * 4, a);
+        return .{ .row = row, .first = @as(usize, @intCast(s.skip_rows)) * row + @as(usize, @intCast(s.skip_pixels)) * 4 };
+    }
+};
+
+/// Bytes a w x h rectangle spans in client memory.
+fn spanOf(first: usize, row: usize, w: u32, h: u32) usize {
+    if (w == 0 or h == 0) return 0;
+    return first + (@as(usize, h) - 1) * row + @as(usize, w) * 4;
+}
+
+const BufBinds = struct {
+    array: u32 = 0,
+    element: u32 = 0,
+    pack: u32 = 0,
+    unpack: u32 = 0,
+    uniform: u32 = 0,
+    copy_read: u32 = 0,
+    copy_write: u32 = 0,
+    xfb: u32 = 0,
+};
+
+fn capBit(cap: u32) ?u5 {
+    return switch (cap) {
+        g.CULL_FACE => 0,
+        g.DEPTH_TEST => 1,
+        g.STENCIL_TEST => 2,
+        g.DITHER => 3,
+        g.BLEND => 4,
+        g.SCISSOR_TEST => 5,
+        g.POLYGON_OFFSET_FILL => 6,
+        g.SAMPLE_ALPHA_TO_COVERAGE => 7,
+        g.SAMPLE_COVERAGE => 8,
+        g.RASTERIZER_DISCARD => 9,
+        g.PRIMITIVE_RESTART_FIXED_INDEX => 10,
+        else => null,
+    };
+}
+
+fn bitOf(cap: u32) u32 {
+    return @as(u32, 1) << capBit(cap).?;
+}
+
+/// float in [0, 1] to an n-bit unsigned normalized integer, rounded to
+/// nearest even as Mesa's _mesa_float_to_unorm.
+fn unorm(x: f32, comptime bits: u5) u32 {
+    const max: f64 = @floatFromInt((@as(u32, 1) << bits) - 1);
+    const c: f64 = if (x != x) 0 else std.math.clamp(@as(f64, x), 0, 1);
+    const t = c * max;
+    var n = @floor(t);
+    const d = t - n;
+    if (d > 0.5 or (d == 0.5 and @mod(n, 2) == 1)) n += 1;
+    return @intFromFloat(n);
+}
+
+/// A pixel of `fmt` from RGBA in [0, 1].
+fn packColor(fmt: Format, c: [4]f32) u32 {
+    const r = unorm(c[0], 8);
+    const gr = unorm(c[1], 8);
+    const b = unorm(c[2], 8);
+    const a = unorm(c[3], 8);
+    return switch (fmt) {
+        .rgba8 => r | gr << 8 | b << 16 | a << 24,
+        .bgra8 => b | gr << 8 | r << 16 | a << 24,
+        .d24s8 => unreachable,
+    };
+}
+
+/// The bits of a `fmt` pixel the color mask keeps (masked off).
+fn colorKeep(fmt: Format, m: [4]bool) u32 {
+    const chan = switch (fmt) {
+        .rgba8 => [4]u5{ 0, 8, 16, 24 },
+        .bgra8 => [4]u5{ 16, 8, 0, 24 },
+        .d24s8 => unreachable,
+    };
+    var keep: u32 = 0;
+    for (m, chan) |on, sh| {
+        if (!on) keep |= @as(u32, 0xff) << sh;
+    }
+    return keep;
+}
+
+/// What a GL format and type in client memory are, as an engine format
+/// (four bytes a pixel), or the error GL gives.
+fn clientFormat(format: u32, ty: u32) union(enum) { ok: Format, err: u32 } {
+    if (ty == g.UNSIGNED_BYTE) {
+        if (format == g.RGBA) return .{ .ok = .rgba8 };
+        if (format == g.BGRA_EXT) return .{ .ok = .bgra8 };
+    }
+    const known_format = switch (format) {
+        g.RGBA, g.BGRA_EXT, g.RGB, g.ALPHA, g.LUMINANCE, g.LUMINANCE_ALPHA, g.RED, g.RG, g.RGBA_INTEGER, g.DEPTH_COMPONENT, g.DEPTH_STENCIL => true,
+        else => false,
+    };
+    const known_type = switch (ty) {
+        g.UNSIGNED_BYTE, g.UNSIGNED_SHORT, g.UNSIGNED_INT, g.FLOAT, g.UNSIGNED_INT_24_8 => true,
+        else => false,
+    };
+    return .{ .err = if (known_format and known_type) g.INVALID_OPERATION else g.INVALID_ENUM };
+}
+
+/// A renderbuffer internal format as the engine stores it.
+fn rbFormat(internal: u32) ?Format {
+    return switch (internal) {
+        g.RGBA8 => .rgba8,
+        g.BGRA8_EXT => .bgra8,
+        g.DEPTH_COMPONENT16, g.DEPTH_COMPONENT24, g.DEPTH24_STENCIL8, g.STENCIL_INDEX8 => .d24s8,
+        else => null,
+    };
+}
+
+fn hasDepth(internal: u32) bool {
+    return internal == g.DEPTH_COMPONENT16 or internal == g.DEPTH_COMPONENT24 or internal == g.DEPTH24_STENCIL8;
+}
+
+fn hasStencil(internal: u32) bool {
+    return internal == g.DEPTH24_STENCIL8 or internal == g.STENCIL_INDEX8;
+}
+
+fn validUsage(u: u32) bool {
+    return switch (u) {
+        g.STREAM_DRAW, g.STREAM_READ, g.STREAM_COPY, g.STATIC_DRAW, g.STATIC_READ, g.STATIC_COPY, g.DYNAMIC_DRAW, g.DYNAMIC_READ, g.DYNAMIC_COPY => true,
+        else => false,
+    };
+}
+
+/// glGen*'s names: the lowest free slots (neither named nor held by an
+/// attachment).
+fn genIn(comptime T: type, table: []T, out: []u32) bool {
+    var at: usize = 0;
+    for (out) |*n| {
+        while (at < table.len) : (at += 1) {
+            const t = &table[at];
+            const held = if (@hasField(T, "orphan")) t.orphan else false;
+            if (!t.named and !t.made and !held) break;
+        } else return false;
+        table[at].named = true;
+        n.* = @intCast(at + 1);
+        at += 1;
+    }
+    return true;
+}
+
+fn slotIn(comptime T: type, table: []T, name: u32) ?*T {
+    if (name == 0 or name > table.len) return null;
+    return &table[name - 1];
+}
+
+/// The object `name` names, made (bound once).
+fn madeIn(comptime T: type, table: []T, name: u32) ?*T {
+    const t = slotIn(T, table, name) orelse return null;
+    return if (t.made) t else null;
+}
+
+/// Bind's object: made now if only named, or not named yet (ES lets a
+/// name glGen* did not give be bound); null when the slot is out of
+/// range or an attachment still holds its old object.
+fn makeIn(comptime T: type, table: []T, name: u32) ?*T {
+    const t = slotIn(T, table, name) orelse return null;
+    if (@hasField(T, "orphan") and t.orphan) return null;
+    t.named = true;
+    t.made = true;
+    return t;
+}
+
+pub const Context = struct {
+    eng: *Engine,
+    objs: *Objects,
+    err: u32 = g.NO_ERROR,
+    reset_told: bool = false,
+    fbos: [MAX_FRAMEBUFFERS]Fbo = undefined,
+    // the default framebuffer: the EGL surfaces' images
+    surf_draw: ?*Image = null,
+    surf_read: ?*Image = null,
+    surf_depth: ?*Image = null,
+    surf_seen: bool = false,
+    default_draw: u32 = g.BACK,
+    default_read: u32 = g.BACK,
+    draw_fb: u32 = 0,
+    read_fb: u32 = 0,
+    rb: u32 = 0,
+    clear_color: [4]f32 = .{ 0, 0, 0, 0 },
+    clear_depth: f32 = 1,
+    clear_stencil: i32 = 0,
+    color_mask: [4]bool = .{ true, true, true, true },
+    depth_mask: bool = true,
+    stencil_mask: u32 = 0xffff_ffff,
+    stencil_back_mask: u32 = 0xffff_ffff,
+    viewport: [4]i32 = .{ 0, 0, 0, 0 },
+    scissor: [4]i32 = .{ 0, 0, 0, 0 },
+    enabled: u32 = 1 << 3, // (DITHER is on at first)
+    unit: u32 = 0,
+    tex2d: [MAX_UNITS]u32 = [_]u32{0} ** MAX_UNITS,
+    /// texture 0 of TEXTURE_2D (each context has its own)
+    default_tex: Tex = .{ .named = true, .made = true, .target = g.TEXTURE_2D },
+    bufs: BufBinds = .{},
+    pack: Store = .{},
+    unpack: Store = .{},
+    hint_mipmap: u32 = g.DONT_CARE,
+    hint_derivative: u32 = g.DONT_CARE,
+
+    /// A context in place over `eng`, holding `objs` (a new share group's,
+    /// initialized by the caller, or another context's).
+    pub fn init(c: *Context, eng: *Engine, objs: *Objects) void {
+        c.* = .{ .eng = eng, .objs = objs };
+        for (&c.fbos) |*f| f.* = .{};
+        objs.users += 1;
+    }
+
+    /// Its framebuffers go; the share group's objects go with its last
+    /// context.
+    pub fn deinit(c: *Context) void {
+        for (&c.fbos) |*f| {
+            if (f.made) c.detachAll(f);
+        }
+        c.eng.freeImage(&c.default_tex.img);
+        c.objs.users -= 1;
+        if (c.objs.users == 0) c.objs.release(c.eng);
+    }
+
+    /// The default framebuffer's images (eglMakeCurrent): drawn to, read
+    /// from, depth and stencil. The first surface sets the viewport and
+    /// scissor box to its size.
+    pub fn setSurface(c: *Context, draw: ?*Image, read: ?*Image, depth: ?*Image) void {
+        c.surf_draw = draw;
+        c.surf_read = read;
+        c.surf_depth = depth;
+        if (!c.surf_seen) {
+            if (draw) |d| {
+                c.viewport = .{ 0, 0, @intCast(d.width), @intCast(d.height) };
+                c.scissor = c.viewport;
+                c.surf_seen = true;
+            }
+        }
+    }
+
+    fn fail(c: *Context, e: u32) void {
+        if (c.err == g.NO_ERROR) c.err = e;
+    }
+
+    // ── Errors, strings, state ─────────────────────────────────────────────
+
+    pub fn getError(c: *Context) u32 {
+        const e = c.err;
+        c.err = g.NO_ERROR;
+        return e;
+    }
+
+    /// KHR_robustness: a reset once (the GPU was lost: the engine went on
+    /// on the CPU), then none.
+    pub fn getGraphicsResetStatus(c: *Context) u32 {
+        if (!c.eng.lost or c.reset_told) return g.NO_ERROR;
+        c.reset_told = true;
+        return g.UNKNOWN_CONTEXT_RESET;
+    }
+
+    pub fn getString(c: *Context, name: u32) ?[*:0]const u8 {
+        return switch (name) {
+            g.VENDOR => VENDOR_STRING.ptr,
+            g.RENDERER => if (c.eng.onGpu()) "Galaxy (GPU)" else "Galaxy (CPU)",
+            g.VERSION => VERSION_STRING.ptr,
+            g.SHADING_LANGUAGE_VERSION => GLSL_STRING.ptr,
+            g.EXTENSIONS => EXTENSIONS_STRING.ptr,
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+    }
+
+    pub fn getStringi(c: *Context, name: u32, index: u32) ?[*:0]const u8 {
+        if (name != g.EXTENSIONS) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        if (index >= EXTENSIONS.len) {
+            c.fail(g.INVALID_VALUE);
+            return null;
+        }
+        return EXTENSIONS[index].ptr;
+    }
+
+    pub fn enable(c: *Context, cap: u32, on: bool) void {
+        const b = capBit(cap) orelse return c.fail(g.INVALID_ENUM);
+        const m = @as(u32, 1) << b;
+        if (on) c.enabled |= m else c.enabled &= ~m;
+    }
+
+    pub fn isEnabled(c: *Context, cap: u32) bool {
+        const b = capBit(cap) orelse {
+            c.fail(g.INVALID_ENUM);
+            return false;
+        };
+        return c.enabled & (@as(u32, 1) << b) != 0;
+    }
+
+    pub fn hint(c: *Context, target: u32, mode: u32) void {
+        if (mode != g.DONT_CARE and mode != g.FASTEST and mode != g.NICEST) return c.fail(g.INVALID_ENUM);
+        switch (target) {
+            g.GENERATE_MIPMAP_HINT => c.hint_mipmap = mode,
+            g.FRAGMENT_SHADER_DERIVATIVE_HINT => c.hint_derivative = mode,
+            else => c.fail(g.INVALID_ENUM),
+        }
+    }
+
+    pub fn pixelStore(c: *Context, pname: u32, param: i32) void {
+        const is_align = pname == g.PACK_ALIGNMENT or pname == g.UNPACK_ALIGNMENT;
+        if (is_align and param != 1 and param != 2 and param != 4 and param != 8) return c.fail(g.INVALID_VALUE);
+        if (!is_align and param < 0) return c.fail(g.INVALID_VALUE);
+        switch (pname) {
+            g.PACK_ALIGNMENT => c.pack.alignment = param,
+            g.PACK_ROW_LENGTH => c.pack.row_length = param,
+            g.PACK_SKIP_ROWS => c.pack.skip_rows = param,
+            g.PACK_SKIP_PIXELS => c.pack.skip_pixels = param,
+            g.UNPACK_ALIGNMENT => c.unpack.alignment = param,
+            g.UNPACK_ROW_LENGTH => c.unpack.row_length = param,
+            g.UNPACK_SKIP_ROWS => c.unpack.skip_rows = param,
+            g.UNPACK_SKIP_PIXELS => c.unpack.skip_pixels = param,
+            g.UNPACK_IMAGE_HEIGHT => c.unpack.image_height = param,
+            g.UNPACK_SKIP_IMAGES => c.unpack.skip_images = param,
+            else => c.fail(g.INVALID_ENUM),
+        }
+    }
+
+    pub fn flush(c: *Context) void {
+        c.eng.flush();
+    }
+
+    pub fn finish(c: *Context) void {
+        c.eng.finish();
+    }
+
+    pub fn clearColor(c: *Context, r: f32, gr: f32, b: f32, a: f32) void {
+        // (ES 3.0 keeps them clamped to [0, 1])
+        c.clear_color = .{ clamp01(r), clamp01(gr), clamp01(b), clamp01(a) };
+    }
+
+    pub fn clearDepth(c: *Context, d: f32) void {
+        c.clear_depth = clamp01(d);
+    }
+
+    pub fn clearStencil(c: *Context, s: i32) void {
+        c.clear_stencil = s;
+    }
+
+    pub fn colorMask(c: *Context, r: bool, gr: bool, b: bool, a: bool) void {
+        c.color_mask = .{ r, gr, b, a };
+    }
+
+    pub fn depthMask(c: *Context, on: bool) void {
+        c.depth_mask = on;
+    }
+
+    pub fn stencilMaskSeparate(c: *Context, face: u32, mask: u32) void {
+        switch (face) {
+            0x0404 => c.stencil_mask = mask, // FRONT
+            0x0405 => c.stencil_back_mask = mask, // BACK
+            0x0408 => { // FRONT_AND_BACK
+                c.stencil_mask = mask;
+                c.stencil_back_mask = mask;
+            },
+            else => c.fail(g.INVALID_ENUM),
+        }
+    }
+
+    pub fn viewportSet(c: *Context, x: i32, y: i32, w: i32, h: i32) void {
+        if (w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+        c.viewport = .{ x, y, @min(w, MAX_SIZE), @min(h, MAX_SIZE) };
+    }
+
+    pub fn scissorSet(c: *Context, x: i32, y: i32, w: i32, h: i32) void {
+        if (w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+        c.scissor = .{ x, y, w, h };
+    }
+
+    // ── Queries ────────────────────────────────────────────────────────────
+
+    /// A state value for glGet*: up to four of one kind.
+    pub const Value = struct {
+        kind: enum { int, float, boolean } = .int,
+        n: u8 = 1,
+        i: [4]i64 = .{ 0, 0, 0, 0 },
+        f: [4]f32 = .{ 0, 0, 0, 0 },
+        /// glGetIntegerv maps it from [-1, 1] to the whole int range
+        /// (colors and depths)
+        normalized: bool = false,
+    };
+
+    fn int(v: i64) Value {
+        return .{ .i = .{ v, 0, 0, 0 } };
+    }
+
+    fn ints(vs: []const i64) Value {
+        var x = Value{ .n = @intCast(vs.len) };
+        @memcpy(x.i[0..vs.len], vs);
+        return x;
+    }
+
+    fn boolean(b: bool) Value {
+        return .{ .kind = .boolean, .i = .{ @intFromBool(b), 0, 0, 0 } };
+    }
+
+    /// pname's value, or null (INVALID_ENUM).
+    pub fn get(c: *Context, pname: u32) ?Value {
+        if (capBit(pname) != null) return boolean(c.enabled & bitOf(pname) != 0);
+        if (pname >= g.DRAW_BUFFER0 and pname < g.DRAW_BUFFER0 + MAX_COLOR) {
+            const i = pname - g.DRAW_BUFFER0;
+            if (c.draw_fb == 0) return int(if (i == 0) c.default_draw else g.NONE);
+            return int(c.fbos[c.draw_fb - 1].draw[i]);
+        }
+        return switch (pname) {
+            g.VIEWPORT => ints(&.{ c.viewport[0], c.viewport[1], c.viewport[2], c.viewport[3] }),
+            g.SCISSOR_BOX => ints(&.{ c.scissor[0], c.scissor[1], c.scissor[2], c.scissor[3] }),
+            g.COLOR_CLEAR_VALUE => .{ .kind = .float, .n = 4, .f = c.clear_color, .normalized = true },
+            g.DEPTH_CLEAR_VALUE => .{ .kind = .float, .f = .{ c.clear_depth, 0, 0, 0 }, .normalized = true },
+            g.STENCIL_CLEAR_VALUE => int(c.clear_stencil),
+            g.COLOR_WRITEMASK => .{ .kind = .boolean, .n = 4, .i = .{ @intFromBool(c.color_mask[0]), @intFromBool(c.color_mask[1]), @intFromBool(c.color_mask[2]), @intFromBool(c.color_mask[3]) } },
+            g.DEPTH_WRITEMASK => boolean(c.depth_mask),
+            g.STENCIL_WRITEMASK => int(c.stencil_mask),
+            g.STENCIL_BACK_WRITEMASK => int(c.stencil_back_mask),
+            g.MAX_TEXTURE_SIZE, g.MAX_RENDERBUFFER_SIZE => int(MAX_SIZE),
+            g.MAX_VIEWPORT_DIMS => ints(&.{ MAX_SIZE, MAX_SIZE }),
+            g.MAX_COLOR_ATTACHMENTS, g.MAX_DRAW_BUFFERS => int(MAX_COLOR),
+            g.MAX_TEXTURE_IMAGE_UNITS => int(16),
+            g.MAX_COMBINED_TEXTURE_IMAGE_UNITS => int(MAX_UNITS),
+            g.MAX_SAMPLES => int(1),
+            g.SAMPLES, g.SAMPLE_BUFFERS => int(0),
+            g.SUBPIXEL_BITS => int(4),
+            g.MAJOR_VERSION => int(3),
+            g.MINOR_VERSION => int(0),
+            g.NUM_EXTENSIONS => int(EXTENSIONS.len),
+            g.DRAW_FRAMEBUFFER_BINDING => int(c.draw_fb),
+            g.READ_FRAMEBUFFER_BINDING => int(c.read_fb),
+            g.RENDERBUFFER_BINDING => int(c.rb),
+            g.TEXTURE_BINDING_2D => int(c.tex2d[c.unit]),
+            g.ACTIVE_TEXTURE => int(g.TEXTURE0 + c.unit),
+            g.ARRAY_BUFFER_BINDING => int(c.bufs.array),
+            g.ELEMENT_ARRAY_BUFFER_BINDING => int(c.bufs.element),
+            g.PIXEL_PACK_BUFFER_BINDING => int(c.bufs.pack),
+            g.PIXEL_UNPACK_BUFFER_BINDING => int(c.bufs.unpack),
+            g.UNIFORM_BUFFER_BINDING => int(c.bufs.uniform),
+            g.COPY_READ_BUFFER => int(c.bufs.copy_read),
+            g.COPY_WRITE_BUFFER => int(c.bufs.copy_write),
+            g.PACK_ALIGNMENT => int(c.pack.alignment),
+            g.PACK_ROW_LENGTH => int(c.pack.row_length),
+            g.PACK_SKIP_ROWS => int(c.pack.skip_rows),
+            g.PACK_SKIP_PIXELS => int(c.pack.skip_pixels),
+            g.UNPACK_ALIGNMENT => int(c.unpack.alignment),
+            g.UNPACK_ROW_LENGTH => int(c.unpack.row_length),
+            g.UNPACK_SKIP_ROWS => int(c.unpack.skip_rows),
+            g.UNPACK_SKIP_PIXELS => int(c.unpack.skip_pixels),
+            g.UNPACK_IMAGE_HEIGHT => int(c.unpack.image_height),
+            g.UNPACK_SKIP_IMAGES => int(c.unpack.skip_images),
+            g.READ_BUFFER => int(if (c.read_fb == 0) c.default_read else c.fbos[c.read_fb - 1].read),
+            g.IMPLEMENTATION_COLOR_READ_FORMAT => blk: {
+                const v = c.view(c.read_fb, true);
+                const img = v.read orelse break :blk int(g.RGBA);
+                break :blk int(if (img.format == .bgra8) g.BGRA_EXT else g.RGBA);
+            },
+            g.IMPLEMENTATION_COLOR_READ_TYPE => int(g.UNSIGNED_BYTE),
+            g.RED_BITS, g.GREEN_BITS, g.BLUE_BITS, g.ALPHA_BITS => int(if (c.view(c.draw_fb, false).color[0] != null) 8 else 0),
+            g.DEPTH_BITS => int(if (c.view(c.draw_fb, false).depth != null) 24 else 0),
+            g.STENCIL_BITS => int(if (c.view(c.draw_fb, false).stencil != null) 8 else 0),
+            g.GENERATE_MIPMAP_HINT => int(c.hint_mipmap),
+            g.FRAGMENT_SHADER_DERIVATIVE_HINT => int(c.hint_derivative),
+            else => null,
+        };
+    }
+
+    pub fn getIntegers(c: *Context, pname: u32, out: []i32) void {
+        const v = c.get(pname) orelse return c.fail(g.INVALID_ENUM);
+        for (0..@min(v.n, out.len)) |i| {
+            out[i] = switch (v.kind) {
+                .int, .boolean => @truncate(v.i[i]),
+                .float => if (v.normalized)
+                    @intFromFloat(std.math.clamp(@round(@as(f64, v.f[i]) * 2147483647.0), -2147483648.0, 2147483647.0))
+                else
+                    @intFromFloat(@round(v.f[i])),
+            };
+        }
+    }
+
+    pub fn getFloats(c: *Context, pname: u32, out: []f32) void {
+        const v = c.get(pname) orelse return c.fail(g.INVALID_ENUM);
+        for (0..@min(v.n, out.len)) |i| {
+            out[i] = switch (v.kind) {
+                .int, .boolean => @floatFromInt(v.i[i]),
+                .float => v.f[i],
+            };
+        }
+    }
+
+    pub fn getBooleans(c: *Context, pname: u32, out: []u8) void {
+        const v = c.get(pname) orelse return c.fail(g.INVALID_ENUM);
+        for (0..@min(v.n, out.len)) |i| {
+            out[i] = @intFromBool(switch (v.kind) {
+                .int, .boolean => v.i[i] != 0,
+                .float => v.f[i] != 0,
+            });
+        }
+    }
+
+    // ── Framebuffers as operations see them ────────────────────────────────
+
+    fn texImage(c: *Context, name: u32) ?*Image {
+        const t = slotIn(Tex, &c.objs.tex, name) orelse return null;
+        return if (t.img.live()) &t.img else null;
+    }
+
+    fn rbOf(c: *Context, name: u32) ?*Rb {
+        return slotIn(Rb, &c.objs.rbs, name);
+    }
+
+    /// The image an attachment names, and whether it may be attached
+    /// there: null with `ok` when nothing is attached.
+    fn attached(c: *Context, a: Attach, want: enum { color, depth, stencil }) struct { img: ?*Image, ok: bool } {
+        switch (a.kind) {
+            .none => return .{ .img = null, .ok = true },
+            .tex => {
+                const img = c.texImage(a.name) orelse return .{ .img = null, .ok = false };
+                return .{ .img = img, .ok = want == .color and img.format.isColor() };
+            },
+            .rb => {
+                const rb = c.rbOf(a.name) orelse return .{ .img = null, .ok = false };
+                if (!rb.img.live()) return .{ .img = null, .ok = false };
+                const ok = switch (want) {
+                    .color => rb.img.format.isColor(),
+                    .depth => hasDepth(rb.internal),
+                    .stencil => hasStencil(rb.internal),
+                };
+                return .{ .img = &rb.img, .ok = ok };
+            },
+        }
+    }
+
+    /// Framebuffer `name` (0: the default one) as drawing (or, with
+    /// `for_read`, reading) sees it, and its completeness.
+    fn view(c: *Context, name: u32, for_read: bool) View {
+        var v = View{};
+        if (name == 0) {
+            const draw = if (c.default_draw == g.BACK) c.surf_draw else null;
+            if (c.surf_draw == null and c.surf_read == null and c.surf_depth == null) {
+                v.status = g.FRAMEBUFFER_UNDEFINED;
+                return v;
+            }
+            v.color[0] = draw;
+            v.read = if (c.default_read == g.BACK) c.surf_read else null;
+            v.depth = c.surf_depth;
+            v.stencil = c.surf_depth;
+            const base = if (for_read) (c.surf_read orelse c.surf_depth) else (c.surf_draw orelse c.surf_depth);
+            if (base) |b| {
+                v.width = b.width;
+                v.height = b.height;
+            }
+            return v;
+        }
+        const f = &c.fbos[name - 1];
+        var any = false;
+        var w: u32 = std.math.maxInt(u32);
+        var h: u32 = std.math.maxInt(u32);
+        var bad = false;
+        var colors: [MAX_COLOR]?*Image = [_]?*Image{null} ** MAX_COLOR;
+        for (f.color, 0..) |a, i| {
+            const x = c.attached(a, .color);
+            if (!x.ok) bad = true;
+            colors[i] = x.img;
+        }
+        const d = c.attached(f.depth, .depth);
+        const s = c.attached(f.stencil, .stencil);
+        if (!d.ok or !s.ok) bad = true;
+        var all: [MAX_COLOR + 2]?*Image = undefined;
+        @memcpy(all[0..MAX_COLOR], &colors);
+        all[MAX_COLOR] = d.img;
+        all[MAX_COLOR + 1] = s.img;
+        for (all) |img| {
+            const im = img orelse continue;
+            any = true;
+            w = @min(w, im.width);
+            h = @min(h, im.height);
+        }
+        v.status = if (bad)
+            g.FRAMEBUFFER_INCOMPLETE_ATTACHMENT
+        else if (!any)
+            g.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT
+        else if (d.img != null and s.img != null and d.img.? != s.img.?)
+            // (depth and stencil share one image here)
+            g.FRAMEBUFFER_UNSUPPORTED
+        else
+            g.FRAMEBUFFER_COMPLETE;
+        if (v.status != g.FRAMEBUFFER_COMPLETE) return v;
+        v.width = w;
+        v.height = h;
+        for (f.draw, 0..) |db, i| {
+            v.color[i] = if (db == g.NONE) null else colors[db - g.COLOR_ATTACHMENT0];
+        }
+        v.read = if (f.read == g.NONE) null else colors[f.read - g.COLOR_ATTACHMENT0];
+        v.depth = d.img;
+        v.stencil = s.img;
+        return v;
+    }
+
+    /// The draw framebuffer, complete; else INVALID_FRAMEBUFFER_OPERATION.
+    fn drawView(c: *Context) ?View {
+        const v = c.view(c.draw_fb, false);
+        if (v.status != g.FRAMEBUFFER_COMPLETE) {
+            c.fail(g.INVALID_FRAMEBUFFER_OPERATION);
+            return null;
+        }
+        return v;
+    }
+
+    /// What a clear of `v` reaches: all of it, or the scissor box's part.
+    fn clearRect(c: *const Context, v: *const View) Rect {
+        var a = v.bounds();
+        if (c.enabled & bitOf(g.SCISSOR_TEST) != 0) {
+            const s = c.scissor;
+            const x0: i64 = @max(s[0], 0);
+            const y0: i64 = @max(s[1], 0);
+            const x1: i64 = @max(@as(i64, s[0]) + s[2], 0);
+            const y1: i64 = @max(@as(i64, s[1]) + s[3], 0);
+            const cap = struct {
+                fn f(x: i64) u32 {
+                    return @intCast(@min(x, MAX_SIZE));
+                }
+            }.f;
+            a = a.meet(.{ .x0 = cap(x0), .y0 = cap(y0), .x1 = cap(x1), .y1 = cap(y1) });
+        }
+        return a;
+    }
+
+    // ── Clears ─────────────────────────────────────────────────────────────
+
+    pub fn clear(c: *Context, mask: u32) void {
+        if (mask & ~(g.COLOR_BUFFER_BIT | g.DEPTH_BUFFER_BIT | g.STENCIL_BUFFER_BIT) != 0) return c.fail(g.INVALID_VALUE);
+        var v = c.drawView() orelse return;
+        // (Mesa: a clear draws nothing while rasterizer discard is on)
+        if (c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0) return;
+        const a = c.clearRect(&v);
+        if (a.empty()) return;
+        if (mask & g.COLOR_BUFFER_BIT != 0) {
+            for (v.color) |img| {
+                if (img) |im| c.fillColor(im, a, c.clear_color);
+            }
+        }
+        c.fillDepthStencil(&v, a, mask & g.DEPTH_BUFFER_BIT != 0, c.clear_depth, mask & g.STENCIL_BUFFER_BIT != 0, c.clear_stencil);
+    }
+
+    fn fillColor(c: *Context, img: *Image, a: Rect, rgba: [4]f32) void {
+        const keep = colorKeep(img.format, c.color_mask);
+        c.eng.fill(img, a, packColor(img.format, .{ clamp01(rgba[0]), clamp01(rgba[1]), clamp01(rgba[2]), clamp01(rgba[3]) }), keep);
+    }
+
+    fn fillDepthStencil(c: *Context, v: *View, a: Rect, depth: bool, d: f32, stencil: bool, s: i32) void {
+        const dimg = if (depth and c.depth_mask) v.depth else null;
+        const smask = c.stencil_mask & 0xff;
+        const simg = if (stencil and smask != 0) v.stencil else null;
+        const dval = unorm(clamp01(d), 24);
+        const sval = (@as(u32, @bitCast(s)) & 0xff) << 24;
+        if (dimg != null and simg != null and dimg.? == simg.?) {
+            const write = 0x00ff_ffff | (smask << 24);
+            return c.eng.fill(dimg.?, a, dval | sval, ~write);
+        }
+        if (dimg) |im| c.eng.fill(im, a, dval, 0xff00_0000);
+        if (simg) |im| c.eng.fill(im, a, sval, ~(smask << 24));
+    }
+
+    /// glClearBufferfv: COLOR (buffer: a draw buffer) or DEPTH (0).
+    pub fn clearBufferf(c: *Context, buffer: u32, drawbuffer: i32, value: []const f32) void {
+        switch (buffer) {
+            g.COLOR => {
+                if (drawbuffer < 0 or drawbuffer >= MAX_COLOR) return c.fail(g.INVALID_VALUE);
+                var v = c.drawView() orelse return;
+                if (c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0) return;
+                const img = v.color[@intCast(drawbuffer)] orelse return;
+                const a = c.clearRect(&v);
+                if (!a.empty()) c.fillColor(img, a, value[0..4].*);
+            },
+            g.DEPTH => {
+                if (drawbuffer != 0) return c.fail(g.INVALID_VALUE);
+                var v = c.drawView() orelse return;
+                if (c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0) return;
+                const a = c.clearRect(&v);
+                if (!a.empty()) c.fillDepthStencil(&v, a, true, value[0], false, 0);
+            },
+            else => c.fail(g.INVALID_ENUM),
+        }
+    }
+
+    /// glClearBufferiv: STENCIL (0), or COLOR (integer buffers: none here,
+    /// so nothing, as for any normalized buffer).
+    pub fn clearBufferi(c: *Context, buffer: u32, drawbuffer: i32, value: []const i32) void {
+        switch (buffer) {
+            g.STENCIL => {
+                if (drawbuffer != 0) return c.fail(g.INVALID_VALUE);
+                var v = c.drawView() orelse return;
+                if (c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0) return;
+                const a = c.clearRect(&v);
+                if (!a.empty()) c.fillDepthStencil(&v, a, false, 0, true, value[0]);
+            },
+            g.COLOR => if (drawbuffer < 0 or drawbuffer >= MAX_COLOR) c.fail(g.INVALID_VALUE),
+            else => c.fail(g.INVALID_ENUM),
+        }
+    }
+
+    /// glClearBufferuiv: COLOR only (integer buffers: none here).
+    pub fn clearBufferu(c: *Context, buffer: u32, drawbuffer: i32) void {
+        if (buffer != g.COLOR) return c.fail(g.INVALID_ENUM);
+        if (drawbuffer < 0 or drawbuffer >= MAX_COLOR) c.fail(g.INVALID_VALUE);
+    }
+
+    /// glClearBufferfi: DEPTH_STENCIL (0).
+    pub fn clearBufferfi(c: *Context, buffer: u32, drawbuffer: i32, depth: f32, stencil: i32) void {
+        if (buffer != g.DEPTH_STENCIL) return c.fail(g.INVALID_ENUM);
+        if (drawbuffer != 0) return c.fail(g.INVALID_VALUE);
+        var v = c.drawView() orelse return;
+        if (c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0) return;
+        const a = c.clearRect(&v);
+        if (!a.empty()) c.fillDepthStencil(&v, a, true, depth, true, stencil);
+    }
+
+    // ── Reading pixels ─────────────────────────────────────────────────────
+
+    /// glReadPixels: pixels outside the framebuffer are left as they were.
+    pub fn readPixels(c: *Context, x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*anyopaque) void {
+        if (w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+        const want = switch (clientFormat(format, ty)) {
+            .ok => |f| f,
+            .err => |e| return c.fail(e),
+        };
+        const v = c.view(c.read_fb, true);
+        if (v.status != g.FRAMEBUFFER_COMPLETE) return c.fail(g.INVALID_FRAMEBUFFER_OPERATION);
+        const src = v.read orelse return c.fail(g.INVALID_OPERATION);
+        const uw: u32 = @intCast(w);
+        const uh: u32 = @intCast(h);
+        const l = c.pack.layout(uw);
+        const span = spanOf(l.first, l.row, uw, uh);
+        if (span == 0) return;
+        var pbo: ?*Buf = null;
+        const dst: []u8 = if (c.bufs.pack != 0) blk: {
+            const b = madeIn(Buf, &c.objs.bufs, c.bufs.pack) orelse return c.fail(g.INVALID_OPERATION);
+            const off = addr(pixels);
+            if (off > b.size or span > b.size - off) return c.fail(g.INVALID_OPERATION);
+            pbo = b;
+            break :blk c.eng.hostView(&b.store, off, span);
+        } else blk: {
+            const p = pixels orelse return;
+            break :blk @as([*]u8, @ptrCast(p))[0..span];
+        };
+        // (the part inside the framebuffer)
+        const x0: i64 = @max(x, 0);
+        const y0: i64 = @max(y, 0);
+        const x1: i64 = @min(@as(i64, x) + w, v.width);
+        const y1: i64 = @min(@as(i64, y) + h, v.height);
+        if (x1 <= x0 or y1 <= y0) return;
+        const at = l.first + @as(usize, @intCast(y0 - y)) * l.row + @as(usize, @intCast(x0 - x)) * 4;
+        c.eng.read(src, @intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0), dst[at..], l.row, want);
+        if (pbo) |b| c.eng.wrote(&b.store, addr(pixels), span);
+    }
+
+    // ── Textures ───────────────────────────────────────────────────────────
+
+    pub fn genTextures(c: *Context, out: []u32) void {
+        if (!genIn(Tex, &c.objs.tex, out)) c.fail(g.OUT_OF_MEMORY);
+    }
+
+    pub fn isTexture(c: *Context, name: u32) bool {
+        return madeIn(Tex, &c.objs.tex, name) != null;
+    }
+
+    pub fn activeTexture(c: *Context, unit: u32) void {
+        if (unit < g.TEXTURE0 or unit >= g.TEXTURE0 + MAX_UNITS) return c.fail(g.INVALID_ENUM);
+        c.unit = unit - g.TEXTURE0;
+    }
+
+    pub fn bindTexture(c: *Context, target: u32, name: u32) void {
+        if (target != g.TEXTURE_2D) return c.fail(g.INVALID_ENUM);
+        if (name != 0) {
+            const t = slotIn(Tex, &c.objs.tex, name) orelse return c.fail(g.OUT_OF_MEMORY);
+            if (t.made and t.target != target) return c.fail(g.INVALID_OPERATION);
+            const m = makeIn(Tex, &c.objs.tex, name) orelse return c.fail(g.OUT_OF_MEMORY);
+            m.target = target;
+        }
+        c.tex2d[c.unit] = name;
+    }
+
+    /// The texture bound to `target` on the active unit.
+    fn boundTex(c: *Context, target: u32) ?*Tex {
+        if (target != g.TEXTURE_2D) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        const name = c.tex2d[c.unit];
+        if (name == 0) return &c.default_tex;
+        return madeIn(Tex, &c.objs.tex, name);
+    }
+
+    pub fn deleteTextures(c: *Context, names: []const u32) void {
+        for (names) |name| {
+            const t = madeIn(Tex, &c.objs.tex, name) orelse {
+                if (slotIn(Tex, &c.objs.tex, name)) |s| s.named = false;
+                continue;
+            };
+            for (&c.tex2d) |*b| {
+                if (b.* == name) b.* = 0;
+            }
+            // (detached from the framebuffers bound here, as GL says)
+            c.detachFromBound(.tex, name);
+            t.named = false;
+            t.made = false;
+            if (t.refs > 0) {
+                t.orphan = true;
+            } else c.dropTex(t);
+        }
+    }
+
+    fn dropTex(c: *Context, t: *Tex) void {
+        c.eng.freeImage(&t.img);
+        t.* = .{};
+    }
+
+    /// The texture's level 0 becomes w x h of `fmt` (none for 0 x 0).
+    fn defineTex(c: *Context, t: *Tex, w: u32, h: u32, fmt: Format, internal: u32) bool {
+        if (t.img.live() and t.img.width == w and t.img.height == h and t.img.format == fmt) {
+            t.internal = internal;
+            return true;
+        }
+        c.eng.freeImage(&t.img);
+        t.internal = internal;
+        t.levels = 1;
+        if (w == 0 or h == 0) return true;
+        t.img = c.eng.newImage(w, h, fmt) orelse {
+            c.fail(g.OUT_OF_MEMORY);
+            return false;
+        };
+        return true;
+    }
+
+    /// The pixels a texture upload reads: client memory, or the unpack
+    /// buffer's at the offset `pixels` gives. Null with nothing to read
+    /// (no pointer), or after an error.
+    fn unpackSource(c: *Context, pixels: ?*const anyopaque, w: u32, h: u32) ?struct { bytes: []const u8, row: usize } {
+        const l = c.unpack.layout(w);
+        const span = spanOf(l.first, l.row, w, h);
+        if (span == 0) return null;
+        if (c.bufs.unpack != 0) {
+            const b = madeIn(Buf, &c.objs.bufs, c.bufs.unpack) orelse {
+                c.fail(g.INVALID_OPERATION);
+                return null;
+            };
+            const off = addr(pixels);
+            if (off > b.size or span > b.size - off) {
+                c.fail(g.INVALID_OPERATION);
+                return null;
+            }
+            const all = c.eng.hostView(&b.store, off, span);
+            return .{ .bytes = all[l.first..], .row = l.row };
+        }
+        const p = pixels orelse return null;
+        return .{ .bytes = @as([*]const u8, @ptrCast(p))[l.first..span], .row = l.row };
+    }
+
+    pub fn texImage2D(c: *Context, target: u32, level: i32, internal: i32, w: i32, h: i32, border: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
+        const t = c.boundTex(target) orelse return;
+        if (level < 0 or w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or border != 0) return c.fail(g.INVALID_VALUE);
+        // (level 0 only, for now: mipmaps come with sampling)
+        if (level > 0) return c.fail(g.INVALID_VALUE);
+        const fmt = switch (clientFormat(format, ty)) {
+            .ok => |f| f,
+            .err => |e| return c.fail(e),
+        };
+        const ifmt: u32 = @bitCast(internal);
+        const fits = switch (fmt) {
+            .rgba8 => ifmt == g.RGBA or ifmt == g.RGBA8,
+            .bgra8 => ifmt == g.BGRA_EXT or ifmt == g.BGRA8_EXT,
+            .d24s8 => false,
+        };
+        if (!fits) return c.fail(g.INVALID_OPERATION);
+        if (t.immutable) return c.fail(g.INVALID_OPERATION);
+        const uw: u32 = @intCast(w);
+        const uh: u32 = @intCast(h);
+        if (!c.defineTex(t, uw, uh, fmt, ifmt)) return;
+        const src = c.unpackSource(pixels, uw, uh) orelse return;
+        c.eng.write(&t.img, 0, 0, uw, uh, src.bytes, src.row, fmt);
+    }
+
+    pub fn texSubImage2D(c: *Context, target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
+        const t = c.boundTex(target) orelse return;
+        if (level != 0 or x < 0 or y < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+        const fmt = switch (clientFormat(format, ty)) {
+            .ok => |f| f,
+            .err => |e| return c.fail(e),
+        };
+        if (@as(i64, x) + w > t.img.width or @as(i64, y) + h > t.img.height) return c.fail(g.INVALID_VALUE);
+        if (w == 0 or h == 0) return;
+        if (fmt != t.img.format) return c.fail(g.INVALID_OPERATION);
+        const src = c.unpackSource(pixels, @intCast(w), @intCast(h)) orelse return;
+        c.eng.write(&t.img, @intCast(x), @intCast(y), @intCast(w), @intCast(h), src.bytes, src.row, fmt);
+    }
+
+    pub fn texStorage2D(c: *Context, target: u32, levels: i32, internal: u32, w: i32, h: i32) void {
+        const t = c.boundTex(target) orelse return;
+        if (levels < 1 or w < 1 or h < 1 or w > MAX_SIZE or h > MAX_SIZE) return c.fail(g.INVALID_VALUE);
+        const fmt: Format = switch (internal) {
+            g.RGBA8 => .rgba8,
+            g.BGRA8_EXT => .bgra8,
+            else => return c.fail(g.INVALID_ENUM),
+        };
+        const most = std.math.log2_int(u32, @intCast(@max(w, h))) + 1;
+        if (levels > most) return c.fail(g.INVALID_OPERATION);
+        if (t.immutable or t == &c.default_tex) return c.fail(g.INVALID_OPERATION);
+        if (!c.defineTex(t, @intCast(w), @intCast(h), fmt, internal)) return;
+        // (levels past 0 are counted, not stored, until sampling needs them)
+        t.levels = @intCast(levels);
+        t.immutable = true;
+    }
+
+    pub fn texParameteri(c: *Context, target: u32, pname: u32, param: i32) void {
+        const t = c.boundTex(target) orelse return;
+        const p: u32 = @bitCast(param);
+        const filter_min = switch (p) {
+            g.NEAREST, g.LINEAR, g.NEAREST_MIPMAP_NEAREST, g.LINEAR_MIPMAP_NEAREST, g.NEAREST_MIPMAP_LINEAR, g.LINEAR_MIPMAP_LINEAR => true,
+            else => false,
+        };
+        const wrap = p == g.REPEAT or p == g.CLAMP_TO_EDGE or p == g.MIRRORED_REPEAT;
+        switch (pname) {
+            g.TEXTURE_MIN_FILTER => if (filter_min) {
+                t.params.min = p;
+            } else c.fail(g.INVALID_ENUM),
+            g.TEXTURE_MAG_FILTER => if (p == g.NEAREST or p == g.LINEAR) {
+                t.params.mag = p;
+            } else c.fail(g.INVALID_ENUM),
+            g.TEXTURE_WRAP_S => if (wrap) {
+                t.params.wrap_s = p;
+            } else c.fail(g.INVALID_ENUM),
+            g.TEXTURE_WRAP_T => if (wrap) {
+                t.params.wrap_t = p;
+            } else c.fail(g.INVALID_ENUM),
+            g.TEXTURE_WRAP_R => if (wrap) {
+                t.params.wrap_r = p;
+            } else c.fail(g.INVALID_ENUM),
+            g.TEXTURE_BASE_LEVEL => if (param >= 0) {
+                t.params.base_level = param;
+            } else c.fail(g.INVALID_VALUE),
+            g.TEXTURE_MAX_LEVEL => if (param >= 0) {
+                t.params.max_level = param;
+            } else c.fail(g.INVALID_VALUE),
+            else => c.fail(g.INVALID_ENUM),
+        }
+    }
+
+    pub fn getTexParameteri(c: *Context, target: u32, pname: u32) ?i32 {
+        const t = c.boundTex(target) orelse return null;
+        const v: u32 = switch (pname) {
+            g.TEXTURE_MIN_FILTER => t.params.min,
+            g.TEXTURE_MAG_FILTER => t.params.mag,
+            g.TEXTURE_WRAP_S => t.params.wrap_s,
+            g.TEXTURE_WRAP_T => t.params.wrap_t,
+            g.TEXTURE_WRAP_R => t.params.wrap_r,
+            g.TEXTURE_BASE_LEVEL => @bitCast(t.params.base_level),
+            g.TEXTURE_MAX_LEVEL => @bitCast(t.params.max_level),
+            g.TEXTURE_IMMUTABLE_FORMAT => @intFromBool(t.immutable),
+            g.TEXTURE_IMMUTABLE_LEVELS => if (t.immutable) t.levels else 0,
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+        return @bitCast(v);
+    }
+
+    /// The read framebuffer's read image, complete; else the error.
+    fn readSource(c: *Context) ?struct { img: *Image, v: View } {
+        const v = c.view(c.read_fb, true);
+        if (v.status != g.FRAMEBUFFER_COMPLETE) {
+            c.fail(g.INVALID_FRAMEBUFFER_OPERATION);
+            return null;
+        }
+        const img = v.read orelse {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        };
+        return .{ .img = img, .v = v };
+    }
+
+    /// The part of (x, y, w, h) inside the read framebuffer copied to
+    /// (dx, dy) of `dst` and on.
+    fn copyFrom(c: *Context, src: *Image, v: View, x: i32, y: i32, w: i32, h: i32, dst: *Image, dx: i32, dy: i32) void {
+        const x0: i64 = @max(x, 0);
+        const y0: i64 = @max(y, 0);
+        const x1: i64 = @min(@as(i64, x) + w, v.width);
+        const y1: i64 = @min(@as(i64, y) + h, v.height);
+        if (x1 <= x0 or y1 <= y0) return;
+        c.eng.copy(src, @intCast(x0), @intCast(y0), dst, @intCast(dx + (x0 - x)), @intCast(dy + (y0 - y)), @intCast(x1 - x0), @intCast(y1 - y0));
+    }
+
+    pub fn copyTexSubImage2D(c: *Context, target: u32, level: i32, dx: i32, dy: i32, x: i32, y: i32, w: i32, h: i32) void {
+        const t = c.boundTex(target) orelse return;
+        if (level != 0 or dx < 0 or dy < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+        if (@as(i64, dx) + w > t.img.width or @as(i64, dy) + h > t.img.height) return c.fail(g.INVALID_VALUE);
+        const s = c.readSource() orelse return;
+        if (!s.img.format.isColor()) return c.fail(g.INVALID_OPERATION);
+        if (s.img == &t.img) return c.fail(g.INVALID_OPERATION);
+        c.copyFrom(s.img, s.v, x, y, w, h, &t.img, dx, dy);
+    }
+
+    pub fn copyTexImage2D(c: *Context, target: u32, level: i32, internal: u32, x: i32, y: i32, w: i32, h: i32, border: i32) void {
+        const t = c.boundTex(target) orelse return;
+        if (level != 0 or w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or border != 0) return c.fail(g.INVALID_VALUE);
+        const fmt: Format = switch (internal) {
+            g.RGBA, g.RGBA8 => .rgba8,
+            g.BGRA_EXT, g.BGRA8_EXT => .bgra8,
+            g.RGB, g.ALPHA, g.LUMINANCE, g.LUMINANCE_ALPHA, g.RGB8, g.RGB565, g.RGBA4, g.RGB5_A1 => return c.fail(g.INVALID_OPERATION),
+            else => return c.fail(g.INVALID_ENUM),
+        };
+        if (t.immutable) return c.fail(g.INVALID_OPERATION);
+        const s = c.readSource() orelse return;
+        if (!s.img.format.isColor() or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
+        if (!c.defineTex(t, @intCast(w), @intCast(h), fmt, internal)) return;
+        c.copyFrom(s.img, s.v, x, y, w, h, &t.img, 0, 0);
+    }
+
+    // ── Buffers ────────────────────────────────────────────────────────────
+
+    pub fn genBuffers(c: *Context, out: []u32) void {
+        if (!genIn(Buf, &c.objs.bufs, out)) c.fail(g.OUT_OF_MEMORY);
+    }
+
+    pub fn isBuffer(c: *Context, name: u32) bool {
+        return madeIn(Buf, &c.objs.bufs, name) != null;
+    }
+
+    fn bindingOf(c: *Context, target: u32) ?*u32 {
+        return switch (target) {
+            g.ARRAY_BUFFER => &c.bufs.array,
+            g.ELEMENT_ARRAY_BUFFER => &c.bufs.element,
+            g.PIXEL_PACK_BUFFER => &c.bufs.pack,
+            g.PIXEL_UNPACK_BUFFER => &c.bufs.unpack,
+            g.UNIFORM_BUFFER => &c.bufs.uniform,
+            g.COPY_READ_BUFFER => &c.bufs.copy_read,
+            g.COPY_WRITE_BUFFER => &c.bufs.copy_write,
+            g.TRANSFORM_FEEDBACK_BUFFER => &c.bufs.xfb,
+            else => null,
+        };
+    }
+
+    pub fn bindBuffer(c: *Context, target: u32, name: u32) void {
+        const b = c.bindingOf(target) orelse return c.fail(g.INVALID_ENUM);
+        if (name != 0 and makeIn(Buf, &c.objs.bufs, name) == null) return c.fail(g.OUT_OF_MEMORY);
+        b.* = name;
+    }
+
+    fn boundBuf(c: *Context, target: u32) ?*Buf {
+        const b = c.bindingOf(target) orelse {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        };
+        return madeIn(Buf, &c.objs.bufs, b.*) orelse {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        };
+    }
+
+    pub fn bufferData(c: *Context, target: u32, size: isize, data: ?*const anyopaque, usage: u32) void {
+        if (c.bindingOf(target) == null) return c.fail(g.INVALID_ENUM);
+        if (size < 0) return c.fail(g.INVALID_VALUE);
+        if (!validUsage(usage)) return c.fail(g.INVALID_ENUM);
+        const b = c.boundBuf(target) orelse return;
+        const n: usize = @intCast(size);
+        // (new storage: what the GPU may still read of the old goes once it is done)
+        c.eng.freeImage(&b.store);
+        b.size = 0;
+        b.usage = usage;
+        if (n == 0) return;
+        b.store = c.eng.newBuffer(n) orelse return c.fail(g.OUT_OF_MEMORY);
+        b.size = n;
+        if (data) |p| c.eng.writeBytes(&b.store, 0, @as([*]const u8, @ptrCast(p))[0..n]);
+    }
+
+    pub fn bufferSubData(c: *Context, target: u32, offset: isize, size: isize, data: ?*const anyopaque) void {
+        if (c.bindingOf(target) == null) return c.fail(g.INVALID_ENUM);
+        if (offset < 0 or size < 0) return c.fail(g.INVALID_VALUE);
+        const b = c.boundBuf(target) orelse return;
+        const off: usize = @intCast(offset);
+        const n: usize = @intCast(size);
+        if (off > b.size or n > b.size - off) return c.fail(g.INVALID_VALUE);
+        const p = data orelse return;
+        c.eng.writeBytes(&b.store, off, @as([*]const u8, @ptrCast(p))[0..n]);
+    }
+
+    pub fn getBufferParameter(c: *Context, target: u32, pname: u32) ?i64 {
+        const b = c.boundBuf(target) orelse return null;
+        return switch (pname) {
+            g.BUFFER_SIZE => @intCast(b.size),
+            g.BUFFER_USAGE => b.usage,
+            g.BUFFER_MAPPED, g.BUFFER_ACCESS_FLAGS, g.BUFFER_MAP_LENGTH, g.BUFFER_MAP_OFFSET => 0,
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+    }
+
+    pub fn deleteBuffers(c: *Context, names: []const u32) void {
+        for (names) |name| {
+            const b = madeIn(Buf, &c.objs.bufs, name) orelse {
+                if (slotIn(Buf, &c.objs.bufs, name)) |s| s.named = false;
+                continue;
+            };
+            inline for (@typeInfo(BufBinds).@"struct".field_names) |f| {
+                if (@field(c.bufs, f) == name) @field(c.bufs, f) = 0;
+            }
+            c.eng.freeImage(&b.store);
+            b.* = .{};
+        }
+    }
+
+    // ── Renderbuffers ──────────────────────────────────────────────────────
+
+    pub fn genRenderbuffers(c: *Context, out: []u32) void {
+        if (!genIn(Rb, &c.objs.rbs, out)) c.fail(g.OUT_OF_MEMORY);
+    }
+
+    pub fn isRenderbuffer(c: *Context, name: u32) bool {
+        return madeIn(Rb, &c.objs.rbs, name) != null;
+    }
+
+    pub fn bindRenderbuffer(c: *Context, target: u32, name: u32) void {
+        if (target != g.RENDERBUFFER) return c.fail(g.INVALID_ENUM);
+        if (name != 0 and makeIn(Rb, &c.objs.rbs, name) == null) return c.fail(g.OUT_OF_MEMORY);
+        c.rb = name;
+    }
+
+    pub fn renderbufferStorage(c: *Context, target: u32, samples: i32, internal: u32, w: i32, h: i32) void {
+        if (target != g.RENDERBUFFER) return c.fail(g.INVALID_ENUM);
+        const fmt = rbFormat(internal) orelse return c.fail(g.INVALID_ENUM);
+        if (w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or samples < 0) return c.fail(g.INVALID_VALUE);
+        if (samples > 1) return c.fail(g.INVALID_OPERATION);
+        const rb = madeIn(Rb, &c.objs.rbs, c.rb) orelse return c.fail(g.INVALID_OPERATION);
+        c.eng.freeImage(&rb.img);
+        rb.internal = internal;
+        rb.samples = 0;
+        if (w == 0 or h == 0) return;
+        rb.img = c.eng.newImage(@intCast(w), @intCast(h), fmt) orelse return c.fail(g.OUT_OF_MEMORY);
+    }
+
+    pub fn getRenderbufferParameter(c: *Context, target: u32, pname: u32) ?i32 {
+        if (target != g.RENDERBUFFER) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        const rb = madeIn(Rb, &c.objs.rbs, c.rb) orelse {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        };
+        const color = rb.img.live() and rb.img.format.isColor();
+        return switch (pname) {
+            g.RENDERBUFFER_WIDTH => @intCast(rb.img.width),
+            g.RENDERBUFFER_HEIGHT => @intCast(rb.img.height),
+            g.RENDERBUFFER_INTERNAL_FORMAT => @bitCast(rb.internal),
+            g.RENDERBUFFER_SAMPLES => @intCast(rb.samples),
+            g.RENDERBUFFER_RED_SIZE, g.RENDERBUFFER_RED_SIZE + 1, g.RENDERBUFFER_RED_SIZE + 2, g.RENDERBUFFER_RED_SIZE + 3 => if (color) 8 else 0,
+            g.RENDERBUFFER_RED_SIZE + 4 => if (rb.img.live() and hasDepth(rb.internal)) 24 else 0,
+            g.RENDERBUFFER_STENCIL_SIZE => if (rb.img.live() and hasStencil(rb.internal)) 8 else 0,
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+    }
+
+    pub fn deleteRenderbuffers(c: *Context, names: []const u32) void {
+        for (names) |name| {
+            const rb = madeIn(Rb, &c.objs.rbs, name) orelse {
+                if (slotIn(Rb, &c.objs.rbs, name)) |s| s.named = false;
+                continue;
+            };
+            if (c.rb == name) c.rb = 0;
+            c.detachFromBound(.rb, name);
+            rb.named = false;
+            rb.made = false;
+            if (rb.refs > 0) {
+                rb.orphan = true;
+            } else {
+                c.eng.freeImage(&rb.img);
+                rb.* = .{};
+            }
+        }
+    }
+
+    // ── Framebuffers ───────────────────────────────────────────────────────
+
+    pub fn genFramebuffers(c: *Context, out: []u32) void {
+        if (!genIn(Fbo, &c.fbos, out)) c.fail(g.OUT_OF_MEMORY);
+    }
+
+    pub fn isFramebuffer(c: *Context, name: u32) bool {
+        return madeIn(Fbo, &c.fbos, name) != null;
+    }
+
+    pub fn bindFramebuffer(c: *Context, target: u32, name: u32) void {
+        if (target != g.FRAMEBUFFER and target != g.READ_FRAMEBUFFER and target != g.DRAW_FRAMEBUFFER) return c.fail(g.INVALID_ENUM);
+        if (name != 0 and makeIn(Fbo, &c.fbos, name) == null) return c.fail(g.OUT_OF_MEMORY);
+        if (target != g.READ_FRAMEBUFFER) c.draw_fb = name;
+        if (target != g.DRAW_FRAMEBUFFER) c.read_fb = name;
+    }
+
+    /// The framebuffer bound to `target`, by name; null with an error.
+    fn fbTarget(c: *Context, target: u32) ?u32 {
+        return switch (target) {
+            g.FRAMEBUFFER, g.DRAW_FRAMEBUFFER => c.draw_fb,
+            g.READ_FRAMEBUFFER => c.read_fb,
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+    }
+
+    /// The attachment points `attachment` names in f (two for
+    /// DEPTH_STENCIL_ATTACHMENT), or null with an error.
+    fn points(c: *Context, f: *Fbo, attachment: u32) ?[2]?*Attach {
+        if (attachment >= g.COLOR_ATTACHMENT0 and attachment < g.COLOR_ATTACHMENT0 + 32) {
+            const i = attachment - g.COLOR_ATTACHMENT0;
+            if (i >= MAX_COLOR) {
+                c.fail(g.INVALID_OPERATION);
+                return null;
+            }
+            return .{ &f.color[i], null };
+        }
+        return switch (attachment) {
+            g.DEPTH_ATTACHMENT => .{ &f.depth, null },
+            g.STENCIL_ATTACHMENT => .{ &f.stencil, null },
+            g.DEPTH_STENCIL_ATTACHMENT => .{ &f.depth, &f.stencil },
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+    }
+
+    fn refsOf(c: *Context, a: Attach) ?*u32 {
+        return switch (a.kind) {
+            .none => null,
+            .tex => if (slotIn(Tex, &c.objs.tex, a.name)) |t| &t.refs else null,
+            .rb => if (slotIn(Rb, &c.objs.rbs, a.name)) |r| &r.refs else null,
+        };
+    }
+
+    /// `p` holds `a` from now on: the old object let go (freed, if it was
+    /// deleted and nothing else holds it), the new one held.
+    fn setAttach(c: *Context, p: *Attach, a: Attach) void {
+        if (c.refsOf(a)) |n| n.* += 1;
+        const old = p.*;
+        p.* = a;
+        const n = c.refsOf(old) orelse return;
+        n.* -= 1;
+        if (n.* != 0) return;
+        switch (old.kind) {
+            .none => {},
+            .tex => {
+                const t = slotIn(Tex, &c.objs.tex, old.name).?;
+                if (t.orphan) c.dropTex(t);
+            },
+            .rb => {
+                const r = slotIn(Rb, &c.objs.rbs, old.name).?;
+                if (r.orphan) {
+                    c.eng.freeImage(&r.img);
+                    r.* = .{};
+                }
+            },
+        }
+    }
+
+    fn detachAll(c: *Context, f: *Fbo) void {
+        for (&f.color) |*p| c.setAttach(p, .{});
+        c.setAttach(&f.depth, .{});
+        c.setAttach(&f.stencil, .{});
+    }
+
+    /// Object `name` detached from the framebuffers bound here.
+    fn detachFromBound(c: *Context, kind: Attach.Kind, name: u32) void {
+        for ([2]u32{ c.draw_fb, c.read_fb }, 0..) |fb, i| {
+            if (fb == 0 or (i == 1 and fb == c.draw_fb)) continue;
+            const f = &c.fbos[fb - 1];
+            for (&f.color) |*p| {
+                if (p.kind == kind and p.name == name) c.setAttach(p, .{});
+            }
+            if (f.depth.kind == kind and f.depth.name == name) c.setAttach(&f.depth, .{});
+            if (f.stencil.kind == kind and f.stencil.name == name) c.setAttach(&f.stencil, .{});
+        }
+    }
+
+    pub fn framebufferTexture2D(c: *Context, target: u32, attachment: u32, textarget: u32, name: u32, level: i32) void {
+        const fb = c.fbTarget(target) orelse return;
+        if (fb == 0) return c.fail(g.INVALID_OPERATION);
+        const pts = c.points(&c.fbos[fb - 1], attachment) orelse return;
+        var a = Attach{};
+        if (name != 0) {
+            if (textarget != g.TEXTURE_2D) return c.fail(g.INVALID_ENUM);
+            const t = madeIn(Tex, &c.objs.tex, name) orelse return c.fail(g.INVALID_OPERATION);
+            if (t.target != g.TEXTURE_2D) return c.fail(g.INVALID_OPERATION);
+            if (level != 0) return c.fail(g.INVALID_VALUE);
+            a = .{ .kind = .tex, .name = name };
+        }
+        for (pts) |p| {
+            if (p) |x| c.setAttach(x, a);
+        }
+    }
+
+    pub fn framebufferRenderbuffer(c: *Context, target: u32, attachment: u32, rbtarget: u32, name: u32) void {
+        const fb = c.fbTarget(target) orelse return;
+        if (rbtarget != g.RENDERBUFFER) return c.fail(g.INVALID_ENUM);
+        if (fb == 0) return c.fail(g.INVALID_OPERATION);
+        const pts = c.points(&c.fbos[fb - 1], attachment) orelse return;
+        var a = Attach{};
+        if (name != 0) {
+            _ = madeIn(Rb, &c.objs.rbs, name) orelse return c.fail(g.INVALID_OPERATION);
+            a = .{ .kind = .rb, .name = name };
+        }
+        for (pts) |p| {
+            if (p) |x| c.setAttach(x, a);
+        }
+    }
+
+    pub fn checkFramebufferStatus(c: *Context, target: u32) u32 {
+        const fb = c.fbTarget(target) orelse return 0;
+        return c.view(fb, target == g.READ_FRAMEBUFFER).status;
+    }
+
+    pub fn deleteFramebuffers(c: *Context, names: []const u32) void {
+        for (names) |name| {
+            const f = madeIn(Fbo, &c.fbos, name) orelse {
+                if (slotIn(Fbo, &c.fbos, name)) |s| s.named = false;
+                continue;
+            };
+            if (c.draw_fb == name) c.draw_fb = 0;
+            if (c.read_fb == name) c.read_fb = 0;
+            c.detachAll(f);
+            f.* = .{};
+        }
+    }
+
+    pub fn drawBuffers(c: *Context, bufs: []const u32) void {
+        if (bufs.len > MAX_COLOR) return c.fail(g.INVALID_VALUE);
+        if (c.draw_fb == 0) {
+            if (bufs.len != 1 or (bufs[0] != g.BACK and bufs[0] != g.NONE)) return c.fail(g.INVALID_OPERATION);
+            c.default_draw = bufs[0];
+            return;
+        }
+        for (bufs, 0..) |b, i| {
+            if (b != g.NONE and b != g.COLOR_ATTACHMENT0 + i) return c.fail(g.INVALID_OPERATION);
+        }
+        const f = &c.fbos[c.draw_fb - 1];
+        for (&f.draw, 0..) |*d, i| d.* = if (i < bufs.len) bufs[i] else g.NONE;
+    }
+
+    pub fn readBuffer(c: *Context, src: u32) void {
+        if (c.read_fb == 0) {
+            if (src != g.BACK and src != g.NONE) return c.fail(g.INVALID_OPERATION);
+            c.default_read = src;
+            return;
+        }
+        if (src != g.NONE and (src < g.COLOR_ATTACHMENT0 or src >= g.COLOR_ATTACHMENT0 + MAX_COLOR)) return c.fail(g.INVALID_OPERATION);
+        c.fbos[c.read_fb - 1].read = src;
+    }
+
+    /// glInvalidateFramebuffer: checked, then nothing (a hint the tiled
+    /// rasterizer will use).
+    pub fn invalidateFramebuffer(c: *Context, target: u32, attachments: []const u32) void {
+        const fb = c.fbTarget(target) orelse return;
+        for (attachments) |a| {
+            const ok = if (fb == 0)
+                a == g.COLOR or a == g.DEPTH or a == g.STENCIL
+            else
+                a == g.DEPTH_ATTACHMENT or a == g.STENCIL_ATTACHMENT or a == g.DEPTH_STENCIL_ATTACHMENT or
+                    (a >= g.COLOR_ATTACHMENT0 and a < g.COLOR_ATTACHMENT0 + MAX_COLOR);
+            if (!ok) return c.fail(if (fb != 0 and a >= g.COLOR_ATTACHMENT0 and a < g.COLOR_ATTACHMENT0 + 32) g.INVALID_OPERATION else g.INVALID_ENUM);
+        }
+    }
+
+    pub fn getFramebufferAttachmentParameter(c: *Context, target: u32, attachment: u32, pname: u32) ?i32 {
+        const fb = c.fbTarget(target) orelse return null;
+        if (fb == 0) {
+            if (attachment != g.BACK and attachment != g.DEPTH and attachment != g.STENCIL) {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            }
+            return switch (pname) {
+                g.FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE => @intCast(g.FRAMEBUFFER_DEFAULT),
+                else => 0,
+            };
+        }
+        const pts = c.points(&c.fbos[fb - 1], attachment) orelse return null;
+        const a = pts[0].?.*;
+        return switch (pname) {
+            g.FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE => switch (a.kind) {
+                .none => @intCast(g.NONE),
+                .tex => @intCast(g.TEXTURE),
+                .rb => @intCast(g.RENDERBUFFER),
+            },
+            g.FRAMEBUFFER_ATTACHMENT_OBJECT_NAME => @intCast(a.name),
+            g.FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL => 0,
+            g.FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE => @intCast(g.UNSIGNED_NORMALIZED),
+            g.FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING => @intCast(g.LINEAR),
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+    }
+};
+
+/// A client pointer as a number (an offset into a bound pack or unpack
+/// buffer).
+fn addr(p: ?*const anyopaque) usize {
+    return if (p) |x| @intFromPtr(x) else 0;
+}
+
+fn clamp01(x: f32) f32 {
+    return if (x != x) 0 else std.math.clamp(x, 0, 1);
+}
+
+test "gles: float to unorm rounds to nearest even, as Mesa" {
+    try std.testing.expectEqual(@as(u32, 0), unorm(0, 8));
+    try std.testing.expectEqual(@as(u32, 255), unorm(1, 8));
+    try std.testing.expectEqual(@as(u32, 128), unorm(0.5, 8)); // 127.5: to 128 (even)
+    try std.testing.expectEqual(@as(u32, 0xff_ffff), unorm(1, 24));
+    try std.testing.expectEqual(@as(u32, 0), unorm(std.math.nan(f32), 8));
+    try std.testing.expectEqual(@as(u32, 0x8040_2010), packColor(.rgba8, .{ 16.0 / 255.0, 32.0 / 255.0, 64.0 / 255.0, 128.0 / 255.0 }));
+    try std.testing.expectEqual(@as(u32, 0x8010_2040), packColor(.bgra8, .{ 16.0 / 255.0, 32.0 / 255.0, 64.0 / 255.0, 128.0 / 255.0 }));
+    try std.testing.expectEqual(@as(u32, 0xff00_ff00), colorKeep(.rgba8, .{ true, false, true, false }));
+    try std.testing.expectEqual(@as(u32, 0x00ff_0000), colorKeep(.bgra8, .{ false, true, true, true }));
+}

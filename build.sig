@@ -1124,6 +1124,31 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // ── gfxapi: Galaxy's GPU driver for apps (OpenGL ES over KIR and gpu.Device,
+    //    Galaxy's render node), on the CPU, KIR's interpreter and the emulated Adreno ──
+    const gfxapi_module = try ctx.addModule("gfxapi", "src/gfxapi/gfxapi.sig");
+    try wire(ctx, gfxapi_module, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, gfxapi_module, "adreno", "src/adreno/adreno.sig");
+    try wire(ctx, gfxapi_module, "nvidia", "src/nvidia/nvidia.sig");
+    const test_gfxapi = try ctx.addStep("test-gfxapi", "Execute the app GPU driver's engine, GLES core, C ABI and render-node client on the CPU and emulated GPUs", &noopStep);
+    try ctx.addDependency(test_all, test_gfxapi);
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-module", "src/gfxapi/gfxapi.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-libgles", "src/gfxapi/libgles.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-gpu", "tests/test_gfxapi.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
