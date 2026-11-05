@@ -4549,8 +4549,9 @@ pub fn Binder(comptime config: types.Config) type {
                 var rel: Relation = .{};
                 var source: Source = .{ .join = item.join };
                 if (item.query != none) {
-                    // Derived tables are not LATERAL: they see enclosing blocks only.
-                    const child = try bindPlan(context, item.query, parent, env, false);
+                    // Derived tables are not LATERAL: they see enclosing blocks
+                    // only; an expanded view sees neither (it is a stored query).
+                    const child = try bindPlan(context, item.query, if (item.view) null else parent, if (item.view) null else env, false);
                     rel.plan = child;
                     source.plan = child;
                     if (plans.items[child].correlated) plans.items[id].correlated = true;
@@ -6271,17 +6272,75 @@ pub fn Binder(comptime config: types.Config) type {
             return error.UnsupportedStatement;
         }
 
+        /// CREATE VIEW / CREATE MATERIALIZED VIEW: the query is bound now
+        /// (its output columns become the relation's columns; a column list
+        /// renames them) and stored as text, expanded again by each reader.
+        /// Dependencies are the tables its plans read (and the views the
+        /// statement expanded, added by the caller).
         fn bindCreateView(context: *const Context, create: *const Ast.CreateView) Error!Bound {
-            _ = context;
-            _ = create;
-            return error.UnsupportedStatement;
+            const name = toName(context, create.name.name);
+            const namespace = try qualifierNamespace(context, create.name.schema);
+            if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace) return error.UnsupportedStatement;
+            const tag: types.CommandTag = if (create.materialized) .create_materialized_view else .create_view;
+            if (relationNameTaken(context, namespace, name.slice())) {
+                if (create.if_not_exists) return .{ .noop = tag };
+                return error.TableExists;
+            }
+            const plans = context.plans orelse return error.UnsupportedStatement;
+            plans.reset();
+            const root = try bindPlan(context, create.query, null, null, false);
+            try resolveUnknown(context, root);
+            const plan = &plans.items[root];
+            if (create.column_count > plan.count) return error.Syntax;
+            if (create.column_count != 0) {
+                const top = &context.pool.queries[create.query];
+                var star = top.set_op != .none;
+                for (top.targets[0..top.count]) |*target| star = star or target.star;
+                if (star) return error.UnsupportedStatement;
+            }
+            var out: Create = .{ .name = name, .columns = @splat(.{}), .count = plan.count, .namespace = namespace, .command = tag };
+            if (plan.count > config.columns) return error.ColumnCapacity;
+            for (0..plan.count) |index| {
+                var column: V.Column = .{ .name = plan.names[index], .data_type = dataType(plan.tys[index]), .typmod = plan.typmods[index] };
+                if (index < create.column_count) column.name = toName(context, create.columns[index]);
+                for (out.columns[0..index]) |*previous| if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
+                out.columns[index] = column;
+            }
+            const text = create.text.slice(context.source);
+            if (text.len > config.text_bytes) return error.TextCapacity;
+            out.extras.relkind = if (create.materialized) 'm' else 'v';
+            out.extras.query.len = text.len;
+            @memcpy(out.extras.query.bytes[0..text.len], text);
+            for (plans.items[0..plans.len]) |*item| for (item.sources[0..item.source_count]) |*source| {
+                const table = source.table orelse continue;
+                const oid = context.tables[table].oid;
+                var known = false;
+                for (out.extras.depends[0..out.extras.depend_count]) |existing| known = known or existing == oid;
+                if (known) continue;
+                out.extras.depends[out.extras.depend_count] = oid;
+                out.extras.depend_count += 1;
+            };
+            if (create.materialized) {
+                out.extras.populated = create.with_data;
+                if (create.with_data) out.plan = root;
+            }
+            return .{ .create_table = out };
         }
 
+        /// DROP VIEW / DROP MATERIALIZED VIEW (42809 for another kind).
         fn bindDropView(context: *const Context, drop: *const Ast.Drop, materialized: bool) Error!Bound {
-            _ = context;
-            _ = drop;
-            _ = materialized;
-            return error.UnsupportedStatement;
+            const tag: types.CommandTag = if (materialized) .drop_materialized_view else .drop_view;
+            const namespace = qualifierNamespace(context, drop.schema) catch |err| {
+                if (err == error.UndefinedSchema and drop.if_exists) return .{ .noop = tag };
+                return err;
+            };
+            const wanted = toName(context, drop.name);
+            const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse {
+                if (drop.if_exists) return .{ .noop = tag };
+                return error.TableNotFound;
+            };
+            if (found.kind != @as(u8, if (materialized) 'm' else 'v')) return error.WrongObjectType;
+            return .{ .drop_relation = .{ .slot = found.slot, .cascade = drop.cascade, .command = tag } };
         }
 
         fn bindRefresh(context: *const Context, name: Ast.TableRef, with_data: bool) Error!Bound {

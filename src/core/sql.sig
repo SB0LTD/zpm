@@ -383,7 +383,110 @@ pub fn Database(comptime config: Config) type {
             nodes: A.Pool = .{},
             plans: B.Plans = .{},
             query: X.Work = .{},
+            /// Statement text followed by the view texts it expands.
+            expansion: [config.expansion_bytes]u8 = undefined,
+            /// OIDs of the views a statement expanded (CREATE VIEW records
+            /// them as dependencies).
+            expanded: [config.tables]u32 = undefined,
+            expanded_count: usize = 0,
         };
+
+        /// A decoded identifier (quoted names keep case, others fold).
+        fn identName(source: []const u8, ident: ast.Ident) Name {
+            var out: Name = .{};
+            var text: ControlText = .{};
+            decodeIdent(source, ident, &text) catch return out;
+            const length = @min(text.len, config.name_bytes);
+            @memcpy(out.bytes[0..length], text.bytes[0..length]);
+            out.len = length;
+            return out;
+        }
+
+        /// Views are stored definitions expanded at bind time: every FROM
+        /// item naming a view (not a CTE or system view) becomes a derived
+        /// table over the view's text, appended to the statement text in
+        /// the workspace (Config.expansion_bytes, TextCapacity beyond) and
+        /// parsed with absolute spans, recursively for views over views.
+        /// Returns the source to bind and execute with.
+        fn expandRelations(workspace: *Workspace, tables: *const [config.tables]S.Table, catalog: *const K, source: []const u8, snap: Snapshot, bound_statement: *A.Statement) Error![]const u8 {
+            workspace.expanded_count = 0;
+            const pool = &workspace.nodes;
+            var length: usize = 0;
+            var block: usize = 0;
+            while (block < pool.query_len) : (block += 1) {
+                const q = &pool.queries[block];
+                for (q.items[0..q.item_count]) |*item| {
+                    if (item.query != ast.none) continue;
+                    const text = if (length == 0) source else workspace.expansion[0..length];
+                    const name = identName(text, item.name);
+                    if (item.schema == null) {
+                        var cte = false;
+                        for (pool.queries[0..pool.query_len]) |*other| for (other.ctes[0..other.cte_count]) |*definition| {
+                            if (types.same(identName(text, definition.name).slice(), name.slice())) cte = true;
+                        };
+                        if (cte) continue;
+                    }
+                    const schema_name = if (item.schema) |qualifier| identName(text, qualifier) else Name{};
+                    if (catalog_module.findView(if (item.schema != null) schema_name.slice() else null, name.slice()) != null) continue;
+                    var namespace: u32 = catalog_module.public_namespace;
+                    if (item.schema != null) {
+                        namespace = 0;
+                        for (catalog_module.namespaces) |known| if (types.same(known.name, schema_name.slice())) {
+                            namespace = known.oid;
+                        };
+                        if (namespace == 0) namespace = if (catalog.findSchema(schema_name.slice(), snap)) |found| found.oid else continue;
+                    }
+                    const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
+                    if (found.kind != 'v') continue;
+                    const view = &tables[found.slot];
+                    if (length == 0) {
+                        if (source.len > workspace.expansion.len) return error.TextCapacity;
+                        @memcpy(workspace.expansion[0..source.len], source);
+                        length = source.len;
+                    }
+                    const body_text = view.query.slice();
+                    if (body_text.len + 1 > workspace.expansion.len - length) return error.TextCapacity;
+                    workspace.expansion[length] = ' ';
+                    const start = length + 1;
+                    @memcpy(workspace.expansion[start..][0..body_text.len], body_text);
+                    length = start + body_text.len;
+                    const parsed = try P.parseQueryAt(workspace.expansion[0..length], start, length, pool);
+                    // View columns keep the names CREATE VIEW gave them.
+                    const top = &pool.queries[parsed];
+                    if (top.set_op == .none) {
+                        var star = false;
+                        for (top.targets[0..top.count]) |*output| star = star or output.star;
+                        if (!star and top.count == view.column_count) {
+                            for (top.targets[0..top.count], view.columns[0..top.count]) |*output, *column| {
+                                const label = column.name.slice();
+                                if (label.len + 3 > workspace.expansion.len - length) return error.TextCapacity;
+                                workspace.expansion[length] = ' ';
+                                workspace.expansion[length + 1] = '"';
+                                @memcpy(workspace.expansion[length + 2 ..][0..label.len], label);
+                                workspace.expansion[length + 2 + label.len] = '"';
+                                output.alias = .{ .span = .{ .start = length + 2, .len = label.len }, .quoted = true, .len = label.len };
+                                length += label.len + 3;
+                            }
+                        }
+                    }
+                    item.query = parsed;
+                    item.view = true;
+                    if (item.alias == null) item.alias = item.name;
+                    q.from = null;
+                    pool.complex = true;
+                    if (workspace.expanded_count < workspace.expanded.len) {
+                        workspace.expanded[workspace.expanded_count] = view.oid;
+                        workspace.expanded_count += 1;
+                    }
+                }
+            }
+            if (length == 0) return source;
+            if (bound_statement.* == .select) {
+                const top = bound_statement.select;
+                bound_statement.* = .{ .query = top };
+            }
+            return workspace.expansion[0..length];
+        }
         /// Independent parser/binder/executor state over shared immutable table
         /// storage. The caller excludes ALL database/schema mutations until the
         /// call returns (or between prepare/run), and owns every scratch/result
@@ -398,6 +501,8 @@ pub fn Database(comptime config: Config) type {
             preparation_error:?Error=null,
             database:?*const Self=null,
             source:[]const u8=&.{},
+            /// `source` plus expanded view texts (inside the workspace).
+            effective:[]const u8=&.{},
             snapshot:Snapshot=.{.csn=0},
 
             pub fn backingBytes(rows:usize) Error!usize {
@@ -478,13 +583,14 @@ pub fn Database(comptime config: Config) type {
             }
             fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
                 self.session.sequences=null;
-                const parsed=try P.parse(source,&self.workspace.nodes,.standard);
+                var parsed=try P.parse(source,&self.workspace.nodes,.standard);
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
+                const expanded=try Self.expandRelations(&self.workspace,&db.tables,&db.catalog,source,snapshot,&parsed);
                 try self.session.checkpoint();
                 for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
-                const context:B.Context=.{.source=source,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
+                const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
                     .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only};
                 const bound=try B.bind(&context,&parsed);
                 for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
@@ -492,7 +598,7 @@ pub fn Database(comptime config: Config) type {
                     else=>{},
                 };
                 self.prepared=switch(bound){.select=>|select| .{.simple=select},.query=>|root| .{.general=root},else=>return error.UnsupportedStatement};
-                self.database=db;self.source=source;self.snapshot=snapshot;
+                self.database=db;self.source=source;self.effective=expanded;self.snapshot=snapshot;
             }
             pub fn run(self:*Context,result:*Result) Error!void {
                 const db=self.database orelse return error.InvalidParameterValue;
@@ -503,9 +609,9 @@ pub fn Database(comptime config: Config) type {
                 self.workspace.query.views=.{.ptr=self,.rows=readViewRows};
                 self.workspace.query.read_stats=.{};
                 switch(plan) {
-                    .simple=>|*select| try X.select(&db.tables,self.source,&self.workspace.nodes,select,self.snapshot,result,X.NoLock{},
+                    .simple=>|*select| try X.select(&db.tables,self.effective,&self.workspace.nodes,select,self.snapshot,result,X.NoLock{},
                         &self.session,self.snapshot.epoch==0,&self.workspace.query.read_stats,&self.workspace.query),
-                    .general=>|root| try X.runQuery(&db.tables,self.source,&self.workspace.nodes,&self.workspace.plans,root,self.snapshot,result,
+                    .general=>|root| try X.runQuery(&db.tables,self.effective,&self.workspace.nodes,&self.workspace.plans,root,self.snapshot,result,
                         &self.session,&self.workspace.query,self.snapshot.epoch==0),
                 }
             }
@@ -1276,11 +1382,13 @@ pub fn Database(comptime config: Config) type {
             return .{ .source = source, .pool = &self.workspace.nodes, .session = &self.session };
         }
 
-        fn body(self: *Self, slot: u16, source: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+        fn body(self: *Self, slot: u16, original: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
+            var statement_copy = parsed.*;
+            const source = try expandRelations(&self.workspace, &self.tables, &self.catalog, original, snap, &statement_copy);
             const context = self.bindContext(source, mode, snap);
-            const bound = try B.bind(&context, parsed);
+            const bound = try B.bind(&context, &statement_copy);
             switch (bound) {
                 .control => return error.UnsupportedStatement,
                 .select => |*select| {
@@ -1303,7 +1411,20 @@ pub fn Database(comptime config: Config) type {
             }
             const affected: usize = switch (bound) {
                 .noop => 0,
-                .create_table => |*create| try self.createTable(slot, create, snap),
+                .create_table => |*create| blk: {
+                    var definition = create.*;
+                    // Views depend on the views they expanded, too.
+                    if (definition.extras.relkind == 'v' or definition.extras.relkind == 'm') {
+                        for (self.workspace.expanded[0..self.workspace.expanded_count]) |oid| {
+                            var known = false;
+                            for (definition.extras.depends[0..definition.extras.depend_count]) |existing| known = known or existing == oid;
+                            if (known or definition.extras.depend_count == config.tables) continue;
+                            definition.extras.depends[definition.extras.depend_count] = oid;
+                            definition.extras.depend_count += 1;
+                        }
+                    }
+                    break :blk try self.createTable(slot, &definition, snap, source);
+                },
                 .drop_table => |index| try self.dropTable(slot, index, false, snap),
                 .create_sequence => |*create| blk: {
                     try self.createSequence(slot, create.name, create.spec, 0, 0, snap);
@@ -2234,7 +2355,8 @@ pub fn Database(comptime config: Config) type {
             if (M.write_capacity - self.txs[slot].write_len < count) return error.WriteSetCapacity;
         }
 
-        fn createTable(self: *Self, slot: u16, create: *const B.Create, snap: Snapshot) Error!usize {
+        fn createTable(self: *Self, slot: u16, create: *const B.Create, snap: Snapshot, source: []const u8) Error!usize {
+            _ = source;
             const tx = &self.txs[slot];
             if (self.catalog.creator(create.name.slice(), snap)) |owner| {
                 var waits: L.Set = .{};
@@ -2287,6 +2409,9 @@ pub fn Database(comptime config: Config) type {
             for (table.constraints[0..table.constraint_count]) |*constraint| {
                 if (constraint.kind != .foreign or constraint.ref_oid == table.oid) continue;
                 try self.lockTable(slot, self.visibleTableSlot(constraint.ref_oid, snap) orelse return error.TableNotFound, .access_share);
+            }
+            for (table.depends[0..table.depend_count]) |oid| {
+                if (self.visibleTableSlot(oid, snap)) |read| try self.lockTable(slot, read, .access_share);
             }
             return 0;
         }
@@ -3717,9 +3842,11 @@ pub fn Database(comptime config: Config) type {
             if (slot) |owner| if (self.active(owner)) {
                 snap = .{ .csn = self.csn, .slot = owner, .epoch = self.txs[owner].epoch, .cid = self.txs[owner].cid +% 1 };
             };
-            var context = self.bindContext(source, .standard, snap);
+            var statement_copy = parsed;
+            const expanded = try expandRelations(&self.workspace, &self.tables, &self.catalog, source, snap, &statement_copy);
+            var context = self.bindContext(expanded, .standard, snap);
             context.describe_only=true;
-            const bound = try B.bind(&context, &parsed);
+            const bound = try B.bind(&context, &statement_copy);
             result.clear(0);
             result.command = B.command(&bound);
             const returning: ?*const B.Returning = switch (bound) {

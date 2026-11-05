@@ -14,7 +14,7 @@ const sql = @import("sql");
 
 const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 8, .expr_nodes = 1024 });
 /// One secondary index per table holding at most six entries.
-const Small = sql.Database(.{ .tables = 4, .columns = 4, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .table_indexes = 1, .index_entries = 6 });
+const Small = sql.Database(.{ .tables = 4, .columns = 4, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .table_indexes = 1, .index_entries = 6, .expansion_bytes = 160 });
 
 var assertions: usize = 0;
 var db: DB = .{};
@@ -673,11 +673,117 @@ fn deferredConstraints() !void {
     try sameState(&[_][]const u8{"SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_schema = 'public' ORDER BY constraint_name"});
 }
 
+// ---- views (PG.VIEW.ORDINARY) -----------------------------------------------
+
+const view_probes = [_][]const u8{
+    "SELECT * FROM v ORDER BY id",
+    "SELECT * FROM labels ORDER BY id",
+    "SELECT * FROM totals ORDER BY g",
+    "SELECT viewname, definition FROM pg_views WHERE schemaname = 'public' ORDER BY viewname",
+    "SELECT relname, relkind, relnatts FROM pg_class WHERE relnamespace = 2200 ORDER BY oid",
+    "SELECT attname, atttypid FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'labels' ORDER BY attnum",
+};
+
+var read_context: DB.ReadContext = .{};
+var read_result: DB.Result = .{};
+
+fn views() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
+    try run("INSERT INTO a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL)");
+    // The oracle program in one transaction.
+    const tx = try db.begin();
+    try statement(tx, "CREATE VIEW tdd_view AS SELECT id,v FROM a");
+    try same(try rows(tx, "SELECT * FROM tdd_view ORDER BY id"), "1|10;2|20;3|30;4|NULL");
+    const other = try db.begin();
+    try statementFails(other, "SELECT * FROM tdd_view", error.TableNotFound);
+    db.abort(other);
+    db.abort(tx);
+    try rejects("SELECT * FROM tdd_view", error.TableNotFound, "SELECT COUNT(*) FROM a", "4");
+    const created = try replicate("CREATE VIEW v AS SELECT id, v FROM a WHERE v IS NOT NULL OR id = 4");
+    try check(created.command == .create_view);
+    try expect(view_probes[0], "1|10;2|20;3|30;4|NULL");
+    // Views read the current rows; string literals, expressions, column
+    // lists, aggregates, views over views, joins and subqueries.
+    try run("CREATE VIEW labels (id, label) AS SELECT id, 'row ' || CAST(id AS TEXT) FROM v WHERE id < 4");
+    try run("CREATE VIEW totals AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM a GROUP BY g");
+    try run("INSERT INTO a VALUES (5, 3, 50)");
+    try expect(view_probes[1], "1|row 1;2|row 2;3|row 3");
+    try expect(view_probes[2], "1|30|2;2|30|2;3|50|1");
+    try expect("SELECT l.label, t.total FROM labels l JOIN a ON a.id = l.id JOIN totals t ON t.g = a.g ORDER BY l.id", "row 1|30;row 2|30;row 3|30");
+    try expect("SELECT COUNT(*) FROM a WHERE id IN (SELECT id FROM v WHERE v > 15)", "3");
+    try expect("WITH w AS (SELECT * FROM labels) SELECT COUNT(*) FROM w", "3");
+    try expect("SELECT id FROM v WHERE id > 3 ORDER BY id", "4;5");
+    const inserted = try replicate("INSERT INTO a SELECT id + 10, 9, v FROM v WHERE id = 1 RETURNING id");
+    try same(try render(&inserted), "11");
+    try run("DELETE FROM a WHERE id = 11");
+    try expect(view_probes[3], "labels|SELECT id, 'row ' || CAST(id AS TEXT) FROM v WHERE id < 4;totals|SELECT g, SUM(v) AS total, COUNT(*) AS n FROM a GROUP BY g;v|SELECT id, v FROM a WHERE v IS NOT NULL OR id = 4");
+    try expect(view_probes[5], "id|23;label|25");
+    try expect("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name", "a|BASE TABLE;labels|VIEW;totals|VIEW;v|VIEW");
+    // Detached reads expand views too.
+    try read_context.execute(&db, "SELECT label FROM labels WHERE id = 2", .{ .csn = db.csn }, &read_result);
+    try same(try render(&read_result), "row 2");
+    try sameState(&view_probes);
+    // Errors: 42P07, 42P01 inside the definition, 42701, 42809 for the
+    // wrong DROP kind, 2BP01 for dependents, 0A000 for writes and renames.
+    const names = "SELECT relname FROM pg_class WHERE relkind = 'v' ORDER BY relname";
+    try rejects("CREATE VIEW v AS SELECT 1 AS one", error.TableExists, names, "labels;totals;v");
+    try rejects("CREATE VIEW a AS SELECT 1 AS one", error.TableExists, names, "labels;totals;v");
+    try rejects("CREATE VIEW w AS SELECT * FROM missing", error.TableNotFound, names, "labels;totals;v");
+    try rejects("CREATE VIEW w AS SELECT id, v AS id FROM a", error.DuplicateColumn, names, "labels;totals;v");
+    try rejects("CREATE VIEW w (x, y, z) AS SELECT id, v FROM a", error.Syntax, names, "labels;totals;v");
+    try rejects("DROP TABLE v", error.WrongObjectType, names, "labels;totals;v");
+    try rejects("DROP VIEW a", error.WrongObjectType, names, "labels;totals;v");
+    try rejects("DROP VIEW v", error.DependentObjects, names, "labels;totals;v");
+    try rejects("DROP TABLE a", error.DependentObjects, names, "labels;totals;v");
+    try rejects("ALTER TABLE a DROP COLUMN v", error.DependentObjects, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
+    try rejects("ALTER TABLE a RENAME COLUMN v TO w", error.UnsupportedStatement, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
+    try rejects("INSERT INTO v VALUES (9, 9)", error.UnsupportedStatement, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
+    try rejects("DELETE FROM v", error.UnsupportedStatement, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
+    try rejects("DROP VIEW missing", error.TableNotFound, names, "labels;totals;v");
+    _ = try replicate("DROP VIEW IF EXISTS missing");
+    // CASCADE drops the dependent views; RESTRICT of a leaf view works.
+    try run("DROP VIEW totals");
+    try run("DROP VIEW v CASCADE");
+    try expect(names, "");
+    try run("ALTER TABLE a RENAME COLUMN v TO val");
+    try run("CREATE VIEW v AS SELECT id, val FROM a WHERE id <= 2");
+    try expect(view_probes[0], "1|10;2|20");
+    // A concurrent DROP TABLE waits for the transaction that created a view
+    // over it (AccessShare) and then fails on the committed dependent.
+    const creator = try db.begin();
+    try statement(creator, "CREATE VIEW late AS SELECT id FROM a");
+    const dropper = try db.begin();
+    try parks(dropper, "DROP TABLE a");
+    try commit(creator);
+    try resumeFails(dropper, "DROP TABLE a", error.DependentObjects);
+    db.abort(dropper);
+    try run("DROP TABLE a CASCADE");
+    try expect(names, "");
+    try check(db.tableCount() == 0);
+    try sameState(&[_][]const u8{ view_probes[3], view_probes[4] });
+}
+
+/// Config.expansion_bytes bounds the statement plus its view texts.
+fn viewCapacity() !void {
+    var small: Small = .{};
+    var result: Small.Result = .{};
+    try small.execute("CREATE TABLE s (id INT PRIMARY KEY, v INT)", &result);
+    try small.execute("CREATE VIEW sv AS SELECT id, v FROM s WHERE v IS NOT NULL", &result);
+    try small.execute("INSERT INTO s VALUES (1, 1)", &result);
+    try small.execute("SELECT COUNT(*) FROM sv", &result);
+    try check(result.rows[0].cells[0].integer == 1);
+    try check(small.execute("SELECT COUNT(*) FROM sv a JOIN sv b ON a.id = b.id JOIN sv c ON c.id = a.id", &result) == error.TextCapacity);
+    try check(small.usage().transactions == 0);
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
     try upsertUnique();
     try foreignKeys();
     try deferredConstraints();
+    try views();
+    try viewCapacity();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

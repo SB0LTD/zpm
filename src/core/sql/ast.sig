@@ -608,6 +608,8 @@ pub fn Ast(comptime config: types.Config) type {
             using_count: usize = 0,
             /// FROM ONLY name: no inheritance children.
             only: bool = false,
+            /// A derived table expanded from a stored view definition.
+            view: bool = false,
         };
 
         pub const Cte = struct {
