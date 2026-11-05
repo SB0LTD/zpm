@@ -490,7 +490,8 @@ pub fn Ast(comptime config: types.Config) type {
             /// INSERT VALUES row (a values_row node) or none (DEFAULT VALUES).
             values: u16 = none,
         };
-        pub const merge_clauses: usize = 4;
+        /// WHEN clauses per MERGE (more are StatementTooComplex, 54001).
+        pub const merge_clauses: usize = 8;
         pub const Merge = struct {
             table: TableRef = .{},
             /// USING items (a FROM-list query block, SELECT *).

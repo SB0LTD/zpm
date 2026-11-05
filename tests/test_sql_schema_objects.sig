@@ -913,6 +913,67 @@ fn createVariants() !void {
     try sameState(&[_][]const u8{"SELECT id FROM snap_copy ORDER BY id"});
 }
 
+// ---- MERGE (PG.DML.MERGE) ---------------------------------------------------
+
+const merge_probes = [_][]const u8{
+    "SELECT id, g, v FROM a ORDER BY id",
+    "SELECT id, v FROM b ORDER BY id",
+};
+
+fn mergeStatement() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
+    try run("INSERT INTO a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, NULL)");
+    try run("CREATE TABLE b (id INT PRIMARY KEY, v INT)");
+    try run("INSERT INTO b VALUES (1, 11), (3, 33), (5, 55)");
+    // The oracle program.
+    const merged = try replicate("MERGE INTO a a USING b b ON a.id=b.id WHEN MATCHED THEN UPDATE SET v=b.v WHEN NOT MATCHED THEN INSERT(id,g,v) VALUES(b.id,0,b.v)");
+    try check(merged.command == .merge and merged.affected_rows == 3);
+    try expect("SELECT id,v FROM a ORDER BY id", "1|11;2|20;3|33;4|NULL;5|55");
+    // Conditions, DELETE, DO NOTHING, BY SOURCE and a subquery source.
+    try run("INSERT INTO b VALUES (6, 66), (7, -1)");
+    const second = try replicate("MERGE INTO a t USING (SELECT id, v FROM b WHERE id > 2) s ON t.id = s.id " ++
+        "WHEN MATCHED AND s.v > 50 THEN DELETE WHEN MATCHED THEN UPDATE SET g = t.g + 10 " ++
+        "WHEN NOT MATCHED AND s.v < 0 THEN DO NOTHING WHEN NOT MATCHED THEN INSERT VALUES (s.id, 6, s.v) " ++
+        "WHEN NOT MATCHED BY SOURCE AND t.v IS NULL THEN UPDATE SET v = 0");
+    try check(second.affected_rows == 4);
+    try expect(merge_probes[0], "1|1|11;2|1|20;3|12|33;4|2|0;6|6|66");
+    try run("MERGE INTO a USING b ON a.id = b.id WHEN NOT MATCHED BY SOURCE THEN DELETE");
+    try expect(merge_probes[0], "1|1|11;3|12|33;6|6|66");
+    // A target row matched twice is 21000; constraint violations roll the
+    // whole MERGE back (23505, 23514, 23502).
+    try run("CREATE TABLE dup (id INT, v INT)");
+    try run("INSERT INTO dup VALUES (1, 100), (1, 200), (9, 9)");
+    try rejects("MERGE INTO a USING dup ON a.id = dup.id WHEN MATCHED THEN UPDATE SET v = dup.v WHEN NOT MATCHED THEN INSERT VALUES (dup.id, 0, dup.v)", error.CardinalityViolation, merge_probes[0], "1|1|11;3|12|33;6|6|66");
+    try run("MERGE INTO a USING dup ON a.id = dup.id WHEN MATCHED THEN DO NOTHING");
+    try rejects("MERGE INTO a USING b ON a.id = b.id + 100 WHEN NOT MATCHED THEN INSERT VALUES (1, 0, b.v)", error.PrimaryKeyViolation, merge_probes[0], "1|1|11;3|12|33;6|6|66");
+    try run("CREATE TABLE c (id INT PRIMARY KEY, v INT NOT NULL CHECK (v < 50))");
+    try run("INSERT INTO c VALUES (1, 1), (5, 1)");
+    try rejects("MERGE INTO c USING b ON c.id = b.id WHEN MATCHED THEN UPDATE SET v = b.v", error.CheckViolation, "SELECT id, v FROM c ORDER BY id", "1|1;5|1");
+    try rejects("MERGE INTO c USING b ON c.id = b.id WHEN NOT MATCHED THEN INSERT (id) VALUES (b.id)", error.NotNullViolation, "SELECT id, v FROM c ORDER BY id", "1|1;5|1");
+    // Names: 42703 for an unknown column, 42P01 for a missing source.
+    try rejects("MERGE INTO a USING b ON a.id = b.id WHEN MATCHED THEN UPDATE SET missing = 1", error.ColumnNotFound, merge_probes[0], "1|1|11;3|12|33;6|6|66");
+    try rejects("MERGE INTO a USING nope ON a.id = nope.id WHEN MATCHED THEN DELETE", error.TableNotFound, merge_probes[0], "1|1|11;3|12|33;6|6|66");
+    try sameState(&merge_probes);
+    // Concurrency: a matched row being updated by another transaction is
+    // waited for and re-checked; the source table is AccessShare-locked, so
+    // a DROP of it waits for the MERGE's transaction (STO-11).
+    const writer = try db.begin();
+    try statement(writer, "UPDATE a SET v = 1000 WHERE id = 1");
+    const merger = try db.begin();
+    try parks(merger, "MERGE INTO a USING b ON a.id = b.id WHEN MATCHED THEN UPDATE SET v = a.v + 1");
+    try commit(writer);
+    _ = try resumed(merger, "MERGE INTO a USING b ON a.id = b.id WHEN MATCHED THEN UPDATE SET v = a.v + 1");
+    const dropper = try db.begin();
+    try parks(dropper, "DROP TABLE b");
+    try commit(merger);
+    _ = try resumed(dropper, "DROP TABLE b");
+    db.abort(dropper);
+    try expect(merge_probes[0], "1|1|1001;3|12|34;6|6|67");
+    try check(db.usage().transactions == 0 and db.usage().table_locks == 0);
+    try sameState(&merge_probes);
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -923,5 +984,6 @@ pub fn main() !void {
     try viewCapacity();
     try materializedViews();
     try createVariants();
+    try mergeStatement();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

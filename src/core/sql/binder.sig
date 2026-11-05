@@ -6484,10 +6484,73 @@ pub fn Binder(comptime config: types.Config) type {
             };
         }
 
+        /// MERGE: the target is relation 0, the USING source relation 1 (a
+        /// `SELECT * FROM source` plan, like UPDATE FROM); ON and every WHEN
+        /// condition, SET and INSERT value bind over both.
         fn bindMerge(context: *const Context, merge: *const Ast.Merge) Error!Bound {
-            _ = context;
-            _ = merge;
-            return error.UnsupportedStatement;
+            const index = try writableTable(context, try resolveQualified(context, merge.table.schema, merge.table.name), false);
+            const entry = &context.tables[index];
+            var scope = tableScope(context, index);
+            if (merge.table.alias) |alias| scope.rels[0].name = toName(context, alias);
+            var out: Merge = .{ .table = index, .source = none, .on = none };
+            try bindSources(context, merge.source, &scope, &out.source, &out.offsets);
+            out.on = try bindWhere(context, &scope, merge.on);
+            try bindChecks(context, index, entry, &out.checks);
+            for (merge.whens[0..merge.when_count]) |*when| {
+                var bound: MergeWhen = .{ .matched = when.matched, .by_source = when.by_source, .action = when.action };
+                if (when.condition != none) bound.condition = try bindWhere(context, &scope, when.condition);
+                switch (when.action) {
+                    .update => {
+                        try bindAssignments(context, &scope, entry, when.assignments[0..when.count], &bound.values);
+                        const needed = assignedDefaults(context, &bound.values);
+                        try bindDefaults(context, index, entry, &needed, &bound.defaults, &bound.generated);
+                    },
+                    .insert => {
+                        var mapping: [config.columns]usize = undefined;
+                        var count: usize = 0;
+                        if (when.column_count != 0) {
+                            var mapped: [config.columns]bool = @splat(false);
+                            for (when.columns[0..when.column_count]) |ident| {
+                                const column = try columnIndex(context, entry, ident);
+                                if (mapped[column]) return error.DuplicateColumn;
+                                mapped[column] = true;
+                                mapping[count] = column;
+                                count += 1;
+                            }
+                        } else {
+                            count = entry.column_count;
+                            for (0..count) |column| mapping[column] = column;
+                        }
+                        if (when.values != none) {
+                            if (context.node(when.values).integer > count) return error.Syntax;
+                            var item = context.node(when.values).b;
+                            var position: usize = 0;
+                            while (item != none) : (position += 1) {
+                                const next = context.node(item).next;
+                                const column = mapping[position];
+                                if (context.node(item).kind == .default_value) {
+                                    bound.values[column] = item;
+                                } else {
+                                    if (!try explicitValue(&entry.columns[column], .none)) {
+                                        bound.values[column] = none;
+                                    } else {
+                                        try typeExpr(context, &scope, item);
+                                        bound.values[column] = try assignment(context, item, &entry.columns[column]);
+                                    }
+                                }
+                                item = next;
+                            }
+                        }
+                        var needed: [config.columns]bool = @splat(false);
+                        for (bound.values, 0..) |id, column| needed[column] = id == none or context.node(id).kind == .default_value;
+                        try bindDefaults(context, index, entry, &needed, &bound.defaults, &bound.generated);
+                    },
+                    .delete, .nothing => {},
+                }
+                out.whens[out.when_count] = bound;
+                out.when_count += 1;
+            }
+            return .{ .merge = out };
         }
 
         /// SET CONSTRAINTS names: every visible constraint with the name

@@ -1491,7 +1491,11 @@ pub fn Database(comptime config: Config) type {
                     break :blk 0;
                 },
                 .refresh_view => |*refresh| try self.refreshView(slot, refresh, source, snap),
-                .merge => return error.UnsupportedStatement,
+                .merge => |*merge| blk: {
+                    try self.lockTable(slot, merge.table, .row_exclusive);
+                    try self.lockSources(slot);
+                    break :blk try self.mergeRows(slot, source, merge, snap);
+                },
                 .select, .query, .control => unreachable,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
@@ -3620,6 +3624,118 @@ pub fn Database(comptime config: Config) type {
             const plans = &self.workspace.plans;
             for (plans.items[0..plans.len]) |*plan| {
                 for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
+            }
+        }
+
+        /// MERGE (PostgreSQL ExecMerge under READ COMMITTED): the source rows
+        /// are materialized once under the statement snapshot; for each, every
+        /// target row the ON condition matches takes the first WHEN MATCHED
+        /// clause whose condition holds (UPDATE, DELETE or DO NOTHING), and a
+        /// source row with no match the first WHEN NOT MATCHED clause (INSERT
+        /// or DO NOTHING); then target rows no source row matched take the
+        /// first WHEN NOT MATCHED BY SOURCE clause. A target row changed twice
+        /// is 21000. Live writers are waited for (EvalPlanQual re-checks ON on
+        /// the newest version; a row that no longer matches is left alone).
+        /// A resumed statement continues after the source rows it handled.
+        fn mergeRows(self: *Self, slot: u16, source: []const u8, merge: *const B.Merge, snap: Snapshot) Error!usize {
+            const tx = &self.txs[slot];
+            const done = tx.progress;
+            const table = &self.tables[merge.table];
+            var ctx = self.evalContext(source);
+            const joined = (try self.joinedRows(source, merge.source, &merge.offsets, snap)) orelse return 0;
+            const work = &self.workspace.query;
+            var position: usize = 0;
+            for (0..joined.list.count) |index| {
+                defer position += 1;
+                if (position < done) continue;
+                try self.session.checkpoint();
+                const row = X.rowAt(work, joined.list, index);
+                for (1..config.relations) |relation| ctx.tuple[relation] = row + joined.offsets[relation];
+                var matched = false;
+                for (0..table.row_high) |target_row| {
+                    if (table.rows[target_row].newest == 0) continue;
+                    const version = S.visibleAt(table, target_row, snap) orelse continue;
+                    if (!try X.keep(&ctx, merge.on, &table.versions[version].cells)) continue;
+                    matched = true;
+                    try self.mergeMatched(slot, &ctx, merge, @intCast(target_row), version, false, snap);
+                }
+                if (!matched) try self.mergeInsert(slot, &ctx, merge, snap);
+                tx.progress = position + 1;
+            }
+            var by_source = false;
+            for (merge.whens[0..merge.when_count]) |*when| by_source = by_source or when.by_source;
+            if (by_source) for (0..table.row_high) |target_row| {
+                defer position += 1;
+                if (position < done) continue;
+                try self.session.checkpoint();
+                if (table.rows[target_row].newest == 0) continue;
+                const version = S.visibleAt(table, target_row, snap) orelse continue;
+                var matched = false;
+                for (0..joined.list.count) |index| {
+                    const row = X.rowAt(work, joined.list, index);
+                    for (1..config.relations) |relation| ctx.tuple[relation] = row + joined.offsets[relation];
+                    if (try X.keep(&ctx, merge.on, &table.versions[version].cells)) matched = true;
+                }
+                if (!matched) {
+                    for (1..config.relations) |relation| ctx.tuple[relation] = null;
+                    try self.mergeMatched(slot, &ctx, merge, @intCast(target_row), version, true, snap);
+                }
+                tx.progress = position + 1;
+            };
+            return tx.progress_affected;
+        }
+
+        fn mergeMatched(self: *Self, slot: u16, ctx: *E.Context, merge: *const B.Merge, row: u32, version: u32, by_source: bool, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const table = &self.tables[merge.table];
+            var chosen: ?*const B.MergeWhen = null;
+            var waits: L.Set = .{};
+            const plan = self.target(slot, merge.table, version, snap, .write, &waits);
+            const goal = switch (plan) {
+                .wait => return self.park(slot, waits),
+                .authored => return error.CardinalityViolation,
+                .skip => return,
+                .ready => |newest| newest,
+            };
+            const cells = &table.versions[goal].cells;
+            if (!by_source and goal != version and !try X.keep(ctx, merge.on, cells)) return;
+            for (merge.whens[0..merge.when_count]) |*when| {
+                if (!when.matched or when.by_source != by_source) continue;
+                if (when.condition != ast.none and !try X.keep(ctx, when.condition, cells)) continue;
+                chosen = when;
+                break;
+            }
+            const when = chosen orelse return;
+            switch (when.action) {
+                .update => {
+                    const update: B.Update = .{ .table = merge.table, .values = when.values, .where = ast.none, .key = ast.none, .defaults = when.defaults, .generated = when.generated, .checks = merge.checks };
+                    try self.updateOne(slot, ctx, &update, row, goal, snap);
+                },
+                .delete => {
+                    try self.referencedChange(slot, merge.table, cells, null, snap);
+                    if (table.versions[goal].xmax.epoch == 0) {
+                        try self.reserveWrites(slot, 1);
+                        table.versions[goal].xmax = tx.ref(slot);
+                        table.versions[goal].xmax_cid = snap.cid;
+                        tx.push(.{ .kind = .delete, .table = @intCast(merge.table), .old = goal }) catch unreachable;
+                    }
+                },
+                .nothing, .insert => return,
+            }
+            tx.progress_affected += 1;
+        }
+
+        fn mergeInsert(self: *Self, slot: u16, ctx: *E.Context, merge: *const B.Merge, snap: Snapshot) Error!void {
+            const nulls: E.Row = @splat(.null_value);
+            for (merge.whens[0..merge.when_count]) |*when| {
+                if (when.matched) continue;
+                if (when.condition != ast.none and !try X.keep(ctx, when.condition, &nulls)) continue;
+                if (when.action != .insert) return;
+                const insert: B.Insert = .{ .table = merge.table, .defaults = when.defaults, .generated = when.generated, .checks = merge.checks };
+                const derived: D.Derived = .{ .defaults = &when.defaults, .generated = &when.generated, .checks = &merge.checks };
+                const affected = try self.insertOne(slot, ctx, &insert, &when.values, derived, snap);
+                self.txs[slot].progress_affected += affected;
+                return;
             }
         }
 
