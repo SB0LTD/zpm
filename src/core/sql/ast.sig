@@ -43,7 +43,9 @@ pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, n
     // Array/range overlap && (B11 advanced types).
     overlap,
     // Range &< &> -|-.
-    over_left, over_right, adjacent };
+    over_left, over_right, adjacent,
+    // Network <<= and >>=.
+    within_eq, contains_eq };
 
 /// Built-in functions bound by name.
 pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
@@ -72,7 +74,9 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // Ranges (B11 advanced types, range_eval.sig): int4range(...) and the
     // other constructors (result type in the node), lower/upper of a range,
     // and the bound predicates.
-    range_constructor, range_lower, range_upper, isempty, lower_inc, upper_inc, lower_inf, upper_inf };
+    range_constructor, range_lower, range_upper, isempty, lower_inc, upper_inc, lower_inf, upper_inf,
+    // Network address functions (B11 advanced types, network.sig).
+    inet_host, masklen, inet_family, inet_network, broadcast, netmask };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -107,6 +111,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
         .array_append, .array_prepend, .array_cat => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
+        .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         else => false,
     };
 }
@@ -126,6 +131,7 @@ pub fn strictFunction(func: Func) bool {
         .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
         .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
         .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
+        .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         else => false,
     };
 }

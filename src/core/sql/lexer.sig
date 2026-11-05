@@ -221,6 +221,9 @@ pub const Keyword = enum {
     daterange,
     tsrange,
     tstzrange,
+    inet,
+    cidr,
+    macaddr,
 };
 
 /// Words that cannot be unquoted identifiers.
@@ -306,6 +309,9 @@ pub const Symbol = enum {
     over_left,
     over_right,
     adjacent,
+    // Networks: <<= and >>=.
+    within_eq,
+    contains_eq,
 };
 
 pub const Token = struct {
@@ -591,15 +597,15 @@ pub const Tokenizer = struct {
                 width = 2;
                 break :blk Symbol.contained;
             } else if (following == '<') blk: {
-                width = 2;
-                break :blk Symbol.shift_left;
+                width = if (third == '=') 3 else 2;
+                break :blk if (third == '=') Symbol.within_eq else Symbol.shift_left;
             } else .lt,
             '>' => if (following == '=') blk: {
                 width = 2;
                 break :blk Symbol.ge;
             } else if (following == '>') blk: {
-                width = 2;
-                break :blk Symbol.shift_right;
+                width = if (third == '=') 3 else 2;
+                break :blk if (third == '=') Symbol.contains_eq else Symbol.shift_right;
             } else .gt,
             '!' => if (following == '=') blk: {
                 width = 2;

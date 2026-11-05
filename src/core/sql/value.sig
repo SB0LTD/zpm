@@ -24,6 +24,7 @@ const money = @import("money.sig");
 const catalog_ids = @import("catalog_ids.sig");
 const array_text = @import("array_text.sig");
 const range_text = @import("range_text.sig");
+const network = @import("network.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -108,6 +109,15 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // casts; strings by I/O conversion; nothing else.
         if (to == .money and (from == .int4 or from == .int8 or from == .numeric)) return context != .implicit;
         if (from == .money and to == .numeric) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (from == .inet or from == .cidr or to == .inet or to == .cidr or from == .macaddr or to == .macaddr) {
+        // cidr -> inet is implicit, inet -> cidr by assignment; strings by
+        // I/O conversion (text(inet) by assignment).
+        if (from == .cidr and to == .inet) return true;
+        if (from == .inet and to == .cidr) return context != .implicit;
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -236,6 +246,8 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
 
 pub fn common(a: Type, b: Type) ?Type {
     if (a == b) return a;
+    // cidr values take inet's operators.
+    if ((a == .inet and b == .cidr) or (a == .cidr and b == .inet)) return .inet;
     // Arrays unify through their element types (ARRAY[] sub-arrays, ||).
     if (types.elementType(a)) |left| {
         const right = types.elementType(b) orelse return null;
@@ -361,6 +373,9 @@ pub fn Io(comptime config: types.Config) type {
                 .xid8 => |value| catalog_ids.formatXid8(value, buffer),
                 .array => |*value| try ArrayText.format(value.slice(), session, buffer),
                 .range => |*value| try RangeText.format(value.slice(), session, buffer),
+                // inet hides a full-length netmask except in its text cast.
+                .inet => |*value| network.format(value, value.cidr or verbose, buffer),
+                .macaddr => |*value| network.formatMac(value, buffer),
             };
         }
 
@@ -453,6 +468,8 @@ pub fn Io(comptime config: types.Config) type {
                 .pg_lsn => .{ .pg_lsn = try catalog_ids.parseLsn(input) },
                 .xid8 => .{ .xid8 = try catalog_ids.parseXid8(input) },
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => try RangeText.parse(ty, input, session),
+                .inet, .cidr => .{ .inet = try network.parse(input, ty == .cidr) },
+                .macaddr => .{ .macaddr = try network.parseMac(input) },
                 // array_in applies the typmod to every element itself.
                 _ => return ArrayText.parse(types.elementType(ty) orelse return error.UndefinedFunction, typmod, input, session),
             };
@@ -793,6 +810,26 @@ pub fn Io(comptime config: types.Config) type {
                 .pg_lsn, .xid8 => switch (cell) {
                     .pg_lsn, .xid8 => cell,
                     .text => |*value| try parse(to, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .inet => switch (cell) {
+                    .inet => |value| blk: {
+                        var out = value;
+                        out.cidr = false;
+                        break :blk V.Cell{ .inet = out };
+                    },
+                    .text => |*value| try parse(.inet, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                // cidr(inet): the host bits are cleared.
+                .cidr => switch (cell) {
+                    .inet => |*value| V.Cell{ .inet = network.network(value) },
+                    .text => |*value| try parse(.cidr, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .macaddr => switch (cell) {
+                    .macaddr => cell,
+                    .text => |*value| try parse(.macaddr, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => switch (cell) {

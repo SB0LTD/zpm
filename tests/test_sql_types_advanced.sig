@@ -634,10 +634,116 @@ fn ranges() !void {
     try meta(2, 3906, -1);
 }
 
+// ---- inet / cidr / macaddr -------------------------------------------------------
+
+fn network() !void {
+    // oracle: PG.TYPE.NETWORK.
+    try exec("CREATE TABLE tdd_type(v INET)");
+    try exec("INSERT INTO tdd_type VALUES('192.0.2.1'),(NULL)");
+    try rows("SELECT v FROM tdd_type ORDER BY v NULLS LAST", "192.0.2.1;NULL");
+    try meta(0, 869, -1);
+    try exec("DROP TABLE tdd_type");
+
+    // inet: a full-length netmask is not printed; IPv6 compresses zeros.
+    try rows("SELECT '192.0.2.1/24'::inet, '10.1/16'::inet, '010.0.0.1'::inet, '::1'::inet, '2001:DB8::/32'::inet, '::ffff:1.2.3.4'::inet, '1:0:0:0:0:0:0:8'::inet, 'fe80::1:2/64'::inet",
+        "192.0.2.1/24|10.1.0.0/16|10.0.0.1|::1|2001:db8::/32|::ffff:1.2.3.4|1::8|fe80::1:2/64");
+    try meta(0, 869, -1);
+    // cidr: always a netmask length; classful defaults; no bits right of it.
+    try rows("SELECT '192.168.1.0/24'::cidr, '10'::cidr, '192.168.1'::cidr, '128.1'::cidr, '10.1.2.3/32'::cidr, '2001:db8::/32'::cidr, '224'::cidr, '::'::cidr",
+        "192.168.1.0/24|10.0.0.0/8|192.168.1.0/24|128.1.0.0/16|10.1.2.3/32|2001:db8::/32|224.0.0.0/4|::/128");
+    try meta(0, 650, -1);
+    for ([_][]const u8{
+        "SELECT '192.168.1.1/24'::cidr",  "SELECT '1.2.3'::inet",         "SELECT '256.0.0.1'::inet",
+        "SELECT '1.2.3.4/33'::inet",      "SELECT '1::2::3'::inet",       "SELECT '::g'::inet",
+        "SELECT ''::inet",                "SELECT '1.2.3.4 '::inet",      "SELECT '10.1/24'::inet",
+        "SELECT '1:2:3:4:5:6:7:8:9'::inet", "SELECT '1.2.3.4/'::inet",    "SELECT 'x'::cidr",
+    }) |source| try rejects(source, error.InvalidTextRepresentation);
+    // macaddr: seven input layouts, lower-case colon output.
+    try rows("SELECT '08:00:2b:01:02:03'::macaddr, '08-00-2B-01-02-03'::macaddr, '08002b:010203'::macaddr, '08002b-010203'::macaddr, '0800.2b01.0203'::macaddr, '0800-2b01-0203'::macaddr, '08002b010203'::macaddr",
+        "08:00:2b:01:02:03|08:00:2b:01:02:03|08:00:2b:01:02:03|08:00:2b:01:02:03|08:00:2b:01:02:03|08:00:2b:01:02:03|08:00:2b:01:02:03");
+    try meta(0, 829, -1);
+    for ([_][]const u8{ "SELECT '08:00:2b:01:02'::macaddr", "SELECT '08:00:2b:01:02:0g'::macaddr", "SELECT '0800:2b01:0203'::macaddr", "SELECT ''::macaddr" }) |source|
+        try rejects(source, error.InvalidTextRepresentation);
+
+    // Functions and casts.
+    try rows("SELECT host('192.0.2.1/24'::inet), masklen('192.0.2.1/24'::inet), family('::1'::inet), network('192.0.2.1/24'::inet), broadcast('192.0.2.1/24'::inet), netmask('192.0.2.1/24'::inet), '192.0.2.1'::inet::text, '10.0.0.1/8'::inet::cidr",
+        "192.0.2.1|24|6|192.0.2.0/24|192.0.2.255/24|255.255.255.0|192.0.2.1/32|10.0.0.0/8");
+    try meta(0, 25, -1);
+    try meta(1, 23, -1);
+    try meta(3, 650, -1);
+    try meta(4, 869, -1);
+    try meta(7, 650, -1);
+    try rows("SELECT '10.0.0.0/8'::cidr::inet, host('::ffff:1.2.3.4/120'::inet), '08:00:2b:01:02:03'::macaddr::text", "10.0.0.0/8|::ffff:1.2.3.4|08:00:2b:01:02:03");
+    try rejects("SELECT 1::inet", error.CannotCoerce);
+    try rejects("SELECT '1.2.3.4'::inet = '1.2.3.4'::text", error.UndefinedFunction);
+    try rejects("SELECT '1.2.3.4'::inet = '08:00:2b:01:02:03'::macaddr", error.UndefinedFunction);
+
+    // Containment operators.
+    try rows("SELECT '192.168.1.5'::inet << '192.168.1.0/24'::inet, '192.168.1.0/24'::inet << '192.168.1.0/24'::inet, '192.168.1.0/24'::inet <<= '192.168.1.0/24'::inet, '192.168.1.0/24'::cidr >> '192.168.1.5'::inet, '192.168.1.0/24'::inet >>= '192.168.1.0/24'::inet, '192.168.1.0/24'::inet && '192.168.0.0/16'::inet, '10.0.0.0/8'::inet && '192.168.0.0/16'::inet, '::1'::inet << '0.0.0.0/0'::inet",
+        "t|f|t|t|t|t|f|f");
+
+    // Ordering (IPv4 first, then the common prefix, then the length),
+    // grouping, hash consistency and inet/cidr comparisons.
+    try exec("CREATE TABLE n(id INT PRIMARY KEY, a INET, c CIDR, m MACADDR)");
+    try exec("INSERT INTO n VALUES(1, '10.0.0.1', '10.0.0.0/8', '08:00:2b:01:02:03'), (2, '10.0.0.1/8', '10.0.0.0/16', '08:00:2b:01:02:04'), (3, '::1', '::/0', NULL), (4, '9.255.255.255', '10.0.0.0/8', '00:00:00:00:00:00'), (5, NULL, NULL, '08-00-2b-01-02-03')");
+    try rows("SELECT a FROM n ORDER BY a NULLS LAST", "9.255.255.255;10.0.0.1/8;10.0.0.1;::1;NULL");
+    try rows("SELECT c FROM n ORDER BY c NULLS LAST", "10.0.0.0/8;10.0.0.0/8;10.0.0.0/16;::/0;NULL");
+    try rows("SELECT m, COUNT(*) FROM n GROUP BY m ORDER BY m", "00:00:00:00:00:00|1;08:00:2b:01:02:03|2;08:00:2b:01:02:04|1;NULL|1");
+    try rows("SELECT COUNT(DISTINCT c), COUNT(DISTINCT a), MIN(a), MAX(a) FROM n", "3|4|9.255.255.255|::1");
+    try rows("SELECT id FROM n WHERE a <<= c ORDER BY id", "1;3");
+    try rows("SELECT id FROM n WHERE a = '10.0.0.1/32' OR c = '10.0.0.0/16'::inet ORDER BY id", "1;2");
+    try rows("SELECT data_type FROM information_schema.columns WHERE table_name = 'n' ORDER BY ordinal_position", "integer;inet;cidr;macaddr");
+    try rejects("INSERT INTO n(id, c) VALUES(6, '10.0.0.1/8')", error.InvalidTextRepresentation);
+    try exec("INSERT INTO n(id, c) VALUES(6, '10.0.0.1/8'::inet)");
+    try rows("SELECT c FROM n WHERE id = 6", "10.0.0.0/8");
+    try rejects("INSERT INTO n(id, a) VALUES(7, '1.1.1.1'), (8, 'bad')", error.InvalidTextRepresentation);
+    try rows("SELECT COUNT(*) FROM n", "6");
+    try rows("SELECT typname, typlen, typcategory, typarray FROM pg_type WHERE oid IN (650, 829, 869) ORDER BY oid", "cidr|-1|I|651;macaddr|6|U|1040;inet|-1|I|1041");
+    try exec("DROP TABLE n");
+
+    // Wire: inet_send {family 2/3, bits, is_cidr, size, address}; macaddr 6 bytes.
+    try exec("SELECT '192.0.2.1/24'::inet, '10.0.0.0/8'::cidr, '08:00:2b:01:02:03'::macaddr, '::1'::inet");
+    const inet_bytes = [_]u8{ 2, 24, 0, 4, 192, 0, 2, 1 };
+    const cidr_bytes = [_]u8{ 2, 8, 1, 4, 10, 0, 0, 0 };
+    const mac_bytes = [_]u8{ 8, 0, 0x2b, 1, 2, 3 };
+    const v6_bytes = [_]u8{ 3, 128, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try check(Wire.oid(.inet) == 869 and Wire.oid(.cidr) == 650 and Wire.oid(.macaddr) == 829 and Wire.length(.macaddr) == 6 and Wire.length(.inet) == -1);
+    try sendBinary(&result.rows[0].cells[0], .inet, &inet_bytes);
+    try sendBinary(&result.rows[0].cells[1], .cidr, &cidr_bytes);
+    try sendBinary(&result.rows[0].cells[2], .macaddr, &mac_bytes);
+    try sendBinary(&result.rows[0].cells[3], .inet, &v6_bytes);
+    try receive(&inet_bytes, .inet, "192.0.2.1/24");
+    try receive(&cidr_bytes, .cidr, "10.0.0.0/8");
+    try receive(&mac_bytes, .macaddr, "08:00:2b:01:02:03");
+    // receiveText renders the text(inet) cast form, which inet_in reads back.
+    try receive(&v6_bytes, .inet, "::1/128");
+    try literal(&inet_bytes, 869, 1, "'192.0.2.1/24'::inet");
+    try literal("10/8", 650, 0, "'10/8'::cidr");
+    var out: [64]u8 = undefined;
+    for ([_][]const u8{ &.{ 2, 24, 0, 16, 192, 0, 2, 1 }, &.{ 4, 24, 0, 4, 192, 0, 2, 1 }, &.{ 2, 33, 0, 4, 192, 0, 2, 1 }, inet_bytes[0..7] }) |bad|
+        try check(if (Wire.receiveText(bad, .inet, &out)) |_| false else |err| err == error.ProtocolViolation);
+    try check(if (Wire.receiveText(mac_bytes[0..5], .macaddr, &out)) |_| false else |err| err == error.ProtocolViolation);
+    // A cidr value must not have bits set right of its mask; inet ignores the flag byte.
+    try check(if (Wire.receiveText(&.{ 2, 8, 1, 4, 10, 0, 0, 1 }, .cidr, &out)) |_| false else |err| err == error.ProtocolViolation);
+    try receive(&.{ 2, 8, 1, 4, 10, 0, 0, 1 }, .inet, "10.0.0.1/8");
+
+    // Durability: change-record value tags 23 (inet/cidr) and 24 (macaddr).
+    try replay(&.{
+        "CREATE TABLE r(id INT PRIMARY KEY, a INET, c CIDR, m MACADDR)",
+        "INSERT INTO r VALUES(1, '2001:db8::1/64', '192.168.0.0/16', '08:00:2b:01:02:03'), (2, NULL, NULL, NULL), (3, '1.2.3.4', '::/0', 'ff:ff:ff:ff:ff:ff')",
+        "UPDATE r SET a = broadcast(a) WHERE id = 1",
+    }, &.{"r"}, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "1|2001:db8::ffff:ffff:ffff:ffff/64|192.168.0.0/16|08:00:2b:01:02:03;2|NULL|NULL|NULL;3|1.2.3.4|::/0|ff:ff:ff:ff:ff:ff");
+    try meta(1, 869, -1);
+    try meta(2, 650, -1);
+    try meta(3, 829, -1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try catalogIds();
     try arrays();
     try ranges();
+    try network();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-advanced\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

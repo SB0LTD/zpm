@@ -53,7 +53,8 @@
 //!   | 21 array {element type OID u32, ndim u8, ndim x (dim u32, lbound
 //!   i32), every element as a value (0 for NULL) in row-major order}.
 //!   | 22 range {subtype OID u32, flags u8 (PostgreSQL's range flags), the
-//!   finite bounds as values}.
+//!   finite bounds as values} | 23 inet/cidr {family u8 (4/6), bits u8,
+//!   cidr u8, 16 address bytes} | 24 macaddr 6 bytes.
 //!   Array type OIDs (1007, ...) name a column's array type. Every value is
 //!   checked against the column's type OID (create_table) before anything
 //!   applies.
@@ -78,7 +79,13 @@ const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
 const array = @import("array.sig");
 const range = @import("range.sig");
+const network = @import("network.sig");
 const Error = types.Error;
+
+fn std_zero(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte != 0) return false;
+    return true;
+}
 
 pub const format_version: u16 = 1;
 pub const header_size: usize = 8;
@@ -301,6 +308,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .xid8 => |value| {
                     try writer.int(u8, 20);
                     try writer.int(u64, value);
+                },
+                .inet => |*value| {
+                    try writer.int(u8, 23);
+                    try writer.bytes(&.{ value.family, value.bits, @intFromBool(value.cidr) });
+                    try writer.bytes(&value.address);
+                },
+                .macaddr => |*value| {
+                    try writer.int(u8, 24);
+                    try writer.bytes(value);
                 },
                 .range => |*span| {
                     const value = V.Ranges.decode(span.slice());
@@ -774,6 +790,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 20 => .{ .xid8 = try reader.int(u64) },
                 21 => try decodeArray(reader),
                 22 => try decodeRange(reader),
+                23 => blk: {
+                    const head = try reader.take(3);
+                    var value: network.Inet = .{ .family = head[0], .bits = head[1], .cidr = head[2] == 1 };
+                    @memcpy(&value.address, try reader.take(16));
+                    if ((value.family != 4 and value.family != 6) or value.bits > value.maxBits() or head[2] > 1) return error.InvalidChangeRecord;
+                    if (value.family == 4 and !std_zero(value.address[4..])) return error.InvalidChangeRecord;
+                    if (value.cidr and !network.maskClean(&value)) return error.InvalidChangeRecord;
+                    break :blk .{ .inet = value };
+                },
+                24 => .{ .macaddr = (try reader.take(6))[0..6].* },
                 17 => blk: {
                     const bits = try reader.int(u32);
                     if (bits > V.BitString.max_bits) return error.ChangeRecordConflict;

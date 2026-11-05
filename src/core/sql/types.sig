@@ -10,6 +10,7 @@ const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
 const array_module = @import("array.sig");
 const range_module = @import("range.sig");
+const network = @import("network.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -353,12 +354,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -460,6 +461,9 @@ pub fn dataTypeOf(ty: Type) DataType {
         .daterange => .daterange,
         .tsrange => .tsrange,
         .tstzrange => .tstzrange,
+        .inet => .inet,
+        .cidr => .cidr,
+        .macaddr => .macaddr,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -499,6 +503,9 @@ pub fn typeOfData(data_type: DataType) Type {
         .daterange => .daterange,
         .tsrange => .tsrange,
         .tstzrange => .tstzrange,
+        .inet => .inet,
+        .cidr => .cidr,
+        .macaddr => .macaddr,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -566,6 +573,9 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .daterange => .{ .oid = 3912, .name = "daterange", .len = -1, .category = 'R', .array = 3913 },
         .tsrange => .{ .oid = 3908, .name = "tsrange", .len = -1, .category = 'R', .array = 3909 },
         .tstzrange => .{ .oid = 3910, .name = "tstzrange", .len = -1, .category = 'R', .array = 3911 },
+        .inet => .{ .oid = 869, .name = "inet", .len = -1, .category = 'I', .array = 1041 },
+        .cidr => .{ .oid = 650, .name = "cidr", .len = -1, .category = 'I', .array = 651 },
+        .macaddr => .{ .oid = 829, .name = "macaddr", .len = 6, .category = 'U', .array = 1040 },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -617,6 +627,9 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .daterange => "daterange",
         .tsrange => "tsrange",
         .tstzrange => "tstzrange",
+        .inet => "inet",
+        .cidr => "cidr",
+        .macaddr => "macaddr",
         _ => "",
     };
 }
@@ -652,6 +665,9 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .pg_lsn => "pg_lsn_in",
         .xid8 => "xid8in",
         .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => "range_in",
+        .inet => "inet_in",
+        .cidr => "cidr_in",
+        .macaddr => "macaddr_in",
         _ => "array_in",
     };
 }
@@ -795,7 +811,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -829,6 +845,9 @@ pub fn Values(comptime config: Config) type {
             array: Text,
             /// Built-in ranges (range.sig layout).
             range: Text,
+            /// inet and cidr (network.sig; `cidr` marks a cidr value).
+            inet: network.Inet,
+            macaddr: network.Mac,
         };
 
         /// Range values of these cells (range.sig).
@@ -878,6 +897,8 @@ pub fn Values(comptime config: Config) type {
                 .pg_lsn => .pg_lsn,
                 .xid8 => .xid8,
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => .range,
+                .inet, .cidr => .inet,
+                .macaddr => .macaddr,
                 _ => .array,
             };
         }
@@ -915,6 +936,8 @@ pub fn Values(comptime config: Config) type {
                 .xid8 => |value| order(u64, value, right.xid8),
                 .array => |*value| Arrays.compare(value.slice(), right.array.slice()),
                 .range => |*value| Ranges.compare(value.slice(), right.range.slice()),
+                .inet => |*value| network.compare(value, &right.inet),
+                .macaddr => |*value| bytesOrder(value, &right.macaddr),
             };
         }
 
@@ -976,6 +999,16 @@ pub fn Values(comptime config: Config) type {
                 .pg_lsn, .xid8 => |word| return wordHash(word, tag),
                 .array => |*items| return wordHash(Arrays.hash(items.slice()), tag),
                 .range => |*span| return wordHash(Ranges.hash(span.slice()), tag),
+                // network_cmp ignores the cidr flag; so does the hash.
+                .inet => |*address| {
+                    mix(&code, tag);
+                    mix(&code, @as(u64, address.family) << 8 | address.bits);
+                    for (address.address) |byte| code = (code ^ byte) *% 1099511628211;
+                },
+                .macaddr => |*bytes| {
+                    mix(&code, tag);
+                    for (bytes) |byte| code = (code ^ byte) *% 1099511628211;
+                },
                 .timetz => |time| {
                     mix(&code, tag);
                     mix(&code, @bitCast(time.us));
@@ -1025,6 +1058,7 @@ pub fn Values(comptime config: Config) type {
                 return;
             }
             if (@as(CellTag, value.*) != cellTag(column.data_type)) return error.TypeMismatch;
+            if (value.* == .inet and value.inet.cidr != (column.data_type == .cidr)) return error.TypeMismatch;
             if (value.* == .range) {
                 const subtype = typeOfData(Ranges.subtypeOf(value.range.slice()));
                 if (rangeSubtype(typeOfData(column.data_type)) != subtype) return error.TypeMismatch;

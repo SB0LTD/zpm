@@ -256,6 +256,11 @@ pub fn Arrays(comptime V: type) type {
                     try put(out, value.slice());
                 },
                 .pg_lsn, .xid8 => |value| try putInt(out, u64, value),
+                .inet => |*value| {
+                    try put(out, &.{ value.family, value.bits, @intFromBool(value.cidr) });
+                    try put(out, &value.address);
+                },
+                .macaddr => |*value| try put(out, value),
                 .array => return error.TypeMismatch,
             }
         }
@@ -324,6 +329,16 @@ pub fn Arrays(comptime V: type) type {
                 },
                 .pg_lsn => .{ .pg_lsn = getInt(u64, bytes, at) },
                 .xid8 => .{ .xid8 = getInt(u64, bytes, at) },
+                .inet => blk: {
+                    var value: V.Cell = .{ .inet = .{ .family = bytes[at.*], .bits = bytes[at.* + 1], .cidr = bytes[at.* + 2] != 0 } };
+                    @memcpy(&value.inet.address, bytes[at.* + 3 ..][0..16]);
+                    at.* += 19;
+                    break :blk value;
+                },
+                .macaddr => blk: {
+                    at.* += 6;
+                    break :blk .{ .macaddr = bytes[at.* - 6 ..][0..6].* };
+                },
             };
         }
 

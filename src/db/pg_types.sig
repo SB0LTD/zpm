@@ -14,7 +14,9 @@
 //! type OID, ndim x (i32 dim, i32 lower bound), then per element an i32
 //! length (-1 for NULL) and the element's binary form}. Ranges use
 //! range_send/range_recv: {flags byte, then each finite bound as an i32
-//! length and the subtype's binary form}.
+//! length and the subtype's binary form}. inet/cidr use inet_send
+//! {family 2 (IPv4) or 3 (IPv6), bits, is_cidr, address size, address};
+//! macaddr is six bytes.
 //! Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
@@ -132,6 +134,12 @@ pub fn Types(comptime Result: type) type {
                 },
                 .money => |value| try putInt(i64, out, &at, value),
                 .pg_lsn, .xid8 => |value| try putInt(u64, out, &at, value),
+                .inet => |*value| {
+                    const size: u8 = if (value.family == 4) 4 else 16;
+                    try put(out, &at, &.{ if (value.family == 4) 2 else 3, value.bits, @intFromBool(value.cidr), size });
+                    try put(out, &at, value.address[0..size]);
+                },
+                .macaddr => |*value| try put(out, &at, value),
                 .range => |*span| {
                     const value = Io.Ranges.decode(span.slice());
                     try put(out, &at, &.{span.bytes[1]});
@@ -341,6 +349,26 @@ pub fn Types(comptime Result: type) type {
         fn decodeBinary(bytes: []const u8, data_type: DataType) Error!Cell {
             if (Io.elementData(data_type) != null) return decodeArray(bytes, data_type);
             if (Io.rangeSubtype(Io.typeOfData(data_type)) != null) return decodeRange(bytes, data_type);
+            switch (data_type) {
+                // inet_recv: the flag byte is ignored; the target type decides.
+                .inet, .cidr => {
+                    if (bytes.len < 4 or (bytes[0] != 2 and bytes[0] != 3)) return error.ProtocolViolation;
+                    const size: usize = if (bytes[0] == 2) 4 else 16;
+                    if (bytes[3] != size or bytes.len != 4 + size or bytes[1] > size * 8) return error.ProtocolViolation;
+                    var text: [Io.format_bytes]u8 = undefined;
+                    var value: Cell = .{ .inet = .{ .family = if (size == 4) 4 else 6, .bits = bytes[1], .cidr = data_type == .cidr } };
+                    @memcpy(value.inet.address[0..size], bytes[4..]);
+                    // Round-trip through the input function (cidr mask check).
+                    const utc: Session = .{};
+                    const rendered = Io.format(&value, true, &utc, &text) catch return error.ProtocolViolation;
+                    return Io.parse(Io.typeOfData(data_type), -1, rendered, &utc) catch error.ProtocolViolation;
+                },
+                .macaddr => {
+                    if (bytes.len != 6) return error.ProtocolViolation;
+                    return .{ .macaddr = bytes[0..6].* };
+                },
+                else => {},
+            }
             const need: usize = switch (data_type) {
                 .smallint => 2,
                 .integer32, .oid, .real, .date => 4,

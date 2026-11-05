@@ -922,6 +922,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "isempty", .func = .isempty },           .{ .name = "lower_inc", .func = .lower_inc },
                 .{ .name = "upper_inc", .func = .upper_inc },       .{ .name = "lower_inf", .func = .lower_inf },
                 .{ .name = "upper_inf", .func = .upper_inf },
+                // Network address functions (B11 advanced types).
+                .{ .name = "host", .func = .inet_host },            .{ .name = "masklen", .func = .masklen },
+                .{ .name = "family", .func = .inet_family },        .{ .name = "network", .func = .inet_network },
+                .{ .name = "broadcast", .func = .broadcast },       .{ .name = "netmask", .func = .netmask },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1046,6 +1050,11 @@ pub fn Binder(comptime config: types.Config) type {
                     .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz, .money => arg_ty,
                     // pg_lsn_larger/smaller and xid8_larger/smaller.
                     .pg_lsn, .xid8 => arg_ty,
+                    // network_larger/network_smaller (cidr input converts).
+                    .inet, .cidr => blk: {
+                        n.b = try convert(context, arg, .inet, -1, .implicit);
+                        break :blk .inet;
+                    },
                     .name, .varchar => blk: {
                         n.b = try convert(context, arg, .text, -1, .implicit);
                         break :blk .text;
@@ -1494,7 +1503,35 @@ pub fn Binder(comptime config: types.Config) type {
                 .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                 .array_append, .array_prepend, .array_cat, .array_to_string => try typeArrayFunction(context, n, count),
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
+                .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => {
+                    // One inet argument (cidr converts implicitly).
+                    if (count != 1) return error.UndefinedFunction;
+                    n.b = try convert(context, n.b, .inet, -1, .implicit);
+                    if (context.node(n.b).ty != .inet) return error.UndefinedFunction;
+                    n.ty = switch (n.func) {
+                        .inet_host => .text,
+                        .masklen, .inet_family => .int4,
+                        .inet_network => .cidr,
+                        else => .inet,
+                    };
+                    n.constant = isConstant(context, n.b);
+                },
             }
+        }
+
+        fn networkType(ty: ast.Type) bool {
+            return ty == .inet or ty == .cidr;
+        }
+
+        /// inet << <<= >> >>= && inet (cidr converts implicitly; an untyped
+        /// side is inet).
+        fn networkOperator(context: *const Context, n: *ast.Node) Error!void {
+            if (context.node(n.a).ty == .unknown) try coerce(context, n.a, .inet);
+            if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .inet);
+            if (!networkType(context.node(n.a).ty) or !networkType(context.node(n.b).ty)) return error.UndefinedFunction;
+            n.a = try convert(context, n.a, .inet, -1, .implicit);
+            n.b = try convert(context, n.b, .inet, -1, .implicit);
+            n.ty = .boolean;
         }
 
         // ---- ranges (B11 advanced types) ------------------------------------
@@ -2828,10 +2865,11 @@ pub fn Binder(comptime config: types.Config) type {
                             n.ty = .text;
                         },
                         .contains, .contained => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (types.isArray(context.node(n.a).ty) or types.isArray(context.node(n.b).ty)) try arrayContainment(context, n) else try jsonOperator(context, n),
-                        .overlap => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else try arrayContainment(context, n),
+                        .overlap => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (networkType(context.node(n.a).ty) or networkType(context.node(n.b).ty)) try networkOperator(context, n) else try arrayContainment(context, n),
+                        .within_eq, .contains_eq => try networkOperator(context, n),
                         .over_left, .over_right, .adjacent => try rangeOperator(context, n),
                         .arrow, .arrow_text, .path, .path_text, .exists => try jsonOperator(context, n),
-                        .shift_left, .shift_right => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else try bitwiseType(context, n),
+                        .shift_left, .shift_right => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (networkType(context.node(n.a).ty) or networkType(context.node(n.b).ty)) try networkOperator(context, n) else try bitwiseType(context, n),
                         .bit_and, .bit_or, .bit_xor => try bitwiseType(context, n),
                         .neg, .pos, .bit_not => unreachable,
                     }
