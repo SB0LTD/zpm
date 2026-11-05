@@ -39,7 +39,15 @@ pub const TypeName = types.Type;
 /// `contained` <@, `exists` ?.
 pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct,
     // Integer bitwise operators (B11): & | # << >> and prefix ~.
-    bit_and, bit_or, bit_xor, shift_left, shift_right, bit_not };
+    bit_and, bit_or, bit_xor, shift_left, shift_right, bit_not,
+    // Array/range overlap && (B11 advanced types).
+    overlap,
+    // Range &< &> -|-.
+    over_left, over_right, adjacent,
+    // Network <<= and >>=.
+    within_eq, contains_eq,
+    // Geometric <-> (distance) and ~= (same as).
+    distance, same };
 
 /// Built-in functions bound by name.
 pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
@@ -57,7 +65,26 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // Formatting input functions (B11, functions_format.sig); STABLE.
     to_date, to_number, to_timestamp,
     // Unicode normalization (B11, functions_unicode.sig).
-    normalize, is_normalized };
+    normalize, is_normalized,
+    // Arrays (B11 advanced types, array_eval.sig). array_constructor is
+    // ARRAY[...] (arguments are elements or sub-arrays); array_subscript is
+    // base[...]... with its subscript layout in `integer` (array_eval.sig);
+    // array_any is `a op ANY/ALL (array)` encoded like in_subquery (op,
+    // negated for ALL).
+    array_constructor, array_subscript, array_any, array_length, cardinality, array_ndims, array_dims, array_lower, array_upper,
+    array_append, array_prepend, array_cat, array_to_string,
+    // Ranges (B11 advanced types, range_eval.sig): int4range(...) and the
+    // other constructors (result type in the node), lower/upper of a range,
+    // and the bound predicates.
+    range_constructor, range_lower, range_upper, isempty, lower_inc, upper_inc, lower_inf, upper_inf,
+    // Network address functions (B11 advanced types, network.sig).
+    inet_host, masklen, inet_family, inet_network, broadcast, netmask,
+    // Geometric functions (B11 advanced types, geometric.sig).
+    point_constructor, box_constructor, area, center, width, height,
+    // XML (B11 advanced types, xml.sig): XMLPARSE / XMLSERIALIZE (node
+    // `integer` 1 for DOCUMENT; XMLSERIALIZE's target in cast_type/typmod)
+    // and the well-formedness predicates.
+    xmlparse, xmlserialize, xml_is_well_formed, xml_is_well_formed_document, xml_is_well_formed_content };
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -89,6 +116,12 @@ pub fn immutableBuiltin(func: Func) bool {
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .overlaps, .aggregate_pair, .normalize, .is_normalized => true,
+        .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
+        .array_append, .array_prepend, .array_cat => true,
+        .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
+        .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
+        .point_constructor, .box_constructor, .area, .center, .width, .height => true,
+        .xmlparse, .xmlserialize, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
         else => false,
     };
 }
@@ -106,6 +139,11 @@ pub fn strictFunction(func: Func) bool {
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
+        .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
+        .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
+        .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
+        .point_constructor, .box_constructor, .area, .center, .width, .height => true,
+        .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
         else => false,
     };
 }

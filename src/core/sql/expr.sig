@@ -17,6 +17,11 @@ const float_text = @import("float_text.sig");
 const bytea_module = @import("bytea.sig");
 const builtins = @import("functions_eval.sig");
 const stats = @import("aggregates_stat.sig");
+const array_eval = @import("array_eval.sig");
+const range_eval = @import("range_eval.sig");
+const network = @import("network.sig");
+const geometric = @import("geometric.sig");
+const xml_module = @import("xml.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -338,6 +343,14 @@ pub fn Eval(comptime config: types.Config) type {
         fn formatType(oid: i64, typmod: i64) Error!V.Cell {
             const data_type = if (oid >= 0 and oid <= 0xffffffff) types.typeFromOid(@intCast(oid)) else null;
             const known = data_type orelse return textCell("???");
+            if (types.elementData(known)) |element| {
+                // An array: its element type (with the typmod) and `[]`.
+                var inner = try formatType(types.typeOid(element), typmod);
+                if (inner.text.len + 2 > config.text_bytes) return error.TextCapacity;
+                @memcpy(inner.text.bytes[inner.text.len..][0..2], "[]");
+                inner.text.len += 2;
+                return inner;
+            }
             var buffer: [64]u8 = undefined;
             var at: usize = 0;
             const append = struct {
@@ -656,10 +669,27 @@ pub fn Eval(comptime config: types.Config) type {
                         const right = try operandRef(ctx, n.b, &right_value);
                         return compareOp(n.op, left, right);
                     }
-                    if (n.op == .contains or n.op == .contained or n.op == .exists) {
+                    if (n.op == .contains or n.op == .contained or n.op == .exists or n.op == .overlap or n.op == .over_left or n.op == .over_right or n.op == .adjacent or n.op == .within_eq or n.op == .contains_eq or n.op == .same or
+                        ((n.op == .shift_left or n.op == .shift_right) and n.ty == .boolean))
+                    {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return null;
+                        if (left == .range or right == .range) return try range_eval.RangeEval(config, @This()).predicate(n.op, &left, &right);
+                        if (left == .point or left == .box) return switch (n.op) {
+                            .same => if (left == .point) geometric.samePoint(left.point, right.point) else geometric.sameBox(left.box, right.box),
+                            .contains => geometric.containsPoint(left.box, right.point),
+                            .contained => geometric.containsPoint(right.box, left.point),
+                            else => geometric.overlaps(left.box, right.box),
+                        };
+                        if (left == .inet) return switch (n.op) {
+                            .shift_left => network.within(&left.inet, &right.inet, false),
+                            .within_eq => network.within(&left.inet, &right.inet, true),
+                            .shift_right => network.within(&right.inet, &left.inet, false),
+                            .contains_eq => network.within(&right.inet, &left.inet, true),
+                            else => network.overlaps(&left.inet, &right.inet),
+                        };
+                        if (left == .array) return try array_eval.ArrayEval(config, @This()).containment(n.op, &left, &right, ctx.session);
                         return switch (n.op) {
                             .contains => J.contains(left.jsonb.slice(), right.jsonb.slice()),
                             .contained => J.contains(right.jsonb.slice(), left.jsonb.slice()),
@@ -787,10 +817,23 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists => return boolCell(try truth(ctx, id)),
+                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same => return boolCell(try truth(ctx, id)),
+                    .distance => {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return .null_value;
+                        return .{ .float8 = geometric.distance(left.point, right.point) };
+                    },
                     .concat => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
+                        if (types.isArray(n.ty)) {
+                            // array_cat / array_append / array_prepend are not strict.
+                            const left_array = types.isArray(node(ctx, n.a).ty);
+                            const right_array = types.isArray(node(ctx, n.b).ty);
+                            const kind: array_eval.ArrayEval(config, @This()).Concat = if (left_array and right_array) .cat else if (left_array) .append else .prepend;
+                            return array_eval.ArrayEval(config, @This()).concat(kind, &left, &right, n.ty);
+                        }
                         if (left == .null_value or right == .null_value) return .null_value;
                         if (n.ty == .jsonb) {
                             var out: J.Buffer = .{};
@@ -812,6 +855,8 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
+                        // Range << and >> are boolean predicates.
+                        if (n.ty == .boolean) return boolCell(try truth(ctx, id));
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return .null_value;
@@ -1006,6 +1051,65 @@ pub fn Eval(comptime config: types.Config) type {
                     .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
                     .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
                     .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
+                    .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
+                    .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
+                    .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
+                        const argument = try eval(ctx, n.b);
+                        if (argument == .null_value) return .null_value;
+                        const document = n.integer == 1;
+                        switch (n.func) {
+                            .xmlparse => {
+                                const bytes = argument.text.slice();
+                                if (document and !xml_module.validDocument(bytes)) return error.InvalidXmlDocument;
+                                if (!document and !xml_module.validContent(bytes)) return error.InvalidXmlContent;
+                                return .{ .xml = argument.text };
+                            },
+                            .xmlserialize => {
+                                if (document and !xml_module.validDocument(argument.xml.slice())) return error.NotAnXmlDocument;
+                                return cast(.{ .text = argument.xml }, .text, n.cast_type, n.typmod, ctx.session);
+                            },
+                            .xml_is_well_formed, .xml_is_well_formed_content => return .{ .boolean = xml_module.validContent(argument.text.slice()) },
+                            else => return .{ .boolean = xml_module.validDocument(argument.text.slice()) },
+                        }
+                    },
+                    .point_constructor, .box_constructor, .area, .center, .width, .height => {
+                        if (n.planned_null) return .null_value;
+                        const first = try eval(ctx, n.b);
+                        const second_id = node(ctx, n.b).next;
+                        const second: V.Cell = if (second_id == none) .null_value else try eval(ctx, second_id);
+                        if (first == .null_value or (second_id != none and second == .null_value)) return .null_value;
+                        return switch (n.func) {
+                            .point_constructor => .{ .point = .{ .x = first.float8, .y = second.float8 } },
+                            .box_constructor => .{ .box = geometric.fromCorners(first.point, second.point) },
+                            .area => .{ .float8 = geometric.area(first.box) },
+                            .width => .{ .float8 = geometric.width(first.box) },
+                            .height => .{ .float8 = geometric.height(first.box) },
+                            else => .{ .point = geometric.center(first.box) },
+                        };
+                    },
+                    .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => {
+                        const argument = try eval(ctx, n.b);
+                        if (argument == .null_value) return .null_value;
+                        const address = &argument.inet;
+                        return switch (n.func) {
+                            .inet_host => blk: {
+                                var full = address.*;
+                                full.bits = full.maxBits();
+                                var buffer: [64]u8 = undefined;
+                                const shown = network.format(&full, false, &buffer);
+                                if (shown.len > config.text_bytes) return error.TextCapacity;
+                                var text: V.Text = .{ .len = shown.len };
+                                @memcpy(text.bytes[0..shown.len], shown);
+                                break :blk V.Cell{ .text = text };
+                            },
+                            .masklen => .{ .integer = address.bits },
+                            .inet_family => .{ .integer = address.family },
+                            .inet_network => .{ .inet = network.network(address) },
+                            .broadcast => .{ .inet = network.broadcast(address) },
+                            else => .{ .inet = network.netmask(address) },
+                        };
+                    },
                     .aggregate_pair => {
                         // Both inputs are evaluated; NULL skips the row (strict).
                         const y = try eval(ctx, n.b);

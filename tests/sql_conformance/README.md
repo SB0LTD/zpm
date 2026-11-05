@@ -101,13 +101,13 @@ component is missing. The annotations below separate those cases.
 | PG.TYPE.TIME | TIME/TIMETZ | Syntax |
 | PG.TYPE.MONEY | MONEY | Syntax |
 | PG.TYPE.BIT | BIT/VARBIT | Syntax |
-| PG.TYPE.NETWORK | Network/MAC | Syntax |
-| PG.TYPE.GEOMETRIC | Geometric types | UndefinedFunction |
-| PG.TYPE.XML | XML | Syntax |
-| PG.TYPE.ARRAY | Arrays | Syntax |
-| PG.TYPE.RANGE | Range/multirange | Syntax |
-| PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax |
-| PG.TYPE.CATALOG_IDS | Additional catalog identifiers | Syntax |
+| PG.TYPE.NETWORK | Network/MAC | pass (B11 candidate); inet/cidr/macaddr, macaddr8 and inet arithmetic open |
+| PG.TYPE.GEOMETRIC | Geometric types | pass (B11 candidate); point/box only, other geometric types open |
+| PG.TYPE.XML | XML | pass (B11 candidate); well-formedness subset, XPath/xmltable/publishing functions open |
+| PG.TYPE.ARRAY | Arrays | pass (B11 candidate); unnest, element assignment and array aggregates open |
+| PG.TYPE.RANGE | Range/multirange | pass (B11 candidate); built-in ranges only, multiranges open |
+| PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax; not implemented (oracle expects database-local OIDs 18673/18682) |
+| PG.TYPE.CATALOG_IDS | Additional catalog identifiers | pass (B11 candidate); pg_lsn/xid8, closure incomplete |
 | PG.JSON.OPS | JSON operators | qualified smoke pass; lexical extraction, broader JSON closure incomplete |
 | PG.JSONB.MODIFY | Remaining JSONB operations | UndefinedFunction |
 | PG.JSON.PATH | JSONPATH/SQL-JSON | UndefinedFunction |

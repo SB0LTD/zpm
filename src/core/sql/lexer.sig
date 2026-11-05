@@ -212,6 +212,21 @@ pub const Keyword = enum {
     bit,
     varbit,
     money,
+    // Advanced types (B11 advanced types lane).
+    pg_lsn,
+    xid8,
+    int4range,
+    int8range,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
+    inet,
+    cidr,
+    macaddr,
+    point,
+    box,
+    xml,
 };
 
 /// Words that cannot be unquoted identifiers.
@@ -288,6 +303,21 @@ pub const Symbol = enum {
     shift_left,
     shift_right,
     tilde,
+    // Arrays and ranges (B11 advanced types): [ ] : and &&.
+    lbracket,
+    rbracket,
+    colon,
+    overlap,
+    // Ranges: &< &> -|-.
+    over_left,
+    over_right,
+    adjacent,
+    // Networks: <<= and >>=.
+    within_eq,
+    contains_eq,
+    // Geometric <-> and ~=.
+    distance,
+    same,
 };
 
 pub const Token = struct {
@@ -559,8 +589,14 @@ pub const Tokenizer = struct {
             '-' => if (following == '>') blk: {
                 width = if (third == '>') 3 else 2;
                 break :blk if (third == '>') Symbol.arrow_text else Symbol.arrow;
+            } else if (following == '|' and third == '-') blk: {
+                width = 3;
+                break :blk Symbol.adjacent;
             } else .minus,
-            '<' => if (following == '=') blk: {
+            '<' => if (following == '-' and third == '>') blk: {
+                width = 3;
+                break :blk Symbol.distance;
+            } else if (following == '=') blk: {
                 width = 2;
                 break :blk Symbol.le;
             } else if (following == '>') blk: {
@@ -570,15 +606,15 @@ pub const Tokenizer = struct {
                 width = 2;
                 break :blk Symbol.contained;
             } else if (following == '<') blk: {
-                width = 2;
-                break :blk Symbol.shift_left;
+                width = if (third == '=') 3 else 2;
+                break :blk if (third == '=') Symbol.within_eq else Symbol.shift_left;
             } else .lt,
             '>' => if (following == '=') blk: {
                 width = 2;
                 break :blk Symbol.ge;
             } else if (following == '>') blk: {
-                width = 2;
-                break :blk Symbol.shift_right;
+                width = if (third == '=') 3 else 2;
+                break :blk if (third == '=') Symbol.contains_eq else Symbol.shift_right;
             } else .gt,
             '!' => if (following == '=') blk: {
                 width = 2;
@@ -588,12 +624,26 @@ pub const Tokenizer = struct {
                 width = 2;
                 break :blk Symbol.concat;
             } else .pipe,
-            '&' => .ampersand,
-            '~' => .tilde,
+            '&' => if (following == '&') blk: {
+                width = 2;
+                break :blk Symbol.overlap;
+            } else if (following == '<') blk: {
+                width = 2;
+                break :blk Symbol.over_left;
+            } else if (following == '>') blk: {
+                width = 2;
+                break :blk Symbol.over_right;
+            } else .ampersand,
+            '[' => .lbracket,
+            ']' => .rbracket,
+            '~' => if (following == '=') blk: {
+                width = 2;
+                break :blk Symbol.same;
+            } else .tilde,
             ':' => if (following == ':') blk: {
                 width = 2;
                 break :blk Symbol.cast;
-            } else return error.Syntax,
+            } else .colon,
             '#' => if (following == '>') blk: {
                 width = if (third == '>') 3 else 2;
                 break :blk if (third == '>') Symbol.path_text else Symbol.path;

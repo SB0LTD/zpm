@@ -8,6 +8,10 @@ const character = @import("character.sig");
 const uuid = @import("uuid.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
+const array_module = @import("array.sig");
+const range_module = @import("range.sig");
+const network = @import("network.sig");
+const geometric = @import("geometric.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -284,6 +288,19 @@ pub const Error = error{
     UndefinedSchema,
     /// SQLSTATE 42P06: CREATE SCHEMA of an existing name.
     DuplicateSchema,
+    /// SQLSTATE 42P18: the type of an expression (an empty ARRAY[]) cannot
+    /// be determined.
+    IndeterminateDatatype,
+    /// SQLSTATE 2202E: mismatched array dimensions or subscripts.
+    ArraySubscriptError,
+    /// SQLSTATE 22000: invalid data (array_append to a multi-dimensional array).
+    DataException,
+    /// SQLSTATE 2200N: text is not well-formed XML content.
+    InvalidXmlContent,
+    /// SQLSTATE 2200M: text is not a well-formed XML document.
+    InvalidXmlDocument,
+    /// SQLSTATE 2200L: XMLSERIALIZE(DOCUMENT ...) of a value that is not one.
+    NotAnXmlDocument,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -342,11 +359,79 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money };
+/// The unnamed values are array types: the element's ordinal with
+/// array_bit set (arrayData/elementData); there are no arrays of arrays.
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
-/// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money };
+/// that has not been resolved by context yet. Unnamed values are array
+/// types, encoded like DataType's (arrayType/elementType).
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, _ };
+
+/// Array types set this bit over the element type's ordinal.
+pub const array_bit: u8 = 0x80;
+const data_type_count = @typeInfo(DataType).@"enum".field_names.len;
+const type_count = @typeInfo(Type).@"enum".field_names.len;
+
+/// The array type of a named element type (null for an array).
+pub fn arrayData(element: DataType) ?DataType {
+    const raw = @intFromEnum(element);
+    if (raw >= data_type_count) return null;
+    return @enumFromInt(raw | array_bit);
+}
+
+/// The element type of an array type (null for a scalar type).
+pub fn elementData(data_type: DataType) ?DataType {
+    const raw = @intFromEnum(data_type);
+    if (raw < array_bit or raw & ~array_bit >= data_type_count) return null;
+    return @enumFromInt(raw & ~array_bit);
+}
+
+pub fn arrayType(element: Type) ?Type {
+    const raw = @intFromEnum(element);
+    if (element == .unknown or raw >= type_count) return null;
+    return @enumFromInt(raw | array_bit);
+}
+
+pub fn elementType(ty: Type) ?Type {
+    const raw = @intFromEnum(ty);
+    if (raw < array_bit or raw & ~array_bit >= type_count or raw & ~array_bit == 0) return null;
+    return @enumFromInt(raw & ~array_bit);
+}
+
+pub fn isArray(ty: Type) bool {
+    return elementType(ty) != null;
+}
+
+/// The subtype of a built-in range type (null otherwise).
+pub fn rangeSubtype(ty: Type) ?Type {
+    return switch (ty) {
+        .int4range => .int4,
+        .int8range => .int8,
+        .numrange => .numeric,
+        .daterange => .date,
+        .tsrange => .timestamp,
+        .tstzrange => .timestamptz,
+        else => null,
+    };
+}
+
+/// The range type over a subtype stored as `subtype` (one per subtype).
+pub fn rangeOfData(subtype: DataType) ?DataType {
+    return switch (subtype) {
+        .integer32 => .int4range,
+        .integer => .int8range,
+        .numeric => .numrange,
+        .date => .daterange,
+        .timestamp => .tsrange,
+        .timestamptz => .tstzrange,
+        else => null,
+    };
+}
+
+pub fn isRange(ty: Type) bool {
+    return rangeSubtype(ty) != null;
+}
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -375,6 +460,21 @@ pub fn dataTypeOf(ty: Type) DataType {
         .bit => .bit,
         .varbit => .varbit,
         .money => .money,
+        .pg_lsn => .pg_lsn,
+        .xid8 => .xid8,
+        .int4range => .int4range,
+        .int8range => .int8range,
+        .numrange => .numrange,
+        .daterange => .daterange,
+        .tsrange => .tsrange,
+        .tstzrange => .tstzrange,
+        .inet => .inet,
+        .cidr => .cidr,
+        .macaddr => .macaddr,
+        .point => .point,
+        .box => .box,
+        .xml => .xml,
+        _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
 
@@ -405,6 +505,21 @@ pub fn typeOfData(data_type: DataType) Type {
         .bit => .bit,
         .varbit => .varbit,
         .money => .money,
+        .pg_lsn => .pg_lsn,
+        .xid8 => .xid8,
+        .int4range => .int4range,
+        .int8range => .int8range,
+        .numrange => .numrange,
+        .daterange => .daterange,
+        .tsrange => .tsrange,
+        .tstzrange => .tstzrange,
+        .inet => .inet,
+        .cidr => .cidr,
+        .macaddr => .macaddr,
+        .point => .point,
+        .box => .box,
+        .xml => .xml,
+        _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
 
@@ -413,6 +528,30 @@ pub fn typeOfData(data_type: DataType) Type {
 pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8, array: u32 };
 
 pub fn typeInfo(data_type: DataType) TypeInfo {
+    if (elementData(data_type)) |element| {
+        const base = baseInfo(element);
+        return .{ .oid = base.array, .name = array_names[@intFromEnum(element)], .len = -1, .category = 'A', .array = 0 };
+    }
+    return baseInfo(data_type);
+}
+
+/// typname of each named type's array type: `_` + the element typname.
+const array_names = blk: {
+    const fields = @typeInfo(DataType).@"enum".field_names;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |field, index| names[index] = "_" ++ baseInfo(@field(DataType, field)).name;
+    break :blk names;
+};
+
+/// SQL spelling of each named type's array type (`integer[]`).
+const array_sql_names = blk: {
+    const fields = @typeInfo(DataType).@"enum".field_names;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |field, index| names[index] = baseSqlName(@field(DataType, field)) ++ "[]";
+    break :blk names;
+};
+
+fn baseInfo(data_type: DataType) TypeInfo {
     return switch (data_type) {
         .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000 },
         .name => .{ .oid = 19, .name = "name", .len = 64, .category = 'S', .array = 1003 },
@@ -439,6 +578,21 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .bit => .{ .oid = 1560, .name = "bit", .len = -1, .category = 'V', .array = 1561 },
         .varbit => .{ .oid = 1562, .name = "varbit", .len = -1, .category = 'V', .array = 1563 },
         .money => .{ .oid = 790, .name = "money", .len = 8, .category = 'N', .array = 791 },
+        .pg_lsn => .{ .oid = 3220, .name = "pg_lsn", .len = 8, .category = 'U', .array = 3221 },
+        .xid8 => .{ .oid = 5069, .name = "xid8", .len = 8, .category = 'U', .array = 271 },
+        .int4range => .{ .oid = 3904, .name = "int4range", .len = -1, .category = 'R', .array = 3905 },
+        .int8range => .{ .oid = 3926, .name = "int8range", .len = -1, .category = 'R', .array = 3927 },
+        .numrange => .{ .oid = 3906, .name = "numrange", .len = -1, .category = 'R', .array = 3907 },
+        .daterange => .{ .oid = 3912, .name = "daterange", .len = -1, .category = 'R', .array = 3913 },
+        .tsrange => .{ .oid = 3908, .name = "tsrange", .len = -1, .category = 'R', .array = 3909 },
+        .tstzrange => .{ .oid = 3910, .name = "tstzrange", .len = -1, .category = 'R', .array = 3911 },
+        .inet => .{ .oid = 869, .name = "inet", .len = -1, .category = 'I', .array = 1041 },
+        .cidr => .{ .oid = 650, .name = "cidr", .len = -1, .category = 'I', .array = 651 },
+        .macaddr => .{ .oid = 829, .name = "macaddr", .len = 6, .category = 'U', .array = 1040 },
+        .point => .{ .oid = 600, .name = "point", .len = 16, .category = 'G', .array = 1017 },
+        .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020 },
+        .xml => .{ .oid = 142, .name = "xml", .len = -1, .category = 'U', .array = 143 },
+        _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
 
@@ -450,6 +604,11 @@ pub fn typeOid(data_type: DataType) u32 {
 /// SQL spelling of a type (format_type with no typmod, regtype output,
 /// information_schema.columns.data_type).
 pub fn sqlTypeName(data_type: DataType) []const u8 {
+    if (elementData(data_type)) |element| return array_sql_names[@intFromEnum(element)];
+    return baseSqlName(data_type);
+}
+
+fn baseSqlName(data_type: DataType) []const u8 {
     return switch (data_type) {
         .integer => "bigint",
         .integer32 => "integer",
@@ -476,6 +635,21 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .bit => "bit",
         .varbit => "bit varying",
         .money => "money",
+        .pg_lsn => "pg_lsn",
+        .xid8 => "xid8",
+        .int4range => "int4range",
+        .int8range => "int8range",
+        .numrange => "numrange",
+        .daterange => "daterange",
+        .tsrange => "tsrange",
+        .tstzrange => "tstzrange",
+        .inet => "inet",
+        .cidr => "cidr",
+        .macaddr => "macaddr",
+        .point => "point",
+        .box => "box",
+        .xml => "xml",
+        _ => "",
     };
 }
 
@@ -507,12 +681,42 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .bit => "bit_in",
         .varbit => "varbit_in",
         .money => "cash_in",
+        .pg_lsn => "pg_lsn_in",
+        .xid8 => "xid8in",
+        .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => "range_in",
+        .inet => "inet_in",
+        .cidr => "cidr_in",
+        .macaddr => "macaddr_in",
+        .point => "point_in",
+        .box => "box_in",
+        .xml => "xml_in",
+        _ => "array_in",
     };
 }
 
 /// regtype input: type names and aliases, optionally pg_catalog-qualified
 /// or quoted, any typmod suffix ignored. null when unknown.
 pub fn typeByName(input: []const u8) ?DataType {
+    var trimmed = input;
+    while (trimmed.len != 0 and (trimmed[trimmed.len - 1] == ' ' or trimmed[trimmed.len - 1] == '\t')) trimmed = trimmed[0 .. trimmed.len - 1];
+    // `element[]` (any number of bracket pairs: arrays have no dimension type).
+    if (trimmed.len > 2 and trimmed[trimmed.len - 1] == ']') {
+        var end = trimmed.len;
+        while (end > 0 and trimmed[end - 1] == ']') {
+            var open = end - 1;
+            while (open > 0 and trimmed[open - 1] != '[') open -= 1;
+            if (open == 0) return null;
+            for (trimmed[open .. end - 1]) |byte| if (!digit(byte)) return null;
+            end = open - 1;
+            while (end > 0 and trimmed[end - 1] == ' ') end -= 1;
+        }
+        const element = scalarByName(trimmed[0..end]) orelse return null;
+        return arrayData(element);
+    }
+    return scalarByName(trimmed);
+}
+
+fn scalarByName(input: []const u8) ?DataType {
     var text = input;
     while (text.len != 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
     while (text.len != 0 and (text[text.len - 1] == ' ' or text[text.len - 1] == '\t')) text = text[0 .. text.len - 1];
@@ -547,6 +751,8 @@ pub fn typeByName(input: []const u8) ?DataType {
     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
         const data_type = @field(DataType, field);
         if (same(name, typeInfo(data_type).name)) return data_type;
+        // `_element`: the array type's typname.
+        if (name.len > 1 and name[0] == '_' and same(name[1..], typeInfo(data_type).name)) return arrayData(data_type);
     }
     return null;
 }
@@ -554,6 +760,9 @@ pub fn typeByName(input: []const u8) ?DataType {
 pub fn typeFromOid(oid: u32) ?DataType {
     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
         if (typeInfo(@field(DataType, field)).oid == oid) return @field(DataType, field);
+    }
+    inline for (@typeInfo(DataType).@"enum".field_names) |field| {
+        if (oid != 0 and baseInfo(@field(DataType, field)).array == oid) return arrayData(@field(DataType, field));
     }
     return null;
 }
@@ -624,7 +833,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -650,7 +859,28 @@ pub fn Values(comptime config: Config) type {
             bits: BitString,
             /// MONEY: cents (money.sig).
             money: i64,
+            /// pg_lsn: a 64-bit WAL position (catalog_ids.sig).
+            pg_lsn: u64,
+            /// xid8: a 64-bit full transaction id (catalog_ids.sig).
+            xid8: u64,
+            /// Arrays of every element type (array.sig layout).
+            array: Text,
+            /// Built-in ranges (range.sig layout).
+            range: Text,
+            /// inet and cidr (network.sig; `cidr` marks a cidr value).
+            inet: network.Inet,
+            macaddr: network.Mac,
+            point: geometric.Point,
+            box: geometric.Box,
+            /// XML: the stored (validated) text.
+            xml: Text,
         };
+
+        /// Range values of these cells (range.sig).
+        pub const Ranges = range_module.Ranges(@This());
+
+        /// Array values of these cells (array.sig).
+        pub const Arrays = array_module.Arrays(@This());
 
         pub const Row = struct {
             cells: [config.columns]Cell = @splat(.null_value),
@@ -690,6 +920,15 @@ pub fn Values(comptime config: Config) type {
                 .timetz => .timetz,
                 .bit, .varbit => .bits,
                 .money => .money,
+                .pg_lsn => .pg_lsn,
+                .xid8 => .xid8,
+                .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => .range,
+                .inet, .cidr => .inet,
+                .macaddr => .macaddr,
+                .point => .point,
+                .box => .box,
+                .xml => .xml,
+                _ => .array,
             };
         }
 
@@ -722,6 +961,15 @@ pub fn Values(comptime config: Config) type {
                 .timetz => |value| time_of_day.compareTimeTz(value, right.timetz),
                 .bits => |*value| BitString.compare(value, &right.bits),
                 .money => |value| order(i64, value, right.money),
+                .pg_lsn => |value| order(u64, value, right.pg_lsn),
+                .xid8 => |value| order(u64, value, right.xid8),
+                .array => |*value| Arrays.compare(value.slice(), right.array.slice()),
+                .range => |*value| Ranges.compare(value.slice(), right.range.slice()),
+                .inet => |*value| network.compare(value, &right.inet),
+                .macaddr => |*value| bytesOrder(value, &right.macaddr),
+                .point => |value| geometric.comparePoints(value, right.point),
+                .box => |value| geometric.compareBoxes(value, right.box),
+                .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
             };
         }
 
@@ -767,7 +1015,7 @@ pub fn Values(comptime config: Config) type {
             // Variable/composite representations retain their canonical hashing.
             switch (value.*) {
                 .integer => |integer| return wordHash(@bitCast(integer), tag),
-                .text, .bytea => |*text| {
+                .text, .bytea, .xml => |*text| {
                     mix(&code, tag);
                     for (text.slice()) |byte| code = (code ^ byte) *% 1099511628211;
                 },
@@ -780,6 +1028,28 @@ pub fn Values(comptime config: Config) type {
                 },
                 .date => |days| return wordHash(@bitCast(@as(i64, days)), tag),
                 .timestamp, .timestamptz, .time, .money => |us| return wordHash(@bitCast(us), tag),
+                .pg_lsn, .xid8 => |word| return wordHash(word, tag),
+                .array => |*items| return wordHash(Arrays.hash(items.slice()), tag),
+                .range => |*span| return wordHash(Ranges.hash(span.slice()), tag),
+                // network_cmp ignores the cidr flag; so does the hash.
+                .inet => |*address| {
+                    mix(&code, tag);
+                    mix(&code, @as(u64, address.family) << 8 | address.bits);
+                    for (address.address) |byte| code = (code ^ byte) *% 1099511628211;
+                },
+                .macaddr => |*bytes| {
+                    mix(&code, tag);
+                    for (bytes) |byte| code = (code ^ byte) *% 1099511628211;
+                },
+                .point => |point| {
+                    mix(&code, tag);
+                    mix(&code, @bitCast(normalFloat(point.x)));
+                    mix(&code, @bitCast(normalFloat(point.y)));
+                },
+                .box => |box| {
+                    mix(&code, tag);
+                    for ([_]f64{ box.high.x, box.high.y, box.low.x, box.low.y }) |coordinate| mix(&code, @bitCast(normalFloat(coordinate)));
+                },
                 .timetz => |time| {
                     mix(&code, tag);
                     mix(&code, @bitCast(time.us));
@@ -829,6 +1099,23 @@ pub fn Values(comptime config: Config) type {
                 return;
             }
             if (@as(CellTag, value.*) != cellTag(column.data_type)) return error.TypeMismatch;
+            if (value.* == .inet and value.inet.cidr != (column.data_type == .cidr)) return error.TypeMismatch;
+            if (value.* == .range) {
+                const subtype = typeOfData(Ranges.subtypeOf(value.range.slice()));
+                if (rangeSubtype(typeOfData(column.data_type)) != subtype) return error.TypeMismatch;
+                return;
+            }
+            if (value.* == .array) {
+                // The element type and every element's own checks (CHAR(n),
+                // VARCHAR(n) and BIT(n) lengths apply to elements).
+                const element = elementData(column.data_type) orelse return error.TypeMismatch;
+                if (Arrays.elementType(value.array.slice()) != element) return error.TypeMismatch;
+                const member: Column = .{ .data_type = element, .typmod = column.typmod };
+                var reader = Arrays.Reader.init(value.array.slice());
+                var cell: Cell = undefined;
+                while (reader.next(&cell)) try validate(&member, &cell);
+                return;
+            }
             switch (column.data_type) {
                 .varchar => if (!character.fits(value.text.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bpchar => if (!character.fits(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,

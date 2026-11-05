@@ -29,6 +29,7 @@ const numeric = @import("numeric.sig");
 const sequence = @import("sequence.sig");
 const character = @import("character.sig");
 const bit_string = @import("bit_string.sig");
+const array_module = @import("array.sig");
 const Error = types.Error;
 const Token = lexer.Token;
 const Symbol = lexer.Symbol;
@@ -721,6 +722,7 @@ pub fn Parser(comptime config: types.Config) type {
             return switch (token.keyword) {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
+                .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml => true,
                 else => false,
             };
         }
@@ -766,7 +768,34 @@ pub fn Parser(comptime config: types.Config) type {
             return bit_string.typmodOf(length);
         }
 
+        /// A type name with an optional array suffix: `[]`, `[n]` (repeated;
+        /// sizes and dimensions are ignored) or `ARRAY [n]`.
         fn typeName(self: *Self) Error!TypeSpec {
+            var spec = try self.scalarTypeName();
+            var array = false;
+            while (self.isSymbol(.lbracket)) {
+                try self.advance();
+                if (self.current.kind == .integer) try self.advance();
+                try self.expectSymbol(.rbracket);
+                array = true;
+            }
+            if (!array and self.rawWord("array")) {
+                try self.advance();
+                if (try self.takeSymbol(.lbracket)) {
+                    if (self.current.kind != .integer) return error.Syntax;
+                    try self.advance();
+                    try self.expectSymbol(.rbracket);
+                }
+                array = true;
+            }
+            if (array) {
+                if (spec.typmod == ast.regclass_typmod or spec.typmod == ast.regtype_typmod) return error.UnsupportedStatement;
+                spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
+            }
+            return spec;
+        }
+
+        fn scalarTypeName(self: *Self) Error!TypeSpec {
             const word = self.current;
             if (word.kind != .word or !typeWord(word)) return error.Syntax;
             try self.advance();
@@ -843,6 +872,20 @@ pub fn Parser(comptime config: types.Config) type {
                 },
                 .varbit => .{ .ty = .varbit, .typmod = try self.bitLength(false) },
                 .money => .{ .ty = .money },
+                .pg_lsn => .{ .ty = .pg_lsn },
+                .xid8 => .{ .ty = .xid8 },
+                .int4range => .{ .ty = .int4range },
+                .int8range => .{ .ty = .int8range },
+                .numrange => .{ .ty = .numrange },
+                .daterange => .{ .ty = .daterange },
+                .tsrange => .{ .ty = .tsrange },
+                .tstzrange => .{ .ty = .tstzrange },
+                .inet => .{ .ty = .inet },
+                .cidr => .{ .ty = .cidr },
+                .macaddr => .{ .ty = .macaddr },
+                .point => .{ .ty = .point },
+                .box => .{ .ty = .box },
+                .xml => .{ .ty = .xml },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -1813,8 +1856,23 @@ pub fn Parser(comptime config: types.Config) type {
                     const all = self.isWord("ALL");
                     try self.advance();
                     try self.expectSymbol(.lparen);
-                    // Array-valued ANY/ALL is a separate PostgreSQL extension.
-                    if (!self.isWord("SELECT") and !self.isWord("WITH") and !self.isSymbol(.lparen)) return error.UnsupportedStatement;
+                    if (!self.isWord("SELECT") and !self.isWord("WITH") and !self.isSymbol(.lparen)) {
+                        // `x op ANY/ALL (array)`: an array_any call over
+                        // (x, array), with in_subquery's op/negated encoding.
+                        const array = try self.expression();
+                        try self.expectSymbol(.rparen);
+                        const any = try self.pool.add(.{ .kind = .function, .func = .array_any, .op = if (all) oppositeComparison(op) else op, .negated = all, .b = left });
+                        self.pool.nodes[left].next = array;
+                        try self.pool.raise(any, left);
+                        try self.pool.raise(any, array);
+                        left = try self.castTail(any);
+                        left = try self.atZoneTail(left);
+                        left = try self.multiplicativeTail(left);
+                        left = try self.additiveTail(left);
+                        left = try self.otherTail(left);
+                        left = try self.patternTail(left);
+                        continue;
+                    }
                     const inner = try self.query();
                     try self.expectSymbol(.rparen);
                     self.pool.complex = true;
@@ -1925,6 +1983,14 @@ pub fn Parser(comptime config: types.Config) type {
                     .hash => .bit_xor,
                     .shift_left => .shift_left,
                     .shift_right => .shift_right,
+                    .overlap => .overlap,
+                    .over_left => .over_left,
+                    .over_right => .over_right,
+                    .adjacent => .adjacent,
+                    .within_eq => .within_eq,
+                    .contains_eq => .contains_eq,
+                    .distance => .distance,
+                    .same => .same,
                     else => break,
                 };
                 try self.advance();
@@ -2422,7 +2488,7 @@ pub fn Parser(comptime config: types.Config) type {
                         return self.overlapsTail(row);
                     }
                     try self.expectSymbol(.rparen);
-                    return inner;
+                    return self.subscriptTail(inner);
                 },
                 .end => return error.Syntax,
                 .word, .quoted_word => {},
@@ -2474,6 +2540,38 @@ pub fn Parser(comptime config: types.Config) type {
                         return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
                     }
                 }
+                // XMLPARSE({DOCUMENT|CONTENT} expr [{PRESERVE|STRIP} WHITESPACE])
+                // and XMLSERIALIZE({DOCUMENT|CONTENT} expr AS type).
+                if (self.mode == .standard and (wordIs(self.source, token, "xmlparse") or wordIs(self.source, token, "xmlserialize")) and lparenNext(try self.peek())) {
+                    const serialize = wordIs(self.source, token, "xmlserialize");
+                    const name = try self.identifier();
+                    try self.expectSymbol(.lparen);
+                    var document = false;
+                    if (try self.takeRaw("document")) {
+                        document = true;
+                    } else if (!try self.takeRaw("content")) return error.Syntax;
+                    const argument = try self.expression();
+                    var call: ast.Node = .{ .kind = .function, .func = if (serialize) .xmlserialize else .xmlparse, .name = name, .b = argument, .integer = @intFromBool(document) };
+                    if (serialize) {
+                        try self.expectWord("AS");
+                        const target = try self.typeName();
+                        call.cast_type = target.ty;
+                        call.typmod = target.typmod;
+                        if ((try self.takeRaw("indent")) or (try self.takeRaw("no"))) return error.UnsupportedStatement;
+                    } else if ((try self.takeRaw("preserve")) or (try self.takeRaw("strip"))) {
+                        if (!try self.takeRaw("whitespace")) return error.Syntax;
+                    }
+                    try self.expectSymbol(.rparen);
+                    return self.pool.add(call);
+                }
+                // ARRAY[...] constructors.
+                if (self.mode == .standard and wordIs(self.source, token, "array")) {
+                    const after = try self.peek();
+                    if (after.kind == .symbol and after.symbol == .lbracket) {
+                        const name = try self.identifier();
+                        return self.arrayConstructor(name);
+                    }
+                }
                 // SQL-standard niladic functions.
                 if (wordIs(self.source, token, "current_timestamp") or wordIs(self.source, token, "current_date")) {
                     const name = try self.identifier();
@@ -2520,9 +2618,65 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeSymbol(.dot)) {
                 if (self.mode == .standard and try self.takeSymbol(.star)) return self.pool.add(.{ .kind = .column, .star = true, .qualifier = name });
                 const column = try self.identifier();
-                return self.pool.add(.{ .kind = .column, .name = column, .qualifier = name });
+                return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = column, .qualifier = name }));
             }
-            return self.pool.add(.{ .kind = .column, .name = name });
+            return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = name }));
+        }
+
+        /// `[elem, ...]` after ARRAY (and nested `[...]` sub-arrays): an
+        /// array_constructor call named `array`.
+        fn arrayConstructor(self: *Self, name: ast.Ident) Error!u16 {
+            try self.enter();
+            defer self.leave();
+            try self.expectSymbol(.lbracket);
+            const node = try self.pool.add(.{ .kind = .function, .func = .array_constructor, .name = name });
+            if (try self.takeSymbol(.rbracket)) return node;
+            var last: u16 = none;
+            while (true) {
+                const item = if (self.isSymbol(.lbracket)) try self.arrayConstructor(name) else try self.expression();
+                if (last == none) self.pool.nodes[node].b = item else self.pool.nodes[last].next = item;
+                try self.pool.raise(node, item);
+                last = item;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rbracket);
+            return node;
+        }
+
+        /// `base[i]`, `base[lo:hi]` (either bound optional), repeated: one
+        /// array_subscript call over every subscript (array.Subscripts).
+        fn subscriptTail(self: *Self, base: u16) Error!u16 {
+            if (self.mode != .standard or !self.isSymbol(.lbracket)) return base;
+            const node = try self.pool.add(.{ .kind = .function, .func = .array_subscript, .b = base, .name = self.pool.nodes[base].name });
+            var layout: array_module.Subscripts = .{};
+            var last = base;
+            while (try self.takeSymbol(.lbracket)) {
+                if (layout.count == array_module.max_dims) return error.ProgramLimitExceeded;
+                var flag: u3 = 0;
+                var bounds: [2]u16 = .{ none, none };
+                if (!self.isSymbol(.colon)) {
+                    bounds[0] = try self.expression();
+                    flag |= array_module.Subscripts.lower_flag;
+                }
+                if (try self.takeSymbol(.colon)) {
+                    flag |= array_module.Subscripts.slice_flag;
+                    if (!self.isSymbol(.rbracket)) {
+                        bounds[1] = try self.expression();
+                        flag |= array_module.Subscripts.upper_flag;
+                    }
+                } else if (bounds[0] == none) return error.Syntax;
+                try self.expectSymbol(.rbracket);
+                for (bounds) |bound| if (bound != none) {
+                    self.pool.nodes[last].next = bound;
+                    try self.pool.raise(node, bound);
+                    last = bound;
+                };
+                layout.flags[layout.count] = flag;
+                layout.count += 1;
+            }
+            try self.pool.raise(node, base);
+            self.pool.nodes[node].integer = layout.encode();
+            return node;
         }
     };
 }

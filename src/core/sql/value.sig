@@ -21,6 +21,12 @@ const bytea = @import("bytea.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
 const money = @import("money.sig");
+const catalog_ids = @import("catalog_ids.sig");
+const array_text = @import("array_text.sig");
+const range_text = @import("range_text.sig");
+const network = @import("network.sig");
+const geometric = @import("geometric.sig");
+const xml = @import("xml.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -109,6 +115,40 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         if (stringType(from)) return context == .explicit;
         return false;
     }
+    if (from == .inet or from == .cidr or to == .inet or to == .cidr or from == .macaddr or to == .macaddr) {
+        // cidr -> inet is implicit, inet -> cidr by assignment; strings by
+        // I/O conversion (text(inet) by assignment).
+        if (from == .cidr and to == .inet) return true;
+        if (from == .inet and to == .cidr) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (from == .xml or to == .xml) {
+        // xml -> text/varchar/bpchar by assignment (binary); text -> xml
+        // explicitly (XMLPARSE CONTENT).
+        if (from == .xml) return characterType(to) and context != .implicit;
+        return characterType(from) and context == .explicit;
+    }
+    if (from == .point or to == .point or from == .box or to == .box) {
+        // Geometric types: strings by I/O conversion only here.
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (types.isRange(from) or types.isRange(to)) {
+        // Ranges have no pg_cast entries: strings by I/O conversion only.
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (from == .pg_lsn or to == .pg_lsn or from == .xid8 or to == .xid8) {
+        // pg_lsn and xid8 have no pg_cast entries for the supported types
+        // (xid8 -> xid is outside them): strings by I/O conversion only.
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
     if (bitType(from) or bitType(to)) {
         // bit <-> varbit are implicit (binary); int4/int8 <-> bit explicit.
         if (bitType(from) and bitType(to)) return true;
@@ -172,6 +212,14 @@ fn datetimeRank(ty: Type) u8 {
 pub fn castable(from: Type, to: Type, context: Context) bool {
     if (from == to) return true;
     if (from == .unknown) return true;
+    if (types.elementType(from)) |element| {
+        // array_coerce: an element cast in the same context; to strings by
+        // I/O conversion (assignment).
+        if (types.elementType(to)) |target| return castable(element, target, context);
+        return stringType(to) and context != .implicit;
+    }
+    // From strings by I/O conversion (array_in), explicitly.
+    if (types.isArray(to)) return stringType(from) and context == .explicit;
     if (extendedCast(from, to, context)) |allowed| return allowed;
     // Implicit promotions.
     if (numericCategory(from) and numericCategory(to) and numericRank(from) < numericRank(to)) return true;
@@ -198,6 +246,13 @@ pub fn castable(from: Type, to: Type, context: Context) bool {
 /// common-type selection. Rounding an exact int/numeric to float4 first can
 /// turn distinct values into equal ones (e.g. 16777217 and 16777216::real).
 pub fn comparisonType(a: Type, b: Type) ?Type {
+    // point has no = operator and box compares only by area: neither has
+    // ordinary comparison operators here.
+    if (a == .point or b == .point or a == .box or b == .box) return null;
+    // xml has no comparison operators.
+    if (a == .xml or b == .xml) return null;
+    // anyarray operators need the same array type on both sides.
+    if (a != b and (types.isArray(a) or types.isArray(b))) return null;
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
     // bit and varbit compare with varbit's operators (varbit is preferred).
     if (a != b and bitType(a) and bitType(b)) return .varbit;
@@ -210,6 +265,14 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
 
 pub fn common(a: Type, b: Type) ?Type {
     if (a == b) return a;
+    // cidr values take inet's operators.
+    if ((a == .inet and b == .cidr) or (a == .cidr and b == .inet)) return .inet;
+    // Arrays unify through their element types (ARRAY[] sub-arrays, ||).
+    if (types.elementType(a)) |left| {
+        const right = types.elementType(b) orelse return null;
+        return types.arrayType(common(left, right) orelse return null);
+    }
+    if (types.isArray(b)) return null;
     // time -> timetz and time -> interval are implicit one way only.
     if ((a == .time and b == .timetz) or (a == .timetz and b == .time)) return .timetz;
     if ((a == .time and b == .interval) or (a == .interval and b == .time)) return .interval;
@@ -260,6 +323,15 @@ pub fn Io(comptime config: types.Config) type {
         pub const SessionValues = SessionType;
         pub const typeInfo = types.typeInfo;
         pub const typeFromOid = types.typeFromOid;
+        /// Array types (wire codecs): element types and in-cell arrays.
+        pub const elementData = types.elementData;
+        pub const arrayData = types.arrayData;
+        pub const typeOfData = types.typeOfData;
+        pub const dataTypeOf = types.dataTypeOf;
+        pub const rangeSubtype = types.rangeSubtype;
+        pub const Arrays = V.Arrays;
+        pub const Ranges = V.Ranges;
+        pub const ArrayShape = @import("array.sig").Shape;
         /// Largest text form of one cell (codec buffers).
         pub const format_bytes: usize = @as(usize, @max(config.text_bytes * 8, numeric.format_bytes)) + 64;
 
@@ -316,8 +388,24 @@ pub fn Io(comptime config: types.Config) type {
                 .timetz => |value| time_of_day.formatTz(value, buffer),
                 .bits => |*value| value.format(buffer),
                 .money => |value| money.format(value, buffer),
+                .pg_lsn => |value| catalog_ids.formatLsn(value, buffer),
+                .xid8 => |value| catalog_ids.formatXid8(value, buffer),
+                .array => |*value| try ArrayText.format(value.slice(), session, buffer),
+                .range => |*value| try RangeText.format(value.slice(), session, buffer),
+                // inet hides a full-length netmask except in its text cast.
+                .inet => |*value| network.format(value, value.cidr or verbose, buffer),
+                .macaddr => |*value| network.formatMac(value, buffer),
+                .point => |value| geometric.formatPoint(value, buffer),
+                .box => |value| geometric.formatBox(value, buffer),
+                .xml => |*value| xml.output(value.slice(), buffer),
             };
         }
+
+        /// Range text I/O and constructors (range_text.sig).
+        pub const RangeText = range_text.RangeText(config, @This());
+
+        /// Array text I/O and element-wise casts (array_text.sig).
+        pub const ArrayText = array_text.ArrayText(config, @This());
 
         fn copy(buffer: []u8, value: []const u8) []const u8 {
             @memcpy(buffer[0..value.len], value);
@@ -399,6 +487,20 @@ pub fn Io(comptime config: types.Config) type {
                 .time, .timetz => try parseTime(ty, input, session),
                 .bit, .varbit => .{ .bits = try V.BitString.parse(input) },
                 .money => .{ .money = try money.parse(input) },
+                .pg_lsn => .{ .pg_lsn = try catalog_ids.parseLsn(input) },
+                .xid8 => .{ .xid8 = try catalog_ids.parseXid8(input) },
+                .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => try RangeText.parse(ty, input, session),
+                .inet, .cidr => .{ .inet = try network.parse(input, ty == .cidr) },
+                .macaddr => .{ .macaddr = try network.parseMac(input) },
+                .point => .{ .point = try geometric.parsePoint(input) },
+                .box => .{ .box = try geometric.parseBox(input) },
+                // xml_in with xmloption CONTENT.
+                .xml => blk: {
+                    if (!xml.validContent(input)) return error.InvalidXmlContent;
+                    break :blk .{ .xml = (try textCell(input)).text };
+                },
+                // array_in applies the typmod to every element itself.
+                _ => return ArrayText.parse(types.elementType(ty) orelse return error.UndefinedFunction, typmod, input, session),
             };
             return applyTypmod(cell, ty, typmod);
         }
@@ -452,6 +554,7 @@ pub fn Io(comptime config: types.Config) type {
         /// Length coercion of the explicit-cast kind (truncation, padding).
         pub fn applyTypmodExplicit(cell: V.Cell, ty: Type, typmod: i32) Error!V.Cell {
             if (typmod < 0 or cell == .null_value) return cell;
+            if (cell == .array) return ArrayText.applyTypmod(cell.array.slice(), types.elementType(ty) orelse return cell, typmod, true);
             return switch (ty) {
                 .varchar => switch (cell) {
                     .text => |*value| characterCell(value.slice(), .varchar, typmod, .explicit),
@@ -472,6 +575,7 @@ pub fn Io(comptime config: types.Config) type {
         /// Length coercion: NUMERIC(p,s) and TIMESTAMP[TZ](p).
         pub fn applyTypmod(cell: V.Cell, ty: Type, typmod: i32) Error!V.Cell {
             if (typmod < 0 or cell == .null_value) return cell;
+            if (cell == .array) return ArrayText.applyTypmod(cell.array.slice(), types.elementType(ty) orelse return cell, typmod, false);
             return switch (ty) {
                 .numeric => .{ .numeric = try N.applyTypmod(&cell.numeric, typmod) },
                 .timestamp => .{ .timestamp = temporal.roundTimestamp(cell.timestamp, typmod) },
@@ -548,6 +652,15 @@ pub fn Io(comptime config: types.Config) type {
         pub fn cast(cell: V.Cell, from: Type, to: Type, typmod: i32, session: *const Session) Error!V.Cell {
             if (cell == .null_value) return .null_value;
             if (from == to and typmod < 0) return cell;
+            if (cell == .xml and to != .xml) {
+                // xml -> text is binary coercible: the stored text.
+                if (!characterType(to)) return error.CannotCoerce;
+                return cast(try textCell(cell.xml.slice()), .text, to, typmod, session);
+            }
+            if (cell == .array and types.isArray(to)) {
+                if (from == to) return applyTypmodExplicit(cell, to, typmod);
+                return ArrayText.cast(cell.array.slice(), types.elementType(from) orelse return error.CannotCoerce, types.elementType(to).?, typmod, session);
+            }
             if (cell == .bpchar and to != .bpchar) {
                 // text(bpchar) drops trailing spaces for the string types;
                 // other targets read bpcharout's padded text (I/O conversion).
@@ -728,6 +841,50 @@ pub fn Io(comptime config: types.Config) type {
                     .text => |*value| try parse(.money, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
+                .pg_lsn, .xid8 => switch (cell) {
+                    .pg_lsn, .xid8 => cell,
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .inet => switch (cell) {
+                    .inet => |value| blk: {
+                        var out = value;
+                        out.cidr = false;
+                        break :blk V.Cell{ .inet = out };
+                    },
+                    .text => |*value| try parse(.inet, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                // cidr(inet): the host bits are cleared.
+                .cidr => switch (cell) {
+                    .inet => |*value| V.Cell{ .inet = network.network(value) },
+                    .text => |*value| try parse(.cidr, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .macaddr => switch (cell) {
+                    .macaddr => cell,
+                    .text => |*value| try parse(.macaddr, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .xml => switch (cell) {
+                    .text => |*value| try parse(.xml, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .point, .box => switch (cell) {
+                    .point, .box => cell,
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => switch (cell) {
+                    .range => cell,
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                // Arrays from text by array_in (array -> array is above).
+                _ => switch (cell) {
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
                 .bit, .varbit => switch (cell) {
                     .bits => cell,
                     .text => |*value| try parse(to, -1, value.slice(), session),
@@ -764,6 +921,8 @@ pub fn Io(comptime config: types.Config) type {
         pub fn arithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell, result: Type, session: *const Session) Error!V.Cell {
             if (try timeArithmetic(op, left, right)) |cell| return cell;
             if (try moneyArithmetic(op, left, right)) |cell| return cell;
+            if (try lsnArithmetic(op, left, right)) |cell| return cell;
+            if (left.* == .range and right.* == .range) return rangeArithmetic(op, left, right);
             switch (left.*) {
                 .integer => |a| switch (right.*) {
                     .integer => |b| {
@@ -854,6 +1013,53 @@ pub fn Io(comptime config: types.Config) type {
                 else => {},
             }
             return null;
+        }
+
+        /// pg_lsn operators (pg_lsn.c): pg_lsn - pg_lsn -> numeric, and
+        /// pg_lsn +- numeric / numeric + pg_lsn -> pg_lsn. The sum goes through
+        /// numeric and back (numeric_pg_lsn rounds to an integer): NaN bytes
+        /// are 22023, an infinite result 0A000 and anything outside
+        /// 0..2^64-1 is 22003.
+        fn lsnArithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell) Error!?V.Cell {
+            if (left.* == .pg_lsn and right.* == .pg_lsn) {
+                if (op != .sub) return error.UndefinedFunction;
+                const a = try lsnNumeric(left.pg_lsn);
+                const b = try lsnNumeric(right.pg_lsn);
+                return .{ .numeric = try N.sub(&a, &b) };
+            }
+            const lsn_left = left.* == .pg_lsn and right.* == .numeric;
+            const lsn_right = left.* == .numeric and right.* == .pg_lsn;
+            if (!lsn_left and !lsn_right) return null;
+            if (op != .add and !(op == .sub and lsn_left)) return error.UndefinedFunction;
+            const bytes = if (lsn_left) &right.numeric else &left.numeric;
+            if (bytes.special == .nan) return error.InvalidParameterValue;
+            const position = try lsnNumeric(if (lsn_left) left.pg_lsn else right.pg_lsn);
+            const sum = if (op == .add) try N.add(&position, bytes) else try N.sub(&position, bytes);
+            if (sum.special != .finite) return error.UnsupportedStatement;
+            const rounded = try N.round(&sum, 0);
+            const raw = rounded.coef();
+            if ((rounded.negative and raw != 0) or raw > 0xffffffffffffffff) return error.NumericValueOutOfRange;
+            return .{ .pg_lsn = @intCast(raw) };
+        }
+
+        /// range + range (union), * (intersection) and - (difference).
+        fn rangeArithmetic(op: ast.Op, left: *const V.Cell, right: *const V.Cell) Error!V.Cell {
+            const a = V.Ranges.decode(left.range.slice());
+            const b = V.Ranges.decode(right.range.slice());
+            const result = switch (op) {
+                .add => try V.Ranges.merge(&a, &b),
+                .mul => try V.Ranges.intersect(&a, &b),
+                .sub => try V.Ranges.minus(&a, &b),
+                else => return error.UndefinedFunction,
+            };
+            return RangeText.encoded(&result);
+        }
+
+        fn lsnNumeric(value: u64) Error!numeric.Numeric {
+            if (value != 0 and numeric.digitCount(value) > config.numeric_digits) return error.NumericCapacity;
+            var out: numeric.Numeric = .{};
+            out.setCoef(value);
+            return out;
         }
 
         /// MONEY operators (cash.c): money +- money, money * / integer or

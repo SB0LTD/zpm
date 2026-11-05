@@ -49,8 +49,17 @@
 //!   (VARCHAR values use 3) | 13 uuid 16 bytes | 14 bytea len u32 + bytes
 //!   | 15 time i64 | 16 timetz {us i64, zone i32 seconds west}
 //!   | 17 bit/varbit bit length u32 + packed bytes (zero padded)
-//!   | 18 money i64 cents. Every value is checked against the
-//!   column's type OID (create_table) before anything applies.
+//!   | 18 money i64 cents | 19 pg_lsn u64 | 20 xid8 u64
+//!   | 21 array {element type OID u32, ndim u8, ndim x (dim u32, lbound
+//!   i32), every element as a value (0 for NULL) in row-major order}.
+//!   | 22 range {subtype OID u32, flags u8 (PostgreSQL's range flags), the
+//!   finite bounds as values} | 23 inet/cidr {family u8 (4/6), bits u8,
+//!   cidr u8, 16 address bytes} | 24 macaddr 6 bytes | 25 point {x, y as
+//!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}
+//!   | 27 xml len u32 + the stored text.
+//!   Array type OIDs (1007, ...) name a column's array type. Every value is
+//!   checked against the column's type OID (create_table) before anything
+//!   applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
 //!
 //! apply() decodes and validates the WHOLE record against a bounded,
@@ -70,7 +79,15 @@ const sequence = @import("sequence.sig");
 const character = @import("character.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
+const array = @import("array.sig");
+const range = @import("range.sig");
+const network = @import("network.sig");
 const Error = types.Error;
+
+fn std_zero(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte != 0) return false;
+    return true;
+}
 
 pub const format_version: u16 = 1;
 pub const header_size: usize = 8;
@@ -285,6 +302,58 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 17);
                     try writer.int(u32, @intCast(value.len));
                     try writer.bytes(value.slice());
+                },
+                .pg_lsn => |value| {
+                    try writer.int(u8, 19);
+                    try writer.int(u64, value);
+                },
+                .xid8 => |value| {
+                    try writer.int(u8, 20);
+                    try writer.int(u64, value);
+                },
+                .inet => |*value| {
+                    try writer.int(u8, 23);
+                    try writer.bytes(&.{ value.family, value.bits, @intFromBool(value.cidr) });
+                    try writer.bytes(&value.address);
+                },
+                .macaddr => |*value| {
+                    try writer.int(u8, 24);
+                    try writer.bytes(value);
+                },
+                .xml => |*text| {
+                    try writer.int(u8, 27);
+                    try writer.int(u32, @intCast(text.len));
+                    try writer.bytes(text.slice());
+                },
+                .point => |value| {
+                    try writer.int(u8, 25);
+                    try writer.int(u64, @bitCast(value.x));
+                    try writer.int(u64, @bitCast(value.y));
+                },
+                .box => |value| {
+                    try writer.int(u8, 26);
+                    for ([_]f64{ value.high.x, value.high.y, value.low.x, value.low.y }) |coordinate| try writer.int(u64, @bitCast(coordinate));
+                },
+                .range => |*span| {
+                    const value = V.Ranges.decode(span.slice());
+                    try writer.int(u8, 22);
+                    try writer.int(u32, types.typeOid(value.subtype));
+                    try writer.int(u8, span.bytes[1]);
+                    if (!value.empty and !value.lower.infinite) try encodeValue(writer, &value.lower.value);
+                    if (!value.empty and !value.upper.infinite) try encodeValue(writer, &value.upper.value);
+                },
+                .array => |*items| {
+                    const shape = V.Arrays.shape(items.slice());
+                    try writer.int(u8, 21);
+                    try writer.int(u32, types.typeOid(shape.element));
+                    try writer.int(u8, @intCast(shape.ndim));
+                    for (0..shape.ndim) |dim| {
+                        try writer.int(u32, shape.dims[dim]);
+                        try writer.int(i32, shape.lbounds[dim]);
+                    }
+                    var reader = V.Arrays.Reader.init(items.slice());
+                    var element: V.Cell = undefined;
+                    while (reader.next(&element)) try encodeValue(writer, &element);
                 },
             }
         }
@@ -733,6 +802,38 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     break :blk .{ .time = us };
                 },
                 18 => .{ .money = try reader.int(i64) },
+                19 => .{ .pg_lsn = try reader.int(u64) },
+                20 => .{ .xid8 = try reader.int(u64) },
+                21 => try decodeArray(reader),
+                22 => try decodeRange(reader),
+                23 => blk: {
+                    const head = try reader.take(3);
+                    var value: network.Inet = .{ .family = head[0], .bits = head[1], .cidr = head[2] == 1 };
+                    @memcpy(&value.address, try reader.take(16));
+                    if ((value.family != 4 and value.family != 6) or value.bits > value.maxBits() or head[2] > 1) return error.InvalidChangeRecord;
+                    if (value.family == 4 and !std_zero(value.address[4..])) return error.InvalidChangeRecord;
+                    if (value.cidr and !network.maskClean(&value)) return error.InvalidChangeRecord;
+                    break :blk .{ .inet = value };
+                },
+                24 => .{ .macaddr = (try reader.take(6))[0..6].* },
+                27 => blk: {
+                    const len = try reader.int(u32);
+                    if (len > config.text_bytes) return error.ChangeRecordConflict;
+                    var text: V.Text = .{ .len = len };
+                    @memcpy(text.bytes[0..len], try reader.take(len));
+                    break :blk .{ .xml = text };
+                },
+                25 => blk: {
+                    const x: f64 = @bitCast(try reader.int(u64));
+                    break :blk .{ .point = .{ .x = x, .y = @bitCast(try reader.int(u64)) } };
+                },
+                26 => blk: {
+                    var coordinates: [4]f64 = undefined;
+                    for (&coordinates) |*coordinate| coordinate.* = @bitCast(try reader.int(u64));
+                    // box_in keeps the high corner first.
+                    if (coordinates[0] < coordinates[2] or coordinates[1] < coordinates[3]) return error.InvalidChangeRecord;
+                    break :blk .{ .box = .{ .high = .{ .x = coordinates[0], .y = coordinates[1] }, .low = .{ .x = coordinates[2], .y = coordinates[3] } } };
+                },
                 17 => blk: {
                     const bits = try reader.int(u32);
                     if (bits > V.BitString.max_bits) return error.ChangeRecordConflict;
@@ -751,6 +852,57 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 else => return error.InvalidChangeRecord,
             };
             return .{ .cell = cell, .offset = offset };
+        }
+
+        /// Value tag 21: a scalar element type, at most six dimensions and
+        /// exactly the shape's element count, each NULL or of the element's
+        /// cell kind; capacity overflow is ChangeRecordConflict.
+        fn decodeArray(reader: *Reader) Error!V.Cell {
+            const element = types.typeFromOid(try reader.int(u32)) orelse return error.InvalidChangeRecord;
+            if (types.elementData(element) != null) return error.InvalidChangeRecord;
+            var shape: array.Shape = .{ .element = element, .ndim = try reader.int(u8) };
+            if (shape.ndim > array.max_dims) return error.InvalidChangeRecord;
+            for (0..shape.ndim) |dim| {
+                shape.dims[dim] = try reader.int(u32);
+                shape.lbounds[dim] = try reader.int(i32);
+                if (shape.dims[dim] == 0) return error.InvalidChangeRecord;
+            }
+            var result: V.Text = .{};
+            var writer = V.Arrays.Writer.begin(&result, &shape) catch |err| return if (err == error.TextCapacity) error.ChangeRecordConflict else error.InvalidChangeRecord;
+            while (!writer.complete()) {
+                // Elements are scalars: no nested arrays (and no recursion).
+                if (reader.position < reader.bytes.len and reader.bytes[reader.position] == 21) return error.InvalidChangeRecord;
+                const item = (try decodeValue(reader)).cell;
+                if (item != .null_value and @as(V.CellTag, item) != V.cellTag(element)) return error.InvalidChangeRecord;
+                writer.append(&item) catch |err| return if (err == error.TextCapacity) error.ChangeRecordConflict else error.InvalidChangeRecord;
+            }
+            return .{ .array = result };
+        }
+
+        /// Value tag 22: a range subtype, known flags and its finite bounds
+        /// of the subtype's cell kind; the range is remade (validated and
+        /// canonical) before it is accepted.
+        fn decodeRange(reader: *Reader) Error!V.Cell {
+            const subtype = types.typeFromOid(try reader.int(u32)) orelse return error.InvalidChangeRecord;
+            if (types.rangeOfData(subtype) == null) return error.InvalidChangeRecord;
+            const flags = try reader.int(u8);
+            if (flags & ~@as(u8, 0x1f) != 0) return error.InvalidChangeRecord;
+            const R = V.Ranges;
+            var lower: R.Bound = .{ .lower = true, .inclusive = flags & range.lower_inclusive_flag != 0 };
+            var upper: R.Bound = .{ .lower = false, .inclusive = flags & range.upper_inclusive_flag != 0 };
+            const empty = flags & range.empty_flag != 0;
+            for ([_]*R.Bound{ &lower, &upper }, [_]u8{ range.lower_infinite_flag, range.upper_infinite_flag }) |bound, infinite| {
+                if (empty or flags & infinite != 0) continue;
+                if (reader.position < reader.bytes.len and (reader.bytes[reader.position] == 21 or reader.bytes[reader.position] == 22)) return error.InvalidChangeRecord;
+                const cell = (try decodeValue(reader)).cell;
+                if (@as(V.CellTag, cell) != V.cellTag(subtype)) return error.InvalidChangeRecord;
+                bound.value = cell;
+                bound.infinite = false;
+            }
+            const made = R.make(subtype, lower, upper, empty) catch return error.InvalidChangeRecord;
+            var out: V.Text = .{};
+            R.encode(&made, &out) catch return error.ChangeRecordConflict;
+            return .{ .range = out };
         }
 
         fn valueAt(record: []const u8, offset: u32) Error!V.Cell {
@@ -872,7 +1024,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (types.same(previous.name.slice(), column.name.slice())) return error.InvalidChangeRecord;
                 column.data_type = types.typeFromOid(try reader.int(u32)) orelse return error.UnsupportedLogVersion;
                 column.typmod = try reader.int(i32);
-                const typmod_ok = switch (column.data_type) {
+                // An array column's typmod is its element type's.
+                const typmod_ok = switch (types.elementData(column.data_type) orelse column.data_type) {
                     .numeric => column.typmod == -1 or blk: {
                         const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(column.typmod) orelse break :blk false;
                         break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
