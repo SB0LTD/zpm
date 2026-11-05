@@ -4506,7 +4506,9 @@ pub fn Binder(comptime config: types.Config) type {
                 // A later join that merges this column again lists it instead.
                 var consumed = false;
                 for (scope.using[position + 1 .. scope.using_count]) |*later| {
-                    if (later.item != k and later.left == entry.left and later.left_column == entry.left_column) consumed = true;
+                    if (later.item == k) continue;
+                    if ((later.left == entry.left and later.left_column == entry.left_column) or
+                        (later.right == entry.left and later.right_column == entry.left_column)) consumed = true;
                 }
                 if (consumed) continue;
                 const id = try context.pool.add(.{ .kind = .column });
@@ -4543,12 +4545,22 @@ pub fn Binder(comptime config: types.Config) type {
         /// before `index`) and the right operand (items index..last). The
         /// right operand must list the name exactly once (42703 / 42702).
         fn usingColumn(context: *const Context, scope: *Scope, join: ast.JoinKind, wanted: V.Name, index: usize, last: usize, condition: u16) Error!u16 {
-            var right: ?[2]usize = null;
-            for (scope.rels[index .. last + 1], index..) |*rel, rel_index| {
-                const column = findColumn(context, rel, wanted.slice()) orelse continue;
-                if (right != null or countColumn(context, rel, wanted.slice()) > 1) return error.AmbiguousColumn;
-                right = .{ rel_index, column };
+            // A parenthesized right operand lists its own merged columns once.
+            switch (operandHas(context, scope, index, last, wanted.slice())) {
+                0 => return error.ColumnNotFound,
+                1 => {},
+                else => return error.AmbiguousColumn,
             }
+            var right: ?[2]usize = null;
+            for (scope.using[0..scope.using_count]) |*entry| {
+                if (entry.left >= index and entry.right <= last and types.same(entry.name.slice(), wanted.slice())) right = .{ entry.left, entry.left_column };
+            }
+            if (right == null) for (scope.rels[index .. last + 1], index..) |*rel, rel_index| {
+                for (0..relationWidth(context, rel)) |column| {
+                    if (mergedIn(scope, index, last, rel_index, column)) continue;
+                    if (types.same(relationColumnName(context, rel, column), wanted.slice())) right = .{ rel_index, column };
+                }
+            };
             const right_hit = right orelse return error.ColumnNotFound;
             var left: ?[2]usize = null;
             var position = scope.using_count;

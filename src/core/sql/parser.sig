@@ -2073,6 +2073,30 @@ pub fn Parser(comptime config: types.Config) type {
             } else self.pool.complex = true;
         }
 
+        /// `( joined_table )` after its `(`: a parenthesized join tree whose
+        /// items follow in `out.items`. The first item carries the outer
+        /// join `kind`; as a right operand it records the group's last
+        /// item, so the executor joins the whole group (a left operand is
+        /// already left-deep). `((SELECT ...)) alias` is one derived table.
+        /// An alias on a join tree is outside the subset (0A000).
+        fn joinGroup(self: *Self, out: *Ast.Select, kind: ast.JoinKind) Error!void {
+            const start = out.item_count;
+            try self.fromItem(out, kind);
+            var joined = false;
+            while (try self.joinClause(out)) joined = true;
+            try self.expectSymbol(.rparen);
+            self.pool.complex = true;
+            if (!joined and out.item_count == start + 1) {
+                const only = &out.items[start];
+                if (only.query == none or only.alias != null) return error.Syntax;
+                only.alias = try self.bareAlias();
+                return;
+            }
+            // `((a JOIN b ON ...))`: redundant parentheses keep the inner group.
+            if (self.isWord("AS") or self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword))) return error.UnsupportedStatement;
+            if (kind != .first) out.items[start].group_end = @intCast(out.item_count - 1);
+        }
+
         /// A FROM item the simple single-table path can scan as written.
         fn plainItem(item: *const Ast.FromItem) bool {
             return item.function == none and item.sample_method == 0 and item.column_aliases == none and item.group_end == none;
@@ -2129,7 +2153,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (out.item_count == config.relations) return error.StatementTooComplex;
             var item: Ast.FromItem = .{ .join = kind };
             if (self.mode == .standard and try self.takeSymbol(.lparen)) {
-                if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.UnsupportedStatement;
+                if (!self.isWord("SELECT") and !self.isWord("WITH")) return self.joinGroup(out, kind);
                 item.query = try self.query();
                 try self.expectSymbol(.rparen);
                 self.pool.complex = true;

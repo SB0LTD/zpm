@@ -344,6 +344,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// Left-deep joins prune eligible WHERE conjuncts at their first
             /// complete tuple, before allocating the next intermediate stage.
             fn join(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
+                if (p.general_join) return self.joinGeneral(p, outer);
                 var ctx = self.context(outer);
                 if (p.source_count == 0) {
                     const kept = try keep(&ctx, p.where, null);
@@ -404,6 +405,138 @@ pub fn Exec(comptime config: types.Config) type {
                     current = next;
                 }
                 return current;
+            }
+
+            // ---- general join trees (B11) ------------------------------
+
+            /// Join tree with LATERAL items and parenthesized right operands
+            /// (binder Plan.general_join). Every tuple holds one handle per
+            /// FROM item, absent outside its operand. A right operand is
+            /// joined as a whole; a LATERAL item reruns per left tuple with
+            /// that tuple as its outer context. WHERE filters the complete
+            /// tree. No probe, early filter or streamed path applies.
+            fn joinGeneral(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
+                var ctx = self.context(outer);
+                const tree = try self.joinRange(p, &ctx, outer, 0, p.source_count - 1);
+                if (p.where == none) return tree;
+                var out: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = tree.width };
+                for (0..tree.count) |index| {
+                    try self.session.checkpoint();
+                    self.setTuple(p, &ctx, tree, index);
+                    if (try keep(&ctx, p.where, null)) try self.emitPair(&out, tree, index, tree, null, tree.width);
+                }
+                return out;
+            }
+
+            /// Items first..last joined left-deep; each later operand is one
+            /// item or a parenthesized group (Source.group_end).
+            fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
+                var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer));
+                var next = first + 1;
+                while (next <= last) {
+                    const end: usize = if (p.sources[next].group_end != none) p.sources[next].group_end else next;
+                    if (end < next or end > last) return error.UnsupportedStatement;
+                    current = try self.joinStep(p, ctx, outer, current, next, end);
+                    next = end + 1;
+                }
+                return current;
+            }
+
+            fn leafTuples(self: *Query, p: *const B.Plan, slot: usize, rows: List) Error!Tuples {
+                const width: u32 = @intCast(p.source_count);
+                var out: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = width };
+                for (self.handles(rows)) |handle| {
+                    try self.session.checkpoint();
+                    const at = try self.refs(width);
+                    if (out.count == 0) out.start = at;
+                    @memset(self.work.refs[at..][0..width], absent);
+                    self.work.refs[at + slot] = handle;
+                    out.count += 1;
+                }
+                return out;
+            }
+
+            /// Appends left[li] slots before `split` and right[ri] slots from
+            /// it (a null index null-extends that side).
+            fn emitPair(self: *Query, out: *Tuples, left: Tuples, li: ?usize, right: Tuples, ri: ?usize, split: usize) Error!void {
+                try self.session.checkpoint();
+                const at = try self.refs(out.width);
+                if (out.count == 0) out.start = at;
+                if (out.start + out.count * out.width != at) return error.WorkspaceCapacity;
+                for (0..out.width) |slot| {
+                    const side = if (slot < split) left else right;
+                    const index = if (slot < split) li else ri;
+                    self.work.refs[at + slot] = if (index) |i| self.work.refs[side.start + i * side.width + slot] else absent;
+                }
+                out.count += 1;
+            }
+
+            fn setSlots(self: *const Query, p: *const B.Plan, ctx: *E.Context, tuples: Tuples, index: usize, first: usize, last: usize) void {
+                const base = tuples.start + index * tuples.width;
+                for (first..last + 1) |slot| {
+                    const handle = self.work.refs[base + slot];
+                    ctx.tuple[slot] = if (handle == absent) null else self.rowOf(&p.sources[slot], handle);
+                }
+            }
+
+            /// Joins the operand of items j..end (the item's join kind and
+            /// condition) to `left`.
+            fn joinStep(self: *Query, p: *const B.Plan, ctx: *E.Context, outer: ?*const E.Context, left: Tuples, j: usize, end: usize) Error!Tuples {
+                const source = &p.sources[j];
+                const width: u32 = @intCast(p.source_count);
+                const lateral = source.lateral and end == j;
+                // Every operand row is produced before the first output
+                // tuple, so the output stays one contiguous workspace range.
+                var lists: u32 = 0;
+                var right: Tuples = .{ .start = 0, .count = 0, .width = width };
+                if (lateral) {
+                    lists = try self.refs(@as(usize, left.count) * 2);
+                    for (0..left.count) |index| {
+                        self.setTuple(p, ctx, left, index);
+                        const rows = try self.run(source.plan, ctx);
+                        self.work.refs[lists + index * 2] = rows.start;
+                        self.work.refs[lists + index * 2 + 1] = rows.count;
+                    }
+                } else if (end == j) {
+                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer));
+                } else right = try self.joinRange(p, ctx, outer, j, end);
+                const tracks = source.join == .right or source.join == .full;
+                if (lateral and tracks) return error.InvalidColumnReference;
+                const outer_join = source.join == .left or source.join == .full;
+                var matched: u32 = 0;
+                if (tracks) {
+                    matched = try self.refs(right.count);
+                    @memset(self.work.refs[matched..][0..right.count], 0);
+                }
+                var out: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = width };
+                for (0..left.count) |li| {
+                    var any = false;
+                    if (lateral) {
+                        const rows: List = .{ .start = self.work.refs[lists + li * 2], .count = self.work.refs[lists + li * 2 + 1] };
+                        for (self.handles(rows)) |handle| {
+                            try self.session.checkpoint();
+                            self.setTuple(p, ctx, left, li);
+                            ctx.tuple[j] = self.rowOf(source, handle);
+                            if (source.on != none and (try E.truth(ctx, source.on)) != true) continue;
+                            any = true;
+                            try self.emitPair(&out, left, li, left, null, width);
+                            self.work.refs[out.start + (out.count - 1) * width + j] = handle;
+                        }
+                    } else for (0..right.count) |ri| {
+                        try self.session.checkpoint();
+                        self.setTuple(p, ctx, left, li);
+                        self.setSlots(p, ctx, right, ri, j, end);
+                        if (source.on != none and (try E.truth(ctx, source.on)) != true) continue;
+                        any = true;
+                        if (tracks) self.work.refs[matched + ri] = 1;
+                        try self.emitPair(&out, left, li, right, ri, j);
+                    }
+                    if (!any and outer_join) try self.emitPair(&out, left, li, right, null, j);
+                }
+                if (tracks) for (0..right.count) |ri| {
+                    if (self.work.refs[matched + ri] == 0) try self.emitPair(&out, left, null, right, ri, j);
+                };
+                return out;
             }
 
             // ---- projection and grouping -------------------------------

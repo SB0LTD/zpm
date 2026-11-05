@@ -239,9 +239,52 @@ fn naturalJoins() !void {
     try controlled("SELECT * FROM na NATURAL FULL JOIN nb ORDER BY k NULLS FIRST,id,y", "NULL|3|c|NULL;NULL|NULL|NULL|n;1|1|a|p;2|2|b|q;2|2|b|r;4|NULL|NULL|s");
 }
 
+// ---- PG.JOIN.TREE ---------------------------------------------------------
+
+fn joinTrees() !void {
+    // oracle
+    try expectTyped("SELECT a.id FROM (tdd_a a JOIN tdd_b b ON a.id=b.id) LEFT JOIN tdd_b c ON c.id=a.id ORDER BY a.id", "id:23", "1;3");
+    // A left operand group is already left-deep; redundant parentheses.
+    try expect("SELECT a.id,c.v FROM ((tdd_a a JOIN tdd_b b ON a.id=b.id)) LEFT JOIN tdd_b c ON c.id=a.id+2 ORDER BY a.id", "1|33;3|55");
+    try expect("SELECT a.id,c.v FROM (((tdd_a a JOIN tdd_b b ON a.id=b.id)) LEFT JOIN tdd_b c ON c.id=a.id+2) ORDER BY a.id", "1|33;3|55");
+    // A right operand group is joined as a whole: null-extended once.
+    try expect("SELECT a.id,b.id,c.id FROM tdd_a a LEFT JOIN (tdd_b b JOIN tdd_b c ON c.id=b.id) ON b.id=a.id ORDER BY a.id", "1|1|1;2|NULL|NULL;3|3|3;4|NULL|NULL");
+    // Flattening would lose every row here: the group itself is empty.
+    try expect("SELECT a.id,b.id,c.id FROM tdd_a a LEFT JOIN (tdd_b b JOIN tdd_b c ON c.v=b.v+100) ON b.id=a.id ORDER BY a.id", "1|NULL|NULL;2|NULL|NULL;3|NULL|NULL;4|NULL|NULL");
+    // The outer condition sees every item of the group.
+    try expect("SELECT a.id,b.id,c.id FROM tdd_a a JOIN (tdd_b b JOIN tdd_b c ON c.id>b.id) ON a.id=c.id ORDER BY a.id,b.id", "3|1|3");
+    try expect("SELECT a.id,b.id,c.id FROM tdd_a a RIGHT JOIN (tdd_b b CROSS JOIN tdd_b c) ON a.id=b.id AND c.id=5 ORDER BY b.id,c.id", "NULL|1|1;NULL|1|3;1|1|5;NULL|3|1;NULL|3|3;3|3|5;NULL|5|1;NULL|5|3;NULL|5|5");
+    try expect("SELECT a.id,b.id FROM tdd_a a FULL JOIN (tdd_b b JOIN tdd_b c ON c.id=b.id) ON a.id=b.id ORDER BY a.id NULLS LAST,b.id", "1|1;2|NULL;3|3;4|NULL;NULL|5");
+    // Nested right groups and a group after a comma.
+    try expect("SELECT a.id,b.id,c.id,d.id FROM tdd_a a LEFT JOIN (tdd_b b JOIN (tdd_b c JOIN tdd_b d ON d.id=c.id) ON c.id=b.id) ON b.id=a.id WHERE a.id<3 ORDER BY a.id", "1|1|1|1;2|NULL|NULL|NULL");
+    try expect("SELECT COUNT(*) FROM tdd_a a, (tdd_b b LEFT JOIN tdd_b c ON c.id=b.id+2)", "12");
+    // USING over a group's merged column; star order follows the tree.
+    try expect("SELECT k,y,x FROM nb JOIN (na JOIN tdd_b ON tdd_b.id=na.id) USING (k) ORDER BY y", "1|p|a");
+    try expectTyped("SELECT * FROM tdd_a a LEFT JOIN (tdd_b b JOIN tdd_b c USING (id)) USING (id) ORDER BY id", "id:23,g:23,v:23,v:23,v:23", "1|1|10|11|11;2|1|20|NULL|NULL;3|2|30|33|33;4|2|NULL|NULL|NULL");
+    try expect("SELECT COUNT(*) FROM tdd_a a NATURAL LEFT JOIN (tdd_b b JOIN nc USING (id))", "4");
+    // WHERE filters after the tree; aggregates over it.
+    try expect("SELECT a.g,COUNT(b.id) FROM tdd_a a LEFT JOIN (tdd_b b JOIN tdd_b c ON c.id=b.id) ON b.id=a.id WHERE a.v IS NOT NULL GROUP BY a.g ORDER BY a.g", "1|1;2|1");
+    try expect("SELECT a.id FROM tdd_a a LEFT JOIN (tdd_b b JOIN tdd_b c ON c.id=b.id) ON b.id=a.id WHERE b.id IS NULL ORDER BY a.id", "2;4");
+    // Empty operands.
+    try expect("SELECT COUNT(*) FROM tdd_a a LEFT JOIN (tdd_b b JOIN tdd_b c ON false) ON true", "4");
+    try expect("SELECT COUNT(*) FROM (SELECT * FROM tdd_a WHERE false) a RIGHT JOIN (tdd_b b JOIN tdd_b c ON c.id=b.id) ON true", "3");
+    // Scope: a group's own condition sees only the group (42P01 / 42703).
+    try rejects("SELECT * FROM tdd_a a JOIN (tdd_b b JOIN tdd_b c ON c.id=a.id) ON true", error.TableNotFound);
+    try rejects("SELECT * FROM tdd_a a JOIN (tdd_b b JOIN tdd_b c ON c.id=g) ON true", error.ColumnNotFound);
+    try rejects("SELECT * FROM tdd_a a JOIN (tdd_b b JOIN na ON na.k=b.id) USING (id)", error.AmbiguousColumn);
+    // An alias on a join tree is outside the subset; `(t)` is not a join.
+    try rejects("SELECT * FROM (tdd_a a JOIN tdd_b b ON a.id=b.id) j", error.UnsupportedStatement);
+    try rejects("SELECT * FROM (tdd_a a JOIN tdd_b b ON a.id=b.id) AS j", error.UnsupportedStatement);
+    try rejects("SELECT * FROM (tdd_a a)", error.Syntax);
+    try rejects("SELECT * FROM (tdd_a a, tdd_b b)", error.Syntax);
+    try rejects("SELECT * FROM (tdd_a a JOIN tdd_b b ON true", error.Syntax);
+    try controlled("SELECT a.id,b.id,c.id FROM tdd_a a LEFT JOIN (tdd_b b JOIN tdd_b c ON c.id=b.id) ON b.id=a.id ORDER BY a.id", "1|1|1;2|NULL|NULL;3|3|3;4|NULL|NULL");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
+    try joinTrees();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
