@@ -49,7 +49,10 @@
 //!   (VARCHAR values use 3) | 13 uuid 16 bytes | 14 bytea len u32 + bytes
 //!   | 15 time i64 | 16 timetz {us i64, zone i32 seconds west}
 //!   | 17 bit/varbit bit length u32 + packed bytes (zero padded)
-//!   | 18 money i64 cents | 19 pg_lsn u64 | 20 xid8 u64. Every value is
+//!   | 18 money i64 cents | 19 pg_lsn u64 | 20 xid8 u64
+//!   | 21 array {element type OID u32, ndim u8, ndim x (dim u32, lbound
+//!   i32), every element as a value (0 for NULL) in row-major order}.
+//!   Array type OIDs (1007, ...) name a column's array type. Every value is
 //!   checked against the column's type OID (create_table) before anything
 //!   applies.
 //! Ops may repeat a (table, rowid) and apply in record order.
@@ -71,6 +74,7 @@ const sequence = @import("sequence.sig");
 const character = @import("character.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
+const array = @import("array.sig");
 const Error = types.Error;
 
 pub const format_version: u16 = 1;
@@ -294,6 +298,19 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .xid8 => |value| {
                     try writer.int(u8, 20);
                     try writer.int(u64, value);
+                },
+                .array => |*items| {
+                    const shape = V.Arrays.shape(items.slice());
+                    try writer.int(u8, 21);
+                    try writer.int(u32, types.typeOid(shape.element));
+                    try writer.int(u8, @intCast(shape.ndim));
+                    for (0..shape.ndim) |dim| {
+                        try writer.int(u32, shape.dims[dim]);
+                        try writer.int(i32, shape.lbounds[dim]);
+                    }
+                    var reader = V.Arrays.Reader.init(items.slice());
+                    var element: V.Cell = undefined;
+                    while (reader.next(&element)) try encodeValue(writer, &element);
                 },
             }
         }
@@ -744,6 +761,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 18 => .{ .money = try reader.int(i64) },
                 19 => .{ .pg_lsn = try reader.int(u64) },
                 20 => .{ .xid8 = try reader.int(u64) },
+                21 => try decodeArray(reader),
                 17 => blk: {
                     const bits = try reader.int(u32);
                     if (bits > V.BitString.max_bits) return error.ChangeRecordConflict;
@@ -762,6 +780,31 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 else => return error.InvalidChangeRecord,
             };
             return .{ .cell = cell, .offset = offset };
+        }
+
+        /// Value tag 21: a scalar element type, at most six dimensions and
+        /// exactly the shape's element count, each NULL or of the element's
+        /// cell kind; capacity overflow is ChangeRecordConflict.
+        fn decodeArray(reader: *Reader) Error!V.Cell {
+            const element = types.typeFromOid(try reader.int(u32)) orelse return error.InvalidChangeRecord;
+            if (types.elementData(element) != null) return error.InvalidChangeRecord;
+            var shape: array.Shape = .{ .element = element, .ndim = try reader.int(u8) };
+            if (shape.ndim > array.max_dims) return error.InvalidChangeRecord;
+            for (0..shape.ndim) |dim| {
+                shape.dims[dim] = try reader.int(u32);
+                shape.lbounds[dim] = try reader.int(i32);
+                if (shape.dims[dim] == 0) return error.InvalidChangeRecord;
+            }
+            var result: V.Text = .{};
+            var writer = V.Arrays.Writer.begin(&result, &shape) catch |err| return if (err == error.TextCapacity) error.ChangeRecordConflict else error.InvalidChangeRecord;
+            while (!writer.complete()) {
+                // Elements are scalars: no nested arrays (and no recursion).
+                if (reader.position < reader.bytes.len and reader.bytes[reader.position] == 21) return error.InvalidChangeRecord;
+                const item = (try decodeValue(reader)).cell;
+                if (item != .null_value and @as(V.CellTag, item) != V.cellTag(element)) return error.InvalidChangeRecord;
+                writer.append(&item) catch |err| return if (err == error.TextCapacity) error.ChangeRecordConflict else error.InvalidChangeRecord;
+            }
+            return .{ .array = result };
         }
 
         fn valueAt(record: []const u8, offset: u32) Error!V.Cell {
@@ -883,7 +926,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (types.same(previous.name.slice(), column.name.slice())) return error.InvalidChangeRecord;
                 column.data_type = types.typeFromOid(try reader.int(u32)) orelse return error.UnsupportedLogVersion;
                 column.typmod = try reader.int(i32);
-                const typmod_ok = switch (column.data_type) {
+                // An array column's typmod is its element type's.
+                const typmod_ok = switch (types.elementData(column.data_type) orelse column.data_type) {
                     .numeric => column.typmod == -1 or blk: {
                         const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(column.typmod) orelse break :blk false;
                         break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;

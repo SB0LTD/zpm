@@ -1547,6 +1547,9 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "InvalidTableDefinition")) return "42P16";
     if (equal(name, "UndefinedSchema")) return "3F000";
     if (equal(name, "DuplicateSchema")) return "42P06";
+    if (equal(name, "IndeterminateDatatype")) return "42P18";
+    if (equal(name, "ArraySubscriptError")) return "2202E";
+    if (equal(name, "DataException")) return "22000";
     if (equal(name, "TypeMismatch")) return "42804";
     if (equal(name, "IntegerOverflow")) return "22003";
     if (equal(name, "ProtocolViolation")) return "08P01";

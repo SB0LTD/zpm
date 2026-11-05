@@ -22,6 +22,7 @@ const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
 const money = @import("money.sig");
 const catalog_ids = @import("catalog_ids.sig");
+const array_text = @import("array_text.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -180,6 +181,14 @@ fn datetimeRank(ty: Type) u8 {
 pub fn castable(from: Type, to: Type, context: Context) bool {
     if (from == to) return true;
     if (from == .unknown) return true;
+    if (types.elementType(from)) |element| {
+        // array_coerce: an element cast in the same context; to strings by
+        // I/O conversion (assignment).
+        if (types.elementType(to)) |target| return castable(element, target, context);
+        return stringType(to) and context != .implicit;
+    }
+    // From strings by I/O conversion (array_in), explicitly.
+    if (types.isArray(to)) return stringType(from) and context == .explicit;
     if (extendedCast(from, to, context)) |allowed| return allowed;
     // Implicit promotions.
     if (numericCategory(from) and numericCategory(to) and numericRank(from) < numericRank(to)) return true;
@@ -206,6 +215,8 @@ pub fn castable(from: Type, to: Type, context: Context) bool {
 /// common-type selection. Rounding an exact int/numeric to float4 first can
 /// turn distinct values into equal ones (e.g. 16777217 and 16777216::real).
 pub fn comparisonType(a: Type, b: Type) ?Type {
+    // anyarray operators need the same array type on both sides.
+    if (a != b and (types.isArray(a) or types.isArray(b))) return null;
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
     // bit and varbit compare with varbit's operators (varbit is preferred).
     if (a != b and bitType(a) and bitType(b)) return .varbit;
@@ -218,6 +229,12 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
 
 pub fn common(a: Type, b: Type) ?Type {
     if (a == b) return a;
+    // Arrays unify through their element types (ARRAY[] sub-arrays, ||).
+    if (types.elementType(a)) |left| {
+        const right = types.elementType(b) orelse return null;
+        return types.arrayType(common(left, right) orelse return null);
+    }
+    if (types.isArray(b)) return null;
     // time -> timetz and time -> interval are implicit one way only.
     if ((a == .time and b == .timetz) or (a == .timetz and b == .time)) return .timetz;
     if ((a == .time and b == .interval) or (a == .interval and b == .time)) return .interval;
@@ -268,6 +285,12 @@ pub fn Io(comptime config: types.Config) type {
         pub const SessionValues = SessionType;
         pub const typeInfo = types.typeInfo;
         pub const typeFromOid = types.typeFromOid;
+        /// Array types (wire codecs): element types and in-cell arrays.
+        pub const elementData = types.elementData;
+        pub const arrayData = types.arrayData;
+        pub const typeOfData = types.typeOfData;
+        pub const Arrays = V.Arrays;
+        pub const ArrayShape = @import("array.sig").Shape;
         /// Largest text form of one cell (codec buffers).
         pub const format_bytes: usize = @as(usize, @max(config.text_bytes * 8, numeric.format_bytes)) + 64;
 
@@ -326,8 +349,12 @@ pub fn Io(comptime config: types.Config) type {
                 .money => |value| money.format(value, buffer),
                 .pg_lsn => |value| catalog_ids.formatLsn(value, buffer),
                 .xid8 => |value| catalog_ids.formatXid8(value, buffer),
+                .array => |*value| try ArrayText.format(value.slice(), session, buffer),
             };
         }
+
+        /// Array text I/O and element-wise casts (array_text.sig).
+        pub const ArrayText = array_text.ArrayText(config, @This());
 
         fn copy(buffer: []u8, value: []const u8) []const u8 {
             @memcpy(buffer[0..value.len], value);
@@ -411,6 +438,8 @@ pub fn Io(comptime config: types.Config) type {
                 .money => .{ .money = try money.parse(input) },
                 .pg_lsn => .{ .pg_lsn = try catalog_ids.parseLsn(input) },
                 .xid8 => .{ .xid8 = try catalog_ids.parseXid8(input) },
+                // array_in applies the typmod to every element itself.
+                _ => return ArrayText.parse(types.elementType(ty) orelse return error.UndefinedFunction, typmod, input, session),
             };
             return applyTypmod(cell, ty, typmod);
         }
@@ -464,6 +493,7 @@ pub fn Io(comptime config: types.Config) type {
         /// Length coercion of the explicit-cast kind (truncation, padding).
         pub fn applyTypmodExplicit(cell: V.Cell, ty: Type, typmod: i32) Error!V.Cell {
             if (typmod < 0 or cell == .null_value) return cell;
+            if (cell == .array) return ArrayText.applyTypmod(cell.array.slice(), types.elementType(ty) orelse return cell, typmod, true);
             return switch (ty) {
                 .varchar => switch (cell) {
                     .text => |*value| characterCell(value.slice(), .varchar, typmod, .explicit),
@@ -484,6 +514,7 @@ pub fn Io(comptime config: types.Config) type {
         /// Length coercion: NUMERIC(p,s) and TIMESTAMP[TZ](p).
         pub fn applyTypmod(cell: V.Cell, ty: Type, typmod: i32) Error!V.Cell {
             if (typmod < 0 or cell == .null_value) return cell;
+            if (cell == .array) return ArrayText.applyTypmod(cell.array.slice(), types.elementType(ty) orelse return cell, typmod, false);
             return switch (ty) {
                 .numeric => .{ .numeric = try N.applyTypmod(&cell.numeric, typmod) },
                 .timestamp => .{ .timestamp = temporal.roundTimestamp(cell.timestamp, typmod) },
@@ -560,6 +591,10 @@ pub fn Io(comptime config: types.Config) type {
         pub fn cast(cell: V.Cell, from: Type, to: Type, typmod: i32, session: *const Session) Error!V.Cell {
             if (cell == .null_value) return .null_value;
             if (from == to and typmod < 0) return cell;
+            if (cell == .array and types.isArray(to)) {
+                if (from == to) return applyTypmodExplicit(cell, to, typmod);
+                return ArrayText.cast(cell.array.slice(), types.elementType(from) orelse return error.CannotCoerce, types.elementType(to).?, typmod, session);
+            }
             if (cell == .bpchar and to != .bpchar) {
                 // text(bpchar) drops trailing spaces for the string types;
                 // other targets read bpcharout's padded text (I/O conversion).
@@ -742,6 +777,11 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .pg_lsn, .xid8 => switch (cell) {
                     .pg_lsn, .xid8 => cell,
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                // Arrays from text by array_in (array -> array is above).
+                _ => switch (cell) {
                     .text => |*value| try parse(to, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },

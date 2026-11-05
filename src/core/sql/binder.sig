@@ -23,6 +23,7 @@ const catalog = @import("catalog.sig");
 const value = @import("value.sig");
 const sequence = @import("sequence.sig");
 const parser = @import("parser.sig");
+const array_module = @import("array.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -907,6 +908,12 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "to_timestamp", .func = .to_timestamp },
                 // Unicode normalization (B11); NORMALIZE(...) is also SQL syntax.
                 .{ .name = "normalize", .func = .normalize },       .{ .name = "is_normalized", .func = .is_normalized },
+                // Array functions (B11 advanced types).
+                .{ .name = "array_length", .func = .array_length }, .{ .name = "cardinality", .func = .cardinality },
+                .{ .name = "array_ndims", .func = .array_ndims },   .{ .name = "array_dims", .func = .array_dims },
+                .{ .name = "array_lower", .func = .array_lower },   .{ .name = "array_upper", .func = .array_upper },
+                .{ .name = "array_append", .func = .array_append }, .{ .name = "array_prepend", .func = .array_prepend },
+                .{ .name = "array_cat", .func = .array_cat },       .{ .name = "array_to_string", .func = .array_to_string },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -1026,7 +1033,8 @@ pub fn Binder(comptime config: types.Config) type {
                     // AVG(interval) is not provided (no interval / number).
                     else => return error.UndefinedFunction,
                 },
-                .min, .max => switch (arg_ty) {
+                // array_larger/array_smaller compare whole arrays.
+                .min, .max => if (types.isArray(arg_ty)) arg_ty else switch (arg_ty) {
                     .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz, .money => arg_ty,
                     // pg_lsn_larger/smaller and xid8_larger/smaller.
                     .pg_lsn, .xid8 => arg_ty,
@@ -1473,6 +1481,186 @@ pub fn Binder(comptime config: types.Config) type {
                 .to_number => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .numeric, true),
                 // to_timestamp(text, text) or to_timestamp(double precision).
                 .to_timestamp => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.float8} else &[_]ast.Type{ .text, .text }, .timestamptz, true),
+                .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
+                .array_append, .array_prepend, .array_cat, .array_to_string => try typeArrayFunction(context, n, count),
+            }
+        }
+
+        // ---- arrays (B11 advanced types) ------------------------------------
+
+        const ArrayConcat = enum { operator, cat, append, prepend };
+
+        /// The array type of `||` / array_cat / array_append / array_prepend
+        /// (anycompatiblearray with anycompatiblearray or anycompatible),
+        /// converting both operands. An untyped operand of `||` or array_cat
+        /// is the other operand's array type.
+        fn arrayConcatTypes(context: *const Context, first: *u16, second: *u16, kind_in: ArrayConcat) Error!ast.Type {
+            const left = context.node(first.*).ty;
+            const right = context.node(second.*).ty;
+            const kind: ArrayConcat = if (kind_in != .operator) kind_in else if (types.isArray(left))
+                (if (types.isArray(right) or right == .unknown) ArrayConcat.cat else .append)
+            else if (left == .unknown) .cat else .prepend;
+            switch (kind) {
+                .cat => {
+                    if (left == .unknown and right == .unknown) return error.TypeMismatch;
+                    const array_ty = if (left == .unknown) right else if (right == .unknown) left else value.common(left, right) orelse return error.UndefinedFunction;
+                    if (!types.isArray(array_ty)) return error.UndefinedFunction;
+                    first.* = try convert(context, first.*, array_ty, -1, .implicit);
+                    second.* = try convert(context, second.*, array_ty, -1, .implicit);
+                    return array_ty;
+                },
+                .append, .prepend => {
+                    const array_at = if (kind == .append) first else second;
+                    const element_at = if (kind == .append) second else first;
+                    const array_ty = context.node(array_at.*).ty;
+                    const element_ty = context.node(element_at.*).ty;
+                    if (array_ty != .unknown and !types.isArray(array_ty)) return error.UndefinedFunction;
+                    if (types.isArray(element_ty)) return error.UndefinedFunction;
+                    const element = if (array_ty == .unknown)
+                        (if (element_ty == .unknown) return error.TypeMismatch else element_ty)
+                    else if (element_ty == .unknown) types.elementType(array_ty).? else value.common(types.elementType(array_ty).?, element_ty) orelse return error.UndefinedFunction;
+                    const result = types.arrayType(element) orelse return error.UndefinedFunction;
+                    array_at.* = try convert(context, array_at.*, result, -1, .implicit);
+                    element_at.* = try convert(context, element_at.*, element, -1, .implicit);
+                    return result;
+                },
+                .operator => unreachable,
+            }
+        }
+
+        /// anyarray @> <@ && anyarray: one array type (an untyped side
+        /// takes the other's); unknown on both sides is ambiguous.
+        fn arrayContainment(context: *const Context, n: *ast.Node) Error!void {
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (left == .unknown and right == .unknown) return error.AmbiguousFunction;
+            if (left == .unknown) try coerce(context, n.a, right);
+            if (right == .unknown) try coerce(context, n.b, left);
+            const ty = context.node(n.a).ty;
+            if (!types.isArray(ty) or context.node(n.b).ty != ty) return error.UndefinedFunction;
+            n.ty = .boolean;
+        }
+
+        /// An anyarray argument: untyped input cannot resolve the polymorphic
+        /// type (42804), other non-array types have no such function (42883).
+        fn arrayArgument(context: *const Context, id: u16) Error!void {
+            const ty = context.node(id).ty;
+            if (ty == .unknown) return error.TypeMismatch;
+            if (!types.isArray(ty)) return error.UndefinedFunction;
+        }
+
+        /// Converts the `next`-linked list after `owner_first` to `target` in
+        /// `mode`, relinking cast nodes in place.
+        fn convertTail(context: *const Context, previous_in: u16, target: ast.Type, mode: value.Context) Error!void {
+            var previous = previous_in;
+            var item = context.node(previous).next;
+            while (item != none) {
+                const next = context.node(item).next;
+                const converted = try convert(context, item, target, -1, mode);
+                if (converted != item) {
+                    context.node(converted).next = next;
+                    context.node(item).next = none;
+                    context.node(previous).next = converted;
+                }
+                previous = converted;
+                item = next;
+            }
+        }
+
+        fn typeArrayFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            switch (n.func) {
+                .array_constructor => {
+                    // ARRAY[...]: the common type of the elements (untyped
+                    // ones are text), or of the sub-arrays (multi-dimensional).
+                    if (count == 0) return error.IndeterminateDatatype;
+                    var common: ast.Type = .unknown;
+                    var nested = false;
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) {
+                        if (types.isArray(context.node(item).ty)) nested = true;
+                        try unifyInto(&common, context.node(item).ty);
+                    }
+                    if (nested) {
+                        if (!types.isArray(common)) return error.TypeMismatch;
+                        n.b = try convertList(context, n.b, common);
+                        n.ty = common;
+                    } else {
+                        if (common == .unknown) common = .text;
+                        n.b = try convertList(context, n.b, common);
+                        n.ty = types.arrayType(common) orelse return error.UndefinedObject;
+                    }
+                    n.constant = listConstant(context, n.b);
+                },
+                .array_subscript => {
+                    const base_ty = context.node(n.b).ty;
+                    const element = types.elementType(base_ty) orelse return error.TypeMismatch;
+                    // Subscripts are int4 by assignment (array subscript
+                    // must have type integer: 42804).
+                    try convertTail(context, n.b, .int4, .assignment);
+                    const layout = array_module.Subscripts.decode(n.integer);
+                    n.ty = if (layout.slice()) base_ty else element;
+                    n.typmod = outputTypmod(context, n.b);
+                    n.constant = listConstant(context, n.b);
+                },
+                .array_any => {
+                    var left = n.b;
+                    var right = context.node(left).next;
+                    if (context.node(right).ty == .unknown) {
+                        const left_ty = context.node(left).ty;
+                        try coerce(context, right, types.arrayType(if (left_ty == .unknown) .text else left_ty) orelse return error.UndefinedFunction);
+                    }
+                    const element = types.elementType(context.node(right).ty) orelse return error.WrongObjectType;
+                    if (context.node(left).ty == .unknown) try coerce(context, left, element);
+                    const left_ty = context.node(left).ty;
+                    if (left_ty == .json or element == .json) return error.UndefinedFunction;
+                    if (left_ty != element and !(value.integral(left_ty) and value.integral(element))) {
+                        const target = value.comparisonType(left_ty, element) orelse return error.UndefinedFunction;
+                        left = try convert(context, left, target, -1, .implicit);
+                        if (target != element) right = try convert(context, right, types.arrayType(target) orelse return error.UndefinedFunction, -1, .implicit);
+                    }
+                    context.node(left).next = right;
+                    context.node(right).next = none;
+                    n.b = left;
+                    n.ty = .boolean;
+                    n.constant = isConstant(context, left) and isConstant(context, right);
+                },
+                .cardinality, .array_ndims, .array_dims => {
+                    if (count != 1) return error.UndefinedFunction;
+                    try arrayArgument(context, n.b);
+                    n.ty = if (n.func == .array_dims) .text else .int4;
+                    n.constant = isConstant(context, n.b);
+                },
+                .array_length, .array_lower, .array_upper => {
+                    if (count != 2) return error.UndefinedFunction;
+                    try arrayArgument(context, n.b);
+                    try convertTail(context, n.b, .int4, .implicit);
+                    n.ty = .int4;
+                    n.constant = listConstant(context, n.b);
+                },
+                .array_append, .array_prepend, .array_cat => {
+                    if (count != 2) return error.UndefinedFunction;
+                    var first = n.b;
+                    var second = context.node(first).next;
+                    n.ty = try arrayConcatTypes(context, &first, &second, switch (n.func) {
+                        .array_append => .append,
+                        .array_prepend => .prepend,
+                        else => .cat,
+                    });
+                    context.node(first).next = second;
+                    context.node(second).next = none;
+                    n.b = first;
+                    n.constant = isConstant(context, first) and isConstant(context, second);
+                },
+                .array_to_string => {
+                    if (count != 2 and count != 3) return error.UndefinedFunction;
+                    try arrayArgument(context, n.b);
+                    try convertTail(context, n.b, .text, .implicit);
+                    var item = context.node(n.b).next;
+                    while (item != none) : (item = context.node(item).next) if (!value.stringType(context.node(item).ty)) return error.UndefinedFunction;
+                    n.ty = .text;
+                    n.constant = listConstant(context, n.b);
+                },
+                else => unreachable,
             }
         }
 
@@ -2532,6 +2720,10 @@ pub fn Binder(comptime config: types.Config) type {
                         .concat => {
                             const left_ty = context.node(n.a).ty;
                             const right_ty = context.node(n.b).ty;
+                            if (types.isArray(left_ty) or types.isArray(right_ty)) {
+                                n.ty = try arrayConcatTypes(context, &n.a, &n.b, .operator);
+                                return;
+                            }
                             if ((left_ty == .jsonb and (right_ty == .jsonb or right_ty == .unknown)) or
                                 (right_ty == .jsonb and left_ty == .unknown)) {
                                 try coerce(context, n.a, .jsonb);
@@ -2555,7 +2747,9 @@ pub fn Binder(comptime config: types.Config) type {
                             if (!value.stringType(context.node(n.a).ty) and !value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
                             n.ty = .text;
                         },
-                        .arrow, .arrow_text, .path, .path_text, .contains, .contained, .exists => try jsonOperator(context, n),
+                        .contains, .contained => if (types.isArray(context.node(n.a).ty) or types.isArray(context.node(n.b).ty)) try arrayContainment(context, n) else try jsonOperator(context, n),
+                        .overlap => try arrayContainment(context, n),
+                        .arrow, .arrow_text, .path, .path_text, .exists => try jsonOperator(context, n),
                         .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => try bitwiseType(context, n),
                         .neg, .pos, .bit_not => unreachable,
                     }
@@ -2714,7 +2908,11 @@ pub fn Binder(comptime config: types.Config) type {
                     if (n.typmod == ast.regclass_typmod or n.typmod == ast.regtype_typmod) return regCast(context, scope, n);
                     const target = n.cast_type;
                     const inner = context.node(n.a);
-                    if (inner.kind == .decimal_literal and (target == .float4 or target == .float8)) {
+                    if (inner.kind == .function and inner.func == .array_constructor and inner.b == none and types.isArray(target)) {
+                        // ARRAY[]::type[]: the cast supplies the element type.
+                        inner.ty = target;
+                        inner.constant = true;
+                    } else if (inner.kind == .decimal_literal and (target == .float4 or target == .float8)) {
                         // numeric -> float8 is float8in of the numeric's text,
                         // so a float-cast literal is parsed as a float directly
                         // (no NUMERIC capacity limit for 1e100::float8).
@@ -2882,6 +3080,10 @@ pub fn Binder(comptime config: types.Config) type {
                         // TRIM(...) calls btrim/ltrim/rtrim, named after them.
                         // IS [form] NORMALIZED calls is_normalized.
                         .btrim, .ltrim, .rtrim, .is_normalized => break :blk .{ .name = @tagName(n.func), .strength = 2 },
+                        // ARRAY[...]; a subscripted value keeps its base's name.
+                        .array_constructor => break :blk .{ .name = "array", .strength = 2 },
+                        .array_subscript => break :blk figure(context, n.b, buffer),
+                        .array_any => break :blk .{ .name = "?column?", .strength = 0 },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);
@@ -2908,7 +3110,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .cast => blk: {
                     const inner = figure(context, n.a, buffer);
                     if (inner.strength > 1) break :blk inner;
-                    break :blk .{ .name = types.typeInfo(types.dataTypeOf(n.cast_type)).name, .strength = 1 };
+                    const named_type = types.elementType(n.cast_type) orelse n.cast_type;
+                    break :blk .{ .name = types.typeInfo(types.dataTypeOf(named_type)).name, .strength = 1 };
                 },
                 else => .{ .name = "?column?", .strength = 0 },
             };
@@ -2977,6 +3180,8 @@ pub fn Binder(comptime config: types.Config) type {
             const n = context.node(id);
             return switch (n.kind) {
                 .column, .cast => n.typmod,
+                // A subscript keeps the array's typmod (reftypmod).
+                .function => if (n.func == .array_subscript) n.typmod else -1,
                 else => -1,
             };
         }
@@ -3601,6 +3806,8 @@ pub fn Binder(comptime config: types.Config) type {
             }
             if (x.op != y.op or x.test_kind != y.test_kind or x.negated != y.negated or x.insensitive != y.insensitive or
                 x.cast_type != y.cast_type or x.typmod != y.typmod or x.func != y.func or x.agg != y.agg or x.distinct != y.distinct) return false;
+            // Subscript layouts (array_subscript) and other call words.
+            if (x.kind == .function and x.integer != y.integer) return false;
             if (!sameExpr(context, x.a, y.a) or !sameExpr(context, x.c, y.c)) return false;
             if (!listOwner(x.kind)) return sameExpr(context, x.b, y.b);
             var left = x.b;

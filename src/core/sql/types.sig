@@ -8,6 +8,7 @@ const character = @import("character.sig");
 const uuid = @import("uuid.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
+const array_module = @import("array.sig");
 
 pub const Config = struct {
     /// Caller supplies row/version/index buffers and query reference workspace.
@@ -284,6 +285,13 @@ pub const Error = error{
     UndefinedSchema,
     /// SQLSTATE 42P06: CREATE SCHEMA of an existing name.
     DuplicateSchema,
+    /// SQLSTATE 42P18: the type of an expression (an empty ARRAY[]) cannot
+    /// be determined.
+    IndeterminateDatatype,
+    /// SQLSTATE 2202E: mismatched array dimensions or subscripts.
+    ArraySubscriptError,
+    /// SQLSTATE 22000: invalid data (array_append to a multi-dimensional array).
+    DataException,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -342,11 +350,49 @@ pub const Dialect = enum { postgres, mysql, tds };
 
 /// Stored column / result types. `integer` is int8 (BIGINT) and
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
-pub const DataType = enum { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8 };
+/// The unnamed values are array types: the element's ordinal with
+/// array_bit set (arrayData/elementData); there are no arrays of arrays.
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
-/// that has not been resolved by context yet.
-pub const Type = enum { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8 };
+/// that has not been resolved by context yet. Unnamed values are array
+/// types, encoded like DataType's (arrayType/elementType).
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, _ };
+
+/// Array types set this bit over the element type's ordinal.
+pub const array_bit: u8 = 0x80;
+const data_type_count = @typeInfo(DataType).@"enum".field_names.len;
+const type_count = @typeInfo(Type).@"enum".field_names.len;
+
+/// The array type of a named element type (null for an array).
+pub fn arrayData(element: DataType) ?DataType {
+    const raw = @intFromEnum(element);
+    if (raw >= data_type_count) return null;
+    return @enumFromInt(raw | array_bit);
+}
+
+/// The element type of an array type (null for a scalar type).
+pub fn elementData(data_type: DataType) ?DataType {
+    const raw = @intFromEnum(data_type);
+    if (raw < array_bit or raw & ~array_bit >= data_type_count) return null;
+    return @enumFromInt(raw & ~array_bit);
+}
+
+pub fn arrayType(element: Type) ?Type {
+    const raw = @intFromEnum(element);
+    if (element == .unknown or raw >= type_count) return null;
+    return @enumFromInt(raw | array_bit);
+}
+
+pub fn elementType(ty: Type) ?Type {
+    const raw = @intFromEnum(ty);
+    if (raw < array_bit or raw & ~array_bit >= type_count or raw & ~array_bit == 0) return null;
+    return @enumFromInt(raw & ~array_bit);
+}
+
+pub fn isArray(ty: Type) bool {
+    return elementType(ty) != null;
+}
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
@@ -377,6 +423,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .money => .money,
         .pg_lsn => .pg_lsn,
         .xid8 => .xid8,
+        _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
 
@@ -409,6 +456,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .money => .money,
         .pg_lsn => .pg_lsn,
         .xid8 => .xid8,
+        _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
 
@@ -417,6 +465,30 @@ pub fn typeOfData(data_type: DataType) Type {
 pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8, array: u32 };
 
 pub fn typeInfo(data_type: DataType) TypeInfo {
+    if (elementData(data_type)) |element| {
+        const base = baseInfo(element);
+        return .{ .oid = base.array, .name = array_names[@intFromEnum(element)], .len = -1, .category = 'A', .array = 0 };
+    }
+    return baseInfo(data_type);
+}
+
+/// typname of each named type's array type: `_` + the element typname.
+const array_names = blk: {
+    const fields = @typeInfo(DataType).@"enum".field_names;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |field, index| names[index] = "_" ++ baseInfo(@field(DataType, field)).name;
+    break :blk names;
+};
+
+/// SQL spelling of each named type's array type (`integer[]`).
+const array_sql_names = blk: {
+    const fields = @typeInfo(DataType).@"enum".field_names;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |field, index| names[index] = baseSqlName(@field(DataType, field)) ++ "[]";
+    break :blk names;
+};
+
+fn baseInfo(data_type: DataType) TypeInfo {
     return switch (data_type) {
         .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000 },
         .name => .{ .oid = 19, .name = "name", .len = 64, .category = 'S', .array = 1003 },
@@ -445,6 +517,7 @@ pub fn typeInfo(data_type: DataType) TypeInfo {
         .money => .{ .oid = 790, .name = "money", .len = 8, .category = 'N', .array = 791 },
         .pg_lsn => .{ .oid = 3220, .name = "pg_lsn", .len = 8, .category = 'U', .array = 3221 },
         .xid8 => .{ .oid = 5069, .name = "xid8", .len = 8, .category = 'U', .array = 271 },
+        _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
 
@@ -456,6 +529,11 @@ pub fn typeOid(data_type: DataType) u32 {
 /// SQL spelling of a type (format_type with no typmod, regtype output,
 /// information_schema.columns.data_type).
 pub fn sqlTypeName(data_type: DataType) []const u8 {
+    if (elementData(data_type)) |element| return array_sql_names[@intFromEnum(element)];
+    return baseSqlName(data_type);
+}
+
+fn baseSqlName(data_type: DataType) []const u8 {
     return switch (data_type) {
         .integer => "bigint",
         .integer32 => "integer",
@@ -484,6 +562,7 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
         .money => "money",
         .pg_lsn => "pg_lsn",
         .xid8 => "xid8",
+        _ => "",
     };
 }
 
@@ -517,12 +596,33 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .money => "cash_in",
         .pg_lsn => "pg_lsn_in",
         .xid8 => "xid8in",
+        _ => "array_in",
     };
 }
 
 /// regtype input: type names and aliases, optionally pg_catalog-qualified
 /// or quoted, any typmod suffix ignored. null when unknown.
 pub fn typeByName(input: []const u8) ?DataType {
+    var trimmed = input;
+    while (trimmed.len != 0 and (trimmed[trimmed.len - 1] == ' ' or trimmed[trimmed.len - 1] == '\t')) trimmed = trimmed[0 .. trimmed.len - 1];
+    // `element[]` (any number of bracket pairs: arrays have no dimension type).
+    if (trimmed.len > 2 and trimmed[trimmed.len - 1] == ']') {
+        var end = trimmed.len;
+        while (end > 0 and trimmed[end - 1] == ']') {
+            var open = end - 1;
+            while (open > 0 and trimmed[open - 1] != '[') open -= 1;
+            if (open == 0) return null;
+            for (trimmed[open .. end - 1]) |byte| if (!digit(byte)) return null;
+            end = open - 1;
+            while (end > 0 and trimmed[end - 1] == ' ') end -= 1;
+        }
+        const element = scalarByName(trimmed[0..end]) orelse return null;
+        return arrayData(element);
+    }
+    return scalarByName(trimmed);
+}
+
+fn scalarByName(input: []const u8) ?DataType {
     var text = input;
     while (text.len != 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
     while (text.len != 0 and (text[text.len - 1] == ' ' or text[text.len - 1] == '\t')) text = text[0 .. text.len - 1];
@@ -557,6 +657,8 @@ pub fn typeByName(input: []const u8) ?DataType {
     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
         const data_type = @field(DataType, field);
         if (same(name, typeInfo(data_type).name)) return data_type;
+        // `_element`: the array type's typname.
+        if (name.len > 1 and name[0] == '_' and same(name[1..], typeInfo(data_type).name)) return arrayData(data_type);
     }
     return null;
 }
@@ -564,6 +666,9 @@ pub fn typeByName(input: []const u8) ?DataType {
 pub fn typeFromOid(oid: u32) ?DataType {
     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
         if (typeInfo(@field(DataType, field)).oid == oid) return @field(DataType, field);
+    }
+    inline for (@typeInfo(DataType).@"enum".field_names) |field| {
+        if (oid != 0 and baseInfo(@field(DataType, field)).array == oid) return arrayData(@field(DataType, field));
     }
     return null;
 }
@@ -634,7 +739,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8 };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -664,7 +769,12 @@ pub fn Values(comptime config: Config) type {
             pg_lsn: u64,
             /// xid8: a 64-bit full transaction id (catalog_ids.sig).
             xid8: u64,
+            /// Arrays of every element type (array.sig layout).
+            array: Text,
         };
+
+        /// Array values of these cells (array.sig).
+        pub const Arrays = array_module.Arrays(@This());
 
         pub const Row = struct {
             cells: [config.columns]Cell = @splat(.null_value),
@@ -706,6 +816,7 @@ pub fn Values(comptime config: Config) type {
                 .money => .money,
                 .pg_lsn => .pg_lsn,
                 .xid8 => .xid8,
+                _ => .array,
             };
         }
 
@@ -740,6 +851,7 @@ pub fn Values(comptime config: Config) type {
                 .money => |value| order(i64, value, right.money),
                 .pg_lsn => |value| order(u64, value, right.pg_lsn),
                 .xid8 => |value| order(u64, value, right.xid8),
+                .array => |*value| Arrays.compare(value.slice(), right.array.slice()),
             };
         }
 
@@ -799,6 +911,7 @@ pub fn Values(comptime config: Config) type {
                 .date => |days| return wordHash(@bitCast(@as(i64, days)), tag),
                 .timestamp, .timestamptz, .time, .money => |us| return wordHash(@bitCast(us), tag),
                 .pg_lsn, .xid8 => |word| return wordHash(word, tag),
+                .array => |*items| return wordHash(Arrays.hash(items.slice()), tag),
                 .timetz => |time| {
                     mix(&code, tag);
                     mix(&code, @bitCast(time.us));
@@ -848,6 +961,17 @@ pub fn Values(comptime config: Config) type {
                 return;
             }
             if (@as(CellTag, value.*) != cellTag(column.data_type)) return error.TypeMismatch;
+            if (value.* == .array) {
+                // The element type and every element's own checks (CHAR(n),
+                // VARCHAR(n) and BIT(n) lengths apply to elements).
+                const element = elementData(column.data_type) orelse return error.TypeMismatch;
+                if (Arrays.elementType(value.array.slice()) != element) return error.TypeMismatch;
+                const member: Column = .{ .data_type = element, .typmod = column.typmod };
+                var reader = Arrays.Reader.init(value.array.slice());
+                var cell: Cell = undefined;
+                while (reader.next(&cell)) try validate(&member, &cell);
+                return;
+            }
             switch (column.data_type) {
                 .varchar => if (!character.fits(value.text.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bpchar => if (!character.fits(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,

@@ -10,6 +10,9 @@
 //! padded), UUID 16 bytes, BYTEA raw bytes (hex text), TIME i64
 //! microseconds, TIMETZ {i64 microseconds, i32 seconds west} and BIT/VARBIT
 //! {i32 bit length, packed bits}, MONEY i64 cents and pg_lsn/xid8 u64.
+//! Arrays use array_send/array_recv: {i32 ndim, i32 has-NULL flag, element
+//! type OID, ndim x (i32 dim, i32 lower bound), then per element an i32
+//! length (-1 for NULL) and the element's binary form}.
 //! Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
@@ -127,13 +130,48 @@ pub fn Types(comptime Result: type) type {
                 },
                 .money => |value| try putInt(i64, out, &at, value),
                 .pg_lsn, .xid8 => |value| try putInt(u64, out, &at, value),
+                .array => |*items| {
+                    const element = Io.elementData(data_type) orelse return error.UnsupportedBinaryType;
+                    const shape = Io.Arrays.shape(items.slice());
+                    try putInt(i32, out, &at, @intCast(shape.ndim));
+                    try putInt(i32, out, &at, @intFromBool(shape.has_nulls));
+                    try putInt(u32, out, &at, Io.typeInfo(element).oid);
+                    for (0..shape.ndim) |dim| {
+                        try putInt(i32, out, &at, @intCast(shape.dims[dim]));
+                        try putInt(i32, out, &at, shape.lbounds[dim]);
+                    }
+                    var reader = Io.Arrays.Reader.init(items.slice());
+                    var item: Cell = undefined;
+                    while (reader.next(&item)) {
+                        if (item == .null_value) {
+                            try putInt(i32, out, &at, -1);
+                            continue;
+                        }
+                        if (out.len - at < 4) return error.BufferTooSmall;
+                        const size = try sendBinary(&item, element, session, out[at + 4 ..]);
+                        try putInt(i32, out, &at, @intCast(size));
+                        at += size;
+                    }
+                },
             }
             return at;
         }
 
+        /// Parameter cast names of array types (`int4[]`; bit as varbit).
+        const array_cast_names = blk: {
+            const fields = @typeInfo(DataType).@"enum".field_names;
+            var names: [fields.len][]const u8 = undefined;
+            for (fields, 0..) |field, index| {
+                const element = @field(DataType, field);
+                names[index] = (if (element == .bit) "varbit" else Io.typeInfo(element).name) ++ "[]";
+            }
+            break :blk names;
+        };
+
         /// SQL type name used in a parameter literal `'...'::name`.
         fn castName(type_oid: u32) ?[]const u8 {
             const data_type = Io.typeFromOid(type_oid) orelse return null;
+            if (Io.elementData(data_type)) |element| return array_cast_names[@intFromEnum(element)];
             return switch (data_type) {
                 .text, .integer, .integer32, .boolean => null,
                 // `::bit` would mean BIT(1); varbit keeps every bit and is
@@ -213,7 +251,53 @@ pub fn Types(comptime Result: type) type {
             return out[0..rendered.len];
         }
 
+        /// array_recv: the declared element type must match, at most six
+        /// dimensions, a flag of 0 or 1, exact element lengths and no
+        /// trailing bytes. Each element goes through its own receive and
+        /// input functions.
+        fn decodeArray(bytes: []const u8, data_type: DataType) Error!Cell {
+            const element = Io.elementData(data_type) orelse return error.UnsupportedBinaryType;
+            if (bytes.len < 12) return error.ProtocolViolation;
+            const ndim = getInt(i32, bytes[0..4]);
+            const flags = getInt(i32, bytes[4..8]);
+            if (ndim < 0 or ndim > 6 or (flags != 0 and flags != 1) or getInt(u32, bytes[8..12]) != Io.typeInfo(element).oid) return error.ProtocolViolation;
+            var at: usize = 12;
+            var shape: Io.ArrayShape = .{ .element = element, .ndim = @intCast(ndim) };
+            var empty = ndim == 0;
+            for (0..shape.ndim) |dim| {
+                if (bytes.len - at < 8) return error.ProtocolViolation;
+                const size = getInt(i32, bytes[at..][0..4]);
+                if (size < 0) return error.ProtocolViolation;
+                shape.dims[dim] = @intCast(size);
+                shape.lbounds[dim] = getInt(i32, bytes[at + 4 ..][0..4]);
+                if (size == 0) empty = true;
+                at += 8;
+            }
+            if (empty) shape.ndim = 0;
+            var result: Io.Text = .{};
+            var writer = Io.Arrays.Writer.begin(&result, &shape) catch |err| return if (err == error.TextCapacity) error.BufferTooSmall else error.ProtocolViolation;
+            const utc: Session = .{};
+            var text: [Io.format_bytes]u8 = undefined;
+            while (!writer.complete()) {
+                if (bytes.len - at < 4) return error.ProtocolViolation;
+                const size = getInt(i32, bytes[at..][0..4]);
+                at += 4;
+                var cell: Cell = .null_value;
+                if (size != -1) {
+                    if (size < 0 or bytes.len - at < @as(usize, @intCast(size))) return error.ProtocolViolation;
+                    const end = at + @as(usize, @intCast(size));
+                    const rendered = try receiveText(bytes[at..end], element, &text);
+                    cell = Io.parse(Io.typeOfData(element), -1, rendered, &utc) catch return error.ProtocolViolation;
+                    at = end;
+                }
+                writer.append(&cell) catch |err| return if (err == error.TextCapacity) error.BufferTooSmall else error.ProtocolViolation;
+            }
+            if (at != bytes.len) return error.ProtocolViolation;
+            return .{ .array = result };
+        }
+
         fn decodeBinary(bytes: []const u8, data_type: DataType) Error!Cell {
+            if (Io.elementData(data_type) != null) return decodeArray(bytes, data_type);
             const need: usize = switch (data_type) {
                 .smallint => 2,
                 .integer32, .oid, .real, .date => 4,

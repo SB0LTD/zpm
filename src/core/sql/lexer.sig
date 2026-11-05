@@ -291,6 +291,11 @@ pub const Symbol = enum {
     shift_left,
     shift_right,
     tilde,
+    // Arrays and ranges (B11 advanced types): [ ] : and &&.
+    lbracket,
+    rbracket,
+    colon,
+    overlap,
 };
 
 pub const Token = struct {
@@ -591,12 +596,17 @@ pub const Tokenizer = struct {
                 width = 2;
                 break :blk Symbol.concat;
             } else .pipe,
-            '&' => .ampersand,
+            '&' => if (following == '&') blk: {
+                width = 2;
+                break :blk Symbol.overlap;
+            } else .ampersand,
+            '[' => .lbracket,
+            ']' => .rbracket,
             '~' => .tilde,
             ':' => if (following == ':') blk: {
                 width = 2;
                 break :blk Symbol.cast;
-            } else return error.Syntax,
+            } else .colon,
             '#' => if (following == '>') blk: {
                 width = if (third == '>') 3 else 2;
                 break :blk if (third == '>') Symbol.path_text else Symbol.path;

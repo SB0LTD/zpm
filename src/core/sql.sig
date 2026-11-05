@@ -1874,6 +1874,11 @@ pub fn Database(comptime config: Config) type {
                     const info = types.typeInfo(data_type);
                     var category: [1]u8 = .{info.category};
                     try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)) });
+                    // The type's array type (`_name`, category A).
+                    if (types.arrayData(data_type)) |array_type| {
+                        const array_info = types.typeInfo(array_type);
+                        try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)) });
+                    }
                 },
                 .pg_namespace, .schemata => {
                     for (catalog_module.namespaces) |namespace| {
@@ -1949,7 +1954,7 @@ pub fn Database(comptime config: Config) type {
                                     const numeric = numericPrecision(column);
                                     try sink.add(&.{
                                         nameCell(database),                                       nameCell(schema_name),                          nameCell(name),            nameCell(column.name.slice()),
-                                        intCell(attnum),                                          if (kind == .default) expressionTextWithPool(pool,column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(types.sqlTypeName(column.data_type)),
+                                        intCell(attnum),                                          if (kind == .default) expressionTextWithPool(pool,column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(if (types.elementData(column.data_type) != null) "ARRAY" else types.sqlTypeName(column.data_type)),
                                         optionalInt(characterMaximumLength(column)),              optionalInt(numeric[0]),                     optionalInt(numeric[1]),   optionalInt(numeric[2]),
                                         optionalInt(datetimePrecision(column)),                   nameCell(if (identity.len != 0) "YES" else "NO"), if (identity.len == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
                                         if (kind == .generated) expressionTextWithPool(pool,column) else .null_value,

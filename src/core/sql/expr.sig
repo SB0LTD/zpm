@@ -17,6 +17,7 @@ const float_text = @import("float_text.sig");
 const bytea_module = @import("bytea.sig");
 const builtins = @import("functions_eval.sig");
 const stats = @import("aggregates_stat.sig");
+const array_eval = @import("array_eval.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -338,6 +339,14 @@ pub fn Eval(comptime config: types.Config) type {
         fn formatType(oid: i64, typmod: i64) Error!V.Cell {
             const data_type = if (oid >= 0 and oid <= 0xffffffff) types.typeFromOid(@intCast(oid)) else null;
             const known = data_type orelse return textCell("???");
+            if (types.elementData(known)) |element| {
+                // An array: its element type (with the typmod) and `[]`.
+                var inner = try formatType(types.typeOid(element), typmod);
+                if (inner.text.len + 2 > config.text_bytes) return error.TextCapacity;
+                @memcpy(inner.text.bytes[inner.text.len..][0..2], "[]");
+                inner.text.len += 2;
+                return inner;
+            }
             var buffer: [64]u8 = undefined;
             var at: usize = 0;
             const append = struct {
@@ -656,10 +665,11 @@ pub fn Eval(comptime config: types.Config) type {
                         const right = try operandRef(ctx, n.b, &right_value);
                         return compareOp(n.op, left, right);
                     }
-                    if (n.op == .contains or n.op == .contained or n.op == .exists) {
+                    if (n.op == .contains or n.op == .contained or n.op == .exists or n.op == .overlap) {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return null;
+                        if (left == .array) return try array_eval.ArrayEval(config, @This()).containment(n.op, &left, &right, ctx.session);
                         return switch (n.op) {
                             .contains => J.contains(left.jsonb.slice(), right.jsonb.slice()),
                             .contained => J.contains(right.jsonb.slice(), left.jsonb.slice()),
@@ -787,10 +797,17 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists => return boolCell(try truth(ctx, id)),
+                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap => return boolCell(try truth(ctx, id)),
                     .concat => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
+                        if (types.isArray(n.ty)) {
+                            // array_cat / array_append / array_prepend are not strict.
+                            const left_array = types.isArray(node(ctx, n.a).ty);
+                            const right_array = types.isArray(node(ctx, n.b).ty);
+                            const kind: array_eval.ArrayEval(config, @This()).Concat = if (left_array and right_array) .cat else if (left_array) .append else .prepend;
+                            return array_eval.ArrayEval(config, @This()).concat(kind, &left, &right, n.ty);
+                        }
                         if (left == .null_value or right == .null_value) return .null_value;
                         if (n.ty == .jsonb) {
                             var out: J.Buffer = .{};
@@ -1006,6 +1023,8 @@ pub fn Eval(comptime config: types.Config) type {
                     .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
                     .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
                     .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
+                    .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
                     .aggregate_pair => {
                         // Both inputs are evaluated; NULL skips the row (strict).
                         const y = try eval(ctx, n.b);

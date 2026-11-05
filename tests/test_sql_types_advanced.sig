@@ -106,6 +106,10 @@ fn sqlstate(err: anyerror, wanted: []const u8) !void {
         .{ .name = "CannotCoerce", .state = "42846" },
         .{ .name = "TypeMismatch", .state = "42804" },
         .{ .name = "UnsupportedStatement", .state = "0A000" },
+        .{ .name = "ProgramLimitExceeded", .state = "54000" },
+        .{ .name = "TextCapacity", .state = "54000" },
+        .{ .name = "IndeterminateDatatype", .state = "42P18" },
+        .{ .name = "ArraySubscriptError", .state = "2202E" },
     };
     var state: []const u8 = "?";
     for (table) |entry| {
@@ -336,8 +340,195 @@ fn catalogIds() !void {
     try meta(2, 5069, -1);
 }
 
+// ---- arrays ------------------------------------------------------------------
+
+fn arrays() !void {
+    // oracle: PG.TYPE.ARRAY.
+    try exec("CREATE TABLE tdd_type(v INT[])");
+    try exec("INSERT INTO tdd_type VALUES(ARRAY[1,2]),(NULL)");
+    try rows("SELECT v FROM tdd_type ORDER BY v NULLS LAST", "{1,2};NULL");
+    try meta(0, 1007, -1);
+    try named(0, "v");
+    try exec("DROP TABLE tdd_type");
+
+    // Declarations: every spelling names the same array type; declared sizes
+    // and dimensions are ignored; the typmod applies to the elements.
+    try exec("CREATE TABLE a(id INT PRIMARY KEY, i INTEGER ARRAY, t TEXT[], n NUMERIC(5,2)[], v VARCHAR(3)[], g INT[3][3], b BOOLEAN ARRAY[2])");
+    try rows("SELECT atttypid, atttypmod FROM pg_attribute WHERE attrelid = 'a'::regclass ORDER BY attnum", "23|-1;1007|-1;1009|-1;1231|327686;1015|7;1007|-1;1000|-1");
+    try rows("SELECT data_type FROM information_schema.columns WHERE table_name = 'a' AND column_name IN ('i', 'v') ORDER BY ordinal_position", "ARRAY;ARRAY");
+    try rows("SELECT format_type(1007, NULL), format_type(1015, 7), format_type(1231, 327686), 'int4[]'::regtype::text, 'integer[]'::regtype::oid, '_text'::regtype::oid, 1009::regtype::text",
+        "integer[]|character varying(3)[]|numeric(5,2)[]|integer[]|1007|1009|text[]");
+    try rows("SELECT typname, typlen, typcategory, typarray, typinput FROM pg_type WHERE oid IN (23, 1007) ORDER BY oid", "int4|4|N|1007|int4in;_int4|-1|A|0|array_in");
+
+    // array_in: quoting, NULL, escapes, whitespace, typmods per element.
+    try exec("INSERT INTO a(id, i, t, n, v, b) VALUES(1, '{1,2,3}', '{a,\"b c\",NULL,\"NULL\",\"\"}', '{1.5,NULL}', '{x,yz}', '{t,f}')");
+    try rows("SELECT i, t, n, v, b FROM a WHERE id = 1", "{1,2,3}|{a,\"b c\",NULL,\"NULL\",\"\"}|{1.50,NULL}|{x,yz}|{t,f}");
+    try meta(1, 1009, -1);
+    try meta(2, 1231, 327686);
+    try meta(3, 1015, 7);
+    try rows("SELECT '{ 1 , 2 }'::int[], '{{1,2},{3,4}}'::int[], '[0:1]={5,6}'::int[], '{}'::int[], '{NULL, null}'::int[], '{\"a\\\"b\",c\\,d, \" e \"}'::text[]",
+        "{1,2}|{{1,2},{3,4}}|[0:1]={5,6}|{}|{NULL,NULL}|{\"a\\\"b\",\"c,d\",\" e \"}");
+    for ([_][]const u8{
+        "SELECT '{1,2'::int[]",           "SELECT '{1,{2}}'::int[]",     "SELECT '1,2'::int[]",
+        "SELECT '{{1,2},{3}}'::int[]",    "SELECT '{1}x'::int[]",        "SELECT '{a}'::int[]",
+        "SELECT '[1:3]={1,2}'::int[]",    "SELECT '{\"a}'::text[]",      "SELECT '{1,,2}'::int[]",
+        "SELECT ''::int[]",               "SELECT '{{1},2}'::int[]",
+    }) |source| try rejects(source, error.InvalidTextRepresentation);
+    try rejects("SELECT '{{{{{{{1}}}}}}}'::int[]", error.ProgramLimitExceeded);
+    try sqlstate(error.ProgramLimitExceeded, "54000");
+
+    // ARRAY[...] constructors: common element type, nesting, empty arrays.
+    try rows("SELECT ARRAY[1,2], ARRAY[[1,2],[3,4]], ARRAY[ARRAY[1],ARRAY[2]], ARRAY['a','b'], ARRAY[1,2.5], ARRAY[NULL,1], ARRAY[]::int[], ARRAY[NULL]",
+        "{1,2}|{{1,2},{3,4}}|{{1},{2}}|{a,b}|{1,2.5}|{NULL,1}|{}|{NULL}");
+    try meta(0, 1007, -1);
+    try meta(3, 1009, -1);
+    try meta(4, 1231, -1);
+    try meta(7, 1009, -1);
+    try named(0, "array");
+    try rejects("SELECT ARRAY[]", error.IndeterminateDatatype);
+    try sqlstate(error.IndeterminateDatatype, "42P18");
+    try rejects("SELECT ARRAY[[1,2],[3]]", error.ArraySubscriptError);
+    try sqlstate(error.ArraySubscriptError, "2202E");
+    try rejects("SELECT ARRAY[1,true]", error.TypeMismatch);
+    try rejects("SELECT ARRAY[1,'x']", error.InvalidTextRepresentation);
+
+    // Subscripts and slices (out of range and NULL subscripts are NULL;
+    // subscripts are assignment-cast to int4; slices restart at 1).
+    try rows("SELECT i[1], i[3], i[4], i[0], i[2:3], i[:2], i[2:] FROM a WHERE id = 1", "1|3|NULL|NULL|{2,3}|{1,2}|{2,3}");
+    try meta(0, 23, -1);
+    try meta(4, 1007, -1);
+    try named(0, "i");
+    try rows("SELECT i[3:2], i[NULL], i[1.5], i[1][1], i[1:1][1] FROM a WHERE id = 1", "{}|NULL|2|NULL|{}");
+    try rows("SELECT t[2], v[2], b[2] FROM a WHERE id = 1", "b c|yz|f");
+    try meta(1, 1043, 7);
+    try rows("SELECT ('{{1,2},{3,4}}'::int[])[2][1], ('{{1,2},{3,4}}'::int[])[2], ('{{1,2},{3,4}}'::int[])[1:2][2:2], ('{{1,2},{3,4}}'::int[])[2:2][1], ('[0:2]={7,8,9}'::int[])[0], ('[0:2]={7,8,9}'::int[])[0:1]",
+        "3|NULL|{{2},{4}}|{{3}}|7|{7,8}");
+    try rejects("SELECT id[1] FROM a", error.TypeMismatch);
+    try sqlstate(error.TypeMismatch, "42804");
+    try rejects("SELECT i['x'] FROM a", error.InvalidTextRepresentation);
+
+    // Functions.
+    try rows("SELECT array_length(i, 1), array_length(i, 2), cardinality(i), array_ndims(i), array_dims(i), array_lower(i, 1), array_upper(i, 1) FROM a WHERE id = 1", "3|NULL|3|1|[1:3]|1|3");
+    try meta(0, 23, -1);
+    try meta(4, 25, -1);
+    try named(0, "array_length");
+    try rows("SELECT array_length('{}'::int[], 1), cardinality('{}'::int[]), array_ndims('{}'::int[]), array_dims('{}'::int[]), cardinality(ARRAY[[1,2],[3,4]]), array_dims('[0:1]={1,2}'::int[]), array_upper(ARRAY[[1,2,3]], 2)",
+        "NULL|0|NULL|NULL|4|[0:1]|3");
+    try rows("SELECT array_to_string(ARRAY[1,NULL,3], ','), array_to_string(ARRAY[1,NULL,3], ',', '*'), array_to_string(ARRAY['a','b'], '')", "1,3|1,*,3|ab");
+
+    // Concatenation (array_cat/array_append/array_prepend are not strict).
+    try rows("SELECT ARRAY[1,2] || 3, 0 || ARRAY[1,2], ARRAY[1] || ARRAY[2,3], ARRAY[[1,2]] || ARRAY[3,4], array_append(ARRAY[1], 2), array_prepend(0, ARRAY[1]), array_cat(ARRAY[1], NULL), NULL::int[] || ARRAY[1]",
+        "{1,2,3}|{0,1,2}|{1,2,3}|{{1,2},{3,4}}|{1,2}|{0,1}|{1}|{1}");
+    try rows("SELECT '[0:0]={1}'::int[] || ARRAY[2], '[0:0]={1}'::int[] || 2, array_append('{}'::int[], 1), array_append(NULL::int[], 1), ARRAY[1,2] || ARRAY[[3,4]]",
+        "[0:1]={1,2}|[0:1]={1,2}|{1}|{1}|{{1,2},{3,4}}");
+    try rejects("SELECT ARRAY[1] || ARRAY[[2,3]]", error.ArraySubscriptError);
+
+    // Comparison, containment and quantified comparisons.
+    try rows("SELECT ARRAY[1,2] = ARRAY[1,2], ARRAY[1,2] <> '{1,3}', ARRAY[1,2] < ARRAY[1,2,3], ARRAY[1,NULL] > ARRAY[1,2], ARRAY[2] > ARRAY[1,9], '[0:1]={1,2}'::int[] = ARRAY[1,2], ARRAY[1,2] IN (ARRAY[1,2], ARRAY[3])",
+        "t|t|t|t|t|f|t");
+    try rows("SELECT ARRAY[1,4,3] @> ARRAY[3,1], ARRAY[1,2] <@ ARRAY[1], ARRAY[1,2] && ARRAY[2,5], ARRAY[1] && ARRAY[3], ARRAY[NULL::int] @> ARRAY[NULL::int], ARRAY[1] @> '{}', ARRAY[[1,2],[3,4]] @> ARRAY[4]",
+        "t|f|t|f|f|t|t");
+    try rows("SELECT 2 = ANY(ARRAY[1,2]), 3 = ANY(ARRAY[1,NULL]), 1 <> ALL(ARRAY[2,3]), 1 = ANY('{}'::int[]), 1 = ANY(NULL::int[]), 2 > ALL(ARRAY[1,1]), 2 = ANY(ARRAY[1.5,2]), NULL = ANY(ARRAY[1])",
+        "t|NULL|t|f|NULL|t|t|NULL");
+    try rows("SELECT id FROM a WHERE 2 = ANY(i)", "1");
+    try rejects("SELECT ARRAY[1] = ARRAY[1::int8]", error.UndefinedFunction);
+    try rejects("SELECT 1 = ANY(ARRAY['a'])", error.UndefinedFunction);
+    try rejects("SELECT 1 = ANY(1)", error.WrongObjectType);
+
+    // Ordering (array_cmp: NULL elements sort last, then length, then
+    // dimensions), grouping and hash consistency.
+    try exec("INSERT INTO a(id, i) VALUES(2, ARRAY[1,2]), (3, '{1,2}'), (4, '{1,NULL}'), (5, '{}'), (6, NULL)");
+    try rows("SELECT i FROM a ORDER BY i NULLS LAST", "{};{1,2};{1,2};{1,2,3};{1,NULL};NULL");
+    try rows("SELECT i FROM a ORDER BY i DESC NULLS LAST", "{1,NULL};{1,2,3};{1,2};{1,2};{};NULL");
+    try rows("SELECT i, COUNT(*) FROM a GROUP BY i ORDER BY i", "{}|1;{1,2}|2;{1,2,3}|1;{1,NULL}|1;NULL|1");
+    try rows("SELECT COUNT(DISTINCT i), MIN(i), MAX(i) FROM a", "4|{}|{1,NULL}");
+    try meta(1, 1007, -1);
+    try rows("SELECT x.id, y.id FROM a x JOIN a y ON x.i = y.i AND x.id < y.id", "2|3");
+    try rows("SELECT i[1] FROM a WHERE id = 6", "NULL");
+    try exec("CREATE TABLE h(x NUMERIC[])");
+    try exec("INSERT INTO h VALUES('{1.0}'), ('{1.00}'), ('{1}'), ('{2}')");
+    try rows("SELECT COUNT(DISTINCT x) FROM h", "2");
+    try rows("SELECT COUNT(*) FROM h GROUP BY x ORDER BY 1", "1;3");
+    try exec("DROP TABLE h");
+
+    // Casts: element-wise between array types, I/O with strings.
+    try rows("SELECT i::text, i::bigint[], i::text[], '{1,2}'::int[]::numeric[], ARRAY[1.6,2.4]::int[], CAST(i AS VARCHAR(5)), '{7}'::text::int[] FROM a WHERE id = 1",
+        "{1,2,3}|{1,2,3}|{1,2,3}|{1,2}|{2,2}|{1,2,|{7}");
+    try meta(1, 1016, -1);
+    try meta(2, 1009, -1);
+    try rows("SELECT '{1,2}'::int[], ARRAY[1]::text[]", "{1,2}|{1}");
+    try named(0, "int4");
+    try named(1, "array");
+    try rejects("SELECT ARRAY['1','x']::int[]", error.InvalidTextRepresentation);
+    try rejects("SELECT ARRAY[1]::int", error.CannotCoerce);
+    try rejects("SELECT 1::int[]", error.CannotCoerce);
+    try sqlstate(error.CannotCoerce, "42846");
+    // Assignment: element casts must exist in assignment context.
+    try rejects("INSERT INTO a(id, i) VALUES(7, ARRAY['1'])", error.TypeMismatch);
+    try exec("INSERT INTO a(id, i) VALUES(7, ARRAY[1::int8])");
+    try rejects("INSERT INTO a(id, i) VALUES(8, ARRAY[3000000000])", error.IntegerOverflow);
+    try rejects("INSERT INTO a(id, v) VALUES(8, '{abcd}')", error.StringDataRightTruncation);
+    try rejects("INSERT INTO a(id, v) VALUES(8, ARRAY['abcd'])", error.StringDataRightTruncation);
+    try rejects("INSERT INTO a(id, i) VALUES(8, '{1}'), (9, '{x}')", error.InvalidTextRepresentation);
+    try exec("UPDATE a SET i = i || 4 WHERE id = 2");
+    try rows("SELECT COUNT(*), MAX(id) FROM a", "7|7");
+    try rows("SELECT i FROM a WHERE id IN (2, 7) ORDER BY id", "{1,2,4};{1}");
+
+    // Capacity: an array is bounded by the cell's byte budget (text_bytes
+    // 160 here: a 12-byte header and 5 bytes per int4 element).
+    try rows("SELECT cardinality('{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29}'::int[])", "29");
+    try rejects("SELECT '{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30}'::int[]", error.TextCapacity);
+    try rejects("SELECT ARRAY[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30]", error.TextCapacity);
+    try sqlstate(error.TextCapacity, "54000");
+    try exec("DROP TABLE a");
+
+    // Defaults, CHECK constraints and keys over arrays.
+    try exec("CREATE TABLE d(id INT[] PRIMARY KEY, tags TEXT[] DEFAULT '{}', n INT[] DEFAULT ARRAY[1,2] CHECK (cardinality(n) < 3))");
+    try exec("INSERT INTO d(id) VALUES('{1,2}'), ('[0:1]={1,2}')");
+    try rows("SELECT id, tags, n FROM d ORDER BY id", "[0:1]={1,2}|{}|{1,2};{1,2}|{}|{1,2}");
+    try rows("SELECT column_default FROM information_schema.columns WHERE table_name = 'd' AND column_name = 'tags'", "'{}'::text[]");
+    try rejects("INSERT INTO d(id) VALUES(ARRAY[1,2])", error.PrimaryKeyViolation);
+    try rejects("INSERT INTO d VALUES('{3}', '{a}', '{1,2,3}')", error.CheckViolation);
+    try rejects("UPDATE d SET n = n || 9", error.CheckViolation);
+    try rows("SELECT COUNT(*) FROM d WHERE id = '{1,2}' OR id = ARRAY[7]", "1");
+    try exec("DROP TABLE d");
+
+    // Wire: array_send / array_recv with element OIDs and lengths.
+    try exec("SELECT ARRAY[1,NULL,3], ARRAY['ab','c']");
+    const ints = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 23, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 1, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 4, 0, 0, 0, 3 };
+    const texts = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 25, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2, 'a', 'b', 0, 0, 0, 1, 'c' };
+    const int_array = result.column_types[0];
+    const text_array = result.column_types[1];
+    try check(Wire.oid(int_array) == 1007 and Wire.length(int_array) == -1 and Wire.oid(text_array) == 1009);
+    try sendText(&result.rows[0].cells[0], "{1,NULL,3}");
+    try sendBinary(&result.rows[0].cells[0], int_array, &ints);
+    try sendBinary(&result.rows[0].cells[1], text_array, &texts);
+    try receive(&ints, int_array, "{1,NULL,3}");
+    try receive(&texts, text_array, "{ab,c}");
+    try receive(&.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23 }, int_array, "{}");
+    try literal(&ints, 1007, 1, "'{1,NULL,3}'::int4[]");
+    try literal("{1}", 1009, 0, "'{1}'::text[]");
+    var out: [64]u8 = undefined;
+    // Wrong element type, truncated element, negative length and too many dimensions.
+    try check(if (Wire.receiveText(&.{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 1 }, int_array, &out)) |_| false else |err| err == error.ProtocolViolation);
+    try check(if (Wire.receiveText(ints[0..38], int_array, &out)) |_| false else |err| err == error.ProtocolViolation);
+    try check(if (Wire.receiveText(&.{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 1, 0, 0, 0, 1, 0xff, 0xff, 0xff, 0xfe }, int_array, &out)) |_| false else |err| err == error.ProtocolViolation);
+    try check(if (Wire.receiveText(&.{ 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 23 }, int_array, &out)) |_| false else |err| err == error.ProtocolViolation);
+
+    // Durability: change-record value tag 21 (element OID, shape, elements).
+    try replay(&.{
+        "CREATE TABLE r(id INT PRIMARY KEY, i INT[], t TEXT[], v VARCHAR(2)[])",
+        "INSERT INTO r VALUES(1, '{1,NULL,3}', '{a,\"b c\"}', '{x}'), (2, NULL, '{}', NULL), (3, '[0:1][1:2]={{1,2},{3,4}}', NULL, NULL)",
+        "UPDATE r SET i = i || 4 WHERE id = 1",
+    }, &.{"r"}, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "1|{1,NULL,3,4}|{a,\"b c\"}|{x};2|NULL|{}|NULL;3|[0:1][1:2]={{1,2},{3,4}}|NULL|NULL");
+    try meta(1, 1007, -1);
+    try meta(3, 1015, 6);
+}
+
 pub fn main(init: std.process.Init) !void {
     try catalogIds();
+    try arrays();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-advanced\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);
