@@ -5318,11 +5318,16 @@ pub fn Binder(comptime config: types.Config) type {
             p.typmods[0] = -1;
             p.count = 1;
             if (item.ordinality) {
-                p.targets[1] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
-                p.names[1] = literalName("ordinality");
-                p.tys[1] = .int8;
-                p.typmods[1] = -1;
-                p.count = 2;
+                // A one-column configuration has no slot for the ordinality
+                // column; the comptime branch keeps index 1 out of its build.
+                if (comptime p.names.len < 2) return error.ColumnCapacity;
+                if (comptime p.names.len >= 2) {
+                    p.targets[1] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
+                    p.names[1] = literalName("ordinality");
+                    p.tys[1] = .int8;
+                    p.typmods[1] = -1;
+                    p.count = 2;
+                }
             }
             p.width = p.count;
             return id;
