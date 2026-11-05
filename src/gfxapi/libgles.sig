@@ -409,6 +409,130 @@ pub export fn glGetFramebufferAttachmentParameteriv(target: u32, attachment: u32
     if (params) |p| p[0] = v;
 }
 
+pub export fn glGenVertexArrays(n: i32, out: ?[*]u32) callconv(.c) void {
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (out) |p| c.genVertexArrays(p[0..k]);
+}
+pub export fn glDeleteVertexArrays(n: i32, names: ?[*]const u32) callconv(.c) void {
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (names) |p| c.deleteVertexArrays(p[0..k]);
+}
+pub export fn glBindVertexArray(name: u32) callconv(.c) void {
+    if (cur()) |c| c.bindVertexArray(name);
+}
+pub export fn glIsVertexArray(name: u32) callconv(.c) u8 {
+    const c = cur() orelse return g.FALSE;
+    return @intFromBool(c.isVertexArray(name));
+}
+pub export fn glVertexAttribPointer(index: u32, size: i32, ty: u32, normalized: u8, stride: i32, pointer: ?*const anyopaque) callconv(.c) void {
+    if (cur()) |c| c.vertexAttribPointer(index, size, ty, b(normalized), stride, @intFromPtr(pointer), false);
+}
+pub export fn glVertexAttribIPointer(index: u32, size: i32, ty: u32, stride: i32, pointer: ?*const anyopaque) callconv(.c) void {
+    if (cur()) |c| c.vertexAttribPointer(index, size, ty, false, stride, @intFromPtr(pointer), true);
+}
+pub export fn glEnableVertexAttribArray(index: u32) callconv(.c) void {
+    if (cur()) |c| c.enableVertexAttribArray(index, true);
+}
+pub export fn glDisableVertexAttribArray(index: u32) callconv(.c) void {
+    if (cur()) |c| c.enableVertexAttribArray(index, false);
+}
+pub export fn glVertexAttribDivisor(index: u32, divisor: u32) callconv(.c) void {
+    if (cur()) |c| c.vertexAttribDivisor(index, divisor);
+}
+fn fattr(index: u32, x: f32, y: f32, z: f32, w: f32) void {
+    if (cur()) |c| c.vertexAttrib(index, .{ @bitCast(x), @bitCast(y), @bitCast(z), @bitCast(w) }, false);
+}
+pub export fn glVertexAttrib1f(index: u32, x: f32) callconv(.c) void {
+    fattr(index, x, 0, 0, 1);
+}
+pub export fn glVertexAttrib2f(index: u32, x: f32, y: f32) callconv(.c) void {
+    fattr(index, x, y, 0, 1);
+}
+pub export fn glVertexAttrib3f(index: u32, x: f32, y: f32, z: f32) callconv(.c) void {
+    fattr(index, x, y, z, 1);
+}
+pub export fn glVertexAttrib4f(index: u32, x: f32, y: f32, z: f32, w: f32) callconv(.c) void {
+    fattr(index, x, y, z, w);
+}
+pub export fn glVertexAttrib1fv(index: u32, v: ?[*]const f32) callconv(.c) void {
+    if (v) |p| fattr(index, p[0], 0, 0, 1);
+}
+pub export fn glVertexAttrib2fv(index: u32, v: ?[*]const f32) callconv(.c) void {
+    if (v) |p| fattr(index, p[0], p[1], 0, 1);
+}
+pub export fn glVertexAttrib3fv(index: u32, v: ?[*]const f32) callconv(.c) void {
+    if (v) |p| fattr(index, p[0], p[1], p[2], 1);
+}
+pub export fn glVertexAttrib4fv(index: u32, v: ?[*]const f32) callconv(.c) void {
+    if (v) |p| fattr(index, p[0], p[1], p[2], p[3]);
+}
+pub export fn glVertexAttribI4i(index: u32, x: i32, y: i32, z: i32, w: i32) callconv(.c) void {
+    if (cur()) |c| c.vertexAttrib(index, .{ @bitCast(x), @bitCast(y), @bitCast(z), @bitCast(w) }, true);
+}
+pub export fn glVertexAttribI4ui(index: u32, x: u32, y: u32, z: u32, w: u32) callconv(.c) void {
+    if (cur()) |c| c.vertexAttrib(index, .{ x, y, z, w }, true);
+}
+pub export fn glVertexAttribI4iv(index: u32, v: ?[*]const i32) callconv(.c) void {
+    if (v) |p| glVertexAttribI4i(index, p[0], p[1], p[2], p[3]);
+}
+pub export fn glVertexAttribI4uiv(index: u32, v: ?[*]const u32) callconv(.c) void {
+    if (v) |p| glVertexAttribI4ui(index, p[0], p[1], p[2], p[3]);
+}
+pub export fn glGetVertexAttribiv(index: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    const c = cur() orelse return;
+    const v = c.getVertexAttrib(index, pname) orelse return;
+    if (params) |p| p[0] = v;
+}
+pub export fn glDrawArrays(mode: u32, first: i32, n: i32) callconv(.c) void {
+    if (cur()) |c| c.drawArrays(mode, first, n, 1);
+}
+pub export fn glDrawArraysInstanced(mode: u32, first: i32, n: i32, instances: i32) callconv(.c) void {
+    if (cur()) |c| c.drawArrays(mode, first, n, instances);
+}
+pub export fn glDrawElements(mode: u32, n: i32, ty: u32, indices: ?*const anyopaque) callconv(.c) void {
+    if (cur()) |c| c.drawElements(mode, n, ty, @intFromPtr(indices), 1);
+}
+pub export fn glDrawElementsInstanced(mode: u32, n: i32, ty: u32, indices: ?*const anyopaque, instances: i32) callconv(.c) void {
+    if (cur()) |c| c.drawElements(mode, n, ty, @intFromPtr(indices), instances);
+}
+pub export fn glDrawRangeElements(mode: u32, start: u32, end: u32, n: i32, ty: u32, indices: ?*const anyopaque) callconv(.c) void {
+    const c = cur() orelse return;
+    if (end < start) {
+        if (c.err == g.NO_ERROR) c.err = g.INVALID_VALUE;
+        return;
+    }
+    c.drawElements(mode, n, ty, @intFromPtr(indices), 1);
+}
+pub export fn glBlendFunc(src: u32, dst: u32) callconv(.c) void {
+    if (cur()) |c| c.blendFunc(src, dst, src, dst);
+}
+pub export fn glBlendFuncSeparate(src_rgb: u32, dst_rgb: u32, src_a: u32, dst_a: u32) callconv(.c) void {
+    if (cur()) |c| c.blendFunc(src_rgb, dst_rgb, src_a, dst_a);
+}
+pub export fn glBlendEquation(mode: u32) callconv(.c) void {
+    if (cur()) |c| c.blendEquation(mode, mode);
+}
+pub export fn glBlendEquationSeparate(rgb: u32, a: u32) callconv(.c) void {
+    if (cur()) |c| c.blendEquation(rgb, a);
+}
+pub export fn glBlendColor(r: f32, gr: f32, bl: f32, a: f32) callconv(.c) void {
+    if (cur()) |c| c.blendColor(r, gr, bl, a);
+}
+pub export fn glDepthFunc(func: u32) callconv(.c) void {
+    if (cur()) |c| c.depthFunc(func);
+}
+pub export fn glDepthRangef(n: f32, f_: f32) callconv(.c) void {
+    if (cur()) |c| c.depthRange(n, f_);
+}
+pub export fn glCullFace(mode: u32) callconv(.c) void {
+    if (cur()) |c| c.cullFace(mode);
+}
+pub export fn glFrontFace(mode: u32) callconv(.c) void {
+    if (cur()) |c| c.frontFace(mode);
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 var t_pool: [1 << 20]u8 align(64) = undefined;
@@ -461,7 +585,7 @@ test "libgles: GL through its C entry points, on the CPU" {
 test "libgles: getProcAddress finds every entry point, and nothing else" {
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glClear)), getProcAddress("glClear"));
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glTexStorage2DEXT)), getProcAddress("glTexStorage2DEXT"));
-    try std.testing.expect(getProcAddress("glDrawArrays") == null);
+    try std.testing.expect(getProcAddress("glCompileShader") == null);
     try std.testing.expect(getProcAddress("getProcAddress") == null);
     try std.testing.expect(entries.len > 70);
 }

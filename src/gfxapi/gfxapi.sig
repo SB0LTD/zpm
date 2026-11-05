@@ -27,6 +27,7 @@ pub const wayland = @import("wayland.sig");
 pub const thread = @import("thread.sig");
 pub const dl = @import("dl.sig");
 pub const host = @import("host.sig");
+pub const raster = @import("raster.sig");
 
 test {
     _ = engine;

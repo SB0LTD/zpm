@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const gpu = @import("gpu");
+const raster = @import("raster.sig");
 const kir = gpu.kir;
 const r = kir.r;
 const u = kir.u;
@@ -227,7 +228,14 @@ const Prog = enum(u8) { fill, fill_masked, copy };
 const N_PROGS = @typeInfo(Prog).@"enum".field_names.len;
 /// A program's code as the backend emits it (ir3, sm_120 or KIR's own).
 pub const CODE_BYTES = 16 * 1024;
-const MAX_PARAMS = 12;
+/// A dispatch's parameter words and bindings at most (a draw's vertex
+/// kernel has the most).
+const MAX_PARAMS = 160;
+const MAX_BIND = 3 + raster.MAX_ATTRS;
+/// KIR instructions a kernel built here may have (a pipeline's).
+pub const MAX_KIR = 8192;
+/// Bytes of a pipeline kernel's code as the backend emits it.
+pub const PIPE_CODE = 256 * 1024;
 
 /// fill: rows y0.. (memory rows, one group row each), pixels x0..x0+w:
 ///   params 0 x0, 1 y0, 2 w, 3 stride (words), 4 value, and for
@@ -292,6 +300,10 @@ fn setOf(img: *const Image) u32 {
     return if (img.no_alpha and img.format.isColor()) 0xff00_0000 else 0;
 }
 
+fn divUp(a: u32, b: u32) u32 {
+    return (a + b - 1) / b;
+}
+
 fn swapRB(v: u32) u32 {
     return (v & 0xff00_ff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16);
 }
@@ -323,12 +335,16 @@ pub const Config = struct {
     /// The GPU; none: everything on the CPU.
     dev: ?gpu.Device = null,
     compiler: Compiler = compileAny,
-    /// Scratch for compiling the kernels, at init only (the backend's
-    /// WORK_BYTES: kir_ir3's, kir_sm120's; little for the interpreter).
+    /// Scratch for compiling kernels: the engine's at init, pipelines'
+    /// when they load (the backend's WORK_BYTES: kir_ir3's, kir_sm120's;
+    /// little for the interpreter). Kept.
     work: []u8 = &.{},
     /// CPU memory for images when the GPU gives none (it is lost, or there
     /// is none).
     pool: []u8 = &.{},
+    /// Scratch for KIR's interpreter, which draws on the CPU (no GPU, or
+    /// it is lost); none: such draws are refused.
+    cpu_work: []u8 = &.{},
 };
 
 pub const Stats = struct {
@@ -346,14 +362,29 @@ pub const Engine = struct {
     lost: bool = false,
     /// Why the engine is on the CPU, when it is.
     why: ?anyerror = null,
+    /// Why the last pipeline did not load, or the last CPU draw failed (and
+    /// where the interpreter stopped).
+    why_pipe: ?anyerror = null,
+    trap: gpu.interp.Trap = .{},
     pool: Pool = .{},
     progs: [N_PROGS]gpu.Program = undefined,
     code: [N_PROGS][CODE_BYTES]u8 align(16) = undefined,
     ops: [MAX_OPS]gpu.Dispatch = undefined,
-    op_bufs: [MAX_OPS][2]gpu.Buffer = undefined,
+    op_bufs: [MAX_OPS][MAX_BIND]gpu.Buffer = undefined,
     op_params: [MAX_OPS][MAX_PARAMS]u32 = undefined,
-    /// the CPU form of each op (for a batch the GPU could not run)
-    op_cpu: [MAX_OPS]CpuOp = undefined,
+    /// the CPU form of each op (for a batch the GPU could not run); a
+    /// draw's has none: lost with the GPU (GL reports the reset)
+    op_cpu: [MAX_OPS]?CpuOp = undefined,
+    compiler: Compiler = compileAny,
+    work: []u8 = &.{},
+    cpu_work: []u8 = &.{},
+    /// a pipeline's kernel as it is built, and its code as compiled
+    kir_insts: [MAX_KIR]kir.Inst = undefined,
+    kir_tys: [MAX_KIR]kir.Ty = undefined,
+    pcode: [PIPE_CODE]u8 align(16) = undefined,
+    /// zeros, bound where a draw has no buffer (no element array, a
+    /// constant attribute, no depth); made at the first draw
+    zero: Image = .{},
     n_ops: usize = 0,
     /// The open batch: ops recorded and not run yet belong to it.
     batch: u64 = 1,
@@ -377,7 +408,7 @@ pub const Engine = struct {
     /// The engine in place (it must stay at `e`): the kernels compiled and
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
-        e.* = .{ .pool = Pool.init(cfg.pool) };
+        e.* = .{ .pool = Pool.init(cfg.pool), .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work };
         const d = cfg.dev orelse return;
         e.loadAll(d, cfg.compiler, cfg.work) catch |err| {
             e.why = err;
@@ -410,6 +441,7 @@ pub const Engine = struct {
     /// free first).
     pub fn deinit(e: *Engine) void {
         e.finish();
+        e.freeImage(&e.zero);
         e.reap(true);
         if (e.dev) |d| {
             if (!e.lost) for (&e.progs) |*p| d.unload(p);
@@ -503,7 +535,9 @@ pub const Engine = struct {
         const f = d.run(e.ops[0..n]) catch |err| {
             e.loseGpu(err);
             // (the batch again, on the CPU: nothing it did is lost)
-            for (e.op_cpu[0..n]) |op| e.cpuDo(op);
+            for (e.op_cpu[0..n]) |op| {
+                if (op) |o| e.cpuDo(o);
+            }
             return;
         };
         e.fences[e.batch % RING] = f;
@@ -599,18 +633,168 @@ pub const Engine = struct {
     }
 
     fn record(e: *Engine, prog: Prog, groups: [3]u32, bufs: []const *Image, params: []const u32, cpu: CpuOp) void {
+        e.recordProg(&e.progs[@intFromEnum(prog)], groups, bufs, @as(u32, 1) << @intCast(bufs.len - 1), params, cpu);
+    }
+
+    /// A dispatch of `prog` in the open batch; `writes`: the bindings it
+    /// writes (bit i, binding i).
+    fn recordProg(e: *Engine, prog: *const gpu.Program, groups: [3]u32, bufs: []const *Image, writes: u32, params: []const u32, cpu: ?CpuOp) void {
         e.room();
         const i = e.n_ops;
         for (bufs, 0..) |img, j| {
             e.op_bufs[i][j] = img.buf;
             img.trk().last = e.batch;
+            if (writes & (@as(u32, 1) << @intCast(j)) != 0) img.trk().gpu_wrote = true;
         }
-        bufs[bufs.len - 1].trk().gpu_wrote = true;
         @memcpy(e.op_params[i][0..params.len], params);
-        e.ops[i] = .{ .prog = &e.progs[@intFromEnum(prog)], .groups = groups, .buffers = e.op_bufs[i][0..bufs.len], .params = e.op_params[i][0..params.len] };
+        e.ops[i] = .{ .prog = prog, .groups = groups, .buffers = e.op_bufs[i][0..bufs.len], .params = e.op_params[i][0..params.len] };
         e.op_cpu[i] = cpu;
         e.n_ops += 1;
         e.stats.dispatches += 1;
+    }
+
+    // ── Draws ──────────────────────────────────────────────────────────────
+
+    const Stage = enum(u2) { vertex, setup, raster };
+
+    fn build(e: *Engine, st: Stage, p: *const raster.Pipeline) kir.Kernel {
+        const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
+        return switch (st) {
+            .vertex => raster.vertexKernel(s, p),
+            .setup => raster.setupKernel(s, p),
+            .raster => raster.rasterKernel(s, p),
+        };
+    }
+
+    /// A pipeline's kernels compiled and loaded on the GPU (nothing to do
+    /// on the CPU, which builds them for each draw). False when one does
+    /// not compile or load.
+    pub fn loadPipeline(e: *Engine, p: *raster.Pipeline) bool {
+        if (!e.onGpu() or p.owner == @as(?*anyopaque, e)) return true;
+        const d = e.dev.?;
+        for (0..3) |n| {
+            var k = e.build(@enumFromInt(n), p);
+            k.finish() catch |err| return e.pipeFailed(p, n, err);
+            var w = gpu.Work.init(e.work);
+            const bin = e.compiler(&k, d.caps, &w, &e.pcode) catch |err| return e.pipeFailed(p, n, err);
+            p.progs[n] = d.load(&bin) catch |err| return e.pipeFailed(p, n, err);
+        }
+        p.owner = e;
+        return true;
+    }
+
+    fn pipeFailed(e: *Engine, p: *raster.Pipeline, n: usize, err: anyerror) bool {
+        e.why_pipe = err;
+        for (p.progs[0..n]) |*q| {
+            if (q.*) |*prog| e.dev.?.unload(prog);
+            q.* = null;
+        }
+        return false;
+    }
+
+    pub fn unloadPipeline(e: *Engine, p: *raster.Pipeline) void {
+        if (p.owner != @as(?*anyopaque, e)) return;
+        e.finish();
+        for (&p.progs) |*q| {
+            if (q.*) |*prog| {
+                if (!e.lost) e.dev.?.unload(prog);
+            }
+            q.* = null;
+        }
+        p.owner = null;
+    }
+
+    /// A draw: its vertices, triangles and pixels, on the GPU (three
+    /// dispatches in the open batch) or the CPU (KIR's interpreter, the
+    /// same kernels). False when there is no memory for it, or no way to
+    /// run it.
+    pub fn draw(e: *Engine, d: *const raster.Draw) bool {
+        const ntri = d.triangles();
+        if (ntri == 0 or d.instances == 0 or d.rect.empty()) return true;
+        // (made at the first draw: an engine that never draws has none)
+        if (e.zero.buf.cpu.len == 0) e.zero = e.newBuffer(256) orelse return false;
+        const p = d.pipe;
+        var verts = e.newBuffer(@as(usize, d.instances) * d.count * p.vstride * 4) orelse return false;
+        defer e.freeImage(&verts);
+        var tris = e.newBuffer(@as(usize, d.instances) * ntri * p.sstride * 4) orelse return false;
+        defer e.freeImage(&tris);
+        var uni = e.newBuffer(@max(d.uniforms.len * 4, 16)) orelse return false;
+        defer e.freeImage(&uni);
+        e.writeBytes(&uni, 0, std.mem.sliceAsBytes(d.uniforms));
+        var vp: [MAX_PARAMS]u32 = undefined;
+        var sp: [MAX_PARAMS]u32 = undefined;
+        var rp: [MAX_PARAMS]u32 = undefined;
+        const vparams = raster.vertexParams(d, &vp);
+        const sparams = raster.setupParams(d, &sp);
+        const rparams = raster.rasterParams(d, &rp);
+        // the bindings: vertex (records, uniforms, element array,
+        // attributes), setup (triangles, vertices), raster (color, depth,
+        // triangles, uniforms)
+        var vb: [MAX_BIND]*Image = undefined;
+        vb[0] = &verts;
+        vb[1] = &uni;
+        vb[2] = d.index orelse &e.zero;
+        for (d.attrs, 0..) |a, j| vb[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
+        const depth = d.depth orelse &e.zero;
+        const sb = [_]*Image{ &tris, &verts };
+        const rb = [_]*Image{ d.color, depth, &tris, &uni };
+        const groups_v = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
+        const groups_s = [3]u32{ divUp(ntri, raster.SETUP_GROUP), d.instances, 1 };
+        const groups_r = [3]u32{ divUp(d.rect.width(), raster.TILE), divUp(d.rect.height(), raster.TILE), 1 };
+        var all_gpu = e.onGpu() and e.loadPipeline(@constCast(p)) and p.owner == @as(?*anyopaque, e);
+        for (vb) |img| all_gpu = all_gpu and e.gpuUsable(img);
+        for (rb) |img| all_gpu = all_gpu and e.gpuUsable(img);
+        if (all_gpu) {
+            const rw: u32 = if (d.depth != null and d.depth_test and d.depth_write) 0b11 else 0b01;
+            e.recordProg(&p.progs[0].?, groups_v, &vb, 1, vparams, null);
+            e.recordProg(&p.progs[1].?, groups_s, &sb, 1, sparams, null);
+            e.recordProg(&p.progs[2].?, groups_r, &rb, rw, rparams, null);
+            return true;
+        }
+        // on the CPU: every image settled (and fetched, if the GPU wrote it)
+        if (e.cpu_work.len == 0) return false;
+        for (vb) |img| e.fetchAll(img);
+        for (rb) |img| e.fetchAll(img);
+        e.stats.cpu_ops += 1;
+        var views: [MAX_BIND][]u8 = undefined;
+        for (vb, 0..) |img, j| views[j] = img.buf.cpu;
+        if (!e.runCpu(.vertex, p, groups_v, views[0..vb.len], vparams)) return false;
+        const sv = [_][]u8{ tris.buf.cpu, verts.buf.cpu };
+        if (!e.runCpu(.setup, p, groups_s, &sv, sparams)) return false;
+        const rv = [_][]u8{ d.color.buf.cpu, depth.buf.cpu, tris.buf.cpu, uni.buf.cpu };
+        if (!e.runCpu(.raster, p, groups_r, &rv, rparams)) return false;
+        for (rb[0..2]) |img| e.wrote(img, 0, img.buf.cpu.len);
+        return true;
+    }
+
+    /// img for the CPU: no batch in flight uses it, the GPU's writes fetched.
+    fn fetchAll(e: *Engine, img: *Image) void {
+        _ = e.hostView(img, 0, img.buf.cpu.len);
+    }
+
+    fn runCpu(e: *Engine, st: Stage, p: *const raster.Pipeline, groups: [3]u32, views: []const []u8, params: []const u32) bool {
+        var k = e.build(st, p);
+        k.finish() catch |err| {
+            e.why_pipe = err;
+            return false;
+        };
+        var w = gpu.Work.init(e.cpu_work);
+        var trap: gpu.interp.Trap = .{};
+        var stats: gpu.interp.Stats = .{};
+        gpu.interp.run(.{
+            .code = k.code(),
+            .regs = k.nv,
+            .group = k.group,
+            .shared_bytes = k.shared_bytes,
+            .groups = groups,
+            .bindings = views,
+            .params = params,
+        }, gpu.interp_caps, &w, &trap, &stats) catch |err| {
+            e.why_pipe = err;
+            e.trap = trap;
+            return false;
+        };
+        return true;
     }
 
     // ── Ops ────────────────────────────────────────────────────────────────

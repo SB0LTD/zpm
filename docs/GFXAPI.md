@@ -11,6 +11,7 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 | `gfxapi.sig` | The module root (`gfxapi` in zpm's build). |
 | `engine.sig` | Images in GPU memory, filled and copied by KIR kernels through any `gpu.Device`. It batches work, waits only where needed, keeps the caches in step, and falls back to the CPU. |
 | `gles.sig` | OpenGL ES 3.0's objects and state: what the C entry points call. |
+| `raster.sig` | Drawing: GL's draws as three KIR kernels (vertices, triangle setup, tiles), the same on every GPU and on the CPU. |
 | `glenum.sig` | GL's enum values. |
 | `egl.sig` | EGL 1.5 for OpenGL ES: displays, configs, contexts with share groups, window and pbuffer surfaces, swaps, fence syncs, errors per thread. |
 | `wayland.sig` | EGL's Wayland platform: a window's frames handed to the compositor as dma-bufs (`zwp_linux_dmabuf_v1`), through the app's own `libwayland-client`. |
@@ -35,7 +36,30 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 
 ### GLES
 
-Textures, buffers and renderbuffers live in an `Objects` table held by a share group's contexts. Framebuffer objects belong to each context. Every table is fixed, in memory the caller owns.
+Textures, buffers and renderbuffers live in an `Objects` table held by a share group's contexts. Framebuffer objects and vertex array objects belong to each context. Every table is fixed, in memory the caller owns.
+
+### Draws
+
+A draw is three KIR kernels, recorded as three dispatches in the engine's open batch:
+
+1. **Vertices**, a thread per vertex of each instance.
+   - Attributes are fetched in any of GL's integer and float formats, normalized or not, or taken from `glVertexAttrib*` where an array is off, or per instance (divisor 1).
+   - Every fetch, and the element array's, stays inside its buffer, so a bad offset can't fault the GPU.
+   - The shader's vertex code runs, then clip space goes to window space: the position snapped to 1/16 pixel, depth through the depth range, 1/w, and the varyings multiplied by 1/w (or kept, for flat ones).
+2. **Setup**, a thread per triangle.
+   - It takes a topology's vertices (lists, strips, fans; the last vertex provokes).
+   - It computes the signed area exactly in 64 bits, culls, and turns the triangle counter-clockwise.
+   - It records the triangle's pixel box, three integer edge equations with a tie rule, and plane equations for depth, 1/w and the varyings.
+3. **Tiles**, a group per 8×8 pixels.
+   - The tile's pixels and depth are loaded once, then every triangle is drawn in GL's order.
+   - A tile outside a triangle's box, or wholly outside one edge, skips it. Otherwise each edge's constant for the tile is computed in 64 bits, then each pixel's coverage in 32.
+   - Then come the depth test, perspective-correct varyings, the shader's fragment code, and blending (every GL factor and equation, `SRC_ALPHA_SATURATE` too), with color masks and scissor. The pixels and depth are stored once.
+
+Coverage is integer arithmetic, and every float operation is one KIR defines bit for bit, so a frame is the same bytes on the Adreno, the RTX and the CPU. A pixel on an edge two triangles share is drawn exactly once.
+
+On the CPU (no GPU, or it is lost), KIR's interpreter runs the same three kernels on the images' memory.
+
+Shaders are KIR emitters (`raster.Shaders`). The GLSL compiler of the next stage makes them; for now the driver's own pipelines are set with `usePipeline`.
 
 Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
@@ -67,13 +91,13 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
 ### The C ABI
 
-The library is `libgalaxy-gl.so`, with 58 `egl*` and 78 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
+The library is `libgalaxy-gl.so`, with 58 `egl*` and 114 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
 
 Each context is current per thread. The current context is kept in a fixed table keyed by the thread pointer (`TPIDR_EL0` on AArch64, `%fs:0` on x86-64), so the library needs no thread-local storage and no C library.
 
 The library's panic handler prints one line and exits, as a failed assertion in a C driver does. It needs neither TLS nor a stack walk. EGL's tables, and the render node's, are filled at first use, so they take no room in the file.
 
-As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 657 KB on aarch64 and 685 KB on x86_64.
+As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 979 KB on aarch64 and 1011 KB on x86_64 (the CPU fallback carries KIR's interpreter and the draw kernels' builders).
 
 ## What is done
 
@@ -92,10 +116,23 @@ As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library
 
 **Stage 4a, EGL** ([SB0LTD/zpm#126](https://github.com/SB0LTD/zpm/pull/126)): EGL 1.5, the Wayland platform, surfaceless and pbuffers, fence syncs.
 
-**Stage 4b:** EGLImages from dma-bufs, GL's `OES_EGL_image`, native fences (with Galaxy's `G_FENCE_FD`, SB0LTD/galaxy#74), and `zwp_linux_dmabuf_v1` version 4's feedback.
+**Stage 4b** ([SB0LTD/zpm#129](https://github.com/SB0LTD/zpm/pull/129)): EGLImages from dma-bufs, GL's `OES_EGL_image`, native fences (with Galaxy's `G_FENCE_FD`, SB0LTD/galaxy#74), and `zwp_linux_dmabuf_v1` version 4's feedback.
+
+**Stage 5a, draws:**
+- the pipeline above;
+- vertex array objects, attribute pointers (integer ones too), generic attributes, divisors;
+- `glDrawArrays`, `glDrawElements` (8, 16 and 32-bit indices), `glDrawArraysInstanced`, `glDrawElementsInstanced`, `glDrawRangeElements`;
+- blend functions, equations and color; the depth function and range; cull face and front face.
+
+That makes 114 GL entry points.
 
 **Not yet:**
-- draws, shaders and GLSL, vertex arrays, samplers, queries, GL sync objects;
+- shaders and GLSL (programs, uniforms by name), samplers and texture sampling, queries, GL sync objects;
+- points and lines;
+- clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped;
+- stencil tests, several color attachments, depth-only drawing;
+- half-float and packed attribute formats, divisors past 1, attribute arrays in client memory;
+- binning triangles to tiles, which every tile now visits in turn;
 - texture levels above 0;
 - other texture targets and formats;
 - multisampling;
@@ -113,6 +150,13 @@ sig build test-gfxapi
 - `test-gfxapi-module`: the engine and the pool on the CPU; float-to-unorm conversion (rounding to nearest even, as Mesa does); the render-node client against `node.Fake`, Galaxy's calls over the emulated Adreno, covering buffers, cache upkeep, import, export, a hang and a missing GPU.
 - `test-gfxapi-libgles`: GL through its C entry points, and `getProcAddress`.
 - `test-gfxapi-lib`: EGL and GL through their C entry points: a surfaceless display, a pbuffer, a clear read back, a fence, errors, `eglGetProcAddress`.
+- `test-gfxapi-draw`: one GL scene of triangles drawn three ways (the CPU, `EmuDevice`, the emulated Adreno through Galaxy's calls with the kernels compiled to ir3), each giving the same bytes. It covers:
+  - the fill rule: a square's two triangles added, the diagonal through pixel centers, every pixel exactly once;
+  - a strip's interpolated colors, the depth test, culling by winding;
+  - indexed instanced quads with a per-instance attribute;
+  - scissor with a color mask, flat shading, and a fan on the window's top-down buffer.
+
+  With the tie rule broken, the check fails.
 - `test-gfxapi-egl`: EGL on a fake Wayland compositor that answers as Galaxy's bridge does, with the engine on `EmuDevice`. It checks:
   - the display's queue and binding;
   - each frame's dma-buf (fd, stride, modifier), `create_immed`'s size and format, and attach, damage, frame, commit and flush;
@@ -141,7 +185,11 @@ sig build test-gfxapi
 | 3 | Done: the engine, the render-node client, the GLES core and the C ABI | zpm |
 | 4a | Done: EGL 1.5, the Wayland platform, surfaceless and pbuffers, fence syncs, one `libgalaxy-gl.so` | zpm |
 | 4b | Done: EGLImages and `EGL_EXT_image_dma_buf_import`, GL's `OES_EGL_image`; `EGL_ANDROID_native_fence_sync`; `zwp_linux_dmabuf_v1` v4 feedback | zpm + Galaxy |
-| 5 | The rest of GLES 3.0 that WebRender uses: a GLSL ES 3.00 compiler to KIR, and a tiled compute rasterizer (triangles binned into tiles, fragments in KIR, blending and depth in the tile). Firefox's WebRender on the GPU | zpm |
+| 5a | Done: draws. Vertex arrays, the three draw kernels (vertices, setup, tiles), exact coverage, depth, blending, culling, instancing; the same bytes on every GPU and the CPU | zpm |
+| 5b | The GLSL ES 3.00 front end: the preprocessor, parser, types and built-ins; shader and program objects, linking, uniforms and attributes by name | zpm |
+| 5c | GLSL to KIR: the vertex and fragment emitters draws take | zpm |
+| 5d | Texture sampling (filters, wraps, the formats WebRender uses: R8, RG8, RGBA16F, RGBA32F, ...), samplers; triangles binned to tiles | zpm |
+| 5e | What WebRender asks beyond that, until Firefox's WebRender draws on the GPU | zpm |
 | 6 | Chromium through ANGLE on GLES | zpm |
 | 7 | `libgbm.so.1` | zpm |
 | 8 | Packaging: the libraries in Galaxy's root under Mesa's names; `mesa-*` provided by Galaxy; a Flatpak GL extension | Galaxy |

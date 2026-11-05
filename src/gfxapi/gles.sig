@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const engine = @import("engine.sig");
+const raster = @import("raster.sig");
 const g = @import("glenum.sig");
 const Engine = engine.Engine;
 const Image = engine.Image;
@@ -43,6 +44,8 @@ pub const MAX_FRAMEBUFFERS = 512;
 pub const MAX_SIZE = 8192;
 pub const MAX_UNITS = 32;
 pub const MAX_COLOR = 4;
+pub const MAX_VAOS = 256;
+pub const MAX_ATTRS = raster.MAX_ATTRS;
 
 pub const VENDOR_STRING: [:0]const u8 = "Galaxy";
 pub const VERSION_STRING: [:0]const u8 = "OpenGL ES 3.0 Galaxy 0.1";
@@ -187,9 +190,30 @@ fn spanOf(first: usize, row: usize, w: u32, h: u32) usize {
     return first + (@as(usize, h) - 1) * row + @as(usize, w) * 4;
 }
 
+/// A vertex attribute's array (glVertexAttribPointer).
+pub const VAttr = struct {
+    enabled: bool = false,
+    size: u8 = 4,
+    ty: u32 = g.FLOAT,
+    normalized: bool = false,
+    integer: bool = false,
+    stride: u32 = 0,
+    /// the pointer: an offset into `buffer`
+    offset: usize = 0,
+    buffer: u32 = 0,
+    divisor: u32 = 0,
+};
+
+pub const Vao = struct {
+    named: bool = false,
+    made: bool = false,
+    attrs: [MAX_ATTRS]VAttr = [_]VAttr{.{}} ** MAX_ATTRS,
+    /// ELEMENT_ARRAY_BUFFER's binding (a vertex array's in ES 3.0)
+    element: u32 = 0,
+};
+
 const BufBinds = struct {
     array: u32 = 0,
-    element: u32 = 0,
     pack: u32 = 0,
     unpack: u32 = 0,
     uniform: u32 = 0,
@@ -378,6 +402,27 @@ pub const Context = struct {
     unpack: Store = .{},
     hint_mipmap: u32 = g.DONT_CARE,
     hint_derivative: u32 = g.DONT_CARE,
+    vaos: [MAX_VAOS]Vao = undefined,
+    vao0: Vao = .{ .named = true, .made = true },
+    vao: u32 = 0,
+    /// glVertexAttrib*'s values (where an array is off), and whether each is an integer one
+    generic: [MAX_ATTRS][4]u32 = [_][4]u32{.{ 0, 0, 0, 0x3f80_0000 }} ** MAX_ATTRS,
+    generic_int: [MAX_ATTRS]bool = [_]bool{false} ** MAX_ATTRS,
+    blend_src_rgb: u32 = g.ONE,
+    blend_dst_rgb: u32 = g.ZERO,
+    blend_src_a: u32 = g.ONE,
+    blend_dst_a: u32 = g.ZERO,
+    blend_eq_rgb: u32 = g.FUNC_ADD,
+    blend_eq_a: u32 = g.FUNC_ADD,
+    blend_color: [4]f32 = .{ 0, 0, 0, 0 },
+    depth_func: u32 = g.LESS,
+    depth_range: [2]f32 = .{ 0, 1 },
+    cull_mode: u32 = g.BACK,
+    front_face: u32 = g.CCW,
+    /// what draws run: a pipeline and its uniforms (the next stage's GLSL
+    /// programs make them; for now the driver's own)
+    pipeline: ?*raster.Pipeline = null,
+    uniforms: []const u32 = &.{},
     /// EGL's check of the default framebuffer (a window resized: a back
     /// buffer of its new size), before an operation reaches it
     revalidate: ?Revalidate = null,
@@ -393,6 +438,7 @@ pub const Context = struct {
     pub fn init(c: *Context, eng: *Engine, objs: *Objects) void {
         c.* = .{ .eng = eng, .objs = objs };
         for (&c.fbos) |*f| f.* = .{};
+        for (&c.vaos) |*v| v.* = .{};
         objs.users += 1;
     }
 
@@ -627,7 +673,20 @@ pub const Context = struct {
             g.REQUIRED_TEXTURE_IMAGE_UNITS_OES => int(1),
             g.ACTIVE_TEXTURE => int(g.TEXTURE0 + c.unit),
             g.ARRAY_BUFFER_BINDING => int(c.bufs.array),
-            g.ELEMENT_ARRAY_BUFFER_BINDING => int(c.bufs.element),
+            g.ELEMENT_ARRAY_BUFFER_BINDING => int(c.curVao().element),
+            g.VERTEX_ARRAY_BINDING => int(c.vao),
+            g.MAX_VERTEX_ATTRIBS => int(MAX_ATTRS),
+            g.BLEND_SRC_RGB => int(c.blend_src_rgb),
+            g.BLEND_DST_RGB => int(c.blend_dst_rgb),
+            g.BLEND_SRC_ALPHA => int(c.blend_src_a),
+            g.BLEND_DST_ALPHA => int(c.blend_dst_a),
+            g.BLEND_EQUATION_RGB => int(c.blend_eq_rgb),
+            g.BLEND_EQUATION_ALPHA => int(c.blend_eq_a),
+            g.BLEND_COLOR => .{ .kind = .float, .n = 4, .f = c.blend_color, .normalized = true },
+            g.DEPTH_FUNC => int(c.depth_func),
+            g.DEPTH_RANGE => .{ .kind = .float, .n = 2, .f = .{ c.depth_range[0], c.depth_range[1], 0, 0 }, .normalized = true },
+            g.CULL_FACE_MODE => int(c.cull_mode),
+            g.FRONT_FACE => int(c.front_face),
             g.PIXEL_PACK_BUFFER_BINDING => int(c.bufs.pack),
             g.PIXEL_UNPACK_BUFFER_BINDING => int(c.bufs.unpack),
             g.UNIFORM_BUFFER_BINDING => int(c.bufs.uniform),
@@ -1276,7 +1335,7 @@ pub const Context = struct {
     fn bindingOf(c: *Context, target: u32) ?*u32 {
         return switch (target) {
             g.ARRAY_BUFFER => &c.bufs.array,
-            g.ELEMENT_ARRAY_BUFFER => &c.bufs.element,
+            g.ELEMENT_ARRAY_BUFFER => &c.curVao().element,
             g.PIXEL_PACK_BUFFER => &c.bufs.pack,
             g.PIXEL_UNPACK_BUFFER => &c.bufs.unpack,
             g.UNIFORM_BUFFER => &c.bufs.uniform,
@@ -1352,6 +1411,12 @@ pub const Context = struct {
             };
             inline for (@typeInfo(BufBinds).@"struct".field_names) |f| {
                 if (@field(c.bufs, f) == name) @field(c.bufs, f) = 0;
+            }
+            // (and from the bound vertex array, as GL says)
+            const va = c.curVao();
+            if (va.element == name) va.element = 0;
+            for (&va.attrs) |*a| {
+                if (a.buffer == name) a.buffer = 0;
             }
             c.eng.freeImage(&b.store);
             b.* = .{};
@@ -1622,6 +1687,255 @@ pub const Context = struct {
         }
     }
 
+    // ── Vertex arrays ──────────────────────────────────────────────────────
+
+    fn curVao(c: *Context) *Vao {
+        return if (c.vao == 0) &c.vao0 else &c.vaos[c.vao - 1];
+    }
+
+    pub fn genVertexArrays(c: *Context, out: []u32) void {
+        if (!genIn(Vao, &c.vaos, out)) c.fail(g.OUT_OF_MEMORY);
+    }
+
+    pub fn isVertexArray(c: *Context, name: u32) bool {
+        return madeIn(Vao, &c.vaos, name) != null;
+    }
+
+    /// (ES 3.0: only names glGenVertexArrays gave)
+    pub fn bindVertexArray(c: *Context, name: u32) void {
+        if (name != 0) {
+            const v = slotIn(Vao, &c.vaos, name) orelse return c.fail(g.INVALID_OPERATION);
+            if (!v.named) return c.fail(g.INVALID_OPERATION);
+            v.made = true;
+        }
+        c.vao = name;
+    }
+
+    pub fn deleteVertexArrays(c: *Context, names: []const u32) void {
+        for (names) |name| {
+            const v = slotIn(Vao, &c.vaos, name) orelse continue;
+            if (!v.named) continue;
+            if (c.vao == name) c.vao = 0;
+            v.* = .{};
+        }
+    }
+
+    fn attrIndex(c: *Context, index: u32) ?*VAttr {
+        if (index >= MAX_ATTRS) {
+            c.fail(g.INVALID_VALUE);
+            return null;
+        }
+        return &c.curVao().attrs[index];
+    }
+
+    /// glVertexAttribPointer (integer: glVertexAttribIPointer).
+    pub fn vertexAttribPointer(c: *Context, index: u32, size: i32, ty: u32, normalized: bool, stride: i32, pointer: usize, integer: bool) void {
+        const a = c.attrIndex(index) orelse return;
+        if (size < 1 or size > 4 or stride < 0 or stride > 2048) return c.fail(g.INVALID_VALUE);
+        if (!knownAttrType(ty)) return c.fail(g.INVALID_ENUM);
+        if (integer and (ty == g.FLOAT or ty == g.HALF_FLOAT or ty == g.FIXED or ty == 0x8D9F or ty == 0x8368)) return c.fail(g.INVALID_ENUM);
+        // (a pointer into client memory: only without a vertex array object)
+        if (c.bufs.array == 0 and pointer != 0 and c.vao != 0) return c.fail(g.INVALID_OPERATION);
+        a.* = .{ .enabled = a.enabled, .divisor = a.divisor, .size = @intCast(size), .ty = ty, .normalized = normalized, .integer = integer, .stride = @intCast(stride), .offset = pointer, .buffer = c.bufs.array };
+    }
+
+    pub fn enableVertexAttribArray(c: *Context, index: u32, on: bool) void {
+        const a = c.attrIndex(index) orelse return;
+        a.enabled = on;
+    }
+
+    pub fn vertexAttribDivisor(c: *Context, index: u32, divisor: u32) void {
+        const a = c.attrIndex(index) orelse return;
+        a.divisor = divisor;
+    }
+
+    /// glVertexAttrib*: the value an attribute has where its array is off.
+    pub fn vertexAttrib(c: *Context, index: u32, v: [4]u32, integer: bool) void {
+        if (index >= MAX_ATTRS) return c.fail(g.INVALID_VALUE);
+        c.generic[index] = v;
+        c.generic_int[index] = integer;
+    }
+
+    pub fn getVertexAttrib(c: *Context, index: u32, pname: u32) ?i32 {
+        const a = c.attrIndex(index) orelse return null;
+        return switch (pname) {
+            g.VERTEX_ATTRIB_ARRAY_ENABLED => @intFromBool(a.enabled),
+            g.VERTEX_ATTRIB_ARRAY_SIZE => a.size,
+            g.VERTEX_ATTRIB_ARRAY_STRIDE => @intCast(a.stride),
+            g.VERTEX_ATTRIB_ARRAY_TYPE => @bitCast(a.ty),
+            g.VERTEX_ATTRIB_ARRAY_NORMALIZED => @intFromBool(a.normalized),
+            g.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING => @intCast(a.buffer),
+            g.VERTEX_ATTRIB_ARRAY_INTEGER => @intFromBool(a.integer),
+            g.VERTEX_ATTRIB_ARRAY_DIVISOR => @intCast(a.divisor),
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+    }
+
+    // ── Draw state ─────────────────────────────────────────────────────────
+
+    pub fn blendFunc(c: *Context, src_rgb: u32, dst_rgb: u32, src_a: u32, dst_a: u32) void {
+        if (!validFactor(src_rgb) or !validFactor(dst_rgb) or !validFactor(src_a) or !validFactor(dst_a)) return c.fail(g.INVALID_ENUM);
+        c.blend_src_rgb = src_rgb;
+        c.blend_dst_rgb = dst_rgb;
+        c.blend_src_a = src_a;
+        c.blend_dst_a = dst_a;
+    }
+
+    pub fn blendEquation(c: *Context, rgb: u32, a: u32) void {
+        if (equationOf(rgb) == null or equationOf(a) == null) return c.fail(g.INVALID_ENUM);
+        c.blend_eq_rgb = rgb;
+        c.blend_eq_a = a;
+    }
+
+    pub fn blendColor(c: *Context, r: f32, gr: f32, b: f32, a: f32) void {
+        c.blend_color = .{ clamp01(r), clamp01(gr), clamp01(b), clamp01(a) };
+    }
+
+    pub fn depthFunc(c: *Context, func: u32) void {
+        if (func < g.NEVER or func > g.ALWAYS) return c.fail(g.INVALID_ENUM);
+        c.depth_func = func;
+    }
+
+    pub fn depthRange(c: *Context, n: f32, f_: f32) void {
+        c.depth_range = .{ clamp01(n), clamp01(f_) };
+    }
+
+    pub fn cullFace(c: *Context, mode: u32) void {
+        if (mode != g.FRONT and mode != g.BACK and mode != g.FRONT_AND_BACK) return c.fail(g.INVALID_ENUM);
+        c.cull_mode = mode;
+    }
+
+    pub fn frontFace(c: *Context, mode: u32) void {
+        if (mode != g.CW and mode != g.CCW) return c.fail(g.INVALID_ENUM);
+        c.front_face = mode;
+    }
+
+    /// What draws run (the driver's own pipelines until GLSL programs).
+    pub fn usePipeline(c: *Context, p: ?*raster.Pipeline, uniforms: []const u32) void {
+        c.pipeline = p;
+        c.uniforms = uniforms;
+    }
+
+    // ── Draws ──────────────────────────────────────────────────────────────
+
+    pub fn drawArrays(c: *Context, mode: u32, first: i32, count: i32, instances: i32) void {
+        if (first < 0) return c.fail(g.INVALID_VALUE);
+        c.drawCall(mode, @intCast(first), count, 0, 0, instances);
+    }
+
+    pub fn drawElements(c: *Context, mode: u32, count: i32, ty: u32, offset: usize, instances: i32) void {
+        if (ty != g.UNSIGNED_BYTE and ty != g.UNSIGNED_SHORT and ty != g.UNSIGNED_INT) return c.fail(g.INVALID_ENUM);
+        c.drawCall(mode, 0, count, ty, offset, instances);
+    }
+
+    fn drawCall(c: *Context, mode: u32, first: u32, count: i32, index_ty: u32, offset: usize, instances: i32) void {
+        const topology: raster.Topology = switch (mode) {
+            g.TRIANGLES => .triangles,
+            g.TRIANGLE_STRIP => .strip,
+            g.TRIANGLE_FAN => .fan,
+            // (points and lines: not drawn yet)
+            g.POINTS, g.LINES, g.LINE_LOOP, g.LINE_STRIP => return,
+            else => return c.fail(g.INVALID_ENUM),
+        };
+        if (count < 0 or instances < 0) return c.fail(g.INVALID_VALUE);
+        var v = c.drawView() orelse return;
+        if (c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0) return;
+        const pipe = c.pipeline orelse return;
+        const color = v.color[0] orelse return;
+        if (count == 0 or instances == 0) return;
+        var d = raster.Draw{ .pipe = pipe, .color = color, .topology = topology, .first = first, .count = @intCast(count), .instances = @intCast(instances), .uniforms = c.uniforms };
+        // the attributes: arrays from buffers, else the generic values
+        const va = c.curVao();
+        for (0..pipe.shaders.attrs) |j| {
+            const a = va.attrs[j];
+            if (!a.enabled) {
+                d.attrs[j] = .{ .constant = c.generic[j], .integer = c.generic_int[j] };
+                continue;
+            }
+            // (arrays in client memory, divisors past 1, half floats and
+            // packed types: not drawn yet)
+            const b = madeIn(Buf, &c.objs.bufs, a.buffer) orelse return c.fail(g.INVALID_OPERATION);
+            if (!b.store.live() and b.store.buf.cpu.len == 0) return c.fail(g.INVALID_OPERATION);
+            const t = attrType(a.ty) orelse return c.fail(g.INVALID_OPERATION);
+            if (a.divisor > 1) return c.fail(g.INVALID_OPERATION);
+            d.attrs[j] = .{
+                .buf = &b.store,
+                .offset = @intCast(a.offset),
+                .stride = if (a.stride != 0) a.stride else @as(u32, a.size) * t.size,
+                .comps = a.size,
+                .size = t.size,
+                .float = t.float,
+                .signed = t.signed,
+                .normalized = a.normalized,
+                .integer = a.integer,
+                .divisor = a.divisor,
+            };
+        }
+        if (index_ty != 0) {
+            const b = madeIn(Buf, &c.objs.bufs, va.element) orelse return c.fail(g.INVALID_OPERATION);
+            if (b.store.buf.cpu.len == 0) return c.fail(g.INVALID_OPERATION);
+            d.index = &b.store;
+            d.index_offset = @intCast(offset);
+            d.index_size = switch (index_ty) {
+                g.UNSIGNED_BYTE => 1,
+                g.UNSIGNED_SHORT => 2,
+                else => 4,
+            };
+        }
+        // viewport and depth range
+        const vp = c.viewport;
+        const hw = @as(f32, @floatFromInt(vp[2])) / 2;
+        const hh = @as(f32, @floatFromInt(vp[3])) / 2;
+        d.half = .{ hw, hh };
+        d.center = .{ @as(f32, @floatFromInt(vp[0])) + hw, @as(f32, @floatFromInt(vp[1])) + hh };
+        const n = c.depth_range[0];
+        const f_ = c.depth_range[1];
+        d.depth_scale = (f_ - n) / 2;
+        d.depth_bias = (f_ + n) / 2;
+        d.zmin = @min(n, f_);
+        d.zmax = @max(n, f_);
+        // the pixels: the viewport, the framebuffer, the scissor
+        const cap = struct {
+            fn f(x: i64) u32 {
+                return @intCast(std.math.clamp(x, 0, MAX_SIZE));
+            }
+        }.f;
+        var rect = v.bounds().meet(.{ .x0 = cap(vp[0]), .y0 = cap(vp[1]), .x1 = cap(@as(i64, vp[0]) + vp[2]), .y1 = cap(@as(i64, vp[1]) + vp[3]) });
+        if (c.enabled & bitOf(g.SCISSOR_TEST) != 0) rect = rect.meet(c.clearRect(&v));
+        d.rect = rect;
+        if (c.enabled & bitOf(g.CULL_FACE) != 0) d.cull = switch (c.cull_mode) {
+            g.FRONT => 1,
+            g.BACK => 2,
+            else => 3,
+        };
+        d.front_ccw = c.front_face == g.CCW;
+        if (c.enabled & bitOf(g.DEPTH_TEST) != 0) {
+            if (v.depth) |dp| {
+                d.depth = dp;
+                d.depth_test = true;
+                d.depth_func = @intCast(c.depth_func - g.NEVER);
+                d.depth_write = c.depth_mask;
+            }
+        }
+        if (c.enabled & bitOf(g.BLEND) != 0) {
+            const bc = c.blend_color;
+            d.blend = .{
+                .src_rgb = factorOf(c.blend_src_rgb, bc) orelse .{},
+                .dst_rgb = factorOf(c.blend_dst_rgb, bc).?,
+                .src_a = factorOf(c.blend_src_a, bc) orelse .{ .c = .{ 1, 1, 1, 1 } },
+                .dst_a = factorOf(c.blend_dst_a, bc).?,
+                .saturate = c.blend_src_rgb == g.SRC_ALPHA_SATURATE,
+                .eq_rgb = equationOf(c.blend_eq_rgb).?,
+                .eq_a = equationOf(c.blend_eq_a).?,
+            };
+        }
+        d.keep = colorKeep(color.format, c.color_mask);
+        if (!c.eng.draw(&d)) c.fail(g.OUT_OF_MEMORY);
+    }
+
     pub fn getFramebufferAttachmentParameter(c: *Context, target: u32, attachment: u32, pname: u32) ?i32 {
         const fb = c.fbTarget(target) orelse return null;
         if (fb == 0) {
@@ -1658,6 +1972,66 @@ pub const Context = struct {
 /// buffer).
 fn addr(p: ?*const anyopaque) usize {
     return if (p) |x| @intFromPtr(x) else 0;
+}
+
+// ── Vertex arrays and draws ────────────────────────────────────────────────
+
+/// A blend factor as raster's linear form (c + ks*s + kd*d + ksa*s.a +
+/// kda*d.a), for RGB or alpha; null: not a factor (or SRC_ALPHA_SATURATE,
+/// which the caller handles).
+fn factorOf(e: u32, constant: [4]f32) ?raster.Factor {
+    const ca = constant[3];
+    return switch (e) {
+        g.ZERO => .{},
+        g.ONE => .{ .c = .{ 1, 1, 1, 1 } },
+        g.SRC_COLOR => .{ .ks = 1 },
+        g.ONE_MINUS_SRC_COLOR => .{ .c = .{ 1, 1, 1, 1 }, .ks = -1 },
+        g.DST_COLOR => .{ .kd = 1 },
+        g.ONE_MINUS_DST_COLOR => .{ .c = .{ 1, 1, 1, 1 }, .kd = -1 },
+        g.SRC_ALPHA => .{ .ksa = 1 },
+        g.ONE_MINUS_SRC_ALPHA => .{ .c = .{ 1, 1, 1, 1 }, .ksa = -1 },
+        g.DST_ALPHA => .{ .kda = 1 },
+        g.ONE_MINUS_DST_ALPHA => .{ .c = .{ 1, 1, 1, 1 }, .kda = -1 },
+        g.CONSTANT_COLOR => .{ .c = constant },
+        g.ONE_MINUS_CONSTANT_COLOR => .{ .c = .{ 1 - constant[0], 1 - constant[1], 1 - constant[2], 1 - constant[3] } },
+        g.CONSTANT_ALPHA => .{ .c = .{ ca, ca, ca, ca } },
+        g.ONE_MINUS_CONSTANT_ALPHA => .{ .c = .{ 1 - ca, 1 - ca, 1 - ca, 1 - ca } },
+        else => null,
+    };
+}
+
+fn validFactor(e: u32) bool {
+    return e == g.SRC_ALPHA_SATURATE or factorOf(e, .{ 0, 0, 0, 0 }) != null;
+}
+
+fn equationOf(e: u32) ?raster.Equation {
+    return switch (e) {
+        g.FUNC_ADD => .add,
+        g.FUNC_SUBTRACT => .subtract,
+        g.FUNC_REVERSE_SUBTRACT => .reverse_subtract,
+        g.MIN => .min,
+        g.MAX => .max,
+        else => null,
+    };
+}
+
+/// An attribute type's bytes a component, and whether it is signed or a
+/// float; null: not one draws take yet (HALF_FLOAT, FIXED, the packed ones).
+fn attrType(ty: u32) ?struct { size: u8, signed: bool, float: bool } {
+    return switch (ty) {
+        g.BYTE => .{ .size = 1, .signed = true, .float = false },
+        g.UNSIGNED_BYTE => .{ .size = 1, .signed = false, .float = false },
+        g.SHORT => .{ .size = 2, .signed = true, .float = false },
+        g.UNSIGNED_SHORT => .{ .size = 2, .signed = false, .float = false },
+        g.INT => .{ .size = 4, .signed = true, .float = false },
+        g.UNSIGNED_INT => .{ .size = 4, .signed = false, .float = false },
+        g.FLOAT => .{ .size = 4, .signed = true, .float = true },
+        else => null,
+    };
+}
+
+fn knownAttrType(ty: u32) bool {
+    return attrType(ty) != null or ty == g.HALF_FLOAT or ty == g.FIXED or ty == 0x8D9F or ty == 0x8368;
 }
 
 fn clamp01(x: f32) f32 {
