@@ -1276,6 +1276,39 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
         importEntry("lfm3_any_audio", "src/core/lfm3_any_audio.sig"),
     });
+    // LFM3-Audio's speech codec on any GPU (up to its polar spectrum): its
+    // KIR kernels and the codec over a gpu.Device against lfm3_audio_gen.
+    const lfm3_kir_codec = try ctx.addModule("lfm3_kir_codec", "src/core/lfm3_kir_codec.sig");
+    try wire(ctx, lfm3_kir_codec, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, lfm3_kir_codec, "lfm3_kir", "src/core/lfm3_kir.sig");
+    const lfm3_any_codec = try ctx.addModule("lfm3_any_codec", "src/core/lfm3_any_codec.sig");
+    try wire(ctx, lfm3_any_codec, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_any_codec, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, lfm3_any_codec, "lfm3_audio_gen", "src/core/lfm3_audio_gen.sig");
+    try wire(ctx, lfm3_any_codec, "lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
+    try wire(ctx, lfm3_any_codec, "lfm3_kir", "src/core/lfm3_kir.sig");
+    try wire(ctx, lfm3_any_codec, "lfm3_kir_codec", "src/core/lfm3_kir_codec.sig");
+    try wire(ctx, lfm3_any_codec, "lfm3_any", "src/core/lfm3_any.sig");
+    const test_lfm3_codec = try ctx.addStep("test-lfm3-codec", "Execute LFM3-Audio's codec kernels and its any-GPU codec against the CPU", &noopStep);
+    try ctx.addDependency(test_all, test_lfm3_codec);
+    _ = try addTest(ctx, test_lfm3_codec, "test-lfm3-codec-run", "tests/test_lfm3_codec.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("lfm3_kir", "src/core/lfm3_kir.sig"),
+        importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+        importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
+        importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
+        importEntry("lfm3_kir_codec", "src/core/lfm3_kir_codec.sig"),
+        importEntry("lfm3_any_codec", "src/core/lfm3_any_codec.sig"),
+    });
 
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");
     try wire(ctx, tts_gpu, "tts_model_container", "src/tts/model_container.sig");
