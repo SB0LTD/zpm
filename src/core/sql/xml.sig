@@ -17,7 +17,11 @@ pub const max_depth: usize = 256;
 pub const Declaration = struct {
     /// Bytes of the declaration (0 when there is none).
     len: usize = 0,
-    version: []const u8 = "1.0",
+    /// The version value's offset and length in the text (length 0: none,
+    /// which means "1.0"). Offsets keep the struct free of slices, which the
+    /// native SB0 backend cannot lower as a comptime default.
+    version_start: usize = 0,
+    version_len: usize = 0,
     version_default: bool = true,
     standalone: ?bool = null,
 };
@@ -294,7 +298,8 @@ pub fn declaration(text: []const u8) ?Declaration {
             if (seen_version or value.len == 0) return null;
             seen_version = true;
             out.version_default = types.same(value, "1.0");
-            out.version = value;
+            out.version_start = start;
+            out.version_len = value.len;
         } else if (types.same(key, "encoding")) {
             if (!seen_version or value.len == 0) return null;
         } else if (types.same(key, "standalone")) {
@@ -358,7 +363,8 @@ pub fn output(text: []const u8, buffer: []u8) []const u8 {
     var skip = decl.len;
     if (decl.len != 0 and (!decl.version_default or decl.standalone != null)) {
         const standalone: []const u8 = if (decl.standalone) |yes| (if (yes) " standalone=\"yes\"" else " standalone=\"no\"") else "";
-        for ([_][]const u8{ "<?xml version=\"", decl.version, "\"", standalone, "?>" }) |part| {
+        const version: []const u8 = if (decl.version_len == 0) "1.0" else text[decl.version_start..][0..decl.version_len];
+        for ([_][]const u8{ "<?xml version=\"", version, "\"", standalone, "?>" }) |part| {
             @memcpy(buffer[at..][0..part.len], part);
             at += part.len;
         }
