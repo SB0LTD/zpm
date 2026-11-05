@@ -1,0 +1,99 @@
+{
+  "baseline_commit": "d91020c",
+  "lane_start_commit": "12abe24",
+  "lane_start_counts": {
+    "core_smoke_pass": 39,
+    "incomplete": 79
+  },
+  "baseline_counts": {
+    "core_smoke_pass": 45,
+    "incomplete": 73
+  },
+  "scope": "B11 wave-2 schema objects finite candidate; smoke passes only, no full SQL/DDL/native parity claim",
+  "exit_code": 1,
+  "terminal_error": "SqlConformanceIncomplete",
+  "core_smoke_pass": 58,
+  "incomplete": 60,
+  "programs": {
+    "PG.INDEX.SECONDARY": "core_smoke_pass",
+    "PG.DML.UPSERT_UNIQUE": "core_smoke_pass",
+    "PG.CONSTRAINT.FK": "core_smoke_pass",
+    "PG.CONSTRAINT.DEFERRED": "core_smoke_pass",
+    "PG.VIEW.ORDINARY": "core_smoke_pass",
+    "PG.DDL.CREATE_VARIANTS": "core_smoke_pass",
+    "PG.DML.MERGE": "core_smoke_pass",
+    "PG.INDEX.ADVANCED": "core_smoke_pass",
+    "PG.VIEW.MATERIALIZED": "core_smoke_pass",
+    "PG.DDL.VIRTUAL": "core_smoke_pass",
+    "PG.CONSTRAINT.EXCLUSION": "core_smoke_pass",
+    "PG.DDL.INHERITANCE": "core_smoke_pass",
+    "PG.DDL.PARTITION": "core_smoke_pass"
+  },
+  "output_sha256_lf": "3271bbbdfb231c7981f67efbfbf163a212295d4548651e121fa8b3a71d5e92eb",
+  "inputs_sha256_lf": {
+    "build.sig": "bd449e6b20b86aa64741886aab22ba1c33d799a170750d408853fd07888403cc",
+    "src/core/sql.sig": "b9972e4fa0153808c164bdff848e50239121d402ccd1ad5282a3f17b362b9f08",
+    "src/core/sql/ast.sig": "928978e65c36f4671972de2fc039cdd29d32742b8ba64b4a9f2cd8269f98e126",
+    "src/core/sql/parser.sig": "0417c8cfac0addfc4119d7959b33c3f6987a7ff9f6073ed8118da5c3798c24cc",
+    "src/core/sql/binder.sig": "6cda7c863264510fdd2944fb6cd7748bf73cf318f81af83b81efb2f0fee53416",
+    "src/core/sql/catalog.sig": "04268294e5f32acab6d4d1e68abdf382dd4a4e616e6a0b1f374c647efa96646b",
+    "src/core/sql/storage.sig": "bd324c47bc17da29f3c9a2b9f3070beafa30f40702ed26631c95bf8a568f147f",
+    "src/core/sql/change_log.sig": "c8348e35042f949b909accf0cf1bce25364545194bbdd6d04ca690c0810b02b4",
+    "src/core/sql/mvcc.sig": "20c8baca0f7e3c5625f274dffc7f0327b9335cd951158b3c441f48693bee9556",
+    "src/core/sql/types.sig": "1709a5b9153bcbad9087d047d56838cc89177bbc47d33c58632a9cfc609054cc",
+    "src/db/postgres.sig": "ec748976a6aa9724ac5788200685dd5593a1eb957c04d264e0390b0b8b62bd6f",
+    "src/db/store.sig": "1ce663d9c084402b60017a4b5ef008e6db40ce75780c0639735f69f6366c1ca6",
+    "tests/test_sql_schema_objects.sig": "9a74d2ed6ccedcd0e1ba4d3957e4e1ee535bc576609a3bbfdc0956d4ee9c8fa3",
+    "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
+    "tests/sql_conformance/postgres18_oracle.json": "dcf2ef99e025d694cffc06c3e07f3b164d20e58f5103becef279335afb246120",
+    "tests/sql_conformance/generate_contracts.py": "0952c368240d51046b899717ff1ca45476758ede29c160a6ab80bc62771c7cf5"
+  },
+  "release_safe_contracts": {
+    "contract-sql-schema-objects": {
+      "exit": 0,
+      "assertions": 1084
+    },
+    "contract-sql-ddl-core": {
+      "exit": 0,
+      "assertions": 1038
+    },
+    "contract-sql": {
+      "exit": 0,
+      "assertions": 8415
+    },
+    "contract-sql-dml": {
+      "exit": 0,
+      "assertions": 229
+    },
+    "contract-sql-catalog": {
+      "exit": 0,
+      "assertions": 36
+    },
+    "contract-sql-change-log": {
+      "exit": 0,
+      "assertions": 940
+    },
+    "contract-sql-mvcc": {
+      "exit": 0,
+      "assertions": 351
+    },
+    "contract-sql-index": {
+      "exit": 0,
+      "assertions": 239627
+    },
+    "contract-db_store": {
+      "exit": 0,
+      "assertions": 3154
+    },
+    "contract-durable_log": {
+      "exit": 0,
+      "assertions": 4834
+    },
+    "contract-sql-types-advanced": {
+      "exit": 0,
+      "assertions": 590
+    }
+  },
+  "change_log": "no new op; definition format version 3 on ops 1 and 12 (written only when needed)",
+  "pending_native_verification": "every tests/test_sql_schema_objects.sig expectation outside the thirteen oracle programs"
+}

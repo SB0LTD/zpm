@@ -72,29 +72,29 @@ component is missing. The annotations below separate those cases.
 | PG.QUERY.LIMIT_EXPR | Expression LIMIT/OFFSET | Syntax |
 | PG.DDL.SCHEMA | Schema lifecycle | pass (B11 candidate); schema-qualified tables, closure incomplete |
 | PG.DDL.ALTER | ALTER TABLE | pass (B11 candidate); column/default/NOT NULL/constraint actions, closure incomplete |
-| PG.DDL.CREATE_VARIANTS | Temporary/CTAS/LIKE | Syntax |
-| PG.DDL.INHERITANCE | Table inheritance | Syntax |
-| PG.DDL.PARTITION | Partition lifecycle | Syntax |
+| PG.DDL.CREATE_VARIANTS | Temporary/CTAS/LIKE | pass (B11 candidate); TEMP tables are ordinary durable tables, closure incomplete |
+| PG.DDL.INHERITANCE | Table inheritance | pass (B11 candidate); parent reads expand, UPDATE/DELETE through a parent 0A000 |
+| PG.DDL.PARTITION | Partition lifecycle | pass (B11 candidate); RANGE/LIST/DEFAULT, INSERT routing, keys on partitioned tables 0A000 |
 | PG.DDL.IF_EXISTS | Conditional DDL | qualified smoke pass; table/sequence clauses, wider DDL/notice parity incomplete |
 | PG.DDL.TRUNCATE | TRUNCATE | pass (B11 candidate); closure incomplete |
 | PG.DDL.DATABASE | Database lifecycle | UnexecutedScopeOrComparator |
 | PG.CONSTRAINT.COMPOSITE | Composite/table-level primary key | pass (B11 candidate); closure incomplete |
 | PG.CONSTRAINT.UNIQUE | UNIQUE/NULL rules | pass (B11 candidate); scan-enforced, closure incomplete |
 | PG.CONSTRAINT.CHECK | CHECK | pass (B11 candidate); closure incomplete |
-| PG.CONSTRAINT.FK | Foreign-key actions | Syntax |
-| PG.CONSTRAINT.DEFERRED | Deferred constraints | Syntax |
-| PG.CONSTRAINT.EXCLUSION | Exclusion constraints | Syntax |
-| PG.INDEX.SECONDARY | Secondary/index catalog | Syntax |
-| PG.INDEX.ADVANCED | Composite/expression/partial/covering index | Syntax |
+| PG.CONSTRAINT.FK | Foreign-key actions | pass (B11 candidate); MATCH SIMPLE, all five actions, closure incomplete |
+| PG.CONSTRAINT.DEFERRED | Deferred constraints | pass (B11 candidate); UNIQUE/FK/EXCLUDE at statement end or COMMIT |
+| PG.CONSTRAINT.EXCLUSION | Exclusion constraints | pass (B11 candidate); `=` and range `&&`, scan-enforced |
+| PG.INDEX.SECONDARY | Secondary/index catalog | pass (B11 candidate); hash entries per version, equality probes only |
+| PG.INDEX.ADVANCED | Composite/expression/partial/covering index | pass (B11 candidate); expression/predicate are definitions, entries hash plain keys |
 | PG.DML.UPDATE_FROM | UPDATE FROM | pass (B11 candidate); RETURNING of source columns open |
 | PG.DML.DELETE_USING | DELETE USING | pass (B11 candidate); closure incomplete |
 | PG.DML.TUPLE_ASSIGN | Tuple assignment | pass (B11 candidate); sub-SELECT source open |
-| PG.DML.MERGE | MERGE | UnsupportedStatement |
-| PG.DML.UPSERT_UNIQUE | Non-PK upsert | Syntax |
+| PG.DML.MERGE | MERGE | pass (B11 candidate); RETURNING and OVERRIDING open |
+| PG.DML.UPSERT_UNIQUE | Non-PK upsert | pass (B11 candidate); constraint/index arbiters, partial-index inference open |
 | PG.SEQUENCE.EXTENDED | Sequence lifecycle/cache/SERIAL | pass (B11 candidate); OWNED BY/RENAME open |
-| PG.DDL.VIRTUAL | Virtual generated columns | Syntax |
-| PG.VIEW.ORDINARY | Views | Syntax |
-| PG.VIEW.MATERIALIZED | Materialized views | Syntax |
+| PG.DDL.VIRTUAL | Virtual generated columns | pass (B11 candidate); computed at write (immutable), catalog 'v' |
+| PG.VIEW.ORDINARY | Views | pass (B11 candidate); bind-time expansion, read-only, OR REPLACE open |
+| PG.VIEW.MATERIALIZED | Materialized views | pass (B11 candidate); REFRESH CONCURRENTLY open |
 | PG.TYPE.CHARACTER | VARCHAR/CHAR | Syntax |
 | PG.TYPE.BINARY | BYTEA | Syntax |
 | PG.TYPE.UUID | UUID | Syntax |
