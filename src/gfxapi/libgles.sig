@@ -16,6 +16,7 @@ const gfxapi = @import("gfxapi");
 const gles = gfxapi.gles;
 const g = gfxapi.glenum;
 const thread = gfxapi.thread;
+const program = gfxapi.program;
 const Context = gles.Context;
 
 /// A failed check in the driver (on Linux): one line on stderr, then the
@@ -533,6 +534,278 @@ pub export fn glFrontFace(mode: u32) callconv(.c) void {
     if (cur()) |c| c.frontFace(mode);
 }
 
+// ── Shaders and programs (program.sig) ─────────────────────────────────────
+
+pub export fn glCreateShader(kind: u32) callconv(.c) u32 {
+    const c = cur() orelse return 0;
+    return program.createShader(c, kind);
+}
+pub export fn glDeleteShader(shader: u32) callconv(.c) void {
+    if (cur()) |c| program.deleteShader(c, shader);
+}
+pub export fn glIsShader(shader: u32) callconv(.c) u8 {
+    const c = cur() orelse return g.FALSE;
+    return @intFromBool(program.isShader(c, shader));
+}
+pub export fn glShaderSource(shader: u32, n: i32, strings: ?[*]const ?[*]const u8, lengths: ?[*]const i32) callconv(.c) void {
+    if (cur()) |c| program.shaderSource(c, shader, n, strings, lengths);
+}
+pub export fn glCompileShader(shader: u32) callconv(.c) void {
+    if (cur()) |c| program.compileShader(c, shader);
+}
+pub export fn glGetShaderiv(shader: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    const c = cur() orelse return;
+    const out = params orelse return;
+    program.getShaderiv(c, shader, pname, &out[0]);
+}
+pub export fn glGetShaderInfoLog(shader: u32, buf_size: i32, length: ?*i32, log: ?[*]u8) callconv(.c) void {
+    if (cur()) |c| program.getShaderInfoLog(c, shader, buf_size, length, log);
+}
+pub export fn glGetShaderSource(shader: u32, buf_size: i32, length: ?*i32, source: ?[*]u8) callconv(.c) void {
+    if (cur()) |c| program.getShaderSource(c, shader, buf_size, length, source);
+}
+pub export fn glGetShaderPrecisionFormat(shader_type: u32, precision_type: u32, range: ?*[2]i32, precision: ?*i32) callconv(.c) void {
+    if (cur()) |c| program.getShaderPrecisionFormat(c, shader_type, precision_type, range, precision);
+}
+pub export fn glReleaseShaderCompiler() callconv(.c) void {}
+pub export fn glShaderBinary(n: i32, shaders: ?[*]const u32, format: u32, binary: ?*const anyopaque, length: i32) callconv(.c) void {
+    _ = .{ n, shaders, format, binary, length };
+    // (no binary formats)
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+pub export fn glCreateProgram() callconv(.c) u32 {
+    const c = cur() orelse return 0;
+    return program.createProgram(c);
+}
+pub export fn glDeleteProgram(prog: u32) callconv(.c) void {
+    if (cur()) |c| program.deleteProgram(c, prog);
+}
+pub export fn glIsProgram(prog: u32) callconv(.c) u8 {
+    const c = cur() orelse return g.FALSE;
+    return @intFromBool(program.isProgram(c, prog));
+}
+pub export fn glAttachShader(prog: u32, shader: u32) callconv(.c) void {
+    if (cur()) |c| program.attachShader(c, prog, shader);
+}
+pub export fn glDetachShader(prog: u32, shader: u32) callconv(.c) void {
+    if (cur()) |c| program.detachShader(c, prog, shader);
+}
+pub export fn glGetAttachedShaders(prog: u32, max_count: i32, n: ?*i32, shaders: ?[*]u32) callconv(.c) void {
+    if (cur()) |c| program.getAttachedShaders(c, prog, max_count, n, shaders);
+}
+pub export fn glLinkProgram(prog: u32) callconv(.c) void {
+    if (cur()) |c| program.linkProgram(c, prog);
+}
+pub export fn glValidateProgram(prog: u32) callconv(.c) void {
+    if (cur()) |c| program.validateProgram(c, prog);
+}
+pub export fn glUseProgram(prog: u32) callconv(.c) void {
+    if (cur()) |c| program.useProgram(c, prog);
+}
+pub export fn glProgramParameteri(prog: u32, pname: u32, value: i32) callconv(.c) void {
+    if (cur()) |c| program.programParameteri(c, prog, pname, value);
+}
+pub export fn glGetProgramiv(prog: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    const c = cur() orelse return;
+    const out = params orelse return;
+    program.getProgramiv(c, prog, pname, &out[0]);
+}
+pub export fn glGetProgramInfoLog(prog: u32, buf_size: i32, length: ?*i32, log: ?[*]u8) callconv(.c) void {
+    if (cur()) |c| program.getProgramInfoLog(c, prog, buf_size, length, log);
+}
+pub export fn glGetProgramBinary(prog: u32, buf_size: i32, length: ?*i32, format: ?*u32, binary: ?*anyopaque) callconv(.c) void {
+    _ = .{ prog, buf_size, format, binary };
+    if (length) |l| l.* = 0;
+    // (no binary formats)
+    if (cur()) |c| c.fail(g.INVALID_OPERATION);
+}
+pub export fn glProgramBinary(prog: u32, format: u32, binary: ?*const anyopaque, length: i32) callconv(.c) void {
+    _ = .{ prog, format, binary, length };
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+pub export fn glBindAttribLocation(prog: u32, index: u32, name: [*:0]const u8) callconv(.c) void {
+    if (cur()) |c| program.bindAttribLocation(c, prog, index, name);
+}
+pub export fn glGetAttribLocation(prog: u32, name: [*:0]const u8) callconv(.c) i32 {
+    const c = cur() orelse return -1;
+    return program.getAttribLocation(c, prog, name);
+}
+pub export fn glGetActiveAttrib(prog: u32, index: u32, buf_size: i32, length: ?*i32, size: ?*i32, kind: ?*u32, name: ?[*]u8) callconv(.c) void {
+    if (cur()) |c| program.getActiveAttrib(c, prog, index, buf_size, length, size, kind, name);
+}
+pub export fn glGetUniformLocation(prog: u32, name: [*:0]const u8) callconv(.c) i32 {
+    const c = cur() orelse return -1;
+    return program.getUniformLocation(c, prog, name);
+}
+pub export fn glGetActiveUniform(prog: u32, index: u32, buf_size: i32, length: ?*i32, size: ?*i32, kind: ?*u32, name: ?[*]u8) callconv(.c) void {
+    if (cur()) |c| program.getActiveUniform(c, prog, index, buf_size, length, size, kind, name);
+}
+pub export fn glGetActiveUniformsiv(prog: u32, n: i32, indices: [*]const u32, pname: u32, params: [*]i32) callconv(.c) void {
+    if (cur()) |c| program.getActiveUniformsiv(c, prog, n, indices, pname, params);
+}
+pub export fn glGetUniformIndices(prog: u32, n: i32, names: [*]const [*:0]const u8, indices: [*]u32) callconv(.c) void {
+    if (cur()) |c| program.getUniformIndices(c, prog, n, names, indices);
+}
+pub export fn glGetFragDataLocation(prog: u32, name: [*:0]const u8) callconv(.c) i32 {
+    const c = cur() orelse return -1;
+    return program.getFragDataLocation(c, prog, name);
+}
+// (uniform blocks: none yet, so no index names one)
+pub export fn glGetUniformBlockIndex(prog: u32, name: [*:0]const u8) callconv(.c) u32 {
+    _ = .{ prog, name };
+    return g.INVALID_INDEX;
+}
+pub export fn glUniformBlockBinding(prog: u32, index: u32, binding: u32) callconv(.c) void {
+    _ = .{ prog, index, binding };
+    if (cur()) |c| c.fail(g.INVALID_VALUE);
+}
+pub export fn glGetActiveUniformBlockiv(prog: u32, index: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    _ = .{ prog, index, pname, params };
+    if (cur()) |c| c.fail(g.INVALID_VALUE);
+}
+pub export fn glGetActiveUniformBlockName(prog: u32, index: u32, buf_size: i32, length: ?*i32, name: ?[*]u8) callconv(.c) void {
+    _ = .{ prog, index, buf_size, length, name };
+    if (cur()) |c| c.fail(g.INVALID_VALUE);
+}
+pub export fn glGetUniformfv(prog: u32, loc: i32, params: [*]f32) callconv(.c) void {
+    if (cur()) |c| program.getUniform(c, prog, loc, .f, @ptrCast(params));
+}
+pub export fn glGetUniformiv(prog: u32, loc: i32, params: [*]i32) callconv(.c) void {
+    if (cur()) |c| program.getUniform(c, prog, loc, .i, @ptrCast(params));
+}
+pub export fn glGetUniformuiv(prog: u32, loc: i32, params: [*]u32) callconv(.c) void {
+    if (cur()) |c| program.getUniform(c, prog, loc, .u, params);
+}
+
+fn uni(loc: i32, n: i32, comps: u32, kind: program.Data, data: ?*const anyopaque) void {
+    const c = cur() orelse return;
+    const d: [*]const u32 = @ptrCast(@alignCast(data orelse {
+        if (n < 0) c.fail(g.INVALID_VALUE);
+        return;
+    }));
+    program.uniform(c, loc, n, comps, kind, d);
+}
+
+fn uniMat(loc: i32, n: i32, transpose: u8, cols: u32, rows: u32, data: ?[*]const f32) void {
+    const c = cur() orelse return;
+    const d = data orelse {
+        if (n < 0) c.fail(g.INVALID_VALUE);
+        return;
+    };
+    program.uniformMatrix(c, loc, n, transpose != 0, cols, rows, @ptrCast(d));
+}
+pub export fn glUniform1f(loc: i32, x: f32) callconv(.c) void {
+    const v = [1]u32{ @bitCast(x) };
+    uni(loc, 1, 1, .f, &v);
+}
+pub export fn glUniform1fv(loc: i32, n: i32, v: ?[*]const f32) callconv(.c) void {
+    uni(loc, n, 1, .f, v);
+}
+pub export fn glUniform1i(loc: i32, x: i32) callconv(.c) void {
+    const v = [1]u32{ @bitCast(x) };
+    uni(loc, 1, 1, .i, &v);
+}
+pub export fn glUniform1iv(loc: i32, n: i32, v: ?[*]const i32) callconv(.c) void {
+    uni(loc, n, 1, .i, v);
+}
+pub export fn glUniform1ui(loc: i32, x: u32) callconv(.c) void {
+    const v = [1]u32{ x };
+    uni(loc, 1, 1, .u, &v);
+}
+pub export fn glUniform1uiv(loc: i32, n: i32, v: ?[*]const u32) callconv(.c) void {
+    uni(loc, n, 1, .u, v);
+}
+pub export fn glUniform2f(loc: i32, x: f32, y: f32) callconv(.c) void {
+    const v = [2]u32{ @bitCast(x), @bitCast(y) };
+    uni(loc, 1, 2, .f, &v);
+}
+pub export fn glUniform2fv(loc: i32, n: i32, v: ?[*]const f32) callconv(.c) void {
+    uni(loc, n, 2, .f, v);
+}
+pub export fn glUniform2i(loc: i32, x: i32, y: i32) callconv(.c) void {
+    const v = [2]u32{ @bitCast(x), @bitCast(y) };
+    uni(loc, 1, 2, .i, &v);
+}
+pub export fn glUniform2iv(loc: i32, n: i32, v: ?[*]const i32) callconv(.c) void {
+    uni(loc, n, 2, .i, v);
+}
+pub export fn glUniform2ui(loc: i32, x: u32, y: u32) callconv(.c) void {
+    const v = [2]u32{ x, y };
+    uni(loc, 1, 2, .u, &v);
+}
+pub export fn glUniform2uiv(loc: i32, n: i32, v: ?[*]const u32) callconv(.c) void {
+    uni(loc, n, 2, .u, v);
+}
+pub export fn glUniform3f(loc: i32, x: f32, y: f32, z: f32) callconv(.c) void {
+    const v = [3]u32{ @bitCast(x), @bitCast(y), @bitCast(z) };
+    uni(loc, 1, 3, .f, &v);
+}
+pub export fn glUniform3fv(loc: i32, n: i32, v: ?[*]const f32) callconv(.c) void {
+    uni(loc, n, 3, .f, v);
+}
+pub export fn glUniform3i(loc: i32, x: i32, y: i32, z: i32) callconv(.c) void {
+    const v = [3]u32{ @bitCast(x), @bitCast(y), @bitCast(z) };
+    uni(loc, 1, 3, .i, &v);
+}
+pub export fn glUniform3iv(loc: i32, n: i32, v: ?[*]const i32) callconv(.c) void {
+    uni(loc, n, 3, .i, v);
+}
+pub export fn glUniform3ui(loc: i32, x: u32, y: u32, z: u32) callconv(.c) void {
+    const v = [3]u32{ x, y, z };
+    uni(loc, 1, 3, .u, &v);
+}
+pub export fn glUniform3uiv(loc: i32, n: i32, v: ?[*]const u32) callconv(.c) void {
+    uni(loc, n, 3, .u, v);
+}
+pub export fn glUniform4f(loc: i32, x: f32, y: f32, z: f32, w: f32) callconv(.c) void {
+    const v = [4]u32{ @bitCast(x), @bitCast(y), @bitCast(z), @bitCast(w) };
+    uni(loc, 1, 4, .f, &v);
+}
+pub export fn glUniform4fv(loc: i32, n: i32, v: ?[*]const f32) callconv(.c) void {
+    uni(loc, n, 4, .f, v);
+}
+pub export fn glUniform4i(loc: i32, x: i32, y: i32, z: i32, w: i32) callconv(.c) void {
+    const v = [4]u32{ @bitCast(x), @bitCast(y), @bitCast(z), @bitCast(w) };
+    uni(loc, 1, 4, .i, &v);
+}
+pub export fn glUniform4iv(loc: i32, n: i32, v: ?[*]const i32) callconv(.c) void {
+    uni(loc, n, 4, .i, v);
+}
+pub export fn glUniform4ui(loc: i32, x: u32, y: u32, z: u32, w: u32) callconv(.c) void {
+    const v = [4]u32{ x, y, z, w };
+    uni(loc, 1, 4, .u, &v);
+}
+pub export fn glUniform4uiv(loc: i32, n: i32, v: ?[*]const u32) callconv(.c) void {
+    uni(loc, n, 4, .u, v);
+}
+pub export fn glUniformMatrix2fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    uniMat(loc, n, transpose, 2, 2, v);
+}
+pub export fn glUniformMatrix3fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    uniMat(loc, n, transpose, 3, 3, v);
+}
+pub export fn glUniformMatrix4fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    uniMat(loc, n, transpose, 4, 4, v);
+}
+pub export fn glUniformMatrix2x3fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    uniMat(loc, n, transpose, 2, 3, v);
+}
+pub export fn glUniformMatrix3x2fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    uniMat(loc, n, transpose, 3, 2, v);
+}
+pub export fn glUniformMatrix2x4fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    uniMat(loc, n, transpose, 2, 4, v);
+}
+pub export fn glUniformMatrix4x2fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    uniMat(loc, n, transpose, 4, 2, v);
+}
+pub export fn glUniformMatrix3x4fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    uniMat(loc, n, transpose, 3, 4, v);
+}
+pub export fn glUniformMatrix4x3fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    uniMat(loc, n, transpose, 4, 3, v);
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 var t_pool: [1 << 20]u8 align(64) = undefined;
@@ -585,7 +858,247 @@ test "libgles: GL through its C entry points, on the CPU" {
 test "libgles: getProcAddress finds every entry point, and nothing else" {
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glClear)), getProcAddress("glClear"));
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glTexStorage2DEXT)), getProcAddress("glTexStorage2DEXT"));
-    try std.testing.expect(getProcAddress("glCompileShader") == null);
+    try std.testing.expect(getProcAddress("glBeginTransformFeedback") == null);
+    try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glUniformMatrix4x3fv)), getProcAddress("glUniformMatrix4x3fv"));
     try std.testing.expect(getProcAddress("getProcAddress") == null);
     try std.testing.expect(entries.len > 70);
+}
+
+fn shaderOk(s: u32) !void {
+    var ok: i32 = 0;
+    glGetShaderiv(s, g.COMPILE_STATUS, @ptrCast(&ok));
+    if (ok != 1) {
+        var buf: [1024]u8 = undefined;
+        var len: i32 = 0;
+        glGetShaderInfoLog(s, buf.len, &len, &buf);
+        std.debug.print("{s}\n", .{buf[0..@intCast(len)]});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn linkOk(p: u32) !void {
+    var ok: i32 = 0;
+    glGetProgramiv(p, g.LINK_STATUS, @ptrCast(&ok));
+    if (ok != 1) {
+        var buf: [1024]u8 = undefined;
+        var len: i32 = 0;
+        glGetProgramInfoLog(p, buf.len, &len, &buf);
+        std.debug.print("{s}\n", .{buf[0..@intCast(len)]});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn newShader(kind: u32, src: [:0]const u8) u32 {
+    const s = glCreateShader(kind);
+    const parts = [_]?[*]const u8{src.ptr};
+    glShaderSource(s, 1, &parts, null);
+    glCompileShader(s);
+    return s;
+}
+
+test "libgles: shaders, programs and uniforms through the C entry points" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    const E = std.testing.expectEqual;
+    const vs_src =
+        \\#version 300 es
+        \\in vec2 aPos;
+        \\in vec4 aColor;
+        \\in float aUnused;
+        \\uniform mat4 uTransform;
+        \\uniform vec4 uTint[3];
+        \\out vec4 vColor;
+        \\flat out int vLayer;
+        \\void main() {
+        \\    vColor = aColor * uTint[2];
+        \\    vLayer = 1;
+        \\    gl_Position = uTransform * vec4(aPos, 0.0, 1.0);
+        \\}
+    ;
+    const vs = glCreateShader(g.VERTEX_SHADER);
+    const vparts = [_]?[*]const u8{vs_src.ptr};
+    const vlens = [_]i32{@intCast(vs_src.len)};
+    glShaderSource(vs, 1, &vparts, &vlens);
+    glCompileShader(vs);
+    try shaderOk(vs);
+    var n: i32 = 0;
+    glGetShaderiv(vs, g.SHADER_SOURCE_LENGTH, @ptrCast(&n));
+    try E(@as(i32, @intCast(vs_src.len + 1)), n);
+    // the fragment shader in two parts, each NUL-terminated
+    const fparts = [_]?[*]const u8{ "#version 300 es\nprecision mediump float;\n",
+        \\uniform sampler2D sColor;
+        \\uniform bool uOn;
+        \\in vec4 vColor;
+        \\flat in int vLayer;
+        \\layout(location = 0) out vec4 oColor;
+        \\void main() { oColor = uOn ? texture(sColor, vec2(0.5)) * vColor : vColor * float(vLayer); }
+    };
+    const fs = glCreateShader(g.FRAGMENT_SHADER);
+    glShaderSource(fs, 2, &fparts, null);
+    glCompileShader(fs);
+    try shaderOk(fs);
+    const prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glAttachShader(prog, vs);
+    try E(g.INVALID_OPERATION, glGetError());
+    glBindAttribLocation(prog, 5, "aColor");
+    glLinkProgram(prog);
+    try linkOk(prog);
+    try E(g.NO_ERROR, glGetError());
+    glGetProgramiv(prog, g.ACTIVE_ATTRIBUTES, @ptrCast(&n));
+    try E(@as(i32, 2), n);
+    try E(@as(i32, 0), glGetAttribLocation(prog, "aPos"));
+    try E(@as(i32, 5), glGetAttribLocation(prog, "aColor"));
+    try E(@as(i32, -1), glGetAttribLocation(prog, "aUnused"));
+    glGetProgramiv(prog, g.ACTIVE_UNIFORMS, @ptrCast(&n));
+    try E(@as(i32, 4), n);
+    const l_transform = glGetUniformLocation(prog, "uTransform");
+    const l_tint = glGetUniformLocation(prog, "uTint");
+    const l_tint2 = glGetUniformLocation(prog, "uTint[2]");
+    const l_color = glGetUniformLocation(prog, "sColor");
+    const l_on = glGetUniformLocation(prog, "uOn");
+    try E(@as(i32, 0), l_transform);
+    try E(@as(i32, 1), l_tint);
+    try E(l_tint + 2, l_tint2);
+    try E(@as(i32, -1), glGetUniformLocation(prog, "uTint[3]"));
+    try E(@as(i32, -1), glGetUniformLocation(prog, "uTint[02]"));
+    try std.testing.expect(l_color >= 0 and l_on >= 0);
+    var name: [32]u8 = undefined;
+    var len: i32 = 0;
+    var size: i32 = 0;
+    var kind: u32 = 0;
+    glGetActiveUniform(prog, 1, name.len, &len, &size, &kind, &name);
+    try std.testing.expectEqualStrings("uTint[0]", name[0..@intCast(len)]);
+    try E(@as(i32, 3), size);
+    try E(@as(u32, 0x8B52), kind); // GL_FLOAT_VEC4
+    glGetActiveAttrib(prog, 1, name.len, &len, &size, &kind, &name);
+    try std.testing.expectEqualStrings("aColor", name[0..@intCast(len)]);
+    try E(@as(i32, 0), glGetFragDataLocation(prog, "oColor"));
+    // values
+    glUniform4f(l_tint, 1, 1, 1, 1);
+    try E(g.INVALID_OPERATION, glGetError()); // (no program in use)
+    glUseProgram(prog);
+    glGetIntegerv(g.CURRENT_PROGRAM, @ptrCast(&n));
+    try E(@as(i32, @intCast(prog)), n);
+    glUniform4f(l_tint2, 1, 2, 3, 4);
+    const two = [_]f32{ 5, 6, 7, 8, 9, 10, 11, 12 };
+    glUniform4fv(l_tint, 2, &two);
+    var f: [16]f32 = undefined;
+    glGetUniformfv(prog, l_tint2, &f);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, f[0..4]);
+    glGetUniformfv(prog, l_tint + 1, &f);
+    try std.testing.expectEqualSlices(f32, &.{ 9, 10, 11, 12 }, f[0..4]);
+    glUniform1i(l_color, 3);
+    var iv: [4]i32 = undefined;
+    glGetUniformiv(prog, l_color, &iv);
+    try E(@as(i32, 3), iv[0]);
+    glUniform1f(l_color, 1.0);
+    try E(g.INVALID_OPERATION, glGetError());
+    glUniform1i(l_color, 99);
+    try E(g.INVALID_VALUE, glGetError());
+    glUniform3f(l_tint, 1, 2, 3);
+    try E(g.INVALID_OPERATION, glGetError());
+    glUniform1i(-1, 0);
+    try E(g.NO_ERROR, glGetError());
+    glUniform1i(l_on, 7);
+    glGetUniformfv(prog, l_on, &f);
+    try E(@as(f32, 1), f[0]);
+    // a matrix, given row by row
+    var m: [16]f32 = undefined;
+    for (&m, 0..) |*x, k| x.* = @floatFromInt(k);
+    glUniformMatrix4fv(l_transform, 1, g.TRUE, &m);
+    glGetUniformfv(prog, l_transform, &f);
+    try E(@as(f32, 4), f[1]); // column 0, row 1: the source's row 1, column 0
+    try E(@as(f32, 1), f[4]);
+    glUniformMatrix3fv(l_transform, 1, g.FALSE, &m);
+    try E(g.INVALID_OPERATION, glGetError());
+    // what goes wrong: a compile's log, a link's
+    const bad = newShader(g.VERTEX_SHADER, "#version 300 es\nvoid main() { gl_Position = 1.0; }");
+    glGetShaderiv(bad, g.COMPILE_STATUS, @ptrCast(&n));
+    try E(@as(i32, 0), n);
+    glGetShaderInfoLog(bad, name.len, &len, &name);
+    try std.testing.expect(std.mem.startsWith(u8, name[0..@intCast(len)], "0:2: error: "));
+    try E(@as(i32, 31), len); // (cut to the buffer, its NUL)
+    const fs2 = newShader(g.FRAGMENT_SHADER, "#version 300 es\nprecision mediump float;\nin vec3 vNormal;\nout vec4 o;\nvoid main() { o = vec4(vNormal, 1.0); }");
+    try shaderOk(fs2);
+    const prog2 = glCreateProgram();
+    glAttachShader(prog2, vs);
+    glAttachShader(prog2, fs2);
+    glLinkProgram(prog2);
+    glGetProgramiv(prog2, g.LINK_STATUS, @ptrCast(&n));
+    try E(@as(i32, 0), n);
+    var log: [256]u8 = undefined;
+    glGetProgramInfoLog(prog2, log.len, &len, &log);
+    try std.testing.expect(std.mem.indexOf(u8, log[0..@intCast(len)], "`vNormal` is not an output of the vertex shader") != null);
+    glUseProgram(prog2);
+    try E(g.INVALID_OPERATION, glGetError());
+    // deleting: a shader stays while attached, a program while in use
+    glDeleteShader(vs);
+    try E(g.TRUE, glIsShader(vs));
+    glGetShaderiv(vs, g.DELETE_STATUS, @ptrCast(&n));
+    try E(@as(i32, 1), n);
+    glDeleteProgram(prog2);
+    try E(g.TRUE, glIsShader(vs)); // (still prog's)
+    glDetachShader(prog, vs);
+    try E(g.FALSE, glIsShader(vs));
+    glDeleteProgram(prog);
+    try E(g.TRUE, glIsProgram(prog));
+    glUseProgram(0);
+    try E(g.FALSE, glIsProgram(prog));
+    try E(g.FALSE, glIsProgram(fs));
+    glUseProgram(fs);
+    try E(g.INVALID_OPERATION, glGetError());
+    glUseProgram(12345);
+    try E(g.INVALID_VALUE, glGetError());
+    glDeleteShader(fs);
+    glDeleteShader(fs2);
+    glDeleteShader(bad);
+}
+
+test "libgles: a GLSL ES 1.00 program, as WebGL 1 writes them" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    const vs = newShader(g.VERTEX_SHADER,
+        \\attribute vec3 position;
+        \\attribute vec2 uv;
+        \\uniform mat4 mvp;
+        \\varying vec2 vUv;
+        \\void main() { vUv = uv; gl_Position = mvp * vec4(position, 1.0); }
+    );
+    const fs = newShader(g.FRAGMENT_SHADER,
+        \\#ifdef GL_FRAGMENT_PRECISION_HIGH
+        \\precision highp float;
+        \\#else
+        \\precision mediump float;
+        \\#endif
+        \\uniform sampler2D tex;
+        \\varying vec2 vUv;
+        \\void main() { gl_FragColor = texture2D(tex, vUv); }
+    );
+    try shaderOk(vs);
+    try shaderOk(fs);
+    const p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glLinkProgram(p);
+    try linkOk(p);
+    try std.testing.expectEqual(@as(i32, 0), glGetAttribLocation(p, "position"));
+    try std.testing.expectEqual(@as(i32, 1), glGetAttribLocation(p, "uv"));
+    var range: [2]i32 = undefined;
+    var precision: i32 = 0;
+    glGetShaderPrecisionFormat(g.FRAGMENT_SHADER, g.HIGH_FLOAT, &range, &precision);
+    try std.testing.expectEqual(@as(i32, 23), precision);
+    glDeleteProgram(p);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
 }

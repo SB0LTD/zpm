@@ -30,6 +30,7 @@
 const std = @import("std");
 const engine = @import("engine.sig");
 const raster = @import("raster.sig");
+const program = @import("program.sig");
 const g = @import("glenum.sig");
 const Engine = engine.Engine;
 const Image = engine.Image;
@@ -126,6 +127,7 @@ pub const Objects = struct {
 
     /// Every object's memory goes back (the last context left).
     fn release(o: *Objects, eng: *Engine) void {
+        program.dropOwner(o);
         for (&o.tex) |*t| eng.freeImage(&t.img);
         for (&o.bufs) |*b| eng.freeImage(&b.store);
         for (&o.rbs) |*b| eng.freeImage(&b.img);
@@ -423,6 +425,8 @@ pub const Context = struct {
     /// programs make them; for now the driver's own)
     pipeline: ?*raster.Pipeline = null,
     uniforms: []const u32 = &.{},
+    /// glUseProgram's (program.sig): while one is in use, draws are its
+    program: u32 = 0,
     /// EGL's check of the default framebuffer (a window resized: a back
     /// buffer of its new size), before an operation reaches it
     revalidate: ?Revalidate = null,
@@ -445,6 +449,7 @@ pub const Context = struct {
     /// Its framebuffers go; the share group's objects go with its last
     /// context.
     pub fn deinit(c: *Context) void {
+        program.leave(c);
         for (&c.fbos) |*f| {
             if (f.made) c.detachAll(f);
         }
@@ -470,7 +475,7 @@ pub const Context = struct {
         }
     }
 
-    fn fail(c: *Context, e: u32) void {
+    pub fn fail(c: *Context, e: u32) void {
         if (c.err == g.NO_ERROR) c.err = e;
     }
 
@@ -676,6 +681,19 @@ pub const Context = struct {
             g.ELEMENT_ARRAY_BUFFER_BINDING => int(c.curVao().element),
             g.VERTEX_ARRAY_BINDING => int(c.vao),
             g.MAX_VERTEX_ATTRIBS => int(MAX_ATTRS),
+            g.CURRENT_PROGRAM => int(c.program),
+            g.SHADER_COMPILER => boolean(true),
+            g.NUM_SHADER_BINARY_FORMATS, g.NUM_PROGRAM_BINARY_FORMATS => int(0),
+            g.MAX_VERTEX_UNIFORM_VECTORS => int(program.MAX_VERTEX_UNIFORM_VECTORS),
+            g.MAX_FRAGMENT_UNIFORM_VECTORS => int(program.MAX_FRAGMENT_UNIFORM_VECTORS),
+            g.MAX_VERTEX_UNIFORM_COMPONENTS => int(program.MAX_VERTEX_UNIFORM_VECTORS * 4),
+            g.MAX_FRAGMENT_UNIFORM_COMPONENTS => int(program.MAX_FRAGMENT_UNIFORM_VECTORS * 4),
+            g.MAX_VARYING_VECTORS => int(program.MAX_VARYING_VECTORS),
+            g.MAX_VARYING_COMPONENTS, g.MAX_FRAGMENT_INPUT_COMPONENTS => int(program.MAX_VARYING_VECTORS * 4),
+            g.MAX_VERTEX_OUTPUT_COMPONENTS => int(16 * 4),
+            g.MAX_VERTEX_TEXTURE_IMAGE_UNITS => int(16),
+            g.MIN_PROGRAM_TEXEL_OFFSET => int(-8),
+            g.MAX_PROGRAM_TEXEL_OFFSET => int(7),
             g.BLEND_SRC_RGB => int(c.blend_src_rgb),
             g.BLEND_DST_RGB => int(c.blend_dst_rgb),
             g.BLEND_SRC_ALPHA => int(c.blend_src_a),
@@ -1843,6 +1861,8 @@ pub const Context = struct {
         if (count < 0 or instances < 0) return c.fail(g.INVALID_VALUE);
         var v = c.drawView() orelse return;
         if (c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0) return;
+        // (a GLSL program's draws: the next stage's code; none drawn yet)
+        if (c.program != 0) return;
         const pipe = c.pipeline orelse return;
         const color = v.color[0] orelse return;
         if (count == 0 or instances == 0) return;

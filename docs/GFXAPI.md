@@ -13,6 +13,8 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 | `gles.sig` | OpenGL ES 3.0's objects and state: what the C entry points call. |
 | `raster.sig` | Drawing: GL's draws as three KIR kernels (vertices, triangle setup, tiles), the same on every GPU and on the CPU. |
 | `glenum.sig` | GL's enum values. |
+| `program.sig` | GL's shader and program objects: sources, compiles and their logs, links, attribute and uniform locations, uniform values. |
+| `glsl/` | The GLSL ES compiler's front end: `lex.sig` (tokens, keywords by version), `pp.sig` (the preprocessor), `parse.sig` (the AST), `sema.sig` (types, scopes, built-ins, ES's rules), `glsl.sig` (a compile, its log and its interface). |
 | `egl.sig` | EGL 1.5 for OpenGL ES: displays, configs, contexts with share groups, window and pbuffer surfaces, swaps, fence syncs, errors per thread. |
 | `wayland.sig` | EGL's Wayland platform: a window's frames handed to the compositor as dma-bufs (`zwp_linux_dmabuf_v1`), through the app's own `libwayland-client`. |
 | `thread.sig` | What EGL and GL keep per thread: the current context and surfaces, EGL's last error, the bound API. |
@@ -59,7 +61,27 @@ Coverage is integer arithmetic, and every float operation is one KIR defines bit
 
 On the CPU (no GPU, or it is lost), KIR's interpreter runs the same three kernels on the images' memory.
 
-Shaders are KIR emitters (`raster.Shaders`). The GLSL compiler of the next stage makes them; for now the driver's own pipelines are set with `usePipeline`.
+Shaders are KIR emitters (`raster.Shaders`). GLSL programs will make them (stage 5c); for now the driver's own pipelines are set with `usePipeline`, and a draw with a GLSL program in use draws nothing.
+
+### GLSL
+
+A shader's source goes through four passes, each in fixed tables of one compile scratch:
+
+1. **The preprocessor** (`pp.sig`). Comments and line continuations go first, keeping line numbers. Directives are handled line by line: `#version` (100, or 300 es), `#define` (object-like and function-like, with `##`), `#undef`, `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif` (integer expressions with `defined`), `#extension`, `#line`, `#error`, `#pragma`. Expansion runs over a stack of token streams, with no recursion, and a macro is off while its own expansion is read. `GL_ES`, `__VERSION__`, `__LINE__`, `GL_FRAGMENT_PRECISION_HIGH` and the extensions' macros are predefined.
+2. **The parser** (`parse.sig`), recursive descent with GLSL's precedence, into nodes in one array linked by index. It covers qualifiers, `layout(location)`, precision statements, structs, arrays and array constructors, functions and prototypes, every statement, and every operator.
+3. **The checker** (`sema.sig`). It types every expression, with ES's rule of no implicit conversions. It covers scopes, structs, swizzles, constructors, l-values, constant integers (array sizes, case labels), and the qualifiers each stage and version allows. A fragment shader needs a default float precision. Integer varyings must be flat in 3.00. The built-in functions are a table of 201 signatures (and `outerProduct`): genType patterns bind one size per call, and sampler patterns one kind (float, int, uint). Version and stage gate them: 1.00's `texture2D`, 3.00's `texture`, `texelFetch` and `textureSize`, derivatives in fragment shaders, `GL_EXT_shader_texture_lod`, and `samplerExternalOES`.
+4. **The interface** (`glsl.sig`): the shader's inputs, outputs and uniforms, with struct uniforms flattened to GL's names (`s[1].m`), each with its type, location and whether the shader uses it.
+
+Logs are in Mesa's form (`0:LINE: error: ...`).
+
+Shaders and programs share one namespace. Names are the process's, and each object belongs to its share group. A shader keeps only its source, in a text pool that is compacted when full. A link compiles both shaders again and then:
+
+- places the active attributes: a `layout(location)` first, then `glBindAttribLocation`'s, then the lowest free locations (a matrix takes one per column);
+- matches each varying the fragment shader uses to a vertex output by name, type and interpolation, and gives it its words;
+- merges the two stages' uniforms (one type per name), each with consecutive locations (one per array element) and its words in the program's uniform storage, which is tight (a float, an int, a bool or a sampler's unit is one word);
+- places 3.00's fragment outputs, or notes 1.00's `gl_FragColor`/`gl_FragData`.
+
+As in Mesa, only what a shader uses is active. `glGetUniformLocation` takes `u`, `u[k]`, `s.m` and `s[1].m[2]`. `glUniform*` checks the type, count and sampler units, and `glGetUniform*` converts. `glUniformMatrix*` takes `transpose`. There are no binary formats. Interface blocks (uniform blocks) are refused for now. Every call takes the program table's lock.
 
 Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
@@ -91,13 +113,13 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
 ### The C ABI
 
-The library is `libgalaxy-gl.so`, with 58 `egl*` and 114 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
+The library is `libgalaxy-gl.so`, with 58 `egl*` and 187 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
 
 Each context is current per thread. The current context is kept in a fixed table keyed by the thread pointer (`TPIDR_EL0` on AArch64, `%fs:0` on x86-64), so the library needs no thread-local storage and no C library.
 
 The library's panic handler prints one line and exits, as a failed assertion in a C driver does. It needs neither TLS nor a stack walk. EGL's tables, and the render node's, are filled at first use, so they take no room in the file.
 
-As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 979 KB on aarch64 and 1011 KB on x86_64 (the CPU fallback carries KIR's interpreter and the draw kernels' builders).
+As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1154 KB on aarch64 and 1194 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL front end adds about 175 KB. Its tables (EGL's, the compile scratch, the text pool, the programs) are bss, about 40 MB of address space, touched only as used.
 
 ## What is done
 
@@ -118,7 +140,7 @@ As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library
 
 **Stage 4b** ([SB0LTD/zpm#129](https://github.com/SB0LTD/zpm/pull/129)): EGLImages from dma-bufs, GL's `OES_EGL_image`, native fences (with Galaxy's `G_FENCE_FD`, SB0LTD/galaxy#74), and `zwp_linux_dmabuf_v1` version 4's feedback.
 
-**Stage 5a, draws:**
+**Stage 5a, draws** ([SB0LTD/zpm#130](https://github.com/SB0LTD/zpm/pull/130)):
 - the pipeline above;
 - vertex array objects, attribute pointers (integer ones too), generic attributes, divisors;
 - `glDrawArrays`, `glDrawElements` (8, 16 and 32-bit indices), `glDrawArraysInstanced`, `glDrawElementsInstanced`, `glDrawRangeElements`;
@@ -126,8 +148,18 @@ As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library
 
 That makes 114 GL entry points.
 
+**Stage 5b, GLSL's front end:**
+- the compiler above, GLSL ES 1.00 and 3.00;
+- `glCreateShader` .. `glDeleteShader`, `glShaderSource`, `glCompileShader`, `glGetShaderiv`, `glGetShaderInfoLog`, `glGetShaderSource`, `glGetShaderPrecisionFormat`;
+- `glCreateProgram` .. `glDeleteProgram`, attach and detach, `glLinkProgram`, `glValidateProgram`, `glUseProgram`, `glGetProgramiv`, `glGetProgramInfoLog`, `glProgramParameteri`;
+- `glBindAttribLocation`, `glGetAttribLocation`, `glGetActiveAttrib`, `glGetUniformLocation`, `glGetActiveUniform`, `glGetActiveUniformsiv`, `glGetUniformIndices`, `glGetFragDataLocation`;
+- every `glUniform*`, `glUniformMatrix*` and `glGetUniform*`;
+- the shader limits in `glGetIntegerv`.
+
+That makes 187 GL entry points.
+
 **Not yet:**
-- shaders and GLSL (programs, uniforms by name), samplers and texture sampling, queries, GL sync objects;
+- GLSL to KIR (a draw with a GLSL program draws nothing), uniform blocks, transform feedback, samplers and texture sampling, queries, GL sync objects;
 - points and lines;
 - clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped;
 - stencil tests, several color attachments, depth-only drawing;
@@ -148,7 +180,8 @@ sig build test-gfxapi
 ```
 
 - `test-gfxapi-module`: the engine and the pool on the CPU; float-to-unorm conversion (rounding to nearest even, as Mesa does); the render-node client against `node.Fake`, Galaxy's calls over the emulated Adreno, covering buffers, cache upkeep, import, export, a hang and a missing GPU.
-- `test-gfxapi-libgles`: GL through its C entry points, and `getProcAddress`.
+- `test-gfxapi-libgles`: GL through its C entry points, and `getProcAddress`. Shaders and programs: a 3.00 program (sources in parts, a bound attribute, an unused one inactive, uniform arrays by element, sampler units, a bool, a transposed matrix, the errors `glUniform*` gives), a 1.00 program as WebGL 1 writes them, compile and link logs, and deletes deferred while attached or in use.
+- `test-gfxapi-module` also runs the compiler's own tests: tokens, macros and conditionals, the parser, the checker on shaders as WebRender and WebGL write them, what ES forbids (each with its message), and an interface with struct uniforms flattened.
 - `test-gfxapi-lib`: EGL and GL through their C entry points: a surfaceless display, a pbuffer, a clear read back, a fence, errors, `eglGetProcAddress`.
 - `test-gfxapi-draw`: one GL scene of triangles drawn three ways (the CPU, `EmuDevice`, the emulated Adreno through Galaxy's calls with the kernels compiled to ir3), each giving the same bytes. It covers:
   - the fill rule: a square's two triangles added, the diagonal through pixel centers, every pixel exactly once;
@@ -186,7 +219,7 @@ sig build test-gfxapi
 | 4a | Done: EGL 1.5, the Wayland platform, surfaceless and pbuffers, fence syncs, one `libgalaxy-gl.so` | zpm |
 | 4b | Done: EGLImages and `EGL_EXT_image_dma_buf_import`, GL's `OES_EGL_image`; `EGL_ANDROID_native_fence_sync`; `zwp_linux_dmabuf_v1` v4 feedback | zpm + Galaxy |
 | 5a | Done: draws. Vertex arrays, the three draw kernels (vertices, setup, tiles), exact coverage, depth, blending, culling, instancing; the same bytes on every GPU and the CPU | zpm |
-| 5b | The GLSL ES 3.00 front end: the preprocessor, parser, types and built-ins; shader and program objects, linking, uniforms and attributes by name | zpm |
+| 5b | Done: the GLSL ES 1.00 and 3.00 front end (the preprocessor, parser, types and built-ins); shader and program objects, linking, uniforms and attributes by name | zpm |
 | 5c | GLSL to KIR: the vertex and fragment emitters draws take | zpm |
 | 5d | Texture sampling (filters, wraps, the formats WebRender uses: R8, RG8, RGBA16F, RGBA32F, ...), samplers; triangles binned to tiles | zpm |
 | 5e | What WebRender asks beyond that, until Firefox's WebRender draws on the GPU | zpm |

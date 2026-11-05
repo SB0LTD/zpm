@@ -13,6 +13,9 @@
 //! - wayland: EGL's Wayland platform (dma-buf frames to the compositor);
 //! - thread: what EGL and GL keep per thread;
 //! - dl: the host program's functions found by name;
+//! - raster: the draw pipeline (vertices, setup, tiles) as KIR kernels;
+//! - glsl: the GLSL ES compiler (preprocessor, parser, checker);
+//! - program: GL's shader and program objects, links and uniforms;
 //! - libgalaxy_gl.sig and libgles.sig (the shared library's root, not
 //!   imported here): the C entry points.
 //!
@@ -28,6 +31,8 @@ pub const thread = @import("thread.sig");
 pub const dl = @import("dl.sig");
 pub const host = @import("host.sig");
 pub const raster = @import("raster.sig");
+pub const program = @import("program.sig");
+pub const glsl = @import("glsl/glsl.sig");
 
 test {
     _ = engine;
@@ -35,4 +40,10 @@ test {
     _ = node;
     _ = thread;
     _ = dl;
+    _ = program;
+    _ = glsl;
+    _ = glsl.lex;
+    _ = glsl.pp;
+    _ = glsl.parse;
+    _ = glsl.sema;
 }
