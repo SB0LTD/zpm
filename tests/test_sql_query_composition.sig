@@ -523,6 +523,43 @@ fn cteMaterialization() !void {
     try controlled("WITH x AS NOT MATERIALIZED (SELECT id FROM tdd_a) SELECT * FROM x ORDER BY id", "1;2;3;4");
 }
 
+// ---- PG.JOIN.LATERAL ------------------------------------------------------
+
+fn lateralJoins() !void {
+    // oracle
+    try expectTyped("SELECT a.id,x.v FROM tdd_a a CROSS JOIN LATERAL (SELECT a.id+1 AS v) x ORDER BY a.id", "id:23,v:23", "1|2;2|3;3|4;4|5");
+    try expect("SELECT a.id,x.c FROM tdd_a a, LATERAL (SELECT COUNT(*) AS c FROM tdd_b b WHERE b.id<=a.id) x ORDER BY a.id", "1|1;2|1;3|2;4|2");
+    // Several, ordered and limited rows per left row; duplicates kept.
+    try expect("SELECT a.id,x.id FROM tdd_a a CROSS JOIN LATERAL (SELECT b.id FROM tdd_b b WHERE b.id>=a.id ORDER BY b.id LIMIT 2) x ORDER BY a.id,x.id", "1|1;1|3;2|3;2|5;3|3;3|5;4|5");
+    try expect("SELECT a.id FROM tdd_a a, LATERAL (SELECT 1 UNION ALL SELECT 2) x WHERE a.id=1", "1;1");
+    // LEFT JOIN LATERAL null-extends empty results; ON filters pairs.
+    try expect("SELECT a.id,x.id FROM tdd_a a LEFT JOIN LATERAL (SELECT b.id FROM tdd_b b WHERE b.id=a.id) x ON true ORDER BY a.id", "1|1;2|NULL;3|3;4|NULL");
+    try expect("SELECT a.id,x.n FROM tdd_a a JOIN LATERAL (SELECT a.v*2 AS n) x ON x.n>20 ORDER BY a.id", "2|40;3|60");
+    try expect("SELECT a.id,x.w FROM tdd_a a, LATERAL (SELECT a.v+1 AS w) x WHERE a.id=4", "4|NULL");
+    try expect("SELECT COUNT(*) FROM tdd_a a CROSS JOIN LATERAL (SELECT b.id FROM tdd_b b WHERE b.id>9) x", "0");
+    // A LATERAL item sees earlier LATERAL items; aggregates over the join.
+    try expect("SELECT a.id,x.p,y.q FROM tdd_a a, LATERAL (SELECT a.id*2 AS p) x, LATERAL (SELECT x.p+1 AS q) y ORDER BY a.id", "1|2|3;2|4|5;3|6|7;4|8|9");
+    try expect("SELECT SUM(x.v) FROM tdd_a a CROSS JOIN LATERAL (SELECT a.id+1 AS v) x", "14");
+    try expect("SELECT a.g,x.m FROM (SELECT DISTINCT g FROM tdd_a) a, LATERAL (SELECT MAX(v) AS m FROM tdd_a i WHERE i.g=a.g) x ORDER BY a.g", "1|20;2|30");
+    // Correlation to an enclosing query and inside a join group.
+    try expect("SELECT o.id,(SELECT x.s FROM tdd_b b, LATERAL (SELECT b.v+o.id AS s) x WHERE b.id=1) FROM tdd_a o ORDER BY o.id", "1|12;2|13;3|14;4|15");
+    try expect("SELECT a.id,b.id,s.n FROM tdd_a a JOIN (tdd_b b CROSS JOIN LATERAL (SELECT b.v AS n) s) ON a.id=b.id ORDER BY a.id", "1|1|11;3|3|33");
+    // Uncorrelated LATERAL behaves as a derived table, RIGHT JOIN included.
+    try expect("SELECT COUNT(*) FROM tdd_a a RIGHT JOIN LATERAL (SELECT 1 AS one) x ON a.id=x.one", "1");
+    // A volatile LATERAL body runs once per left row.
+    try run("CREATE SEQUENCE lt");
+    try expect("SELECT COUNT(DISTINCT x.n) FROM tdd_a a, LATERAL (SELECT nextval('lt')+a.id*0 AS n) x", "4");
+    // Errors.
+    try rejects("SELECT * FROM tdd_a a, (SELECT a.id) x", error.TableNotFound);
+    try rejects("SELECT * FROM tdd_a a RIGHT JOIN LATERAL (SELECT a.id) x ON true", error.InvalidColumnReference);
+    try rejects("SELECT * FROM tdd_a a FULL JOIN LATERAL (SELECT a.id) x ON true", error.InvalidColumnReference);
+    try rejects("SELECT * FROM tdd_a a JOIN (tdd_b b CROSS JOIN LATERAL (SELECT a.id) s) ON true", error.TableNotFound);
+    try rejects("SELECT * FROM tdd_a a, LATERAL tdd_b", error.Syntax);
+    try rejects("SELECT * FROM tdd_a a, LATERAL (tdd_b b JOIN tdd_b c ON true)", error.Syntax);
+    try rejects("SELECT * FROM tdd_a a, LATERAL (SELECT 1/(a.id-1)) x", error.DivisionByZero);
+    try controlled("SELECT a.id,x.id FROM tdd_a a CROSS JOIN LATERAL (SELECT b.id FROM tdd_b b WHERE b.id>=a.id ORDER BY b.id LIMIT 2) x ORDER BY a.id,x.id", "1|1;1|3;2|3;2|5;3|3;3|5;4|5");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
@@ -533,6 +570,7 @@ pub fn main(init: std.process.Init) !void {
     try groupingSets();
     try groupingCube();
     try cteMaterialization();
+    try lateralJoins();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

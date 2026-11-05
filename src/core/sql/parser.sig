@@ -2399,8 +2399,17 @@ pub fn Parser(comptime config: types.Config) type {
         fn fromItem(self: *Self, out: *Ast.Select, kind: ast.JoinKind) Error!void {
             if (out.item_count == config.relations) return error.StatementTooComplex;
             var item: Ast.FromItem = .{ .join = kind };
+            // LATERAL (B11): the item sees the FROM items before it.
+            if (self.mode == .standard and try self.takeWord("LATERAL")) {
+                item.lateral = true;
+                self.pool.complex = true;
+                if (!self.isSymbol(.lparen)) return error.Syntax;
+            }
             if (self.mode == .standard and try self.takeSymbol(.lparen)) {
-                if (!self.queryWord()) return self.joinGroup(out, kind);
+                if (!self.queryWord()) {
+                    if (item.lateral) return error.Syntax;
+                    return self.joinGroup(out, kind);
+                }
                 item.query = try self.query();
                 try self.expectSymbol(.rparen);
                 self.pool.complex = true;

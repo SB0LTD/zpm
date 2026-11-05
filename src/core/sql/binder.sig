@@ -5003,7 +5003,21 @@ pub fn Binder(comptime config: types.Config) type {
             for (q.items[0..q.item_count], 0..) |*item, index| {
                 var rel: Relation = .{};
                 var source: Source = .{ .join = item.join, .group_end = item.group_end };
-                if (item.query != none) {
+                if (item.query != none and item.lateral) {
+                    // LATERAL (B11): the items before it (in its own join
+                    // operand) are the derived table's parent scope; outer
+                    // references mark this plan through markCorrelated.
+                    const saved = scope.rel_first;
+                    scope.rel_first = enclosingGroup(q, index);
+                    const child = bindPlan(context, item.query, &scope, env, false);
+                    scope.rel_first = saved;
+                    rel.plan = try child;
+                    source.plan = rel.plan;
+                    source.lateral = plans.items[rel.plan].correlated;
+                    // PostgreSQL: the combining JOIN type must be INNER or
+                    // LEFT for a LATERAL reference (42P10).
+                    if (source.lateral and (item.join == .right or item.join == .full)) return error.InvalidColumnReference;
+                } else if (item.query != none) {
                     // Derived tables are not LATERAL: they see enclosing blocks
                     // only; an expanded view sees neither (it is a stored query).
                     const child = try bindPlan(context, item.query, if (item.view) null else parent, if (item.view) null else env, false);
