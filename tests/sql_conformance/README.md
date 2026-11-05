@@ -45,7 +45,7 @@ component is missing. The annotations below separate those cases.
 | PG.PRED.QUANTIFIED | ANY/SOME/ALL, scalar subqueries with six ordinary comparison operators | pass; array/row/custom-operator forms and closure remain incomplete |
 | PG.PRED.SYMMETRIC | Symmetric BETWEEN | pass; scalar/flat-row range contracts, broader closure incomplete |
 | PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
-| PG.PRED.REGEX | Regular expressions | Syntax |
+| PG.PRED.REGEX | Regular expressions | pass (B11 candidate); ARE operators, SIMILAR TO, regexp_like; back references, BREs and positional regexp_* functions open |
 | PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
 | PG.QUERY.WINDOW | Ranking/offset windows | qualified smoke pass; LAG/LEAD finite coverage, demand/other window closure incomplete |
 | PG.QUERY.WINDOW_AGG | Window aggregates | pass; complete window family remains partial |
@@ -118,11 +118,11 @@ component is missing. The annotations below separate those cases.
 | PG.FUNC.TEMPORAL | Temporal functions | Syntax |
 | PG.FUNC.FORMAT | Formatting functions | UndefinedFunction for to_date/to_number; temporal to_char implemented separately |
 | PG.FUNC.MINMAX | GREATEST/LEAST | pass; closure incomplete |
-| PG.FUNC.DISCOVERY | Discovery functions | UndefinedFunction |
-| PG.TEXT.COLLATION | Collation selection | Syntax |
+| PG.FUNC.DISCOVERY | Discovery functions | pass (B11 candidate); pg_typeof (regtype), pg_get_serial_sequence; other catalog functions open |
+| PG.TEXT.COLLATION | Collation selection | pass (B11 candidate); COLLATE with C-equivalent collations and explicit derivation; column collations, ICU/Unicode collations open |
 | PG.TEXT.ENCODING | Unicode/codepoint functions | UndefinedFunction |
 | PG.TEXT.LITERALS | Escape/dollar/Unicode literals | Syntax |
-| PG.TEXT.SEARCH | Full text search | Syntax |
+| PG.TEXT.SEARCH | Full text search | pass (B11 candidate); simple configuration, default parser, to_*tsquery, @@; Snowball configurations, ranking and tsvector operators open |
 | PG.OP.BITWISE | Bitwise operators | Syntax |
 | PG.TX.ISOLATION | Repeatable Read/Serializable | pass (B11 candidate); REPEATABLE READ snapshot + 40001, relation-granularity SSI (more 40001s than PostgreSQL) |
 | PG.TX.CHARACTERISTICS | Transaction characteristics | pass (B11 candidate); READ ONLY 25006, DEFERRABLE safe-snapshot wait, 25001 hooks; SET TRANSACTION SNAPSHOT open |

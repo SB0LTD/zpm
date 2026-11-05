@@ -23,6 +23,7 @@ const network = @import("network.sig");
 const geometric = @import("geometric.sig");
 const xml_module = @import("xml.sig");
 const json_eval = @import("json_eval.sig");
+const regex = @import("regex.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -813,6 +814,22 @@ pub fn Eval(comptime config: types.Config) type {
                     };
                 },
                 .binary => {
+                    if (n.op == .text_match) {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return null;
+                        const vector = if (left == .tsvector) left.tsvector.slice() else right.tsvector.slice();
+                        const query = if (left == .tsquery) left.tsquery.slice() else right.tsquery.slice();
+                        return try Io.TextSearch.matches(vector, query, ctx.session.control);
+                    }
+                    if (n.op == .regex_match) {
+                        const subject = try eval(ctx, n.a);
+                        const pattern = try eval(ctx, n.b);
+                        if (subject == .null_value or pattern == .null_value) return null;
+                        // bpchar ~ text reads the padded value (bpcharregexeq).
+                        const bytes = if (subject == .bpchar) subject.bpchar.slice() else subject.text.slice();
+                        return try regexMatch(ctx, bytes, pattern.text.slice(), .{ .icase = n.insensitive }) != n.negated;
+                    }
                     if (n.op == .eq or n.op == .ne or n.op == .lt or n.op == .le or n.op == .gt or n.op == .ge or n.op == .is_distinct or n.op == .is_not_distinct) {
                         // Column operands compare in place, without a cell copy.
                         var left_value: V.Cell = undefined;
@@ -886,6 +903,14 @@ pub fn Eval(comptime config: types.Config) type {
                     // like_escape(pattern, escape) is strict independently of
                     // the outer LIKE operator, after evaluating both arguments.
                     if (pattern == .null_value or (n.c != none and escape == .null_value)) return null;
+                    if (n.op == .regex_match) {
+                        // SIMILAR TO: textregexeq(value, similar_to_escape(pattern, escape)).
+                        var converted: [3 * config.text_bytes + 23]u8 = undefined;
+                        const re = try regex.similarToRegex(pattern.text.slice(), if (n.c == none) null else escape.text.slice(), &converted);
+                        if (value == .null_value) return null;
+                        const subject = if (value == .bpchar) value.bpchar.slice() else value.text.slice();
+                        return try regexMatch(ctx, subject, re, .{}) != n.negated;
+                    }
                     const escape_text: []const u8 = if (n.c == none) "\\" else escape.text.slice();
                     try validateLikeEscape(escape_text);
                     if (value == .null_value) return null;
@@ -902,6 +927,14 @@ pub fn Eval(comptime config: types.Config) type {
                 .boolean => |b| b,
                 else => unreachable,
             };
+        }
+
+        /// Compiles `pattern` (an ARE under `flags`) and searches `subject`;
+        /// every text position of the simulation is a checkpoint.
+        fn regexMatch(ctx: *const Context, subject: []const u8, pattern: []const u8, flags: regex.Flags) Error!bool {
+            var program: regex.Regex(config.regex_states) = .{};
+            try program.compile(pattern, flags, config.expr_depth);
+            return program.search(subject, ctx.session.control);
         }
 
         fn clockValue(ctx: *const Context, func: ast.Func) Error!V.Cell {
@@ -969,7 +1002,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same => return boolCell(try truth(ctx, id)),
+                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same, .regex_match, .text_match => return boolCell(try truth(ctx, id)),
                     .distance => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
@@ -1196,6 +1229,59 @@ pub fn Eval(comptime config: types.Config) type {
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
+                    .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
+                        const config_cell = try eval(ctx, n.b);
+                        const input = try eval(ctx, ctx.pool.nodes[n.b].next);
+                        if (config_cell == .null_value or input == .null_value) return .null_value;
+                        const TS = Io.TextSearch;
+                        _ = try TS.configByName(config_cell.text.slice());
+                        var out: TS.Out = .{};
+                        const text = input.text.slice();
+                        switch (n.func) {
+                            .to_tsvector => {
+                                try TS.toVector(text, &out, ctx.session.control);
+                                return .{ .tsvector = (try textCell(out.slice())).text };
+                            },
+                            .to_tsquery => try TS.toQuery(text, .to, &out),
+                            .plainto_tsquery => try TS.toQuery(text, .plain, &out),
+                            else => try TS.toQuery(text, .phrase, &out),
+                        }
+                        return .{ .tsquery = (try textCell(out.slice())).text };
+                    },
+                    .regexp_like => {
+                        const subject = try eval(ctx, n.b);
+                        const pattern = try eval(ctx, ctx.pool.nodes[n.b].next);
+                        const options_id = ctx.pool.nodes[ctx.pool.nodes[n.b].next].next;
+                        const options = if (options_id != none) try eval(ctx, options_id) else V.Cell{ .text = .{} };
+                        if (subject == .null_value or pattern == .null_value or options == .null_value) return .null_value;
+                        const parsed = try regex.parseOptions(options.text.slice(), .{});
+                        if (parsed.global) return error.InvalidParameterValue;
+                        return .{ .boolean = try regexMatch(ctx, subject.text.slice(), pattern.text.slice(), parsed.flags) };
+                    },
+                    .similar_to_escape => {
+                        const pattern = try eval(ctx, n.b);
+                        const escape_id = ctx.pool.nodes[n.b].next;
+                        const escape = if (escape_id != none) try eval(ctx, escape_id) else V.Cell.null_value;
+                        if (pattern == .null_value or (escape_id != none and escape == .null_value)) return .null_value;
+                        var converted: [3 * config.text_bytes + 23]u8 = undefined;
+                        return textCell(try regex.similarToRegex(pattern.text.slice(), if (escape_id == none) null else escape.text.slice(), &converted));
+                    },
+                    .pg_typeof => {
+                        // The argument is evaluated (its errors surface); its
+                        // bound type is the result.
+                        _ = try eval(ctx, n.b);
+                        return .{ .regtype = @intCast(n.integer) };
+                    },
+                    .pg_get_serial_sequence => {
+                        const table = try eval(ctx, n.b);
+                        const column = try eval(ctx, ctx.pool.nodes[n.b].next);
+                        if (table == .null_value or column == .null_value) return .null_value;
+                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                        const lookup = hook.serial_sequence orelse return error.UnsupportedStatement;
+                        var buffer: [value_module.serial_name_bytes]u8 = undefined;
+                        const length = (try lookup(hook.ptr, table.text.slice(), column.text.slice(), &buffer)) orelse return .null_value;
+                        return textCell(buffer[0..length]);
+                    },
                     .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
                     .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
                     .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),

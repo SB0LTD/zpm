@@ -25,6 +25,7 @@ const sequence = @import("sequence.sig");
 const parser = @import("parser.sig");
 const array_module = @import("array.sig");
 const routine_catalog = @import("routine_catalog.sig");
+const collation = @import("collation.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -761,14 +762,20 @@ pub fn Binder(comptime config: types.Config) type {
             if (n.ty == target) return id;
             if (!value.castable(n.ty, target, mode)) return if (mode == .assignment) error.TypeMismatch else error.UndefinedFunction;
             const constant = n.constant;
+            const derived = if (collation.collatable(target)) n.collation else collation.none;
             const cast_id = try context.pool.add(.{ .kind = .cast, .cast_type = target, .typmod = typmod, .a = id, .ty = target });
             context.node(cast_id).constant = constant;
+            context.node(cast_id).collation = derived;
             return cast_id;
         }
 
         /// Operands of a comparison: unknown takes the other side's type;
         /// numeric and datetime operands promote to their common type.
         fn comparable(context: *const Context, a: *u16, b: *u16) Error!void {
+            // regtype has no operators of its own: oid's apply (binary
+            // coercible), so an untyped literal beside it is read as an oid.
+            if (context.node(a.*).ty == .regtype) a.* = try convert(context, a.*, .oid, -1, .implicit);
+            if (context.node(b.*).ty == .regtype) b.* = try convert(context, b.*, .oid, -1, .implicit);
             const left = context.node(a.*).ty;
             const right = context.node(b.*).ty;
             if (left == .unknown and right == .unknown) {
@@ -780,6 +787,8 @@ pub fn Binder(comptime config: types.Config) type {
             if (left == .json or right == .json or left == .jsonpath or right == .jsonpath) return error.UndefinedFunction;
             // point and box have no ordinary comparison operators here.
             if (geometricType(left) or geometricType(right) or left == .xml or right == .xml) return error.UndefinedFunction;
+            // tsvector / tsquery comparison operators are not provided.
+            if (left == .tsvector or right == .tsvector or left == .tsquery or right == .tsquery) return error.UndefinedFunction;
             if (left == right) return;
             if (value.integral(left) and value.integral(right)) return;
             if (context.legacy) {
@@ -1031,6 +1040,55 @@ pub fn Binder(comptime config: types.Config) type {
             return error.UndefinedFunction;
         }
 
+        /// ~ ~* !~ !~* (textregexeq and friends): text, varchar and name
+        /// subjects, bpchar read with its padding (bpcharregexeq); the
+        /// pattern is text.
+        fn regexOperator(context: *const Context, n: *ast.Node) Error!void {
+            try coerce(context, n.a, .text);
+            try coerce(context, n.b, .text);
+            if (context.node(n.b).ty == .bpchar) n.b = try convert(context, n.b, .text, -1, .implicit);
+            if (!value.characterType(context.node(n.a).ty) or !value.stringType(context.node(n.b).ty)) return error.UndefinedFunction;
+            n.ty = .boolean;
+        }
+
+        fn textSearchType(ty: ast.Type) bool {
+            return ty == .tsvector or ty == .tsquery;
+        }
+
+        /// @@: tsvector @@ tsquery and tsquery @@ tsvector (an untyped side
+        /// takes the other operand type). text @@ tsquery and text @@ text
+        /// use default_text_search_config (pg_catalog.english): 0A000.
+        fn textMatchOperator(context: *const Context, n: *ast.Node) Error!void {
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (left == .tsvector or right == .tsquery) {
+                if (left == .unknown) return error.UnsupportedStatement;
+                try coerce(context, n.b, .tsquery);
+            }
+            if (left == .tsquery) try coerce(context, n.b, .tsvector);
+            const a = context.node(n.a).ty;
+            const b = context.node(n.b).ty;
+            if ((a == .tsvector and b == .tsquery) or (a == .tsquery and b == .tsvector)) {
+                n.ty = .boolean;
+                return;
+            }
+            if ((value.characterType(a) or a == .unknown) and (b == .tsquery or value.characterType(b) or b == .unknown)) return error.UnsupportedStatement;
+            return error.UndefinedFunction;
+        }
+
+        /// to_tsvector / to_tsquery / plainto_tsquery / phraseto_tsquery
+        /// (regconfig, text). The configuration is an untyped literal
+        /// (regconfig input, checked now when constant); the one-argument
+        /// forms use default_text_search_config (english): 0A000.
+        fn typeTextSearchFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            if (count == 1) return error.UnsupportedStatement;
+            if (count != 2) return error.UndefinedFunction;
+            const config_node = context.node(n.b);
+            if (config_node.ty != .unknown) return error.UndefinedFunction;
+            if (config_node.kind == .text_literal) _ = try Io.TextSearch.configByName(E.literalText(context.source, config_node.text).slice());
+            try bindSignature(context, n, &[_]ast.Type{ .text, .text }, if (n.func == .to_tsvector) .tsvector else .tsquery, true);
+        }
+
         /// int2/int4/int8 & | # (common integer type) and << >> (int4 count).
         fn bitwiseType(context: *const Context, n: *ast.Node) Error!void {
             const left = context.node(n.a).ty;
@@ -1279,6 +1337,17 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "obj_description", .func = .obj_description },
                 .{ .name = "col_description", .func = .col_description },
                 .{ .name = "shobj_description", .func = .shobj_description },
+                // Regular expressions (B11 text lane).
+                .{ .name = "regexp_like", .func = .regexp_like },
+                // Full text search (B11 text lane).
+                .{ .name = "to_tsvector", .func = .to_tsvector },
+                .{ .name = "to_tsquery", .func = .to_tsquery },
+                .{ .name = "plainto_tsquery", .func = .plainto_tsquery },
+                .{ .name = "phraseto_tsquery", .func = .phraseto_tsquery },
+                .{ .name = "similar_to_escape", .func = .similar_to_escape },
+                // Discovery functions (B11 text lane).
+                .{ .name = "pg_typeof", .func = .pg_typeof },
+                .{ .name = "pg_get_serial_sequence", .func = .pg_get_serial_sequence },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -2182,6 +2251,24 @@ pub fn Binder(comptime config: types.Config) type {
                     n.ty = .name;
                     n.constant = false;
                 },
+                // pg_typeof("any") is not strict: the argument is evaluated
+                // and its declared type is the result (unknown for an
+                // untyped literal, regclass/regtype for the OID casts).
+                .pg_typeof => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const argument = context.node(n.b);
+                    n.integer = switch (argument.reg) {
+                        .regclass => 2205,
+                        .regtype => 2206,
+                        .none => if (argument.ty == .unknown) 705 else types.typeOid(types.dataTypeOf(argument.ty)),
+                    };
+                    n.ty = .regtype;
+                    n.constant = false;
+                },
+                .pg_get_serial_sequence => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .text, true),
+                .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => try typeTextSearchFunction(context, n, count),
+                .regexp_like => try bindSignature(context, n, if (count == 2) &[_]ast.Type{ .text, .text } else &[_]ast.Type{ .text, .text, .text }, .boolean, true),
+                .similar_to_escape => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, .text, true),
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
                 .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
                 .area, .width, .height => try bindSignature(context, n, &[_]ast.Type{.box}, .float8, true),
@@ -3516,6 +3603,58 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeExpr(context: *const Context, scope: *const Scope, id: u16) Error!void {
+            try typeExprKind(context, scope, id);
+            try deriveCollation(context, id);
+        }
+
+        /// parse_collate.c for explicit collations (collation.sig): a COLLATE
+        /// clause needs a collatable (or still untyped) operand (42804) and an
+        /// existing collation (42704, 0A000); a collatable result inherits
+        /// its inputs' explicit collation, and two different explicit
+        /// collations among the inputs are 42P21. Only collatable inputs
+        /// count, and a CASE's result comes from its THEN / ELSE values.
+        fn deriveCollation(context: *const Context, id: u16) Error!void {
+            const n = context.node(id);
+            if (n.collate_clause) {
+                if (!collation.collatable(n.ty)) return error.TypeMismatch;
+                if (n.collation == collation.unknown) return error.UndefinedObject;
+                if (n.collation == collation.unsupported) return error.UnsupportedStatement;
+            }
+            var merged: u8 = collation.none;
+            const Collations = struct {
+                fn add(c: *const Context, child: u16, into: *u8) Error!void {
+                    if (child == none) return;
+                    const node = c.node(child);
+                    if (!collation.known(node.collation) or !collation.collatable(node.ty)) return;
+                    if (into.* == collation.none) {
+                        into.* = node.collation;
+                    } else if (into.* != node.collation) return error.CollationMismatch;
+                }
+            };
+            switch (n.kind) {
+                .case_expr => {
+                    var arm = n.b;
+                    while (arm != none) : (arm = context.node(arm).next) try Collations.add(context, context.node(arm).b, &merged);
+                    try Collations.add(context, n.c, &merged);
+                },
+                .function, .coalesce, .in_list => {
+                    try Collations.add(context, n.a, &merged);
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) try Collations.add(context, item, &merged);
+                    try Collations.add(context, n.c, &merged);
+                },
+                .scalar_subquery, .exists_subquery, .in_subquery, .column, .row_compare, .row_in => try Collations.add(context, n.a, &merged),
+                else => {
+                    try Collations.add(context, n.a, &merged);
+                    try Collations.add(context, n.b, &merged);
+                    try Collations.add(context, n.c, &merged);
+                },
+            }
+            if (n.collate_clause) return;
+            n.collation = if (collation.collatable(n.ty)) merged else collation.none;
+        }
+
+        fn typeExprKind(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
             n.constant = true;
             switch (n.kind) {
@@ -3583,7 +3722,11 @@ pub fn Binder(comptime config: types.Config) type {
                         .exists_any => try jsonOperatorCall(context, n, .jsonb_exists_any_op),
                         .exists_all => try jsonOperatorCall(context, n, .jsonb_exists_all_op),
                         .path_exists => try jsonOperatorCall(context, n, .jsonb_path_exists_op),
-                        .path_match => try jsonOperatorCall(context, n, .jsonb_path_match_op),
+                        // @@ is also tsvector @@ tsquery (either order).
+                        .path_match => if (textSearchType(context.node(n.a).ty) or textSearchType(context.node(n.b).ty)) {
+                            n.op = .text_match;
+                            try textMatchOperator(context, n);
+                        } else try jsonOperatorCall(context, n, .jsonb_path_match_op),
                         .concat => {
                             const left_ty = context.node(n.a).ty;
                             const right_ty = context.node(n.b).ty;
@@ -3622,6 +3765,8 @@ pub fn Binder(comptime config: types.Config) type {
                         .arrow, .arrow_text, .path, .path_text, .exists => try jsonOperator(context, n),
                         .shift_left, .shift_right => if (types.isRange(context.node(n.a).ty) or types.isRange(context.node(n.b).ty)) try rangeOperator(context, n) else if (networkType(context.node(n.a).ty) or networkType(context.node(n.b).ty)) try networkOperator(context, n) else try bitwiseType(context, n),
                         .bit_and, .bit_or, .bit_xor => try bitwiseType(context, n),
+                        .regex_match => try regexOperator(context, n),
+                        .text_match => try textMatchOperator(context, n),
                         .neg, .pos, .bit_not => unreachable,
                     }
                 },
@@ -5359,7 +5504,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (ty == .json) return error.UndefinedFunction;
             // No btree or hash operator classes (could not identify an
             // ordering/equality operator: 42883).
-            if (ty == .point or ty == .box or ty == .xml or ty == .jsonpath) return error.UndefinedFunction;
+            if (ty == .point or ty == .box or ty == .xml or ty == .jsonpath or ty == .tsvector or ty == .tsquery) return error.UndefinedFunction;
         }
 
         fn bindSetOp(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {
