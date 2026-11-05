@@ -415,6 +415,10 @@ pub fn Binder(comptime config: types.Config) type {
 
         pub const Distinct = enum { none, all, on };
 
+        /// generate_series result family; `none` is a scalar function in
+        /// FROM (one row).
+        pub const Series = enum { none, integer, numeric, timestamp };
+
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
         /// columns, then resjunk sort keys.
@@ -484,6 +488,11 @@ pub fn Binder(comptime config: types.Config) type {
             /// GROUPING SETS / CUBE / composite ROLLUP: int_literal nodes
             /// linked by `next`, each a bit mask over `keys` (Exec.groupingSets).
             grouping_sets: u16 = none,
+            /// Function in FROM: the bound call node, its row generator and
+            /// WITH ORDINALITY (Exec.tableFunction).
+            function: u16 = none,
+            series: Series = .none,
+            ordinality: bool = false,
             with_ties: bool = false,
             ties_limit: u64 = 0xffffffffffffffff,
             tie_keys: [config.columns]SortKey = undefined,
@@ -4960,6 +4969,140 @@ pub fn Binder(comptime config: types.Config) type {
             return none;
         }
 
+        /// A function in FROM (B11) as a plan of its own: generate_series
+        /// over int4/int8/numeric (optional step) or timestamp[tz] with an
+        /// interval step, otherwise any scalar function (one row). Arguments
+        /// see the FROM items before it (implicit LATERAL); aggregates and
+        /// window calls are not allowed (42803 / 42P20). The column is named
+        /// after the function, or the table alias; ORDINALITY adds a bigint
+        /// `ordinality` column.
+        fn bindTableFunction(context: *const Context, scope: *Scope, item: *const Ast.FromItem, env: ?*const CteEnv) Error!u16 {
+            const plans = plansOf(context);
+            const id = try plans.add();
+            var inner: Scope = .{ .parent = scope, .plan = id, .ctes = env };
+            const call = context.node(item.function);
+            if (call.window != none) return error.WindowingError;
+            const name = toName(context, item.name);
+            var series: Series = .none;
+            var ty: ast.Type = .unknown;
+            if (!call.name.quoted and types.same(name.slice(), "generate_series")) {
+                if (call.star or call.distinct or call.c != none) return error.UndefinedFunction;
+                var args: [3]u16 = undefined;
+                var count: usize = 0;
+                var arg = call.b;
+                while (arg != none) : (arg = context.node(arg).next) {
+                    if (count == 3) return error.UndefinedFunction;
+                    try typeExpr(context, &inner, arg);
+                    args[count] = arg;
+                    count += 1;
+                }
+                if (count < 2) return error.UndefinedFunction;
+                var target: ast.Type = .unknown;
+                for (args[0..2]) |a| try unifyInto(&target, context.node(a).ty);
+                // A numeric step selects the numeric series (all three
+                // arguments share one type); a timestamp series steps by interval.
+                const step_ty: ast.Type = if (count == 3) context.node(args[2]).ty else .unknown;
+                if (count == 3 and target != .date and target != .timestamp and target != .timestamptz and step_ty != .interval) try unifyInto(&target, step_ty);
+                switch (target) {
+                    .unknown => return error.AmbiguousFunction,
+                    .int2, .int4 => target = .int4,
+                    .int8, .numeric => {},
+                    .date, .timestamp, .timestamptz => {
+                        if (target == .date) target = .timestamptz;
+                        if (count != 3) return error.UndefinedFunction;
+                    },
+                    else => return error.UndefinedFunction,
+                }
+                series = switch (target) {
+                    .int4, .int8 => .integer,
+                    .numeric => .numeric,
+                    else => .timestamp,
+                };
+                for (args[0..count], 0..) |a, position| {
+                    const want: ast.Type = if (series == .timestamp and position == 2) .interval else target;
+                    const arg_ty = context.node(a).ty;
+                    if (arg_ty == .unknown) {
+                        try coerce(context, a, want);
+                    } else if (arg_ty != want and !(value.integral(arg_ty) and value.integral(want))) {
+                        if (!value.castable(arg_ty, want, .implicit)) return error.UndefinedFunction;
+                        const converted = try convert(context, a, want, -1, .implicit);
+                        const next = context.node(a).next;
+                        context.node(converted).next = next;
+                        if (position == 0) {
+                            call.b = converted;
+                        } else context.node(args[position - 1]).next = converted;
+                        context.node(a).next = none;
+                        args[position] = converted;
+                    }
+                }
+                ty = target;
+            } else {
+                try typeExpr(context, &inner, item.function);
+                ty = context.node(item.function).ty;
+                if (ty == .unknown) ty = .text;
+            }
+            const p = &plans.items[id];
+            p.function = item.function;
+            p.series = series;
+            p.ordinality = item.ordinality;
+            // A series has no per-row expression; planning validation sees a
+            // typed NULL placeholder (the generator reads `function`).
+            p.targets[0] = if (series == .none) item.function else try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+            p.names[0] = if (item.alias) |alias| toName(context, alias) else name;
+            p.tys[0] = ty;
+            p.typmods[0] = -1;
+            p.count = 1;
+            if (item.ordinality) {
+                p.targets[1] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
+                p.names[1] = literalName("ordinality");
+                p.tys[1] = .int8;
+                p.typmods[1] = -1;
+                p.count = 2;
+            }
+            p.width = p.count;
+            return id;
+        }
+
+        /// `alias (c1, ...)` (B11): renames the leading columns of a derived
+        /// table or function plan in place; a table, view or CTE reference
+        /// is wrapped in its own projection plan first. More aliases than
+        /// columns is 42P10.
+        fn applyColumnAliases(context: *const Context, item: *const Ast.FromItem, rel: *Relation, source: *Source) Error!void {
+            const plans = plansOf(context);
+            if (rel.plan == none or rel.cte != no_cte) {
+                const wrapper = try wrapRelation(context, rel, source.*);
+                rel.* = .{ .name = rel.name, .plan = wrapper };
+                source.* = .{ .join = source.join, .plan = wrapper, .group_end = source.group_end };
+            }
+            const p = &plans.items[rel.plan];
+            var alias = item.column_aliases;
+            var column: usize = 0;
+            while (alias != none) : (alias = context.node(alias).next) {
+                if (column == p.count) return error.InvalidColumnReference;
+                p.names[column] = toName(context, context.node(alias).name);
+                column += 1;
+            }
+        }
+
+        /// `SELECT *` over one relation as a plan of its own.
+        fn wrapRelation(context: *const Context, rel: *const Relation, source: Source) Error!u16 {
+            const plans = plansOf(context);
+            const id = try plans.add();
+            var scope: Scope = .{ .plan = id };
+            scope.rels[0] = rel.*;
+            scope.rel_count = 1;
+            const p = &plans.items[id];
+            p.sources[0] = .{ .table = source.table, .view = source.view, .plan = source.plan, .cte = source.cte };
+            p.source_count = 1;
+            for (0..relationWidth(context, rel)) |column| {
+                const node = try columnNode(context, &scope, 0, column);
+                try addTarget(context, p, node, literalName(relationColumnName(context, rel, column)));
+            }
+            p.width = p.count;
+            if (rel.plan != none and plans.items[rel.plan].correlated) p.correlated = true;
+            return id;
+        }
+
         /// The first item of the innermost parenthesized join operand that
         /// contains item `k` after its start (0: the whole FROM list).
         fn enclosingGroup(q: *const Ast.Select, k: usize) usize {
@@ -4997,13 +5140,24 @@ pub fn Binder(comptime config: types.Config) type {
             const plans = plansOf(context);
             const id = try plans.add();
             var scope: Scope = .{ .parent = parent, .plan = id, .ctes = env, .window_defs=q.window_defs };
-            for (q.items[0..q.item_count]) |*item| if (item.group_end != none or item.lateral) {
+            for (q.items[0..q.item_count]) |*item| if (item.group_end != none or item.lateral or item.function != none) {
                 plans.items[id].general_join = true;
             };
             for (q.items[0..q.item_count], 0..) |*item, index| {
                 var rel: Relation = .{};
                 var source: Source = .{ .join = item.join, .group_end = item.group_end };
-                if (item.query != none and item.lateral) {
+                if (item.function != none) {
+                    // A function in FROM is implicitly LATERAL (B11).
+                    const saved = scope.rel_first;
+                    scope.rel_first = enclosingGroup(q, index);
+                    const child = bindTableFunction(context, &scope, item, env);
+                    scope.rel_first = saved;
+                    rel.plan = try child;
+                    source.plan = rel.plan;
+                    rel.name = toName(context, item.name);
+                    source.lateral = plans.items[rel.plan].correlated;
+                    if (source.lateral and (item.join == .right or item.join == .full)) return error.InvalidColumnReference;
+                } else if (item.query != none and item.lateral) {
                     // LATERAL (B11): the items before it (in its own join
                     // operand) are the derived table's parent scope; outer
                     // references mark this plan through markCorrelated.
@@ -5043,6 +5197,7 @@ pub fn Binder(comptime config: types.Config) type {
                     source.table = table;
                 }
                 if (item.alias) |alias| rel.name = toName(context, alias);
+                if (item.column_aliases != none) try applyColumnAliases(context, item, &rel, &source);
                 scope.rels[index] = rel;
                 scope.rel_count = index + 1;
                 plans.items[id].sources[index] = source;
@@ -5532,7 +5687,7 @@ pub fn Binder(comptime config: types.Config) type {
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
             // B11 composition plans keep every output (no demand pruning).
-            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none;
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none or p.function!=none;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
             var cte_references:[config.ctes]usize=@splat(0);

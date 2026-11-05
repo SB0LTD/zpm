@@ -2403,7 +2403,6 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeWord("LATERAL")) {
                 item.lateral = true;
                 self.pool.complex = true;
-                if (!self.isSymbol(.lparen)) return error.Syntax;
             }
             if (self.mode == .standard and try self.takeSymbol(.lparen)) {
                 if (!self.queryWord()) {
@@ -2420,9 +2419,35 @@ pub fn Parser(comptime config: types.Config) type {
                     item.schema = item.name;
                     item.name = try self.identifier();
                 }
-                if (self.mode == .standard and !item.only) _ = try self.takeSymbol(.star);
+                // A function call in FROM (B11), implicitly LATERAL, with
+                // optional WITH ORDINALITY.
+                if (self.mode == .standard and !item.only and self.isSymbol(.lparen)) {
+                    item.function = try self.functionCall(item.name);
+                    self.pool.complex = true;
+                    if (self.isWord("WITH") and wordIs(self.source, try self.peek(), "ordinality")) {
+                        try self.advance();
+                        try self.advance();
+                        item.ordinality = true;
+                    }
+                } else {
+                    if (item.lateral) return error.Syntax;
+                    if (self.mode == .standard and !item.only) _ = try self.takeSymbol(.star);
+                }
             }
             item.alias = try self.bareAlias();
+            // `alias (column, ...)`: column aliases (B11).
+            if (self.mode == .standard and item.alias != null and self.isSymbol(.lparen)) {
+                try self.advance();
+                var last: u16 = none;
+                while (true) {
+                    const node = try self.pool.add(.{ .kind = .column, .name = try self.identifier() });
+                    if (last == none) item.column_aliases = node else self.pool.nodes[last].next = node;
+                    last = node;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
+            }
             out.items[out.item_count] = item;
             out.item_count += 1;
         }

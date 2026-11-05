@@ -560,6 +560,65 @@ fn lateralJoins() !void {
     try controlled("SELECT a.id,x.id FROM tdd_a a CROSS JOIN LATERAL (SELECT b.id FROM tdd_b b WHERE b.id>=a.id ORDER BY b.id LIMIT 2) x ORDER BY a.id,x.id", "1|1;1|3;2|3;2|5;3|3;3|5;4|5");
 }
 
+// ---- PG.QUERY.TABLE_FUNCTION ----------------------------------------------
+
+fn tableFunctions() !void {
+    // oracle
+    try expectTyped("SELECT x,n FROM GENERATE_SERIES(1,3) WITH ORDINALITY AS t(x,n) ORDER BY n", "x:23,n:20", "1|1;2|2;3|3");
+    // Names: the function, a table alias, ORDINALITY, column aliases.
+    try expectTyped("SELECT * FROM generate_series(1,3)", "generate_series:23", "1;2;3");
+    try expectTyped("SELECT * FROM generate_series(1,3) g", "g:23", "1;2;3");
+    try expectTyped("SELECT * FROM generate_series(1,2) WITH ORDINALITY", "generate_series:23,ordinality:20", "1|1;2|2");
+    try expectTyped("SELECT g.* FROM generate_series(5,1,-2) AS g(v)", "v:23", "5;3;1");
+    // Steps, empty ranges, NULL arguments and integer overflow.
+    try expect("SELECT * FROM generate_series(1,10,4)", "1;5;9");
+    try expect("SELECT * FROM generate_series(3,1)", "");
+    try expect("SELECT * FROM generate_series(1,1)", "1");
+    try expect("SELECT COUNT(*) FROM generate_series(1,NULL)", "0");
+    try expect("SELECT COUNT(*) FROM generate_series(NULL::int,3)", "0");
+    try expect("SELECT * FROM generate_series(2147483646,2147483647)", "2147483646;2147483647");
+    try expect("SELECT * FROM generate_series(-2147483647,-2147483648,-1)", "-2147483647;-2147483648");
+    try expect("SELECT * FROM generate_series(9223372036854775806,9223372036854775807)", "9223372036854775806;9223372036854775807");
+    // int8, numeric and timestamp series.
+    try expectTyped("SELECT * FROM generate_series(1,3::bigint)", "generate_series:20", "1;2;3");
+    try expectTyped("SELECT * FROM generate_series(4294967296,4294967298)", "generate_series:20", "4294967296;4294967297;4294967298");
+    try expectTyped("SELECT * FROM generate_series(0.5,2)", "generate_series:1700", "0.5;1.5");
+    try expect("SELECT * FROM generate_series(1,2,0.5)", "1;1.5;2.0");
+    try expectTyped("SELECT * FROM generate_series('2024-01-01'::timestamp,'2024-01-03','1 day')", "generate_series:1114", "2024-01-01 00:00:00;2024-01-02 00:00:00;2024-01-03 00:00:00");
+    try expect("SELECT * FROM generate_series('2024-01-03'::timestamp,'2024-01-01','-1 day')", "2024-01-03 00:00:00;2024-01-02 00:00:00;2024-01-01 00:00:00");
+    // Implicitly LATERAL: arguments see the items before the function.
+    try expect("SELECT a.id,s FROM tdd_a a, generate_series(1,a.g) s ORDER BY a.id,s", "1|1;2|1;3|1;3|2;4|1;4|2");
+    try expect("SELECT a.id,s.n FROM tdd_a a CROSS JOIN LATERAL generate_series(a.id,2) WITH ORDINALITY AS s(v,n) ORDER BY a.id,s.n", "1|1;1|2;2|1");
+    try expect("SELECT a.id,s FROM tdd_a a LEFT JOIN generate_series(1,a.v/10-1) s ON true ORDER BY a.id,s", "1|NULL;2|1;3|1;3|2;4|NULL");
+    try expect("SELECT SUM(s) FROM tdd_a a, generate_series(a.id,a.id+1) s", "24");
+    // Scalar functions in FROM yield one row.
+    try expectTyped("SELECT * FROM upper('ab') AS u", "u:25", "AB");
+    try expectTyped("SELECT * FROM abs(-3) WITH ORDINALITY", "abs:23,ordinality:20", "3|1");
+    // Column aliases on tables, derived tables and CTEs.
+    try expectTyped("SELECT * FROM tdd_b AS b(i,w) WHERE i=3", "i:23,w:23", "3|33");
+    try expectTyped("SELECT p,v FROM tdd_a AS a(p) WHERE p=2", "p:23,v:23", "2|20");
+    try expectTyped("SELECT * FROM (VALUES (1,'a')) v(n,s)", "n:23,s:25", "1|a");
+    try expect("WITH w AS (SELECT 1 AS q) SELECT z FROM w AS c(z)", "1");
+    // Errors.
+    try rejects("SELECT * FROM generate_series(1,3,0)", error.InvalidParameterValue);
+    try rejects("SELECT * FROM generate_series(1.0,3,0)", error.InvalidParameterValue);
+    try rejects("SELECT * FROM generate_series('NaN'::numeric,3)", error.InvalidParameterValue);
+    try rejects("SELECT * FROM generate_series('2024-01-01'::timestamp,'2024-01-02','0 days')", error.InvalidParameterValue);
+    try rejects("SELECT * FROM generate_series('1','3')", error.AmbiguousFunction);
+    try rejects("SELECT * FROM generate_series(1)", error.UndefinedFunction);
+    try rejects("SELECT * FROM generate_series(1,2,3,4)", error.UndefinedFunction);
+    try rejects("SELECT * FROM generate_series(true,false)", error.UndefinedFunction);
+    try rejects("SELECT * FROM generate_series(1,'x')", error.InvalidTextRepresentation);
+    try rejects("SELECT * FROM generate_series(1,COUNT(*))", error.GroupingError);
+    try rejects("SELECT * FROM generate_series(1,2) AS t(a,b)", error.InvalidColumnReference);
+    try rejects("SELECT * FROM tdd_b AS b(i,w,z)", error.InvalidColumnReference);
+    try rejects("SELECT * FROM tdd_a a RIGHT JOIN generate_series(1,a.g) s ON true", error.InvalidColumnReference);
+    try rejects("SELECT * FROM no_such_function(1)", error.UndefinedFunction);
+    // A long series exhausts the statement workspace (54000).
+    try rejects("SELECT COUNT(*) FROM generate_series(1,1000000)", error.WorkspaceCapacity);
+    try controlled("SELECT x,n FROM GENERATE_SERIES(1,3) WITH ORDINALITY AS t(x,n) ORDER BY n", "1|1;2|2;3|3");
+}
+
 pub fn main(init: std.process.Init) !void {
     try baseFixture();
     try naturalJoins();
@@ -571,6 +630,7 @@ pub fn main(init: std.process.Init) !void {
     try groupingCube();
     try cteMaterialization();
     try lateralJoins();
+    try tableFunctions();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-query-composition\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

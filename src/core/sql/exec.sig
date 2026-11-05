@@ -247,7 +247,76 @@ pub fn Exec(comptime config: types.Config) type {
                 if(p.limit==0) {try self.session.checkpoint();return .{};}
                 if (p.set_op != .none) return self.setOperation(p, outer);
                 if (p.values != none) return self.valuesRows(p, outer);
+                if (p.function != none) return self.tableFunction(p, outer);
                 return self.core(p, outer);
+            }
+
+            /// A function in FROM (B11). generate_series follows PostgreSQL:
+            /// a NULL argument yields no rows, a zero step is 22023, integer
+            /// series stop at the type's overflow, numeric NaN / infinite
+            /// bounds or steps are 22023. Rows count against the workspace
+            /// (54000) and every row passes a work checkpoint. Any other
+            /// function yields one row. ORDINALITY numbers rows from 1.
+            fn tableFunction(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                var ctx = self.context(outer);
+                var out: List = .{ .start = @intCast(self.work.ref_low) };
+                if (p.series == .none) {
+                    const at = try self.cells(p.width);
+                    self.work.cells[at] = try E.eval(&ctx, p.function);
+                    if (p.ordinality) self.work.cells[at + 1] = .{ .integer = 1 };
+                    try self.push(&out, at);
+                    return self.finish(p, out);
+                }
+                var args: [3]V.Cell = undefined;
+                var count: usize = 0;
+                var arg = self.pool.nodes[p.function].b;
+                while (arg != none) : (arg = self.pool.nodes[arg].next) {
+                    if (count == 3) return error.UndefinedFunction;
+                    args[count] = try E.eval(&ctx, arg);
+                    count += 1;
+                }
+                for (args[0..count]) |cell| if (cell == .null_value) return self.finish(p, out);
+                const ty = p.tys[0];
+                var one: numeric_module.Numeric = .{};
+                one.setCoef(1);
+                const step: V.Cell = if (count == 3) args[2] else if (p.series == .numeric) .{ .numeric = one } else .{ .integer = 1 };
+                var direction: i8 = 0;
+                switch (p.series) {
+                    .integer => direction = if (step.integer > 0) 1 else if (step.integer < 0) -1 else 0,
+                    .numeric => {
+                        for ([_]*const V.Cell{ &args[0], &args[1], &step }) |cell| {
+                            if (cell.numeric.special != .finite) return error.InvalidParameterValue;
+                        }
+                        direction = if (step.numeric.isZero()) 0 else if (step.numeric.negative) -1 else 1;
+                    },
+                    .timestamp => {
+                        const zero: V.Cell = .{ .interval = .{} };
+                        direction = V.compare(&step, &zero);
+                    },
+                    .none => unreachable,
+                }
+                if (direction == 0) return error.InvalidParameterValue;
+                var current = args[0];
+                var ordinal: i64 = 0;
+                while (true) {
+                    const order = V.compare(&current, &args[1]);
+                    if ((direction > 0 and order > 0) or (direction < 0 and order < 0)) break;
+                    const at = try self.cells(p.width);
+                    self.work.cells[at] = current;
+                    ordinal += 1;
+                    if (p.ordinality) self.work.cells[at + 1] = .{ .integer = ordinal };
+                    try self.push(&out, at);
+                    switch (p.series) {
+                        .integer => {
+                            const next = @addWithOverflow(current.integer, step.integer);
+                            if (next[1] != 0) break;
+                            if (ty == .int4 and (next[0] > 2147483647 or next[0] < -2147483648)) break;
+                            current = .{ .integer = next[0] };
+                        },
+                        else => current = try Io.arithmetic(.add, &current, &step, ty, self.session),
+                    }
+                }
+                return self.finish(p, out);
             }
 
             /// Evaluates non-constant LIMIT / OFFSET expressions once for this
