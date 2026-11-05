@@ -2721,9 +2721,8 @@ pub fn Binder(comptime config: types.Config) type {
                         if (constraint.deferrable) return error.WrongObjectType;
                         break :blk .{ .constraint = position };
                     }
-                    for (entry.indexes[0..entry.index_count], 0..) |*candidate, which| {
-                        if (types.same(wanted.slice(), candidate.name.slice()) and candidate.unique) break :blk .{ .index = which };
-                    }
+                    // A plain unique index is not a constraint: PostgreSQL
+                    // resolves ON CONSTRAINT through pg_constraint only (42704).
                     return error.UndefinedObject;
                 };
             } else if (conflict.column_count != 0) {
@@ -3846,11 +3845,14 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// INSERT ... SELECT: untyped output literals take the target column
         /// type (PostgreSQL does not resolve unknowns in an INSERT's SELECT).
-        fn bindInsertQuery(context: *const Context, entry: *const S.Table, query_index: u16, out: *Insert, overriding: ast.Overriding) Error!void {
+        fn bindInsertQuery(context: *const Context, entry: *const S.Table, query_index: u16, out: *Insert, overriding: ast.Overriding, explicit_columns: bool) Error!void {
             const plans = context.plans orelse return error.UnsupportedStatement;
             if (!context.nested_dml) plans.reset();
             const root = try bindPlan(context, query_index, null, null, true);
             const p = &plans.items[root];
+            // Without a column list a narrower SELECT fills the first N
+            // columns (the mapping is the identity); the rest take defaults.
+            if (!explicit_columns and p.count >= 1 and p.count < out.count) out.count = p.count;
             if (p.count != out.count) return error.Syntax;
             for (0..p.count) |position| if (p.tys[position] == .unknown) {
                 try castColumn(context, root, position, types.typeOfData(entry.columns[out.mapping[position]].data_type));
@@ -6358,12 +6360,19 @@ pub fn Binder(comptime config: types.Config) type {
                     } else {
                         count = entry.column_count;
                         for (0..count) |column| mapping[column] = column;
+                        // Without a column list PostgreSQL targets the first N
+                        // columns of a shorter VALUES row; the rest take their
+                        // defaults. Rows of different lengths stay 42601.
+                        if (insert.source == .values and insert.rows != none) {
+                            const first = context.node(insert.rows).integer;
+                            if (first >= 1 and first < @as(i64, @intCast(count))) count = @intCast(first);
+                        }
                     }
                     var out: Insert = .{ .table = index, .count = count, .rows = insert.rows, .row_count = insert.row_count };
                     for (0..count) |position| out.mapping[position] = @intCast(mapping[position]);
                     switch (insert.source) {
                         .values => try bindValues(context, entry, &out, insert.overriding),
-                        .query => try bindInsertQuery(context, entry, insert.query, &out, insert.overriding),
+                        .query => try bindInsertQuery(context, entry, insert.query, &out, insert.overriding, insert.explicit_columns),
                         .default_values => if (insert.explicit_columns) return error.Syntax,
                     }
                     const needed = insertedDefaults(context, &out);
