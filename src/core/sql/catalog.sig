@@ -10,7 +10,8 @@
 //!   cat_attrdef    (adrelid, adnum, adbin)                       tables x columns (empty until defaults)
 //!   cat_sequences  (seqrelid, start, increment, max, min, cycle)  sequences
 //!                  (values are non-transactional and live in the sequence slots)
-//!   cat_namespaces pg_catalog (11), public (2200), information_schema: static;
+//!   cat_namespaces pg_catalog (11), public (2200), information_schema,
+//!                  pg_toast (99): static;
 //!                  user schemas are cat_relations rows of relkind 'n'
 //!                  (Config.schemas slots) and tables carry their namespace
 //!
@@ -33,11 +34,15 @@ pub const namespaces = [_]Namespace{
     .{ .oid = 11, .name = "pg_catalog" },
     .{ .oid = 2200, .name = "public" },
     .{ .oid = 13000, .name = "information_schema" },
+    // TOAST relations live here in PostgreSQL; ZPM stores no TOAST tables,
+    // so the schema is always empty and closed to user objects.
+    .{ .oid = 99, .name = "pg_toast" },
 };
 
 pub const public_namespace: u32 = 2200;
 pub const catalog_namespace: u32 = 11;
 pub const information_namespace: u32 = 13000;
+pub const toast_namespace: u32 = 99;
 
 /// System views (design §4.10): virtual relations computed at scan time from
 /// the catalog base relations, the table definitions and the static type

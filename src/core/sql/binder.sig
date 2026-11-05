@@ -6993,7 +6993,7 @@ pub fn Binder(comptime config: types.Config) type {
                     const table_name = toName(context, create.name);
                     const namespace = try qualifierNamespace(context, create.schema);
                     // pg_catalog / information_schema are not writable here.
-                    if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace) return error.UnsupportedStatement;
+                    if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
                     if (context.catalog.findIn(namespace, table_name.slice(), context.snapshot) != null) {
                         if (create.if_not_exists) return .{ .noop = .create_table };
                         return error.TableExists;
@@ -8048,7 +8048,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn bindCreateView(context: *const Context, create: *const Ast.CreateView) Error!Bound {
             const name = toName(context, create.name.name);
             const namespace = try qualifierNamespace(context, create.name.schema);
-            if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace) return error.UnsupportedStatement;
+            if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
             const tag: types.CommandTag = if (create.materialized) .create_materialized_view else .create_view;
             if (relationNameTaken(context, namespace, name.slice())) {
                 if (create.if_not_exists) return .{ .noop = tag };
