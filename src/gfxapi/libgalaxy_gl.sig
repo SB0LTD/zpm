@@ -223,127 +223,164 @@ pub export fn eglGetError() callconv(.c) i32 {
     return egl.getError();
 }
 pub export fn eglGetDisplay(native: ?*anyopaque) callconv(.c) ?*anyopaque {
+    egl.calling("eglGetDisplay");
     return h(egl.getDisplay(native));
 }
 pub export fn eglGetPlatformDisplay(platform: u32, native: ?*anyopaque, attribs: ?[*]const isize) callconv(.c) ?*anyopaque {
+    egl.calling("eglGetPlatformDisplay");
     _ = attribs;
     return h(egl.getPlatformDisplay(platform, native));
 }
 pub export fn eglGetPlatformDisplayEXT(platform: u32, native: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglGetPlatformDisplayEXT");
     _ = attribs;
     return h(egl.getPlatformDisplay(platform, native));
 }
 pub export fn eglInitialize(dpy: ?*anyopaque, major: ?*i32, minor: ?*i32) callconv(.c) u32 {
+    egl.calling("eglInitialize");
     return b(egl.initialize(dpy, major, minor));
 }
 pub export fn eglTerminate(dpy: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglTerminate");
     return b(egl.terminate(dpy));
 }
 pub export fn eglQueryString(dpy: ?*anyopaque, name: i32) callconv(.c) ?[*:0]const u8 {
+    egl.calling("eglQueryString");
     return egl.queryString(dpy, name);
 }
 pub export fn eglGetConfigs(dpy: ?*anyopaque, configs: ?[*]?*const anyopaque, size: i32, num: ?*i32) callconv(.c) u32 {
+    egl.calling("eglGetConfigs");
     return b(egl.getConfigs(dpy, configs, size, num));
 }
 pub export fn eglChooseConfig(dpy: ?*anyopaque, attribs: ?[*]const i32, configs: ?[*]?*const anyopaque, size: i32, num: ?*i32) callconv(.c) u32 {
+    egl.calling("eglChooseConfig");
     return b(egl.chooseConfig(dpy, attribs, configs, size, num));
 }
 pub export fn eglGetConfigAttrib(dpy: ?*anyopaque, config: ?*const anyopaque, attribute: i32, value: ?*i32) callconv(.c) u32 {
+    egl.calling("eglGetConfigAttrib");
     return b(egl.getConfigAttrib(dpy, config, attribute, value));
 }
 pub export fn eglCreateWindowSurface(dpy: ?*anyopaque, config: ?*const anyopaque, win: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreateWindowSurface");
     return h(egl.createWindowSurface(i32, dpy, config, win, attribs));
 }
 pub export fn eglCreatePlatformWindowSurface(dpy: ?*anyopaque, config: ?*const anyopaque, win: ?*anyopaque, attribs: ?[*]const isize) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreatePlatformWindowSurface");
     return h(egl.createWindowSurface(isize, dpy, config, win, attribs));
 }
 pub export fn eglCreatePlatformWindowSurfaceEXT(dpy: ?*anyopaque, config: ?*const anyopaque, win: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreatePlatformWindowSurfaceEXT");
     return h(egl.createWindowSurface(i32, dpy, config, win, attribs));
 }
 pub export fn eglCreatePbufferSurface(dpy: ?*anyopaque, config: ?*const anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreatePbufferSurface");
     return h(egl.createPbufferSurface(dpy, config, attribs));
 }
 pub export fn eglCreatePixmapSurface(dpy: ?*anyopaque, config: ?*const anyopaque, pixmap: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreatePixmapSurface");
     _ = .{ dpy, config, pixmap, attribs };
     egl.noSuch(egl.BAD_NATIVE_PIXMAP);
     return null;
 }
 pub export fn eglCreatePlatformPixmapSurface(dpy: ?*anyopaque, config: ?*const anyopaque, pixmap: ?*anyopaque, attribs: ?[*]const isize) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreatePlatformPixmapSurface");
     _ = .{ dpy, config, pixmap, attribs };
     egl.noSuch(egl.BAD_NATIVE_PIXMAP);
     return null;
 }
 pub export fn eglCreatePbufferFromClientBuffer(dpy: ?*anyopaque, buftype: u32, buffer: ?*anyopaque, config: ?*const anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreatePbufferFromClientBuffer");
     _ = .{ dpy, buftype, buffer, config, attribs };
     egl.noSuch(egl.BAD_PARAMETER);
     return null;
 }
 pub export fn eglDestroySurface(dpy: ?*anyopaque, surface: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglDestroySurface");
     return b(egl.destroySurface(dpy, surface));
 }
 pub export fn eglQuerySurface(dpy: ?*anyopaque, surface: ?*anyopaque, attribute: i32, value: ?*i32) callconv(.c) u32 {
+    egl.calling("eglQuerySurface");
     return b(egl.querySurface(dpy, surface, attribute, value));
 }
 pub export fn eglSurfaceAttrib(dpy: ?*anyopaque, surface: ?*anyopaque, attribute: i32, value: i32) callconv(.c) u32 {
+    egl.calling("eglSurfaceAttrib");
     return b(egl.surfaceAttrib(dpy, surface, attribute, value));
 }
 pub export fn eglBindTexImage(dpy: ?*anyopaque, surface: ?*anyopaque, buffer: i32) callconv(.c) u32 {
+    egl.calling("eglBindTexImage");
     _ = .{ dpy, surface, buffer };
     egl.noSuch(egl.BAD_MATCH);
     return 0;
 }
 pub export fn eglReleaseTexImage(dpy: ?*anyopaque, surface: ?*anyopaque, buffer: i32) callconv(.c) u32 {
+    egl.calling("eglReleaseTexImage");
     _ = .{ dpy, surface, buffer };
     egl.noSuch(egl.BAD_MATCH);
     return 0;
 }
 pub export fn eglSwapInterval(dpy: ?*anyopaque, interval: i32) callconv(.c) u32 {
+    egl.calling("eglSwapInterval");
     return b(egl.swapInterval(dpy, interval));
 }
 pub export fn eglBindAPI(api: u32) callconv(.c) u32 {
+    egl.calling("eglBindAPI");
     return b(egl.bindApi(api));
 }
 pub export fn eglQueryAPI() callconv(.c) u32 {
+    egl.calling("eglQueryAPI");
     return egl.queryApi();
 }
 pub export fn eglWaitClient() callconv(.c) u32 {
+    egl.calling("eglWaitClient");
     return b(egl.waitClient());
 }
 pub export fn eglWaitGL() callconv(.c) u32 {
+    egl.calling("eglWaitGL");
     return b(egl.waitClient());
 }
 pub export fn eglWaitNative(engine_id: i32) callconv(.c) u32 {
+    egl.calling("eglWaitNative");
     _ = engine_id;
     return 1;
 }
 pub export fn eglReleaseThread() callconv(.c) u32 {
+    egl.calling("eglReleaseThread");
     return b(egl.releaseThread());
 }
 pub export fn eglCreateContext(dpy: ?*anyopaque, config: ?*const anyopaque, share: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreateContext");
     return h(egl.createContext(dpy, config, share, attribs));
 }
 pub export fn eglDestroyContext(dpy: ?*anyopaque, ctx: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglDestroyContext");
     return b(egl.destroyContext(dpy, ctx));
 }
 pub export fn eglMakeCurrent(dpy: ?*anyopaque, draw: ?*anyopaque, read: ?*anyopaque, ctx: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglMakeCurrent");
     return b(egl.makeCurrent(dpy, draw, read, ctx));
 }
 pub export fn eglGetCurrentContext() callconv(.c) ?*anyopaque {
+    egl.calling("eglGetCurrentContext");
     return egl.getCurrentContext();
 }
 pub export fn eglGetCurrentSurface(readdraw: i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglGetCurrentSurface");
     return egl.getCurrentSurface(readdraw);
 }
 pub export fn eglGetCurrentDisplay() callconv(.c) ?*anyopaque {
+    egl.calling("eglGetCurrentDisplay");
     return egl.getCurrentDisplay();
 }
 pub export fn eglQueryContext(dpy: ?*anyopaque, ctx: ?*anyopaque, attribute: i32, value: ?*i32) callconv(.c) u32 {
+    egl.calling("eglQueryContext");
     return b(egl.queryContext(dpy, ctx, attribute, value));
 }
 pub export fn eglSwapBuffers(dpy: ?*anyopaque, surface: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglSwapBuffers");
     return b(egl.swapBuffers(dpy, surface, &.{}));
 }
 pub export fn eglSwapBuffersWithDamageKHR(dpy: ?*anyopaque, surface: ?*anyopaque, rects: ?[*]const i32, n: i32) callconv(.c) u32 {
+    egl.calling("eglSwapBuffersWithDamageKHR");
     if (n < 0) {
         egl.noSuch(egl.BAD_PARAMETER);
         return 0;
@@ -352,67 +389,106 @@ pub export fn eglSwapBuffersWithDamageKHR(dpy: ?*anyopaque, surface: ?*anyopaque
     return b(egl.swapBuffers(dpy, surface, list));
 }
 pub export fn eglSwapBuffersWithDamageEXT(dpy: ?*anyopaque, surface: ?*anyopaque, rects: ?[*]const i32, n: i32) callconv(.c) u32 {
+    egl.calling("eglSwapBuffersWithDamageEXT");
     return eglSwapBuffersWithDamageKHR(dpy, surface, rects, n);
 }
 pub export fn eglCopyBuffers(dpy: ?*anyopaque, surface: ?*anyopaque, target: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglCopyBuffers");
     _ = .{ dpy, surface, target };
     egl.noSuch(egl.BAD_NATIVE_PIXMAP);
     return 0;
 }
 pub export fn eglCreateSync(dpy: ?*anyopaque, ty: u32, attribs: ?[*]const isize) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreateSync");
     return h(egl.createSync(isize, dpy, ty, attribs));
 }
 pub export fn eglCreateSyncKHR(dpy: ?*anyopaque, ty: u32, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreateSyncKHR");
     return h(egl.createSync(i32, dpy, ty, attribs));
 }
 pub export fn eglDestroySync(dpy: ?*anyopaque, sync: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglDestroySync");
     return b(egl.destroySync(dpy, sync));
 }
 pub export fn eglDestroySyncKHR(dpy: ?*anyopaque, sync: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglDestroySyncKHR");
     return b(egl.destroySync(dpy, sync));
 }
 pub export fn eglClientWaitSync(dpy: ?*anyopaque, sync: ?*anyopaque, flags: i32, timeout: u64) callconv(.c) i32 {
+    egl.calling("eglClientWaitSync");
     return egl.clientWaitSync(dpy, sync, flags, timeout);
 }
 pub export fn eglClientWaitSyncKHR(dpy: ?*anyopaque, sync: ?*anyopaque, flags: i32, timeout: u64) callconv(.c) i32 {
+    egl.calling("eglClientWaitSyncKHR");
     return egl.clientWaitSync(dpy, sync, flags, timeout);
 }
 pub export fn eglWaitSync(dpy: ?*anyopaque, sync: ?*anyopaque, flags: i32) callconv(.c) u32 {
+    egl.calling("eglWaitSync");
     return b(egl.waitSync(dpy, sync, flags));
 }
 pub export fn eglWaitSyncKHR(dpy: ?*anyopaque, sync: ?*anyopaque, flags: i32) callconv(.c) i32 {
+    egl.calling("eglWaitSyncKHR");
     return @intCast(b(egl.waitSync(dpy, sync, flags)));
 }
 pub export fn eglGetSyncAttrib(dpy: ?*anyopaque, sync: ?*anyopaque, attribute: i32, value: ?*isize) callconv(.c) u32 {
+    egl.calling("eglGetSyncAttrib");
     const v = egl.getSyncAttrib(dpy, sync, attribute) orelse return 0;
     if (value) |p| p.* = v;
     return 1;
 }
 pub export fn eglGetSyncAttribKHR(dpy: ?*anyopaque, sync: ?*anyopaque, attribute: i32, value: ?*i32) callconv(.c) u32 {
+    egl.calling("eglGetSyncAttribKHR");
     const v = egl.getSyncAttrib(dpy, sync, attribute) orelse return 0;
     if (value) |p| p.* = v;
     return 1;
 }
 pub export fn eglCreateImage(dpy: ?*anyopaque, ctx: ?*anyopaque, target: u32, buffer: ?*anyopaque, attribs: ?[*]const isize) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreateImage");
     return h(egl.createImage(isize, dpy, ctx, target, buffer, attribs));
 }
 pub export fn eglCreateImageKHR(dpy: ?*anyopaque, ctx: ?*anyopaque, target: u32, buffer: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreateImageKHR");
     return h(egl.createImage(i32, dpy, ctx, target, buffer, attribs));
 }
 pub export fn eglDestroyImage(dpy: ?*anyopaque, image: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglDestroyImage");
     return b(egl.destroyImage(dpy, image));
 }
 pub export fn eglDestroyImageKHR(dpy: ?*anyopaque, image: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglDestroyImageKHR");
     return b(egl.destroyImage(dpy, image));
 }
 pub export fn eglQueryDmaBufFormatsEXT(dpy: ?*anyopaque, max: i32, formats: ?[*]i32, num: ?*i32) callconv(.c) u32 {
+    egl.calling("eglQueryDmaBufFormatsEXT");
     return b(egl.queryDmaBufFormats(dpy, max, formats, num));
 }
 pub export fn eglQueryDmaBufModifiersEXT(dpy: ?*anyopaque, format: i32, max: i32, modifiers: ?[*]u64, external_only: ?[*]u32, num: ?*i32) callconv(.c) u32 {
+    egl.calling("eglQueryDmaBufModifiersEXT");
     return b(egl.queryDmaBufModifiers(dpy, format, max, modifiers, external_only, num));
 }
 pub export fn eglDupNativeFenceFDANDROID(dpy: ?*anyopaque, sync: ?*anyopaque) callconv(.c) i32 {
+    egl.calling("eglDupNativeFenceFDANDROID");
     return egl.dupNativeFenceFd(dpy, sync);
+}
+pub export fn eglQueryDevicesEXT(max: i32, devices: ?[*]?*anyopaque, num: ?*i32) callconv(.c) u32 {
+    egl.calling("eglQueryDevicesEXT");
+    return b(egl.queryDevices(max, devices, num));
+}
+pub export fn eglQueryDeviceStringEXT(dev: ?*anyopaque, name: i32) callconv(.c) ?[*:0]const u8 {
+    egl.calling("eglQueryDeviceStringEXT");
+    return egl.queryDeviceString(dev, name);
+}
+pub export fn eglQueryDeviceAttribEXT(dev: ?*anyopaque, attribute: i32, value: ?*isize) callconv(.c) u32 {
+    egl.calling("eglQueryDeviceAttribEXT");
+    return b(egl.queryDeviceAttrib(dev, attribute, value));
+}
+pub export fn eglQueryDisplayAttribEXT(dpy: ?*anyopaque, attribute: i32, value: ?*isize) callconv(.c) u32 {
+    egl.calling("eglQueryDisplayAttribEXT");
+    return b(egl.queryDisplayAttrib(dpy, attribute, value));
+}
+pub export fn eglQueryDisplayAttribKHR(dpy: ?*anyopaque, attribute: i32, value: ?*isize) callconv(.c) u32 {
+    egl.calling("eglQueryDisplayAttribKHR");
+    return b(egl.queryDisplayAttrib(dpy, attribute, value));
 }
 pub export fn eglGetProcAddress(name: ?[*:0]const u8) callconv(.c) ?*const anyopaque {
     const n = name orelse return null;

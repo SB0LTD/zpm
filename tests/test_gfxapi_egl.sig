@@ -568,6 +568,72 @@ test "egl: a Wayland window's frames go to the compositor as dma-bufs" {
     try std.testing.expectEqual(@as(u32, 0), Fake.queues);
 }
 
+/// Firefox's WebRender start on Wayland, as gfx/gl does it
+/// (GLContextProviderEGL: CreateConfig, CreateSurfaceFromNativeWindow,
+/// CreateGLContext with the robustness attributes first, GLContext::Init),
+/// then its teardown when something fails (the context destroyed while
+/// current, the display's last reference terminating it) and the second
+/// try on the same wl_display.
+fn firefoxStart() !struct { d: *egl.Display, s: *egl.Surface, c: *egl.Context } {
+    const d = egl.getDisplay(native_display) orelse return error.NoDisplay;
+    if (!egl.initialize(d, null, null)) return error.Initialize;
+    if (!egl.bindApi(egl.OPENGL_ES_API)) return error.BindApi;
+    // CreateConfig(32 bpp): RGBA 8888, a window, ES2; NONE, 0, 0, 0
+    const attribs = [_]i32{ egl.SURFACE_TYPE, egl.WINDOW_BIT, egl.RED_SIZE, 8, egl.GREEN_SIZE, 8, egl.BLUE_SIZE, 8, egl.ALPHA_SIZE, 8, egl.RENDERABLE_TYPE, egl.OPENGL_ES2_BIT, egl.NONE, 0, 0, 0 };
+    var cfgs: [64]?*const anyopaque = undefined;
+    var n: i32 = 0;
+    if (!egl.chooseConfig(d, &attribs, &cfgs, 64, &n) or n < 1) return error.ChooseConfig;
+    var cfg: ?*const anyopaque = null;
+    for (cfgs[0..@intCast(n)]) |cf| {
+        var a: i32 = 0;
+        if (egl.getConfigAttrib(d, cf, egl.ALPHA_SIZE, &a) and a == 8) {
+            cfg = cf;
+            break;
+        }
+    }
+    const config_ = cfg orelse return error.NoRgba;
+    const s = egl.createWindowSurface(i32, d, config_, &window, null) orelse return error.WindowSurface;
+    // khr_rbab: ES 3, LOSE_CONTEXT_ON_RESET, the robust-access flag
+    const rbab = [_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY, egl.LOSE_CONTEXT_ON_RESET, egl.CONTEXT_FLAGS_KHR, 4, egl.NONE, 0, 0, 0 };
+    const c = egl.createContext(d, config_, null, &rbab) orelse return error.CreateContext;
+    // GLContext::InitImpl: current, then no GL error pending, and the strings
+    if (!egl.makeCurrent(d, s, s, c)) return error.MakeCurrent;
+    const g = thread.gl() orelse return error.NotCurrent;
+    if (g.getError() != gl.NO_ERROR) return error.PendingGlError;
+    if (g.getString(gl.VERSION) == null or g.getString(gl.SHADING_LANGUAGE_VERSION) == null) return error.NoStrings;
+    return .{ .d = d, .s = s, .c = c };
+}
+
+test "egl: Firefox's start on Wayland, its teardown while current, and its second try" {
+    useDriver();
+    world(64, 32);
+    const base = Fake.live();
+    const first = try firefoxStart();
+    // glxtest's device query: the display's device, its render node
+    var dev: isize = 0;
+    try std.testing.expect(egl.queryDisplayAttrib(first.d, egl.DEVICE_EXT, &dev));
+    const device: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(dev)));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(egl.queryDeviceString(device, egl.EXTENSIONS).?), "EGL_EXT_device_drm_render_node") != null);
+    try std.testing.expectEqualStrings("/dev/dri/renderD128", std.mem.span(egl.queryDeviceString(device, egl.DRM_RENDER_NODE_FILE_EXT).?));
+    try std.testing.expect(egl.queryDeviceString(device, egl.DRM_DEVICE_FILE_EXT) == null);
+    var ndev: i32 = 0;
+    try std.testing.expect(egl.queryDevices(0, null, &ndev));
+    try std.testing.expectEqual(@as(i32, 1), ndev);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(egl.queryString(null, egl.EXTENSIONS).?), "EGL_EXT_device_query") != null);
+    // the teardown after a failure: the context destroyed while still
+    // current, the surface, then eglTerminate (the display's last ref)
+    try std.testing.expect(egl.destroyContext(first.d, first.c));
+    try std.testing.expect(egl.destroySurface(first.d, first.s));
+    try std.testing.expect(egl.terminate(first.d));
+    // the second try: the same wl_display, a new EGL display reference
+    const second = try firefoxStart();
+    try std.testing.expect(egl.makeCurrent(second.d, null, null, null));
+    try std.testing.expect(egl.destroySurface(second.d, second.s));
+    try std.testing.expect(egl.destroyContext(second.d, second.c));
+    try std.testing.expect(egl.terminate(second.d));
+    try std.testing.expectEqual(base, Fake.live());
+}
+
 test "egl: an XRGB window reads back opaque, and is made XRGB8888" {
     useDriver();
     world(8, 8);

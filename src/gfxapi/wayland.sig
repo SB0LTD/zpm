@@ -468,6 +468,19 @@ pub const Window = struct {
         return true;
     }
 
+    /// The wl_egl_window let go now (eglDestroySurface of a surface still
+    /// current: its buffers stay until it is released, but the native
+    /// window may have a new surface at once, as Firefox's second try at
+    /// its compositor makes one). The window shows nothing more.
+    pub fn detach(w: *Window) void {
+        if (w.native) |n| {
+            n.driver_private = null;
+            n.resize_callback = null;
+            n.destroy_window_callback = null;
+        }
+        w.native = null;
+    }
+
     pub fn deinit(w: *Window) void {
         const c = w.d.c;
         if (w.frame_cb) |p| c.destroy(p);
