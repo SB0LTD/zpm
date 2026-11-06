@@ -6,9 +6,10 @@
 //! a Program is a Binary from kir_ir3 copied into a code buffer; `run`
 //! builds one A7xx PM4 stream for all its dispatches, as selftest.sig and
 //! lfm3_gpu.sig do: the compute setup once, then per dispatch the program
-//! (CP_LOAD_STATE6 of the code), the constants (binding addresses,
-//! parameters and group counts direct; the kernel's constant pool loaded by
-//! the CP from the code buffer), CP_EXEC_CS and a wait for idle, so each
+//! (CP_LOAD_STATE6 of the code), the constants in one direct load from c0
+//! (binding addresses, parameters and group counts, then the kernel's
+//! constant pool: never loaded by the CP from memory, which the Surface's
+//! Adreno got wrong), CP_EXEC_CS and a wait for idle, so each
 //! dispatch sees the one before's writes; the always-on counter before and
 //! after; a cache clean at the end. One submit, one fence. With `overlap`,
 //! a dispatch waits only where gpu.Hazards says it reads what those since
@@ -223,6 +224,24 @@ pub const Over = struct {
         o.raw.free(rawOf(p.code));
     }
 
+    /// Every constant of a dispatch, for one direct load from c0: binding
+    /// addresses, parameters and group counts, then the kernel's pool (from
+    /// the program's copy of its code, where load put it). The Surface's
+    /// X1-45 (11-06, the self-test's first case): with the pool loaded by
+    /// the CP from memory into c2.., the kernel's first load read its
+    /// binding address from c0.z:c0.w as 0xc000_0000_ffff, the pool's
+    /// third and fourth words (a fault at 0xc000_0000_ffc0), while
+    /// Galaxy's hand-written kernels, their constants all direct from c0,
+    /// pass. So nothing is loaded from memory into the constants.
+    fn constantsWithPool(cfg: kir_ir3.Config, buffers: []const u64, params: []const u32, groups: [3]u32, code: []const u8, out: []u32) Error![]u32 {
+        if (cfg.pool_words == 0) return cfg.constants(buffers, params, groups, out);
+        const n = @as(usize, cfg.pool) + cfg.pool_words;
+        if (n > out.len or cfg.pool_offset + 4 * @as(usize, cfg.pool_words) > code.len) return error.Unsupported;
+        _ = cfg.constants(buffers, params, groups, out);
+        for (0..cfg.pool_words) |i| out[cfg.pool + i] = std.mem.readInt(u32, code[cfg.pool_offset + 4 * i ..][0..4], .little);
+        return out[0..n];
+    }
+
     fn ensureBuffers(o: *Over) Error!void {
         if (o.ib == null) o.ib = o.raw.vtable.alloc(o.raw.ctx, STREAM_BYTES) orelse return error.OutOfMemory;
         if (o.ts == null) o.ts = o.raw.vtable.alloc(o.raw.ctx, 4096) orelse return error.OutOfMemory;
@@ -252,9 +271,8 @@ pub const Over = struct {
             var addrs: [64]u64 = undefined;
             if (d.buffers.len > addrs.len) return error.Unsupported;
             for (d.buffers, 0..) |b, i| addrs[i] = b.gpu;
-            const words = cfg.constants(addrs[0..d.buffers.len], d.params[0..bin.param_words], d.groups, &o.consts);
+            const words = try constantsWithPool(cfg, addrs[0..d.buffers.len], d.params[0..bin.param_words], d.groups, d.prog.code.cpu, &o.consts);
             s.constants(0, words);
-            if (cfg.pool_words > 0) s.constantsFrom(cfg.pool / 4, d.prog.code.gpu + cfg.pool_offset, (cfg.pool_words + 3) / 4);
             s.dispatch(&k, d.groups);
         }
         s.waitForIdle();
@@ -552,6 +570,52 @@ test "a kernel through the adapter: PM4, constants, the pool, cache maintenance"
     d.fromDevice(b, 0, b.bytes);
     for (b.words(), 0..) |x, n| try std.testing.expectEqual(@as(u32, @intCast(n * 7 + 0x12345)), x);
     try std.testing.expect(d.lastRunNs() > 0);
+}
+
+test "every constant in one direct load from c0, the pool too: none loaded by the CP from memory" {
+    Rig.emu.init(&Rig.arena, &Rig.view);
+    const d = Rig.emu.device();
+    var k = newKernel("pool", .{ 64, 1, 1 });
+    const out = k.binding();
+    const i = k.op2(.shl, .u32, kir.r(k.tid(0)), kir.u(2));
+    const v = k.op2(.iadd, .u32, kir.r(k.tid(0)), kir.u(0x12345));
+    k.store(.u32, kir.global(out, 32), kir.r(i), kir.r(v));
+    const p = try loadKernel(d, &k);
+    const cfg = kir_ir3.Config.fromExtra(p.bin.extra).?;
+    try std.testing.expect(cfg.pool_words > 0);
+    const b = try d.alloc(256, .host);
+    var buf: [4096]u32 = undefined;
+    var s = a7xx.Stream{ .buf = &buf };
+    try Rig.emu.adapter.build(&s, &.{.{ .prog = &p, .groups = .{ 1, 1, 1 }, .buffers = &.{b}, .params = &.{} }}, 0);
+    const w = s.words();
+    var loads: u32 = 0;
+    var at: usize = 0;
+    while (at < w.len) {
+        const h = w[at];
+        const n: usize = switch (h >> 28) {
+            4 => h & 0x7f,
+            7 => h & 0x3fff,
+            else => return error.TestUnexpectedResult,
+        };
+        if (h >> 28 == 7 and (h >> 16) & 0x7f == a7xx.CP_LOAD_STATE6_FRAG and (w[at + 1] >> 14) & 3 == a7xx.ST6_CONSTANTS) {
+            loads += 1;
+            const d0 = w[at + 1];
+            try std.testing.expectEqual(@as(u32, a7xx.SS6_DIRECT), (d0 >> 16) & 3);
+            try std.testing.expectEqual(@as(u32, 0), d0 & 0x3fff);
+            const data = w[at + 4 .. at + 1 + n];
+            // the binding's address at c0.x:c0.y, then the pool where the code reads it
+            try std.testing.expectEqual(@as(u32, @truncate(b.gpu)), data[0]);
+            try std.testing.expectEqual(@as(u32, @truncate(b.gpu >> 32)), data[1]);
+            for (0..cfg.pool_words) |j|
+                try std.testing.expectEqual(std.mem.readInt(u32, p.bin.code[cfg.pool_offset + 4 * j ..][0..4], .little), data[cfg.pool + j]);
+        }
+        at += 1 + n;
+    }
+    try std.testing.expectEqual(@as(u32, 1), loads);
+    // and it still runs
+    try runOne(d, &p, .{ 1, 1, 1 }, &.{b}, &.{});
+    d.fromDevice(b, 0, b.bytes);
+    for (b.words()[0..64], 0..) |x, n| try std.testing.expectEqual(@as(u32, @intCast(n + 0x12345)), x);
 }
 
 test "overlap: a wait only before a dispatch that reads what one before it wrote; without it, between every two" {

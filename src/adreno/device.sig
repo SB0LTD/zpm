@@ -546,13 +546,13 @@ pub const EmuDevice = struct {
                 if (st == a7xx.ST6_CONSTANTS) {
                     if (off * 4 + units * 4 > e.consts.len) return error.BadStream;
                     const dst = e.consts[off * 4 ..][0 .. units * 4];
-                    if (src == a7xx.SS6_DIRECT) {
-                        if (p.len < 3 + units * 4) return error.BadStream;
-                        @memcpy(dst, p[3..][0 .. units * 4]);
-                    } else {
-                        const from = e.words(@as(u64, p[2]) << 32 | p[1], units * 4) orelse return error.BadStream;
-                        @memcpy(dst, from);
-                    }
+                    // Only direct: the Surface's X1-45 put constants the CP
+                    // loaded from memory into c2.. at c0 (11-06, gpu's
+                    // self-test, its first case), where this emulator put
+                    // them where asked and so passed what the GPU failed.
+                    if (src != a7xx.SS6_DIRECT) return error.BadStream;
+                    if (p.len < 3 + units * 4) return error.BadStream;
+                    @memcpy(dst, p[3..][0 .. units * 4]);
                 }
             },
             a7xx.CP_EXEC_CS => try e.dispatch(.{ p[1], p[2], p[3] }),
