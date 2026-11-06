@@ -41,11 +41,35 @@ pub fn Dml(comptime config: types.Config) type {
             return cell;
         }
 
-        /// Bound column defaults and generation expressions (binder).
+        /// Bound column defaults and generation expressions (binder), and the
+        /// table's CHECK constraints by constraint index (null: none bound).
         pub const Derived = struct {
             defaults: *const [config.columns]u16,
             generated: *const [config.columns]u16,
+            checks: ?*const [config.table_constraints]u16 = null,
         };
+
+        /// The bound CHECK constraints over an existing row (ALTER TABLE).
+        pub fn checkRow(ctx: *const E.Context, table: *const S.Table, checks: *const [config.table_constraints]u16, cells: *const E.Row) Error!void {
+            const empty: [config.columns]u16 = @splat(none);
+            return checkConstraints(ctx, table, .{ .defaults = &empty, .generated = &empty, .checks = checks }, cells);
+        }
+
+        /// PostgreSQL ExecConstraints after NOT NULL: a CHECK that yields
+        /// FALSE rejects the row (23514); NULL satisfies it.
+        fn checkConstraints(ctx: *const E.Context, table: *const S.Table, derived: Derived, cells: *const E.Row) Error!void {
+            const checks = derived.checks orelse return;
+            for (table.constraints[0..table.constraint_count], 0..) |*constraint, index| {
+                if (constraint.kind != .check) continue;
+                const id = checks[index];
+                if (id == none) continue;
+                var sub = ctx.*;
+                sub.source = constraint.expression.slice();
+                sub.row = cells;
+                const verdict = try E.eval(&sub, id);
+                if (verdict == .boolean and !verdict.boolean) return error.CheckViolation;
+            }
+        }
 
         /// The column default (DEFAULT expression, identity nextval) for an
         /// unlisted column or a DEFAULT item; NULL without one.
@@ -86,6 +110,7 @@ pub fn Dml(comptime config: types.Config) type {
                 cells[index] = try store(column, evaluated, ctx.session);
             }
             try computeGenerated(ctx, table, derived, &cells);
+            try checkConstraints(ctx, table, derived, &cells);
             return cells;
         }
 
@@ -101,6 +126,7 @@ pub fn Dml(comptime config: types.Config) type {
                 cells[index] = try store(column, evaluated, ctx.session);
             }
             try computeGenerated(ctx, table, derived, &cells);
+            try checkConstraints(ctx, table, derived, &cells);
             return cells;
         }
 
@@ -114,8 +140,56 @@ pub fn Dml(comptime config: types.Config) type {
                 cells[index] = try store(column, evaluated, ctx.session);
             }
             try computeGenerated(ctx, table, derived, &cells);
+            try checkConstraints(ctx, table, derived, &cells);
             ctx.row = old;
             return cells;
+        }
+
+        // ---- rows with BEFORE triggers or rules (B11 wave 3) -------------
+
+        /// store() without the NOT NULL check, which PostgreSQL applies
+        /// after BEFORE ROW triggers (ExecConstraints).
+        pub fn storeRelaxed(column: *const V.Column, evaluated: V.Cell, session: *const value.Session) Error!V.Cell {
+            var relaxed = column.*;
+            relaxed.not_null = false;
+            return store(&relaxed, evaluated, session);
+        }
+
+        /// insertedRow up to the BEFORE ROW triggers: values and defaults
+        /// stored, NOT NULL, generated columns and CHECKs left to finishRow.
+        pub fn insertedRowDeferred(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived) Error!E.Row {
+            var cells: E.Row = @splat(.null_value);
+            ctx.row = null;
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (column.default_kind == .generated) continue;
+                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, derived, index) else try E.eval(ctx, values[index]);
+                cells[index] = try storeRelaxed(column, evaluated, ctx.session);
+            }
+            return cells;
+        }
+
+        /// updatedRow up to the BEFORE ROW triggers (see insertedRowDeferred).
+        pub fn updatedRowDeferred(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived, old: *const E.Row) Error!E.Row {
+            var cells = old.*;
+            ctx.row = old;
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (values[index] == none or column.default_kind == .generated) continue;
+                const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, derived, index) else try E.eval(ctx, values[index]);
+                cells[index] = try storeRelaxed(column, evaluated, ctx.session);
+            }
+            ctx.row = old;
+            return cells;
+        }
+
+        /// After the BEFORE ROW triggers: NOT NULL, stored generated
+        /// columns, then CHECK constraints (PostgreSQL's order).
+        pub fn finishRow(ctx: *const E.Context, table: *const S.Table, derived: Derived, cells: *E.Row) Error!void {
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (column.default_kind == .generated) continue;
+                if (cells[index] == .null_value and column.not_null) return error.NotNullViolation;
+            }
+            try computeGenerated(ctx, table, derived, cells);
+            try checkConstraints(ctx, table, derived, cells);
         }
 
         /// `taken` is the conflicting (newest committed or own) version.

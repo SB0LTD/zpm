@@ -161,18 +161,18 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
             bytes: [capacity]u8 = undefined,
             len: usize = 0,
 
-            fn reserve(self: *Buffer, count: usize) Error![]u8 {
+            pub fn reserve(self: *Buffer, count: usize) Error![]u8 {
                 if (count > capacity - self.len) return error.TextCapacity;
                 const out = self.bytes[self.len..][0..count];
                 self.len += count;
                 return out;
             }
 
-            fn byte(self: *Buffer, value: u8) Error!void {
+            pub fn byte(self: *Buffer, value: u8) Error!void {
                 (try self.reserve(1))[0] = value;
             }
 
-            fn append(self: *Buffer, value: []const u8) Error!void {
+            pub fn append(self: *Buffer, value: []const u8) Error!void {
                 @memcpy(try self.reserve(value.len), value);
             }
         };
@@ -547,13 +547,13 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
             bytes: []u8,
             len: usize = 0,
 
-            fn append(self: *Text, value: []const u8) Error!void {
+            pub fn append(self: *Text, value: []const u8) Error!void {
                 if (value.len > self.bytes.len - self.len) return error.TextCapacity;
                 @memcpy(self.bytes[self.len..][0..value.len], value);
                 self.len += value.len;
             }
 
-            fn byte(self: *Text, value: u8) Error!void {
+            pub fn byte(self: *Text, value: u8) Error!void {
                 return self.append(&.{value});
             }
         };
@@ -1124,6 +1124,288 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
             const size = sizeAt(bytes, at);
             @memcpy(out[0..size], bytes[at..][0..size]);
             return out[0..size];
+        }
+
+        // ---- modification (B11 json-agg lane, after jsonfuncs.c) ---------
+        //
+        // Every function writes a fresh value into a caller-owned Buffer;
+        // recursion follows the (validated, depth-bounded) document and
+        // polls the execution control at every member.
+
+        /// setPath operations: jsonb_set (create / replace), jsonb_insert
+        /// (insert before / after) and #- (delete).
+        pub const PathOp = enum { create, replace, insert_before, insert_after, delete };
+
+        /// Path elements a setPath can reach: one per nesting level.
+        pub const max_path: usize = depth_limit + 1;
+
+        /// One JSONB scalar or string encoding for builders.
+        pub fn writeString(out: *Buffer, value: []const u8) Error!void {
+            if (value.len > 0xffff) return error.TextCapacity;
+            const header = try out.reserve(3);
+            header[0] = @intFromEnum(Tag.string);
+            put16(header[1..], value.len);
+            try out.append(value);
+        }
+
+        /// Starts an array or object; returns its header offset.
+        pub fn beginContainer(out: *Buffer, object: bool) Error!usize {
+            const header = out.len;
+            const bytes = try out.reserve(5);
+            bytes[0] = @intFromEnum(if (object) Tag.object else Tag.array);
+            return header;
+        }
+
+        pub fn endContainer(out: *Buffer, header: usize, count: usize) Error!void {
+            if (count > 0xffff or out.len - header - 5 > 0xffff) return error.TextCapacity;
+            put16(out.bytes[header + 1 ..], count);
+            put16(out.bytes[header + 3 ..], out.len - header - 5);
+        }
+
+        /// An object key (inside an object being built).
+        pub fn writeKey(out: *Buffer, key: []const u8) Error!void {
+            if (key.len > 0xffff) return error.TextCapacity;
+            put16(try out.reserve(2), key.len);
+            try out.append(key);
+        }
+
+        /// Sorts and deduplicates the objects of a built value (canonical form).
+        pub fn canonicalize(raw: []const u8, out: *Buffer, control: ?*types.ExecutionControl) Error!void {
+            out.len = 0;
+            try canonical(raw, out, control);
+        }
+
+        /// strtoint of a jsonb_set/#- array path element: leading
+        /// whitespace, a sign and decimal digits in int4 range (22P02 else).
+        fn pathIndexStrict(text: []const u8) Error!i64 {
+            var at: usize = 0;
+            while (at < text.len and (text[at] == ' ' or (text[at] >= 0x09 and text[at] <= 0x0d))) at += 1;
+            var negative = false;
+            if (at < text.len and (text[at] == '+' or text[at] == '-')) {
+                negative = text[at] == '-';
+                at += 1;
+            }
+            if (at == text.len) return error.InvalidTextRepresentation;
+            var value: i64 = 0;
+            while (at < text.len) : (at += 1) {
+                const c = text[at];
+                if (c < '0' or c > '9') return error.InvalidTextRepresentation;
+                value = value * 10 + (c - '0');
+                if (value > 2147483648) return error.InvalidTextRepresentation;
+            }
+            if (negative) value = -value;
+            if (value > 2147483647 or value < -2147483648) return error.InvalidTextRepresentation;
+            return value;
+        }
+
+        /// jsonb_set / jsonb_insert / #- over a non-scalar document (the
+        /// caller checks the root): `path` holds the first elements of a
+        /// path of `path_len`; `value` is one encoded JSONB value (unused
+        /// for delete). The result is canonical (new keys sorted).
+        pub fn setPath(bytes: []const u8, steps: []const ?[]const u8, path_len: usize, op: PathOp, value: []const u8, out: *Buffer, control: ?*types.ExecutionControl) Error!void {
+            var raw: Buffer = .{};
+            try setLevel(bytes, 0, steps, path_len, 0, op, value, &raw, control);
+            try canonicalize(raw.bytes[0..raw.len], out, control);
+        }
+
+        fn setLevel(bytes: []const u8, at: usize, steps: []const ?[]const u8, path_len: usize, level: usize, op: PathOp, value: []const u8, out: *Buffer, control: ?*types.ExecutionControl) Error!void {
+            if (control) |c| try c.checkpoint();
+            if (level >= steps.len) return error.StatementTooComplex;
+            // setPath: a NULL path step is 22004 where it is reached.
+            const step = steps[level] orelse return error.NullValueNotAllowed;
+            const last = level + 1 == path_len;
+            const creating = op == .create or op == .insert_before or op == .insert_after;
+            switch (@as(Tag, @enumFromInt(bytes[at]))) {
+                .object => {
+                    const header = try beginContainer(out, true);
+                    const count = countAt(bytes, at);
+                    var written: usize = 0;
+                    var done = false;
+                    if (count == 0 and creating and last) {
+                        try writeKey(out, step);
+                        try out.append(value);
+                        written += 1;
+                    }
+                    var members = Members.init(bytes, at);
+                    var index: usize = 0;
+                    while (members.next()) |member| : (index += 1) {
+                        if (control) |c| try c.checkpoint();
+                        if (!done and types.same(member.key, step)) {
+                            done = true;
+                            if (last) {
+                                // jsonb_insert never redefines a key (22023).
+                                if (op == .insert_before or op == .insert_after) return error.InvalidParameterValue;
+                                if (op != .delete) {
+                                    try writeKey(out, step);
+                                    try out.append(value);
+                                    written += 1;
+                                }
+                            } else {
+                                try writeKey(out, member.key);
+                                try setLevel(bytes, member.value, steps, path_len, level + 1, op, value, out, control);
+                                written += 1;
+                            }
+                            continue;
+                        }
+                        if (creating and !done and last and index + 1 == count) {
+                            try writeKey(out, step);
+                            try out.append(value);
+                            written += 1;
+                        }
+                        try copyMember(out, bytes, member, true);
+                        written += 1;
+                    }
+                    try endContainer(out, header, written);
+                },
+                .array => {
+                    const count: i64 = @intCast(countAt(bytes, at));
+                    var index = try pathIndexStrict(step);
+                    const minimum: i64 = -2147483648;
+                    if (index < 0) index = if (-index > count) minimum else count + index;
+                    if (index > 0 and index > count) index = count;
+                    const header = try beginContainer(out, false);
+                    var written: usize = 0;
+                    var done = false;
+                    if ((index == minimum or count == 0) and last and creating) {
+                        try out.append(value);
+                        written += 1;
+                        done = true;
+                    }
+                    var members = Members.init(bytes, at);
+                    var position: i64 = 0;
+                    while (members.next()) |member| : (position += 1) {
+                        if (control) |c| try c.checkpoint();
+                        if (position != index) {
+                            try copyMember(out, bytes, member, false);
+                            written += 1;
+                            continue;
+                        }
+                        if (!last) {
+                            try setLevel(bytes, member.value, steps, path_len, level + 1, op, value, out, control);
+                            written += 1;
+                            continue;
+                        }
+                        if (op == .insert_before or op == .create) {
+                            try out.append(value);
+                            written += 1;
+                        }
+                        if (op == .insert_after or op == .insert_before) {
+                            try copyMember(out, bytes, member, false);
+                            written += 1;
+                        }
+                        if (op == .insert_after or op == .replace) {
+                            try out.append(value);
+                            written += 1;
+                        }
+                        done = true;
+                    }
+                    if (creating and !done and last) {
+                        try out.append(value);
+                        written += 1;
+                    }
+                    try endContainer(out, header, written);
+                },
+                else => try out.append(bytes[at..][0..sizeAt(bytes, at)]),
+            }
+        }
+
+        fn listed(keys: []const ?[]const u8, value: []const u8) bool {
+            for (keys) |key| if (key) |text| if (types.same(text, value)) return true;
+            return false;
+        }
+
+        /// jsonb - text / jsonb - text[]: top-level object keys, or string
+        /// array elements, equal to a non-NULL key (22023 on a scalar).
+        pub fn deleteKeys(bytes: []const u8, keys: []const ?[]const u8, out: *Buffer, control: ?*types.ExecutionControl) Error!void {
+            if (scalar(bytes[0])) return error.InvalidParameterValue;
+            out.len = 0;
+            const object = bytes[0] == @intFromEnum(Tag.object);
+            const header = try beginContainer(out, object);
+            var written: usize = 0;
+            var members = Members.init(bytes, 0);
+            while (members.next()) |member| {
+                if (control) |c| try c.checkpoint();
+                if (object and listed(keys, member.key)) continue;
+                if (!object and bytes[member.value] == @intFromEnum(Tag.string) and listed(keys, stringAt(bytes, member.value))) continue;
+                try copyMember(out, bytes, member, object);
+                written += 1;
+            }
+            try endContainer(out, header, written);
+        }
+
+        /// jsonb - integer: one array element (negative from the end);
+        /// 22023 on a scalar or an object.
+        pub fn deleteIndex(bytes: []const u8, index_in: i64, out: *Buffer, control: ?*types.ExecutionControl) Error!void {
+            if (scalar(bytes[0])) return error.InvalidParameterValue;
+            if (bytes[0] == @intFromEnum(Tag.object)) return error.InvalidParameterValue;
+            const count: i64 = @intCast(countAt(bytes, 0));
+            var index = index_in;
+            if (index < 0) index = if (-index > count) count else count + index;
+            out.len = 0;
+            const header = try beginContainer(out, false);
+            var written: usize = 0;
+            var members = Members.init(bytes, 0);
+            var position: i64 = 0;
+            while (members.next()) |member| : (position += 1) {
+                if (control) |c| try c.checkpoint();
+                if (position == index) continue;
+                try copyMember(out, bytes, member, false);
+                written += 1;
+            }
+            try endContainer(out, header, written);
+        }
+
+        /// jsonb_strip_nulls: object fields whose value is null, at every
+        /// level; with `arrays` also null array elements.
+        pub fn stripNulls(bytes: []const u8, at: usize, arrays: bool, out: *Buffer, control: ?*types.ExecutionControl) Error!void {
+            if (control) |c| try c.checkpoint();
+            if (scalar(bytes[at])) return out.append(bytes[at..][0..sizeAt(bytes, at)]);
+            const object = bytes[at] == @intFromEnum(Tag.object);
+            const header = try beginContainer(out, object);
+            var written: usize = 0;
+            var members = Members.init(bytes, at);
+            while (members.next()) |member| {
+                if (bytes[member.value] == @intFromEnum(Tag.null_value) and (object or arrays)) continue;
+                if (object) try writeKey(out, member.key);
+                try stripNulls(bytes, member.value, arrays, out, control);
+                written += 1;
+            }
+            try endContainer(out, header, written);
+        }
+
+        fn newline(out: *Text, level: usize) Error!void {
+            try out.byte('\n');
+            for (0..level * 4) |_| try out.byte(' ');
+        }
+
+        /// jsonb_pretty (JsonbToCStringIndent): four spaces per level, one
+        /// member per line, `"key": value`, empty containers as `[\n]`.
+        pub fn pretty(bytes: []const u8, at: usize, out: *Text, level: usize, leading: bool, control: ?*types.ExecutionControl) Error!void {
+            if (control) |c| try c.checkpoint();
+            if (scalar(bytes[at])) return render(bytes, at, out);
+            const object = bytes[at] == @intFromEnum(Tag.object);
+            if (leading) try newline(out, level);
+            try out.byte(if (object) '{' else '[');
+            var members = Members.init(bytes, at);
+            var first = true;
+            while (members.next()) |member| {
+                if (!first) try out.byte(',');
+                first = false;
+                const nested = !scalar(bytes[member.value]);
+                if (object) {
+                    try newline(out, level + 1);
+                    try escaped(out, member.key);
+                    try out.append(": ");
+                    if (nested) try pretty(bytes, member.value, out, level + 1, false, control) else try render(bytes, member.value, out);
+                } else if (nested) {
+                    try pretty(bytes, member.value, out, level + 1, true, control);
+                } else {
+                    try newline(out, level + 1);
+                    try render(bytes, member.value, out);
+                }
+            }
+            try newline(out, level);
+            try out.byte(if (object) '}' else ']');
         }
     };
 }

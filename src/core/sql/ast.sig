@@ -7,6 +7,7 @@
 const types = @import("types.sig");
 const lexer = @import("lexer.sig");
 const sequence = @import("sequence.sig");
+const catalog_objects = @import("catalog_objects.sig");
 const Error = types.Error;
 
 /// Absent child / end of a sibling list.
@@ -37,10 +38,143 @@ pub const TypeName = types.Type;
 
 /// `arrow` ->, `arrow_text` ->>, `path` #>, `path_text` #>>, `contains` @>,
 /// `contained` <@, `exists` ?.
-pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct };
+pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, neg, pos, arrow, arrow_text, path, path_text, contains, contained, exists, is_distinct, is_not_distinct,
+    // Integer bitwise operators (B11): & | # << >> and prefix ~.
+    bit_and, bit_or, bit_xor, shift_left, shift_right, bit_not,
+    // Array/range overlap && (B11 advanced types).
+    overlap,
+    // Range &< &> -|-.
+    over_left, over_right, adjacent,
+    // Network <<= and >>=.
+    within_eq, contains_eq,
+    // Geometric <-> (distance) and ~= (same as).
+    distance, same,
+    // JSONB #- ?| ?& and SQL/JSON path @? @@ (B11 json-agg lane); the
+    // binder rewrites them into calls of the *_op functions.
+    delete_path, exists_any, exists_all, path_exists, path_match,
+    // POSIX regular expression match (B11 text): ~ ~* !~ !~* with the
+    // node's `insensitive` / `negated`. A `.like` node with this op is
+    // SIMILAR TO (its pattern converted by similar_to_escape).
+    regex_match,
+    // Full text search @@ (tsvector @@ tsquery, either order).
+    text_match };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least };
+pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
+    // String functions (B11, functions_string.sig).
+    lower, upper, initcap, char_length, octet_length, bit_length, substring, btrim, ltrim, rtrim, strpos, replace, left, right, repeat, reverse, lpad, rpad, split_part, starts_with, ascii, chr, translate, concat, concat_ws, overlay, to_hex,
+    // Mathematical functions (B11, numeric_math.sig).
+    power, ln, log, log10, exp, mod, div, pi, degrees, radians, cbrt, sin, cos, tan, cot, asin, acos, atan, atan2, gcd, lcm, scale, min_scale, trim_scale,
+    // Date/time functions (B11, functions_temporal.sig); *_tz are the STABLE
+    // timestamptz (session time zone) overloads chosen by the binder.
+    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite,
+    // (a, b) OVERLAPS (c, d); overlaps_tz is the STABLE timestamptz + interval form.
+    overlaps, overlaps_tz,
+    // Internal: the (Y, X) input of a two-argument aggregate, NULL when either is.
+    aggregate_pair,
+    // Formatting input functions (B11, functions_format.sig); STABLE.
+    to_date, to_number, to_timestamp,
+    // Unicode normalization (B11, functions_unicode.sig).
+    normalize, is_normalized,
+    // Arrays (B11 advanced types, array_eval.sig). array_constructor is
+    // ARRAY[...] (arguments are elements or sub-arrays); array_subscript is
+    // base[...]... with its subscript layout in `integer` (array_eval.sig);
+    // array_any is `a op ANY/ALL (array)` encoded like in_subquery (op,
+    // negated for ALL).
+    array_constructor, array_subscript, array_any, array_length, cardinality, array_ndims, array_dims, array_lower, array_upper,
+    array_append, array_prepend, array_cat, array_to_string,
+    // Ranges (B11 advanced types, range_eval.sig): int4range(...) and the
+    // other constructors (result type in the node), lower/upper of a range,
+    // and the bound predicates.
+    range_constructor, range_lower, range_upper, isempty, lower_inc, upper_inc, lower_inf, upper_inf,
+    // Network address functions (B11 advanced types, network.sig).
+    inet_host, masklen, inet_family, inet_network, broadcast, netmask,
+    // Geometric functions (B11 advanced types, geometric.sig).
+    point_constructor, box_constructor, area, center, width, height,
+    // XML (B11 advanced types, xml.sig): XMLPARSE / XMLSERIALIZE (node
+    // `integer` 1 for DOCUMENT; XMLSERIALIZE's target in cast_type/typmod)
+    // and the well-formedness predicates.
+    xmlparse, xmlserialize, xml_is_well_formed, xml_is_well_formed_document, xml_is_well_formed_content,
+    // Session functions (tx-session lane, Database session hook; volatile).
+    current_setting, set_config, pg_try_advisory_lock, pg_try_advisory_lock_shared, pg_try_advisory_xact_lock, pg_try_advisory_xact_lock_shared,
+    pg_advisory_unlock, pg_advisory_unlock_shared, pg_backend_pid,
+    // Routines (B11 wave 3, routine_catalog.sig): a call of a user function
+    // (`integer` its routine slot; arguments `b` -> next, converted to the
+    // parameter types) and a bound routine variable (`relation` 0 a
+    // parameter / PL/pgSQL variable `integer`, 1 NEW.`column`, 2
+    // OLD.`column`), read from the evaluation frame.
+    routine, routine_param,
+    // Internal (B11 json-agg lane): the inputs of an aggregate with ORDER BY
+    // keys or several arguments: `b` -> next lists the value arguments, then
+    // the sort keys; `integer` is an AggregateInput layout. Exec reads its
+    // members directly; evaluating it as a value is 0A000.
+    aggregate_input,
+    // JSONB modification, conversion and SQL/JSON path functions (B11
+    // json-agg lane, json_eval.sig); *_op are the operator forms
+    // (jsonb - x, #-, ?|, ?&, @?, @@), named ?column?.
+    jsonb_set, jsonb_set_lax, jsonb_insert, jsonb_delete_path, jsonb_strip_nulls, jsonb_pretty, to_json, to_jsonb,
+    jsonb_path_exists, jsonb_path_match, jsonb_path_query_array, jsonb_path_query_first, jsonb_exists_any, jsonb_exists_all,
+    jsonb_minus_op, jsonb_delete_path_op, jsonb_exists_any_op, jsonb_exists_all_op, jsonb_path_exists_op, jsonb_path_match_op,
+    // JSON_TABLE in FROM (B11 json-agg lane): the table node (`a` context
+    // item, `c` row path, `b` -> next PASSING values then columns,
+    // `integer` bit 0 ERROR ON ERROR), a PASSING value (`name` AS, `b`
+    // value) and a column (`name`, type in cast_type/typmod, `a` PATH, `b`
+    // / `c` DEFAULT ON EMPTY / ON ERROR, `integer` a JsonTableColumn).
+    // Exec reads them; evaluating one as a value is 0A000.
+    json_table, json_table_passing, json_table_column,
+    // Catalog objects (B11 wave 3, catalog_objects.sig): comments and the
+    // current / session role (STABLE).
+    obj_description, col_description, shobj_description, current_user, session_user,
+    // Discovery (B11 text lane): pg_typeof (the argument's type OID in
+    // `integer`, set by the binder) and pg_get_serial_sequence.
+    pg_typeof, pg_get_serial_sequence,
+    // Regular expressions (B11 text lane, regex.sig).
+    regexp_like, similar_to_escape,
+    // Full text search (B11 text lane, text_search.sig): the first argument
+    // is the regconfig name.
+    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery };
+
+/// JSON_TABLE column flags (Node.integer of a json_table_column).
+pub const JsonTableColumn = struct {
+    pub const Kind = enum(u2) { regular = 0, ordinality = 1, exists = 2 };
+    /// ON EMPTY / ON ERROR behaviors (0: not written).
+    pub const Behavior = enum(u4) { unspecified = 0, null_value = 1, error_value = 2, empty_array = 3, empty_object = 4, default_value = 5, true_value = 6, false_value = 7, unknown = 8 };
+    pub const Wrapper = enum(u2) { unspecified = 0, without = 1, unconditional = 2, conditional = 3 };
+    pub const Quotes = enum(u2) { unspecified = 0, keep = 1, omit = 2 };
+    kind: Kind = .regular,
+    format_json: bool = false,
+    wrapper: Wrapper = .unspecified,
+    quotes: Quotes = .unspecified,
+    on_empty: Behavior = .unspecified,
+    on_error: Behavior = .unspecified,
+
+    pub fn encode(self: JsonTableColumn) i64 {
+        return @as(i64, @intFromEnum(self.kind)) | (@as(i64, @intFromBool(self.format_json)) << 2) | (@as(i64, @intFromEnum(self.wrapper)) << 3) |
+            (@as(i64, @intFromEnum(self.quotes)) << 5) | (@as(i64, @intFromEnum(self.on_empty)) << 8) | (@as(i64, @intFromEnum(self.on_error)) << 12);
+    }
+
+    pub fn decode(raw: i64) JsonTableColumn {
+        const word: u64 = @bitCast(raw);
+        return .{
+            .kind = @enumFromInt(@as(u2, @truncate(word & 3))),
+            .format_json = (word >> 2) & 1 != 0,
+            .wrapper = @enumFromInt(@as(u2, @truncate((word >> 3) & 3))),
+            .quotes = @enumFromInt(@as(u2, @truncate((word >> 5) & 3))),
+            .on_empty = behavior(word >> 8),
+            .on_error = behavior(word >> 12),
+        };
+    }
+
+    fn behavior(word: u64) Behavior {
+        const code: u4 = @truncate(word & 15);
+        return if (code > 8) .unspecified else @enumFromInt(code);
+    }
+};
+
+/// The JSONB / SQL/JSON path functions of json_eval.sig.
+pub fn jsonFunction(func: Func) bool {
+    return @intFromEnum(func) >= @intFromEnum(Func.jsonb_set) and @intFromEnum(func) <= @intFromEnum(Func.jsonb_path_match_op);
+}
 
 /// Conservative proof for repeated evaluation during an operator retry. Every
 /// argument is checked separately by the pool walk, so wrapping a sequence,
@@ -48,7 +182,9 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
 pub fn canRepeatFunction(func: Func) bool {
     return switch (func) {
         .grouping, .window_call, .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .greatest, .least => true,
-        else => false,
+        else => immutableBuiltin(func) or func == .concat or func == .concat_ws or
+            func == .extract_tz or func == .date_part_tz or func == .date_trunc_tz or func == .overlaps_tz or
+            func == .to_date or func == .to_number or func == .to_timestamp,
     };
 }
 
@@ -57,7 +193,30 @@ pub fn canRepeatFunction(func: Func) bool {
 pub fn immutableFunction(func: Func) bool {
     return switch (func) {
         .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .greatest, .least, .jsonb_typeof, .jsonb_array_length => true,
-        else => false,
+        else => immutableBuiltin(func),
+    };
+}
+
+/// IMMUTABLE B11 builtins (pg_proc provolatile 'i'). concat/concat_ws are
+/// STABLE: they use type output functions.
+pub fn immutableBuiltin(func: Func) bool {
+    return switch (func) {
+        .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+        .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
+        .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
+        .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
+        .overlaps, .aggregate_pair, .normalize, .is_normalized => true,
+        .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
+        .array_append, .array_prepend, .array_cat => true,
+        .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
+        .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
+        .point_constructor, .box_constructor, .area, .center, .width, .height => true,
+        .xmlparse, .xmlserialize, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
+        // to_json / to_jsonb are STABLE (timestamptz output).
+        .to_json, .to_jsonb => false,
+        .regexp_like, .similar_to_escape => true,
+        .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
+        else => jsonFunction(func),
     };
 }
 
@@ -69,7 +228,22 @@ pub fn strictFunction(func: Func) bool {
         .current_timestamp, .current_date, .current_database, .current_schema,
         .to_regtype, .to_regclass, .pg_get_expr,
         .regclass_in, .regtype_in, .regclass_out, .regtype_out => true,
-        else => false,
+        .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+        .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
+        .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
+        .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
+        .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
+        .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
+        .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
+        .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
+        .point_constructor, .box_constructor, .area, .center, .width, .height => true,
+        .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
+        // jsonb_set_lax reads NULL arguments itself.
+        .jsonb_set_lax => false,
+        .pg_get_serial_sequence => true,
+        .regexp_like, .similar_to_escape => true,
+        .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
+        else => jsonFunction(func),
     };
 }
 
@@ -83,7 +257,35 @@ pub const Reg = enum(u8) { none, regclass, regtype };
 pub const Test = enum { is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
 
 /// Aggregate functions (design §4.9). `count_star` is COUNT(*).
-pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bool_or };
+pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bool_or,
+    // Statistical (B11, aggregates_stat.sig): one-argument variance family and
+    // two-argument (Y, X) float8 regression aggregates; integer bitwise folds.
+    stddev_pop, stddev_samp, var_pop, var_samp, corr, covar_pop, covar_samp, regr_count, regr_sxx, regr_syy,
+    regr_sxy, regr_avgx, regr_avgy, regr_slope, regr_intercept, regr_r2, bit_and, bit_or, bit_xor,
+    // Collection, JSON and ordered-set aggregates (B11 json-agg lane,
+    // aggregates_collect.sig). They read every input of a group (sorted by
+    // their ORDER BY / WITHIN GROUP keys) and so run only on the sorted
+    // grouping operator; the other operators reject them with 0A000.
+    array_agg, string_agg, json_agg, jsonb_agg, json_object_agg, jsonb_object_agg,
+    percentile_cont, percentile_disc, mode, hypothetical_rank, hypothetical_dense_rank, hypothetical_percent_rank, hypothetical_cume_dist };
+
+/// Aggregates that need their group's whole input (Exec.collectAggregate).
+pub fn collectingAggregate(agg: Agg) bool {
+    return @intFromEnum(agg) >= @intFromEnum(Agg.array_agg);
+}
+
+/// Ordered-set and hypothetical-set aggregates (WITHIN GROUP).
+pub fn orderedSetAggregate(agg: Agg) bool {
+    return @intFromEnum(agg) >= @intFromEnum(Agg.percentile_cont);
+}
+
+/// Two-argument (Y, X) aggregates; their argument is an aggregate_pair node.
+pub fn pairAggregate(agg: Agg) bool {
+    return switch (agg) {
+        .corr, .covar_pop, .covar_samp, .regr_count, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => true,
+        else => false,
+    };
+}
 
 /// Relation slot of the grouped row (keys then aggregates) after grouping.
 pub fn groupRelation(comptime config: types.Config) u8 {
@@ -193,6 +395,44 @@ pub const Node = struct {
     star: bool = false,
     agg: Agg = .none,
     reg: Reg = .none,
+    /// Aggregate ORDER BY (inside the call) or WITHIN GROUP (ORDER BY ...)
+    /// keys: an index into Pool.windows whose `order` keys hold them (B11).
+    order: u16 = none,
+    within_group: bool = false,
+    /// Explicit collation (collation.sig): set by a COLLATE clause on this
+    /// node (`collate_clause`) or derived by the binder from its inputs.
+    collation: u8 = 0,
+    collate_clause: bool = false,
+};
+
+/// The member layout of an aggregate_input node (its `integer`): value
+/// argument count in bits 0..3, sort key count in bits 4..11, then per key
+/// two bits at 12 + 2 * index: DESC and NULLS FIRST.
+pub const AggregateInput = struct {
+    values: usize = 1,
+    keys: usize = 0,
+    descending: u64 = 0,
+    nulls_first: u64 = 0,
+
+    pub fn encode(self: *const AggregateInput) i64 {
+        var word: u64 = @as(u64, @intCast(self.values)) | (@as(u64, @intCast(self.keys)) << 4);
+        for (0..self.keys) |index| {
+            word |= ((self.descending >> @intCast(index)) & 1) << @intCast(12 + 2 * index);
+            word |= ((self.nulls_first >> @intCast(index)) & 1) << @intCast(13 + 2 * index);
+        }
+        return @bitCast(word);
+    }
+
+    pub fn decode(raw: i64) AggregateInput {
+        const word: u64 = @bitCast(raw);
+        var out: AggregateInput = .{ .values = @intCast(word & 15), .keys = @intCast((word >> 4) & 0xff) };
+        if (out.keys > 24) out.keys = 24;
+        for (0..out.keys) |index| {
+            out.descending |= ((word >> @intCast(12 + 2 * index)) & 1) << @intCast(index);
+            out.nulls_first |= ((word >> @intCast(13 + 2 * index)) & 1) << @intCast(index);
+        }
+        return out;
+    }
 };
 
 pub fn Ast(comptime config: types.Config) type {
@@ -265,14 +505,165 @@ pub fn Ast(comptime config: types.Config) type {
             expression: Span = .{},
             /// Identity sequence options.
             sequence: sequence.Options = .{},
+            /// SERIAL family: the owned sequence's AS type OID (0: none).
+            serial: u32 = 0,
+            /// GENERATED ALWAYS AS (expr) VIRTUAL (or without STORED).
+            virtual: bool = false,
+        };
+
+        /// ALTER SEQUENCE [IF EXISTS] name options (RESTART included).
+        pub const AlterSequence = struct {
+            if_exists: bool = false,
+            name: TableRef = .{},
+            options: sequence.Options = .{},
+        };
+
+        pub const ConstraintKind = enum { check, unique, primary, foreign, exclusion };
+
+        /// FOREIGN KEY ON DELETE / ON UPDATE actions.
+        pub const ForeignAction = enum(u8) { no_action = 0, restrict = 1, cascade = 2, set_null = 3, set_default = 4 };
+
+        /// A CHECK, UNIQUE or PRIMARY KEY constraint as written, at column
+        /// or table level. Column-level UNIQUE / PRIMARY KEY list their own
+        /// column. `expression` is the CHECK source text and `node` its parsed
+        /// root (statement pool) for naming.
+        pub const ConstraintDef = struct {
+            name: ?Ident = null,
+            kind: ConstraintKind = .check,
+            expression: Span = .{},
+            node: u16 = none,
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            nulls_not_distinct: bool = false,
+            deferrable: bool = false,
+            initially_deferred: bool = false,
+            /// FOREIGN KEY: REFERENCES table [(columns)] and actions.
+            ref_table: TableRef = .{},
+            ref_columns: [config.columns]Ident = undefined,
+            ref_count: usize = 0,
+            on_delete: ForeignAction = .no_action,
+            on_update: ForeignAction = .no_action,
+            /// EXCLUDE: operator per element (1 `=`, 2 `&&`).
+            operators: [config.columns]u8 = undefined,
+        };
+
+        /// LIKE source [INCLUDING | EXCLUDING option ...] inside CREATE TABLE:
+        /// `position` is the column index its columns take.
+        pub const Like = struct {
+            table: TableRef = .{},
+            position: usize = 0,
+            defaults: bool = false,
+            constraints: bool = false,
+            indexes: bool = false,
+            identity: bool = false,
+            generated: bool = false,
+        };
+
+        pub const PartitionStrategy = enum { none, range, list };
+
+        /// FOR VALUES FROM (...) TO (...) | IN (...) | DEFAULT: expression
+        /// nodes (MINVALUE / MAXVALUE are `minvalue` / `maxvalue` flags).
+        pub const PartitionBound = struct {
+            kind: enum { none, range, list, default } = .none,
+            values: [4]u16 = @splat(none),
+            count: usize = 0,
+            minvalue: bool = false,
+            maxvalue: bool = false,
         };
 
         pub const CreateTable = struct {
             if_not_exists: bool = false,
             invalid_definition: bool = false,
+            schema: ?Ident = null,
             name: Ident = .{},
             columns: [config.columns]ColumnDef = undefined,
             count: usize = 0,
+            constraints: [config.table_constraints]ConstraintDef = undefined,
+            constraint_count: usize = 0,
+            /// CREATE TEMP / TEMPORARY (an ordinary table in this engine).
+            temporary: bool = false,
+            like: ?Like = null,
+            inherits: ?TableRef = null,
+            partition_by: PartitionStrategy = .none,
+            partition_key: Ident = .{},
+            /// PARTITION OF parent FOR VALUES ...
+            partition_of: ?TableRef = null,
+            bound: PartitionBound = .{},
+            /// CREATE TABLE ... AS query [WITH [NO] DATA]: Pool.queries index.
+            as_query: u16 = none,
+            as_columns: [config.columns]Ident = undefined,
+            as_column_count: usize = 0,
+            with_data: bool = true,
+        };
+
+        /// CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table [USING m]
+        /// (element [ASC|DESC] [NULLS FIRST|LAST], ...) [INCLUDE (columns)]
+        /// [NULLS [NOT] DISTINCT] [WHERE predicate]. An element is a column
+        /// (`column`) or an expression (`expression` source span).
+        pub const IndexElement = struct { column: ?Ident = null, expression: Span = .{}, node: u16 = none, descending: bool = false, nulls_first: ?bool = null };
+        pub const CreateIndex = struct {
+            unique: bool = false,
+            if_not_exists: bool = false,
+            name: ?Ident = null,
+            table: TableRef = .{},
+            elements: [config.columns]IndexElement = undefined,
+            count: usize = 0,
+            includes: [config.columns]Ident = undefined,
+            include_count: usize = 0,
+            nulls_not_distinct: bool = false,
+            predicate: Span = .{},
+            predicate_node: u16 = none,
+        };
+
+        /// CREATE [OR REPLACE] [TEMP] VIEW / CREATE MATERIALIZED VIEW name
+        /// [(columns)] AS query [WITH [NO] DATA].
+        pub const CreateView = struct {
+            materialized: bool = false,
+            if_not_exists: bool = false,
+            name: TableRef = .{},
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            query: u16 = none,
+            text: Span = .{},
+            with_data: bool = true,
+        };
+
+        /// MERGE INTO target [AS alias] USING source ON condition WHEN ...
+        pub const MergeAction = enum { update, delete, insert, nothing };
+        pub const MergeWhen = struct {
+            matched: bool = true,
+            /// WHEN NOT MATCHED BY SOURCE.
+            by_source: bool = false,
+            condition: u16 = none,
+            action: MergeAction = .nothing,
+            assignments: [config.columns]Assignment = undefined,
+            count: usize = 0,
+            columns: [config.columns]Ident = undefined,
+            column_count: usize = 0,
+            /// INSERT VALUES row (a values_row node) or none (DEFAULT VALUES).
+            values: u16 = none,
+        };
+        /// WHEN clauses per MERGE (more are StatementTooComplex, 54001).
+        pub const merge_clauses: usize = 8;
+        pub const Merge = struct {
+            table: TableRef = .{},
+            /// USING items (a FROM-list query block, SELECT *).
+            source: u16 = none,
+            on: u16 = none,
+            whens: [merge_clauses]MergeWhen = undefined,
+            when_count: usize = 0,
+        };
+
+        /// REFRESH MATERIALIZED VIEW name [WITH [NO] DATA]; `query` is the
+        /// stored definition parsed into the statement pool by the facade.
+        pub const Refresh = struct { name: TableRef = .{}, with_data: bool = true, query: u16 = none };
+
+        /// SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }.
+        pub const SetConstraints = struct {
+            all: bool = false,
+            names: [8]Ident = undefined,
+            count: usize = 0,
+            deferred: bool = false,
         };
 
         pub const CreateSequence = struct {
@@ -281,7 +672,13 @@ pub fn Ast(comptime config: types.Config) type {
             options: sequence.Options = .{},
         };
 
-        pub const Drop = struct { name: Ident, if_exists: bool = false };
+        pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null, cascade: bool = false };
+
+        /// CREATE SCHEMA [IF NOT EXISTS] name.
+        pub const CreateSchema = struct { name: Ident = .{}, if_not_exists: bool = false };
+
+        /// DROP SCHEMA [IF EXISTS] name [CASCADE | RESTRICT].
+        pub const DropSchema = struct { name: Ident = .{}, if_exists: bool = false, cascade: bool = false };
 
         pub const Target = struct {
             expr: u16 = none,
@@ -310,6 +707,7 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Insert = struct {
+            schema: ?Ident = null,
             table: Ident = .{},
             alias: ?Ident = null,
             explicit_columns: bool = false,
@@ -366,6 +764,28 @@ pub fn Ast(comptime config: types.Config) type {
             on: u16 = none,
             using: [config.columns]Ident = undefined,
             using_count: usize = 0,
+            /// FROM ONLY name: no inheritance children.
+            only: bool = false,
+            /// A derived table expanded from a stored view definition.
+            view: bool = false,
+            // Query composition (B11). NATURAL join: USING over every common
+            // column name of the two operands.
+            natural: bool = false,
+            /// LATERAL derived table: it sees the FROM items before it.
+            lateral: bool = false,
+            /// This item starts a parenthesized right join operand that ends
+            /// at item `group_end`; `join`/`on` join that whole group.
+            group_end: u16 = none,
+            /// `AS alias (c1, c2, ...)`: column nodes linked by `next`.
+            column_aliases: u16 = none,
+            /// Table function call (function node) in FROM, WITH ORDINALITY.
+            function: u16 = none,
+            ordinality: bool = false,
+            /// TABLESAMPLE method (0 none, 1 BERNOULLI, 2 SYSTEM), its
+            /// percentage argument and REPEATABLE seed expressions.
+            sample_method: u8 = 0,
+            sample_percent: u16 = none,
+            sample_seed: u16 = none,
         };
 
         pub const Cte = struct {
@@ -373,6 +793,39 @@ pub fn Ast(comptime config: types.Config) type {
             columns: [config.columns]Ident = undefined,
             column_count: usize = 0,
             query: u16 = none,
+            // Query composition (B11).
+            /// [NOT] MATERIALIZED as written (0 default, 1 MATERIALIZED,
+            /// 2 NOT MATERIALIZED). Results are identical: the engine always
+            /// materializes, and PostgreSQL never inlines volatile bodies.
+            materialized: u8 = 0,
+            /// Data-modifying body (INSERT/UPDATE/DELETE ... RETURNING):
+            /// statement kind and the source offset of its first keyword.
+            dml: DmlKind = .none,
+            dml_start: usize = 0,
+            /// SEARCH {DEPTH|BREADTH} FIRST BY columns SET name.
+            search: SearchClause = .{},
+            /// CYCLE columns SET mark [TO value DEFAULT value] USING path.
+            cycle: CycleClause = .{},
+        };
+
+        pub const DmlKind = enum { none, insert, update, delete };
+
+        pub const SearchClause = struct {
+            present: bool = false,
+            breadth: bool = false,
+            /// Column nodes (names only) linked by `next`.
+            columns: u16 = none,
+            set: Ident = .{},
+        };
+
+        pub const CycleClause = struct {
+            present: bool = false,
+            columns: u16 = none,
+            mark: Ident = .{},
+            /// TO / DEFAULT values (none: boolean true / false).
+            mark_value: u16 = none,
+            mark_default: u16 = none,
+            path: Ident = .{},
         };
 
         /// A query block: a SELECT core, or a set operation over the
@@ -411,6 +864,20 @@ pub fn Ast(comptime config: types.Config) type {
             ctes: [config.ctes]Cte = undefined,
             cte_count: usize = 0,
             recursive: bool = false,
+            // Query composition (B11).
+            /// GROUPING SETS / CUBE / composite ROLLUP: int_literal nodes
+            /// linked by `next`, each a bit mask over `group` positions.
+            grouping_sets: u16 = none,
+            /// GROUP BY DISTINCT: duplicate grouping sets are removed.
+            group_distinct: bool = false,
+            /// LIMIT / OFFSET / FETCH count expressions (none: the constant
+            /// `limit` / `offset` fields apply).
+            limit_expr: u16 = none,
+            offset_expr: u16 = none,
+            /// FETCH FIRST n ROWS WITH TIES.
+            with_ties: bool = false,
+            /// Standalone VALUES block: values_row nodes linked by `next`.
+            values: u16 = none,
         };
 
         pub const Assignment = struct {
@@ -419,17 +886,29 @@ pub fn Ast(comptime config: types.Config) type {
         };
 
         pub const Update = struct {
+            /// UPDATE ONLY: no inheritance children.
+            only: bool = false,
+            schema: ?Ident = null,
             table: Ident = .{},
             assignments: [config.columns]Assignment = undefined,
             count: usize = 0,
             where: u16 = none,
             returning: Returning = .{},
+            alias: ?Ident = null,
+            /// UPDATE ... FROM items: a query block (index into Pool.queries)
+            /// holding only the FROM list, or none.
+            from: u16 = none,
         };
 
         pub const Delete = struct {
+            only: bool = false,
+            schema: ?Ident = null,
             table: Ident = .{},
             where: u16 = none,
             returning: Returning = .{},
+            alias: ?Ident = null,
+            /// DELETE ... USING items (a FROM-list query block), or none.
+            using: u16 = none,
         };
 
         /// COPY t [(columns)] FROM STDIN | COPY t [(columns)] | (query) TO
@@ -442,6 +921,37 @@ pub fn Ast(comptime config: types.Config) type {
             query: ?Span = null,
             direction: CopyDirection = .from,
             options: CopyOptions = .{},
+        };
+
+        /// TRUNCATE [TABLE] [ONLY] name [, ...] [RESTART | CONTINUE IDENTITY]
+        /// [CASCADE | RESTRICT].
+        pub const Truncate = struct {
+            tables: [config.tables]TableRef = undefined,
+            count: usize = 0,
+            restart_identity: bool = false,
+        };
+
+        /// One ALTER TABLE action. Column-level CHECK / UNIQUE of an ADD
+        /// COLUMN follow it as add_constraint actions.
+        pub const AlterAction = union(enum) {
+            add_column: struct { column: ColumnDef, if_not_exists: bool = false },
+            drop_column: struct { name: Ident, if_exists: bool = false },
+            rename_column: struct { from: Ident, to: Ident },
+            set_default: struct { column: Ident, expression: Span },
+            drop_default: Ident,
+            set_not_null: Ident,
+            drop_not_null: Ident,
+            add_constraint: ConstraintDef,
+            drop_constraint: struct { name: Ident, if_exists: bool = false },
+            rename_table: Ident,
+        };
+
+        /// ALTER TABLE [IF EXISTS] [ONLY] name action [, ...] | RENAME ...
+        pub const AlterTable = struct {
+            if_exists: bool = false,
+            table: TableRef = .{},
+            actions: [config.columns]AlterAction = undefined,
+            count: usize = 0,
         };
 
         pub const Statement = union(enum) {
@@ -458,6 +968,41 @@ pub fn Ast(comptime config: types.Config) type {
             delete: Delete,
             control: Control,
             copy: Copy,
+            truncate: Truncate,
+            alter_table: AlterTable,
+            alter_sequence: AlterSequence,
+            create_schema: CreateSchema,
+            drop_schema: DropSchema,
+            create_index: CreateIndex,
+            drop_index: Drop,
+            create_view: CreateView,
+            /// DROP VIEW / DROP MATERIALIZED VIEW (`materialized`).
+            drop_view: struct { drop: Drop, materialized: bool },
+            refresh_view: Refresh,
+            merge: Merge,
+            set_constraints: SetConstraints,
+            /// Session and transaction-scoped commands executed by the
+            /// engine (tx-session lane, session.sig): LOCK TABLE, cursors,
+            /// SQL prepared statements, LISTEN/NOTIFY/UNLISTEN.
+            session: SessionCommand,
+            /// Roles, grants, policies, comments, foreign servers and
+            /// publications (catalog_objects.sig, B11 wave 3).
+            catalog_object: catalog_objects.Statement,
+        };
+
+        /// `body`: byte offset of the inner statement (DECLARE's query,
+        /// PREPARE's statement) in the source; it is re-parsed at run time.
+        pub const SessionCommand = union(enum) {
+            lock_table: struct { tables: [config.tables]TableRef = undefined, only: [config.tables]bool = undefined, count: usize = 0, mode: TableLockMode = .access_exclusive, nowait: bool = false },
+            declare: struct { name: Ident, scroll: ?bool = null, hold: bool = false, binary: bool = false, body: usize = 0 },
+            fetch: struct { name: Ident, direction: FetchDirection = .forward, count: i64 = 1, all: bool = false, move: bool = false },
+            close: struct { name: Ident = .{}, all: bool = false },
+            prepare: struct { name: Ident, types: [config.statement_parameters]TypeName = undefined, typmods: [config.statement_parameters]i32 = undefined, count: usize = 0, body: usize = 0 },
+            execute: struct { name: Ident, args: u16 = none, count: usize = 0 },
+            deallocate: struct { name: Ident = .{}, all: bool = false },
+            listen: Ident,
+            unlisten: struct { name: Ident = .{}, all: bool = false },
+            notify: struct { channel: Ident, payload: ?lexer.Quoted = null },
         };
     };
 }
@@ -500,12 +1045,29 @@ pub const ConflictAction = enum { none, nothing, update };
 pub const JoinKind = enum { first, cross, inner, left, right, full };
 pub const SetOp = enum { none, @"union", intersect, except };
 
-/// SELECT ... FOR UPDATE|SHARE [NOWAIT|SKIP LOCKED].
-pub const LockStrength = enum { none, update, share };
+/// SELECT ... FOR {UPDATE|NO KEY UPDATE|SHARE|KEY SHARE} [OF name [, ...]]
+/// [NOWAIT|SKIP LOCKED]. `of` is the first OF name; `of_other` the first
+/// OF name spelled differently (single-table locking: 42P01 when bound).
+pub const LockStrength = enum { none, update, share, key_share, no_key_update };
 pub const LockWait = enum { block, nowait, skip_locked };
-pub const Locking = struct { strength: LockStrength = .none, wait: LockWait = .block };
+pub const Locking = struct {
+    strength: LockStrength = .none,
+    wait: LockWait = .block,
+    of: Ident = .{},
+    of_set: bool = false,
+    of_other: Ident = .{},
+    of_other_set: bool = false,
+};
 
 pub const Isolation = enum { default, read_uncommitted, read_committed, repeatable_read, serializable };
+
+/// Transaction modes of BEGIN / START TRANSACTION / SET TRANSACTION / SET
+/// SESSION CHARACTERISTICS AS TRANSACTION (null: not given).
+pub const Characteristics = struct {
+    isolation: Isolation = .default,
+    read_only: ?bool = null,
+    deferrable: ?bool = null,
+};
 
 /// A configuration parameter name: an identifier, or the special SQL forms
 /// TIME ZONE and TRANSACTION ISOLATION LEVEL.
@@ -520,20 +1082,31 @@ pub const SettingValue = struct {
     kind: enum { default, word, string, number } = .default,
     span: Span = .{},
     quoted: lexer.Quoted = .{ .start = 0, .end = 0, .len = 0 },
+    /// A comma list (`SET search_path TO a, b`): its raw source bytes
+    /// [list_start, list_end); 0 when the value is a single item.
+    list_start: usize = 0,
+    list_end: usize = 0,
 };
 
 /// Transaction control and session commands; executed by the store, never
 /// by a single statement.
 pub const Control = union(enum) {
-    begin: Isolation,
+    begin: Characteristics,
     commit: void,
     rollback: void,
     savepoint: Ident,
     release: Ident,
     rollback_to: Ident,
     set: struct { local: bool, name: SettingName, value: SettingValue },
-    set_transaction: Isolation,
+    set_transaction: Characteristics,
     show: SettingName,
     /// null = RESET ALL.
     reset: ?SettingName,
+    set_session_characteristics: Characteristics,
 };
+
+/// LOCK TABLE modes (PostgreSQL's eight, weakest first).
+pub const TableLockMode = enum { access_share, row_share, row_exclusive, share_update_exclusive, share, share_row_exclusive, exclusive, access_exclusive };
+
+/// FETCH / MOVE direction; `count` is the row count or position.
+pub const FetchDirection = enum { forward, backward, absolute, relative };

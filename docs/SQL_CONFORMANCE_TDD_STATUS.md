@@ -1,5 +1,248 @@
 # SQL conformance TDD checkpoint
 
+## Catalog and security candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/catalog-security` (rebased on 4c028a6) closes seven smoke programs
+test-first: PG.CATALOG, PG.SECURITY.ROLE, PG.SECURITY.RLS,
+PG.UTILITY.COMMENT, PG.INTEGRATION.EXTENSION, PG.INTEGRATION.FOREIGN and
+PG.INTEGRATION.REPLICATION. The unchanged driver moves from 89 passes to
+96; it still exits 1 SqlConformanceIncomplete and no other program
+changed. `contract-sql-catalog-security`
+(tests/test_sql_catalog_security.sig) covers values, column names, OIDs
+and typmods, exact SQLSTATEs (42501, 42939, 55006, 0LP01, 42710, 42704,
+2BP01, 42P01, 42703, 42809, 3F000, 42601, 42804, 0A000, 22023, 54000),
+statement atomicity, waits on uncommitted objects and table locks, SET ROLE
+in the tx-session settings, and replay of every committed record into a
+replica plus crafted records that must fail closed. Only the seven oracle
+programs are native-verified; every other expectation is pending native
+verification. Details, limits and open items: docs/SQL_CATALOG_SECURITY.md.
+
+Durability: change-record ops 70 object_create and 71 object_drop (72-79
+reserved, unused); value tags 36-41 and table definition format 4 unused;
+existing records replay unchanged. Roles, grants, owners and RLS flags,
+policies, comments, wrappers, servers and publications are versions in one
+catalog-object store (Config.catalog_objects, object_text_bytes,
+policy_roles). Roles are SQL-level: RAMSQL's single SCRAM user runs as the
+bootstrap superuser `ramsql` (OID 10); created roles have no passwords and
+are entered with SET ROLE. Wrappers, servers and publications are catalog
+entries only (no foreign scans, no logical replication).
+
+PG.TYPE.ENUM_DOMAIN_COMPOSITE remains open: its oracle OIDs 18673 / 18682
+are the native cluster's OID counter after the earlier programs of the
+oracle run (a fresh database would give OIDs about 2,278 lower, and ZPM
+allocates two OIDs per keyed table where PostgreSQL allocates five), so
+passing it would mean seeding the counter with the expected value.
+
+## JSON and aggregates candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/json-agg` (on 6f32405) closes six smoke programs test-first:
+PG.AGG.COLLECTION, PG.JSON.AGG, PG.AGG.ORDERED_SET, PG.JSONB.MODIFY,
+PG.JSON.PATH and PG.JSON.TABLE. The unchanged driver moves from 83 passes
+to 89; it still exits 1 SqlConformanceIncomplete and no other program
+changed. `contract-sql-json-agg` (tests/test_sql_json_agg.sig) covers
+values, column names and OIDs, NULLs and empty inputs, exact SQLSTATEs
+(22004, 22033-2203G, 42601, 42803, 42804, 42809, 42883, 42P10, 42701,
+42704, 22023, 22003, 22012, 22P02, 2202E, 0A000, 54000, 54001), statement
+atomicity, work budgets and cancellation, and replay into a replica. Only
+the six oracle programs are native-verified; every other expectation is
+pending native verification. Details, limits and open items:
+docs/SQL_JSON_AGG.md.
+
+Durability: no new change-record op (45-49 unused) and no new value tag
+(32-35 unused). The new jsonpath type (OID 4072) stores its canonical text
+with the existing text value tag; replay rejects a jsonpath that is not its
+own canonical text (InvalidChangeRecord). pg_type grows from 78 to 80 rows.
+
+## Routines candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/routines` (rebased on f505a80) closes four smoke programs
+test-first: PG.ROUTINE.FUNCTION, PG.ROUTINE.PROCEDURE, PG.ROUTINE.TRIGGER
+and PG.ROUTINE.RULE. The unchanged driver moves from 79 passes to 83; it
+still exits 1 SqlConformanceIncomplete and no other program changed.
+`contract-sql-routines` (tests/test_sql_routines.sig, 663 assertions)
+covers values, column names and OIDs, command tags, exact SQLSTATEs (42883,
+42725, 42723, 42P13, 42809, 42P17, 42710, 42704, 42601, 42703, 42702,
+2BP01, 0A000, P0001, P0002, P0003, 2F005, 20000, 22004, 22005, 22012,
+22P02, 23502, 23505, 54000, 54001, 57014), statement atomicity, two-
+transaction schedules (pending CREATE / DROP FUNCTION visibility and waits,
+CREATE TRIGGER against a writer, a DO block restarted after a lock wait),
+work budgets and cancellation inside routine loops, capacities, crafted
+change records and replay of every committed record into a replica that
+must answer, and fire its triggers and rules, like the primary. Only the
+four oracle programs are native-verified; every other expectation is
+pending native verification. Details, limits and open items:
+docs/SQL_ROUTINES.md.
+
+Durability: routines, triggers and rules are their own MVCC catalog objects
+with change-record ops 60-65 (60/61 create/drop routine, 62/63 trigger,
+64/65 rule; 66-69 reserved), each a length-prefixed payload validated
+before anything applies. Existing records and the definition format are
+unchanged.
+## Text candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/text` (rebased on 8ae0468) closes four smoke programs
+test-first: PG.FUNC.DISCOVERY, PG.TEXT.COLLATION, PG.PRED.REGEX and
+PG.TEXT.SEARCH. The unchanged driver moves from 96 passes (8ae0468) to 100;
+it still exits 1 SqlConformanceIncomplete and no other program changed.
+`contract-sql-text` (tests/test_sql_text.sig, 3341 assertions) covers
+values, type OIDs, typmods and column names, NULLs, exact SQLSTATEs (new
+42P21, 2201B, 2200C; also 42804, 42704, 3F000, 0A000, 22P02, 22003, 22012,
+22023, 22025, 42601, 42883, 42P01, 42703, 23514, 54000, 54001, 57014),
+statement atomicity, work budgets and cancellation for regular expressions
+and text search, wire text and replay compared with
+sameDatabase/sameCatalog. Only the four oracle programs are
+native-verified; every other expectation is pending native verification
+(each was compared by hand with a local PostgreSQL 18.3, LOCALE 'C', not a
+recorded oracle run). Scope and limits: [SQL_TEXT.md](SQL_TEXT.md).
+
+pg_typeof returns a new regtype value type (2206) with oid's operators;
+pg_get_serial_sequence names SERIAL and identity sequences. COLLATE
+supports the collations identical to this C database ("default", "C",
+"POSIX", "ucs_basic") with parse_collate.c's explicit derivation (42P21);
+column collations other than "default" are 0A000. Regular expressions are
+regcomp.c's ARE language compiled to a bounded Pike VM (Config.regex_states,
+default 512; one checkpoint per text position), with `~ ~* !~ !~*`,
+SIMILAR TO, similar_to_escape and regexp_like; back references and BREs are
+0A000. Full text search adds tsvector/tsquery (canonical text), the
+default parser translated from wparser_def.c, the `simple` configuration,
+to_tsvector/to_tsquery/plainto_tsquery/phraseto_tsquery and `@@` with
+phrase semantics; Snowball configurations and default_text_search_config
+forms are 0A000. Durability: value tags 28 tsvector, 29 tsquery (canonical
+text, re-read on replay) and 30 regtype; ops 40-44 and tag 31 unused; no
+table-definition format change. The pg_type view has 86 rows.
+
+## Transaction and session candidate (lane B11, wave 3) - 5 November 2026
+
+Branch `b11/tx-session` (on 20e7528) closes eight smoke programs
+test-first: PG.TX.ISOLATION, PG.TX.CHARACTERISTICS, PG.TX.LOCK_MODES,
+PG.TX.TABLE_LOCK, PG.CURSOR, PG.SQL_PREPARE, PG.SESSION.SETTINGS and
+PG.SESSION.NOTIFY. The unchanged driver moves from 71 passes to 79; it
+still exits 1 SqlConformanceIncomplete and no other program changed.
+`contract-sql-tx-session` (tests/test_sql_tx_session.sig) covers values,
+column names, OIDs and typmods, exact SQLSTATEs (40001, 25001, 25006,
+25P01, 55P03, 55000, 34000, 42P03, 26000, 42P05, 42601, 42804, 42P18,
+42704, 22023, 42P01, 3F000, 0A000, 54000), statement atomicity,
+two-connection schedules (REPEATABLE READ conflicts, SSI write skew and
+pivots, DEFERRABLE waits, LOCK TABLE and row-lock matrices, advisory locks,
+LISTEN/NOTIFY across store connections and the wire) and replay of
+REPEATABLE READ / SERIALIZABLE commits into a replica. Only the eight
+oracle programs are native-verified; every other expectation is pending
+native verification. Details, limits and open items: docs/SQL_TX_SESSION.md.
+
+Durability: no new change-record op (50-59 unused) and no definition format
+change; the lane adds transaction, lock and session state only.
+SERIALIZABLE is SSI at relation granularity: sound, with more serialization
+failures than PostgreSQL's tuple-level SSI; it is not claimed to match
+PostgreSQL's failure set.
+
+## Schema-object candidate (lane B11, wave 2) - 5 November 2026
+
+Branch `b11/schema-objects` (rebased on d91020c) closes the thirteen
+schema-object smoke programs test-first: PG.INDEX.SECONDARY,
+PG.INDEX.ADVANCED, PG.DML.UPSERT_UNIQUE, PG.CONSTRAINT.FK,
+PG.CONSTRAINT.DEFERRED, PG.CONSTRAINT.EXCLUSION, PG.VIEW.ORDINARY,
+PG.VIEW.MATERIALIZED, PG.DDL.CREATE_VARIANTS, PG.DML.MERGE,
+PG.DDL.VIRTUAL, PG.DDL.INHERITANCE and PG.DDL.PARTITION. The unchanged
+driver moves from 45 passes (d91020c) to 58; it still exits 1
+SqlConformanceIncomplete and no other program changed.
+`contract-sql-schema-objects` (tests/test_sql_schema_objects.sig) covers
+values, exact SQLSTATEs (23503, 23505, 23514, 23P01, 23502, 2BP01, 42P07,
+42P01, 42703, 42704, 42701, 42804, 42809, 42830, 42P10, 42P16, 42P17,
+55000, 21000, 428C9, 0A000, 54000), statement atomicity, concurrent
+schedules (unique-index and upsert races, FOREIGN KEY insert against parent
+delete, exclusion waits, deferred commits, MERGE EvalPlanQual and source
+locks, DROP against view creators) and replay of every committed record
+into a replica that must answer like the primary. Only the thirteen oracle
+programs are native-verified; every other expectation is pending native
+verification.
+
+Durability: no new change-record op was needed. Every new object rides on
+the existing table definition ops (1 create_table, 12 alter_table, 2
+drop_table, 11 truncate, 3/4/5 rows) with definition format version 3,
+written only when a definition needs it (version-1/2 records stay byte
+identical and still replay): column flag bit 5 VIRTUAL; constraint kinds 4
+FOREIGN KEY and 5 EXCLUDE with DEFERRABLE / INITIALLY DEFERRED flags;
+relkind ('r', 'v', 'm', 'p'), secondary indexes with their OIDs, view query
+text and dependencies, the inheritance / partition parent and the partition
+strategy and bound. CREATE / DROP INDEX and REFRESH ... [NO] DATA rewrite
+the table through op 12; views and materialized views are op 1 / op 2;
+REFRESH logs op 11 plus inserts.
+
+Limits: Config.table_indexes (4) secondary indexes per table and
+Config.index_entries entries per index (0: the version arena; no storage
+with external_storage), IndexCapacity 54000; Config.expansion_bytes (4096)
+for a statement plus its expanded views / inheritance / partition texts,
+TextCapacity 54000; Config.constraint_modes (8) SET CONSTRAINTS names;
+8 MERGE WHEN clauses. CREATE / DROP INDEX and REFRESH WITH [NO] DATA copy
+the table slot like ALTER TABLE (AccessExclusive, a free slot until
+commit). Indexes are hash multimaps over plain key columns (equality only);
+expression elements and predicates are definitions. UNIQUE / FOREIGN KEY /
+EXCLUDE checks scan the version arena. Views are read-only; UPDATE/DELETE
+through an inheritance parent with children and keys on partitioned tables
+are 0A000; TEMP tables are ordinary durable tables. Non-deferrable foreign
+keys are checked per row (PostgreSQL checks NO ACTION at statement end);
+deferred checks never wait for another live writer (that writer's own
+check sees the commit). No SQL family, production or native parity claim
+follows from these smokes.
+
+## Advanced types candidate (lane B11) - 5 November 2026
+
+Branch `b11/types-advanced` (on 8458d77) closes six smoke programs
+test-first: PG.TYPE.CATALOG_IDS, PG.TYPE.ARRAY, PG.TYPE.RANGE,
+PG.TYPE.NETWORK, PG.TYPE.GEOMETRIC and PG.TYPE.XML. The unchanged driver
+moves from 39 passes to 45; it still exits 1 SqlConformanceIncomplete and
+no other program changed. `contract-sql-types-advanced`
+(tests/test_sql_types_advanced.sig) covers values, OIDs/typmods, NULLs,
+ordering and hash consistency, casts, exact SQLSTATEs, atomicity, wire
+send/receive and replay compared with sameDatabase/sameCatalog. Only the
+six oracle fixtures are native-verified; every other expectation is pending
+native verification.
+
+Array types are the unnamed values of DataType/Type (element ordinal with
+bit 7 set), so every scalar type has its array type. Arrays, ranges and XML
+live inline in the cell's text_bytes budget (54000 beyond it). New
+change-record value tags: 19 pg_lsn, 20 xid8, 21 array, 22 range, 23
+inet/cidr, 24 macaddr, 25 point, 26 box, 27 xml. Older records never use
+them, so they replay unchanged. New SQLSTATEs: 42P18, 2202E, 22000, 2200N,
+2200M and 2200L. The built-in pg_type view grows from 25 to 78 rows;
+test_sql_catalog's workspace was raised to 128 rows to hold it.
+
+PG.TYPE.ENUM_DOMAIN_COMPOSITE is not implemented. Its oracle expects the
+database-local OIDs 18673/18682, which are artifacts of the native run's OID
+counter. In addition, `sql.typeOid(DataType)` has no per-database type
+identity. Multiranges, unnest, array element assignment, other geometric
+types, macaddr8 and XPath functions also remain open.
+
+## DDL, constraint and DML candidate (lane B11) - 4 November 2026
+
+Branch `b11/ddl-constraints-dml` (started on 4ed58c9, rebased on 16788d4
+with the types lane) closes ten smoke programs
+test-first: PG.DDL.TRUNCATE, PG.CONSTRAINT.CHECK, PG.CONSTRAINT.UNIQUE,
+PG.CONSTRAINT.COMPOSITE, PG.DDL.ALTER, PG.SEQUENCE.EXTENDED,
+PG.DML.UPDATE_FROM, PG.DML.DELETE_USING, PG.DML.TUPLE_ASSIGN and
+PG.DDL.SCHEMA. The unchanged driver moves from 12 passes/106 incomplete to
+22/96 on 4ed58c9, and from 18/100 to 28/90 on 16788d4; it still exits 1
+SqlConformanceIncomplete and no other program changed.
+`contract-sql-ddl-core` (tests/test_sql_ddl_core.sig) covers values, exact
+SQLSTATEs (23502, 23505, 23514, 42P16, 42710, 42P06, 3F000, 2BP01, 22023,
+42702), atomicity, concurrent schedules (UNIQUE and key waits, table locks,
+ALTER/ALTER SEQUENCE visibility) and replay of every committed record into a
+replica that must answer like the primary. Only the ten oracle programs are
+native-verified; every other expectation is pending native verification.
+
+Every new effect is a change-record op: 11 truncate, 12 alter_table, 13
+create_sequence_cached, 14 alter_sequence, 15 create_schema, 16
+drop_schema (10 stays unassigned as the existing unknown-op probe), and
+create_table definition format 2 (namespace and constraints), written only
+when needed so version-1 records stay byte-identical. ALTER TABLE and ALTER
+SEQUENCE copy into a free slot with the same OID and swap through the
+versioned catalog; TRUNCATE marks rows in place with one write entry.
+Limits: Config.table_constraints (8) and Config.schemas (4); UNIQUE scans
+the version arena (no secondary index); ALTER needs a free table slot per
+statement until commit. Evidence: `tests/sql_conformance/ddl_constraints_dml_evidence.json`.
+No SQL family, production or native parity claim follows from these smokes.
+
+
 ## Qualified planner checkpoint - 2 November 2026
 
 Plain derived-output demand and immutable error timing qualified and merged in

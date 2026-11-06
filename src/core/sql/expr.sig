@@ -14,6 +14,16 @@ const value_module = @import("value.sig");
 const temporal = @import("temporal.sig");
 const datetime_format = @import("datetime_format.sig");
 const float_text = @import("float_text.sig");
+const bytea_module = @import("bytea.sig");
+const builtins = @import("functions_eval.sig");
+const stats = @import("aggregates_stat.sig");
+const array_eval = @import("array_eval.sig");
+const range_eval = @import("range_eval.sig");
+const network = @import("network.sig");
+const geometric = @import("geometric.sig");
+const xml_module = @import("xml.sig");
+const json_eval = @import("json_eval.sig");
+const regex = @import("regex.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -146,6 +156,27 @@ pub fn arithmetic(op: ast.Op, ty: ast.Type, left: i64, right: i64) Error!i64 {
     return checkRange(value, ty);
 }
 
+/// int2/int4/int8 bitwise operators. Shift counts are masked to the
+/// operand width as on x86-64/AArch64 PostgreSQL builds (C shifts of the
+/// promoted int, then truncation for int2); bits shifted out are lost.
+pub fn bitwise(op: ast.Op, ty: ast.Type, left: i64, right: i64) i64 {
+    return switch (op) {
+        .bit_and => left & right,
+        .bit_or => left | right,
+        .bit_xor => left ^ right,
+        .shift_left, .shift_right => if (ty == .int8) blk: {
+            const count: u6 = @intCast(right & 63);
+            break :blk if (op == .shift_left) left << count else left >> count;
+        } else blk: {
+            const count: u5 = @intCast(right & 31);
+            const narrow: i32 = @intCast(left);
+            const shifted: i32 = if (op == .shift_left) narrow << count else narrow >> count;
+            break :blk if (ty == .int2) @as(i16, @truncate(shifted)) else shifted;
+        },
+        else => unreachable,
+    };
+}
+
 fn utf8Length(byte: u8) usize {
     if (byte < 0xc0) return 1;
     if (byte < 0xe0) return 2;
@@ -272,7 +303,57 @@ pub fn Eval(comptime config: types.Config) type {
             /// Enclosing block's context (correlated columns, `level` > 0).
             outer: ?*const Context = null,
             hook: ?*const Hook = null,
+            /// Routine frame (B11 wave 3) read by routine_param nodes; the
+            /// innermost context with one wins, else Session.routine_frame.
+            frame: ?*const Frame = null,
         };
+
+        /// Values of a running routine: parameters / PL/pgSQL variables and
+        /// the NEW and OLD rows of a trigger (null: a NULL record).
+        pub const Frame = struct {
+            cells: [*]const V.Cell,
+            count: usize = 0,
+            new: ?*const Row = null,
+            old: ?*const Row = null,
+        };
+
+        fn routineFrame(ctx: *const Context) ?*const Frame {
+            var current: ?*const Context = ctx;
+            while (current) |entry| : (current = entry.outer) {
+                if (entry.frame) |frame| return frame;
+            }
+            const shared = ctx.session.routine_frame orelse return null;
+            return @ptrCast(@alignCast(shared));
+        }
+
+        fn routineValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const frame = routineFrame(ctx) orelse return error.UnsupportedStatement;
+            switch (n.relation) {
+                0 => {
+                    if (n.integer < 0 or n.integer >= frame.count) return error.UnsupportedStatement;
+                    return frame.cells[@intCast(n.integer)];
+                },
+                1 => return if (frame.new) |row| row[n.column] else .null_value,
+                else => return if (frame.old) |row| row[n.column] else .null_value,
+            }
+        }
+
+        /// A user function call through the session's routine hook; every
+        /// argument is evaluated once, left to right.
+        fn routineCall(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const hook = ctx.session.routines orelse return error.UnsupportedStatement;
+            var args: [config.routine_args]V.Cell = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = node(ctx, item).next) {
+                if (count == args.len) return error.ColumnCapacity;
+                args[count] = try eval(ctx, item);
+                count += 1;
+            }
+            var out: V.Cell = .null_value;
+            try hook.call(hook.ptr, @intCast(n.integer), &args, count, &out);
+            return out;
+        }
 
         const null_cell: V.Cell = .null_value;
 
@@ -314,6 +395,14 @@ pub fn Eval(comptime config: types.Config) type {
         fn formatType(oid: i64, typmod: i64) Error!V.Cell {
             const data_type = if (oid >= 0 and oid <= 0xffffffff) types.typeFromOid(@intCast(oid)) else null;
             const known = data_type orelse return textCell("???");
+            if (types.elementData(known)) |element| {
+                // An array: its element type (with the typmod) and `[]`.
+                var inner = try formatType(types.typeOid(element), typmod);
+                if (inner.text.len + 2 > config.text_bytes) return error.TextCapacity;
+                @memcpy(inner.text.bytes[inner.text.len..][0..2], "[]");
+                inner.text.len += 2;
+                return inner;
+            }
             var buffer: [64]u8 = undefined;
             var at: usize = 0;
             const append = struct {
@@ -350,6 +439,24 @@ pub fn Eval(comptime config: types.Config) type {
                     append(&buffer, &at, "timestamp(");
                     number(&buffer, &at, typmod);
                     append(&buffer, &at, if (known == .timestamp) ") without time zone" else ") with time zone");
+                    return textCell(buffer[0..at]);
+                },
+                .time, .timetz => if (typmod >= 0) {
+                    append(&buffer, &at, "time(");
+                    number(&buffer, &at, typmod);
+                    append(&buffer, &at, if (known == .time) ") without time zone" else ") with time zone");
+                    return textCell(buffer[0..at]);
+                },
+                .bit, .varbit => if (typmod > 0) {
+                    append(&buffer, &at, if (known == .bit) "bit(" else "bit varying(");
+                    number(&buffer, &at, typmod);
+                    append(&buffer, &at, ")");
+                    return textCell(buffer[0..at]);
+                },
+                .varchar, .bpchar => if (typmod > 4) {
+                    append(&buffer, &at, if (known == .varchar) "character varying(" else "character(");
+                    number(&buffer, &at, typmod - 4);
+                    append(&buffer, &at, ")");
                     return textCell(buffer[0..at]);
                 },
                 else => {},
@@ -400,6 +507,48 @@ pub fn Eval(comptime config: types.Config) type {
             }
         }
 
+        /// Comments and role names through the session's catalog hook (B11
+        /// wave 3). obj_description(oid) matches any catalog; the two-argument
+        /// forms name the catalog (pg_class, pg_namespace, ...). Strict.
+        fn objectText(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const text_fn = hook.catalog_text orelse return error.UnsupportedStatement;
+            var buffer: [config.text_bytes]u8 = undefined;
+            const found = switch (n.func) {
+                .current_user, .session_user => try text_fn(hook.ptr, .role_name, if (n.func == .current_user) ctx.session.role else ctx.session.session_role, 0, 0, &buffer),
+                else => blk: {
+                    const first = try eval(ctx, n.b);
+                    if (first == .null_value) return .null_value;
+                    if (first.integer < 0 or first.integer > 0xffffffff) return .null_value;
+                    const object: u32 = @intCast(first.integer);
+                    const second_id = node(ctx, n.b).next;
+                    if (second_id == none) break :blk try text_fn(hook.ptr, .description, object, 0, 0, &buffer);
+                    const second = try eval(ctx, second_id);
+                    if (second == .null_value) return .null_value;
+                    switch (n.func) {
+                        .col_description => {
+                            if (second.integer < 0 or second.integer > 0x7fffffff) return .null_value;
+                            break :blk try text_fn(hook.ptr, .description, object, 1259, @intCast(second.integer), &buffer);
+                        },
+                        else => {
+                            const classoid = catalogClass(second.text.slice()) orelse return .null_value;
+                            break :blk try text_fn(hook.ptr, if (n.func == .shobj_description) .shared_description else .description, object, classoid, 0, &buffer);
+                        },
+                    }
+                },
+            };
+            const length = found orelse return .null_value;
+            return textCell(buffer[0..length]);
+        }
+
+        /// The catalog OID named by obj_description's second argument.
+        fn catalogClass(name: []const u8) ?u32 {
+            const names = [_][]const u8{ "pg_class", "pg_namespace", "pg_authid", "pg_foreign_data_wrapper", "pg_foreign_server", "pg_publication", "pg_policy" };
+            const oids = [_]u32{ 1259, 2615, 1260, 2328, 1417, 6104, 3256 };
+            for (names, oids) |known, oid| if (types.same(known, name)) return oid;
+            return null;
+        }
+
         /// nextval/currval/setval/lastval and identity defaults through the
         /// session's sequence hook (strict: a NULL argument gives NULL).
         fn sequenceValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
@@ -432,6 +581,65 @@ pub fn Eval(comptime config: types.Config) type {
                 return .{ .integer = try hook.call(hook.ptr, .setval, name, oid, amount.integer, called) };
             }
             return .{ .integer = try hook.call(hook.ptr, if (n.func == .nextval) .nextval else .currval, name, oid, 0, false) };
+        }
+
+        /// Session functions through the Database's session hook
+        /// (tx-session lane). current_setting and the advisory functions
+        /// are strict; set_config's NULL value resets the setting.
+        fn sessionFunction(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const hook = ctx.session.engine orelse return error.UnsupportedStatement;
+            var args: [3]V.Cell = @splat(.null_value);
+            var count: usize = 0;
+            var item = n.b;
+            while (item != ast.none and count < args.len) : (item = ctx.pool.nodes[item].next) {
+                args[count] = try eval(ctx, item);
+                count += 1;
+            }
+            var out: V.Text = .{};
+            switch (n.func) {
+                .pg_backend_pid => {
+                    const reply = try hook.call(hook.ptr, .backend_pid, "", "", 0, 0, 0, &out.bytes);
+                    return .{ .integer = reply.integer };
+                },
+                .current_setting => {
+                    if (args[0] == .null_value or (count == 2 and args[1] == .null_value)) return .null_value;
+                    const missing_ok = count == 2 and args[1].boolean;
+                    const reply = try hook.call(hook.ptr, .current_setting, args[0].text.slice(), "", 0, 0, if (missing_ok) 1 else 0, &out.bytes);
+                    if (reply.null_value) return .null_value;
+                    out.len = reply.len;
+                    return .{ .text = out };
+                },
+                .set_config => {
+                    if (args[0] == .null_value) return error.InvalidParameterValue;
+                    const local = args[2] != .null_value and args[2].boolean;
+                    var flags: u8 = if (local) 1 else 0;
+                    if (args[1] == .null_value) flags |= 2;
+                    const value = if (args[1] == .null_value) "" else args[1].text.slice();
+                    const reply = try hook.call(hook.ptr, .set_config, args[0].text.slice(), value, 0, 0, flags, &out.bytes);
+                    if (reply.null_value) return .null_value;
+                    out.len = reply.len;
+                    return .{ .text = out };
+                },
+                else => {},
+            }
+            for (args[0..count]) |arg| if (arg == .null_value) return .null_value;
+            var flags: u8 = 0;
+            switch (n.func) {
+                .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock_shared => flags |= 1,
+                else => {},
+            }
+            switch (n.func) {
+                .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared => flags |= 2,
+                else => {},
+            }
+            if (count == 2) flags |= 4;
+            const kind: value_module.SessionCall = switch (n.func) {
+                .pg_advisory_unlock, .pg_advisory_unlock_shared => .advisory_unlock,
+                else => .advisory_try_lock,
+            };
+            const second: i64 = if (count == 2) args[1].integer else 0;
+            const reply = try hook.call(hook.ptr, kind, "", "", args[0].integer, second, flags, &out.bytes);
+            return .{ .boolean = reply.integer != 0 };
         }
 
         pub fn literalText(source: []const u8, quoted: lexer.Quoted) V.Text {
@@ -606,6 +814,22 @@ pub fn Eval(comptime config: types.Config) type {
                     };
                 },
                 .binary => {
+                    if (n.op == .text_match) {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return null;
+                        const vector = if (left == .tsvector) left.tsvector.slice() else right.tsvector.slice();
+                        const query = if (left == .tsquery) left.tsquery.slice() else right.tsquery.slice();
+                        return try Io.TextSearch.matches(vector, query, ctx.session.control);
+                    }
+                    if (n.op == .regex_match) {
+                        const subject = try eval(ctx, n.a);
+                        const pattern = try eval(ctx, n.b);
+                        if (subject == .null_value or pattern == .null_value) return null;
+                        // bpchar ~ text reads the padded value (bpcharregexeq).
+                        const bytes = if (subject == .bpchar) subject.bpchar.slice() else subject.text.slice();
+                        return try regexMatch(ctx, bytes, pattern.text.slice(), .{ .icase = n.insensitive }) != n.negated;
+                    }
                     if (n.op == .eq or n.op == .ne or n.op == .lt or n.op == .le or n.op == .gt or n.op == .ge or n.op == .is_distinct or n.op == .is_not_distinct) {
                         // Column operands compare in place, without a cell copy.
                         var left_value: V.Cell = undefined;
@@ -614,10 +838,27 @@ pub fn Eval(comptime config: types.Config) type {
                         const right = try operandRef(ctx, n.b, &right_value);
                         return compareOp(n.op, left, right);
                     }
-                    if (n.op == .contains or n.op == .contained or n.op == .exists) {
+                    if (n.op == .contains or n.op == .contained or n.op == .exists or n.op == .overlap or n.op == .over_left or n.op == .over_right or n.op == .adjacent or n.op == .within_eq or n.op == .contains_eq or n.op == .same or
+                        ((n.op == .shift_left or n.op == .shift_right) and n.ty == .boolean))
+                    {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return null;
+                        if (left == .range or right == .range) return try range_eval.RangeEval(config, @This()).predicate(n.op, &left, &right);
+                        if (left == .point or left == .box) return switch (n.op) {
+                            .same => if (left == .point) geometric.samePoint(left.point, right.point) else geometric.sameBox(left.box, right.box),
+                            .contains => geometric.containsPoint(left.box, right.point),
+                            .contained => geometric.containsPoint(right.box, left.point),
+                            else => geometric.overlaps(left.box, right.box),
+                        };
+                        if (left == .inet) return switch (n.op) {
+                            .shift_left => network.within(&left.inet, &right.inet, false),
+                            .within_eq => network.within(&left.inet, &right.inet, true),
+                            .shift_right => network.within(&right.inet, &left.inet, false),
+                            .contains_eq => network.within(&right.inet, &left.inet, true),
+                            else => network.overlaps(&left.inet, &right.inet),
+                        };
+                        if (left == .array) return try array_eval.ArrayEval(config, @This()).containment(n.op, &left, &right, ctx.session);
                         return switch (n.op) {
                             .contains => J.contains(left.jsonb.slice(), right.jsonb.slice()),
                             .contained => J.contains(right.jsonb.slice(), left.jsonb.slice()),
@@ -662,10 +903,20 @@ pub fn Eval(comptime config: types.Config) type {
                     // like_escape(pattern, escape) is strict independently of
                     // the outer LIKE operator, after evaluating both arguments.
                     if (pattern == .null_value or (n.c != none and escape == .null_value)) return null;
+                    if (n.op == .regex_match) {
+                        // SIMILAR TO: textregexeq(value, similar_to_escape(pattern, escape)).
+                        var converted: [3 * config.text_bytes + 23]u8 = undefined;
+                        const re = try regex.similarToRegex(pattern.text.slice(), if (n.c == none) null else escape.text.slice(), &converted);
+                        if (value == .null_value) return null;
+                        const subject = if (value == .bpchar) value.bpchar.slice() else value.text.slice();
+                        return try regexMatch(ctx, subject, re, .{}) != n.negated;
+                    }
                     const escape_text: []const u8 = if (n.c == none) "\\" else escape.text.slice();
                     try validateLikeEscape(escape_text);
                     if (value == .null_value) return null;
-                    const matched = try likeMatch(value.text.slice(), pattern.text.slice(), escape_text, n.insensitive, ctx.session.control);
+                    // bpchar LIKE text matches the padded value (bpcharlike).
+                    const subject = if (value == .bpchar) value.bpchar.slice() else value.text.slice();
+                    const matched = try likeMatch(subject, pattern.text.slice(), escape_text, n.insensitive, ctx.session.control);
                     return matched != n.negated;
                 },
                 else => {},
@@ -676,6 +927,14 @@ pub fn Eval(comptime config: types.Config) type {
                 .boolean => |b| b,
                 else => unreachable,
             };
+        }
+
+        /// Compiles `pattern` (an ARE under `flags`) and searches `subject`;
+        /// every text position of the simulation is a checkpoint.
+        fn regexMatch(ctx: *const Context, subject: []const u8, pattern: []const u8, flags: regex.Flags) Error!bool {
+            var program: regex.Regex(config.regex_states) = .{};
+            try program.compile(pattern, flags, config.expr_depth);
+            return program.search(subject, ctx.session.control);
         }
 
         fn clockValue(ctx: *const Context, func: ast.Func) Error!V.Cell {
@@ -739,13 +998,27 @@ pub fn Eval(comptime config: types.Config) type {
                     const value = try eval(ctx, n.a);
                     if (value == .null_value) return .null_value;
                     if (n.op == .pos) return value;
+                    if (n.op == .bit_not) return .{ .integer = try checkRange(~value.integer, n.ty) };
                     return Io.negate(&value, n.ty);
                 },
                 .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists => return boolCell(try truth(ctx, id)),
+                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same, .regex_match, .text_match => return boolCell(try truth(ctx, id)),
+                    .distance => {
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return .null_value;
+                        return .{ .float8 = geometric.distance(left.point, right.point) };
+                    },
                     .concat => {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
+                        if (types.isArray(n.ty)) {
+                            // array_cat / array_append / array_prepend are not strict.
+                            const left_array = types.isArray(node(ctx, n.a).ty);
+                            const right_array = types.isArray(node(ctx, n.b).ty);
+                            const kind: array_eval.ArrayEval(config, @This()).Concat = if (left_array and right_array) .cat else if (left_array) .append else .prepend;
+                            return array_eval.ArrayEval(config, @This()).concat(kind, &left, &right, n.ty);
+                        }
                         if (left == .null_value or right == .null_value) return .null_value;
                         if (n.ty == .jsonb) {
                             var out: J.Buffer = .{};
@@ -755,11 +1028,24 @@ pub fn Eval(comptime config: types.Config) type {
                             value.len = out.len;
                             return .{ .jsonb = value };
                         }
+                        if (n.ty == .bytea) {
+                            var bytes: V.Text = .{};
+                            bytes.len = try bytea_module.concat(left.bytea.slice(), right.bytea.slice(), &bytes.bytes);
+                            return .{ .bytea = bytes };
+                        }
                         var text: V.Text = .{};
                         // anytextcat/textanycat cast booleans to 'true'/'false' (measured on PG18).
                         try appendCell(&text, &left, true, ctx.session);
                         try appendCell(&text, &right, true, ctx.session);
                         return .{ .text = text };
+                    },
+                    .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
+                        // Range << and >> are boolean predicates.
+                        if (n.ty == .boolean) return boolCell(try truth(ctx, id));
+                        const left = try eval(ctx, n.a);
+                        const right = try eval(ctx, n.b);
+                        if (left == .null_value or right == .null_value) return .null_value;
+                        return .{ .integer = bitwise(n.op, n.ty, left.integer, right.integer) };
                     },
                     .add, .sub, .mul, .div, .mod => {
                         // Preserve left-to-right evaluation, including a right
@@ -772,6 +1058,11 @@ pub fn Eval(comptime config: types.Config) type {
                         if (left.* == .null_value or right.* == .null_value) return .null_value;
                         if (left.* == .integer and right.* == .integer and value_module.integral(n.ty))
                             return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };
+                        if (n.ty == .interval and (n.op == .mul or n.op == .div)) {
+                            const span = if (left.* == .interval) left.interval else right.interval;
+                            const factor = if (left.* == .interval) right.float8 else left.float8;
+                            return .{ .interval = if (n.op == .mul) try stats.intervalMultiply(span, factor) else try stats.intervalDivide(span, factor) };
+                        }
                         return Io.arithmetic(n.op, left, right, n.ty, ctx.session);
                     },
                     .arrow, .arrow_text => {
@@ -937,9 +1228,163 @@ pub fn Eval(comptime config: types.Config) type {
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
+                    .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
+                    .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
+                        const config_cell = try eval(ctx, n.b);
+                        const input = try eval(ctx, ctx.pool.nodes[n.b].next);
+                        if (config_cell == .null_value or input == .null_value) return .null_value;
+                        const TS = Io.TextSearch;
+                        _ = try TS.configByName(config_cell.text.slice());
+                        var out: TS.Out = .{};
+                        const text = input.text.slice();
+                        switch (n.func) {
+                            .to_tsvector => {
+                                try TS.toVector(text, &out, ctx.session.control);
+                                return .{ .tsvector = (try textCell(out.slice())).text };
+                            },
+                            .to_tsquery => try TS.toQuery(text, .to, &out),
+                            .plainto_tsquery => try TS.toQuery(text, .plain, &out),
+                            else => try TS.toQuery(text, .phrase, &out),
+                        }
+                        return .{ .tsquery = (try textCell(out.slice())).text };
+                    },
+                    .regexp_like => {
+                        const subject = try eval(ctx, n.b);
+                        const pattern = try eval(ctx, ctx.pool.nodes[n.b].next);
+                        const options_id = ctx.pool.nodes[ctx.pool.nodes[n.b].next].next;
+                        const options = if (options_id != none) try eval(ctx, options_id) else V.Cell{ .text = .{} };
+                        if (subject == .null_value or pattern == .null_value or options == .null_value) return .null_value;
+                        const parsed = try regex.parseOptions(options.text.slice(), .{});
+                        if (parsed.global) return error.InvalidParameterValue;
+                        return .{ .boolean = try regexMatch(ctx, subject.text.slice(), pattern.text.slice(), parsed.flags) };
+                    },
+                    .similar_to_escape => {
+                        const pattern = try eval(ctx, n.b);
+                        const escape_id = ctx.pool.nodes[n.b].next;
+                        const escape = if (escape_id != none) try eval(ctx, escape_id) else V.Cell.null_value;
+                        if (pattern == .null_value or (escape_id != none and escape == .null_value)) return .null_value;
+                        var converted: [3 * config.text_bytes + 23]u8 = undefined;
+                        return textCell(try regex.similarToRegex(pattern.text.slice(), if (escape_id == none) null else escape.text.slice(), &converted));
+                    },
+                    .pg_typeof => {
+                        // The argument is evaluated (its errors surface); its
+                        // bound type is the result.
+                        _ = try eval(ctx, n.b);
+                        return .{ .regtype = @intCast(n.integer) };
+                    },
+                    .pg_get_serial_sequence => {
+                        const table = try eval(ctx, n.b);
+                        const column = try eval(ctx, ctx.pool.nodes[n.b].next);
+                        if (table == .null_value or column == .null_value) return .null_value;
+                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                        const lookup = hook.serial_sequence orelse return error.UnsupportedStatement;
+                        var buffer: [value_module.serial_name_bytes]u8 = undefined;
+                        const length = (try lookup(hook.ptr, table.text.slice(), column.text.slice(), &buffer)) orelse return .null_value;
+                        return textCell(buffer[0..length]);
+                    },
+                    .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+                    .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
+                    .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
+                    .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
+                    .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
+                    .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
+                    .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid => return sessionFunction(ctx, n),
+                    .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
+                        const argument = try eval(ctx, n.b);
+                        if (argument == .null_value) return .null_value;
+                        const document = n.integer == 1;
+                        switch (n.func) {
+                            .xmlparse => {
+                                const bytes = argument.text.slice();
+                                if (document and !xml_module.validDocument(bytes)) return error.InvalidXmlDocument;
+                                if (!document and !xml_module.validContent(bytes)) return error.InvalidXmlContent;
+                                return .{ .xml = argument.text };
+                            },
+                            .xmlserialize => {
+                                if (document and !xml_module.validDocument(argument.xml.slice())) return error.NotAnXmlDocument;
+                                return cast(.{ .text = argument.xml }, .text, n.cast_type, n.typmod, ctx.session);
+                            },
+                            .xml_is_well_formed, .xml_is_well_formed_content => return .{ .boolean = xml_module.validContent(argument.text.slice()) },
+                            else => return .{ .boolean = xml_module.validDocument(argument.text.slice()) },
+                        }
+                    },
+                    .point_constructor, .box_constructor, .area, .center, .width, .height => {
+                        if (n.planned_null) return .null_value;
+                        const first = try eval(ctx, n.b);
+                        const second_id = node(ctx, n.b).next;
+                        const second: V.Cell = if (second_id == none) .null_value else try eval(ctx, second_id);
+                        if (first == .null_value or (second_id != none and second == .null_value)) return .null_value;
+                        return switch (n.func) {
+                            .point_constructor => .{ .point = .{ .x = first.float8, .y = second.float8 } },
+                            .box_constructor => .{ .box = geometric.fromCorners(first.point, second.point) },
+                            .area => .{ .float8 = geometric.area(first.box) },
+                            .width => .{ .float8 = geometric.width(first.box) },
+                            .height => .{ .float8 = geometric.height(first.box) },
+                            else => .{ .point = geometric.center(first.box) },
+                        };
+                    },
+                    .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => {
+                        const argument = try eval(ctx, n.b);
+                        if (argument == .null_value) return .null_value;
+                        const address = &argument.inet;
+                        return switch (n.func) {
+                            .inet_host => blk: {
+                                var full = address.*;
+                                full.bits = full.maxBits();
+                                var buffer: [64]u8 = undefined;
+                                const shown = network.format(&full, false, &buffer);
+                                if (shown.len > config.text_bytes) return error.TextCapacity;
+                                var text: V.Text = .{ .len = shown.len };
+                                @memcpy(text.bytes[0..shown.len], shown);
+                                break :blk V.Cell{ .text = text };
+                            },
+                            .masklen => .{ .integer = address.bits },
+                            .inet_family => .{ .integer = address.family },
+                            .inet_network => .{ .inet = network.network(address) },
+                            .broadcast => .{ .inet = network.broadcast(address) },
+                            else => .{ .inet = network.netmask(address) },
+                        };
+                    },
+                    .aggregate_pair => {
+                        // Both inputs are evaluated; NULL skips the row (strict).
+                        const y = try eval(ctx, n.b);
+                        const x = try eval(ctx, node(ctx, n.b).next);
+                        if (y == .null_value or x == .null_value) return .null_value;
+                        if (comptime config.text_bytes < 16) {
+                            return error.WorkspaceCapacity;
+                        } else {
+                            var pair: V.Text = .{ .len = 16 };
+                            // Little-endian bytes through u64: the native SB0
+                            // compiler rejects array/float @bitCast.
+                            const y_bits: u64 = @bitCast(y.float8);
+                            const x_bits: u64 = @bitCast(x.float8);
+                            for (0..8) |i| {
+                                pair.bytes[i] = @truncate(y_bits >> @intCast(i * 8));
+                                pair.bytes[8 + i] = @truncate(x_bits >> @intCast(i * 8));
+                            }
+                            return .{ .text = pair };
+                        }
+                    },
+                    .routine => return routineCall(ctx, n),
+                    .routine_param => return routineValue(ctx, n),
+                    // Exec.collectAggregate / jsonTableRows read their members (B11).
+                    .aggregate_input, .json_table, .json_table_passing, .json_table_column => return error.UnsupportedStatement,
                     .none => unreachable,
                 },
-                .param, .when_arm => unreachable,
+                // $n of an EXECUTEd SQL prepared statement (tx-session lane).
+                .param => {
+                    const raw = ctx.session.params orelse return error.UndefinedParameter;
+                    const values: *const [config.statement_parameters]V.Cell = @ptrCast(@alignCast(raw));
+                    if (n.integer < 1 or n.integer > config.statement_parameters) return error.UndefinedParameter;
+                    return values[@intCast(n.integer - 1)];
+                },
+                .when_arm => unreachable,
             }
         }
     };

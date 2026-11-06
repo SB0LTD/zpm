@@ -65,6 +65,9 @@ pub const adreno_device = @import("adreno_device.sig");
 /// case, logged line by line (the first boot on a GPU names any op it gets
 /// wrong).
 pub const selftest = @import("selftest.sig");
+// AMD GCN 4 (gfx803, Polaris): KIR to gcn3 words, and the emulated GPU as a Device.
+pub const kir_gcn4 = @import("kir_gcn4.sig");
+pub const amd_device = @import("amd_device.sig");
 
 test {
     _ = kir;
@@ -73,4 +76,6 @@ test {
     _ = emu_device;
     _ = kir_ir3;
     _ = adreno_device;
+    _ = kir_gcn4;
+    _ = amd_device;
 }

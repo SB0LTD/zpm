@@ -236,7 +236,7 @@ fn sequences() !void {
     try expect("SELECT nextval('c'), nextval('c'), nextval('c')", "1|2|1");
     try autocommit("CREATE SEQUENCE d INCREMENT BY -2 START WITH -1");
     try expect("SELECT nextval('d'), nextval('d')", "-1|-3");
-    try rejectsOnly("CREATE SEQUENCE z CACHE 5", error.UnsupportedStatement);
+    try rejectsOnly("CREATE SEQUENCE z CACHE 0", error.InvalidParameterValue);
     try rejectsOnly("CREATE SEQUENCE z INCREMENT 0", error.InvalidParameterValue);
     try rejectsOnly("CREATE SEQUENCE z MINVALUE 5 MAXVALUE 5", error.InvalidParameterValue);
     try rejectsOnly("CREATE SEQUENCE z START 100 MAXVALUE 10", error.InvalidParameterValue);
@@ -265,6 +265,16 @@ fn defaults() !void {
     try autocommit("CREATE TABLE d (id INTEGER PRIMARY KEY, label TEXT DEFAULT 'default', n INTEGER DEFAULT 2 + 3 NOT NULL, flag BOOLEAN DEFAULT TRUE)");
     try expect("INSERT INTO d (id) VALUES (1) RETURNING *", "1|default|5|t");
     try expect("INSERT INTO d VALUES (2, DEFAULT, 7, DEFAULT), (3, 'x', DEFAULT, NULL) RETURNING *", "2|default|7|t;3|x|5|NULL");
+    // Without a column list a shorter source fills the first N columns and
+    // the rest take their defaults (PostgreSQL); explicit lists must match.
+    try expect("INSERT INTO d VALUES (4) RETURNING *", "4|default|5|t");
+    try expect("INSERT INTO d VALUES (5, 'y'), (6, 'z') RETURNING *", "5|y|5|t;6|z|5|t");
+    try expect("INSERT INTO d SELECT 7, 'w' RETURNING *", "7|w|5|t");
+    try rejectsOnly("INSERT INTO d VALUES (8, 'a', 1, TRUE, 9)", error.Syntax);
+    try rejectsOnly("INSERT INTO d VALUES (8), (9, 'b')", error.Syntax);
+    try rejectsOnly("INSERT INTO d (id, label) VALUES (8)", error.Syntax);
+    try rejectsOnly("INSERT INTO d (id, label) SELECT 8", error.Syntax);
+    try expect("SELECT count(*) FROM d WHERE id >= 8", "0");
     try expect("UPDATE d SET label = DEFAULT, n = n * 2 WHERE id = 3 RETURNING label, n", "default|10");
     try rejectsOnly("UPDATE d SET n = NULL", error.NotNullViolation);
     try autocommit("CREATE TABLE nn (id INTEGER PRIMARY KEY, v TEXT NOT NULL DEFAULT NULL, w INTEGER DEFAULT nextval('s'))");

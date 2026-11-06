@@ -645,8 +645,15 @@ fn timers() !void {
     try check(equal(out.rows[0].cells[0].text.slice(), "0"));
     try b.execute("SHOW transaction_isolation", &out);
     try check(equal(out.rows[0].cells[0].text.slice(), "read committed"));
-    if (b.execute("BEGIN ISOLATION LEVEL SERIALIZABLE", &out)) |_| return error.IsolationAccepted else |err| try check(err == error.UnsupportedStatement);
-    if (b.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &out)) |_| return error.IsolationAccepted else |err| try check(err == error.UnsupportedStatement);
+    // Isolation levels are engine transaction modes (tx-session lane).
+    try b.execute("BEGIN ISOLATION LEVEL SERIALIZABLE", &out);
+    try b.execute("SHOW transaction_isolation", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "serializable"));
+    try b.execute("ROLLBACK", &out);
+    // Outside a block SET TRANSACTION only warns.
+    try b.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &out);
+    try b.execute("SHOW transaction_isolation", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "read committed"));
     try check(b.transactionStatus() == 'I');
     var startup: Store.Connection = .{ .store = &store, .id = 9 };
     try startup.startupParameter("options", "-c statement_timeout=1000 -c lock_timeout=2s");

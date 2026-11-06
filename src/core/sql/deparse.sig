@@ -8,6 +8,7 @@
 const types = @import("types.sig");
 const ast = @import("ast.sig");
 const lexer = @import("lexer.sig");
+const collation = @import("collation.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -60,6 +61,19 @@ pub fn Deparse(comptime config: types.Config) type {
 
         fn top(context: *const Context, id: u16, data_type: types.DataType, w: *Writer) Error!void {
             const n = context.node(id);
+            if (n.collate_clause and collation.known(n.collation)) {
+                try w.bytes("(");
+                try topBody(context, id, data_type, w);
+                try w.bytes(" COLLATE ");
+                try w.bytes(collation.sql_names[n.collation - 1]);
+                try w.bytes(")");
+                return;
+            }
+            return topBody(context, id, data_type, w);
+        }
+
+        fn topBody(context: *const Context, id: u16, data_type: types.DataType, w: *Writer) Error!void {
+            const n = context.node(id);
             switch (n.kind) {
                 .int_literal => {
                     if (!integral(data_type) and data_type != .numeric and data_type != .real and data_type != .double) return error.UnsupportedStatement;
@@ -108,6 +122,8 @@ pub fn Deparse(comptime config: types.Config) type {
                 .div => " / ",
                 .mod => " % ",
                 .concat => " || ",
+                .bit_and => " & ", .bit_or => " | ", .bit_xor => " # ",
+                .shift_left => " << ", .shift_right => " >> ",
                 .eq => " = ", .ne => " <> ", .lt => " < ",
                 .le => " <= ", .gt => " > ", .ge => " >= ",
                 .is_distinct => " IS DISTINCT FROM ",
@@ -128,7 +144,21 @@ pub fn Deparse(comptime config: types.Config) type {
             try w.bytes(")");
         }
 
+        /// ruleutils' CollateExpr: `(operand COLLATE name)`.
         fn expression(context: *const Context, id: u16, w: *Writer) Error!void {
+            const n = context.node(id);
+            if (n.collate_clause and collation.known(n.collation)) {
+                try w.bytes("(");
+                try expressionBody(context, id, w);
+                try w.bytes(" COLLATE ");
+                try w.bytes(collation.sql_names[n.collation - 1]);
+                try w.bytes(")");
+                return;
+            }
+            return expressionBody(context, id, w);
+        }
+
+        fn expressionBody(context: *const Context, id: u16, w: *Writer) Error!void {
             const n = context.node(id);
             switch (n.kind) {
                 .and_op, .or_op => {
@@ -153,6 +183,19 @@ pub fn Deparse(comptime config: types.Config) type {
                     try w.bytes(")");
                 },
                 .like => {
+                    if (n.op == .regex_match) {
+                        // SIMILAR TO is stored as ~ similar_to_escape(...).
+                        try w.bytes("(");
+                        try expression(context, n.a, w);
+                        try w.bytes(if (n.negated) " !~ similar_to_escape(" else " ~ similar_to_escape(");
+                        try expression(context, n.b, w);
+                        if (n.c != none) {
+                            try w.bytes(", ");
+                            try expression(context, n.c, w);
+                        }
+                        try w.bytes("))");
+                        return;
+                    }
                     try w.bytes("(");
                     try expression(context, n.a, w);
                     try w.bytes(if (n.negated) " NOT " else " ");
@@ -207,7 +250,8 @@ pub fn Deparse(comptime config: types.Config) type {
                     try w.bytes(n.name.span.slice(context.source));
                 },
                 .binary => {
-                    const op = opText(n.op) orelse return error.UnsupportedStatement;
+                    const regex_text: []const u8 = if (n.negated) (if (n.insensitive) " !~* " else " !~ ") else (if (n.insensitive) " ~* " else " ~ ");
+                    const op = if (n.op == .regex_match) regex_text else if (n.op == .text_match) " @@ " else opText(n.op) orelse return error.UnsupportedStatement;
                     try w.bytes("(");
                     try expression(context, n.a, w);
                     try w.bytes(op);
@@ -216,11 +260,16 @@ pub fn Deparse(comptime config: types.Config) type {
                 },
                 .function => {
                     if (n.star or n.distinct or n.c != none) return error.UnsupportedStatement;
+                    // ARRAY[...], subscripts and op ANY (array) keep their source text.
+                    if (n.func == .array_constructor or n.func == .array_subscript or n.func == .array_any or n.func == .xmlparse or n.func == .xmlserialize) return error.UnsupportedStatement;
                     const raw = n.name.span.slice(context.source);
                     var lowered: [64]u8 = undefined;
                     if (raw.len > lowered.len) return error.UnsupportedStatement;
                     for (raw, 0..) |byte, index| lowered[index] = types.lower(byte);
                     const name = lowered[0..raw.len];
+                    // SQL-syntax calls (TRIM(... FROM x), POSITION(a IN b), ...)
+                    // keep their source text rather than a misleading call form.
+                    if (types.same(name, "trim") or types.same(name, "position") or types.same(name, "substring") or types.same(name, "overlay")) return error.UnsupportedStatement;
                     if (types.same(name, "current_timestamp") or types.same(name, "current_date")) {
                         for (raw, 0..) |byte, index| lowered[index] = if (byte >= 'a' and byte <= 'z') byte - 32 else byte;
                         try w.bytes(lowered[0..raw.len]);
@@ -249,7 +298,10 @@ pub fn Deparse(comptime config: types.Config) type {
                         try w.bytes(")");
                     }
                     try w.bytes("::");
-                    try w.bytes(types.sqlTypeName(types.dataTypeOf(n.cast_type)));
+                    // ::regclass / ::regtype are OID casts marked by typmod.
+                    if (n.cast_type == .oid and n.typmod == ast.regclass_typmod) try w.bytes("regclass")
+                    else if (n.cast_type == .oid and n.typmod == ast.regtype_typmod) try w.bytes("regtype")
+                    else try w.bytes(types.sqlTypeName(types.dataTypeOf(n.cast_type)));
                 },
                 else => return error.UnsupportedStatement,
             }

@@ -121,6 +121,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-nullif-types", "tests/test_sql_nullif_types.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-mvcc", "tests/test_sql_mvcc.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-types", "tests/test_sql_types.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-types-core", "tests/test_sql_types_core.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-types-advanced", "tests/test_sql_types_advanced.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-json-operators", "tests/test_sql_json_operators.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-json-canonical", "tests/test_sql_json_canonical.sig", &.{importEntry("jsonb", "src/core/sql/jsonb.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-query", "tests/test_sql_query.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -144,6 +146,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-window-values", "tests/test_sql_window_values.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-conditional-ddl", "tests/test_sql_conditional_ddl.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-numeric-functions", "tests/test_sql_numeric_functions.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-functions-core", "tests/test_sql_functions_core.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-integer-square-root", "tests/test_integer_square_root.sig", &.{});
     _ = try addContract(ctx, test_sql, "contract-sql-square-root", "tests/test_sql_square_root.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-planner-demand", "tests/test_sql_planner_demand.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -160,9 +163,17 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-dense-group", "tests/test_sql_dense_group.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-rollup", "tests/test_sql_rollup.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-grouping-rollup", "tests/test_sql_grouping_rollup.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-query-composition", "tests/test_sql_query_composition.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-ordered-probes", "tests/test_sql_ordered_probes.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-compact-scan", "tests/test_sql_compact_scan.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-runtime-workspace", "tests/test_sql_runtime_workspace.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-ddl-core", "tests/test_sql_ddl_core.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-schema-objects", "tests/test_sql_schema_objects.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-index-external", "tests/test_sql_index_external.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-routines", "tests/test_sql_routines.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-json-agg", "tests/test_sql_json_agg.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-catalog-security", "tests/test_sql_catalog_security.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-text", "tests/test_sql_text.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});
     _ = try ctx.addModule("packed_integer", "src/core/packed_integer.sig");
     const test_packed = try ctx.addStep("test-packed-integer", "Execute immutable packed integer column contracts", &noopStep);
     try ctx.addDependency(test_all, test_packed);
@@ -207,6 +218,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("page_region", "src/platform/page_region.sig"),
         });
     }
+    _ = try addContract(ctx, test_sql, "contract-sql-tx-session", "tests/test_sql_tx_session.sig", &.{
+        importEntry("sql", "src/core/sql.sig"),       importEntry("db_store", "src/db/store.sig"),
+        importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),
+    });
     _ = try ctx.addModule("resource_observation", "src/core/resource_observation.sig");
     const machine_resources=try ctx.addModule("machine_resources", "src/platform/machine_resources.sig");
     try wire(ctx,machine_resources,"resource_observation","src/core/resource_observation.sig");
@@ -1091,6 +1106,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_nvidia = try ctx.addStep("test-nvidia", "Encode ptxas's sm_120 vectors and assemble its kernels from their listings", &noopStep);
     try ctx.addDependency(test_all, test_nvidia);
     _ = try addTest(ctx, test_nvidia, "test-nvidia-module", "src/nvidia/nvidia.sig", &.{});
+    // ── AMD GCN3/GCN4 (gfx803, Polaris) compute: the ISA, a kernel assembler,
+    //    the kernel descriptor and dispatch registers, a wave64 emulator ──
+    _ = try ctx.addModule("amdgpu", "src/amdgpu/amdgpu.sig");
+    const test_amdgpu = try ctx.addStep("test-amdgpu", "Execute LLVM's gfx803 vectors and kernels, the descriptor, and the wave64 emulator's copy and matmul", &noopStep);
+    try ctx.addDependency(test_all, test_amdgpu);
+    _ = try addTest(ctx, test_amdgpu, "test-amdgpu-module", "src/amdgpu/amdgpu.sig", &.{});
+
     // ── GPU-neutral compute: KIR, devices, the interpreter and EmuDevice
     //    (one module; the backends' files join it) ──
     const gpu_module = try ctx.addModule("gpu", "src/gpu/gpu.sig");
@@ -1098,28 +1120,121 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     // the Adreno backend's files, kir_ir3 and adreno_device, use adreno)
     try wire(ctx, gpu_module, "nvidia", "src/nvidia/nvidia.sig");
     try wire(ctx, gpu_module, "adreno", "src/adreno/adreno.sig");
+    // (kir_gcn4 and amd_device: the AMD backend, with amdgpu)
+    try wire(ctx, gpu_module, "amdgpu", "src/amdgpu/amdgpu.sig");
     const test_gpu = try ctx.addStep("test-gpu", "Execute KIR's verifier, interpreter, exact fdiv/fsqrt expansions and EmuDevice", &noopStep);
     try ctx.addDependency(test_all, test_gpu);
     _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     _ = try addTest(ctx, test_gpu, "test-gpu-ops", "tests/test_gpu_ops.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     _ = try addTest(ctx, test_gpu, "test-gpu-flow", "tests/test_gpu_flow.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     _ = try addTest(ctx, test_gpu, "test-gpu-exact", "tests/test_gpu_exact.sig", &.{
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     _ = try addTest(ctx, test_gpu, "test-gpu-emu", "tests/test_gpu_emu.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
+    });
+    // ── gfxapi: Galaxy's GPU driver for apps (OpenGL ES over KIR and gpu.Device,
+    //    Galaxy's render node), on the CPU, KIR's interpreter and the emulated Adreno ──
+    const gfxapi_module = try ctx.addModule("gfxapi", "src/gfxapi/gfxapi.sig");
+    try wire(ctx, gfxapi_module, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, gfxapi_module, "adreno", "src/adreno/adreno.sig");
+    try wire(ctx, gfxapi_module, "nvidia", "src/nvidia/nvidia.sig");
+    const test_gfxapi = try ctx.addStep("test-gfxapi", "Execute the app GPU driver's engine, GLES core, C ABI and render-node client on the CPU and emulated GPUs", &noopStep);
+    try ctx.addDependency(test_all, test_gfxapi);
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-module", "src/gfxapi/gfxapi.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-libgles", "src/gfxapi/libgles.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-gpu", "tests/test_gfxapi.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-draw", "tests/test_gfxapi_draw.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-glsl", "tests/test_gfxapi_glsl.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-tex", "tests/test_gfxapi_tex.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-targets", "tests/test_gfxapi_targets.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-deriv", "tests/test_gfxapi_deriv.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-mip", "tests/test_gfxapi_mip.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-xfer", "tests/test_gfxapi_xfer.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    // (skipped without GFXAPI_WR_RES: Firefox's gfx/wr/webrender/res)
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-webrender", "tests/test_gfxapi_webrender.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-egl", "tests/test_gfxapi_egl.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-lib", "src/gfxapi/libgalaxy_gl.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
@@ -1184,6 +1299,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, lfm3_gpu, "lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig");
     _ = try addTest(ctx, test_adreno, "test-lfm3-gpu-kernels", "src/core/lfm3_gpu_kernels.sig", &.{
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
     });
     _ = try addTest(ctx, test_adreno, "test-lfm3-gpu", "tests/test_lfm3_gpu.sig", &.{
@@ -1195,6 +1311,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("transformer_ops", "src/core/transformer_ops.sig"),
         importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
         importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
         importEntry("lfm3_gpu", "src/core/lfm3_gpu.sig"),
     });
@@ -1206,6 +1323,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_gpu, "test-gpu-sm120", "src/gpu/nvidia_device.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
         importEntry("lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
     });
@@ -1217,6 +1335,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
     });
@@ -1344,6 +1463,15 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
         importEntry("lfm3_kir_codec", "src/core/lfm3_kir_codec.sig"),
         importEntry("lfm3_any_codec", "src/core/lfm3_any_codec.sig"),
+    });
+    // The AMD backend: every KIR op through gcn3_emu against the interpreter.
+    const test_gpu_gcn4 = try ctx.addStep("test-gpu-gcn4", "Compile KIR for GCN 4 (gfx803) and run it in gcn3_emu against kir_interp", &noopStep);
+    try ctx.addDependency(test_all, test_gpu_gcn4);
+    _ = try addTest(ctx, test_gpu_gcn4, "test-gpu-gcn4-kernels", "tests/test_kir_gcn4.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
 
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");

@@ -235,7 +235,9 @@ fn errors() !void {
     try rejects(&db, &r, "SELECT id || 1 FROM t", error.UndefinedFunction);
     try rejects(&db, &r, "SELECT id LIKE '1' FROM t", error.UndefinedFunction);
     try rejects(&db, &r, "SELECT label -> 'k' FROM t", error.UndefinedFunction);
-    try rejects(&db, &r, "SELECT lower(label) FROM t", error.UndefinedFunction);
+    // lower(text) now exists (B11); lower(integer) and unknown names do not.
+    try rejects(&db, &r, "SELECT lower(id) FROM t", error.UndefinedFunction);
+    try rejects(&db, &r, "SELECT no_such_function(label) FROM t", error.UndefinedFunction);
     try rejects(&db, &r, "SELECT NULL + NULL", error.AmbiguousFunction);
     try rejects(&db, &r, "SELECT '1' + '2'", error.AmbiguousFunction);
     try rejects(&db, &r, "SELECT TRUE::bigint", error.CannotCoerce);

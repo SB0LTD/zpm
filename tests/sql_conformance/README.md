@@ -45,7 +45,7 @@ component is missing. The annotations below separate those cases.
 | PG.PRED.QUANTIFIED | ANY/SOME/ALL, scalar subqueries with six ordinary comparison operators | pass; array/row/custom-operator forms and closure remain incomplete |
 | PG.PRED.SYMMETRIC | Symmetric BETWEEN | pass; scalar/flat-row range contracts, broader closure incomplete |
 | PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
-| PG.PRED.REGEX | Regular expressions | Syntax |
+| PG.PRED.REGEX | Regular expressions | pass (B11 candidate); ARE operators, SIMILAR TO, regexp_like; back references, BREs and positional regexp_* functions open |
 | PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
 | PG.QUERY.WINDOW | Ranking/offset windows | qualified smoke pass; LAG/LEAD finite coverage, demand/other window closure incomplete |
 | PG.QUERY.WINDOW_AGG | Window aggregates | pass; complete window family remains partial |
@@ -53,9 +53,9 @@ component is missing. The annotations below separate those cases.
 | PG.GROUP.ROLLUP | ROLLUP/GROUPING | pass; flat ROLLUP/GROUPING only, broader grouping remains partial |
 | PG.GROUP.CUBE | CUBE | UndefinedFunction |
 | PG.GROUP.SETS | GROUPING SETS | Syntax |
-| PG.AGG.COLLECTION | String/array aggregates | Syntax |
+| PG.AGG.COLLECTION | String/array aggregates | pass (B11 candidate); aggregate ORDER BY/DISTINCT, array_agg (scalars, arrays), string_agg (text, bytea); window and grouping-set forms 0A000 |
 | PG.AGG.STATISTICAL | Statistical aggregates | UndefinedFunction |
-| PG.AGG.ORDERED_SET | Ordered-set aggregates | Syntax |
+| PG.AGG.ORDERED_SET | Ordered-set aggregates | pass (B11 candidate); percentile_cont/disc, mode, hypothetical rank/dense_rank/percent_rank/cume_dist; array fractions open |
 | PG.AGG.BITWISE | Bitwise aggregates | UndefinedFunction |
 | PG.AGG.INTERVAL | AVG(interval) | UndefinedFunction |
 | PG.JOIN.LATERAL | LATERAL | Syntax |
@@ -70,82 +70,82 @@ component is missing. The annotations below separate those cases.
 | PG.QUERY.SAMPLE | TABLESAMPLE | Syntax |
 | PG.QUERY.FETCH_TIES | FETCH WITH TIES | Syntax |
 | PG.QUERY.LIMIT_EXPR | Expression LIMIT/OFFSET | Syntax |
-| PG.DDL.SCHEMA | Schema lifecycle | Syntax |
-| PG.DDL.ALTER | ALTER TABLE | UnsupportedStatement |
-| PG.DDL.CREATE_VARIANTS | Temporary/CTAS/LIKE | Syntax |
-| PG.DDL.INHERITANCE | Table inheritance | Syntax |
-| PG.DDL.PARTITION | Partition lifecycle | Syntax |
+| PG.DDL.SCHEMA | Schema lifecycle | pass (B11 candidate); schema-qualified tables, closure incomplete |
+| PG.DDL.ALTER | ALTER TABLE | pass (B11 candidate); column/default/NOT NULL/constraint actions, closure incomplete |
+| PG.DDL.CREATE_VARIANTS | Temporary/CTAS/LIKE | pass (B11 candidate); TEMP tables are ordinary durable tables, closure incomplete |
+| PG.DDL.INHERITANCE | Table inheritance | pass (B11 candidate); parent reads expand, UPDATE/DELETE through a parent 0A000 |
+| PG.DDL.PARTITION | Partition lifecycle | pass (B11 candidate); RANGE/LIST/DEFAULT, INSERT routing, keys on partitioned tables 0A000 |
 | PG.DDL.IF_EXISTS | Conditional DDL | qualified smoke pass; table/sequence clauses, wider DDL/notice parity incomplete |
-| PG.DDL.TRUNCATE | TRUNCATE | UnsupportedStatement |
+| PG.DDL.TRUNCATE | TRUNCATE | pass (B11 candidate); closure incomplete |
 | PG.DDL.DATABASE | Database lifecycle | UnexecutedScopeOrComparator |
-| PG.CONSTRAINT.COMPOSITE | Composite/table-level primary key | Syntax |
-| PG.CONSTRAINT.UNIQUE | UNIQUE/NULL rules | Syntax |
-| PG.CONSTRAINT.CHECK | CHECK | Syntax |
-| PG.CONSTRAINT.FK | Foreign-key actions | Syntax |
-| PG.CONSTRAINT.DEFERRED | Deferred constraints | Syntax |
-| PG.CONSTRAINT.EXCLUSION | Exclusion constraints | Syntax |
-| PG.INDEX.SECONDARY | Secondary/index catalog | Syntax |
-| PG.INDEX.ADVANCED | Composite/expression/partial/covering index | Syntax |
-| PG.DML.UPDATE_FROM | UPDATE FROM | Syntax |
-| PG.DML.DELETE_USING | DELETE USING | Syntax |
-| PG.DML.TUPLE_ASSIGN | Tuple assignment | Syntax |
-| PG.DML.MERGE | MERGE | UnsupportedStatement |
-| PG.DML.UPSERT_UNIQUE | Non-PK upsert | Syntax |
-| PG.SEQUENCE.EXTENDED | Sequence lifecycle/cache/SERIAL | Syntax |
-| PG.DDL.VIRTUAL | Virtual generated columns | Syntax |
-| PG.VIEW.ORDINARY | Views | Syntax |
-| PG.VIEW.MATERIALIZED | Materialized views | Syntax |
+| PG.CONSTRAINT.COMPOSITE | Composite/table-level primary key | pass (B11 candidate); closure incomplete |
+| PG.CONSTRAINT.UNIQUE | UNIQUE/NULL rules | pass (B11 candidate); scan-enforced, closure incomplete |
+| PG.CONSTRAINT.CHECK | CHECK | pass (B11 candidate); closure incomplete |
+| PG.CONSTRAINT.FK | Foreign-key actions | pass (B11 candidate); MATCH SIMPLE, all five actions, closure incomplete |
+| PG.CONSTRAINT.DEFERRED | Deferred constraints | pass (B11 candidate); UNIQUE/FK/EXCLUDE at statement end or COMMIT |
+| PG.CONSTRAINT.EXCLUSION | Exclusion constraints | pass (B11 candidate); `=` and range `&&`, scan-enforced |
+| PG.INDEX.SECONDARY | Secondary/index catalog | pass (B11 candidate); hash entries per version, equality probes only |
+| PG.INDEX.ADVANCED | Composite/expression/partial/covering index | pass (B11 candidate); expression/predicate are definitions, entries hash plain keys |
+| PG.DML.UPDATE_FROM | UPDATE FROM | pass (B11 candidate); RETURNING of source columns open |
+| PG.DML.DELETE_USING | DELETE USING | pass (B11 candidate); closure incomplete |
+| PG.DML.TUPLE_ASSIGN | Tuple assignment | pass (B11 candidate); sub-SELECT source open |
+| PG.DML.MERGE | MERGE | pass (B11 candidate); RETURNING and OVERRIDING open |
+| PG.DML.UPSERT_UNIQUE | Non-PK upsert | pass (B11 candidate); constraint/index arbiters, partial-index inference open |
+| PG.SEQUENCE.EXTENDED | Sequence lifecycle/cache/SERIAL | pass (B11 candidate); OWNED BY/RENAME open |
+| PG.DDL.VIRTUAL | Virtual generated columns | pass (B11 candidate); computed at write (immutable), catalog 'v' |
+| PG.VIEW.ORDINARY | Views | pass (B11 candidate); bind-time expansion, read-only, OR REPLACE open |
+| PG.VIEW.MATERIALIZED | Materialized views | pass (B11 candidate); REFRESH CONCURRENTLY open |
 | PG.TYPE.CHARACTER | VARCHAR/CHAR | Syntax |
 | PG.TYPE.BINARY | BYTEA | Syntax |
 | PG.TYPE.UUID | UUID | Syntax |
 | PG.TYPE.TIME | TIME/TIMETZ | Syntax |
 | PG.TYPE.MONEY | MONEY | Syntax |
 | PG.TYPE.BIT | BIT/VARBIT | Syntax |
-| PG.TYPE.NETWORK | Network/MAC | Syntax |
-| PG.TYPE.GEOMETRIC | Geometric types | UndefinedFunction |
-| PG.TYPE.XML | XML | Syntax |
-| PG.TYPE.ARRAY | Arrays | Syntax |
-| PG.TYPE.RANGE | Range/multirange | Syntax |
-| PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax |
-| PG.TYPE.CATALOG_IDS | Additional catalog identifiers | Syntax |
+| PG.TYPE.NETWORK | Network/MAC | pass (B11 candidate); inet/cidr/macaddr, macaddr8 and inet arithmetic open |
+| PG.TYPE.GEOMETRIC | Geometric types | pass (B11 candidate); point/box only, other geometric types open |
+| PG.TYPE.XML | XML | pass (B11 candidate); well-formedness subset, XPath/xmltable/publishing functions open |
+| PG.TYPE.ARRAY | Arrays | pass (B11 candidate); unnest, element assignment and array aggregates open |
+| PG.TYPE.RANGE | Range/multirange | pass (B11 candidate); built-in ranges only, multiranges open |
+| PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax; not implemented (oracle OIDs 18673/18682 come from the native cluster's OID history; see docs/SQL_CATALOG_SECURITY.md) |
+| PG.TYPE.CATALOG_IDS | Additional catalog identifiers | pass (B11 candidate); pg_lsn/xid8, closure incomplete |
 | PG.JSON.OPS | JSON operators | qualified smoke pass; lexical extraction, broader JSON closure incomplete |
-| PG.JSONB.MODIFY | Remaining JSONB operations | UndefinedFunction |
-| PG.JSON.PATH | JSONPATH/SQL-JSON | UndefinedFunction |
-| PG.JSON.TABLE | JSON_TABLE | Syntax |
-| PG.JSON.AGG | JSON aggregates | Syntax |
+| PG.JSONB.MODIFY | Remaining JSONB operations | pass (B11 candidate); jsonb_set/_lax/insert, - and #-, ?| ?&, strip_nulls, pretty, to_json[b]; subscript assignment open |
+| PG.JSON.PATH | JSONPATH/SQL-JSON | pass (B11 candidate); jsonpath type, lax/strict evaluator, jsonb_path_* and @? @@; like_regex, keyvalue, datetime methods 0A000 |
+| PG.JSON.TABLE | JSON_TABLE | pass (B11 candidate); PASSING, ORDINALITY, value/query/EXISTS columns, ON EMPTY/ON ERROR; NESTED PATH 0A000 |
+| PG.JSON.AGG | JSON aggregates | pass (B11 candidate); json[b]_agg, json[b]_object_agg with to_json[b] conversion; constructors and *_strict/_unique open |
 | PG.FUNC.STRING | String functions | Syntax |
 | PG.FUNC.NUMERIC | Numeric functions | UndefinedFunction |
 | PG.FUNC.TEMPORAL | Temporal functions | Syntax |
 | PG.FUNC.FORMAT | Formatting functions | UndefinedFunction for to_date/to_number; temporal to_char implemented separately |
 | PG.FUNC.MINMAX | GREATEST/LEAST | pass; closure incomplete |
-| PG.FUNC.DISCOVERY | Discovery functions | UndefinedFunction |
-| PG.TEXT.COLLATION | Collation selection | Syntax |
+| PG.FUNC.DISCOVERY | Discovery functions | pass (B11 candidate); pg_typeof (regtype), pg_get_serial_sequence; other catalog functions open |
+| PG.TEXT.COLLATION | Collation selection | pass (B11 candidate); COLLATE with C-equivalent collations and explicit derivation; column collations, ICU/Unicode collations open |
 | PG.TEXT.ENCODING | Unicode/codepoint functions | UndefinedFunction |
 | PG.TEXT.LITERALS | Escape/dollar/Unicode literals | Syntax |
-| PG.TEXT.SEARCH | Full text search | Syntax |
+| PG.TEXT.SEARCH | Full text search | pass (B11 candidate); simple configuration, default parser, to_*tsquery, @@; Snowball configurations, ranking and tsvector operators open |
 | PG.OP.BITWISE | Bitwise operators | Syntax |
-| PG.TX.ISOLATION | Repeatable Read/Serializable | UnsupportedStatement |
-| PG.TX.CHARACTERISTICS | Transaction characteristics | Syntax |
-| PG.TX.LOCK_MODES | Additional row lock modes | Syntax |
-| PG.TX.TABLE_LOCK | Explicit table/advisory locking | UnsupportedStatement |
+| PG.TX.ISOLATION | Repeatable Read/Serializable | pass (B11 candidate); REPEATABLE READ snapshot + 40001, relation-granularity SSI (more 40001s than PostgreSQL) |
+| PG.TX.CHARACTERISTICS | Transaction characteristics | pass (B11 candidate); READ ONLY 25006, DEFERRABLE safe-snapshot wait, 25001 hooks; SET TRANSACTION SNAPSHOT open |
+| PG.TX.LOCK_MODES | Additional row lock modes | pass (B11 candidate); four strengths and OF; non-key UPDATE still FOR UPDATE strength |
+| PG.TX.TABLE_LOCK | Explicit table/advisory locking | pass (B11 candidate); eight LOCK modes, NOWAIT, try/unlock advisory forms; blocking (void) advisory forms open |
 | PG.TX.TWO_PHASE | Two-phase commit | UnexecutedScopeOrComparator |
-| PG.CURSOR | Cursor lifecycle | UnsupportedStatement |
-| PG.SQL_PREPARE | SQL prepared statements | UnsupportedStatement |
-| PG.SESSION.SETTINGS | General settings/search_path | UnsupportedStatement |
-| PG.SESSION.NOTIFY | Notifications | UnsupportedStatement |
-| PG.SECURITY.ROLE | Roles/privileges | Syntax |
-| PG.SECURITY.RLS | Row-level security | UnsupportedStatement |
-| PG.ROUTINE.FUNCTION | SQL functions | Syntax |
-| PG.ROUTINE.PROCEDURE | Procedures/DO | Syntax |
-| PG.ROUTINE.TRIGGER | Triggers | Syntax |
-| PG.ROUTINE.RULE | Rewrite rules | Syntax |
-| PG.CATALOG | Catalog expansion | RowShapeMismatch |
+| PG.CURSOR | Cursor lifecycle | pass (B11 candidate); materialized at DECLARE, all FETCH/MOVE directions, SCROLL, WITH HOLD |
+| PG.SQL_PREPARE | SQL prepared statements | pass (B11 candidate); declared parameter types only (no inference) |
+| PG.SESSION.SETTINGS | General settings/search_path | pass (B11 candidate); transactional SET/SET LOCAL, placeholders, current_setting/set_config; search_path limited to public |
+| PG.SESSION.NOTIFY | Notifications | pass (B11 candidate); delivered at commit, NotificationResponse on the wire; pg_notify() open |
+| PG.SECURITY.ROLE | Roles/privileges | pass (B11 candidate); roles, membership, table GRANT/REVOKE with 42501 checks, SET ROLE; column/schema/sequence privileges and passwords open |
+| PG.SECURITY.RLS | Row-level security | pass (B11 candidate); policies filter reads/UPDATE/DELETE, WITH CHECK 42501; subqueries in policies, COPY FROM/MERGE/ON CONFLICT under RLS open |
+| PG.ROUTINE.FUNCTION | SQL functions | pass (B11 candidate); SQL / PL/pgSQL functions, overloads, STRICT; SQL bodies beyond one SELECT expression open (docs/SQL_ROUTINES.md) |
+| PG.ROUTINE.PROCEDURE | Procedures/DO | pass (B11 candidate); CALL, DO, statements with INTO, EXCEPTION blocks; transaction control open |
+| PG.ROUTINE.TRIGGER | Triggers | pass (B11 candidate); BEFORE/AFTER ROW/STATEMENT, WHEN, UPDATE OF; INSTEAD OF and statements in trigger functions open |
+| PG.ROUTINE.RULE | Rewrite rules | pass (B11 candidate); DO [ALSO|INSTEAD] NOTHING with qualifications; rule actions open |
+| PG.CATALOG | Catalog expansion | pass (B11 candidate); pg_toast listed (always empty) |
 | PG.UTILITY.EXPLAIN | Explain/analyze plans | UnexecutedScopeOrComparator |
 | PG.UTILITY.MAINTENANCE | Maintenance commands | UnexecutedScopeOrComparator |
-| PG.UTILITY.COMMENT | Object comments | UnsupportedStatement |
-| PG.INTEGRATION.EXTENSION | Extension catalog visibility only; lifecycle remains untested | TableNotFound |
-| PG.INTEGRATION.FOREIGN | Foreign server objects | Syntax |
-| PG.INTEGRATION.REPLICATION | Publication catalog visibility only; replication remains untested | TableNotFound |
+| PG.UTILITY.COMMENT | Object comments | pass (B11 candidate); durable comments on relations, columns, schemas, roles, policies, wrappers, servers, publications; indexes/functions open |
+| PG.INTEGRATION.EXTENSION | Extension catalog visibility only; lifecycle remains untested | pass (B11 candidate); plpgsql row only, CREATE/DROP EXTENSION of others 0A000 |
+| PG.INTEGRATION.FOREIGN | Foreign server objects | pass (B11 candidate); catalog-only wrappers and servers; handlers, options, user mappings, foreign tables open |
+| PG.INTEGRATION.REPLICATION | Publication catalog visibility only; replication remains untested | pass (B11 candidate); catalog-only publications (FOR ALL TABLES, publish options); FOR TABLE, logical decoding, subscriptions open |
 | PG.COPY.OPTIONS | COPY WHERE/options | UnexecutedScopeOrComparator |
 | MYSQL.IDENTIFIERS | Backtick identifiers | UnexecutedScopeOrComparator |
 | MYSQL.TYPES | Native unsigned types | UnexecutedScopeOrComparator |

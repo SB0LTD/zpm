@@ -2,7 +2,7 @@
 
 `src/gpu/` is zpm's GPU-neutral compute layer. A kernel is written once, in
 KIR, and runs on whatever GPU the machine has: Qualcomm's Adreno, NVIDIA's
-RTX, and later Apple, Intel and AMD. It is pure Sig and allocation-free:
+RTX, AMD's GCN 4 (Polaris), and later Apple and Intel. It is pure Sig and allocation-free:
 storage always comes from the caller. No C, Mesa, CUDA, Vulkan or vendor user
 space is involved at build or run time.
 
@@ -18,6 +18,7 @@ Galaxy's kernel already has a module named `gpu`.
 | `emu_device.sig` | `EmuDevice`, the reference device, which runs on the interpreter. |
 | `kir_ir3.sig`, `adreno_device.sig` | The Adreno backend and its device adapter (agent Q's branch). |
 | `kir_sm120.sig`, `nvidia_device.sig` | The NVIDIA backend and its device adapter (agent N's branch). |
+| `kir_gcn4.sig`, `amd_device.sig` | The AMD GCN 4 (gfx803) backend and the emulated Polaris as a device; see `docs/AMD_GCN3.md`. |
 
 Comments in `src/gpu/*.sig` name files in prose only. Galaxy's module resolver
 scans source text, comments included, so a commented-out import of a file
@@ -223,17 +224,26 @@ underflow (rounded to nearest even from c's significand and its sticky bit,
 c's remainder ≠ 0), overflow, the special values, then flushing if the caps
 ask for it.
 
-Run on the fast path, in KIR instructions (about 13 of each are bit-cast
-`mov`s and if/endif pairs that all lanes skip; backends coalesce the movs
-and branch over the blocks):
+Every register is written once. A block's values are picked by a select
+after it, and a lane that skipped the block reads whatever its registers
+hold, which the select drops. A backend that can't tell whether a loop
+carries a register written twice keeps it live through the whole loop. ir3's
+allocator once did, and a GLSL fragment shader (inside the raster's triangle
+loop) with 48 divisions took all of the Adreno's registers. ir3 now tells
+(see the backend's allocation below), and writing once costs nothing either
+way.
+
+Run on the fast path, in KIR instructions (about 16 of each are bit-cast
+`mov`s, the selects after the blocks, and if/endif pairs that all lanes
+skip; backends coalesce the movs and branch over the blocks):
 
 | Expansion | fused | mul/add |
 |---|---|---|
-| fdiv | 39 | 74 |
-| fsqrt | 32 | 60 |
+| fdiv | 42 | 77 |
+| fsqrt | 33 | 61 |
 
 The whole expansion, both paths, is 111 or 146 instructions for fdiv and
-62 or 90 for fsqrt. For comparison, NVIDIA's own fast path (MUFU.RCP plus 7
+61 or 89 for fsqrt. For comparison, NVIDIA's own fast path (MUFU.RCP plus 7
 FFMA, behind FCHK) is about 10 instructions; it relies on MUFU.RCP's known
 accuracy. A target whose reciprocal is proven tight enough for Markstein's
 last step could add that variant as an option; it would then be tested
@@ -290,7 +300,14 @@ A new GPU is a KIR backend plus a device adapter. Nothing else changes.
    - start from `kir.expand(k, caps, storage)`, so that `fdiv` and `fsqrt`
      arrive as the shared exact expansions;
    - expand `dot4` itself when `!caps.dot4`;
-   - allocate registers using liveness over the structured flow;
+   - allocate registers using liveness over the structured flow. A
+     register written more than once inside a loop lives through the loop
+     only when the loop carries it. ir3 decides this by region: the
+     then-part, else-part and loop body record their instruction spans. A
+     register stays local when its first access writes it at the top level
+     of its innermost region and every later access lies in that region:
+     each pass writes it before reading it. Registers live into or out of
+     a loop, and ones read before they are written, still live through it;
    - legalize: `ffma` only with a native fused FMA; `fmad` as the hardware's
      mad; `fneg`/`fabs` as sign-bit ops or as modifiers on ops that flush
      anyway;

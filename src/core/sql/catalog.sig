@@ -10,7 +10,10 @@
 //!   cat_attrdef    (adrelid, adnum, adbin)                       tables x columns (empty until defaults)
 //!   cat_sequences  (seqrelid, start, increment, max, min, cycle)  sequences
 //!                  (values are non-transactional and live in the sequence slots)
-//!   cat_namespaces pg_catalog (11), public (2200), information_schema: static
+//!   cat_namespaces pg_catalog (11), public (2200), information_schema,
+//!                  pg_toast (99): static;
+//!                  user schemas are cat_relations rows of relkind 'n'
+//!                  (Config.schemas slots) and tables carry their namespace
 //!
 //! Every relation is sized by the user-object limits (Config.tables,
 //! columns, sequences) with two versions per row, so user DDL hits
@@ -31,18 +34,26 @@ pub const namespaces = [_]Namespace{
     .{ .oid = 11, .name = "pg_catalog" },
     .{ .oid = 2200, .name = "public" },
     .{ .oid = 13000, .name = "information_schema" },
+    // TOAST relations live here in PostgreSQL; ZPM stores no TOAST tables,
+    // so the schema is always empty and closed to user objects.
+    .{ .oid = 99, .name = "pg_toast" },
 };
 
 pub const public_namespace: u32 = 2200;
 pub const catalog_namespace: u32 = 11;
 pub const information_namespace: u32 = 13000;
+pub const toast_namespace: u32 = 99;
 
 /// System views (design §4.10): virtual relations computed at scan time from
 /// the catalog base relations, the table definitions and the static type
 /// table under the statement snapshot. Columns PostgreSQL declares as
 /// "char", regproc, int2vector, character_data or yes_or_no are text here;
 /// sql_identifier columns are name (OID 19), cardinal_number int4.
-pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_index, pg_attrdef, pg_sequence, schemata, tables, columns, table_constraints, key_column_usage };
+pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_index, pg_attrdef, pg_sequence, schemata, tables, columns, table_constraints, key_column_usage, pg_indexes, pg_views, pg_matviews, pg_inherits,
+    // Routines, triggers and rules (B11 wave 3).
+    pg_proc, pg_trigger, pg_rewrite, pg_rules,
+    // Catalog objects (B11 wave 3, catalog_objects.sig).
+    pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges };
 
 pub const ViewColumn = struct { name: []const u8, ty: types.Type };
 
@@ -61,7 +72,33 @@ const schemata_columns = [_]ViewColumn{ col("catalog_name", .name), col("schema_
 const tables_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("table_type", .text) };
 const columns_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4), col("column_default", .text), col("is_nullable", .text), col("data_type", .text), col("character_maximum_length", .int4), col("numeric_precision", .int4), col("numeric_precision_radix", .int4), col("numeric_scale", .int4), col("datetime_precision", .int4), col("is_identity", .text), col("identity_generation", .text), col("is_generated", .text), col("generation_expression", .text) };
 const table_constraints_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("constraint_type", .text) };
+const pg_indexes_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("indexname", .name), col("tablespace", .name), col("indexdef", .text) };
+const pg_views_columns = [_]ViewColumn{ col("schemaname", .name), col("viewname", .name), col("viewowner", .name), col("definition", .text) };
+const pg_matviews_columns = [_]ViewColumn{ col("schemaname", .name), col("matviewname", .name), col("matviewowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("ispopulated", .boolean), col("definition", .text) };
+const pg_inherits_columns = [_]ViewColumn{ col("inhrelid", .oid), col("inhparent", .oid), col("inhseqno", .int4), col("inhdetachpending", .boolean) };
+// pg_proc.prolang is shown as the language name (its OID is per database).
+const pg_proc_columns = [_]ViewColumn{ col("oid", .oid), col("proname", .name), col("pronamespace", .oid), col("prokind", .text), col("prolang", .name), col("provolatile", .text), col("proisstrict", .boolean), col("pronargs", .int2), col("prorettype", .oid), col("proargtypes", .text), col("prosrc", .text) };
+const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid), col("tgname", .name), col("tgfoid", .oid), col("tgtype", .int2), col("tgenabled", .text), col("tgisinternal", .boolean), col("tgnargs", .int2) };
+const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .text), col("ev_enabled", .text), col("is_instead", .boolean) };
+const pg_rules_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("rulename", .name), col("definition", .text) };
 const key_column_usage_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4) };
+
+const oid_array = types.arrayType(.oid).?;
+const name_array = types.arrayType(.name).?;
+const text_array = types.arrayType(.text).?;
+const pg_roles_columns = [_]ViewColumn{ col("rolname", .name), col("rolsuper", .boolean), col("rolinherit", .boolean), col("rolcreaterole", .boolean), col("rolcreatedb", .boolean), col("rolcanlogin", .boolean), col("rolreplication", .boolean), col("rolconnlimit", .int4), col("rolpassword", .text), col("rolvaliduntil", .timestamptz), col("rolbypassrls", .boolean), col("rolconfig", text_array), col("oid", .oid) };
+const pg_authid_columns = [_]ViewColumn{ col("oid", .oid), col("rolname", .name), col("rolsuper", .boolean), col("rolinherit", .boolean), col("rolcreaterole", .boolean), col("rolcreatedb", .boolean), col("rolcanlogin", .boolean), col("rolreplication", .boolean), col("rolbypassrls", .boolean), col("rolconnlimit", .int4), col("rolpassword", .text), col("rolvaliduntil", .timestamptz) };
+const pg_auth_members_columns = [_]ViewColumn{ col("oid", .oid), col("roleid", .oid), col("member", .oid), col("grantor", .oid), col("admin_option", .boolean), col("inherit_option", .boolean), col("set_option", .boolean) };
+const pg_policy_columns = [_]ViewColumn{ col("oid", .oid), col("polname", .name), col("polrelid", .oid), col("polcmd", .text), col("polpermissive", .boolean), col("polroles", oid_array), col("polqual", .text), col("polwithcheck", .text) };
+const pg_policies_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("policyname", .name), col("permissive", .text), col("roles", name_array), col("cmd", .text), col("qual", .text), col("with_check", .text) };
+const pg_description_columns = [_]ViewColumn{ col("objoid", .oid), col("classoid", .oid), col("objsubid", .int4), col("description", .text) };
+const pg_shdescription_columns = [_]ViewColumn{ col("objoid", .oid), col("classoid", .oid), col("description", .text) };
+const pg_foreign_data_wrapper_columns = [_]ViewColumn{ col("oid", .oid), col("fdwname", .name), col("fdwowner", .oid), col("fdwhandler", .oid), col("fdwvalidator", .oid), col("fdwacl", text_array), col("fdwoptions", text_array) };
+const pg_foreign_server_columns = [_]ViewColumn{ col("oid", .oid), col("srvname", .name), col("srvowner", .oid), col("srvfdw", .oid), col("srvtype", .text), col("srvversion", .text), col("srvacl", text_array), col("srvoptions", text_array) };
+const pg_publication_columns = [_]ViewColumn{ col("oid", .oid), col("pubname", .name), col("pubowner", .oid), col("puballtables", .boolean), col("pubinsert", .boolean), col("pubupdate", .boolean), col("pubdelete", .boolean), col("pubtruncate", .boolean), col("pubviaroot", .boolean), col("pubgencols", .text) };
+const pg_extension_columns = [_]ViewColumn{ col("oid", .oid), col("extname", .name), col("extowner", .oid), col("extnamespace", .oid), col("extrelocatable", .boolean), col("extversion", .text), col("extconfig", oid_array), col("extcondition", text_array) };
+const pg_tables_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("tableowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("hasrules", .boolean), col("hastriggers", .boolean), col("rowsecurity", .boolean) };
+const table_privileges_columns = [_]ViewColumn{ col("grantor", .name), col("grantee", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("privilege_type", .text), col("is_grantable", .text), col("with_hierarchy", .text) };
 
 pub fn viewColumns(view: View) []const ViewColumn {
     return switch (view) {
@@ -77,14 +114,36 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .columns => &columns_columns,
         .table_constraints => &table_constraints_columns,
         .key_column_usage => &key_column_usage_columns,
+        .pg_indexes => &pg_indexes_columns,
+        .pg_views => &pg_views_columns,
+        .pg_matviews => &pg_matviews_columns,
+        .pg_inherits => &pg_inherits_columns,
+        .pg_proc => &pg_proc_columns,
+        .pg_trigger => &pg_trigger_columns,
+        .pg_rewrite => &pg_rewrite_columns,
+        .pg_rules => &pg_rules_columns,
+        .pg_roles => &pg_roles_columns,
+        .pg_authid => &pg_authid_columns,
+        .pg_auth_members => &pg_auth_members_columns,
+        .pg_policy => &pg_policy_columns,
+        .pg_policies => &pg_policies_columns,
+        .pg_description => &pg_description_columns,
+        .pg_shdescription => &pg_shdescription_columns,
+        .pg_foreign_data_wrapper => &pg_foreign_data_wrapper_columns,
+        .pg_foreign_server => &pg_foreign_server_columns,
+        .pg_publication => &pg_publication_columns,
+        .pg_extension => &pg_extension_columns,
+        .pg_tables => &pg_tables_columns,
+        .table_privileges => &table_privileges_columns,
     };
 }
 
 /// pg_catalog views resolve unqualified (pg_catalog is searched first);
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
-    const catalog_views = [_]View{ .pg_type, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence };
-    const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage };
+    const catalog_views = [_]View{ .pg_type, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
+        .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_extension, .pg_tables };
+    const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
         return null;
@@ -98,7 +157,7 @@ pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
 }
 
 pub fn Catalog(comptime config: types.Config) type {
-    const rows = @max(config.tables * config.columns, config.tables + config.sequences);
+    const rows = @max(config.tables * config.columns, config.tables + config.sequences + config.schemas);
     const cat_config: types.Config = .{
         .tables = 1,
         .columns = 6,
@@ -149,6 +208,65 @@ pub fn Catalog(comptime config: types.Config) type {
             return config.tables + slot + 1;
         }
 
+        fn schemaRow(slot: usize) u64 {
+            return config.tables + config.sequences + slot + 1;
+        }
+
+        /// A user schema: cat_relations row (oid, name, 'n', 0, slot).
+        pub fn createSchema(self: *Self, slot: usize, oid: u32, name: []const u8, xmin: storage.TxRef, cid: u32, csn: u64, horizon: u64, out: *[max_changes]Change) Error!usize {
+            const cells = [_]CV.Cell{ int(oid), text(name), text("n"), int(0), int(@intCast(slot)) };
+            out[0] = .{ .relation = .relations, .version = try self.addVersion(.relations, schemaRow(slot), &cells, xmin, cid, csn, horizon) };
+            return 1;
+        }
+
+        pub fn dropSchema(self: *Self, slot: usize, snap: storage.Snapshot, xmax: storage.TxRef, cid: u32, csn: u64, out: *[max_changes]Change) usize {
+            const relations = self.relation(.relations);
+            const version = visibleRow(relations, schemaRow(slot), snap) orelse return 0;
+            mark(relations, version, xmax, cid, csn);
+            out[0] = .{ .relation = .relations, .version = version };
+            return 1;
+        }
+
+        pub const SchemaFound = struct { oid: u32, slot: usize };
+
+        /// A user schema named `name` visible to `snap`.
+        pub fn findSchema(self: *const Self, name: []const u8, snap: storage.Snapshot) ?SchemaFound {
+            const relations = self.relationConst(.relations);
+            for (0..relations.row_high) |row| {
+                const version = SC.visibleAt(relations, row, snap) orelse continue;
+                const cells = &relations.versions[version].cells;
+                if (cells[2].text.bytes[0] != 'n' or !sameName(&cells[1], name)) continue;
+                return .{ .oid = @intCast(cells[0].integer), .slot = @intCast(cells[4].integer) };
+            }
+            return null;
+        }
+
+        /// Every user schema visible to `snap`, in catalog row order.
+        pub fn visibleSchemas(self: *const Self, snap: storage.Snapshot, out: *[rows]SchemaFound) usize {
+            const relations = self.relationConst(.relations);
+            var count: usize = 0;
+            for (0..relations.row_high) |row| {
+                const version = SC.visibleAt(relations, row, snap) orelse continue;
+                const cells = &relations.versions[version].cells;
+                if (cells[2].text.bytes[0] != 'n') continue;
+                out[count] = .{ .oid = @intCast(cells[0].integer), .slot = @intCast(cells[4].integer) };
+                count += 1;
+            }
+            return count;
+        }
+
+        /// A live transaction other than the snapshot's own with an
+        /// uncommitted relation row in namespace `namespace`.
+        pub fn namespaceCreator(self: *const Self, namespace: u32, snap: storage.Snapshot) ?u16 {
+            const relations = self.relationConst(.relations);
+            for (relations.versions[0..relations.version_high]) |*version| {
+                if (version.row == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
+                if (version.xmax.epoch != 0) continue;
+                if (version.cells[3] == .integer and version.cells[3].integer == namespace and version.cells[2].text.bytes[0] != 'n') return version.xmin.slot;
+            }
+            return null;
+        }
+
         /// cat_relations (relkind S) and cat_sequences rows for a sequence slot.
         pub fn createSequence(self: *Self, slot: usize, seq: anytype, xmin: storage.TxRef, cid: u32, csn: u64, horizon: u64, out: *[max_changes]Change) Error!usize {
             var count: usize = 0;
@@ -184,25 +302,33 @@ pub fn Catalog(comptime config: types.Config) type {
         pub const relation_rows = rows;
 
         /// Every relation (table or sequence) visible to `snap`, in
-        /// catalog row order.
+        /// catalog row order. Schemas are listed by visibleSchemas.
         pub fn visibleRelations(self: *const Self, snap: storage.Snapshot, out: *[rows]Found) usize {
             const relations = self.relationConst(.relations);
             var count: usize = 0;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
                 const cells = &relations.versions[version].cells;
+                if (cells[2].text.bytes[0] == 'n') continue;
                 out[count] = .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
                 count += 1;
             }
             return count;
         }
 
-        /// Any relation (table or sequence) named `name` visible to `snap`.
+        /// Any relation (table or sequence) named `name` in the public
+        /// schema (the default search_path) visible to `snap`.
         pub fn find(self: *const Self, name: []const u8, snap: storage.Snapshot) ?Found {
+            return self.findIn(public_namespace, name, snap);
+        }
+
+        /// A table or sequence named `name` in schema `namespace`.
+        pub fn findIn(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) ?Found {
             const relations = self.relationConst(.relations);
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
                 const cells = &relations.versions[version].cells;
+                if (cells[2].text.bytes[0] == 'n' or cells[3].integer != namespace) continue;
                 if (sameName(&cells[1], name)) return .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
             }
             return null;
@@ -229,7 +355,8 @@ pub fn Catalog(comptime config: types.Config) type {
             var count: usize = 0;
             errdefer for (out[0..count]) |change| SC.reclaimVersion(self.relation(change.relation), change.version);
             const oid: i64 = table.oid;
-            const relation_cells = [_]CV.Cell{ int(oid), text(table.name.slice()), text("r"), int(public_namespace), int(@intCast(slot)) };
+            const kind = [1]u8{table.relkind};
+            const relation_cells = [_]CV.Cell{ int(oid), text(table.name.slice()), text(&kind), int(table.namespace), int(@intCast(slot)) };
             out[count] = .{ .relation = .relations, .version = try self.addVersion(.relations, slot + 1, &relation_cells, xmin, cid, csn, horizon) };
             count += 1;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
@@ -278,7 +405,7 @@ pub fn Catalog(comptime config: types.Config) type {
         /// Table slot whose relation row named `name` is visible to `snap`.
         pub fn lookup(self: *const Self, name: []const u8, snap: storage.Snapshot) ?usize {
             const found = self.find(name, snap) orelse return null;
-            return if (found.kind == 'r') found.slot else null;
+            return if (found.kind == 'r' or found.kind == 'm' or found.kind == 'p' or found.kind == 'v') found.slot else null;
         }
 
         /// A live transaction other than the snapshot's own that has an

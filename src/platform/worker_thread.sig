@@ -19,6 +19,13 @@ const Win = struct {
     extern "ntdll" fn RtlWakeAddressAll(*const anyopaque) callconv(.winapi) void;
 };
 pub const Entry = *const fn (?*anyopaque) void;
+/// Worker stack size. Debug frames are far larger than optimized ones: no
+/// slot reuse, and every by-value aggregate gets its own stack copy. One
+/// RAMSQL dispatch frame alone exceeded 4 MiB in Debug. So Debug workers
+/// match the executable's default 16 MiB main stack, and optimized builds
+/// keep 4 MiB. Both are reservations that the OS commits as pages are touched.
+/// Callers that budget memory per worker should count this.
+pub const stack_bytes: usize = if (builtin.mode == .debug) 16 * 1024 * 1024 else 4 * 1024 * 1024;
 pub const Error = error{ UnsupportedPlatform, AlreadyStarted, ThreadCreationFailed, ThreadJoinFailed };
 
 /// Must remain at a stable address until join returns. The context must also
@@ -41,9 +48,9 @@ pub const Thread = struct {
         self.context = context;
         if (builtin.os.tag == .windows) {
             // STACK_SIZE_PARAM_IS_A_RESERVATION; commit grows through OS faults.
-            self.handle = Win.CreateThread(null, 4 * 1024 * 1024, &windowsEntry, self, 0x10000, null) orelse return error.ThreadCreationFailed;
+            self.handle = Win.CreateThread(null, stack_bytes, &windowsEntry, self, 0x10000, null) orelse return error.ThreadCreationFailed;
         } else if (builtin.os.tag == .linux and !builtin.link_libc) {
-            self.handle = std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, run, .{self}) catch return error.ThreadCreationFailed;
+            self.handle = std.Thread.spawn(.{ .stack_size = stack_bytes }, run, .{self}) catch return error.ThreadCreationFailed;
         }
     }
     /// A failed native wait retains ownership. Never close a live thread handle.

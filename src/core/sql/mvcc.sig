@@ -21,6 +21,7 @@ const types = @import("types.sig");
 const storage = @import("storage.sig");
 const locks = @import("locks.sig");
 const sequence = @import("sequence.sig");
+const catalog_objects = @import("catalog_objects.sig");
 const Error = types.Error;
 
 pub fn Mvcc(comptime config: types.Config) type {
@@ -32,7 +33,21 @@ pub fn Mvcc(comptime config: types.Config) type {
         pub const write_capacity: usize = if (config.tx_writes == 0) @max(config.rows_per_table * 2, 64) else config.tx_writes;
         pub const sub_capacity: usize = config.savepoints + 1;
 
-        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence };
+        /// `truncate`: every row version visible to the TRUNCATE statement was
+        /// marked deleted in place with xmax = (this transaction, `old` as
+        /// command id); one entry covers the whole table.
+        /// `alter_table`: ALTER TABLE copied table slot `old` into slot `table`
+        /// (same OID, new definition) at command id `new`; the old slot dies
+        /// at commit, the new one is discarded at abort.
+        /// `alter_sequence`: ALTER SEQUENCE copied sequence slot `old` into
+        /// slot `table` (same OID, new options/state).
+        /// `create_schema` / `drop_schema`: schema slot `table`.
+        /// `create_object` / `drop_object` (B11 wave 3): routine, trigger or
+        /// rule slot `table` of class `new` (routine_catalog.Class).
+        /// `object_insert` / `object_delete`: catalog object entry `new` /
+        /// `old` (catalog_objects.sig, B11 wave 3); an insert's `table` is 1
+        /// when the version took a fresh OID.
+        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_object, drop_object, object_insert, object_delete };
 
         /// `table` is the table slot (catalog relation, sequence slot);
         /// `old`/`new` are version indices.
@@ -47,6 +62,13 @@ pub fn Mvcc(comptime config: types.Config) type {
         };
 
         pub const TableWait = struct { table: u8, mode: locks.TableMode, seq: u64 };
+
+        /// A SET CONSTRAINTS name: the table OID and constraint name.
+        pub const ConstraintMode = struct { oid: u32, name: V.Name, deferred: bool };
+
+        /// Effective isolation levels (READ UNCOMMITTED is READ COMMITTED,
+        /// as in PostgreSQL).
+        pub const Level = enum(u8) { read_committed, repeatable_read, serializable, read_uncommitted };
 
         pub const Tx = struct {
             active: bool = false,
@@ -83,6 +105,28 @@ pub fn Mvcc(comptime config: types.Config) type {
             copy_table: ?u8 = null,
             copy_snap: storage.Snapshot = .{ .csn = 0 },
             copy_rows: usize = 0,
+            /// A deferred constraint skipped a check: COMMIT (or SET
+            /// CONSTRAINTS ... IMMEDIATE) re-checks this transaction's rows.
+            deferred_checks: bool = false,
+            /// SET CONSTRAINTS ALL mode (null: each constraint's INITIALLY).
+            constraints_all: ?bool = null,
+            /// SET CONSTRAINTS name modes, newest last.
+            constraint_modes: [config.constraint_modes]ConstraintMode = undefined,
+            constraint_mode_count: usize = 0,
+            /// Transaction modes (tx-session lane): isolation level (RC, RR
+            /// or SERIALIZABLE), READ ONLY and DEFERRABLE.
+            isolation: Level = .read_committed,
+            read_only: bool = false,
+            deferrable: bool = false,
+            /// REPEATABLE READ / SERIALIZABLE: the transaction snapshot
+            /// (commit sequence number), taken by the first statement that
+            /// needs one (command id `snapshot_cid`).
+            snapshot_csn: ?u64 = null,
+            snapshot_cid: u32 = 0,
+            /// The session (engine session-state id) that began it.
+            session: u64 = 0,
+            /// SERIALIZABLE conflict tracking record (ssi.sig), if any.
+            ssi: ?u16 = null,
 
             pub fn ref(self: *const Tx, slot: usize) storage.TxRef {
                 return .{ .slot = @intCast(slot), .epoch = self.epoch, .sub = @intCast(self.sub_len) };
@@ -142,7 +186,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                         const table = &db.tables[entry.table];
                         table.pending_create = false;
                         table.live = false;
-                        const width: u32 = 1 + @as(u32, @intFromBool(table.primary_column != null));
+                        const width: u32 = S.oidWidth(table);
                         if (db.oid_counter + types_first_oid == table.oid + width) db.oid_counter -= width;
                     },
                     .drop_table => db.tables[entry.table].pending_drop = false,
@@ -156,6 +200,50 @@ pub fn Mvcc(comptime config: types.Config) type {
                         tx.seq_dirty.remove(entry.table);
                     },
                     .drop_sequence => db.seqs[entry.table].pending_drop = false,
+                    .truncate => {
+                        const table = &db.tables[entry.table];
+                        for (table.versions[0..table.version_high]) |*version| {
+                            if (truncated(version, tx, slot, entry.old)) clearMark(version);
+                        }
+                    },
+                    .alter_table => {
+                        const copy = &db.tables[entry.table];
+                        // Index OIDs this ALTER took, when still the tail.
+                        var position = copy.index_count;
+                        while (position > 0) {
+                            position -= 1;
+                            const taken = copy.indexes[position].oid;
+                            var kept = false;
+                            const old = &db.tables[entry.old];
+                            for (old.indexes[0..old.index_count]) |*existing| kept = kept or existing.oid == taken;
+                            if (taken != 0 and !kept and db.oid_counter + types_first_oid == taken + 1) db.oid_counter -= 1;
+                        }
+                        copy.live = false;
+                        copy.pending_create = false;
+                        db.tables[entry.old].pending_drop = false;
+                    },
+                    .alter_sequence => {
+                        const copy = &db.seqs[entry.table];
+                        copy.live = false;
+                        copy.pending_create = false;
+                        tx.seq_dirty.remove(entry.table);
+                        db.seqs[entry.old].pending_drop = false;
+                    },
+                    .create_schema => {
+                        const schema = &db.schemas[entry.table];
+                        schema.live = false;
+                        schema.pending_create = false;
+                        if (db.oid_counter + types_first_oid == schema.oid + 1) db.oid_counter -= 1;
+                    },
+                    .drop_schema => db.schemas[entry.table].pending_drop = false,
+                    .create_object, .drop_object => db.undoObject(entry.kind == .create_object, entry.new, entry.table),
+                    .object_insert => {
+                        const object = &db.catalog_objects.items[entry.new];
+                        // `table` 1: this version took a fresh OID.
+                        if (entry.table == 1 and catalog_objects.ownsOid(object.kind) and db.oid_counter + types_first_oid == object.oid + 1) db.oid_counter -= 1;
+                        db.catalog_objects.undoInsert(entry.new);
+                    },
+                    .object_delete => db.catalog_objects.undoDelete(entry.old),
                 }
             }
             tx.write_len = start;
@@ -163,6 +251,13 @@ pub fn Mvcc(comptime config: types.Config) type {
         }
 
         const types_first_oid: u32 = 16384;
+
+        /// A version this transaction's TRUNCATE (command `cid`) marked and
+        /// has not published.
+        pub fn truncated(version: *const S.Version, tx: *const Tx, slot: usize, cid: u32) bool {
+            return version.row != 0 and version.xmax.epoch == tx.epoch and version.xmax.slot == slot and
+                version.xmax_cid == cid and version.xmax_csn == 0;
+        }
 
         /// Lists a lock just granted to `slot`. When the list is full the
         /// grant is released again, so the failing statement leaves the
@@ -226,6 +321,46 @@ pub fn Mvcc(comptime config: types.Config) type {
                         seq.pending_drop = false;
                         seq.dead_csn = csn;
                     },
+                    .truncate => {
+                        const table = &db.tables[entry.table];
+                        for (table.versions[0..table.version_high], 0..) |*version, index| {
+                            if (!truncated(version, tx, slot, entry.old)) continue;
+                            S.summarize(table, &version.cells, false, csn);
+                            S.scanPublish(table, @intCast(index), false);
+                            version.xmax_csn = csn;
+                        }
+                    },
+                    .alter_table => {
+                        const old = &db.tables[entry.old];
+                        old.pending_drop = false;
+                        old.dead_csn = csn;
+                        // The copy's own versions from statements before the
+                        // ALTER have no write entries in this slot: publish
+                        // them here. Later statements' entries follow.
+                        const copy = &db.tables[entry.table];
+                        copy.pending_create = false;
+                        for (copy.versions[0..copy.version_high]) |*version| {
+                            if (version.row == 0) continue;
+                            if (version.xmin_csn == 0 and version.xmin.epoch == tx.epoch and version.xmin.slot == slot and version.xmin_cid < entry.new) version.xmin_csn = csn;
+                            if (version.xmax_csn == 0 and version.xmax.epoch == tx.epoch and version.xmax.slot == slot and version.xmax_cid < entry.new) version.xmax_csn = csn;
+                        }
+                        S.rebuildCommitted(copy, csn);
+                    },
+                    .alter_sequence => {
+                        const old = &db.seqs[entry.old];
+                        old.pending_drop = false;
+                        old.dead_csn = csn;
+                        db.seqs[entry.table].pending_create = false;
+                    },
+                    .create_schema => db.schemas[entry.table].pending_create = false,
+                    .drop_schema => {
+                        const schema = &db.schemas[entry.table];
+                        schema.pending_drop = false;
+                        schema.dead_csn = csn;
+                    },
+                    .create_object, .drop_object => db.stampObject(entry.kind == .create_object, entry.new, entry.table, csn),
+                    .object_insert => db.catalog_objects.stampInsert(entry.new, csn),
+                    .object_delete => db.catalog_objects.stampDelete(entry.old, csn),
                 }
             }
         }
@@ -236,6 +371,12 @@ pub fn Mvcc(comptime config: types.Config) type {
             const tx = &db.txs[slot];
             var budget: usize = S.reclaim_budget;
             for (tx.writes[0..tx.write_len]) |entry| {
+                // A published TRUNCATE frees its table's dead versions at once.
+                if (entry.kind == .truncate) {
+                    const table = &db.tables[entry.table];
+                    if (table.live and table.dead_csn == 0) _ = S.vacuum(table, horizon);
+                    continue;
+                }
                 if (budget == 0) break;
                 if (entry.kind != .update and entry.kind != .delete) continue;
                 const table = &db.tables[entry.table];

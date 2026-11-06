@@ -1185,7 +1185,11 @@ fn storeContracts() !void {
     try commandTag(try storeQuery(&sa, &a, "COMMIT"), "COMMIT");
     _ = try storeQuery(&sb, &b, "SELECT v FROM w");
     try check(sb.result.rows[0].cells[0].integer == 2);
-    try state(try storeQuery(&sa, &a, "BEGIN ISOLATION LEVEL SERIALIZABLE"), "0A000");
+    // Transaction modes are engine state now (tx-session lane).
+    try commandTag(try storeQuery(&sa, &a, "BEGIN ISOLATION LEVEL SERIALIZABLE"), "BEGIN");
+    _ = try storeQuery(&sa, &a, "SHOW transaction_isolation");
+    try check(equal(sa.result.rows[0].cells[0].text.slice(), "serializable"));
+    try commandTag(try storeQuery(&sa, &a, "ROLLBACK"), "ROLLBACK");
     _ = try storeQuery(&sa, &a, "SHOW transaction_isolation");
     try check(equal(sa.result.rows[0].cells[0].text.slice(), "read committed") and equal(sa.result.column_names[0].slice(), "transaction_isolation"));
     const usage = store.database.usage();

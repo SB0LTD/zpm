@@ -500,13 +500,39 @@ pub fn Session(comptime DB: type) type {
         }
         fn ready(self: *Self, db: *DB, w: *Writer) !void {
             _ = self;
-            // Changed reported settings precede ReadyForQuery, as PostgreSQL's
-            // ReportChangedGUCOptions.
+            // Committed notifications for this session (between transactions,
+            // as PostgreSQL's ProcessCompletedNotifies), then changed reported
+            // settings, before ReadyForQuery.
+            try writeNotifications(db, w);
             if (@hasDecl(DB, "takeParameterChanges")) try reportParameters(db, w, db.takeParameterChanges());
             const p = try w.begin('Z');
             try w.byte(if (@hasDecl(DB, "transactionStatus")) db.transactionStatus() else 'I');
             w.end(p);
         }
+        /// NotificationResponse ('A'): sender pid, channel, payload.
+        fn writeNotifications(db: *DB, w: *Writer) !void {
+            if (!@hasDecl(DB, "takeNotification")) return;
+            var note: DB.Notification = undefined;
+            while (db.takeNotification(&note)) {
+                const p = try w.begin('A');
+                try w.u32be(note.pid);
+                try w.string(note.channel.slice());
+                try w.string(note.payloadSlice());
+                w.end(p);
+            }
+        }
+
+        /// Notifications committed while the client is idle (PostgreSQL
+        /// sends them asynchronously): call when the connection has no
+        /// pending input. Returns the bytes written.
+        pub fn notifications(self: *Self, db: *DB, output: []u8) error{BufferTooSmall}!usize {
+            if (!self.startup or self.copy.mode != .none) return 0;
+            if (@hasDecl(DB, "transactionStatus")) if (db.transactionStatus() != 'I') return 0;
+            var w: Writer = .{ .bytes = output };
+            writeNotifications(db, &w) catch return error.BufferTooSmall;
+            return w.at;
+        }
+
         fn dispatch(self: *Self, db: *DB, tag: u8, body: []const u8, w: *Writer) !bool {
             var r: Reader = .{ .bytes = body };
             switch (tag) {
@@ -647,6 +673,7 @@ pub fn Session(comptime DB: type) type {
             self.result.affected_rows = 0;
             if (@hasField(DB.Result, "command")) self.result.command = .none;
             self.commit_rolled_back = false;
+            if (@hasDecl(DB, "setBackendPid")) db.setBackendPid(self.backend_pid);
             const command_source = trim(source);
             if (keyword(command_source, "begin") or keyword(command_source, "begin work") or keyword(command_source, "begin transaction") or keyword(command_source, "start transaction")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
@@ -658,7 +685,13 @@ pub fn Session(comptime DB: type) type {
                 if (@hasDecl(DB, "rollbackTransaction")) try db.rollbackTransaction() else return error.UnsupportedStatement;
             } else if (word(source, "deallocate")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
-                try self.deallocate(source);
+                // Protocol-level statements first; SQL PREPARE names (and
+                // DEALLOCATE ALL) belong to the engine too.
+                const forward = self.deallocate(source) catch |err| switch (err) {
+                    error.StatementNotFound => if (@hasDecl(DB, "takeNotification")) true else return err,
+                    else => return err,
+                };
+                if (forward and @hasDecl(DB, "takeNotification")) try db.execute(source, &self.result);
             } else {
                 try db.execute(source, &self.result);
                 // ROLLBACK TO closes portals created after the savepoint.
@@ -1067,7 +1100,10 @@ pub fn Session(comptime DB: type) type {
             try db.describe(source, &self.result);
         }
 
-        fn deallocate(self: *Self, source: []const u8) !void {
+        /// Returns true when the engine should see the command as well
+        /// (DEALLOCATE ALL); a name that is no protocol statement is
+        /// StatementNotFound.
+        fn deallocate(self: *Self, source: []const u8) !bool {
             var tokens: Tokens = .{ .source = source };
             if (!keyword(try tokens.next(), "deallocate")) return error.Syntax;
             var name = try tokens.next();
@@ -1078,7 +1114,7 @@ pub fn Session(comptime DB: type) type {
             if (next.len != 0) return error.Syntax;
             if (keyword(name, "all")) {
                 for (&self.statements) |*s| s.live = false;
-                return;
+                return true;
             }
             var unquoted: [64]u8 = undefined;
             if (name[0] == '"') {
@@ -1098,6 +1134,7 @@ pub fn Session(comptime DB: type) type {
             } else if (!identifier(name)) return error.Syntax;
             const s = try self.statement(name);
             s.live = false;
+            return false;
         }
         fn statement(self: *Self, name: []const u8) !*Statement {
             for (&self.statements) |*s| if (s.live and equal(s.name.slice(), name)) return s;
@@ -1215,7 +1252,7 @@ pub fn Session(comptime DB: type) type {
                         column_index += 1;
                         continue;
                     }
-                    if (token[0] == '$') {
+                    if (parameterToken(token)) {
                         if (column_index >= count_columns) return error.ColumnCapacity;
                         try inferOid(s, token, T.oid(self.result.column_types[mapping[column_index]]));
                     }
@@ -1226,7 +1263,7 @@ pub fn Session(comptime DB: type) type {
                 while (true) {
                     const token = try tokens.next();
                     if (token.len == 0) break;
-                    if (token[0] == '$') {
+                    if (parameterToken(token)) {
                         if (column_index) |i| try inferOid(s, token, T.oid(self.result.column_types[i]));
                     } else if (identifier(token)) {
                         column_index = self.column(token);
@@ -1362,7 +1399,39 @@ pub fn Session(comptime DB: type) type {
             }
         }
         fn command(self: *Self, w: *Writer, source: []const u8) !void {
+            if (self.objectTag()) |tag| {
+                const p = try w.begin('C');
+                try w.append(tag);
+                try w.byte(0);
+                w.end(p);
+                return;
+            }
             try commandFor(w, source, self.completed(), self.result.row_count, self.result.affected_rows, self.commit_rolled_back);
+        }
+        /// Command tags of the catalog-object statements (B11 wave 3).
+        fn objectTag(self: *const Self) ?[]const u8 {
+            if (!@hasField(DB.Result, "command")) return null;
+            return switch (self.result.command) {
+                .create_role => "CREATE ROLE",
+                .alter_role => "ALTER ROLE",
+                .drop_role => "DROP ROLE",
+                .grant => "GRANT",
+                .revoke => "REVOKE",
+                .grant_role => "GRANT ROLE",
+                .revoke_role => "REVOKE ROLE",
+                .create_policy => "CREATE POLICY",
+                .alter_policy => "ALTER POLICY",
+                .drop_policy => "DROP POLICY",
+                .comment => "COMMENT",
+                .create_foreign_data_wrapper => "CREATE FOREIGN DATA WRAPPER",
+                .drop_foreign_data_wrapper => "DROP FOREIGN DATA WRAPPER",
+                .create_server => "CREATE SERVER",
+                .drop_server => "DROP SERVER",
+                .create_publication => "CREATE PUBLICATION",
+                .drop_publication => "DROP PUBLICATION",
+                .create_extension => "CREATE EXTENSION",
+                else => null,
+            };
         }
         /// The engine's own command tag for the last statement, when it has one.
         fn completed(self: *const Self) []const u8 {
@@ -1376,6 +1445,11 @@ pub fn Session(comptime DB: type) type {
                 .drop_table => "drop",
                 .create_sequence => "create_sequence",
                 .drop_sequence => "drop_sequence",
+                .truncate => "truncate",
+                .alter_table => "alter_table",
+                .alter_sequence => "alter_sequence",
+                .create_schema => "create_schema",
+                .drop_schema => "drop_schema",
                 .begin => "begin",
                 .commit => "commit",
                 .rollback => "rollback",
@@ -1384,6 +1458,26 @@ pub fn Session(comptime DB: type) type {
                 .set => "set",
                 .show => "show",
                 .reset => "reset",
+                .lock_table => "lock_table",
+                .declare_cursor => "declare_cursor",
+                .fetch => "fetch",
+                .move => "move",
+                .close_cursor => "close_cursor",
+                .prepare => "prepare",
+                .deallocate => "deallocate",
+                .listen => "listen",
+                .notify => "notify",
+                .unlisten => "unlisten",
+                .create_function => "CREATE FUNCTION",
+                .drop_function => "DROP FUNCTION",
+                .create_procedure => "CREATE PROCEDURE",
+                .drop_procedure => "DROP PROCEDURE",
+                .call => "CALL",
+                .do_block => "DO",
+                .create_trigger => "CREATE TRIGGER",
+                .drop_trigger => "DROP TRIGGER",
+                .create_rule => "CREATE RULE",
+                .drop_rule => "DROP RULE",
                 else => "",
             };
         }
@@ -1392,10 +1486,44 @@ pub fn Session(comptime DB: type) type {
         }
         fn commandFor(w: *Writer, source: []const u8, completed_command: []const u8, row_count: usize, affected: usize, rolled_back: bool) !void {
             const p = try w.begin('C');
-            if (equal(completed_command, "create_sequence")) {
+            if (equal(completed_command, "lock_table")) {
+                try w.append("LOCK TABLE");
+            } else if (equal(completed_command, "declare_cursor")) {
+                try w.append("DECLARE CURSOR");
+            } else if (equal(completed_command, "fetch")) {
+                try w.append("FETCH ");
+                try w.number(@intCast(row_count));
+            } else if (equal(completed_command, "move")) {
+                try w.append("MOVE ");
+                try w.number(@intCast(affected));
+            } else if (equal(completed_command, "close_cursor")) {
+                try w.append("CLOSE CURSOR");
+            } else if (equal(completed_command, "prepare")) {
+                try w.append("PREPARE");
+            } else if (equal(completed_command, "deallocate")) {
+                try w.append(if (deallocateAll(source)) "DEALLOCATE ALL" else "DEALLOCATE");
+            } else if (equal(completed_command, "listen")) {
+                try w.append("LISTEN");
+            } else if (equal(completed_command, "notify")) {
+                try w.append("NOTIFY");
+            } else if (equal(completed_command, "unlisten")) {
+                try w.append("UNLISTEN");
+            } else if (completed_command.len != 0 and completed_command[0] >= 'A' and completed_command[0] <= 'Z') {
+                try w.append(completed_command);
+            } else if (equal(completed_command, "create_sequence")) {
                 try w.append("CREATE SEQUENCE");
             } else if (equal(completed_command, "drop_sequence")) {
                 try w.append("DROP SEQUENCE");
+            } else if (equal(completed_command, "truncate")) {
+                try w.append("TRUNCATE TABLE");
+            } else if (equal(completed_command, "alter_table")) {
+                try w.append("ALTER TABLE");
+            } else if (equal(completed_command, "alter_sequence")) {
+                try w.append("ALTER SEQUENCE");
+            } else if (equal(completed_command, "create_schema")) {
+                try w.append("CREATE SCHEMA");
+            } else if (equal(completed_command, "drop_schema")) {
+                try w.append("DROP SCHEMA");
             } else if (isCommand(completed_command, source, "select")) {
                 try w.append("SELECT ");
                 try w.number(@intCast(row_count));
@@ -1413,6 +1541,11 @@ pub fn Session(comptime DB: type) type {
             w.end(p);
         }
     };
+}
+
+fn deallocateAll(source: []const u8) bool {
+    const text = trim(source);
+    return text.len >= 3 and keyword(text[text.len - 3 ..], "all") and (text.len == 3 or text[text.len - 4] == ' ' or text[text.len - 4] == '\t' or text[text.len - 4] == '\n');
 }
 
 fn parameter(w: *Writer, key: []const u8, value: []const u8) !void {
@@ -1477,6 +1610,10 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "DivisionByZero")) return "22012";
     if (equal(name, "InvalidArgumentForPowerFunction")) return "2201F";
     if (equal(name, "InvalidEscapeSequence")) return "22025";
+    if (equal(name, "CharacterNotInRepertoire")) return "22021";
+    if (equal(name, "SubstringError")) return "22011";
+    if (equal(name, "InvalidArgumentForLogarithm")) return "2201E";
+    if (equal(name, "ProgramLimitExceeded")) return "54000";
     if (equal(name, "UndefinedParameter")) return "42P02";
     if (equal(name, "InvalidColumnReference")) return "42P10";
     if (equal(name, "WorkspaceCapacity")) return "54000";
@@ -1500,6 +1637,9 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "UndefinedObject")) return "42704";
     if (equal(name, "BadCopyFormat")) return "22P04";
     if (equal(name, "InvalidBinaryRepresentation")) return "22P03";
+    if (equal(name, "StringDataRightTruncation")) return "22001";
+    if (equal(name, "InvalidTimeZoneDisplacement")) return "22009";
+    if (equal(name, "StringDataLengthMismatch")) return "22026";
     if (equal(name, "NumericValueOutOfRange")) return "22003";
     if (equal(name, "NumericCapacity")) return "54000";
     if (equal(name, "InvalidParameterValue")) return "22023";
@@ -1520,6 +1660,54 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "DuplicateColumn")) return "42701";
     if (equal(name, "PrimaryKeyViolation")) return "23505";
     if (equal(name, "NotNullViolation")) return "23502";
+    if (equal(name, "CheckViolation")) return "23514";
+    if (equal(name, "ForeignKeyViolation")) return "23503";
+    if (equal(name, "ExclusionViolation")) return "23P01";
+    if (equal(name, "IndexCapacity")) return "54000";
+    if (equal(name, "InvalidForeignKey")) return "42830";
+    if (equal(name, "ObjectNotInPrerequisiteState")) return "55000";
+    if (equal(name, "DuplicateObject")) return "42710";
+    if (equal(name, "InvalidTableDefinition")) return "42P16";
+    if (equal(name, "UndefinedSchema")) return "3F000";
+    if (equal(name, "DuplicateSchema")) return "42P06";
+    if (equal(name, "IndeterminateDatatype")) return "42P18";
+    if (equal(name, "ArraySubscriptError")) return "2202E";
+    if (equal(name, "DataException")) return "22000";
+    if (equal(name, "InvalidXmlContent")) return "2200N";
+    if (equal(name, "InvalidXmlDocument")) return "2200M";
+    if (equal(name, "NotAnXmlDocument")) return "2200L";
+    if (equal(name, "CollationMismatch")) return "42P21";
+    if (equal(name, "InvalidRegularExpression")) return "2201B";
+    if (equal(name, "InvalidEscapeCharacterUse")) return "2200C";
+    if (equal(name, "InvalidTablesampleArgument")) return "2202H";
+    if (equal(name, "InvalidTablesampleRepeat")) return "2202G";
+    // Routines, triggers and rules (B11 wave 3).
+    if (equal(name, "DuplicateFunction")) return "42723";
+    if (equal(name, "InvalidFunctionDefinition")) return "42P13";
+    if (equal(name, "RaiseException")) return "P0001";
+    if (equal(name, "NoDataFound")) return "P0002";
+    if (equal(name, "TooManyRows")) return "P0003";
+    if (equal(name, "FunctionExecutedNoReturn")) return "2F005";
+    if (equal(name, "CaseNotFound")) return "20000";
+    if (equal(name, "StackDepthExceeded")) return "54001";
+    if (equal(name, "NullValueNotAllowed")) return "22004";
+    if (equal(name, "ErrorInAssignment")) return "22005";
+    if (equal(name, "SqlJsonArrayNotFound")) return "22039";
+    if (equal(name, "SqlJsonMemberNotFound")) return "2203A";
+    if (equal(name, "SqlJsonObjectNotFound")) return "2203C";
+    if (equal(name, "InvalidSqlJsonSubscript")) return "22033";
+    if (equal(name, "SingletonSqlJsonItemRequired")) return "22038";
+    if (equal(name, "NonNumericSqlJsonItem")) return "22036";
+    if (equal(name, "SqlJsonNumberNotFound")) return "2203B";
+    if (equal(name, "SqlJsonScalarRequired")) return "2203F";
+    if (equal(name, "SqlJsonItemCannotBeCast")) return "2203G";
+    if (equal(name, "MoreThanOneSqlJsonItem")) return "22034";
+    if (equal(name, "NoSqlJsonItem")) return "22035";
+    // Catalog objects (B11 wave 3).
+    if (equal(name, "InsufficientPrivilege")) return "42501";
+    if (equal(name, "ReservedName")) return "42939";
+    if (equal(name, "ObjectInUse")) return "55006";
+    if (equal(name, "InvalidGrantOperation")) return "0LP01";
     if (equal(name, "TypeMismatch")) return "42804";
     if (equal(name, "IntegerOverflow")) return "22003";
     if (equal(name, "ProtocolViolation")) return "08P01";
@@ -1528,6 +1716,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "DuplicateStatement")) return "42P05";
     if (equal(name, "DuplicatePortal")) return "42P03";
     if (equal(name, "TransactionFailed")) return "25P02";
+    if (equal(name, "ActiveSqlTransaction")) return "25001";
+    if (equal(name, "SessionCapacity")) return "54000";
     if (equal(name, "DatabaseBusy")) return "55P03";
     if (equal(name, "SerializationFailure")) return "40001";
     if (equal(name, "DeadlockDetected")) return "40P01";
@@ -1599,6 +1789,10 @@ fn parameterCount(source: []const u8) !usize {
 fn interpolate(source: []const u8, values: []const []const u8, w: *Writer) !void {
     _ = try scan(source, values, w);
 }
+/// `$n`: a dollar-quoted string (`$$x$$`, `$q$x$q$`) is not a parameter.
+fn parameterToken(token: []const u8) bool {
+    return token.len > 1 and token[0] == '$' and token[1] >= '0' and token[1] <= '9';
+}
 fn identifier(token: []const u8) bool {
     if (token.len == 0) return false;
     const first = lower(token[0]);
@@ -1615,7 +1809,7 @@ const Tokens = struct {
         self.at = tokenizer.position;
         if (token.kind == .end) return "";
         if (token.kind == .string or token.kind == .quoted_word)
-            return self.source[token.start - 1 .. token.end + 1];
+            return token.whole(self.source);
         return self.source[token.start..token.end];
     }
 };

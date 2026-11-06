@@ -8,7 +8,9 @@
 //! path is keyed on query text. The assertion counter proves this suite ran.
 const std = @import("std");
 const sql = @import("sql");
-const DB = sql.Database(.{ .tables = 2, .columns = 6, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4 });
+// Catalog views are materialized in the query workspace before filtering;
+// work_rows must hold every built-in pg_type row (more than rows_per_table).
+const DB = sql.Database(.{ .tables = 2, .columns = 6, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .work_rows = 128 });
 var assertions: usize = 0;
 var db: DB = .{};
 
@@ -79,7 +81,8 @@ const public_classes = "SELECT relname, relkind FROM pg_class WHERE relnamespace
 
 fn types() !void {
     try expect("SELECT oid, typname FROM pg_catalog.pg_type WHERE typname = 'int4'", "23|int4");
-    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "16|11|11");
+    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "86|11|11");
+    try expect("SELECT typname, typlen, typcategory, typarray, typinput FROM pg_type WHERE oid IN (4072, 4073) ORDER BY oid", "jsonpath|-1|U|4073|jsonpath_in;_jsonpath|-1|A|0|array_in");
     try expect("SELECT typname, typlen, typcategory, typarray, typdelim, typinput FROM pg_type WHERE oid IN (16, 1700, 3802) ORDER BY oid", "bool|1|B|1000|,|boolin;numeric|-1|N|1231|,|numeric_in;jsonb|-1|U|3807|,|jsonb_in");
     try expect("SELECT typname, oid::regtype::text, format_type(oid, NULL) FROM pg_type WHERE typname IN ('int8', 'float8', 'timestamptz') ORDER BY typname", "float8|double precision|double precision;int8|bigint|bigint;timestamptz|timestamp with time zone|timestamp with time zone");
     try expect("SELECT typname FROM pg_type t WHERE t.oid = to_regtype('integer')", "int4");
@@ -87,7 +90,7 @@ fn types() !void {
     try expect("SELECT format_type(1700, 655366), format_type(1184, 3), format_type(23, -1), format_type(99999, NULL)", "numeric(10,2)|timestamp(3) with time zone|integer|???");
     try rejects("SELECT 'nope'::regtype", error.UndefinedObject);
     try expect("SELECT current_database(), current_schema()", "postgres|public");
-    try expect("SELECT nspname FROM pg_namespace ORDER BY oid", "pg_catalog;public;information_schema");
+    try expect("SELECT nspname FROM pg_namespace ORDER BY oid", "pg_catalog;pg_toast;public;information_schema");
     try expect("SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'public'", "public");
     try expect(public_tables, "");
 }
