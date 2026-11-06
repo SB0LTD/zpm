@@ -3,7 +3,8 @@
 //! with, and what would otherwise go unseen. That covers an entry point an
 //! app asked for that the driver does not have, a program that does not
 //! link, a pipeline the GPU does not take (its draws then run on the CPU),
-//! the GPU lost, and the first GL errors. Each kind is said a few times at
+//! the GPU lost, the first GL errors, and what a check of the GPU against
+//! the CPU found (GALAXY_GL_CHECK). Each kind is said a few times at
 //! most, so a busy app cannot flood the log.
 //!
 //! On in the Linux library (libgalaxy-gl.so); off in tests and on other
@@ -14,10 +15,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const Kind = enum(u3) { device, missing, link, pipeline, lost, gl_error };
+pub const Kind = enum(u3) { device, missing, link, pipeline, lost, gl_error, check };
 
 /// How many lines of each kind a process says.
-const LIMITS = [_]u8{ 4, 64, 16, 16, 4, 16 };
+const LIMITS = [_]u8{ 4, 64, 16, 16, 4, 16, 32 };
 
 pub var sink: ?*const fn ([]const u8) void = if (builtin.os.tag == .linux and !builtin.is_test) &stderrLine else null;
 

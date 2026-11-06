@@ -1355,13 +1355,16 @@ pub fn uniformMatrix(c: *Context, loc: i32, count: i32, transpose: bool, cols: u
 }
 
 /// glGetUniform{f,i,ui}v: the element at `loc`, converted.
-pub fn getUniform(c: *Context, prog: u32, loc: i32, want: Data, out: [*]u32) void {
+/// glGetUniform*, and glGetnUniform* (robustness): the value written as
+/// `want`, in at most `limit` bytes (more needed: INVALID_OPERATION).
+pub fn getUniform(c: *Context, prog: u32, loc: i32, want: Data, limit: usize, out: [*]u32) void {
     start();
     defer unlock();
     const l = linkedOf(c, prog) orelse return;
     const at = l.atLocation(loc) orelse return c.fail(g.INVALID_OPERATION);
     const t = at.u.ty.elem();
     const per: u32 = if (t.sampler()) 1 else t.comps();
+    if (@as(usize, per) * 4 > limit) return c.fail(g.INVALID_OPERATION);
     const src = l.values[at.u.word + at.elem * per ..][0..per];
     for (src, 0..) |x, k| {
         const have: Data = switch (t.base) {

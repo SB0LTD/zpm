@@ -43,6 +43,15 @@ const G = node.Gpu(node.Linux, targets);
 var the_gpu: G = undefined;
 var the_engine: engine.Engine = undefined;
 var compile_work: [work_bytes]u8 align(64) = undefined;
+/// KIR's interpreter's scratch, for what the CPU draws: a lost GPU, a
+/// program the GPU does not take, a check (in .bss: no page is used until
+/// touched).
+var cpu_work: [16 << 20]u8 align(64) = undefined;
+/// Images' memory when the GPU gives none (it is lost), and a check's
+/// scratch: address space reserved at open, each page filled on first
+/// touch.
+const POOL_BYTES: usize = 512 << 20;
+const CHECK_BYTES: usize = 64 << 20;
 var opened = false;
 var refused = false;
 var wl_client: ?wayland.Client = null;
@@ -56,7 +65,15 @@ fn openDriver() ?*engine.Engine {
         refused = true;
         return null;
     };
-    the_engine.init(.{ .dev = d, .compiler = G.compile, .work = &compile_work });
+    const check_px = checkAsked();
+    the_engine.init(.{
+        .dev = d,
+        .compiler = G.compile,
+        .work = &compile_work,
+        .pool = anonymous(POOL_BYTES),
+        .cpu_work = &cpu_work,
+        .check = if (check_px) |px| .{ .mem = anonymous(CHECK_BYTES), .max_px = px } else .{},
+    });
     if (!the_engine.onGpu()) {
         // (the kernels did not load: no GPU drawing at all)
         report.say(.device, "the GPU's kernels did not load ({s}): EGL has no display, and the app draws in software", .{if (the_engine.why) |w| @errorName(w) else "?"});
@@ -64,8 +81,61 @@ fn openDriver() ?*engine.Engine {
         return null;
     }
     opened = true;
-    report.say(.device, "drawing on {s}", .{d.caps.name});
+    if (the_engine.check.mem.len != 0) {
+        report.say(.device, "drawing on {s}; each kernel's first runs of up to {d} pixels checked against the CPU (GALAXY_GL_CHECK)", .{ d.caps.name, the_engine.check.max_px });
+    } else report.say(.device, "drawing on {s}", .{d.caps.name});
     return &the_engine;
+}
+
+/// Read-write memory of `len` bytes, reserved (MAP_NORESERVE: each page
+/// filled on first touch), or none.
+fn anonymous(len: usize) []u8 {
+    if (comptime !on_linux) return &.{};
+    const r = sysResult(linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0));
+    if (r < 0) return &.{};
+    return @as([*]u8, @ptrFromInt(@as(usize, @intCast(r))))[0..len];
+}
+
+var env_buf: [64 * 1024]u8 = undefined;
+
+/// GALAXY_GL_CHECK, from the process's environment (/proc/self/environ:
+/// no C library to ask): "1" or "on", each kernel's first runs of up to
+/// 128 x 128 pixels checked against the CPU; a larger number, that many
+/// pixels; "0", "off" or none, no check.
+fn checkAsked() ?u32 {
+    if (comptime !on_linux) return null;
+    const fd = sysResult(linux.openat(linux.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    if (fd < 0) return null;
+    defer _ = linux.close(@intCast(fd));
+    var n: usize = 0;
+    while (n < env_buf.len) {
+        const r = sysResult(linux.read(@intCast(fd), env_buf[n..].ptr, env_buf.len - n));
+        if (r <= 0) break;
+        n += @intCast(r);
+    }
+    return checkOf(env_buf[0..n]);
+}
+
+/// GALAXY_GL_CHECK's pixels in an environment block (NUL-separated).
+fn checkOf(block: []const u8) ?u32 {
+    const key = "GALAXY_GL_CHECK=";
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |kv| {
+        if (!std.mem.startsWith(u8, kv, key)) continue;
+        const v = std.mem.trim(u8, kv[key.len..], " ");
+        if (v.len == 0 or std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off")) return null;
+        if (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on")) return 128 * 128;
+        return std.fmt.parseInt(u32, v, 10) catch 128 * 128;
+    }
+    return null;
+}
+
+test "libgalaxy-gl: GALAXY_GL_CHECK from an environment block" {
+    try std.testing.expectEqual(@as(?u32, null), checkOf("HOME=/home/galaxy\x00PATH=/bin\x00"));
+    try std.testing.expectEqual(@as(?u32, 128 * 128), checkOf("A=1\x00GALAXY_GL_CHECK=1\x00B=2"));
+    try std.testing.expectEqual(@as(?u32, 4096), checkOf("GALAXY_GL_CHECK=4096"));
+    try std.testing.expectEqual(@as(?u32, null), checkOf("GALAXY_GL_CHECK=0\x00"));
+    try std.testing.expectEqual(@as(?u32, null), checkOf("GALAXY_GL_CHECK=off"));
 }
 
 const linux = std.os.linux;

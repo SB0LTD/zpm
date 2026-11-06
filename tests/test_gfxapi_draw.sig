@@ -380,6 +380,134 @@ test "draw: the scene on the emulated Adreno (ir3) gives the CPU's bytes" {
     a_gpu.close();
 }
 
+// ── GALAXY_GL_CHECK: the GPU's work against the CPU's ──────────────────────
+
+var check_mem: [4 << 20]u8 align(64) = undefined;
+var idle_pool: [8 << 20]u8 align(64) = undefined;
+var c_mem: [8 << 20]u8 align(4096) = undefined;
+var c_shadow: [16 << 20]u8 align(4096) = undefined;
+var c_work: [8 << 20]u8 align(64) = undefined;
+var c_emu: gpu.EmuDevice = undefined;
+var eng_check: engine.Engine = undefined;
+var out_check: Out = .{};
+
+fn checkedEmu() gpu.Device {
+    var caps = gpu.interp_caps;
+    caps.coherent = false;
+    c_emu = gpu.EmuDevice.init(caps, &c_mem, &c_work);
+    c_emu.shadow = &c_shadow;
+    return c_emu.device();
+}
+
+test "draw: the scene on EmuDevice, every op checked against the CPU: the same, the GPU kept" {
+    const want = try cpuOut();
+    eng_check.init(.{ .dev = checkedEmu(), .work = &compile_mem, .cpu_work = &cpu_work, .check = .{ .mem = &check_mem, .max_px = 1 << 20, .times = 255, .tolerance = 0 } });
+    try std.testing.expect(eng_check.onGpu());
+    try scene(&eng_check, &out_check);
+    try std.testing.expect(eng_check.stats.checks >= 9);
+    try std.testing.expectEqual(@as(u32, 0), eng_check.stats.check_diffs);
+    try std.testing.expect(!eng_check.lost);
+    try std.testing.expectEqualSlices(u8, &want.fbo, &out_check.fbo);
+    try std.testing.expectEqualSlices(u8, &want.win, &out_check.win);
+    eng_check.deinit();
+}
+
+/// A GPU that takes every batch and does none of it (as the real Adreno's
+/// compiled kernels were seen to: every pixel left as it was).
+const Idle = struct {
+    var inner: gpu.Device = undefined;
+    var vt: gpu.Device.VTable = undefined;
+    fn run(dev: *anyopaque, ds: []const gpu.Dispatch) gpu.Error!gpu.Fence {
+        _ = ds;
+        return inner.vtable.run(dev, &.{});
+    }
+    fn of(base: gpu.Device) gpu.Device {
+        inner = base;
+        vt = base.vtable.*;
+        vt.run = run;
+        return .{ .ctx = base.ctx, .vtable = &vt, .caps = base.caps };
+    }
+};
+
+var said: [4096]u8 = undefined;
+var said_len: usize = 0;
+fn hear(line: []const u8) void {
+    const n = @min(line.len, said.len - said_len);
+    @memcpy(said[said_len..][0..n], line[0..n]);
+    said_len += n;
+}
+
+test "draw: a GPU that does nothing is caught by the check; the CPU draws, and its bytes stand" {
+    const want = try cpuOut();
+    said_len = 0;
+    gfxapi.report.sink = &hear;
+    defer gfxapi.report.sink = null;
+    // (every run checked: a check that finds the GPU's result the same as
+    // the CPU's, a clear of zeros to zeros, says nothing of the next; and
+    // images made after the GPU is lost come from the pool)
+    eng_check.init(.{ .dev = Idle.of(checkedEmu()), .work = &compile_mem, .cpu_work = &cpu_work, .pool = &idle_pool, .check = .{ .mem = &check_mem, .max_px = 1 << 20, .times = 255 } });
+    try std.testing.expect(eng_check.onGpu());
+    try scene(&eng_check, &out_check);
+    // (the first op checked differed: the GPU was called lost, and GL
+    // reports a reset)
+    try std.testing.expectEqual(@as(u32, 1), eng_check.stats.check_diffs);
+    try std.testing.expect(eng_check.lost);
+    try std.testing.expectEqualStrings("GpuDiffersFromCpu", @errorName(eng_check.why.?));
+    // what the app's stderr says: the op, where, both values; then the loss
+    const text = said[0..said_len];
+    std.debug.print("{s}", .{text});
+    try std.testing.expect(std.mem.indexOf(u8, text, "the GPU's result differs from the CPU's") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "the GPU is lost (GpuDiffersFromCpu): drawing goes on on the CPU") != null);
+    try std.testing.expectEqualSlices(u8, &want.fbo, &out_check.fbo);
+    try std.testing.expectEqualSlices(u8, &want.win, &out_check.win);
+    eng_check.deinit();
+}
+
+/// A GPU that does a draw's vertices and triangles but not its pixels: a
+/// batch of three dispatches or more runs without its last (a checked
+/// draw's batch is the draw alone).
+const NoTiles = struct {
+    var inner: gpu.Device = undefined;
+    var vt: gpu.Device.VTable = undefined;
+    fn run(dev: *anyopaque, ds: []const gpu.Dispatch) gpu.Error!gpu.Fence {
+        return inner.vtable.run(dev, if (ds.len >= 3) ds[0 .. ds.len - 1] else ds);
+    }
+    fn of(base: gpu.Device) gpu.Device {
+        inner = base;
+        vt = base.vtable.*;
+        vt.run = run;
+        return .{ .ctx = base.ctx, .vtable = &vt, .caps = base.caps };
+    }
+};
+
+test "draw: a check names the kernel that differs: the tile kernel, the others agreeing" {
+    const want = try cpuOut();
+    said_len = 0;
+    gfxapi.report.sink = &hear;
+    defer gfxapi.report.sink = null;
+    eng_check.init(.{ .dev = NoTiles.of(checkedEmu()), .work = &compile_mem, .cpu_work = &cpu_work, .pool = &idle_pool, .check = .{ .mem = &check_mem, .max_px = 1 << 20, .times = 255 } });
+    try scene(&eng_check, &out_check);
+    try std.testing.expect(eng_check.lost);
+    try std.testing.expectEqualSlices(u8, &want.fbo, &out_check.fbo);
+    try std.testing.expectEqualSlices(u8, &want.win, &out_check.win);
+    const text = said[0..said_len];
+    std.debug.print("{s}", .{text});
+    try std.testing.expect(std.mem.indexOf(u8, text, "a draw: the GPU's result differs from the CPU's") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "kernels agree)") != null);
+    eng_check.deinit();
+}
+
+test "draw: checks off when there is no room for them; the scene as before" {
+    const want = try cpuOut();
+    var tiny: [64]u8 align(64) = undefined;
+    eng_check.init(.{ .dev = checkedEmu(), .work = &compile_mem, .cpu_work = &cpu_work, .check = .{ .mem = &tiny, .max_px = 1 << 20 } });
+    try scene(&eng_check, &out_check);
+    try std.testing.expectEqual(@as(u32, 0), eng_check.stats.checks);
+    try std.testing.expect(!eng_check.lost);
+    try std.testing.expectEqualSlices(u8, &want.fbo, &out_check.fbo);
+    eng_check.deinit();
+}
+
 // ── Bins: a target of several bins ─────────────────────────────────────────
 
 const BW = 200;

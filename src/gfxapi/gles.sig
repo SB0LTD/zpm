@@ -72,6 +72,10 @@ pub const EXTENSIONS = [_][:0]const u8{
     "GL_OES_packed_depth_stencil",
     "GL_OES_rgb8_rgba8",
     "GL_OES_texture_npot",
+    // (a lost GPU: glGetGraphicsResetStatus, the reset strategy, and
+    // CONTEXT_LOST once; the n-forms of ReadPixels and GetUniform)
+    "GL_EXT_robustness",
+    "GL_KHR_robustness",
 };
 
 /// EGL's EGLImage handles to their images (egl.sig sets it): what
@@ -527,6 +531,10 @@ pub const Context = struct {
     objs: *Objects,
     err: u32 = g.NO_ERROR,
     reset_told: bool = false,
+    /// EGL's reset notification strategy is LOSE_CONTEXT_ON_RESET (else
+    /// NO_RESET_NOTIFICATION, which says nothing of a reset)
+    lose_on_reset: bool = false,
+    lost_told: bool = false,
     fbos: [MAX_FRAMEBUFFERS]Fbo = undefined,
     // the default framebuffer: the EGL surfaces' images
     surf_draw: ?*Image = null,
@@ -643,15 +651,22 @@ pub const Context = struct {
     // ── Errors, strings, state ─────────────────────────────────────────────
 
     pub fn getError(c: *Context) u32 {
+        // KHR_robustness: a context that loses itself on a reset says so
+        // (once: the engine goes on on the CPU, so later calls still work)
+        if (c.lose_on_reset and c.eng.lost and !c.lost_told) {
+            c.lost_told = true;
+            return g.CONTEXT_LOST;
+        }
         const e = c.err;
         c.err = g.NO_ERROR;
         return e;
     }
 
-    /// KHR_robustness: a reset once (the GPU was lost: the engine went on
-    /// on the CPU), then none.
+    /// EXT_ and KHR_robustness: a reset once (the GPU was lost: the
+    /// engine went on on the CPU), then none; nothing for a context whose
+    /// strategy is NO_RESET_NOTIFICATION.
     pub fn getGraphicsResetStatus(c: *Context) u32 {
-        if (!c.eng.lost or c.reset_told) return g.NO_ERROR;
+        if (!c.lose_on_reset or !c.eng.lost or c.reset_told) return g.NO_ERROR;
         c.reset_told = true;
         return g.UNKNOWN_CONTEXT_RESET;
     }
@@ -826,6 +841,10 @@ pub const Context = struct {
             g.MAX_TEXTURE_IMAGE_UNITS => int(16),
             g.MAX_COMBINED_TEXTURE_IMAGE_UNITS => int(MAX_UNITS),
             g.MAX_SAMPLES => int(1),
+            g.RESET_NOTIFICATION_STRATEGY => int(if (c.lose_on_reset) g.LOSE_CONTEXT_ON_RESET else g.NO_RESET_NOTIFICATION),
+            // (out-of-range reads are not promised to be safe: no
+            // robust_buffer_access_behavior)
+            g.CONTEXT_ROBUST_ACCESS => boolean(false),
             g.SAMPLES, g.SAMPLE_BUFFERS => int(0),
             g.SUBPIXEL_BITS => int(4),
             g.MAJOR_VERSION => int(3),
@@ -1160,6 +1179,20 @@ pub const Context = struct {
     // ── Reading pixels ─────────────────────────────────────────────────────
 
     /// glReadPixels: pixels outside the framebuffer are left as they were.
+    /// glReadnPixels (robustness): as readPixels, writing at most
+    /// buf_size bytes; more needed: INVALID_OPERATION, nothing written.
+    pub fn readnPixels(c: *Context, x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, buf_size: i32, pixels: ?*anyopaque) void {
+        if (buf_size < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+        const want = switch (clientFormat(format, ty)) {
+            .ok => |f| f,
+            .err => |e| return c.fail(e),
+        };
+        const bpp = want.bytes();
+        const l = c.pack.layout(@intCast(w), bpp);
+        if (spanOf(l.first, l.row, @intCast(w), @intCast(h), bpp) > @as(usize, @intCast(buf_size))) return c.fail(g.INVALID_OPERATION);
+        c.readPixels(x, y, w, h, format, ty, pixels);
+    }
+
     pub fn readPixels(c: *Context, x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*anyopaque) void {
         if (w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
         const want = switch (clientFormat(format, ty)) {

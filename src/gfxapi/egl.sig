@@ -716,6 +716,7 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
     const cfg: ?*const Config = if (config == null) null else (configOf(config) orelse return fail(?*Context, BAD_CONFIG, null));
     var major: i32 = 1;
     var minor: i32 = 0;
+    var lose = false;
     if (attribs) |list| {
         var i: usize = 0;
         while (list[i] != NONE) : (i += 2) {
@@ -724,7 +725,10 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
                 CONTEXT_MAJOR_VERSION => major = v,
                 CONTEXT_MINOR_VERSION => minor = v,
                 CONTEXT_FLAGS_KHR => if (v & ~@as(i32, 7) != 0) return fail(?*Context, BAD_ATTRIBUTE, null),
-                CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY, CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT => if (v != NO_RESET_NOTIFICATION and v != LOSE_CONTEXT_ON_RESET) return fail(?*Context, BAD_ATTRIBUTE, null),
+                CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY, CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT => {
+                    if (v != NO_RESET_NOTIFICATION and v != LOSE_CONTEXT_ON_RESET) return fail(?*Context, BAD_ATTRIBUTE, null);
+                    lose = v == LOSE_CONTEXT_ON_RESET;
+                },
                 CONTEXT_OPENGL_DEBUG, CONTEXT_OPENGL_ROBUST_ACCESS, CONTEXT_OPENGL_ROBUST_ACCESS_EXT, CONTEXT_OPENGL_NO_ERROR_KHR, CONTEXT_PRIORITY_LEVEL_IMG => {},
                 else => return fail(?*Context, BAD_ATTRIBUTE, null),
             }
@@ -753,6 +757,7 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
     } else return fail(?*Context, BAD_ALLOC, null);
     c.* = .{ .used = true, .display = d, .config = cfg, .share = share, .major = major };
     c.gl.init(eng, &shares[share]);
+    c.gl.lose_on_reset = lose;
     share_users[share] += 1;
     return ok(?*Context, c);
 }

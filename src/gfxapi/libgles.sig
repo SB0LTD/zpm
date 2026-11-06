@@ -222,6 +222,15 @@ pub export fn glClearBufferfi(buffer: u32, drawbuffer: i32, depth: f32, stencil:
 pub export fn glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*anyopaque) callconv(.c) void {
     if (cur()) |c| c.readPixels(x, y, w, h, format, ty, pixels);
 }
+pub export fn glReadnPixels(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, buf_size: i32, pixels: ?*anyopaque) callconv(.c) void {
+    if (cur()) |c| c.readnPixels(x, y, w, h, format, ty, buf_size, pixels);
+}
+pub export fn glReadnPixelsEXT(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, buf_size: i32, pixels: ?*anyopaque) callconv(.c) void {
+    glReadnPixels(x, y, w, h, format, ty, buf_size, pixels);
+}
+pub export fn glReadnPixelsKHR(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, buf_size: i32, pixels: ?*anyopaque) callconv(.c) void {
+    glReadnPixels(x, y, w, h, format, ty, buf_size, pixels);
+}
 
 pub export fn glGenTextures(n: i32, out: ?[*]u32) callconv(.c) void {
     const c = cur() orelse return;
@@ -756,13 +765,44 @@ pub export fn glGetActiveUniformBlockName(prog: u32, index: u32, buf_size: i32, 
     if (cur()) |c| c.fail(g.INVALID_VALUE);
 }
 pub export fn glGetUniformfv(prog: u32, loc: i32, params: [*]f32) callconv(.c) void {
-    if (cur()) |c| program.getUniform(c, prog, loc, .f, @ptrCast(params));
+    if (cur()) |c| program.getUniform(c, prog, loc, .f, std.math.maxInt(usize), @ptrCast(params));
 }
 pub export fn glGetUniformiv(prog: u32, loc: i32, params: [*]i32) callconv(.c) void {
-    if (cur()) |c| program.getUniform(c, prog, loc, .i, @ptrCast(params));
+    if (cur()) |c| program.getUniform(c, prog, loc, .i, std.math.maxInt(usize), @ptrCast(params));
 }
 pub export fn glGetUniformuiv(prog: u32, loc: i32, params: [*]u32) callconv(.c) void {
-    if (cur()) |c| program.getUniform(c, prog, loc, .u, params);
+    if (cur()) |c| program.getUniform(c, prog, loc, .u, std.math.maxInt(usize), params);
+}
+
+// robustness: the n-forms write at most buf_size bytes
+fn getnUniform(prog: u32, loc: i32, want: program.Data, buf_size: i32, params: [*]u32) void {
+    const c = cur() orelse return;
+    if (buf_size < 0) return c.fail(g.INVALID_VALUE);
+    program.getUniform(c, prog, loc, want, @intCast(buf_size), params);
+}
+pub export fn glGetnUniformfv(prog: u32, loc: i32, buf_size: i32, params: [*]f32) callconv(.c) void {
+    getnUniform(prog, loc, .f, buf_size, @ptrCast(params));
+}
+pub export fn glGetnUniformfvEXT(prog: u32, loc: i32, buf_size: i32, params: [*]f32) callconv(.c) void {
+    getnUniform(prog, loc, .f, buf_size, @ptrCast(params));
+}
+pub export fn glGetnUniformfvKHR(prog: u32, loc: i32, buf_size: i32, params: [*]f32) callconv(.c) void {
+    getnUniform(prog, loc, .f, buf_size, @ptrCast(params));
+}
+pub export fn glGetnUniformiv(prog: u32, loc: i32, buf_size: i32, params: [*]i32) callconv(.c) void {
+    getnUniform(prog, loc, .i, buf_size, @ptrCast(params));
+}
+pub export fn glGetnUniformivEXT(prog: u32, loc: i32, buf_size: i32, params: [*]i32) callconv(.c) void {
+    getnUniform(prog, loc, .i, buf_size, @ptrCast(params));
+}
+pub export fn glGetnUniformivKHR(prog: u32, loc: i32, buf_size: i32, params: [*]i32) callconv(.c) void {
+    getnUniform(prog, loc, .i, buf_size, @ptrCast(params));
+}
+pub export fn glGetnUniformuiv(prog: u32, loc: i32, buf_size: i32, params: [*]u32) callconv(.c) void {
+    getnUniform(prog, loc, .u, buf_size, params);
+}
+pub export fn glGetnUniformuivKHR(prog: u32, loc: i32, buf_size: i32, params: [*]u32) callconv(.c) void {
+    getnUniform(prog, loc, .u, buf_size, params);
 }
 
 fn uni(loc: i32, n: i32, comps: u32, kind: program.Data, data: ?*const anyopaque) void {
@@ -943,12 +983,64 @@ test "libgles: GL through its C entry points, on the CPU" {
     try std.testing.expectEqualStrings("GL_EXT_read_format_bgra", std.mem.span(glGetStringi(g.EXTENSIONS, 0).?));
 }
 
+test "libgles: robustness: the extensions, the strategy, a reset told once, the n-forms" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    var win = t_eng.newImage(4, 4, .rgba8).?;
+    defer t_eng.freeImage(&win);
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    t_ctx.setSurface(&win, &win, null);
+    // named, as Firefox asks (its feature "robustness" comes only from them)
+    const ext = std.mem.span(glGetString(g.EXTENSIONS).?);
+    try std.testing.expect(std.mem.indexOf(u8, ext, "GL_EXT_robustness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ext, "GL_KHR_robustness") != null);
+    var v: [4]i32 = undefined;
+    glGetIntegerv(g.RESET_NOTIFICATION_STRATEGY, &v);
+    try std.testing.expectEqual(@as(i32, g.NO_RESET_NOTIFICATION), v[0]);
+    glGetIntegerv(g.CONTEXT_ROBUST_ACCESS, &v);
+    try std.testing.expectEqual(@as(i32, 0), v[0]);
+    // EGL's LOSE_CONTEXT_ON_RESET
+    t_ctx.lose_on_reset = true;
+    glGetIntegerv(g.RESET_NOTIFICATION_STRATEGY, &v);
+    try std.testing.expectEqual(@as(i32, g.LOSE_CONTEXT_ON_RESET), v[0]);
+    try std.testing.expectEqual(g.NO_ERROR, glGetGraphicsResetStatusEXT());
+    // the n-forms: a buffer too small is refused, nothing written
+    var px = [_]u8{0xaa} ** 8;
+    glReadnPixelsEXT(0, 0, 2, 1, g.RGBA, g.UNSIGNED_BYTE, 4, &px);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+    try std.testing.expectEqual(@as(u8, 0xaa), px[0]);
+    glClearColor(0, 1, 0, 1);
+    glClear(g.COLOR_BUFFER_BIT);
+    glReadnPixelsKHR(0, 0, 2, 1, g.RGBA, g.UNSIGNED_BYTE, 8, &px);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255, 0, 255, 0, 255 }, &px);
+    glReadnPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, -1, &px);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    // a lost GPU: a reset told once, CONTEXT_LOST once, then work goes on
+    t_eng.lost = true;
+    try std.testing.expectEqual(g.CONTEXT_LOST, glGetError());
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    try std.testing.expectEqual(g.UNKNOWN_CONTEXT_RESET, glGetGraphicsResetStatusKHR());
+    try std.testing.expectEqual(g.NO_ERROR, glGetGraphicsResetStatus());
+    glClear(g.COLOR_BUFFER_BIT);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    // NO_RESET_NOTIFICATION says nothing of it
+    t_ctx.lose_on_reset = false;
+    t_ctx.reset_told = false;
+    try std.testing.expectEqual(g.NO_ERROR, glGetGraphicsResetStatus());
+}
+
 test "libgles: getProcAddress finds every entry point, and nothing else" {
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glClear)), getProcAddress("glClear"));
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glTexStorage2DEXT)), getProcAddress("glTexStorage2DEXT"));
     try std.testing.expect(getProcAddress("glBeginTransformFeedback") == null);
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glUniformMatrix4x3fv)), getProcAddress("glUniformMatrix4x3fv"));
     try std.testing.expect(getProcAddress("getProcAddress") == null);
+    try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glReadnPixelsEXT)), getProcAddress("glReadnPixelsEXT"));
+    try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glGetnUniformfvKHR)), getProcAddress("glGetnUniformfvKHR"));
     try std.testing.expect(entries.len > 70);
 }
 

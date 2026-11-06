@@ -187,7 +187,7 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
 ### The C ABI
 
-The library is `libgalaxy-gl.so`, with 58 `egl*` and 209 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
+The library is `libgalaxy-gl.so`, with 58 `egl*` and 220 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
 
 Each context is current per thread. The current context is kept in a fixed table keyed by the thread pointer (`TPIDR_EL0` on AArch64, `%fs:0` on x86-64), so the library needs no thread-local storage and no C library.
 
@@ -197,11 +197,35 @@ Each context is current per thread. The current context is kept in a fixed table
 - a program that did not link, with its log's first line;
 - a pipeline the GPU refuses: its draws then run on the CPU, and it isn't compiled again at every draw;
 - a lost GPU;
-- the first GL errors.
+- the first GL errors;
+- what a check of the GPU against the CPU found (below).
+
+**A lost GPU.** The driver says so as EXT_ and KHR_robustness do. Both are in `GL_EXTENSIONS`, because Firefox takes its feature "robustness" only from them. A context made with EGL's `LOSE_CONTEXT_ON_RESET`:
+- answers `GL_RESET_NOTIFICATION_STRATEGY` with it;
+- gives `UNKNOWN_CONTEXT_RESET` from `glGetGraphicsResetStatus` once;
+- gives `CONTEXT_LOST` from `glGetError` once.
+
+Firefox then rebuilds its compositor, finds no display (EGL refuses a context on a lost engine), and goes on in software. Meanwhile the engine draws on the CPU:
+- KIR's interpreter has 16 MB of `.bss` scratch;
+- images made after the loss come from a 512 MB pool of reserved address space, each page filled on first touch.
+
+`glReadnPixels` and `glGetnUniform{f,i,ui}v` (with their EXT and KHR names) refuse a buffer too small. `GL_CONTEXT_ROBUST_ACCESS` is false: robust buffer access isn't promised, and isn't named.
+
+**Checking the GPU against the CPU (`GALAXY_GL_CHECK`).** It's read from `/proc/self/environ`, since there's no C library to ask: `1` or `on` for ops of up to 128 x 128 pixels, a number for that many pixels. Galaxy sets it from `GPU.TXT`'s word `check`. Each kernel's first two runs small enough are done twice:
+1. The work before is finished, and the rows the op writes are saved (a 64 MB reserved scratch).
+2. The op runs on the GPU, and its result is set aside.
+3. The rows are put back, the op runs on the CPU with the same kernels in KIR's interpreter, and the two are compared byte by byte.
+
+A byte may be 2 apart (the GPU's reciprocals and roots aren't the CPU's to the last bit), and a few bytes past that are allowed.
+
+- **When they agree:** a line says so.
+- **When they don't:** a line names the op and its first differing pixel, with both values. For a draw, the GPU's vertex and triangle records are compared with the CPU's too, which names the kernel that went wrong first: the vertex kernel, the setup or bin kernel, or the tile kernel. The GPU is then lost: the CPU's result stands and the CPU draws on.
+
+On the Surface, every KIR-compiled kernel failed on the real Adreno at first, while hand-written ir3 passed. This finds which op, and which kernel, at an app's first draws.
 
 The library's panic handler prints one line and exits, as a failed assertion in a C driver does. It needs neither TLS nor a stack walk. EGL's tables, and the render node's, are filled at first use, so they take no room in the file.
 
-As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1445 KB on aarch64 and 1482 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL compiler adds about 310 KB. Its tables (EGL's, the engine's kernel space, the compile scratch, the code generator's, the text pool, the programs) are bss, about 49 MB of address space, touched only as used.
+As built (`sig build-lib -dynamic -target <arch>-linux-none -fPIC`), the library has no `DT_NEEDED` entries and no TLS segment. Its only undefined symbols are the weak `dlsym` and `dl_iterate_phdr`, which the dynamic linker binds from the program's C library. It is 1460 KB on aarch64 and 1511 KB on x86_64: the CPU fallback carries KIR's interpreter and the draw kernels' builders, and the GLSL compiler adds about 310 KB. Its tables (EGL's, the engine's kernel space, the compile scratch, the interpreter's scratch, the code generator's, the text pool, the programs) are bss, about 69 MB of address space, touched only as used.
 
 ## What is done
 
@@ -344,7 +368,13 @@ sig build test-gfxapi
   - on `EmuDevice`: KIR's interpreter, with memory that is not coherent, so a missing cache call gives wrong bytes;
   - on the emulated Adreno through Galaxy's calls: KIR compiled to ir3, PM4 streams, `ir3_emu`.
 
-  The scenario covers clears with a scissor and a color mask, a top-down BGRA window, a texture upload with an unpack skip, a framebuffer object, a copy that flips and swaps, depth and stencil under a write mask, and a pack buffer. All three runs must give the same bytes. Further tests cover batching, a free deferred until its batch is done, and a GPU lost mid-batch.
+  The scenario covers clears with a scissor and a color mask, a top-down BGRA window, a texture upload with an unpack skip, a framebuffer object, a copy that flips and swaps, depth and stencil under a write mask, and a pack buffer. All three runs must give the same bytes. Further tests cover batching, a free deferred until its batch is done, and a GPU lost mid-batch (a reset told to a context made with `LOSE_CONTEXT_ON_RESET`).
+- `test-gfxapi-draw`, the checks (`GALAXY_GL_CHECK`):
+  - every op of its scene checked on `EmuDevice`: all the same, nothing lost;
+  - a GPU that takes batches and does nothing: the first op that differs is caught, the GPU is lost, and the scene's bytes are the CPU's;
+  - a GPU that skips each draw's tile kernel: the check says the vertex and setup kernels agree;
+  - no room for a check: none is made.
+- `libgles` robustness: the extensions, the strategy, a reset and `CONTEXT_LOST` told once, and the n-forms' size checks.
 
 ## Stages ahead
 

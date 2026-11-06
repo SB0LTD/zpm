@@ -691,6 +691,28 @@ pub const Config = struct {
     /// Scratch for KIR's interpreter, which draws on the CPU (no GPU, or
     /// it is lost); none: such draws are refused.
     cpu_work: []u8 = &.{},
+    /// The GPU's work checked against the CPU's (off: no memory).
+    check: Check = .{},
+};
+
+/// GALAXY_GL_CHECK: the GPU's work checked against the CPU's, which is
+/// KIR's interpreter running the same kernels. A kernel's first runs that
+/// are small enough are checked: the regions the op writes are saved, the
+/// op runs on the GPU and its result is set aside, the regions are put
+/// back, the op runs on the CPU, and the two are compared byte by byte.
+/// More than a few bytes apart past the tolerance: the GPU is called lost
+/// (GL reports a reset), the CPU's result stands, and the CPU draws from
+/// then on. Off without `mem`, or without the engine's cpu_work.
+pub const Check = struct {
+    /// the saved regions, the GPU's results, and a draw's records
+    mem: []u8 = &.{},
+    /// the largest op checked: the pixels it writes
+    max_px: u32 = 128 * 128,
+    /// how many runs of each kernel are checked
+    times: u8 = 2,
+    /// how far apart a byte may be (rounding: the GPU's reciprocals and
+    /// roots are not the CPU's to the last bit)
+    tolerance: u8 = 2,
 };
 
 pub const Stats = struct {
@@ -702,6 +724,9 @@ pub const Stats = struct {
     waits: u64 = 0,
     /// thread-instructions KIR's interpreter ran for draws on the CPU
     cpu_lane_ops: u64 = 0,
+    /// ops checked against the CPU, and those that differed
+    checks: u32 = 0,
+    check_diffs: u32 = 0,
 };
 
 pub const Engine = struct {
@@ -748,6 +773,9 @@ pub const Engine = struct {
     bin_cap: u32 = raster.BIN_CAP,
     /// Off: no draw is binned (every tile goes through every triangle).
     binning: bool = true,
+    check: Check = .{},
+    /// runs of each engine kernel checked against the CPU
+    prog_checked: [N_PROGS]u8 = [_]u8{0} ** N_PROGS,
 
     const Doomed = struct { buf: gpu.Buffer, batch: u64 };
     /// (the images as they were when the op was recorded: a batch done
@@ -761,7 +789,7 @@ pub const Engine = struct {
     /// The engine in place (it must stay at `e`): the kernels compiled and
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
-        e.* = .{ .pool = Pool.init(cfg.pool), .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work };
+        e.* = .{ .pool = Pool.init(cfg.pool), .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .check = cfg.check };
         const d = cfg.dev orelse return;
         e.loadAll(d, cfg.compiler, cfg.work) catch |err| {
             e.why = err;
@@ -905,17 +933,33 @@ pub const Engine = struct {
                 img.format.bytes(),
             };
             const groups = [3]u32{ divUp(img.levelWidth(l + 1), GROUP), img.levelHeight(l + 1), 1 };
+            const regs = [_]Region{.{ .img = img, .off = img.level_at[l + 1], .len = @as(usize, img.levelStride(l + 1)) * img.levelHeight(l + 1), .stride = img.levelStride(l + 1) }};
+            var checking = false;
+            if (e.gpuUsable(img)) checking = e.checkFirst(.mip, @as(u64, img.levelWidth(l + 1)) * img.levelHeight(l + 1), &regs);
             if (e.gpuUsable(img)) {
                 const bufs = [_]*Image{img};
                 e.recordProg(&e.progs[@intFromEnum(Prog.mip)], groups, &bufs, 1, &p, null);
+                if (!checking) continue;
+                checking = e.checkSwap(&regs);
+            }
+            const done = cpu: {
+                if (e.cpu_work.len == 0) break :cpu false;
+                e.fetchAll(img);
+                e.stats.cpu_ops += 1;
+                const views = [_][]u8{img.buf.cpu};
+                if (!e.runCpu(.mip, undefined, groups, &views, &p)) break :cpu false;
+                e.wrote(img, 0, img.buf.cpu.len);
+                break :cpu true;
+            };
+            if (!checking) {
+                if (!done) return false;
                 continue;
             }
-            if (e.cpu_work.len == 0) return false;
-            e.fetchAll(img);
-            e.stats.cpu_ops += 1;
-            const views = [_][]u8{img.buf.cpu};
-            if (!e.runCpu(.mip, undefined, groups, &views, &p)) return false;
-            e.wrote(img, 0, img.buf.cpu.len);
+            if (!done) {
+                e.checkGiveBack(&regs);
+                continue;
+            }
+            e.checkCompare(&regs, "a mipmap level", "");
         }
         return true;
     }
@@ -957,7 +1001,7 @@ pub const Engine = struct {
     }
 
     fn loseGpu(e: *Engine, err: anyerror) void {
-        if (!e.lost) report.say(.lost, "the GPU is lost ({s}): drawing goes on on the CPU, and GL reports a reset", .{@errorName(err)});
+        if (!e.lost) report.say(.lost, "the GPU is lost ({s}): {s}, and GL reports a reset", .{ @errorName(err), if (e.cpu_work.len != 0) "drawing goes on on the CPU" else "nothing more is drawn" });
         e.lost = true;
         if (e.why == null) e.why = err;
         e.n_ops = 0;
@@ -1054,6 +1098,149 @@ pub const Engine = struct {
         e.op_cpu[i] = cpu;
         e.n_ops += 1;
         e.stats.dispatches += 1;
+    }
+
+    // ── Checks (GALAXY_GL_CHECK) ───────────────────────────────────────────
+
+    /// What an op writes: bytes [off, off + len) of img, rows of `stride`.
+    const Region = struct { img: *Image, off: usize, len: usize, stride: u32 };
+
+    /// The memory rows of GL rows y0 .. y1 of img (flipped in a top-down
+    /// image), whole.
+    fn rowsOf(img: *Image, y0: u32, y1: u32) Region {
+        const a = img.rowOf(y0);
+        const b = img.rowOf(y1 - 1);
+        const lo = @min(a, b);
+        const hi = @max(a, b) + 1;
+        return .{ .img = img, .off = @as(usize, lo) * img.stride, .len = @as(usize, hi - lo) * img.stride, .stride = img.stride };
+    }
+
+    fn regionBytes(regs: []const Region) usize {
+        var n: usize = 0;
+        for (regs) |rg| n += rg.len;
+        return n;
+    }
+
+    /// Whether an op writing `px` pixels, by a kernel checked `n` times so
+    /// far, is checked.
+    fn wantCheck(e: *const Engine, n: u8, px: u64) bool {
+        return e.check.mem.len != 0 and e.cpu_work.len != 0 and e.onGpu() and n < e.check.times and px <= e.check.max_px;
+    }
+
+    /// Before a checked op: the work before it done, and its regions saved
+    /// (check.mem's first part). False: it is not checked (no room, or the
+    /// GPU went).
+    fn checkSave(e: *Engine, regs: []const Region) bool {
+        const half = regionBytes(regs);
+        if (2 * half > e.check.mem.len) return false;
+        e.finish();
+        if (!e.onGpu()) return false;
+        var at: usize = 0;
+        for (regs) |rg| {
+            @memcpy(e.check.mem[at..][0..rg.len], e.hostView(rg.img, rg.off, rg.len));
+            at += rg.len;
+        }
+        return true;
+    }
+
+    /// After the op ran on the GPU: its result set aside (after the saved
+    /// regions), and the regions put back as they were. False: the GPU
+    /// went meanwhile (the regions are put back all the same).
+    fn checkSwap(e: *Engine, regs: []const Region) bool {
+        e.finish();
+        const kept = e.onGpu();
+        const half = regionBytes(regs);
+        var at: usize = 0;
+        for (regs) |rg| {
+            const v = e.hostView(rg.img, rg.off, rg.len);
+            if (kept) @memcpy(e.check.mem[half + at ..][0..rg.len], v);
+            @memcpy(v, e.check.mem[at..][0..rg.len]);
+            e.wrote(rg.img, rg.off, rg.len);
+            at += rg.len;
+        }
+        return kept;
+    }
+
+    /// The GPU's result back in the regions (the CPU could not do the op:
+    /// it stands unchecked).
+    fn checkGiveBack(e: *Engine, regs: []const Region) void {
+        const half = regionBytes(regs);
+        var at: usize = 0;
+        for (regs) |rg| {
+            @memcpy(e.hostView(rg.img, rg.off, rg.len), e.check.mem[half + at ..][0..rg.len]);
+            e.wrote(rg.img, rg.off, rg.len);
+            at += rg.len;
+        }
+    }
+
+    /// After the op ran on the CPU: the GPU's result against the CPU's.
+    /// Bytes apart past the tolerance, more than a few: the GPU is lost
+    /// (the CPU's result stands). `what` names the op; `more`, what a draw
+    /// found of its kernels.
+    fn checkCompare(e: *Engine, regs: []const Region, what: []const u8, more: []const u8) void {
+        const half = regionBytes(regs);
+        var bad: usize = 0;
+        var first_reg: usize = 0;
+        var first_base: usize = 0;
+        var first_at: ?usize = null;
+        var base: usize = 0;
+        for (regs, 0..) |rg, i| {
+            const cpu = rg.img.buf.cpu[rg.off..][0..rg.len];
+            const got = e.check.mem[half + base ..][0..rg.len];
+            for (cpu, got, 0..) |x, y, k| {
+                if (@max(x, y) - @min(x, y) <= e.check.tolerance) continue;
+                bad += 1;
+                if (first_at == null) {
+                    first_reg = i;
+                    first_base = base;
+                    first_at = k;
+                }
+            }
+            base += rg.len;
+        }
+        e.stats.checks += 1;
+        if (bad <= 16 + half / 1024) {
+            report.say(.check, "{s} checked against the CPU: {d} bytes, {s}{s}", .{ what, half, if (bad == 0) "the same" else "the same within rounding", more });
+            return;
+        }
+        const rg = regs[first_reg];
+        const bpp = rg.img.format.bytes();
+        const k = first_at.?;
+        const row = k / rg.stride;
+        const px = row * rg.stride + (k % rg.stride) / bpp * bpp;
+        const n = @min(bpp, 4);
+        report.say(.check, "{s}: the GPU's result differs from the CPU's in {d} of {d} bytes; first at pixel {d} of row {d} (a {d}x{d} image, {d} bytes a pixel): GPU 0x{x:0>8}, CPU 0x{x:0>8}{s}", .{
+            what,
+            bad,
+            half,
+            (k % rg.stride) / bpp,
+            (rg.off + px) / rg.stride,
+            rg.img.width,
+            rg.img.height,
+            bpp,
+            getPixel(e.check.mem[half + first_base + px ..], n),
+            getPixel(rg.img.buf.cpu[rg.off + px ..], n),
+            more,
+        });
+        e.stats.check_diffs += 1;
+        e.loseGpu(error.GpuDiffersFromCpu);
+    }
+
+    /// Words of a draw's records (vertex or triangle) the GPU and the CPU
+    /// do not agree on: equal, or both finite floats within 1/1000.
+    fn recordsApart(a: []const u8, b: []const u8) usize {
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i + 4 <= a.len) : (i += 4) {
+            const x = std.mem.readInt(u32, a[i..][0..4], .little);
+            const y = std.mem.readInt(u32, b[i..][0..4], .little);
+            if (x == y) continue;
+            const fx: f32 = @bitCast(x);
+            const fy: f32 = @bitCast(y);
+            if (std.math.isFinite(fx) and std.math.isFinite(fy) and @abs(fx - fy) <= 1e-3 * @max(@max(@abs(fx), @abs(fy)), 1e-3)) continue;
+            n += 1;
+        }
+        return n;
     }
 
     // ── Draws ──────────────────────────────────────────────────────────────
@@ -1172,30 +1359,86 @@ pub const Engine = struct {
         var all_gpu = e.onGpu() and e.loadPipeline(@constCast(p)) and p.owner == @as(?*anyopaque, e);
         for (vb) |img| all_gpu = all_gpu and e.gpuUsable(img);
         for (rb) |img| all_gpu = all_gpu and e.gpuUsable(img);
+        // a check: the color rows the draw covers (and the depth's)
+        var regs: [2]Region = undefined;
+        var nreg: usize = 0;
+        var checking = all_gpu and e.wantCheck(p.checked, @as(u64, d.rect.width()) * d.rect.height());
+        if (checking) {
+            @constCast(p).checked += 1;
+            regs[0] = rowsOf(d.color, d.rect.y0, d.rect.y1);
+            nreg = 1;
+            if (d.depth) |dp| {
+                if (dp != d.color and dp.height >= d.rect.y1 and dp.buf.cpu.len != 0) {
+                    regs[1] = rowsOf(dp, d.rect.y0, d.rect.y1);
+                    nreg = 2;
+                }
+            }
+            checking = e.checkSave(regs[0..nreg]);
+            all_gpu = all_gpu and e.onGpu();
+        }
+        // (the GPU's vertex and triangle records, kept to name the kernel
+        // that differs)
+        var recs: usize = 0;
         if (all_gpu) {
             const rw: u32 = if (d.depth != null and d.depth_test and d.depth_write) 0b11 else 0b01;
             e.recordProg(&p.progs[0].?, groups_v, vb, 1, vparams, null);
             e.recordProg(&p.progs[1].?, groups_s, &sb, 1, sparams, null);
             if (bins.on) e.recordProg(&e.progs[@intFromEnum(Prog.bin)], groups_b, &tb, 1, bparams, null);
             e.recordProg(&p.progs[2].?, groups_r, rb, rw, rparams, null);
-            return true;
+            if (!checking) return true;
+            // the GPU's result aside, the rows back, the records cleared:
+            // the CPU draws it next
+            checking = e.checkSwap(regs[0..nreg]);
+            const at = 2 * regionBytes(regs[0..nreg]);
+            const vl = verts.buf.cpu.len;
+            const tl = tris.buf.cpu.len;
+            const vv = e.hostView(&verts, 0, vl);
+            const tv = e.hostView(&tris, 0, tl);
+            if (checking and at + vl + tl <= e.check.mem.len) {
+                @memcpy(e.check.mem[at..][0..vl], vv);
+                @memcpy(e.check.mem[at + vl ..][0..tl], tv);
+                recs = vl + tl;
+            }
+            @memset(vv, 0);
+            @memset(tv, 0);
+            e.wrote(&verts, 0, vl);
+            e.wrote(&tris, 0, tl);
         }
         // on the CPU: every image settled (and fetched, if the GPU wrote it)
-        if (e.cpu_work.len == 0) return false;
-        for (vb) |img| e.fetchAll(img);
-        for (rb) |img| e.fetchAll(img);
-        e.stats.cpu_ops += 1;
-        var views: [MAX_BIND][]u8 = undefined;
-        for (vb, 0..) |img, j| views[j] = img.buf.cpu;
-        if (!e.runCpu(.vertex, p, groups_v, views[0..vb.len], vparams)) return false;
-        const sv = [_][]u8{ tris.buf.cpu, verts.buf.cpu };
-        if (!e.runCpu(.setup, p, groups_s, &sv, sparams)) return false;
-        const bv = [_][]u8{tris.buf.cpu};
-        if (bins.on and !e.runCpu(.bin, p, groups_b, &bv, bparams)) return false;
-        var rv: [4 + texture.MAX_TEX][]u8 = undefined;
-        for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
-        if (!e.runCpu(.raster, p, groups_r, rv[0..rb.len], rparams)) return false;
-        for (rb[0..2]) |img| e.wrote(img, 0, img.buf.cpu.len);
+        const done = cpu: {
+            if (e.cpu_work.len == 0) break :cpu false;
+            for (vb) |img| e.fetchAll(img);
+            for (rb) |img| e.fetchAll(img);
+            e.stats.cpu_ops += 1;
+            var views: [MAX_BIND][]u8 = undefined;
+            for (vb, 0..) |img, j| views[j] = img.buf.cpu;
+            if (!e.runCpu(.vertex, p, groups_v, views[0..vb.len], vparams)) break :cpu false;
+            const sv = [_][]u8{ tris.buf.cpu, verts.buf.cpu };
+            if (!e.runCpu(.setup, p, groups_s, &sv, sparams)) break :cpu false;
+            const bv = [_][]u8{tris.buf.cpu};
+            if (bins.on and !e.runCpu(.bin, p, groups_b, &bv, bparams)) break :cpu false;
+            var rv: [4 + texture.MAX_TEX][]u8 = undefined;
+            for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
+            if (!e.runCpu(.raster, p, groups_r, rv[0..rb.len], rparams)) break :cpu false;
+            for (rb[0..2]) |img| e.wrote(img, 0, img.buf.cpu.len);
+            break :cpu true;
+        };
+        if (!checking) return done;
+        if (!done) {
+            e.checkGiveBack(regs[0..nreg]);
+            return true;
+        }
+        var more_buf: [160]u8 = undefined;
+        var more: []const u8 = "";
+        if (recs != 0) {
+            const at = 2 * regionBytes(regs[0..nreg]);
+            const vl = verts.buf.cpu.len;
+            const tl = tris.buf.cpu.len;
+            const va = recordsApart(e.check.mem[at..][0..vl], verts.buf.cpu);
+            const ta = recordsApart(e.check.mem[at + vl ..][0..tl], tris.buf.cpu);
+            more = (if (va > vl / 64) std.fmt.bufPrint(&more_buf, " (the vertex kernel's records already differ: {d} of {d} words)", .{ va, vl / 4 }) else if (ta > tl / 64) std.fmt.bufPrint(&more_buf, " (the vertex kernel agrees; the triangles' records differ, from the setup{s} kernel: {d} of {d} words)", .{ if (bins.on) " or bin" else "", ta, tl / 4 }) else std.fmt.bufPrint(&more_buf, " (the vertex{s} kernels agree)", .{if (bins.on) ", setup and bin" else " and setup"})) catch "";
+        }
+        e.checkCompare(regs[0..nreg], "a draw", more);
         return true;
     }
 
@@ -1267,19 +1510,32 @@ pub const Engine = struct {
         p[B_SET] = if (color and (setOf(src) != 0 or src.format.channels() < 4)) 0xff00_0000 else 0;
         p[B_WMASK] = b.wmask;
         const groups = [3]u32{ divUp(a.width(), GROUP), a.height(), 1 };
+        const regs = [_]Region{rowsOf(dst, a.y0, a.y1)};
+        var checking = false;
+        if (e.gpuUsable(src) and e.gpuUsable(dst)) checking = e.checkFirst(.blit, @as(u64, a.width()) * a.height(), &regs);
         if (e.gpuUsable(src) and e.gpuUsable(dst)) {
             const bufs = [_]*Image{ src, dst };
             e.recordProg(&e.progs[@intFromEnum(Prog.blit)], groups, &bufs, 0b10, &p, null);
+            if (!checking) return true;
+            checking = e.checkSwap(&regs);
+        }
+        const done = cpu: {
+            if (e.cpu_work.len == 0) break :cpu false;
+            e.fetchAll(src);
+            e.fetchAll(dst);
+            e.stats.cpu_ops += 1;
+            const views = [_][]u8{ src.buf.cpu, dst.buf.cpu };
+            // (a pipeline the blit kernel ignores)
+            if (!e.runCpu(.blit, undefined, groups, &views, &p)) break :cpu false;
+            e.wrote(dst, 0, dst.buf.cpu.len);
+            break :cpu true;
+        };
+        if (!checking) return done;
+        if (!done) {
+            e.checkGiveBack(&regs);
             return true;
         }
-        if (e.cpu_work.len == 0) return false;
-        e.fetchAll(src);
-        e.fetchAll(dst);
-        e.stats.cpu_ops += 1;
-        const views = [_][]u8{ src.buf.cpu, dst.buf.cpu };
-        // (a pipeline the blit kernel ignores)
-        if (!e.runCpu(.blit, undefined, groups, &views, &p)) return false;
-        e.wrote(dst, 0, dst.buf.cpu.len);
+        e.checkCompare(&regs, "a blit", "");
         return true;
     }
 
@@ -1297,7 +1553,24 @@ pub const Engine = struct {
         const y0 = if (img.top_down) img.height - a.y1 else a.y0;
         const groups = [3]u32{ std.math.divCeil(u32, a.width(), GROUP) catch unreachable, a.height(), 1 };
         const p = [_]u32{ a.x0, y0, a.width(), img.stride, value & ~keep, keep, img.format.bytes() };
-        e.record(if (keep == 0) .fill else .fill_masked, groups, &.{img}, &p, op);
+        const prog: Prog = if (keep == 0) .fill else .fill_masked;
+        const regs = [_]Region{rowsOf(img, a.y0, a.y1)};
+        const checking = e.checkFirst(prog, @as(u64, a.width()) * a.height(), &regs);
+        if (!e.gpuUsable(img)) return e.cpuDo(op);
+        e.record(prog, groups, &.{img}, &p, op);
+        if (!checking) return;
+        const kept = e.checkSwap(&regs);
+        e.cpuDo(op);
+        if (kept) e.checkCompare(&regs, if (keep == 0) "a fill" else "a masked fill", "");
+    }
+
+    /// Whether this run of engine kernel `prog` is checked (counted, the
+    /// regions saved).
+    fn checkFirst(e: *Engine, prog: Prog, px: u64, regs: []const Region) bool {
+        const i = @intFromEnum(prog);
+        if (!e.wantCheck(e.prog_checked[i], px)) return false;
+        e.prog_checked[i] += 1;
+        return e.checkSave(regs);
     }
 
     /// w x h pixels from (sx, sy) in src to (dx, dy) in dst (GL's
@@ -1319,7 +1592,14 @@ pub const Engine = struct {
         const ss: i32 = if (src.top_down) -1 else 1;
         const ds: i32 = if (dst.top_down) -1 else 1;
         const p = [_]u32{ sx, @bitCast(s0), @bitCast(ss), src.stride, dx, @bitCast(d0), @bitCast(ds), dst.stride, w, keep, ~keep, setOf(src), src.format.bytes(), dst.format.bytes() };
+        const regs = [_]Region{rowsOf(dst, dy, dy + h)};
+        const checking = e.checkFirst(.copy, @as(u64, w) * h, &regs);
+        if (!e.gpuUsable(src) or !e.gpuUsable(dst)) return e.cpuDo(op);
         e.record(.copy, .{ std.math.divCeil(u32, w, GROUP) catch unreachable, h, 1 }, &.{ src, dst }, &p, op);
+        if (!checking) return;
+        const kept = e.checkSwap(&regs);
+        e.cpuDo(op);
+        if (kept) e.checkCompare(&regs, "a copy", "");
     }
 
     /// Rows of pixels from the CPU into img's rectangle (x, y, w, h: GL's

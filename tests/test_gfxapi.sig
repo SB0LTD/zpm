@@ -329,6 +329,8 @@ test "gfxapi: a buffer a batch still uses is freed after it; a lost GPU's batch 
     objs.init();
     ctx.init(&eng_f, &objs);
     defer ctx.deinit();
+    // (EGL's LOSE_CONTEXT_ON_RESET: a reset is told)
+    ctx.lose_on_reset = true;
     ctx.setSurface(&b, &b, null);
     Flaky.fail = true;
     ctx.clearColor(0, 0, 1, 1);
