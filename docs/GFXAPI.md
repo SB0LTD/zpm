@@ -217,7 +217,7 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
 The library is `libgalaxy-gl.so`, with 58 `egl*` and 220 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
 
-**Mesa's names (`abi.sig`).** Mesa 25.1's `libGL.so.1`, `libGLESv2.so.2`, `libEGL.so.1` and `libgbm.so.1` export 1448 functions. musl's and glibc's dynamic linkers bind them all at load, so a program that names one the library lacks does not start. The library answers every one of them, and Galaxy packages it under all four names. Then no app needs Mesa, and Galaxy's installer leaves Mesa's packages out:
+**Mesa's names (`abi.sig`).** Mesa 25.1's `libGL.so.1`, `libGLESv2.so.2`, `libEGL.so.1` and `libgbm.so.1` export 1448 functions. musl's and glibc's dynamic linkers bind them all at load, so a program that names one the library lacks does not start. The library answers every one of them, and Galaxy packages it under all four names, and as `libGLESv1_CM.so.1` (Mesa's 145 OpenGL ES 1 names are among the 1448). Then no app needs Mesa, and Galaxy's installer leaves Mesa's packages out:
 - the driver's own EGL and GLES entry points answer for themselves;
 - GLX: there is none. Galaxy's X server has no GLX extension, so `glXQueryExtension` is false and no GLX context is made, as with Mesa's `libGL` on Galaxy. `glXGetProcAddress` hands out EGL's entry points;
 - GBM: no device yet (stage 7). `gbm_create_device` answers null, and apps take their other path: Wayland's shared memory, or the dma-bufs EGL makes itself. `gbm_format_get_name` works;

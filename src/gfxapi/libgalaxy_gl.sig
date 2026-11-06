@@ -3,9 +3,9 @@
 //! (libgles.sig), under Khronos' names. Packaged as libEGL.so.1 and
 //! libGLESv2.so.2, both links to this one file: the dynamic linker loads
 //! a file once, whatever name finds it, so EGL and GL share their state.
-//! Also packaged as libGL.so.1 and libgbm.so.1: every other name Mesa's
-//! four libraries export is answered here too (abi.sig), so a program
-//! linked against Mesa loads against this file.
+//! Also packaged as libGL.so.1, libGLESv1_CM.so.1 and libgbm.so.1: every
+//! other name Mesa's libraries export is answered here too (abi.sig), so
+//! a program linked against Mesa loads against this file.
 //!
 //! The driver behind EGL (egl.Driver): Galaxy's GPU through its render
 //! node (node.Gpu over Linux, with this image's backend: ir3 on AArch64,

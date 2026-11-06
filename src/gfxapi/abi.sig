@@ -3,7 +3,8 @@
 //! export 1448 functions, and a program that names one this library lacks
 //! does not start: musl's and glibc's dynamic linkers bind them all at
 //! load. So libgalaxy-gl.so answers every one, and Galaxy packages it
-//! under all four names. Then no app needs Mesa, and Galaxy's installer
+//! under all four names (and as libGLESv1_CM.so.1: Mesa's 145 OpenGL ES 1
+//! names are among the 1448). Then no app needs Mesa, and Galaxy's installer
 //! leaves Mesa's packages out (Mesa's core and its LLVM, about 260 MB,
 //! came with every app that linked libGL or libgbm).
 //!
