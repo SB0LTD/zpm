@@ -17,6 +17,7 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 | `texfmt.sig` | GL ES's texture formats as the engine stores them: each upload GL allows, its conversion and its swizzle. |
 | `program.sig` | GL's shader and program objects: sources, compiles and their logs, links, attribute and uniform locations, uniform values. |
 | `glsl/` | The GLSL ES compiler: `lex.sig` (tokens, keywords by version), `pp.sig` (the preprocessor), `parse.sig` (the AST), `sema.sig` (types, scopes, built-ins, ES's rules), `glsl.sig` (a compile, its log and its interface), `gen.sig` (a checked shader as KIR, inside the draw kernels). |
+| `dxbc/` | Direct3D's shaders: `dxbc.sig` reads the DXBC container (chunks, the input and output signatures) and Shader Model 4 and 5's tokens in place; `gen.sig` emits a vertex or pixel shader as the raster's KIR emitters, as `glsl/gen.sig` does GLSL's; `fixtures.sig` holds shaders compiled from `fixtures.hlsl` by Microsoft's compiler, and `draw_test.sig` draws them. |
 | `egl.sig` | EGL 1.5 for OpenGL ES: displays, configs, contexts with share groups, window and pbuffer surfaces, swaps, fence syncs, errors per thread. |
 | `wayland.sig` | EGL's Wayland platform: a window's frames handed to the compositor as dma-bufs (`zwp_linux_dmabuf_v1`), through the app's own `libwayland-client`. |
 | `thread.sig` | What EGL and GL keep per thread: the current context and surfaces, EGL's last error, the bound API. |
@@ -128,6 +129,33 @@ A link keeps copies of its shaders' sources and makes the program's pipeline. It
   - After the fragment code is generated, a check finds where its control flow may differ between lanes. That is an `if` on a value that differs between pixels, the rest of a loop's pass after a break or continue on one, the whole of a loop left that way that runs more than one pass, and what follows a `return` or `discard` that some pixels take. It is a fixpoint over KIR: thread ids, shuffles and what they reach are divergent.
   - A derivative's shuffle at such a place becomes a copy of the pixel's own value, so the derivative is 0.
 - **Not yet:** cube, 3D, array and shadow samplers (they read 0), a sampler chosen at run time, `gl_FragDepth`, `gl_PointSize`, and color attachments past the first.
+
+### Direct3D's shaders (DXBC)
+
+Windows programs draw through Direct3D, which hands the driver compiled shaders: DXBC, Shader Model 4 and 5's tokens. The same raster runs them, on every GPU and on the CPU, as KIR emitters (`dxbc/gen.sig`):
+
+- **Registers.** DXBC's registers are typeless vectors of four 32-bit words. Each temp's and output's component is a u32 KIR register, `set` by every write. An instruction reads it as the type it computes in, since KIR's `mov` reinterprets any 32-bit value. An instruction reads all its sources before it writes, so `mov r0.yx, r0.xy` swaps.
+- **Inputs and outputs.**
+  - A vertex shader's inputs are its input layout's attributes (`Layout.attr`).
+  - The varyings between the stages go by their signature element's semantic, component by component, since one register may pack two elements (`Layout.varying`).
+  - `SV_Position` is the clip-space position on the way out and the fragment's coordinate on the way in.
+  - `SV_IsFrontFace`, `SV_VertexID` and `SV_InstanceID` are the raster's.
+  - A pixel shader's `SV_Target0` is the color. fxc writes its system value as 0, so it is known by name.
+  - D3D's `constant` interpolation is a flat varying (`flatVaryings`).
+- **Constant buffers** are words of the uniform binding (`Layout.cbuffer`). An immediate index reads its word, and a relative one loads at run time, clamped to the buffer. The shader's own immediate constant buffer is immediates, or a select chain for a relative index.
+- **Instructions:**
+  - float arithmetic and compares (all-ones or zero);
+  - integer arithmetic, shifts, bit fields and compares;
+  - `udiv`'s quotient and remainder (32 steps of long division; by zero, both all ones);
+  - `imul`/`umul`'s high and low words;
+  - conversions toward zero;
+  - `movc`, `dp2`-`dp4`, `sincos`, the derivatives;
+  - `if`, loops with (conditional) `break` and `continue`, `discard`.
+- **Textures.**
+  - `sample`, `sample_l`, `sample_b`, `sample_d`, `ld` and `resinfo` read a 2D texture through `texture.sig`.
+  - A resource and sampler pair is one texture slot (`Layout.texture`).
+  - A pixel shader with an implicit level of detail runs whole quads (`needsQuads`). Inside an `if` or a loop, where a quad's pixels may part, its derivatives are 0, as GLSL's are.
+- **Not yet** (a log line, not a crash): early returns, `switch`, subroutines, indexable temps, other resource dimensions, multiple render targets, `SV_Depth`, the geometry, hull, domain and compute stages, and Shader Model 5.1's DXIL.
 
 ### Textures
 
