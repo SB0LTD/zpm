@@ -39,11 +39,17 @@ pub fn Missing(comptime name: []const u8) type {
             if (!said) {
                 // (two threads may both say it)
                 said = true;
-                report.say(.missing, "{s}: not in this driver, the call does nothing", .{name});
+                sayMissing(name);
             }
             return 0;
         }
     };
+}
+
+/// (one copy of the line's formatting for every name: `name` a runtime
+/// value here, not a new instance of report.say each)
+noinline fn sayMissing(name: []const u8) void {
+    report.say(.missing, "{s}: not in this driver, the call does nothing", .{name});
 }
 
 // ── GBM (libgbm.so.1) ──────────────────────────────────────────────────────
