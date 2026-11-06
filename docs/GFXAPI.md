@@ -217,6 +217,14 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 
 The library is `libgalaxy-gl.so`, with 58 `egl*` and 220 `gl*` entry points. It is packaged as `libEGL.so.1` and `libGLESv2.so.2`, both links to the one file. The dynamic linker loads a file once, whatever name finds it, so EGL and GL share their state.
 
+**Mesa's names (`abi.sig`).** Mesa 25.1's `libGL.so.1`, `libGLESv2.so.2`, `libEGL.so.1` and `libgbm.so.1` export 1448 functions. musl's and glibc's dynamic linkers bind them all at load, so a program that names one the library lacks does not start. The library answers every one of them, and Galaxy packages it under all four names. Then no app needs Mesa, and Galaxy's installer leaves Mesa's packages out:
+- the driver's own EGL and GLES entry points answer for themselves;
+- GLX: there is none. Galaxy's X server has no GLX extension, so `glXQueryExtension` is false and no GLX context is made, as with Mesa's `libGL` on Galaxy. `glXGetProcAddress` hands out EGL's entry points;
+- GBM: no device yet (stage 7). `gbm_create_device` answers null, and apps take their other path: Wayland's shared memory, or the dma-bufs EGL makes itself. `gbm_format_get_name` works;
+- every other name (desktop GL, the GLES calls not done yet, Mesa's GL interop for OpenCL) is a call that does nothing and returns 0, as a GL call does with no current context. Each is said once on stderr.
+
+The names were read off Alpine 3.22's `mesa-gl`, `mesa-gles`, `mesa-egl` and `mesa-gbm` 25.1.9. Both architectures' builds define all 1448.
+
 Each context is current per thread. The current context is kept in a fixed table keyed by the thread pointer (`TPIDR_EL0` on AArch64, `%fs:0` on x86-64), so the library needs no thread-local storage and no C library.
 
 **What it says of itself.** An app's stderr (on Galaxy, the kernel log) gets `galaxy-gl[pid]:` lines (`report.sig`), each kind a few times at most:
@@ -403,6 +411,7 @@ sig build test-gfxapi
   - a GPU that skips each draw's tile kernel: the check says the vertex and setup kernels agree;
   - no room for a check: none is made.
 - `libgles` robustness: the extensions, the strategy, a reset and `CONTEXT_LOST` told once, and the n-forms' size checks.
+- `abi`: GBM's format names, GLX's client strings and no GLX, a missing name's call, the names sorted and each there once; `libgalaxy_gl`: GLX's lookups are EGL's.
 
 ## Stages ahead
 
@@ -420,8 +429,8 @@ sig build test-gfxapi
 | 5g | Done: mipmaps. Levels in one chain, `glGenerateMipmap` on the GPU, completeness, implicit LOD through quads, `textureLod` and `textureGrad`, trilinear | zpm |
 | 5h | Firefox's WebRender drawing on the Surface's GPU, and what that finds | zpm + Galaxy |
 | 6 | Chromium through ANGLE on GLES | zpm |
-| 7 | `libgbm.so.1` | zpm |
-| 8 | Packaging: the libraries in Galaxy's root under Mesa's names; `mesa-*` provided by Galaxy; a Flatpak GL extension | Galaxy |
+| 7 | `libgbm.so.1`: its names answered (no device yet); a GBM device over the driver's buffers | zpm |
+| 8 | Packaging: in part. The library under Mesa's four names and every name they export (`abi.sig`); `mesa-*` provided by Galaxy's installer. Still to do: a Flatpak GL extension | Galaxy |
 | 9 | A fixed-function Adreno backend (the 3D pipe), for speed | zpm |
 | 10 | The PC: per-app RTX contexts in `nv_drm`, then the same driver on sm_120 | Galaxy + zpm |
 | 11 | A Vulkan ICD (SPIR-V to KIR) | zpm |

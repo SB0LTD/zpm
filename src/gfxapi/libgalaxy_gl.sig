@@ -3,6 +3,9 @@
 //! (libgles.sig), under Khronos' names. Packaged as libEGL.so.1 and
 //! libGLESv2.so.2, both links to this one file: the dynamic linker loads
 //! a file once, whatever name finds it, so EGL and GL share their state.
+//! Also packaged as libGL.so.1 and libgbm.so.1: every other name Mesa's
+//! four libraries export is answered here too (abi.sig), so a program
+//! linked against Mesa loads against this file.
 //!
 //! The driver behind EGL (egl.Driver): Galaxy's GPU through its render
 //! node (node.Gpu over Linux, with this image's backend: ir3 on AArch64,
@@ -24,12 +27,21 @@ const thread = gfxapi.thread;
 const report = gfxapi.report;
 const Host = gfxapi.host.Host;
 const libgles = @import("libgles.sig");
+const abi = @import("abi.sig");
 
 pub const panic = libgles.panic;
 
 comptime {
     // (libgles' gl* entry points are this library's too)
     _ = libgles;
+    // ...and every other name of Mesa's: what abi.sig answers itself, and
+    // for the rest a call that does nothing (abi.Missing)
+    _ = abi;
+    @setEvalBranchQuota(1_000_000);
+    for (abi.names) |name| {
+        if (@hasDecl(@This(), name) or @hasDecl(libgles, name) or abi.answers(name)) continue;
+        @export(&abi.Missing(name).call, .{ .name = name });
+    }
 }
 
 // ── The driver ─────────────────────────────────────────────────────────────
@@ -424,6 +436,14 @@ pub export fn eglGetProcAddress(name: ?[*:0]const u8) callconv(.c) ?*const anyop
     if (p == null) report.say(.missing, "eglGetProcAddress(\"{s}\"): not in this driver", .{s});
     return p;
 }
+/// GLX's (libGL.so.1): EGL's answer. There is no GLX context to call them
+/// in (abi.sig), but a program may look its functions up all the same.
+pub export fn glXGetProcAddress(name: ?[*:0]const u8) callconv(.c) ?*const anyopaque {
+    return eglGetProcAddress(name);
+}
+pub export fn glXGetProcAddressARB(name: ?[*:0]const u8) callconv(.c) ?*const anyopaque {
+    return eglGetProcAddress(name);
+}
 
 const Entry = struct { name: []const u8, ptr: *const anyopaque };
 
@@ -547,4 +567,13 @@ test "libgalaxy_gl: EGL and GL through their C entry points (surfaceless, a pbuf
     try std.testing.expect(eglGetProcAddress("eglSwapBuffersWithDamageKHR") != null);
     try std.testing.expect(eglGetProcAddress("eglNoSuchCall") == null);
     try std.testing.expect(entries.len >= 50);
+}
+
+test "libgalaxy_gl: GLX looks up what EGL does; Mesa's names are answered" {
+    try std.testing.expect(glXGetProcAddressARB("glClear") == eglGetProcAddress("glClear"));
+    try std.testing.expect(glXGetProcAddress("eglSwapBuffers") == eglGetProcAddress("eglSwapBuffers"));
+    try std.testing.expect(glXGetProcAddressARB(null) == null);
+    // (desktop GL's glBegin is abi.Missing's, not an entry point to hand out)
+    try std.testing.expect(glXGetProcAddressARB("glBegin") == null);
+    try std.testing.expect(@hasDecl(libgles, "glClear") and !abi.answers("glClear"));
 }
