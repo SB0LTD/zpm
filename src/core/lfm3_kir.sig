@@ -123,6 +123,11 @@ pub const Format = enum { q4_k, q6_k, q8_0 };
 pub const Layout = struct {
     lanes: u32,
     threads: u32 = 64,
+    /// Blocks a row's threads take an iteration (1, 2 or 4; Q8_0: 1): all
+    /// their weights loaded before any is used, so a warp has that many
+    /// blocks' bytes in flight at once. The blocks are still added in the
+    /// CPU's order. A row's block count must be a multiple of it.
+    unroll: u32 = 1,
 
     pub fn of(caps: Caps) Layout {
         if (caps.target == .ir3_a7xx) return .{ .lanes = 1 };
@@ -708,6 +713,8 @@ pub fn matrix(s: kir.Storage, caps: Caps, format: Format, tokens: u32) Error!kir
 pub fn matrixWith(s: kir.Storage, caps: Caps, lay: Layout, format: Format, tokens: u32) Error!kir.Kernel {
     if (tokens < 1 or tokens > MAX_TOKENS) return error.Unsupported;
     if (lay.lanes != 1 and lay.lanes != 2 and lay.lanes != 4) return error.Unsupported;
+    if (lay.unroll != 1 and lay.unroll != 2 and lay.unroll != 4) return error.Unsupported;
+    if (format == .q8_0 and lay.unroll != 1) return error.Unsupported;
     if (caps.subgroup < lay.threadsPerRow()) return error.Unsupported;
     var k = begin(s, switch (format) {
         .q4_k => "lfm3_q4k",
@@ -757,8 +764,8 @@ pub fn matrixWith(s: kir.Storage, caps: Caps, lay: Layout, format: Format, token
     const blk = b.mov(.u32, U(0));
 
     switch (format) {
-        .q4_k => q4kBody(&b, .{ .W = W, .AQ = AQ, .AD = AD, .AS = AS }, lpt, tokens, l0, l0x4, boff, blk, blocks, &aq_t, &ad_t, &as_t, &acc),
-        .q6_k => q6kBody(&b, .{ .W = W, .AQ = AQ, .AD = AD, .AS = AS }, lpt, tokens, l0, l0x4, boff, blk, blocks, &aq_t, &ad_t, &as_t, &acc),
+        .q4_k => q4kBody(&b, .{ .W = W, .AQ = AQ, .AD = AD, .AS = AS }, lpt, lay.unroll, tokens, l0, l0x4, boff, blk, blocks, &aq_t, &ad_t, &as_t, &acc),
+        .q6_k => q6kBody(&b, .{ .W = W, .AQ = AQ, .AD = AD, .AS = AS }, lpt, lay.unroll, tokens, l0, l0x4, boff, blk, blocks, &aq_t, &ad_t, &as_t, &acc),
         .q8_0 => q80Body(&b, .{ .W = W, .AQ = AQ, .AD = AD, .AS = AS }, lpt, tokens, l0x4, boff, blk, blocks, &aq_t, &ad_t, &acc),
     }
 
@@ -796,75 +803,91 @@ pub fn matrixWith(s: kir.Storage, caps: Caps, lay: Layout, format: Format, token
 
 const MB = struct { W: u8, AQ: u8, AD: u8, AS: u8 };
 
-/// The block loop's end: next block, and out when all are done.
-fn nextBlock(b: *Builder, boff: V, blk: V, blocks: V, block_bytes: u32) void {
-    b.set(boff, .iadd, .u32, R(boff), U(block_bytes), NO);
-    b.set(blk, .iadd, .u32, R(blk), U(1), NO);
+/// The block loop's end: the next `step` blocks, and out when all are done.
+fn nextBlock(b: *Builder, boff: V, blk: V, blocks: V, block_bytes: u32, step: u32) void {
+    b.set(boff, .iadd, .u32, R(boff), U(block_bytes * step), NO);
+    b.set(blk, .iadd, .u32, R(blk), U(step), NO);
     b.brk(b.icmp(.u32, .ge, R(blk), R(blocks)));
 }
 
-fn q4kBody(b: *Builder, m: MB, lpt: u32, tokens: u32, l0: V, l0x4: V, boff: V, blk: V, blocks: V, aq_t: []const V, ad_t: []const V, as_t: []const V, acc: *[MAX_TOKENS][4]V) void {
+pub const MAX_UNROLL = 4;
+
+fn q4kBody(b: *Builder, m: MB, lpt: u32, unroll: u32, tokens: u32, l0: V, l0x4: V, boff: V, blk: V, blocks: V, aq_t: []const V, ad_t: []const V, as_t: []const V, acc: *[MAX_TOKENS][4]V) void {
     // this thread's lanes in the minimums: their half and byte shifts
     const hi_half = b.icmp(.u32, .ge, R(l0), U(4));
     const mshift0 = b.shl(R(b.band(R(l0), U(3))), 3);
     var mshift: [4]V = undefined;
     for (0..lpt) |j| mshift[j] = if (j == 0) mshift0 else b.add(R(mshift0), U(@intCast(8 * j)));
     b.loop();
-    const hdr = b.ldv(m.W, .u32, R(boff), 0, 4);
-    const h0 = at(hdr, 0);
-    const h1 = at(hdr, 1);
-    const h2 = at(hdr, 2);
-    const h3 = at(hdr, 3);
-    const d = b.half(h0, false);
-    const dmin = b.half(h0, true);
-    // GGML's four-word mask sequence (quantized_linear.unpackScalesQ4K)
-    const sc_lo = b.band(R(h1), U(0x3f3f3f3f));
-    const sc_hi = b.bor(R(b.band(R(h3), U(0x0f0f0f0f))), R(b.shl(R(b.band(R(b.shr(R(h1), 6)), U(0x03030303))), 4)));
-    const mn_lo = b.band(R(h2), U(0x3f3f3f3f));
-    const mn_hi = b.bor(R(b.band(R(b.shr(R(h3), 4)), U(0x0f0f0f0f))), R(b.shl(R(b.band(R(b.shr(R(h2), 6)), U(0x03030303))), 4)));
-    var scale: [8]V = undefined;
-    for (0..8) |j| scale[j] = b.as(.i32, b.bfeU(R(if (j < 4) sc_lo else sc_hi), U(@intCast(8 * (j % 4))), 8));
-    const mnw = b.sel(.u32, hi_half, R(mn_hi), R(mn_lo));
-    var minimum: [4]V = undefined;
-    for (0..lpt) |j| minimum[j] = b.as(.i32, b.bfeU(R(mnw), R(mshift[j]), 8));
-    // the weight nibbles: sub-block 2p the low, 2p + 1 the high nibbles of pair p
+    // every block's weights of this iteration first (their loads in flight
+    // together), then each block in turn, in the CPU's order
     const qaddr = b.add(R(boff), R(l0x4));
-    var wq: [8][4]V = undefined;
-    for (0..4) |p| {
-        const w = b.ldv(m.W, .u32, R(qaddr), @intCast(16 + 32 * p), lpt);
-        for (0..lpt) |j| {
-            wq[2 * p][j] = b.band(R(at(w, j)), U(0x0f0f0f0f));
-            wq[2 * p + 1][j] = b.band(R(b.shr(R(at(w, j)), 4)), U(0x0f0f0f0f));
-        }
+    var hdrs: [MAX_UNROLL]V = undefined;
+    var raw: [MAX_UNROLL][4]V = undefined;
+    for (0..unroll) |u| {
+        const ub: u32 = @intCast(u * Q4_K_BLOCK);
+        hdrs[u] = b.ldv(m.W, .u32, R(boff), ub, 4);
+        for (0..4) |p| raw[u][p] = b.ldv(m.W, .u32, R(qaddr), ub + @as(u32, @intCast(16 + 32 * p)), lpt);
     }
     const a_off = b.shl(R(blk), 8);
     const d_off = b.shl(R(blk), 2);
     const s_off = b.shl(R(blk), 5);
-    for (0..tokens) |ti| {
-        const aa = b.add(R(aq_t[ti]), R(a_off));
-        var aw: [8]V = undefined;
-        for (0..8) |j| aw[j] = b.ldv(m.AQ, .u32, R(aa), @intCast(32 * j), lpt);
-        const ad = b.ld(m.AD, .f32, R(b.add(R(ad_t[ti]), R(d_off))), 0, 5);
-        const bs = b.ldv(m.AS, .u32, R(b.add(R(as_t[ti]), R(s_off))), 0, lpt);
-        const da = b.fmul(R(d), R(ad));
-        const dm = b.fmul(R(dmin), R(ad));
-        for (0..lpt) |j| {
-            var sum: V = undefined;
-            for (0..8) |sb| {
-                const dot = b.dot4(.s8u8, R(at(aw[sb], j)), R(wq[sb][j]), I(0));
-                sum = if (sb == 0) b.imulS(R(dot), R(scale[0])) else b.imadS(R(dot), R(scale[sb]), R(sum));
+    for (0..unroll) |u| {
+        const hdr = hdrs[u];
+        const h0 = at(hdr, 0);
+        const h1 = at(hdr, 1);
+        const h2 = at(hdr, 2);
+        const h3 = at(hdr, 3);
+        const d = b.half(h0, false);
+        const dmin = b.half(h0, true);
+        // GGML's four-word mask sequence (quantized_linear.unpackScalesQ4K)
+        const sc_lo = b.band(R(h1), U(0x3f3f3f3f));
+        const sc_hi = b.bor(R(b.band(R(h3), U(0x0f0f0f0f))), R(b.shl(R(b.band(R(b.shr(R(h1), 6)), U(0x03030303))), 4)));
+        const mn_lo = b.band(R(h2), U(0x3f3f3f3f));
+        const mn_hi = b.bor(R(b.band(R(b.shr(R(h3), 4)), U(0x0f0f0f0f))), R(b.shl(R(b.band(R(b.shr(R(h2), 6)), U(0x03030303))), 4)));
+        var scale: [8]V = undefined;
+        for (0..8) |j| scale[j] = b.as(.i32, b.bfeU(R(if (j < 4) sc_lo else sc_hi), U(@intCast(8 * (j % 4))), 8));
+        const mnw = b.sel(.u32, hi_half, R(mn_hi), R(mn_lo));
+        var minimum: [4]V = undefined;
+        for (0..lpt) |j| minimum[j] = b.as(.i32, b.bfeU(R(mnw), R(mshift[j]), 8));
+        // the weight nibbles: sub-block 2p the low, 2p + 1 the high nibbles of pair p
+        var wq: [8][4]V = undefined;
+        for (0..4) |p| {
+            const w = raw[u][p];
+            for (0..lpt) |j| {
+                wq[2 * p][j] = b.band(R(at(w, j)), U(0x0f0f0f0f));
+                wq[2 * p + 1][j] = b.band(R(b.shr(R(at(w, j)), 4)), U(0x0f0f0f0f));
             }
-            // the minimum: min[lane] * (bsums[2 lane] + bsums[2 lane + 1])
-            const bsw = b.as(.i32, at(bs, j));
-            const pair = b.iaddS(R(b.bfeS(R(bsw), U(0), 16)), R(b.bfeS(R(bsw), U(16), 16)));
-            const mm = b.imulS(R(pair), R(minimum[j]));
-            // sums += (d * ad) * I - (dmin * ad) * M
-            const x = b.fmul(R(da), R(b.i2f(sum)));
-            const y = b.fmul(R(dm), R(b.i2f(mm)));
-            b.set(acc[ti][j], .fadd, .f32, R(acc[ti][j]), R(b.fsub(R(x), R(y))), NO);
+        }
+        const uq: u32 = @intCast(u * 256);
+        const ud: u32 = @intCast(u * 4);
+        const us: u32 = @intCast(u * 32);
+        for (0..tokens) |ti| {
+            const aa = b.add(R(aq_t[ti]), R(a_off));
+            var aw: [8]V = undefined;
+            for (0..8) |j| aw[j] = b.ldv(m.AQ, .u32, R(aa), uq + @as(u32, @intCast(32 * j)), lpt);
+            const ad = b.ld(m.AD, .f32, R(b.add(R(ad_t[ti]), R(d_off))), ud, 5);
+            const bs = b.ldv(m.AS, .u32, R(b.add(R(as_t[ti]), R(s_off))), us, lpt);
+            const da = b.fmul(R(d), R(ad));
+            const dm = b.fmul(R(dmin), R(ad));
+            for (0..lpt) |j| {
+                var sum: V = undefined;
+                for (0..8) |sb| {
+                    const dot = b.dot4(.s8u8, R(at(aw[sb], j)), R(wq[sb][j]), I(0));
+                    sum = if (sb == 0) b.imulS(R(dot), R(scale[0])) else b.imadS(R(dot), R(scale[sb]), R(sum));
+                }
+                // the minimum: min[lane] * (bsums[2 lane] + bsums[2 lane + 1])
+                const bsw = b.as(.i32, at(bs, j));
+                const pair = b.iaddS(R(b.bfeS(R(bsw), U(0), 16)), R(b.bfeS(R(bsw), U(16), 16)));
+                const mm = b.imulS(R(pair), R(minimum[j]));
+                // sums += (d * ad) * I - (dmin * ad) * M
+                const x = b.fmul(R(da), R(b.i2f(sum)));
+                const y = b.fmul(R(dm), R(b.i2f(mm)));
+                b.set(acc[ti][j], .fadd, .f32, R(acc[ti][j]), R(b.fsub(R(x), R(y))), NO);
+            }
         }
     }
-    nextBlock(b, boff, blk, blocks, Q4_K_BLOCK);
+    nextBlock(b, boff, blk, blocks, Q4_K_BLOCK, unroll);
     b.endloop();
 }
 
@@ -875,7 +898,7 @@ fn word16(b: *Builder, binding: u8, addr: V, imm: u32) V {
     return b.bor(R(lo), R(b.shl(R(hi), 16)));
 }
 
-fn q6kBody(b: *Builder, m: MB, lpt: u32, tokens: u32, l0: V, l0x4: V, boff: V, blk: V, blocks: V, aq_t: []const V, ad_t: []const V, as_t: []const V, acc: *[MAX_TOKENS][4]V) void {
+fn q6kBody(b: *Builder, m: MB, lpt: u32, unroll: u32, tokens: u32, l0: V, l0x4: V, boff: V, blk: V, blocks: V, aq_t: []const V, ad_t: []const V, as_t: []const V, acc: *[MAX_TOKENS][4]V) void {
     // the quarter scales of this thread's lanes: byte 2 (q % 2) + hs of
     // word 2h + q / 2 (hs: lanes 4..7 take a block's odd scales)
     const hs = b.shr(R(l0), 2);
@@ -893,74 +916,88 @@ fn q6kBody(b: *Builder, m: MB, lpt: u32, tokens: u32, l0: V, l0x4: V, boff: V, b
         osh[j] = if (lpt == 1) R(b.shl(R(b.band(R(l0), U(1))), 4)) else U(@intCast(16 * (j % 2)));
     }
     b.loop();
+    // every block's weights of this iteration first (their loads in flight
+    // together), then each block in turn, in the CPU's order
     const qaddr = b.add(R(boff), R(l0x4));
-    // per lane: ql (low, next) and qh (high) words of each half
-    var low: [2][4]V = undefined;
-    var next: [2][4]V = undefined;
-    var high: [2][4]V = undefined;
-    for (0..2) |h| for (0..lpt) |j| {
-        const o: u32 = @intCast(4 * j);
-        low[h][j] = word16(b, m.W, qaddr, @intCast(h * 64 + o));
-        next[h][j] = word16(b, m.W, qaddr, @intCast(h * 64 + 32 + o));
-        high[h][j] = word16(b, m.W, qaddr, @intCast(128 + h * 32 + o));
-    };
-    var sw: [4]V = undefined;
-    for (0..4) |i| sw[i] = word16(b, m.W, boff, @intCast(192 + 4 * i));
-    const d = b.half(b.ld(m.W, .u32, R(boff), 208, 4), false);
-    var scale: [2][4]V = undefined;
-    for (0..2) |h| for (0..4) |q| {
-        scale[h][q] = b.bfeS(R(b.as(.i32, sw[2 * h + q / 2])), R(if (q % 2 == 0) sh_even else sh_odd), 8);
-    };
-    var osc0: [4]V = undefined;
-    var osc1: [4]V = undefined;
-    for (0..lpt) |j| {
-        const w = b.sel(.u32, ow1[j], R(b.sel(.u32, ow0[j], R(sw[3]), R(sw[2]))), R(b.sel(.u32, ow0[j], R(sw[1]), R(sw[0]))));
-        const wi = b.as(.i32, w);
-        osc0[j] = b.bfeS(R(wi), osh[j], 8);
-        osc1[j] = b.bfeS(R(wi), if (lpt == 1) R(b.add(R(osh[j].reg), U(8))) else U(osh[j].imm + 8), 8);
+    // per block and lane: ql (low, next) and qh (high) words of each half,
+    // the scale words and d
+    var low: [MAX_UNROLL][2][4]V = undefined;
+    var next: [MAX_UNROLL][2][4]V = undefined;
+    var high: [MAX_UNROLL][2][4]V = undefined;
+    var sws: [MAX_UNROLL][4]V = undefined;
+    var draw: [MAX_UNROLL]V = undefined;
+    for (0..unroll) |u| {
+        const ub: u32 = @intCast(u * Q6_K_BLOCK);
+        for (0..2) |h| for (0..lpt) |j| {
+            const o: u32 = @intCast(4 * j);
+            low[u][h][j] = word16(b, m.W, qaddr, ub + @as(u32, @intCast(h * 64)) + o);
+            next[u][h][j] = word16(b, m.W, qaddr, ub + @as(u32, @intCast(h * 64 + 32)) + o);
+            high[u][h][j] = word16(b, m.W, qaddr, ub + @as(u32, @intCast(128 + h * 32)) + o);
+        };
+        for (0..4) |q| sws[u][q] = word16(b, m.W, boff, ub + @as(u32, @intCast(192 + 4 * q)));
+        draw[u] = b.ld(m.W, .u32, R(boff), ub + 208, 4);
     }
-    // the 6-bit values of each half's four quarters
-    var quarter: [2][4][4]V = undefined;
-    for (0..2) |h| for (0..lpt) |j| {
-        const L = low[h][j];
-        const N = next[h][j];
-        const H = high[h][j];
-        const nib = U(0x0f0f0f0f);
-        const three = U(0x03030303);
-        quarter[h][0][j] = b.bor(R(b.band(R(L), nib)), R(b.shl(R(b.band(R(H), three)), 4)));
-        quarter[h][1][j] = b.bor(R(b.band(R(N), nib)), R(b.shl(R(b.band(R(b.shr(R(H), 2)), three)), 4)));
-        quarter[h][2][j] = b.bor(R(b.band(R(b.shr(R(L), 4)), nib)), R(b.shl(R(b.band(R(b.shr(R(H), 4)), three)), 4)));
-        quarter[h][3][j] = b.bor(R(b.band(R(b.shr(R(N), 4)), nib)), R(b.shl(R(b.band(R(b.shr(R(H), 6)), three)), 4)));
-    };
     const a_off = b.shl(R(blk), 8);
     const d_off = b.shl(R(blk), 2);
     const s_off = b.shl(R(blk), 5);
-    for (0..tokens) |ti| {
-        const aa = b.add(R(aq_t[ti]), R(a_off));
-        var aw: [2][4]V = undefined;
+    for (0..unroll) |u| {
+        const sw = sws[u];
+        const d = b.half(draw[u], false);
+        var scale: [2][4]V = undefined;
         for (0..2) |h| for (0..4) |q| {
-            aw[h][q] = b.ldv(m.AQ, .u32, R(aa), @intCast(h * 128 + q * 32), lpt);
+            scale[h][q] = b.bfeS(R(b.as(.i32, sw[2 * h + q / 2])), R(if (q % 2 == 0) sh_even else sh_odd), 8);
         };
-        const ad = b.ld(m.AD, .f32, R(b.add(R(ad_t[ti]), R(d_off))), 0, 5);
-        const bs = b.ldv(m.AS, .u32, R(b.add(R(as_t[ti]), R(s_off))), 0, lpt);
-        const ds = b.fmul(R(d), R(ad));
+        var osc0: [4]V = undefined;
+        var osc1: [4]V = undefined;
         for (0..lpt) |j| {
-            var sum: V = undefined;
-            var first = true;
+            const w = b.sel(.u32, ow1[j], R(b.sel(.u32, ow0[j], R(sw[3]), R(sw[2]))), R(b.sel(.u32, ow0[j], R(sw[1]), R(sw[0]))));
+            const wi = b.as(.i32, w);
+            osc0[j] = b.bfeS(R(wi), osh[j], 8);
+            osc1[j] = b.bfeS(R(wi), if (lpt == 1) R(b.add(R(osh[j].reg), U(8))) else U(osh[j].imm + 8), 8);
+        }
+        // the 6-bit values of each half's four quarters
+        var quarter: [2][4][4]V = undefined;
+        for (0..2) |h| for (0..lpt) |j| {
+            const L = low[u][h][j];
+            const N = next[u][h][j];
+            const H = high[u][h][j];
+            const nib = U(0x0f0f0f0f);
+            const three = U(0x03030303);
+            quarter[h][0][j] = b.bor(R(b.band(R(L), nib)), R(b.shl(R(b.band(R(H), three)), 4)));
+            quarter[h][1][j] = b.bor(R(b.band(R(N), nib)), R(b.shl(R(b.band(R(b.shr(R(H), 2)), three)), 4)));
+            quarter[h][2][j] = b.bor(R(b.band(R(b.shr(R(L), 4)), nib)), R(b.shl(R(b.band(R(b.shr(R(H), 4)), three)), 4)));
+            quarter[h][3][j] = b.bor(R(b.band(R(b.shr(R(N), 4)), nib)), R(b.shl(R(b.band(R(b.shr(R(H), 6)), three)), 4)));
+        };
+        const uq: u32 = @intCast(u * 256);
+        const ud: u32 = @intCast(u * 4);
+        const us: u32 = @intCast(u * 32);
+        for (0..tokens) |ti| {
+            const aa = b.add(R(aq_t[ti]), R(a_off));
+            var aw: [2][4]V = undefined;
             for (0..2) |h| for (0..4) |q| {
-                const dot = b.dot4(.s8u8, R(at(aw[h][q], j)), R(quarter[h][q][j]), I(0));
-                sum = if (first) b.imulS(R(dot), R(scale[h][q])) else b.imadS(R(dot), R(scale[h][q]), R(sum));
-                first = false;
+                aw[h][q] = b.ldv(m.AQ, .u32, R(aa), uq + @as(u32, @intCast(h * 128 + q * 32)), lpt);
             };
-            // offset: bsums[2L] * scale[2L] + bsums[2L + 1] * scale[2L + 1]
-            const bsw = b.as(.i32, at(bs, j));
-            const off = b.imadS(R(b.bfeS(R(bsw), U(16), 16)), R(osc1[j]), R(b.imulS(R(b.bfeS(R(bsw), U(0), 16)), R(osc0[j]))));
-            // sums += (d * ad) * (I - 32 offset)
-            const z = b.fsub(R(b.i2f(sum)), R(b.fmul(F(32.0), R(b.i2f(off)))));
-            b.set(acc[ti][j], .fadd, .f32, R(acc[ti][j]), R(b.fmul(R(ds), R(z))), NO);
+            const ad = b.ld(m.AD, .f32, R(b.add(R(ad_t[ti]), R(d_off))), ud, 5);
+            const bs = b.ldv(m.AS, .u32, R(b.add(R(as_t[ti]), R(s_off))), us, lpt);
+            const ds = b.fmul(R(d), R(ad));
+            for (0..lpt) |j| {
+                var sum: V = undefined;
+                var first = true;
+                for (0..2) |h| for (0..4) |q| {
+                    const dot = b.dot4(.s8u8, R(at(aw[h][q], j)), R(quarter[h][q][j]), I(0));
+                    sum = if (first) b.imulS(R(dot), R(scale[h][q])) else b.imadS(R(dot), R(scale[h][q]), R(sum));
+                    first = false;
+                };
+                // offset: bsums[2L] * scale[2L] + bsums[2L + 1] * scale[2L + 1]
+                const bsw = b.as(.i32, at(bs, j));
+                const off = b.imadS(R(b.bfeS(R(bsw), U(16), 16)), R(osc1[j]), R(b.imulS(R(b.bfeS(R(bsw), U(0), 16)), R(osc0[j]))));
+                // sums += (d * ad) * (I - 32 offset)
+                const z = b.fsub(R(b.i2f(sum)), R(b.fmul(F(32.0), R(b.i2f(off)))));
+                b.set(acc[ti][j], .fadd, .f32, R(acc[ti][j]), R(b.fmul(R(ds), R(z))), NO);
+            }
         }
     }
-    nextBlock(b, boff, blk, blocks, Q6_K_BLOCK);
+    nextBlock(b, boff, blk, blocks, Q6_K_BLOCK, unroll);
     b.endloop();
 }
 
@@ -982,7 +1019,7 @@ fn q80Body(b: *Builder, m: MB, lpt: u32, tokens: u32, l0x4: V, boff: V, blk: V, 
             b.set(acc[ti][j], .mov, .f32, R(b.fma(R(da), R(b.i2f(dot)), R(acc[ti][j]))), NO, NO);
         }
     }
-    nextBlock(b, boff, blk, blocks, Q8_0_BLOCK);
+    nextBlock(b, boff, blk, blocks, Q8_0_BLOCK, 1);
     b.endloop();
 }
 
@@ -2545,7 +2582,7 @@ fn testMatrix(caps: Caps, lay: Layout, format: Format, tokens: u32, rows: u32, b
             };
             const g = got[t * rows + row];
             if (@as(u32, @bitCast(g)) != @as(u32, @bitCast(want))) {
-                if (mismatches < 5) std.debug.print("{s} lanes {d} x{d}: row {d} token {d}: {e} want {e}\n", .{ @tagName(format), lay.lanes, tokens, row, t, g, want });
+                if (mismatches < 5) std.debug.print("{s} lanes {d} unroll {d} x{d}: row {d} token {d}: {e} want {e}\n", .{ @tagName(format), lay.lanes, lay.unroll, tokens, row, t, g, want });
                 mismatches += 1;
             }
         }
@@ -2557,6 +2594,9 @@ test "Q4_K x Q8_K: the CPU's bits, every layout, 1 to 8 tokens, rows not in whol
     for ([_]u32{ 1, 2, 4 }) |lanes| {
         try testMatrix(caps32(true, 32), .{ .lanes = lanes }, .q4_k, 1, 21, 3);
         try testMatrix(caps32(false, 64), .{ .lanes = lanes }, .q4_k, 3, 16, 2);
+        // two and four blocks an iteration (block counts their multiples)
+        try testMatrix(caps32(true, 32), .{ .lanes = lanes, .unroll = 2 }, .q4_k, 1, 21, 6);
+        try testMatrix(caps32(false, 64), .{ .lanes = lanes, .unroll = 4 }, .q4_k, 2, 13, 8);
     }
     try testMatrix(caps32(true, 32), .{ .lanes = 4 }, .q4_k, 8, 40, 2);
     try testMatrix(caps32(true, 128), .{ .lanes = 1 }, .q4_k, 5, 8, 30);
@@ -2566,6 +2606,9 @@ test "Q6_K x Q8_K: the CPU's bits, odd blocks two bytes off, odd block counts" {
     for ([_]u32{ 1, 2, 4 }) |lanes| {
         try testMatrix(caps32(true, 32), .{ .lanes = lanes }, .q6_k, 1, 21, 3);
         try testMatrix(caps32(false, 64), .{ .lanes = lanes }, .q6_k, 2, 9, 30);
+        // two and four blocks an iteration (block counts their multiples)
+        try testMatrix(caps32(true, 32), .{ .lanes = lanes, .unroll = 2 }, .q6_k, 1, 21, 30);
+        try testMatrix(caps32(false, 64), .{ .lanes = lanes, .unroll = 4 }, .q6_k, 1, 9, 8);
     }
     try testMatrix(caps32(true, 32), .{ .lanes = 4 }, .q6_k, 8, 33, 1);
 }

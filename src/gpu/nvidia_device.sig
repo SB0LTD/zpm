@@ -338,7 +338,14 @@ pub const Adapter = struct {
     }
 
     fn profile(ctx: *anyopaque, on: bool) bool {
-        self(ctx).profiling = on;
+        const a = self(ctx);
+        // (the ends' buffers here, not in the first profiled run: an
+        // allocation is a GSP-RM call, and legion31's profiled step showed
+        // 27 ms of CPU side against 11.8 ms unprofiled)
+        if (on) for (&a.sets) |*s| {
+            if (s.ends.cpu.len == 0) s.ends = a.rawOf(true).alloc(16 * MAX_DISPATCHES) catch return false;
+        };
+        a.profiling = on;
         return true;
     }
 
