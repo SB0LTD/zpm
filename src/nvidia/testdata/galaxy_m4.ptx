@@ -1,0 +1,20 @@
+// Galaxy's first kernel on the RTX 5070 (M4): each thread of one CTA
+// writes 0x600d0000 | its thread index to the word it owns at OUT_VA
+// (nv_chan's system memory, SYS_VA + 0x50000). No parameters, no local or
+// shared memory: only the thread index, a store and the exit.
+.version 8.8
+.target sm_120
+.address_size 64
+
+.visible .entry galaxy_m4()
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    mov.u32 %r1, %tid.x;
+    or.b32 %r2, %r1, 0x600d0000;
+    mul.wide.u32 %rd1, %r1, 4;
+    mov.u64 %rd2, 0x2000050000;
+    add.s64 %rd3, %rd2, %rd1;
+    st.global.u32 [%rd3], %r2;
+    ret;
+}

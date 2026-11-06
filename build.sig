@@ -1100,6 +1100,177 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_adreno = try ctx.addStep("test-adreno", "Execute the ir3 ISA vectors, the assembler, the emulator and the A7xx compute self-tests", &noopStep);
     try ctx.addDependency(test_all, test_adreno);
     _ = try addTest(ctx, test_adreno, "test-adreno-module", "src/adreno/adreno.sig", &.{});
+    // ── NVIDIA sm_120 (Blackwell GeForce) compute: the SASS instruction set
+    //    and an assembler for kernels (one module, files import each other) ──
+    _ = try ctx.addModule("nvidia", "src/nvidia/nvidia.sig");
+    const test_nvidia = try ctx.addStep("test-nvidia", "Encode ptxas's sm_120 vectors and assemble its kernels from their listings", &noopStep);
+    try ctx.addDependency(test_all, test_nvidia);
+    _ = try addTest(ctx, test_nvidia, "test-nvidia-module", "src/nvidia/nvidia.sig", &.{});
+    // ── GPU-neutral compute: KIR, devices, the interpreter and EmuDevice
+    //    (one module; the backends' files join it) ──
+    const gpu_module = try ctx.addModule("gpu", "src/gpu/gpu.sig");
+    // (kir_sm120, device.compile's sm_120 backend, assembles with nvidia;
+    // the Adreno backend's files, kir_ir3 and adreno_device, use adreno)
+    try wire(ctx, gpu_module, "nvidia", "src/nvidia/nvidia.sig");
+    try wire(ctx, gpu_module, "adreno", "src/adreno/adreno.sig");
+    const test_gpu = try ctx.addStep("test-gpu", "Execute KIR's verifier, interpreter, exact fdiv/fsqrt expansions and EmuDevice", &noopStep);
+    try ctx.addDependency(test_all, test_gpu);
+    _ = try addTest(ctx, test_gpu, "test-gpu-module", "src/gpu/gpu.sig", &.{
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gpu, "test-gpu-ops", "tests/test_gpu_ops.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gpu, "test-gpu-flow", "tests/test_gpu_flow.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gpu, "test-gpu-exact", "tests/test_gpu_exact.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gpu, "test-gpu-emu", "tests/test_gpu_emu.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    // ── gfxapi: Galaxy's GPU driver for apps (OpenGL ES over KIR and gpu.Device,
+    //    Galaxy's render node), on the CPU, KIR's interpreter and the emulated Adreno ──
+    const gfxapi_module = try ctx.addModule("gfxapi", "src/gfxapi/gfxapi.sig");
+    try wire(ctx, gfxapi_module, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, gfxapi_module, "adreno", "src/adreno/adreno.sig");
+    try wire(ctx, gfxapi_module, "nvidia", "src/nvidia/nvidia.sig");
+    const test_gfxapi = try ctx.addStep("test-gfxapi", "Execute the app GPU driver's engine, GLES core, C ABI and render-node client on the CPU and emulated GPUs", &noopStep);
+    try ctx.addDependency(test_all, test_gfxapi);
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-module", "src/gfxapi/gfxapi.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-libgles", "src/gfxapi/libgles.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-gpu", "tests/test_gfxapi.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-draw", "tests/test_gfxapi_draw.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-glsl", "tests/test_gfxapi_glsl.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-tex", "tests/test_gfxapi_tex.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-targets", "tests/test_gfxapi_targets.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-deriv", "tests/test_gfxapi_deriv.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-mip", "tests/test_gfxapi_mip.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-xfer", "tests/test_gfxapi_xfer.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    // (skipped without GFXAPI_WR_RES: Firefox's gfx/wr/webrender/res)
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-webrender", "tests/test_gfxapi_webrender.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-egl", "tests/test_gfxapi_egl.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-lib", "src/gfxapi/libgalaxy_gl.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
+    _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+    });
+    // LFM3's quantized matrix and quantization kernels on sm_120, in the
+    // emulated RTX against quantized_linear, to the bit.
+    _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-matrix", "src/core/lfm3_nv_matrix.sig", &.{
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
+    // LFM3's forward pass on the RTX: the backend over an nvidia Device,
+    // against lfm3_executor on the emulated RTX.
+    const lfm3_nv_matrix = try ctx.addModule("lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig");
+    try wire(ctx, lfm3_nv_matrix, "nvidia", "src/nvidia/nvidia.sig");
+    try wire(ctx, lfm3_nv_matrix, "quantized_linear", "src/core/quantized_linear.sig");
+    const lfm3_nv_ops = try ctx.addModule("lfm3_nv_ops", "src/core/lfm3_nv_ops.sig");
+    try wire(ctx, lfm3_nv_ops, "nvidia", "src/nvidia/nvidia.sig");
+    try wire(ctx, lfm3_nv_ops, "lfm3_executor", "src/core/lfm3_executor.sig");
+    const lfm3_nv = try ctx.addModule("lfm3_nv", "src/core/lfm3_nv.sig");
+    try wire(ctx, lfm3_nv, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_nv, "lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, lfm3_nv, "lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, lfm3_nv, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, lfm3_nv, "nvidia", "src/nvidia/nvidia.sig");
+    try wire(ctx, lfm3_nv, "lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig");
+    try wire(ctx, lfm3_nv, "lfm3_nv_ops", "src/core/lfm3_nv_ops.sig");
+    _ = try addTest(ctx, test_nvidia, "test-lfm3-nv", "tests/test_lfm3_nv.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig"),
+        importEntry("lfm3_nv_ops", "src/core/lfm3_nv_ops.sig"),
+        importEntry("lfm3_nv", "src/core/lfm3_nv.sig"),
+    });
     // LFM3 on the Adreno: the kernels (each against quantized_linear and the
     // executor's arithmetic) and the backend against lfm3_executor.
     const lfm3_gpu_kernels = try ctx.addModule("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig");
@@ -1127,6 +1298,84 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("adreno", "src/adreno/adreno.sig"),
         importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
         importEntry("lfm3_gpu", "src/core/lfm3_gpu.sig"),
+    });
+    // (the GPU backends' tests import lfm3_nv_matrix and lfm3_gpu_kernels,
+    // so they come after those modules are added: an import registers its
+    // name first, and addModule then refuses the duplicate)
+    // kir_sm120 and nvidia_device: KIR on the emulated RTX against the
+    // interpreter, and against lfm3_nv_matrix's hand-written Q4_K kernel.
+    _ = try addTest(ctx, test_gpu, "test-gpu-sm120", "src/gpu/nvidia_device.sig", &.{
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("lfm3_nv_matrix", "src/core/lfm3_nv_matrix.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
+    // The Adreno backend: every KIR op through ir3_emu against the
+    // interpreter, and KIR rewrites of lfm3_gpu_kernels' kernels.
+    const test_gpu_ir3 = try ctx.addStep("test-gpu-ir3", "Compile KIR for the Adreno and run it in ir3_emu against kir_interp and the hand-written kernels", &noopStep);
+    try ctx.addDependency(test_all, test_gpu_ir3);
+    _ = try addTest(ctx, test_gpu_ir3, "test-gpu-ir3-kernels", "tests/test_kir_ir3.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("lfm3_gpu_kernels", "src/core/lfm3_gpu_kernels.sig"),
+    });
+    // The GPU self-test: every KIR op on a gpu.Device against the
+    // interpreter, on the reference device (several caps), the emulated RTX
+    // and the emulated Adreno, and a broken device reported, not a crash.
+    const test_gpu_selftest = try ctx.addStep("test-gpu-selftest", "Run the GPU self-test (KIR on a Device against the interpreter) on EmuDevice, the emulated RTX and the emulated Adreno", &noopStep);
+    try ctx.addDependency(test_all, test_gpu_selftest);
+    _ = try addTest(ctx, test_gpu_selftest, "test-gpu-selftest-run", "tests/test_gpu_selftest.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
+    // LFM3 on any GPU: the KIR kernels (each against quantized_linear and the
+    // executor's arithmetic, on the interpreter) and the forward pass over a
+    // gpu.Device against lfm3_executor.
+    const lfm3_kir = try ctx.addModule("lfm3_kir", "src/core/lfm3_kir.sig");
+    try wire(ctx, lfm3_kir, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, lfm3_kir, "quantized_linear", "src/core/quantized_linear.sig");
+    const lfm3_any = try ctx.addModule("lfm3_any", "src/core/lfm3_any.sig");
+    try wire(ctx, lfm3_any, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_any, "lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, lfm3_any, "lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, lfm3_any, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, lfm3_any, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, lfm3_any, "lfm3_kir", "src/core/lfm3_kir.sig");
+    const lfm3_any_audio = try ctx.addModule("lfm3_any_audio", "src/core/lfm3_any_audio.sig");
+    try wire(ctx, lfm3_any_audio, "gguf", "src/core/gguf.sig");
+    try wire(ctx, lfm3_any_audio, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, lfm3_any_audio, "lfm3_audio_gen", "src/core/lfm3_audio_gen.sig");
+    try wire(ctx, lfm3_any_audio, "lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");
+    try wire(ctx, lfm3_any_audio, "lfm3_kir", "src/core/lfm3_kir.sig");
+    try wire(ctx, lfm3_any_audio, "lfm3_any", "src/core/lfm3_any.sig");
+    const test_lfm3_any = try ctx.addStep("test-lfm3-any", "Execute LFM3's KIR kernels and its any-GPU forward pass against the CPU", &noopStep);
+    try ctx.addDependency(test_all, test_lfm3_any);
+    _ = try addTest(ctx, test_lfm3_any, "test-lfm3-kir", "src/core/lfm3_kir.sig", &.{
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+    });
+    _ = try addTest(ctx, test_lfm3_any, "test-lfm3-any-forward", "tests/test_lfm3_any.sig", &.{
+        importEntry("sig_math", "src/core/sig_math.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("lfm3_kir", "src/core/lfm3_kir.sig"),
+        importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+        importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
+        importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
+        importEntry("lfm3_any_audio", "src/core/lfm3_any_audio.sig"),
     });
 
     const tts_gpu = try ctx.addModule("tts_gpu", "src/tts/gpu.sig");

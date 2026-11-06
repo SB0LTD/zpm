@@ -30,6 +30,33 @@ pub const Result = struct {
     /// Measured: GB/s reading memory, fp32 GFLOP/s (mad = 2 flops).
     read_gbps: f64 = 0,
     gflops: f64 = 0,
+    /// The "edges" measurement: what the GPU does where KIR's definition
+    /// is exact and the ISA documents nothing (bits set: differs from KIR).
+    edges: Edges = .{},
+    /// What `mul.u24 r, r48.y, c0.z` (a shared register and a const, both
+    /// through the uniform port, which ir3 forbids) gives: the true product
+    /// y * c (`separate`), the const twice, c * c (`const_twice`: the
+    /// Surface's fault), something else, or not run (a device that refuses
+    /// the instruction, as the strict emulator does).
+    uniform_port: enum { unmeasured, refused, separate, const_twice, other } = .unmeasured,
+    /// f32 denormals through add.f, mul.f and mad.f32 (a denormal input),
+    /// and a product that underflows to a denormal: kept, flushed to zero,
+    /// or a mix (per op in the log line).
+    denormals: enum { unmeasured, preserve, flush, mixed } = .unmeasured,
+};
+
+pub const Edges = packed struct(u8) {
+    /// min.f(-0, +0) is not -0 or max.f(-0, +0) not +0
+    zero_order: bool = false,
+    /// min.f/max.f with one NaN operand do not give the other operand
+    nan_operand: bool = false,
+    /// cov.f32s32/f32u32 do not saturate (inf, 3e9, -1e10, -1) or map NaN to 0
+    cov_saturate: bool = false,
+    /// shfl.up/shfl.down past the wave do not give the fiber's own value
+    shfl_edge: bool = false,
+    /// the case did not run
+    unmeasured: bool = true,
+    _: u3 = 0,
 };
 
 /// Working storage (static: holds the assembler's work list).
@@ -50,6 +77,9 @@ const Ctx = struct {
     ts: Buffer,
     res: *Result,
     timeout_us: u64,
+    /// A measurement that may not run (the device refuses its code): a
+    /// failure is reported, not counted.
+    measuring: bool = false,
 
     fn say(c: *Ctx, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.bufPrint(&c.w.line, fmt, args) catch return;
@@ -62,9 +92,13 @@ const Ctx = struct {
     }
 
     fn fail(c: *Ctx, name: []const u8, comptime fmt: []const u8, args: anytype) void {
-        c.res.failed += 1;
         var tmp: [160]u8 = undefined;
         const why = std.fmt.bufPrint(&tmp, fmt, args) catch "?";
+        if (c.measuring) {
+            c.say("compute {s}: not run ({s})", .{ name, why });
+            return;
+        }
+        c.res.failed += 1;
         c.say("compute {s}: FAILED: {s}", .{ name, why });
     }
 
@@ -149,6 +183,9 @@ pub fn runAll(dev: Device, w: *Work, log: Log, bandwidth: bool) Result {
     testSfu(&c);
     testFloat(&c);
     testUnaligned(&c);
+    testEdges(&c);
+    testUniformPort(&c);
+    testDenormals(&c);
     if (bandwidth) testBandwidth(&c);
     testAlu(&c);
     c.say("compute self-test: {d} passed, {d} failed", .{ res.passed, res.failed });
@@ -482,6 +519,174 @@ fn testFloat(c: *Ctx) void {
 /// Q6_K (210-byte) and Q8_0 (34-byte) blocks put every other block two
 /// bytes off a 4-byte boundary: do u32 loads from such addresses read the
 /// bytes there (and u16 loads, into half registers)?
+/// Not a pass/fail case: what min.f/max.f do with signed zeros and NaNs,
+/// whether cov.f32s32/cov.f32u32 saturate and send NaN to 0, and what
+/// shfl.up/shfl.down give past the wave's ends. KIR defines all four
+/// (gpu's kir_interp); the Adreno backend relies on the GPU agreeing, so
+/// the log line says where it does not (Result.edges).
+fn testEdges(c: *Ctx) void {
+    const name = "edges (min/max zeros and NaN, cov saturation, shfl past the wave)";
+    const nz: u32 = 0x80000000;
+    const nan: u32 = 0x7fc00000;
+    // per fiber: a, b (min/max); x (cov)
+    const pairs = [_][2]u32{ .{ nz, 0 }, .{ 0, nz }, .{ nan, 0x3f800000 }, .{ 0x3f800000, nan }, .{ nan, 0xbf800000 }, .{ 0xbf800000, nan } };
+    const covs = [_]u32{ 0x7f800000, 0xff800000, 0x4f32d05e, 0xd01502f9, 0xbf800000, nan, 0x4f000000, 0x3fc00000 };
+    const in: []u32 = @alignCast(std.mem.bytesAsSlice(u32, c.data.cpu[0 .. 64 * 16]));
+    for (0..64) |f| {
+        const p = pairs[f % pairs.len];
+        in[f * 4] = p[0];
+        in[f * 4 + 1] = p[1];
+        in[f * 4 + 2] = covs[f % covs.len];
+        in[f * 4 + 3] = 0;
+    }
+    c.dev.toDevice(c.data, 0, 64 * 16);
+    const d = addr(c.data);
+    const o = addr(c.out);
+    if (!c.launch(name,
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@consts 2
+        \\shl.b r1.x, r0.x, 4
+        \\ldg.a.u32 r2.x, g[c0.x+r1.x+0], 3
+        \\min.f r3.x, r2.x, r2.y
+        \\max.f r3.y, r2.x, r2.y
+        \\cov.f32s32 r3.z, r2.z
+        \\cov.f32u32 r3.w, r2.z
+        \\add.u r4.x, r0.x, 1000
+        \\shfl.up.u32 r4.y, r4.x, 3
+        \\shfl.down.u32 r4.z, r4.x, 3
+        \\mov.u32u32 r4.w, 0
+        \\shl.b r1.y, r0.x, 5
+        \\stg.a.u32 g[c1.x+r1.y+0], r3.x, 4
+        \\add.u r1.z, r1.y, 16
+        \\stg.a.u32 g[c1.x+r1.z+0], r4.x, 4
+        \\end
+    , &.{ d[0], d[1], 0, 0, o[0], o[1], 0, 0 }, .{ 1, 1, 1 })) return;
+    const got = c.outU32();
+    var e = Edges{ .unmeasured = false };
+    for (0..64) |f| {
+        const g = got[f * 8 ..][0..8];
+        const k = f % pairs.len;
+        if (k < 2) {
+            if (g[0] != nz or g[1] != 0) e.zero_order = true;
+        } else {
+            const other = if (k % 2 == 0) in[f * 4 + 1] else in[f * 4];
+            if (g[0] != other or g[1] != other) e.nan_operand = true;
+        }
+        const x: f32 = @bitCast(in[f * 4 + 2]);
+        const want_s: u32 = if (std.math.isNan(x)) 0 else if (x >= 2147483648.0) 0x7fffffff else if (x <= -2147483648.0) 0x80000000 else @bitCast(@as(i32, @intFromFloat(@trunc(x))));
+        const want_u: u32 = if (std.math.isNan(x) or x <= 0) 0 else if (x >= 4294967296.0) 0xffffffff else @intFromFloat(@trunc(x));
+        if (g[2] != want_s or g[3] != want_u) e.cov_saturate = true;
+        const v: u32 = @intCast(1000 + f);
+        const up: u32 = if (f >= 3) v - 3 else v;
+        const down: u32 = if (f + 3 < 64) v + 3 else v;
+        if (g[5] != up or g[6] != down) e.shfl_edge = true;
+    }
+    c.res.edges = e;
+    c.say("compute edges: min/max zeros {s}, NaN operand {s}, cov saturation {s}, shfl past the wave {s} (as KIR / differs)", .{
+        if (e.zero_order) "DIFFER" else "as KIR",
+        if (e.nan_operand) "DIFFER" else "as KIR",
+        if (e.cov_saturate) "DIFFER" else "as KIR",
+        if (e.shfl_edge) "DIFFER" else "as KIR",
+    });
+    c.pass(name, 64);
+}
+
+/// Not pass/fail: the uniform port. ir3 reads at most one cat2 source from
+/// the const/shared file; galaxy-think's first forward faulted 16 MiB past
+/// a buffer where a kernel did `mul.u24 r, r48.y, c3.x` and got c * c. Here
+/// on a 2D grid (so r48.y differs per row): y * c0.z, c0.z * c0.z, other.
+fn testUniformPort(c: *Ctx) void {
+    const name = "uniform port (mul.u24 of a shared register and a const)";
+    const o = addr(c.out);
+    @memset(c.out.cpu[0 .. 4 * 64 * 4], 0);
+    c.dev.toDevice(c.out, 0, 4 * 64 * 4);
+    const k: u32 = 2048;
+    c.measuring = true;
+    const ran = c.launch(name,
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@wgid(r48.x)
+        \\@consts 2
+        \\; (r48.y, a shared register, and c0.z, a const: both through the
+        \\; uniform port, which ir3 does not allow; the GPU's reading is measured)
+        \\mul.u24 r1.x, r48.y, c0.z
+        \\shl.b r2.x, r48.y, 6
+        \\add.u r2.x, r2.x, r0.x
+        \\shl.b r2.x, r2.x, 2
+        \\stg.a.u32 g[c1.x+r2.x+0], r1.x, 1
+        \\end
+    , &.{ 0, 0, k, 0, o[0], o[1], 0, 0 }, .{ 1, 4, 1 });
+    c.measuring = false;
+    if (!ran) {
+        c.res.uniform_port = .refused;
+        return;
+    }
+    const got = c.outU32();
+    var separate: u32 = 0;
+    var twice: u32 = 0;
+    for (0..4) |y| for (0..64) |f| {
+        const g = got[y * 64 + f];
+        if (g == @as(u32, @intCast(y)) * k) separate += 1;
+        if (g == k * k) twice += 1;
+    };
+    // (row 0: y * c = 0; c * c tells only from rows 1..3)
+    c.res.uniform_port = if (separate == 256) .separate else if (twice >= 192) .const_twice else .other;
+    c.say("compute uniform port: mul.u24 r, r48.y, c0.z gave y*c on {d}/256 fibers, c*c on {d}: {s}", .{ separate, twice, @tagName(c.res.uniform_port) });
+    c.pass(name, 256);
+}
+
+/// Not pass/fail: f32 denormals. A denormal input through add.f, mul.f and
+/// mad.f32, and a product of normals that underflows: kept or flushed
+/// (Caps.denormals: the x1_45 caps assume preserve until this says).
+fn testDenormals(c: *Ctx) void {
+    const name = "f32 denormals (add, mul, mad inputs; an underflowing product)";
+    const o = addr(c.out);
+    if (!c.launch(name,
+        \\@localsize 64, 1, 1
+        \\@invocationid(r0.x)
+        \\@consts 2
+        \\; d = 5 x 2^-149 (a denormal), one = 1.0, zero = 0.0
+        \\mov.u32u32 r1.x, 0x5
+        \\mov.u32u32 r1.y, 0x3f800000
+        \\mov.u32u32 r1.z, 0
+        \\; 2^-100 and 2^-30: their product 2^-130 is a denormal result
+        \\mov.u32u32 r1.w, 0x0d800000
+        \\mov.u32u32 r2.x, 0x30800000
+        \\add.f r3.x, r1.x, r1.z
+        \\mul.f r3.y, r1.x, r1.y
+        \\mad.f32 r3.z, r1.x, r1.y, r1.z
+        \\mul.f r3.w, r1.w, r2.x
+        \\shl.b r4.x, r0.x, 4
+        \\stg.a.u32 g[c0.x+r4.x+0], r3.x, 4
+        \\end
+    , &.{ o[0], o[1], 0, 0, 0, 0, 0, 0 }, .{ 1, 1, 1 })) return;
+    const got = c.outU32();
+    const want = [4]u32{ 0x5, 0x5, 0x5, 0x00080000 }; // (2^-130 = 2^19 x 2^-149)
+    var kept: u32 = 0;
+    var flushed: u32 = 0;
+    var per: [4]u8 = .{ '?', '?', '?', '?' };
+    for (0..4) |i| {
+        var k_all = true;
+        var f_all = true;
+        for (0..64) |f| {
+            const g = got[f * 4 + i];
+            if (g != want[i]) k_all = false;
+            if (g != 0) f_all = false;
+        }
+        if (k_all) {
+            kept += 1;
+            per[i] = 'k';
+        } else if (f_all) {
+            flushed += 1;
+            per[i] = 'f';
+        }
+    }
+    c.res.denormals = if (kept == 4) .preserve else if (flushed == 4) .flush else .mixed;
+    c.say("compute denormals: add {c}, mul {c}, mad {c}, underflow {c} (k kept, f flushed): {s}", .{ per[0], per[1], per[2], per[3], @tagName(c.res.denormals) });
+    c.pass(name, 4 * 64);
+}
+
 fn testUnaligned(c: *Ctx) void {
     const name = "unaligned global loads";
     const bytes = c.data.cpu[0..4096];
@@ -642,4 +847,18 @@ test "the bring-up tests pass on the emulated device" {
     const r = runAll(S.dev.device(), &S.work, S.log, true);
     try std.testing.expectEqual(@as(u32, 0), r.failed);
     try std.testing.expect(r.passed >= 9);
+    // the emulator models KIR's edges (min/max, cov, shfl): none differ
+    try std.testing.expectEqual(Edges{ .unmeasured = false }, r.edges);
+    // the strict emulator refuses the uniform-port instruction (not a
+    // failure); its floats keep denormals
+    try std.testing.expectEqual(.refused, r.uniform_port);
+    try std.testing.expectEqual(.preserve, r.denormals);
+    // Not checking operands, it runs: as written (both sources read), and
+    // with the emulator's model of the Surface's reading, the const twice.
+    S.dev = .{ .arena = &S.arena, .gpu_view = &S.gpu_view, .check_operands = false };
+    try std.testing.expectEqual(.separate, runAll(S.dev.device(), &S.work, S.log, false).uniform_port);
+    S.dev = .{ .arena = &S.arena, .gpu_view = &S.gpu_view, .check_operands = false, .uniform_port_quirk = true };
+    const q = runAll(S.dev.device(), &S.work, S.log, false);
+    try std.testing.expectEqual(.const_twice, q.uniform_port);
+    try std.testing.expectEqual(@as(u32, 0), q.failed);
 }

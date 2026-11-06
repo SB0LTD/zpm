@@ -1,0 +1,31 @@
+// Forms Galaxy's probe kernels do not use, for sm120_vectors.txt: 64-bit
+// immediates (MOV.64/UMOV.64), an integer-to-float conversion, a float add
+// of an immediate, 64-bit stores at offsets, IADD.64 of a uniform register.
+.version 8.8
+.target sm_120
+.address_size 64
+
+.visible .entry cov_imm(.param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<8>;
+    ld.param.u64 %rd1, [out];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd2, %r1, 8;
+    add.u64 %rd3, %rd1, %rd2;
+    mov.u64 %rd4, 0x123456789abcdef1;
+    xor.b64 %rd5, %rd4, %rd2;
+    st.global.u64 [%rd3], %rd5;
+    mov.u64 %rd6, 0xfedcba9876543210;
+    add.u64 %rd7, %rd6, %rd2;
+    st.global.u64 [%rd3+8], %rd7;
+    mov.b32 %r2, 0x3c004000;
+    add.u32 %r3, %r2, %r1;
+    st.global.u32 [%rd3+16], %r3;
+    mov.f32 %f1, 0f3F800000;
+    cvt.rn.f32.u32 %f2, %r1;
+    add.f32 %f3, %f2, %f1;
+    st.global.f32 [%rd3+20], %f3;
+    ret;
+}
