@@ -10,7 +10,10 @@
 //! parameters and group counts direct; the kernel's constant pool loaded by
 //! the CP from the code buffer), CP_EXEC_CS and a wait for idle, so each
 //! dispatch sees the one before's writes; the always-on counter before and
-//! after; a cache clean at the end. One submit, one fence.
+//! after; a cache clean at the end. One submit, one fence. With `overlap`,
+//! a dispatch waits only where gpu.Hazards says it reads what those since
+//! the last wait write, or writes what they use (as the RTX's adapter), so
+//! independent dispatches run together.
 //!
 //! `Emu` is the same over the adreno module's EmuDevice: the stream is read
 //! as the command processor would and each dispatch runs in ir3_emu, with
@@ -98,6 +101,11 @@ pub const Over = struct {
     last_ns: u64 = 0,
     timed: bool = false,
     consts: [1024]u32 = undefined,
+    /// Waits only where the data needs them (gpu.Hazards); false: after
+    /// every dispatch.
+    overlap: bool = false,
+    /// The waits between dispatches in the last run.
+    barriers: u32 = 0,
 
     pub fn init(r: raw.Device, caps: Caps) Over {
         var c = caps;
@@ -224,7 +232,16 @@ pub const Over = struct {
     fn build(o: *Over, s: *a7xx.Stream, ds: []const Dispatch, ts_va: u64) Error!void {
         s.computeSetup();
         s.timestamp(ts_va);
-        for (ds) |*d| {
+        var hz = dv.Hazards{};
+        o.barriers = 0;
+        for (ds, 0..) |*d, at| {
+            // (each dispatch sees the writes of those it depends on: all
+            // before it, or with `overlap` those gpu.Hazards names)
+            const needs = hz.barrierBefore(d);
+            if (at > 0 and (needs or !o.overlap)) {
+                s.waitForIdle();
+                o.barriers += 1;
+            }
             const bin = &d.prog.bin;
             if (bin.target != .ir3_a7xx) return error.BadProgram;
             const cfg = kir_ir3.Config.fromExtra(bin.extra) orelse return error.BadProgram;
@@ -239,9 +256,8 @@ pub const Over = struct {
             s.constants(0, words);
             if (cfg.pool_words > 0) s.constantsFrom(cfg.pool / 4, d.prog.code.gpu + cfg.pool_offset, (cfg.pool_words + 3) / 4);
             s.dispatch(&k, d.groups);
-            // (each dispatch sees the one before's writes)
-            s.waitForIdle();
         }
+        s.waitForIdle();
         s.timestamp(ts_va + 8);
         s.cleanCaches();
         s.waitForIdle();
@@ -309,7 +325,18 @@ var the_over: Over = undefined;
 /// The Adreno behind `r` as a gpu.Device (one per process: the adapter's
 /// state is static; use Over for more).
 pub fn over(r: raw.Device, caps: Caps) dv.Device {
+    return overWith(r, caps, .{});
+}
+
+pub const Options = struct {
+    /// Over.overlap: waits only where the data needs them.
+    overlap: bool = false,
+};
+
+/// over, with options.
+pub fn overWith(r: raw.Device, caps: Caps, opts: Options) dv.Device {
     the_over = Over.init(r, caps);
+    the_over.overlap = opts.overlap;
     return the_over.device();
 }
 
@@ -525,6 +552,45 @@ test "a kernel through the adapter: PM4, constants, the pool, cache maintenance"
     d.fromDevice(b, 0, b.bytes);
     for (b.words(), 0..) |x, n| try std.testing.expectEqual(@as(u32, @intCast(n * 7 + 0x12345)), x);
     try std.testing.expect(d.lastRunNs() > 0);
+}
+
+test "overlap: a wait only before a dispatch that reads what one before it wrote; without it, between every two" {
+    Rig.emu.init(&Rig.arena, &Rig.view);
+    const d = Rig.emu.device();
+    // out[i] = in[i] + 1
+    var k = newKernel("inc", .{ 64, 1, 1 });
+    const in = k.binding();
+    const out = k.binding();
+    const i = k.op2(.iadd, .u32, kir.r(k.op2(.shl, .u32, kir.r(k.gid(0)), kir.u(6))), kir.r(k.tid(0)));
+    const a = k.op2(.shl, .u32, kir.r(i), kir.u(2));
+    k.store(.u32, kir.global(out, 32), kir.r(a), kir.r(k.op2(.iadd, .u32, kir.r(k.load(.u32, kir.global(in, 32), kir.r(a))), kir.u(1))));
+    const p = try loadKernel(d, &k);
+    var bufs: [4]Buffer = undefined;
+    for (&bufs) |*b| b.* = try d.alloc(4 * 64, .host);
+    // 0 -> 1 and 2 -> 3 share nothing; 1 -> 2 reads what the first wrote
+    // (and writes what the second read): a wait before the third only
+    const ds = [_]Dispatch{
+        .{ .prog = &p, .groups = .{ 1, 1, 1 }, .buffers = &.{ bufs[0], bufs[1] }, .params = &.{} },
+        .{ .prog = &p, .groups = .{ 1, 1, 1 }, .buffers = &.{ bufs[2], bufs[3] }, .params = &.{} },
+        .{ .prog = &p, .groups = .{ 1, 1, 1 }, .buffers = &.{ bufs[1], bufs[2] }, .params = &.{} },
+    };
+    const o = &Rig.emu.adapter;
+    var words: [4096]u32 = undefined;
+    const wfi = a7xx.pkt7(a7xx.CP_WAIT_FOR_IDLE, 0);
+    // (the stream's own waits, setup's and the timestamps', are the same in
+    // both: the difference is the waits between dispatches)
+    var waits: [2]u32 = undefined;
+    for ([_]bool{ false, true }, 0..) |on, m| {
+        o.overlap = on;
+        var s = a7xx.Stream{ .buf = &words };
+        try o.build(&s, &ds, 0x1000);
+        var n: u32 = 0;
+        for (words[0..s.len]) |w| n += @intFromBool(w == wfi);
+        waits[m] = n;
+        try std.testing.expectEqual(@as(u32, if (on) 1 else 2), o.barriers);
+    }
+    try std.testing.expectEqual(@as(u32, 1), waits[0] - waits[1]);
+    o.overlap = false;
 }
 
 test "zero-copy import: the GPU reads the CPU's memory in place, and free gives it back" {

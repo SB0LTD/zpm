@@ -140,22 +140,22 @@ pub const Layout = struct {
 
 // ── The builder ─────────────────────────────────────────────────────────────
 
-fn R(v: V) Arg {
+pub fn R(v: V) Arg {
     return .{ .reg = v };
 }
-fn U(x: u32) Arg {
+pub fn U(x: u32) Arg {
     return .{ .imm = x };
 }
-fn F(x: f32) Arg {
+pub fn F(x: f32) Arg {
     return .{ .imm = @bitCast(x) };
 }
-fn I(x: i32) Arg {
+pub fn I(x: i32) Arg {
     return .{ .imm = @bitCast(x) };
 }
-const NO: Arg = kir.no;
+pub const NO: Arg = kir.no;
 
 /// The `i`th register of a vector `v` (Kernel.vec).
-fn at(v: V, i: usize) V {
+pub fn at(v: V, i: usize) V {
     return @enumFromInt(@intFromEnum(v) + @as(u16, @intCast(i)));
 }
 
@@ -163,15 +163,16 @@ fn isInt(t: Ty) bool {
     return t == .u32 or t == .i32;
 }
 
-fn log2(x: u32) u5 {
+pub fn log2(x: u32) u5 {
     return @intCast(std.math.log2_int(u32, x));
 }
 
 /// A double-f32: hi + lo, |lo| <= ulp(hi) / 2.
-const DD = struct { hi: V, lo: V };
+pub const DD = struct { hi: V, lo: V };
 
 /// Kernel text the way these kernels write it: SSA values (a fresh register
-/// each), `set` for what a loop carries.
+/// each), `set` for what a loop carries. Public, with R, U, F, I, NO, at,
+/// begin and expGgml: other kernel files (lfm3_kir_codec) build with it.
 pub const Builder = struct {
     k: *kir.Kernel,
     caps: Caps,
@@ -187,226 +188,226 @@ pub const Builder = struct {
 
     /// Reserve the xor exchange's shared memory (when `span` threads exceed
     /// a subgroup).
-    fn needExchange(b: *Builder, span: u32) void {
+    pub fn needExchange(b: *Builder, span: u32) void {
         if (span <= b.caps.subgroup or b.xchg != null) return;
         b.xchg = b.k.shared_bytes;
         b.k.shared_bytes += b.threads * 8;
     }
 
-    fn reg(b: *Builder, ty: Ty) V {
+    pub fn reg(b: *Builder, ty: Ty) V {
         return b.k.reg(ty);
     }
 
-    fn emit(b: *Builder, op: Op, ty: Ty, dst: V, a: Arg, x: Arg, c: Arg, aux: u32) void {
+    pub fn emit(b: *Builder, op: Op, ty: Ty, dst: V, a: Arg, x: Arg, c: Arg, aux: u32) void {
         b.k.emit(.{ .op = op, .ty = ty, .dst = dst, .a = a, .b = x, .c = c, .aux = aux });
     }
 
-    fn op1(b: *Builder, op: Op, ty: Ty, a: Arg) V {
+    pub fn op1(b: *Builder, op: Op, ty: Ty, a: Arg) V {
         const d = b.reg(ty);
         b.emit(op, ty, d, a, NO, NO, 0);
         return d;
     }
-    fn op2(b: *Builder, op: Op, ty: Ty, a: Arg, x: Arg) V {
+    pub fn op2(b: *Builder, op: Op, ty: Ty, a: Arg, x: Arg) V {
         const d = b.reg(ty);
         b.emit(op, ty, d, a, x, NO, 0);
         return d;
     }
-    fn op3(b: *Builder, op: Op, ty: Ty, a: Arg, x: Arg, c: Arg) V {
+    pub fn op3(b: *Builder, op: Op, ty: Ty, a: Arg, x: Arg, c: Arg) V {
         const d = b.reg(ty);
         b.emit(op, ty, d, a, x, c, 0);
         return d;
     }
     /// dst = op(a, x, c), dst an existing register (what a loop carries).
-    fn set(b: *Builder, dst: V, op: Op, ty: Ty, a: Arg, x: Arg, c: Arg) void {
+    pub fn set(b: *Builder, dst: V, op: Op, ty: Ty, a: Arg, x: Arg, c: Arg) void {
         b.emit(op, ty, dst, a, x, c, 0);
     }
 
-    fn mov(b: *Builder, ty: Ty, a: Arg) V {
+    pub fn mov(b: *Builder, ty: Ty, a: Arg) V {
         return b.op1(.mov, ty, a);
     }
     /// The same 32 bits as another type.
-    fn as(b: *Builder, ty: Ty, v: V) V {
+    pub fn as(b: *Builder, ty: Ty, v: V) V {
         const have = b.k.tys[@intFromEnum(v)];
         if (have == ty or (isInt(have) and isInt(ty))) return v;
         return b.op1(.mov, ty, R(v));
     }
 
     // integers (u32 unless named)
-    fn add(b: *Builder, a: Arg, x: Arg) V {
+    pub fn add(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.iadd, .u32, a, x);
     }
-    fn sub(b: *Builder, a: Arg, x: Arg) V {
+    pub fn sub(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.isub, .u32, a, x);
     }
-    fn mul(b: *Builder, a: Arg, x: Arg) V {
+    pub fn mul(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.imul, .u32, a, x);
     }
-    fn shl(b: *Builder, a: Arg, n: u32) V {
+    pub fn shl(b: *Builder, a: Arg, n: u32) V {
         if (n == 0) return b.mov(.u32, a);
         return b.op2(.shl, .u32, a, U(n));
     }
-    fn shr(b: *Builder, a: Arg, n: u32) V {
+    pub fn shr(b: *Builder, a: Arg, n: u32) V {
         return b.op2(.shr, .u32, a, U(n));
     }
-    fn band(b: *Builder, a: Arg, x: Arg) V {
+    pub fn band(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.@"and", .u32, a, x);
     }
-    fn bor(b: *Builder, a: Arg, x: Arg) V {
+    pub fn bor(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.@"or", .u32, a, x);
     }
-    fn umin(b: *Builder, a: Arg, x: Arg) V {
+    pub fn umin(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.imin, .u32, a, x);
     }
-    fn umax(b: *Builder, a: Arg, x: Arg) V {
+    pub fn umax(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.imax, .u32, a, x);
     }
-    fn bfeU(b: *Builder, a: Arg, off: Arg, len: u32) V {
+    pub fn bfeU(b: *Builder, a: Arg, off: Arg, len: u32) V {
         return b.op3(.bfe, .u32, a, off, U(len));
     }
-    fn bfeS(b: *Builder, a: Arg, off: Arg, len: u32) V {
+    pub fn bfeS(b: *Builder, a: Arg, off: Arg, len: u32) V {
         return b.op3(.bfe, .i32, a, off, U(len));
     }
-    fn iaddS(b: *Builder, a: Arg, x: Arg) V {
+    pub fn iaddS(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.iadd, .i32, a, x);
     }
-    fn imulS(b: *Builder, a: Arg, x: Arg) V {
+    pub fn imulS(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.imul, .i32, a, x);
     }
-    fn imadS(b: *Builder, a: Arg, x: Arg, c: Arg) V {
+    pub fn imadS(b: *Builder, a: Arg, x: Arg, c: Arg) V {
         return b.op3(.imad, .i32, a, x, c);
     }
-    fn dot4(b: *Builder, kind: kir.Dot4, a: Arg, x: Arg, c: Arg) V {
+    pub fn dot4(b: *Builder, kind: kir.Dot4, a: Arg, x: Arg, c: Arg) V {
         const d = b.reg(.i32);
         b.emit(.dot4, .i32, d, a, x, c, @intFromEnum(kind));
         return d;
     }
 
     // predicates
-    fn icmp(b: *Builder, ty: Ty, c: kir.Cmp, a: Arg, x: Arg) V {
+    pub fn icmp(b: *Builder, ty: Ty, c: kir.Cmp, a: Arg, x: Arg) V {
         const d = b.reg(.pred);
         b.emit(.icmp, ty, d, a, x, NO, @intFromEnum(c));
         return d;
     }
-    fn fcmp(b: *Builder, c: kir.Cmp, a: Arg, x: Arg) V {
+    pub fn fcmp(b: *Builder, c: kir.Cmp, a: Arg, x: Arg) V {
         const d = b.reg(.pred);
         b.emit(.fcmp, .f32, d, a, x, NO, @intFromEnum(c));
         return d;
     }
-    fn pand(b: *Builder, a: V, x: V) V {
+    pub fn pand(b: *Builder, a: V, x: V) V {
         return b.op2(.pand, .pred, R(a), R(x));
     }
     /// p ? a : x
-    fn sel(b: *Builder, ty: Ty, p: V, a: Arg, x: Arg) V {
+    pub fn sel(b: *Builder, ty: Ty, p: V, a: Arg, x: Arg) V {
         return b.op3(.sel, ty, a, x, R(p));
     }
 
     // f32
-    fn fadd(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fadd(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fadd, .f32, a, x);
     }
-    fn fsub(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fsub(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fsub, .f32, a, x);
     }
-    fn fmul(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fmul(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fmul, .f32, a, x);
     }
-    fn fdiv(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fdiv(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fdiv, .f32, a, x);
     }
-    fn fsqrt(b: *Builder, a: Arg) V {
+    pub fn fsqrt(b: *Builder, a: Arg) V {
         return b.op1(.fsqrt, .f32, a);
     }
-    fn fmax(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fmax(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fmax, .f32, a, x);
     }
-    fn fmin(b: *Builder, a: Arg, x: Arg) V {
+    pub fn fmin(b: *Builder, a: Arg, x: Arg) V {
         return b.op2(.fmin, .f32, a, x);
     }
-    fn fabs(b: *Builder, a: Arg) V {
+    pub fn fabs(b: *Builder, a: Arg) V {
         return b.op1(.fabs, .f32, a);
     }
-    fn fneg(b: *Builder, a: Arg) V {
+    pub fn fneg(b: *Builder, a: Arg) V {
         return b.op1(.fneg, .f32, a);
     }
-    fn frne(b: *Builder, a: Arg) V {
+    pub fn frne(b: *Builder, a: Arg) V {
         return b.op1(.frne, .f32, a);
     }
-    fn cvt(b: *Builder, from: Ty, to: Ty, round: kir.Round, a: Arg) V {
+    pub fn cvt(b: *Builder, from: Ty, to: Ty, round: kir.Round, a: Arg) V {
         const d = b.reg(to);
         b.emit(.cvt, to, d, a, NO, NO, @bitCast(kir.Cvt{ .from = from, .to = to, .round = round }));
         return d;
     }
     /// An integer (|x| < 2^24) as f32.
-    fn i2f(b: *Builder, a: V) V {
+    pub fn i2f(b: *Builder, a: V) V {
         return b.cvt(.i32, .f32, .rne, R(a));
     }
 
     // halves
     /// The f16 in the low (hi = false) or high half of `word`, as f32.
-    fn half(b: *Builder, word: V, hi: bool) V {
+    pub fn half(b: *Builder, word: V, hi: bool) V {
         const bits = if (hi) b.shr(R(word), 16) else b.band(R(word), U(0xffff));
         return b.cvt(.f16, .f32, .rne, R(b.as(.f16, bits)));
     }
     /// x rounded to f16 (nearest even), its 16 bits in a u32.
-    fn halfBits(b: *Builder, x: V) V {
+    pub fn halfBits(b: *Builder, x: V) V {
         const h = b.cvt(.f32, .f16, .rne, R(x));
         return b.band(R(b.as(.u32, h)), U(0xffff));
     }
     /// x rounded through f16 and back.
-    fn f16r(b: *Builder, x: V) V {
+    pub fn f16r(b: *Builder, x: V) V {
         const h = b.cvt(.f32, .f16, .rne, R(x));
         return b.cvt(.f16, .f32, .rne, R(h));
     }
 
     // ids and parameters
-    fn tid(b: *Builder, axis: u32) V {
+    pub fn tid(b: *Builder, axis: u32) V {
         const d = b.reg(.u32);
         b.emit(.tid, .u32, d, NO, NO, NO, axis);
         return d;
     }
-    fn gid(b: *Builder, axis: u32) V {
+    pub fn gid(b: *Builder, axis: u32) V {
         const d = b.reg(.u32);
         b.emit(.gid, .u32, d, NO, NO, NO, axis);
         return d;
     }
-    fn param(b: *Builder, word: u32) V {
+    pub fn param(b: *Builder, word: u32) V {
         const d = b.reg(.u32);
         b.emit(.param, .u32, d, NO, NO, NO, word);
         return d;
     }
 
     // memory
-    fn mem(binding: u8, space: kir.Space, width_log2: u3, signed: bool, imm: u32) u32 {
+    pub fn mem(binding: u8, space: kir.Space, width_log2: u3, signed: bool, imm: u32) u32 {
         return @bitCast(kir.Mem{ .binding = binding, .space = space, .width_log2 = width_log2, .signed = signed, .imm = @intCast(imm) });
     }
     /// One 8, 16 or 32-bit load (zero-extended unless `ty` is i32).
-    fn ld(b: *Builder, binding: u8, ty: Ty, addr: Arg, imm: u32, width_log2: u3) V {
+    pub fn ld(b: *Builder, binding: u8, ty: Ty, addr: Arg, imm: u32, width_log2: u3) V {
         const d = b.reg(ty);
         b.emit(.ld, ty, d, addr, NO, NO, mem(binding, .global, width_log2, ty == .i32 and width_log2 < 5, imm));
         return d;
     }
     /// `n` consecutive 32-bit words (n = 1, 2 or 4) from one load.
-    fn ldv(b: *Builder, binding: u8, ty: Ty, addr: Arg, imm: u32, n: u32) V {
+    pub fn ldv(b: *Builder, binding: u8, ty: Ty, addr: Arg, imm: u32, n: u32) V {
         if (n == 1) return b.ld(binding, ty, addr, imm, 5);
         const d = b.k.vec(ty, @intCast(n));
         b.emit(.ld, ty, d, addr, NO, NO, mem(binding, .global, @intCast(5 + @as(u32, log2(n))), false, imm));
         return d;
     }
-    fn st(b: *Builder, binding: u8, addr: Arg, imm: u32, width_log2: u3, src: V) void {
+    pub fn st(b: *Builder, binding: u8, addr: Arg, imm: u32, width_log2: u3, src: V) void {
         b.emit(.st, b.k.tys[@intFromEnum(src)], .none, addr, R(src), NO, mem(binding, .global, width_log2, false, imm));
     }
-    fn lds(b: *Builder, ty: Ty, addr: Arg, imm: u32, n: u32) V {
+    pub fn lds(b: *Builder, ty: Ty, addr: Arg, imm: u32, n: u32) V {
         const d = if (n == 1) b.reg(ty) else b.k.vec(ty, @intCast(n));
         b.emit(.ld, ty, d, addr, NO, NO, mem(0, .shared, @intCast(5 + @as(u32, log2(n))), false, imm));
         return d;
     }
-    fn sts(b: *Builder, addr: Arg, imm: u32, src: V, n: u32) void {
+    pub fn sts(b: *Builder, addr: Arg, imm: u32, src: V, n: u32) void {
         b.emit(.st, b.k.tys[@intFromEnum(src)], .none, addr, R(src), NO, mem(0, .shared, @intCast(5 + @as(u32, log2(n))), false, imm));
     }
-    fn barrier(b: *Builder) void {
+    pub fn barrier(b: *Builder) void {
         b.emit(.barrier, .u32, .none, NO, NO, NO, 0);
     }
-    fn shfl(b: *Builder, mode: kir.Shfl, v: V, lane_arg: Arg) V {
+    pub fn shfl(b: *Builder, mode: kir.Shfl, v: V, lane_arg: Arg) V {
         const ty = b.k.tys[@intFromEnum(v)];
         const d = b.reg(ty);
         b.emit(.shfl, ty, d, R(v), lane_arg, NO, @intFromEnum(mode));
@@ -414,22 +415,22 @@ pub const Builder = struct {
     }
 
     // structured control flow
-    fn if_(b: *Builder, p: V) void {
+    pub fn if_(b: *Builder, p: V) void {
         b.emit(.@"if", .pred, .none, R(p), NO, NO, 0);
     }
-    fn else_(b: *Builder) void {
+    pub fn else_(b: *Builder) void {
         b.emit(.@"else", .pred, .none, NO, NO, NO, 0);
     }
-    fn endif(b: *Builder) void {
+    pub fn endif(b: *Builder) void {
         b.emit(.endif, .pred, .none, NO, NO, NO, 0);
     }
-    fn loop(b: *Builder) void {
+    pub fn loop(b: *Builder) void {
         b.emit(.loop, .pred, .none, NO, NO, NO, 0);
     }
-    fn brk(b: *Builder, p: V) void {
+    pub fn brk(b: *Builder, p: V) void {
         b.emit(.brk, .pred, .none, R(p), NO, NO, 0);
     }
-    fn endloop(b: *Builder) void {
+    pub fn endloop(b: *Builder) void {
         b.emit(.endloop, .pred, .none, NO, NO, NO, 0);
     }
 
@@ -438,7 +439,7 @@ pub const Builder = struct {
     /// v from the thread `m` apart (tid ^ m) in the workgroup: a shuffle
     /// within a subgroup, else through shared memory. Uniform control flow
     /// only (it may hold a barrier).
-    fn xorPartner(b: *Builder, v: V, m: u32, t: V) V {
+    pub fn xorPartner(b: *Builder, v: V, m: u32, t: V) V {
         if (m < b.caps.subgroup) return b.shfl(.xor, v, U(m));
         const base = b.xchg.?;
         const ty = b.k.tys[@intFromEnum(v)];
@@ -454,14 +455,14 @@ pub const Builder = struct {
     /// v combined over each aligned group of `span` threads by a butterfly
     /// (masks 1, 2, .. span / 2): the same value in every thread when `op`
     /// is commutative.
-    fn xorReduce(b: *Builder, op: Op, ty: Ty, v: V, span: u32, t: V) V {
+    pub fn xorReduce(b: *Builder, op: Op, ty: Ty, v: V, span: u32, t: V) V {
         var acc = v;
         var m: u32 = 1;
         while (m < span) : (m *= 2) acc = b.op2(op, ty, R(acc), R(b.xorPartner(acc, m, t)));
         return acc;
     }
 
-    fn xorReduceDD(b: *Builder, v: DD, span: u32, t: V) DD {
+    pub fn xorReduceDD(b: *Builder, v: DD, span: u32, t: V) DD {
         var acc = v;
         var m: u32 = 1;
         while (m < span) : (m *= 2) acc = b.ddAdd(acc, .{ .hi = b.xorPartner(acc.hi, m, t), .lo = b.xorPartner(acc.lo, m, t) });
@@ -471,7 +472,7 @@ pub const Builder = struct {
     // ── exact arithmetic helpers ──
 
     /// x * x as an exact double-f32 (no overflow: |x| < 2^60).
-    fn square(b: *Builder, x: V) DD {
+    pub fn square(b: *Builder, x: V) DD {
         const p = b.fmul(R(x), R(x));
         if (b.caps.fused_fma) {
             const e = b.op3(.ffma, .f32, R(x), R(x), R(b.fneg(R(p))));
@@ -488,7 +489,7 @@ pub const Builder = struct {
     }
 
     /// a * c's rounding error, exactly (a * c = p + e).
-    fn prodErr(b: *Builder, a: V, c: V, p: V) V {
+    pub fn prodErr(b: *Builder, a: V, c: V, p: V) V {
         if (b.caps.fused_fma) return b.op3(.ffma, .f32, R(a), R(c), R(b.fneg(R(p))));
         const ca = b.fmul(F(4097.0), R(a));
         const ah = b.fsub(R(ca), R(b.fsub(R(ca), R(a))));
@@ -502,7 +503,7 @@ pub const Builder = struct {
         return b.fadd(R(t3), R(b.fmul(R(al), R(cl))));
     }
 
-    fn toReg(b: *Builder, a: Arg) V {
+    pub fn toReg(b: *Builder, a: Arg) V {
         return switch (a) {
             .reg => |v| v,
             .imm => b.mov(.f32, a),
@@ -515,7 +516,7 @@ pub const Builder = struct {
     /// c + its high part by TwoSum, the two low parts added with rounding
     /// to odd, then one rounding to nearest). Exact but for overflow and
     /// underflow; about 35 operations.
-    fn fma(b: *Builder, a: Arg, x: Arg, c: Arg) V {
+    pub fn fma(b: *Builder, a: Arg, x: Arg, c: Arg) V {
         if (b.caps.fused_fma) return b.op3(.ffma, .f32, a, x, c);
         const av = b.toReg(a);
         const xv = b.toReg(x);
@@ -542,7 +543,7 @@ pub const Builder = struct {
 
     /// a + c as a double-f32, symmetric in a and c (the butterfly's
     /// partners get the same bits).
-    fn ddAdd(b: *Builder, a: DD, c: DD) DD {
+    pub fn ddAdd(b: *Builder, a: DD, c: DD) DD {
         const s = b.fadd(R(a.hi), R(c.hi));
         const bb = b.fsub(R(s), R(a.hi));
         const err = b.fadd(R(b.fsub(R(a.hi), R(b.fsub(R(s), R(bb))))), R(b.fsub(R(c.hi), R(bb))));
@@ -551,19 +552,19 @@ pub const Builder = struct {
         return .{ .hi = hi, .lo = b.fsub(R(lo), R(b.fsub(R(hi), R(s)))) };
     }
 
-    fn ddZero(b: *Builder) DD {
+    pub fn ddZero(b: *Builder) DD {
         return .{ .hi = b.mov(.f32, F(0)), .lo = b.mov(.f32, F(0)) };
     }
 
     /// acc += v (loop-carried: acc's registers are written).
-    fn ddAccumulate(b: *Builder, acc: DD, v: DD) void {
+    pub fn ddAccumulate(b: *Builder, acc: DD, v: DD) void {
         const r = b.ddAdd(acc, v);
         b.set(acc.hi, .mov, .f32, R(r.hi), NO, NO);
         b.set(acc.lo, .mov, .f32, R(r.lo), NO, NO);
     }
 
     /// 1 / (hi + lo), correctly rounded but for ties of the pair.
-    fn ddRecip(b: *Builder, s: DD) V {
+    pub fn ddRecip(b: *Builder, s: DD) V {
         const q = b.fdiv(F(1.0), R(s.hi));
         const p = b.fmul(R(q), R(s.hi));
         const e = b.prodErr(q, s.hi, p);
@@ -574,14 +575,14 @@ pub const Builder = struct {
 
     /// RMSNorm's 1 / sqrt(mean + eps) from the row's square sum, as
     /// lfm3_executor.rmsNormRow (mean = sum / n rounded once).
-    fn normInverse(b: *Builder, sum: DD, n: Arg, epsilon: Arg) V {
+    pub fn normInverse(b: *Builder, sum: DD, n: Arg, epsilon: Arg) V {
         const mean = b.ddDiv(sum, n);
         return b.fdiv(F(1.0), R(b.fsqrt(R(b.fadd(R(mean), epsilon)))));
     }
 
     /// (hi + lo) / n rounded once (but for ties of the pair): q = hi / n,
     /// then the remainder hi - q n (exact) + lo divided again.
-    fn ddDiv(b: *Builder, s: DD, n: Arg) V {
+    pub fn ddDiv(b: *Builder, s: DD, n: Arg) V {
         const nv = switch (n) {
             .reg => |v| v,
             .imm => b.mov(.f32, n),
@@ -598,7 +599,7 @@ pub const Builder = struct {
     /// rational step with its division, scalbn), in correctly rounded f32
     /// operations only, so the CPU's bits on every GPU. Branch-free: every
     /// path computed, the right one selected.
-    fn expCpu(b: *Builder, x: V) V {
+    pub fn expCpu(b: *Builder, x: V) V {
         const bits = b.as(.u32, x);
         const sign = b.shr(R(bits), 31);
         const hx = b.band(R(bits), U(0x7fffffff));
@@ -639,17 +640,17 @@ pub const Builder = struct {
     }
 
     /// x / (1 + e^-x), as the CPU's silu (exact division).
-    fn silu(b: *Builder, x: V) V {
+    pub fn silu(b: *Builder, x: V) V {
         return b.fdiv(R(x), R(b.fadd(F(1.0), R(b.expCpu(b.fneg(R(x)))))));
     }
 
     /// 1 / (1 + e^-x).
-    fn sigmoid(b: *Builder, x: V) V {
+    pub fn sigmoid(b: *Builder, x: V) V {
         return b.fdiv(F(1.0), R(b.fadd(F(1.0), R(b.expCpu(b.fneg(R(x)))))));
     }
 };
 
-fn begin(s: kir.Storage, name: []const u8, threads: u32) kir.Kernel {
+pub fn begin(s: kir.Storage, name: []const u8, threads: u32) kir.Kernel {
     return kir.Kernel.init(s, name, .{ threads, 1, 1 });
 }
 
@@ -1132,6 +1133,38 @@ pub fn quant(s: kir.Storage, caps: Caps, mode: QuantMode) Error!kir.Kernel {
         return k;
     }
 
+    normQuantBody(&b, .{ .X = X, .WB = WB, .NB = NB, .AQ = AQ, .AD = AD, .AS = AS }, threads, .{ .width = width, .blocks = blocks, .epsilon = b.param(2), .x = b.param(3), .weight = w_base, .normalized = b.param(5) });
+    try k.finish();
+    return k;
+}
+
+const NormBind = struct { X: u8, WB: u8, NB: u8, AQ: u8, AD: u8, AS: u8 };
+const NormArgs = struct { width: V, blocks: V, epsilon: V, x: V, weight: V, normalized: V };
+
+/// RMSNorm of each token's row (group y) at byte offset `x` of X, then
+/// each pass of eight blocks normalized, written to NB (at `normalized`)
+/// and quantized: the row's square sum as a double-f32, the CPU's bits.
+/// quant's `.norm`, and residualNormQuant's second half.
+fn normQuantBody(b: *Builder, m: NormBind, threads: u32, a: NormArgs) void {
+    const X = m.X;
+    const WB = m.WB;
+    const NB = m.NB;
+    const AQ = m.AQ;
+    const AD = m.AD;
+    const AS = m.AS;
+    const per_pass = threads / 32;
+    const t = b.tid(0);
+    const i = b.band(R(t), U(31));
+    const bin = b.shr(R(t), 5);
+    const width = a.width;
+    const blocks = a.blocks;
+    const tok = b.gid(1);
+    const row_blocks = b.mul(R(tok), R(blocks));
+    const row_bytes = b.shl(R(b.mul(R(tok), R(width))), 2);
+    const last = b.sub(R(blocks), U(1));
+    const lane_bytes = b.shl(R(i), 5);
+    const x_base = b.add(R(a.x), R(row_bytes));
+    const w_base = a.weight;
     // RMSNorm: the row's square sum (double-f32), then each pass of eight
     // blocks normalized, written out and quantized.
     const passes = b.shr(R(b.add(R(blocks), U(per_pass - 1))), log2(per_pass));
@@ -1153,7 +1186,7 @@ pub fn quant(s: kir.Storage, caps: Caps, mode: QuantMode) Error!kir.Kernel {
     }
     b.endloop();
     const total = b.xorReduceDD(sum, threads, t);
-    const inverse = b.normInverse(total, R(b.cvt(.u32, .f32, .rne, R(width))), R(b.as(.f32, b.param(2))));
+    const inverse = b.normInverse(total, R(b.cvt(.u32, .f32, .rne, R(width))), R(b.as(.f32, a.epsilon)));
     b.set(p, .mov, .u32, U(0), NO, NO);
     b.loop();
     {
@@ -1162,7 +1195,7 @@ pub fn quant(s: kir.Storage, caps: Caps, mode: QuantMode) Error!kir.Kernel {
         const blc = b.umin(R(bl), R(last));
         const col = b.add(R(b.shl(R(blc), 10)), R(lane_bytes));
         const off = b.add(R(x_base), R(col));
-        const noff = b.add(R(b.add(R(b.param(5)), R(row_bytes))), R(col));
+        const noff = b.add(R(b.add(R(a.normalized), R(row_bytes))), R(col));
         const wo = b.add(R(w_base), R(col));
         const x0 = b.ldv(X, .f32, R(off), 0, 4);
         const x1 = b.ldv(X, .f32, R(off), 16, 4);
@@ -1182,13 +1215,11 @@ pub fn quant(s: kir.Storage, caps: Caps, mode: QuantMode) Error!kir.Kernel {
         b.st(NB, R(noff), 0, 7, y0);
         b.st(NB, R(noff), 16, 7, y1);
         b.endif();
-        quantQ8K(&b, y, i, t, b.add(R(row_blocks), R(blc)), ok, AQ, AD, AS);
+        quantQ8K(b, y, i, t, b.add(R(row_blocks), R(blc)), ok, AQ, AD, AS);
         b.set(p, .iadd, .u32, R(p), U(1), NO);
         b.brk(b.icmp(.u32, .ge, R(p), R(passes)));
     }
     b.endloop();
-    try k.finish();
-    return k;
 }
 
 // ── Q8_0 quantization ───────────────────────────────────────────────────────
@@ -1274,8 +1305,62 @@ pub fn residual(s: kir.Storage, caps: Caps, postnorm: bool) Error!kir.Kernel {
     const WB = k.binding();
     k.param_words = 3;
     if (postnorm) b.needExchange(threads);
+    residualBody(&b, .{ .HID = HID, .BLK = BLK, .WB = WB }, threads, postnorm, .{ .width = b.param(0), .epsilon = b.param(1), .weight = b.param(2) });
+    try k.finish();
+    return k;
+}
+
+/// residual, then norm+quant over the same rows, in one kernel: lfm3_any's
+/// residual and the norm after it (the FFN's, the next layer's, the
+/// output's) without a dispatch, a barrier of the device's and a trip of
+/// the hidden rows through memory between them. hidden += post(block), a
+/// barrier (the group's global memory ordered), then norm+quant of the new
+/// hidden rows: both kernels' code, the same bits. Bindings: hidden, block,
+/// weights, normalized, AQ, AD, AS. Params: ResidualNormParams. Groups
+/// (1, tokens, 1).
+pub fn residualNormQuant(s: kir.Storage, caps: Caps, postnorm: bool) Error!kir.Kernel {
+    const threads: u32 = rowThreads(caps);
+    if (threads < 32) return error.Unsupported;
+    var k = begin(s, if (postnorm) "lfm3_residual_norm_quant_post" else "lfm3_residual_norm_quant", threads);
+    var b = Builder.init(&k, caps);
+    const HID = k.binding();
+    const BLK = k.binding();
+    const W = k.binding();
+    const NB = k.binding();
+    const AQ = k.binding();
+    const AD = k.binding();
+    const AS = k.binding();
+    k.param_words = ResidualNormParams.WORDS;
+    b.needExchange(threads);
+    residualBody(&b, .{ .HID = HID, .BLK = BLK, .WB = W }, threads, postnorm, .{ .width = b.param(0), .epsilon = b.param(2), .weight = b.param(6) });
+    b.barrier();
+    normQuantBody(&b, .{ .X = HID, .WB = W, .NB = NB, .AQ = AQ, .AD = AD, .AS = AS }, threads, .{ .width = b.param(0), .blocks = b.param(1), .epsilon = b.param(2), .x = b.param(3), .weight = b.param(4), .normalized = b.param(5) });
+    try k.finish();
+    return k;
+}
+
+/// residualNormQuant's words: quantParams' six (the width, its blocks, the
+/// epsilon, the rows' offset, the norm's weights, the normalized rows'
+/// offset), then the residual's post-norm weights.
+pub const ResidualNormParams = struct {
+    pub const WORDS = 7;
+    pub fn words(width: u32, epsilon: f32, x: u32, norm_weight: u32, normalized: u32, post_weight: u32) [WORDS]u32 {
+        const q = quantParams(width, epsilon, x, norm_weight, normalized);
+        return .{ q[0], q[1], q[2], q[3], q[4], q[5], post_weight };
+    }
+};
+
+const ResidualBind = struct { HID: u8, BLK: u8, WB: u8 };
+const ResidualArgs = struct { width: V, epsilon: V, weight: V };
+
+/// hidden += block for each token's row (group y), the block RMSNormed
+/// and weighted first with `postnorm` (sandwich norms): residual's body.
+fn residualBody(b: *Builder, m: ResidualBind, threads: u32, postnorm: bool, a: ResidualArgs) void {
+    const HID = m.HID;
+    const BLK = m.BLK;
+    const WB = m.WB;
     const t = b.tid(0);
-    const width = b.param(0);
+    const width = a.width;
     const row = b.shl(R(b.mul(R(b.gid(1)), R(width))), 2);
     const chunks = b.shr(R(width), log2(threads));
     const t4 = b.shl(R(t), 2);
@@ -1289,20 +1374,18 @@ pub fn residual(s: kir.Storage, caps: Caps, postnorm: bool) Error!kir.Kernel {
         b.set(c, .iadd, .u32, R(c), U(1), NO);
         b.brk(b.icmp(.u32, .ge, R(c), R(chunks)));
         b.endloop();
-        inverse = b.normInverse(b.xorReduceDD(sum, threads, t), R(b.cvt(.u32, .f32, .rne, R(width))), R(b.as(.f32, b.param(1))));
+        inverse = b.normInverse(b.xorReduceDD(sum, threads, t), R(b.cvt(.u32, .f32, .rne, R(width))), R(b.as(.f32, a.epsilon)));
         b.set(c, .mov, .u32, U(0), NO, NO);
     }
     b.loop();
     const col = b.add(R(b.shl(R(c), log2(threads) + 2)), R(t4));
     const off = b.add(R(row), R(col));
     var x = b.ld(BLK, .f32, R(off), 0, 5);
-    if (postnorm) x = b.fmul(R(b.fmul(R(x), R(inverse))), R(b.ld(WB, .f32, R(b.add(R(b.param(2)), R(col))), 0, 5)));
+    if (postnorm) x = b.fmul(R(b.fmul(R(x), R(inverse))), R(b.ld(WB, .f32, R(b.add(R(a.weight), R(col))), 0, 5)));
     b.st(HID, R(off), 0, 5, b.fadd(R(b.ld(HID, .f32, R(off), 0, 5)), R(x)));
     b.set(c, .iadd, .u32, R(c), U(1), NO);
     b.brk(b.icmp(.u32, .ge, R(c), R(chunks)));
     b.endloop();
-    try k.finish();
-    return k;
 }
 
 // ── Short convolution ───────────────────────────────────────────────────────
@@ -1907,6 +1990,29 @@ pub fn copy(s: kir.Storage, caps: Caps) Error!kir.Kernel {
     return k;
 }
 
+/// The memory's read speed: 16 bytes a thread read from `from`, and written
+/// to `to` only where their words' sum is the mark (param 2), so almost
+/// nothing is written but no load can be left out. Bindings: from, to (16
+/// bytes). Params: 16-byte words, the byte offset in from, the mark. Groups
+/// as copyGroups.
+pub fn readProbe(s: kir.Storage, caps: Caps) Error!kir.Kernel {
+    var k = begin(s, "lfm3_read", 64);
+    var b = Builder.init(&k, caps);
+    const FROM = k.binding();
+    const TO = k.binding();
+    k.param_words = 3;
+    const w = b.add(R(b.shl(R(b.gid(0)), 6)), R(b.tid(0)));
+    b.if_(b.icmp(.u32, .lt, R(w), R(b.param(0))));
+    const v = b.ldv(FROM, .u32, R(b.add(R(b.param(1)), R(b.shl(R(w), 4)))), 0, 4);
+    const sum = b.add(R(b.add(R(at(v, 0)), R(at(v, 1)))), R(b.add(R(at(v, 2)), R(at(v, 3)))));
+    b.if_(b.icmp(.u32, .eq, R(sum), R(b.param(2))));
+    b.st(TO, U(0), 0, 7, v);
+    b.endif();
+    b.endif();
+    try k.finish();
+    return k;
+}
+
 // ── LFM3-Audio (the depthformer, as lfm3_audio_gen and lfm3_audio_ops) ──────
 //
 // The audio networks are ggml's CPU graph (lfm3_audio_ops): its RMSNorm
@@ -1917,12 +2023,12 @@ pub fn copy(s: kir.Storage, caps: Caps) Error!kir.Kernel {
 // on every GPU.
 
 /// a * b + c, as the CPU's @mulAdd where the GPU fuses.
-fn mulAdd(b: *Builder, a: Arg, x: Arg, c: Arg) V {
+pub fn mulAdd(b: *Builder, a: Arg, x: Arg, c: Arg) V {
     return b.fma(a, x, c);
 }
 
 /// ggml_v_expf (lfm3_audio_ops.expGgml), op for op, branch-free.
-fn expGgml(b: *Builder, x: V) V {
+pub fn expGgml(b: *Builder, x: V) V {
     const r = F(0x1.8p23);
     const z = mulAdd(b, R(x), F(0x1.715476p+0), r);
     const n = b.fsub(R(z), r);
@@ -2720,6 +2826,44 @@ test "residual: hidden += rmsnorm(block) * w, and += block, the CPU's bits" {
     }
 }
 
+test "residual then norm+quant in one kernel: the two kernels' bits (hidden, normalized rows, Q8_K)" {
+    const T = TestRig;
+    for ([_]bool{ true, false }) |postnorm| for ([_]bool{ true, false }) |fused| {
+        const caps = caps32(fused, 32);
+        const tokens = 3;
+        const width = 2048;
+        const blocks = width / QK_K;
+        var seed: u32 = 41 + @as(u32, @intFromBool(postnorm)) * 7;
+        const hid = f32s(T.a[0 .. tokens * width * 4]);
+        const blk = f32s(T.b[0 .. tokens * width * 4]);
+        // the weights: the residual's post-norm at 64, the norm's at 64 + width * 4
+        const post_w = f32s(T.e[64..][0 .. width * 4]);
+        const norm_w = f32s(T.e[64 + width * 4 ..][0 .. width * 4]);
+        for (hid) |*v| v.* = unit(&seed) * 8;
+        for (blk) |*v| v.* = unit(&seed) * 3;
+        for (post_w) |*v| v.* = 0.75 + unit(&seed);
+        for (norm_w) |*v| v.* = 0.5 + unit(&seed) + 0.5;
+        // the CPU: the residual, then RMSNorm and quantizeQ8K of the new rows
+        var want_hid: [tokens * width]f32 = undefined;
+        var want_y: [tokens * width]f32 = undefined;
+        for (0..tokens) |t| {
+            var row: [width]f32 = undefined;
+            @memcpy(&row, blk[t * width ..][0..width]);
+            if (postnorm) rmsNormRow(&row, post_w, &row, 1e-5);
+            for (want_hid[t * width ..][0..width], hid[t * width ..][0..width], row) |*o, h, r| o.* = h + r;
+            rmsNormRow(want_hid[t * width ..][0..width], norm_w, want_y[t * width ..][0..width], 1e-5);
+        }
+        var k = try residualNormQuant(testStorage(), caps, postnorm);
+        _ = try runOn(&k, caps, .{ 1, tokens, 1 }, &.{ T.a[0 .. tokens * width * 4], T.b[0 .. tokens * width * 4], T.e[0 .. 64 + 2 * width * 4], T.f[0 .. 16 + tokens * width * 4], T.c[0 .. tokens * width], T.d[0 .. tokens * blocks * 4], T.g[0 .. tokens * blocks * 32] }, &ResidualNormParams.words(width, 1e-5, 0, 64 + width * 4, 16, 64));
+        for (want_hid, hid) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        const y = f32s(T.f[16..][0 .. tokens * width * 4]);
+        for (want_y, y) |a, b| try std.testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        var cpu: [tokens * blocks]quantized.Q8KBlock = undefined;
+        try quantized.quantizeQ8K(&want_y, &cpu);
+        try expectQ8K(&cpu, &T.c, &T.d, &T.g);
+    };
+}
+
 test "short convolution: the CPU's floats exactly, the state carried" {
     const T = TestRig;
     const caps = caps32(true, 32);
@@ -2921,4 +3065,21 @@ test "copy: 16-byte words between offsets" {
     _ = try runOn(&k, caps, copyGroups(100), &.{ T.a[0..4096], T.b[0..4096] }, &.{ 100, 32, 64 });
     try std.testing.expectEqualSlices(u8, T.a[32..][0..1600], T.b[64..][0..1600]);
     try std.testing.expect(T.b[63] == 0 and T.b[64 + 1600] == 0);
+}
+
+test "readProbe: writes only the 16 bytes whose sum is the mark" {
+    const T = TestRig;
+    const caps = caps32(true, 32);
+    for (T.a[0..4096], 0..) |*x, i| x.* = @truncate(i * 7 + 3);
+    const words: []align(16) const u32 = @alignCast(std.mem.bytesAsSlice(u32, T.a[0..4096]));
+    // the sum of the 16 bytes thread 37 reads (from byte 32 + 16 * 37)
+    const at_w = (32 + 16 * 37) / 4;
+    const mark = words[at_w] +% words[at_w + 1] +% words[at_w + 2] +% words[at_w + 3];
+    var k = try readProbe(testStorage(), caps);
+    @memset(T.b[0..4096], 0);
+    _ = try runOn(&k, caps, copyGroups(100), &.{ T.a[0..4096], T.b[0..4096] }, &.{ 100, 32, mark });
+    try std.testing.expectEqualSlices(u8, T.a[32 + 16 * 37 ..][0..16], T.b[0..16]);
+    @memset(T.b[0..4096], 0);
+    _ = try runOn(&k, caps, copyGroups(100), &.{ T.a[0..4096], T.b[0..4096] }, &.{ 100, 32, 0xdead_beef });
+    for (T.b[0..16]) |x| try std.testing.expect(x == 0);
 }

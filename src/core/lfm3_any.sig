@@ -92,9 +92,10 @@ pub const Options = struct {
     /// Map the model file zero-copy where the device can (unified memory,
     /// caps.import, the file mapped).
     import: bool = true,
-    /// Dispatches one Device.run takes at most (a call sends more as
-    /// several runs, each waited for: nvidia_device takes 256).
-    max_run: u32 = 256,
+    /// Dispatches one Device.run takes at most, and never more than the
+    /// device's caps.max_run (a call sends more as several runs, each
+    /// waited for: one decode step is one run where the device takes it).
+    max_run: u32 = MAX_DISPATCHES,
     /// Diagnose mode (lfm3_gpu's): every dispatch of a call is a run of its
     /// own, and `diagnose` is called with a line naming it before it is
     /// sent ("lfm3-any: dispatch 12, layer 2 of 24 (attention): matrix
@@ -119,7 +120,96 @@ pub const Options = struct {
     /// that many lanes a thread for every shape. Every layout is the CPU's
     /// bits (lfm3_kir): only the time differs.
     matrix_lanes: u32 = 0,
+    /// The caller's clock (ns), for profileStep's account of a call's CPU
+    /// side (null: not timed).
+    clock: ?*const fn () u64 = null,
 };
+
+/// One kind of dispatch in a profiled call: a kernel, or for a matrix the
+/// tensor's role across layers ("matrix q4k ffn_gate.weight").
+pub const ProfileEntry = struct {
+    name: [56]u8 = undefined,
+    len: u8 = 0,
+    count: u32 = 0,
+    /// GPU time its dispatches took (each end less the latest end before it).
+    ns: u64 = 0,
+    /// The weights its dispatches read (matrices; 0 for the rest).
+    bytes: u64 = 0,
+
+    pub fn nameSlice(e: *const ProfileEntry) []const u8 {
+        return e.name[0..e.len];
+    }
+};
+
+pub const MAX_PROFILE = 48;
+
+/// Where one call's time went (profileStep).
+pub const Profile = struct {
+    entries: [MAX_PROFILE]ProfileEntry = undefined,
+    n: usize = 0,
+    /// The runs' GPU time (each from its start to its end timestamp), the
+    /// part of it after the last dispatch ended (the run's tail), and the
+    /// dispatches and runs.
+    gpu_ns: u64 = 0,
+    tail_ns: u64 = 0,
+    dispatches: u32 = 0,
+    runs: u32 = 0,
+    /// The call's CPU side by Options.clock (0: not timed): its dispatch
+    /// list and uploads, the runs submitted and waited for, the results
+    /// read back.
+    begin_ns: u64 = 0,
+    runs_ns: u64 = 0,
+    complete_ns: u64 = 0,
+
+    pub fn slice(p: *const Profile) []const ProfileEntry {
+        return p.entries[0..p.n];
+    }
+
+    /// `ns` and `bytes` added to the entry `kernel` (and `role`) names.
+    pub fn add(p: *Profile, kernel: []const u8, role: []const u8, ns: u64, bytes: u64) void {
+        var name: [56]u8 = undefined;
+        const text = if (role.len == 0) kernel else std.fmt.bufPrint(&name, "{s} {s}", .{ kernel, role }) catch kernel;
+        const t = text[0..@min(text.len, name.len)];
+        for (p.entries[0..p.n]) |*e| {
+            if (std.mem.eql(u8, e.nameSlice(), t)) {
+                e.count += 1;
+                e.ns += ns;
+                e.bytes += bytes;
+                return;
+            }
+        }
+        // (the last entry is the rest's)
+        if (p.n >= MAX_PROFILE - 1 and !std.mem.eql(u8, t, "(more kinds)")) return p.add("(more kinds)", "", ns, bytes);
+        const e = &p.entries[p.n];
+        e.* = .{ .count = 1, .ns = ns, .bytes = bytes, .len = @intCast(t.len) };
+        @memcpy(e.name[0..t.len], t);
+        p.n += 1;
+    }
+
+    /// One run's dispatches: `ends` (ns after the run's start, each dispatch's
+    /// completion) attributed to `descs` in order, each the time from the
+    /// latest end before it to its own; the rest of `run_ns` is the tail.
+    pub fn addRun(p: *Profile, descs: []const Desc, ends: []const u64, run_ns: u64, roleOf: anytype) void {
+        var latest: u64 = 0;
+        for (descs, ends) |d, end| {
+            const took = end -| latest;
+            latest = @max(latest, end);
+            const r = roleOf.of(d);
+            p.add(d.kernel, r.role, took, r.bytes);
+        }
+        p.tail_ns += run_ns -| latest;
+        p.gpu_ns += run_ns;
+        p.dispatches += @intCast(descs.len);
+        p.runs += 1;
+    }
+};
+
+/// A tensor's role across layers: its name less "blk.N.".
+pub fn roleName(name: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, name, "blk.")) return name;
+    const dot = std.mem.indexOfScalarPos(u8, name, 4, '.') orelse return name;
+    return name[dot + 1 ..];
+}
 
 pub const MATRIX_VARIANTS = kernels.MAX_TOKENS;
 /// The layouts a one-token matrix pass is tried in: lanes a thread (8 / lanes
@@ -167,6 +257,8 @@ const Programs = struct {
     quant: ?Program = null,
     swiglu: ?Program = null,
     residual: ?Program = null,
+    /// residual and the norm+quant after it in one dispatch (null: apart)
+    residual_norm: ?Program = null,
     conv: ?Program = null,
     prepare: ?Program = null,
     scores_decode: ?Program = null,
@@ -176,6 +268,8 @@ const Programs = struct {
     values_prefill: ?Program = null,
     combine: ?Program = null,
     copy: ?Program = null,
+    /// the memory's read speed (readSpeed; null: not built)
+    read: ?Program = null,
 };
 
 /// Activation buffers, sized for max_batch.
@@ -307,8 +401,15 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         total_dispatches: u64 = 0,
         /// The device's time for the last call (ns; 0 when it does not say).
         last_ns: u64 = 0,
+        /// profileStep's call: each run's dispatch ends taken and added up.
+        profiling: bool = false,
+        prof: Profile = .{},
+        prof_ends: [MAX_DISPATCHES]u64 = undefined,
         /// Why the last kernel did not compile.
         compile_error: ?anyerror = null,
+        /// Each residual and the norm after it in one dispatch where the
+        /// fused kernel built (locate turns it off: it checks them apart).
+        fuse: bool = true,
         /// Each matrix shape's layout for one-token passes (tuneMatrices).
         tuned: [MAX_TUNED]Tuned = undefined,
         n_tuned: usize = 0,
@@ -348,7 +449,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             for (&k.q6k) |*p| self.unload(p);
             for (&k.q4k1) |*p| self.unload(p);
             for (&k.q6k1) |*p| self.unload(p);
-            const progs = [_]*?Program{ &k.norm_quant, &k.quant, &k.swiglu, &k.residual, &k.conv, &k.prepare, &k.scores_decode, &k.scores_prefill, &k.softmax, &k.values_decode, &k.values_prefill, &k.combine, &k.copy };
+            const progs = [_]*?Program{ &k.norm_quant, &k.quant, &k.swiglu, &k.residual, &k.residual_norm, &k.conv, &k.prepare, &k.scores_decode, &k.scores_prefill, &k.softmax, &k.values_decode, &k.values_prefill, &k.combine, &k.copy, &k.read };
             for (progs) |p| self.unload(p);
         }
 
@@ -414,7 +515,16 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             try self.build(&self.k.quant, kernels.quant(s, caps, .plain));
             try self.build(&self.k.swiglu, kernels.quant(s, caps, .swiglu));
             try self.build(&self.k.residual, kernels.residual(s, caps, plan.sandwich_norms));
+            // (fused where it builds; apart otherwise, the same bits)
+            self.build(&self.k.residual_norm, kernels.residualNormQuant(s, caps, plan.sandwich_norms)) catch {
+                self.k.residual_norm = null;
+            };
+            self.compile_error = null;
             try self.build(&self.k.copy, kernels.copy(s, caps));
+            self.build(&self.k.read, kernels.readProbe(s, caps)) catch {
+                self.k.read = null;
+            };
+            self.compile_error = null;
             if (plan.conv_layer_count > 0) try self.build(&self.k.conv, kernels.conv(s, caps, plan.conv_kernel));
             if (plan.attention_layer_count > 0) {
                 const group = plan.head_count / attentionGroupSize(plan);
@@ -502,7 +612,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// device's own, read and written (2 x bytes moved). null: it keeps
         /// no timestamps, or there is no memory for the copy. A clock or
         /// power state shows here first (legion22: matrices 3 times faster
-        /// once the GPU had been busy a while).
+        /// once the GPU had been busy a while). A copy that fits the GPU's
+        /// last-level cache (GB206's L2: 32 MiB) measures the cache, not
+        /// the memory: readSpeed is the memory's figure.
         pub fn copySpeed(self: *Self, bytes: u64) ?f64 {
             const n = @min(bytes, 64 << 20, self.weights.bytes) / 16 * 16;
             if (n < 16 or n > std.math.maxInt(u32)) return null;
@@ -519,6 +631,41 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const ns = self.dev.lastRunNs();
             if (ns == 0) return null;
             return @as(f64, @floatFromInt(2 * n)) / @as(f64, @floatFromInt(ns));
+        }
+
+        /// The memory's read speed now, in GB/s by the GPU's timestamps: the
+        /// weights' first `bytes` (all of them at most) read once, nothing
+        /// written. Larger than the GPU's caches (a few hundred MiB), it is
+        /// the memory's own (VRAM on a discrete GPU, the shared DRAM on a
+        /// unified one). null: no read kernel, no timestamps, or no room for
+        /// its 16-byte targets.
+        pub fn readSpeed(self: *Self, bytes: u64) ?f64 {
+            const prog = if (self.k.read) |*p| p else return null;
+            const n = @min(bytes, self.weights.bytes) / 16 * 16;
+            if (n < 16 or n > std.math.maxInt(u32)) return null;
+            const PIECE: u64 = 16 << 20;
+            const pieces = (n + PIECE - 1) / PIECE;
+            if (pieces > 64) return null;
+            // a 16-byte target each, so no piece waits for another
+            const tmp = self.dev.alloc(pieces * 256, .device) catch return null;
+            defer self.dev.free(tmp);
+            var l = List{ .work = self.work };
+            l.what = .{ .kernel = "read probe" };
+            var at: u64 = 0;
+            var i: u64 = 0;
+            while (at < n) : (i += 1) {
+                const words: u32 = @intCast(@min(n - at, PIECE) / 16);
+                var to = tmp;
+                to.gpu += i * 256;
+                to.bytes = 16;
+                to.cpu = &.{};
+                l.add(prog, kernels.copyGroups(words), &.{ self.weights, to }, &.{ words, @intCast(at), 0x5a5a_a5a5 }) catch return null;
+                at += @as(u64, words) * 16;
+            }
+            self.runNow(&l) catch return null;
+            const ns = self.dev.lastRunNs();
+            if (ns == 0) return null;
+            return @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(ns));
         }
 
         fn runNow(self: *Self, l: *const List) Error!void {
@@ -673,7 +820,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// token. error.DeviceLost or error.LongContext: the cache is as it
         /// was, and toCpu() + the CPU executor can do the call.
         pub fn forward(self: *Self, c: *Cache, input: executor.Input, output: executor.Output) Error!?u32 {
+            const clock = self.options.clock;
+            const t0: u64 = if (self.profiling) (if (clock) |f| f() else 0) else 0;
             var call = try self.begin(c, input, output);
+            const t1: u64 = if (self.profiling) (if (clock) |f| f() else 0) else 0;
             const l = &call.list;
             const count = call.count;
             const cache = &c.cpu;
@@ -697,16 +847,59 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 log(std.fmt.bufPrint(&b3, "lfm3-any: forward of {d} tokens at position {d}: all {d} dispatches done", .{ count, cache.position, l.n }) catch "lfm3-any: forward done");
             } else {
                 var at: usize = 0;
+                const most = @max(1, @min(self.options.max_run, self.dev.caps.max_run));
                 while (at < l.n) {
-                    const part = l.slice()[at..@min(l.n, at + self.options.max_run)];
+                    const part = l.slice()[at..@min(l.n, at + most)];
                     const fence = self.dev.run(part) catch |e| return self.failed(c, e);
                     self.finish(fence) catch |e| return self.failed(c, e);
-                    ns += self.dev.lastRunNs();
+                    const run_ns = self.dev.lastRunNs();
+                    if (self.profiling) {
+                        const got = self.dev.dispatchNs(self.prof_ends[0..part.len]);
+                        if (got == part.len) self.prof.addRun(l.work.descs[at..][0..part.len], self.prof_ends[0..part.len], run_ns, Roles{ .b = self });
+                    }
+                    ns += run_ns;
                     at += part.len;
                 }
             }
             self.last_ns = ns;
-            return self.complete(c, &call, output);
+            const t2: u64 = if (self.profiling) (if (clock) |f| f() else 0) else 0;
+            const token_out = self.complete(c, &call, output);
+            if (self.profiling and t0 != 0) {
+                const t3 = clock.?();
+                self.prof.begin_ns += t1 -| t0;
+                self.prof.runs_ns += t2 -| t1;
+                self.prof.complete_ns += t3 -| t2;
+            }
+            return token_out;
+        }
+
+        /// A dispatch's role for its profile entry: a matrix's tensor (less
+        /// "blk.N.") and the bytes it reads.
+        const Roles = struct {
+            b: *const Self,
+            pub fn of(r: Roles, d: Desc) struct { role: []const u8, bytes: u64 } {
+                if (!std.mem.startsWith(u8, d.kernel, "matrix")) return .{ .role = "", .bytes = 0 };
+                const ti = d.tensor orelse return .{ .role = "", .bytes = 0 };
+                if (ti >= r.b.index.tensor_count) return .{ .role = "", .bytes = 0 };
+                const t = &r.b.index.tensors[ti];
+                return .{ .role = roleName(t.nameSlice()), .bytes = t.byte_size };
+            }
+        };
+
+        /// One decode step (a token after `c`'s position, its logits) with
+        /// each dispatch's end timed: where its GPU time goes, by kernel and
+        /// by the tensor a matrix reads, and its CPU side (Options.clock).
+        /// The cache moves on a position. null: the device keeps no
+        /// dispatch times, or the call failed.
+        pub fn profileStep(self: *Self, c: *Cache, token: u32) ?*const Profile {
+            if (!self.dev.profile(true)) return null;
+            defer _ = self.dev.profile(false);
+            self.prof = .{};
+            self.profiling = true;
+            defer self.profiling = false;
+            _ = self.forward(c, .{ .tokens = &.{token} }, .logits) catch return null;
+            if (self.prof.runs == 0) return null;
+            return &self.prof;
         }
 
         /// A call made and not yet run: its dispatches, its tokens.
@@ -768,12 +961,20 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const n: u32 = @intCast(count);
             for (plan.layers[0..plan.layer_count], 0..) |*ly, li| {
                 l.what = .{ .layer = @intCast(li) };
-                try self.layer(&l, ly, c, n);
+                // (the norm after the layer's last residual: the next
+                // layer's, or for one row the output's, fused with it)
+                const next: ?NextNorm = if (li + 1 < plan.layer_count)
+                    .{ .norm = plan.layers[li + 1].attn_norm, .rows = n, .out = self.s.normalized }
+                else if (output != .none and count == 1)
+                    .{ .norm = plan.output_norm, .rows = 1, .out = self.out_hidden }
+                else
+                    null;
+                try self.layer(&l, ly, c, n, li == 0 or !self.fused(), next);
             }
             l.what = .{};
             if (output != .none) {
                 // the last position's output norm (and its quantization)
-                try self.normQuant(&l, @intCast((count - 1) * h * 4), plan.output_norm, 1, self.out_hidden);
+                if (!(count == 1 and self.fused())) try self.normQuant(&l, @intCast((count - 1) * h * 4), plan.output_norm, 1, self.out_hidden);
                 if (output == .logits) try self.linear(&l, try self.matrixOf(plan.output), 1, self.out_logits, plan.vocabulary_size * 4);
             }
             self.dispatches = @intCast(l.n);
@@ -859,10 +1060,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             for (k.q6k) |p| if (p) |pp| if (pp.code.gpu == code_va) return "matrix q6k";
             const named = [_]struct { []const u8, ?Program }{
                 .{ "norm+quant", k.norm_quant },      .{ "quant", k.quant },                       .{ "swiglu+quant", k.swiglu },
-                .{ "residual", k.residual },          .{ "conv", k.conv },                         .{ "prepare", k.prepare },
+                .{ "residual", k.residual },          .{ "residual+norm+quant", k.residual_norm }, .{ "conv", k.conv },                         .{ "prepare", k.prepare },
                 .{ "attention scores", k.scores_decode }, .{ "attention scores (tiles)", k.scores_prefill }, .{ "attention softmax", k.softmax },
                 .{ "attention values", k.values_decode }, .{ "attention values (tiles)", k.values_prefill }, .{ "attention combine", k.combine },
-                .{ "copy", k.copy },
+                .{ "copy", k.copy },                  .{ "read probe", k.read },
             };
             for (named) |n| if (n[1]) |pp| if (pp.code.gpu == code_va) return n[0];
             return "?";
@@ -951,6 +1152,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const diagnose = self.options.diagnose;
             self.options.diagnose = null;
             defer self.options.diagnose = diagnose;
+            // (each dispatch checked against its CPU step: residual and norm apart)
+            const fuse = self.fuse;
+            self.fuse = false;
+            defer self.fuse = fuse;
             var plan: lfm3.Plan = undefined;
             const n = full.layer_count;
             var line: [320]u8 = undefined;
@@ -1489,11 +1694,21 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             return r;
         }
 
-        fn layer(self: *Self, l: *List, ly: *const lfm3.Layer, c: *const Cache, n: u32) Error!void {
+        /// The norm a layer's last residual is fused with.
+        const NextNorm = struct { norm: lfm3.TensorRef, rows: u32, out: Buffer };
+
+        fn fused(self: *const Self) bool {
+            return self.fuse and self.k.residual_norm != null;
+        }
+
+        /// One layer: its attention norm first when `first` (else the
+        /// layer before fused it with its last residual); its last residual
+        /// fused with `next` when there is one and the fused kernel is.
+        fn layer(self: *Self, l: *List, ly: *const lfm3.Layer, c: *const Cache, n: u32, first: bool, next: ?NextNorm) Error!void {
             const plan = self.plan;
             const h: u32 = plan.hidden_size;
             const s = &self.s;
-            try self.normQuant(l, 0, ly.attn_norm, n, s.normalized);
+            if (first) try self.normQuant(l, 0, ly.attn_norm, n, s.normalized);
             switch (ly.kind) {
                 .short_conv => {
                     try self.linear(l, try self.matrixOf(ly.in_proj), n, s.mixed, 3 * h * 4);
@@ -1505,15 +1720,34 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 },
                 .attention => try self.attention(l, ly, c, n),
             }
-            try self.residual(l, ly.post_attention_norm, n);
-            try self.normQuant(l, 0, ly.ffn_norm, n, s.normalized);
+            try self.residualNorm(l, ly.post_attention_norm, ly.ffn_norm, n, s.normalized);
             const ff: u32 = plan.feed_forward_size;
             try self.linear(l, try self.matrixOf(ly.ffn_gate), n, s.ffn_gate, ff * 4);
             try self.linear(l, try self.matrixOf(ly.ffn_up), n, s.ffn_up, ff * 4);
             l.named("swiglu+quant", null, 0, n);
             try l.add(&self.k.swiglu.?, kernels.quantGroups(self.caps, .swiglu, ff, n), &.{ s.ffn_gate, s.ffn_up, s.ffn_gate, s.act_q, s.act_d, s.act_sums }, &kernels.quantParams(ff, 0, 0, 0, 0));
             try self.linear(l, try self.matrixOf(ly.ffn_down), n, s.projected, h * 4);
+            if (next) |nx| {
+                if (self.fused() and nx.rows == n) {
+                    try self.residualNorm(l, ly.post_ffw_norm, nx.norm, n, nx.out);
+                    return;
+                }
+            }
             try self.residual(l, ly.post_ffw_norm, n);
+        }
+
+        /// residual(`post`), then normQuant(`norm`) of the same rows into
+        /// `normalized`: one dispatch where the fused kernel is.
+        fn residualNorm(self: *Self, l: *List, post: lfm3.TensorRef, norm: lfm3.TensorRef, n: u32, normalized: Buffer) Error!void {
+            if (!self.fused()) {
+                try self.residual(l, post, n);
+                return self.normQuant(l, 0, norm, n, normalized);
+            }
+            const h = self.plan.hidden_size;
+            const s = &self.s;
+            const w = if (self.plan.sandwich_norms) try self.tensorOffset(post) else 0;
+            l.named("residual+norm+quant", norm.index, 0, n);
+            try l.add(&self.k.residual_norm.?, .{ 1, n, 1 }, &.{ s.hidden, s.projected, self.weights, normalized, s.act_q, s.act_d, s.act_sums }, &kernels.ResidualNormParams.words(h, self.plan.rms_norm_epsilon, 0, try self.tensorOffset(norm), 0, w));
         }
 
         fn attention(self: *Self, l: *List, ly: *const lfm3.Layer, c: *const Cache, n: u32) Error!void {

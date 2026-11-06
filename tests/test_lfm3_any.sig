@@ -321,17 +321,73 @@ fn followTheCpu(which: Device, tolerance: f64) !f64 {
     // The memory speed probe (a copy of the weights' first MiB): the GPU
     // still agrees with the CPU after it (the copy writes its own buffer).
     const gbps = backend.copySpeed(1 << 20);
+    // ...and the read probe (all the weights read, 16 bytes written apart
+    // where their sum is the mark): built on every device, writing nothing
+    // the model uses
+    try std.testing.expect(backend.k.read != null);
+    const read_gbps = backend.readSpeed(64 << 20);
+    // (a device that keeps no dispatch times: no profile, the cache as it was)
+    {
+        const at = gc.cpu.position;
+        try std.testing.expect(backend.profileStep(&gc, t2) == null);
+        try std.testing.expectEqual(at, gc.cpu.position);
+    }
     {
         const c3 = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{t2} }, .logits, .{})).?;
         const g3 = (backend.forward(&gc, .{ .tokens = &.{t2} }, .logits) catch |e| return failure(&backend, e)).?;
         worst = @max(worst, try compare(104, cpu_work.logits[0..VOCAB], backend.logits(), tolerance));
         try std.testing.expectEqual(c3, g3);
     }
-    std.debug.print("{s}: copySpeed {d:.1} GB/s (-1: no timestamps)\n", .{ @tagName(which), gbps orelse -1 });
+    std.debug.print("{s}: copySpeed {d:.1} GB/s, readSpeed {d:.1} (-1: no timestamps)\n", .{ @tagName(which), gbps orelse -1, read_gbps orelse -1 });
     std.debug.print("{s}: logits within {e} of the CPU's over 13 steps; prefill of 11: {d} lane-ops, {d} dispatches; decode: {d} lane-ops, {d} dispatches a token\n", .{
         @tagName(which), worst, prefill_ops, prefill_dispatches, decode_ops / 7, backend.dispatches,
     });
     return worst;
+}
+
+test "a profiled run: each dispatch's time from the latest end before it, matrices by their tensor's role" {
+    try std.testing.expectEqualStrings("ffn_down.weight", any.roleName("blk.17.ffn_down.weight"));
+    try std.testing.expectEqualStrings("output.weight", any.roleName("output.weight"));
+    const Roles = struct {
+        pub fn of(_: @This(), d: any.Desc) struct { role: []const u8, bytes: u64 } {
+            if (d.tensor) |t| return .{ .role = if (t == 1) "ffn_down.weight" else "attn_q.weight", .bytes = 100 };
+            return .{ .role = "", .bytes = 0 };
+        }
+    };
+    var p = any.Profile{};
+    const descs = [_]any.Desc{
+        .{ .kernel = "norm+quant", .layer = 0 },
+        .{ .kernel = "matrix q4k", .layer = 0, .tensor = 0 },
+        .{ .kernel = "matrix q6k", .layer = 0, .tensor = 1 },
+        .{ .kernel = "norm+quant", .layer = 1 },
+        .{ .kernel = "matrix q6k", .layer = 1, .tensor = 1 },
+    };
+    // (the third ends before the second: two that ran together; the
+    // second's time is from the first's end, the third's 0)
+    const ends = [_]u64{ 10, 50, 40, 70, 100 };
+    p.addRun(&descs, &ends, 120, Roles{});
+    try std.testing.expectEqual(@as(usize, 3), p.n);
+    try std.testing.expectEqualStrings("norm+quant", p.slice()[0].nameSlice());
+    try std.testing.expectEqual(@as(u64, 10 + 20), p.slice()[0].ns);
+    try std.testing.expectEqual(@as(u32, 2), p.slice()[0].count);
+    try std.testing.expectEqualStrings("matrix q4k attn_q.weight", p.slice()[1].nameSlice());
+    try std.testing.expectEqual(@as(u64, 40), p.slice()[1].ns);
+    try std.testing.expectEqualStrings("matrix q6k ffn_down.weight", p.slice()[2].nameSlice());
+    try std.testing.expectEqual(@as(u64, 0 + 30), p.slice()[2].ns);
+    try std.testing.expectEqual(@as(u64, 200), p.slice()[2].bytes);
+    try std.testing.expectEqual(@as(u64, 20), p.tail_ns);
+    try std.testing.expectEqual(@as(u64, 120), p.gpu_ns);
+    try std.testing.expectEqual(@as(u32, 5), p.dispatches);
+    // more kinds than it keeps: the rest in its last entry
+    var q = any.Profile{};
+    var names: [any.MAX_PROFILE + 5][8]u8 = undefined;
+    for (&names, 0..) |*nm, i| {
+        const t = std.fmt.bufPrint(nm, "k{d}", .{i}) catch unreachable;
+        q.add(t, "", 1, 0);
+    }
+    try std.testing.expectEqual(@as(usize, any.MAX_PROFILE), q.n);
+    try std.testing.expectEqualStrings("(more kinds)", q.slice()[any.MAX_PROFILE - 1].nameSlice());
+    try std.testing.expectEqual(@as(u64, 6), q.slice()[any.MAX_PROFILE - 1].ns);
 }
 
 test "the any-GPU backend follows the CPU executor on an ideal GPU, and the CPU takes over from its state" {
@@ -761,6 +817,18 @@ fn depthAgainstCpu(caps: gpu.Caps, src: gguf.Source, tolerance: f64) !void {
         }
         const rel = try compare(pass, depth_work.logits[0..n], got, tolerance);
         std.debug.print("depthformer ({s}) pass {d}: logits within {e} of the CPU's, {d} of {d} its bits; {d} dispatches, {d} lane-ops\n", .{ if (caps.fused_fma) "fused" else "unfused", pass, rel, exact, n, depth.dispatches, emu.stats.lane_ops });
+    }
+    // Whole frames: the Speaker on the CPU's depthformer and on the GPU's
+    // (frameOn), the same sampling and seed: the same codes, frame by frame.
+    const L = gen.lfm3_audio_limits;
+    var on_cpu = gen.Speaker(L).init(gen.modelSampling(&audio_plan, 1234));
+    var on_gpu = gen.Speaker(L).init(gen.modelSampling(&audio_plan, 1234));
+    for (0..3) |f| {
+        for (state[0..audio_plan.backbone], 0..) |*v, i| v.* += @as(f32, @floatFromInt((i + f) % 7)) * 0.01;
+        const a = try on_cpu.frame(AUDIO_CAPACITY, src, &audio_index, &audio_plan, &depth_work, state[0..audio_plan.backbone], .{});
+        const b = try on_gpu.frameOn(&depth, &audio_plan, state[0..audio_plan.backbone]);
+        try std.testing.expectEqual(a.end, b.end);
+        try std.testing.expectEqualSlices(i32, &a.codes, &b.codes);
     }
 }
 

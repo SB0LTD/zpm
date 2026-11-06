@@ -48,8 +48,9 @@ const emu = nvidia.sm120_emu;
 
 /// Buffers an adapter tracks (allocated and not freed).
 pub const MAX_BUFFERS = 512;
-/// Dispatches one run takes.
-pub const MAX_DISPATCHES = 256;
+/// Dispatches one run takes (LFM3-Audio's decode step is ~280: one run, not
+/// two with a wait between).
+pub const MAX_DISPATCHES = 512;
 /// A dispatch's slot: its QMD at 0 (256-aligned), constant buffer 0 at
 /// 0x200 (64-aligned).
 pub const SLOT_BYTES = 0x600;
@@ -86,6 +87,7 @@ pub fn rtx5070(vram: u64) gpu.Caps {
         .dot4 = true,
         .import = false,
         .timestamp_hz = push.TIMESTAMP_HZ,
+        .max_run = MAX_DISPATCHES,
     };
 }
 
@@ -101,6 +103,10 @@ const Set = struct {
     pb: nv.Buffer = .{},
     /// Two timestamp reports (four words each).
     stamps: nv.Buffer = .{},
+    /// Profiling: each dispatch's QMD release (four words: its index, then
+    /// its completion timestamp), MAX_DISPATCHES of them.
+    ends: nv.Buffer = .{},
+    profiled: bool = false,
     fence: ?nv.Fence = null,
     dispatches: u32 = 0,
 };
@@ -117,6 +123,8 @@ pub const Adapter = struct {
     runs: u64 = 0,
     /// The waits for idle the last run took between its dispatches.
     barriers: u32 = 0,
+    /// Each dispatch's end timed (Device.profile).
+    profiling: bool = false,
     lost: u64 = 0,
     last_error: ?anyerror = null,
 
@@ -136,6 +144,8 @@ pub const Adapter = struct {
         .wait = wait,
         .done = done,
         .lastRunNs = lastRunNs,
+        .profile = profile,
+        .dispatchNs = dispatchNs,
     };
 
     fn self(ctx: *anyopaque) *Adapter {
@@ -230,6 +240,8 @@ pub const Adapter = struct {
             s.fence = null;
         }
         try a.setUp(s);
+        if (a.profiling and s.ends.cpu.len == 0) s.ends = a.rawOf(true).alloc(16 * MAX_DISPATCHES) catch return error.OutOfMemory;
+        s.profiled = a.profiling;
         var p = push.Push{ .buf = s.pb.words() };
         p.computeSetup(.{});
         p.invalidateShaderCaches();
@@ -250,6 +262,7 @@ pub const Adapter = struct {
                 .block = bin.group,
                 .shared_bytes = bin.shared_bytes,
             }) catch return error.BadProgram;
+            if (s.profiled) qmd.releaseStamp(q, s.ends.va + i * 16, @intCast(i));
             var params: [qmd.MAX_PARAMS]u8 = undefined;
             var n: usize = 0;
             for (d.buffers) |b| {
@@ -322,6 +335,29 @@ pub const Adapter = struct {
         const t0 = std.mem.readInt(u64, w[8..16], .little);
         const t1 = std.mem.readInt(u64, w[24..32], .little);
         return if (t1 > t0) (t1 - t0) * 1_000_000_000 / a.vram.timestamp_hz else 0;
+    }
+
+    fn profile(ctx: *anyopaque, on: bool) bool {
+        self(ctx).profiling = on;
+        return true;
+    }
+
+    fn dispatchNs(ctx: *anyopaque, out: []u64) usize {
+        const a = self(ctx);
+        const si = a.last_set orelse return 0;
+        const s = &a.sets[si];
+        if (!s.profiled or s.ends.cpu.len == 0) return 0;
+        const host = a.rawOf(true);
+        host.fromDevice(s.stamps, 0, 32);
+        const n = @min(out.len, s.dispatches);
+        host.fromDevice(s.ends, 0, n * 16);
+        const t0 = std.mem.readInt(u64, s.stamps.cpu[8..16], .little);
+        const hz = a.vram.timestamp_hz;
+        for (out[0..n], 0..) |*o, i| {
+            const t = std.mem.readInt(u64, s.ends.cpu[i * 16 + 8 ..][0..8], .little);
+            o.* = if (t > t0) (t - t0) * 1_000_000_000 / hz else 0;
+        }
+        return n;
     }
 };
 
@@ -504,6 +540,19 @@ test "a first kernel: out[i] = b[i] * 2.5 + a[i] + n through the adapter, QMDs a
         try testing.expectEqual(want, fo[j]);
     }
     try testing.expect(d.lastRunNs() > 0);
+    // Profiled: three dispatches, each one's end after the one before's
+    // (each reads what the one before wrote), the last within the run.
+    try testing.expect(d.profile(true));
+    defer _ = d.profile(false);
+    try runWait(d, &.{
+        .{ .prog = &prog, .groups = .{ 2, 1, 1 }, .buffers = &.{ ba, bb, bo }, .params = &.{7} },
+        .{ .prog = &prog, .groups = .{ 2, 1, 1 }, .buffers = &.{ bo, bb, ba }, .params = &.{1} },
+        .{ .prog = &prog, .groups = .{ 2, 1, 1 }, .buffers = &.{ ba, bb, bo }, .params = &.{2} },
+    });
+    var ends: [4]u64 = undefined;
+    try testing.expectEqual(@as(usize, 3), d.dispatchNs(&ends));
+    try testing.expect(ends[0] > 0 and ends[0] < ends[1] and ends[1] < ends[2]);
+    try testing.expect(ends[2] <= d.lastRunNs());
 }
 
 // ── LFM3's Q4_K matrix, rewritten in KIR ────────────────────────────────────
