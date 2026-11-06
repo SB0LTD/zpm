@@ -21,7 +21,7 @@ const kir = @import("kir.sig");
 
 pub const Vendor = enum { nvidia, qualcomm, amd, intel, apple, emulated };
 /// grows: sm_75..sm_90, ir3_a6xx, rdna3, xe, agx ...
-pub const Target = enum { interp, ir3_a7xx, sm_120 };
+pub const Target = enum { interp, ir3_a7xx, sm_120, gcn4_gfx803 };
 pub const MemoryModel = enum { unified, discrete };
 
 pub const Caps = struct {
@@ -418,6 +418,10 @@ const backend_ir3_a7xx = @import("kir_ir3.sig"); // Q
 
 const backend_sm_120 = @import("kir_sm120.sig"); // N
 
+//
+
+const backend_gcn4_gfx803 = @import("kir_gcn4.sig"); // the AMD GCN 4 backend
+
 const none = struct {
     pub fn compile(k: *const kir.Kernel, caps: Caps, work: *Work, out: []u8) Error!Binary {
         _ = k;
@@ -461,6 +465,7 @@ fn compileOne(comptime t: Target, k: *const kir.Kernel, caps: Caps, work: *Work,
         .interp => interpBinary(k, out),
         .ir3_a7xx => backend_ir3_a7xx.compile(k, caps, work, out),
         .sm_120 => backend_sm_120.compile(k, caps, work, out),
+        .gcn4_gfx803 => backend_gcn4_gfx803.compile(k, caps, work, out),
     };
 }
 
