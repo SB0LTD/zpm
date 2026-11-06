@@ -15,6 +15,10 @@
 //! - dl: the host program's functions found by name;
 //! - raster: the draw pipeline (vertices, setup, tiles) as KIR kernels;
 //! - glsl: the GLSL ES compiler (preprocessor, parser, checker);
+//! - dxbc: Direct3D's shader bytecode (the DXBC container, Shader Model 4
+//!   and 5's tokens), read in place;
+//! - dxbc_gen: a DXBC shader as the raster's KIR emitters (Direct3D's
+//!   draws on the same engine as GL's);
 //! - program: GL's shader and program objects, links and uniforms;
 //! - texture: texture reads in KIR (fetch, filters, wraps, sizes);
 //! - texfmt: GL's texture formats as stored, and their uploads;
@@ -38,6 +42,8 @@ pub const program = @import("program.sig");
 pub const texture = @import("texture.sig");
 pub const texfmt = @import("texfmt.sig");
 pub const glsl = @import("glsl/glsl.sig");
+pub const dxbc = @import("dxbc/dxbc.sig");
+pub const dxbc_gen = @import("dxbc/gen.sig");
 pub const report = @import("report.sig");
 
 test {
@@ -55,4 +61,6 @@ test {
     _ = glsl.pp;
     _ = glsl.parse;
     _ = glsl.sema;
+    _ = dxbc;
+    _ = dxbc_gen;
 }
