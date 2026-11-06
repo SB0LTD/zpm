@@ -120,6 +120,9 @@ pub const Options = struct {
     /// that many lanes a thread for every shape. Every layout is the CPU's
     /// bits (lfm3_kir): only the time differs.
     matrix_lanes: u32 = 0,
+    /// With matrix_lanes: the blocks an iteration too (0 or 1: one; 2 or
+    /// 4 where a shape's blocks are a multiple of it).
+    matrix_unroll: u32 = 0,
     /// The caller's clock (ns), for profileStep's account of a call's CPU
     /// side (null: not timed).
     clock: ?*const fn () u64 = null,
@@ -213,12 +216,23 @@ pub fn roleName(name: []const u8) []const u8 {
 
 pub const MATRIX_VARIANTS = kernels.MAX_TOKENS;
 /// The layouts a one-token matrix pass is tried in: lanes a thread (8 / lanes
-/// threads a row). Few long rows (ffn_down: 2048 rows of 30 blocks) want
-/// many threads a row; many short ones, fewer.
+/// threads a row) and blocks an iteration (kernels.Layout.unroll: that
+/// many blocks' weights in flight at once). Few long rows (ffn_down: 2048
+/// rows of 30 blocks) want many threads a row; many short ones, fewer.
 pub const LAYOUT_LANES = [_]u32{ 1, 2, 4 };
+pub const LAYOUT_UNROLLS = [_]u32{ 1, 2, 4 };
+pub const LAYOUTS = layouts: {
+    var out: [LAYOUT_LANES.len * LAYOUT_UNROLLS.len]kernels.Layout = undefined;
+    for (LAYOUT_UNROLLS, 0..) |un, ui| {
+        for (LAYOUT_LANES, 0..) |la, li| out[ui * LAYOUT_LANES.len + li] = .{ .lanes = la, .unroll = un };
+    }
+    break :layouts out;
+};
 /// A matrix shape of the model and the layout its one-token passes take,
-/// with what each layout took when timed (ns; 0: not timed).
-pub const Tuned = struct { q4: bool, rows: u32, blocks: u32, lanes: u32, ns: [LAYOUT_LANES.len]u64 = @splat(0) };
+/// with what each of LAYOUTS took a tensor when timed streaming over the
+/// shape's `tensors` (ns; 0: not timed, or the blocks are not a multiple
+/// of its unroll).
+pub const Tuned = struct { q4: bool, rows: u32, blocks: u32, lanes: u32, unroll: u32 = 1, tensors: u32 = 0, ns: [LAYOUTS.len]u64 = @splat(0) };
 pub const MAX_TUNED = 32;
 /// Dispatches one call may send (Work's capacity).
 pub const MAX_DISPATCHES = 4096;
@@ -249,10 +263,10 @@ pub const Work = struct {
 const Programs = struct {
     q4k: [MATRIX_VARIANTS]?Program = @splat(null),
     q6k: [MATRIX_VARIANTS]?Program = @splat(null),
-    /// One-token passes in each of LAYOUT_LANES (null where it is the
-    /// target's default, which q4k[0] and q6k[0] are, or does not build).
-    q4k1: [LAYOUT_LANES.len]?Program = @splat(null),
-    q6k1: [LAYOUT_LANES.len]?Program = @splat(null),
+    /// One-token passes in each of LAYOUTS (null where it is the target's
+    /// default, which q4k[0] and q6k[0] are, or does not build).
+    q4k1: [LAYOUTS.len]?Program = @splat(null),
+    q6k1: [LAYOUTS.len]?Program = @splat(null),
     norm_quant: ?Program = null,
     quant: ?Program = null,
     swiglu: ?Program = null,
@@ -500,9 +514,8 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             // (the other layouts of one-token passes: one that does not
             // build for this GPU is left out)
             const default_lanes = kernels.Layout.of(caps).lanes;
-            for (LAYOUT_LANES, 0..) |lanes, li| {
-                if (lanes == default_lanes) continue;
-                const lay = kernels.Layout{ .lanes = lanes };
+            for (LAYOUTS, 0..) |lay, li| {
+                if (lay.lanes == default_lanes and lay.unroll == 1) continue;
                 if (used.q4) self.build(&self.k.q4k1[li], kernels.matrixWith(s, caps, lay, .q4_k, 1)) catch {
                     self.k.q4k1[li] = null;
                 };
@@ -1861,11 +1874,11 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 var program: *const Program = if (prog.*) |*pp| pp else return error.Unsupported;
                 var groups = kernels.matrixGroups(self.caps, m.rows);
                 if (tokens == 1) {
-                    const lanes = self.lanesOf(m);
-                    if (self.matrixProgram(m.q4, lanes)) |alt| {
+                    const lay = self.layoutOf(m);
+                    if (m.blocks % lay.unroll == 0) if (self.matrixProgram(m.q4, lay)) |alt| {
                         program = alt;
-                        groups = kernels.matrixGroupsWith(.{ .lanes = lanes }, m.rows);
-                    }
+                        groups = kernels.matrixGroupsWith(lay, m.rows);
+                    };
                 }
                 l.named(if (m.q4) "matrix q4k" else "matrix q6k", m.tensor, first, tokens);
                 try l.add(program, groups, &.{ self.weights, s.act_q, s.act_d, s.act_sums, out }, &p.words(.q4_k));
@@ -1880,14 +1893,14 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             return self.tuned[0..self.n_tuned];
         }
 
-        /// The one-token program of `lanes` (the default's own, or an
+        /// The one-token program of `lay` (the default's own, or an
         /// alternate's); null when it was not built.
-        fn matrixProgram(self: *Self, q4: bool, lanes: u32) ?*const Program {
-            if (lanes == kernels.Layout.of(self.caps).lanes) {
+        fn matrixProgram(self: *Self, q4: bool, lay: kernels.Layout) ?*const Program {
+            if (lay.lanes == kernels.Layout.of(self.caps).lanes and lay.unroll == 1) {
                 const p = if (q4) &self.k.q4k[0] else &self.k.q6k[0];
                 return if (p.*) |*pp| pp else null;
             }
-            for (LAYOUT_LANES, 0..) |x, li| if (x == lanes) {
+            for (LAYOUTS, 0..) |x, li| if (x.lanes == lay.lanes and x.unroll == lay.unroll) {
                 const p = if (q4) &self.k.q4k1[li] else &self.k.q6k1[li];
                 return if (p.*) |*pp| pp else null;
             };
@@ -1895,19 +1908,22 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         }
 
         /// The layout a one-token pass over `m` takes.
-        fn lanesOf(self: *const Self, m: MatrixInfo) u32 {
+        fn layoutOf(self: *const Self, m: MatrixInfo) kernels.Layout {
             for (self.tuned[0..self.n_tuned]) |t| {
-                if (t.q4 == m.q4 and t.rows == m.rows and t.blocks == m.blocks) return t.lanes;
+                if (t.q4 == m.q4 and t.rows == m.rows and t.blocks == m.blocks) return .{ .lanes = t.lanes, .unroll = t.unroll };
             }
-            return kernels.Layout.of(self.caps).lanes;
+            return .{ .lanes = kernels.Layout.of(self.caps).lanes };
         }
 
         /// Every matrix shape of the model file, its one-token pass timed
-        /// in each layout on the model's own weights (the best of two runs
-        /// each, the device's timestamps), the fastest kept. With
-        /// options.matrix_lanes, that layout everywhere; where the device
-        /// keeps no timestamps, the default. Only time differs: a failure
-        /// here leaves the default.
+        /// in each layout on the model's own weights, streaming as a decode
+        /// step reads them: one dispatch for each of the shape's tensors
+        /// (every layer's; legion29's tuning ran one tensor again and again,
+        /// in the GPU's L2, and picked layouts for a cache the step never
+        /// has). The best of two runs each, the device's timestamps, the
+        /// fastest kept. With options.matrix_lanes, that layout everywhere;
+        /// where the device keeps no timestamps, the default. Only time
+        /// differs: a failure here leaves the default.
         fn tuneMatrices(self: *Self) void {
             const default_lanes = kernels.Layout.of(self.caps).lanes;
             for (self.index.tensors[0..self.index.tensor_count], 0..) |*t, ti| {
@@ -1929,15 +1945,22 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 if (self.n_tuned == MAX_TUNED) return;
                 var tu = Tuned{ .q4 = m.q4, .rows = m.rows, .blocks = m.blocks, .lanes = default_lanes };
                 if (self.options.matrix_lanes != 0) {
-                    if (self.matrixProgram(m.q4, self.options.matrix_lanes) != null) tu.lanes = self.options.matrix_lanes;
+                    const want = kernels.Layout{ .lanes = self.options.matrix_lanes, .unroll = @max(1, self.options.matrix_unroll) };
+                    if (m.blocks % want.unroll == 0 and self.matrixProgram(m.q4, want) != null) {
+                        tu.lanes = want.lanes;
+                        tu.unroll = want.unroll;
+                    }
                 } else {
                     var best: u64 = 0;
-                    for (LAYOUT_LANES, 0..) |lanes, li| {
-                        const ns = self.timeMatrix(m, lanes) orelse continue;
-                        tu.ns[li] = ns;
-                        if (best == 0 or ns < best) {
-                            best = ns;
-                            tu.lanes = lanes;
+                    for (LAYOUTS, 0..) |lay, li| {
+                        if (m.blocks % lay.unroll != 0) continue;
+                        const r = self.timeMatrix(m, lay) orelse continue;
+                        tu.ns[li] = r.ns;
+                        tu.tensors = r.tensors;
+                        if (best == 0 or r.ns < best) {
+                            best = r.ns;
+                            tu.lanes = lay.lanes;
+                            tu.unroll = lay.unroll;
                         }
                     }
                 }
@@ -1946,10 +1969,12 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             }
         }
 
-        /// One one-token pass over `m` in `lanes`: the device's time (ns,
-        /// the best of two), null when it cannot say.
-        fn timeMatrix(self: *Self, m: MatrixInfo, lanes: u32) ?u64 {
-            const prog = self.matrixProgram(m.q4, lanes) orelse return null;
+        /// A one-token pass over each of `m`'s shape's tensors (up to 32)
+        /// in `lay`, one dispatch each as a decode step sends them: the
+        /// device's time a tensor (ns, the best of two runs), and how many;
+        /// null when it cannot say.
+        fn timeMatrix(self: *Self, m: MatrixInfo, lay: kernels.Layout) ?struct { ns: u64, tensors: u32 } {
+            const prog = self.matrixProgram(m.q4, lay) orelse return null;
             const s = &self.s;
             // (the scratch it writes: the FFN's, or the logits' for the vocabulary)
             const out = if (@as(u64, m.rows) * 4 <= s.ffn_gate.bytes) s.ffn_gate else if (@as(u64, m.rows) * 4 <= self.out_logits.bytes) self.out_logits else return null;
@@ -1964,17 +1989,29 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 .act_sums = 0,
                 .out = 0,
             };
+            const want_type: u32 = if (m.q4) 12 else 14;
             var best: u64 = std.math.maxInt(u64);
+            var n: u32 = 0;
             for (0..2) |_| {
                 var l = List{ .work = self.work };
                 l.named("matrix (timed)", m.tensor, 0, 1);
-                l.add(prog, kernels.matrixGroupsWith(.{ .lanes = lanes }, m.rows), &.{ self.weights, s.act_q, s.act_d, s.act_sums, out }, &p.words(.q4_k)) catch return null;
+                n = 0;
+                for (self.index.tensors[0..self.index.tensor_count]) |*t| {
+                    if (t.dimension_count != 2 or t.ggml_type != want_type) continue;
+                    if (t.dimensions[1] != m.rows or t.dimensions[0] / quantized.QK_K != m.blocks) continue;
+                    var q = p;
+                    q.weights = @intCast(t.file_offset);
+                    l.add(prog, kernels.matrixGroupsWith(lay, m.rows), &.{ self.weights, s.act_q, s.act_d, s.act_sums, out }, &q.words(.q4_k)) catch return null;
+                    n += 1;
+                    if (n == 32) break;
+                }
+                if (n == 0) return null;
                 self.runNow(&l) catch return null;
                 const ns = self.dev.lastRunNs();
                 if (ns == 0) return null;
-                best = @min(best, ns);
+                best = @min(best, ns / n);
             }
-            return best;
+            return .{ .ns = best, .tensors = n };
         }
 
         fn tensorOf(self: *const Self, ref: lfm3.TensorRef) Error!*const gguf.TensorInfo {

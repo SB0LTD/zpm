@@ -407,14 +407,23 @@ test "...on non-coherent unified memory (every hand-over checked)" {
 }
 
 test "every matrix layout for one-token passes, asked for: the CPU's logits through the model" {
-    for ([_]u32{ 1, 2 }) |lanes| {
+    // (lanes a thread, blocks an iteration: a shape whose blocks are not a
+    // multiple of the unroll keeps one block an iteration)
+    for ([_][2]u32{ .{ 1, 1 }, .{ 2, 1 }, .{ 1, 2 }, .{ 4, 2 }, .{ 2, 4 } }) |lu| {
+        const lanes = lu[0];
+        const unroll = lu[1];
         try fixture.initialize();
         const plan = &fixture.plan;
         const src = fixture.source();
-        var backend = try Backend.init(makeDevice(.ideal), plan, &fixture.index, src, .{ .max_batch = 16, .attention_tokens = 8, .matrix_lanes = lanes }, &work);
+        var backend = try Backend.init(makeDevice(.ideal), plan, &fixture.index, src, .{ .max_batch = 16, .attention_tokens = 8, .matrix_lanes = lanes, .matrix_unroll = unroll }, &work);
         defer backend.deinit();
         try std.testing.expect(backend.tunings().len > 0);
-        for (backend.tunings()) |t| try std.testing.expectEqual(lanes, t.lanes);
+        for (backend.tunings()) |t| {
+            if (t.blocks % unroll == 0) {
+                try std.testing.expectEqual(lanes, t.lanes);
+                try std.testing.expectEqual(unroll, t.unroll);
+            } else try std.testing.expectEqual(@as(u32, 1), t.unroll);
+        }
         var gc = try backend.newCache(CONTEXT);
         defer backend.freeCache(&gc);
         var ccache = cpuCache(CONTEXT);
