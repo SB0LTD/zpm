@@ -139,6 +139,65 @@ pub fn flatVaryings(blob: []const u8, lay: Layout) u64 {
     return bits;
 }
 
+/// The constant buffers a shader declares: bit i for slot i, and each
+/// one's size in 16-byte vectors in `vecs`.
+pub fn constantBuffers(blob: []const u8, vecs: *[MAX_CBUFFERS]u32) u16 {
+    @memset(vecs, 0);
+    const c = dxbc.Container.parse(blob) catch return 0;
+    const p = c.program() catch return 0;
+    var bits: u16 = 0;
+    var rd = p.reader();
+    while (rd.next() catch return bits) |i| {
+        if (i.op != .dcl_constant_buffer or i.n == 0) continue;
+        const o = i.operands[0];
+        const slot = o.index[0].imm;
+        if (slot >= MAX_CBUFFERS) continue;
+        bits |= @as(u16, 1) << @intCast(slot);
+        vecs[slot] = o.index[1].imm;
+    }
+    return bits;
+}
+
+pub const MAX_CBUFFERS = 14;
+
+/// The (resource, sampler) pairs a shader reads, in the order it first
+/// reads them (NO_SAMPLER for ld and resinfo): at most out.len.
+pub fn texturePairs(blob: []const u8, out: [][2]u32) usize {
+    const c = dxbc.Container.parse(blob) catch return 0;
+    const p = c.program() catch return 0;
+    var n: usize = 0;
+    var rd = p.reader();
+    while (rd.next() catch return n) |i| {
+        const pair: [2]u32 = switch (i.op) {
+            .sample, .sample_l, .sample_b, .sample_d => .{ i.operands[2].index[0].imm, i.operands[3].index[0].imm },
+            .ld, .resinfo => .{ i.operands[2].index[0].imm, NO_SAMPLER },
+            else => continue,
+        };
+        var seen = false;
+        for (out[0..n]) |q| seen = seen or (q[0] == pair[0] and q[1] == pair[1]);
+        if (seen) continue;
+        if (n == out.len) break;
+        out[n] = pair;
+        n += 1;
+    }
+    return n;
+}
+
+/// One past a vertex shader's highest declared input register.
+pub fn inputRegisters(blob: []const u8) u32 {
+    const c = dxbc.Container.parse(blob) catch return 0;
+    const p = c.program() catch return 0;
+    var top: u32 = 0;
+    var rd = p.reader();
+    while (rd.next() catch return top) |i| switch (i.op) {
+        .dcl_input, .dcl_input_sgv, .dcl_input_siv => if (i.n > 0 and i.operands[0].reg == .input) {
+            top = @max(top, i.operands[0].index[0].imm + 1);
+        },
+        else => {},
+    };
+    return top;
+}
+
 /// The varying word of a signature's register `reg`, component `c`: its
 /// element's semantic's first word, plus the component's place in it.
 fn wordOf(sig: dxbc.Signature, lay: Layout, reg: u32, c: u2) ?u32 {
@@ -925,14 +984,17 @@ fn asF32(k: *kir.Kernel, a: Arg) kir.V {
 
 // ── A pipeline's shaders ───────────────────────────────────────────────────
 
-/// A Direct3D pipeline's vertex and pixel shaders and their layout, as the
-/// raster's Shaders (ctx: this Pair, which must outlive the pipeline). A
-/// shader that can't be generated draws nothing useful: its log says why
-/// (check it once, at the pipeline's first build).
+/// A Direct3D pipeline's vertex and pixel shaders and their layouts (each
+/// stage has its own constant buffer and texture slots), as the raster's
+/// Shaders (ctx: this Pair, which must outlive the pipeline). A shader that
+/// can't be generated draws nothing useful: its log says why (check it
+/// once, at the pipeline's first build).
 pub const Pair = struct {
     vs: []const u8,
     ps: []const u8,
     lay: Layout,
+    /// the pixel shader's (null: `lay`, as the vertex shader's)
+    ps_lay: ?Layout = null,
     log: *Log,
 
     pub fn shaders(p: *const Pair, attrs: u8, varyings: u8, textures: u8) raster.Shaders {
@@ -941,7 +1003,7 @@ pub const Pair = struct {
             .attrs = attrs,
             .varyings = varyings,
             .textures = textures,
-            .flat = flatVaryings(p.ps, p.lay),
+            .flat = flatVaryings(p.ps, p.ps_lay orelse p.lay),
             .quads = needsQuads(p.ps),
             .vertex = vtx,
             .fragment = frag,
@@ -955,7 +1017,7 @@ pub const Pair = struct {
 
     fn frag(ctx: ?*const anyopaque, k: *kir.Kernel, io: *raster.FragmentIO) void {
         const p: *const Pair = @ptrCast(@alignCast(ctx.?));
-        _ = fragment(p.ps, p.lay, k, io, p.log);
+        _ = fragment(p.ps, p.ps_lay orelse p.lay, k, io, p.log);
     }
 };
 

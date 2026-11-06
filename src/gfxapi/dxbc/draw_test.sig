@@ -172,4 +172,15 @@ test "Direct3D: a wrong stage or a damaged blob fails with a log, not a crash" {
     try std.testing.expect(!gen.needsQuads(&fx.ps40));
     try std.testing.expect(!gen.needsQuads(&fx.vs40));
     _ = &log;
+    // what a runtime reads off a shader before it builds a pipeline
+    var vecs: [gen.MAX_CBUFFERS]u32 = undefined;
+    try std.testing.expectEqual(@as(u16, 1), gen.constantBuffers(&fx.vs40, &vecs));
+    try std.testing.expectEqual(@as(u32, 4), vecs[0]);
+    try std.testing.expectEqual(@as(u16, 1), gen.constantBuffers(&fx.pstex40, &vecs));
+    try std.testing.expectEqual(@as(u32, 5), vecs[0]);
+    var pairs: [4][2]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), gen.texturePairs(&fx.pstex40, &pairs));
+    try std.testing.expectEqual([2]u32{ 0, 0 }, pairs[0]);
+    try std.testing.expectEqual(@as(usize, 0), gen.texturePairs(&fx.ps40, &pairs));
+    try std.testing.expectEqual(@as(u32, 2), gen.inputRegisters(&fx.vs40));
 }
