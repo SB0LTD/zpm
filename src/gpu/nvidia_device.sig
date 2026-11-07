@@ -52,8 +52,10 @@ pub const MAX_BUFFERS = 512;
 /// two with a wait between).
 pub const MAX_DISPATCHES = 512;
 /// A dispatch's slot: its QMD at 0 (256-aligned), constant buffer 0 at
-/// 0x200 (64-aligned).
-pub const SLOT_BYTES = 0x600;
+/// 0x200 (64-aligned), room for the biggest (qmd.CBUF0_MAX_BYTES: GL's
+/// kernels have more parameters than 1 KiB holds; a launch's QMD gives its
+/// own size, so only that much is written).
+pub const SLOT_BYTES = CBUF_AT + qmd.CBUF0_MAX_BYTES;
 const CBUF_AT = 0x200;
 /// Pushbuffer dwords: the set-up, then a dispatch's wait, invalidation and
 /// launch, then the end.
@@ -205,7 +207,7 @@ pub const Adapter = struct {
         if (bin.target != .sm_120 or bin.code.len == 0 or bin.code.len % 16 != 0) return error.BadProgram;
         if (bin.regs == 0 or bin.regs > 255) return error.BadProgram;
         if (bin.extra[kir_sm120.EXTRA_STACK] != 0) return error.Unsupported;
-        if (8 * @as(u32, bin.bindings) + 4 * @as(u32, bin.param_words) > qmd.MAX_PARAMS) return error.BadProgram;
+        if (8 * @as(u32, bin.bindings) + 4 * @as(u32, bin.param_words) > qmd.MAX_BIG_PARAMS) return error.BadProgram;
         const code = alloc(ctx, bin.code.len + CODE_GAP, .upload) orelse return error.OutOfMemory;
         @memcpy(code.cpu[0..bin.code.len], bin.code);
         @memset(code.cpu[bin.code.len..][0..CODE_GAP], 0);
@@ -250,10 +252,16 @@ pub const Adapter = struct {
         a.barriers = 0;
         for (ds, 0..) |d, i| {
             const bin = &d.prog.bin;
-            if (d.buffers.len != bin.bindings or d.params.len != bin.param_words) return error.BadProgram;
+            // (a dispatch may pass more words than its kernel reads, as on
+            // the Adreno and the interpreter: GL hands every draw kernel
+            // the pipeline's whole block; the kernel's own are copied)
+            if (d.buffers.len != bin.bindings or d.params.len < bin.param_words) return error.BadProgram;
+            const words = d.params[0..bin.param_words];
             const at = i * SLOT_BYTES;
             const q: *[qmd.QMD_WORDS]u32 = @ptrCast(@alignCast(s.slots.cpu[at..][0..qmd.QMD_BYTES]));
+            const param_bytes = 8 * d.buffers.len + 4 * words.len;
             qmd.build(q, .{
+                .cbuf_bytes = qmd.cbuf0Bytes(param_bytes),
                 .prog_va = d.prog.code.gpu,
                 .prog_bytes = bin.code.len,
                 .cbuf_va = s.slots.va + at + CBUF_AT,
@@ -263,18 +271,18 @@ pub const Adapter = struct {
                 .shared_bytes = bin.shared_bytes,
             }) catch return error.BadProgram;
             if (s.profiled) qmd.releaseStamp(q, s.ends.va + i * 16, @intCast(i));
-            var params: [qmd.MAX_PARAMS]u8 = undefined;
+            var params: [qmd.MAX_BIG_PARAMS]u8 = undefined;
             var n: usize = 0;
             for (d.buffers) |b| {
                 std.mem.writeInt(u64, params[n..][0..8], b.gpu, .little);
                 n += 8;
             }
-            for (d.params) |w| {
+            for (words) |w| {
                 std.mem.writeInt(u32, params[n..][0..4], w, .little);
                 n += 4;
             }
-            const cb: *[qmd.CBUF0_WORDS]u32 = @ptrCast(@alignCast(s.slots.cpu[at + CBUF_AT ..][0..qmd.CBUF0_BYTES]));
-            qmd.cbuf0(cb, d.groups, bin.group, params[0..n]) catch return error.BadProgram;
+            const cb: []u32 = @alignCast(std.mem.bytesAsSlice(u32, s.slots.cpu[at + CBUF_AT ..][0..qmd.CBUF0_MAX_BYTES]));
+            _ = qmd.cbuf0Into(cb, d.groups, bin.group, params[0..n]) catch return error.BadProgram;
             // (each dispatch sees the writes of those before it that it
             // meets; the others run with it)
             if (hz.barrierBefore(&d) and i > 0) {
@@ -458,6 +466,19 @@ fn freshEmu() gpu.Device {
     return T.dev.device();
 }
 
+test "kir_sm120's work fits the 16 MiB Galaxy's gfx_render compiles in (WebRender's kernels' limits)" {
+    const S = kir_sm120.State;
+    const parts = .{ "insts", "tys", "mi", "text", "words", "asm_work" };
+    var rest: usize = @sizeOf(S);
+    inline for (parts) |f| {
+        const n = @sizeOf(@FieldType(S, f));
+        rest -= n;
+        std.debug.print("{s} {d} KiB; ", .{ f, n >> 10 });
+    }
+    std.debug.print("the rest {d} KiB; WORK_BYTES {d} KiB\n", .{ rest >> 10, kir_sm120.WORK_BYTES >> 10 });
+    try testing.expect(kir_sm120.WORK_BYTES <= 16 << 20);
+}
+
 test "Emu over an emulator Work left undefined (a static `= undefined`): its controls are set by init" {
     @memset(std.mem.asBytes(&T.work.max_steps), 0);
     T.work.check_hazards = false;
@@ -523,8 +544,11 @@ test "a first kernel: out[i] = b[i] * 2.5 + a[i] + n through the adapter, QMDs a
     const z2 = k.op2(.fadd, .f32, r(z), r(nf));
     k.store(.f32, kir.global(O, 32), r(off), r(z2));
     try k.finish();
-    var wmem: [kir_sm120.WORK_BYTES]u8 align(64) = undefined;
-    var work = gpu.Work.init(&wmem);
+    // (static: the work is megabytes, too much for a stack)
+    const W = struct {
+        var mem: [kir_sm120.WORK_BYTES]u8 align(64) = undefined;
+    };
+    var work = gpu.Work.init(&W.mem);
     const bin = try gpu.compile(&k, d.caps, &work, &T.code);
     try testing.expectEqual(gpu.Target.sm_120, bin.target);
     const prog = try d.load(&bin);

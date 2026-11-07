@@ -3,12 +3,12 @@
 //! linked through GL's shader and program objects (which also generate
 //! and verify both stages' KIR); then each program's draw kernels
 //! (vertices, setup, tiles) built and compiled for the Surface's Adreno
-//! (ir3), as a first draw would. Every variant must link and every
-//! kernel compile for ir3.
-//!
-//! The PC's RTX (sm_120) is tried too, and only reported: its backend
-//! takes kernels of up to 4096 KIR instructions after division and root
-//! expansions, and most of WebRender's vertex kernels are larger.
+//! (ir3) and the PC's RTX (sm_120), as a first draw would. Every variant
+//! must link and every kernel compile for both, each in the 16 MiB of
+//! compile work Galaxy's gfx_render gives (WebRender's largest kernels
+//! are several times what sm_120 took before 2026-11-07: 4096 KIR
+//! instructions after the expansions). The largest sm_120 kernel and the
+//! slowest compile are reported.
 //!
 //! Firefox's sources are not part of zpm (they are Mozilla's, under the
 //! MPL): set GFXAPI_WR_RES to a checkout's `gfx/wr/webrender/res`. Without
@@ -202,20 +202,35 @@ var log: [4096]u8 = undefined;
 var k_insts: [engine.MAX_KIR]kir.Inst = undefined;
 var k_tys: [engine.MAX_KIR]kir.Ty = undefined;
 var code: [engine.PIPE_CODE]u8 align(16) = undefined;
-var work_mem: [16 << 20]u8 align(64) = undefined;
+var work_mem: [@max(gpu.kir_ir3.WORK_BYTES, gpu.nvidia_device.kir_sm120.WORK_BYTES)]u8 align(64) = undefined;
 
 const Target = struct { name: []const u8, caps: gpu.Caps, required: bool };
 const targets = [_]Target{
     .{ .name = "ir3", .caps = gpu.adreno_device.x1_45_caps(1 << 30), .required = true },
-    .{ .name = "sm_120", .caps = gpu.nvidia_device.rtx5070(8 << 30), .required = false },
+    .{ .name = "sm_120", .caps = gpu.nvidia_device.rtx5070(8 << 30), .required = true },
 };
 
 const Stage = enum { vertex, setup, raster };
 var last_insts: usize = 0;
 
+/// The largest sm_120 kernel (KIR instructions as built; machine
+/// instructions) and the slowest sm_120 compile (ns), and which.
+var max_kir: usize = 0;
+var max_mi: u32 = 0;
+/// Inside the backend: KIR after the expansions, machine instructions and
+/// labels before the text, virtual registers (kir_sm120's MAX_INSTS,
+/// MAX_MI, MAX_VREGS).
+var max_xkir: u32 = 0;
+var max_xmi: u32 = 0;
+var max_vregs: u32 = 0;
+var max_ns: i96 = 0;
+var max_what: [96]u8 = undefined;
+var max_what_len: usize = 0;
+
 /// A pipeline's kernel built and compiled for `t`: its KIR instructions,
-/// registers and code bytes, or why not.
-fn compileStage(pipe: *const raster.Pipeline, st: Stage, t: Target) !struct { insts: usize, regs: u32, bytes: usize } {
+/// registers, code bytes and machine instructions (sm_120), and the
+/// compile's time, or why not.
+fn compileStage(pipe: *const raster.Pipeline, st: Stage, t: Target) !struct { insts: usize, regs: u32, bytes: usize, mi: u32, ns: i96 } {
     const storage = kir.Storage{ .insts = &k_insts, .tys = &k_tys };
     var k = switch (st) {
         .vertex => raster.vertexKernel(storage, pipe),
@@ -225,8 +240,17 @@ fn compileStage(pipe: *const raster.Pipeline, st: Stage, t: Target) !struct { in
     try k.finish();
     last_insts = k.n;
     var w = gpu.Work.init(&work_mem);
+    const t0 = std.Io.Clock.awake.now(std.testing.io);
     const bin = try gpu.compile(&k, t.caps, &w, &code);
-    return .{ .insts = k.n, .regs = bin.regs, .bytes = bin.code.len };
+    const ns = t0.durationTo(std.Io.Clock.awake.now(std.testing.io)).nanoseconds;
+    const sm = gpu.nvidia_device.kir_sm120;
+    const mi: u32 = if (t.caps.target == .sm_120) bin.extra[sm.EXTRA_INSTRUCTIONS] else 0;
+    if (t.caps.target == .sm_120) {
+        max_xkir = @max(max_xkir, bin.extra[sm.EXTRA_KIR]);
+        max_xmi = @max(max_xmi, bin.extra[sm.EXTRA_MI_VREGS] >> 16);
+        max_vregs = @max(max_vregs, (bin.extra[sm.EXTRA_MI_VREGS] & 0xffff) * 2);
+    }
+    return .{ .insts = k.n, .regs = bin.regs, .bytes = bin.code.len, .mi = mi, .ns = ns };
 }
 var env_mem: [256 * 1024]u8 = undefined;
 
@@ -318,13 +342,24 @@ test "webrender: every shader variant compiles and links" {
                     continue;
                 };
                 if (st == .raster) std.debug.print(" | {s} raster {d} KIR, {d} regs, {d} B", .{ t.name, r.insts, r.regs, r.bytes });
+                if (t.caps.target == .sm_120) {
+                    if (st == .vertex) std.debug.print(" | sm_120 vertex {d} KIR, {d} instrs, {d} regs, {d} us", .{ r.insts, r.mi, r.regs, @divTrunc(r.ns, 1000) });
+                    if (r.insts > max_kir) max_kir = r.insts;
+                    if (r.mi > max_mi) max_mi = r.mi;
+                    if (r.ns > max_ns) {
+                        max_ns = r.ns;
+                        const named = std.fmt.bufPrint(&max_what, "{s} [{s}] {s}", .{ v.name, v.features, @tagName(st) }) catch "";
+                        max_what_len = named.len;
+                    }
+                }
             }
         }
         std.debug.print("\n", .{});
         program.useProgram(c, 0);
         _ = c.getError();
     }
-    std.debug.print("webrender: {d} of {d} variants link; {d} ir3 kernels do not compile ({d} sm_120 kernels, reported)\n", .{ variants.len - failed, variants.len, no_code, reported });
+    std.debug.print("webrender: {d} of {d} variants link; {d} kernels do not compile ({d} not required)\n", .{ variants.len - failed, variants.len, no_code, reported });
+    std.debug.print("webrender on sm_120: the largest kernel {d} KIR, {d} machine instructions; the slowest compile {d} us ({s}); inside the backend at most {d} KIR expanded, {d} MI, {d} vregs\n", .{ max_kir, max_mi, @divTrunc(max_ns, 1000), max_what[0..max_what_len], max_xkir, max_xmi, max_vregs });
     try std.testing.expectEqual(@as(usize, 0), failed);
     try std.testing.expectEqual(@as(usize, 0), no_code);
 }

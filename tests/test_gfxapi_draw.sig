@@ -380,6 +380,49 @@ test "draw: the scene on the emulated Adreno (ir3) gives the CPU's bytes" {
     a_gpu.close();
 }
 
+/// The emulated RTX (kir_sm120's code in sm120_emu, hazard checks on;
+/// discrete memory, as the PC's), the PC's GL device.
+const Rtx = struct {
+    const nvidia = @import("nvidia");
+    // (the emulator's memory is bump-allocated: a scene's draws use more
+    // than they keep)
+    var arena: [128 << 20]u8 align(4096) = undefined;
+    var view: [128 << 20]u8 align(4096) = undefined;
+    var emu_work: nvidia.sm120_emu.Work = undefined;
+    var dev: gpu.nvidia_device.Emu = undefined;
+    var work: [gpu.nvidia_device.kir_sm120.WORK_BYTES]u8 align(64) = undefined;
+};
+var eng_rtx: engine.Engine = undefined;
+var out_rtx: Out = .{};
+
+test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CPU's bytes" {
+    const want = try cpuOut();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work });
+    try std.testing.expect(eng_rtx.onGpu());
+    scene(&eng_rtx, &out_rtx) catch |e| {
+        std.debug.print("rtx scene: {s}; the emulator's memory used {d} KiB of {d}, regions {d}; the engine lost the GPU {} ({?s}), its pipeline error {?s}\n", .{ @errorName(e), Rtx.dev.raw.used >> 10, Rtx.arena.len >> 10, Rtx.dev.raw.n_regions, eng_rtx.lost, if (eng_rtx.why) |w| @errorName(w) else null, if (eng_rtx.why_pipe) |w| @errorName(w) else null });
+        if (Rtx.dev.lastError()) |le| {
+            var buf: [512]u8 = undefined;
+            std.debug.print("sm120_emu: {s}: {s}\n", .{ @errorName(le), Rtx.dev.explain(&buf) });
+        }
+        return e;
+    };
+    if (eng_rtx.why_pipe) |e| std.debug.print("rtx pipeline: {s}\n", .{@errorName(e)});
+    if (Rtx.dev.lastError()) |e| {
+        var buf: [512]u8 = undefined;
+        std.debug.print("sm120_emu: {s}: {s}\n", .{ @errorName(e), Rtx.dev.explain(&buf) });
+    }
+    try std.testing.expect(eng_rtx.why_pipe == null);
+    try std.testing.expect(!eng_rtx.lost);
+    try check(&out_rtx);
+    try std.testing.expectEqualSlices(u8, &want.fbo, &out_rtx.fbo);
+    try std.testing.expectEqualSlices(u8, &want.win, &out_rtx.win);
+    // (every draw's three kernels ran on the RTX, compiled to sm_120)
+    try std.testing.expect(eng_rtx.stats.dispatches >= 3 * 9);
+    eng_rtx.deinit();
+}
+
 // ── GALAXY_GL_CHECK: the GPU's work against the CPU's ──────────────────────
 
 var check_mem: [4 << 20]u8 align(64) = undefined;

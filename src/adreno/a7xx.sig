@@ -262,6 +262,9 @@ pub const Stream = struct {
     }
 
     /// Constants c[first_vec4..] from `dwords` (a multiple of 4 dwords).
+    /// (Direct, in the stream: the Surface's X1-45 put constants the CP
+    /// loaded from memory into c2.. at c0 instead, 11-06; gpu's
+    /// adreno_device loads all of a dispatch's at once from c0.)
     pub fn constants(s: *Stream, first_vec4: u32, dwords: []const u32) void {
         const units: u32 = @intCast((dwords.len + 3) / 4);
         s.emit(pkt7(CP_LOAD_STATE6_FRAG, 3 + units * 4));
@@ -271,11 +274,6 @@ pub const Stream = struct {
         for (dwords) |v| s.emit(v);
         var pad = units * 4 - dwords.len;
         while (pad > 0) : (pad -= 1) s.emit(0);
-    }
-
-    /// Constants loaded by the CP from memory (vec4 units, 16-byte aligned).
-    pub fn constantsFrom(s: *Stream, first_vec4: u32, va: u64, vec4s: u32) void {
-        s.pkt(CP_LOAD_STATE6_FRAG, &.{ first_vec4 | (ST6_CONSTANTS << 14) | (SS6_INDIRECT << 16) | (SB6_CS_SHADER << 18) | (vec4s << 22), @truncate(va), @truncate(va >> 32) });
     }
 
     /// Launch `groups` workgroups of the programmed kernel.
