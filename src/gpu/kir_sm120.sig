@@ -89,7 +89,9 @@
 //!   v03_00 (Ampere, Ada), v04_00 (Hopper), v05_00 (Blackwell).
 //!
 //! Allocation-free: the State comes from the caller's device.Work
-//! (WORK_BYTES: 4.46 MB), the code goes to the caller's bytes.
+//! (WORK_BYTES: 13.6 MiB, inside the 16 MiB Galaxy's gfx_render gives: kernels
+//! of up to 16384 KIR instructions after the expansions, as WebRender's
+//! largest need about 8800), the code goes to the caller's bytes.
 
 const std = @import("std");
 const kir = @import("kir.sig");
@@ -99,13 +101,13 @@ const sm120_asm = nvidia.sm120_asm;
 
 /// KIR instructions after expansion, and virtual registers (KIR's and the
 /// backend's own).
-pub const MAX_INSTS = 4096;
+pub const MAX_INSTS = 16384;
 pub const MAX_VREGS = 16384;
 /// Machine instructions and labels before the text.
-pub const MAX_MI = 6144;
-pub const MAX_LOOPS = 64;
-pub const MAX_DEPTH = 16;
-pub const TEXT_BYTES = 512 * 1024;
+pub const MAX_MI = 16384;
+pub const MAX_LOOPS = 256;
+pub const MAX_DEPTH = 32;
+pub const TEXT_BYTES = 1536 * 1024;
 /// The highest general register handed out: sm120_asm counts the highest
 /// plus 3, and a QMD takes up to 255.
 pub const MAX_GPR: u8 = 252;
@@ -247,6 +249,8 @@ pub const State = struct {
     // machine instructions over virtual registers
     mi: [MAX_MI]MI = undefined,
     n_mi: usize = 0,
+    /// KIR instructions after the expansions.
+    n_kir: u32 = 0,
     nv: u32 = 0,
     cls: [MAX_VREGS]Cls = undefined,
     /// A register's unit (an aligned run it is allocated in) and place.
@@ -259,6 +263,10 @@ pub const State = struct {
     phys: [MAX_VREGS]u8 = undefined,
     /// A predicate kept in a general register (its `home`).
     spilled: [MAX_VREGS]bool = undefined,
+    /// liveness's scratch: a unit's definitions in a loop so far, and
+    /// whether the loop carries it (Ctx.carriedIn).
+    defs: [MAX_VREGS]u16 = undefined,
+    carry: [MAX_VREGS]bool = undefined,
     order: [MAX_VREGS]u16 = undefined,
     loops: [MAX_LOOPS][2]u32 = undefined,
     n_loops: usize = 0,
@@ -299,6 +307,11 @@ pub const EXTRA_INSTRUCTIONS = 0;
 pub const EXTRA_STACK = 1;
 pub const EXTRA_BARRIERS = 2;
 pub const EXTRA_PARAM_BYTES = 3;
+/// The kernel's size inside the backend, for its limits: KIR instructions
+/// after the expansions (MAX_INSTS), and machine instructions and labels
+/// before the text (MAX_MI) << 16 | virtual registers / 2 (MAX_VREGS).
+pub const EXTRA_KIR = 4;
+pub const EXTRA_MI_VREGS = 5;
 
 // ── Compiling ───────────────────────────────────────────────────────────────
 
@@ -335,6 +348,8 @@ pub fn compileIn(k: *const kir.Kernel, caps: device.Caps, st: *State, out: []u8,
     bin.extra[EXTRA_STACK] = ak.stack;
     bin.extra[EXTRA_BARRIERS] = 1;
     bin.extra[EXTRA_PARAM_BYTES] = ak.params;
+    bin.extra[EXTRA_KIR] = st.n_kir;
+    bin.extra[EXTRA_MI_VREGS] = @as(u32, @intCast(st.n_mi)) << 16 | (st.nv >> 1);
     return bin;
 }
 
@@ -412,6 +427,7 @@ const Ctx = struct {
         if (x.err) |e| return e;
         c.n = x.n;
         c.nv_kir = x.nv;
+        c.w.n_kir = @intCast(x.n);
     }
 
     // ── 2. Analysis ─────────────────────────────────────────────────────
@@ -2021,6 +2037,9 @@ const Ctx = struct {
             for (w.loops[0..w.n_loops]) |lp| {
                 const s = lp[0];
                 const e = lp[1];
+                c.carriedIn(s, e);
+                // (tests: the one-unit form agrees, where it is cheap)
+                const check = @import("builtin").is_test and @as(u64, nv) * (e - s + 1) < 1_000_000;
                 for (0..nv) |vi| {
                     if (w.lead[vi] != vi) continue;
                     const f = w.first[vi];
@@ -2028,7 +2047,8 @@ const Ctx = struct {
                     if (f == std.math.maxInt(u32)) continue;
                     // referenced inside, and live before or after it
                     if (l < s or f > e) continue;
-                    if (f < s or l > e or c.carried(@intCast(vi), s, e)) {
+                    if (check and w.carry[vi] != c.carried(@intCast(vi), s, e)) @panic("kir_sm120: carriedIn and carried disagree");
+                    if (f < s or l > e or w.carry[vi]) {
                         if (f > s or l < e) {
                             w.first[vi] = @min(f, s);
                             w.last[vi] = @max(l, e);
@@ -2040,8 +2060,47 @@ const Ctx = struct {
         }
     }
 
+    /// `carried` for every unit at once (w.carry), in one pass over the
+    /// loop [s, e]: each operand in the order `carried` looks at them, a
+    /// count of each unit's definitions so far. (WebRender's tile loops
+    /// hold most of their kernel: `carried` a unit at a time took seconds.)
+    fn carriedIn(c: *const Ctx, s: u32, e: u32) void {
+        const w = c.w;
+        const nv = w.nv;
+        @memset(w.defs[0..nv], 0);
+        @memset(w.carry[0..nv], false);
+        var i = s;
+        while (i <= e) : (i += 1) {
+            const m = &w.mi[i];
+            if (m.kind != .inst) continue;
+            for (m.o[0..m.n], 0..) |o, k| {
+                const v: u16 = switch (o) {
+                    .reg => |r| if (r.v != NOV) w.lead[r.v] else NOV,
+                    .pred => |p| p.v,
+                    .mem => |x| if (x.base != NOV) w.lead[x.base] else NOV,
+                    else => NOV,
+                };
+                if (v == NOV) continue;
+                if (k < m.nd and o != .mem) {
+                    w.defs[v] +|= 1;
+                    if (m.guard != .none) w.carry[v] = true;
+                } else if (w.defs[v] == 0) w.carry[v] = true;
+            }
+            switch (m.guard) {
+                .pred => |p| if (p.v != NOV and w.defs[p.v] == 0) {
+                    w.carry[p.v] = true;
+                },
+                else => {},
+            }
+        }
+        for (w.defs[0..nv], w.carry[0..nv]) |d, *cy| {
+            if (d > 1) cy.* = true;
+        }
+    }
+
     /// A value read in the loop [s, e] before it is written there (in
     /// order), or written more than once: carried around the back edge.
+    /// (One unit; carriedIn does them all, the same way: tests compare.)
     fn carried(c: *const Ctx, v: u16, s: u32, e: u32) bool {
         const w = c.w;
         var defs: usize = 0;

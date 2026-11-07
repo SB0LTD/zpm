@@ -128,12 +128,29 @@ pub const Error = sm120.Error || error{
 pub const Region = struct { va: u64, bytes: []u8 };
 
 pub const Memory = struct {
+    /// Apart from each other; more than SORTED_FROM of them sorted by va
+    /// (EmuDevice keeps them so: a GL scene makes hundreds of buffers).
     regions: []const Region,
 
+    pub const SORTED_FROM = 16;
+
     pub fn find(m: *const Memory, va: u64, len: usize) ?[]u8 {
-        for (m.regions) |r| {
-            if (va >= r.va and va - r.va <= r.bytes.len and len <= r.bytes.len - (va - r.va)) return r.bytes[@intCast(va - r.va)..][0..len];
+        if (m.regions.len <= SORTED_FROM) {
+            for (m.regions) |r| {
+                if (va >= r.va and va - r.va <= r.bytes.len and len <= r.bytes.len - (va - r.va)) return r.bytes[@intCast(va - r.va)..][0..len];
+            }
+            return null;
         }
+        // (the last region at or below va)
+        var lo: usize = 0;
+        var hi: usize = m.regions.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (m.regions[mid].va <= va) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        const r = m.regions[lo - 1];
+        if (va - r.va <= r.bytes.len and len <= r.bytes.len - (va - r.va)) return r.bytes[@intCast(va - r.va)..][0..len];
         return null;
     }
 };

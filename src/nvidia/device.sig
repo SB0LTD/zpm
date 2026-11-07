@@ -102,7 +102,8 @@ pub const Device = struct {
 
 // ── The emulated GPU ────────────────────────────────────────────────────────
 
-pub const EMU_MAX_BUFFERS = 64;
+/// (a GL scene makes hundreds: its images, buffers and pipelines' code)
+pub const EMU_MAX_BUFFERS = 1024;
 pub const EMU_MAX_PROGRAMS = 16;
 const ICACHE = 16;
 /// The compute engine's methods, by address / 4.
@@ -203,7 +204,10 @@ pub const EmuDevice = struct {
         // (fresh memory reads as zeros from both sides, as the drivers' does)
         @memset(bytes, 0);
         @memset(seen, 0);
-        e.regions[e.n_regions] = .{ .va = va, .bytes = seen };
+        // (kept in order of va: emu.Memory.find searches them by halves)
+        var at_r: usize = e.n_regions;
+        while (at_r > 0 and e.regions[at_r - 1].va > va) : (at_r -= 1) e.regions[at_r] = e.regions[at_r - 1];
+        e.regions[at_r] = .{ .va = va, .bytes = seen };
         e.n_regions += 1;
         return .{ .va = va, .cpu = bytes, .handle = @intCast(e.n_regions) };
     }

@@ -66,14 +66,27 @@ pub const MAX_SHARED: u32 = 100 * 1024;
 const SM_SPLITS_KIB = [_]u32{ 32, 64, 100 };
 pub const SM_CONFIG_MAX: u32 = 0x1a;
 
-/// Constant buffer 0, 0x400 bytes (the QMD has its size in 16-byte units):
-/// the driver's 224 words (0x380 bytes, what CUDA kernels read on
-/// Blackwell), then the kernel's parameters.
+/// Constant buffer 0, 0x400 bytes (the QMD has its size in 16-byte units,
+/// up to 128 KiB): the driver's 224 words (0x380 bytes, what CUDA kernels
+/// read on Blackwell), then the kernel's parameters.
 pub const CBUF0_WORDS = 0x100;
 pub const DRIVER_WORDS = 224;
 pub const CBUF0_BYTES: u32 = CBUF0_WORDS * 4;
 pub const PARAMS_OFFSET: u32 = DRIVER_WORDS * 4;
 pub const MAX_PARAMS = (CBUF0_WORDS - DRIVER_WORDS) * 4;
+/// A bigger constant buffer 0 for a kernel with more parameters than 0x400
+/// bytes hold (GL's raster kernel: 54 words and its bindings), up to
+/// CBUF0_MAX_BYTES (cbuf0Into; gpu.nvidia_device's slots keep that room).
+pub const CBUF0_MAX_BYTES: u32 = 0x1000;
+pub const MAX_BIG_PARAMS = CBUF0_MAX_BYTES - PARAMS_OFFSET;
+
+/// Constant buffer 0's size for a launch with `params` bytes of
+/// parameters: the driver's words and them, in 16-byte units, at least
+/// CBUF0_BYTES (what every launch had before 2026-11-07).
+pub fn cbuf0Bytes(params: usize) u32 {
+    const used: u32 = @intCast((PARAMS_OFFSET + params + 15) & ~@as(usize, 15));
+    return @max(CBUF0_BYTES, used);
+}
 
 /// Where constant buffer 0 has what a kernel reads (bytes).
 pub const CB_DESCRIPTOR: u32 = 0x358; // a global memory descriptor (desc[UR4]): 0
@@ -195,6 +208,8 @@ pub const Shape = struct {
     /// The kernel's own shared memory, after the reserved 1 KiB.
     shared_bytes: u32 = 0,
     sass: u32 = SASS_SM120,
+    /// Constant buffer 0's size (cbuf0Bytes of the launch's parameters).
+    cbuf_bytes: u32 = CBUF0_BYTES,
 };
 
 /// A CTA's shared memory as the QMD has it: the reserved 1 KiB and the
@@ -229,6 +244,7 @@ pub fn build(q: *[QMD_WORDS]u32, s: Shape) Error!void {
         @as(u64, s.block[0]) * s.block[1] * s.block[2] > 1024) return error.OutOfRange;
     if (s.grid[0] == 0 or s.grid[1] == 0 or s.grid[2] == 0 or s.grid[0] > 0x7fff_ffff or s.grid[1] > 0xffff or s.grid[2] > 0xffff) return error.OutOfRange;
     if (s.registers == 0 or s.registers > 255) return error.OutOfRange;
+    if (s.cbuf_bytes & 0xf != 0 or s.cbuf_bytes < PARAMS_OFFSET or s.cbuf_bytes > CBUF0_MAX_BYTES) return error.OutOfRange;
     if (s.local_bytes & 0xf != 0 or s.local_bytes >> 4 > 0xffff) return error.OutOfRange;
     if (s.prog_va & 0xff != 0 or s.cbuf_va & 0x3f != 0) return error.OutOfRange;
     const shared = try sharedTotal(s.shared_bytes);
@@ -264,7 +280,7 @@ pub fn build(q: *[QMD_WORDS]u32, s: Shape) Error!void {
     put(&t, F.GRID_DEPTH, s.grid[2]);
     put(&t, F.cbAddrLower(0), (s.cbuf_va >> 6) & 0xffff_ffff);
     put(&t, F.cbAddrUpper(0), s.cbuf_va >> 38);
-    put(&t, F.cbSize(0), CBUF0_BYTES >> 4);
+    put(&t, F.cbSize(0), s.cbuf_bytes >> 4);
     put(&t, F.cbValid(0), 1);
     put(&t, F.cbInvalidate(0), 1);
     put(&t, F.PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED, (s.prog_va >> 8) & 0xffff_ffff);
@@ -372,7 +388,17 @@ pub fn decode(q: *const [QMD_WORDS]u32) Error!Launch {
 /// (223), then the parameters (from 0x380).
 pub fn cbuf0(c: *[CBUF0_WORDS]u32, grid: [3]u32, block: [3]u32, params: []const u8) Error!void {
     if (params.len > MAX_PARAMS) return error.TooManyParams;
-    @memset(c, 0);
+    _ = try cbuf0Into(c, grid, block, params);
+}
+
+/// The same into `c`, which has room for cbuf0Bytes(params.len) (up to
+/// CBUF0_MAX_BYTES): the bytes the launch's QMD gives (Shape.cbuf_bytes).
+/// Only those are written.
+pub fn cbuf0Into(c: []u32, grid: [3]u32, block: [3]u32, params: []const u8) Error!u32 {
+    if (params.len > MAX_BIG_PARAMS) return error.TooManyParams;
+    const bytes = cbuf0Bytes(params.len);
+    if (c.len * 4 < bytes) return error.TooManyParams;
+    @memset(c[0 .. bytes / 4], 0);
     c[188] = @truncate(SHARED_WINDOW);
     c[189] = @truncate(SHARED_WINDOW >> 32);
     c[190] = @truncate(LOCAL_WINDOW);
@@ -381,6 +407,7 @@ pub fn cbuf0(c: *[CBUF0_WORDS]u32, grid: [3]u32, block: [3]u32, params: []const 
     c[CB_GRID / 4 ..][0..3].* = grid;
     c[CB_STACK_TOP / 4] = STACK_TOP;
     @memcpy(std.mem.sliceAsBytes(c[DRIVER_WORDS..])[0..params.len], params);
+    return bytes;
 }
 
 // ── Local memory ────────────────────────────────────────────────────────────

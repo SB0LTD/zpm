@@ -69,7 +69,8 @@ const K = struct {
     var insts: [16384]kir.Inst = undefined;
     var tys: [16384]kir.Ty = undefined;
     var interp_mem: [16 << 20]u8 align(64) = undefined;
-    var compile_mem: [8 << 20]u8 align(64) = undefined;
+    // (the backends' own: kir_sm120's is 13.6 MiB since WebRender's kernels)
+    var compile_mem: [@max(gpu.kir_ir3.WORK_BYTES, gpu.nvidia_device.kir_sm120.WORK_BYTES)]u8 align(64) = undefined;
     var code: [512 << 10]u8 align(16) = undefined;
 };
 

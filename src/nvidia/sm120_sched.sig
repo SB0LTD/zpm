@@ -48,7 +48,7 @@ const std = @import("std");
 const sm120 = @import("sm120.sig");
 const lat = @import("sm120_latency.sig");
 
-pub const MAX_INSTRS = 4096;
+pub const MAX_INSTRS = 16384;
 pub const BARS = 6;
 
 pub const Error = error{

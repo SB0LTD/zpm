@@ -34,7 +34,9 @@ const sm120 = @import("sm120.sig");
 const sched = @import("sm120_sched.sig");
 
 pub const MAX_INSTRS = sched.MAX_INSTRS;
-pub const MAX_LABELS = 128;
+/// (WebRender's vertex kernels branch a lot: an if takes up to three
+/// labels, a loop two)
+pub const MAX_LABELS = 2048;
 
 pub const Error = sm120.Error || sched.Error || error{
     TooManyLabels,
@@ -102,6 +104,7 @@ pub const Work = struct {
     slots: [MAX_INSTRS]sched.Slot = undefined,
     /// Each instruction's byte address (after the schedule's NOPs).
     at: [MAX_INSTRS + 1]u64 = undefined,
+    labels: [MAX_LABELS]Label = undefined,
     sched: sched.Work = .{},
 };
 
@@ -114,7 +117,7 @@ fn nop(stall: u4) sm120.Word {
 /// `text`'s kernel into `out` (two u64 an instruction, the count rounded up
 /// to 8).
 pub fn assemble(text: []const u8, out: []u64, work: *Work) Error!Kernel {
-    var labels: [MAX_LABELS]Label = undefined;
+    const labels = &work.labels;
     var n_labels: usize = 0;
     var k = Kernel{ .code = out[0..0], .count = 0, .registers = 0 };
     // Pass 1: the headers, the labels, the instructions parsed.
