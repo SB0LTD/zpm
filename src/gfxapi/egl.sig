@@ -41,6 +41,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const engine = @import("engine.sig");
 const gles = @import("gles.sig");
+const report = @import("report.sig");
 const thread = @import("thread.sig");
 const wayland = @import("wayland.sig");
 const Host = @import("host.sig").Host;
@@ -69,6 +70,7 @@ pub const BAD_NATIVE_WINDOW: i32 = 0x300B;
 pub const BAD_PARAMETER: i32 = 0x300C;
 pub const BAD_SURFACE: i32 = 0x300D;
 pub const CONTEXT_LOST: i32 = 0x300E;
+pub const BAD_DEVICE_EXT: i32 = 0x322B;
 
 // config attributes
 pub const BUFFER_SIZE: i32 = 0x3020;
@@ -202,12 +204,19 @@ pub const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258;
 pub const dma_buf_formats = [_]u32{ wayland.DRM_FORMAT_ARGB8888, wayland.DRM_FORMAT_XRGB8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888 };
 
 pub const VERSION_STRING: [:0]const u8 = "1.5 Galaxy";
-pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_wayland EGL_MESA_platform_surfaceless";
+pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_device_base EGL_EXT_device_enumeration EGL_EXT_device_query EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_wayland EGL_MESA_platform_surfaceless";
+/// The one device's extensions (eglQueryDeviceStringEXT's EXTENSIONS).
+pub const DEVICE_EXTENSIONS: [:0]const u8 = "EGL_EXT_device_drm EGL_EXT_device_drm_render_node";
+pub const DEVICE_EXT: i32 = 0x322C;
+pub const DRM_DEVICE_FILE_EXT: i32 = 0x3233;
+pub const DRM_RENDER_NODE_FILE_EXT: i32 = 0x3377;
+/// The render node every display draws through.
+pub const RENDER_NODE: [:0]const u8 = "/dev/dri/renderD128";
 pub const DISPLAY_EXTENSIONS: [:0]const u8 = "EGL_ANDROID_native_fence_sync EGL_EXT_buffer_age EGL_EXT_create_context_robustness EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers EGL_EXT_swap_buffers_with_damage EGL_KHR_create_context EGL_KHR_fence_sync EGL_KHR_get_all_proc_addresses EGL_KHR_image_base EGL_KHR_no_config_context EGL_KHR_surfaceless_context EGL_KHR_swap_buffers_with_damage EGL_KHR_wait_sync";
 
 pub const MAX_DISPLAYS = 8;
-pub const MAX_CONTEXTS = 16;
-pub const MAX_SHARE = 4;
+pub const MAX_CONTEXTS = 32;
+pub const MAX_SHARE = 16;
 pub const MAX_SURFACES = 32;
 pub const MAX_SYNCS = 64;
 pub const MAX_IMAGES = 64;
@@ -284,8 +293,30 @@ fn setError(e: i32) void {
 
 /// An EGL call's error: set, and its failure value returned.
 fn fail(comptime T: type, e: i32, v: T) T {
+    return failWhy(T, e, v, "");
+}
+
+/// An EGL error, said on the app's stderr with the call it came from
+/// (`calling`) and why, where the reason is not the code's own: an app
+/// such as Firefox reads eglGetError only after later calls have reset it.
+fn failWhy(comptime T: type, e: i32, v: T, why: []const u8) T {
     setError(e);
+    report.say(.egl_error, "{s}: {s} (0x{x}){s}{s}", .{ calling_name, errorName(e), e, if (why.len != 0) ": " else "", why });
     return v;
+}
+
+/// The EGL entry point running (set by libgalaxy_gl's exports; what a
+/// failure is said to come from).
+pub var calling_name: []const u8 = "egl";
+
+pub fn calling(name: []const u8) void {
+    calling_name = name;
+}
+
+fn errorName(e: i32) []const u8 {
+    const names = [_][]const u8{ "SUCCESS", "NOT_INITIALIZED", "BAD_ACCESS", "BAD_ALLOC", "BAD_ATTRIBUTE", "BAD_CONFIG", "BAD_CONTEXT", "BAD_CURRENT_SURFACE", "BAD_DISPLAY", "BAD_MATCH", "BAD_NATIVE_PIXMAP", "BAD_NATIVE_WINDOW", "BAD_PARAMETER", "BAD_SURFACE", "CONTEXT_LOST" };
+    const i = e - SUCCESS;
+    return if (i >= 0 and i < names.len) names[@intCast(i)] else "error";
 }
 
 fn ok(comptime T: type, v: T) T {
@@ -550,13 +581,16 @@ pub fn initialize(handle: ?*anyopaque, major: ?*i32, minor: ?*i32) bool {
     const d = displayOf(handle) orelse return fail(bool, BAD_DISPLAY, false);
     if (!d.initialized) {
         const drv = driver orelse return fail(bool, NOT_INITIALIZED, false);
-        const eng = drv.open() orelse return fail(bool, NOT_INITIALIZED, false);
-        if (d.platform == .wayland) {
-            const c = drv.wayland() orelse return fail(bool, NOT_INITIALIZED, false);
-            if (!c.isDisplay(d.native.?)) return fail(bool, BAD_DISPLAY, false);
-            if (!d.wl.init(c, drv.host, @ptrCast(d.native.?))) return fail(bool, NOT_INITIALIZED, false);
+        const eng = drv.open() orelse return failWhy(bool, NOT_INITIALIZED, false, "no GPU to draw on");
+        // (terminated while a context of it was still current: its Wayland
+        // state is still there, kept for that context, and taken up again)
+        if (d.platform == .wayland and !d.terminating) {
+            const c = drv.wayland() orelse return failWhy(bool, NOT_INITIALIZED, false, "no libwayland-client in the app");
+            if (!c.isDisplay(d.native.?)) return failWhy(bool, BAD_DISPLAY, false, "not a wl_display");
+            if (!d.wl.init(c, drv.host, @ptrCast(d.native.?))) return failWhy(bool, NOT_INITIALIZED, false, "the compositor offers no dma-bufs this driver can show");
             d.client = c;
         }
+        d.terminating = false;
         d.eng = eng;
         d.initialized = true;
     }
@@ -607,6 +641,63 @@ fn reapDisplay(d: *Display) void {
     }
     d.wl.deinit();
     d.terminating = false;
+}
+
+// ── The device (EGL_EXT_device_query, _enumeration, _drm) ─────────────────
+//
+// One device, the GPU the driver draws on: what Firefox's glxtest asks for
+// (eglQueryDisplayAttribEXT's EGL_DEVICE_EXT, then the device's render node)
+// before it calls the GL usable.
+
+/// The device's handle (any address of ours; only compared).
+pub var the_device: u8 = 0;
+
+fn deviceOf(dev: ?*anyopaque) bool {
+    return dev == @as(?*anyopaque, @ptrCast(&the_device));
+}
+
+/// eglQueryDevicesEXT: the one device, when there is a GPU to draw on.
+pub fn queryDevices(max: i32, out: ?[*]?*anyopaque, num: ?*i32) bool {
+    lock();
+    defer unlock();
+    const n = num orelse return fail(bool, BAD_PARAMETER, false);
+    if (out != null and max <= 0) return fail(bool, BAD_PARAMETER, false);
+    const have: i32 = if (driver) |drv| (if (drv.open() != null) 1 else 0) else 0;
+    if (out) |o| {
+        if (have > 0) o[0] = @ptrCast(&the_device);
+        n.* = @min(have, max);
+    } else n.* = have;
+    return ok(bool, true);
+}
+
+/// eglQueryDeviceStringEXT: its extensions, and its render node (no
+/// primary node: EGL_DRM_DEVICE_FILE_EXT is BAD_PARAMETER, as Mesa says
+/// for a render-only device).
+pub fn queryDeviceString(dev: ?*anyopaque, name: i32) ?[*:0]const u8 {
+    if (!deviceOf(dev)) return fail(?[*:0]const u8, BAD_DEVICE_EXT, null);
+    return switch (name) {
+        EXTENSIONS => ok(?[*:0]const u8, DEVICE_EXTENSIONS.ptr),
+        DRM_RENDER_NODE_FILE_EXT => ok(?[*:0]const u8, RENDER_NODE.ptr),
+        else => fail(?[*:0]const u8, BAD_PARAMETER, null),
+    };
+}
+
+/// eglQueryDeviceAttribEXT: none it has.
+pub fn queryDeviceAttrib(dev: ?*anyopaque, attribute: i32, value: ?*isize) bool {
+    _ = .{ attribute, value };
+    if (!deviceOf(dev)) return fail(bool, BAD_DEVICE_EXT, false);
+    return fail(bool, BAD_ATTRIBUTE, false);
+}
+
+/// eglQueryDisplayAttribEXT/KHR: EGL_DEVICE_EXT, the display's device.
+pub fn queryDisplayAttrib(handle: ?*anyopaque, attribute: i32, value: ?*isize) bool {
+    lock();
+    defer unlock();
+    _ = ready(handle) orelse return false;
+    const v = value orelse return fail(bool, BAD_PARAMETER, false);
+    if (attribute != DEVICE_EXT) return fail(bool, BAD_ATTRIBUTE, false);
+    v.* = @bitCast(@intFromPtr(&the_device));
+    return ok(bool, true);
 }
 
 pub fn queryString(handle: ?*anyopaque, name: i32) ?[*:0]const u8 {
@@ -730,16 +821,16 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
                     lose = v == LOSE_CONTEXT_ON_RESET;
                 },
                 CONTEXT_OPENGL_DEBUG, CONTEXT_OPENGL_ROBUST_ACCESS, CONTEXT_OPENGL_ROBUST_ACCESS_EXT, CONTEXT_OPENGL_NO_ERROR_KHR, CONTEXT_PRIORITY_LEVEL_IMG => {},
-                else => return fail(?*Context, BAD_ATTRIBUTE, null),
+                else => return failWhy(?*Context, BAD_ATTRIBUTE, null, "an attribute this driver does not take"),
             }
         }
     }
     // (OpenGL ES 2.0 and 3.0; ES 3.0 is given either way)
-    if (!((major == 2 and minor == 0) or (major == 3 and minor == 0))) return fail(?*Context, BAD_MATCH, null);
+    if (!((major == 2 and minor == 0) or (major == 3 and minor == 0))) return failWhy(?*Context, BAD_MATCH, null, "only OpenGL ES 2.0 and 3.0");
     const t = thread.mine() orelse return fail(?*Context, BAD_ALLOC, null);
     if (t.api != OPENGL_ES_API) return fail(?*Context, BAD_MATCH, null);
     const eng = d.eng.?;
-    if (eng.lost) return fail(?*Context, BAD_ALLOC, null);
+    if (eng.lost) return failWhy(?*Context, BAD_ALLOC, null, "the GPU is lost");
     const share: usize = if (share_ctx) |sp| blk: {
         const sc = contextOf(sp, d) orelse return fail(?*Context, BAD_CONTEXT, null);
         break :blk sc.share;
@@ -750,11 +841,11 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
                 break :blk i;
             }
         }
-        return fail(?*Context, BAD_ALLOC, null);
+        return failWhy(?*Context, BAD_ALLOC, null, "every share group is in use");
     };
     const c = for (&contexts) |*x| {
         if (!x.used) break x;
-    } else return fail(?*Context, BAD_ALLOC, null);
+    } else return failWhy(?*Context, BAD_ALLOC, null, "every context slot is in use");
     c.* = .{ .used = true, .display = d, .config = cfg, .share = share, .major = major };
     c.gl.init(eng, &shares[share]);
     c.gl.lose_on_reset = lose;
@@ -862,12 +953,12 @@ pub fn createWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*cons
     if (!windowAttribs(T, attribs)) return fail(?*Surface, BAD_ATTRIBUTE, null);
     if (d.platform != .wayland) return fail(?*Surface, BAD_NATIVE_WINDOW, null);
     const n: *wayland.EglWindow = @ptrCast(@alignCast(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null)));
-    if (n.driver_private != null) return fail(?*Surface, BAD_ALLOC, null); // (a surface of it already)
-    const s = newSurface(d, cfg) orelse return fail(?*Surface, BAD_ALLOC, null);
+    if (n.driver_private != null) return failWhy(?*Surface, BAD_ALLOC, null, "the wl_egl_window has a surface already");
+    const s = newSurface(d, cfg) orelse return failWhy(?*Surface, BAD_ALLOC, null, "every surface slot is in use");
     s.kind = .window;
     if (!s.win.init(&d.wl, d.eng.?, n, cfg.alpha)) {
         s.* = .{};
-        return fail(?*Surface, BAD_NATIVE_WINDOW, null);
+        return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "the window's Wayland surface could not be set up");
     }
     return ok(?*Surface, s);
 }
@@ -932,7 +1023,7 @@ pub fn destroySurface(handle: ?*anyopaque, surface: ?*anyopaque) bool {
     const d = ready(handle) orelse return false;
     const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
     s.doomed = true;
-    if (s.ctx == null) freeSurface(s);
+    if (s.ctx == null) freeSurface(s) else if (s.kind == .window) s.win.detach();
     return ok(bool, true);
 }
 
@@ -1060,16 +1151,16 @@ pub fn makeCurrent(handle: ?*anyopaque, draw_h: ?*anyopaque, read_h: ?*anyopaque
     const draw: ?*Surface = if (draw_h) |h| (surfaceOf(h, d) orelse return fail(bool, BAD_SURFACE, false)) else null;
     const read: ?*Surface = if (read_h) |h| (surfaceOf(h, d) orelse return fail(bool, BAD_SURFACE, false)) else null;
     const me = thread.key();
-    if (c.thread_key != 0 and c.thread_key != me) return fail(bool, BAD_ACCESS, false);
+    if (c.thread_key != 0 and c.thread_key != me) return failWhy(bool, BAD_ACCESS, false, "the context is current on another thread");
     for ([2]?*Surface{ draw, read }) |sp| {
         const s = sp orelse continue;
         if (s.ctx) |other| {
             // (another context's, unless that one is this thread's, which
             // this call lets go)
-            if (other != c and other.thread_key != me) return fail(bool, BAD_ACCESS, false);
+            if (other != c and other.thread_key != me) return failWhy(bool, BAD_ACCESS, false, "a surface is another thread's context's");
         }
         if (c.config) |cfg| {
-            if (cfg.alpha != s.config.alpha) return fail(bool, BAD_MATCH, false);
+            if (cfg.alpha != s.config.alpha) return failWhy(bool, BAD_MATCH, false, "the context's config and the surface's differ in alpha");
         }
     }
     if (t.context != @as(?*anyopaque, c)) release(t) else {
@@ -1091,7 +1182,7 @@ pub fn makeCurrent(handle: ?*anyopaque, draw_h: ?*anyopaque, read_h: ?*anyopaque
     t.gl = &c.gl;
     if (!bindSurfaces(c)) {
         release(t);
-        return fail(bool, BAD_ALLOC, false);
+        return failWhy(bool, BAD_ALLOC, false, "no memory for the surface's buffers");
     }
     return ok(bool, true);
 }
