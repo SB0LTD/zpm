@@ -83,6 +83,8 @@ pub const Summary = struct {
     data_offset: u64 = 0,
     architecture: [64]u8 = @splat(0),
     architecture_len: u8 = 0,
+    tokenizer_pre: [64]u8 = @splat(0),
+    tokenizer_pre_len: u8 = 0,
     context_length: u64 = 0,
     embedding_length: u64 = 0,
     block_count: u64 = 0,
@@ -112,6 +114,9 @@ pub const Summary = struct {
 
     pub fn architectureSlice(self: *const Summary) []const u8 {
         return self.architecture[0..self.architecture_len];
+    }
+    pub fn tokenizerPreSlice(self: *const Summary) []const u8 {
+        return self.tokenizer_pre[0..self.tokenizer_pre_len];
     }
 };
 
@@ -349,6 +354,12 @@ fn consumeMetadataValue(
                     summary.architecture_len = @intCast(length);
                     try cursor.readBytes(summary.architecture[0..summary.architecture_len]);
                     if (!validArchitecture(summary.architectureSlice())) return error.InvalidMetadataValue;
+                    return;
+                }
+                if (try keyEquals(cursor.source, present, "tokenizer.ggml.pre")) {
+                    if (length == 0 or length > summary.tokenizer_pre.len) return error.InvalidMetadataValue;
+                    summary.tokenizer_pre_len = @intCast(length);
+                    try cursor.readBytes(summary.tokenizer_pre[0..summary.tokenizer_pre_len]);
                     return;
                 }
             }
@@ -620,5 +631,23 @@ fn basicFixture(dimension: u64, file_size: *usize) FixtureWriter {
     file_size.* = writer.position + 144;
     writer.position = file_size.*;
     return writer;
+}
+
+test "tokenizer profile metadata is bounded and retained" {
+    const std = @import("std");
+    var writer = FixtureWriter{};
+    const key = "tokenizer.ggml.pre";
+    writer.string(key);
+    writer.string("qwen2");
+    const storage = SliceSource{ .bytes = writer.bytes[0..writer.position] };
+    var cursor = Cursor{ .source = storage.source(), .position = 8 + key.len };
+    var summary = Summary{};
+    try consumeMetadataValue(&cursor, .string, 0, .{ .offset = 8, .length = key.len }, &summary);
+    try std.testing.expectEqualStrings("qwen2", summary.tokenizerPreSlice());
+    writer.position = 8 + key.len;
+    writer.putU64(65);
+    const invalid_storage = SliceSource{ .bytes = writer.bytes[0..writer.position] };
+    cursor = .{ .source = invalid_storage.source(), .position = 8 + key.len };
+    try std.testing.expectError(error.InvalidMetadataValue, consumeMetadataValue(&cursor, .string, 0, .{ .offset = 8, .length = key.len }, &summary));
 }
 
