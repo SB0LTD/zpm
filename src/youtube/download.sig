@@ -68,6 +68,9 @@ pub const DownloadOptions = struct {
     // one-shot comparison path. Never shared across fresh attestations.
     reuse_sabr_connection: bool = true,
     web_client: session_mod.WebClient = .mweb,
+    // On a native protection rejection, use the other web client for the
+    // first permitted fresh attestation. No additional attempts are created.
+    alternate_web_client_on_refresh: bool = false,
     require_vm_token: bool = false,
     progress: stream_mod.ProgressFn = null,
     sabr_response: ?*const fn (result: sabr_mod.stream.SabrResult) bool = null,
@@ -220,12 +223,17 @@ fn announceRefresh(refreshes: u8) void {
 
 fn fetchAttemptsFrom(comptime perform: anytype, video_id: *const [meta.VIDEO_ID_LEN]u8, req: MediaRequest, output_path: [*:0]const u8, initial_refreshes: u8) DownloadStatus {
     var refreshes = initial_refreshes;
+    var attempt = req;
     while (true) {
-        var status = perform(video_id, req, output_path);
+        var status = perform(video_id, attempt, output_path);
         status.attestation_refreshes = refreshes;
         if (!shouldRefresh(status, req.options, refreshes)) return status;
         refreshes += 1;
         announceRefresh(refreshes);
+        if (req.options.alternate_web_client_on_refresh and refreshes == 1) {
+            attempt.options.web_client = if (attempt.options.web_client == .web) .mweb else .web;
+            print("  [download] Switching web client for fresh native session\n");
+        }
         // fetchImpl prepares a new session/challenge and reacquires formats.
         // The previous staged sink has closed; never append its preview to
         // a new representation or publish it as a complete destination.
@@ -1048,7 +1056,9 @@ test "download attestation refresh is bounded and only applies to native protect
         var succeeds_after: u8 = 2;
         var failure: sabr_mod.stream.Failure = .protection;
         var source: TokenSource = .vm;
-        fn run(_: *const [meta.VIDEO_ID_LEN]u8, _: MediaRequest, _: [*:0]const u8) DownloadStatus {
+        var clients: [4]session_mod.WebClient = undefined;
+        fn run(_: *const [meta.VIDEO_ID_LEN]u8, request: MediaRequest, _: [*:0]const u8) DownloadStatus {
+            if (calls < clients.len) clients[calls] = request.options.web_client;
             calls += 1;
             return .{ .success = calls >= succeeds_after, .bytes_downloaded = 3, .container = .mp4, .codec = .aac, .bitrate = 1, .duration_sec = 1,
                 .token_source = source, .sabr_result = .{ .failure = if (calls >= succeeds_after) .none else failure } };
@@ -1058,6 +1068,11 @@ test "download attestation refresh is bounded and only applies to native protect
     try testing.expect(recovered.success);
     try testing.expectEqual(@as(u8, 2), Fake.calls);
     try testing.expectEqual(@as(u8, 1), recovered.attestation_refreshes);
+    Fake.calls = 0;
+    const alternate = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{ .options = .{ .web_client = .web, .alternate_web_client_on_refresh = true } }, "unused.m4a");
+    try testing.expect(alternate.success);
+    try testing.expectEqual(session_mod.WebClient.web, Fake.clients[0]);
+    try testing.expectEqual(session_mod.WebClient.mweb, Fake.clients[1]);
     Fake.succeeds_after = 255;
     inline for (.{sabr_mod.stream.Failure.cancelled, .transport, .http_status, .media_write}) |failure| {
         Fake.calls = 0; Fake.failure = failure;
