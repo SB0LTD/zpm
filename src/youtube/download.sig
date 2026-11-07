@@ -1073,10 +1073,15 @@ test "download attestation refresh is bounded and only applies to native protect
     try testing.expect(alternate.success);
     try testing.expectEqual(session_mod.WebClient.web, Fake.clients[0]);
     try testing.expectEqual(session_mod.WebClient.mweb, Fake.clients[1]);
+    Fake.calls = 0;
+    const alternate_reverse = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{ .options = .{ .web_client = .mweb, .alternate_web_client_on_refresh = true } }, "unused.m4a");
+    try testing.expect(alternate_reverse.success);
+    try testing.expectEqual(session_mod.WebClient.mweb, Fake.clients[0]);
+    try testing.expectEqual(session_mod.WebClient.web, Fake.clients[1]);
     Fake.succeeds_after = 255;
     inline for (.{sabr_mod.stream.Failure.cancelled, .transport, .http_status, .media_write}) |failure| {
         Fake.calls = 0; Fake.failure = failure;
-        _ = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{}, "unused.m4a");
+        _ = fetchAttempts(Fake.run, "7Cbr_W7I2Vg", .{ .options = .{ .alternate_web_client_on_refresh = true } }, "unused.m4a");
         try testing.expectEqual(@as(u8, 1), Fake.calls);
     }
     Fake.failure = .protection;
