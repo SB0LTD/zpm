@@ -1,0 +1,157 @@
+// Galaxy's M5 kernels on the RTX 5070 (sm_120): parameters in constant
+// buffer 0, buffers in VRAM, local memory. Each loops over the grid.
+.version 8.8
+.target sm_120
+.address_size 64
+
+// dst[i] = (i * 0x9e3779b1) ^ seed, for i < n.
+.visible .entry galaxy_fill(.param .u64 p_dst, .param .u32 p_n, .param .u32 p_seed)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [p_dst];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r2, [p_seed];
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.u32 %r6, %r3, %r4, %r5;
+    mov.u32 %r7, %nctaid.x;
+    mul.lo.u32 %r8, %r7, %r4;
+FILL:
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra FILL_DONE;
+    mul.lo.u32 %r9, %r6, 0x9e3779b1;
+    xor.b32 %r9, %r9, %r2;
+    mul.wide.u32 %rd2, %r6, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r9;
+    add.u32 %r6, %r6, %r8;
+    bra FILL;
+FILL_DONE:
+    ret;
+}
+
+// dst[i] = src[i] in 16-byte words, for i < n4.
+.visible .entry galaxy_copy(.param .u64 p_dst, .param .u64 p_src, .param .u32 p_n4)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [p_dst];
+    ld.param.u64 %rd2, [p_src];
+    ld.param.u32 %r1, [p_n4];
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.u32 %r6, %r3, %r4, %r5;
+    mov.u32 %r7, %nctaid.x;
+    mul.lo.u32 %r8, %r7, %r4;
+COPY:
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra COPY_DONE;
+    mul.wide.u32 %rd3, %r6, 16;
+    add.s64 %rd4, %rd2, %rd3;
+    ld.global.v4.u32 {%r10, %r11, %r12, %r13}, [%rd4];
+    add.s64 %rd5, %rd1, %rd3;
+    st.global.v4.u32 [%rd5], {%r10, %r11, %r12, %r13};
+    add.u32 %r6, %r6, %r8;
+    bra COPY;
+COPY_DONE:
+    ret;
+}
+
+// c = a * b, n x n fp32 row-major, one thread per element of c.
+.visible .entry galaxy_matmul(.param .u64 p_c, .param .u64 p_a, .param .u64 p_b, .param .u32 p_n)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<10>;
+    ld.param.u64 %rd1, [p_c];
+    ld.param.u64 %rd2, [p_a];
+    ld.param.u64 %rd3, [p_b];
+    ld.param.u32 %r1, [p_n];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;      // column
+    mov.u32 %r6, %ctaid.y;
+    mov.u32 %r7, %ntid.y;
+    mov.u32 %r8, %tid.y;
+    mad.lo.u32 %r9, %r6, %r7, %r8;      // row
+    setp.ge.u32 %p1, %r5, %r1;
+    setp.ge.u32 %p2, %r9, %r1;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra MM_DONE;
+    mul.lo.u32 %r10, %r9, %r1;          // row * n
+    mul.wide.u32 %rd4, %r10, 4;
+    add.s64 %rd5, %rd2, %rd4;           // &a[row][0]
+    mul.wide.u32 %rd6, %r5, 4;
+    add.s64 %rd7, %rd3, %rd6;           // &b[0][col]
+    mul.wide.u32 %rd8, %r1, 4;          // a row of b, in bytes
+    mov.f32 %f1, 0f00000000;
+    mov.u32 %r11, 0;
+MM:
+    setp.ge.u32 %p1, %r11, %r1;
+    @%p1 bra MM_STORE;
+    ld.global.f32 %f2, [%rd5];
+    ld.global.f32 %f3, [%rd7];
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.s64 %rd5, %rd5, 4;
+    add.s64 %rd7, %rd7, %rd8;
+    add.u32 %r11, %r11, 1;
+    bra MM;
+MM_STORE:
+    add.u32 %r12, %r10, %r5;
+    mul.wide.u32 %rd9, %r12, 4;
+    add.s64 %rd9, %rd1, %rd9;
+    st.global.f32 [%rd9], %f1;
+MM_DONE:
+    ret;
+}
+
+// A 16-word array on the thread's stack, written in an order only the
+// thread index decides (so it stays in local memory): out[tid] =
+// sum over j of (tid * 16 + j) = tid * 256 + 120.
+.visible .entry galaxy_local(.param .u64 p_out)
+{
+    .local .align 4 .b8 stack[64];
+    .reg .pred %p<2>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [p_out];
+    mov.u64 %rd2, stack;
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r2, %r1, 4;                // tid * 16
+    mov.u32 %r3, 0;
+WR:
+    setp.ge.u32 %p1, %r3, 16;
+    @%p1 bra RD_START;
+    add.u32 %r4, %r1, %r3;
+    and.b32 %r4, %r4, 15;
+    mul.wide.u32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    add.u32 %r5, %r2, %r3;
+    st.local.u32 [%rd4], %r5;
+    add.u32 %r3, %r3, 1;
+    bra WR;
+RD_START:
+    mov.u32 %r6, 0;
+    mov.u32 %r3, 0;
+RD:
+    setp.ge.u32 %p1, %r3, 16;
+    @%p1 bra STORE;
+    mul.wide.u32 %rd5, %r3, 4;
+    add.s64 %rd6, %rd2, %rd5;
+    ld.local.u32 %r7, [%rd6];
+    add.u32 %r6, %r6, %r7;
+    add.u32 %r3, %r3, 1;
+    bra RD;
+STORE:
+    mul.wide.u32 %rd7, %r1, 4;
+    add.s64 %rd7, %rd1, %rd7;
+    st.global.u32 [%rd7], %r6;
+    ret;
+}

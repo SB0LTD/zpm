@@ -1,0 +1,2778 @@
+{
+  "reference": "PostgreSQL16.15",
+  "setup": "CREATE TEMP TABLE w(id INTEGER PRIMARY KEY,g INTEGER,v INTEGER,o INTEGER); INSERT INTO w VALUES(1,1,10,1),(2,1,NULL,0),(3,1,30,-1),(4,2,40,NULL),(5,2,50,99),(6,2,60,-2147483648);",
+  "cases": [
+    {
+      "sql": "SELECT id,lag(v) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "30",
+          "integer"
+        ],
+        [
+          "3",
+          "40",
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,0) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "30",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,0) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "30",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,1) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,1) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "30",
+          "integer"
+        ],
+        [
+          "3",
+          "40",
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,-1) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "30",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,-1) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "30",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,2,-99) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "-99",
+          "integer"
+        ],
+        [
+          "2",
+          "-99",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "-99",
+          "integer"
+        ],
+        [
+          "5",
+          "-99",
+          "integer"
+        ],
+        [
+          "6",
+          "40",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,2,-99) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "30",
+          "integer"
+        ],
+        [
+          "2",
+          "40",
+          "integer"
+        ],
+        [
+          "3",
+          "50",
+          "integer"
+        ],
+        [
+          "4",
+          "60",
+          "integer"
+        ],
+        [
+          "5",
+          "-99",
+          "integer"
+        ],
+        [
+          "6",
+          "-99",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,-2,-99) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "30",
+          "integer"
+        ],
+        [
+          "2",
+          "-99",
+          "integer"
+        ],
+        [
+          "3",
+          "-99",
+          "integer"
+        ],
+        [
+          "4",
+          "60",
+          "integer"
+        ],
+        [
+          "5",
+          "-99",
+          "integer"
+        ],
+        [
+          "6",
+          "-99",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,-2,-99) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "-99",
+          "integer"
+        ],
+        [
+          "2",
+          "-99",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "30",
+          "integer"
+        ],
+        [
+          "6",
+          "40",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,99,0) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "integer"
+        ],
+        [
+          "2",
+          "0",
+          "integer"
+        ],
+        [
+          "3",
+          "0",
+          "integer"
+        ],
+        [
+          "4",
+          "0",
+          "integer"
+        ],
+        [
+          "5",
+          "0",
+          "integer"
+        ],
+        [
+          "6",
+          "0",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,99,0) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "integer"
+        ],
+        [
+          "2",
+          "0",
+          "integer"
+        ],
+        [
+          "3",
+          "0",
+          "integer"
+        ],
+        [
+          "4",
+          "0",
+          "integer"
+        ],
+        [
+          "5",
+          "0",
+          "integer"
+        ],
+        [
+          "6",
+          "0",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,-99,0) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "integer"
+        ],
+        [
+          "2",
+          "0",
+          "integer"
+        ],
+        [
+          "3",
+          "0",
+          "integer"
+        ],
+        [
+          "4",
+          "0",
+          "integer"
+        ],
+        [
+          "5",
+          "0",
+          "integer"
+        ],
+        [
+          "6",
+          "0",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,-99,0) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "integer"
+        ],
+        [
+          "2",
+          "0",
+          "integer"
+        ],
+        [
+          "3",
+          "0",
+          "integer"
+        ],
+        [
+          "4",
+          "0",
+          "integer"
+        ],
+        [
+          "5",
+          "0",
+          "integer"
+        ],
+        [
+          "6",
+          "0",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,NULL,9) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,NULL,9) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,o,id*100) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "100",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "300",
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "500",
+          "integer"
+        ],
+        [
+          "6",
+          "600",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,o,id*100) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "500",
+          "integer"
+        ],
+        [
+          "6",
+          "600",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,2147483647,7) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "7",
+          "integer"
+        ],
+        [
+          "2",
+          "7",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "7",
+          "integer"
+        ],
+        [
+          "5",
+          "7",
+          "integer"
+        ],
+        [
+          "6",
+          "7",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,2147483647,7) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "7",
+          "integer"
+        ],
+        [
+          "2",
+          "7",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "7",
+          "integer"
+        ],
+        [
+          "5",
+          "7",
+          "integer"
+        ],
+        [
+          "6",
+          "7",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,-2147483648,7) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "7",
+          "integer"
+        ],
+        [
+          "2",
+          "7",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "7",
+          "integer"
+        ],
+        [
+          "5",
+          "7",
+          "integer"
+        ],
+        [
+          "6",
+          "7",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,-2147483648,7) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "7",
+          "integer"
+        ],
+        [
+          "2",
+          "7",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "7",
+          "integer"
+        ],
+        [
+          "5",
+          "7",
+          "integer"
+        ],
+        [
+          "6",
+          "7",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(id::text,1,'outside') OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "outside",
+          "text"
+        ],
+        [
+          "2",
+          "1",
+          "text"
+        ],
+        [
+          "3",
+          "2",
+          "text"
+        ],
+        [
+          "4",
+          "outside",
+          "text"
+        ],
+        [
+          "5",
+          "4",
+          "text"
+        ],
+        [
+          "6",
+          "5",
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(id::text,1,'outside') OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "2",
+          "text"
+        ],
+        [
+          "2",
+          "3",
+          "text"
+        ],
+        [
+          "3",
+          "4",
+          "text"
+        ],
+        [
+          "4",
+          "5",
+          "text"
+        ],
+        [
+          "5",
+          "6",
+          "text"
+        ],
+        [
+          "6",
+          "outside",
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v::numeric,1,2.50) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "2.50",
+          "numeric"
+        ],
+        [
+          "2",
+          "10",
+          "numeric"
+        ],
+        [
+          "3",
+          null,
+          "numeric"
+        ],
+        [
+          "4",
+          "2.50",
+          "numeric"
+        ],
+        [
+          "5",
+          "40",
+          "numeric"
+        ],
+        [
+          "6",
+          "50",
+          "numeric"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v::numeric,1,2.50) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "numeric"
+        ],
+        [
+          "2",
+          "30",
+          "numeric"
+        ],
+        [
+          "3",
+          "40",
+          "numeric"
+        ],
+        [
+          "4",
+          "50",
+          "numeric"
+        ],
+        [
+          "5",
+          "60",
+          "numeric"
+        ],
+        [
+          "6",
+          "2.50",
+          "numeric"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(NULL,1,NULL) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "text"
+        ],
+        [
+          "2",
+          null,
+          "text"
+        ],
+        [
+          "3",
+          null,
+          "text"
+        ],
+        [
+          "4",
+          null,
+          "text"
+        ],
+        [
+          "5",
+          null,
+          "text"
+        ],
+        [
+          "6",
+          null,
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(NULL,1,NULL) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "text"
+        ],
+        [
+          "2",
+          null,
+          "text"
+        ],
+        [
+          "3",
+          null,
+          "text"
+        ],
+        [
+          "4",
+          null,
+          "text"
+        ],
+        [
+          "5",
+          null,
+          "text"
+        ],
+        [
+          "6",
+          null,
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(NULL,1,'outside') OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "outside",
+          "text"
+        ],
+        [
+          "2",
+          null,
+          "text"
+        ],
+        [
+          "3",
+          null,
+          "text"
+        ],
+        [
+          "4",
+          "outside",
+          "text"
+        ],
+        [
+          "5",
+          null,
+          "text"
+        ],
+        [
+          "6",
+          null,
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(NULL,1,'outside') OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "text"
+        ],
+        [
+          "2",
+          null,
+          "text"
+        ],
+        [
+          "3",
+          null,
+          "text"
+        ],
+        [
+          "4",
+          null,
+          "text"
+        ],
+        [
+          "5",
+          null,
+          "text"
+        ],
+        [
+          "6",
+          "outside",
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag('{\"a\":1}'::jsonb,1,'{}') OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "{}",
+          "jsonb"
+        ],
+        [
+          "2",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "3",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "4",
+          "{}",
+          "jsonb"
+        ],
+        [
+          "5",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "6",
+          "{\"a\": 1}",
+          "jsonb"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag('{\"a\":1}'::jsonb,1,'{}') OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "2",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "3",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "4",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "5",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "6",
+          "{}",
+          "jsonb"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,1::smallint,99) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "99",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "99",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v,1::smallint,99) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "30",
+          "integer"
+        ],
+        [
+          "3",
+          "40",
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          "99",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag() OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lag() does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lag() OVER...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lag(v,1,2,3) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lag(integer, integer, integer, integer) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lag(v,1,2,...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lag(v,1::bigint) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lag(integer, bigint) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lag(v,1::b...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lag(v,1.5) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lag(integer, numeric) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lag(v,1.5)...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lag(v,true) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lag(integer, boolean) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lag(v,true...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lag(v,0,1/0) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "22012",
+      "rows": null,
+      "diagnostic": "ERROR:  22012: division by zero\nLOCATION:  int4div, int.c:870"
+    },
+    {
+      "sql": "SELECT id,lag(v) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "22013",
+      "rows": null,
+      "diagnostic": "ERROR:  22013: frame starting offset must not be negative\nLOCATION:  ExecWindowAgg, nodeWindowAgg.c:2156"
+    },
+    {
+      "sql": "SELECT id,lag(v) OVER (ORDER BY id ROWS BETWEEN NULL PRECEDING AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "22004",
+      "rows": null,
+      "diagnostic": "ERROR:  22004: frame starting offset must not be null\nLOCATION:  ExecWindowAgg, nodeWindowAgg.c:2143"
+    },
+    {
+      "sql": "SELECT id,lag(v) FILTER (WHERE true) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "0A000",
+      "rows": null,
+      "diagnostic": "ERROR:  0A000: FILTER is not implemented for non-aggregate window functions\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lag(v) FIL...\n                                                             ^\nLOCATION:  ParseFuncOrColumn, parse_func.c:927"
+    },
+    {
+      "sql": "SELECT id,lead(v) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "30",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "30",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,0) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "30",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,0) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "30",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,1) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "30",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,1) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "30",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,-1) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,-1) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "30",
+          "integer"
+        ],
+        [
+          "3",
+          "40",
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,2,-99) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "30",
+          "integer"
+        ],
+        [
+          "2",
+          "-99",
+          "integer"
+        ],
+        [
+          "3",
+          "-99",
+          "integer"
+        ],
+        [
+          "4",
+          "60",
+          "integer"
+        ],
+        [
+          "5",
+          "-99",
+          "integer"
+        ],
+        [
+          "6",
+          "-99",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,2,-99) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "-99",
+          "integer"
+        ],
+        [
+          "2",
+          "-99",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "30",
+          "integer"
+        ],
+        [
+          "6",
+          "40",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,-2,-99) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "-99",
+          "integer"
+        ],
+        [
+          "2",
+          "-99",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "-99",
+          "integer"
+        ],
+        [
+          "5",
+          "-99",
+          "integer"
+        ],
+        [
+          "6",
+          "40",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,-2,-99) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "30",
+          "integer"
+        ],
+        [
+          "2",
+          "40",
+          "integer"
+        ],
+        [
+          "3",
+          "50",
+          "integer"
+        ],
+        [
+          "4",
+          "60",
+          "integer"
+        ],
+        [
+          "5",
+          "-99",
+          "integer"
+        ],
+        [
+          "6",
+          "-99",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,99,0) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "integer"
+        ],
+        [
+          "2",
+          "0",
+          "integer"
+        ],
+        [
+          "3",
+          "0",
+          "integer"
+        ],
+        [
+          "4",
+          "0",
+          "integer"
+        ],
+        [
+          "5",
+          "0",
+          "integer"
+        ],
+        [
+          "6",
+          "0",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,99,0) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "integer"
+        ],
+        [
+          "2",
+          "0",
+          "integer"
+        ],
+        [
+          "3",
+          "0",
+          "integer"
+        ],
+        [
+          "4",
+          "0",
+          "integer"
+        ],
+        [
+          "5",
+          "0",
+          "integer"
+        ],
+        [
+          "6",
+          "0",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,-99,0) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "integer"
+        ],
+        [
+          "2",
+          "0",
+          "integer"
+        ],
+        [
+          "3",
+          "0",
+          "integer"
+        ],
+        [
+          "4",
+          "0",
+          "integer"
+        ],
+        [
+          "5",
+          "0",
+          "integer"
+        ],
+        [
+          "6",
+          "0",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,-99,0) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0",
+          "integer"
+        ],
+        [
+          "2",
+          "0",
+          "integer"
+        ],
+        [
+          "3",
+          "0",
+          "integer"
+        ],
+        [
+          "4",
+          "0",
+          "integer"
+        ],
+        [
+          "5",
+          "0",
+          "integer"
+        ],
+        [
+          "6",
+          "0",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,NULL,9) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,NULL,9) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,o,id*100) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "500",
+          "integer"
+        ],
+        [
+          "6",
+          "600",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,o,id*100) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "100",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "40",
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "500",
+          "integer"
+        ],
+        [
+          "6",
+          "600",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,2147483647,7) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "7",
+          "integer"
+        ],
+        [
+          "2",
+          "7",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "7",
+          "integer"
+        ],
+        [
+          "5",
+          "7",
+          "integer"
+        ],
+        [
+          "6",
+          "7",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,2147483647,7) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "7",
+          "integer"
+        ],
+        [
+          "2",
+          "7",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "7",
+          "integer"
+        ],
+        [
+          "5",
+          "7",
+          "integer"
+        ],
+        [
+          "6",
+          "7",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,-2147483648,7) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "7",
+          "integer"
+        ],
+        [
+          "2",
+          "7",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "7",
+          "integer"
+        ],
+        [
+          "5",
+          "7",
+          "integer"
+        ],
+        [
+          "6",
+          "7",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,-2147483648,7) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "7",
+          "integer"
+        ],
+        [
+          "2",
+          "7",
+          "integer"
+        ],
+        [
+          "3",
+          "7",
+          "integer"
+        ],
+        [
+          "4",
+          "7",
+          "integer"
+        ],
+        [
+          "5",
+          "7",
+          "integer"
+        ],
+        [
+          "6",
+          "7",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(id::text,1,'outside') OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "2",
+          "text"
+        ],
+        [
+          "2",
+          "3",
+          "text"
+        ],
+        [
+          "3",
+          "outside",
+          "text"
+        ],
+        [
+          "4",
+          "5",
+          "text"
+        ],
+        [
+          "5",
+          "6",
+          "text"
+        ],
+        [
+          "6",
+          "outside",
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(id::text,1,'outside') OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "outside",
+          "text"
+        ],
+        [
+          "2",
+          "1",
+          "text"
+        ],
+        [
+          "3",
+          "2",
+          "text"
+        ],
+        [
+          "4",
+          "3",
+          "text"
+        ],
+        [
+          "5",
+          "4",
+          "text"
+        ],
+        [
+          "6",
+          "5",
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v::numeric,1,2.50) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "numeric"
+        ],
+        [
+          "2",
+          "30",
+          "numeric"
+        ],
+        [
+          "3",
+          "2.50",
+          "numeric"
+        ],
+        [
+          "4",
+          "50",
+          "numeric"
+        ],
+        [
+          "5",
+          "60",
+          "numeric"
+        ],
+        [
+          "6",
+          "2.50",
+          "numeric"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v::numeric,1,2.50) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "2.50",
+          "numeric"
+        ],
+        [
+          "2",
+          "10",
+          "numeric"
+        ],
+        [
+          "3",
+          null,
+          "numeric"
+        ],
+        [
+          "4",
+          "30",
+          "numeric"
+        ],
+        [
+          "5",
+          "40",
+          "numeric"
+        ],
+        [
+          "6",
+          "50",
+          "numeric"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(NULL,1,NULL) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "text"
+        ],
+        [
+          "2",
+          null,
+          "text"
+        ],
+        [
+          "3",
+          null,
+          "text"
+        ],
+        [
+          "4",
+          null,
+          "text"
+        ],
+        [
+          "5",
+          null,
+          "text"
+        ],
+        [
+          "6",
+          null,
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(NULL,1,NULL) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "text"
+        ],
+        [
+          "2",
+          null,
+          "text"
+        ],
+        [
+          "3",
+          null,
+          "text"
+        ],
+        [
+          "4",
+          null,
+          "text"
+        ],
+        [
+          "5",
+          null,
+          "text"
+        ],
+        [
+          "6",
+          null,
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(NULL,1,'outside') OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "text"
+        ],
+        [
+          "2",
+          null,
+          "text"
+        ],
+        [
+          "3",
+          "outside",
+          "text"
+        ],
+        [
+          "4",
+          null,
+          "text"
+        ],
+        [
+          "5",
+          null,
+          "text"
+        ],
+        [
+          "6",
+          "outside",
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(NULL,1,'outside') OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "outside",
+          "text"
+        ],
+        [
+          "2",
+          null,
+          "text"
+        ],
+        [
+          "3",
+          null,
+          "text"
+        ],
+        [
+          "4",
+          null,
+          "text"
+        ],
+        [
+          "5",
+          null,
+          "text"
+        ],
+        [
+          "6",
+          null,
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead('{\"a\":1}'::jsonb,1,'{}') OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "2",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "3",
+          "{}",
+          "jsonb"
+        ],
+        [
+          "4",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "5",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "6",
+          "{}",
+          "jsonb"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead('{\"a\":1}'::jsonb,1,'{}') OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "{}",
+          "jsonb"
+        ],
+        [
+          "2",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "3",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "4",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "5",
+          "{\"a\": 1}",
+          "jsonb"
+        ],
+        [
+          "6",
+          "{\"a\": 1}",
+          "jsonb"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,1::smallint,99) OVER (PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "30",
+          "integer"
+        ],
+        [
+          "3",
+          "99",
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          "99",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead(v,1::smallint,99) OVER (ORDER BY id DESC ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "99",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "30",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lead() OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lead() does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lead() OVE...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lead(v,1,2,3) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lead(integer, integer, integer, integer) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lead(v,1,2...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lead(v,1::bigint) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lead(integer, bigint) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lead(v,1::...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lead(v,1.5) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lead(integer, numeric) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lead(v,1.5...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lead(v,true) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function lead(integer, boolean) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lead(v,tru...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,lead(v,0,1/0) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "22012",
+      "rows": null,
+      "diagnostic": "ERROR:  22012: division by zero\nLOCATION:  int4div, int.c:870"
+    },
+    {
+      "sql": "SELECT id,lead(v) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "22013",
+      "rows": null,
+      "diagnostic": "ERROR:  22013: frame starting offset must not be negative\nLOCATION:  ExecWindowAgg, nodeWindowAgg.c:2156"
+    },
+    {
+      "sql": "SELECT id,lead(v) OVER (ORDER BY id ROWS BETWEEN NULL PRECEDING AND CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "22004",
+      "rows": null,
+      "diagnostic": "ERROR:  22004: frame starting offset must not be null\nLOCATION:  ExecWindowAgg, nodeWindowAgg.c:2143"
+    },
+    {
+      "sql": "SELECT id,lead(v) FILTER (WHERE true) OVER () AS value FROM w ORDER BY id",
+      "sqlstate": "0A000",
+      "rows": null,
+      "diagnostic": "ERROR:  0A000: FILTER is not implemented for non-aggregate window functions\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,lead(v) FI...\n                                                             ^\nLOCATION:  ParseFuncOrColumn, parse_func.c:927"
+    }
+  ]
+}

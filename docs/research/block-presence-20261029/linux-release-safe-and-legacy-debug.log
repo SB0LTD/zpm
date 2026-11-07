@@ -1,0 +1,2 @@
+PASS SQL block presence: 24441 assertions, exact scalar/canonical results, no false negatives, ownership/publication/compaction and identical work totals
+PASS SQL block presence: 24441 assertions, exact scalar/canonical results, no false negatives, ownership/publication/compaction and identical work totals

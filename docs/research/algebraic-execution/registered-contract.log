@@ -1,0 +1,6 @@
+compile: tests/test_sql_factor_algebra.sig -> C:\Just-Things\Projects\sb0\zpm-factorized-execution\sig-out\bin\contract-sql-factor-algebra.exe (178 modules)
+compile: executable verified at C:\Just-Things\Projects\sb0\zpm-factorized-execution\sig-out\bin\contract-sql-factor-algebra.exe
+PASS factor algebra: 1712 assertions; flat joined rows=182609, factor products=2968; excludes scan/link-build costs; research prototype, SQL integration=false
+
+
+Build summary: 266 total, 2 succeeded, 0 cached, 0 failed, 264 skipped in 6216 ms

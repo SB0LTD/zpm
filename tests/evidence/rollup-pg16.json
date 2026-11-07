@@ -1,0 +1,7 @@
+{
+  "reference": "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+  "setup": "CREATE TEMP TABLE fact(id INTEGER PRIMARY KEY,k INTEGER,v INTEGER); INSERT INTO fact VALUES(1,1,10),(2,1,10),(3,1,30),(4,2,5),(5,2,NULL),(6,NULL,7); CREATE TEMP TABLE dim(id INTEGER PRIMARY KEY,label TEXT); INSERT INTO dim VALUES(1,'north'),(2,'north'),(3,'south');",
+  "cases": 31,
+  "sha256": "37463b911c8b2f96ac26f45e95ab88403a5863ac616125c3ba62f6cad821e7ff",
+  "purpose": "correctness fixture; no timings"
+}

@@ -198,7 +198,8 @@ fn decodeCodepoint(bytes: []const u8) Error!DecodedCodepoint {
     return .{ .codepoint = codepoint, .length = 2 };
 }
 
-fn encodeByte(byte: u8, destination: *[2]u8) usize {
+/// GPT-2 byte alphabet: the UTF-8 spelling of `byte` inside vocabulary text.
+pub fn encodeByte(byte: u8, destination: *[2]u8) usize {
     const codepoint: u16 = if (byteIncluded(byte)) byte else 256 + excludedIndex(byte);
     if (codepoint < 0x80) {
         destination[0] = @intCast(codepoint);

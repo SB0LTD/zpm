@@ -1,0 +1,2489 @@
+{
+  "reference": "PostgreSQL16.15",
+  "setup": "CREATE TEMP TABLE w(id INTEGER PRIMARY KEY,g INTEGER,v INTEGER); INSERT INTO w VALUES(1,1,10),(2,1,NULL),(3,1,10),(4,2,40),(5,2,50),(6,NULL,60);",
+  "cases": [
+    {
+      "sql": "SELECT id,first_value(v) OVER() AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER(PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER(ORDER BY v NULLS LAST) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER(ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER(ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER(ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "60",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER(ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER(ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "40",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "40",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER(ORDER BY id ROWS CURRENT ROW EXCLUDE CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER() AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "60",
+          "integer"
+        ],
+        [
+          "2",
+          "60",
+          "integer"
+        ],
+        [
+          "3",
+          "60",
+          "integer"
+        ],
+        [
+          "4",
+          "60",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER(PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER(ORDER BY v NULLS LAST) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER(ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "40",
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER(ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER(ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER(ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "60",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER(ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "60",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,last_value(v) OVER(ORDER BY id ROWS CURRENT ROW EXCLUDE CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER() AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER(PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER(ORDER BY v NULLS LAST) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER(ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER(ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER(ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "60",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER(ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          "50",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER(ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "40",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "40",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1) OVER(ORDER BY id ROWS CURRENT ROW EXCLUDE CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER() AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER(PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER(ORDER BY v NULLS LAST) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER(ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER(ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER(ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER(ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "50",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER(ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "50",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "50",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2) OVER(ORDER BY id ROWS CURRENT ROW EXCLUDE CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER() AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER(PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER(ORDER BY v NULLS LAST) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER(ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER(ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER(ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER(ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER(ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,7) OVER(ORDER BY id ROWS CURRENT ROW EXCLUDE CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER() AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER(PARTITION BY g ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER(ORDER BY v NULLS LAST) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER(ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER(ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER(ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER(ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER(ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,NULL) OVER(ORDER BY id ROWS CURRENT ROW EXCLUDE CURRENT ROW) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,0) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "22016",
+      "rows": null,
+      "diagnostic": "ERROR:  22016: argument of nth_value must be greater than zero\nLOCATION:  window_nth_value, windowfuncs.c:721"
+    },
+    {
+      "sql": "SELECT id,nth_value(v,-1) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "22016",
+      "rows": null,
+      "diagnostic": "ERROR:  22016: argument of nth_value must be greater than zero\nLOCATION:  window_nth_value, windowfuncs.c:721"
+    },
+    {
+      "sql": "SELECT id,nth_value(v,g) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,2147483647) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          null,
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1::smallint) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "10",
+          "integer"
+        ],
+        [
+          "5",
+          "10",
+          "integer"
+        ],
+        [
+          "6",
+          "10",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1::bigint) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function nth_value(integer, bigint) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,nth_value(...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1.2) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function nth_value(integer, numeric) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,nth_value(...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,first_value(NULL) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "42804",
+      "rows": null,
+      "diagnostic": "ERROR:  42804: could not determine polymorphic type because input has type unknown\nLOCATION:  enforce_generic_type_consistency, parse_coerce.c:2513"
+    },
+    {
+      "sql": "SELECT id,last_value('text') OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "42804",
+      "rows": null,
+      "diagnostic": "ERROR:  42804: could not determine polymorphic type because input has type unknown\nLOCATION:  enforce_generic_type_consistency, parse_coerce.c:2513"
+    },
+    {
+      "sql": "SELECT id,first_value(v,1) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function first_value(integer, integer) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,first_valu...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,last_value() OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function last_value() does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,last_value...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,nth_value(v) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function nth_value(integer) does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,nth_value(...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,first_value(*) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "42883",
+      "rows": null,
+      "diagnostic": "ERROR:  42883: function first_value() does not exist\nLINE 1: ...ue::text,pg_typeof(value)::text)) FROM (SELECT id,first_valu...\n                                                             ^\nHINT:  No function matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  ParseFuncOrColumn, parse_func.c:629"
+    },
+    {
+      "sql": "SELECT id,nth_value(v,1/0) OVER(ORDER BY id) AS value FROM w ORDER BY id",
+      "sqlstate": "22012",
+      "rows": null,
+      "diagnostic": "ERROR:  22012: division by zero\nLOCATION:  int4div, int.c:870"
+    },
+    {
+      "sql": "SELECT id,first_value(v) OVER x AS value FROM w WINDOW x AS(PARTITION BY g ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "integer"
+        ],
+        [
+          "2",
+          null,
+          "integer"
+        ],
+        [
+          "3",
+          "10",
+          "integer"
+        ],
+        [
+          "4",
+          "40",
+          "integer"
+        ],
+        [
+          "5",
+          "50",
+          "integer"
+        ],
+        [
+          "6",
+          "60",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,0) OVER() AS value FROM w LIMIT 0",
+      "sqlstate": "00000",
+      "rows": [],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,nth_value(v,0) OVER() AS value FROM w WHERE FALSE",
+      "sqlstate": "00000",
+      "rows": [],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,first_value(v::text) OVER(ORDER BY id DESC) AS value FROM w ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "60",
+          "text"
+        ],
+        [
+          "2",
+          "60",
+          "text"
+        ],
+        [
+          "3",
+          "60",
+          "text"
+        ],
+        [
+          "4",
+          "60",
+          "text"
+        ],
+        [
+          "5",
+          "60",
+          "text"
+        ],
+        [
+          "6",
+          "60",
+          "text"
+        ]
+      ],
+      "diagnostic": ""
+    }
+  ]
+}

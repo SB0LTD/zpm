@@ -1,0 +1,12 @@
+{
+  "id": "PG.LITERAL.FLOAT_CONTEXT_HIGH_EXPONENT",
+  "status": "open",
+  "sql": "CREATE TABLE t(v DOUBLE PRECISION); INSERT INTO t VALUES(1e308),(1e308)",
+  "native": "PostgreSQL16.15 setup succeeded in initial aggregate capture",
+  "baseline_runtime": "ef6e3c0486ca76a3bfe70f3d91acda22c7491c16",
+  "core_error": "NumericCapacity",
+  "configured_numeric_digits": 64,
+  "scope": "High-exponent untyped numeric literal is constrained before coercion to float8. Explicit text-to-float8 cast succeeds but does not close this input limit.",
+  "evidence": ".scratch/aggregate-demand-expansion/initial-core-red.log; initial-native-capture.json",
+  "needed": "Native16/18 direct literal/coercion contracts, preserve numeric precision/capacity and SQLSTATE semantics without hidden allocation"
+}

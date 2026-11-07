@@ -1,0 +1,764 @@
+{
+  "version": "160015",
+  "matrix_queries": 88,
+  "cases": [
+    {
+      "sql": "SELECT sqrt(1::numeric)",
+      "oid": 1700,
+      "text": "1.000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.01::numeric)",
+      "oid": 1700,
+      "text": "0.10000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000001::numeric)",
+      "oid": 1700,
+      "text": "0.0010000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000001::numeric)",
+      "oid": 1700,
+      "text": "0.0000000010000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000001::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000100000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(2::numeric)",
+      "oid": 1700,
+      "text": "1.414213562373095",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.02::numeric)",
+      "oid": 1700,
+      "text": "0.14142135623730950",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000002::numeric)",
+      "oid": 1700,
+      "text": "0.0014142135623730950",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000002::numeric)",
+      "oid": 1700,
+      "text": "0.0000000014142135623730950",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000002::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000141421356237309504880",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(3::numeric)",
+      "oid": 1700,
+      "text": "1.732050807568877",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.03::numeric)",
+      "oid": 1700,
+      "text": "0.17320508075688773",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000003::numeric)",
+      "oid": 1700,
+      "text": "0.0017320508075688773",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000003::numeric)",
+      "oid": 1700,
+      "text": "0.0000000017320508075688773",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000003::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000173205080756887729353",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(4::numeric)",
+      "oid": 1700,
+      "text": "2.000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.04::numeric)",
+      "oid": 1700,
+      "text": "0.20000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000004::numeric)",
+      "oid": 1700,
+      "text": "0.0020000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000004::numeric)",
+      "oid": 1700,
+      "text": "0.0000000020000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000004::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000200000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(9::numeric)",
+      "oid": 1700,
+      "text": "3.000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.09::numeric)",
+      "oid": 1700,
+      "text": "0.30000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000009::numeric)",
+      "oid": 1700,
+      "text": "0.0030000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000009::numeric)",
+      "oid": 1700,
+      "text": "0.0000000030000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000009::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000300000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(10::numeric)",
+      "oid": 1700,
+      "text": "3.162277660168379",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.10::numeric)",
+      "oid": 1700,
+      "text": "0.31622776601683793",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000010::numeric)",
+      "oid": 1700,
+      "text": "0.0031622776601683793",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000010::numeric)",
+      "oid": 1700,
+      "text": "0.0000000031622776601683793",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000010::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000316227766016837933200",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(15::numeric)",
+      "oid": 1700,
+      "text": "3.872983346207417",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.15::numeric)",
+      "oid": 1700,
+      "text": "0.38729833462074169",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000015::numeric)",
+      "oid": 1700,
+      "text": "0.0038729833462074169",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000015::numeric)",
+      "oid": 1700,
+      "text": "0.0000000038729833462074169",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000015::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000387298334620741688518",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(16::numeric)",
+      "oid": 1700,
+      "text": "4.000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.16::numeric)",
+      "oid": 1700,
+      "text": "0.40000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000016::numeric)",
+      "oid": 1700,
+      "text": "0.0040000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000016::numeric)",
+      "oid": 1700,
+      "text": "0.0000000040000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000016::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000400000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(17::numeric)",
+      "oid": 1700,
+      "text": "4.123105625617661",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.17::numeric)",
+      "oid": 1700,
+      "text": "0.41231056256176605",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000017::numeric)",
+      "oid": 1700,
+      "text": "0.0041231056256176605",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000017::numeric)",
+      "oid": 1700,
+      "text": "0.0000000041231056256176605",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000017::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000412310562561766054982",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(99::numeric)",
+      "oid": 1700,
+      "text": "9.949874371066200",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.99::numeric)",
+      "oid": 1700,
+      "text": "0.99498743710661995",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000099::numeric)",
+      "oid": 1700,
+      "text": "0.0099498743710661995",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000099::numeric)",
+      "oid": 1700,
+      "text": "0.0000000099498743710661995",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000099::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000000994987437106619954734",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(100::numeric)",
+      "oid": 1700,
+      "text": "10.000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(1.00::numeric)",
+      "oid": 1700,
+      "text": "1.000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000100::numeric)",
+      "oid": 1700,
+      "text": "0.01000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000100::numeric)",
+      "oid": 1700,
+      "text": "0.00000001000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000100::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000001000000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(101::numeric)",
+      "oid": 1700,
+      "text": "10.049875621120890",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(1.01::numeric)",
+      "oid": 1700,
+      "text": "1.004987562112089",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000101::numeric)",
+      "oid": 1700,
+      "text": "0.01004987562112089",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000101::numeric)",
+      "oid": 1700,
+      "text": "0.00000001004987562112089",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000000101::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000001004987562112089027022",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(9999::numeric)",
+      "oid": 1700,
+      "text": "99.994999874993750",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(99.99::numeric)",
+      "oid": 1700,
+      "text": "9.999499987499375",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.009999::numeric)",
+      "oid": 1700,
+      "text": "0.09999499987499375",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000009999::numeric)",
+      "oid": 1700,
+      "text": "0.00000009999499987499375",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000009999::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000009999499987499374960935",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(10000::numeric)",
+      "oid": 1700,
+      "text": "100.0000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(100.00::numeric)",
+      "oid": 1700,
+      "text": "10.000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.010000::numeric)",
+      "oid": 1700,
+      "text": "0.10000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000010000::numeric)",
+      "oid": 1700,
+      "text": "0.00000010000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000010000::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000010000000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(10001::numeric)",
+      "oid": 1700,
+      "text": "100.0049998750062",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(100.01::numeric)",
+      "oid": 1700,
+      "text": "10.000499987500625",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.010001::numeric)",
+      "oid": 1700,
+      "text": "0.10000499987500625",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000010001::numeric)",
+      "oid": 1700,
+      "text": "0.00000010000499987500625",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000000010001::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000000010000499987500624960940",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(123456789::numeric)",
+      "oid": 1700,
+      "text": "11111.11106055556",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(1234567.89::numeric)",
+      "oid": 1700,
+      "text": "1111.1111060555555",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(123.456789::numeric)",
+      "oid": 1700,
+      "text": "11.111111060555555",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000123456789::numeric)",
+      "oid": 1700,
+      "text": "0.000011111111060555555",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.0000000000000000000000000000000123456789::numeric)",
+      "oid": 1700,
+      "text": "0.0000000000000001111111106055555544054167",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0::numeric)",
+      "oid": 1700,
+      "text": "0.000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000::numeric)",
+      "oid": 1700,
+      "text": "0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001::numeric)",
+      "oid": 1700,
+      "text": "0.000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002::numeric)",
+      "oid": 1700,
+      "text": "0.000000000000000000000000000000000000000000000000000000000001414213562373095048801688724209698078569671875376948073176680",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000099::numeric)",
+      "oid": 1700,
+      "text": "0.000000000000000000000000000000000000000000000000000000000009949874371066199547344798210012060051781265636768060791176046",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(100000000000000000000000000000000000000000000000000000000000000::numeric)",
+      "oid": 1700,
+      "text": "10000000000000000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(1000000000000000000000000000001000000000000000000000000000000::numeric)",
+      "oid": 1700,
+      "text": "1000000000000000000000000000000",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(1000000000000000000000000000001000000000000000000000000000001::numeric)",
+      "oid": 1700,
+      "text": "1000000000000000000000000000001",
+      "state": "00000",
+      "model": "Decimal sqrt with256-digit working precision"
+    },
+    {
+      "sql": "SELECT sqrt(4)",
+      "oid": 701,
+      "text": "2",
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt(4::real)",
+      "oid": 701,
+      "text": "2",
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt('4')",
+      "oid": 701,
+      "text": "2",
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt(NULL)",
+      "oid": 701,
+      "text": null,
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt(NULL::numeric)",
+      "oid": 1700,
+      "text": null,
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt(NULL::int2)",
+      "oid": 701,
+      "text": null,
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt('-0'::float8)",
+      "oid": 701,
+      "text": "-0",
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt('Infinity'::numeric)",
+      "oid": 1700,
+      "text": "Infinity",
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt('NaN'::numeric)",
+      "oid": 1700,
+      "text": "NaN",
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt('NaN'::float8)",
+      "oid": 701,
+      "text": "NaN",
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt('Infinity'::float8)",
+      "oid": 701,
+      "text": "Infinity",
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt(2::float8)",
+      "oid": 701,
+      "text": "1.4142135623730951",
+      "state": "00000",
+      "model": "explicit native edge/overload"
+    },
+    {
+      "sql": "SELECT sqrt(-1)",
+      "state": "2201F",
+      "error": "InvalidArgumentForPowerFunction",
+      "model": "native SQLSTATE"
+    },
+    {
+      "sql": "SELECT sqrt(-1::numeric)",
+      "state": "2201F",
+      "error": "InvalidArgumentForPowerFunction",
+      "model": "native SQLSTATE"
+    },
+    {
+      "sql": "SELECT sqrt('-Infinity'::numeric)",
+      "state": "2201F",
+      "error": "InvalidArgumentForPowerFunction",
+      "model": "native SQLSTATE"
+    },
+    {
+      "sql": "SELECT sqrt('-Infinity'::float8)",
+      "state": "2201F",
+      "error": "InvalidArgumentForPowerFunction",
+      "model": "native SQLSTATE"
+    },
+    {
+      "sql": "SELECT sqrt(TRUE)",
+      "state": "42883",
+      "error": "UndefinedFunction",
+      "model": "native SQLSTATE"
+    },
+    {
+      "sql": "SELECT sqrt('4'::text)",
+      "state": "42883",
+      "error": "UndefinedFunction",
+      "model": "native SQLSTATE"
+    },
+    {
+      "sql": "SELECT sqrt(4::oid)",
+      "state": "42883",
+      "error": "UndefinedFunction",
+      "model": "native SQLSTATE"
+    },
+    {
+      "sql": "SELECT sqrt()",
+      "state": "42883",
+      "error": "UndefinedFunction",
+      "model": "native SQLSTATE"
+    },
+    {
+      "sql": "SELECT sqrt(1,2)",
+      "state": "42883",
+      "error": "UndefinedFunction",
+      "model": "native SQLSTATE"
+    }
+  ],
+  "failures": [],
+  "extended_probes": 14,
+  "extended_statements": 21,
+  "script_lf_sha256": "21a704e2416f9ffcb0023098871af6a60772fd74627b75b45f7fe14844ee53de"
+}

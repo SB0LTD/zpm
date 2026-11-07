@@ -39,9 +39,36 @@ var buf: [4096]u8 = undefined;
 const len = try session.generateComplete(&s, "Hello", .{}, &buf);
 ```
 
+### LFM3 (short-convolution + GQA hybrid)
+
+```
+lfm3_plan.sig        ← schedule from GGUF metadata (per-layer KV heads, SWA pattern)
+lfm3_executor.sig    ← batched CPU forward: rolling conv state, f16 KV, sliding windows
+    └── quantized_linear.sig ← Q8_K activations x Q4_K/Q6_K integer tiles (GGML numerics),
+                                eight-row packed layouts, optional AVX-VNNI
+lfm3_tokenizer.sig   ← special-token partition, LLAMA3 pre-split, ignore_merges, chat template
+    └── unicode_class.sig    ← generated \p{L}/\p{N}/\s table (tools/gen_unicode_class.py)
+```
+
+The executor owns no threads: hosts pass a `Parallel` dispatcher that runs
+independent row/channel/head ranges on their workers. Hosts that can spare the
+memory (`requiredPackedBytes`, the matrices' own size) also hand caller-owned
+storage to `packWeights`: eight-row interleaved Q4_K/Q6_K copies let one
+activation load and scale unpack serve eight rows in prefill and decode.
+`tools/lfm3_run.sig` is the Windows host runner used for llama.cpp parity and
+speed checks.
+
+The Q4_K/Q6_K x Q8_K kernels pick their four-byte dot instruction at comptime:
+AVX-VNNI `vpdpbusd` on x86, `sdot` on AArch64 with the dotprod feature (the
+Surface Laptop's Snapdragon X), and portable vector code otherwise; all paths
+produce the same integers. `tools/aarch64_qemu/run.ps1` runs these kernel
+tests and the LFM3 contract on emulated AArch64 from an x86 host, and with
+`-HostRunner` builds `lfm3-run.exe` for Windows on ARM.
+
 ### Supported Models
 - Qwen3-0.6B (Q4_K, Q6_K) — tested, ~2s/token on ARM64
 - Qwen3-1.7B, Qwen3-4B — supported via configurable limits
+- LFM3-Audio-2B text backbone (`lfm3`, Q4_K_M) — greedy output matches llama.cpp
 
 ### Quantization Formats
 - **Q4_K** (GGML type 12): 256-element blocks, 8-wide SIMD

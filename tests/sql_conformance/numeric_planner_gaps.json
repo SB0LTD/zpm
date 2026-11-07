@@ -1,0 +1,32 @@
+{
+  "scope": "Concrete examples repaired in candidate; hosted qualification and independent final review remain pending. Historical baseline observations retained.",
+  "cases": [
+    {
+      "id": "PG.PLANNER.UNUSED_DERIVED_NUMERIC",
+      "sql": "SELECT 7 FROM (SELECT trunc(NULL::numeric,(1/0)::int4) AS x) q",
+      "native_postgresql_16_15": {
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "sqlstate": "00000"
+      },
+      "needed": "Propagate required output columns into derived plans and prune unused immutable projections before constant validation; preserve volatile semantics and grouping/window dependencies.",
+      "baseline_candidate": {
+        "sqlstate": "22012"
+      },
+      "status": "candidate_fixed_concrete_case",
+      "candidate_observation": {
+        "sqlstate": "00000",
+        "rows": [
+          [
+            "7"
+          ]
+        ]
+      },
+      "evidence": "tests/test_sql_planner_demand.sig; tests/fixtures/planner_demand_pg16.json",
+      "remaining": "General planner parity is not closed; aggregate/window output-state, scalar-subquery projection, correlation and broader pull-up remain open."
+    }
+  ]
+}

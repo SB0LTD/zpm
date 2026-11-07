@@ -1,0 +1,21 @@
+{
+  "baseline_commit": "34f371c2cb3f98640c36050bb285a7cf479edc76",
+  "scope": "local ranking candidate, unchanged118 manifest, no family/full closure claim",
+  "exit_code": 1,
+  "terminal_error": "SqlConformanceIncomplete",
+  "core_smoke_pass": 10,
+  "failures": 91,
+  "unexecuted": 17,
+  "output_sha256_lf": "d709627a8e1ad1a9a50261696e020c91060be41bcf395de3e83dc09f34fcd9c3",
+  "inputs_sha256_lf": {
+    "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
+    "tests/sql_conformance/postgres18_oracle.json": "dcf2ef99e025d694cffc06c3e07f3b164d20e58f5103becef279335afb246120",
+    "tests/sql_conformance/generate_contracts.py": "0952c368240d51046b899717ff1ca45476758ede29c160a6ab80bc62771c7cf5",
+    "src/core/sql.sig": "318a7a9bb509d449374caa4573a57d761f171a9d73fec533d8916972da3d0a07",
+    "src/core/sql/types.sig": "769d78150e09011d06638cda9d7dd8b557bda7a41532d46b6d5d52ba149e4fca",
+    "src/core/sql/ast.sig": "f0a95897397e7debd8793ea8e3fcc7513052fd1c531bc97d9fdc1f969fe13fe5",
+    "src/core/sql/binder.sig": "f1558d9047d5f4e36d2427e07beb066a410d0cf3e3ccba906dc0e81d8cfd8256",
+    "src/core/sql/exec.sig": "061500c4d524a50c2b2f2b94891df5f1c57bb824ce3984c713d78debd78577f2",
+    "src/db/postgres.sig": "e0938bbd42f007e6ae2d1dd6e01e9916d6fae990655e26391bbf2434ef0562ea"
+  }
+}

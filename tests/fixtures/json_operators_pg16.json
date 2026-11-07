@@ -1,0 +1,1736 @@
+{
+  "reference": "PostgreSQL 16.15 Ubuntu, UTF8, UTC",
+  "cases": [
+    {
+      "sql": "SELECT ('{}'::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || '[]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || 'null'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{}, null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{}, 1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || 'true'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{}, true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || '\"s\"'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{}, \"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || '{\"a\":1}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": 1}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || '[1,2]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{}, 1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || '{\"a\":{\"x\":1}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": {\"x\": 1}}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[]'::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[]'::jsonb || '[]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[]'::jsonb || 'null'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[]'::jsonb || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[]'::jsonb || 'true'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[]'::jsonb || '\"s\"'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[]'::jsonb || '{\"a\":1}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": 1}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[]'::jsonb || '[1,2]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[]'::jsonb || '{\"a\":{\"x\":1}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": {\"x\": 1}}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null, {}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::jsonb || '[]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::jsonb || 'null'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null, null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::jsonb || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null, 1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::jsonb || 'true'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null, true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::jsonb || '\"s\"'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null, \"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::jsonb || '{\"a\":1}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null, {\"a\": 1}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::jsonb || '[1,2]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null, 1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::jsonb || '{\"a\":{\"x\":1}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[null, {\"a\": {\"x\": 1}}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, {}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || '[]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || 'null'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || 'true'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || '\"s\"'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, \"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || '{\"a\":1}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, {\"a\": 1}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || '[1,2]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || '{\"a\":{\"x\":1}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, {\"a\": {\"x\": 1}}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('true'::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true, {}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('true'::jsonb || '[]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('true'::jsonb || 'null'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true, null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('true'::jsonb || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true, 1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('true'::jsonb || 'true'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true, true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('true'::jsonb || '\"s\"'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true, \"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('true'::jsonb || '{\"a\":1}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true, {\"a\": 1}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('true'::jsonb || '[1,2]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true, 1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('true'::jsonb || '{\"a\":{\"x\":1}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[true, {\"a\": {\"x\": 1}}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"s\"'::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\", {}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"s\"'::jsonb || '[]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"s\"'::jsonb || 'null'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\", null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"s\"'::jsonb || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\", 1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"s\"'::jsonb || 'true'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\", true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"s\"'::jsonb || '\"s\"'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\", \"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"s\"'::jsonb || '{\"a\":1}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\", {\"a\": 1}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"s\"'::jsonb || '[1,2]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\", 1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"s\"'::jsonb || '{\"a\":{\"x\":1}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[\"s\", {\"a\": {\"x\": 1}}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": 1}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || '[]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": 1}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || 'null'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": 1}, null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": 1}, 1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || 'true'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": 1}, true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || '\"s\"'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": 1}, \"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || '{\"a\":1}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": 1}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || '[1,2]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": 1}, 1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || '{\"a\":{\"x\":1}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": {\"x\": 1}}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1,2]'::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2, {}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1,2]'::jsonb || '[]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1,2]'::jsonb || 'null'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2, null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1,2]'::jsonb || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2, 1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1,2]'::jsonb || 'true'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2, true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1,2]'::jsonb || '\"s\"'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2, \"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1,2]'::jsonb || '{\"a\":1}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2, {\"a\": 1}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1,2]'::jsonb || '[1,2]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2, 1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1,2]'::jsonb || '{\"a\":{\"x\":1}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[1, 2, {\"a\": {\"x\": 1}}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": {\"x\": 1}}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || '[]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": {\"x\": 1}}]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || 'null'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": {\"x\": 1}}, null]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": {\"x\": 1}}, 1]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || 'true'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": {\"x\": 1}}, true]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || '\"s\"'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": {\"x\": 1}}, \"s\"]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || '{\"a\":1}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": 1}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || '[1,2]'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[{\"a\": {\"x\": 1}}, 1, 2]",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || '{\"a\":{\"x\":1}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": {\"x\": 1}}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"aa\":1,\"b\":2,\"a\":3}'::jsonb || '{\"a\":4,\"b\":null,\"z\":9}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": 4, \"b\": null, \"z\": 9, \"aa\": 1}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"x\":1}}'::jsonb || '{\"a\":{\"y\":2}}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": {\"y\": 2}}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::jsonb || '{\"b\":2}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": 1, \"b\": 2}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}' || '{\"b\":2}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\": 1, \"b\": 2}",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb || 'x'::text) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "1x",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('x'::text || '1'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "x1",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT (NULL::jsonb || '{}'::jsonb) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || NULL) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || 1) AS value",
+      "sqlstate": "42883",
+      "result": null,
+      "diagnostic": "ERROR:  42883: operator does not exist: jsonb || integer\nLINE 1: SELECT row_to_json(q) FROM (SELECT ('{}'::jsonb || 1)::text ...\n                                                        ^\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  op_error, parse_oper.c:647"
+    },
+    {
+      "sql": "SELECT (1 || '{}'::jsonb) AS value",
+      "sqlstate": "42883",
+      "result": null,
+      "diagnostic": "ERROR:  42883: operator does not exist: integer || jsonb\nLINE 1: SELECT row_to_json(q) FROM (SELECT (1 || '{}'::jsonb)::text ...\n                                              ^\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  op_error, parse_oper.c:647"
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb || 'not json') AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nLINE 1: ...ELECT row_to_json(q) FROM (SELECT ('{}'::jsonb || 'not json'...\n                                                             ^\nDETAIL:  Token \"not\" is invalid.\nCONTEXT:  JSON data, line 1: not...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"a\":1}'::json @> '{}'::json) AS value",
+      "sqlstate": "42883",
+      "result": null,
+      "diagnostic": "ERROR:  42883: operator does not exist: json @> json\nLINE 1: ...LECT row_to_json(q) FROM (SELECT ('{\"a\":1}'::json @> '{}'::j...\n                                                             ^\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  op_error, parse_oper.c:647"
+    },
+    {
+      "sql": "SELECT (' { \"b\" : 2, \"a\" : 1, \"a\" : 3 } '::json -> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "3",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT (' { \"b\" : 2, \"a\" : 1, \"a\" : 3 } '::json ->> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "3",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT (' { \"b\" : 2, \"a\" : 1, \"a\" : 3 } '::json -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT (' { \"b\" : 2, \"a\" : 1, \"a\" : 3 } '::json -> -1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT (' { \"b\" : 2, \"a\" : 1, \"a\" : 3 } '::json ->> 1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT (' { \"b\" : 2, \"a\" : 1, \"a\" : 3 } '::json #> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{ \"b\" : 2, \"a\" : 1, \"a\" : 3 }",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT (' { \"b\" : 2, \"a\" : 1, \"a\" : 3 } '::json #>> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{ \"b\" : 2, \"a\" : 1, \"a\" : 3 }",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT (' { \"b\" : 2, \"a\" : 1, \"a\" : 3 } '::json #> '{a,b,1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT (' { \"b\" : 2, \"a\" : 1, \"a\" : 3 } '::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[ 1, 2.50, { \"x\" : true } ]'::json -> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[ 1, 2.50, { \"x\" : true } ]'::json ->> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[ 1, 2.50, { \"x\" : true } ]'::json -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "1",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[ 1, 2.50, { \"x\" : true } ]'::json -> -1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{ \"x\" : true }",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[ 1, 2.50, { \"x\" : true } ]'::json ->> 1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "2.50",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[ 1, 2.50, { \"x\" : true } ]'::json #> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[ 1, 2.50, { \"x\" : true } ]",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[ 1, 2.50, { \"x\" : true } ]'::json #>> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "[ 1, 2.50, { \"x\" : true } ]",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[ 1, 2.50, { \"x\" : true } ]'::json #> '{a,b,1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[ 1, 2.50, { \"x\" : true } ]'::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}'::json -> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "null",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}'::json ->> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}'::json -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}'::json -> -1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}'::json ->> 1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}'::json #> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}'::json #>> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}'::json #> '{a,b,1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":null,\"b\":\"a\\tb\",\"c\":\"\\u00e9\"}'::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json -> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json ->> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json -> -1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json ->> 1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json #> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "1",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json #>> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "1",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json #> '{a,b,1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::json -> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::json ->> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::json -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::json -> -1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::json ->> 1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::json #> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "null",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::json #>> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::json #> '{a,b,1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('null'::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"hello\"'::json -> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"hello\"'::json ->> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"hello\"'::json -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"hello\"'::json -> -1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"hello\"'::json ->> 1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"hello\"'::json #> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "\"hello\"",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"hello\"'::json #>> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "hello",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"hello\"'::json #> '{a,b,1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"hello\"'::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}'::json -> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"b\":[1,{ \"x\":2.50 }]}",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}'::json ->> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"b\":[1,{ \"x\":2.50 }]}",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}'::json -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}'::json -> -1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}'::json ->> 1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}'::json #> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}'::json #>> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}'::json #> '{a,b,1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{ \"x\":2.50 }",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"a\":{\"b\":[1,{ \"x\":2.50 }]}}'::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "2.50",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"\\u0061\":1,\"a\":2}'::json -> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "2",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"\\u0061\":1,\"a\":2}'::json ->> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "2",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"\\u0061\":1,\"a\":2}'::json -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"\\u0061\":1,\"a\":2}'::json -> -1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"\\u0061\":1,\"a\":2}'::json ->> 1) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"\\u0061\":1,\"a\":2}'::json #> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"\\u0061\":1,\"a\":2}",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"\\u0061\":1,\"a\":2}'::json #>> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "{\"\\u0061\":1,\"a\":2}",
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"\\u0061\":1,\"a\":2}'::json #> '{a,b,1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"\\u0061\":1,\"a\":2}'::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "text"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json -> 'a') AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json ->> 'a') AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json -> 0) AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json -> -1) AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json ->> 1) AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json #> '{}') AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json #>> '{}') AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json #> '{a,b,1}') AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json -> 'a') AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json ->> 'a') AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json -> 0) AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json -> -1) AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json ->> 1) AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json #> '{}') AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json #>> '{}') AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json #> '{a,b,1}') AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json #>> '{a,b,1,x}') AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\ud800\",\"a\":1}'::json ->> 'bad' ) AS value",
+      "sqlstate": "22P02",
+      "result": null,
+      "diagnostic": "ERROR:  22P02: invalid input syntax for type json\nDETAIL:  Unicode low surrogate must follow a high surrogate.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\ud800\"...\nLOCATION:  json_errsave_error, jsonfuncs.c:646"
+    },
+    {
+      "sql": "SELECT ('{\"bad\":\"\\u0000\",\"a\":1}'::json ->> 'bad' ) AS value",
+      "sqlstate": "22P05",
+      "result": null,
+      "diagnostic": "ERROR:  22P05: unsupported Unicode escape sequence\nDETAIL:  \\u0000 cannot be converted to text.\nCONTEXT:  JSON data, line 1: {\"bad\":\"\\u0000...\nLOCATION:  json_errsave_error, jsonfuncs.c:634"
+    },
+    {
+      "sql": "SELECT (NULL::json -> 'a') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::json -> NULL::text) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('{}'::json -> 1::bigint) AS value",
+      "sqlstate": "42883",
+      "result": null,
+      "diagnostic": "ERROR:  42883: operator does not exist: json -> bigint\nLINE 1: SELECT row_to_json(q) FROM (SELECT ('{}'::json -> 1::bigint)...\n                                                       ^\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  op_error, parse_oper.c:647"
+    },
+    {
+      "sql": "SELECT ('{}'::jsonb -> 1::bigint) AS value",
+      "sqlstate": "42883",
+      "result": null,
+      "diagnostic": "ERROR:  42883: operator does not exist: jsonb -> bigint\nLINE 1: SELECT row_to_json(q) FROM (SELECT ('{}'::jsonb -> 1::bigint...\n                                                        ^\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  op_error, parse_oper.c:647"
+    },
+    {
+      "sql": "SELECT ('[10,20]'::json #> '{+1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "20",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[10,20]'::jsonb #> '{+1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "20",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[10,20]'::json #> '{ 1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "20",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[10,20]'::jsonb #> '{ 1}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "20",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "1",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb #> '{0}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::jsonb #> '{}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "1",
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('[1]'::jsonb #> '{0,0}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "jsonb"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json -> 0) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('1'::json #> '{0}') AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": null,
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"\\ud800\"'::json) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "\"\\ud800\"",
+        "type": "json"
+      },
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('\"\\u0000\"'::json) AS value",
+      "sqlstate": "00000",
+      "result": {
+        "value": "\"\\u0000\"",
+        "type": "json"
+      },
+      "diagnostic": ""
+    }
+  ]
+}

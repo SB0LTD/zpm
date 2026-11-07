@@ -550,7 +550,7 @@ test "tcp: RTT estimation - first sample" {
     rtt.update(100_000); // 100ms
     try expect(rtt.has_sample);
     try expectEqual(u32, 100_000 << 3, rtt.srtt);
-    try expect(rtt.rto >= 1_000_000); // At least 1s minimum
+    try expect(rtt.rto >= tcp.MIN_RTO_US); // RTO floor (200 ms)
 }
 
 test "tcp: RTT estimation - backoff" {
@@ -604,7 +604,7 @@ test "dhcp: processReply ignores wrong xid" {
 
 test "dns: buildQuery encodes domain labels correctly" {
     var buf: [128]u8 = undefined;
-    const len = dns.buildQuery("metadata.google.internal", &buf) orelse unreachable;
+    const len = dns.buildQuery("metadata.google.internal", 0x1234, &buf) orelse unreachable;
     try expect(len > 12); // At least header
 
     // Check question section encoding:

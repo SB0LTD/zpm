@@ -1,0 +1,169 @@
+# Aggregate-state demand gap-closing plan
+
+Status: historical test-first plan. A runtime candidate now passes50/50 locally;
+see [current scope and remaining gates](SQL_AGGREGATE_DEMAND.md). The baseline
+results and open IDs below are retained as investigation history, not current
+candidate results. Physical streaming/typed/factorized regressions have been added;
+full platform and product qualification remain pending.
+
+Historical expanded checkpoint:50 native16.15 programs, with25 matching and25 gaps
+in the standalone core test (expected exit1). All50 native observations replay
+through the public verifier. The initial16-case record below remains historical.
+The expanded test generates deterministically from the fixture, compares NULLs,
+column names/OIDs, row bags and sequence effects, and adds duplicate keys,
+empty groups, selective HAVING, row-dependent failures, FILTER/DISTINCT,
+deduplication, semantic errors and volatile controls. It does not prove optimized
+path coverage or close the runtime gap. Independent expansion review reproduced25/25/50, and native PG16.15/18.3
+calibration each passed all50 expectations. These remain finite native observations,
+not full host/runtime qualification.
+
+A separate finding records NumericCapacity for untyped1e308 assigned to float8
+under the64-digit numeric configuration. The initial observation is preserved in
+aggregate_literal_capacity_open.json; explicit text-to-float8 input in the SUM
+overflow cases isolates aggregation and does not close the literal capacity limit.
+
+This does not change the original118-program inventory or claim SQL compatibility.
+The baseline is ZPM ef6e3c0486ca76a3bfe70f3d91acda22c7491c16, under hosted
+qualification when these observations were captured. PR97 is now merged as
+fe4479c after the full matrix passed; only a CI budget file differs from this
+runtime baseline. RAMSQL PR51 is merged as c68e8f9 and its exact bundle published.
+
+An unused calculation such as SUM(1/0) currently makes a derived query fail even
+when its parent only requests the number7. PostgreSQL can return7 in that case.
+It still raises division-by-zero if ORDER BY, DISTINCT or a shared materialized
+CTE needs that aggregate result. Volatile sequence calls must retain their native
+effects. Simply removing a binder barrier would hide required dependencies while
+leaving optimized aggregate execution inconsistent.
+
+Historical initial16 checkpoint: sixteen probes match native PostgreSQL16.15 reference observations at the wire.
+On the baseline, six match and ten expose gaps. The standalone allocator-free
+contract reproduces exactly6matches/10gaps, exits1 SqlAggregateDemandIncomplete,
+and checks OIDs, integer values, row counts and sequence effects. It is deliberately
+not registered in the green regression aggregate. The frozen native events and
+source hashes are retained; PG18 characterization and broader adversarial dimensions
+remain required. Passing the existing six examples does not close a feature.
+
+Current qualified-candidate work only suppresses plain derived projections.
+The grouped/window barrier remains explicit in binder.planOutputDemand.
+Removing that barrier alone would be wrong: generic grouping, streamed/factorized
+transitions and group-row finalization still evaluate every registered aggregate.
+
+## First native-backed red cases
+
+Retain existing planner_demand_open.json examples, then add native16/18 cases for:
+- unused SUM(1/0), mixed live/dead aggregate outputs and empty input;
+- GROUP BY, HAVING, hidden ORDER BY, DISTINCT and LIMIT/OFFSET dependencies;
+- shared aggregate deduplication and live/dead FILTER, DISTINCT aggregate inputs;
+- volatile sequence arguments and filters, CASE reachability, semantic error priority;
+- ROLLUP/cardinality and repeated/shared/recursive CTE materialization barriers;
+- bound/binary execution, repeated prepares, snapshot/private-write consistency;
+- cancellation at each phase, exhausted grants, poisoned workspace/results, failed DML.
+Native results must decide volatile behavior; do not infer it from immutability or
+reuse an execution-totality proof as a side-effect proof.
+
+## Representation and implementation boundaries
+
+1. Keep output width and group-row indices stable. Add fixed caller-owned aggregate
+   demand bits bounded by existing aggregate capacity; no heap and no AST expansion.
+2. Teach dependency discovery about lowered group_relation columns: keys retain
+   cardinality dependencies, aggregate slots retain their args and FILTER only when
+   semantically live. HAVING/ORDER/DISTINCT and non-prunable effects retain producers.
+3. Preserve pre-lowering output diagnostics and native error priority. Full semantic
+   binding remains mandatory for pruned expressions.
+4. Preserve one row for ungrouped aggregation over empty input, grouped bags and
+   all conservative ROLLUP/CTE barriers. Do not conflate cardinality with value demand.
+5. Initialize every suppressed aggregate slot to NULL. Update generic aggregate
+   evaluation, streamed transition initialization/update/finalization, and projection.
+6. Initially refuse optimized transition/factorized paths with unproven partial-state
+   demand; use a tested generic fallback. Never silently omit a required state.
+7. Keep window and scalar-subquery output liveness separate until their ordering,
+   frame, correlation and volatility proofs have native-backed coverage.
+
+## Qualification
+
+Test first, independent review, full existing grouped/window/rollup suites, original
+118-program audit with honest incomplete exit, PG16/18 wire modes, all supported
+platforms and exact release qualification. No family closure or speedup claim from
+passing these finite cases. This file is a next-slice investigation note, not evidence
+that the work is implemented.
+
+## Independent test-first review
+
+Fresh review reproduced the6/10 red result and independently recaptured all16
+complete native event arrays on PostgreSQL16.15. It found no incorrect expected
+result, but these tests are insufficient for implementation qualification.
+
+Before modifying runtime code, expand the corpus with duplicate group keys,
+empty grouped input, selected NULL aggregates, live group keys/results and
+selective HAVING. Add row-dependent failing aggregate arguments (constant1/0
+alone cannot isolate transition suppression), multiple/deduplicated aggregates,
+live/dead FILTER and aggregate DISTINCT. Exercise generic, streaming and
+factorized paths or require an explicit tested fallback. Semantic-invalid dead
+expressions, prepared/binary modes, poisoned reuse, cancellation/grants,
+snapshot/private writes, failed DML and PostgreSQL18 also remain open.
+
+## Reproduction from a clean checkout
+
+Native verification requires an explicitly selected loopback trust/peer native
+test instance as postgres/postgres; it creates only session-local TEMP objects
+and records the actual server version. No RAMSQL or sibling repository import
+is needed. Invoke:
+
+```text
+python tools/verify_sql_aggregate_demand.py --port <native-port> --expected-major 16 --report <report-path>
+```
+
+For the standalone red core contract, use a matched Sig compiler and SDK, create
+an output directory, and run these exact arguments (quote the -M/-femit arguments
+in PowerShell):
+
+```text
+sig build-exe --Sig-lib-dir <matched-SDK-lib> -OReleaseSafe --dep sql "-Mroot=tests/test_sql_aggregate_demand.sig" "-Msql=src/core/sql.sig" "-femit-bin=<output-executable>"
+<output-executable>
+```
+
+Compilation must exit0; the current expanded baseline executable must exit1 with
+SqlAggregateDemandIncomplete and25passing/25gaps/50programs. The historical
+initial16 version reported6passing/10gaps; it is not the current checkout. A later corrected
+implementation needs expanded passing contracts and the full qualification gates,
+not this baseline red result. Frozen16 fixture fields cover integer OIDs, names,
+values, row counts, command tags, SQLSTATE and sequence effects; the public
+verifier does not claim all possible types or typmods.
+
+The reproducibility finding is closed: fresh independent review invoked the public
+helper on native16.15 (all16pass) and verified that an intentionally wrong major
+exits2 with a harness error. The remaining group-cardinality, transition-path and
+qualification findings stay open with stable IDs in aggregate_demand_red_evidence.json.
+No runtime fix or merge readiness follows from this test-harness improvement.
+
+## Expanded corpus reproduction and CI calibration
+
+Regenerate/check the standalone contract from the frozen fixture with:
+
+```text
+python tools/generate_sql_aggregate_demand.py
+python tools/generate_sql_aggregate_demand.py --check
+```
+
+Use the same compiler argv above; the expanded baseline must report25matching /
+25gaps /50programs and exit1. The public native verifier now replays50programs,
+with a fresh connection and TEMP objects for each case, including case-specific
+setup. Native16.15 was independently replayed, and hosted16.15/18.3 each passed50cases
+in run41407604728. Oracle-only calibration does not count as host qualification.
+
+An explicit workflow_dispatch native_oracles_only=true mode runs only native
+oracle calibration. It skips host builds and is NOT full qualification; push and
+pull_request keep all host gates. This supports fixture/version calibration
+without claiming green runtime implementation or spending a full host matrix.
+
+## Expanded independent review checkpoint
+
+Fresh review reproduced the generated25/25/50 core result, replayed50 native16.15
+programs, checked both hosted16.15/18.3 reports, and independently reproduced the
+numeric-literal capacity finding and successful explicit float8 input. No blocking
+harness/oracle-mode defect was found. Its stale reproduction-count note is fixed.
+
+AGG-TRANSITION-01 remains open: this generated database has factorized_aggregates
+and typed_grouped_aggregates disabled. There are no join/external-storage fixtures
+or path assertions. Passing these50 cases after a generic fix would not establish
+streaming/factorized correctness or justify a release claiming the gap is closed.

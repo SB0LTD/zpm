@@ -1,0 +1,175 @@
+{
+  "reference": "PostgreSQL 16.15 Ubuntu 16.15-0ubuntu0.24.04.1, x86_64",
+  "postgres18_source": "https://github.com/postgres/postgres/blob/REL_18_3/src/backend/utils/adt/timestamp.c",
+  "cases": [
+    {
+      "sql": "SELECT '294277-06-01'::timestamp",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: timestamp out of range: \"294277-06-01\"\nLINE 1: SELECT '294277-06-01'::timestamp;\n               ^\nLOCATION:  timestamp_in, timestamp.c:184"
+    },
+    {
+      "sql": "SELECT '300000-01-01'::date::timestamp",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: date out of range for timestamp\nLOCATION:  date2timestamp_opt_overflow, date.c:590"
+    },
+    {
+      "sql": "SELECT '300000-01-01'::date::timestamptz",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: date out of range for timestamp\nLOCATION:  date2timestamptz_opt_overflow, date.c:653"
+    },
+    {
+      "sql": "SELECT timestamp '294276-12-31' + interval '1 month'",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: timestamp out of range\nLOCATION:  timestamp_pl_interval, timestamp.c:2959"
+    },
+    {
+      "sql": "SELECT timestamptz '294276-12-31 00:00:00+00' + interval '1 month'",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: timestamp out of range\nLOCATION:  timestamptz_pl_interval_internal, timestamp.c:3087"
+    },
+    {
+      "sql": "SELECT date 'infinity' - date 'infinity'",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: cannot subtract infinite dates\nLOCATION:  date_mi, date.c:492"
+    },
+    {
+      "sql": "SELECT date '-infinity' - date '2000-01-01'",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: cannot subtract infinite dates\nLOCATION:  date_mi, date.c:492"
+    },
+    {
+      "sql": "SELECT date '2000-01-01' - date 'infinity'",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: cannot subtract infinite dates\nLOCATION:  date_mi, date.c:492"
+    },
+    {
+      "sql": "SELECT date '2000-01-01' + 1::bigint",
+      "sqlstate": "42883",
+      "output": "",
+      "diagnostic": "ERROR:  42883: operator does not exist: date + bigint\nLINE 1: SELECT date '2000-01-01' + 1::bigint;\n                                 ^\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  op_error, parse_oper.c:647"
+    },
+    {
+      "sql": "SELECT 1::bigint + date '2000-01-01'",
+      "sqlstate": "42883",
+      "output": "",
+      "diagnostic": "ERROR:  42883: operator does not exist: bigint + date\nLINE 1: SELECT 1::bigint + date '2000-01-01';\n                         ^\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  op_error, parse_oper.c:647"
+    },
+    {
+      "sql": "SELECT date '2000-01-01' - 1::bigint",
+      "sqlstate": "42883",
+      "output": "",
+      "diagnostic": "ERROR:  42883: operator does not exist: date - bigint\nLINE 1: SELECT date '2000-01-01' - 1::bigint;\n                                 ^\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.\nLOCATION:  op_error, parse_oper.c:647"
+    },
+    {
+      "sql": "SELECT date '2000-01-01' - (-2147483648)::integer",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: date out of range\nLOCATION:  date_mii, date.c:541"
+    },
+    {
+      "sql": "SELECT (date '5874897-12-31' - date '4714-11-24 BC')::text, (date '4714-11-24 BC' - date '5874897-12-31')::text",
+      "sqlstate": "00000",
+      "output": "2147483493|-2147483493",
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('294276-12-31 23:59:59.999999'::timestamp(0))::text, ('4714-11-24 00:00:00.000001 BC'::timestamp(0))::text",
+      "sqlstate": "00000",
+      "output": "294277-01-01 00:00:00|4714-11-24 00:00:00 BC",
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT ('294277-01-01 00:00:00+01'::timestamptz)::text, (date 'infinity' + 1)::text, (date '-infinity' - 1)::text",
+      "sqlstate": "00000",
+      "output": "294276-12-31 23:00:00+00|infinity|-infinity",
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT 1",
+      "sqlstate": "00000",
+      "output": "1",
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT '9223372036854.9999999 seconds'::interval",
+      "sqlstate": "22015",
+      "output": "",
+      "diagnostic": "ERROR:  22015: interval field value out of range: \"9223372036854.9999999 seconds\"\nLINE 1: SELECT '9223372036854.9999999 seconds'::interval;\n               ^\nLOCATION:  DateTimeParseError, datetime.c:3999"
+    },
+    {
+      "sql": "SELECT '9223372036854775807.9 microseconds'::interval",
+      "sqlstate": "22015",
+      "output": "",
+      "diagnostic": "ERROR:  22015: interval field value out of range: \"9223372036854775807.9 microseconds\"\nLINE 1: SELECT '9223372036854775807.9 microseconds'::interval;\n               ^\nLOCATION:  DateTimeParseError, datetime.c:3999"
+    },
+    {
+      "sql": "SELECT '-9223372036854775807.9 microseconds ago'::interval",
+      "sqlstate": "22015",
+      "output": "",
+      "diagnostic": "ERROR:  22015: interval field value out of range: \"-9223372036854775807.9 microseconds ago\"\nLINE 1: SELECT '-9223372036854775807.9 microseconds ago'::interval;\n               ^\nLOCATION:  DateTimeParseError, datetime.c:3999"
+    },
+    {
+      "sql": "SELECT '9223372036854776 milliseconds'::interval",
+      "sqlstate": "22015",
+      "output": "",
+      "diagnostic": "ERROR:  22015: interval field value out of range: \"9223372036854776 milliseconds\"\nLINE 1: SELECT '9223372036854776 milliseconds'::interval;\n               ^\nLOCATION:  DateTimeParseError, datetime.c:3999"
+    },
+    {
+      "sql": "SELECT '153722867281 minutes'::interval",
+      "sqlstate": "22015",
+      "output": "",
+      "diagnostic": "ERROR:  22015: interval field value out of range: \"153722867281 minutes\"\nLINE 1: SELECT '153722867281 minutes'::interval;\n               ^\nLOCATION:  DateTimeParseError, datetime.c:3999"
+    },
+    {
+      "sql": "SELECT '2562047789 hours'::interval",
+      "sqlstate": "22015",
+      "output": "",
+      "diagnostic": "ERROR:  22015: interval field value out of range: \"2562047789 hours\"\nLINE 1: SELECT '2562047789 hours'::interval;\n               ^\nLOCATION:  DateTimeParseError, datetime.c:3999"
+    },
+    {
+      "sql": "SELECT '2147483648 days'::interval",
+      "sqlstate": "22015",
+      "output": "",
+      "diagnostic": "ERROR:  22015: interval field value out of range: \"2147483648 days\"\nLINE 1: SELECT '2147483648 days'::interval;\n               ^\nLOCATION:  DateTimeParseError, datetime.c:3999"
+    },
+    {
+      "sql": "SELECT '2147483648 months'::interval",
+      "sqlstate": "22015",
+      "output": "",
+      "diagnostic": "ERROR:  22015: interval field value out of range: \"2147483648 months\"\nLINE 1: SELECT '2147483648 months'::interval;\n               ^\nLOCATION:  DateTimeParseError, datetime.c:3999"
+    },
+    {
+      "sql": "SELECT -interval '-2147483648 months'",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: interval out of range\nLOCATION:  interval_um, timestamp.c:3227"
+    },
+    {
+      "sql": "SELECT interval '2147483647 months' + interval '1 month'",
+      "sqlstate": "22008",
+      "output": "",
+      "diagnostic": "ERROR:  22008: interval out of range\nLOCATION:  interval_pl, timestamp.c:3277"
+    },
+    {
+      "sql": "SELECT '-9223372036854775807.9 microseconds'::interval::text, '9223372036854775807 microseconds'::interval::text",
+      "sqlstate": "00000",
+      "output": "-2562047788:00:54.775808|2562047788:00:54.775807",
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT 1",
+      "sqlstate": "00000",
+      "output": "1",
+      "diagnostic": ""
+    }
+  ],
+  "timezone": "UTC"
+}

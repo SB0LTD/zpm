@@ -1,0 +1,2 @@
+windows: grouping_rollup
+PASS SQL rollup: 19443 assertions

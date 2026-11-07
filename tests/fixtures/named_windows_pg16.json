@@ -1,0 +1,546 @@
+{
+  "reference": "PostgreSQL16.15",
+  "setup": "CREATE TEMP TABLE w(id INTEGER PRIMARY KEY,g INTEGER,v INTEGER); INSERT INTO w VALUES(1,1,10),(2,1,NULL),(3,1,30),(4,2,40),(5,2,50),(6,NULL,60);",
+  "cases": [
+    {
+      "sql": "SELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(ORDER BY id) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "bigint"
+        ],
+        [
+          "2",
+          "10",
+          "bigint"
+        ],
+        [
+          "3",
+          "40",
+          "bigint"
+        ],
+        [
+          "4",
+          "80",
+          "bigint"
+        ],
+        [
+          "5",
+          "130",
+          "bigint"
+        ],
+        [
+          "6",
+          "190",
+          "bigint"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(PARTITION BY g ORDER BY id ROWS 1 PRECEDING) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "bigint"
+        ],
+        [
+          "2",
+          "10",
+          "bigint"
+        ],
+        [
+          "3",
+          "30",
+          "bigint"
+        ],
+        [
+          "4",
+          "40",
+          "bigint"
+        ],
+        [
+          "5",
+          "90",
+          "bigint"
+        ],
+        [
+          "6",
+          "60",
+          "bigint"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,lag(v) OVER x AS value FROM w WINDOW x AS(PARTITION BY g ORDER BY id ROWS CURRENT ROW) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "integer"
+        ],
+        [
+          "2",
+          "10",
+          "integer"
+        ],
+        [
+          "3",
+          null,
+          "integer"
+        ],
+        [
+          "4",
+          null,
+          "integer"
+        ],
+        [
+          "5",
+          "40",
+          "integer"
+        ],
+        [
+          "6",
+          null,
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,cume_dist() OVER x AS value FROM w WINDOW x AS(PARTITION BY g ORDER BY v) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "0.3333333333333333",
+          "double precision"
+        ],
+        [
+          "2",
+          "1",
+          "double precision"
+        ],
+        [
+          "3",
+          "0.6666666666666666",
+          "double precision"
+        ],
+        [
+          "4",
+          "0.5",
+          "double precision"
+        ],
+        [
+          "5",
+          "1",
+          "double precision"
+        ],
+        [
+          "6",
+          "1",
+          "double precision"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,ntile(2) OVER x AS value FROM w WINDOW x AS(PARTITION BY g ORDER BY id) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ],
+        [
+          "2",
+          "1",
+          "integer"
+        ],
+        [
+          "3",
+          "2",
+          "integer"
+        ],
+        [
+          "4",
+          "1",
+          "integer"
+        ],
+        [
+          "5",
+          "2",
+          "integer"
+        ],
+        [
+          "6",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER (x ORDER BY id) AS value FROM w WINDOW x AS(PARTITION BY g) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "bigint"
+        ],
+        [
+          "2",
+          "10",
+          "bigint"
+        ],
+        [
+          "3",
+          "40",
+          "bigint"
+        ],
+        [
+          "4",
+          "40",
+          "bigint"
+        ],
+        [
+          "5",
+          "90",
+          "bigint"
+        ],
+        [
+          "6",
+          "60",
+          "bigint"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER (x ROWS 1 PRECEDING) AS value FROM w WINDOW x AS(ORDER BY id) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "bigint"
+        ],
+        [
+          "2",
+          "10",
+          "bigint"
+        ],
+        [
+          "3",
+          "30",
+          "bigint"
+        ],
+        [
+          "4",
+          "70",
+          "bigint"
+        ],
+        [
+          "5",
+          "90",
+          "bigint"
+        ],
+        [
+          "6",
+          "110",
+          "bigint"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER z AS value FROM w WINDOW x AS(PARTITION BY g),y AS(x ORDER BY id),z AS(y ROWS 1 PRECEDING) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "bigint"
+        ],
+        [
+          "2",
+          "10",
+          "bigint"
+        ],
+        [
+          "3",
+          "30",
+          "bigint"
+        ],
+        [
+          "4",
+          "40",
+          "bigint"
+        ],
+        [
+          "5",
+          "90",
+          "bigint"
+        ],
+        [
+          "6",
+          "60",
+          "bigint"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER (x) AS value FROM w WINDOW x AS(ORDER BY id) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "bigint"
+        ],
+        [
+          "2",
+          "10",
+          "bigint"
+        ],
+        [
+          "3",
+          "40",
+          "bigint"
+        ],
+        [
+          "4",
+          "80",
+          "bigint"
+        ],
+        [
+          "5",
+          "130",
+          "bigint"
+        ],
+        [
+          "6",
+          "190",
+          "bigint"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(ROWS UNBOUNDED PRECEDING) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "bigint"
+        ],
+        [
+          "2",
+          "10",
+          "bigint"
+        ],
+        [
+          "3",
+          "40",
+          "bigint"
+        ],
+        [
+          "4",
+          "80",
+          "bigint"
+        ],
+        [
+          "5",
+          "130",
+          "bigint"
+        ],
+        [
+          "6",
+          "190",
+          "bigint"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER (x) AS value FROM w WINDOW x AS(ROWS UNBOUNDED PRECEDING) ORDER BY id",
+      "sqlstate": "42P20",
+      "rows": null,
+      "diagnostic": "ERROR:  42P20: cannot copy window \"x\" because it has a frame clause\nLINE 1: ...typeof(value)::text)) FROM (SELECT id,sum(v) OVER (x) AS val...\n                                                             ^\nHINT:  Omit the parentheses in this OVER clause.\nLOCATION:  transformWindowDefinitions, parse_clause.c:2893"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER (x PARTITION BY g) AS value FROM w WINDOW x AS() ORDER BY id",
+      "sqlstate": "42P20",
+      "rows": null,
+      "diagnostic": "ERROR:  42P20: cannot override PARTITION BY clause of window \"x\"\nLINE 1: ...typeof(value)::text)) FROM (SELECT id,sum(v) OVER (x PARTITI...\n                                                             ^\nLOCATION:  transformWindowDefinitions, parse_clause.c:2845"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER (x ORDER BY id) AS value FROM w WINDOW x AS(ORDER BY v) ORDER BY id",
+      "sqlstate": "42P20",
+      "rows": null,
+      "diagnostic": "ERROR:  42P20: cannot override ORDER BY clause of window \"x\"\nLINE 1: ...typeof(value)::text)) FROM (SELECT id,sum(v) OVER (x ORDER B...\n                                                             ^\nLOCATION:  transformWindowDefinitions, parse_clause.c:2857"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER missing AS value FROM w WINDOW x AS() ORDER BY id",
+      "sqlstate": "42704",
+      "rows": null,
+      "diagnostic": "ERROR:  42704: window \"missing\" does not exist\nLINE 1: ...typeof(value)::text)) FROM (SELECT id,sum(v) OVER missing AS...\n                                                             ^\nLOCATION:  transformWindowFuncCall, parse_agg.c:1068"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(y),y AS() ORDER BY id",
+      "sqlstate": "42704",
+      "rows": null,
+      "diagnostic": "ERROR:  42704: window \"y\" does not exist\nLINE 1: ...ELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(y),y AS()...\n                                                             ^\nLOCATION:  transformWindowDefinitions, parse_clause.c:2796"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(x) ORDER BY id",
+      "sqlstate": "42704",
+      "rows": null,
+      "diagnostic": "ERROR:  42704: window \"x\" does not exist\nLINE 1: ...ELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(x) ORDER ...\n                                                             ^\nLOCATION:  transformWindowDefinitions, parse_clause.c:2796"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(),x AS() ORDER BY id",
+      "sqlstate": "42P20",
+      "rows": null,
+      "diagnostic": "ERROR:  42P20: window \"x\" is already defined\nLINE 1: ...d,sum(v) OVER x AS value FROM w WINDOW x AS(),x AS() ORDER B...\n                                                             ^\nLOCATION:  transformWindowDefinitions, parse_clause.c:2784"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER z AS value FROM w WINDOW x AS(ORDER BY id RANGE UNBOUNDED PRECEDING),z AS(x) ORDER BY id",
+      "sqlstate": "42P20",
+      "rows": null,
+      "diagnostic": "ERROR:  42P20: cannot copy window \"x\" because it has a frame clause\nLINE 1: ...W x AS(ORDER BY id RANGE UNBOUNDED PRECEDING),z AS(x) ORDER ...\n                                                             ^\nLOCATION:  transformWindowDefinitions, parse_clause.c:2887"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER \"X\" AS value FROM w WINDOW \"X\" AS(ORDER BY id) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "10",
+          "bigint"
+        ],
+        [
+          "2",
+          "10",
+          "bigint"
+        ],
+        [
+          "3",
+          "40",
+          "bigint"
+        ],
+        [
+          "4",
+          "80",
+          "bigint"
+        ],
+        [
+          "5",
+          "130",
+          "bigint"
+        ],
+        [
+          "6",
+          "190",
+          "bigint"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER \"X\" AS value FROM w WINDOW x AS(ORDER BY id) ORDER BY id",
+      "sqlstate": "42704",
+      "rows": null,
+      "diagnostic": "ERROR:  42704: window \"X\" does not exist\nLINE 1: ...typeof(value)::text)) FROM (SELECT id,sum(v) OVER \"X\" AS val...\n                                                             ^\nLOCATION:  transformWindowFuncCall, parse_agg.c:1068"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(ORDER BY id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) ORDER BY id",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          null,
+          "bigint"
+        ],
+        [
+          "2",
+          "40",
+          "bigint"
+        ],
+        [
+          "3",
+          "40",
+          "bigint"
+        ],
+        [
+          "4",
+          "80",
+          "bigint"
+        ],
+        [
+          "5",
+          "100",
+          "bigint"
+        ],
+        [
+          "6",
+          "50",
+          "bigint"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT 1 AS id,1 AS value FROM w WINDOW x AS(ORDER BY nonexistent)",
+      "sqlstate": "42703",
+      "rows": null,
+      "diagnostic": "ERROR:  42703: column \"nonexistent\" does not exist\nLINE 1: ...CT 1 AS id,1 AS value FROM w WINDOW x AS(ORDER BY nonexisten...\n                                                             ^\nLOCATION:  errorMissingColumn, parse_relation.c:3722"
+    },
+    {
+      "sql": "SELECT 1 AS id,1 AS value FROM w WINDOW x AS(ORDER BY sum(v))",
+      "sqlstate": "00000",
+      "rows": [
+        [
+          "1",
+          "1",
+          "integer"
+        ]
+      ],
+      "diagnostic": ""
+    },
+    {
+      "sql": "SELECT 1 AS id,count(*) AS value FROM w WINDOW x AS(ORDER BY v)",
+      "sqlstate": "42803",
+      "rows": null,
+      "diagnostic": "ERROR:  42803: column \"w.v\" must appear in the GROUP BY clause or be used in an aggregate function\nLINE 1: ... 1 AS id,count(*) AS value FROM w WINDOW x AS(ORDER BY v))q;\n                                                                  ^\nLOCATION:  check_ungrouped_columns_walker, parse_agg.c:1489"
+    },
+    {
+      "sql": "SELECT id,(SELECT sum(v) OVER x FROM w) AS value FROM w WINDOW x AS() ORDER BY id",
+      "sqlstate": "42704",
+      "rows": null,
+      "diagnostic": "ERROR:  42704: window \"x\" does not exist\nLINE 1: ...alue)::text)) FROM (SELECT id,(SELECT sum(v) OVER x FROM w) ...\n                                                             ^\nLOCATION:  transformWindowFuncCall, parse_agg.c:1068"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER x AS value FROM w WHERE FALSE WINDOW x AS(ROWS -1 PRECEDING)",
+      "sqlstate": "22013",
+      "rows": null,
+      "diagnostic": "ERROR:  22013: frame starting offset must not be negative\nLOCATION:  ExecWindowAgg, nodeWindowAgg.c:2156"
+    },
+    {
+      "sql": "SELECT id,sum(v) OVER x AS value FROM w WINDOW x AS(ROWS (1/0) PRECEDING) LIMIT 0",
+      "sqlstate": "22012",
+      "rows": null,
+      "diagnostic": "ERROR:  22012: division by zero\nLOCATION:  int4div, int.c:870"
+    }
+  ]
+}

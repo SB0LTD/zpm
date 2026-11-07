@@ -1,0 +1,1668 @@
+{
+  "engine": "PostgreSQL16.15 Windows x64",
+  "vendor_archive_sha256": "25e6fcdfb8caec38691bf461125e7564508760666f7b8e5dc6a5f0818f58f81e",
+  "scope": "plain derived query outputs and immutable constant diagnostics; aggregate/set/subquery-output pruning excluded",
+  "cases": [
+    {
+      "sql": "SELECT sqrt(-1::numeric) WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "2201F",
+          "message": "cannot take square root of a negative number"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1/0 WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1/0 LIMIT 0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT CASE WHEN FALSE THEN 1/0 ELSE 7 END WHERE FALSE",
+      "result": {
+        "columns": [
+          [
+            "case",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT CASE WHEN v>0 THEN 7 ELSE 1/0 END FROM t WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT trunc(NULL::numeric,(1/0)::int4) AS x) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT sqrt(-1::numeric) AS x FROM t) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ],
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 2",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x ORDER BY x) q",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x LIMIT 0) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT x FROM (SELECT 1/0 AS x LIMIT 0) q",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT DISTINCT 1/0 AS x) q",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT nextval('seq') AS x FROM t) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ],
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 2",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT currval('seq')",
+      "result": {
+        "columns": [
+          [
+            "currval",
+            20,
+            8,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "2"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1 FROM t WHERE FALSE AND 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1 FROM t WHERE 1/0=0 AND FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1 FROM t WHERE v>0 AND FALSE AND 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1 FROM t WHERE v>0 AND 1/0=0 AND FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1 FROM t WHERE TRUE OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "1"
+          ],
+          [
+            "1"
+          ]
+        ],
+        "command": "SELECT 2",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1 FROM t WHERE 1/0=0 OR TRUE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS a,1/0 AS b) q WHERE a=1",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS a,1/0 AS b) q WHERE b=1",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT a FROM (SELECT 1 AS a,1/0 AS b) q ORDER BY a",
+      "result": {
+        "columns": [
+          [
+            "a",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT v AS a,sqrt(-1::numeric) AS b FROM t WHERE id=1) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS b FROM t WHERE FALSE) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT b FROM (SELECT 1/0 AS b FROM t WHERE FALSE) q",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS b FROM t) q JOIN t x ON TRUE",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ],
+          [
+            "7"
+          ],
+          [
+            "7"
+          ],
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 4",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS a,1/0 AS b) q JOIN t x ON q.a=x.id",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "WITH q AS(SELECT 1 AS a,1/0 AS b) SELECT a FROM q",
+      "result": {
+        "columns": [
+          [
+            "a",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "WITH q AS(SELECT 1 AS a,1/0 AS b) SELECT x.a FROM q x,q y",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "WITH q AS(SELECT 1 AS a,1/0 AS b) SELECT x.a,y.b FROM q x,q y",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x) q WHERE FALSE",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x) q LIMIT 0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT nextval('seq') AS x,1/0 AS y) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x) q WHERE CASE WHEN FALSE THEN x>0 ELSE TRUE END",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT CASE WHEN FALSE THEN (SELECT 1/0) ELSE 7 END",
+      "result": {
+        "columns": [
+          [
+            "case",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT coalesce(7,(SELECT 1/0))",
+      "result": {
+        "columns": [
+          [
+            "coalesce",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS x) q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT setval('seq',1,false)",
+      "result": {
+        "columns": [
+          [
+            "setval",
+            20,
+            8,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT abs(-2147483648) WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22003",
+          "message": "integer out of range"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT abs(-2147483648) LIMIT 0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22003",
+          "message": "integer out of range"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT floor(1/0::numeric) FROM t WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT ceil(1/0::numeric) LIMIT 0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT sign(1/0::numeric) WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT round(1/0::numeric) WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT trunc(NULL::numeric,(1/0)::int4) WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT CASE WHEN FALSE THEN sqrt(-1::numeric) ELSE 7 END LIMIT 0",
+      "result": {
+        "columns": [
+          [
+            "case",
+            1700,
+            -1,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT coalesce(7,1/0) WHERE FALSE",
+      "result": {
+        "columns": [
+          [
+            "coalesce",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT coalesce(v,1/0) FROM t WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT CASE WHEN id>0 THEN 7 ELSE sqrt(-1::numeric) END FROM t LIMIT 0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "2201F",
+          "message": "cannot take square root of a negative number"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1/0,missing FROM t",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "42703",
+          "message": "column \"missing\" does not exist"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x,missing FROM t) q",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "42703",
+          "message": "column \"missing\" does not exist"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT sqrt(TRUE) AS x) q",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "42883",
+          "message": "function sqrt(boolean) does not exist"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x) q ORDER BY 1",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT q.a FROM (SELECT 1 AS a,1/0 AS b) q WHERE q.a+1=2 OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "a",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1+1 AS x) q WHERE x=2 OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1.0+1.0 AS x) q WHERE x=2 OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1/0 AS x) q LEFT JOIN t ON TRUE",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ],
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 2",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT nextval('seq') LIMIT 0",
+      "result": {
+        "columns": [
+          [
+            "nextval",
+            20,
+            8,
+            -1,
+            0
+          ]
+        ],
+        "rows": [],
+        "command": "SELECT 0",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT nextval('seq')",
+      "result": {
+        "columns": [
+          [
+            "nextval",
+            20,
+            8,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT currval('seq')",
+      "result": {
+        "columns": [
+          [
+            "currval",
+            20,
+            8,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT sqrt(-1::numeric) WHERE FALSE AND 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "2201F",
+          "message": "cannot take square root of a negative number"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT CASE WHEN FALSE THEN 1/0 ELSE 7 END FROM (SELECT 1/0 AS x) q",
+      "result": {
+        "columns": [
+          [
+            "case",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "INSERT INTO t(id,v) SELECT 3,1/0 WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "UPDATE t SET v=1/0 WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "DELETE FROM t WHERE FALSE RETURNING 1/0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT id,v FROM t ORDER BY id",
+      "result": {
+        "columns": [
+          [
+            "id",
+            23,
+            4,
+            -1,
+            0
+          ],
+          [
+            "v",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "1",
+            "-1"
+          ],
+          [
+            "2",
+            "4"
+          ]
+        ],
+        "command": "SELECT 2",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT sqrt(-1::numeric) FROM (SELECT 1) q WHERE 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "2201F",
+          "message": "cannot take square root of a negative number"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 1/0 FROM (SELECT 1) q WHERE sqrt(-1::numeric)=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT sqrt(-1::numeric) FROM (SELECT 1) q WHERE (1/0=0 AND FALSE)",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "2201F",
+          "message": "cannot take square root of a negative number"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT sqrt(-1::numeric) FROM (SELECT 1) q WHERE CASE WHEN 1/0=0 THEN TRUE ELSE FALSE END",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "2201F",
+          "message": "cannot take square root of a negative number"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT ROW(1/0,2) IN(NULL) AS x) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT ROW(1/0,2) BETWEEN NULL AND NULL AS x) q",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT CASE WHEN FALSE THEN ROW(1/0,2) IN(NULL) ELSE TRUE END",
+      "result": {
+        "columns": [
+          [
+            "case",
+            16,
+            1,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT FALSE AND ROW(1/0,2) IN(NULL)",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            16,
+            1,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "f"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT ROW(1/0,2) IN(NULL) WHERE FALSE",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1.0 AS x) q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 'abc' AS x) q WHERE x='abc' OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT NULL::int AS x) q WHERE x IS NULL OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT DATE '2026-11-01' AS x) q WHERE x=DATE '2026-11-01' OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS x,1/0 AS y) q WHERE x=1 OR y=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT CASE WHEN FALSE THEN nextval('seq') ELSE 1 END AS x) q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(1)))))))))))))))))))))))))))))))))))))))) AS x) q WHERE abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(abs(x))))))))))))))))))))))))))))))))))))))))=1",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT DISTINCT 1 AS x) q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS x ORDER BY x) q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS x LIMIT 0) q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS x LIMIT 1) q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS x OFFSET 0) q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT 1 AS x,sum(v) AS y FROM t) q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "WITH q AS(SELECT 1 AS x) SELECT 7 FROM q WHERE x=1 OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "WITH q AS(SELECT 1 AS x) SELECT 7 FROM q a,q b WHERE a.x=1 OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "WITH q AS(SELECT 1 AS x) SELECT 7 FROM (SELECT x FROM q) a,q b WHERE a.x=1 OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "WITH q AS(SELECT 1 AS x) SELECT 7 FROM (SELECT 1 AS x FROM q) a,q b WHERE a.x=1 OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT trunc(NULL::numeric,1::int) AS x) q WHERE x IS NULL OR 1/0=0",
+      "result": {
+        "columns": [
+          [
+            "?column?",
+            23,
+            4,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "7"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "I"
+      }
+    },
+    {
+      "sql": "SELECT 7 FROM (SELECT trunc(NULL::numeric,nextval('seq')::int) AS x) q WHERE x IS NULL OR 1/0=0",
+      "result": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "22012",
+          "message": "division by zero"
+        },
+        "transaction": "I"
+      }
+    }
+  ],
+  "setup_native": [
+    "CREATE TEMP TABLE t(id INT,v INT)",
+    "INSERT INTO t VALUES(1,-1),(2,4)",
+    "CREATE TEMP SEQUENCE seq"
+  ]
+}

@@ -1,0 +1,432 @@
+# SQL conformance inventory and closing plan
+
+Status: incomplete; reconciled 1 November 2026 against qualified ZPM main
+`69f75554b4e33d2421d20d389c13918d3ab3538f` (SQRT source `8d8e5c9`).
+The original TDD baseline was `53655a9a89a3ddff6f2f5829388b09a10c3d9c93`.
+PostgreSQL 18.3 is the frozen positive language oracle for this inventory;
+PostgreSQL wire compatibility is a separate contract. MySQL and T-SQL targets
+require their own versioned native oracles. See the
+[current TDD checkpoint](../../docs/SQL_CONFORMANCE_TDD_STATUS.md) and
+[latest recorded checkpoint](checkpoint_20261101.json).
+
+## What this inventory proves
+
+`cases.json` defines 118 executable smoke programs with stable IDs. A smoke pass does not close a feature. `postgres18_features.json` preserves all 755 upstream feature records (459 YES, 296 NO), including bindings outside ordinary SQL. Applicability and mapping remain unreviewed; no assertion of exhaustive SQL coverage is made. The source is [PostgreSQL REL_18_3 sql_features.txt](https://github.com/postgres/postgres/blob/REL_18_3/src/backend/catalog/sql_features.txt), blob `ebe85337c2877ba927b1dee97bc54a9a80470f04`.
+
+Every closure needs result values and exact types; NULL/empty/duplicate/order cases; negative SQLSTATE and atomicity cases; parameters and prepared execution; rollback/replay; cancellation and exhausted grants; concurrency where relevant; supported-platform runs. Preserve non-applicable dimensions with a reviewed reason. An accepted syntax tree alone is insufficient.
+
+## Work sequence and gates
+
+1. Pin the target and validate each positive fixture on native PostgreSQL. Invalid fixtures are test defects, never compatibility passes. Record server version, source SHA, machine, command and result.
+2. Close one semantic slice at a time: first null-safe equality, then quantified/row predicates and scalar functions. Write failing contracts before modifying code. Keep the broad audit red while gaps remain.
+3. Establish typed expression and relational IR invariants; expand types, NULL/collation rules, and scalar/aggregate contracts. Keep planner transformations behind explicit semantic proofs.
+4. Complete relational composition: lateral/table functions, CTE forms, windows, advanced grouping and set operations. Compare generic and optimized execution on generated small tables against PostgreSQL, preserving bags and ordering.
+5. Complete mutation/schema/dependencies: constraints, indexes, ALTER, views, MERGE, sequence lifecycle and generated columns. Test failures before/after WAL reservation and publication; replay must reproduce state.
+6. Transactions, locks, cursors, role policies, catalogs, routines, COPY and administrative/integration SQL need dedicated multi-session/protocol/recovery suites. SQL syntax does not prove their system behavior.
+7. Qualify other dialects independently using native MySQL and SQL Server. Never infer semantic compatibility from listener availability.
+8. Only after correctness gates, measure physical design candidates on unchanged dbMeter plus larger independent distributions. Track regressions and retain generic fallbacks. Performance is not a substitute for conformance.
+
+No calendar promise or universal speedup is implied. A release claiming complete compatibility is blocked until the declared scope has closure evidence and all unresolved applicable upstream records have been adjudicated.
+
+## Concrete smoke specifications
+
+Current core run: **12 smoke passes, 89 failures, 17 unexecuted scopes/comparators**.
+The broad executable still deliberately exits with SqlConformanceIncomplete.
+The former8/93/17 result is retained at `core_smoke_results.consolidation.ndjson`;
+the earlier6/95/17 result remains at `core_smoke_results.stage4.ndjson`.
+These probes are not a percentage of PostgreSQL compatibility. Core-only
+rejection of a server utility does not prove absence in the server layer.
+Some probes combine several features: their first failure does not mean every
+component is missing. The annotations below separate those cases.
+
+| ID | Feature | Core smoke status |
+|---|---|---|
+| PG.PRED.DISTINCT | NULL-safe equality | pass; closure incomplete |
+| PG.PRED.QUANTIFIED | ANY/SOME/ALL, scalar subqueries with six ordinary comparison operators | pass; array/row/custom-operator forms and closure remain incomplete |
+| PG.PRED.SYMMETRIC | Symmetric BETWEEN | pass; scalar/flat-row range contracts, broader closure incomplete |
+| PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
+| PG.PRED.REGEX | Regular expressions | pass (B11 candidate); ARE operators, SIMILAR TO, regexp_like; back references, BREs and positional regexp_* functions open |
+| PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
+| PG.QUERY.WINDOW | Ranking/offset windows | qualified smoke pass; LAG/LEAD finite coverage, demand/other window closure incomplete |
+| PG.QUERY.WINDOW_AGG | Window aggregates | pass; complete window family remains partial |
+| PG.QUERY.WINDOW_FRAMES | Named windows and frame exclusions | qualified smoke pass; scoped named inheritance and bounded/excluded frames; wider family incomplete |
+| PG.GROUP.ROLLUP | ROLLUP/GROUPING | pass; flat ROLLUP/GROUPING only, broader grouping remains partial |
+| PG.GROUP.CUBE | CUBE | UndefinedFunction |
+| PG.GROUP.SETS | GROUPING SETS | Syntax |
+| PG.AGG.COLLECTION | String/array aggregates | pass (B11 candidate); aggregate ORDER BY/DISTINCT, array_agg (scalars, arrays), string_agg (text, bytea); window and grouping-set forms 0A000 |
+| PG.AGG.STATISTICAL | Statistical aggregates | UndefinedFunction |
+| PG.AGG.ORDERED_SET | Ordered-set aggregates | pass (B11 candidate); percentile_cont/disc, mode, hypothetical rank/dense_rank/percent_rank/cume_dist; array fractions open |
+| PG.AGG.BITWISE | Bitwise aggregates | UndefinedFunction |
+| PG.AGG.INTERVAL | AVG(interval) | UndefinedFunction |
+| PG.JOIN.LATERAL | LATERAL | Syntax |
+| PG.JOIN.NATURAL | NATURAL JOIN | Syntax |
+| PG.JOIN.TREE | Parenthesized join tree | UnsupportedStatement |
+| PG.QUERY.TABLE_FUNCTION | Set-returning/table functions | Syntax |
+| PG.QUERY.MODIFYING_CTE | Data-modifying CTE | Syntax |
+| PG.QUERY.CTE_MATERIALIZATION | CTE materialization syntax | Syntax |
+| PG.QUERY.RECURSIVE_SEARCH | Recursive SEARCH/CYCLE | Syntax |
+| PG.QUERY.ROW | Flat constructor comparison predicates | pass; record values and remaining row forms unqualified |
+| PG.QUERY.VALUES_TABLE | Standalone VALUES/TABLE | UnsupportedStatement |
+| PG.QUERY.SAMPLE | TABLESAMPLE | Syntax |
+| PG.QUERY.FETCH_TIES | FETCH WITH TIES | Syntax |
+| PG.QUERY.LIMIT_EXPR | Expression LIMIT/OFFSET | Syntax |
+| PG.DDL.SCHEMA | Schema lifecycle | pass (B11 candidate); schema-qualified tables, closure incomplete |
+| PG.DDL.ALTER | ALTER TABLE | pass (B11 candidate); column/default/NOT NULL/constraint actions, closure incomplete |
+| PG.DDL.CREATE_VARIANTS | Temporary/CTAS/LIKE | pass (B11 candidate); TEMP tables are ordinary durable tables, closure incomplete |
+| PG.DDL.INHERITANCE | Table inheritance | pass (B11 candidate); parent reads expand, UPDATE/DELETE through a parent 0A000 |
+| PG.DDL.PARTITION | Partition lifecycle | pass (B11 candidate); RANGE/LIST/DEFAULT, INSERT routing, keys on partitioned tables 0A000 |
+| PG.DDL.IF_EXISTS | Conditional DDL | qualified smoke pass; table/sequence clauses, wider DDL/notice parity incomplete |
+| PG.DDL.TRUNCATE | TRUNCATE | pass (B11 candidate); closure incomplete |
+| PG.DDL.DATABASE | Database lifecycle | UnexecutedScopeOrComparator |
+| PG.CONSTRAINT.COMPOSITE | Composite/table-level primary key | pass (B11 candidate); closure incomplete |
+| PG.CONSTRAINT.UNIQUE | UNIQUE/NULL rules | pass (B11 candidate); scan-enforced, closure incomplete |
+| PG.CONSTRAINT.CHECK | CHECK | pass (B11 candidate); closure incomplete |
+| PG.CONSTRAINT.FK | Foreign-key actions | pass (B11 candidate); MATCH SIMPLE, all five actions, closure incomplete |
+| PG.CONSTRAINT.DEFERRED | Deferred constraints | pass (B11 candidate); UNIQUE/FK/EXCLUDE at statement end or COMMIT |
+| PG.CONSTRAINT.EXCLUSION | Exclusion constraints | pass (B11 candidate); `=` and range `&&`, scan-enforced |
+| PG.INDEX.SECONDARY | Secondary/index catalog | pass (B11 candidate); hash entries per version, equality probes only |
+| PG.INDEX.ADVANCED | Composite/expression/partial/covering index | pass (B11 candidate); expression/predicate are definitions, entries hash plain keys |
+| PG.DML.UPDATE_FROM | UPDATE FROM | pass (B11 candidate); RETURNING of source columns open |
+| PG.DML.DELETE_USING | DELETE USING | pass (B11 candidate); closure incomplete |
+| PG.DML.TUPLE_ASSIGN | Tuple assignment | pass (B11 candidate); sub-SELECT source open |
+| PG.DML.MERGE | MERGE | pass (B11 candidate); RETURNING and OVERRIDING open |
+| PG.DML.UPSERT_UNIQUE | Non-PK upsert | pass (B11 candidate); constraint/index arbiters, partial-index inference open |
+| PG.SEQUENCE.EXTENDED | Sequence lifecycle/cache/SERIAL | pass (B11 candidate); OWNED BY/RENAME open |
+| PG.DDL.VIRTUAL | Virtual generated columns | pass (B11 candidate); computed at write (immutable), catalog 'v' |
+| PG.VIEW.ORDINARY | Views | pass (B11 candidate); bind-time expansion, read-only, OR REPLACE open |
+| PG.VIEW.MATERIALIZED | Materialized views | pass (B11 candidate); REFRESH CONCURRENTLY open |
+| PG.TYPE.CHARACTER | VARCHAR/CHAR | Syntax |
+| PG.TYPE.BINARY | BYTEA | Syntax |
+| PG.TYPE.UUID | UUID | Syntax |
+| PG.TYPE.TIME | TIME/TIMETZ | Syntax |
+| PG.TYPE.MONEY | MONEY | Syntax |
+| PG.TYPE.BIT | BIT/VARBIT | Syntax |
+| PG.TYPE.NETWORK | Network/MAC | pass (B11 candidate); inet/cidr/macaddr, macaddr8 and inet arithmetic open |
+| PG.TYPE.GEOMETRIC | Geometric types | pass (B11 candidate); point/box only, other geometric types open |
+| PG.TYPE.XML | XML | pass (B11 candidate); well-formedness subset, XPath/xmltable/publishing functions open |
+| PG.TYPE.ARRAY | Arrays | pass (B11 candidate); unnest, element assignment and array aggregates open |
+| PG.TYPE.RANGE | Range/multirange | pass (B11 candidate); built-in ranges only, multiranges open |
+| PG.TYPE.ENUM_DOMAIN_COMPOSITE | User-defined types | Syntax; not implemented (oracle OIDs 18673/18682 come from the native cluster's OID history; see docs/SQL_CATALOG_SECURITY.md) |
+| PG.TYPE.CATALOG_IDS | Additional catalog identifiers | pass (B11 candidate); pg_lsn/xid8, closure incomplete |
+| PG.JSON.OPS | JSON operators | qualified smoke pass; lexical extraction, broader JSON closure incomplete |
+| PG.JSONB.MODIFY | Remaining JSONB operations | pass (B11 candidate); jsonb_set/_lax/insert, - and #-, ?| ?&, strip_nulls, pretty, to_json[b]; subscript assignment open |
+| PG.JSON.PATH | JSONPATH/SQL-JSON | pass (B11 candidate); jsonpath type, lax/strict evaluator, jsonb_path_* and @? @@; like_regex, keyvalue, datetime methods 0A000 |
+| PG.JSON.TABLE | JSON_TABLE | pass (B11 candidate); PASSING, ORDINALITY, value/query/EXISTS columns, ON EMPTY/ON ERROR; NESTED PATH 0A000 |
+| PG.JSON.AGG | JSON aggregates | pass (B11 candidate); json[b]_agg, json[b]_object_agg with to_json[b] conversion; constructors and *_strict/_unique open |
+| PG.FUNC.STRING | String functions | Syntax |
+| PG.FUNC.NUMERIC | Numeric functions | UndefinedFunction |
+| PG.FUNC.TEMPORAL | Temporal functions | Syntax |
+| PG.FUNC.FORMAT | Formatting functions | UndefinedFunction for to_date/to_number; temporal to_char implemented separately |
+| PG.FUNC.MINMAX | GREATEST/LEAST | pass; closure incomplete |
+| PG.FUNC.DISCOVERY | Discovery functions | pass (B11 candidate); pg_typeof (regtype), pg_get_serial_sequence; other catalog functions open |
+| PG.TEXT.COLLATION | Collation selection | pass (B11 candidate); COLLATE with C-equivalent collations and explicit derivation; column collations, ICU/Unicode collations open |
+| PG.TEXT.ENCODING | Unicode/codepoint functions | UndefinedFunction |
+| PG.TEXT.LITERALS | Escape/dollar/Unicode literals | Syntax |
+| PG.TEXT.SEARCH | Full text search | pass (B11 candidate); simple configuration, default parser, to_*tsquery, @@; Snowball configurations, ranking and tsvector operators open |
+| PG.OP.BITWISE | Bitwise operators | Syntax |
+| PG.TX.ISOLATION | Repeatable Read/Serializable | pass (B11 candidate); REPEATABLE READ snapshot + 40001, relation-granularity SSI (more 40001s than PostgreSQL) |
+| PG.TX.CHARACTERISTICS | Transaction characteristics | pass (B11 candidate); READ ONLY 25006, DEFERRABLE safe-snapshot wait, 25001 hooks; SET TRANSACTION SNAPSHOT open |
+| PG.TX.LOCK_MODES | Additional row lock modes | pass (B11 candidate); four strengths and OF; non-key UPDATE still FOR UPDATE strength |
+| PG.TX.TABLE_LOCK | Explicit table/advisory locking | pass (B11 candidate); eight LOCK modes, NOWAIT, try/unlock advisory forms; blocking (void) advisory forms open |
+| PG.TX.TWO_PHASE | Two-phase commit | UnexecutedScopeOrComparator |
+| PG.CURSOR | Cursor lifecycle | pass (B11 candidate); materialized at DECLARE, all FETCH/MOVE directions, SCROLL, WITH HOLD |
+| PG.SQL_PREPARE | SQL prepared statements | pass (B11 candidate); declared parameter types only (no inference) |
+| PG.SESSION.SETTINGS | General settings/search_path | pass (B11 candidate); transactional SET/SET LOCAL, placeholders, current_setting/set_config; search_path limited to public |
+| PG.SESSION.NOTIFY | Notifications | pass (B11 candidate); delivered at commit, NotificationResponse on the wire; pg_notify() open |
+| PG.SECURITY.ROLE | Roles/privileges | pass (B11 candidate); roles, membership, table GRANT/REVOKE with 42501 checks, SET ROLE; column/schema/sequence privileges and passwords open |
+| PG.SECURITY.RLS | Row-level security | pass (B11 candidate); policies filter reads/UPDATE/DELETE, WITH CHECK 42501; subqueries in policies, COPY FROM/MERGE/ON CONFLICT under RLS open |
+| PG.ROUTINE.FUNCTION | SQL functions | pass (B11 candidate); SQL / PL/pgSQL functions, overloads, STRICT; SQL bodies beyond one SELECT expression open (docs/SQL_ROUTINES.md) |
+| PG.ROUTINE.PROCEDURE | Procedures/DO | pass (B11 candidate); CALL, DO, statements with INTO, EXCEPTION blocks; transaction control open |
+| PG.ROUTINE.TRIGGER | Triggers | pass (B11 candidate); BEFORE/AFTER ROW/STATEMENT, WHEN, UPDATE OF; INSTEAD OF and statements in trigger functions open |
+| PG.ROUTINE.RULE | Rewrite rules | pass (B11 candidate); DO [ALSO|INSTEAD] NOTHING with qualifications; rule actions open |
+| PG.CATALOG | Catalog expansion | pass (B11 candidate); pg_toast listed (always empty) |
+| PG.UTILITY.EXPLAIN | Explain/analyze plans | UnexecutedScopeOrComparator |
+| PG.UTILITY.MAINTENANCE | Maintenance commands | UnexecutedScopeOrComparator |
+| PG.UTILITY.COMMENT | Object comments | pass (B11 candidate); durable comments on relations, columns, schemas, roles, policies, wrappers, servers, publications; indexes/functions open |
+| PG.INTEGRATION.EXTENSION | Extension catalog visibility only; lifecycle remains untested | pass (B11 candidate); plpgsql row only, CREATE/DROP EXTENSION of others 0A000 |
+| PG.INTEGRATION.FOREIGN | Foreign server objects | pass (B11 candidate); catalog-only wrappers and servers; handlers, options, user mappings, foreign tables open |
+| PG.INTEGRATION.REPLICATION | Publication catalog visibility only; replication remains untested | pass (B11 candidate); catalog-only publications (FOR ALL TABLES, publish options); FOR TABLE, logical decoding, subscriptions open |
+| PG.COPY.OPTIONS | COPY WHERE/options | UnexecutedScopeOrComparator |
+| MYSQL.IDENTIFIERS | Backtick identifiers | UnexecutedScopeOrComparator |
+| MYSQL.TYPES | Native unsigned types | UnexecutedScopeOrComparator |
+| MYSQL.AUTO_INCREMENT | AUTO_INCREMENT | UnexecutedScopeOrComparator |
+| MYSQL.REPLACE_UPSERT | REPLACE/upsert | UnexecutedScopeOrComparator |
+| MYSQL.LIMIT | MySQL LIMIT forms | UnexecutedScopeOrComparator |
+| MYSQL.FUNCTIONS | Native scalar functions | UnexecutedScopeOrComparator |
+| TSQL.IDENTIFIERS | Bracket identifiers | UnexecutedScopeOrComparator |
+| TSQL.TOP | TOP | UnexecutedScopeOrComparator |
+| TSQL.OUTPUT | OUTPUT | UnexecutedScopeOrComparator |
+| TSQL.APPLY | APPLY | UnexecutedScopeOrComparator |
+| TSQL.FUNCTIONS | Native scalar functions | UnexecutedScopeOrComparator |
+| TSQL.PROCEDURAL | Variables/errors/transactions | UnexecutedScopeOrComparator |
+
+## Remaining work after 1 November candidates
+
+| Area | Available slice | Still missing or unqualified |
+| --- | --- | --- |
+| Windows | Ranking/distribution, LAG/LEAD, scoped named definitions, aggregate FILTER, bounded ROWS/GROUPS, integral RANGE and exclusions; frame value functions with documented native differences | Native EXCLUDE TIES boundary differences and internal-error behavior; numeric/float/temporal RANGE offsets; shared volatile execution, uncertain nested demand, moving volatile inputs, collations and wider type/coercion coverage |
+| Grouping | Ordinary aggregates, flat ROLLUP/GROUPING and GROUP BY () | CUBE/general GROUPING SETS, composite/multiple ROLLUP, remaining aggregate families and DISTINCT domains |
+| Formatting/functions | Temporal to_char; GREATEST/LEAST; ABS/CEIL/FLOOR/TRUNC/SIGN; existing JSON/sequence/catalog subset; candidate SQRT (see SQL_SQUARE_ROOT.md) | to_date/to_number, numeric/interval/localized/ISO/timezone formatting, ordinary string/math/date/regex/discovery function families and overloads |
+| Schema/types | Existing typed tables, identity/default/stored-generation slices | VARCHAR/CHAR, UUID/BYTEA, TIME/TIMETZ, arrays/general records/user types; SERIAL; conditional DDL; ALTER/TRUNCATE/views/schemas; secondary indexes; table/composite/UNIQUE/CHECK/FK/deferred constraints |
+| Relational queries | Existing joins, scalar subqueries, recursive CTE subset, set operations | LATERAL/NATURAL/parenthesized joins, table functions, modifying/materialized CTE forms, SEARCH/CYCLE, standalone VALUES/TABLE, TABLESAMPLE, expression LIMIT/OFFSET and FETCH WITH TIES |
+| Predicates/DML | Flat row comparison/list membership/BETWEEN, scalar-subquery quantified comparisons, RETURNING and PK upsert | General/nested record values, row subquery/ANY/ALL and array forms, OVERLAPS/regex, UPDATE FROM, DELETE USING, tuple assignment, MERGE and non-PK arbiters |
+| System/dialect scope | Independently tested READ COMMITTED, savepoint, lock, prepared-wire and COPY subsets | Remaining isolation/transaction characteristics/locks, cursors, SQL PREPARE, settings/notifications, roles/RLS, routines/triggers/rules, expanded catalogs, COPY options, replication/extensions/foreign objects and native MySQL/T-SQL semantics |
+
+DISTINCT window aggregates are unsupported by PostgreSQL too; they are not an
+extra PostgreSQL-parity requirement. See [frame scope](../../docs/SQL_WINDOW_FRAMES.md)
+for exact fast paths, scalar fallback and finite caller-workspace budgets.
+
+Known wrong-result/error cases also need TDD closure. The earlier LIKE JOIN/WHERE
+error-order mismatch and general planner constant/error timing remain open.
+PG16 and PG18 themselves disagree on the retained discarded-row projection-error
+probe. The newer RAMSQL hardening audit adds temporal overflow/interval parsing,
+JSONB concatenation, infinite-date subtraction and name-binding divergences;
+the consolidation does not fix those SQLF findings. See the
+[application feature/divergence audit](https://github.com/SB0LTD/ramsql/blob/main/docs/compatibility/FEATURE_GAPS.md)
+and [system gap plan](https://github.com/SB0LTD/ramsql/blob/main/compatibility/GAP_CLOSING_PLAN.md).
+
+The 17 unexecuted cases require scope/comparator work, not a claim of 17 proven
+engine absences. Prepared wire operations and selected session/transaction
+commands already have separate server tests. The 755 upstream standard records
+still need reviewed applicability and mappings, including overloads beyond these
+118 probes. No full language or dialect closure follows from this inventory.
+
+Original dbMeter full/subset correctness is separately 7/7 for all three engines
+in run 41024725859. Its overall advantage gate failed, including stock 200-byte
+text, nine-column and 20-additional-table probes. Those finite profile limits,
+elastic schema/value storage, compact 100M-row base/MVCC storage and intra-query
+parallelism remain system/infrastructure work; this driver's small test buffers
+do not define production capacities. No local throughput was measured here.
+
+## Running
+
+The in-process first slice is `contract-sql-distinct` in `test-sql`. The differential audit is a separate development tool, deliberately outside the passing regression aggregate:
+
+```powershell
+python tests/sql_conformance/audit.py --oracle-port 55491 --candidate-port 55492 --report .sig-cache/sql-audit.json
+```
+
+Use owned disposable loopback test instances with trust authentication, matching database/user and extension/catalog setup. Each transaction fixture gets its own connection; disconnect rolls back. The harness compares typed metadata, command tags, transaction state, bags including multiplicity, NULLs and SQL errors. Cases with meaningful order must explicitly set `ordered: true`. OID-valued discovery cases need stable-object normalization before qualification; arbitrary database-local OIDs must never be equated directly. Session/cluster/COPY/native-dialect scopes are currently unexecuted and block qualification. Positive-oracle errors are reported as `oracle_invalid`. The audit always exits nonzero while only smoke coverage exists, including when every selected smoke passes. It does not silently skip gaps.
+
+`postgres18_oracle.json` records the native PostgreSQL 18.3 fixture run, including
+exact server version and manifest SHA-256 (UTF-8 with LF newlines): 102 valid programs and 16 unexecuted
+scopes. Regenerate this evidence when changing SQL or target version. The generator
+rejects stale evidence. To run the corresponding allocator-free core contracts:
+
+```powershell
+python tests/sql_conformance/generate_contracts.py --oracle-report tests/sql_conformance/postgres18_oracle.json --output .sig-cache/sql-conformance-generated.sig
+sig build-exe -O ReleaseSafe --dep sql -Mroot=.sig-cache/sql-conformance-generated.sig -Msql=src/core/sql.sig -femit-bin=.sig-cache/sql-conformance.exe
+.sig-cache/sql-conformance.exe
+python -m unittest discover -s tests/sql_conformance -p test_audit.py
+```
+
+Use the repository-supported SDK/toolchain options if the installed compiler needs
+an explicit library path. The generated core driver uses one transaction per
+fixture and fixed caller-owned test storage (8 tables, 16 columns, 32 rows/table,
+64 result/work rows, 512-byte cells, 2048 expression nodes). These are test budgets,
+not production capacity claims. It checks column names, type OIDs, typmods, exact
+formatted scalar values, NULLs and row multiplicity/order after each statement.
+It does not test wire message tags, native SQL transaction commands, concurrency
+or crash durability. Such cases cannot be closed from this driver. EXPLAIN requires
+a structural comparator and remains unexecuted rather than comparing timing text.
+
+The broad generated suite deliberately returns an error while any feature or
+closure dimension is incomplete. Passing first-slice regressions and a red broad
+audit are separate, visible facts; never rewrite the audit to return success for
+unsupported SQL.
+
+The quantified-comparison regression is `contract-sql-quantified`. To reproduce
+its independent PostgreSQL oracle validation on an owned loopback test instance:
+
+```powershell
+python tests/sql_conformance/verify_quantified_oracle.py --port 55491 --report .sig-cache/quantified-oracle.json
+```
+
+The checked-in `quantified_oracle.json` pins the Sig contract and generator source
+hashes. Harness tests reject stale source or matrix identity. The finite matrix
+has 1,152 cases; 42 additional SQL examples cover types, precision boundaries,
+nesting, correlation, operators and errors. Legacy replay, resource controls and
+multi-session schedules are covered separately in Sig, not by this single-session
+native run. Quantified support currently covers SELECT-context scalar subqueries and ordinary
+`= <> != < <= > >=`; arrays, rows, LIKE/ILIKE/custom operators remain unqualified.
+DML contexts remain unqualified. All 26 default SQL contracts pass; the complete
+second-batch source/evidence record is `quantified_evidence.json`. The original
+`evidence.json` is historical and refers to the archived first-batch smoke run.
+
+The row-comparison checkpoint record is `row_evidence.json`: 27 passing default SQL contracts and
+449,096 assertions. Its constructor-predicate suite has 8,430 assertions in both
+ReleaseSafe and Debug. `row_oracle.json` records 4,160 independent matrix cases
+and 49 additional PostgreSQL 18.3 probes. Reproduce the native part with:
+
+```powershell
+python tests/sql_conformance/verify_row_oracle.py --port 55491 --report .sig-cache/row-oracle.json
+```
+
+`contract-sql-row-predicates` covers flat constructor-to-constructor comparisons
+and constructor NULL tests, including DML, grouping and scalar-subquery fields.
+Record payloads, nested records, whole-row expansion, field selection and remaining
+row membership/quantified forms are unqualified. Standalone/nested record examples
+are explicitly rejected in the Sig suite and are excluded from native passing
+scope; they are not counted as compatibility successes.
+
+The NULLIF follow-up adds `contract-sql-nullif-types`: 24 native PostgreSQL
+18.3 cases and 93 executable assertions covering cross-type result metadata,
+payload representation, volatile evaluation, aggregates and error preservation.
+Reproduce its oracle with:
+
+```powershell
+python tests/sql_conformance/verify_nullif_oracle.py --port 55491 --report .sig-cache/nullif-oracle.json
+```
+
+`nullif_oracle.json` pins the contract and oracle script hashes. The database
+workflow runs all ten Python harness/evidence tests on each native OS. Earlier
+contract totals above describe their historical checkpoints.
+
+SQLancer-style TLP, NoREC and constant-folding metamorphic tests are additional oracles, not substitutes for native differential and crash tests. See [SQLancer papers](https://github.com/sqlancer/sqlancer/blob/main/docs/PAPERS.md) and [CODDTest](https://doi.org/10.1145/3709674). Bounded equivalence can strengthen optimizer checks but remains bounded: [VeriEQL](https://arxiv.org/abs/2403.03193).
+
+Flat row-constructor IN/NOT IN lists are covered by
+`contract-sql-row-membership`: 5,928 assertions, a 2,916-case three-valued
+matrix, and 40 additional native PostgreSQL 18.3 probes. Reproduce the oracle:
+
+```powershell
+python tests/sql_conformance/verify_membership_oracle.py --port 55491 --report .sig-cache/membership-oracle.json
+```
+
+`membership_oracle.json` pins its contract/script hashes and matrix digest.
+The eleven Python tests include identity checks for this evidence. The Sig
+contract separately covers schema replay, work/cancellation and caller-storage
+exhaustion. A 64-candidate list is tested with depth five and 1,024 AST nodes;
+binding storage grows with candidate count and width. This is constructor-list
+support, not general records or row IN subqueries/ANY/ALL. Bare NULL record
+candidates and nested records remain explicitly unsupported. Historical
+unqualified-scope lists in earlier oracle records describe those earlier batches.
+
+Bare NULL record candidates are covered by `contract-sql-row-null-candidates`:
+98 assertions and 43 PostgreSQL 18.3 probes. This closes the bare-NULL exclusion
+above; refreshed constructor-list evidence includes 41 additional probes.
+Grouping/name validation, constant errors, CASE/COALESCE, volatile suppression,
+eliminated aggregates, replay and execution controls are covered. Reproduce with:
+
+```powershell
+python tests/sql_conformance/verify_row_null_oracle.py --port 55491 --report .sig-cache/row-null-oracle.json
+```
+
+`row_null_oracle.json` pins both source hashes. Twelve Python tests validate the
+current harness and evidence. General record/nested values and row subquery
+membership remain unqualified; constant validation is scoped to discarded row
+operands and does not qualify the entire optimizer.
+
+`contract-sql-between` covers scalar and flat row BETWEEN / NOT BETWEEN,
+including ASYMMETRIC and SYMMETRIC: 17,939 assertions, 8,910 finite reference
+cases and 62 additional PostgreSQL 18.3 probes. Reproduce its native oracle:
+
+```powershell
+python tests/sql_conformance/verify_between_oracle.py --port 55491 --report .sig-cache/between-oracle.json
+```
+
+`between_oracle.json` pins both sources and the matrix digest. Thirteen Python
+tests validate current evidence. The Sig contract also checks replay, resource
+controls and caller AST exhaustion. Ordinary lowering uses two comparisons and
+symmetric lowering uses four; simple typed scalar ranges retain their compact
+shape. Nested/general record payloads remain unqualified. This is correctness
+evidence, not a benchmark result or full SQL compatibility claim.
+
+`contract-sql-like-escape` covers explicit ESCAPE for LIKE/ILIKE and negated
+forms: 16,348 assertions, 8,120 matrix cases and 44 additional PostgreSQL 18.3
+probes. Reproduce its independent code-point DP/native oracle:
+
+```powershell
+python tests/sql_conformance/verify_like_oracle.py --port 55491 --report .sig-cache/like-oracle.json
+```
+
+`like_oracle.json` pins the contract/script and matrix digest. Fourteen Python
+tests validate current evidence. Sig checks replay, an at-capacity pattern,
+exact work exhaustion and cancellation inside matching. The matcher uses
+constant scratch without a normalized-pattern buffer; worst-case rescanning is
+still possible. Unicode case folding, collations, planner error timing and
+filter placement remain unqualified. The concrete JOIN/filter error mismatch is
+recorded in [the status document](../../docs/SQL_CONFORMANCE_TDD_STATUS.md).
+
+`contract-sql-expression-sources` covers ownership and validation phases of
+stored expressions: 75 assertions and 30 PostgreSQL 18.3 probes. Reproduce with:
+
+```powershell
+python tests/sql_conformance/verify_sources_oracle.py --port 55491 --report .sig-cache/sources-oracle.json
+```
+
+`sources_oracle.json` pins both sources; fifteen Python tests check current
+evidence. Sig separately checks COPY component calls, work/cancellation and replay
+after overwriting the caller's record buffer. The source owner uses existing AST
+metadata with no retained pointers or node-size growth. Complete generated-column
+restrictions and general planner error timing remain unqualified.
+
+`contract-sql-generated-restrictions` covers stored generated-column immutability,
+dependencies and supported branch reduction: 132 assertions and 52 PostgreSQL
+18.3 probes. Reproduce its native oracle with:
+
+```powershell
+python tests/sql_conformance/verify_generated_oracle.py --port 55491 --report .sig-cache/generated-oracle.json
+```
+
+`generated_oracle.json` pins both sources. Sixteen Python tests validate current
+evidence. Sig separately checks replay, sequence non-effects and interruption
+during candidate CREATE validation; the wire error map checks 42P17. Virtual
+generation, inheritance/partitioning, system-column rules, additional planner
+reductions and complete coercion coverage remain unqualified. These results
+cover explicit STORED generation within the documented expression subset.
+
+## Latest inventory candidates —31 October2026
+
+The unchanged118 programs now yield10 smoke passes,91 failures and17 unexecuted
+scopes/comparators locally. The driver still exits1 SqlConformanceIncomplete.
+The earlier8/93/17 consolidated evidence is retained as historical qualification;
+JSON and offset-window candidates have separate hashed evidence manifests.
+See [offset scope](../../docs/SQL_WINDOW_OFFSETS.md) and
+[JSON scope](../../docs/SQL_JSON_OPERATORS.md). Candidate smoke success does not
+close a feature family, and hosted qualification remains separate evidence.
+
+### Named-window candidate, 31 October 2026
+
+The unchanged118-program inventory now gives **11 smoke passes /90 failures /
+17 unexecuted**. The driver still exits1 SqlConformanceIncomplete. This adds
+PG.QUERY.WINDOW_FRAMES smoke success, not complete window-family qualification.
+`named_windows_evidence.json` pins the exact local inputs/output; older manifests
+describe their historical slices. See [named scope](../../docs/SQL_NAMED_WINDOWS.md).
+
+### Frame value-window candidate - 31 October 2026
+
+first_value/last_value/nth_value now have scoped implementation and78 native
+reference programs,600 independent interval-membership property queries,
+work/cancel/error/reuse and lazy side-effect checks. Linux ReleaseSafe passes:
+value6179, named1832, frames108118, offsets2023, ranking3053, windows9035;
+PostgreSQL protocol17325. The unchanged118 inventory remains11/90/17 and
+intentionally exits1 SqlConformanceIncomplete. The separate evidence manifest
+pins current source/output hashes; historical manifests describe older slices.
+
+Native parity remains incomplete:12 extra EXCLUDE TIES boundary programs retain
+four PostgreSQL16 value differences against independently observed array_agg
+frame membership. A separate native executor XX000/mark-state discrepancy is
+also documented. These differences are not passing compatibility evidence;
+PG18 version characterization, hosted/wire qualification and broader SQL closure
+remain pending. See the value-window scope document and boundary fixture.
+
+### Conditional DDL candidate - 1 November 2026
+
+The unchanged118-program driver now gives12 smoke passes,89 failures and17
+unexecuted; exit1 SqlConformanceIncomplete is required.49 native-reference
+programs and the207-assertion conditional contract cover the declared slice.
+Existing MVCC/catalog/change-log/expression/DML/generated contracts also pass.
+See [scope](../../docs/SQL_CONDITIONAL_DDL.md) and
+`conditional_ddl_evidence.json`. Wider schema/DDL closure remains incomplete.
+
+
+### Conditional DDL durability correction - 1 November 2026
+
+The first candidate's hosted durable run exposed unreplayable quoted schema
+names. The corrected decoder preserves bounded non-NUL identifier bytes; quoted
+identifier NULs are rejected before publication. Core220 assertions and the
+seven existing regression suites pass in Linux ReleaseSafe. The broad118 driver
+still gives12/89/17 and exits1. Updated evidence includes lexer/change-log hashes.
+The preserved failing WAL and recovery gate are documented in SQL_CONDITIONAL_DDL.md.
+Fresh hosted and full durable-wire recovery remain pending; no compatibility or
+production-completeness claim follows from the earlier49 live case successes.

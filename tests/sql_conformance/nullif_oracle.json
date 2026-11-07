@@ -1,0 +1,153 @@
+{
+  "target": "PostgreSQL 18.3",
+  "cases": [
+    {
+      "sql": "SELECT NULLIF(1::real,2::double precision)",
+      "oid": 700,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(1::real,1::double precision)",
+      "oid": 700,
+      "text": null,
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(1,2.0)",
+      "oid": 1700,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(1,1.0)",
+      "oid": 1700,
+      "text": null,
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(1,2::real)",
+      "oid": 701,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(1::numeric,2::real)",
+      "oid": 701,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(1::smallint,2::bigint)",
+      "oid": 21,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(1::int4,2::oid)",
+      "oid": 26,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF('a'::name,'b'::text)",
+      "oid": 19,
+      "text": "a",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF('a'::text,'b'::name)",
+      "oid": 25,
+      "text": "a",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(DATE '2025-01-01',TIMESTAMP '2025-01-02 00:00:00')",
+      "oid": 1082,
+      "text": "2025-01-01",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(TIMESTAMP '2025-01-01 12:00:00',TIMESTAMPTZ '2025-01-02 00:00:00+00')",
+      "oid": 1114,
+      "text": "2025-01-01 12:00:00",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(NULL,NULL)",
+      "oid": 25,
+      "text": null,
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF('1',2)",
+      "oid": 23,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(nextval('nt')::real,0::float8)",
+      "oid": 700,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT currval('nt')",
+      "oid": 20,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(nextval('nt')::real,nextval('nt')::float8)",
+      "oid": 700,
+      "text": "2",
+      "pass": true
+    },
+    {
+      "sql": "SELECT currval('nt')",
+      "oid": 20,
+      "text": "3",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(nextval('nt')::real,4::float8)",
+      "oid": 700,
+      "text": null,
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(v,0::float8) FROM nt_values",
+      "oid": 700,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(MAX(v),0::float8) FROM nt_values",
+      "oid": 700,
+      "text": "1",
+      "pass": true
+    },
+    {
+      "sql": "SELECT NULLIF(v,nextval('nt')::float8) FROM nt_values WHERE id=2",
+      "oid": 700,
+      "text": null,
+      "pass": true
+    },
+    {
+      "sql": "SELECT currval('nt')",
+      "oid": 20,
+      "text": "5",
+      "pass": true
+    },
+    {
+      "sql": "SELECT 17",
+      "oid": 23,
+      "text": "17",
+      "pass": true
+    }
+  ],
+  "failures": [],
+  "contract_sha256": "9daa7eccc1c6b6841fe515f88b45d79eb77e8d2122e99842e0ba52a7167ec065",
+  "oracle_script_sha256": "5ef9a3c875f497d369bad4b8d777521cfc0e5ed941d345a0ae8b4ff434e1108a",
+  "hash_encoding": "UTF-8 with LF newlines"
+}

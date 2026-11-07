@@ -42,12 +42,12 @@ fn addPkgTest(
             .name = name,
             .source_path = source_path,
             .imports = &.{
-            importEntry("conn", "../src/transport/conn.sig"),
-            importEntry("appmap", "../src/transport/appmap.sig"),
-            importEntry("streams", "../src/transport/streams.sig"),
-            importEntry("datagram", "../src/transport/datagram.sig"),
-            importEntry("telemetry", "../src/transport/telemetry.sig"),
-            importEntry("win32", win32_path),
+                importEntry("conn", "../src/transport/conn.sig"),
+                importEntry("appmap", "../src/transport/appmap.sig"),
+                importEntry("streams", "../src/transport/streams.sig"),
+                importEntry("datagram", "../src/transport/datagram.sig"),
+                importEntry("telemetry", "../src/transport/telemetry.sig"),
+                importEntry("win32", win32_path),
             },
         })
     else
@@ -62,7 +62,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     if (lib.len + suffix.len > process_path.len) return error.BufferTooSmall;
     @memcpy(process_path[0..lib.len], lib);
     @memcpy(process_path[lib.len..][0..suffix.len], suffix);
-    const process_source = process_path[0..lib.len + suffix.len];
+    const process_source = process_path[0 .. lib.len + suffix.len];
     _ = try ctx.addModule("sig_process", process_source);
     // Select the platform backend by the *target* OS when cross-compiling
     // (-Dtarget=...), else by the host OS. The win32 module is Windows-only;
@@ -110,6 +110,24 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, appmap, "packet", "../src/transport/packet.sig");
     // Pure-Sig HTTP/1.1 client over the TLS 1.3 stack — backs the registry
     // transport in pal.sig (replacing the old WinHTTP stub).
+    // Register the crypto dependency closure as well as the TLS imports. Each
+    // named module has its own import table; imports on tls_client do not make
+    // AES, HMAC, or SHA-256 visible inside its dependencies.
+    _ = try ctx.addModule("sha256", "../src/core/sha256.sig");
+    const crypto_hmac = try ctx.addModule("hmac", "../src/core/crypto/hmac.sig");
+    try wire(ctx, crypto_hmac, "sha256", "../src/core/sha256.sig");
+    const crypto_hkdf = try ctx.addModule("hkdf", "../src/core/crypto/hkdf.sig");
+    try wire(ctx, crypto_hkdf, "hmac", "../src/core/crypto/hmac.sig");
+    _ = try ctx.addModule("aes", "../src/core/crypto/aes.sig");
+    const crypto_gcm = try ctx.addModule("gcm", "../src/core/crypto/gcm.sig");
+    try wire(ctx, crypto_gcm, "aes", "../src/core/crypto/aes.sig");
+    const crypto_p256 = try ctx.addModule("p256", "../src/core/crypto/p256.sig");
+    try wire(ctx, crypto_p256, "sha256", "../src/core/sha256.sig");
+    try wire(ctx, crypto_p256, "hmac", "../src/core/crypto/hmac.sig");
+    const crypto_tls13 = try ctx.addModule("tls13_keys", "../src/core/crypto/tls13_keys.sig");
+    try wire(ctx, crypto_tls13, "sha256", "../src/core/sha256.sig");
+    try wire(ctx, crypto_tls13, "hkdf", "../src/core/crypto/hkdf.sig");
+    try wire(ctx, crypto_tls13, "hmac", "../src/core/crypto/hmac.sig");
     const tls_client = try ctx.addModule("tls_client", "../src/core/crypto/tls/client.sig");
     try wire(ctx, tls_client, "sha256", "../src/core/sha256.sig");
     try wire(ctx, tls_client, "p256", "../src/core/crypto/p256.sig");

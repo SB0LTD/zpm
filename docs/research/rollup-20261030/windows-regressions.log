@@ -1,0 +1,7 @@
+PASS SQL rollup: 19426 assertions
+{"suite":"sql-rollup","pass":true,"assertions":6409}
+PASS SQL windows: 8844 assertions
+PASS temporal to_char: 551 assertions
+{"suite":"sql-query","pass":true,"assertions":63417,"database_bytes":497888,"big_bytes":1268592,"work_rows":512}
+{"suite":"sql-types","pass":true,"assertions":4491,"database_bytes":589376}
+{"suite":"sql-stream-group","pass":true,"assertions":1702,"rows":100000,"query_refs":1024,"joined_rows":100000,"joined_query_refs":512}

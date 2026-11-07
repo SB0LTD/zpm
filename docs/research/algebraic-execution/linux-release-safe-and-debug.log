@@ -1,0 +1,2 @@
+PASS factor algebra: 1712 assertions; flat joined rows=182609, factor products=2968; excludes scan/link-build costs; research prototype, SQL integration=false
+PASS factor algebra: 1712 assertions; flat joined rows=182609, factor products=2968; excludes scan/link-build costs; research prototype, SQL integration=false

@@ -117,6 +117,8 @@ pub const HandshakeOptions = struct {
     /// A 16-byte nonce for Sec-WebSocket-Key. If null, a fixed dev nonce is
     /// used (the key is not a secret; it only guards against caching proxies).
     key_nonce: ?[16]u8 = null,
+    /// Extra request headers, preformatted as "Name: value\r\n" lines (e.g.
+    /// an API key header, so secrets never travel in the URL).
     extra_headers: []const u8 = "",
 };
 
@@ -130,6 +132,7 @@ pub const Client = struct {
     transport: Transport,
     recv_buf: []u8,
     got_close: bool = false,
+    /// The server's close frame: status code and reason (UTF-8, ≤ 123 bytes).
     close_code: u16 = 0,
     close_reason: [123]u8 = undefined,
     close_reason_len: usize = 0,
@@ -154,8 +157,6 @@ pub const Client = struct {
         try self.handshake(opts);
         return self;
     }
-
-    pub fn pending(self: *const Client) bool { return self.r_off < self.r_len; }
 
     // ── Opening handshake ───────────────────────────────────────────────────
 
@@ -221,6 +222,13 @@ pub const Client = struct {
         _ = std.base64.standard.Encoder.encode(&expected, &sha);
 
         return containsSeq(head, &expected);
+    }
+
+    /// True if bytes of the next frame are already buffered here (callers
+    /// that multiplex sending and receiving check this, plus their
+    /// transport's own buffers, before a blocking receiveMessage()).
+    pub fn pending(self: *const Client) bool {
+        return self.r_off < self.r_len;
     }
 
     // ── Buffered reads over the transport ────────────────────────────────────
@@ -301,6 +309,16 @@ pub const Client = struct {
         header[hlen + 2] = key[2];
         header[hlen + 3] = key[3];
         hlen += 4;
+
+        // Small frames go out as one write (one TLS record / segment) instead
+        // of header + payload pieces.
+        var whole: [8192]u8 = undefined;
+        if (hlen + payload.len <= whole.len) {
+            @memcpy(whole[0..hlen], header[0..hlen]);
+            for (payload, 0..) |b, i| whole[hlen + i] = b ^ key[i & 3];
+            self.transport.writeAll(whole[0 .. hlen + payload.len]) catch return Error.IoFailed;
+            return;
+        }
 
         self.transport.writeAll(header[0..hlen]) catch return Error.IoFailed;
 
@@ -655,4 +673,51 @@ test "containsSeq / case-insensitive header search" {
     try testing.expect(containsCaseInsensitive(head, "UPGRADE"));
     try testing.expect(containsCaseInsensitive(head, "WebSocket"));
     try testing.expect(!containsSeq(head, "404"));
+}
+
+test "small frames go out in one write, large ones in pieces, both masked" {
+    const Sink = struct {
+        var out: [12000]u8 = undefined;
+        var len: usize = 0;
+        var writes: usize = 0;
+        fn rd(_: *anyopaque, _: []u8) Error!usize {
+            return 0;
+        }
+        fn wr(_: *anyopaque, data: []const u8) Error!void {
+            @memcpy(out[len .. len + data.len], data);
+            len += data.len;
+            writes += 1;
+        }
+        fn cl(_: *anyopaque) void {}
+    };
+    var dummy: u8 = 0;
+    const t = Transport{ .ctx = &dummy, .readSomeFn = Sink.rd, .writeAllFn = Sink.wr, .closeFn = Sink.cl };
+    var c = Client{ .transport = t, .recv_buf = &.{} };
+
+    var payload: [10000]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 7);
+    const sizes = [_]usize{ 100, 8000, 10000 };
+    for (sizes) |n| {
+        Sink.len = 0;
+        Sink.writes = 0;
+        try c.sendBinary(payload[0..n]);
+        const hlen: usize = if (n <= 125) 6 else if (n <= 0xFFFF) 8 else 14;
+        try testing.expectEqual(hlen + n, Sink.len);
+        if (hlen + n <= 8192) try testing.expectEqual(@as(usize, 1), Sink.writes) else try testing.expect(Sink.writes > 1);
+        const key = Sink.out[hlen - 4 .. hlen];
+        for (payload[0..n], 0..) |b, i| try testing.expectEqual(b, Sink.out[hlen + i] ^ key[i & 3]);
+    }
+}
+
+test "a close frame records the code and reason, and pending() sees buffered bytes" {
+    // close 1008 "bye", then the start of another frame still buffered.
+    const frames = [_]u8{ 0x88, 0x05, 0x03, 0xF0, 'b', 'y', 'e', 0x81 };
+    var mem = MemTransport{ .inbox = &frames };
+    var recv: [64]u8 = undefined;
+    var c = Client{ .transport = mem.transport(), .recv_buf = &recv };
+    try testing.expectError(Error.Closed, c.receiveMessage());
+    try testing.expect(c.got_close);
+    try testing.expectEqual(@as(u16, 1008), c.close_code);
+    try testing.expectEqualStrings("bye", c.close_reason[0..c.close_reason_len]);
+    try testing.expect(c.pending());
 }

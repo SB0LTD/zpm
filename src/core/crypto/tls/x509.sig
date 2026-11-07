@@ -11,6 +11,10 @@
 //   • SPKI             — subject public key (RSA n/e or EC point) + its algorithm
 //   • SAN dNSNames     — for hostname verification
 //   • basicConstraints — is_ca + path_len (for intermediate/root checks)
+//   • keyUsage / extKeyUsage — keyCertSign on issuers, serverAuth on the leaf
+//   • nameConstraints  — the raw NameConstraints DER (checked by x509_verify)
+//   • unknown_critical — a critical extension this parser does not understand
+//                        (path validation MUST then reject the certificate)
 //
 //   Certificate ::= SEQUENCE {
 //     tbsCertificate       TBSCertificate,
@@ -29,7 +33,7 @@ pub const Error = asn1.Error || error{
     TooManyNames,
 };
 
-pub const MAX_SAN_NAMES: usize = 96;
+pub const MAX_SAN_NAMES: usize = 24;
 pub const MAX_NAME_LEN: usize = 256;
 
 /// Public-key algorithm of the certificate's subject key.
@@ -66,10 +70,35 @@ pub const Cert = struct {
 
     is_ca: bool = false,
     has_basic_constraints: bool = false,
+    /// basicConstraints pathLenConstraint (null = absent, no limit).
+    path_len: ?u8 = null,
+
+    /// keyUsage bits as they appear in the BIT STRING, bit 0 (digitalSignature)
+    /// first: KU_KEY_CERT_SIGN etc. Only meaningful when has_key_usage.
+    key_usage: u16 = 0,
+    has_key_usage: bool = false,
+
+    /// extendedKeyUsage: present at all, and which purposes it lists.
+    has_eku: bool = false,
+    eku_server_auth: bool = false,
+    eku_any: bool = false,
+
+    /// NameConstraints value DER (SEQUENCE { [0] permitted, [1] excluded }),
+    /// empty when the extension is absent.
+    name_constraints: []const u8 = &.{},
+
+    /// A critical extension we do not process was present (RFC 5280 §4.2:
+    /// such a certificate MUST be rejected). Also set when a critical
+    /// extension we do understand could not be decoded.
+    unknown_critical: bool = false,
 
     // SAN dNSNames (each a slice into the DER).
     san: [MAX_SAN_NAMES][]const u8 = [_][]const u8{&.{}} ** MAX_SAN_NAMES,
     san_count: usize = 0,
+    /// The whole SubjectAltName extension (GeneralNames DER): hostnames are
+    /// matched against all of it, however many names a certificate lists
+    /// (CDN certificates carry dozens; `san` keeps only the first few).
+    san_raw: []const u8 = &.{},
 };
 
 // ── OIDs (DER content bytes, i.e. the V of the OID TLV) ─────────────────
@@ -84,6 +113,26 @@ const OID_ECDSA_SHA256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 }
 const OID_ECDSA_SHA384 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 };
 const OID_BASIC_CONSTRAINTS = [_]u8{ 0x55, 0x1d, 0x13 };
 const OID_SAN = [_]u8{ 0x55, 0x1d, 0x11 };
+const OID_KEY_USAGE = [_]u8{ 0x55, 0x1d, 0x0f };
+const OID_EXT_KEY_USAGE = [_]u8{ 0x55, 0x1d, 0x25 };
+const OID_NAME_CONSTRAINTS = [_]u8{ 0x55, 0x1d, 0x1e };
+// Extensions that may legitimately be critical and need no action from a TLS
+// client without policy processing: subjectKeyIdentifier, authorityKeyIdentifier,
+// certificatePolicies, policyConstraints, inhibitAnyPolicy. (Policy checks are
+// not part of the web PKI's TLS-server profile; browsers ignore them too.)
+const OID_SKI = [_]u8{ 0x55, 0x1d, 0x0e };
+const OID_AKI = [_]u8{ 0x55, 0x1d, 0x23 };
+const OID_CERT_POLICIES = [_]u8{ 0x55, 0x1d, 0x20 };
+const OID_POLICY_CONSTRAINTS = [_]u8{ 0x55, 0x1d, 0x24 };
+const OID_INHIBIT_ANY_POLICY = [_]u8{ 0x55, 0x1d, 0x36 };
+// extKeyUsage purposes.
+const OID_KP_SERVER_AUTH = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01 };
+const OID_ANY_EKU = [_]u8{ 0x55, 0x1d, 0x25, 0x00 };
+
+/// keyUsage bit numbers (RFC 5280 §4.2.1.3) as masks over Cert.key_usage.
+pub const KU_DIGITAL_SIGNATURE: u16 = 1 << 0;
+pub const KU_KEY_CERT_SIGN: u16 = 1 << 5;
+pub const KU_CRL_SIGN: u16 = 1 << 6;
 
 fn sigAlgFromOid(el: asn1.Element) SigAlg {
     if (asn1.oidEquals(el, &OID_SHA256_RSA)) return .rsa_pkcs1_sha256;
@@ -208,32 +257,93 @@ fn parseExtensions(ext_wrap: asn1.Element, cert: *Cert) Error!void {
         const ext = try exts.expect(asn1.TAG_SEQUENCE);
         var e = asn1.intoSequence(ext);
         const oid = try e.expect(asn1.TAG_OID);
-        // Optional critical BOOLEAN, then the OCTET STRING value.
+        // Optional critical BOOLEAN (DEFAULT FALSE), then the OCTET STRING value.
+        var critical = false;
         var val_el = try e.next();
         if (val_el.tag == asn1.TAG_BOOLEAN) {
+            critical = val_el.data.len == 1 and val_el.data[0] != 0;
             val_el = try e.next();
         }
-        if (val_el.tag != asn1.TAG_OCTET_STRING) continue;
+        if (val_el.tag != asn1.TAG_OCTET_STRING) {
+            if (critical) cert.unknown_critical = true;
+            continue;
+        }
 
+        // Parsing stays lenient (the trust store must keep loading); a
+        // critical extension we cannot decode is flagged for the verifier.
         if (asn1.oidEquals(oid, &OID_BASIC_CONSTRAINTS)) {
-            parseBasicConstraints(val_el.data, cert);
+            parseBasicConstraints(val_el.data, cert) catch {
+                if (critical) cert.unknown_critical = true;
+            };
         } else if (asn1.oidEquals(oid, &OID_SAN)) {
             try parseSan(val_el.data, cert);
+        } else if (asn1.oidEquals(oid, &OID_KEY_USAGE)) {
+            parseKeyUsage(val_el.data, cert) catch {
+                if (critical) cert.unknown_critical = true;
+            };
+        } else if (asn1.oidEquals(oid, &OID_EXT_KEY_USAGE)) {
+            parseExtKeyUsage(val_el.data, cert) catch {
+                if (critical) cert.unknown_critical = true;
+            };
+        } else if (asn1.oidEquals(oid, &OID_NAME_CONSTRAINTS)) {
+            cert.name_constraints = val_el.data;
+        } else if (critical and !(asn1.oidEquals(oid, &OID_SKI) or
+            asn1.oidEquals(oid, &OID_AKI) or
+            asn1.oidEquals(oid, &OID_CERT_POLICIES) or
+            asn1.oidEquals(oid, &OID_POLICY_CONSTRAINTS) or
+            asn1.oidEquals(oid, &OID_INHIBIT_ANY_POLICY)))
+        {
+            cert.unknown_critical = true;
         }
     }
 }
 
-fn parseBasicConstraints(inner: []const u8, cert: *Cert) void {
+fn parseBasicConstraints(inner: []const u8, cert: *Cert) Error!void {
     cert.has_basic_constraints = true;
     // BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLen INTEGER OPTIONAL }
     var c = asn1.Cursor.init(inner);
-    const seq = c.expect(asn1.TAG_SEQUENCE) catch return;
+    const seq = try c.expect(asn1.TAG_SEQUENCE);
     var b = asn1.intoSequence(seq);
     if (b.peekTag()) |tag| {
         if (tag == asn1.TAG_BOOLEAN) {
-            const boolean = b.next() catch return;
+            const boolean = try b.next();
             if (boolean.data.len == 1 and boolean.data[0] != 0) cert.is_ca = true;
         }
+    }
+    if (b.peekTag()) |tag| {
+        if (tag == asn1.TAG_INTEGER) {
+            const v = try asn1.integerAsU64(try b.next());
+            cert.path_len = @intCast(@min(v, 255));
+        }
+    }
+}
+
+fn parseKeyUsage(inner: []const u8, cert: *Cert) Error!void {
+    // KeyUsage ::= BIT STRING; bit 0 is the MSB of the first content octet.
+    var c = asn1.Cursor.init(inner);
+    const bits = try asn1.bitStringBytes(try c.expect(asn1.TAG_BIT_STRING));
+    var ku: u16 = 0;
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        const byte = i / 8;
+        if (byte >= bits.len) break;
+        const shift: u3 = @intCast(7 - (i % 8));
+        if ((bits[byte] >> shift) & 1 != 0) ku |= @as(u16, 1) << @intCast(i);
+    }
+    cert.key_usage = ku;
+    cert.has_key_usage = true;
+}
+
+fn parseExtKeyUsage(inner: []const u8, cert: *Cert) Error!void {
+    // ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId (OID)
+    var c = asn1.Cursor.init(inner);
+    const seq = try c.expect(asn1.TAG_SEQUENCE);
+    var k = asn1.intoSequence(seq);
+    cert.has_eku = true;
+    while (!k.atEnd()) {
+        const oid = try k.expect(asn1.TAG_OID);
+        if (asn1.oidEquals(oid, &OID_KP_SERVER_AUTH)) cert.eku_server_auth = true;
+        if (asn1.oidEquals(oid, &OID_ANY_EKU)) cert.eku_any = true;
     }
 }
 
@@ -241,6 +351,7 @@ fn parseSan(inner: []const u8, cert: *Cert) Error!void {
     // GeneralNames ::= SEQUENCE OF GeneralName; dNSName is [2] IA5String (0x82).
     var c = asn1.Cursor.init(inner);
     const seq = try c.expect(asn1.TAG_SEQUENCE);
+    cert.san_raw = inner;
     var g = asn1.intoSequence(seq);
     while (!g.atEnd()) {
         const name = try g.next();
@@ -312,6 +423,16 @@ pub fn hostnameMatches(pattern: []const u8, host: []const u8) bool {
 
 /// Does any SAN dNSName match `host`?
 pub fn certMatchesHost(cert: *const Cert, host: []const u8) bool {
+    if (cert.san_raw.len > 0) {
+        var c = asn1.Cursor.init(cert.san_raw);
+        const seq = c.expect(asn1.TAG_SEQUENCE) catch return false;
+        var g = asn1.intoSequence(seq);
+        while (!g.atEnd()) {
+            const name = g.next() catch return false;
+            if (name.tag == asn1.contextPrimitive(2) and hostnameMatches(name.data, host)) return true;
+        }
+        return false;
+    }
     var i: usize = 0;
     while (i < cert.san_count) : (i += 1) {
         if (hostnameMatches(cert.san[i], host)) return true;

@@ -1,0 +1,7 @@
+{
+  "reference": "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+  "setup": "CREATE TEMP TABLE fact(id INTEGER PRIMARY KEY,k INTEGER,v INTEGER); INSERT INTO fact VALUES(1,1,10),(2,1,10),(3,1,30),(4,2,5),(5,2,NULL),(6,NULL,7);",
+  "cases": 66,
+  "sha256": "f2aaee98233648cfe89f7f2fb15399120e5144d30f808eb3ddde3c61d1145c4f",
+  "purpose": "correctness fixture; no timings"
+}

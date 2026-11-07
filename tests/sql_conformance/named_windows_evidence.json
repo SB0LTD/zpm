@@ -1,0 +1,25 @@
+{
+  "baseline_commit": "6671caf59eb61e52c092db8901c27231145b8064",
+  "scope": "local named-window candidate; unchanged118 manifest, no family/full closure claim",
+  "exit_code": 1,
+  "terminal_error": "SqlConformanceIncomplete",
+  "core_smoke_pass": 11,
+  "failures": 90,
+  "unexecuted": 17,
+  "output_sha256_lf": "d1ca525d6bfb4f77919e7353979b163368a99e963f15a8d5b583b10d72afb56c",
+  "inputs_sha256_lf": {
+    "tests/sql_conformance/cases.json": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
+    "tests/sql_conformance/postgres18_oracle.json": "dcf2ef99e025d694cffc06c3e07f3b164d20e58f5103becef279335afb246120",
+    "tests/sql_conformance/generate_contracts.py": "0952c368240d51046b899717ff1ca45476758ede29c160a6ab80bc62771c7cf5",
+    "src/core/sql.sig": "c0a349a01578f7ec8ed21e8afaffe29255345020b2947a4842e14ef78e824126",
+    "src/core/sql/types.sig": "0f26c6f391f983907aa3bc149b0585030b6a5ce86071cb18e55a1682efee2d95",
+    "src/core/sql/ast.sig": "d9dc1eeff4438add1e221904e70b8c8bfdc2196d90eba96b30db529cd23da57f",
+    "src/core/sql/binder.sig": "4e8af0188b6a9de48bb0e58f9b198b011d4728617617e664ca784924e6e13677",
+    "src/core/sql/exec.sig": "b5b583a27194e549976d6813e66125a01fd104d90db0d6f2f52e418adb1a02d9",
+    "src/db/postgres.sig": "5ea833b9dbd6d6c8a6d69885251e082ba0e7d02235d5c071dcf6f81d4c457d9d",
+    "src/core/sql/parser.sig": "2950351feb90410261ec2ad5519ca19446d99795688680a5920486844487b0d3",
+    "tests/test_sql_named_windows.sig": "ecd478805dcba80bfce1a7f2f0a3528eee999a5c91217064ae956b50c0dab2f3",
+    "tests/fixtures/named_windows_pg16.json": "3d5a30fabbde206ae89f94c62fabe54e3587b80b5465a3dd880929cb86a8ede7",
+    "tools/capture_sql_named_windows_oracle.py": "a3963d989f2ee354f154efdbbbe784eccc01d4780757df8d85f8b3a49371df7d"
+  }
+}

@@ -3,3 +3,7 @@
 *.sig text eol=lf
 # The generated contract records the exact input bytes, including newlines.
 /tools/testdata/sample_contract.json text eol=lf
+tests/evidence/to-char-pg16.tsv -text
+tests/evidence/windows-pg16.tsv -text
+tests/evidence/window-frames-pg16.tsv -text
+tests/evidence/rollup-pg16.tsv -text

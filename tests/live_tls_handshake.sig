@@ -39,8 +39,8 @@ pub fn main(init: std.process.Init) !void {
     _ = init;
 
     // 1. Seed real entropy so the X25519 client key + ClientHello.random are
-    //    unpredictable (forward secrecy). Without this the stack uses fixed
-    //    dev bytes, which a real server will still accept but is not secure.
+    //    unpredictable (forward secrecy). Without it the handshake fails with
+    //    error.NoEntropy: each handshake consumes the pool.
     tlsc.fillEntropy();
 
     const now = unixNow();

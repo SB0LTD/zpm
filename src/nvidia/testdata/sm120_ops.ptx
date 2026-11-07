@@ -1,0 +1,285 @@
+// The integer, warp and convergence forms the LFM3 and drawing kernels
+// lean on, for sm120_vectors.txt: high multiplies, 64-bit carries,
+// funnel shifts and LEA, selects, min/max, abs, population counts and
+// leading bits, byte permutes, votes and ballots, the clock, warp
+// synchronization with a variable mask, a divergent loop that ends in a
+// shuffle (BSSY, BSYNC, WARPSYNC), and the tensor cores' f16, bf16 and
+// int8 MMAs.
+.version 8.8
+.target sm_120
+.address_size 64
+
+.visible .entry ops_int(.param .u64 io, .param .u32 k, .param .u32 m)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<24>;
+
+    ld.param.u64 %rd1, [io];
+    ld.param.u32 %r1, [k];
+    ld.param.u32 %r2, [m];
+    mov.u32 %r3, %tid.x;
+    mov.u32 %r4, %laneid;
+    mul.wide.u32 %rd2, %r3, 64;
+    add.s64 %rd3, %rd1, %rd2;
+    ld.global.v4.u32 {%r5, %r6, %r7, %r8}, [%rd3];
+    ld.global.v4.u32 {%r9, %r10, %r11, %r12}, [%rd3+16];
+    mul.hi.u32 %r13, %r5, %r1;
+    mul.hi.s32 %r14, %r6, %r2;
+    mad.hi.u32 %r15, %r7, %r1, %r13;
+    // 64-bit add with carry
+    mov.b64 %rd4, {%r5, %r6};
+    mov.b64 %rd5, {%r7, %r8};
+    add.s64 %rd6, %rd4, %rd5;
+    sub.s64 %rd7, %rd4, %rd5;
+    mov.b64 {%r16, %r17}, %rd6;
+    mov.b64 {%r18, %r19}, %rd7;
+    // funnel shifts, shifts by a register, arithmetic shifts
+    shf.l.wrap.b32 %r20, %r9, %r10, %r1;
+    shf.r.clamp.b32 %r21, %r9, %r10, %r2;
+    shl.b32 %r22, %r11, %r1;
+    shr.u32 %r23, %r11, %r2;
+    shr.s32 %r24, %r12, 3;
+    shr.s32 %r25, %r12, %r1;
+    // selects, min, max, abs
+    setp.gt.s32 %p1, %r9, %r10;
+    selp.b32 %r26, %r9, %r10, %p1;
+    min.u32 %r27, %r11, %r12;
+    max.s32 %r28, %r11, %r12;
+    abs.s32 %r29, %r9;
+    // bits
+    popc.b32 %r30, %r10;
+    clz.b32 %r31, %r11;
+    bfind.u32 %r32, %r12;
+    bfind.s32 %r33, %r9;
+    brev.b32 %r34, %r10;
+    prmt.b32 %r35, %r9, %r10, 0x7531;
+    prmt.b32 %r36, %r9, %r10, %r1;
+    // a signed compare and an unsigned one, 64-bit
+    setp.lt.s64 %p2, %rd6, %rd7;
+    setp.ne.u64 %p3, %rd6, 0;
+    and.pred %p4, %p2, %p3;
+    selp.u32 %r37, 1, 0, %p4;
+    // votes and the clock
+    setp.ne.u32 %p5, %r16, 0;
+    vote.sync.ballot.b32 %r38, %p5, -1;
+    vote.sync.all.pred %p6, %p5, -1;
+    vote.sync.any.pred %p7, %p5, -1;
+    selp.u32 %r39, 2, 0, %p6;
+    selp.u32 %r40, 4, 0, %p7;
+    activemask.b32 %r41;
+    mov.u32 %r42, %clock;
+    mov.u64 %rd8, %clock64;
+    mov.u32 %r43, %lanemask_lt;
+    and.b32 %r44, %r38, %r43;
+    popc.b32 %r45, %r44;
+    add.s32 %r46, %r13, %r14;
+    add.s32 %r46, %r46, %r15;
+    add.s32 %r47, %r16, %r17;
+    add.s32 %r47, %r47, %r18;
+    add.s32 %r47, %r47, %r19;
+    add.s32 %r48, %r20, %r21;
+    add.s32 %r48, %r48, %r22;
+    add.s32 %r48, %r48, %r23;
+    add.s32 %r49, %r24, %r25;
+    add.s32 %r49, %r49, %r26;
+    add.s32 %r49, %r49, %r27;
+    add.s32 %r50, %r28, %r29;
+    add.s32 %r50, %r50, %r30;
+    add.s32 %r50, %r50, %r31;
+    add.s32 %r51, %r32, %r33;
+    add.s32 %r51, %r51, %r34;
+    add.s32 %r51, %r51, %r35;
+    add.s32 %r52, %r36, %r37;
+    add.s32 %r52, %r52, %r39;
+    add.s32 %r52, %r52, %r40;
+    add.s32 %r53, %r41, %r42;
+    add.s32 %r53, %r53, %r45;
+    add.s32 %r53, %r53, %r4;
+    st.global.v4.u32 [%rd3], {%r46, %r47, %r48, %r49};
+    st.global.v4.u32 [%rd3+16], {%r50, %r51, %r52, %r53};
+    st.global.u64 [%rd3+32], %rd8;
+    st.global.u32 [%rd3+40], %r38;
+    ret;
+}
+
+// A lane-dependent trip count (a divergent loop, which ptxas brackets
+// with BSSY and BSYNC) with a warp barrier on a mask from a parameter
+// inside it (WARPSYNC Rn).
+.visible .entry ops_converge(.param .u64 io, .param .u32 n, .param .u32 mask)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+
+    ld.param.u64 %rd1, [io];
+    ld.param.u32 %r1, [n];
+    ld.param.u32 %r8, [mask];
+    mov.u32 %r2, %tid.x;
+    and.b32 %r3, %r2, 31;
+    mul.wide.u32 %rd2, %r2, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    ld.global.f32 %f1, [%rd3];
+    mov.u32 %r4, 0;
+    add.s32 %r5, %r3, %r1;
+    setp.eq.u32 %p1, %r5, 0;
+    @%p1 bra CV_JOIN;
+CV_LOOP:
+    mul.wide.u32 %rd4, %r4, 4;
+    add.s64 %rd5, %rd3, %rd4;
+    ld.global.f32 %f2, [%rd5+128];
+    fma.rn.f32 %f1, %f1, 0f3F000000, %f2;
+    bar.warp.sync %r8;
+    add.s32 %r4, %r4, 1;
+    setp.lt.u32 %p3, %r4, %r5;
+    @%p3 bra CV_LOOP;
+CV_JOIN:
+    st.global.f32 [%rd3], %f1;
+    ret;
+}
+
+// Packed halves (adds, multiplies, fmas, min and max, compares) on
+// registers; a shuffle up; a constant table indexed by a register.
+.const .align 4 .u32 ops_table[64];
+
+.visible .entry ops_half(.param .u64 io, .param .u32 sel)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<8>;
+
+    ld.param.u64 %rd1, [io];
+    ld.param.u32 %r1, [sel];
+    mov.u32 %r2, %tid.x;
+    mul.wide.u32 %rd2, %r2, 16;
+    add.s64 %rd3, %rd1, %rd2;
+    ld.global.v4.u32 {%r3, %r4, %r5, %r6}, [%rd3];
+    add.rn.f16x2 %r7, %r3, %r4;
+    mul.rn.f16x2 %r8, %r5, %r6;
+    sub.rn.f16x2 %r9, %r7, %r8;
+    fma.rn.f16x2 %r10, %r9, %r3, %r7;
+    max.f16x2 %r11, %r10, %r4;
+    min.f16x2 %r12, %r11, %r5;
+    add.rn.bf16x2 %r13, %r3, %r4;
+    fma.rn.bf16x2 %r14, %r13, %r5, %r6;
+    shfl.sync.up.b32 %r15, %r12, 1, 0, -1;
+    and.b32 %r16, %r1, 63;
+    shl.b32 %r17, %r16, 2;
+    mov.u64 %rd4, ops_table;
+    cvt.u64.u32 %rd5, %r17;
+    add.s64 %rd6, %rd4, %rd5;
+    ld.const.u32 %r18, [%rd6];
+    add.s32 %r20, %r2, %r1;
+    and.b32 %r20, %r20, 63;
+    mul.wide.u32 %rd7, %r20, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.const.u32 %r21, [%rd8];
+    add.s32 %r19, %r15, %r18;
+    add.s32 %r19, %r19, %r21;
+    st.global.v4.u32 [%rd3], {%r12, %r14, %r19, %r10};
+    ret;
+}
+
+// Uniform values: a block's offsets from the grid and the parameters
+// (multiplies, shifts, logic, a select, a 64-bit add with carry), which
+// ptxas computes on the uniform datapath.
+.visible .entry ops_uniform(.param .u64 io, .param .u32 a, .param .u32 b, .param .u32 c, .param .u64 big)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [io];
+    ld.param.u32 %r1, [a];
+    ld.param.u32 %r2, [b];
+    ld.param.u32 %r3, [c];
+    ld.param.u64 %rd2, [big];
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ctaid.y;
+    mad.lo.s32 %r6, %r4, %r1, %r2;
+    mul.lo.s32 %r7, %r5, %r3;
+    shl.b32 %r8, %r6, 3;
+    shr.u32 %r9, %r7, 2;
+    xor.b32 %r10, %r8, %r9;
+    and.b32 %r11, %r10, 0xfff0;
+    or.b32 %r11, %r11, %r2;
+    setp.gt.u32 %p1, %r11, %r3;
+    selp.b32 %r12, %r11, %r3, %p1;
+    mul.hi.u32 %r13, %r6, %r1;
+    cvt.u64.u32 %rd3, %r12;
+    add.s64 %rd4, %rd2, %rd3;
+    mul.wide.u32 %rd5, %r13, 8;
+    add.s64 %rd6, %rd4, %rd5;
+    mov.u32 %r14, %tid.x;
+    mul.wide.u32 %rd7, %r14, 8;
+    add.s64 %rd8, %rd1, %rd7;
+    st.global.u64 [%rd8], %rd6;
+    ret;
+}
+
+// Float and half adds sharing a source (ptxas marks it .reuse: the
+// second source's slot is c's), and named barriers with thread counts.
+.visible .entry ops_reuse(.param .u64 io)
+{
+    .reg .b64 %rd<4>;
+    .reg .f32 %f<32>;
+    .reg .b32 %r<32>;
+
+    ld.param.u64 %rd1, [io];
+    ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd1];
+    ld.global.v4.f32 {%f5, %f6, %f7, %f8}, [%rd1+16];
+    add.f32 %f9, %f1, %f8;
+    add.f32 %f10, %f2, %f8;
+    add.f32 %f11, %f3, %f8;
+    add.f32 %f12, %f4, %f8;
+    add.f32 %f13, %f8, %f5;
+    add.f32 %f14, %f8, %f6;
+    add.f32 %f15, %f8, %f7;
+    bar.sync 1;
+    bar.sync 2, 64;
+    bar.arrive 3, 96;
+    st.global.v4.f32 [%rd1], {%f9, %f10, %f11, %f12};
+    st.global.v4.f32 [%rd1+16], {%f13, %f14, %f15, %f9};
+    ret;
+}
+
+// Tensor cores: an m16n8k16 f16 MMA into f32, the same with bf16, an
+// m16n8k8 f16 one into f16, and int8 m16n8k32 into s32 (signed and
+// unsigned), the fragments loaded per lane.
+.visible .entry ops_mma(.param .u64 a, .param .u64 b, .param .u64 c, .param .u64 d)
+{
+    .reg .b32 %r<96>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<32>;
+
+    ld.param.u64 %rd1, [a];
+    ld.param.u64 %rd2, [b];
+    ld.param.u64 %rd3, [c];
+    ld.param.u64 %rd4, [d];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd5, %r1, 16;
+    add.s64 %rd6, %rd1, %rd5;
+    ld.global.v4.u32 {%r2, %r3, %r4, %r5}, [%rd6];
+    mul.wide.u32 %rd7, %r1, 8;
+    add.s64 %rd8, %rd2, %rd7;
+    ld.global.v2.u32 {%r6, %r7}, [%rd8];
+    add.s64 %rd9, %rd3, %rd5;
+    ld.global.v4.f32 {%f1, %f2, %f3, %f4}, [%rd9];
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%f5, %f6, %f7, %f8}, {%r2, %r3, %r4, %r5}, {%r6, %r7}, {%f1, %f2, %f3, %f4};
+    mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f9, %f10, %f11, %f12}, {%r2, %r3, %r4, %r5}, {%r6, %r7}, {%f5, %f6, %f7, %f8};
+    mov.b32 %r8, %f9;
+    mov.b32 %r9, %f10;
+    mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%r10, %r11}, {%r2, %r3}, {%r6}, {%r8, %r9};
+    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%r12, %r13, %r14, %r15}, {%r2, %r3, %r4, %r5}, {%r6, %r7}, {%r10, %r11, %r10, %r11};
+    mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%r16, %r17, %r18, %r19}, {%r2, %r3, %r4, %r5}, {%r6, %r7}, {%r12, %r13, %r14, %r15};
+    mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%r20, %r21, %r22, %r23}, {%r2, %r3}, {%r6}, {%r16, %r17, %r18, %r19};
+    add.s64 %rd10, %rd4, %rd5;
+    st.global.v4.f32 [%rd10], {%f11, %f12, %f9, %f10};
+    mul.wide.u32 %rd11, %r1, 32;
+    add.s64 %rd12, %rd4, %rd11;
+    st.global.v4.u32 [%rd12+4096], {%r20, %r21, %r22, %r23};
+    st.global.v2.u32 [%rd12+4112], {%r10, %r11};
+    ret;
+}

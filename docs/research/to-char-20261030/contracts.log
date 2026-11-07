@@ -1,0 +1,8 @@
+PASS temporal to_char: 551 assertions
+PASS datetime template ownership: 9 assertions
+{"suite":"sql-types","pass":true,"assertions":4491,"database_bytes":567600}
+{"suite":"sql-expr","pass":true,"assertions":397,"database_bytes":319488,"wide_bytes":625440}
+PASS temporal to_char: 551 assertions
+PASS datetime template ownership: 9 assertions
+{"suite":"sql-types","pass":true,"assertions":4491,"database_bytes":567600}
+{"suite":"sql-expr","pass":true,"assertions":397,"database_bytes":319488,"wide_bytes":625440}
