@@ -134,6 +134,16 @@ pub const Adapter = struct {
         return .{ .ctx = a, .vtable = &vtable, .caps = a.caps };
     }
 
+    /// The raw device's handle of `b`, one of this adapter's buffers: what
+    /// the driver under it (gfxapi's node: Galaxy's render node) knows it
+    /// by, which a dma-buf export names. A gpu.Buffer's own handle is the
+    /// adapter's slot, not that. Null for a buffer not this adapter's.
+    pub fn rawHandle(a: *Adapter, b: gpu.Buffer) ?u32 {
+        const s = a.slotOf(b) orelse return null;
+        if (s.raw.cpu.ptr != b.cpu.ptr) return null;
+        return s.raw.handle;
+    }
+
     const vtable = gpu.Device.VTable{
         .alloc = alloc,
         .free = free,
@@ -477,6 +487,28 @@ test "kir_sm120's work fits the 16 MiB Galaxy's gfx_render compiles in (WebRende
     }
     std.debug.print("the rest {d} KiB; WORK_BYTES {d} KiB\n", .{ rest >> 10, kir_sm120.WORK_BYTES >> 10 });
     try testing.expect(kir_sm120.WORK_BYTES <= 16 << 20);
+}
+
+test "a buffer's raw handle: the device under the adapter's, not the adapter's slot" {
+    const d = freshEmu();
+    const a = try d.alloc(4096, .host);
+    const b = try d.alloc(4096, .host);
+    d.free(a);
+    // (slot 1 again, a new raw buffer under it)
+    const c = try d.alloc(8192, .host);
+    try testing.expectEqual(a.handle, c.handle);
+    const ad = &T.dev.adapter;
+    try testing.expectEqual(ad.bufs[c.handle - 1].raw.handle, ad.rawHandle(c).?);
+    try testing.expectEqual(ad.bufs[b.handle - 1].raw.handle, ad.rawHandle(b).?);
+    try testing.expect(ad.rawHandle(b).? != ad.rawHandle(c).?);
+    // (no buffer of this adapter's: none)
+    var x = b;
+    x.handle = 999;
+    try testing.expectEqual(@as(?u32, null), ad.rawHandle(x));
+    x.handle = 0;
+    try testing.expectEqual(@as(?u32, null), ad.rawHandle(x));
+    d.free(b);
+    d.free(c);
 }
 
 test "Emu over an emulator Work left undefined (a static `= undefined`): its controls are set by init" {
