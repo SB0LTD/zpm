@@ -1039,6 +1039,41 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
     });
 
+    // ── d1 (Liquid AI's decision models, System One) on the LFM3 backbone ──
+    const d1_system_one = try ctx.addModule("d1_system_one", "src/core/d1_system_one.sig");
+    try wire(ctx, d1_system_one, "gguf", "src/core/gguf.sig");
+    try wire(ctx, d1_system_one, "lfm3_plan", "src/core/lfm3_plan.sig");
+    try wire(ctx, d1_system_one, "lfm3_executor", "src/core/lfm3_executor.sig");
+    try wire(ctx, d1_system_one, "quantized_linear", "src/core/quantized_linear.sig");
+    try wire(ctx, d1_system_one, "json_pull", "src/core/json_pull.sig");
+    const test_d1 = try ctx.addStep("test-d1", "Execute d1's prompt, option codes, request and answer contracts", &noopStep);
+    try ctx.addDependency(test_all, test_d1);
+    _ = try addTest(ctx, test_d1, "test-d1-system-one", "src/core/d1_system_one.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+        importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
+        importEntry("json_pull", "src/core/json_pull.sig"),
+    });
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/d1_run.sig",
+        .output_name = "d1-run",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+            importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+            importEntry("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig"),
+            importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+            importEntry("worker_thread", "src/platform/worker_thread.sig"),
+            importEntry("sig_process", process_source),
+            importEntry("d1_system_one", "src/core/d1_system_one.sig"),
+        },
+    });
+
     // ── LFM3-Audio: hearing (mel, encoder) and speaking (MaskGIT codes, codec) ──
     _ = try ctx.addModule("lfm3_audio_mel", "src/core/lfm3_audio_mel.sig");
     const lfm3_audio_ops = try ctx.addModule("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig");

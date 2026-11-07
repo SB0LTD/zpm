@@ -65,6 +65,23 @@ produce the same integers. `tools/aarch64_qemu/run.ps1` runs these kernel
 tests and the LFM3 contract on emulated AArch64 from an x86 host, and with
 `-HostRunner` builds `lfm3-run.exe` for Windows on ARM.
 
+### d1 decision models (`d1_system_one.sig`)
+
+Liquid AI's d1-2B (LFM Open License v1.0; `LiquidAI/d1-2B-GGUF`, the same
+`lfm3` text backbone) answers typed questions about a state in one forward
+pass, with nothing decoded: `noul` (yes/no), `choice` (one option) and
+`score` (an ordered level), each a softmax over its options' tokens at the
+question's answer slot, through the checkpoint's temperature
+(`lfm3.decision.temperature.*`). Up to 16 questions share one pass after
+their state (d1's `set` attention: `lfm3_executor.forwardSees`, where the
+state reads every token, a question its state and itself, and sliding and
+convolution layers stay causal). The request and answer are
+`/v1/systemone`'s JSON. `tools/d1_run.sig` asks it from a file or serves it
+over HTTP (`d1-run MODEL serve THREADS PORT`); its answers match llama.cpp
+b12176 to the token count and within about 0.01 of each probability (each
+question its own pass, `set_size` 1), and 16-question packing reads the
+state once. Galaxy's Hybrid agent uses it as its policy.
+
 ### Supported Models
 - Qwen3-0.6B (Q4_K, Q6_K) — tested, ~2s/token on ARM64
 - Qwen3-1.7B, Qwen3-4B — supported via configurable limits

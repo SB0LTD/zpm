@@ -299,6 +299,65 @@ pub fn forwardInput(
     output: Output,
     parallel: Parallel,
 ) Error!?u32 {
+    return forwardMasked(tensor_capacity, limits, source, index, plan, weights, work, cache, input, output, null, parallel);
+}
+
+/// Which keys a query reads on the full-attention layers of a decision pass
+/// (d1's `set` attention, LiquidAI/d1-2B `attention.py`): the state's tokens
+/// read every token and every token reads them; a token after the state
+/// also reads the tokens of its own question group, never another's. A lone
+/// group (one question) is plain bidirectional attention over the prompt.
+/// Sliding-window and convolution layers stay causal over the packed
+/// sequence, as the model was trained.
+pub const Sees = struct {
+    /// Tokens of the state, the sequence's first.
+    state: usize,
+    /// Each token's question group (`group.len` is the pass's token count);
+    /// the state's entries are not read.
+    group: []const u8,
+
+    pub fn allows(self: *const Sees, query: usize, key: usize) bool {
+        return query < self.state or key < self.state or self.group[query] == self.group[key];
+    }
+};
+
+/// One pass over a whole decision prompt under `sees` (see Sees): the
+/// sequence starts the cache (position 0) and fits one batch, so every key a
+/// full-attention layer reads is written before any query reads it. The
+/// final residual of every position stays in `work.hidden` (`output` none)
+/// for the caller's answer slots; `.logits` scores the last one as usual.
+pub fn forwardSees(
+    comptime tensor_capacity: usize,
+    comptime limits: Limits,
+    source: gguf.Source,
+    index: *const gguf.Index(tensor_capacity),
+    plan: *const lfm3.Plan,
+    weights: *const PackedWeights(tensor_capacity),
+    work: *Workspace(limits),
+    cache: *Cache,
+    tokens: []const u32,
+    output: Output,
+    sees: *const Sees,
+    parallel: Parallel,
+) Error!?u32 {
+    if (cache.position != 0 or sees.group.len != tokens.len or sees.state > tokens.len) return error.InvalidToken;
+    return forwardMasked(tensor_capacity, limits, source, index, plan, weights, work, cache, .{ .tokens = tokens }, output, sees, parallel);
+}
+
+fn forwardMasked(
+    comptime tensor_capacity: usize,
+    comptime limits: Limits,
+    source: gguf.Source,
+    index: *const gguf.Index(tensor_capacity),
+    plan: *const lfm3.Plan,
+    weights: *const PackedWeights(tensor_capacity),
+    work: *Workspace(limits),
+    cache: *Cache,
+    input: Input,
+    output: Output,
+    sees: ?*const Sees,
+    parallel: Parallel,
+) Error!?u32 {
     const hidden: usize = plan.hidden_size;
     if (hidden == 0) return error.InvalidPlan;
     const count = input.count(hidden);
@@ -350,7 +409,7 @@ pub fn forwardInput(
                 quantizeBlocks(parallel, work.mixer[0 .. count * hidden], &work.activations);
                 try linear(source, index, weights, layer.out_proj, &work.activations, count, work.projected[0 .. count * hidden], parallel);
             },
-            .attention => try attentionBlock(tensor_capacity, limits, source, index, plan, weights, layer, work, cache, count, parallel),
+            .attention => try attentionBlock(tensor_capacity, limits, source, index, plan, weights, layer, work, cache, count, sees, parallel),
         }
         try addResidual(source, index, plan, layer.post_attention_norm, work.hidden[0 .. count * hidden], work.projected[0 .. count * hidden], parallel);
 
@@ -424,6 +483,7 @@ fn attentionBlock(
     work: *Workspace(limits),
     cache: *Cache,
     count: usize,
+    sees: ?*const Sees,
     parallel: Parallel,
 ) Error!void {
     const hidden: usize = plan.hidden_size;
@@ -470,6 +530,8 @@ fn attentionBlock(
         .first_position = cache.position,
         .sliding_window = layer.sliding_window,
         .window = plan.sliding_window,
+        .sees = sees,
+        .total = cache.position + count,
         .query = work.query[0 .. count * query_width],
         .gate = work.gate[0 .. count * heads],
         .output = work.mixer[0 .. count * query_width],
@@ -720,6 +782,10 @@ fn AttentionTask(comptime context_capacity: usize) type {
         first_position: usize,
         sliding_window: bool,
         window: u32,
+        /// A decision pass's mask on full-attention layers (forwardSees):
+        /// keys up to `total` that it allows, instead of the causal prefix.
+        sees: ?*const Sees = null,
+        total: usize = 0,
         query: []const f32,
         gate: []const f32,
         output: []f32,
@@ -731,22 +797,26 @@ fn AttentionTask(comptime context_capacity: usize) type {
             const width = self.heads * self.head_size;
             const group = self.heads / self.kv_heads;
             const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_size)));
+            const mask: ?*const Sees = if (self.sliding_window) null else self.sees;
             for (first..end) |unit| {
                 const slot = unit / self.heads;
                 const head = unit % self.heads;
                 const kv_head = head / group;
                 const position = self.first_position + slot;
-                const visible = lfm3.firstVisiblePosition(self.sliding_window, self.window, position);
+                const visible = if (mask != null) 0 else lfm3.firstVisiblePosition(self.sliding_window, self.window, position);
+                const last = if (mask != null) self.total else position + 1;
                 const query = self.query[slot * width + head * self.head_size ..][0..self.head_size];
                 const keys = self.kv[self.block(false, kv_head)..];
                 var maximum: f32 = NEGATIVE_INFINITY;
-                for (visible..position + 1) |key_position| {
+                var length: usize = 0;
+                for (visible..last) |key_position| {
+                    if (mask) |sees| if (!sees.allows(position, key_position)) continue;
                     const key = keys[key_position * self.head_size ..][0..self.head_size];
                     const score = dotHalf(query, key) * scale;
-                    scores[key_position - visible] = score;
+                    scores[length] = score;
+                    length += 1;
                     maximum = @max(maximum, score);
                 }
-                const length = position + 1 - visible;
                 var total: f64 = 0;
                 for (scores[0..length]) |*score| {
                     score.* = @exp(score.* - maximum);
@@ -756,8 +826,11 @@ fn AttentionTask(comptime context_capacity: usize) type {
                 const values = self.kv[self.block(true, kv_head)..];
                 const destination = self.output[slot * width + head * self.head_size ..][0..self.head_size];
                 @memset(destination, 0);
-                for (scores[0..length], visible..) |score, key_position| {
-                    const weight = transformer.f16BitsToF32(transformer.f32ToF16Bits(score * inverse));
+                var read: usize = 0;
+                for (visible..last) |key_position| {
+                    if (mask) |sees| if (!sees.allows(position, key_position)) continue;
+                    const weight = transformer.f16BitsToF32(transformer.f32ToF16Bits(scores[read] * inverse));
+                    read += 1;
                     const value = values[key_position * self.head_size ..][0..self.head_size];
                     for (destination, value) |*accumulator, element| accumulator.* += weight * transformer.f16BitsToF32(element);
                 }
