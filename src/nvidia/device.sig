@@ -217,6 +217,35 @@ pub const EmuDevice = struct {
         _ = b;
     }
 
+    /// Memory of the caller's own, seen by the GPU at `va` (Galaxy's
+    /// kernel twin: a render-node buffer's pages, mapped where the node put
+    /// it): no arena used, nothing zeroed, the GPU reading and writing the
+    /// caller's bytes (a device with a `gpu_view` takes none). False when
+    /// it overlaps a region or the table is full.
+    pub fn mapExternal(e: *EmuDevice, va: u64, bytes: []u8) bool {
+        if (e.gpu_view.len != 0 or bytes.len == 0 or e.n_regions >= EMU_MAX_BUFFERS) return false;
+        for (e.regions[0..e.n_regions]) |r| {
+            if (va < r.va + r.bytes.len and r.va < va + bytes.len) return false;
+        }
+        var at_r: usize = e.n_regions;
+        while (at_r > 0 and e.regions[at_r - 1].va > va) : (at_r -= 1) e.regions[at_r] = e.regions[at_r - 1];
+        e.regions[at_r] = .{ .va = va, .bytes = bytes };
+        e.n_regions += 1;
+        return true;
+    }
+
+    /// The region at `va` gone: the GPU faults there from now on.
+    pub fn unmapExternal(e: *EmuDevice, va: u64) void {
+        var i: usize = 0;
+        while (i < e.n_regions) : (i += 1) {
+            if (e.regions[i].va != va) continue;
+            var k = i;
+            while (k + 1 < e.n_regions) : (k += 1) e.regions[k] = e.regions[k + 1];
+            e.n_regions -= 1;
+            return;
+        }
+    }
+
     /// A kernel the device runs from its instructions when its words are
     /// at a QMD's program address (until sm120.decode reads them).
     pub fn addProgram(e: *EmuDevice, p: *const emu.Program) Error!void {
@@ -867,6 +896,51 @@ test "the emulated RTX catches what the real one trips over" {
     // (and the fence after a good batch)
     const f = try d.submit(try d.alloc(16), 0);
     try d.wait(f, 0);
+}
+
+test "memory of the caller's own, mapped at its addresses: a launch reads and writes it there, and faults once it is gone" {
+    _ = freshDevice(false);
+    const k = try assembleProbe("galaxy_m4", false);
+    const X = struct {
+        var code: [0x4000]u8 align(4096) = undefined;
+        var slot: [0x1000]u8 align(4096) = undefined;
+        var out: [0x1000]u8 align(4096) = undefined;
+        var pb: [0x1000]u8 align(4096) = undefined;
+    };
+    @memset(&X.code, 0);
+    @memset(&X.slot, 0);
+    @memset(&X.out, 0);
+    // (where a render node's buffers are, and the probe's fixed output)
+    const code_va: u64 = 0x40_0000_0000;
+    const slot_va: u64 = 0x40_0020_0000;
+    const pb_va: u64 = 0x40_0040_0000;
+    try testing.expect(T.dev.mapExternal(code_va, &X.code));
+    try testing.expect(T.dev.mapExternal(slot_va, &X.slot));
+    try testing.expect(T.dev.mapExternal(pb_va, &X.pb));
+    try testing.expect(T.dev.mapExternal(0x20_0005_0000, &X.out));
+    // (an overlap refused)
+    try testing.expect(!T.dev.mapExternal(slot_va + 0x800, &X.out));
+    @memcpy(@as([]u64, @alignCast(std.mem.bytesAsSlice(u64, X.code[0 .. k.code.len * 8]))), k.code);
+    const q: *[qmd.QMD_WORDS]u32 = @ptrCast(@alignCast(X.slot[0..qmd.QMD_BYTES]));
+    try qmd.build(q, .{ .prog_va = code_va, .prog_bytes = k.code.len * 8, .cbuf_va = slot_va + 0x200, .registers = k.registers, .block = .{ 32, 1, 1 } });
+    try qmd.cbuf0(@ptrCast(@alignCast(X.slot[0x200..][0..qmd.CBUF0_BYTES])), .{ 1, 1, 1 }, .{ 32, 1, 1 }, &.{});
+    var p = push.Push{ .buf = std.mem.bytesAsSlice(u32, &X.pb) };
+    p.computeSetup(.{});
+    p.invalidateShaderCaches();
+    p.launch(slot_va);
+    p.release(slot_va + 0x780, 77);
+    try p.check();
+    try T.dev.execute(pb_va, @intCast(p.len));
+    // (the probe writes 0x600d0000 | its thread index to the fixed output)
+    const out = std.mem.bytesAsSlice(u32, &X.out);
+    for (0..32) |i| try testing.expectEqual(@as(u32, 0x600d_0000) | @as(u32, @intCast(i)), out[i]);
+    try testing.expectEqual(@as(u32, 77), std.mem.readInt(u32, X.slot[0x780..][0..4], .little));
+    // Unmapped, the pushbuffer is gone: the stream fails.
+    T.dev.unmapExternal(pb_va);
+    try testing.expectError(error.BadStream, T.dev.execute(pb_va, @intCast(p.len)));
+    // (a device whose GPU has a view of its own takes none)
+    _ = freshDevice(true);
+    try testing.expect(!T.dev.mapExternal(code_va, &X.code));
 }
 
 test "a timestamp report, a QMD's own release" {

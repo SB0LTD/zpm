@@ -629,8 +629,15 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
         }
 
         /// A gpu.Buffer of this GPU as a dma-buf fd (a window's frame), or
-        /// -errno.
+        /// -errno. The RTX's buffers carry nvidia_device's slot as their
+        /// handle: the node knows them by the raw device's (legion43: the
+        /// slot exported another buffer, "dma-buf smaller than its
+        /// picture").
         pub fn exportFd(g: *Self, b: gpu.Buffer) i64 {
+            if (with_nv and g.node.kind == .nvidia) {
+                const h = g.nv.rawHandle(b) orelse return -EINVAL;
+                return g.node.exportFd(h);
+            }
             return g.node.exportFd(b.handle);
         }
 
