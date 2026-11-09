@@ -785,6 +785,12 @@ pub const Stats = struct {
     /// ops checked against the CPU, and those that differed
     checks: u32 = 0,
     check_diffs: u32 = 0,
+    /// microseconds inside Device.run (handing batches to the GPU) and
+    /// inside Device.wait (the CPU waiting for them), by report.nowUs
+    run_us: u64 = 0,
+    wait_us: u64 = 0,
+    /// draws done on the CPU (cpu_ops counts them too)
+    cpu_draws: u64 = 0,
 };
 
 pub const Engine = struct {
@@ -900,6 +906,18 @@ pub const Engine = struct {
     /// The GPU does the work (not lost, and there is one).
     pub fn onGpu(e: *const Engine) bool {
         return e.dev != null and !e.lost;
+    }
+
+    /// The counters a context's usage line reports (report.Usage).
+    pub fn usage(e: *const Engine) report.Gpu {
+        return .{
+            .batches = e.stats.batches,
+            .kernels = e.stats.dispatches,
+            .submit_us = e.stats.run_us,
+            .waits = e.stats.waits,
+            .wait_us = e.stats.wait_us,
+            .cpu_draws = e.stats.cpu_draws,
+        };
     }
 
     // ── Memory ─────────────────────────────────────────────────────────────
@@ -1105,6 +1123,7 @@ pub const Engine = struct {
         const d = e.dev.?;
         const n = e.n_ops;
         e.n_ops = 0;
+        const t0 = report.nowUs();
         const f = d.run(e.ops[0..n]) catch |err| {
             e.loseGpu(err);
             // (the batch again, on the CPU: nothing it did is lost)
@@ -1113,6 +1132,7 @@ pub const Engine = struct {
             }
             return;
         };
+        e.stats.run_us += report.nowUs() -| t0;
         e.fences[e.batch % RING] = f;
         e.ran = e.batch;
         e.batch += 1;
@@ -1155,6 +1175,8 @@ pub const Engine = struct {
         if (!e.onGpu() or b <= e.done_upto) return true;
         const upto = if (e.ran - b >= RING) e.ran else b;
         e.stats.waits += 1;
+        const began = report.nowUs();
+        defer e.stats.wait_us += report.nowUs() -| began;
         const fence = e.fences[upto % RING];
         e.dev.?.wait(fence, timeout_us) catch |err| {
             if (err == error.Timeout and !lose_on_timeout) return false;
@@ -1586,6 +1608,7 @@ pub const Engine = struct {
             for (vb) |img| e.fetchAll(img);
             for (rb) |img| e.fetchAll(img);
             e.stats.cpu_ops += 1;
+            e.stats.cpu_draws += 1;
             var views: [MAX_BIND][]u8 = undefined;
             for (vb, 0..) |img, j| views[j] = img.buf.cpu;
             if (!e.runCpu(.vertex, p, groups_v, views[0..vb.len], vparams)) break :cpu false;

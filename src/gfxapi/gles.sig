@@ -714,6 +714,8 @@ pub const Context = struct {
     /// EGL's check of the default framebuffer (a window resized: a back
     /// buffer of its new size), before an operation reaches it
     revalidate: ?Revalidate = null,
+    /// what the context is used for, said every few seconds (report.sig)
+    usage: report.Usage = .{},
 
     pub const Revalidate = struct {
         ctx: *anyopaque,
@@ -1020,10 +1022,26 @@ pub const Context = struct {
 
     pub fn flush(c: *Context) void {
         c.eng.flush();
+        if (report.sink != null) c.usageTick(report.nowUs());
     }
 
     pub fn finish(c: *Context) void {
         c.eng.finish();
+        if (report.sink != null) c.usageTick(report.nowUs());
+    }
+
+    /// The context's usage line, if one is due at `now_us` (asked at each
+    /// flush, finish and swap: a clock read and a compare when it is not).
+    pub fn usageTick(c: *Context, now_us: u64) void {
+        if (!c.usage.due(now_us)) return;
+        c.usage.tell(now_us, if (c.eng.onGpu()) c.eng.dev.?.caps.name else null, c.eng.usage());
+    }
+
+    /// An eglSwapBuffers of this context's done at `now_us`, having taken
+    /// `took_us`.
+    pub fn usageSwap(c: *Context, now_us: u64, took_us: u64) void {
+        c.usage.swapped(took_us, c.eng.stats.wait_us);
+        c.usageTick(now_us);
     }
 
     pub fn clearColor(c: *Context, r: f32, gr: f32, b: f32, a: f32) void {
@@ -1962,6 +1980,7 @@ pub const Context = struct {
 
     fn uploadLayer(c: *Context, img: *Image, level: u32, layer: u32, up: texfmt.Upload, x: u32, y: u32, w: u32, h: u32, src: []const u8, row: usize) void {
         const bpp: usize = img.format.bytes();
+        c.usage.upload(@as(usize, w) * h * bpp);
         for (0..h) |j| {
             const gy = y + @as(u32, @intCast(j));
             const mrow = if (level == 0) img.rowOf(gy) else gy;
@@ -3832,6 +3851,7 @@ pub const Context = struct {
             };
         }
         d.keep = colorKeep(color.format, c.color_mask);
+        c.usage.draw(index_ty != 0, d.instances, @as(u64, d.triangles()) * d.instances);
         if (!c.eng.draw(&d)) c.fail(g.OUT_OF_MEMORY);
     }
 
