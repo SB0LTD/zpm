@@ -21,6 +21,8 @@ pub const nvidia_device = @import("nvidia_device.sig");
 /// every GPU's pipeline is called through, the CPU reference and the
 /// self-test's cases.
 pub const draw = @import("draw.sig");
+/// The Adreno's graphics pipeline (adreno/draw.sig) as a draw.Renderer.
+pub const adreno_draw = @import("adreno_draw.sig");
 
 // KIR
 pub const Ty = kir.Ty;
@@ -83,4 +85,5 @@ test {
     _ = kir_gcn4;
     _ = amd_device;
     _ = draw;
+    _ = adreno_draw;
 }
