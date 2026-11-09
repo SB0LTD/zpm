@@ -1434,13 +1434,21 @@ fn lowerOne(w: *Work, i: u32) Error!void {
         },
         .fmin => try alu2(w, .min_f, d, h, try l.arg(in.a, .c2f, true, h), try l.arg(in.b, .c2f, true, h)),
         .fmax => try alu2(w, .max_f, d, h, try l.arg(in.a, .c2f, true, h), try l.arg(in.b, .c2f, true, h)),
-        .fabs => {
+        // (KIR's fabs and fneg are sign-bit operations: no flush, a NaN's
+        // bits kept. absneg.f flushes a denormal on the X1-45: fabs of
+        // 0x00000001 came back 0, the self-test's 11-09 boot. The bits, for
+        // f32)
+        .fabs => if (!h) {
+            try alu2(w, .and_b, d, false, try l.arg(in.a, .c2, false, false), try fit(w, Opnd.imm(0x7fff_ffff), .c2, false, l.loop));
+        } else {
             var a = try l.arg(in.a, .c2f, true, h);
             a.abs = true;
             a.neg = false;
             try alu1(w, .absneg_f, d, h, a);
         },
-        .fneg => {
+        .fneg => if (!h) {
+            try alu2(w, .xor_b, d, false, try l.arg(in.a, .c2, false, false), try fit(w, Opnd.imm(0x8000_0000), .c2, false, l.loop));
+        } else {
             var a = try l.arg(in.a, .c2f, true, h);
             a.neg = !a.neg;
             try alu1(w, .absneg_f, d, h, a);
@@ -2032,9 +2040,11 @@ fn lowerCvt(l: *Lw) Error!void {
             const t = try newVreg(w, .full);
             try cov(w, t, false, try fit(w, x, .c6, false, l.loop), .f16, .f32, .none);
             x = Opnd.reg(t, false);
-        } else if (cv.round == .rd or cv.round == .ru) {
+        } else if ((cv.round == .rd or cv.round == .ru) and w.caps.denormals == .preserve) {
             // A directed integer rounding only needs the sign and nonzero
-            // status for values below one. Preserve both across GPU FTZ.
+            // status for values below one. Preserve both across GPU FTZ
+            // (where KIR keeps denormals: with Caps.denormals == .flush its
+            // input flushes, as the GPU's does: rd of -denorm is 0).
             const raw = try l.arg(in.a, .c2, false, false);
             const abs_bits = try newVreg(w, .full);
             const range = try newVreg(w, .full);

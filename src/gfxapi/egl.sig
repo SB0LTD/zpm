@@ -1550,6 +1550,13 @@ pub fn makeCurrent(handle: ?*anyopaque, draw_h: ?*anyopaque, read_h: ?*anyopaque
     t.gl = &c.gl;
     if (!bindSurfaces(c)) {
         release(t);
+        // (the GPU lost: a window's new buffers cannot be the compositor's
+        // dma-bufs. The app hears its context is lost, as at a swap, and
+        // starts over without it: Firefox then draws in software, where
+        // BAD_ALLOC had it try the same window again and again)
+        if (d.eng) |eng| {
+            if (eng.lost) return failWhy(bool, CONTEXT_LOST, false, "the GPU is lost: the window has no buffer to show");
+        }
         return failWhy(bool, BAD_ALLOC, false, "no memory for the surface's buffers");
     }
     return ok(bool, true);

@@ -36,6 +36,7 @@
 //! caller memory handed out first fit.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gpu = @import("gpu");
 const raster = @import("raster.sig");
 const texture = @import("texture.sig");
@@ -702,6 +703,17 @@ pub const MAX_DOOMED = 128;
 const RING = 64;
 /// How long a CPU access waits for the GPU before calling it lost.
 pub const TIMEOUT_US: u64 = 2_000_000;
+/// How long a batch may run before the GPU is called lost (a wait past
+/// TIMEOUT_US goes on to this; a GPU that hangs is lost sooner, by its
+/// kernel's word).
+pub const LOST_US: u64 = 20_000_000;
+
+fn monoUs() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1000;
+}
 
 /// A backend (gpu.compile, or gpu.compileFor with the targets an image
 /// links).
@@ -1143,10 +1155,26 @@ pub const Engine = struct {
         if (!e.onGpu() or b <= e.done_upto) return true;
         const upto = if (e.ran - b >= RING) e.ran else b;
         e.stats.waits += 1;
-        e.dev.?.wait(e.fences[upto % RING], timeout_us) catch |err| {
+        const fence = e.fences[upto % RING];
+        e.dev.?.wait(fence, timeout_us) catch |err| {
             if (err == error.Timeout and !lose_on_timeout) return false;
-            e.loseGpu(err);
-            return true;
+            if (err != error.Timeout or timeout_us >= LOST_US) {
+                e.loseGpu(err);
+                return true;
+            }
+            // A GPU still busy is not a lost one: the kernel says when the
+            // GPU hangs (its fence not moving), and the wait ends in
+            // DeviceLost then. The Surface's 11-09 boot: Firefox's first
+            // WebRender frame ran past 2 s while the desktop's frames shared
+            // the Adreno, and the app was sent to the CPU, where its new
+            // windows could not be shown.
+            report.say(.slow, "a batch of the GPU's has run {d} s: waiting for it, up to {d} s", .{ timeout_us / 1_000_000, LOST_US / 1_000_000 });
+            const t0 = monoUs();
+            e.dev.?.wait(fence, LOST_US - timeout_us) catch |err2| {
+                e.loseGpu(err2);
+                return true;
+            };
+            report.say(.slow, "that batch was done {d} ms later", .{(monoUs() - t0) / 1000});
         };
         e.done_upto = upto;
         return true;
