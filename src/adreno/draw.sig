@@ -4,7 +4,9 @@
 //! What a compositor draws with: a solid color, an image (a texture times a
 //! color), a mask (an 8-bit coverage texture times a color), each a
 //! rectangle in window pixels, replacing the target's pixels or blended
-//! over them (premultiplied alpha), inside a scissor. The rasterizer walks
+//! over them (premultiplied alpha), inside a scissor; and the same with a
+//! rounded rectangle's coverage worked out per pixel (a filled one, a
+//! stroked one, an image inside one). The rasterizer walks
 //! the rectangle, the texture unit filters, the render backend blends: no
 //! compute kernel, no per-pixel command lists.
 //!
@@ -47,11 +49,43 @@ pub const Error = device.Error || ir3_asm.Error || error{
 };
 
 /// What a rectangle's pixels are.
-pub const Kind = enum(u8) { solid, image, mask };
-const KINDS = 3;
+pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr };
+const KINDS = 6;
 
 /// A rectangle's corners: x0, y0, x1, y1 (pixels; x1 and y1 past the end).
 pub const Rect = [4]f32;
+
+/// A rounded rectangle as the coverage programs take it: its centre, its
+/// half size less the radius, the radius.
+pub const Shape = struct {
+    cx: f32,
+    cy: f32,
+    kx: f32,
+    ky: f32,
+    rad: f32,
+
+    /// The rectangle (x, y, w, h) with corners of `radius`, the radius
+    /// held to half the smaller side as gfx.sdRoundRect holds it.
+    pub fn of(x: f32, y: f32, w: f32, h: f32, radius: f32) Shape {
+        const hw = w / 2;
+        const hh = h / 2;
+        const rad = @min(radius, @min(hw, hh));
+        return .{ .cx = x + hw, .cy = y + hh, .kx = hw - rad, .ky = hh - rad, .rad = rad };
+    }
+
+    /// The signed distance at (px, py): the programs' arithmetic, for tests.
+    pub fn distance(s: Shape, px: f32, py: f32) f32 {
+        const qx = @abs(px - s.cx) - s.kx;
+        const qy = @abs(py - s.cy) - s.ky;
+        const ox = @max(qx, 0);
+        const oy = @max(qy, 0);
+        return @sqrt(ox * ox + oy * oy) + @min(@max(qx, qy), 0) - s.rad;
+    }
+
+    pub fn coverage(s: Shape, px: f32, py: f32) f32 {
+        return std.math.clamp(0.5 - s.distance(px, py), 0, 1);
+    }
+};
 /// Premultiplied r, g, b, a.
 pub const Color = [4]f32;
 
@@ -106,10 +140,124 @@ const FS_MASK =
     \\end
 ;
 
-const SOURCES = [1 + KINDS][]const u8{ VS, FS_SOLID, FS_IMAGE, FS_MASK };
-/// Instruction words a program may take (with its padding).
-const WORDS = 64;
-const CODE_BYTES = 4096;
+// The coverage programs (Galaxy's own: turnip has none like them). A
+// rounded rectangle's signed distance at the pixel, as gfx.sdRoundRect:
+// q = |p - centre| - k (k: the half size less the radius), then
+// length(max(q, 0)) + min(max(q.x, q.y), 0) - radius; the coverage is
+// 0.5 less that, between 0 and 1. The constants hold the negated values,
+// so every step is an add.
+
+/// A filled rounded rectangle. The varyings are the pixel's position.
+/// c0: the color; c1: -centre x, y, -k x, y; c2.x: -radius.
+const FS_RRECT =
+    \\@threadsize 128
+    \\@out r4.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.x
+    \\absneg.f r2.x, (abs)r2.x
+    \\absneg.f r2.y, (abs)r2.y
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.z
+    \\(rpt1)max.f r2.z, (r)r2.x, (0.0)
+    \\mul.f r3.x, r2.z, r2.z
+    \\mul.f r3.y, r2.w, r2.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.x, r3.x
+    \\max.f r3.y, r2.x, r2.y
+    \\min.f r3.y, r3.y, (0.0)
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c2.x
+    \\add.f (sat)r3.x, (neg)r3.x, (0.5)
+    \\(rpt3)mul.f r4.x, (r)c0.x, r3.x
+    \\end
+;
+
+/// A stroked rounded rectangle: the outer shape's coverage less the
+/// inner's (the same centre), not below 0.
+/// c0: the color; c1: -centre, -k (outer); c2.x, c2.y: -radius outer,
+/// inner; c3.zw: -k (inner).
+const FS_RING =
+    \\@threadsize 128
+    \\@out r4.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.x
+    \\absneg.f r2.x, (abs)r2.x
+    \\absneg.f r2.y, (abs)r2.y
+    \\(rpt1)add.f r5.x, (r)r2.x, (r)c1.z
+    \\(rpt1)max.f r5.z, (r)r5.x, (0.0)
+    \\mul.f r3.x, r5.z, r5.z
+    \\mul.f r3.y, r5.w, r5.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.x, r3.x
+    \\max.f r3.y, r5.x, r5.y
+    \\min.f r3.y, r3.y, (0.0)
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c2.x
+    \\add.f (sat)r3.x, (neg)r3.x, (0.5)
+    \\(rpt1)add.f r6.x, (r)r2.x, (r)c3.z
+    \\(rpt1)max.f r6.z, (r)r6.x, (0.0)
+    \\mul.f r3.z, r6.z, r6.z
+    \\mul.f r3.w, r6.w, r6.w
+    \\add.f r3.z, r3.z, r3.w
+    \\sqrt r3.z, r3.z
+    \\max.f r3.w, r6.x, r6.y
+    \\min.f r3.w, r3.w, (0.0)
+    \\add.f r3.z, r3.z, r3.w
+    \\add.f r3.z, r3.z, c2.y
+    \\add.f (sat)r3.z, (neg)r3.z, (0.5)
+    \\add.f r3.x, r3.x, (neg)r3.z
+    \\max.f r3.x, r3.x, (0.0)
+    \\(rpt3)mul.f r4.x, (r)c0.x, r3.x
+    \\end
+;
+
+/// The prefetched texel times c0 times a rounded rectangle's coverage.
+/// The varyings are the texture coordinates; the pixel's position less
+/// the centre is theirs scaled and moved.
+/// c0: the tint; c1: the scale x, y, then the offset x, y; c2: -k x, y,
+/// then -radius.
+const FS_IMAGE_RR =
+    \\@threadsize 128
+    \\@out r4.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\(rpt1)mul.f r2.x, (r)r2.x, (r)c1.x
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.z
+    \\absneg.f r2.x, (abs)r2.x
+    \\absneg.f r2.y, (abs)r2.y
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c2.x
+    \\(rpt1)max.f r2.z, (r)r2.x, (0.0)
+    \\mul.f r3.x, r2.z, r2.z
+    \\mul.f r3.y, r2.w, r2.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.x, r3.x
+    \\max.f r3.y, r2.x, r2.y
+    \\min.f r3.y, r3.y, (0.0)
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c2.z
+    \\add.f (sat)r3.x, (neg)r3.x, (0.5)
+    \\(sy)(rpt3)mul.f r4.x, (r)r0.z, (r)c0.x
+    \\(rpt3)mul.f r4.x, (r)r4.x, r3.x
+    \\end
+;
+
+const SOURCES = [1 + KINDS][]const u8{ VS, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR };
+
+/// How each kind's fragment program is wired: whether it reads the
+/// varyings, whether the pipeline prefetches its texel, where its color is.
+const Wiring = struct { varyings: bool, prefetch: bool, color_reg: u8 };
+const WIRING = [KINDS]Wiring{
+    .{ .varyings = false, .prefetch = false, .color_reg = 0 },
+    .{ .varyings = true, .prefetch = true, .color_reg = 6 },
+    .{ .varyings = true, .prefetch = true, .color_reg = 6 },
+    .{ .varyings = true, .prefetch = false, .color_reg = 16 },
+    .{ .varyings = true, .prefetch = false, .color_reg = 16 },
+    .{ .varyings = true, .prefetch = true, .color_reg = 16 },
+};
+
+/// Instruction words a program may take (with its padding), and its bytes
+/// in the code buffer.
+const WORDS = 128;
+const SLOT = WORDS * 8;
+const CODE_BYTES = 8192;
 /// Where the border colors' zeros are in the code buffer.
 const BORDER_AT = CODE_BYTES - 256;
 /// Bytes a texture's descriptors take in the state buffer.
@@ -159,7 +307,7 @@ pub const Renderer = struct {
         r.stats = .{};
         for (SOURCES, 0..) |src, i| {
             r.kernels[i] = try ir3_asm.assemble(ir3.A7XX, src, work, &r.words[i]);
-            if (r.kernels[i].code.len * 8 > 512) return error.BadKernel;
+            if (r.kernels[i].code.len > WORDS) return error.BadKernel;
         }
         r.code = try dev.alloc(CODE_BYTES);
         errdefer dev.free(r.code);
@@ -168,26 +316,26 @@ pub const Renderer = struct {
         r.ib = try dev.alloc(opts.stream_bytes);
         @memset(r.code.cpu, 0);
         for (r.kernels, 0..) |k, i| {
-            const dst: []u64 = @alignCast(std.mem.bytesAsSlice(u64, r.code.cpu[i * 512 ..][0..512]));
+            const dst: []u64 = @alignCast(std.mem.bytesAsSlice(u64, r.code.cpu[i * SLOT ..][0..SLOT]));
             @memcpy(dst[0..k.code.len], k.code);
         }
         dev.toDevice(r.code, 0, CODE_BYTES);
         const vs_va = r.code.va;
         for (0..KINDS) |k| {
-            const sampled = k != @intFromEnum(Kind.solid);
+            const w = WIRING[k];
             r.progs[k] = .{
                 .vs = &r.kernels[0],
                 .vs_va = vs_va,
                 .fs = &r.kernels[1 + k],
-                .fs_va = r.code.va + (1 + k) * 512,
+                .fs_va = r.code.va + (1 + k) * SLOT,
                 .vertexid_reg = 0,
                 .pos_reg = 1,
-                .vary_reg = if (sampled) 5 else ir3_asm.INVALID_REG,
-                .varyings = if (sampled) 2 else 0,
-                .ij_reg = if (sampled) 0 else ir3_asm.INVALID_REG,
-                .color_reg = if (sampled) 6 else 0,
-                .textures = if (sampled) 1 else 0,
-                .prefetch_reg = if (sampled) 2 else ir3_asm.INVALID_REG,
+                .vary_reg = if (w.varyings) 5 else ir3_asm.INVALID_REG,
+                .varyings = if (w.varyings) 2 else 0,
+                .ij_reg = if (w.varyings) 0 else ir3_asm.INVALID_REG,
+                .color_reg = w.color_reg,
+                .textures = if (w.prefetch) 1 else 0,
+                .prefetch_reg = if (w.prefetch) 2 else ir3_asm.INVALID_REG,
             };
         }
     }
@@ -249,11 +397,50 @@ pub const Renderer = struct {
     }
 
     fn corners(r: *Renderer, rc: Rect, uv: [4]f32, color: Color) void {
+        r.cornersWith(rc, uv, &color);
+    }
+
+    /// The rectangle with the fragment program's constants from c0.
+    fn cornersWith(r: *Renderer, rc: Rect, uv: [4]f32, fs: []const f32) void {
         const v = [8]f32{ rc[0], rc[1], uv[0], uv[1], rc[2], rc[3], uv[2], uv[3] };
         dr.vsConstants(&r.s, @ptrCast(&v));
-        dr.fsConstants(&r.s, @ptrCast(&color));
+        dr.fsConstants(&r.s, @ptrCast(fs));
         dr.rect(&r.s);
         r.stats.rects += 1;
+    }
+
+    /// `color` times the coverage of the rounded rectangle `s`, over the
+    /// pixels of `rc` (s's bounds, or less).
+    pub fn rrect(r: *Renderer, rc: Rect, s: Shape, color: Color, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1])) return;
+        r.use(.rrect, b);
+        const c = [12]f32{ color[0], color[1], color[2], color[3], -s.cx, -s.cy, -s.kx, -s.ky, -s.rad, 0, 0, 0 };
+        r.cornersWith(rc, rc, &c);
+    }
+
+    /// `color` times the coverage of `outer` less that of `inner` (the
+    /// same centre; null: nothing taken out): a stroke.
+    pub fn ring(r: *Renderer, rc: Rect, outer: Shape, inner: ?Shape, color: Color, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1])) return;
+        r.use(.ring, b);
+        // (no inner shape: one no pixel is inside)
+        const in = inner orelse Shape{ .cx = outer.cx, .cy = outer.cy, .kx = -1e9, .ky = -1e9, .rad = 0 };
+        const c = [16]f32{ color[0], color[1], color[2], color[3], -outer.cx, -outer.cy, -outer.kx, -outer.ky, -outer.rad, -in.rad, 0, 0, 0, 0, -in.kx, -in.ky };
+        r.cornersWith(rc, rc, &c);
+    }
+
+    /// image, times the coverage of the rounded rectangle `s` (in window
+    /// pixels, as `rc`).
+    pub fn imageRR(r: *Renderer, rc: Rect, t: Texture, uv: [4]f32, tint: Color, s: Shape, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1])) return;
+        if (!(uv[2] != uv[0] and uv[3] != uv[1])) return;
+        r.use(.image_rr, b);
+        r.bind(t);
+        // the pixel's position from the texture coordinates, less the centre
+        const sx = (rc[2] - rc[0]) / (uv[2] - uv[0]);
+        const sy = (rc[3] - rc[1]) / (uv[3] - uv[1]);
+        const c = [12]f32{ tint[0], tint[1], tint[2], tint[3], sx, sy, rc[0] - uv[0] * sx - s.cx, rc[1] - uv[1] * sy - s.cy, -s.kx, -s.ky, -s.rad, 0 };
+        r.cornersWith(rc, uv, &c);
     }
 
     /// A rectangle of one color.
@@ -292,6 +479,13 @@ pub const Renderer = struct {
         if (r.state_used != 0) r.dev.toDevice(r.state, 0, r.state_used);
         r.dev.toDevice(r.ib, 0, r.s.len * 4);
         return r.dev.submit(r.ib, @intCast(r.s.len));
+    }
+
+    /// The pass submit() ended, handed over again (the device refused it:
+    /// its ring was busy with another context's work).
+    pub fn resubmit(r: *Renderer) Error!Fence {
+        if (r.in_pass or r.stats.stream_dwords == 0) return error.NoPass;
+        return r.dev.submit(r.ib, r.stats.stream_dwords);
     }
 
     /// submit, and wait for it.
@@ -363,7 +557,7 @@ test "the programs are turnip's, word for word" {
     try std.testing.expectEqualSlices(u64, &vs, T.r.kernels[0].code[0..vs.len]);
     try std.testing.expectEqualSlices(u64, &solid, T.r.kernels[1].code[0..solid.len]);
     try std.testing.expectEqualSlices(u64, &image, T.r.kernels[2].code[0..image.len]);
-    for (T.r.kernels) |k| try std.testing.expect(k.instrlen == 1);
+    for (T.r.kernels[0..4]) |k| try std.testing.expect(k.instrlen == 1);
     // footprints as Mesa counts them: the vertex program's two full
     // registers, the solid program's one, the image program's three (its
     // color ends in r2.y), no half registers
@@ -567,6 +761,60 @@ test "the state is turnip's: the values its X1-45 streams carry for the same dra
     try std.testing.expectEqual(@as(u32, 1 << 17), desc[9] & 0xfffe0000);
 }
 
+test "rounded rectangles: filled, stroked, and an image inside one, by the coverage at each pixel" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    const tex_buf = try d.alloc(16 * 16 * 4);
+    const tw: []u32 = @alignCast(std.mem.bytesAsSlice(u32, tex_buf.cpu));
+    // (the fourth byte is not alpha here: an opaque texture reads it as one)
+    for (tw, 0..) |*p, i| p.* = 0x00206080 + @as(u32, @intCast(i % 16)) * 0x00010000;
+    d.toDevice(tex_buf, 0, 16 * 16 * 4);
+    const tx = Texture{ .va = tex_buf.va, .width = 16, .height = 16, .pitch = 64, .format = .bgra8, .filter = .nearest, .no_alpha = true };
+    const fill = Shape.of(4.5, 3.25, 24, 14, 5);
+    const outer = Shape.of(34, 4, 26, 20, 6);
+    const inner = Shape.of(36, 6, 22, 16, 4);
+    const pic = Shape.of(8, 20, 16, 10, 4);
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, T.W, T.H }, .{ 0, 0, 0, 1 }, .replace);
+    T.r.rrect(.{ 4, 3, 29, 18 }, fill, .{ 1, 1, 1, 1 }, .over);
+    T.r.ring(.{ 34, 4, 60, 24 }, outer, inner, .{ 0, 1, 0, 1 }, .over);
+    T.r.imageRR(.{ 8, 20, 24, 30 }, tx, .{ 0, 0, 16, 10 }, .{ 1, 1, 1, 1 }, pic, .over);
+    try T.r.run(1_000_000);
+    const px = T.pixels();
+    for (0..T.H) |y| for (0..T.W) |x| {
+        const fx: f32 = @as(f32, @floatFromInt(x)) + 0.5;
+        const fy: f32 = @as(f32, @floatFromInt(y)) + 0.5;
+        var want: [3]f32 = .{ 0, 0, 0 };
+        if (x >= 4 and x < 29 and y >= 3 and y < 18) {
+            const c = fill.coverage(fx, fy);
+            for (&want) |*v| v.* = c + v.* * (1 - c);
+        }
+        if (x >= 34 and x < 60 and y >= 4 and y < 24) {
+            const c = @max(outer.coverage(fx, fy) - inner.coverage(fx, fy), 0);
+            want = .{ want[0] * (1 - c), c + want[1] * (1 - c), want[2] * (1 - c) };
+        }
+        if (x >= 8 and x < 24 and y >= 20 and y < 30) {
+            const c = pic.coverage(fx, fy);
+            const texel = tw[(y - 20) * 16 + (x - 8)];
+            const tc = [3]f32{ @floatFromInt((texel >> 16) & 0xff), @floatFromInt((texel >> 8) & 0xff), @floatFromInt(texel & 0xff) };
+            for (&want, tc) |*v, s| v.* = s / 255.0 * c + v.* * (1 - c);
+        }
+        const w32 = 0xff000000 | (@as(u32, @intFromFloat(want[0] * 255 + 0.5)) << 16) | (@as(u32, @intFromFloat(want[1] * 255 + 0.5)) << 8) | @as(u32, @intFromFloat(want[2] * 255 + 0.5));
+        if (!near(w32, px[y * T.W + x], 2)) {
+            std.debug.print("pixel ({d}, {d}): want {x:0>8}, got {x:0>8}\n", .{ x, y, w32, px[y * T.W + x] });
+            return error.TestUnexpectedResult;
+        }
+    };
+    // a stroke with nothing taken out is the filled shape
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, T.W, T.H }, .{ 0, 0, 0, 1 }, .replace);
+    T.r.ring(.{ 4, 3, 29, 18 }, fill, null, .{ 1, 1, 1, 1 }, .over);
+    try T.r.run(1_000_000);
+    try expectNear(0xffffffff, T.at(16, 10), 1);
+    try expectNear(0xff000000, T.at(4, 3), 40);
+}
+
 // ── The self-test: the pipeline on the real GPU ─────────────────────────────
 // What the tests above check on the emulated device, drawn on any Device
 // and compared with the values the arithmetic gives, case by case and each
@@ -703,6 +951,23 @@ pub fn selfTest(dev: Device, r: *Renderer, asm_work: *ir3_asm.Work, log: *const 
     r.mask(.{ 8, 8, 12, 10 }, mask, .{ 0, 0, 4, 2 }, .{ 1, 1, 1, 1 }, .over);
     c.check("a coverage mask (text)", &.{ .{ .x = 8, .y = 8, .want = 0xff0000ff, .tol = 2 }, .{ .x = 9, .y = 8, .want = 0xff5555ff, .tol = 2 }, .{ .x = 10, .y = 9, .want = 0xffaaaaff, .tol = 2 }, .{ .x = 11, .y = 9, .want = 0xffffffff, .tol = 2 } });
 
+    // The coverage programs (Galaxy's own, where the ones above are
+    // turnip's): a rounded rectangle filled, stroked, and around an image.
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.rrect(.{ 4, 3, 28, 17 }, Shape.of(4, 3, 24, 14, 5), .{ 1, 1, 1, 1 }, .over);
+    c.check("a filled rounded rectangle", &.{ .{ .x = 16, .y = 10, .want = 0xffffffff, .tol = 2 }, .{ .x = 4, .y = 10, .want = 0xffffffff, .tol = 2 }, .{ .x = 4, .y = 3, .want = 0xff000000, .tol = 2 }, .{ .x = 27, .y = 16, .want = 0xff000000, .tol = 2 }, .{ .x = 3, .y = 10, .want = 0xff000000 } });
+
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.ring(.{ 34, 4, 60, 24 }, Shape.of(34, 4, 26, 20, 6), Shape.of(36, 6, 22, 16, 4), .{ 0, 1, 0, 1 }, .over);
+    c.check("a stroked rounded rectangle", &.{ .{ .x = 34, .y = 14, .want = 0xff00ff00, .tol = 2 }, .{ .x = 47, .y = 4, .want = 0xff00ff00, .tol = 2 }, .{ .x = 47, .y = 14, .want = 0xff000000, .tol = 2 }, .{ .x = 34, .y = 4, .want = 0xff000000, .tol = 2 } });
+
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.imageRR(.{ 8, 20, 16, 24 }, nearest, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, Shape.of(8, 20, 8, 4, 2), .over);
+    c.check("an image inside a rounded rectangle", &.{ .{ .x = 12, .y = 22, .want = tw[2 * 8 + 4], .tol = 2 }, .{ .x = 11, .y = 21, .want = tw[8 + 3], .tol = 2 }, .{ .x = 8, .y = 20, .want = 0xff000000, .tol = 40 }, .{ .x = 16, .y = 22, .want = 0xff000000 } });
+
     // How fast it fills: a 1024 x 1024 target, an image the same size over
     // it once and a half-transparent color 31 times (32 megapixels blended).
     if (!c.res.lost and c.res.failed == 0) speed: {
@@ -746,7 +1011,7 @@ test "the self-test passes on the emulated device" {
     T.dev = .{ .arena = &T.arena, .gpu_view = &T.gpu_view, .log = &T.log };
     // (no clock: the fill-rate case's megapixels would take the emulator minutes)
     const res = selfTest(T.dev.device(), &T.r, &T.asm_work, &testLog, null);
-    try std.testing.expectEqual(@as(u32, 8), res.passed);
+    try std.testing.expectEqual(@as(u32, 11), res.passed);
     try std.testing.expectEqual(@as(u32, 0), res.failed);
     try std.testing.expect(!res.lost);
 }

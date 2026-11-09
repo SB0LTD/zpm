@@ -320,6 +320,9 @@ pub const Texture = struct {
     pitch: u32,
     format: Format = .bgra8,
     filter: Filter = .linear,
+    /// Its alpha reads as one whatever its bytes hold (an opaque picture
+    /// whose fourth byte is not kept).
+    no_alpha: bool = false,
 };
 
 pub const MAX_TEXTURES = 4;
@@ -358,7 +361,8 @@ pub fn descriptors(texs: []const Texture, out: []u32) void {
         @memset(d, 0);
         // swizzles x, y, z, w as stored (R8 then reads (v, 0, 0, 1) by the
         // format's own rule); one level; linear
-        const swiz: u32 = (0 << 4) | (1 << 7) | (2 << 10) | (3 << 13);
+        // (an opaque texture's w is the constant one)
+        const swiz: u32 = (0 << 4) | (1 << 7) | (2 << 10) | (@as(u32, if (t.no_alpha) 5 else 3) << 13);
         d[0] = swiz | (t.format.hw() << 22) | (t.format.swap() << 30);
         d[1] = t.width | (t.height << 15);
         // the pitch's alignment as a power of two of 64 bytes (what a
