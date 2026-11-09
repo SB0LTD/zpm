@@ -2766,7 +2766,7 @@ fn testMatrixRtx(lay: Layout, format: Format, tokens: u32, rows: u32, blocks: u3
 /// The matrix kernel as the Surface's Adreno runs it: kir_ir3's code in
 /// the emulated A7xx.
 fn testMatrixAdreno(lay: Layout, format: Format, tokens: u32, rows: u32, blocks: u32) !void {
-    return testMatrixOn(.adreno, gpu.adreno_device.x1_45_caps(Adreno.arena.len), lay, format, tokens, rows, blocks);
+    return testMatrixOn(.adreno, gpu.adreno_device.emuCaps(Adreno.arena.len), lay, format, tokens, rows, blocks);
 }
 
 fn testMatrixOn(where: enum { interp, rtx, adreno }, caps: Caps, lay: Layout, format: Format, tokens: u32, rows: u32, blocks: u32) !void {

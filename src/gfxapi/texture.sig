@@ -22,8 +22,7 @@
 //! round it, blended (GL ES 3.0's rules). λ is skipped where it cannot
 //! matter (no mipmaps, and one filter both ways).
 //!
-//! Not yet: cube maps, 3D and array textures, shadow comparisons, LOD for
-//! integer textures (their base level is read).
+//! Integer textures read their base level for filtered lookups.
 
 const std = @import("std");
 const gpu = @import("gpu");
@@ -50,12 +49,15 @@ const D_MIN_LOD = 8; // f32
 const D_MAX_LOD = 9; // f32
 const D_C = 10; // f32: a λ at or below it magnifies
 const D_AT = 11; // level l's byte offset at D_AT + l
-pub const DESC_WORDS = D_AT + engine.MAX_LEVELS;
+const D_LAYERS = D_AT + engine.MAX_LEVELS;
+const D_IMAGE_LEVELS = D_LAYERS + 1;
+pub const DESC_WORDS = D_IMAGE_LEVELS + 1;
 
 // D_FMT: log2 of the texel's bytes (bits 0..2), its kind (4..5), its
 // channels (8..10), sRGB (12), a texture there (13)
 const F_SRGB: u32 = 1 << 12;
 const F_VALID: u32 = 1 << 13;
+const F_DEPTH: u32 = 1 << 14;
 // D_SWZ: 3 bits a channel: 0..3 one of the texel's, 4 zero, 5 one
 pub const SWZ_ZERO = 4;
 pub const SWZ_ONE = 5;
@@ -72,12 +74,15 @@ pub const Mip = enum(u2) { none, nearest, linear };
 /// incomplete: it reads (0, 0, 0, 1)), and its state.
 pub const State = struct {
     img: ?*engine.Image = null,
+    layers: u32 = 1,
     srgb: bool = false,
     /// GL's channels as the texel's (or SWZ_ZERO, SWZ_ONE), the format's
     /// swizzle (BGRA, LUMINANCE ...) and TEXTURE_SWIZZLE_* composed
     swizzle: [4]u3 = .{ 0, 1, 2, 3 },
     wrap_s: Wrap = .repeat,
     wrap_t: Wrap = .repeat,
+    wrap_r: Wrap = .repeat,
+    compare: u3 = 0,
     /// the magnification filter LINEAR
     linear: bool = false,
     /// the minification filter's: LINEAR (or *_MIPMAP_* LINEAR within a
@@ -100,7 +105,8 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     out[D_W] = img.width;
     out[D_H] = img.height;
     out[D_STRIDE] = img.stride;
-    out[D_FMT] = std.math.log2_int(u32, fmt.bytes()) | @as(u32, @intFromEnum(fmt.kind())) << 4 | fmt.channels() << 8 | F_VALID | (if (s.srgb) F_SRGB else 0);
+    out[D_FMT] = std.math.log2_int(u32, fmt.bytes()) | @as(u32, @intFromEnum(fmt.kind())) << 4 | fmt.channels() << 8 |
+        F_VALID | (if (s.srgb) F_SRGB else 0) | (if (fmt == .d24s8) F_DEPTH else 0);
     var swz: u32 = 0;
     for (s.swizzle, 0..) |c, i| {
         // (an image without alpha reads opaque)
@@ -108,7 +114,8 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
         swz |= cc << @intCast(3 * i);
     }
     out[D_SWZ] = swz;
-    out[D_MODE] = @as(u32, @intFromEnum(s.wrap_s)) | @as(u32, @intFromEnum(s.wrap_t)) << 4 | (if (s.linear) M_LINEAR else 0);
+    out[D_MODE] = @as(u32, @intFromEnum(s.wrap_s)) | @as(u32, @intFromEnum(s.wrap_t)) << 4 |
+        @as(u32, @intFromEnum(s.wrap_r)) << 12 | @as(u32, s.compare) << 16 | (if (s.linear) M_LINEAR else 0);
     out[D_LAST] = @intCast(@max(img.buf.cpu.len / 4, 1) - 1);
     const matters = s.mip != .none or s.min_linear != s.linear;
     out[D_LOD] = @as(u32, s.base) | @as(u32, s.last) << 4 | @as(u32, @intFromEnum(s.mip)) << 8 | (if (s.min_linear) L_MIN_LINEAR else 0) | (if (matters) L_MATTERS else 0);
@@ -117,6 +124,8 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     // (GL: 0.5 when magnifying LINEAR and minifying NEAREST_MIPMAP_*)
     out[D_C] = @bitCast(@as(f32, if (s.linear and s.mip != .none and !s.min_linear) 0.5 else 0));
     for (0..img.levels) |l| out[D_AT + l] = img.level_at[l];
+    out[D_LAYERS] = s.layers;
+    out[D_IMAGE_LEVELS] = img.levels;
 }
 
 /// What a sampler returns: floats, or int or uint bits.
@@ -124,7 +133,7 @@ pub const Kind = enum { float, int, uint };
 
 /// Where a texture is: its binding, its descriptor's first word in the
 /// uniform binding `uni`.
-pub const Slot = struct { b: u8, uni: u8, word: u32 };
+pub const Slot = struct { b: u8, uni: u8, word: u32, volume: bool = false, cube: bool = false, offset_z: i32 = 0, shadow: ?Arg = null };
 
 const D = struct { w: V, h: V, stride: V, fmt: V, swz: V, mode: V, last: V };
 
@@ -199,11 +208,36 @@ fn texel(k: *kir.Kernel, b: u8, d: D, lv: Lvl, x: Arg, y: Arg, kind: Kind) [4]Ar
         // in a loop on ir3; the same bits on every device all the same)
         var un = k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(byte))), f(1.0 / 255.0));
         if (c < 3) un = srgbToLinear(k, un, srgb);
-        const v = k.sel(.f32, r(unorm), r(un), r(k.mov(.f32, r(words[c]))));
+        var v = k.sel(.f32, r(unorm), r(un), r(k.mov(.f32, r(words[c]))));
+        if (c == 0) {
+            const depth = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_DEPTH))), u(0));
+            v = k.sel(.f32, r(depth), r(unpackDepth(k, words[0])), r(v));
+        }
         const have = k.cmp(.u32, .gt, r(channels), u(@intCast(c)));
         o.* = r(k.sel(.f32, r(have), r(v), if (c == 3) f(1) else f(0)));
     }
     return out;
+}
+
+fn unpackDepth(k: *kir.Kernel, word: V) V {
+    const bits = k.op3(.bfe, .u32, r(word), u(0), u(24));
+    return k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(bits))), f(1.0 / 16777215.0));
+}
+
+fn filteredTexel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, x: Arg, y: Arg, kind: Kind) [4]Arg {
+    const reference = slot.shadow orelse return texel(k, slot.b, d, lv, x, y, kind);
+    const row = k.op3(.imad, .u32, y, r(lv.stride), r(lv.off));
+    const at = k.op3(.imad, .u32, x, u(4), r(row));
+    const limit = k.op2(.shl, .u32, r(d.last), u(2));
+    const word = k.load(.u32, kir.global(slot.b, 32), r(k.op2(.imin, .u32, r(at), r(limit))));
+    const depth = unpackDepth(k, word);
+    const ref = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, reference, f(0))), f(1));
+    const less = k.cmp(.f32, .lt, r(ref), r(depth));
+    const greater = k.cmp(.f32, .gt, r(ref), r(depth));
+    const relation = k.sel(.u32, r(less), u(1), r(k.sel(.u32, r(greater), u(4), u(2))));
+    const compare = k.op3(.bfe, .u32, r(d.mode), u(16), u(3));
+    const pass = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(relation), r(compare))), u(0));
+    return .{ r(k.sel(.f32, r(pass), f(1), f(0))), f(0), f(0), f(1) };
 }
 
 /// sRGB's decode where `on`: c / 12.92, or ((c + 0.055) / 1.055)^2.4.
@@ -263,7 +297,7 @@ pub const Lod = union(enum) {
     base,
     /// from the derivatives of (s, t) across and up (a fragment shader's
     /// implicit LOD, textureGrad's), plus a bias
-    grad: struct { dsdx: Arg, dtdx: Arg, dsdy: Arg, dtdy: Arg, bias: Arg },
+    grad: struct { dsdx: Arg, dtdx: Arg, dsdy: Arg, dtdy: Arg, bias: Arg, drdx: Arg = f(0), drdy: Arg = f(0) },
     /// given (textureLod)
     level: Arg,
 };
@@ -273,11 +307,22 @@ pub const Lod = union(enum) {
 /// two levels), wrapped; `off` in texels (textureOffset). Integer
 /// textures: the base level, nearest.
 pub fn sample(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, kind: Kind, off: [2]i32, lod: Lod) [4]Arg {
+    return sampleArray(k, slot, s, t, null, kind, off, lod);
+}
+
+pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind: Kind, off: [2]i32, lod: Lod) [4]Arg {
     const d = loadDesc(k, slot);
+    const slice: ?Arg = if (slot.volume or slot.cube) layer else if (layer) |z| blk: {
+        const count = k.op2(.imax, .u32, r(descWord(k, slot, D_LAYERS)), u(1));
+        const last = k.cvt(.u32, .f32, .rne, r(k.op2(.isub, .u32, r(count), u(1))));
+        const rounded = k.op1(.ffloor, .f32, r(k.op2(.fadd, .f32, z, f(0.5))));
+        const clamped = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(rounded), f(0))), r(last));
+        break :blk r(k.cvt(.f32, .u32, .rz, r(clamped)));
+    } else null;
     const lw = descWord(k, slot, D_LOD);
     const base = k.op3(.bfe, .u32, r(lw), u(0), u(4));
     if (kind != .float) {
-        const raw = sampleLevel(k, slot, d, levelOf(k, slot, d, base), s, t, k.mov(.pred, u(0)), kind, off);
+        const raw = sampleLayerLevel(k, slot, d, base, slice, s, t, k.mov(.pred, u(0)), kind, off);
         return finish(k, d, raw, kind);
     }
     const last = k.op3(.bfe, .u32, r(lw), u(4), u(4));
@@ -300,8 +345,13 @@ pub fn sample(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, kind: Kind, off: [2]i3
                         return kk.op2(.fmul, .f32, r(v), r(v));
                     }
                 }.f_;
-                const rx = k.op2(.fadd, .f32, r(sq(k, gd.dsdx, wb)), r(sq(k, gd.dtdx, hb)));
-                const ry = k.op2(.fadd, .f32, r(sq(k, gd.dsdy, wb)), r(sq(k, gd.dtdy, hb)));
+                var rx = k.op2(.fadd, .f32, r(sq(k, gd.dsdx, wb)), r(sq(k, gd.dtdx, hb)));
+                var ry = k.op2(.fadd, .f32, r(sq(k, gd.dsdy, wb)), r(sq(k, gd.dtdy, hb)));
+                if (slot.volume) {
+                    const db = k.cvt(.u32, .f32, .rne, r(depthAt(k, slot, base)));
+                    rx = k.op2(.fadd, .f32, r(rx), r(sq(k, gd.drdx, db)));
+                    ry = k.op2(.fadd, .f32, r(ry), r(sq(k, gd.drdy, db)));
+                }
                 // λ = log2 ρ = log2(ρ²) / 2 (ρ² 0: -inf, magnified)
                 const l2 = k.op1(.flog2, .f32, r(k.op2(.fmax, .f32, r(rx), r(ry))));
                 k.set(lam, .fadd, r(k.op2(.fmul, .f32, r(l2), f(0.5))), gd.bias, no);
@@ -347,7 +397,7 @@ pub fn sample(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, kind: Kind, off: [2]i3
     }
     k.loop();
     {
-        const cv = sampleLevel(k, slot, d, levelOf(k, slot, d, lvl), s, t, linear, kind, off);
+        const cv = sampleLayerLevel(k, slot, d, lvl, slice, s, t, linear, kind, off);
         // (one level: the read itself, not a blend: inf and NaN survive)
         for (outv, 0..) |o, c| k.set(o, .sel, r(k.op2(.fadd, .f32, r(o), r(k.op2(.fmul, .f32, cv[c], r(wgt))))), cv[c], r(tri));
         k.brk(r(k.op2(.por, .pred, r(k.op1(.pnot, .pred, r(tri))), r(second))));
@@ -361,9 +411,136 @@ pub fn sample(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, kind: Kind, off: [2]i3
     return finish(k, d, out, kind);
 }
 
+fn depthAt(k: *kir.Kernel, slot: Slot, level: V) V {
+    const depth = descWord(k, slot, D_LAYERS);
+    const n = if (slot.volume) k.op2(.shr, .u32, r(depth), r(level)) else depth;
+    return k.op2(.imax, .u32, r(n), u(1));
+}
+
+/// Cube face order follows GL's +X, -X, +Y, -Y, +Z, -Z enums.
+pub const CubeProjection = struct { s: Arg, t: Arg, face: Arg, inverse_major: Arg };
+
+pub fn cubeProject(k: *kir.Kernel, x: Arg, y: Arg, z: Arg) CubeProjection {
+    const ax = k.op1(.fabs, .f32, x);
+    const ay = k.op1(.fabs, .f32, y);
+    const az = k.op1(.fabs, .f32, z);
+    const x_major = k.op2(.pand, .pred, r(k.cmp(.f32, .ge, r(ax), r(ay))), r(k.cmp(.f32, .ge, r(ax), r(az))));
+    const y_major = k.cmp(.f32, .ge, r(ay), r(az));
+    const major = k.sel(.f32, r(x_major), x, r(k.sel(.f32, r(y_major), y, z)));
+    const neg = k.cmp(.f32, .lt, r(major), f(0));
+    const axis = k.sel(.u32, r(x_major), u(0), r(k.sel(.u32, r(y_major), u(2), u(4))));
+    const face = k.op2(.iadd, .u32, r(axis), r(k.sel(.u32, r(neg), u(1), u(0))));
+    const nx = k.op1(.fneg, .f32, x);
+    const ny = k.op1(.fneg, .f32, y);
+    const nz = k.op1(.fneg, .f32, z);
+    const sc = k.sel(.f32, r(x_major), r(k.sel(.f32, r(neg), z, r(nz))), r(k.sel(.f32, r(y_major), x, r(k.sel(.f32, r(neg), r(nx), x)))));
+    const tc = k.sel(.f32, r(x_major), r(ny), r(k.sel(.f32, r(y_major), r(k.sel(.f32, r(neg), r(nz), z)), r(ny))));
+    const mag = k.op2(.fmax, .f32, r(k.op1(.fabs, .f32, r(major))), f(1e-30));
+    const inverse = k.op1(.frcp, .f32, r(mag));
+    const scale = k.op2(.fmul, .f32, f(0.5), r(inverse));
+    return .{ .s = r(k.op3(.fmad, .f32, r(sc), r(scale), f(0.5))), .t = r(k.op3(.fmad, .f32, r(tc), r(scale), f(0.5))), .face = r(face), .inverse_major = r(inverse) };
+}
+
+/// Project an explicit direction gradient using the selected face's frame.
+pub fn cubeGradient(k: *kir.Kernel, p: CubeProjection, x: Arg, y: Arg, z: Arg) [2]Arg {
+    const xf = k.cmp(.u32, .lt, p.face, u(2));
+    const yf = k.cmp(.u32, .lt, p.face, u(4));
+    const neg = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, p.face, u(1))), u(0));
+    const nx = k.op1(.fneg, .f32, x);
+    const ny = k.op1(.fneg, .f32, y);
+    const nz = k.op1(.fneg, .f32, z);
+    const ds = k.sel(.f32, r(xf), r(k.sel(.f32, r(neg), z, r(nz))), r(k.sel(.f32, r(yf), x, r(k.sel(.f32, r(neg), r(nx), x)))));
+    const dt = k.sel(.f32, r(xf), r(ny), r(k.sel(.f32, r(yf), r(k.sel(.f32, r(neg), r(nz), z)), r(ny))));
+    const major = k.sel(.f32, r(xf), x, r(k.sel(.f32, r(yf), y, z)));
+    const dm = k.sel(.f32, r(neg), r(k.op1(.fneg, .f32, r(major))), r(major));
+    var out: [2]Arg = undefined;
+    for (&out, [_]Arg{ p.s, p.t }, [_]V{ ds, dt }) |*result, coord, derivative| {
+        const q = k.op2(.fsub, .f32, f(0.5), coord);
+        const top = k.op3(.fmad, .f32, r(q), r(dm), r(k.op2(.fmul, .f32, f(0.5), r(derivative))));
+        result.* = r(k.op2(.fmul, .f32, r(top), p.inverse_major));
+    }
+    return out;
+}
+
+fn cubeTap(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, face: Arg, x: V, y: V, linear: V, kind: Kind) [4]Arg {
+    const width = k.cvt(.u32, .f32, .rne, r(lv.w));
+    const height = k.cvt(.u32, .f32, .rne, r(lv.h));
+    const clamp = struct {
+        fn index(kk: *kir.Kernel, value: V, size_: V) V {
+            const last = kk.op2(.fsub, .f32, r(size_), f(1));
+            return kk.cvt(.f32, .u32, .rz, r(kk.op2(.fmin, .f32, r(kk.op2(.fmax, .f32, r(value), f(0))), r(last))));
+        }
+    }.index;
+    const ix = k.reg(.u32);
+    const iy = k.reg(.u32);
+    const selected = k.reg(.u32);
+    k.set(ix, .mov, r(clamp(k, x, width)), no, no);
+    k.set(iy, .mov, r(clamp(k, y, height)), no, no);
+    k.set(selected, .mov, face, no, no);
+    if (kind == .float) {
+        const outside_x = k.op2(.por, .pred, r(k.cmp(.f32, .lt, r(x), f(0))), r(k.cmp(.f32, .ge, r(x), r(width))));
+        const outside_y = k.op2(.por, .pred, r(k.cmp(.f32, .lt, r(y), f(0))), r(k.cmp(.f32, .ge, r(y), r(height))));
+        k.ifp(r(k.op2(.pand, .pred, r(linear), r(k.op2(.por, .pred, r(outside_x), r(outside_y))))));
+        const s = k.op3(.fmad, .f32, r(k.op2(.fadd, .f32, r(x), f(0.5))), r(k.op2(.fmul, .f32, f(2), r(k.op1(.frcp, .f32, r(width))))), f(-1));
+        const t = k.op3(.fmad, .f32, r(k.op2(.fadd, .f32, r(y), f(0.5))), r(k.op2(.fmul, .f32, f(2), r(k.op1(.frcp, .f32, r(height))))), f(-1));
+        const x_face = k.cmp(.u32, .lt, face, u(2));
+        const y_face = k.cmp(.u32, .lt, face, u(4));
+        const negative = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, face, u(1))), u(0));
+        const sign = k.sel(.f32, r(negative), f(-1), f(1));
+        const signed_s = k.op2(.fmul, .f32, r(s), r(sign));
+        const signed_t = k.op2(.fmul, .f32, r(t), r(sign));
+        const dx = k.sel(.f32, r(x_face), r(sign), r(k.sel(.f32, r(y_face), r(s), r(signed_s))));
+        const dy = k.sel(.f32, r(x_face), r(k.op1(.fneg, .f32, r(t))), r(k.sel(.f32, r(y_face), r(sign), r(k.op1(.fneg, .f32, r(t))))));
+        const dz = k.sel(.f32, r(x_face), r(k.op1(.fneg, .f32, r(signed_s))), r(k.sel(.f32, r(y_face), r(signed_t), r(sign))));
+        const projected = cubeProject(k, r(dx), r(dy), r(dz));
+        k.set(ix, .mov, r(clamp(k, k.op1(.ffloor, .f32, r(k.op2(.fmul, .f32, projected.s, r(width)))), width)), no, no);
+        k.set(iy, .mov, r(clamp(k, k.op1(.ffloor, .f32, r(k.op2(.fmul, .f32, projected.t, r(height)))), height)), no, no);
+        k.set(selected, .mov, projected.face, no, no);
+        k.endif();
+    }
+    return filteredTexel(k, slot, d, sliceOf(k, lv, r(selected)), r(ix), r(iy), kind);
+}
+
+fn sampleLayerLevel(k: *kir.Kernel, slot: Slot, d: D, level: V, layer: ?Arg, s: Arg, t: Arg, linear: V, kind: Kind, off: [2]i32) [4]Arg {
+    const lv = levelOf(k, slot, d, level);
+    if (slot.cube) return sampleLevel(k, slot, d, lv, s, t, linear, kind, off, layer);
+    if (!slot.volume) return sampleLevel(k, slot, d, sliceOf(k, lv, layer), s, t, linear, kind, off, null);
+    const depth = k.cvt(.u32, .f32, .rne, r(depthAt(k, slot, level)));
+    const z = k.op2(.fsub, .f32, r(k.op2(.fmul, .f32, layer orelse f(0), r(depth))), r(k.sel(.f32, r(linear), f(0.5), f(0))));
+    const floor = k.op1(.ffloor, .f32, r(z));
+    const fraction = k.op2(.fsub, .f32, r(z), r(floor));
+    const first = k.op2(.fadd, .f32, r(floor), f(@floatFromInt(slot.offset_z)));
+    const mode = k.op3(.bfe, .u32, r(d.mode), u(12), u(2));
+    const a = k.cvt(.f32, .u32, .rz, r(wrap(k, first, depth, mode)));
+    if (kind != .float) return sampleLevel(k, slot, d, sliceOf(k, lv, r(a)), s, t, linear, kind, off, null);
+    const b = k.cvt(.f32, .u32, .rz, r(wrap(k, k.op2(.fadd, .f32, r(first), f(1)), depth, mode)));
+    const blend = k.op2(.pand, .pred, r(linear), r(k.cmp(.u32, .ne, r(a), r(b))));
+    const current = k.reg(.u32);
+    const second = k.reg(.pred);
+    var out: [4]Arg = undefined;
+    k.set(current, .mov, r(a), no, no);
+    k.set(second, .mov, u(0), no, no);
+    for (&out) |*channel| {
+        const value = k.reg(.f32);
+        k.set(value, .mov, f(0), no, no);
+        channel.* = r(value);
+    }
+    k.loop();
+    const texel_channels = sampleLevel(k, slot, d, sliceOf(k, lv, r(current)), s, t, linear, kind, off, null);
+    for (out, texel_channels) |dst, src| {
+        const mix = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, dst, r(k.op2(.fsub, .f32, f(1), r(fraction))))), r(k.op2(.fmul, .f32, src, r(fraction))));
+        k.set(dst.reg, .sel, r(mix), src, r(second));
+    }
+    k.brk(r(k.op2(.por, .pred, r(second), r(k.op1(.pnot, .pred, r(blend))))));
+    k.set(current, .mov, r(b), no, no);
+    k.set(second, .mov, u(1), no, no);
+    k.endloop();
+    return out;
+}
+
 /// One level's sample: (s, t) in [0, 1] across it, nearest or bilinear
 /// (`linear`), wrapped, `off` added: its channels before the swizzle.
-fn sampleLevel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, s: Arg, t: Arg, linear: V, kind: Kind, off: [2]i32) [4]Arg {
+fn sampleLevel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, s: Arg, t: Arg, linear: V, kind: Kind, off: [2]i32, cube_face: ?Arg) [4]Arg {
     const wf = k.cvt(.u32, .f32, .rne, r(lv.w));
     const hf = k.cvt(.u32, .f32, .rne, r(lv.h));
     const half = k.sel(.f32, r(linear), f(0.5), f(0));
@@ -384,13 +561,15 @@ fn sampleLevel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, s: Arg, t: Arg, linear
     }.i;
     const xa = idx(k, wrap(k, x0, wf, ws));
     const ya = idx(k, wrap(k, y0, hf, wt));
-    const t00 = texel(k, slot.b, d, lv, xa, ya, kind);
+    const t00 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x0, y0, linear, kind) else filteredTexel(k, slot, d, lv, xa, ya, kind);
     if (kind != .float) return t00;
-    const xb = idx(k, wrap(k, k.op2(.fadd, .f32, r(x0), f(1)), wf, ws));
-    const yb = idx(k, wrap(k, k.op2(.fadd, .f32, r(y0), f(1)), hf, wt));
-    const t10 = texel(k, slot.b, d, lv, xb, ya, kind);
-    const t01 = texel(k, slot.b, d, lv, xa, yb, kind);
-    const t11 = texel(k, slot.b, d, lv, xb, yb, kind);
+    const x1 = k.op2(.fadd, .f32, r(x0), f(1));
+    const y1 = k.op2(.fadd, .f32, r(y0), f(1));
+    const xb = idx(k, wrap(k, x1, wf, ws));
+    const yb = idx(k, wrap(k, y1, hf, wt));
+    const t10 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x1, y0, linear, kind) else filteredTexel(k, slot, d, lv, xb, ya, kind);
+    const t01 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x0, y1, linear, kind) else filteredTexel(k, slot, d, lv, xa, yb, kind);
+    const t11 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x1, y1, linear, kind) else filteredTexel(k, slot, d, lv, xb, yb, kind);
     const gx = k.op2(.fsub, .f32, f(1), r(fx));
     const gy = k.op2(.fsub, .f32, f(1), r(fy));
     var out: [4]Arg = undefined;
@@ -404,18 +583,32 @@ fn sampleLevel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, s: Arg, t: Arg, linear
     return out;
 }
 
-/// The level `lod` (an int) past the base, at most the last.
+/// The explicit fetch level is independent of the minification filter.
+/// Clamp undefined levels to keep out-of-range reads within the allocation.
 fn levelAt(k: *kir.Kernel, slot: Slot, lod: Arg) V {
     const lw = descWord(k, slot, D_LOD);
     const rel = k.op2(.imax, .i32, lod, u(0));
-    return k.op2(.imin, .u32, r(k.op2(.iadd, .u32, r(k.op3(.bfe, .u32, r(lw), u(0), u(4))), r(rel))), r(k.op3(.bfe, .u32, r(lw), u(4), u(4))));
+    const levels = k.op2(.imax, .u32, r(descWord(k, slot, D_IMAGE_LEVELS)), u(1));
+    const last = k.op2(.isub, .u32, r(levels), u(1));
+    return k.op2(.imin, .u32, r(k.op2(.iadd, .u32, r(k.op3(.bfe, .u32, r(lw), u(0), u(4))), r(rel))), r(last));
 }
 
 /// texelFetch(): texel (x, y) of level `lod` past the base (ints; clamped
 /// inside the level), `off` added.
 pub fn fetch(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, kind: Kind, off: [2]i32, lod: Arg) [4]Arg {
+    return fetchArray(k, slot, x, y, null, kind, off, lod);
+}
+
+fn sliceOf(k: *kir.Kernel, level: Lvl, layer: ?Arg) Lvl {
+    const z = layer orelse return level;
+    var lv = level;
+    const pitch = k.op2(.imul, .u32, r(lv.h), r(lv.stride));
+    lv.off = k.op3(.imad, .u32, z, r(pitch), r(lv.off));
+    return lv;
+}
+
+pub fn fetchArray(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg, kind: Kind, off: [2]i32, lod: Arg) [4]Arg {
     const d = loadDesc(k, slot);
-    const lv = levelOf(k, slot, d, levelAt(k, slot, lod));
     const cl = struct {
         fn c(kk: *kir.Kernel, v: Arg, o: i32, n: V) Arg {
             const moved = if (o != 0) r(kk.op2(.iadd, .i32, v, u(@bitCast(o)))) else v;
@@ -423,8 +616,20 @@ pub fn fetch(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, kind: Kind, off: [2]i32
             return r(kk.op2(.imax, .i32, r(kk.op2(.imin, .i32, moved, r(last))), u(0)));
         }
     }.c;
+    const level = levelAt(k, slot, lod);
+    const z = if (layer) |a| cl(k, a, slot.offset_z, depthAt(k, slot, level)) else null;
+    const lv = sliceOf(k, levelOf(k, slot, d, level), z);
     const raw = texel(k, slot.b, d, lv, cl(k, x, off[0], lv.w), cl(k, y, off[1], lv.h), kind);
     return finish(k, d, raw, kind);
+}
+
+pub fn layerSize(k: *kir.Kernel, slot: Slot, lod: Arg) Arg {
+    const count = descWord(k, slot, D_LAYERS);
+    if (!slot.volume) return r(count);
+    const base = k.op3(.bfe, .u32, r(descWord(k, slot, D_LOD)), u(0), u(4));
+    const level = k.op2(.iadd, .u32, r(base), lod);
+    const n = depthAt(k, slot, level);
+    return r(k.sel(.u32, r(k.cmp(.u32, .eq, r(count), u(0))), u(0), r(n)));
 }
 
 /// textureSize(): level `lod`'s (past the base) width and height (ints;

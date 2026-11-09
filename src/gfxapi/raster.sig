@@ -37,7 +37,7 @@
 //!
 //! Not yet: points and lines; clipping (a triangle with a vertex at w <= 0,
 //! or beyond GUARD pixels, is dropped: a guard band); multisampling;
-//! several color attachments; stencil tests; float and integer targets.
+//! several color attachments; float and integer targets.
 //! Shaders are KIR emitters (`Shaders`): GLSL programs' (glsl/gen.sig), or
 //! Sig code.
 //!
@@ -171,8 +171,9 @@ pub const Pipeline = struct {
     /// words a vertex's record takes, and a triangle's
     vstride: u32,
     sstride: u32,
-    /// the device's programs: vertex, setup, raster (none on the CPU)
-    progs: [3]?gpu.Program = .{ null, null, null },
+    /// Vertex, setup, raster, and the optional stencil raster variant.
+    progs: [4]?gpu.Program = @splat(null),
+    stencil_refused_by: ?*anyopaque = null,
     /// the engine that loaded them
     owner: ?*anyopaque = null,
     /// the engine whose GPU refused them (their draws run on the CPU, not
@@ -250,10 +251,24 @@ pub const Blend = struct {
     eq_a: Equation = .add,
 };
 
+pub const StencilOp = enum(u3) { keep, zero, replace, incr, decr, invert, incr_wrap, decr_wrap };
+pub const Stencil = struct {
+    func: u3 = 7,
+    reference: u8 = 0,
+    value_mask: u8 = 0xff,
+    write_mask: u8 = 0xff,
+    fail: StencilOp = .keep,
+    depth_fail: StencilOp = .keep,
+    pass: StencilOp = .keep,
+};
+
 pub const Draw = struct {
     pipe: *const Pipeline,
     color: *engine.Image,
     depth: ?*engine.Image = null,
+    stencil: ?*engine.Image = null,
+    stencil_front: Stencil = .{},
+    stencil_back: Stencil = .{},
     attrs: [MAX_ATTRS]Attr = [_]Attr{.{}} ** MAX_ATTRS,
     /// the pipeline's textures' images (null: none bound: reads 0, 0, 0, 1)
     textures: [texture.MAX_TEX]?*engine.Image = [_]?*engine.Image{null} ** texture.MAX_TEX,
@@ -834,12 +849,27 @@ const R_BINS_X = 50;
 const R_BIN_BASE = 51;
 const R_BIN_CAP = 52;
 const R_BPP = 53; // the color image's bytes a pixel: 4 (RGBA8, BGRA8), 2 (RG8), 1 (R8)
-pub const RASTER_PARAMS = 54;
+const R_STENCIL = 54;
+const R_S_STRIDE = 55;
+const R_S_TOPDOWN = 56;
+const R_S_HEIGHT = 57;
+const R_DS_SHARED = 58;
+const R_S_FRONT = 59;
+const R_S_BACK = 66;
+pub const RASTER_PARAMS = 73;
 
 /// bindings: 0 color (written), 1 depth (written when on), 2 triangle
 /// records, 3 uniforms, then the textures
 pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
-    var k = kir.Kernel.init(s, "gl_raster", .{ TILE, TILE, 1 });
+    return rasterKernelWithStencil(s, p, false);
+}
+
+pub fn stencilKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
+    return rasterKernelWithStencil(s, p, true);
+}
+
+fn rasterKernelWithStencil(s: kir.Storage, p: *const Pipeline, stencil_enabled: bool) kir.Kernel {
+    var k = kir.Kernel.init(s, if (stencil_enabled) "gl_raster_stencil" else "gl_raster", .{ TILE, TILE, 1 });
     const b_c = k.binding();
     const b_d = k.binding();
     const b_t = k.binding();
@@ -847,6 +877,7 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     const sh = p.shaders;
     const b_tex = k.bindings;
     for (0..sh.textures) |_| _ = k.binding();
+    const b_s = if (stencil_enabled) k.binding() else 0;
     const lx = k.tid(0);
     const ly = k.tid(1);
     const odd_x: V = if (sh.quads) k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(lx), u(1))), u(0)) else .none;
@@ -871,11 +902,16 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     const c_off = k.op3(.imad, .u32, r(rowOf(&k, py, R_C_TOPDOWN, R_C_HEIGHT)), r(k.param(.u32, R_C_STRIDE)), r(k.op2(.imul, .u32, r(px), r(bpp))));
     const d_on = k.cmp(.u32, .ne, r(k.param(.u32, R_DEPTH)), u(0));
     const d_off = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(rowOf(&k, py, R_D_TOPDOWN, R_D_HEIGHT)), r(k.param(.u32, R_D_STRIDE)), r(px))), u(2));
+    const s_on = if (stencil_enabled) k.cmp(.u32, .ne, r(k.param(.u32, R_STENCIL)), u(0)) else .none;
+    const s_off = if (stencil_enabled) k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(rowOf(&k, py, R_S_TOPDOWN, R_S_HEIGHT)), r(k.param(.u32, R_S_STRIDE)), r(px))), u(2)) else .none;
+    const shared_ds = if (stencil_enabled) k.cmp(.u32, .ne, r(k.param(.u32, R_DS_SHARED)), u(0)) else .none;
     // the pixel and its depth, loaded once
     const old_c = k.reg(.u32);
     const old_d = k.reg(.u32);
+    const old_s = if (stencil_enabled) k.reg(.u32) else .none;
     k.set(old_c, .mov, u(0), no, no);
     k.set(old_d, .mov, u(0), no, no);
+    if (stencil_enabled) k.set(old_s, .mov, u(0), no, no);
     k.ifp(r(inside));
     k.ifp(r(wide));
     k.setAux(old_c, .ld, r(c_off), no, no, @bitCast(kir.global(b_c, 32)));
@@ -889,6 +925,11 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     k.ifp(r(d_on));
     k.setAux(old_d, .ld, r(d_off), no, no, @bitCast(kir.global(b_d, 32)));
     k.endif();
+    if (stencil_enabled) {
+        k.ifp(r(s_on));
+        k.setAux(old_s, .ld, r(s_off), no, no, @bitCast(kir.global(b_s, 32)));
+        k.endif();
+    }
     k.endif();
     const shift_r = k.param(.u32, R_SHIFT_R);
     const shift_b = k.param(.u32, R_SHIFT_B);
@@ -906,6 +947,8 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     k.set(dst[3], .sel, f(1), r(chan(&k, old_c, u(24))), r(k.cmp(.u32, .ne, r(k.param(.u32, R_NO_ALPHA)), u(0))));
     const depth = k.reg(.u32);
     k.set(depth, .@"and", r(old_d), u(0x00ff_ffff), no);
+    const stencil = if (stencil_enabled) k.reg(.u32) else .none;
+    if (stencil_enabled) k.set(stencil, .shr, r(old_s), u(24), no);
     const touched = k.reg(.u32);
     k.set(touched, .mov, u(0), no, no);
     const ntri = k.param(.u32, R_NTRI);
@@ -1013,6 +1056,7 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
                 const z = plane(&k, b_t, base, S_Z, dX, dY);
                 // (outside the depth range: clipped)
                 var pass = k.op2(.pand, .pred, r(k.cmp(.f32, .ge, r(z), r(k.param(.f32, R_ZMIN)))), r(k.cmp(.f32, .le, r(z), r(k.param(.f32, R_ZMAX)))));
+                const clipped = if (stencil_enabled) k.op2(.pand, .pred, r(pass), r(covered)) else .none;
                 const dz = k.cvt(.f32, .u32, .rne, r(k.op2(.fmul, .f32, r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(z), f(0))), f(1))), f(16777215.0))));
                 const func = k.param(.u32, R_DFUNC);
                 const bitOn = struct {
@@ -1023,10 +1067,29 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
                 const lt = k.op2(.pand, .pred, r(k.cmp(.u32, .lt, r(dz), r(depth))), r(bitOn(&k, func, 1)));
                 const eq = k.op2(.pand, .pred, r(k.cmp(.u32, .eq, r(dz), r(depth))), r(bitOn(&k, func, 2)));
                 const gt = k.op2(.pand, .pred, r(k.cmp(.u32, .gt, r(dz), r(depth))), r(bitOn(&k, func, 4)));
-                const dpass = k.op2(.por, .pred, r(k.op2(.por, .pred, r(lt), r(eq))), r(gt));
-                pass = k.op2(.pand, .pred, r(pass), r(k.sel(.pred, r(d_on), r(dpass), u(1))));
+                const depth_result = k.op2(.por, .pred, r(k.op2(.por, .pred, r(lt), r(eq))), r(gt));
+                const dpass = k.sel(.pred, r(d_on), r(depth_result), u(1));
+                const front = k.cmp(.u32, .ne, r(ld(&k, b_t, base, S_FRONT, .u32)), u(0));
+                var spass: V = .none;
+                pass = k.op2(.pand, .pred, r(pass), r(dpass));
+                if (stencil_enabled) {
+                    var stencil_params: [3]V = undefined;
+                    for (&stencil_params, 0..) |*param, index| {
+                        param.* = k.sel(.u32, r(front), r(k.param(.u32, @intCast(R_S_FRONT + index))), r(k.param(.u32, @intCast(R_S_BACK + index))));
+                    }
+                    const ref_masked = k.op2(.@"and", .u32, r(stencil_params[1]), r(stencil_params[2]));
+                    const stencil_masked = k.op2(.@"and", .u32, r(stencil), r(stencil_params[2]));
+                    const slt = k.op2(.pand, .pred, r(k.cmp(.u32, .lt, r(ref_masked), r(stencil_masked))), r(bitOn(&k, stencil_params[0], 1)));
+                    const seq = k.op2(.pand, .pred, r(k.cmp(.u32, .eq, r(ref_masked), r(stencil_masked))), r(bitOn(&k, stencil_params[0], 2)));
+                    const sgt = k.op2(.pand, .pred, r(k.cmp(.u32, .gt, r(ref_masked), r(stencil_masked))), r(bitOn(&k, stencil_params[0], 4)));
+                    spass = k.sel(.pred, r(s_on), r(k.op2(.por, .pred, r(k.op2(.por, .pred, r(slt), r(seq))), r(sgt))), u(1));
+                    pass = k.op2(.pand, .pred, r(pass), r(spass));
+                }
                 if (sh.quads) pass = k.op2(.pand, .pred, r(pass), r(covered));
-                k.ifp(r(if (sh.quads) quadAny(&k, pass) else pass));
+                // Stencil fail operations still depend on fragment discard.
+                // Evaluate covered fragments even when their tests fail.
+                const shade = if (stencil_enabled) k.sel(.pred, r(s_on), r(clipped), r(pass)) else pass;
+                k.ifp(r(if (sh.quads) quadAny(&k, shade) else shade));
                 {
                     const iw = plane(&k, b_t, base, S_W, dX, dY);
                     const wv = k.div(f(1), r(iw));
@@ -1037,19 +1100,38 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
                         io.varying[j] = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0) ld(&k, b_t, base, w0, .f32) else k.op2(.fmul, .f32, r(plane(&k, b_t, base, w0, dX, dY)), r(wv));
                     }
                     io.frag_coord = .{ X, Y, z, iw };
-                    io.front_facing = k.cmp(.u32, .ne, r(ld(&k, b_t, base, S_FRONT, .u32)), u(0));
+                    io.front_facing = front;
                     sh.fragment(sh.ctx, &k, &io);
                     var live = if (io.discard == .none) k.mov(.pred, u(1)) else k.op1(.pnot, .pred, r(io.discard));
-                    if (sh.quads) live = k.op2(.pand, .pred, r(live), r(pass));
+                    if (stencil_enabled) {
+                        live = k.op2(.pand, .pred, r(live), r(clipped));
+                    } else if (sh.quads) live = k.op2(.pand, .pred, r(live), r(pass));
                     k.ifp(r(live));
                     {
+                        if (stencil_enabled) {
+                            k.ifp(r(s_on));
+                            const stencil_front = k.cmp(.u32, .ne, r(ld(&k, b_t, base, S_FRONT, .u32)), u(0));
+                            var update: [5]V = undefined;
+                            for (&update, 0..) |*param, index| {
+                                const field: usize = if (index == 0) 1 else index + 2;
+                                param.* = k.sel(.u32, r(stencil_front), r(k.param(.u32, @intCast(R_S_FRONT + field))), r(k.param(.u32, @intCast(R_S_BACK + field))));
+                            }
+                            const op = k.sel(.u32, r(spass), r(k.sel(.u32, r(dpass), r(update[4]), r(update[3]))), r(update[2]));
+                            const result = stencilOp(&k, op, stencil, update[0]);
+                            const mask = update[1];
+                            k.set(stencil, .@"or", r(k.op2(.@"and", .u32, r(result), r(mask))), r(k.op2(.@"and", .u32, r(stencil), r(k.op1(.not, .u32, r(mask))))), no);
+                            k.set(touched, .@"or", r(touched), u(2), no);
+                            k.endif();
+                            k.ifp(r(pass));
+                        }
                         var src: [4]V = undefined;
                         for (0..4) |c| src[c] = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(io.color[c]), f(0))), f(1));
                         const out = blend(&k, src, dst);
                         for (0..4) |c| k.set(dst[c], .mov, r(out[c]), no, no);
-                        k.set(touched, .mov, u(1), no, no);
+                        k.set(touched, .@"or", r(touched), u(1), no);
                         k.ifp(r(k.op2(.pand, .pred, r(d_on), r(k.cmp(.u32, .ne, r(k.param(.u32, R_DWRITE)), u(0))))));
                         k.set(depth, .mov, r(dz), no, no);
+                        if (stencil_enabled) k.endif();
                         k.endif();
                     }
                     k.endif();
@@ -1062,7 +1144,8 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     }
     k.endloop();
     // the pixel and its depth, stored once (the masked channels kept)
-    k.ifp(r(k.op2(.pand, .pred, r(inside), r(k.cmp(.u32, .ne, r(touched), u(0))))));
+    const color_touched = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(touched), u(1))), u(0));
+    k.ifp(r(k.op2(.pand, .pred, r(inside), r(color_touched))));
     {
         const pack = struct {
             fn f_(kk: *kir.Kernel, c: V, sh_: Arg) V {
@@ -1084,12 +1167,46 @@ pub fn rasterKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         k.store(.u32, kir.global(b_c, 8), r(c_off), r(merged));
         k.endif();
         k.endif();
-        k.ifp(r(k.op2(.pand, .pred, r(d_on), r(k.cmp(.u32, .ne, r(k.param(.u32, R_DWRITE)), u(0))))));
-        k.store(.u32, kir.global(b_d, 32), r(d_off), r(k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(old_d), u(0xff00_0000))), r(depth))));
-        k.endif();
+        if (!stencil_enabled) {
+            k.ifp(r(k.op2(.pand, .pred, r(d_on), r(k.cmp(.u32, .ne, r(k.param(.u32, R_DWRITE)), u(0))))));
+            k.store(.u32, kir.global(b_d, 32), r(d_off), r(k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(old_d), u(0xff000000))), r(depth))));
+            k.endif();
+        }
     }
     k.endif();
+    if (stencil_enabled) {
+        const depth_written = k.op2(.pand, .pred, r(color_touched), r(k.op2(.pand, .pred, r(d_on), r(k.cmp(.u32, .ne, r(k.param(.u32, R_DWRITE)), u(0))))));
+        const stencil_written = k.op2(.pand, .pred, r(s_on), r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(touched), u(2))), u(0))));
+        k.ifp(r(k.op2(.pand, .pred, r(inside), r(k.op2(.por, .pred, r(depth_written), r(k.op2(.pand, .pred, r(shared_ds), r(stencil_written))))))));
+        const low_depth = k.sel(.u32, r(depth_written), r(depth), r(k.op2(.@"and", .u32, r(old_d), u(0x00ffffff))));
+        const high_stencil = k.sel(.u32, r(shared_ds), r(k.op2(.shl, .u32, r(stencil), u(24))), r(k.op2(.@"and", .u32, r(old_d), u(0xff000000))));
+        k.store(.u32, kir.global(b_d, 32), r(d_off), r(k.op2(.@"or", .u32, r(low_depth), r(high_stencil))));
+        k.endif();
+        k.ifp(r(k.op2(.pand, .pred, r(inside), r(k.op2(.pand, .pred, r(stencil_written), r(k.op1(.pnot, .pred, r(shared_ds))))))));
+        k.store(.u32, kir.global(b_s, 32), r(s_off), r(k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(old_s), u(0x00ffffff))), r(k.op2(.shl, .u32, r(stencil), u(24))))));
+        k.endif();
+    }
     return k;
+}
+
+fn stencilOp(k: *kir.Kernel, op: V, value: V, reference: V) V {
+    var result = value;
+    const increment = k.op2(.iadd, .u32, r(value), u(1));
+    const decrement = k.op2(.isub, .u32, r(value), u(1));
+    const values = [_]V{
+        value,
+        k.mov(.u32, u(0)),
+        reference,
+        k.op2(.imin, .u32, r(increment), u(255)),
+        k.sel(.u32, r(k.cmp(.u32, .eq, r(value), u(0))), u(0), r(decrement)),
+        k.op2(.xor, .u32, r(value), u(255)),
+        k.op2(.@"and", .u32, r(increment), u(255)),
+        k.op2(.@"and", .u32, r(decrement), u(255)),
+    };
+    for (values[1..], 1..) |candidate, index| {
+        result = k.sel(.u32, r(k.cmp(.u32, .eq, r(op), u(@intCast(index)))), r(candidate), r(result));
+    }
+    return result;
 }
 
 /// Whether any pixel of the lane's quad has `p` (every lane of the group
@@ -1195,7 +1312,7 @@ pub fn vertexParams(d: *const Draw, out: []u32) []u32 {
 
 pub fn setupParams(d: *const Draw, out: []u32) []u32 {
     const rect = d.rect;
-    const p = [_]u32{ d.triangles(), d.count, @intFromEnum(d.topology), d.cull, @intFromBool(d.front_ccw), d.pipe.vstride, d.pipe.sstride, rect.x0, rect.y0, rect.x1, rect.y1 };
+    const p = [_]u32{ d.triangles(), d.count, @backingInt(d.topology), d.cull, @intFromBool(d.front_ccw), d.pipe.vstride, d.pipe.sstride, rect.x0, rect.y0, rect.x1, rect.y1 };
     @memcpy(out[0..p.len], &p);
     return out[0..p.len];
 }
@@ -1249,10 +1366,21 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
     out[R_DWRITE] = @intFromBool(d.depth_write);
     out[R_ZMIN] = fbits(d.zmin);
     out[R_ZMAX] = fbits(d.zmax);
+    if (d.stencil) |stencil| {
+        out[R_STENCIL] = 1;
+        out[R_S_STRIDE] = stencil.stride / 4;
+        out[R_S_TOPDOWN] = @intFromBool(stencil.top_down);
+        out[R_S_HEIGHT] = stencil.height;
+        out[R_DS_SHARED] = @intFromBool(d.depth == stencil);
+        for ([_]Stencil{ d.stencil_front, d.stencil_back }, [_]usize{ R_S_FRONT, R_S_BACK }) |face, start| {
+            const words = [_]u32{ face.func, face.reference, face.value_mask, face.write_mask, @backingInt(face.fail), @backingInt(face.depth_fail), @backingInt(face.pass) };
+            @memcpy(out[start..][0..words.len], &words);
+        }
+    }
     if (d.blend) |b| {
         out[R_BLEND] = 1;
-        out[R_EQ_RGB] = @intFromEnum(b.eq_rgb);
-        out[R_EQ_A] = @intFromEnum(b.eq_a);
+        out[R_EQ_RGB] = @backingInt(b.eq_rgb);
+        out[R_EQ_A] = @backingInt(b.eq_a);
         out[R_SATURATE] = @intFromBool(b.saturate);
         factorWords(b.src_rgb, true, out[R_SRC_RGB..]);
         factorWords(b.dst_rgb, true, out[R_DST_RGB..]);

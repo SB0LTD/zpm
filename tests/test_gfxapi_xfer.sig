@@ -95,7 +95,7 @@ fn scene(eng: *engine.Engine, out: *Out) !void {
     defer c.deinit();
 
     // ── 1. A texture uploaded through a mapped unpack buffer ──
-    var pbo: [2]u32 = undefined;
+    var pbo: [3]u32 = undefined;
     c.genBuffers(&pbo);
     c.bindBuffer(g.PIXEL_UNPACK_BUFFER, pbo[0]);
     c.bufferData(g.PIXEL_UNPACK_BUFFER, S * S * 4, null, g.STREAM_DRAW);
@@ -217,6 +217,18 @@ fn scene(eng: *engine.Engine, out: *Out) !void {
     // (a mapped pack buffer is no target)
     c.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, null);
     err(c, out, g.INVALID_OPERATION, @src().line);
+    _ = c.unmapBuffer(g.PIXEL_PACK_BUFFER);
+    // The same transfer into a noncoherent persistent client map. The
+    // client barrier must expose the bytes while the map stays open.
+    c.bindBuffer(g.PIXEL_PACK_BUFFER, pbo[2]);
+    const persistent_read = g.MAP_READ_BIT | 0x40;
+    c.bufferStorage(g.PIXEL_PACK_BUFFER, D * D * 4, null, persistent_read);
+    const persistent = c.mapBufferRange(g.PIXEL_PACK_BUFFER, 0, D * D * 4, persistent_read);
+    want(c, out, persistent != null, @src().line);
+    c.readPixels(0, 0, D, D, g.RGBA, g.UNSIGNED_BYTE, null);
+    c.clientMappedBarrier(0x4000);
+    err(c, out, g.NO_ERROR, @src().line);
+    if (persistent != null) try std.testing.expectEqualSlices(u8, &out.packed_px, bytes(persistent, D * D * 4));
     _ = c.unmapBuffer(g.PIXEL_PACK_BUFFER);
     c.bindBuffer(g.PIXEL_PACK_BUFFER, 0);
     c.bindFramebuffer(g.READ_FRAMEBUFFER, fr);

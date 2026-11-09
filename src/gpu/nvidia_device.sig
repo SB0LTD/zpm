@@ -121,6 +121,9 @@ pub const Adapter = struct {
     sets: [SETS]Set = [_]Set{.{}} ** SETS,
     next_set: usize = 0,
     last_set: ?usize = null,
+    timer_push: nv.Buffer = .{},
+    timer_value: nv.Buffer = .{},
+    timer_fence: ?nv.Fence = null,
     /// Runs submitted, and the ones whose dispatches failed on the GPU.
     runs: u64 = 0,
     /// The waits for idle the last run took between its dispatches.
@@ -144,6 +147,18 @@ pub const Adapter = struct {
         return s.raw.handle;
     }
 
+    /// Track an imported buffer from the same host device as an allocation.
+    /// On failure the caller still owns the raw reference.
+    pub fn adoptHost(a: *Adapter, raw: nv.Buffer) ?gpu.Buffer {
+        if (a.host == null or raw.cpu.len == 0) return null;
+        for (&a.bufs, 0..) |*slot, i| {
+            if (slot.used) continue;
+            slot.* = .{ .raw = raw, .on_host = true, .used = true };
+            return .{ .gpu = raw.va, .cpu = raw.cpu, .bytes = raw.cpu.len, .handle = @intCast(i + 1), .kind = .host };
+        }
+        return null;
+    }
+
     const vtable = gpu.Device.VTable{
         .alloc = alloc,
         .free = free,
@@ -158,6 +173,7 @@ pub const Adapter = struct {
         .lastRunNs = lastRunNs,
         .profile = profile,
         .dispatchNs = dispatchNs,
+        .timestampNs = timestampNs,
     };
 
     fn self(ctx: *anyopaque) *Adapter {
@@ -236,9 +252,15 @@ pub const Adapter = struct {
 
     fn setUp(a: *Adapter, s: *Set) gpu.Error!void {
         if (s.pb.cpu.len != 0) return;
-        s.slots = a.vram.alloc(SLOT_BYTES * MAX_DISPATCHES) catch return error.OutOfMemory;
-        s.pb = a.vram.alloc(PB_DWORDS * 4) catch return error.OutOfMemory;
-        s.stamps = a.rawOf(true).alloc(64) catch return error.OutOfMemory;
+        const host = a.rawOf(true);
+        const slots = a.vram.alloc(SLOT_BYTES * MAX_DISPATCHES) catch return error.OutOfMemory;
+        errdefer a.vram.free(slots);
+        // Fetch the command stream from coherent system memory, like the
+        // kernel's channel. QMDs and shader data can still live in VRAM.
+        const pb = host.alloc(PB_DWORDS * 4) catch return error.OutOfMemory;
+        errdefer host.free(pb);
+        const stamps = host.alloc(64) catch return error.OutOfMemory;
+        s.* = .{ .slots = slots, .pb = pb, .stamps = stamps };
     }
 
     fn run(ctx: *anyopaque, ds: []const gpu.Dispatch) gpu.Error!gpu.Fence {
@@ -306,8 +328,9 @@ pub const Adapter = struct {
         p.reportTimestamp(s.stamps.va + 16, 2);
         p.check() catch return error.Unsupported;
         a.vram.toDevice(s.slots, 0, ds.len * SLOT_BYTES);
-        a.vram.toDevice(s.pb, 0, p.len * 4);
-        const f = a.vram.submit(s.pb, @intCast(p.len)) catch |e| return mapError(e);
+        const host = a.rawOf(true);
+        host.toDevice(s.pb, 0, p.len * 4);
+        const f = host.submit(s.pb, @intCast(p.len)) catch |e| return mapError(e);
         s.fence = f;
         s.dispatches = @intCast(ds.len);
         a.last_set = si;
@@ -341,6 +364,34 @@ pub const Adapter = struct {
         const a = self(ctx);
         a.vram.wait(f, 0) catch return false;
         return true;
+    }
+
+    fn timestampNs(ctx: *anyopaque, timeout_us: u64) gpu.Error!u64 {
+        const a = self(ctx);
+        const host = a.rawOf(true);
+        if (a.timer_fence) |f| {
+            host.wait(f, timeout_us) catch |e| return mapError(e);
+            a.timer_fence = null;
+        }
+        if (a.timer_push.cpu.len == 0) {
+            const commands = host.alloc(256) catch return error.OutOfMemory;
+            errdefer host.free(commands);
+            a.timer_value = host.alloc(16) catch return error.OutOfMemory;
+            a.timer_push = commands;
+        }
+        var p = push.Push{ .buf = a.timer_push.words() };
+        p.computeSetup(.{});
+        p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
+        p.reportTimestamp(a.timer_value.va, 1);
+        p.check() catch return error.Unsupported;
+        host.toDevice(a.timer_push, 0, p.len * 4);
+        const f = host.submit(a.timer_push, @intCast(p.len)) catch |e| return mapError(e);
+        a.timer_fence = f;
+        host.wait(f, timeout_us) catch |e| return mapError(e);
+        a.timer_fence = null;
+        host.fromDevice(a.timer_value, 0, 16);
+        const tick = std.mem.readInt(u64, a.timer_value.cpu[8..16], .little);
+        return @intCast(@as(u128, tick) * 1_000_000_000 / host.timestamp_hz);
     }
 
     fn lastRunNs(ctx: *anyopaque) u64 {
@@ -603,6 +654,8 @@ test "a first kernel: out[i] = b[i] * 2.5 + a[i] + n through the adapter, QMDs a
         try testing.expectEqual(want, fo[j]);
     }
     try testing.expect(d.lastRunNs() > 0);
+    const clock = d.vtable.timestampNs.?;
+    const before = try clock(d.ctx, 2_000_000);
     // Profiled: three dispatches, each one's end after the one before's
     // (each reads what the one before wrote), the last within the run.
     try testing.expect(d.profile(true));
@@ -616,6 +669,8 @@ test "a first kernel: out[i] = b[i] * 2.5 + a[i] + n through the adapter, QMDs a
     try testing.expectEqual(@as(usize, 3), d.dispatchNs(&ends));
     try testing.expect(ends[0] > 0 and ends[0] < ends[1] and ends[1] < ends[2]);
     try testing.expect(ends[2] <= d.lastRunNs());
+    const after = try clock(d.ctx, 2_000_000);
+    try testing.expect(after > before);
 }
 
 // ── LFM3's Q4_K matrix, rewritten in KIR ────────────────────────────────────

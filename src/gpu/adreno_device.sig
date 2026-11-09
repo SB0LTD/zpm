@@ -46,8 +46,8 @@ pub const STREAM_BYTES = 256 * 1024;
 /// The most groups along one axis (the Adreno's limit; KIR's gid bounds).
 pub const MAX_GROUPS = 65535;
 
-/// The Surface Laptop 13's X1-45 as far as the bring-up self-test has not
-/// measured it: mad's rounding unknown (so no fused FMA), denormals kept.
+/// The Surface Laptop 13's X1-45. The hardware probes measured unfused
+/// multiply-add and flush-to-zero for f32 arithmetic.
 pub fn x1_45_caps(device_bytes: u64) Caps {
     return .{
         .vendor = .qualcomm,
@@ -61,11 +61,18 @@ pub fn x1_45_caps(device_bytes: u64) Caps {
         .shared_bytes = 32 * 1024,
         .fused_fma = false,
         .mad = .unfused,
-        .denormals = .preserve,
+        .denormals = .flush,
         .dot4 = true,
         .import = false,
         .timestamp_hz = 19_200_000,
     };
+}
+
+/// The instruction emulator preserves f32 subnormals.
+pub fn emuCaps(device_bytes: u64) Caps {
+    var caps = x1_45_caps(device_bytes);
+    caps.denormals = .preserve;
+    return caps;
 }
 
 /// The raw device's buffer (what an Importer hands back).
@@ -144,6 +151,7 @@ pub const Over = struct {
         .wait = wait,
         .done = done,
         .lastRunNs = lastRunNs,
+        .timestampNs = timestampNs,
     };
 
     fn self(ctx: *anyopaque) *Over {
@@ -284,6 +292,7 @@ pub const Over = struct {
 
     fn run(ctx: *anyopaque, ds: []const Dispatch) Error!Fence {
         const o = self(ctx);
+        if (o.fence != 0 and !o.timed) try wait(ctx, o.fence, 0);
         try o.ensureBuffers();
         const ib = o.ib.?;
         const ts = o.ts.?;
@@ -326,6 +335,21 @@ pub const Over = struct {
 
     fn lastRunNs(ctx: *anyopaque) u64 {
         return self(ctx).last_ns;
+    }
+
+    fn timestampNs(ctx: *anyopaque, timeout_us: u64) Error!u64 {
+        const o = self(ctx);
+        if (o.raw.timestamp_hz == 0) return error.Unsupported;
+        // The adapter reuses its command and report buffers. Retire the
+        // previous submission before encoding a sample into those buffers.
+        if (o.fence != 0 and !o.timed) try wait(ctx, o.fence, timeout_us);
+        const previous_run_ns = o.last_ns;
+        defer o.last_ns = previous_run_ns;
+        const f = try run(ctx, &.{});
+        try wait(ctx, f, timeout_us);
+        const ts = o.ts.?;
+        const tick = std.mem.readInt(u64, ts.cpu[8..16], .little);
+        return @intCast(@min(@as(u128, tick) * 1_000_000_000 / o.raw.timestamp_hz, std.math.maxInt(u64)));
     }
 
     fn mapError(e: raw.Error) Error {
@@ -381,7 +405,7 @@ pub const Emu = struct {
     /// GPU's own copy, so cache maintenance is checked.
     pub fn init(e: *Emu, arena: []u8, gpu_view: []u8) void {
         e.gpu = .{ .arena = arena, .gpu_view = gpu_view };
-        var c = x1_45_caps(arena.len);
+        var c = emuCaps(arena.len);
         c.name = "ir3_emu (Adreno X1-45)";
         c.coherent = gpu_view.len == 0;
         // (the strict device: each dispatch's code checked, buffers apart)
@@ -414,10 +438,15 @@ pub const Emu = struct {
         .wait = emuWait,
         .done = emuDone,
         .lastRunNs = emuLastRunNs,
+        .timestampNs = emuTimestampNs,
     };
 
     fn of(ctx: *anyopaque) *Emu {
         return @ptrCast(@alignCast(ctx));
+    }
+
+    fn emuTimestampNs(ctx: *anyopaque, timeout_us: u64) Error!u64 {
+        return Over.timestampNs(&of(ctx).adapter, timeout_us);
     }
     fn fwdAlloc(ctx: *anyopaque, bytes: u64, kind: Kind) ?Buffer {
         return Over.alloc(&of(ctx).adapter, bytes, kind);
@@ -566,10 +595,15 @@ test "a kernel through the adapter: PM4, constants, the pool, cache maintenance"
     const b = try d.alloc(4 * 256, .host);
     @memset(b.cpu, 0);
     d.toDevice(b, 0, b.bytes);
+    const clock = d.vtable.timestampNs.?;
+    const before = try clock(d.ctx, 1_000_000);
     try runOne(d, &p, .{ 4, 1, 1 }, &.{b}, &.{7});
+    const elapsed = d.lastRunNs();
+    const after = try clock(d.ctx, 1_000_000);
     d.fromDevice(b, 0, b.bytes);
     for (b.words(), 0..) |x, n| try std.testing.expectEqual(@as(u32, @intCast(n * 7 + 0x12345)), x);
-    try std.testing.expect(d.lastRunNs() > 0);
+    try std.testing.expect(elapsed > 0);
+    try std.testing.expect(after > before and after - before >= elapsed);
 }
 
 test "every constant in one direct load from c0, the pool too: none loaded by the CP from memory" {

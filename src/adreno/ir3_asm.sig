@@ -32,7 +32,7 @@ pub const Instr = ir3.Instr;
 pub const Src = ir3.Src;
 
 pub const MAX_INSTRS = 16384;
-pub const MAX_LABELS = 512;
+pub const MAX_LABELS = 1024;
 /// The register id meaning "not delivered" (Mesa's INVALID_REG, r63.x).
 pub const INVALID_REG: u8 = 0xfc;
 

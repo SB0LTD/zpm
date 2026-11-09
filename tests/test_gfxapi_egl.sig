@@ -92,6 +92,7 @@ const Fake = struct {
     var fence_fds: u32 = 0;
     var fence_signaled = false;
     var imports: u32 = 0;
+    var export_failures: u32 = 0;
 
     // version 4's feedback: a format table (format, pad, modifier), the
     // render node 226:128, one tranche of all of it
@@ -389,6 +390,10 @@ fn open() ?*engine.Engine {
 }
 fn exportFd(ctx: ?*anyopaque, b: gpu.Buffer) i64 {
     _ = ctx;
+    if (Fake.export_failures != 0) {
+        Fake.export_failures -= 1;
+        return -12;
+    }
     return 200 + @as(i64, b.handle);
 }
 /// A dma-buf in: the EmuDevice buffer behind fd (200 + its handle),
@@ -451,6 +456,7 @@ var window: wl.EglWindow = undefined;
 
 fn world(w: c_int, h: c_int) void {
     Fake.reset();
+    Fake.export_failures = 0;
     native_display = Fake.new(&display_iface, 1, null);
     native_surface = Fake.new(&surface_iface, 6, null);
     window = .{ .version = wl.EGL_WINDOW_VERSION, .width = w, .height = h, .dx = 0, .dy = 0, .attached_width = 0, .attached_height = 0, .driver_private = null, .resize_callback = null, .destroy_window_callback = null, .surface = @ptrCast(native_surface) };
@@ -634,6 +640,40 @@ test "egl: Firefox's start on Wayland, its teardown while current, and its secon
     try std.testing.expectEqual(base, Fake.live());
 }
 
+test "egl: a transient window export failure retries and a persistent failure drops the old draw target" {
+    useDriver();
+    world(32, 16);
+    const session = try firefoxStart();
+    const d = session.d;
+    const s = session.s;
+    const ctx = session.c;
+    const c = thread.gl().?;
+    defer {
+        _ = egl.makeCurrent(d, null, null, null);
+        _ = egl.destroySurface(d, s);
+        _ = egl.destroyContext(d, ctx);
+        _ = egl.terminate(d);
+    }
+
+    Fake.export_failures = 1;
+    try std.testing.expect(egl.swapBuffers(d, s, &.{}));
+    try std.testing.expectEqual(@as(u32, 0), Fake.export_failures);
+    try std.testing.expect(c.surf_draw != null);
+    try std.testing.expect(c.surf_draw.? != &s.win.bufs[0].img);
+
+    window.width = 48;
+    window.height = 24;
+    window.resize_callback.?(&window, window.driver_private);
+    Fake.export_failures = 2;
+    try std.testing.expect(!egl.swapBuffers(d, s, &.{}));
+    try std.testing.expectEqual(egl.BAD_ALLOC, egl.getError());
+    try std.testing.expect(c.surf_draw == null and c.surf_read == null);
+    try std.testing.expectEqual(@as(u32, 0), Fake.export_failures);
+
+    try std.testing.expect(egl.makeCurrent(d, s, s, ctx));
+    try std.testing.expectEqual(@as(u32, 48), c.surf_draw.?.width);
+}
+
 test "egl: an XRGB window reads back opaque, and is made XRGB8888" {
     useDriver();
     world(8, 8);
@@ -671,6 +711,37 @@ test "egl: a compositor without dma-bufs is no display (the app draws in softwar
     try std.testing.expectEqual(egl.NOT_INITIALIZED, egl.getError());
     try std.testing.expectEqual(@as(u32, 0), Fake.queues);
     try std.testing.expectEqual(@as(usize, 2), Fake.live()); // (the display and surface: the test's)
+}
+
+fn noNativeInterop() bool {
+    return false;
+}
+
+test "egl: a backend without native interop still exposes window buffers and EGL fences" {
+    egl.setDriver(.{ .open = open, .host = host, .wayland = client, .native_interop = noNativeInterop });
+    defer useDriver();
+    world(32, 16);
+    const session = try firefoxStart();
+    const d = session.d;
+    defer {
+        _ = egl.makeCurrent(d, null, null, null);
+        _ = egl.destroySurface(d, session.s);
+        _ = egl.destroyContext(d, session.c);
+        _ = egl.terminate(d);
+    }
+    const ext = std.mem.span(egl.queryString(d, egl.EXTENSIONS).?);
+    for ([_][]const u8{ "EGL_ANDROID_native_fence_sync", "EGL_EXT_image_dma_buf_import", "EGL_MESA_image_dma_buf_export", "EGL_KHR_image_base" }) |name|
+        try std.testing.expect(std.mem.indexOf(u8, ext, name) == null);
+    try std.testing.expect(std.mem.indexOf(u8, ext, "EGL_KHR_fence_sync") != null);
+    const fence = egl.createSync(i32, d, egl.SYNC_FENCE, null).?;
+    try std.testing.expect(egl.destroySync(d, fence));
+    try std.testing.expect(egl.createSync(i32, d, egl.SYNC_NATIVE_FENCE_ANDROID, null) == null);
+    try std.testing.expectEqual(egl.BAD_ATTRIBUTE, egl.getError());
+    var count: i32 = -1;
+    try std.testing.expect(!egl.queryDmaBufFormats(d, 0, null, &count));
+    try std.testing.expectEqual(egl.BAD_PARAMETER, egl.getError());
+    try std.testing.expect(egl.swapBuffers(d, session.s, &.{}));
+    try std.testing.expectEqual(@as(u32, 1), Fake.commits);
 }
 
 test "egl: configs, contexts, current, syncs and their errors" {

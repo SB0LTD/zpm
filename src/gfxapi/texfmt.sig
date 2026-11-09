@@ -11,7 +11,7 @@
 //! - i32 and u32 x 1, 2, 4 (the 8- and 16-bit ones widened).
 //!
 //! Not yet: RGB10_A2, R11F_G11F_B10F, RGB9_E5, the RGB integer formats,
-//! norm16, depth textures, compressed formats.
+//! norm16, depth32f, compressed formats.
 
 const std = @import("std");
 const engine = @import("engine.sig");
@@ -39,6 +39,9 @@ pub const Conv = enum {
     uint8,
     int16,
     uint16,
+    depth16,
+    depth32,
+    depth24_stencil8,
 };
 
 const Z = texture.SWZ_ZERO;
@@ -81,6 +84,12 @@ const RED_INTEGER: u32 = 0x8D94;
 const HALF_OES: u32 = 0x8D61;
 
 const table = [_]E{
+    e(g.DEPTH_COMPONENT16, g.DEPTH_COMPONENT, g.UNSIGNED_SHORT, .d24s8, .depth16, 2),
+    e(g.DEPTH_COMPONENT16, g.DEPTH_COMPONENT, g.UNSIGNED_INT, .d24s8, .depth32, 4),
+    e(g.DEPTH_COMPONENT24, g.DEPTH_COMPONENT, g.UNSIGNED_INT, .d24s8, .depth32, 4),
+    e(g.DEPTH_COMPONENT, g.DEPTH_COMPONENT, g.UNSIGNED_SHORT, .d24s8, .depth16, 2),
+    e(g.DEPTH_COMPONENT, g.DEPTH_COMPONENT, g.UNSIGNED_INT, .d24s8, .depth32, 4),
+    e(g.DEPTH24_STENCIL8, g.DEPTH_STENCIL, 0x84FA, .d24s8, .depth24_stencil8, 4),
     // ES 2.0's unsized formats (the internal format is the format)
     e(g.RGBA, g.RGBA, g.UNSIGNED_BYTE, .rgba8, .raw, 4),
     e(g.RGBA, g.RGBA, g.UNSIGNED_SHORT_4_4_4_4, .rgba8, .rgba4, 2),
@@ -195,6 +204,15 @@ pub fn convert(up: Upload, src: []const u8, dst: []u8, n: u32) void {
     const sb = up.store.bytes();
     switch (up.conv) {
         .raw => @memcpy(dst[0 .. n * sb], src[0 .. n * sb]),
+        .depth16 => for (0..n) |i| {
+            const value: u32 = std.mem.readInt(u16, src[i * 2 ..][0..2], .little);
+            std.mem.writeInt(u32, dst[i * 4 ..][0..4], value << 8 | value >> 8, .little);
+        },
+        .depth32, .depth24_stencil8 => for (0..n) |i| {
+            const value = std.mem.readInt(u32, src[i * 4 ..][0..4], .little);
+            const stencil = if (up.conv == .depth24_stencil8) value << 24 else 0;
+            std.mem.writeInt(u32, dst[i * 4 ..][0..4], value >> 8 | stencil, .little);
+        },
         .rgb8 => for (0..n) |i| {
             dst[i * 4 ..][0..3].* = src[i * 3 ..][0..3].*;
             dst[i * 4 + 3] = 255;

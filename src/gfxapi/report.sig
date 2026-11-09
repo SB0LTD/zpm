@@ -15,10 +15,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const Kind = enum(u3) { device, missing, link, pipeline, lost, gl_error, check, egl_error };
+pub const Kind = enum(u4) { device, missing, link, pipeline, lost, gl_error, check, egl_error, marker };
 
 /// How many lines of each kind a process says.
-const LIMITS = [_]u8{ 4, 64, 16, 16, 4, 16, 32, 32 };
+const LIMITS = [_]u8{ 4, 64, 16, 16, 4, 16, 32, 32, 16 };
 
 pub var sink: ?*const fn ([]const u8) void = if (builtin.os.tag == .linux and !builtin.is_test) &stderrLine else null;
 

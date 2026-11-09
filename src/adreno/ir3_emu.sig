@@ -339,7 +339,20 @@ fn movValue(c: *const Ctx, f: u32, in: *const Instr, i: u32) u32 {
     }
     const x = readTyped(c, f, in, i);
     return switch (dt) {
-        .f32 => @bitCast(@as(f32, @floatCast(x))),
+        .f32 => blk: {
+            const nearest: f32 = @floatCast(x);
+            const bits: u32 = @bitCast(nearest);
+            if (isIntType(st)) {
+                const rounded: f64 = nearest;
+                switch (in.round) {
+                    .none => if (@abs(rounded) > @abs(x)) break :blk bits - 1,
+                    .even => {},
+                    .pos_infinity => if (rounded < x) break :blk if (x < 0) bits - 1 else bits + 1,
+                    .neg_infinity => if (rounded > x) break :blk if (x < 0) bits + 1 else bits - 1,
+                }
+            }
+            break :blk bits;
+        },
         .f16 => blk: {
             // f32 -> f16: (even) rounds to nearest, otherwise toward zero.
             if (in.round == .even) break :blk @as(u16, @bitCast(@as(f16, @floatCast(x))));

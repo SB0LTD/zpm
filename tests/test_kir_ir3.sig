@@ -32,7 +32,7 @@ const Rig = struct {
 };
 
 fn caps() gpu.Caps {
-    return adreno_device.x1_45_caps(Rig.arena.len);
+    return adreno_device.emuCaps(Rig.arena.len);
 }
 
 fn newKernel(name: []const u8, group: [3]u32) kir.Kernel {
@@ -40,10 +40,10 @@ fn newKernel(name: []const u8, group: [3]u32) kir.Kernel {
 }
 
 /// The kernel on the interpreter, buffers in place.
-fn runInterp(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u32) !interp.Stats {
+fn runInterp(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u32, target: gpu.Caps) !interp.Stats {
     var w = gpu.Work.init(&Rig.interp_mem);
     var trap: interp.Trap = .{};
-    return interp.runKernel(k, caps(), groups, bufs, params, &w, &trap) catch |e| {
+    return interp.runKernel(k, target, groups, bufs, params, &w, &trap) catch |e| {
         std.debug.print("{s}: interpreter trap {s} at pc {d} thread {d} offset {d}\n", .{ k.name, @tagName(trap.what), trap.pc, trap.thread, trap.offset });
         return e;
     };
@@ -81,12 +81,12 @@ fn checkBinary(name: []const u8, bin: *const gpu.Binary) !void {
 }
 
 /// The kernel on the emulated Adreno: buffers copied in, run, copied back.
-fn runEmu(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u32) !EmuRun {
+fn runEmu(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u32, target: gpu.Caps) !EmuRun {
     // (a fresh device per run: buffers do not pile up)
     Rig.emu.init(&Rig.arena, &Rig.view);
     emu_ready = true;
     const d = Rig.emu.device();
-    const bin = kir_ir3.compileWith(k, d.caps, &Rig.work, &Rig.out) catch |e| {
+    const bin = kir_ir3.compileWith(k, target, &Rig.work, &Rig.out) catch |e| {
         std.debug.print("{s}: compile: {s}\n{s}\n", .{ k.name, @errorName(e), kir_ir3.source(&Rig.work) });
         return e;
     };
@@ -134,6 +134,7 @@ const floats = [_]u32{
     0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x3f000000, 0x3fc00000, 0x40200000, 0xc0200000,
     0x40600000, 0x00000001, 0x80800000, 0x007fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0x7f7fffff,
     0x4b000001, 0x4f000000, 0xcf000001, 0x4f800000, 0x501502f9, 0xd01502f9, 0x3effffff, 0x42fe0000,
+    0x807fffff, 0x33000000, 0x33800000, 0xb3800000, 0x387fe000, 0x38800000,
 };
 
 const N = 512;
@@ -203,6 +204,8 @@ fn operand(k: *kir.Kernel, ty: kir.Ty, binding: u8, off: kir.V) kir.V {
 }
 
 fn checkOp(c: OpCaseX) !void {
+    var target = caps();
+    if (c.flush_denormals) target.denormals = .flush;
     const pool: []const u32 = if (c.float_pool) &floats else &ints;
     const in = inputs(pool, 0x51ed + @as(u32, @intFromEnum(c.op)) * 977 + c.aux);
     var outs: [2][N]u32 = undefined;
@@ -236,7 +239,7 @@ fn checkOp(c: OpCaseX) !void {
         var cb = in.b;
         var cc = in.c;
         const bufs = [_][]u8{ std.mem.sliceAsBytes(&ca), std.mem.sliceAsBytes(&cb), std.mem.sliceAsBytes(&cc), std.mem.sliceAsBytes(&outs[way]) };
-        if (way == 0) _ = try runInterp(&k, .{ N / 128, 1, 1 }, &bufs, &.{}) else _ = try runEmu(&k, .{ N / 128, 1, 1 }, &bufs, &.{});
+        if (way == 0) _ = try runInterp(&k, .{ N / 128, 1, 1 }, &bufs, &.{}, target) else _ = try runEmu(&k, .{ N / 128, 1, 1 }, &bufs, &.{}, target);
     }
     var bad: usize = 0;
     for (0..N) |i| {
@@ -270,6 +273,7 @@ const OpCaseX = struct {
     aux: u32 = 0,
     dst: kir.Ty,
     float_pool: bool = false,
+    flush_denormals: bool = false,
     how: Cmp = .exact,
     imm: u32 = 0,
     form: Form = .rrr,
@@ -358,7 +362,7 @@ fn bfeImm(k: *kir.Kernel, ty: kir.Ty, off: u32, width: u32) !void {
         var ca = in.a;
         @memset(&outs[way], 0);
         const bufs = [_][]u8{ std.mem.sliceAsBytes(&ca), std.mem.sliceAsBytes(&outs[way]) };
-        if (way == 0) _ = try runInterp(k, .{ N / 128, 1, 1 }, &bufs, &.{}) else _ = try runEmu(k, .{ N / 128, 1, 1 }, &bufs, &.{});
+        if (way == 0) _ = try runInterp(k, .{ N / 128, 1, 1 }, &bufs, &.{}, caps()) else _ = try runEmu(k, .{ N / 128, 1, 1 }, &bufs, &.{}, caps());
     }
     for (0..N) |i| if (outs[0][i] != outs[1][i]) {
         std.debug.print("bfe {s} off {d} width {d}: a={x}: ir3 {x}, interp {x}\n{s}\n", .{ @tagName(ty), off, width, in.a[i], outs[1][i], outs[0][i], kir_ir3.source(&Rig.work) });
@@ -390,6 +394,12 @@ test "exact fdiv and fsqrt (kir's mul/add-only expansions) equal the interpreter
     try checkOp(withImm(flt2("fdiv imm", .fdiv), fb(3.0), .rri));
     try checkOp(withImm(flt2("fdiv imm", .fdiv), fb(-0.75), .rir));
     try checkOp(flt1("fsqrt", .fsqrt, .nan_any));
+    var div_flush = flt2("fdiv flush", .fdiv);
+    div_flush.flush_denormals = true;
+    try checkOp(div_flush);
+    var sqrt_flush = flt1("fsqrt flush", .fsqrt, .nan_any);
+    sqrt_flush.flush_denormals = true;
+    try checkOp(sqrt_flush);
     // random operands, many more of them
     var seed: u32 = 1234;
     for (0..8) |round| {
@@ -599,8 +609,8 @@ fn both(k: *kir.Kernel, groups: [3]u32, init: []const []const u8, params: []cons
         @memcpy(sa[i], x);
         @memcpy(sb[i], x);
     }
-    _ = try runInterp(k, groups, sa[0..init.len], params);
-    const run = try runEmu(k, groups, sb[0..init.len], params);
+    _ = try runInterp(k, groups, sa[0..init.len], params, caps());
+    const run = try runEmu(k, groups, sb[0..init.len], params, caps());
     for (0..init.len) |i| {
         if (!sameBuffers(sa[i], sb[i])) {
             const wa: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, sa[i][0 .. sa[i].len & ~@as(usize, 3)]));
@@ -1400,7 +1410,7 @@ fn q4kCase(comptime tokens: comptime_int, rows: u32, blocks: u32) !void {
     d.fromDevice(out_kir, 0, out_kir.bytes);
     // the interpreter too (KIR's definition), on the CPU's copies
     var interp_out = zeros(8 * 64 * 4);
-    _ = try runInterp(&k, groups, &.{ w.cpu, aq.cpu, ad.cpu, abs.cpu, interp_out[0..out_kir.cpu.len] }, &params);
+    _ = try runInterp(&k, groups, &.{ w.cpu, aq.cpu, ad.cpu, abs.cpu, interp_out[0..out_kir.cpu.len] }, &params, caps());
     try std.testing.expectEqualSlices(u8, out_hand.cpu, out_kir.cpu);
     try std.testing.expect(sameBuffers(out_kir.cpu, interp_out[0..out_kir.cpu.len]));
     var name_buf: [64]u8 = undefined;
