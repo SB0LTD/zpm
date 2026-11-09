@@ -220,6 +220,7 @@ const Region = struct {
     /// A loop that desyncs (counted in Ctx.nobar while open).
     desync: bool = false,
     rotated: bool = false,
+    single_pass: bool = false,
     /// The address-reuse depth outside the region.
     rdepth: u8 = 0,
 };
@@ -267,6 +268,7 @@ pub const State = struct {
     /// whether the loop carries it (Ctx.carriedIn).
     defs: [MAX_VREGS]u16 = undefined,
     carry: [MAX_VREGS]bool = undefined,
+    label_at: [1 << 16]u16 = undefined,
     order: [MAX_VREGS]u16 = undefined,
     loops: [MAX_LOOPS][2]u32 = undefined,
     n_loops: usize = 0,
@@ -966,7 +968,7 @@ const Ctx = struct {
                     if (in.op == .brk and idx + 1 < c.n and w.insts[idx + 1].op == .endloop and s + 1 == sp and !r.has_cont) {
                         r.rotated = true;
                         if (p == .pt) {
-                            if (!p.pt) try c.bra(.none, r.l_top);
+                            if (p.pt) r.single_pass = true else try c.bra(.none, r.l_top);
                         } else try c.bra(negate(p), r.l_top);
                         continue;
                     }
@@ -1194,9 +1196,13 @@ const Ctx = struct {
         if (r.desync) c.nobar -= 1;
         try c.at(r.l_cont);
         if (!r.rotated) try c.bra(.none, r.l_top);
-        if (w.n_loops == MAX_LOOPS) return error.TooBig;
-        w.loops[w.n_loops] = .{ r.top_at, @intCast(w.n_mi - 1) };
-        w.n_loops += 1;
+        // Switches and inlined returns use a loop with an unconditional
+        // exit. With no back edge their temporaries are not loop-carried.
+        if (!r.single_pass) {
+            if (w.n_loops == MAX_LOOPS) return error.TooBig;
+            w.loops[w.n_loops] = .{ r.top_at, @intCast(w.n_mi - 1) };
+            w.n_loops += 1;
+        }
         try c.at(r.l_end);
         if (r.bssy) |b| {
             try c.eff("BSYNC.RECONVERGENT", 0, &.{.{ .bar = b }});
@@ -2007,6 +2013,7 @@ const Ctx = struct {
         @memset(w.first[0..nv], std.math.maxInt(u32));
         @memset(w.last[0..nv], 0);
         for (w.mi[0..w.n_mi], 0..) |*m, i| {
+            if (m.kind == .label) w.label_at[m.o[0].label] = @intCast(i);
             if (m.kind != .inst) continue;
             const pos: u32 = @intCast(i);
             const S = struct {
@@ -2048,6 +2055,7 @@ const Ctx = struct {
                     // referenced inside, and live before or after it
                     if (l < s or f > e) continue;
                     if (check and w.carry[vi] != c.carried(@intCast(vi), s, e)) @panic("kir_sm120: carriedIn and carried disagree");
+                    if (f >= s and l <= e and w.carry[vi] and c.blockTemporary(@intCast(vi), f, l)) continue;
                     if (f < s or l > e or w.carry[vi]) {
                         if (f > s or l < e) {
                             w.first[vi] = @min(f, s);
@@ -2058,6 +2066,22 @@ const Ctx = struct {
                 }
             }
         }
+    }
+
+    /// A scalar whose first access defines it cannot read an earlier
+    /// iteration's value unless a branch enters after that definition.
+    fn blockTemporary(c: *const Ctx, v: u16, first: u32, last: u32) bool {
+        const w = c.w;
+        if (w.size[v] != 1 or w.mi[first].guard != .none or !c.writtenAt(v, first) or c.readAt(v, first)) return false;
+        for (w.mi[0..w.n_mi], 0..) |m, pos| {
+            if (m.kind != .inst or (pos >= first and pos <= last)) continue;
+            for (m.o[0..m.n]) |operand| {
+                if (operand != .label) continue;
+                const target = w.label_at[operand.label];
+                if (target > first and target <= last) return false;
+            }
+        }
+        return true;
     }
 
     /// `carried` for every unit at once (w.carry), in one pass over the

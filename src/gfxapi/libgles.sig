@@ -150,10 +150,7 @@ pub export fn glGetInteger64v(pname: u32, data: ?[*]i64) callconv(.c) void {
     const c = cur() orelse return;
     const p = data orelse return;
     var v: [4]i32 = undefined;
-    const x = c.get(pname) orelse {
-        if (c.err == g.NO_ERROR) c.err = g.INVALID_ENUM;
-        return;
-    };
+    const x = c.get(pname) orelse return c.invalidEnum("glGetInteger64v", pname);
     if (x.kind == .int) {
         @memcpy(p[0..x.n], x.i[0..x.n]);
         return;
@@ -181,6 +178,18 @@ pub export fn glClearDepthf(d: f32) callconv(.c) void {
 pub export fn glClearStencil(s: i32) callconv(.c) void {
     if (cur()) |c| c.clearStencil(s);
 }
+pub export fn glStencilFunc(func: u32, reference: i32, mask: u32) callconv(.c) void {
+    if (cur()) |c| c.stencilFuncSeparate(g.FRONT_AND_BACK, func, reference, mask);
+}
+pub export fn glStencilFuncSeparate(face: u32, func: u32, reference: i32, mask: u32) callconv(.c) void {
+    if (cur()) |c| c.stencilFuncSeparate(face, func, reference, mask);
+}
+pub export fn glStencilOp(fail: u32, depth_fail: u32, pass: u32) callconv(.c) void {
+    if (cur()) |c| c.stencilOpSeparate(g.FRONT_AND_BACK, fail, depth_fail, pass);
+}
+pub export fn glStencilOpSeparate(face: u32, fail: u32, depth_fail: u32, pass: u32) callconv(.c) void {
+    if (cur()) |c| c.stencilOpSeparate(face, fail, depth_fail, pass);
+}
 pub export fn glColorMask(r: u8, gr: u8, bl: u8, a: u8) callconv(.c) void {
     if (cur()) |c| c.colorMask(b(r), b(gr), b(bl), b(a));
 }
@@ -205,12 +214,12 @@ pub export fn glClear(mask: u32) callconv(.c) void {
 pub export fn glClearBufferfv(buffer: u32, drawbuffer: i32, value: ?[*]const f32) callconv(.c) void {
     const c = cur() orelse return;
     const v = value orelse return;
-    c.clearBufferf(buffer, drawbuffer, v[0 .. if (buffer == g.COLOR) 4 else 1]);
+    c.clearBufferf(buffer, drawbuffer, v[0..if (buffer == g.COLOR) 4 else 1]);
 }
 pub export fn glClearBufferiv(buffer: u32, drawbuffer: i32, value: ?[*]const i32) callconv(.c) void {
     const c = cur() orelse return;
     const v = value orelse return;
-    c.clearBufferi(buffer, drawbuffer, v[0 .. if (buffer == g.COLOR) 4 else 1]);
+    c.clearBufferi(buffer, drawbuffer, v[0..if (buffer == g.COLOR) 4 else 1]);
 }
 pub export fn glClearBufferuiv(buffer: u32, drawbuffer: i32, value: ?[*]const u32) callconv(.c) void {
     _ = value;
@@ -263,6 +272,18 @@ pub export fn glTexStorage2D(target: u32, levels: i32, internal: u32, w: i32, h:
 }
 pub export fn glTexStorage2DEXT(target: u32, levels: i32, internal: u32, w: i32, h: i32) callconv(.c) void {
     glTexStorage2D(target, levels, internal, w, h);
+}
+pub export fn glTexStorage3D(target: u32, levels: i32, internal: u32, w: i32, h: i32, depth: i32) callconv(.c) void {
+    if (cur()) |c| c.texStorage3D(target, levels, internal, w, h, depth);
+}
+pub export fn glTexStorage3DEXT(target: u32, levels: i32, internal: u32, w: i32, h: i32, depth: i32) callconv(.c) void {
+    glTexStorage3D(target, levels, internal, w, h, depth);
+}
+pub export fn glTexSubImage3D(target: u32, level: i32, x: i32, y: i32, z: i32, w: i32, h: i32, depth: i32, format: u32, ty: u32, pixels: ?*const anyopaque) callconv(.c) void {
+    if (cur()) |c| c.texSubImage3D(target, level, x, y, z, w, h, depth, format, ty, pixels);
+}
+pub export fn glTexImage3D(target: u32, level: i32, internal: i32, w: i32, h: i32, depth: i32, border: i32, format: u32, ty: u32, pixels: ?*const anyopaque) callconv(.c) void {
+    if (cur()) |c| c.texImage3D(target, level, internal, w, h, depth, border, format, ty, pixels);
 }
 pub export fn glTexParameteri(target: u32, pname: u32, param: i32) callconv(.c) void {
     if (cur()) |c| c.texParameteri(target, pname, param);
@@ -334,8 +355,15 @@ pub export fn glEGLImageTargetTexture2DOES(target: u32, image: ?*anyopaque) call
 pub export fn glEGLImageTargetRenderbufferStorageOES(target: u32, image: ?*anyopaque) callconv(.c) void {
     if (cur()) |c| c.eglImageTargetRenderbufferStorage(target, image);
 }
+pub export fn glCopyImageSubDataEXT(sn: u32, st: u32, sl: i32, sx: i32, sy: i32, sz: i32, dn: u32, dt: u32, dl: i32, dx: i32, dy: i32, dz: i32, w: i32, h: i32, depth: i32) callconv(.c) void {
+    if (cur()) |c| c.copyImageSubData(sn, st, sl, sx, sy, sz, dn, dt, dl, dx, dy, dz, w, h, depth);
+}
+
 pub export fn glCopyTexSubImage2D(target: u32, level: i32, dx: i32, dy: i32, x: i32, y: i32, w: i32, h: i32) callconv(.c) void {
     if (cur()) |c| c.copyTexSubImage2D(target, level, dx, dy, x, y, w, h);
+}
+pub export fn glCopyTexSubImage3D(target: u32, level: i32, dx: i32, dy: i32, dz: i32, x: i32, y: i32, w: i32, h: i32) callconv(.c) void {
+    if (cur()) |c| c.copyTexSubImage3D(target, level, dx, dy, dz, x, y, w, h);
 }
 pub export fn glCopyTexImage2D(target: u32, level: i32, internal: u32, x: i32, y: i32, w: i32, h: i32, border: i32) callconv(.c) void {
     if (cur()) |c| c.copyTexImage2D(target, level, internal, x, y, w, h, border);
@@ -358,6 +386,186 @@ pub export fn glIsBuffer(name: u32) callconv(.c) u8 {
 pub export fn glBindBuffer(target: u32, name: u32) callconv(.c) void {
     if (cur()) |c| c.bindBuffer(target, name);
 }
+pub export fn glCopyBufferSubData(read_target: u32, write_target: u32, read_offset: isize, write_offset: isize, size: isize) callconv(.c) void {
+    if (cur()) |c| c.copyBufferSubData(read_target, write_target, read_offset, write_offset, size);
+}
+pub export fn glGenQueriesEXT(n: i32, ids: ?[*]u32) callconv(.c) void {
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (ids) |p| c.genTimerQueries(p[0..k]);
+}
+pub export fn glDeleteQueriesEXT(n: i32, ids: ?[*]const u32) callconv(.c) void {
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (ids) |p| c.deleteTimerQueries(p[0..k]);
+}
+pub export fn glIsQueryEXT(id: u32) callconv(.c) u8 {
+    const c = cur() orelse return 0;
+    return @intFromBool(c.isTimerQuery(id));
+}
+pub export fn glBeginQueryEXT(target: u32, id: u32) callconv(.c) void {
+    if (cur()) |c| c.beginTimer(target, id);
+}
+pub export fn glEndQueryEXT(target: u32) callconv(.c) void {
+    if (cur()) |c| c.endTimer(target);
+}
+pub export fn glQueryCounterEXT(id: u32, target: u32) callconv(.c) void {
+    if (cur()) |c| c.timerCounter(id, target);
+}
+pub export fn glGetQueryivEXT(target: u32, pname: u32, out: ?*i32) callconv(.c) void {
+    const c = cur() orelse return;
+    if (c.timerState(target, pname)) |v| {
+        if (out) |p| p.* = v;
+    }
+}
+fn getTimerResult(comptime T: type, id: u32, pname: u32, out: ?*T) void {
+    const c = cur() orelse return;
+    if (c.timerResult(id, pname)) |v| {
+        if (out) |p| p.* = @intCast(@min(v, std.math.maxInt(T)));
+    }
+}
+pub export fn glGetQueryObjectivEXT(id: u32, pname: u32, out: ?*i32) callconv(.c) void {
+    getTimerResult(i32, id, pname, out);
+}
+pub export fn glGetQueryObjectuivEXT(id: u32, pname: u32, out: ?*u32) callconv(.c) void {
+    getTimerResult(u32, id, pname, out);
+}
+pub export fn glGetQueryObjecti64vEXT(id: u32, pname: u32, out: ?*i64) callconv(.c) void {
+    getTimerResult(i64, id, pname, out);
+}
+pub export fn glGetQueryObjectui64vEXT(id: u32, pname: u32, out: ?*u64) callconv(.c) void {
+    getTimerResult(u64, id, pname, out);
+}
+
+pub export fn glDebugMessageCallbackKHR(callback: ?gles.debug_output.Callback, user: ?*const anyopaque) callconv(.c) void {
+    const c = cur() orelse return;
+    c.debug.callback = callback;
+    c.debug.user = user;
+}
+
+pub export fn glDebugMessageControlKHR(src: u32, kind: u32, sev: u32, n: i32, ids: ?[*]const u32, enabled: u8) callconv(.c) void {
+    const c = cur() orelse return;
+    const dbg = gles.debug_output;
+    if ((src != dbg.ANY and !dbg.source(src)) or (kind != dbg.ANY and !dbg.msgType(kind)) or
+        (sev != dbg.ANY and !dbg.severity(sev))) return c.fail(g.INVALID_ENUM);
+    if (n < 0 or (n > 0 and ids == null)) return c.fail(g.INVALID_VALUE);
+    if (n > 0 and (src == dbg.ANY or kind == dbg.ANY or sev != dbg.ANY))
+        return c.fail(g.INVALID_OPERATION);
+    const list: []const u32 = if (n == 0) &.{} else ids.?[0..@intCast(n)];
+    if (!c.debug.control(src, kind, sev, list, enabled != 0)) c.fail(g.OUT_OF_MEMORY);
+}
+
+pub export fn glDebugMessageInsertKHR(src: u32, kind: u32, id: u32, sev: u32, length: i32, text: ?[*]const u8) callconv(.c) void {
+    const c = cur() orelse return;
+    const dbg = gles.debug_output;
+    if (src != dbg.APPLICATION and src != dbg.THIRD_PARTY) return c.fail(g.INVALID_ENUM);
+    if (!dbg.msgType(kind) or kind == 0x8269 or kind == 0x826A or !dbg.severity(sev)) return c.fail(g.INVALID_ENUM);
+    const p = text orelse return c.fail(g.INVALID_VALUE);
+    var n: usize = if (length < 0) 0 else @intCast(length);
+    if (length < 0) {
+        while (n < dbg.MAX_TEXT and p[n] != 0) n += 1;
+    }
+    if (n >= dbg.MAX_TEXT) return c.fail(g.INVALID_VALUE);
+    c.debug.emit(src, kind, id, sev, p[0..n]);
+}
+
+pub export fn glGetDebugMessageLogKHR(n: u32, size: i32, sources: ?[*]u32, types: ?[*]u32, ids: ?[*]u32, severities: ?[*]u32, lengths: ?[*]i32, text: ?[*]u8) callconv(.c) u32 {
+    const c = cur() orelse return 0;
+    if (size < 0 and text != null) {
+        c.fail(g.INVALID_VALUE);
+        return 0;
+    }
+    return c.debug.read(n, @intCast(@max(size, 0)), sources, types, ids, severities, lengths, text);
+}
+
+pub export fn glPushDebugGroupKHR(src: u32, id: u32, length: i32, text: ?[*]const u8) callconv(.c) void {
+    const c = cur() orelse return;
+    const dbg = gles.debug_output;
+    if (src != dbg.APPLICATION and src != dbg.THIRD_PARTY) return c.fail(g.INVALID_ENUM);
+    const p = text orelse return c.fail(g.INVALID_VALUE);
+    var n: usize = if (length < 0) 0 else @intCast(length);
+    if (length < 0) {
+        while (n < dbg.MAX_TEXT and p[n] != 0) n += 1;
+    }
+    if (n >= dbg.MAX_TEXT) return c.fail(g.INVALID_VALUE);
+    if (!c.debug.push(src, id, p[0..n])) c.fail(0x0503); // STACK_OVERFLOW
+}
+
+pub export fn glPopDebugGroupKHR() callconv(.c) void {
+    const c = cur() orelse return;
+    if (!c.debug.pop()) c.fail(0x0504); // STACK_UNDERFLOW
+}
+
+fn setObjectLabel(c: *Context, label: *gles.debug_output.Label, length: i32, text: ?[*]const u8) void {
+    const p = text orelse {
+        label.set(&.{});
+        return;
+    };
+    const max = gles.debug_output.MAX_LABEL_LENGTH;
+    var n: usize = if (length < 0) 0 else @intCast(length);
+    if (length < 0) {
+        while (n < max and p[n] != 0) n += 1;
+    }
+    if (n >= max) return c.fail(g.INVALID_VALUE);
+    label.set(p[0..n]);
+}
+
+pub export fn glObjectLabelKHR(identifier: u32, name: u32, length: i32, text: ?[*]const u8) callconv(.c) void {
+    const c = cur() orelse return;
+    const label = c.objectLabel(identifier, name) orelse return;
+    setObjectLabel(c, label, length, text);
+}
+
+pub export fn glGetObjectLabelKHR(identifier: u32, name: u32, size: i32, length: ?*i32, text: ?[*]u8) callconv(.c) void {
+    const c = cur() orelse return;
+    if (size < 0) return c.fail(g.INVALID_VALUE);
+    const label = c.objectLabel(identifier, name) orelse return;
+    label.get(size, length, text);
+}
+
+pub export fn glObjectPtrLabelKHR(ptr: ?*const anyopaque, length: i32, text: ?[*]const u8) callconv(.c) void {
+    const c = cur() orelse return;
+    const label = c.pointerLabel(ptr) orelse return;
+    setObjectLabel(c, label, length, text);
+}
+
+pub export fn glGetObjectPtrLabelKHR(ptr: ?*const anyopaque, size: i32, length: ?*i32, text: ?[*]u8) callconv(.c) void {
+    const c = cur() orelse return;
+    if (size < 0) return c.fail(g.INVALID_VALUE);
+    const label = c.pointerLabel(ptr) orelse return;
+    label.get(size, length, text);
+}
+
+pub export fn glGetPointervKHR(pname: u32, out: ?*?*const anyopaque) callconv(.c) void {
+    const c = cur() orelse return;
+    const p = out orelse return;
+    p.* = switch (pname) {
+        0x8244 => if (c.debug.callback) |cb| @ptrCast(cb) else null,
+        0x8245 => c.debug.user,
+        else => return c.fail(g.INVALID_ENUM),
+    };
+}
+
+pub export fn glInsertEventMarkerEXT(length: i32, marker: ?[*]const u8) callconv(.c) void {
+    if (cur()) |c| c.debugMarker(.event, length, marker);
+}
+
+pub export fn glPushGroupMarkerEXT(length: i32, marker: ?[*]const u8) callconv(.c) void {
+    if (cur()) |c| c.debugMarker(.push, length, marker);
+}
+
+pub export fn glPopGroupMarkerEXT() callconv(.c) void {
+    if (cur()) |c| c.debugMarker(.pop, 0, null);
+}
+
+pub export fn glMemoryBarrier(barriers: u32) callconv(.c) void {
+    if (cur()) |c| c.clientMappedBarrier(barriers);
+}
+
+pub export fn glBufferStorageEXT(target: u32, size: isize, data: ?*const anyopaque, flags: u32) callconv(.c) void {
+    if (cur()) |c| c.bufferStorage(target, size, data, flags);
+}
+
 pub export fn glBufferData(target: u32, size: isize, data: ?*const anyopaque, usage: u32) callconv(.c) void {
     if (cur()) |c| c.bufferData(target, size, data, usage);
 }
@@ -470,6 +678,9 @@ pub export fn glBindFramebuffer(target: u32, name: u32) callconv(.c) void {
 pub export fn glFramebufferTexture2D(target: u32, attachment: u32, textarget: u32, name: u32, level: i32) callconv(.c) void {
     if (cur()) |c| c.framebufferTexture2D(target, attachment, textarget, name, level);
 }
+pub export fn glFramebufferTextureLayer(target: u32, attachment: u32, name: u32, level: i32, layer: i32) callconv(.c) void {
+    if (cur()) |c| c.framebufferTextureLayer(target, attachment, name, level, layer);
+}
 pub export fn glFramebufferRenderbuffer(target: u32, attachment: u32, rbtarget: u32, name: u32) callconv(.c) void {
     if (cur()) |c| c.framebufferRenderbuffer(target, attachment, rbtarget, name);
 }
@@ -570,7 +781,7 @@ pub export fn glVertexAttribI4i(index: u32, x: i32, y: i32, z: i32, w: i32) call
     if (cur()) |c| c.vertexAttrib(index, .{ @bitCast(x), @bitCast(y), @bitCast(z), @bitCast(w) }, true);
 }
 pub export fn glVertexAttribI4ui(index: u32, x: u32, y: u32, z: u32, w: u32) callconv(.c) void {
-    if (cur()) |c| c.vertexAttrib(index, .{ x, y, z, w }, true);
+    if (cur()) |c| c.vertexAttribUnsigned(index, .{ x, y, z, w });
 }
 pub export fn glVertexAttribI4iv(index: u32, v: ?[*]const i32) callconv(.c) void {
     if (v) |p| glVertexAttribI4i(index, p[0], p[1], p[2], p[3]);
@@ -580,8 +791,24 @@ pub export fn glVertexAttribI4uiv(index: u32, v: ?[*]const u32) callconv(.c) voi
 }
 pub export fn glGetVertexAttribiv(index: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
     const c = cur() orelse return;
-    const v = c.getVertexAttrib(index, pname) orelse return;
-    if (params) |p| p[0] = v;
+    if (params) |p| c.vertexAttribValues(i32, index, pname, p);
+}
+pub export fn glGetVertexAttribfv(index: u32, pname: u32, params: ?[*]f32) callconv(.c) void {
+    const c = cur() orelse return;
+    if (params) |p| c.vertexAttribValues(f32, index, pname, p);
+}
+pub export fn glGetVertexAttribIiv(index: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    const c = cur() orelse return;
+    if (params) |p| c.vertexAttribValues(i32, index, pname, p);
+}
+pub export fn glGetVertexAttribIuiv(index: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    const c = cur() orelse return;
+    if (params) |p| c.vertexAttribValues(u32, index, pname, p);
+}
+pub export fn glGetVertexAttribPointerv(index: u32, pname: u32, params: ?*?*anyopaque) callconv(.c) void {
+    const c = cur() orelse return;
+    const pointer = c.vertexAttribPointerValue(index, pname) orelse return;
+    if (params) |p| p.* = @ptrFromInt(pointer);
 }
 pub export fn glDrawArrays(mode: u32, first: i32, n: i32) callconv(.c) void {
     if (cur()) |c| c.drawArrays(mode, first, n, 1);
@@ -823,21 +1050,21 @@ fn uniMat(loc: i32, n: i32, transpose: u8, cols: u32, rows: u32, data: ?[*]const
     program.uniformMatrix(c, loc, n, transpose != 0, cols, rows, @ptrCast(d));
 }
 pub export fn glUniform1f(loc: i32, x: f32) callconv(.c) void {
-    const v = [1]u32{ @bitCast(x) };
+    const v = [1]u32{@bitCast(x)};
     uni(loc, 1, 1, .f, &v);
 }
 pub export fn glUniform1fv(loc: i32, n: i32, v: ?[*]const f32) callconv(.c) void {
     uni(loc, n, 1, .f, v);
 }
 pub export fn glUniform1i(loc: i32, x: i32) callconv(.c) void {
-    const v = [1]u32{ @bitCast(x) };
+    const v = [1]u32{@bitCast(x)};
     uni(loc, 1, 1, .i, &v);
 }
 pub export fn glUniform1iv(loc: i32, n: i32, v: ?[*]const i32) callconv(.c) void {
     uni(loc, n, 1, .i, v);
 }
 pub export fn glUniform1ui(loc: i32, x: u32) callconv(.c) void {
-    const v = [1]u32{ x };
+    const v = [1]u32{x};
     uni(loc, 1, 1, .u, &v);
 }
 pub export fn glUniform1uiv(loc: i32, n: i32, v: ?[*]const u32) callconv(.c) void {
@@ -952,6 +1179,16 @@ test "libgles: GL through its C entry points, on the CPU" {
     try std.testing.expect(makeCurrent(&t_ctx));
     defer _ = makeCurrent(null);
     try std.testing.expectEqual(@as(?*Context, &t_ctx), getCurrent());
+    glPopGroupMarkerEXT();
+    glPushGroupMarkerEXT(0, "outer");
+    glPushGroupMarkerEXT(0, null);
+    glInsertEventMarkerEXT(2, "hi");
+    try std.testing.expectEqual(@as(u32, 2), t_ctx.marker_depth);
+    glPopGroupMarkerEXT();
+    glPopGroupMarkerEXT();
+    glPopGroupMarkerEXT();
+    try std.testing.expectEqual(@as(u32, 0), t_ctx.marker_depth);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
     // (no surface yet: the default framebuffer is undefined)
     try std.testing.expectEqual(g.FRAMEBUFFER_UNDEFINED, glCheckFramebufferStatus(g.FRAMEBUFFER));
     glClear(g.COLOR_BUFFER_BIT);
@@ -1033,6 +1270,125 @@ test "libgles: robustness: the extensions, the strategy, a reset told once, the 
     try std.testing.expectEqual(g.NO_ERROR, glGetGraphicsResetStatus());
 }
 
+test "libgles: framebuffer copies reach the selected array or volume mip and layer" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var source = t_eng.newImage(4, 4, .rgba8).?;
+    defer t_eng.freeImage(&source);
+    t_ctx.setSurface(&source, &source, null);
+    glClearColor(0, 1, 0, 1);
+    glClear(g.COLOR_BUFFER_BIT);
+    var names: [2]u32 = undefined;
+    glGenTextures(2, &names);
+    glBindTexture(g.TEXTURE_2D_ARRAY, names[0]);
+    glTexStorage3D(g.TEXTURE_2D_ARRAY, 2, g.RGBA8, 4, 4, 3);
+    glCopyTexSubImage3D(g.TEXTURE_2D_ARRAY, 1, 0, 0, 2, -1, 0, 2, 2);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    var framebuffer: [1]u32 = undefined;
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(g.READ_FRAMEBUFFER, framebuffer[0]);
+    glFramebufferTextureLayer(g.READ_FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[0], 1, 2);
+    var pixels: [16]u8 = undefined;
+    glReadPixels(0, 0, 2, 2, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 255, 0, 255, 0, 0, 0, 0, 0, 255, 0, 255 }, &pixels);
+    glFramebufferTextureLayer(g.READ_FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[0], 1, 1);
+    glReadPixels(0, 0, 2, 2, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &pixels);
+    glBindFramebuffer(g.READ_FRAMEBUFFER, 0);
+    glCopyTexSubImage3D(g.TEXTURE_2D_ARRAY, 1, 0, 0, 3, 0, 0, 2, 2);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glBindTexture(g.TEXTURE_3D, names[1]);
+    glTexStorage3D(g.TEXTURE_3D, 3, g.RGBA8, 4, 4, 4);
+    glCopyTexSubImage3D(g.TEXTURE_3D, 1, 0, 0, 1, 0, 0, 2, 2);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    glBindFramebuffer(g.READ_FRAMEBUFFER, framebuffer[0]);
+    glFramebufferTextureLayer(g.READ_FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[1], 1, 1);
+    glReadPixels(0, 0, 2, 2, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255 }, &pixels);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: buffer copies preserve bindings, reject overlap and respect maps" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [2]u32 = undefined;
+    glGenBuffers(2, &names);
+    glBindBuffer(g.COPY_READ_BUFFER, names[0]);
+    const bytes = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    glBufferData(g.COPY_READ_BUFFER, bytes.len, &bytes, g.STATIC_DRAW);
+    glBindBuffer(g.COPY_WRITE_BUFFER, names[1]);
+    glBufferData(g.COPY_WRITE_BUFFER, bytes.len, null, g.STATIC_DRAW);
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, 2, 3, 4);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    const mapped = glMapBufferRange(g.COPY_WRITE_BUFFER, 0, bytes.len, 1).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 2, 3, 4, 5, 0 }, @as([*]const u8, @ptrCast(mapped))[0..bytes.len]);
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, 0, 0, 1);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+    try std.testing.expectEqual(@as(u8, 1), glUnmapBuffer(g.COPY_WRITE_BUFFER));
+    glBindBuffer(g.COPY_WRITE_BUFFER, names[0]);
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, 0, 2, 4);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, 0, 4, 4);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    const copied = glMapBufferRange(g.COPY_READ_BUFFER, 0, bytes.len, 1).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 0, 1, 2, 3 }, @as([*]const u8, @ptrCast(copied))[0..bytes.len]);
+    try std.testing.expectEqual(@as(u8, 1), glUnmapBuffer(g.COPY_READ_BUFFER));
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, std.math.maxInt(isize), 0, 1);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    var binding: i32 = 0;
+    glGetIntegerv(g.COPY_READ_BUFFER, @ptrCast(&binding));
+    try std.testing.expectEqual(@as(i32, @intCast(names[0])), binding);
+}
+
+test "libgles: vertex attribute queries keep vector types, VAO offsets and untouched outputs on errors" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var floats: [4]f32 = undefined;
+    var ints: [4]i32 = undefined;
+    var uints: [4]u32 = undefined;
+    glGetVertexAttribfv(3, g.CURRENT_VERTEX_ATTRIB, &floats);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 1 }, &floats);
+    glVertexAttrib4f(3, 0.5, -1.5, 2.5, 1);
+    glGetVertexAttribfv(3, g.CURRENT_VERTEX_ATTRIB, &floats);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, -1.5, 2.5, 1 }, &floats);
+    glGetVertexAttribiv(3, g.CURRENT_VERTEX_ATTRIB, &ints);
+    try std.testing.expectEqualSlices(i32, &.{ 1, -2, 3, 1 }, &ints);
+    glVertexAttribI4i(3, -5, 6, -7, 8);
+    glGetVertexAttribIiv(3, g.CURRENT_VERTEX_ATTRIB, &ints);
+    try std.testing.expectEqualSlices(i32, &.{ -5, 6, -7, 8 }, &ints);
+    glGetVertexAttribfv(3, g.CURRENT_VERTEX_ATTRIB, &floats);
+    try std.testing.expectEqualSlices(f32, &.{ -5, 6, -7, 8 }, &floats);
+    glVertexAttribI4ui(3, 0xffffffff, 0x80000000, 2, 3);
+    glGetVertexAttribIuiv(3, g.CURRENT_VERTEX_ATTRIB, &uints);
+    try std.testing.expectEqualSlices(u32, &.{ 0xffffffff, 0x80000000, 2, 3 }, &uints);
+    glGetVertexAttribfv(3, g.CURRENT_VERTEX_ATTRIB, &floats);
+    try std.testing.expect(floats[0] > 4e9 and floats[1] > 2e9);
+    const offset: usize = if (@sizeOf(usize) == 8) 0x123456789 else 0x12345;
+    glVertexAttribPointer(3, 2, g.FLOAT, 0, 16, @ptrFromInt(offset));
+    var pointer: ?*anyopaque = null;
+    glGetVertexAttribPointerv(3, g.VERTEX_ATTRIB_ARRAY_POINTER, &pointer);
+    try std.testing.expectEqual(offset, @intFromPtr(pointer));
+    glGetVertexAttribPointerv(3, g.FLOAT, &pointer);
+    try std.testing.expectEqual(g.INVALID_ENUM, glGetError());
+    try std.testing.expectEqual(offset, @intFromPtr(pointer));
+    uints = @splat(99);
+    glGetVertexAttribIuiv(gles.MAX_ATTRS, g.CURRENT_VERTEX_ATTRIB, &uints);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    try std.testing.expectEqualSlices(u32, &.{ 99, 99, 99, 99 }, &uints);
+}
+
 test "libgles: getProcAddress finds every entry point, and nothing else" {
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glClear)), getProcAddress("glClear"));
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glTexStorage2DEXT)), getProcAddress("glTexStorage2DEXT"));
@@ -1109,7 +1465,8 @@ test "libgles: shaders, programs and uniforms through the C entry points" {
     glGetShaderiv(vs, g.SHADER_SOURCE_LENGTH, @ptrCast(&n));
     try E(@as(i32, @intCast(vs_src.len + 1)), n);
     // the fragment shader in two parts, each NUL-terminated
-    const fparts = [_]?[*]const u8{ "#version 300 es\nprecision mediump float;\n",
+    const fparts = [_]?[*]const u8{
+        "#version 300 es\nprecision mediump float;\n",
         \\uniform sampler2D sColor;
         \\uniform bool uOn;
         \\in vec4 vColor;
@@ -1339,4 +1696,303 @@ test "libgles: texture formats and sampler objects through the C entry points" {
     try E(@as(i32, 0), v);
     try E(g.FALSE, glIsSampler(s[0]));
     try E(g.NO_ERROR, glGetError());
+}
+
+test "libgles: CopyImageSubDataEXT copies a texture subrectangle without changing bindings" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [2]u32 = undefined;
+    glGenTextures(2, &names);
+    const pixels = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    glBindTexture(g.TEXTURE_2D, names[0]);
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA8), 2, 1, 0, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    glBindTexture(g.TEXTURE_2D, names[1]);
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA8), 2, 1, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    glCopyImageSubDataEXT(names[0], g.TEXTURE_2D, 0, 1, 0, 0, names[1], g.TEXTURE_2D, 0, 0, 0, 0, 1, 1, 1);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    var fb: [1]u32 = undefined;
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    glFramebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, names[1], 0);
+    var result: [8]u8 = undefined;
+    glReadPixels(0, 0, 2, 1, g.RGBA, g.UNSIGNED_BYTE, &result);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8, 0, 0, 0, 0 }, &result);
+    glCopyImageSubDataEXT(names[0], g.TEXTURE_2D, 0, 1, 0, 0, names[1], g.TEXTURE_2D, 0, 0, 0, 0, 2, 1, 1);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+}
+
+test "libgles: immutable buffer storage enforces update and mapping flags" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var name: [1]u32 = undefined;
+    glGenBuffers(1, &name);
+    glBindBuffer(g.ARRAY_BUFFER, name[0]);
+    const bytes = [_]u8{ 3, 2, 1, 0 };
+    glBufferStorageEXT(g.ARRAY_BUFFER, bytes.len, &bytes, 1);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    var imm: [1]i32 = undefined;
+    glGetBufferParameteriv(g.ARRAY_BUFFER, 0x821F, &imm);
+    try std.testing.expectEqual(@as(i32, 1), imm[0]);
+    glBufferSubData(g.ARRAY_BUFFER, 0, bytes.len, &bytes);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+    glBufferData(g.ARRAY_BUFFER, bytes.len, null, g.STATIC_DRAW);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+    try std.testing.expect(glMapBufferRange(g.ARRAY_BUFFER, 0, bytes.len, 2) == null);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+    const mapped: [*]const u8 = @ptrCast(glMapBufferRange(g.ARRAY_BUFFER, 0, bytes.len, 1).?);
+    try std.testing.expectEqualSlices(u8, &bytes, mapped[0..bytes.len]);
+    try std.testing.expectEqual(@as(u8, 1), glUnmapBuffer(g.ARRAY_BUFFER));
+}
+
+test "libgles: persistent buffer mapping survives a server update and barrier" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var name: [1]u32 = undefined;
+    glGenBuffers(1, &name);
+    glBindBuffer(g.ARRAY_BUFFER, name[0]);
+    const read_persistent: u32 = 0x41;
+    glBufferStorageEXT(g.ARRAY_BUFFER, 8, null, read_persistent | 0x100);
+    const ptr: [*]const u8 = @ptrCast(glMapBufferRange(g.ARRAY_BUFFER, 0, 8, read_persistent).?);
+    const bytes = [_]u8{ 4, 3, 2, 1 };
+    glBufferSubData(g.ARRAY_BUFFER, 2, bytes.len, &bytes);
+    glMemoryBarrier(0x4000);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    try std.testing.expectEqualSlices(u8, &bytes, ptr[2..6]);
+    try std.testing.expectEqual(@as(u8, 1), glUnmapBuffer(g.ARRAY_BUFFER));
+}
+
+test "libgles: cube-map size queries and storage obey the same limit" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+
+    const query = 0x851C; // GL_MAX_CUBE_MAP_TEXTURE_SIZE
+    var limit = [_]i32{ -1, -1, -1, -1 };
+    var wide = [_]i64{ -1, -1, -1, -1 };
+    var float = [_]f32{ -1, -1, -1, -1 };
+    var boolean = [_]u8{ 2, 2, 2, 2 };
+    glGetIntegerv(query, &limit);
+    glGetInteger64v(query, &wide);
+    glGetFloatv(query, &float);
+    glGetBooleanv(query, &boolean);
+    try std.testing.expectEqual([4]i32{ gles.MAX_SIZE, -1, -1, -1 }, limit);
+    try std.testing.expectEqual([4]i64{ gles.MAX_SIZE, -1, -1, -1 }, wide);
+    try std.testing.expectEqual([4]f32{ gles.MAX_SIZE, -1, -1, -1 }, float);
+    try std.testing.expectEqual([4]u8{ 1, 2, 2, 2 }, boolean);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+
+    var names: [2]u32 = undefined;
+    glGenTextures(names.len, &names);
+    glBindTexture(g.TEXTURE_CUBE_MAP, names[0]);
+    const face = g.TEXTURE_CUBE_MAP_POSITIVE_X;
+    const oversized = limit[0] + 1;
+    glTexImage2D(face, 0, g.RGBA8, oversized, oversized, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    // The test pool is too small for a maximum-sized image. Allocation
+    // failure here confirms that the exact boundary passed validation.
+    glTexImage2D(face, 0, g.RGBA8, limit[0], limit[0], 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.OUT_OF_MEMORY, glGetError());
+    glTexImage2D(face, 0, g.RGBA8, 2, 1, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    const last = std.math.log2_int(u32, @intCast(limit[0]));
+    glTexImage2D(face, last, g.RGBA8, 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glTexImage2D(face, last, g.RGBA8, 1, 1, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+
+    glBindTexture(g.TEXTURE_CUBE_MAP, names[1]);
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 1, g.RGBA8, oversized, oversized);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 1, g.RGBA8, limit[0], limit[0]);
+    try std.testing.expectEqual(g.OUT_OF_MEMORY, glGetError());
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 1, g.RGBA8, 2, 1);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 2, g.RGBA8, 2, 2);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: copy array slices to cube faces and volume mips" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [3]u32 = undefined;
+    glGenTextures(names.len, &names);
+    glBindTexture(g.TEXTURE_2D_ARRAY, names[0]);
+    glTexStorage3D(g.TEXTURE_2D_ARRAY, 2, g.RGBA8, 2, 2, 3);
+    glBindTexture(g.TEXTURE_CUBE_MAP, names[1]);
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 2, g.RGBA8, 2, 2);
+    glBindTexture(g.TEXTURE_3D, names[2]);
+    glTexStorage3D(g.TEXTURE_3D, 2, g.RGBA8, 2, 2, 4);
+    const pixels = [_]u8{ 99, 99, 99, 99, 1, 2, 3, 4, 5, 6, 7, 8 };
+    glPixelStorei(g.UNPACK_SKIP_IMAGES, 1);
+    glTexSubImage3D(g.TEXTURE_2D_ARRAY, 1, 0, 0, 1, 1, 1, 2, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    glPixelStorei(g.UNPACK_SKIP_IMAGES, 0);
+    glCopyImageSubDataEXT(names[0], g.TEXTURE_2D_ARRAY, 1, 0, 0, 1, names[1], g.TEXTURE_CUBE_MAP, 1, 0, 0, 4, 1, 1, 2);
+    glCopyImageSubDataEXT(names[1], g.TEXTURE_CUBE_MAP, 1, 0, 0, 4, names[2], g.TEXTURE_3D, 1, 0, 0, 0, 1, 1, 2);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    const volume = &t_objs.tex[names[2] - 1].img;
+    try std.testing.expectEqualSlices(u8, pixels[4..], t_eng.hostView(volume, volume.level_at[1], 8));
+    glCopyImageSubDataEXT(names[1], g.TEXTURE_CUBE_MAP, 1, 0, 0, 4, names[2], g.TEXTURE_3D, 1, 0, 0, 1, 1, 1, 2);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+}
+
+test "libgles: mutable array definitions preserve compatible mips" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [1]u32 = undefined;
+    glGenTextures(1, &names);
+    glBindTexture(g.TEXTURE_2D_ARRAY, names[0]);
+    const mip = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    glTexImage3D(g.TEXTURE_2D_ARRAY, 0, g.RGBA8, 2, 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    glTexImage3D(g.TEXTURE_2D_ARRAY, 1, g.RGBA8, 1, 1, 2, 0, g.RGBA, g.UNSIGNED_BYTE, &mip);
+    glTexImage3D(g.TEXTURE_2D_ARRAY, 0, g.RGBA8, 2, 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    const tex = &t_objs.tex[names[0] - 1];
+    try std.testing.expectEqualSlices(u8, &mip, t_eng.hostView(&tex.img, tex.img.level_at[1], mip.len));
+    glTexImage3D(g.TEXTURE_2D_ARRAY, 0, g.RGBA8, 4, 4, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    glTexSubImage3D(g.TEXTURE_2D_ARRAY, 1, 0, 0, 0, 1, 1, 2, g.RGBA, g.UNSIGNED_BYTE, &mip);
+    var fb: [1]u32 = undefined;
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    glFramebufferTextureLayer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[0], 1, 1);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, glCheckFramebufferStatus(g.FRAMEBUFFER));
+    var pixel: [4]u8 = undefined;
+    glReadPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqualSlices(u8, mip[4..], &pixel);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: a non-base mip can be defined before level zero with its own format" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [2]u32 = undefined;
+    glGenTextures(2, &names);
+    glPixelStorei(g.UNPACK_ALIGNMENT, 1);
+    glBindTexture(g.TEXTURE_2D, names[0]);
+    const red = [_]u8{ 13, 42, 81 };
+    glTexImage2D(g.TEXTURE_2D, 2, g.R8, 3, 1, 0, g.RED, g.UNSIGNED_BYTE, &red);
+    glTexImage2D(g.TEXTURE_2D, 0, g.RGBA8, 4, 4, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    glBindTexture(g.TEXTURE_2D, names[1]);
+    glTexStorage2D(g.TEXTURE_2D, 1, g.R8, 3, 1);
+    glCopyImageSubDataEXT(names[0], g.TEXTURE_2D, 2, 0, 0, 0, names[1], g.TEXTURE_2D, 0, 0, 0, 0, 3, 1, 1);
+    const dst = &t_objs.tex[names[1] - 1].img;
+    try std.testing.expectEqualSlices(u8, &red, t_eng.hostView(dst, 0, red.len));
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: KHR debug logs a message and restores filters on group pop" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    const dbg = gles.debug_output;
+    glEnable(dbg.OUTPUT);
+    glPushDebugGroupKHR(dbg.APPLICATION, 1, -1, "group");
+    glDebugMessageControlKHR(dbg.APPLICATION, dbg.ERROR, dbg.ANY, 0, null, 0);
+    glDebugMessageInsertKHR(dbg.APPLICATION, dbg.ERROR, 2, dbg.HIGH, -1, "hidden");
+    glPopDebugGroupKHR();
+    glDebugMessageInsertKHR(dbg.APPLICATION, dbg.ERROR, 3, dbg.HIGH, -1, "visible");
+    var ids: [4]u32 = undefined;
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 3), glGetDebugMessageLogKHR(4, text.len, null, null, &ids, null, null, &text));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 3 }, ids[0..3]);
+    try std.testing.expectEqualSlices(u8, "group\x00group\x00visible\x00", text[0..20]);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: KHR labels are truncated on read and cleared on object reuse" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var name: [1]u32 = undefined;
+    glGenBuffers(1, &name);
+    glBindBuffer(g.ARRAY_BUFFER, name[0]);
+    glObjectLabelKHR(0x82E0, name[0], -1, "vertex data");
+    var text: [7]u8 = undefined;
+    var len: i32 = 0;
+    glGetObjectLabelKHR(0x82E0, name[0], text.len, &len, &text);
+    try std.testing.expectEqual(@as(i32, 6), len);
+    try std.testing.expectEqualStrings("vertex", std.mem.sliceTo(&text, 0));
+    glDeleteBuffers(1, &name);
+    glBindBuffer(g.ARRAY_BUFFER, name[0]);
+    glGetObjectLabelKHR(0x82E0, name[0], text.len, &len, &text);
+    try std.testing.expectEqual(@as(i32, 0), len);
+    const sync = glFenceSync(g.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    try std.testing.expect(sync != null);
+    glObjectPtrLabelKHR(sync, -1, "fence");
+    glGetObjectPtrLabelKHR(sync, text.len, &len, &text);
+    try std.testing.expectEqualStrings("fence", std.mem.sliceTo(&text, 0));
+    glDeleteSync(sync);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+const TestTimerDev = @typeInfo(@TypeOf(t_eng.dev)).optional.child;
+var test_timer_tick: u64 = 0;
+
+fn testTimerSample(_: *anyopaque, _: u64) error{ OutOfMemory, SubmitFailed, Timeout, DeviceLost, BadProgram, Unsupported }!u64 {
+    test_timer_tick += 100;
+    return test_timer_tick;
+}
+
+test "libgles: timer query lifecycle, 64-bit timestamp and elapsed results" {
+    t_eng.init(.{ .pool = &t_pool });
+    var vt: TestTimerDev.VTable = undefined;
+    vt.timestampNs = testTimerSample;
+    t_eng.dev = .{ .ctx = &test_timer_tick, .vtable = &vt, .caps = undefined };
+    test_timer_tick = 0x1_0000_0000;
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var ids: [2]u32 = undefined;
+    glGenQueriesEXT(2, &ids);
+    try std.testing.expectEqual(@as(u8, 0), glIsQueryEXT(ids[0]));
+    glBeginQueryEXT(gles.TIME_ELAPSED_EXT, ids[0]);
+    try std.testing.expectEqual(@as(u8, 1), glIsQueryEXT(ids[0]));
+    glEndQueryEXT(gles.TIME_ELAPSED_EXT);
+    var value: u64 = 0;
+    glGetQueryObjectui64vEXT(ids[0], 0x8866, &value);
+    try std.testing.expectEqual(@as(u64, 100), value);
+    glQueryCounterEXT(ids[1], gles.TIMESTAMP_EXT);
+    glGetQueryObjectui64vEXT(ids[1], 0x8866, &value);
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0000 + 300), value);
+    var now: [1]i64 = undefined;
+    glGetInteger64v(gles.TIMESTAMP_EXT, &now);
+    try std.testing.expectEqual(@as(i64, 0x1_0000_0000 + 400), now[0]);
+    glDeleteQueriesEXT(2, &ids);
+    try std.testing.expectEqual(@as(u8, 0), glIsQueryEXT(ids[0]));
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
 }

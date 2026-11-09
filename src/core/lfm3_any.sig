@@ -89,6 +89,9 @@ pub const Options = struct {
     /// Tokens one attention launch takes (its scratch: tokens x heads x
     /// max_span scores).
     attention_tokens: u32 = 16,
+    /// Reuse the one-token workgroup for prefill, without splitting the
+    /// dispatch or changing the model's batch size.
+    tiled_attention: bool = true,
     /// Map the model file zero-copy where the device can (unified memory,
     /// caps.import, the file mapped).
     import: bool = true,
@@ -561,7 +564,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 // target's registers take (8 rows, else fewer; one token
                 // is the decode kernels').
                 var tt = kernels.MAX_ROWS / hg;
-                while (tt > 1 and self.options.max_batch > 1) : (tt /= 2) {
+                while (self.options.tiled_attention and tt > 1 and self.options.max_batch > 1) : (tt /= 2) {
                     self.build(&self.k.scores_prefill, kernels.attnScores(s, caps, hg, tt)) catch |e| {
                         if (e != error.CompileFailed) return e;
                         continue;

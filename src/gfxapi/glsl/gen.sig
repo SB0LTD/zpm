@@ -46,8 +46,7 @@
 //!   not uniform (an if, a loop's exit, a return or discard on a value
 //!   that differs between pixels) GL leaves them undefined: here they
 //!   are 0 (`flattenDerivs`).
-//! - Not yet: cube, 3D, array and shadow samplers (they read 0), a sampler
-//!   chosen at run time, gl_FragDepth, gl_PointSize.
+//! - Not yet: a sampler chosen at run time, gl_FragDepth, gl_PointSize.
 //!
 //! Allocation-free: its tables are the Scratch's (Store).
 
@@ -1894,17 +1893,22 @@ const Gen = struct {
     /// gradients (the *Grad ones), or implicit: in a fragment shader the
     /// derivatives of (s, t) through the quad, plus the bias argument if
     /// there is one; elsewhere the base level.
-    fn lodOf(g: *Gen, which: TexFn, args: []Val, s: Arg, t: Arg, kind: texture.Kind) texture.Lod {
+    fn lodOf(g: *Gen, which: TexFn, args: []Val, s: Arg, t: Arg, depth: ?Arg, cube: ?texture.CubeProjection, kind: texture.Kind) texture.Lod {
         if (kind != .float) return .base;
         switch (which) {
-            .textureLod, .textureLodOffset, .textureProjLod, .textureProjLodOffset, .texture2DLod, .texture2DProjLod, .texture2DLodEXT, .texture2DProjLodEXT => {
+            .textureLod, .textureLodOffset, .textureProjLod, .textureProjLodOffset, .texture2DLod, .texture2DProjLod, .texture2DLodEXT, .texture2DProjLodEXT, .textureCubeLod, .textureCubeLodEXT => {
                 return .{ .level = if (args.len > 2) g.cp(g.rv(args[2]).at, 0) else f(0) };
             },
-            .textureGrad, .textureGradOffset, .textureProjGrad, .textureProjGradOffset, .texture2DGradEXT, .texture2DProjGradEXT => {
+            .textureGrad, .textureGradOffset, .textureProjGrad, .textureProjGradOffset, .texture2DGradEXT, .texture2DProjGradEXT, .textureCubeGradEXT => {
                 if (args.len < 4) return .base;
                 const dx = g.rv(args[2]);
                 const dy = g.rv(args[3]);
-                return .{ .grad = .{ .dsdx = g.cp(dx.at, 0), .dtdx = g.cp(dx.at, 1), .dsdy = g.cp(dy.at, 0), .dtdy = g.cp(dy.at, 1), .bias = f(0) } };
+                if (cube) |p| {
+                    const x = texture.cubeGradient(g.k, p, g.cp(dx.at, 0), g.cp(dx.at, 1), g.cp(dx.at, 2));
+                    const y = texture.cubeGradient(g.k, p, g.cp(dy.at, 0), g.cp(dy.at, 1), g.cp(dy.at, 2));
+                    return .{ .grad = .{ .dsdx = x[0], .dtdx = x[1], .dsdy = y[0], .dtdy = y[1], .bias = f(0) } };
+                }
+                return .{ .grad = .{ .dsdx = g.cp(dx.at, 0), .dtdx = g.cp(dx.at, 1), .dsdy = g.cp(dy.at, 0), .dtdy = g.cp(dy.at, 1), .bias = f(0), .drdx = if (depth != null) g.cp(dx.at, 2) else f(0), .drdy = if (depth != null) g.cp(dy.at, 2) else f(0) } };
             },
             else => {},
         }
@@ -1916,7 +1920,16 @@ const Gen = struct {
         const bias = if (bias_at < args.len) g.cp(g.rv(args[bias_at]).at, 0) else f(0);
         // (the program runs whole quads: derivatives are its neighbours')
         g.derivatives = true;
-        return .{ .grad = .{ .dsdx = g.deriv(s, false), .dtdx = g.deriv(t, false), .dsdy = g.deriv(s, true), .dtdy = g.deriv(t, true), .bias = bias } };
+        if (cube) |projection| {
+            const coords = g.rv(args[1]);
+            const x = g.cp(coords.at, 0);
+            const y = g.cp(coords.at, 1);
+            const z = g.cp(coords.at, 2);
+            const dx = texture.cubeGradient(g.k, projection, g.deriv(x, false), g.deriv(y, false), g.deriv(z, false));
+            const dy = texture.cubeGradient(g.k, projection, g.deriv(x, true), g.deriv(y, true), g.deriv(z, true));
+            return .{ .grad = .{ .dsdx = dx[0], .dtdx = dx[1], .dsdy = dy[0], .dtdy = dy[1], .bias = bias } };
+        }
+        return .{ .grad = .{ .dsdx = g.deriv(s, false), .dtdx = g.deriv(t, false), .dsdy = g.deriv(s, true), .dtdy = g.deriv(t, true), .bias = bias, .drdx = if (depth) |z| g.deriv(z, false) else f(0), .drdy = if (depth) |z| g.deriv(z, true) else f(0) } };
     }
 
     /// A constant ivec2 argument (an offset): its two ints.
@@ -1944,17 +1957,21 @@ const Gen = struct {
         const slot = sa.imm;
         const base = args[0].ty.base;
         const kind: texture.Kind = switch (base) {
-            .isampler2D => .int,
-            .usampler2D => .uint,
+            .isampler2D, .isampler2DArray, .isampler3D, .isamplerCube => .int,
+            .usampler2D, .usampler2DArray, .usampler3D, .usamplerCube => .uint,
             else => .float,
         };
-        // (cube, 3D, array and shadow samplers: not yet; zeros, and alpha 1)
+        const shadow = base == .sampler2DShadow or base == .sampler2DArrayShadow or base == .samplerCubeShadow;
+        const array = base == .sampler2DArray or base == .isampler2DArray or base == .usampler2DArray or base == .sampler2DArrayShadow;
+        const volume = base == .sampler3D or base == .isampler3D or base == .usampler3D;
+        const cube = base == .samplerCube or base == .isamplerCube or base == .usamplerCube or base == .samplerCubeShadow;
+        const layered = array or volume;
         const two_d = base == .sampler2D or base == .isampler2D or base == .usampler2D or base == .samplerExternalOES;
-        if (slot == NO_SLOT or !two_d) {
+        if (slot == NO_SLOT or !(two_d or layered or cube or shadow)) {
             if (n == 4) g.put(at, 3, if (kind == .float) f(1) else u(1));
             return out;
         }
-        const ts = texture.Slot{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS };
+        var ts = texture.Slot{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS, .volume = volume, .cube = cube };
         const k = g.k;
         var res: [4]Arg = undefined;
         switch (which) {
@@ -1963,18 +1980,28 @@ const Gen = struct {
                 const sz = texture.size(k, ts, lod);
                 g.put(at, 0, sz[0]);
                 if (n > 1) g.put(at, 1, sz[1]);
+                if (layered and n > 2) g.put(at, 2, texture.layerSize(k, ts, lod));
                 return out;
             },
             .texelFetch, .texelFetchOffset => {
                 const p = g.rv(args[1]);
                 const off = if (which == .texelFetchOffset) g.offsetOf(args[3]) else [2]i32{ 0, 0 };
                 const lod = if (args.len > 2) g.cp(g.rv(args[2]).at, 0) else u(0);
-                res = texture.fetch(k, ts, g.cp(p.at, 0), g.cp(p.at, 1), kind, off, lod);
+                if (volume and which == .texelFetchOffset) ts.offset_z = g.offsetZ(args[3]);
+                res = texture.fetchArray(k, ts, g.cp(p.at, 0), g.cp(p.at, 1), if (layered) g.cp(p.at, 2) else null, kind, off, lod);
             },
             else => {
                 const p = g.rv(args[1]);
                 var s = g.cp(p.at, 0);
                 var tt = g.cp(p.at, 1);
+                var z: ?Arg = if (layered) g.cp(p.at, 2) else null;
+                if (shadow) ts.shadow = g.cp(p.at, if (array or cube) 3 else 2);
+                const projection = if (cube) texture.cubeProject(k, s, tt, g.cp(p.at, 2)) else null;
+                if (projection) |uv| {
+                    s = uv.s;
+                    tt = uv.t;
+                    z = uv.face;
+                }
                 const proj = switch (which) {
                     .textureProj, .textureProjOffset, .textureProjLod, .textureProjLodOffset, .textureProjGrad, .textureProjGradOffset, .texture2DProj, .texture2DProjLod, .texture2DProjLodEXT, .texture2DProjGradEXT => true,
                     else => false,
@@ -1983,6 +2010,8 @@ const Gen = struct {
                     const q = g.cp(p.at, g.size(p.ty) - 1);
                     s = g.fop2(.fdiv, s, q);
                     tt = g.fop2(.fdiv, tt, q);
+                    if (volume) z = g.fop2(.fdiv, z.?, q);
+                    if (ts.shadow) |reference| ts.shadow = g.fop2(.fdiv, reference, q);
                 }
                 // the offset: after the coordinates, a lod, or two gradients
                 const off_at: ?usize = switch (which) {
@@ -1992,11 +2021,19 @@ const Gen = struct {
                     else => null,
                 };
                 const off = if (off_at) |ix| (if (ix < args.len) g.offsetOf(args[ix]) else [2]i32{ 0, 0 }) else [2]i32{ 0, 0 };
-                res = texture.sample(k, ts, s, tt, kind, off, g.lodOf(which, args, s, tt, kind));
+                if (volume) {
+                    if (off_at) |ix| ts.offset_z = g.offsetZ(args[ix]);
+                }
+                res = texture.sampleArray(k, ts, s, tt, z, kind, off, g.lodOf(which, args, s, tt, if (volume) z else null, projection, kind));
             },
         }
         for (0..@min(n, 4)) |ix| g.put(at, @intCast(ix), res[ix]);
         return out;
+    }
+
+    fn offsetZ(g: *Gen, v: Val) i32 {
+        const arg = g.cp(g.rv(v).at, 2);
+        return if (arg == .imm) @bitCast(arg.imm) else 0;
     }
 
     fn dot(g: *Gen, a: Val, b: Val) Arg {

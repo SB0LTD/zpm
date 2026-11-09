@@ -266,7 +266,7 @@ const VInfo = struct {
 
 const NONE_REGION: u32 = 0xffff_ffff;
 
-const Loop = struct { head: u32, end: u32, depth: u16 };
+const Loop = struct { head: u32, end: u32, depth: u16, single_pass: bool = false };
 
 /// The machine instructions [lo, hi) of an if's then-part, an else-part
 /// or a loop's body: entered only at lo, so an instruction at its top
@@ -410,20 +410,23 @@ pub fn compileWith(k: *const kir.Kernel, caps: device.Caps, w: *Work, out: []u8)
     // keeps fewer cannot launch (ir3_emu.maxWaves, Mesa's a7xx formula).
     // Tighter scheduling first; then the group is too big for the kernel.
     const threads = k.group[0] * k.group[1] * k.group[2];
-    var last: device.Binary = undefined;
+    var last: ?device.Binary = null;
     for ([_]i32{ SCHED_PRESSURE, 16, 0 }) |pressure| {
         w.sched_pressure = pressure;
         try expand(w, k);
         try analyze(w);
         try lower(w);
         schedule(w);
-        try allocate(w);
+        allocate(w) catch |err| switch (err) {
+            error.TooManyRegs => continue,
+            else => return err,
+        };
         try emitText(w);
         last = try assembleOut(w, k, out);
-        const cfg = Config.fromExtra(last.extra).?;
-        if (adreno.ir3_emu.groupFits(w.gen, cfg.full_regs, w.threadsize, threads)) return last;
+        const cfg = Config.fromExtra(last.?.extra).?;
+        if (adreno.ir3_emu.groupFits(w.gen, cfg.full_regs, w.threadsize, threads)) return last.?;
     }
-    const cfg = Config.fromExtra(last.extra).?;
+    const cfg = Config.fromExtra((last orelse return error.TooManyRegs).extra).?;
     note(w, "a group of {d} threads needs {d} waves of {d} resident; {d} vec4 registers keep {d} (a7xx): use smaller groups", .{ threads, (threads + w.threadsize - 1) / w.threadsize, w.threadsize, cfg.full_regs, adreno.ir3_emu.maxWaves(w.gen, cfg.full_regs, w.threadsize) });
     return error.TooManyRegs;
 }
@@ -1431,13 +1434,21 @@ fn lowerOne(w: *Work, i: u32) Error!void {
         },
         .fmin => try alu2(w, .min_f, d, h, try l.arg(in.a, .c2f, true, h), try l.arg(in.b, .c2f, true, h)),
         .fmax => try alu2(w, .max_f, d, h, try l.arg(in.a, .c2f, true, h), try l.arg(in.b, .c2f, true, h)),
-        .fabs => {
+        // (KIR's fabs and fneg are sign-bit operations: no flush, a NaN's
+        // bits kept. absneg.f flushes a denormal on the X1-45: fabs of
+        // 0x00000001 came back 0, the self-test's 11-09 boot. The bits, for
+        // f32)
+        .fabs => if (!h) {
+            try alu2(w, .and_b, d, false, try l.arg(in.a, .c2, false, false), try fit(w, Opnd.imm(0x7fff_ffff), .c2, false, l.loop));
+        } else {
             var a = try l.arg(in.a, .c2f, true, h);
             a.abs = true;
             a.neg = false;
             try alu1(w, .absneg_f, d, h, a);
         },
-        .fneg => {
+        .fneg => if (!h) {
+            try alu2(w, .xor_b, d, false, try l.arg(in.a, .c2, false, false), try fit(w, Opnd.imm(0x8000_0000), .c2, false, l.loop));
+        } else {
             var a = try l.arg(in.a, .c2f, true, h);
             a.neg = !a.neg;
             try alu1(w, .absneg_f, d, h, a);
@@ -1785,12 +1796,8 @@ fn lowerBfe(l: *Lw) Error!void {
     try alu2(w, .and_b, b31, false, b, Opnd.imm(31));
     try alu2(w, .sub_u, room, false, Opnd.imm(32), Opnd.reg(b31, false));
     try alu2(w, .min_u, width, false, c, Opnd.reg(room, false));
-    if (!signed) {
-        const mask = try t.f(w);
-        try alu2(w, .mgen_b, mask, false, Opnd.imm(0), Opnd.reg(width, false));
-        return alu3(w, .shrm, d, false, Opnd.reg(b31, false), try l.arg(in.a, .c3mid, false, false), Opnd.reg(mask, false));
-    }
-    // signed: (a << (32 - b - c)) >> (32 - c), arithmetic; width 0 gives 0
+    // Use the same shifts as the signed extraction. The variable-width
+    // mask sequence returned zero for bfe.u32(1, 0, 3) on the X1-45.
     const s1 = try t.f(w);
     const s2 = try t.f(w);
     const y = try t.f(w);
@@ -1799,7 +1806,7 @@ fn lowerBfe(l: *Lw) Error!void {
     try alu2(w, .sub_u, s1, false, Opnd.reg(room, false), Opnd.reg(width, false));
     try alu2(w, .sub_u, s2, false, Opnd.imm(32), Opnd.reg(width, false));
     try alu2(w, .shl_b, y, false, a, Opnd.reg(s1, false));
-    try alu2(w, .ashr_b, r0, false, Opnd.reg(y, false), Opnd.reg(s2, false));
+    try alu2(w, if (signed) .ashr_b else .shr_b, r0, false, Opnd.reg(y, false), Opnd.reg(s2, false));
     try cmp2(w, .cmps_u, .eq, z, Opnd.reg(width, false), Opnd.imm(0));
     try alu3(w, .sel_b32, d, false, try fit(w, Opnd.imm(0), .c3, false, l.loop), Opnd.reg(z, false), Opnd.reg(r0, false));
 }
@@ -1997,12 +2004,12 @@ fn lowerCvt(l: *Lw) Error!void {
         return mov(w, d, false, try l.arg(in.a, .any, false, false), .u32);
     }
     if (from == .f32 and to == .f16) {
-        const r: ir3.Round = switch (cv.round) {
-            .rne => .even,
-            .rz => .none,
-            else => return error.Unsupported,
+        const src = try l.arg(in.a, .c6, false, false);
+        return switch (cv.round) {
+            .rne => cov(w, d, true, src, .f32, .f16, .even),
+            .rz => lowerToHalfRz(l, src),
+            else => error.Unsupported,
         };
-        return cov(w, d, true, try l.arg(in.a, .c6, false, false), .f32, .f16, r);
     }
     if (from == .f16 and to == .f32) {
         if (w.fuse[l.i] == .half_lo or w.fuse[l.i] == .half_hi) {
@@ -2020,9 +2027,10 @@ fn lowerCvt(l: *Lw) Error!void {
         if (cv.round != .rne) return error.Unsupported;
         const src = try l.arg(in.a, .c6, false, false);
         const st: ir3.Type = if (from == .i32) .s32 else .u32;
-        if (to == .f32) return cov(w, d, false, src, st, .f32, .none);
+        // KIR requests ties-to-even. The default cat1 encoding truncates.
+        if (to == .f32) return cov(w, d, false, src, st, .f32, .even);
         const t = try newVreg(w, .full);
-        try cov(w, t, false, src, st, .f32, .none);
+        try cov(w, t, false, src, st, .f32, .even);
         return cov(w, d, true, Opnd.reg(t, false), .f32, .f16, .even);
     }
     if ((from == .f32 or from == .f16) and isInt(to)) {
@@ -2032,6 +2040,25 @@ fn lowerCvt(l: *Lw) Error!void {
             const t = try newVreg(w, .full);
             try cov(w, t, false, try fit(w, x, .c6, false, l.loop), .f16, .f32, .none);
             x = Opnd.reg(t, false);
+        } else if ((cv.round == .rd or cv.round == .ru) and w.caps.denormals == .preserve) {
+            // A directed integer rounding only needs the sign and nonzero
+            // status for values below one. Preserve both across GPU FTZ
+            // (where KIR keeps denormals: with Caps.denormals == .flush its
+            // input flushes, as the GPU's does: rd of -denorm is 0).
+            const raw = try l.arg(in.a, .c2, false, false);
+            const abs_bits = try newVreg(w, .full);
+            const range = try newVreg(w, .full);
+            const subnormal = try newVreg(w, .full);
+            const sign = try newVreg(w, .full);
+            const replacement = try newVreg(w, .full);
+            const adjusted = try newVreg(w, .full);
+            try alu2(w, .and_b, abs_bits, false, raw, try fit(w, Opnd.imm(0x7fffffff), .c2, false, l.loop));
+            try alu2(w, .sub_u, range, false, Opnd.reg(abs_bits, false), Opnd.imm(1));
+            try cmp2(w, .cmps_u, .lt, subnormal, Opnd.reg(range, false), try fit(w, Opnd.imm(0x007fffff), .c2, false, l.loop));
+            try alu2(w, .and_b, sign, false, raw, try fit(w, Opnd.imm(0x80000000), .c2, false, l.loop));
+            try alu2(w, .or_b, replacement, false, Opnd.reg(sign, false), try fit(w, Opnd.imm(0x3f000000), .c2, false, l.loop));
+            try alu3(w, .sel_b32, adjusted, false, Opnd.reg(replacement, false), Opnd.reg(subnormal, false), try fit(w, raw, .c3, false, l.loop));
+            x = Opnd.reg(adjusted, false);
         }
         const rop: ir3.Op = switch (cv.round) {
             .rne => .rndne_f,
@@ -2080,6 +2107,34 @@ fn lowerCvt(l: *Lw) Error!void {
         return;
     }
     return error.BadType;
+}
+
+fn lowerToHalfRz(l: *Lw, raw: Opnd) Error!void {
+    const w = l.w;
+    const normal = try newVreg(w, .half);
+    const normal_bits = try newVreg(w, .full);
+    try cov(w, normal, true, raw, .f32, .f16, .none);
+    try cov(w, normal_bits, false, Opnd.reg(normal, true), .u16, .u32, .none);
+
+    // A half subnormal is an integer multiple of 2^-24. Form its bits
+    // with full-width arithmetic so the hardware cannot flush the result.
+    const magnitude = try newVreg(w, .full);
+    const small = try newVreg(w, .full);
+    const scaled = try newVreg(w, .full);
+    const fraction = try newVreg(w, .full);
+    try alu2(w, .and_b, magnitude, false, raw, try fit(w, Opnd.imm(0x7fffffff), .c2, false, l.loop));
+    try cmp2(w, .cmps_u, .lt, small, Opnd.reg(magnitude, false), try fit(w, Opnd.imm(0x38800000), .c2, false, l.loop));
+    try alu2(w, .mul_f, scaled, false, Opnd.reg(magnitude, false), try fit(w, Opnd.imm(0x4b800000), .c2f, true, l.loop));
+    try cov(w, fraction, false, Opnd.reg(scaled, false), .f32, .u32, .none);
+    const high = try newVreg(w, .full);
+    const sign = try newVreg(w, .full);
+    const small_bits = try newVreg(w, .full);
+    const bits = try newVreg(w, .full);
+    try alu2(w, .shr_b, high, false, raw, Opnd.imm(16));
+    try alu2(w, .and_b, sign, false, Opnd.reg(high, false), try fit(w, Opnd.imm(0x8000), .c2, false, l.loop));
+    try alu2(w, .or_b, small_bits, false, Opnd.reg(sign, false), Opnd.reg(fraction, false));
+    try alu3(w, .sel_b32, bits, false, Opnd.reg(small_bits, false), Opnd.reg(small, false), Opnd.reg(normal_bits, false));
+    try cov(w, l.dst(), true, Opnd.reg(bits, false), .u32, .u16, .none);
 }
 
 fn lowerLane(l: *Lw) Error!void {
@@ -2192,7 +2247,13 @@ fn lowerLoad(l: *Lw) Error!void {
             mi.in.dst.half = true;
             mi.dst = t;
             try put(w, mi);
-            try cov(w, d, false, Opnd.reg(t, true), if (m.signed) .u8_32 else .u16, if (m.signed) .s32 else .u32, .none);
+            if (!m.signed) return cov(w, d, false, Opnd.reg(t, true), .u16, .u32, .none);
+            // Sign-extend the loaded byte without a cat1 packed-byte view.
+            const bits = try newVreg(w, .full);
+            const biased = try newVreg(w, .full);
+            try cov(w, bits, false, Opnd.reg(t, true), .u16, .u32, .none);
+            try alu2(w, .xor_b, biased, false, Opnd.reg(bits, false), Opnd.imm(0x80));
+            try alu2(w, .sub_u, d, false, Opnd.reg(biased, false), Opnd.imm(0x80));
         },
         else => return error.BadOperand,
     }
@@ -2354,7 +2415,15 @@ fn lowerShfl(l: *Lw) Error!void {
     if (mode != .idx) {
         const direct = argImm(in.b) != null or argUniform(w, in.b);
         if (direct) {
-            var m = MI{ .dst = d, .early = true };
+            const shuffle_value = try l.arg(in.a, .c6, false, h);
+            if (argImm(in.b)) |delta| {
+                if (mode != .xor and (delta == 0 or delta >= w.threadsize)) {
+                    return mov(w, d, h, shuffle_value, ty);
+                }
+            }
+            const directional = mode == .up or mode == .down;
+            const shuffled = if (directional) try newVreg(w, if (h) .half else .full) else d;
+            var m = MI{ .dst = shuffled, .early = true };
             m.in.op = .shfl;
             m.in.shfl = switch (mode) {
                 .xor => .xor,
@@ -2364,7 +2433,7 @@ fn lowerShfl(l: *Lw) Error!void {
             };
             m.in.ty = ty;
             m.in.dst.half = h;
-            setSrc(&m, 0, try l.arg(in.a, .c6, false, h));
+            setSrc(&m, 0, shuffle_value);
             m.in.src[0].half = h;
             // KIR's xor mask is taken modulo the subgroup
             var b = try l.arg(in.b, .c6imm, false, false);
@@ -2382,6 +2451,28 @@ fn lowerShfl(l: *Lw) Error!void {
             }
             setSrc(&m, 1, b);
             try put(w, m);
+            if (directional) {
+                const lane = try newVreg(w, .full);
+                const valid = try newVreg(w, .full);
+                try alu2(w, .and_b, lane, false, try linearTid(w), Opnd.imm(w.threadsize - 1));
+                const lane_value = Opnd.reg(lane, false);
+                if (mode == .up) {
+                    try cmp2(w, .cmps_u, .ge, valid, lane_value, b);
+                } else if (argImm(in.b)) |delta| {
+                    try cmp2(w, .cmps_u, .lt, valid, lane_value, Opnd.imm(w.threadsize - delta));
+                } else {
+                    const room = try newVreg(w, .full);
+                    try alu2(w, .sub_u, room, false, Opnd.imm(w.threadsize), lane_value);
+                    try cmp2(w, .cmps_u, .lt, valid, b, Opnd.reg(room, false));
+                }
+                if (h) {
+                    const half_valid = try newVreg(w, .half);
+                    try cov(w, half_valid, true, Opnd.reg(valid, false), .u32, .u16, .none);
+                    try alu3(w, .sel_b16, d, true, Opnd.reg(shuffled, true), Opnd.reg(half_valid, true), shuffle_value);
+                } else {
+                    try alu3(w, .sel_b32, d, false, Opnd.reg(shuffled, false), Opnd.reg(valid, false), shuffle_value);
+                }
+            }
             return;
         }
     }
@@ -2580,9 +2671,13 @@ fn lowerControl(l: *Lw) Error!void {
             // A brk right before endloop: one branch back while the
             // condition is false (a do-while), not a branch out and a jump.
             const last = &w.mi[w.n_mi - 1];
-            if (!c.used_latch and last.kind == .branch and last.in.op == .br and last.label == c.l3 and w.n_mi - 1 > c.head_mi) {
-                last.label = c.l1;
-                last.in.inv1 = !last.in.inv1;
+            if (!c.used_latch and last.kind == .branch and last.label == c.l3 and w.n_mi - 1 > c.head_mi) {
+                if (last.in.op == .jump) {
+                    w.loops[c.loop_index].single_pass = true;
+                } else {
+                    last.label = c.l1;
+                    last.in.inv1 = !last.in.inv1;
+                }
             } else try putBranch(w, .jump, false, c.l1);
             w.loops[c.loop_index].end = w.n_mi - 1;
             addRegion(w, c.head_mi, w.n_mi);
@@ -2958,6 +3053,7 @@ fn allocate(w: *Work) Error!void {
     while (changed and rounds < 16) : (rounds += 1) {
         changed = false;
         for (w.loops[0..w.n_loops]) |lp| {
+            if (lp.single_pass) continue;
             const h = 2 * lp.head;
             const e = 2 * lp.end + 1;
             for (0..w.nv) |vv| {
@@ -2989,6 +3085,7 @@ fn allocate(w: *Work) Error!void {
         while (grew) {
             grew = false;
             for (w.loops[0..w.n_loops]) |lp| {
+                if (lp.single_pass) continue;
                 const e = 2 * lp.end + 1;
                 if (tid_last[a] >= 2 * lp.head and tid_last[a] < e) {
                     tid_last[a] = e;

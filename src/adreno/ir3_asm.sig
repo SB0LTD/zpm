@@ -1,4 +1,5 @@
-//! @zpm/adreno ir3_asm — compute kernels from ir3 assembly text.
+//! @zpm/adreno ir3_asm — compute kernels, and vertex and fragment programs,
+//! from ir3 assembly text.
 //!
 //! A kernel is written in Mesa's disassembly syntax (see ir3.sig), with
 //! labels and a few headers, and comes out as instruction words plus what
@@ -12,6 +13,8 @@
 //!   @shared 4096               bytes of workgroup (local) memory
 //!   @branchstack 4             divergent control flow depth
 //!   @threadsize 128            fibers per wave (64 or 128)
+//!   @out r0.x, 4               a vertex or fragment program's output: 4
+//!                              registers from r0.x, read when it ends
 //!   loop:                      a label; branches name it: br p0.x, #loop
 //!
 //! What the hardware does not interlock is done here, as Mesa's
@@ -20,7 +23,9 @@
 //! SFU results and local loads, (sy) after global loads, the same for
 //! write-after-read hazards on registers a load or store still reads, and
 //! (jp) on branch targets. Control flow is followed through branches, loops
-//! included, until the hazard state settles.
+//! included, until the hazard state settles. A texture sample's result is
+//! read through (sy), as a global load's; `end` reads the outputs (@out),
+//! so a program whose last result is a sample ends with (sy)end.
 //!
 //! Allocation-free: the caller owns the working storage (Work) and the
 //! output words.
@@ -32,7 +37,7 @@ pub const Instr = ir3.Instr;
 pub const Src = ir3.Src;
 
 pub const MAX_INSTRS = 16384;
-pub const MAX_LABELS = 512;
+pub const MAX_LABELS = 1024;
 /// The register id meaning "not delivered" (Mesa's INVALID_REG, r63.x).
 pub const INVALID_REG: u8 = 0xfc;
 
@@ -76,7 +81,14 @@ pub const Kernel = struct {
     branchstack: u8 = 0,
     shared_bytes: u32 = 0,
     threadsize: u8 = 64,
+    /// A vertex or fragment program's outputs (@out): `end` reads them.
+    outs: [MAX_OUTS]Out = [_]Out{.{}} ** MAX_OUTS,
+    n_outs: u8 = 0,
 };
+
+pub const MAX_OUTS = 4;
+/// `count` registers from `reg` (a register id: number * 4 + component).
+pub const Out = struct { reg: u8 = 0, count: u8 = 0 };
 
 const Item = struct {
     in: Instr,
@@ -306,6 +318,12 @@ fn access(in: *const Instr) Access {
             };
             for (0..n) |k| if (srcRange(in.src[k], @intCast(rpt))) |r| a.s(r, @intCast(k));
         },
+        5 => {
+            // (a 2D sample: the coordinates' two registers; the components
+            // written, up to the mask's last)
+            a.d(.{ .num = in.dst.num, .count = 4 - @as(u16, @clz(in.wrmask)), .half = in.dst.half });
+            a.s(.{ .num = in.src[0].num, .count = 2, .half = in.src[0].half }, 0);
+        },
         6 => switch (in.op) {
             .ldg, .ldl, .ldp, .ldlw => {
                 a.d(.{ .num = in.dst.num, .count = @intCast(@max(in.size, 1)), .half = in.dst.half });
@@ -470,6 +488,13 @@ fn parseHeader(w: *Work, line: []const u8) Error!void {
     } else if (std.mem.eql(u8, name, "threadsize")) {
         k.threadsize = std.fmt.parseInt(u8, it.next() orelse return error.BadHeader, 10) catch return error.BadHeader;
         if (k.threadsize != 64 and k.threadsize != 128) return error.BadHeader;
+    } else if (std.mem.eql(u8, name, "out")) {
+        if (k.n_outs >= MAX_OUTS) return error.BadHeader;
+        const reg = try parseRegId(it.next() orelse return error.BadHeader);
+        const count = std.fmt.parseInt(u8, it.next() orelse return error.BadHeader, 10) catch return error.BadHeader;
+        if (count == 0 or count > 16) return error.BadHeader;
+        k.outs[k.n_outs] = .{ .reg = reg, .count = count };
+        k.n_outs += 1;
     } else return error.BadHeader;
 }
 
@@ -677,7 +702,9 @@ fn emitNops(e: *Emit, st: *State, count: u32, ss: bool, sy: bool) Error!void {
 /// One instruction through the state: sync flags, delays, then its effect.
 fn step(e: *Emit, st: *State, item: Item) Error!void {
     var in = item.in;
-    const acc = access(&in);
+    var acc = access(&in);
+    // (the outputs leave at `end`: it reads them)
+    if (in.op == .end) for (e.w.header.outs[0..e.w.header.n_outs]) |o| acc.s(.{ .num = o.reg, .count = o.count, .half = false }, 0);
     const flags = requiredFlags(st, &in, &acc);
     // cat5/cat6 have no (ss) bit: a (ss)nop goes first.
     if (flags.ss and !supportsSs(&in)) {
@@ -687,7 +714,8 @@ fn step(e: *Emit, st: *State, item: Item) Error!void {
     if (in.ss) st.applySs();
     if (in.sy) st.applySy();
     // Delay slots (sync flags do not cover ALU latency).
-    const need = delayNeeded(e, st, &in, &acc);
+    // (outputs need no delay, as far as Mesa knows: ir3_delayslots)
+    const need = if (in.op == .end) 0 else delayNeeded(e, st, &in, &acc);
     if (need > 0) try emitNops(e, st, need, false, false);
     try e.put(.{ .in = in, .target = item.target, .line = item.line });
     e.prev_in_block = true;
@@ -717,7 +745,7 @@ fn step(e: *Emit, st: *State, item: Item) Error!void {
                     st.rem_non[u] = 0;
                 }
                 if (isSfu(&in) or isLocalLoad(in.op) or isLocalAtomic(in.op) or in.op == .shfl) st.needs_ss.set(u);
-                if (isGlobalLoad(in.op) or isGlobalAtomic(in.op)) st.needs_sy.set(u);
+                if (isGlobalLoad(in.op) or isGlobalAtomic(in.op) or in.op.category() == 5) st.needs_sy.set(u);
                 // A vector write of a shared register is read through (ss).
                 if (alu and !r.half and r.num >= ir3.SHARED_BASE and r.num < ir3.A0_X) st.needs_ss.set(u);
             }
@@ -973,6 +1001,30 @@ test "a store, a fence and a barrier let no ALU slots pass: an address made befo
         \\(sy)(ss)bar
         \\(ss)(rpt4)nop
         \\(sy)ldl.u32 r2.y, l[r1.x], 1
+        \\end
+    );
+}
+
+test "a fragment program: the sample's result leaves through (sy)end, or is read through (sy)" {
+    try expectListing(
+        \\@out r0.x, 4
+        \\(rpt1)bary.f (ei)r0.z, (r)0, r0.x
+        \\sam (f32)(xyzw)r0.x, r0.z, s#0, t#0
+        \\end
+    ,
+        \\(rpt1)bary.f (ei)r0.z, (r)0, r0.x
+        \\(rpt4)nop
+        \\sam (f32)(xyzw)r0.x, r0.z, s#0, t#0
+        \\(sy)end
+    );
+    try expectListing(
+        \\@out r1.x, 4
+        \\sam (f32)(xyzw)r0.x, r0.z, s#0, t#0
+        \\(rpt3)mul.f r1.x, (r)r0.x, (r)c0.x
+        \\end
+    ,
+        \\sam (f32)(xyzw)r0.x, r0.z, s#0, t#0
+        \\(sy)(rpt3)mul.f r1.x, (r)r0.x, (r)c0.x
         \\end
     );
 }

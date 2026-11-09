@@ -61,6 +61,7 @@ const Name = struct { at: u16 = 0, len: u16 = 0 };
 const Kind = enum(u8) { free, shader, program };
 
 const Obj = struct {
+    label: gles.debug_output.Label = .{},
     kind: Kind = .free,
     owner: ?*Objects = null,
     /// glDelete* said so: it goes when nothing holds it (a shader: its
@@ -98,8 +99,11 @@ pub const Varying = struct { name: Name, ty: Type, flat: bool, word: u32 };
 pub const Slot = struct {
     word: u32,
     external: bool,
+    array: bool = false,
+    volume: bool = false,
+    cube: bool = false,
+    shadow: bool = false,
     kind: texture.Kind,
-    /// a cube, 3D, array or shadow sampler: reads 0 (not yet)
     unsupported: bool = false,
 };
 pub const Output = struct { name: Name, ty: Type, loc: u32 };
@@ -327,6 +331,12 @@ fn objOf(c: *Context, name: u32) ?*Obj {
     const o = &objs[name - 1];
     if (o.kind == .free or o.owner != c.objs) return null;
     return o;
+}
+
+pub fn objectLabel(c: *Context, name: u32, shader: bool) ?*gles.debug_output.Label {
+    const o = objOf(c, name) orelse return null;
+    if (o.kind != (if (shader) Kind.shader else Kind.program)) return null;
+    return &o.label;
 }
 
 /// A shader by name: INVALID_VALUE for no name, INVALID_OPERATION for a program's.
@@ -902,14 +912,18 @@ fn linkSlots(l: *Linked, log: *glsl.pp.Log) bool {
             .usampler2D, .usampler3D, .usamplerCube, .usampler2DArray => .uint,
             else => .float,
         };
-        const supported = t.base == .sampler2D or t.base == .isampler2D or t.base == .usampler2D or t.base == .samplerExternalOES;
+        const shadow = t.base == .sampler2DShadow or t.base == .sampler2DArrayShadow or t.base == .samplerCubeShadow;
+        const array = t.base == .sampler2DArray or t.base == .isampler2DArray or t.base == .usampler2DArray or t.base == .sampler2DArrayShadow;
+        const volume = t.base == .sampler3D or t.base == .isampler3D or t.base == .usampler3D;
+        const cube = t.base == .samplerCube or t.base == .isamplerCube or t.base == .usamplerCube or t.base == .samplerCubeShadow;
+        const supported = shadow or array or volume or cube or t.base == .sampler2D or t.base == .isampler2D or t.base == .usampler2D or t.base == .samplerExternalOES;
         const n: u32 = if (un.ty.array != 0) un.ty.array else 1;
         for (0..n) |e| {
             if (l.nslots == texture.MAX_TEX) {
                 log.err(0, "too many samplers ({d} at most)", .{texture.MAX_TEX});
                 return false;
             }
-            l.slots[l.nslots] = .{ .word = un.word + @as(u32, @intCast(e)), .external = t.base == .samplerExternalOES, .kind = kind, .unsupported = !supported };
+            l.slots[l.nslots] = .{ .word = un.word + @as(u32, @intCast(e)), .external = t.base == .samplerExternalOES, .array = array, .volume = volume, .cube = cube, .shadow = shadow, .kind = kind, .unsupported = !supported };
             l.nslots += 1;
         }
     }

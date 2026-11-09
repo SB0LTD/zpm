@@ -67,6 +67,7 @@ const CHECK_BYTES: usize = 64 << 20;
 var opened = false;
 var refused = false;
 var wl_client: ?wayland.Client = null;
+var driver_slabs: [16]engine.Slab = undefined;
 
 fn openDriver() ?*engine.Engine {
     if (opened) return if (the_engine.lost) null else &the_engine;
@@ -83,6 +84,7 @@ fn openDriver() ?*engine.Engine {
         .compiler = G.compile,
         .work = &compile_work,
         .pool = anonymous(POOL_BYTES),
+        .slabs = &driver_slabs,
         .cpu_work = &cpu_work,
         .check = if (check_px) |px| .{ .mem = anonymous(CHECK_BYTES), .max_px = px } else .{},
     });
@@ -214,11 +216,20 @@ fn waylandClient() ?*const wayland.Client {
     return if (wl_client) |*c| c else null;
 }
 
+fn nativeInterop() bool {
+    return the_gpu.node.kind == .adreno;
+}
+fn dmaImport() bool {
+    return the_gpu.node.dma_import;
+}
+
 /// What egl.sig takes as its driver (a test build sets its own).
 pub const egl_driver: ?egl.Driver = if (on_linux) .{
     .open = openDriver,
     .host = .{ .exportFd = exportFd, .importFd = importFd, .fenceFd = fenceFd, .close = closeFd, .dup = dupFd, .poll = pollFd, .map = mapFd, .unmap = unmapFd },
     .wayland = waylandClient,
+    .native_interop = nativeInterop,
+    .dma_import = dmaImport,
 } else null;
 
 // ── EGL's entry points ─────────────────────────────────────────────────────
@@ -314,6 +325,15 @@ pub export fn eglQuerySurface(dpy: ?*anyopaque, surface: ?*anyopaque, attribute:
     egl.calling("eglQuerySurface");
     return b(egl.querySurface(dpy, surface, attribute, value));
 }
+pub export fn eglQuerySurfacePointerANGLE(dpy: ?*anyopaque, surface: ?*anyopaque, attribute: i32, value: ?*?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglQuerySurfacePointerANGLE");
+    return b(egl.querySurfacePointer(dpy, surface, attribute, value));
+}
+
+pub export fn eglGetNativeClientBufferANDROID(buffer: ?*const anyopaque) callconv(.c) ?*anyopaque {
+    egl.calling("eglGetNativeClientBufferANDROID");
+    return egl.androidClientBuffer(buffer);
+}
 pub export fn eglSurfaceAttrib(dpy: ?*anyopaque, surface: ?*anyopaque, attribute: i32, value: i32) callconv(.c) u32 {
     egl.calling("eglSurfaceAttrib");
     return b(egl.surfaceAttrib(dpy, surface, attribute, value));
@@ -391,6 +411,11 @@ pub export fn eglSwapBuffers(dpy: ?*anyopaque, surface: ?*anyopaque) callconv(.c
     egl.calling("eglSwapBuffers");
     return b(egl.swapBuffers(dpy, surface, &.{}));
 }
+pub export fn eglSetDamageRegionKHR(dpy: ?*anyopaque, surface: ?*anyopaque, rects: ?[*]const i32, n: i32) callconv(.c) u32 {
+    egl.calling("eglSetDamageRegionKHR");
+    return b(egl.setDamageRegion(dpy, surface, rects, n));
+}
+
 pub export fn eglSwapBuffersWithDamageKHR(dpy: ?*anyopaque, surface: ?*anyopaque, rects: ?[*]const i32, n: i32) callconv(.c) u32 {
     egl.calling("eglSwapBuffersWithDamageKHR");
     if (n < 0) {
@@ -470,6 +495,16 @@ pub export fn eglDestroyImageKHR(dpy: ?*anyopaque, image: ?*anyopaque) callconv(
     egl.calling("eglDestroyImageKHR");
     return b(egl.destroyImage(dpy, image));
 }
+pub export fn eglExportDMABUFImageQueryMESA(dpy: ?*anyopaque, image: ?*anyopaque, fourcc: ?*i32, planes: ?*i32, modifiers: ?*u64) callconv(.c) u32 {
+    egl.calling("eglExportDMABUFImageQueryMESA");
+    return b(egl.exportDmaBufQuery(dpy, image, fourcc, planes, modifiers));
+}
+
+pub export fn eglExportDMABUFImageMESA(dpy: ?*anyopaque, image: ?*anyopaque, fds: ?*i32, strides: ?*i32, offsets: ?*i32) callconv(.c) u32 {
+    egl.calling("eglExportDMABUFImageMESA");
+    return b(egl.exportDmaBuf(dpy, image, fds, strides, offsets));
+}
+
 pub export fn eglQueryDmaBufFormatsEXT(dpy: ?*anyopaque, max: i32, formats: ?[*]i32, num: ?*i32) callconv(.c) u32 {
     egl.calling("eglQueryDmaBufFormatsEXT");
     return b(egl.queryDmaBufFormats(dpy, max, formats, num));
@@ -502,15 +537,51 @@ pub export fn eglQueryDisplayAttribKHR(dpy: ?*anyopaque, attribute: i32, value: 
     egl.calling("eglQueryDisplayAttribKHR");
     return b(egl.queryDisplayAttrib(dpy, attribute, value));
 }
+pub export fn eglCreateStreamKHR(dpy: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreateStreamKHR");
+    return h(egl.createStream(dpy, attribs));
+}
+pub export fn eglDestroyStreamKHR(dpy: ?*anyopaque, stream: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglDestroyStreamKHR");
+    return b(egl.destroyStream(dpy, stream));
+}
+pub export fn eglStreamAttribKHR(dpy: ?*anyopaque, stream: ?*anyopaque, attribute: i32, value: i32) callconv(.c) u32 {
+    egl.calling("eglStreamAttribKHR");
+    return b(egl.setStreamAttrib(dpy, stream, attribute, value));
+}
+pub export fn eglQueryStreamKHR(dpy: ?*anyopaque, stream: ?*anyopaque, attribute: i32, value: ?*i32) callconv(.c) u32 {
+    egl.calling("eglQueryStreamKHR");
+    return b(egl.queryStream(dpy, stream, attribute, value));
+}
+pub export fn eglQueryStreamu64KHR(dpy: ?*anyopaque, stream: ?*anyopaque, attribute: u32, value: ?*u64) callconv(.c) u32 {
+    egl.calling("eglQueryStreamu64KHR");
+    return b(egl.queryStreamU64(dpy, stream, attribute, value));
+}
+pub export fn eglCreateStreamProducerSurfaceKHR(dpy: ?*anyopaque, config: ?*const anyopaque, stream: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
+    egl.calling("eglCreateStreamProducerSurfaceKHR");
+    return h(egl.createStreamProducerSurface(dpy, config, stream, attribs));
+}
+pub export fn eglStreamConsumerGLTextureExternalKHR(dpy: ?*anyopaque, stream: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglStreamConsumerGLTextureExternalKHR");
+    return b(egl.connectStreamTexture(dpy, stream));
+}
+pub export fn eglStreamConsumerAcquireKHR(dpy: ?*anyopaque, stream: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglStreamConsumerAcquireKHR");
+    return b(egl.consumeStream(dpy, stream, true));
+}
+pub export fn eglStreamConsumerReleaseKHR(dpy: ?*anyopaque, stream: ?*anyopaque) callconv(.c) u32 {
+    egl.calling("eglStreamConsumerReleaseKHR");
+    return b(egl.consumeStream(dpy, stream, false));
+}
 pub export fn eglGetProcAddress(name: ?[*:0]const u8) callconv(.c) ?*const anyopaque {
     const n = name orelse return null;
     const s = std.mem.span(n);
     for (entries) |e| {
         if (std.mem.eql(u8, s, e.name)) return e.ptr;
     }
-    const p = libgles.getProcAddress(n);
-    if (p == null) report.say(.missing, "eglGetProcAddress(\"{s}\"): not in this driver", .{s});
-    return p;
+    // Clients probe optional entry points before choosing a rendering
+    // path. A null result is the EGL capability response.
+    return libgles.getProcAddress(n);
 }
 /// GLX's (libGL.so.1): EGL's answer. There is no GLX context to call them
 /// in (abi.sig), but a program may look its functions up all the same.
@@ -540,6 +611,29 @@ const entries = blk: {
 };
 
 // ── Tests (EGL through its C entry points, on the CPU's engine) ───────────
+
+var lookup_test_messages: usize = 0;
+
+fn countLookupTestMessage(_: []const u8) void {
+    lookup_test_messages += 1;
+}
+
+test "libgalaxy_gl: optional Firefox lookups are silent and EGL call errors still report" {
+    const sink = report.sink;
+    report.sink = &countLookupTestMessage;
+    defer report.sink = sink;
+    lookup_test_messages = 0;
+
+    try std.testing.expect(eglGetProcAddress("eglUnknownOptionalEntryPoint") == null);
+    try std.testing.expect(eglGetProcAddress("eglSwapBuffersWithDamageKHR") != null);
+    try std.testing.expect(eglGetProcAddress("glGetIntegerv") != null);
+    try std.testing.expectEqual(@as(usize, 0), lookup_test_messages);
+    try std.testing.expectEqual(egl.SUCCESS, eglGetError());
+
+    try std.testing.expectEqual(egl.FALSE, eglBindAPI(0));
+    try std.testing.expectEqual(egl.BAD_PARAMETER, eglGetError());
+    try std.testing.expectEqual(@as(usize, 1), lookup_test_messages);
+}
 
 var t_pool: [1 << 20]u8 align(64) = undefined;
 var t_eng: engine.Engine = undefined;
@@ -585,6 +679,238 @@ fn noWayland() ?*const wayland.Client {
     return null;
 }
 
+var test_android_object: u8 = 0;
+var test_android_refs: usize = 0;
+var test_android_fd: i32 = 72;
+var test_android_pixels = [_]u8{ 1, 2, 3, 255 } ** 4;
+
+fn testAndroidClient(buffer: *const anyopaque) ?*anyopaque {
+    return if (buffer == @as(*const anyopaque, &test_android_object)) &test_android_object else null;
+}
+
+fn testAndroidRetain(client: *anyopaque) ?egl.AndroidBuffer {
+    _ = testAndroidClient(client) orelse return null;
+    test_android_refs += 1;
+    return .{ .fd = test_android_fd, .width = 2, .height = 2, .fourcc = egl.DRM_FORMAT_ABGR8888, .pitch = 8 };
+}
+
+fn testAndroidRelease(client: *anyopaque) void {
+    std.debug.assert(client == @as(*anyopaque, &test_android_object));
+    test_android_refs -= 1;
+}
+
+fn testAndroidImport(_: ?*anyopaque, fd: i32) ?gpu.Buffer {
+    if (fd != 72) return null;
+    return .{ .cpu = &test_android_pixels, .bytes = test_android_pixels.len, .kind = .external };
+}
+
+fn testAnglePointer(surface: *const egl.Surface, attribute: i32) ?egl.SurfacePointer {
+    if (attribute != 0x3200) return null;
+    return .{ .value = if (surface.width == 2) @ptrFromInt(0x1234_5678_9ABC) else null };
+}
+
+test "libgalaxy_gl: native Android imports retain their client buffer and ANGLE returns full-width pointers" {
+    t_eng.init(.{ .pool = &t_pool });
+    var host = test_host;
+    host.importFd = testAndroidImport;
+    egl.setDriver(.{
+        .open = testOpen,
+        .host = host,
+        .wayland = noWayland,
+        .android = .{ .clientBuffer = testAndroidClient, .retain = testAndroidRetain, .release = testAndroidRelease },
+        .surface_pointer = testAnglePointer,
+    });
+    const d = eglGetDisplay(null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(d, null, null));
+    defer _ = eglTerminate(d);
+    const ext = std.mem.span(eglQueryString(d, egl.EXTENSIONS).?);
+    try std.testing.expect(std.mem.indexOf(u8, ext, "EGL_ANDROID_get_native_client_buffer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ext, "EGL_ANGLE_query_surface_pointer") != null);
+
+    const client = eglGetNativeClientBufferANDROID(&test_android_object).?;
+    try std.testing.expectEqual(@as(usize, 0), test_android_refs);
+    const image = eglCreateImageKHR(d, null, 0x3140, client, null).?;
+    try std.testing.expectEqual(@as(usize, 1), test_android_refs);
+    const internal: *egl.EImage = @ptrCast(@alignCast(image));
+    try std.testing.expectEqualSlices(u8, &test_android_pixels, t_eng.hostView(&internal.img, 0, test_android_pixels.len));
+    try std.testing.expectEqual(egl.TRUE, eglDestroyImageKHR(d, image));
+    try std.testing.expectEqual(@as(usize, 0), test_android_refs);
+    test_android_fd = 73;
+    try std.testing.expect(eglCreateImageKHR(d, null, 0x3140, client, null) == null);
+    test_android_fd = 72;
+    try std.testing.expectEqual(egl.BAD_PARAMETER, eglGetError());
+    try std.testing.expectEqual(@as(usize, 0), test_android_refs);
+    try std.testing.expect(eglGetNativeClientBufferANDROID(null) == null);
+    try std.testing.expectEqual(egl.BAD_PARAMETER, eglGetError());
+
+    const surface = eglCreatePbufferSurface(d, &egl.configs[1], &.{ egl.WIDTH, 2, egl.HEIGHT, 2, egl.NONE }).?;
+    var pointer: ?*anyopaque = null;
+    try std.testing.expectEqual(egl.TRUE, eglQuerySurfacePointerANGLE(d, surface, 0x3200, &pointer));
+    try std.testing.expectEqual(@as(usize, 0x1234_5678_9ABC), @intFromPtr(pointer.?));
+    var scalar: i32 = 0;
+    try std.testing.expectEqual(egl.FALSE, eglQuerySurface(d, surface, 0x3200, &scalar));
+    try std.testing.expectEqual(egl.BAD_PARAMETER, eglGetError());
+    try std.testing.expectEqual(egl.FALSE, eglQuerySurfacePointerANGLE(d, surface, egl.WIDTH, &pointer));
+    try std.testing.expectEqual(egl.BAD_PARAMETER, eglGetError());
+    try std.testing.expectEqual(egl.TRUE, eglDestroySurface(d, surface));
+    try std.testing.expectEqual(egl.FALSE, eglQuerySurfacePointerANGLE(d, surface, 0x3200, &pointer));
+    try std.testing.expectEqual(egl.BAD_SURFACE, eglGetError());
+}
+
+test "libgalaxy_gl: native Android buffers outlive EGLImage handles until the last GL sibling" {
+    const g = gfxapi.glenum;
+    t_eng.init(.{ .pool = &t_pool });
+    var host = test_host;
+    host.importFd = testAndroidImport;
+    egl.setDriver(.{
+        .open = testOpen,
+        .host = host,
+        .wayland = noWayland,
+        .android = .{ .clientBuffer = testAndroidClient, .retain = testAndroidRetain, .release = testAndroidRelease },
+    });
+    const d = eglGetDisplay(null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(d, null, null));
+    defer _ = eglTerminate(d);
+    const ctx = eglCreateContext(d, &egl.configs[1], null, &.{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE }).?;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(d, null, null, ctx));
+    defer _ = eglMakeCurrent(d, null, null, null);
+    const client = eglGetNativeClientBufferANDROID(&test_android_object).?;
+    const image = eglCreateImageKHR(d, null, 0x3140, client, null).?;
+    var name: [1]u32 = undefined;
+    libgles.glGenTextures(1, &name);
+    libgles.glBindTexture(g.TEXTURE_EXTERNAL_OES, name[0]);
+    libgles.glEGLImageTargetTexture2DOES(g.TEXTURE_EXTERNAL_OES, image);
+    try std.testing.expectEqual(g.NO_ERROR, libgles.glGetError());
+    try std.testing.expectEqual(egl.TRUE, eglDestroyImageKHR(d, image));
+    try std.testing.expectEqual(@as(usize, 1), test_android_refs);
+    const sibling = thread.gl().?.streamTexture().?;
+    try std.testing.expectEqualSlices(u8, &test_android_pixels, t_eng.hostView(&sibling.img, 0, test_android_pixels.len));
+    const other = eglCreateImageKHR(d, null, 0x3140, client, null).?;
+    try std.testing.expect(other != image);
+    try std.testing.expectEqual(@as(usize, 2), test_android_refs);
+    try std.testing.expectEqual(egl.TRUE, eglDestroyImageKHR(d, other));
+    try std.testing.expectEqual(@as(usize, 1), test_android_refs);
+    libgles.glDeleteTextures(1, &name);
+    try std.testing.expectEqual(@as(usize, 0), test_android_refs);
+}
+
+test "libgalaxy_gl: EGLStream attributes, counters and lifetime through the C API" {
+    t_eng.init(.{ .pool = &t_pool });
+    egl.setDriver(.{ .open = testOpen, .host = test_host, .wayland = noWayland });
+    const d = eglGetDisplay(null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(d, null, null));
+    defer _ = eglTerminate(d);
+    const extensions = std.mem.span(eglQueryString(d, egl.EXTENSIONS).?);
+    try std.testing.expect(std.mem.indexOf(u8, extensions, "EGL_KHR_stream ") != null);
+    try std.testing.expect(eglGetProcAddress("eglCreateStreamKHR") != null);
+    try std.testing.expect(eglGetProcAddress("eglQueryStreamu64KHR") != null);
+    try std.testing.expect(eglCreateStreamKHR(d, &.{ 0x3214, 0, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_ACCESS, eglGetError());
+
+    const s = eglCreateStreamKHR(d, &.{ 0x3210, 25, egl.NONE }).?;
+    var value: i32 = -1;
+    try std.testing.expectEqual(egl.TRUE, eglQueryStreamKHR(d, s, 0x3214, &value));
+    try std.testing.expectEqual(@as(i32, 0x3215), value);
+    try std.testing.expectEqual(egl.TRUE, eglQueryStreamKHR(d, s, 0x3210, &value));
+    try std.testing.expectEqual(@as(i32, 25), value);
+    try std.testing.expectEqual(egl.TRUE, eglStreamAttribKHR(d, s, 0x3210, 50));
+    try std.testing.expectEqual(egl.TRUE, eglQueryStreamKHR(d, s, 0x3210, &value));
+    try std.testing.expectEqual(@as(i32, 50), value);
+    var frame: u64 = 99;
+    try std.testing.expectEqual(egl.TRUE, eglQueryStreamu64KHR(d, s, 0x3212, &frame));
+    try std.testing.expectEqual(@as(u64, 0), frame);
+    try std.testing.expectEqual(egl.TRUE, eglDestroyStreamKHR(d, s));
+    try std.testing.expectEqual(egl.FALSE, eglQueryStreamKHR(d, s, 0x3214, &value));
+    try std.testing.expectEqual(@as(i32, 0x321B), eglGetError());
+
+    var live: [32]?*anyopaque = undefined;
+    for (&live) |*entry| entry.* = eglCreateStreamKHR(d, null) orelse return error.StreamAllocationFailed;
+    try std.testing.expect(eglCreateStreamKHR(d, null) == null);
+    try std.testing.expectEqual(egl.BAD_ALLOC, eglGetError());
+    try std.testing.expectEqual(egl.TRUE, eglDestroyStreamKHR(d, live[0]));
+    const retired = eglCreateStreamKHR(d, null).?;
+    try std.testing.expectEqual(egl.TRUE, eglTerminate(d));
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(d, null, null));
+    try std.testing.expectEqual(egl.FALSE, eglDestroyStreamKHR(d, retired));
+    try std.testing.expectEqual(@as(i32, 0x321B), eglGetError());
+}
+
+test "libgalaxy_gl: an EGLStream producer posts the newest image to an external texture" {
+    const g = gfxapi.glenum;
+    t_eng.init(.{ .pool = &t_pool });
+    egl.setDriver(.{ .open = testOpen, .host = test_host, .wayland = noWayland });
+    const d = eglGetDisplay(null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(d, null, null));
+    defer _ = eglTerminate(d);
+    const cfg = &egl.configs[1];
+    const ctx = eglCreateContext(d, cfg, null, &.{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE }).?;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(d, null, null, ctx));
+    defer _ = eglMakeCurrent(d, null, null, null);
+    var name: [1]u32 = undefined;
+    libgles.glGenTextures(1, &name);
+    libgles.glBindTexture(g.TEXTURE_EXTERNAL_OES, name[0]);
+    const s = eglCreateStreamKHR(d, null).?;
+    try std.testing.expectEqual(egl.TRUE, eglStreamConsumerGLTextureExternalKHR(d, s));
+    const producer = eglCreateStreamProducerSurfaceKHR(d, cfg, s, &.{ egl.WIDTH, 4, egl.HEIGHT, 4, egl.NONE }).?;
+    try std.testing.expectEqual(egl.TRUE, eglStreamAttribKHR(d, s, 0x321E, 1000));
+    try std.testing.expectEqual(egl.FALSE, eglStreamConsumerAcquireKHR(d, s));
+    try std.testing.expectEqual(@as(i32, 0x321C), eglGetError());
+    try std.testing.expectEqual(egl.TRUE, eglStreamAttribKHR(d, s, 0x321E, 0));
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(d, producer, producer, ctx));
+    libgles.glClearColor(1, 0, 0, 1);
+    libgles.glClear(g.COLOR_BUFFER_BIT);
+    try std.testing.expectEqual(egl.TRUE, eglSwapBuffers(d, producer));
+    libgles.glClearColor(0, 1, 0, 1);
+    libgles.glClear(g.COLOR_BUFFER_BIT);
+    try std.testing.expectEqual(egl.TRUE, eglSwapBuffers(d, producer));
+    try std.testing.expectEqual(egl.TRUE, eglStreamConsumerAcquireKHR(d, s));
+    const tex = thread.gl().?.streamTexture().?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, t_eng.hostView(&tex.img, 0, 4));
+    var number: u64 = 0;
+    try std.testing.expectEqual(egl.TRUE, eglQueryStreamu64KHR(d, s, 0x3213, &number));
+    try std.testing.expectEqual(@as(u64, 2), number);
+    try std.testing.expectEqual(egl.TRUE, eglStreamConsumerReleaseKHR(d, s));
+    try std.testing.expect(!tex.img.live());
+    try std.testing.expectEqual(egl.TRUE, eglStreamConsumerAcquireKHR(d, s));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, t_eng.hostView(&tex.img, 0, 4));
+    libgles.glDeleteTextures(1, &name);
+    var state: i32 = 0;
+    try std.testing.expectEqual(egl.TRUE, eglQueryStreamKHR(d, s, 0x3214, &state));
+    try std.testing.expectEqual(@as(i32, 0x321A), state);
+    try std.testing.expectEqual(egl.FALSE, eglSwapBuffers(d, producer));
+    try std.testing.expectEqual(egl.BAD_CURRENT_SURFACE, eglGetError());
+}
+
+test "libgalaxy_gl: failed stream acquisition releases the previously acquired frame" {
+    const g = gfxapi.glenum;
+    t_eng.init(.{ .pool = &t_pool });
+    egl.setDriver(.{ .open = testOpen, .host = test_host, .wayland = noWayland });
+    const d = eglGetDisplay(null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(d, null, null));
+    defer _ = eglTerminate(d);
+    const cfg = &egl.configs[1];
+    const ctx = eglCreateContext(d, cfg, null, &.{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE }).?;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(d, null, null, ctx));
+    defer _ = eglMakeCurrent(d, null, null, null);
+    var name: [1]u32 = undefined;
+    libgles.glGenTextures(1, &name);
+    libgles.glBindTexture(g.TEXTURE_EXTERNAL_OES, name[0]);
+    const stream = eglCreateStreamKHR(d, null).?;
+    try std.testing.expectEqual(egl.TRUE, eglStreamConsumerGLTextureExternalKHR(d, stream));
+    const producer = eglCreateStreamProducerSurfaceKHR(d, cfg, stream, &.{ egl.WIDTH, 4, egl.HEIGHT, 4, egl.NONE }).?;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(d, producer, producer, ctx));
+    try std.testing.expectEqual(egl.TRUE, eglSwapBuffers(d, producer));
+    try std.testing.expectEqual(egl.TRUE, eglStreamConsumerAcquireKHR(d, stream));
+    const tex = thread.gl().?.streamTexture().?;
+    try std.testing.expect(tex.img.live());
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(d, null, null, ctx));
+    try std.testing.expectEqual(egl.TRUE, eglDestroySurface(d, producer));
+    try std.testing.expectEqual(egl.FALSE, eglStreamConsumerAcquireKHR(d, stream));
+    try std.testing.expectEqual(@as(i32, 0x321C), eglGetError());
+    try std.testing.expect(!tex.img.live());
+    try std.testing.expectEqual(@as(u16, 0), tex.defined);
+}
+
 test "libgalaxy_gl: EGL and GL through their C entry points (surfaceless, a pbuffer)" {
     t_eng.init(.{ .pool = &t_pool });
     egl.setDriver(.{ .open = testOpen, .host = test_host, .wayland = noWayland });
@@ -602,7 +928,7 @@ test "libgalaxy_gl: EGL and GL through their C entry points (surfaceless, a pbuf
     var id: i32 = 0;
     _ = eglGetConfigAttrib(dpy, cfg[0], egl.CONFIG_ID, &id);
     try std.testing.expectEqual(@as(i32, 2), id); // (no depth: the smaller first)
-    const ctx_attribs = [_]i32{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE };
+    const ctx_attribs = [_]i32{ egl.CONTEXT_CLIENT_VERSION, 3, egl.CONTEXT_OPENGL_DEBUG, 1, egl.NONE };
     const ctx = eglCreateContext(dpy, cfg[0], null, &ctx_attribs);
     try std.testing.expect(ctx != null);
     const pb_attribs = [_]i32{ egl.WIDTH, 8, egl.HEIGHT, 4, egl.NONE };
@@ -610,6 +936,9 @@ test "libgalaxy_gl: EGL and GL through their C entry points (surfaceless, a pbuf
     try std.testing.expect(pb != null);
     try std.testing.expectEqual(@as(u32, 1), eglMakeCurrent(dpy, pb, pb, ctx));
     try std.testing.expectEqual(ctx, eglGetCurrentContext());
+    try std.testing.expectEqual(@as(u8, 1), libgles.glIsEnabled(0x92E0));
+    try std.testing.expectEqual(@as(u32, 0), eglSetDamageRegionKHR(dpy, pb, null, 0));
+    try std.testing.expectEqual(egl.BAD_MATCH, eglGetError());
     const clearColor: *const fn (f32, f32, f32, f32) callconv(.c) void = @ptrCast(eglGetProcAddress("glClearColor").?);
     const clear: *const fn (u32) callconv(.c) void = @ptrCast(eglGetProcAddress("glClear").?);
     clearColor(0, 0, 1, 1);
@@ -652,4 +981,49 @@ test "libgalaxy_gl: GLX looks up what EGL does; Mesa's names are answered" {
     // (desktop GL's glBegin is abi.Missing's, not an entry point to hand out)
     try std.testing.expect(glXGetProcAddressARB("glBegin") == null);
     try std.testing.expect(@hasDecl(libgles, "glClear") and !abi.answers("glClear"));
+}
+
+var dma_export_pixels: [64]u8 = undefined;
+var dma_export_closed: i32 = -1;
+
+fn testDmaImport(_: ?*anyopaque, fd: i32) ?gpu.Buffer {
+    if (fd != 10) return null;
+    return .{ .cpu = &dma_export_pixels, .bytes = dma_export_pixels.len, .kind = .external };
+}
+
+fn testDmaClose(_: ?*anyopaque, fd: i32) void {
+    dma_export_closed = fd;
+}
+
+test "libgalaxy_gl: MESA export preserves the plane and returns an independent fd" {
+    t_eng.init(.{ .pool = &t_pool });
+    var host = test_host;
+    host.importFd = testDmaImport;
+    host.close = testDmaClose;
+    egl.setDriver(.{ .open = testOpen, .host = host, .wayland = noWayland });
+    const dpy = eglGetDisplay(null);
+    try std.testing.expectEqual(@as(u32, 1), eglInitialize(dpy, null, null));
+    defer _ = eglTerminate(dpy);
+    const format: i32 = @bitCast(wayland.DRM_FORMAT_ARGB8888);
+    const attrs = [_]i32{
+        egl.WIDTH,                 2,  egl.HEIGHT,                    2, egl.LINUX_DRM_FOURCC_EXT,     format,
+        egl.DMA_BUF_PLANE0_FD_EXT, 10, egl.DMA_BUF_PLANE0_OFFSET_EXT, 4, egl.DMA_BUF_PLANE0_PITCH_EXT, 16,
+        egl.NONE,
+    };
+    const image = eglCreateImageKHR(dpy, null, egl.LINUX_DMA_BUF_EXT, null, &attrs);
+    try std.testing.expect(image != null);
+    var fourcc: i32 = 0;
+    var planes: i32 = 0;
+    var modifier: u64 = 1;
+    try std.testing.expectEqual(@as(u32, 1), eglExportDMABUFImageQueryMESA(dpy, image, &fourcc, &planes, &modifier));
+    try std.testing.expectEqual([2]i32{ format, 1 }, .{ fourcc, planes });
+    try std.testing.expectEqual(@as(u64, 0), modifier);
+    var fd: i32 = 0;
+    var stride: i32 = 0;
+    var offset: i32 = 0;
+    try std.testing.expectEqual(@as(u32, 1), eglExportDMABUFImageMESA(dpy, image, &fd, &stride, &offset));
+    try std.testing.expectEqual([3]i32{ 12, 16, 4 }, .{ fd, stride, offset });
+    try std.testing.expectEqual(@as(u32, 1), eglDestroyImageKHR(dpy, image));
+    try std.testing.expectEqual(@as(i32, 11), dma_export_closed);
+    try std.testing.expectEqual(@as(u32, 0), eglExportDMABUFImageMESA(dpy, image, null, null, null));
 }

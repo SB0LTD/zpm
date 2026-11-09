@@ -1,4 +1,6 @@
-//! @zpm/adreno ir3_emu — a functional emulator of ir3 compute kernels.
+//! @zpm/adreno ir3_emu — a functional emulator of ir3 compute kernels, and
+//! of vertex and fragment programs (stageBegin, stageRun: the pipeline's
+//! side, the rasterizer and the texture unit, is the caller's: Stage).
 //!
 //! There is no Adreno to test against on a PC, so kernels run here first:
 //! the same instruction words the GPU gets are decoded and executed, fiber
@@ -91,6 +93,26 @@ pub const Dispatch = struct {
     /// Optional: only these workgroup x indices run (for sampling big grids).
     first_group: u32 = 0,
     group_stride: u32 = 1,
+    /// A vertex or fragment program's run: what the pipeline gives it.
+    stage: ?*const Stage = null,
+};
+
+/// Varying components a fragment program may read.
+pub const MAX_VARYINGS = 32;
+
+/// What the pipeline gives a vertex or fragment program's fibers, beside
+/// the registers it delivers (the caller writes those: stageBegin, then
+/// Work.regs).
+pub const Stage = struct {
+    /// The register the fragment's barycentrics arrive in (and the next):
+    /// bary.f must name it, as the hardware reads the one the state names.
+    ij_reg: u16 = ir3_asm.INVALID_REG,
+    /// Per fiber, the varying components at the fragment: bary.f's result
+    /// for component `inloc`.
+    varyings: []const [MAX_VARYINGS]f32 = &.{},
+    ctx: ?*anyopaque = null,
+    /// sam: texture `tex` through sampler `samp` at (x, y), four floats.
+    sample: ?*const fn (ctx: ?*anyopaque, tex: u32, samp: u32, x: f32, y: f32) Error![4]f32 = null,
 };
 
 pub const Stats = struct {
@@ -339,7 +361,20 @@ fn movValue(c: *const Ctx, f: u32, in: *const Instr, i: u32) u32 {
     }
     const x = readTyped(c, f, in, i);
     return switch (dt) {
-        .f32 => @bitCast(@as(f32, @floatCast(x))),
+        .f32 => blk: {
+            const nearest: f32 = @floatCast(x);
+            const bits: u32 = @bitCast(nearest);
+            if (isIntType(st)) {
+                const rounded: f64 = nearest;
+                switch (in.round) {
+                    .none => if (@abs(rounded) > @abs(x)) break :blk bits - 1,
+                    .even => {},
+                    .pos_infinity => if (rounded < x) break :blk if (x < 0) bits - 1 else bits + 1,
+                    .neg_infinity => if (rounded > x) break :blk if (x < 0) bits + 1 else bits - 1,
+                }
+            }
+            break :blk bits;
+        },
         .f16 => blk: {
             // f32 -> f16: (even) rounds to nearest, otherwise toward zero.
             if (in.round == .even) break :blk @as(u16, @bitCast(@as(f16, @floatCast(x))));
@@ -534,9 +569,9 @@ fn execute(c: *Ctx, pc: u32, fibers: []const u32) Error!void {
         2 => try execCat2(c, in, fibers, slot0),
         3 => try execCat3(c, in, fibers, slot0),
         4 => try execCat4(c, in, fibers, slot0),
+        5 => try execCat5(c, in, fibers, slot0),
         6 => try execCat6(c, in, fibers, slot0),
         7 => {},
-        else => return error.Unsupported,
     }
     for (fibers) |f| w.pc[f] = pc + 1;
     // Only the vector ALU and cat0 let ALU latency pass, as Mesa counts
@@ -654,6 +689,13 @@ fn execCat2(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
                 },
                 .cbits_b => res = @popCount(usrc(c, f, s0, i)),
                 .getbit_b => res = (usrc(c, f, s0, i) >> @intCast(usrc(c, f, s1, i) & 31)) & 1,
+                .bary_f => {
+                    const st = c.d.stage orelse return error.Unsupported;
+                    if (s0.kind != .imm or s1.kind != .gpr or s1.half or s1.num != st.ij_reg) return error.BadDispatch;
+                    const loc = s0.imm + (if (s0.r) i else 0);
+                    if (f >= st.varyings.len or loc >= MAX_VARYINGS) return error.BadDispatch;
+                    fres = st.varyings[f][loc];
+                },
                 .mgen_b => {
                     const lo = usrc(c, f, s0, i) & 31;
                     const cnt = usrc(c, f, s1, i);
@@ -753,6 +795,27 @@ fn execCat4(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
             putF(c, f, dst, in.dst.half, v, in.sat);
         }
         noteWrite(c, dst, in.dst.half, .ss, slot0 + i);
+    }
+}
+
+/// sam: a 2D texture sampled at the coordinates in two registers.
+fn execCat5(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!void {
+    const st = c.d.stage orelse return error.Unsupported;
+    const sample = st.sample orelse return error.Unsupported;
+    if (in.op != .sam or (in.ty != .f32 and in.ty != .f16)) return error.Unsupported;
+    const sx = in.src[0];
+    var sy = sx;
+    sy.num += 1;
+    try checkRead(c, sx.num, sx.half, false, slot0);
+    try checkRead(c, sy.num, sy.half, false, slot0);
+    for (fibers) |f| {
+        const v = try sample(st.ctx, in.tex, in.samp, fsrc(c, f, sx, 0), fsrc(c, f, sy, 0));
+        for (0..4) |k| {
+            if (in.wrmask >> @intCast(k) & 1 != 0) putF(c, f, in.dst.num + @as(u16, @intCast(k)), in.dst.half, v[k], false);
+        }
+    }
+    for (0..4) |k| {
+        if (in.wrmask >> @intCast(k) & 1 != 0) noteWrite(c, in.dst.num + @as(u16, @intCast(k)), in.dst.half, .sy, slot0);
     }
 }
 
@@ -1061,6 +1124,49 @@ fn runGroup(w: *Work, mem: *const Memory, d: *const Dispatch, stats: *Stats, gid
             w.pend_sy[wi] = .{0} ** 8;
         }
     }
+}
+
+/// Start `n` fibers of a vertex or fragment program (load() it first): at
+/// its first instruction, every register garbage as on the hardware. The
+/// caller then writes what the pipeline delivers into `w.regs[fiber]`
+/// (indexed by register id) and calls stageRun.
+pub fn stageBegin(w: *Work, k: *const ir3_asm.Kernel, n: u32) Error!void {
+    const ts: u32 = k.threadsize;
+    if (n == 0 or n > MAX_FIBERS) return error.BadDispatch;
+    const waves = (n + ts - 1) / ts;
+    for (0..waves * ts) |fi| {
+        w.st[fi] = if (fi < n) .run else .off;
+        w.pc[fi] = 0;
+        @memset(&w.regs[fi], 0xdeadbeef);
+        w.pred[fi] = .{ false, false, false, false };
+        w.a0[fi] = 0;
+        w.a1[fi] = 0;
+    }
+    for (0..waves) |wi| {
+        @memset(&w.shared[wi], 0);
+        w.slot[wi] = 0;
+        w.pend_ss[wi] = .{0} ** 8;
+        w.pend_sy[wi] = .{0} ** 8;
+        @memset(&w.ready_alu[wi], 0);
+        @memset(&w.ready_non[wi], 0);
+    }
+}
+
+/// Run the `n` fibers stageBegin started to their `end` (`d.stage` set,
+/// `d.kernel` the program). Their registers are then in `w.regs`.
+pub fn stageRun(w: *Work, mem: *const Memory, d: *const Dispatch, n: u32, stats: *Stats) Error!void {
+    const ts: u32 = d.kernel.threadsize;
+    if (d.stage == null or n == 0 or n > MAX_FIBERS) return error.BadDispatch;
+    const waves = (n + ts - 1) / ts;
+    stats.waves += waves;
+    var steps: u64 = 0;
+    const delays = ir3_asm.Delays.forGen(d.kernel.gen);
+    for (0..waves) |wi| {
+        var c = Ctx{ .w = w, .mem = mem, .d = d, .wave = @intCast(wi), .threadsize = ts, .stats = stats, .delays = delays };
+        try runWave(&c, &steps);
+    }
+    // (a program has no barriers: every fiber ran to its end)
+    for (0..n) |fi| if (w.st[fi] != .done) return error.Divergence;
 }
 
 fn runWave(c: *Ctx, steps: *u64) Error!void {

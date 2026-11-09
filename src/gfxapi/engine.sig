@@ -36,6 +36,7 @@
 //! caller memory handed out first fit.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gpu = @import("gpu");
 const raster = @import("raster.sig");
 const texture = @import("texture.sig");
@@ -215,6 +216,10 @@ pub const Shared = struct {
     buf: gpu.Buffer = .{},
     pooled: bool = false,
     track: Track = .{},
+    external: ?struct {
+        context: *anyopaque,
+        release: *const fn (*anyopaque) void,
+    } = null,
 };
 
 /// The first name of memory to be shared (`whole`, its pixels from byte
@@ -233,6 +238,28 @@ pub fn alias(img: *const Image) Image {
     std.debug.assert(img.share != null);
     img.share.?.refs += 1;
     return img.*;
+}
+
+/// A borrowed 2D slice of a texture. The owning texture retains the
+/// allocation and the slice and owner track the same GPU access.
+pub fn borrowSlice(img: *Image, share: *Shared, level: u32, layer: u32) Image {
+    if (img.share == null) {
+        share.* = .{ .refs = 1, .buf = img.buf, .pooled = img.pooled, .track = img.track };
+        img.share = share;
+    }
+    const height = img.levelHeight(level);
+    const stride = img.levelStride(level);
+    const bytes = @as(usize, height) * stride;
+    const off = img.level_at[level] + @as(usize, layer) * bytes;
+    var buf = img.buf;
+    if (buf.gpu != 0) buf.gpu += off;
+    buf.cpu = buf.cpu[off..][0..bytes];
+    buf.bytes = bytes;
+    var view = wrap(buf, img.levelWidth(level), height, stride, img.format, img.top_down);
+    view.share = img.share;
+    view.pooled = img.pooled;
+    view.no_alpha = img.no_alpha;
+    return view;
 }
 
 /// An image over memory someone else has (a window's buffer): `buf` with
@@ -568,7 +595,7 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
 /// (clamped to the level before: an odd edge's last one twice) averaged
 /// byte by byte, rounded. params: 0 the level before's byte offset, 1 its
 /// width, 2 height, 3 stride; 4..7 the same of the level made; 8 bytes a
-/// texel (1, 2, 4).
+/// texel (1, 2, 4), 9 source slices, 10 shrink depth.
 fn mipKernel(s: kir.Storage) kir.Kernel {
     var k = kir.Kernel.init(s, "gfx_mip", .{ GROUP, 1, 1 });
     const img = k.binding();
@@ -588,22 +615,32 @@ fn mipKernel(s: kir.Storage) kir.Kernel {
                 return kk.op2(.iadd, .u32, r(base), r(kk.op3(.imad, .u32, r(yy), r(stride), r(kk.op2(.imul, .u32, r(xx), r(b))))));
             }
         }.f_;
+        const z = k.gid(2);
+        const shrink = k.cmp(.u32, .ne, r(k.param(.u32, 10)), u(0));
+        const za = k.sel(.u32, r(shrink), r(k.op2(.shl, .u32, r(z), u(1))), r(z));
+        const zb = k.sel(.u32, r(shrink), r(k.op2(.imin, .u32, r(k.op2(.iadd, .u32, r(za), u(1))), r(k.op2(.isub, .u32, r(k.param(.u32, 9)), u(1))))), r(za));
         const sb = k.param(.u32, 0);
         const ss = k.param(.u32, 3);
-        const t = [4]kir.V{
-            pixelLoad(&k, img, bpp, at(&k, sb, ss, xa, ya, bpp)),
-            pixelLoad(&k, img, bpp, at(&k, sb, ss, xb, ya, bpp)),
-            pixelLoad(&k, img, bpp, at(&k, sb, ss, xa, yb, bpp)),
-            pixelLoad(&k, img, bpp, at(&k, sb, ss, xb, yb, bpp)),
-        };
+        const slice = k.op2(.imul, .u32, r(ss), r(k.param(.u32, 2)));
+        var t: [8]kir.V = undefined;
+        for ([_]kir.V{ za, zb }, 0..) |layer, i| {
+            const base = k.op3(.imad, .u32, r(layer), r(slice), r(sb));
+            t[i * 4 + 0] = pixelLoad(&k, img, bpp, at(&k, base, ss, xa, ya, bpp));
+            t[i * 4 + 1] = pixelLoad(&k, img, bpp, at(&k, base, ss, xb, ya, bpp));
+            t[i * 4 + 2] = pixelLoad(&k, img, bpp, at(&k, base, ss, xa, yb, bpp));
+            t[i * 4 + 3] = pixelLoad(&k, img, bpp, at(&k, base, ss, xb, yb, bpp));
+        }
         var v = k.mov(.u32, u(0));
         for (0..4) |ch| {
             const sh8: u32 = @intCast(8 * ch);
-            var sum = k.mov(.u32, u(2));
+            var sum = k.mov(.u32, u(4));
             for (t) |tx| sum = k.op2(.iadd, .u32, r(sum), r(k.op3(.bfe, .u32, r(tx), u(sh8), u(8))));
-            v = k.op2(.@"or", .u32, r(v), r(k.op2(.shl, .u32, r(k.op2(.shr, .u32, r(sum), u(2))), u(sh8))));
+            v = k.op2(.@"or", .u32, r(v), r(k.op2(.shl, .u32, r(k.op2(.shr, .u32, r(sum), u(3))), u(sh8))));
         }
-        pixelStore(&k, img, bpp, at(&k, k.param(.u32, 4), k.param(.u32, 7), x, y, bpp), v);
+        const ds = k.param(.u32, 7);
+        const dst_slice = k.op2(.imul, .u32, r(ds), r(k.param(.u32, 6)));
+        const db = k.op3(.imad, .u32, r(z), r(dst_slice), r(k.param(.u32, 4)));
+        pixelStore(&k, img, bpp, at(&k, db, ds, x, y, bpp), v);
     }
     k.endif();
     return k;
@@ -666,6 +703,17 @@ pub const MAX_DOOMED = 128;
 const RING = 64;
 /// How long a CPU access waits for the GPU before calling it lost.
 pub const TIMEOUT_US: u64 = 2_000_000;
+/// How long a batch may run before the GPU is called lost (a wait past
+/// TIMEOUT_US goes on to this; a GPU that hangs is lost sooner, by its
+/// kernel's word).
+pub const LOST_US: u64 = 20_000_000;
+
+fn monoUs() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1000;
+}
 
 /// A backend (gpu.compile, or gpu.compileFor with the targets an image
 /// links).
@@ -688,11 +736,21 @@ pub const Config = struct {
     /// CPU memory for images when the GPU gives none (it is lost, or there
     /// is none).
     pool: []u8 = &.{},
+    /// Backing storage for suballocating small GPU objects.
+    slabs: []Slab = &.{},
     /// Scratch for KIR's interpreter, which draws on the CPU (no GPU, or
     /// it is lost); none: such draws are refused.
     cpu_work: []u8 = &.{},
     /// The GPU's work checked against the CPU's (off: no memory).
     check: Check = .{},
+};
+
+const SLAB_BYTES = 2 << 20;
+const MAX_SLAB_OBJECT = 256 << 10;
+
+pub const Slab = struct {
+    buf: gpu.Buffer = .{},
+    pool: Pool = .{},
 };
 
 /// GALAXY_GL_CHECK: the GPU's work checked against the CPU's, which is
@@ -740,6 +798,7 @@ pub const Engine = struct {
     why_pipe: ?anyerror = null,
     trap: gpu.interp.Trap = .{},
     pool: Pool = .{},
+    slabs: []Slab = &.{},
     progs: [N_PROGS]gpu.Program = undefined,
     code: [N_PROGS][CODE_BYTES]u8 align(16) = undefined,
     ops: [MAX_OPS]gpu.Dispatch = undefined,
@@ -789,7 +848,8 @@ pub const Engine = struct {
     /// The engine in place (it must stay at `e`): the kernels compiled and
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
-        e.* = .{ .pool = Pool.init(cfg.pool), .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .check = cfg.check };
+        e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .check = cfg.check };
+        for (e.slabs) |*slab| slab.* = .{};
         const d = cfg.dev orelse return;
         e.loadAll(d, cfg.compiler, cfg.work) catch |err| {
             e.why = err;
@@ -805,7 +865,7 @@ pub const Engine = struct {
             var insts: [512]kir.Inst = undefined;
             var tys: [512]kir.Ty = undefined;
             const s = kir.Storage{ .insts = &insts, .tys = &tys };
-            var k = switch (@as(Prog, @enumFromInt(i))) {
+            var k = switch (@as(Prog, @fromBackingInt(@intCast(i)))) {
                 .fill => fillKernel(s, false),
                 .fill_masked => fillKernel(s, true),
                 .copy => copyKernel(s),
@@ -829,6 +889,10 @@ pub const Engine = struct {
         e.reap(true);
         if (e.dev) |d| {
             if (!e.lost) for (&e.progs) |*p| d.unload(p);
+            for (e.slabs) |*slab| {
+                if (slab.buf.cpu.len != 0) d.free(slab.buf);
+                slab.* = .{};
+            }
         }
         e.dev = null;
     }
@@ -842,28 +906,68 @@ pub const Engine = struct {
 
     /// Memory for an image or a GL buffer: the GPU's, else the pool's.
     /// Fresh memory reads as zeros.
-    fn allocBytes(e: *Engine, bytes: usize) ?struct { buf: gpu.Buffer, pooled: bool } {
-        if (e.onGpu()) {
+    fn allocBytes(e: *Engine, bytes: usize, shareable: bool) ?struct { buf: gpu.Buffer, pooled: bool } {
+        e.reap(false);
+        for (0..2) |attempt| {
+            if (!e.onGpu()) break;
+            if (shareable and bytes <= MAX_SLAB_OBJECT) {
+                if (e.allocSmall(bytes)) |b| return .{ .buf = b, .pooled = false };
+            }
             if (e.dev.?.alloc(bytes, .host)) |b| {
                 if (b.cpu.len >= bytes) return .{ .buf = b, .pooled = false };
                 e.dev.?.free(b);
             } else |_| {}
+            if (attempt != 0 or e.n_doomed == 0) break;
+            e.finish();
         }
         const s = e.pool.alloc(bytes) orelse return null;
         @memset(s, 0);
         return .{ .buf = .{ .cpu = s, .bytes = bytes, .kind = .host }, .pooled = true };
     }
 
+    fn allocSmall(e: *Engine, bytes: usize) ?gpu.Buffer {
+        const d = e.dev.?;
+        for (e.slabs) |*slab| {
+            if (slab.buf.cpu.len == 0) {
+                const b = d.alloc(SLAB_BYTES, .host) catch return null;
+                if (b.cpu.len < SLAB_BYTES) {
+                    d.free(b);
+                    return null;
+                }
+                slab.buf = b;
+                slab.pool = Pool.init(b.cpu[0..SLAB_BYTES]);
+            }
+            const cpu = slab.pool.alloc(bytes) orelse continue;
+            const off = @intFromPtr(cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr);
+            @memset(cpu, 0);
+            d.toDevice(slab.buf, off, bytes);
+            return .{ .cpu = cpu, .gpu = slab.buf.gpu + off, .bytes = bytes, .handle = slab.buf.handle };
+        }
+        return null;
+    }
+
+    fn slabOf(e: *Engine, b: gpu.Buffer) ?*Slab {
+        for (e.slabs) |*slab| {
+            if (slab.buf.handle == b.handle and slab.pool.owns(b.cpu)) return slab;
+        }
+        return null;
+    }
+
+    fn freeGpu(e: *Engine, d: gpu.Device, b: gpu.Buffer) void {
+        if (e.slabOf(b)) |slab| slab.pool.free(b.cpu) else d.free(b);
+    }
+
     fn freeBytes(e: *Engine, b: gpu.Buffer, pooled: bool, last: u64) void {
         if (pooled) return e.pool.free(b.cpu);
         if (b.kind == .external) return;
         const d = e.dev orelse return;
-        if (e.lost or last <= e.done_upto or last == 0) return d.free(b);
+        if (e.lost or last <= e.done_upto or last == 0) return e.freeGpu(d, b);
         if (e.n_doomed == MAX_DOOMED) {
-            e.waitBatch(e.ran);
-            e.reap(false);
+            // The open batch can still reference these buffers. Waiting
+            // only for e.ran leaves that batch queued with stale addresses.
+            e.finish();
+            return e.freeGpu(d, b);
         }
-        if (e.n_doomed == MAX_DOOMED) return d.free(b);
         e.doomed[e.n_doomed] = .{ .buf = b, .batch = last };
         e.n_doomed += 1;
     }
@@ -876,7 +980,7 @@ pub const Engine = struct {
         while (i < e.n_doomed) {
             const x = e.doomed[i];
             if (all or e.lost or x.batch <= e.done_upto) {
-                if (e.dev) |d| d.free(x.buf);
+                if (e.dev) |d| e.freeGpu(d, x.buf);
                 e.n_doomed -= 1;
                 e.doomed[i] = e.doomed[e.n_doomed];
             } else i += 1;
@@ -886,9 +990,18 @@ pub const Engine = struct {
     /// An image of width x height in `format` (rows of width texels,
     /// rounded up to 4 bytes), or null when there is no memory for it.
     pub fn newImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
+        return e.allocImage(width, height, format, true);
+    }
+
+    /// Exported images need a whole backing buffer for the dma-buf.
+    pub fn newWindowImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
+        return e.allocImage(width, height, format, false);
+    }
+
+    fn allocImage(e: *Engine, width: u32, height: u32, format: Format, shareable: bool) ?Image {
         if (width == 0 or height == 0) return null;
         const stride = std.mem.alignForward(u32, width * format.bytes(), 4);
-        const m = e.allocBytes(@as(usize, stride) * height) orelse return null;
+        const m = e.allocBytes(@as(usize, stride) * height, shareable) orelse return null;
         return .{ .buf = m.buf, .width = width, .height = height, .stride = stride, .format = format, .own = true, .pooled = m.pooled };
     }
 
@@ -897,7 +1010,14 @@ pub const Engine = struct {
     pub fn freeImage(e: *Engine, img: *Image) void {
         if (img.share) |sh| {
             sh.refs -= 1;
-            if (sh.refs == 0) e.freeBytes(sh.buf, sh.pooled, sh.track.last);
+            if (sh.refs == 0) {
+                if (sh.external != null) e.settle(img);
+                e.freeBytes(sh.buf, sh.pooled, sh.track.last);
+                if (sh.external) |external| {
+                    sh.external = null;
+                    external.release(external.context);
+                }
+            }
         } else if (img.own and img.buf.cpu.len != 0) e.freeBytes(img.buf, img.pooled, img.track.last);
         img.* = .{};
     }
@@ -913,7 +1033,7 @@ pub const Engine = struct {
             img.level_at[l] = @intCast(at);
             at += @as(usize, img.levelStride(@intCast(l))) * img.levelHeight(@intCast(l));
         }
-        const m = e.allocBytes(at) orelse return null;
+        const m = e.allocBytes(at, true) orelse return null;
         img.buf = m.buf;
         img.own = true;
         img.pooled = m.pooled;
@@ -925,20 +1045,27 @@ pub const Engine = struct {
     /// glGenerateMipmap, for 1-, 2- and 4-byte unorm images. On the GPU, or
     /// the same kernel on the CPU.
     pub fn mipmap(e: *Engine, img: *Image, base: u32, last: u32) bool {
+        return e.mipmapLayers(img, base, last, 1, false);
+    }
+
+    pub fn mipmapLayers(e: *Engine, img: *Image, base: u32, last: u32, base_layers: u32, volume: bool) bool {
+        var layers = base_layers;
         var l = base;
         while (l < last) : (l += 1) {
+            const dst_layers = if (volume) @max(layers / 2, 1) else layers;
             const p = [_]u32{
-                img.level_at[l],      img.levelWidth(l),     img.levelHeight(l),     img.levelStride(l),
-                img.level_at[l + 1],  img.levelWidth(l + 1), img.levelHeight(l + 1), img.levelStride(l + 1),
-                img.format.bytes(),
+                img.level_at[l],     img.levelWidth(l),     img.levelHeight(l),     img.levelStride(l),
+                img.level_at[l + 1], img.levelWidth(l + 1), img.levelHeight(l + 1), img.levelStride(l + 1),
+                img.format.bytes(),  layers,                @intFromBool(volume),
             };
-            const groups = [3]u32{ divUp(img.levelWidth(l + 1), GROUP), img.levelHeight(l + 1), 1 };
-            const regs = [_]Region{.{ .img = img, .off = img.level_at[l + 1], .len = @as(usize, img.levelStride(l + 1)) * img.levelHeight(l + 1), .stride = img.levelStride(l + 1) }};
+            layers = dst_layers;
+            const groups = [3]u32{ divUp(img.levelWidth(l + 1), GROUP), img.levelHeight(l + 1), dst_layers };
+            const regs = [_]Region{.{ .img = img, .off = img.level_at[l + 1], .len = @as(usize, img.levelStride(l + 1)) * img.levelHeight(l + 1) * dst_layers, .stride = img.levelStride(l + 1) }};
             var checking = false;
             if (e.gpuUsable(img)) checking = e.checkFirst(.mip, @as(u64, img.levelWidth(l + 1)) * img.levelHeight(l + 1), &regs);
             if (e.gpuUsable(img)) {
                 const bufs = [_]*Image{img};
-                e.recordProg(&e.progs[@intFromEnum(Prog.mip)], groups, &bufs, 1, &p, null);
+                e.recordProg(&e.progs[@backingInt(Prog.mip)], groups, &bufs, 1, &p, null);
                 if (!checking) continue;
                 checking = e.checkSwap(&regs);
             }
@@ -966,7 +1093,7 @@ pub const Engine = struct {
 
     /// Storage for a GL buffer object of `bytes` (zeros).
     pub fn newBuffer(e: *Engine, bytes: usize) ?Image {
-        const m = e.allocBytes(bytes) orelse return null;
+        const m = e.allocBytes(bytes, true) orelse return null;
         return .{ .buf = m.buf, .width = 0, .height = 0, .own = true, .pooled = m.pooled };
     }
 
@@ -1028,10 +1155,26 @@ pub const Engine = struct {
         if (!e.onGpu() or b <= e.done_upto) return true;
         const upto = if (e.ran - b >= RING) e.ran else b;
         e.stats.waits += 1;
-        e.dev.?.wait(e.fences[upto % RING], timeout_us) catch |err| {
+        const fence = e.fences[upto % RING];
+        e.dev.?.wait(fence, timeout_us) catch |err| {
             if (err == error.Timeout and !lose_on_timeout) return false;
-            e.loseGpu(err);
-            return true;
+            if (err != error.Timeout or timeout_us >= LOST_US) {
+                e.loseGpu(err);
+                return true;
+            }
+            // A GPU still busy is not a lost one: the kernel says when the
+            // GPU hangs (its fence not moving), and the wait ends in
+            // DeviceLost then. The Surface's 11-09 boot: Firefox's first
+            // WebRender frame ran past 2 s while the desktop's frames shared
+            // the Adreno, and the app was sent to the CPU, where its new
+            // windows could not be shown.
+            report.say(.slow, "a batch of the GPU's has run {d} s: waiting for it, up to {d} s", .{ timeout_us / 1_000_000, LOST_US / 1_000_000 });
+            const t0 = monoUs();
+            e.dev.?.wait(fence, LOST_US - timeout_us) catch |err2| {
+                e.loseGpu(err2);
+                return true;
+            };
+            report.say(.slow, "that batch was done {d} ms later", .{(monoUs() - t0) / 1000});
         };
         e.done_upto = upto;
         return true;
@@ -1080,7 +1223,7 @@ pub const Engine = struct {
     }
 
     fn record(e: *Engine, prog: Prog, groups: [3]u32, bufs: []const *Image, params: []const u32, cpu: CpuOp) void {
-        e.recordProg(&e.progs[@intFromEnum(prog)], groups, bufs, @as(u32, 1) << @intCast(bufs.len - 1), params, cpu);
+        e.recordProg(&e.progs[@backingInt(prog)], groups, bufs, @as(u32, 1) << @intCast(bufs.len - 1), params, cpu);
     }
 
     /// A dispatch of `prog` in the open batch; `writes`: the bindings it
@@ -1245,7 +1388,7 @@ pub const Engine = struct {
 
     // ── Draws ──────────────────────────────────────────────────────────────
 
-    const Stage = enum(u3) { vertex, setup, raster, bin, blit, mip };
+    const Stage = enum(u3) { vertex, setup, raster, bin, blit, mip, stencil };
 
     fn build(e: *Engine, st: Stage, p: *const raster.Pipeline) kir.Kernel {
         const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
@@ -1253,6 +1396,7 @@ pub const Engine = struct {
             .vertex => raster.vertexKernel(s, p),
             .setup => raster.setupKernel(s, p),
             .raster => raster.rasterKernel(s, p),
+            .stencil => raster.stencilKernel(s, p),
             .bin => raster.binKernel(s),
             .blit => blitKernel(s),
             .mip => mipKernel(s),
@@ -1267,13 +1411,32 @@ pub const Engine = struct {
         if (p.refused_by == @as(?*anyopaque, e)) return false;
         const d = e.dev.?;
         for (0..3) |n| {
-            var k = e.build(@enumFromInt(n), p);
+            var k = e.build(@fromBackingInt(@intCast(n)), p);
             k.finish() catch |err| return e.pipeFailed(p, n, err);
             var w = gpu.Work.init(e.work);
             const bin = e.compiler(&k, d.caps, &w, &e.pcode) catch |err| return e.pipeFailed(p, n, err);
             p.progs[n] = d.load(&bin) catch |err| return e.pipeFailed(p, n, err);
         }
         p.owner = e;
+        return true;
+    }
+
+    fn loadStencil(e: *Engine, p: *raster.Pipeline) bool {
+        if (p.progs[3] != null) return true;
+        if (p.stencil_refused_by == @as(?*anyopaque, e)) return false;
+        var k = e.build(.stencil, p);
+        const result: anyerror!gpu.Program = blk: {
+            k.finish() catch |err| break :blk err;
+            var w = gpu.Work.init(e.work);
+            const bin = e.compiler(&k, e.dev.?.caps, &w, &e.pcode) catch |err| break :blk err;
+            break :blk e.dev.?.load(&bin);
+        };
+        p.progs[3] = result catch |err| {
+            e.why_pipe = err;
+            p.stencil_refused_by = e;
+            report.say(.pipeline, "a program's stencil kernel does not compile or load for the GPU ({s}): its stencil draws run on the CPU", .{@errorName(err)});
+            return false;
+        };
         return true;
     }
 
@@ -1299,6 +1462,7 @@ pub const Engine = struct {
             q.* = null;
         }
         p.owner = null;
+        p.stencil_refused_by = null;
     }
 
     /// A draw: its vertices, triangles and pixels, on the GPU (three
@@ -1341,7 +1505,7 @@ pub const Engine = struct {
         for (d.attrs, 0..) |a, j| vbs[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
         const depth = d.depth orelse &e.zero;
         const sb = [_]*Image{ &tris, &verts };
-        var rbs: [4 + texture.MAX_TEX]*Image = undefined;
+        var rbs: [5 + texture.MAX_TEX]*Image = undefined;
         rbs[0] = d.color;
         rbs[1] = depth;
         rbs[2] = &tris;
@@ -1351,16 +1515,18 @@ pub const Engine = struct {
             vbs[3 + raster.MAX_ATTRS + j] = img;
             rbs[4 + j] = img;
         }
+        rbs[4 + ntex] = d.stencil orelse &e.zero;
         const vb = vbs[0 .. 3 + raster.MAX_ATTRS + ntex];
-        const rb = rbs[0 .. 4 + ntex];
+        const rb = rbs[0 .. 4 + ntex + @intFromBool(d.stencil != null)];
         const groups_v = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
         const groups_s = [3]u32{ divUp(ntri, raster.SETUP_GROUP), d.instances, 1 };
         const groups_r = [3]u32{ divUp(d.rect.width(), raster.TILE), divUp(d.rect.height(), raster.TILE), 1 };
         var all_gpu = e.onGpu() and e.loadPipeline(@constCast(p)) and p.owner == @as(?*anyopaque, e);
+        if (all_gpu and d.stencil != null) all_gpu = e.loadStencil(@constCast(p));
         for (vb) |img| all_gpu = all_gpu and e.gpuUsable(img);
         for (rb) |img| all_gpu = all_gpu and e.gpuUsable(img);
         // a check: the color rows the draw covers (and the depth's)
-        var regs: [2]Region = undefined;
+        var regs: [3]Region = undefined;
         var nreg: usize = 0;
         var checking = all_gpu and e.wantCheck(p.checked, @as(u64, d.rect.width()) * d.rect.height());
         if (checking) {
@@ -1373,6 +1539,12 @@ pub const Engine = struct {
                     nreg = 2;
                 }
             }
+            if (d.stencil) |stencil| {
+                if (stencil != d.color and stencil != d.depth and stencil.height >= d.rect.y1 and stencil.buf.cpu.len != 0) {
+                    regs[nreg] = rowsOf(stencil, d.rect.y0, d.rect.y1);
+                    nreg += 1;
+                }
+            }
             checking = e.checkSave(regs[0..nreg]);
             all_gpu = all_gpu and e.onGpu();
         }
@@ -1380,11 +1552,15 @@ pub const Engine = struct {
         // that differs)
         var recs: usize = 0;
         if (all_gpu) {
-            const rw: u32 = if (d.depth != null and d.depth_test and d.depth_write) 0b11 else 0b01;
+            var rw: u32 = if (d.depth != null and d.depth_test and d.depth_write) 0b11 else 0b01;
+            if (d.stencil != null) {
+                rw |= @as(u32, 1) << @intCast(4 + ntex);
+                if (d.stencil == d.depth) rw |= 0b10;
+            }
             e.recordProg(&p.progs[0].?, groups_v, vb, 1, vparams, null);
             e.recordProg(&p.progs[1].?, groups_s, &sb, 1, sparams, null);
-            if (bins.on) e.recordProg(&e.progs[@intFromEnum(Prog.bin)], groups_b, &tb, 1, bparams, null);
-            e.recordProg(&p.progs[2].?, groups_r, rb, rw, rparams, null);
+            if (bins.on) e.recordProg(&e.progs[@backingInt(Prog.bin)], groups_b, &tb, 1, bparams, null);
+            e.recordProg(&p.progs[if (d.stencil != null) @as(usize, 3) else 2].?, groups_r, rb, rw, rparams, null);
             if (!checking) return true;
             // the GPU's result aside, the rows back, the records cleared:
             // the CPU draws it next
@@ -1417,10 +1593,11 @@ pub const Engine = struct {
             if (!e.runCpu(.setup, p, groups_s, &sv, sparams)) break :cpu false;
             const bv = [_][]u8{tris.buf.cpu};
             if (bins.on and !e.runCpu(.bin, p, groups_b, &bv, bparams)) break :cpu false;
-            var rv: [4 + texture.MAX_TEX][]u8 = undefined;
+            var rv: [5 + texture.MAX_TEX][]u8 = undefined;
             for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
-            if (!e.runCpu(.raster, p, groups_r, rv[0..rb.len], rparams)) break :cpu false;
+            if (!e.runCpu(if (d.stencil != null) .stencil else .raster, p, groups_r, rv[0..rb.len], rparams)) break :cpu false;
             for (rb[0..2]) |img| e.wrote(img, 0, img.buf.cpu.len);
+            if (d.stencil) |stencil| e.wrote(stencil, 0, stencil.buf.cpu.len);
             break :cpu true;
         };
         if (!checking) return done;
@@ -1515,7 +1692,7 @@ pub const Engine = struct {
         if (e.gpuUsable(src) and e.gpuUsable(dst)) checking = e.checkFirst(.blit, @as(u64, a.width()) * a.height(), &regs);
         if (e.gpuUsable(src) and e.gpuUsable(dst)) {
             const bufs = [_]*Image{ src, dst };
-            e.recordProg(&e.progs[@intFromEnum(Prog.blit)], groups, &bufs, 0b10, &p, null);
+            e.recordProg(&e.progs[@backingInt(Prog.blit)], groups, &bufs, 0b10, &p, null);
             if (!checking) return true;
             checking = e.checkSwap(&regs);
         }
@@ -1567,7 +1744,7 @@ pub const Engine = struct {
     /// Whether this run of engine kernel `prog` is checked (counted, the
     /// regions saved).
     fn checkFirst(e: *Engine, prog: Prog, px: u64, regs: []const Region) bool {
-        const i = @intFromEnum(prog);
+        const i = @backingInt(prog);
         if (!e.wantCheck(e.prog_checked[i], px)) return false;
         e.prog_checked[i] += 1;
         return e.checkSave(regs);
@@ -1716,12 +1893,28 @@ pub const Engine = struct {
 
     fn toDevice(e: *Engine, img: *const Image, off: usize, len: usize) void {
         if (!e.gpuUsable(img)) return;
-        e.dev.?.toDevice(img.buf, off, len);
+        if (e.slabOf(img.buf)) |slab| {
+            const base = @intFromPtr(img.buf.cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr);
+            e.dev.?.toDevice(slab.buf, base + off, len);
+            return;
+        }
+        if (img.share) |sh| {
+            const base = @intFromPtr(img.buf.cpu.ptr) - @intFromPtr(sh.buf.cpu.ptr);
+            e.dev.?.toDevice(sh.buf, base + off, len);
+        } else e.dev.?.toDevice(img.buf, off, len);
     }
 
     fn fromDevice(e: *Engine, img: *const Image, off: usize, len: usize) void {
         if (!e.gpuUsable(img)) return;
-        e.dev.?.fromDevice(img.buf, off, len);
+        if (e.slabOf(img.buf)) |slab| {
+            const base = @intFromPtr(img.buf.cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr);
+            e.dev.?.fromDevice(slab.buf, base + off, len);
+            return;
+        }
+        if (img.share) |sh| {
+            const base = @intFromPtr(img.buf.cpu.ptr) - @intFromPtr(sh.buf.cpu.ptr);
+            e.dev.?.fromDevice(sh.buf, base + off, len);
+        } else e.dev.?.fromDevice(img.buf, off, len);
     }
 
     // ── The CPU forms ──────────────────────────────────────────────────────

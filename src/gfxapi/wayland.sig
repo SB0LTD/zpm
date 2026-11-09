@@ -38,6 +38,7 @@
 //! Allocation-free: fixed tables; the buffers' memory is the engine's.
 
 const std = @import("std");
+const report = @import("report.sig");
 const gpu = @import("gpu");
 const engine = @import("engine.sig");
 const dl = @import("dl.sig");
@@ -529,7 +530,8 @@ pub const Window = struct {
                 if (b.busy) b.stale = true else w.drop(b);
             }
         }
-        while (true) {
+        var retried_allocation = false;
+        choose: while (true) {
             // a free one: the most recently shown (the smallest age)
             var pick: ?usize = null;
             for (&w.bufs, 0..) |*b, i| {
@@ -539,7 +541,14 @@ pub const Window = struct {
             if (pick == null) {
                 for (&w.bufs, 0..) |*b, i| {
                     if (!b.img.live() and !b.busy) {
-                        if (!w.make(b)) return null;
+                        if (!w.make(b)) {
+                            if (retried_allocation) return null;
+                            retried_allocation = true;
+                            // Earlier commits may already have released a
+                            // usable buffer or a stale buffer's storage.
+                            if (w.d.c.roundtrip_queue(w.d.native, w.d.queue.?) < 0) return null;
+                            continue :choose;
+                        }
                         pick = i;
                         break;
                     }
@@ -558,13 +567,17 @@ pub const Window = struct {
     /// wl_buffer.
     fn make(w: *Window, b: *Buffer) bool {
         b.* = .{ .win = w };
-        var img = w.eng.newImage(w.width, w.height, .bgra8) orelse return false;
+        var img = w.eng.newWindowImage(w.width, w.height, .bgra8) orelse {
+            report.say(.egl_error, "could not allocate a {d}x{d} Wayland window buffer", .{ w.width, w.height });
+            return false;
+        };
         img.top_down = true;
         img.no_alpha = !w.alpha;
         b.img = img;
         const host = w.d.host;
         const fd = host.exportFd(host.ctx, img.buf);
         if (fd < 0) {
+            report.say(.egl_error, "could not export a {d}x{d} Wayland window buffer: errno {d}, CPU storage {}", .{ w.width, w.height, -fd, img.pooled });
             w.eng.freeImage(&b.img);
             return false;
         }

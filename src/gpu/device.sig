@@ -312,6 +312,8 @@ pub const Device = struct {
         /// For the last run, profiled: each dispatch's end, ns after the
         /// run's start, into `out` (as many as it ran); 0: none.
         dispatchNs: ?*const fn (ctx: *anyopaque, out: []u64) usize = null,
+        /// A GPU-clock sample ordered after prior commands.
+        timestampNs: ?*const fn (ctx: *anyopaque, timeout_us: u64) Error!u64 = null,
     };
 
     /// A buffer of `bytes`, or error.OutOfMemory.

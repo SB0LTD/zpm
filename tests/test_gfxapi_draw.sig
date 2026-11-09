@@ -25,6 +25,7 @@ const gles = gfxapi.gles;
 const raster = gfxapi.raster;
 const g = gfxapi.glenum;
 const node = gfxapi.node;
+const program = gfxapi.program;
 
 const r = kir.r;
 
@@ -60,12 +61,17 @@ const Uniform = struct {
     fn fragment(_: ?*const anyopaque, k: *kir.Kernel, io: *raster.FragmentIO) void {
         for (0..4) |c| io.color[c] = raster.uniform(k, .f32, io.uniforms, @intCast(c));
     }
+    fn discard(_: ?*const anyopaque, k: *kir.Kernel, io: *raster.FragmentIO) void {
+        fragment(null, k, io);
+        io.discard = k.mov(.pred, kir.u(1));
+    }
 };
 
 var colored = raster.Pipeline.init(.{ .attrs = 2, .varyings = 4, .vertex = Colored.vertex, .fragment = Colored.fragment });
 var flat = raster.Pipeline.init(.{ .attrs = 2, .varyings = 4, .flat = 0xf, .vertex = Colored.vertex, .fragment = Colored.fragment });
 var instanced = raster.Pipeline.init(.{ .attrs = 3, .varyings = 4, .vertex = Colored.instanced, .fragment = Colored.fragment });
 var solid = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .vertex = Uniform.vertex, .fragment = Uniform.fragment });
+var discarded = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .vertex = Uniform.vertex, .fragment = Uniform.discard });
 const pipes = [_]*raster.Pipeline{ &colored, &flat, &instanced, &solid };
 
 // ── The scene ──────────────────────────────────────────────────────────────
@@ -228,7 +234,7 @@ fn scene(eng: *engine.Engine, out: *Out) !void {
     c.clear(g.COLOR_BUFFER_BIT);
     c.usePipeline(&colored, &.{});
     const fan = [_]Vert{
-        winv(16, 8, .{ 1, 1, 1, 1 }), winv(4, 2, red),  winv(28, 2, blue),
+        winv(16, 8, .{ 1, 1, 1, 1 }),  winv(4, 2, red),  winv(28, 2, blue),
         winv(28, 14, .{ 0, 1, 0, 1 }), winv(4, 14, red),
     };
     drawVerts(c, bufs[0], &fan, g.TRIANGLE_FAN);
@@ -320,6 +326,149 @@ test "draw: the scene on the CPU (the interpreter on the images' memory)" {
     try check(o);
 }
 
+fn stencilValue(eng: *engine.Engine, rb: u32) u32 {
+    const img = &ctx.objs.rbs[rb - 1].img;
+    return std.mem.readInt(u32, eng.hostView(img, 10 * 4, 4)[0..4], .little);
+}
+
+fn stencilScene(eng: *engine.Engine, separate: bool) !void {
+    objs.init();
+    ctx.init(eng, &objs);
+    defer ctx.deinit();
+    defer eng.unloadPipeline(&solid);
+    defer eng.unloadPipeline(&discarded);
+    var tex: [1]u32 = undefined;
+    ctx.genTextures(&tex);
+    ctx.bindTexture(g.TEXTURE_2D, tex[0]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, 4, 4);
+    var rb: [2]u32 = undefined;
+    ctx.genRenderbuffers(&rb);
+    ctx.bindRenderbuffer(g.RENDERBUFFER, rb[0]);
+    ctx.renderbufferStorage(g.RENDERBUFFER, 0, if (separate) g.DEPTH_COMPONENT24 else g.DEPTH24_STENCIL8, 4, 4);
+    const stencil_rb = if (separate) rb[1] else rb[0];
+    if (separate) {
+        ctx.bindRenderbuffer(g.RENDERBUFFER, stencil_rb);
+        ctx.renderbufferStorage(g.RENDERBUFFER, 0, g.STENCIL_INDEX8, 4, 4);
+    }
+    var fb: [1]u32 = undefined;
+    ctx.genFramebuffers(&fb);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex[0], 0);
+    ctx.framebufferRenderbuffer(g.FRAMEBUFFER, g.DEPTH_ATTACHMENT, g.RENDERBUFFER, rb[0]);
+    ctx.framebufferRenderbuffer(g.FRAMEBUFFER, g.STENCIL_ATTACHMENT, g.RENDERBUFFER, stencil_rb);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, ctx.checkFramebufferStatus(g.FRAMEBUFFER));
+    ctx.viewportSet(0, 0, 4, 4);
+    ctx.clearDepth(1);
+    ctx.clearStencil(7);
+    ctx.clear(g.COLOR_BUFFER_BIT | g.DEPTH_BUFFER_BIT | g.STENCIL_BUFFER_BIT);
+    var buffer: [1]u32 = undefined;
+    ctx.genBuffers(&buffer);
+    const triangle = [_]f32{ -1, -1, 0, 1, 3, -1, 0, 1, -1, 3, 0, 1 };
+    ctx.bindBuffer(g.ARRAY_BUFFER, buffer[0]);
+    ctx.bufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(triangle)), &triangle, g.STATIC_DRAW);
+    ctx.vertexAttribPointer(0, 4, g.FLOAT, false, 16, 0, false);
+    ctx.enableVertexAttribArray(0, true);
+    const red = [_]u32{ @bitCast(@as(f32, 1)), 0, 0, @bitCast(@as(f32, 1)) };
+    ctx.usePipeline(&solid, &red);
+    ctx.enable(g.STENCIL_TEST, true);
+    ctx.enable(g.DEPTH_TEST, true);
+    ctx.stencilFuncSeparate(g.FRONT_AND_BACK, g.ALWAYS, 9, 0xff);
+    ctx.stencilOpSeparate(g.FRONT_AND_BACK, g.KEEP, g.KEEP, g.REPLACE);
+    ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    try std.testing.expectEqual(@as(u32, 9), stencilValue(eng, stencil_rb) >> 24);
+    const depth = stencilValue(eng, rb[0]) & 0xffffff;
+    try std.testing.expectEqual(@as(u32, 0x800000), depth);
+    ctx.colorMask(false, false, false, false);
+    ctx.stencilMaskSeparate(g.FRONT_AND_BACK, 0x0f);
+    ctx.stencilFuncSeparate(g.FRONT_AND_BACK, g.NEVER, 0xa5, 0xff);
+    ctx.stencilOpSeparate(g.FRONT_AND_BACK, g.REPLACE, g.KEEP, g.KEEP);
+    ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+    try std.testing.expectEqual(@as(u32, 5), stencilValue(eng, stencil_rb) >> 24);
+    try std.testing.expectEqual(depth, stencilValue(eng, rb[0]) & 0xffffff);
+    ctx.stencilMaskSeparate(g.FRONT_AND_BACK, 0xff);
+    ctx.stencilFuncSeparate(g.FRONT_AND_BACK, g.ALWAYS, 0, 0xff);
+    ctx.stencilOpSeparate(g.FRONT_AND_BACK, g.KEEP, g.INCR, g.DECR);
+    ctx.depthFunc(g.NEVER);
+    ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+    try std.testing.expectEqual(@as(u32, 6), stencilValue(eng, stencil_rb) >> 24);
+    ctx.depthFunc(g.ALWAYS);
+    ctx.frontFace(g.CW);
+    ctx.stencilFuncSeparate(g.BACK, g.ALWAYS, 0x44, 0xff);
+    ctx.stencilMaskSeparate(g.BACK, 0xf0);
+    ctx.stencilOpSeparate(g.BACK, g.KEEP, g.KEEP, g.REPLACE);
+    ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+    try std.testing.expectEqual(@as(u32, 0x46), stencilValue(eng, stencil_rb) >> 24);
+    ctx.frontFace(g.CCW);
+    ctx.usePipeline(&discarded, &red);
+    ctx.stencilFuncSeparate(g.FRONT, g.NEVER, 0x77, 0xff);
+    ctx.stencilOpSeparate(g.FRONT, g.REPLACE, g.REPLACE, g.REPLACE);
+    ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+    try std.testing.expectEqual(@as(u32, 0x46), stencilValue(eng, stencil_rb) >> 24);
+    ctx.usePipeline(&solid, &red);
+    ctx.stencilMaskSeparate(g.FRONT_AND_BACK, 0xff);
+    ctx.stencilFuncSeparate(g.FRONT_AND_BACK, g.ALWAYS, 5, 0xff);
+    ctx.clearStencil(254);
+    ctx.clear(g.STENCIL_BUFFER_BIT);
+    const operations = [_]u32{ g.INCR, g.INCR, g.INCR_WRAP, g.DECR, g.DECR_WRAP, g.INVERT, g.ZERO, g.REPLACE, g.KEEP };
+    const results = [_]u32{ 255, 255, 0, 0, 255, 0, 0, 5, 5 };
+    for (operations, results) |op, expected| {
+        ctx.stencilOpSeparate(g.FRONT_AND_BACK, g.KEEP, g.KEEP, op);
+        ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+        try std.testing.expectEqual(expected, stencilValue(eng, stencil_rb) >> 24);
+        try std.testing.expectEqual(depth, stencilValue(eng, rb[0]) & 0xffffff);
+    }
+    const comparisons = [_]u32{ g.NEVER, g.LESS, g.EQUAL, g.LEQUAL, g.GREATER, g.NOTEQUAL, g.GEQUAL, g.ALWAYS };
+    for (comparisons) |comparison| {
+        for ([_]u8{ 4, 5, 6 }) |reference| {
+            ctx.clearStencil(5);
+            ctx.clear(g.STENCIL_BUFFER_BIT);
+            ctx.stencilFuncSeparate(g.FRONT_AND_BACK, comparison, reference, 0xff);
+            ctx.stencilOpSeparate(g.FRONT_AND_BACK, g.INVERT, g.ZERO, g.KEEP);
+            ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+            const passes = switch (comparison) {
+                g.NEVER => false,
+                g.LESS => reference < 5,
+                g.EQUAL => reference == 5,
+                g.LEQUAL => reference <= 5,
+                g.GREATER => reference > 5,
+                g.NOTEQUAL => reference != 5,
+                g.GEQUAL => reference >= 5,
+                g.ALWAYS => true,
+                else => unreachable,
+            };
+            const actual = stencilValue(eng, stencil_rb) >> 24;
+            if (actual != @as(u32, if (passes) 5 else 250)) {
+                std.debug.print("stencil comparison 0x{x}, reference {d}, separate {}, GPU {}, GL error 0x{x}, pipeline {?s}\n", .{ comparison, reference, separate, eng.onGpu(), ctx.err, if (eng.why_pipe) |err| @errorName(err) else null });
+            }
+            try std.testing.expectEqual(@as(u32, if (passes) 5 else 250), actual);
+        }
+    }
+    ctx.clearStencil(5);
+    ctx.clear(g.STENCIL_BUFFER_BIT);
+    ctx.stencilFuncSeparate(g.FRONT_AND_BACK, g.LESS, 0x14, 0x0f);
+    ctx.stencilOpSeparate(g.FRONT_AND_BACK, g.INVERT, g.INVERT, g.INCR);
+    ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+    try std.testing.expectEqual(@as(u32, 6), stencilValue(eng, stencil_rb) >> 24);
+    ctx.stencilMaskSeparate(g.FRONT_AND_BACK, 0);
+    ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+    try std.testing.expectEqual(@as(u32, 6), stencilValue(eng, stencil_rb) >> 24);
+    ctx.stencilMaskSeparate(g.FRONT_AND_BACK, 0xff);
+    ctx.enable(g.DEPTH_TEST, false);
+    ctx.stencilFuncSeparate(g.FRONT_AND_BACK, g.ALWAYS, 0, 0xff);
+    ctx.stencilOpSeparate(g.FRONT_AND_BACK, g.INVERT, g.INVERT, g.INCR);
+    ctx.drawArrays(g.TRIANGLES, 0, 3, 1);
+    try std.testing.expectEqual(@as(u32, 7), stencilValue(eng, stencil_rb) >> 24);
+    try std.testing.expectEqual(depth, stencilValue(eng, rb[0]) & 0xffffff);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+}
+
+test "draw: stencil operations, discard and packed or separate attachments on the CPU" {
+    eng_cpu.init(.{ .pool = &pool_mem, .cpu_work = &cpu_work });
+    try stencilScene(&eng_cpu, false);
+    try stencilScene(&eng_cpu, true);
+}
+
 var emu_mem: [8 << 20]u8 align(4096) = undefined;
 var emu_shadow: [16 << 20]u8 align(4096) = undefined;
 var emu_work: [8 << 20]u8 align(64) = undefined;
@@ -358,6 +507,205 @@ var ir3_work: [gpu.kir_ir3.WORK_BYTES]u8 align(64) = undefined;
 var eng_a: engine.Engine = undefined;
 var out_a: Out = .{};
 
+fn layeredCopy(eng: *engine.Engine) !void {
+    objs.init();
+    ctx.init(eng, &objs);
+    defer ctx.deinit();
+    var names: [2]u32 = undefined;
+    ctx.genTextures(&names);
+    ctx.bindTexture(g.TEXTURE_2D_ARRAY, names[0]);
+    ctx.texStorage3D(g.TEXTURE_2D_ARRAY, 1, g.RGBA8, 1, 1, 2);
+    ctx.bindTexture(g.TEXTURE_CUBE_MAP, names[1]);
+    ctx.texStorage2D(g.TEXTURE_CUBE_MAP, 1, g.RGBA8, 1, 1);
+    const pixels = [_]u8{ 11, 22, 33, 44, 55, 66, 77, 88 };
+    ctx.texSubImage3D(g.TEXTURE_2D_ARRAY, 0, 0, 0, 0, 1, 1, 2, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    ctx.copyImageSubData(names[0], g.TEXTURE_2D_ARRAY, 0, 0, 0, 0, names[1], g.TEXTURE_CUBE_MAP, 0, 0, 0, 0, 1, 1, 1);
+    ctx.copyImageSubData(names[0], g.TEXTURE_2D_ARRAY, 0, 0, 0, 1, names[1], g.TEXTURE_CUBE_MAP, 0, 0, 0, 1, 1, 1, 1);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    try std.testing.expectEqualSlices(u8, &pixels, eng.hostView(&objs.tex[names[1] - 1].img, 0, pixels.len));
+    const before_clear = eng.stats.dispatches;
+    var framebuffers: [1]u32 = undefined;
+    ctx.genFramebuffers(&framebuffers);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, framebuffers[0]);
+    ctx.framebufferTextureLayer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[0], 0, 1);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, ctx.checkFramebufferStatus(g.FRAMEBUFFER));
+    ctx.clearColor(1, 0, 0, 1);
+    ctx.clear(g.COLOR_BUFFER_BIT);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_CUBE_MAP_POSITIVE_X + 1, names[1], 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, ctx.checkFramebufferStatus(g.FRAMEBUFFER));
+    ctx.clearColor(0, 1, 0, 1);
+    ctx.clear(g.COLOR_BUFFER_BIT);
+    var pixel: [4]u8 = undefined;
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, &pixel);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 22, 33, 44, 255, 0, 0, 255 }, eng.hostView(&objs.tex[names[0] - 1].img, 0, pixels.len));
+    try std.testing.expectEqualSlices(u8, &.{ 11, 22, 33, 44, 0, 255, 0, 255 }, eng.hostView(&objs.tex[names[1] - 1].img, 0, pixels.len));
+    try std.testing.expect(eng.stats.dispatches >= before_clear + 2);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    ctx.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_MIN_FILTER, g.NEAREST);
+    ctx.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_MAG_FILTER, g.NEAREST);
+    try sampleLayerTexture("#version 300 es\nprecision highp float; uniform highp sampler2DArray tex; out vec4 color;" ++
+        "void main() { ivec3 size = textureSize(tex, 0); " ++
+        "color = textureLod(tex, vec3(0.5, 0.5, 0.75), 0.0) + texelFetch(tex, ivec3(0, 0, 0), 0); " ++
+        "color.b = float(size.z) * 0.25; }", .{ 255, 22, 128, 255 });
+    var volume: [1]u32 = undefined;
+    ctx.genTextures(&volume);
+    ctx.bindTexture(g.TEXTURE_3D, volume[0]);
+    ctx.texStorage3D(g.TEXTURE_3D, 2, g.RGBA8, 1, 1, 2);
+    const slices = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255 };
+    ctx.texSubImage3D(g.TEXTURE_3D, 0, 0, 0, 0, 1, 1, 2, g.RGBA, g.UNSIGNED_BYTE, &slices);
+    const mip = [_]u8{ 0, 0, 255, 255 };
+    ctx.texSubImage3D(g.TEXTURE_3D, 1, 0, 0, 0, 1, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &mip);
+    ctx.texParameteri(g.TEXTURE_3D, g.TEXTURE_MIN_FILTER, g.LINEAR);
+    ctx.texParameteri(g.TEXTURE_3D, g.TEXTURE_MAG_FILTER, g.LINEAR);
+    try sampleLayerTexture("#version 300 es\nprecision highp float; uniform highp sampler3D tex; out vec4 color;" ++
+        "void main() { color = textureLod(tex, vec3(0.5), 0.0); " ++
+        "color.b = min(texelFetchOffset(tex, ivec3(0), 0, ivec3(0, 0, 1)).g, texelFetch(tex, ivec3(0), 1).b); }", .{ 128, 128, 255, 255 });
+    const before_mips = eng.stats.dispatches;
+    ctx.generateMipmap(g.TEXTURE_3D);
+    ctx.framebufferTextureLayer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, volume[0], 1, 0);
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqualSlices(u8, &.{ 128, 128, 0, 255 }, &pixel);
+    try std.testing.expect(eng.stats.dispatches > before_mips);
+    const red = [_]u8{ 255, 0, 0, 255 };
+    const blue = [_]u8{ 0, 0, 255, 255 };
+    ctx.texSubImage2D(g.TEXTURE_CUBE_MAP_POSITIVE_X, 0, 0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &red);
+    ctx.texSubImage2D(g.TEXTURE_CUBE_MAP_POSITIVE_X + 4, 0, 0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &blue);
+    ctx.framebufferTextureLayer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[0], 0, 1);
+    ctx.texParameteri(g.TEXTURE_CUBE_MAP, g.TEXTURE_MIN_FILTER, g.LINEAR);
+    ctx.texParameteri(g.TEXTURE_CUBE_MAP, g.TEXTURE_MAG_FILTER, g.LINEAR);
+    try sampleLayerTexture("#version 300 es\nprecision highp float; uniform highp samplerCube tex; out vec4 color;" ++
+        "void main() { color = textureLod(tex, vec3(1.0, 0.0, 1.0), 0.0); }", .{ 128, 0, 128, 255 });
+    var depth_tex: [1]u32 = undefined;
+    ctx.genTextures(&depth_tex);
+    ctx.bindTexture(g.TEXTURE_2D, depth_tex[0]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.DEPTH_COMPONENT24, 2, 1);
+    const depths = [_]u32{ 0, 0xffff_ffff };
+    ctx.texSubImage2D(g.TEXTURE_2D, 0, 0, 0, 2, 1, g.DEPTH_COMPONENT, g.UNSIGNED_INT, &depths);
+    ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.LINEAR);
+    ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR);
+    ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_COMPARE_MODE, g.COMPARE_REF_TO_TEXTURE);
+    ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_COMPARE_FUNC, g.LEQUAL);
+    try sampleLayerTexture("#version 300 es\nprecision highp float; uniform highp sampler2DShadow tex; out vec4 color;" ++
+        "void main() { color = vec4(texture(tex, vec3(0.5, 0.5, 0.5)), 0.0, 0.0, 1.0); }", .{ 128, 0, 0, 255 });
+    var detached: [1]u32 = undefined;
+    ctx.genTextures(&detached);
+    ctx.bindTexture(g.TEXTURE_2D_ARRAY, detached[0]);
+    const independent = [_]u8{ 25, 50, 75, 255, 100, 125, 150, 255 };
+    ctx.texImage3D(g.TEXTURE_2D_ARRAY, 2, g.RGBA8, 1, 1, 2, 0, g.RGBA, g.UNSIGNED_BYTE, &independent);
+    ctx.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_BASE_LEVEL, 2);
+    ctx.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_MIN_FILTER, g.NEAREST);
+    ctx.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_MAG_FILTER, g.NEAREST);
+    try sampleLayerTexture("#version 300 es\nprecision highp float; uniform highp sampler2DArray tex; out vec4 color;" ++
+        "void main() { color = texelFetch(tex, ivec3(0, 0, 1), 0); }", .{ 100, 125, 150, 255 });
+    ctx.texImage3D(g.TEXTURE_2D_ARRAY, 2, g.RGBA8, 2, 1, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    ctx.texImage3D(g.TEXTURE_2D_ARRAY, 3, g.RGBA8, 1, 1, 2, 0, g.RGBA, g.UNSIGNED_BYTE, &independent);
+    ctx.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_MIN_FILTER, g.NEAREST_MIPMAP_NEAREST);
+    try sampleLayerTexture("#version 300 es\nprecision highp float; uniform highp sampler2DArray tex; out vec4 color;" ++
+        "void main() { color = textureLod(tex, vec3(0.5, 0.5, 1.0), 1.0); }", .{ 100, 125, 150, 255 });
+    try std.testing.expect(!eng.lost);
+}
+
+fn mutableCubeDraw(eng: *engine.Engine) !void {
+    objs.init();
+    ctx.init(eng, &objs);
+    defer ctx.deinit();
+    var textures: [2]u32 = undefined;
+    ctx.genTextures(&textures);
+    ctx.bindTexture(g.TEXTURE_2D, textures[0]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, 1, 1);
+    var fb: [1]u32 = undefined;
+    ctx.genFramebuffers(&fb);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, textures[0], 0);
+    const red = [_]u8{ 255, 0, 0, 255 };
+    const blue = [_]u8{ 0, 0, 255, 255 };
+    ctx.bindTexture(g.TEXTURE_CUBE_MAP, textures[1]);
+    ctx.texStorage2D(g.TEXTURE_CUBE_MAP, 1, g.RGBA8, 1, 1);
+    ctx.texSubImage2D(g.TEXTURE_CUBE_MAP_POSITIVE_X + 4, 0, 0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &blue);
+    var mutable_cube: [1]u32 = undefined;
+    ctx.genTextures(&mutable_cube);
+    ctx.bindTexture(g.TEXTURE_CUBE_MAP, mutable_cube[0]);
+    for (0..6) |face| {
+        const target = g.TEXTURE_CUBE_MAP_POSITIVE_X + @as(u32, @intCast(face));
+        ctx.texImage2D(target, 1, g.RGBA8, 1, 1, 0, g.RGBA, g.UNSIGNED_BYTE, &red);
+        ctx.texImage2D(target, 0, g.RGBA8, 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    }
+    ctx.copyImageSubData(textures[1], g.TEXTURE_CUBE_MAP, 0, 0, 0, 4, mutable_cube[0], g.TEXTURE_CUBE_MAP, 1, 0, 0, 4, 1, 1, 1);
+    ctx.texParameteri(g.TEXTURE_CUBE_MAP, g.TEXTURE_MIN_FILTER, g.NEAREST_MIPMAP_NEAREST);
+    ctx.texParameteri(g.TEXTURE_CUBE_MAP, g.TEXTURE_MAG_FILTER, g.NEAREST);
+    try sampleLayerTexture("#version 300 es\nprecision highp float; uniform highp samplerCube tex; out vec4 color;" ++
+        "void main() { color = textureLod(tex, vec3(0.0, 0.0, 1.0), 1.0); }", .{ 0, 0, 255, 255 });
+    const red_face = red ** 4;
+    const blue_face = blue ** 4;
+    for (0..6) |face| {
+        const target = g.TEXTURE_CUBE_MAP_POSITIVE_X + @as(u32, @intCast(face));
+        ctx.texSubImage2D(target, 0, 0, 0, 2, 2, g.RGBA, g.UNSIGNED_BYTE, if (face == 0) &blue_face else &red_face);
+    }
+    ctx.generateMipmap(g.TEXTURE_CUBE_MAP);
+    var pixel: [4]u8 = undefined;
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_CUBE_MAP_POSITIVE_X, mutable_cube[0], 1);
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqualSlices(u8, &blue, &pixel);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_CUBE_MAP_POSITIVE_X + 4, mutable_cube[0], 1);
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqualSlices(u8, &red, &pixel);
+    var array: [1]u32 = undefined;
+    ctx.genTextures(&array);
+    ctx.bindTexture(g.TEXTURE_2D_ARRAY, array[0]);
+    const array_pixels = blue_face ++ red_face;
+    ctx.texImage3D(g.TEXTURE_2D_ARRAY, 0, g.RGBA8, 2, 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, &array_pixels);
+    ctx.generateMipmap(g.TEXTURE_2D_ARRAY);
+    ctx.framebufferTextureLayer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, array[0], 1, 0);
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqualSlices(u8, &blue, &pixel);
+    ctx.framebufferTextureLayer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, array[0], 1, 1);
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqualSlices(u8, &red, &pixel);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    try std.testing.expect(!eng.lost);
+}
+
+fn compileLayerShader(kind: u32, source: [:0]const u8) !u32 {
+    const id = program.createShader(&ctx, kind);
+    errdefer program.deleteShader(&ctx, id);
+    const parts = [_]?[*]const u8{source.ptr};
+    program.shaderSource(&ctx, id, 1, &parts, null);
+    program.compileShader(&ctx, id);
+    var ok: i32 = 0;
+    program.getShaderiv(&ctx, id, g.COMPILE_STATUS, &ok);
+    try std.testing.expectEqual(@as(i32, 1), ok);
+    return id;
+}
+
+fn sampleLayerTexture(source: [:0]const u8, expected: [4]u8) !void {
+    const vs = try compileLayerShader(g.VERTEX_SHADER, "#version 300 es\nlayout(location=0) in vec4 pos; void main() { gl_Position=pos; }");
+    defer program.deleteShader(&ctx, vs);
+    const fs = try compileLayerShader(g.FRAGMENT_SHADER, source);
+    defer program.deleteShader(&ctx, fs);
+    const p = program.createProgram(&ctx);
+    defer program.deleteProgram(&ctx, p);
+    program.attachShader(&ctx, p, vs);
+    program.attachShader(&ctx, p, fs);
+    program.linkProgram(&ctx, p);
+    var ok: i32 = 0;
+    program.getProgramiv(&ctx, p, g.LINK_STATUS, &ok);
+    try std.testing.expectEqual(@as(i32, 1), ok);
+    program.useProgram(&ctx, p);
+    defer program.useProgram(&ctx, 0);
+    ctx.viewportSet(0, 0, 1, 1);
+    var buf: [1]u32 = undefined;
+    ctx.genBuffers(&buf);
+    const vertices = quad(0, 0, W, H, 0, .{ 0, 0, 0, 0 });
+    drawVerts(&ctx, buf[0], &vertices, g.TRIANGLES);
+    var pixel: [4]u8 = undefined;
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    const err = ctx.getError();
+    if (err != g.NO_ERROR) std.debug.print("layer sample: GL {x}, pipeline {?s}, GPU {?s}\n", .{ err, if (ctx.eng.why_pipe) |why| @errorName(why) else null, if (ctx.eng.why) |why| @errorName(why) else null });
+    try std.testing.expectEqual(g.NO_ERROR, err);
+    try std.testing.expectEqualSlices(u8, &expected, &pixel);
+}
+
 test "draw: the scene on the emulated Adreno (ir3) gives the CPU's bytes" {
     const want = try cpuOut();
     a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
@@ -376,6 +724,22 @@ test "draw: the scene on the emulated Adreno (ir3) gives the CPU's bytes" {
     try std.testing.expectEqualSlices(u8, &want.win, &out_a.win);
     // (every draw's three kernels ran on the GPU, compiled to ir3)
     try std.testing.expect(eng_a.stats.dispatches >= 3 * 9);
+    // The fake render node uses a bump arena. Give the independent
+    // texture scene a fresh device after the larger draw scene.
+    eng_a.deinit();
+    a_gpu.close();
+    a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
+    a_fake = .{ .emu = &a_emu };
+    a_gpu = .{ .node = .{ .sys = &a_fake } };
+    eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
+    try layeredCopy(&eng_a);
+    eng_a.deinit();
+    a_gpu.close();
+    a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
+    a_fake = .{ .emu = &a_emu };
+    a_gpu = .{ .node = .{ .sys = &a_fake } };
+    eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
+    try mutableCubeDraw(&eng_a);
     eng_a.deinit();
     a_gpu.close();
 }
@@ -393,13 +757,87 @@ const Rtx = struct {
     var work: [gpu.nvidia_device.kir_sm120.WORK_BYTES]u8 align(64) = undefined;
 };
 var eng_rtx: engine.Engine = undefined;
+var rtx_slabs: [16]engine.Slab = undefined;
+var stencil_adreno_slabs: [16]engine.Slab = undefined;
 var out_rtx: Out = .{};
+
+test "draw: Adreno suballocations preserve the scene and accelerate copies within one allocation" {
+    const want = try cpuOut();
+    a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
+    a_fake = .{ .emu = &a_emu };
+    a_gpu = .{ .node = .{ .sys = &a_fake } };
+    eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work, .slabs = &stencil_adreno_slabs });
+    defer a_gpu.close();
+    defer eng_a.deinit();
+    try scene(&eng_a, &out_a);
+    try std.testing.expectEqualSlices(u8, &want.fbo, &out_a.fbo);
+    try std.testing.expectEqualSlices(u8, &want.win, &out_a.win);
+    objs.init();
+    ctx.init(&eng_a, &objs);
+    defer ctx.deinit();
+    var names: [2]u32 = undefined;
+    ctx.genTextures(&names);
+    for (names) |name| {
+        ctx.bindTexture(g.TEXTURE_2D, name);
+        ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, 2, 2);
+    }
+    const src = &objs.tex[names[0] - 1].img;
+    const dst = &objs.tex[names[1] - 1].img;
+    try std.testing.expectEqual(src.buf.handle, dst.buf.handle);
+    const pixels = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    eng_a.writeBytes(src, 0, &pixels);
+    const before = eng_a.stats.cpu_ops;
+    ctx.copyImageSubData(names[0], g.TEXTURE_2D, 0, 0, 0, 0, names[1], g.TEXTURE_2D, 0, 0, 0, 0, 2, 2, 1);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    try std.testing.expectEqual(before, eng_a.stats.cpu_ops);
+    try std.testing.expectEqualSlices(u8, &pixels, eng_a.hostView(dst, 0, pixels.len));
+    try std.testing.expect(eng_a.why_pipe == null and !eng_a.lost);
+}
+
+test "draw: stencil operations on emulated Adreno and RTX with separate and packed attachments" {
+    for ([_]bool{ false, true }) |separate| {
+        a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
+        a_fake = .{ .emu = &a_emu };
+        a_gpu = .{ .node = .{ .sys = &a_fake } };
+        eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work, .slabs = &stencil_adreno_slabs });
+        defer a_gpu.close();
+        defer eng_a.deinit();
+        try stencilScene(&eng_a, separate);
+        try std.testing.expect(eng_a.why_pipe == null);
+        try std.testing.expect(!eng_a.lost);
+        try std.testing.expect(eng_a.stats.dispatches >= 3 * 13);
+    }
+    for ([_]bool{ false, true }) |separate| {
+        Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+        eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs });
+        defer eng_rtx.deinit();
+        try stencilScene(&eng_rtx, separate);
+        try std.testing.expect(eng_rtx.why_pipe == null);
+        try std.testing.expect(!eng_rtx.lost);
+        try std.testing.expect(eng_rtx.stats.dispatches >= 3 * 13);
+    }
+}
 
 test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CPU's bytes" {
     const want = try cpuOut();
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
-    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work });
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs });
     try std.testing.expect(eng_rtx.onGpu());
+    // Firefox exhausted the 256-entry render node with small allocations.
+    var small: [400]engine.Image = undefined;
+    for (&small, 0..) |*img, i| {
+        img.* = eng_rtx.newBuffer(80) orelse return error.OutOfMemory;
+        try std.testing.expectEqual(small[0].buf.handle, img.buf.handle);
+        try std.testing.expectEqual(small[0].buf.gpu + i * 128, img.buf.gpu);
+    }
+    var exported = eng_rtx.newWindowImage(32, 16, .bgra8) orelse return error.OutOfMemory;
+    try std.testing.expect(exported.buf.handle != small[0].buf.handle);
+    eng_rtx.freeImage(&exported);
+    const first_va = small[0].buf.gpu;
+    for (&small) |*img| eng_rtx.freeImage(img);
+    var reused = eng_rtx.newBuffer(80) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(first_va, reused.buf.gpu);
+    eng_rtx.freeImage(&reused);
     scene(&eng_rtx, &out_rtx) catch |e| {
         std.debug.print("rtx scene: {s}; the emulator's memory used {d} KiB of {d}, regions {d}; the engine lost the GPU {} ({?s}), its pipeline error {?s}\n", .{ @errorName(e), Rtx.dev.raw.used >> 10, Rtx.arena.len >> 10, Rtx.dev.raw.n_regions, eng_rtx.lost, if (eng_rtx.why) |w| @errorName(w) else null, if (eng_rtx.why_pipe) |w| @errorName(w) else null });
         if (Rtx.dev.lastError()) |le| {
@@ -420,6 +858,8 @@ test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CP
     try std.testing.expectEqualSlices(u8, &want.win, &out_rtx.win);
     // (every draw's three kernels ran on the RTX, compiled to sm_120)
     try std.testing.expect(eng_rtx.stats.dispatches >= 3 * 9);
+    try layeredCopy(&eng_rtx);
+    try mutableCubeDraw(&eng_rtx);
     eng_rtx.deinit();
 }
 

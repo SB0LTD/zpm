@@ -13,6 +13,9 @@
 //! Firefox's sources are not part of zpm (they are Mozilla's, under the
 //! MPL): set GFXAPI_WR_RES to a checkout's `gfx/wr/webrender/res`. Without
 //! it the test is skipped.
+//! For a different Firefox release, set GFXAPI_WR_VARIANTS to a manifest
+//! from that release's get_shader_features, one shader:FEATURE,FEATURE
+//! per line. The colon is required even when there are no features.
 //!
 //! The variants are webrender_build's `get_shader_features` for a GLES
 //! device with external textures (ESSL 3 and 1), dithering, every path
@@ -33,6 +36,33 @@ const program = gfxapi.program;
 const g = gfxapi.glenum;
 
 const Variant = struct { name: []const u8, features: []const u8 };
+var manifest_bytes: [16 * 1024]u8 = undefined;
+var manifest_variants: [256]Variant = undefined;
+
+fn selectedVariants(io: std.Io, allocator: std.mem.Allocator) ![]const Variant {
+    const path = std.testing.environ.getAlloc(allocator, "GFXAPI_WR_VARIANTS") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return &variants,
+        else => return err,
+    };
+    const data = try std.Io.Dir.cwd().readFile(io, path, &manifest_bytes);
+    if (data.len == manifest_bytes.len) return error.VariantManifestTooLong;
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidVariant;
+        const name = line[0..colon];
+        if (name.len == 0 or count == manifest_variants.len) return error.InvalidVariant;
+        for (name) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and ch != '_') return error.InvalidVariant;
+        }
+        manifest_variants[count] = .{ .name = name, .features = line[colon + 1 ..] };
+        count += 1;
+    }
+    if (count == 0) return error.EmptyVariantManifest;
+    return manifest_variants[0..count];
+}
 
 /// webrender_build's get_shader_features(GLES | TEXTURE_EXTERNAL |
 /// TEXTURE_EXTERNAL_ESSL1 | DITHERING | PATH_AA_ALL_MODES | DEBUG).
@@ -287,7 +317,8 @@ test "webrender: every shader variant compiles and links" {
     var failed: usize = 0;
     var no_code: usize = 0;
     var reported: usize = 0;
-    for (variants) |v| {
+    const selected = try selectedVariants(io, fba.allocator());
+    for (selected) |v| {
         const vs = try build(dir, io, v, true, &vs_buf, &builder);
         const fs = try build(dir, io, v, false, &fs_buf, &builder);
         const sv = program.createShader(c, g.VERTEX_SHADER);
@@ -358,7 +389,7 @@ test "webrender: every shader variant compiles and links" {
         program.useProgram(c, 0);
         _ = c.getError();
     }
-    std.debug.print("webrender: {d} of {d} variants link; {d} kernels do not compile ({d} not required)\n", .{ variants.len - failed, variants.len, no_code, reported });
+    std.debug.print("webrender: {d} of {d} variants link; {d} kernels do not compile ({d} not required)\n", .{ selected.len - failed, selected.len, no_code, reported });
     std.debug.print("webrender on sm_120: the largest kernel {d} KIR, {d} machine instructions; the slowest compile {d} us ({s}); inside the backend at most {d} KIR expanded, {d} MI, {d} vregs\n", .{ max_kir, max_mi, @divTrunc(max_ns, 1000), max_what[0..max_what_len], max_xkir, max_xmi, max_vregs });
     try std.testing.expectEqual(@as(usize, 0), failed);
     try std.testing.expectEqual(@as(usize, 0), no_code);

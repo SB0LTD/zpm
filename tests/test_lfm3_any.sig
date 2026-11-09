@@ -257,14 +257,14 @@ fn failure(b: *const Backend, e: anyerror) anyerror {
 
 /// A prompt, decode steps, then the CPU on the GPU's state; the worst
 /// relative logit difference.
-fn followTheCpu(which: Device, tolerance: f64) !f64 {
+fn followTheCpu(which: Device, tolerance: f64, tiled_attention: bool) !f64 {
     try fixture.initialize();
     const plan = &fixture.plan;
     // (the CPU executor maps its file; the discrete GPU's is read only: copied)
     const src = fixture.source();
     const gpu_src = if (which == .discrete) fixture.readOnly() else src;
     const d = makeDevice(which);
-    var backend = Backend.init(d, plan, &fixture.index, gpu_src, .{ .max_batch = 16, .attention_tokens = 8 }, &work) catch |e| {
+    var backend = Backend.init(d, plan, &fixture.index, gpu_src, .{ .max_batch = 16, .attention_tokens = 8, .tiled_attention = tiled_attention }, &work) catch |e| {
         std.debug.print("init on {s}: {s}\n", .{ @tagName(which), @errorName(e) });
         return e;
     };
@@ -391,19 +391,20 @@ test "a profiled run: each dispatch's time from the latest end before it, matric
 }
 
 test "the any-GPU backend follows the CPU executor on an ideal GPU, and the CPU takes over from its state" {
-    _ = try followTheCpu(.ideal, 1e-4);
+    _ = try followTheCpu(.ideal, 1e-4, true);
 }
 
 test "...on a GPU without fused FMA, mad rounded twice, denormals flushed, subgroups of 64" {
-    _ = try followTheCpu(.unfused, 1e-4);
+    _ = try followTheCpu(.unfused, 1e-4, true);
+    _ = try followTheCpu(.unfused, 1e-4, false);
 }
 
 test "...on discrete memory: VRAM without a CPU view, staging, the copy kernel" {
-    _ = try followTheCpu(.discrete, 1e-4);
+    _ = try followTheCpu(.discrete, 1e-4, true);
 }
 
 test "...on non-coherent unified memory (every hand-over checked)" {
-    _ = try followTheCpu(.noncoherent, 1e-4);
+    _ = try followTheCpu(.noncoherent, 1e-4, true);
 }
 
 test "every matrix layout for one-token passes, asked for: the CPU's logits through the model" {
@@ -448,8 +449,8 @@ test "every matrix layout for one-token passes, asked for: the CPU's logits thro
 }
 
 test "...with subgroups of 8 (reductions through shared memory) in groups of 64, and of 128" {
-    _ = try followTheCpu(.narrow, 1e-4);
-    _ = try followTheCpu(.wide, 1e-4);
+    _ = try followTheCpu(.narrow, 1e-4, true);
+    _ = try followTheCpu(.wide, 1e-4, true);
 }
 
 /// The emulated GPU, whose next wait fails (or runs out) when asked.

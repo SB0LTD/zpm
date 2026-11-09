@@ -28,8 +28,10 @@
 //! owns (a context and its Objects, each at a fixed address).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const engine = @import("engine.sig");
 const report = @import("report.sig");
+pub const debug_output = @import("debug_output.sig");
 const raster = @import("raster.sig");
 const program = @import("program.sig");
 const texture = @import("texture.sig");
@@ -76,6 +78,8 @@ pub const EXTENSIONS = [_][:0]const u8{
     // CONTEXT_LOST once; the n-forms of ReadPixels and GetUniform)
     "GL_EXT_robustness",
     "GL_KHR_robustness",
+    "GL_EXT_debug_marker",
+    "GL_KHR_debug",
 };
 
 /// EGL's EGLImage handles to their images (egl.sig sets it): what
@@ -106,12 +110,17 @@ pub const TexParams = struct {
 /// A sampler object (glGenSamplers): filters and wraps in place of its
 /// unit's texture's.
 pub const Smp = struct {
+    label: debug_output.Label = .{},
     named: bool = false,
     made: bool = false,
     params: TexParams = .{},
 };
 
+pub var stream_changed: ?*const fn () void = null;
+
 pub const Tex = struct {
+    stream_owner: ?*anyopaque = null,
+    label: debug_output.Label = .{},
     named: bool = false,
     made: bool = false,
     /// deleted while attached somewhere: freed at the last detach
@@ -119,24 +128,37 @@ pub const Tex = struct {
     refs: u32 = 0,
     target: u32 = 0,
     img: Image = .{},
+    slice_share: engine.Shared = .{},
     internal: u32 = 0,
     levels: u32 = 0,
+    layers: u32 = 1,
     /// the levels specified (bit l: level l), stored in img's chain
     defined: u16 = 0,
+    extra_levels: [engine.MAX_LEVELS]u16 = @splat(0),
+    cube_faces: [6][engine.MAX_LEVELS]u16 = @splat(@splat(0)),
     immutable: bool = false,
     params: TexParams = .{},
     /// GL's R, G, B, A as the stored texel's channels (LUMINANCE ...),
     /// and sRGB
     fswz: [4]u3 = .{ 0, 1, 2, 3 },
     srgb: bool = false,
+
+    fn disconnectStream(t: *Tex) void {
+        if (t.stream_owner == null) return;
+        t.stream_owner = null;
+        if (stream_changed) |notify| notify();
+    }
 };
 
 pub const Buf = struct {
+    label: debug_output.Label = .{},
     named: bool = false,
     made: bool = false,
     store: Image = .{},
     size: usize = 0,
     usage: u32 = g.STATIC_DRAW,
+    immutable: bool = false,
+    storage_flags: u32 = 0,
     /// glMapBufferRange's: the range the CPU has (none: not mapped)
     map: ?[]u8 = null,
     map_off: usize = 0,
@@ -154,8 +176,14 @@ const MAP_INVALIDATE_RANGE = 0x4;
 const MAP_INVALIDATE_BUFFER = 0x8;
 const MAP_FLUSH_EXPLICIT = 0x10;
 const MAP_UNSYNCHRONIZED = 0x20;
+const MAP_PERSISTENT = 0x40;
+const MAP_COHERENT = 0x80;
+const DYNAMIC_STORAGE = 0x100;
+const CLIENT_STORAGE = 0x200;
+const CLIENT_MAPPED_BUFFER_BARRIER = 0x4000;
 
 pub const Rb = struct {
+    label: debug_output.Label = .{},
     named: bool = false,
     made: bool = false,
     orphan: bool = false,
@@ -171,10 +199,21 @@ pub const Rb = struct {
 pub const MAX_SYNCS = 1024;
 
 /// A fence: the engine's mark after the work before it.
-pub const Sync = struct { used: bool = false, mark: u64 = 0 };
+pub const Sync = struct { used: bool = false, mark: u64 = 0, label: debug_output.Label = .{} };
+
+const ExtraLevel = struct {
+    used: bool = false,
+    img: Image = .{},
+    share: engine.Shared = .{},
+    internal: u32 = 0,
+    layers: u32 = 1,
+    srgb: bool = false,
+    swizzle: [4]u3 = .{ 0, 1, 2, 3 },
+};
 
 pub const Objects = struct {
     tex: [MAX_TEXTURES]Tex = undefined,
+    extra_levels: [512]ExtraLevel = undefined,
     bufs: [MAX_BUFFERS]Buf = undefined,
     rbs: [MAX_RENDERBUFFERS]Rb = undefined,
     samplers: [MAX_SAMPLERS]Smp = undefined,
@@ -184,6 +223,7 @@ pub const Objects = struct {
 
     pub fn init(o: *Objects) void {
         for (&o.tex) |*t| t.* = .{};
+        for (&o.extra_levels) |*mip| mip.* = .{};
         for (&o.bufs) |*b| b.* = .{};
         for (&o.rbs) |*b| b.* = .{};
         for (&o.samplers) |*s| s.* = .{};
@@ -195,6 +235,7 @@ pub const Objects = struct {
     fn release(o: *Objects, eng: *Engine) void {
         program.dropOwner(o);
         for (&o.tex) |*t| eng.freeImage(&t.img);
+        for (&o.extra_levels) |*mip| eng.freeImage(&mip.img);
         for (&o.bufs) |*b| eng.freeImage(&b.store);
         for (&o.rbs) |*b| eng.freeImage(&b.img);
         o.init();
@@ -205,9 +246,14 @@ pub const Attach = struct {
     pub const Kind = enum(u8) { none, tex, rb };
     kind: Kind = .none,
     name: u32 = 0,
+    level: u32 = 0,
+    layer: u32 = 0,
+    face: u32 = 0,
+    slice: Image = .{},
 };
 
 pub const Fbo = struct {
+    label: debug_output.Label = .{},
     named: bool = false,
     made: bool = false,
     color: [MAX_COLOR]Attach = [_]Attach{.{}} ** MAX_COLOR,
@@ -273,6 +319,7 @@ pub const VAttr = struct {
 };
 
 pub const Vao = struct {
+    label: debug_output.Label = .{},
     named: bool = false,
     made: bool = false,
     attrs: [MAX_ATTRS]VAttr = [_]VAttr{.{}} ** MAX_ATTRS,
@@ -526,11 +573,76 @@ fn wrapOf(w: u32) texture.Wrap {
     };
 }
 
+pub const TIME_ELAPSED_EXT = 0x88BF;
+pub const TIMESTAMP_EXT = 0x8E28;
+const TimerQuery = struct {
+    label: debug_output.Label = .{},
+    named: bool = false,
+    target: u32 = 0,
+    value: u64 = 0,
+    ready: bool = false,
+};
+
+const StencilState = struct {
+    func: u32 = g.ALWAYS,
+    reference: u8 = 0,
+    value_mask: u32 = 0xffffffff,
+    fail: raster.StencilOp = .keep,
+    depth_fail: raster.StencilOp = .keep,
+    pass: raster.StencilOp = .keep,
+
+    fn draw(state: StencilState, write_mask: u32) raster.Stencil {
+        return .{
+            .func = @intCast(state.func - g.NEVER),
+            .reference = state.reference,
+            .value_mask = @truncate(state.value_mask),
+            .write_mask = @truncate(write_mask),
+            .fail = state.fail,
+            .depth_fail = state.depth_fail,
+            .pass = state.pass,
+        };
+    }
+};
+
+fn stencilOpOf(op: u32) ?raster.StencilOp {
+    return switch (op) {
+        g.KEEP => .keep,
+        g.ZERO => .zero,
+        g.REPLACE => .replace,
+        g.INCR => .incr,
+        g.DECR => .decr,
+        g.INVERT => .invert,
+        g.INCR_WRAP => .incr_wrap,
+        g.DECR_WRAP => .decr_wrap,
+        else => null,
+    };
+}
+
+fn stencilEnum(op: raster.StencilOp) u32 {
+    return switch (op) {
+        .keep => g.KEEP,
+        .zero => g.ZERO,
+        .replace => g.REPLACE,
+        .incr => g.INCR,
+        .decr => g.DECR,
+        .invert => g.INVERT,
+        .incr_wrap => g.INCR_WRAP,
+        .decr_wrap => g.DECR_WRAP,
+    };
+}
+
 pub const Context = struct {
     eng: *Engine,
     objs: *Objects,
     err: u32 = g.NO_ERROR,
     reset_told: bool = false,
+    marker_depth: u32 = 0,
+    debug: debug_output.Output = .{},
+    debug_context: bool = false,
+    timers: [128]TimerQuery = @splat(.{}),
+    elapsed: u32 = 0,
+    elapsed_begin: u64 = 0,
+    timer_disjoint: bool = false,
     /// EGL's reset notification strategy is LOSE_CONTEXT_ON_RESET (else
     /// NO_RESET_NOTIFICATION, which says nothing of a reset)
     lose_on_reset: bool = false,
@@ -553,11 +665,14 @@ pub const Context = struct {
     depth_mask: bool = true,
     stencil_mask: u32 = 0xffff_ffff,
     stencil_back_mask: u32 = 0xffff_ffff,
+    stencil_front: StencilState = .{},
+    stencil_back: StencilState = .{},
     viewport: [4]i32 = .{ 0, 0, 0, 0 },
     scissor: [4]i32 = .{ 0, 0, 0, 0 },
     enabled: u32 = 1 << 3, // (DITHER is on at first)
     unit: u32 = 0,
     tex2d: [MAX_UNITS]u32 = [_]u32{0} ** MAX_UNITS,
+    layered: [3][MAX_UNITS]u32 = @splat(@splat(0)),
     tex_ext: [MAX_UNITS]u32 = [_]u32{0} ** MAX_UNITS,
     /// texture 0 of TEXTURE_2D and of TEXTURE_EXTERNAL_OES (each context
     /// has its own)
@@ -574,6 +689,7 @@ pub const Context = struct {
     /// glVertexAttrib*'s values (where an array is off), and whether each is an integer one
     generic: [MAX_ATTRS][4]u32 = [_][4]u32{.{ 0, 0, 0, 0x3f80_0000 }} ** MAX_ATTRS,
     generic_int: [MAX_ATTRS]bool = [_]bool{false} ** MAX_ATTRS,
+    generic_unsigned: [MAX_ATTRS]bool = @splat(false),
     blend_src_rgb: u32 = g.ONE,
     blend_dst_rgb: u32 = g.ZERO,
     blend_src_a: u32 = g.ONE,
@@ -607,6 +723,144 @@ pub const Context = struct {
 
     /// A context in place over `eng`, holding `objs` (a new share group's,
     /// initialized by the caller, or another context's).
+    fn timerAvailable(c: *const Context) bool {
+        return c.eng.onGpu() and c.eng.dev.?.vtable.timestampNs != null;
+    }
+
+    fn timerSample(c: *Context) ?u64 {
+        if (!c.timerAvailable()) {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        }
+        c.eng.flush();
+        if (!c.timerAvailable()) {
+            c.timer_disjoint = true;
+            return null;
+        }
+        const d = c.eng.dev.?;
+        return d.vtable.timestampNs.?(d.ctx, engine.TIMEOUT_US) catch {
+            c.timer_disjoint = true;
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        };
+    }
+
+    pub fn genTimerQueries(c: *Context, out: []u32) void {
+        var free: usize = 0;
+        for (c.timers, 0..) |q, i| {
+            if (!q.named and c.elapsed != i + 1) free += 1;
+        }
+        if (free < out.len) return c.fail(g.OUT_OF_MEMORY);
+        var n: usize = 0;
+        for (&c.timers, 0..) |*q, i| {
+            if (n == out.len) break;
+            if (q.named or c.elapsed == i + 1) continue;
+            q.* = .{ .named = true };
+            out[n] = @intCast(i + 1);
+            n += 1;
+        }
+    }
+
+    fn timerOf(c: *Context, name: u32) ?*TimerQuery {
+        if (name == 0 or name > c.timers.len) return null;
+        const q = &c.timers[name - 1];
+        return if (q.named) q else null;
+    }
+
+    pub fn isTimerQuery(c: *Context, name: u32) bool {
+        const q = c.timerOf(name) orelse return false;
+        return q.target != 0;
+    }
+
+    pub fn deleteTimerQueries(c: *Context, names: []const u32) void {
+        for (names) |name| {
+            if (c.timerOf(name)) |q| q.* = .{};
+        }
+    }
+
+    pub fn beginTimer(c: *Context, target: u32, name: u32) void {
+        if (target != TIME_ELAPSED_EXT) return c.fail(g.INVALID_ENUM);
+        const q = c.timerOf(name) orelse return c.fail(g.INVALID_OPERATION);
+        if (c.elapsed != 0 or (q.target != 0 and q.target != target)) return c.fail(g.INVALID_OPERATION);
+        const t = c.timerSample() orelse return;
+        q.target = target;
+        q.ready = false;
+        c.elapsed = name;
+        c.elapsed_begin = t;
+    }
+
+    pub fn endTimer(c: *Context, target: u32) void {
+        if (target != TIME_ELAPSED_EXT) return c.fail(g.INVALID_ENUM);
+        if (c.elapsed == 0) return c.fail(g.INVALID_OPERATION);
+        const name = c.elapsed;
+        c.elapsed = 0;
+        const q = c.timerOf(name) orelse return;
+        const t = c.timerSample() orelse return;
+        if (t < c.elapsed_begin) c.timer_disjoint = true;
+        q.value = t -| c.elapsed_begin;
+        q.ready = true;
+    }
+
+    pub fn timerCounter(c: *Context, name: u32, target: u32) void {
+        if (target != TIMESTAMP_EXT) return c.fail(g.INVALID_ENUM);
+        const q = c.timerOf(name) orelse return c.fail(g.INVALID_OPERATION);
+        if (c.elapsed == name or (q.target != 0 and q.target != target)) return c.fail(g.INVALID_OPERATION);
+        const t = c.timerSample() orelse return;
+        q.target = target;
+        q.ready = true;
+        q.value = t;
+    }
+
+    pub fn timerState(c: *Context, target: u32, pname: u32) ?i32 {
+        if (target == TIME_ELAPSED_EXT or target == TIMESTAMP_EXT) {
+            if (pname == 0x8864) return if (c.timerAvailable()) 64 else 0;
+            if (pname == 0x8865 and target == TIME_ELAPSED_EXT) return @intCast(c.elapsed);
+        }
+        c.fail(g.INVALID_ENUM);
+        return null;
+    }
+
+    pub fn timerResult(c: *Context, name: u32, pname: u32) ?u64 {
+        const q = c.timerOf(name) orelse {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        };
+        if (q.target == 0 or c.elapsed == name) {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        }
+        if (pname == 0x8867) return @intFromBool(q.ready);
+        if (pname == 0x8866) {
+            if (q.ready) return q.value;
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        }
+        c.fail(g.INVALID_ENUM);
+        return null;
+    }
+
+    pub fn debugMarker(c: *Context, kind: enum { event, push, pop }, length: i32, marker: ?[*]const u8) void {
+        if (kind == .pop) {
+            if (c.marker_depth == 0) return;
+            c.marker_depth -= 1;
+            report.say(.marker, "GL marker: end group at depth {d}", .{c.marker_depth});
+            return;
+        }
+        if (length < 0 or (kind == .event and marker == null)) return;
+        var label: [128]u8 = undefined;
+        var n: usize = 0;
+        if (marker) |s| {
+            const limit = if (length == 0) label.len else @min(label.len, @as(usize, @intCast(length)));
+            while (n < limit) : (n += 1) {
+                const ch = s[n];
+                if (length == 0 and ch == 0) break;
+                label[n] = if (ch >= 0x20 and ch < 0x7f) ch else '?';
+            }
+        }
+        report.say(.marker, "GL marker: {s} at depth {d}: {s}", .{ @tagName(kind), c.marker_depth, label[0..n] });
+        if (kind == .push) c.marker_depth +|= 1;
+    }
+
     pub fn init(c: *Context, eng: *Engine, objs: *Objects) void {
         c.* = .{ .eng = eng, .objs = objs };
         for (&c.fbos) |*f| f.* = .{};
@@ -622,6 +876,7 @@ pub const Context = struct {
             if (f.made) c.detachAll(f);
         }
         c.eng.freeImage(&c.default_tex.img);
+        c.dropExtraLevels(&c.default_tex);
         c.eng.freeImage(&c.default_ext.img);
         c.objs.users -= 1;
         if (c.objs.users == 0) c.objs.release(c.eng);
@@ -644,8 +899,22 @@ pub const Context = struct {
     }
 
     pub fn fail(c: *Context, e: u32) void {
-        if (c.err == g.NO_ERROR) c.err = e;
         report.say(.gl_error, "GL error 0x{x}", .{e});
+        c.recordError(e);
+    }
+
+    pub fn invalidEnum(c: *Context, comptime op: []const u8, value: u32) void {
+        report.say(.gl_error, "{s}: GL_INVALID_ENUM (0x{x})", .{ op, value });
+        c.recordError(g.INVALID_ENUM);
+    }
+
+    fn recordError(c: *Context, e: u32) void {
+        if (c.err == g.NO_ERROR) c.err = e;
+        if (c.debug.enabled) {
+            var buf: [32]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "GL error 0x{x}", .{e}) catch return;
+            c.debug.emit(debug_output.API, debug_output.ERROR, e, debug_output.HIGH, msg);
+        }
     }
 
     // ── Errors, strings, state ─────────────────────────────────────────────
@@ -679,7 +948,7 @@ pub const Context = struct {
             g.SHADING_LANGUAGE_VERSION => GLSL_STRING.ptr,
             g.EXTENSIONS => EXTENSIONS_STRING.ptr,
             else => {
-                c.fail(g.INVALID_ENUM);
+                c.invalidEnum("glGetString", name);
                 return null;
             },
         };
@@ -687,7 +956,7 @@ pub const Context = struct {
 
     pub fn getStringi(c: *Context, name: u32, index: u32) ?[*:0]const u8 {
         if (name != g.EXTENSIONS) {
-            c.fail(g.INVALID_ENUM);
+            c.invalidEnum("glGetStringi", name);
             return null;
         }
         if (index >= EXTENSIONS.len) {
@@ -698,25 +967,35 @@ pub const Context = struct {
     }
 
     pub fn enable(c: *Context, cap: u32, on: bool) void {
-        const b = capBit(cap) orelse return c.fail(g.INVALID_ENUM);
+        if (cap == debug_output.OUTPUT) {
+            c.debug.enabled = on;
+            return;
+        }
+        if (cap == debug_output.SYNCHRONOUS) {
+            c.debug.synchronous = on;
+            return;
+        }
+        const b = capBit(cap) orelse return if (on) c.invalidEnum("glEnable", cap) else c.invalidEnum("glDisable", cap);
         const m = @as(u32, 1) << b;
         if (on) c.enabled |= m else c.enabled &= ~m;
     }
 
     pub fn isEnabled(c: *Context, cap: u32) bool {
+        if (cap == debug_output.OUTPUT) return c.debug.enabled;
+        if (cap == debug_output.SYNCHRONOUS) return c.debug.synchronous;
         const b = capBit(cap) orelse {
-            c.fail(g.INVALID_ENUM);
+            c.invalidEnum("glIsEnabled", cap);
             return false;
         };
         return c.enabled & (@as(u32, 1) << b) != 0;
     }
 
     pub fn hint(c: *Context, target: u32, mode: u32) void {
-        if (mode != g.DONT_CARE and mode != g.FASTEST and mode != g.NICEST) return c.fail(g.INVALID_ENUM);
+        if (mode != g.DONT_CARE and mode != g.FASTEST and mode != g.NICEST) return c.invalidEnum("glHint mode", mode);
         switch (target) {
             g.GENERATE_MIPMAP_HINT => c.hint_mipmap = mode,
             g.FRAGMENT_SHADER_DERIVATIVE_HINT => c.hint_derivative = mode,
-            else => c.fail(g.INVALID_ENUM),
+            else => c.invalidEnum("glHint target", target),
         }
     }
 
@@ -735,7 +1014,7 @@ pub const Context = struct {
             g.UNPACK_SKIP_PIXELS => c.unpack.skip_pixels = param,
             g.UNPACK_IMAGE_HEIGHT => c.unpack.image_height = param,
             g.UNPACK_SKIP_IMAGES => c.unpack.skip_images = param,
-            else => c.fail(g.INVALID_ENUM),
+            else => c.invalidEnum("glPixelStorei", pname),
         }
     }
 
@@ -777,6 +1056,39 @@ pub const Context = struct {
                 c.stencil_back_mask = mask;
             },
             else => c.fail(g.INVALID_ENUM),
+        }
+    }
+
+    pub fn stencilFuncSeparate(c: *Context, face: u32, func: u32, reference: i32, mask: u32) void {
+        if (face != g.FRONT and face != g.BACK and face != g.FRONT_AND_BACK) return c.fail(g.INVALID_ENUM);
+        if (func < g.NEVER or func > g.ALWAYS) return c.fail(g.INVALID_ENUM);
+        const ref: u8 = @intCast(std.math.clamp(reference, 0, 255));
+        if (face != g.BACK) {
+            c.stencil_front.func = func;
+            c.stencil_front.reference = ref;
+            c.stencil_front.value_mask = mask;
+        }
+        if (face != g.FRONT) {
+            c.stencil_back.func = func;
+            c.stencil_back.reference = ref;
+            c.stencil_back.value_mask = mask;
+        }
+    }
+
+    pub fn stencilOpSeparate(c: *Context, face: u32, stencil_fail: u32, depth_fail: u32, pass: u32) void {
+        if (face != g.FRONT and face != g.BACK and face != g.FRONT_AND_BACK) return c.fail(g.INVALID_ENUM);
+        const sf = stencilOpOf(stencil_fail) orelse return c.fail(g.INVALID_ENUM);
+        const df = stencilOpOf(depth_fail) orelse return c.fail(g.INVALID_ENUM);
+        const dp = stencilOpOf(pass) orelse return c.fail(g.INVALID_ENUM);
+        if (face != g.BACK) {
+            c.stencil_front.fail = sf;
+            c.stencil_front.depth_fail = df;
+            c.stencil_front.pass = dp;
+        }
+        if (face != g.FRONT) {
+            c.stencil_back.fail = sf;
+            c.stencil_back.depth_fail = df;
+            c.stencil_back.pass = dp;
         }
     }
 
@@ -826,6 +1138,22 @@ pub const Context = struct {
             return int(c.fbos[c.draw_fb - 1].draw[i]);
         }
         return switch (pname) {
+            TIMESTAMP_EXT => int(@intCast(@min(c.timerSample() orelse return null, std.math.maxInt(i64)))),
+            0x8FBB => blk: {
+                const value = c.timer_disjoint or c.eng.lost;
+                c.timer_disjoint = false;
+                break :blk boolean(value);
+            },
+            0x821E => int(if (c.debug_context) 2 else 0), // CONTEXT_FLAGS
+            debug_output.OUTPUT => boolean(c.debug.enabled),
+            debug_output.SYNCHRONOUS => boolean(c.debug.synchronous),
+            0x9143 => int(debug_output.MAX_TEXT), // MAX_DEBUG_MESSAGE_LENGTH
+            0x9144 => int(debug_output.MAX_MESSAGES), // MAX_DEBUG_LOGGED_MESSAGES
+            0x82E8 => int(debug_output.MAX_LABEL_LENGTH),
+            0x826C => int(debug_output.MAX_GROUP_DEPTH), // MAX_DEBUG_GROUP_STACK_DEPTH
+            0x826D => int(@intCast(c.debug.group_len + 1)), // DEBUG_GROUP_STACK_DEPTH
+            0x9145 => int(@intCast(c.debug.len)), // DEBUG_LOGGED_MESSAGES
+            0x8243 => int(@intCast(c.debug.nextLength())), // DEBUG_NEXT_LOGGED_MESSAGE_LENGTH
             g.VIEWPORT => ints(&.{ c.viewport[0], c.viewport[1], c.viewport[2], c.viewport[3] }),
             g.SCISSOR_BOX => ints(&.{ c.scissor[0], c.scissor[1], c.scissor[2], c.scissor[3] }),
             g.COLOR_CLEAR_VALUE => .{ .kind = .float, .n = 4, .f = c.clear_color, .normalized = true },
@@ -835,7 +1163,19 @@ pub const Context = struct {
             g.DEPTH_WRITEMASK => boolean(c.depth_mask),
             g.STENCIL_WRITEMASK => int(c.stencil_mask),
             g.STENCIL_BACK_WRITEMASK => int(c.stencil_back_mask),
-            g.MAX_TEXTURE_SIZE, g.MAX_RENDERBUFFER_SIZE => int(MAX_SIZE),
+            g.STENCIL_FUNC => int(c.stencil_front.func),
+            g.STENCIL_REF => int(c.stencil_front.reference),
+            g.STENCIL_VALUE_MASK => int(c.stencil_front.value_mask),
+            g.STENCIL_FAIL => int(stencilEnum(c.stencil_front.fail)),
+            g.STENCIL_PASS_DEPTH_FAIL => int(stencilEnum(c.stencil_front.depth_fail)),
+            g.STENCIL_PASS_DEPTH_PASS => int(stencilEnum(c.stencil_front.pass)),
+            g.STENCIL_BACK_FUNC => int(c.stencil_back.func),
+            g.STENCIL_BACK_REF => int(c.stencil_back.reference),
+            g.STENCIL_BACK_VALUE_MASK => int(c.stencil_back.value_mask),
+            g.STENCIL_BACK_FAIL => int(stencilEnum(c.stencil_back.fail)),
+            g.STENCIL_BACK_PASS_DEPTH_FAIL => int(stencilEnum(c.stencil_back.depth_fail)),
+            g.STENCIL_BACK_PASS_DEPTH_PASS => int(stencilEnum(c.stencil_back.pass)),
+            g.MAX_TEXTURE_SIZE, g.MAX_CUBE_MAP_TEXTURE_SIZE, g.MAX_RENDERBUFFER_SIZE => int(MAX_SIZE),
             g.MAX_VIEWPORT_DIMS => ints(&.{ MAX_SIZE, MAX_SIZE }),
             g.MAX_COLOR_ATTACHMENTS, g.MAX_DRAW_BUFFERS => int(MAX_COLOR),
             g.MAX_TEXTURE_IMAGE_UNITS => int(16),
@@ -854,6 +1194,9 @@ pub const Context = struct {
             g.READ_FRAMEBUFFER_BINDING => int(c.read_fb),
             g.RENDERBUFFER_BINDING => int(c.rb),
             g.TEXTURE_BINDING_2D => int(c.tex2d[c.unit]),
+            g.TEXTURE_BINDING_3D => int(c.layered[0][c.unit]),
+            g.TEXTURE_BINDING_2D_ARRAY => int(c.layered[1][c.unit]),
+            g.TEXTURE_BINDING_CUBE_MAP => int(c.layered[2][c.unit]),
             g.TEXTURE_BINDING_EXTERNAL_OES => int(c.tex_ext[c.unit]),
             g.SAMPLER_BINDING => int(c.smp[c.unit]),
             g.REQUIRED_TEXTURE_IMAGE_UNITS_OES => int(1),
@@ -926,7 +1269,7 @@ pub const Context = struct {
     }
 
     pub fn getIntegers(c: *Context, pname: u32, out: []i32) void {
-        const v = c.get(pname) orelse return c.fail(g.INVALID_ENUM);
+        const v = c.get(pname) orelse return c.invalidEnum("glGetIntegerv", pname);
         for (0..@min(v.n, out.len)) |i| {
             out[i] = switch (v.kind) {
                 .int, .boolean => @truncate(v.i[i]),
@@ -939,7 +1282,7 @@ pub const Context = struct {
     }
 
     pub fn getFloats(c: *Context, pname: u32, out: []f32) void {
-        const v = c.get(pname) orelse return c.fail(g.INVALID_ENUM);
+        const v = c.get(pname) orelse return c.invalidEnum("glGetFloatv", pname);
         for (0..@min(v.n, out.len)) |i| {
             out[i] = switch (v.kind) {
                 .int, .boolean => @floatFromInt(v.i[i]),
@@ -949,7 +1292,7 @@ pub const Context = struct {
     }
 
     pub fn getBooleans(c: *Context, pname: u32, out: []u8) void {
-        const v = c.get(pname) orelse return c.fail(g.INVALID_ENUM);
+        const v = c.get(pname) orelse return c.invalidEnum("glGetBooleanv", pname);
         for (0..@min(v.n, out.len)) |i| {
             out[i] = @intFromBool(switch (v.kind) {
                 .int, .boolean => v.i[i] != 0,
@@ -966,14 +1309,23 @@ pub const Context = struct {
 
     /// The image an attachment names, and whether it may be attached
     /// there: null with `ok` when nothing is attached.
-    fn attached(c: *Context, a: Attach, want: enum { color, depth, stencil }) struct { img: ?*Image, ok: bool } {
+    fn attached(c: *Context, a: *Attach, want: enum { color, depth, stencil }) struct { img: ?*Image, ok: bool } {
         switch (a.kind) {
             .none => return .{ .img = null, .ok = true },
             .tex => {
                 const t = slotIn(Tex, &c.objs.tex, a.name) orelse return .{ .img = null, .ok = false };
-                if (!t.img.live()) return .{ .img = null, .ok = false };
-                const ok = want == .color and t.img.format.renderable() and !t.srgb and renderableInternal(t.internal);
-                return .{ .img = &t.img, .ok = ok };
+                const face = if (a.face != 0 and !t.immutable) c.cubeFace(t, a.level, a.layer) else null;
+                const mip = if (face) |f| levelOfExtra(f) else c.textureLevel(t, a.level) orelse return .{ .img = null, .ok = false };
+                const layer = if (face != null) 0 else a.layer;
+                if (!mip.img.live() or layer >= mip.layers) return .{ .img = null, .ok = false };
+                const ok = switch (want) {
+                    .color => mip.img.format.renderable() and renderableInternal(mip.internal) and !mip.srgb,
+                    .depth => hasDepth(mip.internal),
+                    .stencil => hasStencil(mip.internal),
+                };
+                if (t.target == g.TEXTURE_2D and mip.level == 0) return .{ .img = mip.img, .ok = ok };
+                a.slice = engine.borrowSlice(mip.img, mip.share, mip.level, layer);
+                return .{ .img = &a.slice, .ok = ok };
             },
             .rb => {
                 const rb = c.rbOf(a.name) orelse return .{ .img = null, .ok = false };
@@ -1018,13 +1370,16 @@ pub const Context = struct {
         var h: u32 = std.math.maxInt(u32);
         var bad = false;
         var colors: [MAX_COLOR]?*Image = [_]?*Image{null} ** MAX_COLOR;
-        for (f.color, 0..) |a, i| {
+        for (&f.color, 0..) |*a, i| {
             const x = c.attached(a, .color);
             if (!x.ok) bad = true;
             colors[i] = x.img;
         }
-        const d = c.attached(f.depth, .depth);
-        const s = c.attached(f.stencil, .stencil);
+        const d = c.attached(&f.depth, .depth);
+        var s = c.attached(&f.stencil, .stencil);
+        if (d.ok and s.ok and f.depth.kind == .tex and f.stencil.kind == .tex and
+            f.depth.name == f.stencil.name and f.depth.level == f.stencil.level and f.depth.layer == f.stencil.layer)
+            s.img = d.img;
         if (!d.ok or !s.ok) bad = true;
         var all: [MAX_COLOR + 2]?*Image = undefined;
         @memcpy(all[0..MAX_COLOR], &colors);
@@ -1040,9 +1395,6 @@ pub const Context = struct {
             g.FRAMEBUFFER_INCOMPLETE_ATTACHMENT
         else if (!any)
             g.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT
-        else if (d.img != null and s.img != null and d.img.? != s.img.?)
-            // (depth and stencil share one image here)
-            g.FRAMEBUFFER_UNSUPPORTED
         else
             g.FRAMEBUFFER_COMPLETE;
         if (v.status != g.FRAMEBUFFER_COMPLETE) return v;
@@ -1249,7 +1601,7 @@ pub const Context = struct {
     }
 
     pub fn bindTexture(c: *Context, target: u32, name: u32) void {
-        if (target != g.TEXTURE_2D and target != g.TEXTURE_EXTERNAL_OES) return c.fail(g.INVALID_ENUM);
+        const binding = c.textureBinding(target) orelse return c.fail(g.INVALID_ENUM);
         if (name != 0) {
             const t = slotIn(Tex, &c.objs.tex, name) orelse return c.fail(g.OUT_OF_MEMORY);
             if (t.made and t.target != target) return c.fail(g.INVALID_OPERATION);
@@ -1259,15 +1611,37 @@ pub const Context = struct {
             // (an external texture's defaults: linear, clamped)
             if (fresh and target == g.TEXTURE_EXTERNAL_OES) m.params = c.default_ext.params;
         }
-        if (target == g.TEXTURE_2D) c.tex2d[c.unit] = name else c.tex_ext[c.unit] = name;
+        binding.* = name;
     }
 
-    /// The texture bound to `target` (TEXTURE_2D or TEXTURE_EXTERNAL_OES)
-    /// on the active unit.
+    fn textureBinding(c: *Context, target: u32) ?*u32 {
+        return switch (target) {
+            g.TEXTURE_2D => &c.tex2d[c.unit],
+            g.TEXTURE_EXTERNAL_OES => &c.tex_ext[c.unit],
+            g.TEXTURE_3D => &c.layered[0][c.unit],
+            g.TEXTURE_2D_ARRAY => &c.layered[1][c.unit],
+            g.TEXTURE_CUBE_MAP => &c.layered[2][c.unit],
+            else => null,
+        };
+    }
+
+    fn boundLayered(c: *Context, target: u32) ?*Tex {
+        const binding = c.textureBinding(target) orelse {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        };
+        return madeIn(Tex, &c.objs.tex, binding.*) orelse {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        };
+    }
+
+    /// The texture bound to `target` on the active unit.
     fn boundTex(c: *Context, target: u32) ?*Tex {
         const name = switch (target) {
             g.TEXTURE_2D => c.tex2d[c.unit],
             g.TEXTURE_EXTERNAL_OES => c.tex_ext[c.unit],
+            g.TEXTURE_3D, g.TEXTURE_2D_ARRAY, g.TEXTURE_CUBE_MAP => return c.boundLayered(target),
             else => {
                 c.fail(g.INVALID_ENUM);
                 return null;
@@ -1295,6 +1669,7 @@ pub const Context = struct {
         const resolve = egl_image orelse return c.fail(g.INVALID_OPERATION);
         const src = resolve(image) orelse return c.fail(g.INVALID_VALUE);
         if (t.immutable) return c.fail(g.INVALID_OPERATION);
+        t.disconnectStream();
         c.eng.freeImage(&t.img);
         t.img = engine.alias(src);
         t.internal = if (src.format == .bgra8) g.BGRA8_EXT else g.RGBA8;
@@ -1302,6 +1677,11 @@ pub const Context = struct {
         t.defined = 1;
         t.fswz = .{ 0, 1, 2, 3 };
         t.srgb = false;
+    }
+
+    pub fn streamTexture(c: *Context) ?*Tex {
+        const t = madeIn(Tex, &c.objs.tex, c.tex_ext[c.unit]) orelse return null;
+        return if (t.target == g.TEXTURE_EXTERNAL_OES and !t.immutable) t else null;
     }
 
     /// glEGLImageTargetRenderbufferStorageOES.
@@ -1328,8 +1708,14 @@ pub const Context = struct {
             for (&c.tex_ext) |*b| {
                 if (b.* == name) b.* = 0;
             }
+            for (&c.layered) |*units| {
+                for (units) |*b| {
+                    if (b.* == name) b.* = 0;
+                }
+            }
             // (detached from the framebuffers bound here, as GL says)
             c.detachFromBound(.tex, name);
+            t.disconnectStream();
             t.named = false;
             t.made = false;
             if (t.refs > 0) {
@@ -1339,28 +1725,178 @@ pub const Context = struct {
     }
 
     fn dropTex(c: *Context, t: *Tex) void {
+        c.dropExtraLevels(t);
         c.eng.freeImage(&t.img);
         t.* = .{};
+    }
+
+    fn extraLevel(c: *Context, t: *Tex, level: u32) ?*ExtraLevel {
+        return c.extraAt(t.extra_levels[level]);
+    }
+
+    fn extraAt(c: *Context, index: u16) ?*ExtraLevel {
+        return if (index != 0) &c.objs.extra_levels[index - 1] else null;
+    }
+
+    fn cubeFace(c: *Context, t: *Tex, level: u32, face: u32) ?*ExtraLevel {
+        return c.extraAt(t.cube_faces[face][level]);
+    }
+
+    fn dropExtraLevel(c: *Context, t: *Tex, level: u32) void {
+        const mip = c.extraLevel(t, level) orelse return;
+        c.eng.freeImage(&mip.img);
+        mip.* = .{};
+        t.extra_levels[level] = 0;
+    }
+
+    fn dropExtraLevels(c: *Context, t: *Tex) void {
+        for (0..engine.MAX_LEVELS) |level| c.dropExtraLevel(t, @intCast(level));
+        for (&t.cube_faces) |*face| {
+            for (face) |*index| {
+                const mip = c.extraAt(index.*) orelse continue;
+                c.eng.freeImage(&mip.img);
+                mip.* = .{};
+                index.* = 0;
+            }
+        }
+    }
+
+    fn putExtraLevel(c: *Context, t: *Tex, level: u32, image: Image, internal: u32, layers: u32, srgb: bool) ?*ExtraLevel {
+        const slot = c.putExtra(&t.extra_levels[level], image, internal, layers, srgb) orelse return null;
+        t.defined &= ~(@as(u16, 1) << @intCast(level));
+        return slot;
+    }
+
+    fn putExtra(c: *Context, index: *u16, image: Image, internal: u32, layers: u32, srgb: bool) ?*ExtraLevel {
+        const slot = c.extraAt(index.*) orelse blk: {
+            for (&c.objs.extra_levels, 0..) |*candidate, i| {
+                if (candidate.used) continue;
+                index.* = @intCast(i + 1);
+                break :blk candidate;
+            }
+            return null;
+        };
+        c.eng.freeImage(&slot.img);
+        slot.* = .{ .used = true, .img = image, .internal = internal, .layers = layers, .srgb = srgb };
+        return slot;
+    }
+
+    const TextureLevel = struct { img: *Image, share: *engine.Shared, level: u32, internal: u32, layers: u32, srgb: bool };
+
+    fn levelOfExtra(mip: *ExtraLevel) TextureLevel {
+        return .{ .img = &mip.img, .share = &mip.share, .level = 0, .internal = mip.internal, .layers = mip.layers, .srgb = mip.srgb };
+    }
+
+    fn textureLevel(c: *Context, t: *Tex, level: u32) ?TextureLevel {
+        if (c.extraLevel(t, level)) |mip| {
+            return levelOfExtra(mip);
+        }
+        if (level >= t.img.levels or t.defined & (@as(u16, 1) << @intCast(level)) == 0) return null;
+        return .{ .img = &t.img, .share = &t.slice_share, .level = level, .internal = t.internal, .layers = layerCount(t.target, t.layers, level), .srgb = t.srgb };
+    }
+
+    fn allocateExtraLevel(c: *Context, t: *Tex, level: u32, internal: u32, w: i32, h: i32, depth: i32, up: texfmt.Upload) ?*ExtraLevel {
+        var img: Image = .{};
+        if (w != 0 and h != 0 and depth != 0) {
+            img = c.newLayerImage(t.target, 1, w, h, depth, up.store) orelse {
+                c.fail(g.OUT_OF_MEMORY);
+                return null;
+            };
+        }
+        const mip = c.putExtraLevel(t, level, img, internal, @intCast(depth), up.srgb) orelse {
+            c.eng.freeImage(&img);
+            c.fail(g.OUT_OF_MEMORY);
+            return null;
+        };
+        mip.swizzle = up.swizzle;
+        return mip;
+    }
+
+    /// Move independently defined mip levels out of a base allocation
+    /// before its layout changes. Each migrated level remains usable
+    /// even if a later allocation fails.
+    fn preservePackedLevels(c: *Context, t: *Tex) bool {
+        for (1..t.img.levels) |at| {
+            const level: u32 = @intCast(at);
+            if (t.defined & (@as(u16, 1) << @intCast(level)) == 0) continue;
+            const layers = layerCount(t.target, t.layers, level);
+            var image = c.newLayerImage(t.target, 1, @intCast(t.img.levelWidth(level)), @intCast(t.img.levelHeight(level)), @intCast(layers), t.img.format) orelse {
+                c.fail(g.OUT_OF_MEMORY);
+                return false;
+            };
+            const bytes = @as(usize, image.stride) * image.height * layers;
+            const source = c.eng.hostView(&t.img, t.img.level_at[level], bytes);
+            @memcpy(c.eng.hostView(&image, 0, bytes), source);
+            c.eng.wrote(&image, 0, bytes);
+            const mip = c.putExtraLevel(t, level, image, t.internal, layers, t.srgb) orelse {
+                c.eng.freeImage(&image);
+                c.fail(g.OUT_OF_MEMORY);
+                return false;
+            };
+            mip.swizzle = t.fswz;
+        }
+        return true;
+    }
+
+    fn joinLevel(c: *Context, t: *Tex, level: u32) bool {
+        const extra = c.extraLevel(t, level) orelse return t.defined & (@as(u16, 1) << @intCast(level)) != 0;
+        if (t.img.share != null and t.img.share != &t.slice_share) return false;
+        if (!extra.img.live() or extra.internal != t.internal or extra.img.format != t.img.format or
+            extra.img.width != t.img.levelWidth(level) or extra.img.height != t.img.levelHeight(level) or
+            extra.layers != layerCount(t.target, t.layers, level) or !std.mem.eql(u3, &extra.swizzle, &t.fswz)) return false;
+        if (level >= t.img.levels) {
+            var img = c.newLayerImage(t.target, @intCast(level + 1), @intCast(t.img.width), @intCast(t.img.height), @intCast(t.layers), t.img.format) orelse return false;
+            const prefix = img.level_at[t.img.levels];
+            @memcpy(c.eng.hostView(&img, 0, prefix), c.eng.hostView(&t.img, 0, prefix));
+            c.eng.wrote(&img, 0, prefix);
+            c.eng.freeImage(&t.img);
+            t.img = img;
+            t.levels = level + 1;
+        }
+        const bytes = @as(usize, extra.img.stride) * extra.img.height * extra.layers;
+        const offset = t.img.level_at[level];
+        @memcpy(c.eng.hostView(&t.img, offset, bytes), c.eng.hostView(&extra.img, 0, bytes));
+        c.eng.wrote(&t.img, offset, bytes);
+        c.dropExtraLevel(t, level);
+        t.defined |= @as(u16, 1) << @intCast(level);
+        return true;
+    }
+
+    fn joinCompatibleLevels(c: *Context, t: *Tex) void {
+        if (!t.img.live()) return;
+        const side = @max(t.img.width, t.img.height, if (t.target == g.TEXTURE_3D) t.layers else 1);
+        const levels = std.math.log2_int(u32, side) + 1;
+        for (1..levels) |at| {
+            const level: u32 = @intCast(at);
+            if (t.extra_levels[level] != 0) _ = c.joinLevel(t, level);
+        }
     }
 
     /// The texture's level 0 becomes w x h of `fmt` (none for 0 x 0); its
     /// other levels stay if its size and format do.
     fn defineTex(c: *Context, t: *Tex, w: u32, h: u32, fmt: Format, internal: u32) bool {
-        if (t.img.live() and t.img.width == w and t.img.height == h and t.img.format == fmt) {
+        if (t.img.live() and t.img.width == w and t.img.height == h and t.img.format == fmt and t.internal == internal) {
             t.internal = internal;
             t.defined |= 1;
             return true;
+        }
+        var img: Image = .{};
+        if (w != 0 and h != 0) {
+            img = c.eng.newImage(w, h, fmt) orelse {
+                c.fail(g.OUT_OF_MEMORY);
+                return false;
+            };
+        }
+        if (!c.preservePackedLevels(t)) {
+            c.eng.freeImage(&img);
+            return false;
         }
         c.eng.freeImage(&t.img);
         t.internal = internal;
         t.levels = 1;
         t.defined = 0;
-        if (w == 0 or h == 0) return true;
-        t.img = c.eng.newImage(w, h, fmt) orelse {
-            c.fail(g.OUT_OF_MEMORY);
-            return false;
-        };
-        t.defined = 1;
+        t.img = img;
+        if (img.live()) t.defined = 1;
         return true;
     }
 
@@ -1373,7 +1909,7 @@ pub const Context = struct {
     /// levels so far copied in (an EGLImage's memory cannot grow one).
     fn growChain(c: *Context, t: *Tex, n: u32) bool {
         if (t.img.levels >= n) return true;
-        if (t.img.share != null or t.img.top_down) {
+        if ((t.img.share != null and t.img.share != &t.slice_share) or t.img.top_down) {
             c.fail(g.INVALID_OPERATION);
             return false;
         }
@@ -1421,11 +1957,15 @@ pub const Context = struct {
     /// Rows of client texels into level `level` of img at (x, y), converted
     /// as `up` says.
     fn uploadRows(c: *Context, img: *Image, level: u32, up: texfmt.Upload, x: u32, y: u32, w: u32, h: u32, src: []const u8, row: usize) void {
+        c.uploadLayer(img, level, 0, up, x, y, w, h, src, row);
+    }
+
+    fn uploadLayer(c: *Context, img: *Image, level: u32, layer: u32, up: texfmt.Upload, x: u32, y: u32, w: u32, h: u32, src: []const u8, row: usize) void {
         const bpp: usize = img.format.bytes();
         for (0..h) |j| {
             const gy = y + @as(u32, @intCast(j));
             const mrow = if (level == 0) img.rowOf(gy) else gy;
-            const off = img.level_at[level] + @as(usize, mrow) * img.levelStride(level) + @as(usize, x) * bpp;
+            const off = img.level_at[level] + (@as(usize, layer) * img.levelHeight(level) + mrow) * img.levelStride(level) + @as(usize, x) * bpp;
             const len = @as(usize, w) * bpp;
             const dst = c.eng.hostView(img, off, len);
             texfmt.convert(up, src[j * row ..], dst, w);
@@ -1433,13 +1973,13 @@ pub const Context = struct {
         }
     }
 
-    /// glTexImage2D. A level past 0 is stored in the texture's chain when
-    /// level 0 is there, of its format, and the level's size is level 0's
-    /// halved; otherwise it is taken and not stored (a texture that needs
-    /// it is incomplete).
+    /// Matching mips share the base allocation. Other levels retain their
+    /// own size and format until a compatible base is defined.
     pub fn texImage2D(c: *Context, target: u32, level: i32, internal: i32, w: i32, h: i32, border: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
-        const t = c.boundTex2D(target) orelse return;
+        const cube = target >= g.TEXTURE_CUBE_MAP_POSITIVE_X and target <= g.TEXTURE_CUBE_MAP_NEGATIVE_Z;
+        const t = (if (cube) c.boundLayered(g.TEXTURE_CUBE_MAP) else c.boundTex2D(target)) orelse return;
         if (level < 0 or level >= engine.MAX_LEVELS or w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or border != 0) return c.fail(g.INVALID_VALUE);
+        if (cube and (w != h or w > @as(i32, MAX_SIZE) >> @as(u5, @intCast(level)))) return c.fail(g.INVALID_VALUE);
         const ifmt: u32 = @bitCast(internal);
         const up = switch (texfmt.upload(ifmt, format, ty)) {
             .ok => |x| x,
@@ -1449,12 +1989,30 @@ pub const Context = struct {
         const uw: u32 = @intCast(w);
         const uh: u32 = @intCast(h);
         const l: u32 = @intCast(level);
+        if (cube) {
+            const index = &t.cube_faces[target - g.TEXTURE_CUBE_MAP_POSITIVE_X][l];
+            var image: Image = .{};
+            if (uw != 0) image = c.eng.newImage(uw, uh, up.store) orelse return c.fail(g.OUT_OF_MEMORY);
+            const mip = c.putExtra(index, image, ifmt, 1, up.srgb) orelse {
+                c.eng.freeImage(&image);
+                return c.fail(g.OUT_OF_MEMORY);
+            };
+            mip.swizzle = up.swizzle;
+            const src = c.unpackSource(pixels, uw, uh, up.client_bytes) orelse return;
+            c.uploadRows(&mip.img, 0, up, 0, 0, uw, uh, src.bytes, src.row);
+            return;
+        }
         if (l > 0) {
             const bit = @as(u16, 1) << @intCast(l);
-            t.defined &= ~bit;
-            const fits = t.img.live() and up.store == t.img.format and l < fullLevels(&t.img) and uw == t.img.levelWidth(l) and uh == t.img.levelHeight(l);
-            if (!fits or t.img.share != null) return;
+            const fits = t.img.live() and ifmt == t.internal and up.store == t.img.format and l < fullLevels(&t.img) and uw == t.img.levelWidth(l) and uh == t.img.levelHeight(l);
+            if (!fits or (t.img.share != null and t.img.share != &t.slice_share)) {
+                const mip = c.allocateExtraLevel(t, l, ifmt, w, h, 1, up) orelse return;
+                const src = c.unpackSource(pixels, uw, uh, up.client_bytes) orelse return;
+                c.uploadRows(&mip.img, 0, up, 0, 0, uw, uh, src.bytes, src.row);
+                return;
+            }
             if (!c.growChain(t, fullLevels(&t.img))) return;
+            c.dropExtraLevel(t, l);
             t.defined |= bit;
             const src = c.unpackSource(pixels, uw, uh, up.client_bytes) orelse return;
             c.uploadRows(&t.img, l, up, 0, 0, uw, uh, src.bytes, src.row);
@@ -1463,31 +2021,47 @@ pub const Context = struct {
         if (!c.defineTex(t, uw, uh, up.store, ifmt)) return;
         t.fswz = up.swizzle;
         t.srgb = up.srgb;
+        c.joinCompatibleLevels(t);
         const src = c.unpackSource(pixels, uw, uh, up.client_bytes) orelse return;
         c.uploadRows(&t.img, 0, up, 0, 0, uw, uh, src.bytes, src.row);
     }
 
     pub fn texSubImage2D(c: *Context, target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
+        if (target >= g.TEXTURE_CUBE_MAP_POSITIVE_X and target <= g.TEXTURE_CUBE_MAP_NEGATIVE_Z) {
+            const tex = c.boundLayered(g.TEXTURE_CUBE_MAP) orelse return;
+            const face = target - g.TEXTURE_CUBE_MAP_POSITIVE_X;
+            if (tex.immutable) return c.subLayers(tex, level, x, y, @intCast(face), w, h, 1, format, ty, pixels, false);
+            if (level < 0 or level >= engine.MAX_LEVELS or x < 0 or y < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+            const mip = c.cubeFace(tex, @intCast(level), face) orelse return c.fail(g.INVALID_OPERATION);
+            return c.subLayerImage(levelOfExtra(mip), x, y, 0, w, h, 1, format, ty, pixels, false);
+        }
         const t = c.boundTex2D(target) orelse return;
         if (level < 0 or level >= engine.MAX_LEVELS or x < 0 or y < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
         const l: u32 = @intCast(level);
-        if (l > 0 and t.defined & (@as(u16, 1) << @intCast(l)) == 0) return c.fail(g.INVALID_OPERATION);
-        if (@as(i64, x) + w > t.img.levelWidth(l) or @as(i64, y) + h > t.img.levelHeight(l)) return c.fail(g.INVALID_VALUE);
-        const up = texfmt.subUpload(t.img.format, format, ty) orelse return c.fail(if (texfmt.known(format, ty)) g.INVALID_OPERATION else g.INVALID_ENUM);
+        const mip = c.textureLevel(t, l) orelse return c.fail(g.INVALID_OPERATION);
+        if (!mip.img.live() or @as(i64, x) + w > mip.img.levelWidth(mip.level) or @as(i64, y) + h > mip.img.levelHeight(mip.level)) return c.fail(g.INVALID_VALUE);
+        const up = texfmt.subUpload(mip.img.format, format, ty) orelse return c.fail(if (texfmt.known(format, ty)) g.INVALID_OPERATION else g.INVALID_ENUM);
         if (w == 0 or h == 0) return;
         const src = c.unpackSource(pixels, @intCast(w), @intCast(h), up.client_bytes) orelse return;
-        c.uploadRows(&t.img, l, up, @intCast(x), @intCast(y), @intCast(w), @intCast(h), src.bytes, src.row);
+        c.uploadRows(mip.img, mip.level, up, @intCast(x), @intCast(y), @intCast(w), @intCast(h), src.bytes, src.row);
     }
 
     pub fn texStorage2D(c: *Context, target: u32, levels: i32, internal: u32, w: i32, h: i32) void {
+        if (target == g.TEXTURE_CUBE_MAP) {
+            if (w != h) return c.fail(g.INVALID_VALUE);
+            return c.storageLayers(target, levels, internal, w, h, 6);
+        }
         const t = c.boundTex2D(target) orelse return;
         if (levels < 1 or w < 1 or h < 1 or w > MAX_SIZE or h > MAX_SIZE) return c.fail(g.INVALID_VALUE);
         const up = texfmt.storage(internal) orelse return c.fail(g.INVALID_ENUM);
         const most = std.math.log2_int(u32, @intCast(@max(w, h))) + 1;
         if (levels > most) return c.fail(g.INVALID_OPERATION);
         if (t.immutable or t == &c.default_tex) return c.fail(g.INVALID_OPERATION);
-        if (!c.defineTex(t, @intCast(w), @intCast(h), up.store, internal)) return;
-        if (levels > 1 and !c.growChain(t, @intCast(levels))) return;
+        const img = c.eng.newImageChain(@intCast(w), @intCast(h), up.store, @intCast(levels)) orelse return c.fail(g.OUT_OF_MEMORY);
+        c.dropExtraLevels(t);
+        c.eng.freeImage(&t.img);
+        t.img = img;
+        t.internal = internal;
         t.fswz = up.swizzle;
         t.srgb = up.srgb;
         t.levels = @intCast(levels);
@@ -1495,15 +2069,190 @@ pub const Context = struct {
         t.immutable = true;
     }
 
+    fn layerCount(target: u32, depth: u32, level: u32) u32 {
+        return if (target == g.TEXTURE_3D) @max(depth >> @intCast(level), 1) else depth;
+    }
+
+    pub fn texStorage3D(c: *Context, target: u32, levels: i32, internal: u32, w: i32, h: i32, depth: i32) void {
+        if (target != g.TEXTURE_3D and target != g.TEXTURE_2D_ARRAY) return c.fail(g.INVALID_ENUM);
+        c.storageLayers(target, levels, internal, w, h, depth);
+    }
+
+    fn storageLayers(c: *Context, target: u32, levels: i32, internal: u32, w: i32, h: i32, depth: i32) void {
+        const t = c.boundLayered(target) orelse return;
+        if (levels < 1 or levels > engine.MAX_LEVELS or w < 1 or h < 1 or depth < 1 or
+            w > MAX_SIZE or h > MAX_SIZE or depth > MAX_SIZE) return c.fail(g.INVALID_VALUE);
+        const side = @max(w, h, if (target == g.TEXTURE_3D) depth else 1);
+        if (t.immutable or levels > std.math.log2_int(u32, @intCast(side)) + 1) return c.fail(g.INVALID_OPERATION);
+        const up = texfmt.storage(internal) orelse return c.fail(g.INVALID_ENUM);
+        const img = c.newLayerImage(target, levels, w, h, depth, up.store) orelse return c.fail(g.OUT_OF_MEMORY);
+        c.dropExtraLevels(t);
+        c.eng.freeImage(&t.img);
+        t.img = img;
+        t.internal = internal;
+        t.levels = @intCast(levels);
+        t.layers = @intCast(depth);
+        t.defined = @intCast((@as(u32, 1) << @intCast(levels)) - 1);
+        t.fswz = up.swizzle;
+        t.srgb = up.srgb;
+        t.immutable = true;
+    }
+
+    fn newLayerImage(c: *Context, target: u32, levels: i32, w: i32, h: i32, depth: i32, format: Format) ?Image {
+        const layers: u32 = @intCast(depth);
+        var layout = Image{
+            .width = @intCast(w),
+            .height = @intCast(h),
+            .format = format,
+            .levels = @intCast(levels),
+            .stride = std.mem.alignForward(u32, @as(u32, @intCast(w)) * format.bytes(), 4),
+        };
+        var bytes: usize = 0;
+        for (0..@intCast(levels)) |at| {
+            const level: u32 = @intCast(at);
+            layout.level_at[at] = std.math.cast(u32, bytes) orelse return null;
+            bytes += @as(usize, layout.levelStride(level)) * layout.levelHeight(level) * layerCount(target, layers, level);
+        }
+        if (bytes > std.math.maxInt(u32)) return null;
+        var img = c.eng.newBuffer(bytes) orelse return null;
+        img.width = layout.width;
+        img.height = layout.height;
+        img.stride = layout.stride;
+        img.format = layout.format;
+        img.levels = layout.levels;
+        img.level_at = layout.level_at;
+        return img;
+    }
+
+    pub fn texSubImage3D(c: *Context, target: u32, level: i32, x: i32, y: i32, z: i32, w: i32, h: i32, depth: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
+        if (target != g.TEXTURE_3D and target != g.TEXTURE_2D_ARRAY) return c.fail(g.INVALID_ENUM);
+        const t = c.boundLayered(target) orelse return;
+        c.subLayers(t, level, x, y, z, w, h, depth, format, ty, pixels, true);
+    }
+
+    pub fn texImage3D(c: *Context, target: u32, level: i32, internal: i32, w: i32, h: i32, depth: i32, border: i32, format: u32, ty: u32, pixels: ?*const anyopaque) void {
+        if (target != g.TEXTURE_3D and target != g.TEXTURE_2D_ARRAY) return c.fail(g.INVALID_ENUM);
+        const t = c.boundLayered(target) orelse return;
+        if (level < 0 or level >= engine.MAX_LEVELS or w < 0 or h < 0 or depth < 0 or
+            w > MAX_SIZE or h > MAX_SIZE or depth > MAX_SIZE or border != 0) return c.fail(g.INVALID_VALUE);
+        if (t.immutable) return c.fail(g.INVALID_OPERATION);
+        const ifmt: u32 = @bitCast(internal);
+        const up = switch (texfmt.upload(ifmt, format, ty)) {
+            .ok => |value| value,
+            .err => |err| return c.fail(err),
+        };
+        const lv: u32 = @intCast(level);
+        const bit = @as(u16, 1) << @intCast(lv);
+        if (lv == 0) {
+            if (w == 0 or h == 0 or depth == 0) {
+                if (!c.preservePackedLevels(t)) return;
+                c.eng.freeImage(&t.img);
+                t.defined = 0;
+                t.levels = 0;
+                return;
+            }
+            if (!t.img.live() or t.img.width != w or t.img.height != h or t.layers != depth or t.internal != ifmt or t.img.format != up.store) {
+                var img = c.newLayerImage(target, 1, w, h, depth, up.store) orelse return c.fail(g.OUT_OF_MEMORY);
+                if (!c.preservePackedLevels(t)) {
+                    c.eng.freeImage(&img);
+                    return;
+                }
+                c.eng.freeImage(&t.img);
+                t.img = img;
+                t.levels = 1;
+                t.layers = @intCast(depth);
+                t.defined = 0;
+            }
+            t.internal = ifmt;
+            t.fswz = up.swizzle;
+            t.srgb = up.srgb;
+        } else {
+            const side = @max(t.img.width, t.img.height, if (target == g.TEXTURE_3D) t.layers else 1);
+            if (!t.img.live() or lv > std.math.log2_int(u32, side) or t.internal != ifmt or t.img.levelWidth(lv) != w or
+                t.img.levelHeight(lv) != h or layerCount(target, t.layers, lv) != depth)
+            {
+                const mip = c.allocateExtraLevel(t, lv, ifmt, w, h, depth, up) orelse return;
+                c.uploadLayers(&mip.img, 0, 0, 0, 0, w, h, depth, up, pixels, true);
+                return;
+            }
+            if (lv >= t.levels) {
+                var img = c.newLayerImage(target, @intCast(lv + 1), @intCast(t.img.width), @intCast(t.img.height), @intCast(t.layers), t.img.format) orelse return c.fail(g.OUT_OF_MEMORY);
+                const prefix = img.level_at[t.levels];
+                @memcpy(c.eng.hostView(&img, 0, prefix), c.eng.hostView(&t.img, 0, prefix));
+                c.eng.wrote(&img, 0, prefix);
+                c.eng.freeImage(&t.img);
+                t.img = img;
+                t.levels = lv + 1;
+            }
+        }
+        c.dropExtraLevel(t, lv);
+        t.defined |= bit;
+        if (lv == 0) c.joinCompatibleLevels(t);
+        c.uploadLayers(&t.img, lv, 0, 0, 0, w, h, depth, up, pixels, true);
+    }
+
+    fn subLayers(c: *Context, t: *Tex, level: i32, x: i32, y: i32, z: i32, w: i32, h: i32, depth: i32, format: u32, ty: u32, pixels: ?*const anyopaque, volume: bool) void {
+        if (level < 0 or x < 0 or y < 0 or z < 0 or w < 0 or h < 0 or depth < 0) return c.fail(g.INVALID_VALUE);
+        if (level >= engine.MAX_LEVELS) return c.fail(g.INVALID_VALUE);
+        const lv: u32 = @intCast(level);
+        const mip = c.textureLevel(t, lv) orelse return c.fail(g.INVALID_OPERATION);
+        c.subLayerImage(mip, x, y, z, w, h, depth, format, ty, pixels, volume);
+    }
+
+    fn subLayerImage(c: *Context, mip: TextureLevel, x: i32, y: i32, z: i32, w: i32, h: i32, depth: i32, format: u32, ty: u32, pixels: ?*const anyopaque, volume: bool) void {
+        if (!mip.img.live() or @as(i64, x) + w > mip.img.levelWidth(mip.level) or @as(i64, y) + h > mip.img.levelHeight(mip.level) or
+            @as(i64, z) + depth > mip.layers) return c.fail(g.INVALID_VALUE);
+        const up = texfmt.subUpload(mip.img.format, format, ty) orelse return c.fail(if (texfmt.known(format, ty)) g.INVALID_OPERATION else g.INVALID_ENUM);
+        c.uploadLayers(mip.img, mip.level, x, y, z, w, h, depth, up, pixels, volume);
+    }
+
+    fn uploadLayers(c: *Context, img: *Image, lv: u32, x: i32, y: i32, z: i32, w: i32, h: i32, depth: i32, up: texfmt.Upload, pixels: ?*const anyopaque, volume: bool) void {
+        if (w == 0 or h == 0 or depth == 0) return;
+        const uw: u32 = @intCast(w);
+        const uh: u32 = @intCast(h);
+        const row_pixels: usize = if (c.unpack.row_length > 0) @intCast(c.unpack.row_length) else uw;
+        const row = std.mem.alignForward(usize, row_pixels * up.client_bytes, @intCast(c.unpack.alignment));
+        const skipped_rows = std.math.mul(usize, @intCast(c.unpack.skip_rows), row) catch return c.fail(g.INVALID_VALUE);
+        const first = std.math.add(usize, skipped_rows, @as(usize, @intCast(c.unpack.skip_pixels)) * up.client_bytes) catch return c.fail(g.INVALID_VALUE);
+        const image_rows: usize = @intCast(if (volume and c.unpack.image_height > 0) c.unpack.image_height else h);
+        const pitch = std.math.mul(usize, row, image_rows) catch return c.fail(g.INVALID_VALUE);
+        const skip: usize = @intCast(if (volume) c.unpack.skip_images else 0);
+        const start = std.math.mul(usize, pitch, skip) catch return c.fail(g.INVALID_VALUE);
+        const end = std.math.mul(usize, pitch, skip + @as(usize, @intCast(depth - 1))) catch return c.fail(g.INVALID_VALUE);
+        const last_slice = std.math.add(usize, first, spanOf(0, row, uw, uh, up.client_bytes)) catch return c.fail(g.INVALID_VALUE);
+        const span = std.math.add(usize, end, last_slice) catch return c.fail(g.INVALID_VALUE);
+        if (span > std.math.maxInt(isize)) return c.fail(g.INVALID_VALUE);
+        const data = if (c.bufs.unpack != 0) blk: {
+            const b = madeIn(Buf, &c.objs.bufs, c.bufs.unpack) orelse return c.fail(g.INVALID_OPERATION);
+            if (!c.notMapped(b)) return;
+            const off = addr(pixels);
+            if (off > b.size or span > b.size - off) return c.fail(g.INVALID_OPERATION);
+            break :blk c.eng.hostView(&b.store, off, span);
+        } else blk: {
+            const p = pixels orelse return;
+            break :blk @as([*]const u8, @ptrCast(p))[0..span];
+        };
+        for (0..@intCast(depth)) |i| {
+            c.uploadLayer(img, lv, @intCast(@as(usize, @intCast(z)) + i), up, @intCast(x), @intCast(y), uw, uh, data[start + i * pitch + first ..], row);
+        }
+    }
+
     /// glGenerateMipmap: the levels past the base, to the last a complete
     /// texture has (MAX_LEVEL, or the immutable texture's), made from the
-    /// base (the engine's mip kernel: 2 x 2 texels averaged). Unorm
+    /// base (2 x 2 texels averaged per layer, or 2 x 2 x 2 for a volume). Unorm
     /// textures of 1, 2 or 4 bytes a texel (what ES 3.0 lets filter and
     /// render); others INVALID_OPERATION.
     pub fn generateMipmap(c: *Context, target: u32) void {
-        const t = c.boundTex2D(target) orelse return;
+        if (target != g.TEXTURE_2D and target != g.TEXTURE_2D_ARRAY and target != g.TEXTURE_3D and target != g.TEXTURE_CUBE_MAP)
+            return c.fail(g.INVALID_ENUM);
+        const t = c.boundTex(target) orelse return;
+        var base: u32 = @intCast(@max(t.params.base_level, 0));
+        if (t.immutable) base = @min(base, t.levels - 1);
+        if (base >= engine.MAX_LEVELS) return c.fail(g.INVALID_OPERATION);
+        if (target != g.TEXTURE_2D or c.extraLevel(t, base) != null) {
+            return c.generateLayerMips(t, base);
+        }
         if (!t.img.live()) return c.fail(g.INVALID_OPERATION);
-        const base: u32 = @intCast(@max(t.params.base_level, 0));
         if (base >= engine.MAX_LEVELS or t.defined & (@as(u16, 1) << @intCast(base)) == 0) return c.fail(g.INVALID_OPERATION);
         if (!t.img.format.renderable()) return c.fail(g.INVALID_OPERATION);
         const full = fullLevels(&t.img);
@@ -1513,7 +2262,75 @@ pub const Context = struct {
         if (!t.immutable and !c.growChain(t, full)) return;
         if (!c.eng.mipmap(&t.img, base, last)) return c.fail(g.OUT_OF_MEMORY);
         var l = base;
-        while (l <= last) : (l += 1) t.defined |= @as(u16, 1) << @intCast(l);
+        while (l <= last) : (l += 1) {
+            c.dropExtraLevel(t, l);
+            t.defined |= @as(u16, 1) << @intCast(l);
+        }
+    }
+
+    fn generateLayerMips(c: *Context, t: *Tex, base: u32) void {
+        const mutable_cube = t.target == g.TEXTURE_CUBE_MAP and !t.immutable;
+        const first_face = if (mutable_cube) c.cubeFace(t, base, 0) else null;
+        const first = (if (first_face) |face| levelOfExtra(face) else c.textureLevel(t, base)) orelse return c.fail(g.INVALID_OPERATION);
+        if (!first.img.live() or !first.img.format.renderable()) return c.fail(g.INVALID_OPERATION);
+        const w = first.img.levelWidth(first.level);
+        const h = first.img.levelHeight(first.level);
+        const volume = t.target == g.TEXTURE_3D;
+        const layers = if (mutable_cube) 6 else first.layers;
+        const depth = if (volume) layers else 1;
+        var last = @min(engine.MAX_LEVELS - 1, base + std.math.log2_int(u32, @max(w, h, depth)));
+        last = @min(last, @as(u32, @intCast(@max(t.params.max_level, 0))));
+        if (t.immutable) last = @min(last, t.levels - 1);
+        if (last <= base) {
+            if (mutable_cube and !c.cubeLevelComplete(t, base, w, first_face.?)) c.fail(g.INVALID_OPERATION);
+            return;
+        }
+        if (t.immutable) {
+            if (!c.eng.mipmapLayers(&t.img, base, last, layers, volume)) c.fail(g.OUT_OF_MEMORY);
+            return;
+        }
+        var cube_base: Image = .{};
+        defer c.eng.freeImage(&cube_base);
+        if (mutable_cube and !c.gatherCube(t, base, base, first_face.?, &cube_base)) {
+            return c.fail(g.INVALID_OPERATION);
+        }
+        const src = if (mutable_cube) &cube_base else first.img;
+        const src_level = if (mutable_cube) 0 else first.level;
+        var chain = c.newLayerImage(t.target, @intCast(last - base + 1), @intCast(w), @intCast(h), @intCast(layers), src.format) orelse return c.fail(g.OUT_OF_MEMORY);
+        defer c.eng.freeImage(&chain);
+        const bytes = @as(usize, chain.stride) * h * layers;
+        const src_stride = src.levelStride(src_level);
+        const rows = @as(usize, h) * layers;
+        const row_bytes = @as(usize, w) * src.format.bytes();
+        const src_data = c.eng.hostView(src, src.level_at[src_level], (rows - 1) * src_stride + row_bytes);
+        const dst = c.eng.hostView(&chain, 0, bytes);
+        for (0..rows) |row| @memcpy(dst[row * chain.stride ..][0..row_bytes], src_data[row * src_stride ..][0..row_bytes]);
+        c.eng.wrote(&chain, 0, bytes);
+        if (!c.eng.mipmapLayers(&chain, 0, last - base, layers, volume)) return c.fail(g.OUT_OF_MEMORY);
+        const format_level = if (first_face != null) first_face else c.extraLevel(t, base);
+        const swizzle = if (format_level) |mip| mip.swizzle else t.fswz;
+        for (base + 1..last + 1) |at| {
+            const lv: u32 = @intCast(at);
+            const rel = lv - base;
+            const slices: usize = if (mutable_cube) 6 else 1;
+            const per_image = if (mutable_cube) 1 else layerCount(t.target, layers, rel);
+            const copy_bytes = @as(usize, chain.levelStride(rel)) * chain.levelHeight(rel) * per_image;
+            for (0..slices) |face| {
+                var img = c.newLayerImage(t.target, 1, @intCast(chain.levelWidth(rel)), @intCast(chain.levelHeight(rel)), @intCast(per_image), chain.format) orelse return c.fail(g.OUT_OF_MEMORY);
+                const off = chain.level_at[rel] + face * copy_bytes;
+                @memcpy(c.eng.hostView(&img, 0, copy_bytes), c.eng.hostView(&chain, off, copy_bytes));
+                c.eng.wrote(&img, 0, copy_bytes);
+                const mip = (if (mutable_cube)
+                    c.putExtra(&t.cube_faces[face][lv], img, first.internal, 1, first.srgb)
+                else
+                    c.putExtraLevel(t, lv, img, first.internal, per_image, first.srgb)) orelse {
+                    c.eng.freeImage(&img);
+                    return c.fail(g.OUT_OF_MEMORY);
+                };
+                mip.swizzle = swizzle;
+            }
+        }
+        if (base == 0 and !mutable_cube) c.joinCompatibleLevels(t);
     }
 
     pub fn texParameteri(c: *Context, target: u32, pname: u32, param: i32) void {
@@ -1583,13 +2400,79 @@ pub const Context = struct {
     /// What texture slot `sl` of a draw reads: its unit's texture (bound
     /// to the slot's target) with the unit's sampler object's state, or
     /// the texture's.
-    fn slotState(c: *Context, sl: program.Slot, values: []const u32) texture.State {
+    /// Gather a complete mip range into one binding for the draw. Keep
+    /// independently defined levels authoritative for uploads and FBOs.
+    fn gatherMips(c: *Context, t: *Tex, base: u32, last: u32, first: TextureLevel, scratch: *Image) bool {
+        const w = first.img.levelWidth(first.level);
+        const h = first.img.levelHeight(first.level);
+        if (first.img.top_down) return false;
+        for (base..last + 1) |at| {
+            const mip = c.textureLevel(t, @intCast(at)) orelse return false;
+            const rel: u32 = @intCast(at - base);
+            if (!mip.img.live() or mip.img.top_down or mip.img.format != first.img.format or mip.internal != first.internal or
+                mip.srgb != first.srgb or mip.img.no_alpha != first.img.no_alpha or
+                mip.img.levelWidth(mip.level) != @max(w >> @intCast(rel), 1) or
+                mip.img.levelHeight(mip.level) != @max(h >> @intCast(rel), 1) or mip.layers != layerCount(t.target, first.layers, rel)) return false;
+        }
+        scratch.* = c.newLayerImage(t.target, @intCast(last - base + 1), @intCast(w), @intCast(h), @intCast(first.layers), first.img.format) orelse {
+            c.fail(g.OUT_OF_MEMORY);
+            return false;
+        };
+        scratch.no_alpha = first.img.no_alpha;
+        for (base..last + 1) |at| {
+            const mip = c.textureLevel(t, @intCast(at)).?;
+            const rel: u32 = @intCast(at - base);
+            const stride = scratch.levelStride(rel);
+            const row_bytes = scratch.levelWidth(rel) * scratch.format.bytes();
+            const src_stride = mip.img.levelStride(mip.level);
+            const rows = @as(usize, scratch.levelHeight(rel)) * mip.layers;
+            const src = c.eng.hostView(mip.img, mip.img.level_at[mip.level], rows * src_stride);
+            const dst = c.eng.hostView(scratch, scratch.level_at[rel], rows * stride);
+            for (0..rows) |row| @memcpy(dst[row * stride ..][0..row_bytes], src[row * src_stride ..][0..row_bytes]);
+            c.eng.wrote(scratch, scratch.level_at[rel], rows * stride);
+        }
+        return true;
+    }
+
+    fn cubeLevelComplete(c: *Context, t: *Tex, level: u32, size: u32, first: *ExtraLevel) bool {
+        for (0..6) |face| {
+            const mip = c.cubeFace(t, level, @intCast(face)) orelse return false;
+            if (!mip.img.live() or mip.img.width != size or mip.img.height != size or mip.internal != first.internal or
+                mip.img.format != first.img.format or mip.srgb != first.srgb or !std.mem.eql(u3, &mip.swizzle, &first.swizzle)) return false;
+        }
+        return true;
+    }
+
+    fn gatherCube(c: *Context, t: *Tex, base: u32, last: u32, first: *ExtraLevel, scratch: *Image) bool {
+        const width = first.img.width;
+        for (base..last + 1) |level| {
+            const size = @max(width >> @intCast(level - base), 1);
+            if (!c.cubeLevelComplete(t, @intCast(level), size, first)) return false;
+        }
+        scratch.* = c.newLayerImage(g.TEXTURE_CUBE_MAP, @intCast(last - base + 1), @intCast(width), @intCast(width), 6, first.img.format) orelse {
+            c.fail(g.OUT_OF_MEMORY);
+            return false;
+        };
+        for (base..last + 1) |level| {
+            const rel: u32 = @intCast(level - base);
+            const bytes = @as(usize, scratch.levelStride(rel)) * scratch.levelHeight(rel);
+            for (0..6) |face| {
+                const mip = c.cubeFace(t, @intCast(level), @intCast(face)).?;
+                const offset = scratch.level_at[rel] + face * bytes;
+                @memcpy(c.eng.hostView(scratch, offset, bytes), c.eng.hostView(&mip.img, 0, bytes));
+                c.eng.wrote(scratch, offset, bytes);
+            }
+        }
+        return true;
+    }
+
+    fn slotState(c: *Context, sl: program.Slot, values: []const u32, scratch: *Image) texture.State {
         if (sl.unsupported) return .{};
         const unit = values[sl.word];
         if (unit >= MAX_UNITS) return .{};
-        const name = if (sl.external) c.tex_ext[unit] else c.tex2d[unit];
+        const name = if (sl.volume) c.layered[0][unit] else if (sl.array) c.layered[1][unit] else if (sl.cube) c.layered[2][unit] else if (sl.external) c.tex_ext[unit] else c.tex2d[unit];
+        if ((sl.array or sl.volume or sl.cube) and name == 0) return .{};
         const t: *Tex = if (name == 0) (if (sl.external) &c.default_ext else &c.default_tex) else (madeIn(Tex, &c.objs.tex, name) orelse return .{});
-        if (!t.img.live()) return .{};
         const p: *const TexParams = if (c.smp[unit] != 0) (if (madeIn(Smp, &c.objs.samplers, c.smp[unit])) |s| &s.params else &t.params) else &t.params;
         // the levels read, and completeness (GL ES 3.0 3.8.13): the base
         // level there; with a mipmap filter, every level to the last
@@ -1600,23 +2483,50 @@ pub const Context = struct {
         };
         var base: u32 = @intCast(@max(t.params.base_level, 0));
         if (t.immutable) base = @min(base, t.levels - 1);
-        if (base >= engine.MAX_LEVELS or t.defined & (@as(u16, 1) << @intCast(base)) == 0) return .{};
-        var last = base;
+        if (base >= engine.MAX_LEVELS) return .{};
+        const mutable_cube = sl.cube and !t.immutable;
+        const extra = if (mutable_cube) c.cubeFace(t, base, 0) else c.extraLevel(t, base);
+        const base_image = if (extra) |separate| levelOfExtra(separate) else c.textureLevel(t, base) orelse return .{};
+        if (!base_image.img.live() or (sl.shadow and (!hasDepth(base_image.internal) or p.compare_mode != g.COMPARE_REF_TO_TEXTURE))) return .{};
+        var image = base_image.img;
+        var storage_base = base_image.level;
+        var layers = if (extra != null) base_image.layers else t.layers;
+        var last = base_image.level;
+        var gl_last = base;
         if (mip != .none) {
-            const top = base + std.math.log2_int(u32, @max(t.img.levelWidth(base), t.img.levelHeight(base)));
+            const depth = if (sl.volume) base_image.layers else 1;
+            const top = base + std.math.log2_int(u32, @max(base_image.img.levelWidth(base_image.level), base_image.img.levelHeight(base_image.level), depth));
             if (t.params.max_level < base) return .{};
-            last = @min(top, @as(u32, @intCast(t.params.max_level)));
-            if (t.immutable) last = @min(last, t.levels - 1);
-            if (last >= t.img.levels) return .{};
-            var l = base;
-            while (l <= last) : (l += 1) {
-                if (t.defined & (@as(u16, 1) << @intCast(l)) == 0) return .{};
+            gl_last = @min(top, @as(u32, @intCast(t.params.max_level)));
+            if (t.immutable) gl_last = @min(gl_last, t.levels - 1);
+            if (gl_last >= engine.MAX_LEVELS) return .{};
+            var contiguous = extra == null and gl_last < t.img.levels;
+            for (base..gl_last + 1) |l| {
+                contiguous = contiguous and t.defined & (@as(u16, 1) << @intCast(l)) != 0;
+            }
+            if (mutable_cube) {
+                // All faces are gathered below, including one-level cubes.
+            } else if (contiguous) {
+                last = gl_last;
+            } else if (gl_last != base) {
+                if (!c.gatherMips(t, base, gl_last, base_image, scratch)) return .{};
+                image = scratch;
+                storage_base = 0;
+                layers = base_image.layers;
+                last = gl_last - base;
             }
         }
+        if (mutable_cube) {
+            if (!c.gatherCube(t, base, gl_last, extra orelse return .{}, scratch)) return .{};
+            image = scratch;
+            storage_base = 0;
+            layers = 6;
+            last = gl_last - base;
+        }
         // GL's R, G, B, A as the stored channels: bgra8's bytes are B, G, R, A
-        const order: [4]u3 = if (t.img.format == .bgra8) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
+        const order: [4]u3 = if (base_image.img.format == .bgra8) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
         var rgba: [4]u3 = undefined;
-        for (t.fswz, 0..) |s, i| rgba[i] = if (s < 4) order[s] else s;
+        for (if (extra) |m| m.swizzle else t.fswz, 0..) |s, i| rgba[i] = if (s < 4) order[s] else s;
         var swz: [4]u3 = undefined;
         for (t.params.swizzle, 0..) |s, i| swz[i] = switch (s) {
             g.RED => rgba[0],
@@ -1627,15 +2537,18 @@ pub const Context = struct {
             else => texture.SWZ_ONE,
         };
         return .{
-            .img = &t.img,
-            .srgb = t.srgb,
-            .swizzle = swz,
+            .img = image,
+            .layers = layers,
+            .srgb = base_image.srgb,
+            .swizzle = if (sl.shadow) .{ 0, 1, 2, 3 } else swz,
             .wrap_s = wrapOf(p.wrap_s),
             .wrap_t = wrapOf(p.wrap_t),
+            .wrap_r = wrapOf(p.wrap_r),
+            .compare = @truncate(p.compare_func),
             .linear = p.mag == g.LINEAR,
             .min_linear = p.min == g.LINEAR or p.min == g.LINEAR_MIPMAP_NEAREST or p.min == g.LINEAR_MIPMAP_LINEAR,
             .mip = mip,
-            .base = @intCast(base),
+            .base = @intCast(storage_base),
             .last = @intCast(last),
             .min_lod = @floatFromInt(p.min_lod),
             .max_lod = @floatFromInt(p.max_lod),
@@ -1748,6 +2661,149 @@ pub const Context = struct {
         return from.renderable() and to.renderable() and to.channels() <= from.channels();
     }
 
+    const CopyImage = struct { img: *Image, internal: u32, samples: u32, layers: u32 = 1, level: u32 = 0 };
+
+    fn copyImageOf(c: *Context, name: u32, target: u32, level: i32, face: ?u32) ?CopyImage {
+        if (level < 0 or level >= engine.MAX_LEVELS) {
+            c.fail(g.INVALID_VALUE);
+            return null;
+        }
+        switch (target) {
+            g.TEXTURE_2D, g.TEXTURE_3D, g.TEXTURE_2D_ARRAY, g.TEXTURE_CUBE_MAP => {
+                const tex = madeIn(Tex, &c.objs.tex, name) orelse {
+                    c.fail(g.INVALID_VALUE);
+                    return null;
+                };
+                if (tex.target != target) {
+                    c.fail(g.INVALID_ENUM);
+                    return null;
+                }
+                const mip = (if (face) |index| blk: {
+                    if (index >= 6) break :blk null;
+                    const image = c.cubeFace(tex, @intCast(level), index) orelse break :blk null;
+                    break :blk levelOfExtra(image);
+                } else c.textureLevel(tex, @intCast(level))) orelse {
+                    c.fail(g.INVALID_VALUE);
+                    return null;
+                };
+                if (!mip.img.live()) {
+                    c.fail(g.INVALID_VALUE);
+                    return null;
+                }
+                return .{ .img = mip.img, .internal = mip.internal, .samples = 0, .layers = mip.layers, .level = mip.level };
+            },
+            g.RENDERBUFFER => {
+                const rb = madeIn(Rb, &c.objs.rbs, name) orelse {
+                    c.fail(g.INVALID_VALUE);
+                    return null;
+                };
+                if (level != 0 or rb.img.buf.cpu.len == 0) {
+                    c.fail(g.INVALID_VALUE);
+                    return null;
+                }
+                return .{ .img = &rb.img, .internal = rb.internal, .samples = rb.samples };
+            },
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        }
+    }
+
+    /// Raw copies between supported images. Do not reinterpret channels
+    /// or use framebuffer state. Wait for pending access to both objects.
+    pub fn copyImageSubData(c: *Context, sn: u32, st: u32, sl: i32, sx: i32, sy: i32, sz: i32, dn: u32, dt: u32, dl: i32, dx: i32, dy: i32, dz: i32, w: i32, h: i32, depth: i32) void {
+        const source_cube = st == g.TEXTURE_CUBE_MAP and c.mutableCube(sn);
+        const dest_cube = dt == g.TEXTURE_CUBE_MAP and c.mutableCube(dn);
+        if (source_cube or dest_cube) {
+            if (sz < 0 or dz < 0 or depth < 0 or depth > 6 or
+                (source_cube and @as(i64, sz) + depth > 6) or (dest_cube and @as(i64, dz) + depth > 6) or
+                @as(i64, sz) + depth > std.math.maxInt(i32) or @as(i64, dz) + depth > std.math.maxInt(i32))
+                return c.fail(g.INVALID_VALUE);
+            if (depth == 0) return;
+            var sources: [6]CopyImage = undefined;
+            var destinations: [6]CopyImage = undefined;
+            for (0..@intCast(depth)) |layer| {
+                const z: i32 = @intCast(layer);
+                sources[layer] = c.copyImageOf(sn, st, sl, if (source_cube) @intCast(sz + z) else null) orelse return;
+                destinations[layer] = c.copyImageOf(dn, dt, dl, if (dest_cube) @intCast(dz + z) else null) orelse return;
+                if (!c.validateImageCopy(sources[layer], destinations[layer], sx, sy, if (source_cube) 0 else sz + z, dx, dy, if (dest_cube) 0 else dz + z, w, h, 1)) return;
+            }
+            if (w == 0 or h == 0) return;
+            for (0..@intCast(depth)) |layer| {
+                const z: i32 = @intCast(layer);
+                c.copyImageRegion(sources[layer], destinations[layer], sx, sy, if (source_cube) 0 else sz + z, dx, dy, if (dest_cube) 0 else dz + z, w, h, 1);
+            }
+            return;
+        }
+        const src = c.copyImageOf(sn, st, sl, null) orelse return;
+        const dst = c.copyImageOf(dn, dt, dl, null) orelse return;
+        if (!c.validateImageCopy(src, dst, sx, sy, sz, dx, dy, dz, w, h, depth)) return;
+        if (w == 0 or h == 0 or depth == 0) return;
+        c.copyImageRegion(src, dst, sx, sy, sz, dx, dy, dz, w, h, depth);
+    }
+
+    fn mutableCube(c: *Context, name: u32) bool {
+        const t = madeIn(Tex, &c.objs.tex, name) orelse return false;
+        return t.target == g.TEXTURE_CUBE_MAP and !t.immutable;
+    }
+
+    fn validateImageCopy(c: *Context, src: CopyImage, dst: CopyImage, sx: i32, sy: i32, sz: i32, dx: i32, dy: i32, dz: i32, w: i32, h: i32, depth: i32) bool {
+        if (src.internal != dst.internal or src.img.format != dst.img.format or src.samples != dst.samples) {
+            c.fail(g.INVALID_OPERATION);
+            return false;
+        }
+        if (sx < 0 or sy < 0 or sz < 0 or dx < 0 or dy < 0 or dz < 0 or
+            w < 0 or h < 0 or depth < 0 or @as(i64, sz) + depth > src.layers or @as(i64, dz) + depth > dst.layers)
+        {
+            c.fail(g.INVALID_VALUE);
+            return false;
+        }
+        if (@as(i64, sx) + w > src.img.levelWidth(src.level) or @as(i64, sy) + h > src.img.levelHeight(src.level) or
+            @as(i64, dx) + w > dst.img.levelWidth(dst.level) or @as(i64, dy) + h > dst.img.levelHeight(dst.level))
+        {
+            c.fail(g.INVALID_VALUE);
+            return false;
+        }
+        return true;
+    }
+
+    fn copyImageRegion(c: *Context, src: CopyImage, dst: CopyImage, sx: i32, sy: i32, sz: i32, dx: i32, dy: i32, dz: i32, w: i32, h: i32, depth: i32) void {
+        const slevel = src.level;
+        const dlevel = dst.level;
+        const sh = src.img.levelHeight(slevel);
+        const dh = dst.img.levelHeight(dlevel);
+        const sa = @intFromPtr(src.img.buf.cpu.ptr);
+        const da = @intFromPtr(dst.img.buf.cpu.ptr);
+        const apart = if (sa <= da) src.img.buf.cpu.len <= da - sa else dst.img.buf.cpu.len <= sa - da;
+        // The existing GPU copy is bit-preserving for these base-level
+        // formats. Other layouts need the raw row path below.
+        if (slevel == 0 and dlevel == 0 and sz == 0 and dz == 0 and depth == 1 and src.img.format.bytes() <= 4 and
+            !src.img.no_alpha and (src.img.buf.handle != dst.img.buf.handle or apart))
+        {
+            c.eng.copy(src.img, @intCast(sx), @intCast(sy), dst.img, @intCast(dx), @intCast(dy), @intCast(w), @intCast(h));
+            return;
+        }
+        const sdata = c.eng.hostView(src.img, 0, src.img.buf.cpu.len);
+        const ddata = c.eng.hostView(dst.img, 0, dst.img.buf.cpu.len);
+        const bpp: usize = src.img.format.bytes();
+        const n = @as(usize, @intCast(w)) * bpp;
+        const ss: usize = src.img.levelStride(slevel);
+        const ds: usize = dst.img.levelStride(dlevel);
+        for (0..@intCast(depth)) |layer| {
+            const sbase = src.img.level_at[slevel] + (@as(usize, @intCast(sz)) + layer) * sh * ss;
+            const dbase = dst.img.level_at[dlevel] + (@as(usize, @intCast(dz)) + layer) * dh * ds;
+            for (0..@intCast(h)) |row| {
+                const srow = @as(usize, @intCast(sy)) + row;
+                const drow = @as(usize, @intCast(dy)) + row;
+                const so = sbase + (if (src.img.top_down) sh - 1 - srow else srow) * ss + @as(usize, @intCast(sx)) * bpp;
+                const do = dbase + (if (dst.img.top_down) dh - 1 - drow else drow) * ds + @as(usize, @intCast(dx)) * bpp;
+                std.mem.copyForwards(u8, ddata[do..][0..n], sdata[so..][0..n]);
+                c.eng.wrote(dst.img, do, n);
+            }
+        }
+    }
+
     pub fn copyTexSubImage2D(c: *Context, target: u32, level: i32, dx: i32, dy: i32, x: i32, y: i32, w: i32, h: i32) void {
         const t = c.boundTex2D(target) orelse return;
         if (level != 0 or dx < 0 or dy < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
@@ -1755,6 +2811,20 @@ pub const Context = struct {
         const s = c.readSource() orelse return;
         if (!copyable(s.img.format, t.img.format) or t.srgb or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
         c.copyFrom(s.img, s.v, x, y, w, h, &t.img, dx, dy);
+    }
+
+    pub fn copyTexSubImage3D(c: *Context, target: u32, level: i32, dx: i32, dy: i32, dz: i32, x: i32, y: i32, w: i32, h: i32) void {
+        if (target != g.TEXTURE_3D and target != g.TEXTURE_2D_ARRAY) return c.fail(g.INVALID_ENUM);
+        const t = c.boundLayered(target) orelse return;
+        if (level < 0 or level >= engine.MAX_LEVELS or dx < 0 or dy < 0 or dz < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
+        const mip = c.textureLevel(t, @intCast(level)) orelse return c.fail(g.INVALID_OPERATION);
+        if (@as(i64, dx) + w > mip.img.levelWidth(mip.level) or @as(i64, dy) + h > mip.img.levelHeight(mip.level) or dz >= mip.layers)
+            return c.fail(g.INVALID_VALUE);
+        const src = c.readSource() orelse return;
+        if (!copyable(src.img.format, mip.img.format) or mip.srgb) return c.fail(g.INVALID_OPERATION);
+        var dst = engine.borrowSlice(mip.img, mip.share, mip.level, @intCast(dz));
+        if (src.img.buf.cpu.ptr == dst.buf.cpu.ptr) return c.fail(g.INVALID_OPERATION);
+        c.copyFrom(src.img, src.v, x, y, w, h, &dst, dx, dy);
     }
 
     pub fn copyTexImage2D(c: *Context, target: u32, level: i32, internal: u32, x: i32, y: i32, w: i32, h: i32, border: i32) void {
@@ -1823,16 +2893,44 @@ pub const Context = struct {
         if (size < 0) return c.fail(g.INVALID_VALUE);
         if (!validUsage(usage)) return c.fail(g.INVALID_ENUM);
         const b = c.boundBuf(target) orelse return;
+        if (b.immutable) return c.fail(g.INVALID_OPERATION);
         const n: usize = @intCast(size);
         c.unmap(b);
         // (new storage: what the GPU may still read of the old goes once it is done)
         c.eng.freeImage(&b.store);
         b.size = 0;
         b.usage = usage;
+        b.storage_flags = MAP_READ | MAP_WRITE | DYNAMIC_STORAGE;
         if (n == 0) return;
         b.store = c.eng.newBuffer(n) orelse return c.fail(g.OUT_OF_MEMORY);
         b.size = n;
         if (data) |p| c.eng.writeBytes(&b.store, 0, @as([*]const u8, @ptrCast(p))[0..n]);
+    }
+
+    /// Immutable storage. Keep the old store
+    /// alive until the replacement has been allocated and initialized.
+    pub fn bufferStorage(c: *Context, target: u32, size: isize, data: ?*const anyopaque, flags: u32) void {
+        const b = c.boundBuf(target) orelse return;
+        if (size <= 0 or flags & ~@as(u32, MAP_READ | MAP_WRITE | MAP_PERSISTENT | MAP_COHERENT | DYNAMIC_STORAGE | CLIENT_STORAGE) != 0 or
+            (flags & MAP_PERSISTENT != 0 and flags & (MAP_READ | MAP_WRITE) == 0) or
+            (flags & MAP_COHERENT != 0 and flags & MAP_PERSISTENT == 0))
+            return c.fail(g.INVALID_VALUE);
+        if (b.immutable) return c.fail(g.INVALID_OPERATION);
+        // Explicit flushes and client barriers synchronize noncoherent
+        // mappings. Coherent mappings need snooped RTX system memory.
+        if (flags & MAP_COHERENT != 0 and c.eng.onGpu() and
+            !(builtin.cpu.arch == .x86_64 and c.eng.dev.?.caps.target == .sm_120))
+            return c.fail(g.OUT_OF_MEMORY);
+        const n: usize = @intCast(size);
+        var store = c.eng.newBuffer(n) orelse return c.fail(g.OUT_OF_MEMORY);
+        if (data) |p| c.eng.writeBytes(&store, 0, @as([*]const u8, @ptrCast(p))[0..n]);
+        c.unmap(b);
+        c.eng.freeImage(&b.store);
+        b.store = store;
+        b.size = n;
+        b.usage = g.DYNAMIC_DRAW;
+        b.immutable = true;
+        b.storage_flags = flags;
     }
 
     pub fn bufferSubData(c: *Context, target: u32, offset: isize, size: isize, data: ?*const anyopaque) void {
@@ -1842,9 +2940,28 @@ pub const Context = struct {
         const off: usize = @intCast(offset);
         const n: usize = @intCast(size);
         if (off > b.size or n > b.size - off) return c.fail(g.INVALID_VALUE);
-        if (b.mapped()) return c.fail(g.INVALID_OPERATION);
+        if (!c.notMapped(b)) return;
+        if (b.immutable and b.storage_flags & DYNAMIC_STORAGE == 0) return c.fail(g.INVALID_OPERATION);
         const p = data orelse return;
         c.eng.writeBytes(&b.store, off, @as([*]const u8, @ptrCast(p))[0..n]);
+    }
+
+    pub fn copyBufferSubData(c: *Context, read_target: u32, write_target: u32, read_offset: isize, write_offset: isize, size: isize) void {
+        if (c.bindingOf(read_target) == null or c.bindingOf(write_target) == null) return c.fail(g.INVALID_ENUM);
+        if (read_offset < 0 or write_offset < 0 or size < 0) return c.fail(g.INVALID_VALUE);
+        const src = c.boundBuf(read_target) orelse return;
+        const dst = c.boundBuf(write_target) orelse return;
+        const from: usize = @intCast(read_offset);
+        const to: usize = @intCast(write_offset);
+        const n: usize = @intCast(size);
+        if (from > src.size or n > src.size - from or to > dst.size or n > dst.size - to) return c.fail(g.INVALID_VALUE);
+        if (src == dst and n != 0 and from < to + n and to < from + n) return c.fail(g.INVALID_VALUE);
+        if (!c.notMapped(src) or !c.notMapped(dst)) return;
+        if (n == 0) return;
+        const source = c.eng.hostView(&src.store, from, n);
+        const target = c.eng.hostView(&dst.store, to, n);
+        @memcpy(target, source);
+        c.eng.wrote(&dst.store, to, n);
     }
 
     /// glMapBufferRange: the buffer's bytes [offset, offset + length) for
@@ -1858,7 +2975,7 @@ pub const Context = struct {
             return null;
         }
         const b = c.boundBuf(target) orelse return null;
-        if (offset < 0 or length < 0 or access & ~@as(u32, 0x3f) != 0) {
+        if (offset < 0 or length < 0 or access & ~@as(u32, 0xff) != 0) {
             c.fail(g.INVALID_VALUE);
             return null;
         }
@@ -1871,13 +2988,15 @@ pub const Context = struct {
         const read = access & MAP_READ != 0;
         const write = access & MAP_WRITE != 0;
         const bad = n == 0 or b.mapped() or (!read and !write) or
+            (access & (MAP_READ | MAP_WRITE | MAP_PERSISTENT | MAP_COHERENT) & ~b.storage_flags != 0) or
+            (access & MAP_COHERENT != 0 and access & MAP_PERSISTENT == 0) or
             (read and access & (MAP_INVALIDATE_RANGE | MAP_INVALIDATE_BUFFER | MAP_UNSYNCHRONIZED) != 0) or
             (access & MAP_FLUSH_EXPLICIT != 0 and !write);
         if (bad) {
             c.fail(g.INVALID_OPERATION);
             return null;
         }
-        if (access & MAP_INVALIDATE_BUFFER != 0 and c.eng.busy(&b.store)) {
+        if (!b.immutable and access & MAP_INVALIDATE_BUFFER != 0 and c.eng.busy(&b.store)) {
             const fresh = c.eng.newBuffer(b.size) orelse {
                 c.fail(g.OUT_OF_MEMORY);
                 return null;
@@ -1947,9 +3066,22 @@ pub const Context = struct {
     /// A buffer a command reads or writes is not mapped (else
     /// INVALID_OPERATION).
     fn notMapped(c: *Context, b: *const Buf) bool {
-        if (!b.mapped()) return true;
+        if (!b.mapped() or b.map_access & MAP_PERSISTENT != 0) return true;
         c.fail(g.INVALID_OPERATION);
         return false;
+    }
+
+    /// Publish server writes to noncoherent persistent client mappings.
+    /// Waiting here is conservative and avoids retaining ranges past unmap.
+    pub fn clientMappedBarrier(c: *Context, bits: u32) void {
+        if (bits == 0) return;
+        if (bits != CLIENT_MAPPED_BUFFER_BARRIER and bits != 0xffff_ffff)
+            return c.fail(g.INVALID_VALUE);
+        c.eng.finish();
+        for (&c.objs.bufs) |*b| {
+            if (b.map_access & (MAP_READ | MAP_PERSISTENT) != (MAP_READ | MAP_PERSISTENT)) continue;
+            if (b.map) |m| _ = c.eng.hostView(&b.store, b.map_off, m.len);
+        }
     }
 
     pub fn getBufferParameter(c: *Context, target: u32, pname: u32) ?i64 {
@@ -1957,6 +3089,8 @@ pub const Context = struct {
         return switch (pname) {
             g.BUFFER_SIZE => @intCast(b.size),
             g.BUFFER_USAGE => b.usage,
+            0x821F => @intFromBool(b.immutable), // GL_BUFFER_IMMUTABLE_STORAGE_EXT
+            0x8220 => b.storage_flags, // GL_BUFFER_STORAGE_FLAGS_EXT
             g.BUFFER_MAPPED => @intFromBool(b.mapped()),
             g.BUFFER_ACCESS_FLAGS => b.map_access,
             g.BUFFER_MAP_LENGTH => @intCast(if (b.map) |m| m.len else 0),
@@ -1993,6 +3127,35 @@ pub const Context = struct {
     //
     // A fence is the engine's mark after the work recorded before it (that
     // work is run then). A GLsync is the share group's slot, plus one.
+
+    pub fn objectLabel(c: *Context, identifier: u32, name: u32) ?*debug_output.Label {
+        const label: ?*debug_output.Label = switch (identifier) {
+            0x82E0 => if (madeIn(Buf, &c.objs.bufs, name)) |o| &o.label else null,
+            0x82E1, 0x82E2 => program.objectLabel(c, name, identifier == 0x82E1),
+            0x8074 => if (madeIn(Vao, &c.vaos, name)) |o| &o.label else null,
+            0x82E6 => if (madeIn(Smp, &c.objs.samplers, name)) |o| &o.label else null,
+            g.TEXTURE => if (madeIn(Tex, &c.objs.tex, name)) |o| &o.label else null,
+            g.RENDERBUFFER => if (madeIn(Rb, &c.objs.rbs, name)) |o| &o.label else null,
+            g.FRAMEBUFFER => if (madeIn(Fbo, &c.fbos, name)) |o| &o.label else null,
+            // These namespaces exist in the API, but this driver has no live objects in them.
+            0x82E3 => if (c.isTimerQuery(name)) &c.timers[name - 1].label else null,
+            0x82E4, 0x8E22 => null,
+            else => {
+                c.fail(g.INVALID_ENUM);
+                return null;
+            },
+        };
+        if (label == null) c.fail(g.INVALID_VALUE);
+        return label;
+    }
+
+    pub fn pointerLabel(c: *Context, h: ?*const anyopaque) ?*debug_output.Label {
+        const s = c.syncOf(h) orelse {
+            c.fail(g.INVALID_VALUE);
+            return null;
+        };
+        return &s.label;
+    }
 
     fn syncOf(c: *Context, h: ?*const anyopaque) ?*Sync {
         const x = @intFromPtr(h);
@@ -2252,11 +3415,28 @@ pub const Context = struct {
         const pts = c.points(&c.fbos[fb - 1], attachment) orelse return;
         var a = Attach{};
         if (name != 0) {
-            if (textarget != g.TEXTURE_2D) return c.fail(g.INVALID_ENUM);
+            const cube = textarget >= g.TEXTURE_CUBE_MAP_POSITIVE_X and textarget <= g.TEXTURE_CUBE_MAP_NEGATIVE_Z;
+            if (!cube and textarget != g.TEXTURE_2D) return c.fail(g.INVALID_ENUM);
             const t = madeIn(Tex, &c.objs.tex, name) orelse return c.fail(g.INVALID_OPERATION);
-            if (t.target != g.TEXTURE_2D) return c.fail(g.INVALID_OPERATION);
-            if (level != 0) return c.fail(g.INVALID_VALUE);
-            a = .{ .kind = .tex, .name = name };
+            if (t.target != (if (cube) g.TEXTURE_CUBE_MAP else g.TEXTURE_2D)) return c.fail(g.INVALID_OPERATION);
+            if (level < 0 or level >= engine.MAX_LEVELS) return c.fail(g.INVALID_VALUE);
+            a = .{ .kind = .tex, .name = name, .level = @intCast(level), .layer = if (cube) textarget - g.TEXTURE_CUBE_MAP_POSITIVE_X else 0, .face = if (cube) textarget else 0 };
+        }
+        for (pts) |p| {
+            if (p) |x| c.setAttach(x, a);
+        }
+    }
+
+    pub fn framebufferTextureLayer(c: *Context, target: u32, attachment: u32, name: u32, level: i32, layer: i32) void {
+        const fb = c.fbTarget(target) orelse return;
+        if (fb == 0) return c.fail(g.INVALID_OPERATION);
+        const pts = c.points(&c.fbos[fb - 1], attachment) orelse return;
+        var a = Attach{};
+        if (name != 0) {
+            const t = madeIn(Tex, &c.objs.tex, name) orelse return c.fail(g.INVALID_OPERATION);
+            if (t.target != g.TEXTURE_3D and t.target != g.TEXTURE_2D_ARRAY) return c.fail(g.INVALID_OPERATION);
+            if (level < 0 or level >= engine.MAX_LEVELS or layer < 0 or layer >= MAX_SIZE) return c.fail(g.INVALID_VALUE);
+            a = .{ .kind = .tex, .name = name, .level = @intCast(level), .layer = @intCast(layer) };
         }
         for (pts) |p| {
             if (p) |x| c.setAttach(x, a);
@@ -2401,6 +3581,47 @@ pub const Context = struct {
         if (index >= MAX_ATTRS) return c.fail(g.INVALID_VALUE);
         c.generic[index] = v;
         c.generic_int[index] = integer;
+        c.generic_unsigned[index] = false;
+    }
+
+    pub fn vertexAttribUnsigned(c: *Context, index: u32, v: [4]u32) void {
+        if (index >= MAX_ATTRS) return c.fail(g.INVALID_VALUE);
+        c.vertexAttrib(index, v, true);
+        c.generic_unsigned[index] = true;
+    }
+
+    pub fn vertexAttribValues(c: *Context, comptime T: type, index: u32, pname: u32, out: [*]T) void {
+        _ = c.attrIndex(index) orelse return;
+        if (pname != g.CURRENT_VERTEX_ATTRIB) {
+            const value = c.getVertexAttrib(index, pname) orelse return;
+            out[0] = if (T == f32) @floatFromInt(value) else @bitCast(value);
+            return;
+        }
+        for (c.generic[index], 0..) |bits, i| {
+            if (c.generic_int[index]) {
+                out[i] = if (T == f32)
+                    (if (c.generic_unsigned[index]) @floatFromInt(bits) else @floatFromInt(@as(i32, @bitCast(bits))))
+                else
+                    @bitCast(bits);
+            } else {
+                const value: f32 = @bitCast(bits);
+                if (T == f32) {
+                    out[i] = value;
+                } else {
+                    const rounded = if (std.math.isNan(value)) 0 else @round(@as(f64, value));
+                    out[i] = @intFromFloat(std.math.clamp(rounded, @as(f64, @floatFromInt(std.math.minInt(T))), @as(f64, @floatFromInt(std.math.maxInt(T)))));
+                }
+            }
+        }
+    }
+
+    pub fn vertexAttribPointerValue(c: *Context, index: u32, pname: u32) ?usize {
+        const attr = c.attrIndex(index) orelse return null;
+        if (pname != g.VERTEX_ATTRIB_ARRAY_POINTER) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        return attr.offset;
     }
 
     pub fn getVertexAttrib(c: *Context, index: u32, pname: u32) ?i32 {
@@ -2504,13 +3725,15 @@ pub const Context = struct {
         const color = v.color[0] orelse return;
         if (count == 0 or instances == 0) return;
         var d = raster.Draw{ .pipe = pipe, .color = color, .topology = topology, .first = first, .count = @intCast(count), .instances = @intCast(instances), .uniforms = uniforms };
+        var sampled_mips: [texture.MAX_TEX]Image = @splat(.{});
+        defer for (&sampled_mips) |*image| c.eng.freeImage(image);
         if (c.program != 0) {
             // the textures: each slot's image, its descriptor after the uniforms
             const ds = program.drawState(c) orelse return;
             const n = ds.uniforms.len;
             @memcpy(c.draw_words[0..n], ds.uniforms);
             for (ds.slots, 0..) |sl, i| {
-                const st = c.slotState(sl, ds.uniforms);
+                const st = c.slotState(sl, ds.uniforms, &sampled_mips[i]);
                 texture.descriptor(st, c.draw_words[n + i * texture.DESC_WORDS ..][0..texture.DESC_WORDS]);
                 d.textures[i] = st.img;
             }
@@ -2591,6 +3814,11 @@ pub const Context = struct {
                 d.depth_write = c.depth_mask;
             }
         }
+        if (c.enabled & bitOf(g.STENCIL_TEST) != 0) {
+            d.stencil = v.stencil;
+            d.stencil_front = c.stencil_front.draw(c.stencil_mask);
+            d.stencil_back = c.stencil_back.draw(c.stencil_back_mask);
+        }
         if (c.enabled & bitOf(g.BLEND) != 0) {
             const bc = c.blend_color;
             d.blend = .{
@@ -2628,7 +3856,9 @@ pub const Context = struct {
                 .rb => @intCast(g.RENDERBUFFER),
             },
             g.FRAMEBUFFER_ATTACHMENT_OBJECT_NAME => @intCast(a.name),
-            g.FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL => 0,
+            g.FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL => @intCast(a.level),
+            g.FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER => @intCast(if (a.face == 0) a.layer else 0),
+            g.FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE => @intCast(a.face),
             g.FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE => @intCast(g.UNSIGNED_NORMALIZED),
             g.FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING => @intCast(g.LINEAR),
             else => {

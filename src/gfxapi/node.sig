@@ -42,6 +42,7 @@
 //! Allocation-free: fixed tables (MAX_BUFFERS entries, MAX_PIECES each).
 
 const std = @import("std");
+const report = @import("report.sig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const gpu = @import("gpu");
@@ -67,6 +68,8 @@ pub const G_INFO: u32 = 0x8020_4700;
 pub const G_RESERVE: u32 = 0xc010_4701;
 pub const G_ALLOC: u32 = 0xc020_4702;
 pub const G_FREE: u32 = 0x4004_4703;
+pub const G_UNRESERVE: u32 = 0x4008_4708;
+pub const G_BUFFER_INFO: u32 = 0xc020_4709;
 pub const G_SUBMIT: u32 = 0xc010_4704;
 pub const G_WAIT: u32 = 0x4010_4705;
 pub const G_IMPORT: u32 = 0xc020_4706;
@@ -145,6 +148,7 @@ pub fn Node(comptime Sys: type) type {
         lost: bool = false,
         /// Which GPU answered (open: G_INFO's chip).
         kind: Kind = .adreno,
+        dma_import: bool = false,
         /// What the kernel's buffers come in: 4 KiB pages on the Adreno,
         /// 2 MiB on the RTX.
         unit: usize = PAGE,
@@ -161,6 +165,7 @@ pub fn Node(comptime Sys: type) type {
             /// names held (an import of the same kernel buffer again)
             refs: u32 = 1,
             va: u64 = 0,
+            reserved: bool = false,
             cpu: usize = 0,
             /// Bytes mapped here (every piece, rounded to whole units; 0
             /// for an import, which is the program's own memory).
@@ -191,6 +196,8 @@ pub fn Node(comptime Sys: type) type {
                 return error.Unsupported;
             }
             g.kind = kind.?;
+            var probe = [_]u8{0} ** 32;
+            g.dma_import = g.kind == .adreno or g.call(G_BUFFER_INFO, &probe) == 0;
             g.unit = if (g.kind == .nvidia) NV_UNIT else PAGE;
             g.line = g.sys.cacheLine();
             return i;
@@ -307,7 +314,11 @@ pub fn Node(comptime Sys: type) type {
             wr64(&a, 0, size);
             wr32(&a, 8, flags);
             wr64(&a, 16, at);
-            if (g.call(G_ALLOC, &a) != 0) return null;
+            const result = g.call(G_ALLOC, &a);
+            if (result != 0) {
+                report.say(.egl_error, "render-node allocation of {d} bytes failed: {d}", .{ size, result });
+                return null;
+            }
             return .{ .handle = rd32(&a, 12), .va = rd64(&a, 16), .off = rd64(&a, 24) };
         }
 
@@ -320,6 +331,11 @@ pub fn Node(comptime Sys: type) type {
         fn release(g: *Self, e: *Entry) void {
             if (e.len != 0) g.sys.unmap(e.cpu, e.len);
             for (e.handles[0..e.n]) |h| g.freeHandle(h);
+            if (e.reserved and g.kind == .nvidia) {
+                var a: [8]u8 = undefined;
+                wr64(&a, 0, e.va);
+                _ = g.call(G_UNRESERVE, &a);
+            }
             e.* = .{};
         }
 
@@ -339,7 +355,10 @@ pub fn Node(comptime Sys: type) type {
             // (whole units: the RTX's pieces must start on 2 MiB)
             const piece = std.mem.alignForward(usize, @max(g.piece, g.unit), g.unit);
             if (g.fd < 0 or g.lost or size == 0 or size > MAX_PIECES * piece) return null;
-            const idx = g.freeEntry() orelse return null;
+            const idx = g.freeEntry() orelse {
+                report.say(.egl_error, "render-node buffer table is full allocating {d} bytes", .{size});
+                return null;
+            };
             const e = &g.buffers[idx];
             // (asked of the kernel in pages, which it rounds up to its
             // units; mapped, and laid out, in its units)
@@ -352,7 +371,10 @@ pub fn Node(comptime Sys: type) type {
                 e.n = 1;
                 e.va = p.va;
                 const at = g.sys.mapBuffer(g.fd, 0, len, p.off);
-                if (at < 0) return g.undo(e);
+                if (at < 0) {
+                    report.say(.egl_error, "render-node mmap of {d} bytes failed: {d}", .{ len, at });
+                    return g.undo(e);
+                }
                 e.cpu = @intCast(at);
                 e.len = len;
             } else {
@@ -361,6 +383,7 @@ pub fn Node(comptime Sys: type) type {
                 wr64(&r, 0, len);
                 if (g.call(G_RESERVE, &r) != 0) return g.undo(e);
                 e.va = rd64(&r, 8);
+                e.reserved = true;
                 const span = g.sys.reserve(len);
                 if (span < 0) return g.undo(e);
                 e.cpu = @intCast(span);
@@ -398,7 +421,7 @@ pub fn Node(comptime Sys: type) type {
         /// buffer of this context: its GPU address, mapped here; null when
         /// the kernel refuses it.
         pub fn importFd(g: *Self, fd: i32) ?Buffer {
-            if (g.fd < 0 or g.lost or g.kind != .adreno) return null;
+            if (g.fd < 0 or g.lost or !g.dma_import) return null;
             const size_i = g.sys.fdSize(fd);
             if (size_i <= 0) return null;
             const size: usize = @intCast(size_i);
@@ -414,6 +437,14 @@ pub fn Node(comptime Sys: type) type {
                 }
             }
             const idx = g.freeEntry() orelse return g.dropHandle(kh);
+            if (g.kind == .nvidia) {
+                var info_buf = [_]u8{0} ** 32;
+                wr32(&info_buf, 0, kh);
+                if (g.call(G_BUFFER_INFO, &info_buf) != 0) return g.dropHandle(kh);
+                const len = std.math.cast(usize, rd64(&info_buf, 24)) orelse return g.dropHandle(kh);
+                if (len < size or len % g.unit != 0) return g.dropHandle(kh);
+                return g.mapImported(idx, kh, rd64(&info_buf, 8), rd64(&info_buf, 16), len, size);
+            }
             var gi = [_]u8{0} ** 24;
             wr32(&gi, 0, kh);
             wr32(&gi, 4, 1); // MSM_INFO_GET_IOVA
@@ -422,7 +453,11 @@ pub fn Node(comptime Sys: type) type {
             wr32(&gi, 4, 0); // MSM_INFO_GET_OFFSET
             if (g.call(MSM_GEM_INFO, &gi) != 0) return g.dropHandle(kh);
             const len = std.mem.alignForward(usize, size, PAGE);
-            const at = g.sys.mapBuffer(g.fd, 0, len, rd64(&gi, 8));
+            return g.mapImported(idx, kh, va, rd64(&gi, 8), len, size);
+        }
+
+        fn mapImported(g: *Self, idx: usize, kh: u32, va: u64, off: u64, len: usize, size: usize) ?Buffer {
+            const at = g.sys.mapBuffer(g.fd, 0, len, off);
             if (at < 0) return g.dropHandle(kh);
             const e = &g.buffers[idx];
             e.* = .{ .used = true, .va = va, .cpu = @intCast(at), .len = len, .first = len, .n = 1 };
@@ -629,16 +664,28 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
         }
 
         /// A gpu.Buffer of this GPU as a dma-buf fd (a window's frame), or
-        /// -errno.
+        /// -errno. The RTX's buffers carry nvidia_device's slot as their
+        /// handle: the node knows them by the raw device's (legion43: the
+        /// slot exported another buffer, "dma-buf smaller than its
+        /// picture").
         pub fn exportFd(g: *Self, b: gpu.Buffer) i64 {
+            if (with_nv and g.node.kind == .nvidia) {
+                const h = g.nv.rawHandle(b) orelse return -EINVAL;
+                return g.node.exportFd(h);
+            }
             return g.node.exportFd(b.handle);
         }
 
         /// A dma-buf as a gpu.Buffer of this GPU (freed as any of its
         /// buffers), or null.
         pub fn importFd(g: *Self, fd: i32) ?gpu.Buffer {
-            if (g.node.kind != .adreno) return null;
             const b = g.node.importFd(fd) orelse return null;
+            if (with_nv and g.node.kind == .nvidia) {
+                return g.nv.adoptHost(.{ .va = b.va, .cpu = b.cpu, .handle = b.handle }) orelse {
+                    g.node.freeIn(b.handle);
+                    return null;
+                };
+            }
             return .{ .gpu = b.va, .cpu = b.cpu, .bytes = b.cpu.len, .handle = b.handle, .kind = .host };
         }
 
@@ -774,6 +821,7 @@ fn wr64(b: []u8, o: usize, v: u64) void {
 /// bytes; PRIME gives fd 100 + the kernel's handle.
 pub const Fake = struct {
     emu: *adreno.device.EmuDevice,
+    chip: u32 = CHIP_X1_45,
     present: bool = true,
     hung: bool = false,
     /// Waits run out (the GPU is slow).
@@ -804,10 +852,19 @@ pub const Fake = struct {
         switch (req) {
             G_INFO => {
                 wr32(a, 0, G_VERSION);
-                wr32(a, 4, CHIP_X1_45);
+                wr32(a, 4, k.chip);
                 wr32(a, 12, @intFromBool(k.hung));
             },
             G_RESERVE => wr64(a, 8, k.emu.va_base + k.next()),
+            G_BUFFER_INFO => {
+                const handle = rd32(a, 0);
+                if (handle == 0) return 0;
+                if (handle >= k.pieces.len or k.pieces[handle].va == 0) return -EINVAL;
+                const buf = k.pieces[handle];
+                wr64(a, 8, buf.va);
+                wr64(a, 16, @as(u64, handle) << 32);
+                wr64(a, 24, buf.cpu.len);
+            },
             G_ALLOC => {
                 k.allocs += 1;
                 if (k.allocs == k.fail_alloc) return -12;
@@ -942,6 +999,28 @@ test "node: the calls' numbers are galaxy_gpu_drm's and DRM's" {
     const want = [_]u32{ (2 << 30) | (32 << 16) | 0x4700, (3 << 30) | (16 << 16) | 0x4701, (3 << 30) | (32 << 16) | 0x4702, (1 << 30) | (4 << 16) | 0x4703, (3 << 30) | (16 << 16) | 0x4704, (1 << 30) | (16 << 16) | 0x4705, (3 << 30) | (32 << 16) | 0x4706, (3 << 30) | (12 << 16) | 0x642d };
     try std.testing.expectEqualSlices(u32, &want, &[_]u32{ G_INFO, G_RESERVE, G_ALLOC, G_FREE, G_SUBMIT, G_WAIT, G_IMPORT, PRIME_HANDLE_TO_FD });
     try std.testing.expectEqual(@as(u32, 0x80000), DRM_CLOEXEC);
+}
+
+test "node: RTX PRIME import maps a shared buffer and counts repeated imports" {
+    var k: Fake = undefined;
+    var g = testNode(&k);
+    k.chip = CHIP_GB206;
+    _ = try g.open();
+    defer g.close();
+    try std.testing.expect(g.dma_import);
+    const external = g.newPiece(NV_UNIT, 0, 0).?;
+    const fd: i32 = @intCast(100 + external.handle);
+    const first = g.importFd(fd).?;
+    const second = g.importFd(fd).?;
+    try std.testing.expectEqual(external.va, first.va);
+    try std.testing.expectEqual(NV_UNIT, first.cpu.len);
+    try std.testing.expectEqual(first.handle, second.handle);
+    first.cpu[17] = 42;
+    try std.testing.expectEqual(@as(u8, 42), second.cpu[17]);
+    g.freeIn(first.handle);
+    try std.testing.expectEqual(@as(u32, 1), k.live);
+    g.freeIn(second.handle);
+    try std.testing.expectEqual(@as(u32, 0), k.live);
 }
 
 test "node: buffers, an import, an export, a hang, no GPU" {
