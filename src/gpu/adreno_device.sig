@@ -43,6 +43,12 @@ const Fence = dv.Fence;
 
 /// Bytes of command stream one run may use.
 pub const STREAM_BYTES = 256 * 1024;
+/// Runs in flight at once (a command stream each).
+pub const STREAMS = 4;
+/// How long a run waits for its stream's last run (µs): longer than the
+/// kernel takes to call a GPU that stopped moving hung (15 s), which ends
+/// the wait sooner with DeviceLost.
+pub const REUSE_WAIT_US: u64 = 20_000_000;
 /// The most groups along one axis (the Adreno's limit; KIR's gid bounds).
 pub const MAX_GROUPS = 65535;
 
@@ -101,10 +107,14 @@ pub const Over = struct {
     /// The handles of the buffers imported and not freed.
     imported: [MAX_IMPORTS]u32 = undefined,
     n_imported: usize = 0,
-    ib: ?raw.Buffer = null,
+    /// The command streams (STREAMS: runs in flight at once), and the
+    /// timestamps: two words a stream.
+    ibs: [STREAMS]?raw.Buffer = .{null} ** STREAMS,
     ts: ?raw.Buffer = null,
+    /// Runs submitted (the last one's Fence).
     fence: Fence = 0,
-    raw_fence: raw.Fence = 0,
+    /// Each stream's last run.
+    raw_fences: [STREAMS]raw.Fence = .{0} ** STREAMS,
     /// GPU time of the last run (ns), once waited for.
     last_ns: u64 = 0,
     timed: bool = false,
@@ -250,9 +260,14 @@ pub const Over = struct {
         return out[0..n];
     }
 
-    fn ensureBuffers(o: *Over) Error!void {
-        if (o.ib == null) o.ib = o.raw.vtable.alloc(o.raw.ctx, STREAM_BYTES) orelse return error.OutOfMemory;
+    fn ensureBuffers(o: *Over, slot: usize) Error!void {
+        if (o.ibs[slot] == null) o.ibs[slot] = o.raw.vtable.alloc(o.raw.ctx, STREAM_BYTES) orelse return error.OutOfMemory;
         if (o.ts == null) o.ts = o.raw.vtable.alloc(o.raw.ctx, 4096) orelse return error.OutOfMemory;
+    }
+
+    /// Run `f`'s stream (its timestamps at ts + 16 x the stream).
+    fn slotOf(f: Fence) usize {
+        return @intCast((f - 1) % STREAMS);
     }
 
     /// The PM4 stream of `ds` into `s`.
@@ -290,17 +305,26 @@ pub const Over = struct {
         s.check() catch return error.Unsupported;
     }
 
+    /// A run takes the next of the STREAMS command streams. The run that had
+    /// it last must be done before it is written again (the GPU runs them
+    /// in order): waited for, as long as a hang takes to be called one.
+    /// The Surface's 11-09 boots: with one stream, polled (a wait of 0)
+    /// before each run, an app's second batch while its first still ran
+    /// failed with Timeout and Galaxy's GL called the GPU lost (Firefox's
+    /// first WebRender frames, 3.5 s into its life).
     fn run(ctx: *anyopaque, ds: []const Dispatch) Error!Fence {
         const o = self(ctx);
-        if (o.fence != 0 and !o.timed) try wait(ctx, o.fence, 0);
-        try o.ensureBuffers();
-        const ib = o.ib.?;
+        const next = o.fence + 1;
+        const slot = slotOf(next);
+        if (next > STREAMS) o.raw.wait(o.raw_fences[slot], REUSE_WAIT_US) catch |e| return mapError(e);
+        try o.ensureBuffers(slot);
+        const ib = o.ibs[slot].?;
         const ts = o.ts.?;
         var s = a7xx.Stream{ .buf = ib.words() };
-        try o.build(&s, ds, ts.va);
+        try o.build(&s, ds, ts.va + 16 * slot);
         o.raw.toDevice(ib, 0, s.len * 4);
-        o.raw_fence = o.raw.submit(ib, @intCast(s.len)) catch |e| return mapError(e);
-        o.fence += 1;
+        o.raw_fences[slot] = o.raw.submit(ib, @intCast(s.len)) catch |e| return mapError(e);
+        o.fence = next;
         o.timed = false;
         return o.fence;
     }
@@ -308,26 +332,28 @@ pub const Over = struct {
     fn wait(ctx: *anyopaque, f: Fence, timeout_us: u64) Error!void {
         const o = self(ctx);
         if (f > o.fence) return error.BadProgram;
-        if (f < o.fence) return;
-        o.raw.wait(o.raw_fence, timeout_us) catch |e| return mapError(e);
-        o.noteTime();
+        // (a run whose stream was taken again was waited for then)
+        if (f == 0 or o.fence - f >= STREAMS) return;
+        o.raw.wait(o.raw_fences[slotOf(f)], timeout_us) catch |e| return mapError(e);
+        if (f == o.fence) o.noteTime();
     }
 
     fn done(ctx: *anyopaque, f: Fence) bool {
         const o = self(ctx);
-        if (f < o.fence) return true;
         if (f > o.fence) return false;
-        o.raw.wait(o.raw_fence, 0) catch return false;
-        o.noteTime();
+        if (f == 0 or o.fence - f >= STREAMS) return true;
+        o.raw.wait(o.raw_fences[slotOf(f)], 0) catch return false;
+        if (f == o.fence) o.noteTime();
         return true;
     }
 
     fn noteTime(o: *Over) void {
-        if (o.timed) return;
+        if (o.timed or o.fence == 0) return;
         o.timed = true;
         const ts = o.ts orelse return;
-        o.raw.fromDevice(ts, 0, 16);
-        const t: []const u64 = @alignCast(std.mem.bytesAsSlice(u64, ts.cpu[0..16]));
+        const at = 16 * slotOf(o.fence);
+        o.raw.fromDevice(ts, at, 16);
+        const t: []const u64 = @alignCast(std.mem.bytesAsSlice(u64, ts.cpu[at..][0..16]));
         const ticks = t[1] -% t[0];
         const hz = @max(o.raw.timestamp_hz, 1);
         o.last_ns = @intCast(@min(@as(u128, ticks) * 1_000_000_000 / hz, std.math.maxInt(u64)));
@@ -340,15 +366,15 @@ pub const Over = struct {
     fn timestampNs(ctx: *anyopaque, timeout_us: u64) Error!u64 {
         const o = self(ctx);
         if (o.raw.timestamp_hz == 0) return error.Unsupported;
-        // The adapter reuses its command and report buffers. Retire the
-        // previous submission before encoding a sample into those buffers.
-        if (o.fence != 0 and !o.timed) try wait(ctx, o.fence, timeout_us);
+        // (a run of its own, its stream's timestamps: run waits for the
+        // stream to be free; the CP takes the sample after what runs before)
         const previous_run_ns = o.last_ns;
         defer o.last_ns = previous_run_ns;
         const f = try run(ctx, &.{});
         try wait(ctx, f, timeout_us);
         const ts = o.ts.?;
-        const tick = std.mem.readInt(u64, ts.cpu[8..16], .little);
+        const at = 16 * slotOf(f);
+        const tick = std.mem.readInt(u64, ts.cpu[at + 8 ..][0..8], .little);
         return @intCast(@min(@as(u128, tick) * 1_000_000_000 / o.raw.timestamp_hz, std.math.maxInt(u64)));
     }
 
@@ -577,6 +603,33 @@ fn runOne(d: dv.Device, p: *const Program, groups: [3]u32, bufs: []const Buffer,
         std.debug.print("emulated Adreno: {s} at {d}: {s}\n", .{ if (Rig.emu.lastError()) |x| @errorName(x) else "?", at, text });
         return e;
     };
+}
+
+test "runs one after another without waits: the streams taken in turn, every run's work done" {
+    Rig.emu.init(&Rig.arena, &Rig.view);
+    const d = Rig.emu.device();
+    var k = newKernel("add", .{ 64, 1, 1 });
+    const out = k.binding();
+    const t4 = k.op2(.shl, .u32, kir.r(k.tid(0)), kir.u(2));
+    const x = k.load(.u32, kir.global(out, 32), kir.r(t4));
+    k.store(.u32, kir.global(out, 32), kir.r(t4), kir.r(k.op2(.iadd, .u32, kir.r(x), kir.r(k.param(.u32, 0)))));
+    const p = try loadKernel(d, &k);
+    const b = try d.alloc(4 * 64, .host);
+    @memset(b.cpu, 0);
+    d.toDevice(b, 0, b.bytes);
+    // three times round the streams, none waited for in between
+    var fences: [3 * STREAMS]Fence = undefined;
+    var params: [3 * STREAMS][1]u32 = undefined;
+    for (&fences, &params, 0..) |*f, *pw, n| {
+        pw[0] = @intCast(n + 1);
+        f.* = try d.run(&.{.{ .prog = &p, .groups = .{ 1, 1, 1 }, .buffers = &.{b}, .params = pw }});
+    }
+    // (a fence whose stream was taken again is done)
+    try std.testing.expect(d.done(fences[0]));
+    try d.wait(fences[fences.len - 1], 1_000_000);
+    d.fromDevice(b, 0, b.bytes);
+    // 1 + 2 + ... + 12, every run's addition there once
+    for (b.words()) |w| try std.testing.expectEqual(@as(u32, 78), w);
 }
 
 test "a kernel through the adapter: PM4, constants, the pool, cache maintenance" {
