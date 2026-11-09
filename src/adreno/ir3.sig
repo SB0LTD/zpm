@@ -10,8 +10,9 @@
 //! four against Mesa's disassembler vectors (tests/data/ir3_disasm_vectors.txt).
 //!
 //! Allocation-free: instructions are plain values, text goes into caller
-//! buffers. Texture (cat5) instructions and the a8xx-only forms are not
-//! here: compute kernels do not need them.
+//! buffers. Of the texture (cat5) instructions only `sam` with
+//! immediate sampler and texture slots is here (what fragment programs
+//! use); the a8xx-only forms are not.
 
 const std = @import("std");
 
@@ -209,6 +210,8 @@ pub const Op = enum(u8) {
     hrsq,
     hlog2,
     hexp2,
+    // cat5
+    sam,
     // cat6
     ldg,
     ldg_a,
@@ -291,6 +294,7 @@ pub const Op = enum(u8) {
         if (v <= @intFromEnum(Op.flat_b)) return 2;
         if (v <= @intFromEnum(Op.wmm_accu)) return 3;
         if (v <= @intFromEnum(Op.hexp2)) return 4;
+        if (v <= @intFromEnum(Op.sam)) return 5;
         if (v <= @intFromEnum(Op.shfl)) return 6;
         return 7;
     }
@@ -420,6 +424,12 @@ pub const Instr = struct {
     w: bool = false,
     /// sleep.l / dccln.all.
     long: bool = false,
+    // cat5
+    /// The components written (x = 1 .. w = 8).
+    wrmask: u4 = 0xf,
+    /// Sampler and texture slots (s#N, t#N).
+    samp: u4 = 0,
+    tex: u7 = 0,
 };
 
 // ── Forms (pattern tables) ──────────────────────────────────────────────────
@@ -453,6 +463,7 @@ const Layout = enum(u8) {
     c3_dp,
     c3_wmm,
     c4,
+    c5_tex,
     c6_ldg,
     c6_ldg_a6,
     c6_ldg_a7,
@@ -718,6 +729,9 @@ const forms = [_]Form{
     c4(.hrsq, "001001"),
     c4(.hlog2, "001010"),
     c4(.hexp2, "001011"),
+    // cat5: a texture sampled at one coordinate source, sampler and
+    // texture slots immediate (no .3d, .a, .o, .p, .s, .clp, no bindless)
+    f(.sam, .c5_tex, &[_]Pat{ p(61, 63, "101"), p(54, 58, "00011"), p(47, 53, "0000000"), p(18, 20, "000"), p(9, 16, "00000000") }),
     // cat6: global, local, private
     f(.ldg, .c6_ldg, &(C6 ++ [_]Pat{ p(0, 0, "1"), p(22, 22, "0"), p(23, 23, "1"), p(27, 28, "00"), p(52, 53, "00"), p(54, 58, "00000") })),
     fg(.ldg_a, .c6_ldg_a6, &(C6 ++ [_]Pat{ p(0, 0, "1"), p(22, 22, "1"), p(23, 23, "1"), p(27, 28, "00"), p(52, 53, "00"), p(54, 58, "00000") }), 500, 699),
@@ -1127,6 +1141,17 @@ pub fn encode(gen: u16, in: *const Instr) Error!u64 {
                 },
                 else => unreachable,
             }
+        },
+        .c5_tex => {
+            const s = in.src[0];
+            if (s.kind != .gpr or in.dst.half != in.ty.half()) return error.NoForm;
+            putb(&w, 0, !s.half);
+            try put(&w, 1, 8, s.num);
+            try put(&w, 21, 4, in.samp);
+            try put(&w, 25, 7, in.tex);
+            try put(&w, 32, 8, in.dst.num);
+            try put(&w, 40, 4, in.wrmask);
+            try put(&w, 44, 3, @intFromEnum(in.ty));
         },
         .c4 => {
             const s = in.src[0];
@@ -1579,6 +1604,14 @@ pub fn decode(gen: u16, w: u64) Error!Instr {
                 },
                 else => unreachable,
             }
+        },
+        .c5_tex => {
+            in.ty = @enumFromInt(get(w, 44, 3));
+            in.dst = .{ .num = @intCast(get(w, 32, 8)), .half = in.ty.half() };
+            in.wrmask = @intCast(get(w, 40, 4));
+            in.src[0] = .{ .kind = .gpr, .num = @intCast(get(w, 1, 8)), .half = !getb(w, 0) };
+            in.samp = @intCast(get(w, 21, 4));
+            in.tex = @intCast(get(w, 25, 7));
         },
         .c4 => {
             in.dst.num = @intCast(get(w, 32, 8));
@@ -2170,6 +2203,21 @@ pub fn format(gen: u16, in: *const Instr, buf: []u8) Error![]const u8 {
             s3.half = false;
             putCat3Src(&t, s3, true);
         },
+        .c5_tex => {
+            if (in.sy) t.s("(sy)");
+            if (in.jp) t.s("(jp)");
+            t.print("{s} ({s})(", .{ nm, @tagName(in.ty) });
+            for (swiz, 0..) |c, k| {
+                if (in.wrmask >> @intCast(k) & 1 != 0) t.s(&[_]u8{c});
+            }
+            t.s(")");
+            putH(&t, in.dst.half);
+            putGpr(&t, in.dst.num, false);
+            t.s(", ");
+            putH(&t, in.src[0].half);
+            putGpr(&t, in.src[0].num, false);
+            t.print(", s#{d}, t#{d}", .{ in.samp, in.tex });
+        },
         .c4 => {
             putSync(&t, in);
             if (in.jp) t.s("(jp)");
@@ -2646,9 +2694,30 @@ pub fn parse(gen: u16, line: []const u8) Error!Instr {
             try l.expect(",");
             in.src[0] = try parseSrc(&l);
         },
+        5 => {
+            if (!sfx.done()) return error.Syntax;
+            try l.expect("(");
+            in.ty = try parseType(&l);
+            try l.expect(")");
+            try l.expect("(");
+            in.wrmask = 0;
+            while (!l.eat(")")) in.wrmask |= @as(u4, 1) << @intCast(try comp(&l));
+            const d = try parseReg(&l);
+            if (d.kind != .gpr) return error.Syntax;
+            in.dst = .{ .num = d.num, .half = d.half };
+            try l.expect(",");
+            const c = try parseReg(&l);
+            if (c.kind != .gpr) return error.Syntax;
+            in.src[0] = .{ .kind = .gpr, .num = c.num, .half = c.half };
+            try l.expect(",");
+            try l.expect("s#");
+            in.samp = @intCast(try l.int());
+            try l.expect(",");
+            try l.expect("t#");
+            in.tex = @intCast(try l.int());
+        },
         6 => try parseCat6(&l, &sfx, &in),
         7 => try parseCat7(&sfx, &in),
-        else => return error.Syntax,
     }
     return finish(gen, &l, &in);
 }

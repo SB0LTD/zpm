@@ -7,7 +7,10 @@
 //! implements it on the CPU: it reads the PM4 stream the way the command
 //! processor would (register writes, CP_LOAD_STATE6, CP_EXEC_CS, timestamps)
 //! and runs each dispatch in ir3_emu. So a stream that is wrong in what it
-//! programs fails here too, not only on the Surface.
+//! programs fails here too, not only on the Surface. It draws as well
+//! (a7xx_draw's streams): a rectangle's vertex and fragment programs run in
+//! ir3_emu, with the rasterizer, the texture unit and the blender between
+//! and after them worked out here from the same registers.
 //!
 //! Allocation-free: buffers come from memory the device owner provides.
 
@@ -16,6 +19,7 @@ const ir3 = @import("ir3.sig");
 const ir3_asm = @import("ir3_asm.sig");
 const ir3_emu = @import("ir3_emu.sig");
 const a7xx = @import("a7xx.sig");
+const dr = @import("a7xx_draw.sig");
 
 pub const Error = error{
     OutOfMemory,
@@ -335,6 +339,16 @@ pub const EmuDevice = struct {
     uniform_port_quirk: bool = false,
     regs: [0x10000]u32 = [_]u32{0} ** 0x10000,
     consts: [512 * 4]u32 = [_]u32{0} ** (512 * 4),
+    // The graphics pipeline's state beside the registers.
+    vs_consts: [64 * 4]u32 = [_]u32{0} ** (64 * 4),
+    fs_consts: [64 * 4]u32 = [_]u32{0} ** (64 * 4),
+    fs_samp: [dr.MAX_TEXTURES][dr.SAMP_DWORDS]u32 = [_][dr.SAMP_DWORDS]u32{[_]u32{0} ** dr.SAMP_DWORDS} ** dr.MAX_TEXTURES,
+    fs_tex: [dr.MAX_TEXTURES][dr.TEX_DWORDS]u32 = [_][dr.TEX_DWORDS]u32{[_]u32{0} ** dr.TEX_DWORDS} ** dr.MAX_TEXTURES,
+    /// The render mode the stream last marked (CP_SET_MARKER).
+    marker: u32 = 0,
+    /// Rectangles the current submission has drawn.
+    draws: u32 = 0,
+    varyings: [ir3_emu.MAX_FIBERS][ir3_emu.MAX_VARYINGS]f32 = undefined,
     emu: ir3_emu.Work = .{},
     stats: ir3_emu.Stats = .{},
     fence: u64 = 0,
@@ -430,6 +444,7 @@ pub const EmuDevice = struct {
         e.last_error = null;
         e.fault = .{};
         e.dispatches = 0;
+        e.draws = 0;
         e.execute(ib.va, dwords, 0) catch |err| {
             e.last_error = err;
             if (e.fault.kind == .none) {
@@ -483,6 +498,7 @@ pub const EmuDevice = struct {
             },
             .other => {
                 t.s(if (f.err) |x| @errorName(x) else "?");
+                if (f.rule.len != 0) t.print(": {s}", .{f.rule});
                 if (f.code_va != 0) {
                     t.s(" in ");
                     kernel(&t, name, f.code_va);
@@ -538,7 +554,11 @@ pub const EmuDevice = struct {
 
     fn packet(e: *EmuDevice, op: u32, p: []const u32, depth: u32) anyerror!void {
         switch (op) {
+            dr.CP_LOAD_STATE6_GEOM => try e.loadState(p),
+            a7xx.CP_SET_MARKER => e.marker = if (p.len > 0) p[0] & 0xf else 0,
+            dr.CP_DRAW_INDX_OFFSET => try e.drawRect(p),
             a7xx.CP_LOAD_STATE6_FRAG => {
+                if ((p[0] >> 18) & 0xf != a7xx.SB6_CS_SHADER) return e.loadState(p);
                 const st = (p[0] >> 14) & 3;
                 const src = (p[0] >> 16) & 3;
                 const off = p[0] & 0x3fff;
@@ -575,7 +595,7 @@ pub const EmuDevice = struct {
                 for (p[2..], 0..) |v, k| std.mem.writeInt(u32, out[k * 4 ..][0..4], v, .little);
             },
             a7xx.CP_EVENT_WRITE7 => {
-                if (p.len >= 4 and p[0] & (1 << 27) != 0) {
+                if (p.len >= 4 and p[0] & (1 << 27) != 0 and p[0] & (1 << 24) == 0) {
                     const va = @as(u64, p[2]) << 32 | p[1];
                     const m = e.memory();
                     const out = m.find(va, 4) orelse return error.BadStream;
@@ -649,6 +669,404 @@ pub const EmuDevice = struct {
         }
         e.fault.code_va = 0;
         e.dispatches += 1;
+    }
+
+    // ── The graphics pipeline ───────────────────────────────────────────────
+    // A rectangle drawn the way the registers say: the vertex program for
+    // its two corners, the pixels whose centres it covers, the fragment
+    // program for each (its varyings worked out as the rasterizer would,
+    // its samples as the texture unit would), then the blend and the write
+    // to the target. State the stream builder's draws do not use is
+    // refused (error.BadStream) rather than guessed at.
+
+    fn regs64(e: *const EmuDevice, reg: u32) u64 {
+        return @as(u64, e.regs[reg + 1]) << 32 | e.regs[reg];
+    }
+
+    fn stageKernel(e: *EmuDevice, base: u64, instrlen: u32, cntl0: u32, const_config: u32) anyerror!ir3_asm.Kernel {
+        const n = instrlen * 16;
+        const m = e.memory();
+        if (n == 0 or base & 127 != 0) return error.BadStream;
+        const bytes = m.find(base, n * 8) orelse return error.BadStream;
+        const code: []const u64 = @alignCast(std.mem.bytesAsSlice(u64, bytes));
+        const k = ir3_asm.Kernel{
+            .gen = ir3.A7XX,
+            .code = code,
+            .count = n,
+            .instrlen = instrlen,
+            .full_regs = @truncate((cntl0 >> 7) & 0x3f),
+            .half_regs = @truncate((cntl0 >> 1) & 0x3f),
+            .constlen = @intCast((const_config & 0xff) << 2),
+            .branchstack = @truncate(((cntl0 >> 13) & 0x7f) * 2),
+        };
+        e.fault.code_va = base;
+        if (e.check_operands) {
+            if (checkWords(k.gen, code, k.constlen, k.full_regs)) |bad| {
+                e.fault.kind = .illegal;
+                e.fault.err = error.IllegalInstruction;
+                e.fault.pc = bad.pc;
+                e.fault.rule = bad.rule;
+                e.fault.reg = bad.reg;
+                if (ir3.decode(k.gen, code[bad.pc])) |in| e.setText(&in) else |_| e.setText(null);
+                return error.IllegalInstruction;
+            }
+        }
+        return k;
+    }
+
+    fn stageFailed(e: *EmuDevice, err: anyerror) anyerror {
+        if (e.fault.kind == .none) {
+            e.fault.kind = .other;
+            e.fault.err = err;
+            e.fault.pc = e.emu.err_pc;
+            if (e.emu.err_pc < e.emu.n_code) e.setText(&e.emu.code[e.emu.err_pc]) else e.setText(null);
+        }
+        return err;
+    }
+
+    /// A draw the emulator will not run: `why` is the check that failed,
+    /// for describe().
+    fn refuse(e: *EmuDevice, comptime why: []const u8) anyerror {
+        e.fault.kind = .other;
+        e.fault.err = error.BadStream;
+        e.fault.rule = why;
+        return error.BadStream;
+    }
+
+    fn drawRect(e: *EmuDevice, p: []const u32) anyerror!void {
+        const r = &e.regs;
+        if (p.len != 3) return e.refuse("p.len != 3");
+        // (one instance of two auto-indexed vertices: a rectangle's corners)
+        if (p[0] & 0x3f != dr.DI_PT_RECTLIST or (p[0] >> 6) & 3 != dr.DI_SRC_SEL_AUTO_INDEX or p[1] != 1 or p[2] != 2) return e.refuse("p[0] & 0x3f != dr.DI_PT_RECTLIST or (p[0] >> 6) & 3 != dr.DI_SRC_SEL_AUTO_INDEX or p[1] != 1 or p[2] != 2");
+        if (e.marker != dr.RM6_DIRECT_RENDER) return e.refuse("e.marker != dr.RM6_DIRECT_RENDER");
+        // the target in plain memory; positions as window pixels
+        if (r[dr.RB_BUFFER_CNTL] & (1 << 2) == 0) return e.refuse("r[dr.RB_BUFFER_CNTL] & (1 << 2) == 0");
+        const cl = r[dr.GRAS_CL_CNTL];
+        if (cl & 1 == 0 or cl & (1 << 8) == 0 or cl & (1 << 9) == 0) return e.refuse("cl & 1 == 0 or cl & (1 << 8) == 0 or cl & (1 << 9) == 0");
+        // no depth, stencil, multisampling or tessellation and geometry stages
+        if (r[dr.RB_DEPTH_CNTL] != 0 or r[dr.RB_STENCIL_CNTL] != 0 or r[dr.RB_RAS_MSAA_CNTL] & 3 != 0) return e.refuse("r[dr.RB_DEPTH_CNTL] != 0 or r[dr.RB_STENCIL_CNTL] != 0 or r[dr.RB_RAS_MSAA_CNTL] & 3 != 0");
+        if (r[dr.SP_HS_CONFIG] | r[dr.SP_DS_CONFIG] | r[dr.SP_GS_CONFIG] != 0) return e.refuse("r[dr.SP_HS_CONFIG] | r[dr.SP_DS_CONFIG] | r[dr.SP_GS_CONFIG] != 0");
+        if (r[dr.SP_VS_CONFIG] & (1 << 8) == 0 or r[dr.SP_PS_CONFIG] & (1 << 8) == 0) return e.refuse("r[dr.SP_VS_CONFIG] & (1 << 8) == 0 or r[dr.SP_PS_CONFIG] & (1 << 8) == 0");
+        if (r[dr.RB_RENDER_CNTL] & (1 << 7) != 0 or r[dr.SP_RENDER_CNTL] & 1 != 0) return e.refuse("r[dr.RB_RENDER_CNTL] & (1 << 7) != 0 or r[dr.SP_RENDER_CNTL] & 1 != 0");
+        e.fault.dispatch = e.dispatches;
+        const m = e.memory();
+
+        // The vertex program, for vertex 0 and vertex 1.
+        const vs = try e.stageKernel(e.regs64(dr.SP_VS_BASE), r[dr.SP_VS_INSTR_SIZE], r[dr.SP_VS_CNTL_0], r[dr.SP_VS_CONST_CONFIG]);
+        const vid: u32 = r[dr.VFD_CNTL_1] & 0xff;
+        if (vid >= ir3_emu.NREGS) return e.refuse("vid >= ir3_emu.NREGS");
+        try ir3_emu.load(&e.emu, &vs);
+        ir3_emu.stageBegin(&e.emu, &vs, 2) catch |err| return e.stageFailed(err);
+        e.emu.regs[0][vid] = 0;
+        e.emu.regs[1][vid] = 1;
+        const none = ir3_emu.Stage{};
+        const vd = ir3_emu.Dispatch{ .kernel = &vs, .consts = &e.vs_consts, .groups = .{ 1, 1, 1 }, .stage = &none };
+        ir3_emu.stageRun(&e.emu, &m, &vd, 2, &e.stats) catch |err| return e.stageFailed(err);
+        // Its outputs, packed as the linkage says.
+        var vpc: [2][64]u32 = undefined;
+        @memset(&vpc[0], 0x7fc0_dead);
+        @memset(&vpc[1], 0x7fc0_dead);
+        const outs = r[dr.SP_VS_OUTPUT_CNTL] & 0x3f;
+        if (outs == 0 or outs > 32) return e.refuse("outs == 0 or outs > 32");
+        for (0..outs) |i| {
+            const ent = (r[dr.SP_VS_OUTPUT_REG + i / 2] >> @intCast(16 * (i % 2))) & 0xffff;
+            const loc = (r[dr.SP_VS_VPC_DEST_REG + i / 4] >> @intCast(8 * (i % 4))) & 0xff;
+            const reg = ent & 0xff;
+            for (0..4) |c| {
+                if ((ent >> @intCast(8 + c)) & 1 == 0) continue;
+                if (reg + c >= ir3_emu.NREGS or loc + c >= 64) return e.refuse("reg + c >= ir3_emu.NREGS or loc + c >= 64");
+                vpc[0][loc + c] = e.emu.regs[0][reg + c];
+                vpc[1][loc + c] = e.emu.regs[1][reg + c];
+            }
+        }
+        const vcntl = r[dr.VPC_VS_CNTL];
+        const stride = vcntl & 0xff;
+        const pos_loc = (vcntl >> 8) & 0xff;
+        if (pos_loc + 4 > stride or stride > 64 or r[dr.PC_VS_CNTL] & 0xff != stride) return e.refuse("pos_loc + 4 > stride or stride > 64 or r[dr.PC_VS_CNTL] & 0xff != stride");
+        var pos: [2][4]f32 = undefined;
+        for (0..2) |v| for (0..4) |c| {
+            pos[v][c] = @bitCast(vpc[v][pos_loc + c]);
+        };
+        // (no perspective division: w is 1)
+        if (pos[0][3] != 1 or pos[1][3] != 1) return e.refuse("pos[0][3] != 1 or pos[1][3] != 1");
+        const xa = @min(pos[0][0], pos[1][0]);
+        const xb = @max(pos[0][0], pos[1][0]);
+        const ya = @min(pos[0][1], pos[1][1]);
+        const yb = @max(pos[0][1], pos[1][1]);
+        if (!(xa >= -32768 and xb <= 32768 and ya >= -32768 and yb <= 32768)) return e.refuse("!(xa >= -32768 and xb <= 32768 and ya >= -32768 and yb <= 32768)");
+
+        // The pixels: centres inside the rectangle, inside every scissor.
+        var bx0: i64 = @intFromFloat(@ceil(xa - 0.5));
+        var bx1: i64 = @intFromFloat(@ceil(xb - 0.5));
+        var by0: i64 = @intFromFloat(@ceil(ya - 0.5));
+        var by1: i64 = @intFromFloat(@ceil(yb - 0.5));
+        inline for (.{ .{ dr.GRAS_SC_WINDOW_SCISSOR_TL, 0x3fff }, .{ dr.GRAS_SC_SCREEN_SCISSOR_TL, 0xffff }, .{ dr.GRAS_SC_VIEWPORT_SCISSOR_TL, 0xffff } }) |sc| {
+            const tl = r[sc[0]];
+            const br = r[sc[0] + 1];
+            bx0 = @max(bx0, tl & sc[1]);
+            by0 = @max(by0, (tl >> 16) & sc[1]);
+            bx1 = @min(bx1, @as(i64, br & sc[1]) + 1);
+            by1 = @min(by1, @as(i64, (br >> 16) & sc[1]) + 1);
+        }
+        e.draws += 1;
+        if (bx1 <= bx0 or by1 <= by0) return;
+
+        // The fragment program.
+        const ps_cntl0 = r[dr.SP_PS_CNTL_0];
+        var fs = try e.stageKernel(e.regs64(dr.SP_PS_BASE), r[dr.SP_PS_INSTR_SIZE], ps_cntl0, r[dr.SP_PS_CONST_CONFIG]);
+        fs.threadsize = if (ps_cntl0 & (1 << 20) != 0) 128 else 64;
+        const vary = ps_cntl0 & (1 << 22) != 0;
+        // (the places that say whether varyings are interpolated agree)
+        if ((r[dr.VPC_PS_CNTL] >> 16) & 1 != @intFromBool(vary) or (r[dr.SP_PS_WAVE_CNTL] >> 1) & 1 != @intFromBool(vary) or (r[dr.RB_INTERP_CNTL] >> 10) & 1 != @intFromBool(vary)) return e.refuse("(r[dr.VPC_PS_CNTL] >> 16) & 1 != @intFromBool(vary) or (r[dr.SP_PS_WAVE_CNTL] >> 1) & 1 != @intFromBool(vary) or (r[dr.RB_INTERP_CNTL] >> 10) & 1 != @intFromBool(vary)");
+        if (r[dr.SP_PS_WAVE_CNTL] & 1 != (ps_cntl0 >> 20) & 1) return e.refuse("r[dr.SP_PS_WAVE_CNTL] & 1 != (ps_cntl0 >> 20) & 1");
+        const ij: u32 = r[dr.SP_REG_PROG_ID_1] & 0xff;
+        if (vary and (ij + 1 >= ir3_emu.NREGS or r[dr.GRAS_CL_INTERP_CNTL] & 1 == 0 or r[dr.RB_INTERP_CNTL] & 1 == 0)) return e.refuse("vary and (ij + 1 >= ir3_emu.NREGS or r[dr.GRAS_CL_INTERP_CNTL] & 1 == 0 or r[dr.RB_INTERP_CNTL] & 1 == 0)");
+        const nvar: u32 = if (vary) @min(r[dr.VPC_PS_CNTL] & 0xff, ir3_emu.MAX_VARYINGS) else 0;
+        const prefetches = r[dr.SP_PS_INITIAL_TEX_LOAD_CNTL] & 7;
+        // (the pipeline reads a prefetch's coordinates with the barycentrics in r0.x)
+        if (prefetches > 4 or (prefetches != 0 and (!vary or ij != 0))) return e.refuse("prefetches without barycentrics in r0.x");
+        if ((r[dr.SP_PS_INITIAL_TEX_LOAD_CNTL] >> 3) & 1 != @intFromBool(!vary)) return e.refuse("IJ_WRITE_DISABLE does not match the varyings");
+        const out_reg = r[dr.SP_PS_OUTPUT_REG];
+        if (out_reg & 0x100 != 0 or (out_reg & 0xff) + 3 >= ir3_emu.NREGS) return e.refuse("out_reg & 0x100 != 0 or (out_reg & 0xff) + 3 >= ir3_emu.NREGS");
+        if (r[dr.SP_PS_MRT_CNTL] & 0xf != 1 or r[dr.RB_PS_MRT_CNTL] & 0xf != 1) return e.refuse("r[dr.SP_PS_MRT_CNTL] & 0xf != 1 or r[dr.RB_PS_MRT_CNTL] & 0xf != 1");
+        // The target.
+        const info = r[dr.RB_MRT_BUF_INFO];
+        if (info & 0xff != dr.FMT6_8_8_8_8_UNORM or (info >> 8) & 3 != 0 or r[dr.SP_PS_MRT_REG] & 0xff != dr.FMT6_8_8_8_8_UNORM) return e.refuse("info & 0xff != dr.FMT6_8_8_8_8_UNORM or (info >> 8) & 3 != 0 or r[dr.SP_PS_MRT_REG] & 0xff != dr.FMT6_8_8_8_8_UNORM");
+        const bgra = (info >> 13) & 3 == dr.WXYZ;
+        if (!bgra and (info >> 13) & 3 != dr.WZYX) return e.refuse("!bgra and (info >> 13) & 3 != dr.WZYX");
+        const t_base = e.regs64(dr.RB_MRT_BASE);
+        const t_pitch: u64 = @as(u64, r[dr.RB_MRT_PITCH]) << 6;
+        // Blending.
+        const mc = r[dr.RB_MRT_CONTROL];
+        const blending = mc & 3 != 0;
+        if (blending and mc & 3 != 3) return e.refuse("blending and mc & 3 != 3");
+        if ((r[dr.RB_BLEND_CNTL] & 1 != 0) != blending or (r[dr.SP_BLEND_CNTL] & 1 != 0) != blending) return e.refuse("(r[dr.RB_BLEND_CNTL] & 1 != 0) != blending or (r[dr.SP_BLEND_CNTL] & 1 != 0) != blending");
+        const bc = r[dr.RB_MRT_BLEND_CONTROL];
+        if (blending and ((bc >> 5) & 7 != 0 or (bc >> 21) & 7 != 0)) return e.refuse("blending and ((bc >> 5) & 7 != 0 or (bc >> 21) & 7 != 0)");
+        const write_mask = (mc >> 7) & 0xf;
+
+        try ir3_emu.load(&e.emu, &fs);
+        const stage = ir3_emu.Stage{ .ij_reg = @intCast(ij), .varyings = &e.varyings, .ctx = e, .sample = emuSample };
+        const fd = ir3_emu.Dispatch{ .kernel = &fs, .consts = &e.fs_consts, .groups = .{ 1, 1, 1 }, .stage = &stage };
+        const w: u64 = @intCast(bx1 - bx0);
+        const total: u64 = w * @as(u64, @intCast(by1 - by0));
+        var done: u64 = 0;
+        while (done < total) {
+            const n: u32 = @intCast(@min(total - done, ir3_emu.MAX_FIBERS));
+            for (0..n) |fi| {
+                const at = done + fi;
+                const px: f32 = @floatFromInt(bx0 + @as(i64, @intCast(at % w)));
+                const py: f32 = @floatFromInt(by0 + @as(i64, @intCast(at / w)));
+                for (0..nvar) |loc| {
+                    const mode = (r[dr.VPC_VARYING_REPLACE_MODE + loc / 16] >> @intCast(2 * (loc % 16))) & 3;
+                    const disabled = (r[dr.VPC_VARYING_LM_TRANSFER_CNTL_DISABLE + loc / 32] >> @intCast(loc % 32)) & 1 != 0;
+                    const v0: f32 = @bitCast(vpc[0][loc]);
+                    const v1: f32 = @bitCast(vpc[1][loc]);
+                    e.varyings[fi][loc] = if (disabled) std.math.nan(f32) else switch (mode) {
+                        // 1: from the first corner's value to the second's
+                        // along x; 2: along y
+                        1 => v0 + (v1 - v0) * ((px + 0.5 - pos[0][0]) / (pos[1][0] - pos[0][0])),
+                        2 => v0 + (v1 - v0) * ((py + 0.5 - pos[0][1]) / (pos[1][1] - pos[0][1])),
+                        // (two vertices give no plane: only a constant)
+                        else => if (vpc[0][loc] == vpc[1][loc]) v0 else return e.refuse("a varying that differs between the corners has no replace mode"),
+                    };
+                }
+            }
+            ir3_emu.stageBegin(&e.emu, &fs, n) catch |err| return e.stageFailed(err);
+            if (vary) for (0..n) |fi| {
+                e.emu.regs[fi][ij] = 0;
+                e.emu.regs[fi][ij + 1] = 0;
+            };
+            // Samples the pipeline takes before the program starts: each at
+            // two varyings, left in registers the program reads through (sy).
+            for (0..prefetches) |pi| {
+                const cmd = r[dr.SP_PS_INITIAL_TEX_LOAD_CMD + pi];
+                const src = cmd & 0x7f;
+                const dst = (cmd >> 13) & 0x3f;
+                if ((cmd >> 26) & 0xf != dr.TEX_PREFETCH_SAM or cmd & (1 << 23) != 0 or cmd & (1 << 25) != 0) return e.refuse("a prefetch that is not a plain sample into full registers");
+                if (src + 1 >= nvar or dst + 3 >= ir3_emu.NREGS) return e.refuse("a prefetch from varyings the program does not have");
+                if (r[dr.SP_PS_INITIAL_TEX_INDEX_CMD + pi] != 0) return e.refuse("a prefetch with bindless indices");
+                for (0..n) |fi| {
+                    const v = e.sampleAt((cmd >> 10) & 7, (cmd >> 7) & 7, e.varyings[fi][src], e.varyings[fi][src + 1]) catch |err| return e.stageFailed(err);
+                    for (0..4) |c| {
+                        if ((cmd >> @intCast(19 + c)) & 1 != 0) e.emu.regs[fi][dst + c] = @bitCast(v[c]);
+                    }
+                }
+                for (0..(n + fs.threadsize - 1) / fs.threadsize) |wi| for (0..4) |c| {
+                    const unit = (dst + c) * 2;
+                    e.emu.pend_sy[wi][unit >> 6] |= @as(u64, 3) << @intCast(unit & 63);
+                };
+            }
+            ir3_emu.stageRun(&e.emu, &m, &fd, n, &e.stats) catch |err| return e.stageFailed(err);
+            for (0..n) |fi| {
+                const at = done + fi;
+                const px: u64 = @intCast(bx0 + @as(i64, @intCast(at % w)));
+                const py: u64 = @intCast(by0 + @as(i64, @intCast(at / w)));
+                const va = t_base + py * t_pitch + px * 4;
+                const out = m.find(va, 4) orelse {
+                    e.fault.kind = .write;
+                    e.fault.err = error.Fault;
+                    e.fault.va = va;
+                    e.fault.bytes = 4;
+                    return error.Fault;
+                };
+                var src: [4]f32 = undefined;
+                for (0..4) |c| src[c] = @bitCast(e.emu.regs[fi][(out_reg & 0xff) + c]);
+                // memory order: B, G, R, A with the WXYZ swap, else R, G, B, A
+                const order: [4]u8 = if (bgra) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
+                var dst: [4]f32 = undefined;
+                for (0..4) |c| dst[c] = @as(f32, @floatFromInt(out[order[c]])) / 255.0;
+                for (0..4) |c| src[c] = if (src[c] != src[c]) 0 else std.math.clamp(src[c], 0, 1);
+                var res = src;
+                if (blending) {
+                    for (0..4) |c| {
+                        const sf = blendFactor(if (c == 3) (bc >> 16) & 0x1f else bc & 0x1f, c, src, dst) orelse return e.refuse("a blend factor the emulator does not have");
+                        const df = blendFactor(if (c == 3) (bc >> 24) & 0x1f else (bc >> 8) & 0x1f, c, src, dst) orelse return e.refuse("a blend factor the emulator does not have");
+                        res[c] = std.math.clamp(src[c] * sf + dst[c] * df, 0, 1);
+                    }
+                }
+                for (0..4) |c| {
+                    if ((write_mask >> @intCast(c)) & 1 != 0) out[order[c]] = @intFromFloat(@floor(res[c] * 255.0 + 0.5));
+                }
+            }
+            done += n;
+        }
+        e.fault.code_va = 0;
+    }
+
+    fn blendFactor(f: u32, c: usize, src: [4]f32, dst: [4]f32) ?f32 {
+        return switch (f) {
+            0 => 0,
+            1 => 1,
+            4 => src[c],
+            5 => 1 - src[c],
+            6 => src[3],
+            7 => 1 - src[3],
+            8 => dst[c],
+            9 => 1 - dst[c],
+            10 => dst[3],
+            11 => 1 - dst[3],
+            else => null,
+        };
+    }
+
+    fn texel(e: *EmuDevice, d: *const [dr.TEX_DWORDS]u32, x: i64, y: i64) ir3_emu.Error![4]f32 {
+        const fmt = (d[0] >> 22) & 0xff;
+        const width: i64 = d[1] & 0x7fff;
+        const height: i64 = (d[1] >> 15) & 0x7fff;
+        const pitch: u64 = (d[2] >> 7) & 0x3fffff;
+        const base = @as(u64, d[5] & 0x1ffff) << 32 | d[4];
+        const cx: u64 = @intCast(std.math.clamp(x, 0, width - 1));
+        const cy: u64 = @intCast(std.math.clamp(y, 0, height - 1));
+        const bpp: u64 = if (fmt == dr.FMT6_8_UNORM) 1 else 4;
+        const m = e.memory();
+        const va = base + cy * pitch + cx * bpp;
+        const b = m.find(va, @intCast(bpp)) orelse {
+            e.fault.kind = .read;
+            e.fault.err = error.Fault;
+            e.fault.va = va;
+            e.fault.bytes = @intCast(bpp);
+            e.fault.base = base;
+            return error.Fault;
+        };
+        var v: [4]f32 = .{ 0, 0, 0, 1 };
+        if (bpp == 1) {
+            v[0] = @as(f32, @floatFromInt(b[0])) / 255.0;
+        } else {
+            const order: [4]u8 = if (d[0] >> 30 == dr.WXYZ) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
+            for (0..4) |c| v[c] = @as(f32, @floatFromInt(b[order[c]])) / 255.0;
+        }
+        var out: [4]f32 = undefined;
+        for (0..4) |c| {
+            out[c] = switch ((d[0] >> @intCast(4 + 3 * c)) & 7) {
+                0 => v[0],
+                1 => v[1],
+                2 => v[2],
+                3 => v[3],
+                4 => 0,
+                else => 1,
+            };
+        }
+        return out;
+    }
+
+    /// The texture unit: a 2D texture's one level, clamped to its edge,
+    /// nearest or bilinear.
+    fn emuSample(ctx: ?*anyopaque, tex: u32, samp: u32, x_in: f32, y_in: f32) ir3_emu.Error![4]f32 {
+        const e: *EmuDevice = @ptrCast(@alignCast(ctx.?));
+        // (a sample instruction's level of detail is worked out from the
+        // pixel's neighbours: the program's state must ask for it)
+        if (e.regs[dr.SP_PS_CNTL_0] & (1 << 26) == 0) return error.BadDispatch;
+        return e.sampleAt(tex, samp, x_in, y_in);
+    }
+
+    fn sampleAt(e: *EmuDevice, tex: u32, samp: u32, x_in: f32, y_in: f32) ir3_emu.Error![4]f32 {
+        const cfg = e.regs[dr.SP_PS_CONFIG];
+        if (tex >= (cfg >> 9) & 0xff or samp >= (cfg >> 17) & 0x1f or tex >= e.regs[dr.SP_PS_TSIZE] or tex >= dr.MAX_TEXTURES or samp >= dr.MAX_TEXTURES) return error.BadDispatch;
+        const d = &e.fs_tex[tex];
+        const s = &e.fs_samp[samp];
+        const fmt = (d[0] >> 22) & 0xff;
+        if (d[2] >> 29 != 1 or d[0] & 3 != 0 or (fmt != dr.FMT6_8_UNORM and fmt != dr.FMT6_8_8_8_8_UNORM)) return error.BadDispatch;
+        // clamp to edge both ways
+        if ((s[0] >> 5) & 7 != 1 or (s[0] >> 8) & 7 != 1) return error.BadDispatch;
+        var x = x_in;
+        var y = y_in;
+        if (s[1] & (1 << 5) == 0) {
+            x *= @floatFromInt(d[1] & 0x7fff);
+            y *= @floatFromInt((d[1] >> 15) & 0x7fff);
+        }
+        if (!(@abs(x) < 1e9) or !(@abs(y) < 1e9)) return .{ 0, 0, 0, 0 };
+        const linear = (s[0] >> 1) & 3 == 1;
+        if (!linear) return e.texel(d, @intFromFloat(@floor(x)), @intFromFloat(@floor(y)));
+        const fx = x - 0.5;
+        const fy = y - 0.5;
+        const x0 = @floor(fx);
+        const y0 = @floor(fy);
+        const wx = fx - x0;
+        const wy = fy - y0;
+        const ix: i64 = @intFromFloat(x0);
+        const iy: i64 = @intFromFloat(y0);
+        const a = try e.texel(d, ix, iy);
+        const b = try e.texel(d, ix + 1, iy);
+        const c = try e.texel(d, ix, iy + 1);
+        const f = try e.texel(d, ix + 1, iy + 1);
+        var out: [4]f32 = undefined;
+        for (0..4) |k| out[k] = (a[k] * (1 - wx) + b[k] * wx) * (1 - wy) + (c[k] * (1 - wx) + f[k] * wx) * wy;
+        return out;
+    }
+
+    /// CP_LOAD_STATE6 for a vertex or fragment program: its constants (in
+    /// the stream), or the texture unit's descriptors (in memory).
+    fn loadState(e: *EmuDevice, p: []const u32) anyerror!void {
+        if (p.len < 3) return error.BadStream;
+        const st = (p[0] >> 14) & 3;
+        const src = (p[0] >> 16) & 3;
+        const block = (p[0] >> 18) & 0xf;
+        const off = p[0] & 0x3fff;
+        const units = p[0] >> 22;
+        switch (block) {
+            dr.SB6_VS_SHADER, dr.SB6_FS_SHADER => {
+                if (st != a7xx.ST6_CONSTANTS) return;
+                const dst_all: []u32 = if (block == dr.SB6_VS_SHADER) &e.vs_consts else &e.fs_consts;
+                // (direct only, as the compute constants are)
+                if (src != a7xx.SS6_DIRECT or off * 4 + units * 4 > dst_all.len or p.len < 3 + units * 4) return error.BadStream;
+                @memcpy(dst_all[off * 4 ..][0 .. units * 4], p[3..][0 .. units * 4]);
+            },
+            dr.SB6_FS_TEX => {
+                if (off != 0 or units > dr.MAX_TEXTURES) return error.BadStream;
+                const per: usize = if (st == a7xx.ST6_SHADER) dr.SAMP_DWORDS else if (st == a7xx.ST6_CONSTANTS) dr.TEX_DWORDS else return error.BadStream;
+                const words_in: []const u32 = if (src == a7xx.SS6_INDIRECT)
+                    (e.words(@as(u64, p[2]) << 32 | (p[1] & ~@as(u32, 3)), units * per) orelse return error.BadStream)
+                else if (src == a7xx.SS6_DIRECT and p.len >= 3 + units * per)
+                    p[3..][0 .. units * per]
+                else
+                    return error.BadStream;
+                for (0..units) |i| {
+                    if (st == a7xx.ST6_SHADER) @memcpy(&e.fs_samp[i], words_in[i * per ..][0..per]) else @memcpy(&e.fs_tex[i], words_in[i * per ..][0..per]);
+                }
+            },
+            else => {},
+        }
     }
 
     fn setText(e: *EmuDevice, in: ?*const ir3.Instr) void {
