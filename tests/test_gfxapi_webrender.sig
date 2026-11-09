@@ -8,7 +8,10 @@
 //! compile work Galaxy's gfx_render gives (WebRender's largest kernels
 //! are several times what sm_120 took before 2026-11-07: 4096 KIR
 //! instructions after the expansions). The largest sm_120 kernel and the
-//! slowest compile are reported.
+//! slowest compile are reported. Each variant's tile kernel then runs on
+//! the emulated RTX over one tile (its fragment code inside the raster's
+//! scan and lists, as on the PC), the CTA's warps in each order: a fault,
+//! a hazard or a divergence there names the variant.
 //!
 //! Firefox's sources are not part of zpm (they are Mozilla's, under the
 //! MPL): set GFXAPI_WR_RES to a checkout's `gfx/wr/webrender/res`. Without
@@ -33,6 +36,7 @@ const kir = gpu.kir;
 const engine = gfxapi.engine;
 const gles = gfxapi.gles;
 const program = gfxapi.program;
+const texture = gfxapi.texture;
 const g = gfxapi.glenum;
 
 const Variant = struct { name: []const u8, features: []const u8 };
@@ -284,6 +288,78 @@ fn compileStage(pipe: *const raster.Pipeline, st: Stage, t: Target) !struct { in
 }
 var env_mem: [256 * 1024]u8 = undefined;
 
+/// The emulated RTX (sm120_emu behind the PC's adapter), for running a
+/// variant's tile kernel.
+const Nv = struct {
+    const nvidia = @import("nvidia");
+    var arena: [32 << 20]u8 align(4096) = undefined;
+    var view: [32 << 20]u8 align(4096) = undefined;
+    var emu_work: nvidia.sm120_emu.Work = undefined;
+    var dev: gpu.nvidia_device.Emu = undefined;
+};
+
+/// Triangle records for one 8x8 tile: TILE_TRIS of them, these live (the
+/// others not valid, so the compaction skips them), each covering the
+/// whole tile (zero edges), its depth 0, its 1/w 1, its varyings 0.
+const TILE_TRIS = 66;
+const LIVE = [_]u32{ 0, 40, 65 };
+
+/// A variant's tile kernel (sm_120, the PC's caps) run on the emulated RTX
+/// over one tile: the fragment code inside the raster's scan and lists, as
+/// on the PC. Null when it ran clean; else the emulator's sentence.
+fn runTile(pipe: *const raster.Pipeline, uniforms: []const u32, nslots: usize, reverse: bool, why: []u8) !?[]const u8 {
+    const storage = kir.Storage{ .insts = &k_insts, .tys = &k_tys };
+    var k = raster.rasterKernel(storage, pipe);
+    try k.finish();
+    var w = gpu.Work.init(&work_mem);
+    const bin = try gpu.compile(&k, targets[1].caps, &w, &code);
+    Nv.dev.init(&Nv.arena, &Nv.view, &Nv.emu_work);
+    Nv.emu_work.reverse_warps = reverse;
+    const d = Nv.dev.device();
+    const prog = try d.load(&bin);
+    defer d.unload(&prog);
+    var color = engine.Image{ .width = 8, .height = 8, .stride = 32, .format = .rgba8 };
+    const draw = raster.Draw{ .pipe = pipe, .color = &color, .rect = .{ .x0 = 0, .y0 = 0, .x1 = 8, .y1 = 8 }, .count = 3 * TILE_TRIS };
+    var rp: [raster.RASTER_PARAMS]u32 = undefined;
+    const params = raster.rasterParams(&draw, .{}, &rp);
+    var bufs: [4 + texture.MAX_TEX]gpu.Buffer = undefined;
+    const ntex: usize = pipe.shaders.textures;
+    const nb = 4 + ntex;
+    for (bufs[0..nb], 0..) |*b, i| {
+        const bytes: u64 = switch (i) {
+            2 => TILE_TRIS * @as(u64, pipe.sstride) * 4,
+            3 => (uniforms.len + nslots * texture.DESC_WORDS + 4) * 4,
+            else => 256,
+        };
+        b.* = try d.alloc(bytes, .host);
+        @memset(b.cpu, 0);
+    }
+    defer for (bufs[0..nb]) |b| d.free(b);
+    const recs: []u32 = @alignCast(std.mem.bytesAsSlice(u32, bufs[2].cpu));
+    for (LIVE) |t| {
+        const rec = recs[t * pipe.sstride ..][0..pipe.sstride];
+        rec[0] = 1; // valid
+        rec[1] = 0; // box: x0, y0, x1, y1 (inclusive)
+        rec[2] = 0;
+        rec[3] = 7;
+        rec[4] = 7;
+        rec[26] = @bitCast(@as(f32, 1)); // 1/w's plane: 1, flat
+    }
+    const uni: []u32 = @alignCast(std.mem.bytesAsSlice(u32, bufs[3].cpu));
+    @memcpy(uni[0..uniforms.len], uniforms);
+    for (bufs[0..nb]) |b| d.toDevice(b, 0, b.cpu.len);
+    const fence = try d.run(&.{.{ .prog = &prog, .groups = .{ 1, 1, 1 }, .buffers = bufs[0..nb], .params = params }});
+    d.wait(fence, 60_000_000) catch |e| {
+        var buf: [256]u8 = undefined;
+        return std.fmt.bufPrint(why, "{s}: {s}", .{ @errorName(e), Nv.dev.explain(&buf) }) catch "(too long)";
+    };
+    if (Nv.dev.lastError()) |e| {
+        var buf: [256]u8 = undefined;
+        return std.fmt.bufPrint(why, "{s}: {s}", .{ @errorName(e), Nv.dev.explain(&buf) }) catch "(too long)";
+    }
+    return null;
+}
+
 /// The first `lines` lines of a log.
 fn head(s: []const u8, lines: usize) []const u8 {
     var n: usize = 0;
@@ -315,6 +391,7 @@ test "webrender: every shader variant compiles and links" {
     c.init(&eng, &objs);
     defer c.deinit();
     var failed: usize = 0;
+    var ran_bad: usize = 0;
     var no_code: usize = 0;
     var reported: usize = 0;
     const selected = try selectedVariants(io, fba.allocator());
@@ -386,11 +463,24 @@ test "webrender: every shader variant compiles and links" {
             }
         }
         std.debug.print("\n", .{});
+        // the tile kernel on the emulated RTX, the warps in each order
+        for ([_]bool{ false, true }) |reverse| {
+            var why_run: [512]u8 = undefined;
+            const bad = runTile(ds.pipe, ds.uniforms, ds.slots.len, reverse, &why_run) catch |e| blk: {
+                break :blk std.fmt.bufPrint(&why_run, "{s}", .{@errorName(e)}) catch "?";
+            };
+            if (bad) |s| {
+                ran_bad += 1;
+                std.debug.print("RUN  {s} [{s}] tile on the emulated RTX{s}: {s}\n", .{ v.name, v.features, if (reverse) " (warps reversed)" else "", s });
+            }
+        }
         program.useProgram(c, 0);
         _ = c.getError();
     }
     std.debug.print("webrender: {d} of {d} variants link; {d} kernels do not compile ({d} not required)\n", .{ selected.len - failed, selected.len, no_code, reported });
     std.debug.print("webrender on sm_120: the largest kernel {d} KIR, {d} machine instructions; the slowest compile {d} us ({s}); inside the backend at most {d} KIR expanded, {d} MI, {d} vregs\n", .{ max_kir, max_mi, @divTrunc(max_ns, 1000), max_what[0..max_what_len], max_xkir, max_xmi, max_vregs });
+    std.debug.print("webrender: {d} tile kernel runs on the emulated RTX went wrong\n", .{ran_bad});
     try std.testing.expectEqual(@as(usize, 0), failed);
     try std.testing.expectEqual(@as(usize, 0), no_code);
+    try std.testing.expectEqual(@as(usize, 0), ran_bad);
 }

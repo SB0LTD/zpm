@@ -1131,6 +1131,66 @@ test "draw: bins on EmuDevice (lists that run over) give the CPU's bytes" {
     eng_emu.deinit();
 }
 
+fn rtxBins(cap: ?u32) !void {
+    return rtxBinsOrder(cap, false);
+}
+
+fn rtxBinsOrder(cap: ?u32, reverse: bool) !void {
+    const want = try binsCpu();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.emu_work.reverse_warps = reverse;
+    defer Rtx.emu_work.reverse_warps = false;
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs });
+    if (cap) |c| eng_rtx.bin_cap = c;
+    try std.testing.expect(eng_rtx.onGpu());
+    var out: BinOut = .{};
+    const ran = binScene(&eng_rtx, &out);
+    if (eng_rtx.why_pipe) |e| std.debug.print("rtx pipeline: {s}\n", .{@errorName(e)});
+    if (Rtx.dev.lastError()) |e| {
+        var buf: [512]u8 = undefined;
+        std.debug.print("sm120_emu: {s}: {s}\n", .{ @errorName(e), Rtx.dev.explain(&buf) });
+    }
+    try ran;
+    try std.testing.expect(eng_rtx.why_pipe == null and !eng_rtx.lost);
+    try std.testing.expectEqualSlices(u8, &want[0].fbo, &out.fbo);
+    try std.testing.expect(eng_rtx.stats.dispatches >= 4 * 3);
+    eng_rtx.deinit();
+}
+
+test "draw: bins on the emulated RTX (sm_120) give the CPU's bytes" {
+    try rtxBins(null);
+}
+
+test "draw: bins on the emulated RTX (sm_120, lists that run over) give the CPU's bytes" {
+    try rtxBins(24);
+}
+
+test "draw: bins on the emulated RTX with each CTA's warps in reverse order give the CPU's bytes" {
+    try rtxBinsOrder(null, true);
+    try rtxBinsOrder(24, true);
+}
+
+test "draw: the scene on the emulated RTX with each CTA's warps in reverse order gives the CPU's bytes" {
+    const want = try cpuOut();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.emu_work.reverse_warps = true;
+    defer Rtx.emu_work.reverse_warps = false;
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs });
+    try std.testing.expect(eng_rtx.onGpu());
+    var out: Out = .{};
+    const ran = scene(&eng_rtx, &out);
+    if (eng_rtx.why_pipe) |e| std.debug.print("rtx pipeline: {s}\n", .{@errorName(e)});
+    if (Rtx.dev.lastError()) |e| {
+        var buf: [512]u8 = undefined;
+        std.debug.print("sm120_emu: {s}: {s}\n", .{ @errorName(e), Rtx.dev.explain(&buf) });
+    }
+    try ran;
+    try std.testing.expect(eng_rtx.why_pipe == null and !eng_rtx.lost);
+    try std.testing.expectEqualSlices(u8, &want.fbo, &out.fbo);
+    try std.testing.expectEqualSlices(u8, &want.win, &out.win);
+    eng_rtx.deinit();
+}
+
 test "draw: bins on the emulated Adreno (ir3) give the CPU's bytes" {
     const want = try binsCpu();
     a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
