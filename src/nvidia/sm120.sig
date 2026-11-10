@@ -43,6 +43,12 @@
 //! tools/gen_sm120_vectors.py), compare all 128 bits, decode the words
 //! again and print them as nvdisasm did.
 //!
+//! The graphics stages' instructions (ALD, AST, IPA, PIXLD, KILL, TEX and
+//! TLD: what a vertex and a pixel program have beside the ALU's) have no
+//! ptxas output to compare with. Their fields are NAK's; their text, and
+//! the words refused, are nvdisasm's reading of raw words
+//! (testdata/sm120_gfx_raw.txt).
+//!
 //! What nvdisasm prints that `format` cannot: a branch's label (.L_x_3) is
 //! the kernel's numbering of its targets, which one instruction does not
 //! know, so a decoded branch prints its absolute byte target, `(0x1a0),
@@ -227,6 +233,14 @@ pub const Addr = struct {
     offset: i32 = 0,
 };
 
+/// An attribute's address: a[0x70] (a byte address among a stage's inputs or
+/// outputs: ALD, AST, IPA), a[Rn+0x20] through an index register (patch
+/// attributes, .P), or a[Rn] (a physical address in Rn, .PHYS).
+pub const Attr = struct {
+    offset: u16,
+    reg: u8 = RZ,
+};
+
 /// How nvdisasm prints an immediate (and how its text is read).
 pub const ImmKind = enum {
     /// 0x10: an unsigned integer, or bits.
@@ -255,12 +269,14 @@ pub const Operand = union(enum) {
     pred: Pred,
     upred: Pred,
     /// A number as written: what it means (an integer, a float, two
-    /// halves) depends on the instruction.
+    /// halves) depends on the instruction. (A texture's dimension, 2D or
+    /// ARRAY_CUBE, is read the same way, and decoded as its name.)
     num: []const u8,
     /// A number as decoded.
     imm: Imm,
     cbuf: CBuf,
     addr: Addr,
+    attr: Attr,
     /// A special register's number (SR_TID.X: 0x21).
     sreg: u8,
     label: []const u8,
@@ -439,6 +455,16 @@ fn cbufOf(t: []const u8) Error!CBuf {
     return cb;
 }
 
+/// "a[0x70]", "a[R7+0x20]", "a[R7]": an attribute's address.
+fn attrOf(t: []const u8) Error!Attr {
+    if (!std.mem.endsWith(u8, t, "]") or t.len == 3) return error.Syntax;
+    var a = Addr{};
+    try addrInner(t[2 .. t.len - 1], &a);
+    if (a.wide or a.ureg != null or a.offset < 0) return error.Syntax;
+    if (a.offset > 0xffff) return error.OutOfRange;
+    return .{ .offset = @intCast(a.offset), .reg = a.reg };
+}
+
 pub fn parseOperand(text: []const u8) Error!Operand {
     var t = std.mem.trim(u8, text, " ");
     if (t.len == 0) return error.Syntax;
@@ -466,6 +492,7 @@ pub fn parseOperand(text: []const u8) Error!Operand {
         try addrInner(t[1 .. t.len - 1], &a);
         return .{ .addr = a };
     }
+    if (std.mem.startsWith(u8, t, "a[")) return .{ .attr = try attrOf(t) };
     if (std.mem.startsWith(u8, t, "SR_")) {
         for (SREGS) |s| {
             if (std.mem.eql(u8, s[0], t)) return .{ .sreg = s[1] };
@@ -801,6 +828,31 @@ const Cx = struct {
         return null;
     }
 
+    /// modParts for a value whose bits are apart (a texture's level of
+    /// detail: bit 59, then 87..89), low first; a value past the table is
+    /// no form this module knows.
+    fn modPartsBits(cx: *Cx, bits: []const u7, table: []const []const []const u8) Error!u64 {
+        if (!cx.enc()) {
+            var v: u64 = 0;
+            for (bits, 0..) |at, k| v |= cx.get(at, 1) << @intCast(k);
+            if (v >= table.len) return error.Unknown;
+            for (table[v]) |m| try cx.addMod(m);
+            return v;
+        }
+        var best: usize = 0;
+        var best_at: usize = 0;
+        for (table, 0..) |parts, v| {
+            if (parts.len == 0 or parts.len <= table[best].len) continue;
+            if (cx.findRun(parts)) |i| {
+                best = v;
+                best_at = i;
+            }
+        }
+        for (0..table[best].len) |k| cx.used |= @as(u32, 1) << @intCast(best_at + k);
+        for (bits, 0..) |at, k| cx.w.bit(at, (best >> @intCast(k)) & 1 == 1);
+        return best;
+    }
+
     /// A modifier field of `n` bits at `at`.
     fn mod(cx: *Cx, at: u7, n: u7, names: []const []const u8) Error!u64 {
         var bits: [8]u7 = undefined;
@@ -866,6 +918,55 @@ const Cx = struct {
 
     fn ureg(cx: *Cx, at: u7) Error!u8 {
         return cx.regOf(at, true);
+    }
+
+    /// A register nvdisasm prints only when it is not RZ (ALD's and AST's
+    /// vertex).
+    fn optReg(cx: *Cx, at: u7) Error!u8 {
+        if (cx.enc()) {
+            if (cx.peek()) |o| {
+                if (o == .gpr) return cx.reg(at);
+            }
+            cx.w.put(at, 8, RZ);
+            return RZ;
+        }
+        return if (cx.get(at, 8) != RZ) cx.reg(at) else RZ;
+    }
+
+    /// An attribute's address, a[0x70]: its bytes in 40..49, an index
+    /// register in 24 (RZ when none is written).
+    fn attr(cx: *Cx) Error!Attr {
+        if (cx.enc()) {
+            const o = try cx.take();
+            if (o != .attr) return error.Syntax;
+            if (o.attr.offset > 0x3ff) return error.OutOfRange;
+            cx.w.put(24, 8, o.attr.reg);
+            cx.w.put(40, 10, o.attr.offset);
+            return o.attr;
+        }
+        const a = Attr{ .offset = @intCast(cx.get(40, 10)), .reg = @intCast(cx.get(24, 8)) };
+        try cx.push(.{ .attr = a });
+        return a;
+    }
+
+    /// An operand that is a name (a texture's dimension, 2D): value v is
+    /// names[v], "?" no form this module knows.
+    fn named(cx: *Cx, at: u7, n: u7, names: []const []const u8) Error!u64 {
+        if (cx.enc()) {
+            const o = try cx.take();
+            if (o != .num) return error.Syntax;
+            for (names, 0..) |name, v| {
+                if (!eql(name, "?") and eql(name, o.num)) {
+                    cx.w.put(at, n, v);
+                    return v;
+                }
+            }
+            return error.Unknown;
+        }
+        const v = cx.get(at, n);
+        if (v >= names.len or eql(names[v], "?")) return error.Unknown;
+        try cx.push(.{ .num = names[v] });
+        return v;
     }
 
     /// A register read at a fixed place (not an ALU slot): its `.reuse` bit
@@ -1486,6 +1587,24 @@ const FTYPES_F32 = [_][]const u8{ "?", "F16", "", "F64" };
 /// The special-function unit's functions (74..79).
 /// (RCP64H and RSQ64H, of a double's high word, are not covered.)
 const MUFU = [_][]const u8{ "COS", "SIN", "EX2", "LG2", "RCP", "RSQ", "?", "?", "SQRT", "TANH" };
+/// The registers an attribute load or store moves (74..75), named by their
+/// bits.
+const ATTR_SIZES = [_][]const u8{ "", "64", "96", "128" };
+/// A texture's dimension (61..63); a texel fetch's (no cubes).
+const TEX_DIMS = [_][]const u8{ "1D", "2D", "3D", "CUBE", "ARRAY_1D", "ARRAY_2D", "?", "ARRAY_CUBE" };
+const TLD_DIMS = [_][]const u8{ "1D", "2D", "3D", "?", "ARRAY_1D", "ARRAY_2D", "?", "?" };
+/// TEX's level of detail (bit 59, then 87..89), as nvdisasm names each
+/// value: automatic, zero, a bias, a level, a clamp, a bias and a clamp
+/// (NAK's six); the U ones NAK does not emit.
+const TEX_LODS = [_][]const []const u8{
+    &.{},      &.{"LZ"},  &.{"LB"},  &.{"LL"},          &.{"LC"},          &.{ "LB", "LC" },
+    &.{"ULB"}, &.{"ULL"}, &.{"ULC"}, &.{ "ULB", "LC" }, &.{ "LB", "ULC" },
+};
+/// Bits 79..80 of a texture op, as nvdisasm names them (NAK leaves them 0).
+const TEX_F16 = [_][]const []const u8{ &.{}, &.{ "F16", "RN" }, &.{ "F16", "RZ" } };
+/// Texel offsets (56..57): NAK's packed offset in a source register, and
+/// the mode nvdisasm calls UAOFFI.
+const TEX_OFFSETS = [_][]const u8{ "", "AOFFI", "UAOFFI", "?" };
 
 // ── The codecs ──────────────────────────────────────────────────────────────
 
@@ -2363,6 +2482,163 @@ fn cImma(cx: *Cx) Error!void {
     cx.put(74, 1, 1); // (b is column-major)
 }
 
+// Graphics stages ------------------------------------------------------------------
+
+/// What nvdisasm takes of an attribute address: an index register only
+/// with .P or .PHYS; .PHYS (never with .P) always with one, of one
+/// register, the address field unused (not printed: zero here).
+fn attrOk(a: Attr, patch: bool, phys: bool, size: u64) bool {
+    if (phys) return !patch and a.reg != RZ and a.offset == 0 and size == 0;
+    return patch or a.reg == RZ;
+}
+
+/// ALD(.O)(.P | .PHYS)(.64 | .96 | .128) Rd, a[address](, Rvertex): a
+/// vertex, tessellation or geometry program's attributes loaded, one to
+/// four words into registers from Rd (.O: an output read back; a vertex
+/// register for another vertex's, which .P does not take).
+fn cAld(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x321);
+    _ = try cx.flag(79, "O");
+    const patch = try cx.flag(76, "P");
+    const phys = try cx.flag(77, "PHYS");
+    const size = try cx.mod(74, 2, &ATTR_SIZES);
+    _ = try cx.reg(16);
+    const a = try cx.attr();
+    const vertex = try cx.optReg(32);
+    if (!attrOk(a, patch, phys, size) or (patch and vertex != RZ)) return if (cx.enc()) error.Syntax else error.Unknown;
+}
+
+/// AST(.P | .PHYS)(.64 | .96 | .128) a[address], Rs(, Rvertex): one to
+/// four registers from Rs stored to the stage's outputs (the position at
+/// 0x70). Its vertex register is in 64, and .P takes it only without an
+/// index. It releases no write scoreboard: nvdisasm calls the word with
+/// one illegal.
+fn cAst(cx: *Cx) Error!void {
+    if (cx.in.control.write != Control.NONE) return if (cx.enc()) error.Syntax else error.Unknown;
+    cx.put(0, 12, 0x322);
+    const patch = try cx.flag(76, "P");
+    const phys = try cx.flag(77, "PHYS");
+    const size = try cx.mod(74, 2, &ATTR_SIZES);
+    const a = try cx.attr();
+    _ = try cx.reg(32);
+    const vertex = try cx.optReg(64);
+    if (!attrOk(a, patch, phys, size) or (patch and a.reg != RZ and vertex != RZ)) return if (cx.enc()) error.Syntax else error.Unknown;
+}
+
+/// IPA.PASS|CONSTANT|STATE(.CENTROID | .OFFSET) Rd(, Pd), a[address](,
+/// Roffset): a pixel program's input interpolated at the pixel's centre,
+/// the centroid, or an offset (in a register, always printed then). The
+/// address is a word's (its index in 64..71), and whether it is carried
+/// flat, in perspective or linearly is the header's (sph.sig): for
+/// perspective the program multiplies by MUFU.RCP of a[0x7c], FMUL.RZ.
+fn cIpa(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x326);
+    _ = try cx.mod(78, 2, &.{ "PASS", "CONSTANT", "STATE", "?" });
+    const at = try cx.mod(76, 2, &.{ "", "CENTROID", "OFFSET", "?" });
+    _ = try cx.reg(16);
+    try cx.optPred(81, false);
+    if (cx.enc()) {
+        const o = try cx.take();
+        if (o != .attr or o.attr.reg != RZ) return error.Syntax;
+        if (o.attr.offset % 4 != 0 or o.attr.offset > 0x3fc) return error.OutOfRange;
+        cx.w.put(64, 8, o.attr.offset / 4);
+    } else try cx.push(.{ .attr = .{ .offset = @intCast(cx.get(64, 8) * 4) } });
+    if (at == 2) _ = try cx.reg(32) else cx.put(32, 8, RZ);
+}
+
+/// PIXLD(.COVMASK | .CENTROID_OFFSET | .MY_INDEX | .INNER_COVERAGE) Rd(,
+/// Pd): what a pixel program knows of its pixel's samples (no modifier:
+/// their count).
+fn cPixld(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x925);
+    _ = try cx.mod(78, 3, &.{ "", "COVMASK", "CENTROID_OFFSET", "MY_INDEX", "INNER_COVERAGE", "?", "?", "?" });
+    _ = try cx.reg(16);
+    try cx.optPred(81, false);
+}
+
+/// KILL (P): the pixel discarded, where its guard says (@P0 KILL, as NAK
+/// writes a discard) or its predicate, printed when not PT. It takes no
+/// scoreboard, as EXIT takes none: nvdisasm calls the word with one
+/// illegal.
+fn cKill(cx: *Cx) Error!void {
+    if (cx.in.control.read != Control.NONE or cx.in.control.write != Control.NONE) {
+        return if (cx.enc()) error.Syntax else error.Unknown;
+    }
+    cx.put(0, 12, 0x95b);
+    try cx.optPredNot(87, false);
+}
+
+/// A texture op's operands: (Pfault,) Rd1, Rd0, Ra, Rb(, URc), dimension(,
+/// mask). As NAK lays them out, the results go to Rd0 on (the first two
+/// channels of the mask) and Rd1 on (the rest; printed first, RZ when the
+/// mask has none for it); Ra on are the coordinates, Rb on the handle and
+/// what the modes take.
+/// The mask (72..75) is printed when it is not all four channels, the
+/// uniform register (48) when it is not URZ; the one in 40 nvdisasm does
+/// not print (URZ here, as NAK leaves it). A source is never RZ.
+fn texOperands(cx: *Cx, dims: []const []const u8) Error!void {
+    try cx.optPred(81, false);
+    _ = try cx.reg(64);
+    _ = try cx.reg(16);
+    const a = try cx.reg(24);
+    const b = try cx.reg(32);
+    if (a == RZ or b == RZ) return if (cx.enc()) error.Syntax else error.Unknown;
+    if (cx.enc()) {
+        const o = cx.peek() orelse return error.Syntax;
+        if (o == .ugpr) {
+            if ((try cx.ureg(48)) == RZ) return error.Syntax;
+        } else cx.w.put(48, 8, RZ);
+    } else if (cx.get(48, 8) != RZ) _ = try cx.ureg(48);
+    cx.put(40, 8, RZ);
+    _ = try cx.named(61, 3, dims);
+    if (cx.enc()) {
+        if (cx.peek() != null) _ = try cx.imm(72, 4, .hex) else cx.w.put(72, 4, 0xf);
+    } else if (cx.get(72, 4) != 0xf) _ = try cx.imm(72, 4, .hex);
+    cx.put(91, 1, 1);
+}
+
+/// TEX(.SCR).B(.F16.RN | .F16.RZ)(.LZ ..)(.AOFFI | .UAOFFI)(.UAI)(.DC)
+/// (.evict)(.NDV | .DXY)(.NODEP) ...: a texture sampled through a handle
+/// in a register (.B, bindless: sm_120's only form in NAK). .DXY is the
+/// derivative mode NAK picks on sm_120 whenever the level is not .LZ's,
+/// .NODEP its bit for a result no helper pixel needs. What the modes NAK
+/// does not emit do (.UAI, the .F16 pair, the U levels) is not known here:
+/// they are nvdisasm's names for the fields' values.
+fn cTex(cx: *Cx) Error!void {
+    cx.put(0, 12, 0xd61);
+    _ = try cx.flag(60, "SCR");
+    try cx.always("B");
+    _ = try cx.modPartsBits(&.{ 79, 80 }, &TEX_F16);
+    _ = try cx.modPartsBits(&.{ 59, 87, 88, 89 }, &TEX_LODS);
+    _ = try cx.mod(56, 2, &TEX_OFFSETS);
+    _ = try cx.flag(58, "UAI");
+    _ = try cx.flag(78, "DC");
+    _ = try cx.mod(84, 3, &EVICT);
+    _ = try cx.mod(76, 2, &.{ "", "NDV", "?", "DXY" });
+    _ = try cx.flag(90, "NODEP");
+    try texOperands(cx, &TEX_DIMS);
+}
+
+/// TLD(.SCR).B(.F16.RN | .F16.RZ).LZ|LL|ULL(.AOFFI | .UAOFFI)(.UAI)
+/// (.evict)(.MS | .UMS)(.CL)(.NODEP) ...: a texel fetched (integer
+/// coordinates; TEX's operands). Its level is 87..88 alone; bit 59, which
+/// nvdisasm ignores, is set as NAK sets it.
+fn cTld(cx: *Cx) Error!void {
+    cx.put(0, 12, 0xd67);
+    _ = try cx.flag(60, "SCR");
+    try cx.always("B");
+    _ = try cx.modPartsBits(&.{ 79, 80 }, &TEX_F16);
+    _ = try cx.mod(87, 2, &.{ "LZ", "LL", "ULL", "?" });
+    _ = try cx.mod(56, 2, &TEX_OFFSETS);
+    _ = try cx.flag(58, "UAI");
+    _ = try cx.mod(84, 3, &EVICT);
+    _ = try cx.mod(77, 2, &.{ "", "MS", "UMS", "?" });
+    _ = try cx.flag(76, "CL");
+    _ = try cx.flag(90, "NODEP");
+    cx.put(59, 1, 1);
+    try texOperands(cx, &TLD_DIMS);
+}
+
 // ── The forms ───────────────────────────────────────────────────────────────
 
 const Codec = *const fn (*Cx) Error!void;
@@ -2461,6 +2737,13 @@ const FORMS = [_]Form{
     .{ .name = "ATOMG", .opcode = 0x9a8, .codec = cAtomg },
     .{ .name = "ATOMS", .opcode = 0x38c, .codec = cAtoms },
     .{ .name = "F2IP", .opcode = 0x043, .alu = true, .codec = cF2ip },
+    .{ .name = "ALD", .opcode = 0x321, .codec = cAld },
+    .{ .name = "AST", .opcode = 0x322, .codec = cAst },
+    .{ .name = "IPA", .opcode = 0x326, .codec = cIpa },
+    .{ .name = "PIXLD", .opcode = 0x925, .codec = cPixld },
+    .{ .name = "KILL", .opcode = 0x95b, .codec = cKill },
+    .{ .name = "TEX", .opcode = 0xd61, .codec = cTex },
+    .{ .name = "TLD", .opcode = 0xd67, .codec = cTld },
 };
 
 fn formOf(name: []const u8) ?*const Form {
@@ -2647,6 +2930,14 @@ fn fmtOperand(o: *Out, x: Operand) FormatError!void {
             }
             try o.str("]");
         },
+        .attr => |a| {
+            try o.str("a[");
+            if (a.reg != RZ) {
+                try o.print("R{d}", .{a.reg});
+                if (a.offset != 0) try o.print("+0x{x}", .{a.offset});
+            } else try o.print("0x{x}", .{a.offset});
+            try o.str("]");
+        },
         .sreg => |n| try o.str(sregName(n) orelse "SR_?"),
         .label => |l| try o.print("`({s})", .{l}),
         .target => |t| try o.print("`(0x{x})", .{t}),
@@ -2824,11 +3115,35 @@ const Big = struct {
 };
 
 /// The registers a load's destination or a store's data spans: 4 for
-/// .128, 2 for .64.
+/// .128, 2 for .64 (and 3 for an attribute's .96).
 pub fn dataWidth(in: *const Instr) u8 {
     if (in.has("128")) return 4;
+    if (in.has("96")) return 3;
     if (in.has("64")) return 2;
     return 1;
+}
+
+/// A texture op's registers at operand `i`. Its results are laid out by
+/// the channel mask, as NAK does: the first two channels in Rd0 on, the
+/// rest in Rd1 on (one register at least here, though a mask may leave
+/// either unused). Its sources are vectors whose lengths are the
+/// dimension's and the modes' (NAK's lower_tex): the longest, four, here,
+/// short of RZ, which keeps a schedule's hazards and a program's register
+/// count on the safe side.
+fn texRegs(in: *const Instr, i: usize) u8 {
+    const o = in.operands();
+    const first: usize = if (o.len > 0 and o[0] == .pred) 1 else 0;
+    if (i < first or i >= first + 4 or o[i] != .gpr) return 1;
+    if (i >= first + 2) return @max(1, @min(4, RZ - o[i].gpr.n));
+    // (the mask is the number after the dimension, all four when left out)
+    var mask: u64 = 0xf;
+    if (o.len >= 2 and o[o.len - 2] == .num) switch (o[o.len - 1]) {
+        .imm => |x| mask = x.bits,
+        .num => |t| mask = @bitCast(number(t) catch 0xf),
+        else => {},
+    };
+    const channels: u8 = @popCount(@as(u4, @truncate(mask)));
+    return if (i == first) @max(1, channels -| 2) else std.math.clamp(channels, 1, 2);
 }
 
 /// How many consecutive registers operand `i` of `in` spans, when it is a
@@ -2836,9 +3151,10 @@ pub fn dataWidth(in: *const Instr) u8 {
 /// and LDCU.64's destination, every register of IADD.64 and SEL.64,
 /// IMAD.WIDE's destination and c, 64-bit compares' sources, conversions'
 /// 64-bit sides, CS2R's pair, the MMAs' fragments (m16n8k16: a four, b
-/// two, c and d four).
+/// two, c and d four), a texture op's results and sources (texRegs).
 pub fn regsAt(in: *const Instr, i: usize) u8 {
     const op = in.op;
+    if (eql(op, "TEX") or eql(op, "TLD")) return texRegs(in, i);
     if (eql(op, "HMMA") or eql(op, "IMMA")) {
         const hmma = eql(op, "HMMA");
         const small = in.has("1688") or in.has("16816") and !hmma;
@@ -2873,6 +3189,7 @@ pub fn highestGpr(in: *const Instr) ?u8 {
             .gpr => |g| if (g.n != RZ) g.n + regsAt(in, i) - 1 else continue,
             .addr => |a| if (a.reg != RZ) a.reg + @as(u8, if (a.wide) 1 else 0) else continue,
             .cbuf => |c| if (c.reg != RZ and !c.ureg) c.reg else continue,
+            .attr => |a| if (a.reg != RZ) a.reg else continue,
             else => continue,
         };
         top = if (top) |x| @max(x, t) else t;
@@ -2881,7 +3198,7 @@ pub fn highestGpr(in: *const Instr) ?u8 {
 }
 
 fn isData(in: *const Instr, i: usize) bool {
-    return (eql(in.op, "STG") or eql(in.op, "STL") or eql(in.op, "STS")) and i == 1;
+    return (eql(in.op, "STG") or eql(in.op, "STL") or eql(in.op, "STS") or eql(in.op, "AST")) and i == 1;
 }
 
 // ── Host tests ──────────────────────────────────────────────────────────────
@@ -3199,6 +3516,147 @@ test "FRND and the 32-bit atomics: ptxas's words and nvdisasm's (testdata/sm120_
         w.put(f[0], f[1], f[2]);
         try testing.expectError(error.Unknown, decode(w.lo(), w.hi(), 0));
     }
+}
+
+test "the graphics stages' instructions, as nvdisasm prints them from raw words (testdata/sm120_gfx_raw.txt)" {
+    // (a vertex and a pixel program's words: ALD, AST, IPA, PIXLD, KILL,
+    // TEX and TLD, each field's values, with the FMUL.RZ, MUFU.RCP and
+    // EXIT beside them. Each line's text assembles to its word, the control
+    // field included; the word decodes and prints as the text)
+    const data = @embedFile("testdata/sm120_gfx_raw.txt");
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    var n: usize = 0;
+    var failures: usize = 0;
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len < 34 or line[0] == '#') continue;
+        const hi = try std.fmt.parseInt(u64, line[0..16], 16);
+        const lo = try std.fmt.parseInt(u64, line[17..33], 16);
+        const text = line[34..];
+        n += 1;
+        const in = parse(text) catch |e| {
+            std.debug.print("parse \"{s}\": {s}\n", .{ text, @errorName(e) });
+            failures += 1;
+            continue;
+        };
+        const w = encode(&in, 0, null) catch |e| {
+            std.debug.print("encode \"{s}\": {s}\n", .{ text, @errorName(e) });
+            failures += 1;
+            continue;
+        };
+        if (w.lo() != lo or w.hi() != hi) {
+            std.debug.print("encode \"{s}\": got {x:0>16}_{x:0>16} want {x:0>16}_{x:0>16} (diff {x:0>16}_{x:0>16})\n", .{ text, w.hi(), w.lo(), hi, lo, w.hi() ^ hi, w.lo() ^ lo });
+            failures += 1;
+            continue;
+        }
+        const back = decode(lo, hi, 0) catch |e| {
+            std.debug.print("decode \"{s}\": {s}\n", .{ text, @errorName(e) });
+            failures += 1;
+            continue;
+        };
+        var buf: [256]u8 = undefined;
+        const got = try format(&back, &buf);
+        if (!eql(got, text)) {
+            std.debug.print("format: \"{s}\"\n  want: \"{s}\"\n", .{ got, text });
+            failures += 1;
+        }
+    }
+    if (failures != 0) {
+        std.debug.print("{d} of {d} graphics words failed\n", .{ failures, n });
+        return error.TestUnexpectedResult;
+    }
+    try testing.expectEqual(@as(usize, 189), n);
+}
+
+test "graphics words nvdisasm refuses, or prints as invalid, are refused" {
+    // (hi, lo: an index register without .P or .PHYS; .PHYS without one,
+    // with .P, of four registers; .P with a vertex register; AST with a
+    // write scoreboard, .P with an index and a vertex; IPA at place 3, at
+    // frequency 3; PIXLD's value 5; KILL with a read or a write scoreboard)
+    for ([_][2]u64{
+        .{ 0x000fc00000000000, 0x000080ff07057321 },
+        .{ 0x000fc00000002000, 0x000080ffff057321 },
+        .{ 0x000fc00000003000, 0x000000ff07057321 },
+        .{ 0x000fc00000002c00, 0x000000ff07057321 },
+        .{ 0x000fc00000001000, 0x00008009ff057321 },
+        .{ 0x000e220000000cff, 0x00007004ff007322 },
+        .{ 0x000fc00000001009, 0x0000800507007322 },
+        .{ 0x000fc000000e3020, 0x000000ff00057326 },
+        .{ 0x000fc000000ec020, 0x000000ff00057326 },
+        .{ 0x000fc000000f4000, 0x0000000000057925 },
+        .{ 0x0003e20003800000, 0x000000000000795b },
+        .{ 0x000e220003800000, 0x000000000000795b },
+        // (TEX without bit 91, its handle RZ, derivative mode 2, dimension
+        // 6, level 11, eviction 6; TLD of a cube, .MS with .UMS)
+        .{ 0x000fc000001e3f0c, 0x20ffff09070a7d61 },
+        .{ 0x000fc000081e3f0c, 0x20ffffff070a7d61 },
+        .{ 0x000fc000081e2f0c, 0x20ffff09070a7d61 },
+        .{ 0x000fc000081e3f0c, 0xc0ffff09070a7d61 },
+        .{ 0x000fc0000a9e0f0c, 0x28ffff09070a7d61 },
+        .{ 0x000fc000086e3f0c, 0x20ffff09070a7d61 },
+        .{ 0x000fc000081e0f0c, 0x68ffff09070a7d67 },
+        .{ 0x000fc000081e6f0c, 0x28ffff09070a7d67 },
+        // (and one nvdisasm prints with ten modifiers, more than an
+        // instruction holds: TEX.SCR.B.F16.RN.LZ.AOFFI.DC.EF.DXY.NODEP)
+        .{ 0x000fc0000c02f70c, 0x3906ff09070a7d61 },
+    }) |w| try testing.expectError(error.Unknown, decode(w[1], w[0], 0));
+    // written, the same are a syntax error, a form not known, or a field
+    // out of range
+    for ([_]struct { []const u8, Error }{
+        .{ "ALD R5, a[R7+0x20]", error.Syntax },
+        .{ "ALD.PHYS R5, a[0x80]", error.Syntax },
+        .{ "ALD.PHYS R5, a[R7+0x20]", error.Syntax },
+        .{ "ALD.P R5, a[0x80], R9", error.Syntax },
+        .{ "ALD R5, a[0x400]", error.OutOfRange },
+        .{ "[B------:R-:W0:-:S01] AST a[0x70], R4", error.Syntax },
+        .{ "AST.P a[R7+0x20], R5, R9", error.Syntax },
+        .{ "[B------:R1:W-:-:S01] KILL", error.Syntax },
+        .{ "IPA R0, a[0x7c]", error.Unknown },
+        .{ "IPA.PASS R0, a[0x7e]", error.OutOfRange },
+        .{ "IPA.PASS R0, a[R1+0x80]", error.Syntax },
+        .{ "IPA.PASS.OFFSET R0, a[0x80]", error.Syntax },
+        .{ "PIXLD.COVERED R0", error.Unknown },
+        .{ "TEX.B.DXY R2, R0, R4, RZ, 2D", error.Syntax },
+        .{ "TEX.DXY R2, R0, R4, R6, 2D", error.Unknown },
+        .{ "TEX.B.DXY R2, R0, R4, R6, 4D", error.Unknown },
+        .{ "TEX.B.DXY R2, R0, R4, R6, URZ, 2D", error.Syntax },
+        .{ "TEX.B.DXY R2, R0, R4, R6, 2D, 0x10", error.OutOfRange },
+        .{ "TLD.B R2, R0, R4, R6, 2D", error.Unknown },
+        .{ "TLD.B.LZ R2, R0, R4, R6, CUBE", error.Unknown },
+    }) |c| try testing.expectError(c[1], encode(&(try parse(c[0])), 0, null));
+}
+
+test "graphics operands: an attribute's address, the registers a load, a store and a texture span" {
+    const ld = try parse("ALD.P.128 R4, a[R7+0x20]");
+    try testing.expectEqual(Attr{ .offset = 0x20, .reg = 7 }, ld.ops[1].attr);
+    try testing.expectEqual(@as(u8, 4), regsAt(&ld, 0));
+    try testing.expectEqual(@as(?u8, 7), highestGpr(&ld));
+    const st = try roundTrip("AST.96 a[0x70], R4, R9", 0);
+    try testing.expectEqual(Attr{ .offset = 0x70 }, st.ops[0].attr);
+    try testing.expectEqual(@as(u8, 3), regsAt(&st, 1));
+    try testing.expectEqual(@as(u8, 1), regsAt(&st, 2));
+    try testing.expectEqual(@as(?u8, 9), highestGpr(&st));
+    // an interpolated word: its address, a predicate result when written
+    const ip = try roundTrip("IPA.PASS.OFFSET R5, P2, a[0x84], R9", 0);
+    try testing.expectEqual(Pred{ .n = 2 }, ip.ops[1].pred);
+    try testing.expectEqual(Attr{ .offset = 0x84 }, ip.ops[2].attr);
+    // a texture: four channels are two registers from each destination;
+    // three leave Rd1 one; two leave it none (counted as one); a source
+    // counts as the longest vector
+    const tx = try roundTrip("TEX.B.DXY R2, R0, R4, R6, 2D", 0);
+    try testing.expectEqualStrings("2D", tx.ops[4].num);
+    try testing.expectEqual([4]u8{ 2, 2, 4, 4 }, [4]u8{ regsAt(&tx, 0), regsAt(&tx, 1), regsAt(&tx, 2), regsAt(&tx, 3) });
+    try testing.expectEqual(@as(?u8, 9), highestGpr(&tx));
+    const t3 = try roundTrip("TEX.B.LZ P1, R2, R0, R4, R6, UR3, 2D, 0x7", 0);
+    try testing.expectEqual([4]u8{ 1, 2, 4, 4 }, [4]u8{ regsAt(&t3, 1), regsAt(&t3, 2), regsAt(&t3, 3), regsAt(&t3, 4) });
+    try testing.expectEqual(@as(u8, 3), t3.ops[5].ugpr.n);
+    const t2 = try parse("TLD.B.LZ RZ, R0, R253, R6, 2D, 0x3");
+    try testing.expectEqual([3]u8{ 2, 2, 4 }, [3]u8{ regsAt(&t2, 1), regsAt(&t2, 2), regsAt(&t2, 3) });
+    try testing.expectEqual(@as(?u8, 254), highestGpr(&t2));
+    // a discard under its guard, or by its predicate
+    const k = try roundTrip("@!P1 KILL !P2", 0);
+    try testing.expectEqual(Pred{ .n = 1, .not = true }, k.guard);
+    try testing.expectEqual(Pred{ .n = 2, .not = true }, k.ops[0].pred);
 }
 
 test "immediates where GB206 takes none are refused: IADD3's third source, IDP.4A's (Xid 13 on the Legion)" {

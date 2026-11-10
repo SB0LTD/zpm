@@ -14,6 +14,11 @@
 //!   ("decoupled") ones' (memory, constant loads, special registers,
 //!   shuffles, MUFU, conversions, POPC, FLO, BREV, FCHK) by scoreboards.
 //!   The uniform datapath's ops are NAK's `udp`; a guard is read at issue.
+//!   The graphics stages' instructions are all variable-latency: attribute
+//!   loads and stores, IPA and PIXLD as memory is (NAK's decoupled_agu),
+//!   textures and KILL as its decoupled. AST only reads, so it releases no
+//!   write scoreboard, and KILL, which touches no register, none at all:
+//!   the two the words cannot carry (see sm120.sig).
 //! - Each hazard, a read after a write (RAW), a write after a read (WAR) or
 //!   after a write (WAW), takes NVIDIA's cycles for its pair of categories
 //!   (sm120_latency.sig), plus NAK's one cycle of padding on sm_120 for
@@ -156,8 +161,8 @@ const Cats = struct {
 };
 
 /// An operand's registers: `width` consecutive general (or uniform)
-/// registers from it; a predicate; an address's and a constant index's
-/// registers (always read).
+/// registers from it; a predicate; an address's, a constant index's and
+/// an attribute index's registers (always read).
 fn operand(u: *Uses, o: sm120.Operand, width: u8, dst: bool, c: Cats) void {
     switch (o) {
         .gpr => |g| {
@@ -190,6 +195,7 @@ fn operand(u: *Uses, o: sm120.Operand, width: u8, dst: bool, c: Cats) void {
         .cbuf => |cb| if (cb.reg != sm120.RZ) {
             if (cb.ureg) u.addSrc(.ugpr, cb.reg, c.ugpr) else u.addSrc(.gpr, cb.reg, c.gpr);
         },
+        .attr => |a| u.addSrc(.gpr, a.reg, c.gpr),
         else => {},
     }
 }
@@ -235,7 +241,9 @@ fn decoupledCats(cat: lat.Reg) Cats {
 /// as a 64-bit dispatch's, UMOV.64 as UMOV, VIMNMX as IMNMX, FSEL and
 /// FCHK as NAK's notes have them (alu, decoupled; FSEL's predicate as
 /// SEL's), F2IP as F2FP, LOP3's predicate result as PLOP3's, CALL as a
-/// branch, RET's registers as a branch's reads, WARPSYNC's as an ALU's.
+/// branch, RET's registers as a branch's reads, WARPSYNC's as an ALU's,
+/// KILL's predicate operand (NAK discards by the guard alone) as a
+/// decoupled read, a predicate's worst case.
 pub fn usesOf(in: *const sm120.Instr) Error!Uses {
     var u = Uses{};
     const o = in.operands();
@@ -285,6 +293,24 @@ pub fn usesOf(in: *const sm120.Instr) Error!Uses {
     } else if (eql(op, "SHFL")) {
         u.decoupled = true;
         regs(&u, in, 2, decoupledCats(.decoupled_agu));
+    } else if (eql(op, "ALD") or eql(op, "IPA") or eql(op, "PIXLD")) {
+        // (an attribute's words into registers from Rd; IPA's and PIXLD's
+        // register, and their predicate when one is written)
+        u.decoupled = true;
+        regs(&u, in, dstCount(o), decoupledCats(.decoupled_agu));
+    } else if (eql(op, "AST")) {
+        // (its data, index and vertex registers read: nothing written)
+        u.decoupled = true;
+        regs(&u, in, 0, decoupledCats(.decoupled_agu));
+    } else if (eql(op, "KILL")) {
+        u.decoupled = true;
+        regs(&u, in, 0, decoupledCats(.decoupled));
+    } else if (eql(op, "TEX") or eql(op, "TLD")) {
+        // ((Pfault,) Rd1, Rd0 written, the rest read; NAK's `tex` for a
+        // uniform register)
+        u.decoupled = true;
+        const fault: usize = if (o.len > 0 and o[0] == .pred) 1 else 0;
+        regs(&u, in, fault + 2, .{ .gpr = r(.decoupled), .ugpr = ur(.tex), .pred = p(.decoupled) });
     } else if (eql(op, "CS2R")) {
         regs(&u, in, 1, .{ .gpr = if (sm120.regsAt(in, 0) == 2) r(.disp_64) else r(.dualalu) });
     } else if (eql(op, "R2UR")) {
@@ -938,6 +964,118 @@ test "the tensor cores' adjustment, uniform predicates, BAR's exec latency" {
     try testing.expectEqual(@as(u32, 0), (try check(&ins, &out, &Vectors.work)).open);
     out[0].control.stall = 5;
     try testing.expectEqual(@as(u32, 1), (try check(&ins, &out, &Vectors.work)).open);
+}
+
+test "the graphics stages' categories: attributes as memory, textures and KILL decoupled" {
+    const alu = Use{ .file = .gpr, .n = 4, .cat = r(.alu) };
+    // (an attribute store reads its registers, four of them, as a store
+    // does: 5 cycles after an ALU's result, 6 with the padding)
+    const ast = try usesOf(&try sm120.parse("AST.128 a[0x70], R4, R9"));
+    try testing.expect(ast.decoupled);
+    try testing.expectEqual(@as(usize, 0), ast.dsts().len);
+    try testing.expectEqual(@as(usize, 5), ast.srcs().len);
+    try testing.expectEqual(Need{ .cycles = 6, .sb = false }, need(.raw, alu, false, ast.srcs()[0]));
+    // (a load's words, and the registers of its address)
+    const ald = try usesOf(&try sm120.parse("ALD.P.96 R4, a[R7+0x20]"));
+    try testing.expectEqual(@as(usize, 3), ald.dsts().len);
+    try testing.expectEqual(Use{ .file = .gpr, .n = 7, .cat = r(.decoupled_agu) }, ald.srcs()[0]);
+    try testing.expect(need(.raw, ald.dsts()[0], true, alu).sb);
+    // (an interpolated word and its predicate: both through a scoreboard)
+    const ipa = try usesOf(&try sm120.parse("IPA.PASS.OFFSET R5, P2, a[0x80], R9"));
+    try testing.expectEqual(@as(usize, 2), ipa.dsts().len);
+    try testing.expectEqual(Use{ .file = .pred, .n = 2, .cat = p(.decoupled) }, ipa.dsts()[1]);
+    try testing.expectEqual(@as(usize, 1), ipa.srcs().len);
+    try testing.expectEqual(@as(usize, 2), (try usesOf(&try sm120.parse("PIXLD.COVMASK R5, P0"))).dsts().len);
+    // (a texture: the fault predicate and two registers from each
+    // destination written; its sources as the longest vectors, and a
+    // uniform register as NAK's `tex`; 4 cycles after an ALU's result, 5
+    // with the padding)
+    const tex = try usesOf(&try sm120.parse("TEX.B.DXY P1, R2, R0, R4, R8, UR3, 2D"));
+    try testing.expectEqual(@as(usize, 5), tex.dsts().len);
+    try testing.expectEqual(@as(usize, 9), tex.srcs().len);
+    try testing.expectEqual(Use{ .file = .ugpr, .n = 3, .cat = ur(.tex) }, tex.srcs()[8]);
+    try testing.expectEqual(Need{ .cycles = 5, .sb = false }, need(.raw, alu, false, tex.srcs()[0]));
+    // (a discard: its guard, read at issue, and nothing else)
+    const kill = try usesOf(&try sm120.parse("@P0 KILL"));
+    try testing.expect(kill.decoupled and !kill.branch and !kill.readsRegs());
+    try testing.expectEqual(@as(usize, 0), kill.dsts().len);
+    try testing.expectEqual(Use{ .file = .pred, .n = 0, .cat = p(.guard) }, kill.srcs()[0]);
+}
+
+fn scheduled(comptime text: []const []const u8, ins: *[text.len]sm120.Instr, out: *[text.len]Slot) !void {
+    for (text, 0..) |t, i| ins[i] = try sm120.parse(t);
+    try schedule(ins, out, &Vectors.work);
+    try testing.expectEqual(@as(u32, 0), (try check(ins, out, &Vectors.work)).open);
+    // what nvdisasm calls illegal: a write scoreboard on AST, any on KILL
+    // or EXIT
+    for (ins, out) |*in, s| {
+        const none = sm120.Control.NONE;
+        if (eql(in.op, "AST")) try testing.expectEqual(none, s.control.write);
+        if (eql(in.op, "KILL") or eql(in.op, "EXIT")) try testing.expect(s.control.read == none and s.control.write == none);
+    }
+}
+
+test "a vertex program: loads through scoreboards, the stores' reads drained by EXIT" {
+    const text = [_][]const u8{
+        "ALD.128 R4, a[0x80]",
+        "ALD.64 R8, a[0x90]",
+        "FMUL R4, R4, 0.5",
+        "AST.128 a[0x70], R4",
+        "AST.64 a[0x80], R8",
+        "EXIT",
+    };
+    var ins: [text.len]sm120.Instr = undefined;
+    var out: [text.len]Slot = undefined;
+    try scheduled(&text, &ins, &out);
+    // each load releases a scoreboard for its registers; the multiply
+    // waits on the first, the second store on the second
+    try testing.expectEqual(@as(u3, 0), out[0].control.write);
+    try testing.expectEqual(@as(u3, 1), out[1].control.write);
+    try testing.expectEqual(@as(u6, 0b01), out[2].control.wait);
+    try testing.expectEqual(@as(u6, 0b10), out[4].control.wait);
+    // the first store reads the multiply's result: 5 cycles and the padding
+    try testing.expectEqual(@as(u4, 6), out[2].control.stall);
+    // each store releases a read scoreboard, and EXIT waits on both, at
+    // least two cycles after the last was set
+    const first = out[3].control.read;
+    const second = out[4].control.read;
+    try testing.expect(first != sm120.Control.NONE and second != sm120.Control.NONE and first != second);
+    try testing.expectEqual(@as(u6, 1) << first | @as(u6, 1) << second, out[5].control.wait);
+    try testing.expect(out[4].control.stall >= SB_SET);
+}
+
+test "a pixel program: perspective, a texture, a discard under its guard" {
+    const text = [_][]const u8{
+        "IPA.PASS R0, a[0x7c]",
+        "IPA.PASS R4, a[0x80]",
+        "IPA.PASS R5, a[0x84]",
+        "MUFU.RCP R0, R0",
+        "FMUL.RZ R4, R4, R0",
+        "FMUL.RZ R5, R5, R0",
+        "LDC R6, c[0x1][0x10]",
+        "TEX.B.DXY R2, R0, R4, R6, 2D",
+        "FSETP.LT.AND P0, PT, R3, 0.5, PT",
+        "@P0 KILL",
+        "EXIT",
+    };
+    var ins: [text.len]sm120.Instr = undefined;
+    var out: [text.len]Slot = undefined;
+    try scheduled(&text, &ins, &out);
+    // every interpolation releases a scoreboard; the reciprocal waits on
+    // w's, the multiplies on the reciprocal's and their own
+    for (out[0..3]) |s| try testing.expect(s.control.write != sm120.Control.NONE);
+    try testing.expectEqual(@as(u6, 1) << out[0].control.write, out[3].control.wait);
+    try testing.expect(out[4].control.wait & (@as(u6, 1) << out[3].control.write) != 0);
+    try testing.expect(out[4].control.wait & (@as(u6, 1) << out[1].control.write) != 0);
+    // the texture waits on its handle's load, and the compare on the
+    // texture's result
+    try testing.expect(out[7].control.wait & (@as(u6, 1) << out[6].control.write) != 0);
+    try testing.expect(out[8].control.wait & (@as(u6, 1) << out[7].control.write) != 0);
+    // the discard's guard: 13 cycles after the compare, and the padding
+    try testing.expectEqual(@as(u4, 14), out[8].control.stall);
+    // EXIT waits on what is still out: the texture's reads
+    try testing.expect(out[7].control.read != sm120.Control.NONE);
+    try testing.expect(out[10].control.wait & (@as(u6, 1) << out[7].control.read) != 0);
 }
 
 test "a guard after its predicate, the predicate after a special register" {
