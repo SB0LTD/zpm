@@ -14,6 +14,9 @@
 //! A second scene is larger than a bin (raster.BIN): blended triangles all
 //! over, big ones across bins under a scissor, a thin strip. Binned, not
 //! binned, and binned with lists that run over must give the same bytes.
+//!
+//! On the emulated Adreno and RTX too: a video picture's unorm16 planes
+//! (P010's R16 and GR1616, as EGLImages give them) sampled exactly.
 
 const std = @import("std");
 const gpu = @import("gpu");
@@ -666,6 +669,79 @@ fn mutableCubeDraw(eng: *engine.Engine) !void {
     try std.testing.expect(!eng.lost);
 }
 
+/// A video picture's unorm16 planes (P010's: R16, GR1616) as EGLImages
+/// give them (the engine's memory, shared; moved out of a slab first
+/// where the engine has slabs), sampled by texelFetch and a bilinear
+/// texture(): the unorm8 GL says (v / 65535), the same on every GPU.
+const Plane = struct {
+    fn resolve(handle: ?*anyopaque) ?*engine.Image {
+        return @ptrCast(@alignCast(handle orelse return null));
+    }
+    fn to8(x: u16) u8 {
+        return @intFromFloat(@round(@as(f64, @floatFromInt(x)) * 255.0 / 65535.0));
+    }
+};
+
+fn planeSample(eng: *engine.Engine) !void {
+    objs.init();
+    ctx.init(eng, &objs);
+    defer ctx.deinit();
+    const saved = gles.egl_image;
+    gles.egl_image = Plane.resolve;
+    defer gles.egl_image = saved;
+    // R16 4 x 1, GR1616 2 x 1: each sample's unorm8 is neither of its
+    // bytes (a plane read a byte a channel, or byte-swapped, differs)
+    const y16 = [4]u16{ 0x12f0, 0x40ff, 0x00c8, 0xe000 };
+    const uv16 = [4]u16{ 0x40ff, 0x12f0, 0xe000, 0x00c8 };
+    var y_bytes: [8]u8 = undefined;
+    var uv_bytes: [8]u8 = undefined;
+    for (y16, uv16, 0..) |a, b, i| {
+        std.mem.writeInt(u16, y_bytes[i * 2 ..][0..2], a, .little);
+        std.mem.writeInt(u16, uv_bytes[i * 2 ..][0..2], b, .little);
+    }
+    var y_sh: engine.Shared = .{};
+    var uv_sh: engine.Shared = .{};
+    var y = eng.newImage(4, 1, .r16) orelse return error.OutOfMemory;
+    var uv = eng.newImage(2, 1, .rg16) orelse return error.OutOfMemory;
+    try std.testing.expect(eng.shareOwn(&y, &y_sh));
+    try std.testing.expect(eng.shareOwn(&uv, &uv_sh));
+    defer eng.freeImage(&y);
+    defer eng.freeImage(&uv);
+    eng.write(&y, 0, 0, 4, 1, &y_bytes, 8, .r16);
+    eng.write(&uv, 0, 0, 2, 1, &uv_bytes, 8, .rg16);
+
+    var names: [3]u32 = undefined;
+    ctx.genTextures(&names);
+    defer ctx.deleteTextures(&names);
+    ctx.bindTexture(g.TEXTURE_2D, names[2]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, 1, 1);
+    var fb: [1]u32 = undefined;
+    ctx.genFramebuffers(&fb);
+    defer ctx.deleteFramebuffers(&fb);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, names[2], 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, ctx.checkFramebufferStatus(g.FRAMEBUFFER));
+    for ([_]u32{ names[0], names[1] }, [_]*engine.Image{ &y, &uv }) |t, img| {
+        ctx.bindTexture(g.TEXTURE_2D, t);
+        ctx.eglImageTargetTexture2D(g.TEXTURE_2D, img);
+        ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST);
+        ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST);
+    }
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    const P = "#version 300 es\nprecision highp float; uniform highp sampler2D tex; out vec4 color; void main() { ";
+    // R16: texel 1 (the high half of word 0), texel 2 (the low half of word 1)
+    ctx.bindTexture(g.TEXTURE_2D, names[0]);
+    try sampleLayerTexture(P ++ "color = texelFetch(tex, ivec2(1, 0), 0); }", .{ Plane.to8(y16[1]), 0, 0, 255 });
+    try sampleLayerTexture(P ++ "color = texelFetch(tex, ivec2(2, 0), 0); }", .{ Plane.to8(y16[2]), 0, 0, 255 });
+    // bilinear, half way between texels 1 and 2: (16639 + 200) / 2 / 257
+    ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR);
+    try sampleLayerTexture(P ++ "color = texture(tex, vec2(0.5, 0.5)); }", .{ 33, 0, 0, 255 });
+    // GR1616: texel 1's R (bytes 0..1) and G (bytes 2..3)
+    ctx.bindTexture(g.TEXTURE_2D, names[1]);
+    try sampleLayerTexture(P ++ "color = texelFetch(tex, ivec2(1, 0), 0); }", .{ Plane.to8(uv16[2]), Plane.to8(uv16[3]), 0, 255 });
+    ctx.bindFramebuffer(g.FRAMEBUFFER, 0);
+}
+
 fn compileLayerShader(kind: u32, source: [:0]const u8) !u32 {
     const id = program.createShader(&ctx, kind);
     errdefer program.deleteShader(&ctx, id);
@@ -740,6 +816,13 @@ test "draw: the scene on the emulated Adreno (ir3) gives the CPU's bytes" {
     a_gpu = .{ .node = .{ .sys = &a_fake } };
     eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
     try mutableCubeDraw(&eng_a);
+    eng_a.deinit();
+    a_gpu.close();
+    a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
+    a_fake = .{ .emu = &a_emu };
+    a_gpu = .{ .node = .{ .sys = &a_fake } };
+    eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
+    try planeSample(&eng_a);
     eng_a.deinit();
     a_gpu.close();
 }
@@ -860,6 +943,7 @@ test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CP
     try std.testing.expect(eng_rtx.stats.dispatches >= 3 * 9);
     try layeredCopy(&eng_rtx);
     try mutableCubeDraw(&eng_rtx);
+    try planeSample(&eng_rtx);
     eng_rtx.deinit();
 }
 

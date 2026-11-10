@@ -165,6 +165,16 @@ pub const EmuDevice = struct {
         return null;
     }
 
+    /// The live buffer GPU address `gpu` is in: a binding may start inside
+    /// its buffer, as a GPU's binding is any address (an imported dma-buf's
+    /// plane at its offset).
+    fn regionHolding(e: *EmuDevice, gpu: u64) ?*Region {
+        for (e.regions[0..e.n_regions]) |*rg| {
+            if (rg.live and gpu >= rg.gpu and gpu - rg.gpu < @max(rg.bytes, 1)) return rg;
+        }
+        return null;
+    }
+
     fn emuFree(ctx: *anyopaque, b: Buffer) void {
         const e = self(ctx);
         const rg = e.region(b.gpu) orelse return;
@@ -256,11 +266,11 @@ pub const EmuDevice = struct {
         if (d.params.len < p.bin.param_words) return error.BadProgram;
         var views: [MAX_BINDINGS][]u8 = undefined;
         for (d.buffers, 0..) |b, ix| {
-            const rg = e.region(b.gpu) orelse {
+            const rg = e.regionHolding(b.gpu) orelse {
                 e.trap = .{ .what = .bad_binding, .binding = @intCast(ix) };
                 return error.Trap;
             };
-            views[ix] = rg.seen[0..@intCast(rg.bytes)];
+            views[ix] = rg.seen[@intCast(b.gpu - rg.gpu)..@intCast(rg.bytes)];
         }
         // the code, as the GPU fetches it
         const crg = e.region(p.code.gpu) orelse return error.BadProgram;

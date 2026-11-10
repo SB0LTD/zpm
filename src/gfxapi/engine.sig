@@ -69,6 +69,12 @@ pub const Format = enum(u8) {
     r32ui,
     rg32ui,
     rgba32ui,
+    /// two bytes a channel (unorm16): an imported dma-buf's DRM R16 and
+    /// GR1616 (video's 10- to 16-bit planes, P010's), sampled as GL's
+    /// R16_EXT and RG16_EXT; never drawn into, copied or mipmapped (GL's
+    /// own R16 and RG16 uploads are stored as floats: texfmt.sig)
+    r16,
+    rg16,
 
     /// A color format of four bytes a pixel (RGBA8, BGRA8).
     pub fn isColor(f: Format) bool {
@@ -84,7 +90,7 @@ pub const Format = enum(u8) {
     pub fn bytes(f: Format) u32 {
         return switch (f) {
             .r8 => 1,
-            .rg8 => 2,
+            .rg8, .r16 => 2,
             .rg32f, .rg32i, .rg32ui => 8,
             .rgba32f, .rgba32i, .rgba32ui => 16,
             else => 4,
@@ -93,17 +99,20 @@ pub const Format = enum(u8) {
 
     pub fn channels(f: Format) u32 {
         return switch (f) {
-            .r8, .r32f, .r32i, .r32ui, .d24s8 => 1,
-            .rg8, .rg32f, .rg32i, .rg32ui => 2,
+            .r8, .r16, .r32f, .r32i, .r32ui, .d24s8 => 1,
+            .rg8, .rg16, .rg32f, .rg32i, .rg32ui => 2,
             else => 4,
         };
     }
 
-    pub const Kind = enum(u2) { unorm8, float, int, uint };
+    /// (texture.sig's descriptor keeps it in three bits: unorm16's bit 2
+    /// says two bytes a channel, its low two bits read as unorm8's)
+    pub const Kind = enum(u3) { unorm8, float, int, uint, unorm16 };
 
     /// What a texel's channels are.
     pub fn kind(f: Format) Kind {
         return switch (f) {
+            .r16, .rg16 => .unorm16,
             .r32f, .rg32f, .rgba32f => .float,
             .r32i, .rg32i, .rgba32i => .int,
             .r32ui, .rg32ui, .rgba32ui, .d24s8 => .uint,
@@ -1070,6 +1079,34 @@ pub const Engine = struct {
             }
         } else if (img.own and img.buf.cpu.len != 0) e.freeBytes(img.buf, img.pooled, img.track.last);
         img.* = .{};
+    }
+
+    /// The image's memory as a GPU buffer of its own, from its byte 0,
+    /// `sh` holding it and the image its first name: an EGLImage made of
+    /// a GL texture (EGL_KHR_gl_texture_2D_image), whose dma-buf is the
+    /// whole buffer. Memory in a slab (others' images beside it) or in the
+    /// CPU pool moves first, its bytes copied. False: no GPU buffer for it.
+    pub fn shareOwn(e: *Engine, img: *Image, sh: *Shared) bool {
+        std.debug.assert(img.share == null and img.own);
+        if (img.pooled or e.slabOf(img.buf) != null) {
+            const n = img.buf.cpu.len;
+            const m = e.allocBytes(n, false) orelse return false;
+            if (m.pooled) {
+                e.pool.free(m.buf.cpu);
+                return false;
+            }
+            var moved = img.*;
+            moved.buf = m.buf;
+            moved.pooled = false;
+            moved.track = .{};
+            @memcpy(moved.buf.cpu[0..n], e.hostView(img, 0, n));
+            e.toDevice(&moved, 0, n);
+            e.freeBytes(img.buf, img.pooled, img.track.last);
+            img.* = moved;
+        }
+        sh.* = .{ .refs = 1, .buf = img.buf, .track = img.track };
+        img.share = sh;
+        return true;
     }
 
     /// An image of `levels` mipmap levels (one buffer, level after level),
