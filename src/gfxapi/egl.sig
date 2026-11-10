@@ -32,8 +32,14 @@
 //!   textures and renderbuffers (gles: OES_EGL_image) name it, the memory
 //!   shared and freed with its last name.
 //!
-//! EGL's calls take one lock (its tables are the process's); GL calls take
-//! none.
+//! - **The driver lock.** One lock for the process, the outermost: every
+//!   EGL call and every GL call (libgles.sig's entry points) holds it from
+//!   start to end. A process's contexts share the engine, its GPU device
+//!   and these tables, and an app may have contexts current on several
+//!   threads at once (Firefox: WebGL and Canvas2D on one, WebRender on
+//!   another), so their calls take turns. Re-entrant for the thread
+//!   holding it (a GL call that ends in EGL, a forwarding entry point).
+//!   program.sig's lock is taken inside it, never around it.
 //!
 //! Allocation-free: fixed tables (MAX_*), in this file's memory.
 
@@ -278,9 +284,16 @@ pub fn setDriver(d: Driver) void {
     driver = d;
 }
 
-// ── The lock ───────────────────────────────────────────────────────────────
+// ── The driver lock ────────────────────────────────────────────────────────
 
+/// The futex word (0 free, 1 held, 2 held with waiters).
 var lock_word = std.atomic.Value(u32).init(0);
+/// The thread holding the lock (its thread.key(), never 0), or 0. Only
+/// the holder stores its own key, and clears it before letting go: a
+/// thread that reads its own key here holds the lock.
+var lock_owner = std.atomic.Value(usize).init(0);
+/// How many times the holder has entered (only the holder touches it).
+var lock_depth: u32 = 0;
 
 /// The tables are filled at the first EGL call (under the lock): left
 /// undefined, they take no room in the library's file (its .bss), where
@@ -298,13 +311,64 @@ fn fillTables() void {
     tables_ready = true;
 }
 
+/// An EGL call's lock: the driver lock, and the tables at the first.
 fn lock() void {
-    take();
+    driverEnter();
     if (!tables_ready) fillTables();
 }
 
+fn unlock() void {
+    driverLeave();
+}
+
+/// The driver lock taken by the calling thread (again, if it holds it
+/// already): what every EGL and GL entry point does first. The thread is
+/// told by thread.key() (its thread pointer: one load), as a context's
+/// thread is.
+pub fn driverEnter() void {
+    const me = thread.key();
+    if (lock_owner.load(.monotonic) == me) {
+        lock_depth += 1;
+        return;
+    }
+    take();
+    lock_owner.store(me, .monotonic);
+    lock_depth = 1;
+}
+
+/// driverEnter's undone; the lock let go at the outermost.
+pub fn driverLeave() void {
+    std.debug.assert(lock_owner.load(.monotonic) == thread.key() and lock_depth != 0);
+    lock_depth -= 1;
+    if (lock_depth != 0) return;
+    lock_owner.store(0, .monotonic);
+    give();
+}
+
+/// Whether no thread holds the driver lock (a test's check).
+pub fn driverFree() bool {
+    return lock_word.load(.acquire) == 0 and lock_owner.load(.monotonic) == 0;
+}
+
+/// The driver lock let go entirely by the thread holding it, however deep,
+/// to wait for what another thread does under it (a stream's next frame);
+/// how deep it was, for driverResume.
+fn driverSuspend() u32 {
+    const depth = lock_depth;
+    lock_depth = 0;
+    lock_owner.store(0, .monotonic);
+    give();
+    return depth;
+}
+
+fn driverResume(depth: u32) void {
+    take();
+    lock_owner.store(thread.key(), .monotonic);
+    lock_depth = depth;
+}
+
 /// A futex mutex (0 free, 1 held, 2 held with waiters): once a thread has
-/// waited it takes the lock by swapping in 2, so the unlock that follows
+/// waited it takes the lock by swapping in 2, so the give that follows
 /// always wakes the next.
 fn take() void {
     if (lock_word.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
@@ -315,7 +379,7 @@ fn take() void {
     }
 }
 
-fn unlock() void {
+fn give() void {
     if (lock_word.swap(0, .release) == 2 and comptime builtin.os.tag == .linux) {
         _ = std.os.linux.syscall3(.futex, @intFromPtr(&lock_word.raw), 129, 1); // FUTEX_WAKE_PRIVATE
     }
@@ -998,9 +1062,11 @@ pub fn consumeStream(handle: ?*anyopaque, stream: ?*anyopaque, acquire: bool) bo
         if (timeout > 0 and (start == 0 or now == 0 or now >= deadline)) break;
         const remaining = deadline -| now;
         const ts = std.os.linux.timespec{ .sec = @intCast(remaining / 1_000_000_000), .nsec = @intCast(remaining % 1_000_000_000) };
-        unlock();
+        // (the frame comes from another thread's calls, under the lock:
+        // let it go while waiting, however deep this thread holds it)
+        const depth = driverSuspend();
         _ = std.os.linux.syscall4(.futex, @intFromPtr(&stream_event.raw), 128, epoch, if (timeout < 0) 0 else @intFromPtr(&ts));
-        lock();
+        driverResume(depth);
         if (streamOf(stream, d) == null or s.serial != serial) return fail(bool, BAD_STREAM_KHR, false);
     }
     const state = streamState(s);
@@ -1416,8 +1482,8 @@ fn bindSurfaces(c: *Context) bool {
 
 /// GL is about to reach the default framebuffer of a window that was
 /// resized: the back buffer, not shown yet, gives way to one of the new
-/// size (on the thread drawing; EGL's lock is not taken: the surface is
-/// this thread's while current).
+/// size (on the thread drawing, inside its GL call: the driver lock is
+/// held already).
 fn revalidateWindow(p: *anyopaque) void {
     const c: *Context = @ptrCast(@alignCast(p));
     const s = c.draw orelse return;
@@ -1597,8 +1663,11 @@ pub fn releaseThread() bool {
     return true;
 }
 
-/// eglWaitClient and eglWaitGL: the current context's work done.
+/// eglWaitClient and eglWaitGL: the current context's work done (under
+/// the lock, as a GL call: the engine is every context's).
 pub fn waitClient() bool {
+    lock();
+    defer unlock();
     const t = thread.get() orelse return ok(bool, true);
     if (t.gl) |g| g.finish();
     return ok(bool, true);
@@ -1773,21 +1842,18 @@ pub fn destroySync(handle: ?*anyopaque, sync: ?*anyopaque) bool {
 }
 
 /// eglClientWaitSync: CONDITION_SATISFIED, TIMEOUT_EXPIRED, or FALSE.
-/// The lock is not held while waiting.
+/// The lock is held while waiting: the flush and the wait are the engine's
+/// (every context's), and what is waited for is the GPU's (or a fence
+/// fd's), which no other thread's call has to move. Other threads' calls
+/// wait their turn meanwhile.
 pub fn clientWaitSync(handle: ?*anyopaque, sync: ?*anyopaque, flags: i32, timeout_ns: u64) i32 {
     lock();
-    const d = ready(handle) orelse {
-        unlock();
-        return @intCast(FALSE);
-    };
-    const s = syncOf(sync, d) orelse {
-        unlock();
-        return fail(i32, BAD_PARAMETER, @intCast(FALSE));
-    };
+    defer unlock();
+    const d = ready(handle) orelse return @intCast(FALSE);
+    const s = syncOf(sync, d) orelse return fail(i32, BAD_PARAMETER, @intCast(FALSE));
     const m = s.mark;
     const fd = s.fd;
     const eng = d.eng.?;
-    unlock();
     if (flags & SYNC_FLUSH_COMMANDS_BIT != 0) {
         if (thread.gl()) |g| g.flush();
     }

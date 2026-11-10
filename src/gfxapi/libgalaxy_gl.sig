@@ -1027,3 +1027,177 @@ test "libgalaxy_gl: MESA export preserves the plane and returns an independent f
     try std.testing.expectEqual(@as(i32, 11), dma_export_closed);
     try std.testing.expectEqual(@as(u32, 0), eglExportDMABUFImageMESA(dpy, image, null, null, null));
 }
+
+// ── Two threads drawing at once (the driver lock) ──────────────────────────
+
+var mt_mem: [8 << 20]u8 align(4096) = undefined;
+var mt_work: [4 << 20]u8 align(64) = undefined;
+var mt_compile: [256 << 10]u8 align(64) = undefined;
+var mt_emu: gpu.EmuDevice = undefined;
+var mt_eng: engine.Engine = undefined;
+/// The threads in at the start (each waits for the other, so their calls
+/// meet).
+var mt_started = std.atomic.Value(u32).init(0);
+
+fn mtOpen() ?*engine.Engine {
+    return &mt_eng;
+}
+
+const MT_THREADS = 2;
+const MT_W = 16;
+const MT_H = 16;
+const MT_ROUNDS = 100;
+
+/// A drawing thread's: its number, the display, and what it found.
+const MtRun = struct {
+    which: u32,
+    dpy: ?*anyopaque,
+    /// rounds whose every pixel was right, and those with one wrong
+    right: u32 = 0,
+    wrong: u32 = 0,
+    /// the first wrong pixel: where, what was read, what was wanted
+    first: ?struct { round: usize, x: usize, y: usize, got: [4]u8, want: [4]u8 } = null,
+    /// a call that failed (no rounds drawn then)
+    failed: ?[]const u8 = null,
+};
+
+/// A color of thread `which`'s, round `round`'s, clear (part 0) or draw
+/// (part 1): no two threads' alike in a round, opaque.
+fn mtColor(which: u32, round: usize, part: u32) [4]u8 {
+    const k: u32 = @intCast(round);
+    return .{ @truncate(which * 120 + part * 60 + k * 5 + 1), @truncate(which * 30 + part * 90 + k * 3), @truncate(250 - which * 70 - part * 40 - k), 255 };
+}
+
+fn mtFloat(v: u8) f32 {
+    return @as(f32, @floatFromInt(v)) / 255.0;
+}
+
+fn mtShader(kind: u32, src: [*:0]const u8) u32 {
+    const s = libgles.glCreateShader(kind);
+    const parts = [_]?[*]const u8{src};
+    libgles.glShaderSource(s, 1, &parts, null);
+    libgles.glCompileShader(s);
+    return s;
+}
+
+/// One thread's: a context and a pbuffer of its own, made current here,
+/// then rounds of a clear and a draw over the left half, each in this
+/// thread's colors of the round, read back and checked whole.
+fn mtDraw(run: *MtRun) void {
+    const g = gfxapi.glenum;
+    _ = mt_started.fetchAdd(1, .acq_rel);
+    while (mt_started.load(.acquire) < MT_THREADS) std.atomic.spinLoopHint();
+    const d = run.dpy;
+    const cfg = &egl.configs[1];
+    const ctx = eglCreateContext(d, cfg, null, &.{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE }) orelse {
+        run.failed = "eglCreateContext";
+        return;
+    };
+    defer _ = eglDestroyContext(d, ctx);
+    const pb = eglCreatePbufferSurface(d, cfg, &.{ egl.WIDTH, MT_W, egl.HEIGHT, MT_H, egl.NONE }) orelse {
+        run.failed = "eglCreatePbufferSurface";
+        return;
+    };
+    defer _ = eglDestroySurface(d, pb);
+    if (eglMakeCurrent(d, pb, pb, ctx) != egl.TRUE) {
+        run.failed = "eglMakeCurrent";
+        return;
+    }
+    defer _ = eglMakeCurrent(d, null, null, null);
+    const vs = mtShader(g.VERTEX_SHADER, "#version 300 es\nin vec2 aPos;\nvoid main() { gl_Position = vec4(aPos, 0.0, 1.0); }\n");
+    defer libgles.glDeleteShader(vs);
+    const fs = mtShader(g.FRAGMENT_SHADER, "#version 300 es\nprecision mediump float;\nuniform vec4 uColor;\nout vec4 oColor;\nvoid main() { oColor = uColor; }\n");
+    defer libgles.glDeleteShader(fs);
+    const prog = libgles.glCreateProgram();
+    defer libgles.glDeleteProgram(prog);
+    libgles.glAttachShader(prog, vs);
+    libgles.glAttachShader(prog, fs);
+    libgles.glBindAttribLocation(prog, 0, "aPos");
+    libgles.glLinkProgram(prog);
+    var linked: i32 = 0;
+    libgles.glGetProgramiv(prog, g.LINK_STATUS, @ptrCast(&linked));
+    if (linked != 1) {
+        run.failed = "glLinkProgram";
+        return;
+    }
+    libgles.glUseProgram(prog);
+    const loc = libgles.glGetUniformLocation(prog, "uColor");
+    // the left half: two triangles over x in [-1, 0]
+    const quad = [_]f32{ -1, -1, 0, -1, 0, 1, -1, -1, 0, 1, -1, 1 };
+    var vbo: [1]u32 = undefined;
+    libgles.glGenBuffers(1, &vbo);
+    defer libgles.glDeleteBuffers(1, &vbo);
+    libgles.glBindBuffer(g.ARRAY_BUFFER, vbo[0]);
+    libgles.glBufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, g.STATIC_DRAW);
+    libgles.glVertexAttribPointer(0, 2, g.FLOAT, 0, 0, null);
+    libgles.glEnableVertexAttribArray(0);
+    if (loc < 0 or libgles.glGetError() != g.NO_ERROR) {
+        run.failed = "the program's setup";
+        return;
+    }
+    var px: [MT_W * MT_H * 4]u8 = undefined;
+    for (0..MT_ROUNDS) |r| {
+        const back = mtColor(run.which, r, 0);
+        const fore = mtColor(run.which, r, 1);
+        libgles.glClearColor(mtFloat(back[0]), mtFloat(back[1]), mtFloat(back[2]), 1);
+        libgles.glClear(g.COLOR_BUFFER_BIT);
+        libgles.glUniform4f(loc, mtFloat(fore[0]), mtFloat(fore[1]), mtFloat(fore[2]), 1);
+        libgles.glDrawArrays(g.TRIANGLES, 0, 6);
+        @memset(&px, 0);
+        libgles.glReadPixels(0, 0, MT_W, MT_H, g.RGBA, g.UNSIGNED_BYTE, &px);
+        var right = true;
+        for (0..MT_H) |y| {
+            for (0..MT_W) |x| {
+                const want = if (x < MT_W / 2) fore else back;
+                const got = px[(y * MT_W + x) * 4 ..][0..4].*;
+                if (std.mem.eql(u8, &got, &want)) continue;
+                if (run.first == null) run.first = .{ .round = r, .x = x, .y = y, .got = got, .want = want };
+                right = false;
+            }
+        }
+        if (right) run.right += 1 else run.wrong += 1;
+    }
+    // (an entry point that calls another: the lock entered twice)
+    if (libgles.glGetGraphicsResetStatusEXT() != g.NO_ERROR) run.failed = "glGetGraphicsResetStatusEXT";
+    if (libgles.glGetError() != g.NO_ERROR) run.failed = "a GL call (glGetError)";
+}
+
+test "libgalaxy_gl: two threads draw at once, each in its own context, and each reads back only its own pixels" {
+    mt_emu = gpu.EmuDevice.init(gpu.interp_caps, &mt_mem, &mt_work);
+    mt_eng.init(.{ .dev = mt_emu.device(), .work = &mt_compile });
+    egl.setDriver(.{ .open = mtOpen, .host = test_host, .wayland = noWayland });
+    const d = eglGetDisplay(null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(d, null, null));
+    defer _ = eglTerminate(d);
+    // the lock: free between calls, re-entrant for its holder (EGL and GL
+    // calls made while this thread holds it go through)
+    try std.testing.expect(egl.driverFree());
+    egl.driverEnter();
+    egl.driverEnter();
+    try std.testing.expect(!egl.driverFree());
+    try std.testing.expectEqual(gfxapi.glenum.NO_ERROR, libgles.glGetError());
+    try std.testing.expectEqual(egl.SUCCESS, eglGetError());
+    try std.testing.expect(eglQueryString(d, egl.EXTENSIONS) != null);
+    egl.driverLeave();
+    try std.testing.expect(!egl.driverFree());
+    egl.driverLeave();
+    try std.testing.expect(egl.driverFree());
+    mt_started.store(0, .release);
+    var runs: [MT_THREADS]MtRun = undefined;
+    for (&runs, 0..) |*r, i| r.* = .{ .which = @intCast(i), .dpy = d };
+    var threads: [MT_THREADS]std.Thread = undefined;
+    for (&threads, &runs) |*t, *r| t.* = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, mtDraw, .{r});
+    for (threads) |t| t.join();
+    for (runs) |r| {
+        if (r.failed) |what| std.debug.print("thread {d}: {s} failed\n", .{ r.which, what });
+        if (r.first) |f| std.debug.print("thread {d}: {d} rounds wrong; the first at round {d}, ({d}, {d}): {any}, not {any}\n", .{ r.which, r.wrong, f.round, f.x, f.y, f.got, f.want });
+    }
+    for (runs) |r| {
+        try std.testing.expect(r.failed == null);
+        try std.testing.expectEqual(@as(u32, MT_ROUNDS), r.right);
+    }
+    // the lock let go by both, the device kept, every draw on it
+    try std.testing.expect(egl.driverFree());
+    try std.testing.expect(!mt_eng.lost);
+    try std.testing.expect(mt_eng.stats.dispatches >= MT_THREADS * MT_ROUNDS * 3);
+}
