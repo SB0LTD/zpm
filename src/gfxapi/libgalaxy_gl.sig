@@ -957,7 +957,7 @@ test "libgalaxy_gl: EGL and GL through their C entry points (surfaceless, a pbuf
     try std.testing.expectEqual(@as(u32, 1), eglDestroySyncKHR(dpy, native));
     var nf: i32 = 0;
     try std.testing.expectEqual(@as(u32, 1), eglQueryDmaBufFormatsEXT(dpy, 0, null, &nf));
-    try std.testing.expectEqual(@as(i32, 4), nf);
+    try std.testing.expectEqual(@as(i32, 8), nf); // (four RGB, four video planes)
     try std.testing.expectEqual(@as(u32, 1), eglSwapBuffers(dpy, pb)); // (a pbuffer's: nothing)
     try std.testing.expectEqual(@as(u32, 1), eglMakeCurrent(dpy, null, null, null));
     try std.testing.expect(eglGetCurrentContext() == null);
