@@ -49,11 +49,66 @@ pub const Error = device.Error || ir3_asm.Error || error{
 };
 
 /// What a rectangle's pixels are.
-pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow };
-const KINDS = 8;
+pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow, shadow };
+const KINDS = 9;
 
 /// A rectangle's corners: x0, y0, x1, y1 (pixels; x1 and y1 past the end).
 pub const Rect = [4]f32;
+
+/// What a shadow leaves alone, and gfx's ways. Deeper than three sigmas
+/// inside the shape nothing is drawn: what casts the shadow covers it.
+/// gfx's shadow differs in two places that a frame compared with gfx's
+/// must have too, both in its corner rows (those above `above` or from
+/// `below` down):
+/// - the pixels from column `from_x` right that are that deep are drawn
+///   whole;
+/// - left of column `left` and from `right` on (its corners), the
+///   distance is taken to the nearest `step` (its table's), counted from
+///   three sigmas inside;
+/// - once a corner row has reached a pixel that deep, gfx skips on to
+///   three sigmas from the right edge, over the right corner's shallower
+///   pixels too: from column `run_from` (the row's deepest pixel right of
+///   its straight part) up to `run_end`, nothing is drawn in a row whose
+///   pixel at `run_from` is that deep.
+/// The defaults have none of them.
+pub const Deep = struct {
+    from_x: f32 = 1e30,
+    above: f32 = -1e30,
+    below: f32 = 1e30,
+    left: f32 = -1e30,
+    right: f32 = 1e30,
+    step: f32 = 0,
+    run_from: f32 = 0,
+    run_end: f32 = -1e30,
+};
+
+/// The part of a Gaussian of `sigma` beyond the distance `d` (gfx's
+/// gaussEdge: Abramowitz and Stegun's erf): the programs' arithmetic.
+pub fn gaussEdge(d: f32, sigma: f32) f32 {
+    const x = d / (sigma * 1.41421356);
+    const t = 1 / (1 + 0.3275911 * @abs(x));
+    const h = 0.5 * (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * @exp2(-x * x * 1.44269504);
+    return if (x >= 0) h else 1 - h;
+}
+
+/// A shadow's alpha at the pixel (x, y): `alpha` times gaussEdge of the
+/// signed distance to `s`, less half a step of 255 (gfx takes it down to a
+/// whole step, and this is the middle of what that loses); deeper than
+/// three sigmas inside, nothing, or `alpha` (254 of 255 of it) where
+/// `deep` says so.
+pub fn shadowAlpha(x: u32, y: u32, s: Shape, sigma: f32, alpha: f32, deep: Deep) f32 {
+    const px = @as(f32, @floatFromInt(x)) + 0.5;
+    const py = @as(f32, @floatFromInt(y)) + 0.5;
+    const ext = 3 * sigma;
+    var d = s.distance(px, py);
+    const corner_row = py < deep.above or py > deep.below;
+    if (corner_row and px > deep.run_from and px < deep.run_end and s.distance(deep.run_from + 0.5, py) < -ext) return 0;
+    if (d < -ext) return if (px > deep.from_x and corner_row) alpha * (254.0 / 255.0) else 0;
+    if (deep.step > 0 and corner_row and (px < deep.left or px > deep.right)) {
+        d = @floor((d + ext) / deep.step + 0.5) * deep.step - ext;
+    }
+    return alpha * @max(gaussEdge(d, sigma) - 0.5 / 255.0, 0);
+}
 
 /// Just under half a step of 255. gfx blends some things (a glow, a scrim)
 /// dropping the fraction, where the blender rounds to the nearest step: a
@@ -368,7 +423,113 @@ const FS_GLOW =
     \\end
 ;
 
-const SOURCES = [1 + KINDS][]const u8{ VS, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW };
+/// A rounded rectangle's soft shadow, as gfx.shadowRoundRect: the color
+/// times gaussEdge of the signed distance (FS_RRECT's), nothing deeper
+/// than three sigmas inside but for Deep's pixels. The varyings are the
+/// pixel's position.
+/// c0: the color (straight), then what the blended color is taken down
+/// by; c1: -centre x, y, -(half size less radius) x, y; c2: -radius,
+/// -3 sigma, 1 / (sigma sqrt 2), the alpha; c3: Deep's from_x, above,
+/// below, and the alpha drawn there; c4, c5: erf's constants, then
+/// -log2(e) and -1; c6: 3 sigma, 1 / Deep's step (0: none), the step;
+/// c7: Deep's left, right, and what the coverage is taken down by; c8:
+/// the run's column as the distance takes it (its x less the half size
+/// less the radius, and that squared where it is past the corner's
+/// centre), Deep's run_from and run_end.
+const FS_SHADOW =
+    \\@threadsize 128
+    \\@out r6.x, 4
+    \\(rpt1)bary.f (ei)r5.x, (r)0, r0.x
+    \\(rpt1)add.f r2.x, (r)r5.x, (r)c1.x
+    \\absneg.f r2.x, (abs)r2.x
+    \\absneg.f r2.y, (abs)r2.y
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.z
+    \\(rpt1)max.f r2.z, (r)r2.x, (0.0)
+    \\mul.f r3.x, r2.z, r2.z
+    \\mul.f r3.y, r2.w, r2.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.x, r3.x
+    \\max.f r3.y, r2.x, r2.y
+    \\min.f r3.y, r3.y, (0.0)
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c2.x
+    \\cmps.f.lt r7.x, r5.y, c3.y
+    \\cmps.f.gt r7.y, r5.y, c3.z
+    \\or.b r7.x, r7.x, r7.y
+    \\mul.f r8.x, r2.w, r2.w
+    \\add.f r8.x, r8.x, c8.y
+    \\sqrt r8.x, r8.x
+    \\max.f r8.y, r2.y, c8.x
+    \\min.f r8.y, r8.y, (0.0)
+    \\add.f r8.x, r8.x, r8.y
+    \\add.f r8.x, r8.x, c2.x
+    \\cmps.f.lt r8.x, r8.x, c2.y
+    \\cmps.f.gt r8.y, r5.x, c8.z
+    \\and.b r8.x, r8.x, r8.y
+    \\cmps.f.lt r8.y, r5.x, c8.w
+    \\and.b r8.x, r8.x, r8.y
+    \\and.b r8.x, r8.x, r7.x
+    \\cov.u32f32 r8.x, r8.x
+    \\add.f r8.x, (neg)r8.x, (1.0)
+    \\cmps.f.lt r7.y, r5.x, c7.x
+    \\cmps.f.gt r7.z, r5.x, c7.y
+    \\or.b r7.y, r7.y, r7.z
+    \\and.b r7.y, r7.y, r7.x
+    \\cov.u32f32 r7.y, r7.y
+    \\add.f r4.x, r3.x, c6.x
+    \\mul.f r4.x, r4.x, c6.y
+    \\add.f r4.x, r4.x, (0.5)
+    \\floor.f r4.x, r4.x
+    \\mul.f r4.x, r4.x, c6.z
+    \\add.f r4.x, r4.x, c2.y
+    \\add.f r7.z, (neg)r3.x, r4.x
+    \\mul.f r7.z, r7.z, r7.y
+    \\add.f r7.z, r7.z, r3.x
+    \\mul.f r3.y, r7.z, c2.z
+    \\absneg.f r3.z, (abs)r3.y
+    \\mul.f r3.w, r3.z, c4.x
+    \\add.f r3.w, r3.w, (1.0)
+    \\rcp r3.w, r3.w
+    \\mul.f r4.x, r3.w, c4.y
+    \\add.f r4.x, r4.x, c4.z
+    \\mul.f r4.x, r4.x, r3.w
+    \\add.f r4.x, r4.x, c4.w
+    \\mul.f r4.x, r4.x, r3.w
+    \\add.f r4.x, r4.x, c5.x
+    \\mul.f r4.x, r4.x, r3.w
+    \\add.f r4.x, r4.x, c5.y
+    \\mul.f r4.x, r4.x, r3.w
+    \\mul.f r4.y, r3.y, r3.y
+    \\mul.f r4.y, r4.y, c5.z
+    \\exp2 r4.y, r4.y
+    \\mul.f r4.x, r4.x, r4.y
+    \\mul.f r4.x, r4.x, (0.5)
+    \\cmps.f.ge r4.z, r3.y, (0.0)
+    \\cov.u32f32 r4.z, r4.z
+    \\add.f r4.w, r4.x, r4.x
+    \\add.f r4.w, r4.w, c5.w
+    \\mul.f r4.w, r4.w, r4.z
+    \\add.f r5.z, (neg)r4.x, (1.0)
+    \\add.f r4.w, r4.w, r5.z
+    \\add.f (sat)r4.w, r4.w, c7.z
+    \\mul.f r4.w, r4.w, c2.w
+    \\cmps.f.lt r5.z, r3.x, c2.y
+    \\cov.u32f32 r5.z, r5.z
+    \\cmps.f.gt r5.w, r5.x, c3.x
+    \\and.b r5.w, r5.w, r7.x
+    \\cov.u32f32 r5.w, r5.w
+    \\mul.f r5.w, r5.w, c3.w
+    \\add.f r5.w, (neg)r4.w, r5.w
+    \\mul.f r5.w, r5.w, r5.z
+    \\add.f r4.w, r4.w, r5.w
+    \\mul.f r4.w, r4.w, r8.x
+    \\(rpt2)mul.f r6.x, (r)c0.x, r4.w
+    \\(rpt2)add.f r6.x, (r)r6.x, c0.w
+    \\mov.f32f32 r6.w, r4.w
+    \\end
+;
+
+const SOURCES = [1 + KINDS][]const u8{ VS, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW, FS_SHADOW };
 
 /// How each kind's fragment program is wired: whether it reads the
 /// varyings, whether the pipeline prefetches its texel, where its color is.
@@ -381,6 +542,7 @@ const WIRING = [KINDS]Wiring{
     .{ .varyings = true, .prefetch = false, .color_reg = 16 },
     .{ .varyings = true, .prefetch = true, .color_reg = 16 },
     .{ .varyings = true, .prefetch = true, .color_reg = 24 },
+    .{ .varyings = true, .prefetch = false, .color_reg = 24 },
     .{ .varyings = true, .prefetch = false, .color_reg = 24 },
 };
 
@@ -638,6 +800,31 @@ pub const Renderer = struct {
             -cx, -cy, inner, 1 / span,
             9.0 / (16.0 * 255.0), (0.5 / 16.0 - 0.5) * 9.0 / 255.0 - 0.5 / 255.0, 3, outer * outer,
             -DROP, 0, 0, 0,
+        };
+        r.cornersWith(rc, rc, &c);
+    }
+
+    /// The soft shadow of the rounded rectangle `s`: `color` (straight,
+    /// its alpha last) at shadowAlpha, the blended color DROP lower (gfx
+    /// blends a shadow as it does a glow). `rc` is the shape's bounds and
+    /// three sigmas around, or less.
+    pub fn shadow(r: *Renderer, rc: Rect, s: Shape, sigma: f32, color: Color, deep: Deep, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1]) or !(sigma > 0)) return;
+        r.use(.shadow, b);
+        // (no step: no corner is gfx's)
+        const stepped = deep.step > 0;
+        const qxm = @abs(deep.run_from + 0.5 - s.cx) - s.kx;
+        const oxm = @max(qxm, 0);
+        const c = [36]f32{
+            color[0], color[1], color[2], -DROP,
+            -s.cx, -s.cy, -s.kx, -s.ky,
+            -s.rad, -3 * sigma, 1 / (sigma * 1.41421356), color[3],
+            deep.from_x, deep.above, deep.below, color[3] * (254.0 / 255.0),
+            0.3275911, 1.061405429, -1.453152027, 1.421413741,
+            -0.284496736, 0.254829592, -1.44269504, -1,
+            3 * sigma, if (stepped) 1 / deep.step else 0, if (stepped) deep.step else 0, 0,
+            if (stepped) deep.left else -1e30, if (stepped) deep.right else 1e30, -0.5 / 255.0, 0,
+            qxm, oxm * oxm, deep.run_from, deep.run_end,
         };
         r.cornersWith(rc, rc, &c);
     }
@@ -1074,6 +1261,41 @@ test "a mask times a gradient, and a glow: the programs against their own arithm
     };
 }
 
+test "a shadow: the program against its own arithmetic at every pixel, the deep pixels too" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const a = Shape.of(8.5, 6.25, 30, 18, 5);
+    const b = Shape.of(44.25, 3, 14, 26, 2);
+    const deep = Deep{ .from_x = 52, .above = 9, .below = 23, .left = 47, .right = 55, .step = 0.125, .run_from = 50, .run_end = 54 };
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, T.W, T.H }, .{ 1, 1, 1, 1 }, .replace);
+    T.r.shadow(.{ 2, 0, 44, 30 }, a, 1.5, .{ 0.1, 0.2, 0.4, 0.7 }, .{}, .over);
+    T.r.shadow(.{ 40, 0, 64, 32 }, b, 1, .{ 0, 0, 0, 1 }, deep, .over);
+    try T.r.run(1_000_000);
+    const px = T.pixels();
+    var deep_seen: u32 = 0;
+    for (0..T.H) |y| for (0..T.W) |x| {
+        var want: [3]f32 = .{ 1, 1, 1 };
+        if (x >= 2 and x < 44 and y < 30) {
+            const al = shadowAlpha(@intCast(x), @intCast(y), a, 1.5, 0.7, .{});
+            for (&want, [3]f32{ 0.1, 0.2, 0.4 }) |*v, s| v.* = @max(s * al - DROP, 0) + v.* * (1 - al);
+        }
+        if (x >= 40) {
+            const al = shadowAlpha(@intCast(x), @intCast(y), b, 1, 1, deep);
+            if (al > 0.9 and b.distance(@as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5) < -3) deep_seen += 1;
+            for (&want) |*v| v.* = v.* * (1 - al);
+        }
+        const w32 = 0xff000000 | (@as(u32, @intFromFloat(want[0] * 255 + 0.5)) << 16) | (@as(u32, @intFromFloat(want[1] * 255 + 0.5)) << 8) | @as(u32, @intFromFloat(want[2] * 255 + 0.5));
+        if (!near(w32, px[y * T.W + x], 2)) {
+            std.debug.print("pixel ({d}, {d}): want {x:0>8}, got {x:0>8}\n", .{ x, y, w32, px[y * T.W + x] });
+            return error.TestUnexpectedResult;
+        }
+    };
+    // (the second shadow has pixels of both kinds: left alone, and drawn whole)
+    try std.testing.expect(deep_seen > 0);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), px[14 * T.W + 49]);
+}
+
 // ── The self-test: the pipeline on the real GPU ─────────────────────────────
 // What the tests above check on the emulated device, drawn on any Device
 // and compared with the values the arithmetic gives, case by case and each
@@ -1239,6 +1461,13 @@ pub fn selfTest(dev: Device, r: *Renderer, asm_work: *ir3_asm.Work, log: *const 
     r.glow(.{ 20, 4, 44, 28 }, 32, 16, 4, 12, .{ 1, 1, 1, 1 }, .over);
     c.check("a glow", &.{ .{ .x = 32, .y = 15, .want = 0xffffffff, .tol = 2 }, .{ .x = 39, .y = 16, .want = 0xff979797, .tol = 3 }, .{ .x = 22, .y = 6, .want = 0xff000000 }, .{ .x = 45, .y = 16, .want = 0xff000000 } });
 
+    // A soft shadow (black, two pixels of sigma, under a 32 x 16 shape:
+    // 40% at the edge, nothing deeper than six pixels inside).
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 1, 1, 1, 1 }, .replace);
+    r.shadow(.{ 10, 2, 54, 30 }, Shape.of(16, 8, 32, 16, 4), 2, .{ 0, 0, 0, 1 }, .{}, .over);
+    c.check("a soft shadow", &.{ .{ .x = 32, .y = 7, .want = 0xff999999, .tol = 3 }, .{ .x = 32, .y = 10, .want = 0xff1b1b1b, .tol = 3 }, .{ .x = 32, .y = 16, .want = 0xffffffff }, .{ .x = 9, .y = 16, .want = 0xffffffff } });
+
     // How fast it fills: a 1024 x 1024 target, an image the same size over
     // it once and a half-transparent color 31 times (32 megapixels blended).
     if (!c.res.lost) speed: {
@@ -1282,7 +1511,7 @@ test "the self-test passes on the emulated device" {
     T.dev = .{ .arena = &T.arena, .gpu_view = &T.gpu_view, .log = &T.log };
     // (no clock: the fill-rate case's megapixels would take the emulator minutes)
     const res = selfTest(T.dev.device(), &T.r, &T.asm_work, &testLog, null);
-    try std.testing.expectEqual(@as(u32, 13), res.passed);
+    try std.testing.expectEqual(@as(u32, 14), res.passed);
     try std.testing.expectEqual(@as(u32, 0), res.failed);
     try std.testing.expect(!res.lost);
 }

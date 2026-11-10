@@ -6,8 +6,8 @@
 //! the target's pixels or blended over them (premultiplied alpha), inside a
 //! scissor; and the same with a rounded rectangle's coverage worked out per
 //! pixel (a filled one, a stroked one, an image inside one), a mask times
-//! a gradient (a path filled with a paint) and a soft dithered disc (a
-//! glow). One pass is begin(target), the rectangles in order, then submit.
+//! a gradient (a path filled with a paint), a soft dithered disc (a glow)
+//! and a rounded rectangle's soft shadow. One pass is begin(target), the rectangles in order, then submit.
 //!
 //! Three things live here, above every GPU's own pipeline (the Adreno's in
 //! adreno/draw.sig, the RTX's in nvidia/draw.sig, each behind an adapter
@@ -78,7 +78,7 @@ pub const Blend = enum(u8) {
 };
 
 /// What a rectangle's pixels are.
-pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow };
+pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow, shadow };
 
 /// A rectangle's corners: x0, y0, x1, y1 (pixels; x1 and y1 past the end).
 pub const Rect = [4]f32;
@@ -174,6 +174,61 @@ pub fn glowAlpha(x: u32, y: u32, cx: f32, cy: f32, inner: f32, outer: f32, alpha
     return std.math.clamp(t * alpha + dither - 0.5 / 255.0, 0, 1);
 }
 
+/// What a shadow leaves alone, and gfx's ways. Deeper than three sigmas
+/// inside the shape nothing is drawn: what casts the shadow covers it.
+/// gfx's shadow differs in two places that a frame compared with gfx's
+/// must have too, both in its corner rows (those above `above` or from
+/// `below` down):
+/// - the pixels from column `from_x` right that are that deep are drawn
+///   whole;
+/// - left of column `left` and from `right` on (its corners), the
+///   distance is taken to the nearest `step` (its table's), counted from
+///   three sigmas inside;
+/// - once a corner row has reached a pixel that deep, gfx skips on to
+///   three sigmas from the right edge, over the right corner's shallower
+///   pixels too: from column `run_from` (the row's deepest pixel right of
+///   its straight part) up to `run_end`, nothing is drawn in a row whose
+///   pixel at `run_from` is that deep.
+/// The defaults have none of them.
+pub const Deep = struct {
+    from_x: f32 = 1e30,
+    above: f32 = -1e30,
+    below: f32 = 1e30,
+    left: f32 = -1e30,
+    right: f32 = 1e30,
+    step: f32 = 0,
+    run_from: f32 = 0,
+    run_end: f32 = -1e30,
+};
+
+/// The part of a Gaussian of `sigma` beyond the distance `d` (gfx's
+/// gaussEdge: Abramowitz and Stegun's erf): the programs' arithmetic.
+pub fn gaussEdge(d: f32, sigma: f32) f32 {
+    const x = d / (sigma * 1.41421356);
+    const t = 1 / (1 + 0.3275911 * @abs(x));
+    const h = 0.5 * (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * @exp2(-x * x * 1.44269504);
+    return if (x >= 0) h else 1 - h;
+}
+
+/// A shadow's alpha at the pixel (x, y): `alpha` times gaussEdge of the
+/// signed distance to `s`, less half a step of 255 (gfx takes it down to a
+/// whole step, and this is the middle of what that loses); deeper than
+/// three sigmas inside, nothing, or `alpha` (254 of 255 of it) where
+/// `deep` says so.
+pub fn shadowAlpha(x: u32, y: u32, s: Shape, sigma: f32, alpha: f32, deep: Deep) f32 {
+    const px = @as(f32, @floatFromInt(x)) + 0.5;
+    const py = @as(f32, @floatFromInt(y)) + 0.5;
+    const ext = 3 * sigma;
+    var d = s.distance(px, py);
+    const corner_row = py < deep.above or py > deep.below;
+    if (corner_row and px > deep.run_from and px < deep.run_end and s.distance(deep.run_from + 0.5, py) < -ext) return 0;
+    if (d < -ext) return if (px > deep.from_x and corner_row) alpha * (254.0 / 255.0) else 0;
+    if (deep.step > 0 and corner_row and (px < deep.left or px > deep.right)) {
+        d = @floor((d + ext) / deep.step + 0.5) * deep.step - ext;
+    }
+    return alpha * @max(gaussEdge(d, sigma) - 0.5 / 255.0, 0);
+}
+
 pub const Error = error{
     OutOfMemory,
     SubmitFailed,
@@ -225,6 +280,7 @@ pub const Renderer = struct {
         imageRR: *const fn (ctx: *anyopaque, rc: Rect, t: Texture, uv: [4]f32, tint: Color, s: Shape, b: Blend) void,
         maskGradient: *const fn (ctx: *anyopaque, rc: Rect, t: Texture, uv: [4]f32, g: Gradient, opacity: f32, b: Blend) void,
         glow: *const fn (ctx: *anyopaque, rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, b: Blend) void,
+        shadow: *const fn (ctx: *anyopaque, rc: Rect, s: Shape, sigma: f32, color: Color, deep: Deep, b: Blend) void,
         submit: *const fn (ctx: *anyopaque) Error!Fence,
         resubmit: *const fn (ctx: *anyopaque) Error!Fence,
         wait: *const fn (ctx: *anyopaque, f: Fence, timeout_us: u64) Error!void,
@@ -292,6 +348,12 @@ pub const Renderer = struct {
     /// at glowAlpha, less DROP once multiplied.
     pub fn glow(r: Renderer, rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, b: Blend) void {
         r.vtable.glow(r.ctx, rc, cx, cy, inner, outer, color, b);
+    }
+
+    /// The soft shadow of the rounded rectangle `s`: `color` (straight
+    /// r, g, b, and its alpha) at shadowAlpha, less DROP once multiplied.
+    pub fn shadow(r: Renderer, rc: Rect, s: Shape, sigma: f32, color: Color, deep: Deep, b: Blend) void {
+        r.vtable.shadow(r.ctx, rc, s, sigma, color, deep, b);
     }
 
     /// End the pass and hand it to the GPU. The target's pixels are in
@@ -483,6 +545,7 @@ pub const Reference = struct {
         .imageRR = &vImageRR,
         .maskGradient = &vMaskGradient,
         .glow = &vGlow,
+        .shadow = &vShadow,
         .submit = &vSubmit,
         .resubmit = &vResubmit,
         .wait = &vWait,
@@ -514,7 +577,9 @@ pub const Reference = struct {
         inner: ?Shape = null,
         grad: ?Gradient = null,
         /// mask_grad: the opacity. glow: its centre, inner and outer radius.
+        /// shadow: its sigma.
         num: [4]f32 = .{ 0, 0, 0, 0 },
+        deep: Deep = .{},
     };
 
     fn draw(m: *Reference, rc: Rect, p: Paint, b: Blend) void {
@@ -582,6 +647,11 @@ pub const Reference = struct {
                         for (c[0..3]) |*o| o.* = @max(o.* * al - DROP, 0);
                         c[3] = al;
                     },
+                    .shadow => {
+                        const al = shadowAlpha(x, y, p.shape.?, p.num[0], p.color[3], p.deep);
+                        for (c[0..3]) |*o| o.* = @max(o.* * al - DROP, 0);
+                        c[3] = al;
+                    },
                 }
                 blendInto(out, @as(usize, y) * t.pitch + @as(usize, x) * t.format.bytes(), t.format, c, b);
             }
@@ -633,6 +703,11 @@ pub const Reference = struct {
     fn vGlow(ctx: *anyopaque, rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, b: Blend) void {
         if (!(outer > 0)) return;
         of(ctx).draw(rc, .{ .kind = .glow, .color = color, .num = .{ cx, cy, inner, outer } }, b);
+    }
+
+    fn vShadow(ctx: *anyopaque, rc: Rect, s: Shape, sigma: f32, color: Color, deep: Deep, b: Blend) void {
+        if (!(sigma > 0)) return;
+        of(ctx).draw(rc, .{ .kind = .shadow, .color = color, .shape = s, .num = .{ sigma, 0, 0, 0 }, .deep = deep }, b);
     }
 
     fn vSubmit(ctx: *anyopaque) Error!Fence {
@@ -707,6 +782,7 @@ pub const Op = union(enum) {
     image_rr: struct { rc: Rect, tex: CaseTexture, uv: [4]f32, tint: Color, shape: Shape, blend: Blend = .over },
     mask_grad: struct { rc: Rect, uv: [4]f32, grad: Gradient, opacity: f32 = 1, blend: Blend = .over },
     glow: struct { rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, blend: Blend = .over },
+    shadow: struct { rc: Rect, shape: Shape, sigma: f32, color: Color, deep: Deep = .{}, blend: Blend = .over },
 };
 
 /// A pixel a case must leave: within `tol` of 255 a byte.
@@ -796,6 +872,13 @@ pub const cases = [_]Case{
         .ops = &.{ .{ .fill = .{ .rc = WHOLE, .color = BLACK } }, .{ .glow = .{ .rc = .{ 20, 4, 44, 28 }, .cx = 32, .cy = 16, .inner = 4, .outer = 12, .color = WHITE } } },
         .probes = &.{ .{ .x = 32, .y = 15, .want = 0xffffffff, .tol = 2 }, .{ .x = 39, .y = 16, .want = 0xff979797, .tol = 3 }, .{ .x = 22, .y = 6, .want = black }, .{ .x = 45, .y = 16, .want = black } },
     },
+    .{
+        // (black, two pixels of sigma, under a 32 x 16 shape: 40% at the
+        // edge, nothing deeper than six pixels inside)
+        .name = "a soft shadow",
+        .ops = &.{ .{ .fill = .{ .rc = WHOLE, .color = WHITE } }, .{ .shadow = .{ .rc = .{ 10, 2, 54, 30 }, .shape = Shape.of(16, 8, 32, 16, 4), .sigma = 2, .color = .{ 0, 0, 0, 1 } } } },
+        .probes = &.{ .{ .x = 32, .y = 7, .want = 0xff999999, .tol = 3 }, .{ .x = 32, .y = 10, .want = 0xff1b1b1b, .tol = 3 }, .{ .x = 32, .y = 16, .want = 0xffffffff }, .{ .x = 9, .y = 16, .want = 0xffffffff } },
+    },
 };
 
 /// The self-test's textures on a device: the 8 x 4 picture at the start
@@ -840,6 +923,7 @@ pub fn record(r: Renderer, t: Target, tex: CaseTextures, c: Case) void {
         .image_rr => |i| r.imageRR(i.rc, tex.get(i.tex), i.uv, i.tint, i.shape, i.blend),
         .mask_grad => |m| r.maskGradient(m.rc, tex.get(.mask), m.uv, m.grad, m.opacity, m.blend),
         .glow => |g| r.glow(g.rc, g.cx, g.cy, g.inner, g.outer, g.color, g.blend),
+        .shadow => |s| r.shadow(s.rc, s.shape, s.sigma, s.color, s.deep, s.blend),
     };
 }
 
@@ -1025,7 +1109,7 @@ test "draw: the reference passes every case" {
     try testing.expectEqual(@as(u32, cases.len), res.passed);
     try testing.expectEqual(@as(u32, 0), res.failed);
     try testing.expect(!res.lost);
-    try testing.expectEqual(@as(usize, 13), cases.len);
+    try testing.expectEqual(@as(usize, 14), cases.len);
 }
 
 test "draw: a pass is a pass: nothing before begin, the scissor, memory that is not the model's" {

@@ -48,6 +48,7 @@ pub const Over = struct {
         .imageRR = &vImageRR,
         .maskGradient = &vMaskGradient,
         .glow = &vGlow,
+        .shadow = &vShadow,
         .submit = &vSubmit,
         .resubmit = &vResubmit,
         .wait = &vWait,
@@ -100,6 +101,10 @@ pub const Over = struct {
 
     fn vGlow(ctx: *anyopaque, rc: draw.Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: draw.Color, b: draw.Blend) void {
         of(ctx).r.glow(rc, cx, cy, inner, outer, color, blendOf(b));
+    }
+
+    fn vShadow(ctx: *anyopaque, rc: draw.Rect, s: draw.Shape, sigma: f32, color: draw.Color, deep: draw.Deep, b: draw.Blend) void {
+        of(ctx).r.shadow(rc, shapeOf(s), sigma, color, .{ .from_x = deep.from_x, .above = deep.above, .below = deep.below, .left = deep.left, .right = deep.right, .step = deep.step, .run_from = deep.run_from, .run_end = deep.run_end }, blendOf(b));
     }
 
     fn vSubmit(ctx: *anyopaque) draw.Error!draw.Fence {
