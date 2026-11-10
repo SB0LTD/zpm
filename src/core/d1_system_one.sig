@@ -65,7 +65,57 @@ pub const Error = executor.Error || error{
     TokenizerFailed,
     InvalidRequest,
     UnsupportedQuestion,
+    /// A Runner did not finish the pass (its GPU refused it, hung or
+    /// faulted): nothing was answered; the CPU's engine still can.
+    EngineFailed,
 };
+
+/// Where a pass runs when not on the CPU's executor: a GPU (lfm3_any's
+/// forwardSees and residualRows behind two functions, so this file knows
+/// of no GPU). The readout (output norm, the options' logits, the
+/// temperature) stays here, on the CPU, either way.
+pub const Runner = struct {
+    context: *anyopaque,
+    /// One pass of `tokens` from position 0 under `sees`.
+    run: *const fn (context: *anyopaque, tokens: []const u32, sees: *const executor.Sees) error{EngineFailed}!void,
+    /// The final residual rows of `positions`, one after another in `out`.
+    rows: *const fn (context: *anyopaque, positions: []const u32, out: []f32) error{EngineFailed}!void,
+};
+
+/// A Runner over a GPU backend and its cache: `B` is lfm3_any's Backend
+/// (forwardSees, residualRows), `C` its Cache (the executor's as `cpu`).
+pub fn GpuRunner(comptime B: type, comptime C: type) type {
+    return struct {
+        backend: *B,
+        cache: *C,
+        /// The backend's error when a pass failed, for the caller's log.
+        failed: ?anyerror = null,
+
+        pub fn runner(self: *@This()) Runner {
+            return .{ .context = self, .run = &run, .rows = &rows };
+        }
+
+        fn run(context: *anyopaque, tokens: []const u32, sees: *const executor.Sees) error{EngineFailed}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            // (every pass starts the context over: nothing of the last one
+            // is kept, on either side)
+            self.cache.cpu.reset();
+            self.cache.kv_on_cpu = false;
+            self.backend.forwardSees(self.cache, tokens, sees) catch |e| {
+                self.failed = e;
+                return error.EngineFailed;
+            };
+        }
+
+        fn rows(context: *anyopaque, positions: []const u32, out: []f32) error{EngineFailed}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.backend.residualRows(self.cache, positions, out) catch |e| {
+                self.failed = e;
+                return error.EngineFailed;
+            };
+        }
+    };
+}
 
 pub const Kind = enum {
     noul,
@@ -171,6 +221,8 @@ pub fn Scratch(comptime limits: executor.Limits) type {
         piece: [limits.batch]u32 = undefined,
         normed: [limits.hidden]f32 = undefined,
         row: [limits.hidden]f32 = undefined,
+        /// A Runner's residual rows, a question each.
+        rows: [MAX_SET * limits.hidden]f32 = undefined,
         forms: [MAX_OPTIONS][MAX_FORMS]u32 = undefined,
         form_count: [MAX_OPTIONS]u8 = undefined,
         used: [MAX_OPTIONS]u32 = undefined,
@@ -419,6 +471,26 @@ pub fn ask(
     answers: []Answer,
     parallel: executor.Parallel,
 ) Error!Usage {
+    return askOn(tensor_capacity, limits, model, tokenizer, work, cache, scratch, state, questions, set_size, answers, parallel, null);
+}
+
+/// `ask`, its passes on `runner` when there is one (`work`, `cache` and
+/// `parallel` are then not used).
+pub fn askOn(
+    comptime tensor_capacity: usize,
+    comptime limits: executor.Limits,
+    model: *const Model(tensor_capacity),
+    tokenizer: anytype,
+    work: *executor.Workspace(limits),
+    cache: *executor.Cache,
+    scratch: *Scratch(limits),
+    state: State,
+    questions: []const Question,
+    set_size: usize,
+    answers: []Answer,
+    parallel: executor.Parallel,
+    runner: ?*const Runner,
+) Error!Usage {
     if (questions.len == 0) return error.NoQuestions;
     if (questions.len > answers.len or questions.len > MAX_QUESTIONS) return error.TooManyQuestions;
     for (questions) |*q| {
@@ -431,7 +503,7 @@ pub fn ask(
     var first: usize = 0;
     while (first < questions.len) : (first += step) {
         const set = questions[first..@min(questions.len, first + step)];
-        usage.input_tokens += try pass(tensor_capacity, limits, model, tokenizer, work, cache, scratch, state, set, answers[first..][0..set.len], parallel);
+        usage.input_tokens += try pass(tensor_capacity, limits, model, tokenizer, work, cache, scratch, state, set, answers[first..][0..set.len], parallel, runner);
         usage.passes += 1;
     }
     return usage;
@@ -450,6 +522,7 @@ fn pass(
     set: []const Question,
     answers: []Answer,
     parallel: executor.Parallel,
+    runner: ?*const Runner,
 ) Error!usize {
     var codes: [MAX_SET][MAX_OPTIONS][4]u8 = undefined;
     var code_len: [MAX_SET][MAX_OPTIONS]u8 = undefined;
@@ -488,11 +561,20 @@ fn pass(
         count += n;
         slots[k] = count - 1;
     }
-    cache.reset();
     const sees = executor.Sees{ .state = state_len, .group = scratch.group[0..count] };
-    _ = try executor.forwardSees(tensor_capacity, limits, model.source, model.index, model.plan, model.weights, work, cache, scratch.ids[0..count], .none, &sees, parallel);
+    const hidden: usize = model.plan.hidden_size;
+    if (runner) |r| {
+        var positions: [MAX_SET]u32 = undefined;
+        for (slots[0..set.len], positions[0..set.len]) |slot, *at| at.* = @intCast(slot);
+        try r.run(r.context, scratch.ids[0..count], &sees);
+        try r.rows(r.context, positions[0..set.len], scratch.rows[0 .. set.len * hidden]);
+    } else {
+        cache.reset();
+        _ = try executor.forwardSees(tensor_capacity, limits, model.source, model.index, model.plan, model.weights, work, cache, scratch.ids[0..count], .none, &sees, parallel);
+    }
     for (set, 0..) |*q, k| {
-        try readSlot(tensor_capacity, limits, model, tokenizer, work, scratch, q, codes[k][0..q.options.len], code_len[k][0..q.options.len], slots[k], &answers[k]);
+        const residual: []const f32 = if (runner != null) scratch.rows[k * hidden ..][0..hidden] else work.hidden[slots[k] * hidden ..][0..hidden];
+        try readSlot(tensor_capacity, limits, model, tokenizer, residual, scratch, q, codes[k][0..q.options.len], code_len[k][0..q.options.len], &answers[k]);
     }
     return count;
 }
@@ -543,24 +625,22 @@ fn singleToken(tokenizer: anytype, text: []const u8, ids: *[8]u32) ?u32 {
     return if (n == 1) ids[0] else null;
 }
 
-/// The answer at one slot: the final residual through the output norm, each
-/// option's best form's logit, the temperature, the softmax.
+/// The answer at one slot: its final `residual` through the output norm,
+/// each option's best form's logit, the temperature, the softmax.
 fn readSlot(
     comptime tensor_capacity: usize,
     comptime limits: executor.Limits,
     model: *const Model(tensor_capacity),
     tokenizer: anytype,
-    work: *executor.Workspace(limits),
+    residual: []const f32,
     scratch: *Scratch(limits),
     q: *const Question,
     codes: []const [4]u8,
     code_len: []const u8,
-    position: usize,
     answer: *Answer,
 ) Error!void {
     const plan = model.plan;
     const hidden: usize = plan.hidden_size;
-    const residual = work.hidden[position * hidden ..][0..hidden];
     const norm = try vector(model.source, model.index, plan.output_norm, hidden);
     rmsNorm(residual, norm, scratch.normed[0..hidden], plan.rms_norm_epsilon);
     const output = try matrix(model.source, model.index, plan.output);
