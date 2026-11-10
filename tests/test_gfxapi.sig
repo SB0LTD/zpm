@@ -260,6 +260,8 @@ test "gfxapi: the scenario on the emulated Adreno (ir3, PM4) gives the CPU's byt
 const Flaky = struct {
     var inner: gpu.Device = undefined;
     var fail = false;
+    /// waits fail (a batch in flight when the GPU is lost)
+    var fail_wait = false;
     var runs: u32 = 0;
     var frees: u32 = 0;
 
@@ -296,9 +298,11 @@ const Flaky = struct {
         return inner.vtable.run(c, ds);
     }
     fn wait(c: *anyopaque, f: gpu.Fence, t: u64) gpu.Error!void {
+        if (fail_wait) return error.DeviceLost;
         return inner.vtable.wait(c, f, t);
     }
     fn done(c: *anyopaque, f: gpu.Fence) bool {
+        if (fail_wait) return false;
         return inner.vtable.done(c, f);
     }
     fn ns(c: *anyopaque) u64 {
@@ -349,4 +353,58 @@ test "gfxapi: a buffer a batch still uses is freed after it; a lost GPU's batch 
     try std.testing.expectEqual(runs, Flaky.runs);
     try std.testing.expectEqualStrings("Galaxy (CPU)", std.mem.span(ctx.getString(g.RENDERER).?));
     eng_f.freeImage(&b);
+}
+
+var said: [2048]u8 = undefined;
+var said_len: usize = 0;
+
+fn sayInto(line: []const u8) void {
+    const n = @min(line.len, said.len - said_len);
+    @memcpy(said[said_len..][0..n], line[0..n]);
+    said_len += n;
+}
+
+test "gfxapi: a GPU lost with batches in flight says their kernels: names, code addresses, sizes, grids" {
+    const old = gfxapi.report.sink;
+    defer gfxapi.report.sink = old;
+    gfxapi.report.sink = &sayInto;
+    said_len = 0;
+    emu = gpu.EmuDevice.init(emuCaps(), &emu_mem, &emu_work);
+    emu.shadow = &emu_shadow;
+    Flaky.fail = false;
+    Flaky.fail_wait = false;
+    defer Flaky.fail_wait = false;
+    var eng_l: engine.Engine = undefined;
+    eng_l.init(.{ .dev = Flaky.device(emu.device()), .work = &compile_mem, .pool = &pool_mem });
+    defer eng_l.deinit();
+    try std.testing.expect(eng_l.onGpu());
+    var a = eng_l.newImage(64, 8, .rgba8).?;
+    var b = eng_l.newImage(64, 8, .rgba8).?;
+    // two batches run, neither waited for; then the GPU is lost
+    eng_l.fill(&a, a.bounds(), 0x1111_1111, 0);
+    eng_l.fill(&b, b.bounds(), 0x2222_2222, 0);
+    eng_l.flush();
+    eng_l.fill(&a, a.bounds(), 0x3333_3333, 0);
+    eng_l.flush();
+    Flaky.fail_wait = true;
+    eng_l.finish();
+    try std.testing.expect(eng_l.lost);
+    const out = said[0..said_len];
+    const at = std.mem.indexOf(u8, out, "on the GPU then (") orelse {
+        std.debug.print("said: {s}\n", .{out});
+        return error.NotSaid;
+    };
+    _ = std.mem.indexOf(u8, out[at..], " not known done): gfx_fill x") orelse {
+        std.debug.print("said: {s}\n", .{out});
+        return error.NotSaid;
+    };
+    const line = out[at..][0 .. std.mem.indexOfScalar(u8, out[at..], '\n') orelse out.len - at];
+    try std.testing.expect(std.mem.indexOf(u8, line, " regs, ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "B shared, up to ") != null);
+    // the label is the kernel's, the address its code's
+    var hex: [24]u8 = undefined;
+    const want = try std.fmt.bufPrint(&hex, "at 0x{x} ", .{eng_l.progs[0].code.gpu});
+    try std.testing.expect(std.mem.indexOf(u8, line, want) != null);
+    eng_l.freeImage(&a);
+    eng_l.freeImage(&b);
 }

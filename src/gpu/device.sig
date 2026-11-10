@@ -272,7 +272,9 @@ test "device: barriers only where a dispatch meets what came before" {
     try std.testing.expect(h.barrierBefore(&.{ .prog = &prog_rw, .groups = .{ 1, 1, 1 }, .buffers = &.{ .{ .gpu = 0x2080, .bytes = 16 }, c }, .params = &.{} }));
 }
 /// A Binary placed in device memory.
-pub const Program = struct { bin: Binary, code: Buffer };
+/// A loaded kernel. `label`: a name for logs (the kernel's), the caller's
+/// to set; loaders leave it empty.
+pub const Program = struct { bin: Binary, code: Buffer, label: []const u8 = "" };
 
 pub const Dispatch = struct {
     prog: *const Program,
