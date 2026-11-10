@@ -53,8 +53,10 @@ const D_LAYERS = D_AT + engine.MAX_LEVELS;
 const D_IMAGE_LEVELS = D_LAYERS + 1;
 pub const DESC_WORDS = D_IMAGE_LEVELS + 1;
 
-// D_FMT: log2 of the texel's bytes (bits 0..2), its kind (4..5), its
-// channels (8..10), sRGB (12), a texture there (13)
+// D_FMT: log2 of the texel's bytes (bits 0..2), its kind (4..6:
+// unorm16 is 4, its bits 4..5 reading as unorm8's and bit 6 saying two
+// bytes a channel), its channels (8..10), sRGB (12), a texture there (13)
+const F_WIDE: u32 = 1 << 6;
 const F_SRGB: u32 = 1 << 12;
 const F_VALID: u32 = 1 << 13;
 const F_DEPTH: u32 = 1 << 14;
@@ -202,12 +204,22 @@ fn texel(k: *kir.Kernel, b: u8, d: D, lv: Lvl, x: Arg, y: Arg, kind: Kind) [4]Ar
     const unorm = k.cmp(.u32, .eq, r(k.op3(.bfe, .u32, r(d.fmt), u(4), u(2))), u(0));
     const byte0 = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(addr), u(3))), u(3));
     const srgb = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_SRGB))), u(0));
+    const wide = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_WIDE))), u(0));
     for (&out, 0..) |*o, c| {
         const byte = k.op3(.bfe, .u32, r(words[0]), r(k.op2(.iadd, .u32, r(byte0), u(@intCast(8 * c)))), u(8));
         // (times 1/255, not a division: an exact division keeps registers
         // in a loop on ir3; the same bits on every device all the same)
         var un = k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(byte))), f(1.0 / 255.0));
         if (c < 3) un = srgbToLinear(k, un, srgb);
+        if (c < 2) {
+            // unorm16 (R16, GR1616): two bytes a channel, times 1/65535;
+            // an R16's texel at byte 0 or 2 of its word, a GR1616's G at 2
+            // (the offset masked to 0 or 16: one shift-and-mask on ir3)
+            const at: Arg = if (c == 0) r(k.op2(.@"and", .u32, r(byte0), u(16))) else u(16);
+            const half = k.op3(.bfe, .u32, r(words[0]), at, u(16));
+            const un16 = k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(half))), f(1.0 / 65535.0));
+            un = k.sel(.f32, r(wide), r(un16), r(un));
+        }
         var v = k.sel(.f32, r(unorm), r(un), r(k.mov(.f32, r(words[c]))));
         if (c == 0) {
             const depth = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_DEPTH))), u(0));

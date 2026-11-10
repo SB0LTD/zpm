@@ -608,6 +608,19 @@ const StencilState = struct {
     }
 };
 
+/// GL's internal format for an EGLImage's memory (a dma-buf's format:
+/// egl.sig's fourccs).
+fn imageInternal(f: Format) u32 {
+    return switch (f) {
+        .bgra8 => g.BGRA8_EXT,
+        .r8 => g.R8,
+        .rg8 => g.RG8,
+        .r16 => g.R16_EXT,
+        .rg16 => g.RG16_EXT,
+        else => g.RGBA8,
+    };
+}
+
 fn stencilOpOf(op: u32) ?raster.StencilOp {
     return switch (op) {
         g.KEEP => .keep,
@@ -1697,11 +1710,30 @@ pub const Context = struct {
         t.disconnectStream();
         c.eng.freeImage(&t.img);
         t.img = engine.alias(src);
-        t.internal = if (src.format == .bgra8) g.BGRA8_EXT else g.RGBA8;
+        t.internal = imageInternal(src.format);
         t.levels = 1;
         t.defined = 1;
         t.fswz = .{ 0, 1, 2, 3 };
         t.srgb = false;
+    }
+
+    /// EGL_KHR_gl_texture_2D_image: level 0 of texture `name` (a
+    /// TEXTURE_2D of this context's share group) as an EGLImage's memory,
+    /// `sh` holding it and the texture its first name. Its memory moves to
+    /// a GPU buffer of its own first (engine.shareOwn), so the image's
+    /// dma-buf can be exported (EGL_MESA_image_dma_buf_export: Firefox's
+    /// dma-buf surfaces are textures made so).
+    pub fn textureImage(c: *Context, name: u32, sh: *engine.Shared) error{ BadParameter, BadMatch, BadAccess, BadAlloc }!*Image {
+        if (name == 0) return error.BadParameter;
+        const t = madeIn(Tex, &c.objs.tex, name) orelse return error.BadParameter;
+        if (t.target != g.TEXTURE_2D) return error.BadParameter;
+        if (!t.img.live() or t.defined & 1 == 0) return error.BadMatch;
+        // (an EGLImage's sibling already: EGL_KHR_image_base's BAD_ACCESS;
+        // or its levels are framebuffer slices)
+        if (t.img.share != null or !t.img.own or t.img.top_down) return error.BadAccess;
+        t.disconnectStream();
+        if (!c.eng.shareOwn(&t.img, sh)) return error.BadAlloc;
+        return &t.img;
     }
 
     pub fn streamTexture(c: *Context) ?*Tex {
@@ -1715,9 +1747,11 @@ pub const Context = struct {
         const rb = madeIn(Rb, &c.objs.rbs, c.rb) orelse return c.fail(g.INVALID_OPERATION);
         const resolve = egl_image orelse return c.fail(g.INVALID_OPERATION);
         const src = resolve(image) orelse return c.fail(g.INVALID_VALUE);
+        // (a renderbuffer is drawn into: no unorm16 plane)
+        if (!src.format.renderable()) return c.fail(g.INVALID_OPERATION);
         c.eng.freeImage(&rb.img);
         rb.img = engine.alias(src);
-        rb.internal = if (src.format == .bgra8) g.BGRA8_EXT else g.RGBA8;
+        rb.internal = imageInternal(src.format);
         rb.samples = 0;
     }
 

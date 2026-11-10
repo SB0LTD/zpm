@@ -28,9 +28,14 @@
 //!   sync_file fd, polled; owned and closed with the sync).
 //! - **Images.** EGL_KHR_image_base with EGL_EXT_image_dma_buf_import
 //!   (and _modifiers): a single-plane linear ARGB8888, XRGB8888, ABGR8888
-//!   or XBGR8888 dma-buf, imported into this context (PRIME), as GL's
-//!   textures and renderbuffers (gles: OES_EGL_image) name it, the memory
-//!   shared and freed with its last name.
+//!   or XBGR8888 dma-buf, or one plane of a video picture (R8 and GR88:
+//!   NV12's; R16 and GR1616: P010's), imported into this context (PRIME),
+//!   as GL's textures and renderbuffers (gles: OES_EGL_image) name it, the
+//!   memory shared and freed with its last name. EGL_KHR_gl_texture_2D_image:
+//!   a texture's level 0 as an image, its memory moved to a buffer of its
+//!   own. EGL_MESA_image_dma_buf_export: either kind out as one linear
+//!   plane (Firefox's dma-buf surfaces: a texture made, exported, imported
+//!   by its compositor).
 //!
 //! - **The driver lock.** One lock for the process, the outermost: every
 //!   EGL call and every GL call (libgles.sig's entry points) holds it from
@@ -208,7 +213,16 @@ pub const IMAGE_PRESERVED_KHR: i32 = 0x30D2;
 const MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 pub const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
 pub const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258;
-pub const dma_buf_formats = [_]u32{ wayland.DRM_FORMAT_ARGB8888, wayland.DRM_FORMAT_XRGB8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888 };
+// a video picture's planes, each imported alone (VA-API's PRIME
+// descriptors as Firefox imports them: SEPARATE_LAYERS)
+pub const DRM_FORMAT_R8: u32 = 0x2020_3852; // 'R8  '
+pub const DRM_FORMAT_GR88: u32 = 0x3838_5247; // 'GR88': R in byte 0, G in 1
+pub const DRM_FORMAT_R16: u32 = 0x2036_3152; // 'R16 '
+pub const DRM_FORMAT_GR1616: u32 = 0x3233_5247; // 'GR32': R in bytes 0..1, G in 2..3
+pub const dma_buf_formats = [_]u32{ wayland.DRM_FORMAT_ARGB8888, wayland.DRM_FORMAT_XRGB8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_R8, DRM_FORMAT_GR88, DRM_FORMAT_R16, DRM_FORMAT_GR1616 };
+// EGL_KHR_gl_texture_2D_image
+pub const GL_TEXTURE_2D_KHR: u32 = 0x30B1;
+pub const GL_TEXTURE_LEVEL_KHR: i32 = 0x30BC;
 
 pub const VERSION_STRING: [:0]const u8 = "1.5 Galaxy";
 pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_device_base EGL_EXT_device_enumeration EGL_EXT_device_query EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_wayland EGL_MESA_platform_surfaceless";
@@ -221,7 +235,7 @@ pub const DRM_RENDER_NODE_FILE_EXT: i32 = 0x3377;
 pub const RENDER_NODE: [:0]const u8 = "/dev/dri/renderD128";
 const DISPLAY_COMMON = "EGL_EXT_buffer_age EGL_EXT_create_context_robustness EGL_EXT_swap_buffers_with_damage EGL_KHR_create_context EGL_KHR_fence_sync EGL_KHR_get_all_proc_addresses EGL_KHR_no_config_context EGL_KHR_partial_update EGL_KHR_stream EGL_KHR_stream_consumer_gltexture EGL_KHR_stream_producer_eglsurface EGL_KHR_surfaceless_context EGL_KHR_swap_buffers_with_damage EGL_KHR_wait_sync";
 const FENCE_EXTENSIONS = " EGL_ANDROID_native_fence_sync";
-const DMA_EXTENSIONS = " EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers EGL_KHR_image_base EGL_MESA_image_dma_buf_export";
+const DMA_EXTENSIONS = " EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers EGL_KHR_gl_texture_2D_image EGL_KHR_image_base EGL_MESA_image_dma_buf_export";
 pub const DISPLAY_EXTENSIONS: [:0]const u8 = DISPLAY_COMMON ++ FENCE_EXTENSIONS ++ DMA_EXTENSIONS;
 const ANDROID_EXTENSIONS = " EGL_ANDROID_get_native_client_buffer EGL_ANDROID_image_native_buffer";
 const ANGLE_EXTENSIONS = " EGL_ANGLE_query_surface_pointer";
@@ -1902,8 +1916,10 @@ pub const EImage = struct {
     display: ?*Display = null,
     img: Image = .{},
     shared: engine.Shared = .{},
-    // An independent reference for the MESA export API.
+    // An independent reference for the MESA export API (a texture's:
+    // exported at its first export).
     fd: i32 = -1,
+    /// its DRM format (0: none, so no export: a float texture's)
     fourcc: i32 = 0,
     offset: i32 = 0,
 };
@@ -1940,23 +1956,43 @@ fn dropImage(m: *EImage) void {
     m.display.?.eng.?.freeImage(&m.img);
 }
 
-/// A dma-buf fourcc as the engine's format, and whether it has alpha.
+/// A dma-buf fourcc as the engine's format, and whether it has alpha
+/// (or no alpha byte to ignore: a plane's).
 fn fourccOf(f: u32) ?struct { format: engine.Format, alpha: bool } {
     return switch (f) {
         wayland.DRM_FORMAT_ARGB8888 => .{ .format = .bgra8, .alpha = true },
         wayland.DRM_FORMAT_XRGB8888 => .{ .format = .bgra8, .alpha = false },
         DRM_FORMAT_ABGR8888 => .{ .format = .rgba8, .alpha = true },
         DRM_FORMAT_XBGR8888 => .{ .format = .rgba8, .alpha = false },
+        DRM_FORMAT_R8 => .{ .format = .r8, .alpha = true },
+        DRM_FORMAT_GR88 => .{ .format = .rg8, .alpha = true },
+        DRM_FORMAT_R16 => .{ .format = .r16, .alpha = true },
+        DRM_FORMAT_GR1616 => .{ .format = .rg16, .alpha = true },
         else => null,
     };
 }
 
-/// eglCreateImage and eglCreateImageKHR: EGL_LINUX_DMA_BUF_EXT, one plane.
-/// The fd stays the caller's. The image holds its own copy for export.
+/// An image's memory as a dma-buf's fourcc (0: none has its layout).
+fn fourccFor(img: *const Image) u32 {
+    return switch (img.format) {
+        .rgba8 => if (img.no_alpha) DRM_FORMAT_XBGR8888 else DRM_FORMAT_ABGR8888,
+        .bgra8 => if (img.no_alpha) wayland.DRM_FORMAT_XRGB8888 else wayland.DRM_FORMAT_ARGB8888,
+        .r8 => DRM_FORMAT_R8,
+        .rg8 => DRM_FORMAT_GR88,
+        .r16 => DRM_FORMAT_R16,
+        .rg16 => DRM_FORMAT_GR1616,
+        else => 0,
+    };
+}
+
+/// eglCreateImage and eglCreateImageKHR: EGL_LINUX_DMA_BUF_EXT, one plane
+/// (the fd stays the caller's; the image holds its own copy for export),
+/// or EGL_GL_TEXTURE_2D_KHR, a texture of `ctx`.
 pub fn createImage(comptime T: type, handle: ?*anyopaque, ctx: ?*anyopaque, target: u32, buffer: ?*anyopaque, attribs: ?[*]const T) ?*EImage {
     lock();
     defer unlock();
     const d = ready(handle) orelse return null;
+    if (target == GL_TEXTURE_2D_KHR) return textureImage(T, d, ctx, buffer, attribs);
     if (target == 0x3140) { // EGL_NATIVE_BUFFER_ANDROID
         if (ctx != null) return fail(?*EImage, BAD_CONTEXT, null);
         const client = buffer orelse return fail(?*EImage, BAD_PARAMETER, null);
@@ -2013,6 +2049,43 @@ pub fn createImage(comptime T: type, handle: ?*anyopaque, ctx: ?*anyopaque, targ
     return importLinearImage(d, fd, width, height, code, pitch, offset);
 }
 
+/// EGL_KHR_gl_texture_2D_image: level 0 of texture `buffer` (its name)
+/// of `ctx`'s share group.
+fn textureImage(comptime T: type, d: *Display, ctx: ?*anyopaque, buffer: ?*anyopaque, attribs: ?[*]const T) ?*EImage {
+    if (!hasDmaImport(driver.?)) return fail(?*EImage, BAD_PARAMETER, null);
+    const c = contextOf(ctx, d) orelse return fail(?*EImage, BAD_CONTEXT, null);
+    if (attribs) |list| {
+        var i: usize = 0;
+        while (list[i] != NONE) : (i += 2) {
+            const v: i64 = @intCast(list[i + 1]);
+            switch (@as(i32, @intCast(list[i]))) {
+                // (level 0 only: an image of a mipmap level is not had)
+                GL_TEXTURE_LEVEL_KHR => if (v != 0) return fail(?*EImage, BAD_MATCH, null),
+                IMAGE_PRESERVED_KHR => {},
+                else => return fail(?*EImage, BAD_ATTRIBUTE, null),
+            }
+        }
+    }
+    const name = std.math.cast(u32, @intFromPtr(buffer)) orelse return fail(?*EImage, BAD_PARAMETER, null);
+    const slot = for (&eimages) |*x| {
+        if (!x.alive and x.shared.refs == 0) break x;
+    } else return fail(?*EImage, BAD_ALLOC, null);
+    const tex = c.gl.textureImage(name, &slot.shared) catch |e| return fail(?*EImage, switch (e) {
+        error.BadParameter => BAD_PARAMETER,
+        error.BadMatch => BAD_MATCH,
+        error.BadAccess => BAD_ACCESS,
+        error.BadAlloc => BAD_ALLOC,
+    }, null);
+    // (the texture's memory is held by the slot's Shared now: this name too)
+    slot.alive = true;
+    slot.display = d;
+    slot.fd = -1;
+    slot.offset = 0;
+    slot.fourcc = @bitCast(fourccFor(tex));
+    slot.img = engine.alias(tex);
+    return ok(?*EImage, slot);
+}
+
 pub fn androidClientBuffer(buffer: ?*const anyopaque) ?*anyopaque {
     lock();
     defer unlock();
@@ -2025,8 +2098,10 @@ pub fn androidClientBuffer(buffer: ?*const anyopaque) ?*anyopaque {
 
 fn importLinearImage(d: *Display, fd: i64, width: i64, height: i64, code: u32, pitch: i64, offset: i64) ?*EImage {
     const f = fourccOf(code) orelse return fail(?*EImage, BAD_MATCH, null);
+    const bpp: i64 = f.format.bytes();
     if (fd < 0 or offset < 0 or width <= 0 or height <= 0 or width > MAX_SIZE or height > MAX_SIZE) return fail(?*EImage, BAD_PARAMETER, null);
-    if (pitch < width * 4 or @mod(pitch, 4) != 0 or @mod(offset, 4) != 0) return fail(?*EImage, BAD_ACCESS, null);
+    // (rows of whole words: a texel is read from its aligned word)
+    if (pitch < width * bpp or @mod(pitch, 4) != 0 or @mod(offset, 4) != 0) return fail(?*EImage, BAD_ACCESS, null);
     const slot = for (&eimages) |*x| {
         if (!x.alive and x.shared.refs == 0) break x;
     } else return fail(?*EImage, BAD_ALLOC, null);
@@ -2040,7 +2115,7 @@ fn importLinearImage(d: *Display, fd: i64, width: i64, height: i64, code: u32, p
         return fail(?*EImage, BAD_PARAMETER, null);
     };
     slot.* = .{ .alive = true, .display = d, .fd = saved_fd, .fourcc = @bitCast(code), .offset = @intCast(offset) };
-    const need = offset + pitch * (height - 1) + width * 4;
+    const need = offset + pitch * (height - 1) + width * bpp;
     if (@as(u64, @intCast(need)) > whole.bytes or @as(u64, @intCast(need)) > whole.cpu.len) {
         // (the import goes again: a picture larger than its buffer)
         slot.img = engine.adopt(&slot.shared, whole, 0, 1, 1, 4, f.format);
@@ -2061,12 +2136,14 @@ pub fn destroyImage(handle: ?*anyopaque, image: ?*anyopaque) bool {
     return ok(bool, true);
 }
 
-/// Export metadata for the linear, single-plane images supported here.
+/// Export metadata for the linear, single-plane images supported here
+/// (modifier 0: DRM_FORMAT_MOD_LINEAR).
 pub fn exportDmaBufQuery(handle: ?*anyopaque, image: ?*anyopaque, fourcc: ?*i32, planes: ?*i32, modifier: ?*u64) bool {
     lock();
     defer unlock();
     const d = ready(handle) orelse return false;
     const m = imageOf(image, d) orelse return fail(bool, BAD_PARAMETER, false);
+    if (m.fourcc == 0) return fail(bool, BAD_MATCH, false);
     if (fourcc) |p| p.* = m.fourcc;
     if (planes) |p| p.* = 1;
     if (modifier) |p| p.* = 0;
@@ -2078,8 +2155,15 @@ pub fn exportDmaBuf(handle: ?*anyopaque, image: ?*anyopaque, fd: ?*i32, stride: 
     defer unlock();
     const d = ready(handle) orelse return false;
     const m = imageOf(image, d) orelse return fail(bool, BAD_PARAMETER, false);
+    if (m.fourcc == 0) return fail(bool, BAD_MATCH, false);
     if (fd) |p| {
         const h = driver.?.host;
+        if (m.fd < 0) {
+            // (a texture's buffer, out the first time: the whole of it)
+            const got = h.exportFd(h.ctx, m.shared.buf);
+            if (got < 0) return fail(bool, BAD_ALLOC, false);
+            m.fd = @intCast(got);
+        }
         const copy = h.dup(h.ctx, m.fd);
         if (copy < 0) return fail(bool, BAD_ALLOC, false);
         p.* = copy;
