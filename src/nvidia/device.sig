@@ -33,6 +33,8 @@ const sm120_asm = @import("sm120_asm.sig");
 const emu = @import("sm120_emu.sig");
 const qmd = @import("qmd.sig");
 const push = @import("push.sig");
+const emu3d = @import("emu3d.sig");
+const gr = @import("draw.sig");
 
 pub const Error = error{
     OutOfMemory,
@@ -160,6 +162,10 @@ pub const EmuDevice = struct {
     n_icache: usize = 0,
     /// The program in the emulator now.
     loaded: ?struct { va: u64, sum: u64, n: usize } = null,
+    /// The 3D engine (the caller's storage), or none: the class is then
+    /// not on this device, as on a channel no BLACKWELL_B object was
+    /// allocated for, and binding it is a refused stream.
+    gr3d: ?*emu3d.Engine = null,
 
     pub fn device(e: *EmuDevice) Device {
         return .{ .ctx = e, .vtable = &vtable };
@@ -363,12 +369,19 @@ pub const EmuDevice = struct {
 
     fn method(e: *EmuDevice, subch: u3, m: u32, v: u32) anyerror!void {
         if (m == push.SET_OBJECT) {
-            // (compute is the class this GPU emulates)
-            if (v != push.BLACKWELL_COMPUTE_B) return error.BadStream;
+            // (compute, and the 3D engine where the device has one)
+            if (v != push.BLACKWELL_COMPUTE_B and !(v == gr.BLACKWELL_B and e.gr3d != null)) return error.BadStream;
             e.subch[subch] = v;
             return;
         }
         if (m < 0x100) return e.host(m, v);
+        if (e.subch[subch] == gr.BLACKWELL_B) {
+            const g = e.gr3d orelse return error.BadStream;
+            // (a draw runs its programs in the emulator: a kernel's is
+            // loaded again at its next launch)
+            e.loaded = null;
+            return g.method(.{ .mem = e.memory(), .work = e.work }, m, v);
+        }
         if (e.subch[subch] != push.BLACKWELL_COMPUTE_B or m / 4 >= METHODS) return error.BadStream;
         e.methods[m / 4] = v;
         switch (m) {

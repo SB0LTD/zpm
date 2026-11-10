@@ -21,6 +21,8 @@ pub const sph = @import("sph.sig");
 pub const push = @import("push.sig");
 pub const sm120_emu = @import("sm120_emu.sig");
 pub const device = @import("device.sig");
+/// The emulated RTX's 3D engine (what EmuDevice does with draw.sig's methods).
+pub const emu3d = @import("emu3d.sig");
 /// Rectangles drawn by the RTX's 3D engine (the methods, the programs, a
 /// renderer over any Device).
 pub const draw = @import("draw.sig");
@@ -34,5 +36,6 @@ test {
     _ = push;
     _ = sm120_emu;
     _ = device;
+    _ = emu3d;
     _ = draw;
 }

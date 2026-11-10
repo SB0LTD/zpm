@@ -36,7 +36,9 @@
 //!
 //! Colors are premultiplied, four floats (r, g, b, a) in [0, 1].
 //!
-//! Nothing here has run on the Legion's RTX yet.
+//! On the emulated RTX (emu3d.sig) the interface's eleven cases are the
+//! CPU reference's within 2 of 255. Nothing here has run on the Legion's
+//! RTX yet.
 //!
 //! Allocation-free: four device buffers (the programs, the pools, the
 //! records, the pushbuffer), sized at init.
@@ -1069,4 +1071,143 @@ test "the stream: a target, a rectangle's nine dwords" {
     try testing.expectEqualSlices(u32, &.{ bits(32), bits(16), bits(1), bits(32), bits(16), bits(0) }, w[i + 1 ..][0..6]);
     // and the scissor, the whole target, last
     try testing.expectEqualSlices(u32, &.{ 0x2003_0380, 1, 64 << 16, 32 << 16 }, w[w.len - 4 ..]);
+}
+
+// ── Tests: the passes on the emulated RTX ───────────────────────────────────
+
+const emu = @import("sm120_emu.sig");
+const emu3d = @import("emu3d.sig");
+
+const T = struct {
+    var arena: [8 << 20]u8 align(4096) = undefined;
+    var gpu_view: [8 << 20]u8 align(4096) = undefined;
+    var work: emu.Work = .{};
+    var engine: emu3d.Engine = .{};
+    var dev: device.EmuDevice = undefined;
+    var r: Renderer = undefined;
+    var pixels: Buffer = undefined;
+
+    const W = 64;
+    const H = 32;
+
+    /// A fresh device with its 3D engine, the renderer on it, a target.
+    fn start() !Target {
+        engine = .{};
+        dev = .{ .arena = &arena, .gpu_view = &gpu_view, .work = &work, .gr3d = &engine };
+        try r.init(dev.device(), &test_work, .{ .stream_bytes = 64 * 1024, .rects = 64, .textures = 15 });
+        pixels = try dev.device().alloc(W * H * 4);
+        return .{ .va = pixels.va, .width = W, .height = H, .pitch = W * 4 };
+    }
+
+    /// The pass run and its pixels fetched; what the engine or a program
+    /// tripped over said when it did not finish.
+    fn finish() !void {
+        r.run(1_000_000) catch |e| {
+            var buf: [400]u8 = undefined;
+            std.debug.print("the pass did not finish ({s}): {s} {s}\n", .{ @errorName(e), engine.why, emu.explain(&work, &buf) });
+            return e;
+        };
+        dev.device().fromDevice(pixels, 0, W * H * 4);
+    }
+
+    fn at(x: u32, y: u32) u32 {
+        return std.mem.readInt(u32, pixels.cpu[(y * W + x) * 4 ..][0..4], .little);
+    }
+};
+
+fn expectPixel(want: u32, x: u32, y: u32) !void {
+    const got = T.at(x, y);
+    if (got == want) return;
+    std.debug.print("pixel ({d}, {d}) is {x:0>8}, not {x:0>8}\n", .{ x, y, got, want });
+    return error.TestUnexpectedResult;
+}
+
+test "solid rectangles on the emulated RTX: where the rasterizer puts them, the scissor, the blend" {
+    const t = try T.start();
+    defer T.r.deinit();
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, 64, 32 }, .{ 0, 0, 1, 1 }, .replace);
+    T.r.fill(.{ 4, 2, 20, 10 }, .{ 1, 0, 0, 1 }, .replace);
+    T.r.scissor(40, 20, 50, 30);
+    T.r.fill(.{ 0, 0, 64, 32 }, .{ 1, 1, 1, 1 }, .replace);
+    T.r.scissor(0, 0, 64, 32);
+    T.r.fill(.{ 0, 24, 8, 32 }, .{ 0, 0.5, 0, 0.5 }, .over);
+    // (edges through pixel centres: the left and the top take them)
+    T.r.fill(.{ 30.5, 4.5, 32.5, 6.5 }, .{ 0, 1, 0, 1 }, .replace);
+    try T.finish();
+    const blue: u32 = 0xff00_00ff;
+    const red: u32 = 0xffff_0000;
+    try expectPixel(blue, 0, 0);
+    try expectPixel(blue, 63, 31);
+    try expectPixel(red, 4, 2);
+    try expectPixel(red, 19, 9);
+    try expectPixel(blue, 3, 2);
+    try expectPixel(blue, 4, 1);
+    try expectPixel(blue, 20, 9);
+    try expectPixel(blue, 19, 10);
+    try expectPixel(0xffff_ffff, 40, 20);
+    try expectPixel(0xffff_ffff, 49, 29);
+    try expectPixel(blue, 39, 20);
+    try expectPixel(blue, 50, 29);
+    try expectPixel(blue, 49, 30);
+    try expectPixel(0xff00_8080, 0, 24);
+    try expectPixel(0xff00_8080, 7, 31);
+    try expectPixel(blue, 8, 31);
+    try expectPixel(0xff00_ff00, 30, 4);
+    try expectPixel(0xff00_ff00, 31, 5);
+    try expectPixel(blue, 32, 5);
+    try expectPixel(blue, 31, 6);
+    try testing.expectEqual(@as(u32, 5), T.r.stats.rects);
+    try testing.expectEqual(@as(u32, 1), T.r.stats.programs);
+    try testing.expectEqual(@as(u64, 5), T.engine.draws);
+}
+
+test "an image and a mask on the emulated RTX: texel for texel, tinted, coverage times a color" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    const tb = try d.alloc(4096);
+    // a 4 x 2 picture in rows of 32 bytes, and a 4 x 1 mask after it
+    for (0..2) |y| for (0..4) |x| {
+        std.mem.writeInt(u32, tb.cpu[y * 32 + x * 4 ..][0..4], 0xff00_0000 | @as(u32, @intCast(x * 64 << 16 | y * 128 << 8 | 0x33)), .little);
+    };
+    tb.cpu[64..68].* = .{ 0, 85, 170, 255 };
+    d.toDevice(tb, 0, 4096);
+    const picture = Texture{ .va = tb.va, .width = 4, .height = 2, .pitch = 32, .format = .bgra8, .filter = .nearest };
+    const coverage_of = Texture{ .va = tb.va + 64, .width = 4, .height = 1, .pitch = 32, .format = .r8, .filter = .nearest };
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, 64, 32 }, .{ 0, 0, 0, 1 }, .replace);
+    T.r.image(.{ 2, 1, 6, 3 }, picture, .{ 0, 0, 4, 2 }, .{ 1, 1, 1, 1 }, .replace);
+    T.r.image(.{ 10, 1, 14, 3 }, picture, .{ 0, 0, 4, 2 }, .{ 0.5, 0.5, 0.5, 0.5 }, .replace);
+    T.r.mask(.{ 20, 1, 24, 2 }, coverage_of, .{ 0, 0, 4, 1 }, .{ 1, 1, 1, 1 }, .over);
+    try T.finish();
+    try expectPixel(0xff00_0033, 2, 1);
+    try expectPixel(0xffc0_0033, 5, 1);
+    try expectPixel(0xff40_8033, 3, 2);
+    try expectPixel(0xff00_0000, 6, 1);
+    // half of each channel (0x33 -> 0x1a: 25.5 rounds up)
+    try expectPixel(0x8060_001a, 13, 1);
+    // white through the coverage, over opaque black
+    try expectPixel(0xff00_0000, 20, 1);
+    try expectPixel(0xff55_5555, 21, 1);
+    try expectPixel(0xffaa_aaaa, 22, 1);
+    try expectPixel(0xffff_ffff, 23, 1);
+    try testing.expectEqual(@as(u32, 2), T.r.stats.bindings);
+}
+
+test "a target the engine would misread is refused: by the renderer, and by the emulated engine" {
+    _ = try T.start();
+    defer T.r.deinit();
+    // rows of 240 bytes: not a multiple of 128
+    T.r.begin(.{ .va = T.pixels.va, .width = 60, .height = 32, .pitch = 240 });
+    T.r.fill(.{ 0, 0, 8, 8 }, .{ 1, 1, 1, 1 }, .replace);
+    try testing.expectError(error.BadStream, T.r.submit());
+    // the same stream handed over all the same: the engine says why
+    try testing.expectError(error.DeviceLost, T.r.dev.run(T.r.pb, @intCast(T.r.p.len), 1_000_000));
+    try testing.expect(std.mem.indexOf(u8, T.engine.why, "128 bytes") != null);
+    // and with no 3D engine on the device, the class itself is refused
+    T.dev.gr3d = null;
+    T.r.begin(.{ .va = T.pixels.va, .width = 64, .height = 32, .pitch = 256 });
+    T.r.fill(.{ 0, 0, 8, 8 }, .{ 1, 1, 1, 1 }, .replace);
+    try testing.expectError(error.DeviceLost, T.r.run(1_000_000));
 }

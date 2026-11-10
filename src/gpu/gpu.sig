@@ -23,6 +23,8 @@ pub const nvidia_device = @import("nvidia_device.sig");
 pub const draw = @import("draw.sig");
 /// The Adreno's graphics pipeline (adreno/draw.sig) as a draw.Renderer.
 pub const adreno_draw = @import("adreno_draw.sig");
+/// The RTX's 3D engine as a draw.Renderer (the adapter over nvidia/draw.sig).
+pub const nvidia_draw = @import("nvidia_draw.sig");
 
 // KIR
 pub const Ty = kir.Ty;
@@ -86,4 +88,5 @@ test {
     _ = amd_device;
     _ = draw;
     _ = adreno_draw;
+    _ = nvidia_draw;
 }
