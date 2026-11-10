@@ -1,5 +1,6 @@
-//! @zpm/nvidia sm120_emu — a functional emulator of sm_120 compute kernels,
-//! with the timing hazards the hardware does not check.
+//! @zpm/nvidia sm120_emu — a functional emulator of sm_120 compute kernels
+//! (and of a vertex and a pixel program: "Graphics stages" below), with the
+//! timing hazards the hardware does not check.
 //!
 //! Kernels for the RTX 5070 run here first, on the CPU: the same
 //! instructions the SMs get (decoded from their words with sm120.decode, or
@@ -66,7 +67,25 @@
 //! nvdisasm prints them. Where sm120_sched has no latency categories for a
 //! form yet, NAK's are used here (`fallbackUses`) until it does.
 //!
+//! Graphics stages. A vertex or a pixel program runs here too, for the
+//! emulated 3D engine: `stageBegin` starts its threads and `stageRun` runs
+//! them to EXIT in warps of 32, with the same timing checks. A `Stage` holds
+//! what the engine gives them and takes back: each thread's attribute words
+//! (what ALD loads in a vertex program, what IPA reads in a pixel program,
+//! already carried across the triangle by the engine as the header says),
+//! the words a vertex program stores with AST, the pixels KILL discarded,
+//! the constant buffers, and the engine's own texture sampling (TEX, TLD).
+//! A pixel program's colour is what R0..R3 hold at EXIT. With the program's
+//! header (sph.sig) in the Stage, a program that does what its header does
+//! not declare, or leaves undone what it declares, is error.HeaderMismatch.
+//! What a Stage has no data for (PIXLD, IPA away from the pixel's centre,
+//! local memory), the forms NAK never emits and the meanings no reference
+//! settles are error.Unsupported; a stage's instruction in a compute launch,
+//! a compute launch's in a stage, or one stage's in the other, is
+//! error.BadInstruction. `explain` says which.
+//!
 //! Allocation-free: the caller owns the Work (about 9 MB: keep it static).
+//! A Stage's attribute words are the caller's too.
 
 const std = @import("std");
 const sm120 = @import("sm120.sig");
@@ -74,6 +93,7 @@ const sm120_asm = @import("sm120_asm.sig");
 const sched = @import("sm120_sched.sig");
 const lat = @import("sm120_latency.sig");
 const qmd = @import("qmd.sig");
+const sph = @import("sph.sig");
 
 const Instr = sm120.Instr;
 const Operand = sm120.Operand;
@@ -105,7 +125,10 @@ const NO_PC: u32 = std.math.maxInt(u32);
 const POISON: u32 = 0xdead_beef;
 
 pub const Error = sm120.Error || error{
-    /// An instruction that does not decode (or parse), or a pc past the code.
+    /// An instruction that does not decode (or parse), a pc past the code,
+    /// or an instruction that does not belong where it ran (a graphics
+    /// stage's in a compute launch, a compute launch's in a stage, a vertex
+    /// program's in a pixel program or the other way).
     BadInstruction,
     /// A form this emulator does not run.
     Unsupported,
@@ -120,6 +143,11 @@ pub const Error = sm120.Error || error{
     /// memory, its block).
     BadLaunch,
     TooManyInstructions,
+    /// A stage's program and its header disagree: the program loads or
+    /// stores an attribute word, or discards, and the header does not say
+    /// so; or the header says it stores a word, or writes a colour, and a
+    /// thread reached EXIT without doing it.
+    HeaderMismatch,
 };
 
 // ── Memory ──────────────────────────────────────────────────────────────────
@@ -193,9 +221,69 @@ pub const Stats = struct {
     hazard_checks: u64 = 0,
 };
 
+// ── Graphics stages ─────────────────────────────────────────────────────────
+
+/// The attribute words a stage's instructions address (ALD, AST, IPA):
+/// byte addresses 0x000..0x2fc, a word each. The position is words
+/// 0x70 / 4 on, generic vector n's component c word (0x80 + 16n + 4c) / 4,
+/// the instance's index word 0x2f8 / 4, the vertex's 0x2fc / 4 (sph.sig).
+pub const ATTR_WORDS = 0x300 / 4;
+
+/// What the 3D engine gives a vertex or a pixel program's threads, and
+/// takes back from them. One entry of each slice a thread, thread 0 first.
+pub const Stage = struct {
+    /// A vertex program (ALD, AST) or a pixel program (IPA, KILL).
+    kind: sph.Stage,
+    /// The program's header (sph.sig). With it, a program that does what
+    /// its header does not declare, or leaves undone what it declares, is
+    /// error.HeaderMismatch (`Why` lists the cases), and a header of the
+    /// other kind is a bad launch. Null: none of that is checked.
+    header: ?*const [sph.WORDS]u32 = null,
+    /// A thread's attribute words. A vertex program's: what ALD loads (the
+    /// engine writes the vertex's index at word 0x2fc / 4, the instance's
+    /// at 0x2f8 / 4, a vertex buffer's words where the streams put them).
+    /// A pixel program's: what IPA reads at that pixel's centre, already
+    /// carried across the triangle by the engine as the header says (flat,
+    /// linear on the screen, or, for perspective, the word over w, with
+    /// 1/w at 0x7c / 4: the program does the multiply itself).
+    in: []const [ATTR_WORDS]u32 = &.{},
+    /// A vertex program's stored words (AST), and which of them a thread
+    /// stored: bit i % 32 of stored[thread][i / 32] for word i. stageRun
+    /// clears the bits first; a word no thread stored is left as it was.
+    out: [][ATTR_WORDS]u32 = &.{},
+    stored: [][ATTR_WORDS / 32]u32 = &.{},
+    /// A pixel program's threads that executed KILL: their colour is not
+    /// to be written. stageRun clears them first. (The thread itself runs
+    /// on to its EXIT, as the hardware's does: see `stageLane`.)
+    killed: []bool = &.{},
+    /// The constant buffers' bytes, as a launch's: LDC c[0x1][0x10] reads
+    /// cbufs[1] at 0x10. A stage's instruction naming one past them traps.
+    cbufs: [qmd.CBUFS][]const u8 = .{&.{}} ** qmd.CBUFS,
+    /// Passed to the callbacks.
+    ctx: ?*anyopaque = null,
+    /// TEX: the texture and sampler `handle` names (the bindless word:
+    /// the texture header's index in bits 19..0, the sampler's in 31..20)
+    /// sampled at (x, y): red, green, blue, alpha. Null: TEX traps.
+    sample: ?*const fn (ctx: ?*anyopaque, handle: u32, x: f32, y: f32) Error![4]f32 = null,
+    /// TLD: texel (x, y) of level `lod` of the texture `handle` names.
+    /// Null: TLD traps.
+    fetch: ?*const fn (ctx: ?*anyopaque, handle: u32, x: i32, y: i32, lod: i32) Error![4]f32 = null,
+};
+
 // ── What went wrong ─────────────────────────────────────────────────────────
 
-pub const What = enum { none, hazard, fault, unsupported, bad_instruction, divergence, timeout, bad_launch };
+pub const What = enum {
+    none,
+    hazard,
+    fault,
+    unsupported,
+    bad_instruction,
+    divergence,
+    timeout,
+    bad_launch,
+    /// A stage's program and its header disagree (error.HeaderMismatch).
+    header,
+};
 
 pub const HazardKind = enum {
     /// A read before the result it reads is ready.
@@ -206,6 +294,61 @@ pub const HazardKind = enum {
     waw,
     /// A wait on a scoreboard sooner than two cycles after it was set.
     wait_too_soon,
+    /// A stage's EXIT with a scoreboard still out: set, and never waited
+    /// on (`reg` is the scoreboard, `other_pc` the instruction that set it).
+    exit_pending,
+};
+
+/// Why a graphics stage's instruction, or its run, was refused: what
+/// `explain` says after `what`.
+pub const Why = enum {
+    none,
+    /// A graphics stage's instruction (ALD, AST, IPA, PIXLD, KILL, TEX,
+    /// TLD) in a compute launch.
+    stage_only,
+    /// A compute launch's own in a stage: a barrier, shared memory, the
+    /// CTA's or the grid's special registers.
+    compute_only,
+    /// A vertex program's instruction (ALD, AST) in a pixel program, or a
+    /// pixel program's (IPA, PIXLD, KILL) in a vertex program.
+    wrong_stage,
+    /// A form of the instruction this emulator does not run (each
+    /// instruction's comment lists them), or a constant buffer past the
+    /// Stage's.
+    form,
+    /// A Stage carries nothing the instruction could return: a pixel's
+    /// samples (PIXLD), a word at the centroid or at an offset (IPA), local
+    /// memory.
+    no_data,
+    /// TEX without the Stage's `sample`, TLD without its `fetch`.
+    no_callback,
+    /// An attribute address that is not a word's, runs past the words a
+    /// Stage carries (0x2fc), or starts a vector where NAK never starts one.
+    address,
+    /// The Stage's header is not a version 4 header of the Stage's kind, or
+    /// is a pixel program's that does not read the position's w.
+    header_kind,
+    /// stageRun without its stageBegin, for other threads than it began,
+    /// or with the Stage's slices shorter than the threads.
+    threads,
+    /// An attribute word loaded (ALD, IPA) that the header does not say
+    /// the program reads.
+    load_undeclared,
+    /// An attribute word stored (AST) that the header does not say the
+    /// program stores, or outside the range of stored words it gives.
+    store_undeclared,
+    /// A word read flat (IPA.CONSTANT) that the header carries across the
+    /// triangle, or carried (IPA.PASS) that the header keeps flat.
+    interpolation,
+    /// A load after a store, in a program whose header says it has none.
+    load_after_store,
+    /// KILL in a program whose header does not say it discards pixels.
+    kill_undeclared,
+    /// A thread at EXIT without a word the header says the program stores.
+    store_missing,
+    /// A pixel's thread at EXIT with a register the header says holds a
+    /// colour (or the sample mask, or the depth) never written.
+    colour_missing,
 };
 
 pub const Trap = struct {
@@ -226,10 +369,47 @@ pub const Trap = struct {
     va: u64 = 0,
     cta: [3]u32 = .{ 0, 0, 0 },
     thread: u32 = 0,
+    /// A stage's refusal: the reason, and the attribute word's byte address
+    /// when it is about one.
+    why: Why = .none,
+    attr: u16 = 0,
 };
 
 /// What `w.trap` says, in a sentence, into `buf`.
 pub fn explain(w: *const Work, buf: []u8) []const u8 {
+    const s = explainWhat(w, buf);
+    if (w.trap.why == .none) return s;
+    const tail = explainWhy(w.trap, buf[s.len..]);
+    return buf[0 .. s.len + tail.len];
+}
+
+/// A stage's reason, after what `explainWhat` wrote: ": " and a sentence.
+fn explainWhy(t: Trap, buf: []u8) []const u8 {
+    const s = switch (t.why) {
+        .none => buf[0..0],
+        .stage_only => std.fmt.bufPrint(buf, ": a graphics stage's instruction in a compute launch", .{}),
+        .compute_only => std.fmt.bufPrint(buf, ": a compute launch's instruction (a barrier, shared memory, the CTA's or the grid's special registers) in a graphics stage", .{}),
+        .wrong_stage => std.fmt.bufPrint(buf, ": the other stage's instruction (ALD and AST are a vertex program's; IPA, PIXLD and KILL a pixel program's)", .{}),
+        .form => std.fmt.bufPrint(buf, ": a form of the instruction the emulator does not run", .{}),
+        .no_data => std.fmt.bufPrint(buf, ": a Stage carries nothing this could return (a pixel's samples, a word away from the pixel's centre, local memory)", .{}),
+        .no_callback => std.fmt.bufPrint(buf, ": the Stage has no callback for this texture instruction", .{}),
+        .address => std.fmt.bufPrint(buf, ": attribute address 0x{x} is not a word's, runs past 0x2fc, or starts a vector where NAK never starts one", .{t.attr}),
+        .header_kind => std.fmt.bufPrint(buf, ": the Stage's header is not a version 4 header of its kind (a pixel program's must read the position's w)", .{}),
+        .threads => std.fmt.bufPrint(buf, ": stageRun without its stageBegin, or the Stage's slices are shorter than its threads", .{}),
+        .load_undeclared => std.fmt.bufPrint(buf, ": thread {d} loads attribute word 0x{x}, which the header does not declare", .{ t.thread, t.attr }),
+        .store_undeclared => std.fmt.bufPrint(buf, ": thread {d} stores attribute word 0x{x}, which the header does not declare", .{ t.thread, t.attr }),
+        .interpolation => std.fmt.bufPrint(buf, ": thread {d} reads attribute word 0x{x} flat where the header carries it across the triangle, or the other way", .{ t.thread, t.attr }),
+        .load_after_store => std.fmt.bufPrint(buf, ": thread {d} loads attribute word 0x{x} after a store, and the header says the program has no such load", .{ t.thread, t.attr }),
+        .kill_undeclared => std.fmt.bufPrint(buf, ": a discard, and the header does not say the program discards pixels", .{}),
+        .store_missing => std.fmt.bufPrint(buf, ": thread {d} ended without storing attribute word 0x{x}, which the header declares", .{ t.thread, t.attr }),
+        .colour_missing => std.fmt.bufPrint(buf, ": thread {d} ended with R{d} never written, and the header says it holds the pixel's output", .{ t.thread, t.reg }),
+    };
+    return s catch buf[0..0];
+}
+
+/// What went wrong and where: for a hazard, the register and the two
+/// instructions; for a fault, the address and the thread.
+fn explainWhat(w: *const Work, buf: []u8) []const u8 {
     const t = w.trap;
     const name = if (t.pc / 16 < w.n_ops) w.ops[@intCast(t.pc / 16)].name() else "?";
     const other = if (t.other_pc / 16 < w.n_ops) w.ops[@intCast(t.other_pc / 16)].name() else "?";
@@ -242,6 +422,7 @@ pub fn explain(w: *const Work, buf: []u8) []const u8 {
     const s = switch (t.what) {
         .hazard => switch (t.hazard) {
             .wait_too_soon => std.fmt.bufPrint(buf, "hazard at 0x{x:0>4} ({s}): waits on a scoreboard {d} cycle(s) after 0x{x:0>4} ({s}) set it; needs {d}", .{ t.pc, name, t.have, t.other_pc, other, t.need }),
+            .exit_pending => std.fmt.bufPrint(buf, "hazard at 0x{x:0>4} ({s}): the program ends with scoreboard {d} still out: 0x{x:0>4} ({s}) set it and nothing waited on it", .{ t.pc, name, t.reg, t.other_pc, other }),
             else => if (t.scoreboard)
                 std.fmt.bufPrint(buf, "hazard at 0x{x:0>4} ({s}): {s} of {s}{d} before the scoreboard of 0x{x:0>4} ({s}) was waited on", .{ t.pc, name, @tagName(t.hazard), file, t.reg, t.other_pc, other })
             else
@@ -322,7 +503,25 @@ const Kind = enum(u8) {
     atoms,
     shfl,
     vote,
+    /// The graphics stages' own (see `stageOp`, `texture`, `stageLane`):
+    /// a vertex's attribute words loaded and stored, a pixel's input word,
+    /// its samples, its discard, a texture sampled and a texel fetched.
+    ald,
+    ast,
+    ipa,
+    pixld,
+    kill,
+    tex,
+    tld,
 };
+
+/// The instructions only a graphics stage has.
+fn isStageKind(k: Kind) bool {
+    return switch (k) {
+        .ald, .ast, .ipa, .pixld, .kill, .tex, .tld => true,
+        else => false,
+    };
+}
 
 const SrcKind = enum(u3) { none, gpr, ugpr, imm, cbuf, pred, upred };
 
@@ -393,6 +592,9 @@ const Op = struct {
     uses: sched.Uses = .{},
     /// Decoupled through the load/store pipe (in order).
     lsu: bool = false,
+    /// A graphics stage's instruction in a form that is not run: it traps
+    /// as unsupported, for this reason, when a thread reaches it.
+    refuse: Why = .none,
     top: ?u8 = null,
 
     fn name(op: *const Op) []const u8 {
@@ -488,6 +690,8 @@ pub const Work = struct {
     /// other.
     reverse_warps: bool = false,
     max_steps: u64 = DEFAULT_MAX_STEPS,
+    /// The threads stageBegin started and stageRun has not run yet.
+    begun: u32 = 0,
 };
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -835,11 +1039,24 @@ fn compile(in: *const Instr, given: ?u64, n_code: usize) Error!Op {
     }
     const o = in.operands();
     try body(&op, in, name, o, given, n_code);
+    // (a graphics instruction with registers past R254 is not run, and its
+    // registers are not counted: sm120.highestGpr and sm120_sched.usesOf
+    // add a register's number and its count in eight bits)
+    if (isStageKind(op.kind) and pastR254(in)) {
+        if (op.refuse == .none) op.refuse = .form;
+        return op;
+    }
     op.uses = sched.usesOf(in) catch fallbackUses(&op, in);
     // (an LDC's index register is read too: NAK's category, decoupled)
     if (op.kind == .ldc and op.s[0].index != RZ and !reads(&op.uses, .gpr, op.s[0].index)) add(&op.uses, false, .gpr, op.s[0].index, @intFromEnum(lat.Reg.decoupled));
     op.top = sm120.highestGpr(in);
     if (op.kind == .ldc and op.s[0].index != RZ) op.top = @max(op.top orelse 0, op.s[0].index);
+    // (a texture's registers as it really reads and writes them, not
+    // sm120_sched's longest vectors, nor sm120.regsAt's)
+    if ((op.kind == .tex or op.kind == .tld) and op.refuse == .none) {
+        op.uses = textureUses(&op);
+        op.top = topOf(&op.uses);
+    }
     return op;
 }
 
@@ -1157,6 +1374,10 @@ fn body(op: *Op, in: *const Instr, name: []const u8, o: []const Operand, given: 
             op.d[1] = try dstOf(o[0]);
             op.p = try predSrc(o[1]);
         }
+    } else if (eql(name, "ALD") or eql(name, "AST") or eql(name, "IPA") or eql(name, "PIXLD") or eql(name, "KILL")) {
+        try stageOp(op, in, name, o);
+    } else if (eql(name, "TEX") or eql(name, "TLD")) {
+        try texture(op, in, name, o);
     } else return error.Unsupported;
     // (the uniform datapath reads no thread's registers)
     if (op.uniform) {
@@ -1282,18 +1503,256 @@ fn memory(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Error
     op.lsu = true;
 }
 
+// ── The graphics stages' instructions, compiled ─────────────────────────────
+
+/// Whether `words` attribute words from byte address `offset` are ones a
+/// Stage carries: whole words below 0x300, two of them from a multiple of
+/// 8 and three or four from a multiple of 16. (The last is NAK's rule for
+/// what it emits, nak_nir_lower_vtg_io.c: it splits any other vector.
+/// Whether the hardware needs it is not known, so a vector elsewhere is
+/// not run.)
+fn attrFits(offset: u32, words: u32) bool {
+    if (offset % 4 != 0 or offset / 4 + words > ATTR_WORDS) return false;
+    const step: u32 = if (words == 1) 4 else if (words == 2) 8 else 16;
+    return offset % step == 0;
+}
+
+/// The attribute instructions and KILL, as sm120.sig parses them:
+///
+/// - ALD(.64 | .96 | .128) Rd, a[address]: a vertex's attribute words, one
+///   to four, into registers from Rd. Not run: .O (an output read back),
+///   .P and .PHYS (patch and physical addresses), a vertex register
+///   (another vertex's words: the geometry and tessellation stages').
+/// - AST(.64 | .96 | .128) a[address], Rs: one to four registers from Rs
+///   stored as the vertex's output words. Not run: .P, .PHYS, a vertex
+///   register.
+/// - IPA.PASS | .CONSTANT Rd, a[address]: a pixel's input word at its
+///   centre. On sm_120 nothing in the instruction multiplies it (NAK
+///   leaves the old inverse-w operand's bits zero, and nvdisasm ignores
+///   them): perspective is the header's and the program's own FMUL by
+///   MUFU.RCP of a[0x7c]. So .PASS and .CONSTANT both read the word the
+///   engine carried; with a header they must agree with how it says the
+///   word is carried. Not run: .STATE (NAK never emits it; what it reads
+///   is not known), .CENTROID and .OFFSET (a Stage has the centre's words
+///   only), a predicate result (NAK: "what is this for?"), an address past
+///   0x2fc (the front face at 0x3fc, the barycentrics).
+/// - PIXLD: a pixel's samples. Not run in any form: a Stage says nothing
+///   of a pixel's samples.
+/// - KILL: the pixel discarded, where the guard says. Not run: KILL with
+///   its own predicate operand (NAK never writes one; how it combines
+///   with the guard is not known).
+///
+/// A form that is not run still compiles, with `refuse` set: it traps when
+/// a thread reaches it. What nvdisasm calls illegal (an index register
+/// without .P or .PHYS, .PHYS without one or of more than a word) is a bad
+/// instruction.
+fn stageOp(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Error!void {
+    if (eql(name, "KILL")) {
+        op.kind = .kill;
+        if (in.n_ops > 1 or (in.n_ops == 1 and o[0] != .pred)) return error.Syntax;
+        if (in.n_ops == 1) op.refuse = .form;
+        return;
+    }
+    if (eql(name, "PIXLD")) {
+        if (in.n_ops < 1 or in.n_ops > 2 or o[0] != .gpr) return error.Syntax;
+        if (in.n_ops == 2 and o[1] != .pred) return error.Syntax;
+        op.kind = .pixld;
+        op.d[0] = try dstOf(o[0]);
+        if (in.n_ops == 2) op.d[1] = try dstOf(o[1]);
+        op.refuse = .no_data;
+        return;
+    }
+    if (eql(name, "IPA")) {
+        if (in.n_ops < 2 or o[0] != .gpr) return error.Syntax;
+        op.kind = .ipa;
+        op.d[0] = try dstOf(o[0]);
+        var k: usize = 1;
+        if (o[k] == .pred) {
+            op.d[1] = try dstOf(o[k]);
+            op.refuse = .form;
+            k += 1;
+        }
+        if (k >= in.n_ops or o[k] != .attr) return error.Syntax;
+        const a = o[k].attr;
+        // (a word's address, never through a register: 64..71 hold its index)
+        if (a.reg != RZ or a.offset % 4 != 0 or a.offset > 0x3fc) return error.BadInstruction;
+        op.mem.offset = a.offset;
+        k += 1;
+        const offset = in.has("OFFSET");
+        if (offset) {
+            if (k >= in.n_ops or o[k] != .gpr) return error.Syntax;
+            op.s[0] = try srcOf(o[k], .int);
+            k += 1;
+        }
+        if (k != in.n_ops) return error.Syntax;
+        op.sub = if (in.has("PASS")) 0 else if (in.has("CONSTANT")) 1 else if (in.has("STATE")) 2 else return error.BadInstruction;
+        if (op.sub == 2) op.refuse = .form;
+        if (offset or in.has("CENTROID")) op.refuse = .no_data;
+        if (a.offset / 4 >= ATTR_WORDS) op.refuse = .address;
+        return;
+    }
+    const load_ = eql(name, "ALD");
+    if (in.n_ops < 2 or in.n_ops > 3) return error.Syntax;
+    const a = if (load_) o[1] else o[0];
+    const r = if (load_) o[0] else o[1];
+    if (a != .attr or r != .gpr or (in.n_ops == 3 and o[2] != .gpr)) return error.Syntax;
+    const words: u8 = sm120.dataWidth(in);
+    const patch = in.has("P");
+    const phys = in.has("PHYS");
+    if (phys) {
+        if (patch or a.attr.reg == RZ or words != 1) return error.BadInstruction;
+    } else if (!patch and a.attr.reg != RZ) return error.BadInstruction;
+    if (a.attr.offset > 0x3ff) return error.BadInstruction;
+    op.kind = if (load_) .ald else .ast;
+    op.size = 4 * words;
+    op.mem.offset = a.attr.offset;
+    if (load_) op.d[0] = .{ .file = .gpr, .n = r.gpr.n } else op.s[0] = .{ .kind = .gpr, .n = r.gpr.n };
+    if (patch or phys or (load_ and in.has("O")) or in.n_ops == 3) {
+        op.refuse = .form;
+    } else if (!attrFits(a.attr.offset, words)) {
+        op.refuse = .address;
+    } else if (r.gpr.n != RZ and @as(u32, r.gpr.n) + words > RZ) {
+        // (registers past R254)
+        op.refuse = .form;
+    }
+}
+
+/// The texture instructions, as sm120.sig parses them ((Pfault,) Rd1, Rd0,
+/// Ra, Rb(, URc), dimension(, mask)):
+///
+/// - TEX.B(.LZ)(.NDV | .DXY)(.NODEP) Rd1, Rd0, Ra, Rb, 2D(, mask): the
+///   Stage's `sample` called with the handle in Rb and the two floats in
+///   Ra and the register after it.
+/// - TLD.B.LZ | .LL(.NODEP) Rd1, Rd0, Ra, Rb, 2D(, mask): the Stage's
+///   `fetch` called with the handle in Rb, the two integers in Ra and the
+///   register after it, and level 0 (.LZ) or the level in the register
+///   after Rb (.LL: NAK's order of a texel fetch's second vector).
+///
+/// The result's channels the mask names (all four when it is left out) go
+/// to registers in order, as NAK lays them out: the first two to Rd0 and
+/// the register after it, the rest to Rd1 and the one after it. So with
+/// all four, red and green are in Rd0 on and blue and alpha in Rd1 on.
+///
+/// The level and the derivatives are the engine's: `sample` is given the
+/// coordinates and nothing of the pixels beside this one, so .LZ, .NDV,
+/// .DXY and .NODEP change nothing here.
+///
+/// Not run: another dimension than 2D; a level from a register for TEX
+/// (.LB, .LL, .LC and the U ones) and TLD's .ULL; texel offsets (.AOFFI,
+/// .UAOFFI); .UAI; a depth comparison (.DC); .SCR; the .F16 pair; an
+/// eviction priority (what one does is not known); .MS, .UMS and .CL; a
+/// fault predicate; a uniform register; registers past R254.
+fn texture(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Error!void {
+    const fetch = eql(name, "TLD");
+    var k: usize = 0;
+    var not_run = false;
+    if (o.len > 0 and o[0] == .pred) {
+        not_run = true;
+        k = 1;
+    }
+    if (o.len < k + 5) return error.Syntax;
+    for (o[k..][0..4]) |x| if (x != .gpr) return error.Syntax;
+    op.kind = if (fetch) .tld else .tex;
+    op.d[1] = .{ .file = .gpr, .n = o[k].gpr.n };
+    op.d[0] = .{ .file = .gpr, .n = o[k + 1].gpr.n };
+    op.s[0] = .{ .kind = .gpr, .n = o[k + 2].gpr.n };
+    op.s[1] = .{ .kind = .gpr, .n = o[k + 3].gpr.n };
+    // (a source is never RZ: nvdisasm prints such a word as invalid)
+    if (op.s[0].n == RZ or op.s[1].n == RZ) return error.BadInstruction;
+    k += 4;
+    if (o[k] == .ugpr) {
+        not_run = true;
+        k += 1;
+    }
+    // (the dimension is a name, 2D, which sm120.sig leaves as text)
+    if (k >= o.len or o[k] != .num) return error.Syntax;
+    if (!eql(o[k].num, "2D")) not_run = true;
+    k += 1;
+    var mask: u64 = 0xf;
+    if (k < o.len) {
+        mask = try numValue(o[k], .int);
+        k += 1;
+    }
+    if (k != o.len or mask > 0xf) return error.Syntax;
+    op.lut[0] = @intCast(mask);
+    // (without .B it is another opcode's form, with uniform registers)
+    if (!in.has("B")) not_run = true;
+    for (in.mods[0..in.n_mods]) |m| {
+        const taken = eql(m, "B") or eql(m, "NODEP") or eql(m, "LZ") or
+            (if (fetch) eql(m, "LL") else (eql(m, "NDV") or eql(m, "DXY")));
+        if (!taken) not_run = true;
+    }
+    // (a fetch always names its level)
+    if (fetch) {
+        if (in.has("LL")) op.sub = 1 else if (!in.has("LZ") and !in.has("ULL")) return error.BadInstruction;
+    }
+    // Registers past R254: the coordinates' second, the level's, a result's.
+    const channels: u8 = @popCount(op.lut[0]);
+    if (op.s[0].n > RZ - 2 or (op.sub == 1 and op.s[1].n > RZ - 2)) not_run = true;
+    if (op.d[0].n != RZ and @as(u32, op.d[0].n) + @min(channels, 2) > RZ) not_run = true;
+    if (op.d[1].n != RZ and @as(u32, op.d[1].n) + (channels -| 2) > RZ) not_run = true;
+    if (not_run) op.refuse = .form;
+}
+
+/// The registers a texture instruction that is run reads and writes: the
+/// two coordinates, the handle (and TLD.LL's level), a result register a
+/// channel of the mask; NAK's `decoupled` for each. sm120_sched counts
+/// more (each source as four registers, each destination as one at least,
+/// to stay on the safe side of every mode): these are among them, so what
+/// it schedules passes here, and a hand-written program is not held to
+/// registers its texture never touches.
+fn textureUses(op: *const Op) sched.Uses {
+    var u = sched.Uses{ .decoupled = true };
+    const cat = @intFromEnum(lat.Reg.decoupled);
+    const channels: u8 = @popCount(op.lut[0]);
+    // (Rd1's first, as sm120_sched has them)
+    for (0..channels -| 2) |k| add(&u, true, .gpr, op.d[1].n +| @as(u8, @intCast(k)), cat);
+    for (0..@min(channels, 2)) |k| add(&u, true, .gpr, op.d[0].n +| @as(u8, @intCast(k)), cat);
+    add(&u, false, .gpr, op.s[0].n, cat);
+    add(&u, false, .gpr, op.s[0].n +| 1, cat);
+    add(&u, false, .gpr, op.s[1].n, cat);
+    if (op.kind == .tld and op.sub == 1) add(&u, false, .gpr, op.s[1].n +| 1, cat);
+    if (op.guard.n != PT) add(&u, false, .pred, op.guard.n, @intFromEnum(lat.Pred.guard));
+    return u;
+}
+
+/// Whether a register operand of `in`, with the registers sm120.regsAt
+/// counts from it, runs past R254.
+fn pastR254(in: *const Instr) bool {
+    for (in.operands(), 0..) |x, i| {
+        if (x == .gpr and x.gpr.n != RZ and @as(u32, x.gpr.n) + sm120.regsAt(in, i) > RZ) return true;
+    }
+    return false;
+}
+
+/// The highest general register among `u`'s.
+fn topOf(u: *const sched.Uses) ?u8 {
+    var top: ?u8 = null;
+    for (u.dsts()) |x| {
+        if (x.file == .gpr) top = if (top) |t| @max(t, x.n) else x.n;
+    }
+    for (u.srcs()) |x| {
+        if (x.file == .gpr) top = if (top) |t| @max(t, x.n) else x.n;
+    }
+    return top;
+}
+
 // ── Latency categories where sm120_sched has none yet ───────────────────────
 
 /// NAK's categories (sm120_instr_latencies.rs) for the forms this emulator
 /// runs that sm120_sched.usesOf does not know yet. sm120_sched's take over
-/// as it learns them.
+/// as it learns them. (It knows the graphics stages' already; they are
+/// here too, with the same categories, so the two agree whichever answers:
+/// the attribute instructions as memory, textures and KILL as decoupled.)
 fn fallbackUses(op: *const Op, in: *const Instr) sched.Uses {
     const R = lat.Reg;
     const P = lat.Pred;
     const U = lat.Ureg;
+    if ((op.kind == .tex or op.kind == .tld) and op.refuse == .none) return textureUses(op);
     var u = sched.Uses{};
     const dec = switch (op.kind) {
         .mufu, .f2f, .f2i, .frnd, .popc, .flo, .brev, .ldc, .s2r, .ldg, .stg, .ldl, .stl, .lds, .sts, .shfl, .bar, .exit, .bra => true,
+        .ald, .ast, .ipa, .pixld, .kill, .tex, .tld => true,
         .i2f => !eql(in.op, "I2FP"),
         .cs2r => op.sub != 0xff,
         else => false,
@@ -1310,18 +1769,19 @@ fn fallbackUses(op: *const Op, in: *const Instr) sched.Uses {
         .mov64, .iadd64 => .disp_64,
         .i2f => if (dec) .decoupled else .disp_64,
         .s2r, .ldg, .stg, .ldl, .stl, .lds, .sts, .shfl, .bar => .decoupled_agu,
+        .ald, .ast, .ipa, .pixld => .decoupled_agu,
         else => .decoupled,
     };
     const pcat: lat.Pred = switch (op.kind) {
         .isetp, .fsetp, .imnmx, .fmnmx => .dualalu,
         .vote => .disp_dual_alu,
-        .shfl => .decoupled,
+        .shfl, .ipa, .pixld => .decoupled,
         else => .coupled,
     };
     const ucat: lat.Ureg = if (op.uniform) .udp else .coupled;
     const width: u8 = switch (op.kind) {
         .mov64, .iadd64, .imad_wide => 2,
-        .ldg, .stg, .ldl, .stl, .lds, .sts, .ldc => @max(1, op.size / 4),
+        .ldg, .stg, .ldl, .stl, .lds, .sts, .ldc, .ald, .ast => @max(1, op.size / 4),
         .cs2r => op.size / 4,
         .i2f, .f2i, .f2f => if (tyBits(op.ty[0]) == 64) 2 else 1,
         else => 1,
@@ -1343,7 +1803,7 @@ fn fallbackUses(op: *const Op, in: *const Instr) sched.Uses {
             }
         }
     }
-    const swidth: u8 = if (op.kind == .stg or op.kind == .stl or op.kind == .sts) width else if (op.kind == .iadd64 or op.kind == .f2i or op.kind == .f2f) (if (op.kind == .iadd64 or tyBits(op.ty[1]) == 64) 2 else 1) else 1;
+    const swidth: u8 = if (op.kind == .stg or op.kind == .stl or op.kind == .sts or op.kind == .ast) width else if (op.kind == .iadd64 or op.kind == .f2i or op.kind == .f2f) (if (op.kind == .iadd64 or tyBits(op.ty[1]) == 64) 2 else 1) else 1;
     for (op.s) |s| {
         for (0..swidth) |j| {
             const n = s.n +| @as(u8, @intCast(j));
@@ -1398,11 +1858,14 @@ const Ctx = struct {
     steps: u64 = 0,
     /// The instruction issuing (for a fault's trap).
     pc: u32 = 0,
+    /// A graphics stage's run (stageRun); null in a launch.
+    stage: ?*const Stage = null,
 };
 
 /// Run a launch (load the kernel first).
 pub fn run(w: *Work, mem: *const Memory, l: *const Launch, stats: *Stats) Error!void {
     w.trap = .{};
+    w.begun = 0;
     const b = l.block;
     const nthreads = @as(u64, b[0]) * b[1] * b[2];
     if (nthreads == 0 or nthreads > MAX_THREADS or l.grid[0] == 0 or l.grid[1] == 0 or l.grid[2] == 0) return badLaunch(w);
@@ -1429,17 +1892,17 @@ fn badLaunch(w: *Work) Error {
     return error.BadLaunch;
 }
 
-fn runCta(c: *Ctx) Error!void {
-    const w = c.w;
-    const nw = (c.nthreads + WARP - 1) / WARP;
-    c.stats.ctas += 1;
-    c.stats.warps += nw;
+/// `n` threads at the first instruction, their warps' histories empty:
+/// the first `registers` registers of each garbage (POISON), predicates
+/// clear, as the uniform registers and predicates of their warps.
+fn startThreads(w: *Work, n: u32, registers: u32) void {
+    const nw = (n + WARP - 1) / WARP;
     w.gen +%= 1;
     for (0..nw * WARP) |t| {
-        w.st[t] = if (t < c.nthreads) .run else .off;
+        w.st[t] = if (t < n) .run else .off;
         w.pc[t] = 0;
         w.preds[t] = 0;
-        @memset(w.regs[t][0..c.l.registers], POISON);
+        @memset(w.regs[t][0..registers], POISON);
         w.regs[t][RZ] = 0;
     }
     for (0..nw) |k| {
@@ -1448,6 +1911,14 @@ fn runCta(c: *Ctx) Error!void {
         w.upreds[k] = 0;
         w.warps[k] = .{};
     }
+}
+
+fn runCta(c: *Ctx) Error!void {
+    const w = c.w;
+    const nw = (c.nthreads + WARP - 1) / WARP;
+    c.stats.ctas += 1;
+    c.stats.warps += nw;
+    startThreads(w, c.nthreads, c.l.registers);
     @memset(w.shared[0..c.l.shared_bytes], 0xcd);
     @memset(w.local[0 .. @as(usize, c.local_per) * c.nthreads], 0xcd);
     while (true) {
@@ -1567,6 +2038,330 @@ fn releaseBsync(c: *Ctx, wi: u32) bool {
     return released;
 }
 
+// ── Running a graphics stage ────────────────────────────────────────────────
+
+/// Start `n` threads (1..MAX_THREADS) of a vertex or a pixel program (load
+/// it first, as a kernel: load, loadText, loadAssembled, loadWords): each
+/// at the first instruction, every register garbage (nothing is preloaded
+/// in either stage: what a thread is given, it loads), predicates clear.
+/// Then stageRun.
+pub fn stageBegin(w: *Work, n: u32) Error!void {
+    w.trap = .{};
+    w.begun = 0;
+    if (n == 0 or n > MAX_THREADS) return stageRefused(w, .threads);
+    startThreads(w, n, NREGS - 1);
+    w.begun = n;
+}
+
+/// Run the `n` threads stageBegin started to their EXIT, in warps of 32
+/// (thread t is lane t % 32 of warp t / 32), as `s` describes their stage,
+/// with the timing checks a launch gets (`w.check_hazards`, `w.strict`).
+/// A vertex program's stored words are then in `s.out` and `s.stored`; a
+/// pixel program's colour is in each thread's R0..R3 (`threadReg`), and
+/// `s.killed` says whose is not to be written.
+///
+/// Checked beside what a launch checks, when hazards are:
+///
+/// - an EXIT issues with no scoreboard out (every one set was waited on
+///   since: NAK makes each EXIT wait on all of them, so a store's read of
+///   its registers is over before the thread is).
+///
+/// And with the Stage's header, at the end:
+///
+/// - a vertex thread stored every word the header says the program stores;
+/// - a pixel thread that was not killed wrote every register the header
+///   says holds an output: target t's declared channels (four registers a
+///   target that has any, in order from R0), then the sample mask's and
+///   the depth's. Written means not the garbage it started with, so a
+///   program that computes exactly 0xdeadbeef there is refused wrongly.
+///
+/// Not checked: a register read before anything wrote it (it reads the
+/// garbage); the register count the engine programs for the stage; whether
+/// vectors start at the registers NAK aligns them to.
+pub fn stageRun(w: *Work, mem: *const Memory, s: *const Stage, n: u32, stats: *Stats) Error!void {
+    w.trap = .{};
+    const begun = w.begun;
+    w.begun = 0;
+    if (n == 0 or n != begun) return stageRefused(w, .threads);
+    const vertex = s.kind == .vertex;
+    if (s.in.len < n) return stageRefused(w, .threads);
+    if (vertex and (s.out.len < n or s.stored.len < n)) return stageRefused(w, .threads);
+    if (!vertex and s.killed.len < n) return stageRefused(w, .threads);
+    if (s.header) |h| {
+        if (sph.stageOf(h) != s.kind) return stageRefused(w, .header_kind);
+        // (NAK: without the position's w a pixel program traps)
+        if (!vertex and !sph.bit(h, POSITION_W_READ)) return stageRefused(w, .header_kind);
+    }
+    if (vertex) {
+        for (s.stored[0..n]) |*x| x.* = @splat(0);
+    } else @memset(s.killed[0..n], false);
+    // (constant buffers through a launch's fields; no shared or local memory)
+    const l = Launch{ .block = .{ n, 1, 1 }, .shared_bytes = 0, .cbufs = s.cbufs };
+    var c = Ctx{ .w = w, .mem = mem, .l = &l, .stats = stats, .cta = .{ 0, 0, 0 }, .nthreads = n, .local_per = 0, .stage = s };
+    const nw = (n + WARP - 1) / WARP;
+    stats.warps += nw;
+    for (0..nw) |k| {
+        const wi: u32 = @intCast(if (w.reverse_warps) nw - 1 - k else k);
+        try runWarp(&c, wi);
+        stats.cycles = @max(stats.cycles, w.warps[wi].cycle);
+    }
+    // (a stage has no barriers: a thread not done waits at a BSYNC for
+    // lanes that never came)
+    for (0..n) |t| {
+        if (w.st[t] != .done) {
+            w.trap = .{ .what = .divergence, .pc = @as(u64, w.pc[t]) * 16, .thread = @intCast(t) };
+            return error.Divergence;
+        }
+    }
+    if (s.header) |h| try stageEnded(&c, s, h, n);
+}
+
+/// Register `r` of thread `thread`, as the program last left it: after
+/// stageRun, a pixel's red, green, blue and alpha are its R0..R3 (floats'
+/// bits), a second target's R4..R7.
+pub fn threadReg(w: *const Work, thread: u32, r: u8) u32 {
+    return w.regs[thread][r];
+}
+
+/// A pixel header's bit for reading the position's w (sph.sig: x, y, z, w
+/// are 188..191).
+const POSITION_W_READ = 191;
+/// A vertex header's bit for loading attribute word 0: word i is LOADS + i.
+const LOADS = 160;
+/// A vertex header's bit for storing attribute word 0: word i is STORES + i.
+const STORES = 400;
+/// A vertex header's bit that says no load follows a store.
+const LOADS_BEFORE_STORES = 25;
+/// A pixel header's bit that says the program discards pixels.
+const KILLS_PIXELS = 15;
+
+/// A stage's run refused before any of its instructions, for `why`.
+fn stageRefused(w: *Work, why: Why) Error {
+    w.trap = .{ .what = .bad_launch, .why = why };
+    return error.BadLaunch;
+}
+
+/// An instruction refused where it issued, for `why`.
+fn refuse(c: *Ctx, pc: u32, t: u32, what: What, why: Why, attr: u32) Error {
+    c.w.trap = .{ .what = what, .why = why, .pc = @as(u64, pc) * 16, .cta = c.cta, .thread = t, .attr = @truncate(attr) };
+    return switch (what) {
+        .bad_instruction => error.BadInstruction,
+        .header => error.HeaderMismatch,
+        else => error.Unsupported,
+    };
+}
+
+/// A program at odds with its header over attribute word `word`.
+fn mismatch(c: *Ctx, t: u32, why: Why, word: u32) Error {
+    return refuse(c, c.pc, t, .header, why, word * 4);
+}
+
+/// Whether `op` may issue where the warp is: a graphics stage's own only
+/// in a stage, and in the stage they belong to (ALD and AST are a vertex
+/// program's; IPA, PIXLD and KILL a pixel program's: NAK's rule, and TEX
+/// and TLD either's); in a stage no barrier, no shared memory, none of
+/// the CTA's or the grid's special registers; no local memory (a Stage
+/// has none), no texture instruction without its callback, no constant
+/// buffer past the Stage's.
+fn belongs(c: *Ctx, op: *const Op, pc: u32, t: u32) Error!void {
+    const s = c.stage orelse return refuse(c, pc, t, .bad_instruction, .stage_only, 0);
+    switch (op.kind) {
+        .bar, .lds, .sts, .atoms => return refuse(c, pc, t, .bad_instruction, .compute_only, 0),
+        // (SR_TID, SR_CTAID and the CTA's place in its cluster)
+        .s2r, .cs2r => if ((op.sub >= 0x20 and op.sub <= 0x27) or op.sub == 0x88) return refuse(c, pc, t, .bad_instruction, .compute_only, 0),
+        .ldl, .stl => return refuse(c, pc, t, .unsupported, .no_data, 0),
+        .ald, .ast => if (s.kind != .vertex) return refuse(c, pc, t, .bad_instruction, .wrong_stage, 0),
+        .ipa, .pixld, .kill => if (s.kind != .pixel) return refuse(c, pc, t, .bad_instruction, .wrong_stage, 0),
+        .tex => if (s.sample == null and op.refuse == .none) return refuse(c, pc, t, .unsupported, .no_callback, 0),
+        .tld => if (s.fetch == null and op.refuse == .none) return refuse(c, pc, t, .unsupported, .no_callback, 0),
+        else => {},
+    }
+    for (op.s) |x| {
+        if (x.kind == .cbuf and x.bank >= qmd.CBUFS) return refuse(c, pc, t, .unsupported, .form, 0);
+    }
+}
+
+/// How a pixel program's header says attribute word `i` is read.
+const Reads = enum {
+    /// Not at all.
+    none,
+    /// A system value's word, a bit each in the header: nothing there says
+    /// how it is carried (the position's, the point's coordinates, the
+    /// layer).
+    word,
+    /// The provoking vertex's value.
+    flat,
+    /// Carried across the triangle, in perspective or linearly.
+    carried,
+};
+
+/// The header's maps are sph.sig's and NAK's: system values A and B a bit
+/// a word from 160 (the position's x, y, z, w at 188..191), generic vector
+/// n's component c two bits from 192 + 8n + 2c, system values C a bit a
+/// word from 464. The fixed-function colours (0x280..0x2bf) count as not
+/// read: NAK never reads them, and how the header's 16 bits for them map
+/// to their words is not in what was read.
+fn pixelReads(h: *const [sph.WORDS]u32, i: u32) Reads {
+    if (i < 32) return if (sph.bit(h, 160 + i)) .word else .none;
+    if (i < 160) return switch (sph.interpOf(h, (i - 32) / 4, (i - 32) % 4)) {
+        .unused => .none,
+        .constant => .flat,
+        .perspective, .linear => .carried,
+    };
+    if (i < 176) return .none;
+    return if (sph.bit(h, 464 + (i - 176))) .word else .none;
+}
+
+/// One thread's turn at a graphics stage's instruction (`stageOp` and
+/// `texture` say what each form is; `belongs` let it issue):
+///
+/// - ALD: the thread's `in` words into the registers. With a header, each
+///   word must be one it says the program loads, and when it says no load
+///   follows a store (the bit that lets the engine keep inputs and outputs
+///   in one space), none may.
+/// - AST: the registers into the thread's `out` words, and their bits in
+///   `stored`. With a header, each word must be one it says the program
+///   stores, inside the range of stored words it gives.
+/// - IPA: the thread's `in` word into the register. With a header, the
+///   word must be one it says the program reads, flat for .CONSTANT and
+///   carried for .PASS where the header says which.
+/// - KILL: the thread's `killed` set. The thread runs on: NAK treats the
+///   instruction as a demotion to a helper pixel, not an end ("execution
+///   continues after KILL"), so a program that means to stop branches to
+///   its EXIT. With a header, it must say the program discards pixels.
+/// - TEX, TLD: the Stage's callback's four floats into the registers the
+///   mask names (see `texture`). The sources are read first, so a result
+///   may land on them.
+fn stageLane(c: *Ctx, wi: u32, t: u32, op: *const Op) Error!void {
+    const s = c.stage.?;
+    const w = c.w;
+    const first: u32 = @intCast(@divTrunc(op.mem.offset, 4));
+    const words: u32 = op.size / 4;
+    switch (op.kind) {
+        .ald => {
+            if (s.header) |h| {
+                for (0..words) |k| {
+                    const i = first + @as(u32, @intCast(k));
+                    if (!sph.bit(h, LOADS + i)) return mismatch(c, t, .load_undeclared, i);
+                }
+                if (sph.bit(h, LOADS_BEFORE_STORES)) {
+                    for (s.stored[t]) |bits| if (bits != 0) return mismatch(c, t, .load_after_store, first);
+                }
+            }
+            for (0..words) |k| put(c, wi, t, .{ .file = .gpr, .n = op.d[0].n +| @as(u8, @intCast(k)) }, s.in[t][first + k]);
+        },
+        .ast => {
+            if (s.header) |h| {
+                // (STORE_REQ_START and END: bits 140..147 and 152..159)
+                const lo = (h[4] >> 12) & 0xff;
+                const hi = (h[4] >> 24) & 0xff;
+                for (0..words) |k| {
+                    const i = first + @as(u32, @intCast(k));
+                    if (!sph.bit(h, STORES + i) or i < lo or i > hi) return mismatch(c, t, .store_undeclared, i);
+                }
+            }
+            for (0..words) |k| {
+                const i = first + k;
+                const r: u8 = if (op.s[0].n == RZ) RZ else op.s[0].n + @as(u8, @intCast(k));
+                s.out[t][i] = w.regs[t][r];
+                s.stored[t][i / 32] |= @as(u32, 1) << @intCast(i % 32);
+            }
+        },
+        .ipa => {
+            if (s.header) |h| switch (pixelReads(h, first)) {
+                .none => return mismatch(c, t, .load_undeclared, first),
+                .word => {},
+                .flat => if (op.sub != 1) return mismatch(c, t, .interpolation, first),
+                .carried => if (op.sub != 0) return mismatch(c, t, .interpolation, first),
+            };
+            put(c, wi, t, op.d[0], s.in[t][first]);
+        },
+        .kill => {
+            if (s.header) |h| {
+                if (!sph.bit(h, KILLS_PIXELS)) return refuse(c, c.pc, t, .header, .kill_undeclared, 0);
+            }
+            s.killed[t] = true;
+        },
+        .tex, .tld => {
+            const handle = w.regs[t][op.s[1].n];
+            const x = w.regs[t][op.s[0].n];
+            const y = w.regs[t][op.s[0].n + 1];
+            var rgba: [4]f32 = undefined;
+            if (op.kind == .tex) {
+                rgba = s.sample.?(s.ctx, handle, f32of(x), f32of(y)) catch |e| return callbackFailed(c, t, e);
+            } else {
+                const xi: i32 = @bitCast(x);
+                const yi: i32 = @bitCast(y);
+                const lod: i32 = if (op.sub == 1) @bitCast(w.regs[t][op.s[1].n + 1]) else 0;
+                rgba = s.fetch.?(s.ctx, handle, xi, yi, lod) catch |e| return callbackFailed(c, t, e);
+            }
+            var k: u8 = 0;
+            for (rgba, 0..) |v, ch| {
+                if ((op.lut[0] >> @intCast(ch)) & 1 == 0) continue;
+                const base = if (k < 2) op.d[0].n else op.d[1].n;
+                if (base != RZ) put(c, wi, t, .{ .file = .gpr, .n = base + (k & 1) }, @bitCast(v));
+                k += 1;
+            }
+        },
+        else => return error.Unsupported,
+    }
+}
+
+/// The engine's callback failed: its error, with the instruction's place
+/// in the trap unless the callback left one.
+fn callbackFailed(c: *Ctx, t: u32, e: Error) Error {
+    if (c.w.trap.what == .none) {
+        c.w.trap = .{ .what = if (e == error.Fault) .fault else .unsupported, .pc = @as(u64, c.pc) * 16, .cta = c.cta, .thread = t };
+    }
+    return e;
+}
+
+/// What the header says a stage's threads have done by their EXIT (see
+/// stageRun).
+fn stageEnded(c: *Ctx, s: *const Stage, h: *const [sph.WORDS]u32, n: u32) Error!void {
+    const w = c.w;
+    if (s.kind == .vertex) {
+        var want: [ATTR_WORDS / 32]u32 = @splat(0);
+        for (0..ATTR_WORDS) |i| {
+            if (sph.bit(h, STORES + @as(u32, @intCast(i)))) want[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+        }
+        for (0..n) |t| {
+            for (want, s.stored[t], 0..) |wanted, got, k| {
+                const missing = wanted & ~got;
+                if (missing == 0) continue;
+                c.pc = w.pc[t];
+                return mismatch(c, @intCast(t), .store_missing, @as(u32, @intCast(k)) * 32 + @ctz(missing));
+            }
+        }
+        return;
+    }
+    // The outputs' registers, in the order NAK leaves them (the header's
+    // target map is bits 576 on, four a target; then the sample mask's bit
+    // and the depth's): four registers for each target that has a channel
+    // written, then one for the sample mask when it or the depth is
+    // written, then one for the depth.
+    var outputs: [34]bool = @splat(false);
+    var r: usize = 0;
+    for (0..8) |target| {
+        const mask = (h[18] >> @intCast(4 * target)) & 0xf;
+        if (mask == 0) continue;
+        for (0..4) |ch| outputs[r + ch] = (mask >> @intCast(ch)) & 1 != 0;
+        r += 4;
+    }
+    outputs[r] = sph.bit(h, 608);
+    outputs[r + 1] = sph.bit(h, 609);
+    for (0..n) |t| {
+        if (s.killed[t]) continue;
+        for (outputs, 0..) |declared, reg| {
+            if (!declared or w.regs[t][reg] != POISON) continue;
+            w.trap = .{ .what = .header, .why = .colour_missing, .pc = @as(u64, w.pc[t]) * 16, .thread = @intCast(t), .reg = @intCast(reg) };
+            return error.HeaderMismatch;
+        }
+    }
+}
+
+// ── Issuing ─────────────────────────────────────────────────────────────────
+
 fn issue(c: *Ctx, wi: u32, op: *const Op, pc: u32, lanes: []const u32) Error!void {
     const w = c.w;
     switch (op.kind) {
@@ -1575,6 +2370,10 @@ fn issue(c: *Ctx, wi: u32, op: *const Op, pc: u32, lanes: []const u32) Error!voi
             return if (op.kind == .invalid) error.BadInstruction else error.Unsupported;
         },
         else => {},
+    }
+    if (c.stage != null or isStageKind(op.kind)) {
+        try belongs(c, op, pc, lanes[0]);
+        if (op.refuse != .none) return refuse(c, pc, lanes[0], .unsupported, op.refuse, @intCast(op.mem.offset));
     }
     c.pc = pc;
     if (w.check_hazards) try timing(c, wi, op, pc) else w.warps[wi].cycle +%= op.control.stall;
@@ -1715,6 +2514,15 @@ fn timing(c: *Ctx, wi: u32, op: *const Op, pc: u32) Error!void {
         ws.count[k] = 0;
         ws.lsu_done = @max(ws.lsu_done, ws.lsu_seq[k]);
         ws.lsu_seq[k] = 0;
+    }
+    // A stage's program ends with nothing out (after its EXIT's own waits,
+    // before the scoreboards a control field written for it may set).
+    if (op.kind == .exit and c.stage != null) {
+        for (0..BARS) |k| {
+            if (ws.count[k] == 0) continue;
+            w.trap = .{ .what = .hazard, .pc = @as(u64, pc) * 16, .hazard = .exit_pending, .reg = @intCast(k), .other_pc = @as(u64, ws.last_pc[k]) * 16, .scoreboard = true, .cta = c.cta };
+            return error.Hazard;
+        }
     }
     // Reads after writes.
     for (op.uses.srcs()) |u| {
@@ -2381,6 +3189,7 @@ fn lane(c: *Ctx, wi: u32, t: u32, op: *const Op) Error!void {
         },
         .ldg, .stg, .ldl, .stl, .lds, .sts => try access(c, wi, t, op),
         .atomg, .atoms => try atomicAccess(c, wi, t, op),
+        .ald, .ast, .ipa, .kill, .tex, .tld => try stageLane(c, wi, t, op),
         else => return error.Unsupported,
     }
 }
@@ -3033,4 +3842,750 @@ test "a launch the GPU would not take" {
     try testing.expectError(error.BadLaunch, runText("[B------:R-:W-:-:S01] MOV R100, RZ\n[B------:R-:W-:Y:S05] EXIT", &l, &regions));
     l.block = .{ 1025, 1, 1 };
     try testing.expectError(error.BadLaunch, runText("[B------:R-:W-:Y:S05] EXIT", &l, &regions));
+}
+
+// ── Tests: graphics stages ──────────────────────────────────────────────────
+
+/// sm120_asm's textured rectangle's vertex program (its test's VERTEX,
+/// the first the driver draws with): a position and a texture coordinate
+/// from the vertex buffers' attributes 0 and 1, stored as the position and
+/// generic vector 0's x and y.
+const VERTEX =
+    \\ALD.128 R4, a[0x80]               // attribute 0: x, y, z, w
+    \\ALD.64 R8, a[0x90]                // attribute 1: u, v
+    \\AST.128 a[0x70], R4               // the position
+    \\AST.64 a[0x80], R8                // generic 0
+    \\EXIT
+;
+
+/// A vertex program that reads nothing but its index: a rectangle's
+/// corner from the index's low two bits (u its bit 0, v the rest; the
+/// position 2u - 1, 2v - 1, 0, 1).
+const VERTEX_ID =
+    \\ALD R0, a[0x2fc]                  // the vertex's index
+    \\LOP3.LUT R1, R0, 0x1, RZ, 0xc0, !PT
+    \\SHF.R.U32.HI R2, RZ, 0x1, R0
+    \\I2FP.F32.S32 R8, R1               // u
+    \\I2FP.F32.S32 R9, R2               // v
+    \\FMUL R4, R8, 2
+    \\FADD R4, R4, -1                   // x
+    \\FMUL R5, R9, 2
+    \\FADD R5, R5, -1                   // y
+    \\MOV R6, RZ                        // z
+    \\MOV R7, 0x3f800000                // w
+    \\AST.128 a[0x70], R4
+    \\AST.64 a[0x80], R8
+    \\EXIT
+;
+
+/// sm120_asm's pixel program for the same rectangle (its test's PIXEL): u
+/// and v carried in perspective, a texel through the handle in constant
+/// buffer 1, pixels under half alpha discarded, the colour left in R0..R3.
+const PIXEL =
+    \\IPA.PASS R0, a[0x7c]              // 1/w
+    \\IPA.PASS R4, a[0x80]              // u/w
+    \\IPA.PASS R5, a[0x84]              // v/w
+    \\MUFU.RCP R0, R0
+    \\FMUL.RZ R4, R4, R0
+    \\FMUL.RZ R5, R5, R0
+    \\LDC R6, c[0x1][0x10]              // the texture's handle
+    \\TEX.B.DXY R2, R0, R4, R6, 2D      // red, green in R0, R1; blue, alpha in R2, R3
+    \\FSETP.LT.AND P0, PT, R3, 0.5, PT
+    \\@P0 KILL
+    \\EXIT
+;
+
+/// The tests' threads' words, the words sm120_asm assembles into, and
+/// what the texture callbacks were called with.
+const StageTest = struct {
+    /// The most threads a test runs.
+    const THREADS = 80;
+    /// A Stage's slices: each thread's words in and out, the stored words'
+    /// bits, the discarded pixels.
+    var in: [THREADS][ATTR_WORDS]u32 = undefined;
+    var out: [THREADS][ATTR_WORDS]u32 = undefined;
+    var stored: [THREADS][ATTR_WORDS / 32]u32 = undefined;
+    var killed: [THREADS]bool = undefined;
+    /// A scheduled program's words.
+    var code: [64]u64 = undefined;
+    /// The callbacks' calls so far, and what each was given.
+    var calls: usize = 0;
+    var handles: [THREADS]u32 = undefined;
+    var xs: [THREADS]f32 = undefined;
+    var ys: [THREADS]f32 = undefined;
+    var lods: [THREADS]i32 = undefined;
+
+    /// A texture whose colour says what it was asked: x + 1, 2 y, the
+    /// texture's index plus the sampler's, and an alpha under a half only
+    /// at x = 0.75.
+    fn sample(_: ?*anyopaque, handle: u32, x: f32, y: f32) Error![4]f32 {
+        handles[calls] = handle;
+        xs[calls] = x;
+        ys[calls] = y;
+        calls += 1;
+        return .{ x + 1, y * 2, @floatFromInt((handle & 0xfffff) + (handle >> 20)), if (x == 0.75) 0.25 else 1 };
+    }
+
+    /// A texel that says where it was fetched: x, y, the level, the
+    /// texture's index.
+    fn fetch(_: ?*anyopaque, handle: u32, x: i32, y: i32, lod: i32) Error![4]f32 {
+        handles[calls] = handle;
+        lods[calls] = lod;
+        calls += 1;
+        return .{ @floatFromInt(x), @floatFromInt(y), @floatFromInt(lod), @floatFromInt(handle & 0xfffff) };
+    }
+
+    /// A vertex stage over the first `n` threads' words.
+    fn vertex(header: ?*const [sph.WORDS]u32, n: usize) Stage {
+        return .{ .kind = .vertex, .header = header, .in = in[0..n], .out = out[0..n], .stored = stored[0..n] };
+    }
+
+    /// A pixel stage over the first `n` threads' words, with `sample`.
+    fn pixel(header: ?*const [sph.WORDS]u32, n: usize) Stage {
+        return .{ .kind = .pixel, .header = header, .in = in[0..n], .killed = killed[0..n], .sample = &sample };
+    }
+};
+
+/// A float's bits, as a register holds them.
+fn bitsOf(x: f32) u32 {
+    return @bitCast(x);
+}
+
+/// The loaded program run as `s`'s stage for `n` threads.
+fn stage(s: *const Stage, n: u32) Error!Stats {
+    const mem = Memory{ .regions = &.{} };
+    var stats = Stats{};
+    try stageBegin(&test_work, n);
+    try stageRun(&test_work, &mem, s, n, &stats);
+    return stats;
+}
+
+/// The same, for a run that must pass: its error's sentence printed.
+fn runStage(s: *const Stage, n: u32) !Stats {
+    return stage(s, n) catch |e| {
+        var buf: [256]u8 = undefined;
+        std.debug.print("stage: {s}: {s}\n", .{ @errorName(e), explain(&test_work, &buf) });
+        return e;
+    };
+}
+
+/// `text` without control fields, assembled and scheduled by sm120_asm
+/// and loaded: the path a driver's programs take.
+fn loadScheduled(text: []const u8) !void {
+    const k = try sm120_asm.assemble(text, &StageTest.code, &test_asm);
+    try testing.expect(k.scheduled);
+    try loadAssembled(&test_work, &test_asm, k);
+}
+
+/// `text` as one stage's whole program refused: the error, and why.
+fn expectRefused(text: []const u8, s: *const Stage, e: Error, why: Why) !void {
+    try loadText(&test_work, text);
+    try testing.expectError(e, stage(s, 1));
+    if (test_work.trap.why != why) {
+        var buf: [256]u8 = undefined;
+        std.debug.print("\"{s}\": {s}\n", .{ text, explain(&test_work, &buf) });
+    }
+    try testing.expectEqual(why, test_work.trap.why);
+}
+
+test "a vertex stage: the assembler's rectangle program stores each vertex's position and coordinates" {
+    const S = StageTest;
+    const pos = [4][4]f32{ .{ -1, -1, 0, 1 }, .{ 1, -1, 0, 1 }, .{ -1, 1, 0.5, 1 }, .{ 1, 1, 0.5, 2 } };
+    const uv = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ 1, 1 } };
+    var v = sph.Vertex{};
+    v.in_generic[0] = 0xf;
+    v.in_generic[1] = 0x3;
+    v.out_generic[0] = 0x3;
+    const header = sph.vertex(v);
+    const s = S.vertex(&header, 4);
+    // (as written, each line with the safe control field; then as sm120_asm
+    // schedules it, at the hardware's level and at NAK's)
+    for (0..3) |pass| {
+        for (0..4) |t| {
+            S.in[t] = @splat(0x5555_5555);
+            S.in[t][0x2fc / 4] = @intCast(t);
+            for (pos[t], 0..) |x, k| S.in[t][0x80 / 4 + k] = bitsOf(x);
+            for (uv[t], 0..) |x, k| S.in[t][0x90 / 4 + k] = bitsOf(x);
+            S.out[t] = @splat(0xaaaa_aaaa);
+            S.stored[t] = @splat(0xffff_ffff);
+        }
+        if (pass == 0) try loadText(&test_work, VERTEX) else try loadScheduled(VERTEX);
+        test_work.strict = pass == 2;
+        defer test_work.strict = false;
+        const stats = try runStage(&s, 4);
+        try testing.expectEqual(@as(u64, 1), stats.warps);
+        try testing.expectEqual(@as(u64, 5), stats.instructions);
+        try testing.expectEqual(@as(u64, 20), stats.thread_instructions);
+        for (0..4) |t| {
+            // the position: words 0x70..0x7c; generic 0's x and y: 0x80, 0x84
+            for (pos[t], 0..) |x, k| try testing.expectEqual(bitsOf(x), S.out[t][0x70 / 4 + k]);
+            for (uv[t], 0..) |x, k| try testing.expectEqual(bitsOf(x), S.out[t][0x80 / 4 + k]);
+            // nothing else: the words beside them as they were, and exactly
+            // those six recorded (words 28..31, 32 and 33)
+            try testing.expectEqual(@as(u32, 0xaaaa_aaaa), S.out[t][0x6c / 4]);
+            try testing.expectEqual(@as(u32, 0xaaaa_aaaa), S.out[t][0x88 / 4]);
+            try testing.expectEqual([6]u32{ 0xf000_0000, 0x3, 0, 0, 0, 0 }, S.stored[t]);
+        }
+        if (pass == 0) continue;
+        // (scheduled, the first store waits on its load's scoreboard and
+        // sets the same one again for its own reads: the wait counts first)
+        const ast = test_work.ops[2].control;
+        try testing.expectEqual(Kind.ast, test_work.ops[2].kind);
+        try testing.expect(ast.read != NONE and ast.wait & (@as(u6, 1) << ast.read) != 0);
+    }
+}
+
+test "a vertex stage: a program that reads its index, over three warps" {
+    const S = StageTest;
+    var v = sph.Vertex{ .vertex_id = true };
+    v.out_generic[0] = 0x3;
+    const header = sph.vertex(v);
+    const n = 70;
+    const s = S.vertex(&header, n);
+    // (indices 0..3 are the rectangle's corners: u, v, then x, y)
+    const corners = [4][4]f32{ .{ 0, 0, -1, -1 }, .{ 1, 0, 1, -1 }, .{ 0, 1, -1, 1 }, .{ 1, 1, 1, 1 } };
+    for (0..3) |pass| {
+        for (0..n) |t| {
+            S.in[t] = @splat(0);
+            S.in[t][0x2fc / 4] = @intCast(t);
+        }
+        if (pass == 0) try loadText(&test_work, VERTEX_ID) else try loadScheduled(VERTEX_ID);
+        test_work.strict = pass == 2;
+        defer test_work.strict = false;
+        const stats = try runStage(&s, n);
+        try testing.expectEqual(@as(u64, 3), stats.warps);
+        for (0..n) |t| {
+            // u is the index's bit 0, v the bits above it
+            const u: f32 = @floatFromInt(t & 1);
+            const vv: f32 = @floatFromInt(t >> 1);
+            const want = if (t < 4) corners[t] else [4]f32{ u, vv, 2 * u - 1, 2 * vv - 1 };
+            try testing.expectEqual(bitsOf(want[2]), S.out[t][0x70 / 4]);
+            try testing.expectEqual(bitsOf(want[3]), S.out[t][0x74 / 4]);
+            try testing.expectEqual(@as(u32, 0), S.out[t][0x78 / 4]);
+            try testing.expectEqual(@as(u32, 0x3f80_0000), S.out[t][0x7c / 4]);
+            try testing.expectEqual(bitsOf(want[0]), S.out[t][0x80 / 4]);
+            try testing.expectEqual(bitsOf(want[1]), S.out[t][0x84 / 4]);
+            try testing.expectEqual([6]u32{ 0xf000_0000, 0x3, 0, 0, 0, 0 }, S.stored[t]);
+        }
+    }
+}
+
+test "a pixel stage: the assembler's program carries, samples through the handle and discards" {
+    const S = StageTest;
+    // each pixel's 1/w, u/w and v/w as the engine carries them, and the u
+    // and v the program must get by multiplying with w (all exact)
+    const inv_w = [8]f32{ 1, 0.5, 0.25, 0.5, 2, 0.125, 4, 1 };
+    const u_w = [8]f32{ 0, 0.125, 0.125, 0.375, 2, 0.015625, 1.5, 0.625 };
+    const v_w = [8]f32{ 0, 0.25, 0.0625, 0.5, 1, 0.09375, 3.5, 0.125 };
+    const u = [8]f32{ 0, 0.25, 0.5, 0.75, 1, 0.125, 0.375, 0.625 };
+    const v = [8]f32{ 0, 0.5, 0.25, 1, 0.5, 0.75, 0.875, 0.125 };
+    // the handle: sampler 3, texture 7
+    var cb1 = [_]u32{0x1111_1111} ** 8;
+    cb1[0x10 / 4] = 0x0030_0007;
+    var p = sph.Pixel{ .kills = true };
+    p.in_generic[0] = .{ .perspective, .perspective, .unused, .unused };
+    const header = sph.pixel(p);
+    var s = S.pixel(&header, 8);
+    s.cbufs[1] = std.mem.sliceAsBytes(&cb1);
+    for (0..3) |pass| {
+        for (0..8) |t| {
+            S.in[t] = @splat(0x5555_5555);
+            S.in[t][0x7c / 4] = bitsOf(inv_w[t]);
+            S.in[t][0x80 / 4] = bitsOf(u_w[t]);
+            S.in[t][0x84 / 4] = bitsOf(v_w[t]);
+            S.killed[t] = true;
+        }
+        S.calls = 0;
+        if (pass == 0) try loadText(&test_work, PIXEL) else try loadScheduled(PIXEL);
+        test_work.strict = pass == 2;
+        defer test_work.strict = false;
+        _ = try runStage(&s, 8);
+        // the callback: once a pixel, in order, with the constant buffer's
+        // handle and the pixel's u and v
+        try testing.expectEqual(@as(usize, 8), S.calls);
+        for (0..8) |t| {
+            try testing.expectEqual(@as(u32, 0x0030_0007), S.handles[t]);
+            try testing.expectEqual(u[t], S.xs[t]);
+            try testing.expectEqual(v[t], S.ys[t]);
+        }
+        // the colour in R0..R3: u + 1, 2 v, 7 + 3, and the alpha, under a
+        // half only for the pixel at u = 0.75, which alone is discarded
+        for (0..8) |ti| {
+            const t: u32 = @intCast(ti);
+            try testing.expectEqual(bitsOf(u[t] + 1), threadReg(&test_work, t, 0));
+            try testing.expectEqual(bitsOf(v[t] * 2), threadReg(&test_work, t, 1));
+            try testing.expectEqual(bitsOf(10), threadReg(&test_work, t, 2));
+            try testing.expectEqual(bitsOf(if (t == 3) 0.25 else 1), threadReg(&test_work, t, 3));
+            try testing.expectEqual(t == 3, S.killed[t]);
+        }
+    }
+}
+
+test "textures: the channel mask, a result over its sources, a texel fetch at a level" {
+    const S = StageTest;
+    var s = S.pixel(null, 1);
+    s.fetch = &S.fetch;
+    S.in[0] = @splat(0);
+    // red, green and alpha: three registers in order, the first two from
+    // Rd0, the third in Rd1; the register after it is left alone
+    S.calls = 0;
+    try loadText(&test_work,
+        \\MOV R4, 0x3f000000
+        \\MOV R5, 0x3e800000
+        \\MOV R6, 0x00100002
+        \\TEX.B.LZ R2, R0, R4, R6, 2D, 0xb
+        \\EXIT
+    );
+    _ = try runStage(&s, 1);
+    try testing.expectEqual(@as(f32, 0.5), S.xs[0]);
+    try testing.expectEqual(@as(f32, 0.25), S.ys[0]);
+    try testing.expectEqual([4]u32{ bitsOf(1.5), bitsOf(0.5), bitsOf(1), POISON }, test_work.regs[0][0..4].*);
+    // red and blue alone: both in Rd0's pair, and Rd1 is RZ
+    try loadText(&test_work,
+        \\MOV R4, 0x3f000000
+        \\MOV R5, 0x3e800000
+        \\MOV R6, 0x00100002
+        \\TEX.B.DXY.NODEP RZ, R0, R4, R6, 2D, 0x5
+        \\EXIT
+    );
+    _ = try runStage(&s, 1);
+    try testing.expectEqual([3]u32{ bitsOf(1.5), bitsOf(3), POISON }, test_work.regs[0][0..3].*);
+    // the result over the coordinates and the handle: read first
+    try loadText(&test_work,
+        \\MOV R0, 0x3f000000
+        \\MOV R1, 0x3e800000
+        \\MOV R2, 0x00100002
+        \\TEX.B.NDV R2, R0, R0, R2, 2D
+        \\EXIT
+    );
+    _ = try runStage(&s, 1);
+    try testing.expectEqual([4]u32{ bitsOf(1.5), bitsOf(0.5), bitsOf(3), bitsOf(1) }, test_work.regs[0][0..4].*);
+    // a texel: integer coordinates, the level after the handle (.LL) or 0
+    S.calls = 0;
+    try loadText(&test_work,
+        \\MOV R4, 0x9
+        \\MOV R5, -0x2
+        \\MOV R6, 0x00100002
+        \\MOV R7, 0x3
+        \\TLD.B.LL R2, R0, R4, R6, 2D
+        \\TLD.B.LZ R10, R8, R4, R6, 2D
+        \\EXIT
+    );
+    _ = try runStage(&s, 1);
+    try testing.expectEqual([4]u32{ bitsOf(9), bitsOf(-2), bitsOf(3), bitsOf(2) }, test_work.regs[0][0..4].*);
+    try testing.expectEqual(bitsOf(0), test_work.regs[0][10]);
+    try testing.expectEqual([2]i32{ 3, 0 }, S.lods[0..2].*);
+    try testing.expectEqual(@as(u32, 0x0010_0002), S.handles[1]);
+}
+
+test "a stage refuses a load its header does not declare" {
+    const S = StageTest;
+    for (0..4) |t| S.in[t] = @splat(0);
+    // attribute 1's words are loaded and not declared
+    var v = sph.Vertex{};
+    v.in_generic[0] = 0xf;
+    v.out_generic[0] = 0x3;
+    var header = sph.vertex(v);
+    try loadText(&test_work, VERTEX);
+    try testing.expectError(error.HeaderMismatch, stage(&S.vertex(&header, 4), 4));
+    try testing.expectEqual(What.header, test_work.trap.what);
+    try testing.expectEqual(Why.load_undeclared, test_work.trap.why);
+    try testing.expectEqual(@as(u64, 0x10), test_work.trap.pc);
+    try testing.expectEqual(@as(u16, 0x90), test_work.trap.attr);
+    var buf: [256]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, explain(&test_work, &buf), "loads attribute word 0x90, which the header does not declare") != null);
+    // without a header nothing is held against it
+    _ = try runStage(&S.vertex(null, 4), 4);
+    // a pixel program's v, read and not declared
+    var p = sph.Pixel{ .kills = true };
+    p.in_generic[0] = .{ .perspective, .unused, .unused, .unused };
+    header = sph.pixel(p);
+    try loadText(&test_work, PIXEL);
+    try testing.expectError(error.HeaderMismatch, stage(&S.pixel(&header, 1), 1));
+    try testing.expectEqual(Why.load_undeclared, test_work.trap.why);
+    try testing.expectEqual(@as(u16, 0x84), test_work.trap.attr);
+    // a word the header keeps flat read as a carried one, and the other way
+    p.in_generic[0] = .{ .perspective, .constant, .unused, .unused };
+    header = sph.pixel(p);
+    try testing.expectError(error.HeaderMismatch, stage(&S.pixel(&header, 1), 1));
+    try testing.expectEqual(Why.interpolation, test_work.trap.why);
+    try testing.expectEqual(@as(u64, 0x20), test_work.trap.pc);
+    try expectRefused("IPA.CONSTANT R0, a[0x80]\nEXIT", &S.pixel(&header, 1), error.HeaderMismatch, .interpolation);
+    // (flat where the header says flat; the position's w is a word either way)
+    try loadText(&test_work, "IPA.CONSTANT R0, a[0x84]\nIPA.CONSTANT R1, a[0x7c]\nIPA.PASS R2, a[0x7c]\nIPA.PASS R3, a[0x80]\nEXIT");
+    _ = try runStage(&S.pixel(&header, 1), 1);
+    // a vertex program that loads after a store, under a header that says
+    // it has no such load
+    const late = "ALD.128 R4, a[0x80]\nAST.128 a[0x70], R4\nALD.64 R8, a[0x90]\nAST.64 a[0x80], R8\nEXIT";
+    v.in_generic[1] = 0x3;
+    header = sph.vertex(v);
+    try expectRefused(late, &S.vertex(&header, 1), error.HeaderMismatch, .load_after_store);
+    try testing.expectEqual(@as(u64, 0x20), test_work.trap.pc);
+    v.loads_before_stores = false;
+    header = sph.vertex(v);
+    try loadText(&test_work, late);
+    _ = try runStage(&S.vertex(&header, 1), 1);
+}
+
+test "a stage refuses a store its header does not declare, and an end without one it declares" {
+    const S = StageTest;
+    for (0..4) |t| S.in[t] = @splat(0);
+    var v = sph.Vertex{};
+    v.in_generic[0] = 0xf;
+    v.in_generic[1] = 0x3;
+    // generic 0's y is stored and not declared
+    v.out_generic[0] = 0x1;
+    var header = sph.vertex(v);
+    try loadText(&test_work, VERTEX);
+    try testing.expectError(error.HeaderMismatch, stage(&S.vertex(&header, 4), 4));
+    try testing.expectEqual(Why.store_undeclared, test_work.trap.why);
+    try testing.expectEqual(@as(u64, 0x30), test_work.trap.pc);
+    try testing.expectEqual(@as(u16, 0x84), test_work.trap.attr);
+    // its z is declared and never stored
+    v.out_generic[0] = 0x7;
+    header = sph.vertex(v);
+    try testing.expectError(error.HeaderMismatch, stage(&S.vertex(&header, 4), 4));
+    try testing.expectEqual(Why.store_missing, test_work.trap.why);
+    try testing.expectEqual(@as(u16, 0x88), test_work.trap.attr);
+    try testing.expectEqual(@as(u64, 0x40), test_work.trap.pc); // (its EXIT)
+    // a discard the header does not declare, for the pixel that discards
+    var p = sph.Pixel{};
+    p.in_generic[0] = .{ .perspective, .perspective, .unused, .unused };
+    header = sph.pixel(p);
+    var cb1 = [_]u32{0} ** 8;
+    var s = S.pixel(&header, 2);
+    s.cbufs[1] = std.mem.sliceAsBytes(&cb1);
+    S.in[0][0x7c / 4] = bitsOf(1);
+    S.in[1][0x7c / 4] = bitsOf(1);
+    S.in[1][0x80 / 4] = bitsOf(0.75);
+    S.calls = 0;
+    try loadText(&test_work, PIXEL);
+    try testing.expectError(error.HeaderMismatch, stage(&s, 2));
+    try testing.expectEqual(Why.kill_undeclared, test_work.trap.why);
+    try testing.expectEqual(@as(u32, 1), test_work.trap.thread);
+    // a colour's register the header declares and the program never wrote
+    try expectRefused("IPA.PASS R0, a[0x7c]\nMOV R2, R0\nMOV R3, R0\nEXIT", &S.pixel(&header, 1), error.HeaderMismatch, .colour_missing);
+    try testing.expectEqual(@as(u8, 1), test_work.trap.reg);
+    var buf: [256]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, explain(&test_work, &buf), "R1 never written") != null);
+}
+
+test "a stage refuses the other stage's instructions, and a header of the other kind" {
+    const S = StageTest;
+    S.in[0] = @splat(0);
+    const vertex = S.vertex(null, 1);
+    const pixel = S.pixel(null, 1);
+    // ALD in a pixel program
+    try expectRefused("ALD R0, a[0x2fc]\nEXIT", &pixel, error.BadInstruction, .wrong_stage);
+    try testing.expectEqual(What.bad_instruction, test_work.trap.what);
+    var buf: [256]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, explain(&test_work, &buf), "the other stage's instruction") != null);
+    try expectRefused("AST a[0x70], R0\nEXIT", &pixel, error.BadInstruction, .wrong_stage);
+    // IPA, PIXLD and KILL in a vertex program
+    try expectRefused("IPA.PASS R0, a[0x7c]\nEXIT", &vertex, error.BadInstruction, .wrong_stage);
+    try expectRefused("PIXLD.COVMASK R0\nEXIT", &vertex, error.BadInstruction, .wrong_stage);
+    try expectRefused("KILL\nEXIT", &vertex, error.BadInstruction, .wrong_stage);
+    // a pixel Stage with a vertex program's header, a header that is
+    // neither, and a pixel program's that does not read the position's w
+    var header = sph.vertex(.{});
+    try loadText(&test_work, "EXIT");
+    try testing.expectError(error.BadLaunch, stage(&S.pixel(&header, 1), 1));
+    try testing.expectEqual(Why.header_kind, test_work.trap.why);
+    header = @splat(0);
+    try testing.expectError(error.BadLaunch, stage(&S.vertex(&header, 1), 1));
+    header = sph.pixel(.{ .targets = @splat(0) });
+    header[5] = 0;
+    try testing.expectError(error.BadLaunch, stage(&S.pixel(&header, 1), 1));
+    try testing.expectEqual(Why.header_kind, test_work.trap.why);
+    // stageRun without its stageBegin, or for other threads than it began
+    const mem = Memory{ .regions = &.{} };
+    var stats = Stats{};
+    try testing.expectError(error.BadLaunch, stageRun(&test_work, &mem, &vertex, 1, &stats));
+    try testing.expectEqual(Why.threads, test_work.trap.why);
+    try stageBegin(&test_work, 2);
+    try testing.expectError(error.BadLaunch, stageRun(&test_work, &mem, &vertex, 1, &stats));
+    try testing.expectError(error.BadLaunch, stageBegin(&test_work, MAX_THREADS + 1));
+    // (and with slices shorter than the threads)
+    try testing.expectError(error.BadLaunch, stage(&S.vertex(null, 1), 2));
+}
+
+test "a compute launch refuses a graphics stage's instruction; a stage refuses a compute launch's" {
+    const l = Launch{};
+    const mem = Memory{ .regions = &.{} };
+    var buf: [256]u8 = undefined;
+    for ([_][]const u8{
+        "ALD R0, a[0x2fc]",
+        "AST a[0x70], R0",
+        "IPA.PASS R0, a[0x7c]",
+        "PIXLD.COVMASK R0",
+        "KILL",
+        "TEX.B.DXY R2, R0, R4, R6, 2D",
+        "TLD.B.LZ R2, R0, R4, R6, 2D",
+    }) |text| {
+        var stats = Stats{};
+        try loadText(&test_work, text);
+        try testing.expectError(error.BadInstruction, run(&test_work, &mem, &l, &stats));
+        try testing.expectEqual(What.bad_instruction, test_work.trap.what);
+        try testing.expectEqual(Why.stage_only, test_work.trap.why);
+        try testing.expect(std.mem.indexOf(u8, explain(&test_work, &buf), "a graphics stage's instruction in a compute launch") != null);
+    }
+    // a barrier, shared memory, the thread's and the CTA's place
+    const S = StageTest;
+    S.in[0] = @splat(0);
+    const pixel = S.pixel(null, 1);
+    for ([_][]const u8{
+        "BAR.SYNC.DEFER_BLOCKING 0x0",
+        "LDS R0, [RZ+0x400]",
+        "STS [RZ+0x400], R0",
+        "ATOMS.ADD R1, [RZ+0x400], R0",
+        "S2R R0, SR_TID.X",
+        "S2UR UR4, SR_CTAID.Y",
+    }) |text| {
+        try expectRefused(text, &pixel, error.BadInstruction, .compute_only);
+        try testing.expect(std.mem.indexOf(u8, explain(&test_work, &buf), "a compute launch's instruction") != null);
+    }
+    // (a Stage has no local memory, and constant buffers 0..7 only)
+    try expectRefused("LDL R0, [RZ]", &pixel, error.Unsupported, .no_data);
+    try expectRefused("LDC R0, c[0x9][0x0]", &pixel, error.Unsupported, .form);
+    // what belongs to neither still runs in a stage: a lane's index, a
+    // branch, a constant
+    try loadText(&test_work,
+        \\S2R R0, SR_LANEID
+        \\ISETP.NE.AND P0, PT, R0, RZ, PT
+        \\@P0 BRA `(odd)
+        \\MOV R0, 0x7
+        \\odd:
+        \\EXIT
+    );
+    S.in[1] = @splat(0);
+    _ = try runStage(&S.pixel(null, 2), 2);
+    try testing.expectEqual([2]u32{ 7, 1 }, [2]u32{ threadReg(&test_work, 0, 0), threadReg(&test_work, 1, 0) });
+}
+
+test "a texture instruction without its callback, and the forms that are not run" {
+    const S = StageTest;
+    S.in[0] = @splat(0);
+    var pixel = S.pixel(null, 1);
+    const vertex = S.vertex(null, 1);
+    const regs = "MOV R4, RZ\nMOV R5, RZ\nMOV R6, RZ\nMOV R7, RZ\n";
+    // TEX with no `sample`, TLD with no `fetch`
+    pixel.sample = null;
+    try expectRefused(regs ++ "TEX.B.DXY R2, R0, R4, R6, 2D\nEXIT", &pixel, error.Unsupported, .no_callback);
+    try testing.expectEqual(What.unsupported, test_work.trap.what);
+    try testing.expectEqual(@as(u64, 0x40), test_work.trap.pc);
+    var buf: [256]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, explain(&test_work, &buf), "no callback") != null);
+    try expectRefused(regs ++ "TLD.B.LZ R2, R0, R4, R6, 2D\nEXIT", &pixel, error.Unsupported, .no_callback);
+    pixel.sample = &S.sample;
+    pixel.fetch = &S.fetch;
+    // the forms of each instruction that are not run
+    for ([_]struct { []const u8, *const Stage, Why }{
+        .{ "IPA.STATE R0, a[0x80]", &pixel, .form },
+        .{ "IPA.PASS R0, P1, a[0x80]", &pixel, .form },
+        .{ "IPA.PASS.CENTROID R0, a[0x80]", &pixel, .no_data },
+        .{ "IPA.PASS.OFFSET R0, a[0x80], R9", &pixel, .no_data },
+        .{ "IPA.CONSTANT R6, a[0x3fc]", &pixel, .address },
+        .{ "PIXLD R0", &pixel, .no_data },
+        .{ "PIXLD.COVMASK R0", &pixel, .no_data },
+        .{ "PIXLD.MY_INDEX R0, P0", &pixel, .no_data },
+        .{ "KILL P1", &pixel, .form },
+        .{ "ALD.O R4, a[0x88]", &vertex, .form },
+        .{ "ALD.P R5, a[R7+0x20]", &vertex, .form },
+        .{ "ALD.PHYS R5, a[R7]", &vertex, .form },
+        .{ "ALD R4, a[0x80], R9", &vertex, .form },
+        .{ "ALD.128 R4, a[0x84]", &vertex, .address },
+        .{ "ALD.64 R4, a[0x2fc]", &vertex, .address },
+        .{ "ALD.64 R254, a[0x80]", &vertex, .form },
+        .{ "AST.P a[0x20], R4", &vertex, .form },
+        .{ "AST a[0x70], R4, R9", &vertex, .form },
+        .{ "AST.64 a[0x74], R4", &vertex, .address },
+        .{ "AST a[0x300], R4", &vertex, .address },
+        .{ "TEX.B.LL R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TEX.B.LB R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TEX.B.AOFFI.DXY R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TEX.B.DC.DXY R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TEX.B.EF.DXY R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TEX.SCR.B.DXY R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TEX.DXY R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TEX.B.DXY R2, R0, R4, R6, 3D", &pixel, .form },
+        .{ "TEX.B.DXY R2, R0, R4, R6, CUBE", &pixel, .form },
+        .{ "TEX.B.DXY P0, R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TEX.B.DXY R2, R0, R4, R6, UR3, 2D", &pixel, .form },
+        .{ "TEX.B.DXY R2, R0, R254, R6, 2D", &pixel, .form },
+        .{ "TLD.B.ULL R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TLD.B.LZ.MS R2, R0, R4, R6, 2D", &pixel, .form },
+        .{ "TLD.B.LZ R2, R0, R4, R6, ARRAY_2D", &pixel, .form },
+    }) |c| {
+        var text: [96]u8 = undefined;
+        try expectRefused(try std.fmt.bufPrint(&text, "{s}\nEXIT", .{c[0]}), c[1], error.Unsupported, c[2]);
+    }
+    try testing.expect(std.mem.indexOf(u8, explain(&test_work, &buf), "a form of the instruction the emulator does not run") != null);
+    // what nvdisasm calls illegal is a bad instruction: an index register
+    // without .P or .PHYS, a texture's source RZ, a fetch without a level
+    for ([_][]const u8{ "ALD R5, a[R7+0x20]", "AST.PHYS a[0x70], R4", "IPA R0, a[0x7c]", "IPA.PASS R0, a[0x7e]", "TEX.B.DXY R2, R0, R4, RZ, 2D", "TLD.B R2, R0, R4, R6, 2D" }) |text| {
+        try expectRefused(text, if (text[0] == 'A') &vertex else &pixel, error.BadInstruction, .none);
+    }
+}
+
+test "a stage's hazards: a result consumed without waiting on its scoreboard, a stored register overwritten, an EXIT with one out" {
+    const S = StageTest;
+    S.in[0] = @splat(0x3f80_0000);
+    var buf: [256]u8 = undefined;
+    var text: [512]u8 = undefined;
+    const pixel = S.pixel(null, 1);
+    // an interpolated word read by a multiply that does not wait on the
+    // scoreboard the interpolation set
+    const carried =
+        \\[B------:R-:W0:-:S02] IPA.PASS R4, a[0x80]
+        \\[B0-----:R-:W-:-:S06] FMUL.RZ R0, R4, R4
+        \\[B------:R-:W-:-:S01] EXIT
+    ;
+    try loadText(&test_work, carried);
+    _ = try runStage(&pixel, 1);
+    _ = std.mem.replace(u8, carried, "[B0-----:R-:W-:-:S06] FMUL", "[B------:R-:W-:-:S06] FMUL", &text);
+    try loadText(&test_work, text[0..carried.len]);
+    try testing.expectError(error.Hazard, stage(&pixel, 1));
+    try testing.expectEqual(HazardKind.raw, test_work.trap.hazard);
+    try testing.expect(test_work.trap.scoreboard);
+    try testing.expectEqual(@as(u64, 0x10), test_work.trap.pc);
+    try testing.expectEqual(@as(u64, 0), test_work.trap.other_pc);
+    try testing.expectEqual(@as(u8, 4), test_work.trap.reg);
+    try testing.expect(std.mem.indexOf(u8, explain(&test_work, &buf), "raw of R4 before the scoreboard of 0x0000 (ipa) was waited on") != null);
+    // (and waited on a cycle too soon after it was set)
+    _ = std.mem.replace(u8, carried, "W0:-:S02] IPA", "W0:-:S01] IPA", &text);
+    try loadText(&test_work, text[0..carried.len]);
+    try testing.expectError(error.Hazard, stage(&pixel, 1));
+    try testing.expectEqual(HazardKind.wait_too_soon, test_work.trap.hazard);
+    // a texture: its handle read before the constant's scoreboard is
+    // waited on, and its colour read before its own is
+    var cb1 = [_]u32{0x0010_0002} ** 8;
+    var tex = S.pixel(null, 1);
+    tex.cbufs[1] = std.mem.sliceAsBytes(&cb1);
+    const sampled =
+        \\[B------:R-:W0:-:S02] LDC R6, c[0x1][0x10]
+        \\[B------:R-:W1:-:S02] IPA.PASS R4, a[0x80]
+        \\[B------:R-:W2:-:S02] IPA.PASS R5, a[0x84]
+        \\[B------:R-:W5:-:S02] IPA.PASS R7, a[0x88]
+        \\[B012---:R3:W4:-:S02] TEX.B.DXY R2, R0, R4, R6, 2D
+        \\[B---34-:R-:W-:-:S06] FMUL R0, R0, R3
+        \\[B-----5:R-:W-:-:S01] EXIT
+    ;
+    S.calls = 0;
+    try loadText(&test_work, sampled);
+    // (R7's scoreboard is still out when the texture issues: sm120_sched
+    // would count R7 among the coordinates' vector; the texture does not
+    // read it, and is not held to it)
+    try testing.expect(reads(&(try sched.usesOf(&test_work.src[4])), .gpr, 7));
+    try testing.expect(!reads(&test_work.ops[4].uses, .gpr, 7));
+    _ = try runStage(&tex, 1);
+    try testing.expectEqual(bitsOf(2 * 1), threadReg(&test_work, 0, 0)); // (1 + 1) * alpha 1
+    _ = std.mem.replace(u8, sampled, "[B012---:R3:W4:-:S02] TEX", "[B-12---:R3:W4:-:S02] TEX", &text);
+    try loadText(&test_work, text[0..sampled.len]);
+    try testing.expectError(error.Hazard, stage(&tex, 1));
+    try testing.expectEqual(@as(u64, 0x40), test_work.trap.pc);
+    try testing.expectEqual(@as(u8, 6), test_work.trap.reg);
+    _ = std.mem.replace(u8, sampled, "[B---34-:R-:W-:-:S06] FMUL", "[B---3--:R-:W-:-:S06] FMUL", &text);
+    try loadText(&test_work, text[0..sampled.len]);
+    try testing.expectError(error.Hazard, stage(&tex, 1));
+    try testing.expectEqual(@as(u64, 0x50), test_work.trap.pc);
+    try testing.expectEqual(@as(u64, 0x40), test_work.trap.other_pc);
+    try testing.expectEqual(@as(u8, 0), test_work.trap.reg);
+    // a store waits on its load's scoreboard and sets the same one for its
+    // own reads; its register may be overwritten once that is waited on
+    const vertex = S.vertex(null, 1);
+    const kept =
+        \\[B------:R-:W0:-:S02] ALD.128 R4, a[0x80]
+        \\[B0-----:R0:W-:-:S02] AST.128 a[0x70], R4
+        \\[B0-----:R-:W-:-:S01] MOV R4, RZ
+        \\[B------:R-:W-:-:S01] EXIT
+    ;
+    try loadText(&test_work, kept);
+    _ = try runStage(&vertex, 1);
+    try testing.expectEqual(@as(u32, 0x3f80_0000), S.out[0][0x70 / 4]);
+    _ = std.mem.replace(u8, kept, "[B0-----:R-:W-:-:S01] MOV", "[B------:R-:W-:-:S01] MOV", &text);
+    try loadText(&test_work, text[0..kept.len]);
+    try testing.expectError(error.Hazard, stage(&vertex, 1));
+    try testing.expectEqual(HazardKind.war, test_work.trap.hazard);
+    try testing.expectEqual(@as(u64, 0x20), test_work.trap.pc);
+    try testing.expectEqual(@as(u64, 0x10), test_work.trap.other_pc);
+    // (the store without its wait reads the load's registers too soon)
+    _ = std.mem.replace(u8, kept, "[B0-----:R0:W-:-:S02] AST", "[B------:R0:W-:-:S02] AST", &text);
+    try loadText(&test_work, text[0..kept.len]);
+    try testing.expectError(error.Hazard, stage(&vertex, 1));
+    try testing.expectEqual(HazardKind.raw, test_work.trap.hazard);
+    try testing.expectEqual(@as(u64, 0x10), test_work.trap.pc);
+    // an EXIT with the store's scoreboard still out
+    const open =
+        \\[B------:R-:W0:-:S02] ALD.128 R4, a[0x80]
+        \\[B0-----:R1:W-:-:S02] AST.128 a[0x70], R4
+        \\[B------:R-:W-:-:S01] EXIT
+    ;
+    try loadText(&test_work, open);
+    try testing.expectError(error.Hazard, stage(&vertex, 1));
+    try testing.expectEqual(HazardKind.exit_pending, test_work.trap.hazard);
+    try testing.expectEqual(@as(u64, 0x20), test_work.trap.pc);
+    try testing.expectEqual(@as(u64, 0x10), test_work.trap.other_pc);
+    try testing.expectEqual(@as(u8, 1), test_work.trap.reg);
+    try testing.expect(std.mem.indexOf(u8, explain(&test_work, &buf), "the program ends with scoreboard 1 still out: 0x0010 (ast) set it") != null);
+    // (not held against a program run without the checks)
+    test_work.check_hazards = false;
+    defer test_work.check_hazards = true;
+    _ = try runStage(&vertex, 1);
+}
+
+/// Whether every register `a` names is one `b` names, in the same category.
+fn usesWithin(a: []const sched.Use, b: []const sched.Use) bool {
+    for (a) |x| {
+        const found = for (b) |y| {
+            if (x.file == y.file and x.n == y.n and x.cat == y.cat) break true;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
+
+test "the graphics stages' reads and writes: sm120_sched's, the emulator's own the same, a texture's without what it does not touch" {
+    for ([_][]const u8{
+        "ALD R0, a[0x2fc]",
+        "ALD.128 R4, a[0x80]",
+        "@P1 ALD.96 R4, a[0x80]",
+        "AST.128 a[0x70], R4",
+        "AST.64 a[0x80], R8",
+        "IPA.PASS R0, a[0x7c]",
+        "IPA.CONSTANT R6, a[0x90]",
+        "IPA.PASS.OFFSET R5, P2, a[0x80], R9",
+        "PIXLD.COVMASK R5, P0",
+        "@P0 KILL",
+        "KILL",
+        "TEX.B.DXY R2, R0, R4, R6, 2D",
+        "@!P2 TEX.B.LZ RZ, R0, R4, R6, 2D, 0x3",
+        "TEX.B.DXY R2, R0, R4, R6, 2D, 0x7",
+        "TLD.B.LL R2, R0, R4, R6, 2D",
+    }) |text| {
+        const in = try sm120.parse(text);
+        const op = try compile(&in, null, 1);
+        const theirs = try sched.usesOf(&in);
+        const own = fallbackUses(&op, &in);
+        errdefer std.debug.print("\"{s}\"\n", .{text});
+        try testing.expect(theirs.decoupled and own.decoupled and op.uses.decoupled);
+        try testing.expect(!op.lsu);
+        // what the emulator checks is among what sm120_sched schedules for
+        try testing.expect(usesWithin(op.uses.dsts(), theirs.dsts()) and usesWithin(op.uses.srcs(), theirs.srcs()));
+        // and its own answer is the one it uses
+        try testing.expect(usesWithin(own.dsts(), op.uses.dsts()) and usesWithin(op.uses.dsts(), own.dsts()));
+        try testing.expect(usesWithin(own.srcs(), op.uses.srcs()) and usesWithin(op.uses.srcs(), own.srcs()));
+        if (op.kind == .tex or op.kind == .tld) continue;
+        try testing.expect(usesWithin(theirs.dsts(), op.uses.dsts()) and usesWithin(theirs.srcs(), op.uses.srcs()));
+    }
+    // a texture's registers: the channels' and no more; two coordinates,
+    // the handle, a fetch's level
+    const all = try compile(&try sm120.parse("TEX.B.DXY R2, R0, R4, R6, 2D"), null, 1);
+    try testing.expectEqual(@as(usize, 4), all.uses.dsts().len);
+    try testing.expectEqual(@as(usize, 3), all.uses.srcs().len);
+    try testing.expectEqual(@as(?u8, 6), all.top);
+    const two = try compile(&try sm120.parse("TEX.B.LZ RZ, R0, R4, R6, 2D, 0x3"), null, 1);
+    try testing.expectEqual(@as(usize, 2), two.uses.dsts().len);
+    const level = try compile(&try sm120.parse("TLD.B.LL R2, R0, R4, R6, 2D"), null, 1);
+    try testing.expectEqual(@as(usize, 4), level.uses.srcs().len);
+    try testing.expectEqual(@as(?u8, 7), level.top);
 }
