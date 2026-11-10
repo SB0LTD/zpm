@@ -133,6 +133,11 @@ pub const Options = struct {
     /// The caller's clock (ns), for profileStep's account of a call's CPU
     /// side (null: not timed).
     clock: ?*const fn () u64 = null,
+    /// forwardSees calls it between two layers (a pass of a thousand tokens
+    /// is seconds on the GPU): until it returns, the device and the Work
+    /// are the caller's to lend to another backend's call (a voice's step
+    /// that should not wait for the whole pass).
+    yield: ?*const fn () void = null,
 };
 
 /// One kind of dispatch in a profiled call: a kernel, or for a matrix the
@@ -1018,6 +1023,10 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 ns += try self.runList(c, &l);
                 sent += l.n;
                 l = List{ .work = self.work };
+                // (nothing of the pass is in the Work now)
+                if (li + 1 < plan.layer_count) {
+                    if (self.options.yield) |yield| yield();
+                }
             }
             self.dispatches = @intCast(sent);
             self.total_dispatches += sent;

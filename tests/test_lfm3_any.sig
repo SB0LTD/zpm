@@ -412,6 +412,11 @@ test "...on non-coherent unified memory (every hand-over checked)" {
 const SEEN_TOKENS = 80;
 const SEEN_LIMITS = executor.Limits{ .hidden = HIDDEN, .feed_forward = FEED, .query = HEADS * HEAD, .key_value = KV_HEADS * HEAD, .heads = HEADS, .vocabulary = VOCAB, .batch = 96, .context = 96 };
 var seen_work: executor.Workspace(SEEN_LIMITS) = .{};
+var seen_yields: u32 = 0;
+
+fn seenYield() void {
+    seen_yields += 1;
+}
 
 /// One pass of 80 tokens from position 0 (longer than one dispatch list
 /// takes: a layer at a time): a state of 30 and three questions of 20, 13
@@ -426,11 +431,12 @@ fn seenPass(which: Device, tolerance: f64, tiled_attention: bool) !f64 {
     const src = fixture.source();
     const gpu_src = if (which == .discrete) fixture.readOnly() else src;
     const d = makeDevice(which);
-    var backend = Backend.init(d, plan, &fixture.index, gpu_src, .{ .max_batch = 96, .attention_tokens = 8, .tiled_attention = tiled_attention }, &work) catch |e| {
+    var backend = Backend.init(d, plan, &fixture.index, gpu_src, .{ .max_batch = 96, .attention_tokens = 8, .tiled_attention = tiled_attention, .yield = &seenYield }, &work) catch |e| {
         std.debug.print("init on {s}: {s}\n", .{ @tagName(which), @errorName(e) });
         return e;
     };
     defer backend.deinit();
+    seen_yields = 0;
     var gc = try backend.newCache(96);
     defer backend.freeCache(&gc);
     var ccache = cpuCache(96);
@@ -444,6 +450,8 @@ fn seenPass(which: Device, tolerance: f64, tiled_attention: bool) !f64 {
     _ = try executor.forwardSees(CAPACITY, SEEN_LIMITS, src, &fixture.index, plan, &unpacked, &seen_work, &ccache, &tokens, .none, &sees, .{});
     backend.forwardSees(&gc, &tokens, &sees) catch |e| return failure(&backend, e);
     try std.testing.expectEqual(ccache.position, gc.cpu.position);
+    // (the caller had the device between every two layers)
+    try std.testing.expectEqual(@as(u32, LAYERS - 1), seen_yields);
     const positions = [_]u32{ 49, 62, 79, 7, 30 };
     var rows: [positions.len * HIDDEN]f32 = undefined;
     backend.residualRows(&gc, &positions, &rows) catch |e| return failure(&backend, e);
