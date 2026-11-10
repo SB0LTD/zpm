@@ -8,10 +8,13 @@
 //! LUMINANCE and ALPHA (swizzled R8), a BGRA texture, RGB565 unpacked
 //! with a TEXTURE_SWIZZLE, an RGBA32F texelFetch, an RGBA32I integer
 //! texture, textureSize, a unit with no texture, a sampler object's
-//! filter over its texture's, and a quad whose corners its vertex shader
-//! fetches from a float texture (vertex texture fetch). The cases are
-//! drawn in two halves, each on a fresh device (the emulated Adreno's
-//! memory is 64 buffers, never freed), into regions apart.
+//! filter over its texture's, a quad whose corners its vertex shader
+//! fetches from a float texture (vertex texture fetch), and
+//! EXT_texture_norm16's R16, RG16, RGBA16 and R16_SNORM (video's 10- to
+//! 16-bit planes) from glTexImage2D and from glTexStorage2D with
+//! glTexSubImage2D, nearest and bilinear. The cases are drawn in three
+//! parts, each on a fresh device (the emulated Adreno's memory is 64
+//! buffers, never freed), into regions apart.
 
 const std = @import("std");
 const gpu = @import("gpu");
@@ -68,7 +71,7 @@ const fs: [:0]const u8 =
 
 const Out = struct {
     fbo: [W * H * 4]u8 = [_]u8{0} ** (W * H * 4),
-    half: [W * H * 4]u8 = undefined,
+    part: [W * H * 4]u8 = undefined,
     errors: u32 = 0,
     log: [512]u8 = undefined,
     log_len: usize = 0,
@@ -105,9 +108,10 @@ fn tex(c: *gles.Context, unit: u32, internal: u32, w: i32, h: i32, format: u32, 
     return name[0];
 }
 
-/// Half 0 draws cases A to H, half 1 cases I to N; out.fbo gets what
-/// it drew (the other half's regions stay clear).
-fn scene(eng: *engine.Engine, out: *Out, half: u1) !void {
+/// Part 0 draws cases A to H, part 1 cases I to N, part 2 O to V (the
+/// norm16 ones); out.fbo gets what it drew (the other parts' regions
+/// stay clear).
+fn scene(eng: *engine.Engine, out: *Out, part: u2) !void {
     objs.init();
     const c = &ctx;
     c.init(eng, &objs);
@@ -166,11 +170,12 @@ fn scene(eng: *engine.Engine, out: *Out, half: u1) !void {
     setI(c, program.getUniformLocation(c, p, "uVerts"), 2);
     setF(c, uScale, &.{ 1, 1 });
     noErr(c, out);
+    if (part == 2) return norm16Part(c, out, fb[0], uRect, p, v, f);
 
     // A: nearest, the 4 x 4 grid (2 x 2 pixels a texel)
     const gpx = grid();
     const t_grid = tex(c, 0, g.RGBA8, 4, 4, g.RGBA, g.UNSIGNED_BYTE, &gpx);
-    if (half == 1) return secondHalf(c, out, t_grid, uRect, uMode, uVtf, p, v, f);
+    if (part == 1) return secondPart(c, out, t_grid, uRect, uMode, uVtf, p, v, f);
     draw(c, uRect, 0, 0);
     // B: bilinear, clamped at the edge
     c.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR);
@@ -206,12 +211,12 @@ fn scene(eng: *engine.Engine, out: *Out, half: u1) !void {
     c.texParameteri(g.TEXTURE_2D, g.TEXTURE_SWIZZLE_G, g.RED);
     draw(c, uRect, 24, 8);
     noErr(c, out);
-    finishHalf(c, out, p, v, f);
+    finishPart(c, out, p, v, f);
 }
 
-fn finishHalf(c: *gles.Context, out: *Out, p: u32, v: u32, f: u32) void {
-    c.readPixels(0, 0, W, H, g.RGBA, g.UNSIGNED_BYTE, &out.half);
-    for (&out.fbo, out.half) |*a, b| a.* |= b;
+fn finishPart(c: *gles.Context, out: *Out, p: u32, v: u32, f: u32) void {
+    c.readPixels(0, 0, W, H, g.RGBA, g.UNSIGNED_BYTE, &out.part);
+    for (&out.fbo, out.part) |*a, b| a.* |= b;
     noErr(c, out);
     c.finish();
     program.useProgram(c, 0);
@@ -234,7 +239,7 @@ fn draw(cc: *gles.Context, l: i32, x0: f32, y0: f32) void {
     cc.drawArrays(g.TRIANGLES, 0, 6, 1);
 }
 
-fn secondHalf(c: *gles.Context, out: *Out, t_grid: u32, uRect: i32, uMode: i32, uVtf: i32, p: u32, v: u32, f: u32) void {
+fn secondPart(c: *gles.Context, out: *Out, t_grid: u32, uRect: i32, uMode: i32, uVtf: i32, p: u32, v: u32, f: u32) void {
     // I: RGBA32F texelFetch: texel (i, j) = (i - 2, j - 2, 0.5, 1)
     var fl: [64]f32 = undefined;
     for (0..4) |j| {
@@ -284,7 +289,71 @@ fn secondHalf(c: *gles.Context, out: *Out, t_grid: u32, uRect: i32, uMode: i32, 
     draw(c, uRect, 100, 100);
     setI(c, uVtf, 0);
     noErr(c, out);
-    finishHalf(c, out, p, v, f);
+    finishPart(c, out, p, v, f);
+}
+
+// EXT_texture_norm16: four 4 x 1 textures, each in a 4 x 4 quad (a texel a
+// column), unorm16 values 0, 32768, 65535 and 16384 in turns.
+const r16 = [_]u16{ 0, 32768, 65535, 16384 };
+const rg16 = [_]u16{ 0, 65535, 32768, 0, 65535, 32768, 16384, 65535 };
+const rgba16 = [_]u16{ 0, 32768, 65535, 65535, 65535, 0, 32768, 16384, 16384, 65535, 0, 32768, 32768, 16384, 65535, 0 };
+const r16_snorm = [_]i16{ 32767, -32768, 16384, 0 };
+
+fn draw4(cc: *gles.Context, l: i32, x0: f32, y0: f32) void {
+    setF(cc, l, &.{ x0, y0, x0 + 4, y0 + 4 });
+    cc.drawArrays(g.TRIANGLES, 0, 6, 1);
+}
+
+/// A 4 x 1 unorm16 texture from glTexStorage2D, its texels given by two
+/// glTexSubImage2D: texels 0 and 1, then 2 and 3.
+fn stored(c: *gles.Context, internal: u32, format: u32, ch: usize, texels: []const u16) void {
+    var name: [1]u32 = undefined;
+    c.genTextures(&name);
+    c.activeTexture(g.TEXTURE0);
+    c.bindTexture(g.TEXTURE_2D, name[0]);
+    c.texStorage2D(g.TEXTURE_2D, 1, internal, 4, 1);
+    c.texSubImage2D(g.TEXTURE_2D, 0, 0, 0, 2, 1, format, g.UNSIGNED_SHORT, texels.ptr);
+    c.texSubImage2D(g.TEXTURE_2D, 0, 2, 0, 2, 1, format, g.UNSIGNED_SHORT, texels[2 * ch ..].ptr);
+    c.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST);
+    c.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST);
+}
+
+fn norm16Part(c: *gles.Context, out: *Out, fb: u32, uRect: i32, p: u32, v: u32, f: u32) void {
+    // O: R16, P: RG16, Q: RGBA16, R: R16_SNORM, from glTexImage2D
+    _ = tex(c, 0, g.R16_EXT, 4, 1, g.RED, g.UNSIGNED_SHORT, &r16);
+    draw4(c, uRect, 16, 24);
+    _ = tex(c, 0, g.RG16_EXT, 4, 1, g.RG, g.UNSIGNED_SHORT, &rg16);
+    draw4(c, uRect, 20, 24);
+    _ = tex(c, 0, g.RGBA16_EXT, 4, 1, g.RGBA, g.UNSIGNED_SHORT, &rgba16);
+    draw4(c, uRect, 24, 24);
+    _ = tex(c, 0, g.R16_SNORM_EXT, 4, 1, g.RED, g.SHORT, &r16_snorm);
+    draw4(c, uRect, 28, 24);
+    noErr(c, out);
+    // S, T, U: O, P, Q again from glTexStorage2D and glTexSubImage2D
+    stored(c, g.R16_EXT, g.RED, 1, &r16);
+    draw4(c, uRect, 16, 28);
+    stored(c, g.RG16_EXT, g.RG, 2, &rg16);
+    draw4(c, uRect, 20, 28);
+    stored(c, g.RGBA16_EXT, g.RGBA, 4, &rgba16);
+    draw4(c, uRect, 24, 28);
+    noErr(c, out);
+    // V: R16 0 then 65535, bilinear (video is scaled so), clamped at the edge
+    const ramp = [_]u16{ 0, 65535 };
+    const t_ramp = tex(c, 0, g.R16_EXT, 2, 1, g.RED, g.UNSIGNED_SHORT, &ramp);
+    c.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR);
+    c.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, g.CLAMP_TO_EDGE);
+    c.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_T, g.CLAMP_TO_EDGE);
+    draw4(c, uRect, 28, 28);
+    noErr(c, out);
+    // sampled only: a framebuffer with one attached is incomplete
+    var fb2: [1]u32 = undefined;
+    c.genFramebuffers(&fb2);
+    c.bindFramebuffer(g.FRAMEBUFFER, fb2[0]);
+    c.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, t_ramp, 0);
+    if (c.checkFramebufferStatus(g.FRAMEBUFFER) == g.FRAMEBUFFER_COMPLETE) out.errors += 1;
+    c.bindFramebuffer(g.FRAMEBUFFER, fb);
+    noErr(c, out);
+    finishPart(c, out, p, v, f);
 }
 
 fn px(o: []const u8, x: usize, y: usize) [4]u8 {
@@ -333,6 +402,29 @@ fn check(o: *const Out) !void {
     // N: the fetched corners put the quad at (8, 24) .. (16, 32)
     try E(texel(0, 0), px(&o.fbo, 8, 24));
     try E(texel(3, 3), px(&o.fbo, 15, 31));
+    // O to R: the norm16 texels a column from x 16 (0 -> 0, 32768 -> 128,
+    // 65535 -> 255, 16384 -> 64, within a rounding; SNORM's -1 clamped)
+    const norm16 = [16][4]u8{
+        .{ 0, 0, 0, 255 },     .{ 128, 0, 0, 255 },  .{ 255, 0, 0, 255 },   .{ 64, 0, 0, 255 },
+        .{ 0, 255, 0, 255 },   .{ 128, 0, 0, 255 },  .{ 255, 128, 0, 255 }, .{ 64, 255, 0, 255 },
+        .{ 0, 128, 255, 255 }, .{ 255, 0, 128, 64 }, .{ 64, 255, 0, 128 },  .{ 128, 64, 255, 0 },
+        .{ 255, 0, 0, 255 },   .{ 0, 0, 0, 255 },    .{ 128, 0, 0, 255 },   .{ 0, 0, 0, 255 },
+    };
+    for (norm16, 16..) |want, x| {
+        for ([_]usize{ 24, 27 }) |y| {
+            if (!near(want, px(&o.fbo, x, y))) {
+                std.debug.print("norm16 at ({d}, {d}): {any}, not {any}\n", .{ x, y, px(&o.fbo, x, y), want });
+                return error.TestUnexpectedResult;
+            }
+        }
+        // S to U: the same texels from glTexStorage2D and glTexSubImage2D
+        if (x < 28) try E(px(&o.fbo, x, 25), px(&o.fbo, x, 29));
+    }
+    // V: R16 bilinear: the edge texels, then a quarter and three quarters
+    try E([4]u8{ 0, 0, 0, 255 }, px(&o.fbo, 28, 30));
+    try std.testing.expect(near(.{ 64, 0, 0, 255 }, px(&o.fbo, 29, 30)));
+    try std.testing.expect(near(.{ 191, 0, 0, 255 }, px(&o.fbo, 30, 30)));
+    try E([4]u8{ 255, 0, 0, 255 }, px(&o.fbo, 31, 30));
 }
 
 // ── The three runs ─────────────────────────────────────────────────────────
@@ -345,9 +437,9 @@ var cpu_done = false;
 
 fn cpuOut() !*const Out {
     if (!cpu_done) {
-        for ([_]u1{ 0, 1 }) |half| {
+        for ([_]u2{ 0, 1, 2 }) |part| {
             eng_cpu.init(.{ .pool = &pool_mem, .cpu_work = &cpu_work });
-            try scene(&eng_cpu, &out_cpu, half);
+            try scene(&eng_cpu, &out_cpu, part);
         }
         if (eng_cpu.why_pipe) |e| std.debug.print("cpu draw: {s} at pc {d}\n", .{ @errorName(e), eng_cpu.trap.pc });
         cpu_done = true;
@@ -369,14 +461,14 @@ var out_emu: Out = .{};
 
 test "textures: on EmuDevice, the CPU's bytes" {
     const want = try cpuOut();
-    for ([_]u1{ 0, 1 }) |half| {
+    for ([_]u2{ 0, 1, 2 }) |part| {
         var caps = gpu.interp_caps;
         caps.coherent = false;
         emu = gpu.EmuDevice.init(caps, &emu_mem, &emu_work);
         emu.shadow = &emu_shadow;
         eng_emu.init(.{ .dev = emu.device(), .work = &compile_mem, .cpu_work = &cpu_work });
         try std.testing.expect(eng_emu.onGpu());
-        try scene(&eng_emu, &out_emu, half);
+        try scene(&eng_emu, &out_emu, part);
         if (eng_emu.why_pipe) |e| std.debug.print("emu pipeline: {s}\n", .{@errorName(e)});
         try std.testing.expect(eng_emu.why_pipe == null);
         try std.testing.expect(!eng_emu.lost);
@@ -398,14 +490,14 @@ var out_a: Out = .{};
 
 test "textures: on the emulated Adreno (ir3), the CPU's bytes" {
     const want = try cpuOut();
-    for ([_]u1{ 0, 1 }) |half| {
+    for ([_]u2{ 0, 1, 2 }) |part| {
         a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
         a_fake = .{ .emu = &a_emu };
         a_gpu = .{ .node = .{ .sys = &a_fake } };
         const d = try a_gpu.open();
         eng_a.init(.{ .dev = d, .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
         try std.testing.expect(eng_a.onGpu());
-        try scene(&eng_a, &out_a, half);
+        try scene(&eng_a, &out_a, part);
         if (eng_a.why_pipe) |e| std.debug.print("adreno pipeline: {s}\n", .{@errorName(e)});
         if (a_emu.last_error) |e| std.debug.print("ir3_emu: {s}: {s}\n", .{ @errorName(e), a_emu.fault.text() });
         try std.testing.expect(eng_a.why_pipe == null);

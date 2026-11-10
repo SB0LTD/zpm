@@ -7,11 +7,13 @@
 //! - unorm8 RGBA (RGBA8, SRGB8_ALPHA8, RGB8 widened, the packed 16-bit
 //!   ones unpacked) and BGRA (as is);
 //! - R8 and RG8 (and LUMINANCE, ALPHA, LUMINANCE_ALPHA: swizzled);
-//! - f32 x 1, 2, 4 (the half floats widened, RGB with alpha 1);
+//! - f32 x 1, 2, 4 (the half floats widened, RGB with alpha 1; and
+//!   EXT_texture_norm16's R16 to RGBA16 and their SNORMs, normalised:
+//!   sampled as GL says, never drawn into);
 //! - i32 and u32 x 1, 2, 4 (the 8- and 16-bit ones widened).
 //!
 //! Not yet: RGB10_A2, R11F_G11F_B10F, RGB9_E5, the RGB integer formats,
-//! norm16, depth32f, compressed formats.
+//! depth32f, compressed formats.
 
 const std = @import("std");
 const engine = @import("engine.sig");
@@ -34,6 +36,12 @@ pub const Conv = enum {
     half,
     /// RGB halves to f32, alpha 1
     half_rgb,
+    /// unorm16s to f32 (v / 65535), and RGB ones with alpha 1
+    unorm16,
+    unorm16_rgb,
+    /// snorm16s to f32 (max(v / 32767, -1)), and RGB ones with alpha 1
+    snorm16,
+    snorm16_rgb,
     /// 8- and 16-bit ints widened
     int8,
     uint8,
@@ -140,6 +148,15 @@ const table = [_]E{
     e(g.RGBA16F, g.RGBA, g.HALF_FLOAT, .rgba32f, .half, 8),
     e(g.RGBA16F, g.RGBA, g.FLOAT, .rgba32f, .raw, 16),
     e(g.RGBA32F, g.RGBA, g.FLOAT, .rgba32f, .raw, 16),
+    // EXT_texture_norm16 (video's 10- to 16-bit planes): stored as floats
+    e(g.R16_EXT, g.RED, g.UNSIGNED_SHORT, .r32f, .unorm16, 2),
+    e(g.RG16_EXT, g.RG, g.UNSIGNED_SHORT, .rg32f, .unorm16, 4),
+    e(g.RGB16_EXT, g.RGB, g.UNSIGNED_SHORT, .rgba32f, .unorm16_rgb, 6),
+    e(g.RGBA16_EXT, g.RGBA, g.UNSIGNED_SHORT, .rgba32f, .unorm16, 8),
+    e(g.R16_SNORM_EXT, g.RED, g.SHORT, .r32f, .snorm16, 2),
+    e(g.RG16_SNORM_EXT, g.RG, g.SHORT, .rg32f, .snorm16, 4),
+    e(g.RGB16_SNORM_EXT, g.RGB, g.SHORT, .rgba32f, .snorm16_rgb, 6),
+    e(g.RGBA16_SNORM_EXT, g.RGBA, g.SHORT, .rgba32f, .snorm16, 8),
     e(g.R8I, RED_INTEGER, g.BYTE, .r32i, .int8, 1),
     e(g.R8UI, RED_INTEGER, g.UNSIGNED_BYTE, .r32ui, .uint8, 1),
     e(g.R16I, RED_INTEGER, g.SHORT, .r32i, .int16, 2),
@@ -230,11 +247,14 @@ pub fn convert(up: Upload, src: []const u8, dst: []u8, n: u32) void {
             @memcpy(dst[i * 16 ..][0..12], src[i * 12 ..][0..12]);
             std.mem.writeInt(u32, dst[i * 16 + 12 ..][0..4], @bitCast(@as(f32, 1)), .little);
         },
-        .half, .half_rgb => {
-            const sc: u32 = if (up.conv == .half_rgb) 3 else ch;
+        .half, .half_rgb, .unorm16, .unorm16_rgb, .snorm16, .snorm16_rgb => {
+            const sc: u32 = switch (up.conv) {
+                .half_rgb, .unorm16_rgb, .snorm16_rgb => 3,
+                else => ch,
+            };
             for (0..n) |i| {
                 for (0..ch) |c| {
-                    const v: f32 = if (c < sc) @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, src[(i * sc + c) * 2 ..][0..2], .little)))) else 1;
+                    const v: f32 = if (c < sc) short(up.conv, std.mem.readInt(u16, src[(i * sc + c) * 2 ..][0..2], .little)) else 1;
                     std.mem.writeInt(u32, dst[(i * ch + c) * 4 ..][0..4], @bitCast(v), .little);
                 }
             }
@@ -249,6 +269,17 @@ pub fn convert(up: Upload, src: []const u8, dst: []u8, n: u32) void {
             std.mem.writeInt(u32, dst[j * 4 ..][0..4], v, .little);
         },
     }
+}
+
+/// A client's 16-bit channel as the float stored: a half widened, or a
+/// unorm16 or snorm16 normalised (as GL ES 3.0 converts signed
+/// normalised values: -32768 is -1 too).
+fn short(conv: Conv, bits: u16) f32 {
+    return switch (conv) {
+        .half, .half_rgb => @floatCast(@as(f16, @bitCast(bits))),
+        .unorm16, .unorm16_rgb => @as(f32, @floatFromInt(bits)) / 65535.0,
+        else => @max(@as(f32, @floatFromInt(@as(i16, @bitCast(bits)))) / 32767.0, -1),
+    };
 }
 
 /// A `bits`-bit unorm channel (the low bits of v) as a byte, rounded.
@@ -281,4 +312,46 @@ test "texfmt: uploads and their conversions" {
     try std.testing.expectEqual(g.INVALID_OPERATION, upload(g.RGBA8, g.RGB, g.UNSIGNED_BYTE).err);
     try std.testing.expect(storage(g.RGBA) == null);
     try std.testing.expectEqual(Format.rg32f, storage(g.RG16F).?.store);
+}
+
+fn f32At(b: []const u8, i: usize) f32 {
+    return @bitCast(std.mem.readInt(u32, b[i * 4 ..][0..4], .little));
+}
+
+test "texfmt: EXT_texture_norm16's uploads, normalised to floats" {
+    const T = std.testing;
+    // R16: 0, 32768, 65535
+    const r = upload(g.R16_EXT, g.RED, g.UNSIGNED_SHORT).ok;
+    try T.expectEqual(Format.r32f, r.store);
+    try T.expectEqual(@as(u32, 2), r.client_bytes);
+    var rv: [12]u8 = undefined;
+    convert(r, &.{ 0, 0, 0x00, 0x80, 0xff, 0xff }, &rv, 3);
+    try T.expectEqual(@as(f32, 0), f32At(&rv, 0));
+    try T.expectApproxEqAbs(@as(f32, 0.5), f32At(&rv, 1), 1e-4);
+    try T.expectEqual(@as(f32, 1), f32At(&rv, 2));
+    // RG16 and RGBA16 stored per channel; RGB16 with alpha 1
+    try T.expectEqual(Format.rg32f, upload(g.RG16_EXT, g.RG, g.UNSIGNED_SHORT).ok.store);
+    const rgba = upload(g.RGBA16_EXT, g.RGBA, g.UNSIGNED_SHORT).ok;
+    try T.expectEqual(Format.rgba32f, rgba.store);
+    const rgb = upload(g.RGB16_EXT, g.RGB, g.UNSIGNED_SHORT).ok;
+    try T.expectEqual(@as(u32, 6), rgb.client_bytes);
+    var cv: [16]u8 = undefined;
+    convert(rgb, &.{ 0xff, 0xff, 0, 0, 0x00, 0x40 }, &cv, 1);
+    try T.expectEqual(@as(f32, 1), f32At(&cv, 0));
+    try T.expectEqual(@as(f32, 0), f32At(&cv, 1));
+    try T.expectApproxEqAbs(@as(f32, 0.25), f32At(&cv, 2), 1e-4);
+    try T.expectEqual(@as(f32, 1), f32At(&cv, 3));
+    // SNORM: 32767, -32767 and -32768 (both -1), 0
+    const s = upload(g.RGBA16_SNORM_EXT, g.RGBA, g.SHORT).ok;
+    convert(s, &.{ 0xff, 0x7f, 0x01, 0x80, 0x00, 0x80, 0, 0 }, &cv, 1);
+    try T.expectEqual(@as(f32, 1), f32At(&cv, 0));
+    try T.expectEqual(@as(f32, -1), f32At(&cv, 1));
+    try T.expectEqual(@as(f32, -1), f32At(&cv, 2));
+    try T.expectEqual(@as(f32, 0), f32At(&cv, 3));
+    // glTexStorage2D and glTexSubImage2D take them
+    try T.expectEqual(Format.r32f, storage(g.R16_EXT).?.store);
+    try T.expectEqual(Format.rgba32f, storage(g.RGBA16_EXT).?.store);
+    try T.expectEqual(Conv.unorm16, subUpload(.rg32f, g.RG, g.UNSIGNED_SHORT).?.conv);
+    // a format and type R16 does not take
+    try T.expectEqual(g.INVALID_OPERATION, upload(g.R16_EXT, g.RED, g.FLOAT).err);
 }

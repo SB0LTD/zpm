@@ -417,6 +417,15 @@ pub const RGBA32I: u32 = 0x8D82;
 pub const RGBA32UI: u32 = 0x8D70;
 pub const RED_INTEGER: u32 = 0x8D94;
 pub const RG_INTEGER: u32 = 0x8228;
+// EXT_texture_norm16's (sampled, not renderable here)
+pub const R16_EXT: u32 = 0x822A;
+pub const RG16_EXT: u32 = 0x822C;
+pub const RGB16_EXT: u32 = 0x8054;
+pub const RGBA16_EXT: u32 = 0x805B;
+pub const R16_SNORM_EXT: u32 = 0x8F98;
+pub const RG16_SNORM_EXT: u32 = 0x8F99;
+pub const RGB16_SNORM_EXT: u32 = 0x8F9A;
+pub const RGBA16_SNORM_EXT: u32 = 0x8F9B;
 
 // texture and sampler state
 pub const GREEN: u32 = 0x1904;
