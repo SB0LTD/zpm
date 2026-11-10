@@ -701,6 +701,34 @@ fn putPixel(b: []u8, bpp: u32, v: u32) void {
 pub const MAX_OPS = 256;
 pub const MAX_DOOMED = 128;
 const RING = 64;
+
+/// A batch's programs as said when the GPU is lost: each one's dispatches
+/// and its largest grid (groups), up to SUM_PROGS of them (`more`: the
+/// others).
+const SUM_PROGS = 24;
+const ProgSum = struct { prog: *const gpu.Program, count: u16, groups: u32 };
+const BatchSum = struct {
+    n: u8 = 0,
+    more: u16 = 0,
+    progs: [SUM_PROGS]ProgSum = undefined,
+
+    fn add(s: *BatchSum, prog: *const gpu.Program, groups: [3]u32, count: u16) void {
+        const g: u32 = @intCast(@min(@as(u64, groups[0]) * groups[1] * groups[2], std.math.maxInt(u32)));
+        for (s.progs[0..s.n]) |*p| {
+            if (p.prog == prog) {
+                p.count +|= count;
+                p.groups = @max(p.groups, g);
+                return;
+            }
+        }
+        if (s.n == SUM_PROGS) {
+            s.more +|= 1;
+            return;
+        }
+        s.progs[s.n] = .{ .prog = prog, .count = count, .groups = g };
+        s.n += 1;
+    }
+};
 /// How long a CPU access waits for the GPU before calling it lost.
 pub const TIMEOUT_US: u64 = 2_000_000;
 /// How long a batch may run before the GPU is called lost (a wait past
@@ -830,6 +858,9 @@ pub const Engine = struct {
     ran: u64 = 0,
     done_upto: u64 = 0,
     fences: [RING]gpu.Fence = [_]gpu.Fence{0} ** RING,
+    /// Each batch in flight's programs (by batch % RING): what is said
+    /// when the GPU is lost.
+    sums: [RING]BatchSum = undefined,
     doomed: [MAX_DOOMED]Doomed = undefined,
     n_doomed: usize = 0,
     stats: Stats = .{},
@@ -883,6 +914,7 @@ pub const Engine = struct {
             var w = gpu.Work.init(work_mem);
             const bin = try compiler(&k, d.caps, &w, &e.code[i]);
             e.progs[i] = try d.load(&bin);
+            e.progs[i].label = k.name;
             loaded += 1;
         }
     }
@@ -1123,6 +1155,9 @@ pub const Engine = struct {
         const d = e.dev.?;
         const n = e.n_ops;
         e.n_ops = 0;
+        const sum = &e.sums[e.batch % RING];
+        sum.* = .{};
+        for (e.ops[0..n]) |op| sum.add(op.prog, op.groups, 1);
         const t0 = report.nowUs();
         const f = d.run(e.ops[0..n]) catch |err| {
             e.loseGpu(err);
@@ -1148,10 +1183,55 @@ pub const Engine = struct {
     }
 
     fn loseGpu(e: *Engine, err: anyerror) void {
-        if (!e.lost) report.say(.lost, "the GPU is lost ({s}): {s}, and GL reports a reset", .{ @errorName(err), if (e.cpu_work.len != 0) "drawing goes on on the CPU" else "nothing more is drawn" });
+        if (!e.lost) {
+            report.say(.lost, "the GPU is lost ({s}): {s}, and GL reports a reset", .{ @errorName(err), if (e.cpu_work.len != 0) "drawing goes on on the CPU" else "nothing more is drawn" });
+            e.sayInFlight();
+        }
         e.lost = true;
         if (e.why == null) e.why = err;
         e.n_ops = 0;
+    }
+
+    /// What was on the GPU when it was lost: the programs of the batches run
+    /// and not known done (a fault or hang is in one of them), largest grid
+    /// first, each with its dispatches, its code's GPU address and size,
+    /// its registers and shared memory. The address is what a GPU fault's
+    /// program counter falls in; the size and registers say which shader
+    /// it is (gfxapi's WebRender test prints them for every variant).
+    /// Legion 1110u: an Xid 13 on ~28 SMs in one of Firefox's launches,
+    /// and nothing said which kernel it was.
+    fn sayInFlight(e: *Engine) void {
+        if (e.ran <= e.done_upto) return;
+        const first = @max(e.done_upto + 1, e.ran -| (RING - 1));
+        var all: BatchSum = .{};
+        var b = first;
+        while (b <= e.ran) : (b += 1) {
+            const s = &e.sums[b % RING];
+            for (s.progs[0..s.n]) |p| all.add(p.prog, .{ p.groups, 1, 1 }, p.count);
+            all.more +|= s.more;
+        }
+        // largest grid first
+        var order: [SUM_PROGS]u8 = undefined;
+        for (0..all.n) |i| order[i] = @intCast(i);
+        var i: usize = 1;
+        while (i < all.n) : (i += 1) {
+            var j = i;
+            while (j > 0 and all.progs[order[j]].groups > all.progs[order[j - 1]].groups) : (j -= 1) {
+                std.mem.swap(u8, &order[j], &order[j - 1]);
+            }
+        }
+        var line: [520]u8 = undefined;
+        var len: usize = 0;
+        for (order[0..all.n], 0..) |k, n| {
+            const p = all.progs[k];
+            const name = if (p.prog.label.len != 0) p.prog.label else "a kernel";
+            const part = std.fmt.bufPrint(line[len..], "{s}{s} x{d} at 0x{x} ({d} B, {d} regs, {d} B shared, up to {d} groups)", .{ if (n == 0) "" else "; ", name, p.count, p.prog.code.gpu, p.prog.bin.code.len, p.prog.bin.regs, p.prog.bin.shared_bytes, p.groups }) catch {
+                all.more +|= @intCast(all.n - n);
+                break;
+            };
+            len += part.len;
+        }
+        report.say(.in_flight, "on the GPU then ({d} batch{s} not known done): {s}{s}", .{ e.ran - first + 1, if (e.ran == first) "" else "es", line[0..len], if (all.more != 0) " (and more)" else "" });
     }
 
     /// done_upto moved to the last batch run, if its fence is done.
@@ -1438,6 +1518,7 @@ pub const Engine = struct {
             var w = gpu.Work.init(e.work);
             const bin = e.compiler(&k, d.caps, &w, &e.pcode) catch |err| return e.pipeFailed(p, n, err);
             p.progs[n] = d.load(&bin) catch |err| return e.pipeFailed(p, n, err);
+            p.progs[n].?.label = k.name;
         }
         p.owner = e;
         return true;
@@ -1459,6 +1540,7 @@ pub const Engine = struct {
             report.say(.pipeline, "a program's stencil kernel does not compile or load for the GPU ({s}): its stencil draws run on the CPU", .{@errorName(err)});
             return false;
         };
+        p.progs[3].?.label = k.name;
         return true;
     }
 
