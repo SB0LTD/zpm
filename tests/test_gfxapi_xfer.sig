@@ -253,6 +253,26 @@ fn scene(eng: *engine.Engine, out: *Out) !void {
     err(c, out, g.INVALID_VALUE, @src().line);
     want(c, out, c.fenceSync(0x1234, 0) == null, @src().line);
     err(c, out, g.INVALID_ENUM, @src().line);
+
+    // -- What Firefox's WebGL needs of a context at its start --
+    // The two ranges it asks for (an error here and it gives the context
+    // up), and WebGL 1's 16-bit renderbuffers as complete color targets.
+    var range: [2]f32 = .{ 0, 0 };
+    c.getFloats(g.ALIASED_LINE_WIDTH_RANGE, &range);
+    want(c, out, range[0] == 1 and range[1] == 1, @src().line);
+    range = .{ 0, 0 };
+    c.getFloats(g.ALIASED_POINT_SIZE_RANGE, &range);
+    want(c, out, range[0] == 1 and range[1] == 1, @src().line);
+    err(c, out, g.NO_ERROR, @src().line);
+    for ([_]u32{ g.RGBA4, g.RGB5_A1, g.RGB565 }) |internal| {
+        const fb16 = fb(c);
+        c.bindFramebuffer(g.FRAMEBUFFER, fb16);
+        const rb16 = rbuf(c, internal, 4, 4);
+        c.framebufferRenderbuffer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.RENDERBUFFER, rb16);
+        want(c, out, c.checkFramebufferStatus(g.FRAMEBUFFER) == g.FRAMEBUFFER_COMPLETE, @src().line);
+        err(c, out, g.NO_ERROR, @src().line);
+    }
+    c.bindFramebuffer(g.FRAMEBUFFER, 0);
     c.finish();
 }
 

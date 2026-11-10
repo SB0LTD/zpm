@@ -423,7 +423,9 @@ fn clientFormat(format: u32, ty: u32) union(enum) { ok: Format, err: u32 } {
 /// A renderbuffer internal format as the engine stores it.
 fn rbFormat(internal: u32) ?Format {
     return switch (internal) {
-        g.RGBA8 => .rgba8,
+        // (the 16-bit ones ES 2.0 and WebGL 1 require are kept at 8 bits a
+        // channel)
+        g.RGBA8, g.RGBA4, g.RGB5_A1, g.RGB565 => .rgba8,
         g.BGRA8_EXT => .bgra8,
         g.R8 => .r8,
         g.RG8 => .rg8,
@@ -1199,6 +1201,9 @@ pub const Context = struct {
             g.MAX_TEXTURE_IMAGE_UNITS => int(16),
             g.MAX_COMBINED_TEXTURE_IMAGE_UNITS => int(MAX_UNITS),
             g.MAX_SAMPLES => int(1),
+            // (lines and points are one pixel: Firefox's WebGL asks both at
+            // a context's start and gives the context up on an error)
+            g.ALIASED_LINE_WIDTH_RANGE, g.ALIASED_POINT_SIZE_RANGE => .{ .kind = .float, .n = 2, .f = .{ 1, 1, 0, 0 } },
             g.RESET_NOTIFICATION_STRATEGY => int(if (c.lose_on_reset) g.LOSE_CONTEXT_ON_RESET else g.NO_RESET_NOTIFICATION),
             // (out-of-range reads are not promised to be safe: no
             // robust_buffer_access_behavior)
