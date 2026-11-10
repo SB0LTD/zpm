@@ -1,0 +1,522 @@
+//! @zpm/va libgalaxy_va — the root of galaxy_drv_video.so, Galaxy's VA-API
+//! driver for the RTX's hardware video decoder (NVDEC on the GB206, the
+//! RTX 5070 Laptop GPU), H.264 first. libva (Alpine's 2.22) loads it as
+//! /usr/lib/dri/galaxy_drv_video.so (LIBVA_DRIVER_NAME=galaxy) and calls
+//! `__vaDriverInit_1_0` with the render node it opened; the driver fills
+//! libva's table with the entry points below. One file, no C library, no
+//! DT_NEEDED: system calls through std.os.linux, fixed tables.
+//!
+//! What works (host-tested, against a fake render node and decoder):
+//! - the queries FFmpeg's vaapi hwaccel and Firefox's VA-API probe make:
+//!   profiles (H.264 Constrained Baseline, Main, High), the VLD
+//!   entrypoint, config attributes (RT format YUV 4:2:0), configs,
+//!   surface attributes (NV12; memory VA and DRM PRIME 2), image formats
+//!   (NV12), the vendor string;
+//! - NV12 surfaces, contexts, buffers (create, map, unmap, destroy, info);
+//! - Begin/Render/EndPicture to an NVDEC pushbuffer and picture setup
+//!   (bitstream with start codes, slice table, end of stream, reference
+//!   slots, the watchdog), submitted with G_VSUBMIT; SyncSurface and
+//!   QuerySurfaceStatus through G_VWAIT, the decoder's status read and
+//!   counted, the block-linear target copied to linear NV12 on the CPU;
+//! - ExportSurfaceHandle (DRM PRIME 2: one dma-buf, separate R8 + GR88
+//!   layers or composed NV12, linear), DeriveImage, CreateImage,
+//!   GetImage, DestroyImage;
+//! - every table entry libva 2.22 checks is set (subpictures, display
+//!   attributes, PutSurface/PutImage answer UNIMPLEMENTED or nothing).
+//!
+//! Untested until a boot on the PC — everything that touches the real
+//! decoder: that GB206's NVCFB0 takes Ada's methods and Ada's
+//! nvdec_h264_pic_s (THE main risk: nvdec.sig), that NVDEC writes the
+//! Blackwell GOB layouts assumed (GALAXY_VA_GOB=turing for Turing's;
+//! tiling.sig), SET_OBJECT's engine field, the scratch buffers' sizes on
+//! Blackwell, interlaced (field) streams, and the speed of the CPU copy
+//! (a GPU copy is the later step). GALAXY_VA_DEBUG=1 says on stderr what
+//! the driver does and each decode the decoder reports in error.
+//!
+//! Build (x86-64 Linux, from the zpm root):
+//!   sig build-lib -dynamic -target x86_64-linux-none -OReleaseSafe -fPIC
+//!     -fno-stack-protector -fno-unwind-tables -fstrip
+//!     --name galaxy_drv_video src/va/libgalaxy_va.sig
+
+const std = @import("std");
+const builtin = @import("builtin");
+const va = @import("vaapi.sig");
+const driver = @import("driver.sig");
+const node = @import("node.sig");
+const linux = std.os.linux;
+
+/// A failed check in the driver: one line on stderr, then the program
+/// ends (no stack walk, no thread-local state: nothing of the C library).
+pub const panic = if (builtin.os.tag == .linux) std.debug.FullPanic(stop) else std.debug.FullPanic(std.debug.defaultPanic);
+
+fn stop(msg: []const u8, ra: ?usize) noreturn {
+    @branchHint(.cold);
+    _ = ra;
+    const head = "galaxy-va: ";
+    _ = linux.write(2, head, head.len);
+    _ = linux.write(2, msg.ptr, msg.len);
+    _ = linux.write(2, "\n", 1);
+    linux.exit_group(134);
+}
+
+// ── The displays ────────────────────────────────────────────────────────────
+
+const D = driver.Driver(node.Linux);
+
+/// A spin lock that yields: each call holds its display's for its length
+/// (a sync, for the decode's few milliseconds).
+const Lock = struct {
+    word: std.atomic.Value(u32) = .init(0),
+
+    fn acquire(l: *Lock) void {
+        var spins: u32 = 0;
+        while (l.word.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            spins += 1;
+            if (spins < 64) std.atomic.spinLoopHint() else _ = linux.sched_yield();
+        }
+    }
+
+    fn release(l: *Lock) void {
+        l.word.store(0, .release);
+    }
+};
+
+const Display = struct {
+    lock: Lock = .{},
+    d: D,
+};
+
+/// vaInitialize's (a process may open a few: Firefox's decoder and its
+/// probe each have one).
+const MAX_DISPLAYS = 4;
+/// (undefined until taken: their tables stay out of the file, in .bss)
+var displays: [MAX_DISPLAYS]Display = undefined;
+var taken = [_]bool{false} ** MAX_DISPLAYS;
+var table_lock: Lock = .{};
+
+fn of(ctx: *va.DriverContext) *Display {
+    return @ptrCast(@alignCast(ctx.pDriverData.?));
+}
+
+/// libva's entry: the driver for `ctx`'s display, or why not.
+pub export fn __vaDriverInit_1_0(ctx: *va.DriverContext) callconv(.c) va.Status {
+    table_lock.acquire();
+    const i = for (taken, 0..) |t, i| {
+        if (!t) break i;
+    } else {
+        table_lock.release();
+        return va.ERROR_ALLOCATION_FAILED;
+    };
+    taken[i] = true;
+    // (the environment read under the table's lock: one buffer for all)
+    const opts = options();
+    table_lock.release();
+    const disp = &displays[i];
+    disp.* = .{ .d = .{ .node = .{ .sys = .{} } } };
+    const fd: i32 = if (ctx.drm_state) |st| (if (st.fd >= 0) st.fd else -1) else -1;
+    const st = disp.d.init(fd, opts);
+    const vt = ctx.vtable;
+    if (st != va.SUCCESS or vt == null) {
+        if (st == va.SUCCESS) disp.d.terminate();
+        table_lock.acquire();
+        taken[i] = false;
+        table_lock.release();
+        return if (st == va.SUCCESS) va.ERROR_INVALID_DISPLAY else st;
+    }
+    fill(vt.?);
+    ctx.pDriverData = disp;
+    ctx.max_profiles = driver.PROFILES.len;
+    ctx.max_entrypoints = 1;
+    ctx.max_attributes = 4;
+    ctx.max_image_formats = 1;
+    ctx.max_subpic_formats = 1;
+    ctx.max_display_attributes = 1;
+    ctx.str_vendor = driver.VENDOR;
+    return va.SUCCESS;
+}
+
+/// libva's table, filled.
+pub fn fill(vt: *va.DriverVTable) void {
+    vt.vaTerminate = @ptrCast(&vaTerminate);
+    vt.vaQueryConfigProfiles = @ptrCast(&vaQueryConfigProfiles);
+    vt.vaQueryConfigEntrypoints = @ptrCast(&vaQueryConfigEntrypoints);
+    vt.vaGetConfigAttributes = @ptrCast(&vaGetConfigAttributes);
+    vt.vaCreateConfig = @ptrCast(&vaCreateConfig);
+    vt.vaDestroyConfig = @ptrCast(&vaDestroyConfig);
+    vt.vaQueryConfigAttributes = @ptrCast(&vaQueryConfigAttributes);
+    vt.vaCreateSurfaces = @ptrCast(&vaCreateSurfaces);
+    vt.vaDestroySurfaces = @ptrCast(&vaDestroySurfaces);
+    vt.vaCreateContext = @ptrCast(&vaCreateContext);
+    vt.vaDestroyContext = @ptrCast(&vaDestroyContext);
+    vt.vaCreateBuffer = @ptrCast(&vaCreateBuffer);
+    vt.vaBufferSetNumElements = @ptrCast(&vaBufferSetNumElements);
+    vt.vaMapBuffer = @ptrCast(&vaMapBuffer);
+    vt.vaUnmapBuffer = @ptrCast(&vaUnmapBuffer);
+    vt.vaDestroyBuffer = @ptrCast(&vaDestroyBuffer);
+    vt.vaBeginPicture = @ptrCast(&vaBeginPicture);
+    vt.vaRenderPicture = @ptrCast(&vaRenderPicture);
+    vt.vaEndPicture = @ptrCast(&vaEndPicture);
+    vt.vaSyncSurface = @ptrCast(&vaSyncSurface);
+    vt.vaQuerySurfaceStatus = @ptrCast(&vaQuerySurfaceStatus);
+    vt.vaQuerySurfaceError = @ptrCast(&unimplemented);
+    vt.vaPutSurface = @ptrCast(&unimplemented);
+    vt.vaQueryImageFormats = @ptrCast(&vaQueryImageFormats);
+    vt.vaCreateImage = @ptrCast(&vaCreateImage);
+    vt.vaDeriveImage = @ptrCast(&vaDeriveImage);
+    vt.vaDestroyImage = @ptrCast(&vaDestroyImage);
+    vt.vaSetImagePalette = @ptrCast(&unimplemented);
+    vt.vaGetImage = @ptrCast(&vaGetImage);
+    vt.vaPutImage = @ptrCast(&unimplemented);
+    vt.vaQuerySubpictureFormats = @ptrCast(&vaQuerySubpictureFormats);
+    vt.vaCreateSubpicture = @ptrCast(&unimplemented);
+    vt.vaDestroySubpicture = @ptrCast(&unimplemented);
+    vt.vaSetSubpictureImage = @ptrCast(&unimplemented);
+    vt.vaSetSubpictureChromakey = @ptrCast(&unimplemented);
+    vt.vaSetSubpictureGlobalAlpha = @ptrCast(&unimplemented);
+    vt.vaAssociateSubpicture = @ptrCast(&unimplemented);
+    vt.vaDeassociateSubpicture = @ptrCast(&unimplemented);
+    vt.vaQueryDisplayAttributes = @ptrCast(&vaQueryDisplayAttributes);
+    vt.vaGetDisplayAttributes = @ptrCast(&unimplemented);
+    vt.vaSetDisplayAttributes = @ptrCast(&unimplemented);
+    vt.vaBufferInfo = @ptrCast(&vaBufferInfo);
+    vt.vaLockSurface = @ptrCast(&unimplemented);
+    vt.vaUnlockSurface = @ptrCast(&unimplemented);
+    vt.vaCreateSurfaces2 = @ptrCast(&vaCreateSurfaces2);
+    vt.vaQuerySurfaceAttributes = @ptrCast(&vaQuerySurfaceAttributes);
+    vt.vaExportSurfaceHandle = @ptrCast(&vaExportSurfaceHandle);
+    vt.vaSyncSurface2 = @ptrCast(&vaSyncSurface2);
+    vt.vaMapBuffer2 = @ptrCast(&vaMapBuffer2);
+}
+
+// ── The options (the process's environment) ─────────────────────────────────
+
+var env_buf: [64 * 1024]u8 = undefined;
+
+/// The options from /proc/self/environ (no C library to ask).
+fn options() driver.Options {
+    if (comptime builtin.os.tag != .linux) return .{};
+    const r: isize = @bitCast(linux.openat(linux.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    if (r < 0) return .{};
+    const fd: i32 = @intCast(r);
+    defer _ = linux.close(fd);
+    var n: usize = 0;
+    while (n < env_buf.len) {
+        const got: isize = @bitCast(linux.read(fd, env_buf[n..].ptr, env_buf.len - n));
+        if (got <= 0) break;
+        n += @intCast(got);
+    }
+    return optionsOf(env_buf[0..n]);
+}
+
+/// GALAXY_VA_DEBUG (set and not "0": say things on stderr), GALAXY_VA_GOB
+/// ("turing": Turing's GOB layout instead of Blackwell's), GALAXY_VA_PROBE
+/// ("0": no decoder probe at init), from an environment block.
+pub fn optionsOf(block: []const u8) driver.Options {
+    var o: driver.Options = .{};
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        const k = kv[0..eq];
+        const v = kv[eq + 1 ..];
+        if (std.mem.eql(u8, k, "GALAXY_VA_DEBUG")) {
+            o.debug = v.len != 0 and !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_GOB")) {
+            o.gob = if (std.ascii.eqlIgnoreCase(v, "turing")) .turing else .blackwell;
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_PROBE")) {
+            o.probe = !std.mem.eql(u8, v, "0");
+        }
+    }
+    return o;
+}
+
+// ── libva's entry points ────────────────────────────────────────────────────
+
+/// (each one under its display's lock)
+fn enter(ctx: *va.DriverContext) *D {
+    const disp = of(ctx);
+    disp.lock.acquire();
+    return &disp.d;
+}
+
+fn leave(ctx: *va.DriverContext) void {
+    of(ctx).lock.release();
+}
+
+fn list(comptime T: type, p: ?[*]T, n: anytype) []T {
+    if (n <= 0) return &.{};
+    return (p orelse return &.{})[0..@intCast(n)];
+}
+
+fn unimplemented(_: *va.DriverContext) callconv(.c) va.Status {
+    return va.ERROR_UNIMPLEMENTED;
+}
+
+fn vaTerminate(ctx: *va.DriverContext) callconv(.c) va.Status {
+    const disp = of(ctx);
+    disp.lock.acquire();
+    disp.d.terminate();
+    disp.lock.release();
+    const i = (@intFromPtr(disp) - @intFromPtr(&displays)) / @sizeOf(Display);
+    table_lock.acquire();
+    taken[i] = false;
+    table_lock.release();
+    ctx.pDriverData = null;
+    return va.SUCCESS;
+}
+
+fn vaQueryConfigProfiles(ctx: *va.DriverContext, profiles: ?[*]va.Profile, n: ?*i32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.queryConfigProfiles(profiles orelse return va.ERROR_INVALID_PARAMETER, n orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaQueryConfigEntrypoints(ctx: *va.DriverContext, profile: va.Profile, eps: ?[*]va.Entrypoint, n: ?*i32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.queryConfigEntrypoints(profile, eps orelse return va.ERROR_INVALID_PARAMETER, n orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaGetConfigAttributes(ctx: *va.DriverContext, profile: va.Profile, ep: va.Entrypoint, attribs: ?[*]va.ConfigAttrib, n: i32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.getConfigAttributes(profile, ep, list(va.ConfigAttrib, attribs, n));
+}
+
+fn vaCreateConfig(ctx: *va.DriverContext, profile: va.Profile, ep: va.Entrypoint, attribs: ?[*]va.ConfigAttrib, n: i32, out: ?*u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.createConfig(profile, ep, list(va.ConfigAttrib, attribs, n), out orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaDestroyConfig(ctx: *va.DriverContext, id: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.destroyConfig(id);
+}
+
+fn vaQueryConfigAttributes(ctx: *va.DriverContext, id: u32, profile: ?*va.Profile, ep: ?*va.Entrypoint, attribs: ?[*]va.ConfigAttrib, n: ?*i32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    var p: va.Profile = 0;
+    var e: va.Entrypoint = 0;
+    var count: i32 = 0;
+    const st = d.queryConfigAttributes(id, &p, &e, attribs, &count);
+    if (profile) |x| x.* = p;
+    if (ep) |x| x.* = e;
+    if (n) |x| x.* = count;
+    return st;
+}
+
+fn vaCreateSurfaces(ctx: *va.DriverContext, width: i32, height: i32, format: i32, num: i32, out: ?[*]u32) callconv(.c) va.Status {
+    if (width <= 0 or height <= 0) return va.ERROR_INVALID_PARAMETER;
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.createSurfaces(@bitCast(format), @intCast(width), @intCast(height), list(u32, out, num), &.{});
+}
+
+fn vaCreateSurfaces2(ctx: *va.DriverContext, format: u32, width: u32, height: u32, out: ?[*]u32, num: u32, attribs: ?[*]va.SurfaceAttrib, na: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.createSurfaces(format, width, height, list(u32, out, num), list(va.SurfaceAttrib, attribs, na));
+}
+
+fn vaDestroySurfaces(ctx: *va.DriverContext, ids: ?[*]u32, n: i32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.destroySurfaces(list(u32, ids, n));
+}
+
+fn vaQuerySurfaceAttributes(ctx: *va.DriverContext, config: u32, attribs: ?[*]va.SurfaceAttrib, n: ?*u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.querySurfaceAttributes(config, attribs, n orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaCreateContext(ctx: *va.DriverContext, config: u32, width: i32, height: i32, flag: i32, targets: ?[*]u32, n: i32, out: ?*u32) callconv(.c) va.Status {
+    _ = flag;
+    _ = targets;
+    _ = n;
+    if (width <= 0 or height <= 0) return va.ERROR_INVALID_PARAMETER;
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.createContext(config, @intCast(width), @intCast(height), out orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaDestroyContext(ctx: *va.DriverContext, id: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.destroyContext(id);
+}
+
+fn vaCreateBuffer(ctx: *va.DriverContext, context: u32, kind: u32, size: u32, num: u32, data: ?*const anyopaque, out: ?*u32) callconv(.c) va.Status {
+    _ = context;
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.createBuffer(kind, size, num, data, out orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaBufferSetNumElements(ctx: *va.DriverContext, id: u32, num: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.bufferSetNumElements(id, num);
+}
+
+fn vaMapBuffer(ctx: *va.DriverContext, id: u32, out: ?*?*anyopaque) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.mapBuffer(id, out orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaMapBuffer2(ctx: *va.DriverContext, id: u32, out: ?*?*anyopaque, flags: u32) callconv(.c) va.Status {
+    _ = flags;
+    return vaMapBuffer(ctx, id, out);
+}
+
+fn vaUnmapBuffer(ctx: *va.DriverContext, id: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.unmapBuffer(id);
+}
+
+fn vaDestroyBuffer(ctx: *va.DriverContext, id: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.destroyBuffer(id);
+}
+
+fn vaBufferInfo(ctx: *va.DriverContext, id: u32, kind: ?*u32, size: ?*u32, num: ?*u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    var k: u32 = 0;
+    var s: u32 = 0;
+    var c: u32 = 0;
+    const st = d.bufferInfo(id, &k, &s, &c);
+    if (kind) |x| x.* = k;
+    if (size) |x| x.* = s;
+    if (num) |x| x.* = c;
+    return st;
+}
+
+fn vaBeginPicture(ctx: *va.DriverContext, context: u32, surface: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.beginPicture(context, surface);
+}
+
+fn vaRenderPicture(ctx: *va.DriverContext, context: u32, ids: ?[*]u32, n: i32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.renderPicture(context, list(u32, ids, n));
+}
+
+fn vaEndPicture(ctx: *va.DriverContext, context: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.endPicture(context);
+}
+
+fn vaSyncSurface(ctx: *va.DriverContext, surface: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.syncSurface(surface, driver.SYNC_NS);
+}
+
+fn vaSyncSurface2(ctx: *va.DriverContext, surface: u32, timeout_ns: u64) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    // (VA_TIMEOUT_INFINITE is all ones)
+    return d.syncSurface(surface, std.math.cast(i64, timeout_ns) orelse std.math.maxInt(i64));
+}
+
+fn vaQuerySurfaceStatus(ctx: *va.DriverContext, surface: u32, status: ?*u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.querySurfaceStatus(surface, status orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaExportSurfaceHandle(ctx: *va.DriverContext, surface: u32, mem_type: u32, flags: u32, desc: ?*anyopaque) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    const out: *va.DrmPrimeDescriptor = @ptrCast(@alignCast(desc orelse return va.ERROR_INVALID_PARAMETER));
+    return d.exportSurfaceHandle(surface, mem_type, flags, out);
+}
+
+fn vaQueryImageFormats(ctx: *va.DriverContext, formats: ?[*]va.ImageFormat, n: ?*i32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.queryImageFormats(formats orelse return va.ERROR_INVALID_PARAMETER, n orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaCreateImage(ctx: *va.DriverContext, format: ?*const va.ImageFormat, width: i32, height: i32, out: ?*va.Image) callconv(.c) va.Status {
+    if (width <= 0 or height <= 0) return va.ERROR_INVALID_PARAMETER;
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.createImage(format orelse return va.ERROR_INVALID_PARAMETER, @intCast(width), @intCast(height), out orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaDeriveImage(ctx: *va.DriverContext, surface: u32, out: ?*va.Image) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.deriveImage(surface, out orelse return va.ERROR_INVALID_PARAMETER);
+}
+
+fn vaDestroyImage(ctx: *va.DriverContext, id: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.destroyImage(id);
+}
+
+fn vaGetImage(ctx: *va.DriverContext, surface: u32, x: i32, y: i32, width: u32, height: u32, image: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.getImage(surface, x, y, width, height, image);
+}
+
+fn vaQuerySubpictureFormats(_: *va.DriverContext, _: ?[*]va.ImageFormat, flags: ?[*]u32, n: ?*u32) callconv(.c) va.Status {
+    _ = flags;
+    if (n) |x| x.* = 0;
+    return va.SUCCESS;
+}
+
+fn vaQueryDisplayAttributes(_: *va.DriverContext, _: ?*anyopaque, n: ?*i32) callconv(.c) va.Status {
+    if (n) |x| x.* = 0;
+    return va.SUCCESS;
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "libgalaxy_va: every entry libva 2.22 checks is set" {
+    var vt: va.DriverVTable = .{};
+    fill(&vt);
+    inline for (va.REQUIRED) |name| {
+        try testing.expect(@field(vt, name) != null);
+    }
+    // (and the ones FFmpeg and Firefox use beyond them)
+    try testing.expect(vt.vaCreateSurfaces2 != null);
+    try testing.expect(vt.vaQuerySurfaceAttributes != null);
+    try testing.expect(vt.vaExportSurfaceHandle != null);
+    try testing.expect(vt.vaSyncSurface2 != null);
+    try testing.expect(vt.vaBufferInfo != null);
+}
+
+test "libgalaxy_va: options from an environment block" {
+    const none = optionsOf("HOME=/root\x00PATH=/bin\x00");
+    try testing.expect(!none.debug and none.probe and none.gob == .blackwell);
+    const all = optionsOf("GALAXY_VA_DEBUG=1\x00GALAXY_VA_GOB=Turing\x00GALAXY_VA_PROBE=0\x00");
+    try testing.expect(all.debug and !all.probe and all.gob == .turing);
+    try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
+}
+
+test "libgalaxy_va: init without Galaxy's RTX fails cleanly" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var vt: va.DriverVTable = .{};
+    var ctx = std.mem.zeroes(va.DriverContext);
+    ctx.vtable = &vt;
+    // (no render node, or one that is not Galaxy's: no G_INFO)
+    try testing.expect(__vaDriverInit_1_0(&ctx) != va.SUCCESS);
+    try testing.expectEqual(@as(?*anyopaque, null), ctx.pDriverData);
+    try testing.expect(vt.vaTerminate == null);
+    for (taken) |t| try testing.expect(!t);
+}
