@@ -19,7 +19,12 @@
 //! imported zero-copy as the kernel's PRIME does) as a GL texture, an
 //! external texture and a renderbuffer, read and drawn on the GPU, the
 //! producer seeing the consumer's pixels; the image kept by GL after its
-//! handle goes, freed with the last name; the errors EGL gives. And
+//! handle goes, freed with the last name; the errors EGL gives. A video
+//! picture's planes (NV12's R8 and GR88, P010's R16 and GR1616) imported
+//! one by one at their offsets in one buffer, sampled by a program. A
+//! texture as an EGLImage (EGL_KHR_gl_texture_2D_image), its dma-buf
+//! exported (EGL_MESA_image_dma_buf_export) and imported again, drawn into
+//! there and seen here (Firefox's dma-buf surfaces and WebGL on them). And
 //! native fences: one of the GPU work handed out, one handed in (polled,
 //! owned, closed).
 
@@ -31,6 +36,7 @@ const egl = gfxapi.egl;
 const wl = gfxapi.wayland;
 const gl = gfxapi.glenum;
 const thread = gfxapi.thread;
+const program = gfxapi.program;
 
 // ── The fake compositor ────────────────────────────────────────────────────
 
@@ -369,10 +375,10 @@ const Fake = struct {
 
 // ── The driver: EmuDevice, fds that are its buffers' handles ──────────────
 
-var emu_mem: [4 << 20]u8 align(4096) = undefined;
-var emu_shadow: [8 << 20]u8 align(4096) = undefined;
-var emu_work: [4 << 20]u8 align(64) = undefined;
-var compile_mem: [64 << 10]u8 align(64) = undefined;
+var emu_mem: [8 << 20]u8 align(4096) = undefined;
+var emu_shadow: [16 << 20]u8 align(4096) = undefined;
+var emu_work: [16 << 20]u8 align(64) = undefined;
+var compile_mem: [256 << 10]u8 align(64) = undefined;
 var emu: gpu.EmuDevice = undefined;
 var eng: engine.Engine = undefined;
 var opened = false;
@@ -1011,7 +1017,7 @@ test "egl: a dma-buf as an EGLImage: a texture, an external texture, a renderbuf
     var formats: [8]i32 = undefined;
     var n: i32 = 0;
     try std.testing.expect(egl.queryDmaBufFormats(d, 8, &formats, &n));
-    try std.testing.expectEqual(@as(i32, 4), n);
+    try std.testing.expectEqual(@as(i32, 8), n);
     var mods: [4]u64 = undefined;
     var ext: [4]u32 = undefined;
     try std.testing.expect(egl.queryDmaBufModifiers(d, argb, 4, &mods, &ext, &n));
@@ -1021,6 +1027,370 @@ test "egl: a dma-buf as an EGLImage: a texture, an external texture, a renderbuf
     try std.testing.expect(!egl.queryDmaBufModifiers(d, 0x3231_564e, 4, &mods, &ext, &n));
 
     eng.freeImage(&prod);
+    try std.testing.expect(egl.makeCurrent(d, null, null, null));
+    try std.testing.expect(egl.destroySurface(d, pb));
+    try std.testing.expect(egl.destroyContext(d, ctx));
+    try std.testing.expect(egl.terminate(d));
+}
+
+// ── A video picture's planes; a texture's dma-buf out and in again ────────
+
+const plane_vs: [:0]const u8 =
+    \\#version 300 es
+    \\in vec2 aPos;
+    \\void main() { gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0); }
+;
+
+const plane_fs: [:0]const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\uniform sampler2D uTex;
+    \\uniform int uMode;
+    \\out vec4 o;
+    \\void main() {
+    \\    ivec2 p = ivec2(gl_FragCoord.xy);
+    \\    if (uMode == 0) {
+    \\        o = texelFetch(uTex, p, 0);
+    \\    } else {
+    \\        o = texture(uTex, (vec2(p) + 0.5) / vec2(textureSize(uTex, 0)));
+    \\    }
+    \\}
+;
+
+/// The program drawing each texel of unit 0's texture once (a quad over
+/// the viewport), in use, its quad bound.
+fn planeProgram(c: *gfxapi.gles.Context) !u32 {
+    const v = program.createShader(c, gl.VERTEX_SHADER);
+    const f = program.createShader(c, gl.FRAGMENT_SHADER);
+    for ([_]u32{ v, f }, [_][:0]const u8{ plane_vs, plane_fs }) |s, src| {
+        const parts = [_]?[*]const u8{src.ptr};
+        program.shaderSource(c, s, 1, &parts, null);
+        program.compileShader(c, s);
+    }
+    const p = program.createProgram(c);
+    program.attachShader(c, p, v);
+    program.attachShader(c, p, f);
+    program.linkProgram(c, p);
+    var linked: i32 = 0;
+    program.getProgramiv(c, p, gl.LINK_STATUS, &linked);
+    if (linked != 1) {
+        var log: [512]u8 = undefined;
+        var len: i32 = 0;
+        program.getProgramInfoLog(c, p, log.len, &len, &log);
+        std.debug.print("plane program: {s}\n", .{log[0..@intCast(len)]});
+        return error.Link;
+    }
+    program.useProgram(c, p);
+    const unit0 = [_]i32{0};
+    program.uniform(c, program.getUniformLocation(c, p, "uTex"), 1, 1, .i, @ptrCast(&unit0));
+    var vao: [1]u32 = undefined;
+    c.genVertexArrays(&vao);
+    c.bindVertexArray(vao[0]);
+    var buf: [1]u32 = undefined;
+    c.genBuffers(&buf);
+    const quad = [_]f32{ 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
+    c.bindBuffer(gl.ARRAY_BUFFER, buf[0]);
+    c.bufferData(gl.ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, gl.STATIC_DRAW);
+    c.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0, false);
+    c.enableVertexAttribArray(0, true);
+    return p;
+}
+
+/// Unit 0's texture drawn texel for pixel into a w x h RGBA8 framebuffer
+/// (mode 0: texelFetch; 1: texture(), nearest), read back as RGBA bytes.
+fn drawPlane(c: *gfxapi.gles.Context, p: u32, mode: i32, w: i32, h: i32, out: []u8) !void {
+    var color: [1]u32 = undefined;
+    c.genTextures(&color);
+    c.activeTexture(gl.TEXTURE0 + 1);
+    c.bindTexture(gl.TEXTURE_2D, color[0]);
+    c.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
+    c.activeTexture(gl.TEXTURE0);
+    var fb: [1]u32 = undefined;
+    c.genFramebuffers(&fb);
+    c.bindFramebuffer(gl.FRAMEBUFFER, fb[0]);
+    c.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color[0], 0);
+    if (c.checkFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE) return error.Incomplete;
+    c.viewportSet(0, 0, w, h);
+    const m = [_]i32{mode};
+    program.uniform(c, program.getUniformLocation(c, p, "uMode"), 1, 1, .i, @ptrCast(&m));
+    c.drawArrays(gl.TRIANGLES, 0, 6, 1);
+    c.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, out.ptr);
+    c.bindFramebuffer(gl.FRAMEBUFFER, 0);
+    c.deleteFramebuffers(&fb);
+    c.deleteTextures(&color);
+}
+
+/// A unorm16 as the unorm8 a draw writes of it (v / 65535, rounded).
+fn to8(v: u16) u8 {
+    return @intFromFloat(@round(@as(f64, @floatFromInt(v)) * 255.0 / 65535.0));
+}
+
+/// 16-bit samples whose unorm8 is neither their high nor their low byte:
+/// a plane read a byte a channel, or its bytes swapped, draws otherwise.
+const y16 = [8]u16{ 0x12f0, 0x40ff, 0x00c8, 0xe000, 0xffff, 0x0000, 0x9d00, 0x2bd0 };
+const uv16 = [4]u16{ 0x40ff, 0x12f0, 0xe000, 0x00c8 };
+
+fn planeImage(d: *egl.Display, fourcc: u32, fd: i32, w: i32, h: i32, offset: i32) ?*egl.EImage {
+    return egl.createImage(i32, d, null, egl.LINUX_DMA_BUF_EXT, null, &[_]i32{
+        egl.WIDTH,                          w,                egl.HEIGHT,                         h,
+        egl.LINUX_DRM_FOURCC_EXT,           @bitCast(fourcc), egl.DMA_BUF_PLANE0_FD_EXT,          fd,
+        egl.DMA_BUF_PLANE0_OFFSET_EXT,      offset,           egl.DMA_BUF_PLANE0_PITCH_EXT,       64,
+        egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0,                egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0,
+        egl.NONE,
+    });
+}
+
+test "egl: a video picture's planes as EGLImages (NV12: R8 and GR88; P010: R16 and GR1616), sampled" {
+    useDriver();
+    Fake.reset();
+    const d = egl.getDisplay(null).?;
+    try std.testing.expect(egl.initialize(d, null, null));
+    const ctx = egl.createContext(d, config(true), null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.NONE }).?;
+    const pb = egl.createPbufferSurface(d, config(true), &[_]i32{ egl.WIDTH, 8, egl.HEIGHT, 4, egl.NONE }).?;
+    try std.testing.expect(egl.makeCurrent(d, pb, pb, ctx));
+    const c = thread.gl().?;
+    const p = try planeProgram(c);
+
+    // the decoder's surface: one buffer, rows of 64 bytes (a pitch-linear
+    // VA surface), its planes at offsets: NV12's Y (8 x 4 bytes) at 0, its
+    // UV (4 x 2 pairs) at 256; P010's Y (4 x 2 halves) at 384, its UV (2 x 1
+    // pairs of halves) at 512
+    var bytes = [_]u8{0} ** 640;
+    for (0..4) |y| {
+        for (0..8) |x| bytes[y * 64 + x] = @intCast(7 + 31 * x + 5 * y);
+    }
+    for (0..2) |y| {
+        for (0..4) |x| {
+            bytes[256 + y * 64 + x * 2] = @intCast(20 + 50 * x + 9 * y);
+            bytes[256 + y * 64 + x * 2 + 1] = @intCast(240 - 45 * x - 13 * y);
+        }
+    }
+    for (0..2) |y| {
+        for (0..4) |x| std.mem.writeInt(u16, bytes[384 + y * 64 + x * 2 ..][0..2], y16[y * 4 + x], .little);
+    }
+    for (0..2) |i| {
+        std.mem.writeInt(u16, bytes[512 + i * 4 ..][0..2], uv16[i * 2], .little);
+        std.mem.writeInt(u16, bytes[512 + i * 4 + 2 ..][0..2], uv16[i * 2 + 1], .little);
+    }
+    var surf = eng.newWindowImage(16, 10, .bgra8).?;
+    eng.write(&surf, 0, 0, 16, 10, &bytes, 64, .bgra8);
+    const fd: i32 = @intCast(exportFd(null, surf.buf));
+    const base = liveRegions();
+
+    const y8 = planeImage(d, egl.DRM_FORMAT_R8, fd, 8, 4, 0).?;
+    const uv8 = planeImage(d, egl.DRM_FORMAT_GR88, fd, 4, 2, 256).?;
+    const y10 = planeImage(d, egl.DRM_FORMAT_R16, fd, 4, 2, 384).?;
+    const uv10 = planeImage(d, egl.DRM_FORMAT_GR1616, fd, 2, 1, 512).?;
+    try std.testing.expectEqual(base + 4, liveRegions());
+
+    var tex: [4]u32 = undefined;
+    c.genTextures(&tex);
+    const planes = [_]*egl.EImage{ y8, uv8, y10, uv10 };
+    const sizes = [_][2]i32{ .{ 8, 4 }, .{ 4, 2 }, .{ 4, 2 }, .{ 2, 1 } };
+    var got: [8 * 4 * 4]u8 = undefined;
+    for (planes, sizes, tex, 0..) |img, size, t, i| {
+        c.activeTexture(gl.TEXTURE0);
+        c.bindTexture(gl.TEXTURE_2D, t);
+        c.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        c.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        c.eglImageTargetTexture2D(gl.TEXTURE_2D, img);
+        try std.testing.expectEqual(gl.NO_ERROR, c.getError());
+        for ([_]i32{ 0, 1 }) |mode| {
+            const w: usize = @intCast(size[0]);
+            const h: usize = @intCast(size[1]);
+            try drawPlane(c, p, mode, size[0], size[1], got[0 .. w * h * 4]);
+            try std.testing.expectEqual(gl.NO_ERROR, c.getError());
+            for (0..h) |y| {
+                for (0..w) |x| {
+                    const want: [4]u8 = switch (i) {
+                        0 => .{ bytes[y * 64 + x], 0, 0, 255 },
+                        1 => .{ bytes[256 + y * 64 + x * 2], bytes[256 + y * 64 + x * 2 + 1], 0, 255 },
+                        2 => .{ to8(y16[y * 4 + x]), 0, 0, 255 },
+                        else => .{ to8(uv16[x * 2]), to8(uv16[x * 2 + 1]), 0, 255 },
+                    };
+                    const at = (y * w + x) * 4;
+                    if (!std.mem.eql(u8, &want, got[at..][0..4])) {
+                        std.debug.print("plane {d} mode {d} texel ({d}, {d}): {any}, not {any}\n", .{ i, mode, x, y, got[at..][0..4], want });
+                        return error.Plane;
+                    }
+                }
+            }
+        }
+    }
+
+    // a unorm16 plane is sampled, never drawn into
+    var fb: [1]u32 = undefined;
+    c.genFramebuffers(&fb);
+    c.bindFramebuffer(gl.FRAMEBUFFER, fb[0]);
+    c.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex[2], 0);
+    try std.testing.expect(c.checkFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE);
+    var rb: [1]u32 = undefined;
+    c.genRenderbuffers(&rb);
+    c.bindRenderbuffer(gl.RENDERBUFFER, rb[0]);
+    c.eglImageTargetRenderbufferStorage(gl.RENDERBUFFER, y10);
+    try std.testing.expectEqual(gl.INVALID_OPERATION, c.getError());
+    c.bindFramebuffer(gl.FRAMEBUFFER, 0);
+    c.deleteFramebuffers(&fb);
+    c.deleteRenderbuffers(&rb);
+
+    // the formats and their (linear) modifier
+    var formats: [8]i32 = undefined;
+    var n: i32 = 0;
+    try std.testing.expect(egl.queryDmaBufFormats(d, 8, &formats, &n));
+    try std.testing.expectEqual(@as(i32, 8), n);
+    var mods: [4]u64 = undefined;
+    try std.testing.expect(egl.queryDmaBufModifiers(d, @bitCast(egl.DRM_FORMAT_GR1616), 4, &mods, null, &n));
+    try std.testing.expectEqual(@as(i32, 1), n);
+    try std.testing.expectEqual(@as(u64, 0), mods[0]);
+    // what a plane's import refuses: a block-linear layout, rows short of
+    // the width (a GR1616 row of 2 is 8 bytes), rows of part words
+    try std.testing.expect(egl.createImage(i32, d, null, egl.LINUX_DMA_BUF_EXT, null, &[_]i32{ egl.WIDTH, 4, egl.HEIGHT, 2, egl.LINUX_DRM_FOURCC_EXT, @bitCast(egl.DRM_FORMAT_R8), egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 64, egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0x14, egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0x0300_0000, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_MATCH, egl.getError());
+    try std.testing.expect(egl.createImage(i32, d, null, egl.LINUX_DMA_BUF_EXT, null, &[_]i32{ egl.WIDTH, 2, egl.HEIGHT, 1, egl.LINUX_DRM_FOURCC_EXT, @bitCast(egl.DRM_FORMAT_GR1616), egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 4, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_ACCESS, egl.getError());
+    try std.testing.expect(egl.createImage(i32, d, null, egl.LINUX_DMA_BUF_EXT, null, &[_]i32{ egl.WIDTH, 3, egl.HEIGHT, 1, egl.LINUX_DRM_FOURCC_EXT, @bitCast(egl.DRM_FORMAT_R8), egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 3, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_ACCESS, egl.getError());
+
+    // every name gone: every import let go
+    // (the draws' own buffers, the program's, stay with the context)
+    c.finish();
+    const live = liveRegions();
+    c.deleteTextures(&tex);
+    try std.testing.expectEqual(live, liveRegions()); // (the images hold them)
+    for (planes) |img| try std.testing.expect(egl.destroyImage(d, img));
+    c.finish();
+    try std.testing.expectEqual(live - 4, liveRegions());
+    eng.freeImage(&surf);
+    try std.testing.expect(egl.makeCurrent(d, null, null, null));
+    try std.testing.expect(egl.destroySurface(d, pb));
+    try std.testing.expect(egl.destroyContext(d, ctx));
+    try std.testing.expect(egl.terminate(d));
+}
+
+var export_slabs: [1]engine.Slab = undefined;
+
+test "egl: a texture as an EGLImage, its dma-buf exported and imported again (Firefox's dma-buf surfaces)" {
+    useDriver();
+    Fake.reset();
+    const d = egl.getDisplay(null).?;
+    try std.testing.expect(egl.initialize(d, null, null));
+    const ctx = egl.createContext(d, config(true), null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.NONE }).?;
+    const pb = egl.createPbufferSurface(d, config(true), &[_]i32{ egl.WIDTH, 4, egl.HEIGHT, 4, egl.NONE }).?;
+    try std.testing.expect(egl.makeCurrent(d, pb, pb, ctx));
+    const c = thread.gl().?;
+    // (slabs, as the library's engine has: a small texture is in one, so
+    // its image moves it to a buffer of its own)
+    eng.slabs = &export_slabs;
+    for (&export_slabs) |*s| s.* = .{};
+    defer {
+        for (&export_slabs) |*s| if (s.buf.cpu.len != 0) emu.device().free(s.buf);
+        eng.slabs = &.{};
+    }
+
+    // Firefox's DMABufSurfaceRGBA::CreateExport: a texture, then an image
+    // of it (pixels here, to see them go with its memory)
+    var px: [4 * 4 * 4]u8 = undefined;
+    for (&px, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+    var tex: [5]u32 = undefined;
+    c.genTextures(&tex);
+    c.bindTexture(gl.TEXTURE_2D, tex[0]);
+    c.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 4, 4, 0, gl.RGBA, gl.UNSIGNED_BYTE, &px);
+    const base = liveRegions();
+    const img = egl.createImage(i32, d, ctx, egl.GL_TEXTURE_2D_KHR, @ptrFromInt(tex[0]), &[_]i32{ egl.GL_TEXTURE_LEVEL_KHR, 0, egl.IMAGE_PRESERVED_KHR, 1, egl.NONE }).?;
+    // (its memory moved out of the engine's slab: a buffer of its own)
+    try std.testing.expectEqual(base + 1, liveRegions());
+    var fourcc: i32 = 0;
+    var nplanes: i32 = 0;
+    var modifier: u64 = 7;
+    try std.testing.expect(egl.exportDmaBufQuery(d, img, &fourcc, &nplanes, &modifier));
+    try std.testing.expectEqual(@as(i32, @bitCast(egl.DRM_FORMAT_ABGR8888)), fourcc);
+    try std.testing.expectEqual(@as(i32, 1), nplanes);
+    try std.testing.expectEqual(@as(u64, 0), modifier); // (DRM_FORMAT_MOD_LINEAR)
+    // the first export fails (the kernel out of memory), the next goes
+    Fake.export_failures = 1;
+    var fd: i32 = -1;
+    var stride: i32 = 0;
+    var offset: i32 = -1;
+    try std.testing.expect(!egl.exportDmaBuf(d, img, &fd, &stride, &offset));
+    try std.testing.expectEqual(egl.BAD_ALLOC, egl.getError());
+    try std.testing.expect(egl.exportDmaBuf(d, img, &fd, &stride, &offset));
+    try std.testing.expectEqual(@as(i32, 16), stride);
+    try std.testing.expectEqual(@as(i32, 0), offset);
+
+    // the compositor's side: the dma-buf imported (the fake's dup is the
+    // fd + 1000), a texture of it in a framebuffer: the same pixels
+    const in = egl.createImage(i32, d, null, egl.LINUX_DMA_BUF_EXT, null, &[_]i32{ egl.WIDTH, 4, egl.HEIGHT, 4, egl.LINUX_DRM_FOURCC_EXT, fourcc, egl.DMA_BUF_PLANE0_FD_EXT, fd - 1000, egl.DMA_BUF_PLANE0_OFFSET_EXT, offset, egl.DMA_BUF_PLANE0_PITCH_EXT, stride, egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0, egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0, egl.NONE }).?;
+    try std.testing.expectEqual(base + 2, liveRegions());
+    c.bindTexture(gl.TEXTURE_2D, tex[1]);
+    c.eglImageTargetTexture2D(gl.TEXTURE_2D, in);
+    var fb: [1]u32 = undefined;
+    c.genFramebuffers(&fb);
+    c.bindFramebuffer(gl.FRAMEBUFFER, fb[0]);
+    c.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex[1], 0);
+    try std.testing.expectEqual(gl.FRAMEBUFFER_COMPLETE, c.checkFramebufferStatus(gl.FRAMEBUFFER));
+    try std.testing.expectEqualSlices(u8, px[(1 * 4 + 2) * 4 ..][0..4], &rgbaAt(c, 2, 1));
+    // drawn into there (WebGL's frames): the exporter's memory is the same
+    // pages, so what the GPU wrote, once fetched for the CPU (pixel 1, 1:
+    // the one read), is in the texture's own bytes (EmuDevice's memory is
+    // not coherent: each side's GPU view is its own copy)
+    c.enable(gl.SCISSOR_TEST, true);
+    c.scissorSet(0, 0, 2, 2);
+    c.clearColor(0, 1, 0, 1);
+    c.clear(gl.COLOR_BUFFER_BIT);
+    c.enable(gl.SCISSOR_TEST, false);
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, rgbaAt(c, 1, 1));
+    const mine = &c.objs.tex[tex[0] - 1].img;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, mine.buf.cpu[1 * 16 + 1 * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, px[(3 * 4 + 3) * 4 ..][0..4], mine.buf.cpu[3 * 16 + 3 * 4 ..][0..4]);
+    try std.testing.expectEqual(gl.NO_ERROR, c.getError());
+
+    // a video plane's texture (R8) is exported as R8; a float texture's
+    // image is had, but no dma-buf has its layout
+    c.bindTexture(gl.TEXTURE_2D, tex[2]);
+    c.texImage2D(gl.TEXTURE_2D, 0, @bitCast(gl.R8), 8, 2, 0, gl.RED, gl.UNSIGNED_BYTE, null);
+    const r8 = egl.createImage(i32, d, ctx, egl.GL_TEXTURE_2D_KHR, @ptrFromInt(tex[2]), null).?;
+    try std.testing.expect(egl.exportDmaBufQuery(d, r8, &fourcc, &nplanes, &modifier));
+    try std.testing.expectEqual(@as(i32, @bitCast(egl.DRM_FORMAT_R8)), fourcc);
+    c.bindTexture(gl.TEXTURE_2D, tex[3]);
+    c.texImage2D(gl.TEXTURE_2D, 0, @bitCast(gl.RGBA32F), 1, 1, 0, gl.RGBA, gl.FLOAT, null);
+    const f32img = egl.createImage(i32, d, ctx, egl.GL_TEXTURE_2D_KHR, @ptrFromInt(tex[3]), null).?;
+    try std.testing.expect(!egl.exportDmaBufQuery(d, f32img, &fourcc, &nplanes, &modifier));
+    try std.testing.expectEqual(egl.BAD_MATCH, egl.getError());
+
+    // what EGL refuses: a texture already an image's, none, a texture with
+    // no level 0, another level, no context
+    try std.testing.expect(egl.createImage(i32, d, ctx, egl.GL_TEXTURE_2D_KHR, @ptrFromInt(tex[0]), null) == null);
+    try std.testing.expectEqual(egl.BAD_ACCESS, egl.getError());
+    try std.testing.expect(egl.createImage(i32, d, ctx, egl.GL_TEXTURE_2D_KHR, null, null) == null);
+    try std.testing.expectEqual(egl.BAD_PARAMETER, egl.getError());
+    try std.testing.expect(egl.createImage(i32, d, ctx, egl.GL_TEXTURE_2D_KHR, @ptrFromInt(9999), null) == null);
+    try std.testing.expectEqual(egl.BAD_PARAMETER, egl.getError());
+    c.bindTexture(gl.TEXTURE_2D, tex[4]);
+    try std.testing.expect(egl.createImage(i32, d, ctx, egl.GL_TEXTURE_2D_KHR, @ptrFromInt(tex[4]), null) == null);
+    try std.testing.expectEqual(egl.BAD_MATCH, egl.getError());
+    c.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    try std.testing.expect(egl.createImage(i32, d, ctx, egl.GL_TEXTURE_2D_KHR, @ptrFromInt(tex[4]), &[_]i32{ egl.GL_TEXTURE_LEVEL_KHR, 1, egl.NONE }) == null);
+    try std.testing.expectEqual(egl.BAD_MATCH, egl.getError());
+    try std.testing.expect(egl.createImage(i32, d, null, egl.GL_TEXTURE_2D_KHR, @ptrFromInt(tex[4]), null) == null);
+    try std.testing.expectEqual(egl.BAD_CONTEXT, egl.getError());
+
+    // the texture goes; its image keeps the memory, then the image goes
+    // and its fd is closed with it; every name gone, every buffer freed
+    c.bindFramebuffer(gl.FRAMEBUFFER, 0);
+    c.deleteFramebuffers(&fb);
+    c.finish();
+    const live = liveRegions();
+    c.deleteTextures(tex[0..1]);
+    try std.testing.expectEqual(live, liveRegions());
+    const closes = Fake.closes;
+    try std.testing.expect(egl.destroyImage(d, img));
+    try std.testing.expectEqual(closes + 1, Fake.closes);
+    c.deleteTextures(tex[1..]);
+    for ([_]*egl.EImage{ in, r8, f32img }) |m| try std.testing.expect(egl.destroyImage(d, m));
+    c.finish();
+    // (the three textures' own buffers and the import; the draws' kernels
+    // stay with the context)
+    try std.testing.expectEqual(live - 4, liveRegions());
     try std.testing.expect(egl.makeCurrent(d, null, null, null));
     try std.testing.expect(egl.destroySurface(d, pb));
     try std.testing.expect(egl.destroyContext(d, ctx));
