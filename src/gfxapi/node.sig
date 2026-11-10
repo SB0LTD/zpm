@@ -159,9 +159,15 @@ pub fn Node(comptime Sys: type) type {
         /// the fence of the last submission (0: none yet)
         last_seq: u32 = 0,
         buffers: [MAX_BUFFERS]Entry = [_]Entry{.{}} ** MAX_BUFFERS,
+        /// Handles refused as their buffer's gone (entryOf).
+        stale: u32 = 0,
 
         const Entry = struct {
             used: bool = false,
+            /// The entry's reuses: a handle carries the generation it was
+            /// made in (bits 16..30), so one kept past its buffer's free
+            /// names no other buffer (handleOf, entryOf).
+            gen: u16 = 0,
             /// names held (an import of the same kernel buffer again)
             refs: u32 = 1,
             va: u64 = 0,
@@ -336,7 +342,16 @@ pub fn Node(comptime Sys: type) type {
                 wr64(&a, 0, e.va);
                 _ = g.call(G_UNRESERVE, &a);
             }
+            // (the entry is free, its generation moved on)
+            const gen = e.gen +% 1;
             e.* = .{};
+            e.gen = gen;
+        }
+
+        /// Entry idx's handle: its index + 1, and the entry's generation
+        /// above (15 bits: a handle stays a positive 32-bit number).
+        fn handleOf(g: *const Self, idx: usize) u32 {
+            return @as(u32, @intCast(idx + 1)) | @as(u32, g.buffers[idx].gen & 0x7fff) << 16;
         }
 
         fn freeEntry(g: *Self) ?usize {
@@ -364,7 +379,7 @@ pub fn Node(comptime Sys: type) type {
             // units; mapped, and laid out, in its units)
             const need = std.mem.alignForward(usize, size, PAGE);
             const len = std.mem.alignForward(usize, size, g.unit);
-            e.* = .{ .used = true, .first = @min(len, piece) };
+            e.* = .{ .used = true, .first = @min(len, piece), .gen = g.buffers[idx].gen };
             if (len <= piece) {
                 const p = g.newPiece(need, 0, flags) orelse return g.undo(e);
                 e.handles[0] = p.handle;
@@ -397,7 +412,7 @@ pub fn Node(comptime Sys: type) type {
                     if (g.sys.mapBuffer(g.fd, want, part, p.off) != @as(i64, @intCast(want))) return g.undo(e);
                 }
             }
-            return .{ .va = e.va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..size], .handle = @intCast(idx + 1) };
+            return .{ .va = e.va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..size], .handle = g.handleOf(idx) };
         }
 
         fn undo(g: *Self, e: *Entry) ?Made {
@@ -405,9 +420,21 @@ pub fn Node(comptime Sys: type) type {
             return null;
         }
 
+        /// The entry a handle names, if its generation is the entry's. A
+        /// handle kept past its buffer's free (freed twice, used after the
+        /// free) is refused, and said once, instead of reaching the buffer
+        /// made in that entry since: entries are reused at once, the first
+        /// free one first, and freeing the wrong one takes a buffer the
+        /// GPU is still using from under it.
         fn entryOf(g: *Self, handle: u32) ?*Entry {
-            if (handle == 0 or handle > MAX_BUFFERS) return null;
-            const e = &g.buffers[handle - 1];
+            const idx = handle & 0xffff;
+            if (idx == 0 or idx > MAX_BUFFERS or handle >> 31 != 0) return null;
+            const e = &g.buffers[idx - 1];
+            if (e.gen & 0x7fff != handle >> 16) {
+                if (g.stale == 0) report.say(.egl_error, "a buffer handle used after its buffer was freed (handle 0x{x}, its entry now generation {d}): refused (said once)", .{ handle, e.gen & 0x7fff });
+                g.stale += 1;
+                return null;
+            }
             return if (e.used) e else null;
         }
 
@@ -433,7 +460,7 @@ pub fn Node(comptime Sys: type) type {
             for (&g.buffers, 0..) |*e, i| {
                 if (e.used and e.n == 1 and e.handles[0] == kh) {
                     e.refs += 1;
-                    return .{ .va = e.va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..@min(size, e.len)], .handle = @intCast(i + 1) };
+                    return .{ .va = e.va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..@min(size, e.len)], .handle = g.handleOf(i) };
                 }
             }
             const idx = g.freeEntry() orelse return g.dropHandle(kh);
@@ -460,9 +487,9 @@ pub fn Node(comptime Sys: type) type {
             const at = g.sys.mapBuffer(g.fd, 0, len, off);
             if (at < 0) return g.dropHandle(kh);
             const e = &g.buffers[idx];
-            e.* = .{ .used = true, .va = va, .cpu = @intCast(at), .len = len, .first = len, .n = 1 };
+            e.* = .{ .used = true, .va = va, .cpu = @intCast(at), .len = len, .first = len, .n = 1, .gen = g.buffers[idx].gen };
             e.handles[0] = kh;
-            return .{ .va = va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..size], .handle = @intCast(idx + 1) };
+            return .{ .va = va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..size], .handle = g.handleOf(idx) };
         }
 
         fn dropHandle(g: *Self, kh: u32) ?Buffer {
@@ -527,9 +554,9 @@ pub fn Node(comptime Sys: type) type {
             wr64(&a, 24, start);
             if (g.call(G_IMPORT, &a) != 0) return null;
             const e = &g.buffers[idx];
-            e.* = .{ .used = true, .va = rd64(&a, 16), .n = 1 };
+            e.* = .{ .used = true, .va = rd64(&a, 16), .n = 1, .gen = g.buffers[idx].gen };
             e.handles[0] = rd32(&a, 12);
-            return .{ .va = e.va + (at - start), .cpu = cpu, .handle = @intCast(idx + 1) };
+            return .{ .va = e.va + (at - start), .cpu = cpu, .handle = g.handleOf(idx) };
         }
 
         fn importCall(ctx: *anyopaque, cpu: []u8, writable: bool) ?Buffer {
@@ -1023,6 +1050,33 @@ test "node: RTX PRIME import maps a shared buffer and counts repeated imports" {
     try std.testing.expectEqual(@as(u32, 0), k.live);
 }
 
+test "node: a buffer freed twice does not free the buffer made in its entry since" {
+    var k: Fake = undefined;
+    var g = testNode(&k);
+    _ = try g.open();
+    const d = g.device();
+    const a = try d.alloc(5000);
+    d.free(a);
+    // (its entry is the first free one: the next buffer takes it)
+    const b = try d.alloc(9000);
+    try std.testing.expectEqual(a.handle & 0xffff, b.handle & 0xffff);
+    try std.testing.expect(a.handle != b.handle);
+    const kh = g.buffers[(b.handle & 0xffff) - 1].handles[0];
+    // the first buffer freed again, and asked for as a dma-buf: refused,
+    // and the second is whole (its entry, its kernel buffer, its export)
+    d.free(a);
+    try std.testing.expectEqual(@as(u32, 1), g.stale);
+    try std.testing.expectEqual(@as(i64, -EINVAL), g.exportFd(a.handle));
+    try std.testing.expect(g.buffers[(b.handle & 0xffff) - 1].used);
+    try std.testing.expectEqual(kh, g.buffers[(b.handle & 0xffff) - 1].handles[0]);
+    try std.testing.expectEqual(@as(i64, 100 + kh), g.exportFd(b.handle));
+    b.cpu[0] = 9;
+    d.toDevice(b, 0, 1);
+    try std.testing.expectEqual(@as(u8, 9), test_gpu_view[@intFromPtr(b.cpu.ptr) - @intFromPtr(&test_arena)]);
+    d.free(b);
+    try std.testing.expect(!g.buffers[(b.handle & 0xffff) - 1].used);
+}
+
 test "node: buffers, an import, an export, a hang, no GPU" {
     var k: Fake = undefined;
     var g = testNode(&k);
@@ -1038,7 +1092,7 @@ test "node: buffers, an import, an export, a hang, no GPU" {
     try std.testing.expectEqual(@as(u8, 7), test_gpu_view[@intFromPtr(b.cpu.ptr) - @intFromPtr(&test_arena)]);
     // an export: the buffer's kernel handle as PRIME's
     const fd = g.exportFd(b.handle);
-    try std.testing.expectEqual(@as(i64, 100 + g.buffers[b.handle - 1].handles[0]), fd);
+    try std.testing.expectEqual(@as(i64, 100 + g.buffers[(b.handle & 0xffff) - 1].handles[0]), fd);
     try std.testing.expectEqual(@as(i64, -EINVAL), g.exportFd(77));
     // an import: the CPU's bytes in place, at their offset in the page
     var mine: [3 * PAGE]u8 align(PAGE) = undefined;
