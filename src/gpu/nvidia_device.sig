@@ -98,7 +98,16 @@ const Slot = struct {
     /// From the host device (else VRAM).
     on_host: bool = false,
     used: bool = false,
+    /// Its reuses: a buffer's handle carries the generation it was made
+    /// in (bits 16..31), so a handle kept past its free (a double free)
+    /// names no buffer made in the slot since.
+    gen: u16 = 0,
 };
+
+/// Slot i's buffer's handle: its index + 1, the slot's generation above.
+fn handleAt(a: *const Adapter, i: usize) u32 {
+    return @as(u32, @intCast(i + 1)) | @as(u32, a.bufs[i].gen) << 16;
+}
 
 const Set = struct {
     slots: nv.Buffer = .{},
@@ -118,6 +127,8 @@ pub const Adapter = struct {
     host: ?nv.Device = null,
     caps: gpu.Caps = undefined,
     bufs: [MAX_BUFFERS]Slot = [_]Slot{.{}} ** MAX_BUFFERS,
+    /// Frees (and lookups) of a handle whose buffer had gone: refused.
+    stale_frees: u32 = 0,
     sets: [SETS]Set = [_]Set{.{}} ** SETS,
     next_set: usize = 0,
     last_set: ?usize = null,
@@ -153,8 +164,8 @@ pub const Adapter = struct {
         if (a.host == null or raw.cpu.len == 0) return null;
         for (&a.bufs, 0..) |*slot, i| {
             if (slot.used) continue;
-            slot.* = .{ .raw = raw, .on_host = true, .used = true };
-            return .{ .gpu = raw.va, .cpu = raw.cpu, .bytes = raw.cpu.len, .handle = @intCast(i + 1), .kind = .host };
+            slot.* = .{ .raw = raw, .on_host = true, .used = true, .gen = slot.gen };
+            return .{ .gpu = raw.va, .cpu = raw.cpu, .bytes = raw.cpu.len, .handle = handleAt(a, i), .kind = .host };
         }
         return null;
     }
@@ -191,15 +202,25 @@ pub const Adapter = struct {
         for (&a.bufs, 0..) |*s, i| {
             if (s.used) continue;
             const raw = a.rawOf(on_host).alloc(@intCast(bytes)) catch return null;
-            s.* = .{ .raw = raw, .on_host = on_host, .used = true };
-            return .{ .gpu = raw.va, .cpu = raw.cpu, .bytes = bytes, .handle = @intCast(i + 1), .kind = kind };
+            s.* = .{ .raw = raw, .on_host = on_host, .used = true, .gen = s.gen };
+            return .{ .gpu = raw.va, .cpu = raw.cpu, .bytes = bytes, .handle = handleAt(a, i), .kind = kind };
         }
         return null;
     }
 
+    /// The slot buffer `b` is in, if it is still that buffer's: a handle
+    /// from before the slot's last free names nothing (its double free is
+    /// counted in stale_frees and does nothing). Legion 1110x: Firefox's
+    /// channel read memory just unmapped and mapped again; a buffer freed
+    /// twice through a reused slot frees whatever took the slot.
     fn slotOf(a: *Adapter, b: gpu.Buffer) ?*Slot {
-        if (b.handle == 0 or b.handle > MAX_BUFFERS) return null;
-        const s = &a.bufs[b.handle - 1];
+        const idx = b.handle & 0xffff;
+        if (idx == 0 or idx > MAX_BUFFERS) return null;
+        const s = &a.bufs[idx - 1];
+        if (s.gen != @as(u16, @truncate(b.handle >> 16))) {
+            a.stale_frees +%= 1;
+            return null;
+        }
         return if (s.used) s else null;
     }
 
@@ -207,7 +228,7 @@ pub const Adapter = struct {
         const a = self(ctx);
         const s = a.slotOf(b) orelse return;
         a.rawOf(s.on_host).free(s.raw);
-        s.* = .{};
+        s.* = .{ .gen = s.gen +% 1 };
     }
 
     fn import_(ctx: *anyopaque, cpu: []u8) ?gpu.Buffer {
@@ -546,12 +567,13 @@ test "a buffer's raw handle: the device under the adapter's, not the adapter's s
     const a = try d.alloc(4096, .host);
     const b = try d.alloc(4096, .host);
     d.free(a);
-    // (slot 1 again, a new raw buffer under it)
+    // (slot 1 again, a new raw buffer under it, the slot's next generation)
     const c = try d.alloc(8192, .host);
-    try testing.expectEqual(a.handle, c.handle);
+    try testing.expectEqual(a.handle & 0xffff, c.handle & 0xffff);
+    try testing.expect(a.handle != c.handle);
     const ad = &T.dev.adapter;
-    try testing.expectEqual(ad.bufs[c.handle - 1].raw.handle, ad.rawHandle(c).?);
-    try testing.expectEqual(ad.bufs[b.handle - 1].raw.handle, ad.rawHandle(b).?);
+    try testing.expectEqual(ad.bufs[(c.handle & 0xffff) - 1].raw.handle, ad.rawHandle(c).?);
+    try testing.expectEqual(ad.bufs[(b.handle & 0xffff) - 1].raw.handle, ad.rawHandle(b).?);
     try testing.expect(ad.rawHandle(b).? != ad.rawHandle(c).?);
     // (no buffer of this adapter's: none)
     var x = b;
@@ -561,6 +583,23 @@ test "a buffer's raw handle: the device under the adapter's, not the adapter's s
     try testing.expectEqual(@as(?u32, null), ad.rawHandle(x));
     d.free(b);
     d.free(c);
+}
+
+test "a buffer freed twice: the second free names nothing, and the buffer made in its slot since stays" {
+    const d = freshEmu();
+    const ad = &T.dev.adapter;
+    const a = try d.alloc(4096, .host);
+    d.free(a);
+    const c = try d.alloc(4096, .host);
+    try testing.expectEqual(a.handle & 0xffff, c.handle & 0xffff);
+    const before = ad.stale_frees;
+    d.free(a); // (a's handle again: c's slot, an older generation)
+    try testing.expectEqual(before + 1, ad.stale_frees);
+    try testing.expect(ad.bufs[(c.handle & 0xffff) - 1].used);
+    try testing.expect(ad.rawHandle(c) != null);
+    try testing.expect(ad.rawHandle(a) == null);
+    d.free(c);
+    try testing.expect(!ad.bufs[(c.handle & 0xffff) - 1].used);
 }
 
 test "Emu over an emulator Work left undefined (a static `= undefined`): its controls are set by init" {
