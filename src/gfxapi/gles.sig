@@ -60,10 +60,12 @@ pub const GLSL_STRING: [:0]const u8 = "OpenGL ES GLSL ES 3.00";
 /// What GL_EXTENSIONS names: what the driver has (WebRender asks for
 /// BGRA and external textures in ESSL 3.00; GLSL ES 1.00 programs for
 /// derivatives and texture LOD; ES 2 apps for sized renderbuffers and
-/// texture storage). The GLSL compiler's #extension takes the shading ones.
+/// texture storage; video's 10- to 16-bit planes for norm16, sampled
+/// only). The GLSL compiler's #extension takes the shading ones.
 pub const EXTENSIONS = [_][:0]const u8{
     "GL_EXT_read_format_bgra",
     "GL_EXT_texture_format_BGRA8888",
+    "GL_EXT_texture_norm16",
     "GL_EXT_texture_storage",
     "GL_EXT_shader_texture_lod",
     "GL_OES_EGL_image",
