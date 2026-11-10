@@ -21,6 +21,9 @@ pub const sph = @import("sph.sig");
 pub const push = @import("push.sig");
 pub const sm120_emu = @import("sm120_emu.sig");
 pub const device = @import("device.sig");
+/// Rectangles drawn by the RTX's 3D engine (the methods, the programs, a
+/// renderer over any Device).
+pub const draw = @import("draw.sig");
 
 test {
     _ = sm120;
@@ -31,4 +34,5 @@ test {
     _ = push;
     _ = sm120_emu;
     _ = device;
+    _ = draw;
 }
