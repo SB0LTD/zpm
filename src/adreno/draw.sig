@@ -4,7 +4,9 @@
 //! What a compositor draws with: a solid color, an image (a texture times a
 //! color), a mask (an 8-bit coverage texture times a color), each a
 //! rectangle in window pixels, replacing the target's pixels or blended
-//! over them (premultiplied alpha), inside a scissor. The rasterizer walks
+//! over them (premultiplied alpha), inside a scissor; and the same with a
+//! rounded rectangle's coverage worked out per pixel (a filled one, a
+//! stroked one, an image inside one). The rasterizer walks
 //! the rectangle, the texture unit filters, the render backend blends: no
 //! compute kernel, no per-pixel command lists.
 //!
@@ -47,11 +49,133 @@ pub const Error = device.Error || ir3_asm.Error || error{
 };
 
 /// What a rectangle's pixels are.
-pub const Kind = enum(u8) { solid, image, mask };
-const KINDS = 3;
+pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow, shadow };
+const KINDS = 9;
 
 /// A rectangle's corners: x0, y0, x1, y1 (pixels; x1 and y1 past the end).
 pub const Rect = [4]f32;
+
+/// What a shadow leaves alone, and gfx's ways. Deeper than three sigmas
+/// inside the shape nothing is drawn: what casts the shadow covers it.
+/// gfx's shadow differs in two places that a frame compared with gfx's
+/// must have too, both in its corner rows (those above `above` or from
+/// `below` down):
+/// - the pixels from column `from_x` right that are that deep are drawn
+///   whole;
+/// - left of column `left` and from `right` on (its corners), the
+///   distance is taken to the nearest `step` (its table's), counted from
+///   three sigmas inside;
+/// - once a corner row has reached a pixel that deep, gfx skips on to
+///   three sigmas from the right edge, over the right corner's shallower
+///   pixels too: from column `run_from` (the row's deepest pixel right of
+///   its straight part) up to `run_end`, nothing is drawn in a row whose
+///   pixel at `run_from` is that deep.
+/// The defaults have none of them.
+pub const Deep = struct {
+    from_x: f32 = 1e30,
+    above: f32 = -1e30,
+    below: f32 = 1e30,
+    left: f32 = -1e30,
+    right: f32 = 1e30,
+    step: f32 = 0,
+    run_from: f32 = 0,
+    run_end: f32 = -1e30,
+};
+
+/// The part of a Gaussian of `sigma` beyond the distance `d` (gfx's
+/// gaussEdge: Abramowitz and Stegun's erf): the programs' arithmetic.
+pub fn gaussEdge(d: f32, sigma: f32) f32 {
+    const x = d / (sigma * 1.41421356);
+    const t = 1 / (1 + 0.3275911 * @abs(x));
+    const h = 0.5 * (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * @exp2(-x * x * 1.44269504);
+    return if (x >= 0) h else 1 - h;
+}
+
+/// A shadow's alpha at the pixel (x, y): `alpha` times gaussEdge of the
+/// signed distance to `s`, less half a step of 255 (gfx takes it down to a
+/// whole step, and this is the middle of what that loses); deeper than
+/// three sigmas inside, nothing, or `alpha` (254 of 255 of it) where
+/// `deep` says so.
+pub fn shadowAlpha(x: u32, y: u32, s: Shape, sigma: f32, alpha: f32, deep: Deep) f32 {
+    const px = @as(f32, @floatFromInt(x)) + 0.5;
+    const py = @as(f32, @floatFromInt(y)) + 0.5;
+    const ext = 3 * sigma;
+    var d = s.distance(px, py);
+    const corner_row = py < deep.above or py > deep.below;
+    if (corner_row and px > deep.run_from and px < deep.run_end and s.distance(deep.run_from + 0.5, py) < -ext) return 0;
+    if (d < -ext) return if (px > deep.from_x and corner_row) alpha * (254.0 / 255.0) else 0;
+    if (deep.step > 0 and corner_row and (px < deep.left or px > deep.right)) {
+        d = @floor((d + ext) / deep.step + 0.5) * deep.step - ext;
+    }
+    return alpha * @max(gaussEdge(d, sigma) - 0.5 / 255.0, 0);
+}
+
+/// Just under half a step of 255. gfx blends some things (a glow, a scrim)
+/// dropping the fraction, where the blender rounds to the nearest step: a
+/// source color this much lower blends to what gfx has (a whole step
+/// stays where it is). Without it every such layer is half a step up on
+/// gfx, and layers add up.
+pub const DROP: f32 = 0.49 / 255.0;
+
+/// A paint that changes across a shape (maskGradient). With q1 and q2 two
+/// lines in window pixels (x's and y's factors, then a constant), t is
+/// |(q1, q2)| * around + q1 * along, held to [0, 1]. The color is `a` at 0,
+/// `b` at `mid` and `c` at 1 (straight, not premultiplied: r, g, b, a).
+pub const Gradient = struct {
+    q1: [3]f32,
+    q2: [3]f32 = .{ 0, 0, 0 },
+    along: f32 = 1,
+    around: f32 = 0,
+    a: Color,
+    b: Color,
+    /// (two stops: `b` is halfway between them at a `mid` of a half)
+    c: Color,
+    mid: f32 = 0.5,
+
+    /// The color at pixel (px, py): the program's arithmetic, for tests.
+    pub fn at(g: Gradient, px: f32, py: f32) Color {
+        const v1 = g.q1[0] * px + g.q1[1] * py + g.q1[2];
+        const v2 = g.q2[0] * px + g.q2[1] * py + g.q2[2];
+        const t = std.math.clamp(@sqrt(v1 * v1 + v2 * v2) * g.around + v1 * g.along, 0, 1);
+        const t1 = std.math.clamp(t / g.mid, 0, 1);
+        const t2 = std.math.clamp((t - g.mid) / (1 - g.mid), 0, 1);
+        var out: Color = undefined;
+        for (0..4) |i| out[i] = g.a[i] + (g.b[i] - g.a[i]) * t1 + (g.c[i] - g.b[i]) * t2;
+        return out;
+    }
+};
+
+/// A rounded rectangle as the coverage programs take it: its centre, its
+/// half size less the radius, the radius.
+pub const Shape = struct {
+    cx: f32,
+    cy: f32,
+    kx: f32,
+    ky: f32,
+    rad: f32,
+
+    /// The rectangle (x, y, w, h) with corners of `radius`, the radius
+    /// held to half the smaller side as gfx.sdRoundRect holds it.
+    pub fn of(x: f32, y: f32, w: f32, h: f32, radius: f32) Shape {
+        const hw = w / 2;
+        const hh = h / 2;
+        const rad = @min(radius, @min(hw, hh));
+        return .{ .cx = x + hw, .cy = y + hh, .kx = hw - rad, .ky = hh - rad, .rad = rad };
+    }
+
+    /// The signed distance at (px, py): the programs' arithmetic, for tests.
+    pub fn distance(s: Shape, px: f32, py: f32) f32 {
+        const qx = @abs(px - s.cx) - s.kx;
+        const qy = @abs(py - s.cy) - s.ky;
+        const ox = @max(qx, 0);
+        const oy = @max(qy, 0);
+        return @sqrt(ox * ox + oy * oy) + @min(@max(qx, qy), 0) - s.rad;
+    }
+
+    pub fn coverage(s: Shape, px: f32, py: f32) f32 {
+        return std.math.clamp(0.5 - s.distance(px, py), 0, 1);
+    }
+};
 /// Premultiplied r, g, b, a.
 pub const Color = [4]f32;
 
@@ -106,10 +230,327 @@ const FS_MASK =
     \\end
 ;
 
-const SOURCES = [1 + KINDS][]const u8{ VS, FS_SOLID, FS_IMAGE, FS_MASK };
-/// Instruction words a program may take (with its padding).
-const WORDS = 64;
-const CODE_BYTES = 4096;
+// The coverage programs (Galaxy's own: turnip has none like them). A
+// rounded rectangle's signed distance at the pixel, as gfx.sdRoundRect:
+// q = |p - centre| - k (k: the half size less the radius), then
+// length(max(q, 0)) + min(max(q.x, q.y), 0) - radius; the coverage is
+// 0.5 less that, between 0 and 1. The constants hold the negated values,
+// so every step is an add.
+
+/// A filled rounded rectangle. The varyings are the pixel's position.
+/// c0: the color; c1: -centre x, y, -k x, y; c2.x: -radius.
+const FS_RRECT =
+    \\@threadsize 128
+    \\@out r4.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.x
+    \\absneg.f r2.x, (abs)r2.x
+    \\absneg.f r2.y, (abs)r2.y
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.z
+    \\(rpt1)max.f r2.z, (r)r2.x, (0.0)
+    \\mul.f r3.x, r2.z, r2.z
+    \\mul.f r3.y, r2.w, r2.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.x, r3.x
+    \\max.f r3.y, r2.x, r2.y
+    \\min.f r3.y, r3.y, (0.0)
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c2.x
+    \\add.f (sat)r3.x, (neg)r3.x, (0.5)
+    \\(rpt3)mul.f r4.x, (r)c0.x, r3.x
+    \\end
+;
+
+/// A stroked rounded rectangle: the outer shape's coverage less the
+/// inner's (the same centre), not below 0.
+/// c0: the color; c1: -centre, -k (outer); c2.x, c2.y: -radius outer,
+/// inner; c3.zw: -k (inner).
+const FS_RING =
+    \\@threadsize 128
+    \\@out r4.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.x
+    \\absneg.f r2.x, (abs)r2.x
+    \\absneg.f r2.y, (abs)r2.y
+    \\(rpt1)add.f r5.x, (r)r2.x, (r)c1.z
+    \\(rpt1)max.f r5.z, (r)r5.x, (0.0)
+    \\mul.f r3.x, r5.z, r5.z
+    \\mul.f r3.y, r5.w, r5.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.x, r3.x
+    \\max.f r3.y, r5.x, r5.y
+    \\min.f r3.y, r3.y, (0.0)
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c2.x
+    \\add.f (sat)r3.x, (neg)r3.x, (0.5)
+    \\(rpt1)add.f r6.x, (r)r2.x, (r)c3.z
+    \\(rpt1)max.f r6.z, (r)r6.x, (0.0)
+    \\mul.f r3.z, r6.z, r6.z
+    \\mul.f r3.w, r6.w, r6.w
+    \\add.f r3.z, r3.z, r3.w
+    \\sqrt r3.z, r3.z
+    \\max.f r3.w, r6.x, r6.y
+    \\min.f r3.w, r3.w, (0.0)
+    \\add.f r3.z, r3.z, r3.w
+    \\add.f r3.z, r3.z, c2.y
+    \\add.f (sat)r3.z, (neg)r3.z, (0.5)
+    \\add.f r3.x, r3.x, (neg)r3.z
+    \\max.f r3.x, r3.x, (0.0)
+    \\(rpt3)mul.f r4.x, (r)c0.x, r3.x
+    \\end
+;
+
+/// The prefetched texel times c0 times a rounded rectangle's coverage.
+/// The varyings are the texture coordinates; the pixel's position less
+/// the centre is theirs scaled and moved.
+/// c0: the tint; c1: the scale x, y, then the offset x, y; c2: -k x, y,
+/// then -radius.
+const FS_IMAGE_RR =
+    \\@threadsize 128
+    \\@out r4.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\(rpt1)mul.f r2.x, (r)r2.x, (r)c1.x
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.z
+    \\absneg.f r2.x, (abs)r2.x
+    \\absneg.f r2.y, (abs)r2.y
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c2.x
+    \\(rpt1)max.f r2.z, (r)r2.x, (0.0)
+    \\mul.f r3.x, r2.z, r2.z
+    \\mul.f r3.y, r2.w, r2.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.x, r3.x
+    \\max.f r3.y, r2.x, r2.y
+    \\min.f r3.y, r3.y, (0.0)
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c2.z
+    \\add.f (sat)r3.x, (neg)r3.x, (0.5)
+    \\(sy)(rpt3)mul.f r4.x, (r)r0.z, (r)c0.x
+    \\(rpt3)mul.f r4.x, (r)r4.x, r3.x
+    \\end
+;
+
+/// The prefetched coverage times a gradient: a path filled with a paint.
+/// The varyings are the mask's texture coordinates, one a pixel. With
+/// q1 and q2 two lines in them, t is |(q1, q2)| times R plus q1 times L,
+/// held to [0, 1] (L one for a gradient along a line, R one for one
+/// around a point); the color is a, then b - a by t up to the middle
+/// stop, then c - b by the rest. Colors are straight here, and leave
+/// premultiplied.
+/// c0: q1's x, y, constant, then L; c1: q2's, then R; c2: 1 / mid,
+/// -mid / (1 - mid), 1 / (1 - mid), the opacity; c3: a; c4: b - a;
+/// c5: c - b.
+const FS_MASK_GRAD =
+    \\@threadsize 128
+    \\@out r6.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\mul.f r2.z, r2.x, c0.x
+    \\mul.f r2.w, r2.y, c0.y
+    \\add.f r2.z, r2.z, r2.w
+    \\add.f r2.z, r2.z, c0.z
+    \\mul.f r3.x, r2.x, c1.x
+    \\mul.f r3.y, r2.y, c1.y
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c1.z
+    \\mul.f r3.y, r2.z, r2.z
+    \\mul.f r3.z, r3.x, r3.x
+    \\add.f r3.y, r3.y, r3.z
+    \\sqrt r3.y, r3.y
+    \\mul.f r3.y, r3.y, c1.w
+    \\mul.f r3.z, r2.z, c0.w
+    \\add.f (sat)r3.y, r3.y, r3.z
+    \\mul.f (sat)r3.z, r3.y, c2.x
+    \\mul.f r3.w, r3.y, c2.z
+    \\add.f (sat)r3.w, r3.w, c2.y
+    \\(rpt3)mul.f r4.x, (r)c4.x, r3.z
+    \\(rpt3)add.f r4.x, (r)r4.x, (r)c3.x
+    \\(rpt3)mul.f r5.x, (r)c5.x, r3.w
+    \\(rpt3)add.f r4.x, (r)r4.x, (r)r5.x
+    \\(sy)mul.f r3.x, r0.z, c2.w
+    \\mul.f r3.x, r3.x, r4.w
+    \\(rpt2)mul.f r6.x, (r)r4.x, r3.x
+    \\mov.f32f32 r6.w, r3.x
+    \\end
+;
+
+/// A soft disc, as gfx.radialGlow: full inside `inner`, falling by a
+/// smooth step to nothing at `outer`, with gfx's 4 x 4 ordered dither
+/// (9 of 255 wide) so the fall does not band. The varyings are the
+/// pixel's position.
+/// c0: the color (straight), then its alpha; c1: -centre x, y, inner,
+/// 1 / (outer - inner); c2: the dither's step and offset, 3, outer
+/// squared; c3.x: what the blended color is taken down by (gfx's blend
+/// drops the fraction where the blender rounds).
+const FS_GLOW =
+    \\@threadsize 128
+    \\@out r6.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\(rpt1)add.f r2.z, (r)r2.x, (r)c1.x
+    \\mul.f r3.x, r2.z, r2.z
+    \\mul.f r3.y, r2.w, r2.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.y, r3.x
+    \\add.f r3.z, (neg)r3.y, c1.z
+    \\mul.f r3.z, r3.z, c1.w
+    \\add.f (sat)r3.z, r3.z, (1.0)
+    \\mul.f r3.w, r3.z, r3.z
+    \\add.f r4.x, r3.z, r3.z
+    \\add.f r4.x, (neg)r4.x, c2.z
+    \\mul.f r3.w, r3.w, r4.x
+    \\mul.f r3.w, r3.w, c0.w
+    \\cov.f32u32 r4.y, r2.x
+    \\cov.f32u32 r4.z, r2.y
+    \\xor.b r4.w, r4.y, r4.z
+    \\and.b r5.x, r4.w, 1
+    \\shl.b r5.x, r5.x, 3
+    \\and.b r5.y, r4.z, 1
+    \\shl.b r5.y, r5.y, 2
+    \\or.b r5.x, r5.x, r5.y
+    \\and.b r5.y, r4.w, 2
+    \\or.b r5.x, r5.x, r5.y
+    \\and.b r5.y, r4.z, 2
+    \\shr.b r5.y, r5.y, 1
+    \\or.b r5.x, r5.x, r5.y
+    \\cov.u32f32 r5.x, r5.x
+    \\mul.f r5.x, r5.x, c2.x
+    \\add.f r5.x, r5.x, c2.y
+    \\add.f (sat)r3.w, r3.w, r5.x
+    \\cmps.f.lt r5.y, r3.x, c2.w
+    \\cov.u32f32 r5.y, r5.y
+    \\mul.f r3.w, r3.w, r5.y
+    \\(rpt2)mul.f r6.x, (r)c0.x, r3.w
+    \\(rpt2)add.f r6.x, (r)r6.x, c3.x
+    \\mov.f32f32 r6.w, r3.w
+    \\end
+;
+
+/// A rounded rectangle's soft shadow, as gfx.shadowRoundRect: the color
+/// times gaussEdge of the signed distance (FS_RRECT's), nothing deeper
+/// than three sigmas inside but for Deep's pixels. The varyings are the
+/// pixel's position.
+/// c0: the color (straight), then what the blended color is taken down
+/// by; c1: -centre x, y, -(half size less radius) x, y; c2: -radius,
+/// -3 sigma, 1 / (sigma sqrt 2), the alpha; c3: Deep's from_x, above,
+/// below, and the alpha drawn there; c4, c5: erf's constants, then
+/// -log2(e) and -1; c6: 3 sigma, 1 / Deep's step (0: none), the step;
+/// c7: Deep's left, right, and what the coverage is taken down by; c8:
+/// the run's column as the distance takes it (its x less the half size
+/// less the radius, and that squared where it is past the corner's
+/// centre), Deep's run_from and run_end.
+const FS_SHADOW =
+    \\@threadsize 128
+    \\@out r6.x, 4
+    \\(rpt1)bary.f (ei)r5.x, (r)0, r0.x
+    \\(rpt1)add.f r2.x, (r)r5.x, (r)c1.x
+    \\absneg.f r2.x, (abs)r2.x
+    \\absneg.f r2.y, (abs)r2.y
+    \\(rpt1)add.f r2.x, (r)r2.x, (r)c1.z
+    \\(rpt1)max.f r2.z, (r)r2.x, (0.0)
+    \\mul.f r3.x, r2.z, r2.z
+    \\mul.f r3.y, r2.w, r2.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.x, r3.x
+    \\max.f r3.y, r2.x, r2.y
+    \\min.f r3.y, r3.y, (0.0)
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c2.x
+    \\cmps.f.lt r7.x, r5.y, c3.y
+    \\cmps.f.gt r7.y, r5.y, c3.z
+    \\or.b r7.x, r7.x, r7.y
+    \\mul.f r8.x, r2.w, r2.w
+    \\add.f r8.x, r8.x, c8.y
+    \\sqrt r8.x, r8.x
+    \\max.f r8.y, r2.y, c8.x
+    \\min.f r8.y, r8.y, (0.0)
+    \\add.f r8.x, r8.x, r8.y
+    \\add.f r8.x, r8.x, c2.x
+    \\cmps.f.lt r8.x, r8.x, c2.y
+    \\cmps.f.gt r8.y, r5.x, c8.z
+    \\and.b r8.x, r8.x, r8.y
+    \\cmps.f.lt r8.y, r5.x, c8.w
+    \\and.b r8.x, r8.x, r8.y
+    \\and.b r8.x, r8.x, r7.x
+    \\cov.u32f32 r8.x, r8.x
+    \\add.f r8.x, (neg)r8.x, (1.0)
+    \\cmps.f.lt r7.y, r5.x, c7.x
+    \\cmps.f.gt r7.z, r5.x, c7.y
+    \\or.b r7.y, r7.y, r7.z
+    \\and.b r7.y, r7.y, r7.x
+    \\cov.u32f32 r7.y, r7.y
+    \\add.f r4.x, r3.x, c6.x
+    \\mul.f r4.x, r4.x, c6.y
+    \\add.f r4.x, r4.x, (0.5)
+    \\floor.f r4.x, r4.x
+    \\mul.f r4.x, r4.x, c6.z
+    \\add.f r4.x, r4.x, c2.y
+    \\add.f r7.z, (neg)r3.x, r4.x
+    \\mul.f r7.z, r7.z, r7.y
+    \\add.f r7.z, r7.z, r3.x
+    \\mul.f r3.y, r7.z, c2.z
+    \\absneg.f r3.z, (abs)r3.y
+    \\mul.f r3.w, r3.z, c4.x
+    \\add.f r3.w, r3.w, (1.0)
+    \\rcp r3.w, r3.w
+    \\mul.f r4.x, r3.w, c4.y
+    \\add.f r4.x, r4.x, c4.z
+    \\mul.f r4.x, r4.x, r3.w
+    \\add.f r4.x, r4.x, c4.w
+    \\mul.f r4.x, r4.x, r3.w
+    \\add.f r4.x, r4.x, c5.x
+    \\mul.f r4.x, r4.x, r3.w
+    \\add.f r4.x, r4.x, c5.y
+    \\mul.f r4.x, r4.x, r3.w
+    \\mul.f r4.y, r3.y, r3.y
+    \\mul.f r4.y, r4.y, c5.z
+    \\exp2 r4.y, r4.y
+    \\mul.f r4.x, r4.x, r4.y
+    \\mul.f r4.x, r4.x, (0.5)
+    \\cmps.f.ge r4.z, r3.y, (0.0)
+    \\cov.u32f32 r4.z, r4.z
+    \\add.f r4.w, r4.x, r4.x
+    \\add.f r4.w, r4.w, c5.w
+    \\mul.f r4.w, r4.w, r4.z
+    \\add.f r5.z, (neg)r4.x, (1.0)
+    \\add.f r4.w, r4.w, r5.z
+    \\add.f (sat)r4.w, r4.w, c7.z
+    \\mul.f r4.w, r4.w, c2.w
+    \\cmps.f.lt r5.z, r3.x, c2.y
+    \\cov.u32f32 r5.z, r5.z
+    \\cmps.f.gt r5.w, r5.x, c3.x
+    \\and.b r5.w, r5.w, r7.x
+    \\cov.u32f32 r5.w, r5.w
+    \\mul.f r5.w, r5.w, c3.w
+    \\add.f r5.w, (neg)r4.w, r5.w
+    \\mul.f r5.w, r5.w, r5.z
+    \\add.f r4.w, r4.w, r5.w
+    \\mul.f r4.w, r4.w, r8.x
+    \\(rpt2)mul.f r6.x, (r)c0.x, r4.w
+    \\(rpt2)add.f r6.x, (r)r6.x, c0.w
+    \\mov.f32f32 r6.w, r4.w
+    \\end
+;
+
+const SOURCES = [1 + KINDS][]const u8{ VS, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW, FS_SHADOW };
+
+/// How each kind's fragment program is wired: whether it reads the
+/// varyings, whether the pipeline prefetches its texel, where its color is.
+const Wiring = struct { varyings: bool, prefetch: bool, color_reg: u8 };
+const WIRING = [KINDS]Wiring{
+    .{ .varyings = false, .prefetch = false, .color_reg = 0 },
+    .{ .varyings = true, .prefetch = true, .color_reg = 6 },
+    .{ .varyings = true, .prefetch = true, .color_reg = 6 },
+    .{ .varyings = true, .prefetch = false, .color_reg = 16 },
+    .{ .varyings = true, .prefetch = false, .color_reg = 16 },
+    .{ .varyings = true, .prefetch = true, .color_reg = 16 },
+    .{ .varyings = true, .prefetch = true, .color_reg = 24 },
+    .{ .varyings = true, .prefetch = false, .color_reg = 24 },
+    .{ .varyings = true, .prefetch = false, .color_reg = 24 },
+};
+
+/// Instruction words a program may take (with its padding), and its bytes
+/// in the code buffer.
+const WORDS = 128;
+const SLOT = WORDS * 8;
+const CODE_BYTES = 16384;
 /// Where the border colors' zeros are in the code buffer.
 const BORDER_AT = CODE_BYTES - 256;
 /// Bytes a texture's descriptors take in the state buffer.
@@ -147,6 +588,8 @@ pub const Renderer = struct {
     in_pass: bool,
     state_used: usize,
     state_full: bool,
+    /// A texture of the pass was one the hardware would not read as given.
+    bad_texture: bool,
     kind: ?Kind,
     blend: ?Blend,
     tex: ?Texture,
@@ -159,7 +602,7 @@ pub const Renderer = struct {
         r.stats = .{};
         for (SOURCES, 0..) |src, i| {
             r.kernels[i] = try ir3_asm.assemble(ir3.A7XX, src, work, &r.words[i]);
-            if (r.kernels[i].code.len * 8 > 512) return error.BadKernel;
+            if (r.kernels[i].code.len > WORDS) return error.BadKernel;
         }
         r.code = try dev.alloc(CODE_BYTES);
         errdefer dev.free(r.code);
@@ -168,26 +611,26 @@ pub const Renderer = struct {
         r.ib = try dev.alloc(opts.stream_bytes);
         @memset(r.code.cpu, 0);
         for (r.kernels, 0..) |k, i| {
-            const dst: []u64 = @alignCast(std.mem.bytesAsSlice(u64, r.code.cpu[i * 512 ..][0..512]));
+            const dst: []u64 = @alignCast(std.mem.bytesAsSlice(u64, r.code.cpu[i * SLOT ..][0..SLOT]));
             @memcpy(dst[0..k.code.len], k.code);
         }
         dev.toDevice(r.code, 0, CODE_BYTES);
         const vs_va = r.code.va;
         for (0..KINDS) |k| {
-            const sampled = k != @intFromEnum(Kind.solid);
+            const w = WIRING[k];
             r.progs[k] = .{
                 .vs = &r.kernels[0],
                 .vs_va = vs_va,
                 .fs = &r.kernels[1 + k],
-                .fs_va = r.code.va + (1 + k) * 512,
+                .fs_va = r.code.va + (1 + k) * SLOT,
                 .vertexid_reg = 0,
                 .pos_reg = 1,
-                .vary_reg = if (sampled) 5 else ir3_asm.INVALID_REG,
-                .varyings = if (sampled) 2 else 0,
-                .ij_reg = if (sampled) 0 else ir3_asm.INVALID_REG,
-                .color_reg = if (sampled) 6 else 0,
-                .textures = if (sampled) 1 else 0,
-                .prefetch_reg = if (sampled) 2 else ir3_asm.INVALID_REG,
+                .vary_reg = if (w.varyings) 5 else ir3_asm.INVALID_REG,
+                .varyings = if (w.varyings) 2 else 0,
+                .ij_reg = if (w.varyings) 0 else ir3_asm.INVALID_REG,
+                .color_reg = w.color_reg,
+                .textures = if (w.prefetch) 1 else 0,
+                .prefetch_reg = if (w.prefetch) 2 else ir3_asm.INVALID_REG,
             };
         }
     }
@@ -205,6 +648,7 @@ pub const Renderer = struct {
         r.in_pass = true;
         r.state_used = 0;
         r.state_full = false;
+        r.bad_texture = false;
         r.kind = null;
         r.blend = null;
         r.tex = null;
@@ -235,6 +679,8 @@ pub const Renderer = struct {
 
     fn bind(r: *Renderer, t: Texture) void {
         if (r.tex) |cur| if (std.meta.eql(cur, t)) return;
+        // (rows not a multiple of 64 bytes apart: the pass is refused)
+        if (!dr.textureFits(t)) r.bad_texture = true;
         if (r.state_used + BINDING > r.state.cpu.len) {
             r.state_full = true;
             return;
@@ -249,11 +695,50 @@ pub const Renderer = struct {
     }
 
     fn corners(r: *Renderer, rc: Rect, uv: [4]f32, color: Color) void {
+        r.cornersWith(rc, uv, &color);
+    }
+
+    /// The rectangle with the fragment program's constants from c0.
+    fn cornersWith(r: *Renderer, rc: Rect, uv: [4]f32, fs: []const f32) void {
         const v = [8]f32{ rc[0], rc[1], uv[0], uv[1], rc[2], rc[3], uv[2], uv[3] };
         dr.vsConstants(&r.s, @ptrCast(&v));
-        dr.fsConstants(&r.s, @ptrCast(&color));
+        dr.fsConstants(&r.s, @ptrCast(fs));
         dr.rect(&r.s);
         r.stats.rects += 1;
+    }
+
+    /// `color` times the coverage of the rounded rectangle `s`, over the
+    /// pixels of `rc` (s's bounds, or less).
+    pub fn rrect(r: *Renderer, rc: Rect, s: Shape, color: Color, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1])) return;
+        r.use(.rrect, b);
+        const c = [12]f32{ color[0], color[1], color[2], color[3], -s.cx, -s.cy, -s.kx, -s.ky, -s.rad, 0, 0, 0 };
+        r.cornersWith(rc, rc, &c);
+    }
+
+    /// `color` times the coverage of `outer` less that of `inner` (the
+    /// same centre; null: nothing taken out): a stroke.
+    pub fn ring(r: *Renderer, rc: Rect, outer: Shape, inner: ?Shape, color: Color, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1])) return;
+        r.use(.ring, b);
+        // (no inner shape: one no pixel is inside)
+        const in = inner orelse Shape{ .cx = outer.cx, .cy = outer.cy, .kx = -1e9, .ky = -1e9, .rad = 0 };
+        const c = [16]f32{ color[0], color[1], color[2], color[3], -outer.cx, -outer.cy, -outer.kx, -outer.ky, -outer.rad, -in.rad, 0, 0, 0, 0, -in.kx, -in.ky };
+        r.cornersWith(rc, rc, &c);
+    }
+
+    /// image, times the coverage of the rounded rectangle `s` (in window
+    /// pixels, as `rc`).
+    pub fn imageRR(r: *Renderer, rc: Rect, t: Texture, uv: [4]f32, tint: Color, s: Shape, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1])) return;
+        if (!(uv[2] != uv[0] and uv[3] != uv[1])) return;
+        r.use(.image_rr, b);
+        r.bind(t);
+        // the pixel's position from the texture coordinates, less the centre
+        const sx = (rc[2] - rc[0]) / (uv[2] - uv[0]);
+        const sy = (rc[3] - rc[1]) / (uv[3] - uv[1]);
+        const c = [12]f32{ tint[0], tint[1], tint[2], tint[3], sx, sy, rc[0] - uv[0] * sx - s.cx, rc[1] - uv[1] * sy - s.cy, -s.kx, -s.ky, -s.rad, 0 };
+        r.cornersWith(rc, uv, &c);
     }
 
     /// A rectangle of one color.
@@ -280,6 +765,70 @@ pub const Renderer = struct {
         r.corners(rc, uv, color);
     }
 
+    /// `g`'s color times the coverage in `t` (an r8 texture, one texel a
+    /// pixel) times `opacity`: a path filled with a gradient.
+    pub fn maskGradient(r: *Renderer, rc: Rect, t: Texture, uv: [4]f32, g: Gradient, opacity: f32, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1])) return;
+        r.use(.mask_grad, b);
+        r.bind(t);
+        // the lines in texture coordinates: a pixel's position is its
+        // coordinate plus where the mask lies
+        const ox = rc[0] - uv[0];
+        const oy = rc[1] - uv[1];
+        const c = [24]f32{
+            g.q1[0], g.q1[1], g.q1[2] + g.q1[0] * ox + g.q1[1] * oy, g.along,
+            g.q2[0], g.q2[1], g.q2[2] + g.q2[0] * ox + g.q2[1] * oy, g.around,
+            1 / g.mid, -g.mid / (1 - g.mid), 1 / (1 - g.mid), opacity,
+            g.a[0], g.a[1], g.a[2], g.a[3],
+            g.b[0] - g.a[0], g.b[1] - g.a[1], g.b[2] - g.a[2], g.b[3] - g.a[3],
+            g.c[0] - g.b[0], g.c[1] - g.b[1], g.c[2] - g.b[2], g.c[3] - g.b[3],
+        };
+        r.cornersWith(rc, uv, &c);
+    }
+
+    /// A soft disc at (cx, cy): `color` (straight, its alpha last) full
+    /// inside `inner`, falling smoothly to nothing at `outer`, dithered.
+    /// (Half a step of 255 under gfx's sum: gfx takes the alpha down to a
+    /// whole step, and this is the middle of what that loses. And the
+    /// blended color is DROP lower, for gfx's blend of a glow.)
+    pub fn glow(r: *Renderer, rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1]) or !(outer > 0)) return;
+        r.use(.glow, b);
+        const span = @max(outer - inner, 1e-6);
+        const c = [16]f32{
+            color[0], color[1], color[2], color[3],
+            -cx, -cy, inner, 1 / span,
+            9.0 / (16.0 * 255.0), (0.5 / 16.0 - 0.5) * 9.0 / 255.0 - 0.5 / 255.0, 3, outer * outer,
+            -DROP, 0, 0, 0,
+        };
+        r.cornersWith(rc, rc, &c);
+    }
+
+    /// The soft shadow of the rounded rectangle `s`: `color` (straight,
+    /// its alpha last) at shadowAlpha, the blended color DROP lower (gfx
+    /// blends a shadow as it does a glow). `rc` is the shape's bounds and
+    /// three sigmas around, or less.
+    pub fn shadow(r: *Renderer, rc: Rect, s: Shape, sigma: f32, color: Color, deep: Deep, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1]) or !(sigma > 0)) return;
+        r.use(.shadow, b);
+        // (no step: no corner is gfx's)
+        const stepped = deep.step > 0;
+        const qxm = @abs(deep.run_from + 0.5 - s.cx) - s.kx;
+        const oxm = @max(qxm, 0);
+        const c = [36]f32{
+            color[0], color[1], color[2], -DROP,
+            -s.cx, -s.cy, -s.kx, -s.ky,
+            -s.rad, -3 * sigma, 1 / (sigma * 1.41421356), color[3],
+            deep.from_x, deep.above, deep.below, color[3] * (254.0 / 255.0),
+            0.3275911, 1.061405429, -1.453152027, 1.421413741,
+            -0.284496736, 0.254829592, -1.44269504, -1,
+            3 * sigma, if (stepped) 1 / deep.step else 0, if (stepped) deep.step else 0, 0,
+            if (stepped) deep.left else -1e30, if (stepped) deep.right else 1e30, -0.5 / 255.0, 0,
+            qxm, oxm * oxm, deep.run_from, deep.run_end,
+        };
+        r.cornersWith(rc, rc, &c);
+    }
+
     /// End the pass and hand it to the GPU. The target's pixels are in
     /// memory once the fence is done (fromDevice them before the CPU reads).
     pub fn submit(r: *Renderer) Error!Fence {
@@ -287,11 +836,19 @@ pub const Renderer = struct {
         r.in_pass = false;
         dr.end(&r.s);
         if (r.state_full) return error.StateFull;
+        if (r.bad_texture) return error.BadStream;
         r.s.check() catch return error.StreamFull;
         r.stats.stream_dwords = @intCast(r.s.len);
         if (r.state_used != 0) r.dev.toDevice(r.state, 0, r.state_used);
         r.dev.toDevice(r.ib, 0, r.s.len * 4);
         return r.dev.submit(r.ib, @intCast(r.s.len));
+    }
+
+    /// The pass submit() ended, handed over again (the device refused it:
+    /// its ring was busy with another context's work).
+    pub fn resubmit(r: *Renderer) Error!Fence {
+        if (r.in_pass or r.stats.stream_dwords == 0) return error.NoPass;
+        return r.dev.submit(r.ib, r.stats.stream_dwords);
     }
 
     /// submit, and wait for it.
@@ -363,7 +920,7 @@ test "the programs are turnip's, word for word" {
     try std.testing.expectEqualSlices(u64, &vs, T.r.kernels[0].code[0..vs.len]);
     try std.testing.expectEqualSlices(u64, &solid, T.r.kernels[1].code[0..solid.len]);
     try std.testing.expectEqualSlices(u64, &image, T.r.kernels[2].code[0..image.len]);
-    for (T.r.kernels) |k| try std.testing.expect(k.instrlen == 1);
+    for (T.r.kernels[0..4]) |k| try std.testing.expect(k.instrlen == 1);
     // footprints as Mesa counts them: the vertex program's two full
     // registers, the solid program's one, the image program's three (its
     // color ends in r2.y), no half registers
@@ -413,13 +970,14 @@ test "an image: copied texel for texel, stretched with the bilinear filter, tint
     defer T.r.deinit();
     const d = T.dev.device();
     // an 8 x 4 texture: red rises with x, green with y, opaque
-    const tex_buf = try d.alloc(8 * 4 * 4);
+    // (rows of 64 bytes: 16 texels a row, the first 8 the picture)
+    const tex_buf = try d.alloc(4 * 64);
     const tw: []u32 = @alignCast(std.mem.bytesAsSlice(u32, tex_buf.cpu));
     for (0..4) |y| for (0..8) |x| {
-        tw[y * 8 + x] = 0xff000000 | (@as(u32, @intCast(x * 32)) << 16) | (@as(u32, @intCast(y * 64)) << 8);
+        tw[y * 16 + x] = 0xff000000 | (@as(u32, @intCast(x * 32)) << 16) | (@as(u32, @intCast(y * 64)) << 8);
     };
-    d.toDevice(tex_buf, 0, 8 * 4 * 4);
-    const nearest = Texture{ .va = tex_buf.va, .width = 8, .height = 4, .pitch = 32, .format = .bgra8, .filter = .nearest };
+    d.toDevice(tex_buf, 0, 4 * 64);
+    const nearest = Texture{ .va = tex_buf.va, .width = 8, .height = 4, .pitch = 64, .format = .bgra8, .filter = .nearest };
     var linear = nearest;
     linear.filter = .linear;
     T.r.begin(t);
@@ -432,7 +990,7 @@ test "an image: copied texel for texel, stretched with the bilinear filter, tint
     T.r.image(.{ 40, 20, 48, 24 }, nearest, .{ 0, 0, 8, 4 }, .{ 0.5, 0.5, 0.5, 0.5 }, .over);
     try T.r.run(1_000_000);
     for (0..4) |y| for (0..8) |x| {
-        try std.testing.expectEqual(tw[y * 8 + x], T.at(@intCast(2 + x), @intCast(1 + y)));
+        try std.testing.expectEqual(tw[y * 16 + x], T.at(@intCast(2 + x), @intCast(1 + y)));
     };
     try std.testing.expectEqual(@as(u32, 0xff000000), T.at(10, 1));
     // stretched: pixel (20 + 2i + 1, 4 + 2j + 1)'s centre is at texel
@@ -450,12 +1008,12 @@ test "a mask: coverage times a color, over what is there" {
     defer T.r.deinit();
     const d = T.dev.device();
     // 4 x 2 coverage: 0, 85, 170, 255 in both rows
-    const m_buf = try d.alloc(64);
+    const m_buf = try d.alloc(128);
     for (0..2) |y| for (0..4) |x| {
-        m_buf.cpu[y * 4 + x] = @intCast(x * 85);
+        m_buf.cpu[y * 64 + x] = @intCast(x * 85);
     };
-    d.toDevice(m_buf, 0, 64);
-    const m = Texture{ .va = m_buf.va, .width = 4, .height = 2, .pitch = 4, .format = .r8, .filter = .nearest };
+    d.toDevice(m_buf, 0, 128);
+    const m = Texture{ .va = m_buf.va, .width = 4, .height = 2, .pitch = 64, .format = .r8, .filter = .nearest };
     T.r.begin(t);
     T.r.fill(.{ 0, 0, T.W, T.H }, .{ 0, 0, 1, 1 }, .replace);
     // white text over blue
@@ -567,6 +1125,177 @@ test "the state is turnip's: the values its X1-45 streams carry for the same dra
     try std.testing.expectEqual(@as(u32, 1 << 17), desc[9] & 0xfffe0000);
 }
 
+test "rounded rectangles: filled, stroked, and an image inside one, by the coverage at each pixel" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    const tex_buf = try d.alloc(16 * 16 * 4);
+    const tw: []u32 = @alignCast(std.mem.bytesAsSlice(u32, tex_buf.cpu));
+    // (the fourth byte is not alpha here: an opaque texture reads it as one)
+    for (tw, 0..) |*p, i| p.* = 0x00206080 + @as(u32, @intCast(i % 16)) * 0x00010000;
+    d.toDevice(tex_buf, 0, 16 * 16 * 4);
+    const tx = Texture{ .va = tex_buf.va, .width = 16, .height = 16, .pitch = 64, .format = .bgra8, .filter = .nearest, .no_alpha = true };
+    const fill = Shape.of(4.5, 3.25, 24, 14, 5);
+    const outer = Shape.of(34, 4, 26, 20, 6);
+    const inner = Shape.of(36, 6, 22, 16, 4);
+    const pic = Shape.of(8, 20, 16, 10, 4);
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, T.W, T.H }, .{ 0, 0, 0, 1 }, .replace);
+    T.r.rrect(.{ 4, 3, 29, 18 }, fill, .{ 1, 1, 1, 1 }, .over);
+    T.r.ring(.{ 34, 4, 60, 24 }, outer, inner, .{ 0, 1, 0, 1 }, .over);
+    T.r.imageRR(.{ 8, 20, 24, 30 }, tx, .{ 0, 0, 16, 10 }, .{ 1, 1, 1, 1 }, pic, .over);
+    try T.r.run(1_000_000);
+    const px = T.pixels();
+    for (0..T.H) |y| for (0..T.W) |x| {
+        const fx: f32 = @as(f32, @floatFromInt(x)) + 0.5;
+        const fy: f32 = @as(f32, @floatFromInt(y)) + 0.5;
+        var want: [3]f32 = .{ 0, 0, 0 };
+        if (x >= 4 and x < 29 and y >= 3 and y < 18) {
+            const c = fill.coverage(fx, fy);
+            for (&want) |*v| v.* = c + v.* * (1 - c);
+        }
+        if (x >= 34 and x < 60 and y >= 4 and y < 24) {
+            const c = @max(outer.coverage(fx, fy) - inner.coverage(fx, fy), 0);
+            want = .{ want[0] * (1 - c), c + want[1] * (1 - c), want[2] * (1 - c) };
+        }
+        if (x >= 8 and x < 24 and y >= 20 and y < 30) {
+            const c = pic.coverage(fx, fy);
+            const texel = tw[(y - 20) * 16 + (x - 8)];
+            const tc = [3]f32{ @floatFromInt((texel >> 16) & 0xff), @floatFromInt((texel >> 8) & 0xff), @floatFromInt(texel & 0xff) };
+            for (&want, tc) |*v, s| v.* = s / 255.0 * c + v.* * (1 - c);
+        }
+        const w32 = 0xff000000 | (@as(u32, @intFromFloat(want[0] * 255 + 0.5)) << 16) | (@as(u32, @intFromFloat(want[1] * 255 + 0.5)) << 8) | @as(u32, @intFromFloat(want[2] * 255 + 0.5));
+        if (!near(w32, px[y * T.W + x], 2)) {
+            std.debug.print("pixel ({d}, {d}): want {x:0>8}, got {x:0>8}\n", .{ x, y, w32, px[y * T.W + x] });
+            return error.TestUnexpectedResult;
+        }
+    };
+    // a stroke with nothing taken out is the filled shape
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, T.W, T.H }, .{ 0, 0, 0, 1 }, .replace);
+    T.r.ring(.{ 4, 3, 29, 18 }, fill, null, .{ 1, 1, 1, 1 }, .over);
+    try T.r.run(1_000_000);
+    try expectNear(0xffffffff, T.at(16, 10), 1);
+    try expectNear(0xff000000, T.at(4, 3), 40);
+}
+
+test "a texture in rows the hardware would misread is refused: by the renderer, and by the emulated GPU" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    const buf = try d.alloc(256);
+    // (rows of 32 bytes: the X1-45 read them 64 apart)
+    const narrow = Texture{ .va = buf.va, .width = 8, .height = 4, .pitch = 32, .format = .bgra8, .filter = .nearest };
+    T.r.begin(t);
+    T.r.image(.{ 0, 0, 8, 4 }, narrow, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, .replace);
+    try std.testing.expectError(error.BadStream, T.r.submit());
+    // (past the renderer's own check: the emulated texture unit refuses it)
+    T.dev.log = null;
+    T.r.begin(t);
+    T.r.image(.{ 0, 0, 8, 4 }, narrow, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, .replace);
+    T.r.bad_texture = false;
+    try std.testing.expectError(error.DeviceLost, T.r.run(1_000_000));
+}
+
+test "a mask times a gradient, and a glow: the programs against their own arithmetic at every pixel" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    // a 16 x 8 coverage mask in rows of 64: a ramp across, full in the middle rows
+    const m_buf = try d.alloc(8 * 64);
+    for (0..8) |y| for (0..16) |x| {
+        m_buf.cpu[y * 64 + x] = if (y >= 2 and y < 6) 255 else @intCast(x * 17);
+    };
+    d.toDevice(m_buf, 0, 8 * 64);
+    const m = Texture{ .va = m_buf.va, .width = 16, .height = 8, .pitch = 64, .format = .r8, .filter = .nearest };
+    // along a line from (10, 4) to (26, 12), three stops; around (40, 20), two
+    const dx: f32 = 16;
+    const dy: f32 = 8;
+    const len2 = dx * dx + dy * dy;
+    const line = Gradient{ .q1 = .{ dx / len2, dy / len2, -(10 * dx + 4 * dy) / len2 }, .a = .{ 1, 0, 0, 1 }, .b = .{ 0, 1, 0, 0.5 }, .c = .{ 0, 0, 1, 1 }, .mid = 0.25 };
+    const disc = Gradient{ .q1 = .{ 1.0 / 8.0, 0, -40.0 / 8.0 }, .q2 = .{ 0, 1.0 / 4.0, -20.0 / 4.0 }, .along = 0, .around = 1, .a = .{ 1, 1, 1, 1 }, .b = .{ 0.6, 0.7, 0.8, 0.9 }, .c = .{ 0.2, 0.4, 0.6, 0.8 } };
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, T.W, T.H }, .{ 0, 0, 0, 1 }, .replace);
+    T.r.maskGradient(.{ 10, 4, 26, 12 }, m, .{ 0, 0, 16, 8 }, line, 0.9, .over);
+    T.r.maskGradient(.{ 32, 16, 48, 24 }, m, .{ 0, 0, 16, 8 }, disc, 1, .over);
+    T.r.glow(.{ 44, 0, 64, 16 }, 54.25, 7.5, 3, 8, .{ 1, 0.5, 0.25, 0.8 }, .over);
+    try T.r.run(1_000_000);
+    const px = T.pixels();
+    const bayer = [16]f32{ 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+    for (0..T.H) |y| for (0..T.W) |x| {
+        const fx: f32 = @as(f32, @floatFromInt(x)) + 0.5;
+        const fy: f32 = @as(f32, @floatFromInt(y)) + 0.5;
+        var want: [3]f32 = .{ 0, 0, 0 };
+        const over = struct {
+            fn f(w: *[3]f32, rgb: [3]f32, a: f32) void {
+                for (w, rgb) |*v, s| v.* = s * a + v.* * (1 - a);
+            }
+        }.f;
+        if (x >= 10 and x < 26 and y >= 4 and y < 12) {
+            const c = line.at(fx, fy);
+            const cov: f32 = @as(f32, @floatFromInt(m_buf.cpu[(y - 4) * 64 + (x - 10)])) / 255.0;
+            over(&want, .{ c[0], c[1], c[2] }, c[3] * cov * 0.9);
+        }
+        if (x >= 32 and x < 48 and y >= 16 and y < 24) {
+            const c = disc.at(fx, fy);
+            const cov: f32 = @as(f32, @floatFromInt(m_buf.cpu[(y - 16) * 64 + (x - 32)])) / 255.0;
+            over(&want, .{ c[0], c[1], c[2] }, c[3] * cov);
+        }
+        if (x >= 44 and y < 16) {
+            const ddx = fx - 54.25;
+            const ddy = fy - 7.5;
+            const d2 = ddx * ddx + ddy * ddy;
+            if (d2 < 64) {
+                var tt = std.math.clamp(1 - (@sqrt(d2) - 3) / 5, 0, 1);
+                tt = tt * tt * (3 - 2 * tt);
+                const dither = ((bayer[(y & 3) * 4 + (x & 3)] + 0.5) / 16.0 - 0.5) * 9.0 / 255.0;
+                over(&want, .{ 1, 0.5, 0.25 }, std.math.clamp(tt * 0.8 + dither - 0.5 / 255.0, 0, 1));
+            }
+            for (&want) |*v| v.* = @max(v.* - DROP, 0);
+        }
+        const w32 = 0xff000000 | (@as(u32, @intFromFloat(want[0] * 255 + 0.5)) << 16) | (@as(u32, @intFromFloat(want[1] * 255 + 0.5)) << 8) | @as(u32, @intFromFloat(want[2] * 255 + 0.5));
+        if (!near(w32, px[y * T.W + x], 2)) {
+            std.debug.print("pixel ({d}, {d}): want {x:0>8}, got {x:0>8}\n", .{ x, y, w32, px[y * T.W + x] });
+            return error.TestUnexpectedResult;
+        }
+    };
+}
+
+test "a shadow: the program against its own arithmetic at every pixel, the deep pixels too" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const a = Shape.of(8.5, 6.25, 30, 18, 5);
+    const b = Shape.of(44.25, 3, 14, 26, 2);
+    const deep = Deep{ .from_x = 52, .above = 9, .below = 23, .left = 47, .right = 55, .step = 0.125, .run_from = 50, .run_end = 54 };
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, T.W, T.H }, .{ 1, 1, 1, 1 }, .replace);
+    T.r.shadow(.{ 2, 0, 44, 30 }, a, 1.5, .{ 0.1, 0.2, 0.4, 0.7 }, .{}, .over);
+    T.r.shadow(.{ 40, 0, 64, 32 }, b, 1, .{ 0, 0, 0, 1 }, deep, .over);
+    try T.r.run(1_000_000);
+    const px = T.pixels();
+    var deep_seen: u32 = 0;
+    for (0..T.H) |y| for (0..T.W) |x| {
+        var want: [3]f32 = .{ 1, 1, 1 };
+        if (x >= 2 and x < 44 and y < 30) {
+            const al = shadowAlpha(@intCast(x), @intCast(y), a, 1.5, 0.7, .{});
+            for (&want, [3]f32{ 0.1, 0.2, 0.4 }) |*v, s| v.* = @max(s * al - DROP, 0) + v.* * (1 - al);
+        }
+        if (x >= 40) {
+            const al = shadowAlpha(@intCast(x), @intCast(y), b, 1, 1, deep);
+            if (al > 0.9 and b.distance(@as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5) < -3) deep_seen += 1;
+            for (&want) |*v| v.* = v.* * (1 - al);
+        }
+        const w32 = 0xff000000 | (@as(u32, @intFromFloat(want[0] * 255 + 0.5)) << 16) | (@as(u32, @intFromFloat(want[1] * 255 + 0.5)) << 8) | @as(u32, @intFromFloat(want[2] * 255 + 0.5));
+        if (!near(w32, px[y * T.W + x], 2)) {
+            std.debug.print("pixel ({d}, {d}): want {x:0>8}, got {x:0>8}\n", .{ x, y, w32, px[y * T.W + x] });
+            return error.TestUnexpectedResult;
+        }
+    };
+    // (the second shadow has pixels of both kinds: left alone, and drawn whole)
+    try std.testing.expect(deep_seen > 0);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), px[14 * T.W + 49]);
+}
+
 // ── The self-test: the pipeline on the real GPU ─────────────────────────────
 // What the tests above check on the emulated device, drawn on any Device
 // and compared with the values the arithmetic gives, case by case and each
@@ -648,16 +1377,16 @@ pub fn selfTest(dev: Device, r: *Renderer, asm_work: *ir3_asm.Work, log: *const 
     const BLUE = Color{ 0, 0, 0.5, 1 };
     const blue: u32 = 0xff000080;
     // An 8 x 4 texture (red rises with x, green with y) and, after it, a
-    // 4 x 2 coverage mask (0, 85, 170, 255).
-    const tw: []u32 = @alignCast(std.mem.bytesAsSlice(u32, tex_buf.cpu[0 .. 8 * 4 * 4]));
+    // 4 x 2 coverage mask (0, 85, 170, 255); both in rows of 64 bytes.
+    const tw: []u32 = @alignCast(std.mem.bytesAsSlice(u32, tex_buf.cpu[0 .. 4 * 64]));
     for (0..4) |y| for (0..8) |x| {
-        tw[y * 8 + x] = 0xff000000 | (@as(u32, @intCast(x * 32)) << 16) | (@as(u32, @intCast(y * 64)) << 8);
+        tw[y * 16 + x] = 0xff000000 | (@as(u32, @intCast(x * 32)) << 16) | (@as(u32, @intCast(y * 64)) << 8);
     };
     for (0..2) |y| for (0..4) |x| {
         tex_buf.cpu[256 + y * 64 + x] = @intCast(x * 85);
     };
     dev.toDevice(tex_buf, 0, 4096);
-    const nearest = Texture{ .va = tex_buf.va, .width = 8, .height = 4, .pitch = 32, .format = .bgra8, .filter = .nearest };
+    const nearest = Texture{ .va = tex_buf.va, .width = 8, .height = 4, .pitch = 64, .format = .bgra8, .filter = .nearest };
     var linear = nearest;
     linear.filter = .linear;
     const mask = Texture{ .va = tex_buf.va + 256, .width = 4, .height = 2, .pitch = 64, .format = .r8, .filter = .nearest };
@@ -686,12 +1415,12 @@ pub fn selfTest(dev: Device, r: *Renderer, asm_work: *ir3_asm.Work, log: *const 
     r.begin(t);
     r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
     r.image(.{ 2, 1, 10, 5 }, nearest, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, .replace);
-    c.check("an image, texel for texel", &.{ .{ .x = 2, .y = 1, .want = tw[0] }, .{ .x = 9, .y = 1, .want = tw[7] }, .{ .x = 2, .y = 4, .want = tw[24] }, .{ .x = 9, .y = 4, .want = tw[31] }, .{ .x = 5, .y = 2, .want = tw[11] }, .{ .x = 10, .y = 1, .want = 0xff000000 } });
+    c.check("an image, texel for texel", &.{ .{ .x = 2, .y = 1, .want = tw[0] }, .{ .x = 9, .y = 1, .want = tw[7] }, .{ .x = 2, .y = 4, .want = tw[48] }, .{ .x = 9, .y = 4, .want = tw[55] }, .{ .x = 5, .y = 2, .want = tw[19] }, .{ .x = 10, .y = 1, .want = 0xff000000 } });
 
     r.begin(t);
     r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
     r.image(.{ 20, 4, 36, 12 }, linear, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, .replace);
-    c.check("an image stretched, filtered", &.{ .{ .x = 27, .y = 7, .want = 0xff000000 | (@as(u32, 32 * 3 + 8) << 16) | (@as(u32, 64 + 16) << 8), .tol = 3 }, .{ .x = 20, .y = 4, .want = tw[0], .tol = 3 }, .{ .x = 35, .y = 11, .want = tw[31], .tol = 3 } });
+    c.check("an image stretched, filtered", &.{ .{ .x = 27, .y = 7, .want = 0xff000000 | (@as(u32, 32 * 3 + 8) << 16) | (@as(u32, 64 + 16) << 8), .tol = 3 }, .{ .x = 20, .y = 4, .want = tw[0], .tol = 3 }, .{ .x = 35, .y = 11, .want = tw[55], .tol = 3 } });
 
     r.begin(t);
     r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
@@ -703,9 +1432,45 @@ pub fn selfTest(dev: Device, r: *Renderer, asm_work: *ir3_asm.Work, log: *const 
     r.mask(.{ 8, 8, 12, 10 }, mask, .{ 0, 0, 4, 2 }, .{ 1, 1, 1, 1 }, .over);
     c.check("a coverage mask (text)", &.{ .{ .x = 8, .y = 8, .want = 0xff0000ff, .tol = 2 }, .{ .x = 9, .y = 8, .want = 0xff5555ff, .tol = 2 }, .{ .x = 10, .y = 9, .want = 0xffaaaaff, .tol = 2 }, .{ .x = 11, .y = 9, .want = 0xffffffff, .tol = 2 } });
 
+    // The coverage programs (Galaxy's own, where the ones above are
+    // turnip's): a rounded rectangle filled, stroked, and around an image.
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.rrect(.{ 4, 3, 28, 17 }, Shape.of(4, 3, 24, 14, 5), .{ 1, 1, 1, 1 }, .over);
+    c.check("a filled rounded rectangle", &.{ .{ .x = 16, .y = 10, .want = 0xffffffff, .tol = 2 }, .{ .x = 4, .y = 10, .want = 0xffffffff, .tol = 2 }, .{ .x = 4, .y = 3, .want = 0xff000000, .tol = 2 }, .{ .x = 27, .y = 16, .want = 0xff000000, .tol = 2 }, .{ .x = 3, .y = 10, .want = 0xff000000 } });
+
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.ring(.{ 34, 4, 60, 24 }, Shape.of(34, 4, 26, 20, 6), Shape.of(36, 6, 22, 16, 4), .{ 0, 1, 0, 1 }, .over);
+    c.check("a stroked rounded rectangle", &.{ .{ .x = 34, .y = 14, .want = 0xff00ff00, .tol = 2 }, .{ .x = 47, .y = 4, .want = 0xff00ff00, .tol = 2 }, .{ .x = 47, .y = 14, .want = 0xff000000, .tol = 2 }, .{ .x = 34, .y = 4, .want = 0xff000000, .tol = 2 } });
+
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.imageRR(.{ 8, 20, 16, 24 }, nearest, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, Shape.of(8, 20, 8, 4, 2), .over);
+    c.check("an image inside a rounded rectangle", &.{ .{ .x = 12, .y = 22, .want = tw[2 * 16 + 4], .tol = 2 }, .{ .x = 11, .y = 21, .want = tw[16 + 3], .tol = 2 }, .{ .x = 8, .y = 20, .want = 0xff000000, .tol = 40 }, .{ .x = 16, .y = 22, .want = 0xff000000 } });
+
+    // A path's paint and a glow (red to blue through the mask's 0, 85,
+    // 170, 255; a white disc, whole at its centre, nothing past 12 pixels).
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.maskGradient(.{ 8, 8, 12, 10 }, mask, .{ 0, 0, 4, 2 }, .{ .q1 = .{ 0.25, 0, -2 }, .a = .{ 1, 0, 0, 1 }, .b = .{ 0.5, 0, 0.5, 1 }, .c = .{ 0, 0, 1, 1 } }, 1, .over);
+    c.check("a mask times a gradient", &.{ .{ .x = 11, .y = 9, .want = 0xff2000df, .tol = 2 }, .{ .x = 10, .y = 8, .want = 0xff40006a, .tol = 2 }, .{ .x = 9, .y = 9, .want = 0xff350020, .tol = 2 }, .{ .x = 8, .y = 8, .want = 0xff000000, .tol = 2 }, .{ .x = 12, .y = 9, .want = 0xff000000 } });
+
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.glow(.{ 20, 4, 44, 28 }, 32, 16, 4, 12, .{ 1, 1, 1, 1 }, .over);
+    c.check("a glow", &.{ .{ .x = 32, .y = 15, .want = 0xffffffff, .tol = 2 }, .{ .x = 39, .y = 16, .want = 0xff979797, .tol = 3 }, .{ .x = 22, .y = 6, .want = 0xff000000 }, .{ .x = 45, .y = 16, .want = 0xff000000 } });
+
+    // A soft shadow (black, two pixels of sigma, under a 32 x 16 shape:
+    // 40% at the edge, nothing deeper than six pixels inside).
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 1, 1, 1, 1 }, .replace);
+    r.shadow(.{ 10, 2, 54, 30 }, Shape.of(16, 8, 32, 16, 4), 2, .{ 0, 0, 0, 1 }, .{}, .over);
+    c.check("a soft shadow", &.{ .{ .x = 32, .y = 7, .want = 0xff999999, .tol = 3 }, .{ .x = 32, .y = 10, .want = 0xff1b1b1b, .tol = 3 }, .{ .x = 32, .y = 16, .want = 0xffffffff }, .{ .x = 9, .y = 16, .want = 0xffffffff } });
+
     // How fast it fills: a 1024 x 1024 target, an image the same size over
     // it once and a half-transparent color 31 times (32 megapixels blended).
-    if (!c.res.lost and c.res.failed == 0) speed: {
+    if (!c.res.lost) speed: {
         const clock = now_us orelse break :speed;
         const N = 1024;
         const big = dev.alloc(N * N * 4) catch break :speed;
@@ -746,7 +1511,7 @@ test "the self-test passes on the emulated device" {
     T.dev = .{ .arena = &T.arena, .gpu_view = &T.gpu_view, .log = &T.log };
     // (no clock: the fill-rate case's megapixels would take the emulator minutes)
     const res = selfTest(T.dev.device(), &T.r, &T.asm_work, &testLog, null);
-    try std.testing.expectEqual(@as(u32, 8), res.passed);
+    try std.testing.expectEqual(@as(u32, 14), res.passed);
     try std.testing.expectEqual(@as(u32, 0), res.failed);
     try std.testing.expect(!res.lost);
 }

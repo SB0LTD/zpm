@@ -467,6 +467,7 @@ pub const Emu = struct {
         work.trap = .{};
         work.check_hazards = true;
         work.strict = true;
+        work.reverse_warps = false;
         work.max_steps = emu.DEFAULT_MAX_STEPS;
         e.* = .{ .raw = .{ .arena = arena, .gpu_view = gpu_view, .work = work, .tpcs = 1 } };
     }

@@ -1077,6 +1077,8 @@ pub const Context = struct {
 };
 
 var contexts: [MAX_CONTEXTS]Context = undefined;
+/// contexts made so far: each one's number in its usage lines (report.sig)
+var contexts_made: u32 = 0;
 var shares: [MAX_SHARE]gles.Objects = undefined;
 var share_users: [MAX_SHARE]u32 = [_]u32{0} ** MAX_SHARE;
 
@@ -1159,6 +1161,10 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
     c.gl.lose_on_reset = lose;
     c.gl.debug_context = debug;
     c.gl.debug.enabled = debug;
+    contexts_made +%= 1;
+    c.gl.usage.id = contexts_made;
+    c.gl.usage.es = @intCast(major);
+    c.gl.usage.robust = lose;
     share_users[share] += 1;
     return ok(?*Context, c);
 }
@@ -1626,6 +1632,8 @@ pub fn swapBuffers(handle: ?*anyopaque, surface: ?*anyopaque, damage: []const [4
     const c: *Context = @ptrCast(@alignCast(t.context orelse return fail(bool, BAD_SURFACE, false)));
     if (c.draw != s) return fail(bool, BAD_SURFACE, false);
     if (s.kind == .pbuffer) return ok(bool, true);
+    // (timed for the context's usage line: report.sig)
+    const began = report.nowUs();
     if (s.kind == .stream) {
         const st = s.stream orelse return fail(bool, BAD_CURRENT_SURFACE, false);
         const state = streamState(st);
@@ -1642,6 +1650,7 @@ pub fn swapBuffers(handle: ?*anyopaque, surface: ?*anyopaque, damage: []const [4
         if (eng.lost) return fail(bool, CONTEXT_LOST, false);
         st.produced +%= 1;
         signalStreams();
+        swapped(c, began);
         return ok(bool, true);
     }
     if (!s.win.swap(damage)) return fail(bool, BAD_NATIVE_WINDOW, false);
@@ -1649,7 +1658,14 @@ pub fn swapBuffers(handle: ?*anyopaque, surface: ?*anyopaque, damage: []const [4
     s.damage_set = false;
     // the context draws on the next back buffer
     if (!bindSurfaces(c)) return fail(bool, BAD_ALLOC, false);
+    swapped(c, began);
     return ok(bool, true);
+}
+
+/// A swap of c's, begun at `began_us`, counted for its usage line.
+fn swapped(c: *Context, began_us: u64) void {
+    const now = report.nowUs();
+    c.gl.usageSwap(now, now -| began_us);
 }
 
 pub fn swapInterval(handle: ?*anyopaque, interval: i32) bool {

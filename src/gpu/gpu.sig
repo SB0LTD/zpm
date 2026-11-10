@@ -17,6 +17,12 @@ pub const interp = @import("kir_interp.sig");
 pub const emu_device = @import("emu_device.sig");
 /// The RTX as a Device (Galaxy's driver or the emulated RTX), running kir_sm120.
 pub const nvidia_device = @import("nvidia_device.sig");
+/// Rectangles through a GPU's graphics pipeline: the types, the Renderer
+/// every GPU's pipeline is called through, the CPU reference and the
+/// self-test's cases.
+pub const draw = @import("draw.sig");
+/// The Adreno's graphics pipeline (adreno/draw.sig) as a draw.Renderer.
+pub const adreno_draw = @import("adreno_draw.sig");
 
 // KIR
 pub const Ty = kir.Ty;
@@ -78,4 +84,6 @@ test {
     _ = adreno_device;
     _ = kir_gcn4;
     _ = amd_device;
+    _ = draw;
+    _ = adreno_draw;
 }

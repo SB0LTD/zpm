@@ -702,6 +702,78 @@ test "egl: an XRGB window reads back opaque, and is made XRGB8888" {
     try std.testing.expect(egl.terminate(d));
 }
 
+var fake_us: u64 = 0;
+fn fakeClock() u64 {
+    return fake_us;
+}
+
+var said: [2048]u8 = undefined;
+var said_len: usize = 0;
+fn hear(line: []const u8) void {
+    const n = @min(line.len, said.len - said_len);
+    @memcpy(said[said_len..][0..n], line[0..n]);
+    said_len += n;
+}
+
+test "egl: a context's swaps are in its usage line, one line in five seconds" {
+    const report = gfxapi.report;
+    useDriver();
+    world(16, 8);
+    const d = egl.getPlatformDisplay(egl.PLATFORM_WAYLAND_KHR, native_display).?;
+    try std.testing.expect(egl.initialize(d, null, null));
+    // (as Firefox asks for WebRender's context: ES 3, lost on a reset)
+    const ctx = egl.createContext(d, config(true), null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT, egl.LOSE_CONTEXT_ON_RESET, egl.NONE }).?;
+    const s = egl.createWindowSurface(i32, d, config(true), &window, null).?;
+    try std.testing.expect(egl.makeCurrent(d, s, s, ctx));
+    try std.testing.expect(egl.swapInterval(d, 0));
+    const c = thread.gl().?;
+    said_len = 0;
+    report.sink = &hear;
+    defer report.sink = null;
+    const real_clock = report.clock;
+    report.clock = &fakeClock;
+    defer report.clock = real_clock;
+    fake_us = 10_000_000;
+    c.clearColor(1, 0, 0, 1);
+    // the first swap begins the time counted; two more in the next four
+    // seconds say nothing (the fake compositor keeps eight swaps' damage:
+    // seven in all here)
+    for (0..3) |_| {
+        c.clear(gl.COLOR_BUFFER_BIT);
+        try std.testing.expect(egl.swapBuffers(d, s, &.{}));
+        fake_us += 1_300_000;
+    }
+    try std.testing.expectEqual(@as(usize, 0), said_len);
+    // past five seconds: the line, with every swap so far
+    fake_us = 15_100_000;
+    c.clear(gl.COLOR_BUFFER_BIT);
+    try std.testing.expect(egl.swapBuffers(d, s, &.{}));
+    const line = said[0..said_len];
+    std.debug.print("{s}", .{line});
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, line, " (ES 3 asked, robust) in 5.1 s on the GPU (") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "): 4 swaps (0 ms in them); 0 draws (") != null);
+    // the swaps of the next four seconds: no second line
+    for (0..2) |_| {
+        fake_us += 2_000_000;
+        c.clear(gl.COLOR_BUFFER_BIT);
+        try std.testing.expect(egl.swapBuffers(d, s, &.{}));
+    }
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, said[0..said_len], "\n"));
+    // then the second, with those two and this one
+    fake_us = 20_200_000;
+    try std.testing.expect(egl.swapBuffers(d, s, &.{}));
+    const both = said[0..said_len];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, both, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, both[line.len..], " in 5.1 s on the GPU (") != null);
+    try std.testing.expect(std.mem.indexOf(u8, both[line.len..], "): 3 swaps (") != null);
+    report.sink = null;
+    try std.testing.expect(egl.makeCurrent(d, null, null, null));
+    try std.testing.expect(egl.destroySurface(d, s));
+    try std.testing.expect(egl.destroyContext(d, ctx));
+    try std.testing.expect(egl.terminate(d));
+}
+
 test "egl: a compositor without dma-bufs is no display (the app draws in software)" {
     useDriver();
     world(8, 8);
