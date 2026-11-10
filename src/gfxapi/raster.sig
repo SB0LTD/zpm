@@ -349,8 +349,19 @@ fn scanAlloc(k: *kir.Kernel) Scan {
 /// linear index): its place among the threads before it that have `hit`,
 /// and how many have it. A scan in shared memory, its barriers included:
 /// call it where the whole group is, never under divergence.
-fn compact(k: *kir.Kernel, sc: Scan, t: V, hit: V) struct { pos: V, total: V } {
+///
+/// Every shared address here and in the lists it fills is clamped into
+/// its CULL words: the thread's index, the place (below CULL; a place
+/// that wrapped below 0 too) and the count (at most CULL). All of them
+/// are in range by construction, and the emulated RTX runs these kernels
+/// clean with any warp order and WebRender's tile kernels on random data;
+/// yet the Legion (fa08a266, 1110u, 1110w) faulted Out Of Range Address
+/// on every SM in one of Firefox's gl_raster launches, now and then, and
+/// lost its GPU context. Clamped, such a launch draws a tile wrong at
+/// worst instead (three IMNMX a chunk).
+fn compact(k: *kir.Kernel, sc: Scan, t_in: V, hit: V) struct { pos: V, total: V } {
     const x = k.sel(.u32, r(hit), u(1), u(0));
+    const t = k.op2(.imin, .u32, r(t_in), u(CULL - 1));
     const t4 = k.op2(.shl, .u32, r(t), u(2));
     k.store(.u32, shAt(sc.a), r(t4), r(x));
     k.barrier();
@@ -372,7 +383,10 @@ fn compact(k: *kir.Kernel, sc: Scan, t: V, hit: V) struct { pos: V, total: V } {
     const total = k.load(.u32, shAt(cur), u(4 * (CULL - 1)));
     // (every read done before the next scan writes)
     k.barrier();
-    return .{ .pos = k.op2(.isub, .u32, r(incl), r(x)), .total = total };
+    return .{
+        .pos = k.op2(.imin, .u32, r(k.op2(.isub, .u32, r(incl), r(x))), u(CULL - 1)),
+        .total = k.op2(.imin, .u32, r(total), u(CULL)),
+    };
 }
 
 /// Whether triangle record `base`'s pixel box meets [x0, x1] x [y0, y1]

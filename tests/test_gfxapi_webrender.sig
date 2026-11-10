@@ -10,8 +10,10 @@
 //! instructions after the expansions). The largest sm_120 kernel and the
 //! slowest compile are reported. Each variant's tile kernel then runs on
 //! the emulated RTX over one tile (its fragment code inside the raster's
-//! scan and lists, as on the PC), the CTA's warps in each order: a fault,
-//! a hazard or a divergence there names the variant.
+//! scan and lists, as on the PC), the CTA's warps in each order, with
+//! neutral inputs and with random ones (varyings, uniforms, every texture
+//! slot bound to random texels: the branches real data takes): a fault, a
+//! hazard or a divergence there names the variant and the seed.
 //!
 //! Firefox's sources are not part of zpm (they are Mozilla's, under the
 //! MPL): set GFXAPI_WR_RES to a checkout's `gfx/wr/webrender/res`. Without
@@ -307,7 +309,35 @@ const LIVE = [_]u32{ 0, 40, 65 };
 /// A variant's tile kernel (sm_120, the PC's caps) run on the emulated RTX
 /// over one tile: the fragment code inside the raster's scan and lists, as
 /// on the PC. Null when it ran clean; else the emulator's sentence.
+/// A random word for a varying, a uniform or a texel: a small integer's
+/// bits (a flat index, a count, a mode) or a float.
+fn fuzzWord(r: std.Random, lo: f32, hi: f32) u32 {
+    if (r.uintLessThan(u32, 10) < 4) return r.uintLessThan(u32, 48);
+    return @bitCast(lo + (hi - lo) * r.float(f32));
+}
+
+const FUZZ_SIDE = 32;
+var fuzz_imgs: [texture.MAX_TEX]engine.Image = undefined;
+
 fn runTile(pipe: *const raster.Pipeline, uniforms: []const u32, nslots: usize, reverse: bool, why: []u8) !?[]const u8 {
+    return runTileSeed(pipe, uniforms, nslots, reverse, 0, why);
+}
+
+/// `seed` 0: the triangles' varyings, the uniforms and the textures as
+/// above (0, as linked, unbound). Else random: about half of the
+/// triangles live, each varying a random plane, the uniforms random, and
+/// every texture slot bound to a FUZZ_SIDE^2 image of random texels
+/// (RGBA8, RGBA32F or RGBA32I by the seed), so the fragment code takes
+/// the branches real data takes. A run past the emulator's step budget is
+/// error.Timeout (a loop random data made long), not a fault.
+fn runTileSeed(pipe: *const raster.Pipeline, uniforms: []const u32, nslots: usize, reverse: bool, seed: u64, why: []u8) !?[]const u8 {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    const fmt: engine.Format = switch (seed % 3) {
+        0 => .rgba8,
+        1 => .rgba32f,
+        else => .rgba32i,
+    };
     const storage = kir.Storage{ .insts = &k_insts, .tys = &k_tys };
     var k = raster.rasterKernel(storage, pipe);
     try k.finish();
@@ -329,7 +359,8 @@ fn runTile(pipe: *const raster.Pipeline, uniforms: []const u32, nslots: usize, r
         const bytes: u64 = switch (i) {
             2 => TILE_TRIS * @as(u64, pipe.sstride) * 4,
             3 => (uniforms.len + nslots * texture.DESC_WORDS + 4) * 4,
-            else => 256,
+            0, 1 => 256,
+            else => if (seed != 0) FUZZ_SIDE * FUZZ_SIDE * @as(u64, fmt.bytes()) else 256,
         };
         b.* = try d.alloc(bytes, .host);
         @memset(b.cpu, 0);
@@ -347,6 +378,39 @@ fn runTile(pipe: *const raster.Pipeline, uniforms: []const u32, nslots: usize, r
     }
     const uni: []u32 = @alignCast(std.mem.bytesAsSlice(u32, bufs[3].cpu));
     @memcpy(uni[0..uniforms.len], uniforms);
+    if (seed != 0) {
+        for (0..TILE_TRIS) |t| {
+            const rec = recs[t * pipe.sstride ..][0..pipe.sstride];
+            const live = r.boolean();
+            rec[0] = @intFromBool(live);
+            rec[1] = 0;
+            rec[2] = 0;
+            rec[3] = 7;
+            rec[4] = 7;
+            rec[26] = @bitCast(@as(f32, 1));
+            // each varying a plane: its value at the tile's first pixel and
+            // its slopes (0, or small)
+            var at: usize = 29;
+            while (at + 3 <= pipe.sstride) : (at += 3) {
+                rec[at] = fuzzWord(r, -3, 3);
+                rec[at + 1] = if (r.boolean()) 0 else @bitCast(r.float(f32) * 0.4 - 0.2);
+                rec[at + 2] = if (r.boolean()) 0 else @bitCast(r.float(f32) * 0.4 - 0.2);
+            }
+        }
+        for (uni[0..uniforms.len]) |*u| u.* = fuzzWord(r, -2, 2);
+        const n = @min(ntex, nslots);
+        for (0..n) |j| {
+            const b = bufs[4 + j];
+            const words: []u32 = @alignCast(std.mem.bytesAsSlice(u32, b.cpu));
+            for (words) |*x| x.* = switch (fmt) {
+                .rgba8 => r.int(u32),
+                .rgba32f => fuzzWord(r, -1, 40),
+                else => r.uintLessThan(u32, 64),
+            };
+            fuzz_imgs[j] = .{ .buf = b, .width = FUZZ_SIDE, .height = FUZZ_SIDE, .stride = FUZZ_SIDE * fmt.bytes(), .format = fmt };
+            texture.descriptor(.{ .img = &fuzz_imgs[j] }, uni[uniforms.len + j * texture.DESC_WORDS ..][0..texture.DESC_WORDS]);
+        }
+    }
     for (bufs[0..nb]) |b| d.toDevice(b, 0, b.cpu.len);
     const fence = try d.run(&.{.{ .prog = &prog, .groups = .{ 1, 1, 1 }, .buffers = bufs[0..nb], .params = params }});
     d.wait(fence, 60_000_000) catch |e| {
@@ -392,6 +456,7 @@ test "webrender: every shader variant compiles and links" {
     defer c.deinit();
     var failed: usize = 0;
     var ran_bad: usize = 0;
+    var ran_long: usize = 0;
     var no_code: usize = 0;
     var reported: usize = 0;
     const selected = try selectedVariants(io, fba.allocator());
@@ -463,15 +528,22 @@ test "webrender: every shader variant compiles and links" {
             }
         }
         std.debug.print("\n", .{});
-        // the tile kernel on the emulated RTX, the warps in each order
-        for ([_]bool{ false, true }) |reverse| {
-            var why_run: [512]u8 = undefined;
-            const bad = runTile(ds.pipe, ds.uniforms, ds.slots.len, reverse, &why_run) catch |e| blk: {
-                break :blk std.fmt.bufPrint(&why_run, "{s}", .{@errorName(e)}) catch "?";
-            };
-            if (bad) |s| {
-                ran_bad += 1;
-                std.debug.print("RUN  {s} [{s}] tile on the emulated RTX{s}: {s}\n", .{ v.name, v.features, if (reverse) " (warps reversed)" else "", s });
+        // the tile kernel on the emulated RTX, the warps in each order,
+        // with neutral inputs (seed 0) and random ones
+        for ([_]u64{ 0, 1, 2, 3 }) |seed| {
+            for ([_]bool{ false, true }) |reverse| {
+                var why_run: [512]u8 = undefined;
+                const bad = runTileSeed(ds.pipe, ds.uniforms, ds.slots.len, reverse, seed, &why_run) catch |e| blk: {
+                    break :blk std.fmt.bufPrint(&why_run, "{s}", .{@errorName(e)}) catch "?";
+                };
+                if (bad) |s| {
+                    if (std.mem.startsWith(u8, s, "Timeout")) {
+                        ran_long += 1;
+                        continue;
+                    }
+                    ran_bad += 1;
+                    std.debug.print("RUN  {s} [{s}] tile on the emulated RTX, seed {d}{s}: {s}\n", .{ v.name, v.features, seed, if (reverse) " (warps reversed)" else "", s });
+                }
             }
         }
         program.useProgram(c, 0);
@@ -479,7 +551,7 @@ test "webrender: every shader variant compiles and links" {
     }
     std.debug.print("webrender: {d} of {d} variants link; {d} kernels do not compile ({d} not required)\n", .{ selected.len - failed, selected.len, no_code, reported });
     std.debug.print("webrender on sm_120: the largest kernel {d} KIR, {d} machine instructions; the slowest compile {d} us ({s}); inside the backend at most {d} KIR expanded, {d} MI, {d} vregs\n", .{ max_kir, max_mi, @divTrunc(max_ns, 1000), max_what[0..max_what_len], max_xkir, max_xmi, max_vregs });
-    std.debug.print("webrender: {d} tile kernel runs on the emulated RTX went wrong\n", .{ran_bad});
+    std.debug.print("webrender: {d} tile kernel runs on the emulated RTX went wrong, {d} ran past the step budget\n", .{ ran_bad, ran_long });
     try std.testing.expectEqual(@as(usize, 0), failed);
     try std.testing.expectEqual(@as(usize, 0), no_code);
     try std.testing.expectEqual(@as(usize, 0), ran_bad);
