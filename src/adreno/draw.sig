@@ -1227,6 +1227,18 @@ pub fn selfTest(dev: Device, r: *Renderer, asm_work: *ir3_asm.Work, log: *const 
     r.imageRR(.{ 8, 20, 16, 24 }, nearest, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, Shape.of(8, 20, 8, 4, 2), .over);
     c.check("an image inside a rounded rectangle", &.{ .{ .x = 12, .y = 22, .want = tw[2 * 16 + 4], .tol = 2 }, .{ .x = 11, .y = 21, .want = tw[16 + 3], .tol = 2 }, .{ .x = 8, .y = 20, .want = 0xff000000, .tol = 40 }, .{ .x = 16, .y = 22, .want = 0xff000000 } });
 
+    // A path's paint and a glow (red to blue through the mask's 0, 85,
+    // 170, 255; a white disc, whole at its centre, nothing past 12 pixels).
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.maskGradient(.{ 8, 8, 12, 10 }, mask, .{ 0, 0, 4, 2 }, .{ .q1 = .{ 0.25, 0, -2 }, .a = .{ 1, 0, 0, 1 }, .b = .{ 0.5, 0, 0.5, 1 }, .c = .{ 0, 0, 1, 1 } }, 1, .over);
+    c.check("a mask times a gradient", &.{ .{ .x = 11, .y = 9, .want = 0xff2000df, .tol = 2 }, .{ .x = 10, .y = 8, .want = 0xff40006a, .tol = 2 }, .{ .x = 9, .y = 9, .want = 0xff350020, .tol = 2 }, .{ .x = 8, .y = 8, .want = 0xff000000, .tol = 2 }, .{ .x = 12, .y = 9, .want = 0xff000000 } });
+
+    r.begin(t);
+    r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
+    r.glow(.{ 20, 4, 44, 28 }, 32, 16, 4, 12, .{ 1, 1, 1, 1 }, .over);
+    c.check("a glow", &.{ .{ .x = 32, .y = 15, .want = 0xffffffff, .tol = 2 }, .{ .x = 39, .y = 16, .want = 0xff979797, .tol = 3 }, .{ .x = 22, .y = 6, .want = 0xff000000 }, .{ .x = 45, .y = 16, .want = 0xff000000 } });
+
     // How fast it fills: a 1024 x 1024 target, an image the same size over
     // it once and a half-transparent color 31 times (32 megapixels blended).
     if (!c.res.lost) speed: {
@@ -1270,7 +1282,7 @@ test "the self-test passes on the emulated device" {
     T.dev = .{ .arena = &T.arena, .gpu_view = &T.gpu_view, .log = &T.log };
     // (no clock: the fill-rate case's megapixels would take the emulator minutes)
     const res = selfTest(T.dev.device(), &T.r, &T.asm_work, &testLog, null);
-    try std.testing.expectEqual(@as(u32, 11), res.passed);
+    try std.testing.expectEqual(@as(u32, 13), res.passed);
     try std.testing.expectEqual(@as(u32, 0), res.failed);
     try std.testing.expect(!res.lost);
 }

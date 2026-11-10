@@ -5,8 +5,9 @@
 //! a color) or a mask (an 8-bit coverage texture times a color), replacing
 //! the target's pixels or blended over them (premultiplied alpha), inside a
 //! scissor; and the same with a rounded rectangle's coverage worked out per
-//! pixel (a filled one, a stroked one, an image inside one). One pass is
-//! begin(target), the rectangles in order, then submit.
+//! pixel (a filled one, a stroked one, an image inside one), a mask times
+//! a gradient (a path filled with a paint) and a soft dithered disc (a
+//! glow). One pass is begin(target), the rectangles in order, then submit.
 //!
 //! Three things live here, above every GPU's own pipeline (the Adreno's in
 //! adreno/draw.sig, the RTX's in nvidia/draw.sig, each behind an adapter
@@ -77,7 +78,7 @@ pub const Blend = enum(u8) {
 };
 
 /// What a rectangle's pixels are.
-pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr };
+pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow };
 
 /// A rectangle's corners: x0, y0, x1, y1 (pixels; x1 and y1 past the end).
 pub const Rect = [4]f32;
@@ -118,6 +119,60 @@ pub const Shape = struct {
         return std.math.clamp(0.5 - s.distance(px, py), 0, 1);
     }
 };
+
+/// Just under half a step of 255. A software compositor that blends in
+/// 8-bit fixed point drops the fraction where a GPU's blender rounds to
+/// the nearest step; a source color this much lower blends to what such a
+/// compositor has (a whole step stays where it is). Without it every such
+/// layer is half a step up, and layers add up. A glow has it built in.
+pub const DROP: f32 = 0.49 / 255.0;
+
+/// A paint that changes across a shape (maskGradient). With q1 and q2 two
+/// lines in window pixels (x's and y's factors, then a constant), t is
+/// |(q1, q2)| * around + q1 * along, held to [0, 1]. The color is `a` at 0,
+/// `b` at `mid` and `c` at 1 (straight, not premultiplied: r, g, b, a).
+pub const Gradient = struct {
+    q1: [3]f32,
+    q2: [3]f32 = .{ 0, 0, 0 },
+    along: f32 = 1,
+    around: f32 = 0,
+    a: Color,
+    /// (two stops: `b` is halfway between them at a `mid` of a half)
+    b: Color,
+    c: Color,
+    mid: f32 = 0.5,
+
+    /// The color at pixel (px, py): the programs' arithmetic.
+    pub fn at(g: Gradient, px: f32, py: f32) Color {
+        const v1 = g.q1[0] * px + g.q1[1] * py + g.q1[2];
+        const v2 = g.q2[0] * px + g.q2[1] * py + g.q2[2];
+        const t = std.math.clamp(@sqrt(v1 * v1 + v2 * v2) * g.around + v1 * g.along, 0, 1);
+        const t1 = std.math.clamp(t / g.mid, 0, 1);
+        const t2 = std.math.clamp((t - g.mid) / (1 - g.mid), 0, 1);
+        var out: Color = undefined;
+        for (0..4) |i| out[i] = g.a[i] + (g.b[i] - g.a[i]) * t1 + (g.c[i] - g.b[i]) * t2;
+        return out;
+    }
+};
+
+/// The 4 x 4 ordered dither a glow's fall is spread with, in [-0.5, 0.5):
+/// the pixel's column and row, each from 0 to 3.
+pub const bayer4 = [16]f32{ 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+
+/// A glow's alpha at the pixel (x, y), whose centre is half a pixel on:
+/// `alpha` inside `inner`, falling by a smooth step to nothing at `outer`,
+/// plus the dither (9 steps of 255 wide) less half a step, held to [0, 1];
+/// nothing at or past `outer`. The programs' arithmetic.
+pub fn glowAlpha(x: u32, y: u32, cx: f32, cy: f32, inner: f32, outer: f32, alpha: f32) f32 {
+    const dx = @as(f32, @floatFromInt(x)) + 0.5 - cx;
+    const dy = @as(f32, @floatFromInt(y)) + 0.5 - cy;
+    const d2 = dx * dx + dy * dy;
+    if (!(d2 < outer * outer)) return 0;
+    var t = std.math.clamp((inner - @sqrt(d2)) / @max(outer - inner, 1e-6) + 1, 0, 1);
+    t = t * t * (3 - 2 * t);
+    const dither = ((bayer4[(y & 3) * 4 + (x & 3)] + 0.5) / 16.0 - 0.5) * 9.0 / 255.0;
+    return std.math.clamp(t * alpha + dither - 0.5 / 255.0, 0, 1);
+}
 
 pub const Error = error{
     OutOfMemory,
@@ -168,6 +223,8 @@ pub const Renderer = struct {
         rrect: *const fn (ctx: *anyopaque, rc: Rect, s: Shape, color: Color, b: Blend) void,
         ring: *const fn (ctx: *anyopaque, rc: Rect, outer: Shape, inner: ?Shape, color: Color, b: Blend) void,
         imageRR: *const fn (ctx: *anyopaque, rc: Rect, t: Texture, uv: [4]f32, tint: Color, s: Shape, b: Blend) void,
+        maskGradient: *const fn (ctx: *anyopaque, rc: Rect, t: Texture, uv: [4]f32, g: Gradient, opacity: f32, b: Blend) void,
+        glow: *const fn (ctx: *anyopaque, rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, b: Blend) void,
         submit: *const fn (ctx: *anyopaque) Error!Fence,
         resubmit: *const fn (ctx: *anyopaque) Error!Fence,
         wait: *const fn (ctx: *anyopaque, f: Fence, timeout_us: u64) Error!void,
@@ -221,6 +278,20 @@ pub const Renderer = struct {
     /// pixels, as `rc`).
     pub fn imageRR(r: Renderer, rc: Rect, t: Texture, uv: [4]f32, tint: Color, s: Shape, b: Blend) void {
         r.vtable.imageRR(r.ctx, rc, t, uv, tint, s, b);
+    }
+
+    /// `g`'s color at each pixel times the coverage in `t` (an r8
+    /// texture, a texel a pixel) times `opacity`: a path filled with a
+    /// gradient. The gradient's colors are straight; what is blended is
+    /// premultiplied.
+    pub fn maskGradient(r: Renderer, rc: Rect, t: Texture, uv: [4]f32, g: Gradient, opacity: f32, b: Blend) void {
+        r.vtable.maskGradient(r.ctx, rc, t, uv, g, opacity, b);
+    }
+
+    /// A soft disc at (cx, cy): `color` (straight r, g, b, and its alpha)
+    /// at glowAlpha, less DROP once multiplied.
+    pub fn glow(r: Renderer, rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, b: Blend) void {
+        r.vtable.glow(r.ctx, rc, cx, cy, inner, outer, color, b);
     }
 
     /// End the pass and hand it to the GPU. The target's pixels are in
@@ -410,6 +481,8 @@ pub const Reference = struct {
         .rrect = &vRrect,
         .ring = &vRing,
         .imageRR = &vImageRR,
+        .maskGradient = &vMaskGradient,
+        .glow = &vGlow,
         .submit = &vSubmit,
         .resubmit = &vResubmit,
         .wait = &vWait,
@@ -439,6 +512,9 @@ pub const Reference = struct {
         uv: [4]f32 = .{ 0, 0, 0, 0 },
         shape: ?Shape = null,
         inner: ?Shape = null,
+        grad: ?Gradient = null,
+        /// mask_grad: the opacity. glow: its centre, inner and outer radius.
+        num: [4]f32 = .{ 0, 0, 0, 0 },
     };
 
     fn draw(m: *Reference, rc: Rect, p: Paint, b: Blend) void {
@@ -495,6 +571,17 @@ pub const Reference = struct {
                         const cov = p.shape.?.coverage(px, py);
                         for (&c, s) |*o, sv| o.* *= sv * cov;
                     },
+                    .mask_grad => {
+                        const s = sample(texels, p.tex.?, u, v);
+                        const g = p.grad.?.at(px, py);
+                        const al = g[3] * s[0] * p.num[0];
+                        c = .{ g[0] * al, g[1] * al, g[2] * al, al };
+                    },
+                    .glow => {
+                        const al = glowAlpha(x, y, p.num[0], p.num[1], p.num[2], p.num[3], p.color[3]);
+                        for (c[0..3]) |*o| o.* = @max(o.* * al - DROP, 0);
+                        c[3] = al;
+                    },
                 }
                 blendInto(out, @as(usize, y) * t.pitch + @as(usize, x) * t.format.bytes(), t.format, c, b);
             }
@@ -537,6 +624,15 @@ pub const Reference = struct {
     fn vImageRR(ctx: *anyopaque, rc: Rect, t: Texture, uv: [4]f32, tint: Color, s: Shape, b: Blend) void {
         if (!(uv[2] != uv[0] and uv[3] != uv[1])) return;
         of(ctx).draw(rc, .{ .kind = .image_rr, .color = tint, .tex = t, .uv = uv, .shape = s }, b);
+    }
+
+    fn vMaskGradient(ctx: *anyopaque, rc: Rect, t: Texture, uv: [4]f32, g: Gradient, opacity: f32, b: Blend) void {
+        of(ctx).draw(rc, .{ .kind = .mask_grad, .color = .{ 0, 0, 0, 0 }, .tex = t, .uv = uv, .grad = g, .num = .{ opacity, 0, 0, 0 } }, b);
+    }
+
+    fn vGlow(ctx: *anyopaque, rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, b: Blend) void {
+        if (!(outer > 0)) return;
+        of(ctx).draw(rc, .{ .kind = .glow, .color = color, .num = .{ cx, cy, inner, outer } }, b);
     }
 
     fn vSubmit(ctx: *anyopaque) Error!Fence {
@@ -609,6 +705,8 @@ pub const Op = union(enum) {
     rrect: struct { rc: Rect, shape: Shape, color: Color, blend: Blend = .over },
     ring: struct { rc: Rect, outer: Shape, inner: ?Shape, color: Color, blend: Blend = .over },
     image_rr: struct { rc: Rect, tex: CaseTexture, uv: [4]f32, tint: Color, shape: Shape, blend: Blend = .over },
+    mask_grad: struct { rc: Rect, uv: [4]f32, grad: Gradient, opacity: f32 = 1, blend: Blend = .over },
+    glow: struct { rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, blend: Blend = .over },
 };
 
 /// A pixel a case must leave: within `tol` of 255 a byte.
@@ -684,6 +782,20 @@ pub const cases = [_]Case{
         .ops = &.{ .{ .fill = .{ .rc = WHOLE, .color = BLACK } }, .{ .image_rr = .{ .rc = .{ 8, 20, 16, 24 }, .tex = .nearest, .uv = .{ 0, 0, 8, 4 }, .tint = WHITE, .shape = Shape.of(8, 20, 8, 4, 2) } } },
         .probes = &.{ .{ .x = 12, .y = 22, .want = caseTexel(4, 2), .tol = 2 }, .{ .x = 11, .y = 21, .want = caseTexel(3, 1), .tol = 2 }, .{ .x = 8, .y = 20, .want = black, .tol = 40 }, .{ .x = 16, .y = 22, .want = black } },
     },
+    .{
+        // (red at the mask's left edge to blue at its right, through the
+        // mask's 0, 85, 170, 255)
+        .name = "a mask times a gradient",
+        .ops = &.{ .{ .fill = .{ .rc = WHOLE, .color = BLACK } }, .{ .mask_grad = .{ .rc = .{ 8, 8, 12, 10 }, .uv = .{ 0, 0, 4, 2 }, .grad = .{ .q1 = .{ 0.25, 0, -2 }, .a = .{ 1, 0, 0, 1 }, .b = .{ 0.5, 0, 0.5, 1 }, .c = .{ 0, 0, 1, 1 } } } } },
+        .probes = &.{ .{ .x = 11, .y = 9, .want = 0xff2000df, .tol = 2 }, .{ .x = 10, .y = 8, .want = 0xff40006a, .tol = 2 }, .{ .x = 9, .y = 9, .want = 0xff350020, .tol = 2 }, .{ .x = 8, .y = 8, .want = black, .tol = 2 }, .{ .x = 12, .y = 9, .want = black } },
+    },
+    .{
+        // (white: whole at the centre, a smooth step out to 12 pixels,
+        // dithered; nothing past that)
+        .name = "a glow",
+        .ops = &.{ .{ .fill = .{ .rc = WHOLE, .color = BLACK } }, .{ .glow = .{ .rc = .{ 20, 4, 44, 28 }, .cx = 32, .cy = 16, .inner = 4, .outer = 12, .color = WHITE } } },
+        .probes = &.{ .{ .x = 32, .y = 15, .want = 0xffffffff, .tol = 2 }, .{ .x = 39, .y = 16, .want = 0xff979797, .tol = 3 }, .{ .x = 22, .y = 6, .want = black }, .{ .x = 45, .y = 16, .want = black } },
+    },
 };
 
 /// The self-test's textures on a device: the 8 x 4 picture at the start
@@ -726,6 +838,8 @@ pub fn record(r: Renderer, t: Target, tex: CaseTextures, c: Case) void {
         .rrect => |p| r.rrect(p.rc, p.shape, p.color, p.blend),
         .ring => |p| r.ring(p.rc, p.outer, p.inner, p.color, p.blend),
         .image_rr => |i| r.imageRR(i.rc, tex.get(i.tex), i.uv, i.tint, i.shape, i.blend),
+        .mask_grad => |m| r.maskGradient(m.rc, tex.get(.mask), m.uv, m.grad, m.opacity, m.blend),
+        .glow => |g| r.glow(g.rc, g.cx, g.cy, g.inner, g.outer, g.color, g.blend),
     };
 }
 
@@ -911,7 +1025,7 @@ test "draw: the reference passes every case" {
     try testing.expectEqual(@as(u32, cases.len), res.passed);
     try testing.expectEqual(@as(u32, 0), res.failed);
     try testing.expect(!res.lost);
-    try testing.expectEqual(@as(usize, 11), cases.len);
+    try testing.expectEqual(@as(usize, 13), cases.len);
 }
 
 test "draw: a pass is a pass: nothing before begin, the scissor, memory that is not the model's" {
