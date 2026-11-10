@@ -482,6 +482,11 @@ pub const Work = struct {
     check_hazards: bool = true,
     /// NAK's model (sm120_sched's guarantee) instead of the hardware's.
     strict: bool = false,
+    /// A CTA's warps run between barriers last first (else first first).
+    /// The SMs promise no order: a kernel that reads another warp's shared
+    /// memory without a barrier between can pass one order and not the
+    /// other.
+    reverse_warps: bool = false,
     max_steps: u64 = DEFAULT_MAX_STEPS,
 };
 
@@ -1446,7 +1451,7 @@ fn runCta(c: *Ctx) Error!void {
     @memset(w.shared[0..c.l.shared_bytes], 0xcd);
     @memset(w.local[0 .. @as(usize, c.local_per) * c.nthreads], 0xcd);
     while (true) {
-        for (0..nw) |k| try runWarp(c, @intCast(k));
+        for (0..nw) |k| try runWarp(c, @intCast(if (w.reverse_warps) nw - 1 - k else k));
         // Every lane is at a barrier or done: release the barrier, the
         // warps in step.
         var at_bar = false;

@@ -689,6 +689,12 @@ pub fn linkProgram(c: *Context, prog: u32) void {
     p.fs_src = .{};
     p.linked = link(p, &log);
     if (p.linked) p.eng = c.eng else report.say(.link, "a program did not link: {s}", .{report.firstLine(log.text())});
+    if (p.linked) {
+        // (whose shaders these are, for the context's usage line)
+        var whose: report.Whose = .{};
+        for (p.out.uniforms[0..p.out.nuniforms]) |u| whose.see(p.out.name(u.name));
+        c.usage.linked(whose);
+    }
     p.validated = false;
     setLog(o, log.text());
 }
