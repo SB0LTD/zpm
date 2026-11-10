@@ -8,12 +8,13 @@
 //! texture times a color), each a rectangle in window pixels, replacing the
 //! target's pixels or blended over them (premultiplied alpha), inside a
 //! scissor; and the same with a rounded rectangle's coverage worked out per
-//! pixel. The rasterizer walks the rectangle, the texture unit filters, the
+//! pixel, a mask times a gradient, and a soft dithered disc (a glow). The
+//! rasterizer walks the rectangle, the texture unit filters, the
 //! render backend blends: no compute kernel.
 //!
 //! How a rectangle reaches the engine. It is a triangle strip of four
 //! vertices with no vertex buffer: the vertex program reads the vertex's
-//! index and picks a corner from the rectangle's record, 128 bytes the CPU
+//! index and picks a corner from the rectangle's record, 192 bytes the CPU
 //! wrote (the corners in clip space, the varyings at the corners, the
 //! color, the shape's numbers, the texture's handle). The record is bound
 //! as constant buffer 0 of the vertex and the pixel stage, so a rectangle
@@ -36,7 +37,7 @@
 //!
 //! Colors are premultiplied, four floats (r, g, b, a) in [0, 1].
 //!
-//! On the emulated RTX (emu3d.sig) the interface's eleven cases are the
+//! On the emulated RTX (emu3d.sig) the interface's thirteen cases are the
 //! CPU reference's within 2 of 255. Nothing here has run on the Legion's
 //! RTX yet.
 //!
@@ -109,8 +110,8 @@ pub const Blend = enum(u8) {
 };
 
 /// What a rectangle's pixels are.
-pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr };
-const KINDS = 6;
+pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow };
+const KINDS = 8;
 
 /// A rectangle's corners: x0, y0, x1, y1 (pixels; x1 and y1 past the end).
 pub const Rect = [4]f32;
@@ -125,6 +126,26 @@ pub const Shape = struct {
     kx: f32,
     ky: f32,
     rad: f32,
+};
+
+/// Just under half a step of 255 (gpu/draw.sig's DROP): a glow's color is
+/// this much lower once multiplied, so it blends to what a compositor that
+/// drops the fraction has.
+pub const DROP: f32 = 0.49 / 255.0;
+
+/// A paint that changes across a shape (maskGradient; gpu/draw.sig's).
+/// With q1 and q2 two lines in window pixels (x's and y's factors, then a
+/// constant), t is |(q1, q2)| * around + q1 * along, held to [0, 1]. The
+/// color is `a` at 0, `b` at `mid` and `c` at 1 (straight: r, g, b, a).
+pub const Gradient = struct {
+    q1: [3]f32,
+    q2: [3]f32 = .{ 0, 0, 0 },
+    along: f32 = 1,
+    around: f32 = 0,
+    a: Color,
+    b: Color,
+    c: Color,
+    mid: f32 = 0.5,
 };
 
 // ── The 3D engine's methods (clce97.h, by address) ──────────────────────────
@@ -262,16 +283,19 @@ pub const BLEND_ONE_MINUS_SRC_ALPHA: u32 = 0x4303;
 // ── A rectangle's record ────────────────────────────────────────────────────
 
 /// Bytes a record (a constant buffer's size and address are multiples of 64).
-pub const RECORD = 128;
+pub const RECORD = 192;
 /// Where a record's parts are (bytes): the corners in clip space (x0, y0,
-/// x1, y1), the varyings at them (s0, t0, s1, t1), the color, three
-/// vectors a kind's program reads its own way, the texture's handle.
+/// x1, y1), the varyings at them (s0, t0, s1, t1), the color, five
+/// vectors a kind's program reads its own way (P1 on), the texture's
+/// handle.
 pub const AT_CORNERS = 0x00;
 pub const AT_VARYINGS = 0x10;
 pub const AT_COLOR = 0x20;
 pub const AT_P1 = 0x30;
 pub const AT_P2 = 0x40;
-pub const AT_HANDLE = 0x60;
+pub const AT_HANDLE = 0x80;
+/// The floats a kind's program may have after the color.
+const PARAMS = (AT_HANDLE - AT_P1) / 4;
 
 // ── The programs ────────────────────────────────────────────────────────────
 // Constant buffer 0 is the rectangle's record. A pixel program's color
@@ -340,7 +364,7 @@ const VARYINGS =
 /// The texel at (R4, R5) through the record's handle: red, green, blue,
 /// alpha into R0..R3.
 const SAMPLE =
-    \\LDC R6, c[0x0][0x60]
+    \\LDC R6, c[0x0][0x80]
     \\TEX.B.DXY R2, R0, R4, R6, 2D
     \\
 ;
@@ -479,9 +503,130 @@ const FS_IMAGE_RR = VARYINGS ++ SAMPLE ++
     \\EXIT
 ;
 
+/// One channel of a gradient's color into register `out`: a's, plus b - a
+/// by R19 (the way to the middle stop), plus c - b by R20 (the way on from
+/// it); the three at `at`, 0x10 and 0x20 further in the record.
+fn stop(comptime out: u8, comptime at: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\LDC R12, c[0x0][0x{[a]x}]
+        \\LDC R13, c[0x0][0x{[b]x}]
+        \\LDC R14, c[0x0][0x{[c]x}]
+        \\FFMA R12, R13, R19, R12
+        \\FFMA R{[out]d}, R14, R20, R12
+        \\
+    , .{ .out = out, .a = at, .b = at + 0x10, .c = at + 0x20 });
+}
+
+/// The texel's first channel (coverage) times a gradient: a path filled
+/// with a paint. The varyings are the mask's texture coordinates, one a
+/// pixel. With q1 and q2 two lines in them, t is |(q1, q2)| times R plus
+/// q1 times L, held to [0, 1]; the color is a, then b - a by t up to the
+/// middle stop, then c - b by the rest. Colors are straight here, and
+/// leave premultiplied.
+/// The color's place: q1's x, y, constant, then L; P1: q2's, then R; P2:
+/// 1 / mid, -mid / (1 - mid), 1 / (1 - mid), the opacity; then a, b - a,
+/// c - b.
+const FS_MASK_GRAD = VARYINGS ++ SAMPLE ++ COLOR ++
+    \\LDC R12, c[0x0][0x30]
+    \\LDC R13, c[0x0][0x34]
+    \\LDC R14, c[0x0][0x38]
+    \\LDC R15, c[0x0][0x3c]
+    \\FFMA R16, R4, R8, R10
+    \\FFMA R16, R5, R9, R16
+    \\FFMA R17, R4, R12, R14
+    \\FFMA R17, R5, R13, R17
+    \\FMUL R18, R16, R16
+    \\FFMA R18, R17, R17, R18
+    \\MUFU.SQRT R18, R18
+    \\FMUL R18, R18, R15
+    \\FFMA R18, R16, R11, R18
+    \\FADD.SAT R18, R18, RZ
+    \\LDC R8, c[0x0][0x40]
+    \\LDC R9, c[0x0][0x44]
+    \\LDC R10, c[0x0][0x48]
+    \\LDC R11, c[0x0][0x4c]
+    \\FMUL R19, R18, R8
+    \\FADD.SAT R19, R19, RZ
+    \\FFMA R20, R18, R10, R9
+    \\FADD.SAT R20, R20, RZ
+    \\
+++ stop(21, 0x50) ++ stop(22, 0x54) ++ stop(23, 0x58) ++ stop(24, 0x5c) ++
+    \\FMUL R24, R24, R0
+    \\FMUL R3, R24, R11
+    \\FMUL R0, R21, R3
+    \\FMUL R1, R22, R3
+    \\FMUL R2, R23, R3
+    \\EXIT
+;
+
+/// A soft disc: the color (straight, its alpha last) whole inside the
+/// inner radius, falling by a smooth step to nothing at the outer one,
+/// spread by a 4 x 4 ordered dither (gpu/draw.sig's glowAlpha); the color
+/// leaves times that alpha, less DROP, not below 0. The varyings are the
+/// pixel's position. The dither's step for column x and row y is
+/// 8 (e & 1) + (e & 2) + 4 (y & 1) + (y & 2) / 2, e being x xor y.
+/// P1: -centre x, y, the inner radius, 1 / (outer - inner); P2: the
+/// dither's scale (9 / (16 * 255)), its offset, 3, the outer radius
+/// squared; then -DROP and 1.
+const FS_GLOW = VARYINGS ++
+    \\LDC R8, c[0x0][0x30]
+    \\LDC R9, c[0x0][0x34]
+    \\LDC R10, c[0x0][0x38]
+    \\LDC R11, c[0x0][0x3c]
+    \\LDC R12, c[0x0][0x40]
+    \\LDC R13, c[0x0][0x44]
+    \\LDC R14, c[0x0][0x48]
+    \\LDC R15, c[0x0][0x4c]
+    \\LDC R16, c[0x0][0x50]
+    \\LDC R17, c[0x0][0x54]
+    \\F2I.TRUNC.NTZ R6, R4
+    \\F2I.TRUNC.NTZ R7, R5
+    \\FADD R4, R4, R8
+    \\FADD R5, R5, R9
+    \\FMUL R18, R4, R4
+    \\FFMA R18, R5, R5, R18
+    \\FSETP.LT.AND P0, PT, R18, R15, PT
+    \\MUFU.SQRT R19, R18
+    \\FADD R19, R10, -R19
+    \\FFMA R19, R19, R11, R17
+    \\FADD.SAT R19, R19, RZ
+    \\FADD R20, R19, R19
+    \\FADD R20, R14, -R20
+    \\FMUL R19, R19, R19
+    \\FMUL R19, R19, R20
+    \\LOP3.LUT R20, R6, R7, RZ, 0x3c, !PT
+    \\LOP3.LUT R21, R20, 0x1, RZ, 0xc0, !PT
+    \\LOP3.LUT R22, R20, 0x2, RZ, 0xc0, !PT
+    \\LOP3.LUT R23, R7, 0x1, RZ, 0xc0, !PT
+    \\LOP3.LUT R24, R7, 0x2, RZ, 0xc0, !PT
+    \\I2FP.F32.S32 R21, R21
+    \\I2FP.F32.S32 R22, R22
+    \\I2FP.F32.S32 R23, R23
+    \\I2FP.F32.S32 R24, R24
+    \\FMUL R21, R21, 8
+    \\FADD R21, R21, R22
+    \\FMUL R23, R23, 4
+    \\FADD R21, R21, R23
+    \\FMUL R24, R24, 0.5
+    \\FADD R21, R21, R24
+    \\FFMA R21, R21, R12, R13
+    \\
+++ COLOR ++
+    \\FFMA R3, R19, R11, R21
+    \\FADD.SAT R3, R3, RZ
+    \\SEL R3, R3, RZ, P0
+    \\FFMA R0, R8, R3, R16
+    \\FFMA R1, R9, R3, R16
+    \\FFMA R2, R10, R3, R16
+    \\FMNMX R0, R0, RZ, !PT
+    \\FMNMX R1, R1, RZ, !PT
+    \\FMNMX R2, R2, RZ, !PT
+    \\EXIT
+;
+
 /// The programs: the two vertex programs, then a pixel program a kind.
 const PROGRAMS = 2 + KINDS;
-const SOURCES = [PROGRAMS][]const u8{ VS_FLAT, VS_VARY, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR };
+const SOURCES = [PROGRAMS][]const u8{ VS_FLAT, VS_VARY, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW };
 
 /// Whether a kind's programs carry varyings (all but a solid rectangle's).
 fn varies(k: Kind) bool {
@@ -742,7 +887,7 @@ pub const Options = struct {
     /// rectangle and a few more where the kind, the blend or the scissor
     /// changes.
     stream_bytes: usize = 256 * 1024,
-    /// The rectangles a pass may hold (128 bytes each).
+    /// The rectangles a pass may hold (192 bytes each).
     rects: u32 = 4096,
     /// The textures a pass may sample.
     textures: u32 = 255,
@@ -905,7 +1050,7 @@ pub const Renderer = struct {
         for (corners, 0..) |v, n| std.mem.writeInt(u32, rec[AT_CORNERS + n * 4 ..][0..4], bits(v), .little);
         for (vary, 0..) |v, n| std.mem.writeInt(u32, rec[AT_VARYINGS + n * 4 ..][0..4], bits(v), .little);
         for (color, 0..) |v, n| std.mem.writeInt(u32, rec[AT_COLOR + n * 4 ..][0..4], bits(v), .little);
-        for (params, 0..) |v, n| std.mem.writeInt(u32, rec[AT_P1 + n * 4 ..][0..4], bits(v), .little);
+        for (params[0..@min(params.len, PARAMS)], 0..) |v, n| std.mem.writeInt(u32, rec[AT_P1 + n * 4 ..][0..4], bits(v), .little);
         std.mem.writeInt(u32, rec[AT_HANDLE..][0..4], handle, .little);
         rect(&r.p, r.records.va + at);
         r.stats.rects += 1;
@@ -965,6 +1110,40 @@ pub const Renderer = struct {
         const sx = (rc[2] - rc[0]) / (uv[2] - uv[0]);
         const sy = (rc[3] - rc[1]) / (uv[3] - uv[1]);
         r.emit(rc, uv, tint, &.{ sx, sy, rc[0] - uv[0] * sx - s.cx, rc[1] - uv[1] * sy - s.cy, -s.kx, -s.ky, -s.rad }, r.bind(t));
+    }
+
+    /// `g`'s color at each pixel times the coverage in `t` (an r8
+    /// texture, a texel a pixel) times `opacity`: a path filled with a
+    /// gradient.
+    pub fn maskGradient(r: *Renderer, rc: Rect, t: Texture, uv: [4]f32, g: Gradient, opacity: f32, b: Blend) void {
+        if (!r.drawn(rc)) return;
+        r.use(.mask_grad, b);
+        // the lines in texture coordinates: a pixel's position is its
+        // coordinate plus where the mask lies
+        const ox = rc[0] - uv[0];
+        const oy = rc[1] - uv[1];
+        const params = [20]f32{
+            g.q2[0],         g.q2[1],              g.q2[2] + g.q2[0] * ox + g.q2[1] * oy, g.around,
+            1 / g.mid,       -g.mid / (1 - g.mid), 1 / (1 - g.mid),                       opacity,
+            g.a[0],          g.a[1],               g.a[2],                                g.a[3],
+            g.b[0] - g.a[0], g.b[1] - g.a[1],      g.b[2] - g.a[2],                       g.b[3] - g.a[3],
+            g.c[0] - g.b[0], g.c[1] - g.b[1],      g.c[2] - g.b[2],                       g.c[3] - g.b[3],
+        };
+        r.emit(rc, uv, .{ g.q1[0], g.q1[1], g.q1[2] + g.q1[0] * ox + g.q1[1] * oy, g.along }, &params, r.bind(t));
+    }
+
+    /// A soft disc at (cx, cy): `color` (straight, its alpha last) whole
+    /// inside `inner`, falling smoothly to nothing at `outer`, dithered.
+    pub fn glow(r: *Renderer, rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, b: Blend) void {
+        if (!r.drawn(rc) or !(outer > 0)) return;
+        r.use(.glow, b);
+        const span = @max(outer - inner, 1e-6);
+        const params = [10]f32{
+            -cx,                  -cy,                                            inner, 1 / span,
+            9.0 / (16.0 * 255.0), (0.5 / 16.0 - 0.5) * 9.0 / 255.0 - 0.5 / 255.0, 3,     outer * outer,
+            -DROP,                1,
+        };
+        r.emit(rc, rc, color, &params, 0);
     }
 
     /// End the pass and hand it to the GPU. The target's pixels are in
@@ -1051,10 +1230,10 @@ test "a texture's header and the samplers: NVK's words" {
 test "the stream: a target, a rectangle's nine dwords" {
     var buf: [512]u32 = undefined;
     var p = Push{ .buf = &buf };
-    rect(&p, 0x10_0004_0080);
+    rect(&p, 0x10_0004_00c0);
     try p.check();
     try testing.expectEqualSlices(u32, &.{
-        0x2003_08e0, RECORD, 0x10, 0x0004_0080, // the selector: size, address
+        0x2003_08e0, RECORD, 0x10, 0x0004_00c0, // the selector: size, address
         0x8001_0904, // bound to the vertex stage's slot 0
         0x8001_0924, // and the pixel stage's
         0x2002_009c, 0, 4, // four vertices from vertex 0

@@ -47,6 +47,8 @@ pub const Over = struct {
         .rrect = &vRrect,
         .ring = &vRing,
         .imageRR = &vImageRR,
+        .maskGradient = &vMaskGradient,
+        .glow = &vGlow,
         .submit = &vSubmit,
         .resubmit = &vResubmit,
         .wait = &vWait,
@@ -91,6 +93,14 @@ pub const Over = struct {
 
     fn vImageRR(ctx: *anyopaque, rc: draw.Rect, t: draw.Texture, uv: [4]f32, tint: draw.Color, s: draw.Shape, b: draw.Blend) void {
         of(ctx).r.imageRR(rc, textureOf(t), uv, tint, shapeOf(s), blendOf(b));
+    }
+
+    fn vMaskGradient(ctx: *anyopaque, rc: draw.Rect, t: draw.Texture, uv: [4]f32, g: draw.Gradient, opacity: f32, b: draw.Blend) void {
+        of(ctx).r.maskGradient(rc, textureOf(t), uv, .{ .q1 = g.q1, .q2 = g.q2, .along = g.along, .around = g.around, .a = g.a, .b = g.b, .c = g.c, .mid = g.mid }, opacity, blendOf(b));
+    }
+
+    fn vGlow(ctx: *anyopaque, rc: draw.Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: draw.Color, b: draw.Blend) void {
+        of(ctx).r.glow(rc, cx, cy, inner, outer, color, blendOf(b));
     }
 
     fn vSubmit(ctx: *anyopaque) draw.Error!draw.Fence {
