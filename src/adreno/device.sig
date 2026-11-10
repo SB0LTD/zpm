@@ -1007,6 +1007,9 @@ pub const EmuDevice = struct {
         const s = &e.fs_samp[samp];
         const fmt = (d[0] >> 22) & 0xff;
         if (d[2] >> 29 != 1 or d[0] & 3 != 0 or (fmt != dr.FMT6_8_UNORM and fmt != dr.FMT6_8_8_8_8_UNORM)) return error.BadDispatch;
+        // rows a multiple of 64 bytes apart, from an address that is one
+        // (the X1-45 reads other pitches as the next 64)
+        if ((d[2] >> 7) & 0x3fffff == 0 or ((d[2] >> 7) & 0x3fffff) % 64 != 0 or d[4] & 63 != 0) return error.BadDispatch;
         // clamp to edge both ways
         if ((s[0] >> 5) & 7 != 1 or (s[0] >> 8) & 7 != 1) return error.BadDispatch;
         var x = x_in;

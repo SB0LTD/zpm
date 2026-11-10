@@ -49,11 +49,46 @@ pub const Error = device.Error || ir3_asm.Error || error{
 };
 
 /// What a rectangle's pixels are.
-pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr };
-const KINDS = 6;
+pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow };
+const KINDS = 8;
 
 /// A rectangle's corners: x0, y0, x1, y1 (pixels; x1 and y1 past the end).
 pub const Rect = [4]f32;
+
+/// Just under half a step of 255. gfx blends some things (a glow, a scrim)
+/// dropping the fraction, where the blender rounds to the nearest step: a
+/// source color this much lower blends to what gfx has (a whole step
+/// stays where it is). Without it every such layer is half a step up on
+/// gfx, and layers add up.
+pub const DROP: f32 = 0.49 / 255.0;
+
+/// A paint that changes across a shape (maskGradient). With q1 and q2 two
+/// lines in window pixels (x's and y's factors, then a constant), t is
+/// |(q1, q2)| * around + q1 * along, held to [0, 1]. The color is `a` at 0,
+/// `b` at `mid` and `c` at 1 (straight, not premultiplied: r, g, b, a).
+pub const Gradient = struct {
+    q1: [3]f32,
+    q2: [3]f32 = .{ 0, 0, 0 },
+    along: f32 = 1,
+    around: f32 = 0,
+    a: Color,
+    b: Color,
+    /// (two stops: `b` is halfway between them at a `mid` of a half)
+    c: Color,
+    mid: f32 = 0.5,
+
+    /// The color at pixel (px, py): the program's arithmetic, for tests.
+    pub fn at(g: Gradient, px: f32, py: f32) Color {
+        const v1 = g.q1[0] * px + g.q1[1] * py + g.q1[2];
+        const v2 = g.q2[0] * px + g.q2[1] * py + g.q2[2];
+        const t = std.math.clamp(@sqrt(v1 * v1 + v2 * v2) * g.around + v1 * g.along, 0, 1);
+        const t1 = std.math.clamp(t / g.mid, 0, 1);
+        const t2 = std.math.clamp((t - g.mid) / (1 - g.mid), 0, 1);
+        var out: Color = undefined;
+        for (0..4) |i| out[i] = g.a[i] + (g.b[i] - g.a[i]) * t1 + (g.c[i] - g.b[i]) * t2;
+        return out;
+    }
+};
 
 /// A rounded rectangle as the coverage programs take it: its centre, its
 /// half size less the radius, the radius.
@@ -239,7 +274,101 @@ const FS_IMAGE_RR =
     \\end
 ;
 
-const SOURCES = [1 + KINDS][]const u8{ VS, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR };
+/// The prefetched coverage times a gradient: a path filled with a paint.
+/// The varyings are the mask's texture coordinates, one a pixel. With
+/// q1 and q2 two lines in them, t is |(q1, q2)| times R plus q1 times L,
+/// held to [0, 1] (L one for a gradient along a line, R one for one
+/// around a point); the color is a, then b - a by t up to the middle
+/// stop, then c - b by the rest. Colors are straight here, and leave
+/// premultiplied.
+/// c0: q1's x, y, constant, then L; c1: q2's, then R; c2: 1 / mid,
+/// -mid / (1 - mid), 1 / (1 - mid), the opacity; c3: a; c4: b - a;
+/// c5: c - b.
+const FS_MASK_GRAD =
+    \\@threadsize 128
+    \\@out r6.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\mul.f r2.z, r2.x, c0.x
+    \\mul.f r2.w, r2.y, c0.y
+    \\add.f r2.z, r2.z, r2.w
+    \\add.f r2.z, r2.z, c0.z
+    \\mul.f r3.x, r2.x, c1.x
+    \\mul.f r3.y, r2.y, c1.y
+    \\add.f r3.x, r3.x, r3.y
+    \\add.f r3.x, r3.x, c1.z
+    \\mul.f r3.y, r2.z, r2.z
+    \\mul.f r3.z, r3.x, r3.x
+    \\add.f r3.y, r3.y, r3.z
+    \\sqrt r3.y, r3.y
+    \\mul.f r3.y, r3.y, c1.w
+    \\mul.f r3.z, r2.z, c0.w
+    \\add.f (sat)r3.y, r3.y, r3.z
+    \\mul.f (sat)r3.z, r3.y, c2.x
+    \\mul.f r3.w, r3.y, c2.z
+    \\add.f (sat)r3.w, r3.w, c2.y
+    \\(rpt3)mul.f r4.x, (r)c4.x, r3.z
+    \\(rpt3)add.f r4.x, (r)r4.x, (r)c3.x
+    \\(rpt3)mul.f r5.x, (r)c5.x, r3.w
+    \\(rpt3)add.f r4.x, (r)r4.x, (r)r5.x
+    \\(sy)mul.f r3.x, r0.z, c2.w
+    \\mul.f r3.x, r3.x, r4.w
+    \\(rpt2)mul.f r6.x, (r)r4.x, r3.x
+    \\mov.f32f32 r6.w, r3.x
+    \\end
+;
+
+/// A soft disc, as gfx.radialGlow: full inside `inner`, falling by a
+/// smooth step to nothing at `outer`, with gfx's 4 x 4 ordered dither
+/// (9 of 255 wide) so the fall does not band. The varyings are the
+/// pixel's position.
+/// c0: the color (straight), then its alpha; c1: -centre x, y, inner,
+/// 1 / (outer - inner); c2: the dither's step and offset, 3, outer
+/// squared; c3.x: what the blended color is taken down by (gfx's blend
+/// drops the fraction where the blender rounds).
+const FS_GLOW =
+    \\@threadsize 128
+    \\@out r6.x, 4
+    \\(rpt1)bary.f (ei)r2.x, (r)0, r0.x
+    \\(rpt1)add.f r2.z, (r)r2.x, (r)c1.x
+    \\mul.f r3.x, r2.z, r2.z
+    \\mul.f r3.y, r2.w, r2.w
+    \\add.f r3.x, r3.x, r3.y
+    \\sqrt r3.y, r3.x
+    \\add.f r3.z, (neg)r3.y, c1.z
+    \\mul.f r3.z, r3.z, c1.w
+    \\add.f (sat)r3.z, r3.z, (1.0)
+    \\mul.f r3.w, r3.z, r3.z
+    \\add.f r4.x, r3.z, r3.z
+    \\add.f r4.x, (neg)r4.x, c2.z
+    \\mul.f r3.w, r3.w, r4.x
+    \\mul.f r3.w, r3.w, c0.w
+    \\cov.f32u32 r4.y, r2.x
+    \\cov.f32u32 r4.z, r2.y
+    \\xor.b r4.w, r4.y, r4.z
+    \\and.b r5.x, r4.w, 1
+    \\shl.b r5.x, r5.x, 3
+    \\and.b r5.y, r4.z, 1
+    \\shl.b r5.y, r5.y, 2
+    \\or.b r5.x, r5.x, r5.y
+    \\and.b r5.y, r4.w, 2
+    \\or.b r5.x, r5.x, r5.y
+    \\and.b r5.y, r4.z, 2
+    \\shr.b r5.y, r5.y, 1
+    \\or.b r5.x, r5.x, r5.y
+    \\cov.u32f32 r5.x, r5.x
+    \\mul.f r5.x, r5.x, c2.x
+    \\add.f r5.x, r5.x, c2.y
+    \\add.f (sat)r3.w, r3.w, r5.x
+    \\cmps.f.lt r5.y, r3.x, c2.w
+    \\cov.u32f32 r5.y, r5.y
+    \\mul.f r3.w, r3.w, r5.y
+    \\(rpt2)mul.f r6.x, (r)c0.x, r3.w
+    \\(rpt2)add.f r6.x, (r)r6.x, c3.x
+    \\mov.f32f32 r6.w, r3.w
+    \\end
+;
+
+const SOURCES = [1 + KINDS][]const u8{ VS, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW };
 
 /// How each kind's fragment program is wired: whether it reads the
 /// varyings, whether the pipeline prefetches its texel, where its color is.
@@ -251,13 +380,15 @@ const WIRING = [KINDS]Wiring{
     .{ .varyings = true, .prefetch = false, .color_reg = 16 },
     .{ .varyings = true, .prefetch = false, .color_reg = 16 },
     .{ .varyings = true, .prefetch = true, .color_reg = 16 },
+    .{ .varyings = true, .prefetch = true, .color_reg = 24 },
+    .{ .varyings = true, .prefetch = false, .color_reg = 24 },
 };
 
 /// Instruction words a program may take (with its padding), and its bytes
 /// in the code buffer.
 const WORDS = 128;
 const SLOT = WORDS * 8;
-const CODE_BYTES = 8192;
+const CODE_BYTES = 16384;
 /// Where the border colors' zeros are in the code buffer.
 const BORDER_AT = CODE_BYTES - 256;
 /// Bytes a texture's descriptors take in the state buffer.
@@ -295,6 +426,8 @@ pub const Renderer = struct {
     in_pass: bool,
     state_used: usize,
     state_full: bool,
+    /// A texture of the pass was one the hardware would not read as given.
+    bad_texture: bool,
     kind: ?Kind,
     blend: ?Blend,
     tex: ?Texture,
@@ -353,6 +486,7 @@ pub const Renderer = struct {
         r.in_pass = true;
         r.state_used = 0;
         r.state_full = false;
+        r.bad_texture = false;
         r.kind = null;
         r.blend = null;
         r.tex = null;
@@ -383,6 +517,8 @@ pub const Renderer = struct {
 
     fn bind(r: *Renderer, t: Texture) void {
         if (r.tex) |cur| if (std.meta.eql(cur, t)) return;
+        // (rows not a multiple of 64 bytes apart: the pass is refused)
+        if (!dr.textureFits(t)) r.bad_texture = true;
         if (r.state_used + BINDING > r.state.cpu.len) {
             r.state_full = true;
             return;
@@ -467,6 +603,45 @@ pub const Renderer = struct {
         r.corners(rc, uv, color);
     }
 
+    /// `g`'s color times the coverage in `t` (an r8 texture, one texel a
+    /// pixel) times `opacity`: a path filled with a gradient.
+    pub fn maskGradient(r: *Renderer, rc: Rect, t: Texture, uv: [4]f32, g: Gradient, opacity: f32, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1])) return;
+        r.use(.mask_grad, b);
+        r.bind(t);
+        // the lines in texture coordinates: a pixel's position is its
+        // coordinate plus where the mask lies
+        const ox = rc[0] - uv[0];
+        const oy = rc[1] - uv[1];
+        const c = [24]f32{
+            g.q1[0], g.q1[1], g.q1[2] + g.q1[0] * ox + g.q1[1] * oy, g.along,
+            g.q2[0], g.q2[1], g.q2[2] + g.q2[0] * ox + g.q2[1] * oy, g.around,
+            1 / g.mid, -g.mid / (1 - g.mid), 1 / (1 - g.mid), opacity,
+            g.a[0], g.a[1], g.a[2], g.a[3],
+            g.b[0] - g.a[0], g.b[1] - g.a[1], g.b[2] - g.a[2], g.b[3] - g.a[3],
+            g.c[0] - g.b[0], g.c[1] - g.b[1], g.c[2] - g.b[2], g.c[3] - g.b[3],
+        };
+        r.cornersWith(rc, uv, &c);
+    }
+
+    /// A soft disc at (cx, cy): `color` (straight, its alpha last) full
+    /// inside `inner`, falling smoothly to nothing at `outer`, dithered.
+    /// (Half a step of 255 under gfx's sum: gfx takes the alpha down to a
+    /// whole step, and this is the middle of what that loses. And the
+    /// blended color is DROP lower, for gfx's blend of a glow.)
+    pub fn glow(r: *Renderer, rc: Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: Color, b: Blend) void {
+        if (!r.in_pass or !(rc[2] > rc[0] and rc[3] > rc[1]) or !(outer > 0)) return;
+        r.use(.glow, b);
+        const span = @max(outer - inner, 1e-6);
+        const c = [16]f32{
+            color[0], color[1], color[2], color[3],
+            -cx, -cy, inner, 1 / span,
+            9.0 / (16.0 * 255.0), (0.5 / 16.0 - 0.5) * 9.0 / 255.0 - 0.5 / 255.0, 3, outer * outer,
+            -DROP, 0, 0, 0,
+        };
+        r.cornersWith(rc, rc, &c);
+    }
+
     /// End the pass and hand it to the GPU. The target's pixels are in
     /// memory once the fence is done (fromDevice them before the CPU reads).
     pub fn submit(r: *Renderer) Error!Fence {
@@ -474,6 +649,7 @@ pub const Renderer = struct {
         r.in_pass = false;
         dr.end(&r.s);
         if (r.state_full) return error.StateFull;
+        if (r.bad_texture) return error.BadStream;
         r.s.check() catch return error.StreamFull;
         r.stats.stream_dwords = @intCast(r.s.len);
         if (r.state_used != 0) r.dev.toDevice(r.state, 0, r.state_used);
@@ -607,13 +783,14 @@ test "an image: copied texel for texel, stretched with the bilinear filter, tint
     defer T.r.deinit();
     const d = T.dev.device();
     // an 8 x 4 texture: red rises with x, green with y, opaque
-    const tex_buf = try d.alloc(8 * 4 * 4);
+    // (rows of 64 bytes: 16 texels a row, the first 8 the picture)
+    const tex_buf = try d.alloc(4 * 64);
     const tw: []u32 = @alignCast(std.mem.bytesAsSlice(u32, tex_buf.cpu));
     for (0..4) |y| for (0..8) |x| {
-        tw[y * 8 + x] = 0xff000000 | (@as(u32, @intCast(x * 32)) << 16) | (@as(u32, @intCast(y * 64)) << 8);
+        tw[y * 16 + x] = 0xff000000 | (@as(u32, @intCast(x * 32)) << 16) | (@as(u32, @intCast(y * 64)) << 8);
     };
-    d.toDevice(tex_buf, 0, 8 * 4 * 4);
-    const nearest = Texture{ .va = tex_buf.va, .width = 8, .height = 4, .pitch = 32, .format = .bgra8, .filter = .nearest };
+    d.toDevice(tex_buf, 0, 4 * 64);
+    const nearest = Texture{ .va = tex_buf.va, .width = 8, .height = 4, .pitch = 64, .format = .bgra8, .filter = .nearest };
     var linear = nearest;
     linear.filter = .linear;
     T.r.begin(t);
@@ -626,7 +803,7 @@ test "an image: copied texel for texel, stretched with the bilinear filter, tint
     T.r.image(.{ 40, 20, 48, 24 }, nearest, .{ 0, 0, 8, 4 }, .{ 0.5, 0.5, 0.5, 0.5 }, .over);
     try T.r.run(1_000_000);
     for (0..4) |y| for (0..8) |x| {
-        try std.testing.expectEqual(tw[y * 8 + x], T.at(@intCast(2 + x), @intCast(1 + y)));
+        try std.testing.expectEqual(tw[y * 16 + x], T.at(@intCast(2 + x), @intCast(1 + y)));
     };
     try std.testing.expectEqual(@as(u32, 0xff000000), T.at(10, 1));
     // stretched: pixel (20 + 2i + 1, 4 + 2j + 1)'s centre is at texel
@@ -644,12 +821,12 @@ test "a mask: coverage times a color, over what is there" {
     defer T.r.deinit();
     const d = T.dev.device();
     // 4 x 2 coverage: 0, 85, 170, 255 in both rows
-    const m_buf = try d.alloc(64);
+    const m_buf = try d.alloc(128);
     for (0..2) |y| for (0..4) |x| {
-        m_buf.cpu[y * 4 + x] = @intCast(x * 85);
+        m_buf.cpu[y * 64 + x] = @intCast(x * 85);
     };
-    d.toDevice(m_buf, 0, 64);
-    const m = Texture{ .va = m_buf.va, .width = 4, .height = 2, .pitch = 4, .format = .r8, .filter = .nearest };
+    d.toDevice(m_buf, 0, 128);
+    const m = Texture{ .va = m_buf.va, .width = 4, .height = 2, .pitch = 64, .format = .r8, .filter = .nearest };
     T.r.begin(t);
     T.r.fill(.{ 0, 0, T.W, T.H }, .{ 0, 0, 1, 1 }, .replace);
     // white text over blue
@@ -815,6 +992,88 @@ test "rounded rectangles: filled, stroked, and an image inside one, by the cover
     try expectNear(0xff000000, T.at(4, 3), 40);
 }
 
+test "a texture in rows the hardware would misread is refused: by the renderer, and by the emulated GPU" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    const buf = try d.alloc(256);
+    // (rows of 32 bytes: the X1-45 read them 64 apart)
+    const narrow = Texture{ .va = buf.va, .width = 8, .height = 4, .pitch = 32, .format = .bgra8, .filter = .nearest };
+    T.r.begin(t);
+    T.r.image(.{ 0, 0, 8, 4 }, narrow, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, .replace);
+    try std.testing.expectError(error.BadStream, T.r.submit());
+    // (past the renderer's own check: the emulated texture unit refuses it)
+    T.dev.log = null;
+    T.r.begin(t);
+    T.r.image(.{ 0, 0, 8, 4 }, narrow, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, .replace);
+    T.r.bad_texture = false;
+    try std.testing.expectError(error.DeviceLost, T.r.run(1_000_000));
+}
+
+test "a mask times a gradient, and a glow: the programs against their own arithmetic at every pixel" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    // a 16 x 8 coverage mask in rows of 64: a ramp across, full in the middle rows
+    const m_buf = try d.alloc(8 * 64);
+    for (0..8) |y| for (0..16) |x| {
+        m_buf.cpu[y * 64 + x] = if (y >= 2 and y < 6) 255 else @intCast(x * 17);
+    };
+    d.toDevice(m_buf, 0, 8 * 64);
+    const m = Texture{ .va = m_buf.va, .width = 16, .height = 8, .pitch = 64, .format = .r8, .filter = .nearest };
+    // along a line from (10, 4) to (26, 12), three stops; around (40, 20), two
+    const dx: f32 = 16;
+    const dy: f32 = 8;
+    const len2 = dx * dx + dy * dy;
+    const line = Gradient{ .q1 = .{ dx / len2, dy / len2, -(10 * dx + 4 * dy) / len2 }, .a = .{ 1, 0, 0, 1 }, .b = .{ 0, 1, 0, 0.5 }, .c = .{ 0, 0, 1, 1 }, .mid = 0.25 };
+    const disc = Gradient{ .q1 = .{ 1.0 / 8.0, 0, -40.0 / 8.0 }, .q2 = .{ 0, 1.0 / 4.0, -20.0 / 4.0 }, .along = 0, .around = 1, .a = .{ 1, 1, 1, 1 }, .b = .{ 0.6, 0.7, 0.8, 0.9 }, .c = .{ 0.2, 0.4, 0.6, 0.8 } };
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, T.W, T.H }, .{ 0, 0, 0, 1 }, .replace);
+    T.r.maskGradient(.{ 10, 4, 26, 12 }, m, .{ 0, 0, 16, 8 }, line, 0.9, .over);
+    T.r.maskGradient(.{ 32, 16, 48, 24 }, m, .{ 0, 0, 16, 8 }, disc, 1, .over);
+    T.r.glow(.{ 44, 0, 64, 16 }, 54.25, 7.5, 3, 8, .{ 1, 0.5, 0.25, 0.8 }, .over);
+    try T.r.run(1_000_000);
+    const px = T.pixels();
+    const bayer = [16]f32{ 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+    for (0..T.H) |y| for (0..T.W) |x| {
+        const fx: f32 = @as(f32, @floatFromInt(x)) + 0.5;
+        const fy: f32 = @as(f32, @floatFromInt(y)) + 0.5;
+        var want: [3]f32 = .{ 0, 0, 0 };
+        const over = struct {
+            fn f(w: *[3]f32, rgb: [3]f32, a: f32) void {
+                for (w, rgb) |*v, s| v.* = s * a + v.* * (1 - a);
+            }
+        }.f;
+        if (x >= 10 and x < 26 and y >= 4 and y < 12) {
+            const c = line.at(fx, fy);
+            const cov: f32 = @as(f32, @floatFromInt(m_buf.cpu[(y - 4) * 64 + (x - 10)])) / 255.0;
+            over(&want, .{ c[0], c[1], c[2] }, c[3] * cov * 0.9);
+        }
+        if (x >= 32 and x < 48 and y >= 16 and y < 24) {
+            const c = disc.at(fx, fy);
+            const cov: f32 = @as(f32, @floatFromInt(m_buf.cpu[(y - 16) * 64 + (x - 32)])) / 255.0;
+            over(&want, .{ c[0], c[1], c[2] }, c[3] * cov);
+        }
+        if (x >= 44 and y < 16) {
+            const ddx = fx - 54.25;
+            const ddy = fy - 7.5;
+            const d2 = ddx * ddx + ddy * ddy;
+            if (d2 < 64) {
+                var tt = std.math.clamp(1 - (@sqrt(d2) - 3) / 5, 0, 1);
+                tt = tt * tt * (3 - 2 * tt);
+                const dither = ((bayer[(y & 3) * 4 + (x & 3)] + 0.5) / 16.0 - 0.5) * 9.0 / 255.0;
+                over(&want, .{ 1, 0.5, 0.25 }, std.math.clamp(tt * 0.8 + dither - 0.5 / 255.0, 0, 1));
+            }
+            for (&want) |*v| v.* = @max(v.* - DROP, 0);
+        }
+        const w32 = 0xff000000 | (@as(u32, @intFromFloat(want[0] * 255 + 0.5)) << 16) | (@as(u32, @intFromFloat(want[1] * 255 + 0.5)) << 8) | @as(u32, @intFromFloat(want[2] * 255 + 0.5));
+        if (!near(w32, px[y * T.W + x], 2)) {
+            std.debug.print("pixel ({d}, {d}): want {x:0>8}, got {x:0>8}\n", .{ x, y, w32, px[y * T.W + x] });
+            return error.TestUnexpectedResult;
+        }
+    };
+}
+
 // ── The self-test: the pipeline on the real GPU ─────────────────────────────
 // What the tests above check on the emulated device, drawn on any Device
 // and compared with the values the arithmetic gives, case by case and each
@@ -896,16 +1155,16 @@ pub fn selfTest(dev: Device, r: *Renderer, asm_work: *ir3_asm.Work, log: *const 
     const BLUE = Color{ 0, 0, 0.5, 1 };
     const blue: u32 = 0xff000080;
     // An 8 x 4 texture (red rises with x, green with y) and, after it, a
-    // 4 x 2 coverage mask (0, 85, 170, 255).
-    const tw: []u32 = @alignCast(std.mem.bytesAsSlice(u32, tex_buf.cpu[0 .. 8 * 4 * 4]));
+    // 4 x 2 coverage mask (0, 85, 170, 255); both in rows of 64 bytes.
+    const tw: []u32 = @alignCast(std.mem.bytesAsSlice(u32, tex_buf.cpu[0 .. 4 * 64]));
     for (0..4) |y| for (0..8) |x| {
-        tw[y * 8 + x] = 0xff000000 | (@as(u32, @intCast(x * 32)) << 16) | (@as(u32, @intCast(y * 64)) << 8);
+        tw[y * 16 + x] = 0xff000000 | (@as(u32, @intCast(x * 32)) << 16) | (@as(u32, @intCast(y * 64)) << 8);
     };
     for (0..2) |y| for (0..4) |x| {
         tex_buf.cpu[256 + y * 64 + x] = @intCast(x * 85);
     };
     dev.toDevice(tex_buf, 0, 4096);
-    const nearest = Texture{ .va = tex_buf.va, .width = 8, .height = 4, .pitch = 32, .format = .bgra8, .filter = .nearest };
+    const nearest = Texture{ .va = tex_buf.va, .width = 8, .height = 4, .pitch = 64, .format = .bgra8, .filter = .nearest };
     var linear = nearest;
     linear.filter = .linear;
     const mask = Texture{ .va = tex_buf.va + 256, .width = 4, .height = 2, .pitch = 64, .format = .r8, .filter = .nearest };
@@ -934,12 +1193,12 @@ pub fn selfTest(dev: Device, r: *Renderer, asm_work: *ir3_asm.Work, log: *const 
     r.begin(t);
     r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
     r.image(.{ 2, 1, 10, 5 }, nearest, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, .replace);
-    c.check("an image, texel for texel", &.{ .{ .x = 2, .y = 1, .want = tw[0] }, .{ .x = 9, .y = 1, .want = tw[7] }, .{ .x = 2, .y = 4, .want = tw[24] }, .{ .x = 9, .y = 4, .want = tw[31] }, .{ .x = 5, .y = 2, .want = tw[11] }, .{ .x = 10, .y = 1, .want = 0xff000000 } });
+    c.check("an image, texel for texel", &.{ .{ .x = 2, .y = 1, .want = tw[0] }, .{ .x = 9, .y = 1, .want = tw[7] }, .{ .x = 2, .y = 4, .want = tw[48] }, .{ .x = 9, .y = 4, .want = tw[55] }, .{ .x = 5, .y = 2, .want = tw[19] }, .{ .x = 10, .y = 1, .want = 0xff000000 } });
 
     r.begin(t);
     r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
     r.image(.{ 20, 4, 36, 12 }, linear, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, .replace);
-    c.check("an image stretched, filtered", &.{ .{ .x = 27, .y = 7, .want = 0xff000000 | (@as(u32, 32 * 3 + 8) << 16) | (@as(u32, 64 + 16) << 8), .tol = 3 }, .{ .x = 20, .y = 4, .want = tw[0], .tol = 3 }, .{ .x = 35, .y = 11, .want = tw[31], .tol = 3 } });
+    c.check("an image stretched, filtered", &.{ .{ .x = 27, .y = 7, .want = 0xff000000 | (@as(u32, 32 * 3 + 8) << 16) | (@as(u32, 64 + 16) << 8), .tol = 3 }, .{ .x = 20, .y = 4, .want = tw[0], .tol = 3 }, .{ .x = 35, .y = 11, .want = tw[55], .tol = 3 } });
 
     r.begin(t);
     r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
@@ -966,11 +1225,11 @@ pub fn selfTest(dev: Device, r: *Renderer, asm_work: *ir3_asm.Work, log: *const 
     r.begin(t);
     r.fill(.{ 0, 0, W, H }, .{ 0, 0, 0, 1 }, .replace);
     r.imageRR(.{ 8, 20, 16, 24 }, nearest, .{ 0, 0, 8, 4 }, .{ 1, 1, 1, 1 }, Shape.of(8, 20, 8, 4, 2), .over);
-    c.check("an image inside a rounded rectangle", &.{ .{ .x = 12, .y = 22, .want = tw[2 * 8 + 4], .tol = 2 }, .{ .x = 11, .y = 21, .want = tw[8 + 3], .tol = 2 }, .{ .x = 8, .y = 20, .want = 0xff000000, .tol = 40 }, .{ .x = 16, .y = 22, .want = 0xff000000 } });
+    c.check("an image inside a rounded rectangle", &.{ .{ .x = 12, .y = 22, .want = tw[2 * 16 + 4], .tol = 2 }, .{ .x = 11, .y = 21, .want = tw[16 + 3], .tol = 2 }, .{ .x = 8, .y = 20, .want = 0xff000000, .tol = 40 }, .{ .x = 16, .y = 22, .want = 0xff000000 } });
 
     // How fast it fills: a 1024 x 1024 target, an image the same size over
     // it once and a half-transparent color 31 times (32 megapixels blended).
-    if (!c.res.lost and c.res.failed == 0) speed: {
+    if (!c.res.lost) speed: {
         const clock = now_us orelse break :speed;
         const N = 1024;
         const big = dev.alloc(N * N * 4) catch break :speed;

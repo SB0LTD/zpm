@@ -687,7 +687,9 @@ pub const cases = [_]Case{
 };
 
 /// The self-test's textures on a device: the 8 x 4 picture at the start
-/// of `buf` (rows of 32 bytes), the mask 256 bytes in (rows of 64).
+/// of `buf`, the mask 256 bytes in, both in rows of 64 bytes (a GPU's
+/// texture unit may not read narrower rows as given: the Adreno X1-45
+/// read rows of 32 as 64).
 pub const CaseTextures = struct {
     buf: Buffer,
 
@@ -695,7 +697,7 @@ pub const CaseTextures = struct {
 
     pub fn fill(buf: Buffer) CaseTextures {
         for (0..4) |y| for (0..8) |x| {
-            std.mem.writeInt(u32, buf.cpu[(y * 8 + x) * 4 ..][0..4], caseTexel(@intCast(x), @intCast(y)), .little);
+            std.mem.writeInt(u32, buf.cpu[y * 64 + x * 4 ..][0..4], caseTexel(@intCast(x), @intCast(y)), .little);
         };
         for (0..2) |y| for (0..4) |x| {
             buf.cpu[256 + y * 64 + x] = caseMask(@intCast(x));
@@ -705,8 +707,8 @@ pub const CaseTextures = struct {
 
     pub fn get(c: CaseTextures, which: CaseTexture) Texture {
         return switch (which) {
-            .nearest => .{ .va = c.buf.va, .width = 8, .height = 4, .pitch = 32, .format = .bgra8, .filter = .nearest },
-            .linear => .{ .va = c.buf.va, .width = 8, .height = 4, .pitch = 32, .format = .bgra8, .filter = .linear },
+            .nearest => .{ .va = c.buf.va, .width = 8, .height = 4, .pitch = 64, .format = .bgra8, .filter = .nearest },
+            .linear => .{ .va = c.buf.va, .width = 8, .height = 4, .pitch = 64, .format = .bgra8, .filter = .linear },
             .mask => .{ .va = c.buf.va + 256, .width = 4, .height = 2, .pitch = 64, .format = .r8, .filter = .nearest },
         };
     }

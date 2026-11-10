@@ -312,7 +312,10 @@ pub const Target = struct {
 pub const Filter = enum(u8) { nearest = 0, linear = 1 };
 
 /// A texture a fragment program samples, with unnormalized coordinates
-/// (texels), clamped to its edge; one level, linear layout.
+/// (texels), clamped to its edge; one level, linear layout. Its rows are a
+/// multiple of 64 bytes apart and it starts on one: the X1-45 read rows 32
+/// bytes apart as 64 apart (the Surface, 2026-11-10: every texel below the
+/// first row came from the wrong place).
 pub const Texture = struct {
     va: u64,
     width: u32,
@@ -324,6 +327,11 @@ pub const Texture = struct {
     /// whose fourth byte is not kept).
     no_alpha: bool = false,
 };
+
+/// Whether the hardware reads `t` as described (see Texture).
+pub fn textureFits(t: Texture) bool {
+    return t.pitch != 0 and t.pitch % 64 == 0 and t.va & 63 == 0 and t.width != 0 and t.height != 0;
+}
 
 pub const MAX_TEXTURES = 4;
 /// Dwords of a texture's descriptor and of a sampler's.
