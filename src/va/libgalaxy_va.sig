@@ -210,7 +210,8 @@ fn options() driver.Options {
 
 /// GALAXY_VA_DEBUG (set and not "0": say things on stderr), GALAXY_VA_GOB
 /// ("turing": Turing's GOB layout instead of Blackwell's), GALAXY_VA_PROBE
-/// ("0": no decoder probe at init), from an environment block.
+/// ("0": no decoder probe at init), GALAXY_VA_AV1_BLACKWELL ("1": AV1's
+/// Blackwell extras, av1.State.blackwell), from an environment block.
 pub fn optionsOf(block: []const u8) driver.Options {
     var o: driver.Options = .{};
     var it = std.mem.splitScalar(u8, block, 0);
@@ -224,6 +225,8 @@ pub fn optionsOf(block: []const u8) driver.Options {
             o.gob = if (std.ascii.eqlIgnoreCase(v, "turing")) .turing else .blackwell;
         } else if (std.mem.eql(u8, k, "GALAXY_VA_PROBE")) {
             o.probe = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_AV1_BLACKWELL")) {
+            o.av1_blackwell = v.len != 0 and !std.mem.eql(u8, v, "0");
         }
     }
     return o;

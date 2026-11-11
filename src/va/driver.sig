@@ -44,6 +44,7 @@ const tiling = @import("tiling.sig");
 const node = @import("node.sig");
 const codec = @import("codec.sig");
 const hevc = @import("hevc.sig");
+const av1 = @import("av1.sig");
 
 const Buf = node.Buf;
 
@@ -81,7 +82,7 @@ pub const MIN_SIZE = 16;
 /// far sooner).
 pub const SYNC_NS: i64 = 2_000_000_000;
 
-pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264, HEVC), zpm";
+pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264, HEVC, AV1), zpm";
 
 // Each kind of object's ids: base + index.
 pub const CONFIG_BASE: u32 = 0x100;
@@ -91,17 +92,18 @@ pub const BUFFER_BASE: u32 = 0x1000;
 pub const IMAGE_BASE: u32 = 0x2000;
 const NONE: u16 = 0xffff;
 
-pub const PROFILES = [_]va.Profile{ va.PROFILE_H264_CONSTRAINED_BASELINE, va.PROFILE_H264_MAIN, va.PROFILE_H264_HIGH, hevc.PROFILE };
+pub const PROFILES = [_]va.Profile{ va.PROFILE_H264_CONSTRAINED_BASELINE, va.PROFILE_H264_MAIN, va.PROFILE_H264_HIGH, hevc.PROFILE, av1.PROFILE };
 
 pub fn supported(profile: va.Profile) bool {
     return std.mem.indexOfScalar(va.Profile, &PROFILES, profile) != null;
 }
 
-pub const Codec = enum { h264, hevc };
+pub const Codec = enum { h264, hevc, av1 };
 
 pub fn codecOf(profile: va.Profile) Codec {
     return switch (profile) {
         hevc.PROFILE => .hevc,
+        av1.PROFILE => .av1,
         else => .h264,
     };
 }
@@ -114,6 +116,8 @@ pub const Options = struct {
     /// a do-nothing submission at init, so a GPU without a decoder fails
     /// vaInitialize (and Firefox's probe) instead of the first frame
     probe: bool = true,
+    /// GALAXY_VA_AV1_BLACKWELL: AV1's Blackwell extras (av1.State.blackwell)
+    av1_blackwell: bool = false,
 };
 
 const Config = struct {
@@ -157,6 +161,7 @@ const Context = struct {
     scratch_bytes: usize = 0,
     /// each module's state (only the context's codec's is used)
     hevc: hevc.State = undefined,
+    av1: av1.State = undefined,
     /// the target's VA id (a module's Picture)
     target_id: u32 = 0,
     width_mbs: u32 = 0,
@@ -547,6 +552,7 @@ pub fn Driver(comptime Sys: type) type {
         fn createModuleContext(d: *Self, i: u8, config: u32, kind: Codec, width: u32, height: u32, out: *u32) va.Status {
             const scratch_bytes = switch (kind) {
                 .hevc => hevc.scratchBytes(width, height),
+                .av1 => av1.scratchBytes(width, height),
                 .h264 => unreachable,
             };
             const scratch_off = FRAMES * FRAME_BYTES;
@@ -569,6 +575,10 @@ pub fn Driver(comptime Sys: type) type {
             };
             switch (kind) {
                 .hevc => d.contexts[i].hevc = hevc.State.init(width, height),
+                .av1 => {
+                    d.contexts[i].av1 = av1.State.init(width, height);
+                    d.contexts[i].av1.blackwell = d.opts.av1_blackwell;
+                },
                 .h264 => unreachable,
             }
             out.* = CONTEXT_BASE + @as(u32, i);
@@ -721,6 +731,7 @@ pub fn Driver(comptime Sys: type) type {
             c.frame = f;
             switch (c.codec) {
                 .hevc => hevc.begin(&c.hevc),
+                .av1 => av1.begin(&c.av1),
                 .h264 => {},
             }
             c.have_pic = false;
@@ -756,6 +767,7 @@ pub fn Driver(comptime Sys: type) type {
                 const slot = frameSlot(c, c.frame);
                 return switch (c.codec) {
                     .hevc => hevc.take(&c.hevc, buf, slot),
+                    .av1 => av1.take(&c.av1, buf, slot),
                     .h264 => unreachable,
                 };
             }
@@ -928,6 +940,7 @@ pub fn Driver(comptime Sys: type) type {
             var e: codec.End = undefined;
             const st = switch (c.codec) {
                 .hevc => hevc.end(&c.hevc, slot, scratch, pic, lookup, &e),
+                .av1 => av1.end(&c.av1, slot, scratch, pic, lookup, &e),
                 .h264 => unreachable,
             };
             if (st != va.SUCCESS) {
@@ -958,6 +971,7 @@ pub fn Driver(comptime Sys: type) type {
                 if (w != va.SUCCESS and w != va.ERROR_DECODING_ERROR) return w;
                 switch (c.codec) {
                     .hevc => hevc.after(&c.hevc, scratch),
+                    .av1 => av1.after(&c.av1, scratch),
                     .h264 => unreachable,
                 }
             }
@@ -1245,7 +1259,8 @@ comptime {
     std.debug.assert(STATUS_OFF + 0x100 <= AUX_OFF);
     std.debug.assert(@sizeOf(nvdec.H264Pic) <= codec.PIC_BYTES);
     std.debug.assert(hevc.MAX_PIC_BYTES <= codec.PIC_BYTES and hevc.MAX_AUX_BYTES <= codec.AUX_BYTES);
-    std.debug.assert(nvdec.PUSH_DWORDS <= PUSH_DWORDS_MAX and hevc.PUSH_DWORDS <= PUSH_DWORDS_MAX);
+    std.debug.assert(av1.MAX_PIC_BYTES <= codec.PIC_BYTES and av1.MAX_AUX_BYTES <= codec.AUX_BYTES);
+    std.debug.assert(nvdec.PUSH_DWORDS <= PUSH_DWORDS_MAX and hevc.PUSH_DWORDS <= PUSH_DWORDS_MAX and av1.PUSH_DWORDS <= PUSH_DWORDS_MAX);
 }
 
 /// `n` dwords at byte `off` of mapped GPU memory.

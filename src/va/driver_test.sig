@@ -175,7 +175,7 @@ test "driver: profiles, entrypoints, attributes, and Firefox's probe" {
     var profiles: [8]va.Profile = undefined;
     var n: i32 = 0;
     try testing.expectEqual(va.SUCCESS, d.queryConfigProfiles(&profiles, &n));
-    try testing.expectEqualSlices(va.Profile, &.{ 13, 6, 7, 17 }, profiles[0..@intCast(n)]);
+    try testing.expectEqualSlices(va.Profile, &.{ 13, 6, 7, 17, 32 }, profiles[0..@intCast(n)]);
     // Firefox's vaapitest: each profile's entrypoints, then a config of
     // (profile, VLD) with no attributes
     for (profiles[0..@intCast(n)]) |p| {
@@ -519,5 +519,22 @@ test "driver: HEVC through a fake node: an IDR, then a P picture referencing it"
     try testing.expectEqual(va.SUCCESS, d.syncSurface(surfaces[1], SYNC_NS));
     try expectPicture(&d, surfaces[1], 1);
     try testing.expectEqual(@as(u32, 0), d.errors);
+    try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
+}
+
+test "driver: an AV1 config makes an AV1 context with the module's buffers" {
+    var k = Fake{ .decoder = fakeDecode };
+    var d: TestDriver = .{ .node = .{ .sys = &k } };
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .av1_blackwell = true }));
+    defer d.terminate();
+    var cfg: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createConfig(va.PROFILE_AV1_PROFILE_0, va.ENTRYPOINT_VLD, &.{}, &cfg));
+    var ctx: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createContext(cfg, 1920, 1080, &ctx));
+    const c = &d.contexts[ctx - CONTEXT_BASE];
+    try testing.expectEqual(driver.Codec.av1, c.codec);
+    try testing.expect(c.av1.blackwell);
+    try testing.expectEqual(@import("av1.sig").scratchBytes(1920, 1080), c.scratch_bytes);
+    try testing.expect(c.work.len >= c.scratch_off + c.scratch_bytes);
     try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
 }

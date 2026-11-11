@@ -567,16 +567,16 @@ pub const DriverVTable = extern struct {
 /// The entries libva 2.22's va_openDriver requires set after init (va.c's
 /// CHECK_VTABLE list); without any one, vaInitialize fails.
 pub const REQUIRED = [_][]const u8{
-    "vaTerminate",              "vaQueryConfigProfiles",    "vaQueryConfigEntrypoints", "vaQueryConfigAttributes",
-    "vaCreateConfig",           "vaDestroyConfig",          "vaGetConfigAttributes",    "vaCreateSurfaces",
-    "vaDestroySurfaces",        "vaCreateContext",          "vaDestroyContext",         "vaCreateBuffer",
-    "vaBufferSetNumElements",   "vaMapBuffer",              "vaUnmapBuffer",            "vaDestroyBuffer",
-    "vaBeginPicture",           "vaRenderPicture",          "vaEndPicture",             "vaSyncSurface",
-    "vaQuerySurfaceStatus",     "vaQueryImageFormats",      "vaCreateImage",            "vaDeriveImage",
-    "vaDestroyImage",           "vaSetImagePalette",        "vaGetImage",               "vaPutImage",
-    "vaQuerySubpictureFormats", "vaCreateSubpicture",       "vaDestroySubpicture",      "vaSetSubpictureImage",
-    "vaSetSubpictureChromakey", "vaSetSubpictureGlobalAlpha", "vaAssociateSubpicture",  "vaDeassociateSubpicture",
-    "vaQueryDisplayAttributes", "vaGetDisplayAttributes",   "vaSetDisplayAttributes",
+    "vaTerminate",              "vaQueryConfigProfiles",      "vaQueryConfigEntrypoints", "vaQueryConfigAttributes",
+    "vaCreateConfig",           "vaDestroyConfig",            "vaGetConfigAttributes",    "vaCreateSurfaces",
+    "vaDestroySurfaces",        "vaCreateContext",            "vaDestroyContext",         "vaCreateBuffer",
+    "vaBufferSetNumElements",   "vaMapBuffer",                "vaUnmapBuffer",            "vaDestroyBuffer",
+    "vaBeginPicture",           "vaRenderPicture",            "vaEndPicture",             "vaSyncSurface",
+    "vaQuerySurfaceStatus",     "vaQueryImageFormats",        "vaCreateImage",            "vaDeriveImage",
+    "vaDestroyImage",           "vaSetImagePalette",          "vaGetImage",               "vaPutImage",
+    "vaQuerySubpictureFormats", "vaCreateSubpicture",         "vaDestroySubpicture",      "vaSetSubpictureImage",
+    "vaSetSubpictureChromakey", "vaSetSubpictureGlobalAlpha", "vaAssociateSubpicture",    "vaDeassociateSubpicture",
+    "vaQueryDisplayAttributes", "vaGetDisplayAttributes",     "vaSetDisplayAttributes",
 };
 
 /// struct VADriverContext.
