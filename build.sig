@@ -1279,6 +1279,19 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // ── hlsl: the HLSL compiler (HLSL to DXBC, as d3dcompiler_47 does), its
+    //    own tests, and the oracle comparison with Microsoft's compiler
+    //    (Windows hosts only: skipped elsewhere) ──
+    const test_hlsl = try ctx.addStep("test-hlsl", "Compile HLSL to DXBC: the compiler's tests, and (on Windows) signatures, reflection and pixels against Microsoft's compiler", &noopStep);
+    try ctx.addDependency(test_all, test_hlsl);
+    _ = try addTest(ctx, test_hlsl, "test-hlsl-module", "src/hlsl/hlsl.sig", &.{});
+    _ = try addTest(ctx, test_hlsl, "test-hlsl-oracle", "tests/test_hlsl_oracle.sig", &.{
+        importEntry("hlsl", "src/hlsl/hlsl.sig"),
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     // ── va: Galaxy's VA-API driver for the RTX's video decoder (NVDEC,
     //    H.264), on the host against a fake render node and decoder. Its
     //    files import each other by path: no modules to register. ──
