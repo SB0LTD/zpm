@@ -410,17 +410,59 @@ pub export fn glTexParameterf(target: u32, pname: u32, param: f32) callconv(.c) 
 pub export fn glTexParameteriv(target: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    if (params) |p| glTexParameteri(target, pname, p[0]);
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.texBorder(target, borderNormalized(p));
+        return;
+    }
+    glTexParameteri(target, pname, p[0]);
 }
 pub export fn glTexParameterfv(target: u32, pname: u32, params: ?[*]const f32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    if (params) |p| glTexParameterf(target, pname, p[0]);
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.texBorder(target, borderFloats(p));
+        return;
+    }
+    glTexParameterf(target, pname, p[0]);
+}
+/// glTexParameterIiv and Iuiv (ES 3.2, OES/EXT_texture_border_clamp): the
+/// border color's integers as they are; anything else as glTexParameteriv.
+pub export fn glTexParameterIiv(target: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.texBorder(target, .{ @bitCast(p[0]), @bitCast(p[1]), @bitCast(p[2]), @bitCast(p[3]) });
+        return;
+    }
+    glTexParameteri(target, pname, p[0]);
+}
+pub export fn glTexParameterIuiv(target: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glTexParameterIiv(target, pname, @ptrCast(params));
+}
+pub export fn glTexParameterIivOES(target: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    glTexParameterIiv(target, pname, params);
+}
+pub export fn glTexParameterIuivOES(target: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glTexParameterIiv(target, pname, @ptrCast(params));
+}
+pub export fn glTexParameterIivEXT(target: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    glTexParameterIiv(target, pname, params);
+}
+pub export fn glTexParameterIuivEXT(target: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glTexParameterIiv(target, pname, @ptrCast(params));
 }
 pub export fn glGetTexParameteriv(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
     const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getTexBorder(target) orelse return;
+        if (params) |p| putNormalized(w, p);
+        return;
+    }
     const v = c.getTexParameteri(target, pname) orelse return;
     if (params) |p| p[0] = v;
 }
@@ -428,8 +470,66 @@ pub export fn glGetTexParameterfv(target: u32, pname: u32, params: ?[*]f32) call
     driverEnter();
     defer driverLeave();
     const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getTexBorder(target) orelse return;
+        if (params) |p| putWords(w, @ptrCast(p));
+        return;
+    }
     const v = c.getTexParameteri(target, pname) orelse return;
     if (params) |p| p[0] = @floatFromInt(v);
+}
+pub export fn glGetTexParameterIiv(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getTexBorder(target) orelse return;
+        if (params) |p| putWords(w, @ptrCast(p));
+        return;
+    }
+    const v = c.getTexParameteri(target, pname) orelse return;
+    if (params) |p| p[0] = v;
+}
+pub export fn glGetTexParameterIuiv(target: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, @ptrCast(params));
+}
+pub export fn glGetTexParameterIivOES(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, params);
+}
+pub export fn glGetTexParameterIuivOES(target: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, @ptrCast(params));
+}
+pub export fn glGetTexParameterIivEXT(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, params);
+}
+pub export fn glGetTexParameterIuivEXT(target: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, @ptrCast(params));
+}
+
+/// glTexParameteriv's border color: integers mapped to [-1, 1] (the
+/// signed normalized conversion), as floats' bits.
+fn borderNormalized(p: [*]const i32) [4]u32 {
+    var out: [4]u32 = undefined;
+    for (&out, 0..) |*o, i| {
+        const v: f32 = @floatCast(@max(@as(f64, @floatFromInt(p[i])) / 2147483647.0, -1.0));
+        o.* = @bitCast(v);
+    }
+    return out;
+}
+
+fn borderFloats(p: [*]const f32) [4]u32 {
+    return .{ @bitCast(p[0]), @bitCast(p[1]), @bitCast(p[2]), @bitCast(p[3]) };
+}
+
+fn putNormalized(w: [4]u32, p: [*]i32) void {
+    for (w, 0..) |x, i| {
+        const v: f64 = std.math.clamp(@as(f64, @as(f32, @bitCast(x))), -1.0, 1.0);
+        p[i] = @intFromFloat(@round(v * 2147483647.0));
+    }
+}
+
+fn putWords(w: [4]u32, p: [*]u32) void {
+    for (w, 0..) |x, i| p[i] = x;
 }
 pub export fn glGenerateMipmap(target: u32) callconv(.c) void {
     driverEnter();
@@ -474,17 +574,72 @@ pub export fn glSamplerParameterf(name: u32, pname: u32, param: f32) callconv(.c
 pub export fn glSamplerParameteriv(name: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    if (params) |p| glSamplerParameteri(name, pname, p[0]);
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.samplerBorder(name, borderNormalized(p));
+        return;
+    }
+    glSamplerParameteri(name, pname, p[0]);
 }
 pub export fn glSamplerParameterfv(name: u32, pname: u32, params: ?[*]const f32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    if (params) |p| glSamplerParameterf(name, pname, p[0]);
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.samplerBorder(name, borderFloats(p));
+        return;
+    }
+    glSamplerParameterf(name, pname, p[0]);
+}
+pub export fn glSamplerParameterIiv(name: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.samplerBorder(name, .{ @bitCast(p[0]), @bitCast(p[1]), @bitCast(p[2]), @bitCast(p[3]) });
+        return;
+    }
+    glSamplerParameteri(name, pname, p[0]);
+}
+pub export fn glSamplerParameterIuiv(name: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glSamplerParameterIiv(name, pname, @ptrCast(params));
+}
+pub export fn glSamplerParameterIivOES(name: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    glSamplerParameterIiv(name, pname, params);
+}
+pub export fn glSamplerParameterIuivOES(name: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glSamplerParameterIiv(name, pname, @ptrCast(params));
+}
+pub export fn glGetSamplerParameterIiv(name: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getSamplerBorder(name) orelse return;
+        if (params) |p| putWords(w, @ptrCast(p));
+        return;
+    }
+    const v = c.getSamplerParameteri(name, pname) orelse return;
+    if (params) |p| p[0] = v;
+}
+pub export fn glGetSamplerParameterIuiv(name: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetSamplerParameterIiv(name, pname, @ptrCast(params));
+}
+pub export fn glGetSamplerParameterIivOES(name: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    glGetSamplerParameterIiv(name, pname, params);
+}
+pub export fn glGetSamplerParameterIuivOES(name: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetSamplerParameterIiv(name, pname, @ptrCast(params));
 }
 pub export fn glGetSamplerParameteriv(name: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
     const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getSamplerBorder(name) orelse return;
+        if (params) |p| putNormalized(w, p);
+        return;
+    }
     const v = c.getSamplerParameteri(name, pname) orelse return;
     if (params) |p| p[0] = v;
 }
@@ -492,6 +647,11 @@ pub export fn glGetSamplerParameterfv(name: u32, pname: u32, params: ?[*]f32) ca
     driverEnter();
     defer driverLeave();
     const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getSamplerBorder(name) orelse return;
+        if (params) |p| putWords(w, @ptrCast(p));
+        return;
+    }
     const v = c.getSamplerParameteri(name, pname) orelse return;
     if (params) |p| p[0] = @floatFromInt(v);
 }
@@ -829,6 +989,13 @@ pub export fn glFlushMappedBufferRange(target: u32, offset: isize, length: isize
     defer driverLeave();
     if (cur()) |c| c.flushMappedBufferRange(target, offset, length);
 }
+// (GL_EXT_map_buffer_range's names: ES 3.0's calls)
+pub export fn glMapBufferRangeEXT(target: u32, offset: isize, length: isize, access: u32) callconv(.c) ?*anyopaque {
+    return glMapBufferRange(target, offset, length, access);
+}
+pub export fn glFlushMappedBufferRangeEXT(target: u32, offset: isize, length: isize) callconv(.c) void {
+    glFlushMappedBufferRange(target, offset, length);
+}
 pub export fn glGetBufferPointerv(target: u32, pname: u32, params: ?*?*anyopaque) callconv(.c) void {
     driverEnter();
     defer driverLeave();
@@ -1034,6 +1201,19 @@ pub export fn glIsVertexArray(name: u32) callconv(.c) u8 {
     defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(c.isVertexArray(name));
+}
+// (GL_OES_vertex_array_object's names: ES 3.0's calls)
+pub export fn glGenVertexArraysOES(n: i32, out: ?[*]u32) callconv(.c) void {
+    glGenVertexArrays(n, out);
+}
+pub export fn glDeleteVertexArraysOES(n: i32, names: ?[*]const u32) callconv(.c) void {
+    glDeleteVertexArrays(n, names);
+}
+pub export fn glBindVertexArrayOES(name: u32) callconv(.c) void {
+    glBindVertexArray(name);
+}
+pub export fn glIsVertexArrayOES(name: u32) callconv(.c) u8 {
+    return glIsVertexArray(name);
 }
 pub export fn glVertexAttribPointer(index: u32, size: i32, ty: u32, normalized: u8, stride: i32, pointer: ?*const anyopaque) callconv(.c) void {
     driverEnter();
@@ -2170,6 +2350,146 @@ test "libgles: a GLSL ES 1.00 program, as WebGL 1 writes them" {
     glDeleteShader(vs);
     glDeleteShader(fs);
     try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+var border_work: [8 << 20]u8 align(64) = undefined;
+var border_pool: [2 << 20]u8 align(64) = undefined;
+
+fn nearPx(want: [4]u8, got: [4]u8) bool {
+    for (want, got) |x, y| {
+        if (@abs(@as(i32, x) - y) > 1) return false;
+    }
+    return true;
+}
+
+/// The 8 x 8 window's pixel (x, y) from the bottom, RGBA.
+fn borderPx(x: i32, y: i32) [4]u8 {
+    var px: [4]u8 = undefined;
+    glReadPixels(x, y, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &px);
+    return px;
+}
+
+test "libgles: OES_texture_border_clamp: past the texture, its border color (glamor's RepeatNone)" {
+    t_eng.init(.{ .pool = &border_pool, .cpu_work = &border_work });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    var win = t_eng.newImage(8, 8, .rgba8).?;
+    defer t_eng.freeImage(&win);
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    t_ctx.setSurface(&win, &win, null);
+    const ext = std.mem.span(glGetString(g.EXTENSIONS).?);
+    for ([_][]const u8{ "GL_OES_texture_border_clamp", "GL_OES_vertex_array_object", "GL_EXT_map_buffer_range", "GL_EXT_texture_format_BGRA8888" }) |e| {
+        try std.testing.expect(std.mem.indexOf(u8, ext, e) != null);
+    }
+    // (the quad's texture coordinates run from -0.5 to 1.5: a texel of
+    // the 2 x 2 texture is 2 x 2 pixels, the texture the middle 4 x 4)
+    const vs = newShader(g.VERTEX_SHADER,
+        \\#version 300 es
+        \\in vec2 aPos;
+        \\out vec2 vUv;
+        \\void main() { vUv = aPos * 2.0 - 0.5; gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0); }
+    );
+    const fs = newShader(g.FRAGMENT_SHADER,
+        \\#version 300 es
+        \\precision mediump float;
+        \\uniform sampler2D uTex;
+        \\in vec2 vUv;
+        \\out vec4 o;
+        \\void main() { o = texture(uTex, vUv); }
+    );
+    try shaderOk(vs);
+    try shaderOk(fs);
+    const p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glBindAttribLocation(p, 0, "aPos");
+    glLinkProgram(p);
+    try linkOk(p);
+    glUseProgram(p);
+    glUniform1i(glGetUniformLocation(p, "uTex"), 0);
+    var vao: [1]u32 = undefined;
+    glGenVertexArraysOES(1, &vao);
+    glBindVertexArrayOES(vao[0]);
+    try std.testing.expectEqual(g.TRUE, glIsVertexArrayOES(vao[0]));
+    var buf: [1]u32 = undefined;
+    glGenBuffers(1, &buf);
+    glBindBuffer(g.ARRAY_BUFFER, buf[0]);
+    const quad = [_]f32{ 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
+    glBufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, g.STATIC_DRAW);
+    glVertexAttribPointer(0, 2, g.FLOAT, 0, 8, null);
+    glEnableVertexAttribArray(0);
+
+    var tex: [1]u32 = undefined;
+    glGenTextures(1, &tex);
+    glBindTexture(g.TEXTURE_2D, tex[0]);
+    const white = [_]u8{255} ** 16;
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA), 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, &white);
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, @intCast(g.NEAREST));
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, @intCast(g.NEAREST));
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, @intCast(g.CLAMP_TO_BORDER));
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_T, @intCast(g.CLAMP_TO_BORDER));
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    // the default border: transparent black
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, borderPx(0, 0));
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, borderPx(3, 4));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, borderPx(7, 5));
+    // a border color, read back as given
+    const blue = [_]f32{ 0, 0, 1, 0.5 };
+    glTexParameterfv(g.TEXTURE_2D, g.TEXTURE_BORDER_COLOR, &blue);
+    var back: [4]f32 = undefined;
+    glGetTexParameterfv(g.TEXTURE_2D, g.TEXTURE_BORDER_COLOR, &back);
+    try std.testing.expectEqualSlices(f32, &blue, &back);
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expect(nearPx(.{ 0, 0, 255, 128 }, borderPx(0, 0)));
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, borderPx(4, 3));
+    // S clamped to the edge, T to the border: left and right are the
+    // texture's edge, top and bottom the border
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, @intCast(g.CLAMP_TO_EDGE));
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, borderPx(0, 4));
+    try std.testing.expect(nearPx(.{ 0, 0, 255, 128 }, borderPx(4, 0)));
+    // bilinear: the edge texel blended with the border
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, @intCast(g.CLAMP_TO_BORDER));
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, @intCast(g.LINEAR));
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    const edge = borderPx(2, 4);
+    try std.testing.expect(edge[0] > 0 and edge[0] < 255 and edge[2] == 255);
+    // a BGRA texture: the border is still R, G, B, A
+    const bgra = [_]u8{ 0, 255, 0, 255 } ** 4;
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.BGRA_EXT), 2, 2, 0, g.BGRA_EXT, g.UNSIGNED_BYTE, &bgra);
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, @intCast(g.NEAREST));
+    const red = [_]i32{ 2147483647, 0, 0, 2147483647 };
+    glTexParameteriv(g.TEXTURE_2D, g.TEXTURE_BORDER_COLOR, &red);
+    var ired: [4]i32 = undefined;
+    glGetTexParameteriv(g.TEXTURE_2D, g.TEXTURE_BORDER_COLOR, &ired);
+    try std.testing.expectEqualSlices(i32, &red, &ired);
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, borderPx(0, 0));
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, borderPx(4, 4));
+    // a sampler object's border over the texture's
+    var smp: [1]u32 = undefined;
+    glGenSamplers(1, &smp);
+    glSamplerParameteri(smp[0], g.TEXTURE_MIN_FILTER, @intCast(g.NEAREST));
+    glSamplerParameteri(smp[0], g.TEXTURE_MAG_FILTER, @intCast(g.NEAREST));
+    glSamplerParameteri(smp[0], g.TEXTURE_WRAP_S, @intCast(g.CLAMP_TO_BORDER));
+    glSamplerParameteri(smp[0], g.TEXTURE_WRAP_T, @intCast(g.CLAMP_TO_BORDER));
+    const grey = [_]f32{ 0.5, 0.5, 0.5, 1 };
+    glSamplerParameterfv(smp[0], g.TEXTURE_BORDER_COLOR, &grey);
+    glBindSampler(0, smp[0]);
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expect(nearPx(.{ 128, 128, 128, 255 }, borderPx(7, 7)));
+    glBindSampler(0, 0);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    glDeleteSamplers(1, &smp);
+    glDeleteTextures(1, &tex);
+    glDeleteBuffers(1, &buf);
+    glDeleteVertexArraysOES(1, &vao);
+    glDeleteProgram(p);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
 }
 
 test "libgles: texture formats and sampler objects through the C entry points" {

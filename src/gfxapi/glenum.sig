@@ -172,6 +172,9 @@ pub const LINEAR_MIPMAP_LINEAR: u32 = 0x2703;
 pub const REPEAT: u32 = 0x2901;
 pub const CLAMP_TO_EDGE: u32 = 0x812F;
 pub const MIRRORED_REPEAT: u32 = 0x8370;
+/// OES_texture_border_clamp's
+pub const CLAMP_TO_BORDER: u32 = 0x812D;
+pub const TEXTURE_BORDER_COLOR: u32 = 0x1004;
 
 // draws
 pub const POINTS: u32 = 0x0000;
