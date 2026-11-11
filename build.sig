@@ -1263,6 +1263,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // The VA driver's GPU conversion for CPU readers (a KIR kernel over
+    // gfxapi's blocklinear address math), on EmuDevice and the emulated RTX.
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-va-convert", "src/va/gpu_convert.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     _ = try addTest(ctx, test_gfxapi, "test-gfxapi-egl", "tests/test_gfxapi_egl.sig", &.{
         importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
         importEntry("va_tiling", "src/va/tiling.sig"),

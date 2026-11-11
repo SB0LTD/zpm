@@ -50,7 +50,14 @@
 //! Build (x86-64 Linux, from the zpm root):
 //!   sig build-lib -dynamic -target x86_64-linux-none -OReleaseSafe -fPIC
 //!     -fno-stack-protector -fno-unwind-tables -fstrip
-//!     --name galaxy_drv_video src/va/libgalaxy_va.sig
+//!     --name galaxy_drv_video
+//!     --dep gpu --dep gfxapi -Mroot=src/va/libgalaxy_va.sig
+//!     --dep gpu --dep adreno --dep nvidia -Mgfxapi=src/gfxapi/gfxapi.sig
+//!     --dep nvidia --dep adreno --dep amdgpu -Mgpu=src/gpu/gpu.sig
+//!     -Madreno=src/adreno/adreno.sig -Mnvidia=src/nvidia/nvidia.sig
+//!     -Mamdgpu=src/amdgpu/amdgpu.sig
+//!   (gpu and gfxapi: gpu_convert.sig, the RTX converting a picture for a
+//!   CPU reader; the tests run without them, converting on the CPU)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -75,7 +82,11 @@ fn stop(msg: []const u8, ra: ?usize) noreturn {
 
 // ── The displays ────────────────────────────────────────────────────────────
 
-const D = driver.Driver(node.Linux);
+/// Pictures a CPU reader asks for are converted on the RTX (gpu_convert:
+/// a KIR kernel; the build wires the `gpu` and `gfxapi` modules); this
+/// file's tests convert on the CPU (convert.Cpu), without those modules.
+const Conv = if (builtin.is_test) @import("convert.sig").Cpu else @import("gpu_convert.sig").Gpu(@import("gfxapi").node.Linux);
+const D = driver.DriverWith(node.Linux, Conv);
 
 /// A spin lock that yields: each call holds its display's for its length
 /// (a sync, for the decode's few milliseconds).
