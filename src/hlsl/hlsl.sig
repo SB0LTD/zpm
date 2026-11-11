@@ -497,12 +497,15 @@ pub const Compiler = struct {
                 }
             }
         }
-        // constant buffers: $Globals first, then as declared
-        for (g.cbs[0..g.ncbs]) |b| {
-            if (!b.used or r.nbinds >= container.MAX_R) continue;
-            const name = if (b.sym == 0) "$Globals" else c.ast.symName(b.sym);
-            r.binds[r.nbinds] = .{ .name = name, .type = if (b.tbuffer) 1 else 0, .bind = b.slot, .flags = if (b.userpacked) 1 else 0 };
-            r.nbinds += 1;
+        // constant buffers, by slot
+        var cslot: u32 = 0;
+        while (cslot < 16) : (cslot += 1) {
+            for (g.cbs[0..g.ncbs]) |b| {
+                if (b.slot != cslot or !b.used or r.nbinds >= container.MAX_R) continue;
+                const name = if (b.sym == 0) "$Globals" else c.ast.symName(b.sym);
+                r.binds[r.nbinds] = .{ .name = name, .type = if (b.tbuffer) 1 else 0, .bind = b.slot, .flags = if (b.userpacked) 1 else 0 };
+                r.nbinds += 1;
+            }
         }
         // (bindings in fxc's order: by type, then register)
         for (g.cbs[0..g.ncbs], 0..) |b, bi| {

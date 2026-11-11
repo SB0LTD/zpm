@@ -257,10 +257,6 @@ fn resources(D: *anyopaque, C: *anyopaque, blob: []const u8, srv_at: usize, smp_
     if (!r.read(rdef)) return;
     var srvs: [16]?*anyopaque = [_]?*anyopaque{null} ** 16;
     var smps: [16]?*anyopaque = [_]?*anyopaque{null} ** 16;
-    var cmp_any = false;
-    for (r.binds[0..r.nbinds]) |b| {
-        if (b.type == 3 and b.flags & 2 != 0) cmp_any = true;
-    }
     for (r.binds[0..r.nbinds]) |b| {
         var k: u32 = 0;
         while (k < b.count) : (k += 1) {
@@ -275,7 +271,7 @@ fn resources(D: *anyopaque, C: *anyopaque, blob: []const u8, srv_at: usize, smp_
                     nobj.* += 1;
                 }
             } else if (b.type == 2) {
-                srvs[slot] = try texture(D, b, cmp_any, objs, nobj);
+                srvs[slot] = try texture(D, b, isDepth(b), objs, nobj);
             }
         }
     }
@@ -285,10 +281,20 @@ fn resources(D: *anyopaque, C: *anyopaque, blob: []const u8, srv_at: usize, smp_
 
 /// An 8x8 texture of the binding's dimension (a cube's 6 faces, an
 /// array's 2 layers), every texel different; R32F for a depth compare.
+/// A texture sampled with a comparison sampler: ANGLE names them
+/// textures*_comparison (and so does the corpus).
+pub fn isDepth(b: ct.RBind) bool {
+    return std.mem.indexOf(u8, b.name, "comparison") != null;
+}
+
+const Tex3DDesc = extern struct { Width: u32, Height: u32, Depth: u32, MipLevels: u32, Format: u32, Usage: u32, BindFlags: u32, CPUAccessFlags: u32, MiscFlags: u32 };
+const CreateTexture3D = 6;
+
 fn texture(D: *anyopaque, b: ct.RBind, depth: bool, objs: *[128]?*anyopaque, nobj: *usize) error{Resource}!?*anyopaque {
     const cube = b.dim == 9;
     const array = b.dim == 5;
-    const layers: u32 = if (cube) 6 else if (array) 2 else 1;
+    const volume = b.dim == 8;
+    const layers: u32 = if (cube) 6 else if (array or volume) 2 else 1;
     const fmt: u32 = if (depth) FMT_R32F else switch (b.ret) {
         3 => FMT_RGBA32I,
         4 => FMT_RGBA32U,
@@ -320,15 +326,26 @@ fn texture(D: *anyopaque, b: ct.RBind, depth: bool, objs: *[128]?*anyopaque, nob
         }
         inits[l] = .{ .pSysMem = &S.texels[l], .SysMemPitch = 8 * bpp, .SysMemSlicePitch = 0 };
     }
-    const td = Tex2DDesc{ .Width = 8, .Height = 8, .MipLevels = 1, .ArraySize = layers, .Format = fmt, .SampleCount = 1, .SampleQuality = 0, .Usage = 0, .BindFlags = 8, .CPUAccessFlags = 0, .MiscFlags = if (cube) 4 else 0 };
     var tex: ?*anyopaque = null;
-    if (call(HRESULT, D, CreateTexture2D, .{ &td, &inits, &tex }) < 0) return error.Resource;
+    if (volume) {
+        // (one 8x8x2 volume: its slices one after the other)
+        const S3 = struct {
+            var slab: [2 * 8 * 8 * 16]u8 = undefined;
+        };
+        for (0..2) |l| @memcpy(S3.slab[l * 64 * bpp ..][0 .. 64 * bpp], S.texels[l][0 .. 64 * bpp]);
+        const t3 = Tex3DDesc{ .Width = 8, .Height = 8, .Depth = 2, .MipLevels = 1, .Format = fmt, .Usage = 0, .BindFlags = 8, .CPUAccessFlags = 0, .MiscFlags = 0 };
+        const init3 = SubresourceData{ .pSysMem = &S3.slab, .SysMemPitch = 8 * bpp, .SysMemSlicePitch = 64 * bpp };
+        if (call(HRESULT, D, CreateTexture3D, .{ &t3, &init3, &tex }) < 0) return error.Resource;
+    } else {
+        const td = Tex2DDesc{ .Width = 8, .Height = 8, .MipLevels = 1, .ArraySize = layers, .Format = fmt, .SampleCount = 1, .SampleQuality = 0, .Usage = 0, .BindFlags = 8, .CPUAccessFlags = 0, .MiscFlags = if (cube) 4 else 0 };
+        if (call(HRESULT, D, CreateTexture2D, .{ &td, &inits, &tex }) < 0) return error.Resource;
+    }
     if (nobj.* < objs.len) {
         objs[nobj.*] = tex;
         nobj.* += 1;
     }
     // (the view's dimension as the shader declares it: a cube, an array, 2D)
-    const vd = SrvDesc{ .Format = fmt, .ViewDimension = if (cube) 9 else if (array) 5 else 4, .a = 0, .b = 1, .c = 0, .d = layers };
+    const vd = SrvDesc{ .Format = fmt, .ViewDimension = if (cube) 9 else if (array) 5 else if (volume) 8 else 4, .a = 0, .b = 1, .c = 0, .d = layers };
     var srv: ?*anyopaque = null;
     if (call(HRESULT, D, CreateShaderResourceView, .{ tex.?, &vd, &srv }) < 0) return error.Resource;
     if (nobj.* < objs.len) {

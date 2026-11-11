@@ -65,6 +65,37 @@ const corpus = [_]Case{
     .{ .name = "ps_texture_array", .src = @embedFile("hlsl/ps_texture_array.hlsl") },
     .{ .name = "vs_webgl2", .src = @embedFile("hlsl/vs_webgl2.hlsl") },
     .{ .name = "ps_while_do", .src = @embedFile("hlsl/ps_while_do.hlsl") },
+    // ANGLE's own output (Chromium's ANGLE, D3D11 renderer, WEBGL_debug_shaders)
+    .{ .name = "ps_angle_cube_env", .src = @embedFile("hlsl/ps_angle_cube_env.hlsl") },
+    .{ .name = "ps_angle_es3_3d_uint", .src = @embedFile("hlsl/ps_angle_es3_3d_uint.hlsl") },
+    .{ .name = "ps_angle_es3_array_shadow", .src = @embedFile("hlsl/ps_angle_es3_array_shadow.hlsl") },
+    .{ .name = "ps_angle_es3_ints_fetch", .src = @embedFile("hlsl/ps_angle_es3_ints_fetch.hlsl") },
+    .{ .name = "ps_angle_es3_lod_grad", .src = @embedFile("hlsl/ps_angle_es3_lod_grad.hlsl") },
+    .{ .name = "ps_angle_es3_mrt", .src = @embedFile("hlsl/ps_angle_es3_mrt.hlsl") },
+    .{ .name = "ps_angle_es3_switch_flat", .src = @embedFile("hlsl/ps_angle_es3_switch_flat.hlsl") },
+    .{ .name = "ps_angle_es3_ubo_matrix", .src = @embedFile("hlsl/ps_angle_es3_ubo_matrix.hlsl") },
+    .{ .name = "ps_angle_fragcoord_facing", .src = @embedFile("hlsl/ps_angle_fragcoord_facing.hlsl") },
+    .{ .name = "ps_angle_functions_out", .src = @embedFile("hlsl/ps_angle_functions_out.hlsl") },
+    .{ .name = "ps_angle_lighting", .src = @embedFile("hlsl/ps_angle_lighting.hlsl") },
+    .{ .name = "ps_angle_math_builtins", .src = @embedFile("hlsl/ps_angle_math_builtins.hlsl") },
+    .{ .name = "ps_angle_points", .src = @embedFile("hlsl/ps_angle_points.hlsl") },
+    .{ .name = "ps_angle_structs", .src = @embedFile("hlsl/ps_angle_structs.hlsl") },
+    .{ .name = "ps_angle_textured", .src = @embedFile("hlsl/ps_angle_textured.hlsl") },
+    .{ .name = "vs_angle_cube_env", .src = @embedFile("hlsl/vs_angle_cube_env.hlsl") },
+    .{ .name = "vs_angle_es3_3d_uint", .src = @embedFile("hlsl/vs_angle_es3_3d_uint.hlsl") },
+    .{ .name = "vs_angle_es3_array_shadow", .src = @embedFile("hlsl/vs_angle_es3_array_shadow.hlsl") },
+    .{ .name = "vs_angle_es3_ints_fetch", .src = @embedFile("hlsl/vs_angle_es3_ints_fetch.hlsl") },
+    .{ .name = "vs_angle_es3_lod_grad", .src = @embedFile("hlsl/vs_angle_es3_lod_grad.hlsl") },
+    .{ .name = "vs_angle_es3_mrt", .src = @embedFile("hlsl/vs_angle_es3_mrt.hlsl") },
+    .{ .name = "vs_angle_es3_switch_flat", .src = @embedFile("hlsl/vs_angle_es3_switch_flat.hlsl") },
+    .{ .name = "vs_angle_es3_ubo_matrix", .src = @embedFile("hlsl/vs_angle_es3_ubo_matrix.hlsl") },
+    .{ .name = "vs_angle_fragcoord_facing", .src = @embedFile("hlsl/vs_angle_fragcoord_facing.hlsl") },
+    .{ .name = "vs_angle_functions_out", .src = @embedFile("hlsl/vs_angle_functions_out.hlsl") },
+    .{ .name = "vs_angle_lighting", .src = @embedFile("hlsl/vs_angle_lighting.hlsl") },
+    .{ .name = "vs_angle_math_builtins", .src = @embedFile("hlsl/vs_angle_math_builtins.hlsl") },
+    .{ .name = "vs_angle_points", .src = @embedFile("hlsl/vs_angle_points.hlsl") },
+    .{ .name = "vs_angle_structs", .src = @embedFile("hlsl/vs_angle_structs.hlsl") },
+    .{ .name = "vs_angle_textured", .src = @embedFile("hlsl/vs_angle_textured.hlsl") },
 };
 
 // ── Microsoft's compiler (Windows only) ────────────────────────────────────
@@ -488,6 +519,21 @@ var tex_ready = false;
 
 var tex_arr: engine.Image = undefined;
 var tex_depth: engine.Image = undefined;
+var tex_int: engine.Image = undefined;
+var tex_int_vol: engine.Image = undefined;
+
+/// An 8x8 integer image of `layers` layers: texel (x, y) of layer l is
+/// x + 8y + c + l in channel c (as WARP's).
+fn intLayers(e: *engine.Engine, layers: u32, fmt: engine.Format) engine.Image {
+    var img = e.newImage(8, 8 * layers, fmt).?;
+    var words: [8 * 8 * 2 * 4]u32 = undefined;
+    for (0..64 * layers) |i| {
+        for (0..4) |c| words[i * 4 + c] = @intCast((i % 64) % 8 + ((i % 64) / 8) * 8 + c + i / 64);
+    }
+    e.write(&img, 0, 0, 8, 8 * layers, std.mem.sliceAsBytes(words[0 .. 64 * layers * 4]), 8 * 16, fmt);
+    img.height = 8;
+    return img;
+}
 var tex_cube: engine.Image = undefined;
 var tex_imgs: [NTEX]*engine.Image = undefined;
 
@@ -521,22 +567,24 @@ fn testTextures(uni: []u32, r: *const ct.Reflection) *const [NTEX]*engine.Image 
         tex_arr = layered(e, 2);
         tex_cube = layered(e, 6);
         // (a depth map: R32F, x * 32 / 255 across, as WARP's)
+        tex_int = intLayers(e, 1, .rgba32ui);
+        tex_int_vol = intLayers(e, 2, .rgba32ui);
         tex_depth = e.newImage(8, 8, .r32f).?;
         var depths: [64]f32 = undefined;
         for (&depths, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i % 8) * 32)) / 255.0;
         e.write(&tex_depth, 0, 0, 8, 8, std.mem.sliceAsBytes(&depths), 32, .r32f);
         tex_ready = true;
     }
-    var cmp = false;
-    for (r.binds[0..r.nbinds]) |b| {
-        if (b.type == 3 and b.flags & 2 != 0) cmp = true;
-    }
     for (0..NTEX) |k| {
-        var st = texture.State{ .img = if (cmp) &tex_depth else &tex_img, .compare = if (cmp) 3 else 0 };
+        var st = texture.State{ .img = &tex_img };
         for (r.binds[0..r.nbinds]) |b| {
             if (b.type != 2 or k < b.bind or k >= b.bind + b.count) continue;
-            if (b.dim == 5) st = .{ .img = &tex_arr, .layers = 2, .compare = st.compare };
-            if (b.dim == 9) st = .{ .img = &tex_cube, .layers = 6, .compare = st.compare };
+            const int = b.ret == 3 or b.ret == 4;
+            if (warp.isDepth(b)) st = .{ .img = &tex_depth, .compare = 3 };
+            if (b.dim == 5) st = .{ .img = &tex_arr, .layers = 2 };
+            if (b.dim == 9) st = .{ .img = &tex_cube, .layers = 6 };
+            if (b.dim == 8) st = .{ .img = if (int) &tex_int_vol else &tex_arr, .layers = 2 };
+            if (int and b.dim != 8) st = .{ .img = &tex_int };
         }
         tex_imgs[k] = st.img.?;
         var dw: [texture.DESC_WORDS]u32 = undefined;
