@@ -6,9 +6,11 @@
 //! parameters, so the slice headers the engine writes agree with the
 //! parameter sets in the stream.
 //!
-//! Profiles: Constrained Baseline (CAVLC, no 8x8 transform), Main, High;
-//! 4:2:0 8-bit, progressive frames, pic_order_cnt_type 0 or 2, P pictures
-//! with one reference (the driver's EncMaxRefFrames).
+//! Profiles: Constrained Baseline (CAVLC, no 8x8 transform, no B), Main,
+//! High; 4:2:0 8-bit, progressive frames, pic_order_cnt_type 0 or 2; P
+//! pictures with up to MAX_L0 references, B pictures (referenced or not)
+//! with up to MAX_L0 before and MAX_L1 after (EncMaxRefFrames), their
+//! direct-mode scale factors (8.4.1.2.3) given to the engine.
 //!
 //! Pure: no calls, no state.
 
@@ -18,6 +20,7 @@ const ve = @import("vaapi_enc.sig");
 const nvenc = @import("nvenc.sig");
 const bits = @import("bits.sig");
 const tiling = @import("tiling.sig");
+const enc_rc = @import("enc_rc.sig");
 
 const H = nvenc.H264;
 
@@ -25,6 +28,15 @@ pub const Seq = ve.EncSequenceParameterBufferH264;
 pub const Pic = ve.EncPictureParameterBufferH264;
 
 pub const PROFILES = [_]va.Profile{ va.PROFILE_H264_CONSTRAINED_BASELINE, va.PROFILE_H264_MAIN, va.PROFILE_H264_HIGH };
+
+/// The references a picture's lists may hold: the engine's lists have 8
+/// entries each; NVIDIA's own driver offers up to 4 in L0 and 1 in L1
+/// for these generations' encoders, and so does this one (ASSUMED the
+/// firmware's limits; only the hardware says more).
+pub const MAX_L0 = 4;
+pub const MAX_L1 = 1;
+/// The list entries a slice carries here.
+pub const LIST = 4;
 
 /// profile_idc for a VA profile.
 pub fn profileIdc(p: va.Profile) u8 {
@@ -52,8 +64,10 @@ pub const Slice = struct {
     deblock_idc: u8 = 0,
     alpha: i8 = 0,
     beta: i8 = 0,
-    /// RefPicList0's surfaces (VA ids; INVALID_ID: none)
-    ref0: [4]u32 = [_]u32{va.INVALID_ID} ** 4,
+    direct_spatial: bool = true,
+    /// RefPicList0's and RefPicList1's surfaces (VA ids; INVALID_ID: none)
+    ref0: [LIST]u32 = [_]u32{va.INVALID_ID} ** LIST,
+    ref1: [LIST]u32 = [_]u32{va.INVALID_ID} ** LIST,
 
     pub fn of(s: *const ve.EncSliceParameterBufferH264) Slice {
         var r = Slice{
@@ -71,12 +85,22 @@ pub const Slice = struct {
             .deblock_idc = s.disable_deblocking_filter_idc,
             .alpha = s.slice_alpha_c0_offset_div2,
             .beta = s.slice_beta_offset_div2,
+            .direct_spatial = s.direct_spatial_mv_pred_flag != 0,
         };
-        for (&r.ref0, 0..) |*id, k| {
+        for (&r.ref0, &r.ref1, 0..) |*id0, *id1, k| {
             const p = s.RefPicList0[k];
-            id.* = if (p.flags & va.PICTURE_H264_INVALID != 0) va.INVALID_ID else p.picture_id;
+            id0.* = if (p.flags & va.PICTURE_H264_INVALID != 0) va.INVALID_ID else p.picture_id;
+            const q = s.RefPicList1[k];
+            id1.* = if (q.flags & va.PICTURE_H264_INVALID != 0) va.INVALID_ID else q.picture_id;
         }
         return r;
+    }
+
+    /// The active entries of list `l` (0, 1).
+    pub fn list(s: *const Slice, l: u1) []const u32 {
+        if (l == 0) return s.ref0[0..@min(@as(usize, s.l0_minus1) + 1, LIST)];
+        if (s.slice_type != 1) return s.ref1[0..0];
+        return s.ref1[0..@min(@as(usize, s.l1_minus1) + 1, LIST)];
     }
 };
 
@@ -91,6 +115,19 @@ pub fn check(profile: va.Profile, seq: *const Seq, pic: *const Pic) va.Status {
     if (pic.pic_fields.pic_scaling_matrix_present_flag != 0 or sf.seq_scaling_matrix_present_flag != 0) return va.ERROR_INVALID_PARAMETER;
     if (profile == va.PROFILE_H264_CONSTRAINED_BASELINE and (pic.pic_fields.entropy_coding_mode_flag != 0 or pic.pic_fields.transform_8x8_mode_flag != 0)) return va.ERROR_INVALID_PARAMETER;
     if (profile == va.PROFILE_H264_MAIN and pic.pic_fields.transform_8x8_mode_flag != 0) return va.ERROR_INVALID_PARAMETER;
+    // (implicit or explicit weights: not given to the engine)
+    if (pic.pic_fields.weighted_pred_flag != 0 or pic.pic_fields.weighted_bipred_idc != 0) return va.ERROR_INVALID_PARAMETER;
+    return va.SUCCESS;
+}
+
+/// Whether the slices' lists are ones the engine takes.
+pub fn checkSlices(profile: va.Profile, slices: []const Slice) va.Status {
+    for (slices) |s| {
+        if (s.slice_type == 1 and profile == va.PROFILE_H264_CONSTRAINED_BASELINE) return va.ERROR_INVALID_PARAMETER;
+        if (s.slice_type != 2 and s.l0_minus1 + 1 > MAX_L0) return va.ERROR_MAX_NUM_EXCEEDED;
+        if (s.slice_type == 1 and s.l1_minus1 + 1 > MAX_L1) return va.ERROR_MAX_NUM_EXCEEDED;
+        if (s.slice_type != slices[0].slice_type) return va.ERROR_INVALID_PARAMETER;
+    }
     return va.SUCCESS;
 }
 
@@ -171,8 +208,10 @@ fn vui(w: *bits.Writer, seq: *const Seq) void {
         w.ue(0); // max_bits_per_mb_denom
         w.ue(v.log2_max_mv_length_horizontal);
         w.ue(v.log2_max_mv_length_vertical);
-        w.ue(0); // max_num_reorder_frames: P pictures only
-        w.ue(@max(seq.max_num_ref_frames, 1)); // max_dec_frame_buffering
+        // max_num_reorder_frames: the B pictures between anchors
+        const reorder = if (seq.ip_period > 1) seq.ip_period - 1 else 0;
+        w.ue(reorder);
+        w.ue(@max(seq.max_num_ref_frames, reorder, 1)); // max_dec_frame_buffering
     }
 }
 
@@ -215,6 +254,9 @@ pub const Planes = struct {
     chroma: u64,
     pitch_luma: u32,
     pitch_chroma: u32,
+    /// block linear: log2 of GOBs per block (the input's; references and
+    /// reconstructions are tiled 16x16 and ignore it)
+    block_height: u7 = INPUT_BLOCK_HEIGHT,
 };
 
 /// What one picture's setup is made from.
@@ -261,6 +303,17 @@ pub fn picType(pic: *const Pic, first: Slice) u2 {
     };
 }
 
+/// Temporal direct's DistScaleFactor (8.4.1.2.3, frames): a picture at
+/// `cur` between `poc0` (L0) and `poc1` (L1); `zero` when the two
+/// references' distance is 0 (the factor is then unused).
+pub fn directScale(cur: i32, poc0: i32, poc1: i32) struct { scale: i32, zero: bool } {
+    const td = std.math.clamp(poc1 - poc0, -128, 127);
+    if (td == 0) return .{ .scale = 256, .zero = true };
+    const tb = std.math.clamp(cur - poc0, -128, 127);
+    const tx = @divTrunc(16384 + @divTrunc(@as(i32, @intCast(@abs(td))), 2), td);
+    return .{ .scale = std.math.clamp((tb * tx + 32) >> 6, -1024, 1023), .zero = false };
+}
+
 /// The reference slot of VA surface `id` (null: not a reference).
 fn slotOf(s: Setup, id: u32) ?u8 {
     if (id == va.INVALID_ID) return null;
@@ -297,7 +350,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     // decoder setup leaves its offsets 0)
     nvenc.set(buf, H.refpic_cfg_tiled_16x16, 1);
     nvenc.set(buf, H.outputpic_cfg_tiled_16x16, 1);
-    nvenc.set(buf, H.input_cfg_block_height, INPUT_BLOCK_HEIGHT);
+    nvenc.set(buf, H.input_cfg_block_height, s.input.block_height);
     // sps_data, pps_data: what the parameter sets say
     nvenc.set(buf, H.profile_idc, profileIdc(s.profile));
     nvenc.set(buf, H.level_idc, seq.level_idc);
@@ -319,21 +372,48 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, H.transform_8x8_mode_flag, pf.transform_8x8_mode_flag);
     nvenc.set(buf, H.pic_order_present_flag, pf.pic_order_present_flag);
     nvenc.set(buf, H.weighted_pred_flag, pf.weighted_pred_flag);
-    // rate control: the driver's QP, the firmware's control off
-    for ([_]nvenc.F{ H.rc_qp_p, H.rc_qp_b, H.rc_qp_i, H.rc_min_qp_p, H.rc_min_qp_b, H.rc_min_qp_i, H.rc_max_qp_p, H.rc_max_qp_b, H.rc_max_qp_i }) |f| nvenc.set(buf, f, s.qp);
-    nvenc.set(buf, H.rc_framerate, s.framerate);
-    nvenc.set(buf, H.rc_gop_length, s.gop_length);
+    // rate control: the driver's QP (encode.sig puts the firmware's in
+    // instead when it runs it)
+    enc_rc.constQp(buf, enc_rc.RcFields.of(H), s.qp, s.framerate, s.gop_length);
     // pic_control: the lists, the slice header's values, the controls
+    const cur_poc = pic.CurrPic.TopFieldOrderCnt;
     for (0..8) |k| {
         const kk: u32 = @intCast(k);
         nvenc.set(buf, nvenc.at(H.l0, kk), 0xff);
         nvenc.set(buf, nvenc.at(H.l1, kk), 0xff);
-        if (k >= first.ref0.len or k > first.l0_minus1) continue;
-        const slot = slotOf(s, first.ref0[k]) orelse continue;
-        nvenc.set(buf, nvenc.at(H.l0, kk), slot);
-        const cur_poc = pic.CurrPic.TopFieldOrderCnt;
-        const d = std.math.clamp(cur_poc - s.ref_poc[slot], -128, 127);
-        nvenc.setSigned(buf, nvenc.at(H.temp_dist_l0, kk), d);
+    }
+    var poc0 = [_]i32{0} ** LIST;
+    var poc1 = [_]i32{0} ** LIST;
+    const lists = [2][]const u32{ first.list(0), if (first.slice_type == 1) first.list(1) else &.{} };
+    for (lists, 0..) |l, li| {
+        for (l, 0..) |id, k| {
+            const kk: u32 = @intCast(k);
+            const slot = slotOf(s, id) orelse continue;
+            const d = std.math.clamp(cur_poc - s.ref_poc[slot], -128, 127);
+            if (li == 0) {
+                nvenc.set(buf, nvenc.at(H.l0, kk), slot);
+                nvenc.setSigned(buf, nvenc.at(H.temp_dist_l0, kk), d);
+                poc0[k] = s.ref_poc[slot];
+            } else {
+                nvenc.set(buf, nvenc.at(H.l1, kk), slot);
+                nvenc.setSigned(buf, nvenc.at(H.temp_dist_l1, kk), d);
+                poc1[k] = s.ref_poc[slot];
+            }
+        }
+    }
+    // temporal direct's scale factors, [refidx1][refidx0] (8.4.1.2.3)
+    if (first.slice_type == 1) {
+        var zero: u64 = 0;
+        for (lists[1], 0..) |_, r1| {
+            for (lists[0], 0..) |_, r0| {
+                const f = directScale(cur_poc, poc0[r0], poc1[r1]);
+                const idx: u32 = @intCast(r1 * 8 + r0);
+                nvenc.setSigned(buf, nvenc.at(H.dist_scale_factor, idx), f.scale);
+                if (f.zero) zero |= @as(u64, 1) << @intCast(idx);
+            }
+        }
+        nvenc.set(buf, H.diff_pic_order_cnt_zero, zero & 0xffff_ffff);
+        nvenc.set(buf, nvenc.at(H.diff_pic_order_cnt_zero, 1), zero >> 32);
     }
     nvenc.set(buf, H.frame_num, pic.frame_num);
     nvenc.set(buf, H.pic_order_cnt_lsb, first.pic_order_cnt_lsb);
@@ -349,6 +429,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, H.bitstream_start_pos, s.bitstream_start);
     nvenc.set(buf, H.pic_type, picType(pic, first));
     nvenc.set(buf, H.ref_pic_flag, @intFromBool(pf.reference_pic_flag != 0));
+    nvenc.set(buf, H.b_as_ref, @intFromBool(first.slice_type == 1 and pf.reference_pic_flag != 0));
     // static slices: the slice controls' macroblock counts
     nvenc.set(buf, H.slice_mode, 1);
     nvenc.set(buf, H.base_view, 1);
@@ -383,6 +464,17 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(md, D.l0_part_16x8_enable, 1);
     nvenc.set(md, D.l0_part_8x16_enable, 1);
     nvenc.set(md, D.l0_part_8x8_enable, 1);
+    // (B pictures: the same partitions for L1 and bi-prediction; direct
+    // mode as the slice header says, B_Skip with it)
+    for (0..4) |p| {
+        const pp: u32 = @intCast(p);
+        nvenc.set(md, .{ .bit = D.l1_part_16x16_enable.bit + pp, .width = 1 }, 1);
+        nvenc.set(md, .{ .bit = D.bi_part_16x16_enable.bit + pp, .width = 1 }, 1);
+    }
+    if (first.slice_type == 1) {
+        nvenc.set(md, D.bdirect_mode, if (first.direct_spatial) 1 else 2);
+        nvenc.set(md, D.bskip_enable, 1);
+    }
     nvenc.set(md, D.pskip_enable, 1);
     nvenc.set(md, D.mv_cost_enable, 1);
     // which intra sizes to search: 4x4, 16x16, and 8x8 with the 8x8 transform

@@ -13,7 +13,14 @@
 //! driver's. The short-term reference picture set is in each slice header
 //! (FFmpeg's SPS has none), made from VA's reference list.
 //!
-//! Main (4:2:0 8-bit), P pictures with one reference, CTBs of 16 to 64.
+//! When the app packs its own SPS and PPS, what they say (POC LSB length,
+//! output flags, extra slice header bits, cabac_init_present, the
+//! deblocking override, lists modification, the SPS's RPS count) is read
+//! from them (enc_parse.sig) and given to the engine instead.
+//!
+//! Main (4:2:0 8-bit); P pictures with up to MAX_L0 references, B pictures
+//! (random access or low delay) with up to MAX_L0 and MAX_L1; CTBs of 16
+//! to 64.
 //!
 //! Pure: no calls, no state.
 
@@ -23,6 +30,8 @@ const ve = @import("vaapi_enc.sig");
 const nvenc = @import("nvenc.sig");
 const bits = @import("bits.sig");
 const h264 = @import("enc_h264.sig");
+const enc_rc = @import("enc_rc.sig");
+const enc_parse = @import("enc_parse.sig");
 
 const H = nvenc.H265;
 
@@ -30,8 +39,14 @@ pub const PROFILE = va.PROFILE_HEVC_MAIN;
 pub const Seq = ve.EncSequenceParameterBufferHEVC;
 pub const Pic = ve.EncPictureParameterBufferHEVC;
 
-/// log2_max_pic_order_cnt_lsb_minus4: FFmpeg's (VA has no field for it).
+/// log2_max_pic_order_cnt_lsb_minus4 of the driver's own SPS (FFmpeg's
+/// choice too); an app's packed SPS gives its own (enc_parse.HevcParams).
 pub const POC_LSB_MINUS4: u32 = 8;
+pub const MAX_L0 = h264.MAX_L0;
+pub const MAX_L1 = h264.MAX_L1;
+const LIST = h264.LIST;
+/// The DPB the driver's VPS and SPS declare (references and the picture).
+pub const DPB = MAX_L0 + MAX_L1 + 1;
 
 /// VAConfigAttribValEncHEVCFeatures this driver answers: AMP, SAO,
 /// temporal MVP, strong intra smoothing, CU QP delta supported (1), the
@@ -47,7 +62,9 @@ pub const Slice = struct {
     /// 0 B, 1 P, 2 I
     slice_type: u8 = 2,
     l0_minus1: u8 = 0,
+    l1_minus1: u8 = 0,
     override: bool = false,
+    cabac_init: bool = false,
     max_num_merge_cand: u8 = 5,
     qp_delta: i8 = 0,
     beta: i8 = 0,
@@ -58,7 +75,8 @@ pub const Slice = struct {
     deblocking_disabled: bool = false,
     loop_filter_across_slices: bool = false,
     collocated_from_l0: bool = true,
-    ref0: [4]u32 = [_]u32{va.INVALID_ID} ** 4,
+    ref0: [LIST]u32 = [_]u32{va.INVALID_ID} ** LIST,
+    ref1: [LIST]u32 = [_]u32{va.INVALID_ID} ** LIST,
 
     pub fn of(s: *const ve.EncSliceParameterBufferHEVC) Slice {
         const f = s.slice_fields;
@@ -67,6 +85,8 @@ pub const Slice = struct {
             .num_ctu = s.num_ctu_in_slice,
             .slice_type = s.slice_type,
             .l0_minus1 = s.num_ref_idx_l0_active_minus1,
+            .l1_minus1 = s.num_ref_idx_l1_active_minus1,
+            .cabac_init = f.cabac_init_flag != 0,
             .override = f.num_ref_idx_active_override_flag != 0,
             .max_num_merge_cand = if (s.max_num_merge_cand == 0) 5 else s.max_num_merge_cand,
             .qp_delta = s.slice_qp_delta,
@@ -79,13 +99,40 @@ pub const Slice = struct {
             .loop_filter_across_slices = f.slice_loop_filter_across_slices_enabled_flag != 0,
             .collocated_from_l0 = f.collocated_from_l0_flag != 0 or s.slice_type != 0,
         };
-        for (&r.ref0, 0..) |*id, k| {
+        for (&r.ref0, &r.ref1, 0..) |*id0, *id1, k| {
             const p = s.ref_pic_list0[k];
-            id.* = if (p.flags & va.PICTURE_HEVC_INVALID != 0) va.INVALID_ID else p.picture_id;
+            id0.* = if (p.flags & va.PICTURE_HEVC_INVALID != 0) va.INVALID_ID else p.picture_id;
+            const q = s.ref_pic_list1[k];
+            id1.* = if (q.flags & va.PICTURE_HEVC_INVALID != 0) va.INVALID_ID else q.picture_id;
         }
         return r;
     }
+
+    /// The active entries of list `l` (B slices have both).
+    pub fn list(s: *const Slice, l: u1) []const u32 {
+        if (s.slice_type == 2) return s.ref0[0..0];
+        if (l == 0) return s.ref0[0..@min(@as(usize, s.l0_minus1) + 1, LIST)];
+        if (s.slice_type != 0) return s.ref1[0..0];
+        return s.ref1[0..@min(@as(usize, s.l1_minus1) + 1, LIST)];
+    }
+
+    /// collocated_ref_idx: where the picture's collocated reference
+    /// (VA's collocated_ref_pic_index names it in reference_frames) is in
+    /// the list it comes from.
+    pub fn collocatedIdx(s: *const Slice, id: u32) u8 {
+        const l = s.list(if (s.collocated_from_l0) 0 else 1);
+        return @intCast(std.mem.indexOfScalar(u32, l, id) orelse 0);
+    }
 };
+
+pub fn checkSlices(slices: []const Slice) va.Status {
+    for (slices) |s| {
+        if (s.slice_type != slices[0].slice_type) return va.ERROR_INVALID_PARAMETER;
+        if (s.slice_type != 2 and s.l0_minus1 + 1 > MAX_L0) return va.ERROR_MAX_NUM_EXCEEDED;
+        if (s.slice_type == 0 and s.l1_minus1 + 1 > MAX_L1) return va.ERROR_MAX_NUM_EXCEEDED;
+    }
+    return va.SUCCESS;
+}
 
 fn ctbLog2(seq: *const Seq) u32 {
     return @as(u32, seq.log2_min_luma_coding_block_size_minus3) + 3 + seq.log2_diff_max_min_luma_coding_block_size;
@@ -139,9 +186,10 @@ pub fn writeHeadersSized(out: []u8, seq: *const Seq, pic: *const Pic, width: u32
     w.flag(true); // vps_temporal_id_nesting_flag
     w.u(16, 0xffff);
     profileTierLevel(&w, seq);
+    const reorder: u32 = if (seq.ip_period > 1) @min(seq.ip_period - 1, DPB - 1) else 0;
     w.flag(false); // vps_sub_layer_ordering_info_present_flag
-    w.ue(1); // vps_max_dec_pic_buffering_minus1: a reference and the picture
-    w.ue(0); // vps_max_num_reorder_pics
+    w.ue(DPB - 1); // vps_max_dec_pic_buffering_minus1: the references and the picture
+    w.ue(reorder); // vps_max_num_reorder_pics
     w.ue(0); // vps_max_latency_increase_plus1
     w.u(6, 0); // vps_max_layer_id
     w.ue(0); // vps_num_layer_sets_minus1
@@ -176,8 +224,8 @@ pub fn writeHeadersSized(out: []u8, seq: *const Seq, pic: *const Pic, width: u32
     w.ue(0); // bit_depth_chroma_minus8
     w.ue(POC_LSB_MINUS4);
     w.flag(false); // sps_sub_layer_ordering_info_present_flag
-    w.ue(1); // sps_max_dec_pic_buffering_minus1
-    w.ue(0); // sps_max_num_reorder_pics
+    w.ue(DPB - 1); // sps_max_dec_pic_buffering_minus1
+    w.ue(reorder); // sps_max_num_reorder_pics
     w.ue(0); // sps_max_latency_increase_plus1
     w.ue(seq.log2_min_luma_coding_block_size_minus3);
     w.ue(seq.log2_diff_max_min_luma_coding_block_size);
@@ -283,6 +331,10 @@ pub const Setup = struct {
     recon: h264.Planes,
     ref_ids: [nvenc.REF_SLOTS]u32,
     ref_poc: [nvenc.REF_SLOTS]i32,
+    /// what the app's packed SPS and PPS say (the driver's own when none)
+    params: enc_parse.HevcParams = .{},
+    /// the collocated picture (VA's collocated_ref_pic_index's surface)
+    collocated_id: u32 = va.INVALID_ID,
     qp: u8,
     gop_length: u32,
     framerate: u32,
@@ -330,13 +382,14 @@ pub fn setup(buf: []u8, s: Setup) void {
     }
     nvenc.set(buf, H.refpic_cfg_tiled_16x16, 1);
     nvenc.set(buf, H.outputpic_cfg_tiled_16x16, 1);
-    nvenc.set(buf, H.input_cfg_block_height, h264.INPUT_BLOCK_HEIGHT);
+    nvenc.set(buf, H.input_cfg_block_height, s.input.block_height);
     // sps_data
     const min_cb = @as(u32, seq.log2_min_luma_coding_block_size_minus3);
     const ctb = ctbLog2(seq);
     const min_tb = @as(u32, seq.log2_min_transform_block_size_minus2);
     nvenc.set(buf, H.chroma_format_idc, 1);
-    nvenc.set(buf, H.log2_max_pic_order_cnt_lsb_minus4, POC_LSB_MINUS4);
+    const prm = s.params;
+    nvenc.set(buf, H.log2_max_pic_order_cnt_lsb_minus4, prm.log2_max_poc_lsb_minus4);
     nvenc.set(buf, H.min_cu_size, log2Size(min_cb));
     nvenc.set(buf, H.max_cu_size, log2Size(ctb - 3));
     nvenc.set(buf, H.min_tu_size, log2Size(min_tb));
@@ -345,8 +398,16 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, H.max_transform_depth_intra, @min(seq.max_transform_hierarchy_depth_intra, 3));
     nvenc.set(buf, H.amp_enabled_flag, sf.amp_enabled_flag);
     nvenc.set(buf, H.strong_intra_smoothing_enabled_flag, sf.strong_intra_smoothing_enabled_flag);
-    nvenc.set(buf, H.sample_adaptive_offset_enabled_flag, sf.sample_adaptive_offset_enabled_flag);
-    nvenc.set(buf, H.sps_temporal_mvp_enabled_flag, sf.sps_temporal_mvp_enabled_flag);
+    nvenc.set(buf, H.sample_adaptive_offset_enabled_flag, if (prm.have_sps) @intFromBool(prm.sao) else sf.sample_adaptive_offset_enabled_flag);
+    nvenc.set(buf, H.sps_temporal_mvp_enabled_flag, if (prm.have_sps) @intFromBool(prm.temporal_mvp) else sf.sps_temporal_mvp_enabled_flag);
+    nvenc.set(buf, H.num_short_term_ref_pic_sets, prm.num_short_term_ref_pic_sets);
+    // (the app's PPS: what its slice headers carry)
+    nvenc.set(buf, H.output_flag_present_flag, @intFromBool(prm.output_flag_present));
+    nvenc.set(buf, H.num_extra_slice_header_bits, prm.num_extra_slice_header_bits);
+    nvenc.set(buf, H.cabac_init_present_flag, @intFromBool(prm.cabac_init_present));
+    nvenc.set(buf, H.deblocking_filter_override_enabled_flag, @intFromBool(prm.deblocking_override_enabled));
+    nvenc.set(buf, H.pps_slice_chroma_qp_offsets_present, @intFromBool(prm.slice_chroma_qp_offsets_present));
+    nvenc.set(buf, H.lists_modification_present_flag, @intFromBool(prm.lists_modification_present));
     // pps_data
     nvenc.set(buf, H.pic_param_set_id, pic.slice_pic_parameter_set_id);
     nvenc.set(buf, H.pps_num_ref_idx_l0_active_minus1, pic.num_ref_idx_l0_default_active_minus1);
@@ -361,52 +422,80 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.setSigned(buf, H.pps_cr_qp_offset, pic.pps_cr_qp_offset);
     nvenc.set(buf, H.sign_data_hiding_enabled_flag, pf.sign_data_hiding_enabled_flag);
     nvenc.set(buf, H.log2_parallel_merge_level_minus2, @min(pic.log2_parallel_merge_level_minus2, 7));
-    for ([_]nvenc.F{ H.rc_qp_p, H.rc_qp_b, H.rc_qp_i, H.rc_min_qp_p, H.rc_min_qp_b, H.rc_min_qp_i, H.rc_max_qp_p, H.rc_max_qp_b, H.rc_max_qp_i }) |f| nvenc.set(buf, f, s.qp);
-    nvenc.set(buf, H.rc_framerate, s.framerate);
-    nvenc.set(buf, H.rc_gop_length, s.gop_length);
-    // the short-term RPS: every reference before this picture, nearest first
+    enc_rc.constQp(buf, enc_rc.RcFields.of(H), s.qp, s.framerate, s.gop_length);
+    // the short-term RPS (in the slice header): every reference kept,
+    // those before this picture nearest first (S0), then those after it
+    // nearest first (S1); the RPS's entries are S0's then S1's
     const cur = pic.decoded_curr_pic.pic_order_cnt;
-    var order: [nvenc.REF_SLOTS]u8 = undefined;
+    var neg: [nvenc.REF_SLOTS]u8 = undefined;
+    var pos: [nvenc.REF_SLOTS]u8 = undefined;
     var nneg: u32 = 0;
+    var npos: u32 = 0;
     for (s.ref_ids, 0..) |id, i| {
-        if (id == va.INVALID_ID or s.ref_poc[i] >= cur) continue;
-        order[nneg] = @intCast(i);
-        nneg += 1;
+        if (id == va.INVALID_ID or s.ref_poc[i] == cur) continue;
+        if (s.ref_poc[i] < cur) {
+            neg[nneg] = @intCast(i);
+            nneg += 1;
+        } else {
+            pos[npos] = @intCast(i);
+            npos += 1;
+        }
     }
-    std.mem.sort(u8, order[0..nneg], &s, struct {
-        fn nearer(ss: *const Setup, a: u8, b: u8) bool {
+    const Order = struct {
+        fn before(ss: *const Setup, a: u8, b: u8) bool {
             return ss.ref_poc[a] > ss.ref_poc[b];
         }
-    }.nearer);
-    const first = s.slices[0];
-    var used: u32 = 0;
-    var prev = cur;
-    for (order[0..nneg], 0..) |slot, k| {
-        const kk: u32 = @intCast(k);
-        nvenc.set(buf, nvenc.at(H.st_delta_poc_s0_minus1, kk), @as(u64, @intCast(prev - s.ref_poc[slot] - 1)));
-        prev = s.ref_poc[slot];
-        for (first.ref0[0..@min(@as(usize, first.l0_minus1) + 1, first.ref0.len)]) |r| {
-            if (r == s.ref_ids[slot]) used |= @as(u32, 1) << @intCast(k);
+        fn after(ss: *const Setup, a: u8, b: u8) bool {
+            return ss.ref_poc[a] < ss.ref_poc[b];
         }
+    };
+    std.mem.sort(u8, neg[0..nneg], &s, Order.before);
+    std.mem.sort(u8, pos[0..npos], &s, Order.after);
+    const first = s.slices[0];
+    const l0 = first.list(0);
+    const l1 = first.list(1);
+    const sides = [2][]const u8{ neg[0..nneg], pos[0..npos] };
+    const deltas = [2]nvenc.F{ H.st_delta_poc_s0_minus1, H.st_delta_poc_s1_minus1 };
+    const used_f = [2]nvenc.F{ H.st_used_by_curr_pic_s0_flag, H.st_used_by_curr_pic_s1_flag };
+    for (sides, 0..) |side, si| {
+        var used: u32 = 0;
+        var prev = cur;
+        for (side, 0..) |slot, k| {
+            const kk: u32 = @intCast(k);
+            const gap = if (si == 0) prev - s.ref_poc[slot] else s.ref_poc[slot] - prev;
+            nvenc.set(buf, nvenc.at(deltas[si], kk), @as(u64, @intCast(gap - 1)));
+            prev = s.ref_poc[slot];
+            const id = s.ref_ids[slot];
+            if (std.mem.indexOfScalar(u32, l0, id) != null or std.mem.indexOfScalar(u32, l1, id) != null) used |= @as(u32, 1) << @intCast(k);
+        }
+        nvenc.set(buf, used_f[si], used);
     }
     nvenc.set(buf, H.st_num_negative_pics, nneg);
-    nvenc.set(buf, H.st_used_by_curr_pic_s0_flag, used);
-    // the lists
+    nvenc.set(buf, H.st_num_positive_pics, npos);
+    // the lists: slots, distances, and each entry's place in the RPS
     for (0..8) |k| {
         const kk: u32 = @intCast(k);
         nvenc.set(buf, nvenc.at(H.l0, kk), 0xff);
         nvenc.set(buf, nvenc.at(H.l1, kk), 0xff);
         nvenc.set(buf, nvenc.at(H.poc_entry_l0, kk), 0xff);
-        if (k >= first.ref0.len or k > first.l0_minus1) continue;
-        const id = first.ref0[k];
-        if (id == va.INVALID_ID) continue;
-        const slot = std.mem.indexOfScalar(u32, &s.ref_ids, id) orelse continue;
-        nvenc.set(buf, nvenc.at(H.l0, kk), slot);
-        nvenc.setSigned(buf, nvenc.at(H.temp_dist_l0, kk), std.math.clamp(cur - s.ref_poc[slot], -128, 127));
-        if (std.mem.indexOfScalar(u8, order[0..nneg], @intCast(slot))) |e| nvenc.set(buf, nvenc.at(H.poc_entry_l0, kk), e);
+        nvenc.set(buf, nvenc.at(H.poc_entry_l1, kk), 0xff);
+    }
+    const lf = [2][3]nvenc.F{ .{ H.l0, H.temp_dist_l0, H.poc_entry_l0 }, .{ H.l1, H.temp_dist_l1, H.poc_entry_l1 } };
+    for ([2][]const u32{ l0, l1 }, 0..) |l, li| {
+        for (l, 0..) |id, k| {
+            const kk: u32 = @intCast(k);
+            if (id == va.INVALID_ID) continue;
+            const slot = std.mem.indexOfScalar(u32, &s.ref_ids, id) orelse continue;
+            nvenc.set(buf, nvenc.at(lf[li][0], kk), slot);
+            nvenc.setSigned(buf, nvenc.at(lf[li][1], kk), std.math.clamp(cur - s.ref_poc[slot], -128, 127));
+            const su: u8 = @intCast(slot);
+            const e: u32 = if (std.mem.indexOfScalar(u8, neg[0..nneg], su)) |e0| @intCast(e0) else if (std.mem.indexOfScalar(u8, pos[0..npos], su)) |e1| nneg + @as(u32, @intCast(e1)) else continue;
+            nvenc.set(buf, nvenc.at(lf[li][2], kk), e);
+        }
     }
     nvenc.set(buf, H.pic_output_flag, 1);
-    const poc_lsb = @as(u32, @bitCast(cur)) & ((@as(u32, 1) << @intCast(POC_LSB_MINUS4 + 4)) - 1);
+    const poc_lsb = @as(u32, @bitCast(cur)) & ((@as(u32, 1) << @intCast(@as(u32, prm.log2_max_poc_lsb_minus4) + 4)) - 1);
+
     nvenc.set(buf, H.pic_order_cnt_lsb, poc_lsb);
     nvenc.set(buf, H.num_forced_slices_minus1, s.slices.len - 1);
     nvenc.set(buf, H.slice_control_offset, nvenc.SLICE_CONTROL_OFF);
@@ -445,6 +534,9 @@ pub fn setup(buf: []u8, s: Setup) void {
         nvenc.set(c, L.collocated_from_l0_flag, @intFromBool(sl.collocated_from_l0));
         nvenc.set(c, L.num_ref_idx_active_override_flag, @intFromBool(sl.override));
         nvenc.set(c, L.num_ref_idx_l0_active_minus1, sl.l0_minus1);
+        nvenc.set(c, L.num_ref_idx_l1_active_minus1, if (sl.slice_type == 0) sl.l1_minus1 else 0);
+        nvenc.set(c, L.collocated_ref_idx, if (s.collocated_id != va.INVALID_ID) sl.collocatedIdx(s.collocated_id) else 0);
+        nvenc.set(c, L.cabac_init_flag, @intFromBool(sl.cabac_init and prm.cabac_init_present));
     }
     nvenc.meControl(buf[nvenc.ME_CONTROL_OFF..]);
     const md = buf[nvenc.MD_CONTROL_OFF..];

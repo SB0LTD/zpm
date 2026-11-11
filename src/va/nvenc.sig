@@ -31,8 +31,29 @@
 //!   parameter sets said, for the slice headers it writes.
 //! - reference and reconstructed pictures are the engine's own "tiled
 //!   16x16" layout (it writes them, it reads them: the CPU never does);
-//!   the input picture is block linear (GPU BL, `input_bl_mode` 0), which
-//!   the CPU makes here from the app's linear NV12 (`tileNv12`).
+//! - the input picture is block linear (GPU BL, `input_bl_mode` 0) or the
+//!   engine's tiled 16x16: nvenc_drv.h 1.5 (2) says input pictures are
+//!   "either all in BL format or all in tiled 16x16 format", and its
+//!   surface configuration has no pitch-linear mode (block_height,
+//!   tiled_16x16, memory_mode semi-planar/planar, nv21, input_bl_mode GPU,
+//!   Tegra or the C model's "naive" BL: nothing else). A block-linear
+//!   surface is read where it is (any block height: `input_cfg_block_height`
+//!   is log2 of GOBs per block, as NVIDIA's DRM modifier says it); a
+//!   pitch-linear picture needs a pass into block linear first (enc_input.sig
+//!   decides; `tileNv12` is the CPU's pass, kept for a GPU without one).
+//! - rate control: SET_CONTROL_PARAMS' RCMODE (nvenc_drv.h 3.1: 0 constant
+//!   QP, 1 picture-level VBR, 2 picture-level CBR, 3 VBR with a minimum
+//!   QP, 17..19 the same per macroblock row, 32 activity based) with the
+//!   setup's rate_control struct and the persistent state in the RC process
+//!   buffer (nvenc_persistent_state_s). Its fixed-point fields' units
+//!   (Np, Bmin, Ravg, R) are not documented: enc_rc.sig says what is filled
+//!   from them and when the firmware's control is used at all.
+//!
+//! AV1 (NVC9B7's AV1, nvenc_av1_drv_pic_setup_s): the same methods plus
+//! the probability (CDF) buffers in and out, and the entropy, deblocking,
+//! CDEF and loop-restoration line buffers (0x480..0x49c); the status
+//! (nvenc_av1_pic_stat_s) reports the QP and loop-filter level "to be
+//! inserted into frame header by driver" (enc_av1.sig writes the headers).
 //!
 //! Pure: no calls, no state.
 
@@ -72,6 +93,15 @@ pub const SET_OUT_MEPRED_DATA: u32 = 0x73c;
 pub const SET_IN_CUR_PIC_CHROMA_U: u32 = 0x740;
 pub const SET_IN_CUR_PIC_CHROMA_V: u32 = 0x744;
 pub const SET_OUT_REF_PIC_CHROMA: u32 = 0x74c;
+// AV1's (clc9b7.h)
+pub const SET_IN_AV1_PROBABILITY_DATA: u32 = 0x480;
+pub const SET_OUT_AV1_PROBABILITY_DATA: u32 = 0x484;
+pub const SET_IOENTROPY_ABOVE_CTX_DATA: u32 = 0x488;
+pub const SET_IOENTROPY_ABOVE_MV_DATA: u32 = 0x48c;
+pub const SET_IODEBLOCK_TOPROW: u32 = 0x490;
+pub const SET_IODEBLOCK_LEFTCOLUMN: u32 = 0x494;
+pub const SET_IOCDEF_LEFTCOLUMN: u32 = 0x498;
+pub const SET_IOLR_LEFTCOLUMN: u32 = 0x49c;
 
 pub const APPLICATION_ID_H264: u32 = 1;
 pub const APPLICATION_ID_H265: u32 = 3;
@@ -86,10 +116,13 @@ pub const CODEC_TYPE_AV1: u32 = 10;
 /// GPTIMER_ON (12): the watchdog, its timeout the setup's
 /// gpTimer_timeout_val.
 pub const CONTROL_GPTIMER_ON: u32 = 1 << 12;
-/// RCMODE (31:24): only CONSTQP (0) is named; the firmware's own picture
-/// rate control ((rc_mode & 3) != 0 per nvenc_drv.h) is not used: the
-/// driver chooses each picture's QP (encode.sig's rate control).
+/// RCMODE (31:24), nvenc_drv.h 3.1's list: constant QP; the firmware's
+/// picture-level VBR and CBR (its state in the RC process buffer, used
+/// when (rc_mode & 3) != 0). enc_rc.sig chooses.
 pub const RCMODE_CONSTQP: u32 = 0;
+pub const RCMODE_VBR: u32 = 1;
+pub const RCMODE_CBR: u32 = 2;
+pub const RCMODE_VBR_MINQP: u32 = 3;
 
 pub const ENC_ERROR_H264_APPTIMER_EXPIRED: u32 = 0x3000_0001;
 pub const ENC_ERROR_H264_INVALID_INPUT: u32 = 0x3000_0002;
@@ -244,6 +277,30 @@ pub const H264 = struct {
     pub const wp_control_offset: F = .{ .bit = 3552, .width = 32 };
     pub const enable_source_image_padding: F = .{ .bit = 3674, .width = 1 };
     pub const gp_timer_timeout_val: F = .{ .bit = 4064, .width = 32 };
+    // (B pictures, the input's format, the firmware's rate control)
+    pub const input_cfg_nv21_enable: F = .{ .bit = 522, .width = 1 };
+    pub const temp_dist_l1: F = .{ .bit = 1792, .width = 8 };
+    /// [refidx1][refidx0], 16 bits each
+    pub const dist_scale_factor: F = .{ .bit = 1856, .width = 16 };
+    pub const diff_pic_order_cnt_zero: F = .{ .bit = 2880, .width = 32 };
+    pub const b_as_ref: F = .{ .bit = 3592, .width = 1 };
+    pub const rc_hrd_type: F = .{ .bit = 896, .width = 8 };
+    pub const rc_max_qpd: F = .{ .bit = 976, .width = 8 };
+    pub const rc_base_qpd: F = .{ .bit = 984, .width = 8 };
+    pub const rc_rhopbi: F = .{ .bit = 992, .width = 32 };
+    pub const rc_buffersize: F = .{ .bit = 1120, .width = 32 };
+    pub const rc_nal_cpb_size: F = .{ .bit = 1152, .width = 32 };
+    pub const rc_nal_bitrate: F = .{ .bit = 1184, .width = 32 };
+    pub const rc_vcl_cpb_size: F = .{ .bit = 1216, .width = 32 };
+    pub const rc_vcl_bitrate: F = .{ .bit = 1248, .width = 32 };
+    pub const rc_np: F = .{ .bit = 1312, .width = 32 };
+    pub const rc_bmin: F = .{ .bit = 1344, .width = 32 };
+    pub const rc_ravg: F = .{ .bit = 1376, .width = 32 };
+    pub const rc_r: F = .{ .bit = 1408, .width = 32 };
+    pub const rc_ab_alpha: F = .{ .bit = 1440, .width = 8 };
+    pub const rc_single_frame_vbv: F = .{ .bit = 1480, .width = 8 };
+    pub const rc_i_size_ratio_x: F = .{ .bit = 1512, .width = 8 };
+    pub const rc_i_size_ratio_y: F = .{ .bit = 1520, .width = 8 };
 };
 
 pub const H264Slice = struct {
@@ -304,6 +361,12 @@ pub const H264Md = struct {
     pub const l0_part_16x8_enable: F = .{ .bit = 65, .width = 1 };
     pub const l0_part_8x16_enable: F = .{ .bit = 66, .width = 1 };
     pub const l0_part_8x8_enable: F = .{ .bit = 67, .width = 1 };
+    /// l1_part_16x16, 16x8, 8x16, 8x8 at 72..75; bi_part_* at 80..83
+    pub const l1_part_16x16_enable: F = .{ .bit = 72, .width = 1 };
+    pub const bi_part_16x16_enable: F = .{ .bit = 80, .width = 1 };
+    /// 0 off, 1 spatial, 2 temporal
+    pub const bdirect_mode: F = .{ .bit = 88, .width = 2 };
+    pub const bskip_enable: F = .{ .bit = 90, .width = 1 };
     pub const pskip_enable: F = .{ .bit = 91, .width = 1 };
     pub const mv_cost_enable: F = .{ .bit = 433, .width = 1 };
     pub const intra_most_prob_force_on: F = .{ .bit = 434, .width = 1 };
@@ -327,6 +390,49 @@ pub const Stat = struct {
     pub const avg_qp: F = .{ .bit = 176, .width = 16 };
     pub const bitstream_start_pos: F = .{ .bit = 256, .width = 32 };
     pub const last_valid_byte_offset: F = .{ .bit = 288, .width = 32 };
+    pub const hrd_fullness: F = .{ .bit = 224, .width = 32 };
+    pub const total_intra_cost: F = .{ .bit = 416, .width = 32 };
+    pub const total_inter_cost: F = .{ .bit = 448, .width = 32 };
+};
+
+/// nvenc_h265_pic_stat_s: nvenc_pic_stat_s's first 64 bytes, then its own
+/// counts (the costs further on).
+pub const H265Stat = struct {
+    pub const total_intra_cost: F = .{ .bit = 576, .width = 32 };
+    pub const total_inter_cost: F = .{ .bit = 608, .width = 32 };
+};
+
+/// nvenc_av1_pic_stat_s.
+pub const Av1Stat = struct {
+    pub const SIZE = 128;
+    pub const error_status: F = .{ .bit = 32, .width = 2 };
+    pub const ucode_error_status: F = .{ .bit = 34, .width = 30 };
+    pub const total_bit_count: F = .{ .bit = 64, .width = 32 };
+    pub const num_tiles: F = .{ .bit = 128, .width = 16 };
+    /// "to be inserted into frame header by driver"
+    pub const av1_start_qp: F = .{ .bit = 144, .width = 8 };
+    pub const loop_filter_level: F = .{ .bit = 152, .width = 8 };
+    pub const cdef_damping_minus_3: F = .{ .bit = 174, .width = 2 };
+    pub const avg_qp: F = .{ .bit = 176, .width = 16 };
+    pub const bitstream_start_pos: F = .{ .bit = 256, .width = 32 };
+    pub const total_intra_cost: F = .{ .bit = 608, .width = 32 };
+    pub const total_inter_cost: F = .{ .bit = 640, .width = 32 };
+};
+
+/// nvenc_persistent_state_s: the firmware's rate control state (the RC
+/// process buffer, kept across a stream's pictures).
+pub const Persistent = struct {
+    pub const SIZE = 256;
+    pub const nal_cpb_fullness: F = .{ .bit = 0, .width = 32 };
+    pub const vcl_cpb_fullness: F = .{ .bit = 32, .width = 32 };
+    /// Wpbi[3], then Whist[3][3] (27.4)
+    pub const wpbi: F = .{ .bit = 64, .width = 32 };
+    pub const whist: F = .{ .bit = 160, .width = 32 };
+    pub const np: F = .{ .bit = 448, .width = 32 };
+    pub const nb: F = .{ .bit = 480, .width = 32 };
+    pub const t: F = .{ .bit = 512, .width = 32 };
+    pub const rmean: F = .{ .bit = 544, .width = 32 };
+    pub const bavg: F = .{ .bit = 576, .width = 32 };
 };
 
 pub const H265 = struct {
@@ -437,6 +543,32 @@ pub const H265 = struct {
     pub const wp_control_offset: F = .{ .bit = 5504, .width = 32 };
     pub const poc_entry_l0: F = .{ .bit = 5728, .width = 8 };
     pub const gp_timer_timeout_val: F = .{ .bit = 6240, .width = 32 };
+    // (B pictures, what the app's parameter sets say, the firmware's rate control)
+    pub const input_cfg_nv21_enable: F = .{ .bit = 522, .width = 1 };
+    pub const temp_dist_l1: F = .{ .bit = 1888, .width = 8 };
+    pub const poc_entry_l1: F = .{ .bit = 5792, .width = 8 };
+    pub const st_delta_poc_s1_minus1: F = .{ .bit = 3952, .width = 16 };
+    pub const st_used_by_curr_pic_s1_flag: F = .{ .bit = 4208, .width = 16 };
+    pub const lists_modification_present_flag: F = .{ .bit = 888, .width = 1 };
+    pub const output_flag_present_flag: F = .{ .bit = 889, .width = 1 };
+    pub const long_term_ref_pics_present_flag: F = .{ .bit = 822, .width = 1 };
+    pub const rc_hrd_type: F = .{ .bit = 928, .width = 8 };
+    pub const rc_max_qpd: F = .{ .bit = 1008, .width = 8 };
+    pub const rc_base_qpd: F = .{ .bit = 1016, .width = 8 };
+    pub const rc_rhopbi: F = .{ .bit = 1024, .width = 32 };
+    pub const rc_buffersize: F = .{ .bit = 1152, .width = 32 };
+    pub const rc_nal_cpb_size: F = .{ .bit = 1184, .width = 32 };
+    pub const rc_nal_bitrate: F = .{ .bit = 1216, .width = 32 };
+    pub const rc_vcl_cpb_size: F = .{ .bit = 1248, .width = 32 };
+    pub const rc_vcl_bitrate: F = .{ .bit = 1280, .width = 32 };
+    pub const rc_np: F = .{ .bit = 1344, .width = 32 };
+    pub const rc_bmin: F = .{ .bit = 1376, .width = 32 };
+    pub const rc_ravg: F = .{ .bit = 1408, .width = 32 };
+    pub const rc_r: F = .{ .bit = 1440, .width = 32 };
+    pub const rc_ab_alpha: F = .{ .bit = 1472, .width = 8 };
+    pub const rc_single_frame_vbv: F = .{ .bit = 1512, .width = 8 };
+    pub const rc_i_size_ratio_x: F = .{ .bit = 1544, .width = 8 };
+    pub const rc_i_size_ratio_y: F = .{ .bit = 1552, .width = 8 };
 };
 
 pub const H265Slice = struct {
@@ -460,6 +592,8 @@ pub const H265Slice = struct {
     pub const collocated_ref_idx: F = .{ .bit = 84, .width = 5 };
     pub const slice_beta_offset_div2: F = .{ .bit = 64, .width = 4 };
     pub const slice_tc_offset_div2: F = .{ .bit = 68, .width = 4 };
+    pub const cabac_init_flag: F = .{ .bit = 38, .width = 1 };
+    pub const deblocking_filter_override_flag: F = .{ .bit = 39, .width = 1 };
 };
 
 pub const H265Md = struct {
@@ -492,6 +626,191 @@ pub const H265Quant = struct {
     pub const SIZE = 16;
 };
 
+/// nvenc_av1_drv_pic_setup_s (768 bytes: its MD and ME controls inside).
+pub const Av1 = struct {
+    pub const SIZE = 768;
+    pub const magic: F = .{ .bit = 0, .width = 32 };
+    pub const refpic_cfg_frame_width_minus1: F = .{ .bit = 32, .width = 16 };
+    pub const refpic_cfg_frame_height_minus1: F = .{ .bit = 48, .width = 16 };
+    pub const refpic_cfg_sfc_pitch: F = .{ .bit = 64, .width = 16 };
+    pub const refpic_cfg_sfc_pitch_chroma: F = .{ .bit = 80, .width = 16 };
+    pub const refpic_cfg_block_height: F = .{ .bit = 256, .width = 7 };
+    pub const refpic_cfg_tiled_16x16: F = .{ .bit = 263, .width = 1 };
+    pub const input_cfg_frame_width_minus1: F = .{ .bit = 288, .width = 16 };
+    pub const input_cfg_frame_height_minus1: F = .{ .bit = 304, .width = 16 };
+    pub const input_cfg_sfc_pitch: F = .{ .bit = 320, .width = 16 };
+    pub const input_cfg_sfc_pitch_chroma: F = .{ .bit = 336, .width = 16 };
+    pub const input_cfg_block_height: F = .{ .bit = 512, .width = 7 };
+    pub const input_cfg_tiled_16x16: F = .{ .bit = 519, .width = 1 };
+    pub const input_cfg_memory_mode: F = .{ .bit = 520, .width = 2 };
+    pub const input_cfg_input_bl_mode: F = .{ .bit = 523, .width = 2 };
+    pub const outputpic_cfg_frame_width_minus1: F = .{ .bit = 544, .width = 16 };
+    pub const outputpic_cfg_frame_height_minus1: F = .{ .bit = 560, .width = 16 };
+    pub const outputpic_cfg_sfc_pitch: F = .{ .bit = 576, .width = 16 };
+    pub const outputpic_cfg_sfc_pitch_chroma: F = .{ .bit = 592, .width = 16 };
+    pub const outputpic_cfg_block_height: F = .{ .bit = 768, .width = 7 };
+    pub const outputpic_cfg_tiled_16x16: F = .{ .bit = 775, .width = 1 };
+    // seqhdr_data
+    pub const min_cu_size: F = .{ .bit = 800, .width = 2 };
+    pub const max_cu_size: F = .{ .bit = 802, .width = 2 };
+    pub const chroma_format_idc: F = .{ .bit = 804, .width = 2 };
+    pub const bit_depth_minus_8: F = .{ .bit = 807, .width = 4 };
+    pub const input_bit_depth_minus8: F = .{ .bit = 811, .width = 4 };
+    pub const enable_cdef: F = .{ .bit = 828, .width = 1 };
+    pub const enable_restoration: F = .{ .bit = 829, .width = 1 };
+    // framehdr_data
+    pub const frame_type: F = .{ .bit = 832, .width = 2 };
+    pub const disable_cdf_update: F = .{ .bit = 834, .width = 1 };
+    pub const allow_high_precision_mv: F = .{ .bit = 837, .width = 1 };
+    pub const is_filter_switchable: F = .{ .bit = 839, .width = 1 };
+    pub const frame_end_update_cdf: F = .{ .bit = 841, .width = 1 };
+    pub const interp_filter: F = .{ .bit = 842, .width = 3 };
+    pub const delta_q_present_flag: F = .{ .bit = 845, .width = 1 };
+    pub const frame_tx_mode: F = .{ .bit = 854, .width = 2 };
+    pub const frame_reference_mode: F = .{ .bit = 856, .width = 2 };
+    pub const skip_mode_flag: F = .{ .bit = 858, .width = 1 };
+    pub const reduced_tx_set_flag: F = .{ .bit = 860, .width = 1 };
+    pub const coded_lossless: F = .{ .bit = 861, .width = 1 };
+    pub const bicompound_enable: F = .{ .bit = 873, .width = 1 };
+    pub const unicompound_enable: F = .{ .bit = 874, .width = 1 };
+    pub const mc_hfilter: F = .{ .bit = 875, .width = 4 };
+    pub const mc_vfilter: F = .{ .bit = 879, .width = 4 };
+    pub const segmentation_enable: F = .{ .bit = 883, .width = 1 };
+    /// [8] bytes
+    pub const ref_frame_sign_bias: F = .{ .bit = 896, .width = 8 };
+    /// [4] bytes: luma vertical, horizontal; U; V
+    pub const lf_filter_level: F = .{ .bit = 960, .width = 8 };
+    /// [8] signed bytes
+    pub const lf_ref_delta: F = .{ .bit = 992, .width = 8 };
+    pub const lf_mode_delta_0: F = .{ .bit = 1056, .width = 8 };
+    pub const lf_mode_delta_1: F = .{ .bit = 1064, .width = 8 };
+    pub const lf_update_ref_delta_flag: F = .{ .bit = 1072, .width = 8 };
+    pub const lf_update_mode_delta0: F = .{ .bit = 1080, .width = 1 };
+    pub const lf_update_mode_delta1: F = .{ .bit = 1081, .width = 1 };
+    pub const lf_delta_enabled: F = .{ .bit = 1082, .width = 1 };
+    pub const lf_sharpness: F = .{ .bit = 1083, .width = 3 };
+    pub const cdef_damping_minus_3: F = .{ .bit = 1088, .width = 2 };
+    /// y_strength_0..3, 6 bits each, consecutive
+    pub const cdef_y_strength_0: F = .{ .bit = 1090, .width = 6 };
+    pub const cdef_bits: F = .{ .bit = 1138, .width = 2 };
+    /// uv_strength_0..3, 6 bits each, consecutive
+    pub const cdef_uv_strength_0: F = .{ .bit = 1140, .width = 6 };
+    pub const cdef_y_strength_num_minus_1: F = .{ .bit = 1190, .width = 3 };
+    pub const cdef_uv_strength_num_minus_1: F = .{ .bit = 1193, .width = 3 };
+    pub const cdef_combined_idx_minus_1: F = .{ .bit = 1196, .width = 3 };
+    pub const cdef_combined_luma_idx: F = .{ .bit = 1216, .width = 24 };
+    pub const cdef_combined_chroma_idx: F = .{ .bit = 1248, .width = 24 };
+    pub const base_q_idx: F = .{ .bit = 1280, .width = 8 };
+    pub const delta_y_dc: F = .{ .bit = 1288, .width = 8 };
+    pub const delta_uv_dc: F = .{ .bit = 1296, .width = 8 };
+    pub const delta_uv_ac: F = .{ .bit = 1304, .width = 8 };
+    pub const y_lr_type: F = .{ .bit = 1312, .width = 2 };
+    pub const uv_lr_type: F = .{ .bit = 1314, .width = 2 };
+    pub const y_lr_unit_size: F = .{ .bit = 1316, .width = 2 };
+    pub const uv_lr_unit_size: F = .{ .bit = 1318, .width = 2 };
+    pub const lr_codebook_enable: F = .{ .bit = 1320, .width = 16 };
+    // rate_control (nvenc_av1_rc_s)
+    pub const rc_hrd_type: F = .{ .bit = 1344, .width = 8 };
+    pub const rc_qp_p: F = .{ .bit = 1352, .width = 8 };
+    pub const rc_qp_b: F = .{ .bit = 1360, .width = 8 };
+    pub const rc_qp_i: F = .{ .bit = 1368, .width = 8 };
+    pub const rc_min_qp_p: F = .{ .bit = 1376, .width = 8 };
+    pub const rc_min_qp_b: F = .{ .bit = 1384, .width = 8 };
+    pub const rc_min_qp_i: F = .{ .bit = 1392, .width = 8 };
+    pub const rc_max_qp_p: F = .{ .bit = 1400, .width = 8 };
+    pub const rc_max_qp_b: F = .{ .bit = 1408, .width = 8 };
+    pub const rc_max_qp_i: F = .{ .bit = 1416, .width = 8 };
+    pub const rc_max_qpd: F = .{ .bit = 1424, .width = 8 };
+    pub const rc_base_qpd: F = .{ .bit = 1432, .width = 8 };
+    pub const rc_rhopbi: F = .{ .bit = 1440, .width = 32 };
+    pub const rc_framerate: F = .{ .bit = 1536, .width = 32 };
+    pub const rc_buffersize: F = .{ .bit = 1568, .width = 32 };
+    pub const rc_nal_cpb_size: F = .{ .bit = 1600, .width = 32 };
+    pub const rc_nal_bitrate: F = .{ .bit = 1632, .width = 32 };
+    pub const rc_vcl_cpb_size: F = .{ .bit = 1664, .width = 32 };
+    pub const rc_vcl_bitrate: F = .{ .bit = 1696, .width = 32 };
+    pub const rc_gop_length: F = .{ .bit = 1728, .width = 32 };
+    pub const rc_np: F = .{ .bit = 1760, .width = 32 };
+    pub const rc_bmin: F = .{ .bit = 1792, .width = 32 };
+    pub const rc_ravg: F = .{ .bit = 1824, .width = 32 };
+    pub const rc_r: F = .{ .bit = 1856, .width = 32 };
+    pub const rc_ab_alpha: F = .{ .bit = 1888, .width = 8 };
+    pub const rc_i_size_ratio_x: F = .{ .bit = 1960, .width = 8 };
+    pub const rc_i_size_ratio_y: F = .{ .bit = 1968, .width = 8 };
+    // pic_control
+    /// l0[4], l1[3], temp_dist_l0[4], temp_dist_l1[3], poc_entry_l0[4],
+    /// poc_entry_l1[3]: bytes
+    pub const l0: F = .{ .bit = 2112, .width = 8 };
+    pub const l1: F = .{ .bit = 2144, .width = 8 };
+    pub const temp_dist_l0: F = .{ .bit = 2168, .width = 8 };
+    pub const temp_dist_l1: F = .{ .bit = 2200, .width = 8 };
+    pub const poc_entry_l0: F = .{ .bit = 2224, .width = 8 };
+    pub const poc_entry_l1: F = .{ .bit = 2256, .width = 8 };
+    pub const pic_output_flag: F = .{ .bit = 2338, .width = 1 };
+    pub const num_ref_idx_l0_active: F = .{ .bit = 2341, .width = 3 };
+    pub const num_ref_idx_l1_active: F = .{ .bit = 2344, .width = 3 };
+    pub const tile_idx_start: F = .{ .bit = 2347, .width = 8 };
+    pub const num_strip_tiles_minus1: F = .{ .bit = 2355, .width = 8 };
+    pub const max_tu_depth_inter: F = .{ .bit = 2368, .width = 2 };
+    pub const max_tu_depth_intra: F = .{ .bit = 2370, .width = 2 };
+    pub const num_tiles_minus1: F = .{ .bit = 2372, .width = 8 };
+    pub const enable_source_image_padding: F = .{ .bit = 2380, .width = 1 };
+    pub const prob_tables_offset: F = .{ .bit = 2400, .width = 32 };
+    pub const tile_control_offset: F = .{ .bit = 2432, .width = 32 };
+    pub const hist_buf_size: F = .{ .bit = 2464, .width = 32 };
+    pub const bitstream_buf_size: F = .{ .bit = 2496, .width = 32 };
+    pub const bitstream_start_pos: F = .{ .bit = 2528, .width = 32 };
+    pub const pic_type: F = .{ .bit = 2560, .width = 2 };
+    pub const ref_pic_flag: F = .{ .bit = 2562, .width = 1 };
+    pub const codec: F = .{ .bit = 2563, .width = 3 };
+    pub const num_tile_cols: F = .{ .bit = 2567, .width = 8 };
+    pub const num_tile_rows: F = .{ .bit = 2575, .width = 8 };
+    pub const ctx_update_tile_id: F = .{ .bit = 2583, .width = 8 };
+    pub const strips_in_frame: F = .{ .bit = 2824, .width = 8 };
+    pub const strip_width_in_sbs: F = .{ .bit = 2832, .width = 16 };
+    pub const strip_height_in_sbs: F = .{ .bit = 2848, .width = 16 };
+    /// the MD and ME controls, inside the setup
+    pub const MD_CONTROL_OFF = 408;
+    pub const ME_CONTROL_OFF = 568;
+    pub const gp_timer_timeout_val: F = .{ .bit = 6080, .width = 32 };
+};
+
+/// nvenc_av1_md_control_s.
+pub const Av1Md = struct {
+    pub const SIZE = 160;
+    pub const cu8x8_part_2Nx2N_enable: F = .{ .bit = 0, .width = 1 };
+    pub const cu16x16_part_2Nx2N_enable: F = .{ .bit = 1, .width = 1 };
+    pub const cu32x32_part_2Nx2N_enable: F = .{ .bit = 4, .width = 1 };
+    pub const cu64x64_part_2Nx2N_enable: F = .{ .bit = 7, .width = 1 };
+    pub const tusize_4x4_enable: F = .{ .bit = 10, .width = 1 };
+    pub const tusize_8x8_enable: F = .{ .bit = 11, .width = 1 };
+    pub const tusize_16x16_enable: F = .{ .bit = 12, .width = 1 };
+    pub const tusize_32x32_enable: F = .{ .bit = 13, .width = 1 };
+    pub const tusize_64x64_enable: F = .{ .bit = 14, .width = 1 };
+    pub const mv_cost_enable: F = .{ .bit = 83, .width = 1 };
+    /// 4x4, 8x8, 16x16, 32x32, 64x64: 16 bits each, consecutive
+    pub const intra_luma_base_mode_4x4_enable: F = .{ .bit = 544, .width = 16 };
+    /// [2]: the RDO stage's, the reconstruction's
+    pub const tx_type_search_mask: F = .{ .bit = 1216, .width = 16 };
+};
+
+/// nvenc_av1_tile_control_s.
+pub const Av1Tile = struct {
+    pub const SIZE = 32;
+    pub const tile_top_sbx: F = .{ .bit = 0, .width = 16 };
+    pub const tile_top_sby: F = .{ .bit = 16, .width = 16 };
+    pub const tile_bot_sbx: F = .{ .bit = 32, .width = 16 };
+    pub const tile_bot_sby: F = .{ .bit = 48, .width = 16 };
+    pub const qp_tile_min: F = .{ .bit = 64, .width = 8 };
+    pub const qp_tile_max: F = .{ .bit = 72, .width = 8 };
+    pub const qp_avr: F = .{ .bit = 80, .width = 8 };
+    /// 0 B, 1 P, 2 I
+    pub const tile_type: F = .{ .bit = 88, .width = 2 };
+    pub const force_intra: F = .{ .bit = 90, .width = 1 };
+    pub const tile_end_update_cdf: F = .{ .bit = 91, .width = 1 };
+    pub const tile_idx: F = .{ .bit = 96, .width = 8 };
+};
+
 // ── Where a picture's setup and controls are ────────────────────────────────
 
 /// One picture's setup area (SET_IN_DRV_PIC_SETUP; 256-byte aligned): the
@@ -505,8 +824,15 @@ pub const ME_CONTROL_OFF: u32 = SLICE_CONTROL_OFF + MAX_SLICES * H264Slice.SIZE;
 pub const MD_CONTROL_OFF: u32 = ME_CONTROL_OFF + Me.SIZE;
 pub const Q_CONTROL_OFF: u32 = MD_CONTROL_OFF + H264Md.SIZE;
 
+/// AV1's tile controls (tile_control_offset): where H.264's and HEVC's
+/// slice controls are; a picture has at most MAX_TILES.
+pub const TILE_CONTROL_OFF: u32 = SLICE_CONTROL_OFF;
+pub const MAX_TILES = 16;
+
 comptime {
     std.debug.assert(H265.SIZE <= SLICE_CONTROL_OFF);
+    std.debug.assert(Av1.SIZE <= TILE_CONTROL_OFF);
+    std.debug.assert(TILE_CONTROL_OFF + MAX_TILES * Av1Tile.SIZE <= SETUP_BYTES);
     std.debug.assert(Q_CONTROL_OFF + H264Quant.SIZE <= SETUP_BYTES);
 }
 
@@ -639,10 +965,27 @@ pub const PictureAddrs = struct {
     ref_luma: [REF_SLOTS]u64 = [_]u64{0} ** REF_SLOTS,
     ref_chroma: [REF_SLOTS]u64 = [_]u64{0} ** REF_SLOTS,
     picture_index: u32,
+    /// SET_CONTROL_PARAMS' RCMODE
+    rc_mode: u32 = RCMODE_CONSTQP,
+    /// AV1's buffers
+    av1: ?Av1Addrs = null,
+};
+
+/// AV1's own buffers (256-byte aligned).
+pub const Av1Addrs = struct {
+    /// the CDFs the picture starts from, and where its adapted ones go
+    prob_in: u64,
+    prob_out: u64,
+    above_ctx: u64,
+    above_mv: u64,
+    deblock_top: u64,
+    deblock_left: u64,
+    cdef_left: u64,
+    lr_left: u64,
 };
 
 /// The most dwords a picture takes.
-pub const PUSH_DWORDS_MAX = 2 * (19 + 2 * REF_SLOTS) + 2;
+pub const PUSH_DWORDS_MAX = 2 * (19 + 2 * REF_SLOTS + 8) + 2;
 
 fn put(out: []u32, n: *usize, method: u32, value: u32) void {
     out[n.*] = header(0, method, 1);
@@ -658,7 +1001,7 @@ pub fn push(out: []u32, a: PictureAddrs) usize {
     var n: usize = 0;
     put(out, &n, SET_OBJECT, CLASS | SET_OBJECT_ENGINE_SW);
     put(out, &n, SET_APPLICATION_ID, a.application_id);
-    put(out, &n, SET_CONTROL_PARAMS, a.codec_type | CONTROL_GPTIMER_ON | (RCMODE_CONSTQP << 24));
+    put(out, &n, SET_CONTROL_PARAMS, a.codec_type | CONTROL_GPTIMER_ON | (a.rc_mode << 24));
     put(out, &n, SET_PICTURE_INDEX, a.picture_index);
     put(out, &n, SET_IN_DRV_PIC_SETUP, shifted(a.setup));
     put(out, &n, SET_OUT_ENC_STATUS, shifted(a.status));
@@ -679,10 +1022,23 @@ pub fn push(out: []u32, a: PictureAddrs) usize {
         put(out, &n, SET_IN_REF_PIC0_LUMA + 4 * k, shifted(a.ref_luma[i]));
         put(out, &n, SET_IN_REF_PIC0_CHROMA + 4 * k, shifted(a.ref_chroma[i]));
     }
+    if (a.av1) |v| {
+        put(out, &n, SET_IN_AV1_PROBABILITY_DATA, shifted(v.prob_in));
+        put(out, &n, SET_OUT_AV1_PROBABILITY_DATA, shifted(v.prob_out));
+        put(out, &n, SET_IOENTROPY_ABOVE_CTX_DATA, shifted(v.above_ctx));
+        put(out, &n, SET_IOENTROPY_ABOVE_MV_DATA, shifted(v.above_mv));
+        put(out, &n, SET_IODEBLOCK_TOPROW, shifted(v.deblock_top));
+        put(out, &n, SET_IODEBLOCK_LEFTCOLUMN, shifted(v.deblock_left));
+        put(out, &n, SET_IOCDEF_LEFTCOLUMN, shifted(v.cdef_left));
+        put(out, &n, SET_IOLR_LEFTCOLUMN, shifted(v.lr_left));
+    }
     put(out, &n, EXECUTE, 0);
     std.debug.assert(n <= PUSH_DWORDS_MAX);
     return n;
 }
+
+/// Whose status struct a picture's is.
+pub const StatKind = enum { h264, hevc, av1 };
 
 /// What the engine said of a picture (its status).
 pub const Result = struct {
@@ -692,9 +1048,38 @@ pub const Result = struct {
     slices: u32,
     avg_qp: u32,
     start: u32,
-    last_valid: u32,
+    last_valid: u32 = 0,
+    /// the best intra and inter modes' summed SATDs (the rate control's
+    /// complexity measure; 0 when the engine wrote none)
+    intra_cost: u32 = 0,
+    inter_cost: u32 = 0,
+    /// AV1: the QP index and loop-filter level the engine used, and its
+    /// CDEF damping, for the frame header
+    av1_qindex: u32 = 0,
+    av1_lf_level: u32 = 0,
+    av1_cdef_damping_minus_3: u32 = 0,
 
     pub fn of(stat: []const u8) Result {
+        return ofKind(stat, .h264);
+    }
+
+    pub fn ofKind(stat: []const u8, kind: StatKind) Result {
+        if (kind == .av1) {
+            return .{
+                .error_status = @intCast(get(stat, Av1Stat.error_status)),
+                .ucode_error = @intCast(get(stat, Av1Stat.ucode_error_status)),
+                .bits = @intCast(get(stat, Av1Stat.total_bit_count)),
+                .slices = @intCast(get(stat, Av1Stat.num_tiles)),
+                .avg_qp = @intCast(get(stat, Av1Stat.avg_qp)),
+                .start = @intCast(get(stat, Av1Stat.bitstream_start_pos)),
+                .intra_cost = @intCast(get(stat, Av1Stat.total_intra_cost)),
+                .inter_cost = @intCast(get(stat, Av1Stat.total_inter_cost)),
+                .av1_qindex = @intCast(get(stat, Av1Stat.av1_start_qp)),
+                .av1_lf_level = @intCast(get(stat, Av1Stat.loop_filter_level)),
+                .av1_cdef_damping_minus_3 = @intCast(get(stat, Av1Stat.cdef_damping_minus_3)),
+            };
+        }
+        const costs = if (kind == .hevc) [2]F{ H265Stat.total_intra_cost, H265Stat.total_inter_cost } else [2]F{ Stat.total_intra_cost, Stat.total_inter_cost };
         return .{
             .error_status = @intCast(get(stat, Stat.error_status)),
             .ucode_error = @intCast(get(stat, Stat.ucode_error_status)),
@@ -703,6 +1088,8 @@ pub const Result = struct {
             .avg_qp = @intCast(get(stat, Stat.avg_qp)),
             .start = @intCast(get(stat, Stat.bitstream_start_pos)),
             .last_valid = @intCast(get(stat, Stat.last_valid_byte_offset)),
+            .intra_cost = @intCast(get(stat, costs[0])),
+            .inter_cost = @intCast(get(stat, costs[1])),
         };
     }
 

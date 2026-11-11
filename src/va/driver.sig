@@ -191,6 +191,9 @@ pub const Options = struct {
     encode: bool = true,
     /// GALAXY_VA_NVENC_MAGIC: the encoder setup's magic word (nvenc.MAGIC)
     nvenc_magic: ?u32 = null,
+    /// GALAXY_VA_NVENC_RC=firmware: the encoder firmware's own rate
+    /// control for CBR and VBR (enc_rc.sig), not the driver's
+    nvenc_rc_firmware: bool = false,
 };
 
 const Config = struct {
@@ -211,7 +214,8 @@ const Coded = struct {
     fence: u32 = 0,
     ctx: u8 = 0,
     header_bytes: u32 = 0,
-    intra: bool = false,
+    /// what the picture was (encode.finish's rate control and filler)
+    done: encode.Done = .{},
 };
 
 const Surface = struct {
@@ -919,6 +923,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 .enc_scratch = sz,
             };
             d.contexts[i].enc = encode.State.init(kind, cfg.profile, width, height, cfg.rc_mode, cfg.packed_headers);
+            d.contexts[i].enc.firmware_rc = d.opts.nvenc_rc_firmware;
             out.* = CONTEXT_BASE + @as(u32, i);
             d.debug("{s} encode context {d}x{d}: rate control {x}, packed headers {x}", .{ @tagName(kind), width, height, cfg.rc_mode, cfg.packed_headers });
             return va.SUCCESS;
@@ -1118,8 +1123,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             }
             cb.pending = false;
             const c = &d.contexts[cb.ctx];
-            const rate: ?*encode.Rate = if (c.used and c.encoding) &c.enc.rate else null;
-            const f = encode.finish(rate, cb.buf.bytes(), cb.header_bytes, cb.intra);
+            const est: ?*encode.State = if (c.used and c.encoding) &c.enc else null;
+            const f = encode.finish(est, cb.buf.bytes(), cb.done);
             if (f.result.failed()) {
                 d.errors += 1;
                 d.say("an encode failed: error_status {x}, ucode error {x}{s}", .{ f.result.error_status, f.result.ucode_error, if (f.result.ucode_error == nvenc.ENC_ERROR_H264_BAD_MAGIC) " (bad magic: the setup is not the firmware's; GALAXY_VA_NVENC_MAGIC)" else "" });
@@ -1469,17 +1474,19 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             if (st != va.SUCCESS) return st;
             st = d.waitEncodeInput(s, deadline);
             if (st != va.SUCCESS) return st;
-            // (the input's linear picture, which encode.end tiles: made,
-            // and converted from the block-linear one if a decode wrote
-            // that since; an 8-bit picture only)
+            // (the engine reads the input's block-linear picture where it
+            // is: a decode into it done first; an app's CPU write into its
+            // linear copy converted back by the driver's converter, the
+            // GPU's in the shared library; an 8-bit picture only)
             if (s.layout.sample_bytes != 1) return va.ERROR_UNSUPPORTED_RT_FORMAT;
-            st = d.syncLinear(si);
+            st = d.complete(si, deadline);
             if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+            st = d.syncTiled(si);
+            if (st != va.SUCCESS) return st;
             const f = c.frame;
             const frame = c.work.bytes()[f * ENC_FRAME_BYTES ..][0..ENC_FRAME_BYTES];
             const base = c.work.va + f * ENC_FRAME_BYTES;
-            const sz = c.enc_scratch;
-            const sva = c.work.va + c.scratch_off;
+            const input = d.encodeInput(s);
             var out: encode.EndOut = .{};
             st = encode.end(&c.enc, .{
                 .push = words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX),
@@ -1487,22 +1494,12 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 .setup_va = base + ENC_SETUP_OFF,
                 .coded = cb.buf.bytes(),
                 .coded_va = cb.buf.va,
-                .input = .{
-                    .linear = s.linear.bytes(),
-                    .lin = s.linear_layout,
-                    .tiled = s.tiled.bytes(),
-                    .tiled_va = s.tiled.va,
-                    .layout = s.layout,
-                    .width = s.width,
-                    .height = s.height,
-                },
-                .gob = d.opts.gob,
+                .input = input,
                 .lookup = .{ .ctx = d, .surface_fn = lookupSurface },
                 .scratch = .{
-                    .history = sva,
-                    .history_bytes = @intCast(sz.history),
-                    .coloc = .{ sva + sz.history, sva + sz.history + sz.coloc },
-                    .rc_process = sva + sz.history + 2 * sz.coloc,
+                    .base = c.work.va + c.scratch_off,
+                    .cpu = c.work.bytes()[c.scratch_off..][0..c.enc_scratch.total],
+                    .sizes = c.enc_scratch,
                 },
                 .picture_index = c.decodes,
                 .magic = d.opts.nvenc_magic orelse nvenc.MAGIC,
@@ -1516,9 +1513,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 return if (e == error.NoEncoder) va.ERROR_UNIMPLEMENTED else va.ERROR_OPERATION_FAILED;
             };
             const kept = cb.buf;
-            cb.* = .{ .used = true, .buf = kept, .pending = true, .fence = fence, .ctx = ci, .header_bytes = out.header_bytes, .intra = out.intra };
-            // (encode.end tiled the linear picture into the block-linear one)
-            s.tiled_stale = false;
+            cb.* = .{ .used = true, .buf = kept, .pending = true, .fence = fence, .ctx = ci, .header_bytes = out.header_bytes, .done = out.done };
             s.enc_pending = true;
             s.enc_fence = fence;
             c.frame_fence[f] = fence;
@@ -1527,6 +1522,20 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             c.decodes +%= 1;
             d.debug("encode {d} submitted: QP {d}, {d} bytes of headers", .{ c.decodes, out.qp, out.header_bytes });
             return va.SUCCESS;
+        }
+
+        /// The encode's input as the engine reads it: the surface's block-
+        /// linear planes, as they lie (no pass of the driver's).
+        fn encodeInput(_: *Self, s: *Surface) encode.Input {
+            return .{
+                .luma = s.tiled.va,
+                .chroma = s.tiled.va + s.layout.chroma_offset,
+                .pitch_luma = s.layout.luma.pitch,
+                .pitch_chroma = s.layout.chroma.pitch,
+                .rows = s.layout.luma.rows,
+                .width = s.width,
+                .height = s.height,
+            };
         }
 
         fn lookupSurface(ctx: *anyopaque, id: u32) ?codec.SurfaceRef {
@@ -1889,7 +1898,7 @@ pub fn encodeAttribute(profile: va.Profile, kind: u32) u32 {
         ve.ATTRIB_RATE_CONTROL => encode.RC_MODES,
         ve.ATTRIB_ENC_PACKED_HEADERS => encode.PACKED_HEADERS,
         ve.ATTRIB_ENC_INTERLACED => ve.ENC_INTERLACED_NONE,
-        ve.ATTRIB_ENC_MAX_REF_FRAMES => encode.MAX_REFS_L0,
+        ve.ATTRIB_ENC_MAX_REF_FRAMES => encode.MAX_REFS,
         ve.ATTRIB_ENC_MAX_SLICES => nvenc.MAX_SLICES,
         ve.ATTRIB_ENC_SLICE_STRUCTURE => ve.SLICE_STRUCTURE_POWER_OF_TWO_ROWS | ve.SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS | ve.SLICE_STRUCTURE_EQUAL_ROWS | ve.SLICE_STRUCTURE_ARBITRARY_ROWS,
         va.ATTRIB_MAX_PICTURE_WIDTH, va.ATTRIB_MAX_PICTURE_HEIGHT => MAX_SIZE,

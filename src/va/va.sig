@@ -34,8 +34,11 @@
 //!                    pushbuffer
 //!   enc_h264.sig     H.264's SPS and PPS, the encoder's H.264 setup
 //!   enc_hevc.sig     HEVC's VPS, SPS and PPS, the encoder's HEVC setup
-//!   encode.sig       an encode context: buffers, packed headers, rate
-//!                    control, EndPicture's work, the coded buffer
+//!   encode.sig       an encode context: buffers, packed headers, the
+//!                    references kept, EndPicture's work, the coded buffer
+//!   enc_rc.sig       the encoder's rate control: the driver's HRD-bound
+//!                    controller, the firmware's (opt-in)
+//!   enc_parse.sig    what an app's packed HEVC SPS and PPS say
 //!   convert.sig      a picture between its block-linear planes and a
 //!                    pitch-linear copy, for CPU readers (the CPU's;
 //!                    gpu_convert.sig: the RTX's, a KIR kernel)
@@ -59,6 +62,8 @@ pub const nvenc = @import("nvenc.sig");
 pub const enc_h264 = @import("enc_h264.sig");
 pub const enc_hevc = @import("enc_hevc.sig");
 pub const encode = @import("encode.sig");
+pub const enc_rc = @import("enc_rc.sig");
+pub const enc_parse = @import("enc_parse.sig");
 pub const convert = @import("convert.sig");
 pub const driver = @import("driver.sig");
 
@@ -81,6 +86,8 @@ test {
     _ = enc_h264;
     _ = enc_hevc;
     _ = encode;
+    _ = enc_rc;
+    _ = enc_parse;
     _ = convert;
     _ = driver;
     _ = @import("driver_test.sig");

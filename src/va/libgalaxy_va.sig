@@ -228,7 +228,8 @@ fn options() driver.Options {
 /// ("0": no decoder probe at init), GALAXY_VA_AV1_BLACKWELL ("1": AV1's
 /// Blackwell extras, av1.State.blackwell), GALAXY_VA_ENCODE ("0": no
 /// encode entrypoints), GALAXY_VA_NVENC_MAGIC (hex: the encoder setup's
-/// magic word), from an environment block.
+/// magic word), GALAXY_VA_NVENC_RC ("firmware": the encoder's own rate
+/// control), from an environment block.
 pub fn optionsOf(block: []const u8) driver.Options {
     var o: driver.Options = .{};
     var it = std.mem.splitScalar(u8, block, 0);
@@ -249,6 +250,9 @@ pub fn optionsOf(block: []const u8) driver.Options {
         } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_MAGIC")) {
             const hex = if (std.mem.startsWith(u8, v, "0x") or std.mem.startsWith(u8, v, "0X")) v[2..] else v;
             o.nvenc_magic = std.fmt.parseInt(u32, hex, 16) catch null;
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_RC")) {
+            // ("firmware": the encoder's own CBR/VBR, enc_rc.sig)
+            o.nvenc_rc_firmware = std.ascii.eqlIgnoreCase(v, "firmware");
         }
     }
     return o;

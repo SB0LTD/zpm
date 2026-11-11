@@ -911,8 +911,8 @@ test "driver: encode's attributes as FFmpeg asks, configs, and a GPU without an 
     try testing.expectEqual(va.RT_FORMAT_YUV420, attribs[0].value);
     try testing.expectEqual(ve.RC_CQP | ve.RC_CBR | ve.RC_VBR, attribs[1].value);
     try testing.expectEqual(ve.PACKED_HEADER_SEQUENCE | ve.PACKED_HEADER_MISC | ve.PACKED_HEADER_RAW_DATA, attribs[2].value);
-    // one L0 reference, no L1: no B pictures
-    try testing.expectEqual(@as(u32, 1), attribs[3].value);
+    // L0 references in the low half, L1 in the high: B pictures
+    try testing.expectEqual(encode.MAX_REFS, attribs[3].value);
     try testing.expectEqual(@as(u32, nvenc.MAX_SLICES), attribs[4].value);
     try testing.expect(attribs[5].value & ve.SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS != 0);
     try testing.expectEqual(va.ATTRIB_NOT_SUPPORTED, attribs[6].value);
@@ -1007,8 +1007,9 @@ test "driver: H.264 through the fake encoder: an IDR then a P picture, the strea
     try testing.expectEqual(@as(u64, 3), nvenc.get(&enc_seen.setup, nvenc.H264.pic_type)); // IDR
     try testing.expectEqual(@as(u64, 66), nvenc.get(&enc_seen.setup, nvenc.H264.profile_idc));
     try testing.expectEqual(@as(u64, 6), nvenc.get(enc_seen.setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H264Slice.num_mb));
-    // (CBR at 500 kb/s: the rate control's QP, 28 less 2 for an intra picture)
-    try testing.expectEqual(@as(u64, 26), nvenc.get(enc_seen.setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H264Slice.qp_avr));
+    // (CBR at 500 kb/s: the rate control's QP, an intra picture's at or
+    // below the app's initial 28)
+    try testing.expect(nvenc.get(enc_seen.setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H264Slice.qp_avr) <= 28);
     // FFmpeg's async path: vaSyncBuffer on the coded buffer, then map it
     try testing.expectEqual(va.SUCCESS, d.syncBuffer(coded, std.math.maxInt(i64)));
     var n = try codedBytes(&d, coded, &enc_stream);
