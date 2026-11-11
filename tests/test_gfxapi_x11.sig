@@ -23,6 +23,11 @@
 //!   from its dma-buf, presented; interval 1 waits for CompleteNotify,
 //!   idle buffers reused (age 2), interval 0 presents Async; a resize
 //!   (ConfigureNotify) gives new pixmaps, the old freed once idle;
+//! - Xwayland with glamor (DRI3 1.2, Present, XFIXES): pixmaps from
+//!   PixmapFromBuffers with the linear modifier (Xwayland's GBM imports
+//!   them and may hand them to its compositor), a swap's damage as
+//!   Present's update region (top-down, the region made once and set
+//!   after), none for the whole window; DRI3 1.0 servers: PixmapFromBuffer;
 //! - a server that refuses our dma-buf: the window turns to PutImage;
 //! - errors: no server, a window that is not the server's, one of depth
 //!   16, a second surface for a window.
@@ -48,6 +53,7 @@ const get32 = x11.get32;
 const DRI3_OP = 149;
 const PRESENT_OP = 148;
 const SHM_OP = 130;
+const XFIXES_OP = 151;
 
 const Win = struct {
     xid: u32 = 0,
@@ -59,11 +65,22 @@ const Win = struct {
 
 const Seg = struct { seg: u32 = 0, fd: i32 = -1 };
 
+const Region = struct { id: u32 = 0, n: usize = 0, rects: [8][4]u16 = undefined };
+
 const Pix = struct { xid: u32 = 0, fd: i32 = -1, w: u32 = 0, h: u32 = 0, stride: u32 = 0, depth: u8 = 0, size: u32 = 0 };
 
 const Fake = struct {
     // what the server offers
     var dri3 = false;
+    /// DRI3's minor version the server answers (2: PixmapFromBuffers)
+    var dri3_minor: u32 = 2;
+    var xfixes = false;
+    /// XFIXES regions: id, rectangles
+    var regions: [4]Region = undefined;
+    var last_update: u32 = 0;
+    var last_modifier: u64 = 0xff;
+    var from_buffer: u32 = 0;
+    var from_buffers: u32 = 0;
     var present = true;
     var refuse_dri3 = false;
     var refuse_connect = false;
@@ -122,6 +139,13 @@ const Fake = struct {
 
     fn reset() void {
         dri3 = false;
+        dri3_minor = 2;
+        xfixes = false;
+        for (&regions) |*g| g.* = .{};
+        last_update = 0;
+        last_modifier = 0xff;
+        from_buffer = 0;
+        from_buffers = 0;
         present = true;
         refuse_dri3 = false;
         refuse_connect = false;
@@ -181,6 +205,13 @@ const Fake = struct {
     fn win(xid: u32) ?*Win {
         for (&wins) |*x| {
             if (x.xid != 0 and x.xid == xid) return x;
+        }
+        return null;
+    }
+
+    fn region(id: u32) ?*Region {
+        for (&regions) |*g| {
+            if (g.id == id and id != 0) return g;
         }
         return null;
     }
@@ -290,6 +321,8 @@ const Fake = struct {
                     reply(0, &.{ 1, PRESENT_OP, 0, 0 });
                 } else if (std.mem.eql(u8, name, "MIT-SHM") and shm) {
                     reply(0, &.{ 1, SHM_OP, 0, 0 });
+                } else if (std.mem.eql(u8, name, "XFIXES") and xfixes) {
+                    reply(0, &.{ 1, XFIXES_OP, 0, 0 });
                 } else reply(0, &.{ 0, 0, 0, 0 });
             },
             x11.OP_GET_GEOMETRY => {
@@ -336,8 +369,29 @@ const Fake = struct {
                 put_rows += ih;
             },
             DRI3_OP => switch (r[1]) {
-                x11.DRI3_QUERY_VERSION => queue(&x11.versionReply(seq, 1, 2)),
+                x11.DRI3_QUERY_VERSION => queue(&x11.versionReply(seq, 1, dri3_minor)),
+                x11.DRI3_PIXMAP_FROM_BUFFERS => {
+                    std.debug.assert(dri3_minor >= 2);
+                    std.debug.assert(fds_used < n_fds);
+                    const fd = fds[fds_used];
+                    fds_used += 1;
+                    from_buffers += 1;
+                    if (refuse_dri3) return sendError(x11.BAD_ALLOC, 0, DRI3_OP, x11.DRI3_PIXMAP_FROM_BUFFERS);
+                    std.debug.assert(r.len == 64 and r[12] == 1 and r[53] == 32);
+                    last_modifier = x11.get64(r[56..]);
+                    for (&pixmaps) |*p| {
+                        if (p.xid == 0) {
+                            const stride = get32(r[20..]);
+                            const h: u32 = get16(r[18..]);
+                            p.* = .{ .xid = get32(r[4..]), .fd = fd, .size = stride * h, .w = get16(r[16..]), .h = h, .stride = stride, .depth = r[52] };
+                            made_pixmaps += 1;
+                            return;
+                        }
+                    }
+                    unreachable;
+                },
                 x11.DRI3_PIXMAP_FROM_BUFFER => {
+                    from_buffer += 1;
                     std.debug.assert(fds_used < n_fds);
                     const fd = fds[fds_used];
                     fds_used += 1;
@@ -412,6 +466,33 @@ const Fake = struct {
                     sendError(1, 0, r[0], r[1]);
                 },
             },
+            XFIXES_OP => switch (r[1]) {
+                x11.XFIXES_QUERY_VERSION => queue(&x11.versionReply(seq, 5, 0)),
+                x11.XFIXES_CREATE_REGION, x11.XFIXES_SET_REGION => {
+                    const id = get32(r[4..]);
+                    const g = for (&regions) |*g| {
+                        if (g.id == id) break g;
+                    } else for (&regions) |*g| {
+                        if (g.id == 0) break g;
+                    } else unreachable;
+                    if ((r[1] == x11.XFIXES_CREATE_REGION) != (g.id == 0)) return sendError(x11.BAD_MATCH, id, r[0], r[1]);
+                    g.id = id;
+                    g.n = (r.len - 8) / 8;
+                    for (0..g.n) |i| {
+                        const at = r[8 + 8 * i ..];
+                        g.rects[i] = .{ get16(at[0..]), get16(at[2..]), get16(at[4..]), get16(at[6..]) };
+                    }
+                },
+                x11.XFIXES_DESTROY_REGION => {
+                    for (&regions) |*g| {
+                        if (g.id == get32(r[4..])) g.* = .{};
+                    }
+                },
+                else => {
+                    bad_requests += 1;
+                    sendError(1, 0, r[0], r[1]);
+                },
+            },
             PRESENT_OP => switch (r[1]) {
                 x11.PRESENT_QUERY_VERSION => queue(&x11.versionReply(seq, 1, 2)),
                 x11.PRESENT_SELECT_INPUT => {
@@ -427,6 +508,8 @@ const Fake = struct {
                     _ = pixmap(pm) orelse return sendError(x11.BAD_PIXMAP, pm, r[0], r[1]);
                     presents += 1;
                     last_options = get32(r[40..]);
+                    last_update = get32(r[20..]);
+                    if (last_update != 0 and region(last_update) == null) return sendError(140, last_update, r[0], r[1]); // (BadRegion)
                     // shown: this frame complete, the one before idle
                     var c = presentEvent(x11.PRESENT_COMPLETE_NOTIFY, 2);
                     put32(c[16..], window);
@@ -834,6 +917,87 @@ test "x11: DRI3 and Present: dma-buf pixmaps presented, interval 1 waits for com
     try testing.expect(egl.destroyContext(d, ctx));
     try testing.expect(egl.terminate(d));
     try testing.expect(Fake.closed);
+}
+
+test "x11: Xwayland with glamor: PixmapFromBuffers (linear), damage as Present's update region" {
+    useDriver();
+    Fake.reset();
+    Fake.dri3 = true;
+    Fake.xfixes = true;
+    _ = Fake.addWindow(0x600004, 32, 16, 24);
+    const d = egl.getDisplay(null).?;
+    try testing.expect(egl.initialize(d, null, null));
+    const cfg = firefoxConfig(d, 24) orelse return error.NoConfig;
+    const s = egl.createWindowSurface(i32, d, cfg, @ptrFromInt(0x600004), null) orelse return error.WindowSurface;
+    try testing.expectEqual(x11.Mode.present, s.xwin.mode);
+    try testing.expect(s.xwin.conn.xfixes != null);
+    const ctx = egl.createContext(d, cfg, null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.NONE }).?;
+    try testing.expect(egl.makeCurrent(d, s, s, ctx));
+    const c = thread.gl().?;
+    // frame 1: everything (no damage): no update region; the pixmap from
+    // PixmapFromBuffers, linear
+    c.clearColor(1, 0, 0, 1);
+    c.clear(gl.COLOR_BUFFER_BIT);
+    try testing.expect(egl.swapBuffers(d, s, &.{}));
+    try testing.expectEqual(@as(u32, 1), Fake.from_buffers);
+    try testing.expectEqual(@as(u32, 0), Fake.from_buffer);
+    try testing.expectEqual(@as(u64, 0), Fake.last_modifier);
+    try testing.expectEqual(@as(u32, 128), Fake.pixmap(Fake.last_presented).?.stride);
+    try testing.expectEqual(@as(u32, 0), Fake.last_update);
+    // frame 2: two damaged rectangles (EGL's, from the bottom left): the
+    // update region made with them, top-down
+    var age: i32 = 0;
+    try testing.expect(egl.querySurface(d, s, egl.BUFFER_AGE_EXT, &age));
+    c.clear(gl.COLOR_BUFFER_BIT);
+    try testing.expect(egl.swapBuffers(d, s, &.{ .{ 2, 0, 4, 3 }, .{ 0, 10, 32, 6 } }));
+    const id = Fake.last_update;
+    try testing.expect(id != 0);
+    const g = Fake.region(id).?;
+    try testing.expectEqual(@as(usize, 2), g.n);
+    try testing.expectEqual([4]u16{ 2, 13, 4, 3 }, g.rects[0]);
+    try testing.expectEqual([4]u16{ 0, 0, 32, 6 }, g.rects[1]);
+    // frame 3: other damage: the same region, set
+    c.clear(gl.COLOR_BUFFER_BIT);
+    try testing.expect(egl.swapBuffers(d, s, &.{.{ 31, 15, 1, 1 }}));
+    try testing.expectEqual(id, Fake.last_update);
+    try testing.expectEqual(@as(usize, 1), g.n);
+    try testing.expectEqual([4]u16{ 31, 0, 1, 1 }, g.rects[0]);
+    try testing.expectEqual(@as(u64, 2), s.xwin.stats.partial);
+    // frame 4: damage covering the whole window: no region
+    c.clear(gl.COLOR_BUFFER_BIT);
+    try testing.expect(egl.swapBuffers(d, s, &.{.{ 0, 0, 32, 16 }}));
+    try testing.expectEqual(@as(u32, 0), Fake.last_update);
+    try testing.expectEqual(@as(u32, 0), Fake.errors_sent);
+    try testing.expectEqual(@as(u32, 0), Fake.bad_requests);
+    // the region goes with the surface
+    try testing.expect(egl.makeCurrent(d, null, null, null));
+    try testing.expect(egl.destroySurface(d, s));
+    try testing.expect(Fake.region(id) == null);
+    try testing.expect(egl.destroyContext(d, ctx));
+    try testing.expect(egl.terminate(d));
+
+    // a DRI3 1.0 server: PixmapFromBuffer, as before
+    useDriver();
+    Fake.reset();
+    Fake.dri3 = true;
+    Fake.dri3_minor = 0;
+    _ = Fake.addWindow(0x600006, 16, 16, 24);
+    const d2 = egl.getDisplay(null).?;
+    try testing.expect(egl.initialize(d2, null, null));
+    const cfg2 = firefoxConfig(d2, 24) orelse return error.NoConfig;
+    const s2 = egl.createWindowSurface(i32, d2, cfg2, @ptrFromInt(0x600006), null) orelse return error.WindowSurface;
+    const ctx2 = egl.createContext(d2, cfg2, null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.NONE }).?;
+    try testing.expect(egl.makeCurrent(d2, s2, s2, ctx2));
+    thread.gl().?.clear(gl.COLOR_BUFFER_BIT);
+    try testing.expect(egl.swapBuffers(d2, s2, &.{.{ 0, 0, 4, 4 }}));
+    try testing.expectEqual(@as(u32, 1), Fake.from_buffer);
+    try testing.expectEqual(@as(u32, 0), Fake.from_buffers);
+    // (no XFIXES on this server: the whole window)
+    try testing.expectEqual(@as(u32, 0), Fake.last_update);
+    try testing.expect(egl.makeCurrent(d2, null, null, null));
+    try testing.expect(egl.destroySurface(d2, s2));
+    try testing.expect(egl.destroyContext(d2, ctx2));
+    try testing.expect(egl.terminate(d2));
 }
 
 test "x11: MIT-SHM (Galaxy's Xwayland: Present and MIT-SHM, no DRI3): frames through shared memory, damage, resize, a refusal" {

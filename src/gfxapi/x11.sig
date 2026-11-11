@@ -20,9 +20,13 @@
 //!   - *DRI3 and Present* (a server that imports dma-bufs: Xwayland with
 //!     glamor): up to MAX_BUFFERS engine images in GPU memory (top-down
 //!     BGRA, linear, the window's depth, 32 bits a pixel), each a pixmap
-//!     made from its dma-buf (DRI3 PixmapFromBuffer, the fd passed with
+//!     made from its dma-buf (DRI3 1.2's PixmapFromBuffers with the linear
+//!     modifier, so Xwayland can hand the buffer itself to its compositor;
+//!     DRI3 1.0's PixmapFromBuffer on an older server; the fd passed with
 //!     SCM_RIGHTS) and shown with PresentPixmap, as Mesa's DRI3 loader
-//!     does. A pixmap is the server's until its IdleNotify; with all of
+//!     does. The swap's damage (EGL_KHR_swap_buffers_with_damage) goes as
+//!     Present's update region (an XFixes region, where the server has
+//!     XFIXES 2), so Xwayland copies and damages only what changed. A pixmap is the server's until its IdleNotify; with all of
 //!     them held, EGL waits for one. Swap interval 1 waits for the last
 //!     frame's CompleteNotify first (the frame clock); 0 presents Async.
 //!     Present's ConfigureNotify marks the window resized. A server that
@@ -230,6 +234,14 @@ pub const OP_QUERY_EXTENSION = 98;
 // DRI3's
 pub const DRI3_QUERY_VERSION = 0;
 pub const DRI3_PIXMAP_FROM_BUFFER = 2;
+pub const DRI3_PIXMAP_FROM_BUFFERS = 7;
+// XFIXES' (2.0: regions)
+pub const XFIXES_QUERY_VERSION = 0;
+pub const XFIXES_CREATE_REGION = 5;
+pub const XFIXES_DESTROY_REGION = 10;
+pub const XFIXES_SET_REGION = 11;
+/// DRM_FORMAT_MOD_LINEAR
+pub const MOD_LINEAR: u64 = 0;
 // MIT-SHM's
 pub const SHM_QUERY_VERSION = 0;
 pub const SHM_DETACH = 2;
@@ -375,7 +387,11 @@ pub const Conn = struct {
     out: [OUT_BYTES]u8 = undefined,
     out_len: usize = 0,
     dri3: ?Ext = null,
+    /// DRI3's minor version as the server answered (2: PixmapFromBuffers)
+    dri3_minor: u32 = 0,
     present: ?Ext = null,
+    /// XFIXES 2 (regions: Present's update), where Present is
+    xfixes: ?Ext = null,
     /// MIT-SHM 1.2 (ShmAttachFd), where the Wire has shared memory
     shm: ?Ext = null,
     /// errors for requests no reply waited for (the last MAX_ERRORS)
@@ -417,13 +433,29 @@ pub const Conn = struct {
             c.close();
             return false;
         }
-        // (DRI3 1.0's PixmapFromBuffer and Present 1.0's PresentPixmap are
-        // all EGL asks; the versions are said so the server enables them)
+        // (DRI3 1.2's PixmapFromBuffers, else 1.0's PixmapFromBuffer, and
+        // Present 1.0's PresentPixmap are all EGL asks; the versions are
+        // said so the server enables them)
         if (c.dri3) |e| {
-            if (!c.queryVersion(e, DRI3_QUERY_VERSION, 1, 0)) c.dri3 = null;
+            if (c.queryVersion(e, DRI3_QUERY_VERSION, 1, 2)) |minor| {
+                c.dri3_minor = minor;
+            } else c.dri3 = null;
         }
         if (c.present) |e| {
-            if (!c.queryVersion(e, PRESENT_QUERY_VERSION, 1, 0)) c.present = null;
+            if (c.queryVersion(e, PRESENT_QUERY_VERSION, 1, 0) == null) c.present = null;
+        }
+        // (a frame's damage as Present's update region)
+        if (c.present != null) {
+            c.xfixes = c.queryExtension("XFIXES");
+            if (c.xfixes) |e| {
+                const r = c.begin(e.opcode, XFIXES_QUERY_VERSION, 3);
+                if (r) |q| {
+                    put32(q.b[4..], 5);
+                    put32(q.b[8..], 0);
+                    const rep = c.wait(q.seq);
+                    if (rep == null or get32(rep.?[8..]) < 2) c.xfixes = null;
+                } else c.xfixes = null;
+            }
         }
         if (wire.shm_create != null and wire.shm_destroy != null) {
             c.shm = c.queryExtension("MIT-SHM");
@@ -435,7 +467,7 @@ pub const Conn = struct {
             c.close();
             return false;
         }
-        report.say(.device, "X11: {s} {d}x{d}, depth {d}; DRI3 {s}, Present {s}, MIT-SHM {s}", .{ name, c.setup.width, c.setup.height, c.setup.root_depth, if (c.dri3 != null) "yes" else "no", if (c.present != null) "yes" else "no", if (c.shm != null) "yes" else "no" });
+        report.say(.device, "X11: {s} {d}x{d}, depth {d}; DRI3 {s}, Present {s}, XFIXES {s}, MIT-SHM {s}", .{ name, c.setup.width, c.setup.height, c.setup.root_depth, if (c.dri3 == null) "no" else if (c.dri3_minor >= 2) "1.2" else "1.0", if (c.present != null) "yes" else "no", if (c.xfixes != null) "yes" else "no", if (c.shm != null) "yes" else "no" });
         return true;
     }
 
@@ -680,12 +712,15 @@ pub const Conn = struct {
         return .{ .opcode = rep[9], .first_event = rep[10] };
     }
 
-    fn queryVersion(c: *Conn, e: Ext, minor_op: u8, major: u32, minor: u32) bool {
-        const r = c.begin(e.opcode, minor_op, 3) orelse return false;
+    /// An extension's QueryVersion: the server's minor version when its
+    /// major is `major` or later, else null.
+    fn queryVersion(c: *Conn, e: Ext, minor_op: u8, major: u32, minor: u32) ?u32 {
+        const r = c.begin(e.opcode, minor_op, 3) orelse return null;
         put32(r.b[4..], major);
         put32(r.b[8..], minor);
-        const rep = c.wait(r.seq) orelse return false;
-        return get32(rep[8..]) >= major;
+        const rep = c.wait(r.seq) orelse return null;
+        if (get32(rep[8..]) < major) return null;
+        return if (get32(rep[8..]) > major) 0xffff else get32(rep[12..]);
     }
 
     /// MIT-SHM's QueryVersion: 1.2 or later (ShmAttachFd).
@@ -808,6 +843,48 @@ pub const Conn = struct {
         return c.sendWithFds(&req, &.{fd});
     }
 
+    /// DRI3 1.2 PixmapFromBuffers: `pixmap` made from the one-plane dma-buf
+    /// `fd` (sent with it; the caller keeps its own) with `modifier`.
+    fn pixmapFromBuffers(c: *Conn, pixmap: u32, window: u32, fd: i32, w: u32, h: u32, stride: u32, depth: u8, modifier: u64) ?u32 {
+        const e = c.dri3 orelse return null;
+        var req = [_]u8{0} ** 64;
+        req[0] = e.opcode;
+        req[1] = DRI3_PIXMAP_FROM_BUFFERS;
+        put16(req[2..], 16);
+        put32(req[4..], pixmap);
+        put32(req[8..], window);
+        req[12] = 1; // one buffer
+        put16(req[16..], @intCast(w));
+        put16(req[18..], @intCast(h));
+        put32(req[20..], stride); // stride0, offset0 (0); the other planes 0
+        req[52] = depth;
+        req[53] = 32;
+        put64(req[56..], modifier);
+        return c.sendWithFds(&req, &.{fd});
+    }
+
+    /// XFIXES CreateRegion (`op` XFIXES_CREATE_REGION) or SetRegion
+    /// (XFIXES_SET_REGION) of `region` from rectangles (x, y, w, h).
+    fn region(c: *Conn, op: u8, id: u32, rects: []const [4]u32) ?u32 {
+        const e = c.xfixes orelse return null;
+        const r = c.begin(e.opcode, op, 2 + 2 * rects.len) orelse return null;
+        put32(r.b[4..], id);
+        for (rects, 0..) |q, i| {
+            const at = r.b[8 + 8 * i ..];
+            put16(at[0..], @intCast(q[0]));
+            put16(at[2..], @intCast(q[1]));
+            put16(at[4..], @intCast(q[2]));
+            put16(at[6..], @intCast(q[3]));
+        }
+        return r.seq;
+    }
+
+    fn destroyRegion(c: *Conn, id: u32) void {
+        const e = c.xfixes orelse return;
+        const r = c.begin(e.opcode, XFIXES_DESTROY_REGION, 2) orelse return;
+        put32(r.b[4..], id);
+    }
+
     fn presentSelectInput(c: *Conn, eid: u32, window: u32, mask: u32) ?u32 {
         const e = c.present orelse return null;
         const r = c.begin(e.opcode, PRESENT_SELECT_INPUT, 4) orelse return null;
@@ -817,14 +894,17 @@ pub const Conn = struct {
         return r.seq;
     }
 
-    fn presentPixmap(c: *Conn, window: u32, pixmap: u32, serial: u32, options: u32) ?u32 {
+    /// PresentPixmap: `update` the region that changed (None: all of it).
+    fn presentPixmap(c: *Conn, window: u32, pixmap: u32, serial: u32, update: u32, options: u32) ?u32 {
         const e = c.present orelse return null;
         const r = c.begin(e.opcode, PRESENT_PIXMAP, 18) orelse return null;
         put32(r.b[4..], window);
         put32(r.b[8..], pixmap);
         put32(r.b[12..], serial);
-        // valid, update: None (all of it); x_off, y_off 0; target_crtc,
-        // wait_fence, idle_fence None (the dma-buf's implicit fences)
+        // valid: None (all of it, so Xwayland may flip); x_off, y_off 0;
+        // target_crtc, wait_fence, idle_fence None (the dma-buf's
+        // implicit fences)
+        put32(r.b[20..], update);
         put32(r.b[40..], options);
         // target_msc, divisor, remainder 0: the next frame
         return r.seq;
@@ -868,6 +948,10 @@ pub const Window = struct {
     completing: bool = false,
     /// PutImage's and MIT-SHM's graphics context
     gc: u32 = 0,
+    /// Present's update region (XFIXES), 0: none made yet
+    region: u32 = 0,
+    /// the last frame's update was a region (0: the whole window)
+    last_update: u32 = 0,
     /// MIT-SHM's segment (0: none yet) and its memory
     seg: u32 = 0,
     shm: ?Shm = null,
@@ -877,7 +961,7 @@ pub const Window = struct {
     /// GL takes a back buffer afresh at its next drawing (egl.sig's
     /// revalidate, which clears it as it binds)
     resized: std.atomic.Value(bool) = .init(false),
-    stats: struct { swaps: u64 = 0, idle_waits: u64 = 0, complete_waits: u64 = 0, made: u64 = 0, put_bytes: u64 = 0, put_requests: u64 = 0, geometry: u64 = 0 } = .{},
+    stats: struct { swaps: u64 = 0, idle_waits: u64 = 0, complete_waits: u64 = 0, made: u64 = 0, put_bytes: u64 = 0, put_requests: u64 = 0, geometry: u64 = 0, partial: u64 = 0 } = .{},
 
     /// A window in place over X window `xid` (it stays at `w`: events find
     /// it there). False when the window is not the server's, its depth is
@@ -933,6 +1017,7 @@ pub const Window = struct {
         w.dropSegment();
         if (c.live()) {
             if (w.eid != 0) _ = c.presentSelectInput(w.eid, w.xid, 0);
+            if (w.region != 0) c.destroyRegion(w.region);
             if (w.gc != 0) c.freeGc(w.gc);
             _ = c.flush();
         }
@@ -941,6 +1026,7 @@ pub const Window = struct {
         }
         w.eid = 0;
         w.gc = 0;
+        w.region = 0;
     }
 
     /// MIT-SHM's segment detached and its memory let go.
@@ -1076,7 +1162,10 @@ pub const Window = struct {
             w.eng.freeImage(&b.img);
             return false;
         };
-        const seq = c.pixmapFromBuffer(pixmap, w.xid, @intCast(fd), img.stride * img.height, img.width, img.height, img.stride, w.depth) orelse {
+        const seq = (if (c.dri3_minor >= 2)
+            c.pixmapFromBuffers(pixmap, w.xid, @intCast(fd), img.width, img.height, img.stride, w.depth, MOD_LINEAR)
+        else
+            c.pixmapFromBuffer(pixmap, w.xid, @intCast(fd), img.stride * img.height, img.width, img.height, img.stride, w.depth)) orelse {
             w.eng.freeImage(&b.img);
             return false;
         };
@@ -1128,7 +1217,7 @@ pub const Window = struct {
         if (w.gone) return false;
         _ = w.backImage() orelse return false;
         const ok = switch (w.mode) {
-            .present => w.swapPresent(),
+            .present => w.swapPresent(damage),
             .shm => w.swapShm(damage) or (w.mode == .put_image and w.swapPutImage(damage)),
             .put_image => w.swapPutImage(damage),
         };
@@ -1139,7 +1228,7 @@ pub const Window = struct {
         return true;
     }
 
-    fn swapPresent(w: *Window) bool {
+    fn swapPresent(w: *Window, damage: []const [4]i32) bool {
         const c = w.conn;
         // (interval 1: one frame on the screen at a time)
         while (w.interval > 0 and w.completing) {
@@ -1150,7 +1239,8 @@ pub const Window = struct {
         // the GPU's work runs; the dma-buf's fence covers it
         w.eng.flush();
         w.serial +%= 1;
-        const seq = c.presentPixmap(w.xid, b.pixmap, w.serial, if (w.interval == 0) PRESENT_OPTION_ASYNC else 0) orelse return false;
+        const update = w.updateRegion(&b.img, damage);
+        const seq = c.presentPixmap(w.xid, b.pixmap, w.serial, update, if (w.interval == 0) PRESENT_OPTION_ASYNC else 0) orelse return false;
         if (!c.flush()) return false;
         if (c.errorOf(seq)) |_| return false;
         w.completing = true;
@@ -1159,6 +1249,26 @@ pub const Window = struct {
         b.busy = true;
         w.back = null;
         return true;
+    }
+
+    /// Present's update region for a frame's damage: the window's region
+    /// set to its rectangles (made at the first), or None (0: all of it)
+    /// without damage, without XFIXES, or when it covers the whole image.
+    fn updateRegion(w: *Window, img: *const Image, damage: []const [4]i32) u32 {
+        const c = w.conn;
+        if (c.xfixes == null or damage.len == 0 or damage.len > MAX_RECTS) return 0;
+        var rb: [MAX_RECTS][4]u32 = undefined;
+        const rects = rectsOf(img, damage, &rb);
+        if (rects.len == 1 and rects[0][0] == 0 and rects[0][1] == 0 and rects[0][2] == img.width and rects[0][3] == img.height) return 0;
+        if (w.region == 0) {
+            const id = c.newXid() orelse return 0;
+            _ = c.region(XFIXES_CREATE_REGION, id, rects) orelse return 0;
+            w.region = id;
+        } else {
+            _ = c.region(XFIXES_SET_REGION, w.region, rects) orelse return 0;
+        }
+        w.stats.partial += 1;
+        return w.region;
     }
 
     /// The damaged rectangles (top-down rows, clamped to the image) of
@@ -1505,18 +1615,25 @@ test "x11: the connection: setup, extensions, versions; requests as bytes" {
     Script.feed(&reply(2, 0, &.{ 1, 148, 0, 0 }));
     Script.feed(&versionReply(3, 1, 2)); // DRI3 1.2
     Script.feed(&versionReply(4, 1, 4)); // Present 1.4
+    Script.feed(&reply(5, 0, &.{ 1, 150, 0, 0 })); // XFIXES (150)
+    Script.feed(&versionReply(6, 6, 0)); // XFIXES 6.0
     var c: Conn = undefined;
     try testing.expect(c.open(&Script.wire, ":1", null));
     try testing.expectEqual(@as(u8, 149), c.dri3.?.opcode);
+    try testing.expectEqual(@as(u32, 2), c.dri3_minor);
     try testing.expectEqual(@as(u8, 148), c.present.?.opcode);
-    try testing.expectEqual(@as(u32, 4), c.sent);
+    try testing.expectEqual(@as(u8, 150), c.xfixes.?.opcode);
+    try testing.expectEqual(@as(u32, 6), c.sent);
     const sent = Script.out[0..Script.out_len];
     try testing.expectEqualSlices(u8, &setupRequest(), sent[0..12]);
     // QueryExtension "DRI3": opcode 98, length 3, name length 4
     try testing.expectEqualSlices(u8, &.{ 98, 0, 3, 0, 4, 0, 0, 0, 'D', 'R', 'I', '3' }, sent[12..24]);
     try testing.expectEqualSlices(u8, &.{ 98, 0, 4, 0, 7, 0, 0, 0, 'P', 'r', 'e', 's', 'e', 'n', 't', 0 }, sent[24..40]);
-    try testing.expectEqualSlices(u8, &.{ 149, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0 }, sent[40..52]);
+    // (DRI3 asked for 1.2, Present for 1.0, XFIXES for 5.0)
+    try testing.expectEqualSlices(u8, &.{ 149, 0, 3, 0, 1, 0, 0, 0, 2, 0, 0, 0 }, sent[40..52]);
     try testing.expectEqualSlices(u8, &.{ 148, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0 }, sent[52..64]);
+    try testing.expectEqualSlices(u8, &.{ 98, 0, 4, 0, 6, 0, 0, 0, 'X', 'F', 'I', 'X', 'E', 'S', 0, 0 }, sent[64..80]);
+    try testing.expectEqualSlices(u8, &.{ 150, 0, 3, 0, 5, 0, 0, 0, 0, 0, 0, 0 }, sent[80..92]);
 
     // ids: base | n * (the mask's lowest bit)
     try testing.expectEqual(@as(u32, 0x0020_0001), c.newXid().?);
@@ -1524,7 +1641,7 @@ test "x11: the connection: setup, extensions, versions; requests as bytes" {
 
     // PresentPixmap: 72 bytes, the window, pixmap, serial and options
     Script.out_len = 0;
-    _ = c.presentPixmap(0x400001, 0x200002, 7, PRESENT_OPTION_ASYNC).?;
+    _ = c.presentPixmap(0x400001, 0x200002, 7, 0, PRESENT_OPTION_ASYNC).?;
     _ = c.flush();
     const pp = Script.out[0..Script.out_len];
     try testing.expectEqual(@as(usize, 72), pp.len);
@@ -1542,6 +1659,21 @@ test "x11: the connection: setup, extensions, versions; requests as bytes" {
     try testing.expectEqualSlices(u8, &.{ 149, 2, 6, 0, 0x03, 0, 0x20, 0, 0x01, 0, 0x40, 0, 0x00, 0x10, 0, 0, 64, 0, 16, 0, 0, 1, 24, 32 }, Script.out[0..Script.out_len]);
     try testing.expectEqual(@as(usize, 1), Script.n_fds);
     try testing.expectEqual(@as(i32, 42), Script.fds[0]);
+
+    // DRI3 1.2 PixmapFromBuffers: 64 bytes, one plane, the linear modifier
+    Script.out_len = 0;
+    _ = c.pixmapFromBuffers(0x200003, 0x400001, 43, 64, 16, 256, 24, MOD_LINEAR).?;
+    const pb = Script.out[0..Script.out_len];
+    try testing.expectEqual(@as(usize, 64), pb.len);
+    try testing.expectEqualSlices(u8, &.{ 149, 7, 16, 0, 0x03, 0, 0x20, 0, 0x01, 0, 0x40, 0, 1, 0, 0, 0, 64, 0, 16, 0, 0, 1, 0, 0 }, pb[0..24]);
+    try testing.expectEqualSlices(u8, &.{ 24, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, pb[52..64]);
+    try testing.expectEqual(@as(i32, 43), Script.fds[1]);
+
+    // XFIXES SetRegion: the region and its rectangles (x, y, w, h)
+    Script.out_len = 0;
+    _ = c.region(XFIXES_SET_REGION, 0x200005, &.{ .{ 1, 2, 3, 4 }, .{ 10, 20, 30, 40 } }).?;
+    _ = c.flush();
+    try testing.expectEqualSlices(u8, &.{ 150, 11, 6, 0, 0x05, 0, 0x20, 0, 1, 0, 2, 0, 3, 0, 4, 0, 10, 0, 20, 0, 30, 0, 40, 0 }, Script.out[0..Script.out_len]);
 
     // PutImage: header and rows
     Script.out_len = 0;
