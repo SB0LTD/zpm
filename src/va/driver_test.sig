@@ -207,12 +207,12 @@ test "driver: profiles, entrypoints, attributes, and Firefox's probe" {
     // looks for)
     try testing.expectEqualSlices(va.Profile, &.{ 13, 6, 7, 17, 18, 14, 19, 21, 32 }, profiles[0..@intCast(n)]);
     // Firefox's vaapitest: each profile's entrypoints, then a config of
-    // (profile, VLD) with no attributes; H.264 and HEVC also encode
+    // (profile, VLD) with no attributes; H.264, HEVC and AV1 also encode
     for (profiles[0..@intCast(n)]) |p| {
         var eps: [4]va.Entrypoint = undefined;
         var m: i32 = 0;
         try testing.expectEqual(va.SUCCESS, d.queryConfigEntrypoints(p, &eps, &m));
-        if (p == 14 or p == va.PROFILE_VP9_PROFILE_0 or p == va.PROFILE_AV1_PROFILE_0 or p == va.PROFILE_HEVC_MAIN10 or p == va.PROFILE_VP9_PROFILE_2) {
+        if (p == 14 or p == va.PROFILE_VP9_PROFILE_0 or p == va.PROFILE_HEVC_MAIN10 or p == va.PROFILE_VP9_PROFILE_2) {
             try testing.expectEqualSlices(va.Entrypoint, &.{va.ENTRYPOINT_VLD}, eps[0..@intCast(m)]);
         } else {
             try testing.expectEqualSlices(va.Entrypoint, &.{ va.ENTRYPOINT_VLD, ve.ENTRYPOINT_ENC_SLICE }, eps[0..@intCast(m)]);

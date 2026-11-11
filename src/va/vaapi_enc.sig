@@ -27,6 +27,12 @@ pub const ATTRIB_MAX_FRAME_SIZE: u32 = 38;
 pub const ATTRIB_PREDICTION_DIRECTION: u32 = 39;
 pub const ATTRIB_ENC_HEVC_FEATURES: u32 = 50;
 pub const ATTRIB_ENC_HEVC_BLOCK_SIZES: u32 = 51;
+pub const ATTRIB_ENC_AV1: u32 = 52;
+pub const ATTRIB_ENC_AV1_EXT1: u32 = 53;
+pub const ATTRIB_ENC_AV1_EXT2: u32 = 54;
+pub const ATTRIB_ENC_TILE_SUPPORT: u32 = 35;
+pub const ATTRIB_ENC_MAX_TILE_ROWS: u32 = 56;
+pub const ATTRIB_ENC_MAX_TILE_COLS: u32 = 57;
 
 pub const RC_NONE: u32 = 0x01;
 pub const RC_CBR: u32 = 0x02;
@@ -422,6 +428,165 @@ pub const EncSliceParameterBufferHEVC = extern struct {
     va_reserved: [6]u32,
 };
 
+// ── AV1 (va_enc_av1.h) ──────────────────────────────────────────────────────
+
+pub const EncSeqFieldsAV1 = packed struct(u32) {
+    still_picture: u1 = 0,
+    use_128x128_superblock: u1 = 0,
+    enable_filter_intra: u1 = 0,
+    enable_intra_edge_filter: u1 = 0,
+    enable_interintra_compound: u1 = 0,
+    enable_masked_compound: u1 = 0,
+    enable_warped_motion: u1 = 0,
+    enable_dual_filter: u1 = 0,
+    enable_order_hint: u1 = 0,
+    enable_jnt_comp: u1 = 0,
+    enable_ref_frame_mvs: u1 = 0,
+    enable_superres: u1 = 0,
+    enable_cdef: u1 = 0,
+    enable_restoration: u1 = 0,
+    bit_depth_minus8: u3 = 0,
+    subsampling_x: u1 = 0,
+    subsampling_y: u1 = 0,
+    mono_chrome: u1 = 0,
+    _: u12 = 0,
+};
+
+pub const EncSequenceParameterBufferAV1 = extern struct {
+    seq_profile: u8,
+    seq_level_idx: u8,
+    seq_tier: u8,
+    hierarchical_flag: u8,
+    intra_period: u32,
+    ip_period: u32,
+    bits_per_second: u32,
+    seq_fields: EncSeqFieldsAV1,
+    order_hint_bits_minus_1: u8,
+    va_reserved: [16]u32,
+};
+
+pub const EncPicFlagsAV1 = packed struct(u32) {
+    /// 0 key, 1 inter, 2 intra only, 3 switch
+    frame_type: u2 = 0,
+    error_resilient_mode: u1 = 0,
+    disable_cdf_update: u1 = 0,
+    use_superres: u1 = 0,
+    allow_high_precision_mv: u1 = 0,
+    use_ref_frame_mvs: u1 = 0,
+    disable_frame_end_update_cdf: u1 = 0,
+    reduced_tx_set: u1 = 0,
+    enable_frame_obu: u1 = 0,
+    long_term_reference: u1 = 0,
+    disable_frame_recon: u1 = 0,
+    allow_intrabc: u1 = 0,
+    palette_mode_enable: u1 = 0,
+    allow_screen_content_tools: u1 = 0,
+    force_integer_mv: u1 = 0,
+    _: u16 = 0,
+};
+
+pub const EncModeControlAV1 = packed struct(u32) {
+    delta_q_present: u1 = 0,
+    delta_q_res: u2 = 0,
+    delta_lf_present: u1 = 0,
+    delta_lf_res: u2 = 0,
+    delta_lf_multi: u1 = 0,
+    /// 0 only 4x4, 1 largest, 2 select
+    tx_mode: u2 = 0,
+    /// 0 single, 1 compound, 2 select
+    reference_mode: u2 = 0,
+    skip_mode_present: u1 = 0,
+    _: u20 = 0,
+};
+
+pub const EncSegParamAV1 = extern struct {
+    seg_flags: u8,
+    segment_number: u8,
+    feature_data: [8][8]i16,
+    feature_mask: [8]u8,
+    va_reserved: [4]u32,
+};
+
+pub const EncWarpedMotionAV1 = extern struct {
+    wmtype: u32,
+    wmmat: [8]i32,
+    invalid: u8,
+    va_reserved: [4]u32,
+};
+
+pub const EncPictureParameterBufferAV1 = extern struct {
+    frame_width_minus_1: u16,
+    frame_height_minus_1: u16,
+    reconstructed_frame: u32,
+    coded_buf: u32,
+    reference_frames: [8]u32,
+    ref_frame_idx: [7]u8,
+    hierarchical_level_plus1: u8,
+    primary_ref_frame: u8,
+    order_hint: u8,
+    refresh_frame_flags: u8,
+    reserved8bits1: u8,
+    /// search_idx0..6: 3 bits each, reference names (LAST 1 .. ALTREF 7)
+    ref_frame_ctrl_l0: u32,
+    ref_frame_ctrl_l1: u32,
+    picture_flags: EncPicFlagsAV1,
+    seg_id_block_size: u8,
+    num_tile_groups_minus1: u8,
+    temporal_id: u8,
+    filter_level: [2]u8,
+    filter_level_u: u8,
+    filter_level_v: u8,
+    /// sharpness 2:0, mode_ref_delta_enabled 3, mode_ref_delta_update 4
+    loop_filter_flags: u8,
+    superres_scale_denominator: u8,
+    interpolation_filter: u8,
+    ref_deltas: [8]i8,
+    mode_deltas: [2]i8,
+    base_qindex: u8,
+    y_dc_delta_q: i8,
+    u_dc_delta_q: i8,
+    u_ac_delta_q: i8,
+    v_dc_delta_q: i8,
+    v_ac_delta_q: i8,
+    min_base_qindex: u8,
+    max_base_qindex: u8,
+    qmatrix_flags: u16,
+    reserved16bits1: u16,
+    mode_control_flags: EncModeControlAV1,
+    segments: EncSegParamAV1,
+    tile_cols: u8,
+    tile_rows: u8,
+    reserved16bits2: u16,
+    width_in_sbs_minus_1: [63]u16,
+    height_in_sbs_minus_1: [63]u16,
+    context_update_tile_id: u16,
+    cdef_damping_minus_3: u8,
+    cdef_bits: u8,
+    cdef_y_strengths: [8]u8,
+    cdef_uv_strengths: [8]u8,
+    /// y 1:0, cb 3:2, cr 5:4, lr_unit_shift 7:6, lr_uv_shift 8
+    loop_restoration_flags: u16,
+    wm: [7]EncWarpedMotionAV1,
+    bit_offset_qindex: u32,
+    bit_offset_segmentation: u32,
+    bit_offset_loopfilter_params: u32,
+    bit_offset_cdef_params: u32,
+    size_in_bits_cdef_params: u32,
+    byte_offset_frame_hdr_obu_size: u32,
+    size_in_bits_frame_hdr_obu: u32,
+    tile_group_obu_hdr_info: u8,
+    number_skip_frames: u8,
+    reserved16bits3: u16,
+    skip_frames_reduced_size: i32,
+    va_reserved: [16]u32,
+};
+
+pub const EncTileGroupBufferAV1 = extern struct {
+    tg_start: u8,
+    tg_end: u8,
+    va_reserved: [4]u32,
+};
+
 // ── Layout checks (gcc on libva 2.22, x86-64) ───────────────────────────────
 
 comptime {
@@ -500,6 +665,40 @@ comptime {
     std.debug.assert(@offsetOf(EncSliceParameterBufferHEVC, "max_num_merge_cand") == 1034);
     std.debug.assert(@offsetOf(EncSliceParameterBufferHEVC, "slice_fields") == 1040);
     std.debug.assert(@offsetOf(EncSliceParameterBufferHEVC, "pred_weight_table_bit_offset") == 1044);
+    std.debug.assert(@sizeOf(EncSequenceParameterBufferAV1) == 88);
+    std.debug.assert(@offsetOf(EncSequenceParameterBufferAV1, "bits_per_second") == 12);
+    std.debug.assert(@offsetOf(EncSequenceParameterBufferAV1, "seq_fields") == 16);
+    std.debug.assert(@offsetOf(EncSequenceParameterBufferAV1, "order_hint_bits_minus_1") == 20);
+    std.debug.assert(@sizeOf(EncSegParamAV1) == 156);
+    std.debug.assert(@sizeOf(EncWarpedMotionAV1) == 56);
+    std.debug.assert(@sizeOf(EncTileGroupBufferAV1) == 20);
+    const P = EncPictureParameterBufferAV1;
+    std.debug.assert(@sizeOf(P) == 1032);
+    std.debug.assert(@offsetOf(P, "reference_frames") == 12);
+    std.debug.assert(@offsetOf(P, "ref_frame_idx") == 44);
+    std.debug.assert(@offsetOf(P, "primary_ref_frame") == 52);
+    std.debug.assert(@offsetOf(P, "refresh_frame_flags") == 54);
+    std.debug.assert(@offsetOf(P, "ref_frame_ctrl_l0") == 56);
+    std.debug.assert(@offsetOf(P, "picture_flags") == 64);
+    std.debug.assert(@offsetOf(P, "filter_level") == 71);
+    std.debug.assert(@offsetOf(P, "loop_filter_flags") == 75);
+    std.debug.assert(@offsetOf(P, "interpolation_filter") == 77);
+    std.debug.assert(@offsetOf(P, "ref_deltas") == 78);
+    std.debug.assert(@offsetOf(P, "base_qindex") == 88);
+    std.debug.assert(@offsetOf(P, "min_base_qindex") == 94);
+    std.debug.assert(@offsetOf(P, "mode_control_flags") == 100);
+    std.debug.assert(@offsetOf(P, "segments") == 104);
+    std.debug.assert(@offsetOf(P, "tile_cols") == 260);
+    std.debug.assert(@offsetOf(P, "width_in_sbs_minus_1") == 264);
+    std.debug.assert(@offsetOf(P, "height_in_sbs_minus_1") == 390);
+    std.debug.assert(@offsetOf(P, "cdef_damping_minus_3") == 518);
+    std.debug.assert(@offsetOf(P, "cdef_y_strengths") == 520);
+    std.debug.assert(@offsetOf(P, "loop_restoration_flags") == 536);
+    std.debug.assert(@offsetOf(P, "wm") == 540);
+    std.debug.assert(@offsetOf(P, "bit_offset_qindex") == 932);
+    std.debug.assert(@offsetOf(P, "size_in_bits_frame_hdr_obu") == 956);
+    std.debug.assert(@offsetOf(P, "tile_group_obu_hdr_info") == 960);
+    std.debug.assert(@offsetOf(P, "skip_frames_reduced_size") == 964);
 }
 
 test "vaapi_enc: bit fields where gcc puts them" {

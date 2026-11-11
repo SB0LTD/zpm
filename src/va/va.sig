@@ -39,6 +39,10 @@
 //!   enc_rc.sig       the encoder's rate control: the driver's HRD-bound
 //!                    controller, the firmware's (opt-in)
 //!   enc_parse.sig    what an app's packed HEVC SPS and PPS say
+//!   enc_av1.sig      AV1's OBUs (sequence and frame headers) and the
+//!                    encoder's AV1 setup
+//!   enc_import.sig   surfaces over an app's dma-bufs (DRM PRIME)
+//!   enc_test.sig     the encoder through the driver and a pretend NVENC
 //!   convert.sig      a picture between its block-linear planes and a
 //!                    pitch-linear copy, for CPU readers (the CPU's;
 //!                    gpu_convert.sig: the RTX's, a KIR kernel)
@@ -64,6 +68,8 @@ pub const enc_hevc = @import("enc_hevc.sig");
 pub const encode = @import("encode.sig");
 pub const enc_rc = @import("enc_rc.sig");
 pub const enc_parse = @import("enc_parse.sig");
+pub const enc_av1 = @import("enc_av1.sig");
+pub const enc_import = @import("enc_import.sig");
 pub const convert = @import("convert.sig");
 pub const driver = @import("driver.sig");
 
@@ -88,11 +94,12 @@ test {
     _ = encode;
     _ = enc_rc;
     _ = enc_parse;
+    _ = enc_av1;
     _ = convert;
     _ = driver;
     _ = @import("driver_test.sig");
     _ = @import("driver_10bit_test.sig");
     _ = @import("hevc_stream_test.sig");
     _ = @import("enc_test.sig");
-    _ = @import("enc_import.sig");
+    _ = enc_import;
 }

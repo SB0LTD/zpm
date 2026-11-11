@@ -26,6 +26,10 @@
 //! Rate control: enc_rc.sig (the driver's controller unless the
 //! firmware's is asked for).
 //!
+//! AV1 (enc_av1.sig): the driver writes the OBUs around the engine's tile
+//! data; each kept surface also keeps the CDFs its picture adapted, which
+//! a later picture naming it as primary reference starts from.
+//!
 //! Allocation-free: fixed fields; the caller's buffers.
 
 const std = @import("std");
@@ -39,8 +43,9 @@ const h264 = @import("enc_h264.sig");
 const hevc = @import("enc_hevc.sig");
 const enc_rc = @import("enc_rc.sig");
 const enc_parse = @import("enc_parse.sig");
+const av1 = @import("enc_av1.sig");
 
-pub const Codec = enum { h264, hevc };
+pub const Codec = enum { h264, hevc, av1 };
 
 pub const SEGMENT_OFF: usize = 0;
 pub const STATUS_OFF: usize = 0x100;
@@ -58,12 +63,19 @@ pub const PACKED_HEADERS: u32 = ve.PACKED_HEADER_SEQUENCE | ve.PACKED_HEADER_MIS
 pub const MAX_REFS: u32 = h264.MAX_L0 | (h264.MAX_L1 << 16);
 /// (the old name: L0's count)
 pub const MAX_REFS_L0: u32 = h264.MAX_L0;
+pub const MAX_REFS_AV1: u32 = av1.MAX_L0 | (av1.MAX_L1 << 16);
+
+/// The packed headers a codec takes.
+pub fn packedHeaders(kind: Codec) u32 {
+    return if (kind == .av1) av1.PACKED_HEADERS else PACKED_HEADERS;
+}
 /// Surfaces kept as references at once (each with its co-located buffer).
 pub const KEPT = 10;
 
 pub fn supported(profile: va.Profile) ?Codec {
     if (std.mem.indexOfScalar(va.Profile, &h264.PROFILES, profile) != null) return .h264;
     if (profile == hevc.PROFILE) return .hevc;
+    if (profile == av1.PROFILE) return .av1;
     return null;
 }
 
@@ -124,6 +136,9 @@ pub const State = struct {
     have_seq: bool = false,
     h264_seq: h264.Seq = undefined,
     hevc_seq: hevc.Seq = undefined,
+    av1_seq: av1.Seq = undefined,
+    /// AV1: what the reference slots hold, what was shown
+    av1_state: Av1State = .{},
     /// what the app's packed HEVC SPS and PPS say
     hevc_params: enc_parse.HevcParams = .{},
     kept: Kept = .{},
@@ -131,6 +146,10 @@ pub const State = struct {
     have_pic: bool = false,
     h264_pic: h264.Pic = undefined,
     hevc_pic: hevc.Pic = undefined,
+    av1_pic: av1.Pic = undefined,
+    /// AV1: the app's packed frame header said whether it is shown
+    av1_shown: ?bool = null,
+    av1_showable: bool = false,
     /// a sequence parameter buffer came with this picture
     new_seq: bool = false,
     h264_slices: [nvenc.MAX_SLICES]h264.Slice = undefined,
@@ -151,14 +170,29 @@ pub const State = struct {
 
     pub fn init(kind: Codec, profile: va.Profile, width: u32, height: u32, rc_mode: u32, packed_headers: u32) State {
         var st = State{ .kind = kind, .profile = profile, .width = width, .height = height, .packed_headers = packed_headers };
-        st.rate = .{ .mode = rcMode(rc_mode), .scale = .h26x, .pixels = @as(u64, width) * height, .max_qp = 51 };
+        const scale: enc_rc.Scale = if (kind == .av1) .av1 else .h26x;
+        st.rate = .{ .mode = rcMode(rc_mode), .scale = scale, .pixels = @as(u64, width) * height, .max_qp = enc_rc.qMax(scale) };
         return st;
     }
+};
+
+/// AV1's state across pictures: each reference slot's order hint, whether
+/// the last picture was shown, and a hidden picture waiting for its
+/// show_existing_frame. (Each kept surface's CDFs are the table the
+/// engine wrote for its picture: ASSUMED written also when the picture
+/// adapted none, disable_frame_end_update_cdf, as the CDFs it read.)
+pub const Av1State = struct {
+    slot_hint: [8]u8 = .{0} ** 8,
+    defaults_written: bool = false,
+    prev_shown: bool = true,
+    last_shown: u8 = 0,
+    hidden: ?struct { slot: u3, hint: u8 } = null,
 };
 
 /// A new picture (BeginPicture).
 pub fn begin(st: *State) void {
     st.have_pic = false;
+    st.av1_shown = null;
     st.new_seq = false;
     st.slices = 0;
     st.hdr_len = 0;
@@ -195,6 +229,12 @@ pub fn take(st: *State, b: codec.Buffer) va.Status {
                 st.have_seq = true;
                 st.new_seq = true;
             },
+            .av1 => {
+                st.av1_seq = value(av1.Seq, b.data) orelse return va.ERROR_INVALID_BUFFER;
+                gopOf(st, st.av1_seq.intra_period, st.av1_seq.ip_period, st.av1_seq.bits_per_second);
+                st.have_seq = true;
+                st.new_seq = true;
+            },
         },
         ve.ENC_PICTURE_PARAMETER_BUFFER => switch (st.kind) {
             .h264 => {
@@ -203,6 +243,10 @@ pub fn take(st: *State, b: codec.Buffer) va.Status {
             },
             .hevc => {
                 st.hevc_pic = value(hevc.Pic, b.data) orelse return va.ERROR_INVALID_BUFFER;
+                st.have_pic = true;
+            },
+            .av1 => {
+                st.av1_pic = value(av1.Pic, b.data) orelse return va.ERROR_INVALID_BUFFER;
                 st.have_pic = true;
             },
         },
@@ -220,6 +264,8 @@ pub fn take(st: *State, b: codec.Buffer) va.Status {
                         const s = b.element(ve.EncSliceParameterBufferHEVC, k);
                         st.hevc_slices[st.slices] = hevc.Slice.of(&s);
                     },
+                    // (AV1's tile groups: one tile, one group)
+                    .av1 => if (b.size < 2) return va.ERROR_INVALID_BUFFER,
                 }
                 st.slices += 1;
             }
@@ -259,8 +305,18 @@ pub fn take(st: *State, b: codec.Buffer) va.Status {
             // (the engine writes its own slice headers: an app's are dropped)
             if (st.packed_kind == ve.PACKED_SLICE) return va.SUCCESS;
             const room = st.hdr[st.hdr_len..];
+            if (st.kind == .av1 and st.packed_kind == ve.PACKED_PICTURE) {
+                // (the app's frame header: whether it is shown; the driver
+                // writes its own)
+                if (av1.shownOf(b.data[0..n])) |sh| {
+                    st.av1_shown = sh.show;
+                    st.av1_showable = sh.showable;
+                }
+                return va.SUCCESS;
+            }
             const header_len: usize = if (st.kind == .hevc) 2 else 1;
-            const wrote = if (st.packed_emulation) copy(room, b.data[0..n]) else emulate(room, b.data[0..n], header_len);
+            // (OBUs have no emulation prevention)
+            const wrote = if (st.packed_emulation or st.kind == .av1) copy(room, b.data[0..n]) else emulate(room, b.data[0..n], header_len);
             const written = wrote orelse return va.ERROR_NOT_ENOUGH_BUFFER;
             if (st.packed_kind == ve.PACKED_SEQUENCE) {
                 st.packed_seq = true;
@@ -310,6 +366,7 @@ pub fn codedBuffer(st: *const State) ?u32 {
     return switch (st.kind) {
         .h264 => st.h264_pic.coded_buf,
         .hevc => st.hevc_pic.coded_buf,
+        .av1 => st.av1_pic.coded_buf,
     };
 }
 
@@ -318,6 +375,7 @@ pub fn reconSurface(st: *const State) u32 {
     return switch (st.kind) {
         .h264 => st.h264_pic.CurrPic.picture_id,
         .hevc => st.hevc_pic.decoded_curr_pic.picture_id,
+        .av1 => st.av1_pic.reconstructed_frame,
     };
 }
 
@@ -334,6 +392,7 @@ pub fn picType(st: *const State) enc_rc.Type {
             1 => .p,
             else => .i,
         },
+        .av1 => av1.rcType(&st.av1_pic),
     };
 }
 
@@ -370,6 +429,19 @@ pub const Scratch = struct {
     pub fn coloc(s: Scratch, k: usize) u64 {
         return s.base + s.sizes.coloc_off + k * s.sizes.coloc;
     }
+    /// AV1: kept surface `k`'s CDFs (KEPT: the discard table)
+    pub fn cdf(s: Scratch, k: usize) u64 {
+        return s.base + s.sizes.cdf_off + k * av1.CDF_BYTES;
+    }
+    pub fn defaults(s: Scratch, ctx: u2) u64 {
+        return s.base + s.sizes.defaults_off + @as(usize, ctx) * av1.CDF_BYTES;
+    }
+    /// AV1's line buffers: 0..2 above (entropy context, motion vectors,
+    /// deblocking's top row), 3..5 left (deblocking, CDEF, restoration)
+    pub fn line(s: Scratch, i: usize) u64 {
+        const above = s.sizes.lines.above;
+        return s.base + s.sizes.lines_off + (if (i < 3) i * above else 3 * above + (i - 3) * s.sizes.lines.left);
+    }
 };
 
 pub const EndIn = struct {
@@ -393,6 +465,14 @@ pub const Done = struct {
     qp: i32 = 0,
     /// the stream's bytes the driver wrote (headers) ahead of the engine's
     header_bytes: u32 = 0,
+    /// AV1: where the frame header and the tile group's size are, the
+    /// frame (for a rewrite with the engine's QP and loop-filter level),
+    /// and a hidden picture to show after this one
+    av1_fh_off: u32 = 0,
+    av1_fh_room: u32 = 0,
+    av1_tg_size_off: u32 = 0,
+    av1_frame: ?av1.Frame = null,
+    av1_show_existing: ?u3 = null,
 };
 
 pub const EndOut = struct {
@@ -412,13 +492,16 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
     const st_ok = switch (st.kind) {
         .h264 => h264.check(st.profile, &st.h264_seq, &st.h264_pic),
         .hevc => hevc.check(&st.hevc_seq, &st.hevc_pic),
+        .av1 => av1.check(&st.av1_seq, &st.av1_pic, @as(u32, st.av1_pic.frame_width_minus_1) + 1, @as(u32, st.av1_pic.frame_height_minus_1) + 1),
     };
     if (st_ok != va.SUCCESS) return st_ok;
     const sl_ok = switch (st.kind) {
         .h264 => h264.checkSlices(st.profile, st.h264_slices[0..st.slices]),
         .hevc => hevc.checkSlices(st.hevc_slices[0..st.slices]),
+        .av1 => va.SUCCESS,
     };
     if (sl_ok != va.SUCCESS) return sl_ok;
+    if (st.kind == .av1) return endAv1(st, in, out);
     const recon_id = reconSurface(st);
     const recon = in.lookup.surface(recon_id) orelse return va.ERROR_INVALID_SURFACE;
     if (recon.luma == in.input.luma) return va.ERROR_INVALID_SURFACE;
@@ -430,6 +513,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
     const idr = switch (st.kind) {
         .h264 => st.h264_pic.pic_fields.idr_pic_flag != 0,
         .hevc => st.hevc_pic.pic_fields.idr_pic_flag != 0,
+        .av1 => unreachable,
     };
     if (idr) st.kept.reset();
     if ((idr or st.new_seq) and !st.packed_seq) {
@@ -443,6 +527,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
                 // (the driver's own parameter sets: their defaults)
                 st.hevc_params = .{};
             },
+            .av1 => unreachable,
         }
     }
     if (n + st.hdr_len > HEADER_BYTES) return va.ERROR_NOT_ENOUGH_BUFFER;
@@ -487,6 +572,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
             a.ref_luma[i] = s.luma;
             a.ref_chroma[i] = s.chroma;
         },
+        .av1 => unreachable,
     }
     // the reconstruction's entry (its co-located motion goes there), and
     // the collocated picture's: B's L1[0] (H.264), the picture's
@@ -502,6 +588,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
             const ci = p.collocated_ref_pic_index;
             break :blk if (ci < p.reference_frames.len and p.reference_frames[ci].flags & va.PICTURE_HEVC_INVALID == 0) p.reference_frames[ci].picture_id else st.hevc_slices[0].ref0[0];
         },
+        .av1 => unreachable,
     };
     const in_k = st.kept.find(col_id) orelse out_k;
     a.coloc_out = in.scratch.coloc(out_k);
@@ -580,6 +667,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
             if (st.firmware_rc and st.rate.active()) a.rc_mode = firmware(st, in, enc_rc.RcFields.of(nvenc.H265), qp);
             done.qp = qp;
         },
+        .av1 => unreachable,
     }
     // a clean status, an empty segment until the engine is done
     @memset(in.coded[STATUS_OFF..DATA_OFF], 0);
@@ -592,6 +680,205 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
     out.done = done;
     st.pictures += 1;
     return va.SUCCESS;
+}
+
+/// AV1's EndPicture (`end`'s checks done): the OBUs ahead of the engine's
+/// tile data, the references and CDFs, the setup and the pushbuffer.
+fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
+    const pic = &st.av1_pic;
+    const seq = &st.av1_seq;
+    const as = &st.av1_state;
+    const width = @as(u32, pic.frame_width_minus_1) + 1;
+    const height = @as(u32, pic.frame_height_minus_1) + 1;
+    const recon_id = pic.reconstructed_frame;
+    const recon = in.lookup.surface(recon_id) orelse return va.ERROR_INVALID_SURFACE;
+    const inp = in.input;
+    if (recon.luma == inp.luma) return va.ERROR_INVALID_SURFACE;
+    if (width > inp.pitch_luma or height > inp.rows) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
+    const key = pic.picture_flags.frame_type == 0;
+    if (key) as.hidden = null;
+
+    // shown? the app's packed frame header says; else a picture whose
+    // order hint runs ahead of the next to show is hidden
+    var show = true;
+    var showable = false;
+    if (st.av1_shown) |sh| {
+        show = sh;
+        showable = st.av1_showable;
+    } else if (!key and pic.order_hint != as.last_shown +% 1) {
+        const ahead = @as(i8, @bitCast(pic.order_hint -% as.last_shown));
+        if (ahead > 1) {
+            show = false;
+            showable = true;
+        }
+    }
+    const t = av1.rcType(pic);
+    const plan = st.rate.plan(t, pic.base_qindex);
+    const q: u8 = @intCast(std.math.clamp(plan.qp, 1, 255));
+    const frame = av1.frameOf(seq, pic, q, show, showable, as.slot_hint);
+
+    // The stream: a temporal delimiter (a new temporal unit), the
+    // sequence header at a key frame (the app's, or the driver's), the
+    // app's other OBUs, the frame header (room for a rewrite), the tile
+    // group's header.
+    const data = in.coded[DATA_OFF..];
+    var n: usize = 0;
+    if (as.prev_shown) n += av1.temporalDelimiter(data[n..]);
+    if ((key or st.new_seq) and !st.packed_seq) {
+        n += av1.sequenceHeaderObu(data[n..HEADER_BYTES], seq, width, height) orelse return va.ERROR_NOT_ENOUGH_BUFFER;
+    }
+    if (n + st.hdr_len > HEADER_BYTES) return va.ERROR_NOT_ENOUGH_BUFFER;
+    @memcpy(data[n..][0..st.hdr_len], st.hdr[0..st.hdr_len]);
+    n += st.hdr_len;
+    var probe: [512]u8 = undefined;
+    const plain = av1.frameHeaderObu(&probe, frame, 0) orelse return va.ERROR_NOT_ENOUGH_BUFFER;
+    const fh_room: u32 = @intCast(plain - 5 + 2);
+    const fh_off: u32 = @intCast(n);
+    n += av1.frameHeaderObu(data[n..HEADER_BYTES], frame, fh_room) orelse return va.ERROR_NOT_ENOUGH_BUFFER;
+    if (n + 5 > HEADER_BYTES) return va.ERROR_NOT_ENOUGH_BUFFER;
+    data[n] = av1.obuHeader(av1.OBU_TILE_GROUP);
+    av1.leb128Fixed(data[n + 1 ..][0..4], 0);
+    const tg_size_off: u32 = @intCast(n + 1);
+    n += 5;
+
+    // The references (VA's slots are the engine's), the kept surfaces'
+    // CDFs: the primary reference's, else the defaults for the quantiser.
+    var ref_ids = [_]u32{va.INVALID_ID} ** 8;
+    var a = nvenc.PictureAddrs{
+        .application_id = nvenc.APPLICATION_ID_AV1,
+        .codec_type = nvenc.CODEC_TYPE_AV1,
+        .setup = in.setup_va,
+        .status = in.coded_va + STATUS_OFF,
+        .bitstream = in.coded_va + DATA_OFF,
+        .history = in.scratch.history(),
+        .rc_process = in.scratch.rcProcess(),
+        .coloc_in = undefined,
+        .coloc_out = undefined,
+        .cur_luma = inp.luma,
+        .cur_chroma = inp.chroma,
+        .out_luma = recon.luma,
+        .out_chroma = recon.chroma,
+        .picture_index = in.picture_index,
+    };
+    for (pic.reference_frames, 0..) |id, i| {
+        if (id == va.INVALID_ID) continue;
+        const s = in.lookup.surface(id) orelse continue;
+        ref_ids[i] = id;
+        a.ref_luma[i] = s.luma;
+        a.ref_chroma[i] = s.chroma;
+    }
+    const out_k = st.kept.take(recon_id, &ref_ids) orelse return va.ERROR_MAX_NUM_EXCEEDED;
+    if (!as.defaults_written) {
+        for (0..4) |ctx| av1.writeDefaults(in.scratch.cpu[in.scratch.sizes.defaults_off + ctx * av1.CDF_BYTES ..][0..av1.CDF_BYTES], @intCast(ctx));
+        as.defaults_written = true;
+    }
+    var prob_in = in.scratch.defaults(av1.qContext(q));
+    if (!frame.intra() and !frame.error_resilient and frame.primary_ref_frame != av1.NONE) {
+        const src = pic.reference_frames[frame.ref_frame_idx[frame.primary_ref_frame]];
+        if (st.kept.find(src)) |k| prob_in = in.scratch.cdf(k);
+    }
+    a.coloc_in = in.scratch.coloc(out_k);
+    a.coloc_out = in.scratch.coloc(out_k);
+    a.av1 = .{
+        .prob_in = prob_in,
+        .prob_out = in.scratch.cdf(out_k),
+        .above_ctx = in.scratch.line(0),
+        .above_mv = in.scratch.line(1),
+        .deblock_top = in.scratch.line(2),
+        .deblock_left = in.scratch.line(3),
+        .cdef_left = in.scratch.line(4),
+        .lr_left = in.scratch.line(5),
+    };
+    for ([_]u64{ a.setup, a.status, a.bitstream, a.history, a.rc_process, a.coloc_in, a.cur_luma, a.cur_chroma, a.out_luma, a.out_chroma, a.av1.?.prob_in, a.av1.?.lr_left }) |x| {
+        if (!nvenc.addressable(x)) return va.ERROR_INVALID_SURFACE;
+    }
+    const room: u32 = @intCast(@min(in.coded.len - DATA_OFF, std.math.maxInt(u32)));
+    av1.setup(in.setup, .{
+        .frame = frame,
+        .pic = pic,
+        .input = .{ .luma = inp.luma, .chroma = inp.chroma, .pitch_luma = inp.pitch_luma, .pitch_chroma = inp.pitch_chroma, .block_height = inp.block_height },
+        .recon = .{ .luma = recon.luma, .chroma = recon.chroma, .pitch_luma = recon.pitch_luma, .pitch_chroma = recon.pitch_chroma },
+        .ref_ids = ref_ids,
+        .framerate = st.rate.fps_num / @max(st.rate.fps_den, 1),
+        .gop_length = if (seq.intra_period != 0) seq.intra_period else 0xffff_ffff,
+        .bitstream_start = @intCast(n),
+        .bitstream_room = room,
+        .history_bytes = @intCast(in.scratch.sizes.history),
+        .magic = in.magic,
+    });
+    if (st.firmware_rc and st.rate.active()) a.rc_mode = firmware(st, in, enc_rc.RcFields.of(nvenc.Av1), q);
+
+    // After it: the slots it refreshes hold its order hint; shown, or
+    // hidden until the picture before it is out (then shown with a
+    // show_existing_frame, unless the app packs its own headers).
+    var done = Done{ .kind = .av1, .type = t, .qp = q, .header_bytes = @intCast(n), .av1_fh_off = fh_off, .av1_fh_room = fh_room, .av1_tg_size_off = tg_size_off, .av1_frame = frame };
+    var first_slot: ?u3 = null;
+    for (0..8) |i| {
+        if (frame.refresh & (@as(u8, 1) << @intCast(i)) == 0) continue;
+        as.slot_hint[i] = frame.order_hint;
+        if (first_slot == null) first_slot = @intCast(i);
+    }
+    if (show) {
+        as.last_shown = frame.order_hint;
+        if (st.av1_shown == null) {
+            if (as.hidden) |h| {
+                if (h.hint == frame.order_hint +% 1) {
+                    done.av1_show_existing = h.slot;
+                    as.last_shown = h.hint;
+                    as.hidden = null;
+                }
+            }
+        }
+    } else if (first_slot) |slot| {
+        as.hidden = .{ .slot = slot, .hint = frame.order_hint };
+    }
+    as.prev_shown = show;
+
+    @memset(in.coded[STATUS_OFF..DATA_OFF], 0);
+    @memset(in.coded[SEGMENT_OFF..][0..@sizeOf(ve.CodedBufferSegment)], 0);
+    out.dwords = nvenc.push(in.push, a);
+    out.header_bytes = @intCast(n);
+    out.qp = q;
+    out.intra = t == .i;
+    out.done = done;
+    st.pictures += 1;
+    return va.SUCCESS;
+}
+
+/// AV1's picture done (`n` bytes so far: the OBUs and the tile data): the
+/// tile group's size patched; the frame header rewritten if the engine
+/// reports another QP or loop-filter level than it was given; a hidden
+/// picture's show_existing_frame after it. The bytes now.
+fn finishAv1(stream: []u8, n0: usize, r: nvenc.Result, done: Done) usize {
+    var n = n0;
+    if (done.av1_tg_size_off + 4 > stream.len) return n;
+    av1.leb128Fixed(stream[done.av1_tg_size_off..][0..4], @intCast(@min(n - done.header_bytes, std.math.maxInt(u28))));
+    if (done.av1_frame) |f0| {
+        var f = f0;
+        var changed = false;
+        if (r.av1_qindex != 0 and r.av1_qindex != f.qindex) {
+            f.qindex = @intCast(r.av1_qindex);
+            changed = true;
+        }
+        if (r.av1_lf_level != f.lf[0] and !(r.av1_lf_level == 0 and f.lf[0] == 0)) {
+            const l: u6 = @intCast(@min(r.av1_lf_level, 63));
+            f.lf = .{ l, l, if (l == 0) 0 else f.lf[2], if (l == 0) 0 else f.lf[3] };
+            changed = true;
+        }
+        if (changed) {
+            var tmp: [512]u8 = undefined;
+            if (av1.frameHeaderObu(&tmp, f, done.av1_fh_room)) |m| {
+                if (m == 5 + done.av1_fh_room) @memcpy(stream[done.av1_fh_off..][0..m], tmp[0..m]);
+            }
+        }
+    }
+    if (done.av1_show_existing) |slot| {
+        if (n + 5 <= stream.len) {
+            n += av1.temporalDelimiter(stream[n..]);
+            n += av1.showExistingObu(stream[n..], slot);
+        }
+    }
+    return n;
 }
 
 /// The firmware's rate control (GALAXY_VA_NVENC_RC=firmware): its struct
@@ -622,6 +909,7 @@ pub fn finish(st: ?*State, coded: []u8, done: Done) Finished {
     const r = nvenc.Result.ofKind(coded[STATUS_OFF..][0..nvenc.Stat.SIZE], switch (done.kind) {
         .h264 => .h264,
         .hevc => .hevc,
+        .av1 => .av1,
     });
     const header_bytes = done.header_bytes;
     const room = coded.len - DATA_OFF;
@@ -629,6 +917,7 @@ pub fn finish(st: ?*State, coded: []u8, done: Done) Finished {
     const overflow = n > room;
     if (overflow) n = room;
     if (r.failed()) n = header_bytes;
+    if (done.kind == .av1 and !r.failed()) n = finishAv1(coded[DATA_OFF..], n, r, done);
     var pad_bytes: u32 = 0;
     if (st) |s| {
         const pad = s.rate.done(done.type, @as(u64, n) * 8, done.qp, r.intra_cost, r.inter_cost);
@@ -654,6 +943,7 @@ pub fn filler(stream: []u8, at: usize, want: usize, kind: Codec) usize {
     const head: []const u8 = switch (kind) {
         .h264 => &.{ 0, 0, 0, 1, 0x0c },
         .hevc => &.{ 0, 0, 0, 1, 0x4c, 0x01 },
+        .av1 => return av1.paddingObu(stream[@min(at, stream.len)..], want),
     };
     if (want < head.len + 1 or at + head.len + 1 > stream.len) return 0;
     const len = @min(want, stream.len - at);
@@ -681,18 +971,37 @@ pub const ScratchSizes = struct {
     coloc_off: usize,
     rc: usize,
     rc_off: usize,
+    /// AV1: KEPT + 1 CDF tables (the last a discard), the four default
+    /// tables, the line buffers
+    cdf_off: usize = 0,
+    defaults_off: usize = 0,
+    lines: av1.Lines = .{ .above = 0, .left = 0, .history = 0 },
+    lines_off: usize = 0,
     total: usize,
 };
 
 pub fn scratchSizes(width: u32, height: u32) ScratchSizes {
+    return scratchSizesFor(.h264, width, height);
+}
+
+pub fn scratchSizesFor(kind: Codec, width: u32, height: u32) ScratchSizes {
     const wmbs: usize = (width + 15) / 16;
     const hmbs: usize = (height + 15) / 16;
-    const history = std.mem.alignForward(usize, (wmbs + 16) * 1024, 4096);
+    const lines = av1.Lines.of(width, height);
+    const history = if (kind == .av1) lines.history else std.mem.alignForward(usize, (wmbs + 16) * 1024, 4096);
     const coloc = std.mem.alignForward(usize, wmbs * hmbs * 64, 4096);
     const rc: usize = 4096;
     const coloc_off = history;
     const rc_off = coloc_off + KEPT * coloc;
-    return .{ .history = history, .coloc = coloc, .coloc_off = coloc_off, .rc = rc, .rc_off = rc_off, .total = rc_off + rc };
+    var s = ScratchSizes{ .history = history, .coloc = coloc, .coloc_off = coloc_off, .rc = rc, .rc_off = rc_off, .total = rc_off + rc };
+    if (kind == .av1) {
+        s.cdf_off = s.total;
+        s.defaults_off = s.cdf_off + (KEPT + 1) * av1.CDF_BYTES;
+        s.lines_off = s.defaults_off + 4 * av1.CDF_BYTES;
+        s.lines = lines;
+        s.total = s.lines_off + 3 * lines.above + 3 * lines.left;
+    }
+    return s;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

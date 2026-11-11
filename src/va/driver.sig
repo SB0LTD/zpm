@@ -563,7 +563,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                         rc_mode = a.value;
                     },
                     ve.ATTRIB_ENC_PACKED_HEADERS => {
-                        if (a.value & ~encode.PACKED_HEADERS != 0) return va.ERROR_INVALID_CONFIG;
+                        const kind = encode.supported(profile) orelse return va.ERROR_UNSUPPORTED_PROFILE;
+                        if (a.value & ~encode.packedHeaders(kind) != 0) return va.ERROR_INVALID_CONFIG;
                         packed_headers = a.value;
                     },
                     else => {},
@@ -998,7 +999,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         /// the engine's scratch (zeroed).
         fn createEncodeContext(d: *Self, i: u8, config: u32, cfg: *const Config, width: u32, height: u32, out: *u32) va.Status {
             const kind = encode.supported(cfg.profile) orelse return va.ERROR_UNSUPPORTED_PROFILE;
-            const sz = encode.scratchSizes(width, height);
+            const sz = encode.scratchSizesFor(kind, width, height);
             const scratch_off = FRAMES * ENC_FRAME_BYTES;
             var work = d.node.alloc(scratch_off + sz.total, 0) orelse return va.ERROR_ALLOCATION_FAILED;
             if (!nvenc.addressable(work.va) or !nvenc.addressable(work.va + work.len - 256)) {
@@ -1538,6 +1539,21 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             c.frame_serial[f] = d.serial;
             c.next_frame = (f + 1) % FRAMES;
             c.decodes +%= 1;
+            // (AV1's film grain: the graded picture written into another
+            // surface by the same decode, done with its fence)
+            if (e.display) |id| if (d.surfaceIndex(id)) |di| {
+                const ds = &d.surfaces[di];
+                ds.pending = true;
+                ds.linear_stale = true;
+                ds.tiled_stale = false;
+                ds.fence = fence;
+                ds.ctx = ci;
+                ds.frame = f;
+                ds.serial = d.serial;
+                ds.failed = false;
+                ds.field_coded = false;
+                ds.fields = 3;
+            };
             if (e.wait) {
                 const w = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
                 if (w != va.SUCCESS and w != va.ERROR_DECODING_ERROR) return w;
@@ -1666,6 +1682,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 .pitch_luma = s.layout.luma.pitch,
                 .pitch_chroma = s.layout.chroma.pitch,
                 .sample_bytes = s.layout.sample_bytes,
+                .bytes = @intCast(s.layout.bytes),
             };
         }
 
@@ -2004,6 +2021,18 @@ pub fn intAttrib(kind: u32, flags: u32, v: u32) va.SurfaceAttrib {
 /// An EncSlice config attribute's value (what FFmpeg's vaapi_encode asks).
 pub fn encodeAttribute(profile: va.Profile, kind: u32) u32 {
     const hevc_profile = profile == va.PROFILE_HEVC_MAIN;
+    const av1_profile = encode.supported(profile) == .av1;
+    const enc_av1 = @import("enc_av1.sig");
+    if (av1_profile) switch (kind) {
+        ve.ATTRIB_ENC_AV1 => return enc_av1.ATTRIB,
+        ve.ATTRIB_ENC_AV1_EXT1 => return enc_av1.ATTRIB_EXT1,
+        ve.ATTRIB_ENC_AV1_EXT2 => return enc_av1.ATTRIB_EXT2,
+        ve.ATTRIB_ENC_MAX_REF_FRAMES => return encode.MAX_REFS_AV1,
+        ve.ATTRIB_ENC_PACKED_HEADERS => return enc_av1.PACKED_HEADERS,
+        ve.ATTRIB_ENC_MAX_SLICES, ve.ATTRIB_ENC_MAX_TILE_ROWS, ve.ATTRIB_ENC_MAX_TILE_COLS => return 1,
+        ve.ATTRIB_ENC_SLICE_STRUCTURE => return va.ATTRIB_NOT_SUPPORTED,
+        else => {},
+    };
     return switch (kind) {
         va.ATTRIB_RT_FORMAT => va.RT_FORMAT_YUV420,
         ve.ATTRIB_RATE_CONTROL => encode.RC_MODES,

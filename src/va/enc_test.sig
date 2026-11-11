@@ -620,3 +620,97 @@ test "enc: HEVC B picture's setup: the RPS both sides, the lists, the collocated
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.collocated_ref_idx));
     try testing.expectEqual(va.ERROR_MAX_NUM_EXCEEDED, enc_hevc.checkSlices(&.{.{ .slice_type = 0, .l1_minus1 = 1 }}));
 }
+
+// ── AV1 ─────────────────────────────────────────────────────────────────────
+
+const enc_av1 = @import("enc_av1.sig");
+
+var av1_stream: [64 << 10]u8 = undefined;
+
+test "enc: AV1 through the pretend encoder: a key frame, a hidden P, a B, the P shown after; the OBUs" {
+    var k = Fake{ .encoder = fakeEncode };
+    var f = ImportFake{ .k = &k };
+    seen = .{};
+    var d: D = .{ .node = .{ .sys = &f } };
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    // FFmpeg's questions: the AV1 attributes (Ext2 it requires)
+    var attribs = [_]va.ConfigAttrib{
+        .{ .type = ve.ATTRIB_ENC_AV1_EXT2, .value = 0 },
+        .{ .type = ve.ATTRIB_ENC_PACKED_HEADERS, .value = 0 },
+        .{ .type = ve.ATTRIB_ENC_MAX_REF_FRAMES, .value = 0 },
+    };
+    try testing.expectEqual(va.SUCCESS, d.getConfigAttributes(enc_av1.PROFILE, ve.ENTRYPOINT_ENC_SLICE, &attribs));
+    try testing.expectEqual(enc_av1.ATTRIB_EXT2, attribs[0].value);
+    try testing.expectEqual(enc_av1.PACKED_HEADERS, attribs[1].value);
+    try testing.expectEqual(@as(u32, 4 | (3 << 16)), attribs[2].value);
+    var cfg: u32 = 0;
+    const attrs = [_]va.ConfigAttrib{ .{ .type = ve.ATTRIB_RATE_CONTROL, .value = ve.RC_CBR }, .{ .type = ve.ATTRIB_ENC_PACKED_HEADERS, .value = ve.PACKED_HEADER_SEQUENCE | ve.PACKED_HEADER_PICTURE } };
+    try testing.expectEqual(va.SUCCESS, d.createConfig(enc_av1.PROFILE, ve.ENTRYPOINT_ENC_SLICE, &attrs, &cfg));
+    var in: [3]u32 = undefined;
+    var rec: [3]u32 = undefined;
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, 256, 192, &in, &.{}));
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, 256, 192, &rec, &.{}));
+    var ctx: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createContext(cfg, 256, 192, &ctx));
+    var coded: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(ve.ENC_CODED_BUFFER, 1 << 20, 1, null, &coded));
+    var seq = enc_av1.testSeq();
+    seq.bits_per_second = 1_000_000;
+    seq.ip_period = 2;
+    const tg = std.mem.zeroes(ve.EncTileGroupBufferAV1);
+    var n: usize = 0;
+    // ── key frame (order 0) into slot 0 .. 7 ──
+    var p0 = enc_av1.testPic(rec[0], coded, true, 0);
+    try picture(&d, ctx, in[0], &.{ buf(ve.ENC_SEQUENCE_PARAMETER_BUFFER, &seq), buf(ve.ENC_PICTURE_PARAMETER_BUFFER, &p0), buf(ve.ENC_SLICE_PARAMETER_BUFFER, &tg) });
+    try testing.expectEqual(nvenc.APPLICATION_ID_AV1, seen.app);
+    try testing.expectEqual(nvenc.CODEC_TYPE_AV1 | nvenc.CONTROL_GPTIMER_ON, seen.methods[nvenc.SET_CONTROL_PARAMS >> 2]);
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&seen.setup, nvenc.Av1.pic_type));
+    // the CDFs: the defaults in, the reconstruction's own table out; the line buffers bound
+    try testing.expect(seen.methods[nvenc.SET_IN_AV1_PROBABILITY_DATA >> 2] != 0);
+    const key_cdf = seen.methods[nvenc.SET_OUT_AV1_PROBABILITY_DATA >> 2];
+    try testing.expect(key_cdf != 0 and seen.methods[nvenc.SET_IOLR_LEFTCOLUMN >> 2] != 0);
+    const q0 = nvenc.get(&seen.setup, nvenc.Av1.base_q_idx);
+    try testing.expect(q0 >= 1 and q0 <= 255);
+    n += try codedBytes(&d, coded, av1_stream[n..]);
+    // TD, the driver's sequence header, the frame header, the tile group
+    try testing.expectEqualSlices(u8, &.{ 0x12, 0x00, 0x0a }, av1_stream[0..3]);
+    // ── P (order 2), hidden: refreshes slot 1 ──
+    var p2 = enc_av1.testPic(rec[2], coded, false, 2);
+    p2.reference_frames[0] = rec[0];
+    p2.ref_frame_idx = .{ 0, 0, 0, 0, 0, 0, 0 };
+    p2.primary_ref_frame = 0;
+    p2.refresh_frame_flags = 2;
+    try picture(&d, ctx, in[2], &.{ buf(ve.ENC_PICTURE_PARAMETER_BUFFER, &p2), buf(ve.ENC_SLICE_PARAMETER_BUFFER, &tg) });
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&seen.setup, nvenc.Av1.pic_type)); // P
+    // (starts from the key frame's adapted CDFs)
+    try testing.expectEqual(key_cdf, seen.methods[nvenc.SET_IN_AV1_PROBABILITY_DATA >> 2]);
+    const m2 = try codedBytes(&d, coded, av1_stream[n..]);
+    // a temporal delimiter (the key frame was shown), then the header: not shown
+    try testing.expectEqual(@as(u8, 0x12), av1_stream[n]);
+    n += m2;
+    // ── B (order 1): LAST the key frame, BWDREF the P; shown, then the P ──
+    var p1 = enc_av1.testPic(rec[1], coded, false, 1);
+    p1.reference_frames[0] = rec[0];
+    p1.reference_frames[1] = rec[2];
+    p1.ref_frame_idx = .{ 0, 0, 0, 0, 1, 1, 1 };
+    p1.primary_ref_frame = 0;
+    p1.refresh_frame_flags = 0;
+    p1.ref_frame_ctrl_l0 = 1;
+    p1.ref_frame_ctrl_l1 = 5;
+    p1.mode_control_flags.reference_mode = 2;
+    p1.picture_flags.disable_frame_recon = 1;
+    try picture(&d, ctx, in[1], &.{ buf(ve.ENC_PICTURE_PARAMETER_BUFFER, &p1), buf(ve.ENC_SLICE_PARAMETER_BUFFER, &tg) });
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&seen.setup, nvenc.Av1.pic_type)); // B
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&seen.setup, nvenc.Av1.num_ref_idx_l1_active));
+    const m1 = try codedBytes(&d, coded, av1_stream[n..]);
+    // no temporal delimiter (same temporal unit as the hidden P); the P
+    // shown after it: TD, show_existing_frame of slot 1
+    try testing.expect(av1_stream[n] != 0x12);
+    try testing.expectEqualSlices(u8, &.{ 0x12, 0x00, 0x1a, 0x01, 0x98 }, av1_stream[n + m1 - 5 ..][0..5]);
+    n += m1;
+    try testing.expectEqual(@as(u32, 0), d.errors);
+    writeFile("/tmp/galaxy-va-enc/av1.obu", av1_stream[0..n]);
+    try testing.expectEqual(va.SUCCESS, d.destroyBuffer(coded));
+    try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
+}
