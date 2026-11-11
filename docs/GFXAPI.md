@@ -20,6 +20,7 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 | `dxbc/` | Direct3D's shaders: `dxbc.sig` reads the DXBC container (chunks, the input and output signatures) and Shader Model 4 and 5's tokens in place; `gen.sig` emits a vertex or pixel shader as the raster's KIR emitters, as `glsl/gen.sig` does GLSL's; `fixtures.sig` holds shaders compiled from `fixtures.hlsl` by Microsoft's compiler, and `draw_test.sig` draws them. |
 | `egl.sig` | EGL 1.5 for OpenGL ES: displays, configs, contexts with share groups, window and pbuffer surfaces, swaps, fence syncs, errors per thread. |
 | `wayland.sig` | EGL's Wayland platform: a window's frames handed to the compositor as dma-bufs (`zwp_linux_dmabuf_v1`), through the app's own `libwayland-client`. |
+| `x11.sig` | EGL's X11 platform: the X11 protocol spoken by EGL itself over a connection of its own (no Xlib, no XCB), a window's frames shown by DRI3 and Present, else MIT-SHM, else PutImage. |
 | `thread.sig` | What EGL and GL keep per thread: the current context and surfaces, EGL's last error, the bound API. |
 | `dl.sig` | The host program's functions found by name: weak `dlsym`, else the loaded objects' symbol tables. |
 | `host.sig` | What EGL asks of the process: dma-bufs out and in, fence files, dup, poll, a file mapped. The library's root gives Linux's calls and the render node; tests give their own. |
@@ -225,8 +226,8 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 ### EGL
 
 - **The driver.** The library's root opens Galaxy's GPU through the render node at the first `eglInitialize`, with this image's backend (ir3 on AArch64, sm_120 on x86-64), and starts the engine on it. Without a GPU, or after it is lost, `eglInitialize` fails (`EGL_NOT_INITIALIZED`). The app then draws in software (Firefox's SWGL, Chromium's SwiftShader), which beats GL done on the CPU.
-- **Displays.** `EGL_DEFAULT_DISPLAY` and `EGL_PLATFORM_SURFACELESS_MESA` give the surfaceless display: pbuffers and surfaceless contexts. A `wl_display`, from `eglGetDisplay` or `EGL_PLATFORM_WAYLAND_KHR`, gives a Wayland display: window surfaces of `wl_egl_window`s.
-- **Configs.** There are four: ARGB8888 and XRGB8888, each with and without depth 24 + stencil 8. All take windows and pbuffers, and OpenGL ES 2 and 3. The native visual is DRM's fourcc. `eglChooseConfig` matches and sorts as EGL 1.5's §3.4.1 says.
+- **Displays.** `EGL_DEFAULT_DISPLAY` and `EGL_PLATFORM_SURFACELESS_MESA` give the surfaceless display: pbuffers and surfaceless contexts. A `wl_display`, from `eglGetDisplay` or `EGL_PLATFORM_WAYLAND_KHR`, gives a Wayland display: window surfaces of `wl_egl_window`s. An Xlib `Display*`, from `eglGetDisplay` or `EGL_PLATFORM_X11_KHR` (whose `EGL_DEFAULT_DISPLAY` is `$DISPLAY`), gives an X11 display: window surfaces of X windows. The default display takes X windows too, as Mesa's does on X11: it connects to `$DISPLAY` at its first window surface or native-visual query (Firefox on X11 asks `EGL_DEFAULT_DISPLAY` for everything).
+- **Configs.** There are four: ARGB8888 and XRGB8888, each with and without depth 24 + stencil 8. All take windows and pbuffers, and OpenGL ES 2 and 3. The native visual is DRM's fourcc (on an X display, the server's visual). `eglChooseConfig` matches and sorts as EGL 1.5's §3.4.1 says.
 - **Contexts.** OpenGL ES 2.0 and 3.0 (ES 3.0 either way, as Mesa gives), with share groups. The robustness attributes are taken: the engine reports a lost GPU as a reset. `EGL_KHR_no_config_context` and `EGL_KHR_surfaceless_context` are supported.
 - **Windows.**
   - EGL works through the app's own `libwayland-client`, as Mesa does, found by name in the process. Its events go to a queue of its own, through libwayland's generic dispatcher.
@@ -237,6 +238,13 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
   - **The next back buffer** is one the compositor has released, else a new one. Before choosing, EGL dispatches the events it has already received, as Mesa does.
   - **A resize** (`wl_egl_window_resize`) takes effect at the next GL drawing, as in Mesa: the GL context checks before it uses the default framebuffer.
   - `EGL_EXT_buffer_age` and `EGL_KHR_swap_buffers_with_damage` are supported. Damage rectangles are flipped to the buffer's rows.
+- **X windows** (`x11.sig`, `EGL_KHR_platform_x11`):
+  - EGL opens a Unix socket of its own to the server (`/tmp/.X11-unix/XN`, then the abstract one) and speaks the protocol there, little endian, without authorization. The app's `Display*` is read for its name only (`DisplayString`: Xlib's public struct); its fd and sequence numbers stay Xlib's. Windows are the server's, so EGL draws on a window the app made on its own connection. The socket calls are the library root's (`x11.Wire`: `connect`, `sendmsg` with `SCM_RIGHTS` and `MSG_NOSIGNAL`, `read`, `poll`, memfds).
+  - The configs' native visuals are the server's TrueColor visuals of depth 24 (XRGB) and 32 (ARGB), as Firefox matches them with `XGetVisualInfo`. `eglCreateWindowSurface` takes the window's id as the pointer's value, `eglCreatePlatformWindowSurface` a pointer to it. Windows of depth 24 and 32 (32 bits a pixel) are taken.
+  - **DRI3 and Present**, where the server imports dma-bufs (Xwayland with glamor): up to 4 buffers, each a pixmap from its dma-buf (`PixmapFromBuffer`, the fd over `SCM_RIGHTS`) shown by `PresentPixmap`, as Mesa's DRI3 loader does. A pixmap is the server's until its `IdleNotify`. Interval 1 waits for the last frame's `CompleteNotify`; 0 presents `Async`. `ConfigureNotify` marks the window resized. A server that refuses the dma-buf turns the window to the next way.
+  - **MIT-SHM** 1.2, where there is no DRI3 (Galaxy's Xwayland runs `-glamor off`): one image, read back at a swap, its damaged rectangles copied into a memfd the server maps (`ShmAttachFd`, read only) and shown by `ShmPutImage`, then a round trip (the server has read the memory before the next frame writes it). Its age is 1.
+  - **PutImage**, without either: the same, the rows over the socket in `ZPixmap` strips that fit the server's longest request.
+  - The window's size is asked (`GetGeometry`) when a back buffer is taken, which after a swap is at the next GL drawing. An X error for a window's request (it is gone) fails the swap with `EGL_BAD_NATIVE_WINDOW`.
 - **Syncs.** `EGL_KHR_fence_sync`, `EGL_KHR_wait_sync` and EGL 1.5's syncs are supported. A fence is the engine's mark, its work flushed, and the CPU waits on it. `eglWaitSync` waits for nothing, since one in-order GPU ring already orders the work.
 - **Native fences.** `EGL_ANDROID_native_fence_sync`:
   - **Handed out:** a fence of this process's GPU work, as a `sync_file` from Galaxy's `G_FENCE_FD` (SB0LTD/galaxy#74), a new one at each `eglDupNativeFenceFDANDROID`.
@@ -381,7 +389,8 @@ That makes 3 more GL entry points (`glPolygonOffset`, `glSampleCoverage`, `glLin
 - `libgbm` (stage 7);
 - one EGLImage of a picture's planes together (each plane alone is had: R8, GR88, R16, GR1616);
 - native fences and dma-buf import on the PC: they wait for per-app RTX contexts;
-- a Wayland connection of EGL's own, for `EGL_PLATFORM_WAYLAND_KHR` with `EGL_DEFAULT_DISPLAY`.
+- a Wayland connection of EGL's own, for `EGL_PLATFORM_WAYLAND_KHR` with `EGL_DEFAULT_DISPLAY`;
+- on X11: GLX, X authorization (cookies), TCP displays, pixmap surfaces, Present's explicit fences, the windows' `XFixes` damage regions (DRI3 frames are presented whole), depths other than 24 and 32.
 
 ## Tests
 
@@ -461,6 +470,13 @@ sig build test-gfxapi
   - configs, sharing, surfaceless contexts, fences, and destroys while current;
   - EGLImages: another program's dma-buf (an `EmuDevice` buffer imported zero-copy) as a texture read and drawn on the GPU, its producer seeing the pixels, as an external texture and a renderbuffer, kept by GL after its handle goes, freed with its last name; the errors EGL gives; the format and modifier queries;
   - native fences: one handed out (a new `sync_file` at each dup), one handed in (polled, owned, closed).
+- `test-gfxapi-x11`: EGL on X11 through a fake X server behind `x11.Wire` (it reads EGL's requests as Xwayland would, keeps its windows' pixels, answers with replies, errors and Present's events), with the engine on `EmuDevice`. It checks:
+  - Firefox's start as `gfx/gl` does it on X11: `EGL_DEFAULT_DISPLAY`, the configs' native visuals, a window surface of a window's id, a context, the fallback pbuffer, and the GPU process's offscreen work (a context without config or surface, a pbuffer) on the same display;
+  - PutImage under a short request length (strips), damage (only those rows), age 1, a resize at the next drawing, the window gone (`EGL_BAD_NATIVE_WINDOW`), everything given back;
+  - MIT-SHM: frames through shared memory, damage, a bigger window's new memory, a server that refuses the memory (PutImage instead);
+  - DRI3 and Present, with an Xlib `Display*` and `eglCreatePlatformWindowSurface`'s `Window*`: pixmaps from dma-bufs (fd, size, stride, depth), interval 1 waiting for `CompleteNotify`, idle buffers reused (age 2), interval 0 `Async`, a resize's new pixmaps and the old freed;
+  - a server that refuses the dma-buf, and the errors: no server, no `DISPLAY`, a window not the server's, depth 16, not a `Display`.
+- `x11.sig`'s own tests: display names, the setup reply (ids, request length, formats, visuals), each request's bytes, replies, errors and a broken connection, and Xlib's `Display` read for its name.
 - `test-gfxapi-gpu`: one GL scenario, run three ways:
   - on the CPU;
   - on `EmuDevice`: KIR's interpreter, with memory that is not coherent, so a missing cache call gives wrong bytes;

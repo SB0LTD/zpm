@@ -107,7 +107,7 @@ const sm120_asm = nvidia.sm120_asm;
 pub const MAX_INSTS = 16384;
 pub const MAX_VREGS = 16384;
 /// Machine instructions and labels before the text.
-pub const MAX_MI = 16384;
+pub const MAX_MI = 20480;
 pub const MAX_LOOPS = 256;
 pub const MAX_DEPTH = 32;
 pub const TEXT_BYTES = 1536 * 1024;

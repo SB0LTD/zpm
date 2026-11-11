@@ -1507,11 +1507,14 @@ fn linkOutputs(l: *Linked, fs: *const glsl.Iface, log: *glsl.pp.Log) bool {
     }
     var taken: u32 = 0;
     var count: u32 = 0;
+    // (the outputs the shader uses; one it never names, without a
+    // location, is no output of the program's)
     for (fs.vars[0..fs.n]) |v| {
-        if (v.kind == .output) count += 1;
+        if (v.kind == .output and v.used) count += 1;
     }
     for (fs.vars[0..fs.n]) |v| {
         if (v.kind != .output) continue;
+        if (!v.used and v.loc < 0) continue;
         const nm = fs.name(v);
         const at: u32 = if (v.loc >= 0) @intCast(v.loc) else if (count == 1) 0 else {
             log.err(0, "output `{s}` needs a layout location", .{nm});

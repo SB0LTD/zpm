@@ -78,6 +78,12 @@ pub const EXTENSIONS = [_][:0]const u8{
     "GL_OES_packed_depth_stencil",
     "GL_OES_rgb8_rgba8",
     "GL_OES_texture_npot",
+    // (glamor's GLES needs: the border for RepeatNone; VAOs and mapped
+    // ranges are ES 3.0's, named as ES 2's extensions)
+    "GL_OES_texture_border_clamp",
+    "GL_EXT_texture_border_clamp",
+    "GL_OES_vertex_array_object",
+    "GL_EXT_map_buffer_range",
     // (a lost GPU: glGetGraphicsResetStatus, the reset strategy, and
     // CONTEXT_LOST once; the n-forms of ReadPixels and GetUniform)
     "GL_EXT_robustness",
@@ -109,6 +115,10 @@ pub const TexParams = struct {
     compare_func: u32 = g.LEQUAL,
     /// TEXTURE_SWIZZLE_R, _G, _B, _A (a texture's, not a sampler's)
     swizzle: [4]u32 = .{ g.RED, g.GREEN, g.BLUE, g.ALPHA },
+    /// TEXTURE_BORDER_COLOR (OES_texture_border_clamp): R, G, B, A as a
+    /// float's bits (glTexParameterfv's, iv's normalized) or an integer's
+    /// (glTexParameterIiv's, Iuiv's)
+    border: [4]u32 = .{ 0, 0, 0, 0 },
 };
 
 /// A sampler object (glGenSamplers): filters and wraps in place of its
@@ -551,7 +561,7 @@ fn setParam(p: *TexParams, ext: bool, sampler: bool, pname: u32, param: i32) u32
         g.NEAREST, g.LINEAR, g.NEAREST_MIPMAP_NEAREST, g.LINEAR_MIPMAP_NEAREST, g.NEAREST_MIPMAP_LINEAR, g.LINEAR_MIPMAP_LINEAR => true,
         else => false,
     };
-    const wrap = v == g.CLAMP_TO_EDGE or (!ext and (v == g.REPEAT or v == g.MIRRORED_REPEAT));
+    const wrap = v == g.CLAMP_TO_EDGE or (!ext and (v == g.REPEAT or v == g.MIRRORED_REPEAT or v == g.CLAMP_TO_BORDER));
     const chan = v == g.RED or v == g.GREEN or v == g.BLUE or v == g.ALPHA or v == g.ZERO or v == g.ONE;
     const func = v >= g.NEVER and v <= g.NEVER + 7;
     switch (pname) {
@@ -611,10 +621,21 @@ fn getParam(p: *const TexParams, sampler: bool, pname: u32) ?i32 {
     return @bitCast(v);
 }
 
+/// GL's R, G, B, A border words in the texel's channel order (`order`:
+/// GL channel i is stored channel order[i]).
+fn borderIn(border: [4]u32, order: [4]u3) [4]u32 {
+    var out = [4]u32{ 0, 0, 0, 0 };
+    for (border, order) |w, o| {
+        if (o < 4) out[o] = w;
+    }
+    return out;
+}
+
 fn wrapOf(w: u32) texture.Wrap {
     return switch (w) {
         g.CLAMP_TO_EDGE => .clamp,
         g.MIRRORED_REPEAT => .mirror,
+        g.CLAMP_TO_BORDER => .border,
         else => .repeat,
     };
 }
@@ -2742,6 +2763,31 @@ pub const Context = struct {
         if (e != g.NO_ERROR) c.fail(e);
     }
 
+    /// TEXTURE_BORDER_COLOR of the bound texture (`words`: R, G, B, A).
+    pub fn texBorder(c: *Context, target: u32, words: [4]u32) void {
+        const t = c.boundTex(target) orelse return;
+        if (t.target == g.TEXTURE_EXTERNAL_OES) return c.fail(g.INVALID_ENUM);
+        t.params.border = words;
+    }
+
+    pub fn getTexBorder(c: *Context, target: u32) ?[4]u32 {
+        const t = c.boundTex(target) orelse return null;
+        return t.params.border;
+    }
+
+    pub fn samplerBorder(c: *Context, name: u32, words: [4]u32) void {
+        const s = madeIn(Smp, &c.objs.samplers, name) orelse return c.fail(g.INVALID_OPERATION);
+        s.params.border = words;
+    }
+
+    pub fn getSamplerBorder(c: *Context, name: u32) ?[4]u32 {
+        const s = madeIn(Smp, &c.objs.samplers, name) orelse {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        };
+        return s.params.border;
+    }
+
     pub fn getTexParameteri(c: *Context, target: u32, pname: u32) ?i32 {
         const t = c.boundTex(target) orelse return null;
         switch (pname) {
@@ -2955,6 +3001,7 @@ pub const Context = struct {
             .last = @intCast(last),
             .min_lod = @floatFromInt(p.min_lod),
             .max_lod = @floatFromInt(p.max_lod),
+            .border = borderIn(p.border, order),
         };
     }
 

@@ -12,7 +12,18 @@
 //! - **Displays.** EGL_DEFAULT_DISPLAY and EGL_PLATFORM_SURFACELESS_MESA
 //!   are the surfaceless display (pbuffers, surfaceless contexts). A
 //!   wl_display (eglGetDisplay of one, or EGL_PLATFORM_WAYLAND_KHR) is a
-//!   Wayland display: window surfaces of wl_egl_windows.
+//!   Wayland display: window surfaces of wl_egl_windows. An Xlib Display
+//!   (eglGetDisplay of one, or EGL_PLATFORM_X11_KHR, whose
+//!   EGL_DEFAULT_DISPLAY is $DISPLAY) is an X11 display (x11.sig): window
+//!   surfaces of X windows, over a connection of EGL's own. The default
+//!   display, as Mesa's on X11, takes X windows too: it connects to
+//!   $DISPLAY at its first window surface (or native visual asked), so
+//!   Firefox on X11 (which asks EGL_DEFAULT_DISPLAY for everything,
+//!   window surfaces and its GPU process's offscreen contexts) draws there.
+//!   A gbm_device (gbm.sig: eglGetDisplay of one, or EGL_PLATFORM_GBM_KHR)
+//!   is a GBM display: surfaceless contexts, pbuffers, window surfaces of
+//!   gbm_surfaces, and EGL_KHR_image_pixmap's images of gbm_bos
+//!   (Xwayland's glamor).
 //! - **Configs.** Four: ARGB8888 and XRGB8888 (DRM's fourcc is the native
 //!   visual), each with and without depth 24 + stencil 8; windows and
 //!   pbuffers; OpenGL ES 2 and 3. eglChooseConfig matches and sorts as
@@ -59,6 +70,8 @@ const gles = @import("gles.sig");
 const report = @import("report.sig");
 const thread = @import("thread.sig");
 const wayland = @import("wayland.sig");
+const x11 = @import("x11.sig");
+const gbm = @import("gbm.sig");
 const Host = @import("host.sig").Host;
 const Engine = engine.Engine;
 const Image = engine.Image;
@@ -186,6 +199,12 @@ pub const EXTENSIONS: i32 = 0x3055;
 pub const CLIENT_APIS: i32 = 0x308D;
 pub const PLATFORM_WAYLAND_KHR: u32 = 0x31D8;
 pub const PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
+pub const PLATFORM_X11_KHR: u32 = 0x31D5;
+pub const PLATFORM_X11_SCREEN_KHR: i32 = 0x31D6;
+/// EGL_PLATFORM_GBM_KHR (EGL_PLATFORM_GBM_MESA: the same number)
+pub const PLATFORM_GBM_KHR: u32 = 0x31D7;
+/// EGL_KHR_image_pixmap's target: a native pixmap (a gbm_bo here)
+pub const NATIVE_PIXMAP_KHR: u32 = 0x30B0;
 
 // syncs
 pub const SYNC_FENCE: u32 = 0x30F9;
@@ -229,7 +248,7 @@ pub const GL_TEXTURE_2D_KHR: u32 = 0x30B1;
 pub const GL_TEXTURE_LEVEL_KHR: i32 = 0x30BC;
 
 pub const VERSION_STRING: [:0]const u8 = "1.5 Galaxy";
-pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_device_base EGL_EXT_device_enumeration EGL_EXT_device_query EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_wayland EGL_MESA_platform_surfaceless";
+pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_device_base EGL_EXT_device_enumeration EGL_EXT_device_query EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_EXT_platform_x11 EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_gbm EGL_KHR_platform_wayland EGL_KHR_platform_x11 EGL_MESA_platform_gbm EGL_MESA_platform_surfaceless";
 /// The one device's extensions (eglQueryDeviceStringEXT's EXTENSIONS).
 pub const DEVICE_EXTENSIONS: [:0]const u8 = "EGL_EXT_device_drm EGL_EXT_device_drm_render_node";
 pub const DEVICE_EXT: i32 = 0x322C;
@@ -237,7 +256,7 @@ pub const DRM_DEVICE_FILE_EXT: i32 = 0x3233;
 pub const DRM_RENDER_NODE_FILE_EXT: i32 = 0x3377;
 /// The render node every display draws through.
 pub const RENDER_NODE: [:0]const u8 = "/dev/dri/renderD128";
-const DISPLAY_COMMON = "EGL_EXT_buffer_age EGL_EXT_create_context_robustness EGL_EXT_swap_buffers_with_damage EGL_KHR_create_context EGL_KHR_fence_sync EGL_KHR_get_all_proc_addresses EGL_KHR_no_config_context EGL_KHR_partial_update EGL_KHR_stream EGL_KHR_stream_consumer_gltexture EGL_KHR_stream_producer_eglsurface EGL_KHR_surfaceless_context EGL_KHR_swap_buffers_with_damage EGL_KHR_wait_sync";
+const DISPLAY_COMMON = "EGL_EXT_buffer_age EGL_EXT_create_context_robustness EGL_EXT_swap_buffers_with_damage EGL_KHR_create_context EGL_KHR_fence_sync EGL_KHR_get_all_proc_addresses EGL_KHR_image_pixmap EGL_KHR_no_config_context EGL_KHR_partial_update EGL_KHR_stream EGL_KHR_stream_consumer_gltexture EGL_KHR_stream_producer_eglsurface EGL_KHR_surfaceless_context EGL_KHR_swap_buffers_with_damage EGL_KHR_wait_sync";
 const FENCE_EXTENSIONS = " EGL_ANDROID_native_fence_sync";
 const DMA_EXTENSIONS = " EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers EGL_KHR_gl_texture_2D_image EGL_KHR_image_base EGL_MESA_image_dma_buf_export";
 pub const DISPLAY_EXTENSIONS: [:0]const u8 = DISPLAY_COMMON ++ FENCE_EXTENSIONS ++ DMA_EXTENSIONS;
@@ -261,6 +280,8 @@ pub const Driver = struct {
     host: Host,
     /// libwayland-client (null: not in this process).
     wayland: *const fn () ?*const wayland.Client,
+    /// The socket calls EGL's X11 platform speaks over (null: no X11).
+    x11: ?*const fn () ?*const x11.Wire = null,
     /// Whether EGL can import dma-bufs and exchange native fence FDs.
     native_interop: *const fn () bool = allInterop,
     dma_import: ?*const fn () bool = null,
@@ -401,6 +422,19 @@ fn give() void {
     if (lock_word.swap(0, .release) == 2 and comptime builtin.os.tag == .linux) {
         _ = std.os.linux.syscall3(.futex, @intFromPtr(&lock_word.raw), 129, 1); // FUTEX_WAKE_PRIVATE
     }
+}
+
+/// The driver's engine for GBM (gbm.sig), opened as eglInitialize opens
+/// it: null without a GPU (the caller holds the driver lock).
+pub fn gbmEngine() ?*Engine {
+    const drv = driver orelse return null;
+    return drv.open();
+}
+
+/// The process's side of things for GBM (dma-bufs out and in, dup).
+pub fn gbmHost() ?Host {
+    const drv = driver orelse return null;
+    return drv.host;
 }
 
 // ── Errors (per thread) ────────────────────────────────────────────────────
@@ -625,7 +659,9 @@ pub fn configOf(handle: ?*const anyopaque) ?*const Config {
 
 // ── Displays ───────────────────────────────────────────────────────────────
 
-pub const Platform = enum { surfaceless, wayland };
+/// gbm: a GBM device's (EGL_PLATFORM_GBM_KHR): surfaceless contexts,
+/// pbuffers and window surfaces of gbm_surfaces.
+pub const Platform = enum { surfaceless, wayland, x11, gbm };
 
 pub const Display = struct {
     used: bool = false,
@@ -635,7 +671,14 @@ pub const Display = struct {
     eng: ?*Engine = null,
     client: ?*const wayland.Client = null,
     wl: wayland.Display = undefined,
-    /// terminated with objects still current: the Wayland state goes with the last
+    /// the X server's connection (an X11 display's, or the default one's
+    /// once it took an X window), while x11_up
+    xc: x11.Conn = undefined,
+    x11_up: bool = false,
+    /// (the default display tried $DISPLAY once already)
+    x11_tried: bool = false,
+    /// terminated with objects still current: the Wayland (or X11) state
+    /// goes with the last
     terminating: bool = false,
 };
 
@@ -671,10 +714,39 @@ pub fn getDisplay(native: ?*anyopaque) ?*Display {
     lock();
     defer unlock();
     const n = native orelse return ok(?*Display, displayFor(.surfaceless, null));
+    // (a GBM device of ours, as Mesa tells one: before anything reads it
+    // as another platform's)
+    if (gbm.deviceOf(n) != null) return ok(?*Display, displayFor(.gbm, n));
     const drv = driver orelse return failWhy(?*Display, BAD_DISPLAY, null, "no EGL driver");
-    const c = drv.wayland() orelse return failWhy(?*Display, BAD_DISPLAY, null, "no libwayland-client symbols");
-    if (!c.isDisplay(n)) return failWhy(?*Display, BAD_PARAMETER, null, "native display is not a wl_display");
-    return ok(?*Display, displayFor(.wayland, n));
+    const c = drv.wayland();
+    if (c) |wc| {
+        if (wc.isDisplay(n)) return ok(?*Display, displayFor(.wayland, n));
+    }
+    // (not a wl_display: an Xlib Display, as Mesa takes it)
+    if (x11Wire() != null and x11.isXlibDisplay(n)) return ok(?*Display, displayFor(.x11, n));
+    if (c == null) return failWhy(?*Display, BAD_DISPLAY, null, "no libwayland-client symbols, and not an Xlib Display");
+    return failWhy(?*Display, BAD_PARAMETER, null, "native display is neither a wl_display nor an Xlib Display");
+}
+
+/// The driver's X11 socket calls, if it has them.
+fn x11Wire() ?*const x11.Wire {
+    const drv = driver orelse return null;
+    const f = drv.x11 orelse return null;
+    return f();
+}
+
+/// The X server's connection of a display that takes X windows: an X11
+/// display's, or the default (surfaceless) display's, which connects to
+/// $DISPLAY at its first need (once). Null otherwise.
+fn xconn(d: *Display) ?*x11.Conn {
+    if (d.x11_up) return if (d.xc.live()) &d.xc else null;
+    if (d.platform != .surfaceless or d.x11_tried or !d.initialized) return null;
+    d.x11_tried = true;
+    const wire = x11Wire() orelse return null;
+    const name = wire.display_env(wire.ctx) orelse return null;
+    if (!d.xc.open(wire, name, null)) return null;
+    d.x11_up = true;
+    return &d.xc;
 }
 
 /// eglGetPlatformDisplay (and the EXT one).
@@ -690,6 +762,20 @@ pub fn getPlatformDisplay(platform: u32, native: ?*anyopaque) ?*Display {
             // (EGL_DEFAULT_DISPLAY would mean a connection of EGL's own: not made)
             const n = native orelse return fail(?*Display, BAD_PARAMETER, null);
             return ok(?*Display, displayFor(.wayland, n));
+        },
+        PLATFORM_X11_KHR => {
+            // (an Xlib Display, or EGL_DEFAULT_DISPLAY: $DISPLAY)
+            if (x11Wire() == null) return failWhy(?*Display, BAD_PARAMETER, null, "no X11 in this driver");
+            if (native) |n| {
+                if (!x11.isXlibDisplay(n)) return failWhy(?*Display, BAD_PARAMETER, null, "not an Xlib Display");
+            }
+            return ok(?*Display, displayFor(.x11, native));
+        },
+        PLATFORM_GBM_KHR => {
+            // (a gbm_device of this library's: gbm_create_device's)
+            const n = native orelse return failWhy(?*Display, BAD_PARAMETER, null, "EGL_PLATFORM_GBM_KHR needs a gbm_device");
+            if (gbm.deviceOf(n) == null) return failWhy(?*Display, BAD_PARAMETER, null, "not a gbm_device of this driver's");
+            return ok(?*Display, displayFor(.gbm, n));
         },
         else => return fail(?*Display, BAD_PARAMETER, null),
     }
@@ -709,6 +795,18 @@ pub fn initialize(handle: ?*anyopaque, major: ?*i32, minor: ?*i32) bool {
             if (!c.isDisplay(d.native.?)) return failWhy(bool, BAD_DISPLAY, false, "not a wl_display");
             if (!d.wl.init(c, drv.host, @ptrCast(d.native.?))) return failWhy(bool, NOT_INITIALIZED, false, "the compositor offers no dma-bufs this driver can show");
             d.client = c;
+        }
+        if (d.platform == .x11 and !d.x11_up) {
+            const wire = x11Wire() orelse return failWhy(bool, NOT_INITIALIZED, false, "no X11 in this driver");
+            var name: []const u8 = undefined;
+            var screen: ?u32 = null;
+            if (d.native) |n| {
+                const xn = x11.xlibName(n);
+                name = xn.name;
+                screen = xn.screen;
+            } else name = wire.display_env(wire.ctx) orelse return failWhy(bool, NOT_INITIALIZED, false, "DISPLAY is not set");
+            if (!d.xc.open(wire, name, screen)) return failWhy(bool, NOT_INITIALIZED, false, "no X server to show windows on");
+            d.x11_up = true;
         }
         d.terminating = false;
         d.eng = eng;
@@ -748,7 +846,7 @@ pub fn terminate(handle: ?*anyopaque) bool {
         if (s.display == d) dropStream(s);
     }
     d.initialized = false;
-    d.terminating = d.platform == .wayland;
+    d.terminating = d.platform == .wayland or d.x11_up;
     reapDisplay(d);
     return ok(bool, true);
 }
@@ -762,7 +860,10 @@ fn reapDisplay(d: *Display) void {
     for (&contexts) |*c| {
         if (c.used and c.display == d) return;
     }
-    d.wl.deinit();
+    if (d.platform == .wayland) d.wl.deinit();
+    if (d.x11_up) d.xc.close();
+    d.x11_up = false;
+    d.x11_tried = false;
     d.terminating = false;
 }
 
@@ -1136,9 +1237,14 @@ pub fn chooseConfig(handle: ?*anyopaque, attribs: ?[*]const i32, out: ?[*]?*cons
 pub fn getConfigAttrib(handle: ?*anyopaque, config: ?*const anyopaque, a: i32, value: ?*i32) bool {
     lock();
     defer unlock();
-    _ = ready(handle) orelse return false;
+    const d = ready(handle) orelse return false;
     const c = configOf(config) orelse return fail(bool, BAD_CONFIG, false);
-    const v = c.attrib(a) orelse return fail(bool, BAD_ATTRIBUTE, false);
+    var v = c.attrib(a) orelse return fail(bool, BAD_ATTRIBUTE, false);
+    // (on X the native visual is the server's: TrueColor, of depth 24 for
+    // XRGB, 32 for ARGB, as Firefox matches them with XGetVisualInfo)
+    if (a == NATIVE_VISUAL_ID or a == NATIVE_VISUAL_TYPE) {
+        if (xconn(d)) |xc| v = if (a == NATIVE_VISUAL_TYPE) x11.TRUE_COLOR else @bitCast(if (c.alpha) xc.setup.visual32 else xc.setup.visual24);
+    }
     if (value) |p| p.* = v;
     return ok(bool, true);
 }
@@ -1294,9 +1400,13 @@ pub const Surface = struct {
     used: bool = false,
     display: ?*Display = null,
     config: *const Config = &configs[0],
-    kind: enum { window, pbuffer, stream } = .pbuffer,
+    kind: enum { window, xwindow, pbuffer, stream, gbm } = .pbuffer,
     stream: ?*Stream = null,
     win: wayland.Window = undefined,
+    /// an X window's (kind xwindow)
+    xwin: x11.Window = undefined,
+    /// a gbm_surface's (kind gbm): its buffers are the back buffers
+    gsurf: ?*gbm.Surface = null,
     age_queried: bool = false,
     damage_set: bool = false,
     /// a pbuffer's color
@@ -1347,15 +1457,17 @@ fn windowAttribs(comptime T: type, attribs: ?[*]const T) bool {
     return true;
 }
 
-/// eglCreateWindowSurface and eglCreatePlatformWindowSurface: `native` is
-/// a wl_egl_window.
+/// eglCreateWindowSurface: `native` is a wl_egl_window, or on a display
+/// that takes X windows (an X11 one, the default one) an X Window (its id
+/// as the pointer's value).
 pub fn createWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*const anyopaque, native: ?*anyopaque, attribs: ?[*]const T) ?*Surface {
     lock();
     defer unlock();
     const d = ready(handle) orelse return null;
     const cfg = configOf(config) orelse return fail(?*Surface, BAD_CONFIG, null);
     if (!windowAttribs(T, attribs)) return fail(?*Surface, BAD_ATTRIBUTE, null);
-    if (d.platform != .wayland) return fail(?*Surface, BAD_NATIVE_WINDOW, null);
+    if (d.platform == .gbm) return gbmWindowSurface(d, cfg, native);
+    if (d.platform != .wayland) return xWindowSurface(d, cfg, native);
     const n: *wayland.EglWindow = @ptrCast(@alignCast(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null)));
     if (n.driver_private != null) return failWhy(?*Surface, BAD_ALLOC, null, "the wl_egl_window has a surface already");
     const s = newSurface(d, cfg) orelse return failWhy(?*Surface, BAD_ALLOC, null, "every surface slot is in use");
@@ -1364,6 +1476,51 @@ pub fn createWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*cons
         s.* = .{};
         return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "the window's Wayland surface could not be set up");
     }
+    return ok(?*Surface, s);
+}
+
+/// eglCreatePlatformWindowSurface (and the EXT one): as eglCreateWindowSurface,
+/// but on X (EGL_KHR_platform_x11) `native` points to the Window.
+pub fn createPlatformWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*const anyopaque, native: ?*anyopaque, attribs: ?[*]const T) ?*Surface {
+    lock();
+    defer unlock();
+    if (displayOf(handle)) |d| {
+        // (EGL_KHR_platform_gbm's native window is the gbm_surface itself)
+        if (d.platform != .wayland and d.platform != .gbm) {
+            const p: *const c_ulong = @ptrCast(@alignCast(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null)));
+            return createWindowSurface(T, handle, config, @ptrFromInt(p.*), attribs);
+        }
+    }
+    return createWindowSurface(T, handle, config, native, attribs);
+}
+
+/// A window surface over X window `native` (its id as the pointer's value).
+fn xWindowSurface(d: *Display, cfg: *const Config, native: ?*anyopaque) ?*Surface {
+    const xid_wide = @intFromPtr(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null));
+    if (xid_wide > 0x1fff_ffff) return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "not an X window id");
+    const xid: u32 = @intCast(xid_wide);
+    const xc = xconn(d) orelse return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "no X server for this display's windows");
+    for (&surfaces) |*o| {
+        if (o.used and !o.doomed and o.display == d and o.kind == .xwindow and o.xwin.xid == xid) return failWhy(?*Surface, BAD_ALLOC, null, "the X window has a surface already");
+    }
+    const s = newSurface(d, cfg) orelse return failWhy(?*Surface, BAD_ALLOC, null, "every surface slot is in use");
+    s.kind = .xwindow;
+    if (!s.xwin.init(xc, d.eng.?, driver.?.host, xid, cfg.alpha)) {
+        s.* = .{};
+        return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "the X window could not be drawn on");
+    }
+    return ok(?*Surface, s);
+}
+
+/// A window surface over gbm_surface `native`: its buffers drawn into in
+/// turn (gbm.sig), one EGL surface a gbm_surface.
+fn gbmWindowSurface(d: *Display, cfg: *const Config, native: ?*anyopaque) ?*Surface {
+    const gs = gbm.surfaceOf(native) orelse return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "not a gbm_surface of this driver's");
+    if (gs.egl_bound) return failWhy(?*Surface, BAD_ALLOC, null, "the gbm_surface has an EGL surface already");
+    const s = newSurface(d, cfg) orelse return failWhy(?*Surface, BAD_ALLOC, null, "every surface slot is in use");
+    s.kind = .gbm;
+    s.gsurf = gs;
+    gs.egl_bound = true;
     return ok(?*Surface, s);
 }
 
@@ -1445,6 +1602,8 @@ fn freeSurface(s: *Surface) void {
     const d = s.display.?;
     const eng = d.eng.?;
     if (s.kind == .window) s.win.deinit();
+    if (s.kind == .xwindow) s.xwin.deinit();
+    if (s.gsurf) |gs| gbm.unbind(gs);
     if (s.stream) |st| {
         st.producer = null;
         st.disconnected = true;
@@ -1462,14 +1621,19 @@ pub fn destroySurface(handle: ?*anyopaque, surface: ?*anyopaque) bool {
     const d = ready(handle) orelse return false;
     const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
     s.doomed = true;
-    if (s.ctx == null) freeSurface(s) else if (s.kind == .window) s.win.detach();
+    if (s.ctx == null) freeSurface(s) else if (s.kind == .window) s.win.detach() else if (s.kind == .xwindow) s.xwin.detach();
     return ok(bool, true);
 }
 
 /// The surface's color image to draw to now (a window's back buffer), and
 /// its depth image (made or remade at the color's size).
 fn images(s: *Surface) ?struct { color: *Image, depth: ?*Image } {
-    const color: *Image = if (s.kind == .window) (s.win.backImage() orelse return null) else &s.color;
+    const color: *Image = switch (s.kind) {
+        .window => s.win.backImage() orelse return null,
+        .xwindow => s.xwin.backImage() orelse return null,
+        .gbm => gbm.backImage(s.gsurf.?) orelse return null,
+        else => &s.color,
+    };
     if (!s.config.depth) return .{ .color = color, .depth = null };
     const eng = s.display.?.eng.?;
     if (s.depth.width != color.width or s.depth.height != color.height) {
@@ -1488,7 +1652,18 @@ fn bindSurfaces(c: *Context) bool {
         c.gl.revalidate = null;
         return true;
     };
-    c.gl.revalidate = if (draw.kind == .window) .{ .ctx = c, .f = revalidateWindow, .stale = &draw.win.resized } else null;
+    c.gl.revalidate = switch (draw.kind) {
+        .window => .{ .ctx = c, .f = revalidateWindow, .stale = &draw.win.resized },
+        .xwindow => .{ .ctx = c, .f = revalidateWindow, .stale = &draw.xwin.resized },
+        .gbm => .{ .ctx = c, .f = revalidateWindow, .stale = &draw.gsurf.?.stale },
+        else => null,
+    };
+    // (an X window's binding is fresh from here: its size is asked below)
+    if (draw.kind == .xwindow) draw.xwin.resized.store(false, .release);
+    if (draw.kind == .gbm) draw.gsurf.?.stale.store(false, .release);
+    if (c.read) |r| {
+        if (r.kind == .xwindow) r.xwin.resized.store(false, .release);
+    }
     const di = images(draw) orelse return false;
     var ri = di;
     if (c.read) |r| {
@@ -1505,8 +1680,12 @@ fn bindSurfaces(c: *Context) bool {
 fn revalidateWindow(p: *anyopaque) void {
     const c: *Context = @ptrCast(@alignCast(p));
     const s = c.draw orelse return;
-    if (s.kind != .window) return;
-    s.win.dropBack();
+    switch (s.kind) {
+        .window => s.win.dropBack(),
+        .xwindow => s.xwin.dropBack(),
+        .gbm => {},
+        else => return,
+    }
     _ = bindSurfaces(c);
 }
 
@@ -1516,8 +1695,18 @@ pub fn querySurface(handle: ?*anyopaque, surface: ?*anyopaque, a: i32, value: ?*
     const d = ready(handle) orelse return false;
     const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
     const v: i32 = switch (a) {
-        WIDTH => @intCast(if (s.kind == .window) s.win.wanted()[0] else s.width),
-        HEIGHT => @intCast(if (s.kind == .window) s.win.wanted()[1] else s.height),
+        WIDTH => @intCast(switch (s.kind) {
+            .window => s.win.wanted()[0],
+            .xwindow => s.xwin.wanted()[0],
+            .gbm => s.gsurf.?.width,
+            else => s.width,
+        }),
+        HEIGHT => @intCast(switch (s.kind) {
+            .window => s.win.wanted()[1],
+            .xwindow => s.xwin.wanted()[1],
+            .gbm => s.gsurf.?.height,
+            else => s.height,
+        }),
         CONFIG_ID => s.config.id,
         RENDER_BUFFER => BACK_BUFFER,
         SWAP_BEHAVIOR => BUFFER_DESTROYED,
@@ -1531,7 +1720,12 @@ pub fn querySurface(handle: ?*anyopaque, surface: ?*anyopaque, a: i32, value: ?*
             const t = thread.get() orelse return fail(bool, BAD_SURFACE, false);
             if (t.draw != @as(?*anyopaque, s)) return fail(bool, BAD_SURFACE, false);
             s.age_queried = true;
-            break :blk if (s.kind == .window) s.win.age() else 0;
+            break :blk switch (s.kind) {
+                .window => s.win.age(),
+                .xwindow => s.xwin.age(),
+                .gbm => gbm.age(s.gsurf.?),
+                else => 0,
+            };
         },
         else => {
             if (driver.?.surface_pointer) |query| {
@@ -1700,7 +1894,7 @@ pub fn setDamageRegion(handle: ?*anyopaque, surface: ?*anyopaque, rects: ?[*]con
     const d = ready(handle) orelse return false;
     const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
     const t = thread.get() orelse return fail(bool, BAD_MATCH, false);
-    if (s.kind != .window or t.draw != @as(?*anyopaque, s)) return fail(bool, BAD_MATCH, false);
+    if ((s.kind != .window and s.kind != .xwindow and s.kind != .gbm) or t.draw != @as(?*anyopaque, s)) return fail(bool, BAD_MATCH, false);
     if (!s.age_queried or s.damage_set) return fail(bool, BAD_ACCESS, false);
     if (n < 0 or (n != 0 and rects == null)) return fail(bool, BAD_PARAMETER, false);
     // Wayland retains the back buffer's contents for the age it reports.
@@ -1740,11 +1934,24 @@ pub fn swapBuffers(handle: ?*anyopaque, surface: ?*anyopaque, damage: []const [4
         swapped(c, began);
         return ok(bool, true);
     }
-    if (!s.win.swap(damage)) return fail(bool, BAD_NATIVE_WINDOW, false);
+    const shown = switch (s.kind) {
+        .xwindow => s.xwin.swap(damage),
+        .gbm => blk: {
+            // (the GPU's work on it submitted: the dma-buf's fence covers it)
+            c.gl.flush();
+            break :blk gbm.swap(s.gsurf.?);
+        },
+        else => s.win.swap(damage),
+    };
+    if (!shown) return fail(bool, BAD_NATIVE_WINDOW, false);
     s.age_queried = false;
     s.damage_set = false;
-    // the context draws on the next back buffer
-    if (!bindSurfaces(c)) return fail(bool, BAD_ALLOC, false);
+    // the context draws on the next back buffer: an X window's is taken at
+    // the next drawing (revalidate), at the window's size then; a
+    // gbm_surface's too (the app may release one first)
+    if (s.kind == .xwindow or s.kind == .gbm) {
+        c.gl.setSurface(null, null, null);
+    } else if (!bindSurfaces(c)) return fail(bool, BAD_ALLOC, false);
     swapped(c, began);
     return ok(bool, true);
 }
@@ -1763,6 +1970,7 @@ pub fn swapInterval(handle: ?*anyopaque, interval: i32) bool {
     const sp = t.draw orelse return fail(bool, BAD_SURFACE, false);
     const s: *Surface = @ptrCast(@alignCast(sp));
     if (s.kind == .window) s.win.interval = @intCast(std.math.clamp(interval, 0, 1));
+    if (s.kind == .xwindow) s.xwin.interval = @intCast(std.math.clamp(interval, 0, 1));
     return ok(bool, true);
 }
 
@@ -1997,6 +2205,7 @@ pub fn createImage(comptime T: type, handle: ?*anyopaque, ctx: ?*anyopaque, targ
     defer unlock();
     const d = ready(handle) orelse return null;
     if (target == GL_TEXTURE_2D_KHR) return textureImage(T, d, ctx, buffer, attribs);
+    if (target == NATIVE_PIXMAP_KHR) return pixmapImage(T, d, ctx, buffer, attribs);
     if (target == 0x3140) { // EGL_NATIVE_BUFFER_ANDROID
         if (ctx != null) return fail(?*EImage, BAD_CONTEXT, null);
         const client = buffer orelse return fail(?*EImage, BAD_PARAMETER, null);
@@ -2094,6 +2303,33 @@ fn textureImage(comptime T: type, d: *Display, ctx: ?*anyopaque, buffer: ?*anyop
     return ok(?*EImage, slot);
 }
 
+/// EGL_KHR_image_pixmap: a gbm_bo (the native pixmap of a GBM display,
+/// and of any other: a buffer is the driver's own memory), its memory
+/// itself, no dma-buf between (an imported buffer's imported now).
+fn pixmapImage(comptime T: type, d: *Display, ctx: ?*anyopaque, buffer: ?*anyopaque, attribs: ?[*]const T) ?*EImage {
+    if (ctx != null) return fail(?*EImage, BAD_CONTEXT, null);
+    if (attribs) |list| {
+        var i: usize = 0;
+        while (list[i] != NONE) : (i += 2) {
+            if (@as(i32, @intCast(list[i])) != IMAGE_PRESERVED_KHR) return fail(?*EImage, BAD_ATTRIBUTE, null);
+        }
+    }
+    const bo = gbm.boOf(buffer) orelse return failWhy(?*EImage, BAD_PARAMETER, null, "not a gbm_bo of this driver's");
+    const img = gbm.memory(bo) orelse return failWhy(?*EImage, BAD_ALLOC, null, "the gbm_bo's dma-buf could not be imported");
+    const slot = for (&eimages) |*x| {
+        if (!x.alive and x.shared.refs == 0) break x;
+    } else return fail(?*EImage, BAD_ALLOC, null);
+    // (its dma-buf for EGL_MESA_image_dma_buf_export: the buffer's own, if
+    // it has one yet; else exported at the first export)
+    const h = driver.?.host;
+    const fd: i32 = if (bo.fd >= 0) h.dup(h.ctx, bo.fd) else -1;
+    slot.* = .{ .alive = true, .display = d, .fd = if (fd >= 0) fd else -1, .fourcc = @bitCast(bo.format), .offset = @intCast(bo.offset) };
+    slot.img = engine.alias(img);
+    // (a texture's rows are memory's from row 0: the buffer's own order)
+    slot.img.top_down = false;
+    return ok(?*EImage, slot);
+}
+
 pub fn androidClientBuffer(buffer: ?*const anyopaque) ?*anyopaque {
     lock();
     defer unlock();
@@ -2175,7 +2411,7 @@ pub fn exportDmaBuf(handle: ?*anyopaque, image: ?*anyopaque, fd: ?*i32, stride: 
         const h = driver.?.host;
         if (m.fd < 0) {
             // (a texture's buffer, out the first time: the whole of it)
-            const got = h.exportFd(h.ctx, m.shared.buf);
+            const got = h.exportFd(h.ctx, (m.img.share orelse &m.shared).buf);
             if (got < 0) return fail(bool, BAD_ALLOC, false);
             m.fd = @intCast(got);
         }
