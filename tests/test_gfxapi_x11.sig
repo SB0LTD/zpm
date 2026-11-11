@@ -47,6 +47,7 @@ const get32 = x11.get32;
 
 const DRI3_OP = 149;
 const PRESENT_OP = 148;
+const SHM_OP = 130;
 
 const Win = struct {
     xid: u32 = 0,
@@ -56,6 +57,8 @@ const Win = struct {
     fb: [64 * 64]u32 = undefined,
 };
 
+const Seg = struct { seg: u32 = 0, fd: i32 = -1 };
+
 const Pix = struct { xid: u32 = 0, fd: i32 = -1, w: u32 = 0, h: u32 = 0, stride: u32 = 0, depth: u8 = 0, size: u32 = 0 };
 
 const Fake = struct {
@@ -64,6 +67,17 @@ const Fake = struct {
     var present = true;
     var refuse_dri3 = false;
     var refuse_connect = false;
+    var shm = false;
+    var refuse_shm = false;
+    /// MIT-SHM's memory, as the Wire makes it (fd 70 + n), and the
+    /// segments the server attached
+    var shm_mem: [2][64 * 64 * 4]u8 = undefined;
+    var shm_used = [2]bool{ false, false };
+    var shm_creates: u32 = 0;
+    var shm_destroys: u32 = 0;
+    var segs: [4]Seg = undefined;
+    var shm_puts: u32 = 0;
+    var detaches: u32 = 0;
     /// CompleteNotify held back until EGL waits for it (the next vblank)
     var hold_complete = false;
     var held: [256]u8 = undefined;
@@ -111,6 +125,14 @@ const Fake = struct {
         present = true;
         refuse_dri3 = false;
         refuse_connect = false;
+        shm = false;
+        refuse_shm = false;
+        shm_used = .{ false, false };
+        shm_creates = 0;
+        shm_destroys = 0;
+        for (&segs) |*g| g.* = .{};
+        shm_puts = 0;
+        detaches = 0;
         hold_complete = false;
         held_len = 0;
         max_words = 0xffff;
@@ -266,6 +288,8 @@ const Fake = struct {
                     reply(0, &.{ 1, DRI3_OP, 0, 0 });
                 } else if (std.mem.eql(u8, name, "Present") and present) {
                     reply(0, &.{ 1, PRESENT_OP, 0, 0 });
+                } else if (std.mem.eql(u8, name, "MIT-SHM") and shm) {
+                    reply(0, &.{ 1, SHM_OP, 0, 0 });
                 } else reply(0, &.{ 0, 0, 0, 0 });
             },
             x11.OP_GET_GEOMETRY => {
@@ -327,6 +351,61 @@ const Fake = struct {
                         }
                     }
                     unreachable;
+                },
+                else => {
+                    bad_requests += 1;
+                    sendError(1, 0, r[0], r[1]);
+                },
+            },
+            SHM_OP => switch (r[1]) {
+                // 1.2, shared pixmaps, ZPixmap
+                x11.SHM_QUERY_VERSION => reply(1, &.{ 1, 0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0 }),
+                x11.SHM_ATTACH_FD => {
+                    std.debug.assert(fds_used < n_fds);
+                    const fd = fds[fds_used];
+                    fds_used += 1;
+                    if (refuse_shm) return sendError(10, 0, SHM_OP, x11.SHM_ATTACH_FD); // BadAccess
+                    std.debug.assert(r[8] == 1); // (read only)
+                    for (&segs) |*g| {
+                        if (g.seg == 0) {
+                            g.* = .{ .seg = get32(r[4..]), .fd = fd };
+                            return;
+                        }
+                    }
+                    unreachable;
+                },
+                x11.SHM_DETACH => {
+                    for (&segs) |*g| {
+                        if (g.seg == get32(r[4..])) g.* = .{};
+                    }
+                    detaches += 1;
+                },
+                x11.SHM_PUT_IMAGE => {
+                    shm_puts += 1;
+                    const w = win(get32(r[4..])) orelse return sendError(x11.BAD_DRAWABLE, get32(r[4..]), r[0], r[1]);
+                    const tw: u32 = get16(r[12..]);
+                    const sx: u32 = get16(r[16..]);
+                    const sy: u32 = get16(r[18..]);
+                    const sw: u32 = get16(r[20..]);
+                    const sh: u32 = get16(r[22..]);
+                    const dx: u32 = get16(r[24..]);
+                    const dy: u32 = get16(r[26..]);
+                    if (r[28] != w.depth or r[29] != x11.Z_PIXMAP) return sendError(x11.BAD_MATCH, 0, r[0], r[1]);
+                    const seg = get32(r[32..]);
+                    const fd = for (segs) |g| {
+                        if (g.seg == seg and seg != 0) break g.fd;
+                    } else return sendError(128, seg, r[0], r[1]); // (BadShmSeg)
+                    const mem = &shm_mem[@intCast(fd - 70)];
+                    const off = get32(r[36..]);
+                    for (0..sh) |j| {
+                        for (0..sw) |i| {
+                            const x = dx + i;
+                            const y = dy + j;
+                            if (x >= w.w or y >= w.h) continue;
+                            w.fb[y * w.w + x] = get32(mem[off + ((sy + j) * tw + sx + i) * 4 ..]);
+                        }
+                    }
+                    put_rows += sh;
                 },
                 else => {
                     bad_requests += 1;
@@ -426,7 +505,22 @@ const Fake = struct {
     fn env(_: ?*anyopaque) ?[]const u8 {
         return display_env;
     }
-    const wire = x11.Wire{ .connect = connect, .send = send, .recv = recv, .poll = poll, .close = close, .display_env = env };
+    fn shmCreate(_: ?*anyopaque, size: usize) ?x11.Shm {
+        if (size > shm_mem[0].len) return null;
+        for (&shm_used, 0..) |*u, i| {
+            if (u.*) continue;
+            u.* = true;
+            shm_creates += 1;
+            @memset(&shm_mem[i], 0xee);
+            return .{ .fd = 70 + @as(i32, @intCast(i)), .mem = shm_mem[i][0..size] };
+        }
+        return null;
+    }
+    fn shmDestroy(_: ?*anyopaque, m: x11.Shm) void {
+        shm_used[@intCast(m.fd - 70)] = false;
+        shm_destroys += 1;
+    }
+    const wire = x11.Wire{ .connect = connect, .send = send, .recv = recv, .poll = poll, .close = close, .display_env = env, .shm_create = shmCreate, .shm_destroy = shmDestroy };
 };
 
 fn pad4(n: usize) usize {
@@ -740,6 +834,81 @@ test "x11: DRI3 and Present: dma-buf pixmaps presented, interval 1 waits for com
     try testing.expect(egl.destroyContext(d, ctx));
     try testing.expect(egl.terminate(d));
     try testing.expect(Fake.closed);
+}
+
+test "x11: MIT-SHM (Galaxy's Xwayland: Present and MIT-SHM, no DRI3): frames through shared memory, damage, resize, a refusal" {
+    useDriver();
+    Fake.reset();
+    Fake.shm = true;
+    _ = Fake.addWindow(0x600006, 24, 12, 24);
+    const d = egl.getDisplay(null).?;
+    try testing.expect(egl.initialize(d, null, null));
+    const cfg = firefoxConfig(d, 24).?;
+    const s = egl.createWindowSurface(i32, d, cfg, @ptrFromInt(0x600006), null).?;
+    try testing.expectEqual(x11.Mode.shm, s.xwin.mode);
+    const ctx = egl.createContext(d, cfg, null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.NONE }).?;
+    try testing.expect(egl.makeCurrent(d, s, s, ctx));
+    const c = thread.gl().?;
+    // frame 1: red; the memory made and attached (its fd sent), one ShmPutImage
+    c.clearColor(1, 0, 0, 1);
+    c.clear(gl.COLOR_BUFFER_BIT);
+    try testing.expect(egl.swapBuffers(d, s, &.{}));
+    try testing.expectEqual(@as(u32, 1), Fake.shm_creates);
+    try testing.expectEqual(@as(i32, 70), Fake.segs[0].fd);
+    try testing.expectEqual(@as(u32, 1), Fake.shm_puts);
+    try testing.expectEqual(@as(u32, 0), Fake.put_images);
+    try testing.expectEqual(RED, Fake.pixel(0x600006, 0, 0));
+    try testing.expectEqual(RED, Fake.pixel(0x600006, 23, 11));
+    // frame 2: green in GL's bottom left 4 x 2, only that rectangle sent
+    var age: i32 = 0;
+    try testing.expect(egl.querySurface(d, s, egl.BUFFER_AGE_EXT, &age));
+    try testing.expectEqual(@as(i32, 1), age);
+    c.enable(gl.SCISSOR_TEST, true);
+    c.scissorSet(0, 0, 4, 2);
+    c.clearColor(0, 1, 0, 1);
+    c.clear(gl.COLOR_BUFFER_BIT);
+    c.enable(gl.SCISSOR_TEST, false);
+    const rows = Fake.put_rows;
+    try testing.expect(egl.swapBuffers(d, s, &.{.{ 0, 0, 4, 2 }}));
+    try testing.expectEqual(rows + 2, Fake.put_rows);
+    try testing.expectEqual(GREEN, Fake.pixel(0x600006, 3, 11));
+    try testing.expectEqual(RED, Fake.pixel(0x600006, 4, 11));
+    try testing.expectEqual(RED, Fake.pixel(0x600006, 0, 9));
+    try testing.expectEqual(@as(u32, 1), Fake.shm_creates);
+    // a bigger window: new memory, the old detached and let go
+    Fake.resize(0x600006, 40, 20);
+    c.clearColor(0, 0, 1, 1);
+    c.clear(gl.COLOR_BUFFER_BIT);
+    try testing.expect(egl.swapBuffers(d, s, &.{}));
+    try testing.expectEqual(BLUE, Fake.pixel(0x600006, 39, 19));
+    try testing.expectEqual(@as(u32, 2), Fake.shm_creates);
+    try testing.expectEqual(@as(u32, 1), Fake.shm_destroys);
+    try testing.expectEqual(@as(u32, 1), Fake.detaches);
+    try testing.expectEqual(@as(u32, 0), Fake.errors_sent);
+    try testing.expectEqual(@as(u32, 0), Fake.bad_requests);
+    // given back: detached, let go, the GC freed
+    try testing.expect(egl.makeCurrent(d, null, null, null));
+    try testing.expect(egl.destroySurface(d, s));
+    try testing.expectEqual(@as(u32, 2), Fake.detaches);
+    try testing.expectEqual(Fake.shm_creates, Fake.shm_destroys);
+    try testing.expectEqual(@as(u32, 1), Fake.freed_gcs);
+
+    // a server that refuses the memory: PutImage, the same frame shown
+    Fake.refuse_shm = true;
+    _ = Fake.addWindow(0x600007, 16, 8, 24);
+    const s2 = egl.createWindowSurface(i32, d, cfg, @ptrFromInt(0x600007), null).?;
+    try testing.expect(egl.makeCurrent(d, s2, s2, ctx));
+    thread.gl().?.clearColor(1, 0, 0, 1);
+    thread.gl().?.clear(gl.COLOR_BUFFER_BIT);
+    try testing.expect(egl.swapBuffers(d, s2, &.{}));
+    try testing.expectEqual(x11.Mode.put_image, s2.xwin.mode);
+    try testing.expectEqual(RED, Fake.pixel(0x600007, 15, 7));
+    try testing.expect(Fake.put_images >= 1);
+    try testing.expectEqual(Fake.shm_creates, Fake.shm_destroys);
+    try testing.expect(egl.makeCurrent(d, null, null, null));
+    try testing.expect(egl.destroySurface(d, s2));
+    try testing.expect(egl.destroyContext(d, ctx));
+    try testing.expect(egl.terminate(d));
 }
 
 test "x11: a server that refuses our dma-buf: the window turns to PutImage" {

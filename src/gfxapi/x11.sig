@@ -16,7 +16,7 @@
 //! - **Visuals.** The setup reply's screen: its TrueColor visuals of depth
 //!   24 (the root's, where it is one) and 32 are the configs' native
 //!   visuals (XRGB and ARGB), as Firefox matches them with XGetVisualInfo.
-//! - **Frames, two ways**, chosen per window when it is made:
+//! - **Frames, three ways**, chosen per window when it is made:
 //!   - *DRI3 and Present* (a server that imports dma-bufs: Xwayland with
 //!     glamor): up to MAX_BUFFERS engine images in GPU memory (top-down
 //!     BGRA, linear, the window's depth, 32 bits a pixel), each a pixmap
@@ -26,13 +26,18 @@
 //!     them held, EGL waits for one. Swap interval 1 waits for the last
 //!     frame's CompleteNotify first (the frame clock); 0 presents Async.
 //!     Present's ConfigureNotify marks the window resized. A server that
-//!     refuses the first dma-buf turns the window to the second way.
-//!   - *PutImage* (no DRI3 or no Present: Galaxy's Xwayland runs with
-//!     -glamor off): one image, read back to the CPU at a swap and sent
-//!     as ZPixmap PutImage requests in strips that fit the server's
-//!     request length, only the damaged rectangles (EGL_KHR_swap_buffers_
-//!     with_damage), then a round trip (errors seen, the app paced by
-//!     the server). The image is kept, so its age is 1.
+//!     refuses the first dma-buf turns the window to the next way.
+//!   - *MIT-SHM* (no DRI3, MIT-SHM 1.2: Galaxy's Xwayland, which runs
+//!     with -glamor off): one image, read back to the CPU at a swap, its
+//!     damaged rectangles (EGL_KHR_swap_buffers_with_damage) copied into
+//!     a shared memory file (a memfd the server maps: ShmAttachFd) and
+//!     shown with ShmPutImage, then a round trip (the server has read the
+//!     memory before the next frame writes it; errors seen; the app paced
+//!     by the server). The image is kept, so its age is 1. A server that
+//!     refuses the memory turns the window to the last way.
+//!   - *PutImage* (none of those): the same, the rows sent over the
+//!     socket as ZPixmap PutImage requests in strips that fit the
+//!     server's request length.
 //! - **Sizes.** GetGeometry when a back buffer is taken (after every
 //!   swap, at the first drawing of the next frame), so a window the app
 //!   resized is drawn at its new size; a pixmap of an old size goes once
@@ -68,7 +73,14 @@ pub const Wire = struct {
     close: *const fn (?*anyopaque, fd: i32) void,
     /// The process's $DISPLAY, or null.
     display_env: *const fn (?*anyopaque) ?[]const u8,
+    /// A shared memory file of `size` bytes (a memfd), mapped read-write,
+    /// for MIT-SHM; null: none (then no MIT-SHM).
+    shm_create: ?*const fn (?*anyopaque, size: usize) ?Shm = null,
+    shm_destroy: ?*const fn (?*anyopaque, Shm) void = null,
 };
+
+/// Shared memory: its fd (the caller's) and its bytes, mapped.
+pub const Shm = struct { fd: i32, mem: []u8 };
 
 // ── Xlib's Display (read, never written) ───────────────────────────────────
 
@@ -218,6 +230,11 @@ pub const OP_QUERY_EXTENSION = 98;
 // DRI3's
 pub const DRI3_QUERY_VERSION = 0;
 pub const DRI3_PIXMAP_FROM_BUFFER = 2;
+// MIT-SHM's
+pub const SHM_QUERY_VERSION = 0;
+pub const SHM_DETACH = 2;
+pub const SHM_PUT_IMAGE = 3;
+pub const SHM_ATTACH_FD = 6;
 // Present's
 pub const PRESENT_QUERY_VERSION = 0;
 pub const PRESENT_PIXMAP = 1;
@@ -332,6 +349,8 @@ pub const XError = struct { code: u8, seq: u32, value: u32, major: u8, minor: u1
 // ── The connection ─────────────────────────────────────────────────────────
 
 pub const MAX_WINDOWS = 16;
+/// Damage rectangles a swap sends apart (more: the whole window).
+pub const MAX_RECTS = 64;
 pub const MAX_BUFFERS = 4;
 const OUT_BYTES = 4096;
 const EXTRA_BYTES = 256;
@@ -357,6 +376,8 @@ pub const Conn = struct {
     out_len: usize = 0,
     dri3: ?Ext = null,
     present: ?Ext = null,
+    /// MIT-SHM 1.2 (ShmAttachFd), where the Wire has shared memory
+    shm: ?Ext = null,
     /// errors for requests no reply waited for (the last MAX_ERRORS)
     errors: [MAX_ERRORS]XError = undefined,
     n_errors: usize = 0,
@@ -404,11 +425,17 @@ pub const Conn = struct {
         if (c.present) |e| {
             if (!c.queryVersion(e, PRESENT_QUERY_VERSION, 1, 0)) c.present = null;
         }
+        if (wire.shm_create != null and wire.shm_destroy != null) {
+            c.shm = c.queryExtension("MIT-SHM");
+            if (c.shm) |e| {
+                if (!c.shmVersion(e)) c.shm = null;
+            }
+        }
         if (c.broken) {
             c.close();
             return false;
         }
-        report.say(.device, "X11: {s} {d}x{d}, depth {d}; DRI3 {s}, Present {s}", .{ name, c.setup.width, c.setup.height, c.setup.root_depth, if (c.dri3 != null) "yes" else "no", if (c.present != null) "yes" else "no" });
+        report.say(.device, "X11: {s} {d}x{d}, depth {d}; DRI3 {s}, Present {s}, MIT-SHM {s}", .{ name, c.setup.width, c.setup.height, c.setup.root_depth, if (c.dri3 != null) "yes" else "no", if (c.present != null) "yes" else "no", if (c.shm != null) "yes" else "no" });
         return true;
     }
 
@@ -661,6 +688,58 @@ pub const Conn = struct {
         return get32(rep[8..]) >= major;
     }
 
+    /// MIT-SHM's QueryVersion: 1.2 or later (ShmAttachFd).
+    fn shmVersion(c: *Conn, e: Ext) bool {
+        const r = c.begin(e.opcode, SHM_QUERY_VERSION, 1) orelse return false;
+        const rep = c.wait(r.seq) orelse return false;
+        const major = get16(rep[8..]);
+        const minor = get16(rep[10..]);
+        return major > 1 or (major == 1 and minor >= 2);
+    }
+
+    /// ShmAttachFd: segment `seg` over the shared memory file `fd` (sent
+    /// with it), read only for the server.
+    fn shmAttachFd(c: *Conn, seg: u32, fd: i32) ?u32 {
+        const e = c.shm orelse return null;
+        var req = [_]u8{0} ** 12;
+        req[0] = e.opcode;
+        req[1] = SHM_ATTACH_FD;
+        put16(req[2..], 3);
+        put32(req[4..], seg);
+        req[8] = 1; // read only
+        return c.sendWithFds(&req, &.{fd});
+    }
+
+    fn shmDetach(c: *Conn, seg: u32) void {
+        const e = c.shm orelse return;
+        const r = c.begin(e.opcode, SHM_DETACH, 2) orelse return;
+        put32(r.b[4..], seg);
+    }
+
+    /// ShmPutImage (ZPixmap) of the rectangle (x, y, w, h) of an image of
+    /// total_w x total_h at `offset` in segment `seg`, to the same place
+    /// of `drawable`.
+    fn shmPutImage(c: *Conn, drawable: u32, gc: u32, total_w: u32, total_h: u32, x: u32, y: u32, w: u32, h: u32, depth: u8, seg: u32, offset: u32) ?u32 {
+        const e = c.shm orelse return null;
+        const r = c.begin(e.opcode, SHM_PUT_IMAGE, 10) orelse return null;
+        put32(r.b[4..], drawable);
+        put32(r.b[8..], gc);
+        put16(r.b[12..], @intCast(total_w));
+        put16(r.b[14..], @intCast(total_h));
+        put16(r.b[16..], @intCast(x));
+        put16(r.b[18..], @intCast(y));
+        put16(r.b[20..], @intCast(w));
+        put16(r.b[22..], @intCast(h));
+        put16(r.b[24..], @intCast(x));
+        put16(r.b[26..], @intCast(y));
+        r.b[28] = depth;
+        r.b[29] = Z_PIXMAP;
+        r.b[30] = 0; // no completion event: the round trip after says it
+        put32(r.b[32..], seg);
+        put32(r.b[36..], offset);
+        return r.seq;
+    }
+
     pub const Geometry = struct { depth: u8, width: u32, height: u32 };
 
     /// GetGeometry of a drawable, or null (an error: it is gone).
@@ -754,7 +833,7 @@ pub const Conn = struct {
 
 // ── Windows ────────────────────────────────────────────────────────────────
 
-pub const Mode = enum { present, put_image };
+pub const Mode = enum { present, shm, put_image };
 
 pub const Buffer = struct {
     img: Image = .{},
@@ -787,8 +866,11 @@ pub const Window = struct {
     eid: u32 = 0,
     serial: u32 = 0,
     completing: bool = false,
-    /// PutImage's graphics context
+    /// PutImage's and MIT-SHM's graphics context
     gc: u32 = 0,
+    /// MIT-SHM's segment (0: none yet) and its memory
+    seg: u32 = 0,
+    shm: ?Shm = null,
     /// eglDestroySurface'd while current: shows nothing more
     gone: bool = false,
     /// the size may have changed (a swap, or Present's ConfigureNotify):
@@ -823,7 +905,7 @@ pub const Window = struct {
         const slot = for (&conn.windows) |*s| {
             if (s.* == null) break s;
         } else return false;
-        w.mode = if (conn.dri3 != null and conn.present != null) .present else .put_image;
+        w.mode = if (conn.dri3 != null and conn.present != null) .present else if (conn.shm != null) .shm else .put_image;
         if (w.mode == .present) {
             w.eid = conn.newXid() orelse return false;
             _ = conn.presentSelectInput(w.eid, xid, PRESENT_MASK_CONFIGURE | PRESENT_MASK_COMPLETE | PRESENT_MASK_IDLE) orelse return false;
@@ -848,6 +930,7 @@ pub const Window = struct {
     pub fn deinit(w: *Window) void {
         const c = w.conn;
         for (&w.bufs) |*b| w.drop(b);
+        w.dropSegment();
         if (c.live()) {
             if (w.eid != 0) _ = c.presentSelectInput(w.eid, w.xid, 0);
             if (w.gc != 0) c.freeGc(w.gc);
@@ -858,6 +941,46 @@ pub const Window = struct {
         }
         w.eid = 0;
         w.gc = 0;
+    }
+
+    /// MIT-SHM's segment detached and its memory let go.
+    fn dropSegment(w: *Window) void {
+        const c = w.conn;
+        if (w.seg != 0 and c.live()) c.shmDetach(w.seg);
+        w.seg = 0;
+        if (w.shm) |m| c.wire.shm_destroy.?(c.wire.ctx, m);
+        w.shm = null;
+    }
+
+    /// A segment of at least `size` bytes, attached (a new one when the
+    /// window grew). False when there is no memory or the server refused
+    /// it (the window is then turned to PutImage).
+    fn segment(w: *Window, size: usize) bool {
+        const c = w.conn;
+        if (w.shm) |m| {
+            if (m.mem.len >= size) return true;
+        }
+        w.dropSegment();
+        const m = c.wire.shm_create.?(c.wire.ctx, size) orelse {
+            report.say(.egl_error, "X11: no shared memory of {d} bytes for MIT-SHM: PutImage instead", .{size});
+            w.mode = .put_image;
+            return false;
+        };
+        w.shm = m;
+        w.seg = c.newXid() orelse {
+            w.dropSegment();
+            return false;
+        };
+        const seq = c.shmAttachFd(w.seg, m.fd) orelse return false;
+        if (!c.sync()) return false;
+        if (c.errorOf(seq)) |e| {
+            report.say(.egl_error, "X11: the server refused shared memory (error {d}): PutImage instead", .{e.code});
+            w.seg = 0;
+            w.dropSegment();
+            w.mode = .put_image;
+            return false;
+        }
+        return true;
     }
 
     fn drop(w: *Window, b: *Buffer) void {
@@ -903,8 +1026,9 @@ pub const Window = struct {
                 for (&w.bufs, 0..) |*b, i| {
                     if (b.img.live() or b.busy) continue;
                     if (!w.make(b)) {
-                        // (the server refused the dma-buf: PutImage from now)
-                        if (w.mode == .put_image and w.gc == 0) {
+                        // (the server refused the dma-buf: MIT-SHM or
+                        // PutImage from now)
+                        if (w.mode != .present and w.gc == 0) {
                             if (!w.makeGc()) return null;
                             continue :choose;
                         }
@@ -935,7 +1059,7 @@ pub const Window = struct {
         img.top_down = true;
         img.no_alpha = !w.alpha;
         b.img = img;
-        if (w.mode == .put_image) {
+        if (w.mode != .present) {
             w.stats.made += 1;
             return true;
         }
@@ -973,9 +1097,10 @@ pub const Window = struct {
     }
 
     /// Present's way given up for good (the server takes no dma-buf of
-    /// ours): idle pixmaps go, busy ones once idle.
+    /// ours): MIT-SHM's from now, else PutImage's; idle pixmaps go, busy
+    /// ones once idle.
     fn toPutImage(w: *Window) void {
-        w.mode = .put_image;
+        w.mode = if (w.conn.shm != null) .shm else .put_image;
         for (&w.bufs) |*b| {
             if (!b.img.live()) continue;
             if (b.busy) b.stale = true else w.drop(b);
@@ -1004,6 +1129,7 @@ pub const Window = struct {
         _ = w.backImage() orelse return false;
         const ok = switch (w.mode) {
             .present => w.swapPresent(),
+            .shm => w.swapShm(damage) or (w.mode == .put_image and w.swapPutImage(damage)),
             .put_image => w.swapPutImage(damage),
         };
         if (!ok) return false;
@@ -1035,6 +1161,61 @@ pub const Window = struct {
         return true;
     }
 
+    /// The damaged rectangles (top-down rows, clamped to the image) of
+    /// EGL's (from the bottom left; none: everything), into `out`.
+    fn rectsOf(img: *const Image, damage: []const [4]i32, out: *[MAX_RECTS][4]u32) []const [4]u32 {
+        if (damage.len == 0 or damage.len > MAX_RECTS) {
+            out[0] = .{ 0, 0, img.width, img.height };
+            return out[0..1];
+        }
+        var n: usize = 0;
+        for (damage) |r| {
+            const x0: i64 = std.math.clamp(@as(i64, r[0]), 0, img.width);
+            const x1: i64 = std.math.clamp(@as(i64, r[0]) + r[2], 0, img.width);
+            const y1: i64 = std.math.clamp(@as(i64, img.height) - r[1], 0, img.height);
+            const y0: i64 = std.math.clamp(@as(i64, img.height) - r[1] - r[3], 0, img.height);
+            if (x1 <= x0 or y1 <= y0) continue;
+            out[n] = .{ @intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0) };
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    fn swapShm(w: *Window, damage: []const [4]i32) bool {
+        const c = w.conn;
+        const b = &w.bufs[w.back.?];
+        const img = &b.img;
+        const size = @as(usize, img.stride) * img.height;
+        if (!w.segment(size)) return false;
+        const mem = w.shm.?.mem;
+        w.eng.flush();
+        const all = w.eng.hostView(img, 0, size);
+        const first = c.sent +% 1;
+        var rb: [MAX_RECTS][4]u32 = undefined;
+        for (rectsOf(img, damage, &rb)) |r| {
+            // (the rows into the shared memory, where the image has them)
+            for (0..r[3]) |j| {
+                const at = (@as(usize, r[1]) + j) * img.stride + @as(usize, r[0]) * 4;
+                const dst = mem[at..][0 .. @as(usize, r[2]) * 4];
+                @memcpy(dst, all[at..][0..dst.len]);
+                if (!w.alpha and w.depth == 32) opaqueRow(dst);
+            }
+            _ = c.shmPutImage(w.xid, w.gc, img.width, img.height, r[0], r[1], r[2], r[3], w.depth, w.seg, 0) orelse return false;
+            w.stats.put_requests += 1;
+            w.stats.put_bytes += @as(u64, r[2]) * r[3] * 4;
+        }
+        // (the server has read the memory before the next frame writes it;
+        // its errors seen; the app paced by the server)
+        if (!c.sync()) return false;
+        if (c.errorIn(first, c.sent)) |e| {
+            report.say(.egl_error, "X11: window 0x{x}: error {d} for its image (request {d}.{d}): it is gone", .{ w.xid, e.code, e.major, e.minor });
+            return false;
+        }
+        w.frames += 1;
+        b.shown = w.frames;
+        return true;
+    }
+
     fn swapPutImage(w: *Window, damage: []const [4]i32) bool {
         const c = w.conn;
         const b = &w.bufs[w.back.?];
@@ -1042,16 +1223,9 @@ pub const Window = struct {
         w.eng.flush();
         const all = w.eng.hostView(img, 0, @as(usize, img.stride) * img.height);
         const first = c.sent +% 1;
-        if (damage.len == 0) {
-            if (!w.putRect(all, img.stride, 0, 0, img.width, img.height)) return false;
-        } else for (damage) |r| {
-            // (EGL's rectangles are from the bottom left; the rows from the top)
-            const x0: i64 = std.math.clamp(@as(i64, r[0]), 0, img.width);
-            const x1: i64 = std.math.clamp(@as(i64, r[0]) + r[2], 0, img.width);
-            const y1: i64 = std.math.clamp(@as(i64, img.height) - r[1], 0, img.height);
-            const y0: i64 = std.math.clamp(@as(i64, img.height) - r[1] - r[3], 0, img.height);
-            if (x1 <= x0 or y1 <= y0) continue;
-            if (!w.putRect(all, img.stride, @intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0))) return false;
+        var rb: [MAX_RECTS][4]u32 = undefined;
+        for (rectsOf(img, damage, &rb)) |r| {
+            if (!w.putRect(all, img.stride, r[0], r[1], r[2], r[3])) return false;
         }
         // (every strip taken, its errors seen: and the app waits for the
         // server, as a frame clock would make it)
@@ -1091,17 +1265,19 @@ pub const Window = struct {
                 const src = all[(@as(usize, y + row) + j) * stride + @as(usize, x) * 4 ..][0..row_bytes];
                 const dst = out[j * row_bytes ..][0..row_bytes];
                 @memcpy(dst, src);
-                // (no alpha: what a depth-32 window reads as alpha is opaque)
-                if (!w.alpha and w.depth == 32) {
-                    var k: usize = 3;
-                    while (k < dst.len) : (k += 4) dst[k] = 0xff;
-                }
+                if (!w.alpha and w.depth == 32) opaqueRow(dst);
             }
             _ = c.putImage(w.xid, w.gc, w.depth, x, y + row, rw, n, out) orelse return false;
             w.stats.put_requests += 1;
             w.stats.put_bytes += out.len;
         }
         return true;
+    }
+
+    /// No alpha: what a depth-32 window reads as alpha is opaque.
+    fn opaqueRow(row: []u8) void {
+        var k: usize = 3;
+        while (k < row.len) : (k += 4) row[k] = 0xff;
     }
 
     /// A Present event of this window's.

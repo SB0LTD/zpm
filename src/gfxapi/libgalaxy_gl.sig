@@ -15,8 +15,8 @@
 //! first eglInitialize; without a GPU EGL has no display and the app
 //! draws in software. EGL's X11 platform speaks over Linux's Unix sockets
 //! (x11.Wire: connect, sendmsg with SCM_RIGHTS and MSG_NOSIGNAL, read,
-//! poll), its server named by the Display or $DISPLAY (the C library's
-//! getenv, else /proc/self/environ).
+//! poll; memfds for MIT-SHM), its server named by the Display or $DISPLAY
+//! (the C library's getenv, else /proc/self/environ).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -349,7 +349,31 @@ test "libgalaxy-gl: DISPLAY from an environment block" {
     try std.testing.expect(displayOf("DISPLAY=/a/very/long/path/to/a/socket:0", &out) == null);
 }
 
-const x11_wire = x11.Wire{ .connect = xConnect, .send = xSend, .recv = xRecv, .poll = xPoll, .close = closeFd, .display_env = xDisplayEnv };
+/// MIT-SHM's memory: a memfd of `size` bytes, mapped shared, read-write.
+fn xShmCreate(ctx: ?*anyopaque, size: usize) ?x11.Shm {
+    _ = ctx;
+    if (size == 0) return null;
+    const fd = sysResult(linux.memfd_create("galaxy-egl-x11", 1)); // MFD_CLOEXEC
+    if (fd < 0) return null;
+    if (sysResult(linux.ftruncate(@intCast(fd), @intCast(size))) < 0) {
+        _ = linux.close(@intCast(fd));
+        return null;
+    }
+    const r = sysResult(linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, @intCast(fd), 0));
+    if (r < 0) {
+        _ = linux.close(@intCast(fd));
+        return null;
+    }
+    return .{ .fd = @intCast(fd), .mem = @as([*]u8, @ptrFromInt(@as(usize, @intCast(r))))[0..size] };
+}
+
+fn xShmDestroy(ctx: ?*anyopaque, m: x11.Shm) void {
+    _ = ctx;
+    _ = linux.munmap(m.mem.ptr, m.mem.len);
+    _ = linux.close(m.fd);
+}
+
+const x11_wire = x11.Wire{ .connect = xConnect, .send = xSend, .recv = xRecv, .poll = xPoll, .close = closeFd, .display_env = xDisplayEnv, .shm_create = xShmCreate, .shm_destroy = xShmDestroy };
 
 fn x11Wire() ?*const x11.Wire {
     return &x11_wire;
