@@ -1055,24 +1055,6 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("json_pull", "src/core/json_pull.sig"),
     });
-    _ = try ctx.addCompileStep(.{
-        .source_path = "tools/d1_run.sig",
-        .output_name = "d1-run",
-        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
-        .optimize = ctx.optimize,
-        .target = null,
-        .compiler_path = "",
-        .imports = &.{
-            importEntry("gguf", "src/core/gguf.sig"),
-            importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
-            importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
-            importEntry("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig"),
-            importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
-            importEntry("worker_thread", "src/platform/worker_thread.sig"),
-            importEntry("sig_process", process_source),
-            importEntry("d1_system_one", "src/core/d1_system_one.sig"),
-        },
-    });
 
     // ── LFM3-Audio: hearing (mel, encoder) and speaking (MaskGIT codes, codec) ──
     _ = try ctx.addModule("lfm3_audio_mel", "src/core/lfm3_audio_mel.sig");
@@ -1215,6 +1197,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try addTest(ctx, test_gfxapi, "test-gfxapi-draw", "tests/test_gfxapi_draw.sig", &.{
         importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("va_tiling", "src/va/tiling.sig"),
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
@@ -1268,8 +1251,17 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // The VA driver's GPU conversion for CPU readers (a KIR kernel over
+    // gfxapi's blocklinear address math), on EmuDevice and the emulated RTX.
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-va-convert", "src/va/gpu_convert.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     _ = try addTest(ctx, test_gfxapi, "test-gfxapi-egl", "tests/test_gfxapi_egl.sig", &.{
         importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("va_tiling", "src/va/tiling.sig"),
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
@@ -1280,6 +1272,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // ── va: Galaxy's VA-API driver for the RTX's video decoder (NVDEC,
+    //    H.264), on the host against a fake render node and decoder. Its
+    //    files import each other by path: no modules to register. ──
+    const test_va = try ctx.addStep("test-va", "Execute Galaxy's VA-API driver (NVDEC H.264) against a fake render node and decoder", &noopStep);
+    try ctx.addDependency(test_all, test_va);
+    _ = try addTest(ctx, test_va, "test-va-module", "src/va/va.sig", &.{});
+    _ = try addTest(ctx, test_va, "test-va-lib", "src/va/libgalaxy_va.sig", &.{});
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
@@ -1435,6 +1434,29 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("lfm3_audio_ops", "src/core/lfm3_audio_ops.sig"),
         importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
         importEntry("lfm3_any_audio", "src/core/lfm3_any_audio.sig"),
+    });
+    // d1's host runner (its `emu` mode runs d1's passes through lfm3_any on
+    // the emulated GPU: after the modules it names).
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/d1_run.sig",
+        .output_name = "d1-run",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+            importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+            importEntry("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig"),
+            importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+            importEntry("worker_thread", "src/platform/worker_thread.sig"),
+            importEntry("sig_process", process_source),
+            importEntry("d1_system_one", "src/core/d1_system_one.sig"),
+            importEntry("gpu", "src/gpu/gpu.sig"),
+            importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+            importEntry("page_region", "src/platform/page_region.sig"),
+        },
     });
     // LFM3-Audio's hearing encoder on any GPU (lfm3_any_hear, its kernels in
     // lfm3_kir_hear) against lfm3_audio_encoder; the new kernels on the

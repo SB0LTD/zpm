@@ -37,6 +37,8 @@ const wl = gfxapi.wayland;
 const gl = gfxapi.glenum;
 const thread = gfxapi.thread;
 const program = gfxapi.program;
+/// (zpm src/va's: the layout the VA driver's pictures are in)
+const tiling = @import("va_tiling");
 
 // ── The fake compositor ────────────────────────────────────────────────────
 
@@ -1233,17 +1235,21 @@ test "egl: a video picture's planes as EGLImages (NV12: R8 and GR88; P010: R16 a
     c.deleteFramebuffers(&fb);
     c.deleteRenderbuffers(&rb);
 
-    // the formats and their (linear) modifier
+    // the formats and their modifiers: linear, and NVIDIA's block-linear
+    // GOB_2 ones (Turing's, GB20x's 8- and 16-bit sector layouts)
     var formats: [8]i32 = undefined;
     var n: i32 = 0;
     try std.testing.expect(egl.queryDmaBufFormats(d, 8, &formats, &n));
     try std.testing.expectEqual(@as(i32, 8), n);
     var mods: [4]u64 = undefined;
     try std.testing.expect(egl.queryDmaBufModifiers(d, @bitCast(egl.DRM_FORMAT_GR1616), 4, &mods, null, &n));
-    try std.testing.expectEqual(@as(i32, 1), n);
-    try std.testing.expectEqual(@as(u64, 0), mods[0]);
-    // what a plane's import refuses: a block-linear layout, rows short of
-    // the width (a GR1616 row of 2 is 8 bytes), rows of part words
+    try std.testing.expectEqual(@as(i32, 4), n);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0x0300_0000_0060_6011, 0x0300_0000_0420_6011, 0x0300_0000_0460_6011 }, &mods);
+    try std.testing.expect(egl.queryDmaBufModifiers(d, @bitCast(egl.DRM_FORMAT_R8), 0, null, null, &n));
+    try std.testing.expectEqual(@as(i32, 4), n);
+    // what a plane's import refuses: a block-linear layout of Tegra's
+    // (16Bx2: GOB kind 0, sector layout 0), rows short of the width (a
+    // GR1616 row of 2 is 8 bytes), rows of part words
     try std.testing.expect(egl.createImage(i32, d, null, egl.LINUX_DMA_BUF_EXT, null, &[_]i32{ egl.WIDTH, 4, egl.HEIGHT, 2, egl.LINUX_DRM_FOURCC_EXT, @bitCast(egl.DRM_FORMAT_R8), egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 64, egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0x14, egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0x0300_0000, egl.NONE }) == null);
     try std.testing.expectEqual(egl.BAD_MATCH, egl.getError());
     try std.testing.expect(egl.createImage(i32, d, null, egl.LINUX_DMA_BUF_EXT, null, &[_]i32{ egl.WIDTH, 2, egl.HEIGHT, 1, egl.LINUX_DRM_FOURCC_EXT, @bitCast(egl.DRM_FORMAT_GR1616), egl.DMA_BUF_PLANE0_FD_EXT, fd, egl.DMA_BUF_PLANE0_OFFSET_EXT, 0, egl.DMA_BUF_PLANE0_PITCH_EXT, 4, egl.NONE }) == null);
@@ -1260,6 +1266,151 @@ test "egl: a video picture's planes as EGLImages (NV12: R8 and GR88; P010: R16 a
     for (planes) |img| try std.testing.expect(egl.destroyImage(d, img));
     c.finish();
     try std.testing.expectEqual(live - 4, liveRegions());
+    eng.freeImage(&surf);
+    try std.testing.expect(egl.makeCurrent(d, null, null, null));
+    try std.testing.expect(egl.destroySurface(d, pb));
+    try std.testing.expect(egl.destroyContext(d, ctx));
+    try std.testing.expect(egl.terminate(d));
+}
+
+/// One plane of a VA surface as Galaxy's VA driver exports it: block
+/// linear, its modifier, `pitch` bytes across.
+fn blockPlaneImage(d: *egl.Display, fourcc: u32, fd: i32, w: i32, h: i32, offset: i32, pitch: i32, modifier: u64) ?*egl.EImage {
+    return egl.createImage(i32, d, null, egl.LINUX_DMA_BUF_EXT, null, &[_]i32{
+        egl.WIDTH,                          w,                                         egl.HEIGHT,                         h,
+        egl.LINUX_DRM_FOURCC_EXT,           @bitCast(fourcc),                          egl.DMA_BUF_PLANE0_FD_EXT,          fd,
+        egl.DMA_BUF_PLANE0_OFFSET_EXT,      offset,                                    egl.DMA_BUF_PLANE0_PITCH_EXT,       pitch,
+        egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT, @bitCast(@as(u32, @truncate(modifier))), egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT, @bitCast(@as(u32, @truncate(modifier >> 32))),
+        egl.NONE,
+    });
+}
+
+var bl_bytes: [224 * 64]u8 = undefined;
+var bl_got: [37 * 21 * 4]u8 = undefined;
+
+test "egl: a VA surface's block-linear planes (NV12, P010) imported with NVIDIA's modifiers, sampled texel by texel" {
+    useDriver();
+    Fake.reset();
+    const d = egl.getDisplay(null).?;
+    try std.testing.expect(egl.initialize(d, null, null));
+    const ctx = egl.createContext(d, config(true), null, &[_]i32{ egl.CONTEXT_MAJOR_VERSION, 3, egl.NONE }).?;
+    const pb = egl.createPbufferSurface(d, config(true), &[_]i32{ egl.WIDTH, 8, egl.HEIGHT, 4, egl.NONE }).?;
+    try std.testing.expect(egl.makeCurrent(d, pb, pb, ctx));
+    const c = thread.gl().?;
+    const p = try planeProgram(c);
+
+    // A 37 x 21 picture, NV12 then P010, laid out as the VA driver's
+    // surfaces are (va's tiling.Nv12: Y, then UV at a 4 KiB boundary) and
+    // tiled by va's tiling.sig in GB20x's layouts (Y 8 bpp, UV 16; P010:
+    // Y 16, UV 32 = Turing's), in one buffer: NV12 at 0, P010 at 8 KiB.
+    const w = 37;
+    const h = 21;
+    const cw = 19;
+    const ch = 11;
+    @memset(&bl_bytes, 0);
+    const nv = tiling.Nv12.of(w, h);
+    const p10 = tiling.Nv12.p010(w, h);
+    const p10_at: usize = 8192;
+    var y8: [w * h]u8 = undefined;
+    var uv8: [cw * 2 * ch]u8 = undefined;
+    var y16b: [w * 2 * h]u8 = undefined;
+    var uv16b: [cw * 4 * ch]u8 = undefined;
+    for (&y8, 0..) |*b, i| b.* = @truncate(i * 7 + (i >> 3) * 13);
+    for (&uv8, 0..) |*b, i| b.* = @truncate((i *% 11) ^ 0xff);
+    for (0..w * h) |i| std.mem.writeInt(u16, y16b[i * 2 ..][0..2], @truncate(i * 0x9e3 + 0x10f), .little);
+    for (0..cw * 2 * ch) |i| std.mem.writeInt(u16, uv16b[i * 2 ..][0..2], @truncate((i *% 0x7b1) ^ 0xffff), .little);
+    const sw8 = nv.swizzles(.blackwell);
+    const sw10 = p10.swizzles(.blackwell);
+    tiling.tile(bl_bytes[0..], nv.luma, sw8[0], &y8, w, w, h);
+    tiling.tile(bl_bytes[@intCast(nv.chroma_offset)..], nv.chroma, sw8[1], &uv8, cw * 2, cw * 2, ch);
+    tiling.tile(bl_bytes[p10_at..], p10.luma, sw10[0], &y16b, w * 2, w * 2, h);
+    tiling.tile(bl_bytes[p10_at + @as(usize, @intCast(p10.chroma_offset)) ..], p10.chroma, sw10[1], &uv16b, cw * 4, cw * 4, ch);
+    try std.testing.expect(p10_at + p10.bytes <= bl_bytes.len);
+    var surf = eng.newWindowImage(16, 224, .bgra8).?;
+    eng.write(&surf, 0, 0, 16, 224, &bl_bytes, 64, .bgra8);
+    const fd: i32 = @intCast(exportFd(null, surf.buf));
+
+    const planes = [_]*egl.EImage{
+        blockPlaneImage(d, egl.DRM_FORMAT_R8, fd, w, h, 0, @intCast(nv.luma.pitch), tiling.modifierOf(sw8[0])).?,
+        blockPlaneImage(d, egl.DRM_FORMAT_GR88, fd, cw, ch, @intCast(nv.chroma_offset), @intCast(nv.chroma.pitch), tiling.modifierOf(sw8[1])).?,
+        blockPlaneImage(d, egl.DRM_FORMAT_R16, fd, w, h, @intCast(p10_at), @intCast(p10.luma.pitch), tiling.modifierOf(sw10[0])).?,
+        blockPlaneImage(d, egl.DRM_FORMAT_GR1616, fd, cw, ch, @intCast(p10_at + p10.chroma_offset), @intCast(p10.chroma.pitch), tiling.modifierOf(sw10[1])).?,
+    };
+    // (the modifier comes back out: EGL_MESA_image_dma_buf_export)
+    var fourcc: i32 = 0;
+    var np: i32 = 0;
+    var m: u64 = 0;
+    try std.testing.expect(egl.exportDmaBufQuery(d, planes[1], &fourcc, &np, &m));
+    try std.testing.expectEqual(tiling.modifierOf(.blackwell16), m);
+    const sizes = [_][2]usize{ .{ w, h }, .{ cw, ch }, .{ w, h }, .{ cw, ch } };
+    var tex: [4]u32 = undefined;
+    c.genTextures(&tex);
+    for (planes, sizes, tex, 0..) |img, size, t, i| {
+        c.activeTexture(gl.TEXTURE0);
+        c.bindTexture(gl.TEXTURE_2D, t);
+        c.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        c.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        c.eglImageTargetTexture2D(gl.TEXTURE_2D, img);
+        try std.testing.expectEqual(gl.NO_ERROR, c.getError());
+        for ([_]i32{ 0, 1 }) |mode| {
+            const pw = size[0];
+            const ph = size[1];
+            try drawPlane(c, p, mode, @intCast(pw), @intCast(ph), bl_got[0 .. pw * ph * 4]);
+            try std.testing.expectEqual(gl.NO_ERROR, c.getError());
+            for (0..ph) |y| {
+                for (0..pw) |x| {
+                    const r16 = struct {
+                        fn at(b: []const u8, k: usize) u16 {
+                            return std.mem.readInt(u16, b[k * 2 ..][0..2], .little);
+                        }
+                    }.at;
+                    const want: [4]u8 = switch (i) {
+                        0 => .{ y8[y * w + x], 0, 0, 255 },
+                        1 => .{ uv8[y * cw * 2 + x * 2], uv8[y * cw * 2 + x * 2 + 1], 0, 255 },
+                        2 => .{ to8(r16(&y16b, y * w + x)), 0, 0, 255 },
+                        else => .{ to8(r16(&uv16b, y * cw * 2 + x * 2)), to8(r16(&uv16b, y * cw * 2 + x * 2 + 1)), 0, 255 },
+                    };
+                    const at = (y * pw + x) * 4;
+                    if (!std.mem.eql(u8, &want, bl_got[at..][0..4])) {
+                        std.debug.print("block-linear plane {d} mode {d} texel ({d}, {d}): {any}, not {any}\n", .{ i, mode, x, y, bl_got[at..][0..4], want });
+                        return error.Plane;
+                    }
+                }
+            }
+        }
+    }
+
+    // a block-linear plane is only sampled: not drawn into, not uploaded to
+    var fb: [1]u32 = undefined;
+    c.genFramebuffers(&fb);
+    c.bindFramebuffer(gl.FRAMEBUFFER, fb[0]);
+    c.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex[0], 0);
+    try std.testing.expect(c.checkFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE);
+    c.bindFramebuffer(gl.FRAMEBUFFER, 0);
+    c.deleteFramebuffers(&fb);
+    c.bindTexture(gl.TEXTURE_2D, tex[0]);
+    const one = [_]u8{0};
+    c.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, 1, gl.RED, gl.UNSIGNED_BYTE, &one);
+    try std.testing.expectEqual(gl.INVALID_OPERATION, c.getError());
+    var rb: [1]u32 = undefined;
+    c.genRenderbuffers(&rb);
+    c.bindRenderbuffer(gl.RENDERBUFFER, rb[0]);
+    c.eglImageTargetRenderbufferStorage(gl.RENDERBUFFER, planes[0]);
+    try std.testing.expectEqual(gl.INVALID_OPERATION, c.getError());
+    c.deleteRenderbuffers(&rb);
+    // what the import refuses: a pitch of part GOBs, a plane past the
+    // buffer (its whole blocks counted), a compressed modifier
+    try std.testing.expect(blockPlaneImage(d, egl.DRM_FORMAT_R8, fd, w, h, 0, 96, tiling.modifierOf(.blackwell8)) == null);
+    try std.testing.expectEqual(egl.BAD_ACCESS, egl.getError());
+    try std.testing.expect(blockPlaneImage(d, egl.DRM_FORMAT_R8, fd, w, 300, 0, 64, tiling.modifierOf(.blackwell8)) == null);
+    try std.testing.expectEqual(egl.BAD_ACCESS, egl.getError());
+    try std.testing.expect(blockPlaneImage(d, egl.DRM_FORMAT_R8, fd, w, h, 0, 64, tiling.nvidiaBlockLinear2d(1, 2, 2, 0x06, 1)) == null);
+    try std.testing.expectEqual(egl.BAD_MATCH, egl.getError());
+
+    c.finish();
+    c.deleteTextures(&tex);
+    for (planes) |img| try std.testing.expect(egl.destroyImage(d, img));
+    c.finish();
     eng.freeImage(&surf);
     try std.testing.expect(egl.makeCurrent(d, null, null, null));
     try std.testing.expect(egl.destroySurface(d, pb));

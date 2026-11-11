@@ -40,6 +40,7 @@ const builtin = @import("builtin");
 const gpu = @import("gpu");
 const raster = @import("raster.sig");
 const texture = @import("texture.sig");
+const blocklinear = @import("blocklinear.sig");
 const report = @import("report.sig");
 const kir = gpu.kir;
 const r = kir.r;
@@ -173,10 +174,22 @@ pub const Image = struct {
     /// apart, from byte level_at[l]; level 0 is the image itself
     levels: u8 = 1,
     level_at: [MAX_LEVELS]u32 = [_]u32{0} ** MAX_LEVELS,
+    /// how its memory is laid out: pitch linear (the engine's own, and
+    /// most imports), or block linear (a video decoder's picture imported
+    /// with NVIDIA's modifier: `stride` its pitch in bytes, whole GOBs).
+    /// A block-linear image is only sampled (texture.sig reads the GOBs
+    /// in place): never drawn into, copied, read back or mipmapped.
+    layout: blocklinear.Layout = .{},
     /// samples a pixel (multisampled: 2, 4, 8): a pixel's samples side by
     /// side in its row (sample s of pixel x at x * samples + s), so a row
     /// is width * samples pixels' bytes; `width` counts pixels
     samples: u8 = 1,
+
+    /// Whether the engine may draw into, copy, read back or mipmap it: a
+    /// renderable format, laid out pitch linear.
+    pub fn drawable(img: *const Image) bool {
+        return img.format.renderable() and img.layout.linear();
+    }
 
     pub fn levelWidth(img: *const Image, l: u32) u32 {
         return @max(img.width >> @intCast(l), 1);

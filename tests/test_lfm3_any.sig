@@ -407,6 +407,87 @@ test "...on non-coherent unified memory (every hand-over checked)" {
     _ = try followTheCpu(.noncoherent, 1e-4, true);
 }
 
+// ── A pass with a visibility rule (d1's sets) ───────────────────────────────
+
+const SEEN_TOKENS = 80;
+const SEEN_LIMITS = executor.Limits{ .hidden = HIDDEN, .feed_forward = FEED, .query = HEADS * HEAD, .key_value = KV_HEADS * HEAD, .heads = HEADS, .vocabulary = VOCAB, .batch = 96, .context = 96 };
+var seen_work: executor.Workspace(SEEN_LIMITS) = .{};
+var seen_yields: u32 = 0;
+
+fn seenYield() void {
+    seen_yields += 1;
+}
+
+/// One pass of 80 tokens from position 0 (longer than one dispatch list
+/// takes: a layer at a time): a state of 30 and three questions of 20, 13
+/// and 17. On the full-attention layer the state's rows read every
+/// position, a question's the state and itself; the sliding layer and the
+/// convolutions stay causal. The final residual rows of each question's
+/// last position, of a state row and of the first question's first row,
+/// against the CPU's executor.forwardSees; the worst relative difference.
+fn seenPass(which: Device, tolerance: f64, tiled_attention: bool) !f64 {
+    try fixture.initialize();
+    const plan = &fixture.plan;
+    const src = fixture.source();
+    const gpu_src = if (which == .discrete) fixture.readOnly() else src;
+    const d = makeDevice(which);
+    var backend = Backend.init(d, plan, &fixture.index, gpu_src, .{ .max_batch = 96, .attention_tokens = 8, .tiled_attention = tiled_attention, .yield = &seenYield }, &work) catch |e| {
+        std.debug.print("init on {s}: {s}\n", .{ @tagName(which), @errorName(e) });
+        return e;
+    };
+    defer backend.deinit();
+    seen_yields = 0;
+    var gc = try backend.newCache(96);
+    defer backend.freeCache(&gc);
+    var ccache = cpuCache(96);
+    var tokens: [SEEN_TOKENS]u32 = undefined;
+    var group: [SEEN_TOKENS]u8 = undefined;
+    for (&tokens, &group, 0..) |*t, *g, i| {
+        t.* = @intCast((i * 7 + 3) % VOCAB);
+        g.* = if (i < 30) 0 else if (i < 50) 1 else if (i < 63) 2 else 3;
+    }
+    const sees = executor.Sees{ .state = 30, .group = &group };
+    _ = try executor.forwardSees(CAPACITY, SEEN_LIMITS, src, &fixture.index, plan, &unpacked, &seen_work, &ccache, &tokens, .none, &sees, .{});
+    backend.forwardSees(&gc, &tokens, &sees) catch |e| return failure(&backend, e);
+    try std.testing.expectEqual(ccache.position, gc.cpu.position);
+    // (the caller had the device between every two layers)
+    try std.testing.expectEqual(@as(u32, LAYERS - 1), seen_yields);
+    const positions = [_]u32{ 49, 62, 79, 7, 30 };
+    var rows: [positions.len * HIDDEN]f32 = undefined;
+    backend.residualRows(&gc, &positions, &rows) catch |e| return failure(&backend, e);
+    var worst: f64 = 0;
+    for (positions, 0..) |p, i| {
+        worst = @max(worst, try compare(p, seen_work.hidden[p * HIDDEN ..][0..HIDDEN], rows[i * HIDDEN ..][0..HIDDEN], tolerance));
+    }
+    // The rule is in the result: the same tokens read causally give the
+    // first question's last row another value on the CPU (so a GPU pass
+    // that ignored the rule would not have passed above).
+    var causal = cpuCache(96);
+    _ = try executor.forwardInput(CAPACITY, SEEN_LIMITS, src, &fixture.index, plan, &unpacked, &seen_work, &causal, .{ .tokens = &tokens }, .none, .{});
+    var apart: f64 = 0;
+    for (seen_work.hidden[49 * HIDDEN ..][0..HIDDEN], rows[0..HIDDEN]) |a, b| apart = @max(apart, @abs(@as(f64, a) - b));
+    try std.testing.expect(apart > 1e-3);
+    // What the pass refuses: a start past position 0, a group in two runs.
+    try std.testing.expectError(error.ContextCapacity, backend.forwardSees(&gc, &tokens, &sees));
+    var gc2 = try backend.newCache(96);
+    defer backend.freeCache(&gc2);
+    group[70] = 1;
+    try std.testing.expectError(error.Unsupported, backend.forwardSees(&gc2, &tokens, &sees));
+    try std.testing.expectEqual(@as(usize, 0), gc2.cpu.position);
+    // ...and a call of more tokens than one list takes is not forward's.
+    try std.testing.expectError(error.BatchCapacity, backend.forward(&gc2, .{ .tokens = &tokens }, .none));
+    std.debug.print("{s}: a seen pass of {d} tokens (a state of 30, questions of 20, 13 and 17): residual rows within {e} of the CPU's; {d} dispatches; causal differs by {e}\n", .{ @tagName(which), SEEN_TOKENS, worst, backend.dispatches, apart });
+    return worst;
+}
+
+test "a pass with a visibility rule (d1's sets) follows the CPU's forwardSees: ideal, unfused, discrete, wide" {
+    _ = try seenPass(.ideal, 1e-4, true);
+    _ = try seenPass(.ideal, 1e-4, false);
+    _ = try seenPass(.unfused, 1e-4, true);
+    _ = try seenPass(.discrete, 1e-4, true);
+    _ = try seenPass(.wide, 1e-4, true);
+}
+
 test "every matrix layout for one-token passes, asked for: the CPU's logits through the model" {
     // (lanes a thread, blocks an iteration, slots side by side: a shape
     // with fewer blocks than their product keeps one block and one slot)

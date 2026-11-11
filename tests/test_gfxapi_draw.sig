@@ -29,6 +29,8 @@ const raster = gfxapi.raster;
 const g = gfxapi.glenum;
 const node = gfxapi.node;
 const program = gfxapi.program;
+/// (zpm src/va's: the layout the VA driver's pictures are in)
+const tiling = @import("va_tiling");
 
 const r = kir.r;
 
@@ -742,6 +744,118 @@ fn planeSample(eng: *engine.Engine) !void {
     ctx.bindFramebuffer(g.FRAMEBUFFER, 0);
 }
 
+/// A video decoder's planes as the VA driver exports them (block linear,
+/// NVIDIA's GOBs, each swizzle: GB20x's 8- and 16-bit, Turing's), as
+/// EGLImages give them, sampled by texelFetch at every texel: each against
+/// va's tiling.sig (the layout's CPU reference) — the texel's bytes where
+/// tiling.tile put them.
+fn blockPlaneSample(eng: *engine.Engine) !void {
+    objs.init();
+    ctx.init(eng, &objs);
+    defer ctx.deinit();
+    const saved = gles.egl_image;
+    gles.egl_image = Plane.resolve;
+    defer gles.egl_image = saved;
+    const pw = 37;
+    const ph = 21;
+    const Case = struct { format: engine.Format, swizzle: tiling.Swizzle };
+    const cases = [_]Case{
+        .{ .format = .rg16, .swizzle = .turing2d }, // P010's UV
+        .{ .format = .r8, .swizzle = .blackwell8 }, // NV12's Y
+        .{ .format = .rg8, .swizzle = .blackwell16 }, // NV12's UV
+        .{ .format = .r16, .swizzle = .blackwell16 }, // P010's Y
+        .{ .format = .r8, .swizzle = .turing2d }, // GALAXY_VA_GOB=turing
+        .{ .format = .rg8, .swizzle = .blackwell8 },
+    };
+    var names: [1]u32 = undefined;
+    ctx.genTextures(&names);
+    defer ctx.deleteTextures(&names);
+    var target: [1]u32 = undefined;
+    ctx.genTextures(&target);
+    defer ctx.deleteTextures(&target);
+    ctx.bindTexture(g.TEXTURE_2D, target[0]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, pw, ph);
+    var fb: [1]u32 = undefined;
+    ctx.genFramebuffers(&fb);
+    defer ctx.deleteFramebuffers(&fb);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, target[0], 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, ctx.checkFramebufferStatus(g.FRAMEBUFFER));
+    const vs = try compileLayerShader(g.VERTEX_SHADER, "#version 300 es\nlayout(location=0) in vec4 pos; void main() { gl_Position=pos; }");
+    defer program.deleteShader(&ctx, vs);
+    const fs = try compileLayerShader(g.FRAGMENT_SHADER, "#version 300 es\nprecision highp float; uniform highp sampler2D tex; out vec4 color; void main() { color = texelFetch(tex, ivec2(gl_FragCoord.xy), 0); }");
+    defer program.deleteShader(&ctx, fs);
+    const prog = program.createProgram(&ctx);
+    defer program.deleteProgram(&ctx, prog);
+    program.attachShader(&ctx, prog, vs);
+    program.attachShader(&ctx, prog, fs);
+    program.linkProgram(&ctx, prog);
+    program.useProgram(&ctx, prog);
+    defer program.useProgram(&ctx, 0);
+    var vbuf: [1]u32 = undefined;
+    ctx.genBuffers(&vbuf);
+    for (cases) |cs| {
+        const bpp = cs.format.bytes();
+        const plane = tiling.Plane.of(pw * bpp, ph);
+        // the plane's memory: an image of whole GOB rows, filled with
+        // tiling.tile's bytes, then named as the block-linear picture
+        var img = eng.newImage(plane.pitch / bpp, plane.rows, cs.format) orelse return error.OutOfMemory;
+        var sh: engine.Shared = .{};
+        try std.testing.expect(eng.shareOwn(&img, &sh));
+        try std.testing.expectEqual(plane.pitch, img.stride);
+        var linear: [pw * 4 * ph]u8 = undefined;
+        for (&linear, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 11);
+        var tiled: [8192]u8 = undefined;
+        @memset(&tiled, 0);
+        tiling.tile(&tiled, plane, cs.swizzle, &linear, pw * bpp, pw * bpp, ph);
+        eng.write(&img, 0, 0, plane.pitch / bpp, plane.rows, tiled[0..plane.bytes()], plane.pitch, cs.format);
+        const whole_w = img.width;
+        const whole_h = img.height;
+        img.width = pw;
+        img.height = ph;
+        img.layout = .{ .block = true, .swizzle = @enumFromInt(@intFromEnum(cs.swizzle)), .gobs_log2 = tiling.BLOCK_GOBS_LOG2 };
+        ctx.bindTexture(g.TEXTURE_2D, names[0]);
+        ctx.eglImageTargetTexture2D(g.TEXTURE_2D, &img);
+        ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST);
+        ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST);
+        try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+        ctx.viewportSet(0, 0, pw, ph);
+        const vertices = quad(0, 0, W, H, 0, .{ 0, 0, 0, 0 });
+        drawVerts(&ctx, vbuf[0], &vertices, g.TRIANGLES);
+        var got: [pw * ph * 4]u8 = undefined;
+        ctx.readPixels(0, 0, pw, ph, g.RGBA, g.UNSIGNED_BYTE, &got);
+        const err = ctx.getError();
+        if (err != g.NO_ERROR) std.debug.print("block-linear {s} {s}: GL {x}, pipeline {?s}, GPU {?s}\n", .{ @tagName(cs.format), @tagName(cs.swizzle), err, if (ctx.eng.why_pipe) |why| @errorName(why) else null, if (ctx.eng.why) |why| @errorName(why) else null });
+        try std.testing.expectEqual(g.NO_ERROR, err);
+        for (0..ph) |y| {
+            for (0..pw) |x| {
+                const row = linear[y * pw * bpp ..];
+                const want: [4]u8 = switch (cs.format) {
+                    .r8 => .{ row[x], 0, 0, 255 },
+                    .rg8 => .{ row[x * 2], row[x * 2 + 1], 0, 255 },
+                    .r16 => .{ Plane.to8(std.mem.readInt(u16, row[x * 2 ..][0..2], .little)), 0, 0, 255 },
+                    else => .{ Plane.to8(std.mem.readInt(u16, row[x * 4 ..][0..2], .little)), Plane.to8(std.mem.readInt(u16, row[x * 4 + 2 ..][0..2], .little)), 0, 255 },
+                };
+                const have = got[(y * pw + x) * 4 ..][0..4];
+                if (!std.mem.eql(u8, &want, have)) {
+                    std.debug.print("block-linear {s} {s} texel ({d}, {d}): {any}, not {any}\n", .{ @tagName(cs.format), @tagName(cs.swizzle), x, y, have, want });
+                    return error.BlockLinear;
+                }
+            }
+        }
+        // (unbound, and the GPU done with it, before the image goes)
+        ctx.finish();
+        ctx.bindTexture(g.TEXTURE_2D, 0);
+        ctx.deleteTextures(&names);
+        ctx.genTextures(&names);
+        img.width = whole_w;
+        img.height = whole_h;
+        eng.freeImage(&img);
+    }
+    ctx.deleteBuffers(&vbuf);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, 0);
+}
+
 // ── Uniform blocks (std140) ────────────────────────────────────────────────
 
 const block_vs: [:0]const u8 =
@@ -1381,6 +1495,7 @@ test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CP
     try layeredCopy(&eng_rtx);
     try mutableCubeDraw(&eng_rtx);
     try planeSample(&eng_rtx);
+    try blockPlaneSample(&eng_rtx);
     try uniformBlocks(&eng_rtx);
     try feedbackAndQueries(&eng_rtx);
     eng_rtx.deinit();

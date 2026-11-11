@@ -1679,7 +1679,7 @@ pub const Context = struct {
                 const layer = if (face != null) 0 else a.layer;
                 if (!mip.img.live() or layer >= mip.layers) return .{ .img = null, .ok = false };
                 const ok = switch (want) {
-                    .color => mip.img.format.renderable() and renderableInternal(mip.internal) and !mip.srgb,
+                    .color => mip.img.drawable() and renderableInternal(mip.internal) and !mip.srgb,
                     .depth => hasDepth(mip.internal),
                     .stencil => hasStencil(mip.internal),
                 };
@@ -1691,7 +1691,7 @@ pub const Context = struct {
                 const rb = c.rbOf(a.name) orelse return .{ .img = null, .ok = false };
                 if (!rb.img.live()) return .{ .img = null, .ok = false };
                 const ok = switch (want) {
-                    .color => rb.img.format.renderable(),
+                    .color => rb.img.drawable(),
                     .depth => hasDepth(rb.internal),
                     .stencil => hasStencil(rb.internal),
                 };
@@ -2089,7 +2089,7 @@ pub const Context = struct {
         const resolve = egl_image orelse return c.fail(g.INVALID_OPERATION);
         const src = resolve(image) orelse return c.fail(g.INVALID_VALUE);
         // (a renderbuffer is drawn into: no unorm16 plane)
-        if (!src.format.renderable()) return c.fail(g.INVALID_OPERATION);
+        if (!src.drawable()) return c.fail(g.INVALID_OPERATION);
         c.eng.freeImage(&rb.img);
         rb.img = engine.alias(src);
         rb.internal = imageInternal(src.format);
@@ -2441,6 +2441,8 @@ pub const Context = struct {
         const l: u32 = @intCast(level);
         const mip = c.textureLevel(t, l) orelse return c.fail(g.INVALID_OPERATION);
         if (!mip.img.live() or @as(i64, x) + w > mip.img.levelWidth(mip.level) or @as(i64, y) + h > mip.img.levelHeight(mip.level)) return c.fail(g.INVALID_VALUE);
+        // (a block-linear EGLImage is only sampled)
+        if (!mip.img.layout.linear()) return c.fail(g.INVALID_OPERATION);
         const up = texfmt.subUpload(mip.img.format, format, ty) orelse return c.fail(if (texfmt.known(format, ty)) g.INVALID_OPERATION else g.INVALID_ENUM);
         if (w == 0 or h == 0) return;
         const src = c.unpackSource(pixels, @intCast(w), @intCast(h), up.client_bytes) orelse return;
@@ -2655,7 +2657,7 @@ pub const Context = struct {
         }
         if (!t.img.live()) return c.fail(g.INVALID_OPERATION);
         if (base >= engine.MAX_LEVELS or t.defined & (@as(u16, 1) << @intCast(base)) == 0) return c.fail(g.INVALID_OPERATION);
-        if (!t.img.format.renderable()) return c.fail(g.INVALID_OPERATION);
+        if (!t.img.drawable()) return c.fail(g.INVALID_OPERATION);
         const full = fullLevels(&t.img);
         var last: u32 = @min(full - 1, @as(u32, @intCast(@max(t.params.max_level, 0))));
         if (t.immutable) last = @min(last, t.levels - 1);
@@ -2673,7 +2675,7 @@ pub const Context = struct {
         const mutable_cube = t.target == g.TEXTURE_CUBE_MAP and !t.immutable;
         const first_face = if (mutable_cube) c.cubeFace(t, base, 0) else null;
         const first = (if (first_face) |face| levelOfExtra(face) else c.textureLevel(t, base)) orelse return c.fail(g.INVALID_OPERATION);
-        if (!first.img.live() or !first.img.format.renderable()) return c.fail(g.INVALID_OPERATION);
+        if (!first.img.live() or !first.img.drawable()) return c.fail(g.INVALID_OPERATION);
         const w = first.img.levelWidth(first.level);
         const h = first.img.levelHeight(first.level);
         const volume = t.target == g.TEXTURE_3D;
@@ -3230,7 +3232,7 @@ pub const Context = struct {
         if (level != 0 or dx < 0 or dy < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
         if (@as(i64, dx) + w > t.img.width or @as(i64, dy) + h > t.img.height) return c.fail(g.INVALID_VALUE);
         const s = c.readSource() orelse return;
-        if (!copyable(s.img.format, t.img.format) or t.srgb or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
+        if (!copyable(s.img.format, t.img.format) or t.srgb or !t.img.layout.linear() or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
         c.copyFrom(s.img, s.v, x, y, w, h, &t.img, dx, dy);
     }
 
