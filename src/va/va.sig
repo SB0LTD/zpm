@@ -1,5 +1,7 @@
 //! @zpm/va — Galaxy's VA-API driver for the RTX's hardware video decoder
-//! (NVDEC, NVCFB0 on GB206): H.264, HEVC Main, VP9 profile 0 and AV1 Main,
+//! (NVDEC, NVCFB0 on GB206): H.264, HEVC Main and Main10, VP9 profiles 0
+//! and 2, AV1 Main (8- and 10-bit, film grain), zero copy (VRAM, block
+//! linear, exported with NVIDIA's modifiers),
 //! and its encoder (NVENC, NVCFB7): H.264 and HEVC Main, in
 //! pure Sig: no C, no C library, no allocator. libgalaxy_va.sig is the shared library's root
 //! (galaxy_drv_video.so) and says what works and what waits for a boot.
@@ -7,7 +9,8 @@
 //!   vaapi.sig        libva 2.22's driver ABI and VA-API's H.264 buffers
 //!   nvdec.sig        the decoder: methods, nvdec_h264_pic_s, one frame's
 //!                    pushbuffer (after Mesa NVK's H.264 decode)
-//!   tiling.sig       block-linear pictures and their copy to linear NV12
+//!   tiling.sig       block-linear pictures, their DRM format modifiers,
+//!                    and their copy to pitch linear on the CPU
 //!   node.sig         Galaxy's render node: G_ALLOC, G_VSUBMIT, G_VWAIT,
 //!                    PRIME; a fake kernel for tests
 //!   codec.sig        what the driver gives a codec module, and asks of it
@@ -43,6 +46,9 @@
 //!                    encoder's AV1 setup
 //!   enc_import.sig   surfaces over an app's dma-bufs (DRM PRIME)
 //!   enc_test.sig     the encoder through the driver and a pretend NVENC
+//!   av1_grain.sig    AV1 film grain: the decoder's grain buffer (scaling
+//!                    tables, grain templates) from a frame's parameters
+//!   driver_10bit_test.sig  P010 surfaces through the driver
 //!   convert.sig      a picture between its block-linear planes and a
 //!                    pitch-linear copy, for CPU readers (the CPU's;
 //!                    gpu_convert.sig: the RTX's, a KIR kernel)

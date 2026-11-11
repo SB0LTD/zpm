@@ -17,10 +17,14 @@
 //!   (bitstream with start codes, slice table, end of stream, reference
 //!   slots, the watchdog), submitted with G_VSUBMIT; SyncSurface and
 //!   QuerySurfaceStatus through G_VWAIT, the decoder's status read and
-//!   counted, the block-linear target copied to linear NV12 on the CPU;
-//! - ExportSurfaceHandle (DRM PRIME 2: one dma-buf, separate R8 + GR88
-//!   layers or composed NV12, linear), DeriveImage, CreateImage,
-//!   GetImage, DestroyImage;
+//!   counted; nothing copied (decode targets live in VRAM, block linear);
+//! - 10-bit: HEVC Main10, VP9 profile 2, AV1 10-bit into P010 surfaces;
+//!   AV1's film grain applied by the decoder into current_display_picture;
+//! - ExportSurfaceHandle (DRM PRIME 2: the decode target's own dma-buf,
+//!   separate R8 + GR88 / R16 + GR1616 layers or composed NV12 / P010,
+//!   each plane with NVIDIA's block-linear modifier: zero copy), DeriveImage,
+//!   CreateImage, GetImage, PutImage, DestroyImage (the CPU's copy made on
+//!   the RTX by gpu_convert's kernel, only when one of these asks);
 //! - every table entry libva 2.22 checks is set (subpictures, display
 //!   attributes, PutSurface answer UNIMPLEMENTED or nothing);
 //! - encoding on the RTX's NVENC (encode.sig): the EncSlice entrypoint for
@@ -43,8 +47,9 @@
 //! nvdec_h264_pic_s (THE main risk: nvdec.sig), that NVDEC writes the
 //! Blackwell GOB layouts assumed (GALAXY_VA_GOB=turing for Turing's;
 //! tiling.sig), SET_OBJECT's engine field, the scratch buffers' sizes on
-//! Blackwell, interlaced (field) streams, and the speed of the CPU copy
-//! (a GPU copy is the later step). GALAXY_VA_DEBUG=1 says on stderr what
+//! Blackwell, interlaced (field) streams, the 10-bit setups (output mode
+//! 1, strides in samples) and film grain's buffer (av1_grain.sig's
+//! ASSUMED fields). GALAXY_VA_DEBUG=1 says on stderr what
 //! the driver does and each decode the decoder reports in error.
 //!
 //! Build (x86-64 Linux, from the zpm root):
