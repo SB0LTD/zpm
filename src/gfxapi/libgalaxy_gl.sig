@@ -32,18 +32,21 @@ const report = gfxapi.report;
 const Host = gfxapi.host.Host;
 const libgles = @import("libgles.sig");
 const abi = @import("abi.sig");
+const libgbm = @import("libgbm.sig");
 
 pub const panic = libgles.panic;
 
 comptime {
     // (libgles' gl* entry points are this library's too)
     _ = libgles;
+    // (and GBM's: libgbm.so.1 is this file too)
+    _ = libgbm;
     // ...and every other name of Mesa's: what abi.sig answers itself, and
     // for the rest a call that does nothing (abi.Missing)
     _ = abi;
     @setEvalBranchQuota(1_000_000);
     for (abi.names) |name| {
-        if (@hasDecl(@This(), name) or @hasDecl(libgles, name) or abi.answers(name)) continue;
+        if (@hasDecl(@This(), name) or @hasDecl(libgles, name) or @hasDecl(libgbm, name) or abi.answers(name)) continue;
         @export(&abi.Missing(name).call, .{ .name = name });
     }
 }
@@ -1190,6 +1193,300 @@ test "libgalaxy_gl: MESA export preserves the plane and returns an independent f
     try std.testing.expectEqual(@as(u32, 1), eglDestroyImageKHR(dpy, image));
     try std.testing.expectEqual(@as(i32, 11), dma_export_closed);
     try std.testing.expectEqual(@as(u32, 0), eglExportDMABUFImageMESA(dpy, image, null, null, null));
+}
+
+// ── GBM, as Xwayland's glamor uses it (xwayland-glamor-gbm.c, 24.1) ───────
+
+/// A fake PRIME in one process: an exported buffer's fd names it, and an
+/// import of that fd is the same memory (as Galaxy's render node gives).
+var prime_bufs: [16]gpu.Buffer = undefined;
+var prime_n: usize = 0;
+
+fn primeExport(_: ?*anyopaque, buf: gpu.Buffer) i64 {
+    if (prime_n == prime_bufs.len) return -24;
+    prime_bufs[prime_n] = buf;
+    prime_n += 1;
+    return @intCast(100 + prime_n - 1);
+}
+fn primeImport(_: ?*anyopaque, fd: i32) ?gpu.Buffer {
+    if (fd < 100 or fd >= 100 + @as(i32, @intCast(prime_n))) return null;
+    const pb = prime_bufs[@intCast(fd - 100)];
+    return .{ .cpu = pb.cpu, .bytes = pb.cpu.len, .kind = .external };
+}
+fn primeDup(_: ?*anyopaque, fd: i32) i32 {
+    return fd;
+}
+fn primeClose(_: ?*anyopaque, fd: i32) void {
+    _ = fd;
+}
+fn yes() bool {
+    return true;
+}
+fn no() bool {
+    return false;
+}
+
+fn gbmTestDriver() void {
+    t_eng.init(.{ .pool = &t_pool });
+    prime_n = 0;
+    gfxapi.gbm.resetForTest();
+    var host = test_host;
+    host.exportFd = primeExport;
+    host.importFd = primeImport;
+    host.dup = primeDup;
+    host.close = primeClose;
+    egl.setDriver(.{ .open = testOpen, .host = host, .wayland = noWayland, .native_interop = no, .dma_import = yes });
+}
+
+fn hasWord(list: []const u8, word: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, list, ' ');
+    while (it.next()) |w| {
+        if (std.mem.eql(u8, w, word)) return true;
+    }
+    return false;
+}
+
+/// A dma-buf EGLImage as glamor makes one of a buffer
+/// (xwl_glamor_gbm_create_pixmap_for_bo), bound to a new texture.
+fn glamorTexture(dpy: ?*anyopaque, bo: ?*anyopaque) !struct { image: ?*anyopaque, tex: u32 } {
+    const g = gfxapi.glenum;
+    const fd = libgbm.gbm_bo_get_fd_for_plane(bo, 0);
+    try std.testing.expect(fd >= 0);
+    const modifier = libgbm.gbm_bo_get_modifier(bo);
+    const attrs = [_]i32{
+        egl.WIDTH,                          @intCast(libgbm.gbm_bo_get_width(bo)),
+        egl.HEIGHT,                         @intCast(libgbm.gbm_bo_get_height(bo)),
+        egl.LINUX_DRM_FOURCC_EXT,           @bitCast(libgbm.gbm_bo_get_format(bo)),
+        egl.DMA_BUF_PLANE0_FD_EXT,          fd,
+        egl.DMA_BUF_PLANE0_OFFSET_EXT,      @intCast(libgbm.gbm_bo_get_offset(bo, 0)),
+        egl.DMA_BUF_PLANE0_PITCH_EXT,       @intCast(libgbm.gbm_bo_get_stride_for_plane(bo, 0)),
+        egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT, @bitCast(@as(u32, @truncate(modifier))),
+        egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT, @bitCast(@as(u32, @truncate(modifier >> 32))),
+        egl.NONE,
+    };
+    const image = eglCreateImageKHR(dpy, null, egl.LINUX_DMA_BUF_EXT, null, &attrs) orelse return error.NoImage;
+    var tex: [1]u32 = undefined;
+    libgles.glGenTextures(1, &tex);
+    libgles.glBindTexture(g.TEXTURE_2D, tex[0]);
+    libgles.glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, @intCast(g.NEAREST));
+    libgles.glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, @intCast(g.NEAREST));
+    libgles.glEGLImageTargetTexture2DOES(g.TEXTURE_2D, image);
+    try std.testing.expectEqual(egl.SUCCESS, eglGetError());
+    try std.testing.expectEqual(g.NO_ERROR, libgles.glGetError());
+    libgles.glBindTexture(g.TEXTURE_2D, 0);
+    return .{ .image = image, .tex = tex[0] };
+}
+
+/// The texture cleared to `rgba` through a framebuffer (glamor's fbo of
+/// a pixmap).
+fn clearThrough(tex: u32, rgba: [4]f32) !void {
+    const g = gfxapi.glenum;
+    var fbo: [1]u32 = undefined;
+    libgles.glGenFramebuffers(1, &fbo);
+    libgles.glBindFramebuffer(g.FRAMEBUFFER, fbo[0]);
+    libgles.glFramebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex, 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, libgles.glCheckFramebufferStatus(g.FRAMEBUFFER));
+    libgles.glClearColor(rgba[0], rgba[1], rgba[2], rgba[3]);
+    libgles.glClear(g.COLOR_BUFFER_BIT);
+    libgles.glFinish();
+    libgles.glBindFramebuffer(g.FRAMEBUFFER, 0);
+    libgles.glDeleteFramebuffers(1, &fbo);
+}
+
+test "libgbm: Xwayland's glamor on GBM: device, EGL platform, buffers with modifiers, dma-buf images" {
+    const g = gfxapi.glenum;
+    const B = gfxapi.gbm;
+    gbmTestDriver();
+    // no fd: no device
+    try std.testing.expect(libgbm.gbm_create_device(-1) == null);
+    const dev = libgbm.gbm_create_device(7) orelse return error.NoDevice;
+    defer libgbm.gbm_device_destroy(dev);
+    try std.testing.expectEqual(@as(c_int, 7), libgbm.gbm_device_get_fd(dev));
+    try std.testing.expectEqualStrings("drm", std.mem.span(libgbm.gbm_device_get_backend_name(dev).?));
+    try std.testing.expectEqual(@as(c_int, 1), libgbm.gbm_device_is_format_supported(dev, B.FORMAT_XRGB8888, B.BO_USE_RENDERING));
+    try std.testing.expectEqual(@as(c_int, 0), libgbm.gbm_device_is_format_supported(dev, 0x3631_4752, B.BO_USE_RENDERING)); // RGB565
+    try std.testing.expectEqual(@as(c_int, 1), libgbm.gbm_device_get_format_modifier_plane_count(dev, B.FORMAT_ARGB8888, 0));
+    try std.testing.expectEqual(@as(c_int, -1), libgbm.gbm_device_get_format_modifier_plane_count(dev, B.FORMAT_ARGB8888, 0x0100_0000_0000_0001));
+    // (RGB565 and the others glamor asks for at depths 15, 16, 30: none,
+    // and glamor makes a texture-only pixmap instead)
+    try std.testing.expect(libgbm.gbm_bo_create(dev, 8, 8, 0x3631_4752, B.BO_USE_RENDERING) == null);
+
+    // xwl_glamor_gbm_has_egl_extension, glamor_egl_get_display
+    const client = std.mem.span(eglQueryString(null, egl.EXTENSIONS).?);
+    try std.testing.expect(hasWord(client, "EGL_MESA_platform_gbm") and hasWord(client, "EGL_KHR_platform_gbm") and hasWord(client, "EGL_EXT_platform_base"));
+    const dpy = eglGetPlatformDisplayEXT(egl.PLATFORM_GBM_KHR, dev, null) orelse return error.NoDisplay;
+    // (eglGetDisplay of a GBM device: the same display, as Mesa detects one)
+    try std.testing.expectEqual(dpy, eglGetDisplay(dev).?);
+    try std.testing.expect(eglGetPlatformDisplayEXT(egl.PLATFORM_GBM_KHR, null, null) == null);
+    var major: i32 = 0;
+    var minor: i32 = 0;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(dpy, &major, &minor));
+    defer _ = eglTerminate(dpy);
+
+    // xwl_glamor_try_big_gl_api: no desktop GL here
+    try std.testing.expectEqual(egl.FALSE, eglBindAPI(0x30A2));
+    const core = [_]i32{ egl.CONTEXT_OPENGL_PROFILE_MASK, 1, egl.CONTEXT_MAJOR_VERSION, 3, egl.CONTEXT_MINOR_VERSION, 1, egl.NONE };
+    try std.testing.expect(eglCreateContext(dpy, null, null, &core) == null);
+    try std.testing.expect(eglCreateContext(dpy, null, null, null) == null);
+    // xwl_glamor_try_gles_api
+    try std.testing.expectEqual(egl.TRUE, eglBindAPI(egl.OPENGL_ES_API));
+    const ctx = eglCreateContext(dpy, null, null, &.{ egl.CONTEXT_CLIENT_VERSION, 2, egl.NONE }) orelse return error.NoContext;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(dpy, null, null, ctx));
+    defer _ = eglMakeCurrent(dpy, null, null, null);
+    const renderer = std.mem.span(libgles.glGetString(g.RENDERER).?);
+    try std.testing.expect(std.mem.indexOf(u8, renderer, "llvmpipe") == null and std.mem.indexOf(u8, renderer, "softpipe") == null);
+    const gl_ext = std.mem.span(libgles.glGetString(g.EXTENSIONS).?);
+    try std.testing.expect(hasWord(gl_ext, "GL_OES_EGL_image"));
+    const ext = std.mem.span(eglQueryString(dpy, egl.EXTENSIONS).?);
+    try std.testing.expect(hasWord(ext, "EGL_EXT_image_dma_buf_import") and hasWord(ext, "EGL_EXT_image_dma_buf_import_modifiers"));
+    try std.testing.expect(hasWord(ext, "EGL_KHR_surfaceless_context") and hasWord(ext, "EGL_KHR_no_config_context"));
+    try std.testing.expect(hasWord(ext, "EGL_MESA_image_dma_buf_export") and hasWord(ext, "EGL_KHR_image_pixmap"));
+    try std.testing.expectEqualStrings("Galaxy", std.mem.span(eglQueryString(dpy, egl.VENDOR).?));
+
+    // xwl_glamor_gbm_create_pixmap_internal: the compositor's modifiers
+    // (linear) and gbm_bo_create_with_modifiers2
+    const tiled = [_]u64{0x0100_0000_0000_0002};
+    try std.testing.expect(libgbm.gbm_bo_create_with_modifiers2(dev, 64, 32, B.FORMAT_ARGB8888, &tiled, 1, B.BO_USE_RENDERING) == null);
+    const linear = [_]u64{B.MOD_LINEAR};
+    const bo = libgbm.gbm_bo_create_with_modifiers2(dev, 64, 32, B.FORMAT_ARGB8888, &linear, 1, B.BO_USE_RENDERING | B.BO_USE_SCANOUT) orelse return error.NoBo;
+    try std.testing.expectEqual(@as(u64, 0), libgbm.gbm_bo_get_modifier(bo));
+    try std.testing.expectEqual(@as(c_int, 1), libgbm.gbm_bo_get_plane_count(bo));
+    try std.testing.expectEqual(@as(u32, 256), libgbm.gbm_bo_get_stride(bo));
+    try std.testing.expectEqual(@as(u32, 256), libgbm.gbm_bo_get_stride_for_plane(bo, 0));
+    try std.testing.expectEqual(@as(u32, 0), libgbm.gbm_bo_get_offset(bo, 0));
+    try std.testing.expectEqual(@as(u32, 32), libgbm.gbm_bo_get_bpp(bo));
+    try std.testing.expectEqual(dev, libgbm.gbm_bo_get_device(bo).?);
+    try std.testing.expectEqual(@as(c_int, -1), libgbm.gbm_bo_get_fd_for_plane(bo, 1));
+    try std.testing.expectEqual(libgbm.gbm_bo_get_handle(bo).u64, libgbm.gbm_bo_get_handle_for_plane(bo, 0).u64);
+
+    // its EGLImage and texture, drawn into (glamor's fbo): the buffer's memory
+    const window = try glamorTexture(dpy, bo);
+    try clearThrough(window.tex, .{ 1, 0, 0, 1 });
+    var stride: u32 = 0;
+    var map_data: ?*anyopaque = null;
+    const px: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(bo, 0, 0, 64, 32, B.BO_TRANSFER_READ, &stride, &map_data) orelse return error.NoMap);
+    try std.testing.expectEqual(@as(u32, 256), stride);
+    // (ARGB8888: bytes B, G, R, A)
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, px[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, px[31 * 256 + 63 * 4 ..][0..4]);
+    try std.testing.expect(libgbm.gbm_bo_map(bo, 0, 0, 1, 1, 1, &stride, &map_data) == null); // (one map at a time)
+    libgbm.gbm_bo_unmap(bo, map_data);
+
+    // glamor_pixmap_from_fds, DRI3 1.2 (PixmapFromBuffers, a linear
+    // modifier): a client's dma-buf (here another buffer's) imported
+    const client_bo = libgbm.gbm_bo_create(dev, 16, 8, B.FORMAT_XRGB8888, B.BO_USE_RENDERING) orelse return error.NoBo;
+    const client_fd = libgbm.gbm_bo_get_fd(client_bo);
+    var mod_data = B.ImportFdModifier{ .width = 16, .height = 8, .format = B.FORMAT_ARGB8888, .num_fds = 1, .fds = .{ client_fd, -1, -1, -1 }, .strides = .{ 64, 0, 0, 0 }, .offsets = .{ 0, 0, 0, 0 }, .modifier = 0 };
+    const imported = libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD_MODIFIER, &mod_data, B.BO_USE_RENDERING) orelse return error.NoImport;
+    try std.testing.expectEqual(@as(u64, 0), libgbm.gbm_bo_get_modifier(imported));
+    try std.testing.expectEqual(@as(u32, 64), libgbm.gbm_bo_get_stride(imported));
+    const pix = try glamorTexture(dpy, imported);
+    try clearThrough(pix.tex, .{ 0, 1, 0, 1 });
+    const cpx: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(client_bo, 0, 0, 16, 8, B.BO_TRANSFER_READ, &stride, &map_data).?);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0 }, cpx[7 * 64 + 15 * 4 ..][0..3]);
+    libgbm.gbm_bo_unmap(client_bo, map_data);
+    // (a tiled modifier, or two planes: not taken)
+    mod_data.modifier = 0x0100_0000_0000_0002;
+    try std.testing.expect(libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD_MODIFIER, &mod_data, 0) == null);
+    mod_data.modifier = 0;
+    mod_data.num_fds = 2;
+    try std.testing.expect(libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD_MODIFIER, &mod_data, 0) == null);
+
+    // DRI3 1.0's PixmapFromBuffer: GBM_BO_IMPORT_FD, no modifier
+    var fd_data = B.ImportFd{ .fd = client_fd, .width = 16, .height = 8, .stride = 64, .format = B.FORMAT_ARGB8888 };
+    const implicit = libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD, &fd_data, B.BO_USE_RENDERING) orelse return error.NoImport;
+    try std.testing.expectEqual(B.MOD_INVALID, libgbm.gbm_bo_get_modifier(implicit));
+    const pix2 = try glamorTexture(dpy, implicit);
+    // (a stride too short for the width: refused)
+    fd_data.stride = 32;
+    try std.testing.expect(libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD, &fd_data, 0) == null);
+
+    // EGL_NATIVE_PIXMAP_KHR (glamor without dma-buf imports): the bo itself
+    const native = eglCreateImageKHR(dpy, null, egl.NATIVE_PIXMAP_KHR, bo, null) orelse return error.NoImage;
+    var tex: [1]u32 = undefined;
+    libgles.glGenTextures(1, &tex);
+    libgles.glBindTexture(g.TEXTURE_2D, tex[0]);
+    libgles.glEGLImageTargetTexture2DOES(g.TEXTURE_2D, native);
+    try std.testing.expectEqual(g.NO_ERROR, libgles.glGetError());
+    try clearThrough(tex[0], .{ 0, 0, 1, 1 });
+    const npx: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(bo, 0, 0, 64, 32, B.BO_TRANSFER_READ, &stride, &map_data).?);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, npx[0..4]);
+    libgbm.gbm_bo_unmap(bo, map_data);
+    try std.testing.expect(eglCreateImageKHR(dpy, null, egl.NATIVE_PIXMAP_KHR, dev, null) == null);
+
+    // xwl_glamor_gbm_destroy_pixmap: images, then buffers; the memory goes
+    // with the last name (the textures)
+    for ([_]?*anyopaque{ window.image, pix.image, pix2.image, native }) |im| try std.testing.expectEqual(egl.TRUE, eglDestroyImageKHR(dpy, im));
+    for ([_]?*anyopaque{ bo, imported, implicit, client_bo }) |x| libgbm.gbm_bo_destroy(x);
+    try std.testing.expect(libgbm.gbm_bo_get_width(bo) == 0);
+    for ([_]u32{ window.tex, pix.tex, pix2.tex, tex[0] }) |t| libgles.glDeleteTextures(1, &[_]u32{t});
+}
+
+var user_data_freed: ?*anyopaque = null;
+fn freeUserData(x: ?*gfxapi.gbm.Bo, data: ?*anyopaque) callconv(.c) void {
+    _ = x;
+    user_data_freed = data;
+}
+
+test "libgbm: user data, writes, and a gbm_surface EGL draws into" {
+    const g = gfxapi.glenum;
+    const B = gfxapi.gbm;
+    gbmTestDriver();
+    const dev = libgbm.gbm_create_device(3) orelse return error.NoDevice;
+    defer libgbm.gbm_device_destroy(dev);
+    const cursor = libgbm.gbm_bo_create(dev, 4, 4, B.FORMAT_ARGB8888, B.BO_USE_CURSOR | B.BO_USE_WRITE).?;
+    var marker: u8 = 0;
+    libgbm.gbm_bo_set_user_data(cursor, &marker, freeUserData);
+    try std.testing.expectEqual(@as(?*anyopaque, &marker), libgbm.gbm_bo_get_user_data(cursor));
+    const rows = [_]u8{0x7f} ** 64;
+    try std.testing.expectEqual(@as(c_int, 0), libgbm.gbm_bo_write(cursor, &rows, rows.len));
+    try std.testing.expectEqual(@as(c_int, -1), libgbm.gbm_bo_write(cursor, &rows, 65));
+    var stride: u32 = 0;
+    var md: ?*anyopaque = null;
+    const p: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(cursor, 1, 1, 2, 2, 1, &stride, &md).?);
+    try std.testing.expectEqual(@as(u8, 0x7f), p[0]);
+    libgbm.gbm_bo_unmap(cursor, md);
+    libgbm.gbm_bo_destroy(cursor);
+    try std.testing.expectEqual(@as(?*anyopaque, &marker), user_data_freed);
+
+    const gs = libgbm.gbm_surface_create(dev, 8, 8, B.FORMAT_XRGB8888, B.BO_USE_RENDERING | B.BO_USE_SCANOUT) orelse return error.NoSurface;
+    defer libgbm.gbm_surface_destroy(gs);
+    try std.testing.expectEqual(@as(c_int, 1), libgbm.gbm_surface_has_free_buffers(gs));
+    const dpy = eglGetPlatformDisplay(egl.PLATFORM_GBM_KHR, dev, null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(dpy, null, null));
+    defer _ = eglTerminate(dpy);
+    // (XRGB8888: the config without alpha, its native visual the format)
+    var visual: i32 = 0;
+    try std.testing.expectEqual(egl.TRUE, eglGetConfigAttrib(dpy, &egl.configs[3], egl.NATIVE_VISUAL_ID, &visual));
+    try std.testing.expectEqual(B.FORMAT_XRGB8888, @as(u32, @bitCast(visual)));
+    const surface = eglCreateWindowSurface(dpy, &egl.configs[3], gs, null) orelse return error.NoSurface;
+    try std.testing.expect(eglCreatePlatformWindowSurface(dpy, &egl.configs[3], gs, null) == null);
+    const ctx = eglCreateContext(dpy, &egl.configs[3], null, &.{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE }).?;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(dpy, surface, surface, ctx));
+    var w: i32 = 0;
+    try std.testing.expectEqual(egl.TRUE, eglQuerySurface(dpy, surface, egl.WIDTH, &w));
+    try std.testing.expectEqual(@as(i32, 8), w);
+    var front: [3]?*B.Bo = undefined;
+    for (0..3) |frame| {
+        var age: i32 = -1;
+        try std.testing.expectEqual(egl.TRUE, eglQuerySurface(dpy, surface, egl.BUFFER_AGE_EXT, &age));
+        try std.testing.expectEqual(@as(i32, if (frame == 2) 2 else 0), age);
+        const v: f32 = @floatFromInt(frame + 1);
+        libgles.glClearColor(v / 4, 0, 0, 1);
+        libgles.glClear(g.COLOR_BUFFER_BIT);
+        try std.testing.expectEqual(egl.TRUE, eglSwapBuffers(dpy, surface));
+        front[frame] = libgbm.gbm_surface_lock_front_buffer(gs) orelse return error.NoFront;
+        const px: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(front[frame], 0, 0, 8, 8, 1, &stride, &md).?);
+        try std.testing.expectEqual(@as(u8, @intFromFloat(@round(v / 4 * 255))), px[2]);
+        libgbm.gbm_bo_unmap(front[frame], md);
+        // (the one before goes back once this one is shown)
+        if (frame > 0) libgbm.gbm_surface_release_buffer(gs, front[frame - 1]);
+    }
+    try std.testing.expect(front[0] != front[1] and front[2] == front[0]);
+    try std.testing.expect(libgbm.gbm_surface_lock_front_buffer(gs) == null);
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(dpy, null, null, null));
+    try std.testing.expectEqual(egl.TRUE, eglDestroySurface(dpy, surface));
+    libgbm.gbm_surface_release_buffer(gs, front[2]);
 }
 
 // ── Two threads drawing at once (the driver lock) ──────────────────────────
