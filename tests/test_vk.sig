@@ -611,6 +611,102 @@ test "vk: naga's reduction with push constants, dynamic offsets and an indirect 
     try reduceThroughVulkan(&openRtx);
 }
 
+// ── Queries ──
+
+/// A command buffer begun on its own pool (freed with the pool).
+fn beginCb(v: *const Vk) !struct { pool: H, cb: Ptr } {
+    const cpci = abi.CommandPoolCreateInfo{ .sType = ST.command_pool_create_info, .pNext = null, .flags = 2, .queueFamilyIndex = 0 };
+    var cpool: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreateCommandPool", *const fn (Ptr, *const abi.CommandPoolCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &cpci, null, &cpool));
+    const cbai = abi.CommandBufferAllocateInfo{ .sType = ST.command_buffer_allocate_info, .pNext = null, .commandPool = cpool, .level = 0, .commandBufferCount = 1 };
+    var cb: Ptr = null;
+    try testing.expectEqual(R.success, v.f("vkAllocateCommandBuffers", *const fn (Ptr, *const abi.CommandBufferAllocateInfo, *Ptr) callconv(.c) Res)(v.dev, &cbai, &cb));
+    const cbbi = abi.CommandBufferBeginInfo{ .sType = ST.command_buffer_begin_info, .pNext = null, .flags = 1, .pInheritanceInfo = null };
+    try testing.expectEqual(R.success, v.f("vkBeginCommandBuffer", *const fn (Ptr, *const abi.CommandBufferBeginInfo) callconv(.c) Res)(cb, &cbbi));
+    return .{ .pool = cpool, .cb = cb };
+}
+
+/// Ends, submits and waits for `cb`.
+fn submitWait(v: *const Vk, cb: Ptr) !void {
+    try testing.expectEqual(R.success, v.f("vkEndCommandBuffer", *const fn (Ptr) callconv(.c) Res)(cb));
+    const si = abi.SubmitInfo{ .sType = ST.submit_info, .pNext = null, .waitSemaphoreCount = 0, .pWaitSemaphores = null, .pWaitDstStageMask = null, .commandBufferCount = 1, .pCommandBuffers = @ptrCast(&cb), .signalSemaphoreCount = 0, .pSignalSemaphores = null };
+    try testing.expectEqual(R.success, v.f("vkQueueSubmit", *const fn (Ptr, u32, [*]const abi.SubmitInfo, H) callconv(.c) Res)(v.queue, 1, @ptrCast(&si), 0));
+    try testing.expectEqual(R.success, v.f("vkQueueWaitIdle", *const fn (Ptr) callconv(.c) Res)(v.queue));
+}
+
+fn queryPool(v: *const Vk, ty: u32, n: u32) !H {
+    const ci = abi.QueryPoolCreateInfo{ .sType = ST.query_pool_create_info, .pNext = null, .flags = 0, .queryType = ty, .queryCount = n, .pipelineStatistics = 0 };
+    var qp: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreateQueryPool", *const fn (Ptr, *const abi.QueryPoolCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &ci, null, &qp));
+    return qp;
+}
+
+fn queriesThroughVulkan(open: *const fn () ?icd.Gpu) !void {
+    use(open);
+    var v = try Vk.open();
+    defer v.close();
+    const ts = try queryPool(&v, 2, 4); // TIMESTAMP
+    const occ = try queryPool(&v, 0, 2); // OCCLUSION
+    const work = try v.buffer(64 * 1024, 1);
+    const out = try v.buffer(256, 2);
+    @memset(out.ptr.?[0..256], 0xee);
+    const c = try beginCb(&v);
+    const cb = c.cb;
+    const reset = v.f("vkCmdResetQueryPool", *const fn (Ptr, H, u32, u32) callconv(.c) void);
+    const stamp = v.f("vkCmdWriteTimestamp", *const fn (Ptr, u32, H, u32) callconv(.c) void);
+    reset(cb, ts, 0, 4);
+    reset(cb, occ, 0, 2);
+    // two timestamps around some work; query 2 written, query 3 not
+    stamp(cb, 0x1, ts, 0);
+    v.f("vkCmdFillBuffer", *const fn (Ptr, H, u64, u64, u32) callconv(.c) void)(cb, work.buf, 0, ~@as(u64, 0), 0x1234);
+    stamp(cb, 0x2000, ts, 1);
+    stamp(cb, 0x2000, ts, 2);
+    // an occlusion query with no draw in it: 0
+    v.f("vkCmdBeginQuery", *const fn (Ptr, H, u32, u32) callconv(.c) void)(cb, occ, 0, 0);
+    v.f("vkCmdEndQuery", *const fn (Ptr, H, u32) callconv(.c) void)(cb, occ, 0);
+    // the GPU's copy: 64-bit with availability; then 32-bit, partial
+    const copy = v.f("vkCmdCopyQueryPoolResults", *const fn (Ptr, H, u32, u32, H, u64, u64, u32) callconv(.c) void);
+    copy(cb, ts, 0, 4, out.buf, 0, 16, 1 | 2 | 4);
+    copy(cb, occ, 0, 1, out.buf, 64, 8, 4);
+    copy(cb, ts, 3, 1, out.buf, 72, 4, 8);
+    try submitWait(&v, cb);
+    const w: [*]const u64 = @ptrCast(@alignCast(out.ptr.?));
+    // (available: 1; unwritten query 3: its value left, availability 0)
+    try testing.expectEqual(@as(u64, 1), w[1]);
+    try testing.expectEqual(@as(u64, 1), w[3]);
+    try testing.expectEqual(@as(u64, 1), w[5]);
+    try testing.expectEqual(@as(u64, 0xeeee_eeee_eeee_eeee), w[6]);
+    try testing.expectEqual(@as(u64, 0), w[7]);
+    try testing.expect(w[0] > 0 and w[2] >= w[0] and w[4] >= w[2]);
+    const w32: [*]const u32 = @ptrCast(@alignCast(out.ptr.?));
+    try testing.expectEqual([2]u32{ 0, 1 }, w32[16..18].*);
+    try testing.expectEqual(@as(u32, 0), w32[18]);
+    // the host's read: waited, 64-bit, with availability
+    var host: [8]u64 = undefined;
+    const get_results = v.f("vkGetQueryPoolResults", *const fn (Ptr, H, u32, u32, usize, *anyopaque, u64, u32) callconv(.c) Res);
+    try testing.expectEqual(R.success, get_results(v.dev, ts, 0, 3, 48, &host, 16, 1 | 2 | 4));
+    try testing.expectEqual([6]u64{ w[0], 1, w[2], 1, w[4], 1 }, host[0..6].*);
+    // query 3 never written: not ready
+    try testing.expectEqual(R.not_ready, get_results(v.dev, ts, 3, 1, 8, &host, 8, 1));
+    // a host reset: every query unavailable again
+    v.f("vkResetQueryPool", *const fn (Ptr, H, u32, u32) callconv(.c) void)(v.dev, ts, 0, 4);
+    try testing.expectEqual(R.not_ready, get_results(v.dev, ts, 0, 1, 8, &host, 8, 1));
+    v.f("vkDestroyQueryPool", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, ts, null);
+    v.f("vkDestroyQueryPool", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, occ, null);
+    v.f("vkDestroyCommandPool", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, c.pool, null);
+    for ([_]Vk.Buf{ work, out }) |b| {
+        v.f("vkDestroyBuffer", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, b.buf, null);
+        v.f("vkFreeMemory", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, b.mem, null);
+    }
+}
+
+test "vk: timestamp and occlusion queries (GPU stamps, the GPU's copy, the host's read, resets) on the emulated RTX" {
+    try queriesThroughVulkan(&openRtx);
+}
+test "vk: timestamp and occlusion queries on KIR's interpreter" {
+    try queriesThroughVulkan(&openInterp);
+}
+
 test "vk: a shader the front end cannot take fails its pipeline, with the reason logged" {
     use(&openInterp);
     var v = try Vk.open();

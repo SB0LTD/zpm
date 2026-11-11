@@ -167,6 +167,10 @@ pub const CMD_BLOCK = 64 * 1024;
 pub const MAX_CMD_BLOCKS = 512;
 const MAX_CB_BLOCKS = 64;
 pub const MAX_FENCES = 1024;
+pub const MAX_QUERY_POOLS = 256;
+/// A query's bytes in its pool's buffer: u32 available (1), u32 0, then
+/// the u64 result (a timestamp's GPU clock, an occlusion's samples).
+const QUERY_BYTES = 16;
 pub const MAX_SEMAPHORES = 1024;
 const MAX_PENDING = 16;
 const MAX_CACHES = 64;
@@ -220,7 +224,7 @@ fn nowNs() u64 {
 
 const Hdr = extern struct { loader: usize };
 
-const Tag = enum(u8) { memory = 1, buffer, set_layout, pipeline_layout, pool, set, shader, pipeline, cmd_pool, fence, semaphore, cache, image, view, sampler, render_pass, framebuffer, gpipe, template, swapchain };
+const Tag = enum(u8) { memory = 1, buffer, set_layout, pipeline_layout, pool, set, shader, pipeline, cmd_pool, fence, semaphore, cache, image, view, sampler, render_pass, framebuffer, gpipe, template, swapchain, query_pool };
 
 fn handle(tag: Tag, i: u32) u64 {
     return @as(u64, @intFromEnum(tag)) << 48 | (@as(u64, i) + 1);
@@ -243,6 +247,10 @@ const Device = struct {
     copy8: ?gpu.Program,
     fill32: ?gpu.Program,
     xfer: ?gpu.Program,
+    /// queries: a kernel that does nothing (its dispatch carries a
+    /// timestamp's stamp) and vkCmdCopyQueryPoolResults's
+    nop: ?gpu.Program = null,
+    qcopy: ?gpu.Program = null,
     staging: gpu.Buffer,
     staging_used: u64,
     staging_fence: u64,
@@ -380,6 +388,7 @@ const T = struct {
     var fences: [MAX_FENCES]Fence = undefined;
     var semaphores: [MAX_SEMAPHORES]Semaphore = undefined;
     var caches: [MAX_CACHES]bool = undefined;
+    var query_pools: [MAX_QUERY_POOLS]QueryPool = undefined;
     // compiling
     var scratch: spirv.Scratch = undefined;
     var insts: [1 << 16]kir.Inst = undefined;
@@ -439,6 +448,7 @@ fn ready() void {
     markAll("gpipes");
     markAll("templates");
     markAll("swapchains");
+    markAll("query_pools");
     for (&T.caches) |*c| c.* = false;
     T.desc_map = .{};
     T.shader_map = .{};
@@ -719,6 +729,7 @@ fn limits(caps: gpu.Caps) abi.PhysicalDeviceLimits {
     l.minUniformBufferOffsetAlignment = 16;
     l.minStorageBufferOffsetAlignment = 16;
     l.timestampPeriod = if (caps.timestamp_hz != 0) 1.0e9 / @as(f32, @floatFromInt(caps.timestamp_hz)) else 1.0;
+    l.timestampComputeAndGraphics = @intFromBool(caps.stamps);
     l.discreteQueuePriorities = 2;
     l.optimalBufferCopyOffsetAlignment = 4;
     l.optimalBufferCopyRowPitchAlignment = 4;
@@ -815,15 +826,19 @@ fn getPhysicalDeviceProperties2(_: ?*anyopaque, out: ?*abi.PhysicalDevicePropert
     }
 }
 
-const queue_family = abi.QueueFamilyProperties{
-    .queueFlags = 0x1 | 0x2 | 0x4, // GRAPHICS | COMPUTE | TRANSFER
-    .queueCount = 1,
-    .timestampValidBits = 0,
-    .minImageTransferGranularity = .{ .width = 1, .height = 1, .depth = 1 },
-};
+fn queueFamily() abi.QueueFamilyProperties {
+    const stamps = if (theGpu()) |g| g.dev.caps.stamps else false;
+    return .{
+        .queueFlags = 0x1 | 0x2 | 0x4, // GRAPHICS | COMPUTE | TRANSFER
+        .queueCount = 1,
+        // (timestamps: the GPU's clock, written by a dispatch's stamp)
+        .timestampValidBits = if (stamps) 64 else 0,
+        .minImageTransferGranularity = .{ .width = 1, .height = 1, .depth = 1 },
+    };
+}
 
 fn getPhysicalDeviceQueueFamilyProperties(_: ?*anyopaque, count: ?*u32, out: ?[*]abi.QueueFamilyProperties) callconv(.c) void {
-    _ = enumerate(abi.QueueFamilyProperties, &.{queue_family}, count, out);
+    _ = enumerate(abi.QueueFamilyProperties, &.{queueFamily()}, count, out);
 }
 
 fn getPhysicalDeviceQueueFamilyProperties2(_: ?*anyopaque, count: ?*u32, out: ?[*]abi.QueueFamilyProperties2) callconv(.c) void {
@@ -833,7 +848,7 @@ fn getPhysicalDeviceQueueFamilyProperties2(_: ?*anyopaque, count: ?*u32, out: ?[
         return;
     };
     if (c.* == 0) return;
-    dst[0].queueFamilyProperties = queue_family;
+    dst[0].queueFamilyProperties = queueFamily();
     c.* = 1;
 }
 
@@ -1026,7 +1041,9 @@ fn createDevice(phys: ?*anyopaque, info: ?*const abi.DeviceCreateInfo, _: ?*cons
     d.copy8 = internalKernel(g, .copy8);
     d.fill32 = internalKernel(g, .fill32);
     d.xfer = xferKernel(g);
-    if (d.copy32 == null or d.copy8 == null or d.fill32 == null or d.xfer == null) {
+    d.nop = internalKernel(g, .nop);
+    d.qcopy = internalKernel(g, .qcopy);
+    if (d.copy32 == null or d.copy8 == null or d.fill32 == null or d.xfer == null or d.nop == null or d.qcopy == null) {
         say("vkCreateDevice: the copy kernels did not compile or load", .{});
         dropDevice(g, &d);
         return R.error_initialization_failed;
@@ -1045,7 +1062,7 @@ fn createDevice(phys: ?*anyopaque, info: ?*const abi.DeviceCreateInfo, _: ?*cons
 
 fn dropDevice(g: *Gpu, d: *Device) void {
     const dev = g.dev;
-    inline for (.{ "copy32", "copy8", "fill32", "xfer" }) |f| {
+    inline for (.{ "copy32", "copy8", "fill32", "xfer", "nop", "qcopy" }) |f| {
         if (@field(d, f)) |*p| dev.unload(p);
         @field(d, f) = null;
     }
@@ -1080,6 +1097,10 @@ fn destroyDevice(h: ?*anyopaque, _: ?*const anyopaque) callconv(.c) void {
         p.live = false;
     };
     for (&T.pools, 0..) |*pl, pi| if (pl.live and pl.dev == di) dropPool(@intCast(pi), true);
+    for (&T.query_pools) |*qp| if (qp.live and qp.dev == di) {
+        g.dev.free(qp.buf);
+        qp.live = false;
+    };
     dropDevice(g, d);
     d.live = false;
     // (the raster goes with the last device)
@@ -1108,12 +1129,20 @@ fn queueDev(q: ?*anyopaque) ?u32 {
 
 // ── The copy and fill kernels ──────────────────────────────────────────────
 
-const Internal = enum { copy32, copy8, fill32 };
+const Internal = enum { copy32, copy8, fill32, nop, qcopy };
 
 fn internalKernel(g: *Gpu, which: Internal) ?gpu.Program {
-    var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, @tagName(which), .{ GROUP, 1, 1 });
+    var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, @tagName(which), if (which == .nop) .{ 1, 1, 1 } else .{ GROUP, 1, 1 });
     const r = kir.r;
     const u = kir.u;
+    if (which == .nop) {
+        k.ret();
+        return loadInternal(g, &k, which);
+    }
+    if (which == .qcopy) {
+        queryCopyKernel(&k);
+        return loadInternal(g, &k, which);
+    }
     const src = if (which == .fill32) 0 else k.binding();
     const dst = k.binding();
     const so = k.param(.u32, 0);
@@ -1136,13 +1165,60 @@ fn internalKernel(g: *Gpu, which: Internal) ?gpu.Program {
             const off = k.op2(.shl, .u32, r(i), u(2));
             const value = k.param(.u32, 3);
             k.store(.u32, kir.global(dst, 32), r(k.op2(.iadd, .u32, r(so), r(off))), r(value));
-
         },
+        .nop, .qcopy => unreachable,
     }
     k.endif();
+    return loadInternal(g, &k, which);
+}
+
+/// vkCmdCopyQueryPoolResults's kernel: thread i copies query i. Params:
+/// the pool's first query's byte offset, the destination's, the count,
+/// the stride, the flags (64-bit 1, with availability 4, partial 8).
+fn queryCopyKernel(k: *kir.Kernel) void {
+    const r = kir.r;
+    const u = kir.u;
+    const src = k.binding();
+    const dst = k.binding();
+    const so = k.param(.u32, 0);
+    const do = k.param(.u32, 1);
+    const n = k.param(.u32, 2);
+    const stride = k.param(.u32, 3);
+    const flags = k.param(.u32, 4);
+    const i = k.op3(.imad, .u32, r(k.gid(0)), u(GROUP), r(k.tid(0)));
+    k.ifp(r(k.cmp(.u32, .lt, r(i), r(n))));
+    const s = k.op3(.imad, .u32, r(i), u(QUERY_BYTES), r(so));
+    const avail = k.cmp(.u32, .ne, r(k.load(.u32, kir.global(src, 32), r(s))), u(0));
+    var m8 = kir.global(src, 32);
+    m8.imm = 8;
+    const lo = k.load(.u32, m8, r(s));
+    m8.imm = 12;
+    const hi = k.load(.u32, m8, r(s));
+    const d = k.op3(.imad, .u32, r(i), r(stride), r(do));
+    const wide = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(flags), u(1))), u(0));
+    const partial = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(flags), u(8))), u(0));
+    const with_avail = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(flags), u(4))), u(0));
+    const d4 = k.op2(.iadd, .u32, r(d), u(4));
+    k.ifp(r(k.op2(.por, .pred, r(avail), r(partial))));
+    k.store(.u32, kir.global(dst, 32), r(d), r(lo));
+    k.ifp(r(wide));
+    k.store(.u32, kir.global(dst, 32), r(d4), r(hi));
+    k.endif();
+    k.endif();
+    k.ifp(r(with_avail));
+    const at = k.sel(.u32, r(wide), r(k.op2(.iadd, .u32, r(d), u(8))), r(d4));
+    k.store(.u32, kir.global(dst, 32), r(at), r(k.sel(.u32, r(avail), u(1), u(0))));
+    k.ifp(r(wide));
+    k.store(.u32, kir.global(dst, 32), r(k.op2(.iadd, .u32, r(at), u(4))), u(0));
+    k.endif();
+    k.endif();
+    k.endif();
+}
+
+fn loadInternal(g: *Gpu, k: *kir.Kernel, which: Internal) ?gpu.Program {
     k.finish() catch return null;
     var work = gpu.Work.init(g.work);
-    const bin = g.compile(&k, g.dev.caps, &work, &T.code) catch |e| {
+    const bin = g.compile(k, g.dev.caps, &work, &T.code) catch |e| {
         say("the {s} kernel did not compile ({s})", .{ @tagName(which), @errorName(e) });
         return null;
     };
@@ -1867,7 +1943,7 @@ fn resetCommandBuffer(h: ?*anyopaque, _: u32) callconv(.c) Result {
 
 // ── Recording: commands as bytes in the command buffer's blocks ────────────
 
-const Cmd = enum(u16) { bind_pipeline, bind_sets, push, dispatch, dispatch_indirect, copy, fill, update, bind_gpipe, begin_pass, end_pass, bind_vb, bind_ib, viewport, scissor, stencil, blend_consts, draw, draw_indirect, clear_atts, copy_b2i, copy_i2b, copy_i2i, clear_image, blit };
+const Cmd = enum(u16) { bind_pipeline, bind_sets, push, dispatch, dispatch_indirect, copy, fill, update, bind_gpipe, begin_pass, end_pass, bind_vb, bind_ib, viewport, scissor, stencil, blend_consts, draw, draw_indirect, clear_atts, copy_b2i, copy_i2b, copy_i2i, clear_image, blit, reset_queries, timestamp, begin_query, end_query, copy_queries };
 const CmdHead = extern struct { tag: u16, pad: u16 = 0, size: u32 };
 
 const BindSets = extern struct { point: u32, first: u32, count: u32, n_dyn: u32, sets: [MAX_SETS_PER_LAYOUT]u32, dyn: [MAX_DYNAMIC * 2]u32 };
@@ -2029,6 +2105,8 @@ const Exec = struct {
     push: [MAX_PUSH_BYTES / 4]u32 = [_]u32{0} ** (MAX_PUSH_BYTES / 4),
     err: Result = R.success,
     gfx: Gfx = .{},
+    /// the draws since vkCmdBeginQuery of an occlusion query
+    occ_draws: u32 = 0,
 
     fn dev(e: *Exec) *Device {
         return &T.devices[e.di];
@@ -2291,8 +2369,54 @@ const Exec = struct {
                 e.copyMem(st, at, T.memories[d.mem].buf, d.off + u.off, u.size);
                 e.markDirty(d.mem);
             },
+            .reset_queries => {
+                const q = as(QueryRange, body);
+                const qp = queryPoolOf(q.pool) orelse return;
+                e.fill(qp.buf, @as(u64, q.first) * QUERY_BYTES, @as(u64, q.count) * QUERY_BYTES / 4, 0);
+            },
+            .timestamp => {
+                const q = as(QueryRange, body);
+                const qp = queryPoolOf(q.pool) orelse return;
+                e.stamp(qp.buf, @as(u64, q.first) * QUERY_BYTES);
+            },
+            .begin_query => e.occ_draws = 0,
+            .end_query => {
+                // (an occlusion query: whether a draw ran in its scope; the
+                // raster counts no samples, so a draw counts as visible)
+                const q = as(QueryRange, body);
+                const qp = queryPoolOf(q.pool) orelse return;
+                const at = @as(u64, q.first) * QUERY_BYTES;
+                e.fill(qp.buf, at, QUERY_BYTES / 4, 0);
+                e.fill(qp.buf, at, 1, 1);
+                if (e.occ_draws != 0) e.fill(qp.buf, at + 8, 1, e.occ_draws);
+            },
+            .copy_queries => {
+                const c = as(QueryCopy, body);
+                const qp = queryPoolOf(c.pool) orelse return;
+                const pl = e.place(c.dst) orelse return;
+                if (c.count == 0) return;
+                const groups = (c.count + GROUP - 1) / GROUP;
+                const mem = T.memories[pl.mem].buf;
+                const dst_off = pl.off + c.dst_off;
+                e.kernel(&e.dev().qcopy.?, .{ groups, 1, 1 }, &.{ qp.buf, mem }, &.{ c.first * QUERY_BYTES, @intCast(dst_off), c.count, @intCast(c.stride), c.flags });
+                e.markDirty(pl.mem);
+            },
             else => e.graphics(tag, body),
         }
+    }
+
+    /// A timestamp: a dispatch of nothing whose stamp, once everything
+    /// before it is done, writes the GPU's clock into the query (devices
+    /// without stamps: the query available, its time 0).
+    fn stamp(e: *Exec, buf: gpu.Buffer, off: u64) void {
+        if (!e.g.dev.caps.stamps) {
+            e.fill(buf, off, QUERY_BYTES / 4, 0);
+            e.fill(buf, off, 1, 1);
+            return;
+        }
+        e.toIcd();
+        const s = e.slot() orelse return;
+        T.ds[s] = .{ .prog = &e.dev().nop.?, .groups = .{ 1, 1, 1 }, .buffers = &.{}, .params = &.{}, .stamp = .{ .buf = buf, .off = off } };
     }
 
     // ── Graphics (the raster's draws, transfers of images) ──
@@ -2567,6 +2691,7 @@ const Exec = struct {
         const gx = &e.gfx;
         const p = gpipeOf(gx.pipe) orelse return;
         if (gx.rp == NONE or p.discard or dc.count == 0 or dc.instances == 0) return;
+        e.occ_draws +|= 1;
         const topo: raster.Topology = switch (p.topology) {
             .triangles => .triangles,
             .strip => .strip,
@@ -3086,6 +3211,144 @@ fn deviceWaitIdle(dh: ?*anyopaque) callconv(.c) Result {
     const res = waitFence(g, T.devices[di].last_fence, WHOLE_SIZE);
     pullDone(g);
     return res;
+}
+
+// ── Queries ────────────────────────────────────────────────────────────────
+//
+// A pool is one buffer of the GPU's, QUERY_BYTES a query. Timestamps are
+// written by the GPU (a stamp: the QMD's release on the RTX), occlusion
+// queries say whether a draw ran in their scope (the raster counts no
+// samples), pipeline statistics are not offered (all 0).
+
+const QueryPool = struct { live: bool, dev: u32, ty: u32, count: u32, buf: gpu.Buffer };
+const QueryRange = extern struct { pool: u32, first: u32, count: u32 };
+const QueryCopy = extern struct { pool: u32, first: u32, count: u32, flags: u32, dst: u32, pad: u32 = 0, dst_off: u64, stride: u64 };
+
+fn queryPoolOf(i: u32) ?*QueryPool {
+    if (i == NONE or i >= MAX_QUERY_POOLS or !T.query_pools[i].live) return null;
+    return &T.query_pools[i];
+}
+
+fn createQueryPool(h: ?*anyopaque, info: ?*const abi.QueryPoolCreateInfo, _: ?*const anyopaque, out: ?*u64) callconv(.c) Result {
+    const ci = info orelse return R.error_initialization_failed;
+    lock();
+    defer unlock();
+    const di = devOf(h) orelse return R.error_initialization_failed;
+    const g = theGpu() orelse return R.error_initialization_failed;
+    if (ci.queryCount == 0) return R.error_initialization_failed;
+    const i = findFree("query_pools") orelse return R.error_too_many_objects;
+    const bytes = @as(u64, ci.queryCount) * QUERY_BYTES;
+    const buf = g.dev.alloc(bytes, .host) catch return R.error_out_of_device_memory;
+    @memset(buf.cpu[0..@intCast(bytes)], 0);
+    g.dev.toDevice(buf, 0, bytes);
+    T.query_pools[i] = .{ .live = true, .dev = di, .ty = ci.queryType, .count = ci.queryCount, .buf = buf };
+    (out orelse return R.error_initialization_failed).* = handle(.query_pool, i);
+    return R.success;
+}
+
+fn destroyQueryPool(_: ?*anyopaque, h: u64, _: ?*const anyopaque) callconv(.c) void {
+    lock();
+    defer unlock();
+    const g = theGpu() orelse return;
+    const qp = queryPoolOf(unhandle(.query_pool, h) orelse NONE) orelse return;
+    g.dev.free(qp.buf);
+    qp.live = false;
+}
+
+/// vkResetQueryPool (host reset, Vulkan 1.2's and the EXT's).
+fn resetQueryPool(_: ?*anyopaque, h: u64, first: u32, count: u32) callconv(.c) void {
+    lock();
+    defer unlock();
+    const g = theGpu() orelse return;
+    const qp = queryPoolOf(unhandle(.query_pool, h) orelse NONE) orelse return;
+    if (first >= qp.count) return;
+    const n = @min(count, qp.count - first);
+    const at = @as(u64, first) * QUERY_BYTES;
+    const len = @as(u64, n) * QUERY_BYTES;
+    @memset(qp.buf.cpu[@intCast(at)..][0..@intCast(len)], 0);
+    g.dev.toDevice(qp.buf, at, len);
+}
+
+fn cmdResetQueryPool(h: ?*anyopaque, ph: u64, first: u32, count: u32) callconv(.c) void {
+    lock();
+    defer unlock();
+    const cb = cbOf(h) orelse return;
+    put(cb, .reset_queries, QueryRange{ .pool = unhandle(.query_pool, ph) orelse NONE, .first = first, .count = count });
+}
+
+fn cmdWriteTimestamp(h: ?*anyopaque, _: u32, ph: u64, query: u32) callconv(.c) void {
+    lock();
+    defer unlock();
+    const cb = cbOf(h) orelse return;
+    put(cb, .timestamp, QueryRange{ .pool = unhandle(.query_pool, ph) orelse NONE, .first = query, .count = 1 });
+}
+
+fn cmdBeginQuery(h: ?*anyopaque, ph: u64, query: u32, _: u32) callconv(.c) void {
+    lock();
+    defer unlock();
+    const cb = cbOf(h) orelse return;
+    put(cb, .begin_query, QueryRange{ .pool = unhandle(.query_pool, ph) orelse NONE, .first = query, .count = 1 });
+}
+
+fn cmdEndQuery(h: ?*anyopaque, ph: u64, query: u32) callconv(.c) void {
+    lock();
+    defer unlock();
+    const cb = cbOf(h) orelse return;
+    put(cb, .end_query, QueryRange{ .pool = unhandle(.query_pool, ph) orelse NONE, .first = query, .count = 1 });
+}
+
+fn cmdCopyQueryPoolResults(h: ?*anyopaque, ph: u64, first: u32, count: u32, dst: u64, dst_off: u64, stride: u64, flags: u32) callconv(.c) void {
+    lock();
+    defer unlock();
+    const cb = cbOf(h) orelse return;
+    const pi = unhandle(.query_pool, ph) orelse NONE;
+    const qp = queryPoolOf(pi) orelse return;
+    if (first >= qp.count) return;
+    put(cb, .copy_queries, QueryCopy{ .pool = pi, .first = first, .count = @min(count, qp.count - first), .flags = flags, .dst = unhandle(.buffer, dst) orelse NONE, .dst_off = dst_off, .stride = stride });
+}
+
+fn getQueryPoolResults(dh: ?*anyopaque, ph: u64, first: u32, count: u32, size: usize, data: ?*anyopaque, stride: u64, flags: u32) callconv(.c) Result {
+    lock();
+    defer unlock();
+    const di = devOf(dh) orelse return R.error_initialization_failed;
+    const g = theGpu() orelse return R.error_initialization_failed;
+    if (T.devices[di].lost) return R.error_device_lost;
+    const qp = queryPoolOf(unhandle(.query_pool, ph) orelse NONE) orelse return R.error_initialization_failed;
+    if (first + count > qp.count) return R.error_initialization_failed;
+    const wide = flags & 1 != 0;
+    const wait = flags & 2 != 0;
+    const with_avail = flags & 4 != 0;
+    const partial = flags & 8 != 0;
+    // (the queue runs in order: what the last submission's fence covers
+    // includes every query written so far)
+    if (wait) {
+        const res = waitFence(g, T.devices[di].last_fence, WHOLE_SIZE);
+        if (res != R.success) return res;
+        pullDone(g);
+    } else if (T.devices[di].last_fence != 0 and !g.dev.done(T.devices[di].last_fence)) {
+        // (in flight: what is there may still change; read what is)
+    }
+    g.dev.fromDevice(qp.buf, @as(u64, first) * QUERY_BYTES, @as(u64, count) * QUERY_BYTES);
+    const out: [*]u8 = @ptrCast(data orelse return R.error_initialization_failed);
+    const unit: usize = if (wide) 8 else 4;
+    const per = unit * (1 + @as(usize, @intFromBool(with_avail)));
+    var all = true;
+    for (0..count) |i| {
+        const at: usize = @intCast((@as(u64, first) + i) * QUERY_BYTES);
+        const src = qp.buf.cpu[at..][0..QUERY_BYTES];
+        const avail = std.mem.readInt(u32, src[0..4], .little) != 0;
+        const value = std.mem.readInt(u64, src[8..16], .little);
+        const o: usize = @intCast(i * stride);
+        if (o + per > size) return R.error_initialization_failed;
+        all = all and avail;
+        if (avail or partial) {
+            if (wide) std.mem.writeInt(u64, out[o..][0..8], value, .little) else std.mem.writeInt(u32, out[o..][0..4], @truncate(value), .little);
+        }
+        if (with_avail) {
+            if (wide) std.mem.writeInt(u64, out[o + 8 ..][0..8], @intFromBool(avail), .little) else std.mem.writeInt(u32, out[o + 4 ..][0..4], @intFromBool(avail), .little);
+        }
+    }
+    return if (all) R.success else R.not_ready;
 }
 
 // ── Fences and semaphores ──────────────────────────────────────────────────
@@ -5583,6 +5846,16 @@ const procs = [_]Proc{
     entry("vkCmdDispatch", &cmdDispatch, .device),
     entry("vkCmdDispatchBase", &cmdDispatchBase, .device),
     entry("vkCmdDispatchIndirect", &cmdDispatchIndirect, .device),
+    entry("vkCreateQueryPool", &createQueryPool, .device),
+    entry("vkDestroyQueryPool", &destroyQueryPool, .device),
+    entry("vkResetQueryPool", &resetQueryPool, .device),
+    entry("vkResetQueryPoolEXT", &resetQueryPool, .device),
+    entry("vkCmdResetQueryPool", &cmdResetQueryPool, .device),
+    entry("vkCmdWriteTimestamp", &cmdWriteTimestamp, .device),
+    entry("vkCmdBeginQuery", &cmdBeginQuery, .device),
+    entry("vkCmdEndQuery", &cmdEndQuery, .device),
+    entry("vkCmdCopyQueryPoolResults", &cmdCopyQueryPoolResults, .device),
+    entry("vkGetQueryPoolResults", &getQueryPoolResults, .device),
     entry("vkCmdCopyBuffer", &cmdCopyBuffer, .device),
     entry("vkCmdFillBuffer", &cmdFillBuffer, .device),
     entry("vkCmdUpdateBuffer", &cmdUpdateBuffer, .device),

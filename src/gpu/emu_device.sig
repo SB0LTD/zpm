@@ -301,6 +301,15 @@ pub const EmuDevice = struct {
         e.total.groups += st.groups;
         e.total.issued += st.issued;
         e.total.lane_ops += st.lane_ops;
+        // (the clock: the instructions issued so far, a tick each)
+        if (d.stamp) |s| {
+            const rg = e.regionHolding(s.buf.gpu + s.off) orelse return error.Trap;
+            const at: usize = @intCast(s.buf.gpu + s.off - rg.gpu);
+            if (at + 16 > rg.bytes) return error.Trap;
+            const word = rg.seen[at..][0..16];
+            std.mem.writeInt(u64, word[0..8], 1, .little);
+            std.mem.writeInt(u64, word[8..16], e.total.issued, .little);
+        }
     }
 
     fn emuWait(ctx: *anyopaque, f: Fence, timeout_us: u64) Error!void {

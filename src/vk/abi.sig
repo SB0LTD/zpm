@@ -364,6 +364,14 @@ pub const PipelineShaderStageCreateInfo = extern struct {
     pName: ?[*:0]const u8,
     pSpecializationInfo: ?[*]const SpecializationInfo,
 };
+pub const QueryPoolCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    queryType: u32,
+    queryCount: u32,
+    pipelineStatistics: u32,
+};
 pub const ComputePipelineCreateInfo = extern struct {
     sType: u32,
     pNext: ?*const anyopaque,
@@ -719,6 +727,7 @@ pub const StructureType = struct {
     pub const pipeline_cache_create_info: u32 = 17;
     pub const pipeline_shader_stage_create_info: u32 = 18;
     pub const compute_pipeline_create_info: u32 = 29;
+    pub const query_pool_create_info: u32 = 11;
     pub const pipeline_layout_create_info: u32 = 30;
     pub const descriptor_set_layout_create_info: u32 = 32;
     pub const descriptor_pool_create_info: u32 = 33;

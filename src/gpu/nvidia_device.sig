@@ -89,6 +89,8 @@ pub fn rtx5070(vram: u64) gpu.Caps {
         .dot4 = true,
         .import = false,
         .timestamp_hz = push.TIMESTAMP_HZ,
+        // (a dispatch's stamp is its QMD's four-word release)
+        .stamps = true,
         .max_run = MAX_DISPATCHES,
     };
 }
@@ -323,7 +325,9 @@ pub const Adapter = struct {
                 .block = bin.group,
                 .shared_bytes = bin.shared_bytes,
             }) catch return error.BadProgram;
-            if (s.profiled) qmd.releaseStamp(q, s.ends.va + i * 16, @intCast(i));
+            if (d.stamp) |st| {
+                qmd.releaseStamp(q, st.buf.gpu + st.off, 1);
+            } else if (s.profiled) qmd.releaseStamp(q, s.ends.va + i * 16, @intCast(i));
             var params: [qmd.MAX_BIG_PARAMS]u8 = undefined;
             var n: usize = 0;
             for (d.buffers) |b| {
