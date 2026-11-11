@@ -38,6 +38,9 @@ pub const Log = struct {
     len: usize = 0,
     errors: u32 = 0,
     file_name: []const u8 = "",
+    /// the column of the next message (1-based; 0: none), set by whoever
+    /// knows the token
+    col: u32 = 0,
 
     pub fn err(l: *Log, line: u32, comptime fmt: []const u8, args: anytype) void {
         l.errors += 1;
@@ -50,7 +53,11 @@ pub const Log = struct {
 
     fn put(l: *Log, line: u32, what: []const u8, comptime fmt: []const u8, args: anytype) void {
         if (l.len >= l.buf.len) return;
-        const head = std.fmt.bufPrint(l.buf[l.len..], "{s}({d}): {s} X3000: ", .{ if (l.file_name.len > 0) l.file_name else "hlsl", line, what }) catch {
+        const name = if (l.file_name.len > 0) l.file_name else "hlsl";
+        const head = (if (l.col > 0)
+            std.fmt.bufPrint(l.buf[l.len..], "{s}({d},{d}): {s} X3000: ", .{ name, line, l.col, what })
+        else
+            std.fmt.bufPrint(l.buf[l.len..], "{s}({d}): {s} X3000: ", .{ name, line, what })) catch {
             l.len = l.buf.len;
             return;
         };
@@ -112,6 +119,7 @@ pub const Pp = struct {
     failed: bool = false,
 
     pub fn fail(p: *Pp, line: u32, comptime fmt: []const u8, args: anytype) void {
+        p.log.col = 0;
         p.log.err(line, fmt, args);
         p.failed = true;
     }

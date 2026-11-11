@@ -88,7 +88,10 @@ pub const Parser = struct {
     }
 
     pub fn fail(p: *Parser, comptime fmt: []const u8, args: anytype) void {
-        if (!p.failed) p.log.err(p.line(), fmt, args);
+        if (!p.failed) {
+            p.log.col = column(p.pool, p.t[p.at].off);
+            p.log.err(p.line(), fmt, args);
+        }
         p.failed = true;
         // (stop: every later read sees the end)
         p.at = p.t.len - 1;
@@ -1262,6 +1265,14 @@ pub const Parser = struct {
         };
     }
 };
+
+/// A text offset's column (1-based) on its line.
+pub fn column(pool: []const u8, off: u32) u32 {
+    var i: usize = @min(off, pool.len);
+    var n: u32 = 1;
+    while (i > 0 and pool[i - 1] != '\n' and pool[i - 1] != 0) : (i -= 1) n += 1;
+    return n;
+}
 
 // ── built-in type names ────────────────────────────────────────────────────
 

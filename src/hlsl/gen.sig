@@ -211,6 +211,7 @@ pub const Gen = struct {
     nfns: usize = 0,
     failed: bool = false,
     cur_line: u32 = 0,
+    cur_col: u32 = 0,
     /// GS: the input primitive, output topology, max vertices
     gs_input_prim: u32 = 0,
     gs_output_topo: u32 = 0,
@@ -228,13 +229,19 @@ pub const Gen = struct {
     // ── errors ──
 
     pub fn fail(g: *Gen, comptime fmt: []const u8, args: anytype) void {
-        if (!g.failed) g.log.err(g.cur_line, fmt, args);
+        if (!g.failed) {
+            g.log.col = g.cur_col;
+            g.log.err(g.cur_line, fmt, args);
+        }
         g.failed = true;
     }
 
     fn locate(g: *Gen, n: u32) void {
         const t = g.a.nodes[n].tok;
-        if (t < g.toks.len) g.cur_line = g.toks[t].line();
+        if (t < g.toks.len) {
+            g.cur_line = g.toks[t].line();
+            g.cur_col = @import("parse.sig").column(g.a.pool, g.toks[t].off);
+        }
     }
 
     pub fn tokText(g: *const Gen, t: u32) []const u8 {
