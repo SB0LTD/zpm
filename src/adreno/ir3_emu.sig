@@ -944,13 +944,19 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
             for (fibers) |f| writeReg(c, f, in.dst.num, false, f - c.wave * c.threadsize);
             noteWrite(c, in.dst.num, false, .sy, slot0);
         },
-        .atomic_g_add, .atomic_g_sub, .atomic_g_xchg, .atomic_g_min, .atomic_g_max, .atomic_g_and, .atomic_g_or, .atomic_g_xor => {
+        .atomic_g_add, .atomic_g_sub, .atomic_g_xchg, .atomic_g_min, .atomic_g_max, .atomic_g_and, .atomic_g_or, .atomic_g_xor, .atomic_g_cmpxchg => {
             // dst = the old word; the word = op(old, value); fiber by fiber
+            // (cmpxchg: src1 a pair, the new value and the compared one)
+            const cas = in.op == .atomic_g_cmpxchg;
             if (in.src[0].kind == .gpr) {
                 try checkRead(c, in.src[0].num, false, false, slot0);
                 try checkRead(c, in.src[0].num + 1, false, false, slot0);
             }
             if (in.src[1].kind == .gpr) try checkRead(c, in.src[1].num, false, false, slot0);
+            if (cas) {
+                if (in.src[1].kind != .gpr) return error.Unsupported;
+                try checkRead(c, in.src[1].num + 1, false, false, slot0);
+            }
             for (fibers) |f| {
                 const va = @as(u64, readFull(c, f, in.src[0].num + 1)) << 32 | readFull(c, f, in.src[0].num);
                 if (va & 3 != 0) return error.Fault;
@@ -958,23 +964,30 @@ fn execCat6(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
                 const bytes = c.mem.find(va, 4) orelse return faultAt(c, va);
                 const v = if (in.src[1].kind == .imm) in.src[1].imm else readFull(c, f, in.src[1].num);
                 const old = std.mem.readInt(u32, bytes[0..4], .little);
-                std.mem.writeInt(u32, bytes[0..4], atomicOp(in.op, in.ty, old, v), .little);
+                const new = if (cas) (if (old == readFull(c, f, in.src[1].num + 1)) v else old) else atomicOp(in.op, in.ty, old, v);
+                std.mem.writeInt(u32, bytes[0..4], new, .little);
                 writeReg(c, f, in.dst.num, false, old);
             }
             c.stats.global_bytes_read += fibers.len * 4;
             c.stats.global_bytes_written += fibers.len * 4;
             noteWrite(c, in.dst.num, false, .sy, slot0);
         },
-        .atomic_add, .atomic_sub, .atomic_xchg, .atomic_min, .atomic_max, .atomic_and, .atomic_or, .atomic_xor => {
+        .atomic_add, .atomic_sub, .atomic_xchg, .atomic_min, .atomic_max, .atomic_and, .atomic_or, .atomic_xor, .atomic_cmpxchg => {
+            const cas = in.op == .atomic_cmpxchg;
             if (in.src[0].kind == .gpr) try checkRead(c, in.src[0].num, false, false, slot0);
             if (in.src[1].kind == .gpr) try checkRead(c, in.src[1].num, false, false, slot0);
+            if (cas) {
+                if (in.src[1].kind != .gpr) return error.Unsupported;
+                try checkRead(c, in.src[1].num + 1, false, false, slot0);
+            }
             for (fibers) |f| {
                 const a = if (in.src[0].kind == .imm) in.src[0].imm else readFull(c, f, in.src[0].num);
                 if (a & 3 != 0 or @as(u64, a) + 4 > c.w.local_limit) return localFault(c, a);
                 const v = if (in.src[1].kind == .imm) in.src[1].imm else readFull(c, f, in.src[1].num);
                 const word = w.local[a..][0..4];
                 const old = std.mem.readInt(u32, word, .little);
-                std.mem.writeInt(u32, word, atomicOp(in.op, in.ty, old, v), .little);
+                const new = if (cas) (if (old == readFull(c, f, in.src[1].num + 1)) v else old) else atomicOp(in.op, in.ty, old, v);
+                std.mem.writeInt(u32, word, new, .little);
                 writeReg(c, f, in.dst.num, false, old);
             }
             noteWrite(c, in.dst.num, false, .ss, slot0);

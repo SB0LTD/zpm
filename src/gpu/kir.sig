@@ -30,9 +30,11 @@
 //!   ld            ty       offset    -          -        Mem
 //!   st            -        offset    value      -        Mem       ty = value's type
 //!   atom          int      offset    value      Atom     Mem       c = u(@intFromEnum(Atom)); dst = old
+//!   cas           int      offset    compare    value    Mem       dst = old; value stored where old == compare
 //!   barrier       -        -         -          -        -
 //!   shfl          ty       x         lane/mask  -        Shfl
 //!   vote          pred     p         -          -        Vote
+//!   ballot        u32      p         -          -        word      bit i: lane 32*word+i active with p
 //!   if            -        p         -          -        -
 //!   brk cont      -        p         -          -        -
 //!   else endif loop endloop ret: no operands.
@@ -122,7 +124,7 @@ pub const Op = enum(u8) {
     ld,
     st, // aux: Mem (space global|shared, width 8|16|32|64|128 bits, signed)
     // 64/128: dst/src is the first of 2/4 consecutive vregs (Kernel.vec)
-    atom, // aux: Mem; c: Atom (add, min, max, xchg; u32/i32); dst = old value
+    atom, // aux: Mem; c: Atom (add, min, max, xchg, and, or, xor; u32/i32); dst = old value
     barrier, // the whole group, with shared and global memory ordered
     shfl, // aux: Shfl (idx, xor, up, down); dst = a from lane (b)
     vote, // aux: Vote (any|all); dst (pred) over the subgroup's active lanes
@@ -135,7 +137,13 @@ pub const Op = enum(u8) {
     cont,
     endloop, // brk/cont: when a (pred) is true
     ret,
+    // (later ops: after ret, so the earlier ones keep their numbers)
+    cas, // aux: Mem (32 bits); dst = old; c stored where old == b; u32/i32
+    ballot, // aux: word 0..3; dst (u32) = the active lanes 32*aux.. where a (pred) holds
 };
+
+/// The last op (the binary form's bound).
+pub const LAST_OP = Op.ballot;
 
 /// (Not `extern`: Arg is a tagged union, which an extern struct cannot
 /// hold. A Binary for the interpreter carries instructions in the fixed
@@ -155,7 +163,7 @@ pub const Mem = packed struct(u32) {
     imm: u18,
 };
 pub const Shfl = enum(u8) { idx, xor, up, down };
-pub const Atom = enum(u8) { add, min, max, xchg };
+pub const Atom = enum(u8) { add, min, max, xchg, @"and", @"or", xor };
 pub const Vote = enum(u8) { any, all };
 
 pub const Error = error{
@@ -221,7 +229,7 @@ pub fn memRegs(m: Mem) u8 {
 pub fn writtenBindings(k: *const Kernel) u32 {
     var mask: u32 = 0;
     for (k.insts[0..k.n]) |in| switch (in.op) {
-        .st, .atom => {
+        .st, .atom, .cas => {
             const m: Mem = @bitCast(in.aux);
             if (m.space != .global) continue;
             mask |= if (m.binding < 32) @as(u32, 1) << @intCast(m.binding) else 0xffff_ffff;
@@ -459,6 +467,16 @@ pub const Kernel = struct {
     pub fn atomic(k: *Kernel, ty: Ty, kind: Atom, m: Mem, off: Arg, val: Arg) V {
         return k.opAux(.atom, ty, off, val, u(@intFromEnum(kind)), @bitCast(m));
     }
+    /// A compare-and-swap on the 32 bits at `off`: `val` stored where the
+    /// old value equals `expect`; returns the old value.
+    pub fn cas(k: *Kernel, ty: Ty, m: Mem, off: Arg, expect: Arg, val: Arg) V {
+        return k.opAux(.cas, ty, off, expect, val, @bitCast(m));
+    }
+    /// The subgroup's active lanes 32*word .. 32*word+31 where `p` holds,
+    /// bit i for lane 32*word+i.
+    pub fn ballot(k: *Kernel, p: Arg, word: u2) V {
+        return k.opAux(.ballot, .u32, p, no, no, word);
+    }
     pub fn barrier(k: *Kernel) void {
         k.emit(.{ .op = .barrier, .ty = .u32, .dst = .none, .a = no, .b = no, .c = no, .aux = 0 });
     }
@@ -542,7 +560,8 @@ fn shape(op: Op) Shape {
         .param => .{ .dst = .ty },
         .ld => .{ .dst = .ty, .a = .int },
         .st => .{ .dst = .none, .a = .int, .b = .ty },
-        .atom => .{ .dst = .int, .a = .int, .b = .int, .c = .int },
+        .atom, .cas => .{ .dst = .int, .a = .int, .b = .int, .c = .int },
+        .ballot => .{ .dst = .int, .a = .pred },
         .barrier => .{ .dst = .none },
         .shfl => .{ .dst = .ty, .a = .ty, .b = .int },
         .vote => .{ .dst = .pred, .a = .pred },
@@ -641,8 +660,12 @@ fn verifyKernel(k: *const Kernel, caps: ?Caps) Error!void {
                 if (in.ty == .pred) return error.BadType;
             },
             .vote => if (in.aux > @intFromEnum(Vote.all)) return error.BadOperand,
+            .ballot => {
+                if (in.aux > 3) return error.BadOperand;
+                if (in.ty != .u32) return error.BadType;
+            },
             .ffma => if (caps) |cp| if (!cp.fused_fma) return error.NeedsFusedFma,
-            .ld, .st, .atom => try checkMem(k, in),
+            .ld, .st, .atom, .cas => try checkMem(k, in),
             .@"if" => {
                 if (depth == MAX_DEPTH) return error.Unbalanced;
                 stack[depth] = 0;
@@ -681,7 +704,7 @@ fn verifyKernel(k: *const Kernel, caps: ?Caps) Error!void {
             if (!isInt(in.ty)) return error.BadType;
         }
         if ((in.op == .iabs) and in.ty != .i32) return error.BadType;
-        if (in.op == .atom and !isInt(in.ty)) return error.BadType;
+        if ((in.op == .atom or in.op == .cas) and !isInt(in.ty)) return error.BadType;
         if (in.op == .ld or in.op == .st) if (in.ty == .pred) return error.BadType;
         // the destination
         if (s.dst != .none) {
@@ -713,7 +736,7 @@ fn verifyKernel(k: *const Kernel, caps: ?Caps) Error!void {
         }
         if (in.op == .atom) {
             switch (in.c) {
-                .imm => |x| if (x > @intFromEnum(Atom.xchg)) return error.BadOperand,
+                .imm => |x| if (x > @intFromEnum(Atom.xor)) return error.BadOperand,
                 .reg => return error.BadOperand,
             }
         }
@@ -726,7 +749,7 @@ fn checkMem(k: *const Kernel, in: Inst) Error!void {
     if ((in.aux >> 8) & 3 > 1) return error.BadOperand;
     const m: Mem = @bitCast(in.aux);
     if (m.width_log2 < 3) return error.BadOperand;
-    if (in.op == .atom and m.width_log2 != 5) return error.BadOperand;
+    if ((in.op == .atom or in.op == .cas) and m.width_log2 != 5) return error.BadOperand;
     switch (m.space) {
         .global => if (m.binding >= k.bindings) return error.BadBinding,
         .shared => {
@@ -779,7 +802,7 @@ pub fn encodeInst(in: Inst, out: *[INST_BYTES]u8) void {
 }
 
 pub fn decodeInst(b: *const [INST_BYTES]u8) error{BadOperand}!Inst {
-    if (b[0] > @intFromEnum(Op.ret) or b[1] > @intFromEnum(Ty.pred)) return error.BadOperand;
+    if (b[0] > @intFromEnum(LAST_OP) or b[1] > @intFromEnum(Ty.pred)) return error.BadOperand;
     var args: [3]Arg = undefined;
     for (0..3) |ix| {
         const word = std.mem.readInt(u32, b[8 + 4 * ix ..][0..4], .little);
@@ -839,11 +862,30 @@ pub fn expand(src: *const Kernel, caps: Caps, s: Storage) Error!Kernel {
         switch (in.op) {
             .fdiv => expandDiv(&k, caps, in.dst, in.a, in.b),
             .fsqrt => expandSqrt(&k, caps, in.dst, in.a),
+            .ballot => expandBallot(&k, in.dst, in.a, @intCast(in.aux & 3)),
             else => k.emit(in),
         }
     }
     if (k.err) |e| return e;
     return k;
+}
+
+/// dst = ballot(p) over lanes 32*word.. from votes alone, for targets
+/// without a native ballot (kir.expand's): bit i is a vote among the
+/// active lanes of whether lane 32*word+i is one where p holds. Every
+/// register written once.
+pub fn expandBallot(k: *Kernel, dst: V, p: Arg, word: u2) void {
+    const ln = k.lane();
+    var acc: Arg = u(0);
+    for (0..32) |bit| {
+        const at = @as(u32, word) * 32 + @as(u32, @intCast(bit));
+        const me = k.cmp(.u32, .eq, r(ln), u(at));
+        const both = k.op2(.pand, .pred, r(me), p);
+        const v = k.vote(.any, r(both));
+        const m = k.sel(.u32, r(v), u(@as(u32, 1) << @intCast(bit)), u(0));
+        acc = r(k.op2(.@"or", .u32, acc, r(m)));
+    }
+    k.emit(.{ .op = .mov, .ty = .u32, .dst = dst, .a = acc, .b = no, .c = no, .aux = 0 });
 }
 
 // How the expansions work (docs/GPU.md has the proofs' outline):

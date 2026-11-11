@@ -1538,6 +1538,78 @@ test "atomics, barriers, shuffles, votes" {
     }
 }
 
+test "atomics and, or, xor and compare-and-swap (CAS loops, global and shared); ballots" {
+    const caps = caseCaps(false);
+    fillInts(0xca5);
+    var k = newKernel("cas", .{ 64, 1, 1 });
+    const A = k.binding();
+    const Bb = k.binding();
+    _ = k.binding();
+    const O = k.binding();
+    k.shared_bytes = 16;
+    const t = lin(&k);
+    const tid = k.tid(0);
+    const off = k.op2(.shl, .u32, r(t), u(2));
+    const x = k.load(.u32, kir.global(A, 32), r(off));
+    const y = k.load(.u32, kir.global(Bb, 32), r(off));
+    const g = kir.global(O, 32);
+    _ = k.atomic(.u32, .@"or", g, u(0), r(x));
+    _ = k.atomic(.u32, .xor, g, u(4), r(x));
+    // (thread 0 sets the shared words: and's all ones)
+    const first = k.cmp(.u32, .eq, r(tid), u(0));
+    k.ifp(r(first));
+    k.store(.u32, kir.shared(32), u(0), u(0xffff_ffff));
+    k.store(.u32, kir.shared(32), u(4), u(0));
+    k.store(.u32, kir.shared(32), u(8), u(0));
+    k.store(.u32, kir.shared(32), u(12), u(0));
+    k.endif();
+    k.barrier();
+    _ = k.atomic(.u32, .@"and", kir.shared(32), u(0), r(x));
+    _ = k.atomic(.u32, .@"or", kir.shared(32), u(4), r(y));
+    _ = k.atomic(.u32, .xor, kir.shared(32), u(8), r(y));
+    // an increment by compare-and-swap, every lane contending (the
+    // returned word is the next guess)
+    for ([_]kir.Mem{ g, kir.shared(32) }, [_]u32{ 8, 12 }) |m, at| {
+        const exp = k.mov(.u32, u(0));
+        k.loop();
+        const got = k.cas(.u32, m, u(at), r(exp), r(k.op2(.iadd, .u32, r(exp), u(1))));
+        k.brk(r(k.cmp(.u32, .eq, r(got), r(exp))));
+        k.set(exp, .mov, r(got), kir.no, kir.no);
+        k.endloop();
+    }
+    k.barrier();
+    k.ifp(r(first));
+    const ob = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(k.gid(0)), u(4))), u(16));
+    const s0 = k.load(.u32, kir.shared(128), u(0));
+    k.store(.u32, kir.global(O, 128), r(ob), r(s0));
+    k.endif();
+    // each lane's own word: stored, then swapped where it matches (odd
+    // lanes) and kept (even ones); the old word returned
+    var own = kir.global(O, 32);
+    own.imm = 64;
+    k.store(.u32, own, r(off), r(x));
+    const odd = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(t), u(1))), u(0));
+    const want = k.sel(.u32, r(odd), r(x), r(k.op2(.iadd, .u32, r(x), u(1))));
+    const old = k.cas(.u32, own, r(off), r(want), r(y));
+    var m = kir.global(O, 32);
+    m.imm = 64 + 4 * NT;
+    k.store(.u32, m, r(off), r(old));
+    // ballots: the whole warp, the second word (none on a warp of 32), and
+    // in a divergent if
+    const p = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(x), u(1))), u(0));
+    m.imm = 64 + 8 * NT;
+    k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
+    m.imm = 64 + 12 * NT;
+    k.store(.u32, m, r(off), r(k.ballot(r(p), 1)));
+    k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(y), u(2))), u(0))));
+    m.imm = 64 + 16 * NT;
+    k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
+    k.endif();
+    try same(caps, &k, .{ 2, 1, 1 }, &.{}, 16 + 5 * NT, null);
+    try std.testing.expectEqual(@as(u32, 2 * 64), X.ref[2]);
+    try std.testing.expectEqual(@as(u32, 64), X.ref[4 + 3]);
+}
+
 test "control flow: divergent ifs, loops with brk and cont, nesting, an early ret" {
     for ([_]bool{ false, true }) |flush| {
         const caps = caseCaps(flush);

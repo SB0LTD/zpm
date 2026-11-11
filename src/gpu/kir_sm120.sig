@@ -605,9 +605,9 @@ const Ctx = struct {
 
     fn uniformOp(c: *const Ctx, in: kir.Inst) bool {
         switch (in.op) {
-            .tid, .lane, .atom => return false,
+            .tid, .lane, .atom, .cas => return false,
             .gid, .gsize, .subgroup, .param => return true,
-            .vote => return true,
+            .vote, .ballot => return true,
             .shfl => return @as(kir.Shfl, @enumFromInt(in.aux)) == .idx and c.uniformArg(in.b),
             else => {},
         }
@@ -1030,7 +1030,7 @@ const Ctx = struct {
         var used = [_]bool{false} ** 256;
         for (c.insts()) |in| {
             switch (in.op) {
-                .ld, .st, .atom => {
+                .ld, .st, .atom, .cas => {
                     const m: kir.Mem = @bitCast(in.aux);
                     if (m.space == .global) {
                         used[m.binding] = true;
@@ -1061,14 +1061,14 @@ const Ctx = struct {
         if (to - from > limit) return false;
         for (c.w.insts[from..to]) |in| {
             switch (in.op) {
-                .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .fdiv, .fsqrt => return false,
+                .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .ballot, .fdiv, .fsqrt => return false,
                 .sel, .pand, .por, .pnot, .icmp, .fcmp => return false,
                 else => {},
             }
             // (a few ops lower to several instructions with predicates of
             // their own)
             if (in.op == .bfe and !(in.b == .imm and in.c == .imm)) return false;
-            if (in.op == .atom) return false;
+            if (in.op == .atom or in.op == .cas) return false;
         }
         return true;
     }
@@ -1409,6 +1409,7 @@ const Ctx = struct {
             .ld => try c.load(in),
             .st => try c.store(in),
             .atom => try c.atom(in),
+            .cas => try c.cas(in),
             .barrier => try c.eff("BAR.SYNC.DEFER_BLOCKING", 0, &.{.{ .imm = 0 }}),
             .shfl => {
                 const mode: kir.Shfl = @enumFromInt(in.aux);
@@ -1440,6 +1441,13 @@ const Ctx = struct {
                 const p = try c.pred(in.a);
                 try c.drainIfDivergent();
                 try c.eff(name, 1, &.{ pdst(in), p });
+            },
+            .ballot => {
+                // (a warp of 32: words past the first are 0)
+                if (in.aux != 0) return c.ins("MOV", 1, &.{ c.dst(in), .{ .imm = 0 } });
+                const p = try c.pred(in.a);
+                try c.drainIfDivergent();
+                try c.eff("VOTE.ANY", 2, &.{ c.dst(in), .{ .pt = true }, p });
             },
             .fsqrt => try c.sqrtNative(in),
             .fdiv => return error.Unsupported,
@@ -1951,6 +1959,9 @@ const Ctx = struct {
                 .min => if (sgn) "ATOMG.E.MIN.S32.STRONG.GPU" else "ATOMG.E.MIN.STRONG.GPU",
                 .max => if (sgn) "ATOMG.E.MAX.S32.STRONG.GPU" else "ATOMG.E.MAX.STRONG.GPU",
                 .xchg => "ATOMG.E.EXCH.STRONG.GPU",
+                .@"and" => "ATOMG.E.AND.STRONG.GPU",
+                .@"or" => "ATOMG.E.OR.STRONG.GPU",
+                .xor => "ATOMG.E.XOR.STRONG.GPU",
             };
             try c.eff(name, 2, &.{ .{ .pt = true }, c.dst(in), ad, v });
         } else {
@@ -1960,8 +1971,29 @@ const Ctx = struct {
                 .min => if (sgn) "ATOMS.MIN.S32" else "ATOMS.MIN",
                 .max => if (sgn) "ATOMS.MAX.S32" else "ATOMS.MAX",
                 .xchg => "ATOMS.EXCH",
+                .@"and" => "ATOMS.AND",
+                .@"or" => "ATOMS.OR",
+                .xor => "ATOMS.XOR",
             };
             try c.eff(name, 1, &.{ c.dst(in), ad, v });
+        }
+    }
+
+    /// A compare-and-swap: ptxas's atom.cas.b32. The global form has no
+    /// descriptor (its Rc takes the descriptor's bits): the plain 64-bit
+    /// address, [Ra+offset].
+    fn cas(c: *Ctx, in: kir.Inst) Error!void {
+        const m: kir.Mem = @bitCast(in.aux);
+        const expect = try c.reg(in.b);
+        const v = try c.reg(in.c);
+        if (m.space == .global) {
+            var ad = try c.gaddr(m, in.a);
+            ad.mem.desc = false;
+            ad.mem.wide = false;
+            try c.eff("ATOMG.E.CAS.STRONG.GPU", 2, &.{ .{ .pt = true }, c.dst(in), ad, expect, v });
+        } else {
+            const ad = try c.saddr(m, in.a);
+            try c.eff("ATOMS.CAS", 1, &.{ c.dst(in), ad, expect, v });
         }
     }
 

@@ -720,6 +720,14 @@ const Cx = struct {
         return false;
     }
 
+    /// Encoding: whether `m` is among the modifiers written (none taken).
+    fn written(cx: *const Cx, m: []const u8) bool {
+        for (cx.in.mods[0..cx.in.n_mods]) |x| {
+            if (std.mem.eql(u8, x, m)) return true;
+        }
+        return false;
+    }
+
     fn addMod(cx: *Cx, m: []const u8) Error!void {
         if (cx.in.n_mods == MAX_MODS) return error.Unknown;
         cx.in.mods[cx.in.n_mods] = m;
@@ -2281,6 +2289,7 @@ const ATOM_TYPES = [_][]const u8{ "", "S32", "?", "?", "?", "?", "?", "?" };
 /// printed. The form without a descriptor ([Ra.64+URb], bit 76 clear) is
 /// not covered.
 fn cAtomg(cx: *Cx) Error!void {
+    if (cx.enc() and cx.written("CAS")) return cAtomgCas(cx);
     cx.put(0, 12, 0x9a8);
     try cx.always("E");
     cx.put(72, 1, 1);
@@ -2301,12 +2310,42 @@ fn cAtomg(cx: *Cx) Error!void {
 /// atom.shared). The offset is 24 bits at 40; the address's scale (78..79:
 /// .X4 ..) and the uniform register's form (0x98c) are not covered.
 fn cAtoms(cx: *Cx) Error!void {
+    if (cx.enc() and cx.written("CAS")) return cAtomsCas(cx);
     cx.put(0, 12, 0x38c);
     _ = try cx.mod(87, 4, &ATOM_OPS);
     _ = try cx.mod(73, 3, &ATOM_TYPES);
     _ = try cx.reg(16);
     _ = try cx.addr(.{});
     _ = try cx.reg(32);
+}
+
+/// ATOMG.E.CAS(.S32).order Pd, Rd, [Ra+offset], Rb, Rc: ptxas's
+/// atom.global.cas.b32, Rc stored where the old word equals Rb. No
+/// descriptor (Rc has its bits) and no .64: the address is 64 bits, the
+/// offset 24 bits at 40.
+fn cAtomgCas(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x3a9);
+    try cx.always("E");
+    cx.put(72, 1, 1);
+    try cx.always("CAS");
+    _ = try cx.mod(84, 3, &.{ "?", "" });
+    _ = try cx.mod(73, 3, &ATOM_TYPES);
+    try cx.modParts(77, 4, &ORDERS);
+    _ = try cx.pred(81, false);
+    _ = try cx.reg(16);
+    _ = try cx.addr(.{});
+    _ = try cx.reg(32);
+    _ = try cx.reg(64);
+}
+
+/// ATOMS.CAS Rd, [Ra+offset], Rb, Rc: ptxas's atom.shared.cas.b32.
+fn cAtomsCas(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x38d);
+    try cx.always("CAS");
+    _ = try cx.reg(16);
+    _ = try cx.addr(.{});
+    _ = try cx.reg(32);
+    _ = try cx.reg(64);
 }
 
 /// I2FP.F32.U32 / .S32 Rd, b (sm_90's integer to float)
@@ -2460,6 +2499,8 @@ const FORMS = [_]Form{
     .{ .name = "FRND", .opcode = 0x107, .alu = true, .codec = cFrnd },
     .{ .name = "ATOMG", .opcode = 0x9a8, .codec = cAtomg },
     .{ .name = "ATOMS", .opcode = 0x38c, .codec = cAtoms },
+    .{ .name = "ATOMG", .opcode = 0x3a9, .codec = cAtomgCas },
+    .{ .name = "ATOMS", .opcode = 0x38d, .codec = cAtomsCas },
     .{ .name = "F2IP", .opcode = 0x043, .alu = true, .codec = cF2ip },
 };
 
@@ -2871,7 +2912,7 @@ pub fn highestGpr(in: *const Instr) ?u8 {
     for (in.operands(), 0..) |o, i| {
         const t: u8 = switch (o) {
             .gpr => |g| if (g.n != RZ) g.n + regsAt(in, i) - 1 else continue,
-            .addr => |a| if (a.reg != RZ) a.reg + @as(u8, if (a.wide) 1 else 0) else continue,
+            .addr => |a| if (a.reg != RZ) a.reg + @as(u8, if (a.wide or (eql(in.op, "ATOMG") and in.has("CAS"))) 1 else 0) else continue,
             .cbuf => |c| if (c.reg != RZ and !c.ureg) c.reg else continue,
             else => continue,
         };
@@ -3185,7 +3226,7 @@ test "FRND and the 32-bit atomics: ptxas's words and nvdisasm's (testdata/sm120_
         try testing.expectEqual(hi, w.hi());
         try testing.expectEqual(lo, w.lo());
     }
-    try testing.expectEqual(@as(usize, 46), n);
+    try testing.expectEqual(@as(usize, 52), n);
     // what nvdisasm calls illegal, or prints without a field, is refused
     const frnd = Word.of(0x0000000a00087307, 0x000fe20000205000);
     for ([_]struct { u7, u7, u64 }{ .{ 75, 2, 1 }, .{ 84, 2, 1 }, .{ 73, 1, 1 }, .{ 72, 1, 1 }, .{ 77, 1, 1 } }) |f| {
