@@ -53,9 +53,11 @@
 //!   its encode (G_EWAIT) and fills the segment.
 //! - **BeginPicture** takes the input surface and the next frame slot;
 //!   **RenderPicture** hands each buffer to encode.take; **EndPicture**
-//!   brings the surface's linear picture up to date (a decode into it
-//!   since: converted), tiles the input (the linear picture into its
-//!   block-linear buffer, which the engine reads), writes the headers, the setup and
+//!   has the engine read the input's block-linear planes where they are
+//!   (a decode into it waited for; an app's CPU write into its linear copy
+//!   converted back by the converter; an imported block-linear dma-buf
+//!   read in place, a linear or RGB one converted on the GPU first:
+//!   enc_import.sig, enc_rgb.sig), writes the headers, the setup and
 //!   the pushbuffer, and submits it on the encoder channel (G_ESUBMIT).
 //!   The reconstructed and reference pictures live in their surfaces'
 //!   block-linear buffers, in the engine's own layout.
@@ -1634,7 +1636,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             return va.SUCCESS;
         }
 
-        /// An encode's picture: the input tiled, the headers, setup and
+        /// An encode's picture: the input current, the headers, setup and
         /// pushbuffer made (encode.end), submitted on the encoder channel.
         fn endEncode(d: *Self, ci: u8, c: *Context) va.Status {
             const si = c.target;

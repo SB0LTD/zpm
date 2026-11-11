@@ -39,8 +39,9 @@
 //!   Tegra or the C model's "naive" BL: nothing else). A block-linear
 //!   surface is read where it is (any block height: `input_cfg_block_height`
 //!   is log2 of GOBs per block, as NVIDIA's DRM modifier says it); a
-//!   pitch-linear picture needs a pass into block linear first (enc_input.sig
-//!   decides; `tileNv12` is the CPU's pass, kept for a GPU without one).
+//!   pitch-linear picture needs a pass into block linear first (the
+//!   driver's converter, the GPU's in the library; `tileNv12` is the CPU's
+//!   pass, kept for tests).
 //! - rate control: SET_CONTROL_PARAMS' RCMODE (nvenc_drv.h 3.1: 0 constant
 //!   QP, 1 picture-level VBR, 2 picture-level CBR, 3 VBR with a minimum
 //!   QP, 17..19 the same per macroblock row, 32 activity based) with the

@@ -850,3 +850,34 @@ test "enc: an RGB dma-buf (screen capture) converted by the converter's GPU path
     desc.objects[0].fd = @intCast(100 + px2.handle);
     try testing.expectEqual(va.ERROR_UNSUPPORTED_MEMORY_TYPE, d2.createSurfaces(va.RT_FORMAT_YUV420, 48, 32, &in, &attrs));
 }
+
+test "enc: GALAXY_VA_NVENC_RC=firmware: RCMODE CBR and the rate control struct, the persistent state started" {
+    var k = Fake{ .encoder = fakeEncode };
+    var f = ImportFake{ .k = &k };
+    seen = .{};
+    var d: D = .{ .node = .{ .sys = &f } };
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .nvenc_rc_firmware = true }));
+    defer d.terminate();
+    var cfg: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createConfig(va.PROFILE_H264_HIGH, ve.ENTRYPOINT_ENC_SLICE, &.{.{ .type = ve.ATTRIB_RATE_CONTROL, .value = ve.RC_CBR }}, &cfg));
+    var s: [2]u32 = undefined;
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, 40, 24, &s, &.{}));
+    var ctx: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createContext(cfg, 40, 24, &ctx));
+    var coded: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(ve.ENC_CODED_BUFFER, 1 << 20, 1, null, &coded));
+    var seq = h264Seq();
+    seq.bits_per_second = 800_000;
+    const pic = enc_h264.testPic(s[1], coded, true, 0);
+    const sl = slice264(2, 0, null, null);
+    try picture(&d, ctx, s[0], &.{ buf(ve.ENC_SEQUENCE_PARAMETER_BUFFER, &seq), buf(ve.ENC_PICTURE_PARAMETER_BUFFER, &pic), buf(ve.ENC_SLICE_PARAMETER_BUFFER, &sl) });
+    try testing.expectEqual(nvenc.CODEC_TYPE_H264 | nvenc.CONTROL_GPTIMER_ON | (nvenc.RCMODE_CBR << 24), seen.methods[nvenc.SET_CONTROL_PARAMS >> 2]);
+    try testing.expectEqual(@as(u64, 800_000), nvenc.get(&seen.setup, nvenc.H264.rc_nal_bitrate));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&seen.setup, nvenc.H264.rc_hrd_type));
+    // the RC process buffer's state: the CPB three quarters full (28.4)
+    const c = &d.contexts[ctx - driver.CONTEXT_BASE];
+    const st = c.work.bytes()[c.scratch_off + c.enc_scratch.rc_off ..];
+    try testing.expectEqual(@as(u64, 600_000 * 16), nvenc.get(st, nvenc.Persistent.nal_cpb_fullness));
+    try testing.expectEqual(va.SUCCESS, d.destroyBuffer(coded));
+    try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
+}

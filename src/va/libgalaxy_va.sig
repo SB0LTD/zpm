@@ -28,13 +28,17 @@
 //! - every table entry libva 2.22 checks is set (subpictures, display
 //!   attributes, PutSurface answer UNIMPLEMENTED or nothing);
 //! - encoding on the RTX's NVENC (encode.sig): the EncSlice entrypoint for
-//!   H.264 (Constrained Baseline, Main, High) and HEVC Main, the config
-//!   attributes FFmpeg's vaapi_encode asks (rate control CQP, CBR, VBR;
-//!   packed sequence, misc and raw headers; one L0 reference; up to 16
-//!   slices), coded buffers and their segments, PutImage (how an app
-//!   fills a surface to encode), SyncBuffer; the input tiled on the CPU,
-//!   the parameter sets written here, the engine's setup and pushbuffer
-//!   submitted with G_ESUBMIT (host-tested against a fake encoder).
+//!   H.264 (Constrained Baseline, Main, High), HEVC Main and AV1 Profile
+//!   0, the config attributes FFmpeg's vaapi_encode asks (rate control
+//!   CQP, CBR, VBR: the driver's HRD-bound controller, enc_rc.sig, or the
+//!   firmware's with GALAXY_VA_NVENC_RC=firmware; packed headers; B
+//!   pictures, 4 L0 and 1 L1 references (AV1: 4 and 3); up to 16 slices,
+//!   one AV1 tile), coded buffers and their segments (CBR's filler),
+//!   PutImage, surfaces over an app's dma-bufs (NV12 linear or NVIDIA
+//!   block linear, RGB converted on the GPU: enc_rgb.sig), SyncBuffer;
+//!   the input read where it lies, the parameter sets and OBU headers
+//!   written here, the engine's setup and pushbuffer submitted with
+//!   G_ESUBMIT (host-tested against a pretend encoder: enc_test.sig).
 //!
 //! Untested until a boot (encode): that GB206's NVCFB7 takes Ada's NVC9B7
 //! methods and nvenc_drv.h's structs (its magic word, ASSUMED 0xcfb70006,

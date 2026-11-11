@@ -16,7 +16,8 @@
 //!
 //! The input picture is the engine's as it lies in memory (`Input`: block
 //! linear planes, any block height); a picture that needs a pass first
-//! (pitch linear) has had it before EndPicture gets here (enc_input.sig).
+//! (pitch linear, RGB) has had it, on the GPU, before EndPicture gets
+//! here (driver.sig, enc_import.sig, enc_rgb.sig).
 //!
 //! References: VA names the surfaces; each surface that is or becomes a
 //! reference keeps an entry in `kept` while VA's lists name it, and the
