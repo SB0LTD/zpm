@@ -1107,6 +1107,7 @@ fn checkCode(p: *const Program, log: *glsl.pp.Log, quads: *bool) bool {
         for (io.position) |v| {
             if (v != .none) k.store(.f32, kir.global(io.uniforms, 32), kir.u(0), kir.r(v));
         }
+        if (io.point_size != .none) k.store(.f32, kir.global(io.uniforms, 32), kir.u(0), kir.r(io.point_size));
         k.finish() catch |err| return codeFailed(log, "vertex", @errorName(err));
     }
     {
@@ -1117,6 +1118,7 @@ fn checkCode(p: *const Program, log: *glsl.pp.Log, quads: *bool) bool {
         for (&io.varying) |*v| v.* = k.reg(.f32);
         for (&io.frag_coord) |*v| v.* = k.reg(.f32);
         io.front_facing = k.reg(.pred);
+        io.point_coord = .{ k.reg(.f32), k.reg(.f32) };
         io.quads = true;
         io.odd_x = k.reg(.pred);
         io.odd_y = k.reg(.pred);
@@ -1126,6 +1128,13 @@ fn checkCode(p: *const Program, log: *glsl.pp.Log, quads: *bool) bool {
         for (io.color) |v| {
             if (v != .none) k.store(.f32, kir.global(io.uniforms, 32), kir.u(0), kir.r(v));
         }
+        // (the other outputs, gl_FragDepth: their code checked too)
+        for (io.colors[1..]) |cs| {
+            for (cs) |v| {
+                if (v != .none) k.store(.f32, kir.global(io.uniforms, 32), kir.u(0), kir.r(v));
+            }
+        }
+        if (io.depth != .none) k.store(.f32, kir.global(io.uniforms, 32), kir.u(0), kir.r(io.depth));
         k.finish() catch |err| return codeFailed(log, "fragment", @errorName(err));
     }
     return true;
