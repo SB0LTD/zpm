@@ -20,6 +20,10 @@
 //!   $DISPLAY at its first window surface (or native visual asked), so
 //!   Firefox on X11 (which asks EGL_DEFAULT_DISPLAY for everything,
 //!   window surfaces and its GPU process's offscreen contexts) draws there.
+//!   A gbm_device (gbm.sig: eglGetDisplay of one, or EGL_PLATFORM_GBM_KHR)
+//!   is a GBM display: surfaceless contexts, pbuffers, window surfaces of
+//!   gbm_surfaces, and EGL_KHR_image_pixmap's images of gbm_bos
+//!   (Xwayland's glamor).
 //! - **Configs.** Four: ARGB8888 and XRGB8888 (DRM's fourcc is the native
 //!   visual), each with and without depth 24 + stencil 8; windows and
 //!   pbuffers; OpenGL ES 2 and 3. eglChooseConfig matches and sorts as

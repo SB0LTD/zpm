@@ -752,10 +752,18 @@ pub const Checker = struct {
         c.push();
         var i = c.node(root).a;
         while (i != 0) : (i = c.node(i).next) c.external(i);
-        if (c.stage == .fragment and c.version >= 300 and c.noutputs > 1) {
+        // (several outputs the shader uses: each needs its location. One
+        // unused does not count, as Mesa links them: glamor's GLES 3
+        // glyphs declare color0 and color1 for dual-source blending and
+        // write frag_color alone)
+        if (c.stage == .fragment and c.version >= 300) {
+            var active: usize = 0;
             for (c.outputs[0..c.noutputs]) |o| {
-                if (o.loc < 0) c.log.err(o.line, "with several outputs, `{s}` needs a layout location", .{o.name});
+                if (c.syms[o.sym].used) active += 1;
             }
+            if (active > 1) for (c.outputs[0..c.noutputs]) |o| {
+                if (o.loc < 0 and c.syms[o.sym].used) c.log.err(o.line, "with several outputs, `{s}` needs a layout location", .{o.name});
+            };
         }
         if (c.uses_frag_color and c.uses_frag_data) c.log.err(0, "gl_FragColor and gl_FragData both written", .{});
     }
@@ -1860,7 +1868,9 @@ test "sema: what GLSL ES forbids" {
     try expectErr(H ++ "void main() { break; }", .vertex, "break outside a loop or switch");
     try expectErr(H ++ "float f() { return 1; } void main() {}", .vertex, "returns int, the function float");
     try expectErr("#version 300 es\nout vec4 o; void main() { o = vec4(0.0); }", .fragment, "no precision for float");
-    try expectErr(H ++ "out vec4 a; out vec4 b; void main() {}", .fragment, "needs a layout location");
+    try expectErr(H ++ "out vec4 a; out vec4 b; void main() { a = vec4(0.0); b = vec4(1.0); }", .fragment, "needs a layout location");
+    // (one of them unused: no matter, as Mesa links it)
+    try std.testing.expectEqualStrings("", testCheck(H ++ "out vec4 a; out vec4 b; void main() { a = vec4(0.0); }", .fragment));
     try expectErr(H ++ "void main() { int a[2]; int x = a[2]; }", .vertex, "index 2 is out of range");
     try expectErr(H ++ "void main() { const int k; }", .vertex, "const `k` needs an initializer");
     try expectErr(H ++ "in vec4 v; void main() { v = vec4(0.0); }", .vertex, "`v` is an input: read only");
