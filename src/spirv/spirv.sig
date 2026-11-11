@@ -1,4 +1,4 @@
-//! @zpm/spirv — SPIR-V compute shaders to KIR.
+//! @zpm/spirv — SPIR-V compute, vertex and fragment shaders to KIR.
 //!
 //! The front end of Galaxy's Vulkan driver (src/vk): a GLCompute entry
 //! point of a SPIR-V module becomes one KIR kernel (docs/GPU.md), which
@@ -43,12 +43,26 @@
 //!   may return early runs inside a KIR loop that a return leaves (through
 //!   inner loops by a flag). The entry point's own return is KIR's `ret`.
 //!
+//! # Vertex and fragment stages
+//!
+//! A graphics stage is not a kernel of its own: `Gen.emitStage` emits its
+//! code into the kernel gfxapi's raster is building (its vertex kernel, its
+//! tile kernel), through a `StageIO`: the inputs (vertex attributes by
+//! location, the varyings, built-ins) as the raster's registers, the
+//! outputs (the position, the varyings, the colour of one location) as
+//! registers the raster then reads. Buffers are KIR bindings after the
+//! raster's own (`StageIO.buffers`), their views (offset, range) words of
+//! the draw's uniform binding, as are push constants. Images and samplers
+//! become texture slots (an image with its sampler, or alone) read through
+//! the caller's `TexOps` (gfxapi's texture.sig in src/vk). `Resources`
+//! gathers, over both stages, what the pipeline binds.
+//!
 //! Not yet (an error with a message, `Gen.diag`): 64-bit and 16-bit types,
-//! images and samplers, subgroup operations, atomic and/or/xor and
+//! storage images, gathers, binding arrays, FragDepth, subgroup operations, atomic and/or/xor and
 //! compare-exchange (KIR's atomics are add, min, max and exchange),
 //! pointers as values beyond function arguments (OpPtrAccessChain,
 //! variable pointers), spec constant operations, stages other than
-//! GLCompute.
+//! GLCompute, Vertex and Fragment.
 //!
 //! Allocation-free: every table is the caller's (`Scratch`, the kernel's
 //! `kir.Storage`).
@@ -153,6 +167,24 @@ pub const Op = struct {
     pub const composite_insert = 82;
     pub const copy_object = 83;
     pub const transpose = 84;
+    pub const sampled_image = 86;
+    pub const image_sample_implicit_lod = 87;
+    pub const image_sample_explicit_lod = 88;
+    pub const image_sample_dref_implicit_lod = 89;
+    pub const image_sample_dref_explicit_lod = 90;
+    pub const image_sample_proj_implicit_lod = 91;
+    pub const image_sample_proj_explicit_lod = 92;
+    pub const image_fetch = 95;
+    pub const image_gather = 96;
+    pub const image_dref_gather = 97;
+    pub const image_read = 98;
+    pub const image_write = 99;
+    pub const image = 100;
+    pub const image_query_size_lod = 103;
+    pub const image_query_size = 104;
+    pub const image_query_lod = 105;
+    pub const image_query_levels = 106;
+    pub const image_query_samples = 107;
     pub const convert_f_to_u = 109;
     pub const convert_f_to_s = 110;
     pub const convert_s_to_f = 111;
@@ -229,6 +261,15 @@ pub const Op = struct {
     pub const bit_field_u_extract = 203;
     pub const bit_reverse = 204;
     pub const bit_count = 205;
+    pub const dpdx = 207;
+    pub const dpdy = 208;
+    pub const fwidth = 209;
+    pub const dpdx_fine = 210;
+    pub const dpdy_fine = 211;
+    pub const fwidth_fine = 212;
+    pub const dpdx_coarse = 213;
+    pub const dpdy_coarse = 214;
+    pub const fwidth_coarse = 215;
     pub const control_barrier = 224;
     pub const memory_barrier = 225;
     pub const atomic_load = 227;
@@ -263,6 +304,7 @@ pub const Op = struct {
     pub const decorate_id = 332;
     pub const copy_logical = 400;
     pub const terminate_invocation = 4416;
+    pub const demote_to_helper_invocation = 5380;
     pub const decorate_string = 5632;
     pub const member_decorate_string = 5633;
 };
@@ -286,13 +328,28 @@ const Deco = struct {
     const row_major = 4;
     const array_stride = 6;
     const matrix_stride = 7;
+    const flat = 14;
     const builtin = 11;
+    const location = 30;
+    const component = 31;
     const binding = 33;
     const descriptor_set = 34;
     const offset = 35;
 };
 
 const BuiltIn = struct {
+    const position = 0;
+    const point_size = 1;
+    const clip_distance = 3;
+    const cull_distance = 4;
+    const frag_coord = 15;
+    const front_facing = 17;
+    const sample_id = 18;
+    const sample_mask = 20;
+    const frag_depth = 22;
+    const helper_invocation = 23;
+    const vertex_index = 42;
+    const instance_index = 43;
     const num_workgroups = 24;
     const workgroup_size = 25;
     const workgroup_id = 26;
@@ -381,6 +438,8 @@ pub const SpecEntry = struct { id: u32, offset: u32, size: u32 };
 pub const Options = struct {
     /// robustBufferAccess: loads past a binding's range read 0, stores past it are dropped
     robust: bool = true,
+    /// the entry point's stage (compute: Gen.compile; vertex, fragment: Gen.emitStage)
+    stage: Stage = .compute,
     spec: []const SpecEntry = &.{},
     spec_data: []const u8 = &.{},
 };
@@ -402,6 +461,117 @@ pub const Info = struct {
     }
 };
 
+/// The shader stage an entry point is compiled for.
+pub const Stage = enum(u8) { compute, vertex, fragment };
+
+pub const SetBinding = struct { set: u32, binding: u32 };
+
+/// Texture slots a graphics pipeline may have (gfxapi's texture.MAX_TEX).
+pub const MAX_TEX = 16;
+/// Vertex input locations, and scalar varyings (four a location).
+pub const MAX_ATTRS = 16;
+pub const MAX_VARYINGS = 64;
+
+/// A texture slot: an image with the sampler it is sampled through, or an
+/// image alone (fetched, its size asked).
+pub const TexSlot = struct { image: SetBinding, sampler: SetBinding, has_sampler: bool };
+
+/// What a graphics pipeline's stages use, gathered as each compiles once
+/// (`frozen` off), then fixed (`frozen` on: a use not listed is an error):
+/// buffers and texture slots in the order first used, shared by the stages.
+pub const Resources = struct {
+    bufs: [MAX_BINDINGS]Binding = undefined,
+    n_bufs: u8 = 0,
+    tex: [MAX_TEX]TexSlot = undefined,
+    n_tex: u8 = 0,
+    push_bytes: u32 = 0,
+    /// vertex input locations read (bit l), fragment output locations written
+    attrs: u32 = 0,
+    outputs: u32 = 0,
+    /// scalar varyings the vertex stage writes (four a location), those the
+    /// fragment stage reads, and the flat ones (bit 4l + c)
+    varyings_out: u8 = 0,
+    varyings_in: u8 = 0,
+    flat: u64 = 0,
+    /// the fragment stage takes derivatives: it runs for whole quads
+    quads: bool = false,
+    frozen: bool = false,
+};
+
+pub const Dim = enum(u8) { d1 = 0, d2 = 1, d3 = 2, cube = 3, rect = 4, buffer = 5, subpass = 6 };
+pub const SampleKind = enum(u8) { float, int, uint };
+
+/// An image read: its slot and what its type says.
+pub const ImageRef = struct {
+    slot: u32,
+    dim: Dim,
+    arrayed: bool,
+    depth: bool,
+    kind: SampleKind,
+    /// a depth comparison's reference (OpImageSampleDref*)
+    compare: ?Arg = null,
+};
+
+/// A sample's level of detail: none (the base level), given, or from the
+/// coordinates' derivatives across (dx) and up (dy), plus a bias.
+pub const Lod = union(enum) {
+    base,
+    level: Arg,
+    grad: struct { dx: [3]Arg, dy: [3]Arg, bias: Arg },
+};
+
+/// The caller's texture unit (src/vk: gfxapi's texture.sig).
+pub const TexOps = struct {
+    ctx: ?*const anyopaque = null,
+    /// coords: s, t, r (a cube's direction is three), then an array's
+    /// layer; offset in texels
+    sample: *const fn (?*const anyopaque, *kir.Kernel, ImageRef, [4]Arg, Lod, [3]i32) [4]Arg,
+    /// integer coords (x, y, then z or the layer), the level
+    fetch: *const fn (?*const anyopaque, *kir.Kernel, ImageRef, [4]Arg, Arg) [4]Arg,
+    /// level `lod`'s width, height, and depth or layers
+    size: *const fn (?*const anyopaque, *kir.Kernel, ImageRef, Arg) [3]Arg,
+    levels: *const fn (?*const anyopaque, *kir.Kernel, ImageRef) Arg,
+};
+
+/// Where a graphics stage's code meets the raster's kernel (see the header).
+pub const StageIO = struct {
+    /// the binding of the draw's words, and the words: the framebuffer's
+    /// height (f32), the base vertex and instance, the push constants, the
+    /// buffers' views (offset, range each)
+    uni: u8 = 0,
+    word_height: u32 = 0,
+    word_base_vertex: u32 = 0,
+    word_base_instance: u32 = 0,
+    word_push: u32 = 0,
+    word_views: u32 = 0,
+    /// the first buffer's KIR binding
+    buffers: u8 = 0,
+    tex: ?*const TexOps = null,
+    // vertex: in
+    attr: ?*const [MAX_ATTRS][4]V = null,
+    vertex_id: V = .none,
+    instance_id: V = .none,
+    // vertex: out (f32 registers)
+    position: [4]V = .{ .none, .none, .none, .none },
+    varying_out: [MAX_VARYINGS]V = [_]V{.none} ** MAX_VARYINGS,
+    // fragment: in
+    varying_in: ?*const [MAX_VARYINGS]V = null,
+    /// x + 0.5, y + 0.5 from the bottom, depth, 1/w
+    frag_coord: [4]V = .{ .none, .none, .none, .none },
+    front_facing: V = .none,
+    /// whole quads run (derivatives by shuffles with lane ^ quad_x, quad_y)
+    quads: bool = false,
+    odd_x: V = .none,
+    odd_y: V = .none,
+    quad_x: u32 = 1,
+    quad_y: u32 = 8,
+    // fragment: out
+    /// the output location that is the colour (the rest are dropped)
+    color_loc: u32 = 0,
+    color: [4]V = .{ .none, .none, .none, .none },
+    discard: V = .none,
+};
+
 const Def = struct {
     op: u16 = 0,
     /// the defining instruction's first word (a block: its OpLabel)
@@ -419,13 +589,16 @@ const Def = struct {
     term_at: u32 = 0,
     /// a buffer variable: its KIR binding (NONE: unused)
     kbind: u32 = NONE,
+    location: u32 = NONE,
+    component: u32 = 0,
+    flat: bool = false,
 };
 
 const Member = struct { offset: u32 = NONE, mstride: u32 = 0, builtin: u32 = NONE };
 
 const Comps = struct { start: u32 = 0, n: u32 = 0 };
 
-const Space = enum(u8) { buffer, shared, func, push, input };
+const Space = enum(u8) { buffer, shared, func, push, input, handle };
 
 /// A pointer: where a value lives.
 const Ptr = struct {
@@ -485,7 +658,7 @@ pub const Gen = struct {
     view: [MAX_BINDINGS]Arg = undefined,
     range: [MAX_BINDINGS]Arg = undefined,
     lim: [MAX_BINDINGS]Arg = undefined,
-    inputs: [16]Input = undefined,
+    inputs: [48]Input = undefined,
     n_inputs: u32 = 0,
     push_var: u32 = NONE,
     frames: [MAX_FRAMES]Frame = undefined,
@@ -494,6 +667,15 @@ pub const Gen = struct {
     diag_len: usize = 0,
     /// the last inlined call's result
     last_ret: Comps = .{},
+    // graphics stages (emitStage)
+    io: ?*StageIO = null,
+    res: ?*Resources = null,
+    discard: V = .none,
+    wrap_entry: bool = false,
+    outs: [32]Out = undefined,
+    n_outs: u32 = 0,
+
+    const Out = struct { id: u32, first: u32, ty: u32 };
 
     /// Compiles entry point `entry_name` (GLCompute) into `k` (over
     /// `storage`); `diag` says what went wrong. Returns what its dispatches need.
@@ -570,7 +752,12 @@ pub const Gen = struct {
                 },
                 Op.entry_point => {
                     if (wc < 4) return error.BadSpirv;
-                    if (in[1] == 5 and std.mem.eql(u8, litStr(in[3..]), entry_name)) g.entry = in[2];
+                    const model: u32 = switch (g.opts.stage) {
+                        .compute => 5,
+                        .vertex => 0,
+                        .fragment => 4,
+                    };
+                    if (in[1] == model and std.mem.eql(u8, litStr(in[3..]), entry_name)) g.entry = in[2];
                 },
                 Op.type_void, Op.type_bool, Op.type_int, Op.type_float, Op.type_vector, Op.type_matrix, Op.type_array, Op.type_runtime_array, Op.type_pointer, Op.type_function, Op.type_image, Op.type_sampler, Op.type_sampled_image => try g.record(in[1], op, at),
                 Op.type_struct => {
@@ -609,7 +796,11 @@ pub const Gen = struct {
             at += wc;
         }
         if (g.entry == NONE) {
-            g.say("spirv: no GLCompute entry point \"{s}\"", .{entry_name});
+            g.say("spirv: no {s} entry point \"{s}\"", .{ switch (g.opts.stage) {
+                .compute => "GLCompute",
+                .vertex => "Vertex",
+                .fragment => "Fragment",
+            }, entry_name });
             return error.NoEntryPoint;
         }
         // decorations and execution modes (they come before the types they name)
@@ -627,6 +818,9 @@ pub const Gen = struct {
                         Deco.array_stride => d.stride = v,
                         Deco.builtin => d.builtin = v,
                         Deco.binding => d.binding = v,
+                        Deco.location => d.location = v,
+                        Deco.component => d.component = v,
+                        Deco.flat => d.flat = true,
                         Deco.descriptor_set => d.set = v,
                         else => {},
                     }
@@ -1343,7 +1537,10 @@ pub const Gen = struct {
             scan += g.wcAt(scan);
         }
         if (first_label == NONE) return g.bad("spirv: a function without blocks", .{});
-        var fr = FuncFrame{ .entry = entry, .wrapped = !entry and (returns > 1 or loops), .flag = .none, .ret = .{} };
+        // (a graphics stage's entry is inlined into the raster's kernel: its
+        // returns and discards leave its own loop, never the kernel)
+        const own_loop = g.wrap_entry and fid == g.entry;
+        var fr = FuncFrame{ .entry = entry, .wrapped = (!entry and (returns > 1 or loops)) or own_loop, .flag = .none, .ret = .{} };
         if (!entry and g.tyOp(rty) != Op.type_void) {
             if (fr.wrapped) {
                 var tys: [MAX_DYNAMIC]kir.Ty = undefined;
@@ -1424,7 +1621,10 @@ pub const Gen = struct {
                     return;
                 },
                 Op.kill, Op.terminate_invocation => {
-                    g.k.ret();
+                    if (g.io != null) {
+                        g.k.set(g.discard, .mov, u(1), no, no);
+                        try g.doReturn(NONE);
+                    } else g.k.ret();
                     return;
                 },
                 Op.@"unreachable" => return,
@@ -1765,6 +1965,7 @@ pub const Gen = struct {
             },
             Op.access_chain, Op.in_bounds_access_chain => {
                 var p = try g.ptrOf(in[3]);
+                if (p.space == .handle) return g.unsupported("spirv: arrays of images or samplers", .{});
                 for (in[4..]) |ix| p = try g.step(p, ix);
                 g.s.vals[in[2]] = .{ .ptr = p };
             },
@@ -1792,6 +1993,23 @@ pub const Gen = struct {
                 if (g.tyOp(in[1]) != Op.type_void) g.setVal(in[2], g.last_ret);
             },
             Op.control_barrier => k.barrier(),
+            Op.sampled_image => {
+                const im = try g.get(in[3]);
+                const sm = try g.get(in[4]);
+                if (im.len != 1 or sm.len != 1) return error.BadSpirv;
+                try g.define(in[2], &.{ im[0], sm[0] });
+            },
+            Op.image => {
+                const si = try g.get(in[3]);
+                try g.define(in[2], si[0..1]);
+            },
+            Op.image_sample_implicit_lod, Op.image_sample_explicit_lod, Op.image_sample_dref_implicit_lod, Op.image_sample_dref_explicit_lod, Op.image_fetch, Op.image_query_size_lod, Op.image_query_size, Op.image_query_levels, Op.image_query_samples => try g.imageOp(op, in),
+            Op.image_sample_proj_implicit_lod, Op.image_sample_proj_explicit_lod, Op.image_gather, Op.image_dref_gather, Op.image_read, Op.image_write, Op.image_query_lod => return g.unsupported("spirv: image op {d}", .{op}),
+            Op.dpdx, Op.dpdy, Op.fwidth, Op.dpdx_fine, Op.dpdy_fine, Op.fwidth_fine, Op.dpdx_coarse, Op.dpdy_coarse, Op.fwidth_coarse => try g.derivative(op, in),
+            Op.demote_to_helper_invocation => {
+                if (g.io == null) return g.unsupported("spirv: demote outside a fragment shader", .{});
+                k.set(g.discard, .mov, u(1), no, no);
+            },
             Op.memory_barrier => {},
             Op.copy_object, Op.copy_logical => try g.define(in[2], try g.get(in[3])),
             Op.composite_construct => {
@@ -2017,6 +2235,11 @@ pub const Gen = struct {
                 }
                 return c;
             },
+            .handle => {
+                const c = try g.newComps(1);
+                g.slice(c)[0] = u(p.slot);
+                return c;
+            },
             .input => {
                 const in_v = for (g.inputs[0..g.n_inputs]) |iv| {
                     if (iv.id == p.slot) break iv;
@@ -2039,7 +2262,7 @@ pub const Gen = struct {
                 if (n != vals.len) return error.BadSpirv;
                 for (0..n) |j| g.bufStore(p.slot, p.off, p.imm + g.s.lay_off[j], g.s.lay_ty[j], vals[j]);
             },
-            .push, .input => return g.bad("spirv: a store to a read-only variable", .{}),
+            .push, .input, .handle => return g.bad("spirv: a store to a read-only variable", .{}),
             .shared => {
                 var tys: [MAX_DYNAMIC]kir.Ty = undefined;
                 const n = try g.compTys(p.ty, &tys);
@@ -2096,11 +2319,11 @@ pub const Gen = struct {
         const k = g.k;
         const total = g.iadd(off, u(imm));
         if (!g.opts.robust) {
-            return r(k.load(ty, kir.global(@intCast(b), 32), g.iadd(g.view[b], total)));
+            return r(k.load(ty, kir.global(g.kbinding(b), 32), g.iadd(g.view[b], total)));
         }
         const inb = g.icmp(.u32, .lt, total, g.lim[b]);
         const a = g.iadd(g.view[b], g.sel(.u32, inb, total, u(0)));
-        const v = r(k.load(ty, kir.global(@intCast(b), 32), a));
+        const v = r(k.load(ty, kir.global(g.kbinding(b), 32), a));
         return g.sel(ty, inb, v, u(0));
     }
 
@@ -2109,12 +2332,12 @@ pub const Gen = struct {
         const total = g.iadd(off, u(imm));
         const val = r(g.reg(v, ty));
         if (!g.opts.robust) {
-            k.store(ty, kir.global(@intCast(b), 32), g.iadd(g.view[b], total), val);
+            k.store(ty, kir.global(g.kbinding(b), 32), g.iadd(g.view[b], total), val);
             return;
         }
         const inb = g.icmp(.u32, .lt, total, g.lim[b]);
         k.ifp(inb);
-        k.store(ty, kir.global(@intCast(b), 32), g.iadd(g.view[b], total), val);
+        k.store(ty, kir.global(g.kbinding(b), 32), g.iadd(g.view[b], total), val);
         k.endif();
     }
 
@@ -2125,16 +2348,410 @@ pub const Gen = struct {
         if (off == .imm) {
             const wi = (off.imm + imm) / 4;
             if (wi >= words) return u(0);
-            return r(g.k.param(ty, @intCast(base + wi)));
+            return g.pushWord(ty, base, wi);
         }
         var res: Arg = u(0);
         for (0..words) |wi| {
             const at: u32 = @intCast(wi * 4);
             if (at < imm) continue;
-            res = g.sel(ty, g.icmp(.u32, .eq, off, u(at - imm)), r(g.k.param(ty, @intCast(base + wi))), res);
+            res = g.sel(ty, g.icmp(.u32, .eq, off, u(at - imm)), g.pushWord(ty, base, @intCast(wi)), res);
         }
         return res;
     }
+
+    /// Push-constant word wi: a parameter (compute), or a word of the
+    /// draw's uniform binding (a graphics stage).
+    fn pushWord(g: *Gen, ty: kir.Ty, base: u32, wi: u32) Arg {
+        if (g.io) |io| return r(g.uniWord(ty, io.word_push + wi));
+        return r(g.k.param(ty, @intCast(base + wi)));
+    }
+
+    /// The KIR binding of buffer slot b.
+    fn kbinding(g: *const Gen, b: u32) u8 {
+        return if (g.io) |io| @intCast(io.buffers + b) else @intCast(b);
+    }
+
+    /// A word of the draw's uniform binding (a graphics stage).
+    fn uniWord(g: *Gen, ty: kir.Ty, word: u32) V {
+        var m = kir.global(g.io.?.uni, 32);
+        m.imm = @intCast(word * 4);
+        return g.k.load(ty, m, u(0));
+    }
+
+    // ── Graphics stages ──
+
+    /// Emits entry point `entry_name` of a vertex or fragment stage
+    /// (Options.stage) into `k`, the raster's kernel being built, through
+    /// `io` (see the header). `res` gathers what the pipeline binds, or
+    /// (frozen) names the slots the pipeline has. The kernel is not
+    /// finished here: the raster goes on with it.
+    pub fn emitStage(g: *Gen, entry_name: []const u8, k: *kir.Kernel, io: *StageIO, res: *Resources) Error!void {
+        if (g.opts.stage == .compute) return g.bad("spirv: emitStage of a compute stage", .{});
+        try g.parse(entry_name);
+        g.k = k;
+        g.io = io;
+        g.res = res;
+        try g.markUses();
+        const stage = g.opts.stage;
+        // buffers: the pipeline's slots, their views from the draw's words
+        var id: u32 = 0;
+        while (id < g.bound) : (id += 1) {
+            const d = &g.s.defs[id];
+            if (d.op != Op.variable or d.kbind != NONE - 1) continue;
+            const sc = g.inst(d.at)[3];
+            const want = Binding{ .set = if (d.set == NONE) 0 else d.set, .binding = if (d.binding == NONE) 0 else d.binding, .kind = if (sc == StorageClass.uniform) .uniform else .storage };
+            const b = try g.bufSlot(want);
+            d.kbind = b;
+            g.view[b] = r(g.uniWord(.u32, io.word_views + 2 * b));
+            g.range[b] = r(g.uniWord(.u32, io.word_views + 2 * b + 1));
+            g.lim[b] = if (g.opts.robust) r(k.op2(.isub, .u32, r(k.op2(.imax, .u32, g.range[b], u(4))), u(3))) else u(0);
+        }
+        if (stage == .fragment) {
+            g.discard = k.reg(.pred);
+            k.set(g.discard, .mov, u(0), no, no);
+        }
+        id = 0;
+        while (id < g.bound) : (id += 1) {
+            const d = g.s.defs[id];
+            if (d.op != Op.variable or d.kbind == NONE) continue;
+            const in = g.inst(d.at);
+            const t = g.elemOf(in[1], 0);
+            switch (in[3]) {
+                StorageClass.storage_buffer, StorageClass.uniform => {
+                    g.s.vals[id] = .{ .ptr = .{ .space = .buffer, .slot = d.kbind, .ty = t } };
+                },
+                StorageClass.push_constant => {
+                    g.push_var = id;
+                    g.info.push_bytes = try g.blockBytes(t);
+                    res.push_bytes = @max(res.push_bytes, g.info.push_bytes);
+                    g.s.vals[id] = .{ .ptr = .{ .space = .push, .slot = 0, .ty = t } };
+                },
+                StorageClass.uniform_constant => g.s.vals[id] = .{ .ptr = .{ .space = .handle, .slot = id, .ty = t } },
+                StorageClass.input => try g.stageInput(id, t),
+                StorageClass.output => {
+                    if (g.n_outs == g.outs.len) return error.TooBig;
+                    try g.funcVar(id, t, if (in.len > 4) in[4] else NONE);
+                    g.outs[g.n_outs] = .{ .id = id, .first = g.s.vals[id].ptr.slot, .ty = t };
+                    g.n_outs += 1;
+                },
+                StorageClass.private => try g.funcVar(id, t, if (in.len > 4) in[4] else NONE),
+                StorageClass.function => {},
+                else => return g.unsupported("spirv: storage class {d} in a {s} shader", .{ in[3], @tagName(stage) }),
+            }
+        }
+        g.wrap_entry = true;
+        try g.call(g.entry, &.{}, false);
+        try g.finishOutputs();
+        if (stage == .fragment) io.discard = g.discard;
+    }
+
+    /// Buffer (set, binding)'s slot in the pipeline's list.
+    fn bufSlot(g: *Gen, want: Binding) Error!u32 {
+        const res = g.res.?;
+        for (res.bufs[0..res.n_bufs], 0..) |b, i| {
+            if (b.set == want.set and b.binding == want.binding) return @intCast(i);
+        }
+        if (res.frozen) return g.bad("spirv: buffer ({d}, {d}) is not the pipeline's", .{ want.set, want.binding });
+        if (res.n_bufs == MAX_BINDINGS) return g.unsupported("spirv: more than {d} buffers", .{MAX_BINDINGS});
+        res.bufs[res.n_bufs] = want;
+        res.n_bufs += 1;
+        return res.n_bufs - 1;
+    }
+
+    /// An Input variable of a graphics stage: a built-in, or a location's
+    /// attribute (vertex) or varying (fragment).
+    fn stageInput(g: *Gen, id: u32, t: u32) Error!void {
+        const io = g.io.?;
+        const res = g.res.?;
+        const k = g.k;
+        const d = g.s.defs[id];
+        var vals: [4]Arg = undefined;
+        var n: u32 = 1;
+        if (d.builtin != NONE) {
+            switch (d.builtin) {
+                BuiltIn.vertex_index => vals[0] = g.iadd(r(io.vertex_id), r(g.uniWord(.u32, io.word_base_vertex))),
+                BuiltIn.instance_index => vals[0] = g.iadd(r(io.instance_id), r(g.uniWord(.u32, io.word_base_instance))),
+                BuiltIn.frag_coord => {
+                    // (the raster's y is from the bottom; Vulkan's from the top)
+                    n = 4;
+                    vals[0] = r(io.frag_coord[0]);
+                    vals[1] = r(k.op2(.fsub, .f32, r(g.uniWord(.f32, io.word_height)), r(io.frag_coord[1])));
+                    vals[2] = r(io.frag_coord[2]);
+                    vals[3] = r(io.frag_coord[3]);
+                },
+                BuiltIn.front_facing => vals[0] = r(io.front_facing),
+                BuiltIn.sample_id => vals[0] = u(0),
+                BuiltIn.helper_invocation => vals[0] = u(0),
+                else => return g.unsupported("spirv: input built-in {d} in a {s} shader", .{ d.builtin, @tagName(g.opts.stage) }),
+            }
+            if (g.comps(t) != n) return g.bad("spirv: built-in {d} of the wrong type", .{d.builtin});
+        } else {
+            if (d.location == NONE) return g.unsupported("spirv: an Input variable with neither a built-in nor a location", .{});
+            var tys: [16]kir.Ty = undefined;
+            n = try g.compTys(t, &tys);
+            if (n == 0 or d.component + n > 4) return g.unsupported("spirv: an input of {d} components at location {d}", .{ n, d.location });
+            const loc = d.location;
+            for (0..n) |j| {
+                const c = d.component + @as(u32, @intCast(j));
+                const src: V = if (g.opts.stage == .vertex) blk: {
+                    if (loc >= MAX_ATTRS) return g.unsupported("spirv: vertex input location {d}", .{loc});
+                    break :blk io.attr.?[loc][c];
+                } else blk: {
+                    if (loc * 4 + c >= MAX_VARYINGS) return g.unsupported("spirv: varying location {d}", .{loc});
+                    break :blk io.varying_in.?[loc * 4 + c];
+                };
+                // (an attribute's register holds f32 bits or an integer's: as the type says)
+                vals[j] = if (k.tys[@intFromEnum(src)] == tys[j]) r(src) else r(k.mov(tys[j], r(src)));
+            }
+            if (g.opts.stage == .vertex) {
+                res.attrs |= @as(u32, 1) << @intCast(loc);
+            } else {
+                res.varyings_in = @max(res.varyings_in, @as(u8, @intCast(4 * (loc + 1))));
+                if (d.flat or tys[0] != .f32) {
+                    for (0..n) |j| res.flat |= @as(u64, 1) << @intCast(loc * 4 + d.component + j);
+                }
+            }
+        }
+        if (g.n_inputs == g.inputs.len) return error.TooBig;
+        const c = try g.newComps(n);
+        @memcpy(g.slice(c), vals[0..n]);
+        g.inputs[g.n_inputs] = .{ .id = id, .comps = c };
+        g.n_inputs += 1;
+        g.s.vals[id] = .{ .ptr = .{ .space = .input, .slot = id, .ty = t } };
+    }
+
+    /// The Output variables' registers handed to the raster: the position
+    /// and varyings (vertex), the colour and the discard (fragment).
+    fn finishOutputs(g: *Gen) Error!void {
+        const io = g.io.?;
+        const res = g.res.?;
+        const k = g.k;
+        for (g.outs[0..g.n_outs]) |o| {
+            const d = g.s.defs[o.id];
+            if (g.tyOp(o.ty) == Op.type_struct) {
+                // (glslang's gl_PerVertex: built-in members)
+                var at: u32 = 0;
+                for (0..g.lenOf(o.ty)) |m| {
+                    const mt = g.elemOf(o.ty, @intCast(m));
+                    try g.outBuiltin(g.member(o.ty, @intCast(m)).builtin, o.first + at, g.comps(mt));
+                    at += g.comps(mt);
+                }
+                continue;
+            }
+            if (d.builtin != NONE) {
+                try g.outBuiltin(d.builtin, o.first, g.comps(o.ty));
+                continue;
+            }
+            if (d.location == NONE) return g.unsupported("spirv: an Output variable with neither a built-in nor a location", .{});
+            const n = g.comps(o.ty);
+            if (n == 0 or d.component + n > 4) return g.unsupported("spirv: an output of {d} components at location {d}", .{ n, d.location });
+            for (0..n) |j| {
+                const src: V = @enumFromInt(o.first + j);
+                const c = d.component + @as(u32, @intCast(j));
+                const v = if (k.tys[@intFromEnum(src)] == .f32) src else k.mov(.f32, r(src));
+                if (g.opts.stage == .vertex) {
+                    const slot = d.location * 4 + c;
+                    if (slot >= MAX_VARYINGS) return g.unsupported("spirv: varying location {d}", .{d.location});
+                    io.varying_out[slot] = v;
+                    res.varyings_out = @max(res.varyings_out, @as(u8, @intCast(4 * (d.location + 1))));
+                    if (d.flat) res.flat |= @as(u64, 1) << @intCast(slot);
+                } else {
+                    res.outputs |= @as(u32, 1) << @intCast(d.location);
+                    if (d.location == io.color_loc) io.color[c] = v;
+                }
+            }
+        }
+        // (what no output wrote reads 0)
+        const fill = if (g.opts.stage == .vertex) io.position[0..] else io.color[0..];
+        for (fill) |*x| {
+            if (x.* == .none) x.* = k.mov(.f32, f(0));
+        }
+    }
+
+    fn outBuiltin(g: *Gen, bi: u32, first: u32, n: u32) Error!void {
+        const io = g.io.?;
+        switch (bi) {
+            BuiltIn.position => {
+                if (n != 4) return error.BadSpirv;
+                for (0..4) |j| io.position[j] = @enumFromInt(first + j);
+            },
+            // (points are drawn one pixel; no clip planes yet)
+            BuiltIn.point_size, BuiltIn.clip_distance, BuiltIn.cull_distance, BuiltIn.sample_mask, NONE => {},
+            BuiltIn.frag_depth => return g.unsupported("spirv: FragDepth (the raster keeps the interpolated depth)", .{}),
+            else => return g.unsupported("spirv: output built-in {d}", .{bi}),
+        }
+    }
+
+    /// The texture slot an image (and its sampler) value names.
+    fn imageRef(g: *Gen, h: []const Arg) Error!ImageRef {
+        const res = g.res orelse return g.unsupported("spirv: images in a compute shader", .{});
+        if (h.len == 0 or h[0] != .imm or h[0].imm >= g.bound) return g.bad("spirv: an image that is not a variable's", .{});
+        const iv = g.s.defs[h[0].imm];
+        if (iv.op != Op.variable) return g.bad("spirv: an image that is not a variable's", .{});
+        const it = g.elemOf(g.inst(iv.at)[1], 0);
+        if (g.tyOp(it) != Op.type_image) return g.bad("spirv: %{d} is not an image", .{h[0].imm});
+        const ti = g.tyInst(it);
+        if (ti.len < 9) return error.BadSpirv;
+        if (ti[6] != 0) return g.unsupported("spirv: multisampled images", .{});
+        const st = g.tyInst(ti[2]);
+        const kind: SampleKind = if (g.tyOp(ti[2]) == Op.type_float) .float else if (st.len > 3 and st[3] != 0) .int else .uint;
+        const want = TexSlot{
+            .image = .{ .set = if (iv.set == NONE) 0 else iv.set, .binding = if (iv.binding == NONE) 0 else iv.binding },
+            .sampler = .{ .set = 0, .binding = 0 },
+            .has_sampler = h.len > 1,
+        };
+        var slot = want;
+        if (h.len > 1) {
+            if (h[1] != .imm or h[1].imm >= g.bound) return error.BadSpirv;
+            const sv = g.s.defs[h[1].imm];
+            slot.sampler = .{ .set = if (sv.set == NONE) 0 else sv.set, .binding = if (sv.binding == NONE) 0 else sv.binding };
+        }
+        const n: u32 = for (res.tex[0..res.n_tex], 0..) |x, i| {
+            if (x.has_sampler == slot.has_sampler and x.image.set == slot.image.set and x.image.binding == slot.image.binding and
+                (!x.has_sampler or (x.sampler.set == slot.sampler.set and x.sampler.binding == slot.sampler.binding))) break @intCast(i);
+        } else blk: {
+            if (res.frozen) return g.bad("spirv: a texture the pipeline does not have", .{});
+            if (res.n_tex == MAX_TEX) return g.unsupported("spirv: more than {d} textures", .{MAX_TEX});
+            res.tex[res.n_tex] = slot;
+            res.n_tex += 1;
+            break :blk res.n_tex - 1;
+        };
+        return .{ .slot = n, .dim = @enumFromInt(@as(u8, @intCast(@min(ti[3], 6)))), .arrayed = ti[5] != 0, .depth = ti[4] == 1, .kind = kind };
+    }
+
+    /// The coordinates a dimension has (before an array's layer).
+    fn coordsOf(dim: Dim) u32 {
+        return switch (dim) {
+            .d1, .buffer => 1,
+            .d3, .cube => 3,
+            else => 2,
+        };
+    }
+
+    fn imageOp(g: *Gen, op: u16, in: []const u32) Error!void {
+        const io = g.io orelse return g.unsupported("spirv: images in a compute shader", .{});
+        const k = g.k;
+        var img = try g.imageRef(try g.get(in[3]));
+        const tex = io.tex orelse return g.unsupported("spirv: images without a texture unit", .{});
+        const n = g.comps(in[1]);
+        var out: [4]Arg = .{ u(0), u(0), u(0), u(0) };
+        switch (op) {
+            Op.image_query_size_lod, Op.image_query_size => {
+                const lod = if (op == Op.image_query_size_lod) (try g.get(in[4]))[0] else u(0);
+                const sz = tex.size(tex.ctx, k, img, lod);
+                out[0] = sz[0];
+                out[1] = sz[1];
+                out[2] = sz[2];
+            },
+            Op.image_query_levels => out[0] = tex.levels(tex.ctx, k, img),
+            Op.image_query_samples => out[0] = u(1),
+            Op.image_fetch => {
+                const c = try g.get(in[4]);
+                var cs: [4]Arg = .{ u(0), u(0), u(0), u(0) };
+                for (c[0..@min(c.len, 4)], 0..) |x, j| cs[j] = x;
+                var lod: Arg = u(0);
+                if (in.len > 6 and in[5] & 2 != 0) lod = (try g.get(in[6]))[0];
+                out = tex.fetch(tex.ctx, k, img, cs, lod);
+            },
+            else => {
+                const dref = op == Op.image_sample_dref_implicit_lod or op == Op.image_sample_dref_explicit_lod;
+                const implicit = op == Op.image_sample_implicit_lod or op == Op.image_sample_dref_implicit_lod;
+                const c = try g.get(in[4]);
+                var cs: [4]Arg = .{ f(0), f(0), f(0), f(0) };
+                for (c[0..@min(c.len, 4)], 0..) |x, j| cs[j] = x;
+                var at: usize = 5;
+                if (dref) {
+                    img.compare = (try g.get(in[5]))[0];
+                    at = 6;
+                }
+                var bias: Arg = f(0);
+                var lod: Lod = .base;
+                var offset: [3]i32 = .{ 0, 0, 0 };
+                if (at < in.len) {
+                    const mask = in[at];
+                    var x = at + 1;
+                    if (mask & 0x1 != 0) {
+                        bias = (try g.get(in[x]))[0];
+                        x += 1;
+                    }
+                    if (mask & 0x2 != 0) {
+                        lod = .{ .level = (try g.get(in[x]))[0] };
+                        x += 1;
+                    }
+                    if (mask & 0x4 != 0) {
+                        const dx = try g.get(in[x]);
+                        const dy = try g.get(in[x + 1]);
+                        var gr: Lod = .{ .grad = .{ .dx = .{ f(0), f(0), f(0) }, .dy = .{ f(0), f(0), f(0) }, .bias = f(0) } };
+                        for (0..@min(dx.len, 3)) |j| gr.grad.dx[j] = dx[j];
+                        for (0..@min(dy.len, 3)) |j| gr.grad.dy[j] = dy[j];
+                        lod = gr;
+                        x += 2;
+                    }
+                    if (mask & 0x8 != 0) {
+                        const o = try g.get(in[x]);
+                        for (0..@min(o.len, 3)) |j| {
+                            if (o[j] != .imm) return g.bad("spirv: a ConstOffset that is not constant", .{});
+                            offset[j] = @bitCast(o[j].imm);
+                        }
+                        x += 1;
+                    }
+                    if (mask & ~@as(u32, 0xf) != 0) return g.unsupported("spirv: image operands 0x{x}", .{mask});
+                }
+                if (implicit and img.kind == .float) {
+                    // a fragment shader's: from the coordinates' derivatives
+                    const nc = coordsOf(img.dim);
+                    var gr: Lod = .{ .grad = .{ .dx = .{ f(0), f(0), f(0) }, .dy = .{ f(0), f(0), f(0) }, .bias = bias } };
+                    if (g.opts.stage == .fragment) {
+                        for (0..nc) |j| {
+                            gr.grad.dx[j] = g.deriv(cs[j], false);
+                            gr.grad.dy[j] = g.deriv(cs[j], true);
+                        }
+                        lod = gr;
+                    } else lod = .base;
+                }
+                out = tex.sample(tex.ctx, k, img, cs, lod, offset);
+            },
+        }
+        if (n > 4) return error.BadSpirv;
+        try g.define(in[2], out[0..n]);
+    }
+
+    /// d/dx (across) or d/dy (up) of a fragment shader's value: its
+    /// difference with the quad's neighbour (0 outside whole quads: the
+    /// pipeline learns it must run them).
+    fn deriv(g: *Gen, x: Arg, up: bool) Arg {
+        if (g.opts.stage != .fragment) return f(0);
+        g.res.?.quads = true;
+        const io = g.io.?;
+        if (!io.quads or x == .imm) return f(0);
+        const k = g.k;
+        const xv = if (x == .reg and k.tys[@intFromEnum(x.reg)] == .f32) x.reg else k.mov(.f32, x);
+        const o = k.shfl(.f32, .xor, r(xv), u(if (up) io.quad_y else io.quad_x));
+        const odd = if (up) io.odd_y else io.odd_x;
+        // (the raster's y is up, Vulkan's down: dy is the other way)
+        const d = k.sel(.f32, r(odd), r(k.op2(.fsub, .f32, r(xv), r(o))), r(k.op2(.fsub, .f32, r(o), r(xv))));
+        return if (up) r(k.op1(.fneg, .f32, r(d))) else r(d);
+    }
+
+    fn derivative(g: *Gen, op: u16, in: []const u32) Error!void {
+        const a = try g.get(in[3]);
+        const c = try g.newComps(@intCast(a.len));
+        const k = g.k;
+        for (a, g.slice(c)) |x, *o| {
+            o.* = switch (op) {
+                Op.dpdx, Op.dpdx_fine, Op.dpdx_coarse => g.deriv(x, false),
+                Op.dpdy, Op.dpdy_fine, Op.dpdy_coarse => g.deriv(x, true),
+                else => blk: {
+                    const dx = g.deriv(x, false);
+                    const dy = g.deriv(x, true);
+                    if (dx == .imm and dy == .imm) break :blk f(0);
+                    break :blk r(k.op2(.fadd, .f32, r(k.op1(.fabs, .f32, dx)), r(k.op1(.fabs, .f32, dy))));
+                },
+            };
+        }
+        g.setVal(in[2], c);
+    }
+
 
     fn atomic(g: *Gen, op: u16, in: []const u32) Error!void {
         const k = g.k;
@@ -2701,7 +3318,7 @@ fn litStr(words: []const u32) []const u8 {
 /// Whether an opcode has a result (type, id) pair, for the module scan.
 fn hasResult(op: u16) bool {
     return switch (op) {
-        Op.store, Op.copy_memory, Op.control_barrier, Op.memory_barrier, Op.atomic_store, Op.loop_merge, Op.selection_merge, Op.branch, Op.branch_conditional, Op.@"switch", Op.kill, Op.@"return", Op.return_value, Op.@"unreachable", Op.terminate_invocation => false,
+        Op.store, Op.copy_memory, Op.control_barrier, Op.memory_barrier, Op.atomic_store, Op.loop_merge, Op.selection_merge, Op.branch, Op.branch_conditional, Op.@"switch", Op.kill, Op.@"return", Op.return_value, Op.@"unreachable", Op.terminate_invocation, Op.image_write, Op.demote_to_helper_invocation => false,
         else => true,
     };
 }
