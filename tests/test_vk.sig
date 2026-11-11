@@ -960,6 +960,7 @@ const GShaders = struct {
     const quad align(4) = @embedFile("data/vk/quad.spv").*;
     const targets align(4) = @embedFile("data/vk/targets.spv").*;
     const fstore align(4) = @embedFile("data/vk/fstore.spv").*;
+    const multiview align(4) = @embedFile("data/vk/multiview.spv").*;
 };
 
 const RGBA8: u32 = 37;
@@ -1505,6 +1506,58 @@ fn fragmentStores(open: *const fn () ?icd.Gpu) !void {
             return e;
         };
     };
+}
+
+/// Multiview: a render pass of views 0 and 2 into a 3-layer image, the
+/// quad drawn once a view (ViewIndex in both stages); layer 1 neither
+/// cleared nor drawn.
+fn multiviewDraw(open: *const fn () ?icd.Gpu) !void {
+    use(open);
+    var v = try Vk.open();
+    defer v.close();
+    var g = try G.init(&v);
+    const W = 8;
+    const color = try g.newImage(RGBA8, W, W, 1, 3, 0x11);
+    const cview = try g.newView(color.img, RGBA8, 5, 1, 0, 3); // 2D_ARRAY
+    const atts = [_]abi.AttachmentDescription{.{ .flags = 0, .format = RGBA8, .samples = 1, .loadOp = 1, .storeOp = 0, .stencilLoadOp = 2, .stencilStoreOp = 1, .initialLayout = 0, .finalLayout = 2 }};
+    const cref = abi.AttachmentReference{ .attachment = 0, .layout = 2 };
+    const sp = abi.SubpassDescription{ .flags = 0, .pipelineBindPoint = 0, .inputAttachmentCount = 0, .pInputAttachments = null, .colorAttachmentCount = 1, .pColorAttachments = @ptrCast(&cref), .pResolveAttachments = null, .pDepthStencilAttachment = null, .preserveAttachmentCount = 0, .pPreserveAttachments = null };
+    const masks = [_]u32{0b101};
+    const mv = abi.RenderPassMultiviewCreateInfo{ .sType = ST.render_pass_multiview_create_info, .pNext = null, .subpassCount = 1, .pViewMasks = &masks, .dependencyCount = 0, .pViewOffsets = null, .correlationMaskCount = 0, .pCorrelationMasks = null };
+    const rci = abi.RenderPassCreateInfo{ .sType = ST.render_pass_create_info, .pNext = &mv, .flags = 0, .attachmentCount = 1, .pAttachments = &atts, .subpassCount = 1, .pSubpasses = @ptrCast(&sp), .dependencyCount = 0, .pDependencies = null };
+    var rp: H = 0;
+    try testing.expectEqual(R.success, g.f("vkCreateRenderPass", *const fn (Ptr, *const abi.RenderPassCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &rci, null, &rp));
+    const fb = try g.framebuffer(rp, &.{cview}, W, W);
+    const pl = try g.newLayout(&.{});
+    const module = try v.shader(&GShaders.multiview);
+    var pipe: H = 0;
+    try testing.expectEqual(R.success, g.pipelineOut(.{ .module = module, .fs = "fs_main", .layout = pl, .rp = rp }, &pipe));
+    const back = try v.buffer(W * W * 4 * 3, 2);
+    @memset(back.ptr.?[0 .. W * W * 4 * 3], 0xcc);
+    try g.begin();
+    const clears = [_]abi.ClearValue{.{ .color = .{ .float32 = .{ 0, 0, 1, 1 } } }};
+    g.beginPass(rp, fb, W, W, &clears);
+    g.f("vkCmdBindPipeline", *const fn (Ptr, u32, H) callconv(.c) void)(g.cb, 0, pipe);
+    g.f("vkCmdDraw", *const fn (Ptr, u32, u32, u32, u32) callconv(.c) void)(g.cb, 6, 1, 0, 0);
+    g.f("vkCmdEndRenderPass", *const fn (Ptr) callconv(.c) void)(g.cb);
+    for (0..3) |l| {
+        const r = abi.BufferImageCopy{ .bufferOffset = l * W * W * 4, .bufferRowLength = 0, .bufferImageHeight = 0, .imageSubresource = .{ .aspectMask = 1, .mipLevel = 0, .baseArrayLayer = @intCast(l), .layerCount = 1 }, .imageOffset = .{ .x = 0, .y = 0, .z = 0 }, .imageExtent = .{ .width = W, .height = W, .depth = 1 } };
+        g.f("vkCmdCopyImageToBuffer", *const fn (Ptr, H, u32, H, u32, [*]const abi.BufferImageCopy) callconv(.c) void)(g.cb, color.img, 6, back.buf, 1, @ptrCast(&r));
+    }
+    try g.run();
+    const out = back.ptr.?;
+    for (0..W * W) |t| {
+        // view 0: red 0, green (0 + 1) / 4; view 2: red 1, green 3 / 4
+        try testing.expectEqualSlices(u8, &.{ 0, 64, 0, 255 }, out[t * 4 ..][0..4]);
+        try testing.expectEqualSlices(u8, &.{ 255, 191, 0, 255 }, out[2 * W * W * 4 + t * 4 ..][0..4]);
+        // layer 1: neither drawn nor cleared
+        const l1 = out[W * W * 4 + t * 4 ..][0..4];
+        try testing.expect(!std.mem.eql(u8, l1, &.{ 0, 0, 255, 255 }) and l1[1] != 64 and l1[1] != 191);
+    }
+}
+
+test "vk: multiview: views 0 and 2 of a 3-layer attachment, ViewIndex in both stages, on the emulated RTX" {
+    try multiviewDraw(&openRtx);
 }
 
 test "vk: a fragment shader writing a storage texture (FRAGMENT_WRITABLE_STORAGE) on the emulated RTX" {

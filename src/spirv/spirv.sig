@@ -407,6 +407,7 @@ const BuiltIn = struct {
     const num_subgroups = 38;
     const subgroup_id = 40;
     const subgroup_local_invocation_id = 41;
+    const view_index = 4440;
     const subgroup_eq_mask = 4416;
     const subgroup_ge_mask = 4417;
     const subgroup_gt_mask = 4418;
@@ -657,6 +658,8 @@ pub const StageIO = struct {
     uni: u8 = 0,
     word_height: u32 = 0,
     word_base_vertex: u32 = 0,
+    /// multiview: the view this draw renders (ViewIndex)
+    word_view: u32 = 0,
     word_base_instance: u32 = 0,
     word_push: u32 = 0,
     word_views: u32 = 0,
@@ -2778,6 +2781,7 @@ pub const Gen = struct {
             switch (d.builtin) {
                 BuiltIn.vertex_index => vals[0] = g.iadd(r(io.vertex_id), r(g.uniWord(.u32, io.word_base_vertex))),
                 BuiltIn.instance_index => vals[0] = g.iadd(r(io.instance_id), r(g.uniWord(.u32, io.word_base_instance))),
+                BuiltIn.view_index => vals[0] = r(g.uniWord(.u32, io.word_view)),
                 BuiltIn.frag_coord => {
                     // (the raster's y is from the bottom; Vulkan's from the top)
                     n = 4;

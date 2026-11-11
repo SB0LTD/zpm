@@ -715,6 +715,13 @@ fn fillFeatureChain(chain: ?*anyopaque) void {
                 sf.storagePushConstant16 = 1;
                 sf.storageInputOutput16 = 1;
             },
+            ST.physical_device_multiview_features => {
+                // (a draw repeated a view, into its layer)
+                const mf: *abi.PhysicalDeviceMultiviewFeatures = @ptrCast(@alignCast(c));
+                mf.multiview = 1;
+                mf.multiviewGeometryShader = 0;
+                mf.multiviewTessellationShader = 0;
+            },
             ST.physical_device_index_type_uint8_features => {
                 const xf: *abi.PhysicalDeviceIndexTypeUint8Features = @ptrCast(@alignCast(c));
                 xf.indexTypeUint8 = 1;
@@ -825,7 +832,7 @@ fn getPhysicalDeviceProperties2(_: ?*anyopaque, out: ?*abi.PhysicalDevicePropert
             },
             ST.physical_device_multiview_properties => {
                 const mp: *abi.PhysicalDeviceMultiviewProperties = @ptrCast(@alignCast(c));
-                mp.maxMultiviewViewCount = 1;
+                mp.maxMultiviewViewCount = 8;
                 mp.maxMultiviewInstanceIndex = 0x7ffffff;
             },
             ST.physical_device_point_clipping_properties => {
@@ -2915,7 +2922,12 @@ const Exec = struct {
                 if (at.sload == 1) aspects |= format.ASPECT_STENCIL;
             }
             if (aspects == 0 or a >= b.n) continue;
-            e.clearAtt(@intCast(a), aspects, b.clears[a], b.x, b.y, b.w, b.h, 0, fb.layers);
+            // (multiview: the views' layers only)
+            if (rp.view_mask != 0) {
+                for (0..32) |vw| {
+                    if (rp.view_mask >> @intCast(vw) & 1 != 0) e.clearAtt(@intCast(a), aspects, b.clears[a], b.x, b.y, b.w, b.h, @intCast(vw), 1);
+                }
+            } else e.clearAtt(@intCast(a), aspects, b.clears[a], b.x, b.y, b.w, b.h, 0, fb.layers);
         }
     }
 
@@ -3013,7 +3025,20 @@ const Exec = struct {
         }
     }
 
+    /// A draw: once, or (multiview) once a view, into its layer.
     fn draw(e: *Exec, dc: DrawCmd) void {
+        const gx = &e.gfx;
+        if (gx.rp == NONE) return;
+        const mask = T.render_passes[gx.rp].view_mask;
+        if (mask == 0) return e.drawView(dc, 0);
+        for (0..32) |v| {
+            if (mask >> @intCast(v) & 1 != 0) e.drawView(dc, @intCast(v));
+        }
+    }
+
+    /// A draw of view `view`: its attachments' layer `view`, ViewIndex
+    /// in the words.
+    fn drawView(e: *Exec, dc: DrawCmd, view: u32) void {
         const gx = &e.gfx;
         const p = gpipeOf(gx.pipe) orelse return;
         if (gx.rp == NONE or p.discard or dc.count == 0 or dc.instances == 0) return;
@@ -3034,6 +3059,7 @@ const Exec = struct {
         words[W_HEIGHT] = @bitCast(@as(f32, @floatFromInt(fb.h)));
         words[W_BASE_VERTEX] = if (dc.indexed != 0) @bitCast(dc.vertex_offset) else 0;
         words[W_BASE_INSTANCE] = dc.first_instance;
+        words[W_VIEW] = view;
         @memcpy(words[W_PUSH..][0 .. MAX_PUSH_BYTES / 4], &e.push);
         var d = raster.Draw{ .pipe = &p.rp[0], .color = undefined };
         // buffers: their memories, views in the words
@@ -3142,7 +3168,7 @@ const Exec = struct {
         var dsimg: engine.Image = undefined;
         var ds_mem: u32 = NONE;
         if (rpass.ds != NONE and rpass.ds < fb.n) {
-            if (attImage(fb.views[rpass.ds], 0, fb.h)) |img| {
+            if (attImage(fb.views[rpass.ds], view, fb.h)) |img| {
                 dsimg = img;
                 const v = &T.views[fb.views[rpass.ds]];
                 ds_mem = T.images[v.image].mem;
@@ -3173,7 +3199,7 @@ const Exec = struct {
             if (ai == NONE or ai >= fb.n or j >= p.n_var) continue;
             const bl = p.blend[j];
             if (bl.mask & 0xf == 0) continue;
-            cimg = attImage(fb.views[ai], 0, fb.h) orelse continue;
+            cimg = attImage(fb.views[ai], view, fb.h) orelse continue;
             if (!cimg.format.renderable()) {
                 e.sayOnce(5, "a colour attachment of format {s}: not drawn into", .{@tagName(cimg.format)});
                 continue;
@@ -3930,6 +3956,7 @@ pub const MAX_LAYERS: u32 = 256;
 const W_HEIGHT = 0;
 const W_BASE_VERTEX = 1;
 const W_BASE_INSTANCE = 2;
+const W_VIEW = 3;
 const W_PUSH = 4;
 const W_VIEWS = W_PUSH + MAX_PUSH_BYTES / 4;
 const W_TEX = W_VIEWS + 2 * spirv.MAX_BINDINGS;
@@ -4018,6 +4045,9 @@ const RenderPass = struct {
     /// colour attachment j's resolve attachment (NONE: none), copied into
     /// at the end of the pass (a 4x image keeps one sample: see MSAA)
     resolve: [MAX_COLOR]u32 = [_]u32{NONE} ** MAX_COLOR,
+    /// multiview: the first subpass's views (bit v: layer v drawn, as
+    /// ViewIndex v); 0: none
+    view_mask: u32 = 0,
 };
 const Framebuffer = struct { live: bool, w: u32, h: u32, layers: u32, n: u32, views: [MAX_ATT]u32 };
 
@@ -4432,6 +4462,10 @@ fn createRenderPass(_: ?*anyopaque, info: ?*const abi.RenderPassCreateInfo, _: ?
         if (ad.samples != 1 and ad.samples != SAMPLES_4) return R.error_feature_not_present;
         rp.att[a] = .{ .fmt = ad.format, .load = ad.loadOp, .sload = ad.stencilLoadOp };
     }
+    if (findIn(ci.pNext, ST.render_pass_multiview_create_info)) |mb| {
+        const mv: *const abi.RenderPassMultiviewCreateInfo = @ptrCast(@alignCast(mb));
+        if (mv.subpassCount > 0) rp.view_mask = mv.pViewMasks.?[0];
+    }
     const sp = ci.pSubpasses.?[0];
     if (sp.colorAttachmentCount > MAX_COLOR) return R.error_initialization_failed;
     rp.n_color = sp.colorAttachmentCount;
@@ -4813,6 +4847,7 @@ fn stageIo(uni: u8, bufs: u8, ops: *const spirv.TexOps) spirv.StageIO {
         .uni = uni,
         .word_height = W_HEIGHT,
         .word_base_vertex = W_BASE_VERTEX,
+        .word_view = W_VIEW,
         .word_base_instance = W_BASE_INSTANCE,
         .word_push = W_PUSH,
         .word_views = W_VIEWS,

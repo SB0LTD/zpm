@@ -794,6 +794,7 @@ pub const StructureType = struct {
     pub const image_memory_requirements_info_2: u32 = 1000146001;
     pub const descriptor_update_template_create_info: u32 = 1000085000;
     pub const physical_device_multiview_features: u32 = 1000053001;
+    pub const render_pass_multiview_create_info: u32 = 1000053000;
     pub const physical_device_multiview_properties: u32 = 1000053002;
     pub const physical_device_point_clipping_properties: u32 = 1000117000;
     pub const physical_device_protected_memory_properties: u32 = 1000145001;
@@ -1153,6 +1154,16 @@ pub const DescriptorUpdateTemplateCreateInfo = extern struct {
 };
 pub const DrawIndirectCommand = extern struct { vertexCount: u32, instanceCount: u32, firstVertex: u32, firstInstance: u32 };
 pub const DrawIndexedIndirectCommand = extern struct { indexCount: u32, instanceCount: u32, firstIndex: u32, vertexOffset: i32, firstInstance: u32 };
+pub const RenderPassMultiviewCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    subpassCount: u32,
+    pViewMasks: ?[*]const u32,
+    dependencyCount: u32,
+    pViewOffsets: ?[*]const i32,
+    correlationMaskCount: u32,
+    pCorrelationMasks: ?[*]const u32,
+};
 pub const PhysicalDeviceMultiviewFeatures = extern struct { sType: u32, pNext: ?*anyopaque, multiview: u32, multiviewGeometryShader: u32, multiviewTessellationShader: u32 };
 pub const PhysicalDeviceMultiviewProperties = extern struct { sType: u32, pNext: ?*anyopaque, maxMultiviewViewCount: u32, maxMultiviewInstanceIndex: u32 };
 pub const PhysicalDevicePointClippingProperties = extern struct { sType: u32, pNext: ?*anyopaque, pointClippingBehavior: u32 };
