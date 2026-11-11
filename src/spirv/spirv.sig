@@ -528,11 +528,25 @@ pub const Info = struct {
 
 /// A storage image format (SPIR-V's ImageFormat) as it is in memory:
 /// `comps` 32-bit components of `ty`, or four unorm bytes in one word.
-pub const StorageFormat = struct { comps: u8, ty: kir.Ty, unorm8: bool = false };
+/// How a storage image's texel is kept: `comps` 32-bit words of `ty`, or
+/// (unorm8) four bytes in one word. The 8- and 16-bit formats WebGPU
+/// stores to are kept widened, a word a channel (the driver converts at
+/// copies, vk's format.sig): `quant` rounds a write to what the narrow
+/// format holds.
+pub const StorageFormat = struct { comps: u8, ty: kir.Ty, unorm8: bool = false, quant: Quant = .none };
+pub const Quant = enum(u8) { none, snorm8, u8, s8, u16, s16 };
 
 pub fn storageFormat(image_format: u32) ?StorageFormat {
     return switch (image_format) {
         1 => .{ .comps = 4, .ty = .f32 }, // Rgba32f
+        2 => .{ .comps = 4, .ty = .f32 }, // Rgba16f (widened)
+        7 => .{ .comps = 2, .ty = .f32 }, // Rg16f
+        9 => .{ .comps = 1, .ty = .f32 }, // R16f
+        5 => .{ .comps = 4, .ty = .f32, .quant = .snorm8 }, // Rgba8Snorm
+        22 => .{ .comps = 4, .ty = .i32, .quant = .s16 }, // Rgba16i
+        23 => .{ .comps = 4, .ty = .i32, .quant = .s8 }, // Rgba8i
+        31 => .{ .comps = 4, .ty = .u32, .quant = .u16 }, // Rgba16ui
+        32 => .{ .comps = 4, .ty = .u32, .quant = .u8 }, // Rgba8ui
         3 => .{ .comps = 1, .ty = .f32 }, // R32f
         4 => .{ .comps = 4, .ty = .f32, .unorm8 = true }, // Rgba8
         6 => .{ .comps = 2, .ty = .f32 }, // Rg32f
@@ -653,6 +667,9 @@ pub const StageIO = struct {
     // fragment: out
     /// the output location that is the colour (the rest are dropped)
     color_loc: u32 = 0,
+    /// fragment: the colour location's attachment is sRGB: its colour is
+    /// encoded here (linear to sRGB), the raster writing bytes as unorm
+    srgb: bool = false,
     color: [4]V = .{ .none, .none, .none, .none },
     discard: V = .none,
 };
@@ -2809,6 +2826,20 @@ pub const Gen = struct {
         for (fill) |*x| {
             if (x.* == .none) x.* = k.mov(.f32, f(0));
         }
+        if (g.opts.stage == .fragment and io.srgb) {
+            for (io.color[0..3]) |*x| x.* = g.srgbEncode(x.*);
+        }
+    }
+
+    /// Linear to sRGB (IEC 61966-2-1), clamped to [0, 1].
+    fn srgbEncode(g: *Gen, x: V) V {
+        const k = g.k;
+        const c = g.fop(.fmin, g.fop(.fmax, r(x), f(0)), f(1));
+        const lo = g.fop(.fmul, c, f(12.92));
+        const p = g.fop1(.fexp2, g.fop(.fmul, g.fop1(.flog2, c), f(1.0 / 2.4)));
+        const hi = g.fop(.fsub, g.fop(.fmul, p, f(1.055)), f(0.055));
+        const v = g.sel(.f32, g.fcmp(.le, c, f(0.0031308)), lo, hi);
+        return if (v == .reg) v.reg else k.mov(.f32, v);
     }
 
     fn outBuiltin(g: *Gen, bi: u32, first: u32, n: u32) Error!void {
@@ -2938,7 +2969,19 @@ pub const Gen = struct {
             k.store(.u32, mem, addr, r(g.reg(word, .u32)));
         } else {
             for (0..fmt.comps) |j| {
-                const v = if (j < texel.len) texel[j] else u(0);
+                const v0 = if (j < texel.len) texel[j] else u(0);
+                // (what the narrow format holds: its rounding, its bits)
+                const v = switch (fmt.quant) {
+                    .none => v0,
+                    .snorm8 => blk: {
+                        const cl = g.fop(.fmin, g.fop(.fmax, v0, f(-1)), f(1));
+                        break :blk g.fop(.fdiv, g.fop1(.frne, g.fop(.fmul, cl, f(127))), f(127));
+                    },
+                    .u8 => g.iop(.@"and", .u32, v0, u(0xff)),
+                    .u16 => g.iop(.@"and", .u32, v0, u(0xffff)),
+                    .s8 => r(g.k.op3(.bfe, .i32, r(g.reg(v0, .i32)), u(0), u(8))),
+                    .s16 => r(g.k.op3(.bfe, .i32, r(g.reg(v0, .i32)), u(0), u(16))),
+                };
                 k.store(fmt.ty, mem, g.iadd(addr, u(@intCast(4 * j))), r(g.reg(v, fmt.ty)));
             }
         }

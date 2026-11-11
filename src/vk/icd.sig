@@ -409,6 +409,8 @@ const T = struct {
     var code: [2 << 20]u8 align(16) = undefined;
     /// a pipeline cache's blob, made (or copied) before it goes into the arena
     var blob: [(2 << 20) + 4096]u8 align(8) = undefined;
+    /// (the transfer kernel's rg11b10 channels, while it is built)
+    var uf_parts: [3]kir.V = undefined;
     // running
     var ds: [MAX_RUN]gpu.Dispatch = undefined;
     var ds_bufs: [MAX_RUN][spirv.MAX_BINDINGS]gpu.Buffer = undefined;
@@ -3152,7 +3154,8 @@ const Exec = struct {
 
     /// The transfer kernel's mode and texel bytes for one aspect between a
     /// buffer and an image (to_image: the buffer is the source).
-    fn aspectMode(fi: *const format.Info, aspect: u32, to_image: bool) struct { mode: XMode, buf: u32, img: u32 } {
+    fn aspectMode(fi: *const format.Info, aspect: u32, to_image: bool) struct { mode: XMode, buf: u32, img: u32, fmt: u32 = 0 } {
+        if (fi.wide != .none) return .{ .mode = if (to_image) .widen else .narrow, .buf = fi.app_bytes, .img = fi.bytes, .fmt = @as(u32, @intFromEnum(fi.wide)) | @as(u32, fi.wcomps) << 8 };
         if (aspect & format.ASPECT_STENCIL != 0 and aspect & format.ASPECT_DEPTH == 0 and fi.aspects & format.ASPECT_STENCIL != 0) {
             return .{ .mode = if (to_image) .s8_in else .s8_out, .buf = 1, .img = 4 };
         }
@@ -3189,6 +3192,7 @@ const Exec = struct {
         var p = [_]u32{0} ** X_PARAMS;
         p[X_W] = w;
         p[X_MODE] = @intFromEnum(m.mode);
+        p[X_FMT] = m.fmt;
         if (to_image) {
             p[X_SOFF] = buf_off;
             p[X_SROW] = brow;
@@ -3973,6 +3977,8 @@ const GPipe = struct {
     front: abi.StencilOpState,
     back: abi.StencilOpState,
     n_color: u32,
+    /// colour attachment c is sRGB (bit c): its fragment colour encoded
+    srgb: u32 = 0,
     blend: [MAX_COLOR]BlendAtt,
     consts: [4]f32,
     viewport: abi.Viewport,
@@ -4571,6 +4577,14 @@ fn makeGPipe(di: u32, pi: u32, ci: *const abi.GraphicsPipelineCreateInfo) Result
     const rpi = unhandle(.render_pass, ci.renderPass) orelse return R.error_initialization_failed;
     const rpass = &T.render_passes[rpi];
     p.n_color = rpass.n_color;
+    p.srgb = 0;
+    for (0..rpass.n_color) |c| {
+        const a = rpass.color[c];
+        if (a == NONE or a >= rpass.n_att) continue;
+        if (format.image(rpass.att[a].fmt)) |fi| {
+            if (fi.srgb) p.srgb |= @as(u32, 1) << @intCast(c);
+        }
+    }
     for (0..MAX_COLOR) |c| p.blend[c] = .{ .enable = false, .src_c = 1, .dst_c = 0, .op_c = 0, .src_a = 1, .dst_a = 0, .op_a = 0, .mask = 0xf };
     if (ci.pColorBlendState) |cb| {
         for (0..@min(cb.attachmentCount, MAX_COLOR)) |c| {
@@ -4767,6 +4781,7 @@ fn emitFragment(ctx: ?*const anyopaque, k: *kir.Kernel, fio: *raster.FragmentIO)
     io.odd_x = fio.odd_x;
     io.odd_y = fio.odd_y;
     io.color_loc = em.loc;
+    io.srgb = em.loc != NONE and em.loc < 32 and p.srgb >> @intCast(em.loc) & 1 != 0;
     var res = p.res;
     if (!emitStage(p, .fragment, k, &io, &res)) {
         if (k.err == null) k.err = error.BadOperand;
@@ -5063,7 +5078,9 @@ const X_SB = 8;
 const X_DB = 9;
 const X_V = 10;
 const X_KEEP = 14;
-const X_PARAMS = 15;
+/// widen, narrow: the app's channels: format.Wide | count << 8
+const X_FMT = 15;
+const X_PARAMS = 16;
 
 const XMode = enum(u32) {
     /// SB bytes as they are
@@ -5077,7 +5094,185 @@ const XMode = enum(u32) {
     d24_in = 7,
     fill = 8,
     s8_word_in = 9,
+    /// a widened format's texel: the app's (in a buffer) into the image's
+    /// words, and back (X_FMT says which)
+    widen = 10,
+    narrow = 11,
 };
+
+/// The transfer kernel's widen and narrow (format.sig's widened formats):
+/// texel x at s (the source's) to d. Widen: the app's channels (8 or 16
+/// bits each, or one packed word) to 32-bit words; narrow: back, rounded
+/// to the format (unorm, snorm: to nearest; integers: their low bits).
+fn xferWide(k: *kir.Kernel, src: u8, dst: u8, s: kir.V, d: kir.V, widen: kir.V) void {
+    const r = kir.r;
+    const u = kir.u;
+    const f = kir.f;
+    const W = format.Wide;
+    const fw = k.param(.u32, X_FMT);
+    const kind = k.op2(.@"and", .u32, r(fw), u(0xff));
+    const nc = k.op2(.shr, .u32, r(fw), u(8));
+    const isk = struct {
+        fn f_(kk: *kir.Kernel, v: kir.V, w: W) kir.V {
+            return kk.cmp(.u32, .eq, r(v), u(@intFromEnum(w)));
+        }
+    }.f_;
+    const any = struct {
+        fn f_(kk: *kir.Kernel, v: kir.V, ws: []const W) kir.V {
+            var p = isk(kk, v, ws[0]);
+            for (ws[1..]) |w| p = kk.op2(.por, .pred, r(p), r(isk(kk, v, w)));
+            return p;
+        }
+    }.f_;
+    const packed_ = any(k, kind, &.{ .rgb10a2, .rgb10a2ui, .rg11b10 });
+    const bytes8 = any(k, kind, &.{ .snorm8, .u8, .s8 });
+    const signed_ = any(k, kind, &.{ .snorm8, .s8, .snorm16, .s16 });
+    const g32 = kir.global(dst, 32);
+    k.ifp(r(widen));
+    {
+        k.ifp(r(packed_));
+        {
+            const w = k.load(.u32, kir.global(src, 32), r(s));
+            for (0..4) |c| {
+                const cc: u32 = @intCast(c);
+                // rgb10a2: 10, 10, 10, 2 bits
+                const field = k.op3(.bfe, .u32, r(w), u(10 * cc), u(if (c < 3) 10 else 2));
+                const un = k.div(r(k.cvt(.u32, .f32, .rne, r(field))), f(if (c < 3) 1023 else 3));
+                // rg11b10: 11, 11, 10 bits of e5 m6 / e5 m5; alpha 1
+                const uf: kir.V = if (c < 3) ufloatDecode(k, w, if (c == 2) 22 else 11 * cc, if (c == 2) 5 else 6) else k.mov(.u32, f(1));
+                const v = k.sel(.u32, r(isk(k, kind, .rgb10a2)), r(k.mov(.u32, r(un))), r(k.sel(.u32, r(isk(k, kind, .rg11b10)), r(uf), r(field))));
+                k.store(.u32, g32, r(k.op2(.iadd, .u32, r(d), u(4 * cc))), r(v));
+            }
+        }
+        k.els();
+        for (0..4) |c| {
+            const cc: u32 = @intCast(c);
+            k.ifp(r(k.cmp(.u32, .gt, r(nc), u(cc))));
+            const raw = k.reg(.u32);
+            k.ifp(r(bytes8));
+            {
+                var m8 = kir.global(src, 8);
+                m8.signed = true;
+                const sv = k.load(.i32, m8, r(k.op2(.iadd, .u32, r(s), u(cc))));
+                const uv = k.load(.u32, kir.global(src, 8), r(k.op2(.iadd, .u32, r(s), u(cc))));
+                k.set(raw, .sel, r(sv), r(uv), r(signed_));
+            }
+            k.els();
+            {
+                var m16 = kir.global(src, 16);
+                m16.signed = true;
+                const at = k.op2(.iadd, .u32, r(s), u(2 * cc));
+                const sv = k.load(.i32, m16, r(at));
+                const uv = k.load(.u32, kir.global(src, 16), r(at));
+                k.set(raw, .sel, r(sv), r(uv), r(signed_));
+            }
+            k.endif();
+            // (the 16 bits of a half: raw's low half as an f16 register)
+            const half = k.cvt(.f16, .f32, .rne, r(k.mov(.f16, r(k.op2(.@"and", .u32, r(raw), u(0xffff))))));
+            const un16 = k.div(r(k.cvt(.u32, .f32, .rne, r(raw))), f(65535));
+            const sn16 = k.op2(.fmax, .f32, r(k.div(r(k.cvt(.i32, .f32, .rne, r(raw))), f(32767))), f(-1));
+            const sn8 = k.op2(.fmax, .f32, r(k.div(r(k.cvt(.i32, .f32, .rne, r(raw))), f(127))), f(-1));
+            var v = raw;
+            v = k.sel(.u32, r(isk(k, kind, .f16)), r(k.mov(.u32, r(half))), r(v));
+            v = k.sel(.u32, r(isk(k, kind, .unorm16)), r(k.mov(.u32, r(un16))), r(v));
+            v = k.sel(.u32, r(isk(k, kind, .snorm16)), r(k.mov(.u32, r(sn16))), r(v));
+            v = k.sel(.u32, r(isk(k, kind, .snorm8)), r(k.mov(.u32, r(sn8))), r(v));
+            k.store(.u32, g32, r(k.op2(.iadd, .u32, r(d), u(4 * cc))), r(v));
+            k.endif();
+        }
+        k.endif();
+    }
+    k.els();
+    {
+        k.ifp(r(packed_));
+        {
+            var word: kir.Arg = u(0);
+            for (0..4) |c| {
+                const cc: u32 = @intCast(c);
+                var m = kir.global(src, 32);
+                m.imm = @intCast(4 * cc);
+                const w = k.load(.u32, m, r(s));
+                const fv = k.mov(.f32, r(w));
+                const top: f32 = if (c < 3) 1023 else 3;
+                const un = k.cvt(.f32, .u32, .rne, r(k.op2(.fmul, .f32, r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(fv), f(0))), f(1))), f(top))));
+                const ui = k.op2(.@"and", .u32, r(w), u(if (c < 3) 1023 else 3));
+                const q = k.sel(.u32, r(isk(k, kind, .rgb10a2)), r(un), r(ui));
+                word = r(k.op2(.@"or", .u32, word, r(k.op2(.shl, .u32, r(q), u(10 * cc)))));
+                if (c < 3) {
+                    const e = ufloatEncode(k, w, if (c == 2) 5 else 6);
+                    const at: u32 = if (c == 2) 22 else 11 * cc;
+                    // (rg11b10's word built apart, chosen below)
+                    T.uf_parts[c] = k.op2(.shl, .u32, r(e), u(at));
+                }
+            }
+            const uf = k.op2(.@"or", .u32, r(T.uf_parts[0]), r(k.op2(.@"or", .u32, r(T.uf_parts[1]), r(T.uf_parts[2]))));
+            k.store(.u32, kir.global(dst, 32), r(d), r(k.sel(.u32, r(isk(k, kind, .rg11b10)), r(uf), word)));
+        }
+        k.els();
+        for (0..4) |c| {
+            const cc: u32 = @intCast(c);
+            k.ifp(r(k.cmp(.u32, .gt, r(nc), u(cc))));
+            var m = kir.global(src, 32);
+            m.imm = @intCast(4 * cc);
+            const w = k.load(.u32, m, r(s));
+            const fv = k.mov(.f32, r(w));
+            const h = k.mov(.u32, r(k.cvt(.f32, .f16, .rne, r(fv))));
+            const un16 = k.cvt(.f32, .u32, .rne, r(k.op2(.fmul, .f32, r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(fv), f(0))), f(1))), f(65535))));
+            const sn16 = k.cvt(.f32, .i32, .rne, r(k.op2(.fmul, .f32, r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(fv), f(-1))), f(1))), f(32767))));
+            const sn8 = k.cvt(.f32, .i32, .rne, r(k.op2(.fmul, .f32, r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(fv), f(-1))), f(1))), f(127))));
+            var v = w;
+            v = k.sel(.u32, r(isk(k, kind, .f16)), r(h), r(v));
+            v = k.sel(.u32, r(isk(k, kind, .unorm16)), r(un16), r(v));
+            v = k.sel(.u32, r(isk(k, kind, .snorm16)), r(sn16), r(v));
+            v = k.sel(.u32, r(isk(k, kind, .snorm8)), r(sn8), r(v));
+            k.ifp(r(bytes8));
+            k.store(.u32, kir.global(dst, 8), r(k.op2(.iadd, .u32, r(d), u(cc))), r(v));
+            k.els();
+            k.store(.u32, kir.global(dst, 16), r(k.op2(.iadd, .u32, r(d), u(2 * cc))), r(v));
+            k.endif();
+            k.endif();
+        }
+        k.endif();
+    }
+    k.endif();
+}
+
+/// An unsigned small float (5 exponent bits, `mb` mantissa bits) at bit
+/// `at` of w, as f32 bits: normal, denormal, infinity and NaN.
+fn ufloatDecode(k: *kir.Kernel, w: kir.V, at: u32, mb: u5) kir.V {
+    const r = kir.r;
+    const u = kir.u;
+    const e = k.op3(.bfe, .u32, r(w), u(at + mb), u(5));
+    const m = k.op3(.bfe, .u32, r(w), u(at), u(mb));
+    const sh: u32 = 23 - @as(u32, mb);
+    const normal = k.op2(.@"or", .u32, r(k.op2(.shl, .u32, r(k.op2(.iadd, .u32, r(e), u(112))), u(23))), r(k.op2(.shl, .u32, r(m), u(sh))));
+    const scale: f32 = std.math.pow(f32, 2, -14 - @as(f32, @floatFromInt(mb)));
+    const denorm = k.mov(.u32, r(k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(m))), kir.f(scale))));
+    const special = k.op2(.@"or", .u32, u(0x7f80_0000), r(k.op2(.shl, .u32, r(m), u(sh))));
+    return k.sel(.u32, r(k.cmp(.u32, .eq, r(e), u(0))), r(denorm), r(k.sel(.u32, r(k.cmp(.u32, .eq, r(e), u(31))), r(special), r(normal))));
+}
+
+/// f32 bits b as an unsigned small float (5 exponent bits, `mb` mantissa
+/// bits; truncated: a value that came from the format comes back exactly;
+/// negative: 0, too big: infinity, NaN: a NaN).
+fn ufloatEncode(k: *kir.Kernel, b: kir.V, mb: u5) kir.V {
+    const r = kir.r;
+    const u = kir.u;
+    const sh: u32 = 23 - @as(u32, mb);
+    const e8 = k.op3(.bfe, .u32, r(b), u(23), u(8));
+    const m23 = k.op2(.@"and", .u32, r(b), u(0x7f_ffff));
+    const normal = k.op2(.@"or", .u32, r(k.op2(.shl, .u32, r(k.op2(.isub, .u32, r(e8), u(112))), u(mb))), r(k.op2(.shr, .u32, r(m23), u(sh))));
+    // (a denormal: 1.m shifted down past the smallest exponent)
+    const total = k.op2(.iadd, .u32, u(sh), r(k.op2(.isub, .u32, u(113), r(e8))));
+    const den = k.sel(.u32, r(k.cmp(.u32, .lt, r(total), u(32))), r(k.op2(.shr, .u32, r(k.op2(.@"or", .u32, r(m23), u(0x80_0000))), r(total))), u(0));
+    const inf: u32 = @as(u32, 31) << mb;
+    const nan = k.sel(.u32, r(k.cmp(.u32, .ne, r(m23), u(0))), u(inf | 1), u(inf));
+    var v = k.sel(.u32, r(k.cmp(.u32, .ge, r(e8), u(113))), r(normal), r(den));
+    v = k.sel(.u32, r(k.cmp(.u32, .ge, r(e8), u(143))), u(inf), r(v));
+    v = k.sel(.u32, r(k.cmp(.u32, .eq, r(e8), u(255))), r(nan), r(v));
+    v = k.sel(.u32, r(k.cmp(.u32, .eq, r(e8), u(0))), u(0), r(v));
+    return k.sel(.u32, r(k.cmp(.u32, .ne, r(k.op2(.shr, .u32, r(b), u(31))), u(0))), u(0), r(v));
+}
 
 fn xferKernel(g: *Gpu) ?gpu.Program {
     var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "vk_xfer", .{ GROUP, 1, 1 });
@@ -5144,6 +5339,9 @@ fn xferKernel(g: *Gpu) ?gpu.Program {
         k.endif();
     }
     k.els();
+    k.ifp(r(k.op2(.por, .pred, r(is(&k, mode, .widen)), r(is(&k, mode, .narrow)))));
+    xferWide(&k, src, dst, s, d, is(&k, mode, .widen));
+    k.els();
     {
         // the depth and stencil conversions: one word of the image's a texel
         const w32 = k.load(.u32, kir.global(src, 32), r(k.op2(.@"and", .u32, r(s), u(0xffff_fffc))));
@@ -5193,6 +5391,7 @@ fn xferKernel(g: *Gpu) ?gpu.Program {
         }
         k.endif();
     }
+    k.endif();
     k.endif();
     k.endif();
     k.endif();

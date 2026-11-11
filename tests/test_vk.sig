@@ -219,15 +219,16 @@ test "vk: what vulkaninfo asks, through the ICD's entry points, on the emulated 
         fmtProps(pd, f, &fp);
         try testing.expect(fp.optimalTilingFeatures & 0x201 == 0x201); // sampled, depth-stencil attachment
     }
-    fmtProps(pd, 97, &fp); // R16G16B16A16_SFLOAT: a vertex format, not an image one yet
-    try testing.expectEqual(@as(u32, 0), fp.optimalTilingFeatures);
+    fmtProps(pd, 97, &fp); // R16G16B16A16_SFLOAT: widened: sampled, filtered, storage; no linear tiling
+    try testing.expect(fp.optimalTilingFeatures & 0x1003 == 0x1003);
+    try testing.expectEqual(@as(u32, 0), fp.linearTilingFeatures);
     try testing.expect(fp.bufferFeatures & 0x40 != 0);
     const imgFmt = get(inst, "vkGetPhysicalDeviceImageFormatProperties", *const fn (Ptr, u32, u32, u32, u32, u32, ?*abi.ImageFormatProperties) callconv(.c) Res);
     var ifp: abi.ImageFormatProperties = undefined;
     try testing.expectEqual(R.success, imgFmt(pd, 37, 1, 0, 0x14, 0, &ifp));
     try testing.expectEqual(@as(u32, 8192), ifp.maxExtent.width);
     try testing.expectEqual(@as(u32, 5), ifp.sampleCounts); // 1 and 4 (one sample kept)
-    try testing.expectEqual(R.error_format_not_supported, imgFmt(pd, 43, 1, 0, 0x10, 0, &ifp)); // sRGB is not drawn into
+    try testing.expectEqual(R.success, imgFmt(pd, 43, 1, 0, 0x10, 0, &ifp)); // sRGB is drawn into (the fragment shader encodes)
 
     var groups: [1]abi.PhysicalDeviceGroupProperties = undefined;
     groups[0].sType = ST.physical_device_group_properties;
@@ -876,6 +877,9 @@ const G = struct {
     }
 
     /// A render pass: one colour attachment (cleared), and a depth one if asked.
+    /// the colour attachment's format (renderPass's)
+    var color_fmt: u32 = RGBA8;
+
     fn renderPass(g: *G, depth: bool) !H {
         return g.renderPassDs(if (depth) D32F else null);
     }
@@ -883,7 +887,7 @@ const G = struct {
     fn renderPassDs(g: *G, ds_fmt: ?u32) !H {
         const depth = ds_fmt != null;
         const atts = [_]abi.AttachmentDescription{
-            .{ .flags = 0, .format = RGBA8, .samples = 1, .loadOp = 1, .storeOp = 0, .stencilLoadOp = 2, .stencilStoreOp = 1, .initialLayout = 0, .finalLayout = 2 },
+            .{ .flags = 0, .format = G.color_fmt, .samples = 1, .loadOp = 1, .storeOp = 0, .stencilLoadOp = 2, .stencilStoreOp = 1, .initialLayout = 0, .finalLayout = 2 },
             .{ .flags = 0, .format = ds_fmt orelse D32F, .samples = 1, .loadOp = 1, .storeOp = 0, .stencilLoadOp = 1, .stencilStoreOp = 0, .initialLayout = 0, .finalLayout = 3 },
         };
         const cref = abi.AttachmentReference{ .attachment = 0, .layout = 2 };
@@ -1112,13 +1116,22 @@ fn triangleDraw(open: *const fn () ?icd.Gpu, indexed: bool) !void {
 /// texture with two levels sampled (implicit LOD: derivatives over quads;
 /// an explicit level), and a layer of a 2D array fetched.
 fn quadThroughVulkan(open: *const fn () ?icd.Gpu) !void {
+    return quadDraw(open, false);
+}
+
+/// `srgb`: into an R8G8B8A8_SRGB attachment (the fragment shader's colour
+/// encoded: each byte the sRGB of the texel's, within one).
+fn quadDraw(open: *const fn () ?icd.Gpu, srgb: bool) !void {
     use(open);
     var v = try Vk.open();
     defer v.close();
     var g = try G.init(&v);
     const W = 16;
-    const color = try g.newImage(RGBA8, W, W, 1, 1, 0x11);
-    const cview = try g.newView(color.img, RGBA8, 1, 1, 0, 1);
+    const cfmt: u32 = if (srgb) 43 else RGBA8;
+    G.color_fmt = cfmt;
+    defer G.color_fmt = RGBA8;
+    const color = try g.newImage(cfmt, W, W, 1, 1, 0x11);
+    const cview = try g.newView(color.img, cfmt, 1, 1, 0, 1);
     const rp = try g.renderPass(false);
     const fb = try g.framebuffer(rp, &.{cview}, W, W);
     // the texture: 4 x 4 (level 0) and 2 x 2 (level 1); the array: 2 layers of 4 x 4
@@ -1197,12 +1210,105 @@ fn quadThroughVulkan(open: *const fn () ?icd.Gpu) !void {
                 else => sw[32 + 16 + (y / 4) * 4 + x / 4],
             };
             const got = std.mem.readInt(u32, &p, .little);
+            if (srgb) {
+                for (0..4) |ch| {
+                    const b: u8 = @truncate(want >> @intCast(8 * ch));
+                    const lin = @as(f32, @floatFromInt(b)) / 255.0;
+                    const enc = if (lin <= 0.0031308) lin * 12.92 else 1.055 * std.math.pow(f32, lin, 1.0 / 2.4) - 0.055;
+                    const e: i32 = if (ch == 3) b else @intFromFloat(@round(enc * 255.0));
+                    const gb: i32 = p[ch];
+                    if (@abs(gb - e) > 1) {
+                        std.debug.print("quad into sRGB, {s}: pixel ({d}, {d}) channel {d} = {d}, want {d}\n", .{ names[which], x, y, ch, gb, e });
+                        return error.TestUnexpectedResult;
+                    }
+                }
+                continue;
+            }
             if (got != want) {
                 std.debug.print("quad, {s}: pixel ({d}, {d}) = 0x{x:0>8}, want 0x{x:0>8}\n", .{ names[which], x, y, got, want });
                 return error.TestUnexpectedResult;
             }
         };
     }
+}
+
+// ── Widened formats ──
+
+/// Each widened format: texels uploaded (widened to a word a channel) and
+/// read back (narrowed) to the bytes they were; the image's words, read
+/// through a same-sized 32-bit format, the channels' values.
+fn widenedFormats(open: *const fn () ?icd.Gpu) !void {
+    use(open);
+    var v = try Vk.open();
+    defer v.close();
+    var g = try G.init(&v);
+    const Case = struct { vk: u32, app: u32, wide32: u32, texel: []const u8, want: []const u32 };
+    const h1: u16 = @bitCast(@as(f16, 1.5));
+    const h2: u16 = @bitCast(@as(f16, -0.25));
+    const h3: u16 = @bitCast(@as(f16, 6.0e-5)); // a half's denormal
+    const h4: u16 = @bitCast(@as(f16, 65504));
+    const cases = [_]Case{
+        // rgba16float
+        .{ .vk = 97, .app = 8, .wide32 = 109, .texel = &.{ @truncate(h1), @truncate(h1 >> 8), @truncate(h2), @truncate(h2 >> 8), @truncate(h3), @truncate(h3 >> 8), @truncate(h4), @truncate(h4 >> 8) }, .want = &.{ @bitCast(@as(f32, 1.5)), @bitCast(@as(f32, -0.25)), @bitCast(@as(f32, @as(f16, 6.0e-5))), @bitCast(@as(f32, 65504)) } },
+        // rgba8snorm: 127, -127, 0, 64
+        .{ .vk = 38, .app = 4, .wide32 = 109, .texel = &.{ 127, 0x81, 0, 64 }, .want = &.{ @bitCast(@as(f32, 1)), @bitCast(@as(f32, -1)), 0, @bitCast(@as(f32, 64.0) / @as(f32, 127.0)) } },
+        // rgba8uint, rgba8sint
+        .{ .vk = 41, .app = 4, .wide32 = 107, .texel = &.{ 1, 200, 255, 0 }, .want = &.{ 1, 200, 255, 0 } },
+        .{ .vk = 42, .app = 4, .wide32 = 108, .texel = &.{ 1, 0x80, 0xff, 0x7f }, .want = &.{ 1, @bitCast(@as(i32, -128)), @bitCast(@as(i32, -1)), 127 } },
+        // rgba16uint, rgba16sint
+        .{ .vk = 95, .app = 8, .wide32 = 107, .texel = &.{ 1, 0, 0xff, 0xff, 0x34, 0x12, 0, 0x80 }, .want = &.{ 1, 0xffff, 0x1234, 0x8000 } },
+        .{ .vk = 96, .app = 8, .wide32 = 108, .texel = &.{ 1, 0, 0xff, 0xff, 0x34, 0x12, 0, 0x80 }, .want = &.{ 1, @bitCast(@as(i32, -1)), 0x1234, @bitCast(@as(i32, -32768)) } },
+        // rgba16unorm: 0, 65535, 32768, 1
+        .{ .vk = 91, .app = 8, .wide32 = 109, .texel = &.{ 0, 0, 0xff, 0xff, 0, 0x80, 1, 0 }, .want = &.{ 0, @bitCast(@as(f32, 1)), @bitCast(@as(f32, 32768.0) / @as(f32, 65535.0)), @bitCast(@as(f32, 1.0) / @as(f32, 65535.0)) } },
+        // rgb10a2unorm: r 1023, g 0, b 512, a 2
+        .{ .vk = 64, .app = 4, .wide32 = 109, .texel = &.{ 0xff, 0x03, 0x00, 0xa0 }, .want = &.{ @bitCast(@as(f32, 1)), 0, @bitCast(@as(f32, 512.0) / @as(f32, 1023.0)), @bitCast(@as(f32, 2.0) / @as(f32, 3.0)) } },
+        // rg11b10ufloat: r 1.0 (e15 m0), g 0.5 (e14), b 2.0 (e16 in 5:5); alpha 1
+        .{ .vk = 122, .app = 4, .wide32 = 109, .texel = blk: {
+            const w: u32 = (15 << 6) | ((14 << 6) << 11) | ((16 << 5) << 22);
+            break :blk &.{ @truncate(w), @truncate(w >> 8), @truncate(w >> 16), @truncate(w >> 24) };
+        }, .want = &.{ @bitCast(@as(f32, 1)), @bitCast(@as(f32, 0.5)), @bitCast(@as(f32, 2)), @bitCast(@as(f32, 1)) } },
+    };
+    const W = 4;
+    const stage = try v.buffer(4096, 2);
+    const back = try v.buffer(4096, 2);
+    const wide = try v.buffer(4096, 2);
+    for (cases) |c| {
+        const img = try g.newImage(c.vk, W, W, 1, 1, 0x7);
+        const img32 = try g.newImage(c.wide32, W, W, 1, 1, 0x7);
+        for (0..W * W) |t| @memcpy(stage.ptr.?[t * c.app ..][0..c.app], c.texel);
+        @memset(back.ptr.?[0..4096], 0xcc);
+        try g.begin();
+        g.fromBuffer(stage.buf, 0, img.img, W, W, 0, 0);
+        g.toBuffer(img.img, back.buf, W, W, 0, 0, 1);
+        const region = abi.ImageCopy{ .srcSubresource = .{ .aspectMask = 1, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 }, .srcOffset = .{ .x = 0, .y = 0, .z = 0 }, .dstSubresource = .{ .aspectMask = 1, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 }, .dstOffset = .{ .x = 0, .y = 0, .z = 0 }, .extent = .{ .width = W, .height = W, .depth = 1 } };
+        g.f("vkCmdCopyImage", *const fn (Ptr, H, u32, H, u32, u32, [*]const abi.ImageCopy) callconv(.c) void)(g.cb, img.img, 6, img32.img, 7, 1, @ptrCast(&region));
+        g.toBuffer(img32.img, wide.buf, W, W, 0, 0, 1);
+        try g.run();
+        testing.expectEqualSlices(u8, stage.ptr.?[0 .. W * W * c.app], back.ptr.?[0 .. W * W * c.app]) catch |e| {
+            std.debug.print("widened format {d}: read back {any}, want {any}\n", .{ c.vk, back.ptr.?[0..c.app], c.texel });
+            return e;
+        };
+        const words: [*]const u32 = @ptrCast(@alignCast(wide.ptr.?));
+        for (0..W * W) |t| {
+            for (c.want, 0..) |want, ch| {
+                testing.expectEqual(want, words[t * 4 + ch]) catch |e| {
+                    std.debug.print("widened format {d}: channel {d} = {x}, want {x}\n", .{ c.vk, ch, words[t * 4 + ch], want });
+                    return e;
+                };
+            }
+        }
+    }
+}
+
+test "vk: widened formats (16-bit float, snorm, 8/16-bit integers, RGBA16, RGB10A2, RG11B10) uploaded and read back on the emulated RTX" {
+    try widenedFormats(&openRtx);
+}
+test "vk: widened formats on KIR's interpreter" {
+    try widenedFormats(&openInterp);
+}
+
+test "vk: naga's textured quad into an sRGB attachment (the fragment shader encodes) on the emulated RTX" {
+    try quadDraw(&openRtx, true);
 }
 
 test "vk: naga's triangle drawn with 8-bit indices and a negative vertexOffset on the emulated RTX" {
