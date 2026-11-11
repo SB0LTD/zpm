@@ -26,7 +26,7 @@ pub const N = enum(u8) {
     func, // tok: name, a: return type_spec, b: first param, c: body block (0: prototype)
     param, // tok: name (0: none), a: type_spec, b: array size, flags: in/out/inout/const
     invariant, // tok: the name made invariant
-    block_decl, // an interface block (refused by the checker)
+    block_decl, // a uniform block: tok: its name, a: struct_def (the members), b: the instance's var (0: none), flags: qualifiers
     // statements
     block, // a: first statement
     decl_stmt, // a: decl
@@ -79,6 +79,10 @@ pub const Q = struct {
     pub const varying: u16 = 1 << 9;
     /// a precision said (lowp, mediump, highp)
     pub const precision: u16 = 1 << 10;
+    /// a uniform block's (or its member's) matrices: layout(row_major),
+    /// layout(column_major) (std140, shared and packed are all std140 here)
+    pub const row_major: u16 = 1 << 11;
+    pub const column_major: u16 = 1 << 12;
 };
 
 pub const Node = struct {
@@ -110,6 +114,8 @@ pub const Parser = struct {
     struct_names: [MAX_STRUCT_NAMES][]const u8 = undefined,
     nstructs: usize = 0,
     full: bool = false,
+    /// `layout(row_major) uniform;`: the uniform blocks' default after it
+    block_row_major: bool = false,
 
     /// Parses the tokens (the last an eof); the root's index, or 0 when
     /// the nodes ran out.
@@ -199,7 +205,7 @@ pub const Parser = struct {
     }
 
     fn isTypeKw(kw: Kw) bool {
-        return @intFromEnum(kw) >= @intFromEnum(Kw.void) and @intFromEnum(kw) <= @intFromEnum(Kw.samplerExternalOES);
+        return @backingInt(kw) >= @backingInt(Kw.void) and @backingInt(kw) <= @backingInt(Kw.samplerExternalOES);
     }
 
     fn isQualKw(kw: Kw) bool {
@@ -277,7 +283,11 @@ pub const Parser = struct {
                             if (std.mem.eql(u8, id.text, "location")) {
                                 if (v.kind == .int_lit or v.kind == .uint_lit) location = (lex.intValue(v.text) orelse 0) + 1 else p.log.err(v.line, "layout location needs a number", .{});
                             } else p.log.err(id.line, "layout qualifier `{s}` is not supported", .{id.text});
-                        } else if (!std.mem.eql(u8, id.text, "std140") and !std.mem.eql(u8, id.text, "shared") and !std.mem.eql(u8, id.text, "packed") and !std.mem.eql(u8, id.text, "row_major") and !std.mem.eql(u8, id.text, "column_major")) {
+                        } else if (std.mem.eql(u8, id.text, "row_major")) {
+                            flags = (flags & ~Q.column_major) | Q.row_major;
+                        } else if (std.mem.eql(u8, id.text, "column_major")) {
+                            flags = (flags & ~Q.row_major) | Q.column_major;
+                        } else if (!std.mem.eql(u8, id.text, "std140") and !std.mem.eql(u8, id.text, "shared") and !std.mem.eql(u8, id.text, "packed")) {
                             p.log.err(id.line, "layout qualifier `{s}` is not supported", .{id.text});
                         }
                         if (!p.accept(.comma)) break;
@@ -320,37 +330,7 @@ pub const Parser = struct {
                 }
             }
             if (!p.expect(.lbrace, "`{` of a struct")) return ts;
-            var last: u32 = 0;
-            while (!p.is(.rbrace) and !p.is(.eof)) {
-                const before = p.at;
-                const q = p.qualifiers();
-                if (q.flags & ~Q.precision != 0) p.log.err(p.line(), "struct members take no qualifiers", .{});
-                const mt = p.typeSpec();
-                // a member decl: a = type, b = first declarator
-                const md = p.node(.decl, p.line());
-                p.set(md).a = mt;
-                var first: u32 = 0;
-                var dlast: u32 = 0;
-                while (true) {
-                    if (p.peek().kind != .ident) {
-                        p.log.err(p.line(), "expected a member name, found `{s}`", .{p.peek().text});
-                        break;
-                    }
-                    const v = p.node(.@"var", p.line());
-                    p.set(v).tok = p.take();
-                    var unsized = false;
-                    p.set(v).a = p.arraySuffix(&unsized);
-                    if (unsized) p.log.err(p.line(), "struct members need a size", .{});
-                    if (first == 0) first = v else p.set(dlast).next = v;
-                    dlast = v;
-                    if (!p.accept(.comma)) break;
-                }
-                p.set(md).b = first;
-                _ = p.expect(.semicolon, "`;` after a member");
-                p.link(sd, &last, md);
-                if (p.at == before) p.at += 1;
-            }
-            _ = p.expect(.rbrace, "`}`");
+            p.members(sd, false);
             p.set(ts).a = sd;
             p.set(ts).tok = p.set(sd).tok;
         } else if (t.kind == .ident and (isTypeKw(t.kw) or p.isStructName(t))) {
@@ -364,6 +344,45 @@ pub const Parser = struct {
         p.set(ts).b = p.arraySuffix(&unsized);
         if (unsized) p.set(ts).op = 1;
         return ts;
+    }
+
+    /// A struct's or a uniform block's members, to the `}`: each a decl
+    /// (a = type, b = first declarator; a block member's flags: its
+    /// row_major or column_major).
+    fn members(p: *Parser, sd: u32, in_block: bool) void {
+        var last: u32 = 0;
+        while (!p.is(.rbrace) and !p.is(.eof)) {
+            const before = p.at;
+            const q = p.qualifiers();
+            const allowed: u16 = if (in_block) Q.precision | Q.row_major | Q.column_major else Q.precision;
+            if (q.flags & ~allowed != 0) p.log.err(p.line(), "{s} members take no qualifiers", .{if (in_block) "uniform block" else "struct"});
+            const mt = p.typeSpec();
+            // a member decl: a = type, b = first declarator
+            const md = p.node(.decl, p.line());
+            p.set(md).a = mt;
+            p.set(md).flags = q.flags & (Q.row_major | Q.column_major);
+            var first: u32 = 0;
+            var dlast: u32 = 0;
+            while (true) {
+                if (p.peek().kind != .ident) {
+                    p.log.err(p.line(), "expected a member name, found `{s}`", .{p.peek().text});
+                    break;
+                }
+                const v = p.node(.@"var", p.line());
+                p.set(v).tok = p.take();
+                var unsized = false;
+                p.set(v).a = p.arraySuffix(&unsized);
+                if (unsized) p.log.err(p.line(), "{s} members need a size", .{if (in_block) "uniform block" else "struct"});
+                if (first == 0) first = v else p.set(dlast).next = v;
+                dlast = v;
+                if (!p.accept(.comma)) break;
+            }
+            p.set(md).b = first;
+            _ = p.expect(.semicolon, "`;` after a member");
+            p.link(sd, &last, md);
+            if (p.at == before) p.at += 1;
+        }
+        _ = p.expect(.rbrace, "`}`");
     }
 
     // ── Declarations ───────────────────────────────────────────────────────
@@ -382,7 +401,7 @@ pub const Parser = struct {
             const q = p.peek();
             if (q.kw != .lowp and q.kw != .mediump and q.kw != .highp) p.log.err(ln, "precision needs lowp, mediump or highp", .{});
             _ = p.take();
-            p.set(pr).op = @intFromEnum(q.kw);
+            p.set(pr).op = @backingInt(q.kw);
             const t = p.peek();
             if (t.kind != .ident or !isTypeKw(t.kw)) p.log.err(ln, "precision needs a type", .{});
             p.set(pr).tok = p.take();
@@ -398,22 +417,34 @@ pub const Parser = struct {
             _ = p.expect(.semicolon, "`;`");
             return iv;
         }
-        // an interface block: `uniform Name { ... } name;`
+        // `layout(std140, row_major) uniform;`: the blocks' default layout
+        if (top and q.flags & Q.uniform != 0 and p.is(.semicolon)) {
+            _ = p.take();
+            if (q.flags & Q.row_major != 0) p.block_row_major = true;
+            if (q.flags & Q.column_major != 0) p.block_row_major = false;
+            return 0;
+        }
+        // an interface block: `uniform Name { ... } name;` (the checker
+        // takes uniform ones)
         if (q.flags & (Q.uniform | Q.in | Q.out) != 0 and p.peek().kind == .ident and p.peek().kw == .none and !p.isStructName(p.peek()) and p.peekAt(1).kind == .lbrace) {
             const bd = p.node(.block_decl, ln);
             p.set(bd).tok = p.take();
-            var depth: u32 = 0;
-            while (!p.is(.eof)) {
-                const t = p.peek();
-                _ = p.take();
-                if (t.kind == .lbrace) depth += 1;
-                if (t.kind == .rbrace) {
-                    depth -= 1;
-                    if (depth == 0) break;
-                }
+            var flags = q.flags;
+            if (flags & (Q.row_major | Q.column_major) == 0 and p.block_row_major) flags |= Q.row_major;
+            p.set(bd).flags = flags;
+            _ = p.take(); // {
+            const sd = p.node(.struct_def, ln);
+            p.members(sd, true);
+            p.set(bd).a = sd;
+            if (p.peek().kind == .ident and p.peek().kw == .none) {
+                const v = p.node(.@"var", p.line());
+                p.set(v).tok = p.take();
+                var unsized = false;
+                p.set(v).a = p.arraySuffix(&unsized);
+                if (unsized) p.log.err(p.line(), "a uniform block's instance array needs a size", .{});
+                p.set(bd).b = v;
             }
-            while (!p.is(.semicolon) and !p.is(.eof)) _ = p.take();
-            _ = p.accept(.semicolon);
+            _ = p.expect(.semicolon, "`;` after a uniform block");
             return bd;
         }
         const ts = p.typeSpec();
@@ -646,7 +677,7 @@ pub const Parser = struct {
                 const ln = p.line();
                 _ = p.take();
                 const a = p.node(.assign, ln);
-                p.set(a).op = @intFromEnum(k);
+                p.set(a).op = @backingInt(k);
                 p.set(a).a = l;
                 p.set(a).b = p.assignment();
                 return a;
@@ -694,7 +725,7 @@ pub const Parser = struct {
             const ln = p.line();
             _ = p.take();
             const b = p.node(.binary, ln);
-            p.set(b).op = @intFromEnum(k);
+            p.set(b).op = @backingInt(k);
             p.set(b).a = l;
             p.set(b).b = p.binary(pr);
             l = b;
@@ -709,7 +740,7 @@ pub const Parser = struct {
             .plus, .minus, .bang, .tilde => {
                 _ = p.take();
                 const u = p.node(.unary, ln);
-                p.set(u).op = @intFromEnum(k);
+                p.set(u).op = @backingInt(k);
                 p.set(u).a = p.unary();
                 return u;
             },
