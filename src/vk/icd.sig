@@ -133,6 +133,7 @@ pub const device_extensions = [_]Ext{
     .{ .name = "VK_KHR_image_format_list", .version = 1 },
     .{ .name = "VK_KHR_16bit_storage", .version = 1 },
     .{ .name = "VK_KHR_shader_float16_int8", .version = 1 },
+    .{ .name = "VK_EXT_index_type_uint8", .version = 1 },
     .{ .name = "VK_KHR_swapchain", .version = 70, .host = true },
     .{ .name = "VK_KHR_external_memory", .version = 1, .host = true },
     .{ .name = "VK_KHR_external_memory_fd", .version = 1, .host = true },
@@ -686,6 +687,10 @@ fn fillFeatureChain(chain: ?*anyopaque) void {
                 sf.uniformAndStorageBuffer16BitAccess = 1;
                 sf.storagePushConstant16 = 1;
                 sf.storageInputOutput16 = 1;
+            },
+            ST.physical_device_index_type_uint8_features => {
+                const xf: *abi.PhysicalDeviceIndexTypeUint8Features = @ptrCast(@alignCast(c));
+                xf.indexTypeUint8 = 1;
             },
             ST.physical_device_shader_float16_int8_features => {
                 const hf: *abi.PhysicalDeviceShaderFloat16Int8Features = @ptrCast(@alignCast(c));
@@ -2747,21 +2752,20 @@ const Exec = struct {
             if (a.binding >= MAX_VB) continue;
             const bound = gx.vb[a.binding];
             const pl = e.place(bound.buf) orelse continue;
-            var off = pl.off + bound.off + a.offset;
-            if (vb.rate == 0 and dc.indexed != 0 and dc.vertex_offset > 0) off += @as(u64, @intCast(dc.vertex_offset)) * vb.stride;
-            if (vb.rate == 1) off += @as(u64, dc.first_instance) * vb.stride;
+            var off: i64 = @intCast(pl.off + bound.off + a.offset);
+            // (the raster has no base vertex: its fetch of index i at
+            // offset + i * stride, in 32-bit arithmetic, is vertex
+            // i + vertexOffset's when the offset moves by vertexOffset
+            // strides, a negative one wrapping)
+            if (vb.rate == 0 and dc.indexed != 0) off += @as(i64, dc.vertex_offset) * vb.stride;
+            if (vb.rate == 1) off += @as(i64, dc.first_instance) * vb.stride;
             vimg[a.location] = memImage(pl.mem);
-            d.attrs[a.location] = .{ .buf = &vimg[a.location], .offset = @intCast(off), .stride = vb.stride, .comps = a.fi.comps, .size = a.fi.size, .float = a.fi.float, .signed = a.fi.signed, .normalized = a.fi.norm, .integer = a.fi.integer, .divisor = vb.rate };
+            d.attrs[a.location] = .{ .buf = &vimg[a.location], .offset = @truncate(@as(u64, @bitCast(off))), .stride = vb.stride, .comps = a.fi.comps, .size = a.fi.size, .float = a.fi.float, .signed = a.fi.signed, .normalized = a.fi.norm, .integer = a.fi.integer, .divisor = vb.rate };
         }
-        if (dc.indexed != 0 and dc.vertex_offset < 0) e.sayOnce(3, "an indexed draw with a negative vertex offset: the attributes start at the index", .{});
         // indices
         var iimg: engine.Image = undefined;
         if (dc.indexed != 0) {
             const pl = e.place(gx.ib) orelse return;
-            if (gx.ib_size == 1) {
-                e.sayOnce(4, "8-bit indices are not drawn", .{});
-                return;
-            }
             iimg = memImage(pl.mem);
             d.index = &iimg;
             d.index_offset = @intCast(pl.off + gx.ib_off + @as(u64, dc.first) * gx.ib_size);

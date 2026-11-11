@@ -566,6 +566,11 @@ pub const PhysicalDevice16BitStorageFeatures = extern struct {
     storagePushConstant16: u32,
     storageInputOutput16: u32,
 };
+pub const PhysicalDeviceIndexTypeUint8Features = extern struct {
+    sType: u32,
+    pNext: ?*anyopaque,
+    indexTypeUint8: u32,
+};
 pub const PhysicalDeviceShaderFloat16Int8Features = extern struct {
     sType: u32,
     pNext: ?*anyopaque,
@@ -762,6 +767,7 @@ pub const StructureType = struct {
     pub const physical_device_timeline_semaphore_features: u32 = 1000207000;
     pub const physical_device_16bit_storage_features: u32 = 1000083000;
     pub const physical_device_shader_float16_int8_features: u32 = 1000082000;
+    pub const physical_device_index_type_uint8_features: u32 = 1000265000;
     pub const physical_device_timeline_semaphore_properties: u32 = 1000207001;
     pub const semaphore_type_create_info: u32 = 1000207002;
     pub const timeline_semaphore_submit_info: u32 = 1000207003;

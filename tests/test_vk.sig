@@ -200,7 +200,7 @@ test "vk: what vulkaninfo asks, through the ICD's entry points, on the emulated 
     const enumDevExt = get(inst, "vkEnumerateDeviceExtensionProperties", *const fn (Ptr, ?[*:0]const u8, *u32, ?[*]abi.ExtensionProperties) callconv(.c) Res);
     try testing.expectEqual(R.success, enumDevExt(pd, null, &n, null));
     // (no Host here: no swapchain, no external memory)
-    try testing.expectEqual(@as(u32, 9), n);
+    try testing.expectEqual(@as(u32, 10), n);
     n = 1;
     try testing.expectEqual(R.incomplete, enumDevExt(pd, null, &n, &exts));
     try testing.expectEqual(@as(u32, 1), n);
@@ -941,6 +941,12 @@ fn px(b: [*]const u8, w: u32, x: u32, y: u32) [4]u8 {
 /// naga's triangle: a vertex buffer (two attributes), a uniform block
 /// read by the vertex stage, a depth attachment, a varying colour.
 fn triangleThroughVulkan(open: *const fn () ?icd.Gpu) !void {
+    return triangleDraw(open, false);
+}
+
+/// `indexed`: 8-bit indices 3, 4, 5 with a vertexOffset of -3 (the
+/// attributes' fetch before the buffer's start, wrapped back into it).
+fn triangleDraw(open: *const fn () ?icd.Gpu, indexed: bool) !void {
     use(open);
     var v = try Vk.open();
     defer v.close();
@@ -981,7 +987,12 @@ fn triangleThroughVulkan(open: *const fn () ?icd.Gpu) !void {
     g.f("vkCmdBindDescriptorSets", *const fn (Ptr, u32, H, u32, u32, [*]const H, u32, ?[*]const u32) callconv(.c) void)(g.cb, 0, pl, 0, 1, @ptrCast(&set), 0, null);
     const off = [_]u64{16};
     g.f("vkCmdBindVertexBuffers", *const fn (Ptr, u32, u32, [*]const H, [*]const u64) callconv(.c) void)(g.cb, 0, 1, @ptrCast(&vb.buf), &off);
-    g.f("vkCmdDraw", *const fn (Ptr, u32, u32, u32, u32) callconv(.c) void)(g.cb, 3, 1, 0, 0);
+    const ib = try v.buffer(16, 2);
+    ib.ptr.?[0..3].* = .{ 3, 4, 5 };
+    if (indexed) {
+        g.f("vkCmdBindIndexBuffer", *const fn (Ptr, H, u64, u32) callconv(.c) void)(g.cb, ib.buf, 0, 1000265000);
+        g.f("vkCmdDrawIndexed", *const fn (Ptr, u32, u32, u32, i32, u32) callconv(.c) void)(g.cb, 3, 1, 0, -3, 0);
+    } else g.f("vkCmdDraw", *const fn (Ptr, u32, u32, u32, u32) callconv(.c) void)(g.cb, 3, 1, 0, 0);
     g.f("vkCmdEndRenderPass", *const fn (Ptr) callconv(.c) void)(g.cb);
     g.toBuffer(color.img, back.buf, W, W, 0, 0, 1);
     // the depth aspect as f32, after the colour
@@ -1054,6 +1065,9 @@ fn quadThroughVulkan(open: *const fn () ?icd.Gpu) !void {
     const ib = try v.buffer(64, 2);
     const iw: [*]u16 = @ptrCast(@alignCast(ib.ptr.?));
     iw[0..8].* = .{ 9, 9, 0, 1, 2, 2, 1, 3 };
+    // (8-bit indices 5 past them: drawn with a vertexOffset of -5)
+    const ib8 = try v.buffer(64, 2);
+    ib8.ptr.?[0..8].* = .{ 9, 9, 5, 6, 7, 7, 6, 8 };
     const sl0 = try g.setLayout(&.{ SAMPLED, SAMPLER });
     const sl1 = try g.setLayout(&.{ UNIFORM, SAMPLED });
     const pl = try g.newLayout(&.{ sl0, sl1 });
@@ -1069,7 +1083,7 @@ fn quadThroughVulkan(open: *const fn () ?icd.Gpu) !void {
     for ([_][*:0]const u8{ "fs_main", "fs_lod", "fs_fetch" }, 0..) |name, i| {
         try testing.expectEqual(R.success, g.pipelineOut(.{ .module = module, .fs = name, .layout = pl, .rp = rp }, &pipes[i]));
     }
-    const back = try v.buffer(W * W * 4 * 3, 2);
+    const back = try v.buffer(W * W * 4 * 4, 2);
 
     // the uploads, then each pipeline into the target, read back after each
     try g.begin();
@@ -1078,26 +1092,32 @@ fn quadThroughVulkan(open: *const fn () ?icd.Gpu) !void {
     g.fromBuffer(staging.buf, 128, arr.img, 4, 4, 0, 0);
     g.fromBuffer(staging.buf, 192, arr.img, 4, 4, 0, 1);
     const clears = [_]abi.ClearValue{.{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } }};
-    for (pipes, 0..) |pipe, i| {
+    for ([_]H{ pipes[0], pipes[1], pipes[2], pipes[0] }, 0..) |pipe, i| {
         g.beginPass(rp, fb, W, W, &clears);
         g.f("vkCmdBindPipeline", *const fn (Ptr, u32, H) callconv(.c) void)(g.cb, 0, pipe);
         const sets = [_]H{ set0, set1 };
         g.f("vkCmdBindDescriptorSets", *const fn (Ptr, u32, H, u32, u32, [*]const H, u32, ?[*]const u32) callconv(.c) void)(g.cb, 0, pl, 0, 2, &sets, 0, null);
-        g.f("vkCmdBindIndexBuffer", *const fn (Ptr, H, u64, u32) callconv(.c) void)(g.cb, ib.buf, 0, 0);
-        g.f("vkCmdDrawIndexed", *const fn (Ptr, u32, u32, u32, i32, u32) callconv(.c) void)(g.cb, 6, 1, 2, 0, 0);
+        if (i == 3) {
+            // VK_INDEX_TYPE_UINT8_EXT, a negative vertexOffset
+            g.f("vkCmdBindIndexBuffer", *const fn (Ptr, H, u64, u32) callconv(.c) void)(g.cb, ib8.buf, 0, 1000265000);
+            g.f("vkCmdDrawIndexed", *const fn (Ptr, u32, u32, u32, i32, u32) callconv(.c) void)(g.cb, 6, 1, 2, -5, 0);
+        } else {
+            g.f("vkCmdBindIndexBuffer", *const fn (Ptr, H, u64, u32) callconv(.c) void)(g.cb, ib.buf, 0, 0);
+            g.f("vkCmdDrawIndexed", *const fn (Ptr, u32, u32, u32, i32, u32) callconv(.c) void)(g.cb, 6, 1, 2, 0, 0);
+        }
         g.f("vkCmdEndRenderPass", *const fn (Ptr) callconv(.c) void)(g.cb);
         const r = abi.BufferImageCopy{ .bufferOffset = i * W * W * 4, .bufferRowLength = 0, .bufferImageHeight = 0, .imageSubresource = .{ .aspectMask = 1, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 }, .imageOffset = .{ .x = 0, .y = 0, .z = 0 }, .imageExtent = .{ .width = W, .height = W, .depth = 1 } };
         g.f("vkCmdCopyImageToBuffer", *const fn (Ptr, H, u32, H, u32, [*]const abi.BufferImageCopy) callconv(.c) void)(g.cb, color.img, 6, back.buf, 1, @ptrCast(&r));
     }
     try g.run();
 
-    const names = [_][]const u8{ "textureSample", "textureSampleLevel 1", "textureLoad of layer 1" };
-    for (0..3) |which| {
+    const names = [_][]const u8{ "textureSample", "textureSampleLevel 1", "textureLoad of layer 1", "8-bit indices, vertexOffset -5" };
+    for (0..4) |which| {
         const out = back.ptr.? + which * W * W * 4;
         for (0..W) |y| for (0..W) |x| {
             const p = px(out, W, @intCast(x), @intCast(y));
             const want: u32 = switch (which) {
-                0 => sw[(y / 4) * 4 + x / 4],
+                0, 3 => sw[(y / 4) * 4 + x / 4],
                 1 => sw[16 + (y / 8) * 2 + x / 8],
                 else => sw[32 + 16 + (y / 4) * 4 + x / 4],
             };
@@ -1108,6 +1128,10 @@ fn quadThroughVulkan(open: *const fn () ?icd.Gpu) !void {
             }
         };
     }
+}
+
+test "vk: naga's triangle drawn with 8-bit indices and a negative vertexOffset on the emulated RTX" {
+    try triangleDraw(&openRtx, true);
 }
 
 test "vk: naga's triangle drawn on the emulated RTX (vertex buffer, uniform block, depth), read back" {
