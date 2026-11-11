@@ -29,7 +29,10 @@
 //! - **Images.** EGL_KHR_image_base with EGL_EXT_image_dma_buf_import
 //!   (and _modifiers): a single-plane linear ARGB8888, XRGB8888, ABGR8888
 //!   or XBGR8888 dma-buf, or one plane of a video picture (R8 and GR88:
-//!   NV12's; R16 and GR1616: P010's), imported into this context (PRIME),
+//!   NV12's; R16 and GR1616: P010's), pitch linear or block linear with
+//!   NVIDIA's DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D modifiers (Galaxy's
+//!   VA driver exports the RTX decoder's pictures so: sampled where the
+//!   decoder wrote them, blocklinear.sig), imported into this context (PRIME),
 //!   as GL's textures and renderbuffers (gles: OES_EGL_image) name it, the
 //!   memory shared and freed with its last name. EGL_KHR_gl_texture_2D_image:
 //!   a texture's level 0 as an image, its memory moved to a buffer of its
@@ -51,6 +54,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const engine = @import("engine.sig");
+const blocklinear = @import("blocklinear.sig");
 const gles = @import("gles.sig");
 const report = @import("report.sig");
 const thread = @import("thread.sig");
@@ -2004,7 +2008,7 @@ pub fn createImage(comptime T: type, handle: ?*anyopaque, ctx: ?*anyopaque, targ
             android.release(client);
             return fail(?*EImage, BAD_PARAMETER, null);
         }
-        const image = importLinearImage(d, buf.fd, buf.width, buf.height, buf.fourcc, buf.pitch, buf.offset) orelse {
+        const image = importImage(d, buf.fd, buf.width, buf.height, buf.fourcc, buf.pitch, buf.offset, .{}) orelse {
             android.release(client);
             return fail(?*EImage, if (getError() == BAD_ALLOC) BAD_ALLOC else BAD_PARAMETER, null);
         };
@@ -2042,11 +2046,15 @@ pub fn createImage(comptime T: type, handle: ?*anyopaque, ctx: ?*anyopaque, targ
     if (width < 0 or height < 0 or fourcc < 0 or fd < 0 or offset < 0 or pitch < 0) return fail(?*EImage, BAD_PARAMETER, null);
     const code = std.math.cast(u32, fourcc) orelse return fail(?*EImage, BAD_PARAMETER, null);
     if ((mod_lo == null) != (mod_hi == null)) return fail(?*EImage, BAD_PARAMETER, null);
+    // The modifier: none (linear), linear, or NVIDIA's block-linear 2D
+    // (a video decoder's picture: Galaxy's VA driver exports its planes
+    // so, sampled here where the decoder wrote them). Any other: BAD_MATCH.
+    var layout: blocklinear.Layout = .{};
     if (mod_lo) |lo| {
         const m = @as(u64, mod_hi.?) << 32 | lo;
-        if (m != 0 and m != MOD_INVALID) return fail(?*EImage, BAD_MATCH, null);
+        if (m != MOD_INVALID) layout = blocklinear.parseModifier(m) orelse return fail(?*EImage, BAD_MATCH, null);
     }
-    return importLinearImage(d, fd, width, height, code, pitch, offset);
+    return importImage(d, fd, width, height, code, pitch, offset, layout);
 }
 
 /// EGL_KHR_gl_texture_2D_image: level 0 of texture `buffer` (its name)
@@ -2096,12 +2104,16 @@ pub fn androidClientBuffer(buffer: ?*const anyopaque) ?*anyopaque {
     return ok(?*anyopaque, client);
 }
 
-fn importLinearImage(d: *Display, fd: i64, width: i64, height: i64, code: u32, pitch: i64, offset: i64) ?*EImage {
+/// One plane of a dma-buf as an image, laid out `layout` (pitch linear,
+/// or block linear: `pitch` then the plane's bytes across, whole GOBs).
+fn importImage(d: *Display, fd: i64, width: i64, height: i64, code: u32, pitch: i64, offset: i64, layout: blocklinear.Layout) ?*EImage {
     const f = fourccOf(code) orelse return fail(?*EImage, BAD_MATCH, null);
     const bpp: i64 = f.format.bytes();
     if (fd < 0 or offset < 0 or width <= 0 or height <= 0 or width > MAX_SIZE or height > MAX_SIZE) return fail(?*EImage, BAD_PARAMETER, null);
-    // (rows of whole words: a texel is read from its aligned word)
+    // (rows of whole words: a texel is read from its aligned word; a
+    // block-linear plane's rows are whole GOBs)
     if (pitch < width * bpp or @mod(pitch, 4) != 0 or @mod(offset, 4) != 0) return fail(?*EImage, BAD_ACCESS, null);
+    if (layout.block and @mod(pitch, 64) != 0) return fail(?*EImage, BAD_ACCESS, null);
     const slot = for (&eimages) |*x| {
         if (!x.alive and x.shared.refs == 0) break x;
     } else return fail(?*EImage, BAD_ALLOC, null);
@@ -2115,7 +2127,8 @@ fn importLinearImage(d: *Display, fd: i64, width: i64, height: i64, code: u32, p
         return fail(?*EImage, BAD_PARAMETER, null);
     };
     slot.* = .{ .alive = true, .display = d, .fd = saved_fd, .fourcc = @bitCast(code), .offset = @intCast(offset) };
-    const need = offset + pitch * (height - 1) + width * bpp;
+    // (a block-linear plane: whole blocks down)
+    const need: i64 = if (layout.block) offset + @as(i64, @intCast(blocklinear.planeBytes(@intCast(pitch), @intCast(height), layout.gobs_log2))) else offset + pitch * (height - 1) + width * bpp;
     if (@as(u64, @intCast(need)) > whole.bytes or @as(u64, @intCast(need)) > whole.cpu.len) {
         // (the import goes again: a picture larger than its buffer)
         slot.img = engine.adopt(&slot.shared, whole, 0, 1, 1, 4, f.format);
@@ -2124,6 +2137,7 @@ fn importLinearImage(d: *Display, fd: i64, width: i64, height: i64, code: u32, p
     }
     slot.img = engine.adopt(&slot.shared, whole, @intCast(offset), @intCast(width), @intCast(height), @intCast(pitch), f.format);
     slot.img.no_alpha = !f.alpha;
+    slot.img.layout = layout;
     return ok(?*EImage, slot);
 }
 
@@ -2136,8 +2150,9 @@ pub fn destroyImage(handle: ?*anyopaque, image: ?*anyopaque) bool {
     return ok(bool, true);
 }
 
-/// Export metadata for the linear, single-plane images supported here
-/// (modifier 0: DRM_FORMAT_MOD_LINEAR).
+/// Export metadata for the single-plane images supported here: the
+/// modifier is the image's layout's (DRM_FORMAT_MOD_LINEAR, or an
+/// imported block-linear plane's own).
 pub fn exportDmaBufQuery(handle: ?*anyopaque, image: ?*anyopaque, fourcc: ?*i32, planes: ?*i32, modifier: ?*u64) bool {
     lock();
     defer unlock();
@@ -2146,7 +2161,7 @@ pub fn exportDmaBufQuery(handle: ?*anyopaque, image: ?*anyopaque, fourcc: ?*i32,
     if (m.fourcc == 0) return fail(bool, BAD_MATCH, false);
     if (fourcc) |p| p.* = m.fourcc;
     if (planes) |p| p.* = 1;
-    if (modifier) |p| p.* = 0;
+    if (modifier) |p| p.* = blocklinear.modifierOf(m.img.layout);
     return ok(bool, true);
 }
 
@@ -2189,8 +2204,27 @@ pub fn queryDmaBufFormats(handle: ?*anyopaque, max: i32, formats: ?[*]i32, num: 
     return ok(bool, true);
 }
 
-/// eglQueryDmaBufModifiersEXT: linear only, for every format; none
-/// external only.
+/// The modifiers a format is imported with: linear for every one; and
+/// for a video plane (R8, GR88, R16, GR1616), NVIDIA's block-linear 2D in
+/// GOB_2 blocks with each swizzle (Turing's, GB20x's 8- and 16-bit: what
+/// an RTX's decoder writes). None external only (sampled as TEXTURE_2D).
+pub fn modifiersOf(format: u32) []const u64 {
+    const S = struct {
+        const linear = [_]u64{blocklinear.MOD_LINEAR};
+        const video = [_]u64{
+            blocklinear.MOD_LINEAR,
+            blocklinear.modifierOf(.{ .block = true, .swizzle = .turing2d, .gobs_log2 = 1 }),
+            blocklinear.modifierOf(.{ .block = true, .swizzle = .blackwell8, .gobs_log2 = 1 }),
+            blocklinear.modifierOf(.{ .block = true, .swizzle = .blackwell16, .gobs_log2 = 1 }),
+        };
+    };
+    return switch (format) {
+        DRM_FORMAT_R8, DRM_FORMAT_GR88, DRM_FORMAT_R16, DRM_FORMAT_GR1616 => &S.video,
+        else => &S.linear,
+    };
+}
+
+/// eglQueryDmaBufModifiersEXT: `modifiersOf` the format.
 pub fn queryDmaBufModifiers(handle: ?*anyopaque, format: i32, max: i32, modifiers: ?[*]u64, external_only: ?[*]u32, num: ?*i32) bool {
     lock();
     defer unlock();
@@ -2199,10 +2233,14 @@ pub fn queryDmaBufModifiers(handle: ?*anyopaque, format: i32, max: i32, modifier
     const n = num orelse return fail(bool, BAD_PARAMETER, false);
     if (fourccOf(@bitCast(format)) == null) return fail(bool, BAD_PARAMETER, false);
     if (max < 0 or (max > 0 and modifiers == null)) return fail(bool, BAD_PARAMETER, false);
+    const all = modifiersOf(@bitCast(format));
+    const k: usize = if (max == 0) all.len else @min(all.len, @as(usize, @intCast(max)));
     if (max > 0) {
-        modifiers.?[0] = 0;
-        if (external_only) |e| e[0] = FALSE;
+        for (0..k) |i| {
+            modifiers.?[i] = all[i];
+            if (external_only) |e| e[i] = FALSE;
+        }
     }
-    n.* = 1;
+    n.* = @intCast(k);
     return ok(bool, true);
 }

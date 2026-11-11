@@ -1197,6 +1197,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try addTest(ctx, test_gfxapi, "test-gfxapi-draw", "tests/test_gfxapi_draw.sig", &.{
         importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("va_tiling", "src/va/tiling.sig"),
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
@@ -1244,8 +1245,17 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // The VA driver's GPU conversion for CPU readers (a KIR kernel over
+    // gfxapi's blocklinear address math), on EmuDevice and the emulated RTX.
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-va-convert", "src/va/gpu_convert.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     _ = try addTest(ctx, test_gfxapi, "test-gfxapi-egl", "tests/test_gfxapi_egl.sig", &.{
         importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("va_tiling", "src/va/tiling.sig"),
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
@@ -1256,6 +1266,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // ── va: Galaxy's VA-API driver for the RTX's video decoder (NVDEC,
+    //    H.264), on the host against a fake render node and decoder. Its
+    //    files import each other by path: no modules to register. ──
+    const test_va = try ctx.addStep("test-va", "Execute Galaxy's VA-API driver (NVDEC H.264) against a fake render node and decoder", &noopStep);
+    try ctx.addDependency(test_all, test_va);
+    _ = try addTest(ctx, test_va, "test-va-module", "src/va/va.sig", &.{});
+    _ = try addTest(ctx, test_va, "test-va-lib", "src/va/libgalaxy_va.sig", &.{});
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
