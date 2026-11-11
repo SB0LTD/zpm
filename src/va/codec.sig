@@ -91,6 +91,8 @@ pub const SurfaceRef = struct {
     /// the pitches are in bytes either way, so the decoder's framestride is
     /// the 2-byte layout's)
     sample_bytes: u8 = 1,
+    /// the buffer's bytes from `luma` (both planes; 0: not known)
+    bytes: u32 = 0,
 
     /// The surface holds `bits`-bit samples (8 in NV12, 10 in P010).
     pub fn holds(s: SurfaceRef, bits: u32) bool {
@@ -122,6 +124,9 @@ pub const Picture = struct {
 pub const End = struct {
     dwords: usize,
     wait: bool = false,
+    /// another surface the decode writes besides the target (AV1 with film
+    /// grain: the graded picture into current_display_picture), its VA id
+    display: ?u32 = null,
 };
 
 /// SET_OBJECT, the decoder's class bound on subchannel 0: every pushbuffer
@@ -180,7 +185,7 @@ pub const FakeSurfaces = struct {
         if (id == 0 or id > f.n) return null;
         const base = 0x40_0000_0000 + @as(u64, id) * 0x100_0000;
         const pitch = std.mem.alignForward(u32, f.w * f.sample_bytes, 64);
-        return .{ .luma = base, .chroma = base + 0x80_0000, .width = f.w, .height = f.h, .pitch_luma = pitch, .pitch_chroma = pitch, .sample_bytes = f.sample_bytes };
+        return .{ .luma = base, .chroma = base + 0x80_0000, .width = f.w, .height = f.h, .pitch_luma = pitch, .pitch_chroma = pitch, .sample_bytes = f.sample_bytes, .bytes = 0x100_0000 };
     }
 
     pub fn lookup(f: *FakeSurfaces) Lookup {

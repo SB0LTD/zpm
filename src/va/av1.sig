@@ -50,9 +50,15 @@
 //! its table; the spec saves the regular MV CDFs (still the defaults) for
 //! later frames, so End.wait is set and `after` puts the defaults back.
 //!
-//! Not done in this round: film grain (apply_grain off: the grain-free
-//! picture goes to the target, current_display_picture is not written),
-//! 10/12-bit, 4:4:4 and monochrome (refused), large-scale tile (refused),
+//! 10-bit frames decode into P010 targets (seq bit_depth 10, strides in
+//! samples). Film grain is the decoder's: with apply_grain, fgs_cfg and
+//! the film grain buffer (av1_grain.sig: scaling tables and grain
+//! templates made here) are set and the display buffer
+//! (SET_DISPLAY_BUF_*) is current_display_picture, which gets the graded
+//! picture while the target (current_frame, the references') stays grain
+//! free; End.display tells the driver that surface is written too.
+//!
+//! Not done: 12-bit, 4:4:4 and monochrome (refused), large-scale tile (refused),
 //! references of another size than the frame (refused:
 //! ERROR_RESOLUTION_NOT_SUPPORTED; superres's horizontal scaling is set).
 
@@ -62,6 +68,7 @@ const nvdec = @import("nvdec.sig");
 const codec = @import("codec.sig");
 const vaav1 = @import("vaapi_av1.sig");
 const cdf = @import("av1_cdf.sig");
+const grain = @import("av1_grain.sig");
 
 pub const PictureParameterBufferAV1 = vaav1.PictureParameterBufferAV1;
 pub const SliceParameterBufferAV1 = vaav1.SliceParameterBufferAV1;
@@ -377,11 +384,15 @@ pub const TILES_BYTES: usize = MAX_TILES * TILE_ENTRY;
 /// Seven references' global motion, 32 bytes each (AV1_GLOBAL_MOTION_BUF_SIZE).
 pub const GM_OFF: usize = 0x1000;
 pub const GM_ENTRY: usize = 32;
-pub const MAX_AUX_BYTES: usize = GM_OFF + 0x100;
+/// The film grain buffer (AV1FilmGrainMemory: av1_grain.sig), a frame's
+/// own, when it applies grain.
+pub const FGS_OFF: usize = GM_OFF + 0x100;
+pub const MAX_AUX_BYTES: usize = FGS_OFF + std.mem.alignForward(usize, @sizeOf(grain.Memory), 256);
 
 comptime {
     std.debug.assert(MAX_PIC_BYTES <= codec.PIC_BYTES and MAX_AUX_BYTES <= codec.AUX_BYTES);
     std.debug.assert(TILES_OFF + TILES_BYTES <= GM_OFF);
+    std.debug.assert(FGS_OFF % 256 == 0);
 }
 
 // ── The context's buffers (scratch) ─────────────────────────────────────────
@@ -538,6 +549,8 @@ pub const State = struct {
     tile_start: [MAX_TILES]u32 = undefined,
     tile_end: [MAX_TILES]u32 = undefined,
     tile_seen: [MAX_TILES]bool = [_]bool{false} ** MAX_TILES,
+    /// room for a frame's film grain templates (av1_grain.sig)
+    grain_t: grain.Templates = undefined,
 
     pub fn init(width: u32, height: u32) State {
         return .{ .width = width, .height = height, .layout = Layout.of(width, height) };
@@ -729,6 +742,34 @@ fn superresStep(down: i64, up: i64) struct { step: u16, x0: u16 } {
 
 // ── A frame's setup ─────────────────────────────────────────────────────────
 
+/// av1_fgs_cfg_t from a frame's grain parameters (zero without
+/// apply_grain): the flags, ScalingShift (grain_scaling_minus_8 + 8), the
+/// seed, and the Cb/Cr mixing as the syntax elements' raw values
+/// (av1_grain.sig: ASSUMED).
+pub fn fgsCfg(g: *const vaav1.FilmGrain) FgsCfg {
+    const f = g.film_grain_info_fields;
+    if (f.apply_grain == 0) return .{};
+    return .{
+        .bits = .{
+            .apply_grain = 1,
+            .overlap_flag = f.overlap_flag,
+            .clip_to_restricted_range = f.clip_to_restricted_range,
+            .chroma_scaling_from_luma = f.chroma_scaling_from_luma,
+            .num_y_points_b = @intFromBool(g.num_y_points > 0),
+            .num_cb_points_b = @intFromBool(g.num_cb_points > 0),
+            .num_cr_points_b = @intFromBool(g.num_cr_points > 0),
+            .scaling_shift = @as(u4, f.grain_scaling_minus_8) + 8,
+        },
+        .sw_random_seed = g.grain_seed,
+        .cb_offset = @intCast(g.cb_offset),
+        .cr_offset = @intCast(g.cr_offset),
+        .cb_mult = @bitCast(g.cb_mult),
+        .cb_luma_mult = @bitCast(g.cb_luma_mult),
+        .cr_mult = @bitCast(g.cr_mult),
+        .cr_luma_mult = @bitCast(g.cr_luma_mult),
+    };
+}
+
 /// A resolved reference: what was kept of it, its surface's pitches.
 pub const Ref = struct {
     saved: Saved,
@@ -744,6 +785,8 @@ pub const Frame = struct {
     pitch_luma: u32,
     pitch_chroma: u32,
     gob_height: u3,
+    /// film grain applied (into the display buffer: Addrs.display)
+    grain: bool = false,
     /// the pictures' bytes a sample: 2 for a 10-bit frame (P010 targets
     /// and references; the setup's strides count samples)
     sample_bytes: u8 = 1,
@@ -791,7 +834,10 @@ pub fn av1Setup(f: Frame) Setup {
         .enable_jnt_comp = seq.enable_jnt_comp,
         // (off where CDEF does nothing: one strength set, all zero)
         .enable_cdef = @intFromBool(seq.enable_cdef != 0 and (p.cdef_bits != 0 or p.cdef_y_strengths[0] != 0 or p.cdef_uv_strengths[0] != 0)),
+        // (as NVK: the sequence's film_grain_params_present)
+        .enable_fgs = seq.film_grain_params_present,
     };
+    s.fgs_cfg = if (f.grain) fgsCfg(&p.film_grain_info) else .{};
     const scaled = sz.width != sz.upscaled_width;
     s.frame = .{
         // (VA: a switch frame is decoded as an inter frame)
@@ -1085,11 +1131,22 @@ pub const Addrs = struct {
     prob_write: u64,
     /// Blackwell's extra buffer (State.blackwell), or none
     blk: ?u64 = null,
+    /// with film grain applied: the display buffer, where the graded
+    /// picture goes (current_display_picture's planes, its bytes)
+    display: ?Display = null,
     luma: [nvdec.SLOTS]u64,
     chroma: [nvdec.SLOTS]u64,
 };
 
-pub const PUSH_DWORDS = 2 * 7 + 2 * 15 + 2 * (1 + nvdec.SLOTS) + 2;
+pub const PUSH_DWORDS = 2 * 7 + 2 * 15 + 2 * 3 + 2 * (1 + nvdec.SLOTS) + 2;
+
+pub const Display = struct { luma: u64, chroma: u64, bytes: u32 };
+
+/// The decoder's display buffer (clc9b0.h): where a frame's
+/// post-processed picture goes (film grain applied).
+pub const SET_DISPLAY_BUF_SIZE: u32 = 0x41c;
+pub const SET_DISPLAY_BUF_LUMA_OFFSET: u32 = 0x428;
+pub const SET_DISPLAY_BUF_CHROMA_OFFSET: u32 = 0x42c;
 
 /// One AV1 frame's methods: the decoder bound, the application, the
 /// controls, the picture index, the setup, the bitstream, the status, the
@@ -1107,6 +1164,13 @@ pub fn av1Push(out: []u32, a: Addrs) usize {
     codec.put(out, &n, SET_TILE_SIZE_BUF_OFFSET, nvdec.shifted(a.tile_info));
     codec.put(out, &n, AV1_SET_GLOBAL_MODEL_BUF_OFFSET, nvdec.shifted(a.global_motion));
     codec.put(out, &n, AV1_SET_FILM_GRAIN_BUF_OFFSET, nvdec.shifted(a.film_grain));
+    if (a.display) |dp| {
+        // (its size in bytes: a size the decoder reads as larger only
+        // gives it room it has)
+        codec.put(out, &n, SET_DISPLAY_BUF_SIZE, dp.bytes);
+        codec.put(out, &n, SET_DISPLAY_BUF_LUMA_OFFSET, nvdec.shifted(dp.luma));
+        codec.put(out, &n, SET_DISPLAY_BUF_CHROMA_OFFSET, nvdec.shifted(dp.chroma));
+    }
     codec.put(out, &n, AV1_SET_SEGMENT_READ_BUF_OFFSET, nvdec.shifted(a.seg_read));
     codec.put(out, &n, AV1_SET_SEGMENT_WRITE_BUF_OFFSET, nvdec.shifted(a.seg_write));
     for (a.col_mv, 0..) |m, i| codec.put(out, &n, AV1_SET_COL_MV0_READ_BUF_OFFSET + 4 * @as(u32, @intCast(i)), nvdec.shifted(m));
@@ -1193,6 +1257,19 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
         }
     }
 
+    // Film grain: the decoder applies it, the graded picture into the
+    // display buffer, current_display_picture (FFmpeg's shown frame; the
+    // target, current_frame, stays grain free: the references). Without
+    // a display surface of its own (the target named again, or none of
+    // this driver's), the grain-free picture is what there is.
+    var display: ?codec.SurfaceRef = null;
+    if (p.film_grain_info.film_grain_info_fields.apply_grain != 0 and p.current_display_picture != pic.target_id) {
+        if (lookup.surface(p.current_display_picture)) |d| {
+            if (d.sample_bytes == pic.target.sample_bytes and d.width >= sz.upscaled_width and d.height >= sz.height and d.bytes != 0 and nvdec.addressable(d.luma) and nvdec.addressable(d.chroma)) display = d;
+        }
+    }
+    f.grain = display != null;
+
     // The picture slots: references by role, the current at CUR_SLOT, the
     // rest the target.
     var luma: [nvdec.SLOTS]u64 = undefined;
@@ -1252,6 +1329,10 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
         for (0..6) |k| std.mem.writeInt(i32, e[4 * k ..][0..4], wm.wmmat[k], .little);
         for (shear(&wm.wmmat), 0..) |v, k| std.mem.writeInt(i16, e[24 + 2 * k ..][0..2], v, .little);
     }
+    if (f.grain) {
+        const mem: *grain.Memory = @ptrCast(@alignCast(aux[FGS_OFF..][0..@sizeOf(grain.Memory)]));
+        grain.memory(&p.film_grain_info, depth, &st.grain_t, mem);
+    }
     @memset(slot.stream[st.stream..][0..STREAM_PAD], 0);
 
     const base = scratch.va;
@@ -1267,7 +1348,8 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
         .coloc = base + L.mv(buf),
         .tile_info = slot.aux_va + TILES_OFF,
         .global_motion = slot.aux_va + GM_OFF,
-        .film_grain = base + L.zero_off,
+        .film_grain = if (f.grain) slot.aux_va + FGS_OFF else base + L.zero_off,
+        .display = if (display) |dp| Display{ .luma = dp.luma, .chroma = dp.chroma, .bytes = dp.bytes } else null,
         .seg_read = if (s.prevsegid_flag != 0) base + L.seg(f.prim.?.buf) else base + L.zero_off,
         .seg_write = base + L.seg(buf),
         .col_mv = col_mv,
@@ -1307,7 +1389,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     // defaults once the decoder is done)
     const fix = is_intra and pf.allow_intrabc != 0 and adapted;
     st.fixup = if (fix) write else null;
-    out.* = .{ .dwords = n, .wait = fix };
+    out.* = .{ .dwords = n, .wait = fix, .display = if (display != null) p.current_display_picture else null };
     return va.SUCCESS;
 }
 
@@ -1326,6 +1408,7 @@ const testing = std.testing;
 
 test {
     _ = vaav1;
+    _ = grain;
 }
 
 fn wordAt(bytes: []const u8, off: usize) u32 {
@@ -2011,6 +2094,65 @@ test "av1: a 10-bit key frame into a P010 surface: bit depth 10, strides in 16-s
     try testing.expectEqual([2]u16{ 16, 16 }, s.current_frame.stride);
     // an 8-bit frame into a P010 surface: refused
     try testing.expectEqual(va.ERROR_INVALID_SURFACE, decode(&st, keyFrame(), 2).status);
+}
+
+test "av1: film grain applied by the decoder: fgs_cfg, the grain buffer, the display buffer is current_display_picture; none into the target itself" {
+    @memset(&test_scratch, 0);
+    var st = State.init(TW, TH);
+    var p = keyFrame();
+    p.seq_info_fields.film_grain_params_present = 1;
+    const g = &p.film_grain_info;
+    g.film_grain_info_fields.apply_grain = 1;
+    g.film_grain_info_fields.grain_scaling_minus_8 = 2;
+    g.film_grain_info_fields.overlap_flag = 1;
+    g.grain_seed = 0xbeef;
+    g.num_y_points = 2;
+    g.point_y_value[1] = 255;
+    g.point_y_scaling[0] = 20;
+    g.point_y_scaling[1] = 40;
+    g.num_cb_points = 1;
+    g.point_cb_value[0] = 128;
+    g.point_cb_scaling[0] = 9;
+    g.cb_mult = 128;
+    g.cb_offset = 256;
+    p.current_frame = 1;
+    p.current_display_picture = 5;
+    const d = decode(&st, p, 1);
+    try testing.expectEqual(va.SUCCESS, d.status);
+    try testing.expectEqual(@as(?u32, 5), d.end.display);
+    const s = std.mem.bytesToValue(Av1Pic, d.slot.pic[0..@sizeOf(Av1Pic)]);
+    try testing.expectEqual(@as(u1, 1), s.seq.enable_fgs);
+    try testing.expectEqual(@as(u1, 1), s.fgs_cfg.bits.apply_grain);
+    try testing.expectEqual(@as(u1, 1), s.fgs_cfg.bits.overlap_flag);
+    try testing.expectEqual(@as(u1, 1), s.fgs_cfg.bits.num_y_points_b);
+    try testing.expectEqual(@as(u1, 1), s.fgs_cfg.bits.num_cb_points_b);
+    try testing.expectEqual(@as(u1, 0), s.fgs_cfg.bits.num_cr_points_b);
+    try testing.expectEqual(@as(u4, 10), s.fgs_cfg.bits.scaling_shift);
+    try testing.expectEqual(@as(u16, 0xbeef), s.fgs_cfg.sw_random_seed);
+    try testing.expectEqual(@as(i16, 256), s.fgs_cfg.cb_offset);
+    // the grain buffer: the frame's own, its tables made here
+    const push = d.slot.push[0..d.end.dwords];
+    try testing.expectEqual(nvdec.shifted(d.slot.aux_va + FGS_OFF), method(push, AV1_SET_FILM_GRAIN_BUF_OFFSET).?);
+    const mem = std.mem.bytesToValue(grain.Memory, d.slot.aux[FGS_OFF..][0..@sizeOf(grain.Memory)]);
+    try testing.expectEqual(@as(u8, 20), mem.scaling_lut_y[0]);
+    try testing.expectEqual(@as(u8, 40), mem.scaling_lut_y[255]);
+    try testing.expectEqual(@as(u8, 9), mem.scaling_lut_cb[200]);
+    var t: grain.Templates = undefined;
+    grain.generate(g, 8, &t);
+    try testing.expectEqual(@as(i16, @intCast(t.luma[9 + 5][9 + 7])), mem.cropped_luma_grain_block[5 * 64 + 7]);
+    // the display buffer: surface 5's planes
+    try testing.expectEqual(nvdec.shifted(surfaceLuma(5)), method(push, SET_DISPLAY_BUF_LUMA_OFFSET).?);
+    try testing.expectEqual(nvdec.shifted(surfaceLuma(5) + 0x80_0000), method(push, SET_DISPLAY_BUF_CHROMA_OFFSET).?);
+    try testing.expectEqual(@as(u32, 0x100_0000), method(push, SET_DISPLAY_BUF_SIZE).?);
+    // the target itself as the display picture: no grain (the grain-free
+    // picture, not references with grain in them)
+    p.current_display_picture = 1;
+    const d2 = decode(&st, p, 1);
+    try testing.expectEqual(va.SUCCESS, d2.status);
+    try testing.expectEqual(@as(?u32, null), d2.end.display);
+    const s2 = std.mem.bytesToValue(Av1Pic, d2.slot.pic[0..@sizeOf(Av1Pic)]);
+    try testing.expectEqual(@as(u1, 0), s2.fgs_cfg.bits.apply_grain);
+    try testing.expect(method(d2.slot.push[0..d2.end.dwords], SET_DISPLAY_BUF_LUMA_OFFSET) == null);
 }
 
 test "av1: what is refused" {
