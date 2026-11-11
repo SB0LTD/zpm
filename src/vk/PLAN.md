@@ -5,7 +5,55 @@ The goal: Firefox's WebGPU (wgpu's Vulkan backend, `dom.webgpu.enabled` and
 the PC's RTX 5070 (GB206, sm_120), through this ICD. Pure Sig, allocation-free,
 no Mesa; zpm is pinned by Galaxy, never vendored.
 
-## Where it stands (milestone 3, branch `sig-vulkan`)
+## Where it stands (milestone 4, branch `sig-vulkan`)
+
+Milestone 4 (WebGPU's features):
+
+- **KIR** (src/gpu, every backend): atom `and`/`or`/`xor`, `cas` (compare
+  and swap) and `ballot`, after `ret` so the earlier ops keep their
+  numbers. sm_120: ATOMG/ATOMS AND/OR/XOR, ATOMG.E.CAS (no descriptor,
+  64-bit [Ra+offset]) and ATOMS.CAS from ptxas's words (testdata
+  sm120_kir_raw.txt, tools/gen_sm120_vectors.py), ballot = VOTE.ANY Rd;
+  ir3: atomic(.g).and/or/xor/cmpxchg (cmpxchg's pair new, compared, as
+  Mesa's a6xx; not checked on hardware); gcn4: buffer_atomic_*/ds_*_rtn;
+  ir3 and gcn4 take ballot as kir.expand's 32 votes. The GPU self-test has
+  a compare-and-swap and ballots case (run it on the PC: it checks
+  ATOMG.E.CAS on the real RTX). `gpu.Dispatch.stamp` (Caps.stamps): the
+  GPU's clock written after a dispatch (the RTX's QMD four-word release).
+- **Subgroups** (spirv): every OpGroupNonUniform* (elect, all, any,
+  all-equal, broadcast(-first), ballot and its bit ops, shuffles, the
+  arithmetic as reduce/inclusive/exclusive/clustered, quad broadcast and
+  swap) and the mask built-ins; a butterfly when the subgroup is whole,
+  else a walk over the active lanes. Reported in compute and fragment
+  stages (a fragment kernel's lanes are the raster's pixels; not tested
+  in a fragment shader yet).
+- **f16** (spirv): f32 registers holding halves, every result rounded to
+  half precision, 16 bits in buffers and push constants;
+  VK_KHR_shader_float16_int8 (shaderFloat16), VK_KHR_16bit_storage.
+- **Atomics** (spirv): and, or, xor, compare-exchange; OpAtomicLoad of
+  memory is an atomic add of 0 (no cached word for a spinning reader).
+- **Queries**: timestamp (a nop dispatch carrying a stamp: GPU-written,
+  no CPU in the path; timestampValidBits 64), occlusion (whether a draw
+  ran in the scope: the raster counts no samples), the GPU's
+  vkCmdCopyQueryPoolResults (a KIR kernel), vkGetQueryPoolResults,
+  vkResetQueryPool. Pipeline statistics are not offered.
+- **Formats**: the 16-bit floats, RGBA16 unorm, 8/16-bit snorm and
+  integers, RGB10A2 (unorm, uint), RG11B10 ufloat kept widened (a word a
+  channel; the transfer kernel's widen/narrow at copies; optimal tiling
+  only); storage rgba16float, rgba8snorm/uint/sint, rgba16uint/sint (a
+  write rounded to the format); sRGB colour attachments (the fragment
+  shader encodes); 32-bit floats filter (FLOAT32_FILTERABLE).
+- **Pipeline cache**: compute binaries and their Info under SHA-256 of
+  what the compile depends on; vkGetPipelineCacheData/
+  vkCreatePipelineCache/vkMergePipelineCaches; the driver's own cache
+  besides (8 MiB arena). Graphics pipelines (the raster's kernels) are not
+  cached.
+- **Indices**: 8-bit (VK_EXT_index_type_uint8; the raster reads any
+  size) and a negative vertexOffset (the attributes' offset moved back in
+  the raster's 32-bit arithmetic).
+- Tests (`sig build test-vk`): 45, from 33 (test-spirv 13, test-vk-icd
+  23, the module 5, wsi 3, lib 1); test-gpu, -ir3, -gcn4 and -selftest
+  grew with the new ops (the self-test has 25 cases).
 
 Milestone 3 (this branch, Galaxy's `webgpu` branch ships it):
 
@@ -82,10 +130,13 @@ wgpu has run against it yet (the first on-hardware check is §1):
 ## Graphics: what is still missing (the next work, roughly by need)
 
 - **Storage textures**: compute shaders only (spirv's storageImageOp), in
-  Rgba8 unorm and the 32-bit formats. Not yet: fragment-stage storage
-  images (FRAGMENT_WRITABLE_STORAGE), rgba8snorm/uint/sint and the 16-bit
-  formats, BGRA8 storage, storage texel buffers. Sampled images in compute
-  shaders are not compiled yet either (the texture unit is the raster's).
+  Rgba8 unorm, the 32-bit formats and the widened WebGPU ones. Not yet:
+  vertex/fragment-stage storage images (FRAGMENT_WRITABLE_STORAGE: the
+  front end's emitStage would take them as buffers with the image words in
+  the draw's uniform words), BGRA8 storage, storage texel buffers. Sampled
+  images in compute shaders are not compiled yet either (spirv's imageRef
+  wants the graphics Resources: compute needs texture bindings and
+  descriptor words in the dispatch's parameters, texture.sig's ops).
 - **Multisampling**: 4x is taken (images, attachments, limits, resolves)
   but keeps one sample a pixel: rendering is right, edges are not
   antialiased; sample shading, sample masks and alpha-to-coverage are
@@ -94,16 +145,18 @@ wgpu has run against it yet (the first on-hardware check is §1):
   and FragCoord scaled in the ICD).
 - **Points and lines** (logged, not drawn), **primitive restart**, **depth
   bias**, **FragDepth**, **clip/cull distances**, rasterizer depth clamp.
-- **Formats**: the 16-bit float, snorm, 8/16-bit integer, RGB10A2 and
-  RG11B10 images (each needs a texfmt conversion on upload and readback, or
-  native sampling in texture.sig); sRGB render targets (the raster writes
-  unorm); 32-bit float filtering. Vertex formats are wider (format.sig).
+- **Formats**: widened formats are not colour attachments (the raster
+  writes 8-bit unorm only: rgba16float render targets need src/gfxapi's
+  raster); an sRGB attachment blends on encoded values; a copy between a
+  widened image and another format of the same texel size copies the wide
+  words. Vertex formats are wider (format.sig).
 - **Samplers**: CLAMP_TO_BORDER and MIRROR_CLAMP_TO_EDGE clamp/mirror to
   the edge; anisotropy is linear; cube arrays sample (face + 6 layer) but
   are not reported (imageCubeArray 0) until tested.
 - **Depth precision**: D32_SFLOAT and D32_SFLOAT_S8_UINT hold 24 bits.
 - **Several subpasses** (only the first is drawn), input attachments,
-  imageless framebuffers, secondary command buffers, events, query pools.
+  imageless framebuffers, secondary command buffers, events; occlusion
+  queries that count samples (the raster's).
 - **Multiview** (a Vulkan 1.1 requirement this device does not meet).
 - **Stencil-tested draws run on the CPU on sm_120**: gfxapi's stencil tile
   kernel does not compile for sm_120 (TooManyRegs, GL's too: GL falls back
@@ -111,11 +164,20 @@ wgpu has run against it yet (the first on-hardware check is §1):
   first; on the PC that needs CPU views of the images' memory. The fix is
   in kir_sm120's register budget or a smaller stencil kernel (src/gfxapi).
 - **Indirect draws** read their arguments back (the CPU waits inside
-  vkQueueSubmit), as dispatch indirect.
+  vkQueueSubmit), as dispatch indirect. The plan for dispatch on the GPU
+  (not done): a `gpu.Dispatch.indirect` the RTX takes by a patch kernel
+  (precompiled SASS, embedded and checked against kir_sm120 by a test)
+  writing the counts into the next QMD (GRID_WIDTH word 39, HEIGHT and
+  DEPTH the low halves of 40 and 41) and cbuf0's CB_GRID before its
+  launch, a zero count swapping in a nop program (word 32 and the
+  prefetch word 59); EmuDevice reads the counts itself. Draws need the
+  raster to read the vertex count from memory (src/gfxapi).
 - Each colour attachment past the first re-runs the raster (vertex and
   setup too): depth EQUAL and not written, stencil off for those passes.
-- Draws with a negative vertexOffset take attributes from the index (the
-  raster has no base vertex); 8-bit indices are refused.
+- **Depth bias clamp** (the raster has no depth bias), **anisotropic
+  filtering** (texture.sig's linear; samplerAnisotropy 0), **cube arrays**
+  (texture.sig samples face + 6 layer; imageCubeArray 0 until a test
+  draws one), **border colours** (texture.sig has no border wrap).
 
 ## 1. Galaxy integration (done in galaxy `webgpu`; on-hardware check left)
 
@@ -137,30 +199,14 @@ wgpu has run against it yet (the first on-hardware check is §1):
 
 ## 2. Compute completeness (what WebGPU compute shaders still hit)
 
-- **Atomics**: KIR has add, min, max, exchange. WGSL's `atomicAnd/Or/Xor`
-  and `atomicCompareExchangeWeak` need KIR atom ops `and`, `or`, `xor`,
-  `cmpxchg` in `src/gpu` (kir.sig, the interpreter, kir_sm120 `ATOM`/`ATOMS`,
-  kir_ir3, kir_gcn4). This is a src/gpu change across every backend: its own
-  PR.
-- **Subgroups** (`wgt::Features::SUBGROUP`): OpGroupNonUniform* (elect,
-  ballot, broadcast, shuffle, arithmetic) over KIR's `shfl` and `vote`, and
-  ballot (KIR has no ballot: another src/gpu op). Report
-  `VkPhysicalDeviceSubgroupProperties.supportedOperations` truthfully as they land.
-- **f16** (`SHADER_F16`, VK_KHR_shader_float16_int8, VK_KHR_16bit_storage):
-  KIR has f16 registers; the front end needs 16-bit loads/stores and f16
-  arithmetic.
+- Atomics, subgroups, f16, timestamp queries and pipeline caches: done
+  (milestone 4, above).
 - **Dispatch indirect on the GPU**: today the counts are copied back and read
   by the CPU (a wait inside vkQueueSubmit). The RTX can launch from a QMD the
   GPU writes; needs a `gpu.Device` dispatch-indirect hook (src/gpu).
 - **Zero-initialized workgroup memory**
   (VK_KHR_zero_initialize_workgroup_memory): naga's polyfill works now; the
   extension would let wgpu skip it.
-- **Pipeline cache data**: kir_sm120 binaries keyed by a hash of the SPIR-V
-  and the spec constants (compiles take the driver lock and are slow for big
-  shaders).
-- **Timestamp queries** (`TIMESTAMP_QUERY`): query pools, `vkCmdWriteTimestamp`,
-  `vkCmdResetQueryPool`, `vkGetQueryPoolResults`, `vkCmdCopyQueryPoolResults`;
-  `gpu.Device.timestampNs` exists. Then set the queue's `timestampValidBits` (>= 36).
 - **Waits without the lock**: `vkWaitForFences` polls with the driver lock let
   go between 1 ms waits; a futex wait on the node's fence fd is better.
 - **Wait-before-signal** of timeline semaphores across threads: today a
