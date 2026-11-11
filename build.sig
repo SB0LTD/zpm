@@ -1274,6 +1274,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // ── hlsl: the HLSL compiler (HLSL to DXBC, as d3dcompiler_47 does), its
+    //    own tests, and the oracle comparison with Microsoft's compiler
+    //    (Windows hosts only: skipped elsewhere) ──
+    const test_hlsl = try ctx.addStep("test-hlsl", "Compile HLSL to DXBC: the compiler's tests, and (on Windows) signatures, reflection and pixels against Microsoft's compiler", &noopStep);
+    try ctx.addDependency(test_all, test_hlsl);
+    _ = try addTest(ctx, test_hlsl, "test-hlsl-module", "src/hlsl/hlsl.sig", &.{});
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
