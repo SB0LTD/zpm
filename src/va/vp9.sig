@@ -41,6 +41,17 @@
 //! follows libvpx v1.14.0 (BSD) and the VP9 bitstream specification; the
 //! tests compare against libvpx's own results.
 //!
+//! Blackwell and NVIDIA's method set (pc-1111c: GB206 faulted at address 0
+//! on the first VP9 frame, which had neither): AROS nvgfx's trace of
+//! NVIDIA's driver (facts only, codec.sig) binds the intra-top line buffer
+//! (SET_INTRA_TOP_BUF_OFFSET, max(64 * 2048, superblock columns * 2048)
+//! bytes) for VP9 too, and on the CFB0 class the 0x4dc buffer with
+//! reserved5 (surface code), reserved1[2] (depth code) and a count at 0x108
+//! past Ada's struct (`State.blackwell`, full by default; `State.intra_top`);
+//! it gives stream_len as the whole frame's bytes though the decoder gets
+//! the tiles only (`State.stream_len`, .frame by default; the stream is
+//! padded with zeros that far and 256 bytes more).
+//!
 //! Allocator-free: the state, the contexts and every table are fixed-size.
 
 const std = @import("std");
@@ -324,8 +335,11 @@ fn alignUp(v: usize, a: usize) usize {
     return (v + a - 1) / a * a;
 }
 
+/// Blackwell's count past Ada's struct (State.blackwell): codec.blkUnits
+/// of the frame's width.
+pub const BLACKWELL_UNITS_AT: usize = 0x108;
 /// The setup's room in a frame slot.
-pub const MAX_PIC_BYTES: usize = @sizeOf(Vp9Pic);
+pub const MAX_PIC_BYTES: usize = 0x10c;
 
 /// The frame slot's side buffers: the probability table, then the tile
 /// sizes (u16 width and height in superblocks per tile, row by row; 0x700
@@ -336,7 +350,22 @@ pub const TILE_BYTES: usize = 0x700;
 pub const MAX_AUX_BYTES: usize = AUX_TILES + TILE_BYTES;
 
 /// The dwords one frame's pushbuffer takes.
-pub const PUSH_DWORDS: usize = 15 * 2 + 2 * (1 + nvdec.SLOTS) + 2;
+pub const PUSH_DWORDS: usize = 17 * 2 + 2 * (1 + nvdec.SLOTS) + 2;
+
+/// SET_INTRA_TOP_BUF_OFFSET (clc9b0.h; NVIDIA's driver binds it for VP9).
+pub const SET_INTRA_TOP_BUF_OFFSET: u32 = 0x4c8;
+
+/// What stream_len counts (GALAXY_VA_VP9_STREAM_LEN).
+pub const StreamLen = enum {
+    /// the whole frame's bytes, headers included (NVIDIA's, traced)
+    frame,
+    /// the tiles' bytes, what the decoder is given (pc-1111c's)
+    tiles,
+
+    pub fn parse(s: []const u8) ?StreamLen {
+        return std.meta.stringToEnum(StreamLen, s);
+    }
+};
 
 comptime {
     std.debug.assert(MAX_PIC_BYTES <= codec.PIC_BYTES);
@@ -361,6 +390,11 @@ pub const Layout = struct {
     filter_bytes: usize,
     bsd: usize,
     above: usize,
+    /// the intra-prediction row above (SET_INTRA_TOP_BUF_OFFSET)
+    intra_top: usize,
+    intra_top_bytes: usize,
+    /// Blackwell's buffer (codec.SET_BLK_BUF_OFFSET)
+    blk: usize,
     total: usize,
 };
 
@@ -396,6 +430,13 @@ pub fn layout(width: u32, height: u32) Layout {
     l.above = filt + bsd;
     l.filter_bytes = filt + bsd + above;
     at += l.filter_bytes;
+    // (AROS's trace: 2048 bytes a superblock column, 64 KiB at least)
+    at = alignUp(at, 0x100);
+    l.intra_top = at;
+    l.intra_top_bytes = @max(((w + 63) / 64) * 2048, 0x10000);
+    at += l.intra_top_bytes;
+    l.blk = at;
+    at += alignUp(codec.blkBytes(width), 0x100);
     l.total = at;
     return l;
 }
@@ -1185,6 +1226,17 @@ pub const State = struct {
     mv_latest: u1 = 0,
     /// a decode whose counts `after` adapts from
     pending: ?struct { idx: u2, flags: AdaptFlags } = null,
+    /// the frame's header bytes (uncompressed and compressed), not given
+    /// to the decoder
+    header_bytes: u32 = 0,
+    /// Blackwell's additions sent (GALAXY_VA_VP9_BLACKWELL)
+    blackwell: codec.Blackwell = .full,
+    /// SET_CONTROL_PARAMS' word (GALAXY_VA_CONTROL)
+    control: codec.Control = .nvk,
+    /// the intra-top buffer bound (GALAXY_VA_VP9_INTRA_TOP=0: not)
+    intra_top: bool = true,
+    /// what stream_len counts (GALAXY_VA_VP9_STREAM_LEN)
+    stream_len_is: StreamLen = .frame,
 
     pub fn init(width: u32, height: u32) State {
         return .{
@@ -1250,9 +1302,11 @@ fn frame(st: *State, data: []const u8, slot: codec.Slot) va.Status {
     const tiles = data[tiles_at..];
     if (tiles.len > slot.stream.len) return va.ERROR_NOT_ENOUGH_BUFFER;
     @memcpy(slot.stream[0..tiles.len], tiles);
-    // (a little zero padding after the tiles, where it fits)
-    const pad = @min(slot.stream.len - tiles.len, 16);
+    // (zeros after the tiles, where they fit: as far as a stream_len of the
+    // whole frame reaches, and the decoder's read-ahead past that)
+    const pad = @min(slot.stream.len - tiles.len, tiles_at + codec.STREAM_PAD);
     @memset(slot.stream[tiles.len..][0..pad], 0);
+    st.header_bytes = @intCast(tiles_at);
 
     // the reset's effects on the saved contexts (setup_past_independence)
     if (h.reset) {
@@ -1317,7 +1371,10 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     }
 
     // the setup
-    s.stream_len = st.stream_len;
+    s.stream_len = switch (st.stream_len_is) {
+        .frame => st.stream_len + st.header_bytes,
+        .tiles => st.stream_len,
+    };
     s.gptimer_timeout_value = nvdec.GPTIMER_TIMEOUT;
     s.surface = .{ .tileformat = 1, .gob_height = pic.gob_height };
     s.Vp9BsdCtrlOffset = @intCast(l.bsd >> 8);
@@ -1361,7 +1418,13 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     s.mbModeLfDelta = st.lf.mode;
     s.v1.Vp9FltAboveOffset = @intCast(l.above >> 8);
     s.v1.bits.bit_depth = @intCast(depth);
+    if (st.blackwell.writesFields()) {
+        s.reserved5 = codec.surfaceCode(depth);
+        s.reserved1[2] = codec.depthCode(depth);
+    }
+    @memset(slot.pic[0..MAX_PIC_BYTES], 0);
     @memcpy(slot.pic[0..@sizeOf(Vp9Pic)], std.mem.asBytes(&s));
+    if (st.blackwell.writesFields()) std.mem.writeInt(u32, slot.pic[BLACKWELL_UNITS_AT..][0..4], codec.blkUnits(width), .little);
 
     // the side buffers
     const probs = hwProbs(&st.fc, &st.seg, h.seg_temporal);
@@ -1379,7 +1442,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     var n: usize = 0;
     codec.bind(o, &n);
     codec.put(o, &n, nvdec.SET_APPLICATION_ID, APPLICATION_ID_VP9);
-    codec.put(o, &n, nvdec.SET_CONTROL_PARAMS, codec.controlParams(CODEC_TYPE_VP9, 0));
+    codec.put(o, &n, nvdec.SET_CONTROL_PARAMS, codec.controlFor(CODEC_TYPE_VP9, st.control));
     codec.put(o, &n, nvdec.SET_PICTURE_INDEX, pic.picture_index);
     codec.put(o, &n, nvdec.SET_DRV_PIC_SETUP_OFFSET, nvdec.shifted(slot.pic_va));
     codec.put(o, &n, nvdec.SET_IN_BUF_BASE_OFFSET, nvdec.shifted(slot.stream_va));
@@ -1392,11 +1455,13 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     codec.put(o, &n, VP9_SET_SEGMENT_READ_BUF_OFFSET, nvdec.shifted(scratch.va + seg_read));
     codec.put(o, &n, VP9_SET_SEGMENT_WRITE_BUF_OFFSET, nvdec.shifted(scratch.va + seg_write));
     codec.put(o, &n, VP9_SET_FILTER_BUFFER_OFFSET, nvdec.shifted(scratch.va + l.filter));
+    if (st.intra_top) codec.put(o, &n, SET_INTRA_TOP_BUF_OFFSET, nvdec.shifted(scratch.va + l.intra_top));
+    if (st.blackwell.bindsBuffer()) codec.put(o, &n, codec.SET_BLK_BUF_OFFSET, nvdec.shifted(scratch.va + l.blk));
     luma[3] = pic.target.luma;
     chroma[3] = pic.target.chroma;
     codec.pictures(o, &n, luma, chroma);
     codec.execute(o, &n);
-    std.debug.assert(n == PUSH_DWORDS);
+    std.debug.assert(n <= PUSH_DWORDS);
 
     // what this frame leaves for the next
     const adapt_due = !h.error_res and !h.parallel and h.refresh_context;
@@ -1462,7 +1527,7 @@ test "vp9: the decoder's structs as nvdec_drv.h lays them out" {
     try testing.expectEqual(@as(u32, 8 << 1), std.mem.readInt(u32, b[0xf0..][0..4], .little));
     try testing.expectEqual(@as(usize, 0xf00), AUX_TILES);
     try testing.expectEqual(@as(usize, 0x1600), MAX_AUX_BYTES);
-    try testing.expectEqual(@as(usize, 68), PUSH_DWORDS);
+    try testing.expectEqual(@as(usize, 72), PUSH_DWORDS);
 }
 
 /// libvpx's boolean encoder (vpx_dsp/bitwriter), for the tests.
@@ -1622,7 +1687,7 @@ test "vp9: the scratch layout" {
 
 const TestCtx = struct {
     var fs: codec.FakeSlot = .{};
-    var scratch: [256 << 10]u8 align(256) = undefined;
+    var scratch: [1 << 20]u8 align(256) = undefined;
     var st: State = undefined;
 };
 
@@ -1695,7 +1760,10 @@ test "vp9: a libvpx clip through take, end and after, against libvpx" {
         try testing.expectEqual(st.fc.mv[1].class0_fp[1][2], probs.a.nmvc.class0_fp[1][1][2]);
 
         const setup = std.mem.bytesToValue(Vp9Pic, slot.pic[0..@sizeOf(Vp9Pic)]);
-        try testing.expectEqual(@as(u32, @intCast(tiles.len)), setup.stream_len);
+        // (stream_len NVIDIA's: the whole frame, though the decoder gets
+        // the tiles; zeros that far past them)
+        try testing.expectEqual(@as(u32, @intCast(f.bytes.len)), setup.stream_len);
+        for (TestCtx.fs.stream[tiles.len..][0 .. f.bytes.len - tiles.len + codec.STREAM_PAD]) |z| try testing.expectEqual(@as(u8, 0), z);
         try testing.expectEqual(nvdec.GPTIMER_TIMEOUT, setup.gptimer_timeout_value);
         try testing.expectEqual(@as(u3, 2), setup.surface.gob_height);
         try testing.expectEqual(@as(u2, 1), setup.surface.tileformat);
@@ -1748,17 +1816,23 @@ test "vp9: a libvpx clip through take, end and after, against libvpx" {
                 0x2001_0172, 0x2000_0036, // VP9_SET_SEGMENT_READ_BUF_OFFSET (the zero map)
                 0x2001_0173, 0x2000_0035, // VP9_SET_SEGMENT_WRITE_BUF_OFFSET (map 1)
                 0x2001_0177, 0x2000_0077, // VP9_SET_FILTER_BUFFER_OFFSET
+                0x2001_0132, @intCast(0x2000_0000 + (l.intra_top >> 8)), // SET_INTRA_TOP_BUF_OFFSET
+                0x2001_0137, @intCast(0x2000_0000 + (l.blk >> 8)), // Blackwell's 0x4dc
                 0x2011_010c, // SET_PICTURE_LUMA_OFFSET0, 17
                 0x4001_0000, 0x4001_0000, 0x4001_0000, 0x4002_0000, // last, golden, altref: surface 1; current: 2
             };
             try testing.expectEqualSlices(u32, &want, slot.push[0..want.len]);
             // (the unused slots: the target)
             for (slot.push[want.len .. want.len + 13]) |w| try testing.expectEqual(@as(u32, 0x4002_0000), w);
-            try testing.expectEqual(@as(u32, 0x2011_011d), slot.push[48]); // SET_PICTURE_CHROMA_OFFSET0, 17
-            try testing.expectEqual(@as(u32, 0x4001_8000), slot.push[49]);
-            try testing.expectEqual(@as(u32, 0x4002_8000), slot.push[52]);
-            try testing.expectEqual(@as(u32, 0x4002_8000), slot.push[65]);
-            try testing.expectEqual([2]u32{ 0x2001_00c0, 0 }, slot.push[66..68].*); // EXECUTE
+            try testing.expectEqual(@as(u32, 0x2011_011d), slot.push[52]); // SET_PICTURE_CHROMA_OFFSET0, 17
+            try testing.expectEqual(@as(u32, 0x4001_8000), slot.push[53]);
+            try testing.expectEqual(@as(u32, 0x4002_8000), slot.push[56]);
+            try testing.expectEqual(@as(u32, 0x4002_8000), slot.push[69]);
+            try testing.expectEqual([2]u32{ 0x2001_00c0, 0 }, slot.push[70..72].*); // EXECUTE
+            // Blackwell's setup: surface code 9, depth code 0, 512 wide: 5 blocks
+            try testing.expectEqual(@as(u8, 9), slot.pic[0xeb]);
+            try testing.expectEqual(@as(u8, 0), slot.pic[0x43]);
+            try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, slot.pic[BLACKWELL_UNITS_AT..][0..4], .little));
         }
         if (i == 2) {
             // frame 1 wrote map 1: read it, write map 0

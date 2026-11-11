@@ -11,10 +11,12 @@
 //! the change is wrong and the status word says so (GALAXY_VA_DEBUG). One
 //! independent AV1 driver for this engine (AROS nvgfx, 2026, from traces of
 //! NVIDIA's driver with the class reported as CFB0) says Blackwell's driver
-//! also writes reserved12 = 0xffff, reserved_stat = 9, a word at 0x244 (past
-//! Ada's 0x23c-byte struct) of ceil(width / 128) + 1, and binds one more
+//! also writes reserved12 = 0xffff, reserved_stat = 9 (2 | 3 << 4 at 10
+//! bits), a word at 0x244 (past Ada's 0x23c-byte struct) of
+//! ceil(width / 128) + 1, and binds one more
 //! buffer at method 0x4dc of that many 16 KiB blocks: `State.blackwell`
-//! turns those on (off by default; nothing public confirms them).
+//! sends them (codec.Blackwell: full by default since GB206 faulted at
+//! address 0 without the buffer on pc-1111c; GALAXY_VA_AV1_BLACKWELL).
 //!
 //! The method set, the default CDF layout (av1_cdf.sig), the filter
 //! buffer's parts and their order, the superres step defaults and the
@@ -535,8 +537,10 @@ pub const State = struct {
     height: u32,
     layout: Layout,
     /// Blackwell's extra fields and buffer as AROS's trace has them (see
-    /// the header); off: Ada's public layout.
-    blackwell: bool = false,
+    /// the header); .off: Ada's public layout (GALAXY_VA_AV1_BLACKWELL).
+    blackwell: codec.Blackwell = .full,
+    /// SET_CONTROL_PARAMS' word (GALAXY_VA_CONTROL)
+    control: codec.Control = .nvk,
     saved: [POOL]Saved = [_]Saved{.{}} ** POOL,
     defaults_written: bool = false,
     /// the pool table whose MV CDFs `after` resets (intrabc)
@@ -795,7 +799,7 @@ pub const Frame = struct {
     /// the primary reference's state (null: none)
     prim: ?Saved = null,
     layout: *const Layout,
-    blackwell: bool = false,
+    blackwell: codec.Blackwell = .full,
 };
 
 pub const Setup = struct {
@@ -997,9 +1001,10 @@ pub fn av1Setup(f: Frame) Setup {
     s.Av1HusVertOffset = l.flt[3];
     s.Av1LrVertOffset = l.flt[4];
     s.Av1FgsVertOffset = l.flt[5];
-    if (f.blackwell) {
+    if (f.blackwell.writesFields()) {
         s.reserved12 = 0xffff;
-        s.stat.reserved_stat = 9;
+        // (the surface code; a 10-bit frame's also 3 << 4, AROS's trace)
+        s.stat.reserved_stat = if (f.sample_bytes == 2) @as(u17, codec.surfaceCode(10)) | (3 << 4) else codec.surfaceCode(8);
     }
     return out;
 }
@@ -1129,6 +1134,8 @@ pub const Addrs = struct {
     intra_top: u64,
     prob_read: u64,
     prob_write: u64,
+    /// SET_CONTROL_PARAMS' word
+    control: codec.Control = .nvk,
     /// Blackwell's extra buffer (State.blackwell), or none
     blk: ?u64 = null,
     /// with film grain applied: the display buffer, where the graded
@@ -1155,7 +1162,7 @@ pub fn av1Push(out: []u32, a: Addrs) usize {
     var n: usize = 0;
     codec.bind(out, &n);
     codec.put(out, &n, nvdec.SET_APPLICATION_ID, APPLICATION_ID_AV1);
-    codec.put(out, &n, nvdec.SET_CONTROL_PARAMS, codec.controlParams(CODEC_TYPE_AV1, 0));
+    codec.put(out, &n, nvdec.SET_CONTROL_PARAMS, codec.controlFor(CODEC_TYPE_AV1, a.control));
     codec.put(out, &n, nvdec.SET_PICTURE_INDEX, CUR_SLOT);
     codec.put(out, &n, nvdec.SET_DRV_PIC_SETUP_OFFSET, nvdec.shifted(a.pic_setup));
     codec.put(out, &n, nvdec.SET_IN_BUF_BASE_OFFSET, nvdec.shifted(a.bitstream));
@@ -1310,7 +1317,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     // The setup, the tile table, the global motion, the stream's padding.
     @memset(slot.pic[0..MAX_PIC_BYTES], 0);
     @memcpy(slot.pic[0..@sizeOf(Av1Pic)], std.mem.asBytes(s));
-    if (st.blackwell) std.mem.writeInt(u32, slot.pic[BLACKWELL_WORD_AT..][0..4], @intCast(blkUnits(sz.upscaled_width)), .little);
+    if (st.blackwell.writesFields()) std.mem.writeInt(u32, slot.pic[BLACKWELL_WORD_AT..][0..4], @intCast(blkUnits(sz.upscaled_width)), .little);
     const aux = slot.aux;
     @memset(aux[0..MAX_AUX_BYTES], 0);
     var t: usize = 0;
@@ -1358,7 +1365,8 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
         .intra_top = base + L.intra_top_off,
         .prob_read = cdf_addr(L, base, read),
         .prob_write = base + L.poolCdf(write),
-        .blk = if (st.blackwell) base + L.blk_off else null,
+        .blk = if (st.blackwell.bindsBuffer()) base + L.blk_off else null,
+        .control = st.control,
         .luma = luma,
         .chroma = chroma,
     });
@@ -1750,7 +1758,7 @@ test "av1: a key frame of four tiles in two tile groups" {
     try testing.expectEqual(va.SUCCESS, take(&st, .{ .kind = va.SLICE_DATA_BUFFER, .size = d2.len, .count = 1, .data = &d2 }, slot));
     var e: codec.End = undefined;
     try testing.expectEqual(va.SUCCESS, end(&st, slot, testScratch(), .{ .target_id = 3, .target = look.surface(3).?, .gob_height = 2, .picture_index = 5 }, look, &e));
-    try testing.expectEqual(@as(usize, 80), e.dwords);
+    try testing.expectEqual(@as(usize, 82), e.dwords);
     try testing.expect(!e.wait);
 
     // the bitstream: both groups' bytes, then zeros
@@ -1839,8 +1847,8 @@ test "av1: a key frame of four tiles in two tile groups" {
     try testing.expectEqual(nvdec.shifted(sv + L.mv(0)), method(push, AV1_SET_COL_MVWRITE_BUF_OFFSET).?);
     try testing.expectEqual(nvdec.shifted(sv + L.filter_off), method(push, SET_FILTER_BUFFER_OFFSET).?);
     try testing.expectEqual(nvdec.shifted(sv + L.intra_top_off), method(push, SET_INTRA_TOP_BUF_OFFSET).?);
-    try testing.expect(method(push, SET_BLK_BUF_OFFSET) == null);
-    for (0..nvdec.SLOTS) |i| try testing.expectEqual(nvdec.shifted(surfaceLuma(3)), push[43 + i]);
+    try testing.expectEqual(nvdec.shifted(sv + L.blk_off), method(push, SET_BLK_BUF_OFFSET).?);
+    for (0..nvdec.SLOTS) |i| try testing.expectEqual(nvdec.shifted(surfaceLuma(3)), push[45 + i]);
     // the default tables written into the scratch
     for ([4]u32{ 0x6e606314, 0xf56ff0ad, 0x9a859934, 0x80303e0c }, 0..) |want, q| {
         try testing.expectEqual(want, fnv1a(test_scratch[L.defaultCdf(@intCast(q))..][0..cdf.TABLE_BYTES]));
@@ -2025,7 +2033,7 @@ test "av1: references, skip mode and the motion field" {
     const push = d.slot.push[0..d.end.dwords];
     for (0..nvdec.SLOTS) |i| {
         const want: u32 = if (i < 4) 1 else if (i < 7) 2 else 3;
-        try testing.expectEqual(nvdec.shifted(surfaceLuma(want)), push[43 + i]);
+        try testing.expectEqual(nvdec.shifted(surfaceLuma(want)), push[45 + i]);
     }
     const L = st.layout;
     // frame 2 kept motion buffer 1: both sources read it
@@ -2200,17 +2208,43 @@ test "av1: what is refused" {
     _ = &slot;
 }
 
-test "av1: Blackwell's traced extras when asked for" {
+test "av1: Blackwell's traced extras (the default), each half alone, none; the control words" {
     @memset(&test_scratch, 0);
     var st = State.init(TW, TH);
-    st.blackwell = true;
-    const d = decode(&st, keyFrame(), 1);
+    try testing.expectEqual(codec.Blackwell.full, st.blackwell);
+    var d = decode(&st, keyFrame(), 1);
     try testing.expectEqual(va.SUCCESS, d.status);
     try testing.expectEqual(@as(u32, 0xffff), wordAt(d.slot.pic, 0x54));
     try testing.expectEqual(@as(u32, 9 << 15), wordAt(d.slot.pic, 0x238));
     try testing.expectEqual(@as(u32, 3), wordAt(d.slot.pic, BLACKWELL_WORD_AT));
     try testing.expectEqual(@as(usize, 82), d.end.dwords);
     try testing.expectEqual(nvdec.shifted(SCRATCH_VA + st.layout.blk_off), method(d.slot.push[0..d.end.dwords], SET_BLK_BUF_OFFSET).?);
+    try testing.expectEqual(codec.controlParams(CODEC_TYPE_AV1, 0), method(d.slot.push[0..d.end.dwords], nvdec.SET_CONTROL_PARAMS).?);
+    // the buffer only: Ada's setup
+    @memset(&test_scratch, 0);
+    st = State.init(TW, TH);
+    st.blackwell = .buffer;
+    st.control = .nvidia;
+    d = decode(&st, keyFrame(), 1);
+    try testing.expectEqual(@as(u32, 0), wordAt(d.slot.pic, 0x54));
+    try testing.expectEqual(@as(u32, 0), wordAt(d.slot.pic, BLACKWELL_WORD_AT));
+    try testing.expect(method(d.slot.push[0..d.end.dwords], SET_BLK_BUF_OFFSET) != null);
+    try testing.expectEqual(@as(u32, 0x5205a), method(d.slot.push[0..d.end.dwords], nvdec.SET_CONTROL_PARAMS).?);
+    // the fields only: no buffer
+    @memset(&test_scratch, 0);
+    st = State.init(TW, TH);
+    st.blackwell = .fields;
+    d = decode(&st, keyFrame(), 1);
+    try testing.expectEqual(@as(u32, 3), wordAt(d.slot.pic, BLACKWELL_WORD_AT));
+    try testing.expectEqual(@as(?u32, null), method(d.slot.push[0..d.end.dwords], SET_BLK_BUF_OFFSET));
+    try testing.expectEqual(@as(usize, 80), d.end.dwords);
+    // Ada's (pc-1111c's)
+    @memset(&test_scratch, 0);
+    st = State.init(TW, TH);
+    st.blackwell = .off;
+    d = decode(&st, keyFrame(), 1);
+    try testing.expectEqual(@as(u32, 0), wordAt(d.slot.pic, 0x238));
+    try testing.expectEqual(@as(usize, 80), d.end.dwords);
 }
 
 test "av1: the scratch sizes (nvdec_drv.h's formulas)" {

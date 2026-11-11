@@ -188,8 +188,19 @@ pub const Options = struct {
     /// a do-nothing submission at init, so a GPU without a decoder fails
     /// vaInitialize (and Firefox's probe) instead of the first frame
     probe: bool = true,
-    /// GALAXY_VA_AV1_BLACKWELL: AV1's Blackwell extras (av1.State.blackwell)
-    av1_blackwell: bool = false,
+    /// Blackwell's additions to HEVC, VP9 and AV1 (codec.Blackwell; the
+    /// modules' State.blackwell): GALAXY_VA_BLACKWELL for all three,
+    /// GALAXY_VA_{HEVC,VP9,AV1}_BLACKWELL for one
+    hevc_blackwell: codec.Blackwell = .full,
+    vp9_blackwell: codec.Blackwell = .full,
+    av1_blackwell: codec.Blackwell = .full,
+    /// GALAXY_VA_CONTROL: HEVC's, VP9's and AV1's SET_CONTROL_PARAMS word
+    /// (codec.Control; H.264's stays NVK's)
+    control: codec.Control = .nvk,
+    /// GALAXY_VA_VP9_INTRA_TOP=0: VP9 without the intra-top buffer
+    vp9_intra_top: bool = true,
+    /// GALAXY_VA_VP9_STREAM_LEN: what VP9's stream_len counts (vp9.StreamLen)
+    vp9_stream_len: vp9.StreamLen = .frame,
     /// GALAXY_VA_ENCODE=0: no encode entrypoints
     encode: bool = true,
     /// GALAXY_VA_NVENC_MAGIC: the encoder setup's magic word (nvenc.MAGIC)
@@ -1048,18 +1059,37 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 .scratch_off = scratch_off,
                 .scratch_bytes = scratch_bytes,
             };
+            const o = d.opts;
             switch (kind) {
-                .hevc => d.contexts[i].hevc = hevc.State.init(width, height),
+                .hevc => {
+                    d.contexts[i].hevc = hevc.State.init(width, height);
+                    d.contexts[i].hevc.blackwell = o.hevc_blackwell;
+                    d.contexts[i].hevc.control = o.control;
+                },
                 .vp8 => d.contexts[i].vp8 = vp8.State.init(width, height),
-                .vp9 => d.contexts[i].vp9 = vp9.State.init(width, height),
+                .vp9 => {
+                    d.contexts[i].vp9 = vp9.State.init(width, height);
+                    d.contexts[i].vp9.blackwell = o.vp9_blackwell;
+                    d.contexts[i].vp9.control = o.control;
+                    d.contexts[i].vp9.intra_top = o.vp9_intra_top;
+                    d.contexts[i].vp9.stream_len_is = o.vp9_stream_len;
+                },
                 .av1 => {
                     d.contexts[i].av1 = av1.State.init(width, height);
-                    d.contexts[i].av1.blackwell = d.opts.av1_blackwell;
+                    d.contexts[i].av1.blackwell = o.av1_blackwell;
+                    d.contexts[i].av1.control = o.control;
                 },
                 .h264 => unreachable,
             }
             out.* = CONTEXT_BASE + @as(u32, i);
             d.debug("{s} context {d}x{d}: work buffer {d} MiB", .{ @tagName(kind), width, height, work.len >> 20 });
+            // (what this boot tries: the variant switches in force)
+            switch (kind) {
+                .hevc => d.debug("hevc variant: blackwell {s}, control {s}", .{ @tagName(o.hevc_blackwell), @tagName(o.control) }),
+                .vp9 => d.debug("vp9 variant: blackwell {s}, control {s}, intra-top {s}, stream_len {s}", .{ @tagName(o.vp9_blackwell), @tagName(o.control), if (o.vp9_intra_top) "on" else "off", @tagName(o.vp9_stream_len) }),
+                .av1 => d.debug("av1 variant: blackwell {s}, control {s}", .{ @tagName(o.av1_blackwell), @tagName(o.control) }),
+                else => {},
+            }
             return va.SUCCESS;
         }
 

@@ -26,6 +26,16 @@
 //! Main10: a 10-bit stream decodes into a P010 surface (output mode 1,
 //! the frame strides in 2-byte samples, init_qp with QpBdOffsetY).
 //!
+//! Blackwell (codec.sig's `Blackwell`): GB206's decoder faulted at address
+//! 0 on the first HEVC picture with Ada's method set (pc-1111c). NVIDIA's
+//! driver, as AROS nvgfx traced it on the CFB0 class, binds one more buffer
+//! (0x4dc, `Layout.blk_off`) and writes reserved6 (a surface code), reserved7
+//! (a depth and chroma code), a count at 0x11c and 0xffff at 0x120, past
+//! Ada's struct; `State.blackwell` says which (full by default). Its
+//! v3.HevcSliceEdgeOffset (the SAO-above part's, in NVIDIA's layout) and
+//! co-located-MV concealment are set too, and the bitstream is padded with
+//! 256 zero bytes, as NVIDIA's driver does.
+//!
 //! Left for later: 12-bit, 4:4:4, the above-row filter
 //! offsets' real use (set apart here, see `Layout`).
 
@@ -231,7 +241,11 @@ comptime {
 
 // ── Buffers ─────────────────────────────────────────────────────────────────
 
-pub const MAX_PIC_BYTES: usize = @sizeOf(HevcPic);
+/// Blackwell's words past Ada's struct (State.blackwell): the 0x4dc
+/// buffer's count (codec.blkUnits of the picture's width), then a u16 0xffff.
+pub const BLACKWELL_UNITS_AT: usize = 0x11c;
+pub const BLACKWELL_FFFF_AT: usize = 0x120;
+pub const MAX_PIC_BYTES: usize = 0x124;
 /// The frame slot's side buffers: the scaling list, then the tile sizes.
 pub const SCALING_OFF: usize = 0;
 pub const TILES_OFF: usize = 0x400;
@@ -273,6 +287,8 @@ pub const Layout = struct {
     flt_above_off: usize,
     sao_above_off: usize,
     intra_top_off: usize,
+    /// Blackwell's buffer (codec.SET_BLK_BUF_OFFSET)
+    blk_off: usize,
     bytes: usize,
 
     pub fn of(width: u32, height: u32) Layout {
@@ -288,6 +304,7 @@ pub const Layout = struct {
         const sao_above_off = flt_above_off + alignUp(sb16 * alignUp(632, 128), 256);
         const filter_bytes = sao_above_off + alignUp(sb16 * alignUp(713, 128), 256);
         const intra_top_off = alignUp(filter_off + filter_bytes, 4096);
+        const blk_off = intra_top_off + INTRA_TOP_BYTES;
         return .{
             .colmv = colmv,
             .coloc_off = coloc_off,
@@ -297,7 +314,8 @@ pub const Layout = struct {
             .flt_above_off = flt_above_off,
             .sao_above_off = sao_above_off,
             .intra_top_off = intra_top_off,
-            .bytes = intra_top_off + INTRA_TOP_BYTES,
+            .blk_off = blk_off,
+            .bytes = blk_off + alignUp(codec.blkBytes(width), 4096),
         };
     }
 };
@@ -477,6 +495,10 @@ pub const State = struct {
     width: u32,
     height: u32,
     layout: Layout,
+    /// Blackwell's additions sent (GALAXY_VA_HEVC_BLACKWELL)
+    blackwell: codec.Blackwell = .full,
+    /// SET_CONTROL_PARAMS' word (GALAXY_VA_CONTROL)
+    control: codec.Control = .nvk,
     /// each picture slot's VA surface (NONE: free)
     slot_surface: [nvdec.SLOTS]u32 = [_]u32{NONE} ** nvdec.SLOTS,
     // ── the picture being made ──
@@ -636,7 +658,7 @@ pub fn tileSizes(out: []u16, p: *const va.PictureParameterBufferHEVC) void {
     }
 }
 
-pub const PUSH_DWORDS = 2 * 13 + 2 * (1 + nvdec.SLOTS) + 2;
+pub const PUSH_DWORDS = 2 * 14 + 2 * (1 + nvdec.SLOTS) + 2;
 
 pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Picture, lookup: codec.Lookup, out: *codec.End) va.Status {
     if (!st.have_pic or st.slices == 0 or !st.have_header) return va.ERROR_INVALID_PARAMETER;
@@ -761,6 +783,15 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
         .long_term_ref_pics_present_flag = sf.long_term_ref_pics_present_flag,
     };
     s.num_bits_short_term_ref_pics_in_slice = p.st_rps_bits;
+    // v3 as NVIDIA's driver sets it (AROS's trace): the slice-edge part at
+    // the SAO-above part's offset, concealment from co-located MVs (1, 3:2),
+    // a P slice's (1, 6:5) for an intra picture
+    s.v3 = .{ (1 << 2) | (@as(u32, @intFromBool(sf.RapPicFlag != 0)) << 5), @intCast(L.sao_above_off >> 8) };
+    if (st.blackwell.writesFields()) {
+        s.reserved6 = codec.surfaceCode(depth);
+        // (3 x depth index + chroma_format_idc - 1; 4:2:0 only here)
+        s.reserved7 = codec.depthCode(depth);
+    }
 
     // The reference sets, by slot.
     const cur_poc: i64 = p.CurrPic.pic_order_cnt;
@@ -843,7 +874,13 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     }
     const tile_words: [*]u16 = @ptrCast(@alignCast(slot.aux.ptr + TILES_OFF));
     tileSizes(tile_words[0 .. TILES_BYTES / 2], p);
+    @memset(slot.pic[0..MAX_PIC_BYTES], 0);
     @memcpy(slot.pic[0..@sizeOf(HevcPic)], std.mem.asBytes(&s));
+    if (st.blackwell.writesFields()) {
+        std.mem.writeInt(u32, slot.pic[BLACKWELL_UNITS_AT..][0..4], codec.blkUnits(p.pic_width_in_luma_samples), .little);
+        std.mem.writeInt(u16, slot.pic[BLACKWELL_FFFF_AT..][0..2], 0xffff, .little);
+    }
+    codec.padStream(slot.stream, st.stream);
 
     // The picture slots' planes: unused ones the scratch reference's (or
     // the target's), never address 0.
@@ -864,7 +901,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     var n: usize = 0;
     codec.bind(o, &n);
     codec.put(o, &n, nvdec.SET_APPLICATION_ID, APPLICATION_ID_HEVC);
-    codec.put(o, &n, nvdec.SET_CONTROL_PARAMS, codec.controlParams(CODEC_TYPE_HEVC, 0));
+    codec.put(o, &n, nvdec.SET_CONTROL_PARAMS, codec.controlFor(CODEC_TYPE_HEVC, st.control));
     codec.put(o, &n, nvdec.SET_PICTURE_INDEX, pic.picture_index);
     codec.put(o, &n, nvdec.SET_DRV_PIC_SETUP_OFFSET, nvdec.shifted(slot.pic_va));
     codec.put(o, &n, nvdec.SET_IN_BUF_BASE_OFFSET, nvdec.shifted(slot.stream_va));
@@ -874,6 +911,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     codec.put(o, &n, HEVC_SET_TILE_SIZES_OFFSET, nvdec.shifted(slot.aux_va + TILES_OFF));
     codec.put(o, &n, HEVC_SET_SCALING_LIST_OFFSET, nvdec.shifted(slot.aux_va + SCALING_OFF));
     codec.put(o, &n, SET_INTRA_TOP_BUF_OFFSET, nvdec.shifted(scratch.va + L.intra_top_off));
+    if (st.blackwell.bindsBuffer()) codec.put(o, &n, codec.SET_BLK_BUF_OFFSET, nvdec.shifted(scratch.va + L.blk_off));
     codec.pictures(o, &n, luma, chroma);
     codec.execute(o, &n);
     std.debug.assert(n <= PUSH_DWORDS);
@@ -1124,11 +1162,41 @@ test "hevc: a P picture through take and end" {
     try testing.expectEqual(@as(u32, 9), w[7]);
     try testing.expectEqual(nvdec.header(0, HEVC_SET_FILTER_BUFFER_OFFSET, 1), w[16]);
     try testing.expectEqual(nvdec.shifted(scratch.va + L.filter_off), w[17]);
-    const luma0 = 25;
+    // (Blackwell's buffer after the intra-top one)
+    try testing.expectEqual(nvdec.header(0, SET_INTRA_TOP_BUF_OFFSET, 1), w[22]);
+    try testing.expectEqual(nvdec.header(0, codec.SET_BLK_BUF_OFFSET, 1), w[24]);
+    try testing.expectEqual(nvdec.shifted(scratch.va + L.blk_off), w[25]);
+    const luma0 = 27;
     try testing.expectEqual(nvdec.header(0, nvdec.SET_PICTURE_LUMA_OFFSET0, nvdec.SLOTS), w[luma0 - 1]);
     try testing.expectEqual(nvdec.shifted(target.luma), w[luma0]);
     try testing.expectEqual(nvdec.shifted(surf.lookup().surface(5).?.luma), w[luma0 + 9]);
     try testing.expectEqual(nvdec.header(0, nvdec.EXECUTE, 1), w[e.dwords - 2]);
+    try testing.expectEqual(@as(usize, 64), e.dwords);
+    // Blackwell's setup words: surface code 9 (8-bit), depth code 0, the
+    // count for 1920 (16) at 0x11c, 0xffff at 0x120; v3's slice edge
+    try testing.expectEqual(@as(u8, 9), s.reserved6);
+    try testing.expectEqual(@as(u16, 0), s.reserved7);
+    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, slot.pic[BLACKWELL_UNITS_AT..][0..4], .little));
+    try testing.expectEqual(@as(u16, 0xffff), std.mem.readInt(u16, slot.pic[BLACKWELL_FFFF_AT..][0..2], .little));
+    try testing.expectEqual(@as(u32, @intCast(L.sao_above_off >> 8)), s.v3[1]);
+    try testing.expectEqual(@as(u32, 1 << 2), s.v3[0] & 0xc);
+    // the stream padded with zeros
+    try testing.expectEqual(@as(u8, 0), slot.stream[s.stream_len + 255]);
+    try testing.expect(L.blk_off + codec.blkBytes(1920) <= L.bytes);
+    // Ada's (off): no buffer, no words; the control word NVIDIA's
+    st.blackwell = .off;
+    st.control = .nvidia;
+    begin(&st);
+    _ = take(&st, .{ .kind = va.PICTURE_PARAMETER_BUFFER, .size = @sizeOf(va.PictureParameterBufferHEVC), .count = 1, .data = std.mem.asBytes(&p) }, slot);
+    _ = take(&st, .{ .kind = va.SLICE_PARAMETER_BUFFER, .size = @sizeOf(va.SliceParameterBufferHEVC), .count = 1, .data = std.mem.asBytes(&slice) }, slot);
+    _ = take(&st, .{ .kind = va.SLICE_DATA_BUFFER, .size = slice.slice_data_size, .count = 1, .data = data[0..slice.slice_data_size] }, slot);
+    try testing.expectEqual(va.SUCCESS, end(&st, slot, scratch, .{ .target_id = 3, .target = target, .gob_height = 0, .picture_index = 9 }, surf.lookup(), &e));
+    try testing.expectEqual(@as(usize, 62), e.dwords);
+    try testing.expectEqual(@as(u32, 0x52057), slot.push[5]);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, slot.pic[BLACKWELL_UNITS_AT..][0..4], .little));
+    try testing.expectEqual(@as(u8, 0), slot.pic[0x71]);
+    st.blackwell = .full;
+    st.control = .nvk;
     // a second picture drops the slots of pictures no longer referenced
     p.ReferenceFrames[4] = .{ .picture_id = va.INVALID_ID, .pic_order_cnt = 0, .flags = va.PICTURE_HEVC_INVALID };
     p.CurrPic.picture_id = 2;
@@ -1176,6 +1244,9 @@ test "hevc: Main10 into a P010 target (output mode 1, strides in 2-byte samples,
     // (init_qp_minus26 -4: 22, and 12 for the two bits past 8)
     try testing.expectEqual(@as(u7, 34), s.pps0.init_qp);
     try testing.expectEqual(@as(u8, 2), s.pattern_id);
+    // Blackwell's codes for 10-bit 4:2:0: surface 2, depth 3
+    try testing.expectEqual(@as(u8, 2), s.reserved6);
+    try testing.expectEqual(@as(u16, 3), s.reserved7);
     // 12-bit, and luma and chroma of different depths
     st.pic.bit_depth_luma_minus8 = 4;
     st.pic.bit_depth_chroma_minus8 = 4;

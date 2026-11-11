@@ -622,7 +622,7 @@ test "driver: HEVC through a fake node: an IDR, then a P picture referencing it"
 test "driver: an AV1 config makes an AV1 context with the module's buffers" {
     var k = Fake{ .decoder = fakeDecode };
     var d: TestDriver = .{ .node = .{ .sys = &k } };
-    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .av1_blackwell = true }));
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .av1_blackwell = .buffer, .control = .prod }));
     defer d.terminate();
     var cfg: u32 = 0;
     try testing.expectEqual(va.SUCCESS, d.createConfig(va.PROFILE_AV1_PROFILE_0, va.ENTRYPOINT_VLD, &.{}, &cfg));
@@ -630,7 +630,8 @@ test "driver: an AV1 config makes an AV1 context with the module's buffers" {
     try testing.expectEqual(va.SUCCESS, d.createContext(cfg, 1920, 1080, &ctx));
     const c = &d.contexts[ctx - CONTEXT_BASE];
     try testing.expectEqual(driver.Codec.av1, c.codec);
-    try testing.expect(c.av1.blackwell);
+    try testing.expectEqual(@import("codec.sig").Blackwell.buffer, c.av1.blackwell);
+    try testing.expectEqual(@import("codec.sig").Control.prod, c.av1.control);
     try testing.expectEqual(@import("av1.sig").scratchBytes(1920, 1080), c.scratch_bytes);
     try testing.expect(c.work.len >= c.scratch_off + c.scratch_bytes);
     try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));

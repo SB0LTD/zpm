@@ -170,6 +170,110 @@ pub fn controlParams(codec_type: u32, error_frm_idx: u32) u32 {
     return codec_type | (1 << 4) | (1 << 6) | ((error_frm_idx & 0x3f) << 7) | (1 << 13);
 }
 
+/// Which SET_CONTROL_PARAMS word the HEVC, VP9 and AV1 modules send
+/// (GALAXY_VA_CONTROL; H.264's is NVK's, always).
+pub const Control = enum {
+    /// NVK's (controlParams): proven on GB206 by H.264
+    nvk,
+    /// NVK's and TESTRUN_ENV PROD_RUN (19:18 = 1)
+    prod,
+    /// NVIDIA's driver's word as AROS nvgfx traced it on Ada and Blackwell
+    /// (0x52050): NVK's, EVENT_TRACE_LOGGING_ON (16) and PROD_RUN
+    nvidia,
+
+    pub fn parse(s: []const u8) ?Control {
+        return std.meta.stringToEnum(Control, s);
+    }
+};
+
+pub fn controlFor(codec_type: u32, c: Control) u32 {
+    const base = controlParams(codec_type, 0);
+    return switch (c) {
+        .nvk => base,
+        .prod => base | (1 << 18),
+        .nvidia => base | (1 << 16) | (1 << 18),
+    };
+}
+
+// ── Blackwell (NVCFB0) ──────────────────────────────────────────────────────
+//
+// NVIDIA's public headers stop at Ada. AROS nvgfx (2026; workbench/hidds/
+// nvgfx/nvgfx_decode{.h,_hevc.c,_vp9.c,_av1.c}, run on a GB207; facts only,
+// none of its code) traced NVIDIA's driver on the class reported as CFB0:
+// the HEVC, VP9 and AV1 paths (and the new H.264 application, id 8, which
+// this driver does not use) bind one more buffer at method 0x4dc, of
+// ceil(width / 128) + 1 blocks of 16 KiB, and write that count in the
+// setup past Ada's struct, with a surface code and a depth code in fields
+// Ada's header calls reserved. Without the buffer GB206's decoder faults at
+// address 0 on the first HEVC, VP9 or AV1 picture (pc-1111c: MMU fault, VA
+// 0, NVDEC0, every codec but H.264's old application).
+
+/// The buffer's method (not in clc9b0.h).
+pub const SET_BLK_BUF_OFFSET: u32 = 0x4dc;
+pub const BLK_UNIT_BYTES: usize = 16 << 10;
+
+/// The setup's count for pictures `width` samples wide.
+pub fn blkUnits(width: u32) u32 {
+    return (width + 127) / 128 + 1;
+}
+
+/// The buffer's bytes for pictures up to `width` wide.
+pub fn blkBytes(width: u32) usize {
+    return @as(usize, blkUnits(width)) * BLK_UNIT_BYTES;
+}
+
+/// The surface code NVIDIA's driver writes on Blackwell (HEVC reserved6,
+/// VP9 reserved5, AV1 reserved_stat's low bits): 9 for 8-bit samples, 2
+/// for 16-bit ones (P010).
+pub fn surfaceCode(depth: u32) u8 {
+    return if (depth > 8) 2 else 9;
+}
+
+/// The depth code beside it: 0, 3, 6 for 8, 10, 12 bits (4:2:0; HEVC adds
+/// chroma_format_idc - 1).
+pub fn depthCode(depth: u32) u8 {
+    return @intCast(3 * ((@max(depth, 8) - 8) / 2));
+}
+
+/// What a module sends of Blackwell's additions (GALAXY_VA_BLACKWELL and
+/// GALAXY_VA_{HEVC,VP9,AV1}_BLACKWELL).
+pub const Blackwell = enum {
+    /// the buffer at 0x4dc and the setup's fields (NVIDIA's, traced)
+    full,
+    /// the buffer only, Ada's setup
+    buffer,
+    /// the setup's fields only, no buffer (expected to fault: a check)
+    fields,
+    /// Ada's: neither (pc-1111c's)
+    off,
+
+    pub fn bindsBuffer(b: Blackwell) bool {
+        return b == .full or b == .buffer;
+    }
+
+    pub fn writesFields(b: Blackwell) bool {
+        return b == .full or b == .fields;
+    }
+
+    /// "1"/"on"/"full", "0"/"off", "buffer", "fields"; null: not one.
+    pub fn parse(s: []const u8) ?Blackwell {
+        if (std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "on")) return .full;
+        if (std.mem.eql(u8, s, "0") or s.len == 0) return .off;
+        return std.meta.stringToEnum(Blackwell, s);
+    }
+};
+
+/// Zero bytes after a picture's bitstream (the decoder reads ahead; NVIDIA's
+/// driver pads 256, as AROS traced).
+pub const STREAM_PAD: usize = 256;
+
+/// Pads the stream's `len` bytes in `stream` with zeros, as far as it fits.
+pub fn padStream(stream: []u8, len: usize) void {
+    if (len >= stream.len) return;
+    const end = @min(stream.len, len + STREAM_PAD);
+    @memset(stream[len..end], 0);
+}
+
 // ── A fake lookup for modules' tests ────────────────────────────────────────
 
 /// Surfaces 1..n at made-up addresses, `w` x `h`, 64-byte pitches.
@@ -231,4 +335,38 @@ test "codec: a pushbuffer's common pieces" {
     try std.testing.expectEqual(@as(u32, 2), out[4 + 17]);
     try std.testing.expectEqual(@as(u32, 0x2001_00c0), out[n - 2]);
     try std.testing.expectEqual(@as(u32, 7 | (1 << 4) | (1 << 6) | (3 << 7) | (1 << 13)), controlParams(7, 3));
+}
+
+test "codec: Blackwell's additions and the control words" {
+    // (NVIDIA's HEVC word as AROS traced it: 7 | 0x52050)
+    try std.testing.expectEqual(@as(u32, 0x52057), controlFor(7, .nvidia));
+    try std.testing.expectEqual(controlParams(9, 0), controlFor(9, .nvk));
+    try std.testing.expectEqual(controlParams(10, 0) | (1 << 18), controlFor(10, .prod));
+    try std.testing.expectEqual(@as(?Control, .nvidia), Control.parse("nvidia"));
+    try std.testing.expectEqual(@as(?Control, null), Control.parse("x"));
+    // 640 wide: 5 + 1 blocks; 1920: 15 + 1; 1921: 16 + 1
+    try std.testing.expectEqual(@as(u32, 6), blkUnits(640));
+    try std.testing.expectEqual(@as(u32, 16), blkUnits(1920));
+    try std.testing.expectEqual(@as(u32, 17), blkUnits(1921));
+    try std.testing.expectEqual(@as(usize, 16 * 16384), blkBytes(1920));
+    try std.testing.expectEqual(@as(u8, 9), surfaceCode(8));
+    try std.testing.expectEqual(@as(u8, 2), surfaceCode(10));
+    try std.testing.expectEqual(@as(u8, 0), depthCode(8));
+    try std.testing.expectEqual(@as(u8, 3), depthCode(10));
+    try std.testing.expectEqual(@as(?Blackwell, .full), Blackwell.parse("1"));
+    try std.testing.expectEqual(@as(?Blackwell, .full), Blackwell.parse("full"));
+    try std.testing.expectEqual(@as(?Blackwell, .off), Blackwell.parse("0"));
+    try std.testing.expectEqual(@as(?Blackwell, .buffer), Blackwell.parse("buffer"));
+    try std.testing.expectEqual(@as(?Blackwell, .fields), Blackwell.parse("fields"));
+    try std.testing.expect(Blackwell.full.bindsBuffer() and Blackwell.full.writesFields());
+    try std.testing.expect(Blackwell.buffer.bindsBuffer() and !Blackwell.buffer.writesFields());
+    try std.testing.expect(!Blackwell.fields.bindsBuffer() and Blackwell.fields.writesFields());
+    var s = [_]u8{0xaa} ** 300;
+    padStream(&s, 10);
+    try std.testing.expectEqual(@as(u8, 0xaa), s[9]);
+    try std.testing.expectEqual(@as(u8, 0), s[10]);
+    try std.testing.expectEqual(@as(u8, 0), s[265]);
+    try std.testing.expectEqual(@as(u8, 0xaa), s[266]);
+    padStream(&s, 299);
+    try std.testing.expectEqual(@as(u8, 0), s[299]);
 }

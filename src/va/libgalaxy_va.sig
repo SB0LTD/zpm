@@ -56,6 +56,14 @@
 //! ASSUMED fields). GALAXY_VA_DEBUG=1 says on stderr what
 //! the driver does and each decode the decoder reports in error.
 //!
+//! pc-1111c's boot: H.264 decoded on GB206; HEVC, VP9 and AV1 faulted at
+//! address 0 on their first picture. Blackwell's extra buffer (method
+//! 0x4dc) and setup words, as AROS nvgfx traced NVIDIA's driver
+//! (codec.sig), are now sent by default; GALAXY_VA_BLACKWELL,
+//! GALAXY_VA_{HEVC,VP9,AV1}_BLACKWELL, GALAXY_VA_CONTROL,
+//! GALAXY_VA_VP9_INTRA_TOP and GALAXY_VA_VP9_STREAM_LEN pick the other
+//! variants, so one boot can try them all (optionsOf).
+//!
 //! Build (x86-64 Linux, from the zpm root):
 //!   sig build-lib -dynamic -target x86_64-linux-none -OReleaseSafe -fPIC
 //!     -fno-stack-protector -fno-unwind-tables -fstrip
@@ -72,6 +80,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const va = @import("vaapi.sig");
 const driver = @import("driver.sig");
+const codec = @import("codec.sig");
+const vp9 = @import("vp9.sig");
 const node = @import("node.sig");
 const linux = std.os.linux;
 
@@ -252,13 +262,23 @@ fn options() driver.Options {
 
 /// GALAXY_VA_DEBUG (set and not "0": say things on stderr), GALAXY_VA_GOB
 /// ("turing": Turing's GOB layout instead of Blackwell's), GALAXY_VA_PROBE
-/// ("0": no decoder probe at init), GALAXY_VA_AV1_BLACKWELL ("1": AV1's
-/// Blackwell extras, av1.State.blackwell), GALAXY_VA_ENCODE ("0": no
+/// ("0": no decoder probe at init), GALAXY_VA_BLACKWELL and
+/// GALAXY_VA_{HEVC,VP9,AV1}_BLACKWELL (Blackwell's additions, codec.Blackwell:
+/// "full" or "1" the default, "buffer", "fields", "off" or "0"; a codec's own
+/// wins over the common one), GALAXY_VA_CONTROL (HEVC's, VP9's and AV1's
+/// control word: "nvk" the default, "prod", "nvidia"), GALAXY_VA_VP9_INTRA_TOP
+/// ("0": no intra-top buffer), GALAXY_VA_VP9_STREAM_LEN ("frame" the
+/// default, "tiles"), GALAXY_VA_ENCODE ("0": no
 /// encode entrypoints), GALAXY_VA_NVENC_MAGIC (hex: the encoder setup's
 /// magic word), GALAXY_VA_NVENC_RC ("firmware": the encoder's own rate
-/// control), from an environment block.
+/// control), from an environment block. Values not understood leave the
+/// default.
 pub fn optionsOf(block: []const u8) driver.Options {
     var o: driver.Options = .{};
+    var all_bw: ?codec.Blackwell = null;
+    var hevc_bw: ?codec.Blackwell = null;
+    var vp9_bw: ?codec.Blackwell = null;
+    var av1_bw: ?codec.Blackwell = null;
     var it = std.mem.splitScalar(u8, block, 0);
     while (it.next()) |kv| {
         const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
@@ -270,8 +290,20 @@ pub fn optionsOf(block: []const u8) driver.Options {
             o.gob = if (std.ascii.eqlIgnoreCase(v, "turing")) .turing else .blackwell;
         } else if (std.mem.eql(u8, k, "GALAXY_VA_PROBE")) {
             o.probe = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_BLACKWELL")) {
+            all_bw = codec.Blackwell.parse(v);
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_HEVC_BLACKWELL")) {
+            hevc_bw = codec.Blackwell.parse(v);
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VP9_BLACKWELL")) {
+            vp9_bw = codec.Blackwell.parse(v);
         } else if (std.mem.eql(u8, k, "GALAXY_VA_AV1_BLACKWELL")) {
-            o.av1_blackwell = v.len != 0 and !std.mem.eql(u8, v, "0");
+            av1_bw = codec.Blackwell.parse(v);
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_CONTROL")) {
+            o.control = codec.Control.parse(v) orelse o.control;
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VP9_INTRA_TOP")) {
+            o.vp9_intra_top = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VP9_STREAM_LEN")) {
+            o.vp9_stream_len = vp9.StreamLen.parse(v) orelse o.vp9_stream_len;
         } else if (std.mem.eql(u8, k, "GALAXY_VA_ENCODE")) {
             o.encode = !std.mem.eql(u8, v, "0");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_MAGIC")) {
@@ -282,6 +314,9 @@ pub fn optionsOf(block: []const u8) driver.Options {
             o.nvenc_rc_firmware = std.ascii.eqlIgnoreCase(v, "firmware");
         }
     }
+    o.hevc_blackwell = hevc_bw orelse all_bw orelse o.hevc_blackwell;
+    o.vp9_blackwell = vp9_bw orelse all_bw orelse o.vp9_blackwell;
+    o.av1_blackwell = av1_bw orelse all_bw orelse o.av1_blackwell;
     return o;
 }
 
@@ -583,6 +618,16 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expect(!enc.encode);
     try testing.expectEqual(@as(?u32, 0xc9b7_0006), enc.nvenc_magic);
     try testing.expectEqual(@as(?u32, 0xcfb7_0007), optionsOf("GALAXY_VA_NVENC_MAGIC=cfb70007").nvenc_magic);
+    // the decode variants: defaults, the common switch, a codec's own over it
+    try testing.expect(none.hevc_blackwell == .full and none.vp9_blackwell == .full and none.av1_blackwell == .full);
+    try testing.expect(none.control == .nvk and none.vp9_intra_top and none.vp9_stream_len == .frame);
+    const v = optionsOf("GALAXY_VA_VP9_BLACKWELL=buffer\x00GALAXY_VA_BLACKWELL=off\x00GALAXY_VA_CONTROL=nvidia\x00GALAXY_VA_VP9_INTRA_TOP=0\x00GALAXY_VA_VP9_STREAM_LEN=tiles\x00");
+    try testing.expect(v.hevc_blackwell == .off and v.vp9_blackwell == .buffer and v.av1_blackwell == .off);
+    try testing.expect(v.control == .nvidia and !v.vp9_intra_top and v.vp9_stream_len == .tiles);
+    try testing.expectEqual(codec.Blackwell.fields, optionsOf("GALAXY_VA_AV1_BLACKWELL=fields").av1_blackwell);
+    try testing.expectEqual(codec.Blackwell.off, optionsOf("GALAXY_VA_AV1_BLACKWELL=0").av1_blackwell);
+    try testing.expectEqual(codec.Blackwell.full, optionsOf("GALAXY_VA_HEVC_BLACKWELL=bogus").hevc_blackwell);
+    try testing.expectEqual(codec.Control.nvk, optionsOf("GALAXY_VA_CONTROL=bogus").control);
 }
 
 test "libgalaxy_va: init without Galaxy's RTX fails cleanly" {
