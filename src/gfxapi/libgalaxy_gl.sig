@@ -13,7 +13,10 @@
 //! by name (dl.sig), and the process's side of things (host.Host): PRIME
 //! out and in, sync_files (Galaxy's G_FENCE_FD), dup, poll, mmap. Opened at the
 //! first eglInitialize; without a GPU EGL has no display and the app
-//! draws in software.
+//! draws in software. EGL's X11 platform speaks over Linux's Unix sockets
+//! (x11.Wire: connect, sendmsg with SCM_RIGHTS and MSG_NOSIGNAL, read,
+//! poll), its server named by the Display or $DISPLAY (the C library's
+//! getenv, else /proc/self/environ).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,6 +24,7 @@ const gfxapi = @import("gfxapi");
 const gpu = @import("gpu");
 const egl = gfxapi.egl;
 const wayland = gfxapi.wayland;
+const x11 = gfxapi.x11;
 const node = gfxapi.node;
 const engine = gfxapi.engine;
 const thread = gfxapi.thread;
@@ -216,6 +220,141 @@ fn waylandClient() ?*const wayland.Client {
     return if (wl_client) |*c| c else null;
 }
 
+// ── X11's socket (x11.Wire) ────────────────────────────────────────────────
+
+/// A stream socket connected to the Unix socket at `path` (abstract: in
+/// Linux's abstract namespace, as Xwayland also listens), or -errno.
+fn xConnect(ctx: ?*anyopaque, path: []const u8, abstract: bool) i32 {
+    _ = ctx;
+    var a = linux.sockaddr.un{ .path = [_]u8{0} ** 108 };
+    const off: usize = @intFromBool(abstract);
+    if (path.len + off >= a.path.len) return -36; // ENAMETOOLONG
+    @memcpy(a.path[off..][0..path.len], path);
+    const s = sysResult(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0));
+    if (s < 0) return @intCast(s);
+    const len: linux.socklen_t = if (abstract) @intCast(@offsetOf(linux.sockaddr.un, "path") + 1 + path.len) else @sizeOf(linux.sockaddr.un);
+    while (true) {
+        const r = sysResult(linux.connect(@intCast(s), @ptrCast(&a), len));
+        if (r == -4) continue; // EINTR
+        if (r < 0) {
+            _ = linux.close(@intCast(s));
+            return @intCast(r);
+        }
+        return @intCast(s);
+    }
+}
+
+/// struct iovec and the kernel's struct user_msghdr.
+const Iovec = extern struct { base: [*]const u8, len: usize };
+const Msghdr = extern struct {
+    name: ?*anyopaque = null,
+    namelen: u32 = 0,
+    iov: [*]const Iovec,
+    iovlen: usize,
+    control: ?*anyopaque = null,
+    controllen: usize = 0,
+    flags: u32 = 0,
+};
+const MAX_SEND_FDS = 4;
+
+/// `bytes` out (MSG_NOSIGNAL: a server gone is an error, never SIGPIPE),
+/// `fds` with them as SCM_RIGHTS: the bytes written, or -errno.
+fn xSend(ctx: ?*anyopaque, fd: i32, bytes: []const u8, fds: []const i32) isize {
+    _ = ctx;
+    if (fds.len > MAX_SEND_FDS) return -22; // EINVAL
+    var iov = [1]Iovec{.{ .base = bytes.ptr, .len = bytes.len }};
+    // struct cmsghdr (len, level, type) and the fds
+    var cbuf: [16 + 4 * MAX_SEND_FDS]u8 align(8) = undefined;
+    var msg = Msghdr{ .iov = &iov, .iovlen = 1 };
+    if (fds.len > 0) {
+        const len = 16 + 4 * fds.len;
+        std.mem.writeInt(u64, cbuf[0..8], len, builtin.cpu.arch.endian());
+        std.mem.writeInt(i32, cbuf[8..12], 1, builtin.cpu.arch.endian()); // SOL_SOCKET
+        std.mem.writeInt(i32, cbuf[12..16], 1, builtin.cpu.arch.endian()); // SCM_RIGHTS
+        for (fds, 0..) |f, i| std.mem.writeInt(i32, cbuf[16 + 4 * i ..][0..4], f, builtin.cpu.arch.endian());
+        msg.control = &cbuf;
+        msg.controllen = std.mem.alignForward(usize, len, 8);
+    }
+    while (true) {
+        const r = sysResult(linux.syscall3(.sendmsg, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&msg), 0x4000)); // MSG_NOSIGNAL
+        if (r == -4) continue; // EINTR
+        return @intCast(r);
+    }
+}
+
+fn xRecv(ctx: ?*anyopaque, fd: i32, buf: []u8) isize {
+    _ = ctx;
+    while (true) {
+        const r = sysResult(linux.read(fd, buf.ptr, buf.len));
+        if (r == -4) continue; // EINTR
+        return @intCast(r);
+    }
+}
+
+fn xPoll(ctx: ?*anyopaque, fd: i32, timeout_ms: i32) i32 {
+    _ = ctx;
+    var p = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    while (true) {
+        const r = sysResult(linux.poll(&p, 1, timeout_ms));
+        if (r == -4) continue; // EINTR
+        if (r < 0) return @intCast(r);
+        // (readable, or hung up: the read that follows tells which)
+        return if (r > 0) 1 else 0;
+    }
+}
+
+var display_buf: [256]u8 = undefined;
+
+/// $DISPLAY: the C library's getenv (what the app may have set), else the
+/// environment the process began with.
+fn xDisplayEnv(ctx: ?*anyopaque) ?[]const u8 {
+    _ = ctx;
+    const Getenv = *const fn ([*:0]const u8) callconv(.c) ?[*:0]const u8;
+    if (gfxapi.dl.sym(Getenv, "getenv")) |getenv| {
+        const v = std.mem.span(getenv("DISPLAY") orelse return null);
+        return if (v.len == 0) null else v;
+    }
+    if (comptime !on_linux) return null;
+    const fd = sysResult(linux.openat(linux.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    if (fd < 0) return null;
+    defer _ = linux.close(@intCast(fd));
+    var n: usize = 0;
+    while (n < env_buf.len) {
+        const r = sysResult(linux.read(@intCast(fd), env_buf[n..].ptr, env_buf.len - n));
+        if (r <= 0) break;
+        n += @intCast(r);
+    }
+    return displayOf(env_buf[0..n], &display_buf);
+}
+
+/// DISPLAY's value in an environment block (NUL-separated), copied to `out`.
+fn displayOf(block: []const u8, out: []u8) ?[]const u8 {
+    const key = "DISPLAY=";
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |kv| {
+        if (!std.mem.startsWith(u8, kv, key)) continue;
+        const v = kv[key.len..];
+        if (v.len == 0 or v.len > out.len) return null;
+        @memcpy(out[0..v.len], v);
+        return out[0..v.len];
+    }
+    return null;
+}
+
+test "libgalaxy-gl: DISPLAY from an environment block" {
+    var out: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(":3", displayOf("HOME=/\x00DISPLAY=:3\x00", &out).?);
+    try std.testing.expect(displayOf("WAYLAND_DISPLAY=wayland-0\x00", &out) == null);
+    try std.testing.expect(displayOf("DISPLAY=\x00", &out) == null);
+    try std.testing.expect(displayOf("DISPLAY=/a/very/long/path/to/a/socket:0", &out) == null);
+}
+
+const x11_wire = x11.Wire{ .connect = xConnect, .send = xSend, .recv = xRecv, .poll = xPoll, .close = closeFd, .display_env = xDisplayEnv };
+
+fn x11Wire() ?*const x11.Wire {
+    return &x11_wire;
+}
+
 fn nativeInterop() bool {
     return the_gpu.node.kind == .adreno;
 }
@@ -228,6 +367,7 @@ pub const egl_driver: ?egl.Driver = if (on_linux) .{
     .open = openDriver,
     .host = .{ .exportFd = exportFd, .importFd = importFd, .fenceFd = fenceFd, .close = closeFd, .dup = dupFd, .poll = pollFd, .map = mapFd, .unmap = unmapFd },
     .wayland = waylandClient,
+    .x11 = x11Wire,
     .native_interop = nativeInterop,
     .dma_import = dmaImport,
 } else null;
@@ -289,11 +429,11 @@ pub export fn eglCreateWindowSurface(dpy: ?*anyopaque, config: ?*const anyopaque
 }
 pub export fn eglCreatePlatformWindowSurface(dpy: ?*anyopaque, config: ?*const anyopaque, win: ?*anyopaque, attribs: ?[*]const isize) callconv(.c) ?*anyopaque {
     egl.calling("eglCreatePlatformWindowSurface");
-    return h(egl.createWindowSurface(isize, dpy, config, win, attribs));
+    return h(egl.createPlatformWindowSurface(isize, dpy, config, win, attribs));
 }
 pub export fn eglCreatePlatformWindowSurfaceEXT(dpy: ?*anyopaque, config: ?*const anyopaque, win: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
     egl.calling("eglCreatePlatformWindowSurfaceEXT");
-    return h(egl.createWindowSurface(i32, dpy, config, win, attribs));
+    return h(egl.createPlatformWindowSurface(i32, dpy, config, win, attribs));
 }
 pub export fn eglCreatePbufferSurface(dpy: ?*anyopaque, config: ?*const anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
     egl.calling("eglCreatePbufferSurface");

@@ -12,7 +12,14 @@
 //! - **Displays.** EGL_DEFAULT_DISPLAY and EGL_PLATFORM_SURFACELESS_MESA
 //!   are the surfaceless display (pbuffers, surfaceless contexts). A
 //!   wl_display (eglGetDisplay of one, or EGL_PLATFORM_WAYLAND_KHR) is a
-//!   Wayland display: window surfaces of wl_egl_windows.
+//!   Wayland display: window surfaces of wl_egl_windows. An Xlib Display
+//!   (eglGetDisplay of one, or EGL_PLATFORM_X11_KHR, whose
+//!   EGL_DEFAULT_DISPLAY is $DISPLAY) is an X11 display (x11.sig): window
+//!   surfaces of X windows, over a connection of EGL's own. The default
+//!   display, as Mesa's on X11, takes X windows too: it connects to
+//!   $DISPLAY at its first window surface (or native visual asked), so
+//!   Firefox on X11 (which asks EGL_DEFAULT_DISPLAY for everything,
+//!   window surfaces and its GPU process's offscreen contexts) draws there.
 //! - **Configs.** Four: ARGB8888 and XRGB8888 (DRM's fourcc is the native
 //!   visual), each with and without depth 24 + stencil 8; windows and
 //!   pbuffers; OpenGL ES 2 and 3. eglChooseConfig matches and sorts as
@@ -55,6 +62,7 @@ const gles = @import("gles.sig");
 const report = @import("report.sig");
 const thread = @import("thread.sig");
 const wayland = @import("wayland.sig");
+const x11 = @import("x11.sig");
 const Host = @import("host.sig").Host;
 const Engine = engine.Engine;
 const Image = engine.Image;
@@ -182,6 +190,8 @@ pub const EXTENSIONS: i32 = 0x3055;
 pub const CLIENT_APIS: i32 = 0x308D;
 pub const PLATFORM_WAYLAND_KHR: u32 = 0x31D8;
 pub const PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
+pub const PLATFORM_X11_KHR: u32 = 0x31D5;
+pub const PLATFORM_X11_SCREEN_KHR: i32 = 0x31D6;
 
 // syncs
 pub const SYNC_FENCE: u32 = 0x30F9;
@@ -225,7 +235,7 @@ pub const GL_TEXTURE_2D_KHR: u32 = 0x30B1;
 pub const GL_TEXTURE_LEVEL_KHR: i32 = 0x30BC;
 
 pub const VERSION_STRING: [:0]const u8 = "1.5 Galaxy";
-pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_device_base EGL_EXT_device_enumeration EGL_EXT_device_query EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_wayland EGL_MESA_platform_surfaceless";
+pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_device_base EGL_EXT_device_enumeration EGL_EXT_device_query EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_EXT_platform_x11 EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_wayland EGL_KHR_platform_x11 EGL_MESA_platform_surfaceless";
 /// The one device's extensions (eglQueryDeviceStringEXT's EXTENSIONS).
 pub const DEVICE_EXTENSIONS: [:0]const u8 = "EGL_EXT_device_drm EGL_EXT_device_drm_render_node";
 pub const DEVICE_EXT: i32 = 0x322C;
@@ -257,6 +267,8 @@ pub const Driver = struct {
     host: Host,
     /// libwayland-client (null: not in this process).
     wayland: *const fn () ?*const wayland.Client,
+    /// The socket calls EGL's X11 platform speaks over (null: no X11).
+    x11: ?*const fn () ?*const x11.Wire = null,
     /// Whether EGL can import dma-bufs and exchange native fence FDs.
     native_interop: *const fn () bool = allInterop,
     dma_import: ?*const fn () bool = null,
@@ -621,7 +633,7 @@ pub fn configOf(handle: ?*const anyopaque) ?*const Config {
 
 // ── Displays ───────────────────────────────────────────────────────────────
 
-pub const Platform = enum { surfaceless, wayland };
+pub const Platform = enum { surfaceless, wayland, x11 };
 
 pub const Display = struct {
     used: bool = false,
@@ -631,7 +643,14 @@ pub const Display = struct {
     eng: ?*Engine = null,
     client: ?*const wayland.Client = null,
     wl: wayland.Display = undefined,
-    /// terminated with objects still current: the Wayland state goes with the last
+    /// the X server's connection (an X11 display's, or the default one's
+    /// once it took an X window), while x11_up
+    xc: x11.Conn = undefined,
+    x11_up: bool = false,
+    /// (the default display tried $DISPLAY once already)
+    x11_tried: bool = false,
+    /// terminated with objects still current: the Wayland (or X11) state
+    /// goes with the last
     terminating: bool = false,
 };
 
@@ -668,9 +687,35 @@ pub fn getDisplay(native: ?*anyopaque) ?*Display {
     defer unlock();
     const n = native orelse return ok(?*Display, displayFor(.surfaceless, null));
     const drv = driver orelse return failWhy(?*Display, BAD_DISPLAY, null, "no EGL driver");
-    const c = drv.wayland() orelse return failWhy(?*Display, BAD_DISPLAY, null, "no libwayland-client symbols");
-    if (!c.isDisplay(n)) return failWhy(?*Display, BAD_PARAMETER, null, "native display is not a wl_display");
-    return ok(?*Display, displayFor(.wayland, n));
+    const c = drv.wayland();
+    if (c) |wc| {
+        if (wc.isDisplay(n)) return ok(?*Display, displayFor(.wayland, n));
+    }
+    // (not a wl_display: an Xlib Display, as Mesa takes it)
+    if (x11Wire() != null and x11.isXlibDisplay(n)) return ok(?*Display, displayFor(.x11, n));
+    if (c == null) return failWhy(?*Display, BAD_DISPLAY, null, "no libwayland-client symbols, and not an Xlib Display");
+    return failWhy(?*Display, BAD_PARAMETER, null, "native display is neither a wl_display nor an Xlib Display");
+}
+
+/// The driver's X11 socket calls, if it has them.
+fn x11Wire() ?*const x11.Wire {
+    const drv = driver orelse return null;
+    const f = drv.x11 orelse return null;
+    return f();
+}
+
+/// The X server's connection of a display that takes X windows: an X11
+/// display's, or the default (surfaceless) display's, which connects to
+/// $DISPLAY at its first need (once). Null otherwise.
+fn xconn(d: *Display) ?*x11.Conn {
+    if (d.x11_up) return if (d.xc.live()) &d.xc else null;
+    if (d.platform != .surfaceless or d.x11_tried or !d.initialized) return null;
+    d.x11_tried = true;
+    const wire = x11Wire() orelse return null;
+    const name = wire.display_env(wire.ctx) orelse return null;
+    if (!d.xc.open(wire, name, null)) return null;
+    d.x11_up = true;
+    return &d.xc;
 }
 
 /// eglGetPlatformDisplay (and the EXT one).
@@ -686,6 +731,14 @@ pub fn getPlatformDisplay(platform: u32, native: ?*anyopaque) ?*Display {
             // (EGL_DEFAULT_DISPLAY would mean a connection of EGL's own: not made)
             const n = native orelse return fail(?*Display, BAD_PARAMETER, null);
             return ok(?*Display, displayFor(.wayland, n));
+        },
+        PLATFORM_X11_KHR => {
+            // (an Xlib Display, or EGL_DEFAULT_DISPLAY: $DISPLAY)
+            if (x11Wire() == null) return failWhy(?*Display, BAD_PARAMETER, null, "no X11 in this driver");
+            if (native) |n| {
+                if (!x11.isXlibDisplay(n)) return failWhy(?*Display, BAD_PARAMETER, null, "not an Xlib Display");
+            }
+            return ok(?*Display, displayFor(.x11, native));
         },
         else => return fail(?*Display, BAD_PARAMETER, null),
     }
@@ -705,6 +758,18 @@ pub fn initialize(handle: ?*anyopaque, major: ?*i32, minor: ?*i32) bool {
             if (!c.isDisplay(d.native.?)) return failWhy(bool, BAD_DISPLAY, false, "not a wl_display");
             if (!d.wl.init(c, drv.host, @ptrCast(d.native.?))) return failWhy(bool, NOT_INITIALIZED, false, "the compositor offers no dma-bufs this driver can show");
             d.client = c;
+        }
+        if (d.platform == .x11 and !d.x11_up) {
+            const wire = x11Wire() orelse return failWhy(bool, NOT_INITIALIZED, false, "no X11 in this driver");
+            var name: []const u8 = undefined;
+            var screen: ?u32 = null;
+            if (d.native) |n| {
+                const xn = x11.xlibName(n);
+                name = xn.name;
+                screen = xn.screen;
+            } else name = wire.display_env(wire.ctx) orelse return failWhy(bool, NOT_INITIALIZED, false, "DISPLAY is not set");
+            if (!d.xc.open(wire, name, screen)) return failWhy(bool, NOT_INITIALIZED, false, "no X server to show windows on");
+            d.x11_up = true;
         }
         d.terminating = false;
         d.eng = eng;
@@ -744,7 +809,7 @@ pub fn terminate(handle: ?*anyopaque) bool {
         if (s.display == d) dropStream(s);
     }
     d.initialized = false;
-    d.terminating = d.platform == .wayland;
+    d.terminating = d.platform == .wayland or d.x11_up;
     reapDisplay(d);
     return ok(bool, true);
 }
@@ -758,7 +823,10 @@ fn reapDisplay(d: *Display) void {
     for (&contexts) |*c| {
         if (c.used and c.display == d) return;
     }
-    d.wl.deinit();
+    if (d.platform == .wayland) d.wl.deinit();
+    if (d.x11_up) d.xc.close();
+    d.x11_up = false;
+    d.x11_tried = false;
     d.terminating = false;
 }
 
@@ -1132,9 +1200,14 @@ pub fn chooseConfig(handle: ?*anyopaque, attribs: ?[*]const i32, out: ?[*]?*cons
 pub fn getConfigAttrib(handle: ?*anyopaque, config: ?*const anyopaque, a: i32, value: ?*i32) bool {
     lock();
     defer unlock();
-    _ = ready(handle) orelse return false;
+    const d = ready(handle) orelse return false;
     const c = configOf(config) orelse return fail(bool, BAD_CONFIG, false);
-    const v = c.attrib(a) orelse return fail(bool, BAD_ATTRIBUTE, false);
+    var v = c.attrib(a) orelse return fail(bool, BAD_ATTRIBUTE, false);
+    // (on X the native visual is the server's: TrueColor, of depth 24 for
+    // XRGB, 32 for ARGB, as Firefox matches them with XGetVisualInfo)
+    if (a == NATIVE_VISUAL_ID or a == NATIVE_VISUAL_TYPE) {
+        if (xconn(d)) |xc| v = if (a == NATIVE_VISUAL_TYPE) x11.TRUE_COLOR else @bitCast(if (c.alpha) xc.setup.visual32 else xc.setup.visual24);
+    }
     if (value) |p| p.* = v;
     return ok(bool, true);
 }
@@ -1290,9 +1363,11 @@ pub const Surface = struct {
     used: bool = false,
     display: ?*Display = null,
     config: *const Config = &configs[0],
-    kind: enum { window, pbuffer, stream } = .pbuffer,
+    kind: enum { window, xwindow, pbuffer, stream } = .pbuffer,
     stream: ?*Stream = null,
     win: wayland.Window = undefined,
+    /// an X window's (kind xwindow)
+    xwin: x11.Window = undefined,
     age_queried: bool = false,
     damage_set: bool = false,
     /// a pbuffer's color
@@ -1343,15 +1418,16 @@ fn windowAttribs(comptime T: type, attribs: ?[*]const T) bool {
     return true;
 }
 
-/// eglCreateWindowSurface and eglCreatePlatformWindowSurface: `native` is
-/// a wl_egl_window.
+/// eglCreateWindowSurface: `native` is a wl_egl_window, or on a display
+/// that takes X windows (an X11 one, the default one) an X Window (its id
+/// as the pointer's value).
 pub fn createWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*const anyopaque, native: ?*anyopaque, attribs: ?[*]const T) ?*Surface {
     lock();
     defer unlock();
     const d = ready(handle) orelse return null;
     const cfg = configOf(config) orelse return fail(?*Surface, BAD_CONFIG, null);
     if (!windowAttribs(T, attribs)) return fail(?*Surface, BAD_ATTRIBUTE, null);
-    if (d.platform != .wayland) return fail(?*Surface, BAD_NATIVE_WINDOW, null);
+    if (d.platform != .wayland) return xWindowSurface(d, cfg, native);
     const n: *wayland.EglWindow = @ptrCast(@alignCast(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null)));
     if (n.driver_private != null) return failWhy(?*Surface, BAD_ALLOC, null, "the wl_egl_window has a surface already");
     const s = newSurface(d, cfg) orelse return failWhy(?*Surface, BAD_ALLOC, null, "every surface slot is in use");
@@ -1359,6 +1435,38 @@ pub fn createWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*cons
     if (!s.win.init(&d.wl, d.eng.?, n, cfg.alpha)) {
         s.* = .{};
         return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "the window's Wayland surface could not be set up");
+    }
+    return ok(?*Surface, s);
+}
+
+/// eglCreatePlatformWindowSurface (and the EXT one): as eglCreateWindowSurface,
+/// but on X (EGL_KHR_platform_x11) `native` points to the Window.
+pub fn createPlatformWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*const anyopaque, native: ?*anyopaque, attribs: ?[*]const T) ?*Surface {
+    lock();
+    defer unlock();
+    if (displayOf(handle)) |d| {
+        if (d.platform != .wayland) {
+            const p: *const c_ulong = @ptrCast(@alignCast(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null)));
+            return createWindowSurface(T, handle, config, @ptrFromInt(p.*), attribs);
+        }
+    }
+    return createWindowSurface(T, handle, config, native, attribs);
+}
+
+/// A window surface over X window `native` (its id as the pointer's value).
+fn xWindowSurface(d: *Display, cfg: *const Config, native: ?*anyopaque) ?*Surface {
+    const xid_wide = @intFromPtr(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null));
+    if (xid_wide > 0x1fff_ffff) return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "not an X window id");
+    const xid: u32 = @intCast(xid_wide);
+    const xc = xconn(d) orelse return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "no X server for this display's windows");
+    for (&surfaces) |*o| {
+        if (o.used and !o.doomed and o.display == d and o.kind == .xwindow and o.xwin.xid == xid) return failWhy(?*Surface, BAD_ALLOC, null, "the X window has a surface already");
+    }
+    const s = newSurface(d, cfg) orelse return failWhy(?*Surface, BAD_ALLOC, null, "every surface slot is in use");
+    s.kind = .xwindow;
+    if (!s.xwin.init(xc, d.eng.?, driver.?.host, xid, cfg.alpha)) {
+        s.* = .{};
+        return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "the X window could not be drawn on");
     }
     return ok(?*Surface, s);
 }
@@ -1441,6 +1549,7 @@ fn freeSurface(s: *Surface) void {
     const d = s.display.?;
     const eng = d.eng.?;
     if (s.kind == .window) s.win.deinit();
+    if (s.kind == .xwindow) s.xwin.deinit();
     if (s.stream) |st| {
         st.producer = null;
         st.disconnected = true;
@@ -1458,14 +1567,18 @@ pub fn destroySurface(handle: ?*anyopaque, surface: ?*anyopaque) bool {
     const d = ready(handle) orelse return false;
     const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
     s.doomed = true;
-    if (s.ctx == null) freeSurface(s) else if (s.kind == .window) s.win.detach();
+    if (s.ctx == null) freeSurface(s) else if (s.kind == .window) s.win.detach() else if (s.kind == .xwindow) s.xwin.detach();
     return ok(bool, true);
 }
 
 /// The surface's color image to draw to now (a window's back buffer), and
 /// its depth image (made or remade at the color's size).
 fn images(s: *Surface) ?struct { color: *Image, depth: ?*Image } {
-    const color: *Image = if (s.kind == .window) (s.win.backImage() orelse return null) else &s.color;
+    const color: *Image = switch (s.kind) {
+        .window => s.win.backImage() orelse return null,
+        .xwindow => s.xwin.backImage() orelse return null,
+        else => &s.color,
+    };
     if (!s.config.depth) return .{ .color = color, .depth = null };
     const eng = s.display.?.eng.?;
     if (s.depth.width != color.width or s.depth.height != color.height) {
@@ -1484,7 +1597,16 @@ fn bindSurfaces(c: *Context) bool {
         c.gl.revalidate = null;
         return true;
     };
-    c.gl.revalidate = if (draw.kind == .window) .{ .ctx = c, .f = revalidateWindow, .stale = &draw.win.resized } else null;
+    c.gl.revalidate = switch (draw.kind) {
+        .window => .{ .ctx = c, .f = revalidateWindow, .stale = &draw.win.resized },
+        .xwindow => .{ .ctx = c, .f = revalidateWindow, .stale = &draw.xwin.resized },
+        else => null,
+    };
+    // (an X window's binding is fresh from here: its size is asked below)
+    if (draw.kind == .xwindow) draw.xwin.resized.store(false, .release);
+    if (c.read) |r| {
+        if (r.kind == .xwindow) r.xwin.resized.store(false, .release);
+    }
     const di = images(draw) orelse return false;
     var ri = di;
     if (c.read) |r| {
@@ -1501,8 +1623,11 @@ fn bindSurfaces(c: *Context) bool {
 fn revalidateWindow(p: *anyopaque) void {
     const c: *Context = @ptrCast(@alignCast(p));
     const s = c.draw orelse return;
-    if (s.kind != .window) return;
-    s.win.dropBack();
+    switch (s.kind) {
+        .window => s.win.dropBack(),
+        .xwindow => s.xwin.dropBack(),
+        else => return,
+    }
     _ = bindSurfaces(c);
 }
 
@@ -1512,8 +1637,16 @@ pub fn querySurface(handle: ?*anyopaque, surface: ?*anyopaque, a: i32, value: ?*
     const d = ready(handle) orelse return false;
     const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
     const v: i32 = switch (a) {
-        WIDTH => @intCast(if (s.kind == .window) s.win.wanted()[0] else s.width),
-        HEIGHT => @intCast(if (s.kind == .window) s.win.wanted()[1] else s.height),
+        WIDTH => @intCast(switch (s.kind) {
+            .window => s.win.wanted()[0],
+            .xwindow => s.xwin.wanted()[0],
+            else => s.width,
+        }),
+        HEIGHT => @intCast(switch (s.kind) {
+            .window => s.win.wanted()[1],
+            .xwindow => s.xwin.wanted()[1],
+            else => s.height,
+        }),
         CONFIG_ID => s.config.id,
         RENDER_BUFFER => BACK_BUFFER,
         SWAP_BEHAVIOR => BUFFER_DESTROYED,
@@ -1527,7 +1660,11 @@ pub fn querySurface(handle: ?*anyopaque, surface: ?*anyopaque, a: i32, value: ?*
             const t = thread.get() orelse return fail(bool, BAD_SURFACE, false);
             if (t.draw != @as(?*anyopaque, s)) return fail(bool, BAD_SURFACE, false);
             s.age_queried = true;
-            break :blk if (s.kind == .window) s.win.age() else 0;
+            break :blk switch (s.kind) {
+                .window => s.win.age(),
+                .xwindow => s.xwin.age(),
+                else => 0,
+            };
         },
         else => {
             if (driver.?.surface_pointer) |query| {
@@ -1696,7 +1833,7 @@ pub fn setDamageRegion(handle: ?*anyopaque, surface: ?*anyopaque, rects: ?[*]con
     const d = ready(handle) orelse return false;
     const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
     const t = thread.get() orelse return fail(bool, BAD_MATCH, false);
-    if (s.kind != .window or t.draw != @as(?*anyopaque, s)) return fail(bool, BAD_MATCH, false);
+    if ((s.kind != .window and s.kind != .xwindow) or t.draw != @as(?*anyopaque, s)) return fail(bool, BAD_MATCH, false);
     if (!s.age_queried or s.damage_set) return fail(bool, BAD_ACCESS, false);
     if (n < 0 or (n != 0 and rects == null)) return fail(bool, BAD_PARAMETER, false);
     // Wayland retains the back buffer's contents for the age it reports.
@@ -1736,11 +1873,15 @@ pub fn swapBuffers(handle: ?*anyopaque, surface: ?*anyopaque, damage: []const [4
         swapped(c, began);
         return ok(bool, true);
     }
-    if (!s.win.swap(damage)) return fail(bool, BAD_NATIVE_WINDOW, false);
+    const shown = if (s.kind == .xwindow) s.xwin.swap(damage) else s.win.swap(damage);
+    if (!shown) return fail(bool, BAD_NATIVE_WINDOW, false);
     s.age_queried = false;
     s.damage_set = false;
-    // the context draws on the next back buffer
-    if (!bindSurfaces(c)) return fail(bool, BAD_ALLOC, false);
+    // the context draws on the next back buffer: an X window's is taken at
+    // the next drawing (revalidate), at the window's size then
+    if (s.kind == .xwindow) {
+        c.gl.setSurface(null, null, null);
+    } else if (!bindSurfaces(c)) return fail(bool, BAD_ALLOC, false);
     swapped(c, began);
     return ok(bool, true);
 }
@@ -1759,6 +1900,7 @@ pub fn swapInterval(handle: ?*anyopaque, interval: i32) bool {
     const sp = t.draw orelse return fail(bool, BAD_SURFACE, false);
     const s: *Surface = @ptrCast(@alignCast(sp));
     if (s.kind == .window) s.win.interval = @intCast(std.math.clamp(interval, 0, 1));
+    if (s.kind == .xwindow) s.xwin.interval = @intCast(std.math.clamp(interval, 0, 1));
     return ok(bool, true);
 }
 

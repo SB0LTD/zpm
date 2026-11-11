@@ -11,6 +11,8 @@
 //!   gpu.Device;
 //! - egl: EGL 1.5: displays, configs, contexts, surfaces, swaps, syncs;
 //! - wayland: EGL's Wayland platform (dma-buf frames to the compositor);
+//! - x11: EGL's X11 platform (the protocol spoken by EGL itself: DRI3 and
+//!   Present with dma-bufs, else PutImage);
 //! - thread: what EGL and GL keep per thread;
 //! - dl: the host program's functions found by name;
 //! - raster: the draw pipeline (vertices, setup, tiles) as KIR kernels;
@@ -34,6 +36,7 @@ pub const glenum = @import("glenum.sig");
 pub const node = @import("node.sig");
 pub const egl = @import("egl.sig");
 pub const wayland = @import("wayland.sig");
+pub const x11 = @import("x11.sig");
 pub const thread = @import("thread.sig");
 pub const dl = @import("dl.sig");
 pub const host = @import("host.sig");
@@ -56,6 +59,7 @@ test {
     _ = texture;
     _ = texfmt;
     _ = report;
+    _ = x11;
     _ = glsl;
     _ = glsl.lex;
     _ = glsl.pp;
