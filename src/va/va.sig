@@ -92,4 +92,6 @@ test {
     _ = driver;
     _ = @import("driver_test.sig");
     _ = @import("hevc_stream_test.sig");
+    _ = @import("enc_test.sig");
+    _ = @import("enc_import.sig");
 }

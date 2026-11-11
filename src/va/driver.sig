@@ -79,6 +79,7 @@ const ve = @import("vaapi_enc.sig");
 const encode = @import("encode.sig");
 const nvenc = @import("nvenc.sig");
 const convert = @import("convert.sig");
+const enc_import = @import("enc_import.sig");
 
 const Buf = node.Buf;
 
@@ -361,6 +362,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         coded: [MAX_CODED]Coded = [_]Coded{.{}} ** MAX_CODED,
         /// the encoder answered the init's probe (or no probe was made)
         has_encoder: bool = true,
+        /// surfaces made over an app's dma-bufs (enc_import.sig), by index
+        imports: [MAX_SURFACES]enc_import.Imported = [_]enc_import.Imported{.{}} ** MAX_SURFACES,
         /// decodes submitted (each one's number), and those the decoder
         /// said went wrong
         serial: u32 = 0,
@@ -651,18 +654,25 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const sample_bytes = sampleBytesOf(format) orelse return va.ERROR_UNSUPPORTED_RT_FORMAT;
             if (width == 0 or height == 0) return va.ERROR_INVALID_PARAMETER;
             if (width > MAX_SIZE or height > MAX_SIZE) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
+            var mem_type: u32 = 0;
+            var external: ?*anyopaque = null;
             for (attribs) |a| {
                 switch (a.type) {
                     // (the pixel format is the render-target format's)
                     va.SURFACE_ATTRIB_PIXEL_FORMAT => if (@as(u32, @bitCast(a.value.value.i)) != fourccOf(sample_bytes)) return va.ERROR_UNSUPPORTED_RT_FORMAT,
                     va.SURFACE_ATTRIB_MEMORY_TYPE => {
                         const t: u32 = @bitCast(a.value.value.i);
-                        if (t != 0 and t != va.MEM_TYPE_VA and t != va.MEM_TYPE_DRM_PRIME_2) return va.ERROR_UNSUPPORTED_MEMORY_TYPE;
+                        if (t != 0 and t != va.MEM_TYPE_VA and t != va.MEM_TYPE_DRM_PRIME and t != va.MEM_TYPE_DRM_PRIME_2) return va.ERROR_UNSUPPORTED_MEMORY_TYPE;
+                        mem_type = t;
                     },
-                    // (importing an app's buffers: not done)
-                    va.SURFACE_ATTRIB_EXTERNAL_BUFFER_DESCRIPTOR => if (a.value.value.p != null) return va.ERROR_UNSUPPORTED_MEMORY_TYPE,
+                    // (an app's dma-bufs: importSurfaces)
+                    va.SURFACE_ATTRIB_EXTERNAL_BUFFER_DESCRIPTOR => external = a.value.value.p,
                     else => {},
                 }
+            }
+            if (external) |p| {
+                if (sample_bytes != 1) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+                return d.importSurfaces(mem_type, p, width, height, out);
             }
             for (out, 0..) |*id, k| {
                 const i = d.makeSurface(width, height, sample_bytes) orelse {
@@ -800,6 +810,91 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             d.node.free(&s.tiled);
             d.node.free(&s.linear);
             s.* = .{};
+            d.node.free(&d.imports[i].second);
+            d.imports[i] = .{};
+        }
+
+        // ── Surfaces over an app's dma-bufs (enc_import.sig) ────────────
+
+        /// vaCreateSurfaces with VASurfaceAttribExternalBuffers (DRM PRIME
+        /// fds: one surface per buffer) or a DRM_PRIME_2 descriptor (one
+        /// surface): each imported, block linear read where it is, linear
+        /// converted into the surface's own block-linear planes before
+        /// each encode.
+        fn importSurfaces(d: *Self, mem_type: u32, p: *anyopaque, width: u32, height: u32, out: []u32) va.Status {
+            for (out, 0..) |*id, k| {
+                const plan = (if (mem_type == va.MEM_TYPE_DRM_PRIME_2)
+                    (if (k == 0) enc_import.fromPrime2(@ptrCast(@alignCast(p)), d.opts.gob) else error.BadDescriptor)
+                else
+                    enc_import.fromExternal(@ptrCast(@alignCast(p)), k)) catch |e| {
+                    d.debug("a surface over an app's dma-buf refused: {s}", .{@errorName(e)});
+                    for (out[0..k]) |made| d.dropSurface(@intCast(made - SURFACE_BASE));
+                    return if (e == error.Unsupported) va.ERROR_UNSUPPORTED_MEMORY_TYPE else va.ERROR_INVALID_PARAMETER;
+                };
+                const i = d.importSurface(plan, width, height) orelse {
+                    for (out[0..k]) |made| d.dropSurface(@intCast(made - SURFACE_BASE));
+                    return va.ERROR_ALLOCATION_FAILED;
+                };
+                id.* = SURFACE_BASE + i;
+            }
+            d.debug("{d} surfaces of {d}x{d} over the app's dma-bufs", .{ out.len, width, height });
+            return va.SUCCESS;
+        }
+
+        fn importSurface(d: *Self, plan: enc_import.Plan, width: u32, height: u32) ?u16 {
+            const i = for (d.surfaces, 0..) |s, i| {
+                if (!s.used) break i;
+            } else return null;
+            const w = @min(width, plan.width);
+            const h = @min(height, plan.height);
+            var im = enc_import.Imported{ .used = true, .layout = plan.layout, .pitch = plan.pitch, .gobs_log2 = plan.gobs_log2 };
+            var buf = enc_import.importFd(&d.node, plan.fd[0], plan.offset[0] + enc_import.planeBytes(plan, 0)) orelse return null;
+            const same = plan.fd[1] == plan.fd[0];
+            var chroma_buf = buf;
+            if (!same) {
+                chroma_buf = enc_import.importFd(&d.node, plan.fd[1], plan.offset[1] + enc_import.planeBytes(plan, 1)) orelse {
+                    d.node.free(&buf);
+                    return null;
+                };
+                // (the same kernel buffer under another fd: one buffer)
+                if (chroma_buf.handle == buf.handle) {
+                    chroma_buf = buf;
+                } else im.second = chroma_buf;
+            } else if (plan.offset[1] + enc_import.planeBytes(plan, 1) > buf.len) {
+                d.node.free(&buf);
+                return null;
+            }
+            im.luma = buf.va + plan.offset[0];
+            im.chroma = chroma_buf.va + plan.offset[1];
+            im.rows = @intCast(enc_import.planeBytes(plan, 0) / plan.pitch[0]);
+            var s = Surface{ .used = true, .width = w, .height = h, .layout = tiling.Nv12.of(w, std.mem.alignForward(u32, h, SURFACE_ROW_ALIGN)), .linear_layout = tiling.Linear.of(w, h) };
+            switch (plan.layout) {
+                .block_linear => {
+                    // (the picture is the app's: the driver's CPU paths see it
+                    // as a GOB_2 surface with the app's pitch and planes)
+                    s.tiled = buf;
+                    s.layout.luma.pitch = plan.pitch[0];
+                    s.layout.chroma.pitch = plan.pitch[1];
+                    s.layout.chroma_offset = plan.offset[1];
+                    s.linear_stale = true;
+                },
+                .linear => {
+                    // the app's linear picture, and the surface's own block-
+                    // linear planes the converter fills for the engine
+                    s.linear = buf;
+                    s.linear_layout = .{ .pitch = plan.pitch[0], .uv_offset = plan.offset[1], .bytes = @intCast(@min(buf.len, std.math.maxInt(u32))) };
+                    s.tiled = d.node.alloc(@intCast(s.layout.bytes), node.G_VRAM) orelse {
+                        d.node.free(&buf);
+                        d.node.free(&im.second);
+                        return null;
+                    };
+                    s.linear_stale = false;
+                    s.tiled_stale = true;
+                },
+            }
+            d.surfaces[i] = s;
+            d.imports[i] = im;
+            return @intCast(i);
         }
 
         pub fn destroySurfaces(d: *Self, ids: []const u32) va.Status {
@@ -1481,12 +1576,15 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             if (s.layout.sample_bytes != 1) return va.ERROR_UNSUPPORTED_RT_FORMAT;
             st = d.complete(si, deadline);
             if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+            // (an app's linear dma-buf changes behind the driver: converted
+            // every time)
+            if (d.imports[si].used and d.imports[si].layout == .linear) s.tiled_stale = true;
             st = d.syncTiled(si);
             if (st != va.SUCCESS) return st;
             const f = c.frame;
             const frame = c.work.bytes()[f * ENC_FRAME_BYTES ..][0..ENC_FRAME_BYTES];
             const base = c.work.va + f * ENC_FRAME_BYTES;
-            const input = d.encodeInput(s);
+            const input = d.encodeInput(si);
             var out: encode.EndOut = .{};
             st = encode.end(&c.enc, .{
                 .push = words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX),
@@ -1526,7 +1624,20 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
 
         /// The encode's input as the engine reads it: the surface's block-
         /// linear planes, as they lie (no pass of the driver's).
-        fn encodeInput(_: *Self, s: *Surface) encode.Input {
+        fn encodeInput(d: *Self, si: u16) encode.Input {
+            const s = &d.surfaces[si];
+            const im = d.imports[si];
+            // (an app's block-linear dma-buf: its own planes, block height)
+            if (im.used and im.layout == .block_linear) return .{
+                .luma = im.luma,
+                .chroma = im.chroma,
+                .pitch_luma = im.pitch[0],
+                .pitch_chroma = im.pitch[1],
+                .block_height = im.gobs_log2,
+                .rows = im.rows,
+                .width = s.width,
+                .height = s.height,
+            };
             return .{
                 .luma = s.tiled.va,
                 .chroma = s.tiled.va + s.layout.chroma_offset,
