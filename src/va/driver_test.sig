@@ -175,7 +175,7 @@ test "driver: profiles, entrypoints, attributes, and Firefox's probe" {
     var profiles: [8]va.Profile = undefined;
     var n: i32 = 0;
     try testing.expectEqual(va.SUCCESS, d.queryConfigProfiles(&profiles, &n));
-    try testing.expectEqualSlices(va.Profile, &.{ 13, 6, 7, 17, 32 }, profiles[0..@intCast(n)]);
+    try testing.expectEqualSlices(va.Profile, &.{ 13, 6, 7, 17, 19, 32 }, profiles[0..@intCast(n)]);
     // Firefox's vaapitest: each profile's entrypoints, then a config of
     // (profile, VLD) with no attributes
     for (profiles[0..@intCast(n)]) |p| {
