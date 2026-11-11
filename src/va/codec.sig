@@ -172,13 +172,15 @@ pub const FakeSurfaces = struct {
     w: u32,
     h: u32,
     n: u32,
+    /// 2: P010 surfaces (10-bit)
+    sample_bytes: u8 = 1,
 
     fn find(ctx: *anyopaque, id: u32) ?SurfaceRef {
         const f: *FakeSurfaces = @ptrCast(@alignCast(ctx));
         if (id == 0 or id > f.n) return null;
         const base = 0x40_0000_0000 + @as(u64, id) * 0x100_0000;
-        const pitch = std.mem.alignForward(u32, f.w, 64);
-        return .{ .luma = base, .chroma = base + 0x80_0000, .width = f.w, .height = f.h, .pitch_luma = pitch, .pitch_chroma = pitch };
+        const pitch = std.mem.alignForward(u32, f.w * f.sample_bytes, 64);
+        return .{ .luma = base, .chroma = base + 0x80_0000, .width = f.w, .height = f.h, .pitch_luma = pitch, .pitch_chroma = pitch, .sample_bytes = f.sample_bytes };
     }
 
     pub fn lookup(f: *FakeSurfaces) Lookup {

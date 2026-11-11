@@ -1,4 +1,4 @@
-//! @zpm/va vp9 — VP9 profile 0 (8-bit 4:2:0) on the RTX's video decoder
+//! @zpm/va vp9 — VP9 profiles 0 and 2 (8- and 10-bit 4:2:0) on the RTX's video decoder
 //! (NVCFB0, GB206), as a codec module (codec.sig): VA-API's VP9 buffers in,
 //! nvdec_vp9_pic_s, the decoder's probability table and tile sizes, and one
 //! frame's pushbuffer out; VP9's backward adaptation from the counts the
@@ -1208,8 +1208,9 @@ pub fn take(st: *State, b: codec.Buffer, slot: codec.Slot) va.Status {
         va.PICTURE_PARAMETER_BUFFER => {
             if (b.size < @sizeOf(vav.PictureParameterBufferVP9) or b.count < 1 or b.data.len < @sizeOf(vav.PictureParameterBufferVP9)) return va.ERROR_INVALID_BUFFER;
             const p = b.element(vav.PictureParameterBufferVP9, 0);
-            if (p.profile != 0) return va.ERROR_UNSUPPORTED_PROFILE;
-            if (p.bit_depth != 8 or p.pic_fields.subsampling_x != 1 or p.pic_fields.subsampling_y != 1) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+            // profile 0 (8-bit 4:2:0) and 2 (10-bit 4:2:0: a P010 target)
+            if (p.profile != 0 and p.profile != 2) return va.ERROR_UNSUPPORTED_PROFILE;
+            if (p.bit_depth != (if (p.profile == 2) @as(u8, 10) else 8) or p.pic_fields.subsampling_x != 1 or p.pic_fields.subsampling_y != 1) return va.ERROR_UNSUPPORTED_RT_FORMAT;
             if (p.frame_width == 0 or p.frame_height == 0) return va.ERROR_INVALID_PARAMETER;
             st.pic = p;
             st.have_pic = true;
@@ -1239,7 +1240,7 @@ fn frame(st: *State, data: []const u8, slot: codec.Slot) va.Status {
     var p: Parsed = undefined;
     parseUncompressed(st, data, st.pic.frame_width, &p) catch return va.ERROR_INVALID_PARAMETER;
     const h = &p.hdr;
-    if (h.profile != 0) return va.ERROR_UNSUPPORTED_PROFILE;
+    if (h.profile != st.pic.profile) return va.ERROR_UNSUPPORTED_PROFILE;
     if (h.width != 0 and (h.width != st.pic.frame_width or h.height != st.pic.frame_height)) return va.ERROR_INVALID_PARAMETER;
     // (VA's header sizes must be the bitstream's: else this parse is wrong)
     if (h.uncompressed_bytes != st.pic.frame_header_length_in_bytes or h.compressed_bytes != st.pic.first_partition_size) return va.ERROR_INVALID_PARAMETER;
@@ -1279,6 +1280,13 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     if (width > st.width or height > st.height) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
     const l = layout(st.width, st.height);
     if (scratch.cpu.len < l.total or slot.pic.len < MAX_PIC_BYTES or slot.aux.len < MAX_AUX_BYTES or slot.push.len < PUSH_DWORDS) return va.ERROR_OPERATION_FAILED;
+    // profile 2: 10-bit samples into a P010 target, every stride the
+    // decoder is given counting 2-byte samples (half the bytes: "the
+    // stride is divided by 2 when the depth is > 8", NVIDIA's Tegra
+    // driver), v1.bit_depth 10
+    const depth: u32 = st.pic.bit_depth;
+    if (!pic.target.holds(depth)) return va.ERROR_INVALID_SURFACE;
+    const unit: u32 = if (depth > 8) 2 else 1;
 
     // the references: last, golden, altref (none for an intra frame: the
     // target's planes, never address 0)
@@ -1289,7 +1297,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
         var dims = RefDims{
             .width = @intCast(width),
             .height = @intCast(height),
-            .stride = .{ @truncate(pic.target.pitch_luma), @truncate(pic.target.pitch_chroma) },
+            .stride = .{ @truncate(pic.target.pitch_luma / unit), @truncate(pic.target.pitch_chroma / unit) },
         };
         if (!h.intra()) {
             const k = h.ref_idx[i];
@@ -1301,7 +1309,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
                 dims = .{
                     .width = if (known) st.slots[k].width else @truncate(r.width),
                     .height = if (known) st.slots[k].height else @truncate(r.height),
-                    .stride = .{ @truncate(r.pitch_luma), @truncate(r.pitch_chroma) },
+                    .stride = .{ @truncate(r.pitch_luma / unit), @truncate(r.pitch_chroma / unit) },
                 };
             }
         }
@@ -1315,7 +1323,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     s.Vp9BsdCtrlOffset = @intCast(l.bsd >> 8);
     s.width = @intCast(width);
     s.height = @intCast(height);
-    s.framestride = .{ @truncate(pic.target.pitch_luma), @truncate(pic.target.pitch_chroma) };
+    s.framestride = .{ @truncate(pic.target.pitch_luma / unit), @truncate(pic.target.pitch_chroma / unit) };
     s.flags = .{
         .keyFrame = @intFromBool(h.key),
         .prevIsKeyFrame = @intFromBool(st.last.valid and st.last.key),
@@ -1352,7 +1360,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     s.mbRefLfDelta = st.lf.ref;
     s.mbModeLfDelta = st.lf.mode;
     s.v1.Vp9FltAboveOffset = @intCast(l.above >> 8);
-    s.v1.bits.bit_depth = 8;
+    s.v1.bits.bit_depth = @intCast(depth);
     @memcpy(slot.pic[0..@sizeOf(Vp9Pic)], std.mem.asBytes(&s));
 
     // the side buffers
@@ -1770,6 +1778,52 @@ test "vp9: a libvpx clip through take, end and after, against libvpx" {
             if (st.hdr.refresh_flags & (@as(u8, 1) << @intCast(k)) != 0) r.* = target;
         }
     }
+}
+
+test "vp9: profile 2 (10-bit): taken, its setup's strides in 2-byte samples and bit depth 10, a P010 target only" {
+    const st = &TestCtx.st;
+    st.* = State.init(512, 64);
+    var surfaces = codec.FakeSurfaces{ .w = 512, .h = 64, .n = 8 };
+    const scratch = codec.Scratch{ .cpu = TestCtx.scratch[0..scratchBytes(512, 64)], .va = 0x20_0000_0000 };
+    @memset(scratch.cpu, 0);
+    const slot = TestCtx.fs.slot();
+    begin(st);
+    var pic = vaPicture(CLIP[0], [_]u32{va.INVALID_ID} ** 8);
+    // profile 2: 10 bits only (12 and 8 refused)
+    pic.profile = 2;
+    pic.bit_depth = 12;
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, take(st, buffer(va.PICTURE_PARAMETER_BUFFER, std.mem.asBytes(&pic)), slot));
+    pic.bit_depth = 8;
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, take(st, buffer(va.PICTURE_PARAMETER_BUFFER, std.mem.asBytes(&pic)), slot));
+    pic.bit_depth = 10;
+    try testing.expectEqual(va.SUCCESS, take(st, buffer(va.PICTURE_PARAMETER_BUFFER, std.mem.asBytes(&pic)), slot));
+    // (the clip is profile 0: its header says so, and is refused for a
+    // profile-2 picture)
+    var sp = std.mem.zeroes(vav.SliceParameterBufferVP9);
+    sp.slice_data_size = @intCast(CLIP[0].bytes.len);
+    try testing.expectEqual(va.SUCCESS, take(st, buffer(va.SLICE_PARAMETER_BUFFER, std.mem.asBytes(&sp)), slot));
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_PROFILE, take(st, buffer(va.SLICE_DATA_BUFFER, CLIP[0].bytes), slot));
+    // the setup for a 10-bit frame: the clip's key frame parsed as profile
+    // 0, then its picture's depth made 10
+    begin(st);
+    pic.profile = 0;
+    pic.bit_depth = 8;
+    try testing.expectEqual(va.SUCCESS, take(st, buffer(va.PICTURE_PARAMETER_BUFFER, std.mem.asBytes(&pic)), slot));
+    try testing.expectEqual(va.SUCCESS, take(st, buffer(va.SLICE_PARAMETER_BUFFER, std.mem.asBytes(&sp)), slot));
+    try testing.expectEqual(va.SUCCESS, take(st, buffer(va.SLICE_DATA_BUFFER, CLIP[0].bytes), slot));
+    st.pic.bit_depth = 10;
+    var out: codec.End = undefined;
+    const nv12 = surfaces.lookup().surface(1).?;
+    try testing.expectEqual(va.ERROR_INVALID_SURFACE, end(st, slot, scratch, .{ .target_id = 1, .target = nv12, .gob_height = 0, .picture_index = 0 }, surfaces.lookup(), &out));
+    var p010 = nv12;
+    p010.sample_bytes = 2;
+    p010.pitch_luma = 1024;
+    p010.pitch_chroma = 1024;
+    try testing.expectEqual(va.SUCCESS, end(st, slot, scratch, .{ .target_id = 1, .target = p010, .gob_height = 0, .picture_index = 0 }, surfaces.lookup(), &out));
+    const setup = std.mem.bytesToValue(Vp9Pic, slot.pic[0..@sizeOf(Vp9Pic)]);
+    try testing.expectEqual(@as(u4, 10), setup.v1.bits.bit_depth);
+    try testing.expectEqual([2]u16{ 512, 512 }, setup.framestride);
+    for (setup.refs) |r| try testing.expectEqual([2]u16{ 512, 512 }, r.stride);
 }
 
 test "vp9: refused and malformed input" {

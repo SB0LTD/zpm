@@ -23,7 +23,10 @@
 //!   header's order where its order count bits match, repeated to 16
 //!   entries (the decoder applies the slice's list modification itself).
 //!
-//! Left for later: Main10 (P010 surfaces), 4:4:4, the above-row filter
+//! Main10: a 10-bit stream decodes into a P010 surface (output mode 1,
+//! the frame strides in 2-byte samples, init_qp with QpBdOffsetY).
+//!
+//! Left for later: 12-bit, 4:4:4, the above-row filter
 //! offsets' real use (set apart here, see `Layout`).
 
 const std = @import("std");
@@ -641,7 +644,11 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     const pf = p.pic_fields;
     const sf = p.slice_parsing_fields;
     if (pf.chroma_format_idc != 1 or pf.separate_colour_plane_flag != 0) return va.ERROR_UNSUPPORTED_RT_FORMAT;
-    if (p.bit_depth_luma_minus8 != 0 or p.bit_depth_chroma_minus8 != 0) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+    // Main (8-bit) and Main10 (10-bit, P010 targets): luma and chroma of
+    // one depth, the target's
+    const depth = @as(u32, p.bit_depth_luma_minus8) + 8;
+    if (p.bit_depth_chroma_minus8 != p.bit_depth_luma_minus8 or (depth != 8 and depth != 10)) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+    if (!pic.target.holds(depth)) return va.ERROR_INVALID_SURFACE;
     if (p.pic_width_in_luma_samples > st.width or p.pic_height_in_luma_samples > st.height) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
     if (p.pic_width_in_luma_samples > pic.target.width or p.pic_height_in_luma_samples > pic.target.height) return va.ERROR_INVALID_SURFACE;
     if (p.num_tile_columns_minus1 >= 20 or p.num_tile_rows_minus1 >= 22) return va.ERROR_INVALID_PARAMETER;
@@ -662,8 +669,13 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     s.gptimer_timeout_value = nvdec.GPTIMER_TIMEOUT;
     s.surface = .{ .tileformat = 1, .gob_height = pic.gob_height };
     s.sw_start_code_e = 1;
-    s.disp_output_mode = 0;
-    s.framestride = .{ pic.target.pitch_luma, pic.target.pitch_chroma };
+    // (nvdec_drv.h's output modes: 0 Rec.709 8-bit, 1 Rec.709 10-bit: the
+    // 16-bit samples of P010, the 10 bits at the top; the frame strides
+    // then count those 2-byte samples, half the bytes, as NVIDIA's Tegra
+    // driver and NVK give them)
+    const ten = depth == 10;
+    s.disp_output_mode = if (ten) 1 else 0;
+    s.framestride = if (ten) .{ pic.target.pitch_luma / 2, pic.target.pitch_chroma / 2 } else .{ pic.target.pitch_luma, pic.target.pitch_chroma };
     s.colMvBuffersize = @intCast(L.colmv >> 8);
     s.HevcSaoBufferOffset = @intCast(L.sao_off >> 8);
     s.HevcBsdCtrlOffset = @intCast(L.bsd_off >> 8);
@@ -675,8 +687,8 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     const log2_min_tb = @as(u32, p.log2_min_transform_block_size_minus2) + 2;
     s.sps0 = .{
         .chroma_format_idc = 1,
-        .bit_depth_luma = 8,
-        .bit_depth_chroma = 8,
+        .bit_depth_luma = @intCast(depth),
+        .bit_depth_chroma = @intCast(depth),
         .log2_min_luma_coding_block_size = @intCast(log2_min_cb),
         .log2_max_luma_coding_block_size = @intCast(log2_min_cb + p.log2_diff_max_min_luma_coding_block_size),
         .log2_min_transform_block_size = @intCast(log2_min_tb),
@@ -707,8 +719,8 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
         .cabac_init_present_flag = sf.cabac_init_present_flag,
         .num_ref_idx_l0_default_active = @intCast((@as(u32, p.num_ref_idx_l0_default_active_minus1) + 1) & 15),
         .num_ref_idx_l1_default_active = @intCast((@as(u32, p.num_ref_idx_l1_default_active_minus1) + 1) & 15),
-        // (8-bit: no QpBdOffset)
-        .init_qp = @intCast(@as(i32, p.init_qp_minus26) + 26),
+        // (plus 6 for each bit past 8: QpBdOffsetY, as NVK sets it)
+        .init_qp = @intCast(@as(i32, p.init_qp_minus26) + 26 + 6 * @as(i32, p.bit_depth_luma_minus8)),
         .constrained_intra_pred_flag = pf.constrained_intra_pred_flag,
         .transform_skip_enabled_flag = pf.transform_skip_enabled_flag,
         .cu_qp_delta_enabled_flag = pf.cu_qp_delta_enabled_flag,
@@ -1130,7 +1142,7 @@ test "hevc: a P picture through take and end" {
     try testing.expectEqual(@as(u32, 2), st.slot_surface[5]);
 }
 
-test "hevc: Main10 and 4:2:2 are refused" {
+test "hevc: Main10 into a P010 target (output mode 1, strides in 2-byte samples, 10-bit depths, QpBdOffset); not into NV12; 12-bit and mixed depths refused" {
     var st = State.init(64, 64);
     var fs = codec.FakeSlot{};
     const slot = fs.slot();
@@ -1139,6 +1151,7 @@ test "hevc: Main10 and 4:2:2 are refused" {
     p.pic_width_in_luma_samples = 64;
     p.pic_height_in_luma_samples = 64;
     p.bit_depth_luma_minus8 = 2;
+    p.bit_depth_chroma_minus8 = 2;
     st.pic = p;
     st.have_pic = true;
     st.have_header = true;
@@ -1146,5 +1159,28 @@ test "hevc: Main10 and 4:2:2 are refused" {
     var big: [1]u8 = undefined;
     const scratch = codec.Scratch{ .cpu = @as([*]u8, @ptrCast(&big))[0..st.layout.bytes], .va = 0x20_0000_0000 };
     var e: codec.End = undefined;
-    try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, end(&st, slot, scratch, .{ .target_id = 1, .target = surf.lookup().surface(1).?, .gob_height = 0, .picture_index = 0 }, surf.lookup(), &e));
+    // an NV12 target: not this stream's
+    const nv12 = surf.lookup().surface(1).?;
+    try testing.expectEqual(va.ERROR_INVALID_SURFACE, end(&st, slot, scratch, .{ .target_id = 1, .target = nv12, .gob_height = 0, .picture_index = 0 }, surf.lookup(), &e));
+    // a P010 one: 128 bytes a row (64 samples of 2 bytes)
+    var p010 = nv12;
+    p010.sample_bytes = 2;
+    p010.pitch_luma = 128;
+    p010.pitch_chroma = 128;
+    try testing.expectEqual(va.SUCCESS, end(&st, slot, scratch, .{ .target_id = 1, .target = p010, .gob_height = 0, .picture_index = 0 }, surf.lookup(), &e));
+    const s = std.mem.bytesToValue(HevcPic, slot.pic[0..@sizeOf(HevcPic)]);
+    try testing.expectEqual(@as(u8, 1), s.disp_output_mode);
+    try testing.expectEqual([2]u32{ 64, 64 }, s.framestride);
+    try testing.expectEqual(@as(u4, 10), s.sps0.bit_depth_luma);
+    try testing.expectEqual(@as(u4, 10), s.sps0.bit_depth_chroma);
+    // (init_qp_minus26 -4: 22, and 12 for the two bits past 8)
+    try testing.expectEqual(@as(u7, 34), s.pps0.init_qp);
+    try testing.expectEqual(@as(u8, 2), s.pattern_id);
+    // 12-bit, and luma and chroma of different depths
+    st.pic.bit_depth_luma_minus8 = 4;
+    st.pic.bit_depth_chroma_minus8 = 4;
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, end(&st, slot, scratch, .{ .target_id = 1, .target = p010, .gob_height = 0, .picture_index = 0 }, surf.lookup(), &e));
+    st.pic.bit_depth_luma_minus8 = 2;
+    st.pic.bit_depth_chroma_minus8 = 0;
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, end(&st, slot, scratch, .{ .target_id = 1, .target = p010, .gob_height = 0, .picture_index = 0 }, surf.lookup(), &e));
 }

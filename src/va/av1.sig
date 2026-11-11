@@ -562,7 +562,8 @@ pub fn take(st: *State, b: codec.Buffer, slot: codec.Slot) va.Status {
             const p = b.element(PictureParameterBufferAV1, 0);
             const s = p.seq_info_fields;
             if (p.profile != 0) return va.ERROR_UNSUPPORTED_PROFILE;
-            if (p.bit_depth_idx != 0 or s.mono_chrome != 0 or s.subsampling_x != 1 or s.subsampling_y != 1) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+            // Main: 8- and 10-bit 4:2:0 (a 10-bit picture: a P010 target)
+            if (p.bit_depth_idx > 1 or s.mono_chrome != 0 or s.subsampling_x != 1 or s.subsampling_y != 1) return va.ERROR_UNSUPPORTED_RT_FORMAT;
             if (p.pic_info_fields.large_scale_tile != 0) return va.ERROR_UNIMPLEMENTED;
             if (p.tile_cols == 0 or p.tile_rows == 0 or p.tile_cols > 64 or p.tile_rows > 64) return va.ERROR_INVALID_PARAMETER;
             if (@as(u32, p.tile_cols) * p.tile_rows > MAX_TILES) return va.ERROR_MAX_NUM_EXCEEDED;
@@ -743,6 +744,9 @@ pub const Frame = struct {
     pitch_luma: u32,
     pitch_chroma: u32,
     gob_height: u3,
+    /// the pictures' bytes a sample: 2 for a 10-bit frame (P010 targets
+    /// and references; the setup's strides count samples)
+    sample_bytes: u8 = 1,
     /// LAST .. ALTREF (null: an intra frame's, or not known)
     refs: [7]?Ref = [_]?Ref{null} ** 7,
     /// the primary reference's state (null: none)
@@ -778,7 +782,7 @@ pub fn av1Setup(f: Frame) Setup {
     s.seq = .{
         .use_128x128_superblock = seq.use_128x128_superblock,
         .chroma_format = 1,
-        .bit_depth = 8,
+        .bit_depth = if (p.bit_depth_idx == 1) 10 else 8,
         .enable_filter_intra = seq.enable_filter_intra,
         .enable_intra_edge_filter = seq.enable_intra_edge_filter,
         .enable_interintra_compound = seq.enable_interintra_compound,
@@ -899,11 +903,14 @@ pub fn av1Setup(f: Frame) Setup {
         s.lr_unit_size = y | (uv << 2) | (uv << 4);
     }
 
-    // The pictures.
+    // The pictures. Their strides in units of 16 samples (16 bytes for
+    // 8-bit, as NVK traced; 32 for a 10-bit frame's 2-byte samples, as
+    // the decoder's other codecs count 10-bit strides in samples)
+    const stride_unit: u32 = 16 * @as(u32, f.sample_bytes);
     s.current_frame = .{
         .width = @intCast(sz.width),
         .height = @intCast(sz.height),
-        .stride = .{ @intCast(f.pitch_luma / 16), @intCast(f.pitch_chroma / 16) },
+        .stride = .{ @intCast(f.pitch_luma / stride_unit), @intCast(f.pitch_chroma / stride_unit) },
         .frame_buffer_idx = CUR_SLOT,
     };
     const cur_hint: i32 = p.order_hint;
@@ -919,7 +926,7 @@ pub fn av1Setup(f: Frame) Setup {
                 .info = .{
                     .width = sv.upscaled_width,
                     .height = sv.height,
-                    .stride = .{ @intCast(r.pitch_luma / 16), @intCast(r.pitch_chroma / 16) },
+                    .stride = .{ @intCast(r.pitch_luma / stride_unit), @intCast(r.pitch_chroma / stride_unit) },
                     .frame_buffer_idx = @intCast(i),
                 },
                 .x_scale_fp = @intCast(@min(x_scale, 0x7fff)),
@@ -1147,6 +1154,9 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
     const sz = frameSize(p);
     if (sz.upscaled_width > st.width or sz.height > st.height) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
     if (sz.upscaled_width > pic.target.width or sz.height > pic.target.height) return va.ERROR_INVALID_SURFACE;
+    // (a 10-bit frame into a P010 target, an 8-bit one into NV12)
+    const depth: u32 = if (p.bit_depth_idx == 1) 10 else 8;
+    if (!pic.target.holds(depth)) return va.ERROR_INVALID_SURFACE;
     const L = st.layout;
     if (scratch.cpu.len < L.bytes) return va.ERROR_ALLOCATION_FAILED;
     var widths: [64]u16 = undefined;
@@ -1162,6 +1172,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
         .pitch_luma = pic.target.pitch_luma,
         .pitch_chroma = pic.target.pitch_chroma,
         .gob_height = pic.gob_height,
+        .sample_bytes = pic.target.sample_bytes,
         .layout = &st.layout,
         .blackwell = st.blackwell,
     };
@@ -1173,6 +1184,7 @@ pub fn end(st: *State, slot: codec.Slot, scratch: codec.Scratch, pic: codec.Pict
             const sv = find(st, id) orelse continue;
             const sr = lookup.surface(id) orelse continue;
             if (sv.upscaled_width != sz.upscaled_width or sv.height != sz.height) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
+            if (sr.sample_bytes != pic.target.sample_bytes) return va.ERROR_INVALID_SURFACE;
             f.refs[i] = .{ .saved = sv.*, .pitch_luma = sr.pitch_luma, .pitch_chroma = sr.pitch_chroma };
             ref_surface[i] = sr;
         }
@@ -1592,8 +1604,11 @@ const Decoded = struct {
 
 /// One frame of `tiles` tiles (one tile group of fake tile data) into
 /// surface `target`.
+/// The fake surfaces' bytes a sample (2: P010, a 10-bit test's).
+var test_sample_bytes: u8 = 1;
+
 fn decode(st: *State, p: PictureParameterBufferAV1, target: u32) Decoded {
-    var surfaces = codec.FakeSurfaces{ .w = TW, .h = TH, .n = 8 };
+    var surfaces = codec.FakeSurfaces{ .w = TW, .h = TH, .n = 8, .sample_bytes = test_sample_bytes };
     const slot = test_slot.slot();
     begin(st);
     var pp = p;
@@ -1981,6 +1996,23 @@ test "av1: segmentation, the previous map and coded lossless" {
     try testing.expectEqual(@as(u32, 0), wordAt(decode(&st, p, 3).slot.pic, 0x5c) & (1 << 26));
 }
 
+test "av1: a 10-bit key frame into a P010 surface: bit depth 10, strides in 16-sample units of 2-byte samples; an 8-bit frame not into P010" {
+    @memset(&test_scratch, 0);
+    var st = State.init(TW, TH);
+    test_sample_bytes = 2;
+    defer test_sample_bytes = 1;
+    var p = keyFrame();
+    p.bit_depth_idx = 1;
+    const d = decode(&st, p, 1);
+    try testing.expectEqual(va.SUCCESS, d.status);
+    const s = std.mem.bytesToValue(Av1Pic, d.slot.pic[0..@sizeOf(Av1Pic)]);
+    try testing.expectEqual(@as(u4, 10), s.seq.bit_depth);
+    // (a 256-sample row: 512 bytes, 16 units of 32 bytes)
+    try testing.expectEqual([2]u16{ 16, 16 }, s.current_frame.stride);
+    // an 8-bit frame into a P010 surface: refused
+    try testing.expectEqual(va.ERROR_INVALID_SURFACE, decode(&st, keyFrame(), 2).status);
+}
+
 test "av1: what is refused" {
     @memset(&test_scratch, 0);
     var st = State.init(TW, TH);
@@ -1988,8 +2020,12 @@ test "av1: what is refused" {
     p.profile = 1;
     try testing.expectEqual(va.ERROR_UNSUPPORTED_PROFILE, decode(&st, p, 1).status);
     p = keyFrame();
-    p.bit_depth_idx = 1;
+    p.bit_depth_idx = 2; // (12-bit: Professional)
     try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, decode(&st, p, 1).status);
+    // (10-bit into an NV12 surface)
+    p = keyFrame();
+    p.bit_depth_idx = 1;
+    try testing.expectEqual(va.ERROR_INVALID_SURFACE, decode(&st, p, 1).status);
     p = keyFrame();
     p.seq_info_fields.mono_chrome = 1;
     try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, decode(&st, p, 1).status);
