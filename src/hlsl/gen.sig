@@ -195,6 +195,8 @@ pub const Gen = struct {
     binds: *[ast.MAX_SYMS]Bind,
     /// per virtual temp: 1 when it belongs to a variable
     vflags: *[MAX_VREGS]u8,
+    /// each node's type, once known (0: not yet)
+    tycache: *[ast.MAX_NODES]u32,
     cbs: [MAX_CB]CB = undefined,
     ncbs: u32 = 0,
     res: [MAX_RES]Res = undefined,
@@ -2094,6 +2096,16 @@ pub const Gen = struct {
         return g.inlineCall(f, arg_nodes[0..argc], &args);
     }
 
+    fn sameSignature(g: *Gen, a: u32, b: u32) bool {
+        const x = g.a.syms[a];
+        const y = g.a.syms[b];
+        if (x.nparams != y.nparams) return false;
+        for (0..x.nparams) |k| {
+            if (g.a.syms[x.params + k].ty != g.a.syms[y.params + k].ty) return false;
+        }
+        return true;
+    }
+
     fn findDefinition(g: *Gen, proto: u32) ?u32 {
         const p = g.a.syms[proto];
         var i: u32 = 1;
@@ -2113,6 +2125,25 @@ pub const Gen = struct {
     fn pickOverload(g: *Gen, newest: u32, argn: []const u32) ?u32 {
         var best: ?u32 = null;
         var best_cost: u32 = 0xffff_ffff;
+        // one candidate for this many arguments: it (no dry run of the
+        // arguments, which nested calls would repeat at every level)
+        var only: ?u32 = null;
+        var fits: u32 = 0;
+        var cand = newest;
+        while (cand != NONE and g.a.syms[cand].kind == .function) : (cand = g.a.syms[cand].prev) {
+            const s = g.a.syms[cand];
+            if (argn.len > s.nparams) continue;
+            var ok = true;
+            for (argn.len..s.nparams) |k| ok = ok and g.a.syms[s.params + k].init != NONE;
+            if (!ok) continue;
+            // (a prototype and its definition are one function)
+            if (only) |o| {
+                if (g.sameSignature(o, cand)) continue;
+            }
+            fits += 1;
+            only = cand;
+        }
+        if (fits == 1) return only;
         var tys: [32]u32 = undefined;
         for (argn, 0..) |e, k| tys[k] = g.typeOf(e);
         var f = newest;
@@ -2177,6 +2208,8 @@ pub const Gen = struct {
 
     /// An expression's type, without generating code (for overloads).
     pub fn typeOf(g: *Gen, n: u32) u32 {
+        // (a node's type is the same wherever it is inlined: once each)
+        if (g.tycache[n] != 0) return g.tycache[n];
         const save_n = g.p.n;
         const save_v = g.p.nvregs;
         const save_s = g.nsrcs;
@@ -2196,6 +2229,7 @@ pub const Gen = struct {
         g.failed = save_failed;
         g.log.len = save_len;
         g.log.errors = save_err;
+        g.tycache[n] = t;
         return t;
     }
 

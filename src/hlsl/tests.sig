@@ -59,6 +59,19 @@ test "signature elements read back" {
     try testing.expectEqual(@as(u8, 3), e.mask);
 }
 
+test "nested overloaded calls compile in time (types once per node)" {
+    // f(f(f(...))) twenty deep, f overloaded: each level's arguments typed once
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try w.writeAll("float f(float x) { return x * 0.5 + 0.25; }\nfloat2 f(float2 x) { return x.yx; }\n");
+    try w.writeAll("float4 main(float4 p : SV_Position) : SV_Target { return ");
+    for (0..20) |_| try w.writeAll("f(");
+    try w.writeAll("p.x");
+    for (0..20) |_| try w.writeAll(")");
+    try w.writeAll(".xxxx; }\n");
+    _ = try compileOk(w.buffered(), "ps_4_0");
+}
+
 test "errors come back as fxc-shaped messages" {
     const r = compiler.compile("float4 main() : SV_Target { return undefined_thing; }", .{ .target = "ps_4_0" });
     try testing.expect(!r.ok);

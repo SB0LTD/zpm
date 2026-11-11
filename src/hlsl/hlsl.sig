@@ -82,6 +82,7 @@ pub const Compiler = struct {
     locs: [gen.MAX_LOCS]gen.Loc,
     binds: [ast.MAX_SYMS]gen.Bind,
     vflags: [gen.MAX_VREGS]u8,
+    tycache: [ast.MAX_NODES]u32,
     reads: [gen.MAX_VREGS]u8,
     intervals: [gen.MAX_VREGS]ir.Interval,
     vmap: [gen.MAX_VREGS]u32,
@@ -122,7 +123,8 @@ pub const Compiler = struct {
         // the code
         c.prog.reset();
         for (c.binds[0..c.ast.nsyms]) |*b| b.* = .{};
-        c.g = .{ .a = &c.ast, .p = &c.prog, .log = &c.log, .toks = c.parser.t, .target = target, .flags = o.flags, .srcs = &c.srcs, .locs = &c.locs, .binds = &c.binds, .vflags = &c.vflags };
+        c.g = .{ .a = &c.ast, .p = &c.prog, .log = &c.log, .toks = c.parser.t, .target = target, .flags = o.flags, .srcs = &c.srcs, .locs = &c.locs, .binds = &c.binds, .vflags = &c.vflags, .tycache = &c.tycache };
+        @memset(c.tycache[0..c.ast.nnodes], 0);
         if (!c.g.run(o.entry)) return c.failed();
         if (o.flags & flags.WARNINGS_ARE_ERRORS != 0 and c.log.len > 0) return c.failed();
         ir.deadComponents(&c.prog, &c.reads);
