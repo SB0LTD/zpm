@@ -1,7 +1,8 @@
 //! @zpm/va driver — Galaxy's VA-API driver for the RTX's video decoder
-//! (NVDEC, NVCFB0 on GB206), H.264 only: the state behind each of libva's
-//! entry points, over Galaxy's render node (node.sig). libgalaxy_va.sig
-//! puts it behind libva's C table.
+//! (NVDEC, NVCFB0 on GB206): the state behind each of libva's entry
+//! points, over Galaxy's render node (node.sig). libgalaxy_va.sig puts it
+//! behind libva's C table. H.264 is the driver's own (nvdec.sig); HEVC,
+//! VP9 and AV1 are codec modules (codec.sig says what they are given).
 //!
 //! What a decode is here:
 //!
@@ -12,9 +13,10 @@
 //!   vaExportSurfaceHandle), derived as a VAImage, read by vaGetImage.
 //! - **Contexts** (MAX_CONTEXTS) each have one work buffer: FRAMES frame
 //!   slots (a pushbuffer, the picture setup, the slice table, the status,
-//!   then the bitstream, each a frame's own so the CPU fills the next while
-//!   the decoder reads the last), then the decoder's scratch (co-located
-//!   motion for every picture slot, macroblock history, history).
+//!   the codec's side buffers, then the bitstream, each a frame's own so
+//!   the CPU fills the next while the decoder reads the last), then the
+//!   decoder's scratch (H.264: co-located motion for every picture slot,
+//!   macroblock history, history; a module's: what scratchBytes says).
 //! - **BeginPicture** takes the next frame slot (waiting for its last
 //!   decode); **RenderPicture** keeps the picture parameters and scaling
 //!   lists and writes each slice into the slot's bitstream with a start
@@ -40,6 +42,8 @@ const va = @import("vaapi.sig");
 const nvdec = @import("nvdec.sig");
 const tiling = @import("tiling.sig");
 const node = @import("node.sig");
+const codec = @import("codec.sig");
+const hevc = @import("hevc.sig");
 
 const Buf = node.Buf;
 
@@ -58,21 +62,26 @@ const POOL_BYTES = SMALL_BUFFERS * SMALL_BYTES + LARGE_BUFFERS * LARGE_BYTES;
 pub const FRAMES = 4;
 pub const FRAME_BYTES: usize = 8 << 20;
 pub const PUSH_OFF: usize = 0;
-pub const PIC_OFF: usize = 0x400;
-pub const SLICES_OFF: usize = 0x800;
-pub const STATUS_OFF: usize = 0xc00;
-pub const STREAM_OFF: usize = 0x1000;
+pub const PUSH_DWORDS_MAX: usize = 0x800 / 4;
+pub const PIC_OFF: usize = 0x800;
+pub const SLICES_OFF: usize = PIC_OFF + codec.PIC_BYTES;
+pub const STATUS_OFF: usize = SLICES_OFF + 0x400;
+pub const AUX_OFF: usize = 0x2000;
+pub const STREAM_OFF: usize = AUX_OFF + codec.AUX_BYTES;
 /// The bitstream's room in a frame slot (the end of stream after it).
 pub const STREAM_ROOM: usize = FRAME_BYTES - STREAM_OFF - nvdec.EOS.len - 256;
 
-/// NVDEC's H.264 limit.
+/// NVDEC's H.264 limit (and this driver's for every codec).
 pub const MAX_SIZE = 4096;
+/// Surfaces' rows are padded to this: the decoder writes whole coding
+/// blocks (HEVC's 64-row CTUs, VP9's 64-row and AV1's 128-row superblocks).
+pub const SURFACE_ROW_ALIGN = 128;
 pub const MIN_SIZE = 16;
 /// How long a sync waits for a decode (NVK's watchdog ends a wedged one
 /// far sooner).
 pub const SYNC_NS: i64 = 2_000_000_000;
 
-pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264), zpm";
+pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264, HEVC), zpm";
 
 // Each kind of object's ids: base + index.
 pub const CONFIG_BASE: u32 = 0x100;
@@ -82,10 +91,19 @@ pub const BUFFER_BASE: u32 = 0x1000;
 pub const IMAGE_BASE: u32 = 0x2000;
 const NONE: u16 = 0xffff;
 
-pub const PROFILES = [_]va.Profile{ va.PROFILE_H264_CONSTRAINED_BASELINE, va.PROFILE_H264_MAIN, va.PROFILE_H264_HIGH };
+pub const PROFILES = [_]va.Profile{ va.PROFILE_H264_CONSTRAINED_BASELINE, va.PROFILE_H264_MAIN, va.PROFILE_H264_HIGH, hevc.PROFILE };
 
 pub fn supported(profile: va.Profile) bool {
     return std.mem.indexOfScalar(va.Profile, &PROFILES, profile) != null;
+}
+
+pub const Codec = enum { h264, hevc };
+
+pub fn codecOf(profile: va.Profile) Codec {
+    return switch (profile) {
+        hevc.PROFILE => .hevc,
+        else => .h264,
+    };
 }
 
 pub const Options = struct {
@@ -133,6 +151,14 @@ const Surface = struct {
 const Context = struct {
     used: bool = false,
     config: u16 = 0,
+    codec: Codec = .h264,
+    /// a module's buffers in the work buffer (after the frame slots)
+    scratch_off: usize = 0,
+    scratch_bytes: usize = 0,
+    /// each module's state (only the context's codec's is used)
+    hevc: hevc.State = undefined,
+    /// the target's VA id (a module's Picture)
+    target_id: u32 = 0,
     width_mbs: u32 = 0,
     height_mbs: u32 = 0,
     work: Buf = .{},
@@ -430,7 +456,7 @@ pub fn Driver(comptime Sys: type) type {
             const i = for (d.surfaces, 0..) |s, i| {
                 if (!s.used) break i;
             } else return null;
-            const layout = tiling.Nv12.of(width, height);
+            const layout = tiling.Nv12.of(width, std.mem.alignForward(u32, height, SURFACE_ROW_ALIGN));
             const lin = tiling.Linear.of(width, height);
             var tiled = d.node.alloc(@intCast(layout.bytes), 0) orelse return null;
             const linear = d.node.alloc(lin.bytes, 0) orelse {
@@ -479,11 +505,13 @@ pub fn Driver(comptime Sys: type) type {
         // ── Contexts ────────────────────────────────────────────────────
 
         pub fn createContext(d: *Self, config: u32, width: u32, height: u32, out: *u32) va.Status {
-            if (d.configOf(config) == null) return va.ERROR_INVALID_CONFIG;
+            const cfg = d.configOf(config) orelse return va.ERROR_INVALID_CONFIG;
             if (width == 0 or height == 0 or width > MAX_SIZE or height > MAX_SIZE) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
             const i = for (d.contexts, 0..) |c, i| {
                 if (!c.used) break i;
             } else return va.ERROR_ALLOCATION_FAILED;
+            const kind = codecOf(cfg.profile);
+            if (kind != .h264) return d.createModuleContext(@intCast(i), config, kind, width, height, out);
             const wmbs = (width + 15) / 16;
             const hmbs = (height + 15) / 16;
             // (the frame's height in macroblocks: map units are at most it)
@@ -511,6 +539,40 @@ pub fn Driver(comptime Sys: type) type {
             };
             out.* = CONTEXT_BASE + @as(u32, @intCast(i));
             d.debug("context {d}x{d}: work buffer {d} MiB", .{ width, height, work.len >> 20 });
+            return va.SUCCESS;
+        }
+
+        /// A context for a codec module: the frame slots, then the module's
+        /// buffers (zeroed).
+        fn createModuleContext(d: *Self, i: u8, config: u32, kind: Codec, width: u32, height: u32, out: *u32) va.Status {
+            const scratch_bytes = switch (kind) {
+                .hevc => hevc.scratchBytes(width, height),
+                .h264 => unreachable,
+            };
+            const scratch_off = FRAMES * FRAME_BYTES;
+            const total = scratch_off + scratch_bytes;
+            var work = d.node.alloc(total, 0) orelse return va.ERROR_ALLOCATION_FAILED;
+            if (!nvdec.addressable(work.va) or !nvdec.addressable(work.va + work.len - 256)) {
+                d.node.free(&work);
+                return va.ERROR_ALLOCATION_FAILED;
+            }
+            @memset(work.bytes()[scratch_off..total], 0);
+            d.contexts[i] = .{
+                .used = true,
+                .config = @intCast(config - CONFIG_BASE),
+                .codec = kind,
+                .width_mbs = (width + 15) / 16,
+                .height_mbs = (height + 15) / 16,
+                .work = work,
+                .scratch_off = scratch_off,
+                .scratch_bytes = scratch_bytes,
+            };
+            switch (kind) {
+                .hevc => d.contexts[i].hevc = hevc.State.init(width, height),
+                .h264 => unreachable,
+            }
+            out.* = CONTEXT_BASE + @as(u32, i);
+            d.debug("{s} context {d}x{d}: work buffer {d} MiB", .{ @tagName(kind), width, height, work.len >> 20 });
             return va.SUCCESS;
         }
 
@@ -655,7 +717,12 @@ pub fn Driver(comptime Sys: type) type {
                 }
             }
             c.target = si;
+            c.target_id = surface;
             c.frame = f;
+            switch (c.codec) {
+                .hevc => hevc.begin(&c.hevc),
+                .h264 => {},
+            }
             c.have_pic = false;
             c.have_iq = false;
             c.slices = 0;
@@ -684,6 +751,14 @@ pub fn Driver(comptime Sys: type) type {
         fn take(d: *Self, c: *Context, bi: u16) va.Status {
             const b = d.buffers[bi];
             const data = d.bufferBytes(bi);
+            if (c.codec != .h264) {
+                const buf = codec.Buffer{ .kind = b.type, .size = b.size, .count = b.count, .data = data };
+                const slot = frameSlot(c, c.frame);
+                return switch (c.codec) {
+                    .hevc => hevc.take(&c.hevc, buf, slot),
+                    .h264 => unreachable,
+                };
+            }
             switch (b.type) {
                 va.PICTURE_PARAMETER_BUFFER => {
                     if (data.len < @sizeOf(va.PictureParameterBufferH264)) return va.ERROR_INVALID_BUFFER;
@@ -740,6 +815,7 @@ pub fn Driver(comptime Sys: type) type {
             defer c.target = NONE;
             if (c.target == NONE) return va.ERROR_OPERATION_FAILED;
             if (c.bad != va.SUCCESS) return c.bad;
+            if (c.codec != .h264) return d.endModule(ci, c);
             if (!c.have_pic or c.slices == 0) return va.ERROR_INVALID_PARAMETER;
             const pic = &c.pic;
             const wmbs = @as(u32, pic.picture_width_in_mbs_minus1) + 1;
@@ -835,6 +911,74 @@ pub fn Driver(comptime Sys: type) type {
             c.next_frame = (f + 1) % FRAMES;
             c.decodes +%= 1;
             return va.SUCCESS;
+        }
+
+        /// A codec module's picture: its setup, side buffers and pushbuffer,
+        /// submitted; waited for and handed back when it asks.
+        fn endModule(d: *Self, ci: u8, c: *Context) va.Status {
+            const si = c.target;
+            const s = &d.surfaces[si];
+            const f = c.frame;
+            const slot = frameSlot(c, f);
+            @memset(c.frameBytes(f)[STATUS_OFF..][0..@sizeOf(nvdec.Status)], 0);
+            const scratch = codec.Scratch{ .cpu = c.work.bytes()[c.scratch_off..][0..c.scratch_bytes], .va = c.work.va + c.scratch_off };
+            const pic = codec.Picture{ .target_id = c.target_id, .target = surfaceRef(s), .gob_height = tiling.GOB_HEIGHT_FIELD, .picture_index = c.decodes };
+            if (!nvdec.addressable(pic.target.luma) or !nvdec.addressable(pic.target.chroma)) return va.ERROR_INVALID_SURFACE;
+            const lookup = codec.Lookup{ .ctx = d, .surface_fn = lookupSurface };
+            var e: codec.End = undefined;
+            const st = switch (c.codec) {
+                .hevc => hevc.end(&c.hevc, slot, scratch, pic, lookup, &e),
+                .h264 => unreachable,
+            };
+            if (st != va.SUCCESS) {
+                d.debug("{s} picture refused ({x})", .{ @tagName(c.codec), st });
+                return st;
+            }
+            std.debug.assert(e.dwords <= PUSH_DWORDS_MAX);
+            const fence = d.node.vsubmit(c.work, @intCast(f * FRAME_BYTES + PUSH_OFF), @intCast(e.dwords)) catch |err| {
+                d.say("a decode was not submitted ({s})", .{@errorName(err)});
+                return if (err == error.NoDecoder) va.ERROR_UNIMPLEMENTED else va.ERROR_OPERATION_FAILED;
+            };
+            d.serial +%= 1;
+            s.pending = true;
+            s.fence = fence;
+            s.ctx = ci;
+            s.frame = f;
+            s.serial = d.serial;
+            s.failed = false;
+            s.field_coded = false;
+            s.fields = 3;
+            c.frame_fence[f] = fence;
+            c.frame_surface[f] = si;
+            c.frame_serial[f] = d.serial;
+            c.next_frame = (f + 1) % FRAMES;
+            c.decodes +%= 1;
+            if (e.wait) {
+                const w = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
+                if (w != va.SUCCESS and w != va.ERROR_DECODING_ERROR) return w;
+                switch (c.codec) {
+                    .hevc => hevc.after(&c.hevc, scratch),
+                    .h264 => unreachable,
+                }
+            }
+            return va.SUCCESS;
+        }
+
+        fn lookupSurface(ctx: *anyopaque, id: u32) ?codec.SurfaceRef {
+            const d: *Self = @ptrCast(@alignCast(ctx));
+            const i = d.surfaceIndex(id) orelse return null;
+            return surfaceRef(&d.surfaces[i]);
+        }
+
+        fn surfaceRef(s: *const Surface) codec.SurfaceRef {
+            return .{
+                .luma = s.tiled.va,
+                .chroma = s.tiled.va + s.layout.chroma_offset,
+                .width = s.width,
+                .height = s.height,
+                .pitch_luma = s.layout.luma.pitch,
+                .pitch_chroma = s.layout.chroma.pitch,
+            };
         }
 
         /// The decode into surface `si` done by `deadline` (0: only look),
@@ -1078,6 +1222,30 @@ pub fn intAttrib(kind: u32, flags: u32, v: u32) va.SurfaceAttrib {
 
 fn sliceParam(params: []const u8, size: u32, k: usize) va.SliceParameterBufferH264 {
     return std.mem.bytesToValue(va.SliceParameterBufferH264, params[k * size ..][0..@sizeOf(va.SliceParameterBufferH264)]);
+}
+
+/// Frame slot `f` of a context's work buffer, as a codec module sees it.
+fn frameSlot(c: *Context, f: usize) codec.Slot {
+    const frame = c.frameBytes(f);
+    const base = c.work.va + f * FRAME_BYTES;
+    return .{
+        .push = words(frame.ptr, PUSH_OFF, PUSH_DWORDS_MAX),
+        .pic = frame[PIC_OFF..][0..codec.PIC_BYTES],
+        .pic_va = base + PIC_OFF,
+        .aux = frame[AUX_OFF..][0..codec.AUX_BYTES],
+        .aux_va = base + AUX_OFF,
+        .status_va = base + STATUS_OFF,
+        .stream = frame[STREAM_OFF..],
+        .stream_va = base + STREAM_OFF,
+    };
+}
+
+comptime {
+    std.debug.assert(PIC_OFF + codec.PIC_BYTES <= SLICES_OFF);
+    std.debug.assert(STATUS_OFF + 0x100 <= AUX_OFF);
+    std.debug.assert(@sizeOf(nvdec.H264Pic) <= codec.PIC_BYTES);
+    std.debug.assert(hevc.MAX_PIC_BYTES <= codec.PIC_BYTES and hevc.MAX_AUX_BYTES <= codec.AUX_BYTES);
+    std.debug.assert(nvdec.PUSH_DWORDS <= PUSH_DWORDS_MAX and hevc.PUSH_DWORDS <= PUSH_DWORDS_MAX);
 }
 
 /// `n` dwords at byte `off` of mapped GPU memory.

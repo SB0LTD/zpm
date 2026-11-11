@@ -55,6 +55,9 @@ pub const PROFILE_NONE: Profile = -1;
 pub const PROFILE_H264_MAIN: Profile = 6;
 pub const PROFILE_H264_HIGH: Profile = 7;
 pub const PROFILE_H264_CONSTRAINED_BASELINE: Profile = 13;
+pub const PROFILE_HEVC_MAIN: Profile = 17;
+pub const PROFILE_VP9_PROFILE_0: Profile = 19;
+pub const PROFILE_AV1_PROFILE_0: Profile = 32;
 
 /// VAEntrypoint.
 pub const Entrypoint = u32;
@@ -321,6 +324,173 @@ pub const SliceParameterBufferH264 = extern struct {
     chroma_offset_l1: [32][2]i16,
     va_reserved: [4]u32,
 };
+
+// ── HEVC decode (va.h, va_dec_hevc.h) ───────────────────────────────────────
+
+pub const PICTURE_HEVC_INVALID: u32 = 0x01;
+pub const PICTURE_HEVC_FIELD_PIC: u32 = 0x02;
+pub const PICTURE_HEVC_BOTTOM_FIELD: u32 = 0x04;
+pub const PICTURE_HEVC_LONG_TERM_REFERENCE: u32 = 0x08;
+/// The current picture's RPS sets a reference is in (VAAPI's own).
+pub const PICTURE_HEVC_RPS_ST_CURR_BEFORE: u32 = 0x10;
+pub const PICTURE_HEVC_RPS_ST_CURR_AFTER: u32 = 0x20;
+pub const PICTURE_HEVC_RPS_LT_CURR: u32 = 0x40;
+
+pub const PictureHEVC = extern struct {
+    picture_id: u32,
+    pic_order_cnt: i32,
+    flags: u32,
+    va_reserved: [4]u32 = .{ 0, 0, 0, 0 },
+};
+
+/// VAPictureParameterBufferHEVC's pic_fields.
+pub const HevcPicFields = packed struct(u32) {
+    chroma_format_idc: u2 = 0,
+    separate_colour_plane_flag: u1 = 0,
+    pcm_enabled_flag: u1 = 0,
+    scaling_list_enabled_flag: u1 = 0,
+    transform_skip_enabled_flag: u1 = 0,
+    amp_enabled_flag: u1 = 0,
+    strong_intra_smoothing_enabled_flag: u1 = 0,
+    sign_data_hiding_enabled_flag: u1 = 0,
+    constrained_intra_pred_flag: u1 = 0,
+    cu_qp_delta_enabled_flag: u1 = 0,
+    weighted_pred_flag: u1 = 0,
+    weighted_bipred_flag: u1 = 0,
+    transquant_bypass_enabled_flag: u1 = 0,
+    tiles_enabled_flag: u1 = 0,
+    entropy_coding_sync_enabled_flag: u1 = 0,
+    pps_loop_filter_across_slices_enabled_flag: u1 = 0,
+    loop_filter_across_tiles_enabled_flag: u1 = 0,
+    pcm_loop_filter_disabled_flag: u1 = 0,
+    NoPicReorderingFlag: u1 = 0,
+    NoBiPredFlag: u1 = 0,
+    _: u11 = 0,
+};
+
+/// VAPictureParameterBufferHEVC's slice_parsing_fields.
+pub const HevcSliceParsingFields = packed struct(u32) {
+    lists_modification_present_flag: u1 = 0,
+    long_term_ref_pics_present_flag: u1 = 0,
+    sps_temporal_mvp_enabled_flag: u1 = 0,
+    cabac_init_present_flag: u1 = 0,
+    output_flag_present_flag: u1 = 0,
+    dependent_slice_segments_enabled_flag: u1 = 0,
+    pps_slice_chroma_qp_offsets_present_flag: u1 = 0,
+    sample_adaptive_offset_enabled_flag: u1 = 0,
+    deblocking_filter_override_enabled_flag: u1 = 0,
+    pps_disable_deblocking_filter_flag: u1 = 0,
+    slice_segment_header_extension_present_flag: u1 = 0,
+    RapPicFlag: u1 = 0,
+    IdrPicFlag: u1 = 0,
+    IntraPicFlag: u1 = 0,
+    _: u18 = 0,
+};
+
+pub const PictureParameterBufferHEVC = extern struct {
+    CurrPic: PictureHEVC,
+    ReferenceFrames: [15]PictureHEVC,
+    pic_width_in_luma_samples: u16,
+    pic_height_in_luma_samples: u16,
+    pic_fields: HevcPicFields,
+    sps_max_dec_pic_buffering_minus1: u8,
+    bit_depth_luma_minus8: u8,
+    bit_depth_chroma_minus8: u8,
+    pcm_sample_bit_depth_luma_minus1: u8,
+    pcm_sample_bit_depth_chroma_minus1: u8,
+    log2_min_luma_coding_block_size_minus3: u8,
+    log2_diff_max_min_luma_coding_block_size: u8,
+    log2_min_transform_block_size_minus2: u8,
+    log2_diff_max_min_transform_block_size: u8,
+    log2_min_pcm_luma_coding_block_size_minus3: u8,
+    log2_diff_max_min_pcm_luma_coding_block_size: u8,
+    max_transform_hierarchy_depth_intra: u8,
+    max_transform_hierarchy_depth_inter: u8,
+    init_qp_minus26: i8,
+    diff_cu_qp_delta_depth: u8,
+    pps_cb_qp_offset: i8,
+    pps_cr_qp_offset: i8,
+    log2_parallel_merge_level_minus2: u8,
+    num_tile_columns_minus1: u8,
+    num_tile_rows_minus1: u8,
+    column_width_minus1: [19]u16,
+    row_height_minus1: [21]u16,
+    slice_parsing_fields: HevcSliceParsingFields,
+    log2_max_pic_order_cnt_lsb_minus4: u8,
+    num_short_term_ref_pic_sets: u8,
+    /// (libva's name: num_long_term_ref_pic_sps)
+    num_long_term_ref_pic_sps: u8,
+    num_ref_idx_l0_default_active_minus1: u8,
+    num_ref_idx_l1_default_active_minus1: u8,
+    pps_beta_offset_div2: i8,
+    pps_tc_offset_div2: i8,
+    num_extra_slice_header_bits: u8,
+    /// the bits short_term_ref_pic_set() takes in the slice segment header
+    /// when short_term_ref_pic_set_sps_flag is 0 (0 when it is 1)
+    st_rps_bits: u32,
+    va_reserved: [8]u32,
+};
+
+pub const SliceParameterBufferHEVC = extern struct {
+    slice_data_size: u32,
+    /// Byte offset of the slice's NAL unit header in the slice data buffer
+    /// (no start code before it).
+    slice_data_offset: u32,
+    slice_data_flag: u32,
+    slice_data_byte_offset: u32,
+    slice_segment_address: u32,
+    RefPicList: [2][15]u8,
+    LongSliceFlags: u32,
+    collocated_ref_idx: u8,
+    num_ref_idx_l0_active_minus1: u8,
+    num_ref_idx_l1_active_minus1: u8,
+    slice_qp_delta: i8,
+    slice_cb_qp_offset: i8,
+    slice_cr_qp_offset: i8,
+    slice_beta_offset_div2: i8,
+    slice_tc_offset_div2: i8,
+    luma_log2_weight_denom: u8,
+    delta_chroma_log2_weight_denom: i8,
+    delta_luma_weight_l0: [15]i8,
+    luma_offset_l0: [15]i8,
+    delta_chroma_weight_l0: [15][2]i8,
+    ChromaOffsetL0: [15][2]i8,
+    delta_luma_weight_l1: [15]i8,
+    luma_offset_l1: [15]i8,
+    delta_chroma_weight_l1: [15][2]i8,
+    ChromaOffsetL1: [15][2]i8,
+    five_minus_max_num_merge_cand: u8,
+    num_entry_point_offsets: u16,
+    entry_offset_to_subset_array: u16,
+    slice_data_num_emu_prevn_bytes: u16,
+    va_reserved: [2]u32,
+};
+
+pub const IQMatrixBufferHEVC = extern struct {
+    /// raster order (FFmpeg's VA-API HEVC passes its raster lists)
+    ScalingList4x4: [6][16]u8,
+    ScalingList8x8: [6][64]u8,
+    ScalingList16x16: [6][64]u8,
+    ScalingList32x32: [2][64]u8,
+    ScalingListDC16x16: [6]u8,
+    ScalingListDC32x32: [2]u8,
+    va_reserved: [4]u32,
+};
+
+comptime {
+    // (libva 2.22 on x86-64, measured with gcc on its headers)
+    std.debug.assert(@sizeOf(PictureHEVC) == 28);
+    std.debug.assert(@offsetOf(PictureParameterBufferHEVC, "pic_width_in_luma_samples") == 448);
+    std.debug.assert(@offsetOf(PictureParameterBufferHEVC, "pic_fields") == 452);
+    std.debug.assert(@offsetOf(PictureParameterBufferHEVC, "column_width_minus1") == 476);
+    std.debug.assert(@offsetOf(PictureParameterBufferHEVC, "slice_parsing_fields") == 556);
+    std.debug.assert(@offsetOf(PictureParameterBufferHEVC, "st_rps_bits") == 568);
+    std.debug.assert(@sizeOf(PictureParameterBufferHEVC) == 604);
+    std.debug.assert(@offsetOf(SliceParameterBufferHEVC, "LongSliceFlags") == 52);
+    std.debug.assert(@offsetOf(SliceParameterBufferHEVC, "five_minus_max_num_merge_cand") == 246);
+    std.debug.assert(@sizeOf(SliceParameterBufferHEVC) == 264);
+    std.debug.assert(@sizeOf(IQMatrixBufferHEVC) == 1016);
+}
 
 // ── The driver context and its table (va_backend.h) ─────────────────────────
 
