@@ -268,7 +268,7 @@ fn resources(D: *anyopaque, C: *anyopaque, blob: []const u8, srv_at: usize, smp_
             if (slot >= 16) continue;
             if (b.type == 3) {
                 const cmp = b.flags & 2 != 0;
-                const sd = SamplerDesc{ .Filter = if (cmp) 0x80 else 0x15, .AddressU = 1, .AddressV = 1, .AddressW = 1, .MipLODBias = 0, .MaxAnisotropy = 1, .ComparisonFunc = if (cmp) 4 else 1, .BorderColor = .{ 0, 0, 0, 0 }, .MinLOD = 0, .MaxLOD = 1000 };
+                const sd = SamplerDesc{ .Filter = if (cmp) 0x80 else 0, .AddressU = 1, .AddressV = 1, .AddressW = 1, .MipLODBias = 0, .MaxAnisotropy = 1, .ComparisonFunc = if (cmp) 4 else 1, .BorderColor = .{ 0, 0, 0, 0 }, .MinLOD = 0, .MaxLOD = 1000 };
                 if (call(HRESULT, D, CreateSamplerState, .{ &sd, &smps[slot] }) < 0) return error.Resource;
                 if (nobj.* < objs.len) {
                     objs[nobj.*] = smps[slot];
@@ -308,7 +308,7 @@ fn texture(D: *anyopaque, b: ct.RBind, depth: bool, objs: *[128]?*anyopaque, nob
             const y: u32 = @intCast(i / 8);
             const t = S.texels[l][i * bpp ..];
             switch (fmt) {
-                FMT_R32F => std.mem.writeInt(u32, t[0..4], @bitCast(@as(f32, @floatFromInt(x * 8 + y)) / 64.0), .little),
+                FMT_R32F => std.mem.writeInt(u32, t[0..4], @bitCast(@as(f32, @floatFromInt(x * 32)) / 255.0), .little),
                 FMT_RGBA8 => {
                     t[0] = @intCast(x * 32);
                     t[1] = @intCast(y * 32);

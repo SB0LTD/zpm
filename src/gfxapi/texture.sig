@@ -242,7 +242,10 @@ fn filteredTexel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, x: Arg, y: Arg, kind
     const at = k.op3(.imad, .u32, x, u(4), r(row));
     const limit = k.op2(.shl, .u32, r(d.last), u(2));
     const word = k.load(.u32, kir.global(slot.b, 32), r(k.op2(.imin, .u32, r(at), r(limit))));
-    const depth = unpackDepth(k, word);
+    // (a D24S8 image's 24 bits, or an R32F one's float: Direct3D's
+    // D32_FLOAT depth seen through an R32_FLOAT view)
+    const d24 = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_DEPTH))), u(0));
+    const depth = k.sel(.f32, r(d24), r(unpackDepth(k, word)), r(k.mov(.f32, r(word))));
     const ref = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, reference, f(0))), f(1));
     const less = k.cmp(.f32, .lt, r(ref), r(depth));
     const greater = k.cmp(.f32, .gt, r(ref), r(depth));
@@ -646,6 +649,15 @@ pub fn layerSize(k: *kir.Kernel, slot: Slot, lod: Arg) Arg {
 
 /// textureSize(): level `lod`'s (past the base) width and height (ints;
 /// at least 1, 0 without a texture).
+/// The levels a sampler reads (its base to its last): a Direct3D
+/// view's mip count.
+pub fn levelCount(k: *kir.Kernel, slot: Slot) Arg {
+    const lw = descWord(k, slot, D_LOD);
+    const base = k.op3(.bfe, .u32, r(lw), u(0), u(4));
+    const last = k.op3(.bfe, .u32, r(lw), u(4), u(4));
+    return r(k.op2(.iadd, .u32, r(k.op2(.isub, .u32, r(last), r(base))), u(1)));
+}
+
 pub fn size(k: *kir.Kernel, slot: Slot, lod: Arg) [2]Arg {
     const d = loadDesc(k, slot);
     const valid = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_VALID))), u(0));

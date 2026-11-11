@@ -200,6 +200,10 @@ const Tally = struct {
     warp_diff: u32 = 0,
     warp_failed: u32 = 0,
     warp_pixels: u64 = 0,
+    /// our pixel shader drawn by gfxapi/dxbc and by WARP: the same pixels
+    /// (the front end itself checked against Direct3D)
+    fe_warp_same: u32 = 0,
+    fe_warp_diff: u32 = 0,
     /// Direct3D 11's runtime and drivers took our blob (or refused it)
     d3d_accepted: u32 = 0,
     d3d_refused: u32 = 0,
@@ -415,7 +419,7 @@ fn setLog(log: *dgen.Log, m: []const u8) void {
 }
 
 /// Draws vs+ps; the pixels (rgba32f) and whether the front end took them.
-fn draw(vs: []const u8, ps: []const u8, uni: []const u32, vlay: *const Lay, play: *const Lay, img: ?*engine.Image, ntex: u8, attrs: u32, out: *[W * H * 4]f32, log: *dgen.Log) bool {
+fn draw(vs: []const u8, ps: []const u8, uni: []const u32, vlay: *const Lay, play: *const Lay, imgs: *const [NTEX]*engine.Image, ntex: u8, attrs: u32, out: *[W * H * 4]f32, log: *dgen.Log) bool {
     const e = engineCpu();
     var target = e.newImage(W, H, .rgba8) orelse {
         setLog(log, "no target image");
@@ -445,14 +449,16 @@ fn draw(vs: []const u8, ps: []const u8, uni: []const u32, vlay: *const Lay, play
         .color = &target,
         .count = 3,
         .center = .{ W / 2, H / 2 },
-        .half = .{ W / 2, H / 2 },
+        // (D3D's y runs down the target, and depth is NDC's z, as galaxy-pe
+        // draws Direct3D's)
+        .half = .{ W / 2, -H / 2 },
+        .depth_scale = 1,
+        .depth_bias = 0,
         .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H },
         .uniforms = uni,
     };
     for (0..@min(attrs, raster.MAX_ATTRS)) |a| d.attrs[a] = .{ .buf = &vb, .offset = @intCast(a * 3 * 16), .stride = 16, .comps = 4 };
-    if (img) |t| for (0..ntex) |k| {
-        d.textures[k] = t;
-    };
+    for (0..ntex) |k| d.textures[k] = imgs[k];
     if (!e.draw(&d)) {
         if (log.len == 0) {
             const m = std.fmt.bufPrint(&log.buf, "the engine refused the draw: {any} pc {d}", .{ e.why_pipe, e.trap.pc }) catch "the engine refused the draw";
@@ -480,26 +486,64 @@ var src_buf: [16 * 1024]u8 = undefined;
 var tex_img: engine.Image = undefined;
 var tex_ready = false;
 
-fn testTexture(uni: []u32) *engine.Image {
+var tex_arr: engine.Image = undefined;
+var tex_depth: engine.Image = undefined;
+var tex_cube: engine.Image = undefined;
+var tex_imgs: [NTEX]*engine.Image = undefined;
+
+/// An 8x8 RGBA8 image of `layers` layers (stacked, as texture.sig reads
+/// arrays and cube faces), every texel different.
+fn layered(e: *engine.Engine, layers: u32) engine.Image {
+    var img = e.newImage(8, 8 * layers, .rgba8).?;
+    var texels: [8 * 8 * 6 * 4]u8 = undefined;
+    for (0..64 * layers) |i| {
+        const x = i % 8;
+        const y = (i / 8) % 8;
+        const l = i / 64;
+        texels[i * 4 + 0] = @intCast(x * 32);
+        texels[i * 4 + 1] = @intCast(y * 32);
+        texels[i * 4 + 2] = @intCast((l * 40 + ((x ^ y) & 1) * 100) % 256);
+        texels[i * 4 + 3] = @intCast(128 + x * 8);
+    }
+    e.write(&img, 0, 0, 8, 8 * layers, texels[0 .. 64 * layers * 4], 32, .rgba8);
+    // (one layer's height: the rest are the next layers)
+    img.height = 8;
+    return img;
+}
+
+/// Each texture slot's image and descriptor, as the shader's reflection
+/// declares it: 2D, a 2D array (2 layers), a cube (6 faces); a
+/// comparison sampler's slots compare less-or-equal.
+fn testTextures(uni: []u32, r: *const ct.Reflection) *const [NTEX]*engine.Image {
     const e = engineCpu();
     if (!tex_ready) {
-        tex_img = e.newImage(8, 8, .rgba8).?;
-        var texels: [8 * 8 * 4]u8 = undefined;
-        for (0..64) |i| {
-            const x = i % 8;
-            const y = i / 8;
-            texels[i * 4 + 0] = @intCast(x * 32);
-            texels[i * 4 + 1] = @intCast(y * 32);
-            texels[i * 4 + 2] = @intCast(((x ^ y) & 1) * 255);
-            texels[i * 4 + 3] = @intCast(128 + x * 8);
-        }
-        e.write(&tex_img, 0, 0, 8, 8, &texels, 32, .rgba8);
+        tex_img = layered(e, 1);
+        tex_arr = layered(e, 2);
+        tex_cube = layered(e, 6);
+        // (a depth map: R32F, x * 32 / 255 across, as WARP's)
+        tex_depth = e.newImage(8, 8, .r32f).?;
+        var depths: [64]f32 = undefined;
+        for (&depths, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i % 8) * 32)) / 255.0;
+        e.write(&tex_depth, 0, 0, 8, 8, std.mem.sliceAsBytes(&depths), 32, .r32f);
         tex_ready = true;
     }
-    var dw: [texture.DESC_WORDS]u32 = undefined;
-    texture.descriptor(.{ .img = &tex_img }, &dw);
-    for (0..NTEX) |k| @memcpy(uni[UNI_DESC + k * texture.DESC_WORDS ..][0..texture.DESC_WORDS], &dw);
-    return &tex_img;
+    var cmp = false;
+    for (r.binds[0..r.nbinds]) |b| {
+        if (b.type == 3 and b.flags & 2 != 0) cmp = true;
+    }
+    for (0..NTEX) |k| {
+        var st = texture.State{ .img = if (cmp) &tex_depth else &tex_img, .compare = if (cmp) 3 else 0 };
+        for (r.binds[0..r.nbinds]) |b| {
+            if (b.type != 2 or k < b.bind or k >= b.bind + b.count) continue;
+            if (b.dim == 5) st = .{ .img = &tex_arr, .layers = 2, .compare = st.compare };
+            if (b.dim == 9) st = .{ .img = &tex_cube, .layers = 6, .compare = st.compare };
+        }
+        tex_imgs[k] = st.img.?;
+        var dw: [texture.DESC_WORDS]u32 = undefined;
+        texture.descriptor(st, &dw);
+        @memcpy(uni[UNI_DESC + k * texture.DESC_WORDS ..][0..texture.DESC_WORDS], &dw);
+    }
+    return &tex_imgs;
 }
 
 fn layVaryings(lay: *Lay, sig: dxbc.Signature) void {
@@ -528,7 +572,7 @@ fn hlslType(comp: dxbc.CompType, n: u32, buf: []u8) []const u8 {
 
 /// A pixel shader writing one vertex shader output element as its color.
 fn partnerPs(e: dxbc.Element, out: []u8) []const u8 {
-    const n: u32 = @popCount(e.mask) + @ctz(e.mask);
+    const n: u32 = @popCount(e.mask);
     var tb: [16]u8 = undefined;
     const t = hlslType(e.comp, n, &tb);
     const nointerp = if (e.comp != .float32) "nointerpolation " else "";
@@ -550,7 +594,7 @@ fn partnerVs(sig: dxbc.Signature, out: []u8) []const u8 {
     while (k < sig.count) : (k += 1) {
         const e = sig.get(k).?;
         if (e.sys != .none) continue;
-        const n: u32 = @popCount(e.mask) + @ctz(e.mask);
+        const n: u32 = @popCount(e.mask);
         var tb: [16]u8 = undefined;
         w.print("  {s}{s} v{d} : {s}{d};\n", .{ if (e.comp != .float32) "nointerpolation " else "", hlslType(e.comp, n, &tb), k, e.name, e.index }) catch return "";
     }
@@ -559,11 +603,11 @@ fn partnerVs(sig: dxbc.Signature, out: []u8) []const u8 {
     while (k < sig.count) : (k += 1) {
         const e = sig.get(k).?;
         if (e.sys != .none) continue;
-        const n: u32 = @popCount(e.mask) + @ctz(e.mask);
+        const n: u32 = @popCount(e.mask);
         const f: f32 = @floatFromInt(k);
         var tb: [16]u8 = undefined;
         if (e.comp == .float32) {
-            w.print("  o.v{d} = ({s})float4(p.x * 0.5 + 0.5, p.y * 0.4 + 0.45, {d} * 0.1 + 0.1, 1.0 - p.x * 0.25);\n", .{ k, hlslType(e.comp, n, &tb), f }) catch return "";
+            w.print("  o.v{d} = ({s})float4(p.x * 0.5 + 0.5, p.y * 0.37 + 0.451, {d} * 0.1 + 0.1, 1.0 - p.x * 0.25);\n", .{ k, hlslType(e.comp, n, &tb), f }) catch return "";
         } else {
             w.print("  o.v{d} = ({s})int4(p.x * 4 + 4, p.y * 3 + 4, {d}, 2);\n", .{ k, hlslType(e.comp, n, &tb), k }) catch return "";
         }
@@ -580,7 +624,7 @@ fn compareDraw(name: []const u8, ms: []const u8, ours: []const u8, stage: dxbc.S
     var vlay = Lay{};
     var play = Lay{};
     var next: u32 = 0;
-    const img = testTexture(&uni);
+    const img = testTextures(&uni, ms_refl);
     const mc = dxbc.Container.parse(ms) catch return;
     var ntex: u8 = 0;
     for (ms_refl.binds[0..ms_refl.nbinds]) |b| {
@@ -613,6 +657,7 @@ fn compareDraw(name: []const u8, ms: []const u8, ours: []const u8, stage: dxbc.S
         }
         ran = true;
         same = comparePixels(name, "", &drawn);
+        fe_drawn = true;
     } else if (stage == .vertex) {
         fillUniforms(ms_refl, &vlay, &uni, &next);
         const osg = mc.signature(true) orelse return;
@@ -753,6 +798,26 @@ fn warpPixels(name: []const u8, what: []const u8) bool {
     return bad == 0;
 }
 
+/// Whether the front end drew our pixel shader (px_ours) as WARP did
+/// (wpx_ours, clamped to the RGBA8 target's range).
+fn frontEndMatchesWarp(name: []const u8) bool {
+    var bad: u32 = 0;
+    var first: usize = 0;
+    for (0..W * H * 4) |i| {
+        const a = std.math.clamp(wpx_ours[i], 0, 1);
+        const b = px_ours[i];
+        if (std.math.isNan(wpx_ours[i])) continue;
+        if (!(@abs(a - b) <= 3.0 / 255.0)) {
+            if (bad == 0) first = i;
+            bad += 1;
+        }
+    }
+    if (bad > 0) std.debug.print("  {s}: gfxapi/dxbc and WARP differ on our program: {d} values; first at pixel {d} comp {d}: gfxapi {d}, WARP {d}" ++ "\n", .{ name, bad, first / 4, first % 4, px_ours[first], wpx_ours[first] });
+    return bad == 0;
+}
+
+var fe_drawn = false;
+
 fn compareWarp(name: []const u8, ms: []const u8, ours: []const u8, stage: dxbc.Stage, ms_refl: *const ct.Reflection) void {
     if (!warp.device()) return;
     const mc = dxbc.Container.parse(ms) catch return;
@@ -772,6 +837,9 @@ fn compareWarp(name: []const u8, ms: []const u8, ours: []const u8, stage: dxbc.S
             warp.draw(.{ .vs = .{ .blob = vs }, .ps = st, .attrs = &a }, &wpx_ours) catch |e| return warpFail(name, e);
             drew = true;
             same = warpPixels(name, "");
+            if (fe_drawn) {
+                if (frontEndMatchesWarp(name)) tally.fe_warp_same += 1 else tally.fe_warp_diff += 1;
+            }
         },
         .vertex, .geometry => {
             // (a geometry shader: fed by a vertex shader made for its inputs,
@@ -864,6 +932,7 @@ fn runCase(c: Case, target: []const u8) void {
     }
     // (refl_ms holds Microsoft's reflection now)
     var keep: ct.Reflection = refl_ms;
+    fe_drawn = false;
     compareDraw(label, ms, r.blob, stage, &keep);
     compareWarp(label, ms, r.blob, stage, &keep);
 }
@@ -886,9 +955,10 @@ test "the HLSL compiler against Microsoft's: signatures, reflection, pixels" {
         \\  reflection: {d} same, {d} different
         \\  pixels:     {d} same, {d} different ({d} pixels drawn); {d} not drawable by the front end, {d} ours refused
         \\  WARP (Direct3D 11's own rasterizer): {d} same, {d} different ({d} pixels drawn), {d} not drawn
+        \\  gfxapi/dxbc against WARP, our pixel shaders: {d} same, {d} different
         \\  Direct3D 11 (hardware and WARP): {d} of our shaders accepted, {d} refused
         \\
-    , .{ tally.cases, tally.ms_refused, tally.ours_failed, tally.sig_same, tally.sig_diff, tally.refl_same, tally.refl_diff, tally.draw_same, tally.draw_diff, tally.pixels, tally.draw_skipped, tally.draw_ours_refused, tally.warp_same, tally.warp_diff, tally.warp_pixels, tally.warp_failed, tally.d3d_accepted, tally.d3d_refused });
+    , .{ tally.cases, tally.ms_refused, tally.ours_failed, tally.sig_same, tally.sig_diff, tally.refl_same, tally.refl_diff, tally.draw_same, tally.draw_diff, tally.pixels, tally.draw_skipped, tally.draw_ours_refused, tally.warp_same, tally.warp_diff, tally.warp_pixels, tally.warp_failed, tally.fe_warp_same, tally.fe_warp_diff, tally.d3d_accepted, tally.d3d_refused });
     try std.testing.expectEqual(@as(u32, 0), tally.ours_failed);
     try std.testing.expectEqual(@as(u32, 0), tally.sig_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.refl_diff);
@@ -897,5 +967,6 @@ test "the HLSL compiler against Microsoft's: signatures, reflection, pixels" {
     try std.testing.expectEqual(@as(u32, 0), tally.d3d_refused);
     try std.testing.expectEqual(@as(u32, 0), tally.warp_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.warp_failed);
+    try std.testing.expectEqual(@as(u32, 0), tally.fe_warp_diff);
     if (d3d_devs[0] != null or d3d_devs[1] != null) try std.testing.expect(checksum_refused);
 }

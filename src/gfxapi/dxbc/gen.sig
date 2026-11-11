@@ -25,12 +25,16 @@
 //!   discard (the raster's discard pred), and a return at the end. An
 //!   early return, switch, subroutines and indexable temps are refused,
 //!   with a log, for now.
-//! - **Textures.** sample, sample_l, sample_b, sample_d, ld and resinfo
-//!   on 2D textures, through texture.sig: a resource and sampler pair is
-//!   one texture slot (Layout.texture). A pixel shader's implicit level of
-//!   detail comes from its coordinates' derivatives across the quad (so
-//!   it runs whole quads: needsQuads); inside an if or a loop, where some
-//!   pixels of a quad may not run, derivatives are 0 (as GLSL's are).
+//! - **Textures.** sample, sample_l, sample_b, sample_d, sample_c,
+//!   sample_c_lz, ld and resinfo on 1D, 2D and 3D textures, 1D and 2D
+//!   texture arrays and cube maps, float, sint and uint (as the resource
+//!   declares), through texture.sig: a resource and sampler pair is one
+//!   texture slot (Layout.texture); a comparison sampler's function is the
+//!   slot's descriptor's (texture.State.compare). A pixel shader's
+//!   implicit level of detail comes from its coordinates' derivatives
+//!   across the quad (so it runs whole quads: needsQuads); inside an if or
+//!   a loop, where some pixels of a quad may not run, derivatives are 0
+//!   (as GLSL's are). Multisampled textures and cube arrays: not yet.
 //!
 //! Allocation-free: its tables are the Gen's, on the caller's stack.
 
@@ -110,7 +114,7 @@ pub fn needsQuads(blob: []const u8) bool {
     if (p.stage != .pixel) return false;
     var rd = p.reader();
     while (rd.next() catch return false) |i| switch (i.op) {
-        .sample, .sample_b, .sample_c, .deriv_rtx, .deriv_rty, .deriv_rtx_coarse, .deriv_rtx_fine, .deriv_rty_coarse, .deriv_rty_fine => return true,
+        .sample, .sample_b, .sample_c, .lod, .deriv_rtx, .deriv_rty, .deriv_rtx_coarse, .deriv_rtx_fine, .deriv_rty_coarse, .deriv_rty_fine => return true,
         else => {},
     };
     return false;
@@ -169,7 +173,7 @@ pub fn texturePairs(blob: []const u8, out: [][2]u32) usize {
     var rd = p.reader();
     while (rd.next() catch return n) |i| {
         const pair: [2]u32 = switch (i.op) {
-            .sample, .sample_l, .sample_b, .sample_d => .{ i.operands[2].index[0].imm, i.operands[3].index[0].imm },
+            .sample, .sample_l, .sample_b, .sample_d, .sample_c, .sample_c_lz, .gather4 => .{ i.operands[2].index[0].imm, i.operands[3].index[0].imm },
             .ld, .resinfo => .{ i.operands[2].index[0].imm, NO_SAMPLER },
             else => continue,
         };
@@ -300,6 +304,10 @@ const Gen = struct {
     ins: [MAX_REGS][4]Arg,
     /// the immediate constant buffer's words
     icb: []align(1) const u32,
+    /// each t#'s declared dimension (D3D10_SB_RESOURCE_DIMENSION; 0:
+    /// undeclared) and what it returns
+    res_dim: [128]u8,
+    res_kind: [128]texture.Kind,
     discard: V,
     quads: bool,
     /// if and loop nesting: derivatives only at 0
@@ -322,6 +330,8 @@ const Gen = struct {
             .outs = undefined,
             .ins = undefined,
             .icb = &.{},
+            .res_dim = [_]u8{0} ** 128,
+            .res_kind = [_]texture.Kind{.float} ** 128,
             .discard = .none,
             .quads = false,
             .depth = 0,
@@ -399,9 +409,24 @@ const Gen = struct {
             },
             .dcl_indexable_temp => _ = g.fail("indexable temps (x#[]) not yet", .{}),
             .dcl_resource => {
-                // (bits 11-15: the dimension; 3: texture2d)
+                // (bits 11-15: the dimension: 2 1D, 3 2D, 5 3D, 6 cube,
+                // 7 1D array, 8 2D array; then a return type per component)
                 const dim = (i.raw[0] >> 11) & 0x1f;
-                if (dim != 3) _ = g.fail("a resource of dimension {d} (only 2D textures yet)", .{dim});
+                switch (dim) {
+                    2, 3, 5, 6, 7, 8 => {},
+                    else => {
+                        _ = g.fail("a resource of dimension {d} (buffers, multisampled textures and cube arrays not yet)", .{dim});
+                        return;
+                    },
+                }
+                const tn = i.operands[0].index[0].imm;
+                if (tn >= g.res_dim.len) return;
+                g.res_dim[tn] = @intCast(dim);
+                g.res_kind[tn] = switch (i.raw[i.raw.len - 1] & 0xf) {
+                    3 => .int,
+                    4 => .uint,
+                    else => .float,
+                };
             },
             else => {}, // constant buffers, samplers, global flags: nothing to emit
         }
@@ -760,7 +785,7 @@ const Gen = struct {
                 }
                 g.write(d, vals, sat);
             },
-            .sample, .sample_l, .sample_b, .sample_d => g.sample(i),
+            .sample, .sample_l, .sample_b, .sample_d, .sample_c, .sample_c_lz => g.sample(i),
             .ld => g.ld(i),
             .resinfo => g.resinfo(i),
             else => _ = g.fail("instruction {s} not yet", .{@tagName(op)}),
@@ -899,7 +924,20 @@ const Gen = struct {
         const sn = if (s) |x| x.index[0].imm else NO_SAMPLER;
         const slot = g.lay.texture(g.lay.ctx, tn, sn) orelse return null;
         if (slot >= texture.MAX_TEX) return null;
-        return .{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS };
+        const dim = g.dimOf(t);
+        return .{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS, .volume = dim == 5, .cube = dim == 6 };
+    }
+
+    /// A resource's declared dimension (2D when undeclared).
+    fn dimOf(g: *Gen, t: *const dxbc.Operand) u8 {
+        const tn = t.index[0].imm;
+        if (tn >= g.res_dim.len or g.res_dim[tn] == 0) return 3;
+        return g.res_dim[tn];
+    }
+
+    fn kindOf(g: *Gen, t: *const dxbc.Operand) texture.Kind {
+        const tn = t.index[0].imm;
+        return if (tn < g.res_kind.len) g.res_kind[tn] else .float;
     }
 
     /// The four results to the destination, through the resource's swizzle.
@@ -915,27 +953,79 @@ const Gen = struct {
     fn sample(g: *Gen, i: *const dxbc.Inst) void {
         const k = g.k;
         const d = &i.operands[0];
+        const c = &i.operands[1];
         const res = &i.operands[2];
         const smp = &i.operands[3];
-        const s = g.fsrc(&i.operands[1], 0);
-        const t = g.fsrc(&i.operands[1], 1);
+        const dim = g.dimOf(res);
+        const one_d = dim == 2 or dim == 7;
+        // the coordinates: (s, t) and a layer (an array's), a depth (3D),
+        // or a cube's face from its direction
+        const x = g.fsrc(c, 0);
+        var s = x;
+        var t = if (one_d) f(0.5) else g.fsrc(c, 1);
+        var layer: ?Arg = switch (dim) {
+            7 => g.fsrc(c, 1),
+            5, 8 => g.fsrc(c, 2),
+            else => null,
+        };
+        var projection: ?texture.CubeProjection = null;
+        if (dim == 6) {
+            const p = texture.cubeProject(k, x, g.fsrc(c, 1), g.fsrc(c, 2));
+            s = p.s;
+            t = p.t;
+            layer = p.face;
+            projection = p;
+        }
         const off = [2]i32{ i.offset[0], i.offset[1] };
+        const compare = i.op == .sample_c or i.op == .sample_c_lz;
         const lod: texture.Lod = switch (i.op) {
             .sample_l => .{ .level = g.fsrc(&i.operands[4], 0) },
-            .sample_d => .{ .grad = .{ .dsdx = g.fsrc(&i.operands[4], 0), .dtdx = g.fsrc(&i.operands[4], 1), .dsdy = g.fsrc(&i.operands[5], 0), .dtdy = g.fsrc(&i.operands[5], 1), .bias = f(0) } },
-            else => if (g.stage == .pixel) .{ .grad = .{
-                .dsdx = g.deriv(s, false),
-                .dtdx = g.deriv(t, false),
-                .dsdy = g.deriv(s, true),
-                .dtdy = g.deriv(t, true),
-                .bias = if (i.op == .sample_b) g.fsrc(&i.operands[4], 0) else f(0),
-            } } else .base,
+            .sample_c_lz => .{ .level = f(0) },
+            .sample_d => blk: {
+                const gx = &i.operands[4];
+                const gy = &i.operands[5];
+                if (projection) |p| {
+                    const a = texture.cubeGradient(k, p, g.fsrc(gx, 0), g.fsrc(gx, 1), g.fsrc(gx, 2));
+                    const b = texture.cubeGradient(k, p, g.fsrc(gy, 0), g.fsrc(gy, 1), g.fsrc(gy, 2));
+                    break :blk .{ .grad = .{ .dsdx = a[0], .dtdx = a[1], .dsdy = b[0], .dtdy = b[1], .bias = f(0) } };
+                }
+                break :blk .{ .grad = .{
+                    .dsdx = g.fsrc(gx, 0),
+                    .dtdx = if (one_d) f(0) else g.fsrc(gx, 1),
+                    .dsdy = g.fsrc(gy, 0),
+                    .dtdy = if (one_d) f(0) else g.fsrc(gy, 1),
+                    .bias = f(0),
+                    .drdx = if (dim == 5) g.fsrc(gx, 2) else f(0),
+                    .drdy = if (dim == 5) g.fsrc(gy, 2) else f(0),
+                } };
+            },
+            else => if (g.stage == .pixel) blk: {
+                const bias = if (i.op == .sample_b) g.fsrc(&i.operands[4], 0) else f(0);
+                if (projection) |p| {
+                    const cx = [3]Arg{ g.deriv(x, false), g.deriv(g.fsrc(c, 1), false), g.deriv(g.fsrc(c, 2), false) };
+                    const cy = [3]Arg{ g.deriv(x, true), g.deriv(g.fsrc(c, 1), true), g.deriv(g.fsrc(c, 2), true) };
+                    const a = texture.cubeGradient(k, p, cx[0], cx[1], cx[2]);
+                    const b = texture.cubeGradient(k, p, cy[0], cy[1], cy[2]);
+                    break :blk .{ .grad = .{ .dsdx = a[0], .dtdx = a[1], .dsdy = b[0], .dtdy = b[1], .bias = bias } };
+                }
+                break :blk .{ .grad = .{
+                    .dsdx = g.deriv(s, false),
+                    .dtdx = if (one_d) f(0) else g.deriv(t, false),
+                    .dsdy = g.deriv(s, true),
+                    .dtdy = if (one_d) f(0) else g.deriv(t, true),
+                    .bias = bias,
+                    .drdx = if (dim == 5) g.deriv(layer.?, false) else f(0),
+                    .drdy = if (dim == 5) g.deriv(layer.?, true) else f(0),
+                } };
+            } else .base,
         };
-        const slot = g.slotOf(res, smp) orelse {
+        var slot = g.slotOf(res, smp) orelse {
             g.writeTexel(d, res, .{ f(0), f(0), f(0), f(1) });
             return;
         };
-        g.writeTexel(d, res, texture.sample(k, slot, s, t, .float, off, lod));
+        // (a comparison: the reference against the texel, the descriptor's function)
+        if (compare) slot.shadow = g.fsrc(&i.operands[4], 0);
+        g.writeTexel(d, res, texture.sampleArray(k, slot, s, t, layer, if (compare) .float else g.kindOf(res), off, lod));
     }
 
     fn ld(g: *Gen, i: *const dxbc.Inst) void {
@@ -946,10 +1036,18 @@ const Gen = struct {
             g.writeTexel(d, res, .{ f(0), f(0), f(0), f(1) });
             return;
         };
-        const x = g.isrc(&i.operands[1], 0, .u32);
-        const y = g.isrc(&i.operands[1], 1, .u32);
-        const lvl = g.isrc(&i.operands[1], 3, .u32);
-        g.writeTexel(d, res, texture.fetch(k, slot, x, y, .float, .{ i.offset[0], i.offset[1] }, lvl));
+        // (x, y, a layer or depth, the level at w; a 1D array's layer at y)
+        const dim = g.dimOf(res);
+        const a = &i.operands[1];
+        const x = g.isrc(a, 0, .u32);
+        const y = if (dim == 2 or dim == 7) u(0) else g.isrc(a, 1, .u32);
+        const layer: ?Arg = switch (dim) {
+            7 => g.isrc(a, 1, .u32),
+            5, 8 => g.isrc(a, 2, .u32),
+            else => null,
+        };
+        const lvl = g.isrc(a, 3, .u32);
+        g.writeTexel(d, res, texture.fetchArray(k, slot, x, y, layer, g.kindOf(res), .{ i.offset[0], i.offset[1] }, lvl));
     }
 
     fn resinfo(g: *Gen, i: *const dxbc.Inst) void {
@@ -957,20 +1055,29 @@ const Gen = struct {
         const d = &i.operands[0];
         const res = &i.operands[2];
         const slot = g.slotOf(res, null) orelse return;
-        const sz = texture.size(k, slot, g.isrc(&i.operands[1], 0, .u32));
+        const lod = g.isrc(&i.operands[1], 0, .u32);
+        const sz = texture.size(k, slot, lod);
+        // (x width; y height, a 1D array's layers; z a 2D array's layers,
+        // a 3D texture's depth; w the levels)
+        const dim = g.dimOf(res);
+        var raw: [4]Arg = .{ sz[0], sz[1], u(0), texture.levelCount(k, slot) };
+        switch (dim) {
+            2 => raw[1] = u(0),
+            7 => raw[1] = texture.layerSize(k, slot, lod),
+            5, 8 => raw[2] = texture.layerSize(k, slot, lod),
+            else => {},
+        }
         // (bits 11-12: the return type: 0 float, 1 1/float, 2 uint)
         const rt = (i.raw[0] >> 11) & 3;
         var t: [4]Arg = undefined;
-        for (0..2) |c| {
-            const w = asU32(k, sz[c]);
+        for (0..4) |c| {
+            const w = asU32(k, raw[c]);
             t[c] = switch (rt) {
                 2 => w,
-                1 => r(k.op1(.frcp, .f32, r(k.cvt(.u32, .f32, .rne, w)))),
+                1 => if (c < 3) r(k.op1(.frcp, .f32, r(k.cvt(.u32, .f32, .rne, w)))) else r(k.cvt(.u32, .f32, .rne, w)),
                 else => r(k.cvt(.u32, .f32, .rne, w)),
             };
         }
-        t[2] = if (rt == 2) u(0) else f(0);
-        t[3] = if (rt == 2) u(1) else f(1);
         g.writeTexel(d, res, t);
     }
 };
