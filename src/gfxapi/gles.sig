@@ -281,6 +281,17 @@ const View = struct {
     fn bounds(v: *const View) Rect {
         return .{ .x0 = 0, .y0 = 0, .x1 = v.width, .y1 = v.height };
     }
+
+    /// Samples a pixel (every attachment's: completeness says so).
+    fn sampleCount(v: *const View) u8 {
+        for (v.color) |x| {
+            if (x) |img| return img.samples;
+        }
+        if (v.read) |img| return img.samples;
+        if (v.depth) |img| return img.samples;
+        if (v.stencil) |img| return img.samples;
+        return 1;
+    }
 };
 
 /// glPixelStorei's state, for packing or unpacking.
@@ -765,6 +776,14 @@ pub const Context = struct {
     depth_range: [2]f32 = .{ 0, 1 },
     cull_mode: u32 = g.BACK,
     front_face: u32 = g.CCW,
+    /// glPolygonOffset's factor and units (POLYGON_OFFSET_FILL)
+    polygon_offset: [2]f32 = .{ 0, 0 },
+    /// glSampleCoverage's (SAMPLE_COVERAGE)
+    sample_coverage: f32 = 1,
+    sample_invert: bool = false,
+    /// glLineWidth's (lines are drawn one pixel wide whatever it is:
+    /// ALIASED_LINE_WIDTH_RANGE is 1..1)
+    line_width: f32 = 1,
     /// what draws run: a pipeline and its uniforms (the next stage's GLSL
     /// programs make them; for now the driver's own)
     pipeline: ?*raster.Pipeline = null,
@@ -1511,15 +1530,22 @@ pub const Context = struct {
             g.MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS => int(program.MAX_FRAGMENT_UNIFORM_VECTORS * 4 + glsl_max_blocks * program.MAX_UNIFORM_BLOCK_SIZE / 4),
             g.MAX_TEXTURE_IMAGE_UNITS => int(16),
             g.MAX_COMBINED_TEXTURE_IMAGE_UNITS => int(MAX_UNITS),
-            g.MAX_SAMPLES => int(1),
-            // (lines and points are one pixel: Firefox's WebGL asks both at
-            // a context's start and gives the context up on an error)
-            g.ALIASED_LINE_WIDTH_RANGE, g.ALIASED_POINT_SIZE_RANGE => .{ .kind = .float, .n = 2, .f = .{ 1, 1, 0, 0 } },
+            g.MAX_SAMPLES => int(raster.MAX_SAMPLES),
+            // (lines are one pixel wide, points up to raster's largest:
+            // Firefox's WebGL asks both at a context's start)
+            g.ALIASED_LINE_WIDTH_RANGE => .{ .kind = .float, .n = 2, .f = .{ 1, 1, 0, 0 } },
+            g.ALIASED_POINT_SIZE_RANGE => .{ .kind = .float, .n = 2, .f = .{ 1, raster.MAX_POINT_SIZE, 0, 0 } },
+            g.LINE_WIDTH => .{ .kind = .float, .f = .{ c.line_width, 0, 0, 0 } },
+            g.POLYGON_OFFSET_FACTOR => .{ .kind = .float, .f = .{ c.polygon_offset[0], 0, 0, 0 } },
+            g.POLYGON_OFFSET_UNITS => .{ .kind = .float, .f = .{ c.polygon_offset[1], 0, 0, 0 } },
+            g.SAMPLE_COVERAGE_VALUE => .{ .kind = .float, .f = .{ c.sample_coverage, 0, 0, 0 } },
+            g.SAMPLE_COVERAGE_INVERT => boolean(c.sample_invert),
             g.RESET_NOTIFICATION_STRATEGY => int(if (c.lose_on_reset) g.LOSE_CONTEXT_ON_RESET else g.NO_RESET_NOTIFICATION),
             // (out-of-range reads are not promised to be safe: no
             // robust_buffer_access_behavior)
             g.CONTEXT_ROBUST_ACCESS => boolean(false),
-            g.SAMPLES, g.SAMPLE_BUFFERS => int(0),
+            g.SAMPLES => int(c.fbSamples(c.draw_fb)),
+            g.SAMPLE_BUFFERS => int(@intFromBool(c.fbSamples(c.draw_fb) > 1)),
             g.SUBPIXEL_BITS => int(4),
             g.MAJOR_VERSION => int(3),
             g.MINOR_VERSION => int(0),
@@ -1725,10 +1751,19 @@ pub const Context = struct {
             w = @min(w, im.width);
             h = @min(h, im.height);
         }
+        // (every attachment of as many samples)
+        var ns: ?u8 = null;
+        var mixed = false;
+        for (all) |img| {
+            const im = img orelse continue;
+            if (ns) |x| mixed = mixed or x != im.samples else ns = im.samples;
+        }
         v.status = if (bad)
             g.FRAMEBUFFER_INCOMPLETE_ATTACHMENT
         else if (!any)
             g.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT
+        else if (mixed)
+            g.FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
         else
             g.FRAMEBUFFER_COMPLETE;
         if (v.status != g.FRAMEBUFFER_COMPLETE) return v;
@@ -1741,6 +1776,14 @@ pub const Context = struct {
         v.depth = d.img;
         v.stencil = s.img;
         return v;
+    }
+
+    /// Samples a pixel of framebuffer `name` (complete; else 0): GL's
+    /// SAMPLES, 0 when single-sampled.
+    fn fbSamples(c: *Context, name: u32) u32 {
+        const v = c.view(name, false);
+        if (v.status != g.FRAMEBUFFER_COMPLETE) return 0;
+        return if (v.sampleCount() > 1) v.sampleCount() else 0;
     }
 
     /// The draw framebuffer, complete; else INVALID_FRAMEBUFFER_OPERATION.
@@ -1888,6 +1931,8 @@ pub const Context = struct {
         const v = c.view(c.read_fb, true);
         if (v.status != g.FRAMEBUFFER_COMPLETE) return c.fail(g.INVALID_FRAMEBUFFER_OPERATION);
         const src = v.read orelse return c.fail(g.INVALID_OPERATION);
+        // (a multisampled framebuffer is read through a blit's resolve)
+        if (src.samples > 1) return c.fail(g.INVALID_OPERATION);
         // (RED and RG: only as the framebuffer is, its read format)
         if (!want.isColor() and want != src.format) return c.fail(g.INVALID_OPERATION);
         const bpp = want.bytes();
@@ -2922,6 +2967,11 @@ pub const Context = struct {
             c.fail(g.INVALID_OPERATION);
             return null;
         };
+        // (copies from a multisampled framebuffer: GL refuses them)
+        if (img.samples > 1) {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        }
         return .{ .img = img, .v = v };
     }
 
@@ -2960,6 +3010,21 @@ pub const Context = struct {
         }
         if (mask & g.DEPTH_BUFFER_BIT != 0 and rv.depth != null and rv.depth == dv.depth) return c.fail(g.INVALID_OPERATION);
         if (mask & g.STENCIL_BUFFER_BIT != 0 and rv.stencil != null and rv.stencil == dv.stencil) return c.fail(g.INVALID_OPERATION);
+        // (multisampled: into a single-sampled framebuffer, the same
+        // rectangles, the same colour formats; resolved)
+        const rs = rv.sampleCount();
+        const ds_ = dv.sampleCount();
+        if (ds_ > 1 and rs != ds_) return c.fail(g.INVALID_OPERATION);
+        if (rs > 1) {
+            if (sx0 != dx0 or sy0 != dy0 or sx1 != dx1 or sy1 != dy1) return c.fail(g.INVALID_OPERATION);
+            if (mask & g.COLOR_BUFFER_BIT != 0) {
+                if (rv.read) |s| {
+                    for (dv.color) |d| {
+                        if (d != null and d.?.format != s.format) return c.fail(g.INVALID_OPERATION);
+                    }
+                }
+            }
+        }
         if (sx0 == sx1 or sy0 == sy1 or dx0 == dx1 or dy0 == dy1 or mask == 0) return;
         const cap = struct {
             fn f(x: i32) u32 {
@@ -3302,15 +3367,19 @@ pub const Context = struct {
         return c.eng.hostView(&b.store, s.offset, len);
     }
 
-    /// glGetInternalformativ: no multisampled renderbuffers (MAX_SAMPLES
-    /// is 1), so every renderable format has no sample counts.
+    /// glGetInternalformativ: every renderable format multisamples 8, 4
+    /// and 2 times (the raster's counts, most first).
     pub fn internalformat(c: *Context, target: u32, pname: u32, out: []i32) void {
         if (target != g.RENDERBUFFER) return c.fail(g.INVALID_ENUM);
+        const counts = [_]i32{ 8, 4, 2 };
         switch (pname) {
             g.NUM_SAMPLE_COUNTS => {
-                if (out.len > 0) out[0] = 0;
+                if (out.len > 0) out[0] = counts.len;
             },
-            g.SAMPLES => {},
+            g.SAMPLES => {
+                const n = @min(out.len, counts.len);
+                @memcpy(out[0..n], counts[0..n]);
+            },
             else => c.fail(g.INVALID_ENUM),
         }
     }
@@ -3706,13 +3775,15 @@ pub const Context = struct {
         if (target != g.RENDERBUFFER) return c.fail(g.INVALID_ENUM);
         const fmt = rbFormat(internal) orelse return c.fail(g.INVALID_ENUM);
         if (w < 0 or h < 0 or w > MAX_SIZE or h > MAX_SIZE or samples < 0) return c.fail(g.INVALID_VALUE);
-        if (samples > 1) return c.fail(g.INVALID_OPERATION);
+        if (samples > raster.MAX_SAMPLES) return c.fail(g.INVALID_OPERATION);
         const rb = madeIn(Rb, &c.objs.rbs, c.rb) orelse return c.fail(g.INVALID_OPERATION);
         c.eng.freeImage(&rb.img);
         rb.internal = internal;
-        rb.samples = 0;
+        // (the fewest samples the raster has, at least those asked: 2, 4, 8)
+        const ns: u8 = if (samples <= 0) 1 else if (samples <= 2) 2 else if (samples <= 4) 4 else 8;
+        rb.samples = if (ns > 1) ns else 0;
         if (w == 0 or h == 0) return;
-        rb.img = c.eng.newImage(@intCast(w), @intCast(h), fmt) orelse return c.fail(g.OUT_OF_MEMORY);
+        rb.img = c.eng.newImageSamples(@intCast(w), @intCast(h), fmt, ns) orelse return c.fail(g.OUT_OF_MEMORY);
     }
 
     pub fn getRenderbufferParameter(c: *Context, target: u32, pname: u32) ?i32 {
@@ -4124,6 +4195,20 @@ pub const Context = struct {
         c.depth_range = .{ clamp01(n), clamp01(f_) };
     }
 
+    pub fn polygonOffset(c: *Context, factor: f32, units: f32) void {
+        c.polygon_offset = .{ factor, units };
+    }
+
+    pub fn sampleCoverage(c: *Context, value: f32, invert: bool) void {
+        c.sample_coverage = clamp01(value);
+        c.sample_invert = invert;
+    }
+
+    pub fn lineWidth(c: *Context, w: f32) void {
+        if (!(w > 0)) return c.fail(g.INVALID_VALUE);
+        c.line_width = w;
+    }
+
     pub fn cullFace(c: *Context, mode: u32) void {
         if (mode != g.FRONT and mode != g.BACK and mode != g.FRONT_AND_BACK) return c.fail(g.INVALID_ENUM);
         c.cull_mode = mode;
@@ -4157,8 +4242,10 @@ pub const Context = struct {
             g.TRIANGLES => .triangles,
             g.TRIANGLE_STRIP => .strip,
             g.TRIANGLE_FAN => .fan,
-            // (points and lines: captured by transform feedback, not drawn yet)
-            g.POINTS, g.LINES, g.LINE_LOOP, g.LINE_STRIP => null,
+            g.POINTS => .points,
+            g.LINES => .lines,
+            g.LINE_STRIP => .line_strip,
+            g.LINE_LOOP => .line_loop,
             else => return c.fail(g.INVALID_ENUM),
         };
         if (count < 0 or instances < 0) return c.fail(g.INVALID_VALUE);
@@ -4190,12 +4277,17 @@ pub const Context = struct {
             pipe = c.pipeline orelse return;
             uniforms = c.uniforms;
         }
-        const color_or = v.color[0];
-        if (color_or == null and xfb == null) return;
+        // the draw buffers: fragment output i into draw buffer i; none (a
+        // depth or stencil pass) draws no colour
+        var drawn = false;
+        for (v.color) |x| drawn = drawn or x != null;
+        const ds_img = v.depth orelse v.stencil;
+        if (!drawn and ds_img == null and xfb == null) return;
         if (count == 0 or instances == 0) return;
         // (a capture alone draws no pixel: any image stands for the color)
-        const color = color_or orelse &c.eng.zero;
+        const color = v.color[0] orelse ds_img orelse &c.eng.zero;
         var d = raster.Draw{ .pipe = pipe, .color = color, .topology = topology orelse .triangles, .first = first, .count = @intCast(count), .instances = @intCast(instances), .uniforms = uniforms };
+        d.color_off = v.color[0] == null;
         d.restart = c.enabled & bitOf(g.PRIMITIVE_RESTART_FIXED_INDEX) != 0;
         var sampled_mips: [texture.MAX_TEX]Image = @splat(.{});
         defer for (&sampled_mips) |*image| c.eng.freeImage(image);
@@ -4256,7 +4348,7 @@ pub const Context = struct {
         if (xfb) |t| {
             if (!c.feedbackCapture(t, &d, mode)) return;
         }
-        if (topology == null or discard or color_or == null) return;
+        if (topology == null or discard or (!drawn and ds_img == null)) return;
         // an occlusion query: its word
         if (c.timerOf(c.occlusion)) |q| d.query = &q.word;
         // viewport and depth range
@@ -4312,7 +4404,28 @@ pub const Context = struct {
             };
         }
         d.keep = colorKeep(color.format, c.color_mask);
-        c.usage.draw(index_ty != 0, d.instances, @as(u64, d.triangles()) * d.instances);
+        for (v.color[1..], 1..) |x, i| {
+            const img = x orelse continue;
+            d.targets[i] = .{ .img = img, .keep = colorKeep(img.format, c.color_mask) };
+        }
+        // depth bias: polygons (triangles) alone, as GL has it
+        if (c.enabled & bitOf(g.POLYGON_OFFSET_FILL) != 0) {
+            d.bias_factor = c.polygon_offset[0];
+            d.bias_units = c.polygon_offset[1];
+        }
+        // multisampling: the sample coverage's share of the samples, alpha
+        // to coverage
+        const ns = v.sampleCount();
+        if (ns > 1) {
+            if (c.enabled & bitOf(g.SAMPLE_COVERAGE) != 0) {
+                const nc: u5 = @intFromFloat(@round(c.sample_coverage * @as(f32, @floatFromInt(ns))));
+                var m: u32 = (@as(u32, 1) << nc) - 1;
+                if (c.sample_invert) m = ~m;
+                d.sample_mask = m & ((@as(u32, 1) << @intCast(ns)) - 1);
+            }
+            d.alpha_to_coverage = c.enabled & bitOf(g.SAMPLE_ALPHA_TO_COVERAGE) != 0;
+        }
+        c.usage.draw(index_ty != 0, d.instances, @as(u64, d.prims()) * d.instances);
         if (!c.eng.draw(&d)) c.fail(g.OUT_OF_MEMORY);
     }
 

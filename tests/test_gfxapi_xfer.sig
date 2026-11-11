@@ -262,7 +262,7 @@ fn scene(eng: *engine.Engine, out: *Out) !void {
     want(c, out, range[0] == 1 and range[1] == 1, @src().line);
     range = .{ 0, 0 };
     c.getFloats(g.ALIASED_POINT_SIZE_RANGE, &range);
-    want(c, out, range[0] == 1 and range[1] == 1, @src().line);
+    want(c, out, range[0] == 1 and range[1] == gfxapi.raster.MAX_POINT_SIZE, @src().line);
     err(c, out, g.NO_ERROR, @src().line);
     for ([_]u32{ g.RGBA4, g.RGB5_A1, g.RGB565 }) |internal| {
         const fb16 = fb(c);

@@ -672,6 +672,11 @@ pub const Checker = struct {
     told_prec: bool = false,
     uses_frag_data: bool = false,
     uses_frag_color: bool = false,
+    /// gl_PointSize (vertex), gl_PointCoord and gl_FragDepth (fragment)
+    /// read or written
+    uses_point_size: bool = false,
+    uses_point_coord: bool = false,
+    uses_frag_depth: bool = false,
 
     fn node(c: *Checker, i: u32) *Node {
         return &c.p.nodes[i];
@@ -1359,6 +1364,7 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, "gl_FragColor")) c.uses_frag_color = true;
             if (std.mem.eql(u8, name, "gl_FragData")) c.uses_frag_data = true;
         }
+        if (s.builtin) c.noteBuiltin(name);
         return s.ty;
     }
 
@@ -1392,6 +1398,13 @@ pub const Checker = struct {
             if (std.mem.eql(u8, s.name, "gl_FragColor")) c.uses_frag_color = true;
             if (std.mem.eql(u8, s.name, "gl_FragData")) c.uses_frag_data = true;
         }
+        if (s.builtin) c.noteBuiltin(s.name);
+    }
+
+    fn noteBuiltin(c: *Checker, name: []const u8) void {
+        if (std.mem.eql(u8, name, "gl_PointSize")) c.uses_point_size = true;
+        if (std.mem.eql(u8, name, "gl_PointCoord")) c.uses_point_coord = true;
+        if (std.mem.eql(u8, name, "gl_FragDepth")) c.uses_frag_depth = true;
     }
 
     fn binaryExpr(c: *Checker, nd: *Node) Type {

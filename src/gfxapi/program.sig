@@ -965,7 +965,7 @@ fn link(p: *Program, log: *glsl.pp.Log) bool {
         if (!v.flat) continue;
         for (0..wordsOf(v.ty)) |w| flat |= @as(u64, 1) << @intCast(v.word + w);
     }
-    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .textures = @intCast(l.nslots), .quads = quads, .capture = l.capture[0..l.ncapture], .capture_stride = l.xfb_stride, .vertex = emitVertex, .fragment = emitFragment });
+    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .textures = @intCast(l.nslots), .quads = quads, .capture = l.capture[0..l.ncapture], .capture_stride = l.xfb_stride, .point_size = vs.point_size, .point_coord = fs.point_coord, .frag_depth = fs.frag_depth, .vertex = emitVertex, .fragment = emitFragment });
     p.has_pipe = true;
     return true;
 }

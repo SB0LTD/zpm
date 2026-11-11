@@ -46,7 +46,10 @@
 //!   not uniform (an if, a loop's exit, a return or discard on a value
 //!   that differs between pixels) GL leaves them undefined: here they
 //!   are 0 (`flattenDerivs`).
-//! - Not yet: a sampler chosen at run time, gl_FragDepth, gl_PointSize.
+//! - gl_PointSize, gl_PointCoord and gl_FragDepth through the raster's
+//!   VertexIO and FragmentIO; outputs at locations 1.. (gl_FragData[n],
+//!   gl_FragColor to every draw buffer) as FragmentIO.colors.
+//! - Not yet: a sampler chosen at run time.
 //!
 //! Allocation-free: its tables are the Scratch's (Store).
 
@@ -2554,6 +2557,7 @@ pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexI
     g.bind("gl_Position", sema.vecT(.float, 4), null, false);
     const pos_ix = g.nvars - 1;
     g.bind("gl_PointSize", FLOAT, null, false);
+    const psize_ix = g.nvars - 1;
     g.declare(.{ .name = "gl_VertexID", .ty = INT, .at = g.imms(INT, &.{r(k.mov(.i32, r(io.vertex_id)))}).at, .ro = true });
     g.declare(.{ .name = "gl_InstanceID", .ty = INT, .at = g.imms(INT, &.{r(k.mov(.i32, r(io.instance_id)))}).at, .ro = true });
     var outs: [64]Out = undefined;
@@ -2563,6 +2567,7 @@ pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexI
     runMain(&g, main);
     const pos = g.st.vars[pos_ix];
     for (0..4) |c| io.position[c] = asF32(&g, g.cp(pos.at, @intCast(c)));
+    if (s.checker.uses_point_size) io.point_size = asF32(&g, g.cp(g.st.vars[psize_ix].at, 0));
     for (outs[0..nouts]) |o| {
         if (o.word == 0xffff_ffff) continue;
         const v = g.st.vars[o.var_ix];
@@ -2587,7 +2592,8 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     const v4 = sema.vecT(.float, 4);
     g.declare(.{ .name = "gl_FragCoord", .ty = v4, .at = g.imms(v4, &.{ r(io.frag_coord[0]), r(io.frag_coord[1]), r(io.frag_coord[2]), r(io.frag_coord[3]) }).at, .ro = true });
     g.declare(.{ .name = "gl_FrontFacing", .ty = BOOL, .at = g.imms(BOOL, &.{if (io.front_facing == .none) u(1) else r(io.front_facing)}).at, .ro = true });
-    g.declare(.{ .name = "gl_PointCoord", .ty = sema.vecT(.float, 2), .at = g.imms(sema.vecT(.float, 2), &.{ f(0), f(0) }).at, .ro = true });
+    const pc = [2]Arg{ if (io.point_coord[0] == .none) f(0) else r(io.point_coord[0]), if (io.point_coord[1] == .none) f(0) else r(io.point_coord[1]) };
+    g.declare(.{ .name = "gl_PointCoord", .ty = sema.vecT(.float, 2), .at = g.imms(sema.vecT(.float, 2), &pc).at, .ro = true });
     g.bind("gl_FragColor", v4, null, false);
     const color_ix = g.nvars - 1;
     var fd_t = v4;
@@ -2595,6 +2601,7 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     g.bind("gl_FragData", fd_t, null, false);
     const data_ix = g.nvars - 1;
     g.bind("gl_FragDepth", FLOAT, null, false);
+    const depth_ix = g.nvars - 1;
     g.discard = k.reg(.pred);
     k.set(g.discard, .mov, u(0), no, no);
     var outs: [64]Out = undefined;
@@ -2602,24 +2609,45 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     const main = globals(&g, null, io, &outs, &nouts);
     g.nglobals = g.nvars;
     runMain(&g, main);
-    // the color: location 0's output, else gl_FragColor (or gl_FragData[0])
-    var color: [4]Arg = .{ f(0), f(0), f(0), f(1) };
+    // the colors: location n's output, else gl_FragData[n], else
+    // gl_FragColor (every draw buffer's); location 0 (0, 0, 0, 1) without
+    const NT = raster.MAX_TARGETS;
+    var color: [NT][4]Arg = undefined;
+    var have = [_]bool{false} ** NT;
+    color[0] = .{ f(0), f(0), f(0), f(1) };
+    have[0] = true;
     if (s.checker.uses_frag_data) {
-        for (0..4) |c| color[c] = g.cp(g.st.vars[data_ix].at, @intCast(c));
+        for (0..4) |t| {
+            for (0..4) |c| color[t][c] = g.cp(g.st.vars[data_ix].at, @intCast(4 * t + c));
+            have[t] = true;
+        }
     } else if (s.checker.version < 300) {
-        for (0..4) |c| color[c] = g.cp(g.st.vars[color_ix].at, @intCast(c));
+        for (0..NT) |t| {
+            for (0..4) |c| color[t][c] = g.cp(g.st.vars[color_ix].at, @intCast(c));
+            have[t] = true;
+        }
     }
     for (outs[0..nouts]) |o| {
-        if (o.loc != 0) continue;
         const v = g.st.vars[o.var_ix];
-        const n = @min(g.size(v.ty.elem()), 4);
-        for (0..n) |ix| {
-            const i_: u32 = @intCast(ix);
-            color[ix] = g.convert(g.cp(v.at, i_), g.baseAt(v.ty, i_), .float);
+        const elem = g.size(v.ty.elem());
+        const n_el: u32 = if (v.ty.array != 0) v.ty.array else 1;
+        for (0..n_el) |j| {
+            const loc = o.loc + @as(u32, @intCast(j));
+            if (loc >= NT) break;
+            color[loc] = .{ f(0), f(0), f(0), f(1) };
+            have[loc] = true;
+            for (0..@min(elem, 4)) |ix| {
+                const i_: u32 = @intCast(j * elem + ix);
+                color[loc][ix] = g.convert(g.cp(v.at, i_), g.baseAt(v.ty, i_), .float);
+            }
         }
-        break;
     }
-    for (0..4) |c| io.color[c] = asF32(&g, color[c]);
+    for (0..4) |c| io.color[c] = asF32(&g, color[0][c]);
+    for (1..NT) |t| {
+        if (!have[t]) continue;
+        for (0..4) |c| io.colors[t][c] = asF32(&g, color[t][c]);
+    }
+    if (s.checker.uses_frag_depth) io.depth = asF32(&g, g.cp(g.st.vars[depth_ix].at, 0));
     io.discard = g.discard;
     io.derivatives = g.derivatives;
     if (g.nderivs > 0) flattenDerivs(k, lo, g.st, g.st.derivs[0..g.nderivs]);

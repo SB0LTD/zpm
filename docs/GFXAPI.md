@@ -11,7 +11,7 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 | `gfxapi.sig` | The module root (`gfxapi` in zpm's build). |
 | `engine.sig` | Images in GPU memory, filled and copied by KIR kernels through any `gpu.Device`. It batches work, waits only where needed, keeps the caches in step, and falls back to the CPU. |
 | `gles.sig` | OpenGL ES 3.0's objects and state: what the C entry points call. |
-| `raster.sig` | Drawing: GL's draws as KIR kernels (vertices, triangle setup, bins, tiles), the same on every GPU and on the CPU. |
+| `raster.sig` | Drawing: GL's and Vulkan's draws as KIR kernels (vertices, primitive setup, bins, tiles), the same on every GPU and on the CPU: triangles, points and lines; multisampling; several colour targets; stencil; depth bias, `gl_FragDepth`, clip distances. |
 | `glenum.sig` | GL's enum values. |
 | `texture.sig` | Texture reads in KIR: `texelFetch`, sampled reads (nearest, bilinear or trilinear; repeat, clamp, mirrored repeat; the level of detail implicit, given or from gradients), `textureSize`, one code for every format. |
 | `texfmt.sig` | GL ES's texture formats as the engine stores them: each upload GL allows, its conversion and its swizzle. |
@@ -82,9 +82,40 @@ Coverage is integer arithmetic, and every float operation is one KIR defines bit
 Culling 64 triangles at a time and binning cut the work a tile does for the triangles that miss it. On a 200×136 scene of 262 triangles, KIR's interpreter runs 167 million thread-instructions with the kernels before binning, 49 million unbinned and 43 million binned. Most of what remains is shading. Binning saves more as a target and its triangle count grow.
 
 - **Color targets** are RGBA8, BGRA8, RG8 and R8 (WebRender's masks): 4, 2 or 1 bytes a pixel, loaded and stored at their width. An RG8 or R8 pixel's channels are RGBA8's first bytes: what it lacks reads 0, and alpha 1. Clears, color masks, copies and reads take them too.
+- **Primitives.** Besides triangles (lists, strips, fans), the setup kernel takes:
+  - **points**: a square sprite `gl_PointSize` pixels a side (1 to 1024) about the vertex, as two triangles; the half-open square's pixel centers are its pixels. `gl_PointCoord` is two planes across it (s right, t down, as GL and Vulkan have it). A point whose vertex is outside the clip volume is dropped, sprite and all.
+  - **lines** (lists, strips, loops), one pixel wide. Single-sampled, a line is a record of its own, and the tile kernel covers it by GL's and Vulkan's diamond-exit rule: a pixel is drawn when the line crosses its diamond (|x - cx| + |y - cy| < 1/2) and does not end in it. The test is exact in integers: the diamond is the square |u - uc|, |v - vc| < 8 (u = x + y, v = x - y, 1/16 pixel), tested by separating axes, with the ends nudged by an infinitesimal (d, d'), d >> d' > 0, so a line through a diamond's corner falls one way. A strip's shared vertices are drawn once. Varyings go along the line (t the center's projection, perspective-correct). Multisampled, a line is a rectangle one pixel wide with square ends (two triangles), as GL ES 3.0 and Vulkan say.
+- **Multisampling** (2x, 4x, 8x). A multisampled image (`Image.samples`) keeps a pixel's samples side by side in its row. The tile kernel tests each sample against the edges at Vulkan's standard sample positions (`raster.sample_pos`, the raster's y up), runs the fragment code once a pixel (varyings at the center), and gives each covered sample its own depth (the depth plane at the sample), its own depth and stencil tests and stencil operations, and its own blend. Alpha to coverage (output 0's alpha takes its share of the samples) and the sample mask apply. The samples' words live in shared memory, each thread its own, so a variant's registers stay those of one pixel. A resolve (`Engine.resolve`, GL's blit of a multisampled framebuffer) averages each colour byte (rounded half up) and takes sample 0 of depth and stencil.
+- **Colour targets.** One pipeline draws up to 8 targets at once: output i into target i (`Draw.targets`), each with its own format, colour mask, and blending on or off. The factors and equations are one set for all of them (GL ES 3.0's state, Vulkan without `independentBlend`). A draw may have none (`Draw.color_off`: depth and stencil only).
+- **Depth and stencil.** Depth bias (`glPolygonOffset`, Vulkan's depth bias, with its clamp) moves a triangle's depth plane by factor × max(|dz/dx|, |dz/dy|) + units × 2^-24. A program writing `gl_FragDepth` has its depth and stencil tests after its fragment code. Clip distances are interpolated like varyings, and a sample whose distance is below 0 at its pixel's center is out (clipping per pixel).
+- **Primitive restart.** The restart index's vertex is marked in its record, and a strip or fan starts anew after it: the setup kernel finds the last restart before its triangle (only when the draw has one: the vertex kernel sets a word), so a new strip's first triangle is even and a new fan's center is the vertex after the restart.
+- **Kernel variants.** A pipeline's tile kernel is built for each `raster.Variant` its draws need (stencil, samples, targets, lines) and its setup kernel for each `raster.SetupKind`, at the first such draw, and kept (`Pipeline.more`).
 - **Derivatives.** A fragment shader that takes them (`dFdx`, `dFdy`, `fwidth`) runs whole 2×2 quads. A quad with a pixel to draw runs the code in all four, and the pixels not drawn are helpers. A derivative is the difference with the quad's neighbour, through a shuffle. The tile's lanes are its pixels in order, so the neighbours are lanes `xor 1` and `xor 8`. Programs without derivatives run covered pixels alone.
 
 On the CPU (no GPU, or it is lost), KIR's interpreter runs the same kernels on the images' memory.
+
+#### The raster's API (for the Vulkan driver)
+
+The changes are additive; a draw that sets none of the new fields draws as before.
+
+- `raster.Topology`: `.points`, `.lines`, `.line_strip`, `.line_loop` besides the triangles.
+- `raster.Draw`:
+  - `targets: [MAX_TARGETS]?Target` (`Target{ img, keep, blend }`): fragment output i into `targets[i]` for i ≥ 1; output 0 into `color` unless `color_off`. Vulkan's colour attachments in one draw, in place of one pipeline per attachment.
+  - `color_off`: no colour target 0 (depth-only and stencil-only passes; `color` only names the size).
+  - `sample_mask` (Vulkan's `pSampleMask`), `alpha_to_coverage`.
+  - `bias_factor`, `bias_units`, `bias_clamp` (Vulkan's `depthBiasSlopeFactor`, `depthBiasConstantFactor`, `depthBiasClamp`; units of 2^-24).
+  - `prims()`, `records()`, `samples()`, `setupKind()`, `variant()`; `triangles()` stays (it counts primitives).
+- `raster.Shaders`: `point_size` (the vertex code sets `VertexIO.point_size`), `point_coord` (the fragment code reads `FragmentIO.point_coord`), `frag_depth` (it sets `FragmentIO.depth`), `clips` (the vertex code sets `VertexIO.clip[0..clips]`).
+- `raster.FragmentIO.colors[1..]`: outputs past location 0.
+- `engine.Image.samples`, `Engine.newImageSamples(w, h, format, samples)`, `Engine.resolve(src, dst, rect)` (Vulkan's resolve attachments and `vkCmdResolveImage`). `Engine.fill` and `Engine.copy` take multisampled images (every sample).
+- `raster.sample_pos` / `samplePositions(n)`: the sample positions in 1/16 pixel with the raster's y up, which are Vulkan's standard ones in a y-down framebuffer (`standardSampleLocations`).
+- The tile kernel's bindings: colour, depth, primitive records, uniforms, the textures, the query word, the stencil image (stencil variants), then targets 1.. in order (the bits of `Variant.targets`). On sig-vulkan, `Shaders.buffers` come after the textures; merged, the order is textures, buffers, query, stencil, targets.
+- Limits to report: 8 colour attachments, sample counts 1, 2, 4 and 8 for colour, depth and stencil, `pointSizeRange` 1..1024, line width 1 (no `wideLines`), 8 clip distances, no `independentBlend` (per-attachment blend enable and write mask hold), no `sampleRateShading`.
+- The stencil tile kernel of a large program now compiles for sm_120 (below), so stencil draws need no CPU fallback.
+
+#### Stencil on the RTX
+
+The stencil tile kernel of a lit, textured program failed on sm_120 with `TooManyRegs`, and its draws ran on the CPU. It was not register pressure: the kernel takes 128 general registers (the plain one 116, of 253). The stencil code keeps more predicates live through the fragment code (the depth and stencil results, the face, the clip test) than the six predicate registers hold, so kir_sm120 homes the rest in general registers and moves each through a scratch predicate where an instruction reads it. It kept two scratch predicates, P5 and P6, and an instruction reading three such predicates (a `PLOP3` of three, or a compare's accumulator with a guard) had nowhere to put the third. The fix is in kir_sm120's allocator, where the limit was: when an instruction needs more scratch predicates than are left, the allocation gives up one more predicate register (down to P0..P2 allocated, P3..P6 scratch, enough for a `PLOP3`'s three and a guard) and allocates again. Splitting the kernel would only have moved the limit; any program with enough live conditions would hit it again.
 
 Shaders are KIR emitters (`raster.Shaders`): a GLSL program's (below), or the driver's own (`usePipeline`). A draw has up to 60 scalar varyings (GL ES's 15 vectors). A flat varying keeps the provoking vertex's bits, so an integer's survive.
 
@@ -330,12 +361,20 @@ That makes 187 GL entry points.
 - primitive restart at the fixed index: the restart index's vertex is out, so the triangles with it are dropped;
 - the limits WebGL 2 reads at a context's start, and `glGetIntegeri_v`, `glGetInteger64i_v` and `glGetInternalformativ`. There are 24 new GL entry points.
 
+**Stage 5i, the raster for WebGL 2 and WebGPU:**
+- multisampling 2x, 4x, 8x: per-sample coverage, depth, stencil and blending; alpha to coverage, `glSampleCoverage`; `glRenderbufferStorageMultisample` (the fewest samples at least those asked), `FRAMEBUFFER_INCOMPLETE_MULTISAMPLE`, `SAMPLES`, `SAMPLE_BUFFERS`, `MAX_SAMPLES` 8, and `glGetInternalformativ`'s counts (8, 4, 2); a multisampled framebuffer resolved by `glBlitFramebuffer` (1:1, as ES 3.0 says) and refused by `glReadPixels` and the copies;
+- points (`gl_PointSize`, `gl_PointCoord`), lines by the diamond-exit rule, line strips and loops; `ALIASED_POINT_SIZE_RANGE` 1..1024, `glLineWidth` (lines stay one pixel wide);
+- several draw buffers in one draw: `glDrawBuffers`, GLSL ES 3.00 outputs at locations 1..3, `gl_FragData[n]`, 1.00's `gl_FragColor` to every draw buffer; draws with no colour buffer (depth only);
+- `glPolygonOffset` and `POLYGON_OFFSET_FILL`; `gl_FragDepth`; clip distances in the raster (Vulkan's; GLSL ES 3.00 has none);
+- primitive restart in strips and fans starts a new strip or fan;
+- stencil draws of large programs on the RTX: kir_sm120 refused their tile kernel with `TooManyRegs`, because an instruction read more predicates living in registers than it had scratch predicates (below).
+
+That makes 3 more GL entry points (`glPolygonOffset`, `glSampleCoverage`, `glLineWidth`).
+
 **Not yet:**
-- points and lines (transform feedback captures them);
-- primitive restart in a strip continues the strip's winding (GL starts a new strip);
 - compressed textures: ETC2 and EAC uploads fail with INVALID_ENUM;
-- clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped;
-- stencil tests, several color attachments, depth-only drawing;
+- clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped (a line likewise); a point is dropped by its vertex, as GL says;
+- lines wider than a pixel; sample shading; a line loop's closing line across a restart;
 - half-float and packed attribute formats, divisors past 1, attribute arrays in client memory;
 - framebuffer attachments and copies of texture levels past 0, other texture targets, the texture formats listed under Textures;
 - multisampling;
@@ -357,7 +396,7 @@ sig build test-gfxapi
   - `textureSize`, a unit with no texture, a sampler object's filter over its texture's;
   - a quad whose corners its vertex shader fetches from a float texture.
 
-  The cases are drawn in two halves, each on a fresh device: the emulated Adreno's memory is 64 buffers, never freed.
+  The cases are drawn in two halves, each on a fresh device: the emulated Adreno's memory is 128 buffers, never freed.
 - `test-gfxapi-mip`: mipmaps on the CPU, on `EmuDevice` and on the emulated Adreno (ir3), the same bytes and the texels GL says. It uses a texture of five levels, each one color, drawn on quads of 16, 8, 4, 2 and 1 pixels (the implicit LOD picks levels 0 to 4). The other cases:
   - `textureLod`, trilinear between two levels, `textureGrad`, a bias;
   - `texelFetch` and `textureSize` of a level, a base level of 1;
@@ -388,6 +427,15 @@ sig build test-gfxapi
   - Blits: 1:1, flipped and scaled 2×, a bilinear 2:1 downscale, under a scissor box, into BGRA8 and R8, depth and stencil together and depth alone.
   - Fences waited on and queried.
   - The errors GL gives for each.
+- `test-gfxapi-raster`: the raster past one target of triangles, on the CPU and on the emulated RTX (sm_120 in `sm120_emu`), the same bytes from both and the bytes rules written in the test say:
+  - multisampled coverage at 2x, 4x and 8x: two triangles off the grid sharing an edge, added, every sample against exact edge functions at the sample positions (no sample twice, none missed), and the resolve against each pixel's samples averaged;
+  - multisampled depth (two triangles crossing: pixels with samples of both), stencil, alpha to coverage and the sample mask;
+  - points of sizes 1 to 8 (the half-open squares, `gl_PointCoord` as setup's planes give it), single- and multisampled;
+  - 15 lines (level, upright, diagonal, on pixel centers and on the edges between them, both ways, shallow, steep, short) against the diamond-exit rule in f64 with the ends nudged; multisampled lines against their rectangles; strips and loops sharing their vertices' pixels once;
+  - four targets of three formats (RGBA8, BGRA8, R8) from one pipeline, a colour mask and blending on one, single- and 4x multisampled;
+  - depth bias (units, slope, clamp), `gl_FragDepth`, a clip distance; primitive restart starting a new strip and a new fan, back faces culled;
+  - every variant's tile and setup kernels compile for ir3 and sm_120;
+  - through GL: a lit, textured program's stencil draws into a 4x framebuffer on the RTX (its stencil kernel compiled for sm_120, no draw on the CPU), resolved by a blit; two draw buffers; points; lines, strips and loops; polygon offset.
 - `test-gfxapi-webrender`: WebRender's shaders, read from a Firefox checkout's `gfx/wr/webrender/res` (`GFXAPI_WR_RES`; skipped without it, since Mozilla's sources stay out of zpm).
   - The 46 variants a GLES device builds are assembled as `webrender_build` assembles them (its defines, its `#include`s), then compiled and linked through GL's program objects.
   - Each program's vertex, setup and tile kernels are compiled for the Adreno's ir3. All must succeed.

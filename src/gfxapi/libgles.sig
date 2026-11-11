@@ -1346,6 +1346,21 @@ pub export fn glDepthFunc(func: u32) callconv(.c) void {
     defer driverLeave();
     if (cur()) |c| c.depthFunc(func);
 }
+pub export fn glPolygonOffset(factor: f32, units: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.polygonOffset(factor, units);
+}
+pub export fn glSampleCoverage(value: f32, invert: u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.sampleCoverage(value, invert != 0);
+}
+pub export fn glLineWidth(w: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.lineWidth(w);
+}
 pub export fn glDepthRangef(n: f32, f_: f32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
