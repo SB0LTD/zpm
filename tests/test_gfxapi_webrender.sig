@@ -21,6 +21,16 @@
 //! For a different Firefox release, set GFXAPI_WR_VARIANTS to a manifest
 //! from that release's get_shader_features, one shader:FEATURE,FEATURE
 //! per line. The colon is required even when there are no features.
+//! tests/webrender_variants_151.txt is Firefox 151's (Galaxy's), for a
+//! GLES device with external textures, dithering and the debug shaders.
+//! Its optimized shaders are not another set to check here: a Linux
+//! Firefox carries them for desktop GL only (webrender's build.rs), so on
+//! GLES it builds these either way.
+//!
+//! The same checks run over Xwayland's glamor (the second test): every
+//! program glamor 24.1 builds on a GLES 3 context, from a directory
+//! GFXAPI_GLAMOR_SHADERS names (tests/generate_glamor_shaders.py writes
+//! it from Xwayland's source; X.Org's, MIT); skipped without it.
 //!
 //! The variants are webrender_build's `get_shader_features` for a GLES
 //! device with external textures (ESSL 3 and 1), dithering, every path
@@ -352,15 +362,17 @@ fn runTileSeed(pipe: *const raster.Pipeline, uniforms: []const u32, nslots: usiz
     const draw = raster.Draw{ .pipe = pipe, .color = &color, .rect = .{ .x0 = 0, .y0 = 0, .x1 = 8, .y1 = 8 }, .count = 3 * TILE_TRIS };
     var rp: [raster.RASTER_PARAMS]u32 = undefined;
     const params = raster.rasterParams(&draw, .{}, &rp);
-    var bufs: [4 + texture.MAX_TEX]gpu.Buffer = undefined;
+    // (color, depth, triangles, uniforms, the textures, an occlusion
+    // query's word)
+    var bufs: [5 + texture.MAX_TEX]gpu.Buffer = undefined;
     const ntex: usize = pipe.shaders.textures;
-    const nb = 4 + ntex;
+    const nb = 5 + ntex;
     for (bufs[0..nb], 0..) |*b, i| {
         const bytes: u64 = switch (i) {
             2 => TILE_TRIS * @as(u64, pipe.sstride) * 4,
             3 => (uniforms.len + nslots * texture.DESC_WORDS + 4) * 4,
             0, 1 => 256,
-            else => if (seed != 0) FUZZ_SIDE * FUZZ_SIDE * @as(u64, fmt.bytes()) else 256,
+            else => if (i == nb - 1) 256 else if (seed != 0) FUZZ_SIDE * FUZZ_SIDE * @as(u64, fmt.bytes()) else 256,
         };
         b.* = try d.alloc(bytes, .host);
         @memset(b.cpu, 0);
@@ -436,6 +448,101 @@ fn head(s: []const u8, lines: usize) []const u8 {
     return s;
 }
 
+/// What a set of programs came to.
+const Stats = struct { failed: usize = 0, ran_bad: usize = 0, ran_long: usize = 0, no_code: usize = 0, reported: usize = 0 };
+
+/// One program (`vs` and `fs`, named `name` [`features`]): compiled and
+/// linked through GL's objects, its draw kernels built and compiled for
+/// each GPU, its tile kernel run on the emulated RTX (neutral and random
+/// inputs, the warps in each order); what went wrong counted in `stats`.
+fn checkProgram(c: *gles.Context, name: []const u8, features: []const u8, vs: [:0]const u8, fs: [:0]const u8, stats: *Stats) !void {
+    const sv = program.createShader(c, g.VERTEX_SHADER);
+    const sf = program.createShader(c, g.FRAGMENT_SHADER);
+    defer program.deleteShader(c, sv);
+    defer program.deleteShader(c, sf);
+    var why: []const u8 = "";
+    var what: []const u8 = "link";
+    for ([_]u32{ sv, sf }, [_][:0]const u8{ vs, fs }, [_][]const u8{ "vertex", "fragment" }) |s, src, stage| {
+        const parts = [_]?[*]const u8{src.ptr};
+        program.shaderSource(c, s, 1, &parts, null);
+        program.compileShader(c, s);
+        var ok: i32 = 0;
+        program.getShaderiv(c, s, g.COMPILE_STATUS, &ok);
+        if (ok != 1 and why.len == 0) {
+            var len: i32 = 0;
+            program.getShaderInfoLog(c, s, log.len, &len, &log);
+            why = log[0..@intCast(len)];
+            what = stage;
+        }
+    }
+    const p = program.createProgram(c);
+    defer program.deleteProgram(c, p);
+    if (why.len == 0) {
+        program.attachShader(c, p, sv);
+        program.attachShader(c, p, sf);
+        program.linkProgram(c, p);
+        var ok: i32 = 0;
+        program.getProgramiv(c, p, g.LINK_STATUS, &ok);
+        if (ok != 1) {
+            var len: i32 = 0;
+            program.getProgramInfoLog(c, p, log.len, &len, &log);
+            why = log[0..@intCast(len)];
+            if (why.len == 0) why = "(no log)";
+        }
+    }
+    if (why.len > 0) {
+        stats.failed += 1;
+        std.debug.print("FAIL {s} [{s}] {s}: {s}\n", .{ name, features, what, head(why, 3) });
+        _ = c.getError();
+        return;
+    }
+    // the draw kernels, for each GPU
+    program.useProgram(c, p);
+    const ds = program.drawState(c) orelse return error.NoPipeline;
+    std.debug.print("ok   {s} [{s}]", .{ name, features });
+    for (targets) |t| {
+        for ([_]Stage{ .vertex, .setup, .raster }) |st| {
+            const r = compileStage(ds.pipe, st, t) catch |e| {
+                if (t.required) stats.no_code += 1 else stats.reported += 1;
+                std.debug.print(" {s} {s}: {s} ({d} KIR)", .{ t.name, @tagName(st), @errorName(e), last_insts });
+                continue;
+            };
+            if (st == .raster) std.debug.print(" | {s} raster {d} KIR, {d} regs, {d} B", .{ t.name, r.insts, r.regs, r.bytes });
+            if (t.caps.target == .sm_120) {
+                if (st == .vertex) std.debug.print(" | sm_120 vertex {d} KIR, {d} instrs, {d} regs, {d} us", .{ r.insts, r.mi, r.regs, @divTrunc(r.ns, 1000) });
+                if (r.insts > max_kir) max_kir = r.insts;
+                if (r.mi > max_mi) max_mi = r.mi;
+                if (r.ns > max_ns) {
+                    max_ns = r.ns;
+                    const named = std.fmt.bufPrint(&max_what, "{s} [{s}] {s}", .{ name, features, @tagName(st) }) catch "";
+                    max_what_len = named.len;
+                }
+            }
+        }
+    }
+    std.debug.print("\n", .{});
+    // the tile kernel on the emulated RTX, the warps in each order,
+    // with neutral inputs (seed 0) and random ones
+    for ([_]u64{ 0, 1, 2, 3 }) |seed| {
+        for ([_]bool{ false, true }) |reverse| {
+            var why_run: [512]u8 = undefined;
+            const bad = runTileSeed(ds.pipe, ds.uniforms, ds.slots.len, reverse, seed, &why_run) catch |e| blk: {
+                break :blk std.fmt.bufPrint(&why_run, "{s}", .{@errorName(e)}) catch "?";
+            };
+            if (bad) |s| {
+                if (std.mem.startsWith(u8, s, "Timeout")) {
+                    stats.ran_long += 1;
+                    continue;
+                }
+                stats.ran_bad += 1;
+                std.debug.print("RUN  {s} [{s}] tile on the emulated RTX, seed {d}{s}: {s}\n", .{ name, features, seed, if (reverse) " (warps reversed)" else "", s });
+            }
+        }
+    }
+    program.useProgram(c, 0);
+    _ = c.getError();
+}
+
 test "webrender: every shader variant compiles and links" {
     const io = std.testing.io;
     var fba = std.heap.FixedBufferAllocator.init(&env_mem);
@@ -454,105 +561,69 @@ test "webrender: every shader variant compiles and links" {
     const c = &ctx;
     c.init(&eng, &objs);
     defer c.deinit();
-    var failed: usize = 0;
-    var ran_bad: usize = 0;
-    var ran_long: usize = 0;
-    var no_code: usize = 0;
-    var reported: usize = 0;
+    var st = Stats{};
     const selected = try selectedVariants(io, fba.allocator());
     for (selected) |v| {
         const vs = try build(dir, io, v, true, &vs_buf, &builder);
         const fs = try build(dir, io, v, false, &fs_buf, &builder);
-        const sv = program.createShader(c, g.VERTEX_SHADER);
-        const sf = program.createShader(c, g.FRAGMENT_SHADER);
-        defer program.deleteShader(c, sv);
-        defer program.deleteShader(c, sf);
-        var why: []const u8 = "";
-        var what: []const u8 = "link";
-        for ([_]u32{ sv, sf }, [_][:0]const u8{ vs, fs }, [_][]const u8{ "vertex", "fragment" }) |s, src, stage| {
-            const parts = [_]?[*]const u8{src.ptr};
-            program.shaderSource(c, s, 1, &parts, null);
-            program.compileShader(c, s);
-            var ok: i32 = 0;
-            program.getShaderiv(c, s, g.COMPILE_STATUS, &ok);
-            if (ok != 1 and why.len == 0) {
-                var len: i32 = 0;
-                program.getShaderInfoLog(c, s, log.len, &len, &log);
-                why = log[0..@intCast(len)];
-                what = stage;
-            }
-        }
-        const p = program.createProgram(c);
-        defer program.deleteProgram(c, p);
-        if (why.len == 0) {
-            program.attachShader(c, p, sv);
-            program.attachShader(c, p, sf);
-            program.linkProgram(c, p);
-            var ok: i32 = 0;
-            program.getProgramiv(c, p, g.LINK_STATUS, &ok);
-            if (ok != 1) {
-                var len: i32 = 0;
-                program.getProgramInfoLog(c, p, log.len, &len, &log);
-                why = log[0..@intCast(len)];
-                if (why.len == 0) why = "(no log)";
-            }
-        }
-        if (why.len > 0) {
-            failed += 1;
-            std.debug.print("FAIL {s} [{s}] {s}: {s}\n", .{ v.name, v.features, what, head(why, 3) });
-            _ = c.getError();
-            continue;
-        }
-        // the draw kernels, for each GPU
-        program.useProgram(c, p);
-        const ds = program.drawState(c) orelse return error.NoPipeline;
-        std.debug.print("ok   {s} [{s}]", .{ v.name, v.features });
-        for (targets) |t| {
-            for ([_]Stage{ .vertex, .setup, .raster }) |st| {
-                const r = compileStage(ds.pipe, st, t) catch |e| {
-                    if (t.required) no_code += 1 else reported += 1;
-                    std.debug.print(" {s} {s}: {s} ({d} KIR)", .{ t.name, @tagName(st), @errorName(e), last_insts });
-                    continue;
-                };
-                if (st == .raster) std.debug.print(" | {s} raster {d} KIR, {d} regs, {d} B", .{ t.name, r.insts, r.regs, r.bytes });
-                if (t.caps.target == .sm_120) {
-                    if (st == .vertex) std.debug.print(" | sm_120 vertex {d} KIR, {d} instrs, {d} regs, {d} us", .{ r.insts, r.mi, r.regs, @divTrunc(r.ns, 1000) });
-                    if (r.insts > max_kir) max_kir = r.insts;
-                    if (r.mi > max_mi) max_mi = r.mi;
-                    if (r.ns > max_ns) {
-                        max_ns = r.ns;
-                        const named = std.fmt.bufPrint(&max_what, "{s} [{s}] {s}", .{ v.name, v.features, @tagName(st) }) catch "";
-                        max_what_len = named.len;
-                    }
-                }
-            }
-        }
-        std.debug.print("\n", .{});
-        // the tile kernel on the emulated RTX, the warps in each order,
-        // with neutral inputs (seed 0) and random ones
-        for ([_]u64{ 0, 1, 2, 3 }) |seed| {
-            for ([_]bool{ false, true }) |reverse| {
-                var why_run: [512]u8 = undefined;
-                const bad = runTileSeed(ds.pipe, ds.uniforms, ds.slots.len, reverse, seed, &why_run) catch |e| blk: {
-                    break :blk std.fmt.bufPrint(&why_run, "{s}", .{@errorName(e)}) catch "?";
-                };
-                if (bad) |s| {
-                    if (std.mem.startsWith(u8, s, "Timeout")) {
-                        ran_long += 1;
-                        continue;
-                    }
-                    ran_bad += 1;
-                    std.debug.print("RUN  {s} [{s}] tile on the emulated RTX, seed {d}{s}: {s}\n", .{ v.name, v.features, seed, if (reverse) " (warps reversed)" else "", s });
-                }
-            }
-        }
-        program.useProgram(c, 0);
-        _ = c.getError();
+        try checkProgram(c, v.name, v.features, vs, fs, &st);
     }
-    std.debug.print("webrender: {d} of {d} variants link; {d} kernels do not compile ({d} not required)\n", .{ selected.len - failed, selected.len, no_code, reported });
+    std.debug.print("webrender: {d} of {d} variants link; {d} kernels do not compile ({d} not required)\n", .{ selected.len - st.failed, selected.len, st.no_code, st.reported });
     std.debug.print("webrender on sm_120: the largest kernel {d} KIR, {d} machine instructions; the slowest compile {d} us ({s}); inside the backend at most {d} KIR expanded, {d} MI, {d} vregs\n", .{ max_kir, max_mi, @divTrunc(max_ns, 1000), max_what[0..max_what_len], max_xkir, max_xmi, max_vregs });
-    std.debug.print("webrender: {d} tile kernel runs on the emulated RTX went wrong, {d} ran past the step budget\n", .{ ran_bad, ran_long });
-    try std.testing.expectEqual(@as(usize, 0), failed);
-    try std.testing.expectEqual(@as(usize, 0), no_code);
-    try std.testing.expectEqual(@as(usize, 0), ran_bad);
+    std.debug.print("webrender: {d} tile kernel runs on the emulated RTX went wrong, {d} ran past the step budget\n", .{ st.ran_bad, st.ran_long });
+    try std.testing.expectEqual(@as(usize, 0), st.failed);
+    try std.testing.expectEqual(@as(usize, 0), st.no_code);
+    try std.testing.expectEqual(@as(usize, 0), st.ran_bad);
+}
+
+// ── Prebuilt program sets (Xwayland's glamor) ─────────────────────────────
+//
+// GFXAPI_GLAMOR_SHADERS: a directory of programs as glamor builds them on a
+// GLES 3 context (tests/generate_glamor_shaders.py makes it from Xwayland's
+// source): LIST names one per line (`name ...`; `#` lines are notes), each
+// as name.vert and name.frag. Every one goes through checkProgram, as
+// WebRender's variants do. Without it the test is skipped.
+
+var list_buf: [64 * 1024]u8 = undefined;
+
+test "glamor: every program Xwayland's glamor builds on GLES compiles, links and runs" {
+    const io = std.testing.io;
+    var fba = std.heap.FixedBufferAllocator.init(&env_mem);
+    const where = std.testing.environ.getAlloc(fba.allocator(), "GFXAPI_GLAMOR_SHADERS") catch |e| {
+        std.debug.print("glamor: GFXAPI_GLAMOR_SHADERS: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    var dir = std.Io.Dir.cwd().openDir(io, where, .{}) catch |e| {
+        std.debug.print("glamor: {s}: {s}\n", .{ where, @errorName(e) });
+        return error.SkipZigTest;
+    };
+    defer dir.close(io);
+    const list = try dir.readFile(io, "LIST", &list_buf);
+    if (list.len == list_buf.len) return error.ListTooLong;
+    eng.init(.{ .pool = &pool_mem, .cpu_work = &cpu_work });
+    defer eng.deinit();
+    objs.init();
+    const c = &ctx;
+    c.init(&eng, &objs);
+    defer c.deinit();
+    var st = Stats{};
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, list, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const name = line[0 .. std.mem.indexOfScalar(u8, line, ' ') orelse line.len];
+        var path: [160]u8 = undefined;
+        const vs_bytes = try dir.readFile(io, try std.fmt.bufPrint(&path, "{s}.vert", .{name}), vs_buf[0 .. vs_buf.len - 1]);
+        vs_buf[vs_bytes.len] = 0;
+        const fs_bytes = try dir.readFile(io, try std.fmt.bufPrint(&path, "{s}.frag", .{name}), fs_buf[0 .. fs_buf.len - 1]);
+        fs_buf[fs_bytes.len] = 0;
+        try checkProgram(c, name, "glamor", vs_buf[0..vs_bytes.len :0], fs_buf[0..fs_bytes.len :0], &st);
+        n += 1;
+    }
+    std.debug.print("glamor: {d} of {d} programs link; {d} kernels do not compile ({d} not required); {d} tile runs went wrong, {d} ran past the step budget\n", .{ n - st.failed, n, st.no_code, st.reported, st.ran_bad, st.ran_long });
+    try std.testing.expect(n > 0);
+    try std.testing.expectEqual(@as(usize, 0), st.failed);
+    try std.testing.expectEqual(@as(usize, 0), st.no_code);
+    try std.testing.expectEqual(@as(usize, 0), st.ran_bad);
 }

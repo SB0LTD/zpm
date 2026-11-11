@@ -322,7 +322,12 @@ def kir_words():
         (0x0000040F000F738C, 0x001E280000800000),  # ATOMS.MIN R15, [R0+0x4], R15
         (0x0000080F0011738C, 0x001E280001000200),  # ATOMS.MAX.S32 R17, [R0+0x8], R15
         (0x00000C110011738C, 0x001F220004000000),  # ATOMS.EXCH R17, [R0+0xc], R17
+        (0x00000004020673A9, 0x002EA200001EE105),  # ATOMG.E.CAS.STRONG.GPU PT, R6, [R2], R4, R5 (atom.global.cas.b32)
+        (0x000004060806738D, 0x004E240000000007),  # ATOMS.CAS R6, [R8+0x4], R6, R7 (atom.shared.cas.b32)
+        (0x0000000000097806, 0x000FCC00000E0100),  # VOTE.ANY R9, PT, P0 (vote.sync.ballot.b32)
     ]
+    cas = (0x00000004020673A9, 0x00000000001EE105 | CTL)
+    out += [field(cas, 40, 24, 0x10), field(cas, 40, 24, 0xFFFFF0), field(cas, 81, 3, 0)]
     atomg = (0x80000007080B79A8, 0x00000000081EF106 | CTL)
     atoms = (0x00000007000F738C, CTL)
     frnd = (0x0000000A00087307, 0x0000000000205000 | CTL)
@@ -341,7 +346,7 @@ def raw_kir(out_path, nvdisasm):
     words = kir_words()
     texts = disasm_raw(nvdisasm, words)
     out = [
-        "# FRND and the 32-bit atomics: ptxas's words and fields set, as nvdisasm -b SM120",
+        "# FRND, the 32-bit atomics and the ballot: ptxas's words and fields set, as nvdisasm -b SM120",
         f"# prints them ({version}). Test data only, made by tools/gen_sm120_vectors.py --raw-kir.",
         "# <hi>_<lo> <control> <disassembly>",
     ]

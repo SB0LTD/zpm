@@ -712,11 +712,50 @@ const Machine = struct {
             const new: u32 = switch (kind) {
                 .add => old +% v,
                 .xchg => v,
+                .@"and" => old & v,
+                .@"or" => old | v,
+                .xor => old ^ v,
                 .min => if (signed) (if (@as(i32, @bitCast(v)) < @as(i32, @bitCast(old))) v else old) else @min(old, v),
                 .max => if (signed) (if (@as(i32, @bitCast(v)) > @as(i32, @bitCast(old))) v else old) else @max(old, v),
             };
             std.mem.writeInt(u32, p, new, .little);
             d[t] = old;
+        }
+    }
+
+    fn cas(m: *Machine, in: Inst) Error!void {
+        const mem: kir.Mem = @bitCast(in.aux);
+        const off = m.src(in.a, m.sa);
+        const cmp = m.src(in.b, m.sb);
+        const val = m.src(in.c, m.sc);
+        const space = m.bytesOf(mem) orelse return m.fail(.bad_binding, 0, mem.binding, 0);
+        const d = m.file(in.dst);
+        for (m.lanes[0..m.n_lanes]) |t| {
+            const at = try m.addr(mem, off[t], t);
+            const p = space[at..][0..4];
+            const old = std.mem.readInt(u32, p, .little);
+            if (old == cmp[t]) std.mem.writeInt(u32, p, val[t], .little);
+            d[t] = old;
+        }
+    }
+
+    fn ballot(m: *Machine, in: Inst) void {
+        const p = m.src(in.a, m.sa);
+        const s = m.sub;
+        const lo: u32 = 32 * (in.aux & 3);
+        const d = m.file(in.dst);
+        var start: u32 = 0;
+        while (start < m.threads) : (start += s) {
+            const end = @min(start + s, m.threads);
+            var mask: u32 = 0;
+            for (start..end) |t| {
+                const ln: u32 = @as(u32, @intCast(t)) - start;
+                if (!has(&m.act, t) or p[t] == 0 or ln < lo or ln >= lo + 32) continue;
+                mask |= @as(u32, 1) << @intCast(ln - lo);
+            }
+            for (start..end) |t| {
+                if (has(&m.act, t)) d[t] = mask;
+            }
         }
     }
 
@@ -905,8 +944,10 @@ const Machine = struct {
             .ld => return m.load(in),
             .st => return m.store(in),
             .atom => return m.atom(in),
+            .cas => return m.cas(in),
             .shfl => return m.shfl(in),
             .vote => return m.vote(in),
+            .ballot => return m.ballot(in),
             else => {},
         }
         const a = m.src(in.a, m.sa);
@@ -1104,7 +1145,9 @@ fn prepare(code: []const Inst, regs: u32, match: []u32) Error!void {
                     .imm => if (nr != 1) return error.BadProgram,
                 }
             },
-            .atom => if (in.c != .imm or in.c.imm > @intFromEnum(kir.Atom.xchg)) return error.BadProgram,
+            .atom => if (in.c != .imm or in.c.imm > @intFromEnum(kir.Atom.xor)) return error.BadProgram,
+            .cas => if ((in.aux >> 8) & 3 > 1 or (in.aux >> 10) & 7 != 5) return error.BadProgram,
+            .ballot => if (in.aux > 3) return error.BadProgram,
             .icmp, .fcmp => if (in.aux > @intFromEnum(kir.Cmp.ge)) return error.BadProgram,
             .dot4 => if (in.aux > @intFromEnum(kir.Dot4.u8u8)) return error.BadProgram,
             .shfl => if (in.aux > @intFromEnum(kir.Shfl.down)) return error.BadProgram,
@@ -1120,8 +1163,8 @@ fn prepare(code: []const Inst, regs: u32, match: []u32) Error!void {
         }
         inline for (.{ in.a, in.b, in.c }, 0..) |arg, ix| {
             const used = switch (in.op) {
-                .mov, .ineg, .iabs, .not, .pnot, .fabs, .fneg, .ffloor, .fceil, .ftrunc, .frne, .fsqrt, .frcp, .frsq, .fexp2, .flog2, .fsin, .fcos, .cvt, .ld, .vote, .@"if", .brk, .cont => ix == 0,
-                .sel, .imad, .bfe, .dot4, .ffma, .fmad, .atom => true,
+                .mov, .ineg, .iabs, .not, .pnot, .fabs, .fneg, .ffloor, .fceil, .ftrunc, .frne, .fsqrt, .frcp, .frsq, .fexp2, .flog2, .fsin, .fcos, .cvt, .ld, .vote, .ballot, .@"if", .brk, .cont => ix == 0,
+                .sel, .imad, .bfe, .dot4, .ffma, .fmad, .atom, .cas => true,
                 .iadd, .isub, .imul, .imulhi, .imin, .imax, .@"and", .@"or", .xor, .shl, .shr, .icmp, .fcmp, .pand, .por, .fadd, .fsub, .fmul, .fmin, .fmax, .fdiv, .st, .shfl => ix < 2,
                 else => false,
             };

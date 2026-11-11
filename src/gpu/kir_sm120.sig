@@ -44,7 +44,10 @@
 //!    edge. Vectors (64- and 128-bit loads and stores) get aligned runs of
 //!    2 or 4 registers, addresses aligned pairs. Predicates get P0..P5;
 //!    when more are live, the rest live in general registers (0 or 1) and
-//!    are moved through P6 where an instruction reads or writes one.
+//!    are moved through scratch predicates (P6 down) where an instruction
+//!    reads or writes one: P5 and P6 at first, and as many more (P3..P6
+//!    at most) as the instruction reading the most of them needs (a
+//!    PLOP3's three and a guard), taken from the allocation.
 //! 6. **Dead code** (results nothing reads, after the folds) is dropped,
 //!    and the text goes to sm120_asm.
 //!
@@ -104,7 +107,7 @@ const sm120_asm = nvidia.sm120_asm;
 pub const MAX_INSTS = 16384;
 pub const MAX_VREGS = 16384;
 /// Machine instructions and labels before the text.
-pub const MAX_MI = 16384;
+pub const MAX_MI = 20480;
 pub const MAX_LOOPS = 256;
 pub const MAX_DEPTH = 32;
 pub const TEXT_BYTES = 1536 * 1024;
@@ -114,6 +117,9 @@ pub const MAX_GPR: u8 = 252;
 /// Predicates allocated (P6 is the scratch for those in registers).
 const PREDS: u8 = 6;
 const SCRATCH_P: u8 = 6;
+/// Predicates allocated at least when some live in registers: P3..P6 are
+/// then scratch, enough for a PLOP3's three and a guard.
+const MIN_PREDS: u8 = 3;
 
 pub const Error = kir.Error || sm120_asm.Error || error{
     /// A KIR form this backend does not compile (see the op's lowering).
@@ -264,6 +270,8 @@ pub const State = struct {
     phys: [MAX_VREGS]u8 = undefined,
     /// A predicate kept in a general register (its `home`).
     spilled: [MAX_VREGS]bool = undefined,
+    /// Predicates allocated (P0 up); the rest to P6 are scratch.
+    npreds: u8 = PREDS,
     /// liveness's scratch: a unit's definitions in a loop so far, and
     /// whether the loop carries it (Ctx.carriedIn).
     defs: [MAX_VREGS]u16 = undefined,
@@ -605,9 +613,9 @@ const Ctx = struct {
 
     fn uniformOp(c: *const Ctx, in: kir.Inst) bool {
         switch (in.op) {
-            .tid, .lane, .atom => return false,
+            .tid, .lane, .atom, .cas => return false,
             .gid, .gsize, .subgroup, .param => return true,
-            .vote => return true,
+            .vote, .ballot => return true,
             .shfl => return @as(kir.Shfl, @enumFromInt(in.aux)) == .idx and c.uniformArg(in.b),
             else => {},
         }
@@ -1030,7 +1038,7 @@ const Ctx = struct {
         var used = [_]bool{false} ** 256;
         for (c.insts()) |in| {
             switch (in.op) {
-                .ld, .st, .atom => {
+                .ld, .st, .atom, .cas => {
                     const m: kir.Mem = @bitCast(in.aux);
                     if (m.space == .global) {
                         used[m.binding] = true;
@@ -1061,14 +1069,14 @@ const Ctx = struct {
         if (to - from > limit) return false;
         for (c.w.insts[from..to]) |in| {
             switch (in.op) {
-                .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .fdiv, .fsqrt => return false,
+                .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .ballot, .fdiv, .fsqrt => return false,
                 .sel, .pand, .por, .pnot, .icmp, .fcmp => return false,
                 else => {},
             }
             // (a few ops lower to several instructions with predicates of
             // their own)
             if (in.op == .bfe and !(in.b == .imm and in.c == .imm)) return false;
-            if (in.op == .atom) return false;
+            if (in.op == .atom or in.op == .cas) return false;
         }
         return true;
     }
@@ -1409,6 +1417,7 @@ const Ctx = struct {
             .ld => try c.load(in),
             .st => try c.store(in),
             .atom => try c.atom(in),
+            .cas => try c.cas(in),
             .barrier => try c.eff("BAR.SYNC.DEFER_BLOCKING", 0, &.{.{ .imm = 0 }}),
             .shfl => {
                 const mode: kir.Shfl = @enumFromInt(in.aux);
@@ -1440,6 +1449,13 @@ const Ctx = struct {
                 const p = try c.pred(in.a);
                 try c.drainIfDivergent();
                 try c.eff(name, 1, &.{ pdst(in), p });
+            },
+            .ballot => {
+                // (a warp of 32: words past the first are 0)
+                if (in.aux != 0) return c.ins("MOV", 1, &.{ c.dst(in), .{ .imm = 0 } });
+                const p = try c.pred(in.a);
+                try c.drainIfDivergent();
+                try c.eff("VOTE.ANY", 2, &.{ c.dst(in), .{ .pt = true }, p });
             },
             .fsqrt => try c.sqrtNative(in),
             .fdiv => return error.Unsupported,
@@ -1951,6 +1967,9 @@ const Ctx = struct {
                 .min => if (sgn) "ATOMG.E.MIN.S32.STRONG.GPU" else "ATOMG.E.MIN.STRONG.GPU",
                 .max => if (sgn) "ATOMG.E.MAX.S32.STRONG.GPU" else "ATOMG.E.MAX.STRONG.GPU",
                 .xchg => "ATOMG.E.EXCH.STRONG.GPU",
+                .@"and" => "ATOMG.E.AND.STRONG.GPU",
+                .@"or" => "ATOMG.E.OR.STRONG.GPU",
+                .xor => "ATOMG.E.XOR.STRONG.GPU",
             };
             try c.eff(name, 2, &.{ .{ .pt = true }, c.dst(in), ad, v });
         } else {
@@ -1960,8 +1979,29 @@ const Ctx = struct {
                 .min => if (sgn) "ATOMS.MIN.S32" else "ATOMS.MIN",
                 .max => if (sgn) "ATOMS.MAX.S32" else "ATOMS.MAX",
                 .xchg => "ATOMS.EXCH",
+                .@"and" => "ATOMS.AND",
+                .@"or" => "ATOMS.OR",
+                .xor => "ATOMS.XOR",
             };
             try c.eff(name, 1, &.{ c.dst(in), ad, v });
+        }
+    }
+
+    /// A compare-and-swap: ptxas's atom.cas.b32. The global form has no
+    /// descriptor (its Rc takes the descriptor's bits): the plain 64-bit
+    /// address, [Ra+offset].
+    fn cas(c: *Ctx, in: kir.Inst) Error!void {
+        const m: kir.Mem = @bitCast(in.aux);
+        const expect = try c.reg(in.b);
+        const v = try c.reg(in.c);
+        if (m.space == .global) {
+            var ad = try c.gaddr(m, in.a);
+            ad.mem.desc = false;
+            ad.mem.wide = false;
+            try c.eff("ATOMG.E.CAS.STRONG.GPU", 2, &.{ .{ .pt = true }, c.dst(in), ad, expect, v });
+        } else {
+            const ad = try c.saddr(m, in.a);
+            try c.eff("ATOMS.CAS", 1, &.{ c.dst(in), ad, expect, v });
         }
     }
 
@@ -2220,9 +2260,18 @@ const Ctx = struct {
                 preds = PREDS - 1;
                 continue;
             }
+            // An instruction reads its spilled predicates through scratch
+            // ones (P6 down), its guard too: one reading more than the
+            // scratch left (a PLOP3 of three, a compare's accumulator and
+            // a guard) takes another predicate from the allocation.
+            if (spills > 0 and c.scratchNeed() > SCRATCH_P + 1 - preds and preds > MIN_PREDS) {
+                preds -= 1;
+                continue;
+            }
             w.stats.spills = spills;
             break;
         }
+        w.npreds = preds;
         // general registers: spilled predicates are homed in them
         var active: [MAX_GPR + 1]u16 = undefined;
         var n_active: usize = 0;
@@ -2247,6 +2296,31 @@ const Ctx = struct {
             active[n_active] = u;
             n_active += 1;
         }
+    }
+
+    /// The most scratch predicates an instruction needs: its distinct
+    /// spilled predicates read, its guard's among them.
+    fn scratchNeed(c: *const Ctx) u8 {
+        const w = c.w;
+        var most: u8 = 0;
+        for (w.mi[0..w.n_mi]) |*m| {
+            if (m.kind != .inst) continue;
+            var seen: [8]u16 = undefined;
+            var n: u8 = 0;
+            const reads = m.o[m.nd..m.n];
+            for (reads) |o| {
+                if (o != .pred or o.pred.v == NOV or !w.spilled[o.pred.v]) continue;
+                if (std.mem.indexOfScalar(u16, seen[0..n], o.pred.v) == null and n < seen.len) {
+                    seen[n] = o.pred.v;
+                    n += 1;
+                }
+            }
+            if (m.guard == .pred and w.spilled[m.guard.pred.v]) {
+                if (std.mem.indexOfScalar(u16, seen[0..n], m.guard.pred.v) == null) n += 1;
+            }
+            most = @max(most, n);
+        }
+        return most;
     }
 
     /// Whether unit `u` is read by the instruction at `pos` (so a value
@@ -2376,12 +2450,12 @@ const Ctx = struct {
                     if (x.v == m.guard.pred.v) have = true;
                 }
                 if (!have) {
-                    if (scratch < PREDS - 1) return error.TooManyRegs;
+                    if (scratch < w.npreds) return error.TooManyRegs;
                     try c.spillRead(&t, m.guard.pred.v, scratch, &map, &n_map);
                     scratch -= 1;
                 }
             }
-            if (scratch + 2 < SCRATCH_P) return error.TooManyRegs;
+            if (scratch + 1 < w.npreds) return error.TooManyRegs;
             var spilled_dst: ?u16 = null;
             if (m.guard != .none) {
                 t.str("@");

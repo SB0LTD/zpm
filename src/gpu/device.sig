@@ -45,6 +45,10 @@ pub const Caps = struct {
     /// zero-copy import of CPU memory (unified)
     import: bool,
     timestamp_hz: u64,
+    /// Dispatch.stamp is written (a GPU clock sample after the dispatch).
+    stamps: bool = false,
+    /// Dispatch.indirect is read on the GPU, when the dispatch runs.
+    indirect: bool = false,
     /// The most dispatches one run takes.
     max_run: u32 = 256,
 };
@@ -67,6 +71,8 @@ pub const interp_caps = Caps{
     .dot4 = true,
     .import = true,
     .timestamp_hz = 1_000_000_000,
+    .stamps = true,
+    .indirect = true,
 };
 
 pub const Kind = enum {
@@ -150,13 +156,22 @@ pub const Hazards = struct {
     /// Whether `d` must wait for the dispatches before it; then the barrier
     /// is counted as taken. d's accesses are noted either way.
     pub fn barrierBefore(h: *Hazards, d: *const Dispatch) bool {
-        var need = h.full;
+        // (a stamp waits for everything before it, and is a write; an
+        // indirect dispatch's counts are a read)
+        var need = h.full or d.stamp != null;
+        if (d.indirect) |ind| {
+            if (meets(h.written[0..h.nw], .{ ind.buf.gpu + ind.off, ind.buf.gpu + ind.off + 12 })) need = true;
+        }
         for (d.buffers, 0..) |b, i| {
             const r = rangeOf(b);
             if (meets(h.written[0..h.nw], r)) need = true;
             if (writes(d, i) and meets(h.read[0..h.nr], r)) need = true;
         }
         if (need) h.* = .{};
+        if (d.stamp) |s| {
+            h.written[h.nw] = .{ s.buf.gpu + s.off, s.buf.gpu + s.off + 16 };
+            h.nw += 1;
+        }
         for (d.buffers, 0..) |b, i| {
             const r = rangeOf(b);
             if (writes(d, i)) {
@@ -283,7 +298,18 @@ pub const Dispatch = struct {
     buffers: []const Buffer,
     /// the u32 words after them
     params: []const u32,
+    /// Where caps.stamps: once this dispatch and every one before it are
+    /// done, 16 bytes at buf+off (8-aligned): u32 1, u32 0, then the GPU
+    /// clock (u64, caps.timestamp_hz ticks). Vulkan's timestamp queries.
+    stamp: ?Stamp = null,
+    /// Where caps.indirect: the group counts are the three u32 at
+    /// buf+off (4-aligned) as the dispatches before this one left them
+    /// (`groups` is not read); a count of 0 runs nothing. Vulkan's
+    /// vkCmdDispatchIndirect without the CPU.
+    indirect: ?Stamp = null,
 };
+
+pub const Stamp = struct { buf: Buffer, off: u64 };
 
 pub const Error = error{ OutOfMemory, SubmitFailed, Timeout, DeviceLost, BadProgram, Unsupported };
 pub const Fence = u64;

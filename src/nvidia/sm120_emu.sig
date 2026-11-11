@@ -1245,8 +1245,11 @@ fn lea(op: *Op, in: *const Instr, o: []const Operand) Error!void {
 /// OR, XOR, EXCH), the old value to Rd.
 fn atomic(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Error!void {
     const global_ = eql(name, "ATOMG");
-    try count(in, if (global_) 4 else 3);
-    const ops = [_][]const u8{ "ADD", "MIN", "MAX", "INC", "DEC", "AND", "OR", "XOR", "EXCH" };
+    // (CAS: Rc stored where the old word equals Rb; ATOMG.E.CAS's address
+    // is 64 bits without .64)
+    const cas = in.has("CAS");
+    try count(in, @as(usize, if (global_) 4 else 3) + @intFromBool(cas));
+    const ops = [_][]const u8{ "ADD", "MIN", "MAX", "INC", "DEC", "AND", "OR", "XOR", "EXCH", "CAS" };
     op.kind = if (global_) .atomg else .atoms;
     op.sub = try cmpOf(in, &ops);
     op.signed = in.has("S32");
@@ -1259,9 +1262,10 @@ fn atomic(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Error
     op.d[0] = try dstOf(o[k]);
     if (o[k + 1] != .addr) return error.Syntax;
     const ad = o[k + 1].addr;
-    if (global_ != ad.wide or (!global_ and ad.desc != null)) return error.Unsupported;
-    op.mem = .{ .base = .{ .kind = .gpr, .n = ad.reg }, .wide = ad.wide, .offset = ad.offset };
+    if ((global_ and !cas) != ad.wide or (!global_ and ad.desc != null) or (cas and ad.desc != null)) return error.Unsupported;
+    op.mem = .{ .base = .{ .kind = .gpr, .n = ad.reg }, .wide = global_, .offset = ad.offset };
     op.s[0] = try srcOf(o[k + 2], .int);
+    if (cas) op.s[1] = try srcOf(o[k + 3], .int);
     op.size = 4;
     op.lsu = true;
 }
@@ -2516,6 +2520,7 @@ fn atomicAccess(c: *Ctx, wi: u32, t: u32, op: *const Op) Error!void {
         5 => old & v,
         6 => old | v,
         7 => old ^ v,
+        9 => if (old == v) raw32(c, wi, t, op.s[1]) else old,
         else => v,
     };
     std.mem.writeInt(u32, bytes, new, .little);

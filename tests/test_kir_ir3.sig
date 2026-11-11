@@ -777,7 +777,7 @@ test "loads and stores: 8, 16, 32, 64 and 128 bits, signed and unsigned, f16, la
 }
 
 test "atomics, global and shared, contended" {
-    for ([_]kir.Atom{ .add, .min, .max, .xchg }) |kind| {
+    for ([_]kir.Atom{ .add, .min, .max, .xchg, .@"and", .@"or", .xor }) |kind| {
         for ([_]kir.Ty{ .u32, .i32 }) |ty| {
             var k = newKernel("atomics", .{ 64, 1, 1 });
             const g = k.binding();
@@ -815,6 +815,55 @@ test "atomics, global and shared, contended" {
             _ = try both(&k, .{ 3, 1, 1 }, &.{ &words, &out }, &.{});
         }
     }
+}
+
+test "compare-and-swap (CAS loops, global and shared; swapped and kept) and ballots" {
+    var k = newKernel("cas", .{ 64, 1, 1 });
+    const g = k.binding();
+    const o = k.binding();
+    const t = k.tid(0);
+    const gid = k.gid(0);
+    const gl = k.op2(.iadd, .u32, r(t), r(k.op2(.shl, .u32, r(gid), u(6))));
+    const val = k.op2(.imul, .u32, r(gl), u(0x9e3779b9));
+    const sh = k.sharedAlloc(16, 4);
+    var ms = kir.shared(32);
+    ms.imm = @intCast(sh);
+    const first = k.cmp(.u32, .eq, r(t), u(0));
+    k.ifp(r(first));
+    k.store(.u32, ms, u(0), u(0));
+    k.endif();
+    k.barrier();
+    // an increment by compare-and-swap, every lane contending
+    for ([_]kir.Mem{ kir.global(g, 32), ms }) |m| {
+        const exp = k.mov(.u32, u(0));
+        k.loop();
+        const got = k.cas(.u32, m, u(0), r(exp), r(k.op2(.iadd, .u32, r(exp), u(1))));
+        k.brk(r(k.cmp(.u32, .eq, r(got), r(exp))));
+        k.set(exp, .mov, r(got), no, no);
+        k.endloop();
+    }
+    k.barrier();
+    const final = k.load(.u32, ms, u(0));
+    // each lane's own word (4 + its index): swapped by odd lanes
+    const ob = k.op2(.shl, .u32, r(gl), u(4));
+    const own = k.op2(.iadd, .u32, r(ob), u(16));
+    k.store(.u32, kir.global(g, 32), r(own), r(val));
+    const odd = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(t), u(1))), u(0));
+    const want = k.sel(.u32, r(odd), r(val), r(k.op2(.iadd, .u32, r(val), u(1))));
+    const old = k.cas(.u32, kir.global(g, 32), r(own), r(want), r(t));
+    const p = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(val), u(0x100))), u(0));
+    const b0 = k.ballot(r(p), 0);
+    const b1 = k.ballot(r(p), 1);
+    const v = k.vec(.u32, 4);
+    k.set(kir.Kernel.at(v, 0), .mov, r(old), no, no);
+    k.set(kir.Kernel.at(v, 1), .mov, r(final), no, no);
+    k.set(kir.Kernel.at(v, 2), .mov, r(b0), no, no);
+    k.set(kir.Kernel.at(v, 3), .mov, r(b1), no, no);
+    k.store(.u32, kir.global(o, 128), r(ob), r(v));
+    var words = zeros(16 + 3 * 64 * 16);
+    var out = zeros(3 * 64 * 16);
+    _ = try both(&k, .{ 3, 1, 1 }, &.{ &words, &out }, &.{});
+    try std.testing.expectEqual(@as(u32, 3 * 64), std.mem.readInt(u32, Bufs.a[0][0..4], .little));
 }
 
 test "shuffles: idx, xor, up, down; immediate, uniform and per-lane operands" {

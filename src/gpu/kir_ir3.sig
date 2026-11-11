@@ -47,7 +47,7 @@ pub const MAX_PROLOGUE = 256;
 pub const MAX_LOOPS = 256;
 pub const MAX_POOL = 512;
 pub const MAX_CACHED = 128;
-pub const TEXT_BYTES = 768 * 1024;
+pub const TEXT_BYTES = 1536 * 1024;
 /// Units of the register file: half registers (full rN.c = units 2(4N+c), +1).
 const UNITS = 384;
 /// Half registers live in the first 192 units (hr0.x..hr47.w): in the
@@ -459,7 +459,7 @@ fn expand(w: *Work, k: *const kir.Kernel) Error!void {
     if (k.nv > MAX_VREGS) return error.TooManyRegs;
     var has = false;
     for (k.insts[0..k.n]) |in| {
-        if (in.op == .fdiv or in.op == .fsqrt) has = true;
+        if (in.op == .fdiv or in.op == .fsqrt or in.op == .ballot) has = true;
     }
     if (!has) {
         @memcpy(w.insts[0..k.n], k.insts[0..k.n]);
@@ -747,7 +747,7 @@ fn uniformity(w: *Work) void {
             const d = vid(in.dst) orelse continue;
             if (defCount(in) == 0 or d >= w.nv) continue;
             var u = switch (in.op) {
-                .tid, .lane, .ld, .atom, .shfl => false,
+                .tid, .lane, .ld, .atom, .cas, .shfl => false,
                 .gid, .gsize, .subgroup, .param, .vote => true,
                 else => argUniform(w, in.a) and argUniform(w, in.b) and argUniform(w, in.c),
             };
@@ -1476,7 +1476,7 @@ fn lowerOne(w: *Work, i: u32) Error!void {
         .lane => try lowerLane(&l),
         .ld => try lowerLoad(&l),
         .st => try lowerStore(&l),
-        .atom => try lowerAtom(&l),
+        .atom, .cas => try lowerAtom(&l),
         .barrier => {
             var f = MI{};
             f.in.op = .fence;
@@ -1490,6 +1490,7 @@ fn lowerOne(w: *Work, i: u32) Error!void {
         },
         .shfl => try lowerShfl(&l),
         .vote => try lowerVote(&l),
+        .ballot => return error.BadOperand, // (kir.expand made it votes)
         .@"if", .@"else", .endif, .loop, .brk, .cont, .endloop, .ret => try lowerControl(&l),
     }
     _ = isF;
@@ -2318,17 +2319,31 @@ fn lowerAtom(l: *Lw) Error!void {
     const in = l.in;
     const d = l.dst();
     const mem = memOf(in.aux);
-    const kx = argImm(in.c) orelse return error.BadOperand;
-    if (kx > @intFromEnum(kir.Atom.xchg)) return error.BadOperand;
-    const kind: kir.Atom = @enumFromInt(@as(u8, @intCast(kx)));
     const shared = mem.space == .shared;
-    const op: ir3.Op = switch (kind) {
-        .add => if (shared) .atomic_add else .atomic_g_add,
-        .min => if (shared) .atomic_min else .atomic_g_min,
-        .max => if (shared) .atomic_max else .atomic_g_max,
-        .xchg => if (shared) .atomic_xchg else .atomic_g_xchg,
+    const cas = in.op == .cas;
+    const op: ir3.Op = if (cas) (if (shared) .atomic_cmpxchg else .atomic_g_cmpxchg) else blk: {
+        const kx = argImm(in.c) orelse return error.BadOperand;
+        if (kx > @intFromEnum(kir.Atom.xor)) return error.BadOperand;
+        const kind: kir.Atom = @enumFromInt(@as(u8, @intCast(kx)));
+        break :blk switch (kind) {
+            .add => if (shared) .atomic_add else .atomic_g_add,
+            .min => if (shared) .atomic_min else .atomic_g_min,
+            .max => if (shared) .atomic_max else .atomic_g_max,
+            .xchg => if (shared) .atomic_xchg else .atomic_g_xchg,
+            .@"and" => if (shared) .atomic_and else .atomic_g_and,
+            .@"or" => if (shared) .atomic_or else .atomic_g_or,
+            .xor => if (shared) .atomic_xor else .atomic_g_xor,
+        };
     };
-    const val = try l.arg(in.b, .c6, false, false);
+    // (cmpxchg: the new value and the compared one in a pair, as Mesa's
+    // a6xx atomics collect them)
+    const val = if (cas) blk: {
+        const pair = try newVec(w, .full, 2);
+        try mov(w, pair, false, try l.arg(in.c, .any, false, false), .u32);
+        try mov(w, pair + 1, false, try l.arg(in.b, .any, false, false), .u32);
+        try vecRange(w, pair, 2);
+        break :blk Opnd.reg(pair, false);
+    } else try l.arg(in.b, .c6, false, false);
     var mi = MI{ .dst = d, .early = true };
     mi.in.op = op;
     mi.in.typed = false;
@@ -2361,6 +2376,7 @@ fn lowerAtom(l: *Lw) Error!void {
         mi.sn[0] = 2;
     }
     setSrc(&mi, 1, val);
+    if (cas) mi.sn[1] = 2;
     try put(w, mi);
 }
 
@@ -2726,8 +2742,8 @@ fn latency(p: *const MI, reader: *const MI) u32 {
     if (c == 4) return 12; // SFU, through (ss)
     if (c == 6) {
         return switch (p.in.op) {
-            .ldl, .shfl, .atomic_add, .atomic_min, .atomic_max, .atomic_xchg => 10,
-            .ldg_a, .ldg, .atomic_g_add, .atomic_g_min, .atomic_g_max, .atomic_g_xchg => 24,
+            .ldl, .shfl, .atomic_add, .atomic_min, .atomic_max, .atomic_xchg, .atomic_and, .atomic_or, .atomic_xor, .atomic_cmpxchg => 10,
+            .ldg_a, .ldg, .atomic_g_add, .atomic_g_min, .atomic_g_max, .atomic_g_xchg, .atomic_g_and, .atomic_g_or, .atomic_g_xor, .atomic_g_cmpxchg => 24,
             else => 1,
         };
     }
@@ -2752,8 +2768,8 @@ fn reads(m: *const MI, v: u16) bool {
 
 fn memSpace(op: ir3.Op) u8 {
     return switch (op) {
-        .ldg, .ldg_a, .stg, .stg_a, .atomic_g_add, .atomic_g_min, .atomic_g_max, .atomic_g_xchg => 1,
-        .ldl, .stl, .atomic_add, .atomic_min, .atomic_max, .atomic_xchg => 2,
+        .ldg, .ldg_a, .stg, .stg_a, .atomic_g_add, .atomic_g_min, .atomic_g_max, .atomic_g_xchg, .atomic_g_and, .atomic_g_or, .atomic_g_xor, .atomic_g_cmpxchg => 1,
+        .ldl, .stl, .atomic_add, .atomic_min, .atomic_max, .atomic_xchg, .atomic_and, .atomic_or, .atomic_xor, .atomic_cmpxchg => 2,
         else => 0,
     };
 }
@@ -2767,7 +2783,7 @@ fn isStoreOrAtomic(op: ir3.Op) bool {
 
 fn isAtomic(op: ir3.Op) bool {
     return switch (op) {
-        .atomic_add, .atomic_min, .atomic_max, .atomic_xchg, .atomic_g_add, .atomic_g_min, .atomic_g_max, .atomic_g_xchg => true,
+        .atomic_add, .atomic_min, .atomic_max, .atomic_xchg, .atomic_and, .atomic_or, .atomic_xor, .atomic_cmpxchg, .atomic_g_add, .atomic_g_min, .atomic_g_max, .atomic_g_xchg, .atomic_g_and, .atomic_g_or, .atomic_g_xor, .atomic_g_cmpxchg => true,
         else => false,
     };
 }

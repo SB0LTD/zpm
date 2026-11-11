@@ -282,6 +282,13 @@ pub fn usesOf(in: *const sm120.Instr) Error!Uses {
         // ATOMG writes its predicate and its old value)
         u.decoupled = true;
         regs(&u, in, if (eql(op, "ATOMG")) 2 else 1, decoupledCats(.decoupled_agu));
+        // (ATOMG.E.CAS's address is 64 bits, though not printed .64)
+        if (eql(op, "ATOMG") and in.has("CAS")) {
+            for (o) |x| switch (x) {
+                .addr => |a| if (a.reg != sm120.RZ and !a.wide) u.addSrc(.gpr, a.reg + 1, decoupledCats(.decoupled_agu).gpr),
+                else => {},
+            };
+        }
     } else if (eql(op, "SHFL")) {
         u.decoupled = true;
         regs(&u, in, 2, decoupledCats(.decoupled_agu));

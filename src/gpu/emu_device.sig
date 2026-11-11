@@ -259,7 +259,17 @@ pub const EmuDevice = struct {
         return e.fence;
     }
 
-    fn dispatch(e: *EmuDevice, d: Dispatch) anyerror!void {
+    fn dispatch(e: *EmuDevice, d0: Dispatch) anyerror!void {
+        var d = d0;
+        // (the counts as the dispatches before left them)
+        if (d.indirect) |ind| {
+            const rg = e.regionHolding(ind.buf.gpu + ind.off) orelse return error.Trap;
+            const at: usize = @intCast(ind.buf.gpu + ind.off - rg.gpu);
+            if (at + 12 > rg.bytes) return error.Trap;
+            const w = rg.seen[at..][0..12];
+            d.groups = .{ std.mem.readInt(u32, w[0..4], .little), std.mem.readInt(u32, w[4..8], .little), std.mem.readInt(u32, w[8..12], .little) };
+            if (d.groups[0] == 0 or d.groups[1] == 0 or d.groups[2] == 0) return;
+        }
         const p = d.prog;
         if (p.bin.target != .interp) return error.BadProgram;
         if (d.buffers.len != p.bin.bindings or d.buffers.len > MAX_BINDINGS) return error.BadProgram;
@@ -301,6 +311,15 @@ pub const EmuDevice = struct {
         e.total.groups += st.groups;
         e.total.issued += st.issued;
         e.total.lane_ops += st.lane_ops;
+        // (the clock: the instructions issued so far, a tick each)
+        if (d.stamp) |s| {
+            const rg = e.regionHolding(s.buf.gpu + s.off) orelse return error.Trap;
+            const at: usize = @intCast(s.buf.gpu + s.off - rg.gpu);
+            if (at + 16 > rg.bytes) return error.Trap;
+            const word = rg.seen[at..][0..16];
+            std.mem.writeInt(u64, word[0..8], 1, .little);
+            std.mem.writeInt(u64, word[8..16], e.total.issued, .little);
+        }
     }
 
     fn emuWait(ctx: *anyopaque, f: Fence, timeout_us: u64) Error!void {

@@ -89,6 +89,10 @@ pub fn rtx5070(vram: u64) gpu.Caps {
         .dot4 = true,
         .import = false,
         .timestamp_hz = push.TIMESTAMP_HZ,
+        // (a dispatch's stamp is its QMD's four-word release)
+        .stamps = true,
+        // (a patch kernel writes the counts into the dispatch's QMD)
+        .indirect = true,
         .max_run = MAX_DISPATCHES,
     };
 }
@@ -141,6 +145,7 @@ pub const Adapter = struct {
     barriers: u32 = 0,
     /// Each dispatch's end timed (Device.profile).
     profiling: bool = false,
+    indirect_progs: ?IndirectProgs = null,
     lost: u64 = 0,
     last_error: ?anyerror = null,
 
@@ -303,14 +308,72 @@ pub const Adapter = struct {
         p.reportTimestamp(s.stamps.va, 1);
         var hz = gpu.Hazards{};
         a.barriers = 0;
-        for (ds, 0..) |d, i| {
-            const bin = &d.prog.bin;
-            // (a dispatch may pass more words than its kernel reads, as on
-            // the Adreno and the interpreter: GL hands every draw kernel
-            // the pipeline's whole block; the kernel's own are copied)
-            if (d.buffers.len != bin.bindings or d.params.len < bin.param_words) return error.BadProgram;
-            const words = d.params[0..bin.param_words];
-            const at = i * SLOT_BYTES;
+        // (the patch kernels' QMDs, in the slots after the dispatches')
+        var extra: usize = 0;
+        for (ds, 0..) |d0, i| {
+            var d = d0;
+            if (d.indirect) |ind| {
+                // the counts into this dispatch's QMD and cbuf0, by the
+                // patch kernel, once what came before is done; its launch
+                // then reads them (the QMD built here with a 1x1x1 grid)
+                d.groups = .{ 1, 1, 1 };
+                const pp = try a.indirectProgs(ctx);
+                const ps = ds.len + extra;
+                if (ps >= MAX_DISPATCHES) return error.Unsupported;
+                extra += 1;
+                const qva = s.slots.va + i * SLOT_BYTES;
+                const nop_va = pp.nop.code.gpu;
+                // (the patch writes the program address's low words only)
+                if (nop_va >> 36 != d.prog.code.gpu >> 36 or nop_va >> 40 != d.prog.code.gpu >> 40) return error.Unsupported;
+                const pb = [3]gpu.Buffer{ ind.buf, .{ .gpu = qva, .bytes = SLOT_BYTES }, .{ .gpu = qva + CBUF_AT + qmd.CB_GRID, .bytes = 12 } };
+                const pw = [3]u32{ @intCast(ind.off), @truncate(nop_va >> 4), @truncate(nop_va >> 8) };
+                try a.buildSlot(s, ps, .{ .prog = &pp.patch, .groups = .{ 1, 1, 1 }, .buffers = &pb, .params = &pw }, null);
+                p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
+                p.invalidateShaderCaches();
+                p.launch(s.slots.va + ps * SLOT_BYTES);
+                p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
+                p.invalidateShaderCaches();
+                a.barriers += 2;
+                hz = .{};
+            }
+            try a.buildSlot(s, i, d, if (s.profiled) i else null);
+            // (each dispatch sees the writes of those before it that it
+            // meets; the others run with it)
+            if (hz.barrierBefore(&d) and i > 0 and d.indirect == null) {
+                p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
+                p.invalidateShaderCaches();
+                a.barriers += 1;
+            }
+            p.launch(s.slots.va + i * SLOT_BYTES);
+        }
+        p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
+        p.reportTimestamp(s.stamps.va + 16, 2);
+        p.check() catch return error.Unsupported;
+        a.vram.toDevice(s.slots, 0, (ds.len + extra) * SLOT_BYTES);
+        const host = a.rawOf(true);
+        host.toDevice(s.pb, 0, p.len * 4);
+        const f = host.submit(s.pb, @intCast(p.len)) catch |e| return mapError(e);
+        s.fence = f;
+        s.dispatches = @intCast(ds.len);
+        a.last_set = si;
+        a.next_set = (si + 1) % SETS;
+        a.runs += 1;
+        return f;
+    }
+
+    /// Dispatch d's QMD and cbuf0 into slot `slot` of set s (`profile`:
+    /// its end timed into ends[profile]).
+    fn buildSlot(a: *Adapter, s: *Set, slot: usize, d: gpu.Dispatch, timed: ?usize) gpu.Error!void {
+        _ = a;
+        const bin = &d.prog.bin;
+        // (a dispatch may pass more words than its kernel reads, as on
+        // the Adreno and the interpreter: GL hands every draw kernel
+        // the pipeline's whole block; the kernel's own are copied)
+        if (d.buffers.len != bin.bindings or d.params.len < bin.param_words) return error.BadProgram;
+        const words = d.params[0..bin.param_words];
+        {
+            const i = timed orelse 0;
+            const at = slot * SLOT_BYTES;
             const q: *[qmd.QMD_WORDS]u32 = @ptrCast(@alignCast(s.slots.cpu[at..][0..qmd.QMD_BYTES]));
             const param_bytes = 8 * d.buffers.len + 4 * words.len;
             qmd.build(q, .{
@@ -323,7 +386,9 @@ pub const Adapter = struct {
                 .block = bin.group,
                 .shared_bytes = bin.shared_bytes,
             }) catch return error.BadProgram;
-            if (s.profiled) qmd.releaseStamp(q, s.ends.va + i * 16, @intCast(i));
+            if (d.stamp) |st| {
+                qmd.releaseStamp(q, st.buf.gpu + st.off, 1);
+            } else if (timed != null) qmd.releaseStamp(q, s.ends.va + i * 16, @intCast(i));
             var params: [qmd.MAX_BIG_PARAMS]u8 = undefined;
             var n: usize = 0;
             for (d.buffers) |b| {
@@ -336,28 +401,24 @@ pub const Adapter = struct {
             }
             const cb: []u32 = @alignCast(std.mem.bytesAsSlice(u32, s.slots.cpu[at + CBUF_AT ..][0..qmd.CBUF0_MAX_BYTES]));
             _ = qmd.cbuf0Into(cb, d.groups, bin.group, params[0..n]) catch return error.BadProgram;
-            // (each dispatch sees the writes of those before it that it
-            // meets; the others run with it)
-            if (hz.barrierBefore(&d) and i > 0) {
-                p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
-                p.invalidateShaderCaches();
-                a.barriers += 1;
-            }
-            p.launch(s.slots.va + at);
         }
-        p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
-        p.reportTimestamp(s.stamps.va + 16, 2);
-        p.check() catch return error.Unsupported;
-        a.vram.toDevice(s.slots, 0, ds.len * SLOT_BYTES);
-        const host = a.rawOf(true);
-        host.toDevice(s.pb, 0, p.len * 4);
-        const f = host.submit(s.pb, @intCast(p.len)) catch |e| return mapError(e);
-        s.fence = f;
-        s.dispatches = @intCast(ds.len);
-        a.last_set = si;
-        a.next_set = (si + 1) % SETS;
-        a.runs += 1;
-        return f;
+    }
+
+    const IndirectProgs = struct { patch: gpu.Program, nop: gpu.Program };
+
+    /// The indirect dispatch's patch kernel and the program a zero count
+    /// launches instead (both prebuilt: indirect_patch_code, nop_code),
+    /// loaded at the first indirect dispatch.
+    fn indirectProgs(a: *Adapter, ctx: *anyopaque) gpu.Error!*const IndirectProgs {
+        if (a.indirect_progs == null) {
+            const patch = try load(ctx, &indirectPatchBinary());
+            const nop = load(ctx, &nopBinary()) catch |e| {
+                unload(ctx, &patch);
+                return e;
+            };
+            a.indirect_progs = .{ .patch = patch, .nop = nop };
+        }
+        return &a.indirect_progs.?;
     }
 
     fn mapError(e: nv.Error) gpu.Error {
@@ -1538,6 +1599,78 @@ test "atomics, barriers, shuffles, votes" {
     }
 }
 
+test "atomics and, or, xor and compare-and-swap (CAS loops, global and shared); ballots" {
+    const caps = caseCaps(false);
+    fillInts(0xca5);
+    var k = newKernel("cas", .{ 64, 1, 1 });
+    const A = k.binding();
+    const Bb = k.binding();
+    _ = k.binding();
+    const O = k.binding();
+    k.shared_bytes = 16;
+    const t = lin(&k);
+    const tid = k.tid(0);
+    const off = k.op2(.shl, .u32, r(t), u(2));
+    const x = k.load(.u32, kir.global(A, 32), r(off));
+    const y = k.load(.u32, kir.global(Bb, 32), r(off));
+    const g = kir.global(O, 32);
+    _ = k.atomic(.u32, .@"or", g, u(0), r(x));
+    _ = k.atomic(.u32, .xor, g, u(4), r(x));
+    // (thread 0 sets the shared words: and's all ones)
+    const first = k.cmp(.u32, .eq, r(tid), u(0));
+    k.ifp(r(first));
+    k.store(.u32, kir.shared(32), u(0), u(0xffff_ffff));
+    k.store(.u32, kir.shared(32), u(4), u(0));
+    k.store(.u32, kir.shared(32), u(8), u(0));
+    k.store(.u32, kir.shared(32), u(12), u(0));
+    k.endif();
+    k.barrier();
+    _ = k.atomic(.u32, .@"and", kir.shared(32), u(0), r(x));
+    _ = k.atomic(.u32, .@"or", kir.shared(32), u(4), r(y));
+    _ = k.atomic(.u32, .xor, kir.shared(32), u(8), r(y));
+    // an increment by compare-and-swap, every lane contending (the
+    // returned word is the next guess)
+    for ([_]kir.Mem{ g, kir.shared(32) }, [_]u32{ 8, 12 }) |m, at| {
+        const exp = k.mov(.u32, u(0));
+        k.loop();
+        const got = k.cas(.u32, m, u(at), r(exp), r(k.op2(.iadd, .u32, r(exp), u(1))));
+        k.brk(r(k.cmp(.u32, .eq, r(got), r(exp))));
+        k.set(exp, .mov, r(got), kir.no, kir.no);
+        k.endloop();
+    }
+    k.barrier();
+    k.ifp(r(first));
+    const ob = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(k.gid(0)), u(4))), u(16));
+    const s0 = k.load(.u32, kir.shared(128), u(0));
+    k.store(.u32, kir.global(O, 128), r(ob), r(s0));
+    k.endif();
+    // each lane's own word: stored, then swapped where it matches (odd
+    // lanes) and kept (even ones); the old word returned
+    var own = kir.global(O, 32);
+    own.imm = 64;
+    k.store(.u32, own, r(off), r(x));
+    const odd = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(t), u(1))), u(0));
+    const want = k.sel(.u32, r(odd), r(x), r(k.op2(.iadd, .u32, r(x), u(1))));
+    const old = k.cas(.u32, own, r(off), r(want), r(y));
+    var m = kir.global(O, 32);
+    m.imm = 64 + 4 * NT;
+    k.store(.u32, m, r(off), r(old));
+    // ballots: the whole warp, the second word (none on a warp of 32), and
+    // in a divergent if
+    const p = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(x), u(1))), u(0));
+    m.imm = 64 + 8 * NT;
+    k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
+    m.imm = 64 + 12 * NT;
+    k.store(.u32, m, r(off), r(k.ballot(r(p), 1)));
+    k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(y), u(2))), u(0))));
+    m.imm = 64 + 16 * NT;
+    k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
+    k.endif();
+    try same(caps, &k, .{ 2, 1, 1 }, &.{}, 16 + 5 * NT, null);
+    try std.testing.expectEqual(@as(u32, 2 * 64), X.ref[2]);
+    try std.testing.expectEqual(@as(u32, 64), X.ref[4 + 3]);
+}
+
 test "control flow: divergent ifs, loops with brk and cont, nesting, an early ret" {
     for ([_]bool{ false, true }) |flush| {
         const caps = caseCaps(flush);
@@ -1939,4 +2072,100 @@ test "sdRoundRect + blendOver in KIR: the hand text's bits, within 10% of its in
     const kp = kir_count - KIR_HARNESS;
     std.debug.print("sdRoundRect + blendOver: KIR {d} instructions ({d} the piece), {d} registers; hand {d} ({d} the piece), {d} registers\n", .{ kir_count, kp, kir_regs, hand_count, hp, hbin.regs });
     try testing.expect(kp * 10 <= hp * 11);
+}
+
+// ── Indirect dispatch: the patch kernel ────────────────────────────────────
+//
+// A dispatch whose counts the GPU wrote (Dispatch.indirect) is launched
+// after the patch kernel: it reads the three counts (binding 0, at param
+// 0) and writes them into the dispatch's QMD (binding 1: GRID_WIDTH,
+// word 39; GRID_HEIGHT and GRID_DEPTH, the low halves of words 40 and 41)
+// and into its cbuf0's %nctaid words (binding 2, qmd.CB_GRID); a zero
+// count makes the grid 1x1x1 of the nop program instead (the program
+// address's low word 32, its prefetch address's word 59: params 1, 2).
+// Prebuilt (kir_sm120's binaries below: the device compiles nothing), a
+// test keeping them kir_sm120's.
+
+/// The patch kernel's KIR (what indirect_patch_code is compiled from).
+pub fn indirectPatchKernel(k: *kir.Kernel) void {
+    const cnt = k.binding();
+    const q = k.binding();
+    const cb = k.binding();
+    const off = k.param(.u32, 0);
+    var m = kir.global(cnt, 32);
+    const x = k.load(.u32, m, r(off));
+    m.imm = 4;
+    const y = k.load(.u32, m, r(off));
+    m.imm = 8;
+    const z = k.load(.u32, m, r(off));
+    const zero = k.op2(.por, .pred, r(k.cmp(.u32, .eq, r(x), u(0))), r(k.op2(.por, .pred, r(k.cmp(.u32, .eq, r(y), u(0))), r(k.cmp(.u32, .eq, r(z), u(0))))));
+    const gx = k.sel(.u32, r(zero), u(1), r(x));
+    const gy = k.sel(.u32, r(zero), u(1), r(y));
+    const gz = k.sel(.u32, r(zero), u(1), r(z));
+    k.store(.u32, kir.global(q, 32), u(39 * 4), r(gx));
+    k.store(.u32, kir.global(q, 16), u(40 * 4), r(gy));
+    k.store(.u32, kir.global(q, 16), u(41 * 4), r(gz));
+    k.store(.u32, kir.global(cb, 32), u(0), r(gx));
+    k.store(.u32, kir.global(cb, 32), u(4), r(gy));
+    k.store(.u32, kir.global(cb, 32), u(8), r(gz));
+    k.ifp(r(zero));
+    k.store(.u32, kir.global(q, 32), u(32 * 4), r(k.param(.u32, 1)));
+    k.store(.u32, kir.global(q, 32), u(59 * 4), r(k.param(.u32, 2)));
+    k.endif();
+}
+
+const indirect_patch_code = [_]u64{
+    0x00006b00ff0477ac, 0x000e020008000a00, 0x0000e000ff007b82, 0x000e420000000a00,
+    0x0000e200ff027b82, 0x000e820000000a00, 0x0000e400ff047b82, 0x000ec20000000a00,
+    0x0000e600ff067b82, 0x000f040000000800, 0x0000000106007825, 0x012fcc00078e0000,
+    0x0000000400067981, 0x001042000c1e1900, 0x0000040400077981, 0x000944000c1e1900,
+    0x0000080400007981, 0x011102000c1e1900, 0x000000ff0600720c, 0x002fc20003f02070,
+    0x000000ff0700720c, 0x020fca0003f22070, 0x000000ff0000720c, 0x010fca0000f22470,
+    0x000000000000781c, 0x000fca0000703f74, 0x0000000106017807, 0x001fc20004000000,
+    0x0000000107067807, 0x000fc20004000000, 0x0000000100007807, 0x000fc80004000000,
+    0x00009c0102007986, 0x0041c2000c101904, 0x0000a00602007986, 0x0003c2000c101504,
+    0x0000a40002007986, 0x0005c2000c101504, 0x0000000104007986, 0x0087c2000c101904,
+    0x0000040604007986, 0x0009c2000c101904, 0x0000080004007986, 0x000bc4000c101904,
+    0x0000e700ff000b82, 0x024e840000000800, 0x0000800002000986, 0x0045c4000c101904,
+    0x0000e800ff000b82, 0x004e840000000800, 0x0000ec0002000986, 0x0045c4000c101904,
+    0x000000000000794d, 0x01ffc20003800000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+};
+const indirect_patch_regs: u32 = 10;
+const nop_code = [_]u64{
+    0x000000000000794d, 0x000fc20003800000, 0x000000000000794d, 0x000fc20003800000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+};
+const nop_regs: u32 = 3;
+
+fn prebuilt(code: []const u64, regs: u32, bindings: u8, params: u16) gpu.Binary {
+    return .{ .target = .sm_120, .code = std.mem.sliceAsBytes(code), .regs = regs, .shared_bytes = 0, .group = .{ 1, 1, 1 }, .bindings = bindings, .param_words = params };
+}
+fn indirectPatchBinary() gpu.Binary {
+    return prebuilt(&indirect_patch_code, indirect_patch_regs, 3, 3);
+}
+fn nopBinary() gpu.Binary {
+    return prebuilt(&nop_code, nop_regs, 0, 0);
+}
+
+test "indirect dispatch: the prebuilt patch and nop kernels are kir_sm120's" {
+    const caps = emuCaps();
+    for (0..2) |which| {
+        var k = newKernel(if (which == 0) "vk_indirect_patch" else "vk_nop", .{ 1, 1, 1 });
+        if (which == 0) indirectPatchKernel(&k) else k.ret();
+        try k.finish();
+        const bin = try kir_sm120.compileIn(&k, caps, &T.st, &T.code, .{});
+        const words: []const u64 = @alignCast(std.mem.bytesAsSlice(u64, bin.code));
+        const want = if (which == 0) indirectPatchBinary() else nopBinary();
+        const matches = std.mem.eql(u8, bin.code, want.code) and bin.regs == want.regs and bin.extra[kir_sm120.EXTRA_STACK] == 0;
+        if (!matches) {
+            std.debug.print("{s}: regs {d}, code:\n", .{ k.name, bin.regs });
+            for (words) |w| std.debug.print("0x{x:0>16}, ", .{w});
+            std.debug.print("\n", .{});
+            return error.TestUnexpectedResult;
+        }
+    }
 }

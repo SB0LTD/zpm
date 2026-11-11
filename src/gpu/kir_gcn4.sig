@@ -516,7 +516,7 @@ fn analyze(w: *Work) Error!void {
             .gid => w.group_id[@min(in.aux, 2)] = true,
             .gsize => uses_gsize = true,
             .shfl => w.uses_lds = true,
-            .ld, .st, .atom => {
+            .ld, .st, .atom, .cas => {
                 const m: kir.Mem = @bitCast(in.aux);
                 if (m.space == .shared) w.uses_lds = true;
             },
@@ -1269,7 +1269,7 @@ fn lowerInst(w: *Work, in: Inst) Error!void {
             try valu(w, op("v_mbcnt_lo_u32_b32"), t, &.{ .{ .code = MINUS_ONE }, .{ .code = ZERO } }, .{});
             try valu(w, op("v_mbcnt_hi_u32_b32"), try dstV(w, in.dst), &.{ .{ .code = MINUS_ONE }, .{ .code = t } }, .{});
         },
-        .ld, .st, .atom => {
+        .ld, .st, .atom, .cas => {
             const m: kir.Mem = @bitCast(in.aux);
             if (m.space == .shared) try lowerLds(w, in, m) else try lowerBuf(w, in, m);
         },
@@ -1294,6 +1294,7 @@ fn lowerInst(w: *Work, in: Inst) Error!void {
             try sop2(w, op("s_cselect_b64"), d, MINUS_ONE, ZERO);
             try predDone(w, in.dst, d);
         },
+        .ballot => return w.fail(error.BadOperand, "a ballot kir.expand did not expand", .{}),
         .@"if", .@"else", .endif, .loop, .brk, .cont, .endloop, .ret => try lowerFlow(w, in),
     }
 }
@@ -1452,6 +1453,20 @@ fn lowerBuf(w: *Work, in: Inst, m: kir.Mem) Error!void {
             g.dst = (try toV(w, v)).code;
             try emit(w, g);
         },
+        .cas => {
+            // (vdata: the new value, then the compared one; the old word
+            // comes back in the first)
+            g.op = op("buffer_atomic_cmpswap");
+            g.glc = true;
+            const t = try tmpV(w);
+            const t2 = try tmpV(w);
+            if (t2 != t + 1) return w.fail(error.TooComplex, "cmpswap's pair", .{});
+            try valu(w, op("v_mov_b32"), t, &.{try src(w, in.c)}, .{});
+            try valu(w, op("v_mov_b32"), t2, &.{try src(w, in.b)}, .{});
+            g.dst = t;
+            try emit(w, g);
+            try valu(w, op("v_mov_b32"), try dstV(w, in.dst), &.{.{ .code = t }}, .{});
+        },
         else => {
             const kind: kir.Atom = @enumFromInt(in.c.imm);
             const signed = in.ty == .i32;
@@ -1460,6 +1475,9 @@ fn lowerBuf(w: *Work, in: Inst, m: kir.Mem) Error!void {
                 .xchg => op("buffer_atomic_swap"),
                 .min => if (signed) op("buffer_atomic_smin") else op("buffer_atomic_umin"),
                 .max => if (signed) op("buffer_atomic_smax") else op("buffer_atomic_umax"),
+                .@"and" => op("buffer_atomic_and"),
+                .@"or" => op("buffer_atomic_or"),
+                .xor => op("buffer_atomic_xor"),
             };
             g.glc = true;
             // the data register comes back as the old value: a copy
@@ -1512,6 +1530,12 @@ fn lowerLds(w: *Work, in: Inst, m: kir.Mem) Error!void {
             const v = try toV(w, try src(w, in.b));
             try emit(w, .{ .op = o, .src = .{ addr.code, v.code, 0 }, .imm = off });
         },
+        .cas => {
+            // (data0: the compared value, data1: the new one)
+            const cmp = try toV(w, try src(w, in.b));
+            const v = try toV(w, try src(w, in.c));
+            try emit(w, .{ .op = op("ds_cmpst_rtn_b32"), .dst = try dstV(w, in.dst), .src = .{ addr.code, cmp.code, v.code }, .imm = off });
+        },
         else => {
             const kind: kir.Atom = @enumFromInt(in.c.imm);
             const signed = in.ty == .i32;
@@ -1520,6 +1544,9 @@ fn lowerLds(w: *Work, in: Inst, m: kir.Mem) Error!void {
                 .xchg => op("ds_wrxchg_rtn_b32"),
                 .min => if (signed) op("ds_min_rtn_i32") else op("ds_min_rtn_u32"),
                 .max => if (signed) op("ds_max_rtn_i32") else op("ds_max_rtn_u32"),
+                .@"and" => op("ds_and_rtn_b32"),
+                .@"or" => op("ds_or_rtn_b32"),
+                .xor => op("ds_xor_rtn_b32"),
             };
             const v = try toV(w, try src(w, in.b));
             try emit(w, .{ .op = o, .dst = try dstV(w, in.dst), .src = .{ addr.code, v.code, 0 }, .imm = off });

@@ -301,7 +301,7 @@ test "a broken device: wrong words, a timeout and a lost device are failures in 
     try std.testing.expectEqual(n - 6, res.skipped);
     try std.testing.expectEqual(@as(u32, 5), Log.failed_lines);
     try std.testing.expect(std.mem.startsWith(u8, res.firstFailure(), "int i32: FAILED: timeout"));
-    try std.testing.expectEqualStrings("gpu self-test: 1 passed, 5 failed, 18 skipped", Log.last[0..Log.last_len]);
+    try std.testing.expectEqualStrings("gpu self-test: 1 passed, 5 failed, 19 skipped", Log.last[0..Log.last_len]);
     try std.testing.expectEqual(@as(u64, 4000), res.gpu_ns);
 
     // a device whose every result is off: every case fails, the run ends
