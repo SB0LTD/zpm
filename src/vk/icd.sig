@@ -370,6 +370,8 @@ const T = struct {
     var slabs: [16]engine.Slab = undefined;
     /// the colour a draw without colour attachments writes nothing to
     var null_color: gpu.Buffer = .{};
+    /// KIR's interpreter's scratch, for draws whose kernels the GPU refused
+    var cpu_work: [16 << 20]u8 align(64) = undefined;
 };
 
 fn markAll(comptime field: []const u8) void {
@@ -942,7 +944,7 @@ fn createDevice(phys: ?*anyopaque, info: ?*const abi.DeviceCreateInfo, _: ?*cons
         return R.error_initialization_failed;
     }
     if (!T.eng_live) {
-        T.eng.init(.{ .dev = dev, .compiler = g.compile, .work = g.work, .slabs = &T.slabs });
+        T.eng.init(.{ .dev = dev, .compiler = g.compile, .work = g.work, .slabs = &T.slabs, .cpu_work = &T.cpu_work });
         T.eng_live = true;
         if (!T.eng.onGpu()) say("vkCreateDevice: the raster's kernels did not load ({s}): draws are dropped", .{if (T.eng.why) |w| @errorName(w) else "?"});
     }
@@ -2553,7 +2555,7 @@ const Exec = struct {
                 if (d.depth_test) d.depth_func = 0b010;
                 d.stencil = null;
             }
-            if (!T.eng.draw(&d)) e.sayOnce(6, "a draw was dropped (no memory for it, or its kernels did not load: {s}))", .{if (T.eng.why_pipe) |w| @errorName(w) else "?"});
+            e.engineDraw(&d);
             e.markDirty(T.images[T.views[fb.views[ai]].image].mem);
             drawn = true;
         }
@@ -2576,9 +2578,26 @@ const Exec = struct {
             d.color = &cimg;
             d.keep = 0xffff_ffff;
             d.blend = null;
-            if (!T.eng.draw(&d)) e.sayOnce(6, "a draw was dropped (no memory for it, or its kernels did not load: {s})", .{if (T.eng.why_pipe) |w| @errorName(w) else "?"});
+            e.engineDraw(&d);
         }
         if (ds_mem != NONE and (d.depth_write or d.stencil != null)) e.markDirty(ds_mem);
+    }
+
+    /// A draw through the engine. One whose kernels the GPU refused runs on
+    /// the CPU (KIR's interpreter: the stencil tile kernel does not fit
+    /// sm_120's registers yet): the GPU's work is waited for and its writes
+    /// fetched first, as the engine's own images would be.
+    fn engineDraw(e: *Exec, d: *const raster.Draw) void {
+        const p = d.pipe;
+        const maybe_cpu = p.refused_by != null or (d.stencil != null and p.progs[3] == null);
+        if (maybe_cpu) {
+            e.toIcd();
+            e.g.dev.wait(e.dev().last_fence, 10_000_000) catch {};
+            for (&T.memories) |*m| {
+                if (m.live and m.dev == e.di and m.buf.cpu.len != 0) e.g.dev.fromDevice(m.buf, 0, m.buf.cpu.len);
+            }
+        }
+        if (!T.eng.draw(d)) e.sayOnce(6, "a draw was dropped (no memory for it, or its kernels did not load: {s})", .{if (T.eng.why_pipe) |w| @errorName(w) else "?"});
     }
 
     /// The transfer kernel's mode and texel bytes for one aspect between a

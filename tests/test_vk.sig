@@ -692,9 +692,14 @@ const G = struct {
 
     /// A render pass: one colour attachment (cleared), and a depth one if asked.
     fn renderPass(g: *G, depth: bool) !H {
+        return g.renderPassDs(if (depth) D32F else null);
+    }
+
+    fn renderPassDs(g: *G, ds_fmt: ?u32) !H {
+        const depth = ds_fmt != null;
         const atts = [_]abi.AttachmentDescription{
             .{ .flags = 0, .format = RGBA8, .samples = 1, .loadOp = 1, .storeOp = 0, .stencilLoadOp = 2, .stencilStoreOp = 1, .initialLayout = 0, .finalLayout = 2 },
-            .{ .flags = 0, .format = D32F, .samples = 1, .loadOp = 1, .storeOp = 0, .stencilLoadOp = 2, .stencilStoreOp = 1, .initialLayout = 0, .finalLayout = 3 },
+            .{ .flags = 0, .format = ds_fmt orelse D32F, .samples = 1, .loadOp = 1, .storeOp = 0, .stencilLoadOp = 1, .stencilStoreOp = 0, .initialLayout = 0, .finalLayout = 3 },
         };
         const cref = abi.AttachmentReference{ .attachment = 0, .layout = 2 };
         const dref = abi.AttachmentReference{ .attachment = 1, .layout = 3 };
@@ -730,6 +735,8 @@ const G = struct {
         depth: bool = false,
         blend: bool = false,
         targets: u32 = 1,
+        /// 0: no stencil test; 1: write the reference everywhere drawn; 2: draw where equal to it
+        stencil: u32 = 0,
     };
 
     /// A graphics pipeline as wgpu makes one: viewport and scissor
@@ -749,8 +756,8 @@ const G = struct {
         const vps = abi.PipelineViewportStateCreateInfo{ .sType = 22, .pNext = null, .flags = 0, .viewportCount = 1, .pViewports = null, .scissorCount = 1, .pScissors = null };
         const rs = abi.PipelineRasterizationStateCreateInfo{ .sType = 23, .pNext = null, .flags = 0, .depthClampEnable = 0, .rasterizerDiscardEnable = 0, .polygonMode = 0, .cullMode = 0, .frontFace = 0, .depthBiasEnable = 0, .depthBiasConstantFactor = 0, .depthBiasClamp = 0, .depthBiasSlopeFactor = 0, .lineWidth = 1 };
         const ms = abi.PipelineMultisampleStateCreateInfo{ .sType = 24, .pNext = null, .flags = 0, .rasterizationSamples = 1, .sampleShadingEnable = 0, .minSampleShading = 0, .pSampleMask = null, .alphaToCoverageEnable = 0, .alphaToOneEnable = 0 };
-        const so = abi.StencilOpState{ .failOp = 0, .passOp = 0, .depthFailOp = 0, .compareOp = 7, .compareMask = 0xff, .writeMask = 0xff, .reference = 0 };
-        const ds = abi.PipelineDepthStencilStateCreateInfo{ .sType = 25, .pNext = null, .flags = 0, .depthTestEnable = @intFromBool(d.depth), .depthWriteEnable = @intFromBool(d.depth), .depthCompareOp = 1, .depthBoundsTestEnable = 0, .stencilTestEnable = 0, .front = so, .back = so, .minDepthBounds = 0, .maxDepthBounds = 1 };
+        const so = abi.StencilOpState{ .failOp = 0, .passOp = if (d.stencil == 1) 2 else 0, .depthFailOp = 0, .compareOp = if (d.stencil == 2) 2 else 7, .compareMask = 0xff, .writeMask = 0xff, .reference = 0 };
+        const ds = abi.PipelineDepthStencilStateCreateInfo{ .sType = 25, .pNext = null, .flags = 0, .depthTestEnable = @intFromBool(d.depth), .depthWriteEnable = @intFromBool(d.depth), .depthCompareOp = 1, .depthBoundsTestEnable = 0, .stencilTestEnable = @intFromBool(d.stencil != 0), .front = so, .back = so, .minDepthBounds = 0, .maxDepthBounds = 1 };
         // (blending: src alpha over)
         // (the first attachment blended if asked, the others not)
         const att = [2]abi.PipelineColorBlendAttachmentState{
@@ -1070,4 +1077,93 @@ fn targetsThroughVulkan(open: *const fn () ?icd.Gpu) !void {
 
 test "vk: two colour attachments, blending and vkCmdClearAttachments on the emulated RTX" {
     try targetsThroughVulkan(&openRtx);
+}
+
+/// The stencil buffer: naga's triangle writes 1 (REPLACE, a dynamic
+/// reference) into D24_UNORM_S8_UINT cleared to 0; a triangle over the whole
+/// target then draws only where it is 1 (EQUAL); the stencil aspect is read
+/// back as bytes.
+fn stencilThroughVulkan(open: *const fn () ?icd.Gpu) !void {
+    use(open);
+    var v = try Vk.open();
+    defer v.close();
+    var g = try G.init(&v);
+    const W = 32;
+    const D24S8: u32 = 129;
+    const color = try g.newImage(RGBA8, W, W, 1, 1, 0x11);
+    const ds = try g.newImage(D24S8, W, W, 1, 1, 0x21);
+    const cview = try g.newView(color.img, RGBA8, 1, 1, 0, 1);
+    const dview = try g.newView(ds.img, D24S8, 1, 6, 0, 1);
+    const rp = try g.renderPassDs(D24S8);
+    const fb = try g.framebuffer(rp, &.{ cview, dview }, W, W);
+    const vb = try v.buffer(256, 2);
+    const vf: [*]f32 = @ptrCast(@alignCast(vb.ptr.?));
+    const verts = [_]f32{ -0.5, -0.5, 1, 0, 0, 0.5, -0.5, 1, 0, 0, 0, 0.5, 1, 0, 0 };
+    @memcpy(vf[0..verts.len], &verts);
+    const ub = try v.buffer(64, 2);
+    const uf: [*]f32 = @ptrCast(@alignCast(ub.ptr.?));
+    uf[0..5].* = .{ 1, 1, 1, 1, 0.5 };
+    const sl = try g.setLayout(&.{UNIFORM});
+    const pl = try g.newLayout(&.{sl});
+    const pool = try g.newPool();
+    const set = try g.newSet(pool, sl);
+    v.write(set, 0, UNIFORM, ub.buf, 0, 32);
+    const tri = try v.shader(&GShaders.triangle);
+    const full = try v.shader(&GShaders.targets);
+    const binds = [_]abi.VertexInputBindingDescription{.{ .binding = 0, .stride = 20, .inputRate = 0 }};
+    const attrs = [_]abi.VertexInputAttributeDescription{ .{ .location = 0, .binding = 0, .format = 103, .offset = 0 }, .{ .location = 1, .binding = 0, .format = 106, .offset = 8 } };
+    var write_pipe: H = 0;
+    var test_pipe: H = 0;
+    try testing.expectEqual(R.success, g.pipelineOut(.{ .module = tri, .layout = pl, .rp = rp, .binds = &binds, .attrs = &attrs, .stencil = 1 }, &write_pipe));
+    try testing.expectEqual(R.success, g.pipelineOut(.{ .module = full, .layout = pl, .rp = rp, .stencil = 2 }, &test_pipe));
+    const back = try v.buffer(W * W * 5, 2);
+
+    try g.begin();
+    const clears = [_]abi.ClearValue{ .{ .color = .{ .float32 = .{ 0, 0, 0, 1 } } }, .{ .depthStencil = .{ .depth = 1, .stencil = 0 } } };
+    g.beginPass(rp, fb, W, W, &clears);
+    g.f("vkCmdSetStencilReference", *const fn (Ptr, u32, u32) callconv(.c) void)(g.cb, 3, 1);
+    g.f("vkCmdBindPipeline", *const fn (Ptr, u32, H) callconv(.c) void)(g.cb, 0, write_pipe);
+    g.f("vkCmdBindDescriptorSets", *const fn (Ptr, u32, H, u32, u32, [*]const H, u32, ?[*]const u32) callconv(.c) void)(g.cb, 0, pl, 0, 1, @ptrCast(&set), 0, null);
+    const off = [_]u64{0};
+    g.f("vkCmdBindVertexBuffers", *const fn (Ptr, u32, u32, [*]const H, [*]const u64) callconv(.c) void)(g.cb, 0, 1, @ptrCast(&vb.buf), &off);
+    g.f("vkCmdDraw", *const fn (Ptr, u32, u32, u32, u32) callconv(.c) void)(g.cb, 3, 1, 0, 0);
+    g.f("vkCmdBindPipeline", *const fn (Ptr, u32, H) callconv(.c) void)(g.cb, 0, test_pipe);
+    g.f("vkCmdDraw", *const fn (Ptr, u32, u32, u32, u32) callconv(.c) void)(g.cb, 3, 1, 0, 0);
+    g.f("vkCmdEndRenderPass", *const fn (Ptr) callconv(.c) void)(g.cb);
+    g.toBuffer(color.img, back.buf, W, W, 0, 0, 1);
+    const r = abi.BufferImageCopy{ .bufferOffset = W * W * 4, .bufferRowLength = 0, .bufferImageHeight = 0, .imageSubresource = .{ .aspectMask = 4, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 }, .imageOffset = .{ .x = 0, .y = 0, .z = 0 }, .imageExtent = .{ .width = W, .height = W, .depth = 1 } };
+    g.f("vkCmdCopyImageToBuffer", *const fn (Ptr, H, u32, H, u32, [*]const abi.BufferImageCopy) callconv(.c) void)(g.cb, ds.img, 6, back.buf, 1, @ptrCast(&r));
+    try g.run();
+
+    const out = back.ptr.?;
+    var inside: u32 = 0;
+    for (0..W) |yy| for (0..W) |xx| {
+        const x: f32 = @as(f32, @floatFromInt(xx)) + 0.5;
+        const y: f32 = @as(f32, @floatFromInt(yy)) + 0.5;
+        const e0 = 24 - y;
+        const e1 = (y - 8) - 2 * (x - 16);
+        const e2 = (y - 8) + 2 * (x - 16);
+        const m = @min(e0, @min(e1 / 2.24, e2 / 2.24));
+        const p = px(out, W, @intCast(xx), @intCast(yy));
+        const st = out[W * W * 4 + yy * W + xx];
+        if (m > 0.5) {
+            inside += 1;
+            try testing.expectEqual(@as(u8, 1), st);
+            testing.expectEqualSlices(u8, &.{ 64, 128, 191, 128 }, &p) catch |e| {
+                std.debug.print("stencil: pixel ({d}, {d}) = {any}, want the second draw\n", .{ xx, yy, p });
+                return e;
+            };
+        } else if (m < -0.5) {
+            try testing.expectEqual(@as(u8, 0), st);
+            testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, &p) catch |e| {
+                std.debug.print("stencil: pixel ({d}, {d}) = {any}, want the clear colour\n", .{ xx, yy, p });
+                return e;
+            };
+        }
+    };
+    try testing.expect(inside > 80);
+}
+
+test "vk: a stencil written and tested (D24S8, dynamic reference), the stencil aspect read back, on the emulated RTX" {
+    try stencilThroughVulkan(&openRtx);
 }

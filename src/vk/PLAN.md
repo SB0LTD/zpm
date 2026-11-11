@@ -80,6 +80,11 @@ wgpu has run against it yet (the first on-hardware check is §1):
 - **Several subpasses** (only the first is drawn), input attachments,
   imageless framebuffers, secondary command buffers, events, query pools.
 - **Multiview** (a Vulkan 1.1 requirement this device does not meet).
+- **Stencil-tested draws run on the CPU on sm_120**: gfxapi's stencil tile
+  kernel does not compile for sm_120 (TooManyRegs, GL's too: GL falls back
+  the same way). The driver waits for the GPU and fetches every memory
+  first; on the PC that needs CPU views of the images' memory. The fix is
+  in kir_sm120's register budget or a smaller stencil kernel (src/gfxapi).
 - **Indirect draws** read their arguments back (the CPU waits inside
   vkQueueSubmit), as dispatch indirect.
 - Each colour attachment past the first re-runs the raster (vertex and
