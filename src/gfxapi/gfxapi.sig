@@ -21,6 +21,8 @@
 //!   draws on the same engine as GL's);
 //! - program: GL's shader and program objects, links and uniforms;
 //! - texture: texture reads in KIR (fetch, filters, wraps, sizes);
+//! - blocklinear: NVIDIA's block-linear layout in KIR, and its DRM format
+//!   modifiers (a video decoder's pictures sampled where they are);
 //! - texfmt: GL's texture formats as stored, and their uploads;
 //! - report: what the driver says of itself on the app's stderr;
 //! - libgalaxy_gl.sig and libgles.sig (the shared library's root, not
@@ -40,6 +42,7 @@ pub const host = @import("host.sig");
 pub const raster = @import("raster.sig");
 pub const program = @import("program.sig");
 pub const texture = @import("texture.sig");
+pub const blocklinear = @import("blocklinear.sig");
 pub const texfmt = @import("texfmt.sig");
 pub const glsl = @import("glsl/glsl.sig");
 pub const dxbc = @import("dxbc/dxbc.sig");
@@ -54,6 +57,7 @@ test {
     _ = dl;
     _ = program;
     _ = texture;
+    _ = blocklinear;
     _ = texfmt;
     _ = report;
     _ = glsl;

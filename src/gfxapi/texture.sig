@@ -27,6 +27,7 @@
 const std = @import("std");
 const gpu = @import("gpu");
 const engine = @import("engine.sig");
+const blocklinear = @import("blocklinear.sig");
 const kir = gpu.kir;
 const V = kir.V;
 const Arg = kir.Arg;
@@ -56,10 +57,14 @@ pub const DESC_WORDS = D_IMAGE_LEVELS + 1;
 // D_FMT: log2 of the texel's bytes (bits 0..2), its kind (4..6:
 // unorm16 is 4, its bits 4..5 reading as unorm8's and bit 6 saying two
 // bytes a channel), its channels (8..10), sRGB (12), a texture there (13)
+// ... block linear (15: the image's memory is NVIDIA's block-linear
+// layout, D_STRIDE its pitch; its swizzle at 16..17, log2 of its blocks'
+// height in GOBs at 18..20: blocklinear.sig)
 const F_WIDE: u32 = 1 << 6;
 const F_SRGB: u32 = 1 << 12;
 const F_VALID: u32 = 1 << 13;
 const F_DEPTH: u32 = 1 << 14;
+const F_BLOCK: u32 = 1 << 15;
 // D_SWZ: 3 bits a channel: 0..3 one of the texel's, 4 zero, 5 one
 pub const SWZ_ZERO = 4;
 pub const SWZ_ONE = 5;
@@ -109,6 +114,9 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     out[D_STRIDE] = img.stride;
     out[D_FMT] = std.math.log2_int(u32, fmt.bytes()) | @as(u32, @intFromEnum(fmt.kind())) << 4 | fmt.channels() << 8 |
         F_VALID | (if (s.srgb) F_SRGB else 0) | (if (fmt == .d24s8) F_DEPTH else 0);
+    if (img.layout.block) {
+        out[D_FMT] |= F_BLOCK | @as(u32, @intFromEnum(img.layout.swizzle)) << 16 | @as(u32, img.layout.gobs_log2) << 18;
+    }
     var swz: u32 = 0;
     for (s.swizzle, 0..) |c, i| {
         // (an image without alpha reads opaque)
@@ -185,7 +193,20 @@ fn ty(kind: Kind) kir.Ty {
 /// 0, 0, 1), sRGB decoded, before the swizzle.
 fn texel(k: *kir.Kernel, b: u8, d: D, lv: Lvl, x: Arg, y: Arg, kind: Kind) [4]Arg {
     const shift = k.op3(.bfe, .u32, r(d.fmt), u(0), u(3));
-    const addr = k.op2(.iadd, .u32, r(lv.off), r(k.op3(.imad, .u32, y, r(lv.stride), r(k.op2(.shl, .u32, x, r(shift))))));
+    const xb = k.op2(.shl, .u32, x, r(shift));
+    // pitch linear, or (a video decoder's picture, imported with NVIDIA's
+    // modifier) the GOB the texel is in and its place in it: a branch on
+    // the descriptor, so every lane takes the same way
+    const addr = k.reg(.u32);
+    k.set(addr, .iadd, r(lv.off), r(k.op3(.imad, .u32, y, r(lv.stride), r(xb))), kir.no);
+    k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_BLOCK))), u(0))));
+    {
+        const swz = k.op3(.bfe, .u32, r(d.fmt), u(16), u(2));
+        const gobs = k.op3(.bfe, .u32, r(d.fmt), u(18), u(3));
+        const at = blocklinear.address(k, r(lv.stride), r(gobs), r(swz), r(xb), y);
+        k.set(addr, .iadd, r(lv.off), r(at), kir.no);
+    }
+    k.endif();
     const w0 = k.op2(.shr, .u32, r(addr), u(2));
     var words: [4]V = undefined;
     for (&words, 0..) |*w, i| {

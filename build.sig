@@ -1215,6 +1215,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try addTest(ctx, test_gfxapi, "test-gfxapi-draw", "tests/test_gfxapi_draw.sig", &.{
         importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("va_tiling", "src/va/tiling.sig"),
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
@@ -1264,6 +1265,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try addTest(ctx, test_gfxapi, "test-gfxapi-egl", "tests/test_gfxapi_egl.sig", &.{
         importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("va_tiling", "src/va/tiling.sig"),
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
