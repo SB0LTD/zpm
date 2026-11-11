@@ -51,8 +51,16 @@ Milestone 4 (WebGPU's features):
 - **Indices**: 8-bit (VK_EXT_index_type_uint8; the raster reads any
   size) and a negative vertexOffset (the attributes' offset moved back in
   the raster's 32-bit arithmetic).
-- Tests (`sig build test-vk`): 45, from 33 (test-spirv 13, test-vk-icd
-  23, the module 5, wsi 3, lib 1); test-gpu, -ir3, -gcn4 and -selftest
+- After it (same branch): **indirect dispatch on the GPU**
+  (`gpu.Dispatch.indirect`: the RTX's prebuilt patch kernel writes the
+  counts into the dispatch's QMD and cbuf0, a zero count swapping in a nop
+  program; EmuDevice reads them), **sampled textures in compute shaders**
+  (Info.tex_uni/tex_first/tex_room, the descriptors in staging words),
+  **storage textures in vertex and fragment shaders** (fragmentStoresAndAtomics),
+  **cube arrays** and **anisotropic samplers** reported after a test,
+  **multiview** (a draw a view into its layer, ViewIndex; maxMultiviewViewCount 8).
+- Tests (`sig build test-vk`): 51, from 33 (test-spirv 13, test-vk-icd
+  29, the module 5, wsi 3, lib 1); test-gpu, -ir3, -gcn4 and -selftest
   grew with the new ops (the self-test has 25 cases).
 
 Milestone 3 (this branch, Galaxy's `webgpu` branch ships it):
@@ -129,14 +137,10 @@ wgpu has run against it yet (the first on-hardware check is §1):
 
 ## Graphics: what is still missing (the next work, roughly by need)
 
-- **Storage textures**: compute shaders only (spirv's storageImageOp), in
-  Rgba8 unorm, the 32-bit formats and the widened WebGPU ones. Not yet:
-  vertex/fragment-stage storage images (FRAGMENT_WRITABLE_STORAGE: the
-  front end's emitStage would take them as buffers with the image words in
-  the draw's uniform words), BGRA8 storage, storage texel buffers. Sampled
-  images in compute shaders are not compiled yet either (spirv's imageRef
-  wants the graphics Resources: compute needs texture bindings and
-  descriptor words in the dispatch's parameters, texture.sig's ops).
+- **Storage textures**: in every stage (fragment ones tested; vertex
+  ones by the same path, untested), Rgba8 unorm, the 32-bit formats and
+  the widened WebGPU ones. Not yet: BGRA8 storage, storage texel buffers.
+  A fragment's helper lanes (quads) are not kept from storing.
 - **Multisampling**: 4x is taken (images, attachments, limits, resolves)
   but keeps one sample a pixel: rendering is right, edges are not
   antialiased; sample shading, sample masks and alpha-to-coverage are
@@ -154,30 +158,23 @@ wgpu has run against it yet (the first on-hardware check is §1):
   the edge; anisotropy is linear; cube arrays sample (face + 6 layer) but
   are not reported (imageCubeArray 0) until tested.
 - **Depth precision**: D32_SFLOAT and D32_SFLOAT_S8_UINT hold 24 bits.
+- **Multiview**: vkCmdClearAttachments and resolves are not per view.
 - **Several subpasses** (only the first is drawn), input attachments,
   imageless framebuffers, secondary command buffers, events; occlusion
   queries that count samples (the raster's).
-- **Multiview** (a Vulkan 1.1 requirement this device does not meet).
 - **Stencil-tested draws run on the CPU on sm_120**: gfxapi's stencil tile
   kernel does not compile for sm_120 (TooManyRegs, GL's too: GL falls back
   the same way). The driver waits for the GPU and fetches every memory
   first; on the PC that needs CPU views of the images' memory. The fix is
   in kir_sm120's register budget or a smaller stencil kernel (src/gfxapi).
 - **Indirect draws** read their arguments back (the CPU waits inside
-  vkQueueSubmit), as dispatch indirect. The plan for dispatch on the GPU
-  (not done): a `gpu.Dispatch.indirect` the RTX takes by a patch kernel
-  (precompiled SASS, embedded and checked against kir_sm120 by a test)
-  writing the counts into the next QMD (GRID_WIDTH word 39, HEIGHT and
-  DEPTH the low halves of 40 and 41) and cbuf0's CB_GRID before its
-  launch, a zero count swapping in a nop program (word 32 and the
-  prefetch word 59); EmuDevice reads the counts itself. Draws need the
-  raster to read the vertex count from memory (src/gfxapi).
+  vkQueueSubmit): the raster would have to read the vertex count from
+  memory (src/gfxapi). Indirect dispatch runs on the GPU (the RTX's
+  patch kernel; the Adreno and AMD devices still read back).
 - Each colour attachment past the first re-runs the raster (vertex and
   setup too): depth EQUAL and not written, stencil off for those passes.
-- **Depth bias clamp** (the raster has no depth bias), **anisotropic
-  filtering** (texture.sig's linear; samplerAnisotropy 0), **cube arrays**
-  (texture.sig samples face + 6 layer; imageCubeArray 0 until a test
-  draws one), **border colours** (texture.sig has no border wrap).
+- **Depth bias clamp** (the raster has no depth bias), **border colours**
+  (texture.sig has no border wrap). Anisotropic samplers filter linearly.
 
 ## 1. Galaxy integration (done in galaxy `webgpu`; on-hardware check left)
 
@@ -310,6 +307,19 @@ format support for depth formats, and limits (`to_wgpu_limits`:
 are 8, 65535 and 16).
 
 ## 7. Vulkan Video (last)
+
+Blocked: src/va (zpm#161, branch `va-driver`) is not on main, and this
+branch takes it as a library only once it is (no stacked branches). The
+design, when it lands: a video decode queue family (VIDEO_DECODE, with
+VkQueueFamilyVideoPropertiesKHR and the codecs), video sessions (their
+memory requirements: NVDEC's scratch, nvdec.sizes), session parameters
+holding the Std SPS/PPS/VPS (H.264, H.265) and sequence headers (AV1),
+DPB and output pictures as NV12/P010 images (two planes,
+VK_KHR_sampler_ycbcr_conversion to sample them), and vkCmdDecodeVideoKHR
+translating each picture's Std info into the VA-API parameter and slice
+buffers src/va's codecs take (h264, hevc, av1: begin/take/end) so
+nvdec's builders and the driver's pushbuffer code are called, not
+copied; the decode runs on the NVDEC channel src/va's driver opens.
 
 Firefox 153+ can decode through Vulkan Video (H.264, H.265, AV1). The RTX's
 NVDEC is already driven for VA-API (galaxy#114, zpm#161: Sig VA driver).
