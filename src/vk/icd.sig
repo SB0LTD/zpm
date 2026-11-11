@@ -684,6 +684,9 @@ fn features() abi.PhysicalDeviceFeatures {
     f.independentBlend = 1;
     f.multiDrawIndirect = 1;
     f.drawIndirectFirstInstance = 1;
+    // (a fragment shader's storage buffers and images: the front end's
+    // emitStage binds them as the draw's buffers)
+    f.fragmentStoresAndAtomics = 1;
     return f;
 }
 
@@ -3033,6 +3036,22 @@ const Exec = struct {
         var bimg: [spirv.MAX_BINDINGS]engine.Image = undefined;
         for (p.res.bufs[0..p.res.n_bufs], 0..) |b, j| {
             const x = e.gdesc(b.set, b.binding) orelse continue;
+            if (b.kind == .storage_image) {
+                // (a storage image: its view's level and first layer, the
+                // words the front end addresses texels by)
+                const v = viewOf(x.d.view) orelse continue;
+                const im = &T.images[v.image];
+                if (!im.live or im.mem == NONE or !T.memories[im.mem].live) continue;
+                const lv = v.base_level;
+                const depth = if (im.ty == 2) im.ld(lv) else v.layers;
+                bimg[j] = memImage(im.mem);
+                d.buffers[j] = &bimg[j];
+                words[W_VIEWS + 2 * j] = @truncate(im.at(lv, if (im.ty == 2) 0 else v.base_layer));
+                words[W_VIEWS + 2 * j + 1] = @intCast(@min(im.slice(lv) * depth, 0xffff_ffff));
+                words[W_IMAGES + 4 * j ..][0..4].* = .{ im.pitch(lv), @intCast(@min(im.slice(lv), 0xffff_ffff)), im.lw(lv) | im.lh(lv) << 16, depth };
+                e.markDirty(im.mem);
+                continue;
+            }
             const pl = e.place(x.d.buf) orelse continue;
             const range = if (x.d.range == WHOLE_SIZE) pl.size -| x.d.offset else x.d.range;
             bimg[j] = memImage(pl.mem);
@@ -3910,7 +3929,8 @@ const W_BASE_INSTANCE = 2;
 const W_PUSH = 4;
 const W_VIEWS = W_PUSH + MAX_PUSH_BYTES / 4;
 const W_TEX = W_VIEWS + 2 * spirv.MAX_BINDINGS;
-const W_WORDS = W_TEX + spirv.MAX_TEX * texture.DESC_WORDS;
+const W_IMAGES = W_TEX + spirv.MAX_TEX * texture.DESC_WORDS;
+const W_WORDS = W_IMAGES + 4 * spirv.MAX_BINDINGS;
 
 comptime {
     std.debug.assert(W_WORDS <= raster.MAX_UNIFORM_WORDS);
@@ -4792,6 +4812,7 @@ fn stageIo(uni: u8, bufs: u8, ops: *const spirv.TexOps) spirv.StageIO {
         .word_base_instance = W_BASE_INSTANCE,
         .word_push = W_PUSH,
         .word_views = W_VIEWS,
+        .word_images = W_IMAGES,
         .buffers = bufs,
         .tex = ops,
         .quad_x = raster.QUAD_X,

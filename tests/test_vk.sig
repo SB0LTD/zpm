@@ -886,6 +886,7 @@ const GShaders = struct {
     const triangle align(4) = @embedFile("data/vk/triangle.spv").*;
     const quad align(4) = @embedFile("data/vk/quad.spv").*;
     const targets align(4) = @embedFile("data/vk/targets.spv").*;
+    const fstore align(4) = @embedFile("data/vk/fstore.spv").*;
 };
 
 const RGBA8: u32 = 37;
@@ -1382,6 +1383,59 @@ test "vk: widened formats on KIR's interpreter" {
 
 test "vk: naga's textured quad into an sRGB attachment (the fragment shader encodes) on the emulated RTX" {
     try quadDraw(&openRtx, true);
+}
+
+/// A fragment shader storing to a storage texture (each fragment its
+/// position at its texel), and its colour.
+fn fragmentStores(open: *const fn () ?icd.Gpu) !void {
+    use(open);
+    var v = try Vk.open();
+    defer v.close();
+    var g = try G.init(&v);
+    const W = 16;
+    const color = try g.newImage(RGBA8, W, W, 1, 1, 0x11);
+    const cview = try g.newView(color.img, RGBA8, 1, 1, 0, 1);
+    const simg = try g.newImage(RGBA8, W, W, 1, 1, 0x9); // storage, transfer src
+    const sview = try g.newView(simg.img, RGBA8, 1, 1, 0, 1);
+    const rp = try g.renderPass(false);
+    const fb = try g.framebuffer(rp, &.{cview}, W, W);
+    const sl = try g.setLayout(&.{STORAGE_IMAGE});
+    const pl = try g.newLayout(&.{sl});
+    const sizes = [_]abi.DescriptorPoolSize{.{ .@"type" = STORAGE_IMAGE, .descriptorCount = 2 }};
+    const dpci = abi.DescriptorPoolCreateInfo{ .sType = ST.descriptor_pool_create_info, .pNext = null, .flags = 1, .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &sizes };
+    var pool: H = 0;
+    try testing.expectEqual(R.success, g.f("vkCreateDescriptorPool", *const fn (Ptr, *const abi.DescriptorPoolCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &dpci, null, &pool));
+    const set = try g.newSet(pool, sl);
+    g.writeImage(set, 0, STORAGE_IMAGE, sview, 0);
+    const module = try v.shader(&GShaders.fstore);
+    var pipe: H = 0;
+    try testing.expectEqual(R.success, g.pipelineOut(.{ .module = module, .fs = "fs_main", .layout = pl, .rp = rp }, &pipe));
+    const back = try v.buffer(W * W * 4 * 2, 2);
+    try g.begin();
+    const clears = [_]abi.ClearValue{.{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } }};
+    g.beginPass(rp, fb, W, W, &clears);
+    g.f("vkCmdBindPipeline", *const fn (Ptr, u32, H) callconv(.c) void)(g.cb, 0, pipe);
+    g.f("vkCmdBindDescriptorSets", *const fn (Ptr, u32, H, u32, u32, [*]const H, u32, ?[*]const u32) callconv(.c) void)(g.cb, 0, pl, 0, 1, @ptrCast(&set), 0, null);
+    g.f("vkCmdDraw", *const fn (Ptr, u32, u32, u32, u32) callconv(.c) void)(g.cb, 6, 1, 0, 0);
+    g.f("vkCmdEndRenderPass", *const fn (Ptr) callconv(.c) void)(g.cb);
+    g.toBuffer(color.img, back.buf, W, W, 0, 0, 1);
+    const r = abi.BufferImageCopy{ .bufferOffset = W * W * 4, .bufferRowLength = 0, .bufferImageHeight = 0, .imageSubresource = .{ .aspectMask = 1, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 }, .imageOffset = .{ .x = 0, .y = 0, .z = 0 }, .imageExtent = .{ .width = W, .height = W, .depth = 1 } };
+    g.f("vkCmdCopyImageToBuffer", *const fn (Ptr, H, u32, H, u32, [*]const abi.BufferImageCopy) callconv(.c) void)(g.cb, simg.img, 6, back.buf, 1, @ptrCast(&r));
+    try g.run();
+    const out = back.ptr.?;
+    for (0..W) |y| for (0..W) |x| {
+        try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, &px(out, W, @intCast(x), @intCast(y)));
+        const sp = out[W * W * 4 + (y * W + x) * 4 ..][0..4];
+        const want = [4]u8{ @intFromFloat(@round((@as(f32, @floatFromInt(x)) + 0.5) / 16.0 * 255.0)), @intFromFloat(@round((@as(f32, @floatFromInt(y)) + 0.5) / 16.0 * 255.0)), 64, 255 };
+        testing.expectEqualSlices(u8, &want, sp) catch |e| {
+            std.debug.print("fragment stores: texel ({d}, {d}) = {any}, want {any}" ++ "\n", .{ x, y, sp.*, want });
+            return e;
+        };
+    };
+}
+
+test "vk: a fragment shader writing a storage texture (FRAGMENT_WRITABLE_STORAGE) on the emulated RTX" {
+    try fragmentStores(&openRtx);
 }
 
 test "vk: naga's triangle drawn with 8-bit indices and a negative vertexOffset on the emulated RTX" {

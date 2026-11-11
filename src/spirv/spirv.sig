@@ -660,6 +660,9 @@ pub const StageIO = struct {
     word_base_instance: u32 = 0,
     word_push: u32 = 0,
     word_views: u32 = 0,
+    /// storage images: four words a buffer slot (row pitch, layer pitch,
+    /// width | height << 16, layers), as a compute kernel's parameters
+    word_images: u32 = 0,
     /// the first buffer's KIR binding
     buffers: u8 = 0,
     tex: ?*const TexOps = null,
@@ -1600,7 +1603,7 @@ pub const Gen = struct {
                     d.kbind = switch (sc) {
                         StorageClass.storage_buffer, StorageClass.uniform => NONE - 1,
                         StorageClass.function => NONE,
-                        StorageClass.uniform_constant => if (g.opts.stage == .compute and g.isStorageImage(g.elemOf(g.inst(d.at)[1], 0))) NONE - 1 else 0,
+                        StorageClass.uniform_constant => if (g.isStorageImage(g.elemOf(g.inst(d.at)[1], 0))) NONE - 1 else 0,
                         else => 0,
                     };
                 }
@@ -2702,7 +2705,8 @@ pub const Gen = struct {
             const d = &g.s.defs[id];
             if (d.op != Op.variable or d.kbind != NONE - 1) continue;
             const sc = g.inst(d.at)[3];
-            const want = Binding{ .set = if (d.set == NONE) 0 else d.set, .binding = if (d.binding == NONE) 0 else d.binding, .kind = if (sc == StorageClass.uniform) .uniform else .storage };
+            const kind: BindKind = if (sc == StorageClass.uniform) .uniform else if (sc == StorageClass.uniform_constant) .storage_image else .storage;
+            const want = Binding{ .set = if (d.set == NONE) 0 else d.set, .binding = if (d.binding == NONE) 0 else d.binding, .kind = kind };
             const b = try g.bufSlot(want);
             d.kbind = b;
             g.view[b] = r(g.uniWord(.u32, io.word_views + 2 * b));
@@ -2910,7 +2914,6 @@ pub const Gen = struct {
     /// A compute shader's storage image op (see the header): OpImageRead,
     /// OpImageWrite, OpImageQuerySize(Lod).
     fn storageImageOp(g: *Gen, op: u16, in: []const u32) Error!void {
-        if (g.io != null) return g.unsupported("spirv: storage images in a {s} shader", .{@tagName(g.opts.stage)});
         const k = g.k;
         const h = try g.get(if (op == Op.image_write) in[1] else in[3]);
         if (h.len == 0 or h[0] != .imm or h[0].imm >= g.bound) return g.bad("spirv: an image that is not a variable's", .{});
@@ -2927,11 +2930,18 @@ pub const Gen = struct {
         const arrayed = ti[5] != 0;
         const fmt = storageFormat(ti[8]) orelse return g.unsupported("spirv: storage image format {d}", .{ti[8]});
         const b = iv.kbind;
-        const w0 = g.info.imageWord(b);
-        const pitch = r(k.param(.u32, @intCast(w0)));
-        const lpitch = r(k.param(.u32, @intCast(w0 + 1)));
-        const wh = r(k.param(.u32, @intCast(w0 + 2)));
-        const layers = r(k.param(.u32, @intCast(w0 + 3)));
+        // (a compute kernel's parameters; a graphics stage's draw words)
+        var iw: [4]Arg = undefined;
+        if (g.io) |io| {
+            for (&iw, 0..) |*x, j| x.* = r(g.uniWord(.u32, io.word_images + 4 * b + @as(u32, @intCast(j))));
+        } else {
+            const w0 = g.info.imageWord(b);
+            for (&iw, 0..) |*x, j| x.* = r(k.param(.u32, @intCast(w0 + j)));
+        }
+        const pitch = iw[0];
+        const lpitch = iw[1];
+        const wh = iw[2];
+        const layers = iw[3];
         const width = g.iop(.@"and", .u32, wh, u(0xffff));
         const height = g.iop(.shr, .u32, wh, u(16));
         switch (op) {
