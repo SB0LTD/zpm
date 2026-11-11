@@ -14,7 +14,7 @@
 //! Built as Galaxy builds libgalaxy-gl.so (scripts/build-gl.sh):
 //!   sig build-lib -dynamic -target x86_64-linux-none -OReleaseSafe -fPIC
 //!     --name vulkan_galaxy --dep vk --dep gpu --dep gfxapi -Mroot=src/vk/libgalaxy_vk.sig
-//!     --dep gpu --dep spirv -Mvk=src/vk/vk.sig --dep gpu -Mspirv=src/spirv/spirv.sig
+//!     --dep gpu --dep spirv --dep gfxapi -Mvk=src/vk/vk.sig --dep gpu -Mspirv=src/spirv/spirv.sig
 //!     (gfxapi, gpu, nvidia, adreno, amdgpu as build-gl.sh wires them)
 
 const std = @import("std");

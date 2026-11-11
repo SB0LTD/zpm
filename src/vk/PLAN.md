@@ -5,28 +5,94 @@ The goal: Firefox's WebGPU (wgpu's Vulkan backend, `dom.webgpu.enabled` and
 the PC's RTX 5070 (GB206, sm_120), through this ICD. Pure Sig, allocation-free,
 no Mesa; zpm is pinned by Galaxy, never vendored.
 
-## Where it stands (milestone 1, branch `sig-vulkan`)
+## Where it stands (milestone 2, branch `sig-vulkan`)
 
-- `src/spirv`: SPIR-V compute shaders to KIR (naga's WGSL output first).
-- `src/vk/icd.sig`: a Vulkan 1.0 compute device (instance 1.1) with
-  VK_KHR_maintenance1, VK_KHR_storage_buffer_storage_class and
-  VK_KHR_timeline_semaphore; buffers, descriptors, compute pipelines, command
-  buffers, submission, fences, semaphores. One COMPUTE|TRANSFER queue family.
+- `src/spirv`: SPIR-V to KIR (naga's WGSL output first): compute kernels;
+  vertex and fragment stages emitted into gfxapi's raster kernels
+  (`Gen.emitStage`), with images and samplers through the caller's texture
+  unit (gfxapi's texture.sig), derivatives over quads.
+- `src/vk/icd.sig`: a Vulkan 1.1 device (instance 1.1) with one
+  GRAPHICS|COMPUTE|TRANSFER queue family; VK_KHR_maintenance1,
+  VK_KHR_storage_buffer_storage_class, VK_KHR_timeline_semaphore. Buffers,
+  descriptors (buffers, images, samplers, combined, templates), compute and
+  graphics pipelines, images and views (1D, 2D, arrays, cube, 3D, mips),
+  samplers, render passes and framebuffers (first subpass), draws (direct,
+  indexed, indirect), clears, buffer/image copies, blits, submission, fences,
+  semaphores. Draws are gfxapi's raster (the GL driver's draw path) on the
+  same gpu.Device queue as the driver's kernels.
+- `src/vk/format.sig`: the formats, how each is kept (gfxapi engine formats;
+  every depth/stencil format as the raster's d24s8 word), what each can do.
 - `src/vk/libgalaxy_vk.sig`: libvulkan_galaxy.so, the loader's ICD interface
   version 5; `galaxy_icd.json` its manifest.
-- Tests (`sig build test-vk`): the front end on naga's SPIR-V on KIR's
-  interpreter and the emulated RTX; the ICD through its entry points.
+- Tests (`sig build test-vk`, 26): the front end on naga's SPIR-V; the ICD
+  through its entry points: compute (axpy, reduction), naga's triangle
+  (vertex buffer, uniform block, depth read back) on the emulated RTX and
+  KIR's interpreter, naga's textured quad (index buffer, mips, sampler, 2D
+  array fetched, three fragment shaders), two colour attachments with
+  blending and vkCmdClearAttachments. Pixels read back and checked.
 
-**wgpu does not take this adapter yet.** `expose_adapter` (wgpu-hal 30,
-`vulkan/adapter.rs`) hides an adapter whose first queue family lacks
-GRAPHICS. Everything below is what it takes to get past that and then to be
-useful to Firefox.
+**What wgpu (trunk `vulkan/adapter.rs`) sees now**, by reading the code; no
+wgpu has run against it yet (the first on-hardware check is §1):
+
+- `expose_adapter` takes it: the first family has GRAPHICS; API 1.1, so
+  maintenance1 and storage_buffer_storage_class are core; no
+  VK_KHR_driver_properties (so no conformance-version-0 hiding).
+- Features: the always-on set (wgpu claims ADDRESS_MODE_CLAMP_TO_BORDER and
+  _TO_ZERO unconditionally: the sampler clamps to the edge instead, see
+  below), INDIRECT_FIRST_INSTANCE, DEPTH32FLOAT_STENCIL8. Not:
+  TIMESTAMP_QUERY (timestampValidBits 0), FLOAT32_FILTERABLE,
+  RG11B10UFLOAT_RENDERABLE, BGRA8UNORM_STORAGE, SHADER_F16, SUBGROUP,
+  POLYGON_MODE_*, MULTIVIEW, texture compression.
+- Downlevel flags: WEBGPU_TEXTURE_FORMAT_SUPPORT (S8, D24S8, D32, D32S8
+  depth-stencil attachments, sampled), INDEPENDENT_BLEND,
+  FULL_DRAW_INDEX_UINT32, READ_ONLY_DEPTH_STENCIL (1.1), SURFACE_VIEW_FORMATS
+  (no swapchain extension), and the unconditional ones. Missing (not
+  compliant): CUBE_ARRAY_TEXTURES, ANISOTROPIC_FILTERING,
+  FRAGMENT_WRITABLE_STORAGE, MULTISAMPLED_SHADING, DEPTH_BIAS_CLAMP. wgpu-core
+  only warns; Firefox does not filter on it.
+- Limits (`to_wgpu_limits`): WebGPU's defaults or better, so Firefox's
+  requestDevice with default limits fits: textures 8192 (1D, 2D), 2048 (3D),
+  256 layers; 8 bind groups (8 here), 1000 bindings a group; a stage: 12
+  uniform and 8 storage buffers, 16 sampled textures, 16 samplers, 4 storage
+  textures (reported for the default; not compiled yet, see below); 8 and 4
+  dynamic uniform and storage buffers; 64 KiB uniform and 2 GiB storage
+  bindings; 16 vertex buffers, 16 attributes, stride 2048; 16 inter-stage
+  variables (64 scalar varyings + position); 8 colour attachments; offset
+  alignments 16; compute from gpu.Caps.
+
+## Graphics: what is still missing (the next work, roughly by need)
+
+- **Storage textures** (OpImageRead/OpImageWrite, STORAGE_IMAGE
+  descriptors): the limit says 4 a stage (WebGPU's default) but pipelines
+  using them fail with a message.
+- **Multisampling**: images are 1 sample; WebGPU requires 4x render targets
+  (sampleCount 4 fails validation in wgpu). The raster has no MSAA.
+- **Points and lines** (logged, not drawn), **primitive restart**, **depth
+  bias**, **FragDepth**, **clip/cull distances**, rasterizer depth clamp.
+- **Formats**: the 16-bit float, snorm, 8/16-bit integer, RGB10A2 and
+  RG11B10 images (each needs a texfmt conversion on upload and readback, or
+  native sampling in texture.sig); sRGB render targets (the raster writes
+  unorm); 32-bit float filtering. Vertex formats are wider (format.sig).
+- **Samplers**: CLAMP_TO_BORDER and MIRROR_CLAMP_TO_EDGE clamp/mirror to
+  the edge; anisotropy is linear; cube arrays sample (face + 6 layer) but
+  are not reported (imageCubeArray 0) until tested.
+- **Depth precision**: D32_SFLOAT and D32_SFLOAT_S8_UINT hold 24 bits.
+- **Several subpasses** (only the first is drawn), input attachments,
+  imageless framebuffers, secondary command buffers, events, query pools.
+- **Multiview** (a Vulkan 1.1 requirement this device does not meet).
+- **Indirect draws** read their arguments back (the CPU waits inside
+  vkQueueSubmit), as dispatch indirect.
+- Each colour attachment past the first re-runs the raster (vertex and
+  setup too): depth EQUAL and not written, stencil off for those passes.
+- Draws with a negative vertexOffset take attributes from the index (the
+  raster has no base vertex); 8-bit indices are refused.
 
 ## 1. Galaxy integration (small, first)
 
 - `scripts/build-vk.sh` in Galaxy, as `build-gl.sh`: `sig build-lib -dynamic
   -target x86_64-linux-none --name vulkan_galaxy` over the pinned zpm (the
-  wiring is in `libgalaxy_vk.sig`'s header). Install as
+  wiring is in `libgalaxy_vk.sig`'s header; the vk module now depends on
+  gfxapi too, for the raster). Install as
   `/usr/lib/libvulkan_galaxy.so` and `galaxy_icd.json` as
   `/usr/share/vulkan/icd.d/galaxy_icd.json`. Alpine's `vulkan-loader` package
   only, no Mesa ICDs.
@@ -71,45 +137,9 @@ useful to Firefox.
   submission waiting on a value only the host will signal spins in
   vkQueueSubmit. A deferred-submission queue (fixed, in .bss) instead.
 
-## 3. Graphics (the GRAPHICS queue flag; wgpu takes the adapter here)
+## 3. Graphics (milestone 2: done, see above)
 
-wgpu-hal uses classic render passes and framebuffers (`vkCreateRenderPass`,
-`vkCreateFramebuffer`, `vkCmdBeginRenderPass`), not dynamic rendering.
-
-- **Images and memory**: `vkCreateImage`, `vkGetImageMemoryRequirements(2)`,
-  `vkBindImageMemory(2)`, image views, linear and optimal tiling (optimal =
-  the engine's layout; gfxapi's `engine.sig` images and `texfmt.sig` formats
-  first: RGBA8/BGRA8/R8/RG8, the 16F/32F/int ones), `vkGetImageSubresourceLayout`.
-- **Formats**: `vkGetPhysicalDeviceFormatProperties` truthful per format.
-  WebGPU's required set includes depth formats: wgpu sets
-  `WEBGPU_TEXTURE_FORMAT_SUPPORT` only with S8 or D24S8, D24S8 or D32S8, and
-  D32 (gfxapi's raster has depth 24 + stencil 8 already).
-- **Transfers**: `vkCmdCopyBufferToImage`, `vkCmdCopyImageToBuffer`,
-  `vkCmdCopyImage`, `vkCmdBlitImage`, `vkCmdClearColorImage`,
-  `vkCmdClearDepthStencilImage`, `vkCmdResolveImage` (wgpu's `CLEAR_TEXTURE`
-  is advertised unconditionally). The engine's copy and blit kernels.
-- **Samplers**: `vkCreateSampler` over `texture.sig`'s descriptors; sampled
-  images, storage images, combined image samplers in descriptor sets; SPIR-V
-  OpImage* in the front end (`OpImageSampleImplicitLod`, `OpImageFetch`,
-  `OpImageRead/Write`, `OpImageQuerySize`).
-- **Graphics pipelines**: vertex and fragment SPIR-V to the raster's KIR
-  emitters (as `glsl/gen.sig` and `dxbc/gen.sig` do), vertex input state,
-  input assembly, rasterization (cull, front face, depth bias), depth/stencil,
-  color blend, dynamic viewport and scissor, blend constants, stencil
-  reference. `vkCmdDraw`, `vkCmdDrawIndexed`, the indirect forms,
-  `vkCmdBindVertexBuffers`, `vkCmdBindIndexBuffer`.
-- **Render passes**: load/store ops, clears at begin, subpass 0 only at
-  first, resolves later (MSAA: the raster has none yet).
-- Core 1.0 features wgpu turns into downlevel flags, each only when true:
-  `independentBlend`, `imageCubeArray`, `sampleRateShading`,
-  `fragmentStoresAndAtomics`, `fullDrawIndexUint32`, `depthBiasClamp`,
-  `samplerAnisotropy`.
-- Limits then become real: `maxImageDimension*` (WebGPU's defaults: 8192 2D,
-  2048 3D, 256 layers), vertex input limits, `maxColorAttachments`, sample counts.
-
-Vulkan version: once images and graphics are in, report 1.1 (VK 1.1 needs
-`multiview`, descriptor update templates, `vkGetDescriptorSetLayoutSupport`,
-the 1.1 entry points; wgpu takes the 1.1 paths for maintenance1/2/3 then).
+What is left of it is the list under "Graphics: what is still missing".
 Not 1.2 while `VK_KHR_driver_properties` would carry conformance version 0:
 wgpu hides such an adapter unless `ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`
 (adapter.rs, `driver.conformance_version.major == 0`).
