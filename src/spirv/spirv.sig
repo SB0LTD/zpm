@@ -17,6 +17,16 @@
 //!   word 2i     binding i's offset in its buffer (bytes)
 //!   word 2i+1   binding i's range (bytes)
 //!   word 2n+w   push constant word w (n = Info.n_bindings)
+//!   word 2n+p+4j..  storage image j's (the j-th binding of kind
+//!               storage_image): row pitch, layer (or 3D slice) pitch,
+//!               width | height << 16, depth or layers (p: the push words)
+//!
+//! A storage image (OpTypeImage with Sampled 2, WebGPU's storage textures)
+//! is a binding of its own: its linear texels in the image's memory, the
+//! view's level and first layer at the binding's offset (src/vk keeps every
+//! image linear). OpImageRead and OpImageWrite address texels from those
+//! words; a texel outside the image reads 0 and is not written. Formats:
+//! Rgba8 (unorm), R32f/i/ui, Rg32f/i/ui, Rgba32f/i/ui.
 //!
 //! With `Options.robust` (Vulkan's robustBufferAccess), every load and
 //! store is checked against its binding's range: a load past it reads 0,
@@ -58,7 +68,8 @@
 //! gathers, over both stages, what the pipeline binds.
 //!
 //! Not yet (an error with a message, `Gen.diag`): 64-bit and 16-bit types,
-//! storage images, gathers, binding arrays, FragDepth, subgroup operations, atomic and/or/xor and
+//! storage images outside compute shaders and in other formats, sampled
+//! images in compute shaders, gathers, binding arrays, FragDepth, subgroup operations, atomic and/or/xor and
 //! compare-exchange (KIR's atomics are add, min, max and exchange),
 //! pointers as values beyond function arguments (OpPtrAccessChain,
 //! variable pointers), spec constant operations, stages other than
@@ -444,7 +455,7 @@ pub const Options = struct {
     spec_data: []const u8 = &.{},
 };
 
-pub const BindKind = enum(u8) { storage, uniform };
+pub const BindKind = enum(u8) { storage, uniform, storage_image };
 pub const Binding = struct { set: u32, binding: u32, kind: BindKind };
 
 /// What the kernel needs from its dispatch (see the header).
@@ -454,12 +465,42 @@ pub const Info = struct {
     n_bindings: u8 = 0,
     /// The push-constant block's bytes (0: none).
     push_bytes: u32 = 0,
+    /// The storage images among the bindings (bit b: binding b is one).
+    image_bits: u32 = 0,
+    n_images: u8 = 0,
 
-    /// The parameter words a dispatch fills: two per binding, then the push constants.
+    /// The parameter words a dispatch fills: two per binding, the push
+    /// constants, then four per storage image.
     pub fn paramWords(info: *const Info) u32 {
-        return 2 * @as(u32, info.n_bindings) + (info.push_bytes + 3) / 4;
+        return 2 * @as(u32, info.n_bindings) + (info.push_bytes + 3) / 4 + 4 * @as(u32, info.n_images);
+    }
+
+    /// Binding b's storage-image words' first parameter word.
+    pub fn imageWord(info: *const Info, b: u32) u32 {
+        const below = info.image_bits & ((@as(u32, 1) << @intCast(b)) - 1);
+        return 2 * @as(u32, info.n_bindings) + (info.push_bytes + 3) / 4 + 4 * @popCount(below);
     }
 };
+
+/// A storage image format (SPIR-V's ImageFormat) as it is in memory:
+/// `comps` 32-bit components of `ty`, or four unorm bytes in one word.
+pub const StorageFormat = struct { comps: u8, ty: kir.Ty, unorm8: bool = false };
+
+pub fn storageFormat(image_format: u32) ?StorageFormat {
+    return switch (image_format) {
+        1 => .{ .comps = 4, .ty = .f32 }, // Rgba32f
+        3 => .{ .comps = 1, .ty = .f32 }, // R32f
+        4 => .{ .comps = 4, .ty = .f32, .unorm8 = true }, // Rgba8
+        6 => .{ .comps = 2, .ty = .f32 }, // Rg32f
+        21 => .{ .comps = 4, .ty = .i32 }, // Rgba32i
+        24 => .{ .comps = 1, .ty = .i32 }, // R32i
+        25 => .{ .comps = 2, .ty = .i32 }, // Rg32i
+        30 => .{ .comps = 4, .ty = .u32 }, // Rgba32ui
+        33 => .{ .comps = 1, .ty = .u32 }, // R32ui
+        35 => .{ .comps = 2, .ty = .u32 }, // Rg32ui
+        else => null,
+    };
+}
 
 /// The shader stage an entry point is compiled for.
 pub const Stage = enum(u8) { compute, vertex, fragment };
@@ -1308,8 +1349,13 @@ pub const Gen = struct {
             const sc = g.inst(d.at)[3];
             if (g.info.n_bindings == MAX_BINDINGS) return g.unsupported("spirv: more than {d} buffers", .{MAX_BINDINGS});
             const b = k.binding();
-            g.info.bindings[b] = .{ .set = if (d.set == NONE) 0 else d.set, .binding = if (d.binding == NONE) 0 else d.binding, .kind = if (sc == StorageClass.uniform) .uniform else .storage };
+            const kind: BindKind = if (sc == StorageClass.uniform) .uniform else if (sc == StorageClass.uniform_constant) .storage_image else .storage;
+            g.info.bindings[b] = .{ .set = if (d.set == NONE) 0 else d.set, .binding = if (d.binding == NONE) 0 else d.binding, .kind = kind };
             g.info.n_bindings += 1;
+            if (kind == .storage_image) {
+                g.info.image_bits |= @as(u32, 1) << @intCast(b);
+                g.info.n_images += 1;
+            }
             d.kbind = b;
         }
         // the prologue: binding views, built-ins, Private and Workgroup variables
@@ -1351,7 +1397,12 @@ pub const Gen = struct {
                     if (d.kbind == NONE) continue;
                     try g.funcVar(@intCast(id), t, if (in.len > 4) in[4] else NONE);
                 },
-                StorageClass.output, StorageClass.uniform_constant => {
+                StorageClass.uniform_constant => {
+                    if (d.kbind == NONE) continue;
+                    if (!g.isStorageImage(t)) return g.unsupported("spirv: sampled images and samplers in a compute shader", .{});
+                    g.s.vals[id] = .{ .ptr = .{ .space = .handle, .slot = id, .ty = t } };
+                },
+                StorageClass.output => {
                     if (d.kbind == NONE) continue;
                     return g.unsupported("spirv: storage class {d} in a compute shader", .{sc});
                 },
@@ -1410,6 +1461,7 @@ pub const Gen = struct {
                     d.kbind = switch (sc) {
                         StorageClass.storage_buffer, StorageClass.uniform => NONE - 1,
                         StorageClass.function => NONE,
+                        StorageClass.uniform_constant => if (g.opts.stage == .compute and g.isStorageImage(g.elemOf(g.inst(d.at)[1], 0))) NONE - 1 else 0,
                         else => 0,
                     };
                 }
@@ -2004,7 +2056,8 @@ pub const Gen = struct {
                 try g.define(in[2], si[0..1]);
             },
             Op.image_sample_implicit_lod, Op.image_sample_explicit_lod, Op.image_sample_dref_implicit_lod, Op.image_sample_dref_explicit_lod, Op.image_fetch, Op.image_query_size_lod, Op.image_query_size, Op.image_query_levels, Op.image_query_samples => try g.imageOp(op, in),
-            Op.image_sample_proj_implicit_lod, Op.image_sample_proj_explicit_lod, Op.image_gather, Op.image_dref_gather, Op.image_read, Op.image_write, Op.image_query_lod => return g.unsupported("spirv: image op {d}", .{op}),
+            Op.image_read, Op.image_write => try g.storageImageOp(op, in),
+            Op.image_sample_proj_implicit_lod, Op.image_sample_proj_explicit_lod, Op.image_gather, Op.image_dref_gather, Op.image_query_lod => return g.unsupported("spirv: image op {d}", .{op}),
             Op.dpdx, Op.dpdy, Op.fwidth, Op.dpdx_fine, Op.dpdy_fine, Op.fwidth_fine, Op.dpdx_coarse, Op.dpdy_coarse, Op.fwidth_coarse => try g.derivative(op, in),
             Op.demote_to_helper_invocation => {
                 if (g.io == null) return g.unsupported("spirv: demote outside a fragment shader", .{});
@@ -2583,6 +2636,125 @@ pub const Gen = struct {
     }
 
     /// The texture slot an image (and its sampler) value names.
+    /// Whether type `t` is a storage image (OpTypeImage, Sampled 2).
+    fn isStorageImage(g: *Gen, t: u32) bool {
+        if (t >= g.bound or g.tyOp(t) != Op.type_image) return false;
+        const ti = g.tyInst(t);
+        return ti.len >= 9 and ti[7] == 2;
+    }
+
+    /// A compute shader's storage image op (see the header): OpImageRead,
+    /// OpImageWrite, OpImageQuerySize(Lod).
+    fn storageImageOp(g: *Gen, op: u16, in: []const u32) Error!void {
+        if (g.io != null) return g.unsupported("spirv: storage images in a {s} shader", .{@tagName(g.opts.stage)});
+        const k = g.k;
+        const h = try g.get(if (op == Op.image_write) in[1] else in[3]);
+        if (h.len == 0 or h[0] != .imm or h[0].imm >= g.bound) return g.bad("spirv: an image that is not a variable's", .{});
+        const iv = g.s.defs[h[0].imm];
+        if (iv.op != Op.variable) return g.bad("spirv: an image that is not a variable's", .{});
+        const it = g.elemOf(g.inst(iv.at)[1], 0);
+        if (!g.isStorageImage(it) or iv.kbind >= MAX_BINDINGS) {
+            return g.unsupported("spirv: image op {d} on a sampled image in a compute shader", .{op});
+        }
+        const ti = g.tyInst(it);
+        const dim: Dim = @enumFromInt(@as(u8, @intCast(@min(ti[3], 6))));
+        if (dim != .d1 and dim != .d2 and dim != .d3) return g.unsupported("spirv: storage images of dimension {s}", .{@tagName(dim)});
+        if (ti[6] != 0) return g.unsupported("spirv: multisampled storage images", .{});
+        const arrayed = ti[5] != 0;
+        const fmt = storageFormat(ti[8]) orelse return g.unsupported("spirv: storage image format {d}", .{ti[8]});
+        const b = iv.kbind;
+        const w0 = g.info.imageWord(b);
+        const pitch = r(k.param(.u32, @intCast(w0)));
+        const lpitch = r(k.param(.u32, @intCast(w0 + 1)));
+        const wh = r(k.param(.u32, @intCast(w0 + 2)));
+        const layers = r(k.param(.u32, @intCast(w0 + 3)));
+        const width = g.iop(.@"and", .u32, wh, u(0xffff));
+        const height = g.iop(.shr, .u32, wh, u(16));
+        switch (op) {
+            Op.image_query_size, Op.image_query_size_lod => {
+                const all: [3]Arg = switch (dim) {
+                    .d1 => .{ width, layers, u(0) },
+                    else => .{ width, height, layers },
+                };
+                const n = g.comps(in[1]);
+                if (n > 3) return error.BadSpirv;
+                try g.define(in[2], all[0..n]);
+                return;
+            },
+            Op.image_read, Op.image_write => {},
+            else => return g.unsupported("spirv: image op {d} on a storage image", .{op}),
+        }
+        // the texel: (x, y, layer or z), in the image or not
+        const c = try g.get(if (op == Op.image_write) in[2] else in[4]);
+        const x = c[0];
+        var y: Arg = u(0);
+        var z: Arg = u(0);
+        switch (dim) {
+            .d1 => if (arrayed and c.len > 1) {
+                z = c[1];
+            },
+            .d2 => {
+                if (c.len > 1) y = c[1];
+                if (arrayed and c.len > 2) z = c[2];
+            },
+            else => {
+                if (c.len > 1) y = c[1];
+                if (c.len > 2) z = c[2];
+            },
+        }
+        const inb = g.pand(g.pand(g.icmp(.u32, .lt, x, width), g.icmp(.u32, .lt, y, if (dim == .d1) u(1) else height)), g.icmp(.u32, .lt, z, layers));
+        const bytes: u32 = if (fmt.unorm8) 4 else 4 * @as(u32, fmt.comps);
+        const zs = if (z == .imm and z.imm == 0) u(0) else g.imul(z, lpitch);
+        const yp = if (y == .imm and y.imm == 0) u(0) else g.imul(y, pitch);
+        const at = g.iadd(g.iadd(zs, yp), g.imul(x, u(bytes)));
+        const mem = kir.global(g.kbinding(b), 32);
+        if (op == Op.image_read) {
+            const safe = g.iadd(g.view[b], g.sel(.u32, inb, at, u(0)));
+            const one: Arg = if (fmt.ty == .f32) f(1.0) else u(1);
+            var out: [4]Arg = .{ u(0), u(0), u(0), one };
+            if (fmt.ty == .f32) {
+                out[0] = f(0);
+                out[1] = f(0);
+                out[2] = f(0);
+            }
+            if (fmt.unorm8) {
+                const word = r(k.load(.u32, mem, safe));
+                for (0..4) |j| {
+                    const byte = g.iop(.@"and", .u32, g.iop(.shr, .u32, word, u(@intCast(8 * j))), u(0xff));
+                    out[j] = g.fop(.fmul, r(g.k.cvt(.u32, .f32, .rne, byte)), f(1.0 / 255.0));
+                }
+            } else {
+                for (0..fmt.comps) |j| out[j] = r(k.load(fmt.ty, mem, g.iadd(safe, u(@intCast(4 * j)))));
+            }
+            const zero: Arg = if (fmt.ty == .f32) f(0) else u(0);
+            for (&out) |*o| o.* = g.sel(fmt.ty, inb, o.*, zero);
+            const n = g.comps(in[1]);
+            if (n > 4) return error.BadSpirv;
+            try g.define(in[2], out[0..n]);
+            return;
+        }
+        // a write: the texel's first components, in the image only
+        const texel = try g.get(in[3]);
+        const addr = g.iadd(g.view[b], at);
+        k.ifp(inb);
+        if (fmt.unorm8) {
+            var word: Arg = u(0);
+            for (0..4) |j| {
+                const v = if (j < texel.len) texel[j] else f(0);
+                const cl = g.fop(.fmin, g.fop(.fmax, v, f(0)), f(1));
+                const q = r(g.k.cvt(.f32, .u32, .rz, g.fop(.fadd, g.fop(.fmul, cl, f(255.0)), f(0.5))));
+                word = g.iop(.@"or", .u32, word, g.iop(.shl, .u32, q, u(@intCast(8 * j))));
+            }
+            k.store(.u32, mem, addr, r(g.reg(word, .u32)));
+        } else {
+            for (0..fmt.comps) |j| {
+                const v = if (j < texel.len) texel[j] else u(0);
+                k.store(fmt.ty, mem, g.iadd(addr, u(@intCast(4 * j))), r(g.reg(v, fmt.ty)));
+            }
+        }
+        k.endif();
+    }
+
     fn imageRef(g: *Gen, h: []const Arg) Error!ImageRef {
         const res = g.res orelse return g.unsupported("spirv: images in a compute shader", .{});
         if (h.len == 0 or h[0] != .imm or h[0].imm >= g.bound) return g.bad("spirv: an image that is not a variable's", .{});
@@ -2592,7 +2764,8 @@ pub const Gen = struct {
         if (g.tyOp(it) != Op.type_image) return g.bad("spirv: %{d} is not an image", .{h[0].imm});
         const ti = g.tyInst(it);
         if (ti.len < 9) return error.BadSpirv;
-        if (ti[6] != 0) return g.unsupported("spirv: multisampled images", .{});
+        // (a multisampled image: src/vk keeps one sample a pixel, so a
+        // fetch's Sample operand reads that one)
         const st = g.tyInst(ti[2]);
         const kind: SampleKind = if (g.tyOp(ti[2]) == Op.type_float) .float else if (st.len > 3 and st[3] != 0) .int else .uint;
         const want = TexSlot{
@@ -2629,7 +2802,7 @@ pub const Gen = struct {
     }
 
     fn imageOp(g: *Gen, op: u16, in: []const u32) Error!void {
-        const io = g.io orelse return g.unsupported("spirv: images in a compute shader", .{});
+        const io = g.io orelse return g.storageImageOp(op, in);
         const k = g.k;
         var img = try g.imageRef(try g.get(in[3]));
         const tex = io.tex orelse return g.unsupported("spirv: images without a texture unit", .{});

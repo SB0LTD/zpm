@@ -214,7 +214,7 @@ test "vk: what vulkaninfo asks, through the ICD's entry points, on the emulated 
     var ifp: abi.ImageFormatProperties = undefined;
     try testing.expectEqual(R.success, imgFmt(pd, 37, 1, 0, 0x14, 0, &ifp));
     try testing.expectEqual(@as(u32, 8192), ifp.maxExtent.width);
-    try testing.expectEqual(@as(u32, 1), ifp.sampleCounts);
+    try testing.expectEqual(@as(u32, 5), ifp.sampleCounts); // 1 and 4 (one sample kept)
     try testing.expectEqual(R.error_format_not_supported, imgFmt(pd, 43, 1, 0, 0x10, 0, &ifp)); // sRGB is not drawn into
 
     var groups: [1]abi.PhysicalDeviceGroupProperties = undefined;
@@ -1168,4 +1168,247 @@ fn stencilThroughVulkan(open: *const fn () ?icd.Gpu) !void {
 
 test "vk: a stencil written and tested (D24S8, dynamic reference), the stencil aspect read back, on the emulated RTX" {
     try stencilThroughVulkan(&openRtx);
+}
+
+// ── Storage images (WebGPU's storage textures) ─────────────────────────────
+
+const storage_spv align(4) = @embedFile("data/vk/storage.spv").*;
+const STORAGE_IMAGE: u32 = 3;
+
+const ImageAndView = struct { img: H, mem: H, view: H };
+
+/// A storage image of `fmt` with `layers`, in memory of its own
+/// (device-local), and a view of all of it.
+fn storageImage(v: *const Vk, fmt: u32, w: u32, h: u32, layers: u32) !ImageAndView {
+    return image2d(v, fmt, w, h, layers, 1, 0x8 | 0x1 | 0x2);
+}
+
+fn image2d(v: *const Vk, fmt: u32, w: u32, h: u32, layers: u32, samples: u32, usage: u32) !ImageAndView {
+    const ici = abi.ImageCreateInfo{ .sType = ST.image_create_info, .pNext = null, .flags = 0, .imageType = 1, .format = fmt, .extent = .{ .width = w, .height = h, .depth = 1 }, .mipLevels = 1, .arrayLayers = layers, .samples = samples, .tiling = 0, .usage = usage, .sharingMode = 0, .queueFamilyIndexCount = 0, .pQueueFamilyIndices = null, .initialLayout = 0 };
+    var img: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreateImage", *const fn (Ptr, *const abi.ImageCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &ici, null, &img));
+    var req: abi.MemoryRequirements = undefined;
+    v.f("vkGetImageMemoryRequirements", *const fn (Ptr, H, *abi.MemoryRequirements) callconv(.c) void)(v.dev, img, &req);
+    const mai = abi.MemoryAllocateInfo{ .sType = ST.memory_allocate_info, .pNext = null, .allocationSize = req.size, .memoryTypeIndex = v.memType(1, req.memoryTypeBits) };
+    var mem: H = 0;
+    try testing.expectEqual(R.success, v.f("vkAllocateMemory", *const fn (Ptr, *const abi.MemoryAllocateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &mai, null, &mem));
+    try testing.expectEqual(R.success, v.f("vkBindImageMemory", *const fn (Ptr, H, H, u64) callconv(.c) Res)(v.dev, img, mem, 0));
+    const vci = abi.ImageViewCreateInfo{ .sType = ST.image_view_create_info, .pNext = null, .flags = 0, .image = img, .viewType = if (layers > 1) 5 else 1, .format = fmt, .components = .{ .r = 0, .g = 0, .b = 0, .a = 0 }, .subresourceRange = .{ .aspectMask = 1, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = layers } };
+    var view: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreateImageView", *const fn (Ptr, *const abi.ImageViewCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &vci, null, &view));
+    return .{ .img = img, .mem = mem, .view = view };
+}
+
+fn storageImagesThroughVulkan(open: *const fn () ?icd.Gpu) !void {
+    use(open);
+    var v = try Vk.open();
+    defer v.close();
+    const W = 10;
+    const HH = 6;
+    const L = 3;
+    // storage formats: rgba8 unorm and r32 float are storage images
+    var fp: abi.FormatProperties = undefined;
+    const fmtProps = v.f("vkGetPhysicalDeviceFormatProperties", *const fn (Ptr, u32, *abi.FormatProperties) callconv(.c) void);
+    var pd: [1]Ptr = undefined;
+    var n: u32 = 1;
+    try testing.expectEqual(R.success, v.f("vkEnumeratePhysicalDevices", *const fn (Ptr, *u32, ?[*]Ptr) callconv(.c) Res)(v.inst, &n, &pd));
+    for ([_]u32{ 37, 100, 107, 109 }) |fmt| {
+        fmtProps(pd[0], fmt, &fp);
+        try testing.expect(fp.optimalTilingFeatures & 0x2 != 0);
+    }
+    fmtProps(pd[0], 44, &fp); // BGRA8: not a storage image here
+    try testing.expectEqual(@as(u32, 0), fp.optimalTilingFeatures & 0x2);
+
+    const src = try storageImage(&v, 37, W, HH, 1);
+    const dst = try storageImage(&v, 37, W, HH, 1);
+    const acc = try storageImage(&v, 100, W, HH, L);
+    const sizes = try v.buffer(16, 2);
+    const up = try v.buffer(W * HH * 4 * (1 + L), 2);
+    const back = try v.buffer(W * HH * 4 * (1 + L), 2);
+    // src: (20x, 40y, 100, 200); acc: x + 100y + 1000 layer
+    for (0..HH) |y| for (0..W) |x| {
+        const at = (y * W + x) * 4;
+        up.ptr.?[at..][0..4].* = .{ @intCast(x * 20), @intCast(y * 40), 100, 200 };
+    };
+    const accf: [*]f32 = @ptrCast(@alignCast(up.ptr.? + W * HH * 4));
+    for (0..L) |l| for (0..HH) |y| for (0..W) |x| {
+        accf[(l * HH + y) * W + x] = @floatFromInt(x + 100 * y + 1000 * l);
+    };
+
+    const layout = try v.setLayout(&.{ STORAGE_IMAGE, STORAGE_IMAGE, STORAGE_IMAGE, STORAGE });
+    const plci = abi.PipelineLayoutCreateInfo{ .sType = ST.pipeline_layout_create_info, .pNext = null, .flags = 0, .setLayoutCount = 1, .pSetLayouts = @ptrCast(&layout), .pushConstantRangeCount = 0, .pPushConstantRanges = null };
+    var pl_layout: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreatePipelineLayout", *const fn (Ptr, *const abi.PipelineLayoutCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &plci, null, &pl_layout));
+    const psizes = [_]abi.DescriptorPoolSize{ .{ .@"type" = STORAGE_IMAGE, .descriptorCount = 3 }, .{ .@"type" = STORAGE, .descriptorCount = 1 } };
+    const dpci = abi.DescriptorPoolCreateInfo{ .sType = ST.descriptor_pool_create_info, .pNext = null, .flags = 1, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = &psizes };
+    var pool: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreateDescriptorPool", *const fn (Ptr, *const abi.DescriptorPoolCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &dpci, null, &pool));
+    const dsai = abi.DescriptorSetAllocateInfo{ .sType = ST.descriptor_set_allocate_info, .pNext = null, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = @ptrCast(&layout) };
+    var set: H = 0;
+    try testing.expectEqual(R.success, v.f("vkAllocateDescriptorSets", *const fn (Ptr, *const abi.DescriptorSetAllocateInfo, [*]H) callconv(.c) Res)(v.dev, &dsai, @ptrCast(&set)));
+    for ([_]H{ src.view, dst.view, acc.view }, 0..) |view, b| {
+        const ii = abi.DescriptorImageInfo{ .sampler = 0, .imageView = view, .imageLayout = 1 };
+        const w = abi.WriteDescriptorSet{ .sType = ST.write_descriptor_set, .pNext = null, .dstSet = set, .dstBinding = @intCast(b), .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = STORAGE_IMAGE, .pImageInfo = @ptrCast(&ii), .pBufferInfo = null, .pTexelBufferView = null };
+        v.f("vkUpdateDescriptorSets", *const fn (Ptr, u32, [*]const abi.WriteDescriptorSet, u32, ?*const anyopaque) callconv(.c) void)(v.dev, 1, @ptrCast(&w), 0, null);
+    }
+    v.write(set, 3, STORAGE, sizes.buf, 0, 16);
+
+    const module = try v.shader(&storage_spv);
+    const pipe = try v.pipeline(module, pl_layout);
+    v.f("vkDestroyShaderModule", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, module, null);
+
+    const cpci = abi.CommandPoolCreateInfo{ .sType = ST.command_pool_create_info, .pNext = null, .flags = 2, .queueFamilyIndex = 0 };
+    var cpool: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreateCommandPool", *const fn (Ptr, *const abi.CommandPoolCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &cpci, null, &cpool));
+    const cbai = abi.CommandBufferAllocateInfo{ .sType = ST.command_buffer_allocate_info, .pNext = null, .commandPool = cpool, .level = 0, .commandBufferCount = 1 };
+    var cb: Ptr = null;
+    try testing.expectEqual(R.success, v.f("vkAllocateCommandBuffers", *const fn (Ptr, *const abi.CommandBufferAllocateInfo, *Ptr) callconv(.c) Res)(v.dev, &cbai, &cb));
+    const cbbi = abi.CommandBufferBeginInfo{ .sType = ST.command_buffer_begin_info, .pNext = null, .flags = 1, .pInheritanceInfo = null };
+    try testing.expectEqual(R.success, v.f("vkBeginCommandBuffer", *const fn (Ptr, *const abi.CommandBufferBeginInfo) callconv(.c) Res)(cb, &cbbi));
+    const b2i = v.f("vkCmdCopyBufferToImage", *const fn (Ptr, H, H, u32, u32, [*]const abi.BufferImageCopy) callconv(.c) void);
+    const i2b = v.f("vkCmdCopyImageToBuffer", *const fn (Ptr, H, u32, H, u32, [*]const abi.BufferImageCopy) callconv(.c) void);
+    const rgn_src = abi.BufferImageCopy{ .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0, .imageSubresource = .{ .aspectMask = 1, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 }, .imageOffset = .{ .x = 0, .y = 0, .z = 0 }, .imageExtent = .{ .width = W, .height = HH, .depth = 1 } };
+    var rgn_acc = rgn_src;
+    rgn_acc.bufferOffset = W * HH * 4;
+    rgn_acc.imageSubresource.layerCount = L;
+    b2i(cb, up.buf, src.img, 7, 1, @ptrCast(&rgn_src));
+    b2i(cb, up.buf, acc.img, 7, 1, @ptrCast(&rgn_acc));
+    v.f("vkCmdBindPipeline", *const fn (Ptr, u32, H) callconv(.c) void)(cb, 1, pipe);
+    v.f("vkCmdBindDescriptorSets", *const fn (Ptr, u32, H, u32, u32, [*]const H, u32, ?[*]const u32) callconv(.c) void)(cb, 1, pl_layout, 0, 1, @ptrCast(&set), 0, null);
+    v.f("vkCmdDispatch", *const fn (Ptr, u32, u32, u32) callconv(.c) void)(cb, 2, 1, 1);
+    i2b(cb, dst.img, 6, back.buf, 1, @ptrCast(&rgn_src));
+    i2b(cb, acc.img, 6, back.buf, 1, @ptrCast(&rgn_acc));
+    try testing.expectEqual(R.success, v.f("vkEndCommandBuffer", *const fn (Ptr) callconv(.c) Res)(cb));
+    const si = abi.SubmitInfo{ .sType = ST.submit_info, .pNext = null, .waitSemaphoreCount = 0, .pWaitSemaphores = null, .pWaitDstStageMask = null, .commandBufferCount = 1, .pCommandBuffers = @ptrCast(&cb), .signalSemaphoreCount = 0, .pSignalSemaphores = null };
+    try testing.expectEqual(R.success, v.f("vkQueueSubmit", *const fn (Ptr, u32, [*]const abi.SubmitInfo, H) callconv(.c) Res)(v.queue, 1, @ptrCast(&si), 0));
+    try testing.expectEqual(R.success, v.f("vkQueueWaitIdle", *const fn (Ptr) callconv(.c) Res)(v.queue));
+
+    // the sizes the shader saw: 10 x 6, 3 layers
+    const sz: [*]const u32 = @ptrCast(@alignCast(sizes.ptr.?));
+    try testing.expectEqual(@as(u32, W), sz[0]);
+    try testing.expectEqual(@as(u32, HH), sz[1]);
+    try testing.expectEqual(@as(u32, L), sz[2]);
+    try testing.expectEqual(@as(u32, W), sz[3]);
+    // dst: src's channels swapped, alpha inverted
+    for (0..HH) |y| for (0..W) |x| {
+        const got = back.ptr.?[(y * W + x) * 4 ..][0..4].*;
+        const want = [4]u8{ 100, @intCast(y * 40), @intCast(x * 20), 55 };
+        testing.expectEqualSlices(u8, &want, &got) catch |e| {
+            std.debug.print("storage images: dst ({d}, {d}) = {any}, want {any}\n", .{ x, y, got, want });
+            return e;
+        };
+    };
+    // acc: layer 1 added to, layers 0 and 2 as they were
+    const outf: [*]const f32 = @ptrCast(@alignCast(back.ptr.? + W * HH * 4));
+    for (0..L) |l| for (0..HH) |y| for (0..W) |x| {
+        const base: f32 = @floatFromInt(x + 100 * y + 1000 * l);
+        const want = if (l == 1) base + @as(f32, @floatFromInt(x * 10 + y)) else base;
+        try testing.expectEqual(want, outf[(l * HH + y) * W + x]);
+    };
+
+    v.f("vkFreeCommandBuffers", *const fn (Ptr, H, u32, [*]const Ptr) callconv(.c) void)(v.dev, cpool, 1, @ptrCast(&cb));
+    v.f("vkDestroyCommandPool", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, cpool, null);
+    v.f("vkDestroyPipeline", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, pipe, null);
+    v.f("vkDestroyPipelineLayout", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, pl_layout, null);
+    v.f("vkDestroyDescriptorPool", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, pool, null);
+    v.f("vkDestroyDescriptorSetLayout", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, layout, null);
+    for ([_]ImageAndView{ src, dst, acc }) |x| {
+        v.f("vkDestroyImageView", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, x.view, null);
+        v.f("vkDestroyImage", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, x.img, null);
+        v.f("vkFreeMemory", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, x.mem, null);
+    }
+    for ([_]Vk.Buf{ sizes, up, back }) |b| {
+        v.f("vkDestroyBuffer", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, b.buf, null);
+        v.f("vkFreeMemory", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, b.mem, null);
+    }
+}
+
+test "vk: storage images (rgba8 read, rgba8 written, an r32float array read and written, their sizes) in a compute shader on the emulated RTX" {
+    try storageImagesThroughVulkan(&openRtx);
+}
+
+test "vk: storage images in a compute shader on KIR's interpreter" {
+    try storageImagesThroughVulkan(&openInterp);
+}
+
+// ── Multisampling (4x, one sample kept) ────────────────────────────────────
+
+test "vk: a 4x colour attachment cleared and resolved by the render pass, on the emulated RTX" {
+    use(&openRtx);
+    var v = try Vk.open();
+    defer v.close();
+    var pd: [1]Ptr = undefined;
+    var n: u32 = 1;
+    try testing.expectEqual(R.success, v.f("vkEnumeratePhysicalDevices", *const fn (Ptr, *u32, ?[*]Ptr) callconv(.c) Res)(v.inst, &n, &pd));
+    // 4x for attachments; not for storage images
+    var props: abi.PhysicalDeviceProperties = undefined;
+    v.f("vkGetPhysicalDeviceProperties", *const fn (Ptr, *abi.PhysicalDeviceProperties) callconv(.c) void)(pd[0], &props);
+    try testing.expect(props.limits.framebufferColorSampleCounts & 4 != 0 and props.limits.framebufferDepthSampleCounts & 4 != 0);
+    const imgFmt = v.f("vkGetPhysicalDeviceImageFormatProperties", *const fn (Ptr, u32, u32, u32, u32, u32, ?*abi.ImageFormatProperties) callconv(.c) Res);
+    var ifp: abi.ImageFormatProperties = undefined;
+    try testing.expectEqual(R.success, imgFmt(pd[0], 37, 1, 0, 0x10, 0, &ifp));
+    try testing.expectEqual(@as(u32, 5), ifp.sampleCounts);
+    try testing.expectEqual(R.success, imgFmt(pd[0], 129, 1, 0, 0x20, 0, &ifp));
+    try testing.expectEqual(@as(u32, 5), ifp.sampleCounts);
+    try testing.expectEqual(R.success, imgFmt(pd[0], 37, 1, 0, 0x8, 0, &ifp));
+    try testing.expectEqual(@as(u32, 1), ifp.sampleCounts);
+
+    const W = 8;
+    const HH = 4;
+    const ms = try image2d(&v, 37, W, HH, 1, 4, 0x10 | 0x1);
+    const one = try image2d(&v, 37, W, HH, 1, 1, 0x10 | 0x1 | 0x2);
+    const back = try v.buffer(W * HH * 4, 2);
+    const atts = [_]abi.AttachmentDescription{
+        .{ .flags = 0, .format = 37, .samples = 4, .loadOp = 1, .storeOp = 1, .stencilLoadOp = 2, .stencilStoreOp = 1, .initialLayout = 0, .finalLayout = 2 },
+        .{ .flags = 0, .format = 37, .samples = 1, .loadOp = 2, .storeOp = 0, .stencilLoadOp = 2, .stencilStoreOp = 1, .initialLayout = 0, .finalLayout = 6 },
+    };
+    const color = [_]abi.AttachmentReference{.{ .attachment = 0, .layout = 2 }};
+    const resolve = [_]abi.AttachmentReference{.{ .attachment = 1, .layout = 2 }};
+    const sub = abi.SubpassDescription{ .flags = 0, .pipelineBindPoint = 0, .inputAttachmentCount = 0, .pInputAttachments = null, .colorAttachmentCount = 1, .pColorAttachments = &color, .pResolveAttachments = &resolve, .pDepthStencilAttachment = null, .preserveAttachmentCount = 0, .pPreserveAttachments = null };
+    const rpci = abi.RenderPassCreateInfo{ .sType = ST.render_pass_create_info, .pNext = null, .flags = 0, .attachmentCount = 2, .pAttachments = &atts, .subpassCount = 1, .pSubpasses = @ptrCast(&sub), .dependencyCount = 0, .pDependencies = null };
+    var rp: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreateRenderPass", *const fn (Ptr, *const abi.RenderPassCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &rpci, null, &rp));
+    const views = [_]H{ ms.view, one.view };
+    const fbci = abi.FramebufferCreateInfo{ .sType = ST.framebuffer_create_info, .pNext = null, .flags = 0, .renderPass = rp, .attachmentCount = 2, .pAttachments = &views, .width = W, .height = HH, .layers = 1 };
+    var fb: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreateFramebuffer", *const fn (Ptr, *const abi.FramebufferCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &fbci, null, &fb));
+
+    const cpci = abi.CommandPoolCreateInfo{ .sType = ST.command_pool_create_info, .pNext = null, .flags = 2, .queueFamilyIndex = 0 };
+    var cpool: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreateCommandPool", *const fn (Ptr, *const abi.CommandPoolCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &cpci, null, &cpool));
+    const cbai = abi.CommandBufferAllocateInfo{ .sType = ST.command_buffer_allocate_info, .pNext = null, .commandPool = cpool, .level = 0, .commandBufferCount = 1 };
+    var cb: Ptr = null;
+    try testing.expectEqual(R.success, v.f("vkAllocateCommandBuffers", *const fn (Ptr, *const abi.CommandBufferAllocateInfo, *Ptr) callconv(.c) Res)(v.dev, &cbai, &cb));
+    const cbbi = abi.CommandBufferBeginInfo{ .sType = ST.command_buffer_begin_info, .pNext = null, .flags = 1, .pInheritanceInfo = null };
+    try testing.expectEqual(R.success, v.f("vkBeginCommandBuffer", *const fn (Ptr, *const abi.CommandBufferBeginInfo) callconv(.c) Res)(cb, &cbbi));
+    const clears = [_]abi.ClearValue{ .{ .color = .{ .float32 = .{ 0.25, 0.5, 0.75, 1.0 } } }, .{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } } };
+    const rpbi = abi.RenderPassBeginInfo{ .sType = ST.render_pass_begin_info, .pNext = null, .renderPass = rp, .framebuffer = fb, .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = W, .height = HH } }, .clearValueCount = 2, .pClearValues = &clears };
+    v.f("vkCmdBeginRenderPass", *const fn (Ptr, *const abi.RenderPassBeginInfo, u32) callconv(.c) void)(cb, &rpbi, 0);
+    v.f("vkCmdEndRenderPass", *const fn (Ptr) callconv(.c) void)(cb);
+    const rgn = abi.BufferImageCopy{ .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0, .imageSubresource = .{ .aspectMask = 1, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 }, .imageOffset = .{ .x = 0, .y = 0, .z = 0 }, .imageExtent = .{ .width = W, .height = HH, .depth = 1 } };
+    v.f("vkCmdCopyImageToBuffer", *const fn (Ptr, H, u32, H, u32, [*]const abi.BufferImageCopy) callconv(.c) void)(cb, one.img, 6, back.buf, 1, @ptrCast(&rgn));
+    try testing.expectEqual(R.success, v.f("vkEndCommandBuffer", *const fn (Ptr) callconv(.c) Res)(cb));
+    const si = abi.SubmitInfo{ .sType = ST.submit_info, .pNext = null, .waitSemaphoreCount = 0, .pWaitSemaphores = null, .pWaitDstStageMask = null, .commandBufferCount = 1, .pCommandBuffers = @ptrCast(&cb), .signalSemaphoreCount = 0, .pSignalSemaphores = null };
+    try testing.expectEqual(R.success, v.f("vkQueueSubmit", *const fn (Ptr, u32, [*]const abi.SubmitInfo, H) callconv(.c) Res)(v.queue, 1, @ptrCast(&si), 0));
+    try testing.expectEqual(R.success, v.f("vkQueueWaitIdle", *const fn (Ptr) callconv(.c) Res)(v.queue));
+    // the resolve attachment has the 4x attachment's clear
+    for (0..W * HH) |i| {
+        const texel = back.ptr.?[i * 4 ..][0..4];
+        try testing.expect(texel[0] >= 63 and texel[0] <= 64);
+        try testing.expect(texel[1] >= 127 and texel[1] <= 128);
+        try testing.expect(texel[2] >= 191 and texel[2] <= 192);
+        try testing.expectEqual(@as(u8, 255), texel[3]);
+    }
+
+    v.f("vkFreeCommandBuffers", *const fn (Ptr, H, u32, [*]const Ptr) callconv(.c) void)(v.dev, cpool, 1, @ptrCast(&cb));
+    v.f("vkDestroyCommandPool", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, cpool, null);
+    v.f("vkDestroyFramebuffer", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, fb, null);
+    v.f("vkDestroyRenderPass", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, rp, null);
+    for ([_]ImageAndView{ ms, one }) |x| {
+        v.f("vkDestroyImageView", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, x.view, null);
+        v.f("vkDestroyImage", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, x.img, null);
+        v.f("vkFreeMemory", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, x.mem, null);
+    }
+    v.f("vkDestroyBuffer", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, back.buf, null);
+    v.f("vkFreeMemory", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, back.mem, null);
 }

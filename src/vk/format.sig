@@ -12,7 +12,8 @@
 //! Colour attachments are what the raster writes: RGBA8, BGRA8, RG8, R8
 //! (unorm; an sRGB one is not encoded on write, so the sRGB formats are
 //! sampled only). The 16-bit unorm and 32-bit float and integer formats
-//! are sampled and copied, not drawn into.
+//! are sampled and copied, not drawn into. Storage images (compute shaders):
+//! RGBA8 unorm and the 32-bit float and integer formats.
 
 const std = @import("std");
 const gfxapi = @import("gfxapi");
@@ -52,6 +53,8 @@ pub const Info = struct {
     srgb: bool = false,
     /// a colour attachment the raster writes (and blends)
     render: bool = false,
+    /// a storage image compute shaders read and write (spirv's storage formats)
+    storage: bool = false,
     filter: bool = true,
     depth: DepthForm = .none,
     /// vertex attribute: components, bytes each, float, signed, normalized,
@@ -72,21 +75,21 @@ pub const table = [_]Info{
     // images: colour
     .{ .vk = 9, .fmt = .r8, .bytes = 1, .render = true },
     .{ .vk = 16, .fmt = .rg8, .bytes = 2, .render = true },
-    .{ .vk = 37, .fmt = .rgba8, .bytes = 4, .render = true, .comps = 4, .size = 1, .norm = true },
+    .{ .vk = 37, .fmt = .rgba8, .bytes = 4, .render = true, .storage = true, .comps = 4, .size = 1, .norm = true },
     .{ .vk = 43, .fmt = .rgba8, .bytes = 4, .srgb = true },
     .{ .vk = 44, .fmt = .bgra8, .bytes = 4, .render = true },
     .{ .vk = 50, .fmt = .bgra8, .bytes = 4, .srgb = true },
     .{ .vk = 70, .fmt = .r16, .bytes = 2 },
     .{ .vk = 77, .fmt = .rg16, .bytes = 4, .comps = 2, .size = 2, .norm = true },
-    .{ .vk = 98, .fmt = .r32ui, .bytes = 4, .filter = false, .comps = 1, .size = 4, .integer = true },
-    .{ .vk = 99, .fmt = .r32i, .bytes = 4, .filter = false, .comps = 1, .size = 4, .integer = true, .signed = true },
-    .{ .vk = 100, .fmt = .r32f, .bytes = 4, .filter = false, .comps = 1, .size = 4, .float = true },
-    .{ .vk = 101, .fmt = .rg32ui, .bytes = 8, .filter = false, .comps = 2, .size = 4, .integer = true },
-    .{ .vk = 102, .fmt = .rg32i, .bytes = 8, .filter = false, .comps = 2, .size = 4, .integer = true, .signed = true },
-    .{ .vk = 103, .fmt = .rg32f, .bytes = 8, .filter = false, .comps = 2, .size = 4, .float = true },
-    .{ .vk = 107, .fmt = .rgba32ui, .bytes = 16, .filter = false, .comps = 4, .size = 4, .integer = true },
-    .{ .vk = 108, .fmt = .rgba32i, .bytes = 16, .filter = false, .comps = 4, .size = 4, .integer = true, .signed = true },
-    .{ .vk = 109, .fmt = .rgba32f, .bytes = 16, .filter = false, .comps = 4, .size = 4, .float = true },
+    .{ .vk = 98, .fmt = .r32ui, .storage = true, .bytes = 4, .filter = false, .comps = 1, .size = 4, .integer = true },
+    .{ .vk = 99, .fmt = .r32i, .storage = true, .bytes = 4, .filter = false, .comps = 1, .size = 4, .integer = true, .signed = true },
+    .{ .vk = 100, .fmt = .r32f, .storage = true, .bytes = 4, .filter = false, .comps = 1, .size = 4, .float = true },
+    .{ .vk = 101, .fmt = .rg32ui, .storage = true, .bytes = 8, .filter = false, .comps = 2, .size = 4, .integer = true },
+    .{ .vk = 102, .fmt = .rg32i, .storage = true, .bytes = 8, .filter = false, .comps = 2, .size = 4, .integer = true, .signed = true },
+    .{ .vk = 103, .fmt = .rg32f, .storage = true, .bytes = 8, .filter = false, .comps = 2, .size = 4, .float = true },
+    .{ .vk = 107, .fmt = .rgba32ui, .storage = true, .bytes = 16, .filter = false, .comps = 4, .size = 4, .integer = true },
+    .{ .vk = 108, .fmt = .rgba32i, .storage = true, .bytes = 16, .filter = false, .comps = 4, .size = 4, .integer = true, .signed = true },
+    .{ .vk = 109, .fmt = .rgba32f, .storage = true, .bytes = 16, .filter = false, .comps = 4, .size = 4, .float = true },
     // images: depth and stencil (all d24s8 in memory)
     .{ .vk = 124, .fmt = .d24s8, .bytes = 4, .aspects = D, .depth = .unorm16 },
     .{ .vk = 125, .fmt = .d24s8, .bytes = 4, .aspects = D, .depth = .unorm24 },
@@ -142,6 +145,7 @@ pub fn props(vk: u32) Props {
     const x = image(vk) orelse return p;
     var o: u32 = Feature.sampled | Feature.transfer_src | Feature.transfer_dst;
     if (x.filter) o |= Feature.filter_linear;
+    if (x.storage) o |= Feature.storage;
     if (x.aspects & (D | S) != 0) {
         o |= Feature.depth_stencil;
     } else if (x.render) {

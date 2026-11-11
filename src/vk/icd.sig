@@ -11,8 +11,9 @@
 //! # What it is so far
 //!
 //! A Vulkan 1.1 device (instance version 1.1) for graphics and compute,
-//! truthful about it (multiview, multisampling and the features below
-//! apart; PLAN.md says what is left):
+//! truthful about it (multiview and the features below apart; 4x
+//! multisampling keeps one sample, "Multisampling" says how; PLAN.md says
+//! what is left):
 //!
 //! - **One queue family**, GRAPHICS, COMPUTE and TRANSFER, one queue (wgpu
 //!   takes an adapter whose first family has GRAPHICS).
@@ -169,7 +170,7 @@ const MAX_PENDING = 16;
 const MAX_CACHES = 64;
 /// Dispatches one gpu.Device run takes from a submission.
 const MAX_RUN = 256;
-const MAX_RUN_PARAMS = 2 * spirv.MAX_BINDINGS + MAX_PUSH_BYTES / 4 + 8;
+const MAX_RUN_PARAMS = 2 * spirv.MAX_BINDINGS + MAX_PUSH_BYTES / 4 + 4 * spirv.MAX_BINDINGS + 8;
 const STAGING_BYTES = 1 << 20;
 const GROUP = 64;
 const MAX_GROUPS: u32 = 65535;
@@ -2091,6 +2092,26 @@ const Exec = struct {
             const l = &T.set_layouts[set.layout];
             const lb = layoutBinding(l, want.binding) orelse continue;
             const d = T.descs[set.first + lb.first];
+            if (want.kind == .storage_image) {
+                // the view's level and first layer, and the words the
+                // front end addresses texels by (spirv's header); none
+                // bound: 0 by 0, nothing read or written
+                const v = viewOf(d.view) orelse continue;
+                const im = &T.images[v.image];
+                if (!im.live or im.mem == NONE or !T.memories[im.mem].live) continue;
+                const lv = v.base_level;
+                const depth = if (im.ty == 2) im.ld(lv) else v.layers;
+                const w0 = p.info.imageWord(@intCast(i));
+                bufs[i] = T.memories[im.mem].buf;
+                params[2 * i] = @truncate(im.at(lv, if (im.ty == 2) 0 else v.base_layer));
+                params[2 * i + 1] = @intCast(@min(im.slice(lv) * depth, 0xffff_ffff));
+                params[w0] = im.pitch(lv);
+                params[w0 + 1] = @intCast(@min(im.slice(lv), 0xffff_ffff));
+                params[w0 + 2] = im.lw(lv) | im.lh(lv) << 16;
+                params[w0 + 3] = depth;
+                if (p.writes >> @intCast(i) & 1 != 0) e.markDirty(im.mem);
+                continue;
+            }
             const pl = e.place(d.buf) orelse continue;
             var off = pl.off + d.offset;
             if (lb.dyn_first != NONE) off += e.dyn[want.set][lb.dyn_first];
@@ -2102,7 +2123,7 @@ const Exec = struct {
         }
         const pw = (p.info.push_bytes + 3) / 4;
         @memcpy(params[2 * nb ..][0..pw], e.push[0..pw]);
-        const np = @max(2 * nb + pw, p.param_words);
+        const np = @max(p.info.paramWords(), p.param_words);
         e.kernel(&p.prog, groups, bufs[0..nb], params[0..np]);
     }
 
@@ -2293,6 +2314,7 @@ const Exec = struct {
             .bind_gpipe => gx.pipe = as(u32, body),
             .begin_pass => e.beginPass(as(BeginPass, body)),
             .end_pass => {
+                e.resolvePass();
                 gx.rp = NONE;
                 gx.fb = NONE;
             },
@@ -2435,6 +2457,30 @@ const Exec = struct {
             }
             if (aspects == 0 or a >= b.n) continue;
             e.clearAtt(@intCast(a), aspects, b.clears[a], b.x, b.y, b.w, b.h, 0, fb.layers);
+        }
+    }
+
+    /// The pass's resolve attachments: each colour attachment's render
+    /// area copied into its resolve attachment (one sample kept: a copy).
+    fn resolvePass(e: *Exec) void {
+        const gx = &e.gfx;
+        if (gx.rp == NONE or gx.fb == NONE) return;
+        const rp = &T.render_passes[gx.rp];
+        const fb = &T.framebuffers[gx.fb];
+        for (0..rp.n_color) |j| {
+            const c = rp.color[j];
+            const r_ = rp.resolve[j];
+            if (c == NONE or r_ == NONE or c >= fb.n or r_ >= fb.n) continue;
+            const sv = viewOf(fb.views[c]) orelse continue;
+            const dv = viewOf(fb.views[r_]) orelse continue;
+            const off = abi.Offset3D{ .x = gx.area.offset.x, .y = gx.area.offset.y, .z = 0 };
+            e.copyImages(.{ .src = sv.image, .dst = dv.image, .region = .{
+                .srcSubresource = .{ .aspectMask = format.ASPECT_COLOR, .mipLevel = sv.base_level, .baseArrayLayer = sv.base_layer, .layerCount = fb.layers },
+                .srcOffset = off,
+                .dstSubresource = .{ .aspectMask = format.ASPECT_COLOR, .mipLevel = dv.base_level, .baseArrayLayer = dv.base_layer, .layerCount = fb.layers },
+                .dstOffset = off,
+                .extent = .{ .width = @min(gx.area.extent.width, fb.w), .height = @min(gx.area.extent.height, fb.h), .depth = 1 },
+            } });
         }
     }
 
@@ -3226,8 +3272,18 @@ fn waitSemaphores(dh: ?*anyopaque, info: ?*const abi.SemaphoreWaitInfo, timeout:
 // its own pass of the raster (its fragment code writes that location);
 // after the first, depth is tested EQUAL and not written, stencil is off.
 //
-// Not yet: multisampling, points and lines, primitive restart, depth bias,
-// storage images, FragDepth, scaled blits of the non-renderable formats.
+// Not yet: real multisampling (4x keeps one sample), points and lines,
+// primitive restart, depth bias, storage images outside compute shaders,
+// FragDepth, scaled blits of the non-renderable formats.
+
+/// Multisampling: VK_SAMPLE_COUNT_4_BIT, the one count past 1 here.
+/// WebGPU needs 4x render targets (and their resolves); the raster has no
+/// multisampling, so a 4x image keeps one sample a pixel (its memory a
+/// 1-sample image's), drawn at the pixel's centre: rendering is right, not
+/// antialiased. A resolve (vkCmdResolveImage, a subpass's resolve
+/// attachments) is a copy; a multisampled texture's every sample reads that
+/// one (textureNumSamples says 1).
+const SAMPLES_4: u32 = 4;
 
 pub const MAX_IMAGES = 4096;
 pub const MAX_VIEWS = 8192;
@@ -3333,6 +3389,9 @@ const RenderPass = struct {
     n_color: u32,
     color: [MAX_COLOR]u32,
     ds: u32,
+    /// colour attachment j's resolve attachment (NONE: none), copied into
+    /// at the end of the pass (a 4x image keeps one sample: see MSAA)
+    resolve: [MAX_COLOR]u32 = [_]u32{NONE} ** MAX_COLOR,
 };
 const Framebuffer = struct { live: bool, w: u32, h: u32, layers: u32, n: u32, views: [MAX_ATT]u32 };
 
@@ -3419,7 +3478,7 @@ fn gfxLimits(l: *abi.PhysicalDeviceLimits) void {
     l.maxSamplerAllocationCount = MAX_SAMPLERS;
     l.maxPerStageDescriptorSamplers = 16;
     l.maxPerStageDescriptorSampledImages = 16;
-    // (storage images are not compiled yet; WebGPU's default limit is 4)
+    // (storage images: compute shaders, spirv's storage formats; WebGPU's default is 4)
     l.maxPerStageDescriptorStorageImages = 4;
     l.maxPerStageDescriptorInputAttachments = 4;
     l.maxPerStageResources = 48;
@@ -3456,15 +3515,16 @@ fn gfxLimits(l: *abi.PhysicalDeviceLimits) void {
     l.maxFramebufferWidth = MAX_IMAGE_2D;
     l.maxFramebufferHeight = MAX_IMAGE_2D;
     l.maxFramebufferLayers = MAX_LAYERS;
-    l.framebufferColorSampleCounts = 1;
-    l.framebufferDepthSampleCounts = 1;
-    l.framebufferStencilSampleCounts = 1;
-    l.framebufferNoAttachmentsSampleCounts = 1;
+    // (MSAA 4x as WebGPU needs it, one sample kept: see "Multisampling")
+    l.framebufferColorSampleCounts = 1 | SAMPLES_4;
+    l.framebufferDepthSampleCounts = 1 | SAMPLES_4;
+    l.framebufferStencilSampleCounts = 1 | SAMPLES_4;
+    l.framebufferNoAttachmentsSampleCounts = 1 | SAMPLES_4;
     l.maxColorAttachments = MAX_COLOR;
-    l.sampledImageColorSampleCounts = 1;
-    l.sampledImageIntegerSampleCounts = 1;
-    l.sampledImageDepthSampleCounts = 1;
-    l.sampledImageStencilSampleCounts = 1;
+    l.sampledImageColorSampleCounts = 1 | SAMPLES_4;
+    l.sampledImageIntegerSampleCounts = 1 | SAMPLES_4;
+    l.sampledImageDepthSampleCounts = 1 | SAMPLES_4;
+    l.sampledImageStencilSampleCounts = 1 | SAMPLES_4;
     l.storageImageSampleCounts = 1;
     l.maxSampleMaskWords = 1;
     l.pointSizeRange = .{ 1, 1 };
@@ -3479,7 +3539,7 @@ fn imageFormatProperties(f: u32, ty: u32, tiling: u32, usage: u32, flags: u32, o
     const feats = if (tiling == 0) p.optimal else if (tiling == 1) p.linear else 0;
     if (feats == 0 or ty > 2) return R.error_format_not_supported;
     // usage: transfer src 1, dst 2, sampled 4, storage 8, colour 0x10, depth 0x20, transient 0x40, input 0x80
-    if (usage & 0x8 != 0) return R.error_format_not_supported;
+    if (usage & 0x8 != 0 and feats & format.Feature.storage == 0) return R.error_format_not_supported;
     if (usage & 0x10 != 0 and feats & format.Feature.color_attachment == 0) return R.error_format_not_supported;
     if (usage & 0x20 != 0 and feats & format.Feature.depth_stencil == 0) return R.error_format_not_supported;
     if (fi.aspects != format.ASPECT_COLOR and ty == 2) return R.error_format_not_supported;
@@ -3490,8 +3550,9 @@ fn imageFormatProperties(f: u32, ty: u32, tiling: u32, usage: u32, flags: u32, o
     };
     o.maxMipLevels = if (tiling == 1) 1 else MAX_LEVELS;
     o.maxArrayLayers = if (ty == 2 or tiling == 1) 1 else MAX_LAYERS;
-    _ = flags;
-    o.sampleCounts = 1;
+    // (4x: optimal 2D attachments, not cube-compatible, not storage)
+    const attach = feats & (format.Feature.color_attachment | format.Feature.depth_stencil) != 0;
+    o.sampleCounts = if (tiling == 0 and ty == 1 and attach and flags & 0x10 == 0 and usage & 0x8 == 0) 1 | SAMPLES_4 else 1;
     o.maxResourceSize = 1 << 31;
     return R.success;
 }
@@ -3512,8 +3573,8 @@ fn createImage(dh: ?*anyopaque, info: ?*const abi.ImageCreateInfo, _: ?*const an
         say("vkCreateImage: format {d} is not supported", .{ci.format});
         return R.error_format_not_supported;
     };
-    if (ci.samples > 1) {
-        say("vkCreateImage: {d} samples (no multisampling yet)", .{ci.samples});
+    if (ci.samples != 1 and ci.samples != SAMPLES_4) {
+        say("vkCreateImage: {d} samples (1 or 4 here)", .{ci.samples});
         return R.error_feature_not_present;
     }
     const e = ci.extent;
@@ -3740,13 +3801,16 @@ fn createRenderPass(_: ?*anyopaque, info: ?*const abi.RenderPassCreateInfo, _: ?
     var rp = RenderPass{ .live = true, .n_att = ci.attachmentCount, .att = undefined, .n_color = 0, .color = [_]u32{NONE} ** MAX_COLOR, .ds = NONE };
     for (0..ci.attachmentCount) |a| {
         const ad = ci.pAttachments.?[a];
-        if (ad.samples > 1) return R.error_feature_not_present;
+        if (ad.samples != 1 and ad.samples != SAMPLES_4) return R.error_feature_not_present;
         rp.att[a] = .{ .fmt = ad.format, .load = ad.loadOp, .sload = ad.stencilLoadOp };
     }
     const sp = ci.pSubpasses.?[0];
     if (sp.colorAttachmentCount > MAX_COLOR) return R.error_initialization_failed;
     rp.n_color = sp.colorAttachmentCount;
     for (0..sp.colorAttachmentCount) |c| rp.color[c] = sp.pColorAttachments.?[c].attachment;
+    if (sp.pResolveAttachments) |ra| {
+        for (0..sp.colorAttachmentCount) |c| rp.resolve[c] = ra[c].attachment;
+    }
     if (sp.pDepthStencilAttachment) |ds| rp.ds = ds.attachment;
     T.render_passes[i] = rp;
     (out orelse return R.error_initialization_failed).* = handle(.render_pass, i);
@@ -4773,7 +4837,7 @@ fn cmdCopyImage(h: ?*anyopaque, src: u64, _: u32, dst: u64, _: u32, n: u32, regi
     for (0..n) |i| put(cb, .copy_i2i, ImgImg{ .src = unhandle(.image, src) orelse NONE, .dst = unhandle(.image, dst) orelse NONE, .region = regions.?[i] });
 }
 
-/// (no multisampling: a resolve is a copy)
+/// (4x images keep one sample: a resolve is a copy)
 fn cmdResolveImage(h: ?*anyopaque, src: u64, sl: u32, dst: u64, dl: u32, n: u32, regions: ?[*]const abi.ImageCopy) callconv(.c) void {
     cmdCopyImage(h, src, sl, dst, dl, n, regions);
 }
