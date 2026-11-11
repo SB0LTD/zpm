@@ -287,6 +287,7 @@ pub const Op = struct {
     pub const atomic_store = 228;
     pub const atomic_exchange = 229;
     pub const atomic_compare_exchange = 230;
+    pub const atomic_compare_exchange_weak = 231;
     pub const atomic_i_increment = 232;
     pub const atomic_i_decrement = 233;
     pub const atomic_i_add = 234;
@@ -313,6 +314,41 @@ pub const Op = struct {
     pub const module_processed = 330;
     pub const execution_mode_id = 331;
     pub const decorate_id = 332;
+    // OpGroupNonUniform*: 333 (Elect) .. 366 (QuadSwap)
+    pub const group_non_uniform_elect = 333;
+    pub const group_non_uniform_all = 334;
+    pub const group_non_uniform_any = 335;
+    pub const group_non_uniform_all_equal = 336;
+    pub const group_non_uniform_broadcast = 337;
+    pub const group_non_uniform_broadcast_first = 338;
+    pub const group_non_uniform_ballot = 339;
+    pub const group_non_uniform_inverse_ballot = 340;
+    pub const group_non_uniform_ballot_bit_extract = 341;
+    pub const group_non_uniform_ballot_bit_count = 342;
+    pub const group_non_uniform_ballot_find_lsb = 343;
+    pub const group_non_uniform_ballot_find_msb = 344;
+    pub const group_non_uniform_shuffle = 345;
+    pub const group_non_uniform_shuffle_xor = 346;
+    pub const group_non_uniform_shuffle_up = 347;
+    pub const group_non_uniform_shuffle_down = 348;
+    pub const group_non_uniform_i_add = 349;
+    pub const group_non_uniform_f_add = 350;
+    pub const group_non_uniform_i_mul = 351;
+    pub const group_non_uniform_f_mul = 352;
+    pub const group_non_uniform_s_min = 353;
+    pub const group_non_uniform_u_min = 354;
+    pub const group_non_uniform_f_min = 355;
+    pub const group_non_uniform_s_max = 356;
+    pub const group_non_uniform_u_max = 357;
+    pub const group_non_uniform_f_max = 358;
+    pub const group_non_uniform_bitwise_and = 359;
+    pub const group_non_uniform_bitwise_or = 360;
+    pub const group_non_uniform_bitwise_xor = 361;
+    pub const group_non_uniform_logical_and = 362;
+    pub const group_non_uniform_logical_or = 363;
+    pub const group_non_uniform_logical_xor = 364;
+    pub const group_non_uniform_quad_broadcast = 365;
+    pub const group_non_uniform_quad_swap = 366;
     pub const copy_logical = 400;
     pub const terminate_invocation = 4416;
     pub const demote_to_helper_invocation = 5380;
@@ -371,6 +407,11 @@ const BuiltIn = struct {
     const num_subgroups = 38;
     const subgroup_id = 40;
     const subgroup_local_invocation_id = 41;
+    const subgroup_eq_mask = 4416;
+    const subgroup_ge_mask = 4417;
+    const subgroup_gt_mask = 4418;
+    const subgroup_le_mask = 4419;
+    const subgroup_lt_mask = 4420;
 };
 
 const GLSL = struct {
@@ -453,6 +494,9 @@ pub const Options = struct {
     stage: Stage = .compute,
     spec: []const SpecEntry = &.{},
     spec_data: []const u8 = &.{},
+    /// The device's subgroup width (Caps.subgroup): the subgroup ops take
+    /// 32 or fewer.
+    subgroup: u32 = 32,
 };
 
 pub const BindKind = enum(u8) { storage, uniform, storage_image };
@@ -967,10 +1011,40 @@ pub const Gen = struct {
         return switch (g.tyOp(t)) {
             Op.type_bool => .pred,
             Op.type_int => if (in[2] != 32) g.unsupported("spirv: {d}-bit integers", .{in[2]}) else if (in[3] != 0) .i32 else .u32,
-            Op.type_float => if (in[2] != 32) g.unsupported("spirv: {d}-bit floats", .{in[2]}) else .f32,
+            // (f16 values live as f32 registers holding the half's value:
+            // every result rounded to half precision, 16 bits in memory)
+            Op.type_float => if (in[2] != 32 and in[2] != 16) g.unsupported("spirv: {d}-bit floats", .{in[2]}) else .f32,
             Op.type_vector, Op.type_matrix, Op.type_array, Op.type_runtime_array => g.scalarTy(g.elemOf(t, 0)),
             else => g.bad("spirv: no scalar type in type {d}", .{t}),
         };
+    }
+
+    /// Whether type `t` is f16, or a vector or matrix of it.
+    fn isHalf(g: *const Gen, t: u32) bool {
+        return switch (g.tyOp(t)) {
+            Op.type_float => g.tyInst(t)[2] == 16,
+            Op.type_vector, Op.type_matrix => g.isHalf(g.tyInst(t)[2]),
+            else => false,
+        };
+    }
+
+    /// x rounded to half precision (to nearest even), as an f32.
+    fn roundHalf(g: *Gen, x: Arg) Arg {
+        if (x == .imm) {
+            const h: f16 = @floatCast(@as(f32, @bitCast(x.imm)));
+            return f(@floatCast(h));
+        }
+        const h = r(g.k.cvt(.f32, .f16, .rne, x));
+        return r(g.k.cvt(.f16, .f32, .rne, h));
+    }
+
+    /// An f16 result (value `id` of type `t`) rounded to half precision.
+    fn roundResult(g: *Gen, t: u32, id: u32) Error!void {
+        if (!g.isHalf(t)) return;
+        const vals = try g.get(id);
+        const c = try g.newComps(@intCast(vals.len));
+        for (g.slice(c), vals) |*o, x| o.* = g.roundHalf(x);
+        g.setVal(id, c);
     }
 
     /// Every component's KIR type, in order, into out; returns the count.
@@ -1021,11 +1095,13 @@ pub const Gen = struct {
             Op.type_bool, Op.type_int, Op.type_float => {
                 if (n >= MAX_LAYOUT) return error.TooBig;
                 g.s.lay_off[n] = base;
-                g.s.lay_ty[n] = try g.scalarTy(t);
+                // (.f16: the 16 bits of a half in memory)
+                g.s.lay_ty[n] = if (g.isHalf(t)) .f16 else try g.scalarTy(t);
                 n += 1;
             },
             Op.type_vector => for (0..g.lenOf(t)) |ix| {
-                n = try g.layout(g.elemOf(t, 0), base + 4 * @as(u32, @intCast(ix)), mstride, n);
+                const eb: u32 = if (g.isHalf(t)) 2 else 4;
+                n = try g.layout(g.elemOf(t, 0), base + eb * @as(u32, @intCast(ix)), mstride, n);
             },
             Op.type_matrix => for (0..g.lenOf(t)) |c| {
                 n = try g.layout(g.elemOf(t, 0), base + mstride * @as(u32, @intCast(c)), mstride, n);
@@ -1120,7 +1196,10 @@ pub const Gen = struct {
                 if (in.len < 4) return error.BadSpirv;
                 if (in.len > 4) return g.unsupported("spirv: 64-bit constants", .{});
                 const v = if (g.opAt(at) == Op.spec_constant) (g.specValue(id) orelse in[3]) else in[3];
-                try g.define(id, &.{u(v)});
+                if (g.isHalf(t)) {
+                    const h: f16 = @bitCast(@as(u16, @truncate(v)));
+                    try g.define(id, &.{f(@floatCast(h))});
+                } else try g.define(id, &.{u(v)});
             },
             Op.constant_true, Op.constant_false => try g.define(id, &.{u(@intFromBool(g.opAt(at) == Op.constant_true))}),
             Op.spec_constant_true, Op.spec_constant_false => {
@@ -1474,7 +1553,7 @@ pub const Gen = struct {
         const k = g.k;
         const bi = g.s.defs[id].builtin;
         if (bi == NONE) return g.unsupported("spirv: an Input variable that is not a built-in", .{});
-        var v: [3]Arg = .{ u(0), u(0), u(0) };
+        var v: [4]Arg = .{ u(0), u(0), u(0), u(0) };
         var n: u32 = 3;
         switch (bi) {
             BuiltIn.local_invocation_id => for (0..3) |a| {
@@ -1489,7 +1568,7 @@ pub const Gen = struct {
             BuiltIn.global_invocation_id => for (0..3) |a| {
                 v[a] = r(k.op3(.imad, .u32, r(k.gid(@intCast(a))), u(g.info.group[a]), r(k.tid(@intCast(a)))));
             },
-            BuiltIn.workgroup_size => v = .{ u(g.info.group[0]), u(g.info.group[1]), u(g.info.group[2]) },
+            BuiltIn.workgroup_size => v = .{ u(g.info.group[0]), u(g.info.group[1]), u(g.info.group[2]), u(0) },
             BuiltIn.local_invocation_index => {
                 n = 1;
                 v[0] = g.localIndex();
@@ -1511,6 +1590,23 @@ pub const Gen = struct {
                 const threads = g.info.group[0] * g.info.group[1] * g.info.group[2];
                 const w = r(k.subgroupWidth());
                 v[0] = g.udiv(g.iadd(u(threads), g.isub(w, u(1))), w)[0];
+            },
+            BuiltIn.subgroup_eq_mask, BuiltIn.subgroup_ge_mask, BuiltIn.subgroup_gt_mask, BuiltIn.subgroup_le_mask, BuiltIn.subgroup_lt_mask => {
+                // (a subgroup of 32 or fewer: the first word only)
+                n = 4;
+                const ln = r(k.lane());
+                const below = g.sel(.u32, g.icmp(.u32, .eq, ln, u(0)), u(0), g.iop(.shr, .u32, u(0xffff_ffff), g.iop(.isub, .u32, u(32), ln)));
+                const eq = g.iop(.shl, .u32, u(1), ln);
+                v[0] = switch (bi) {
+                    BuiltIn.subgroup_eq_mask => eq,
+                    BuiltIn.subgroup_lt_mask => below,
+                    BuiltIn.subgroup_le_mask => g.iop(.@"or", .u32, below, eq),
+                    BuiltIn.subgroup_gt_mask => g.iop(.xor, .u32, g.iop(.@"or", .u32, below, eq), u(0xffff_ffff)),
+                    else => g.iop(.xor, .u32, below, u(0xffff_ffff)),
+                };
+                v[1] = u(0);
+                v[2] = u(0);
+                v[3] = u(0);
             },
             else => return g.unsupported("spirv: built-in {d}", .{bi}),
         }
@@ -2005,9 +2101,15 @@ pub const Gen = struct {
                 @memset(g.slice(c), u(0));
                 g.setVal(in[2], c);
             },
-            Op.load, Op.atomic_load => {
+            Op.load => {
                 const p = try g.ptrOf(in[3]);
                 g.setVal(in[2], try g.loadPtr(p));
+            },
+            Op.atomic_load => {
+                // (in memory: an atomic add of 0, so that a spinning
+                // reader sees other groups' writes, not a cached word)
+                const p = try g.ptrOf(in[3]);
+                if (p.space == .buffer or p.space == .shared) try g.atomic(op, in) else g.setVal(in[2], try g.loadPtr(p));
             },
             Op.store => try g.storePtr(try g.ptrOf(in[1]), try g.get(in[2])),
             Op.atomic_store => try g.storePtr(try g.ptrOf(in[1]), try g.get(in[4])),
@@ -2137,10 +2239,15 @@ pub const Gen = struct {
             Op.ext_inst => {
                 if (in[3] != g.glsl_set) return g.unsupported("spirv: an extended instruction set other than GLSL.std.450", .{});
                 try g.glsl(in);
+                try g.roundResult(in[1], in[2]);
             },
             Op.atomic_i_add, Op.atomic_i_sub, Op.atomic_s_min, Op.atomic_u_min, Op.atomic_s_max, Op.atomic_u_max, Op.atomic_exchange, Op.atomic_i_increment, Op.atomic_i_decrement => try g.atomic(op, in),
             Op.bit_field_insert, Op.bit_field_s_extract, Op.bit_field_u_extract => try g.bitfield(in, op),
-            Op.atomic_and, Op.atomic_or, Op.atomic_xor, Op.atomic_compare_exchange => return g.unsupported("spirv: atomic op {d} (KIR has add, min, max and exchange)", .{op}),
+            Op.atomic_and, Op.atomic_or, Op.atomic_xor, Op.atomic_compare_exchange, Op.atomic_compare_exchange_weak => try g.atomic(op, in),
+            Op.group_non_uniform_elect...Op.group_non_uniform_quad_swap => {
+                try g.subgroup(op, in);
+                try g.roundResult(in[1], in[2]);
+            },
             Op.transpose => {
                 const m = try g.get(in[3]);
                 const cols = g.lenOf(in[1]);
@@ -2151,8 +2258,48 @@ pub const Gen = struct {
                 }
                 g.setVal(in[2], c);
             },
-            else => try g.arith(op, in),
+            Op.bitcast => if (!try g.halfCast(in)) {
+                try g.arith(op, in);
+            },
+            else => {
+                try g.arith(op, in);
+                try g.roundResult(in[1], in[2]);
+            },
         }
+    }
+
+    /// A bitcast between halves and 32-bit values (vec2<f16> and a u32,
+    /// i32 or f32; vec4<f16> and vec2 of them): the halves' bits packed,
+    /// low first. False when neither side is f16.
+    fn halfCast(g: *Gen, in: []const u32) Error!bool {
+        const src_t = g.typeOfValue(in[3]) orelse return false;
+        const to_half = g.isHalf(in[1]);
+        if (!to_half and !g.isHalf(src_t)) return false;
+        if (to_half and g.isHalf(src_t)) {
+            try g.define(in[2], try g.get(in[3]));
+            return true;
+        }
+        const x = try g.get(in[3]);
+        if (to_half) {
+            // each 32-bit word into two halves
+            const c = try g.newComps(@intCast(2 * x.len));
+            for (x, 0..) |w0, j| {
+                const w = r(g.reg(w0, .u32));
+                g.slice(c)[2 * j] = g.unhalf(g.iop(.@"and", .u32, w, u(0xffff)));
+                g.slice(c)[2 * j + 1] = g.unhalf(g.iop(.shr, .u32, w, u(16)));
+            }
+            g.setVal(in[2], c);
+        } else {
+            if (x.len % 2 != 0) return g.unsupported("spirv: a bitcast of an odd number of halves", .{});
+            const dst = try g.scalarTy(in[1]);
+            const c = try g.newComps(@intCast(x.len / 2));
+            for (g.slice(c), 0..) |*o, j| {
+                const w = g.iop(.@"or", .u32, g.half(x[2 * j]), g.iop(.shl, .u32, g.half(x[2 * j + 1]), u(16)));
+                o.* = g.cast(w, .u32, dst);
+            }
+            g.setVal(in[2], c);
+        }
+        return true;
     }
 
     const At = struct { off: u32, n: u32 };
@@ -2209,7 +2356,7 @@ pub const Gen = struct {
             Op.type_array, Op.type_runtime_array, Op.type_vector, Op.type_matrix => {
                 const e = g.elemOf(t, 0);
                 const stride: u32 = if (bytes) switch (g.tyOp(t)) {
-                    Op.type_vector => 4,
+                    Op.type_vector => if (g.isHalf(t)) 2 else 4,
                     Op.type_matrix => p.mstride,
                     else => g.s.defs[t].stride,
                 } else g.unit(p.space) * g.comps(e);
@@ -2247,7 +2394,9 @@ pub const Gen = struct {
                     const off = g.s.lay_off[j];
                     const ty = g.s.lay_ty[j];
                     if (ty == .pred) return g.bad("spirv: a bool in a block", .{});
-                    g.slice(c)[j] = if (p.space == .buffer) g.bufLoad(p.slot, p.off, p.imm + off, ty) else try g.pushLoad(p.off, p.imm + off, ty);
+                    g.slice(c)[j] = if (ty == .f16)
+                        (if (p.space == .buffer) g.bufLoadHalf(p.slot, p.off, p.imm + off) else g.unhalf(try g.pushHalf(p.off, p.imm + off)))
+                    else if (p.space == .buffer) g.bufLoad(p.slot, p.off, p.imm + off, ty) else try g.pushLoad(p.off, p.imm + off, ty);
                 }
                 return c;
             },
@@ -2313,7 +2462,9 @@ pub const Gen = struct {
             .buffer => {
                 const n = try g.layout(p.ty, 0, p.mstride, 0);
                 if (n != vals.len) return error.BadSpirv;
-                for (0..n) |j| g.bufStore(p.slot, p.off, p.imm + g.s.lay_off[j], g.s.lay_ty[j], vals[j]);
+                for (0..n) |j| {
+                    if (g.s.lay_ty[j] == .f16) g.bufStoreHalf(p.slot, p.off, p.imm + g.s.lay_off[j], vals[j]) else g.bufStore(p.slot, p.off, p.imm + g.s.lay_off[j], g.s.lay_ty[j], vals[j]);
+                }
             },
             .push, .input, .handle => return g.bad("spirv: a store to a read-only variable", .{}),
             .shared => {
@@ -2392,6 +2543,45 @@ pub const Gen = struct {
         k.ifp(inb);
         k.store(ty, kir.global(g.kbinding(b), 32), g.iadd(g.view[b], total), val);
         k.endif();
+    }
+
+    /// A half from binding b at off + imm (16 bits; 0 out of range when
+    /// robust), as an f32.
+    fn bufLoadHalf(g: *Gen, b: u32, off: Arg, imm: u32) Arg {
+        const k = g.k;
+        const total = g.iadd(off, u(imm));
+        if (!g.opts.robust) return r(k.cvt(.f16, .f32, .rne, r(k.load(.f16, kir.global(g.kbinding(b), 16), g.iadd(g.view[b], total)))));
+        const inb = g.icmp(.u32, .lt, total, g.iop(.isub, .u32, g.iop(.imax, .u32, g.range[b], u(2)), u(1)));
+        const a = g.iadd(g.view[b], g.sel(.u32, inb, total, u(0)));
+        const v = r(k.cvt(.f16, .f32, .rne, r(k.load(.f16, kir.global(g.kbinding(b), 16), a))));
+        return g.sel(.f32, inb, v, f(0));
+    }
+
+    /// A half (an f32 holding one) stored as 16 bits.
+    fn bufStoreHalf(g: *Gen, b: u32, off: Arg, imm: u32, v: Arg) void {
+        const k = g.k;
+        const total = g.iadd(off, u(imm));
+        const h = r(k.cvt(.f32, .f16, .rne, r(g.reg(v, .f32))));
+        if (!g.opts.robust) {
+            k.store(.f16, kir.global(g.kbinding(b), 16), g.iadd(g.view[b], total), h);
+            return;
+        }
+        const inb = g.icmp(.u32, .lt, total, g.iop(.isub, .u32, g.iop(.imax, .u32, g.range[b], u(2)), u(1)));
+        k.ifp(inb);
+        k.store(.f16, kir.global(g.kbinding(b), 16), g.iadd(g.view[b], total), h);
+        k.endif();
+    }
+
+    /// A push constant's half: the 16 bits of its word (as a u32).
+    fn pushHalf(g: *Gen, off: Arg, imm: u32) Error!Arg {
+        if (off == .imm) {
+            const at = off.imm + imm;
+            const w = try g.pushLoad(u(at & ~@as(u32, 3)), 0, .u32);
+            return g.iop(.@"and", .u32, g.iop(.shr, .u32, w, u(8 * (at & 2))), u(0xffff));
+        }
+        const at = g.iadd(off, u(imm));
+        const w = try g.pushLoad(g.iop(.@"and", .u32, at, u(~@as(u32, 3))), 0, .u32);
+        return g.iop(.@"and", .u32, g.iop(.shr, .u32, w, g.iop(.shl, .u32, g.iop(.@"and", .u32, at, u(2)), u(3))), u(0xffff));
     }
 
     /// A push-constant word: its parameter, or a choice among them for a dynamic offset.
@@ -2931,16 +3121,23 @@ pub const Gen = struct {
         const ty = try g.scalarTy(in[1]);
         if (ty != .u32 and ty != .i32) return g.unsupported("spirv: float atomics", .{});
         const p = try g.ptrOf(in[3]);
+        // (compare-exchange: Value at 7, Comparator at 8, after two semantics)
+        const cas = op == Op.atomic_compare_exchange or op == Op.atomic_compare_exchange_weak;
         const val: Arg = switch (op) {
             Op.atomic_i_increment => u(1),
+            Op.atomic_load => u(0),
             Op.atomic_i_decrement => u(0xffff_ffff),
             Op.atomic_i_sub => g.op1(.ineg, .i32, (try g.get(in[6]))[0]),
+            Op.atomic_compare_exchange, Op.atomic_compare_exchange_weak => (try g.get(in[7]))[0],
             else => (try g.get(in[6]))[0],
         };
         const kind: kir.Atom = switch (op) {
             Op.atomic_s_min, Op.atomic_u_min => .min,
             Op.atomic_s_max, Op.atomic_u_max => .max,
             Op.atomic_exchange => .xchg,
+            Op.atomic_and => .@"and",
+            Op.atomic_or => .@"or",
+            Op.atomic_xor => .xor,
             else => .add,
         };
         const aty: kir.Ty = switch (op) {
@@ -2949,27 +3146,262 @@ pub const Gen = struct {
             else => ty,
         };
         const v = r(g.reg(val, aty));
+        const cmp: Arg = if (cas) r(g.reg((try g.get(in[8]))[0], aty)) else no;
         switch (p.space) {
             .shared => {
                 var m = kir.shared(32);
                 const a = g.sharedAddr(p, 0, &m);
-                try g.define(in[2], &.{r(k.atomic(aty, kind, m, a, v))});
+                try g.define(in[2], &.{r(if (cas) k.cas(aty, m, a, cmp, v) else k.atomic(aty, kind, m, a, v))});
             },
             .buffer => {
                 const total = g.iadd(p.off, u(p.imm));
+                const m = kir.global(@intCast(p.slot), 32);
                 if (!g.opts.robust) {
-                    try g.define(in[2], &.{r(k.atomic(aty, kind, kir.global(@intCast(p.slot), 32), g.iadd(g.view[p.slot], total), v))});
+                    const a = g.iadd(g.view[p.slot], total);
+                    try g.define(in[2], &.{r(if (cas) k.cas(aty, m, a, cmp, v) else k.atomic(aty, kind, m, a, v))});
                     return;
                 }
                 const inb = g.icmp(.u32, .lt, total, g.lim[p.slot]);
                 const res = k.reg(aty);
                 k.set(res, .mov, u(0), no, no);
                 k.ifp(inb);
-                k.setAux(res, .atom, g.iadd(g.view[p.slot], total), v, u(@intFromEnum(kind)), @bitCast(kir.global(@intCast(p.slot), 32)));
+                if (cas)
+                    k.setAux(res, .cas, g.iadd(g.view[p.slot], total), cmp, v, @bitCast(m))
+                else
+                    k.setAux(res, .atom, g.iadd(g.view[p.slot], total), v, u(@intFromEnum(kind)), @bitCast(m));
                 k.endif();
                 try g.define(in[2], &.{r(res)});
             },
             else => return g.unsupported("spirv: an atomic on storage of space {s}", .{@tagName(p.space)}),
+        }
+    }
+
+    // ── Subgroups ──
+    //
+    // Over KIR's shfl, vote and ballot, for subgroups of 32 or fewer lanes.
+    // Reductions and scans: a butterfly (shfl xor / up) when every lane of
+    // the subgroup is active; otherwise a walk over the active lanes in
+    // turn (shfl idx from each, under a uniform if), which never reads an
+    // inactive lane.
+
+    const GroupOp = struct {
+        const reduce = 0;
+        const inclusive = 1;
+        const exclusive = 2;
+        const clustered = 3;
+    };
+
+    /// The active lanes' mask (a ballot of true).
+    fn activeMask(g: *Gen) Arg {
+        return r(g.k.ballot(u(1), 0));
+    }
+
+    /// The lowest set bit's index (-1 for 0).
+    fn lsb(g: *Gen, x0: Arg) Arg {
+        const x = r(g.reg(x0, .u32));
+        return g.findMsb(g.iop(.@"and", .u32, x, g.op1(.ineg, .i32, x)));
+    }
+
+    /// shfl of any scalar (a pred through 0/1).
+    fn shflAny(g: *Gen, ty: kir.Ty, mode: kir.Shfl, x: Arg, b: Arg) Arg {
+        if (ty == .pred) {
+            const v = g.sel(.u32, x, u(1), u(0));
+            return g.icmp(.u32, .ne, r(g.k.shfl(.u32, mode, r(g.reg(v, .u32)), b)), u(0));
+        }
+        return r(g.k.shfl(ty, mode, r(g.reg(x, ty)), b));
+    }
+
+    const Combine = struct { op: kir.Op, ty: kir.Ty, identity: u32 };
+
+    fn combineOf(op: u16) Combine {
+        return switch (op) {
+            Op.group_non_uniform_i_add => .{ .op = .iadd, .ty = .u32, .identity = 0 },
+            Op.group_non_uniform_f_add => .{ .op = .fadd, .ty = .f32, .identity = 0x8000_0000 },
+            Op.group_non_uniform_i_mul => .{ .op = .imul, .ty = .u32, .identity = 1 },
+            Op.group_non_uniform_f_mul => .{ .op = .fmul, .ty = .f32, .identity = 0x3f80_0000 },
+            Op.group_non_uniform_s_min => .{ .op = .imin, .ty = .i32, .identity = 0x7fff_ffff },
+            Op.group_non_uniform_u_min => .{ .op = .imin, .ty = .u32, .identity = 0xffff_ffff },
+            Op.group_non_uniform_f_min => .{ .op = .fmin, .ty = .f32, .identity = 0x7f80_0000 },
+            Op.group_non_uniform_s_max => .{ .op = .imax, .ty = .i32, .identity = 0x8000_0000 },
+            Op.group_non_uniform_u_max => .{ .op = .imax, .ty = .u32, .identity = 0 },
+            Op.group_non_uniform_f_max => .{ .op = .fmax, .ty = .f32, .identity = 0xff80_0000 },
+            Op.group_non_uniform_bitwise_and, Op.group_non_uniform_logical_and => .{ .op = .@"and", .ty = .u32, .identity = 0xffff_ffff },
+            Op.group_non_uniform_bitwise_or, Op.group_non_uniform_logical_or => .{ .op = .@"or", .ty = .u32, .identity = 0 },
+            else => .{ .op = .xor, .ty = .u32, .identity = 0 },
+        };
+    }
+
+    fn combine(g: *Gen, c: Combine, a: Arg, b: Arg) Arg {
+        return switch (c.ty) {
+            .f32 => g.fop(c.op, a, b),
+            else => g.iop(c.op, c.ty, a, b),
+        };
+    }
+
+    /// A reduction or scan of x (u32/i32/f32) over the active lanes.
+    fn groupArith(g: *Gen, c: Combine, gop: u32, cluster: u32, x0: Arg) Error!Arg {
+        const k = g.k;
+        const width = g.opts.subgroup;
+        const full: u32 = if (width >= 32) 0xffff_ffff else (@as(u32, 1) << @intCast(width)) - 1;
+        const x = r(g.reg(x0, c.ty));
+        const ln = r(k.lane());
+        const res = k.reg(c.ty);
+        k.ifp(g.icmp(.u32, .eq, g.activeMask(), u(full)));
+        {
+            var acc = x;
+            switch (gop) {
+                GroupOp.reduce, GroupOp.clustered => {
+                    const n = if (gop == GroupOp.clustered) @min(cluster, width) else width;
+                    var s: u32 = 1;
+                    while (s < n) : (s *= 2) acc = g.combine(c, acc, r(k.shfl(c.ty, .xor, r(g.reg(acc, c.ty)), u(s))));
+                },
+                else => {
+                    var s: u32 = 1;
+                    while (s < width) : (s *= 2) {
+                        const v = r(k.shfl(c.ty, .up, r(g.reg(acc, c.ty)), u(s)));
+                        acc = g.sel(c.ty, g.icmp(.u32, .ge, ln, u(s)), g.combine(c, acc, v), acc);
+                    }
+                    if (gop == GroupOp.exclusive) {
+                        const v = r(k.shfl(c.ty, .up, r(g.reg(acc, c.ty)), u(1)));
+                        acc = g.sel(c.ty, g.icmp(.u32, .ge, ln, u(1)), v, u(c.identity));
+                    }
+                },
+            }
+            k.set(res, .mov, acc, no, no);
+        }
+        k.els();
+        {
+            const mask = g.activeMask();
+            k.set(res, .mov, u(c.identity), no, no);
+            const j = k.mov(.u32, u(0));
+            k.loop();
+            k.brk(g.icmp(.u32, .ge, r(j), u(width)));
+            k.ifp(g.icmp(.u32, .ne, g.iop(.@"and", .u32, g.iop(.shr, .u32, mask, r(j)), u(1)), u(0)));
+            const v = r(k.shfl(c.ty, .idx, x, r(j)));
+            const take: Arg = switch (gop) {
+                GroupOp.reduce => u(1),
+                GroupOp.inclusive => g.icmp(.u32, .le, r(j), ln),
+                GroupOp.exclusive => g.icmp(.u32, .lt, r(j), ln),
+                else => g.icmp(.u32, .eq, g.iop(.@"and", .u32, g.iop(.xor, .u32, r(j), ln), u(~(@max(cluster, 1) - 1))), u(0)),
+            };
+            const both = g.combine(c, r(res), v);
+            k.set(res, .mov, if (take == .imm) both else g.sel(c.ty, take, both, r(res)), no, no);
+            k.endif();
+            k.set(j, .iadd, r(j), u(1), no);
+            k.endloop();
+        }
+        k.endif();
+        return r(res);
+    }
+
+    fn subgroup(g: *Gen, op: u16, in: []const u32) Error!void {
+        const k = g.k;
+        if (g.opts.subgroup > 32) return g.unsupported("spirv: subgroup ops on a subgroup of {d}", .{g.opts.subgroup});
+        const id = in[2];
+        const rt = in[1];
+        switch (op) {
+            Op.group_non_uniform_elect => {
+                try g.define(id, &.{g.icmp(.u32, .eq, r(k.lane()), g.lsb(g.activeMask()))});
+            },
+            Op.group_non_uniform_all, Op.group_non_uniform_any => {
+                const p = (try g.get(in[4]))[0];
+                const mode: kir.Vote = if (op == Op.group_non_uniform_all) .all else .any;
+                try g.define(id, &.{if (p == .imm) p else r(k.vote(mode, p))});
+            },
+            Op.group_non_uniform_all_equal => {
+                const xs = try g.get(in[4]);
+                const ty = try g.scalarTy(g.typeOfValue(in[4]) orelse return error.BadSpirv);
+                const first = g.lsb(g.activeMask());
+                var same: Arg = u(1);
+                for (xs) |x| {
+                    const f0 = g.shflAny(ty, .idx, x, first);
+                    const eq = switch (ty) {
+                        .pred => g.pnot(g.pxor(x, f0)),
+                        .f32 => g.fcmp(.eq, x, f0),
+                        else => g.icmp(.u32, .eq, x, f0),
+                    };
+                    same = g.pand(same, eq);
+                }
+                try g.define(id, &.{if (same == .imm) same else r(k.vote(.all, same))});
+            },
+            Op.group_non_uniform_broadcast, Op.group_non_uniform_broadcast_first, Op.group_non_uniform_shuffle, Op.group_non_uniform_shuffle_xor, Op.group_non_uniform_shuffle_up, Op.group_non_uniform_shuffle_down, Op.group_non_uniform_quad_broadcast, Op.group_non_uniform_quad_swap => {
+                const xs = try g.get(in[4]);
+                const ty = try g.scalarTy(rt);
+                var mode: kir.Shfl = .idx;
+                const b: Arg = switch (op) {
+                    Op.group_non_uniform_broadcast_first => g.lsb(g.activeMask()),
+                    Op.group_non_uniform_quad_broadcast => g.iop(.@"or", .u32, g.iop(.@"and", .u32, r(k.lane()), u(~@as(u32, 3))), g.iop(.@"and", .u32, (try g.get(in[5]))[0], u(3))),
+                    Op.group_non_uniform_quad_swap => blk: {
+                        mode = .xor;
+                        const dir = (try g.get(in[5]))[0];
+                        if (dir != .imm) return g.bad("spirv: a QuadSwap direction not constant", .{});
+                        break :blk u(dir.imm + 1);
+                    },
+                    else => blk: {
+                        mode = switch (op) {
+                            Op.group_non_uniform_shuffle_xor => .xor,
+                            Op.group_non_uniform_shuffle_up => .up,
+                            Op.group_non_uniform_shuffle_down => .down,
+                            else => .idx,
+                        };
+                        break :blk (try g.get(in[5]))[0];
+                    },
+                };
+                const c = try g.newComps(@intCast(xs.len));
+                for (g.slice(c), xs) |*o, x| o.* = g.shflAny(ty, mode, x, b);
+                g.setVal(id, c);
+            },
+            Op.group_non_uniform_ballot => {
+                const p = (try g.get(in[4]))[0];
+                try g.define(id, &.{ r(k.ballot(p, 0)), u(0), u(0), u(0) });
+            },
+            Op.group_non_uniform_inverse_ballot => {
+                const v = (try g.get(in[4]))[0];
+                try g.define(id, &.{g.icmp(.u32, .ne, g.iop(.@"and", .u32, g.iop(.shr, .u32, v, r(k.lane())), u(1)), u(0))});
+            },
+            Op.group_non_uniform_ballot_bit_extract => {
+                const v = try g.get(in[4]);
+                const ix = (try g.get(in[5]))[0];
+                const bit = g.icmp(.u32, .ne, g.iop(.@"and", .u32, g.iop(.shr, .u32, v[0], ix), u(1)), u(0));
+                try g.define(id, &.{g.pand(bit, g.icmp(.u32, .lt, ix, u(32)))});
+            },
+            Op.group_non_uniform_ballot_bit_count => {
+                const v = (try g.get(in[5]))[0];
+                const ln = r(k.lane());
+                const below = g.sel(.u32, g.icmp(.u32, .eq, ln, u(0)), u(0), g.iop(.shr, .u32, u(0xffff_ffff), g.iop(.isub, .u32, u(32), ln)));
+                const eq = g.iop(.shl, .u32, u(1), ln);
+                const width = g.opts.subgroup;
+                const full: u32 = if (width >= 32) 0xffff_ffff else (@as(u32, 1) << @intCast(width)) - 1;
+                const m: Arg = switch (in[4]) {
+                    GroupOp.inclusive => g.iop(.@"or", .u32, below, eq),
+                    GroupOp.exclusive => below,
+                    else => u(full),
+                };
+                try g.define(id, &.{g.popcount(g.iop(.@"and", .u32, v, m))});
+            },
+            Op.group_non_uniform_ballot_find_lsb => try g.define(id, &.{g.lsb((try g.get(in[4]))[0])}),
+            Op.group_non_uniform_ballot_find_msb => try g.define(id, &.{g.findMsb((try g.get(in[4]))[0])}),
+            else => {
+                // the arithmetic: i/f add, mul, min, max; bitwise; logical
+                const gop = in[4];
+                const cluster: u32 = if (gop == GroupOp.clustered) blk: {
+                    if (in.len < 7) return error.BadSpirv;
+                    const cs = (try g.get(in[6]))[0];
+                    if (cs != .imm or cs.imm == 0 or cs.imm & (cs.imm - 1) != 0) return g.bad("spirv: a ClusterSize not a constant power of two", .{});
+                    break :blk cs.imm;
+                } else 0;
+                if (gop > GroupOp.clustered) return g.unsupported("spirv: group operation {d}", .{gop});
+                const logical = op >= Op.group_non_uniform_logical_and;
+                const cmb = combineOf(op);
+                const xs = try g.get(in[5]);
+                const c = try g.newComps(@intCast(xs.len));
+                for (g.slice(c), xs) |*o, x| {
+                    const xv = if (logical) g.sel(.u32, x, u(1), u(0)) else x;
+                    const v = try g.groupArith(cmb, gop, cluster, xv);
+                    o.* = if (logical) g.icmp(.u32, .ne, v, u(0)) else v;
+                }
+                g.setVal(id, c);
+            },
         }
     }
 

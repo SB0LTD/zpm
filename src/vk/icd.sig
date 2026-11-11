@@ -131,6 +131,8 @@ pub const device_extensions = [_]Ext{
     .{ .name = "VK_KHR_get_memory_requirements2", .version = 1 },
     .{ .name = "VK_KHR_dedicated_allocation", .version = 3 },
     .{ .name = "VK_KHR_image_format_list", .version = 1 },
+    .{ .name = "VK_KHR_16bit_storage", .version = 1 },
+    .{ .name = "VK_KHR_shader_float16_int8", .version = 1 },
     .{ .name = "VK_KHR_swapchain", .version = 70, .host = true },
     .{ .name = "VK_KHR_external_memory", .version = 1, .host = true },
     .{ .name = "VK_KHR_external_memory_fd", .version = 1, .host = true },
@@ -666,6 +668,20 @@ fn fillFeatureChain(chain: ?*anyopaque) void {
                 const tf: *abi.PhysicalDeviceTimelineSemaphoreFeatures = @ptrCast(@alignCast(c));
                 tf.timelineSemaphore = 1;
             },
+            // (halves are f32 registers rounded to half precision, 16 bits
+            // in memory: the SPIR-V front end's)
+            ST.physical_device_16bit_storage_features => {
+                const sf: *abi.PhysicalDevice16BitStorageFeatures = @ptrCast(@alignCast(c));
+                sf.storageBuffer16BitAccess = 1;
+                sf.uniformAndStorageBuffer16BitAccess = 1;
+                sf.storagePushConstant16 = 1;
+                sf.storageInputOutput16 = 1;
+            },
+            ST.physical_device_shader_float16_int8_features => {
+                const hf: *abi.PhysicalDeviceShaderFloat16Int8Features = @ptrCast(@alignCast(c));
+                hf.shaderFloat16 = 1;
+                hf.shaderInt8 = 0;
+            },
             else => {},
         }
     }
@@ -758,8 +774,11 @@ fn getPhysicalDeviceProperties2(_: ?*anyopaque, out: ?*abi.PhysicalDevicePropert
             ST.physical_device_subgroup_properties => {
                 const sp: *abi.PhysicalDeviceSubgroupProperties = @ptrCast(@alignCast(c));
                 sp.subgroupSize = g.dev.caps.subgroup;
-                sp.supportedStages = 0x20; // compute
-                sp.supportedOperations = 0; // (no subgroup operations in the SPIR-V front end yet)
+                // (the SPIR-V front end's, over KIR's shfl, vote and ballot;
+                // a fragment shader's lanes are the raster's pixels, in quads)
+                sp.supportedStages = 0x20 | 0x10; // compute, fragment
+                // basic, vote, arithmetic, ballot, shuffle, relative, clustered, quad
+                sp.supportedOperations = if (g.dev.caps.subgroup <= 32) 0xff else 0;
                 sp.quadOperationsInAllStages = 0;
             },
             ST.physical_device_multiview_properties => {
@@ -1669,7 +1688,7 @@ fn compilePipeline(di: u32, ci: *const abi.ComputePipelineCreateInfo) ?Pipeline 
     const sh = T.shaders[si];
     if (!sh.live) return null;
     var spec_entries: [64]spirv.SpecEntry = undefined;
-    var opts = spirv.Options{ .robust = T.devices[di].robust };
+    var opts = spirv.Options{ .robust = T.devices[di].robust, .subgroup = theGpu().?.dev.caps.subgroup };
     if (stage.pSpecializationInfo) |sp| {
         const n = @min(sp[0].mapEntryCount, spec_entries.len);
         for (0..n) |j| {
@@ -4110,7 +4129,7 @@ fn dropEngine() void {
 fn emitStage(p: *const GPipe, st: spirv.Stage, k: *kir.Kernel, io: *spirv.StageIO, res: *spirv.Resources) bool {
     const mi = if (st == .vertex) p.vs else p.fs;
     const sh = T.shaders[mi];
-    var gen = spirv.init(T.shader_words[sh.at..][0..sh.n], &T.scratch, .{ .robust = p.robust, .stage = st });
+    var gen = spirv.init(T.shader_words[sh.at..][0..sh.n], &T.scratch, .{ .robust = p.robust, .stage = st, .subgroup = theGpu().?.dev.caps.subgroup });
     const name = std.mem.sliceTo(if (st == .vertex) &p.vs_name else &p.fs_name, 0);
     gen.emitStage(name, k, io, res) catch |e| {
         say("vkCreateGraphicsPipelines: {s}: {s} ({s})", .{ name, gen.diag(), @errorName(e) });

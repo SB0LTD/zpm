@@ -92,7 +92,7 @@ test "vk: what vulkaninfo asks, through the ICD's entry points, on the emulated 
     try testing.expectEqual(R.success, enumInstExt(null, &n, null));
     // (properties2, the three external capabilities, surface and wayland_surface)
     try testing.expectEqual(@as(u32, 6), n);
-    var exts: [8]abi.ExtensionProperties = undefined;
+    var exts: [16]abi.ExtensionProperties = undefined;
     try testing.expectEqual(R.success, enumInstExt(null, &n, &exts));
     try testing.expectEqualStrings("VK_KHR_get_physical_device_properties2", std.mem.sliceTo(&exts[0].extensionName, 0));
 
@@ -151,19 +151,31 @@ test "vk: what vulkaninfo asks, through the ICD's entry points, on the emulated 
     try testing.expectEqual(props.limits.maxComputeWorkGroupSize, props2.properties.limits.maxComputeWorkGroupSize);
     try testing.expect(tsp.maxTimelineSemaphoreValueDifference > 0);
     try testing.expectEqual(@as(u32, 32), sub.subgroupSize);
+    try testing.expectEqual(@as(u32, 0xff), sub.supportedOperations);
+    try testing.expectEqual(@as(u32, 0x30), sub.supportedStages);
     try testing.expectEqual(@as(u32, 0xabcd), unknown[4]);
 
     var feats: abi.PhysicalDeviceFeatures = undefined;
     get(inst, "vkGetPhysicalDeviceFeatures", *const fn (Ptr, *abi.PhysicalDeviceFeatures) callconv(.c) void)(pd, &feats);
     try testing.expectEqual(@as(u32, 1), feats.robustBufferAccess);
     try testing.expectEqual(@as(u32, 0), feats.shaderInt64);
+    var h16 = std.mem.zeroes(abi.PhysicalDeviceShaderFloat16Int8Features);
+    h16.sType = ST.physical_device_shader_float16_int8_features;
+    var s16 = std.mem.zeroes(abi.PhysicalDevice16BitStorageFeatures);
+    s16.sType = ST.physical_device_16bit_storage_features;
+    s16.pNext = &h16;
     var tsf = std.mem.zeroes(abi.PhysicalDeviceTimelineSemaphoreFeatures);
     tsf.sType = ST.physical_device_timeline_semaphore_features;
+    tsf.pNext = &s16;
     var f2 = std.mem.zeroes(abi.PhysicalDeviceFeatures2);
     f2.sType = ST.physical_device_features_2;
     f2.pNext = &tsf;
     get(inst, "vkGetPhysicalDeviceFeatures2", *const fn (Ptr, *abi.PhysicalDeviceFeatures2) callconv(.c) void)(pd, &f2);
     try testing.expectEqual(@as(u32, 1), tsf.timelineSemaphore);
+    // (wgpu's SHADER_F16: shaderFloat16 and both 16-bit storage features)
+    try testing.expectEqual(@as(u32, 1), h16.shaderFloat16);
+    try testing.expectEqual(@as(u32, 1), s16.storageBuffer16BitAccess);
+    try testing.expectEqual(@as(u32, 1), s16.uniformAndStorageBuffer16BitAccess);
 
     // one queue family: graphics, compute and transfer (wgpu wants graphics on the first)
     const qfp = get(inst, "vkGetPhysicalDeviceQueueFamilyProperties", *const fn (Ptr, *u32, ?[*]abi.QueueFamilyProperties) callconv(.c) void);
@@ -188,11 +200,11 @@ test "vk: what vulkaninfo asks, through the ICD's entry points, on the emulated 
     const enumDevExt = get(inst, "vkEnumerateDeviceExtensionProperties", *const fn (Ptr, ?[*:0]const u8, *u32, ?[*]abi.ExtensionProperties) callconv(.c) Res);
     try testing.expectEqual(R.success, enumDevExt(pd, null, &n, null));
     // (no Host here: no swapchain, no external memory)
-    try testing.expectEqual(@as(u32, 7), n);
+    try testing.expectEqual(@as(u32, 9), n);
     n = 1;
     try testing.expectEqual(R.incomplete, enumDevExt(pd, null, &n, &exts));
     try testing.expectEqual(@as(u32, 1), n);
-    n = 8;
+    n = 16;
     try testing.expectEqual(R.success, enumDevExt(pd, null, &n, &exts));
     try testing.expectEqualStrings("VK_KHR_timeline_semaphore", std.mem.sliceTo(&exts[2].extensionName, 0));
     try testing.expectEqual(R.error_layer_not_present, enumDevExt(pd, "VK_LAYER_x", &n, null));
