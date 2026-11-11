@@ -34,6 +34,28 @@
 //! VA buffers live in a fixed pool reserved at init: SMALL_BUFFERS of 64
 //! KiB (parameters) and LARGE_BUFFERS of 16 MiB (slice data, images).
 //!
+//! What an encode is here (the RTX's NVENC, encode.sig and nvenc.sig):
+//!
+//! - **Configs** of the EncSlice entrypoint (H.264 Constrained Baseline,
+//!   Main, High; HEVC Main), with a rate control mode (CQP, CBR, VBR) and
+//!   the packed headers the app will send (sequence, misc, raw).
+//! - **Contexts** have a work buffer of FRAMES frame slots (a pushbuffer,
+//!   the picture setup) and the engine's scratch (history, co-located
+//!   motion, rate control state), and the codec's encode.State.
+//! - **Coded buffers** (VAEncCodedBufferType) are the kernel's buffers
+//!   (MAX_CODED of them): the segment vaMapBuffer returns, the engine's
+//!   status, then the stream (encode.sig's layout); mapping one waits for
+//!   its encode (G_EWAIT) and fills the segment.
+//! - **BeginPicture** takes the input surface and the next frame slot;
+//!   **RenderPicture** hands each buffer to encode.take; **EndPicture**
+//!   tiles the input (the surface's linear picture into its block-linear
+//!   buffer, which the engine reads), writes the headers, the setup and
+//!   the pushbuffer, and submits it on the encoder channel (G_ESUBMIT).
+//!   The reconstructed and reference pictures live in their surfaces'
+//!   block-linear buffers, in the engine's own layout.
+//! - **SyncSurface** on the input, or **SyncBuffer** on the coded buffer,
+//!   waits for the encode.
+//!
 //! Allocation-free: fixed tables, the kernel's buffers, the reserved pool.
 //! Not thread-safe by itself: libgalaxy_va holds a lock around each call.
 
@@ -46,6 +68,10 @@ const codec = @import("codec.sig");
 const hevc = @import("hevc.sig");
 const av1 = @import("av1.sig");
 const vp9 = @import("vp9.sig");
+const vp8 = @import("vp8.sig");
+const ve = @import("vaapi_enc.sig");
+const encode = @import("encode.sig");
+const nvenc = @import("nvenc.sig");
 
 const Buf = node.Buf;
 
@@ -83,7 +109,14 @@ pub const MIN_SIZE = 16;
 /// far sooner).
 pub const SYNC_NS: i64 = 2_000_000_000;
 
-pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264, HEVC, VP9, AV1), zpm";
+pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264, HEVC, VP8, VP9, AV1) and NVENC (H.264, HEVC), zpm";
+
+/// Coded buffers at once (the kernel's buffers).
+pub const MAX_CODED = 16;
+/// An encode frame slot: the pushbuffer, then the picture setup.
+pub const ENC_FRAME_BYTES: usize = 0x2000;
+pub const ENC_PUSH_OFF: usize = 0;
+pub const ENC_SETUP_OFF: usize = 0x800;
 
 // Each kind of object's ids: base + index.
 pub const CONFIG_BASE: u32 = 0x100;
@@ -93,17 +126,18 @@ pub const BUFFER_BASE: u32 = 0x1000;
 pub const IMAGE_BASE: u32 = 0x2000;
 const NONE: u16 = 0xffff;
 
-pub const PROFILES = [_]va.Profile{ va.PROFILE_H264_CONSTRAINED_BASELINE, va.PROFILE_H264_MAIN, va.PROFILE_H264_HIGH, hevc.PROFILE, vp9.PROFILE, av1.PROFILE };
+pub const PROFILES = [_]va.Profile{ va.PROFILE_H264_CONSTRAINED_BASELINE, va.PROFILE_H264_MAIN, va.PROFILE_H264_HIGH, hevc.PROFILE, vp8.PROFILE, vp9.PROFILE, av1.PROFILE };
 
 pub fn supported(profile: va.Profile) bool {
     return std.mem.indexOfScalar(va.Profile, &PROFILES, profile) != null;
 }
 
-pub const Codec = enum { h264, hevc, vp9, av1 };
+pub const Codec = enum { h264, hevc, vp8, vp9, av1 };
 
 pub fn codecOf(profile: va.Profile) Codec {
     return switch (profile) {
         hevc.PROFILE => .hevc,
+        vp8.PROFILE => .vp8,
         vp9.PROFILE => .vp9,
         av1.PROFILE => .av1,
         else => .h264,
@@ -120,11 +154,31 @@ pub const Options = struct {
     probe: bool = true,
     /// GALAXY_VA_AV1_BLACKWELL: AV1's Blackwell extras (av1.State.blackwell)
     av1_blackwell: bool = false,
+    /// GALAXY_VA_ENCODE=0: no encode entrypoints
+    encode: bool = true,
+    /// GALAXY_VA_NVENC_MAGIC: the encoder setup's magic word (nvenc.MAGIC)
+    nvenc_magic: ?u32 = null,
 };
 
 const Config = struct {
     used: bool = false,
     profile: va.Profile = 0,
+    entrypoint: va.Entrypoint = va.ENTRYPOINT_VLD,
+    /// encode: the rate control mode and the app's packed headers
+    rc_mode: u32 = ve.RC_CQP,
+    packed_headers: u32 = 0,
+};
+
+/// A coded buffer: the kernel's buffer, and the encode writing it.
+const Coded = struct {
+    used: bool = false,
+    buf: Buf = .{},
+    /// an encode into it not yet seen done
+    pending: bool = false,
+    fence: u32 = 0,
+    ctx: u8 = 0,
+    header_bytes: u32 = 0,
+    intra: bool = false,
 };
 
 const Surface = struct {
@@ -152,6 +206,9 @@ const Surface = struct {
     field_coded: bool = false,
     /// its last decode's status said nothing came out right
     failed: bool = false,
+    /// an encode reading its block-linear copy, not yet seen done
+    enc_pending: bool = false,
+    enc_fence: u32 = 0,
 };
 
 const Context = struct {
@@ -163,6 +220,7 @@ const Context = struct {
     scratch_bytes: usize = 0,
     /// each module's state (only the context's codec's is used)
     hevc: hevc.State = undefined,
+    vp8: vp8.State = undefined,
     vp9: vp9.State = undefined,
     av1: av1.State = undefined,
     /// the target's VA id (a module's Picture)
@@ -198,6 +256,10 @@ const Context = struct {
     last_param: u16 = NONE,
     /// what went wrong while rendering (EndPicture reports it)
     bad: va.Status = va.SUCCESS,
+    // ── encode contexts ──
+    encoding: bool = false,
+    enc: encode.State = undefined,
+    enc_scratch: encode.ScratchSizes = undefined,
 
     fn frameBytes(c: *const Context, f: usize) []u8 {
         return c.work.bytes()[f * FRAME_BYTES ..][0..FRAME_BYTES];
@@ -211,8 +273,12 @@ const Buffer = struct {
     count: u32 = 0,
     /// a derived image's: the surface's linear picture, not the pool
     surface: u16 = NONE,
+    /// a coded buffer's: its entry in the coded table, not the pool
+    coded: u8 = NO_CODED,
     mapped: bool = false,
 };
+
+const NO_CODED: u8 = 0xff;
 
 const ImageEntry = struct {
     used: bool = false,
@@ -235,6 +301,9 @@ pub fn Driver(comptime Sys: type) type {
         contexts: [MAX_CONTEXTS]Context = [_]Context{.{}} ** MAX_CONTEXTS,
         buffers: [MAX_BUFFERS]Buffer = [_]Buffer{.{}} ** MAX_BUFFERS,
         images: [MAX_IMAGES]ImageEntry = [_]ImageEntry{.{}} ** MAX_IMAGES,
+        coded: [MAX_CODED]Coded = [_]Coded{.{}} ** MAX_CODED,
+        /// the encoder answered the init's probe (or no probe was made)
+        has_encoder: bool = true,
         /// decodes submitted (each one's number), and those the decoder
         /// said went wrong
         serial: u32 = 0,
@@ -290,8 +359,38 @@ pub fn Driver(comptime Sys: type) type {
             const at = d.node.sys.reserve(POOL_BYTES);
             if (at < 0) return va.ERROR_ALLOCATION_FAILED;
             d.pool = @ptrFromInt(@as(usize, @intCast(at)));
-            if (d.opts.probe) return d.probe();
+            d.has_encoder = d.opts.encode;
+            if (d.opts.probe) {
+                const st = d.probe();
+                if (st != va.SUCCESS) return st;
+                if (d.opts.encode) d.has_encoder = d.probeEncoder();
+            }
             return va.SUCCESS;
+        }
+
+        /// SET_OBJECT of the encoder's class and a NOP on the encoder
+        /// channel, waited for: whether encode entrypoints are offered.
+        fn probeEncoder(d: *Self) bool {
+            var b = d.node.alloc(node.UNIT, 0) orelse return false;
+            defer d.node.free(&b);
+            const w = words(b.cpu, 0, 4);
+            w[0] = nvenc.header(0, nvenc.SET_OBJECT, 1);
+            w[1] = nvenc.CLASS | nvenc.SET_OBJECT_ENGINE_SW;
+            w[2] = nvenc.header(0, nvenc.NOP, 1);
+            w[3] = 0;
+            const f = d.node.esubmit(b, 0, 4) catch |e| {
+                d.say("the RTX's video encoder is not there ({s}): decode only", .{@errorName(e)});
+                return false;
+            };
+            switch (d.node.ewait(f, d.node.sys.nowNs() + SYNC_NS)) {
+                .done => {
+                    d.debug("the video encoder answered (fence {d})", .{f});
+                    return true;
+                },
+                .timeout => d.say("the video encoder did not answer a NOP: decode only", .{}),
+                .lost => d.say("the GPU was lost answering the video encoder's NOP", .{}),
+            }
+            return false;
         }
 
         /// SET_OBJECT and a NOP on the video channel, waited for.
@@ -329,6 +428,10 @@ pub fn Driver(comptime Sys: type) type {
             for (0..MAX_SURFACES) |i| {
                 if (d.surfaces[i].used) d.dropSurface(@intCast(i));
             }
+            for (&d.coded) |*c| {
+                if (c.used) d.node.free(&c.buf);
+                c.* = .{};
+            }
             for (&d.buffers) |*b| b.* = .{};
             if (d.pool) |p| d.node.sys.unmap(@intFromPtr(p), POOL_BYTES);
             d.pool = null;
@@ -345,18 +448,31 @@ pub fn Driver(comptime Sys: type) type {
             return va.SUCCESS;
         }
 
-        pub fn queryConfigEntrypoints(_: *Self, profile: va.Profile, list: [*]va.Entrypoint, n: *i32) va.Status {
+        /// Whether `profile` encodes here (and the encoder is there).
+        pub fn encodes(d: *const Self, profile: va.Profile) bool {
+            return d.has_encoder and encode.supported(profile) != null;
+        }
+
+        pub fn queryConfigEntrypoints(d: *Self, profile: va.Profile, list: [*]va.Entrypoint, n: *i32) va.Status {
             if (!supported(profile)) {
                 n.* = 0;
                 return va.ERROR_UNSUPPORTED_PROFILE;
             }
             list[0] = va.ENTRYPOINT_VLD;
             n.* = 1;
+            if (d.encodes(profile)) {
+                list[1] = ve.ENTRYPOINT_ENC_SLICE;
+                n.* = 2;
+            }
             return va.SUCCESS;
         }
 
-        pub fn getConfigAttributes(_: *Self, profile: va.Profile, ep: va.Entrypoint, attribs: []va.ConfigAttrib) va.Status {
+        pub fn getConfigAttributes(d: *Self, profile: va.Profile, ep: va.Entrypoint, attribs: []va.ConfigAttrib) va.Status {
             if (!supported(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
+            if (ep == ve.ENTRYPOINT_ENC_SLICE and d.encodes(profile)) {
+                for (attribs) |*a| a.value = encodeAttribute(profile, a.type);
+                return va.SUCCESS;
+            }
             if (ep != va.ENTRYPOINT_VLD) return va.ERROR_UNSUPPORTED_ENTRYPOINT;
             for (attribs) |*a| {
                 a.value = switch (a.type) {
@@ -371,13 +487,29 @@ pub fn Driver(comptime Sys: type) type {
 
         pub fn createConfig(d: *Self, profile: va.Profile, ep: va.Entrypoint, attribs: []const va.ConfigAttrib, out: *u32) va.Status {
             if (!supported(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
-            if (ep != va.ENTRYPOINT_VLD) return va.ERROR_UNSUPPORTED_ENTRYPOINT;
+            const enc = ep == ve.ENTRYPOINT_ENC_SLICE and d.encodes(profile);
+            if (ep != va.ENTRYPOINT_VLD and !enc) return va.ERROR_UNSUPPORTED_ENTRYPOINT;
+            var rc_mode: u32 = ve.RC_CQP;
+            var packed_headers: u32 = 0;
             for (attribs) |a| {
                 if (a.type == va.ATTRIB_RT_FORMAT and a.value & va.RT_FORMAT_YUV420 == 0) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+                if (!enc) continue;
+                switch (a.type) {
+                    ve.ATTRIB_RATE_CONTROL => {
+                        // (one mode, one this driver has)
+                        if (a.value & encode.RC_MODES == 0 or @popCount(a.value) != 1) return va.ERROR_INVALID_CONFIG;
+                        rc_mode = a.value;
+                    },
+                    ve.ATTRIB_ENC_PACKED_HEADERS => {
+                        if (a.value & ~encode.PACKED_HEADERS != 0) return va.ERROR_INVALID_CONFIG;
+                        packed_headers = a.value;
+                    },
+                    else => {},
+                }
             }
             for (&d.configs, 0..) |*c, i| {
                 if (c.used) continue;
-                c.* = .{ .used = true, .profile = profile };
+                c.* = .{ .used = true, .profile = profile, .entrypoint = ep, .rc_mode = rc_mode, .packed_headers = packed_headers };
                 out.* = CONFIG_BASE + @as(u32, @intCast(i));
                 return va.SUCCESS;
             }
@@ -393,9 +525,16 @@ pub fn Driver(comptime Sys: type) type {
         pub fn queryConfigAttributes(d: *Self, id: u32, profile: *va.Profile, ep: *va.Entrypoint, attribs: ?[*]va.ConfigAttrib, n: *i32) va.Status {
             const c = d.configOf(id) orelse return va.ERROR_INVALID_CONFIG;
             profile.* = c.profile;
-            ep.* = va.ENTRYPOINT_VLD;
-            if (attribs) |a| a[0] = .{ .type = va.ATTRIB_RT_FORMAT, .value = va.RT_FORMAT_YUV420 };
+            ep.* = c.entrypoint;
             n.* = 1;
+            if (attribs) |a| a[0] = .{ .type = va.ATTRIB_RT_FORMAT, .value = va.RT_FORMAT_YUV420 };
+            if (c.entrypoint == ve.ENTRYPOINT_ENC_SLICE) {
+                if (attribs) |a| {
+                    a[1] = .{ .type = ve.ATTRIB_RATE_CONTROL, .value = c.rc_mode };
+                    a[2] = .{ .type = ve.ATTRIB_ENC_PACKED_HEADERS, .value = c.packed_headers };
+                }
+                n.* = 3;
+            }
             return va.SUCCESS;
         }
 
@@ -518,6 +657,7 @@ pub fn Driver(comptime Sys: type) type {
             const i = for (d.contexts, 0..) |c, i| {
                 if (!c.used) break i;
             } else return va.ERROR_ALLOCATION_FAILED;
+            if (cfg.entrypoint == ve.ENTRYPOINT_ENC_SLICE) return d.createEncodeContext(@intCast(i), config, cfg, width, height, out);
             const kind = codecOf(cfg.profile);
             if (kind != .h264) return d.createModuleContext(@intCast(i), config, kind, width, height, out);
             const wmbs = (width + 15) / 16;
@@ -555,6 +695,7 @@ pub fn Driver(comptime Sys: type) type {
         fn createModuleContext(d: *Self, i: u8, config: u32, kind: Codec, width: u32, height: u32, out: *u32) va.Status {
             const scratch_bytes = switch (kind) {
                 .hevc => hevc.scratchBytes(width, height),
+                .vp8 => vp8.scratchBytes(width, height),
                 .vp9 => vp9.scratchBytes(width, height),
                 .av1 => av1.scratchBytes(width, height),
                 .h264 => unreachable,
@@ -579,6 +720,7 @@ pub fn Driver(comptime Sys: type) type {
             };
             switch (kind) {
                 .hevc => d.contexts[i].hevc = hevc.State.init(width, height),
+                .vp8 => d.contexts[i].vp8 = vp8.State.init(width, height),
                 .vp9 => d.contexts[i].vp9 = vp9.State.init(width, height),
                 .av1 => {
                     d.contexts[i].av1 = av1.State.init(width, height);
@@ -591,9 +733,50 @@ pub fn Driver(comptime Sys: type) type {
             return va.SUCCESS;
         }
 
+        /// An encode context: FRAMES frame slots (pushbuffer, setup), then
+        /// the engine's scratch (zeroed).
+        fn createEncodeContext(d: *Self, i: u8, config: u32, cfg: *const Config, width: u32, height: u32, out: *u32) va.Status {
+            const kind = encode.supported(cfg.profile) orelse return va.ERROR_UNSUPPORTED_PROFILE;
+            const sz = encode.scratchSizes(width, height);
+            const scratch_off = FRAMES * ENC_FRAME_BYTES;
+            var work = d.node.alloc(scratch_off + sz.total, 0) orelse return va.ERROR_ALLOCATION_FAILED;
+            if (!nvenc.addressable(work.va) or !nvenc.addressable(work.va + work.len - 256)) {
+                d.node.free(&work);
+                return va.ERROR_ALLOCATION_FAILED;
+            }
+            @memset(work.bytes()[scratch_off..][0..sz.total], 0);
+            d.contexts[i] = .{
+                .used = true,
+                .config = @intCast(config - CONFIG_BASE),
+                .encoding = true,
+                .width_mbs = (width + 15) / 16,
+                .height_mbs = (height + 15) / 16,
+                .work = work,
+                .scratch_off = scratch_off,
+                .scratch_bytes = sz.total,
+                .enc_scratch = sz,
+            };
+            d.contexts[i].enc = encode.State.init(kind, cfg.profile, width, height, cfg.rc_mode, cfg.packed_headers);
+            out.* = CONTEXT_BASE + @as(u32, i);
+            d.debug("{s} encode context {d}x{d}: rate control {x}, packed headers {x}", .{ @tagName(kind), width, height, cfg.rc_mode, cfg.packed_headers });
+            return va.SUCCESS;
+        }
+
         pub fn destroyContext(d: *Self, id: u32) va.Status {
             const ci = d.contextIndex(id) orelse return va.ERROR_INVALID_CONTEXT;
             const c = &d.contexts[ci];
+            if (c.encoding) {
+                // (its encodes finished, their coded buffers filled)
+                for (&d.coded, 0..) |*cb, k| {
+                    if (cb.used and cb.pending and cb.ctx == ci) _ = d.completeCoded(@intCast(k), d.node.sys.nowNs() + SYNC_NS);
+                }
+                for (&d.surfaces) |*s| {
+                    if (s.used and s.enc_pending) _ = d.waitEncodeInput(s, d.node.sys.nowNs() + SYNC_NS);
+                }
+                d.node.free(&c.work);
+                c.* = .{};
+                return va.SUCCESS;
+            }
             // (its decodes finished, their status read, before it goes)
             for (0..FRAMES) |f| {
                 const si = c.frame_surface[f];
@@ -636,6 +819,7 @@ pub fn Driver(comptime Sys: type) type {
 
         pub fn createBuffer(d: *Self, kind: u32, size: u32, count: u32, data: ?*const anyopaque, out: *u32) va.Status {
             const bytes = @as(u64, size) * count;
+            if (kind == ve.ENC_CODED_BUFFER) return d.createCoded(size, count, bytes, out);
             if (bytes > LARGE_BYTES) return va.ERROR_ALLOCATION_FAILED;
             const i = d.newBuffer(@intCast(bytes)) orelse return va.ERROR_ALLOCATION_FAILED;
             d.buffers[i] = .{ .used = true, .type = kind, .size = size, .count = count };
@@ -644,9 +828,27 @@ pub fn Driver(comptime Sys: type) type {
             return va.SUCCESS;
         }
 
+        /// A coded buffer: the kernel's (the engine writes the stream into
+        /// it), `bytes` of stream after encode.sig's header.
+        fn createCoded(d: *Self, size: u32, count: u32, bytes: u64, out: *u32) va.Status {
+            if (bytes == 0 or bytes > 256 << 20) return va.ERROR_ALLOCATION_FAILED;
+            const k = for (d.coded, 0..) |c, k| {
+                if (!c.used) break k;
+            } else return va.ERROR_ALLOCATION_FAILED;
+            const i = d.newBuffer(0) orelse return va.ERROR_ALLOCATION_FAILED;
+            const want = @max(encode.DATA_OFF + @as(usize, @intCast(bytes)), encode.DATA_OFF + encode.HEADER_BYTES + (1 << 20));
+            const buf = d.node.alloc(want, 0) orelse return va.ERROR_ALLOCATION_FAILED;
+            d.coded[k] = .{ .used = true, .buf = buf };
+            encode.emptySegment(buf.bytes());
+            d.buffers[i] = .{ .used = true, .type = ve.ENC_CODED_BUFFER, .size = size, .count = count, .coded = @intCast(k) };
+            out.* = BUFFER_BASE + i;
+            return va.SUCCESS;
+        }
+
         pub fn bufferSetNumElements(d: *Self, id: u32, count: u32) va.Status {
             const i = d.bufferIndex(id) orelse return va.ERROR_INVALID_BUFFER;
             const b = &d.buffers[i];
+            if (b.coded != NO_CODED) return va.ERROR_INVALID_PARAMETER;
             if (b.surface != NONE or @as(u64, b.size) * count > d.storage(i).len) return va.ERROR_INVALID_PARAMETER;
             b.count = count;
             return va.SUCCESS;
@@ -655,7 +857,12 @@ pub fn Driver(comptime Sys: type) type {
         pub fn mapBuffer(d: *Self, id: u32, out: *?*anyopaque) va.Status {
             const i = d.bufferIndex(id) orelse return va.ERROR_INVALID_BUFFER;
             const b = &d.buffers[i];
-            if (b.surface != NONE) {
+            if (b.coded != NO_CODED) {
+                // (a coded buffer: its segment, once the encode is done)
+                const st = d.completeCoded(b.coded, d.node.sys.nowNs() + SYNC_NS);
+                if (st != va.SUCCESS) return st;
+                out.* = d.coded[b.coded].buf.cpu;
+            } else if (b.surface != NONE) {
                 // (a derived image: the decode's picture, once it is there)
                 const st = d.complete(b.surface, d.node.sys.nowNs() + SYNC_NS);
                 if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
@@ -681,6 +888,13 @@ pub fn Driver(comptime Sys: type) type {
             const b = d.buffers[i];
             for (&d.contexts) |*c| {
                 if (c.last_param == i) c.last_param = NONE;
+            }
+            if (b.coded != NO_CODED) {
+                // (the kernel keeps the pages until the engine is done)
+                d.node.free(&d.coded[b.coded].buf);
+                d.coded[b.coded] = .{};
+                d.buffers[i] = .{};
+                return;
             }
             // (a large buffer's pages go back: the next may be small)
             const bytes = @as(usize, b.size) * b.count;
@@ -709,6 +923,60 @@ pub fn Driver(comptime Sys: type) type {
             return d.storage(i)[0 .. @as(usize, b.size) * b.count];
         }
 
+        /// vaSyncBuffer: the encode into coded buffer `id` done (by
+        /// `timeout_ns` from now) and its segment filled.
+        pub fn syncBuffer(d: *Self, id: u32, timeout_ns: i64) va.Status {
+            const i = d.bufferIndex(id) orelse return va.ERROR_INVALID_BUFFER;
+            const b = d.buffers[i];
+            if (b.coded == NO_CODED) return va.ERROR_INVALID_BUFFER;
+            const now = d.node.sys.nowNs();
+            const deadline = if (timeout_ns >= std.math.maxInt(i64) - now) std.math.maxInt(i64) else now + timeout_ns;
+            return d.completeCoded(b.coded, deadline);
+        }
+
+        /// The encode into coded buffer `k` done by `deadline` (0: only
+        /// look), the engine's status read, the segment filled.
+        fn completeCoded(d: *Self, k: u8, deadline: i64) va.Status {
+            const cb = &d.coded[k];
+            if (!cb.pending) return va.SUCCESS;
+            switch (d.node.ewait(cb.fence, deadline)) {
+                .done => {},
+                .timeout => return va.ERROR_TIMEDOUT,
+                .lost => {
+                    cb.pending = false;
+                    encode.emptySegment(cb.buf.bytes());
+                    d.say("the GPU was lost during an encode", .{});
+                    return va.ERROR_OPERATION_FAILED;
+                },
+            }
+            cb.pending = false;
+            const c = &d.contexts[cb.ctx];
+            const rate: ?*encode.Rate = if (c.used and c.encoding) &c.enc.rate else null;
+            const f = encode.finish(rate, cb.buf.bytes(), cb.header_bytes, cb.intra);
+            if (f.result.failed()) {
+                d.errors += 1;
+                d.say("an encode failed: error_status {x}, ucode error {x}{s}", .{ f.result.error_status, f.result.ucode_error, if (f.result.ucode_error == nvenc.ENC_ERROR_H264_BAD_MAGIC) " (bad magic: the setup is not the firmware's; GALAXY_VA_NVENC_MAGIC)" else "" });
+            } else {
+                d.debug("encode done: {d} bytes ({d} of headers), {d} slices, average QP {d}{s}", .{ f.bytes, cb.header_bytes, f.result.slices, f.result.avg_qp, if (f.overflow) ", cut: the coded buffer is too small" else "" });
+            }
+            return va.SUCCESS;
+        }
+
+        /// The encode reading surface `s`'s block-linear copy done.
+        fn waitEncodeInput(d: *Self, s: *Surface, deadline: i64) va.Status {
+            if (!s.enc_pending) return va.SUCCESS;
+            switch (d.node.ewait(s.enc_fence, deadline)) {
+                .done => {},
+                .timeout => return va.ERROR_TIMEDOUT,
+                .lost => {
+                    s.enc_pending = false;
+                    return va.ERROR_OPERATION_FAILED;
+                },
+            }
+            s.enc_pending = false;
+            return va.SUCCESS;
+        }
+
         // ── Decoding ────────────────────────────────────────────────────
 
         pub fn beginPicture(d: *Self, ctx: u32, surface: u32) va.Status {
@@ -716,6 +984,21 @@ pub fn Driver(comptime Sys: type) type {
             const si = d.surfaceIndex(surface) orelse return va.ERROR_INVALID_SURFACE;
             const c = &d.contexts[ci];
             c.target = NONE;
+            if (c.encoding) {
+                // the next frame slot, once its last encode is done
+                const f = c.next_frame;
+                if (c.frame_fence[f] != 0) switch (d.node.ewait(c.frame_fence[f], d.node.sys.nowNs() + SYNC_NS)) {
+                    .done => {},
+                    .timeout => return va.ERROR_TIMEDOUT,
+                    .lost => return va.ERROR_OPERATION_FAILED,
+                };
+                c.target = si;
+                c.target_id = surface;
+                c.frame = f;
+                encode.begin(&c.enc);
+                c.bad = va.SUCCESS;
+                return va.SUCCESS;
+            }
             // The next frame slot, once its last decode is done (that
             // surface's picture copied out now if nobody synced it).
             const f = c.next_frame;
@@ -736,6 +1019,7 @@ pub fn Driver(comptime Sys: type) type {
             c.frame = f;
             switch (c.codec) {
                 .hevc => hevc.begin(&c.hevc),
+                .vp8 => vp8.begin(&c.vp8),
                 .vp9 => vp9.begin(&c.vp9),
                 .av1 => av1.begin(&c.av1),
                 .h264 => {},
@@ -767,12 +1051,15 @@ pub fn Driver(comptime Sys: type) type {
         /// One buffer of the picture.
         fn take(d: *Self, c: *Context, bi: u16) va.Status {
             const b = d.buffers[bi];
+            if (b.coded != NO_CODED) return va.ERROR_INVALID_BUFFER;
             const data = d.bufferBytes(bi);
+            if (c.encoding) return encode.take(&c.enc, .{ .kind = b.type, .size = b.size, .count = b.count, .data = data });
             if (c.codec != .h264) {
                 const buf = codec.Buffer{ .kind = b.type, .size = b.size, .count = b.count, .data = data };
                 const slot = frameSlot(c, c.frame);
                 return switch (c.codec) {
                     .hevc => hevc.take(&c.hevc, buf, slot),
+                    .vp8 => vp8.take(&c.vp8, buf, slot),
                     .vp9 => vp9.take(&c.vp9, buf, slot),
                     .av1 => av1.take(&c.av1, buf, slot),
                     .h264 => unreachable,
@@ -834,6 +1121,7 @@ pub fn Driver(comptime Sys: type) type {
             defer c.target = NONE;
             if (c.target == NONE) return va.ERROR_OPERATION_FAILED;
             if (c.bad != va.SUCCESS) return c.bad;
+            if (c.encoding) return d.endEncode(ci, c);
             if (c.codec != .h264) return d.endModule(ci, c);
             if (!c.have_pic or c.slices == 0) return va.ERROR_INVALID_PARAMETER;
             const pic = &c.pic;
@@ -947,6 +1235,7 @@ pub fn Driver(comptime Sys: type) type {
             var e: codec.End = undefined;
             const st = switch (c.codec) {
                 .hevc => hevc.end(&c.hevc, slot, scratch, pic, lookup, &e),
+                .vp8 => vp8.end(&c.vp8, slot, scratch, pic, lookup, &e),
                 .vp9 => vp9.end(&c.vp9, slot, scratch, pic, lookup, &e),
                 .av1 => av1.end(&c.av1, slot, scratch, pic, lookup, &e),
                 .h264 => unreachable,
@@ -979,11 +1268,85 @@ pub fn Driver(comptime Sys: type) type {
                 if (w != va.SUCCESS and w != va.ERROR_DECODING_ERROR) return w;
                 switch (c.codec) {
                     .hevc => hevc.after(&c.hevc, scratch),
+                    .vp8 => vp8.after(&c.vp8, scratch),
                     .vp9 => vp9.after(&c.vp9, scratch),
                     .av1 => av1.after(&c.av1, scratch),
                     .h264 => unreachable,
                 }
             }
+            return va.SUCCESS;
+        }
+
+        /// An encode's picture: the input tiled, the headers, setup and
+        /// pushbuffer made (encode.end), submitted on the encoder channel.
+        fn endEncode(d: *Self, ci: u8, c: *Context) va.Status {
+            const si = c.target;
+            const s = &d.surfaces[si];
+            const cid = encode.codedBuffer(&c.enc) orelse return va.ERROR_INVALID_PARAMETER;
+            const bi = d.bufferIndex(cid) orelse return va.ERROR_INVALID_BUFFER;
+            const k = d.buffers[bi].coded;
+            if (k == NO_CODED) return va.ERROR_INVALID_BUFFER;
+            const cb = &d.coded[k];
+            const deadline = d.node.sys.nowNs() + SYNC_NS;
+            // (the coded buffer's last encode, the input's last reader, and
+            // a decode into the input, all done first)
+            var st = d.completeCoded(k, deadline);
+            if (st != va.SUCCESS) return st;
+            st = d.waitEncodeInput(s, deadline);
+            if (st != va.SUCCESS) return st;
+            if (s.pending) {
+                st = d.complete(si, deadline);
+                if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+            }
+            const f = c.frame;
+            const frame = c.work.bytes()[f * ENC_FRAME_BYTES ..][0..ENC_FRAME_BYTES];
+            const base = c.work.va + f * ENC_FRAME_BYTES;
+            const sz = c.enc_scratch;
+            const sva = c.work.va + c.scratch_off;
+            var out: encode.EndOut = .{};
+            st = encode.end(&c.enc, .{
+                .push = words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX),
+                .setup = frame[ENC_SETUP_OFF..][0..nvenc.SETUP_BYTES],
+                .setup_va = base + ENC_SETUP_OFF,
+                .coded = cb.buf.bytes(),
+                .coded_va = cb.buf.va,
+                .input = .{
+                    .linear = s.linear.bytes(),
+                    .lin = s.linear_layout,
+                    .tiled = s.tiled.bytes(),
+                    .tiled_va = s.tiled.va,
+                    .layout = s.layout,
+                    .width = s.width,
+                    .height = s.height,
+                },
+                .gob = d.opts.gob,
+                .lookup = .{ .ctx = d, .surface_fn = lookupSurface },
+                .scratch = .{
+                    .history = sva,
+                    .history_bytes = @intCast(sz.history),
+                    .coloc = .{ sva + sz.history, sva + sz.history + sz.coloc },
+                    .rc_process = sva + sz.history + 2 * sz.coloc,
+                },
+                .picture_index = c.decodes,
+                .magic = d.opts.nvenc_magic orelse nvenc.MAGIC,
+            }, &out);
+            if (st != va.SUCCESS) {
+                d.debug("encode picture refused ({x})", .{st});
+                return st;
+            }
+            const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {
+                d.say("an encode was not submitted ({s})", .{@errorName(e)});
+                return if (e == error.NoEncoder) va.ERROR_UNIMPLEMENTED else va.ERROR_OPERATION_FAILED;
+            };
+            const kept = cb.buf;
+            cb.* = .{ .used = true, .buf = kept, .pending = true, .fence = fence, .ctx = ci, .header_bytes = out.header_bytes, .intra = out.intra };
+            s.enc_pending = true;
+            s.enc_fence = fence;
+            c.frame_fence[f] = fence;
+            c.frame_surface[f] = si;
+            c.next_frame = (f + 1) % FRAMES;
+            c.decodes +%= 1;
+            d.debug("encode {d} submitted: QP {d}, {d} bytes of headers", .{ c.decodes, out.qp, out.header_bytes });
             return va.SUCCESS;
         }
 
@@ -1049,11 +1412,26 @@ pub fn Driver(comptime Sys: type) type {
             const si = d.surfaceIndex(surface) orelse return va.ERROR_INVALID_SURFACE;
             const now = d.node.sys.nowNs();
             const deadline = if (timeout_ns >= std.math.maxInt(i64) - now) std.math.maxInt(i64) else now + timeout_ns;
+            // (an encode reading it: its coded buffer filled too)
+            if (d.surfaces[si].enc_pending) {
+                const fence = d.surfaces[si].enc_fence;
+                const st = d.waitEncodeInput(&d.surfaces[si], deadline);
+                if (st != va.SUCCESS) return st;
+                for (&d.coded, 0..) |*cb, k| {
+                    if (cb.used and cb.pending and cb.fence == fence) _ = d.completeCoded(@intCast(k), deadline);
+                }
+            }
             return d.complete(si, deadline);
         }
 
         pub fn querySurfaceStatus(d: *Self, surface: u32, status: *u32) va.Status {
             const si = d.surfaceIndex(surface) orelse return va.ERROR_INVALID_SURFACE;
+            if (d.surfaces[si].enc_pending) {
+                if (d.waitEncodeInput(&d.surfaces[si], 0) == va.ERROR_TIMEDOUT) {
+                    status.* = va.SURFACE_RENDERING;
+                    return va.SUCCESS;
+                }
+            }
             if (d.surfaces[si].pending) {
                 const st = d.complete(si, 0);
                 if (st == va.ERROR_TIMEDOUT) {
@@ -1204,6 +1582,50 @@ pub fn Driver(comptime Sys: type) type {
             return va.SUCCESS;
         }
 
+        /// vaPutImage: the rectangle (src_x, src_y, width, height) of the
+        /// image into the surface's picture at (dst_x, dst_y), no scaling:
+        /// how an app fills a surface to encode.
+        pub fn putImage(d: *Self, surface: u32, image: u32, src_x: i32, src_y: i32, src_w: u32, src_h: u32, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32) va.Status {
+            const si = d.surfaceIndex(surface) orelse return va.ERROR_INVALID_SURFACE;
+            if (image < IMAGE_BASE or image - IMAGE_BASE >= MAX_IMAGES or !d.images[image - IMAGE_BASE].used) return va.ERROR_INVALID_IMAGE;
+            if (src_w != dst_w or src_h != dst_h) return va.ERROR_UNIMPLEMENTED;
+            if (src_x < 0 or src_y < 0 or dst_x < 0 or dst_y < 0) return va.ERROR_INVALID_PARAMETER;
+            const im = d.images[image - IMAGE_BASE];
+            if (im.surface == si) return va.SUCCESS;
+            const s = &d.surfaces[si];
+            // (a decode into it lands first, or it would land over this)
+            if (s.pending) {
+                const st = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
+                if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+            }
+            const sx: u32 = @intCast(src_x);
+            const sy: u32 = @intCast(src_y);
+            const dx: u32 = @intCast(dst_x);
+            const dy: u32 = @intCast(dst_y);
+            const w = src_w;
+            const h = src_h;
+            if (sx + w > im.image.width or sy + h > im.image.height or dx + w > s.width or dy + h > s.height) return va.ERROR_INVALID_PARAMETER;
+            const src = if (im.surface != NONE) d.surfaces[im.surface].linear.bytes() else d.storage(im.buffer);
+            const dst = s.linear.bytes();
+            const lin = s.linear_layout;
+            const ip = im.image.pitches;
+            const io = im.image.offsets;
+            for (0..h) |r| {
+                @memcpy(dst[(dy + r) * lin.pitch + dx ..][0..w], src[io[0] + (sy + r) * ip[0] + sx ..][0..w]);
+            }
+            // chroma: whole UV pairs, rows of the 4:2:0 plane
+            const csx = sx & ~@as(u32, 1);
+            const cdx = dx & ~@as(u32, 1);
+            const cw = @min(2 * ((w + 1) / 2), 2 * ((s.width + 1) / 2) - cdx);
+            for (0..(h + 1) / 2) |r| {
+                const srow = sy / 2 + r;
+                const drow = dy / 2 + r;
+                if (drow >= (s.height + 1) / 2 or srow >= (@as(u32, im.image.height) + 1) / 2) break;
+                @memcpy(dst[lin.uv_offset + drow * lin.pitch + cdx ..][0..cw], src[io[1] + srow * ip[1] + csx ..][0..cw]);
+            }
+            return va.SUCCESS;
+        }
+
         /// The rectangle (x, y, width, height) of surface's picture into
         /// image (at its origin).
         pub fn getImage(d: *Self, surface: u32, x: i32, y: i32, width: u32, height: u32, image: u32) va.Status {
@@ -1243,6 +1665,24 @@ pub fn intAttrib(kind: u32, flags: u32, v: u32) va.SurfaceAttrib {
     return .{ .type = kind, .flags = flags, .value = .{ .type = va.GENERIC_INTEGER, .value = .{ .i = @bitCast(v) } } };
 }
 
+/// An EncSlice config attribute's value (what FFmpeg's vaapi_encode asks).
+pub fn encodeAttribute(profile: va.Profile, kind: u32) u32 {
+    const hevc_profile = profile == va.PROFILE_HEVC_MAIN;
+    return switch (kind) {
+        va.ATTRIB_RT_FORMAT => va.RT_FORMAT_YUV420,
+        ve.ATTRIB_RATE_CONTROL => encode.RC_MODES,
+        ve.ATTRIB_ENC_PACKED_HEADERS => encode.PACKED_HEADERS,
+        ve.ATTRIB_ENC_INTERLACED => ve.ENC_INTERLACED_NONE,
+        ve.ATTRIB_ENC_MAX_REF_FRAMES => encode.MAX_REFS_L0,
+        ve.ATTRIB_ENC_MAX_SLICES => nvenc.MAX_SLICES,
+        ve.ATTRIB_ENC_SLICE_STRUCTURE => ve.SLICE_STRUCTURE_POWER_OF_TWO_ROWS | ve.SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS | ve.SLICE_STRUCTURE_EQUAL_ROWS | ve.SLICE_STRUCTURE_ARBITRARY_ROWS,
+        va.ATTRIB_MAX_PICTURE_WIDTH, va.ATTRIB_MAX_PICTURE_HEIGHT => MAX_SIZE,
+        ve.ATTRIB_ENC_HEVC_FEATURES => if (hevc_profile) @import("enc_hevc.sig").FEATURES else va.ATTRIB_NOT_SUPPORTED,
+        ve.ATTRIB_ENC_HEVC_BLOCK_SIZES => if (hevc_profile) @import("enc_hevc.sig").BLOCK_SIZES else va.ATTRIB_NOT_SUPPORTED,
+        else => va.ATTRIB_NOT_SUPPORTED,
+    };
+}
+
 fn sliceParam(params: []const u8, size: u32, k: usize) va.SliceParameterBufferH264 {
     return std.mem.bytesToValue(va.SliceParameterBufferH264, params[k * size ..][0..@sizeOf(va.SliceParameterBufferH264)]);
 }
@@ -1269,8 +1709,11 @@ comptime {
     std.debug.assert(@sizeOf(nvdec.H264Pic) <= codec.PIC_BYTES);
     std.debug.assert(hevc.MAX_PIC_BYTES <= codec.PIC_BYTES and hevc.MAX_AUX_BYTES <= codec.AUX_BYTES);
     std.debug.assert(av1.MAX_PIC_BYTES <= codec.PIC_BYTES and av1.MAX_AUX_BYTES <= codec.AUX_BYTES);
+    std.debug.assert(vp8.MAX_PIC_BYTES <= codec.PIC_BYTES and vp8.MAX_AUX_BYTES <= codec.AUX_BYTES and vp8.PUSH_DWORDS <= PUSH_DWORDS_MAX);
     std.debug.assert(vp9.MAX_PIC_BYTES <= codec.PIC_BYTES and vp9.MAX_AUX_BYTES <= codec.AUX_BYTES and vp9.PUSH_DWORDS <= PUSH_DWORDS_MAX);
     std.debug.assert(nvdec.PUSH_DWORDS <= PUSH_DWORDS_MAX and hevc.PUSH_DWORDS <= PUSH_DWORDS_MAX and av1.PUSH_DWORDS <= PUSH_DWORDS_MAX);
+    std.debug.assert(ENC_PUSH_OFF + nvenc.PUSH_DWORDS_MAX * 4 <= ENC_SETUP_OFF and ENC_SETUP_OFF % 256 == 0);
+    std.debug.assert(ENC_SETUP_OFF + nvenc.SETUP_BYTES <= ENC_FRAME_BYTES and ENC_FRAME_BYTES % 256 == 0);
 }
 
 /// `n` dwords at byte `off` of mapped GPU memory.

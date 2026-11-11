@@ -22,7 +22,21 @@
 //!   layers or composed NV12, linear), DeriveImage, CreateImage,
 //!   GetImage, DestroyImage;
 //! - every table entry libva 2.22 checks is set (subpictures, display
-//!   attributes, PutSurface/PutImage answer UNIMPLEMENTED or nothing).
+//!   attributes, PutSurface answer UNIMPLEMENTED or nothing);
+//! - encoding on the RTX's NVENC (encode.sig): the EncSlice entrypoint for
+//!   H.264 (Constrained Baseline, Main, High) and HEVC Main, the config
+//!   attributes FFmpeg's vaapi_encode asks (rate control CQP, CBR, VBR;
+//!   packed sequence, misc and raw headers; one L0 reference; up to 16
+//!   slices), coded buffers and their segments, PutImage (how an app
+//!   fills a surface to encode), SyncBuffer; the input tiled on the CPU,
+//!   the parameter sets written here, the engine's setup and pushbuffer
+//!   submitted with G_ESUBMIT (host-tested against a fake encoder).
+//!
+//! Untested until a boot (encode): that GB206's NVCFB7 takes Ada's NVC9B7
+//! methods and nvenc_drv.h's structs (its magic word, ASSUMED 0xcfb70006,
+//! GALAXY_VA_NVENC_MAGIC=hex sets another; the status says BAD_MAGIC when
+//! wrong), the input's block height, the codec type numbers for HEVC, the
+//! ME/MD tuning, and how many bytes the engine says it wrote.
 //!
 //! Untested until a boot on the PC — everything that touches the real
 //! decoder: that GB206's NVCFB0 takes Ada's methods and Ada's
@@ -126,8 +140,8 @@ pub export fn __vaDriverInit_1_0(ctx: *va.DriverContext) callconv(.c) va.Status 
     fill(vt.?);
     ctx.pDriverData = disp;
     ctx.max_profiles = driver.PROFILES.len;
-    ctx.max_entrypoints = 1;
-    ctx.max_attributes = 4;
+    ctx.max_entrypoints = 2;
+    ctx.max_attributes = 16;
     ctx.max_image_formats = 1;
     ctx.max_subpic_formats = 1;
     ctx.max_display_attributes = 1;
@@ -166,7 +180,7 @@ pub fn fill(vt: *va.DriverVTable) void {
     vt.vaDestroyImage = @ptrCast(&vaDestroyImage);
     vt.vaSetImagePalette = @ptrCast(&unimplemented);
     vt.vaGetImage = @ptrCast(&vaGetImage);
-    vt.vaPutImage = @ptrCast(&unimplemented);
+    vt.vaPutImage = @ptrCast(&vaPutImage);
     vt.vaQuerySubpictureFormats = @ptrCast(&vaQuerySubpictureFormats);
     vt.vaCreateSubpicture = @ptrCast(&unimplemented);
     vt.vaDestroySubpicture = @ptrCast(&unimplemented);
@@ -185,6 +199,7 @@ pub fn fill(vt: *va.DriverVTable) void {
     vt.vaQuerySurfaceAttributes = @ptrCast(&vaQuerySurfaceAttributes);
     vt.vaExportSurfaceHandle = @ptrCast(&vaExportSurfaceHandle);
     vt.vaSyncSurface2 = @ptrCast(&vaSyncSurface2);
+    vt.vaSyncBuffer = @ptrCast(&vaSyncBuffer);
     vt.vaMapBuffer2 = @ptrCast(&vaMapBuffer2);
 }
 
@@ -211,7 +226,9 @@ fn options() driver.Options {
 /// GALAXY_VA_DEBUG (set and not "0": say things on stderr), GALAXY_VA_GOB
 /// ("turing": Turing's GOB layout instead of Blackwell's), GALAXY_VA_PROBE
 /// ("0": no decoder probe at init), GALAXY_VA_AV1_BLACKWELL ("1": AV1's
-/// Blackwell extras, av1.State.blackwell), from an environment block.
+/// Blackwell extras, av1.State.blackwell), GALAXY_VA_ENCODE ("0": no
+/// encode entrypoints), GALAXY_VA_NVENC_MAGIC (hex: the encoder setup's
+/// magic word), from an environment block.
 pub fn optionsOf(block: []const u8) driver.Options {
     var o: driver.Options = .{};
     var it = std.mem.splitScalar(u8, block, 0);
@@ -227,6 +244,11 @@ pub fn optionsOf(block: []const u8) driver.Options {
             o.probe = !std.mem.eql(u8, v, "0");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_AV1_BLACKWELL")) {
             o.av1_blackwell = v.len != 0 and !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_ENCODE")) {
+            o.encode = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_MAGIC")) {
+            const hex = if (std.mem.startsWith(u8, v, "0x") or std.mem.startsWith(u8, v, "0X")) v[2..] else v;
+            o.nvenc_magic = std.fmt.parseInt(u32, hex, 16) catch null;
         }
     }
     return o;
@@ -431,6 +453,12 @@ fn vaSyncSurface2(ctx: *va.DriverContext, surface: u32, timeout_ns: u64) callcon
     return d.syncSurface(surface, std.math.cast(i64, timeout_ns) orelse std.math.maxInt(i64));
 }
 
+fn vaSyncBuffer(ctx: *va.DriverContext, buf: u32, timeout_ns: u64) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.syncBuffer(buf, std.math.cast(i64, timeout_ns) orelse std.math.maxInt(i64));
+}
+
 fn vaQuerySurfaceStatus(ctx: *va.DriverContext, surface: u32, status: ?*u32) callconv(.c) va.Status {
     const d = enter(ctx);
     defer leave(ctx);
@@ -475,6 +503,12 @@ fn vaGetImage(ctx: *va.DriverContext, surface: u32, x: i32, y: i32, width: u32, 
     return d.getImage(surface, x, y, width, height, image);
 }
 
+fn vaPutImage(ctx: *va.DriverContext, surface: u32, image: u32, src_x: i32, src_y: i32, src_w: u32, src_h: u32, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32) callconv(.c) va.Status {
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.putImage(surface, image, src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h);
+}
+
 fn vaQuerySubpictureFormats(_: *va.DriverContext, _: ?[*]va.ImageFormat, flags: ?[*]u32, n: ?*u32) callconv(.c) va.Status {
     _ = flags;
     if (n) |x| x.* = 0;
@@ -502,6 +536,9 @@ test "libgalaxy_va: every entry libva 2.22 checks is set" {
     try testing.expect(vt.vaExportSurfaceHandle != null);
     try testing.expect(vt.vaSyncSurface2 != null);
     try testing.expect(vt.vaBufferInfo != null);
+    // (and encoding's)
+    try testing.expect(vt.vaPutImage != @as(va.Fn, @ptrCast(&unimplemented)));
+    try testing.expect(vt.vaSyncBuffer != null);
 }
 
 test "libgalaxy_va: options from an environment block" {
@@ -510,6 +547,11 @@ test "libgalaxy_va: options from an environment block" {
     const all = optionsOf("GALAXY_VA_DEBUG=1\x00GALAXY_VA_GOB=Turing\x00GALAXY_VA_PROBE=0\x00");
     try testing.expect(all.debug and !all.probe and all.gob == .turing);
     try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
+    try testing.expect(none.encode and none.nvenc_magic == null);
+    const enc = optionsOf("GALAXY_VA_ENCODE=0\x00GALAXY_VA_NVENC_MAGIC=0xc9b70006\x00");
+    try testing.expect(!enc.encode);
+    try testing.expectEqual(@as(?u32, 0xc9b7_0006), enc.nvenc_magic);
+    try testing.expectEqual(@as(?u32, 0xcfb7_0007), optionsOf("GALAXY_VA_NVENC_MAGIC=cfb70007").nvenc_magic);
 }
 
 test "libgalaxy_va: init without Galaxy's RTX fails cleanly" {

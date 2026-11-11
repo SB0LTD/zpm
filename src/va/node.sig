@@ -1,7 +1,7 @@
 //! @zpm/va node — the decoder's side of Galaxy's render node
 //! (/dev/dri/renderD128, nv_drm.sig on the PC's RTX): the 'G' calls a video
 //! driver makes. The same calls, numbers and layouts as the GL driver's
-//! client (src/gfxapi/node.sig), with the two video ones:
+//! client (src/gfxapi/node.sig), with the video ones:
 //!
 //!   G_INFO     out: u32 version, u32 chip, u32 faults, u32 lost, ...
 //!   G_ALLOC    in: u64 size, u32 flags, u64 GPU address (0: one given);
@@ -16,6 +16,13 @@
 //!              u32 fence of that channel.
 //!   G_VWAIT    in: u32 fence, i64 absolute CLOCK_MONOTONIC deadline (0:
 //!              just look): 0 done, ETIMEDOUT, EIO lost.
+//!   G_ESUBMIT  _IOWR('G', 12, 16), G_VSUBMIT's struct: a pushbuffer run
+//!              on the open file's own channel on the video encoder
+//!              (NVENC0, made at the first one; ENODEV: no encoder); out:
+//!              u32 fence of that channel. The kernel binds nothing: the
+//!              pushbuffer starts with SET_OBJECT of the encoder's class.
+//!   G_EWAIT    _IOW('G', 13, 16), G_VWAIT's struct, for the encoder
+//!              channel's fences.
 //!   PRIME_HANDLE_TO_FD (DRM's): a buffer as a dma-buf fd.
 //!
 //! `Node(Sys)`: `Sys` makes the system calls (`Linux` here; `Fake` below
@@ -33,6 +40,8 @@ pub const G_ALLOC: u32 = 0xc020_4702;
 pub const G_FREE: u32 = 0x4004_4703;
 pub const G_VSUBMIT: u32 = 0xc010_470a;
 pub const G_VWAIT: u32 = 0x4010_470b;
+pub const G_ESUBMIT: u32 = 0xc010_470c;
+pub const G_EWAIT: u32 = 0x4010_470d;
 pub const PRIME_HANDLE_TO_FD: u32 = 0xc00c_642d;
 pub const DRM_CLOEXEC: u32 = 0o2000000;
 pub const DRM_RDWR: u32 = 2;
@@ -86,11 +95,12 @@ pub fn Node(comptime Sys: type) type {
         lost: bool = false,
 
         /// A call: 0 or -errno. EIO or ENODEV on a call other than
-        /// G_VSUBMIT (whose ENODEV only says there is no decoder): lost.
+        /// G_VSUBMIT or G_ESUBMIT (whose ENODEV only says there is no
+        /// decoder or encoder): lost.
         fn call(n: *Self, req: u32, a: []u8) i64 {
             if (n.fd < 0) return -ENODEV;
             const r = n.sys.ioctl(n.fd, req, a);
-            if (r == -EIO or (r == -ENODEV and req != G_VSUBMIT)) n.lost = true;
+            if (r == -EIO or (r == -ENODEV and req != G_VSUBMIT and req != G_ESUBMIT)) n.lost = true;
             return r;
         }
 
@@ -132,17 +142,35 @@ pub fn Node(comptime Sys: type) type {
         }
 
         pub const SubmitError = error{ NoDecoder, Lost, Refused };
+        pub const EncodeError = error{ NoEncoder, Lost, Refused };
 
         /// `dwords` of pushbuffer at byte `offset` of `b`, on the video
         /// channel: its fence.
         pub fn vsubmit(n: *Self, b: Buf, offset: u32, dwords: u32) SubmitError!u32 {
+            return n.submitOn(G_VSUBMIT, b, offset, dwords) catch |e| switch (e) {
+                error.NoEngine => error.NoDecoder,
+                error.Lost => error.Lost,
+                error.Refused => error.Refused,
+            };
+        }
+
+        /// The same on the encoder's channel (G_ESUBMIT).
+        pub fn esubmit(n: *Self, b: Buf, offset: u32, dwords: u32) EncodeError!u32 {
+            return n.submitOn(G_ESUBMIT, b, offset, dwords) catch |e| switch (e) {
+                error.NoEngine => error.NoEncoder,
+                error.Lost => error.Lost,
+                error.Refused => error.Refused,
+            };
+        }
+
+        fn submitOn(n: *Self, req: u32, b: Buf, offset: u32, dwords: u32) error{ NoEngine, Lost, Refused }!u32 {
             if (n.lost) return error.Lost;
             var a = [_]u8{0} ** 16;
             wr32(&a, 0, b.handle);
             wr32(&a, 4, offset);
             wr32(&a, 8, dwords);
-            const r = n.call(G_VSUBMIT, &a);
-            if (r == -ENODEV) return error.NoDecoder;
+            const r = n.call(req, &a);
+            if (r == -ENODEV) return error.NoEngine;
             if (r != 0) return if (n.lost) error.Lost else error.Refused;
             return rd32(&a, 12);
         }
@@ -150,12 +178,21 @@ pub fn Node(comptime Sys: type) type {
         /// Wait for `fence` until `deadline_ns` (CLOCK_MONOTONIC; 0: only
         /// look).
         pub fn vwait(n: *Self, fence: u32, deadline_ns: i64) Wait {
+            return n.waitOn(G_VWAIT, fence, deadline_ns);
+        }
+
+        /// The same for the encoder channel's fences (G_EWAIT).
+        pub fn ewait(n: *Self, fence: u32, deadline_ns: i64) Wait {
+            return n.waitOn(G_EWAIT, fence, deadline_ns);
+        }
+
+        fn waitOn(n: *Self, req: u32, fence: u32, deadline_ns: i64) Wait {
             if (n.lost) return .lost;
             var a = [_]u8{0} ** 16;
             wr32(&a, 0, fence);
             wr64(&a, 8, @bitCast(deadline_ns));
             while (true) {
-                const r = n.call(G_VWAIT, &a);
+                const r = n.call(req, &a);
                 if (r == 0) return .done;
                 if (r == -EINTR or r == -ERESTART) continue;
                 if (r == -ETIMEDOUT) return .timeout;
@@ -254,18 +291,21 @@ pub const Linux = struct {
 
 // ── A fake kernel (for tests) ───────────────────────────────────────────────
 
-/// nv_drm's video calls with a pretend decoder: buffers are anonymous
-/// memory at made-up GPU addresses; each G_VSUBMIT is recorded and handed
-/// to `decoder` (the test's), whose work is done at once or, with `hold`,
-/// at the next wait; PRIME gives fd 100 + the handle. Memory calls are
+/// nv_drm's video calls with a pretend decoder and encoder: buffers are
+/// anonymous memory at made-up GPU addresses; each G_VSUBMIT (G_ESUBMIT)
+/// is recorded and handed to `decoder` (`encoder`, the test's), whose
+/// work is done at once or, with `hold`, at the next wait; each channel
+/// has its own fences; PRIME gives fd 100 + the handle. Memory calls are
 /// Linux's.
 pub const Fake = struct {
     chip: u32 = CHIP_GB206,
     has_decoder: bool = true,
+    has_encoder: bool = true,
     hung: bool = false,
     /// a submission's fence is done only once waited for (the GPU is busy)
     hold: bool = false,
     decoder: ?*const fn (*Fake, Submit) void = null,
+    encoder: ?*const fn (*Fake, Submit) void = null,
     bufs: [64]FakeBuf = [_]FakeBuf{.{}} ** 64,
     next_va: u64 = 0x40_0000_0000,
     fence: u32 = 0,
@@ -273,6 +313,11 @@ pub const Fake = struct {
     live: u32 = 0,
     submits: [16]Submit = undefined,
     n_submits: u32 = 0,
+    /// the encoder channel's
+    efence: u32 = 0,
+    edone: u32 = 0,
+    esubmits: [16]Submit = undefined,
+    n_esubmits: u32 = 0,
     waits: u32 = 0,
     exports: u32 = 0,
     lines: u32 = 0,
@@ -356,6 +401,26 @@ pub const Fake = struct {
                 if (@as(i64, @bitCast(rd64(a, 8))) == 0) return -ETIMEDOUT;
                 k.done = k.fence;
             },
+            G_ESUBMIT => {
+                if (!k.has_encoder) return -ENODEV;
+                const s = Submit{ .handle = rd32(a, 0), .offset = rd32(a, 4), .dwords = rd32(a, 8) };
+                if (s.handle == 0 or s.handle >= k.bufs.len or k.bufs[s.handle].mem.len == 0) return -2;
+                if (s.dwords == 0 or s.offset % 4 != 0 or s.offset + s.dwords * 4 > k.bufs[s.handle].mem.len) return -EINVAL;
+                if (k.n_esubmits < k.esubmits.len) k.esubmits[k.n_esubmits] = s;
+                k.n_esubmits += 1;
+                if (k.encoder) |e| e(k, s);
+                k.efence += 1;
+                if (!k.hold) k.edone = k.efence;
+                wr32(a, 12, k.efence);
+            },
+            G_EWAIT => {
+                k.waits += 1;
+                const f = rd32(a, 0);
+                if (f > k.efence) return -EINVAL;
+                if (f <= k.edone) return 0;
+                if (@as(i64, @bitCast(rd64(a, 8))) == 0) return -ETIMEDOUT;
+                k.edone = k.efence;
+            },
             PRIME_HANDLE_TO_FD => {
                 const h = rd32(a, 0);
                 if (h == 0 or h >= k.bufs.len or k.bufs[h].mem.len == 0) return -2;
@@ -394,9 +459,10 @@ const testing = std.testing;
 
 test "node: the calls' numbers are nv_drm's and DRM's" {
     // _IOR('G', 0, 32), _IOWR('G', 2, 32), _IOW('G', 3, 4),
-    // _IOWR('G', 10, 16), _IOW('G', 11, 16); _IOWR('d', 0x2d, 12)
-    const want = [_]u32{ (2 << 30) | (32 << 16) | 0x4700, (3 << 30) | (32 << 16) | 0x4702, (1 << 30) | (4 << 16) | 0x4703, (3 << 30) | (16 << 16) | 0x470a, (1 << 30) | (16 << 16) | 0x470b, (3 << 30) | (12 << 16) | 0x642d };
-    try testing.expectEqualSlices(u32, &want, &[_]u32{ G_INFO, G_ALLOC, G_FREE, G_VSUBMIT, G_VWAIT, PRIME_HANDLE_TO_FD });
+    // _IOWR('G', 10, 16), _IOW('G', 11, 16), _IOWR('G', 12, 16),
+    // _IOW('G', 13, 16); _IOWR('d', 0x2d, 12)
+    const want = [_]u32{ (2 << 30) | (32 << 16) | 0x4700, (3 << 30) | (32 << 16) | 0x4702, (1 << 30) | (4 << 16) | 0x4703, (3 << 30) | (16 << 16) | 0x470a, (1 << 30) | (16 << 16) | 0x470b, (3 << 30) | (16 << 16) | 0x470c, (1 << 30) | (16 << 16) | 0x470d, (3 << 30) | (12 << 16) | 0x642d };
+    try testing.expectEqualSlices(u32, &want, &[_]u32{ G_INFO, G_ALLOC, G_FREE, G_VSUBMIT, G_VWAIT, G_ESUBMIT, G_EWAIT, PRIME_HANDLE_TO_FD });
 }
 
 test "node: alloc, submit, wait, export, no decoder, lost" {
@@ -421,4 +487,29 @@ test "node: alloc, submit, wait, export, no decoder, lost" {
     try testing.expect(n.lost);
     n.free(&b);
     try testing.expectEqual(@as(u32, 0), k.live);
+}
+
+test "node: the encoder's channel: its own fences, no encoder, lost" {
+    var k = Fake{};
+    var n = Node(*Fake){ .sys = &k, .fd = 3 };
+    var b = n.alloc(4096, 0).?;
+    k.hold = true;
+    const d = try n.vsubmit(b, 0, 2);
+    const e = try n.esubmit(b, 0, 2);
+    try testing.expectEqual(@as(u32, 1), d);
+    try testing.expectEqual(@as(u32, 1), e);
+    try testing.expectEqual(@as(u32, 1), k.n_esubmits);
+    try testing.expectEqual(Wait.timeout, n.ewait(e, 0));
+    try testing.expectEqual(Wait.done, n.ewait(e, 5_000_000_000));
+    // (the decoder's fence still running: the channels are apart)
+    try testing.expectEqual(Wait.timeout, n.vwait(d, 0));
+    k.has_encoder = false;
+    try testing.expectError(error.NoEncoder, n.esubmit(b, 0, 2));
+    try testing.expect(!n.lost);
+    k.has_encoder = true;
+    k.hung = true;
+    try testing.expectError(error.Lost, n.esubmit(b, 0, 2));
+    try testing.expect(n.lost);
+    try testing.expectEqual(Wait.lost, n.ewait(e, 0));
+    n.free(&b);
 }
