@@ -90,7 +90,8 @@ test "vk: what vulkaninfo asks, through the ICD's entry points, on the emulated 
     const enumInstExt = get(null, "vkEnumerateInstanceExtensionProperties", *const fn (?[*:0]const u8, *u32, ?[*]abi.ExtensionProperties) callconv(.c) Res);
     var n: u32 = 0;
     try testing.expectEqual(R.success, enumInstExt(null, &n, null));
-    try testing.expectEqual(@as(u32, 1), n);
+    // (properties2, the three external capabilities, surface and wayland_surface)
+    try testing.expectEqual(@as(u32, 6), n);
     var exts: [8]abi.ExtensionProperties = undefined;
     try testing.expectEqual(R.success, enumInstExt(null, &n, &exts));
     try testing.expectEqualStrings("VK_KHR_get_physical_device_properties2", std.mem.sliceTo(&exts[0].extensionName, 0));
@@ -98,7 +99,7 @@ test "vk: what vulkaninfo asks, through the ICD's entry points, on the emulated 
     // an instance asking for a later version (allowed since interface 5), and an extension it does not have
     const createInstance = get(null, "vkCreateInstance", *const fn (*const abi.InstanceCreateInfo, ?*const anyopaque, *Ptr) callconv(.c) Res);
     const app = abi.ApplicationInfo{ .sType = ST.application_info, .pNext = null, .pApplicationName = "test", .applicationVersion = 1, .pEngineName = "wgpu", .engineVersion = 1, .apiVersion = icd.makeVersion(1, 3, 0) };
-    const bad_ext = [_]?[*:0]const u8{"VK_KHR_surface"};
+    const bad_ext = [_]?[*:0]const u8{"VK_KHR_xcb_surface"};
     var inst: Ptr = null;
     var ici = abi.InstanceCreateInfo{ .sType = ST.instance_create_info, .pNext = null, .flags = 0, .pApplicationInfo = @ptrCast(&app), .enabledLayerCount = 0, .ppEnabledLayerNames = null, .enabledExtensionCount = 1, .ppEnabledExtensionNames = &bad_ext };
     try testing.expectEqual(R.error_extension_not_present, createInstance(&ici, null, &inst));
@@ -186,7 +187,8 @@ test "vk: what vulkaninfo asks, through the ICD's entry points, on the emulated 
     // device extensions, with the two-call protocol cut short
     const enumDevExt = get(inst, "vkEnumerateDeviceExtensionProperties", *const fn (Ptr, ?[*:0]const u8, *u32, ?[*]abi.ExtensionProperties) callconv(.c) Res);
     try testing.expectEqual(R.success, enumDevExt(pd, null, &n, null));
-    try testing.expectEqual(@as(u32, 3), n);
+    // (no Host here: no swapchain, no external memory)
+    try testing.expectEqual(@as(u32, 7), n);
     n = 1;
     try testing.expectEqual(R.incomplete, enumDevExt(pd, null, &n, &exts));
     try testing.expectEqual(@as(u32, 1), n);

@@ -1308,6 +1308,15 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("adreno", "src/adreno/adreno.sig"),
         importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
+    _ = try addTest(ctx, test_vk, "test-vk-wsi", "tests/test_vk_wsi.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("vk", "src/vk/vk.sig"),
+        importEntry("spirv", "src/spirv/spirv.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
+    });
     _ = try addTest(ctx, test_vk, "test-vk-lib", "src/vk/libgalaxy_vk.sig", &.{
         importEntry("vk", "src/vk/vk.sig"),
         importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),

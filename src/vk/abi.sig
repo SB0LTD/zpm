@@ -766,6 +766,37 @@ pub const StructureType = struct {
     pub const physical_device_multiview_properties: u32 = 1000053002;
     pub const physical_device_point_clipping_properties: u32 = 1000117000;
     pub const physical_device_protected_memory_properties: u32 = 1000145001;
+    pub const memory_dedicated_allocate_info: u32 = 1000127001;
+    pub const physical_device_external_image_format_info: u32 = 1000071000;
+    pub const external_image_format_properties: u32 = 1000071001;
+    pub const external_memory_buffer_create_info: u32 = 1000072000;
+    pub const external_memory_image_create_info: u32 = 1000072001;
+    pub const export_memory_allocate_info: u32 = 1000072002;
+    pub const export_fence_create_info: u32 = 1000113000;
+    pub const export_semaphore_create_info: u32 = 1000077000;
+    pub const image_format_list_create_info: u32 = 1000147000;
+    pub const import_memory_fd_info_khr: u32 = 1000074000;
+    pub const memory_fd_properties_khr: u32 = 1000074001;
+    pub const memory_get_fd_info_khr: u32 = 1000074002;
+    pub const import_semaphore_fd_info_khr: u32 = 1000079000;
+    pub const semaphore_get_fd_info_khr: u32 = 1000079001;
+    pub const import_fence_fd_info_khr: u32 = 1000115000;
+    pub const fence_get_fd_info_khr: u32 = 1000115001;
+    pub const drm_format_modifier_properties_list_ext: u32 = 1000158000;
+    pub const physical_device_image_drm_format_modifier_info_ext: u32 = 1000158002;
+    pub const image_drm_format_modifier_list_create_info_ext: u32 = 1000158003;
+    pub const image_drm_format_modifier_explicit_create_info_ext: u32 = 1000158004;
+    pub const image_drm_format_modifier_properties_ext: u32 = 1000158005;
+    pub const swapchain_create_info_khr: u32 = 1000001000;
+    pub const present_info_khr: u32 = 1000001001;
+    pub const device_group_present_capabilities_khr: u32 = 1000060007;
+    pub const image_swapchain_create_info_khr: u32 = 1000060008;
+    pub const bind_image_memory_swapchain_info_khr: u32 = 1000060009;
+    pub const acquire_next_image_info_khr: u32 = 1000060010;
+    pub const wayland_surface_create_info_khr: u32 = 1000006000;
+    pub const physical_device_surface_info_2_khr: u32 = 1000119000;
+    pub const surface_capabilities_2_khr: u32 = 1000119001;
+    pub const surface_format_2_khr: u32 = 1000119002;
 };
 
 pub const result = struct {
@@ -1095,3 +1126,101 @@ pub const PhysicalDeviceMultiviewFeatures = extern struct { sType: u32, pNext: ?
 pub const PhysicalDeviceMultiviewProperties = extern struct { sType: u32, pNext: ?*anyopaque, maxMultiviewViewCount: u32, maxMultiviewInstanceIndex: u32 };
 pub const PhysicalDevicePointClippingProperties = extern struct { sType: u32, pNext: ?*anyopaque, pointClippingBehavior: u32 };
 pub const PhysicalDeviceProtectedMemoryProperties = extern struct { sType: u32, pNext: ?*anyopaque, protectedNoFault: u32 };
+
+// ── External memory, semaphores and fences (fds), DRM format modifiers ────
+
+pub const ExternalHandle = struct {
+    /// VkExternalMemoryHandleTypeFlagBits, ...Semaphore..., ...Fence...
+    pub const opaque_fd: u32 = 0x1;
+    pub const dma_buf: u32 = 0x200;
+    pub const semaphore_sync_fd: u32 = 0x10;
+    pub const fence_sync_fd: u32 = 0x8;
+    /// VkExternalMemoryFeatureFlagBits
+    pub const memory_dedicated_only: u32 = 0x1;
+    pub const memory_exportable: u32 = 0x2;
+    pub const memory_importable: u32 = 0x4;
+    /// VkExternalSemaphoreFeatureFlagBits (and the fence's: the same bits)
+    pub const exportable: u32 = 0x1;
+    pub const importable: u32 = 0x2;
+};
+/// VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+pub const TILING_DRM_FORMAT_MODIFIER: u32 = 1000158000;
+/// DRM_FORMAT_MOD_LINEAR
+pub const DRM_MOD_LINEAR: u64 = 0;
+
+pub const PhysicalDeviceExternalImageFormatInfo = extern struct { sType: u32, pNext: ?*const anyopaque, handleType: u32 };
+pub const ExternalImageFormatProperties = extern struct { sType: u32, pNext: ?*anyopaque, externalMemoryProperties: ExternalMemoryProperties };
+pub const ExternalMemoryCreateInfo = extern struct { sType: u32, pNext: ?*const anyopaque, handleTypes: u32 };
+pub const ExportMemoryAllocateInfo = extern struct { sType: u32, pNext: ?*const anyopaque, handleTypes: u32 };
+pub const ImportMemoryFdInfoKHR = extern struct { sType: u32, pNext: ?*const anyopaque, handleType: u32, fd: i32 };
+pub const MemoryGetFdInfoKHR = extern struct { sType: u32, pNext: ?*const anyopaque, memory: u64, handleType: u32 };
+pub const MemoryFdPropertiesKHR = extern struct { sType: u32, pNext: ?*anyopaque, memoryTypeBits: u32 };
+pub const MemoryDedicatedAllocateInfo = extern struct { sType: u32, pNext: ?*const anyopaque, image: u64, buffer: u64 };
+pub const ExportSemaphoreCreateInfo = extern struct { sType: u32, pNext: ?*const anyopaque, handleTypes: u32 };
+pub const SemaphoreGetFdInfoKHR = extern struct { sType: u32, pNext: ?*const anyopaque, semaphore: u64, handleType: u32 };
+pub const ImportSemaphoreFdInfoKHR = extern struct { sType: u32, pNext: ?*const anyopaque, semaphore: u64, flags: u32, handleType: u32, fd: i32 };
+pub const FenceGetFdInfoKHR = extern struct { sType: u32, pNext: ?*const anyopaque, fence: u64, handleType: u32 };
+pub const ImportFenceFdInfoKHR = extern struct { sType: u32, pNext: ?*const anyopaque, fence: u64, flags: u32, handleType: u32, fd: i32 };
+pub const DrmFormatModifierPropertiesEXT = extern struct { drmFormatModifier: u64, drmFormatModifierPlaneCount: u32, drmFormatModifierTilingFeatures: u32 };
+pub const DrmFormatModifierPropertiesListEXT = extern struct { sType: u32, pNext: ?*anyopaque, drmFormatModifierCount: u32, pDrmFormatModifierProperties: ?[*]DrmFormatModifierPropertiesEXT };
+pub const PhysicalDeviceImageDrmFormatModifierInfoEXT = extern struct { sType: u32, pNext: ?*const anyopaque, drmFormatModifier: u64, sharingMode: u32, queueFamilyIndexCount: u32, pQueueFamilyIndices: ?[*]const u32 };
+pub const ImageDrmFormatModifierListCreateInfoEXT = extern struct { sType: u32, pNext: ?*const anyopaque, drmFormatModifierCount: u32, pDrmFormatModifiers: ?[*]const u64 };
+pub const ImageDrmFormatModifierExplicitCreateInfoEXT = extern struct { sType: u32, pNext: ?*const anyopaque, drmFormatModifier: u64, drmFormatModifierPlaneCount: u32, pPlaneLayouts: ?[*]const SubresourceLayout };
+pub const ImageDrmFormatModifierPropertiesEXT = extern struct { sType: u32, pNext: ?*anyopaque, drmFormatModifier: u64 };
+
+// ── Window system integration (VK_KHR_surface, _wayland_surface, _swapchain) ──
+
+/// VkIcdSurfaceWayland (vk_icd.h): what the loader makes of
+/// vkCreateWaylandSurfaceKHR and hands the driver as the VkSurfaceKHR.
+pub const IcdSurfaceWayland = extern struct { platform: u32, display: ?*anyopaque, surface: ?*anyopaque };
+pub const ICD_WSI_PLATFORM_WAYLAND: u32 = 1;
+pub const SurfaceCapabilitiesKHR = extern struct {
+    minImageCount: u32,
+    maxImageCount: u32,
+    currentExtent: Extent2D,
+    minImageExtent: Extent2D,
+    maxImageExtent: Extent2D,
+    maxImageArrayLayers: u32,
+    supportedTransforms: u32,
+    currentTransform: u32,
+    supportedCompositeAlpha: u32,
+    supportedUsageFlags: u32,
+};
+pub const SurfaceFormatKHR = extern struct { format: u32, colorSpace: u32 };
+pub const SwapchainCreateInfoKHR = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    surface: u64,
+    minImageCount: u32,
+    imageFormat: u32,
+    imageColorSpace: u32,
+    imageExtent: Extent2D,
+    imageArrayLayers: u32,
+    imageUsage: u32,
+    imageSharingMode: u32,
+    queueFamilyIndexCount: u32,
+    pQueueFamilyIndices: ?[*]const u32,
+    preTransform: u32,
+    compositeAlpha: u32,
+    presentMode: u32,
+    clipped: u32,
+    oldSwapchain: u64,
+};
+pub const PresentInfoKHR = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    waitSemaphoreCount: u32,
+    pWaitSemaphores: ?[*]const u64,
+    swapchainCount: u32,
+    pSwapchains: ?[*]const u64,
+    pImageIndices: ?[*]const u32,
+    pResults: ?[*]Result,
+};
+pub const AcquireNextImageInfoKHR = extern struct { sType: u32, pNext: ?*const anyopaque, swapchain: u64, timeout: u64, semaphore: u64, fence: u64, deviceMask: u32 };
+pub const DeviceGroupPresentCapabilitiesKHR = extern struct { sType: u32, pNext: ?*anyopaque, presentMask: [32]u32, modes: u32 };
+pub const ImageSwapchainCreateInfoKHR = extern struct { sType: u32, pNext: ?*const anyopaque, swapchain: u64 };
+pub const BindImageMemorySwapchainInfoKHR = extern struct { sType: u32, pNext: ?*const anyopaque, swapchain: u64, imageIndex: u32 };
+pub const PhysicalDeviceSurfaceInfo2KHR = extern struct { sType: u32, pNext: ?*const anyopaque, surface: u64 };
+pub const SurfaceCapabilities2KHR = extern struct { sType: u32, pNext: ?*anyopaque, surfaceCapabilities: SurfaceCapabilitiesKHR };
+pub const SurfaceFormat2KHR = extern struct { sType: u32, pNext: ?*anyopaque, surfaceFormat: SurfaceFormatKHR };

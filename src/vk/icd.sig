@@ -59,6 +59,7 @@ const gfxapi = @import("gfxapi");
 const engine = gfxapi.engine;
 const raster = gfxapi.raster;
 const texture = gfxapi.texture;
+const wl = gfxapi.wayland;
 const kir = gpu.kir;
 const ST = abi.StructureType;
 const R = abi.result;
@@ -77,6 +78,13 @@ pub const Gpu = struct {
     /// PCI vendor and device (0: unknown)
     vendor_id: u32 = 0,
     device_id: u32 = 0,
+    /// dma-bufs out and in and fence files (Galaxy's render node, as EGL
+    /// has them): external memory, semaphores and fences, and swapchains.
+    /// Null: none of those extensions is offered.
+    host: ?gfxapi.host.Host = null,
+    /// the app's libwayland-client, found in the process (null: no Wayland
+    /// surface is supported)
+    wayland: ?*const fn () ?*const wl.Client = null,
 };
 
 /// Opens the GPU at the first vkEnumeratePhysicalDevices (null: none, and
@@ -103,14 +111,34 @@ pub const DRIVER_VERSION = makeVersion(0, 1, 0);
 pub const ICD_INTERFACE_VERSION: u32 = 5;
 const ICD_LOADER_MAGIC: usize = 0x01CDC0DE;
 
-const Ext = struct { name: []const u8, version: u32 };
+/// `host`: offered only with the root's Host (Gpu.host): external memory
+/// and swapchains.
+const Ext = struct { name: []const u8, version: u32, host: bool = false };
 pub const instance_extensions = [_]Ext{
     .{ .name = "VK_KHR_get_physical_device_properties2", .version = 2 },
+    .{ .name = "VK_KHR_external_memory_capabilities", .version = 1 },
+    .{ .name = "VK_KHR_external_semaphore_capabilities", .version = 1 },
+    .{ .name = "VK_KHR_external_fence_capabilities", .version = 1 },
+    .{ .name = "VK_KHR_surface", .version = 25 },
+    .{ .name = "VK_KHR_wayland_surface", .version = 6 },
 };
 pub const device_extensions = [_]Ext{
     .{ .name = "VK_KHR_maintenance1", .version = 2 },
     .{ .name = "VK_KHR_storage_buffer_storage_class", .version = 1 },
     .{ .name = "VK_KHR_timeline_semaphore", .version = 2 },
+    .{ .name = "VK_KHR_bind_memory2", .version = 1 },
+    .{ .name = "VK_KHR_get_memory_requirements2", .version = 1 },
+    .{ .name = "VK_KHR_dedicated_allocation", .version = 3 },
+    .{ .name = "VK_KHR_image_format_list", .version = 1 },
+    .{ .name = "VK_KHR_swapchain", .version = 70, .host = true },
+    .{ .name = "VK_KHR_external_memory", .version = 1, .host = true },
+    .{ .name = "VK_KHR_external_memory_fd", .version = 1, .host = true },
+    .{ .name = "VK_EXT_external_memory_dma_buf", .version = 1, .host = true },
+    .{ .name = "VK_EXT_image_drm_format_modifier", .version = 2, .host = true },
+    .{ .name = "VK_KHR_external_semaphore", .version = 1, .host = true },
+    .{ .name = "VK_KHR_external_semaphore_fd", .version = 1, .host = true },
+    .{ .name = "VK_KHR_external_fence", .version = 1, .host = true },
+    .{ .name = "VK_KHR_external_fence_fd", .version = 1, .host = true },
 };
 
 pub const MAX_INSTANCES = 8;
@@ -189,7 +217,7 @@ fn nowNs() u64 {
 
 const Hdr = extern struct { loader: usize };
 
-const Tag = enum(u8) { memory = 1, buffer, set_layout, pipeline_layout, pool, set, shader, pipeline, cmd_pool, fence, semaphore, cache, image, view, sampler, render_pass, framebuffer, gpipe, template };
+const Tag = enum(u8) { memory = 1, buffer, set_layout, pipeline_layout, pool, set, shader, pipeline, cmd_pool, fence, semaphore, cache, image, view, sampler, render_pass, framebuffer, gpipe, template, swapchain };
 
 fn handle(tag: Tag, i: u32) u64 {
     return @as(u64, @intFromEnum(tag)) << 48 | (@as(u64, i) + 1);
@@ -228,6 +256,8 @@ const Memory = struct {
     mapped: bool,
     dirty: bool,
     dirty_fence: u64,
+    /// a swapchain's image's (freed with the swapchain)
+    swapchain: bool = false,
 };
 const Buffer = struct { live: bool, dev: u32, size: u64, usage: u32, mem: u32, offset: u64 };
 const LayoutBinding = struct { binding: u32, dtype: u32, count: u32, first: u32, dyn_first: u32, imm: u32 = NONE };
@@ -269,6 +299,9 @@ const Semaphore = struct {
     pend: [MAX_PENDING]Pending,
     n_pend: u32,
     signaled: bool,
+    /// made for export (VkExportSemaphoreCreateInfo): a submission that
+    /// signals it is waited for (the external memory section says why)
+    exported: bool = false,
 };
 
 /// A fixed set of blocks, handed out in runs (first fit).
@@ -363,6 +396,7 @@ const T = struct {
     var framebuffers: [MAX_FRAMEBUFFERS]Framebuffer = undefined;
     var gpipes: [MAX_GPIPES]GPipe = undefined;
     var templates: [MAX_TEMPLATES]Template = undefined;
+    var swapchains: [MAX_SWAPCHAINS]Swapchain = undefined;
     /// the raster under every device's draws (gfxapi's engine), made at
     /// the first vkCreateDevice
     var eng: engine.Engine = undefined;
@@ -401,6 +435,7 @@ fn ready() void {
     markAll("framebuffers");
     markAll("gpipes");
     markAll("templates");
+    markAll("swapchains");
     for (&T.caches) |*c| c.* = false;
     T.desc_map = .{};
     T.shader_map = .{};
@@ -819,7 +854,9 @@ fn getPhysicalDeviceFormatProperties(_: ?*anyopaque, f: u32, out: ?*abi.FormatPr
 }
 
 fn getPhysicalDeviceFormatProperties2(_: ?*anyopaque, f: u32, out: ?*abi.FormatProperties2) callconv(.c) void {
-    (out orelse return).formatProperties = formatProperties(f);
+    const o = out orelse return;
+    o.formatProperties = formatProperties(f);
+    fillModifierList(f, o.pNext);
 }
 
 fn getPhysicalDeviceImageFormatProperties(_: ?*anyopaque, f: u32, ty: u32, tiling: u32, usage: u32, flags: u32, out: ?*abi.ImageFormatProperties) callconv(.c) Result {
@@ -830,7 +867,34 @@ fn getPhysicalDeviceImageFormatProperties(_: ?*anyopaque, f: u32, ty: u32, tilin
 fn getPhysicalDeviceImageFormatProperties2(_: ?*anyopaque, info: ?*const abi.PhysicalDeviceImageFormatInfo2, out: ?*abi.ImageFormatProperties2) callconv(.c) Result {
     const i = info orelse return R.error_initialization_failed;
     const o = out orelse return R.error_initialization_failed;
-    return imageFormatProperties(i.format, i.@"type", i.tiling, i.usage, i.flags, &o.imageFormatProperties);
+    lock();
+    defer unlock();
+    // (a DRM format modifier: linear is the one there is)
+    var tiling = i.tiling;
+    if (tiling == abi.TILING_DRM_FORMAT_MODIFIER) {
+        const b = findIn(i.pNext, ST.physical_device_image_drm_format_modifier_info_ext) orelse return R.error_format_not_supported;
+        const mi: *const abi.PhysicalDeviceImageDrmFormatModifierInfoEXT = @ptrCast(@alignCast(b));
+        if (mi.drmFormatModifier != abi.DRM_MOD_LINEAR) return R.error_format_not_supported;
+        tiling = 1;
+    }
+    const res = imageFormatProperties(i.format, i.@"type", tiling, i.usage, i.flags, &o.imageFormatProperties);
+    if (res != R.success) return res;
+    var ext = std.mem.zeroes(abi.ExternalMemoryProperties);
+    if (findIn(i.pNext, ST.physical_device_external_image_format_info)) |b| {
+        const ei: *const abi.PhysicalDeviceExternalImageFormatInfo = @ptrCast(@alignCast(b));
+        if (ei.handleType != 0) {
+            ext = externalMemoryProps(ei.handleType);
+            if (ext.externalMemoryFeatures == 0) return R.error_format_not_supported;
+        }
+    }
+    var cur: ?*abi.BaseOutStructure = @ptrCast(@alignCast(o.pNext));
+    while (cur) |c| : (cur = nextOut(c)) {
+        if (c.sType == ST.external_image_format_properties) {
+            const ep: *abi.ExternalImageFormatProperties = @ptrCast(@alignCast(c));
+            ep.externalMemoryProperties = ext;
+        }
+    }
+    return R.success;
 }
 
 fn getPhysicalDeviceSparseImageFormatProperties(_: ?*anyopaque, _: u32, _: u32, _: u32, _: u32, _: u32, count: ?*u32, _: ?*anyopaque) callconv(.c) void {
@@ -841,28 +905,32 @@ fn getPhysicalDeviceSparseImageFormatProperties2(_: ?*anyopaque, _: ?*const anyo
     if (count) |c| c.* = 0;
 }
 
-fn getPhysicalDeviceExternalBufferProperties(_: ?*anyopaque, _: ?*const anyopaque, out: ?*abi.ExternalBufferProperties) callconv(.c) void {
-    (out orelse return).externalMemoryProperties = std.mem.zeroes(abi.ExternalMemoryProperties);
+/// The device extensions this GPU has (those needing a Host only with one).
+fn deviceExtensions(out: *[device_extensions.len]abi.ExtensionProperties) []const abi.ExtensionProperties {
+    const all = comptime extList(&device_extensions);
+    const host = hasHost();
+    var n: usize = 0;
+    for (device_extensions, 0..) |e, i| {
+        if (e.host and !host) continue;
+        out[n] = all[i];
+        n += 1;
+    }
+    return out[0..n];
 }
 
-fn getPhysicalDeviceExternalFenceProperties(_: ?*anyopaque, _: ?*const anyopaque, out: ?*abi.ExternalFenceProperties) callconv(.c) void {
-    const o = out orelse return;
-    o.exportFromImportedHandleTypes = 0;
-    o.compatibleHandleTypes = 0;
-    o.externalFenceFeatures = 0;
-}
-
-fn getPhysicalDeviceExternalSemaphoreProperties(_: ?*anyopaque, _: ?*const anyopaque, out: ?*abi.ExternalSemaphoreProperties) callconv(.c) void {
-    const o = out orelse return;
-    o.exportFromImportedHandleTypes = 0;
-    o.compatibleHandleTypes = 0;
-    o.externalSemaphoreFeatures = 0;
+fn deviceHasExt(name: []const u8) bool {
+    for (device_extensions) |e| {
+        if (std.mem.eql(u8, e.name, name)) return !e.host or hasHost();
+    }
+    return false;
 }
 
 fn enumerateDeviceExtensionProperties(_: ?*anyopaque, layer: ?[*:0]const u8, count: ?*u32, out: ?[*]abi.ExtensionProperties) callconv(.c) Result {
     if (layer != null) return R.error_layer_not_present;
-    const list = extList(&device_extensions);
-    return enumerate(abi.ExtensionProperties, &list, count, out);
+    lock();
+    defer unlock();
+    var buf: [device_extensions.len]abi.ExtensionProperties = undefined;
+    return enumerate(abi.ExtensionProperties, deviceExtensions(&buf), count, out);
 }
 
 fn enumerateDeviceLayerProperties(_: ?*anyopaque, count: ?*u32, out: ?[*]abi.LayerProperties) callconv(.c) Result {
@@ -887,7 +955,7 @@ fn createDevice(phys: ?*anyopaque, info: ?*const abi.DeviceCreateInfo, _: ?*cons
     const g = theGpu() orelse return R.error_initialization_failed;
     for (0..ci.enabledExtensionCount) |i| {
         const name = cstr(ci.ppEnabledExtensionNames.?[i]);
-        if (!hasExt(&device_extensions, name)) {
+        if (!deviceHasExt(name)) {
             say("vkCreateDevice: extension {s} is not supported", .{name});
             return R.error_extension_not_present;
         }
@@ -974,6 +1042,7 @@ fn destroyDevice(h: ?*anyopaque, _: ?*const anyopaque) callconv(.c) void {
     const d = &T.devices[di];
     // (the app has waited for its work; free what is left of the device's)
     if (d.last_fence != 0) g.dev.wait(d.last_fence, 5_000_000) catch {};
+    for (&T.swapchains) |*sc| if (sc.live and sc.dev == di) dropSwapchain(g, sc);
     for (&T.pipelines) |*p| if (p.live and p.dev == di) {
         g.dev.unload(&p.prog);
         p.live = false;
@@ -1071,8 +1140,39 @@ fn allocateMemory(h: ?*anyopaque, info: ?*const abi.MemoryAllocateInfo, _: ?*con
     if (ai.memoryTypeIndex >= T.n_mem_types) return R.error_out_of_device_memory;
     const t = T.mem_types[ai.memoryTypeIndex];
     const mi = findFree("memories") orelse return R.error_too_many_objects;
+    // a dma-buf in: this device's memory over it, zero-copy
+    if (findIn(ai.pNext, ST.import_memory_fd_info_khr)) |base| {
+        const im: *const abi.ImportMemoryFdInfoKHR = @ptrCast(@alignCast(base));
+        if (im.handleType != 0) {
+            const host = g.host orelse return R.error_invalid_external_handle;
+            if (im.handleType & EXT_MEM_FDS == 0 or im.fd < 0) return R.error_invalid_external_handle;
+            const ib = host.importFd(host.ctx, im.fd) orelse {
+                say("vkAllocateMemory: the render node refused dma-buf fd {d}", .{im.fd});
+                return R.error_invalid_external_handle;
+            };
+            if (ib.bytes < ai.allocationSize) {
+                g.dev.free(ib);
+                return R.error_invalid_external_handle;
+            }
+            // (the fd is the driver's now: the buffer holds the memory)
+            host.close(host.ctx, im.fd);
+            T.memories[mi] = .{ .live = true, .dev = di, .buf = ib, .size = ai.allocationSize, .host = t.flags & MEM_HOST_VISIBLE != 0 and ib.cpu.len != 0, .mapped = false, .dirty = false, .dirty_fence = 0 };
+            (out orelse return R.error_initialization_failed).* = handle(.memory, mi);
+            return R.success;
+        }
+    }
+    // memory for export: system memory, as EGL's window buffers (what other
+    // contexts and the compositor map)
+    var kind = t.kind;
+    if (findIn(ai.pNext, ST.export_memory_allocate_info)) |base| {
+        const ex: *const abi.ExportMemoryAllocateInfo = @ptrCast(@alignCast(base));
+        if (ex.handleTypes != 0) {
+            if (g.host == null or ex.handleTypes & ~EXT_MEM_FDS != 0) return R.error_invalid_external_handle;
+            kind = .host;
+        }
+    }
     const size = @max(ai.allocationSize, 4);
-    const b = g.dev.alloc(size, t.kind) catch return R.error_out_of_device_memory;
+    const b = g.dev.alloc(size, kind) catch return R.error_out_of_device_memory;
     T.memories[mi] = .{ .live = true, .dev = di, .buf = b, .size = ai.allocationSize, .host = t.flags & MEM_HOST_VISIBLE != 0 and b.cpu.len != 0, .mapped = false, .dirty = false, .dirty_fence = 0 };
     (out orelse return R.error_initialization_failed).* = handle(.memory, mi);
     return R.success;
@@ -1088,6 +1188,7 @@ fn freeMemory(dh: ?*anyopaque, h: u64, _: ?*const anyopaque) callconv(.c) void {
     defer unlock();
     _ = devOf(dh) orelse return;
     const m = memOf(h) orelse return;
+    if (m.swapchain) return;
     const g = theGpu() orelse return;
     g.dev.free(m.buf);
     m.live = false;
@@ -2813,6 +2914,7 @@ fn queueSubmit(q: ?*anyopaque, n: u32, submits: ?[*]const abi.SubmitInfo, fh: u6
     if (d.staging_used != 0 and g.dev.done(d.last_fence)) d.staging_used = 0;
     var e = Exec{ .g = g, .di = di };
     T.n_ds = 0;
+    var wait_out = false;
     for (0..n) |si| {
         const s = submits.?[si];
         const tl: ?*const abi.TimelineSemaphoreSubmitInfo = if (findIn(s.pNext, ST.timeline_semaphore_submit_info)) |b| @ptrCast(@alignCast(b)) else null;
@@ -2845,6 +2947,7 @@ fn queueSubmit(q: ?*anyopaque, n: u32, submits: ?[*]const abi.SubmitInfo, fh: u6
         finishDirty(d.last_fence);
         for (0..s.signalSemaphoreCount) |xi| {
             const sem = semOf(s.pSignalSemaphores.?[xi]) orelse continue;
+            wait_out = wait_out or sem.exported;
             if (!sem.timeline) {
                 sem.signaled = true;
                 continue;
@@ -2861,6 +2964,15 @@ fn queueSubmit(q: ?*anyopaque, n: u32, submits: ?[*]const abi.SubmitInfo, fh: u6
                 sem.value = @max(sem.value, v);
             }
         }
+    }
+    // (a semaphore another context waits on: the work done before it is told)
+    if (wait_out and d.last_fence != 0) {
+        const res = waitFence(g, d.last_fence, 2_000_000_000);
+        if (res == R.error_device_lost) {
+            d.lost = true;
+            return res;
+        }
+        pullDone(g);
     }
     if (fenceOf(fh)) |f| {
         if (d.last_fence == 0) {
@@ -3013,6 +3125,10 @@ fn createSemaphore(_: ?*anyopaque, info: ?*const abi.SemaphoreCreateInfo, _: ?*c
             s.timeline = true;
             s.value = ti.initialValue;
         }
+    }
+    if (findIn(ci.pNext, ST.export_semaphore_create_info)) |b| {
+        const ei: *const abi.ExportSemaphoreCreateInfo = @ptrCast(@alignCast(b));
+        s.exported = ei.handleTypes != 0;
     }
     T.semaphores[i] = s;
     (out orelse return R.error_initialization_failed).* = handle(.semaphore, i);
@@ -3403,6 +3519,24 @@ fn createImage(dh: ?*anyopaque, info: ?*const abi.ImageCreateInfo, _: ?*const an
     const e = ci.extent;
     if (e.width == 0 or e.height == 0 or e.depth == 0 or ci.mipLevels == 0 or ci.arrayLayers == 0) return R.error_initialization_failed;
     if (ci.mipLevels > MAX_LEVELS or ci.arrayLayers > MAX_LAYERS or e.width > MAX_IMAGE_2D or e.height > MAX_IMAGE_2D or e.depth > MAX_IMAGE_3D) return R.error_out_of_device_memory;
+    // a DRM format modifier: linear, the layout every image has
+    var explicit: ?abi.SubresourceLayout = null;
+    if (ci.tiling == abi.TILING_DRM_FORMAT_MODIFIER) {
+        if (findIn(ci.pNext, ST.image_drm_format_modifier_list_create_info_ext)) |b| {
+            const ml: *const abi.ImageDrmFormatModifierListCreateInfoEXT = @ptrCast(@alignCast(b));
+            var linear = false;
+            for (0..ml.drmFormatModifierCount) |k| linear = linear or ml.pDrmFormatModifiers.?[k] == abi.DRM_MOD_LINEAR;
+            if (!linear) {
+                say("vkCreateImage: no linear modifier among {d} (linear is the one here)", .{ml.drmFormatModifierCount});
+                return R.error_format_not_supported;
+            }
+        } else if (findIn(ci.pNext, ST.image_drm_format_modifier_explicit_create_info_ext)) |b| {
+            const xi: *const abi.ImageDrmFormatModifierExplicitCreateInfoEXT = @ptrCast(@alignCast(b));
+            if (xi.drmFormatModifier != abi.DRM_MOD_LINEAR or xi.drmFormatModifierPlaneCount != 1) return R.error_invalid_drm_format_modifier_plane_layout_ext;
+            explicit = xi.pPlaneLayouts.?[0];
+        } else return R.error_initialization_failed;
+        if (ci.mipLevels != 1 or ci.arrayLayers != 1 or ci.imageType != 1) return R.error_format_not_supported;
+    }
     const i = findFree("images") orelse return R.error_too_many_objects;
     var im = Image{ .live = true, .dev = di, .fi = fi, .ty = ci.imageType, .w = e.width, .h = if (ci.imageType == 0) 1 else e.height, .d = if (ci.imageType == 2) e.depth else 1, .levels = ci.mipLevels, .layers = if (ci.imageType == 2) 1 else ci.arrayLayers, .mem = NONE, .offset = 0, .level_at = undefined, .size = 0 };
     var at: u64 = 0;
@@ -3412,6 +3546,12 @@ fn createImage(dh: ?*anyopaque, info: ?*const abi.ImageCreateInfo, _: ?*const an
         at = std.mem.alignForward(u64, at, 16);
     }
     im.size = @max(at, 16);
+    if (explicit) |pl| {
+        if (pl.offset != 0 or pl.rowPitch != im.pitch(0)) {
+            say("vkCreateImage: plane layout offset {d}, row pitch {d} (rows here are {d} bytes)", .{ pl.offset, pl.rowPitch, im.pitch(0) });
+            return R.error_invalid_drm_format_modifier_plane_layout_ext;
+        }
+    }
     T.images[i] = im;
     (out orelse return R.error_initialization_failed).* = handle(.image, i);
     return R.success;
@@ -4661,6 +4801,602 @@ fn cmdClearDepthStencilImage(h: ?*anyopaque, img: u64, _: u32, ds: ?*const abi.C
     for (0..n) |i| put(cb, .clear_image, ClearImage{ .image = unhandle(.image, img) orelse NONE, .depth_stencil = 1, .value = .{ .depthStencil = v.* }, .range = ranges.?[i] });
 }
 
+// ── External memory, semaphores and fences (fds) ───────────────────────────
+//
+// What Firefox's WebGPU shares with WebRender (wgpu_bindings' server.rs on
+// Linux: VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf,
+// VK_EXT_image_drm_format_modifier, VK_KHR_external_semaphore_fd), over
+// the root's Host (Galaxy's render node: PRIME export and import, fence
+// files). Without a Host none of it is offered.
+//
+// - **Memory out**: memory allocated for export (VkExportMemoryAllocateInfo)
+//   is system memory the GPU maps, whatever its type says, as EGL's window
+//   buffers are (the compositor and other contexts map such dma-bufs);
+//   vkGetMemoryFdKHR is its dma-buf (PRIME), opaque fds the same.
+// - **Memory in**: VkImportMemoryFdInfoKHR maps a dma-buf as this device's
+//   memory (PRIME import), zero-copy; the fd is the driver's then (closed).
+// - **Images**: every image is linear, so DRM_FORMAT_MOD_LINEAR is the one
+//   modifier, one plane, rows as format.sig keeps them; an explicit layout
+//   must be that one.
+// - **Semaphores**: exported ones (opaque fd or sync_file) are fence files
+//   of everything submitted so far. A submission that signals a semaphore
+//   made for export waits for its work before vkQueueSubmit returns: the
+//   other side (Firefox's WebRender on Galaxy's GL, which has no
+//   EXT_semaphore_fd to wait with) then finds the pixels done. Imported
+//   ones are waited for on the CPU at import (sync_files poll).
+
+const EXT_MEM_FDS: u32 = abi.ExternalHandle.opaque_fd | abi.ExternalHandle.dma_buf;
+const EXT_SEM_FDS: u32 = abi.ExternalHandle.opaque_fd | abi.ExternalHandle.semaphore_sync_fd;
+const EXT_FENCE_FDS: u32 = abi.ExternalHandle.opaque_fd | abi.ExternalHandle.fence_sync_fd;
+
+fn hasHost() bool {
+    const g = theGpu() orelse return false;
+    return g.host != null;
+}
+
+fn externalMemoryProps(handle_type: u32) abi.ExternalMemoryProperties {
+    if (!hasHost() or handle_type & EXT_MEM_FDS == 0 or @popCount(handle_type) != 1) return std.mem.zeroes(abi.ExternalMemoryProperties);
+    return .{
+        .externalMemoryFeatures = abi.ExternalHandle.memory_exportable | abi.ExternalHandle.memory_importable,
+        .exportFromImportedHandleTypes = EXT_MEM_FDS,
+        .compatibleHandleTypes = EXT_MEM_FDS,
+    };
+}
+
+fn getPhysicalDeviceExternalBufferProperties(_: ?*anyopaque, info: ?*const abi.PhysicalDeviceExternalBufferInfo, out: ?*abi.ExternalBufferProperties) callconv(.c) void {
+    lock();
+    defer unlock();
+    const o = out orelse return;
+    o.externalMemoryProperties = externalMemoryProps(if (info) |i| i.handleType else 0);
+}
+
+fn getPhysicalDeviceExternalFenceProperties(_: ?*anyopaque, info: ?*const abi.PhysicalDeviceExternalFenceInfo, out: ?*abi.ExternalFenceProperties) callconv(.c) void {
+    lock();
+    defer unlock();
+    const o = out orelse return;
+    const t = if (info) |i| i.handleType else 0;
+    const ok = hasHost() and t == abi.ExternalHandle.fence_sync_fd;
+    o.exportFromImportedHandleTypes = if (ok) t else 0;
+    o.compatibleHandleTypes = if (ok) t else 0;
+    o.externalFenceFeatures = if (ok) abi.ExternalHandle.exportable | abi.ExternalHandle.importable else 0;
+}
+
+fn getPhysicalDeviceExternalSemaphoreProperties(_: ?*anyopaque, info: ?*const abi.PhysicalDeviceExternalSemaphoreInfo, out: ?*abi.ExternalSemaphoreProperties) callconv(.c) void {
+    lock();
+    defer unlock();
+    const o = out orelse return;
+    const t = if (info) |i| i.handleType else 0;
+    // (binary semaphores: a timeline one asked for in the chain is not exported)
+    var timeline = false;
+    if (info) |i| if (findIn(i.pNext, ST.semaphore_type_create_info)) |b| {
+        const ti: *const abi.SemaphoreTypeCreateInfo = @ptrCast(@alignCast(b));
+        timeline = ti.semaphoreType == 1;
+    };
+    const ok = hasHost() and !timeline and t & EXT_SEM_FDS != 0 and @popCount(t) == 1;
+    o.exportFromImportedHandleTypes = if (ok) t else 0;
+    o.compatibleHandleTypes = if (ok) t else 0;
+    o.externalSemaphoreFeatures = if (ok) abi.ExternalHandle.exportable | abi.ExternalHandle.importable else 0;
+}
+
+fn getMemoryFd(dh: ?*anyopaque, info: ?*const abi.MemoryGetFdInfoKHR, out: ?*i32) callconv(.c) Result {
+    const gi = info orelse return R.error_initialization_failed;
+    lock();
+    defer unlock();
+    _ = devOf(dh) orelse return R.error_initialization_failed;
+    const g = theGpu() orelse return R.error_initialization_failed;
+    const h = g.host orelse return R.error_invalid_external_handle;
+    if (gi.handleType & EXT_MEM_FDS == 0) return R.error_invalid_external_handle;
+    const m = memOf(gi.memory) orelse return R.error_invalid_external_handle;
+    const fd = h.exportFd(h.ctx, m.buf);
+    if (fd < 0) {
+        say("vkGetMemoryFdKHR: the render node gave no dma-buf (errno {d})", .{-fd});
+        return R.error_too_many_objects;
+    }
+    (out orelse return R.error_initialization_failed).* = @intCast(fd);
+    return R.success;
+}
+
+fn getMemoryFdProperties(dh: ?*anyopaque, handle_type: u32, fd: i32, out: ?*abi.MemoryFdPropertiesKHR) callconv(.c) Result {
+    lock();
+    defer unlock();
+    _ = devOf(dh) orelse return R.error_initialization_failed;
+    if (!hasHost() or handle_type != abi.ExternalHandle.dma_buf or fd < 0) return R.error_invalid_external_handle;
+    (out orelse return R.error_initialization_failed).memoryTypeBits = (@as(u32, 1) << @intCast(T.n_mem_types)) - 1;
+    return R.success;
+}
+
+fn getSemaphoreFd(dh: ?*anyopaque, info: ?*const abi.SemaphoreGetFdInfoKHR, out: ?*i32) callconv(.c) Result {
+    const gi = info orelse return R.error_initialization_failed;
+    lock();
+    defer unlock();
+    _ = devOf(dh) orelse return R.error_initialization_failed;
+    const g = theGpu() orelse return R.error_initialization_failed;
+    const h = g.host orelse return R.error_invalid_external_handle;
+    if (gi.handleType & EXT_SEM_FDS == 0) return R.error_invalid_external_handle;
+    const s = semOf(gi.semaphore) orelse return R.error_invalid_external_handle;
+    // (a fence file of everything submitted so far: its signal comes
+    // after, in the in-order queue, or was waited for already)
+    const fd = h.fenceFd(h.ctx);
+    if (fd < 0) {
+        say("vkGetSemaphoreFdKHR: the render node gave no fence file (errno {d})", .{-fd});
+        return R.error_too_many_objects;
+    }
+    // (a sync_file export takes the payload: the semaphore is unsignaled)
+    if (gi.handleType == abi.ExternalHandle.semaphore_sync_fd) s.signaled = false;
+    (out orelse return R.error_initialization_failed).* = @intCast(fd);
+    return R.success;
+}
+
+/// An imported fence file, waited for on the CPU (at most a second) and closed.
+fn settleFd(h: gfxapi.host.Host, fd: i32) void {
+    if (fd < 0) return;
+    _ = h.poll(h.ctx, fd, 1000);
+    h.close(h.ctx, fd);
+}
+
+fn importSemaphoreFd(dh: ?*anyopaque, info: ?*const abi.ImportSemaphoreFdInfoKHR) callconv(.c) Result {
+    const ii = info orelse return R.error_initialization_failed;
+    lock();
+    defer unlock();
+    _ = devOf(dh) orelse return R.error_initialization_failed;
+    const g = theGpu() orelse return R.error_initialization_failed;
+    const h = g.host orelse return R.error_invalid_external_handle;
+    if (ii.handleType & EXT_SEM_FDS == 0) return R.error_invalid_external_handle;
+    const s = semOf(ii.semaphore) orelse return R.error_invalid_external_handle;
+    if (s.timeline) return R.error_invalid_external_handle;
+    settleFd(h, ii.fd);
+    s.signaled = true;
+    return R.success;
+}
+
+fn getFenceFd(dh: ?*anyopaque, info: ?*const abi.FenceGetFdInfoKHR, out: ?*i32) callconv(.c) Result {
+    const gi = info orelse return R.error_initialization_failed;
+    lock();
+    defer unlock();
+    _ = devOf(dh) orelse return R.error_initialization_failed;
+    const g = theGpu() orelse return R.error_initialization_failed;
+    const h = g.host orelse return R.error_invalid_external_handle;
+    if (gi.handleType != abi.ExternalHandle.fence_sync_fd) return R.error_invalid_external_handle;
+    const f = fenceOf(gi.fence) orelse return R.error_invalid_external_handle;
+    const o = out orelse return R.error_initialization_failed;
+    // (signaled already: -1, as the spec lets a sync_file export say)
+    if (fenceDone(g, f)) {
+        o.* = -1;
+        return R.success;
+    }
+    const fd = h.fenceFd(h.ctx);
+    if (fd < 0) return R.error_too_many_objects;
+    o.* = @intCast(fd);
+    return R.success;
+}
+
+fn importFenceFd(dh: ?*anyopaque, info: ?*const abi.ImportFenceFdInfoKHR) callconv(.c) Result {
+    const ii = info orelse return R.error_initialization_failed;
+    lock();
+    defer unlock();
+    _ = devOf(dh) orelse return R.error_initialization_failed;
+    const g = theGpu() orelse return R.error_initialization_failed;
+    const h = g.host orelse return R.error_invalid_external_handle;
+    if (ii.handleType != abi.ExternalHandle.fence_sync_fd) return R.error_invalid_external_handle;
+    const f = fenceOf(ii.fence) orelse return R.error_invalid_external_handle;
+    settleFd(h, ii.fd);
+    f.signaled = true;
+    f.pending = 0;
+    return R.success;
+}
+
+fn getImageDrmFormatModifierProperties(_: ?*anyopaque, ih: u64, out: ?*abi.ImageDrmFormatModifierPropertiesEXT) callconv(.c) Result {
+    lock();
+    defer unlock();
+    _ = imgOf(ih) orelse return R.error_initialization_failed;
+    (out orelse return R.error_initialization_failed).drmFormatModifier = abi.DRM_MOD_LINEAR;
+    return R.success;
+}
+
+/// VkDrmFormatModifierPropertiesListEXT for format `f`: linear, where the
+/// format has linear images.
+fn fillModifierList(f: u32, chain: ?*anyopaque) void {
+    const lin = format.props(f).linear;
+    var cur: ?*abi.BaseOutStructure = @ptrCast(@alignCast(chain));
+    while (cur) |c| : (cur = nextOut(c)) {
+        if (c.sType != ST.drm_format_modifier_properties_list_ext) continue;
+        const ml: *abi.DrmFormatModifierPropertiesListEXT = @ptrCast(@alignCast(c));
+        const n: u32 = if (lin != 0) 1 else 0;
+        if (ml.pDrmFormatModifierProperties) |arr| {
+            if (ml.drmFormatModifierCount >= 1 and n == 1) arr[0] = .{ .drmFormatModifier = abi.DRM_MOD_LINEAR, .drmFormatModifierPlaneCount = 1, .drmFormatModifierTilingFeatures = lin };
+            ml.drmFormatModifierCount = @min(ml.drmFormatModifierCount, n);
+        } else ml.drmFormatModifierCount = n;
+    }
+}
+
+// ── Presentation: VK_KHR_surface, VK_KHR_wayland_surface, VK_KHR_swapchain ─
+//
+// The loader makes a Wayland VkSurfaceKHR itself (its VkIcdSurfaceWayland:
+// the app's wl_display and wl_surface) and hands it here. A swapchain is
+// gfxapi's Wayland platform (wayland.sig) as EGL's windows use it: the
+// app's libwayland-client (the root's `wayland`), a queue of the
+// driver's own, zwp_linux_dmabuf_v1. Its images are linear BGRA8 images in
+// system memory, each a dma-buf (PRIME) made a wl_buffer by create_immed
+// (DRM ARGB8888, or XRGB8888 for an opaque swapchain). vkAcquireNextImageKHR
+// takes an image the compositor has released (dispatching the driver's
+// queue, waiting for a release when every image is out); its semaphore and
+// fence are signaled at once. vkQueuePresentKHR attaches, damages the
+// whole buffer, commits and flushes, after the work submitted before it
+// (the queue runs in order; Galaxy's dma-buf fences cover the GPU's
+// writes, as for EGL's swaps). FIFO waits for the frame callback of the
+// frame before (one frame on the screen at a time); MAILBOX does not.
+
+pub const MAX_SWAPCHAINS = 16;
+pub const MAX_SC_IMAGES = 4;
+const SC_FORMAT: u32 = 44; // VK_FORMAT_B8G8R8A8_UNORM
+const PRESENT_MAILBOX: u32 = 1;
+const PRESENT_FIFO: u32 = 2;
+const SUBOPTIMAL: Result = 1000001003;
+const SURFACE_EXTENT_ANY: u32 = 0xffff_ffff;
+// (wl_surface's, zwp_linux_dmabuf_v1's and its params' requests)
+const WL_SURFACE_ATTACH = 1;
+const WL_SURFACE_DAMAGE = 2;
+const WL_SURFACE_FRAME = 3;
+const WL_SURFACE_COMMIT = 6;
+const WL_SURFACE_DAMAGE_BUFFER = 9;
+const WL_BUFFER_DESTROY = 0;
+const DMABUF_CREATE_PARAMS = 1;
+const PARAMS_DESTROY = 0;
+const PARAMS_ADD = 1;
+const PARAMS_CREATE_IMMED = 3;
+
+const ScImage = struct {
+    image: u32 = NONE,
+    mem: u32 = NONE,
+    buf: ?*wl.Proxy = null,
+    /// the compositor holds it (attached, not released yet)
+    busy: bool = false,
+    /// the app holds it (acquired, not presented yet)
+    acquired: bool = false,
+};
+
+const Swapchain = struct {
+    live: bool = false,
+    dev: u32 = 0,
+    display: wl.Display = undefined,
+    surface: ?*wl.Proxy = null,
+    n: u32 = 0,
+    imgs: [MAX_SC_IMAGES]ScImage = [_]ScImage{.{}} ** MAX_SC_IMAGES,
+    frame_cb: ?*wl.Proxy = null,
+    fifo: bool = true,
+    alpha: bool = false,
+    w: u32 = 0,
+    h: u32 = 0,
+    /// replaced by a newer swapchain (oldSwapchain): nothing more to acquire
+    retired: bool = false,
+    presents: u64 = 0,
+};
+
+fn wsiClient(g: *Gpu) ?*const wl.Client {
+    if (g.host == null) return null;
+    const f = g.wayland orelse return null;
+    return f();
+}
+
+fn surfaceOf(h: u64) ?*const abi.IcdSurfaceWayland {
+    if (h == 0) return null;
+    const s: *const abi.IcdSurfaceWayland = @ptrFromInt(@as(usize, @intCast(h)));
+    if (s.platform != abi.ICD_WSI_PLATFORM_WAYLAND or s.display == null or s.surface == null) return null;
+    return s;
+}
+
+fn scOf(h: u64) ?*Swapchain {
+    const i = unhandle(.swapchain, h) orelse return null;
+    return if (T.swapchains[i].live) &T.swapchains[i] else null;
+}
+
+fn getPhysicalDeviceSurfaceSupport(_: ?*anyopaque, family: u32, surface: u64, out: ?*u32) callconv(.c) Result {
+    lock();
+    defer unlock();
+    const g = theGpu() orelse return R.error_initialization_failed;
+    const ok = family == 0 and surfaceOf(surface) != null and wsiClient(g) != null;
+    (out orelse return R.error_initialization_failed).* = @intFromBool(ok);
+    return R.success;
+}
+
+fn getPhysicalDeviceWaylandPresentationSupport(_: ?*anyopaque, family: u32, display: ?*anyopaque) callconv(.c) u32 {
+    lock();
+    defer unlock();
+    const g = theGpu() orelse return 0;
+    return @intFromBool(family == 0 and display != null and wsiClient(g) != null);
+}
+
+fn surfaceCaps() abi.SurfaceCapabilitiesKHR {
+    return .{
+        .minImageCount = 2,
+        .maxImageCount = MAX_SC_IMAGES,
+        // (Wayland: the swapchain's size is the window's)
+        .currentExtent = .{ .width = SURFACE_EXTENT_ANY, .height = SURFACE_EXTENT_ANY },
+        .minImageExtent = .{ .width = 1, .height = 1 },
+        .maxImageExtent = .{ .width = MAX_IMAGE_2D, .height = MAX_IMAGE_2D },
+        .maxImageArrayLayers = 1,
+        .supportedTransforms = 1, // identity
+        .currentTransform = 1,
+        .supportedCompositeAlpha = 0x1 | 0x2, // opaque, premultiplied
+        // transfer src and dst, sampled, colour attachment
+        .supportedUsageFlags = 0x1 | 0x2 | 0x4 | 0x10,
+    };
+}
+
+fn getPhysicalDeviceSurfaceCapabilities(_: ?*anyopaque, surface: u64, out: ?*abi.SurfaceCapabilitiesKHR) callconv(.c) Result {
+    lock();
+    defer unlock();
+    _ = surfaceOf(surface) orelse return R.error_surface_lost_khr;
+    (out orelse return R.error_initialization_failed).* = surfaceCaps();
+    return R.success;
+}
+
+fn getPhysicalDeviceSurfaceFormats(_: ?*anyopaque, surface: u64, count: ?*u32, out: ?[*]abi.SurfaceFormatKHR) callconv(.c) Result {
+    lock();
+    defer unlock();
+    _ = surfaceOf(surface) orelse return R.error_surface_lost_khr;
+    // (BGRA8, sRGB colour space: what the raster writes and Wayland's ARGB8888 is)
+    return enumerate(abi.SurfaceFormatKHR, &.{.{ .format = SC_FORMAT, .colorSpace = 0 }}, count, out);
+}
+
+fn getPhysicalDeviceSurfacePresentModes(_: ?*anyopaque, surface: u64, count: ?*u32, out: ?[*]u32) callconv(.c) Result {
+    lock();
+    defer unlock();
+    _ = surfaceOf(surface) orelse return R.error_surface_lost_khr;
+    return enumerate(u32, &.{ PRESENT_FIFO, PRESENT_MAILBOX }, count, out);
+}
+
+fn getPhysicalDevicePresentRectangles(_: ?*anyopaque, surface: u64, count: ?*u32, out: ?[*]abi.Rect2D) callconv(.c) Result {
+    _ = surfaceOf(surface) orelse return R.error_surface_lost_khr;
+    const all = abi.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = MAX_IMAGE_2D, .height = MAX_IMAGE_2D } };
+    return enumerate(abi.Rect2D, &.{all}, count, out);
+}
+
+fn getDeviceGroupPresentCapabilities(_: ?*anyopaque, out: ?*abi.DeviceGroupPresentCapabilitiesKHR) callconv(.c) Result {
+    const o = out orelse return R.error_initialization_failed;
+    @memset(&o.presentMask, 0);
+    o.presentMask[0] = 1;
+    o.modes = 1; // local
+    return R.success;
+}
+
+fn getDeviceGroupSurfacePresentModes(_: ?*anyopaque, _: u64, out: ?*u32) callconv(.c) Result {
+    (out orelse return R.error_initialization_failed).* = 1;
+    return R.success;
+}
+
+fn createSwapchain(dh: ?*anyopaque, info: ?*const abi.SwapchainCreateInfoKHR, _: ?*const anyopaque, out: ?*u64) callconv(.c) Result {
+    const ci = info orelse return R.error_initialization_failed;
+    lock();
+    defer unlock();
+    const di = devOf(dh) orelse return R.error_initialization_failed;
+    const g = theGpu() orelse return R.error_initialization_failed;
+    const h = g.host orelse return R.error_initialization_failed;
+    const c = wsiClient(g) orelse return R.error_surface_lost_khr;
+    const surf = surfaceOf(ci.surface) orelse return R.error_surface_lost_khr;
+    if (ci.imageFormat != SC_FORMAT or ci.imageArrayLayers != 1) {
+        say("vkCreateSwapchainKHR: format {d}, {d} layers (BGRA8 UNORM, one layer)", .{ ci.imageFormat, ci.imageArrayLayers });
+        return R.error_initialization_failed;
+    }
+    const w = ci.imageExtent.width;
+    const hh = ci.imageExtent.height;
+    if (w == 0 or hh == 0 or w > MAX_IMAGE_2D or hh > MAX_IMAGE_2D or ci.minImageCount > MAX_SC_IMAGES) return R.error_initialization_failed;
+    // the swapchain it replaces gives nothing more to acquire
+    if (scOf(ci.oldSwapchain)) |old| old.retired = true;
+    const si = findFree("swapchains") orelse return R.error_too_many_objects;
+    const sc = &T.swapchains[si];
+    sc.* = .{ .live = true, .dev = di, .fifo = ci.presentMode != PRESENT_MAILBOX and ci.presentMode != 0, .alpha = ci.compositeAlpha != 0x1, .w = w, .h = hh };
+    if (!sc.display.init(c, h, @ptrCast(surf.display.?))) {
+        sc.live = false;
+        say("vkCreateSwapchainKHR: the compositor offers no linear dma-bufs", .{});
+        return R.error_surface_lost_khr;
+    }
+    if (!sc.display.takes(sc.alpha)) sc.alpha = !sc.alpha;
+    sc.surface = c.create_wrapper(@ptrCast(surf.surface.?));
+    if (sc.surface == null) {
+        dropSwapchain(g, sc);
+        return R.error_surface_lost_khr;
+    }
+    c.set_queue(sc.surface.?, sc.display.queue);
+    sc.n = @max(ci.minImageCount, 2);
+    for (0..sc.n) |i| {
+        if (!makeScImage(g, h, sc, @intCast(i))) {
+            dropSwapchain(g, sc);
+            return R.error_out_of_device_memory;
+        }
+    }
+    (out orelse return R.error_initialization_failed).* = handle(.swapchain, si);
+    return R.success;
+}
+
+/// Image `i` of `sc`: an image and its memory (system memory), its
+/// dma-buf a wl_buffer.
+fn makeScImage(g: *Gpu, h: gfxapi.host.Host, sc: *Swapchain, i: u32) bool {
+    const c = sc.display.c;
+    const fi = format.image(SC_FORMAT).?;
+    const ii = findFree("images") orelse return false;
+    var im = Image{ .live = true, .dev = sc.dev, .fi = fi, .ty = 1, .w = sc.w, .h = sc.h, .d = 1, .levels = 1, .layers = 1, .mem = NONE, .offset = 0, .level_at = undefined, .size = 0 };
+    im.level_at[0] = 0;
+    im.size = std.mem.alignForward(u64, im.slice(0), 256);
+    const mi = findFree("memories") orelse return false;
+    const buf = g.dev.alloc(im.size, .host) catch return false;
+    T.memories[mi] = .{ .live = true, .dev = sc.dev, .buf = buf, .size = im.size, .host = false, .mapped = false, .dirty = false, .dirty_fence = 0, .swapchain = true };
+    im.mem = mi;
+    T.images[ii] = im;
+    sc.imgs[i] = .{ .image = ii, .mem = mi };
+    const fd = h.exportFd(h.ctx, buf);
+    if (fd < 0) {
+        say("vkCreateSwapchainKHR: no dma-buf for a {d}x{d} image (errno {d})", .{ sc.w, sc.h, -fd });
+        return false;
+    }
+    defer h.close(h.ctx, @intCast(fd));
+    var none = [_]wl.Arg{.{ .o = null }};
+    const params = c.send(sc.display.dmabuf.?, DMABUF_CREATE_PARAMS, &wl.params_interface, null, 0, &none) orelse return false;
+    var add = [_]wl.Arg{ .{ .h = @intCast(fd) }, .{ .u = 0 }, .{ .u = 0 }, .{ .u = im.pitch(0) }, .{ .u = @intCast(abi.DRM_MOD_LINEAR >> 32) }, .{ .u = @truncate(abi.DRM_MOD_LINEAR) } };
+    _ = c.send(params, PARAMS_ADD, null, null, 0, &add);
+    const drm: u32 = if (sc.alpha) wl.DRM_FORMAT_ARGB8888 else wl.DRM_FORMAT_XRGB8888;
+    var immed = [_]wl.Arg{ .{ .o = null }, .{ .i = @intCast(sc.w) }, .{ .i = @intCast(sc.h) }, .{ .u = drm }, .{ .u = 0 } };
+    sc.imgs[i].buf = c.send(params, PARAMS_CREATE_IMMED, c.buffer_interface, 1, 0, &immed);
+    _ = c.send(params, PARAMS_DESTROY, null, null, wl.DESTROY, &none);
+    const b = sc.imgs[i].buf orelse return false;
+    _ = c.add_dispatcher(b, &onScBuffer, &sc.imgs[i], null);
+    return true;
+}
+
+fn dropSwapchain(g: *Gpu, sc: *Swapchain) void {
+    const c = sc.display.c;
+    var none = [_]wl.Arg{.{ .o = null }};
+    // (the GPU's work on its images done first)
+    const d = &T.devices[sc.dev];
+    if (d.live and d.last_fence != 0) _ = waitFence(g, d.last_fence, 1_000_000_000);
+    if (sc.frame_cb) |p| c.destroy(p);
+    sc.frame_cb = null;
+    for (sc.imgs[0..sc.n]) |*x| {
+        if (x.buf) |p| _ = c.send(p, WL_BUFFER_DESTROY, null, null, wl.DESTROY, &none);
+        if (x.mem != NONE and T.memories[x.mem].live) {
+            g.dev.free(T.memories[x.mem].buf);
+            T.memories[x.mem].live = false;
+        }
+        if (x.image != NONE) T.images[x.image].live = false;
+        x.* = .{};
+    }
+    if (sc.surface) |p| c.wrapper_destroy(p);
+    sc.surface = null;
+    sc.display.deinit();
+    sc.live = false;
+}
+
+fn destroySwapchain(_: ?*anyopaque, h: u64, _: ?*const anyopaque) callconv(.c) void {
+    lock();
+    defer unlock();
+    const sc = scOf(h) orelse return;
+    const g = theGpu() orelse return;
+    dropSwapchain(g, sc);
+}
+
+fn getSwapchainImages(_: ?*anyopaque, h: u64, count: ?*u32, out: ?[*]u64) callconv(.c) Result {
+    lock();
+    defer unlock();
+    const sc = scOf(h) orelse return R.error_initialization_failed;
+    var list: [MAX_SC_IMAGES]u64 = undefined;
+    for (sc.imgs[0..sc.n], 0..) |x, i| list[i] = handle(.image, x.image);
+    return enumerate(u64, list[0..sc.n], count, out);
+}
+
+/// An image of `sc` the compositor and the app do not hold, waiting for a
+/// release up to `timeout` (with the lock let go while it waits).
+fn acquireImage(sc_h: u64, timeout: u64, sem: u64, fence: u64, out: ?*u32) Result {
+    var sc = scOf(sc_h) orelse return R.error_initialization_failed;
+    if (sc.retired) return R.error_out_of_date_khr;
+    const c = sc.display.c;
+    _ = c.dispatch_pending(sc.display.native, sc.display.queue.?);
+    while (true) {
+        for (sc.imgs[0..sc.n], 0..) |*x, i| {
+            if (x.busy or x.acquired) continue;
+            x.acquired = true;
+            if (semOf(sem)) |s| s.signaled = true;
+            if (fenceOf(fence)) |f| {
+                f.signaled = true;
+                f.pending = 0;
+            }
+            (out orelse return R.error_initialization_failed).* = @intCast(i);
+            return R.success;
+        }
+        if (timeout == 0) return R.not_ready;
+        const native = sc.display.native;
+        const q = sc.display.queue.?;
+        unlock();
+        const r = c.dispatch_queue(native, q);
+        lock();
+        sc = scOf(sc_h) orelse return R.error_out_of_date_khr;
+        if (r < 0) return R.error_surface_lost_khr;
+    }
+}
+
+fn acquireNextImage(_: ?*anyopaque, h: u64, timeout: u64, sem: u64, fence: u64, out: ?*u32) callconv(.c) Result {
+    lock();
+    defer unlock();
+    return acquireImage(h, timeout, sem, fence, out);
+}
+
+fn acquireNextImage2(_: ?*anyopaque, info: ?*const abi.AcquireNextImageInfoKHR, out: ?*u32) callconv(.c) Result {
+    const ai = info orelse return R.error_initialization_failed;
+    lock();
+    defer unlock();
+    return acquireImage(ai.swapchain, ai.timeout, ai.semaphore, ai.fence, out);
+}
+
+/// Image `idx` of the swapchain `sc_h` to the compositor.
+fn presentOne(sc_h: u64, idx: u32) Result {
+    var sc = scOf(sc_h) orelse return R.error_initialization_failed;
+    if (idx >= sc.n or !sc.imgs[idx].acquired) return R.error_initialization_failed;
+    const c = sc.display.c;
+    // (FIFO: one frame on the screen at a time)
+    while (sc.fifo and sc.frame_cb != null) {
+        const native = sc.display.native;
+        const q = sc.display.queue.?;
+        unlock();
+        const r = c.dispatch_queue(native, q);
+        lock();
+        sc = scOf(sc_h) orelse return R.error_out_of_date_khr;
+        if (r < 0) return R.error_surface_lost_khr;
+    }
+    const surface = sc.surface orelse return R.error_surface_lost_khr;
+    const x = &sc.imgs[idx];
+    var none = [_]wl.Arg{.{ .o = null }};
+    if (sc.fifo) {
+        sc.frame_cb = c.send(surface, WL_SURFACE_FRAME, c.callback_interface, null, 0, &none);
+        if (sc.frame_cb) |cb| _ = c.add_dispatcher(cb, &onScFrame, sc, null);
+    }
+    var at = [_]wl.Arg{ .{ .o = x.buf }, .{ .i = 0 }, .{ .i = 0 } };
+    _ = c.send(surface, WL_SURFACE_ATTACH, null, null, 0, &at);
+    const op: u32 = if (c.get_version(surface) >= 4) WL_SURFACE_DAMAGE_BUFFER else WL_SURFACE_DAMAGE;
+    var all = [_]wl.Arg{ .{ .i = 0 }, .{ .i = 0 }, .{ .i = std.math.maxInt(i32) }, .{ .i = std.math.maxInt(i32) } };
+    _ = c.send(surface, op, null, null, 0, &all);
+    _ = c.send(surface, WL_SURFACE_COMMIT, null, null, 0, &none);
+    _ = c.flush(sc.display.native);
+    x.acquired = false;
+    x.busy = true;
+    sc.presents += 1;
+    return if (sc.retired) SUBOPTIMAL else R.success;
+}
+
+fn queuePresent(q: ?*anyopaque, info: ?*const abi.PresentInfoKHR) callconv(.c) Result {
+    const pi = info orelse return R.error_initialization_failed;
+    lock();
+    defer unlock();
+    const di = queueDev(q) orelse return R.error_initialization_failed;
+    if (T.devices[di].lost) return R.error_device_lost;
+    // (the queue runs in order: what signaled these was submitted before)
+    for (0..pi.waitSemaphoreCount) |i| {
+        if (semOf(pi.pWaitSemaphores.?[i])) |s| s.signaled = false;
+    }
+    var worst: Result = R.success;
+    for (0..pi.swapchainCount) |k| {
+        const r = presentOne(pi.pSwapchains.?[k], pi.pImageIndices.?[k]);
+        if (pi.pResults) |rs| rs[k] = r;
+        if (r < 0 and (worst >= 0 or r < worst)) worst = r else if (r > 0 and worst == R.success) worst = r;
+    }
+    return worst;
+}
+
+fn onScBuffer(impl: ?*const anyopaque, target: ?*anyopaque, opcode: u32, msg: ?*const wl.Message, args: [*]wl.Arg) callconv(.c) c_int {
+    _ = .{ target, msg, args };
+    if (opcode != 0) return 0; // release
+    const x: *ScImage = @ptrCast(@alignCast(@constCast(impl.?)));
+    x.busy = false;
+    return 0;
+}
+
+fn onScFrame(impl: ?*const anyopaque, target: ?*anyopaque, opcode: u32, msg: ?*const wl.Message, args: [*]wl.Arg) callconv(.c) c_int {
+    _ = .{ msg, args };
+    if (opcode != 0) return 0; // done
+    const sc: *Swapchain = @ptrCast(@alignCast(@constCast(impl.?)));
+    if (target) |t| sc.display.c.destroy(@ptrCast(t));
+    if (sc.frame_cb == @as(?*wl.Proxy, @ptrCast(target))) sc.frame_cb = null;
+    return 0;
+}
+
 // ── The entry points by name ───────────────────────────────────────────────
 
 pub const Level = enum { global, instance, physical, device };
@@ -4839,6 +5575,32 @@ const procs = [_]Proc{
     entry("vkCmdResolveImage", &cmdResolveImage, .device),
     entry("vkCmdClearColorImage", &cmdClearColorImage, .device),
     entry("vkCmdClearDepthStencilImage", &cmdClearDepthStencilImage, .device),
+    // external memory, semaphores, fences; DRM format modifiers
+    entry("vkGetPhysicalDeviceExternalBufferPropertiesKHR", &getPhysicalDeviceExternalBufferProperties, .physical),
+    entry("vkGetPhysicalDeviceExternalFencePropertiesKHR", &getPhysicalDeviceExternalFenceProperties, .physical),
+    entry("vkGetPhysicalDeviceExternalSemaphorePropertiesKHR", &getPhysicalDeviceExternalSemaphoreProperties, .physical),
+    entry("vkGetMemoryFdKHR", &getMemoryFd, .device),
+    entry("vkGetMemoryFdPropertiesKHR", &getMemoryFdProperties, .device),
+    entry("vkGetSemaphoreFdKHR", &getSemaphoreFd, .device),
+    entry("vkImportSemaphoreFdKHR", &importSemaphoreFd, .device),
+    entry("vkGetFenceFdKHR", &getFenceFd, .device),
+    entry("vkImportFenceFdKHR", &importFenceFd, .device),
+    entry("vkGetImageDrmFormatModifierPropertiesEXT", &getImageDrmFormatModifierProperties, .device),
+    // presentation
+    entry("vkGetPhysicalDeviceSurfaceSupportKHR", &getPhysicalDeviceSurfaceSupport, .physical),
+    entry("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", &getPhysicalDeviceSurfaceCapabilities, .physical),
+    entry("vkGetPhysicalDeviceSurfaceFormatsKHR", &getPhysicalDeviceSurfaceFormats, .physical),
+    entry("vkGetPhysicalDeviceSurfacePresentModesKHR", &getPhysicalDeviceSurfacePresentModes, .physical),
+    entry("vkGetPhysicalDeviceWaylandPresentationSupportKHR", &getPhysicalDeviceWaylandPresentationSupport, .physical),
+    entry("vkGetPhysicalDevicePresentRectanglesKHR", &getPhysicalDevicePresentRectangles, .physical),
+    entry("vkGetDeviceGroupPresentCapabilitiesKHR", &getDeviceGroupPresentCapabilities, .device),
+    entry("vkGetDeviceGroupSurfacePresentModesKHR", &getDeviceGroupSurfacePresentModes, .device),
+    entry("vkCreateSwapchainKHR", &createSwapchain, .device),
+    entry("vkDestroySwapchainKHR", &destroySwapchain, .device),
+    entry("vkGetSwapchainImagesKHR", &getSwapchainImages, .device),
+    entry("vkAcquireNextImageKHR", &acquireNextImage, .device),
+    entry("vkAcquireNextImage2KHR", &acquireNextImage2, .device),
+    entry("vkQueuePresentKHR", &queuePresent, .device),
 };
 
 fn find(name: []const u8) ?Proc {

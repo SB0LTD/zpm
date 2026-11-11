@@ -9,7 +9,11 @@
 //! (gfxapi's node.Gpu, the same client EGL uses), with this image's
 //! backend: sm_120 on x86-64 (the PC's RTX), ir3 on AArch64. It is opened at
 //! the first vkEnumeratePhysicalDevices; without one the instance has no
-//! physical device.
+//! physical device. Its dma-bufs (PRIME export and import) and fence
+//! files are the driver's Host (external memory, semaphores and fences:
+//! Firefox's WebGPU canvases go to WebRender that way), and the app's own
+//! libwayland-client, found in the process as EGL finds it, is its
+//! swapchains' (VK_KHR_wayland_surface).
 //!
 //! Built as Galaxy builds libgalaxy-gl.so (scripts/build-gl.sh):
 //!   sig build-lib -dynamic -target x86_64-linux-none -OReleaseSafe -fPIC
@@ -24,13 +28,14 @@ const gfxapi = @import("gfxapi");
 const vk = @import("vk");
 const icd = vk.icd;
 const node = gfxapi.node;
+const wayland = gfxapi.wayland;
+const linux = std.os.linux;
 
 pub const panic = if (builtin.os.tag == .linux) std.debug.FullPanic(stop) else std.debug.FullPanic(std.debug.defaultPanic);
 
 fn stop(msg: []const u8, ra: ?usize) noreturn {
     @branchHint(.cold);
     _ = ra;
-    const linux = std.os.linux;
     const head = "libvulkan_galaxy: ";
     _ = linux.write(2, head, head.len);
     _ = linux.write(2, msg.ptr, msg.len);
@@ -54,12 +59,81 @@ fn open() ?icd.Gpu {
         log(std.fmt.bufPrint(&buf, "no GPU ({s}): no physical device", .{@errorName(err)}) catch "no GPU");
         return null;
     };
-    return .{ .dev = d, .compile = G.compile, .work = &compile_work };
+    opened = true;
+    return .{
+        .dev = d,
+        .compile = G.compile,
+        .work = &compile_work,
+        .host = .{ .exportFd = exportFd, .importFd = importFd, .fenceFd = fenceFd, .close = closeFd, .dup = dupFd, .poll = pollFd, .map = mapFd, .unmap = unmapFd },
+        .wayland = waylandClient,
+    };
+}
+
+var opened = false;
+var wl_client: ?wayland.Client = null;
+var wl_tried = false;
+
+fn waylandClient() ?*const wayland.Client {
+    if (!wl_tried) {
+        wl_tried = true;
+        wl_client = wayland.Client.load();
+    }
+    return if (wl_client) |*c| c else null;
+}
+
+// ── The Host: Galaxy's render node and Linux's calls (as libgalaxy_gl's) ──
+
+fn sysResult(r: usize) i64 {
+    return @as(isize, @bitCast(r));
+}
+
+fn exportFd(_: ?*anyopaque, buf: gpu.Buffer) i64 {
+    if (!opened) return -19; // ENODEV
+    return the_gpu.exportFd(buf);
+}
+
+fn importFd(_: ?*anyopaque, fd: i32) ?gpu.Buffer {
+    if (!opened) return null;
+    return the_gpu.importFd(fd);
+}
+
+fn fenceFd(_: ?*anyopaque) i64 {
+    if (!opened) return -19;
+    return the_gpu.fenceFd();
+}
+
+fn closeFd(_: ?*anyopaque, fd: i32) void {
+    _ = linux.close(fd);
+}
+
+fn dupFd(_: ?*anyopaque, fd: i32) i32 {
+    return @intCast(sysResult(linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 0)));
+}
+
+fn pollFd(_: ?*anyopaque, fd: i32, timeout_ms: i32) i32 {
+    var p = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    while (true) {
+        const r = sysResult(linux.poll(&p, 1, timeout_ms));
+        if (r == -4) continue; // EINTR
+        if (r < 0) return @intCast(r);
+        if (r == 0) return 0;
+        return if (p[0].revents & (linux.POLL.IN | linux.POLL.ERR) != 0) 1 else -5;
+    }
+}
+
+fn mapFd(_: ?*anyopaque, fd: i32, size: usize) ?[]const u8 {
+    if (size == 0) return null;
+    const r = sysResult(linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0));
+    if (r < 0) return null;
+    return @as([*]const u8, @ptrFromInt(@as(usize, @intCast(r))))[0..size];
+}
+
+fn unmapFd(_: ?*anyopaque, m: []const u8) void {
+    _ = linux.munmap(m.ptr, m.len);
 }
 
 fn log(msg: []const u8) void {
     if (comptime builtin.os.tag != .linux) return;
-    const linux = std.os.linux;
     const head = "Galaxy Vulkan: ";
     _ = linux.write(2, head, head.len);
     _ = linux.write(2, msg.ptr, msg.len);
