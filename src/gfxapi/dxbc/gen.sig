@@ -775,7 +775,8 @@ const Gen = struct {
         const k = g.k;
         const s = i.operands[1..];
         return switch (op) {
-            .mov => if (s[0].neg or s[0].abs) g.fsrc(&s[0], c) else g.bits(&s[0], c),
+            // (a copy: `mov r0.xyzw, r0.wzyx` reads every source before it writes)
+            .mov => if (s[0].neg or s[0].abs) g.fsrc(&s[0], c) else asU32(k, g.bits(&s[0], c)),
             .add => r(k.op2(.fadd, .f32, g.fsrc(&s[0], c), g.fsrc(&s[1], c))),
             .mul => r(k.op2(.fmul, .f32, g.fsrc(&s[0], c), g.fsrc(&s[1], c))),
             .div => r(k.div(g.fsrc(&s[0], c), g.fsrc(&s[1], c))),
