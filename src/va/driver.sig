@@ -812,6 +812,10 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             d.node.free(&s.linear);
             s.* = .{};
             d.node.free(&d.imports[i].second);
+            if (d.imports[i].rgb) |*pic| {
+                d.node.sys.close(pic.fd);
+                d.node.free(&pic.buf);
+            }
             d.imports[i] = .{};
         }
 
@@ -824,6 +828,24 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         /// each encode.
         fn importSurfaces(d: *Self, mem_type: u32, p: *anyopaque, width: u32, height: u32, out: []u32) va.Status {
             for (out, 0..) |*id, k| {
+                // (an RGB picture: a screen capture's, converted on the GPU)
+                const rgb = if (mem_type == va.MEM_TYPE_DRM_PRIME_2)
+                    (if (k == 0) enc_import.rgbOfPrime2(@ptrCast(@alignCast(p))) else null)
+                else
+                    enc_import.rgbOfExternal(@ptrCast(@alignCast(p)), k);
+                if (rgb) |pic| {
+                    if (!@hasDecl(Conv, "rgb")) {
+                        d.debug("an RGB dma-buf refused: no GPU converter (the CPU never converts what the encoder reads)", .{});
+                        for (out[0..k]) |made| d.dropSurface(@intCast(made - SURFACE_BASE));
+                        return va.ERROR_UNSUPPORTED_MEMORY_TYPE;
+                    }
+                    const i = d.importRgbSurface(pic.fd, pic.offset, pic.pitch, pic.order, width, height) orelse {
+                        for (out[0..k]) |made| d.dropSurface(@intCast(made - SURFACE_BASE));
+                        return va.ERROR_ALLOCATION_FAILED;
+                    };
+                    id.* = SURFACE_BASE + i;
+                    continue;
+                }
                 const plan = (if (mem_type == va.MEM_TYPE_DRM_PRIME_2)
                     (if (k == 0) enc_import.fromPrime2(@ptrCast(@alignCast(p)), d.opts.gob) else error.BadDescriptor)
                 else
@@ -839,6 +861,50 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 id.* = SURFACE_BASE + i;
             }
             d.debug("{d} surfaces of {d}x{d} over the app's dma-bufs", .{ out.len, width, height });
+            return va.SUCCESS;
+        }
+
+        /// An RGB picture's surface: the app's buffer imported (and our own
+        /// dma-buf of it, the app's fd being the app's), the surface's own
+        /// NV12 block-linear planes the GPU fills before each encode.
+        fn importRgbSurface(d: *Self, fd: i32, offset: u32, pitch: u32, order: enc_import.RgbOrder, width: u32, height: u32) ?u16 {
+            const i = for (d.surfaces, 0..) |s, i| {
+                if (!s.used) break i;
+            } else return null;
+            var buf = enc_import.importFd(&d.node, fd, @as(u64, offset) + @as(u64, pitch) * height) orelse return null;
+            const own = d.node.exportFd(buf);
+            if (own < 0) {
+                d.node.free(&buf);
+                return null;
+            }
+            const layout = tiling.Nv12.of(width, std.mem.alignForward(u32, height, SURFACE_ROW_ALIGN));
+            const tiled = d.node.alloc(@intCast(layout.bytes), node.G_VRAM) orelse {
+                d.node.free(&buf);
+                d.node.sys.close(@intCast(own));
+                return null;
+            };
+            d.surfaces[i] = .{ .used = true, .width = width, .height = height, .layout = layout, .linear_layout = tiling.Linear.of(width, height), .tiled = tiled, .linear_stale = true };
+            d.imports[i] = .{ .used = true, .layout = .block_linear, .rgb = .{ .buf = buf, .fd = @intCast(own), .offset = offset, .pitch = pitch, .order = order } };
+            return @intCast(i);
+        }
+
+        /// An RGB surface's picture into its NV12 planes, on the GPU (the
+        /// converter's `rgb`), before the encode reads them.
+        fn convertRgb(d: *Self, si: u16) va.Status {
+            if (!@hasDecl(Conv, "rgb")) return va.ERROR_UNSUPPORTED_MEMORY_TYPE;
+            const s = &d.surfaces[si];
+            const pic = d.imports[si].rgb.?;
+            var job = enc_import.RgbJob{ .dst = s.tiled.bytes(), .layout = s.layout, .gob = d.opts.gob, .src = pic.buf.bytes(), .src_offset = pic.offset, .src_pitch = pic.pitch, .order = pic.order, .width = s.width, .height = s.height };
+            if (Conv.wants_fds) {
+                job.dst_fd = d.surfaceFd(s) orelse return va.ERROR_OPERATION_FAILED;
+                job.src_fd = pic.fd;
+            }
+            if (d.conv.rgb(job, .{ .ctx = d, .f = sayLine }) == .failed) {
+                d.say("an RGB picture could not be converted on the GPU: not encoded", .{});
+                return va.ERROR_OPERATION_FAILED;
+            }
+            s.tiled_stale = false;
+            s.linear_stale = true;
             return va.SUCCESS;
         }
 
@@ -1595,7 +1661,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             // (an app's linear dma-buf changes behind the driver: converted
             // every time)
             if (d.imports[si].used and d.imports[si].layout == .linear) s.tiled_stale = true;
-            st = d.syncTiled(si);
+            st = if (d.imports[si].rgb != null) d.convertRgb(si) else d.syncTiled(si);
             if (st != va.SUCCESS) return st;
             const f = c.frame;
             const frame = c.work.bytes()[f * ENC_FRAME_BYTES ..][0..ENC_FRAME_BYTES];
@@ -1644,7 +1710,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const s = &d.surfaces[si];
             const im = d.imports[si];
             // (an app's block-linear dma-buf: its own planes, block height)
-            if (im.used and im.layout == .block_linear) return .{
+            if (im.used and im.layout == .block_linear and im.rgb == null) return .{
                 .luma = im.luma,
                 .chroma = im.chroma,
                 .pitch_luma = im.pitch[0],

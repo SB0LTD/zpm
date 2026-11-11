@@ -194,6 +194,97 @@ fn drop(n: anytype, handle: u32) ?node.Buf {
     return null;
 }
 
+// ── RGB (screen capture) ────────────────────────────────────────────────────
+
+/// A 32-bit RGB picture's byte order in memory: B G R X (DRM XRGB8888 /
+/// ARGB8888, VA BGRX / BGRA) or R G B X (XBGR8888 / ABGR8888, RGBX / RGBA).
+pub const RgbOrder = enum(u32) { bgrx = 0, rgbx = 1 };
+
+pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258; // 'X','R','2','4'
+pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241; // 'A','R','2','4'
+pub const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258; // 'X','B','2','4'
+pub const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241; // 'A','B','2','4'
+pub const FOURCC_BGRX: u32 = 0x5852_4742; // 'B','G','R','X'
+pub const FOURCC_BGRA: u32 = 0x4152_4742;
+pub const FOURCC_RGBX: u32 = 0x5842_4752;
+pub const FOURCC_RGBA: u32 = 0x4142_4752;
+
+pub fn rgbOrder(fourcc: u32) ?RgbOrder {
+    return switch (fourcc) {
+        DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888, FOURCC_BGRX, FOURCC_BGRA => .bgrx,
+        DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR8888, FOURCC_RGBX, FOURCC_RGBA => .rgbx,
+        else => null,
+    };
+}
+
+/// One RGB picture to convert into a surface's NV12 block-linear planes
+/// (the GPU's job: enc_rgb.sig; `rgbToNv12` is its reference).
+pub const RgbJob = struct {
+    /// the surface's planes (block linear) and the RGB picture (linear):
+    /// CPU views, and dma-bufs for a GPU converter
+    dst: []u8,
+    dst_fd: i32 = -1,
+    layout: tiling.Nv12,
+    gob: tiling.Gob,
+    src: []const u8,
+    src_fd: i32 = -1,
+    src_offset: u32,
+    src_pitch: u32,
+    order: RgbOrder,
+    width: u32,
+    height: u32,
+};
+
+/// BT.601, limited range (libyuv's ARGBToNV12, what WebRTC's software
+/// path makes): Y from a pixel, U and V from a 2x2 block's average.
+pub fn lumaOf(r: i32, g: i32, b: i32) u8 {
+    return @intCast(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+}
+pub fn cbOf(r: i32, g: i32, b: i32) u8 {
+    return @intCast(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+}
+pub fn crOf(r: i32, g: i32, b: i32) u8 {
+    return @intCast(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+}
+
+/// Pixel (x, y) of the job's picture (clamped into it: the padding to
+/// whole macroblocks repeats the last column and row): r, g, b.
+pub fn pixel(j: RgbJob, x: u32, y: u32) [3]i32 {
+    const at = j.src_offset + @min(y, j.height - 1) * j.src_pitch + @min(x, j.width - 1) * 4;
+    const p = j.src[at..][0..4];
+    return if (j.order == .bgrx) .{ p[2], p[1], p[0] } else .{ p[0], p[1], p[2] };
+}
+
+/// The conversion on the CPU: the reference the GPU kernel is tested
+/// against, and the tests' converter. The whole macroblock-aligned
+/// picture is written.
+pub fn rgbToNv12(j: RgbJob) void {
+    const sw = j.layout.swizzles(j.gob);
+    const w = std.mem.alignForward(u32, j.width, 16);
+    const h = std.mem.alignForward(u32, j.height, 16);
+    for (0..h) |yy| {
+        for (0..w) |xx| {
+            const c = pixel(j, @intCast(xx), @intCast(yy));
+            j.dst[j.layout.luma.offsetOf(sw[0], xx, yy)] = lumaOf(c[0], c[1], c[2]);
+        }
+    }
+    const uv = j.dst[@intCast(j.layout.chroma_offset)..];
+    for (0..h / 2) |cy| {
+        for (0..w / 2) |cx| {
+            var s = [3]i32{ 0, 0, 0 };
+            for (0..2) |dy| {
+                for (0..2) |dx| {
+                    const c = pixel(j, @intCast(2 * cx + dx), @intCast(2 * cy + dy));
+                    for (&s, c) |*a, v| a.* += v;
+                }
+            }
+            for (&s) |*a| a.* = (a.* + 2) >> 2;
+            uv[j.layout.chroma.offsetOf(sw[1], 2 * cx, cy)] = cbOf(s[0], s[1], s[2]);
+            uv[j.layout.chroma.offsetOf(sw[1], 2 * cx + 1, cy)] = crOf(s[0], s[1], s[2]);
+        }
+    }
+}
+
 /// What the driver keeps of an imported surface (beside its Surface).
 pub const Imported = struct {
     used: bool = false,
@@ -206,7 +297,31 @@ pub const Imported = struct {
     rows: u32 = 0,
     /// a second buffer (the chroma plane's, when it is another dma-buf)
     second: node.Buf = .{},
+    /// an RGB picture (converted into the surface's NV12 planes before
+    /// each encode): its buffer, dma-buf, offset, pitch, byte order
+    rgb: ?struct { buf: node.Buf, fd: i32, offset: u32, pitch: u32, order: RgbOrder } = null,
 };
+
+pub const RgbPic = struct { fd: i32, offset: u32, pitch: u32, order: RgbOrder, size: u32 };
+
+/// A DRM_PRIME_2 descriptor's or the external buffers' RGB picture (one
+/// plane, pitch linear): its fd, offset, pitch, order; null when it is not
+/// one.
+pub fn rgbOfPrime2(d: *const va.DrmPrimeDescriptor) ?RgbPic {
+    const order = rgbOrder(d.fourcc) orelse (if (d.num_layers == 1) rgbOrder(d.layers[0].drm_format) else null) orelse return null;
+    if (d.num_objects != 1 or d.num_layers != 1 or d.layers[0].num_planes != 1) return null;
+    if (d.objects[0].drm_format_modifier != va.DRM_FORMAT_MOD_LINEAR) return null;
+    const l = d.layers[0];
+    if (l.pitch[0] < d.width * 4) return null;
+    return .{ .fd = d.objects[0].fd, .offset = l.offset[0], .pitch = l.pitch[0], .order = order, .size = d.objects[0].size };
+}
+
+pub fn rgbOfExternal(e: *const ExternalBuffers, k: usize) ?RgbPic {
+    const order = rgbOrder(e.pixel_format) orelse return null;
+    const bufs = e.buffers orelse return null;
+    if (k >= e.num_buffers or e.pitches[0] < e.width * 4) return null;
+    return .{ .fd = @intCast(@as(isize, @bitCast(bufs[k]))), .offset = e.offsets[0], .pitch = e.pitches[0], .order = order, .size = e.data_size };
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 

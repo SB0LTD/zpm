@@ -714,3 +714,139 @@ test "enc: AV1 through the pretend encoder: a key frame, a hidden P, a B, the P 
     try testing.expectEqual(va.SUCCESS, d.destroyBuffer(coded));
     try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
 }
+
+// ── RGB (screen capture) ────────────────────────────────────────────────────
+
+const convert = @import("convert.sig");
+
+/// The library's converter's shape (enc_rgb.WithRgb): the CPU's
+/// conversions, and `rgb` standing in for the GPU kernel with its
+/// reference (enc_rgb.sig tests the kernel against it on EmuDevice and the
+/// emulated RTX).
+const TestConv = struct {
+    pub const wants_fds = false;
+    inner: convert.Cpu = .{},
+    rgbs: u32 = 0,
+    pub fn run(c: *TestConv, j: convert.Job, say: convert.Say) convert.Done {
+        return c.inner.run(j, say);
+    }
+    pub fn rgb(c: *TestConv, j: enc_import.RgbJob, _: convert.Say) convert.Done {
+        enc_import.rgbToNv12(j);
+        c.rgbs += 1;
+        return .gpu;
+    }
+    pub fn deinit(c: *TestConv) void {
+        c.inner.deinit();
+    }
+};
+const DR = driver.DriverWith(*ImportFake, TestConv);
+
+var rgb_yuv: [48 * 32 * 3 / 2]u8 = undefined;
+
+fn idr264r(d: *DR, ctx: u32, input: u32, recon: u32, coded: u32, out: []u8) !usize {
+    var ids: [3]u32 = undefined;
+    var seq = h264Seq();
+    seq.frame_crop_right_offset = 0;
+    seq.frame_crop_bottom_offset = 0;
+    seq.frame_cropping_flag = 0;
+    const pic = enc_h264.testPic(recon, coded, true, 0);
+    const sl = slice264(2, 0, null, null);
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(ve.ENC_SEQUENCE_PARAMETER_BUFFER, @sizeOf(enc_h264.Seq), 1, &seq, &ids[0]));
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(ve.ENC_PICTURE_PARAMETER_BUFFER, @sizeOf(enc_h264.Pic), 1, &pic, &ids[1]));
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(ve.ENC_SLICE_PARAMETER_BUFFER, @sizeOf(ve.EncSliceParameterBufferH264), 1, &sl, &ids[2]));
+    try testing.expectEqual(va.SUCCESS, d.beginPicture(ctx, input));
+    try testing.expectEqual(va.SUCCESS, d.renderPicture(ctx, &ids));
+    try testing.expectEqual(va.SUCCESS, d.endPicture(ctx));
+    for (ids) |id| try testing.expectEqual(va.SUCCESS, d.destroyBuffer(id));
+    var p: ?*anyopaque = null;
+    try testing.expectEqual(va.SUCCESS, d.mapBuffer(coded, &p));
+    const seg: *const ve.CodedBufferSegment = @ptrCast(@alignCast(p.?));
+    const data: [*]const u8 = @ptrCast(seg.buf.?);
+    @memcpy(out[0..seg.size], data[0..seg.size]);
+    try testing.expectEqual(va.SUCCESS, d.unmapBuffer(coded));
+    return seg.size;
+}
+
+test "enc: an RGB dma-buf (screen capture) converted by the converter's GPU path before each encode; refused without one" {
+    var k = Fake{ .encoder = fakeEncode };
+    var f = ImportFake{ .k = &k };
+    seen = .{};
+    var d: DR = .{ .node = .{ .sys = &f } };
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    var cfg: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createConfig(va.PROFILE_H264_MAIN, ve.ENTRYPOINT_ENC_SLICE, &.{}, &cfg));
+    var rec: [1]u32 = undefined;
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, 48, 32, &rec, &.{}));
+    var ctx: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createContext(cfg, 48, 32, &ctx));
+    var coded: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(ve.ENC_CODED_BUFFER, 1 << 20, 1, null, &coded));
+    // a 48x32 BGRX picture, 4-byte pixels, a pitch of 256
+    var px = d.node.alloc(1, 0).?;
+    const pitch: u32 = 256;
+    for (0..32) |y| {
+        for (0..48) |x| {
+            const o = y * pitch + x * 4;
+            px.bytes()[o] = @truncate(x * 5); // B
+            px.bytes()[o + 1] = @truncate(y * 7); // G
+            px.bytes()[o + 2] = @truncate(x * 3 + y * 2); // R
+            px.bytes()[o + 3] = 0xff;
+        }
+    }
+    var desc = std.mem.zeroes(va.DrmPrimeDescriptor);
+    desc.fourcc = enc_import.DRM_FORMAT_XRGB8888;
+    desc.width = 48;
+    desc.height = 32;
+    desc.num_objects = 1;
+    desc.objects[0] = .{ .fd = @intCast(100 + px.handle), .size = @intCast(px.len), .drm_format_modifier = 0 };
+    desc.num_layers = 1;
+    desc.layers[0] = .{ .drm_format = enc_import.DRM_FORMAT_XRGB8888, .num_planes = 1, .object_index = .{ 0, 0, 0, 0 }, .offset = .{ 0, 0, 0, 0 }, .pitch = .{ pitch, 0, 0, 0 } };
+    var in: [1]u32 = undefined;
+    const attrs = importAttribs(va.MEM_TYPE_DRM_PRIME_2, &desc);
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, 48, 32, &in, &attrs));
+    var out: [16 << 10]u8 = undefined;
+    const n = try idr264r(&d, ctx, in[0], rec[0], coded, &out);
+    try testing.expectEqual(@as(u32, 1), d.conv.rgbs);
+    // (a second encode converts again: the app draws into it meanwhile)
+    _ = try idr264r(&d, ctx, in[0], rec[0], coded, &out);
+    try testing.expectEqual(@as(u32, 2), d.conv.rgbs);
+    // what the stream should decode to: the same conversion, planar
+    for (0..32) |y| {
+        for (0..48) |x| {
+            const c = [3]i32{ @as(i32, @intCast((x * 3 + y * 2) & 0xff)), @intCast((y * 7) & 0xff), @intCast((x * 5) & 0xff) };
+            rgb_yuv[y * 48 + x] = enc_import.lumaOf(c[0], c[1], c[2]);
+        }
+    }
+    for (0..16) |cy| {
+        for (0..24) |cx| {
+            var s = [3]i32{ 0, 0, 0 };
+            for (0..2) |dy| {
+                for (0..2) |dx| {
+                    const x = 2 * cx + dx;
+                    const y = 2 * cy + dy;
+                    s[0] += @intCast((x * 3 + y * 2) & 0xff);
+                    s[1] += @intCast((y * 7) & 0xff);
+                    s[2] += @intCast((x * 5) & 0xff);
+                }
+            }
+            for (&s) |*a| a.* = (a.* + 2) >> 2;
+            rgb_yuv[48 * 32 + cy * 24 + cx] = enc_import.cbOf(s[0], s[1], s[2]);
+            rgb_yuv[48 * 32 + 24 * 16 + cy * 24 + cx] = enc_import.crOf(s[0], s[1], s[2]);
+        }
+    }
+    writeFile("/tmp/galaxy-va-enc/h264-rgb.264", out[0..n]);
+    writeFile("/tmp/galaxy-va-enc/h264-rgb.yuv", &rgb_yuv);
+    try testing.expectEqual(va.SUCCESS, d.destroySurfaces(&in));
+
+    // (the CPU's converter alone, as in the tests' D: an RGB import refused)
+    var k2 = Fake{ .encoder = fakeEncode };
+    var f2 = ImportFake{ .k = &k2 };
+    var d2: D = .{ .node = .{ .sys = &f2 } };
+    try testing.expectEqual(va.SUCCESS, d2.init(3, .{}));
+    defer d2.terminate();
+    var px2 = d2.node.alloc(1, 0).?;
+    defer d2.node.free(&px2);
+    desc.objects[0].fd = @intCast(100 + px2.handle);
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_MEMORY_TYPE, d2.createSurfaces(va.RT_FORMAT_YUV420, 48, 32, &in, &attrs));
+}

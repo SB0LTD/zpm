@@ -90,7 +90,14 @@ fn stop(msg: []const u8, ra: ?usize) noreturn {
 /// Pictures a CPU reader asks for are converted on the RTX (gpu_convert:
 /// a KIR kernel; the build wires the `gpu` and `gfxapi` modules); this
 /// file's tests convert on the CPU (convert.Cpu), without those modules.
-const Conv = if (builtin.is_test) @import("convert.sig").Cpu else @import("gpu_convert.sig").Gpu(@import("gfxapi").node.Linux);
+/// RGB pictures an encode reads (screen captures) are converted on the RTX
+/// too (enc_rgb: another KIR kernel, its own GPU context).
+const Conv = if (builtin.is_test) @import("convert.sig").Cpu else @import("enc_rgb.sig").WithRgb(
+    @import("gpu_convert.sig").Gpu(@import("gfxapi").node.Linux),
+    @import("gfxapi").node.Gpu(@import("gfxapi").node.Linux, &.{.sm_120}),
+    @import("convert.sig").Say,
+    @import("convert.sig").Done,
+);
 const D = driver.DriverWith(node.Linux, Conv);
 
 /// A spin lock that yields: each call holds its display's for its length
