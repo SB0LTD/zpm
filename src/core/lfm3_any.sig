@@ -133,6 +133,11 @@ pub const Options = struct {
     /// The caller's clock (ns), for profileStep's account of a call's CPU
     /// side (null: not timed).
     clock: ?*const fn () u64 = null,
+    /// forwardSees calls it between two layers (a pass of a thousand tokens
+    /// is seconds on the GPU): until it returns, the device and the Work
+    /// are the caller's to lend to another backend's call (a voice's step
+    /// that should not wait for the whole pass).
+    yield: ?*const fn () void = null,
 };
 
 /// One kind of dispatch in a profiled call: a kernel, or for a matrix the
@@ -249,6 +254,50 @@ pub const Tuned = struct { q4: bool, rows: u32, blocks: u32, lanes: u32, unroll:
 pub const MAX_TUNED = 32;
 /// Dispatches one call may send (Work's capacity).
 pub const MAX_DISPATCHES = 4096;
+/// Tokens a call sent as one dispatch list takes at most (forward). A longer
+/// pass (forwardSees) builds and runs its dispatches a layer at a time: one
+/// layer's fit Work where the whole pass's do not.
+pub const WHOLE_TOKENS = 64;
+/// Options.max_batch's ceiling: d1's passes are up to 2048 tokens.
+pub const MAX_BATCH = 2048;
+/// The runs of tokens a forwardSees pass may have after its state (d1 packs
+/// up to 16 questions).
+pub const MAX_SEEN_GROUPS = 32;
+/// Rows residualRows reads at most a call.
+pub const MAX_ROWS_OUT = 16;
+
+/// A run of a seen pass's rows that all read the same keys: positions 0 up
+/// to `seen` - 1, but for those from `hole_first` up to `hole_end` - 1
+/// (kernels.AttnParams).
+const Seen = struct { first: u32, count: u32, seen: u32, hole_first: u32, hole_end: u32 };
+
+/// lfm3_executor.Sees as runs: the state's rows (they read every position
+/// of the pass), then each group's (the state and the group itself). Null:
+/// more runs than MAX_SEEN_GROUPS, or a group that is not one run of
+/// positions (its rows would read keys a run cannot name).
+fn seenRuns(sees: *const executor.Sees, n: u32, out: *[MAX_SEEN_GROUPS + 1]Seen) ?usize {
+    if (sees.group.len < n) return null;
+    var met = [_]bool{false} ** 256;
+    var k: usize = 0;
+    const state: u32 = @intCast(@min(sees.state, n));
+    if (state > 0) {
+        out[0] = .{ .first = 0, .count = state, .seen = n, .hole_first = 0, .hole_end = 0 };
+        k = 1;
+    }
+    var t: u32 = state;
+    while (t < n) {
+        const g = sees.group[t];
+        if (met[g]) return null;
+        met[g] = true;
+        var e = t + 1;
+        while (e < n and sees.group[e] == g) e += 1;
+        if (k == out.len) return null;
+        out[k] = .{ .first = t, .count = e - t, .seen = e, .hole_first = state, .hole_end = t };
+        k += 1;
+        t = e;
+    }
+    return k;
+}
 const MAX_BINDINGS = 8;
 const MAX_WORDS = 16;
 const HALF_HEAD = kernels.HEAD_SIZE / 2;
@@ -413,6 +462,12 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// (host) The conv state as a call found it: put back when the
         /// call fails, the GPU having written part of it.
         conv_snapshot: Buffer = .{},
+        /// (host) residualRows' rows, where `hidden` has no CPU view (a
+        /// backend for long passes only: max_batch over WHOLE_TOKENS).
+        out_rows: Buffer = .{},
+        /// The pass under way is forwardSees': who reads whom on the
+        /// full-attention layers.
+        sees: ?*const executor.Sees = null,
         k: Programs = .{},
         /// Attention workgroups: query heads (of one KV head) and tokens.
         heads_per_group: u32 = 1,
@@ -470,6 +525,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const s = &self.s;
             const bufs = [_]*Buffer{ &s.hidden, &s.normalized, &s.mixed, &s.query, &s.key, &s.value, &s.gate, &s.mixer, &s.projected, &s.ffn_gate, &s.ffn_up, &s.act_q, &s.act_d, &s.act_sums, &s.scores, &s.partial, &s.rope_full, &s.rope_swa, &s.input, &self.out_hidden, &self.out_logits, &self.conv_snapshot };
             for (bufs) |b| self.release(b);
+            self.release(&self.out_rows);
             if (!self.imported) self.release(&self.weights) else self.weights = .{};
             const k = &self.k;
             for (&k.q4k) |*p| self.unload(p);
@@ -746,6 +802,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             self.out_hidden = try d.alloc(h * 4, .host);
             self.out_logits = try d.alloc(@as(u64, plan.vocabulary_size) * 4, .host);
             self.conv_snapshot = try d.alloc(@max(try executor.requiredConvElements(plan), 1) * 4, .host);
+            if (self.options.max_batch > WHOLE_TOKENS and s.hidden.cpu.len == 0) self.out_rows = try d.alloc(MAX_ROWS_OUT * h * 4, .host);
         }
 
         /// Partial outputs a row: the value chunks a span of max_span meets.
@@ -899,6 +956,135 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             return token_out;
         }
 
+        /// One whole pass from position 0 with a visibility rule on the
+        /// full-attention layers, as the CPU's executor.forwardSees with
+        /// Output.none (d1's sets: the state's rows read every position, a
+        /// question's the state and itself): up to Options.max_batch tokens,
+        /// a layer's dispatches built and run at a time. Afterwards
+        /// residualRows gives its final rows. error.DeviceLost,
+        /// error.LongContext, error.BatchCapacity or error.Unsupported (a
+        /// rule that is not a state and then one run a group): the cache is
+        /// as it was, and the CPU executor can do the pass.
+        pub fn forwardSees(self: *Self, c: *Cache, tokens: []const u32, sees: *const executor.Sees) Error!void {
+            const cache = &c.cpu;
+            const plan = self.plan;
+            const h: usize = plan.hidden_size;
+            const count = tokens.len;
+            if (cache.position != 0) return error.ContextCapacity;
+            if (count == 0 or count > self.options.max_batch) return error.BatchCapacity;
+            for (tokens) |token| {
+                if (token >= plan.vocabulary_size) return error.InvalidToken;
+            }
+            if (count > cache.context) return error.ContextCapacity;
+            // (a full layer's rows read up to the whole pass)
+            if (count > self.options.max_span) return error.LongContext;
+            const n: u32 = @intCast(count);
+            var runs: [MAX_SEEN_GROUPS + 1]Seen = undefined;
+            _ = seenRuns(sees, n, &runs) orelse return error.Unsupported;
+            var l = List{ .work = self.work };
+            // (as begin: the CPU's KV rows and conv state to the GPU, the
+            // conv state kept for a pass that fails; the tokens' rows; RoPE)
+            const kv_back = c.kv_on_cpu;
+            if (kv_back) {
+                if (c.kv_host) |m| {
+                    self.dev.toDevice(m, 0, m.bytes);
+                    try self.copyInto(&l, m, 0, c.kv, 0, @intCast(c.kv.bytes / 16));
+                } else self.dev.toDevice(c.kv, 0, c.kv.bytes);
+            }
+            const conv_bytes = cache.conv.len * 4;
+            self.dev.toDevice(c.conv, 0, conv_bytes);
+            @memcpy(self.conv_snapshot.cpu[0..conv_bytes], c.conv.cpu[0..conv_bytes]);
+            const direct = self.s.hidden.cpu.len != 0;
+            const rows_buf = if (direct) self.s.hidden else self.s.input;
+            const hid: []f32 = @alignCast(std.mem.bytesAsSlice(f32, rows_buf.cpu[0 .. count * h * 4]));
+            for (tokens, 0..) |token, slot| try self.embed(token, hid[slot * h ..][0..h]);
+            self.dev.toDevice(rows_buf, 0, count * h * 4);
+            if (!direct) try self.copyInto(&l, self.s.input, 0, self.s.hidden, 0, @intCast(count * h * 4 / 16));
+            if (plan.attention_layer_count > 0) {
+                const factors: ?[]const f32 = if (self.has_factors) &self.factors else null;
+                kernels.ropeTable(@alignCast(std.mem.bytesAsSlice(f32, self.s.rope_full.cpu)), 0, count, plan.head_size, plan.rope_frequency_base, factors);
+                kernels.ropeTable(@alignCast(std.mem.bytesAsSlice(f32, self.s.rope_swa.cpu)), 0, count, plan.head_size, plan.rope_frequency_base_swa, null);
+                self.dev.toDevice(self.s.rope_full, 0, count * HALF_HEAD * 8);
+                self.dev.toDevice(self.s.rope_swa, 0, count * HALF_HEAD * 8);
+            }
+            self.sees = sees;
+            defer self.sees = null;
+            var sent: usize = 0;
+            var ns: u64 = 0;
+            for (plan.layers[0..plan.layer_count], 0..) |*ly, li| {
+                l.what = .{ .layer = @intCast(li) };
+                // (the last layer's residual stays as it is: the rows the
+                // caller reads are before the output norm)
+                const next: ?NextNorm = if (li + 1 < plan.layer_count)
+                    .{ .norm = plan.layers[li + 1].attn_norm, .rows = n, .out = self.s.normalized }
+                else
+                    null;
+                try self.layer(&l, ly, c, n, li == 0 or !self.fused(), next);
+                ns += try self.runList(c, &l);
+                sent += l.n;
+                l = List{ .work = self.work };
+                // (nothing of the pass is in the Work now)
+                if (li + 1 < plan.layer_count) {
+                    if (self.options.yield) |yield| yield();
+                }
+            }
+            self.dispatches = @intCast(sent);
+            self.total_dispatches += sent;
+            self.last_ns = ns;
+            if (kv_back) c.kv_on_cpu = false;
+            self.dev.fromDevice(c.conv, 0, conv_bytes);
+            cache.position += count;
+        }
+
+        /// A list's dispatches run in parts of max_run; a failure is the
+        /// call's (failed).
+        fn runList(self: *Self, c: *Cache, l: *const List) Error!u64 {
+            var at: usize = 0;
+            var ns: u64 = 0;
+            const most = @max(1, @min(self.options.max_run, self.dev.caps.max_run));
+            while (at < l.n) {
+                const part = l.slice()[at..@min(l.n, at + most)];
+                const fence = self.dev.run(part) catch |e| return self.failed(c, e);
+                self.finish(fence) catch |e| return self.failed(c, e);
+                ns += self.dev.lastRunNs();
+                at += part.len;
+            }
+            return ns;
+        }
+
+        /// After forwardSees: the final residual rows (before the output
+        /// norm) of the pass's positions `positions`, `out` holding a row of
+        /// the hidden width for each, in their order.
+        pub fn residualRows(self: *Self, c: *Cache, positions: []const u32, out: []f32) Error!void {
+            const h: usize = self.plan.hidden_size;
+            if (positions.len > MAX_ROWS_OUT or out.len < positions.len * h) return error.BatchCapacity;
+            for (positions) |p| {
+                if (p >= c.cpu.position or p >= self.options.max_batch) return error.ContextCapacity;
+            }
+            if (self.s.hidden.cpu.len != 0) {
+                for (positions, 0..) |p, i| {
+                    self.dev.fromDevice(self.s.hidden, p * h * 4, h * 4);
+                    const row: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, self.s.hidden.cpu[p * h * 4 ..][0 .. h * 4]));
+                    @memcpy(out[i * h ..][0..h], row);
+                }
+                return;
+            }
+            if (self.out_rows.bytes == 0) return error.Unsupported;
+            var l = List{ .work = self.work };
+            for (positions, 0..) |p, i| try self.copyInto(&l, self.s.hidden, @intCast(p * h * 4), self.out_rows, @intCast(i * h * 4), @intCast(h * 4 / 16));
+            var at: usize = 0;
+            const most = @max(1, @min(self.options.max_run, self.dev.caps.max_run));
+            while (at < l.n) {
+                const part = l.slice()[at..@min(l.n, at + most)];
+                const fence = self.dev.run(part) catch return error.DeviceLost;
+                self.finish(fence) catch return error.DeviceLost;
+                at += part.len;
+            }
+            self.dev.fromDevice(self.out_rows, 0, positions.len * h * 4);
+            const rows: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, self.out_rows.cpu[0 .. positions.len * h * 4]));
+            @memcpy(out[0 .. positions.len * h], rows);
+        }
+
         /// A dispatch's role for its profile entry: a matrix's tensor (less
         /// "blk.N.") and the bytes it reads.
         const Roles = struct {
@@ -940,7 +1126,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 .tokens => |t| t.len,
                 .embeddings => |e| e.len / h,
             };
-            if (count == 0 or count > self.options.max_batch) return error.BatchCapacity;
+            // (a longer call's dispatches do not fit one list: forwardSees
+            // runs such a pass a layer at a time)
+            if (count == 0 or count > @min(self.options.max_batch, WHOLE_TOKENS)) return error.BatchCapacity;
             switch (input) {
                 .tokens => |tokens| for (tokens) |token| {
                     if (token >= plan.vocabulary_size) return error.InvalidToken;
@@ -1800,11 +1988,31 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const rope = if (ly.sliding_window) s.rope_swa else s.rope_full;
             l.named("prepare", null, 0, n);
             try l.add(&self.k.prepare.?, kernels.prepareGroups(heads, kv_heads, n), &.{ s.query, s.key, s.value, self.weights, self.weights, rope, c.kv }, &pp.words());
-            // split by keys, in launches of attention_tokens tokens
+            // A seen pass's full-attention layer: the state's rows, then each
+            // group's, each run reading the same keys. Else causal: every row
+            // up to its own position (a sliding layer always).
+            if (self.sees != null and !ly.sliding_window) {
+                var runs: [MAX_SEEN_GROUPS + 1]Seen = undefined;
+                const k = seenRuns(self.sees.?, n, &runs) orelse return error.Unsupported;
+                for (runs[0..k]) |r| try self.attend(l, ly, c, r);
+            } else try self.attend(l, ly, c, .{ .first = 0, .count = n, .seen = 0, .hole_first = 0, .hole_end = 0 });
+            try self.quant(l, s.mixer, @intCast(plan.queryWidth()), n);
+            try self.linear(l, try self.matrixOf(ly.attn_output), n, s.projected, plan.hidden_size * 4);
+        }
+
+        /// The attention launches of rows `r.first` .. + `r.count` of the
+        /// call (scores, softmax, values, combine), attention_tokens tokens a
+        /// launch: causal, or (r.seen set) all reading the same keys.
+        fn attend(self: *Self, l: *List, ly: *const lfm3.Layer, c: *const Cache, r: Seen) Error!void {
+            const plan = self.plan;
+            const s = &self.s;
+            const heads: u32 = plan.head_count;
+            const kv_heads: u32 = ly.kv_head_count;
+            const position: u32 = @intCast(c.cpu.position);
             const at = @min(self.options.attention_tokens, self.options.max_batch);
-            var t0: u32 = 0;
-            while (t0 < n) : (t0 += at) {
-                const tokens = @min(at, n - t0);
+            var t0: u32 = r.first;
+            while (t0 < r.first + r.count) : (t0 += at) {
+                const tokens = @min(at, r.first + r.count - t0);
                 const ap = kernels.AttnParams{
                     .heads = heads,
                     .kv_heads = kv_heads,
@@ -1819,6 +2027,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                     .query = t0 * heads * kernels.HEAD_SIZE * 4,
                     .gate = t0 * heads * 4,
                     .out = t0 * heads * kernels.HEAD_SIZE * 4,
+                    .seen = r.seen,
+                    .hole_first = r.hole_first,
+                    .hole_end = r.hole_end,
                 };
                 const words = ap.words();
                 const prefill = tokens > 1 and self.k.scores_prefill != null;
@@ -1835,8 +2046,6 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 l.named("attention combine", null, t0, tokens);
                 try l.add(&self.k.combine.?, kernels.combineGroups(ap), &.{ s.partial, s.gate, s.mixer }, &words);
             }
-            try self.quant(l, s.mixer, @intCast(plan.queryWidth()), n);
-            try self.linear(l, try self.matrixOf(ly.attn_output), n, s.projected, plan.hidden_size * 4);
         }
 
         /// RMSNorm `n` rows of hidden width (from byte `x_off` of hidden)
@@ -2065,7 +2274,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             if (plan.feed_forward_size == 0 or plan.feed_forward_size % quantized.QK_K != 0) return error.Unsupported;
             if (plan.queryWidth() % quantized.QK_K != 0) return error.Unsupported;
             if (plan.vocabulary_size == 0 or !plan.output.present()) return error.Unsupported;
-            if (options.max_batch == 0 or options.max_batch > 64 or options.attention_tokens == 0 or options.max_run == 0) return error.Unsupported;
+            if (options.max_batch == 0 or options.max_batch > MAX_BATCH or options.attention_tokens == 0 or options.max_run == 0) return error.Unsupported;
             if (options.max_span < kernels.VALUE_CHUNK or options.max_span % kernels.VALUE_CHUNK != 0) return error.Unsupported;
             if (plan.layer_count == 0) return error.Unsupported;
             if (plan.conv_layer_count > 0 and (plan.conv_kernel < kernels.MIN_TAPS or plan.conv_kernel > kernels.MAX_TAPS)) return error.Unsupported;
@@ -2092,7 +2301,11 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 if (t.dimension_count != 2 or (t.ggml_type != 12 and t.ggml_type != 14)) return error.Unsupported;
                 if (t.dimensions[0] == 0 or t.dimensions[0] % quantized.QK_K != 0 or t.dimensions[1] == 0) return error.Unsupported;
             }
-            if (launchesFor(plan, options.max_batch, @min(options.attention_tokens, options.max_batch)) > MAX_DISPATCHES) return error.Unsupported;
+            // (a call of up to WHOLE_TOKENS tokens is one list; a longer
+            // pass a list a layer)
+            const whole = @min(options.max_batch, WHOLE_TOKENS);
+            if (launchesFor(plan, whole, @min(options.attention_tokens, whole)) > MAX_DISPATCHES) return error.Unsupported;
+            if (options.max_batch > WHOLE_TOKENS and layerLaunchesFor(options.max_batch, options.attention_tokens) > MAX_DISPATCHES) return error.Unsupported;
         }
     };
 }
@@ -2160,6 +2373,16 @@ pub fn launchesFor(plan: *const lfm3.Plan, tokens: u32, attention_tokens: u32) u
         };
     }
     return n;
+}
+
+/// Dispatches one layer of a seen pass of `tokens` tokens sends at most (an
+/// attention layer's: more than a conv layer's), the inputs' and the KV
+/// rows' copies with the first.
+pub fn layerLaunchesFor(tokens: u32, attention_tokens: u32) u32 {
+    const passes = (tokens + MATRIX_VARIANTS - 1) / MATRIX_VARIANTS;
+    // (each run's last launch may be a short one)
+    const attn = (tokens + attention_tokens - 1) / attention_tokens + MAX_SEEN_GROUPS + 1;
+    return 2 + 5 + 3 * passes + 2 + 4 * attn + 5 * passes;
 }
 
 const HEAD_SIZE = kernels.HEAD_SIZE;
