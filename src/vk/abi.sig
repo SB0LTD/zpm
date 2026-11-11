@@ -751,6 +751,21 @@ pub const StructureType = struct {
     pub const physical_device_vulkan_1_1_features: u32 = 49;
     pub const physical_device_vulkan_1_2_features: u32 = 51;
     pub const physical_device_driver_properties: u32 = 1000196000;
+    pub const image_create_info: u32 = 14;
+    pub const image_view_create_info: u32 = 15;
+    pub const pipeline_vertex_input_state_create_info: u32 = 19;
+    pub const graphics_pipeline_create_info: u32 = 28;
+    pub const sampler_create_info: u32 = 31;
+    pub const framebuffer_create_info: u32 = 37;
+    pub const render_pass_create_info: u32 = 38;
+    pub const render_pass_begin_info: u32 = 43;
+    pub const bind_image_memory_info: u32 = 1000157001;
+    pub const image_memory_requirements_info_2: u32 = 1000146001;
+    pub const descriptor_update_template_create_info: u32 = 1000085000;
+    pub const physical_device_multiview_features: u32 = 1000053001;
+    pub const physical_device_multiview_properties: u32 = 1000053002;
+    pub const physical_device_point_clipping_properties: u32 = 1000117000;
+    pub const physical_device_protected_memory_properties: u32 = 1000145001;
 };
 
 pub const result = struct {
@@ -795,3 +810,288 @@ pub const result = struct {
     pub const error_compression_exhausted_ext: Result = -1000338000;
     pub const error_not_enough_space_khr: Result = -1000483000;
 };
+
+// ── Images, render passes and graphics pipelines ───────────────────────────
+
+pub const Offset2D = extern struct { x: i32, y: i32 };
+pub const Extent2D = extern struct { width: u32, height: u32 };
+pub const Offset3D = extern struct { x: i32, y: i32, z: i32 };
+pub const Rect2D = extern struct { offset: Offset2D, extent: Extent2D };
+pub const Viewport = extern struct { x: f32, y: f32, width: f32, height: f32, minDepth: f32, maxDepth: f32 };
+
+pub const ImageCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    imageType: u32,
+    format: u32,
+    extent: Extent3D,
+    mipLevels: u32,
+    arrayLayers: u32,
+    samples: u32,
+    tiling: u32,
+    usage: u32,
+    sharingMode: u32,
+    queueFamilyIndexCount: u32,
+    pQueueFamilyIndices: ?[*]const u32,
+    initialLayout: u32,
+};
+pub const ComponentMapping = extern struct { r: u32, g: u32, b: u32, a: u32 };
+pub const ImageSubresourceRange = extern struct { aspectMask: u32, baseMipLevel: u32, levelCount: u32, baseArrayLayer: u32, layerCount: u32 };
+pub const ImageViewCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    image: u64,
+    viewType: u32,
+    format: u32,
+    components: ComponentMapping,
+    subresourceRange: ImageSubresourceRange,
+};
+pub const SamplerCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    magFilter: u32,
+    minFilter: u32,
+    mipmapMode: u32,
+    addressModeU: u32,
+    addressModeV: u32,
+    addressModeW: u32,
+    mipLodBias: f32,
+    anisotropyEnable: u32,
+    maxAnisotropy: f32,
+    compareEnable: u32,
+    compareOp: u32,
+    minLod: f32,
+    maxLod: f32,
+    borderColor: u32,
+    unnormalizedCoordinates: u32,
+};
+pub const ImageSubresource = extern struct { aspectMask: u32, mipLevel: u32, arrayLayer: u32 };
+pub const SubresourceLayout = extern struct { offset: u64, size: u64, rowPitch: u64, arrayPitch: u64, depthPitch: u64 };
+pub const ImageSubresourceLayers = extern struct { aspectMask: u32, mipLevel: u32, baseArrayLayer: u32, layerCount: u32 };
+pub const BufferImageCopy = extern struct {
+    bufferOffset: u64,
+    bufferRowLength: u32,
+    bufferImageHeight: u32,
+    imageSubresource: ImageSubresourceLayers,
+    imageOffset: Offset3D,
+    imageExtent: Extent3D,
+};
+pub const ImageCopy = extern struct {
+    srcSubresource: ImageSubresourceLayers,
+    srcOffset: Offset3D,
+    dstSubresource: ImageSubresourceLayers,
+    dstOffset: Offset3D,
+    extent: Extent3D,
+};
+pub const ImageBlit = extern struct {
+    srcSubresource: ImageSubresourceLayers,
+    srcOffsets: [2]Offset3D,
+    dstSubresource: ImageSubresourceLayers,
+    dstOffsets: [2]Offset3D,
+};
+pub const ClearColorValue = extern union { float32: [4]f32, int32: [4]i32, uint32: [4]u32 };
+pub const ClearDepthStencilValue = extern struct { depth: f32, stencil: u32 };
+pub const ClearValue = extern union { color: ClearColorValue, depthStencil: ClearDepthStencilValue };
+pub const ClearAttachment = extern struct { aspectMask: u32, colorAttachment: u32, clearValue: ClearValue };
+pub const ClearRect = extern struct { rect: Rect2D, baseArrayLayer: u32, layerCount: u32 };
+
+pub const AttachmentDescription = extern struct {
+    flags: u32,
+    format: u32,
+    samples: u32,
+    loadOp: u32,
+    storeOp: u32,
+    stencilLoadOp: u32,
+    stencilStoreOp: u32,
+    initialLayout: u32,
+    finalLayout: u32,
+};
+pub const AttachmentReference = extern struct { attachment: u32, layout: u32 };
+pub const SubpassDescription = extern struct {
+    flags: u32,
+    pipelineBindPoint: u32,
+    inputAttachmentCount: u32,
+    pInputAttachments: ?[*]const AttachmentReference,
+    colorAttachmentCount: u32,
+    pColorAttachments: ?[*]const AttachmentReference,
+    pResolveAttachments: ?[*]const AttachmentReference,
+    pDepthStencilAttachment: ?*const AttachmentReference,
+    preserveAttachmentCount: u32,
+    pPreserveAttachments: ?[*]const u32,
+};
+pub const SubpassDependency = extern struct {
+    srcSubpass: u32,
+    dstSubpass: u32,
+    srcStageMask: u32,
+    dstStageMask: u32,
+    srcAccessMask: u32,
+    dstAccessMask: u32,
+    dependencyFlags: u32,
+};
+pub const RenderPassCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    attachmentCount: u32,
+    pAttachments: ?[*]const AttachmentDescription,
+    subpassCount: u32,
+    pSubpasses: ?[*]const SubpassDescription,
+    dependencyCount: u32,
+    pDependencies: ?[*]const SubpassDependency,
+};
+pub const FramebufferCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    renderPass: u64,
+    attachmentCount: u32,
+    pAttachments: ?[*]const u64,
+    width: u32,
+    height: u32,
+    layers: u32,
+};
+pub const RenderPassBeginInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    renderPass: u64,
+    framebuffer: u64,
+    renderArea: Rect2D,
+    clearValueCount: u32,
+    pClearValues: ?[*]const ClearValue,
+};
+
+pub const VertexInputBindingDescription = extern struct { binding: u32, stride: u32, inputRate: u32 };
+pub const VertexInputAttributeDescription = extern struct { location: u32, binding: u32, format: u32, offset: u32 };
+pub const PipelineVertexInputStateCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    vertexBindingDescriptionCount: u32,
+    pVertexBindingDescriptions: ?[*]const VertexInputBindingDescription,
+    vertexAttributeDescriptionCount: u32,
+    pVertexAttributeDescriptions: ?[*]const VertexInputAttributeDescription,
+};
+pub const PipelineInputAssemblyStateCreateInfo = extern struct { sType: u32, pNext: ?*const anyopaque, flags: u32, topology: u32, primitiveRestartEnable: u32 };
+pub const PipelineViewportStateCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    viewportCount: u32,
+    pViewports: ?[*]const Viewport,
+    scissorCount: u32,
+    pScissors: ?[*]const Rect2D,
+};
+pub const PipelineRasterizationStateCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    depthClampEnable: u32,
+    rasterizerDiscardEnable: u32,
+    polygonMode: u32,
+    cullMode: u32,
+    frontFace: u32,
+    depthBiasEnable: u32,
+    depthBiasConstantFactor: f32,
+    depthBiasClamp: f32,
+    depthBiasSlopeFactor: f32,
+    lineWidth: f32,
+};
+pub const PipelineMultisampleStateCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    rasterizationSamples: u32,
+    sampleShadingEnable: u32,
+    minSampleShading: f32,
+    pSampleMask: ?[*]const u32,
+    alphaToCoverageEnable: u32,
+    alphaToOneEnable: u32,
+};
+pub const StencilOpState = extern struct { failOp: u32, passOp: u32, depthFailOp: u32, compareOp: u32, compareMask: u32, writeMask: u32, reference: u32 };
+pub const PipelineDepthStencilStateCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    depthTestEnable: u32,
+    depthWriteEnable: u32,
+    depthCompareOp: u32,
+    depthBoundsTestEnable: u32,
+    stencilTestEnable: u32,
+    front: StencilOpState,
+    back: StencilOpState,
+    minDepthBounds: f32,
+    maxDepthBounds: f32,
+};
+pub const PipelineColorBlendAttachmentState = extern struct {
+    blendEnable: u32,
+    srcColorBlendFactor: u32,
+    dstColorBlendFactor: u32,
+    colorBlendOp: u32,
+    srcAlphaBlendFactor: u32,
+    dstAlphaBlendFactor: u32,
+    alphaBlendOp: u32,
+    colorWriteMask: u32,
+};
+pub const PipelineColorBlendStateCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    logicOpEnable: u32,
+    logicOp: u32,
+    attachmentCount: u32,
+    pAttachments: ?[*]const PipelineColorBlendAttachmentState,
+    blendConstants: [4]f32,
+};
+pub const PipelineDynamicStateCreateInfo = extern struct { sType: u32, pNext: ?*const anyopaque, flags: u32, dynamicStateCount: u32, pDynamicStates: ?[*]const u32 };
+pub const GraphicsPipelineCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    stageCount: u32,
+    pStages: ?[*]const PipelineShaderStageCreateInfo,
+    pVertexInputState: ?*const PipelineVertexInputStateCreateInfo,
+    pInputAssemblyState: ?*const PipelineInputAssemblyStateCreateInfo,
+    pTessellationState: ?*const anyopaque,
+    pViewportState: ?*const PipelineViewportStateCreateInfo,
+    pRasterizationState: ?*const PipelineRasterizationStateCreateInfo,
+    pMultisampleState: ?*const PipelineMultisampleStateCreateInfo,
+    pDepthStencilState: ?*const PipelineDepthStencilStateCreateInfo,
+    pColorBlendState: ?*const PipelineColorBlendStateCreateInfo,
+    pDynamicState: ?*const PipelineDynamicStateCreateInfo,
+    layout: u64,
+    renderPass: u64,
+    subpass: u32,
+    basePipelineHandle: u64,
+    basePipelineIndex: i32,
+};
+pub const ImageMemoryRequirementsInfo2 = extern struct { sType: u32, pNext: ?*const anyopaque, image: u64 };
+pub const BindImageMemoryInfo = extern struct { sType: u32, pNext: ?*const anyopaque, image: u64, memory: u64, memoryOffset: u64 };
+pub const DescriptorUpdateTemplateEntry = extern struct {
+    dstBinding: u32,
+    dstArrayElement: u32,
+    descriptorCount: u32,
+    descriptorType: u32,
+    offset: usize,
+    stride: usize,
+};
+pub const DescriptorUpdateTemplateCreateInfo = extern struct {
+    sType: u32,
+    pNext: ?*const anyopaque,
+    flags: u32,
+    descriptorUpdateEntryCount: u32,
+    pDescriptorUpdateEntries: ?[*]const DescriptorUpdateTemplateEntry,
+    templateType: u32,
+    descriptorSetLayout: u64,
+    pipelineBindPoint: u32,
+    pipelineLayout: u64,
+    set: u32,
+};
+pub const DrawIndirectCommand = extern struct { vertexCount: u32, instanceCount: u32, firstVertex: u32, firstInstance: u32 };
+pub const DrawIndexedIndirectCommand = extern struct { indexCount: u32, instanceCount: u32, firstIndex: u32, vertexOffset: i32, firstInstance: u32 };
+pub const PhysicalDeviceMultiviewFeatures = extern struct { sType: u32, pNext: ?*anyopaque, multiview: u32, multiviewGeometryShader: u32, multiviewTessellationShader: u32 };
+pub const PhysicalDeviceMultiviewProperties = extern struct { sType: u32, pNext: ?*anyopaque, maxMultiviewViewCount: u32, maxMultiviewInstanceIndex: u32 };
+pub const PhysicalDevicePointClippingProperties = extern struct { sType: u32, pNext: ?*anyopaque, pointClippingBehavior: u32 };
+pub const PhysicalDeviceProtectedMemoryProperties = extern struct { sType: u32, pNext: ?*anyopaque, protectedNoFault: u32 };

@@ -8,7 +8,9 @@
 
 pub const abi = @import("abi.sig");
 pub const icd = @import("icd.sig");
+pub const format = @import("format.sig");
 
 test {
     _ = icd;
+    _ = format;
 }

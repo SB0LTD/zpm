@@ -1290,7 +1290,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const vk_module = try ctx.addModule("vk", "src/vk/vk.sig");
     try wire(ctx, vk_module, "gpu", "src/gpu/gpu.sig");
     try wire(ctx, vk_module, "spirv", "src/spirv/spirv.sig");
+    try wire(ctx, vk_module, "gfxapi", "src/gfxapi/gfxapi.sig");
     _ = try addTest(ctx, test_vk, "test-vk-module", "src/vk/vk.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
         importEntry("spirv", "src/spirv/spirv.sig"),
         importEntry("gpu", "src/gpu/gpu.sig"),
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
@@ -1298,6 +1300,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
     });
     _ = try addTest(ctx, test_vk, "test-vk-icd", "tests/test_vk.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
         importEntry("vk", "src/vk/vk.sig"),
         importEntry("spirv", "src/spirv/spirv.sig"),
         importEntry("gpu", "src/gpu/gpu.sig"),
