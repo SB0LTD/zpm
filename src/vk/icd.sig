@@ -2432,7 +2432,13 @@ const Exec = struct {
     }
 
     fn dispatch(e: *Exec, groups: [3]u32) void {
-        if (groups[0] == 0 or groups[1] == 0 or groups[2] == 0) return;
+        e.dispatchFrom(groups, null);
+    }
+
+    /// A dispatch of the bound pipeline: `groups`, or (`indirect`) the
+    /// counts the GPU reads at buf+off when it runs.
+    fn dispatchFrom(e: *Exec, groups: [3]u32, from: ?gpu.Stamp) void {
+        if (from == null and (groups[0] == 0 or groups[1] == 0 or groups[2] == 0)) return;
         if (e.pipe == NONE) return;
         const p = &T.pipelines[e.pipe];
         if (!p.live) return;
@@ -2484,6 +2490,7 @@ const Exec = struct {
         @memcpy(params[2 * nb ..][0..pw], e.push[0..pw]);
         const np = @max(p.info.paramWords(), p.param_words);
         e.kernel(&p.prog, groups, bufs[0..nb], params[0..np]);
+        if (from != null) T.ds[T.n_ds - 1].indirect = from;
     }
 
     /// A copy of `size` bytes between two memories, as copy kernels.
@@ -2597,7 +2604,14 @@ const Exec = struct {
                 e.dispatch(.{ d.x, d.y, d.z });
             },
             .dispatch_indirect => {
-                const groups = e.indirect(as(Indirect, body)) orelse {
+                const ind = as(Indirect, body);
+                // (on the GPU where it reads the counts itself: no wait)
+                if (e.g.dev.caps.indirect) {
+                    const pl = e.place(ind.buf) orelse return;
+                    e.dispatchFrom(.{ 1, 1, 1 }, .{ .buf = T.memories[pl.mem].buf, .off = pl.off + ind.offset });
+                    return;
+                }
+                const groups = e.indirect(ind) orelse {
                     say("vkCmdDispatchIndirect: the counts could not be read", .{});
                     return;
                 };

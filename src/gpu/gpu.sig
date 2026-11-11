@@ -51,6 +51,7 @@ pub const Hazards = device.Hazards;
 pub const Binary = device.Binary;
 pub const Program = device.Program;
 pub const Dispatch = device.Dispatch;
+pub const Stamp = device.Stamp;
 pub const Error = device.Error;
 pub const Fence = device.Fence;
 pub const Device = device.Device;

@@ -544,12 +544,12 @@ fn reduceThroughVulkan(open: *const fn () ?icd.Gpu) !void {
     // at offset 64 of another (a dynamic offset too)
     const input = try v.buffer(256 + 192 * 4, 2);
     const output = try v.buffer(64 + 16, 2);
-    const args = try v.buffer(16, 2);
+    const args = try v.buffer(32, 2);
     const fin: [*]f32 = @ptrCast(@alignCast(input.ptr.? + 256));
     for (0..192) |i| fin[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) + 0.5;
     const aw: [*]u32 = @ptrCast(@alignCast(args.ptr.?));
-    aw[0] = 3;
-    aw[1] = 1;
+    aw[0] = 7; // (the GPU writes 3, 1, 1 over these)
+    aw[1] = 9;
     aw[2] = 1;
     const layout = try v.setLayout(&.{ STORAGE_DYNAMIC, STORAGE_DYNAMIC });
     const pcr = abi.PushConstantRange{ .stageFlags = 0x20, .offset = 0, .size = 8 };
@@ -582,7 +582,17 @@ fn reduceThroughVulkan(open: *const fn () ?icd.Gpu) !void {
     const scale: f32 = 0.25;
     const pc = [_]u32{ n, @bitCast(scale) };
     v.f("vkCmdPushConstants", *const fn (Ptr, H, u32, u32, u32, *const anyopaque) callconv(.c) void)(cb, pl_layout, 0x20, 0, 8, &pc);
+    // the counts written by the GPU before the dispatch reads them (3, 1,
+    // 1 over the host's), then an indirect dispatch of zero groups
+    const fill = v.f("vkCmdFillBuffer", *const fn (Ptr, H, u64, u64, u32) callconv(.c) void);
+    fill(cb, args.buf, 16, 16, 0);
+    fill(cb, args.buf, 0, 4, 3);
+    fill(cb, args.buf, 4, 8, 1);
     v.f("vkCmdDispatchIndirect", *const fn (Ptr, H, u64) callconv(.c) void)(cb, args.buf, 0);
+    // (were it to run, its scale would show)
+    const pc2 = [_]u32{ n, @bitCast(@as(f32, 100)) };
+    v.f("vkCmdPushConstants", *const fn (Ptr, H, u32, u32, u32, *const anyopaque) callconv(.c) void)(cb, pl_layout, 0x20, 0, 8, &pc2);
+    v.f("vkCmdDispatchIndirect", *const fn (Ptr, H, u64) callconv(.c) void)(cb, args.buf, 16);
     try testing.expectEqual(R.success, v.f("vkEndCommandBuffer", *const fn (Ptr) callconv(.c) Res)(cb));
     const si = abi.SubmitInfo{ .sType = ST.submit_info, .pNext = null, .waitSemaphoreCount = 0, .pWaitSemaphores = null, .pWaitDstStageMask = null, .commandBufferCount = 1, .pCommandBuffers = @ptrCast(&cb), .signalSemaphoreCount = 0, .pSignalSemaphores = null };
     try testing.expectEqual(R.success, v.f("vkQueueSubmit", *const fn (Ptr, u32, [*]const abi.SubmitInfo, H) callconv(.c) Res)(v.queue, 1, @ptrCast(&si), 0));

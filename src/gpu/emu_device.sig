@@ -259,7 +259,17 @@ pub const EmuDevice = struct {
         return e.fence;
     }
 
-    fn dispatch(e: *EmuDevice, d: Dispatch) anyerror!void {
+    fn dispatch(e: *EmuDevice, d0: Dispatch) anyerror!void {
+        var d = d0;
+        // (the counts as the dispatches before left them)
+        if (d.indirect) |ind| {
+            const rg = e.regionHolding(ind.buf.gpu + ind.off) orelse return error.Trap;
+            const at: usize = @intCast(ind.buf.gpu + ind.off - rg.gpu);
+            if (at + 12 > rg.bytes) return error.Trap;
+            const w = rg.seen[at..][0..12];
+            d.groups = .{ std.mem.readInt(u32, w[0..4], .little), std.mem.readInt(u32, w[4..8], .little), std.mem.readInt(u32, w[8..12], .little) };
+            if (d.groups[0] == 0 or d.groups[1] == 0 or d.groups[2] == 0) return;
+        }
         const p = d.prog;
         if (p.bin.target != .interp) return error.BadProgram;
         if (d.buffers.len != p.bin.bindings or d.buffers.len > MAX_BINDINGS) return error.BadProgram;
