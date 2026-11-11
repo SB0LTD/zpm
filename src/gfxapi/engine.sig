@@ -342,7 +342,7 @@ pub const CODE_BYTES = 16 * 1024;
 /// A dispatch's parameter words and bindings at most (a draw's vertex
 /// kernel has the most).
 const MAX_PARAMS = 160;
-const MAX_BIND = 3 + raster.MAX_ATTRS + texture.MAX_TEX;
+const MAX_BIND = 3 + raster.MAX_ATTRS + texture.MAX_TEX + raster.MAX_BUFFERS;
 /// KIR instructions a kernel built here may have (a pipeline's, a GLSL
 /// shader inlined in it).
 pub const MAX_KIR = 65536;
@@ -1646,7 +1646,8 @@ pub const Engine = struct {
         for (d.attrs, 0..) |a, j| vbs[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
         const depth = d.depth orelse &e.zero;
         const sb = [_]*Image{ &tris, &verts };
-        var rbs: [5 + texture.MAX_TEX]*Image = undefined;
+        const nbuf: usize = p.shaders.buffers;
+        var rbs: [5 + texture.MAX_TEX + raster.MAX_BUFFERS]*Image = undefined;
         rbs[0] = d.color;
         rbs[1] = depth;
         rbs[2] = &tris;
@@ -1656,9 +1657,14 @@ pub const Engine = struct {
             vbs[3 + raster.MAX_ATTRS + j] = img;
             rbs[4 + j] = img;
         }
-        rbs[4 + ntex] = d.stencil orelse &e.zero;
-        const vb = vbs[0 .. 3 + raster.MAX_ATTRS + ntex];
-        const rb = rbs[0 .. 4 + ntex + @intFromBool(d.stencil != null)];
+        for (0..nbuf) |j| {
+            const img = d.buffers[j] orelse &e.zero;
+            vbs[3 + raster.MAX_ATTRS + ntex + j] = img;
+            rbs[4 + ntex + j] = img;
+        }
+        rbs[4 + ntex + nbuf] = d.stencil orelse &e.zero;
+        const vb = vbs[0 .. 3 + raster.MAX_ATTRS + ntex + nbuf];
+        const rb = rbs[0 .. 4 + ntex + nbuf + @intFromBool(d.stencil != null)];
         const groups_v = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
         const groups_s = [3]u32{ divUp(ntri, raster.SETUP_GROUP), d.instances, 1 };
         const groups_r = [3]u32{ divUp(d.rect.width(), raster.TILE), divUp(d.rect.height(), raster.TILE), 1 };
@@ -1695,7 +1701,7 @@ pub const Engine = struct {
         if (all_gpu) {
             var rw: u32 = if (d.depth != null and d.depth_test and d.depth_write) 0b11 else 0b01;
             if (d.stencil != null) {
-                rw |= @as(u32, 1) << @intCast(4 + ntex);
+                rw |= @as(u32, 1) << @intCast(4 + ntex + nbuf);
                 if (d.stencil == d.depth) rw |= 0b10;
             }
             e.recordProg(&p.progs[0].?, groups_v, vb, 1, vparams, null);
@@ -1735,7 +1741,7 @@ pub const Engine = struct {
             if (!e.runCpu(.setup, p, groups_s, &sv, sparams)) break :cpu false;
             const bv = [_][]u8{tris.buf.cpu};
             if (bins.on and !e.runCpu(.bin, p, groups_b, &bv, bparams)) break :cpu false;
-            var rv: [5 + texture.MAX_TEX][]u8 = undefined;
+            var rv: [5 + texture.MAX_TEX + raster.MAX_BUFFERS][]u8 = undefined;
             for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
             if (!e.runCpu(if (d.stencil != null) .stencil else .raster, p, groups_r, rv[0..rb.len], rparams)) break :cpu false;
             for (rb[0..2]) |img| e.wrote(img, 0, img.buf.cpu.len);

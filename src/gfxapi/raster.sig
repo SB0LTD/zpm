@@ -38,8 +38,10 @@
 //! Not yet: points and lines; clipping (a triangle with a vertex at w <= 0,
 //! or beyond GUARD pixels, is dropped: a guard band); multisampling;
 //! several color attachments; float and integer targets.
-//! Shaders are KIR emitters (`Shaders`): GLSL programs' (glsl/gen.sig), or
-//! Sig code.
+//! Shaders are KIR emitters (`Shaders`): GLSL programs' (glsl/gen.sig),
+//! Vulkan's SPIR-V (src/vk through src/spirv), or Sig code. Besides the
+//! uniform words and the textures, a pipeline may bind buffers
+//! (`Shaders.buffers`: Vulkan's uniform and storage buffers).
 //!
 //! Allocation-free: kernels are built into the caller's storage.
 
@@ -68,6 +70,9 @@ pub const MAX_ATTRS = 16;
 /// Scalar varyings (a vec4 is four): GL ES 3.0's 15 vectors, and room.
 pub const MAX_VARYINGS = 64;
 pub const MAX_UNIFORM_WORDS = 1024;
+/// Buffers a pipeline's shaders may read and write besides the uniform
+/// words (Vulkan's uniform and storage buffers): bound after the textures.
+pub const MAX_BUFFERS = 32;
 /// A tile's edge constants are clamped to +-LIMIT: the 32-bit per-pixel
 /// part then never overflows (fixed coordinates < 2^19, steps < 2^7).
 const LIMIT: u32 = 1 << 29;
@@ -103,6 +108,8 @@ pub const VertexIO = struct {
     uniforms: u8 = 0,
     /// the first texture's binding (the pipeline's textures follow)
     textures: u8 = 0,
+    /// the first buffer's binding (Shaders.buffers of them follow)
+    buffers: u8 = 0,
     /// outputs: the clip-space position, the varyings (f32)
     position: [4]V = .{ .none, .none, .none, .none },
     varying: [MAX_VARYINGS]V = [_]V{.none} ** MAX_VARYINGS,
@@ -128,6 +135,7 @@ pub const FragmentIO = struct {
     front_facing: V = .none,
     uniforms: u8 = 0,
     textures: u8 = 0,
+    buffers: u8 = 0,
     /// outputs: the color (f32, 0..1 for unorm targets), and a pred that
     /// drops the fragment (discard), if the shader sets one
     color: [4]V = .{ .none, .none, .none, .none },
@@ -147,6 +155,9 @@ pub const Shaders = struct {
     /// textures both stages may read (texture.sig), bound after each
     /// kernel's own buffers
     textures: u8 = 0,
+    /// buffers both stages may read and write (Draw.buffers), bound after
+    /// the textures
+    buffers: u8 = 0,
     /// the fragment code takes derivatives: the raster runs it for whole
     /// quads (FragmentIO.quads)
     quads: bool = false,
@@ -183,7 +194,7 @@ pub const Pipeline = struct {
     checked: u8 = 0,
 
     pub fn init(sh: Shaders) Pipeline {
-        std.debug.assert(sh.attrs <= MAX_ATTRS and sh.varyings <= MAX_VARYINGS and sh.textures <= texture.MAX_TEX);
+        std.debug.assert(sh.attrs <= MAX_ATTRS and sh.varyings <= MAX_VARYINGS and sh.textures <= texture.MAX_TEX and sh.buffers <= MAX_BUFFERS);
         return .{ .shaders = sh, .vstride = VREC + sh.varyings, .sstride = SREC + 3 * @as(u32, sh.varyings) };
     }
 };
@@ -272,6 +283,8 @@ pub const Draw = struct {
     attrs: [MAX_ATTRS]Attr = [_]Attr{.{}} ** MAX_ATTRS,
     /// the pipeline's textures' images (null: none bound: reads 0, 0, 0, 1)
     textures: [texture.MAX_TEX]?*engine.Image = [_]?*engine.Image{null} ** texture.MAX_TEX,
+    /// the pipeline's buffers (Shaders.buffers; null: zeros)
+    buffers: [MAX_BUFFERS]?*engine.Image = [_]?*engine.Image{null} ** MAX_BUFFERS,
     /// the element array: its buffer, byte offset, index size (1, 2, 4)
     index: ?*engine.Image = null,
     index_offset: u32 = 0,
@@ -440,6 +453,8 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     const sh = p.shaders;
     const b_tex = k.bindings;
     for (0..sh.textures) |_| _ = k.binding();
+    const b_buf = k.bindings;
+    for (0..sh.buffers) |_| _ = k.binding();
     const count = k.param(.u32, V_COUNT);
     const x = k.op3(.imad, .u32, r(k.gid(0)), u(VERTEX_GROUP), r(k.tid(0)));
     const inst = k.gid(1);
@@ -459,7 +474,7 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
             k.set(v, .bfe, r(word), r(shift), r(k.op2(.shl, .u32, r(idx_size), u(3))));
         }
         k.endif();
-        var io = VertexIO{ .vertex_id = v, .instance_id = inst, .uniforms = b_uni, .textures = b_tex };
+        var io = VertexIO{ .vertex_id = v, .instance_id = inst, .uniforms = b_uni, .textures = b_tex, .buffers = b_buf };
         for (0..sh.attrs) |a| io.attr[a] = fetch(&k, b_attr[a], @intCast(V_ATTR + a * V_ATTR_WORDS), v, inst);
         sh.vertex(sh.ctx, &k, &io);
         // clip space to window space
@@ -891,6 +906,8 @@ fn rasterKernelWithStencil(s: kir.Storage, p: *const Pipeline, stencil_enabled: 
     const sh = p.shaders;
     const b_tex = k.bindings;
     for (0..sh.textures) |_| _ = k.binding();
+    const b_buf = k.bindings;
+    for (0..sh.buffers) |_| _ = k.binding();
     const b_s = if (stencil_enabled) k.binding() else 0;
     const lx = k.tid(0);
     const ly = k.tid(1);
@@ -1107,7 +1124,7 @@ fn rasterKernelWithStencil(s: kir.Storage, p: *const Pipeline, stencil_enabled: 
                 {
                     const iw = plane(&k, b_t, base, S_W, dX, dY);
                     const wv = k.div(f(1), r(iw));
-                    var io = FragmentIO{ .uniforms = b_uni, .textures = b_tex, .quads = sh.quads, .odd_x = odd_x, .odd_y = odd_y };
+                    var io = FragmentIO{ .uniforms = b_uni, .textures = b_tex, .buffers = b_buf, .quads = sh.quads, .odd_x = odd_x, .odd_y = odd_y };
                     for (0..sh.varyings) |j| {
                         const w0: u32 = @intCast(SREC + 3 * j);
                         // (flat: the provoking vertex's bits, untouched: an integer's too)

@@ -102,7 +102,10 @@ pub const State = struct {
 pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     @memset(out, 0);
     const img = s.img orelse return;
-    if (!img.live()) return;
+    // (an image in GPU memory without a CPU view, as Vulkan's in VRAM, is
+    // live too: its size is the buffer's)
+    const bytes: u64 = if (img.buf.cpu.len != 0) img.buf.cpu.len else if (img.buf.gpu != 0) img.buf.bytes else 0;
+    if (img.width == 0 or bytes == 0) return;
     const fmt = img.format;
     out[D_W] = img.width;
     out[D_H] = img.height;
@@ -118,7 +121,7 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     out[D_SWZ] = swz;
     out[D_MODE] = @as(u32, @intFromEnum(s.wrap_s)) | @as(u32, @intFromEnum(s.wrap_t)) << 4 |
         @as(u32, @intFromEnum(s.wrap_r)) << 12 | @as(u32, s.compare) << 16 | (if (s.linear) M_LINEAR else 0);
-    out[D_LAST] = @intCast(@max(img.buf.cpu.len / 4, 1) - 1);
+    out[D_LAST] = @intCast(@min(@max(bytes / 4, 1) - 1, 0xffff_ffff));
     const matters = s.mip != .none or s.min_linear != s.linear;
     out[D_LOD] = @as(u32, s.base) | @as(u32, s.last) << 4 | @as(u32, @intFromEnum(s.mip)) << 8 | (if (s.min_linear) L_MIN_LINEAR else 0) | (if (matters) L_MATTERS else 0);
     out[D_MIN_LOD] = @bitCast(s.min_lod);
