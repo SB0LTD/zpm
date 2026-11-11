@@ -1175,6 +1175,7 @@ fn streamMethod(g: *Gen, name: []const u8, argn: []const u32) Val {
         if (g.failed) return none(g);
         // the outputs are this vertex's elements (declared once: the same each time)
         g.nouts = 0;
+        g.packReset();
         var reg: u32 = 0;
         const vt = v.ty;
         g.outputLeaves(vt, 0, 0, 0, 0, v, &reg);

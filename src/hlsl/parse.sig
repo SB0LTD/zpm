@@ -306,7 +306,11 @@ pub const Parser = struct {
             const s = p.newSym(.{ .kind = .variable, .storage = storage, .name_off = name.off, .name_len = name.len, .ty = p.packTy(ty, flags), .flags = flags, .line = name.line() });
             var sem: [2]u32 = undefined;
             if (!p.postfixDecl(s, &sem)) return;
-            if (p.accept(.assign)) p.a.syms[s].init = p.initializer();
+            if (p.accept(.assign)) {
+                const init = p.initializer();
+                p.a.syms[s].init = init;
+                p.sizeFromInit(s, init);
+            }
             p.declare(s);
             p.addGlobal(s);
             if (!p.accept(.comma)) break;
@@ -752,13 +756,8 @@ pub const Parser = struct {
             if (p.accept(.assign)) {
                 const init = p.initializer();
                 p.a.syms[s].init = init;
-                // T a[] = {...}: the length from the initializer
-                if (p.a.types[ty].class == .array and p.a.types[ty].len == 0 and p.a.nodes[init].kind == .init_list) {
-                    const et = p.a.types[ty].elem;
-                    const per = @max(p.a.comps(et), 1);
-                    ty = p.a.array(et, p.listComps(init) / per);
-                    p.a.syms[s].ty = ty;
-                }
+                p.sizeFromInit(s, init);
+                ty = p.a.syms[s].ty;
             }
             p.declare(s);
             const d = p.newNode(.decl);
@@ -769,6 +768,26 @@ pub const Parser = struct {
         }
         _ = p.expect(.semicolon);
         return first;
+    }
+
+    /// T a[] = {...}: the length from the initializer.
+    fn sizeFromInit(p: *Parser, s: u32, init: u32) void {
+        const ty = p.a.syms[s].ty;
+        if (p.a.types[ty].class != .array or p.a.types[ty].len != 0 or p.a.nodes[init].kind != .init_list) return;
+        const et = p.a.types[ty].elem;
+        // (elements given as nested lists, or as scalars)
+        const n = p.a.nodes[init].c;
+        var nested = true;
+        var e = p.a.nodes[init].a;
+        while (e != NONE) : (e = p.a.nodes[e].next) nested = nested and p.a.nodes[e].kind == .init_list;
+        const len = if (nested or p.a.comps(et) == 1) n else blk: {
+            // constructors count one element each; bare scalars by components
+            var any_scalar = false;
+            e = p.a.nodes[init].a;
+            while (e != NONE) : (e = p.a.nodes[e].next) any_scalar = any_scalar or p.a.nodes[e].kind == .lit_float or p.a.nodes[e].kind == .lit_int;
+            break :blk if (any_scalar) p.listComps(init) / @max(p.a.comps(et), 1) else n;
+        };
+        p.a.syms[s].ty = p.a.array(et, len);
     }
 
     /// The scalars an initializer list holds (nested lists flattened;

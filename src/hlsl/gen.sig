@@ -218,6 +218,10 @@ pub const Gen = struct {
     gs_in_vertices: u32 = 0,
     /// the entry's symbol
     entry: u32 = 0,
+    /// signature packing: each register's used components and the
+    /// interpolation mode its elements share
+    pk_used: [64]u8 = [_]u8{0} ** 64,
+    pk_mode: [64]u16 = [_]u16{0} ** 64,
     /// whether derivatives / sample are used (statistics)
     globals_cb: u32 = 0xffff_ffff,
 
@@ -593,6 +597,8 @@ pub const Gen = struct {
                 const c: u2 = @intCast((off % 16) / 4);
                 var s = Src{ .reg = .cb, .idx = slot, .row = off / 16, .n = x.cols, .rel = rel };
                 for (0..4) |j| s.swz[j] = @intCast(@min(@as(u32, c) + j, 3));
+                // (a bool in memory is true when nonzero: made 0 or ~0)
+                if (ast.canon(x.base) == .bool) s = g.alu(.ine, x.cols, &.{ s, imm1(0) });
                 g.srcs[first + k.*] = s;
                 k.* += 1;
             },
@@ -2378,7 +2384,111 @@ pub const Gen = struct {
         g.emit(i);
     }
 
+    /// A value known now: an expression evaluated without keeping its code
+    /// (null when it is not an immediate).
+    pub fn dryConst(g: *Gen, n: u32) ?Val {
+        const save_n = g.p.n;
+        const save_v = g.p.nvregs;
+        const save_l = g.nlocs;
+        const save_icb = g.nicb;
+        const save_failed = g.failed;
+        const save_len = g.log.len;
+        const save_err = g.log.errors;
+        const v = g.expr(n);
+        const ok = !g.failed and v.kind == .srcs and v.n == 1 and g.srcs[v.at].reg == .imm32 and g.p.n == save_n;
+        g.p.n = save_n;
+        g.p.nvregs = save_v;
+        g.nlocs = save_l;
+        g.nicb = save_icb;
+        g.failed = save_failed;
+        g.log.len = save_len;
+        g.log.errors = save_err;
+        return if (ok) v else null;
+    }
+
+    const MAX_UNROLL = 64;
+
+    /// `for (int i = A; i OP B; i STEP C) body` with A, B, C known, a body
+    /// that leaves i alone and has no break or continue: unrolled, i an
+    /// immediate in each copy (as fxc does unless told [loop]): textures
+    /// indexed by i then work, and derivatives stay real.
+    fn unrolled(g: *Gen, node: ast.Node) bool {
+        if (node.kind != .for_ or node.attr & ast.A_LOOP != 0) return false;
+        if (node.a == NONE or node.b == NONE or node.c == NONE) return false;
+        const init = g.a.nodes[node.a];
+        if (init.kind != .decl or init.next != NONE) return false;
+        const sym = init.a;
+        const s = g.a.syms[sym];
+        const st = g.a.types[s.ty];
+        if (st.class != .scalar or !(st.base == .int or st.base == .uint) or s.init == NONE) return false;
+        if (containsJump(g.a, node.d) or assignsSym(g.a, node.d, sym)) return false;
+        const c = g.a.nodes[node.b];
+        if (c.kind != .binary or g.a.nodes[c.a].kind != .ident or g.a.nodes[c.a].a != sym) return false;
+        const cop: lex.Kind = @enumFromInt(c.op);
+        // the step: i++, ++i, i--, --i, i += k, i -= k
+        const stp = g.a.nodes[node.c];
+        var delta: i64 = 0;
+        switch (stp.kind) {
+            .postinc, .preinc, .postdec, .predec => {
+                if (g.a.nodes[stp.a].kind != .ident or g.a.nodes[stp.a].a != sym) return false;
+                delta = if (stp.kind == .postinc or stp.kind == .preinc) 1 else -1;
+            },
+            .assign => {
+                if (g.a.nodes[stp.a].kind != .ident or g.a.nodes[stp.a].a != sym) return false;
+                const sk: lex.Kind = @enumFromInt(stp.op);
+                if (sk != .add_assign and sk != .sub_assign) return false;
+                const dv = g.dryConst(stp.b) orelse return false;
+                const d = constInt(g, dv) orelse return false;
+                delta = if (sk == .add_assign) d else -d;
+            },
+            else => return false,
+        }
+        if (delta == 0) return false;
+        const av = g.dryConst(s.init) orelse return false;
+        const bv = g.dryConst(c.b) orelse return false;
+        var i = constInt(g, av) orelse return false;
+        const b = constInt(g, bv) orelse return false;
+        // the trip count
+        var vals: [MAX_UNROLL]i64 = undefined;
+        var n: usize = 0;
+        while (true) {
+            const go = switch (cop) {
+                .lt => i < b,
+                .le => i <= b,
+                .gt => i > b,
+                .ge => i >= b,
+                .ne => i != b,
+                else => return false,
+            };
+            if (!go) break;
+            if (n >= MAX_UNROLL) return false;
+            vals[n] = i;
+            n += 1;
+            i += delta;
+        }
+        const t = s.ty;
+        for (vals[0..n]) |x| {
+            g.binds[sym] = .{ .kind = .val, .val = g.immVal(t, @truncate(@as(u64, @bitCast(x)))) };
+            g.stmt(node.d, false);
+            if (g.failed) return true;
+        }
+        g.binds[sym] = .{ .kind = .val, .val = g.immVal(t, @truncate(@as(u64, @bitCast(i)))) };
+        return true;
+    }
+
+    fn constInt(g: *Gen, v: Val) ?i64 {
+        const s = g.srcs[v.at];
+        const w = s.imm[0];
+        return switch (g.baseOf(v.ty)) {
+            .int => @as(i32, @bitCast(w)),
+            .uint, .bool => w,
+            .float => @intFromFloat(@as(f32, @bitCast(applyMods(w, s.mods)))),
+            else => null,
+        };
+    }
+
     fn loopStmt(g: *Gen, node: ast.Node) void {
+        if (g.unrolled(node)) return;
         if (node.kind == .for_ and node.a != NONE) g.stmt(node.a, false);
         if (g.failed) return;
         if (node.kind == .for_ or node.kind == .while_) {
@@ -2678,7 +2788,7 @@ pub const Gen = struct {
             g.ncbs += 1;
             var off: u32 = 0;
             for (0..sy.nparams) |k| {
-                const m = sy.cbuf + @as(u32, @intCast(k));
+                const m = g.a.cbMember(s, @intCast(k));
                 const ms = g.a.syms[m];
                 var o: u32 = undefined;
                 if (ms.packoffset != 0xffff_ffff) {
@@ -2780,6 +2890,7 @@ pub const Gen = struct {
     fn entryInputs(g: *Gen, f: u32) void {
         const fs = g.a.syms[f];
         var reg: u32 = 0;
+        g.packReset();
         // GS: the input primitive and the stream
         for (0..fs.nparams) |k| {
             const psym = fs.params + @as(u32, @intCast(k));
@@ -2844,6 +2955,46 @@ pub const Gen = struct {
         g.binds[psym] = .{ .kind = .gs_input, .val = mkVal(ps.ty, all, per * @as(u32, t.len)) };
     }
 
+    pub fn packReset(g: *Gen) void {
+        @memset(&g.pk_used, 0);
+        @memset(&g.pk_mode, 0);
+    }
+
+    /// The interpolation mode an element links with (ints are constant).
+    fn elemMode(flags: u32, b: ast.Base) u16 {
+        if (flags & ast.F_NOINTERP != 0 or ast.canon(b) != .float) return 1;
+        const np = flags & ast.F_NOPERSP != 0;
+        if (flags & ast.F_SAMPLE != 0) return if (np) 7 else 6;
+        if (flags & ast.F_CENTROID != 0) return if (np) 5 else 3;
+        return if (np) 4 else 2;
+    }
+
+    /// A register and first component for an element of n components:
+    /// fxc's packing (the first register so far of the same interpolation
+    /// whose free components after its last used one hold it), or a new
+    /// register. System values and matrix or array rows take their own.
+    fn place(g: *Gen, n: u8, mode: u16, packable: bool, reg: *u32) struct { reg: u32, comp: u2 } {
+        if (packable) {
+            var r: u32 = 0;
+            while (r < reg.* and r < g.pk_used.len) : (r += 1) {
+                const used = g.pk_used[r];
+                if (used == 0xf or g.pk_mode[r] != mode) continue;
+                const k: u8 = 8 - @clz(used);
+                if (k + n <= 4) {
+                    g.pk_used[r] |= @intCast(((@as(u32, 1) << @intCast(n)) - 1) << @intCast(k));
+                    return .{ .reg = r, .comp = @intCast(k) };
+                }
+            }
+        }
+        const r = reg.*;
+        reg.* += 1;
+        if (r < g.pk_used.len) {
+            g.pk_used[r] = if (packable) @intCast((@as(u32, 1) << @intCast(n)) - 1) else 0xf;
+            g.pk_mode[r] = mode;
+        }
+        return .{ .reg = r, .comp = 0 };
+    }
+
     /// Input elements for a value of type `t` (a struct's members each
     /// with its own semantic); the value reading them.
     fn inputLeaves(g: *Gen, t: u32, sem_off: u32, sem_len: u16, sem_index: u32, flags: u32, reg: *u32) Val {
@@ -2900,11 +3051,13 @@ pub const Gen = struct {
                 g.fail("too many inputs", .{});
                 return g.immVal(t, 0);
             }
-            const vreg_ = reg.*;
-            g.ins[g.nins] = .{ .name = name, .index = sem_index + @as(u32, @intCast(r)), .sys = sv, .comp = compType(info.base), .reg = vreg_, .mask = mask, .flags = flags };
+            const packs = (g.target.stage == .pixel or g.target.stage == .geometry) and sv == 0 and (g.a.types[t].class == .scalar or g.a.types[t].class == .vector);
+            const at_ = g.place(info.n, elemMode(flags, info.base), packs, reg);
+            g.ins[g.nins] = .{ .name = name, .index = sem_index + @as(u32, @intCast(r)), .sys = sv, .comp = compType(info.base), .reg = at_.reg, .mask = mask << at_.comp, .flags = flags };
             g.nins += 1;
-            reg.* += 1;
-            g.srcs[first + r] = .{ .reg = .input, .idx = vreg_, .n = info.n };
+            var src_ = Src{ .reg = .input, .idx = at_.reg, .n = info.n };
+            for (0..4) |c| src_.swz[c] = @intCast(@min(@as(u32, at_.comp) + c, 3));
+            g.srcs[first + r] = src_;
             // (bools come in as uints: 0 or 1 becomes false or true)
             if (info.base == .bool and sv != 9) g.srcs[first + r] = g.alu(.ine, info.n, &.{ g.srcs[first + r], imm1(0) });
         }
@@ -2914,6 +3067,7 @@ pub const Gen = struct {
     fn entryOutputs(g: *Gen, f: u32, ctx: FnCtx) void {
         const fs = g.a.syms[f];
         var reg: u32 = 0;
+        g.packReset();
         if (g.target.stage == .geometry) {
             // GS outputs are declared by the stream's vertex type, written at Append
             return;
@@ -2954,7 +3108,8 @@ pub const Gen = struct {
             const mask: u8 = @intCast((@as(u32, 1) << @intCast(info.n)) - 1);
             const sv: u32 = sys orelse 0;
             const index = sem_index + @as(u32, @intCast(r));
-            var o_reg: u32 = reg.*;
+            var o_reg: u32 = 0;
+            var comp: u2 = 0;
             var special: Reg = .null;
             if (g.target.stage == .pixel) {
                 if (sv == 64 or sv == 0) {
@@ -2965,19 +3120,25 @@ pub const Gen = struct {
                 } else if (sv == 66) {
                     o_reg = 0xffff_ffff;
                 }
-            } else reg.* += 1;
+            } else {
+                const packs = sv == 0 and (x.class == .scalar or x.class == .vector);
+                const at_ = g.place(info.n, elemMode(flags, info.base), packs, reg);
+                o_reg = at_.reg;
+                comp = at_.comp;
+            }
             if (g.nouts >= MAX_ELEMS) return g.fail("too many outputs", .{});
-            g.outs[g.nouts] = .{ .name = name, .index = index, .sys = if (g.target.stage == .pixel and sv == 0) 64 else sv, .comp = compType(info.base), .reg = o_reg, .mask = mask, .used = mask, .flags = flags, .special = special };
+            g.outs[g.nouts] = .{ .name = name, .index = index, .sys = if (g.target.stage == .pixel and sv == 0) 64 else sv, .comp = compType(info.base), .reg = o_reg, .mask = mask << comp, .used = mask << comp, .flags = flags, .special = special };
             g.nouts += 1;
-            // (bools go out as 0 or 1? D3D keeps their bits)
             const s = g.srcs[v.at + r];
             var i = ir.Inst{ .op = .mov, .n = 2 };
             if (special == .output_depth) {
                 i.ops[0] = .{ .reg = .output_depth, .comps = 1, .dims = 0, .mode = .mask };
                 i.ops[1] = g.opnd(s, ident4, 1);
             } else {
-                i.ops[0] = .{ .reg = .output, .comps = 4, .mode = .mask, .mask = @intCast(mask), .idx = .{ o_reg, 0 } };
-                i.ops[1] = g.opnd(s, ident4, info.n);
+                var map: [4]u2 = undefined;
+                for (0..4) |c| map[c] = @intCast(@min(@as(u32, comp) + c, 3));
+                i.ops[0] = .{ .reg = .output, .comps = 4, .mode = .mask, .mask = @intCast(mask << comp), .idx = .{ o_reg, 0 } };
+                i.ops[1] = g.opnd(s, map, info.n);
             }
             g.emit(i);
         }
@@ -3006,6 +3167,74 @@ pub fn countReturns(a: *const Ast, n: u32) u32 {
 
 pub fn containsReturn(a: *const Ast, n: u32) bool {
     return countReturns(a, n) > 0;
+}
+
+/// A break, continue or return anywhere inside (nested loops' too).
+pub fn containsJump(a: *const Ast, n: u32) bool {
+    if (n == NONE) return false;
+    const node = a.nodes[n];
+    return switch (node.kind) {
+        .break_, .continue_, .return_ => true,
+        .block => blk: {
+            var s = node.a;
+            while (s != NONE) : (s = a.nodes[s].next) if (containsJump(a, s)) break :blk true;
+            break :blk false;
+        },
+        .if_ => containsJump(a, node.b) or containsJump(a, node.c),
+        .for_, .while_, .do_ => containsJump(a, node.d),
+        .switch_ => containsJump(a, node.b),
+        else => false,
+    };
+}
+
+/// Whether anything in a statement assigns `sym` (or passes it out).
+pub fn assignsSym(a: *const Ast, n: u32, sym: u32) bool {
+    if (n == NONE) return false;
+    const node = a.nodes[n];
+    switch (node.kind) {
+        .assign, .preinc, .predec, .postinc, .postdec => {
+            var x = node.a;
+            while (x != NONE) {
+                const xn = a.nodes[x];
+                if (xn.kind == .ident) {
+                    if (xn.a == sym) return true;
+                    break;
+                }
+                if (xn.kind == .member or xn.kind == .index) x = xn.a else break;
+            }
+            return assignsSym(a, node.b, sym) or (node.kind != .assign and false);
+        },
+        .call => {
+            // (an out argument: conservatively, any call taking it)
+            var e = node.a;
+            while (e != NONE) : (e = a.nodes[e].next) {
+                if (a.nodes[e].kind == .ident and a.nodes[e].a == sym and node.d != NONE) return true;
+                if (assignsSym(a, e, sym)) return true;
+            }
+            return false;
+        },
+        else => {},
+    }
+    var r = false;
+    if (node.kind == .block or node.kind == .init_list) {
+        var s = node.a;
+        while (s != NONE) : (s = a.nodes[s].next) r = r or assignsSym(a, s, sym);
+        return r;
+    }
+    if (node.kind == .decl) return false;
+    const kids = [_]u32{ node.a, node.b, node.c, node.d };
+    for (kids) |kid| {
+        if (kid != NONE and kid < a.nnodes and isNodeChild(node.kind)) r = r or assignsSym(a, kid, sym);
+    }
+    return r;
+}
+
+fn isNodeChild(k: ast.NodeKind) bool {
+    // (fields that hold nodes, not symbols or types)
+    return switch (k) {
+        .ident, .lit_int, .lit_float, .lit_bool, .construct, .cast, .member, .method => false,
+        else => true,
+    };
 }
 
 pub fn containsContinue(a: *const Ast, n: u32) bool {

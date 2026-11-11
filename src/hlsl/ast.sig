@@ -271,6 +271,21 @@ pub const Ast = struct {
         return a.name(a.syms[s].name_off, a.syms[s].name_len);
     }
 
+    /// A cbuffer's k-th member (its members are the variables declared in
+    /// it, in order; a struct declared inside has a symbol among them).
+    pub fn cbMember(a: *const Ast, cb: u32, k: u32) u32 {
+        var i = a.syms[cb].cbuf;
+        var n: u32 = 0;
+        while (i < a.nsyms) : (i += 1) {
+            const s = a.syms[i];
+            if (s.kind == .variable and s.storage == .cbuffer_member and s.cbuf == cb) {
+                if (n == k) return i;
+                n += 1;
+            }
+        }
+        return 0;
+    }
+
     pub fn semName(a: *const Ast, s: u32) []const u8 {
         return a.name(a.syms[s].sem_off, a.syms[s].sem_len);
     }

@@ -18,6 +18,7 @@ pub const parse = @import("parse.sig");
 pub const ir = @import("ir.sig");
 pub const gen = @import("gen.sig");
 pub const container = @import("container.sig");
+pub const live = @import("live.sig");
 
 pub const Include = pp.Include;
 pub const Define = pp.Define;
@@ -80,11 +81,14 @@ pub const Compiler = struct {
     locs: [gen.MAX_LOCS]gen.Loc,
     binds: [ast.MAX_SYMS]gen.Bind,
     vflags: [gen.MAX_VREGS]u8,
-    reads: [gen.MAX_VREGS]u32,
+    reads: [gen.MAX_VREGS]u8,
     intervals: [gen.MAX_VREGS]ir.Interval,
     vmap: [gen.MAX_VREGS]u32,
     sorted: [gen.MAX_VREGS]u32,
     loops: [4096][2]u32,
+    live_arena: [16 << 20]u8,
+    live_match: [ir.MAX_INSTS]u32,
+    live_dead: [ir.MAX_INSTS]bool,
     code: [CODE_WORDS]u32,
     blob: [BLOB]u8,
     chunk: [BLOB]u8,
@@ -120,7 +124,11 @@ pub const Compiler = struct {
         c.g = .{ .a = &c.ast, .p = &c.prog, .log = &c.log, .toks = c.parser.t, .target = target, .flags = o.flags, .srcs = &c.srcs, .locs = &c.locs, .binds = &c.binds, .vflags = &c.vflags };
         if (!c.g.run(o.entry)) return c.failed();
         if (o.flags & flags.WARNINGS_ARE_ERRORS != 0 and c.log.len > 0) return c.failed();
-        ir.deadCode(&c.prog, &c.reads);
+        ir.deadComponents(&c.prog, &c.reads);
+        if (c.prog.nvregs > 0) {
+            var lv = live.Live{ .p = &c.prog, .arena = &c.live_arena, .n = c.prog.nvregs, .match = &c.live_match, .dead = &c.live_dead };
+            if (lv.run()) ir.deadComponents(&c.prog, &c.reads);
+        }
         var ntemps = ir.allocate(&c.prog, &c.intervals, &c.vmap, &c.loops, &c.sorted);
         if (c.prog.nvregs == 0) ntemps = 0;
         const n = c.assemble(target, o.flags, ntemps) orelse return c.failed();
@@ -155,6 +163,9 @@ pub const Compiler = struct {
         c.reflection(t, fl);
         c.refl.write(&w, t.major >= 5);
         const rdef_end = w.n;
+        // (elements in register order: a packed one after its register's first)
+        sortElems(g.ins[0..g.nins]);
+        if (t.stage != .pixel) sortElems(g.outs[0..g.nouts]);
         var isg: [64]container.SigElem = undefined;
         for (g.ins[0..g.nins], 0..) |e, k| isg[k] = .{ .name = e.name, .index = e.index, .sys = e.sys, .comp = e.comp, .reg = e.reg, .mask = e.mask, .rw = e.used };
         const isgn_at = w.n;
@@ -206,12 +217,7 @@ pub const Compiler = struct {
         for (c.prog.insts[0..c.prog.n]) |*i| {
             for (i.ops[0..i.n], 0..) |op, k| {
                 if (k < i.ndst) continue;
-                var comps: u8 = 0;
-                if (op.comps == 4) {
-                    if (op.mode == .select1) comps = @as(u8, 1) << op.swz[0] else for (op.swz) |s| {
-                        comps |= @as(u8, 1) << s;
-                    }
-                } else comps = 1;
+                const comps: u8 = ir.readMask(i, k);
                 switch (op.reg) {
                     .input => {
                         const r = if (op.dims == 2) op.idx[1] else op.idx[0];
@@ -473,7 +479,7 @@ pub const Compiler = struct {
                 }
             } else {
                 const sy = c.ast.syms[b.sym];
-                for (0..sy.nparams) |k| c.addVar(sy.cbuf + @as(u32, @intCast(k)), bi);
+                for (0..sy.nparams) |k| c.addVar(c.ast.cbMember(b.sym, @intCast(k)), bi);
             }
             r.bufs[r.nbufs] = .{ .name = if (b.sym == 0) "$Globals" else c.ast.symName(b.sym), .first = first, .nvars = r.nvars - first, .size = b.size, .kind = if (b.tbuffer) 1 else 0 };
             r.nbufs += 1;
@@ -503,10 +509,7 @@ pub const Compiler = struct {
                     if (row * 16 >= off / 16 * 16 and row * 16 < off + size) return true;
                     continue;
                 }
-                var comps: u8 = 0;
-                if (op.mode == .select1) comps = @as(u8, 1) << op.swz[0] else for (op.swz) |s| {
-                    comps |= @as(u8, 1) << s;
-                }
+                const comps: u8 = ir.readMask(i, k);
                 for (0..4) |cc| {
                     if (comps & (@as(u8, 1) << @intCast(cc)) == 0) continue;
                     const byte = row * 16 + @as(u32, @intCast(cc)) * 4;
@@ -609,6 +612,15 @@ const type_names = [_][]const u8{
     "float3x3", "float3x4", "float4x1", "float4x2", "float4x3", "float4x4", "half",     "half2",    "half3",    "half4",
     "int2x2",   "int3x3",   "int4x4",   "double",   "min16float", "min16int", "min16uint",
 };
+
+fn sortElems(e: []gen.Elem) void {
+    std.sort.insertion(gen.Elem, e, {}, struct {
+        fn lt(_: void, a: gen.Elem, b: gen.Elem) bool {
+            if (a.reg != b.reg) return a.reg < b.reg;
+            return @ctz(a.mask) < @ctz(b.mask);
+        }
+    }.lt);
+}
 
 fn gen_intrin_resDim(d: ast.TexDim) u32 {
     return @import("intrin.sig").resDim(d);

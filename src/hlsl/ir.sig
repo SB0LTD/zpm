@@ -287,6 +287,92 @@ pub fn deadCode(p: *Program, reads: []u32) void {
     }
 }
 
+/// Ops computed component by component: a source's component c feeds
+/// the destination's component c.
+pub fn componentwise(op: Op) bool {
+    return switch (op) {
+        .mov, .movc, .add, .mul, .div, .mad, .min, .max, .frc, .round_ne, .round_ni, .round_pi, .round_z, .exp, .log, .rsq, .sqrt, .rcp, .eq, .ne, .lt, .ge, .iadd, .imul, .umul, .imad, .umad, .imax, .imin, .umax, .umin, .ineg, .not, .@"and", .@"or", .xor, .ishl, .ishr, .ushr, .ieq, .ine, .ilt, .ige, .ult, .uge, .ftoi, .ftou, .itof, .utof, .udiv, .sincos, .deriv_rtx, .deriv_rty, .deriv_rtx_coarse, .deriv_rtx_fine, .deriv_rty_coarse, .deriv_rty_fine, .f32tof16, .f16tof32, .bfrev, .countbits, .firstbit_hi, .firstbit_lo, .firstbit_shi, .ubfe, .ibfe, .bfi => true,
+        else => false,
+    };
+}
+
+/// The components of source operand `k` an instruction reads (of the
+/// register, after its swizzle).
+pub fn readMask(i: *const Inst, k: usize) u4 {
+    const o = i.ops[k];
+    if (o.comps != 4) return 1;
+    if (o.mode == .select1) return @as(u4, 1) << o.swz[0];
+    if (o.mode == .mask) return o.mask;
+    var m: u4 = 0;
+    if (componentwise(i.op)) {
+        var dm: u4 = 0;
+        for (i.ops[0..i.ndst]) |d| {
+            if (d.reg != .null and d.comps == 4) dm |= d.mask;
+        }
+        for (0..4) |c| {
+            if (dm & (@as(u4, 1) << @intCast(c)) != 0) m |= @as(u4, 1) << o.swz[c];
+        }
+        return m;
+    }
+    // (dp2 and dp3 read their first components only)
+    const n: usize = switch (i.op) {
+        .dp2 => 2,
+        .dp3 => 3,
+        else => 4,
+    };
+    for (o.swz[0..n]) |sw| m |= @as(u4, 1) << sw;
+    return m;
+}
+
+/// Drops the components of temps nobody reads from the instructions that
+/// write them (and instructions left writing nothing), until none.
+pub fn deadComponents(p: *Program, reads: []u8) void {
+    while (true) {
+        @memset(reads[0..p.nvregs], 0);
+        for (p.insts[0..p.n]) |*i| {
+            for (i.ops[0..i.n], 0..) |o, k| {
+                if (k >= i.ndst and o.reg == .temp) reads[o.idx[0]] |= readMask(i, k);
+                if (o.rel.on and o.rel.reg == .temp) reads[o.rel.idx] |= @as(u8, 1) << o.rel.comp;
+            }
+        }
+        var changed = false;
+        var w: u32 = 0;
+        for (p.insts[0..p.n]) |ins| {
+            var i = ins;
+            var only_temps = !sideEffect(i.op) and i.ndst > 0;
+            if (only_temps) {
+                for (i.ops[0..i.ndst]) |d| {
+                    if (d.reg != .temp and d.reg != .null) only_temps = false;
+                }
+            }
+            if (only_temps) {
+                var left: u4 = 0;
+                for (i.ops[0..i.ndst]) |*d| {
+                    if (d.reg != .temp) continue;
+                    const m: u4 = d.mask & @as(u4, @truncate(reads[d.idx[0]]));
+                    if (m != d.mask) {
+                        d.mask = m;
+                        changed = true;
+                    }
+                    left |= m;
+                }
+                if (left == 0) {
+                    changed = true;
+                    continue;
+                }
+                // (a destination left empty: null, as fxc writes it)
+                for (i.ops[0..i.ndst]) |*d| {
+                    if (d.reg == .temp and d.mask == 0) d.* = .{ .reg = .null, .comps = 0, .dims = 0 };
+                }
+            }
+            p.insts[w] = i;
+            w += 1;
+        }
+        p.n = w;
+        if (!changed) break;
+    }
+}
+
 pub const Interval = struct { start: u32, end: u32, first_read: bool, used: bool };
 
 /// Gives each virtual temp a real one; the count of real temps.
