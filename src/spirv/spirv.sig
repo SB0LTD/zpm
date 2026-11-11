@@ -497,6 +497,10 @@ pub const Options = struct {
     /// The device's subgroup width (Caps.subgroup): the subgroup ops take
     /// 32 or fewer.
     subgroup: u32 = 32,
+    /// compute: the caller's texture unit, for sampled images (its slots'
+    /// bindings Info.tex_first.., their descriptor words in binding
+    /// Info.tex_uni); null: none (a sampled image is unsupported)
+    tex: ?*const TexOps = null,
 };
 
 pub const BindKind = enum(u8) { storage, uniform, storage_image };
@@ -512,6 +516,14 @@ pub const Info = struct {
     /// The storage images among the bindings (bit b: binding b is one).
     image_bits: u32 = 0,
     n_images: u8 = 0,
+    /// sampled images (compute, Options.tex): the texture slots used, the
+    /// KIR binding of their descriptor words, the first of their images'
+    /// (tex_room of them, after the buffers)
+    n_tex: u8 = 0,
+    tex: [MAX_TEX]TexSlot = undefined,
+    tex_uni: u8 = 0,
+    tex_first: u8 = 0,
+    tex_room: u8 = 0,
 
     /// The parameter words a dispatch fills: two per binding, the push
     /// constants, then four per storage image.
@@ -609,6 +621,11 @@ pub const ImageRef = struct {
     kind: SampleKind,
     /// a depth comparison's reference (OpImageSampleDref*)
     compare: ?Arg = null,
+    /// compute: the KIR bindings of the slot's image and of the
+    /// descriptor words (Info.tex_first + slot, Info.tex_uni); 0xff in a
+    /// graphics stage (the caller's own)
+    bind: u8 = 0xff,
+    uni: u8 = 0xff,
 };
 
 /// A sample's level of detail: none (the base level), given, or from the
@@ -772,6 +789,8 @@ pub const Gen = struct {
     // graphics stages (emitStage)
     io: ?*StageIO = null,
     res: ?*Resources = null,
+    /// a compute shader's texture slots (g.res there)
+    cres: Resources = .{},
     discard: V = .none,
     wrap_entry: bool = false,
     outs: [32]Out = undefined,
@@ -1454,6 +1473,26 @@ pub const Gen = struct {
             }
             d.kbind = b;
         }
+        // sampled images and samplers (compute): their descriptor words'
+        // binding, then a binding for each image variable's slot
+        var n_sampled: u32 = 0;
+        id = 0;
+        while (id < g.bound) : (id += 1) {
+            const d = g.s.defs[id];
+            if (d.op != Op.variable or d.kbind == NONE or g.inst(d.at)[3] != StorageClass.uniform_constant) continue;
+            const t = g.elemOf(g.inst(d.at)[1], 0);
+            if (g.tyOp(t) == Op.type_image and !g.isStorageImage(t)) n_sampled += 1;
+        }
+        if (n_sampled != 0) {
+            if (g.opts.tex == null) return g.unsupported("spirv: sampled images in a compute shader without a texture unit", .{});
+            g.info.tex_uni = k.binding();
+            g.info.tex_first = k.bindings;
+            // (an image may be read with a sampler and without: two slots)
+            g.info.tex_room = @intCast(@min(2 * n_sampled, MAX_TEX));
+            for (0..g.info.tex_room) |_| _ = k.binding();
+            g.res = &g.cres;
+            g.cres = .{};
+        }
         // the prologue: binding views, built-ins, Private and Workgroup variables
         for (0..g.info.n_bindings) |b| {
             g.view[b] = r(k.param(.u32, @intCast(2 * b)));
@@ -1495,7 +1534,6 @@ pub const Gen = struct {
                 },
                 StorageClass.uniform_constant => {
                     if (d.kbind == NONE) continue;
-                    if (!g.isStorageImage(t)) return g.unsupported("spirv: sampled images and samplers in a compute shader", .{});
                     g.s.vals[id] = .{ .ptr = .{ .space = .handle, .slot = id, .ty = t } };
                 },
                 StorageClass.output => {
@@ -1507,6 +1545,11 @@ pub const Gen = struct {
             }
         }
         try g.call(g.entry, &.{}, true);
+        if (n_sampled != 0) {
+            if (g.cres.n_tex > g.info.tex_room) return g.unsupported("spirv: {d} image and sampler pairs, {d} images", .{ g.cres.n_tex, g.info.tex_room });
+            g.info.n_tex = g.cres.n_tex;
+            @memcpy(g.info.tex[0..g.cres.n_tex], g.cres.tex[0..g.cres.n_tex]);
+        }
         k.finish() catch |e| {
             g.say("spirv: the KIR does not verify ({s})", .{@errorName(e)});
             return e;
@@ -3022,7 +3065,13 @@ pub const Gen = struct {
             res.n_tex += 1;
             break :blk res.n_tex - 1;
         };
-        return .{ .slot = n, .dim = @enumFromInt(@as(u8, @intCast(@min(ti[3], 6)))), .arrayed = ti[5] != 0, .depth = ti[4] == 1, .kind = kind };
+        var ref = ImageRef{ .slot = n, .dim = @enumFromInt(@as(u8, @intCast(@min(ti[3], 6)))), .arrayed = ti[5] != 0, .depth = ti[4] == 1, .kind = kind };
+        if (g.io == null) {
+            if (n >= g.info.tex_room) return g.unsupported("spirv: more image and sampler pairs than images", .{});
+            ref.bind = g.info.tex_first + @as(u8, @intCast(n));
+            ref.uni = g.info.tex_uni;
+        }
+        return ref;
     }
 
     /// The coordinates a dimension has (before an array's layer).
@@ -3035,10 +3084,17 @@ pub const Gen = struct {
     }
 
     fn imageOp(g: *Gen, op: u16, in: []const u32) Error!void {
-        const io = g.io orelse return g.storageImageOp(op, in);
+        // (compute: a storage image's ops, or a sampled one's through
+        // Options.tex)
+        if (g.io == null) {
+            const h = try g.get(in[3]);
+            if (h.len == 0 or h[0] != .imm or h[0].imm >= g.bound) return g.bad("spirv: an image that is not a variable's", .{});
+            const iv = g.s.defs[h[0].imm];
+            if (iv.op != Op.variable or g.isStorageImage(g.elemOf(g.inst(iv.at)[1], 0))) return g.storageImageOp(op, in);
+        }
         const k = g.k;
         var img = try g.imageRef(try g.get(in[3]));
-        const tex = io.tex orelse return g.unsupported("spirv: images without a texture unit", .{});
+        const tex = (if (g.io) |io| io.tex else g.opts.tex) orelse return g.unsupported("spirv: images without a texture unit", .{});
         const n = g.comps(in[1]);
         var out: [4]Arg = .{ u(0), u(0), u(0), u(0) };
         switch (op) {
@@ -3103,7 +3159,7 @@ pub const Gen = struct {
                     }
                     if (mask & ~@as(u32, 0xf) != 0) return g.unsupported("spirv: image operands 0x{x}", .{mask});
                 }
-                if (implicit and img.kind == .float) {
+                if (implicit and img.kind == .float and g.io != null) {
                     // a fragment shader's: from the coordinates' derivatives
                     const nc = coordsOf(img.dim);
                     var gr: Lod = .{ .grad = .{ .dx = .{ f(0), f(0), f(0) }, .dy = .{ f(0), f(0), f(0) }, .bias = bias } };

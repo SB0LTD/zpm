@@ -283,6 +283,7 @@ test "vk: no GPU, no physical device" {
 const Shaders = struct {
     const axpy align(4) = @embedFile("data/vk/axpy.spv").*;
     const reduce align(4) = @embedFile("data/vk/reduce.spv").*;
+    const ctex align(4) = @embedFile("data/vk/ctex.spv").*;
 };
 
 /// A device and the entry points a compute test uses.
@@ -620,6 +621,68 @@ test "vk: naga's reduction with push constants, dynamic offsets and an indirect 
 
 test "vk: naga's reduction with push constants, dynamic offsets and an indirect dispatch on the emulated RTX" {
     try reduceThroughVulkan(&openRtx);
+}
+
+// ── Sampled textures in a compute shader ──
+
+fn computeTextures(open: *const fn () ?icd.Gpu) !void {
+    use(open);
+    var v = try Vk.open();
+    defer v.close();
+    var g = try G.init(&v);
+    const tex = try g.newImage(RGBA8, 4, 4, 1, 1, 0x6);
+    const itex = try g.newImage(41, 4, 4, 1, 1, 0x6); // R8G8B8A8_UINT (widened)
+    const tview = try g.newView(tex.img, RGBA8, 1, 1, 0, 1);
+    const iview = try g.newView(itex.img, 41, 1, 1, 0, 1);
+    const staging = try v.buffer(256, 2);
+    const sw: [*]u32 = @ptrCast(@alignCast(staging.ptr.?));
+    for (0..16) |i| sw[i] = @as(u32, @intCast(i * 16)) | 0x40 << 8 | @as(u32, @intCast(255 - i)) << 16 | 0xff << 24;
+    for (0..16) |i| sw[16 + i] = @as(u32, @intCast(i)) | @as(u32, @intCast(200 + i)) << 24;
+    const sampler_ci = abi.SamplerCreateInfo{ .sType = ST.sampler_create_info, .pNext = null, .flags = 0, .magFilter = 0, .minFilter = 0, .mipmapMode = 0, .addressModeU = 2, .addressModeV = 2, .addressModeW = 2, .mipLodBias = 0, .anisotropyEnable = 0, .maxAnisotropy = 1, .compareEnable = 0, .compareOp = 0, .minLod = 0, .maxLod = 32, .borderColor = 0, .unnormalizedCoordinates = 0 };
+    var sampler: H = 0;
+    try testing.expectEqual(R.success, g.f("vkCreateSampler", *const fn (Ptr, *const abi.SamplerCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &sampler_ci, null, &sampler));
+    const out = try v.buffer(48 * 16, 2);
+    const sl = try v.setLayout(&.{ SAMPLED, SAMPLER, STORAGE, SAMPLED });
+    const plci = abi.PipelineLayoutCreateInfo{ .sType = ST.pipeline_layout_create_info, .pNext = null, .flags = 0, .setLayoutCount = 1, .pSetLayouts = @ptrCast(&sl), .pushConstantRangeCount = 0, .pPushConstantRanges = null };
+    var pl: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreatePipelineLayout", *const fn (Ptr, *const abi.PipelineLayoutCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &plci, null, &pl));
+    const pool = try g.newPool();
+    const set = try g.newSet(pool, sl);
+    g.writeImage(set, 0, SAMPLED, tview, 0);
+    g.writeImage(set, 1, SAMPLER, 0, sampler);
+    v.write(set, 2, STORAGE, out.buf, 0, 48 * 16);
+    g.writeImage(set, 3, SAMPLED, iview, 0);
+    const pipe = try v.pipeline(try v.shader(&Shaders.ctex), pl);
+    try g.begin();
+    g.fromBuffer(staging.buf, 0, tex.img, 4, 4, 0, 0);
+    g.fromBuffer(staging.buf, 64, itex.img, 4, 4, 0, 0);
+    g.f("vkCmdBindPipeline", *const fn (Ptr, u32, H) callconv(.c) void)(g.cb, 1, pipe);
+    g.f("vkCmdBindDescriptorSets", *const fn (Ptr, u32, H, u32, u32, [*]const H, u32, ?[*]const u32) callconv(.c) void)(g.cb, 1, pl, 0, 1, @ptrCast(&set), 0, null);
+    g.f("vkCmdDispatch", *const fn (Ptr, u32, u32, u32) callconv(.c) void)(g.cb, 1, 1, 1);
+    try g.run();
+    const o: [*]const f32 = @ptrCast(@alignCast(out.ptr.?));
+    for (0..16) |i| {
+        var want: [12]f32 = undefined;
+        for (0..4) |c| {
+            const b: f32 = @floatFromInt((sw[i] >> @intCast(8 * c)) & 0xff);
+            want[c] = b / 255.0;
+            want[4 + c] = b / 255.0;
+        }
+        want[8..12].* = .{ 4, 4, @floatFromInt(i), @floatFromInt(200 + i) };
+        for (want, 0..) |w, j| {
+            testing.expectApproxEqAbs(w, o[12 * i + j], 1e-6) catch |e| {
+                std.debug.print("compute textures: invocation {d} value {d} = {d}, want {d}\n", .{ i, j, o[12 * i + j], w });
+                return e;
+            };
+        }
+    }
+}
+
+test "vk: sampled textures in a compute shader (textureSampleLevel, textureLoad, textureDimensions; a widened uint) on the emulated RTX" {
+    try computeTextures(&openRtx);
+}
+test "vk: sampled textures in a compute shader on KIR's interpreter" {
+    try computeTextures(&openInterp);
 }
 
 // ── Queries ──

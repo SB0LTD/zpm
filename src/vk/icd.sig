@@ -184,6 +184,9 @@ const MAX_CACHE_ENTRIES = 1024;
 const DRIVER_CACHE: u32 = MAX_CACHES;
 /// Dispatches one gpu.Device run takes from a submission.
 const MAX_RUN = 256;
+/// A compute kernel's KIR bindings: its buffers, then (sampled images)
+/// the descriptor words' and an image's a slot.
+const MAX_KBINDINGS = spirv.MAX_BINDINGS + 1 + spirv.MAX_TEX;
 const MAX_RUN_PARAMS = 2 * spirv.MAX_BINDINGS + MAX_PUSH_BYTES / 4 + 4 * spirv.MAX_BINDINGS + 8;
 const STAGING_BYTES = 1 << 20;
 const GROUP = 64;
@@ -413,7 +416,7 @@ const T = struct {
     var uf_parts: [3]kir.V = undefined;
     // running
     var ds: [MAX_RUN]gpu.Dispatch = undefined;
-    var ds_bufs: [MAX_RUN][spirv.MAX_BINDINGS]gpu.Buffer = undefined;
+    var ds_bufs: [MAX_RUN][MAX_KBINDINGS]gpu.Buffer = undefined;
     var ds_params: [MAX_RUN][MAX_RUN_PARAMS]u32 = undefined;
     var n_ds: u32 = 0;
     // graphics
@@ -2003,7 +2006,7 @@ fn compilePipeline(di: u32, ci: *const abi.ComputePipelineCreateInfo, cache: u32
     const sh = T.shaders[si];
     if (!sh.live) return null;
     var spec_entries: [64]spirv.SpecEntry = undefined;
-    var opts = spirv.Options{ .robust = T.devices[di].robust, .subgroup = theGpu().?.dev.caps.subgroup };
+    var opts = spirv.Options{ .robust = T.devices[di].robust, .subgroup = theGpu().?.dev.caps.subgroup, .tex = &compute_tex_ops };
     if (stage.pSpecializationInfo) |sp| {
         const n = @min(sp[0].mapEntryCount, spec_entries.len);
         for (0..n) |j| {
@@ -2442,7 +2445,7 @@ const Exec = struct {
         if (e.pipe == NONE) return;
         const p = &T.pipelines[e.pipe];
         if (!p.live) return;
-        var bufs: [spirv.MAX_BINDINGS]gpu.Buffer = undefined;
+        var bufs: [MAX_KBINDINGS]gpu.Buffer = undefined;
         var params: [MAX_RUN_PARAMS]u32 = [_]u32{0} ** MAX_RUN_PARAMS;
         const nb = p.info.n_bindings;
         for (0..nb) |i| {
@@ -2486,10 +2489,40 @@ const Exec = struct {
             params[2 * i + 1] = @intCast(@min(range, 0xffff_ffff));
             if (p.writes >> @intCast(i) & 1 != 0) e.markDirty(pl.mem);
         }
+        // sampled images: each slot's image memory bound, its descriptor
+        // (texture.sig's) in staging words bound after the buffers
+        var nk: usize = nb;
+        if (p.info.tex_room != 0) {
+            const n_words: u32 = W_TEX + @as(u32, p.info.tex_room) * texture.DESC_WORDS;
+            const at = e.stage(4 * n_words) orelse {
+                e.err = R.error_out_of_device_memory;
+                return;
+            };
+            const st = e.dev().staging;
+            const wds: []u32 = @alignCast(std.mem.bytesAsSlice(u32, st.cpu[@intCast(at)..][0 .. 4 * n_words]));
+            @memset(wds, 0);
+            bufs[p.info.tex_uni] = .{ .gpu = st.gpu + at, .bytes = 4 * n_words, .handle = st.handle, .kind = st.kind };
+            for (0..p.info.tex_room) |j| bufs[p.info.tex_first + j] = e.dev().dummy;
+            for (p.info.tex[0..p.info.n_tex], 0..) |ts, j| {
+                const x = e.cdesc(ts.image.set, ts.image.binding) orelse continue;
+                const v = viewOf(x.view) orelse continue;
+                var smp: ?*const Sampler = null;
+                if (ts.has_sampler) {
+                    if (e.cdesc(ts.sampler.set, ts.sampler.binding)) |sx| {
+                        if (sx.sampler != NONE and sx.sampler < MAX_SAMPLERS and T.samplers[sx.sampler].live) smp = &T.samplers[sx.sampler];
+                    }
+                }
+                var timg = texImage(v);
+                texture.descriptor(texState(&timg, v, smp), wds[W_TEX + j * texture.DESC_WORDS ..][0..texture.DESC_WORDS]);
+                bufs[p.info.tex_first + j] = timg.buf;
+            }
+            e.g.dev.toDevice(st, at, 4 * n_words);
+            nk = @as(usize, p.info.tex_first) + p.info.tex_room;
+        }
         const pw = (p.info.push_bytes + 3) / 4;
         @memcpy(params[2 * nb ..][0..pw], e.push[0..pw]);
         const np = @max(p.info.paramWords(), p.param_words);
-        e.kernel(&p.prog, groups, bufs[0..nb], params[0..np]);
+        e.kernel(&p.prog, groups, bufs[0..nk], params[0..np]);
         if (from != null) T.ds[T.n_ds - 1].indirect = from;
     }
 
@@ -2917,6 +2950,16 @@ const Exec = struct {
 
     /// The descriptor (set, binding) names in the bound graphics sets, and
     /// its dynamic offset.
+    /// A descriptor of the compute bind point's sets.
+    fn cdesc(e: *Exec, set: u32, binding: u32) ?Desc {
+        if (set >= MAX_SETS_PER_LAYOUT) return null;
+        const si = e.sets[set];
+        if (si == NONE or !T.sets[si].live) return null;
+        const s = &T.sets[si];
+        const lb = layoutBinding(&T.set_layouts[s.layout], binding) orelse return null;
+        return T.descs[s.first + lb.first];
+    }
+
     fn gdesc(e: *Exec, set: u32, binding: u32) ?struct { d: Desc, dyn: u32, dtype: u32 } {
         if (set >= MAX_SETS_PER_LAYOUT) return null;
         const si = e.gfx.sets[set];
@@ -4810,13 +4853,20 @@ fn emitFragment(ctx: ?*const anyopaque, k: *kir.Kernel, fio: *raster.FragmentIO)
 
 const TexCtx = struct { tex: u8, uni: u8 };
 
+/// Compute kernels' texture unit (each ImageRef names its bindings).
+const compute_tex_ctx = TexCtx{ .tex = 0, .uni = 0 };
+const compute_tex_ops = spirv.TexOps{ .ctx = &compute_tex_ctx, .sample = &texSample, .fetch = &texFetch, .size = &texSize, .levels = &texLevels };
+
 fn texOps(tc: *const TexCtx) spirv.TexOps {
     return .{ .ctx = tc, .sample = &texSample, .fetch = &texFetch, .size = &texSize, .levels = &texLevels };
 }
 
 fn texSlot(ctx: ?*const anyopaque, img: spirv.ImageRef) texture.Slot {
     const tc: *const TexCtx = @ptrCast(@alignCast(ctx.?));
-    return .{ .b = tc.tex + @as(u8, @intCast(img.slot)), .uni = tc.uni, .word = W_TEX + img.slot * texture.DESC_WORDS, .volume = img.dim == .d3, .cube = img.dim == .cube, .shadow = img.compare };
+    // (a compute kernel's: the bindings the front end gave it)
+    const b = if (img.bind != 0xff) img.bind else tc.tex + @as(u8, @intCast(img.slot));
+    const uni = if (img.uni != 0xff) img.uni else tc.uni;
+    return .{ .b = b, .uni = uni, .word = W_TEX + img.slot * texture.DESC_WORDS, .volume = img.dim == .d3, .cube = img.dim == .cube, .shadow = img.compare };
 }
 
 fn texKind(img: spirv.ImageRef) texture.Kind {
