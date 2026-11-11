@@ -687,6 +687,10 @@ fn features() abi.PhysicalDeviceFeatures {
     // (a fragment shader's storage buffers and images: the front end's
     // emitStage binds them as the draw's buffers)
     f.fragmentStoresAndAtomics = 1;
+    // (texture.sig samples a cube array's face + 6 layer; anisotropy reads
+    // as the linear filter, its quality the implementation's)
+    f.imageCubeArray = 1;
+    f.samplerAnisotropy = 1;
     return f;
 }
 
@@ -4125,7 +4129,7 @@ fn gfxLimits(l: *abi.PhysicalDeviceLimits) void {
     l.maxDrawIndexedIndexValue = 0xffff_ffff;
     l.maxDrawIndirectCount = 1 << 16;
     l.maxSamplerLodBias = 16;
-    l.maxSamplerAnisotropy = 1;
+    l.maxSamplerAnisotropy = 16;
     l.maxViewports = 1;
     l.maxViewportDimensions = .{ MAX_IMAGE_2D, MAX_IMAGE_2D };
     l.viewportBoundsRange = .{ -2 * @as(f32, MAX_IMAGE_2D), 2 * @as(f32, MAX_IMAGE_2D) };

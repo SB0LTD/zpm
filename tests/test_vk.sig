@@ -284,6 +284,7 @@ const Shaders = struct {
     const axpy align(4) = @embedFile("data/vk/axpy.spv").*;
     const reduce align(4) = @embedFile("data/vk/reduce.spv").*;
     const ctex align(4) = @embedFile("data/vk/ctex.spv").*;
+    const cube align(4) = @embedFile("data/vk/cube.spv").*;
 };
 
 /// A device and the entry points a compute test uses.
@@ -683,6 +684,78 @@ test "vk: sampled textures in a compute shader (textureSampleLevel, textureLoad,
 }
 test "vk: sampled textures in a compute shader on KIR's interpreter" {
     try computeTextures(&openInterp);
+}
+
+/// A cube array (two cubes, each face one colour) sampled at each face's
+/// centre, and an anisotropic sampler reading as the linear one.
+fn cubeArrayAniso(open: *const fn () ?icd.Gpu) !void {
+    use(open);
+    var v = try Vk.open();
+    defer v.close();
+    var g = try G.init(&v);
+    const cubes = try g.newImage(RGBA8, 2, 2, 1, 12, 0x6);
+    const cview = try g.newView(cubes.img, RGBA8, 6, 1, 0, 12); // CUBE_ARRAY
+    const tex = try g.newImage(RGBA8, 4, 4, 1, 1, 0x6);
+    const tview = try g.newView(tex.img, RGBA8, 1, 1, 0, 1);
+    const staging = try v.buffer(1024, 2);
+    const sw: [*]u32 = @ptrCast(@alignCast(staging.ptr.?));
+    for (0..12) |f| {
+        for (0..4) |t| sw[f * 4 + t] = @as(u32, @intCast(20 * f + 5)) | @as(u32, @intCast(f % 6)) << 8 | @as(u32, @intCast(f / 6 * 200)) << 16 | 0xff << 24;
+    }
+    for (0..16) |i| sw[48 + i] = @as(u32, @intCast(i * 15)) | @as(u32, @intCast(255 - i * 10)) << 8 | 0x80 << 16 | 0xff << 24;
+    const create_sampler = g.f("vkCreateSampler", *const fn (Ptr, *const abi.SamplerCreateInfo, ?*const anyopaque, *H) callconv(.c) Res);
+    var sci = abi.SamplerCreateInfo{ .sType = ST.sampler_create_info, .pNext = null, .flags = 0, .magFilter = 0, .minFilter = 0, .mipmapMode = 0, .addressModeU = 2, .addressModeV = 2, .addressModeW = 2, .mipLodBias = 0, .anisotropyEnable = 0, .maxAnisotropy = 1, .compareEnable = 0, .compareOp = 0, .minLod = 0, .maxLod = 32, .borderColor = 0, .unnormalizedCoordinates = 0 };
+    var nearest: H = 0;
+    try testing.expectEqual(R.success, create_sampler(v.dev, &sci, null, &nearest));
+    sci.magFilter = 1;
+    sci.minFilter = 1;
+    var linear: H = 0;
+    try testing.expectEqual(R.success, create_sampler(v.dev, &sci, null, &linear));
+    sci.anisotropyEnable = 1;
+    sci.maxAnisotropy = 16;
+    var aniso: H = 0;
+    try testing.expectEqual(R.success, create_sampler(v.dev, &sci, null, &aniso));
+    const out = try v.buffer(36 * 16, 2);
+    const sl = try v.setLayout(&.{ SAMPLED, SAMPLER, STORAGE, SAMPLED, SAMPLER, SAMPLER });
+    const plci = abi.PipelineLayoutCreateInfo{ .sType = ST.pipeline_layout_create_info, .pNext = null, .flags = 0, .setLayoutCount = 1, .pSetLayouts = @ptrCast(&sl), .pushConstantRangeCount = 0, .pPushConstantRanges = null };
+    var pl: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreatePipelineLayout", *const fn (Ptr, *const abi.PipelineLayoutCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &plci, null, &pl));
+    const pool = try g.newPool();
+    const set = try g.newSet(pool, sl);
+    g.writeImage(set, 0, SAMPLED, cview, 0);
+    g.writeImage(set, 1, SAMPLER, 0, nearest);
+    v.write(set, 2, STORAGE, out.buf, 0, 36 * 16);
+    g.writeImage(set, 3, SAMPLED, tview, 0);
+    g.writeImage(set, 4, SAMPLER, 0, aniso);
+    g.writeImage(set, 5, SAMPLER, 0, linear);
+    const pipe = try v.pipeline(try v.shader(&Shaders.cube), pl);
+    try g.begin();
+    for (0..12) |f| g.fromBuffer(staging.buf, f * 16, cubes.img, 2, 2, 0, @intCast(f));
+    g.fromBuffer(staging.buf, 192, tex.img, 4, 4, 0, 0);
+    g.f("vkCmdBindPipeline", *const fn (Ptr, u32, H) callconv(.c) void)(g.cb, 1, pipe);
+    g.f("vkCmdBindDescriptorSets", *const fn (Ptr, u32, H, u32, u32, [*]const H, u32, ?[*]const u32) callconv(.c) void)(g.cb, 1, pl, 0, 1, @ptrCast(&set), 0, null);
+    g.f("vkCmdDispatch", *const fn (Ptr, u32, u32, u32) callconv(.c) void)(g.cb, 1, 1, 1);
+    try g.run();
+    const o: [*]const f32 = @ptrCast(@alignCast(out.ptr.?));
+    for (0..12) |i| {
+        for (0..4) |c| {
+            const want = @as(f32, @floatFromInt((sw[i * 4] >> @intCast(8 * c)) & 0xff)) / 255.0;
+            testing.expectApproxEqAbs(want, o[4 * i + c], 1e-6) catch |e| {
+                std.debug.print("cube array: face {d} of cube {d}, channel {d} = {d}, want {d}" ++ "\n", .{ i % 6, i / 6, c, o[4 * i + c], want });
+                return e;
+            };
+            try testing.expectEqual(o[4 * (24 + i) + c], o[4 * (12 + i) + c]);
+        }
+    }
+    // (the linear reads mix texels: not all equal to one)
+    try testing.expect(o[4 * 24] != o[4 * 30]);
+}
+
+test "vk: a cube array sampled per face, an anisotropic sampler, in a compute shader on the emulated RTX" {
+    try cubeArrayAniso(&openRtx);
+}
+test "vk: a cube array and an anisotropic sampler on KIR's interpreter" {
+    try cubeArrayAniso(&openInterp);
 }
 
 // ── Queries ──
