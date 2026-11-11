@@ -36,6 +36,9 @@
 //!   enc_hevc.sig     HEVC's VPS, SPS and PPS, the encoder's HEVC setup
 //!   encode.sig       an encode context: buffers, packed headers, rate
 //!                    control, EndPicture's work, the coded buffer
+//!   convert.sig      a picture between its block-linear planes and a
+//!                    pitch-linear copy, for CPU readers (the CPU's;
+//!                    gpu_convert.sig: the RTX's, a KIR kernel)
 //!   driver.sig       the VA-API objects and calls over the node
 //!   driver_test.sig  the driver against the fake node's pretend decoder
 //!                    and encoder
@@ -56,6 +59,7 @@ pub const nvenc = @import("nvenc.sig");
 pub const enc_h264 = @import("enc_h264.sig");
 pub const enc_hevc = @import("enc_hevc.sig");
 pub const encode = @import("encode.sig");
+pub const convert = @import("convert.sig");
 pub const driver = @import("driver.sig");
 
 test {
@@ -77,6 +81,7 @@ test {
     _ = enc_h264;
     _ = enc_hevc;
     _ = encode;
+    _ = convert;
     _ = driver;
     _ = @import("driver_test.sig");
     _ = @import("hevc_stream_test.sig");

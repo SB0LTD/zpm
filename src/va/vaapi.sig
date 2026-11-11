@@ -56,7 +56,9 @@ pub const PROFILE_H264_MAIN: Profile = 6;
 pub const PROFILE_H264_HIGH: Profile = 7;
 pub const PROFILE_H264_CONSTRAINED_BASELINE: Profile = 13;
 pub const PROFILE_HEVC_MAIN: Profile = 17;
+pub const PROFILE_HEVC_MAIN10: Profile = 18;
 pub const PROFILE_VP9_PROFILE_0: Profile = 19;
+pub const PROFILE_VP9_PROFILE_2: Profile = 21;
 pub const PROFILE_AV1_PROFILE_0: Profile = 32;
 
 /// VAEntrypoint.
@@ -70,6 +72,8 @@ pub const ATTRIB_MAX_PICTURE_WIDTH: u32 = 18;
 pub const ATTRIB_MAX_PICTURE_HEIGHT: u32 = 19;
 pub const ATTRIB_NOT_SUPPORTED: u32 = 0x8000_0000;
 pub const RT_FORMAT_YUV420: u32 = 0x1;
+/// 4:2:0, 10 bits a sample in 16, at the top (P010)
+pub const RT_FORMAT_YUV420_10: u32 = 0x100;
 pub const DEC_SLICE_MODE_NORMAL: u32 = 0x1;
 
 pub const ConfigAttrib = extern struct {
@@ -159,6 +163,7 @@ pub const DrmState = extern struct {
 // ── Images ──────────────────────────────────────────────────────────────────
 
 pub const FOURCC_NV12: u32 = 0x3231_564e; // 'N','V','1','2'
+pub const FOURCC_P010: u32 = 0x3031_3050; // 'P','0','1','0'
 pub const LSB_FIRST: u32 = 1;
 
 pub const ImageFormat = extern struct {
@@ -194,6 +199,20 @@ pub const NV12_FORMAT = ImageFormat{
     .fourcc = FOURCC_NV12,
     .byte_order = LSB_FIRST,
     .bits_per_pixel = 12,
+    .depth = 0,
+    .red_mask = 0,
+    .green_mask = 0,
+    .blue_mask = 0,
+    .alpha_mask = 0,
+    .va_reserved = .{ 0, 0, 0, 0 },
+};
+
+/// P010 (24 bits a pixel: two bytes a sample, 4:2:0), as the Intel and
+/// Mesa drivers describe it.
+pub const P010_FORMAT = ImageFormat{
+    .fourcc = FOURCC_P010,
+    .byte_order = LSB_FIRST,
+    .bits_per_pixel = 24,
     .depth = 0,
     .red_mask = 0,
     .green_mask = 0,
@@ -616,6 +635,9 @@ pub const DriverContext = extern struct {
 pub const DRM_FORMAT_R8: u32 = 0x2020_3852; // 'R','8',' ',' '
 pub const DRM_FORMAT_GR88: u32 = 0x3838_5247; // 'G','R','8','8'
 pub const DRM_FORMAT_NV12: u32 = 0x3231_564e; // 'N','V','1','2'
+pub const DRM_FORMAT_P010: u32 = 0x3031_3050; // 'P','0','1','0'
+pub const DRM_FORMAT_R16: u32 = 0x2036_3152; // 'R','1','6',' '
+pub const DRM_FORMAT_GR1616: u32 = 0x3233_5247; // 'G','R','3','2'
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 // ── Layout checks (LP64) ────────────────────────────────────────────────────

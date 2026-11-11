@@ -323,7 +323,7 @@ pub const Fake = struct {
     lines: u32 = 0,
     dup_next: i32 = 200,
 
-    pub const FakeBuf = struct { va: u64 = 0, mem: []u8 = &.{} };
+    pub const FakeBuf = struct { va: u64 = 0, mem: []u8 = &.{}, vram: bool = false };
     pub const Submit = struct { handle: u32, offset: u32, dwords: u32 };
 
     /// The bytes behind GPU address `va` (`len` of them), or null.
@@ -366,7 +366,7 @@ pub const Fake = struct {
                 } else return -12;
                 const r = result(linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0));
                 if (r < 0) return -12;
-                k.bufs[h] = .{ .va = k.next_va, .mem = @as([*]u8, @ptrFromInt(@as(usize, @intCast(r))))[0..size] };
+                k.bufs[h] = .{ .va = k.next_va, .mem = @as([*]u8, @ptrFromInt(@as(usize, @intCast(r))))[0..size], .vram = rd32(a, 8) & G_VRAM != 0 };
                 k.next_va += size + UNIT;
                 k.live += 1;
                 wr32(a, 12, @intCast(h));

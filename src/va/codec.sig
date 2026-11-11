@@ -87,6 +87,15 @@ pub const SurfaceRef = struct {
     height: u32,
     pitch_luma: u32,
     pitch_chroma: u32,
+    /// bytes a sample: 1 for NV12, 2 for P010 (a 10-bit stream's target;
+    /// the pitches are in bytes either way, so the decoder's framestride is
+    /// the 2-byte layout's)
+    sample_bytes: u8 = 1,
+
+    /// The surface holds `bits`-bit samples (8 in NV12, 10 in P010).
+    pub fn holds(s: SurfaceRef, bits: u32) bool {
+        return if (bits == 8) s.sample_bytes == 1 else bits == 10 and s.sample_bytes == 2;
+    }
 };
 
 /// VA surface ids to surfaces (null: not one of this driver's).

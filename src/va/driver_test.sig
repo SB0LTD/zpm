@@ -23,6 +23,7 @@ const enc_h264 = @import("enc_h264.sig");
 const enc_hevc = @import("enc_hevc.sig");
 const encode = @import("encode.sig");
 const bits = @import("bits.sig");
+const convert = @import("convert.sig");
 const linux = std.os.linux;
 
 const testing = std.testing;
@@ -167,7 +168,22 @@ fn decodeOne(d: *TestDriver, ctx: u32, pic: *const va.PictureParameterBufferH264
     for (ids) |id| try testing.expectEqual(va.SUCCESS, d.destroyBuffer(id));
 }
 
+/// The decode's picture where the decoder wrote it (VRAM, block linear):
+/// nothing converted, no linear copy made.
 fn expectPicture(d: *TestDriver, surface: u32, n: u32) !void {
+    const s = &d.surfaces[surface - SURFACE_BASE];
+    const t = s.tiled.bytes();
+    const at_uv: usize = @intCast(s.layout.chroma_offset);
+    for (0..s.height) |y| {
+        for (0..s.width) |x| try testing.expectEqual(pattern(x, y, n), t[s.layout.luma.offsetOf(.blackwell8, x, y)]);
+    }
+    for (0..(s.height + 1) / 2) |y| {
+        for (0..s.width) |x| try testing.expectEqual(pattern(x + 1, y + 100, n), t[at_uv + s.layout.chroma.offsetOf(.blackwell16, x, y)]);
+    }
+}
+
+/// The surface's linear copy (a CPU reader's): the picture, pitch linear.
+fn expectLinear(d: *TestDriver, surface: u32, n: u32) !void {
     const s = &d.surfaces[surface - SURFACE_BASE];
     const lin = s.linear_layout;
     const out = s.linear.bytes();
@@ -184,17 +200,19 @@ test "driver: profiles, entrypoints, attributes, and Firefox's probe" {
     var d: TestDriver = .{ .node = .{ .sys = &k } };
     try testing.expectEqual(va.SUCCESS, d.init(3, .{}));
     defer d.terminate();
-    var profiles: [8]va.Profile = undefined;
+    var profiles: [12]va.Profile = undefined;
     var n: i32 = 0;
     try testing.expectEqual(va.SUCCESS, d.queryConfigProfiles(&profiles, &n));
-    try testing.expectEqualSlices(va.Profile, &.{ 13, 6, 7, 17, 14, 19, 32 }, profiles[0..@intCast(n)]);
+    // (HEVCMain10 18 and VP9Profile2 21: the 10-bit profiles vaapitest
+    // looks for)
+    try testing.expectEqualSlices(va.Profile, &.{ 13, 6, 7, 17, 18, 14, 19, 21, 32 }, profiles[0..@intCast(n)]);
     // Firefox's vaapitest: each profile's entrypoints, then a config of
     // (profile, VLD) with no attributes; H.264 and HEVC also encode
     for (profiles[0..@intCast(n)]) |p| {
         var eps: [4]va.Entrypoint = undefined;
         var m: i32 = 0;
         try testing.expectEqual(va.SUCCESS, d.queryConfigEntrypoints(p, &eps, &m));
-        if (p == 14 or p == va.PROFILE_VP9_PROFILE_0 or p == va.PROFILE_AV1_PROFILE_0) {
+        if (p == 14 or p == va.PROFILE_VP9_PROFILE_0 or p == va.PROFILE_AV1_PROFILE_0 or p == va.PROFILE_HEVC_MAIN10 or p == va.PROFILE_VP9_PROFILE_2) {
             try testing.expectEqualSlices(va.Entrypoint, &.{va.ENTRYPOINT_VLD}, eps[0..@intCast(m)]);
         } else {
             try testing.expectEqualSlices(va.Entrypoint, &.{ va.ENTRYPOINT_VLD, ve.ENTRYPOINT_ENC_SLICE }, eps[0..@intCast(m)]);
@@ -207,7 +225,7 @@ test "driver: profiles, entrypoints, attributes, and Firefox's probe" {
         var qn: i32 = 0;
         try testing.expectEqual(va.SUCCESS, d.queryConfigAttributes(cfg, &qp, &qe, &qa, &qn));
         try testing.expectEqual(p, qp);
-        try testing.expectEqual(va.RT_FORMAT_YUV420, qa[0].value);
+        try testing.expectEqual(driver.rtFormats(p), qa[0].value);
         try testing.expectEqual(va.SUCCESS, d.destroyConfig(cfg));
     }
     var eps: [4]va.Entrypoint = undefined;
@@ -239,8 +257,25 @@ test "driver: profiles, entrypoints, attributes, and Firefox's probe" {
     try testing.expectEqual(va.MEM_TYPE_VA | va.MEM_TYPE_DRM_PRIME_2, @as(u32, @bitCast(sa[5].value.value.i)));
     var formats: [2]va.ImageFormat = undefined;
     try testing.expectEqual(va.SUCCESS, d.queryImageFormats(&formats, &m));
-    try testing.expectEqual(@as(i32, 1), m);
+    try testing.expectEqual(@as(i32, 2), m);
     try testing.expectEqual(va.FOURCC_NV12, formats[0].fourcc);
+    try testing.expectEqual(va.FOURCC_P010, formats[1].fourcc);
+    try testing.expectEqual(@as(u32, 24), formats[1].bits_per_pixel);
+    // the 10-bit profiles: 8- and 10-bit targets, both pixel formats
+    // listed (FFmpeg takes the one its stream's format matches)
+    for ([_]va.Profile{ va.PROFILE_HEVC_MAIN10, va.PROFILE_VP9_PROFILE_2, va.PROFILE_AV1_PROFILE_0 }) |p| {
+        var c10: u32 = 0;
+        try testing.expectEqual(va.SUCCESS, d.createConfig(p, va.ENTRYPOINT_VLD, &.{.{ .type = va.ATTRIB_RT_FORMAT, .value = va.RT_FORMAT_YUV420_10 }}, &c10));
+        var s10: [7]va.SurfaceAttrib = undefined;
+        var n10: u32 = 7;
+        try testing.expectEqual(va.SUCCESS, d.querySurfaceAttributes(c10, &s10, &n10));
+        try testing.expectEqual(@as(u32, 7), n10);
+        try testing.expectEqual(va.FOURCC_NV12, @as(u32, @bitCast(s10[0].value.value.i)));
+        try testing.expectEqual(va.FOURCC_P010, @as(u32, @bitCast(s10[1].value.value.i)));
+        try testing.expectEqual(va.SUCCESS, d.destroyConfig(c10));
+    }
+    // (H.264 has no 10-bit here)
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, d.createConfig(va.PROFILE_H264_HIGH, va.ENTRYPOINT_VLD, &.{.{ .type = va.ATTRIB_RT_FORMAT, .value = va.RT_FORMAT_YUV420_10 }}, &cfg));
 }
 
 test "driver: init refuses another GPU and a GPU without a decoder" {
@@ -312,9 +347,13 @@ test "driver: Begin/Render/End/Sync through a fake node: the pushbuffer, the bit
         try testing.expectEqual(nvdec.shifted(s0.tiled.va + s0.layout.chroma_offset), seen.methods[(nvdec.SET_PICTURE_CHROMA_OFFSET0 >> 2) + slot]);
     }
     try testing.expectEqual(@as(u2, 0), seen.pic.dpb[0].bits.state);
-    // done: the picture, linear
+    // done: the picture where the decoder wrote it, in VRAM; no linear
+    // copy, nothing converted
     try testing.expectEqual(va.SUCCESS, d.syncSurface(surfaces[0], SYNC_NS));
     try expectPicture(&d, surfaces[0], 0);
+    try testing.expect(k.bufs[s0.tiled.handle].vram);
+    try testing.expectEqual(@as(u32, 0), s0.linear.handle);
+    try testing.expectEqual([3]u32{ 0, 0, 0 }, d.conversions);
     var status: u32 = 0;
     try testing.expectEqual(va.SUCCESS, d.querySurfaceStatus(surfaces[0], &status));
     try testing.expectEqual(va.SURFACE_READY, status);
@@ -346,52 +385,93 @@ test "driver: Begin/Render/End/Sync through a fake node: the pushbuffer, the bit
     try testing.expectEqual(va.SUCCESS, d.querySurfaceStatus(surfaces[1], &status));
     try testing.expectEqual(va.SURFACE_READY, status);
 
-    // ── export: one dma-buf, two layers (R8, GR88), linear ──
+    // ── export: the decode target itself, one dma-buf (VRAM), block
+    //    linear: Y (R8) and UV (GR88) as two objects of it (their
+    //    modifiers differ on Blackwell: sector layouts 2 and 3) ──
     var desc: va.DrmPrimeDescriptor = undefined;
     try testing.expectEqual(va.ERROR_UNSUPPORTED_MEMORY_TYPE, d.exportSurfaceHandle(surfaces[1], va.MEM_TYPE_DRM_PRIME, 0, &desc));
     try testing.expectEqual(va.SUCCESS, d.exportSurfaceHandle(surfaces[1], va.MEM_TYPE_DRM_PRIME_2, va.EXPORT_SURFACE_READ_ONLY | va.EXPORT_SURFACE_SEPARATE_LAYERS, &desc));
     try testing.expectEqual(va.FOURCC_NV12, desc.fourcc);
     try testing.expectEqual(@as(u32, 40), desc.width);
     try testing.expectEqual(@as(u32, 24), desc.height);
-    try testing.expectEqual(@as(u32, 1), desc.num_objects);
+    try testing.expectEqual(@as(u32, 2), desc.num_objects);
+    // (two fds of the one dma-buf, each layer's own: Firefox closes them)
     try testing.expectEqual(@as(i32, 201), desc.objects[0].fd);
-    try testing.expectEqual(@as(u32, @intCast(s1.linear.len)), desc.objects[0].size);
-    try testing.expectEqual(va.DRM_FORMAT_MOD_LINEAR, desc.objects[0].drm_format_modifier);
+    try testing.expectEqual(@as(i32, 202), desc.objects[1].fd);
+    try testing.expectEqual(@as(u32, 1), k.exports);
+    for (0..2) |o| try testing.expectEqual(@as(u32, @intCast(s1.tiled.len)), desc.objects[o].size);
+    try testing.expectEqual(@as(u64, 0x0300_0000_0420_6011), desc.objects[0].drm_format_modifier);
+    try testing.expectEqual(@as(u64, 0x0300_0000_0460_6011), desc.objects[1].drm_format_modifier);
     try testing.expectEqual(@as(u32, 2), desc.num_layers);
     try testing.expectEqual(va.DRM_FORMAT_R8, desc.layers[0].drm_format);
     try testing.expectEqual(@as(u32, 1), desc.layers[0].num_planes);
     try testing.expectEqual(@as(u32, 64), desc.layers[0].pitch[0]);
     try testing.expectEqual(@as(u32, 0), desc.layers[0].offset[0]);
+    try testing.expectEqual(@as(u32, 0), desc.layers[0].object_index[0]);
     try testing.expectEqual(va.DRM_FORMAT_GR88, desc.layers[1].drm_format);
-    try testing.expectEqual(@as(u32, 64 * 32), desc.layers[1].offset[0]);
+    // (the 40 x 24 surface's rows padded to 128: Y is 64 x 128, 8 KiB)
+    try testing.expectEqual(@as(u32, @intCast(s1.layout.chroma_offset)), desc.layers[1].offset[0]);
+    try testing.expectEqual(@as(u32, 8192), desc.layers[1].offset[0]);
     try testing.expectEqual(@as(u32, 64), desc.layers[1].pitch[0]);
-    try testing.expectEqual(@as(u32, 0), desc.layers[1].object_index[0]);
-    // (the dma-buf made once: a second export dups it)
+    try testing.expectEqual(@as(u32, 1), desc.layers[1].object_index[0]);
+    // composed: one NV12 layer, its planes in the two objects; the
+    // dma-buf made once, dup'd for each export
     try testing.expectEqual(va.SUCCESS, d.exportSurfaceHandle(surfaces[1], va.MEM_TYPE_DRM_PRIME_2, va.EXPORT_SURFACE_COMPOSED_LAYERS, &desc));
     try testing.expectEqual(@as(u32, 1), k.exports);
-    try testing.expectEqual(@as(i32, 202), desc.objects[0].fd);
+    try testing.expectEqual(@as(i32, 203), desc.objects[0].fd);
     try testing.expectEqual(@as(u32, 1), desc.num_layers);
     try testing.expectEqual(va.DRM_FORMAT_NV12, desc.layers[0].drm_format);
-    try testing.expectEqual([4]u32{ 0, 64 * 32, 0, 0 }, desc.layers[0].offset);
+    try testing.expectEqual([4]u32{ 0, 8192, 0, 0 }, desc.layers[0].offset);
+    try testing.expectEqual([4]u32{ 0, 1, 0, 0 }, desc.layers[0].object_index);
+    try testing.expectEqual([4]u32{ 64, 64, 0, 0 }, desc.layers[0].pitch);
+    // (still nothing converted: the frame goes out as the decoder wrote it)
+    try testing.expectEqual([3]u32{ 0, 0, 0 }, d.conversions);
+    try testing.expectEqual(@as(u32, 0), s1.linear.handle);
+    // GALAXY_VA_GOB=turing: one modifier for both planes, one object
+    d.opts.gob = .turing;
+    try testing.expectEqual(va.SUCCESS, d.exportSurfaceHandle(surfaces[1], va.MEM_TYPE_DRM_PRIME_2, va.EXPORT_SURFACE_SEPARATE_LAYERS, &desc));
+    try testing.expectEqual(@as(u32, 1), desc.num_objects);
+    try testing.expectEqual(@as(u64, 0x0300_0000_0060_6011), desc.objects[0].drm_format_modifier);
+    try testing.expectEqual(@as(u32, 0), desc.layers[1].object_index[0]);
+    d.opts.gob = .blackwell;
 
-    // ── images: derived (the linear picture itself), and a copy ──
+    // ── images: derived (the linear copy, made and converted when it is
+    //    mapped), and a copy (converted for vaGetImage) ──
     var img: va.Image = undefined;
     try testing.expectEqual(va.SUCCESS, d.deriveImage(surfaces[1], &img));
     try testing.expectEqual(va.FOURCC_NV12, img.format.fourcc);
     try testing.expectEqual([3]u32{ 64, 64, 0 }, img.pitches);
     try testing.expectEqual([3]u32{ 0, 64 * 32, 0 }, img.offsets);
+    try testing.expect(s1.linear.handle != 0 and !k.bufs[s1.linear.handle].vram);
     var p: ?*anyopaque = null;
     try testing.expectEqual(va.SUCCESS, d.mapBuffer(img.buf, &p));
     try testing.expectEqual(@intFromPtr(s1.linear.cpu), @intFromPtr(p.?));
+    try testing.expectEqual(@as(u32, 1), d.conversions[@intFromEnum(convert.Done.cpu)]);
+    try expectLinear(&d, surfaces[1], 1);
     try testing.expectEqual(va.SUCCESS, d.unmapBuffer(img.buf));
+    // (mapped: the app may have written it, so the picture is converted
+    // back before the next export)
+    try testing.expect(s1.tiled_stale);
+    try testing.expectEqual(va.SUCCESS, d.exportSurfaceHandle(surfaces[1], va.MEM_TYPE_DRM_PRIME_2, va.EXPORT_SURFACE_SEPARATE_LAYERS, &desc));
+    try testing.expectEqual(@as(u32, 2), d.conversions[@intFromEnum(convert.Done.cpu)]);
+    try testing.expect(!s1.tiled_stale);
+    try expectPicture(&d, surfaces[1], 1);
     try testing.expectEqual(va.SUCCESS, d.destroyImage(img.image_id));
     var copy: va.Image = undefined;
     try testing.expectEqual(va.SUCCESS, d.createImage(&va.NV12_FORMAT, 40, 24, &copy));
     try testing.expectEqual(va.SUCCESS, d.getImage(surfaces[0], 0, 0, 40, 24, copy.image_id));
+    try testing.expectEqual(@as(u32, 3), d.conversions[@intFromEnum(convert.Done.cpu)]);
+    // (again: the linear copy is current, nothing converted)
+    try testing.expectEqual(va.SUCCESS, d.getImage(surfaces[0], 0, 0, 40, 24, copy.image_id));
+    try testing.expectEqual(@as(u32, 3), d.conversions[@intFromEnum(convert.Done.cpu)]);
     try testing.expectEqual(va.SUCCESS, d.mapBuffer(copy.buf, &p));
     const bytes: [*]const u8 = @ptrCast(p.?);
     try testing.expectEqual(pattern(39, 23, 0), bytes[23 * copy.pitches[0] + 39]);
     try testing.expectEqual(pattern(1 + 7, 100 + 11, 0), bytes[copy.offsets[1] + 11 * copy.pitches[1] + 7]);
+    try testing.expectEqual(va.SUCCESS, d.destroyImage(copy.image_id));
+    // (a P010 image for an NV12 surface: refused)
+    try testing.expectEqual(va.SUCCESS, d.createImage(&va.P010_FORMAT, 40, 24, &copy));
+    try testing.expectEqual(va.ERROR_INVALID_IMAGE_FORMAT, d.getImage(surfaces[0], 0, 0, 40, 24, copy.image_id));
     try testing.expectEqual(va.SUCCESS, d.destroyImage(copy.image_id));
 
     // ── a surface used as a reference keeps its slot; others are let go ──

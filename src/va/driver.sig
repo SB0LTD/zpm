@@ -6,11 +6,17 @@
 //!
 //! What a decode is here:
 //!
-//! - **Surfaces** (MAX_SURFACES) are NV12 pictures, each two buffers in
-//!   system memory: the decode target, block linear as NVDEC writes it
-//!   (tiling.Nv12), and a pitch-linear copy (tiling.Linear) that is what
-//!   the app sees: exported as one dma-buf (made once, a new fd per
-//!   vaExportSurfaceHandle), derived as a VAImage, read by vaGetImage.
+//! - **Surfaces** (MAX_SURFACES) are NV12 or P010 pictures (8- or 10-bit
+//!   streams), the decode target in VRAM, block linear as NVDEC writes it
+//!   (tiling.Nv12). That is what the app gets: vaExportSurfaceHandle
+//!   hands out that buffer's dma-buf as it is, each plane with NVIDIA's
+//!   block-linear modifier (tiling.modifierOf), and the GL driver samples
+//!   the GOBs where they are (zero copy: no detile, no copy, the CPU never
+//!   touches a frame on its way to the screen). A pitch-linear copy in
+//!   system memory (tiling.Linear) is made only for a CPU reader or
+//!   writer (vaGetImage, a derived image, vaPutImage, an encode's input),
+//!   converted on the GPU (convert.sig, gpu_convert.sig) when one asks,
+//!   and only when the other copy has changed since.
 //! - **Contexts** (MAX_CONTEXTS) each have one work buffer: FRAMES frame
 //!   slots (a pushbuffer, the picture setup, the slice table, the status,
 //!   the codec's side buffers, then the bitstream, each a frame's own so
@@ -27,9 +33,8 @@
 //!   (nvdec.h264Push) and submits it on the video channel (G_VSUBMIT).
 //! - **SyncSurface** (and anything that reads a surface: export, derive,
 //!   GetImage, a status query that finds it done) waits for the decode's
-//!   fence (G_VWAIT), reads the decoder's status (errors counted; said on
-//!   stderr with GALAXY_VA_DEBUG) and copies the target to the linear
-//!   picture on the CPU (tiling.detile). A GPU copy is the later step.
+//!   fence (G_VWAIT) and reads the decoder's status (errors counted; said
+//!   on stderr with GALAXY_VA_DEBUG). Nothing is copied.
 //!
 //! VA buffers live in a fixed pool reserved at init: SMALL_BUFFERS of 64
 //! KiB (parameters) and LARGE_BUFFERS of 16 MiB (slice data, images).
@@ -48,8 +53,9 @@
 //!   its encode (G_EWAIT) and fills the segment.
 //! - **BeginPicture** takes the input surface and the next frame slot;
 //!   **RenderPicture** hands each buffer to encode.take; **EndPicture**
-//!   tiles the input (the surface's linear picture into its block-linear
-//!   buffer, which the engine reads), writes the headers, the setup and
+//!   brings the surface's linear picture up to date (a decode into it
+//!   since: converted), tiles the input (the linear picture into its
+//!   block-linear buffer, which the engine reads), writes the headers, the setup and
 //!   the pushbuffer, and submits it on the encoder channel (G_ESUBMIT).
 //!   The reconstructed and reference pictures live in their surfaces'
 //!   block-linear buffers, in the engine's own layout.
@@ -72,6 +78,7 @@ const vp8 = @import("vp8.sig");
 const ve = @import("vaapi_enc.sig");
 const encode = @import("encode.sig");
 const nvenc = @import("nvenc.sig");
+const convert = @import("convert.sig");
 
 const Buf = node.Buf;
 
@@ -126,7 +133,10 @@ pub const BUFFER_BASE: u32 = 0x1000;
 pub const IMAGE_BASE: u32 = 0x2000;
 const NONE: u16 = 0xffff;
 
-pub const PROFILES = [_]va.Profile{ va.PROFILE_H264_CONSTRAINED_BASELINE, va.PROFILE_H264_MAIN, va.PROFILE_H264_HIGH, hevc.PROFILE, vp8.PROFILE, vp9.PROFILE, av1.PROFILE };
+/// The decode profiles (Firefox's probe, vaapitest, finds each by name:
+/// HEVCMain10 and VP9Profile2 are what let it hand 10-bit streams here;
+/// AV1Profile0 is Main, 8 and 10 bits).
+pub const PROFILES = [_]va.Profile{ va.PROFILE_H264_CONSTRAINED_BASELINE, va.PROFILE_H264_MAIN, va.PROFILE_H264_HIGH, hevc.PROFILE, va.PROFILE_HEVC_MAIN10, vp8.PROFILE, vp9.PROFILE, va.PROFILE_VP9_PROFILE_2, av1.PROFILE };
 
 pub fn supported(profile: va.Profile) bool {
     return std.mem.indexOfScalar(va.Profile, &PROFILES, profile) != null;
@@ -136,12 +146,35 @@ pub const Codec = enum { h264, hevc, vp8, vp9, av1 };
 
 pub fn codecOf(profile: va.Profile) Codec {
     return switch (profile) {
-        hevc.PROFILE => .hevc,
+        hevc.PROFILE, va.PROFILE_HEVC_MAIN10 => .hevc,
         vp8.PROFILE => .vp8,
-        vp9.PROFILE => .vp9,
+        vp9.PROFILE, va.PROFILE_VP9_PROFILE_2 => .vp9,
         av1.PROFILE => .av1,
         else => .h264,
     };
+}
+
+/// The render-target formats a decode profile gives: 8-bit 4:2:0 (NV12)
+/// and, for the 10-bit profiles, 10-bit 4:2:0 (P010). HEVC Main10 and VP9
+/// profile 2 streams may be 8-bit too (their decoders take either).
+pub fn rtFormats(profile: va.Profile) u32 {
+    return switch (profile) {
+        va.PROFILE_HEVC_MAIN10, va.PROFILE_VP9_PROFILE_2, av1.PROFILE => va.RT_FORMAT_YUV420 | va.RT_FORMAT_YUV420_10,
+        else => va.RT_FORMAT_YUV420,
+    };
+}
+
+/// A render-target format's bytes a sample (null: not one had here).
+pub fn sampleBytesOf(rt_format: u32) ?u8 {
+    return switch (rt_format) {
+        va.RT_FORMAT_YUV420 => 1,
+        va.RT_FORMAT_YUV420_10 => 2,
+        else => null,
+    };
+}
+
+pub fn fourccOf(sample_bytes: u8) u32 {
+    return if (sample_bytes == 2) va.FOURCC_P010 else va.FOURCC_NV12;
 }
 
 pub const Options = struct {
@@ -187,11 +220,18 @@ const Surface = struct {
     height: u32 = 0,
     layout: tiling.Nv12 = undefined,
     linear_layout: tiling.Linear = undefined,
-    /// the decode target (block linear), its linear copy
+    /// the decode target (block linear, VRAM), and its pitch-linear copy
+    /// (system memory: made the first time a CPU reader or writer asks)
     tiled: Buf = .{},
     linear: Buf = .{},
-    /// the linear copy's dma-buf (made at the first export)
+    /// the decode target's dma-buf (made at the first export or GPU
+    /// conversion), and the linear copy's (a GPU conversion's)
     dmabuf: i32 = -1,
+    linear_fd: i32 = -1,
+    /// the linear copy is older than the picture (a decode since); the
+    /// picture is older than the linear copy (a CPU write since)
+    linear_stale: bool = true,
+    tiled_stale: bool = false,
     /// a decode into it not yet seen done
     pending: bool = false,
     fence: u32 = 0,
@@ -288,13 +328,26 @@ const ImageEntry = struct {
     buffer: u16 = NONE,
 };
 
+/// The driver over `Sys`'s node, CPU readers' pictures converted on the
+/// CPU (tests; convert.Cpu).
 pub fn Driver(comptime Sys: type) type {
+    return DriverWith(Sys, convert.Cpu);
+}
+
+/// The driver, CPU readers' pictures converted by `Conv` (convert.sig: the
+/// shared library's runs on the GPU).
+pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
     return struct {
         const Self = @This();
 
         node: node.Node(Sys),
         own_fd: bool = false,
         opts: Options = .{},
+        conv: Conv = .{},
+        /// conversions made, by where (the tests and GALAXY_VA_DEBUG read them)
+        conversions: [3]u32 = .{ 0, 0, 0 },
+        /// vaExportSurfaceHandle calls answered
+        exports: u32 = 0,
         pool: ?[*]u8 = null,
         configs: [MAX_CONFIGS]Config = [_]Config{.{}} ** MAX_CONFIGS,
         surfaces: [MAX_SURFACES]Surface = [_]Surface{.{}} ** MAX_SURFACES,
@@ -428,6 +481,7 @@ pub fn Driver(comptime Sys: type) type {
             for (0..MAX_SURFACES) |i| {
                 if (d.surfaces[i].used) d.dropSurface(@intCast(i));
             }
+            d.conv.deinit();
             for (&d.coded) |*c| {
                 if (c.used) d.node.free(&c.buf);
                 c.* = .{};
@@ -476,7 +530,7 @@ pub fn Driver(comptime Sys: type) type {
             if (ep != va.ENTRYPOINT_VLD) return va.ERROR_UNSUPPORTED_ENTRYPOINT;
             for (attribs) |*a| {
                 a.value = switch (a.type) {
-                    va.ATTRIB_RT_FORMAT => va.RT_FORMAT_YUV420,
+                    va.ATTRIB_RT_FORMAT => rtFormats(profile),
                     va.ATTRIB_DEC_SLICE_MODE => va.DEC_SLICE_MODE_NORMAL,
                     va.ATTRIB_MAX_PICTURE_WIDTH, va.ATTRIB_MAX_PICTURE_HEIGHT => MAX_SIZE,
                     else => va.ATTRIB_NOT_SUPPORTED,
@@ -491,8 +545,9 @@ pub fn Driver(comptime Sys: type) type {
             if (ep != va.ENTRYPOINT_VLD and !enc) return va.ERROR_UNSUPPORTED_ENTRYPOINT;
             var rc_mode: u32 = ve.RC_CQP;
             var packed_headers: u32 = 0;
+            const formats = if (enc) va.RT_FORMAT_YUV420 else rtFormats(profile);
             for (attribs) |a| {
-                if (a.type == va.ATTRIB_RT_FORMAT and a.value & va.RT_FORMAT_YUV420 == 0) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+                if (a.type == va.ATTRIB_RT_FORMAT and a.value & formats == 0) return va.ERROR_UNSUPPORTED_RT_FORMAT;
                 if (!enc) continue;
                 switch (a.type) {
                     ve.ATTRIB_RATE_CONTROL => {
@@ -527,7 +582,7 @@ pub fn Driver(comptime Sys: type) type {
             profile.* = c.profile;
             ep.* = c.entrypoint;
             n.* = 1;
-            if (attribs) |a| a[0] = .{ .type = va.ATTRIB_RT_FORMAT, .value = va.RT_FORMAT_YUV420 };
+            if (attribs) |a| a[0] = .{ .type = va.ATTRIB_RT_FORMAT, .value = if (c.entrypoint == ve.ENTRYPOINT_ENC_SLICE) va.RT_FORMAT_YUV420 else rtFormats(c.profile) };
             if (c.entrypoint == ve.ENTRYPOINT_ENC_SLICE) {
                 if (attribs) |a| {
                     a[1] = .{ .type = ve.ATTRIB_RATE_CONTROL, .value = c.rc_mode };
@@ -546,39 +601,56 @@ pub fn Driver(comptime Sys: type) type {
 
         // ── Surfaces ────────────────────────────────────────────────────
 
-        const SURFACE_ATTRIBS = 6;
+        const SURFACE_ATTRIBS_MAX = 7;
 
+        /// What a config's surfaces may be: the pixel formats its profile
+        /// decodes to (FFmpeg picks the one its stream's software format
+        /// matches: P010 for a 10-bit one), sizes, memory types.
         pub fn querySurfaceAttributes(d: *Self, config: u32, list: ?[*]va.SurfaceAttrib, n: *u32) va.Status {
-            if (d.configOf(config) == null) return va.ERROR_INVALID_CONFIG;
+            const c = d.configOf(config) orelse return va.ERROR_INVALID_CONFIG;
             const both = va.SURFACE_ATTRIB_GETTABLE | va.SURFACE_ATTRIB_SETTABLE;
-            const all = [SURFACE_ATTRIBS]va.SurfaceAttrib{
-                intAttrib(va.SURFACE_ATTRIB_PIXEL_FORMAT, both, va.FOURCC_NV12),
+            var all: [SURFACE_ATTRIBS_MAX]va.SurfaceAttrib = undefined;
+            var k: u32 = 0;
+            const formats = if (c.entrypoint == ve.ENTRYPOINT_ENC_SLICE) va.RT_FORMAT_YUV420 else rtFormats(c.profile);
+            if (formats & va.RT_FORMAT_YUV420 != 0) {
+                all[k] = intAttrib(va.SURFACE_ATTRIB_PIXEL_FORMAT, both, va.FOURCC_NV12);
+                k += 1;
+            }
+            if (formats & va.RT_FORMAT_YUV420_10 != 0) {
+                all[k] = intAttrib(va.SURFACE_ATTRIB_PIXEL_FORMAT, both, va.FOURCC_P010);
+                k += 1;
+            }
+            for ([_]va.SurfaceAttrib{
                 intAttrib(va.SURFACE_ATTRIB_MIN_WIDTH, va.SURFACE_ATTRIB_GETTABLE, MIN_SIZE),
                 intAttrib(va.SURFACE_ATTRIB_MAX_WIDTH, va.SURFACE_ATTRIB_GETTABLE, MAX_SIZE),
                 intAttrib(va.SURFACE_ATTRIB_MIN_HEIGHT, va.SURFACE_ATTRIB_GETTABLE, MIN_SIZE),
                 intAttrib(va.SURFACE_ATTRIB_MAX_HEIGHT, va.SURFACE_ATTRIB_GETTABLE, MAX_SIZE),
                 intAttrib(va.SURFACE_ATTRIB_MEMORY_TYPE, both, va.MEM_TYPE_VA | va.MEM_TYPE_DRM_PRIME_2),
-            };
+            }) |a| {
+                all[k] = a;
+                k += 1;
+            }
             const out = list orelse {
-                n.* = SURFACE_ATTRIBS;
+                n.* = k;
                 return va.SUCCESS;
             };
-            if (n.* < SURFACE_ATTRIBS) {
-                n.* = SURFACE_ATTRIBS;
+            if (n.* < k) {
+                n.* = k;
                 return va.ERROR_MAX_NUM_EXCEEDED;
             }
-            for (all, 0..) |a, i| out[i] = a;
-            n.* = SURFACE_ATTRIBS;
+            for (all[0..k], 0..) |a, i| out[i] = a;
+            n.* = k;
             return va.SUCCESS;
         }
 
         pub fn createSurfaces(d: *Self, format: u32, width: u32, height: u32, out: []u32, attribs: []const va.SurfaceAttrib) va.Status {
-            if (format != va.RT_FORMAT_YUV420) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+            const sample_bytes = sampleBytesOf(format) orelse return va.ERROR_UNSUPPORTED_RT_FORMAT;
             if (width == 0 or height == 0) return va.ERROR_INVALID_PARAMETER;
             if (width > MAX_SIZE or height > MAX_SIZE) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
             for (attribs) |a| {
                 switch (a.type) {
-                    va.SURFACE_ATTRIB_PIXEL_FORMAT => if (@as(u32, @bitCast(a.value.value.i)) != va.FOURCC_NV12) return va.ERROR_UNSUPPORTED_RT_FORMAT,
+                    // (the pixel format is the render-target format's)
+                    va.SURFACE_ATTRIB_PIXEL_FORMAT => if (@as(u32, @bitCast(a.value.value.i)) != fourccOf(sample_bytes)) return va.ERROR_UNSUPPORTED_RT_FORMAT,
                     va.SURFACE_ATTRIB_MEMORY_TYPE => {
                         const t: u32 = @bitCast(a.value.value.i);
                         if (t != 0 and t != va.MEM_TYPE_VA and t != va.MEM_TYPE_DRM_PRIME_2) return va.ERROR_UNSUPPORTED_MEMORY_TYPE;
@@ -589,32 +661,121 @@ pub fn Driver(comptime Sys: type) type {
                 }
             }
             for (out, 0..) |*id, k| {
-                const i = d.makeSurface(width, height) orelse {
+                const i = d.makeSurface(width, height, sample_bytes) orelse {
                     for (out[0..k]) |made| d.dropSurface(@intCast(made - SURFACE_BASE));
                     return va.ERROR_ALLOCATION_FAILED;
                 };
                 id.* = SURFACE_BASE + i;
             }
-            d.debug("{d} surfaces of {d}x{d}", .{ out.len, width, height });
+            d.debug("{d} {s} surfaces of {d}x{d} in VRAM", .{ out.len, if (sample_bytes == 2) "P010" else "NV12", width, height });
             return va.SUCCESS;
         }
 
-        fn makeSurface(d: *Self, width: u32, height: u32) ?u16 {
+        /// A surface: its decode target in VRAM (black until decoded: Y
+        /// 16, UV 128, at the top of P010's two bytes; every byte of a
+        /// plane the same pattern, whatever the swizzle). Its linear copy
+        /// waits for a CPU reader.
+        fn makeSurface(d: *Self, width: u32, height: u32, sample_bytes: u8) ?u16 {
             const i = for (d.surfaces, 0..) |s, i| {
                 if (!s.used) break i;
             } else return null;
-            const layout = tiling.Nv12.of(width, std.mem.alignForward(u32, height, SURFACE_ROW_ALIGN));
-            const lin = tiling.Linear.of(width, height);
-            var tiled = d.node.alloc(@intCast(layout.bytes), 0) orelse return null;
-            const linear = d.node.alloc(lin.bytes, 0) orelse {
-                d.node.free(&tiled);
-                return null;
-            };
-            // (black until decoded: Y 16, UV 128)
-            @memset(linear.bytes()[0..lin.uv_offset], 16);
-            @memset(linear.bytes()[lin.uv_offset..lin.bytes], 128);
-            d.surfaces[i] = .{ .used = true, .width = width, .height = height, .layout = layout, .linear_layout = lin, .tiled = tiled, .linear = linear };
+            const layout = tiling.Nv12.ofDepth(width, std.mem.alignForward(u32, height, SURFACE_ROW_ALIGN), sample_bytes);
+            const lin = tiling.Linear.ofDepth(width, height, sample_bytes);
+            const tiled = d.node.alloc(@intCast(layout.bytes), node.G_VRAM) orelse return null;
+            const at: usize = @intCast(layout.chroma_offset);
+            const b = tiled.bytes();
+            if (sample_bytes == 1) {
+                @memset(b[0..at], 16);
+                @memset(b[at..@intCast(layout.bytes)], 128);
+            } else {
+                const y: []align(2) u8 = @alignCast(b[0..at]);
+                const uv: []align(2) u8 = @alignCast(b[at..@intCast(layout.bytes)]);
+                @memset(std.mem.bytesAsSlice(u16, y), 16 << 8);
+                @memset(std.mem.bytesAsSlice(u16, uv), 128 << 8);
+            }
+            d.surfaces[i] = .{ .used = true, .width = width, .height = height, .layout = layout, .linear_layout = lin, .tiled = tiled };
             return @intCast(i);
+        }
+
+        // ── A surface's two copies ──────────────────────────────────────
+
+        /// The surface's pitch-linear copy, made if it has none (stale:
+        /// the next sync converts into it).
+        fn ensureLinear(d: *Self, s: *Surface) bool {
+            if (s.linear.handle != 0) return true;
+            s.linear = d.node.alloc(s.linear_layout.bytes, 0) orelse return false;
+            s.linear_stale = true;
+            return true;
+        }
+
+        /// The surface's linear copy up to date (made and converted from
+        /// the picture if a decode came since), for a CPU reader. The
+        /// decode is waited for first.
+        fn syncLinear(d: *Self, si: u16) va.Status {
+            const st = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
+            if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+            const s = &d.surfaces[si];
+            if (!d.ensureLinear(s)) return va.ERROR_ALLOCATION_FAILED;
+            if (!s.linear_stale) return st;
+            if (!d.convertSurface(s, .to_linear)) return va.ERROR_OPERATION_FAILED;
+            s.linear_stale = false;
+            return st;
+        }
+
+        /// The surface's block-linear picture up to date (a CPU write into
+        /// its linear copy since: converted back), for the decoder, an
+        /// export or the encoder.
+        fn syncTiled(d: *Self, si: u16) va.Status {
+            const s = &d.surfaces[si];
+            if (!s.tiled_stale) return va.SUCCESS;
+            if (!d.convertSurface(s, .to_tiled)) return va.ERROR_OPERATION_FAILED;
+            s.tiled_stale = false;
+            return va.SUCCESS;
+        }
+
+        fn convertSurface(d: *Self, s: *Surface, dir: convert.Direction) bool {
+            var job = convert.Job{
+                .tiled = s.tiled,
+                .layout = s.layout,
+                .linear = s.linear,
+                .lin = s.linear_layout,
+                .width = s.width,
+                .height = s.height,
+                .gob = d.opts.gob,
+                .dir = dir,
+            };
+            if (Conv.wants_fds) {
+                job.tiled_fd = d.surfaceFd(s) orelse return false;
+                if (s.linear_fd < 0) {
+                    const fd = d.node.exportFd(s.linear);
+                    if (fd < 0) return false;
+                    s.linear_fd = @intCast(fd);
+                }
+                job.linear_fd = s.linear_fd;
+            }
+            const done = d.conv.run(job, .{ .ctx = d, .f = sayLine });
+            d.conversions[@intFromEnum(done)] += 1;
+            if (done == .failed) return false;
+            d.debug("{s} {d}x{d} converted {s} on the {s}", .{ if (s.layout.sample_bytes == 2) "P010" else "NV12", s.width, s.height, @tagName(dir), @tagName(done) });
+            return true;
+        }
+
+        fn sayLine(ctx: *anyopaque, line: []const u8) void {
+            const d: *Self = @ptrCast(@alignCast(ctx));
+            d.node.sys.say(line);
+        }
+
+        /// The decode target's dma-buf (made once; the surface holds it).
+        fn surfaceFd(d: *Self, s: *Surface) ?i32 {
+            if (s.dmabuf < 0) {
+                const fd = d.node.exportFd(s.tiled);
+                if (fd < 0) {
+                    d.say("the surface's dma-buf was refused ({d})", .{fd});
+                    return null;
+                }
+                s.dmabuf = @intCast(fd);
+            }
+            return s.dmabuf;
         }
 
         fn dropSurface(d: *Self, i: u16) void {
@@ -630,6 +791,7 @@ pub fn Driver(comptime Sys: type) type {
                 if (c.target == i) c.target = NONE;
             }
             if (s.dmabuf >= 0) d.node.sys.close(s.dmabuf);
+            if (s.linear_fd >= 0) d.node.sys.close(s.linear_fd);
             // (the kernel keeps the pages until the decoder is done)
             d.node.free(&s.tiled);
             d.node.free(&s.linear);
@@ -863,10 +1025,15 @@ pub fn Driver(comptime Sys: type) type {
                 if (st != va.SUCCESS) return st;
                 out.* = d.coded[b.coded].buf.cpu;
             } else if (b.surface != NONE) {
-                // (a derived image: the decode's picture, once it is there)
-                const st = d.complete(b.surface, d.node.sys.nowNs() + SYNC_NS);
+                // (a derived image: the decode's picture in the linear
+                // copy, converted on the GPU if a decode came since; the
+                // app may write it, so the picture is converted back
+                // before the decoder, an export or the encoder reads it)
+                const st = d.syncLinear(b.surface);
                 if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
-                out.* = d.surfaces[b.surface].linear.cpu;
+                const s = &d.surfaces[b.surface];
+                s.tiled_stale = true;
+                out.* = s.linear.cpu;
             } else out.* = d.storage(i).ptr;
             b.mapped = true;
             return va.SUCCESS;
@@ -1131,6 +1298,8 @@ pub fn Driver(comptime Sys: type) type {
             if (pic.seq_fields.chroma_format_idc != 1 or pic.bit_depth_luma_minus8 != 0 or pic.bit_depth_chroma_minus8 != 0) return va.ERROR_UNSUPPORTED_RT_FORMAT;
             const si = c.target;
             const s = &d.surfaces[si];
+            // (H.264 here is 8-bit: an NV12 target)
+            if (s.layout.sample_bytes != 1) return va.ERROR_INVALID_SURFACE;
             if (wmbs * 16 > s.layout.luma.pitch or hmbs * 16 > s.layout.luma.rows) return va.ERROR_INVALID_SURFACE;
 
             // Fields: the second of a pair goes into the surface holding
@@ -1144,6 +1313,8 @@ pub fn Driver(comptime Sys: type) type {
             for (pic.ReferenceFrames, 0..) |rf, k| {
                 if (rf.flags & va.PICTURE_H264_INVALID != 0) continue;
                 ref_surface[k] = d.surfaceIndex(rf.picture_id) orelse NONE;
+                // (a reference the CPU wrote since: its picture first)
+                if (ref_surface[k] != NONE) _ = d.syncTiled(ref_surface[k]);
             }
             const slot = assignSlots(c, si, &ref_surface) orelse return va.ERROR_MAX_NUM_EXCEEDED;
             var refs = [_]?nvdec.Ref{null} ** 16;
@@ -1204,6 +1375,8 @@ pub fn Driver(comptime Sys: type) type {
 
             d.serial +%= 1;
             s.pending = true;
+            s.linear_stale = true;
+            s.tiled_stale = false;
             s.fence = fence;
             s.ctx = ci;
             s.frame = f;
@@ -1251,6 +1424,8 @@ pub fn Driver(comptime Sys: type) type {
             };
             d.serial +%= 1;
             s.pending = true;
+            s.linear_stale = true;
+            s.tiled_stale = false;
             s.fence = fence;
             s.ctx = ci;
             s.frame = f;
@@ -1294,10 +1469,12 @@ pub fn Driver(comptime Sys: type) type {
             if (st != va.SUCCESS) return st;
             st = d.waitEncodeInput(s, deadline);
             if (st != va.SUCCESS) return st;
-            if (s.pending) {
-                st = d.complete(si, deadline);
-                if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
-            }
+            // (the input's linear picture, which encode.end tiles: made,
+            // and converted from the block-linear one if a decode wrote
+            // that since; an 8-bit picture only)
+            if (s.layout.sample_bytes != 1) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+            st = d.syncLinear(si);
+            if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
             const f = c.frame;
             const frame = c.work.bytes()[f * ENC_FRAME_BYTES ..][0..ENC_FRAME_BYTES];
             const base = c.work.va + f * ENC_FRAME_BYTES;
@@ -1340,6 +1517,8 @@ pub fn Driver(comptime Sys: type) type {
             };
             const kept = cb.buf;
             cb.* = .{ .used = true, .buf = kept, .pending = true, .fence = fence, .ctx = ci, .header_bytes = out.header_bytes, .intra = out.intra };
+            // (encode.end tiled the linear picture into the block-linear one)
+            s.tiled_stale = false;
             s.enc_pending = true;
             s.enc_fence = fence;
             c.frame_fence[f] = fence;
@@ -1353,6 +1532,8 @@ pub fn Driver(comptime Sys: type) type {
         fn lookupSurface(ctx: *anyopaque, id: u32) ?codec.SurfaceRef {
             const d: *Self = @ptrCast(@alignCast(ctx));
             const i = d.surfaceIndex(id) orelse return null;
+            // (a reference the CPU wrote since: its picture first)
+            _ = d.syncTiled(i);
             return surfaceRef(&d.surfaces[i]);
         }
 
@@ -1364,11 +1545,13 @@ pub fn Driver(comptime Sys: type) type {
                 .height = s.height,
                 .pitch_luma = s.layout.luma.pitch,
                 .pitch_chroma = s.layout.chroma.pitch,
+                .sample_bytes = s.layout.sample_bytes,
             };
         }
 
         /// The decode into surface `si` done by `deadline` (0: only look),
-        /// its status read and its picture copied out linear.
+        /// its status read. (Nothing copied: the picture stays where the
+        /// decoder wrote it.)
         fn complete(d: *Self, si: u16, deadline: i64) va.Status {
             const s = &d.surfaces[si];
             if (!s.pending) return if (s.failed) va.ERROR_DECODING_ERROR else va.SUCCESS;
@@ -1394,18 +1577,7 @@ pub fn Driver(comptime Sys: type) type {
                     d.debug("decode {d} (surface {d}): error_status {x}, macroblocks {d} in error / {d} right, slice header error {x}; {d} errors so far", .{ s.serial, si, st.error_status, st.mbs_in_error, st.mbs_correctly_decoded, st.slice_header_error_code, d.errors });
                 }
             }
-            d.detileSurface(s);
             return if (s.failed) va.ERROR_DECODING_ERROR else va.SUCCESS;
-        }
-
-        fn detileSurface(d: *Self, s: *Surface) void {
-            const lin = s.linear_layout;
-            const out = s.linear.bytes();
-            const src = s.tiled.bytes();
-            tiling.detile(out, lin.pitch, src, s.layout.luma, d.opts.gob.luma(), s.width, s.height);
-            const cw = 2 * ((s.width + 1) / 2);
-            const ch = (s.height + 1) / 2;
-            tiling.detile(out[lin.uv_offset..], lin.pitch, src[@intCast(s.layout.chroma_offset)..], s.layout.chroma, d.opts.gob.chroma(), cw, ch);
         }
 
         pub fn syncSurface(d: *Self, surface: u32, timeout_ns: i64) va.Status {
@@ -1479,40 +1651,54 @@ pub fn Driver(comptime Sys: type) type {
             if (mem_type != va.MEM_TYPE_DRM_PRIME_2) return va.ERROR_UNSUPPORTED_MEMORY_TYPE;
             const st = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
             if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+            if (d.syncTiled(si) != va.SUCCESS) return va.ERROR_OPERATION_FAILED;
             const s = &d.surfaces[si];
-            if (s.dmabuf < 0) {
-                const fd = d.node.exportFd(s.linear);
+            const held = d.surfaceFd(s) orelse return va.ERROR_OPERATION_FAILED;
+            // The decode target as it is: one dma-buf (VRAM), each plane
+            // block linear with its modifier. NV12's Y (8 bpp) and UV (16
+            // bpp) have different sector layouts on Blackwell, and a
+            // descriptor gives a modifier per object, so the planes are
+            // two objects of the one dma-buf (an fd each: Firefox closes
+            // every layer's object fd); with one modifier for both
+            // (GALAXY_VA_GOB=turing), one object.
+            const sw = s.layout.swizzles(d.opts.gob);
+            const mods = [2]u64{ tiling.modifierOf(sw[0]), tiling.modifierOf(sw[1]) };
+            const objects: u32 = if (mods[0] == mods[1]) 1 else 2;
+            desc.* = std.mem.zeroes(va.DrmPrimeDescriptor);
+            for (0..objects) |o| {
+                const fd = d.node.sys.dup(held);
                 if (fd < 0) {
-                    d.say("the surface's dma-buf was refused ({d})", .{fd});
+                    for (0..o) |k| d.node.sys.close(desc.objects[k].fd);
                     return va.ERROR_OPERATION_FAILED;
                 }
-                s.dmabuf = @intCast(fd);
+                desc.objects[o] = .{ .fd = @intCast(fd), .size = @intCast(s.tiled.len), .drm_format_modifier = mods[o] };
             }
-            const fd = d.node.sys.dup(s.dmabuf);
-            if (fd < 0) return va.ERROR_OPERATION_FAILED;
-            const lin = s.linear_layout;
-            desc.* = std.mem.zeroes(va.DrmPrimeDescriptor);
-            desc.fourcc = va.FOURCC_NV12;
+            const p010 = s.layout.sample_bytes == 2;
+            const chroma_object: u32 = objects - 1;
+            const chroma_at: u32 = @intCast(s.layout.chroma_offset);
+            desc.fourcc = fourccOf(s.layout.sample_bytes);
             desc.width = s.width;
             desc.height = s.height;
-            desc.num_objects = 1;
-            desc.objects[0] = .{ .fd = @intCast(fd), .size = @intCast(s.linear.len), .drm_format_modifier = va.DRM_FORMAT_MOD_LINEAR };
+            desc.num_objects = objects;
             if (flags & va.EXPORT_SURFACE_COMPOSED_LAYERS != 0) {
                 desc.num_layers = 1;
-                desc.layers[0].drm_format = va.DRM_FORMAT_NV12;
+                desc.layers[0].drm_format = if (p010) va.DRM_FORMAT_P010 else va.DRM_FORMAT_NV12;
                 desc.layers[0].num_planes = 2;
-                desc.layers[0].offset = .{ 0, lin.uv_offset, 0, 0 };
-                desc.layers[0].pitch = .{ lin.pitch, lin.pitch, 0, 0 };
+                desc.layers[0].object_index = .{ 0, chroma_object, 0, 0 };
+                desc.layers[0].offset = .{ 0, chroma_at, 0, 0 };
+                desc.layers[0].pitch = .{ s.layout.luma.pitch, s.layout.chroma.pitch, 0, 0 };
             } else {
                 desc.num_layers = 2;
-                desc.layers[0].drm_format = va.DRM_FORMAT_R8;
+                desc.layers[0].drm_format = if (p010) va.DRM_FORMAT_R16 else va.DRM_FORMAT_R8;
                 desc.layers[0].num_planes = 1;
-                desc.layers[0].pitch[0] = lin.pitch;
-                desc.layers[1].drm_format = va.DRM_FORMAT_GR88;
+                desc.layers[0].pitch[0] = s.layout.luma.pitch;
+                desc.layers[1].drm_format = if (p010) va.DRM_FORMAT_GR1616 else va.DRM_FORMAT_GR88;
                 desc.layers[1].num_planes = 1;
-                desc.layers[1].offset[0] = lin.uv_offset;
-                desc.layers[1].pitch[0] = lin.pitch;
+                desc.layers[1].object_index[0] = chroma_object;
+                desc.layers[1].offset[0] = chroma_at;
+                desc.layers[1].pitch[0] = s.layout.chroma.pitch;
             }
+            d.exports += 1;
             return va.SUCCESS;
         }
 
@@ -1520,7 +1706,8 @@ pub fn Driver(comptime Sys: type) type {
 
         pub fn queryImageFormats(_: *Self, list: [*]va.ImageFormat, n: *i32) va.Status {
             list[0] = va.NV12_FORMAT;
-            n.* = 1;
+            list[1] = va.P010_FORMAT;
+            n.* = 2;
             return va.SUCCESS;
         }
 
@@ -1531,10 +1718,19 @@ pub fn Driver(comptime Sys: type) type {
             return null;
         }
 
+        /// An image format's bytes a sample (null: not had here).
+        fn imageSampleBytes(fourcc: u32) ?u8 {
+            return switch (fourcc) {
+                va.FOURCC_NV12 => 1,
+                va.FOURCC_P010 => 2,
+                else => null,
+            };
+        }
+
         fn describe(id: u32, buf: u32, width: u32, height: u32, lin: tiling.Linear) va.Image {
             var im = std.mem.zeroes(va.Image);
             im.image_id = id;
-            im.format = va.NV12_FORMAT;
+            im.format = if (lin.sample_bytes == 2) va.P010_FORMAT else va.NV12_FORMAT;
             im.buf = buf;
             im.width = @intCast(width);
             im.height = @intCast(height);
@@ -1546,10 +1742,10 @@ pub fn Driver(comptime Sys: type) type {
         }
 
         pub fn createImage(d: *Self, format: *const va.ImageFormat, width: u32, height: u32, out: *va.Image) va.Status {
-            if (format.fourcc != va.FOURCC_NV12) return va.ERROR_INVALID_IMAGE_FORMAT;
+            const sb = imageSampleBytes(format.fourcc) orelse return va.ERROR_INVALID_IMAGE_FORMAT;
             if (width == 0 or height == 0 or width > MAX_SIZE or height > MAX_SIZE) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
             const ii = d.newImage() orelse return va.ERROR_ALLOCATION_FAILED;
-            const lin = tiling.Linear.of(width, height);
+            const lin = tiling.Linear.ofDepth(width, height, sb);
             var bid: u32 = 0;
             const st = d.createBuffer(va.IMAGE_BUFFER, lin.bytes, 1, null, &bid);
             if (st != va.SUCCESS) return st;
@@ -1559,6 +1755,9 @@ pub fn Driver(comptime Sys: type) type {
             return va.SUCCESS;
         }
 
+        /// vaDeriveImage: the surface's linear copy as an image (made now
+        /// if it has none; converted from the picture when the image's
+        /// buffer is mapped).
         pub fn deriveImage(d: *Self, surface: u32, out: *va.Image) va.Status {
             const si = d.surfaceIndex(surface) orelse return va.ERROR_INVALID_SURFACE;
             const ii = d.newImage() orelse return va.ERROR_ALLOCATION_FAILED;
@@ -1566,6 +1765,7 @@ pub fn Driver(comptime Sys: type) type {
                 if (!b.used) break i;
             } else return va.ERROR_ALLOCATION_FAILED;
             const s = &d.surfaces[si];
+            if (!d.ensureLinear(s)) return va.ERROR_ALLOCATION_FAILED;
             d.buffers[bi] = .{ .used = true, .type = va.IMAGE_BUFFER, .size = s.linear_layout.bytes, .count = 1, .surface = si };
             const id = IMAGE_BASE + @as(u32, ii);
             const bid = BUFFER_BASE + @as(u32, @intCast(bi));
@@ -1582,9 +1782,19 @@ pub fn Driver(comptime Sys: type) type {
             return va.SUCCESS;
         }
 
+        /// An image's bytes for a copy: its own buffer, or (derived) its
+        /// surface's linear copy brought up to date.
+        fn imageBytes(d: *Self, im: ImageEntry) ?[]u8 {
+            if (im.surface == NONE) return d.storage(im.buffer);
+            const st = d.syncLinear(im.surface);
+            if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return null;
+            return d.surfaces[im.surface].linear.bytes();
+        }
+
         /// vaPutImage: the rectangle (src_x, src_y, width, height) of the
         /// image into the surface's picture at (dst_x, dst_y), no scaling:
-        /// how an app fills a surface to encode.
+        /// how an app fills a surface to encode. Into the linear copy (up
+        /// to date first), the picture converted back when next needed.
         pub fn putImage(d: *Self, surface: u32, image: u32, src_x: i32, src_y: i32, src_w: u32, src_h: u32, dst_x: i32, dst_y: i32, dst_w: u32, dst_h: u32) va.Status {
             const si = d.surfaceIndex(surface) orelse return va.ERROR_INVALID_SURFACE;
             if (image < IMAGE_BASE or image - IMAGE_BASE >= MAX_IMAGES or !d.images[image - IMAGE_BASE].used) return va.ERROR_INVALID_IMAGE;
@@ -1593,11 +1803,8 @@ pub fn Driver(comptime Sys: type) type {
             const im = d.images[image - IMAGE_BASE];
             if (im.surface == si) return va.SUCCESS;
             const s = &d.surfaces[si];
-            // (a decode into it lands first, or it would land over this)
-            if (s.pending) {
-                const st = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
-                if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
-            }
+            const sb = s.layout.sample_bytes;
+            if (imageSampleBytes(im.image.format.fourcc) != sb) return va.ERROR_INVALID_IMAGE_FORMAT;
             const sx: u32 = @intCast(src_x);
             const sy: u32 = @intCast(src_y);
             const dx: u32 = @intCast(dst_x);
@@ -1605,13 +1812,17 @@ pub fn Driver(comptime Sys: type) type {
             const w = src_w;
             const h = src_h;
             if (sx + w > im.image.width or sy + h > im.image.height or dx + w > s.width or dy + h > s.height) return va.ERROR_INVALID_PARAMETER;
-            const src = if (im.surface != NONE) d.surfaces[im.surface].linear.bytes() else d.storage(im.buffer);
+            // (a decode into it lands first, or it would land over this;
+            // the rest of the picture kept)
+            const st = d.syncLinear(si);
+            if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+            const src = d.imageBytes(im) orelse return va.ERROR_OPERATION_FAILED;
             const dst = s.linear.bytes();
             const lin = s.linear_layout;
             const ip = im.image.pitches;
             const io = im.image.offsets;
             for (0..h) |r| {
-                @memcpy(dst[(dy + r) * lin.pitch + dx ..][0..w], src[io[0] + (sy + r) * ip[0] + sx ..][0..w]);
+                @memcpy(dst[(dy + r) * lin.pitch + dx * sb ..][0 .. w * sb], src[io[0] + (sy + r) * ip[0] + sx * sb ..][0 .. w * sb]);
             }
             // chroma: whole UV pairs, rows of the 4:2:0 plane
             const csx = sx & ~@as(u32, 1);
@@ -1621,32 +1832,36 @@ pub fn Driver(comptime Sys: type) type {
                 const srow = sy / 2 + r;
                 const drow = dy / 2 + r;
                 if (drow >= (s.height + 1) / 2 or srow >= (@as(u32, im.image.height) + 1) / 2) break;
-                @memcpy(dst[lin.uv_offset + drow * lin.pitch + cdx ..][0..cw], src[io[1] + srow * ip[1] + csx ..][0..cw]);
+                @memcpy(dst[lin.uv_offset + drow * lin.pitch + cdx * sb ..][0 .. cw * sb], src[io[1] + srow * ip[1] + csx * sb ..][0 .. cw * sb]);
             }
+            s.tiled_stale = true;
             return va.SUCCESS;
         }
 
         /// The rectangle (x, y, width, height) of surface's picture into
-        /// image (at its origin).
+        /// image (at its origin): from its linear copy, converted on the
+        /// GPU first if a decode came since.
         pub fn getImage(d: *Self, surface: u32, x: i32, y: i32, width: u32, height: u32, image: u32) va.Status {
             const si = d.surfaceIndex(surface) orelse return va.ERROR_INVALID_SURFACE;
             if (image < IMAGE_BASE or image - IMAGE_BASE >= MAX_IMAGES or !d.images[image - IMAGE_BASE].used) return va.ERROR_INVALID_IMAGE;
             const im = d.images[image - IMAGE_BASE];
-            const st = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
+            const st = d.syncLinear(si);
             if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
             if (im.surface == si) return va.SUCCESS;
             const s = &d.surfaces[si];
+            const sb = s.layout.sample_bytes;
+            if (imageSampleBytes(im.image.format.fourcc) != sb) return va.ERROR_INVALID_IMAGE_FORMAT;
             if (x < 0 or y < 0) return va.ERROR_INVALID_PARAMETER;
             const ux: u32 = @intCast(x);
             const uy: u32 = @intCast(y);
             if (ux + width > s.width or uy + height > s.height or width > im.image.width or height > im.image.height) return va.ERROR_INVALID_PARAMETER;
-            const dst = if (im.surface != NONE) d.surfaces[im.surface].linear.bytes() else d.storage(im.buffer);
+            const dst = d.imageBytes(im) orelse return va.ERROR_OPERATION_FAILED;
             const src = s.linear.bytes();
             const lin = s.linear_layout;
             const ip = im.image.pitches;
             const io = im.image.offsets;
             for (0..height) |r| {
-                @memcpy(dst[io[0] + r * ip[0] ..][0..width], src[(uy + r) * lin.pitch + ux ..][0..width]);
+                @memcpy(dst[io[0] + r * ip[0] ..][0 .. width * sb], src[(uy + r) * lin.pitch + ux * sb ..][0 .. width * sb]);
             }
             const cx = ux & ~@as(u32, 1);
             const cw = 2 * ((width + 1) / 2);
@@ -1654,8 +1869,9 @@ pub fn Driver(comptime Sys: type) type {
                 const sy = uy / 2 + r;
                 if (sy >= (s.height + 1) / 2) break;
                 const n = @min(cw, 2 * ((s.width + 1) / 2) - cx);
-                @memcpy(dst[io[1] + r * ip[1] ..][0..n], src[lin.uv_offset + sy * lin.pitch + cx ..][0..n]);
+                @memcpy(dst[io[1] + r * ip[1] ..][0 .. n * sb], src[lin.uv_offset + sy * lin.pitch + cx * sb ..][0 .. n * sb]);
             }
+            if (im.surface != NONE) d.surfaces[im.surface].tiled_stale = true;
             return va.SUCCESS;
         }
     };

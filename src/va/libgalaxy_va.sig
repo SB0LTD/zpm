@@ -142,7 +142,7 @@ pub export fn __vaDriverInit_1_0(ctx: *va.DriverContext) callconv(.c) va.Status 
     ctx.max_profiles = driver.PROFILES.len;
     ctx.max_entrypoints = 2;
     ctx.max_attributes = 16;
-    ctx.max_image_formats = 1;
+    ctx.max_image_formats = 2;
     ctx.max_subpic_formats = 1;
     ctx.max_display_attributes = 1;
     ctx.str_vendor = driver.VENDOR;
