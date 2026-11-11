@@ -26,6 +26,7 @@ const texture = gfxapi.texture;
 const dxbc = gfxapi.dxbc;
 const dgen = gfxapi.dxbc_gen;
 const ct = hlsl.container;
+const warp = @import("hlsl_warp.sig");
 
 const Case = struct { name: []const u8, src: []const u8 };
 
@@ -194,6 +195,11 @@ const Tally = struct {
     /// the front end ran Microsoft's program but not ours
     draw_ours_refused: u32 = 0,
     pixels: u64 = 0,
+    /// both programs drawn by Direct3D 11 on WARP: the same pixels or not
+    warp_same: u32 = 0,
+    warp_diff: u32 = 0,
+    warp_failed: u32 = 0,
+    warp_pixels: u64 = 0,
     /// Direct3D 11's runtime and drivers took our blob (or refused it)
     d3d_accepted: u32 = 0,
     d3d_refused: u32 = 0,
@@ -677,6 +683,141 @@ fn comparePixels(name: []const u8, what: []const u8, drawn: *u32) bool {
     return bad == 0;
 }
 
+// ── the second renderer: Direct3D 11 on WARP ──────────────────────────────
+
+var wpx_ms: [warp.W * warp.H * 4]f32 = undefined;
+var wpx_ours: [warp.W * warp.H * 4]f32 = undefined;
+var warp_partner: [3][1 << 16]u8 = undefined;
+var warp_src: [16 * 1024]u8 = undefined;
+
+/// A stage's constant buffers' words, as fillUniforms made them.
+fn stageCbs(r: *const ct.Reflection, uni: *[UNI_WORDS]u32) warp.Stage {
+    var lay = Lay{};
+    var next: u32 = 0;
+    fillUniforms(r, &lay, uni, &next);
+    var st = warp.Stage{ .blob = &.{} };
+    for (0..16) |slot| {
+        if (lay.cb_vecs[slot] > 0) st.cbs[slot] = uni[lay.cb_word[slot]..][0 .. lay.cb_vecs[slot] * 4];
+    }
+    return st;
+}
+
+/// The vertex shader's inputs: one buffer each, 3 vertices over the target
+/// (the first element) or a variation of them.
+fn attrsOf(sig: ?dxbc.Signature, out: []warp.Attr) []warp.Attr {
+    const s = sig orelse return out[0..0];
+    const pos = [3][4]f32{ .{ -1, -1, 0.5, 1 }, .{ 3, -1, 0.5, 1 }, .{ -1, 3, 0.5, 1 } };
+    var n: usize = 0;
+    var k: u32 = 0;
+    while (k < s.count and n < out.len) : (k += 1) {
+        const e = s.get(k).?;
+        if (e.sys != .none and !(e.sys == .position)) continue;
+        var a = warp.Attr{ .name = e.name.ptr[0..e.name.len :0], .index = e.index, .format = switch (e.comp) {
+            .sint32 => 4,
+            .uint32 => 3,
+            else => 2,
+        }, .data = undefined };
+        for (0..3) |v| {
+            for (0..4) |c| {
+                const f: f32 = if (n == 0) pos[v][c] else switch (c) {
+                    0 => pos[v][0] * 0.5 + 0.1 * @as(f32, @floatFromInt(n)),
+                    1 => pos[v][1] * 0.25 + 0.5,
+                    2 => 0.3 + 0.05 * @as(f32, @floatFromInt(n)),
+                    else => 1,
+                };
+                a.data[v][c] = if (e.comp == .float32) @bitCast(f) else @intCast(@as(u32, @intCast(v)) + @as(u32, @intCast(c)) + n);
+            }
+        }
+        out[n] = a;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn warpPixels(name: []const u8, what: []const u8) bool {
+    var bad: u32 = 0;
+    var first: usize = 0;
+    for (0..warp.W * warp.H * 4) |i| {
+        const a = wpx_ms[i];
+        const b = wpx_ours[i];
+        if (std.math.isNan(a) and std.math.isNan(b)) continue;
+        if (!(@abs(a - b) <= 2e-3 + @abs(a) * 1e-3)) {
+            if (bad == 0) first = i;
+            bad += 1;
+        }
+    }
+    for (0..warp.W * warp.H) |p| {
+        if (wpx_ms[p * 4] != 0 or wpx_ms[p * 4 + 1] != 0 or wpx_ms[p * 4 + 2] != 0 or wpx_ms[p * 4 + 3] != 0) tally.warp_pixels += 1;
+    }
+    if (bad > 0) std.debug.print("  {s} {s} (WARP): {d} values differ; first at pixel {d} comp {d}: ours {d}, Microsoft's {d}" ++ "\n", .{ name, what, bad, first / 4, first % 4, wpx_ours[first], wpx_ms[first] });
+    return bad == 0;
+}
+
+fn compareWarp(name: []const u8, ms: []const u8, ours: []const u8, stage: dxbc.Stage, ms_refl: *const ct.Reflection) void {
+    if (!warp.device()) return;
+    const mc = dxbc.Container.parse(ms) catch return;
+    var uni: [UNI_WORDS]u32 = [_]u32{0} ** UNI_WORDS;
+    var st = stageCbs(ms_refl, &uni);
+    var attrs: [16]warp.Attr = undefined;
+    var same = true;
+    var drew = false;
+    switch (stage) {
+        .pixel => {
+            const isg = mc.signature(false) orelse return;
+            const vs = msCompile(partnerVs(isg, &warp_src), "vs_4_0", &warp_partner[0]) orelse return;
+            const a = [_]warp.Attr{.{ .name = "POSITION", .index = 0, .format = 2, .data = .{ .{ @bitCast(@as(f32, -1)), @bitCast(@as(f32, -1)), @bitCast(@as(f32, 0.5)), @bitCast(@as(f32, 1)) }, .{ @bitCast(@as(f32, 3)), @bitCast(@as(f32, -1)), @bitCast(@as(f32, 0.5)), @bitCast(@as(f32, 1)) }, .{ @bitCast(@as(f32, -1)), @bitCast(@as(f32, 3)), @bitCast(@as(f32, 0.5)), @bitCast(@as(f32, 1)) } } }};
+            st.blob = ms;
+            warp.draw(.{ .vs = .{ .blob = vs }, .ps = st, .attrs = &a }, &wpx_ms) catch |e| return warpFail(name, e);
+            st.blob = ours;
+            warp.draw(.{ .vs = .{ .blob = vs }, .ps = st, .attrs = &a }, &wpx_ours) catch |e| return warpFail(name, e);
+            drew = true;
+            same = warpPixels(name, "");
+        },
+        .vertex, .geometry => {
+            // (a geometry shader: fed by a vertex shader made for its inputs,
+            // three points)
+            var vs_st = st;
+            var gs: ?warp.Stage = null;
+            var gs_ours: ?warp.Stage = null;
+            var at: []warp.Attr = undefined;
+            const osg = mc.signature(true) orelse return;
+            if (stage == .geometry) {
+                const isg = mc.signature(false) orelse return;
+                const vsrc = partnerVs(isg, &warp_src);
+                vs_st = .{ .blob = msCompile(vsrc, "vs_4_0", &warp_partner[0]) orelse return };
+                gs = st;
+                gs.?.blob = ms;
+                gs_ours = st;
+                gs_ours.?.blob = ours;
+                at = attrsOf(dxbc.Signature.parse(ct.findChunk(vs_st.blob, "ISGN").?, false) catch return, &attrs);
+            } else at = attrsOf(mc.signature(false), &attrs);
+            var k: u32 = 0;
+            while (k < osg.count) : (k += 1) {
+                const e = osg.get(k).?;
+                if (e.sys != .none) continue;
+                const ps = msCompile(partnerPs(e, &warp_src), "ps_4_0", &warp_partner[1]) orelse return;
+                const topo: u32 = if (stage == .geometry) 1 else 4;
+                var v1 = vs_st;
+                if (stage == .vertex) v1.blob = ms;
+                warp.draw(.{ .vs = v1, .gs = gs, .ps = .{ .blob = ps }, .attrs = at, .topology = topo }, &wpx_ms) catch |err| return warpFail(name, err);
+                var v2 = vs_st;
+                if (stage == .vertex) v2.blob = ours;
+                warp.draw(.{ .vs = v2, .gs = gs_ours, .ps = .{ .blob = ps }, .attrs = at, .topology = topo }, &wpx_ours) catch |err| return warpFail(name, err);
+                drew = true;
+                if (!warpPixels(name, e.name)) same = false;
+            }
+        },
+        else => return,
+    }
+    if (!drew) return;
+    if (same) tally.warp_same += 1 else tally.warp_diff += 1;
+}
+
+fn warpFail(name: []const u8, e: anyerror) void {
+    tally.warp_failed += 1;
+    std.debug.print("  {s}: WARP did not draw: {s}" ++ "\n", .{ name, @errorName(e) });
+}
+
 fn runCase(c: Case, target: []const u8) void {
     tally.cases += 1;
     var label_buf: [64]u8 = undefined;
@@ -724,6 +865,7 @@ fn runCase(c: Case, target: []const u8) void {
     // (refl_ms holds Microsoft's reflection now)
     var keep: ct.Reflection = refl_ms;
     compareDraw(label, ms, r.blob, stage, &keep);
+    compareWarp(label, ms, r.blob, stage, &keep);
 }
 
 test "the HLSL compiler against Microsoft's: signatures, reflection, pixels" {
@@ -743,14 +885,17 @@ test "the HLSL compiler against Microsoft's: signatures, reflection, pixels" {
         \\  signatures: {d} same, {d} different
         \\  reflection: {d} same, {d} different
         \\  pixels:     {d} same, {d} different ({d} pixels drawn); {d} not drawable by the front end, {d} ours refused
+        \\  WARP (Direct3D 11's own rasterizer): {d} same, {d} different ({d} pixels drawn), {d} not drawn
         \\  Direct3D 11 (hardware and WARP): {d} of our shaders accepted, {d} refused
         \\
-    , .{ tally.cases, tally.ms_refused, tally.ours_failed, tally.sig_same, tally.sig_diff, tally.refl_same, tally.refl_diff, tally.draw_same, tally.draw_diff, tally.pixels, tally.draw_skipped, tally.draw_ours_refused, tally.d3d_accepted, tally.d3d_refused });
+    , .{ tally.cases, tally.ms_refused, tally.ours_failed, tally.sig_same, tally.sig_diff, tally.refl_same, tally.refl_diff, tally.draw_same, tally.draw_diff, tally.pixels, tally.draw_skipped, tally.draw_ours_refused, tally.warp_same, tally.warp_diff, tally.warp_pixels, tally.warp_failed, tally.d3d_accepted, tally.d3d_refused });
     try std.testing.expectEqual(@as(u32, 0), tally.ours_failed);
     try std.testing.expectEqual(@as(u32, 0), tally.sig_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.refl_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.draw_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.draw_ours_refused);
     try std.testing.expectEqual(@as(u32, 0), tally.d3d_refused);
+    try std.testing.expectEqual(@as(u32, 0), tally.warp_diff);
+    try std.testing.expectEqual(@as(u32, 0), tally.warp_failed);
     if (d3d_devs[0] != null or d3d_devs[1] != null) try std.testing.expect(checksum_refused);
 }
