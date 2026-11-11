@@ -5,7 +5,26 @@ The goal: Firefox's WebGPU (wgpu's Vulkan backend, `dom.webgpu.enabled` and
 the PC's RTX 5070 (GB206, sm_120), through this ICD. Pure Sig, allocation-free,
 no Mesa; zpm is pinned by Galaxy, never vendored.
 
-## Where it stands (milestone 2, branch `sig-vulkan`)
+## Where it stands (milestone 3, branch `sig-vulkan`)
+
+Milestone 3 (this branch, Galaxy's `webgpu` branch ships it):
+
+- **Galaxy ships the driver** (galaxy `webgpu`): `galaxy/scripts/build-vk.sh`
+  (x86-64: the RTX), `/usr/lib/libvulkan_galaxy.so` and
+  `/usr/share/vulkan/icd.d/galaxy_icd.json` in the root image, Alpine's
+  `vulkan-loader` (musl only, no Mesa) installed with Firefox, apps on the
+  GPU told `VK_DRIVER_FILES=` that manifest, and galaxy.cfg turning
+  `dom.webgpu.enabled` and `gfx.webgpu.ignore-blocklist` on under it.
+- **Firefox's canvases as dma-bufs** (§5, done): VK_KHR_external_memory_fd,
+  VK_EXT_external_memory_dma_buf, VK_EXT_image_drm_format_modifier (linear,
+  one plane), VK_KHR_external_semaphore_fd (opaque and sync_file), external
+  fence fds; the root's Host (gfxapi's: PRIME export/import, fence files).
+- **Swapchains** (§4, done): VK_KHR_surface, VK_KHR_wayland_surface,
+  VK_KHR_swapchain over gfxapi's wayland.Display.
+- **Storage images** in compute shaders and **4x multisampling** that keeps
+  one sample (below).
+- Tests: 33 (`test-vk-wsi` added: Firefox's dma-buf sequence step by step,
+  a FIFO swapchain on a fake compositor).
 
 - `src/spirv`: SPIR-V to KIR (naga's WGSL output first): compute kernels;
   vertex and fragment stages emitted into gfxapi's raster kernels
@@ -62,11 +81,17 @@ wgpu has run against it yet (the first on-hardware check is §1):
 
 ## Graphics: what is still missing (the next work, roughly by need)
 
-- **Storage textures** (OpImageRead/OpImageWrite, STORAGE_IMAGE
-  descriptors): the limit says 4 a stage (WebGPU's default) but pipelines
-  using them fail with a message.
-- **Multisampling**: images are 1 sample; WebGPU requires 4x render targets
-  (sampleCount 4 fails validation in wgpu). The raster has no MSAA.
+- **Storage textures**: compute shaders only (spirv's storageImageOp), in
+  Rgba8 unorm and the 32-bit formats. Not yet: fragment-stage storage
+  images (FRAGMENT_WRITABLE_STORAGE), rgba8snorm/uint/sint and the 16-bit
+  formats, BGRA8 storage, storage texel buffers. Sampled images in compute
+  shaders are not compiled yet either (the texture unit is the raster's).
+- **Multisampling**: 4x is taken (images, attachments, limits, resolves)
+  but keeps one sample a pixel: rendering is right, edges are not
+  antialiased; sample shading, sample masks and alpha-to-coverage are
+  ignored. Real MSAA needs the raster's coverage per sample (src/gfxapi),
+  or a 2x2 supersampled image with a box-filter resolve (viewport, scissor
+  and FragCoord scaled in the ICD).
 - **Points and lines** (logged, not drawn), **primitive restart**, **depth
   bias**, **FragDepth**, **clip/cull distances**, rasterizer depth clamp.
 - **Formats**: the 16-bit float, snorm, 8/16-bit integer, RGB10A2 and
@@ -92,7 +117,7 @@ wgpu has run against it yet (the first on-hardware check is §1):
 - Draws with a negative vertexOffset take attributes from the index (the
   raster has no base vertex); 8-bit indices are refused.
 
-## 1. Galaxy integration (small, first)
+## 1. Galaxy integration (done in galaxy `webgpu`; on-hardware check left)
 
 - `scripts/build-vk.sh` in Galaxy, as `build-gl.sh`: `sig build-lib -dynamic
   -target x86_64-linux-none --name vulkan_galaxy` over the pinned zpm (the
@@ -149,7 +174,12 @@ Not 1.2 while `VK_KHR_driver_properties` would carry conformance version 0:
 wgpu hides such an adapter unless `ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`
 (adapter.rs, `driver.conformance_version.major == 0`).
 
-## 4. Presentation (Wayland swapchain)
+## 4. Presentation (Wayland swapchain): done
+
+What follows was the plan; icd.sig's "Presentation" section is what is.
+The loader keeps its own VkIcdSurfaceWayland (the driver does not make
+surfaces); a swapchain's images are system memory, as EGL's window
+buffers, dma-bufs as linear ARGB8888/XRGB8888 wl_buffers.
 
 wgpu's instance asks for `VK_KHR_surface`, `VK_KHR_wayland_surface` (and
 xlib/xcb), `VK_EXT_swapchain_colorspace`, `VK_KHR_get_physical_device_properties2`,
@@ -167,7 +197,22 @@ always in wgpu's list (dropped quietly when absent; then wgpu has no surfaces).
   commit), FIFO and MAILBOX. `VK_KHR_swapchain_mutable_format` for wgpu's
   `SURFACE_VIEW_FORMATS`.
 
-## 5. Firefox's WebGPU presentation (dma-bufs)
+## 5. Firefox's WebGPU presentation (dma-bufs): done
+
+Firefox 151 (gfx/wgpu_bindings/src/server.rs) takes the dma-buf path only
+when all four extensions are there and OPAQUE_FD semaphores export; it
+then makes a B8G8R8A8_UNORM image with DRM-modifier tiling, dedicated
+exported memory, reads plane 0's layout and the memory's fd, and before
+each submission makes an exportable semaphore whose fd goes with the
+surface. Galaxy's GL has no GL_EXT_semaphore_fd, so WebRender cannot wait
+on it (Firefox logs once and goes on): a submission that signals a
+semaphore made for export waits for its work inside vkQueueSubmit. A
+canvas in another format than bgra8unorm goes by readback, which needs
+nothing more. Left: EXT_semaphore_fd in gfxapi's GL (then no CPU wait),
+and a check on the PC that Firefox's two contexts on the RTX (EGL's and
+this driver's, each its own channel) share the dma-bufs.
+
+The plan, as written before:
 
 Firefox's GPU process does not present through a Vulkan swapchain: it renders
 into textures it exports and hands to WebRender (and the compositor) as
