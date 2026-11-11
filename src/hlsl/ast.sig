@@ -234,8 +234,8 @@ pub const Node = struct {
 
 pub const MAX_TYPES = 8192;
 pub const MAX_MEMBERS = 8192;
-pub const MAX_SYMS = 32768;
-pub const MAX_NODES = 1 << 18;
+pub const MAX_SYMS = 16384;
+pub const MAX_NODES = 1 << 17;
 
 pub const Ast = struct {
     types: [MAX_TYPES]Type,

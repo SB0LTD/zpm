@@ -48,3 +48,9 @@ test "errors come back as fxc-shaped messages" {
     try testing.expect(std.mem.indexOf(u8, r.messages, "error") != null);
     try testing.expect(std.mem.indexOf(u8, r.messages, "undefined_thing") != null);
 }
+
+test "the compiler's tables fit a DLL's static data" {
+    // (demand-paged: only what a compile touches costs memory)
+    try testing.expect(@sizeOf(hlsl.Compiler) < 64 << 20);
+    std.debug.print("Compiler: {d} MiB\n", .{@sizeOf(hlsl.Compiler) >> 20});
+}

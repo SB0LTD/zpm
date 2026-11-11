@@ -59,13 +59,13 @@ pub const Result = struct {
 
 pub const CREATOR = "Galaxy HLSL Compiler (zpm) 1.0";
 
-const TEXT = 4 << 20;
-const RAW_TOKENS = 1 << 18;
-const OUT_TOKENS = 1 << 18;
+const TEXT = 2 << 20;
+const RAW_TOKENS = 1 << 17;
+const OUT_TOKENS = 1 << 17;
 const MACRO_TOKENS = 1 << 16;
 const SCRATCH_TOKENS = 1 << 16;
-const BLOB = 4 << 20;
-const CODE_WORDS = 1 << 20;
+const BLOB = 1 << 20;
+const CODE_WORDS = 1 << 18;
 
 pub const Compiler = struct {
     pool: [TEXT]u8,
@@ -86,7 +86,7 @@ pub const Compiler = struct {
     vmap: [gen.MAX_VREGS]u32,
     sorted: [gen.MAX_VREGS]u32,
     loops: [4096][2]u32,
-    live_arena: [16 << 20]u8,
+    live_arena: [8 << 20]u8,
     live_match: [ir.MAX_INSTS]u32,
     live_dead: [ir.MAX_INSTS]bool,
     code: [CODE_WORDS]u32,

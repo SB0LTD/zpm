@@ -44,9 +44,9 @@ pub const PACK_ROW_MAJOR: u32 = 1 << 3;
 pub const PACK_COLUMN_MAJOR: u32 = 1 << 4;
 pub const ENABLE_BACKWARDS_COMPATIBILITY: u32 = 1 << 12;
 
-pub const MAX_SRCS = 1 << 18;
+pub const MAX_SRCS = 1 << 17;
 pub const MAX_LOCS = 1 << 16;
-pub const MAX_VREGS = 1 << 18;
+pub const MAX_VREGS = 1 << 17;
 const MAX_CB = 16;
 const MAX_RES = 256;
 pub const MAX_ICB = 4096;

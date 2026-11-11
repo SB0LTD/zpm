@@ -87,6 +87,61 @@ const win = if (builtin.os.tag == .windows) struct {
 
 var ms_compile: ?D3DCompileFn = null;
 
+// ── real Direct3D 11 (Windows' runtime and a driver): what it accepts ─────
+
+const D3D11CreateDeviceFn = *const fn (adapter: ?*anyopaque, driver: u32, software: ?*anyopaque, flags: u32, levels: ?[*]const u32, nlevels: u32, sdk: u32, dev: *?*anyopaque, level: ?*u32, ctx: ?*?*anyopaque) callconv(.winapi) i32;
+const CreateShaderFn = *const fn (dev: *anyopaque, code: [*]const u8, len: usize, linkage: ?*anyopaque, out: *?*anyopaque) callconv(.winapi) i32;
+const ReleaseFn = *const fn (obj: *anyopaque) callconv(.winapi) u32;
+
+/// Devices: a hardware one (its driver compiles the DXBC) and WARP.
+var d3d_devs: [2]?*anyopaque = .{ null, null };
+var d3d_tried = false;
+var checksum_refused = false;
+
+fn d3dDevices() void {
+    if (builtin.os.tag != .windows or d3d_tried) return;
+    d3d_tried = true;
+    const m = win.LoadLibraryA("d3d11.dll") orelse return;
+    const create: D3D11CreateDeviceFn = @ptrCast(win.GetProcAddress(m, "D3D11CreateDevice") orelse return);
+    const levels = [_]u32{0xb000};
+    // (D3D_DRIVER_TYPE_HARDWARE 1, WARP 5)
+    for ([_]u32{ 1, 5 }, 0..) |driver, k| {
+        var dev: ?*anyopaque = null;
+        if (create(null, driver, null, 0, &levels, 1, 7, &dev, null, null) >= 0) d3d_devs[k] = dev;
+    }
+}
+
+fn vtFn(obj: *anyopaque, index: usize) *const anyopaque {
+    const vt: *const [*]const *const anyopaque = @ptrCast(@alignCast(obj));
+    return vt.*[index];
+}
+
+/// Whether every device takes the blob as a shader of its stage
+/// (ID3D11Device::CreateVertexShader 12, CreateGeometryShader 13,
+/// CreatePixelShader 15).
+fn d3dAccepts(blob: []const u8, stage: dxbc.Stage, name: []const u8) bool {
+    var ok = true;
+    for (d3d_devs, 0..) |d, k| {
+        const dev = d orelse continue;
+        const slot: usize = switch (stage) {
+            .vertex => 12,
+            .geometry => 13,
+            else => 15,
+        };
+        const f: CreateShaderFn = @ptrCast(vtFn(dev, slot));
+        var sh: ?*anyopaque = null;
+        const hres = f(dev, blob.ptr, blob.len, null, &sh);
+        if (hres < 0) {
+            std.debug.print("  {s}: Direct3D 11 ({s}) refused our shader: 0x{x}\n", .{ name, if (k == 0) "hardware" else "WARP", @as(u32, @bitCast(hres)) });
+            ok = false;
+        } else if (sh) |s| {
+            const rel: ReleaseFn = @ptrCast(vtFn(s, 2));
+            _ = rel(s);
+        }
+    }
+    return ok;
+}
+
 fn loadMs() bool {
     if (builtin.os.tag != .windows) return false;
     if (ms_compile != null) return true;
@@ -138,6 +193,9 @@ const Tally = struct {
     /// the front end ran Microsoft's program but not ours
     draw_ours_refused: u32 = 0,
     pixels: u64 = 0,
+    /// Direct3D 11's runtime and drivers took our blob (or refused it)
+    d3d_accepted: u32 = 0,
+    d3d_refused: u32 = 0,
 };
 
 var tally = Tally{};
@@ -648,6 +706,17 @@ fn runCase(c: Case, target: []const u8) void {
     if (s1 and s2) tally.sig_same += 1 else tally.sig_diff += 1;
     if (reflSame(label, ms, r.blob)) tally.refl_same += 1 else tally.refl_diff += 1;
     const stage = (mc.program() catch return).stage;
+    if (d3d_devs[0] != null or d3d_devs[1] != null) {
+        if (d3dAccepts(r.blob, stage, label)) tally.d3d_accepted += 1 else tally.d3d_refused += 1;
+        // (the control: one checksum bit wrong, and Direct3D must refuse it)
+        if (tally.cases == 1) {
+            var bad: [1 << 16]u8 = undefined;
+            @memcpy(bad[0..r.blob.len], r.blob);
+            bad[4] ^= 1;
+            std.debug.print("  (a damaged checksum, expected to be refused:)\n", .{});
+            checksum_refused = !d3dAccepts(bad[0..r.blob.len], stage, label);
+        }
+    }
     // (refl_ms holds Microsoft's reflection now)
     var keep: ct.Reflection = refl_ms;
     compareDraw(label, ms, r.blob, stage, &keep);
@@ -656,6 +725,7 @@ fn runCase(c: Case, target: []const u8) void {
 test "the HLSL compiler against Microsoft's: signatures, reflection, pixels" {
     if (!loadMs()) return error.SkipZigTest;
     tally = .{};
+    d3dDevices();
     for (corpus) |c| {
         const gs = std.mem.startsWith(u8, c.name, "gs_");
         const v4 = if (std.mem.startsWith(u8, c.name, "vs_")) "vs_4_0" else if (gs) "gs_4_0" else "ps_4_0";
@@ -669,11 +739,14 @@ test "the HLSL compiler against Microsoft's: signatures, reflection, pixels" {
         \\  signatures: {d} same, {d} different
         \\  reflection: {d} same, {d} different
         \\  pixels:     {d} same, {d} different ({d} pixels drawn); {d} not drawable by the front end, {d} ours refused
+        \\  Direct3D 11 (hardware and WARP): {d} of our shaders accepted, {d} refused
         \\
-    , .{ tally.cases, tally.ms_refused, tally.ours_failed, tally.sig_same, tally.sig_diff, tally.refl_same, tally.refl_diff, tally.draw_same, tally.draw_diff, tally.pixels, tally.draw_skipped, tally.draw_ours_refused });
+    , .{ tally.cases, tally.ms_refused, tally.ours_failed, tally.sig_same, tally.sig_diff, tally.refl_same, tally.refl_diff, tally.draw_same, tally.draw_diff, tally.pixels, tally.draw_skipped, tally.draw_ours_refused, tally.d3d_accepted, tally.d3d_refused });
     try std.testing.expectEqual(@as(u32, 0), tally.ours_failed);
     try std.testing.expectEqual(@as(u32, 0), tally.sig_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.refl_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.draw_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.draw_ours_refused);
+    try std.testing.expectEqual(@as(u32, 0), tally.d3d_refused);
+    if (d3d_devs[0] != null or d3d_devs[1] != null) try std.testing.expect(checksum_refused);
 }

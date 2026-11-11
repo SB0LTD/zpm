@@ -220,7 +220,7 @@ pub const Inst = struct {
 pub const CTL_SAT: u16 = 1 << 2; // (bit 13 of the token)
 pub const CTL_NZ: u16 = 1 << 7; // (bit 18)
 
-pub const MAX_INSTS = 1 << 16;
+pub const MAX_INSTS = 1 << 15;
 
 pub const Program = struct {
     insts: [MAX_INSTS]Inst,
