@@ -19,6 +19,7 @@ pub const ir = @import("ir.sig");
 pub const gen = @import("gen.sig");
 pub const container = @import("container.sig");
 pub const live = @import("live.sig");
+pub const disasm = @import("disasm.sig");
 
 pub const Include = pp.Include;
 pub const Define = pp.Define;
@@ -133,6 +134,40 @@ pub const Compiler = struct {
         if (c.prog.nvregs == 0) ntemps = 0;
         const n = c.assemble(target, o.flags, ntemps) orelse return c.failed();
         return .{ .ok = true, .blob = c.blob[0..n], .messages = c.log.text() };
+    }
+
+    /// The preprocessed source (D3DPreprocess): the tokens, a line each as
+    /// the source has them, `#line` where a file changes.
+    pub fn preprocess(c: *Compiler, src: []const u8, o: Options) Result {
+        c.log = .{ .buf = &c.msgs, .file_name = if (o.source_name.len > 0) o.source_name else "hlsl" };
+        c.pp = .{ .pool = &c.pool, .raw = &c.raw, .out = &c.out, .mtoks = &c.mtoks, .scratch = &c.scratch, .xout = &c.xout, .macros = &c.macros, .log = &c.log, .include = o.include };
+        for (o.defines) |d| c.pp.defineText(d.name, d.value);
+        if (!c.pp.run(src, c.log.file_name)) return c.failed();
+        var w = container.W{ .buf = &c.blob };
+        var line: u32 = 1;
+        var file: u8 = 0;
+        for (c.out[0..c.pp.out_len], 0..) |t, k| {
+            if (k > 0 and (t.line() != line or t.file() != file)) {
+                w.bytes("\n");
+                if (t.file() != file) {
+                    var b: [32]u8 = undefined;
+                    w.bytes(std.fmt.bufPrint(&b, "#line {d}\n", .{t.line()}) catch "");
+                }
+            } else if (k > 0) w.bytes(" ");
+            line = t.line();
+            file = t.file();
+            switch (t.kind) {
+                .pragma_row_major => w.bytes("#pragma pack_matrix(row_major)"),
+                .pragma_column_major => w.bytes("#pragma pack_matrix(column_major)"),
+                else => w.bytes(c.pp.text(t)),
+            }
+        }
+        w.bytes("\n");
+        if (w.over) {
+            c.log.err(0, "preprocessed text too long", .{});
+            return c.failed();
+        }
+        return .{ .ok = true, .blob = c.blob[0..w.n], .messages = c.log.text() };
     }
 
     fn failed(c: *Compiler) Result {
@@ -655,5 +690,6 @@ test {
     _ = pp;
     _ = ir;
     _ = container;
+    _ = disasm;
     _ = @import("tests.sig");
 }

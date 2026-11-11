@@ -157,6 +157,36 @@ pub const SigElem = struct {
     stream: u32 = 0,
 };
 
+/// A signature chunk's element k (ISGN/OSGN: 24 bytes each; OSG5: 28,
+/// the stream first), or null past its end.
+pub fn sigElem(d: []const u8, streams: bool, k: u32) ?SigElem {
+    if (d.len < 8) return null;
+    const n = rd(d, 0);
+    if (k >= n) return null;
+    const stride: u32 = if (streams) 28 else 24;
+    var at = rd(d, 4) + k * stride;
+    if (at + stride > d.len) return null;
+    var stream: u32 = 0;
+    if (streams) {
+        stream = rd(d, at);
+        at += 4;
+    }
+    return .{
+        .name = cstr(d, rd(d, at)),
+        .index = rd(d, at + 4),
+        .sys = rd(d, at + 8),
+        .comp = rd(d, at + 12),
+        .reg = rd(d, at + 16),
+        .mask = d[at + 20],
+        .rw = d[at + 21],
+        .stream = stream,
+    };
+}
+
+pub fn sigCount(d: []const u8) u32 {
+    return if (d.len < 8) 0 else rd(d, 0);
+}
+
 /// An ISGN/OSGN chunk's bytes (OSG5 with `streams`).
 pub fn signature(w: *W, elems: []const SigElem, streams: bool) void {
     const base = w.n;

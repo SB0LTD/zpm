@@ -97,6 +97,7 @@ const ReleaseFn = *const fn (obj: *anyopaque) callconv(.winapi) u32;
 var d3d_devs: [2]?*anyopaque = .{ null, null };
 var d3d_tried = false;
 var checksum_refused = false;
+var listing: [256 * 1024]u8 = undefined;
 
 fn d3dDevices() void {
     if (builtin.os.tag != .windows or d3d_tried) return;
@@ -706,6 +707,9 @@ fn runCase(c: Case, target: []const u8) void {
     if (s1 and s2) tally.sig_same += 1 else tally.sig_diff += 1;
     if (reflSame(label, ms, r.blob)) tally.refl_same += 1 else tally.refl_diff += 1;
     const stage = (mc.program() catch return).stage;
+    // (both containers list as D3DDisassemble gives them)
+    _ = hlsl.disasm.disassemble(ms, &listing) catch |e| std.debug.print("  {s}: Microsoft's blob does not list: {s}\n", .{ label, @errorName(e) });
+    _ = hlsl.disasm.disassemble(r.blob, &listing) catch |e| std.debug.print("  {s}: ours does not list: {s}\n", .{ label, @errorName(e) });
     if (d3d_devs[0] != null or d3d_devs[1] != null) {
         if (d3dAccepts(r.blob, stage, label)) tally.d3d_accepted += 1 else tally.d3d_refused += 1;
         // (the control: one checksum bit wrong, and Direct3D must refuse it)

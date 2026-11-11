@@ -42,6 +42,23 @@ test "a vertex shader: a matrix from the globals, a struct in and out" {
     try testing.expectEqual(@as(u32, 64), r.vars[0].size);
 }
 
+test "preprocessing alone (D3DPreprocess)" {
+    const r = compiler.preprocess("#define K 2\nfloat f() { return K * 3; }\n#if K > 1\nint x;\n#endif\n", .{ .target = "ps_4_0" });
+    try testing.expect(r.ok);
+    try testing.expect(std.mem.indexOf(u8, r.blob, "return 2 * 3") != null);
+    try testing.expect(std.mem.indexOf(u8, r.blob, "int x ;") != null);
+}
+
+test "signature elements read back" {
+    const blob = try compileOk("float4 main(float4 p : SV_Position, float2 uv : TEXCOORD3) : SV_Target { return uv.xyxy; }", "ps_4_0");
+    const isg = ct.findChunk(blob, "ISGN").?;
+    try testing.expectEqual(@as(u32, 2), ct.sigCount(isg));
+    const e = ct.sigElem(isg, false, 1).?;
+    try testing.expectEqualStrings("TEXCOORD", e.name);
+    try testing.expectEqual(@as(u32, 3), e.index);
+    try testing.expectEqual(@as(u8, 3), e.mask);
+}
+
 test "errors come back as fxc-shaped messages" {
     const r = compiler.compile("float4 main() : SV_Target { return undefined_thing; }", .{ .target = "ps_4_0" });
     try testing.expect(!r.ok);
