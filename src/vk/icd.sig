@@ -175,6 +175,13 @@ const QUERY_BYTES = 16;
 pub const MAX_SEMAPHORES = 1024;
 const MAX_PENDING = 16;
 const MAX_CACHES = 64;
+/// Pipeline caches' compiled binaries: one arena for every cache's
+/// entries (and the driver's own, cache DRIVER_CACHE: every compute
+/// pipeline compiled, found again by its key whichever cache the app
+/// names).
+const CACHE_ARENA = 8 << 20;
+const MAX_CACHE_ENTRIES = 1024;
+const DRIVER_CACHE: u32 = MAX_CACHES;
 /// Dispatches one gpu.Device run takes from a submission.
 const MAX_RUN = 256;
 const MAX_RUN_PARAMS = 2 * spirv.MAX_BINDINGS + MAX_PUSH_BYTES / 4 + 4 * spirv.MAX_BINDINGS + 8;
@@ -389,6 +396,10 @@ const T = struct {
     var fences: [MAX_FENCES]Fence = undefined;
     var semaphores: [MAX_SEMAPHORES]Semaphore = undefined;
     var caches: [MAX_CACHES]bool = undefined;
+    var cache_arena: [CACHE_ARENA]u8 align(8) = undefined;
+    var cache_used: usize = 0;
+    var cache_entries: [MAX_CACHE_ENTRIES]CacheEntry = undefined;
+    var cache_hits: u64 = 0;
     var query_pools: [MAX_QUERY_POOLS]QueryPool = undefined;
     // compiling
     var scratch: spirv.Scratch = undefined;
@@ -396,6 +407,8 @@ const T = struct {
     var tys: [1 << 16]kir.Ty = undefined;
     var kernel: kir.Kernel = undefined;
     var code: [2 << 20]u8 align(16) = undefined;
+    /// a pipeline cache's blob, made (or copied) before it goes into the arena
+    var blob: [(2 << 20) + 4096]u8 align(8) = undefined;
     // running
     var ds: [MAX_RUN]gpu.Dispatch = undefined;
     var ds_bufs: [MAX_RUN][spirv.MAX_BINDINGS]gpu.Buffer = undefined;
@@ -451,6 +464,8 @@ fn ready() void {
     markAll("swapchains");
     markAll("query_pools");
     for (&T.caches) |*c| c.* = false;
+    for (&T.cache_entries) |*e| e.live = false;
+    T.cache_used = 0;
     T.desc_map = .{};
     T.shader_map = .{};
     T.cmd_map = .{};
@@ -761,8 +776,7 @@ fn properties() abi.PhysicalDeviceProperties {
     var name: [256]u8 = undefined;
     const text = std.fmt.bufPrint(&name, "Galaxy Vulkan ({s})", .{caps.name}) catch name[0..];
     copyName(&p.deviceName, text);
-    const uuid = "galaxy-vk-0.1.0\x00";
-    @memcpy(&p.pipelineCacheUUID, uuid[0..16]);
+    p.pipelineCacheUUID = CACHE_UUID;
     p.limits = limits(caps);
     return p;
 }
@@ -1733,15 +1747,186 @@ fn unrefShader(i: u32) void {
     s.live = false;
 }
 
-fn createPipelineCache(_: ?*anyopaque, _: ?*const abi.PipelineCacheCreateInfo, _: ?*const anyopaque, out: ?*u64) callconv(.c) Result {
+// ── Pipeline caches ────────────────────────────────────────────────────────
+//
+// An entry is a compute pipeline's compiled binary and its front end's
+// Info, under a key: SHA-256 of what the compile depends on (the target,
+// the subgroup width, robustness, the entry point, the specialization and
+// the SPIR-V). vkGetPipelineCacheData writes Vulkan's 32-byte header
+// (version one, the ids, CACHE_UUID) and then each entry as its key, its
+// length (u32) and its blob; vkCreatePipelineCache reads that back. The
+// UUID carries the blob's format and the Info's size, so another build's
+// data is refused as a whole.
+
+const CacheEntry = struct { live: bool, cache: u32, key: [32]u8, at: u32, len: u32 };
+const BLOB_MAGIC: u32 = 0x5056_4b47; // "GKVP"
+const BLOB_HEAD_WORDS = 8 + 16 + 3;
+const CACHE_UUID: [16]u8 = blk: {
+    var u: [16]u8 = "galaxy-vk-pc1...".*;
+    const n = @sizeOf(spirv.Info);
+    u[13] = "0123456789abcdef"[(n >> 8) & 15];
+    u[14] = "0123456789abcdef"[(n >> 4) & 15];
+    u[15] = "0123456789abcdef"[n & 15];
+    break :blk u;
+};
+
+/// Compute pipelines found in a cache instead of compiled (tests).
+pub fn cacheHits() u64 {
+    return T.cache_hits;
+}
+
+fn cacheFind(cache: u32, key: *const [32]u8) ?*CacheEntry {
+    for (&T.cache_entries) |*e| {
+        if (e.live and e.cache == cache and std.mem.eql(u8, &e.key, key)) return e;
+    }
+    return null;
+}
+
+/// Room for `n` bytes in the arena: the driver's own entries dropped and
+/// the live ones moved down when it is full.
+fn cacheRoom(n: usize) ?usize {
+    if (n > CACHE_ARENA) return null;
+    if (T.cache_used + n > CACHE_ARENA) {
+        for (&T.cache_entries) |*e| {
+            if (e.live and e.cache == DRIVER_CACHE) e.live = false;
+        }
+        // (compaction: entries in arena order)
+        var at: usize = 0;
+        while (true) {
+            var next: ?*CacheEntry = null;
+            for (&T.cache_entries) |*e| {
+                if (e.live and e.at >= at and (next == null or e.at < next.?.at)) next = e;
+            }
+            const e = next orelse break;
+            if (e.at != at) std.mem.copyForwards(u8, T.cache_arena[at..][0..e.len], T.cache_arena[e.at..][0..e.len]);
+            e.at = @intCast(at);
+            at = std.mem.alignForward(usize, at + e.len, 8);
+        }
+        T.cache_used = at;
+        if (T.cache_used + n > CACHE_ARENA) return null;
+    }
+    const at = T.cache_used;
+    T.cache_used = std.mem.alignForward(usize, at + n, 8);
+    return at;
+}
+
+/// A copy of `blob` under `key` in cache `cache` (none when one is there).
+/// `blob` must not be in the arena (a compaction would move it).
+fn cacheInsert(cache: u32, key: *const [32]u8, blob: []const u8) void {
+    if (cacheFind(cache, key) != null) return;
+    const slot = for (&T.cache_entries) |*e| {
+        if (!e.live) break e;
+    } else return;
+    const at = cacheRoom(blob.len) orelse return;
+    @memcpy(T.cache_arena[at..][0..blob.len], blob);
+    slot.* = .{ .live = true, .cache = cache, .key = key.*, .at = @intCast(at), .len = @intCast(blob.len) };
+}
+
+/// A pipeline's blob: the binary's fields, the Info, the code.
+fn blobOf(bin: *const gpu.Binary, info: *const spirv.Info, out: []u8) ?[]u8 {
+    const head = BLOB_HEAD_WORDS * 4;
+    const n = head + @sizeOf(spirv.Info) + bin.code.len;
+    if (n > out.len) return null;
+    var w: [BLOB_HEAD_WORDS]u32 = undefined;
+    w[0] = BLOB_MAGIC;
+    w[1] = @intFromEnum(bin.target);
+    w[2] = bin.regs;
+    w[3] = bin.shared_bytes;
+    w[4] = bin.bindings;
+    w[5] = bin.param_words;
+    w[6] = bin.writes;
+    w[7] = @intCast(bin.code.len);
+    @memcpy(w[8..24], &bin.extra);
+    @memcpy(w[24..27], &bin.group);
+    @memcpy(out[0..head], std.mem.sliceAsBytes(&w));
+    @memcpy(out[head..][0..@sizeOf(spirv.Info)], std.mem.asBytes(info));
+    @memcpy(out[head + @sizeOf(spirv.Info) ..][0..bin.code.len], bin.code);
+    return out[0..n];
+}
+
+/// A blob back into a binary (its code in the blob) and an Info; false
+/// when it does not hold together.
+fn blobRead(blob: []const u8, bin: *gpu.Binary, info: *spirv.Info) bool {
+    const head = BLOB_HEAD_WORDS * 4;
+    if (blob.len < head + @sizeOf(spirv.Info)) return false;
+    var w: [BLOB_HEAD_WORDS]u32 = undefined;
+    @memcpy(std.mem.sliceAsBytes(&w), blob[0..head]);
+    if (w[0] != BLOB_MAGIC or w[1] > @intFromEnum(gpu.Target.gcn4_gfx803)) return false;
+    if (blob.len != head + @sizeOf(spirv.Info) + w[7]) return false;
+    @memcpy(std.mem.asBytes(info), blob[head..][0..@sizeOf(spirv.Info)]);
+    if (info.n_bindings > spirv.MAX_BINDINGS or info.n_images > info.n_bindings or info.push_bytes > MAX_PUSH_BYTES) return false;
+    if (w[4] > 255 or w[5] > 0xffff) return false;
+    bin.* = .{
+        .target = @enumFromInt(w[1]),
+        .code = blob[head + @sizeOf(spirv.Info) ..],
+        .regs = w[2],
+        .shared_bytes = w[3],
+        .group = w[24..27].*,
+        .bindings = @intCast(w[4]),
+        .param_words = @intCast(w[5]),
+        .writes = w[6],
+    };
+    @memcpy(&bin.extra, w[8..24]);
+    return true;
+}
+
+/// The key of compute stage `stage` compiled with `opts`.
+fn pipelineKey(stage: *const abi.PipelineShaderStageCreateInfo, words: []const u32, opts: *const spirv.Options, out: *[32]u8) void {
+    const g = theGpu().?;
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(&CACHE_UUID);
+    const head = [_]u32{ @intFromEnum(g.dev.caps.target), opts.subgroup, @intFromBool(opts.robust), @intCast(opts.spec.len), @intCast(opts.spec_data.len) };
+    h.update(std.mem.sliceAsBytes(&head));
+    h.update(cstr(stage.pName));
+    h.update(&.{0});
+    for (opts.spec) |e| h.update(std.mem.asBytes(&[3]u32{ @intCast(e.id), @intCast(e.offset), @intCast(e.size) }));
+    h.update(opts.spec_data);
+    h.update(std.mem.sliceAsBytes(words));
+    h.final(out);
+}
+
+fn createPipelineCache(dh: ?*anyopaque, info: ?*const abi.PipelineCacheCreateInfo, _: ?*const anyopaque, out: ?*u64) callconv(.c) Result {
     lock();
     defer unlock();
+    _ = devOf(dh) orelse return R.error_initialization_failed;
+    const ci = info orelse return R.error_initialization_failed;
     for (&T.caches, 0..) |*c, i| if (!c.*) {
         c.* = true;
+        // initial data another run wrote: taken when its header is ours
+        // (an entry that does not fit: it and the rest ignored)
+        if (ci.pInitialData) |pd| {
+            const data = @as([*]const u8, @ptrCast(pd))[0..ci.initialDataSize];
+            cacheLoad(@intCast(i), data);
+        }
         (out orelse return R.error_initialization_failed).* = handle(.cache, @intCast(i));
         return R.success;
     };
     return R.error_too_many_objects;
+}
+
+fn cacheHeader() [32]u8 {
+    var hd: [32]u8 = undefined;
+    const p = properties();
+    std.mem.writeInt(u32, hd[0..4], 32, .little);
+    std.mem.writeInt(u32, hd[4..8], 1, .little); // VK_PIPELINE_CACHE_HEADER_VERSION_ONE
+    std.mem.writeInt(u32, hd[8..12], p.vendorID, .little);
+    std.mem.writeInt(u32, hd[12..16], p.deviceID, .little);
+    @memcpy(hd[16..32], &CACHE_UUID);
+    return hd;
+}
+
+fn cacheLoad(cache: u32, data: []const u8) void {
+    if (theGpu() == null or data.len < 32) return;
+    const want = cacheHeader();
+    if (!std.mem.eql(u8, data[0..32], &want)) return;
+    var at: usize = 32;
+    while (at + 36 <= data.len) {
+        const key = data[at..][0..32];
+        const len = std.mem.readInt(u32, data[at + 32 ..][0..4], .little);
+        if (at + 36 + len > data.len) return;
+        cacheInsert(cache, key, data[at + 36 ..][0..len]);
+        at += 36 + len;
+    }
 }
 
 fn destroyPipelineCache(_: ?*anyopaque, h: u64, _: ?*const anyopaque) callconv(.c) void {
@@ -1749,19 +1934,66 @@ fn destroyPipelineCache(_: ?*anyopaque, h: u64, _: ?*const anyopaque) callconv(.
     defer unlock();
     const i = unhandle(.cache, h) orelse return;
     T.caches[i] = false;
+    for (&T.cache_entries) |*e| {
+        if (e.live and e.cache == i) e.live = false;
+    }
 }
 
-fn getPipelineCacheData(_: ?*anyopaque, _: u64, size: ?*usize, _: ?*anyopaque) callconv(.c) Result {
-    // (nothing is cached: compiles are fast enough for now)
-    (size orelse return R.error_initialization_failed).* = 0;
+fn getPipelineCacheData(dh: ?*anyopaque, h: u64, size: ?*usize, data: ?*anyopaque) callconv(.c) Result {
+    lock();
+    defer unlock();
+    _ = devOf(dh) orelse return R.error_initialization_failed;
+    const i = unhandle(.cache, h) orelse return R.error_initialization_failed;
+    const sz = size orelse return R.error_initialization_failed;
+    var total: usize = 32;
+    for (&T.cache_entries) |*e| {
+        if (e.live and e.cache == i) total += 36 + e.len;
+    }
+    const dst: [*]u8 = @ptrCast(data orelse {
+        sz.* = total;
+        return R.success;
+    });
+    if (sz.* < 32) {
+        sz.* = 0;
+        return R.incomplete;
+    }
+    const hd = cacheHeader();
+    @memcpy(dst[0..32], &hd);
+    var at: usize = 32;
+    for (&T.cache_entries) |*e| {
+        if (!e.live or e.cache != i) continue;
+        if (at + 36 + e.len > sz.*) {
+            sz.* = at;
+            return R.incomplete;
+        }
+        @memcpy(dst[at..][0..32], &e.key);
+        std.mem.writeInt(u32, dst[at + 32 ..][0..4], e.len, .little);
+        @memcpy(dst[at + 36 ..][0..e.len], T.cache_arena[e.at..][0..e.len]);
+        at += 36 + e.len;
+    }
+    sz.* = at;
     return R.success;
 }
 
-fn mergePipelineCaches(_: ?*anyopaque, _: u64, _: u32, _: ?[*]const u64) callconv(.c) Result {
+fn mergePipelineCaches(_: ?*anyopaque, dst: u64, n: u32, srcs: ?[*]const u64) callconv(.c) Result {
+    lock();
+    defer unlock();
+    const d = unhandle(.cache, dst) orelse return R.error_initialization_failed;
+    for (0..n) |j| {
+        const s = unhandle(.cache, srcs.?[j]) orelse continue;
+        if (s == d) continue;
+        for (0..MAX_CACHE_ENTRIES) |k| {
+            const e = T.cache_entries[k];
+            if (!e.live or e.cache != s) continue;
+            // (through the scratch: an insert may move the arena's blobs)
+            @memcpy(T.blob[0..e.len], T.cache_arena[e.at..][0..e.len]);
+            cacheInsert(d, &e.key, T.blob[0..e.len]);
+        }
+    }
     return R.success;
 }
 
-fn compilePipeline(di: u32, ci: *const abi.ComputePipelineCreateInfo) ?Pipeline {
+fn compilePipeline(di: u32, ci: *const abi.ComputePipelineCreateInfo, cache: u32) ?Pipeline {
     const g = theGpu() orelse return null;
     const stage = ci.stage;
     if (stage.stage != 0x20) return null;
@@ -1782,7 +2014,25 @@ fn compilePipeline(di: u32, ci: *const abi.ComputePipelineCreateInfo) ?Pipeline 
             opts.spec_data = data[0..sp[0].dataSize];
         }
     }
-    var gen = spirv.init(T.shader_words[sh.at..][0..sh.n], &T.scratch, opts);
+    const words = T.shader_words[sh.at..][0..sh.n];
+    var key: [32]u8 = undefined;
+    pipelineKey(&stage, words, &opts, &key);
+    // the app's cache, then the driver's: the binary as compiled before
+    for ([_]u32{ cache, DRIVER_CACHE }) |c| {
+        if (c == NONE) continue;
+        const e = cacheFind(c, &key) orelse continue;
+        var cbin: gpu.Binary = undefined;
+        var cinfo: spirv.Info = undefined;
+        if (!blobRead(T.cache_arena[e.at..][0..e.len], &cbin, &cinfo)) continue;
+        const prog = g.dev.load(&cbin) catch continue;
+        T.cache_hits += 1;
+        if (c != cache and cache != NONE) {
+            @memcpy(T.blob[0..e.len], T.cache_arena[e.at..][0..e.len]);
+            cacheInsert(cache, &key, T.blob[0..e.len]);
+        }
+        return .{ .live = true, .dev = di, .prog = prog, .info = cinfo, .writes = cbin.writes, .param_words = cbin.param_words };
+    }
+    var gen = spirv.init(words, &T.scratch, opts);
     const name = cstr(stage.pName);
     const info = gen.compile(name, .{ .insts = &T.insts, .tys = &T.tys }, &T.kernel) catch |e| {
         say("vkCreateComputePipelines: {s}: {s} ({s})", .{ name, gen.diag(), @errorName(e) });
@@ -1797,10 +2047,14 @@ fn compilePipeline(di: u32, ci: *const abi.ComputePipelineCreateInfo) ?Pipeline 
         say("vkCreateComputePipelines: {s}: the device did not load it ({s})", .{ name, @errorName(e) });
         return null;
     };
+    if (blobOf(&bin, &info, T.blob[0..])) |blob| {
+        cacheInsert(DRIVER_CACHE, &key, blob);
+        if (cache != NONE) cacheInsert(cache, &key, blob);
+    }
     return .{ .live = true, .dev = di, .prog = prog, .info = info, .writes = bin.writes, .param_words = bin.param_words };
 }
 
-fn createComputePipelines(dh: ?*anyopaque, _: u64, n: u32, infos: ?[*]const abi.ComputePipelineCreateInfo, _: ?*const anyopaque, out: ?[*]u64) callconv(.c) Result {
+fn createComputePipelines(dh: ?*anyopaque, cache_h: u64, n: u32, infos: ?[*]const abi.ComputePipelineCreateInfo, _: ?*const anyopaque, out: ?[*]u64) callconv(.c) Result {
     lock();
     defer unlock();
     const di = devOf(dh) orelse return R.error_initialization_failed;
@@ -1812,7 +2066,8 @@ fn createComputePipelines(dh: ?*anyopaque, _: u64, n: u32, infos: ?[*]const abi.
             res = R.error_out_of_host_memory;
             continue;
         };
-        const p = compilePipeline(di, &infos.?[j]) orelse {
+        const cache = if (unhandle(.cache, cache_h)) |c| (if (T.caches[c]) c else NONE) else NONE;
+        const p = compilePipeline(di, &infos.?[j], cache) orelse {
             res = R.error_unknown;
             continue;
         };

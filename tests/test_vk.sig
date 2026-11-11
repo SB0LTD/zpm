@@ -707,6 +707,81 @@ test "vk: timestamp and occlusion queries on KIR's interpreter" {
     try queriesThroughVulkan(&openInterp);
 }
 
+fn pipelineCacheRoundTrip(open: *const fn () ?icd.Gpu) !void {
+    use(open);
+    var v = try Vk.open();
+    defer v.close();
+    const layout = try v.setLayout(&.{ STORAGE, STORAGE, UNIFORM });
+    const plci = abi.PipelineLayoutCreateInfo{ .sType = ST.pipeline_layout_create_info, .pNext = null, .flags = 0, .setLayoutCount = 1, .pSetLayouts = @ptrCast(&layout), .pushConstantRangeCount = 0, .pPushConstantRanges = null };
+    var pl_layout: H = 0;
+    try testing.expectEqual(R.success, v.f("vkCreatePipelineLayout", *const fn (Ptr, *const abi.PipelineLayoutCreateInfo, ?*const anyopaque, *H) callconv(.c) Res)(v.dev, &plci, null, &pl_layout));
+    const module = try v.shader(&Shaders.axpy);
+    const create_cache = v.f("vkCreatePipelineCache", *const fn (Ptr, *const abi.PipelineCacheCreateInfo, ?*const anyopaque, *H) callconv(.c) Res);
+    const cache_data = v.f("vkGetPipelineCacheData", *const fn (Ptr, H, *usize, ?*anyopaque) callconv(.c) Res);
+    const destroy_cache = v.f("vkDestroyPipelineCache", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void);
+    const empty = abi.PipelineCacheCreateInfo{ .sType = 17, .pNext = null, .flags = 0, .initialDataSize = 0, .pInitialData = null };
+    var a: H = 0;
+    try testing.expectEqual(R.success, create_cache(v.dev, &empty, null, &a));
+    const stage = abi.PipelineShaderStageCreateInfo{ .sType = ST.pipeline_shader_stage_create_info, .pNext = null, .flags = 0, .stage = 0x20, .module = module, .pName = "main", .pSpecializationInfo = null };
+    const ci = abi.ComputePipelineCreateInfo{ .sType = ST.compute_pipeline_create_info, .pNext = null, .flags = 0, .stage = stage, .layout = pl_layout, .basePipelineHandle = 0, .basePipelineIndex = -1 };
+    const create = v.f("vkCreateComputePipelines", *const fn (Ptr, H, u32, [*]const abi.ComputePipelineCreateInfo, ?*const anyopaque, [*]H) callconv(.c) Res);
+    const destroy = v.f("vkDestroyPipeline", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void);
+    const hits0 = icd.cacheHits();
+    var p1: H = 0;
+    try testing.expectEqual(R.success, create(v.dev, a, 1, @ptrCast(&ci), null, @ptrCast(&p1)));
+    try testing.expectEqual(hits0, icd.cacheHits());
+    // the data: the header (32 bytes, version one, the UUID), one entry
+    var n: usize = 0;
+    try testing.expectEqual(R.success, cache_data(v.dev, a, &n, null));
+    try testing.expect(n > 32 + 36);
+    var data: [64 << 10]u8 = undefined;
+    try testing.expect(n <= data.len);
+    var short: usize = 40;
+    try testing.expectEqual(R.incomplete, cache_data(v.dev, a, &short, &data));
+    try testing.expectEqual(@as(usize, 32), short);
+    try testing.expectEqual(R.success, cache_data(v.dev, a, &n, &data));
+    try testing.expectEqual(@as(u32, 32), std.mem.readInt(u32, data[0..4], .little));
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, data[4..8], .little));
+    var props: abi.PhysicalDeviceProperties = undefined;
+    var pd: [1]Ptr = undefined;
+    var one: u32 = 1;
+    _ = v.f("vkEnumeratePhysicalDevices", *const fn (Ptr, *u32, ?[*]Ptr) callconv(.c) Res)(v.inst, &one, &pd);
+    v.f("vkGetPhysicalDeviceProperties", *const fn (Ptr, *abi.PhysicalDeviceProperties) callconv(.c) void)(pd[0], &props);
+    try testing.expectEqualSlices(u8, &props.pipelineCacheUUID, data[16..32]);
+    destroy(v.dev, p1, null);
+    destroy_cache(v.dev, a, null);
+    // a cache made from that data holds the same; the pipeline is found
+    // in it, not compiled
+    const filled = abi.PipelineCacheCreateInfo{ .sType = 17, .pNext = null, .flags = 0, .initialDataSize = n, .pInitialData = &data };
+    var b: H = 0;
+    try testing.expectEqual(R.success, create_cache(v.dev, &filled, null, &b));
+    var again: [64 << 10]u8 = undefined;
+    var n2: usize = again.len;
+    try testing.expectEqual(R.success, cache_data(v.dev, b, &n2, &again));
+    try testing.expectEqualSlices(u8, data[0..n], again[0..n2]);
+    var p2: H = 0;
+    try testing.expectEqual(R.success, create(v.dev, b, 1, @ptrCast(&ci), null, @ptrCast(&p2)));
+    try testing.expectEqual(hits0 + 1, icd.cacheHits());
+    // another build's data (a UUID that is not ours): ignored whole
+    data[20] ^= 0xff;
+    var c: H = 0;
+    try testing.expectEqual(R.success, create_cache(v.dev, &filled, null, &c));
+    var n3: usize = 0;
+    try testing.expectEqual(R.success, cache_data(v.dev, c, &n3, null));
+    try testing.expectEqual(@as(usize, 32), n3);
+    destroy(v.dev, p2, null);
+    destroy_cache(v.dev, b, null);
+    destroy_cache(v.dev, c, null);
+    v.f("vkDestroyShaderModule", *const fn (Ptr, H, ?*const anyopaque) callconv(.c) void)(v.dev, module, null);
+}
+
+test "vk: a pipeline cache's data written, read back into another cache, the pipeline found there (emulated RTX)" {
+    try pipelineCacheRoundTrip(&openRtx);
+}
+test "vk: a pipeline cache round trip on KIR's interpreter" {
+    try pipelineCacheRoundTrip(&openInterp);
+}
+
 test "vk: a shader the front end cannot take fails its pipeline, with the reason logged" {
     use(&openInterp);
     var v = try Vk.open();
