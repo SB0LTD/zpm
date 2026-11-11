@@ -46,7 +46,10 @@
 //!   not uniform (an if, a loop's exit, a return or discard on a value
 //!   that differs between pixels) GL leaves them undefined: here they
 //!   are 0 (`flattenDerivs`).
-//! - Not yet: a sampler chosen at run time, gl_FragDepth, gl_PointSize.
+//! - gl_PointSize, gl_PointCoord and gl_FragDepth through the raster's
+//!   VertexIO and FragmentIO; outputs at locations 1.. (gl_FragData[n],
+//!   gl_FragColor to every draw buffer) as FragmentIO.colors.
+//! - Not yet: a sampler chosen at run time.
 //!
 //! Allocation-free: its tables are the Scratch's (Store).
 
@@ -286,12 +289,12 @@ const Gen = struct {
 
     fn isMut(g: *Gen, a: Arg) bool {
         if (a != .reg or a.reg == .none) return false;
-        const x = @intFromEnum(a.reg);
+        const x = @backingInt(a.reg);
         return g.st.mut[x >> 3] & (@as(u8, 1) << @intCast(x & 7)) != 0;
     }
 
     fn markMut(g: *Gen, v: V) void {
-        const x = @intFromEnum(v);
+        const x = @backingInt(v);
         g.st.mut[x >> 3] |= @as(u8, 1) << @intCast(x & 7);
     }
 
@@ -299,7 +302,7 @@ const Gen = struct {
     /// change it); anything else as it is.
     fn snap(g: *Gen, a: Arg) Arg {
         if (!g.isMut(a)) return a;
-        return r(g.k.mov(g.k.tys[@intFromEnum(a.reg)], a));
+        return r(g.k.mov(g.k.tys[@backingInt(a.reg)], a));
     }
 
     fn snapVal(g: *Gen, v0: Val) Val {
@@ -658,7 +661,6 @@ const Gen = struct {
         return null;
     }
 
-
     // ── Arithmetic on operands (immediates folded where exact) ─────────────
 
     fn fop2(g: *Gen, op: kir.Op, a: Arg, b: Arg) Arg {
@@ -948,7 +950,7 @@ const Gen = struct {
     }
 
     fn binary(g: *Gen, nd: *Node, t: Type) Val {
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         switch (op) {
             .and_and, .or_or => {
                 const a = g.cond(nd.a);
@@ -1087,7 +1089,7 @@ const Gen = struct {
 
     fn unary(g: *Gen, nd: *Node, t: Type) Val {
         const a = g.rv(g.expr(nd.a));
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         if (op == .plus) return a;
         const n = g.size(t);
         const at = g.alloc(n);
@@ -1123,7 +1125,7 @@ const Gen = struct {
 
     fn assign(g: *Gen, nd: *Node) Val {
         const dst = g.expr(nd.a);
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         if (op == .assign) {
             const v = g.rv(g.expr(nd.b));
             g.store(dst, v);
@@ -2388,7 +2390,7 @@ fn kty(b: Base) Ty {
 }
 
 fn isSampler(b: Base) bool {
-    return @intFromEnum(b) >= @intFromEnum(Base.sampler2D) and @intFromEnum(b) <= @intFromEnum(Base.samplerExternalOES);
+    return @backingInt(b) >= @backingInt(Base.sampler2D) and @backingInt(b) <= @backingInt(Base.samplerExternalOES);
 }
 
 fn sameReg(a: Arg, b: Arg) bool {
@@ -2400,6 +2402,37 @@ fn sameReg(a: Arg, b: Arg) bool {
 /// An output variable (its index in vars): its varying's first scalar
 /// (vertex) or location (fragment).
 const Out = struct { var_ix: u32, word: u32, loc: u32 };
+
+/// A uniform: its words (loaded at the start when small), its samplers
+/// their texture slots; zeros where the program has none of it.
+fn uniformGlobal(g: *Gen, name: []const u8, t: Type) void {
+    const word = g.lay.uniform(g.lay.ctx, name) orelse {
+        const z = g.zeros(t);
+        // (an unused sampler: no slot)
+        for (0..g.size(t)) |ix| {
+            if (isSampler(g.baseAt(t, @intCast(ix)))) g.put(z.at, @intCast(ix), u(NO_SLOT));
+        }
+        g.declare(.{ .name = name, .ty = t, .at = z.at, .ro = true });
+        return;
+    };
+    if (g.hasSampler(t)) {
+        // samplers are their texture slots; the rest is loaded
+        const n = g.size(t);
+        const at = g.alloc(n);
+        for (0..n) |ix| {
+            const i_: u32 = @intCast(ix);
+            const b = g.baseAt(t, i_);
+            g.put(at, i_, if (isSampler(b)) u(g.lay.sampler(g.lay.ctx, word + i_) orelse NO_SLOT) else g.loadUni(b, word + i_, no));
+        }
+        g.declare(.{ .name = name, .ty = t, .at = at, .ro = true });
+        return;
+    }
+    const mem = Val{ .ty = t, .mem = true, .word = word };
+    if (g.size(t) <= PRELOAD_WORDS and !g.hasArray(t)) {
+        const loaded = g.rv(mem);
+        g.declare(.{ .name = name, .ty = t, .at = loaded.at, .ro = true });
+    } else g.declare(.{ .name = name, .ty = t, .mem = true, .word = word, .ro = true });
+}
 
 /// The globals in order (inputs, outputs, uniforms, plain ones), the
 /// functions noted; main's node, or 0.
@@ -2419,6 +2452,18 @@ fn globals(g: *Gen, vio: ?*raster.VertexIO, fio: ?*raster.FragmentIO, outs: *[64
             }
             continue;
         }
+        if (dn.kind == .block_decl) {
+            // a uniform block: its instance a struct uniform, or (anonymous)
+            // each member a uniform of its own (the program's words: its
+            // draws copy the block's buffer into them)
+            const st = Type.of(dn.ty);
+            if (st.base != .structure) continue;
+            if (dn.b != 0) {
+                const vn = g.node(dn.b);
+                uniformGlobal(g, g.text(vn.tok), st);
+            } else for (s.checker.structFields(st)) |fd| uniformGlobal(g, fd.name, fd.ty);
+            continue;
+        }
         if (dn.kind != .decl) continue;
         var v = dn.b;
         while (v != 0) : (v = g.node(v).next) {
@@ -2427,32 +2472,7 @@ fn globals(g: *Gen, vio: ?*raster.VertexIO, fio: ?*raster.FragmentIO, outs: *[64
             const name = g.text(vn.tok);
             const q = vn.flags;
             if (q & Q.uniform != 0) {
-                const word = g.lay.uniform(g.lay.ctx, name) orelse {
-                    const z = g.zeros(t);
-                    // (an unused sampler: no slot)
-                    for (0..g.size(t)) |ix| {
-                        if (isSampler(g.baseAt(t, @intCast(ix)))) g.put(z.at, @intCast(ix), u(NO_SLOT));
-                    }
-                    g.declare(.{ .name = name, .ty = t, .at = z.at, .ro = true });
-                    continue;
-                };
-                if (g.hasSampler(t)) {
-                    // samplers are their texture slots; the rest is loaded
-                    const n = g.size(t);
-                    const at = g.alloc(n);
-                    for (0..n) |ix| {
-                        const i_: u32 = @intCast(ix);
-                        const b = g.baseAt(t, i_);
-                        g.put(at, i_, if (isSampler(b)) u(g.lay.sampler(g.lay.ctx, word + i_) orelse NO_SLOT) else g.loadUni(b, word + i_, no));
-                    }
-                    g.declare(.{ .name = name, .ty = t, .at = at, .ro = true });
-                    continue;
-                }
-                const mem = Val{ .ty = t, .mem = true, .word = word };
-                if (g.size(t) <= PRELOAD_WORDS and !g.hasArray(t)) {
-                    const loaded = g.rv(mem);
-                    g.declare(.{ .name = name, .ty = t, .at = loaded.at, .ro = true });
-                } else g.declare(.{ .name = name, .ty = t, .mem = true, .word = word, .ro = true });
+                uniformGlobal(g, name, t);
                 continue;
             }
             const is_in = q & Q.in != 0 or (q & Q.varying != 0 and g.stage == .fragment);
@@ -2515,7 +2535,7 @@ fn begin(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, log: *pp.Log, stage: sem
 
 /// A component as an f32 register (a register's bits, or an immediate's).
 fn asF32(g: *Gen, a: Arg) V {
-    if (a == .reg and a.reg != .none and g.k.tys[@intFromEnum(a.reg)] == .f32) return a.reg;
+    if (a == .reg and a.reg != .none and g.k.tys[@backingInt(a.reg)] == .f32) return a.reg;
     return g.k.mov(.f32, a);
 }
 
@@ -2537,6 +2557,7 @@ pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexI
     g.bind("gl_Position", sema.vecT(.float, 4), null, false);
     const pos_ix = g.nvars - 1;
     g.bind("gl_PointSize", FLOAT, null, false);
+    const psize_ix = g.nvars - 1;
     g.declare(.{ .name = "gl_VertexID", .ty = INT, .at = g.imms(INT, &.{r(k.mov(.i32, r(io.vertex_id)))}).at, .ro = true });
     g.declare(.{ .name = "gl_InstanceID", .ty = INT, .at = g.imms(INT, &.{r(k.mov(.i32, r(io.instance_id)))}).at, .ro = true });
     var outs: [64]Out = undefined;
@@ -2546,6 +2567,7 @@ pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexI
     runMain(&g, main);
     const pos = g.st.vars[pos_ix];
     for (0..4) |c| io.position[c] = asF32(&g, g.cp(pos.at, @intCast(c)));
+    if (s.checker.uses_point_size) io.point_size = asF32(&g, g.cp(g.st.vars[psize_ix].at, 0));
     for (outs[0..nouts]) |o| {
         if (o.word == 0xffff_ffff) continue;
         const v = g.st.vars[o.var_ix];
@@ -2570,7 +2592,8 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     const v4 = sema.vecT(.float, 4);
     g.declare(.{ .name = "gl_FragCoord", .ty = v4, .at = g.imms(v4, &.{ r(io.frag_coord[0]), r(io.frag_coord[1]), r(io.frag_coord[2]), r(io.frag_coord[3]) }).at, .ro = true });
     g.declare(.{ .name = "gl_FrontFacing", .ty = BOOL, .at = g.imms(BOOL, &.{if (io.front_facing == .none) u(1) else r(io.front_facing)}).at, .ro = true });
-    g.declare(.{ .name = "gl_PointCoord", .ty = sema.vecT(.float, 2), .at = g.imms(sema.vecT(.float, 2), &.{ f(0), f(0) }).at, .ro = true });
+    const pc = [2]Arg{ if (io.point_coord[0] == .none) f(0) else r(io.point_coord[0]), if (io.point_coord[1] == .none) f(0) else r(io.point_coord[1]) };
+    g.declare(.{ .name = "gl_PointCoord", .ty = sema.vecT(.float, 2), .at = g.imms(sema.vecT(.float, 2), &pc).at, .ro = true });
     g.bind("gl_FragColor", v4, null, false);
     const color_ix = g.nvars - 1;
     var fd_t = v4;
@@ -2578,6 +2601,7 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     g.bind("gl_FragData", fd_t, null, false);
     const data_ix = g.nvars - 1;
     g.bind("gl_FragDepth", FLOAT, null, false);
+    const depth_ix = g.nvars - 1;
     g.discard = k.reg(.pred);
     k.set(g.discard, .mov, u(0), no, no);
     var outs: [64]Out = undefined;
@@ -2585,24 +2609,45 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     const main = globals(&g, null, io, &outs, &nouts);
     g.nglobals = g.nvars;
     runMain(&g, main);
-    // the color: location 0's output, else gl_FragColor (or gl_FragData[0])
-    var color: [4]Arg = .{ f(0), f(0), f(0), f(1) };
+    // the colors: location n's output, else gl_FragData[n], else
+    // gl_FragColor (every draw buffer's); location 0 (0, 0, 0, 1) without
+    const NT = raster.MAX_TARGETS;
+    var color: [NT][4]Arg = undefined;
+    var have = [_]bool{false} ** NT;
+    color[0] = .{ f(0), f(0), f(0), f(1) };
+    have[0] = true;
     if (s.checker.uses_frag_data) {
-        for (0..4) |c| color[c] = g.cp(g.st.vars[data_ix].at, @intCast(c));
+        for (0..4) |t| {
+            for (0..4) |c| color[t][c] = g.cp(g.st.vars[data_ix].at, @intCast(4 * t + c));
+            have[t] = true;
+        }
     } else if (s.checker.version < 300) {
-        for (0..4) |c| color[c] = g.cp(g.st.vars[color_ix].at, @intCast(c));
+        for (0..NT) |t| {
+            for (0..4) |c| color[t][c] = g.cp(g.st.vars[color_ix].at, @intCast(c));
+            have[t] = true;
+        }
     }
     for (outs[0..nouts]) |o| {
-        if (o.loc != 0) continue;
         const v = g.st.vars[o.var_ix];
-        const n = @min(g.size(v.ty.elem()), 4);
-        for (0..n) |ix| {
-            const i_: u32 = @intCast(ix);
-            color[ix] = g.convert(g.cp(v.at, i_), g.baseAt(v.ty, i_), .float);
+        const elem = g.size(v.ty.elem());
+        const n_el: u32 = if (v.ty.array != 0) v.ty.array else 1;
+        for (0..n_el) |j| {
+            const loc = o.loc + @as(u32, @intCast(j));
+            if (loc >= NT) break;
+            color[loc] = .{ f(0), f(0), f(0), f(1) };
+            have[loc] = true;
+            for (0..@min(elem, 4)) |ix| {
+                const i_: u32 = @intCast(j * elem + ix);
+                color[loc][ix] = g.convert(g.cp(v.at, i_), g.baseAt(v.ty, i_), .float);
+            }
         }
-        break;
     }
-    for (0..4) |c| io.color[c] = asF32(&g, color[c]);
+    for (0..4) |c| io.color[c] = asF32(&g, color[0][c]);
+    for (1..NT) |t| {
+        if (!have[t]) continue;
+        for (0..4) |c| io.colors[t][c] = asF32(&g, color[t][c]);
+    }
+    if (s.checker.uses_frag_depth) io.depth = asF32(&g, g.cp(g.st.vars[depth_ix].at, 0));
     io.discard = g.discard;
     io.derivatives = g.derivatives;
     if (g.nderivs > 0) flattenDerivs(k, lo, g.st, g.st.derivs[0..g.nderivs]);
@@ -2681,7 +2726,7 @@ fn flattenDerivs(k: *kir.Kernel, lo: usize, st: *Store, derivs: []const u32) voi
     }
     const isDiv = struct {
         fn f_(set: []const u8, a: Arg) bool {
-            return a == .reg and a.reg != .none and bitOf(set, @intFromEnum(a.reg));
+            return a == .reg and a.reg != .none and bitOf(set, @backingInt(a.reg));
         }
     }.f_;
     var changed = true;
@@ -2738,7 +2783,7 @@ fn flattenDerivs(k: *kir.Kernel, lo: usize, st: *Store, derivs: []const u32) voi
                     if (!d) continue;
                     const nregs: usize = if (in.op == .ld) kir.memRegs(@bitCast(in.aux)) else 1;
                     for (0..nregs) |j| {
-                        const v = @as(usize, @intFromEnum(in.dst)) + j;
+                        const v = @as(usize, @backingInt(in.dst)) + j;
                         if (v >= FLOW_BITS or bitOf(&st.div, v)) continue;
                         setBit(&st.div, v);
                         changed = true;

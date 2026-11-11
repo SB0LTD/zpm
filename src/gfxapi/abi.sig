@@ -15,9 +15,9 @@
 //!   glXQueryExtension is false and no GLX context is ever made, as with
 //!   Mesa's libGL on Galaxy. glXGetProcAddress hands out EGL's entry
 //!   points (libgalaxy_gl.sig).
-//! - GBM: no device yet (stage 7). gbm_create_device answers null, and
-//!   apps take their other path: Wayland's shared memory, or the dma-bufs
-//!   the driver's EGL makes itself. gbm_format_get_name works.
+//! - GBM: the driver's own (gbm.sig, libgbm.sig): devices, linear
+//!   buffers made and imported as dma-bufs, surfaces EGL draws into
+//!   (Xwayland's glamor). gbm_format_get_name is here.
 //! - Every other name (desktop GL, the GLES calls not done yet, Mesa's GL
 //!   interop for OpenCL): a call that does nothing and returns 0, as a GL
 //!   call does with no current context, said once on stderr (report.sig).

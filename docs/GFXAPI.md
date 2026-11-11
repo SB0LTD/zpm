@@ -11,7 +11,7 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 | `gfxapi.sig` | The module root (`gfxapi` in zpm's build). |
 | `engine.sig` | Images in GPU memory, filled and copied by KIR kernels through any `gpu.Device`. It batches work, waits only where needed, keeps the caches in step, and falls back to the CPU. |
 | `gles.sig` | OpenGL ES 3.0's objects and state: what the C entry points call. |
-| `raster.sig` | Drawing: GL's draws as KIR kernels (vertices, triangle setup, bins, tiles), the same on every GPU and on the CPU. |
+| `raster.sig` | Drawing: GL's and Vulkan's draws as KIR kernels (vertices, primitive setup, bins, tiles), the same on every GPU and on the CPU: triangles, points and lines; multisampling; several colour targets; stencil; depth bias, `gl_FragDepth`, clip distances. |
 | `glenum.sig` | GL's enum values. |
 | `texture.sig` | Texture reads in KIR: `texelFetch`, sampled reads (nearest, bilinear or trilinear; repeat, clamp, mirrored repeat; the level of detail implicit, given or from gradients), `textureSize`, one code for every format. |
 | `texfmt.sig` | GL ES's texture formats as the engine stores them: each upload GL allows, its conversion and its swizzle. |
@@ -20,6 +20,7 @@ Unmodified Firefox and Chromium (Alpine's and Flatpak's) are the first targets. 
 | `dxbc/` | Direct3D's shaders: `dxbc.sig` reads the DXBC container (chunks, the input and output signatures) and Shader Model 4 and 5's tokens in place; `gen.sig` emits a vertex or pixel shader as the raster's KIR emitters, as `glsl/gen.sig` does GLSL's; `fixtures.sig` holds shaders compiled from `fixtures.hlsl` by Microsoft's compiler, and `draw_test.sig` draws them. |
 | `egl.sig` | EGL 1.5 for OpenGL ES: displays, configs, contexts with share groups, window and pbuffer surfaces, swaps, fence syncs, errors per thread. |
 | `wayland.sig` | EGL's Wayland platform: a window's frames handed to the compositor as dma-bufs (`zwp_linux_dmabuf_v1`), through the app's own `libwayland-client`. |
+| `x11.sig` | EGL's X11 platform: the X11 protocol spoken by EGL itself over a connection of its own (no Xlib, no XCB), a window's frames shown by DRI3 and Present, else MIT-SHM, else PutImage. |
 | `thread.sig` | What EGL and GL keep per thread: the current context and surfaces, EGL's last error, the bound API. |
 | `dl.sig` | The host program's functions found by name: weak `dlsym`, else the loaded objects' symbol tables. |
 | `host.sig` | What EGL asks of the process: dma-bufs out and in, fence files, dup, poll, a file mapped. The library's root gives Linux's calls and the render node; tests give their own. |
@@ -82,9 +83,40 @@ Coverage is integer arithmetic, and every float operation is one KIR defines bit
 Culling 64 triangles at a time and binning cut the work a tile does for the triangles that miss it. On a 200×136 scene of 262 triangles, KIR's interpreter runs 167 million thread-instructions with the kernels before binning, 49 million unbinned and 43 million binned. Most of what remains is shading. Binning saves more as a target and its triangle count grow.
 
 - **Color targets** are RGBA8, BGRA8, RG8 and R8 (WebRender's masks): 4, 2 or 1 bytes a pixel, loaded and stored at their width. An RG8 or R8 pixel's channels are RGBA8's first bytes: what it lacks reads 0, and alpha 1. Clears, color masks, copies and reads take them too.
+- **Primitives.** Besides triangles (lists, strips, fans), the setup kernel takes:
+  - **points**: a square sprite `gl_PointSize` pixels a side (1 to 1024) about the vertex, as two triangles; the half-open square's pixel centers are its pixels. `gl_PointCoord` is two planes across it (s right, t down, as GL and Vulkan have it). A point whose vertex is outside the clip volume is dropped, sprite and all.
+  - **lines** (lists, strips, loops), one pixel wide. Single-sampled, a line is a record of its own, and the tile kernel covers it by GL's and Vulkan's diamond-exit rule: a pixel is drawn when the line crosses its diamond (|x - cx| + |y - cy| < 1/2) and does not end in it. The test is exact in integers: the diamond is the square |u - uc|, |v - vc| < 8 (u = x + y, v = x - y, 1/16 pixel), tested by separating axes, with the ends nudged by an infinitesimal (d, d'), d >> d' > 0, so a line through a diamond's corner falls one way. A strip's shared vertices are drawn once. Varyings go along the line (t the center's projection, perspective-correct). Multisampled, a line is a rectangle one pixel wide with square ends (two triangles), as GL ES 3.0 and Vulkan say.
+- **Multisampling** (2x, 4x, 8x). A multisampled image (`Image.samples`) keeps a pixel's samples side by side in its row. The tile kernel tests each sample against the edges at Vulkan's standard sample positions (`raster.sample_pos`, the raster's y up), runs the fragment code once a pixel (varyings at the center), and gives each covered sample its own depth (the depth plane at the sample), its own depth and stencil tests and stencil operations, and its own blend. Alpha to coverage (output 0's alpha takes its share of the samples) and the sample mask apply. The samples' words live in shared memory, each thread its own, so a variant's registers stay those of one pixel. A resolve (`Engine.resolve`, GL's blit of a multisampled framebuffer) averages each colour byte (rounded half up) and takes sample 0 of depth and stencil.
+- **Colour targets.** One pipeline draws up to 8 targets at once: output i into target i (`Draw.targets`), each with its own format, colour mask, and blending on or off. The factors and equations are one set for all of them (GL ES 3.0's state, Vulkan without `independentBlend`). A draw may have none (`Draw.color_off`: depth and stencil only).
+- **Depth and stencil.** Depth bias (`glPolygonOffset`, Vulkan's depth bias, with its clamp) moves a triangle's depth plane by factor × max(|dz/dx|, |dz/dy|) + units × 2^-24. A program writing `gl_FragDepth` has its depth and stencil tests after its fragment code. Clip distances are interpolated like varyings, and a sample whose distance is below 0 at its pixel's center is out (clipping per pixel).
+- **Primitive restart.** The restart index's vertex is marked in its record, and a strip or fan starts anew after it: the setup kernel finds the last restart before its triangle (only when the draw has one: the vertex kernel sets a word), so a new strip's first triangle is even and a new fan's center is the vertex after the restart.
+- **Kernel variants.** A pipeline's tile kernel is built for each `raster.Variant` its draws need (stencil, samples, targets, lines) and its setup kernel for each `raster.SetupKind`, at the first such draw, and kept (`Pipeline.more`).
 - **Derivatives.** A fragment shader that takes them (`dFdx`, `dFdy`, `fwidth`) runs whole 2×2 quads. A quad with a pixel to draw runs the code in all four, and the pixels not drawn are helpers. A derivative is the difference with the quad's neighbour, through a shuffle. The tile's lanes are its pixels in order, so the neighbours are lanes `xor 1` and `xor 8`. Programs without derivatives run covered pixels alone.
 
 On the CPU (no GPU, or it is lost), KIR's interpreter runs the same kernels on the images' memory.
+
+#### The raster's API (for the Vulkan driver)
+
+The changes are additive; a draw that sets none of the new fields draws as before.
+
+- `raster.Topology`: `.points`, `.lines`, `.line_strip`, `.line_loop` besides the triangles.
+- `raster.Draw`:
+  - `targets: [MAX_TARGETS]?Target` (`Target{ img, keep, blend }`): fragment output i into `targets[i]` for i ≥ 1; output 0 into `color` unless `color_off`. Vulkan's colour attachments in one draw, in place of one pipeline per attachment.
+  - `color_off`: no colour target 0 (depth-only and stencil-only passes; `color` only names the size).
+  - `sample_mask` (Vulkan's `pSampleMask`), `alpha_to_coverage`.
+  - `bias_factor`, `bias_units`, `bias_clamp` (Vulkan's `depthBiasSlopeFactor`, `depthBiasConstantFactor`, `depthBiasClamp`; units of 2^-24).
+  - `prims()`, `records()`, `samples()`, `setupKind()`, `variant()`; `triangles()` stays (it counts primitives).
+- `raster.Shaders`: `point_size` (the vertex code sets `VertexIO.point_size`), `point_coord` (the fragment code reads `FragmentIO.point_coord`), `frag_depth` (it sets `FragmentIO.depth`), `clips` (the vertex code sets `VertexIO.clip[0..clips]`).
+- `raster.FragmentIO.colors[1..]`: outputs past location 0.
+- `engine.Image.samples`, `Engine.newImageSamples(w, h, format, samples)`, `Engine.resolve(src, dst, rect)` (Vulkan's resolve attachments and `vkCmdResolveImage`). `Engine.fill` and `Engine.copy` take multisampled images (every sample).
+- `raster.sample_pos` / `samplePositions(n)`: the sample positions in 1/16 pixel with the raster's y up, which are Vulkan's standard ones in a y-down framebuffer (`standardSampleLocations`).
+- The tile kernel's bindings: colour, depth, primitive records, uniforms, the textures, the query word, the stencil image (stencil variants), then targets 1.. in order (the bits of `Variant.targets`). On sig-vulkan, `Shaders.buffers` come after the textures; merged, the order is textures, buffers, query, stencil, targets.
+- Limits to report: 8 colour attachments, sample counts 1, 2, 4 and 8 for colour, depth and stencil, `pointSizeRange` 1..1024, line width 1 (no `wideLines`), 8 clip distances, no `independentBlend` (per-attachment blend enable and write mask hold), no `sampleRateShading`.
+- The stencil tile kernel of a large program now compiles for sm_120 (below), so stencil draws need no CPU fallback.
+
+#### Stencil on the RTX
+
+The stencil tile kernel of a lit, textured program failed on sm_120 with `TooManyRegs`, and its draws ran on the CPU. It was not register pressure: the kernel takes 128 general registers (the plain one 116, of 253). The stencil code keeps more predicates live through the fragment code (the depth and stencil results, the face, the clip test) than the six predicate registers hold, so kir_sm120 homes the rest in general registers and moves each through a scratch predicate where an instruction reads it. It kept two scratch predicates, P5 and P6, and an instruction reading three such predicates (a `PLOP3` of three, or a compare's accumulator with a guard) had nowhere to put the third. The fix is in kir_sm120's allocator, where the limit was: when an instruction needs more scratch predicates than are left, the allocation gives up one more predicate register (down to P0..P2 allocated, P3..P6 scratch, enough for a `PLOP3`'s three and a guard) and allocates again. Splitting the kernel would only have moved the limit; any program with enough live conditions would hit it again.
 
 Shaders are KIR emitters (`raster.Shaders`): a GLSL program's (below), or the driver's own (`usePipeline`). A draw has up to 60 scalar varyings (GL ES's 15 vectors). A flat varying keeps the provoking vertex's bits, so an integer's survive.
 
@@ -106,7 +138,11 @@ Shaders and programs share one namespace. Names are the process's, and each obje
 - merges the two stages' uniforms (one type per name), each with consecutive locations (one per array element) and its words in the program's uniform storage, which is tight (a float, an int, a bool or a sampler's unit is one word);
 - places 3.00's fragment outputs, or notes 1.00's `gl_FragColor`/`gl_FragData`.
 
-As in Mesa, only what a shader uses is active. `glGetUniformLocation` takes `u`, `u[k]`, `s.m` and `s[1].m[2]`. `glUniform*` checks the type, count and sampler units, and `glGetUniform*` converts. `glUniformMatrix*` takes `transpose`. There are no binary formats. Interface blocks (uniform blocks) are refused for now. Every call takes the program table's lock.
+As in Mesa, only what a shader uses is active. `glGetUniformLocation` takes `u`, `u[k]`, `s.m` and `s[1].m[2]`. `glUniform*` checks the type, count and sampler units, and `glGetUniform*` converts. `glUniformMatrix*` takes `transpose`. There are no binary formats. Every call takes the program table's lock.
+
+Uniform blocks (3.00) are laid out std140; `shared` and `packed` are laid out the same way. A block's members are uniform words of the program too, but have no location, and their std140 offsets and strides are what `glGetActiveUniformsiv` reports. A named block's members are named `Block.member`; each shader may name the instance as it likes. Every draw copies each block's bytes from the range bound to its binding point (`glBindBufferBase`, `glBindBufferRange`) into those words, so the shader code reads a member like any uniform. A block is at most 16384 bytes, and a program's uniforms, blocks included, at most 4096 words. Arrays of blocks are refused for now.
+
+Transform feedback (`glTransformFeedbackVaryings` before the link) captures `gl_Position` or any vertex output, whether the fragment shader reads it or not. The variables go interleaved into one buffer, or each into its own (up to 4). A fifth pipeline kernel runs the vertex code again and writes the outputs as the shader made them, in clip space. Points and lines are captured even though they are not drawn yet, and `RASTERIZER_DISCARD` captures without drawing. GL ES 3.0's rules hold: only arrays (no indexed draws), the begun primitive mode, and room in the buffers.
 
 ### GLSL to KIR
 
@@ -190,8 +226,8 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
 ### EGL
 
 - **The driver.** The library's root opens Galaxy's GPU through the render node at the first `eglInitialize`, with this image's backend (ir3 on AArch64, sm_120 on x86-64), and starts the engine on it. Without a GPU, or after it is lost, `eglInitialize` fails (`EGL_NOT_INITIALIZED`). The app then draws in software (Firefox's SWGL, Chromium's SwiftShader), which beats GL done on the CPU.
-- **Displays.** `EGL_DEFAULT_DISPLAY` and `EGL_PLATFORM_SURFACELESS_MESA` give the surfaceless display: pbuffers and surfaceless contexts. A `wl_display`, from `eglGetDisplay` or `EGL_PLATFORM_WAYLAND_KHR`, gives a Wayland display: window surfaces of `wl_egl_window`s.
-- **Configs.** There are four: ARGB8888 and XRGB8888, each with and without depth 24 + stencil 8. All take windows and pbuffers, and OpenGL ES 2 and 3. The native visual is DRM's fourcc. `eglChooseConfig` matches and sorts as EGL 1.5's §3.4.1 says.
+- **Displays.** `EGL_DEFAULT_DISPLAY` and `EGL_PLATFORM_SURFACELESS_MESA` give the surfaceless display: pbuffers and surfaceless contexts. A `wl_display`, from `eglGetDisplay` or `EGL_PLATFORM_WAYLAND_KHR`, gives a Wayland display: window surfaces of `wl_egl_window`s. An Xlib `Display*`, from `eglGetDisplay` or `EGL_PLATFORM_X11_KHR` (whose `EGL_DEFAULT_DISPLAY` is `$DISPLAY`), gives an X11 display: window surfaces of X windows. The default display takes X windows too, as Mesa's does on X11: it connects to `$DISPLAY` at its first window surface or native-visual query (Firefox on X11 asks `EGL_DEFAULT_DISPLAY` for everything).
+- **Configs.** There are four: ARGB8888 and XRGB8888, each with and without depth 24 + stencil 8. All take windows and pbuffers, and OpenGL ES 2 and 3. The native visual is DRM's fourcc (on an X display, the server's visual). `eglChooseConfig` matches and sorts as EGL 1.5's §3.4.1 says.
 - **Contexts.** OpenGL ES 2.0 and 3.0 (ES 3.0 either way, as Mesa gives), with share groups. The robustness attributes are taken: the engine reports a lost GPU as a reset. `EGL_KHR_no_config_context` and `EGL_KHR_surfaceless_context` are supported.
 - **Windows.**
   - EGL works through the app's own `libwayland-client`, as Mesa does, found by name in the process. Its events go to a queue of its own, through libwayland's generic dispatcher.
@@ -202,6 +238,13 @@ Errors behave as in Mesa: the first error is kept until `glGetError` reads it.
   - **The next back buffer** is one the compositor has released, else a new one. Before choosing, EGL dispatches the events it has already received, as Mesa does.
   - **A resize** (`wl_egl_window_resize`) takes effect at the next GL drawing, as in Mesa: the GL context checks before it uses the default framebuffer.
   - `EGL_EXT_buffer_age` and `EGL_KHR_swap_buffers_with_damage` are supported. Damage rectangles are flipped to the buffer's rows.
+- **X windows** (`x11.sig`, `EGL_KHR_platform_x11`):
+  - EGL opens a Unix socket of its own to the server (`/tmp/.X11-unix/XN`, then the abstract one) and speaks the protocol there, little endian, without authorization. The app's `Display*` is read for its name only (`DisplayString`: Xlib's public struct); its fd and sequence numbers stay Xlib's. Windows are the server's, so EGL draws on a window the app made on its own connection. The socket calls are the library root's (`x11.Wire`: `connect`, `sendmsg` with `SCM_RIGHTS` and `MSG_NOSIGNAL`, `read`, `poll`, memfds).
+  - The configs' native visuals are the server's TrueColor visuals of depth 24 (XRGB) and 32 (ARGB), as Firefox matches them with `XGetVisualInfo`. `eglCreateWindowSurface` takes the window's id as the pointer's value, `eglCreatePlatformWindowSurface` a pointer to it. Windows of depth 24 and 32 (32 bits a pixel) are taken.
+  - **DRI3 and Present**, where the server imports dma-bufs (Xwayland with glamor): up to 4 buffers, each a pixmap from its dma-buf (`PixmapFromBuffer`, the fd over `SCM_RIGHTS`) shown by `PresentPixmap`, as Mesa's DRI3 loader does. A pixmap is the server's until its `IdleNotify`. Interval 1 waits for the last frame's `CompleteNotify`; 0 presents `Async`. `ConfigureNotify` marks the window resized. A server that refuses the dma-buf turns the window to the next way.
+  - **MIT-SHM** 1.2, where there is no DRI3 (Galaxy's Xwayland runs `-glamor off`): one image, read back at a swap, its damaged rectangles copied into a memfd the server maps (`ShmAttachFd`, read only) and shown by `ShmPutImage`, then a round trip (the server has read the memory before the next frame writes it). Its age is 1.
+  - **PutImage**, without either: the same, the rows over the socket in `ZPixmap` strips that fit the server's longest request.
+  - The window's size is asked (`GetGeometry`) when a back buffer is taken, which after a swap is at the next GL drawing. An X error for a window's request (it is gone) fails the swap with `EGL_BAD_NATIVE_WINDOW`.
 - **Syncs.** `EGL_KHR_fence_sync`, `EGL_KHR_wait_sync` and EGL 1.5's syncs are supported. A fence is the engine's mark, its work flushed, and the CPU waits on it. `eglWaitSync` waits for nothing, since one in-order GPU ring already orders the work.
 - **Native fences.** `EGL_ANDROID_native_fence_sync`:
   - **Handed out:** a fence of this process's GPU work, as a `sync_file` from Galaxy's `G_FENCE_FD` (SB0LTD/galaxy#74), a new one at each `eglDupNativeFenceFDANDROID`.
@@ -317,18 +360,37 @@ That makes 187 GL entry points.
 
 **Stage 5g, mipmaps:** levels stored in a chain, `glGenerateMipmap` on the GPU, texture completeness, the level of detail (implicit through quads, given, gradients, bias), nearest-mipmap and trilinear filtering, and `texelFetch` and `textureSize` by level.
 
+**Stage 5h, WebGL 2 (the rest of GL ES 3.0):**
+- uniform blocks (std140) and indexed buffer binding points;
+- transform feedback objects, pause and resume;
+- queries:
+  - `ANY_SAMPLES_PASSED` and its `CONSERVATIVE` form are exact: each passing pixel sets the query's word;
+  - `TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN` is counted as primitives are captured;
+- primitive restart at the fixed index: the restart index's vertex is out, so the triangles with it are dropped;
+- the limits WebGL 2 reads at a context's start, and `glGetIntegeri_v`, `glGetInteger64i_v` and `glGetInternalformativ`. There are 24 new GL entry points.
+
+**Stage 5i, the raster for WebGL 2 and WebGPU:**
+- multisampling 2x, 4x, 8x: per-sample coverage, depth, stencil and blending; alpha to coverage, `glSampleCoverage`; `glRenderbufferStorageMultisample` (the fewest samples at least those asked), `FRAMEBUFFER_INCOMPLETE_MULTISAMPLE`, `SAMPLES`, `SAMPLE_BUFFERS`, `MAX_SAMPLES` 8, and `glGetInternalformativ`'s counts (8, 4, 2); a multisampled framebuffer resolved by `glBlitFramebuffer` (1:1, as ES 3.0 says) and refused by `glReadPixels` and the copies;
+- points (`gl_PointSize`, `gl_PointCoord`), lines by the diamond-exit rule, line strips and loops; `ALIASED_POINT_SIZE_RANGE` 1..1024, `glLineWidth` (lines stay one pixel wide);
+- several draw buffers in one draw: `glDrawBuffers`, GLSL ES 3.00 outputs at locations 1..3, `gl_FragData[n]`, 1.00's `gl_FragColor` to every draw buffer; draws with no colour buffer (depth only);
+- `glPolygonOffset` and `POLYGON_OFFSET_FILL`; `gl_FragDepth`; clip distances in the raster (Vulkan's; GLSL ES 3.00 has none);
+- primitive restart in strips and fans starts a new strip or fan;
+- stencil draws of large programs on the RTX: kir_sm120 refused their tile kernel with `TooManyRegs`, because an instruction read more predicates living in registers than it had scratch predicates (below).
+
+That makes 3 more GL entry points (`glPolygonOffset`, `glSampleCoverage`, `glLineWidth`).
+
 **Not yet:**
-- uniform blocks, transform feedback, queries;
-- points and lines;
-- clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped;
-- stencil tests, several color attachments, depth-only drawing;
+- compressed textures: ETC2 and EAC uploads fail with INVALID_ENUM;
+- clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped (a line likewise); a point is dropped by its vertex, as GL says;
+- lines wider than a pixel; sample shading; a line loop's closing line across a restart;
 - half-float and packed attribute formats, divisors past 1, attribute arrays in client memory;
 - framebuffer attachments and copies of texture levels past 0, other texture targets, the texture formats listed under Textures;
 - multisampling;
-- EGLImages of GL textures (`EGL_KHR_gl_texture_2D_image`) and dma-buf export (`EGL_MESA_image_dma_buf_export`), with `libgbm` (stage 7);
-- multi-plane and YUV dma-bufs;
+- `libgbm` (stage 7);
+- one EGLImage of a picture's planes together (each plane alone is had: R8, GR88, R16, GR1616);
 - native fences and dma-buf import on the PC: they wait for per-app RTX contexts;
-- a Wayland connection of EGL's own, for `EGL_PLATFORM_WAYLAND_KHR` with `EGL_DEFAULT_DISPLAY`.
+- a Wayland connection of EGL's own, for `EGL_PLATFORM_WAYLAND_KHR` with `EGL_DEFAULT_DISPLAY`;
+- on X11: GLX, X authorization (cookies), TCP displays, pixmap surfaces, Present's explicit fences, the windows' `XFixes` damage regions (DRI3 frames are presented whole), depths other than 24 and 32.
 
 ## Tests
 
@@ -343,7 +405,7 @@ sig build test-gfxapi
   - `textureSize`, a unit with no texture, a sampler object's filter over its texture's;
   - a quad whose corners its vertex shader fetches from a float texture.
 
-  The cases are drawn in two halves, each on a fresh device: the emulated Adreno's memory is 64 buffers, never freed.
+  The cases are drawn in two halves, each on a fresh device: the emulated Adreno's memory is 128 buffers, never freed.
 - `test-gfxapi-mip`: mipmaps on the CPU, on `EmuDevice` and on the emulated Adreno (ir3), the same bytes and the texels GL says. It uses a texture of five levels, each one color, drawn on quads of 16, 8, 4, 2 and 1 pixels (the implicit LOD picks levels 0 to 4). The other cases:
   - `textureLod`, trilinear between two levels, `textureGrad`, a bias;
   - `texelFetch` and `textureSize` of a level, a base level of 1;
@@ -374,6 +436,15 @@ sig build test-gfxapi
   - Blits: 1:1, flipped and scaled 2×, a bilinear 2:1 downscale, under a scissor box, into BGRA8 and R8, depth and stencil together and depth alone.
   - Fences waited on and queried.
   - The errors GL gives for each.
+- `test-gfxapi-raster`: the raster past one target of triangles, on the CPU and on the emulated RTX (sm_120 in `sm120_emu`), the same bytes from both and the bytes rules written in the test say:
+  - multisampled coverage at 2x, 4x and 8x: two triangles off the grid sharing an edge, added, every sample against exact edge functions at the sample positions (no sample twice, none missed), and the resolve against each pixel's samples averaged;
+  - multisampled depth (two triangles crossing: pixels with samples of both), stencil, alpha to coverage and the sample mask;
+  - points of sizes 1 to 8 (the half-open squares, `gl_PointCoord` as setup's planes give it), single- and multisampled;
+  - 15 lines (level, upright, diagonal, on pixel centers and on the edges between them, both ways, shallow, steep, short) against the diamond-exit rule in f64 with the ends nudged; multisampled lines against their rectangles; strips and loops sharing their vertices' pixels once;
+  - four targets of three formats (RGBA8, BGRA8, R8) from one pipeline, a colour mask and blending on one, single- and 4x multisampled;
+  - depth bias (units, slope, clamp), `gl_FragDepth`, a clip distance; primitive restart starting a new strip and a new fan, back faces culled;
+  - every variant's tile and setup kernels compile for ir3 and sm_120;
+  - through GL: a lit, textured program's stencil draws into a 4x framebuffer on the RTX (its stencil kernel compiled for sm_120, no draw on the CPU), resolved by a blit; two draw buffers; points; lines, strips and loops; polygon offset.
 - `test-gfxapi-webrender`: WebRender's shaders, read from a Firefox checkout's `gfx/wr/webrender/res` (`GFXAPI_WR_RES`; skipped without it, since Mozilla's sources stay out of zpm).
   - The 46 variants a GLES device builds are assembled as `webrender_build` assembles them (its defines, its `#include`s), then compiled and linked through GL's program objects.
   - Each program's vertex, setup and tile kernels are compiled for the Adreno's ir3. All must succeed.
@@ -399,6 +470,13 @@ sig build test-gfxapi
   - configs, sharing, surfaceless contexts, fences, and destroys while current;
   - EGLImages: another program's dma-buf (an `EmuDevice` buffer imported zero-copy) as a texture read and drawn on the GPU, its producer seeing the pixels, as an external texture and a renderbuffer, kept by GL after its handle goes, freed with its last name; the errors EGL gives; the format and modifier queries;
   - native fences: one handed out (a new `sync_file` at each dup), one handed in (polled, owned, closed).
+- `test-gfxapi-x11`: EGL on X11 through a fake X server behind `x11.Wire` (it reads EGL's requests as Xwayland would, keeps its windows' pixels, answers with replies, errors and Present's events), with the engine on `EmuDevice`. It checks:
+  - Firefox's start as `gfx/gl` does it on X11: `EGL_DEFAULT_DISPLAY`, the configs' native visuals, a window surface of a window's id, a context, the fallback pbuffer, and the GPU process's offscreen work (a context without config or surface, a pbuffer) on the same display;
+  - PutImage under a short request length (strips), damage (only those rows), age 1, a resize at the next drawing, the window gone (`EGL_BAD_NATIVE_WINDOW`), everything given back;
+  - MIT-SHM: frames through shared memory, damage, a bigger window's new memory, a server that refuses the memory (PutImage instead);
+  - DRI3 and Present, with an Xlib `Display*` and `eglCreatePlatformWindowSurface`'s `Window*`: pixmaps from dma-bufs (fd, size, stride, depth), interval 1 waiting for `CompleteNotify`, idle buffers reused (age 2), interval 0 `Async`, a resize's new pixmaps and the old freed;
+  - a server that refuses the dma-buf, and the errors: no server, no `DISPLAY`, a window not the server's, depth 16, not a `Display`.
+- `x11.sig`'s own tests: display names, the setup reply (ids, request length, formats, visuals), each request's bytes, replies, errors and a broken connection, and Xlib's `Display` read for its name.
 - `test-gfxapi-gpu`: one GL scenario, run three ways:
   - on the CPU;
   - on `EmuDevice`: KIR's interpreter, with memory that is not coherent, so a missing cache call gives wrong bytes;

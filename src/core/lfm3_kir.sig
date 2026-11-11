@@ -1792,13 +1792,26 @@ pub const AttnParams = struct {
     query: u32 = 0,
     gate: u32 = 0,
     out: u32 = 0,
+    /// A launch whose rows all see the same keys, not each its own past
+    /// (d1's sets: lfm3_executor.Sees): every row reads positions 0 up to
+    /// `seen` - 1, but for those from `hole_first` up to `hole_end` - 1,
+    /// which none sees. 0: causal, each row up to its own position. Full
+    /// attention only (window 0).
+    seen: u32 = 0,
+    hole_first: u32 = 0,
+    hole_end: u32 = 0,
 
-    pub const WORDS = 15;
+    pub const WORDS = 18;
 
     pub fn words(p: AttnParams) [WORDS]u32 {
         const group = p.heads / p.kv_heads;
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(HEAD_SIZE)));
-        return .{ p.heads, p.kv_heads, p.first_position, p.tokens, p.window, p.context, p.slot, p.max_kv_heads, p.span, p.chunks, std.math.log2_int(u32, group), @bitCast(scale), p.query, p.gate, p.out };
+        return .{ p.heads, p.kv_heads, p.first_position, p.tokens, p.window, p.context, p.slot, p.max_kv_heads, p.span, p.chunks, std.math.log2_int(u32, group), @bitCast(scale), p.query, p.gate, p.out, p.seen, p.hole_first, p.hole_end };
+    }
+
+    /// The last position row `t` reads.
+    pub fn last(p: AttnParams, t: u32) u32 {
+        return if (p.seen != 0) p.seen - 1 else p.first_position + t;
     }
 
     /// The first position row `t` sees.
@@ -1809,7 +1822,7 @@ pub const AttnParams = struct {
 
     /// Positions row `t` reads.
     pub fn span_of(p: AttnParams, t: u32) u32 {
-        return p.first_position + t + 1 - p.visible(t);
+        return p.last(t) + 1 - p.visible(t);
     }
 
     /// Chunks of `chunk` positions (aligned) a tile of `tt` tokens covers at most.
@@ -1817,9 +1830,9 @@ pub const AttnParams = struct {
         var most: u32 = 0;
         var t0: u32 = 0;
         while (t0 < p.tokens) : (t0 += tt) {
-            const last = @min(t0 + tt, p.tokens) - 1;
+            const last_t = @min(t0 + tt, p.tokens) - 1;
             const first_chunk = p.visible(t0) / chunk;
-            const last_chunk = (p.first_position + last) / chunk;
+            const last_chunk = p.last(last_t) / chunk;
             most = @max(most, last_chunk - first_chunk + 1);
         }
         return most;
@@ -1841,7 +1854,8 @@ pub fn combineGroups(p: AttnParams) [3]u32 {
 
 /// What every attention kernel works out of its params for row (t, h).
 const Row = struct {
-    pos: V,
+    /// The last position the row reads: its own, or the launch's `seen` - 1.
+    last: V,
     first: V,
     ok: V,
 };
@@ -1850,7 +1864,17 @@ fn attnRow(b: *Builder, t: V, tokens: V, window: V, first_position: V) Row {
     const pos = b.add(R(first_position), R(t));
     const windowed = b.pand(b.icmp(.u32, .ne, R(window), U(0)), b.icmp(.u32, .ge, R(pos), R(window)));
     const first = b.sel(.u32, windowed, R(b.add(R(b.sub(R(pos), R(window))), U(1))), U(0));
-    return .{ .pos = pos, .first = first, .ok = b.icmp(.u32, .lt, R(t), R(tokens)) };
+    const seen = b.param(15);
+    const last = b.sel(.u32, b.icmp(.u32, .ne, R(seen), U(0)), R(b.sub(R(seen), U(1))), R(pos));
+    return .{ .last = last, .first = first, .ok = b.icmp(.u32, .lt, R(t), R(tokens)) };
+}
+
+/// Position `p` is outside the launch's hole (AttnParams.hole_*: the keys
+/// no row sees; empty when causal, so every position is outside).
+fn attnSeen(b: *Builder, p: V) V {
+    // (one unsigned compare: p - hole_first wraps past the hole's width
+    // below it, and is at least the width above it)
+    return b.icmp(.u32, .ge, R(b.sub(R(p), R(b.param(16)))), R(b.sub(R(b.param(17)), R(b.param(16)))));
 }
 
 /// The tile's rows: `hg` heads from h0 (one KV head), `tt` tokens from t0.
@@ -1887,7 +1911,8 @@ fn attnTile(b: *Builder, hg: u32, tt: u32) Tile {
     tile.base = tile.rows[0].first;
     // the last valid token of the tile
     const last_t = b.umin(R(b.add(R(t0), U(tt - 1))), R(b.sub(R(tokens), U(1))));
-    tile.end = b.add(R(first_position), R(last_t));
+    const seen = b.param(15);
+    tile.end = b.sel(.u32, b.icmp(.u32, .ne, R(seen), U(0)), R(b.sub(R(seen), U(1))), R(b.add(R(first_position), R(last_t))));
     return tile;
 }
 
@@ -1966,15 +1991,19 @@ pub fn attnScores(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel
     b.endloop();
     const scale = b.as(.f32, b.param(11));
     const span4 = b.shl(R(b.param(8)), 2);
+    const seen_p = attnSeen(&b, p);
+    const minus_inf = b.mov(.f32, F(-std.math.inf(f32)));
     for (0..n) |r| {
         var sum = lanes[r][0];
         for (1..8) |l| sum = b.fadd(R(sum), R(lanes[r][l]));
         const score = b.fmul(R(sum), R(scale));
         const row = tile.rows[r];
-        const in = b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(p), R(row.first))), b.icmp(.u32, .le, R(p), R(row.pos)));
+        const in = b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(p), R(row.first))), b.icmp(.u32, .le, R(p), R(row.last)));
         b.if_(in);
         const so = b.add(R(rowOffset(&b, tile.token[r], tile.head[r], span4)), R(b.shl(R(b.sub(R(p), R(row.first))), 2)));
-        b.st(S, R(so), 0, 5, score);
+        // (a key in the hole: -inf, so the softmax gives it exactly 0 and
+        // neither the maximum nor the total knows of it)
+        b.st(S, R(so), 0, 5, b.sel(.f32, seen_p, R(score), R(minus_inf)));
         b.endif();
     }
     try k.finish();
@@ -1995,7 +2024,7 @@ pub fn attnSoftmax(s: kir.Storage, caps: Caps) Error!kir.Kernel {
     const h = b.gid(0);
     const tok = b.gid(1);
     const row = attnRow(&b, tok, b.param(3), b.param(4), b.param(2));
-    const len = b.sub(R(b.add(R(row.pos), U(1))), R(row.first));
+    const len = b.sub(R(b.add(R(row.last), U(1))), R(row.first));
     const passes = b.shr(R(b.add(R(len), U(63))), 6);
     const base = rowOffset(&b, tok, h, b.shl(R(b.param(8)), 2));
     const last = b.sub(R(len), U(1));
@@ -2088,9 +2117,11 @@ pub fn attnValues(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel
             const vo = b.add(R(vaddr), R(b.shl(R(p), 8)));
             const v0 = b.half(b.ld(KV, .u32, R(vo), 0, 4), false);
             const v1 = b.half(b.ld(KV, .u32, R(vo), 128, 4), false);
+            // (a key in the hole adds nothing: left out, as the CPU leaves it)
+            const seen_p = attnSeen(&b, p);
             for (0..n) |r| {
                 const row = tile.rows[r];
-                const in = b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(p), R(row.first))), b.icmp(.u32, .le, R(p), R(row.pos)));
+                const in = b.pand(b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(p), R(row.first))), b.icmp(.u32, .le, R(p), R(row.last))), seen_p);
                 const rel = b.sel(.u32, in, R(b.sub(R(p), R(row.first))), U(0));
                 const w = b.ld(S, .f32, R(b.add(R(srow[r]), R(b.shl(R(rel), 2)))), 0, 5);
                 b.set(acc[r][0], .sel, .f32, R(b.fadd(R(acc[r][0]), R(b.fmul(R(w), R(v0))))), R(acc[r][0]), R(in));
@@ -2105,7 +2136,7 @@ pub fn attnValues(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel
         for (0..n) |r| {
             const row = tile.rows[r];
             const first_chunk = b.shr(R(row.first), cshift);
-            const meets = b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(chunk), R(first_chunk))), b.icmp(.u32, .le, R(cs), R(row.pos)));
+            const meets = b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(chunk), R(first_chunk))), b.icmp(.u32, .le, R(cs), R(row.last)));
             b.if_(meets);
             const po = b.add(R(b.add(R(rowOffset(&b, tile.token[r], tile.head[r], chunks_bytes)), R(b.shl(R(b.sub(R(chunk), R(first_chunk))), 9)))), R(b.shl(R(t), 2)));
             b.st(P, R(po), 0, 5, acc[r][0]);
@@ -2133,7 +2164,7 @@ pub fn attnCombine(s: kir.Storage, caps: Caps) Error!kir.Kernel {
     const tok = b.gid(1);
     const row = attnRow(&b, tok, b.param(3), b.param(4), b.param(2));
     const cshift = log2(VALUE_CHUNK);
-    const count = b.add(R(b.sub(R(b.shr(R(row.pos), cshift)), R(b.shr(R(row.first), cshift)))), U(1));
+    const count = b.add(R(b.sub(R(b.shr(R(row.last), cshift)), R(b.shr(R(row.first), cshift)))), U(1));
     const base = b.add(R(rowOffset(&b, tok, h, b.shl(R(b.param(9)), 9))), R(b.shl(R(t), 2)));
     const o0 = b.mov(.f32, R(b.ld(P, .f32, R(base), 0, 5)));
     const o1 = b.mov(.f32, R(b.ld(P, .f32, R(base), 256, 5)));
@@ -3243,7 +3274,8 @@ fn halfOf(bits: u16) f32 {
 
 /// lfm3_executor's PrepareTask then AttentionTask,
 /// against prepare, scores, softmax, values and combine.
-fn testAttention(caps: Caps, heads: u32, kv_heads: u32, context: u32, tokens: u32, first: u32, window: u32, hg: u32, tt: u32) !f64 {
+/// `sn`: AttnParams' seen, hole_first and hole_end (all 0: causal).
+fn testAttention(caps: Caps, heads: u32, kv_heads: u32, context: u32, tokens: u32, first: u32, window: u32, hg: u32, tt: u32, sn: [3]u32) !f64 {
     const T = TestRig;
     const hd = HEAD_SIZE;
     const max_kv = kv_heads;
@@ -3311,18 +3343,25 @@ fn testAttention(caps: Caps, heads: u32, kv_heads: u32, context: u32, tokens: u3
         const kh = h / (heads / kv_heads);
         const query = cq[(t * heads + h) * hd ..][0..hd];
         var scores: [1100]f32 = undefined;
+        var seen_at: [1100]usize = undefined;
+        var length: usize = 0;
         var maximum: f32 = -std.math.inf(f32);
-        for (visible..pos + 1) |p| {
+        // (the keys the row sees, as lfm3_executor's AttentionTask walks
+        // them with a mask: in position order, the hole's left out)
+        const last: usize = if (sn[0] != 0) sn[0] - 1 else pos;
+        for (visible..last + 1) |p| {
+            if (p >= sn[1] and p < sn[2]) continue;
             var lanes = [_]f32{0} ** 8;
             for (0..hd / 8) |i| for (0..8) |l| {
                 lanes[l] += query[8 * i + l] * halfOf(ccache[CacheRow.at(context, max_kv, false, kh, p) + 8 * i + l]);
             };
             var sum = lanes[0];
             for (1..8) |l| sum += lanes[l];
-            scores[p - visible] = sum * scale;
-            maximum = @max(maximum, scores[p - visible]);
+            scores[length] = sum * scale;
+            seen_at[length] = p;
+            maximum = @max(maximum, scores[length]);
+            length += 1;
         }
-        const length = pos + 1 - visible;
         var total: f64 = 0;
         for (scores[0..length]) |*sc| {
             sc.* = @exp(sc.* - maximum);
@@ -3331,7 +3370,7 @@ fn testAttention(caps: Caps, heads: u32, kv_heads: u32, context: u32, tokens: u3
         const inverse: f32 = @floatCast(1.0 / total);
         const dst = cout[(t * heads + h) * hd ..][0..hd];
         @memset(dst, 0);
-        for (scores[0..length], visible..) |sc, p| {
+        for (scores[0..length], seen_at[0..length]) |sc, p| {
             const wgt = f16r(sc * inverse);
             for (dst, 0..) |*acc, e| acc.* += wgt * halfOf(ccache[CacheRow.at(context, max_kv, true, kh, p) + e]);
         }
@@ -3353,7 +3392,7 @@ fn testAttention(caps: Caps, heads: u32, kv_heads: u32, context: u32, tokens: u3
     }
     try std.testing.expectEqual(@as(usize, 0), q_diff);
     try std.testing.expectEqual(@as(usize, 0), kv_diff);
-    const ap = AttnParams{ .heads = heads, .kv_heads = kv_heads, .first_position = first, .tokens = tokens, .window = window, .context = context, .slot = slot, .max_kv_heads = max_kv, .span = span, .chunks = chunks, .query = 0, .gate = 0, .out = 0 };
+    const ap = AttnParams{ .heads = heads, .kv_heads = kv_heads, .first_position = first, .tokens = tokens, .window = window, .context = context, .slot = slot, .max_kv_heads = max_kv, .span = span, .chunks = chunks, .query = 0, .gate = 0, .out = 0, .seen = sn[0], .hole_first = sn[1], .hole_end = sn[2] };
     const words = ap.words();
     const sbuf = T.f[0 .. tokens * heads * span * 4];
     const pbuf = T.g[0 .. tokens * heads * chunks * HEAD_SIZE * 4];
@@ -3373,18 +3412,32 @@ fn testAttention(caps: Caps, heads: u32, kv_heads: u32, context: u32, tokens: u3
         worst = @max(worst, @abs(@as(f64, a) - b) / @max(@abs(@as(f64, a)), 0.05));
         if (@as(u32, @bitCast(a)) == @as(u32, @bitCast(b))) exact += 1;
     }
-    std.debug.print("attention ({d} heads, {d} kv, {d} tokens from {d}, window {d}, {d}x{d} a workgroup): worst {e}, {d} of {d} the CPU's bits\n", .{ heads, kv_heads, tokens, first, window, hg, tt, worst, exact, got.len });
+    std.debug.print("attention ({d} heads, {d} kv, {d} tokens from {d}, window {d}, seen {d} but {d}..{d}, {d}x{d} a workgroup): worst {e}, {d} of {d} the CPU's bits\n", .{ heads, kv_heads, tokens, first, window, sn[0], sn[1], sn[2], hg, tt, worst, exact, got.len });
     return worst;
 }
 
 test "attention: prepare, then scores, softmax, values and combine, against the executor's tasks" {
     const caps = caps32(false, 32);
     // one value chunk: the CPU's operations in its order
-    try std.testing.expect(try testAttention(caps, 8, 2, 300, 3, 37, 0, 4, 2) < 1e-6);
+    try std.testing.expect(try testAttention(caps, 8, 2, 300, 3, 37, 0, 4, 2, .{ 0, 0, 0 }) < 1e-6);
     // spans over several chunks, decode and tiles, a sliding window, GQA groups of 2
-    try std.testing.expect(try testAttention(caps, 8, 2, 1100, 1, 1000, 0, 4, 1) < 1e-5);
-    try std.testing.expect(try testAttention(caps, 4, 2, 1100, 5, 700, 0, 2, 4) < 1e-5);
-    try std.testing.expect(try testAttention(caps32(true, 64), 8, 2, 1100, 4, 1050, 64, 1, 1) < 1e-5);
+    try std.testing.expect(try testAttention(caps, 8, 2, 1100, 1, 1000, 0, 4, 1, .{ 0, 0, 0 }) < 1e-5);
+    try std.testing.expect(try testAttention(caps, 4, 2, 1100, 5, 700, 0, 2, 4, .{ 0, 0, 0 }) < 1e-5);
+    try std.testing.expect(try testAttention(caps32(true, 64), 8, 2, 1100, 4, 1050, 64, 1, 1, .{ 0, 0, 0 }) < 1e-5);
+}
+
+test "attention: a launch whose rows all see the same keys (d1's sets), against the CPU" {
+    const caps = caps32(false, 32);
+    // the state's rows: every position of the pass, those after them too
+    try std.testing.expect(try testAttention(caps, 8, 2, 300, 5, 0, 0, 4, 2, .{ 40, 0, 0 }) < 1e-6);
+    // a question's rows: the state (20 positions) and the question itself
+    // (30..33), never the questions between
+    try std.testing.expect(try testAttention(caps, 8, 2, 300, 4, 30, 0, 4, 2, .{ 34, 20, 30 }) < 1e-6);
+    try std.testing.expect(try testAttention(caps, 8, 2, 300, 4, 30, 0, 1, 1, .{ 34, 20, 30 }) < 1e-6);
+    // over several chunks, a hole that starts and ends inside chunks, tiles of 2 x 3
+    try std.testing.expect(try testAttention(caps, 4, 2, 1100, 3, 900, 0, 2, 3, .{ 903, 600, 900 }) < 1e-5);
+    // the discrete-memory, wide-group caps the RTX has
+    try std.testing.expect(try testAttention(caps32(true, 64), 8, 2, 1100, 4, 700, 0, 2, 2, .{ 1000, 0, 0 }) < 1e-5);
 }
 
 test "copy: 16-byte words between offsets" {

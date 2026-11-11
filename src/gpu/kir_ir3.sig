@@ -47,7 +47,7 @@ pub const MAX_PROLOGUE = 256;
 pub const MAX_LOOPS = 256;
 pub const MAX_POOL = 512;
 pub const MAX_CACHED = 128;
-pub const TEXT_BYTES = 768 * 1024;
+pub const TEXT_BYTES = 1536 * 1024;
 /// Units of the register file: half registers (full rN.c = units 2(4N+c), +1).
 const UNITS = 384;
 /// Half registers live in the first 192 units (hr0.x..hr47.w): in the
