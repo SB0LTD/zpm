@@ -342,7 +342,9 @@ pub const CODE_BYTES = 16 * 1024;
 /// A dispatch's parameter words and bindings at most (a draw's vertex
 /// kernel has the most).
 const MAX_PARAMS = 160;
-const MAX_BIND = 3 + raster.MAX_ATTRS + texture.MAX_TEX;
+/// a kernel's bindings at most: the capture kernel's (its buffers,
+/// uniforms, element array, attributes, textures)
+const MAX_BIND = raster.MAX_CAPTURE_BUFFERS + 2 + raster.MAX_ATTRS + texture.MAX_TEX;
 /// KIR instructions a kernel built here may have (a pipeline's, a GLSL
 /// shader inlined in it).
 pub const MAX_KIR = 65536;
@@ -1527,7 +1529,7 @@ pub const Engine = struct {
 
     // ── Draws ──────────────────────────────────────────────────────────────
 
-    const Stage = enum(u3) { vertex, setup, raster, bin, blit, mip, stencil };
+    const Stage = enum(u3) { vertex, setup, raster, bin, blit, mip, stencil, capture };
 
     fn build(e: *Engine, st: Stage, p: *const raster.Pipeline) kir.Kernel {
         const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
@@ -1536,6 +1538,7 @@ pub const Engine = struct {
             .setup => raster.setupKernel(s, p),
             .raster => raster.rasterKernel(s, p),
             .stencil => raster.stencilKernel(s, p),
+            .capture => raster.captureKernel(s, p),
             .bin => raster.binKernel(s),
             .blit => blitKernel(s),
             .mip => mipKernel(s),
@@ -1578,6 +1581,71 @@ pub const Engine = struct {
             return false;
         };
         p.progs[3].?.label = k.name;
+        return true;
+    }
+
+    fn loadCapture(e: *Engine, p: *raster.Pipeline) bool {
+        if (p.progs[4] != null) return true;
+        if (p.capture_refused_by == @as(?*anyopaque, e)) return false;
+        var k = e.build(.capture, p);
+        const result: anyerror!gpu.Program = blk: {
+            k.finish() catch |err| break :blk err;
+            var w = gpu.Work.init(e.work);
+            const bin = e.compiler(&k, e.dev.?.caps, &w, &e.pcode) catch |err| break :blk err;
+            break :blk e.dev.?.load(&bin);
+        };
+        p.progs[4] = result catch |err| {
+            e.why_pipe = err;
+            p.capture_refused_by = e;
+            report.say(.pipeline, "a program's transform feedback kernel does not compile or load for the GPU ({s}): its captures run on the CPU", .{@errorName(err)});
+            return false;
+        };
+        p.progs[4].?.label = k.name;
+        return true;
+    }
+
+    /// Transform feedback: the draw's vertices (count of each instance)
+    /// through its pipeline's vertex code, the outputs it captures into
+    /// `outs` (buffer i from word bases[i]); on the GPU, or the same kernel
+    /// on the CPU. False when it could not run.
+    pub fn capture(e: *Engine, d: *const raster.Draw, outs: [raster.MAX_CAPTURE_BUFFERS]?*Image, bases: [raster.MAX_CAPTURE_BUFFERS]u32) bool {
+        if (d.count == 0 or d.instances == 0) return true;
+        if (e.zero.buf.cpu.len == 0) e.zero = e.newBuffer(256) orelse return false;
+        const p = d.pipe;
+        var uni = e.newBuffer(@max(d.uniforms.len * 4, 16)) orelse return false;
+        defer e.freeImage(&uni);
+        e.writeBytes(&uni, 0, std.mem.sliceAsBytes(d.uniforms));
+        var cp: [MAX_PARAMS]u32 = undefined;
+        const params = raster.captureParams(d, bases, &cp);
+        const ntex: usize = p.shaders.textures;
+        var bs: [MAX_BIND]*Image = undefined;
+        var writes: u32 = 0;
+        for (outs, 0..) |o, i| {
+            bs[i] = o orelse &e.zero;
+            if (o != null) writes |= @as(u32, 1) << @intCast(i);
+        }
+        const B = raster.MAX_CAPTURE_BUFFERS;
+        bs[B] = &uni;
+        bs[B + 1] = d.index orelse &e.zero;
+        for (d.attrs, 0..) |a, j| bs[B + 2 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
+        for (0..ntex) |j| bs[B + 2 + raster.MAX_ATTRS + j] = d.textures[j] orelse &e.zero;
+        const bl = bs[0 .. B + 2 + raster.MAX_ATTRS + ntex];
+        const groups = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
+        var on_gpu = e.onGpu() and e.loadPipeline(@constCast(p)) and p.owner == @as(?*anyopaque, e) and e.loadCapture(@constCast(p));
+        for (bl) |img| on_gpu = on_gpu and e.gpuUsable(img);
+        if (on_gpu) {
+            e.recordProg(&p.progs[4].?, groups, bl, writes, params, null);
+            return true;
+        }
+        if (e.cpu_work.len == 0) return false;
+        for (bl) |img| e.fetchAll(img);
+        e.stats.cpu_ops += 1;
+        var views: [MAX_BIND][]u8 = undefined;
+        for (bl, 0..) |img, j| views[j] = img.buf.cpu;
+        if (!e.runCpu(.capture, p, groups, views[0..bl.len], params)) return false;
+        for (outs) |o| {
+            if (o) |img| e.wrote(img, 0, img.buf.cpu.len);
+        }
         return true;
     }
 
@@ -1646,7 +1714,7 @@ pub const Engine = struct {
         for (d.attrs, 0..) |a, j| vbs[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
         const depth = d.depth orelse &e.zero;
         const sb = [_]*Image{ &tris, &verts };
-        var rbs: [5 + texture.MAX_TEX]*Image = undefined;
+        var rbs: [6 + texture.MAX_TEX]*Image = undefined;
         rbs[0] = d.color;
         rbs[1] = depth;
         rbs[2] = &tris;
@@ -1656,9 +1724,11 @@ pub const Engine = struct {
             vbs[3 + raster.MAX_ATTRS + j] = img;
             rbs[4 + j] = img;
         }
-        rbs[4 + ntex] = d.stencil orelse &e.zero;
+        // (an occlusion query's word; none on: the zeros, never written)
+        rbs[4 + ntex] = d.query orelse &e.zero;
+        rbs[5 + ntex] = d.stencil orelse &e.zero;
         const vb = vbs[0 .. 3 + raster.MAX_ATTRS + ntex];
-        const rb = rbs[0 .. 4 + ntex + @intFromBool(d.stencil != null)];
+        const rb = rbs[0 .. 5 + ntex + @intFromBool(d.stencil != null)];
         const groups_v = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
         const groups_s = [3]u32{ divUp(ntri, raster.SETUP_GROUP), d.instances, 1 };
         const groups_r = [3]u32{ divUp(d.rect.width(), raster.TILE), divUp(d.rect.height(), raster.TILE), 1 };
@@ -1694,8 +1764,9 @@ pub const Engine = struct {
         var recs: usize = 0;
         if (all_gpu) {
             var rw: u32 = if (d.depth != null and d.depth_test and d.depth_write) 0b11 else 0b01;
+            if (d.query != null) rw |= @as(u32, 1) << @intCast(4 + ntex);
             if (d.stencil != null) {
-                rw |= @as(u32, 1) << @intCast(4 + ntex);
+                rw |= @as(u32, 1) << @intCast(5 + ntex);
                 if (d.stencil == d.depth) rw |= 0b10;
             }
             e.recordProg(&p.progs[0].?, groups_v, vb, 1, vparams, null);
@@ -1735,10 +1806,11 @@ pub const Engine = struct {
             if (!e.runCpu(.setup, p, groups_s, &sv, sparams)) break :cpu false;
             const bv = [_][]u8{tris.buf.cpu};
             if (bins.on and !e.runCpu(.bin, p, groups_b, &bv, bparams)) break :cpu false;
-            var rv: [5 + texture.MAX_TEX][]u8 = undefined;
+            var rv: [6 + texture.MAX_TEX][]u8 = undefined;
             for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
             if (!e.runCpu(if (d.stencil != null) .stencil else .raster, p, groups_r, rv[0..rb.len], rparams)) break :cpu false;
             for (rb[0..2]) |img| e.wrote(img, 0, img.buf.cpu.len);
+            if (d.query) |q| e.wrote(q, 0, q.buf.cpu.len);
             if (d.stencil) |stencil| e.wrote(stencil, 0, stencil.buf.cpu.len);
             break :cpu true;
         };

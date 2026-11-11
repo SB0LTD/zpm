@@ -74,7 +74,7 @@ pub const Type = packed struct(u32) {
         return t.array == 0 and (t.base == .int or t.base == .uint);
     }
     pub fn scalar(t: Type) bool {
-        return t.array == 0 and t.cols == 1 and t.rows == 1 and @intFromEnum(t.base) <= @intFromEnum(Base.float) and t.base != .void;
+        return t.array == 0 and t.cols == 1 and t.rows == 1 and @backingInt(t.base) <= @backingInt(Base.float) and t.base != .void;
     }
     pub fn vector(t: Type) bool {
         return t.array == 0 and t.cols == 1 and t.rows > 1;
@@ -83,7 +83,7 @@ pub const Type = packed struct(u32) {
         return t.array == 0 and t.cols > 1;
     }
     pub fn sampler(t: Type) bool {
-        return @intFromEnum(t.base) >= @intFromEnum(Base.sampler2D) and @intFromEnum(t.base) <= @intFromEnum(Base.samplerExternalOES);
+        return @backingInt(t.base) >= @backingInt(Base.sampler2D) and @backingInt(t.base) <= @backingInt(Base.samplerExternalOES);
     }
     /// components of a scalar, vector or matrix
     pub fn comps(t: Type) u32 {
@@ -393,13 +393,13 @@ pub const Builtin = struct {
 
 fn patOf(s: []const u8) Pat {
     const map = .{
-        .{ "F", Pat.genF },  .{ "I", Pat.genI },   .{ "U", Pat.genU },   .{ "B", Pat.genB },   .{ "f", Pat.f },
-        .{ "i", Pat.i },     .{ "u", Pat.u },      .{ "b", Pat.b },      .{ "VF", Pat.vF },    .{ "VI", Pat.vI },
-        .{ "VU", Pat.vU },   .{ "VB", Pat.vB },    .{ "v2", Pat.v2 },    .{ "v3", Pat.v3 },    .{ "v4", Pat.v4 },
-        .{ "iv2", Pat.iv2 }, .{ "iv3", Pat.iv3 },  .{ "iv4", Pat.iv4 },  .{ "uv2", Pat.uv2 },  .{ "uv3", Pat.uv3 },
-        .{ "uv4", Pat.uv4 }, .{ "M", Pat.m },      .{ "MS", Pat.ms },    .{ "MT", Pat.mt },    .{ "gS2", Pat.gS2 },
-        .{ "gS3", Pat.gS3 }, .{ "gSC", Pat.gSC },  .{ "gSA", Pat.gSA },  .{ "gv4", Pat.gv4 },  .{ "s2", Pat.s2 },
-        .{ "sC", Pat.sC },   .{ "s2S", Pat.s2S },  .{ "sCS", Pat.sCS },  .{ "s2AS", Pat.s2AS }, .{ "sE", Pat.sE },
+        .{ "F", Pat.genF },      .{ "I", Pat.genI },  .{ "U", Pat.genU },  .{ "B", Pat.genB },    .{ "f", Pat.f },
+        .{ "i", Pat.i },         .{ "u", Pat.u },     .{ "b", Pat.b },     .{ "VF", Pat.vF },     .{ "VI", Pat.vI },
+        .{ "VU", Pat.vU },       .{ "VB", Pat.vB },   .{ "v2", Pat.v2 },   .{ "v3", Pat.v3 },     .{ "v4", Pat.v4 },
+        .{ "iv2", Pat.iv2 },     .{ "iv3", Pat.iv3 }, .{ "iv4", Pat.iv4 }, .{ "uv2", Pat.uv2 },   .{ "uv3", Pat.uv3 },
+        .{ "uv4", Pat.uv4 },     .{ "M", Pat.m },     .{ "MS", Pat.ms },   .{ "MT", Pat.mt },     .{ "gS2", Pat.gS2 },
+        .{ "gS3", Pat.gS3 },     .{ "gSC", Pat.gSC }, .{ "gSA", Pat.gSA }, .{ "gv4", Pat.gv4 },   .{ "s2", Pat.s2 },
+        .{ "sC", Pat.sC },       .{ "s2S", Pat.s2S }, .{ "sCS", Pat.sCS }, .{ "s2AS", Pat.s2AS }, .{ "sE", Pat.sE },
         .{ "oF", Pat.out_genF },
     };
     inline for (map) |e| {
@@ -578,6 +578,8 @@ pub const MAX_FIELDS = 1024;
 pub const MAX_PARAMS = 2048;
 pub const MAX_IO = 64;
 pub const MAX_UNIFORMS = 256;
+/// uniform blocks a shader may declare (GL ES 3.0's MAX_VERTEX_UNIFORM_BLOCKS)
+pub const MAX_BLOCKS = 12;
 const MAX_DEPTH = 64;
 
 pub const SymKind = enum(u8) { variable, function, strukt };
@@ -601,7 +603,23 @@ pub const Sym = struct {
     used: bool = false,
 };
 
-pub const Field = struct { name: []const u8, ty: Type };
+/// A struct's member; a uniform block's says its matrices' layout
+/// (layout(row_major) or (column_major): else the block's).
+pub const Field = struct { name: []const u8, ty: Type, layout: enum(u2) { block, row_major, column_major } = .block };
+
+/// A uniform block (GLSL ES 3.00): its members are uniforms[first ..
+/// first + n] (an instance's: the one struct uniform), laid out std140.
+pub const Block = struct {
+    name: []const u8,
+    /// its instance's name ("": an anonymous block, its members global)
+    instance: []const u8 = "",
+    row_major: bool = false,
+    first: u32 = 0,
+    n: u32 = 0,
+    line: u32 = 0,
+    /// its members as a struct (structs[strukt]: their layouts)
+    strukt: u8 = 0,
+};
 pub const Struct = struct { name: []const u8, first: u32, n: u32 };
 pub const Param = struct { ty: Type, q: u16 };
 
@@ -615,6 +633,8 @@ pub const Var = struct {
     line: u32 = 0,
     /// its symbol (syms[sym].used: whether the shader uses it)
     sym: u32 = 0,
+    /// a uniform block's member: the block's index + 1 (0: none)
+    block: u8 = 0,
 };
 
 pub const Checker = struct {
@@ -640,6 +660,8 @@ pub const Checker = struct {
     noutputs: usize = 0,
     uniforms: [MAX_UNIFORMS]Var = undefined,
     nuniforms: usize = 0,
+    blocks: [MAX_BLOCKS]Block = undefined,
+    nblocks: usize = 0,
     has_main: bool = false,
     /// the function being checked: its return type, loops and switches open
     ret: Type = ERR,
@@ -774,7 +796,7 @@ pub const Checker = struct {
                 const s = c.find(c.tokText(nd.tok));
                 if (s == null or s.?.q & Q.out == 0 and s.?.q & Q.varying == 0) c.log.err(nd.line, "`invariant {s}`: not an output", .{c.tokText(nd.tok)});
             },
-            .block_decl => c.log.err(nd.line, "interface blocks (`{s} {{ ... }}`) are not supported yet", .{c.tokText(nd.tok)}),
+            .block_decl => c.blockDecl(i),
             else => {},
         }
     }
@@ -794,7 +816,7 @@ pub const Checker = struct {
             },
             .unary => blk: {
                 const v = c.constInt(nd.a) orelse break :blk null;
-                break :blk switch (@as(Kind, @enumFromInt(nd.op))) {
+                break :blk switch (@as(Kind, @fromBackingInt(@intCast(nd.op)))) {
                     .minus => -%v,
                     .plus => v,
                     .tilde => ~v,
@@ -805,7 +827,7 @@ pub const Checker = struct {
             .binary => blk: {
                 const a = c.constInt(nd.a) orelse break :blk null;
                 const b = c.constInt(nd.b) orelse break :blk null;
-                break :blk switch (@as(Kind, @enumFromInt(nd.op))) {
+                break :blk switch (@as(Kind, @fromBackingInt(@intCast(nd.op)))) {
                     .plus => a +% b,
                     .minus => a -% b,
                     .star => a *% b,
@@ -911,7 +933,7 @@ pub const Checker = struct {
                     c.log.err(vn.line, "too many struct members", .{});
                     break;
                 }
-                c.fields[c.nfields] = .{ .name = fname, .ty = ft };
+                c.fields[c.nfields] = .{ .name = fname, .ty = ft, .layout = if (md.flags & Q.row_major != 0) .row_major else if (md.flags & Q.column_major != 0) .column_major else .block };
                 c.nfields += 1;
                 c.structs[id].n += 1;
             }
@@ -982,6 +1004,47 @@ pub const Checker = struct {
             vn.ty = t.bits();
             _ = c.add(s, vn.line);
         }
+    }
+
+    /// A uniform block (GLSL ES 3.00): an instance's members are its
+    /// struct uniform's ("inst.m"), an anonymous block's each a uniform
+    /// of their own; the block notes them for its std140 layout.
+    fn blockDecl(c: *Checker, i: u32) void {
+        const nd = c.node(i);
+        const bname = c.tokText(nd.tok);
+        if (c.version < 300) return c.log.err(nd.line, "interface blocks are GLSL ES 3.00's: {s}", .{bname});
+        if (nd.flags & Q.uniform == 0 or nd.flags & (Q.in | Q.out) != 0) return c.log.err(nd.line, "only uniform blocks are GLSL ES 3.00's: {s}", .{bname});
+        if (std.mem.startsWith(u8, bname, "gl_")) return c.log.err(nd.line, "names beginning gl_ are reserved: {s}", .{bname});
+        for (c.blocks[0..c.nblocks]) |b| {
+            if (std.mem.eql(u8, b.name, bname)) return c.log.err(nd.line, "uniform block `{s}` declared twice", .{bname});
+        }
+        if (c.nblocks == MAX_BLOCKS) return c.log.err(nd.line, "too many uniform blocks ({d} at most)", .{MAX_BLOCKS});
+        const st = c.structDef(nd.a);
+        if (st.isErr()) return;
+        nd.ty = st.bits();
+        const bi = c.nblocks;
+        c.blocks[bi] = .{ .name = bname, .row_major = nd.flags & Q.row_major != 0, .first = @intCast(c.nuniforms), .line = nd.line, .strukt = st.strukt };
+        c.nblocks += 1;
+        if (nd.b != 0) {
+            const vn = c.node(nd.b);
+            const name = c.tokText(vn.tok);
+            if (vn.a != 0) return c.log.err(vn.line, "arrays of uniform blocks are not supported yet: {s}", .{name});
+            c.blocks[bi].instance = name;
+            c.blockVar(name, st, vn.line, bi);
+            vn.ty = st.bits();
+        } else {
+            for (c.structFields(st)) |fd| c.blockVar(fd.name, fd.ty, nd.line, bi);
+        }
+        c.blocks[bi].n = @intCast(c.nuniforms - c.blocks[bi].first);
+    }
+
+    fn blockVar(c: *Checker, name: []const u8, t: Type, line: u32, bi: usize) void {
+        if (std.mem.startsWith(u8, name, "gl_")) return c.log.err(line, "names beginning gl_ are reserved: {s}", .{name});
+        if (c.nuniforms == MAX_UNIFORMS) return c.log.err(line, "too many uniforms", .{});
+        const sym: u32 = @intCast(c.nsyms);
+        _ = c.add(.{ .name = name, .kind = .variable, .ty = t, .q = Q.uniform }, line) orelse return;
+        c.uniforms[c.nuniforms] = .{ .name = name, .ty = t, .q = Q.uniform, .line = line, .sym = sym, .block = @intCast(bi + 1) };
+        c.nuniforms += 1;
     }
 
     fn storageName(c: *Checker, q: u16) []const u8 {
@@ -1335,7 +1398,7 @@ pub const Checker = struct {
         const a = c.expr(nd.a);
         const b = c.expr(nd.b);
         if (a.isErr() or b.isErr()) return ERR;
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         return c.binaryType(op, a, b, nd.line);
     }
 
@@ -1426,7 +1489,7 @@ pub const Checker = struct {
     fn unaryExpr(c: *Checker, nd: *Node) Type {
         const t = c.expr(nd.a);
         if (t.isErr()) return ERR;
-        switch (@as(Kind, @enumFromInt(nd.op))) {
+        switch (@as(Kind, @fromBackingInt(@intCast(nd.op)))) {
             .bang => if (!t.eq(BOOL)) {
                 c.log.err(nd.line, "`!` needs a bool, not {s}", .{c.typeName(t)});
                 return ERR;
@@ -1448,7 +1511,7 @@ pub const Checker = struct {
         const b = c.expr(nd.b);
         c.needLvalue(nd.a, nd.line);
         if (a.isErr() or b.isErr()) return ERR;
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         if (op == .assign) {
             if (!a.eq(b)) {
                 c.log.err(nd.line, "cannot assign {s} to {s}", .{ c.typeName(b), c.typeName(a) });

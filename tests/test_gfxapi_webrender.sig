@@ -352,15 +352,17 @@ fn runTileSeed(pipe: *const raster.Pipeline, uniforms: []const u32, nslots: usiz
     const draw = raster.Draw{ .pipe = pipe, .color = &color, .rect = .{ .x0 = 0, .y0 = 0, .x1 = 8, .y1 = 8 }, .count = 3 * TILE_TRIS };
     var rp: [raster.RASTER_PARAMS]u32 = undefined;
     const params = raster.rasterParams(&draw, .{}, &rp);
-    var bufs: [4 + texture.MAX_TEX]gpu.Buffer = undefined;
+    // (color, depth, triangles, uniforms, the textures, an occlusion
+    // query's word)
+    var bufs: [5 + texture.MAX_TEX]gpu.Buffer = undefined;
     const ntex: usize = pipe.shaders.textures;
-    const nb = 4 + ntex;
+    const nb = 5 + ntex;
     for (bufs[0..nb], 0..) |*b, i| {
         const bytes: u64 = switch (i) {
             2 => TILE_TRIS * @as(u64, pipe.sstride) * 4,
             3 => (uniforms.len + nslots * texture.DESC_WORDS + 4) * 4,
             0, 1 => 256,
-            else => if (seed != 0) FUZZ_SIDE * FUZZ_SIDE * @as(u64, fmt.bytes()) else 256,
+            else => if (i == nb - 1) 256 else if (seed != 0) FUZZ_SIDE * FUZZ_SIDE * @as(u64, fmt.bytes()) else 256,
         };
         b.* = try d.alloc(bytes, .host);
         @memset(b.cpu, 0);

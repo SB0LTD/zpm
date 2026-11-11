@@ -557,6 +557,138 @@ pub export fn glCopyBufferSubData(read_target: u32, write_target: u32, read_offs
     defer driverLeave();
     if (cur()) |c| c.copyBufferSubData(read_target, write_target, read_offset, write_offset, size);
 }
+// GL ES 3.0's queries (one name space with EXT_disjoint_timer_query's)
+pub export fn glGenQueries(n: i32, ids: ?[*]u32) callconv(.c) void {
+    glGenQueriesEXT(n, ids);
+}
+pub export fn glDeleteQueries(n: i32, ids: ?[*]const u32) callconv(.c) void {
+    glDeleteQueriesEXT(n, ids);
+}
+pub export fn glIsQuery(id: u32) callconv(.c) u8 {
+    return glIsQueryEXT(id);
+}
+pub export fn glBeginQuery(target: u32, id: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.beginQuery(target, id);
+}
+pub export fn glEndQuery(target: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.endQuery(target);
+}
+pub export fn glGetQueryiv(target: u32, pname: u32, out: ?*i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (c.queryState(target, pname)) |v| {
+        if (out) |p| p.* = v;
+    }
+}
+pub export fn glGetQueryObjectuiv(id: u32, pname: u32, out: ?*u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (c.queryResult(id, pname)) |v| {
+        if (out) |p| p.* = @intCast(@min(v, std.math.maxInt(u32)));
+    }
+}
+
+// GL ES 3.0's transform feedback
+pub export fn glGenTransformFeedbacks(n: i32, ids: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (ids) |p| c.genTransformFeedbacks(p[0..k]);
+}
+pub export fn glDeleteTransformFeedbacks(n: i32, ids: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (ids) |p| c.deleteTransformFeedbacks(p[0..k]);
+}
+pub export fn glIsTransformFeedback(id: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return 0;
+    return @intFromBool(c.isTransformFeedback(id));
+}
+pub export fn glBindTransformFeedback(target: u32, id: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.bindTransformFeedback(target, id);
+}
+pub export fn glBeginTransformFeedback(mode: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.beginTransformFeedback(mode);
+}
+pub export fn glEndTransformFeedback() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.endTransformFeedback();
+}
+pub export fn glPauseTransformFeedback() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.pauseTransformFeedback();
+}
+pub export fn glResumeTransformFeedback() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.resumeTransformFeedback();
+}
+pub export fn glTransformFeedbackVaryings(prog: u32, n: i32, names: ?[*]const [*:0]const u8, mode: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const list = names orelse if (n == 0) @as([*]const [*:0]const u8, undefined) else return c.fail(g.INVALID_VALUE);
+    program.transformFeedbackVaryings(c, prog, n, list, mode);
+}
+pub export fn glGetTransformFeedbackVarying(prog: u32, index: u32, buf_size: i32, length: ?*i32, size: ?*i32, kind: ?*u32, name: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| program.getTransformFeedbackVarying(c, prog, index, buf_size, length, size, kind, name);
+}
+
+pub export fn glGetInternalformativ(target: u32, internalformat: u32, pname: u32, buf_size: i32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    _ = internalformat;
+    const k = count(buf_size) orelse return;
+    c.internalformat(target, pname, if (params) |p| p[0..k] else &.{});
+}
+
+// (no compressed formats: GL ES 3.0's ETC2 and EAC are not decoded yet, so
+// an upload says so rather than leaving its texture empty)
+pub export fn glCompressedTexImage2D(target: u32, level: i32, internal: u32, w: i32, h: i32, border: i32, size: i32, data: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    _ = .{ target, level, internal, w, h, border, size, data };
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+pub export fn glCompressedTexSubImage2D(target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, size: i32, data: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    _ = .{ target, level, x, y, w, h, format, size, data };
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+pub export fn glCompressedTexImage3D(target: u32, level: i32, internal: u32, w: i32, h: i32, depth: i32, border: i32, size: i32, data: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    _ = .{ target, level, internal, w, h, depth, border, size, data };
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+pub export fn glCompressedTexSubImage3D(target: u32, level: i32, x: i32, y: i32, z: i32, w: i32, h: i32, depth: i32, format: u32, size: i32, data: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    _ = .{ target, level, x, y, z, w, h, depth, format, size, data };
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+
 pub export fn glGenQueriesEXT(n: i32, ids: ?[*]u32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
@@ -580,12 +712,12 @@ pub export fn glIsQueryEXT(id: u32) callconv(.c) u8 {
 pub export fn glBeginQueryEXT(target: u32, id: u32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    if (cur()) |c| c.beginTimer(target, id);
+    if (cur()) |c| c.beginQuery(target, id);
 }
 pub export fn glEndQueryEXT(target: u32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    if (cur()) |c| c.endTimer(target);
+    if (cur()) |c| c.endQuery(target);
 }
 pub export fn glQueryCounterEXT(id: u32, target: u32) callconv(.c) void {
     driverEnter();
@@ -1410,30 +1542,53 @@ pub export fn glGetFragDataLocation(prog: u32, name: [*:0]const u8) callconv(.c)
     const c = cur() orelse return -1;
     return program.getFragDataLocation(c, prog, name);
 }
-// (uniform blocks: none yet, so no index names one)
+// (uniform blocks, std140: program.sig)
 pub export fn glGetUniformBlockIndex(prog: u32, name: [*:0]const u8) callconv(.c) u32 {
     driverEnter();
     defer driverLeave();
-    _ = .{ prog, name };
-    return g.INVALID_INDEX;
+    const c = cur() orelse return g.INVALID_INDEX;
+    return program.getUniformBlockIndex(c, prog, name);
 }
 pub export fn glUniformBlockBinding(prog: u32, index: u32, binding: u32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    _ = .{ prog, index, binding };
-    if (cur()) |c| c.fail(g.INVALID_VALUE);
+    if (cur()) |c| program.uniformBlockBinding(c, prog, index, binding);
 }
 pub export fn glGetActiveUniformBlockiv(prog: u32, index: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    _ = .{ prog, index, pname, params };
-    if (cur()) |c| c.fail(g.INVALID_VALUE);
+    const c = cur() orelse return;
+    const out = params orelse return c.fail(g.INVALID_VALUE);
+    program.getActiveUniformBlockiv(c, prog, index, pname, out);
 }
 pub export fn glGetActiveUniformBlockName(prog: u32, index: u32, buf_size: i32, length: ?*i32, name: ?[*]u8) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    _ = .{ prog, index, buf_size, length, name };
-    if (cur()) |c| c.fail(g.INVALID_VALUE);
+    if (cur()) |c| program.getActiveUniformBlockName(c, prog, index, buf_size, length, name);
+}
+pub export fn glBindBufferBase(target: u32, index: u32, buffer: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.bindBufferRange(target, index, buffer, 0, 0, false);
+}
+pub export fn glBindBufferRange(target: u32, index: u32, buffer: u32, offset: isize, size: isize) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.bindBufferRange(target, index, buffer, offset, size, true);
+}
+pub export fn glGetIntegeri_v(pname: u32, index: u32, data: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const v = c.getIndexed(pname, index) orelse return;
+    if (data) |p| p[0] = @truncate(v);
+}
+pub export fn glGetInteger64i_v(pname: u32, index: u32, data: ?[*]i64) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const v = c.getIndexed(pname, index) orelse return;
+    if (data) |p| p[0] = v;
 }
 pub export fn glGetUniformfv(prog: u32, loc: i32, params: [*]f32) callconv(.c) void {
     driverEnter();
@@ -1924,7 +2079,8 @@ test "libgles: vertex attribute queries keep vector types, VAO offsets and untou
 test "libgles: getProcAddress finds every entry point, and nothing else" {
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glClear)), getProcAddress("glClear"));
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glTexStorage2DEXT)), getProcAddress("glTexStorage2DEXT"));
-    try std.testing.expect(getProcAddress("glBeginTransformFeedback") == null);
+    try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glBeginTransformFeedback)), getProcAddress("glBeginTransformFeedback"));
+    try std.testing.expect(getProcAddress("glDispatchCompute") == null);
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glUniformMatrix4x3fv)), getProcAddress("glUniformMatrix4x3fv"));
     try std.testing.expect(getProcAddress("getProcAddress") == null);
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glReadnPixelsEXT)), getProcAddress("glReadnPixelsEXT"));

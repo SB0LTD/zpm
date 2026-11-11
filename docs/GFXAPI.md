@@ -106,7 +106,11 @@ Shaders and programs share one namespace. Names are the process's, and each obje
 - merges the two stages' uniforms (one type per name), each with consecutive locations (one per array element) and its words in the program's uniform storage, which is tight (a float, an int, a bool or a sampler's unit is one word);
 - places 3.00's fragment outputs, or notes 1.00's `gl_FragColor`/`gl_FragData`.
 
-As in Mesa, only what a shader uses is active. `glGetUniformLocation` takes `u`, `u[k]`, `s.m` and `s[1].m[2]`. `glUniform*` checks the type, count and sampler units, and `glGetUniform*` converts. `glUniformMatrix*` takes `transpose`. There are no binary formats. Interface blocks (uniform blocks) are refused for now. Every call takes the program table's lock.
+As in Mesa, only what a shader uses is active. `glGetUniformLocation` takes `u`, `u[k]`, `s.m` and `s[1].m[2]`. `glUniform*` checks the type, count and sampler units, and `glGetUniform*` converts. `glUniformMatrix*` takes `transpose`. There are no binary formats. Every call takes the program table's lock.
+
+Uniform blocks (3.00) are laid out std140; `shared` and `packed` are laid out the same way. A block's members are uniform words of the program too, but have no location, and their std140 offsets and strides are what `glGetActiveUniformsiv` reports. A named block's members are named `Block.member`; each shader may name the instance as it likes. Every draw copies each block's bytes from the range bound to its binding point (`glBindBufferBase`, `glBindBufferRange`) into those words, so the shader code reads a member like any uniform. A block is at most 16384 bytes, and a program's uniforms, blocks included, at most 4096 words. Arrays of blocks are refused for now.
+
+Transform feedback (`glTransformFeedbackVaryings` before the link) captures `gl_Position` or any vertex output, whether the fragment shader reads it or not. The variables go interleaved into one buffer, or each into its own (up to 4). A fifth pipeline kernel runs the vertex code again and writes the outputs as the shader made them, in clip space. Points and lines are captured even though they are not drawn yet, and `RASTERIZER_DISCARD` captures without drawing. GL ES 3.0's rules hold: only arrays (no indexed draws), the begun primitive mode, and room in the buffers.
 
 ### GLSL to KIR
 
@@ -317,16 +321,26 @@ That makes 187 GL entry points.
 
 **Stage 5g, mipmaps:** levels stored in a chain, `glGenerateMipmap` on the GPU, texture completeness, the level of detail (implicit through quads, given, gradients, bias), nearest-mipmap and trilinear filtering, and `texelFetch` and `textureSize` by level.
 
+**Stage 5h, WebGL 2 (the rest of GL ES 3.0):**
+- uniform blocks (std140) and indexed buffer binding points;
+- transform feedback objects, pause and resume;
+- queries:
+  - `ANY_SAMPLES_PASSED` and its `CONSERVATIVE` form are exact: each passing pixel sets the query's word;
+  - `TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN` is counted as primitives are captured;
+- primitive restart at the fixed index: the restart index's vertex is out, so the triangles with it are dropped;
+- the limits WebGL 2 reads at a context's start, and `glGetIntegeri_v`, `glGetInteger64i_v` and `glGetInternalformativ`. There are 24 new GL entry points.
+
 **Not yet:**
-- uniform blocks, transform feedback, queries;
-- points and lines;
+- points and lines (transform feedback captures them);
+- primitive restart in a strip continues the strip's winding (GL starts a new strip);
+- compressed textures: ETC2 and EAC uploads fail with INVALID_ENUM;
 - clipping: a triangle with a vertex at w ≤ 0, or past a guard band of 24576 pixels, is dropped;
 - stencil tests, several color attachments, depth-only drawing;
 - half-float and packed attribute formats, divisors past 1, attribute arrays in client memory;
 - framebuffer attachments and copies of texture levels past 0, other texture targets, the texture formats listed under Textures;
 - multisampling;
-- EGLImages of GL textures (`EGL_KHR_gl_texture_2D_image`) and dma-buf export (`EGL_MESA_image_dma_buf_export`), with `libgbm` (stage 7);
-- multi-plane and YUV dma-bufs;
+- `libgbm` (stage 7);
+- one EGLImage of a picture's planes together (each plane alone is had: R8, GR88, R16, GR1616);
 - native fences and dma-buf import on the PC: they wait for per-app RTX contexts;
 - a Wayland connection of EGL's own, for `EGL_PLATFORM_WAYLAND_KHR` with `EGL_DEFAULT_DISPLAY`.
 

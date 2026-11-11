@@ -35,6 +35,12 @@
 //!
 //! Color targets: RGBA8, BGRA8, RG8 and R8 (WebRender's masks).
 //!
+//! GL ES 3.0's too: transform feedback (a fifth kernel, **capture**: the
+//! vertex code again, its outputs as the shader made them into buffers),
+//! occlusion queries (a pixel the raster writes says a sample passed),
+//! primitive restart at the fixed index (the index's vertex is out: the
+//! triangles with it are dropped).
+//!
 //! Not yet: points and lines; clipping (a triangle with a vertex at w <= 0,
 //! or beyond GUARD pixels, is dropped: a guard band); multisampling;
 //! several color attachments; float and integer targets.
@@ -150,8 +156,25 @@ pub const Shaders = struct {
     /// the fragment code takes derivatives: the raster runs it for whole
     /// quads (FragmentIO.quads)
     quads: bool = false,
+    /// transform feedback: the components a vertex writes (the capture
+    /// kernel), and each buffer's words a vertex
+    capture: []const Capture = &.{},
+    capture_stride: [MAX_CAPTURE_BUFFERS]u32 = @splat(0),
     vertex: *const fn (?*const anyopaque, *kir.Kernel, *VertexIO) void,
     fragment: *const fn (?*const anyopaque, *kir.Kernel, *FragmentIO) void,
+};
+
+/// Transform feedback's buffers (GL ES 3.0's MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS).
+pub const MAX_CAPTURE_BUFFERS = 4;
+
+/// A component a vertex writes to a transform feedback buffer: the
+/// position's (src: its component) or a varying word's, into word `word`
+/// of `buffer`'s record.
+pub const Capture = struct {
+    position: bool = false,
+    src: u8 = 0,
+    buffer: u8 = 0,
+    word: u16 = 0,
 };
 
 /// A uniform word (f32 bits, or an int's) of the binding `b`.
@@ -171,9 +194,11 @@ pub const Pipeline = struct {
     /// words a vertex's record takes, and a triangle's
     vstride: u32,
     sstride: u32,
-    /// Vertex, setup, raster, and the optional stencil raster variant.
-    progs: [4]?gpu.Program = @splat(null),
+    /// Vertex, setup, raster, the optional stencil raster variant, and
+    /// transform feedback's capture.
+    progs: [5]?gpu.Program = @splat(null),
     stencil_refused_by: ?*anyopaque = null,
+    capture_refused_by: ?*anyopaque = null,
     /// the engine that loaded them
     owner: ?*anyopaque = null,
     /// the engine whose GPU refused them (their draws run on the CPU, not
@@ -280,6 +305,10 @@ pub const Draw = struct {
     first: u32 = 0,
     count: u32 = 0,
     instances: u32 = 1,
+    /// primitive restart at the fixed index (the index type's largest)
+    restart: bool = false,
+    /// an occlusion query's word: set where a sample passes (null: none)
+    query: ?*engine.Image = null,
     /// window = ndc * half + center (x, y); depth = ndc * scale + bias,
     /// fragments outside [zmin, zmax] dropped
     center: [2]f32 = .{ 0, 0 },
@@ -422,6 +451,11 @@ const V_STRIDE = 10;
 const V_INDEX_LIMIT = 11;
 const V_ATTR = 12;
 const V_ATTR_WORDS = 8;
+/// the restart index (0: none), after the attributes; then the capture
+/// kernel's buffers' first words
+const V_RESTART = V_ATTR + MAX_ATTRS * V_ATTR_WORDS;
+const C_BASE = V_RESTART + 1;
+pub const VERTEX_PARAMS = C_BASE + MAX_CAPTURE_BUFFERS;
 // an attribute's format word
 const F_FLOAT = 1 << 8;
 const F_SIGNED = 1 << 9;
@@ -445,20 +479,7 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     const inst = k.gid(1);
     k.ifp(r(k.cmp(.u32, .lt, r(x), r(count))));
     {
-        // the vertex: first + x, or the element array's x-th index
-        const idx_size = k.param(.u32, V_INDEX_SIZE);
-        const v = k.reg(.u32);
-        k.set(v, .iadd, r(k.param(.u32, V_FIRST)), r(x), no);
-        k.ifp(r(k.cmp(.u32, .ne, r(idx_size), u(0))));
-        {
-            const at = k.op3(.imad, .u32, r(x), r(idx_size), r(k.param(.u32, V_INDEX_OFF)));
-            // (inside the buffer whatever the app asks: the last word at most)
-            const wat = k.op2(.imin, .u32, r(k.op2(.@"and", .u32, r(at), u(0xffff_fffc))), r(k.param(.u32, V_INDEX_LIMIT)));
-            const word = k.load(.u32, kir.global(b_idx, 32), r(wat));
-            const shift = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(at), u(3))), u(3));
-            k.set(v, .bfe, r(word), r(shift), r(k.op2(.shl, .u32, r(idx_size), u(3))));
-        }
-        k.endif();
+        const v = vertexOf(&k, b_idx, x);
         var io = VertexIO{ .vertex_id = v, .instance_id = inst, .uniforms = b_uni, .textures = b_tex };
         for (0..sh.attrs) |a| io.attr[a] = fetch(&k, b_attr[a], @intCast(V_ATTR + a * V_ATTR_WORDS), v, inst);
         sh.vertex(sh.ctx, &k, &io);
@@ -468,8 +489,12 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         const xw = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(k.op2(.fmul, .f32, r(io.position[0]), r(iw))), r(k.param(.f32, V_HX)))), r(k.param(.f32, V_CX)));
         const yw = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(k.op2(.fmul, .f32, r(io.position[1]), r(iw))), r(k.param(.f32, V_HY)))), r(k.param(.f32, V_CY)));
         const zw = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(k.op2(.fmul, .f32, r(io.position[2]), r(iw))), r(k.param(.f32, V_ZS)))), r(k.param(.f32, V_ZB)));
-        // (in: w > 0, inside the guard band; NaN fails every compare)
+        // (in: w > 0, inside the guard band; NaN fails every compare; not
+        // the restart index)
         var ok = k.cmp(.f32, .gt, r(w), f(0));
+        const restart = k.param(.u32, V_RESTART);
+        const restarts = k.op2(.pand, .pred, r(k.cmp(.u32, .ne, r(restart), u(0))), r(k.cmp(.u32, .eq, r(v), r(restart))));
+        ok = k.op2(.pand, .pred, r(ok), r(k.op1(.pnot, .pred, r(restarts))));
         ok = k.op2(.pand, .pred, r(ok), r(k.cmp(.f32, .le, r(k.op1(.fabs, .f32, r(xw))), f(GUARD))));
         ok = k.op2(.pand, .pred, r(ok), r(k.cmp(.f32, .le, r(k.op1(.fabs, .f32, r(yw))), f(GUARD))));
         const xs = k.sel(.f32, r(ok), r(xw), f(0));
@@ -486,6 +511,66 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
             const val = io.varying[j];
             const out = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0) val else k.op2(.fmul, .f32, r(val), r(iw));
             k.store(.f32, memAt(b_out, @intCast(16 + 4 * j)), r(base), r(out));
+        }
+    }
+    k.endif();
+    return k;
+}
+
+/// The vertex thread x draws: first + x, or the element array's x-th
+/// index.
+fn vertexOf(k: *kir.Kernel, b_idx: u8, x: V) V {
+    const idx_size = k.param(.u32, V_INDEX_SIZE);
+    const v = k.reg(.u32);
+    k.set(v, .iadd, r(k.param(.u32, V_FIRST)), r(x), no);
+    k.ifp(r(k.cmp(.u32, .ne, r(idx_size), u(0))));
+    {
+        const at = k.op3(.imad, .u32, r(x), r(idx_size), r(k.param(.u32, V_INDEX_OFF)));
+        // (inside the buffer whatever the app asks: the last word at most)
+        const wat = k.op2(.imin, .u32, r(k.op2(.@"and", .u32, r(at), u(0xffff_fffc))), r(k.param(.u32, V_INDEX_LIMIT)));
+        const word = k.load(.u32, kir.global(b_idx, 32), r(wat));
+        const shift = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(at), u(3))), u(3));
+        k.set(v, .bfe, r(word), r(shift), r(k.op2(.shl, .u32, r(idx_size), u(3))));
+    }
+    k.endif();
+    return v;
+}
+
+/// Transform feedback: a thread per vertex of each instance (as the
+/// vertex kernel), the shader's vertex code, and the outputs it captures,
+/// as the shader made them (clip space; no 1/w), into each buffer's
+/// record of vertex (instance * count + x), from the buffer's first word.
+pub fn captureKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
+    var k = kir.Kernel.init(s, "gl_capture", .{ VERTEX_GROUP, 1, 1 });
+    var b_out: [MAX_CAPTURE_BUFFERS]u8 = undefined;
+    for (&b_out) |*b| b.* = k.binding();
+    const b_uni = k.binding();
+    const b_idx = k.binding();
+    var b_attr: [MAX_ATTRS]u8 = undefined;
+    for (&b_attr) |*b| b.* = k.binding();
+    const sh = p.shaders;
+    const b_tex = k.bindings;
+    for (0..sh.textures) |_| _ = k.binding();
+    const count = k.param(.u32, V_COUNT);
+    const x = k.op3(.imad, .u32, r(k.gid(0)), u(VERTEX_GROUP), r(k.tid(0)));
+    const inst = k.gid(1);
+    k.ifp(r(k.cmp(.u32, .lt, r(x), r(count))));
+    {
+        const v = vertexOf(&k, b_idx, x);
+        var io = VertexIO{ .vertex_id = v, .instance_id = inst, .uniforms = b_uni, .textures = b_tex };
+        for (0..sh.attrs) |a| io.attr[a] = fetch(&k, b_attr[a], @intCast(V_ATTR + a * V_ATTR_WORDS), v, inst);
+        sh.vertex(sh.ctx, &k, &io);
+        const rec = k.op3(.imad, .u32, r(inst), r(count), r(x));
+        var at: [MAX_CAPTURE_BUFFERS]V = @splat(.none);
+        for (sh.capture_stride, 0..) |stride, b| {
+            if (stride == 0) continue;
+            at[b] = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(rec), u(stride), r(k.param(.u32, @intCast(C_BASE + b))))), u(2));
+        }
+        for (sh.capture) |cp| {
+            const val = if (cp.position) io.position[cp.src] else io.varying[cp.src];
+            const m = memAt(b_out[cp.buffer], @as(u32, cp.word) * 4);
+            // (an output the code never writes: 0)
+            if (val == .none) k.store(.u32, m, r(at[cp.buffer]), r(k.mov(.u32, u(0)))) else k.store(.f32, m, r(at[cp.buffer]), r(val));
         }
     }
     k.endif();
@@ -870,7 +955,8 @@ const R_S_HEIGHT = 57;
 const R_DS_SHARED = 58;
 const R_S_FRONT = 59;
 const R_S_BACK = 66;
-pub const RASTER_PARAMS = 73;
+const R_QUERY = 73; // an occlusion query on: a pixel written sets its word
+pub const RASTER_PARAMS = 74;
 
 /// bindings: 0 color (written), 1 depth (written when on), 2 triangle
 /// records, 3 uniforms, then the textures
@@ -891,6 +977,7 @@ fn rasterKernelWithStencil(s: kir.Storage, p: *const Pipeline, stencil_enabled: 
     const sh = p.shaders;
     const b_tex = k.bindings;
     for (0..sh.textures) |_| _ = k.binding();
+    const b_q = k.binding();
     const b_s = if (stencil_enabled) k.binding() else 0;
     const lx = k.tid(0);
     const ly = k.tid(1);
@@ -1188,6 +1275,10 @@ fn rasterKernelWithStencil(s: kir.Storage, p: *const Pipeline, stencil_enabled: 
         }
     }
     k.endif();
+    // an occlusion query: a sample passed here
+    k.ifp(r(k.op2(.pand, .pred, r(k.op2(.pand, .pred, r(inside), r(color_touched))), r(k.cmp(.u32, .ne, r(k.param(.u32, R_QUERY)), u(0))))));
+    k.store(.u32, kir.global(b_q, 32), r(k.mov(.u32, u(0))), r(k.mov(.u32, u(1))));
+    k.endif();
     if (stencil_enabled) {
         const depth_written = k.op2(.pand, .pred, r(color_touched), r(k.op2(.pand, .pred, r(d_on), r(k.cmp(.u32, .ne, r(k.param(.u32, R_DWRITE)), u(0))))));
         const stencil_written = k.op2(.pand, .pred, r(s_on), r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(touched), u(2))), u(0))));
@@ -1290,10 +1381,16 @@ fn fbits(x: f32) u32 {
     return @bitCast(x);
 }
 
-/// The vertex kernel's parameters.
+/// The vertex kernel's parameters (and the capture kernel's: then the
+/// buffers' first words, captureParams).
 pub fn vertexParams(d: *const Draw, out: []u32) []u32 {
-    const n = V_ATTR + MAX_ATTRS * V_ATTR_WORDS;
+    const n = VERTEX_PARAMS;
     @memset(out[0..n], 0);
+    if (d.restart and d.index != null) out[V_RESTART] = switch (d.index_size) {
+        1 => 0xff,
+        2 => 0xffff,
+        else => 0xffff_ffff,
+    };
     out[V_COUNT] = d.count;
     out[V_FIRST] = if (d.index == null) d.first else 0;
     out[V_INDEX_SIZE] = if (d.index != null) d.index_size else 0;
@@ -1322,6 +1419,14 @@ pub fn vertexParams(d: *const Draw, out: []u32) []u32 {
         w.* = .{ a.offset, a.stride, fmt, @intFromBool(a.divisor != 0), fbits(div), lastWord(a.buf.?), 0, 0 };
     }
     return out[0..n];
+}
+
+/// The capture kernel's parameters: the vertex kernel's, and each
+/// transform feedback buffer's first word.
+pub fn captureParams(d: *const Draw, bases: [MAX_CAPTURE_BUFFERS]u32, out: []u32) []u32 {
+    const p = vertexParams(d, out);
+    @memcpy(out[C_BASE..][0..MAX_CAPTURE_BUFFERS], &bases);
+    return p;
 }
 
 pub fn setupParams(d: *const Draw, out: []u32) []u32 {
@@ -1391,6 +1496,7 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
             @memcpy(out[start..][0..words.len], &words);
         }
     }
+    out[R_QUERY] = @intFromBool(d.query != null);
     if (d.blend) |b| {
         out[R_BLEND] = 1;
         out[R_EQ_RGB] = @backingInt(b.eq_rgb);

@@ -286,12 +286,12 @@ const Gen = struct {
 
     fn isMut(g: *Gen, a: Arg) bool {
         if (a != .reg or a.reg == .none) return false;
-        const x = @intFromEnum(a.reg);
+        const x = @backingInt(a.reg);
         return g.st.mut[x >> 3] & (@as(u8, 1) << @intCast(x & 7)) != 0;
     }
 
     fn markMut(g: *Gen, v: V) void {
-        const x = @intFromEnum(v);
+        const x = @backingInt(v);
         g.st.mut[x >> 3] |= @as(u8, 1) << @intCast(x & 7);
     }
 
@@ -299,7 +299,7 @@ const Gen = struct {
     /// change it); anything else as it is.
     fn snap(g: *Gen, a: Arg) Arg {
         if (!g.isMut(a)) return a;
-        return r(g.k.mov(g.k.tys[@intFromEnum(a.reg)], a));
+        return r(g.k.mov(g.k.tys[@backingInt(a.reg)], a));
     }
 
     fn snapVal(g: *Gen, v0: Val) Val {
@@ -658,7 +658,6 @@ const Gen = struct {
         return null;
     }
 
-
     // ── Arithmetic on operands (immediates folded where exact) ─────────────
 
     fn fop2(g: *Gen, op: kir.Op, a: Arg, b: Arg) Arg {
@@ -948,7 +947,7 @@ const Gen = struct {
     }
 
     fn binary(g: *Gen, nd: *Node, t: Type) Val {
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         switch (op) {
             .and_and, .or_or => {
                 const a = g.cond(nd.a);
@@ -1087,7 +1086,7 @@ const Gen = struct {
 
     fn unary(g: *Gen, nd: *Node, t: Type) Val {
         const a = g.rv(g.expr(nd.a));
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         if (op == .plus) return a;
         const n = g.size(t);
         const at = g.alloc(n);
@@ -1123,7 +1122,7 @@ const Gen = struct {
 
     fn assign(g: *Gen, nd: *Node) Val {
         const dst = g.expr(nd.a);
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         if (op == .assign) {
             const v = g.rv(g.expr(nd.b));
             g.store(dst, v);
@@ -2388,7 +2387,7 @@ fn kty(b: Base) Ty {
 }
 
 fn isSampler(b: Base) bool {
-    return @intFromEnum(b) >= @intFromEnum(Base.sampler2D) and @intFromEnum(b) <= @intFromEnum(Base.samplerExternalOES);
+    return @backingInt(b) >= @backingInt(Base.sampler2D) and @backingInt(b) <= @backingInt(Base.samplerExternalOES);
 }
 
 fn sameReg(a: Arg, b: Arg) bool {
@@ -2400,6 +2399,37 @@ fn sameReg(a: Arg, b: Arg) bool {
 /// An output variable (its index in vars): its varying's first scalar
 /// (vertex) or location (fragment).
 const Out = struct { var_ix: u32, word: u32, loc: u32 };
+
+/// A uniform: its words (loaded at the start when small), its samplers
+/// their texture slots; zeros where the program has none of it.
+fn uniformGlobal(g: *Gen, name: []const u8, t: Type) void {
+    const word = g.lay.uniform(g.lay.ctx, name) orelse {
+        const z = g.zeros(t);
+        // (an unused sampler: no slot)
+        for (0..g.size(t)) |ix| {
+            if (isSampler(g.baseAt(t, @intCast(ix)))) g.put(z.at, @intCast(ix), u(NO_SLOT));
+        }
+        g.declare(.{ .name = name, .ty = t, .at = z.at, .ro = true });
+        return;
+    };
+    if (g.hasSampler(t)) {
+        // samplers are their texture slots; the rest is loaded
+        const n = g.size(t);
+        const at = g.alloc(n);
+        for (0..n) |ix| {
+            const i_: u32 = @intCast(ix);
+            const b = g.baseAt(t, i_);
+            g.put(at, i_, if (isSampler(b)) u(g.lay.sampler(g.lay.ctx, word + i_) orelse NO_SLOT) else g.loadUni(b, word + i_, no));
+        }
+        g.declare(.{ .name = name, .ty = t, .at = at, .ro = true });
+        return;
+    }
+    const mem = Val{ .ty = t, .mem = true, .word = word };
+    if (g.size(t) <= PRELOAD_WORDS and !g.hasArray(t)) {
+        const loaded = g.rv(mem);
+        g.declare(.{ .name = name, .ty = t, .at = loaded.at, .ro = true });
+    } else g.declare(.{ .name = name, .ty = t, .mem = true, .word = word, .ro = true });
+}
 
 /// The globals in order (inputs, outputs, uniforms, plain ones), the
 /// functions noted; main's node, or 0.
@@ -2419,6 +2449,18 @@ fn globals(g: *Gen, vio: ?*raster.VertexIO, fio: ?*raster.FragmentIO, outs: *[64
             }
             continue;
         }
+        if (dn.kind == .block_decl) {
+            // a uniform block: its instance a struct uniform, or (anonymous)
+            // each member a uniform of its own (the program's words: its
+            // draws copy the block's buffer into them)
+            const st = Type.of(dn.ty);
+            if (st.base != .structure) continue;
+            if (dn.b != 0) {
+                const vn = g.node(dn.b);
+                uniformGlobal(g, g.text(vn.tok), st);
+            } else for (s.checker.structFields(st)) |fd| uniformGlobal(g, fd.name, fd.ty);
+            continue;
+        }
         if (dn.kind != .decl) continue;
         var v = dn.b;
         while (v != 0) : (v = g.node(v).next) {
@@ -2427,32 +2469,7 @@ fn globals(g: *Gen, vio: ?*raster.VertexIO, fio: ?*raster.FragmentIO, outs: *[64
             const name = g.text(vn.tok);
             const q = vn.flags;
             if (q & Q.uniform != 0) {
-                const word = g.lay.uniform(g.lay.ctx, name) orelse {
-                    const z = g.zeros(t);
-                    // (an unused sampler: no slot)
-                    for (0..g.size(t)) |ix| {
-                        if (isSampler(g.baseAt(t, @intCast(ix)))) g.put(z.at, @intCast(ix), u(NO_SLOT));
-                    }
-                    g.declare(.{ .name = name, .ty = t, .at = z.at, .ro = true });
-                    continue;
-                };
-                if (g.hasSampler(t)) {
-                    // samplers are their texture slots; the rest is loaded
-                    const n = g.size(t);
-                    const at = g.alloc(n);
-                    for (0..n) |ix| {
-                        const i_: u32 = @intCast(ix);
-                        const b = g.baseAt(t, i_);
-                        g.put(at, i_, if (isSampler(b)) u(g.lay.sampler(g.lay.ctx, word + i_) orelse NO_SLOT) else g.loadUni(b, word + i_, no));
-                    }
-                    g.declare(.{ .name = name, .ty = t, .at = at, .ro = true });
-                    continue;
-                }
-                const mem = Val{ .ty = t, .mem = true, .word = word };
-                if (g.size(t) <= PRELOAD_WORDS and !g.hasArray(t)) {
-                    const loaded = g.rv(mem);
-                    g.declare(.{ .name = name, .ty = t, .at = loaded.at, .ro = true });
-                } else g.declare(.{ .name = name, .ty = t, .mem = true, .word = word, .ro = true });
+                uniformGlobal(g, name, t);
                 continue;
             }
             const is_in = q & Q.in != 0 or (q & Q.varying != 0 and g.stage == .fragment);
@@ -2515,7 +2532,7 @@ fn begin(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, log: *pp.Log, stage: sem
 
 /// A component as an f32 register (a register's bits, or an immediate's).
 fn asF32(g: *Gen, a: Arg) V {
-    if (a == .reg and a.reg != .none and g.k.tys[@intFromEnum(a.reg)] == .f32) return a.reg;
+    if (a == .reg and a.reg != .none and g.k.tys[@backingInt(a.reg)] == .f32) return a.reg;
     return g.k.mov(.f32, a);
 }
 
@@ -2681,7 +2698,7 @@ fn flattenDerivs(k: *kir.Kernel, lo: usize, st: *Store, derivs: []const u32) voi
     }
     const isDiv = struct {
         fn f_(set: []const u8, a: Arg) bool {
-            return a == .reg and a.reg != .none and bitOf(set, @intFromEnum(a.reg));
+            return a == .reg and a.reg != .none and bitOf(set, @backingInt(a.reg));
         }
     }.f_;
     var changed = true;
@@ -2738,7 +2755,7 @@ fn flattenDerivs(k: *kir.Kernel, lo: usize, st: *Store, derivs: []const u32) voi
                     if (!d) continue;
                     const nregs: usize = if (in.op == .ld) kir.memRegs(@bitCast(in.aux)) else 1;
                     for (0..nregs) |j| {
-                        const v = @as(usize, @intFromEnum(in.dst)) + j;
+                        const v = @as(usize, @backingInt(in.dst)) + j;
                         if (v >= FLOW_BITS or bitOf(&st.div, v)) continue;
                         setBit(&st.div, v);
                         changed = true;

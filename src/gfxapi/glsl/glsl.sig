@@ -2,7 +2,8 @@
 //! (1.00 or 3.00 es) preprocessed, parsed and checked, its log in Mesa's
 //! form, and its interface (inputs, outputs, uniforms: struct uniforms
 //! flattened to GL's names, each with its type, location and whether the
-//! shader uses it) copied out where a link can keep it.
+//! shader uses it; uniform blocks, their members laid out std140) copied
+//! out where a link can keep it.
 //!
 //! One Scratch holds a compile (its tokens, nodes, symbols); the caller
 //! keeps it and runs one compile in it at a time. A shader keeps only its
@@ -82,7 +83,10 @@ pub const Scratch = struct {
         out.* = .{ .stage = s.stage, .version = s.pre.version, .has_main = c.has_main, .frag_color = c.uses_frag_color, .frag_data = c.uses_frag_data };
         for (c.inputs[0..c.ninputs]) |v| out.add(v, .input, c.syms[v.sym].used, c);
         for (c.outputs[0..c.noutputs]) |v| out.add(v, .output, c.syms[v.sym].used, c);
-        for (c.uniforms[0..c.nuniforms]) |v| out.add(v, .uniform, c.syms[v.sym].used, c);
+        for (c.uniforms[0..c.nuniforms]) |v| {
+            if (v.block == 0) out.add(v, .uniform, c.syms[v.sym].used, c);
+        }
+        for (c.blocks[0..c.nblocks]) |b| out.addBlock(b, c);
         return !out.overflow;
     }
 };
@@ -103,6 +107,25 @@ pub const IVar = struct {
     used: bool,
     name_at: u16,
     name_len: u16,
+    /// a uniform block's member: the block's index + 1 (0: none), and its
+    /// std140 place: its (first element's) byte offset in the block, an
+    /// array's stride, a matrix's column (row-major: row) stride
+    block: u8 = 0,
+    offset: u32 = 0,
+    array_stride: u32 = 0,
+    matrix_stride: u32 = 0,
+    row_major: bool = false,
+};
+
+/// A uniform block of a compiled shader: its name, its instance's name's
+/// length (0: anonymous; its members' names start with the instance's),
+/// its std140 size, whether the shader uses it (all its members active).
+pub const IBlock = struct {
+    name_at: u16,
+    name_len: u16,
+    inst_len: u16 = 0,
+    size: u32 = 0,
+    used: bool = false,
 };
 
 pub const Iface = struct {
@@ -114,6 +137,8 @@ pub const Iface = struct {
     frag_data: bool = false,
     vars: [MAX_IVARS]IVar = undefined,
     n: usize = 0,
+    blocks: [sema.MAX_BLOCKS]IBlock = undefined,
+    nblocks: usize = 0,
     names: [IFACE_NAMES]u8 = undefined,
     nnames: usize = 0,
     overflow: bool = false,
@@ -148,6 +173,89 @@ pub const Iface = struct {
         f.leaf(v.name, &.{}, v.ty, v.q, v.loc, kind, used, c, 0);
     }
 
+    pub fn blockName(f: *const Iface, b: IBlock) []const u8 {
+        return f.names[b.name_at..][0..b.name_len];
+    }
+
+    /// A uniform block: its members' leaves (named as the code names them:
+    /// "inst.m", or an anonymous block's "m"), each with its std140 place.
+    fn addBlock(f: *Iface, b: sema.Block, c: *const sema.Checker) void {
+        if (f.nblocks == f.blocks.len) {
+            f.overflow = true;
+            return;
+        }
+        const nm = f.put(&.{b.name}) orelse return;
+        var used = false;
+        for (c.uniforms[b.first..][0..b.n]) |v| used = used or c.syms[v.sym].used;
+        const bi = f.nblocks;
+        f.nblocks += 1;
+        const fields = c.structFields(.{ .base = .structure, .strukt = b.strukt });
+        var cur: u32 = 0;
+        for (fields) |fd| {
+            const rm = switch (fd.layout) {
+                .block => b.row_major,
+                .row_major => true,
+                .column_major => false,
+            };
+            cur = std.mem.alignForward(u32, cur, std140Align(fd.ty));
+            if (b.instance.len > 0)
+                f.blockLeaf(b.instance, &.{ ".", fd.name }, fd.ty, rm, cur, bi, used, c, 0)
+            else
+                f.blockLeaf(fd.name, &.{}, fd.ty, rm, cur, bi, used, c, 0);
+            cur += std140Size(fd.ty, rm, c);
+        }
+        f.blocks[bi] = .{ .name_at = nm.at, .name_len = nm.len, .inst_len = @intCast(b.instance.len), .size = std.mem.alignForward(u32, cur, 16), .used = used };
+    }
+
+    /// A block member at byte `at`: a leaf, or a struct's members (each
+    /// element of an array of structs), std140.
+    fn blockLeaf(f: *Iface, base: []const u8, parts: []const []const u8, t: Type, rm: bool, at: u32, bi: usize, used: bool, c: *const sema.Checker, depth: u32) void {
+        if (depth > 8) return;
+        var all: [20][]const u8 = undefined;
+        const np = @min(parts.len, all.len - 4);
+        all[0] = base;
+        @memcpy(all[1..][0..np], parts[0..np]);
+        if (t.base != .structure) {
+            const nm = f.put(all[0 .. 1 + np]) orelse return;
+            const e = t.elem();
+            f.push(.{
+                .kind = .uniform,
+                .ty = t,
+                .q = Q.uniform,
+                .loc = -1,
+                .used = used,
+                .name_at = nm.at,
+                .name_len = nm.len,
+                .block = @intCast(bi + 1),
+                .offset = at,
+                .array_stride = if (t.array != 0) std140Size(t, rm, c) / t.array else 0,
+                .matrix_stride = if (e.matrix()) 16 else 0,
+                .row_major = rm and e.matrix(),
+            });
+            return;
+        }
+        const n_el: u32 = if (t.array != 0) t.array else 1;
+        const esize = std140Size(t.elem(), rm, c);
+        for (0..n_el) |e| {
+            var idx: [12]u8 = undefined;
+            const istr = if (t.array != 0) (std.fmt.bufPrint(&idx, "[{d}]", .{e}) catch return) else "";
+            var cur: u32 = 0;
+            for (c.structFields(t)) |fd| {
+                const frm = switch (fd.layout) {
+                    .block => rm,
+                    .row_major => true,
+                    .column_major => false,
+                };
+                cur = std.mem.alignForward(u32, cur, std140Align(fd.ty));
+                all[1 + np] = istr;
+                all[2 + np] = ".";
+                all[3 + np] = fd.name;
+                f.blockLeaf(base, all[1 .. 4 + np], fd.ty, frm, at + @as(u32, @intCast(e)) * esize + cur, bi, used, c, depth + 1);
+                cur += std140Size(fd.ty, frm, c);
+            }
+        }
+    }
+
     /// `prefix ++ parts` named variable(s) of type `t`: a leaf, or a
     /// struct's members (each element of an array of structs).
     fn leaf(f: *Iface, base: []const u8, parts: []const []const u8, t: Type, q: u16, loc: i32, kind: IKind, used: bool, c: *const sema.Checker, depth: u32) void {
@@ -174,6 +282,46 @@ pub const Iface = struct {
         }
     }
 };
+
+// ── std140 (GL ES 3.0's 2.12.6.4) ──────────────────────────────────────────
+
+/// A type's base alignment: a scalar's 4, a vec2's 8, a vec3's and a
+/// vec4's 16; an array's, a matrix's and a struct's a vec4's (16).
+pub fn std140Align(t: Type) u32 {
+    if (t.array != 0 or t.base == .structure or t.matrix()) return 16;
+    return switch (t.rows) {
+        1 => 4,
+        2 => 8,
+        else => 16,
+    };
+}
+
+/// A type's size: a scalar or vector's components; a matrix's columns
+/// (row-major: rows) of a vec4 each; an array's elements, each rounded up
+/// to a vec4; a struct's members, their alignments kept, rounded up to a
+/// vec4.
+pub fn std140Size(t: Type, row_major: bool, c: *const sema.Checker) u32 {
+    const e = t.elem();
+    const one: u32 = if (e.base == .structure) blk: {
+        var cur: u32 = 0;
+        for (c.structFields(e)) |fd| {
+            const rm = switch (fd.layout) {
+                .block => row_major,
+                .row_major => true,
+                .column_major => false,
+            };
+            cur = std.mem.alignForward(u32, cur, std140Align(fd.ty));
+            cur += std140Size(fd.ty, rm, c);
+        }
+        break :blk std.mem.alignForward(u32, cur, 16);
+    } else if (e.matrix())
+        @as(u32, if (row_major) e.rows else e.cols) * 16
+    else if (t.array != 0)
+        16
+    else
+        @as(u32, e.rows) * 4;
+    return if (t.array != 0) one * t.array else one;
+}
 
 // ── GL's names of types ────────────────────────────────────────────────────
 

@@ -50,6 +50,8 @@ pub const MAX_FRAMEBUFFERS = 512;
 pub const MAX_SIZE = 8192;
 pub const MAX_UNITS = 32;
 pub const MAX_COLOR = 4;
+/// uniform blocks a shader may have (MAX_VERTEX_UNIFORM_BLOCKS, MAX_FRAGMENT_UNIFORM_BLOCKS)
+const glsl_max_blocks = program.glsl.sema.MAX_BLOCKS;
 pub const MAX_VAOS = 256;
 pub const MAX_SAMPLERS = 256;
 pub const MAX_ATTRS = raster.MAX_ATTRS;
@@ -339,6 +341,35 @@ const BufBinds = struct {
     xfb: u32 = 0,
 };
 
+/// GL ES 3.0's transform feedback limits: separate buffers (and
+/// attributes), components a vertex writes interleaved, objects
+pub const MAX_FEEDBACK_BUFFERS = 4;
+pub const MAX_FEEDBACK_COMPONENTS = 64;
+pub const MAX_FEEDBACKS = 32;
+
+/// A transform feedback object: its buffers' binding points, and while
+/// active, the primitive mode and program begun with and the vertices
+/// captured so far (each buffer's next vertex).
+pub const Feedback = struct {
+    named: bool = false,
+    made: bool = false,
+    bufs: [MAX_FEEDBACK_BUFFERS]Indexed = @splat(.{}),
+    active: bool = false,
+    paused: bool = false,
+    mode: u32 = 0,
+    program: u32 = 0,
+    vertices: u64 = 0,
+};
+
+/// An indexed binding point (glBindBufferBase, glBindBufferRange): a
+/// buffer, and the range of it (the whole, from offset, when not ranged).
+pub const Indexed = struct {
+    buf: u32 = 0,
+    offset: usize = 0,
+    size: usize = 0,
+    ranged: bool = false,
+};
+
 fn capBit(cap: u32) ?u5 {
     return switch (cap) {
         g.CULL_FACE => 0,
@@ -579,12 +610,18 @@ fn wrapOf(w: u32) texture.Wrap {
 
 pub const TIME_ELAPSED_EXT = 0x88BF;
 pub const TIMESTAMP_EXT = 0x8E28;
+/// A query object (glGenQueries, glGenQueriesEXT: one name space): a
+/// timer's, an occlusion query's (its word, set where a sample passes,
+/// and the engine's mark after its draws), transform feedback's
+/// primitives (counted as they are captured).
 const TimerQuery = struct {
     label: debug_output.Label = .{},
     named: bool = false,
     target: u32 = 0,
     value: u64 = 0,
     ready: bool = false,
+    word: Image = .{},
+    mark: u64 = 0,
 };
 
 const StencilState = struct {
@@ -659,6 +696,9 @@ pub const Context = struct {
     timers: [128]TimerQuery = @splat(.{}),
     elapsed: u32 = 0,
     elapsed_begin: u64 = 0,
+    /// the occlusion query and the primitives query active (0: none)
+    occlusion: u32 = 0,
+    primitives: u32 = 0,
     timer_disjoint: bool = false,
     /// EGL's reset notification strategy is LOSE_CONTEXT_ON_RESET (else
     /// NO_RESET_NOTIFICATION, which says nothing of a reset)
@@ -696,6 +736,13 @@ pub const Context = struct {
     default_tex: Tex = .{ .named = true, .made = true, .target = g.TEXTURE_2D },
     default_ext: Tex = .{ .named = true, .made = true, .target = g.TEXTURE_EXTERNAL_OES, .params = .{ .min = g.LINEAR, .wrap_s = g.CLAMP_TO_EDGE, .wrap_t = g.CLAMP_TO_EDGE, .wrap_r = g.CLAMP_TO_EDGE } },
     bufs: BufBinds = .{},
+    /// the uniform buffer binding points a program's blocks read
+    ubo: [program.MAX_UNIFORM_BUFFER_BINDINGS]Indexed = @splat(.{}),
+    /// transform feedback objects (a context's own, not shared), the
+    /// default one (0), the one bound
+    feedbacks: [MAX_FEEDBACKS]Feedback = @splat(.{}),
+    feedback0: Feedback = .{ .named = true, .made = true },
+    xfb: u32 = 0,
     pack: Store = .{},
     unpack: Store = .{},
     hint_mipmap: u32 = g.DONT_CARE,
@@ -793,8 +840,239 @@ pub const Context = struct {
 
     pub fn deleteTimerQueries(c: *Context, names: []const u32) void {
         for (names) |name| {
-            if (c.timerOf(name)) |q| q.* = .{};
+            if (c.timerOf(name)) |q| {
+                if (c.occlusion == name) c.occlusion = 0;
+                if (c.primitives == name) c.primitives = 0;
+                if (c.elapsed == name) c.elapsed = 0;
+                c.eng.freeImage(&q.word);
+                q.* = .{};
+            }
         }
+    }
+
+    /// glBeginQuery: a timer, an occlusion query (ANY_SAMPLES_PASSED, and
+    /// its CONSERVATIVE form: exact here), transform feedback's primitives.
+    pub fn beginQuery(c: *Context, target: u32, name: u32) void {
+        switch (target) {
+            TIME_ELAPSED_EXT => return c.beginTimer(target, name),
+            g.ANY_SAMPLES_PASSED, g.ANY_SAMPLES_PASSED_CONSERVATIVE, g.TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN => {},
+            else => return c.fail(g.INVALID_ENUM),
+        }
+        const q = c.timerOf(name) orelse return c.fail(g.INVALID_OPERATION);
+        const occ = target != g.TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN;
+        const busy_name = if (occ) c.occlusion else c.primitives;
+        if (busy_name != 0 or (q.target != 0 and q.target != target) or c.elapsed == name or c.occlusion == name or c.primitives == name) return c.fail(g.INVALID_OPERATION);
+        q.target = target;
+        q.ready = false;
+        q.value = 0;
+        if (occ) {
+            // (a word of its own, zeroed: the draws set it)
+            c.eng.freeImage(&q.word);
+            q.word = c.eng.newBuffer(16) orelse return c.fail(g.OUT_OF_MEMORY);
+            c.occlusion = name;
+        } else c.primitives = name;
+    }
+
+    pub fn endQuery(c: *Context, target: u32) void {
+        switch (target) {
+            TIME_ELAPSED_EXT => return c.endTimer(target),
+            g.ANY_SAMPLES_PASSED, g.ANY_SAMPLES_PASSED_CONSERVATIVE => {
+                const q = c.timerOf(c.occlusion) orelse return c.fail(g.INVALID_OPERATION);
+                if (q.target != target) return c.fail(g.INVALID_OPERATION);
+                c.occlusion = 0;
+                q.mark = c.eng.mark();
+            },
+            g.TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN => {
+                const q = c.timerOf(c.primitives) orelse return c.fail(g.INVALID_OPERATION);
+                c.primitives = 0;
+                q.ready = true;
+            },
+            else => c.fail(g.INVALID_ENUM),
+        }
+    }
+
+    /// glGetQueryiv: CURRENT_QUERY (and a timer's counter bits).
+    pub fn queryState(c: *Context, target: u32, pname: u32) ?i32 {
+        if (target == TIME_ELAPSED_EXT or target == TIMESTAMP_EXT) return c.timerState(target, pname);
+        if (pname != g.CURRENT_QUERY) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        return switch (target) {
+            g.ANY_SAMPLES_PASSED, g.ANY_SAMPLES_PASSED_CONSERVATIVE => blk: {
+                const q = c.timerOf(c.occlusion) orelse break :blk 0;
+                break :blk if (q.target == target) @intCast(c.occlusion) else 0;
+            },
+            g.TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN => @intCast(c.primitives),
+            else => blk: {
+                c.fail(g.INVALID_ENUM);
+                break :blk null;
+            },
+        };
+    }
+
+    /// glGetQueryObject*: QUERY_RESULT_AVAILABLE, QUERY_RESULT (waited for).
+    pub fn queryResult(c: *Context, name: u32, pname: u32) ?u64 {
+        const q = c.timerOf(name) orelse {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        };
+        switch (q.target) {
+            g.ANY_SAMPLES_PASSED, g.ANY_SAMPLES_PASSED_CONSERVATIVE => {},
+            g.TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN => {
+                if (c.primitives == name) {
+                    c.fail(g.INVALID_OPERATION);
+                    return null;
+                }
+                return switch (pname) {
+                    g.QUERY_RESULT_AVAILABLE => 1,
+                    g.QUERY_RESULT => q.value,
+                    else => blk: {
+                        c.fail(g.INVALID_ENUM);
+                        break :blk null;
+                    },
+                };
+            },
+            else => return c.timerResult(name, pname),
+        }
+        if (c.occlusion == name) {
+            c.fail(g.INVALID_OPERATION);
+            return null;
+        }
+        if (!q.ready) {
+            if (pname == g.QUERY_RESULT_AVAILABLE and !c.eng.markDone(q.mark)) return 0;
+            var w: [4]u8 = .{ 0, 0, 0, 0 };
+            if (q.word.buf.cpu.len >= 4) c.eng.readBytes(&q.word, 0, &w);
+            q.value = @intFromBool(std.mem.readInt(u32, &w, .little) != 0);
+            q.ready = true;
+            c.eng.freeImage(&q.word);
+        }
+        return switch (pname) {
+            g.QUERY_RESULT_AVAILABLE => 1,
+            g.QUERY_RESULT => q.value,
+            else => blk: {
+                c.fail(g.INVALID_ENUM);
+                break :blk null;
+            },
+        };
+    }
+
+    // ── Transform feedback objects ─────────────────────────────────────────
+
+    pub fn genTransformFeedbacks(c: *Context, out: []u32) void {
+        if (!genIn(Feedback, &c.feedbacks, out)) c.fail(g.OUT_OF_MEMORY);
+    }
+
+    pub fn deleteTransformFeedbacks(c: *Context, names: []const u32) void {
+        for (names) |name| {
+            const t = slotIn(Feedback, &c.feedbacks, name) orelse continue;
+            if (t.active) {
+                c.fail(g.INVALID_OPERATION);
+                continue;
+            }
+            if (c.xfb == name) c.xfb = 0;
+            t.* = .{};
+        }
+    }
+
+    pub fn isTransformFeedback(c: *Context, name: u32) bool {
+        return madeIn(Feedback, &c.feedbacks, name) != null;
+    }
+
+    pub fn bindTransformFeedback(c: *Context, target: u32, name: u32) void {
+        if (target != g.TRANSFORM_FEEDBACK) return c.fail(g.INVALID_ENUM);
+        if (c.feedbackOf()) |t| {
+            if (t.active and !t.paused) return c.fail(g.INVALID_OPERATION);
+        }
+        if (name != 0) {
+            const t = slotIn(Feedback, &c.feedbacks, name) orelse return c.fail(g.INVALID_OPERATION);
+            if (!t.named) return c.fail(g.INVALID_OPERATION);
+            t.made = true;
+        }
+        c.xfb = name;
+    }
+
+    pub fn beginTransformFeedback(c: *Context, mode: u32) void {
+        if (mode != g.POINTS and mode != g.LINES and mode != g.TRIANGLES) return c.fail(g.INVALID_ENUM);
+        const t = c.feedbackOf() orelse return;
+        if (t.active or c.program == 0) return c.fail(g.INVALID_OPERATION);
+        const ds = program.drawState(c) orelse return c.fail(g.INVALID_OPERATION);
+        var any = false;
+        for (ds.xfb_stride, 0..) |stride, i| {
+            if (stride == 0) continue;
+            any = true;
+            if (t.bufs[i].buf == 0) return c.fail(g.INVALID_OPERATION);
+        }
+        if (!any) return c.fail(g.INVALID_OPERATION);
+        t.active = true;
+        t.paused = false;
+        t.mode = mode;
+        t.program = c.program;
+        t.vertices = 0;
+    }
+
+    pub fn endTransformFeedback(c: *Context) void {
+        const t = c.feedbackOf() orelse return;
+        if (!t.active) return c.fail(g.INVALID_OPERATION);
+        t.active = false;
+        t.paused = false;
+    }
+
+    pub fn pauseTransformFeedback(c: *Context) void {
+        const t = c.feedbackOf() orelse return;
+        if (!t.active or t.paused) return c.fail(g.INVALID_OPERATION);
+        t.paused = true;
+    }
+
+    pub fn resumeTransformFeedback(c: *Context) void {
+        const t = c.feedbackOf() orelse return;
+        if (!t.active or !t.paused or c.program != t.program) return c.fail(g.INVALID_OPERATION);
+        t.paused = false;
+    }
+
+    /// A draw's capture: its whole primitives' vertices (each instance's)
+    /// through the vertex code into the buffers, after those captured
+    /// since the begin; INVALID_OPERATION when a buffer has no room.
+    fn feedbackCapture(c: *Context, t: *Feedback, d: *const raster.Draw, mode: u32) bool {
+        const ds = program.drawState(c) orelse {
+            c.fail(g.INVALID_OPERATION);
+            return false;
+        };
+        const per: u32 = switch (mode) {
+            g.POINTS => 1,
+            g.LINES => 2,
+            else => 3,
+        };
+        const prims = d.count / per;
+        if (prims == 0) return true;
+        const n: u64 = @as(u64, prims) * per * d.instances;
+        var outs: [raster.MAX_CAPTURE_BUFFERS]?*Image = @splat(null);
+        var bases: [raster.MAX_CAPTURE_BUFFERS]u32 = @splat(0);
+        for (ds.xfb_stride, 0..) |stride, i| {
+            if (stride == 0) continue;
+            const s = t.bufs[i];
+            const b = madeIn(Buf, &c.objs.bufs, s.buf) orelse {
+                c.fail(g.INVALID_OPERATION);
+                return false;
+            };
+            const room: u64 = if (s.offset >= b.size) 0 else if (s.ranged) @min(s.size, b.size - s.offset) else b.size - s.offset;
+            if ((t.vertices + n) * stride * 4 > room or b.store.buf.cpu.len < b.size) {
+                c.fail(g.INVALID_OPERATION);
+                return false;
+            }
+            if (!c.notMapped(b)) return false;
+            outs[i] = &b.store;
+            bases[i] = @intCast(s.offset / 4 + t.vertices * stride);
+        }
+        var cd = d.*;
+        cd.count = prims * per;
+        if (!c.eng.capture(&cd, outs, bases)) {
+            c.fail(g.OUT_OF_MEMORY);
+            return false;
+        }
+        t.vertices += n;
+        if (c.timerOf(c.primitives)) |q| q.value += @as(u64, prims) * d.instances;
+        return true;
     }
 
     pub fn beginTimer(c: *Context, target: u32, name: u32) void {
@@ -1213,6 +1491,24 @@ pub const Context = struct {
             g.MAX_TEXTURE_SIZE, g.MAX_CUBE_MAP_TEXTURE_SIZE, g.MAX_RENDERBUFFER_SIZE => int(MAX_SIZE),
             g.MAX_VIEWPORT_DIMS => ints(&.{ MAX_SIZE, MAX_SIZE }),
             g.MAX_COLOR_ATTACHMENTS, g.MAX_DRAW_BUFFERS => int(MAX_COLOR),
+            // (GL ES 3.0's: WebGL 2 asks them at a context's start)
+            g.MAX_3D_TEXTURE_SIZE, g.MAX_ARRAY_TEXTURE_LAYERS => int(2048),
+            g.MAX_ELEMENT_INDEX => int(std.math.maxInt(u32)),
+            g.MAX_TEXTURE_LOD_BIAS => .{ .kind = .float, .f = .{ 16, 0, 0, 0 } },
+            g.MAX_UNIFORM_BUFFER_BINDINGS => int(program.MAX_UNIFORM_BUFFER_BINDINGS),
+            g.MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS => int(program.MAX_XFB_COMPONENTS),
+            g.MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS => int(MAX_FEEDBACK_BUFFERS),
+            g.MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS => int(program.MAX_XFB_SEPARATE_COMPONENTS),
+            g.TRANSFORM_FEEDBACK_BINDING => int(c.xfb),
+            g.TRANSFORM_FEEDBACK_BUFFER_BINDING => int(c.bufs.xfb),
+            g.TRANSFORM_FEEDBACK_ACTIVE => boolean(if (c.feedbackOf()) |t| t.active else false),
+            g.TRANSFORM_FEEDBACK_PAUSED => boolean(if (c.feedbackOf()) |t| t.paused else false),
+            g.MAX_VERTEX_UNIFORM_BLOCKS, g.MAX_FRAGMENT_UNIFORM_BLOCKS => int(glsl_max_blocks),
+            g.MAX_COMBINED_UNIFORM_BLOCKS => int(program.MAX_BLOCKS),
+            g.MAX_UNIFORM_BLOCK_SIZE => int(program.MAX_UNIFORM_BLOCK_SIZE),
+            g.UNIFORM_BUFFER_OFFSET_ALIGNMENT => int(program.UNIFORM_BUFFER_OFFSET_ALIGNMENT),
+            g.MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS => int(program.MAX_VERTEX_UNIFORM_VECTORS * 4 + glsl_max_blocks * program.MAX_UNIFORM_BLOCK_SIZE / 4),
+            g.MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS => int(program.MAX_FRAGMENT_UNIFORM_VECTORS * 4 + glsl_max_blocks * program.MAX_UNIFORM_BLOCK_SIZE / 4),
             g.MAX_TEXTURE_IMAGE_UNITS => int(16),
             g.MAX_COMBINED_TEXTURE_IMAGE_UNITS => int(MAX_UNITS),
             g.MAX_SAMPLES => int(1),
@@ -2931,6 +3227,94 @@ pub const Context = struct {
         };
     }
 
+    /// glBindBufferBase and glBindBufferRange (range: size > 0): an
+    /// indexed binding point, and the target's own one too, as GL says.
+    pub fn bindBufferRange(c: *Context, target: u32, index: u32, name: u32, offset: isize, size: isize, ranged: bool) void {
+        const slot: *Indexed = switch (target) {
+            g.UNIFORM_BUFFER => blk: {
+                if (index >= program.MAX_UNIFORM_BUFFER_BINDINGS) return c.fail(g.INVALID_VALUE);
+                if (ranged and @mod(offset, program.UNIFORM_BUFFER_OFFSET_ALIGNMENT) != 0) return c.fail(g.INVALID_VALUE);
+                break :blk &c.ubo[index];
+            },
+            g.TRANSFORM_FEEDBACK_BUFFER => blk: {
+                const t = c.feedbackOf() orelse return;
+                if (index >= MAX_FEEDBACK_BUFFERS) return c.fail(g.INVALID_VALUE);
+                if (t.active) return c.fail(g.INVALID_OPERATION);
+                if (ranged and (@mod(offset, 4) != 0 or @mod(size, 4) != 0)) return c.fail(g.INVALID_VALUE);
+                break :blk &t.bufs[index];
+            },
+            else => return c.fail(g.INVALID_ENUM),
+        };
+        if (ranged and name != 0 and (offset < 0 or size <= 0)) return c.fail(g.INVALID_VALUE);
+        if (name != 0 and makeIn(Buf, &c.objs.bufs, name) == null) return c.fail(g.OUT_OF_MEMORY);
+        slot.* = if (name == 0) .{} else .{ .buf = name, .offset = if (ranged) @intCast(offset) else 0, .size = if (ranged) @intCast(size) else 0, .ranged = ranged };
+        (c.bindingOf(target) orelse unreachable).* = name;
+    }
+
+    /// The transform feedback object bound.
+    pub fn feedbackOf(c: *Context) ?*Feedback {
+        if (c.xfb == 0) return &c.feedback0;
+        return madeIn(Feedback, &c.feedbacks, c.xfb);
+    }
+
+    /// glGetIntegeri_v and glGetInteger64i_v: an indexed binding point's
+    /// buffer, start and size.
+    pub fn getIndexed(c: *Context, pname: u32, index: u32) ?i64 {
+        const uniform = pname == g.UNIFORM_BUFFER_BINDING or pname == g.UNIFORM_BUFFER_START or pname == g.UNIFORM_BUFFER_SIZE;
+        const xfb = pname == g.TRANSFORM_FEEDBACK_BUFFER_BINDING or pname == g.TRANSFORM_FEEDBACK_BUFFER_START or pname == g.TRANSFORM_FEEDBACK_BUFFER_SIZE;
+        if (!uniform and !xfb) {
+            c.fail(g.INVALID_ENUM);
+            return null;
+        }
+        const s: Indexed = if (uniform) blk: {
+            if (index >= program.MAX_UNIFORM_BUFFER_BINDINGS) {
+                c.fail(g.INVALID_VALUE);
+                return null;
+            }
+            break :blk c.ubo[index];
+        } else blk: {
+            if (index >= MAX_FEEDBACK_BUFFERS) {
+                c.fail(g.INVALID_VALUE);
+                return null;
+            }
+            const t = c.feedbackOf() orelse return null;
+            break :blk t.bufs[index];
+        };
+        return switch (pname) {
+            g.UNIFORM_BUFFER_BINDING, g.TRANSFORM_FEEDBACK_BUFFER_BINDING => s.buf,
+            g.UNIFORM_BUFFER_START, g.TRANSFORM_FEEDBACK_BUFFER_START => @intCast(s.offset),
+            else => @intCast(s.size),
+        };
+    }
+
+    /// The bytes a uniform block bound at `binding` reads (at most
+    /// `want`): its buffer's range, as the CPU sees it now; none when no
+    /// buffer is bound there.
+    pub fn uniformBytes(c: *Context, binding: u32, want: u32) []const u8 {
+        if (binding >= program.MAX_UNIFORM_BUFFER_BINDINGS) return &.{};
+        const s = c.ubo[binding];
+        const b = madeIn(Buf, &c.objs.bufs, s.buf) orelse return &.{};
+        if (s.offset >= b.size) return &.{};
+        var len = b.size - s.offset;
+        if (s.ranged) len = @min(len, s.size);
+        len = @min(len, want);
+        if (len == 0 or b.store.buf.cpu.len < s.offset + len) return &.{};
+        return c.eng.hostView(&b.store, s.offset, len);
+    }
+
+    /// glGetInternalformativ: no multisampled renderbuffers (MAX_SAMPLES
+    /// is 1), so every renderable format has no sample counts.
+    pub fn internalformat(c: *Context, target: u32, pname: u32, out: []i32) void {
+        if (target != g.RENDERBUFFER) return c.fail(g.INVALID_ENUM);
+        switch (pname) {
+            g.NUM_SAMPLE_COUNTS => {
+                if (out.len > 0) out[0] = 0;
+            },
+            g.SAMPLES => {},
+            else => c.fail(g.INVALID_ENUM),
+        }
+    }
+
     pub fn bindBuffer(c: *Context, target: u32, name: u32) void {
         const b = c.bindingOf(target) orelse return c.fail(g.INVALID_ENUM);
         if (name != 0 and makeIn(Buf, &c.objs.bufs, name) == null) return c.fail(g.OUT_OF_MEMORY);
@@ -3170,6 +3554,15 @@ pub const Context = struct {
             };
             inline for (@typeInfo(BufBinds).@"struct".field_names) |f| {
                 if (@field(c.bufs, f) == name) @field(c.bufs, f) = 0;
+            }
+            // (and from the indexed binding points)
+            for (&c.ubo) |*s| {
+                if (s.buf == name) s.* = .{};
+            }
+            if (c.feedbackOf()) |t| {
+                for (&t.bufs) |*s| {
+                    if (s.buf == name) s.* = .{};
+                }
             }
             // (and from the bound vertex array, as GL says)
             const va = c.curVao();
@@ -3760,17 +4153,32 @@ pub const Context = struct {
     }
 
     fn drawCall(c: *Context, mode: u32, first: u32, count: i32, index_ty: u32, offset: usize, instances: i32) void {
-        const topology: raster.Topology = switch (mode) {
+        const topology: ?raster.Topology = switch (mode) {
             g.TRIANGLES => .triangles,
             g.TRIANGLE_STRIP => .strip,
             g.TRIANGLE_FAN => .fan,
-            // (points and lines: not drawn yet)
-            g.POINTS, g.LINES, g.LINE_LOOP, g.LINE_STRIP => return,
+            // (points and lines: captured by transform feedback, not drawn yet)
+            g.POINTS, g.LINES, g.LINE_LOOP, g.LINE_STRIP => null,
             else => return c.fail(g.INVALID_ENUM),
         };
         if (count < 0 or instances < 0) return c.fail(g.INVALID_VALUE);
+        // transform feedback on: the begun mode's primitives, from arrays
+        // (GL ES 3.0's rules)
+        var xfb: ?*Feedback = null;
+        if (c.feedbackOf()) |t| {
+            if (t.active and !t.paused) xfb = t;
+        }
+        if (xfb) |t| {
+            const same = switch (t.mode) {
+                g.POINTS => mode == g.POINTS,
+                g.LINES => mode == g.LINES,
+                else => mode == g.TRIANGLES,
+            };
+            if (!same or index_ty != 0) return c.fail(g.INVALID_OPERATION);
+        }
+        const discard = c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0;
+        if (xfb == null and (topology == null or discard)) return;
         var v = c.drawView() orelse return;
-        if (c.enabled & bitOf(g.RASTERIZER_DISCARD) != 0) return;
         // the program in use (its pipeline, its uniforms), else the driver's own
         var pipe: *raster.Pipeline = undefined;
         var uniforms: []const u32 = undefined;
@@ -3782,9 +4190,13 @@ pub const Context = struct {
             pipe = c.pipeline orelse return;
             uniforms = c.uniforms;
         }
-        const color = v.color[0] orelse return;
+        const color_or = v.color[0];
+        if (color_or == null and xfb == null) return;
         if (count == 0 or instances == 0) return;
-        var d = raster.Draw{ .pipe = pipe, .color = color, .topology = topology, .first = first, .count = @intCast(count), .instances = @intCast(instances), .uniforms = uniforms };
+        // (a capture alone draws no pixel: any image stands for the color)
+        const color = color_or orelse &c.eng.zero;
+        var d = raster.Draw{ .pipe = pipe, .color = color, .topology = topology orelse .triangles, .first = first, .count = @intCast(count), .instances = @intCast(instances), .uniforms = uniforms };
+        d.restart = c.enabled & bitOf(g.PRIMITIVE_RESTART_FIXED_INDEX) != 0;
         var sampled_mips: [texture.MAX_TEX]Image = @splat(.{});
         defer for (&sampled_mips) |*image| c.eng.freeImage(image);
         if (c.program != 0) {
@@ -3792,6 +4204,8 @@ pub const Context = struct {
             const ds = program.drawState(c) orelse return;
             const n = ds.uniforms.len;
             @memcpy(c.draw_words[0..n], ds.uniforms);
+            // (the uniform blocks' members from their buffers)
+            program.fillBlocks(c, c.draw_words[0..n]);
             for (ds.slots, 0..) |sl, i| {
                 const st = c.slotState(sl, ds.uniforms, &sampled_mips[i]);
                 texture.descriptor(st, c.draw_words[n + i * texture.DESC_WORDS ..][0..texture.DESC_WORDS]);
@@ -3839,6 +4253,12 @@ pub const Context = struct {
                 else => 4,
             };
         }
+        if (xfb) |t| {
+            if (!c.feedbackCapture(t, &d, mode)) return;
+        }
+        if (topology == null or discard or color_or == null) return;
+        // an occlusion query: its word
+        if (c.timerOf(c.occlusion)) |q| d.query = &q.word;
         // viewport and depth range
         const vp = c.viewport;
         const hw = @as(f32, @floatFromInt(vp[2])) / 2;
