@@ -361,7 +361,7 @@ pub const CODE_BYTES = 16 * 1024;
 const MAX_PARAMS = 160;
 /// a kernel's bindings at most: the capture kernel's (its buffers,
 /// uniforms, element array, attributes, textures)
-const MAX_BIND = raster.MAX_CAPTURE_BUFFERS + 2 + raster.MAX_ATTRS + texture.MAX_TEX + raster.MAX_TARGETS;
+const MAX_BIND = raster.MAX_CAPTURE_BUFFERS + 2 + raster.MAX_ATTRS + texture.MAX_TEX + raster.MAX_BUFFERS + raster.MAX_TARGETS;
 /// KIR instructions a kernel built here may have (a pipeline's, a GLSL
 /// shader inlined in it).
 pub const MAX_KIR = 65536;
@@ -1749,7 +1749,9 @@ pub const Engine = struct {
         bs[B + 1] = d.index orelse &e.zero;
         for (d.attrs, 0..) |a, j| bs[B + 2 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
         for (0..ntex) |j| bs[B + 2 + raster.MAX_ATTRS + j] = d.textures[j] orelse &e.zero;
-        const bl = bs[0 .. B + 2 + raster.MAX_ATTRS + ntex];
+        const nbuf: usize = p.shaders.buffers;
+        for (0..nbuf) |j| bs[B + 2 + raster.MAX_ATTRS + ntex + j] = d.buffers[j] orelse &e.zero;
+        const bl = bs[0 .. B + 2 + raster.MAX_ATTRS + ntex + nbuf];
         const groups = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
         var on_gpu = e.onGpu() and e.loadPipeline(@constCast(p)) and p.owner == @as(?*anyopaque, e) and e.loadCapture(@constCast(p));
         for (bl) |img| on_gpu = on_gpu and e.gpuUsable(img);
@@ -1851,7 +1853,7 @@ pub const Engine = struct {
         for (d.attrs, 0..) |a, j| vbs[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
         const depth = d.depth orelse &e.zero;
         const sb = [_]*Image{ &tris, &verts };
-        var rbs: [6 + texture.MAX_TEX + raster.MAX_TARGETS]*Image = undefined;
+        var rbs: [6 + texture.MAX_TEX + raster.MAX_BUFFERS + raster.MAX_TARGETS]*Image = undefined;
         rbs[0] = if (d.color_off) &e.zero else d.color;
         rbs[1] = depth;
         rbs[2] = &tris;
@@ -1861,9 +1863,16 @@ pub const Engine = struct {
             vbs[3 + raster.MAX_ATTRS + j] = img;
             rbs[4 + j] = img;
         }
+        // (Vulkan's uniform and storage buffers, after the textures)
+        const nbuf: usize = p.shaders.buffers;
+        for (0..nbuf) |j| {
+            const img = d.buffers[j] orelse &e.zero;
+            vbs[3 + raster.MAX_ATTRS + ntex + j] = img;
+            rbs[4 + ntex + j] = img;
+        }
         // (an occlusion query's word; none on: the zeros, never written)
-        rbs[4 + ntex] = d.query orelse &e.zero;
-        var nrb: usize = 5 + ntex;
+        rbs[4 + ntex + nbuf] = d.query orelse &e.zero;
+        var nrb: usize = 5 + ntex + nbuf;
         if (d.stencil) |s| {
             rbs[nrb] = s;
             nrb += 1;
@@ -1871,9 +1880,9 @@ pub const Engine = struct {
         // (bit j: binding j written)
         var rw: u32 = if (d.color_off) 0 else 0b01;
         if (d.depth != null and d.depth_test and d.depth_write) rw |= 0b10;
-        if (d.query != null) rw |= @as(u32, 1) << @intCast(4 + ntex);
+        if (d.query != null) rw |= @as(u32, 1) << @intCast(4 + ntex + nbuf);
         if (d.stencil != null) {
-            rw |= @as(u32, 1) << @intCast(5 + ntex);
+            rw |= @as(u32, 1) << @intCast(5 + ntex + nbuf);
             if (d.stencil == d.depth) rw |= 0b10;
         }
         for (d.targets[1..]) |tg| {
@@ -1882,7 +1891,7 @@ pub const Engine = struct {
             rw |= @as(u32, 1) << @intCast(nrb);
             nrb += 1;
         }
-        const vb = vbs[0 .. 3 + raster.MAX_ATTRS + ntex];
+        const vb = vbs[0 .. 3 + raster.MAX_ATTRS + ntex + nbuf];
         const rb = rbs[0..nrb];
         const groups_v = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
         const groups_s = [3]u32{ divUp(nprim, raster.SETUP_GROUP), d.instances, 1 };

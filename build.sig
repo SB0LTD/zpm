@@ -1286,6 +1286,58 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try ctx.addDependency(test_all, test_va);
     _ = try addTest(ctx, test_va, "test-va-module", "src/va/va.sig", &.{});
     _ = try addTest(ctx, test_va, "test-va-lib", "src/va/libgalaxy_va.sig", &.{});
+    // ── vk: Galaxy's Vulkan driver (src/vk) and its SPIR-V front end
+    //    (src/spirv), on KIR's interpreter and the emulated RTX ──
+    const spirv_module = try ctx.addModule("spirv", "src/spirv/spirv.sig");
+    try wire(ctx, spirv_module, "gpu", "src/gpu/gpu.sig");
+    const test_vk = try ctx.addStep("test-vk", "Execute the Vulkan driver and its SPIR-V front end on KIR's interpreter and the emulated RTX", &noopStep);
+    try ctx.addDependency(test_all, test_vk);
+    _ = try addTest(ctx, test_vk, "test-spirv", "tests/test_spirv.sig", &.{
+        importEntry("spirv", "src/spirv/spirv.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
+    });
+    const vk_module = try ctx.addModule("vk", "src/vk/vk.sig");
+    try wire(ctx, vk_module, "gpu", "src/gpu/gpu.sig");
+    try wire(ctx, vk_module, "spirv", "src/spirv/spirv.sig");
+    try wire(ctx, vk_module, "gfxapi", "src/gfxapi/gfxapi.sig");
+    _ = try addTest(ctx, test_vk, "test-vk-module", "src/vk/vk.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("spirv", "src/spirv/spirv.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
+    });
+    _ = try addTest(ctx, test_vk, "test-vk-icd", "tests/test_vk.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("vk", "src/vk/vk.sig"),
+        importEntry("spirv", "src/spirv/spirv.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
+    });
+    _ = try addTest(ctx, test_vk, "test-vk-wsi", "tests/test_vk_wsi.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("vk", "src/vk/vk.sig"),
+        importEntry("spirv", "src/spirv/spirv.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
+    });
+    _ = try addTest(ctx, test_vk, "test-vk-lib", "src/vk/libgalaxy_vk.sig", &.{
+        importEntry("vk", "src/vk/vk.sig"),
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("spirv", "src/spirv/spirv.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
+    });
     // LFM3's layer kernels on sm_120, in the emulated RTX against lfm3_executor.
     _ = try addTest(ctx, test_nvidia, "test-lfm3-nv-ops", "src/core/lfm3_nv_ops.sig", &.{
         importEntry("nvidia", "src/nvidia/nvidia.sig"),

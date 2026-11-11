@@ -136,8 +136,8 @@ pub const Client = struct {
     }
 
     /// A request: its new object (or null). `version` is the new object's
-    /// (null: the proxy's own).
-    fn send(c: *const Client, p: *Proxy, opcode: u32, iface: ?*const Interface, version: ?u32, flags: u32, args: []Arg) ?*Proxy {
+    /// (null: the proxy's own). (Public for Vulkan's swapchains, src/vk.)
+    pub fn send(c: *const Client, p: *Proxy, opcode: u32, iface: ?*const Interface, version: ?u32, flags: u32, args: []Arg) ?*Proxy {
         const v = version orelse c.get_version(p);
         if (c.marshal_flags) |f| return f(p, opcode, iface, v, flags, args.ptr);
         var out: ?*Proxy = null;
