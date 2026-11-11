@@ -1422,6 +1422,74 @@ test "libgbm: Xwayland's glamor on GBM: device, EGL platform, buffers with modif
     for ([_]u32{ window.tex, pix.tex, pix2.tex, tex[0] }) |t| libgles.glDeleteTextures(1, &[_]u32{t});
 }
 
+/// glamor_add_format's check on GLES (glamor.c): a 1 x 1 texture of
+/// `internal`/`format`, uploaded, an fbo of it complete, and the
+/// implementation's read format and type what glamor reads back with.
+fn glamorFormat(internal: u32, format: u32) !void {
+    const g = gfxapi.glenum;
+    var tex: [1]u32 = undefined;
+    libgles.glGenTextures(1, &tex);
+    defer libgles.glDeleteTextures(1, &tex);
+    libgles.glBindTexture(g.TEXTURE_2D, tex[0]);
+    libgles.glTexImage2D(g.TEXTURE_2D, 0, @intCast(internal), 1, 1, 0, format, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.NO_ERROR, libgles.glGetError());
+    var fbo: [1]u32 = undefined;
+    libgles.glGenFramebuffers(1, &fbo);
+    defer libgles.glDeleteFramebuffers(1, &fbo);
+    libgles.glBindFramebuffer(g.FRAMEBUFFER, fbo[0]);
+    defer libgles.glBindFramebuffer(g.FRAMEBUFFER, 0);
+    libgles.glFramebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex[0], 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, libgles.glCheckFramebufferStatus(g.FRAMEBUFFER));
+    var rf: i32 = 0;
+    var rt: i32 = 0;
+    libgles.glGetIntegerv(g.IMPLEMENTATION_COLOR_READ_FORMAT, @ptrCast(&rf));
+    libgles.glGetIntegerv(g.IMPLEMENTATION_COLOR_READ_TYPE, @ptrCast(&rt));
+    try std.testing.expectEqual(@as(i32, @intCast(format)), rf);
+    try std.testing.expectEqual(@as(i32, @intCast(g.UNSIGNED_BYTE)), rt);
+}
+
+test "libgbm: glamor_init on GLES: the version, extensions and formats it needs" {
+    const g = gfxapi.glenum;
+    gbmTestDriver();
+    const dev = libgbm.gbm_create_device(5) orelse return error.NoDevice;
+    defer libgbm.gbm_device_destroy(dev);
+    const dpy = eglGetPlatformDisplayEXT(egl.PLATFORM_GBM_KHR, dev, null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(dpy, null, null));
+    defer _ = eglTerminate(dpy);
+    const ctx = eglCreateContext(dpy, null, null, &.{ egl.CONTEXT_CLIENT_VERSION, 2, egl.NONE }).?;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(dpy, null, null, ctx));
+    defer _ = eglMakeCurrent(dpy, null, null, null);
+    // epoxy_is_desktop_gl, epoxy_gl_version (30), epoxy_glsl_version (300)
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.span(libgles.glGetString(g.VERSION).?), "OpenGL ES 3.0"));
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.span(libgles.glGetString(g.SHADING_LANGUAGE_VERSION).?), "OpenGL ES GLSL ES 3.00"));
+    // epoxy_has_gl_extension on GL 3: glGetStringi
+    var n: i32 = 0;
+    libgles.glGetIntegerv(g.NUM_EXTENSIONS, @ptrCast(&n));
+    for ([_][]const u8{ "GL_EXT_texture_format_BGRA8888", "GL_OES_texture_border_clamp", "GL_OES_vertex_array_object", "GL_OES_EGL_image", "GL_EXT_map_buffer_range", "GL_KHR_debug" }) |want| {
+        var found = false;
+        for (0..@intCast(n)) |i| {
+            if (std.mem.eql(u8, std.mem.span(libgles.glGetStringi(g.EXTENSIONS, @intCast(i)).?), want)) found = true;
+        }
+        if (!found) std.debug.print("glamor needs {s}\n", .{want});
+        try std.testing.expect(found);
+    }
+    // glamor_setup_formats: depth 24 and 32 as BGRA, read back as BGRA;
+    // depth 8 as R8 (ES 3: RG and swizzles), read back as RED
+    try glamorFormat(g.BGRA_EXT, g.BGRA_EXT);
+    try glamorFormat(g.R8, g.RED);
+    // (the swizzle glamor binds a GL_RED source with)
+    var tex: [1]u32 = undefined;
+    libgles.glGenTextures(1, &tex);
+    libgles.glBindTexture(g.TEXTURE_2D, tex[0]);
+    libgles.glTexParameteri(g.TEXTURE_2D, g.TEXTURE_SWIZZLE_R, @intCast(g.ZERO));
+    try std.testing.expectEqual(g.NO_ERROR, libgles.glGetError());
+    libgles.glDeleteTextures(1, &tex);
+    var dims: [2]i32 = undefined;
+    libgles.glGetIntegerv(g.MAX_VIEWPORT_DIMS, &dims);
+    try std.testing.expect(dims[0] >= 4096 and dims[1] >= 4096);
+    try std.testing.expect(libgles.glGetString(g.VENDOR) != null);
+}
+
 var user_data_freed: ?*anyopaque = null;
 fn freeUserData(x: ?*gfxapi.gbm.Bo, data: ?*anyopaque) callconv(.c) void {
     _ = x;
