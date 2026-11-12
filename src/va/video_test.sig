@@ -19,7 +19,9 @@ const Fake = node.Fake;
 const D = driver.Driver(*Fake);
 const HIGH = @embedFile("testdata/h264_high.h264");
 const VP9 = @embedFile("testdata/vp9_96x64.ivf");
+const VP8 = @embedFile("testdata/vp8_96x64.ivf");
 const vp9r = @import("vp9_read.sig");
+const vp8r = @import("vp8_read.sig");
 var vp9_frames: u32 = 0;
 
 fn at(k: *Fake, m: []const u32, method: u32, len: usize) []u8 {
@@ -182,6 +184,70 @@ test "video: libvpx's VP9 stream (IVF) through the decoder: every frame decoded 
     try std.testing.expectEqual(@as(i64, 30), shown);
     try std.testing.expectEqual(@as(u32, 30), vp9_frames);
     try std.testing.expectEqual(@as(u64, 0), dec.errors);
+}
+
+test "video: libvpx's VP8 stream (IVF, four token partitions) through the decoder: every frame decoded and shown in order" {
+    var k = Fake{ .decoder = fakeDecode };
+    var d: D = .{ .node = .{ .sys = &k } };
+    try std.testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    try std.testing.expectEqual(video.Status.ok, dec.init(&d, .vp8));
+    defer dec.deinit();
+    vp9_frames = 0;
+    var pos: usize = 32;
+    var n: i64 = 0;
+    var shown: i64 = 0;
+    var buf: [96 * 64 * 3 / 2]u8 = undefined;
+    while (pos + 12 <= VP8.len) {
+        const sz = std.mem.readInt(u32, VP8[pos..][0..4], .little);
+        const frame = VP8[pos + 12 ..][0..sz];
+        pos += 12 + sz;
+        while (true) {
+            const st = dec.push(frame, n * 100, 100);
+            if (st == .full) {
+                const o = dec.next() orelse return error.FullButEmpty;
+                try std.testing.expectEqual(shown * 100, o.pts);
+                try std.testing.expect(dec.read(&buf, 96, .nv12));
+                shown += 1;
+                continue;
+            }
+            // (the driver checked each DCT partition's size against the
+            // frame's own table, or the decode would have failed)
+            try std.testing.expectEqual(video.Status.ok, st);
+            break;
+        }
+        n += 1;
+        while (dec.next()) |o| {
+            try std.testing.expectEqual(shown * 100, o.pts);
+            try std.testing.expectEqual([4]u32{ 0, 0, 96, 64 }, o.visible);
+            try std.testing.expect(dec.read(&buf, 96, .nv12));
+            shown += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(i64, 30), n);
+    try std.testing.expectEqual(@as(i64, 30), shown);
+    try std.testing.expectEqual(@as(u32, 30), vp9_frames);
+    try std.testing.expectEqual(@as(u64, 0), dec.errors);
+}
+
+test "video: VP8's frame headers: four DCT partitions in every frame (libvpx -slices 4), the key frame's size" {
+    var st = vp8r.State{};
+    var f: vp8r.Frame = .{};
+    var pos: usize = 32;
+    var n: u32 = 0;
+    while (pos + 12 <= VP8.len) {
+        const sz = std.mem.readInt(u32, VP8[pos..][0..4], .little);
+        const frame = VP8[pos + 12 ..][0..sz];
+        pos += 12 + sz;
+        try vp8r.read(&st, frame, &f);
+        try std.testing.expectEqual(@as(u8, 5), f.slice.num_of_partitions);
+        try std.testing.expectEqual(@as(u32, 96), f.pic.frame_width);
+        try std.testing.expectEqual(@as(u32, 64), f.pic.frame_height);
+        try std.testing.expect(f.pic.loop_filter_level[0] <= 63);
+        vp8r.commit(&st, &f, 0x400 + n % 4);
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 30), n);
 }
 
 test "video: a VP9 superframe's index splits it" {

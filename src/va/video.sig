@@ -23,6 +23,8 @@ const va = @import("vaapi.sig");
 const h264 = @import("h264_parse.sig");
 const vp9r = @import("vp9_read.sig");
 const vav9 = @import("vaapi_vp9.sig");
+const vp8r = @import("vp8_read.sig");
+const vav8 = @import("vaapi_vp8.sig");
 
 pub const Codec = enum(u32) { h264 = 1, hevc = 2, vp8 = 3, vp9 = 4, av1 = 5, _ };
 
@@ -101,6 +103,10 @@ pub fn Decoder(comptime D: type) type {
         vp9_slots: [8]u32 = [_]u32{vp9r.INVALID} ** 8,
         vp9_sizes: [8][2]u32 = [_][2]u32{.{ 0, 0 }} ** 8,
         vp9_depth: u8 = 8,
+        /// VP8: what it keeps across frames (references, probabilities),
+        /// and the frame being read
+        vp8: vp8r.State = .{},
+        vp8_frame: vp8r.Frame = .{},
         /// pictures decoded, failed
         decoded: u64 = 0,
         errors: u64 = 0,
@@ -109,7 +115,7 @@ pub fn Decoder(comptime D: type) type {
         pub fn init(self: *Self, drv: *D, codec: Codec) Status {
             self.* = .{ .drv = drv, .codec = codec };
             return switch (codec) {
-                .h264, .vp9 => .ok,
+                .h264, .vp8, .vp9 => .ok,
                 else => .unsupported,
             };
         }
@@ -220,6 +226,7 @@ pub fn Decoder(comptime D: type) type {
             return switch (self.codec) {
                 .h264 => self.pushH264(au, pts, duration),
                 .vp9 => self.pushVp9(au, pts, duration),
+                .vp8 => self.pushVp8(au, pts, duration),
                 else => .unsupported,
             };
         }
@@ -414,6 +421,80 @@ pub fn Decoder(comptime D: type) type {
             return st == va.SUCCESS;
         }
 
+        // ── VP8 ──────────────────────────────────────────────────────────
+
+        fn vp8Hold(self: *Self) void {
+            const st = &self.vp8;
+            for (0..self.count) |i| {
+                const s = self.surfaces[i];
+                self.held[i] = s == st.last or s == st.golden or s == st.altref;
+            }
+        }
+
+        fn pushVp8(self: *Self, au: []const u8, pts: i64, duration: i64) Status {
+            if (self.o_len > 0) return .full;
+            const f = &self.vp8_frame;
+            vp8r.read(&self.vp8, au, f) catch |e| return switch (e) {
+                error.Unsupported => .unsupported,
+                error.Corrupt => if (self.count == 0) .more else .bad,
+                error.Truncated => .bad,
+            };
+            if (f.key and (self.count == 0 or f.width != self.width or f.height != self.height)) {
+                if (self.q_len > 0) return .full;
+                self.vp8 = .{};
+                vp8r.read(&self.vp8, au, f) catch return .bad;
+                const st = self.setup(vav8.PROFILE_VP8_VERSION0_3, f.width, f.height, 8, 3);
+                if (st != .ok) return st;
+            }
+            if (self.count == 0) return .more;
+            if (self.q_len >= QUEUE or self.freeSurfaces() == 0) return .full;
+            var target: u32 = 0;
+            for (0..self.count) |i| {
+                if (!self.held[i] and !self.queued[i]) {
+                    target = self.surfaces[i];
+                    break;
+                }
+            }
+            if (target == 0) return .full;
+            const bufs = [_]Buf{
+                .{ .kind = va.PICTURE_PARAMETER_BUFFER, .size = @sizeOf(vav8.PictureParameterBufferVP8), .data = std.mem.asBytes(&f.pic) },
+                .{ .kind = vav8.PROBABILITY_BUFFER, .size = @sizeOf(vav8.ProbabilityDataBufferVP8), .data = std.mem.asBytes(&f.probs) },
+                .{ .kind = va.IQ_MATRIX_BUFFER, .size = @sizeOf(vav8.IQMatrixBufferVP8), .data = std.mem.asBytes(&f.iq) },
+                .{ .kind = va.SLICE_PARAMETER_BUFFER, .size = @sizeOf(vav8.SliceParameterBufferVP8), .data = std.mem.asBytes(&f.slice) },
+                .{ .kind = va.SLICE_DATA_BUFFER, .size = @intCast(au.len - f.data_offset), .data = au[f.data_offset..] },
+            };
+            if (!self.decodeBufs(target, &bufs)) {
+                self.errors += 1;
+                return .failed;
+            }
+            self.decoded += 1;
+            vp8r.commit(&self.vp8, f, target);
+            self.vp8Hold();
+            if (f.show) self.queueOut(target, pts, duration, f.width, f.height);
+            return .ok;
+        }
+
+        const Buf = struct { kind: u32, size: u32, data: []const u8 };
+
+        /// One picture from a list of VA buffers.
+        fn decodeBufs(self: *Self, target: u32, bufs: []const Buf) bool {
+            const d = self.drv;
+            if (d.beginPicture(self.context, target) != va.SUCCESS) return false;
+            var ids: [8]u32 = undefined;
+            var n: usize = 0;
+            defer for (ids[0..n]) |id| {
+                _ = d.destroyBuffer(id);
+            };
+            for (bufs) |b| {
+                if (d.createBuffer(b.kind, b.size, 1, b.data.ptr, &ids[n]) != va.SUCCESS) return false;
+                n += 1;
+            }
+            if (d.renderPicture(self.context, ids[0..n]) != va.SUCCESS) return false;
+            const st = d.endPicture(self.context);
+            self.last_status = st;
+            return st == va.SUCCESS;
+        }
+
         fn decodeH264(self: *Self) bool {
             const d = self.drv;
             const p = &self.pic;
@@ -463,6 +544,13 @@ pub fn Decoder(comptime D: type) type {
                     // (decoding restarts at the next key frame)
                     self.vp9_slots = [_]u32{vp9r.INVALID} ** 8;
                     self.vp9Hold();
+                },
+                .vp8 => {
+                    self.vp8.last = vp8r.INVALID;
+                    self.vp8.golden = vp8r.INVALID;
+                    self.vp8.altref = vp8r.INVALID;
+                    self.vp8.have_key = false;
+                    self.vp8Hold();
                 },
                 else => {},
             }
