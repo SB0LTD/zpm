@@ -82,6 +82,9 @@ const encode = @import("encode.sig");
 const nvenc = @import("nvenc.sig");
 const convert = @import("convert.sig");
 const enc_import = @import("enc_import.sig");
+const enc_vpx = @import("enc_vpx.sig");
+const enc_vp8 = @import("enc_vp8.sig");
+const enc_vp9 = @import("enc_vp9.sig");
 
 const Buf = node.Buf;
 
@@ -119,7 +122,7 @@ pub const MIN_SIZE = 16;
 /// far sooner).
 pub const SYNC_NS: i64 = 2_000_000_000;
 
-pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264, HEVC, VP8, VP9, AV1) and NVENC (H.264, HEVC), zpm";
+pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264, HEVC, VP8, VP9, AV1), NVENC (H.264, HEVC, AV1) and its own VP8 and VP9 encoders on the GPU, zpm";
 
 /// Coded buffers at once (the kernel's buffers).
 pub const MAX_CODED = 16;
@@ -208,6 +211,10 @@ pub const Options = struct {
     /// GALAXY_VA_NVENC_RC=firmware: the encoder firmware's own rate
     /// control for CBR and VBR (enc_rc.sig), not the driver's
     nvenc_rc_firmware: bool = false,
+    /// GALAXY_VA_VPX_ENCODE=0: no VP8 or VP9 encode entrypoints
+    vpx_encode: bool = true,
+    /// GALAXY_VA_VPX_GPU=0: VP8 and VP9 encode on the CPU, not the RTX
+    vpx_gpu: bool = true,
 };
 
 const Config = struct {
@@ -318,6 +325,14 @@ const Context = struct {
     encoding: bool = false,
     enc: encode.State = undefined,
     enc_scratch: encode.ScratchSizes = undefined,
+    /// VP8 and VP9 (enc_vpx.sig): the state, the packer's scratch, the
+    /// CPU engine's memory (made when the CPU encodes), which engine has
+    /// the frame store
+    vpx_on: bool = false,
+    vpx: enc_vpx.State = undefined,
+    vpx_work: Buf = .{},
+    vpx_cpu: Buf = .{},
+    vpx_engine: enum { none, gpu, cpu } = .none,
 
     fn frameBytes(c: *const Context, f: usize) []u8 {
         return c.work.bytes()[f * FRAME_BYTES ..][0..FRAME_BYTES];
@@ -524,6 +539,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
 
         /// Whether `profile` encodes here (and the encoder is there).
         pub fn encodes(d: *const Self, profile: va.Profile) bool {
+            // (VP8 and VP9: the kernels' encoder, not NVENC's)
+            if (enc_vpx.supported(profile) != null) return d.opts.encode and d.opts.vpx_encode;
             return d.has_encoder and encode.supported(profile) != null;
         }
 
@@ -576,8 +593,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                         rc_mode = a.value;
                     },
                     ve.ATTRIB_ENC_PACKED_HEADERS => {
-                        const kind = encode.supported(profile) orelse return va.ERROR_UNSUPPORTED_PROFILE;
-                        if (a.value & ~encode.packedHeaders(kind) != 0) return va.ERROR_INVALID_CONFIG;
+                        const allowed = if (enc_vpx.supported(profile) != null) enc_vpx.PACKED_HEADERS else encode.packedHeaders(encode.supported(profile) orelse return va.ERROR_UNSUPPORTED_PROFILE);
+                        if (a.value & ~allowed != 0) return va.ERROR_INVALID_CONFIG;
                         packed_headers = a.value;
                     },
                     else => {},
@@ -1096,6 +1113,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         /// An encode context: FRAMES frame slots (pushbuffer, setup), then
         /// the engine's scratch (zeroed).
         fn createEncodeContext(d: *Self, i: u8, config: u32, cfg: *const Config, width: u32, height: u32, out: *u32) va.Status {
+            if (enc_vpx.supported(cfg.profile)) |vk| return d.createVpxContext(i, config, cfg, vk, width, height, out);
             const kind = encode.supported(cfg.profile) orelse return va.ERROR_UNSUPPORTED_PROFILE;
             const sz = encode.scratchSizesFor(kind, width, height);
             const scratch_off = FRAMES * ENC_FRAME_BYTES;
@@ -1126,6 +1144,14 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         pub fn destroyContext(d: *Self, id: u32) va.Status {
             const ci = d.contextIndex(id) orelse return va.ERROR_INVALID_CONTEXT;
             const c = &d.contexts[ci];
+            if (c.vpx_on) {
+                // (its pictures were encoded at EndPicture: nothing waits)
+                if (@hasDecl(Conv, "vpxRelease")) d.conv.vpxRelease(ci);
+                d.node.free(&c.vpx_work);
+                d.node.free(&c.vpx_cpu);
+                c.* = .{};
+                return va.SUCCESS;
+            }
             if (c.encoding) {
                 // (its encodes finished, their coded buffers filled)
                 for (&d.coded, 0..) |*cb, k| {
@@ -1361,7 +1387,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 c.target = si;
                 c.target_id = surface;
                 c.frame = f;
-                encode.begin(&c.enc);
+                if (c.vpx_on) enc_vpx.begin(&c.vpx) else encode.begin(&c.enc);
                 c.bad = va.SUCCESS;
                 return va.SUCCESS;
             }
@@ -1419,6 +1445,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const b = d.buffers[bi];
             if (b.coded != NO_CODED) return va.ERROR_INVALID_BUFFER;
             const data = d.bufferBytes(bi);
+            if (c.vpx_on) return enc_vpx.take(&c.vpx, .{ .kind = b.type, .size = b.size, .count = b.count, .data = data });
             if (c.encoding) return encode.take(&c.enc, .{ .kind = b.type, .size = b.size, .count = b.count, .data = data });
             if (c.codec != .h264) {
                 const buf = codec.Buffer{ .kind = b.type, .size = b.size, .count = b.count, .data = data };
@@ -1487,6 +1514,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             defer c.target = NONE;
             if (c.target == NONE) return va.ERROR_OPERATION_FAILED;
             if (c.bad != va.SUCCESS) return c.bad;
+            if (c.vpx_on) return d.endVpx(ci, c);
             if (c.encoding) return d.endEncode(ci, c);
             if (c.codec != .h264) return d.endModule(ci, c);
             if (!c.have_pic or c.slices == 0) return va.ERROR_INVALID_PARAMETER;
@@ -1733,6 +1761,205 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             c.next_frame = (f + 1) % FRAMES;
             c.decodes +%= 1;
             d.debug("encode {d} submitted: QP {d}, {d} bytes of headers", .{ c.decodes, out.qp, out.header_bytes });
+            return va.SUCCESS;
+        }
+
+        // ── VP8 and VP9 (enc_vpx.sig) ───────────────────────────────────
+
+        /// The packer's scratch for a context of `width` x `height`: the
+        /// partitions (VP8) or the headers and tiles (VP9) while they are
+        /// written, each up to a frame's worth.
+        fn vpxScratchBytes(width: u32, height: u32) usize {
+            const w: usize = std.mem.alignForward(u32, width, 64);
+            const h: usize = std.mem.alignForward(u32, height, 64);
+            return 2 * (w * h * 3 / 2 + (256 << 10));
+        }
+
+        /// A VP8 or VP9 encode context: the state and the packer's scratch
+        /// (system memory). The encoder itself is made at the first
+        /// picture, at the stream's size (the context's may be the
+        /// surfaces' aligned size: FFmpeg's VP9); the CPU engine's memory
+        /// when the CPU encodes, the RTX's in the converter's GPU context.
+        fn createVpxContext(d: *Self, i: u8, config: u32, cfg: *const Config, kind: enc_vpx.Codec, width: u32, height: u32, out: *u32) va.Status {
+            const work = d.node.alloc(vpxScratchBytes(width, height), 0) orelse return va.ERROR_ALLOCATION_FAILED;
+            d.contexts[i] = .{
+                .used = true,
+                .config = @intCast(config - CONFIG_BASE),
+                .encoding = true,
+                .width_mbs = (width + 15) / 16,
+                .height_mbs = (height + 15) / 16,
+                .vpx_on = true,
+                .vpx = enc_vpx.State.init(kind, width, height, cfg.rc_mode),
+                .vpx_work = work,
+            };
+            out.* = CONTEXT_BASE + @as(u32, i);
+            d.debug("{s} encode context {d}x{d} (kernels on the {s}): rate control {x}", .{ @tagName(kind), width, height, if (@hasDecl(Conv, "vpxFrame") and d.opts.vpx_gpu) "RTX" else "CPU", cfg.rc_mode });
+            return va.SUCCESS;
+        }
+
+        /// The stream's size: VP8's sequence, VP9's picture.
+        fn vpxSize(c: *const Context) [2]u32 {
+            const v = &c.vpx;
+            return switch (v.codec) {
+                .vp8 => if (v.have_seq and v.seq8.frame_width != 0) .{ v.seq8.frame_width, v.seq8.frame_height } else .{ v.width, v.height },
+                .vp9 => if (v.have_pic and v.pic9.frame_width_dst != 0) .{ v.pic9.frame_width_dst, v.pic9.frame_height_dst } else .{ v.width, v.height },
+            };
+        }
+
+        /// The encoder at the stream's size (made again when it changes:
+        /// the next picture is a key frame then).
+        fn vpxEnsure(d: *Self, c: *Context) va.Status {
+            const sz = vpxSize(c);
+            if (sz[0] == 0 or sz[1] == 0 or sz[0] > c.width_mbs * 16 or sz[1] > c.height_mbs * 16) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
+            const same = c.vpx_engine != .none and switch (c.vpx.codec) {
+                .vp8 => c.vpx.vp8.lay.width == sz[0] and c.vpx.vp8.lay.height == sz[1],
+                .vp9 => c.vpx.vp9.width == sz[0] and c.vpx.vp9.height == sz[1],
+            };
+            if (same) return va.SUCCESS;
+            switch (c.vpx.codec) {
+                .vp8 => c.vpx.vp8 = enc_vp8.Encoder.init(sz[0], sz[1]) catch return va.ERROR_RESOLUTION_NOT_SUPPORTED,
+                .vp9 => c.vpx.vp9 = enc_vp9.Encoder.init(sz[0], sz[1]) catch return va.ERROR_RESOLUTION_NOT_SUPPORTED,
+            }
+            d.node.free(&c.vpx_cpu);
+            c.vpx_engine = .none;
+            return va.SUCCESS;
+        }
+
+        /// A VP8 or VP9 picture, encoded now: the input current, the plan,
+        /// the kernels on the RTX (the converter's GPU context) or the CPU,
+        /// the bitstream into the coded buffer, its segment filled.
+        fn endVpx(d: *Self, ci: u8, c: *Context) va.Status {
+            const si = c.target;
+            const s = &d.surfaces[si];
+            const cid = enc_vpx.codedBuffer(&c.vpx) orelse return va.ERROR_INVALID_PARAMETER;
+            const bi = d.bufferIndex(cid) orelse return va.ERROR_INVALID_BUFFER;
+            const k = d.buffers[bi].coded;
+            if (k == NO_CODED) return va.ERROR_INVALID_BUFFER;
+            const cb = &d.coded[k];
+            const deadline = d.node.sys.nowNs() + SYNC_NS;
+            var st = d.completeCoded(k, deadline);
+            if (st != va.SUCCESS) return st;
+            // (the input current: a decode into it done; an app's CPU write
+            // or linear dma-buf converted back; RGB converted on the GPU)
+            if (s.layout.sample_bytes != 1) return va.ERROR_UNSUPPORTED_RT_FORMAT;
+            st = d.complete(si, deadline);
+            if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+            if (d.imports[si].used and d.imports[si].layout == .linear) s.tiled_stale = true;
+            st = if (d.imports[si].rgb != null) d.convertRgb(si) else d.syncTiled(si);
+            if (st != va.SUCCESS) return st;
+            st = d.vpxEnsure(c);
+            if (st != va.SUCCESS) return st;
+            var pl: enc_vpx.Plan = undefined;
+            st = enc_vpx.plan(&c.vpx, &pl);
+            if (st != va.SUCCESS) return st;
+
+            // the input as the load kernel reads it: the surface's buffer,
+            // its planes' offsets, pitches, swizzles and block height
+            const im = d.imports[si];
+            var luma_at: u64 = 0;
+            var chroma_at: u64 = s.layout.chroma_offset;
+            var gobs: u32 = tiling.BLOCK_GOBS_LOG2;
+            if (im.used and im.layout == .block_linear and im.rgb == null) {
+                // (an app's planes in two buffers: not read here)
+                if (im.second.handle != 0) return va.ERROR_UNSUPPORTED_MEMORY_TYPE;
+                luma_at = im.luma - s.tiled.va;
+                chroma_at = im.chroma - s.tiled.va;
+                gobs = im.gobs_log2;
+            }
+            const sw = s.layout.swizzles(d.opts.gob);
+            const surf = enc_vp8.Surface{
+                .luma = @intCast(luma_at),
+                .chroma = @intCast(chroma_at),
+                .pitch_luma = s.layout.luma.pitch,
+                .pitch_chroma = s.layout.chroma.pitch,
+                .swz_luma = @intFromEnum(sw[0]),
+                .swz_chroma = @intFromEnum(sw[1]),
+                .gobs = gobs,
+            };
+            const coded = cb.buf.bytes();
+            const out = coded[encode.DATA_OFF..];
+            const scratch = c.vpx_work.bytes();
+            var bytes: usize = 0;
+            var full = false;
+            var on: @TypeOf(c.vpx_engine) = .none;
+            // the RTX: the converter's GPU context runs the kernels
+            if (@hasDecl(Conv, "vpxFrame") and d.opts.vpx_gpu and c.vpx_engine != .cpu) gpu: {
+                const fd = d.surfaceFd(s) orelse break :gpu;
+                const r = d.conv.vpxFrame(ci, .{
+                    .state = &c.vpx,
+                    .plan = pl,
+                    .surface = surf,
+                    .surface_fd = fd,
+                    .surface_bytes = s.tiled.len,
+                    .out = out,
+                    .scratch = scratch,
+                    .fresh = c.vpx_engine == .none,
+                }, .{ .ctx = d, .f = sayLine });
+                switch (r) {
+                    .done => |n| {
+                        bytes = n;
+                        on = .gpu;
+                    },
+                    .full => {
+                        full = true;
+                        on = .gpu;
+                    },
+                    .unavailable => {},
+                    .failed => {
+                        d.say("a {s} picture failed on the GPU: the CPU encodes, from a key frame", .{@tagName(c.vpx.codec)});
+                        c.vpx_engine = .none;
+                    },
+                }
+            }
+            if (on == .none) {
+                if (c.vpx_engine == .gpu) {
+                    // (the frame store was the GPU's: start again)
+                    c.vpx_engine = .none;
+                    st = d.vpxEnsure(c);
+                    if (st != va.SUCCESS) return st;
+                }
+                const need = switch (c.vpx.codec) {
+                    .vp8 => c.vpx.vp8.lay.mem_bytes + c.vpx.vp8.lay.info_bytes,
+                    .vp9 => enc_vp9.cpuBytes(&c.vpx.vp9),
+                };
+                if (c.vpx_cpu.handle == 0) {
+                    c.vpx_cpu = d.node.alloc(need, 0) orelse return va.ERROR_ALLOCATION_FAILED;
+                    @memset(c.vpx_cpu.bytes()[0..need], 0);
+                }
+                if (c.vpx_engine == .none) switch (c.vpx.codec) {
+                    // (a new frame store: a key frame first)
+                    .vp8 => c.vpx.vp8.have_last = false,
+                    .vp9 => enc_vp9.restart(&c.vpx.vp9),
+                };
+                const mem = c.vpx_cpu.bytes()[0..need];
+                switch (c.vpx.codec) {
+                    .vp8 => {
+                        const lay = c.vpx.vp8.lay;
+                        var eng = enc_vp8.CpuEngine{ .mem = mem[0..lay.mem_bytes], .info = mem[lay.mem_bytes..][0..lay.info_bytes], .surf = s.tiled.bytes() };
+                        if (enc_vp8.encodeFrame(&c.vpx.vp8, &eng, surf, pl.vp8, out, scratch)) |r| {
+                            bytes = r.bytes;
+                        } else |e| {
+                            if (e != error.NoSpace) return va.ERROR_ENCODING_ERROR;
+                            full = true;
+                        }
+                    },
+                    .vp9 => {
+                        if (enc_vp9.encodeCpu(&c.vpx.vp9, mem, s.tiled.bytes(), surf, pl.vp9, out, scratch)) |r| {
+                            bytes = r;
+                        } else |e| {
+                            if (e != error.NoSpace) return va.ERROR_ENCODING_ERROR;
+                            full = true;
+                        }
+                    },
+                }
+                on = .cpu;
+            }
+            c.vpx_engine = on;
+            enc_vpx.segment(coded, encode.DATA_OFF, @intCast(bytes), full);
+            cb.pending = false;
+            enc_vpx.done(&c.vpx, pl, bytes);
+            c.decodes +%= 1;
+            d.debug("{s} picture {d} on the {s}: {s}, q {d}, {d} bytes{s}", .{ @tagName(c.vpx.codec), c.decodes, @tagName(on), if (pl.key) "key" else "inter", pl.q, bytes, if (full) " (the coded buffer is too small)" else "" });
             return va.SUCCESS;
         }
 
@@ -2118,6 +2345,14 @@ pub fn intAttrib(kind: u32, flags: u32, v: u32) va.SurfaceAttrib {
 
 /// An EncSlice config attribute's value (what FFmpeg's vaapi_encode asks).
 pub fn encodeAttribute(profile: va.Profile, kind: u32) u32 {
+    if (enc_vpx.supported(profile) != null) return switch (kind) {
+        va.ATTRIB_RT_FORMAT => va.RT_FORMAT_YUV420,
+        ve.ATTRIB_RATE_CONTROL => enc_vpx.RC_MODES,
+        ve.ATTRIB_ENC_PACKED_HEADERS => enc_vpx.PACKED_HEADERS,
+        ve.ATTRIB_ENC_MAX_REF_FRAMES => enc_vpx.MAX_REFS,
+        va.ATTRIB_MAX_PICTURE_WIDTH, va.ATTRIB_MAX_PICTURE_HEIGHT => MAX_SIZE,
+        else => va.ATTRIB_NOT_SUPPORTED,
+    };
     const hevc_profile = profile == va.PROFILE_HEVC_MAIN;
     const av1_profile = encode.supported(profile) == .av1;
     const enc_av1 = @import("enc_av1.sig");
