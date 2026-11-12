@@ -477,24 +477,8 @@ pub const Engine = struct {
     /// to the grid rounding to nearest even): the model of the viewport
     /// transform, so the two rasterizers put a vertex in the same place.
     fn project(g: *Engine, v: usize) void {
-        // (behind the plane: never drawn, but given a place all the same)
-        const w: f32 = @floatCast(@max(g.vfloat(v, POSITION + 3), W_MIN));
-        const iw: f32 = 1.0 / w;
-        const x: f32 = @floatCast(g.vfloat(v, POSITION));
-        const y: f32 = @floatCast(g.vfloat(v, POSITION + 1));
         const vp: [4]f32 = .{ @floatCast(g.vp[0]), @floatCast(g.vp[1]), @floatCast(g.vp[2]), @floatCast(g.vp[3]) };
-        const xw = x * iw * vp[0] + vp[2];
-        const yw = y * iw * vp[1] + vp[3];
-        g.win[v] = .{ gridOf(xw * 256), gridOf(yw * 256) };
-    }
-
-    /// A window coordinate on the grid (rounded to nearest, ties to even),
-    /// held far out (the edge functions' products stay in 64 bits); not a
-    /// number is 0.
-    fn gridOf(x: f32) i64 {
-        const lim: f32 = 1 << 29;
-        if (x != x) return 0;
-        return @intFromFloat(rne(std.math.clamp(x, -lim, lim)));
+        g.win[v] = windowOf(@floatCast(g.vfloat(v, POSITION)), @floatCast(g.vfloat(v, POSITION + 1)), @floatCast(g.vfloat(v, POSITION + 3)), vp);
     }
 
     /// A triangle clipped against w >= W_MIN (as the hardware clips
@@ -610,42 +594,21 @@ pub const Engine = struct {
     /// between them do not z-fight). `area`: twice the triangle's area on
     /// the grid, > 0 (tri wound so).
     fn depthPlane(g: *const Engine, tri: [3]usize, area: i64) DepthPlane {
-        const zs: f32 = @floatCast(g.zscale);
-        const zo: f32 = @floatCast(g.zoffset);
-        var z: [3]f32 = undefined;
-        var fx: [3]f32 = undefined;
-        var fy: [3]f32 = undefined;
+        var zc: [3]f32 = undefined;
+        var w: [3]f32 = undefined;
+        var win: [3][2]i64 = undefined;
         for (tri, 0..) |v, k| {
-            const w: f32 = @floatCast(@max(g.vfloat(v, POSITION + 3), W_MIN));
-            const iw: f32 = 1.0 / w;
-            const zc: f32 = @floatCast(g.vfloat(v, POSITION + 2));
-            z[k] = zc * iw * zs + zo;
-            fx[k] = @as(f32, @floatFromInt(g.win[v][0])) * (1.0 / 256.0);
-            fy[k] = @as(f32, @floatFromInt(g.win[v][1])) * (1.0 / 256.0);
+            zc[k] = @floatCast(g.vfloat(v, POSITION + 2));
+            w[k] = @floatCast(g.vfloat(v, POSITION + 3));
+            win[k] = g.win[v];
         }
-        // (the determinant from the exact area: its high and low words)
-        const hi: i32 = @intCast(area >> 32);
-        const lo: u32 = @truncate(@as(u64, @bitCast(area)));
-        const det: f32 = (@as(f32, @floatFromInt(hi)) * 4294967296.0 + @as(f32, @floatFromInt(lo))) * (1.0 / 65536.0);
-        const idet: f32 = 1.0 / det;
-        const ex1 = fx[1] - fx[0];
-        const ey1 = fy[1] - fy[0];
-        const ex2 = fx[2] - fx[0];
-        const ey2 = fy[2] - fy[0];
-        const d1 = z[1] - z[0];
-        const d2 = z[2] - z[0];
-        return .{ .z0 = z[0], .gx = (d1 * ey2 - d2 * ey1) * idet, .gy = (d2 * ex1 - d1 * ex2) * idet, .x0 = fx[0], .y0 = fy[0] };
+        return planeOf(zc, w, win, @floatCast(g.zscale), @floatCast(g.zoffset), area);
     }
 
     /// Whether a pixel's depth (window units) is in the viewport's depth
-    /// range (the clip volume's near and far planes there), as gfxapi's
-    /// raster keeps a pixel: zmin <= z <= zmax.
+    /// range, as gfxapi's raster keeps a pixel (depthInRange).
     fn depthIn(g: *const Engine, z: f32) bool {
-        const zs: f32 = @floatCast(g.zscale);
-        const zo: f32 = @floatCast(g.zoffset);
-        const lo_w: f32 = @as(f32, @floatCast(g.zlo)) * zs + zo;
-        const hi_w: f32 = @as(f32, @floatCast(g.zhi)) * zs + zo;
-        return z >= @min(lo_w, hi_w) and z <= @max(lo_w, hi_w);
+        return depthInRange(z, @floatCast(g.zlo), @floatCast(g.zhi), @floatCast(g.zscale), @floatCast(g.zoffset));
     }
 
     /// A pixel queued (a helper: not covered, run for its quad, never
@@ -734,10 +697,7 @@ pub const Engine = struct {
         if (x >= z.width or y >= z.height) return false;
         const at = blAddress(z.pitch, z.gobs, x * 4, y);
         const w = std.mem.readInt(u32, z.bytes[at..][0..4], .little);
-        // (as the raster's depthWord: in f32, rounded to the nearest even;
-        // above 2^23 the product is whole already, and adding a half in
-        // f32 would round it up)
-        const zq: u32 = @intFromFloat(rne(std.math.clamp(zw, 0, 1) * 16777215.0));
+        const zq = depthWord(zw);
         const old_z = w & 0xff_ffff;
         var stencil: u32 = w >> 24;
         const st_on = g.reg(gr.SET_STENCIL_TEST) & 1 != 0;
@@ -815,14 +775,86 @@ pub const Engine = struct {
     }
 };
 
+// ── The rasterizer's model, alone ──────────────────────────────────────────
+// What the engine above uses to place vertices, cover pixels and give them
+// depth (and gfxapi's compute raster does bit for bit): pub, so the
+// hardware test (gpu/nvidia_draw.sig) can put the real 3D engine's
+// pixels beside the model's.
+
+/// A vertex's window place on the 1/256 grid: x * (1/w) * scale + offset in
+/// f32, op by op, rounded to nearest even; w at least W_MIN (one behind
+/// the eye's plane: clipped before, placed all the same). `vp`: scale x,
+/// y, offset x, y.
+pub fn windowOf(x: f32, y: f32, w_in: f32, vp: [4]f32) [2]i64 {
+    const w: f32 = @max(w_in, @as(f32, @floatCast(W_MIN)));
+    const iw: f32 = 1.0 / w;
+    const xw = x * iw * vp[0] + vp[2];
+    const yw = y * iw * vp[1] + vp[3];
+    return .{ gridOf(xw * 256), gridOf(yw * 256) };
+}
+
+/// A window coordinate on the grid (rounded to nearest, ties to even),
+/// held far out (the edge functions' products stay in 64 bits); not a
+/// number is 0.
+pub fn gridOf(x: f32) i64 {
+    const lim: f32 = 1 << 29;
+    if (x != x) return 0;
+    return @intFromFloat(rne(std.math.clamp(x, -lim, lim)));
+}
+
+/// The depth plane of a triangle (its vertices' clip z and w, their grid
+/// places, wound so that `area` = edge(win0, win1, win2) > 0) over the
+/// pixel centres from its first vertex, in f32 op by op as gfxapi's
+/// compute raster sets it up (writeTri) and reads it (plane).
+pub fn planeOf(zc: [3]f32, w_in: [3]f32, win: [3][2]i64, zs: f32, zo: f32, area: i64) DepthPlane {
+    var z: [3]f32 = undefined;
+    var fx: [3]f32 = undefined;
+    var fy: [3]f32 = undefined;
+    for (0..3) |k| {
+        const w: f32 = @max(w_in[k], @as(f32, @floatCast(W_MIN)));
+        const iw: f32 = 1.0 / w;
+        z[k] = zc[k] * iw * zs + zo;
+        fx[k] = @as(f32, @floatFromInt(win[k][0])) * (1.0 / 256.0);
+        fy[k] = @as(f32, @floatFromInt(win[k][1])) * (1.0 / 256.0);
+    }
+    // (the determinant from the exact area: its high and low words)
+    const hi: i32 = @intCast(area >> 32);
+    const lo: u32 = @truncate(@as(u64, @bitCast(area)));
+    const det: f32 = (@as(f32, @floatFromInt(hi)) * 4294967296.0 + @as(f32, @floatFromInt(lo))) * (1.0 / 65536.0);
+    const idet: f32 = 1.0 / det;
+    const ex1 = fx[1] - fx[0];
+    const ey1 = fy[1] - fy[0];
+    const ex2 = fx[2] - fx[0];
+    const ey2 = fy[2] - fy[0];
+    const d1 = z[1] - z[0];
+    const d2 = z[2] - z[0];
+    return .{ .z0 = z[0], .gx = (d1 * ey2 - d2 * ey1) * idet, .gy = (d2 * ex1 - d1 * ex2) * idet, .x0 = fx[0], .y0 = fy[0] };
+}
+
+/// Whether a pixel's depth (window units) is in the viewport's depth range
+/// (the clip volume's near and far planes there: zlo, zhi in NDC, -1 or
+/// 0 and 1), as gfxapi's raster keeps a pixel: zmin <= z <= zmax.
+pub fn depthInRange(z: f32, zlo: f32, zhi: f32, zs: f32, zo: f32) bool {
+    const lo_w: f32 = zlo * zs + zo;
+    const hi_w: f32 = zhi * zs + zo;
+    return z >= @min(lo_w, hi_w) and z <= @max(lo_w, hi_w);
+}
+
+/// A depth's 24-bit word, as the raster's depthWord: in f32, rounded to
+/// the nearest even (above 2^23 the product is whole already; adding a
+/// half in f32 would round it up).
+pub fn depthWord(z: f32) u32 {
+    return @intFromFloat(rne(std.math.clamp(z, 0, 1) * 16777215.0));
+}
+
 /// x rounded to the nearest whole number, ties to even (as cvt's .rne).
-fn rne(x: f32) f32 {
+pub fn rne(x: f32) f32 {
     return if (@abs(x - @trunc(x)) == 0.5) 2 * @round(x / 2) else @round(x);
 }
 
 /// A triangle's depth plane (depthPlane): z0 at its first vertex (x0, y0,
 /// pixels), slopes gx, gy.
-const DepthPlane = struct {
+pub const DepthPlane = struct {
     z0: f32,
     gx: f32,
     gy: f32,
@@ -830,7 +862,7 @@ const DepthPlane = struct {
     y0: f32,
 
     /// At pixel (px, py)'s centre, as gfxapi's raster's plane().
-    fn at(p: DepthPlane, px: i64, py: i64) f32 {
+    pub fn at(p: DepthPlane, px: i64, py: i64) f32 {
         const dx = (@as(f32, @floatFromInt(px)) + 0.5) - p.x0;
         const dy = (@as(f32, @floatFromInt(py)) + 0.5) - p.y0;
         return (p.z0 + p.gx * dx) + p.gy * dy;
@@ -839,14 +871,14 @@ const DepthPlane = struct {
 
 /// The edge a -> b's function at p, on the 1/256 grid: positive on the
 /// inside of a triangle wound as `draw` leaves it.
-fn edge(a: [2]i64, b: [2]i64, p: [2]i64) i64 {
+pub fn edge(a: [2]i64, b: [2]i64, p: [2]i64) i64 {
     return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
 }
 
 /// Whether a centre with edge function `e` on a -> b counts as covered:
 /// inside, or on the edge where it is a top or a left one (the top-left
 /// rule: a pixel on two triangles' shared edge is drawn once).
-fn inside(e: i64, a: [2]i64, b: [2]i64) bool {
+pub fn inside(e: i64, a: [2]i64, b: [2]i64) bool {
     if (e != 0) return e > 0;
     const dx = b[0] - a[0];
     const dy = b[1] - a[1];
@@ -929,7 +961,7 @@ fn stencilOp(op: u32, v: u32, ref: u32) u32 {
 
 /// Byte `xb` of row `y` of a block-linear surface (`pitch` bytes across,
 /// blocks of 2^gobs GOBs, Turing2D's swizzle: 32-bit texels).
-fn blAddress(pitch: u32, gobs: u3, xb: u32, y: u32) usize {
+pub fn blAddress(pitch: u32, gobs: u3, xb: u32, y: u32) usize {
     const shift: u5 = @as(u5, gobs) + 3;
     const block = (y >> shift) * (pitch / 64) + xb / 64;
     const gob = (y >> 3) & ((@as(u32, 1) << gobs) - 1);

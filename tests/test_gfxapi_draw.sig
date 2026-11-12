@@ -1665,6 +1665,35 @@ test "draw: two triangles sharing an edge, one on the RTX's 3D engine and one on
     }
 }
 
+const HwTest = struct {
+    var over: gpu.nvidia_draw.Over = undefined;
+    var kst: gpu.nvidia_device.kir_sm120.State = .{};
+    var mem: [64 * 1024]u8 = undefined;
+    var model: gpu.draw.Reference = .{ .mem = &mem };
+    var ticks: u64 = 0;
+    fn clock() u64 {
+        ticks += 7;
+        return ticks;
+    }
+    fn say(line: []const u8) void {
+        if (std.mem.indexOf(u8, line, "edges") != null or std.mem.indexOf(u8, line, "FAILED") != null) std.debug.print("[nv] {s}\n", .{line});
+    }
+};
+
+test "draw: the drawtest boot's hardware test on the emulated RTX, step 4 (edges) too: the 3D engine's edges and depth are the compute path's, exactly" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    const gd = Rtx.dev.device();
+    const res = gpu.nvidia_draw.hardwareTest(Rtx.dev.raw.device(), gd, &HwTest.over, &HwTest.kst, &HwTest.model, &HwTest.say, &HwTest.clock);
+    try std.testing.expect(res.started and res.object and res.state and !res.lost);
+    try std.testing.expectEqual(@as(u32, 0), res.failed);
+    try std.testing.expect(!res.edge_skipped);
+    try std.testing.expectEqual(@as(u32, 6), res.edge_scenes);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_cover_apart);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_depth_apart);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_equal_apart);
+}
+
 // ── GALAXY_GL_CHECK: the GPU's work against the CPU's ──────────────────────
 
 var check_mem: [4 << 20]u8 align(64) = undefined;

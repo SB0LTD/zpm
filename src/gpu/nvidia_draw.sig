@@ -13,8 +13,13 @@
 const std = @import("std");
 const nvidia = @import("nvidia");
 const draw = @import("draw.sig");
+const gpu = @import("device.sig");
+const kir = @import("kir.sig");
+const kir_sm120 = @import("kir_sm120.sig");
+const nvidia_gl = @import("nvidia_gl.sig");
 
 const nv = nvidia.draw;
+const model3d = nvidia.emu3d;
 
 pub const Device = nvidia.device.Device;
 pub const Options = nv.Options;
@@ -229,6 +234,16 @@ pub const Hardware = struct {
     mpx_per_s: u32 = 0,
     /// The slowest case's pass, submit to fence (us).
     slowest_us: u64 = 0,
+    /// Step 4 (edges): the scenes drawn, and over them the pixels the 3D
+    /// engine covered otherwise than the compute path's rule, the pixels
+    /// both covered whose depth words differ, and the pixels whose depth
+    /// EQUAL test against the compute path's depths went otherwise.
+    edge_scenes: u32 = 0,
+    edge_cover_apart: u32 = 0,
+    edge_depth_apart: u32 = 0,
+    edge_equal_apart: u32 = 0,
+    /// Step 4 did not get to draw (a program did not compile, no memory).
+    edge_skipped: bool = false,
 };
 
 pub const Clock = *const fn () u64;
@@ -278,8 +293,14 @@ fn word(b: []const u8, px: usize) u32 {
 /// The test on `dev` (a channel the 3D engine's object is on), in `o` (the
 /// caller's storage); `model` is the CPU's reference, with 64 KiB of
 /// memory or more.
-pub fn hardwareTest(dev: Device, o: *Over, work: *nvidia.sm120_asm.Work, model: *draw.Reference, log: draw.Log, now_us: Clock) Hardware {
+/// `kst`: kir_sm120's scratch (WORK_BYTES), the renderer's assembler's
+/// too (kst.asm_work). `gd`: gpu/nvidia_device's adapter over the same
+/// channel with graphics dispatches (Caps.graphics), for step 4 (edges):
+/// it draws as galaxy-gl's GL draws go (gl3d's state, nvidia_gl's
+/// programs); null, step 4 is not run.
+pub fn hardwareTest(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.State, model: *draw.Reference, log: draw.Log, now_us: Clock) Hardware {
     var res: Hardware = .{};
+    const work = &kst.asm_work;
     o.init(dev, work, .{ .stream_bytes = 64 * 1024, .rects = 256, .textures = 31 }) catch |e| {
         hsay(log, "the renderer did not start ({s}): nothing sent", .{@errorName(e)});
         return res;
@@ -385,7 +406,13 @@ pub fn hardwareTest(dev: Device, o: *Over, work: *nvidia.sm120_asm.Work, model: 
         }
     }
 
-    // 4. How fast it fills: a 1024 x 1024 target, an image the same size
+    // 4. The rasterizers side by side (edges), before the fill rate's big
+    // buffers.
+    if (!res.lost) {
+        if (gd) |d| edges(d, kst, log, now_us, &res) else res.edge_skipped = true;
+    }
+
+    // 5. How fast it fills: a 1024 x 1024 target, an image the same size
     // over it once and a half-transparent color 31 times (32 megapixels
     // blended), as draw.selfTest measures it.
     if (!res.lost and res.failed == 0) speed: {
@@ -417,7 +444,276 @@ pub fn hardwareTest(dev: Device, o: *Over, work: *nvidia.sm120_asm.Work, model: 
         hsay(log, "the fill rate: 32 megapixels blended in {d} us, {d} megapixels a second (first pixel {x:0>8})", .{ us, res.mpx_per_s, word(big.cpu, 0) });
     }
     hsay(log, "{d} of {d} cases passed, {d} failed{s}", .{ res.passed, draw.cases.len, res.failed, if (res.lost) "; a pass did not finish" else "" });
+    if (res.edge_scenes != 0) hsay(log, "edges: {d} scenes; against the compute path's rule: {d} pixels covered otherwise, {d} depths apart, {d} depth EQUAL tests otherwise: {s}", .{ res.edge_scenes, res.edge_cover_apart, res.edge_depth_apart, res.edge_equal_apart, if (res.edge_cover_apart + res.edge_depth_apart + res.edge_equal_apart == 0) "the 3D engine IS the model (1/256 grid, top-left rule, depth plane): draws may be split between it and the compute kernels" else "the 3D engine is NOT the model: the lines above say where" });
     return res;
+}
+
+// ── 4. The 3D engine's edges and depth against the compute path's ──────────
+// A frame can mix draws on the 3D engine and on gfxapi's compute raster
+// (draws the engine does not take fall back), so the two must cover each
+// edge's pixels alike and give them the same depth bits. gfxapi's raster
+// and emu3d share one model of the engine (emu3d.windowOf, planeOf,
+// edge/inside, depthWord: the 1/256 grid rounded to nearest even, the
+// top-left rule in the engine's rows, depth as an f32 plane over the
+// pixel centres): tests/test_gfxapi_draw.sig holds the compute kernels to
+// it bit for bit. Here the real engine draws the same scenes as that
+// test: two triangles sharing an edge (through pixel centres, and off any
+// grid coarser than 1/256), corners at different depths, rows up and
+// flipped, added ONE + ONE with depth LESS (written); its target and its
+// depth (S8Z24, block linear) come back and are put beside the model's
+// pixel for pixel, exactly. Then the model's depths go into the depth
+// target and the engine draws the scene again with depth EQUAL (not
+// written): it draws exactly the pixels whose depth it makes the same as
+// the compute path does.
+
+const EW = 64;
+const EH = 32;
+/// The depth target's blocks: 4 GOBs (32 rows), its pitch 256 bytes.
+const E_GOBS: u3 = 2;
+const E_PITCH = EW * 4;
+const E_DEPTH_BYTES = (E_PITCH / 64) * ((EH + 31) / 32) * (512 << E_GOBS);
+/// The quads, in pixels (x right, y the target's rows), and their
+/// corners' clip z.
+const edge_scenes = [_]struct { name: []const u8, pts: [4][2]f32 }{
+    .{ .name = "a 45-degree edge through pixel centres", .pts = .{ .{ 8, 4 }, .{ 32, 4 }, .{ 32, 28 }, .{ 8, 28 } } },
+    .{ .name = "off-grid corners", .pts = .{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } } },
+    .{ .name = "steep, sub-pixel corners", .pts = .{ .{ 40.5, 2.25 }, .{ 61.0078125, 30.0039 }, .{ 12.25, 30.5 }, .{ 3.1, 1.9 } } },
+};
+const edge_z = [4]f32{ -0.3, 0.2117, 0.7, 0.0931 };
+
+/// What the model gives a scene: each pixel's hits (0, 1; 2 would be a
+/// pixel drawn twice) and depth word (0xffffff: none).
+const EdgeModel = struct { hits: [EW * EH]u8 = undefined, z: [EW * EH]u32 = undefined };
+
+const E = struct {
+    var insts: [256]kir.Inst = undefined;
+    var tys: [512]kir.Ty = undefined;
+    var vcode: [16 * 1024]u8 align(16) = undefined;
+    var pcode: [16 * 1024]u8 align(16) = undefined;
+    var m: EdgeModel = .{};
+    var verts: [6][4]f32 = undefined;
+};
+
+/// The scene's six vertices (clip space: the triangles (0, 1, 2) and
+/// (0, 2, 3) of the quad).
+fn edgeVerts(pts: [4][2]f32) [6][4]f32 {
+    var v: [6][4]f32 = undefined;
+    const tris = [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
+    for (tris, 0..) |t, n| {
+        for (t, 0..) |c, j| v[n * 3 + j] = .{ 2 * pts[c][0] / EW - 1, 2 * pts[c][1] / EH - 1, edge_z[c], 1 };
+    }
+    return v;
+}
+
+/// The model's picture of a scene drawn with depth LESS (written) over a
+/// depth of 1, viewport `vp` (scale x, y, offset x, y), depth scale and
+/// offset 0.5 (GL's -1 .. 1 to 0 .. 1).
+fn edgeModel(verts: *const [6][4]f32, vp: [4]f32, m: *EdgeModel) void {
+    @memset(&m.hits, 0);
+    @memset(&m.z, 0xff_ffff);
+    const zs: f32 = 0.5;
+    const zo: f32 = 0.5;
+    for (0..2) |t| {
+        var win: [3][2]i64 = undefined;
+        var zc: [3]f32 = undefined;
+        var w: [3]f32 = undefined;
+        for (0..3) |k| {
+            const v = verts[3 * t + k];
+            win[k] = model3d.windowOf(v[0], v[1], v[3], vp);
+            zc[k] = v[2];
+            w[k] = v[3];
+        }
+        var area = model3d.edge(win[0], win[1], win[2]);
+        if (area == 0) continue;
+        if (area < 0) {
+            std.mem.swap([2]i64, &win[1], &win[2]);
+            std.mem.swap(f32, &zc[1], &zc[2]);
+            std.mem.swap(f32, &w[1], &w[2]);
+            area = -area;
+        }
+        const plane = model3d.planeOf(zc, w, win, zs, zo, area);
+        const a = win[0];
+        const b = win[1];
+        const c = win[2];
+        for (0..EH) |py| for (0..EW) |px| {
+            const p = [2]i64{ @as(i64, @intCast(px)) * 256 + 128, @as(i64, @intCast(py)) * 256 + 128 };
+            if (!model3d.inside(model3d.edge(b, c, p), b, c) or !model3d.inside(model3d.edge(c, a, p), c, a) or !model3d.inside(model3d.edge(a, b, p), a, b)) continue;
+            const z = plane.at(@intCast(px), @intCast(py));
+            if (!model3d.depthInRange(z, -1, 1, zs, zo)) continue;
+            const q = model3d.depthWord(z);
+            const i = py * EW + px;
+            if (q >= m.z[i]) continue;
+            m.z[i] = q;
+            m.hits[i] += 1;
+        };
+    }
+}
+
+/// A pixel's red (0.25 added once a hit) as hits: 0, 1, 2, else 3.
+fn hitsOf(red: u8) u8 {
+    if (red == 0) return 0;
+    if (red >= 62 and red <= 66) return 1;
+    if (red >= 126 and red <= 130) return 2;
+    return 3;
+}
+
+fn edgeVertex(k: *kir.Kernel) void {
+    const io = k.binding();
+    const vb = k.binding();
+    const vid = k.load(.u32, nvidia_gl.ioMem(io, nvidia_gl.VERTEX_ID, false), kir.u(0));
+    const base = k.op2(.imul, .u32, kir.r(vid), kir.u(16));
+    for (0..4) |c| {
+        var m = kir.global(vb, 32);
+        m.imm = @intCast(4 * c);
+        const x = k.load(.f32, m, kir.r(base));
+        k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.POSITION + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.r(x));
+    }
+}
+
+fn edgePixel(k: *kir.Kernel) void {
+    const io = k.binding();
+    _ = k.binding();
+    const color = [4]f32{ 0.25, 0, 0, 0 };
+    for (color, 0..) |x, c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(x));
+}
+
+fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res: *Hardware) void {
+    if (!d.caps.graphics) {
+        hsay(log, "step 4, edges: the device offers no graphics dispatches: not run", .{});
+        res.edge_skipped = true;
+        return;
+    }
+    var vk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "edges_vs", .{ 1, 1, 1 });
+    edgeVertex(&vk);
+    var pk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "edges_ps", .{ 1, 1, 1 });
+    const vbin = blk: {
+        vk.finish() catch |e| break :blk e;
+        st.asm_work.sched = .{};
+        break :blk nvidia_gl.compileStage(&vk, d.caps, st, .vertex, 0, &E.vcode);
+    } catch |e| {
+        hsay(log, "step 4, edges: the vertex program did not compile ({s}): not run", .{@errorName(e)});
+        res.edge_skipped = true;
+        return;
+    };
+    // (the vertex program's KIR is spent: its storage is the pixel's now)
+    pk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "edges_ps", .{ 1, 1, 1 });
+    edgePixel(&pk);
+    const pbin = blk: {
+        pk.finish() catch |e| break :blk e;
+        st.asm_work.sched = .{};
+        break :blk nvidia_gl.compileStage(&pk, d.caps, st, .pixel, 0, &E.pcode);
+    } catch |e| {
+        hsay(log, "step 4, edges: the pixel program did not compile ({s}): not run", .{@errorName(e)});
+        res.edge_skipped = true;
+        return;
+    };
+    const vp = d.load(&vbin) catch |e| {
+        hsay(log, "step 4, edges: the vertex program did not load ({s}): not run", .{@errorName(e)});
+        res.edge_skipped = true;
+        return;
+    };
+    defer d.unload(&vp);
+    const pp = d.load(&pbin) catch |e| {
+        hsay(log, "step 4, edges: the pixel program did not load ({s}): not run", .{@errorName(e)});
+        res.edge_skipped = true;
+        return;
+    };
+    defer d.unload(&pp);
+    const vb = d.alloc(6 * 16, .host) catch return noMemory(log, res);
+    defer d.free(vb);
+    const target = d.alloc(EW * EH * 4, .host) catch return noMemory(log, res);
+    defer d.free(target);
+    const depth = d.alloc(E_DEPTH_BYTES, .host) catch return noMemory(log, res);
+    defer d.free(depth);
+    const add = gpu.GraphicsBlend{ .src_rgb = .one, .dst_rgb = .one, .src_a = .one, .dst_a = .one };
+    for ([_]bool{ false, true }) |flipped| {
+        for (edge_scenes) |sc| {
+            const vpw = [4]f32{ EW / 2, if (flipped) -@as(f32, EH / 2) else EH / 2, EW / 2, if (flipped) @as(f32, EH) - EH / 2 else EH / 2 };
+            E.verts = edgeVerts(sc.pts);
+            @memcpy(vb.cpu[0 .. 6 * 16], std.mem.sliceAsBytes(&E.verts));
+            d.toDevice(vb, 0, 6 * 16);
+            edgeModel(&E.verts, vpw, &E.m);
+            var cover_apart: u32 = 0;
+            var depth_apart: u32 = 0;
+            var equal_apart: u32 = 0;
+            var want: u32 = 0;
+            var drawn: u32 = 0;
+            var listed: u32 = 0;
+            for (0..2) |pass| {
+                // the target cleared; the depth 1 (pass 0) or the model's
+                @memset(target.cpu[0 .. EW * EH * 4], 0);
+                d.toDevice(target, 0, EW * EH * 4);
+                for (0..EH) |y| for (0..EW) |x| {
+                    const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
+                    std.mem.writeInt(u32, depth.cpu[at..][0..4], if (pass == 0) 0xff_ffff else E.m.z[y * EW + x], .little);
+                };
+                d.toDevice(depth, 0, E_DEPTH_BYTES);
+                const g = gpu.Graphics{
+                    .vertex = &vp,
+                    .va = target.gpu,
+                    .width = EW,
+                    .height = EH,
+                    .stride = EW * 4,
+                    .format = .rgba8,
+                    .blend = add,
+                    .scale = .{ vpw[0], vpw[1], 0.5 },
+                    .offset = .{ vpw[2], vpw[3], 0.5 },
+                    .scissor = .{ 0, 0, EW, EH },
+                    .count = 6,
+                    .depth = .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = pass == 0, .func = if (pass == 0) 1 else 2 },
+                };
+                const t0 = now_us();
+                const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {
+                    hsay(log, "step 4, edges, '{s}'{s}: the draw was not sent ({s}): not run", .{ sc.name, if (flipped) " (flipped)" else "", @errorName(e) });
+                    if (e == error.DeviceLost) res.lost = true else res.edge_skipped = true;
+                    return;
+                };
+                d.wait(fence, STEP_US) catch |e| {
+                    hsay(log, "step 4, edges, '{s}'{s}: FAILED: the draw did not finish ({s} after {d} us): nothing after it runs", .{ sc.name, if (flipped) " (flipped)" else "", @errorName(e), now_us() - t0 });
+                    res.lost = true;
+                    return;
+                };
+                d.fromDevice(target, 0, EW * EH * 4);
+                d.fromDevice(depth, 0, E_DEPTH_BYTES);
+                for (0..EH) |y| for (0..EW) |x| {
+                    const i = y * EW + x;
+                    const h = hitsOf(target.cpu[i * 4]);
+                    const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
+                    const z = std.mem.readInt(u32, depth.cpu[at..][0..4], .little) & 0xff_ffff;
+                    const mh = E.m.hits[i];
+                    if (pass == 0) {
+                        want += @intFromBool(mh != 0);
+                        drawn += @intFromBool(h != 0);
+                        const cov = h != mh;
+                        const dep = !cov and mh != 0 and z != E.m.z[i];
+                        cover_apart += @intFromBool(cov);
+                        depth_apart += @intFromBool(dep);
+                        if ((cov or dep) and listed < 3) {
+                            listed += 1;
+                            hsay(log, "step 4, edges, '{s}'{s}: ({d}, {d}): the 3D engine {d} hit(s) depth {x:0>6}, the compute path's {d} depth {x:0>6}", .{ sc.name, if (flipped) " (flipped)" else "", x, y, h, z, mh, E.m.z[i] });
+                        }
+                    } else {
+                        const eq = (h != 0) != (mh != 0);
+                        equal_apart += @intFromBool(eq);
+                        if (eq and listed < 6) {
+                            listed += 1;
+                            hsay(log, "step 4, edges, '{s}'{s}, depth EQUAL against the compute path's depth {x:0>6}: ({d}, {d}) {s}", .{ sc.name, if (flipped) " (flipped)" else "", E.m.z[i], x, y, if (h != 0) "drawn, the compute path's rule has no pixel there" else "NOT drawn: the engine's depth there is not the compute path's" });
+                        }
+                    }
+                };
+            }
+            res.edge_scenes += 1;
+            res.edge_cover_apart += cover_apart;
+            res.edge_depth_apart += depth_apart;
+            res.edge_equal_apart += equal_apart;
+            hsay(log, "step 4, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, {d} depths apart; depth EQUAL against the compute path's depths: {d} pixels otherwise: {s}", .{ sc.name, if (flipped) " (flipped)" else "", drawn, want, cover_apart, depth_apart, equal_apart, if (cover_apart + depth_apart + equal_apart == 0) "EXACT" else "APART" });
+        }
+    }
+}
+
+fn noMemory(log: draw.Log, res: *Hardware) void {
+    hsay(log, "step 4, edges: no memory for its buffers: not run", .{});
+    res.edge_skipped = true;
 }
 
 // ── Tests: the emulated RTX through the interface ───────────────────────────
@@ -431,6 +727,7 @@ const T = struct {
     var engine: nvidia.emu3d.Engine = .{};
     var dev: nvidia.device.EmuDevice = undefined;
     var asm_work: nvidia.sm120_asm.Work = .{};
+    var st: kir_sm120.State = .{};
     var over: Over = undefined;
     var mem: [64 * 1024]u8 = undefined;
     var model: draw.Reference = .{ .mem = &mem };
@@ -504,11 +801,13 @@ test "nvidia_draw: every case's whole target is the reference's, within 2 of 255
 }
 
 test "nvidia_draw: the hardware test, step by step, on the emulated RTX: every case the CPU's" {
-    const res = hardwareTest(T.fresh(), &T.over, &T.asm_work, &T.model, &T.loud, &T.clock);
+    const res = hardwareTest(T.fresh(), null, &T.over, &T.st, &T.model, &T.loud, &T.clock);
     try testing.expect(res.started and res.object and res.state);
     try testing.expectEqual(@as(u32, draw.cases.len), res.passed);
     try testing.expectEqual(@as(u32, 0), res.failed);
     try testing.expect(!res.lost);
+    // (step 4 needs the adapter: tests/test_gfxapi_draw.sig runs it)
+    try testing.expect(res.edge_skipped);
     // (the fill rate's 8 MiB are more than the emulated RTX's arena holds)
     try testing.expectEqual(@as(u32, 0), res.mpx_per_s);
 }
@@ -516,7 +815,7 @@ test "nvidia_draw: the hardware test, step by step, on the emulated RTX: every c
 test "nvidia_draw: the hardware test stops at step 1 when the channel has no 3D engine" {
     T.engine = .{};
     T.dev = .{ .arena = &T.arena, .gpu_view = &T.gpu_view, .work = &T.work };
-    const res = hardwareTest(T.dev.device(), &T.over, &T.asm_work, &T.model, &T.silent, &T.clock);
+    const res = hardwareTest(T.dev.device(), null, &T.over, &T.st, &T.model, &T.silent, &T.clock);
     try testing.expect(res.started and !res.object and !res.state and res.lost);
     try testing.expectEqual(@as(u32, 0), res.passed);
 }
