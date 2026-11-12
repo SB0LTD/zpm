@@ -25,6 +25,8 @@ const vp9r = @import("vp9_read.sig");
 const vav9 = @import("vaapi_vp9.sig");
 const vp8r = @import("vp8_read.sig");
 const hevcp = @import("hevc_parse.sig");
+const av1r = @import("av1_read.sig");
+const vav1 = @import("vaapi_av1.sig");
 const vav8 = @import("vaapi_vp8.sig");
 
 pub const Codec = enum(u32) { h264 = 1, hevc = 2, vp8 = 3, vp9 = 4, av1 = 5, _ };
@@ -66,6 +68,8 @@ pub const Out = struct {
 };
 
 pub const MAX_SURFACES = 24;
+/// An AV1 frame's tile data at most (its OBUs' payloads, gathered).
+pub const AV1_DATA = 4 << 20;
 pub const QUEUE = 8;
 
 pub fn Decoder(comptime D: type) type {
@@ -111,6 +115,11 @@ pub fn Decoder(comptime D: type) type {
         /// HEVC: the reader's state and one picture's VA buffers
         hs: hevcp.State = .{},
         hpic: hevcp.Picture = .{},
+        /// AV1: the reader's state (sequence header, reference slots), the
+        /// frame read, its tile groups' bytes
+        av1: av1r.State = .{},
+        av1_frame: av1r.Frame = .{},
+        av1_buf: [AV1_DATA]u8 = undefined,
         /// pictures decoded, failed
         decoded: u64 = 0,
         errors: u64 = 0,
@@ -119,7 +128,7 @@ pub fn Decoder(comptime D: type) type {
         pub fn init(self: *Self, drv: *D, codec: Codec) Status {
             self.* = .{ .drv = drv, .codec = codec };
             return switch (codec) {
-                .h264, .hevc, .vp8, .vp9 => .ok,
+                .h264, .hevc, .vp8, .vp9, .av1 => .ok,
                 else => .unsupported,
             };
         }
@@ -232,6 +241,7 @@ pub fn Decoder(comptime D: type) type {
                 .vp9 => self.pushVp9(au, pts, duration),
                 .vp8 => self.pushVp8(au, pts, duration),
                 .hevc => self.pushHevc(au, pts, duration),
+                .av1 => self.pushAv1(au, pts, duration),
                 else => .unsupported,
             };
         }
@@ -594,6 +604,128 @@ pub fn Decoder(comptime D: type) type {
             return .failed;
         }
 
+        // ── AV1 ──────────────────────────────────────────────────────────
+
+        fn av1Hold(self: *Self) void {
+            for (0..self.count) |i| {
+                self.held[i] = false;
+                for (self.av1.slots) |s| {
+                    if (s.valid and s.surface == self.surfaces[i]) self.held[i] = true;
+                }
+            }
+        }
+
+        /// One temporal unit: every frame in it decoded (and shown, as its
+        /// header says), or `.full` before any is when output must come first.
+        fn pushAv1(self: *Self, tu: []const u8, pts: i64, duration: i64) Status {
+            if (self.o_len > 0) return .full;
+            // (a dry read for what the unit needs: its first frame's size and
+            // depth, a surface a frame decoded and queue room a frame shown)
+            {
+                var at: usize = 0;
+                var decodes: u32 = 0;
+                var shows: u32 = 0;
+                var probe = self.av1;
+                while (at < tu.len) {
+                    const used = av1r.read(&probe, tu[at..], &self.av1_buf, &self.av1_frame) catch |e| return switch (e) {
+                        error.Unsupported => .unsupported,
+                        else => .bad,
+                    };
+                    if (used == 0) break;
+                    at += used;
+                    const f = &self.av1_frame;
+                    if (f.show_existing) {
+                        shows += 1;
+                        continue;
+                    }
+                    if (self.av1_frame.width == 0) break;
+                    decodes += 1;
+                    if (f.show) shows += 1;
+                    const depth = probe.seq.bit_depth;
+                    if (f.key and (self.count == 0 or f.width != self.width or f.height != self.height or depth != self.depth)) {
+                        if (probe.seq.profile != 0 or (depth != 8 and depth != 10) or probe.seq.mono or !probe.seq.ssx or !probe.seq.ssy) return .unsupported;
+                        if (self.q_len > 0) return .full;
+                        // (film grain: a second surface a frame; DPB 8)
+                        const st = self.setup(va.PROFILE_AV1_PROFILE_0, f.width, f.height, depth, 8 + 4);
+                        if (st != .ok) return st;
+                        self.av1.slots = [_]av1r.Slot{.{}} ** 8;
+                        probe.slots = [_]av1r.Slot{.{}} ** 8;
+                    }
+                    av1r.commit(&probe, f, 0xfffffffe);
+                }
+                if (self.count == 0) return .more;
+                if (self.q_len + shows > QUEUE or self.freeSurfaces() < 2 * decodes) return .full;
+            }
+            var at: usize = 0;
+            while (at < tu.len) {
+                const used = av1r.read(&self.av1, tu[at..], &self.av1_buf, &self.av1_frame) catch return .bad;
+                if (used == 0) break;
+                at += used;
+                const f = &self.av1_frame;
+                if (f.show_existing) {
+                    const s = self.av1.slots[f.existing_slot];
+                    if (!s.valid) return .bad;
+                    self.queueOut(s.surface, pts, duration, s.upscaled_width, s.frame_height);
+                    av1r.commit(&self.av1, f, s.surface);
+                    self.av1Hold();
+                    continue;
+                }
+                if (f.width != self.width or f.height != self.height) return .unsupported; // (scaled references)
+                var target: u32 = 0;
+                var display: u32 = 0;
+                for (0..self.count) |i| {
+                    if (self.held[i] or self.queued[i]) continue;
+                    if (target == 0) {
+                        target = self.surfaces[i];
+                        // (held while decoded: the grained copy must not take it)
+                        self.held[i] = true;
+                    } else if (f.apply_grain and display == 0) {
+                        display = self.surfaces[i];
+                    }
+                }
+                if (target == 0 or (f.apply_grain and display == 0)) return .full;
+                f.pic.current_frame = target;
+                f.pic.current_display_picture = if (f.apply_grain) display else target;
+                const bufs = [_]Buf{
+                    .{ .kind = va.PICTURE_PARAMETER_BUFFER, .size = @sizeOf(vav1.PictureParameterBufferAV1), .data = std.mem.asBytes(&f.pic) },
+                    .{ .kind = va.SLICE_PARAMETER_BUFFER, .size = @sizeOf(vav1.SliceParameterBufferAV1) * f.n_tiles, .data = std.mem.sliceAsBytes(f.tiles[0..f.n_tiles]) },
+                    .{ .kind = va.SLICE_DATA_BUFFER, .size = @intCast(f.data_len), .data = self.av1_buf[0..f.data_len] },
+                };
+                if (!self.decodeBufsCount(target, &bufs, @sizeOf(vav1.SliceParameterBufferAV1), f.n_tiles)) {
+                    self.av1Hold();
+                    self.errors += 1;
+                    return .failed;
+                }
+                self.decoded += 1;
+                av1r.commit(&self.av1, f, target);
+                self.av1Hold();
+                if (f.show) self.queueOut(if (f.apply_grain) display else target, pts, duration, f.width, f.height);
+            }
+            return .ok;
+        }
+
+        /// decodeBufs with the slice parameter buffer as `count` elements
+        /// of `elem` bytes (AV1's tiles).
+        fn decodeBufsCount(self: *Self, target: u32, bufs: []const Buf, elem: u32, count: u32) bool {
+            const d = self.drv;
+            if (d.beginPicture(self.context, target) != va.SUCCESS) return false;
+            var ids: [8]u32 = undefined;
+            var n: usize = 0;
+            defer for (ids[0..n]) |id| {
+                _ = d.destroyBuffer(id);
+            };
+            for (bufs) |b| {
+                const sz: u32 = if (b.kind == va.SLICE_PARAMETER_BUFFER) elem else b.size;
+                const cnt: u32 = if (b.kind == va.SLICE_PARAMETER_BUFFER) count else 1;
+                if (d.createBuffer(b.kind, sz, cnt, b.data.ptr, &ids[n]) != va.SUCCESS) return false;
+                n += 1;
+            }
+            if (d.renderPicture(self.context, ids[0..n]) != va.SUCCESS) return false;
+            const st = d.endPicture(self.context);
+            self.last_status = st;
+            return st == va.SUCCESS;
+        }
+
         fn decodeH264(self: *Self) bool {
             const d = self.drv;
             const p = &self.pic;
@@ -645,6 +777,10 @@ pub fn Decoder(comptime D: type) type {
                     // (decoding restarts at the next key frame)
                     self.vp9_slots = [_]u32{vp9r.INVALID} ** 8;
                     self.vp9Hold();
+                },
+                .av1 => {
+                    self.av1.slots = [_]av1r.Slot{.{}} ** 8;
+                    self.av1Hold();
                 },
                 .vp8 => {
                     self.vp8.last = vp8r.INVALID;

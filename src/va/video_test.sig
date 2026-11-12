@@ -21,6 +21,7 @@ const HIGH = @embedFile("testdata/h264_high.h264");
 const VP9 = @embedFile("testdata/vp9_96x64.ivf");
 const VP8 = @embedFile("testdata/vp8_96x64.ivf");
 const HEVC = @embedFile("testdata/hevc_128x96.hevc");
+const AV1 = @embedFile("testdata/av1_96x64.ivf");
 const vp9r = @import("vp9_read.sig");
 const vp8r = @import("vp8_read.sig");
 var vp9_frames: u32 = 0;
@@ -38,7 +39,9 @@ fn fakeDecode(k: *Fake, sub: Fake.Submit) void {
         const h = push[i];
         const method = h & 0x1fff;
         const count = (h >> 16) & 0x1fff;
-        for (0..count) |j| m[method + j] = push[i + 1 + j];
+        for (0..count) |j| {
+            if (method + j < m.len) m[method + j] = push[i + 1 + j];
+        }
         i += 1 + count;
     }
     if (m[nvdec.SET_DRV_PIC_SETUP_OFFSET >> 2] == 0) return;
@@ -317,5 +320,44 @@ test "video: x265's open-GOP HEVC stream through the decoder: 30 pictures out, e
     try std.testing.expectEqual(@as(u32, 30), shown);
     for (seen) |s| try std.testing.expect(s);
     try std.testing.expectEqual(@as(u64, 30), dec.decoded);
+    try std.testing.expectEqual(@as(u64, 0), dec.errors);
+}
+
+test "video: libaom's AV1 stream (hidden alt-refs, show_existing_frame) through the decoder: 24 frames shown in order" {
+    var k = Fake{ .decoder = fakeDecode };
+    var d: D = .{ .node = .{ .sys = &k } };
+    try std.testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    try std.testing.expectEqual(video.Status.ok, dec.init(&d, .av1));
+    defer dec.deinit();
+    var pos: usize = 32;
+    var n: i64 = 0;
+    var shown: i64 = 0;
+    var buf: [96 * 64 * 3 / 2]u8 = undefined;
+    while (pos + 12 <= AV1.len) {
+        const sz = std.mem.readInt(u32, AV1[pos..][0..4], .little);
+        const tu = AV1[pos + 12 ..][0..sz];
+        pos += 12 + sz;
+        while (true) {
+            const st = dec.push(tu, n * 100, 100);
+            if (st == .full) {
+                const o = dec.next() orelse return error.FullButEmpty;
+                try std.testing.expectEqual(shown * 100, o.pts);
+                try std.testing.expect(dec.read(&buf, 96, .nv12));
+                shown += 1;
+                continue;
+            }
+            try std.testing.expectEqual(video.Status.ok, st);
+            break;
+        }
+        n += 1;
+        while (dec.next()) |o| {
+            try std.testing.expectEqual(shown * 100, o.pts);
+            try std.testing.expect(dec.read(&buf, 96, .nv12));
+            shown += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(i64, 24), n);
+    try std.testing.expectEqual(@as(i64, 24), shown);
     try std.testing.expectEqual(@as(u64, 0), dec.errors);
 }
