@@ -127,6 +127,15 @@ pub const Shape = struct {
     kx: f32,
     ky: f32,
     rad: f32,
+
+    /// The rounded rectangle at (x, y), `w` by `h`, its corners' radius
+    /// at most half its shorter side (gpu/draw.sig's Shape.of).
+    pub fn of(x: f32, y: f32, w: f32, h: f32, radius: f32) Shape {
+        const hw = w / 2;
+        const hh = h / 2;
+        const rad = @min(radius, @min(hw, hh));
+        return .{ .cx = x + hw, .cy = y + hh, .kx = hw - rad, .ky = hh - rad, .rad = rad };
+    }
 };
 
 /// Just under half a step of 255 (gpu/draw.sig's DROP): a glow's color is
