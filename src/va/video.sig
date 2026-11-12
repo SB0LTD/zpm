@@ -21,6 +21,8 @@
 const std = @import("std");
 const va = @import("vaapi.sig");
 const h264 = @import("h264_parse.sig");
+const vp9r = @import("vp9_read.sig");
+const vav9 = @import("vaapi_vp9.sig");
 
 pub const Codec = enum(u32) { h264 = 1, hevc = 2, vp8 = 3, vp9 = 4, av1 = 5, _ };
 
@@ -94,6 +96,11 @@ pub fn Decoder(comptime D: type) type {
         o_len: u32 = 0,
         h: h264.State = .{},
         pic: h264.Picture = .{},
+        /// VP9: the eight reference slots' surfaces (vp9r.INVALID: none)
+        /// and frame sizes, the stream's depth
+        vp9_slots: [8]u32 = [_]u32{vp9r.INVALID} ** 8,
+        vp9_sizes: [8][2]u32 = [_][2]u32{.{ 0, 0 }} ** 8,
+        vp9_depth: u8 = 8,
         /// pictures decoded, failed
         decoded: u64 = 0,
         errors: u64 = 0,
@@ -102,7 +109,7 @@ pub fn Decoder(comptime D: type) type {
         pub fn init(self: *Self, drv: *D, codec: Codec) Status {
             self.* = .{ .drv = drv, .codec = codec };
             return switch (codec) {
-                .h264 => .ok,
+                .h264, .vp9 => .ok,
                 else => .unsupported,
             };
         }
@@ -212,6 +219,7 @@ pub fn Decoder(comptime D: type) type {
         pub fn push(self: *Self, au: []const u8, pts: i64, duration: i64) Status {
             return switch (self.codec) {
                 .h264 => self.pushH264(au, pts, duration),
+                .vp9 => self.pushVp9(au, pts, duration),
                 else => .unsupported,
             };
         }
@@ -283,6 +291,129 @@ pub fn Decoder(comptime D: type) type {
             return .failed;
         }
 
+        // ── VP9 ──────────────────────────────────────────────────────────
+
+        /// The surfaces the eight slots hold are held; the rest free.
+        fn vp9Hold(self: *Self) void {
+            for (0..self.count) |i| {
+                self.held[i] = false;
+                for (self.vp9_slots) |s| {
+                    if (s == self.surfaces[i]) self.held[i] = true;
+                }
+            }
+        }
+
+        fn queueOut(self: *Self, surface: u32, pts: i64, duration: i64, w: u32, hgt: u32) void {
+            const i = self.indexOf(surface) orelse return;
+            self.queued[i] = true;
+            const o = Out{ .surface = surface, .pts = pts, .duration = duration, .visible = .{ 0, 0, w, hgt }, .depth = self.depth };
+            if (self.q_len < QUEUE) {
+                self.queue[(self.q_head + self.q_len) % QUEUE] = o;
+                self.q_len += 1;
+            } else if (self.o_len < MAX_SURFACES) {
+                self.overflow[self.o_len] = o;
+                self.o_len += 1;
+            }
+        }
+
+        fn pushVp9(self: *Self, au: []const u8, pts: i64, duration: i64) Status {
+            if (self.o_len > 0) return .full;
+            const frames = vp9r.Frames.of(au);
+            if (frames.n == 0) return .more;
+            // What the superframe needs: a surface for each frame decoded,
+            // queue room for each shown; else output first.
+            var decodes: u32 = 0;
+            var shows: u32 = 0;
+            {
+                var at: usize = 0;
+                for (frames.sizes[0..frames.n]) |sz| {
+                    var hd: vp9r.Header = .{};
+                    vp9r.parse(au[at..][0..sz], &self.vp9_sizes, self.vp9_depth, &hd) catch |e| return if (e == error.Unsupported) .unsupported else .bad;
+                    at += sz;
+                    if (hd.show_existing) {
+                        shows += 1;
+                        continue;
+                    }
+                    decodes += 1;
+                    if (hd.show_frame) shows += 1;
+                    // a key frame of a new size or depth: new surfaces
+                    if (hd.key and (self.count == 0 or hd.width != self.width or hd.height != self.height or hd.bit_depth != self.depth)) {
+                        if (hd.bit_depth != 8 and hd.bit_depth != 10) return .unsupported;
+                        if (self.q_len > 0) return .full;
+                        self.vp9_slots = [_]u32{vp9r.INVALID} ** 8;
+                        const prof: va.Profile = if (hd.bit_depth == 10) va.PROFILE_VP9_PROFILE_2 else va.PROFILE_VP9_PROFILE_0;
+                        const st = self.setup(prof, hd.width, hd.height, hd.bit_depth, 8);
+                        if (st != .ok) return st;
+                        self.vp9_depth = hd.bit_depth;
+                    }
+                }
+            }
+            if (self.count == 0) return .more; // (no key frame yet)
+            if (self.q_len + shows > QUEUE or self.freeSurfaces() < decodes) return .full;
+            var at: usize = 0;
+            for (frames.sizes[0..frames.n]) |sz| {
+                const frame = au[at..][0..sz];
+                at += sz;
+                var hd: vp9r.Header = .{};
+                vp9r.parse(frame, &self.vp9_sizes, self.vp9_depth, &hd) catch return .bad;
+                if (hd.show_existing) {
+                    const s = self.vp9_slots[hd.existing_idx];
+                    if (s == vp9r.INVALID) return .bad;
+                    const sz2 = self.vp9_sizes[hd.existing_idx];
+                    self.queueOut(s, pts, duration, sz2[0], sz2[1]);
+                    continue;
+                }
+                if (hd.width != self.width or hd.height != self.height) return .unsupported; // (scaled references)
+                // a free surface for it
+                var target: u32 = 0;
+                for (0..self.count) |i| {
+                    if (!self.held[i] and !self.queued[i]) {
+                        target = self.surfaces[i];
+                        break;
+                    }
+                }
+                if (target == 0) return .full;
+                var pp = vp9r.pictureParams(&hd, &self.vp9_slots);
+                var sp = vp9r.sliceParams(@intCast(frame.len));
+                if (!self.decodeOne(target, std.mem.asBytes(&pp), @sizeOf(vav9.PictureParameterBufferVP9), std.mem.asBytes(&sp), @sizeOf(vav9.SliceParameterBufferVP9), frame)) {
+                    self.errors += 1;
+                    return .failed;
+                }
+                self.decoded += 1;
+                for (0..8) |k| {
+                    if (hd.refresh & (@as(u8, 1) << @intCast(k)) != 0) {
+                        self.vp9_slots[k] = target;
+                        self.vp9_sizes[k] = .{ hd.width, hd.height };
+                    }
+                }
+                self.vp9Hold();
+                if (hd.show_frame) self.queueOut(target, pts, duration, hd.width, hd.height);
+            }
+            return .ok;
+        }
+
+        /// One picture of a codec with one picture-parameter, one slice
+        /// parameter and one slice data buffer (VP8, VP9).
+        fn decodeOne(self: *Self, target: u32, pic: []const u8, pic_size: u32, slice: []const u8, slice_size: u32, data: []const u8) bool {
+            const d = self.drv;
+            if (d.beginPicture(self.context, target) != va.SUCCESS) return false;
+            var ids: [3]u32 = undefined;
+            var n: usize = 0;
+            defer for (ids[0..n]) |id| {
+                _ = d.destroyBuffer(id);
+            };
+            if (d.createBuffer(va.PICTURE_PARAMETER_BUFFER, pic_size, 1, pic.ptr, &ids[n]) != va.SUCCESS) return false;
+            n += 1;
+            if (d.createBuffer(va.SLICE_PARAMETER_BUFFER, slice_size, 1, slice.ptr, &ids[n]) != va.SUCCESS) return false;
+            n += 1;
+            if (d.createBuffer(va.SLICE_DATA_BUFFER, @intCast(data.len), 1, data.ptr, &ids[n]) != va.SUCCESS) return false;
+            n += 1;
+            if (d.renderPicture(self.context, ids[0..n]) != va.SUCCESS) return false;
+            const st = d.endPicture(self.context);
+            self.last_status = st;
+            return st == va.SUCCESS;
+        }
+
         fn decodeH264(self: *Self) bool {
             const d = self.drv;
             const p = &self.pic;
@@ -328,6 +459,11 @@ pub fn Decoder(comptime D: type) type {
             self.queued = [_]bool{false} ** MAX_SURFACES;
             switch (self.codec) {
                 .h264 => h264.reset(&self.h, self.cb()),
+                .vp9 => {
+                    // (decoding restarts at the next key frame)
+                    self.vp9_slots = [_]u32{vp9r.INVALID} ** 8;
+                    self.vp9Hold();
+                },
                 else => {},
             }
         }
@@ -345,10 +481,14 @@ pub fn Decoder(comptime D: type) type {
             return self.queue[self.q_head];
         }
 
-        /// Copies the next picture into `dst` (`pitch`: bytes between luma
-        /// rows; its rows `height` of the visible rectangle; chroma as
-        /// `layout` says) and lets it go. Returns false when the copy
-        /// failed (the picture is let go either way).
+        /// Copies the next picture into `dst` and lets it go: the whole
+        /// coded picture (`width` x `height`, the visible rectangle inside
+        /// it as `Out.visible` says), luma rows `pitch` bytes apart, then
+        /// chroma as `layout` says (NV12/P010: interleaved UV rows `pitch`
+        /// apart; YV12: V then U, rows pitch / 2 apart), each plane right
+        /// after the last one's `height` (or `height / 2`) rows, as Media
+        /// Foundation lays out a frame. False when the copy failed (the
+        /// picture is let go either way).
         pub fn read(self: *Self, dst: []u8, pitch: u32, layout: Layout) bool {
             const o = self.next() orelse return false;
             self.q_head = (self.q_head + 1) % QUEUE;
@@ -385,30 +525,28 @@ pub fn Decoder(comptime D: type) type {
             defer _ = d.unmapBuffer(self.image_buf);
             const src: [*]const u8 = @ptrCast(mp orelse return false);
             const sb: u32 = if (o.depth > 8) 2 else 1;
-            const vx = o.visible[0];
-            const vy = o.visible[1];
-            const w = o.visible[2];
-            const h = o.visible[3];
+            const w = self.width;
+            const h = self.height;
             const sp = self.image_pitch;
-            const ch = (h + 1) / 2;
-            const cw = (w + 1) / 2;
+            const ch = h / 2;
             switch (layout) {
                 .nv12, .p010 => {
                     if ((layout == .p010) != (sb == 2)) return false;
                     if (@as(u64, pitch) * (h + ch) > dst.len or pitch < w * sb) return false;
-                    for (0..h) |r| @memcpy(dst[r * pitch ..][0 .. w * sb], src[(vy + r) * sp + vx * sb ..][0 .. w * sb]);
+                    for (0..h) |r| @memcpy(dst[r * pitch ..][0 .. w * sb], src[r * sp ..][0 .. w * sb]);
                     const uv = dst[@as(usize, pitch) * h ..];
-                    for (0..ch) |r| @memcpy(uv[r * pitch ..][0 .. 2 * cw * sb], src[self.image_uv + (vy / 2 + r) * sp + (vx & ~@as(u32, 1)) * sb ..][0 .. 2 * cw * sb]);
+                    for (0..ch) |r| @memcpy(uv[r * pitch ..][0 .. w * sb], src[self.image_uv + r * sp ..][0 .. w * sb]);
                 },
                 .yv12 => {
                     if (sb != 1) return false;
                     const cp = pitch / 2;
+                    const cw = w / 2;
                     if (@as(u64, pitch) * h + 2 * @as(u64, cp) * ch > dst.len or pitch < w) return false;
-                    for (0..h) |r| @memcpy(dst[r * pitch ..][0..w], src[(vy + r) * sp + vx ..][0..w]);
+                    for (0..h) |r| @memcpy(dst[r * pitch ..][0..w], src[r * sp ..][0..w]);
                     const vplane = dst[@as(usize, pitch) * h ..];
                     const uplane = vplane[@as(usize, cp) * ch ..];
                     for (0..ch) |r| {
-                        const row = src[self.image_uv + (vy / 2 + r) * sp + (vx & ~@as(u32, 1)) ..];
+                        const row = src[self.image_uv + r * sp ..];
                         for (0..cw) |c| {
                             uplane[r * cp + c] = row[2 * c];
                             vplane[r * cp + c] = row[2 * c + 1];

@@ -56,6 +56,12 @@
 //!   driver_test.sig  the driver against the fake node's pretend decoder
 //!                    and encoder
 //!   hevc_stream_test.sig  the slice-header parse on x265's real stream
+//!   h264_parse.sig   an H.264 stream read as a VA client reads it: parameter
+//!                    sets, slice headers, POC, the DPB, output order
+//!   video.sig        Decoder: a bitstream in, pictures out (display order),
+//!                    for apps that hold no VA buffers (Galaxy's Windows
+//!                    Media Foundation)
+//!   h264_stream_test.sig, video_test.sig  their tests on x264's streams
 
 pub const vaapi = @import("vaapi.sig");
 pub const nvdec = @import("nvdec.sig");
@@ -78,6 +84,13 @@ pub const enc_av1 = @import("enc_av1.sig");
 pub const enc_import = @import("enc_import.sig");
 pub const convert = @import("convert.sig");
 pub const driver = @import("driver.sig");
+pub const h264_parse = @import("h264_parse.sig");
+pub const video = @import("video.sig");
+/// (the RTX converting pictures for a CPU reader; they import the `gpu` and
+/// `gfxapi` modules, so a build that names them wires those: libgalaxy_va,
+/// galaxy-pe)
+pub const gpu_convert = @import("gpu_convert.sig");
+pub const enc_rgb = @import("enc_rgb.sig");
 
 test {
     _ = vaapi;

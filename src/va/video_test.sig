@@ -18,6 +18,9 @@ const video = @import("video.sig");
 const Fake = node.Fake;
 const D = driver.Driver(*Fake);
 const HIGH = @embedFile("testdata/h264_high.h264");
+const VP9 = @embedFile("testdata/vp9_96x64.ivf");
+const vp9r = @import("vp9_read.sig");
+var vp9_frames: u32 = 0;
 
 fn at(k: *Fake, m: []const u32, method: u32, len: usize) []u8 {
     return k.at(@as(u64, m[method >> 2]) << 8, len).?;
@@ -36,6 +39,11 @@ fn fakeDecode(k: *Fake, sub: Fake.Submit) void {
         i += 1 + count;
     }
     if (m[nvdec.SET_DRV_PIC_SETUP_OFFSET >> 2] == 0) return;
+    // (other codecs: decoded as they come, nothing painted)
+    if (m[nvdec.SET_APPLICATION_ID >> 2] != nvdec.APPLICATION_ID_H264) {
+        vp9_frames += 1;
+        return;
+    }
     const pic = std.mem.bytesToValue(nvdec.H264Pic, at(k, &m, nvdec.SET_DRV_PIC_SETUP_OFFSET, @sizeOf(nvdec.H264Pic)));
     const cur: u32 = pic.current.CurrPicIdx;
     const hgt: u32 = @intCast(pic.FrameHeightInMbs * 16);
@@ -130,4 +138,59 @@ test "video: no decoder in the GPU, no Decoder (the driver refuses at init)" {
     var k = Fake{ .has_decoder = false };
     var d: D = .{ .node = .{ .sys = &k } };
     try std.testing.expect(d.init(3, .{}) != va.SUCCESS);
+}
+
+test "video: libvpx's VP9 stream (IVF) through the decoder: every frame decoded and shown in order" {
+    var k = Fake{ .decoder = fakeDecode };
+    var d: D = .{ .node = .{ .sys = &k } };
+    try std.testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    try std.testing.expectEqual(video.Status.ok, dec.init(&d, .vp9));
+    defer dec.deinit();
+    vp9_frames = 0;
+    var pos: usize = 32;
+    var n: i64 = 0;
+    var shown: i64 = 0;
+    var buf: [96 * 64 * 3 / 2]u8 = undefined;
+    while (pos + 12 <= VP9.len) {
+        const sz = std.mem.readInt(u32, VP9[pos..][0..4], .little);
+        const frame = VP9[pos + 12 ..][0..sz];
+        pos += 12 + sz;
+        while (true) {
+            const st = dec.push(frame, n * 100, 100);
+            if (st == .full) {
+                const o = dec.next() orelse return error.FullButEmpty;
+                try std.testing.expectEqual(shown * 100, o.pts);
+                try std.testing.expect(dec.read(&buf, 96, .nv12));
+                shown += 1;
+                continue;
+            }
+            // (the driver's own parse of both headers agreed with VA's
+            // lengths, or the decode would have failed)
+            try std.testing.expectEqual(video.Status.ok, st);
+            break;
+        }
+        n += 1;
+        while (dec.next()) |o| {
+            try std.testing.expectEqual(shown * 100, o.pts);
+            try std.testing.expectEqual([4]u32{ 0, 0, 96, 64 }, o.visible);
+            try std.testing.expect(dec.read(&buf, 96, .nv12));
+            shown += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(i64, 30), n);
+    try std.testing.expectEqual(@as(i64, 30), shown);
+    try std.testing.expectEqual(@as(u32, 30), vp9_frames);
+    try std.testing.expectEqual(@as(u64, 0), dec.errors);
+}
+
+test "video: a VP9 superframe's index splits it" {
+    // two frames of 3 and 2 bytes, sizes in one byte each: marker 0b110_00_001
+    const sf = [_]u8{ 1, 2, 3, 4, 5, 0xc1, 3, 2, 0xc1 };
+    const f = vp9r.Frames.of(&sf);
+    try std.testing.expectEqual(@as(u32, 2), f.n);
+    try std.testing.expectEqual(@as(u32, 3), f.sizes[0]);
+    try std.testing.expectEqual(@as(u32, 2), f.sizes[1]);
+    const one = vp9r.Frames.of(sf[0..5]);
+    try std.testing.expectEqual(@as(u32, 1), one.n);
 }
