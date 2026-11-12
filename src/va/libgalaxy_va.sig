@@ -31,9 +31,10 @@
 //!   H.264 (Constrained Baseline, Main, High), HEVC Main and AV1 Profile
 //!   0, the config attributes FFmpeg's vaapi_encode asks (rate control
 //!   CQP, CBR, VBR: the driver's HRD-bound controller, enc_rc.sig, or the
-//!   firmware's with GALAXY_VA_NVENC_RC=firmware; packed headers; B
-//!   pictures, 4 L0 and 1 L1 references (AV1: 4 and 3); up to 16 slices,
-//!   one AV1 tile), coded buffers and their segments (CBR's filler),
+//!   firmware's with GALAXY_VA_NVENC_RC=firmware; packed headers; 4 L0
+//!   references, and B pictures with 1 L1 reference (AV1: 3) only with
+//!   GALAXY_VA_NVENC_B=1; up to 16 slices, one AV1 tile), coded buffers
+//!   and their segments (CBR's filler),
 //!   PutImage, surfaces over an app's dma-bufs (NV12 linear or NVIDIA
 //!   block linear, RGB converted on the GPU: enc_rgb.sig), SyncBuffer;
 //!   the input read where it lies, the parameter sets and OBU headers
@@ -44,7 +45,9 @@
 //! methods and nvenc_drv.h's structs (its magic word, ASSUMED 0xcfb70006,
 //! GALAXY_VA_NVENC_MAGIC=hex sets another; the status says BAD_MAGIC when
 //! wrong), the input's block height, the codec type numbers for HEVC, the
-//! ME/MD tuning, and how many bytes the engine says it wrote.
+//! ME/MD tuning, and how many bytes the engine says it wrote. On pc-1111h
+//! (GB206) intra pictures encoded and every inter picture failed; the
+//! inter setup is now NVIDIA's own driver's (nvenc.meControl), unbooted.
 //!
 //! Untested until a boot on the PC — everything that touches the real
 //! decoder: that GB206's NVCFB0 takes Ada's methods and Ada's
@@ -277,7 +280,8 @@ fn options() driver.Options {
 /// default, "tiles"), GALAXY_VA_ENCODE ("0": no
 /// encode entrypoints), GALAXY_VA_NVENC_MAGIC (hex: the encoder setup's
 /// magic word), GALAXY_VA_NVENC_RC ("firmware": the encoder's own rate
-/// control), from an environment block. Values not understood leave the
+/// control), GALAXY_VA_NVENC_B ("1": B pictures on the encoder), from an
+/// environment block. Values not understood leave the
 /// default.
 pub fn optionsOf(block: []const u8) driver.Options {
     var o: driver.Options = .{};
@@ -315,6 +319,9 @@ pub fn optionsOf(block: []const u8) driver.Options {
         } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_MAGIC")) {
             const hex = if (std.mem.startsWith(u8, v, "0x") or std.mem.startsWith(u8, v, "0X")) v[2..] else v;
             o.nvenc_magic = std.fmt.parseInt(u32, hex, 16) catch null;
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_B")) {
+            // ("1": B pictures offered and taken, encode.MAX_REFS)
+            o.nvenc_b_frames = std.mem.eql(u8, v, "1");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_RC")) {
             // ("firmware": the encoder's own CBR/VBR, enc_rc.sig)
             o.nvenc_rc_firmware = std.ascii.eqlIgnoreCase(v, "firmware");
@@ -628,6 +635,10 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expect(!enc.encode);
     try testing.expectEqual(@as(?u32, 0xc9b7_0006), enc.nvenc_magic);
     try testing.expectEqual(@as(?u32, 0xcfb7_0007), optionsOf("GALAXY_VA_NVENC_MAGIC=cfb70007").nvenc_magic);
+    // (B pictures on the encoder: off unless GALAXY_VA_NVENC_B=1)
+    try testing.expect(!none.nvenc_b_frames);
+    try testing.expect(optionsOf("GALAXY_VA_NVENC_B=1").nvenc_b_frames);
+    try testing.expect(!optionsOf("GALAXY_VA_NVENC_B=0").nvenc_b_frames);
     // the decode variants: defaults, the common switch, a codec's own over it
     try testing.expect(none.hevc_blackwell == .full and none.vp9_blackwell == .full and none.av1_blackwell == .full);
     try testing.expect(none.control == .nvk and none.vp9_intra_top and none.vp9_stream_len == .frame);

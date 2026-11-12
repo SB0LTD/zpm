@@ -117,6 +117,10 @@ pub const CODEC_TYPE_AV1: u32 = 10;
 /// GPTIMER_ON (12): the watchdog, its timeout the setup's
 /// gpTimer_timeout_val.
 pub const CONTROL_GPTIMER_ON: u32 = 1 << 12;
+/// FORCE_OUT_PIC (8): the reconstruction written even for a picture that
+/// is not a reference (NVIDIA's own driver sets it on every job: the
+/// SET_CONTROL_PARAMS word 0x12001103 of the Switch's grc, see meControl).
+pub const CONTROL_FORCE_OUT_PIC: u32 = 1 << 8;
 /// RCMODE (31:24), nvenc_drv.h 3.1's list: constant QP; the firmware's
 /// picture-level VBR and CBR (its state in the RC process buffer, used
 /// when (rc_mode & 3) != 0). enc_rc.sig chooses.
@@ -139,6 +143,19 @@ pub const GPTIMER_TIMEOUT: u32 = nvdec.GPTIMER_TIMEOUT;
 
 /// The engine's reference slots: SET_IN_REF_PIC{0..15}_{LUMA,CHROMA}.
 pub const REF_SLOTS = 16;
+
+/// An unused entry of pic_control's l0[]/l1[] (the lists of reference
+/// slots): -2, as NVIDIA's own driver writes it (every unused entry of
+/// grc's IDR and P setups is 0xfe; see meControl for where they come
+/// from). This driver wrote -1 there before, and every inter picture
+/// failed on GB206 (pc-1111h; with the other differences meControl and
+/// the MEPRED buffers name: which of them the firmware minded is not
+/// known).
+pub const LIST_NONE: u8 = 0xfe;
+/// An unused entry of temp_dist_l0[]/l1[] (NVIDIA's driver: -1), and of
+/// dist_scale_factor[][] (-1 as a 16-bit value).
+pub const DIST_NONE: u8 = 0xff;
+pub const SCALE_NONE: u16 = 0xffff;
 
 pub const header = nvdec.header;
 pub const shifted = nvdec.shifted;
@@ -837,28 +854,99 @@ comptime {
     std.debug.assert(Q_CONTROL_OFF + H264Quant.SIZE <= SETUP_BYTES);
 }
 
-/// The ME control every picture uses: quarter-pel refinement, the
-/// spatial (neighbours') and constant (zero) vector hints searched and
-/// refined, every point of the first two stamp shapes, the five hint
-/// types in order (nvenc_drv.h: their bits must cover 0x1f). Tuning, not
-/// syntax: any setting gives a valid stream.
+/// The ME control every picture uses: NVIDIA's own, byte for byte.
+///
+/// Where it is from: no open driver programs NVENC, but NVIDIA's closed
+/// driver's jobs have been captured on hardware. switch-frame-tap
+/// (github.com/TomasUribe/switch-frame-tap, MIT) recorded the Switch's
+/// grc service (NVIDIA's Tegra encoder driver, NVENC 5.0, magic
+/// 0xd0b70006) driving NVENC, and then encoded P frames itself with grc's
+/// P setup (tier4/applet-mitm/source/nvenc_grc_p.h; "M85 Run K: P frames
+/// in the live stream, no drift"; native 1080p P frames in "M92 Run S").
+/// That setup's ME control (at its me_control_offset 0x600) is the bytes
+/// below; nvenc_drv.h's nvenc_h264_me_control_s reads them as:
+/// - qpel refinement, refine_on_search, constant lambda 0.5 (U8.3 4),
+///   fps_mvcost, sps_mvcost, sps_cost_func;
+/// - limit_mv on: x -2048..2047.75, y -512..511.75 (H.264's range);
+/// - hints: spatial (stamp 1, search) and constant zero vector (stamp 2,
+///   search), no temporal, co-located or external hint;
+/// - stamps 0..4: 4, 9, 12, 13 and 20 points (not every point of 8x8);
+/// - mbc_mb_size 110, partDecisionMadeByFPP, spatial_hint_pattern 0xf,
+///   temporal_hint_pattern 0x3f, fbm_op_winner_num_p_frame 1 and _b_frame
+///   l0/l1 1, fbm_select_best_cu32_parttype_num 3,
+///   sps_evaluate_merge_cand_num 5, external/coloc hint order 1;
+/// - hint types 0..4 in order.
+///
+/// This driver's own control before had every one of mbc_mb_size, the FBM
+/// winner counts, the part-decision and merge-candidate counts zero (the
+/// motion search configured to keep no winner), and it failed on every
+/// inter picture on GB206 (pc-1111h: H.264 lost its channel to an NVENC
+/// error, HEVC and AV1 reported ucode errors) while every intra picture,
+/// where the motion search does not run, encoded. HEVC's and AV1's
+/// setups name the same struct (nvenc_me_control_s); these values are
+/// H.264's tuning, valid for them too (the CU8/CU64 decisions left off).
+pub const ME_NVIDIA = [Me.SIZE]u8{
+    0x26, 0x40, 0x07, 0x00, 0x01, 0x40, 0x00, 0x08, 0xff, 0x1f, 0xff, 0x07, 0x00, 0x00, 0x90, 0x28,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xa4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c,
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x1c, 0x1c, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x3e, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x08, 0x3e, 0x7f, 0x3e, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x89, 0x1c, 0x1c, 0x7f,
+    0x1c, 0x1c, 0x08, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6e, 0x04, 0xfe, 0x07, 0x49, 0x56, 0x00, 0x06, 0x00, 0x00, 0x88, 0x46, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+/// The ME control into `me` (Me.SIZE bytes): ME_NVIDIA.
 pub fn meControl(me: []u8) void {
-    @memset(me[0..Me.SIZE], 0);
-    set(me, Me.refinement_mode, 1);
-    set(me, Me.refine_on_search_enable, 1);
-    set(me, Me.spatial_search, 1);
-    set(me, Me.spatial_refine, 1);
-    set(me, Me.spatial_enable, 1);
-    set(me, Me.const_mv_search, 1);
-    set(me, Me.const_mv_refine, 1);
-    set(me, Me.const_mv_enable, 1);
-    for (0..2) |s| {
-        const base = Me.shape0.bit + @as(u32, @intCast(s)) * Me.SHAPE_BITS;
-        set(me, .{ .bit = base, .width = 32 }, 0xffff_ffff);
-        set(me, .{ .bit = base + 32, .width = 32 }, 0xffff_ffff);
-    }
-    const types = [_]F{ Me.hint_type0, Me.hint_type1, Me.hint_type2, Me.hint_type3, Me.hint_type4 };
-    for (types, 0..) |f, i| set(me, f, i);
+    @memcpy(me[0..Me.SIZE], &ME_NVIDIA);
+}
+
+/// The fields of the ME control past the hints (nvenc_h264_me_control_s,
+/// generated as the rest): what ME_NVIDIA's test reads back.
+pub const MeTail = struct {
+    pub const mv_limit_enable: F = .{ .bit = 32, .width = 1 };
+    pub const const_lambda: F = .{ .bit = 3, .width = 11 };
+    pub const mbc_mb_size: F = .{ .bit = 1152, .width = 9 };
+    pub const part_decision_by_fpp: F = .{ .bit = 1162, .width = 1 };
+    pub const spatial_hint_pattern: F = .{ .bit = 1169, .width = 4 };
+    pub const temporal_hint_pattern: F = .{ .bit = 1173, .width = 6 };
+    pub const fbm_op_winner_num_p_frame: F = .{ .bit = 1184, .width = 3 };
+    pub const fbm_op_winner_num_b_frame_l0: F = .{ .bit = 1187, .width = 3 };
+    pub const fbm_op_winner_num_b_frame_l1: F = .{ .bit = 1190, .width = 3 };
+    pub const fbm_select_best_cu32_parttype_num: F = .{ .bit = 1193, .width = 3 };
+    pub const sps_evaluate_merge_cand_num: F = .{ .bit = 1196, .width = 3 };
+};
+
+/// The MEPRED buffers (SET_IN_MEPRED_DATA, SET_OUT_MEPRED_DATA): the
+/// motion search's vectors of one picture, read by the next (nvenc_drv.h:
+/// "vector hints produced by an earlier execute"). NVIDIA's driver binds
+/// both on every inter picture, the two buffers swapping (grc: 128 KiB
+/// each at 720p, 3600 macroblocks, under 37 bytes a macroblock); given
+/// 256 bytes a macroblock here, for HEVC's and AV1's finer blocks.
+pub const MEPRED_BYTES_PER_MB: usize = 256;
+
+/// The history buffer (SET_IOHISTORY) a picture of `wmbs` x `hmbs`
+/// macroblocks needs: NVIDIA's driver gives every macroblock of the
+/// picture and a row more its block (grc: 80 x 46 x HIST_BLOCK_SIZE 192 =
+/// 0xac800 at 720p), not nvenc_drv.h 2.3's one row; this driver gives
+/// 256 bytes a block (H264_HIST_BLOCK_SIZE is 224).
+pub fn historyBytes(wmbs: usize, hmbs: usize) usize {
+    return std.mem.alignForward(usize, wmbs * (hmbs + 1) * 256, 4096);
+}
+
+/// surface_cfg's block_height for a block-linear input of 2^`gobs_log2`
+/// GOBs a block: the number of GOBs. NVIDIA's Tegra driver writes 2 for
+/// 16-row blocks, and NVENC read the input as 16-row blocks then
+/// (switch-frame-tap's Run H: 42-48 dB with 16-row blocks, 9.5 dB or
+/// less with any other reading); the GPU's other classes take log2, and
+/// this driver wrote log2 (1) before. ASSUMED the same on GB206 (its
+/// input_bl_mode 0 is the same "GPU BL").
+pub fn blockHeightField(gobs_log2: u7) u7 {
+    return @as(u7, 1) << @intCast(@min(gobs_log2, 5));
 }
 
 // ── The input picture, block linear ─────────────────────────────────────────
@@ -954,8 +1042,15 @@ pub const PictureAddrs = struct {
     bitstream: u64,
     history: u64,
     rc_process: u64,
+    /// the co-located motion buffers (0: the method left out, as
+    /// nvenc_drv.h allows: the input for B pictures, the output for
+    /// reference pictures)
     coloc_in: u64,
     coloc_out: u64,
+    /// the motion search's vectors in and out (0: left out; NVIDIA's
+    /// driver sends both on every inter picture: MEPRED_BYTES_PER_MB)
+    mepred_in: u64 = 0,
+    mepred_out: u64 = 0,
     /// the input picture's planes (block linear)
     cur_luma: u64,
     cur_chroma: u64,
@@ -997,26 +1092,29 @@ fn put(out: []u32, n: *usize, method: u32, value: u32) void {
 /// One picture's methods into `out`: the encoder bound, the application,
 /// the controls, the setup, the status, the bitstream, the scratch
 /// buffers, the pictures, then EXECUTE (the kernel's fence follows). Only
-/// the references in use are sent (nvenc_drv.h 2.4). Its length.
+/// the references in use are sent (nvenc_drv.h 2.4), and only the motion
+/// buffers given. Its length.
 pub fn push(out: []u32, a: PictureAddrs) usize {
     var n: usize = 0;
     put(out, &n, SET_OBJECT, CLASS | SET_OBJECT_ENGINE_SW);
     put(out, &n, SET_APPLICATION_ID, a.application_id);
-    put(out, &n, SET_CONTROL_PARAMS, a.codec_type | CONTROL_GPTIMER_ON | (a.rc_mode << 24));
+    put(out, &n, SET_CONTROL_PARAMS, a.codec_type | CONTROL_FORCE_OUT_PIC | CONTROL_GPTIMER_ON | (a.rc_mode << 24));
     put(out, &n, SET_PICTURE_INDEX, a.picture_index);
     put(out, &n, SET_IN_DRV_PIC_SETUP, shifted(a.setup));
     put(out, &n, SET_OUT_ENC_STATUS, shifted(a.status));
     put(out, &n, SET_OUT_BITSTREAM, shifted(a.bitstream));
     put(out, &n, SET_IOHISTORY, shifted(a.history));
     put(out, &n, SET_IO_RC_PROCESS, shifted(a.rc_process));
-    put(out, &n, SET_IN_COLOC_DATA, shifted(a.coloc_in));
-    put(out, &n, SET_OUT_COLOC_DATA, shifted(a.coloc_out));
+    if (a.coloc_in != 0) put(out, &n, SET_IN_COLOC_DATA, shifted(a.coloc_in));
+    if (a.coloc_out != 0) put(out, &n, SET_OUT_COLOC_DATA, shifted(a.coloc_out));
     put(out, &n, SET_OUT_REF_PIC_LUMA, shifted(a.out_luma));
     put(out, &n, SET_OUT_REF_PIC_CHROMA, shifted(a.out_chroma));
     put(out, &n, SET_IN_CUR_PIC, shifted(a.cur_luma));
     put(out, &n, SET_IN_CUR_PIC_CHROMA_U, shifted(a.cur_chroma));
     // (semi-planar: V is interleaved with U; the same plane)
     put(out, &n, SET_IN_CUR_PIC_CHROMA_V, shifted(a.cur_chroma));
+    if (a.mepred_in != 0) put(out, &n, SET_IN_MEPRED_DATA, shifted(a.mepred_in));
+    if (a.mepred_out != 0) put(out, &n, SET_OUT_MEPRED_DATA, shifted(a.mepred_out));
     for (0..REF_SLOTS) |i| {
         if (a.ref_luma[i] == 0) continue;
         const k: u32 = @intCast(i);
@@ -1180,7 +1278,7 @@ test "nvenc: a picture's pushbuffer, word by word" {
     const want = [_]u32{
         0x2001_0000, 0x001f_cfb7, // SET_OBJECT
         0x2001_0080, 1, // SET_APPLICATION_ID H264
-        0x2001_01c0, 3 | (1 << 12), // SET_CONTROL_PARAMS
+        0x2001_01c0, 3 | (1 << 8) | (1 << 12), // SET_CONTROL_PARAMS: FORCE_OUT_PIC, GPTIMER_ON
         0x2001_01c1, 9, // SET_PICTURE_INDEX
         0x2001_01c4, 0x100_0008, // SET_IN_DRV_PIC_SETUP
         0x2001_01c6, 0x200_0001, // SET_OUT_ENC_STATUS
@@ -1192,4 +1290,68 @@ test "nvenc: a picture's pushbuffer, word by word" {
     try testing.expectEqual(@as(u32, 0x500_0000), out[33]);
     try testing.expectEqual(header(0, SET_IN_REF_PIC0_CHROMA + 12, 1), out[34]);
     try testing.expectEqual(@as(u32, 0x2001_00c0), out[36]);
+
+    // an inter picture as NVIDIA's driver sends it: the MEPRED buffers in
+    // and out, no co-located motion (a P picture that is not a reference
+    // here): two methods in, two out
+    a.coloc_in = 0;
+    a.coloc_out = 0;
+    a.mepred_in = 0x1_0050_0000;
+    a.mepred_out = 0x1_0060_0000;
+    const m = push(&out, a);
+    try testing.expectEqual(@as(usize, 2 * 19), m);
+    var saw_in = false;
+    var saw_out = false;
+    var k: usize = 0;
+    while (k < m) : (k += 2) {
+        try testing.expect(out[k] != header(0, SET_IN_COLOC_DATA, 1) and out[k] != header(0, SET_OUT_COLOC_DATA, 1));
+        if (out[k] == header(0, SET_IN_MEPRED_DATA, 1)) {
+            try testing.expectEqual(@as(u32, 0x100_5000), out[k + 1]);
+            saw_in = true;
+        }
+        if (out[k] == header(0, SET_OUT_MEPRED_DATA, 1)) {
+            try testing.expectEqual(@as(u32, 0x100_6000), out[k + 1]);
+            saw_out = true;
+        }
+    }
+    try testing.expect(saw_in and saw_out);
+}
+
+test "nvenc: the ME control is NVIDIA's: winners kept, its cache, its hints" {
+    var me = [_]u8{0} ** (Me.SIZE + 8);
+    meControl(&me);
+    try testing.expectEqualSlices(u8, &ME_NVIDIA, me[0..Me.SIZE]);
+    // (nvenc_drv.h's fields, read back where gcc puts them)
+    try testing.expectEqual(@as(u64, 1), get(&me, Me.refinement_mode));
+    try testing.expectEqual(@as(u64, 1), get(&me, Me.lambda_mode));
+    try testing.expectEqual(@as(u64, 4), get(&me, MeTail.const_lambda));
+    try testing.expectEqual(@as(u64, 1), get(&me, MeTail.mv_limit_enable));
+    try testing.expectEqual(@as(u64, 1), get(&me, Me.spatial_enable));
+    try testing.expectEqual(@as(u64, 1), get(&me, Me.spatial_search));
+    try testing.expectEqual(@as(u64, 0), get(&me, Me.temporal_enable));
+    try testing.expectEqual(@as(u64, 1), get(&me, Me.const_mv_enable));
+    try testing.expectEqual(@as(u64, 110), get(&me, MeTail.mbc_mb_size));
+    try testing.expectEqual(@as(u64, 1), get(&me, MeTail.part_decision_by_fpp));
+    try testing.expectEqual(@as(u64, 0xf), get(&me, MeTail.spatial_hint_pattern));
+    try testing.expectEqual(@as(u64, 0x3f), get(&me, MeTail.temporal_hint_pattern));
+    try testing.expectEqual(@as(u64, 1), get(&me, MeTail.fbm_op_winner_num_p_frame));
+    try testing.expectEqual(@as(u64, 1), get(&me, MeTail.fbm_op_winner_num_b_frame_l0));
+    try testing.expectEqual(@as(u64, 1), get(&me, MeTail.fbm_op_winner_num_b_frame_l1));
+    try testing.expectEqual(@as(u64, 3), get(&me, MeTail.fbm_select_best_cu32_parttype_num));
+    try testing.expectEqual(@as(u64, 5), get(&me, MeTail.sps_evaluate_merge_cand_num));
+    const types = [_]F{ Me.hint_type0, Me.hint_type1, Me.hint_type2, Me.hint_type3, Me.hint_type4 };
+    for (types, 0..) |f, i| try testing.expectEqual(@as(u64, i), get(&me, f));
+    // stamp 0: the 4 points around the predictor
+    try testing.expectEqual(@as(u64, 0x0c0c_0000), get(&me, Me.shape0));
+    // (nothing past the struct)
+    try testing.expectEqualSlices(u8, &[_]u8{0} ** 8, me[Me.SIZE..]);
+}
+
+test "nvenc: the history covers the picture, the input's block height counts GOBs" {
+    // grc's 720p history: 80 x 46 blocks of 192; this driver's 256
+    try testing.expect(historyBytes(80, 45) >= 0xac800);
+    try testing.expectEqual(@as(usize, 0), historyBytes(120, 68) % 4096);
+    try testing.expectEqual(@as(u7, 2), blockHeightField(1));
+    try testing.expectEqual(@as(u7, 1), blockHeightField(0));
+    try testing.expectEqual(@as(u7, 16), blockHeightField(4));
 }

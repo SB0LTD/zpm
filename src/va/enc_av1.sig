@@ -582,7 +582,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     }
     nvenc.set(buf, A.refpic_cfg_tiled_16x16, 1);
     nvenc.set(buf, A.outputpic_cfg_tiled_16x16, 1);
-    nvenc.set(buf, A.input_cfg_block_height, s.input.block_height);
+    nvenc.set(buf, A.input_cfg_block_height, nvenc.blockHeightField(s.input.block_height));
     // seqhdr_data: CUs 16 to 64 (the engine's range), 8-bit 4:2:0
     nvenc.set(buf, A.min_cu_size, 1);
     nvenc.set(buf, A.max_cu_size, 3);
@@ -641,12 +641,16 @@ pub fn setup(buf: []u8, s: Setup) void {
     enc_rc.constQp(buf, enc_rc.RcFields.of(A), f.qindex, s.framerate, s.gop_length);
     // pic_control: the lists, by reference name through ref_frame_idx to
     // the slot; poc_entry the name's index (LAST 0 .. ALTREF 6)
+    // (unused: the lists -2 and the distances -1, as NVIDIA's driver
+    // writes H.264's; nvenc.LIST_NONE)
     for (0..4) |k| {
-        nvenc.set(buf, nvenc.at(A.l0, @intCast(k)), 0xff);
+        nvenc.set(buf, nvenc.at(A.l0, @intCast(k)), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(A.temp_dist_l0, @intCast(k)), nvenc.DIST_NONE);
         nvenc.set(buf, nvenc.at(A.poc_entry_l0, @intCast(k)), 0xff);
     }
     for (0..3) |k| {
-        nvenc.set(buf, nvenc.at(A.l1, @intCast(k)), 0xff);
+        nvenc.set(buf, nvenc.at(A.l1, @intCast(k)), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(A.temp_dist_l1, @intCast(k)), nvenc.DIST_NONE);
         nvenc.set(buf, nvenc.at(A.poc_entry_l1, @intCast(k)), 0xff);
     }
     var counts = [2]usize{ 0, 0 };

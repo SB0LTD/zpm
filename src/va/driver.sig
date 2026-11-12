@@ -227,6 +227,9 @@ pub const Options = struct {
     encode: bool = true,
     /// GALAXY_VA_NVENC_MAGIC: the encoder setup's magic word (nvenc.MAGIC)
     nvenc_magic: ?u32 = null,
+    /// GALAXY_VA_NVENC_B=1: B pictures offered (EncMaxRefFrames' L1) and
+    /// taken on NVENC; off, I and P only (encode.MAX_REFS)
+    nvenc_b_frames: bool = false,
     /// GALAXY_VA_NVENC_RC=firmware: the encoder firmware's own rate
     /// control for CBR and VBR (enc_rc.sig), not the driver's
     nvenc_rc_firmware: bool = false,
@@ -586,6 +589,12 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             if (!supported(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
             if (ep == ve.ENTRYPOINT_ENC_SLICE and d.encodes(profile)) {
                 for (attribs) |*a| a.value = encodeAttribute(profile, a.type);
+                // (B pictures on NVENC only when asked for: encode.MAX_REFS)
+                if (d.opts.nvenc_b_frames and encode.supported(profile) != null) {
+                    for (attribs) |*a| if (a.type == ve.ATTRIB_ENC_MAX_REF_FRAMES) {
+                        a.value = encode.maxRefs(profile, true);
+                    };
+                }
                 return va.SUCCESS;
             }
             if (ep != va.ENTRYPOINT_VLD) return va.ERROR_UNSUPPORTED_ENTRYPOINT;
@@ -1166,6 +1175,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             };
             d.contexts[i].enc = encode.State.init(kind, cfg.profile, width, height, cfg.rc_mode, cfg.packed_headers);
             d.contexts[i].enc.firmware_rc = d.opts.nvenc_rc_firmware;
+            d.contexts[i].enc.b_frames = d.opts.nvenc_b_frames;
             out.* = CONTEXT_BASE + @as(u32, i);
             d.debug("{s} encode context {d}x{d}: rate control {x}, packed headers {x}", .{ @tagName(kind), width, height, cfg.rc_mode, cfg.packed_headers });
             return va.SUCCESS;

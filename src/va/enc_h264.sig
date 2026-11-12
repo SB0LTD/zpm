@@ -288,9 +288,9 @@ pub const Setup = struct {
     magic: u32 = nvenc.MAGIC,
 };
 
-/// The block height of the input picture's blocks, as surface_cfg's
-/// block_height takes it: ASSUMED log2 of GOBs per block (the GPU's own
-/// BLOCK_HEIGHT field's meaning; tiling.sig's blocks are 2 GOBs).
+/// The block height of the input picture's blocks: log2 of GOBs per
+/// block (tiling.sig's blocks are 2 GOBs); surface_cfg's block_height
+/// takes nvenc.blockHeightField of it.
 pub const INPUT_BLOCK_HEIGHT: u7 = tiling.BLOCK_GOBS_LOG2;
 
 /// pic_type: 0 P, 1 B, 2 I, 3 IDR.
@@ -350,7 +350,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     // decoder setup leaves its offsets 0)
     nvenc.set(buf, H.refpic_cfg_tiled_16x16, 1);
     nvenc.set(buf, H.outputpic_cfg_tiled_16x16, 1);
-    nvenc.set(buf, H.input_cfg_block_height, s.input.block_height);
+    nvenc.set(buf, H.input_cfg_block_height, nvenc.blockHeightField(s.input.block_height));
     // sps_data, pps_data: what the parameter sets say
     nvenc.set(buf, H.profile_idc, profileIdc(s.profile));
     nvenc.set(buf, H.level_idc, seq.level_idc);
@@ -376,12 +376,17 @@ pub fn setup(buf: []u8, s: Setup) void {
     // instead when it runs it)
     enc_rc.constQp(buf, enc_rc.RcFields.of(H), s.qp, s.framerate, s.gop_length);
     // pic_control: the lists, the slice header's values, the controls
+    // (unused entries as NVIDIA's driver leaves them: lists -2,
+    // distances -1, scale factors -1; nvenc.LIST_NONE)
     const cur_poc = pic.CurrPic.TopFieldOrderCnt;
     for (0..8) |k| {
         const kk: u32 = @intCast(k);
-        nvenc.set(buf, nvenc.at(H.l0, kk), 0xff);
-        nvenc.set(buf, nvenc.at(H.l1, kk), 0xff);
+        nvenc.set(buf, nvenc.at(H.l0, kk), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(H.l1, kk), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(H.temp_dist_l0, kk), nvenc.DIST_NONE);
+        nvenc.set(buf, nvenc.at(H.temp_dist_l1, kk), nvenc.DIST_NONE);
     }
+    for (0..64) |k| nvenc.set(buf, nvenc.at(H.dist_scale_factor, @intCast(k)), nvenc.SCALE_NONE);
     var poc0 = [_]i32{0} ** LIST;
     var poc1 = [_]i32{0} ** LIST;
     const lists = [2][]const u32{ first.list(0), if (first.slice_type == 1) first.list(1) else &.{} };
@@ -401,7 +406,14 @@ pub fn setup(buf: []u8, s: Setup) void {
             }
         }
     }
-    // temporal direct's scale factors, [refidx1][refidx0] (8.4.1.2.3)
+    // temporal direct's scale factors, [refidx1][refidx0] (8.4.1.2.3); a
+    // P picture's as NVIDIA's driver writes them: 256 (1.0) for each L0
+    // entry in use, in every row
+    if (first.slice_type == 0) {
+        for (0..8) |r1| {
+            for (lists[0], 0..) |_, r0| nvenc.setSigned(buf, nvenc.at(H.dist_scale_factor, @intCast(r1 * 8 + r0)), 256);
+        }
+    }
     if (first.slice_type == 1) {
         var zero: u64 = 0;
         for (lists[1], 0..) |_, r1| {
@@ -583,7 +595,16 @@ test "enc_h264: the setup from VA's parameters" {
     try testing.expectEqual(@as(u64, 0x1e), nvenc.get(&buf, H.chroma_qp_index_offset)); // -2
     try testing.expectEqual(@as(u64, 30), nvenc.get(&buf, H.rc_qp_p));
     try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, nvenc.at(H.l0, 0)));
-    try testing.expectEqual(@as(u64, 0xff), nvenc.get(&buf, nvenc.at(H.l0, 1)));
+    // (unused entries as NVIDIA's driver writes them: -2, distances -1;
+    // a P picture's scale factors 256 for its L0 entry, -1 elsewhere)
+    try testing.expectEqual(@as(u64, nvenc.LIST_NONE), nvenc.get(&buf, nvenc.at(H.l0, 1)));
+    try testing.expectEqual(@as(u64, nvenc.LIST_NONE), nvenc.get(&buf, nvenc.at(H.l1, 0)));
+    try testing.expectEqual(@as(u64, nvenc.DIST_NONE), nvenc.get(&buf, nvenc.at(H.temp_dist_l0, 1)));
+    try testing.expectEqual(@as(u64, 256), nvenc.get(&buf, nvenc.at(H.dist_scale_factor, 0)));
+    try testing.expectEqual(@as(u64, 256), nvenc.get(&buf, nvenc.at(H.dist_scale_factor, 7 * 8)));
+    try testing.expectEqual(@as(u64, nvenc.SCALE_NONE), nvenc.get(&buf, nvenc.at(H.dist_scale_factor, 1)));
+    // the input's 16-row blocks: 2 GOBs
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&buf, H.input_cfg_block_height));
     try testing.expectEqual(@as(u64, 2), nvenc.get(&buf, nvenc.at(H.temp_dist_l0, 0)));
     try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.frame_num));
     try testing.expectEqual(@as(u64, 2), nvenc.get(&buf, H.pic_order_cnt_lsb));

@@ -60,11 +60,26 @@ pub const RC_MODES: u32 = ve.RC_CQP | ve.RC_CBR | ve.RC_VBR;
 /// its SEI and other NAL units (misc, raw). Not slices: the engine writes
 /// its slice headers.
 pub const PACKED_HEADERS: u32 = ve.PACKED_HEADER_SEQUENCE | ve.PACKED_HEADER_MISC | ve.PACKED_HEADER_RAW_DATA;
-/// EncMaxRefFrames: L0 in the low 16 bits, L1 in the high 16.
-pub const MAX_REFS: u32 = h264.MAX_L0 | (h264.MAX_L1 << 16);
+/// EncMaxRefFrames: L0 in the low 16 bits, L1 in the high 16. No L1 (no
+/// B pictures) unless GALAXY_VA_NVENC_B=1 asks: the engine's B pictures
+/// (direct modes, the co-located motion, two lists) have never encoded
+/// on hardware, and an app offered L1 sends them (FFmpeg's default is two
+/// B pictures between anchors); offered none, it sends I and P pictures.
+pub const MAX_REFS: u32 = h264.MAX_L0;
+pub const MAX_REFS_AV1: u32 = av1.MAX_L0;
 /// (the old name: L0's count)
 pub const MAX_REFS_L0: u32 = h264.MAX_L0;
-pub const MAX_REFS_AV1: u32 = av1.MAX_L0 | (av1.MAX_L1 << 16);
+/// GALAXY_VA_NVENC_B=1: L1 too.
+pub const MAX_REFS_B: u32 = h264.MAX_L0 | (h264.MAX_L1 << 16);
+pub const MAX_REFS_AV1_B: u32 = av1.MAX_L0 | (av1.MAX_L1 << 16);
+
+/// EncMaxRefFrames for `profile` (one of `supported`'s), with or without
+/// B pictures.
+pub fn maxRefs(profile: va.Profile, b_frames: bool) u32 {
+    const kind = supported(profile) orelse return 0;
+    if (kind == .av1) return if (b_frames) MAX_REFS_AV1_B else MAX_REFS_AV1;
+    return if (b_frames) MAX_REFS_B else MAX_REFS;
+}
 
 /// The packed headers a codec takes.
 pub fn packedHeaders(kind: Codec) u32 {
@@ -133,6 +148,10 @@ pub const State = struct {
     /// GALAXY_VA_NVENC_RC=firmware: the engine's own rate control
     firmware_rc: bool = false,
     firmware_rc_started: bool = false,
+    /// GALAXY_VA_NVENC_B=1: B pictures taken (else refused: MAX_REFS)
+    b_frames: bool = false,
+    /// which MEPRED buffer the next inter picture writes (they swap)
+    mepred_flip: u1 = 0,
     // ── the sequence (kept across pictures) ──
     have_seq: bool = false,
     h264_seq: h264.Seq = undefined,
@@ -430,6 +449,10 @@ pub const Scratch = struct {
     pub fn coloc(s: Scratch, k: usize) u64 {
         return s.base + s.sizes.coloc_off + k * s.sizes.coloc;
     }
+    /// MEPRED buffer `k` (0, 1)
+    pub fn mepred(s: Scratch, k: usize) u64 {
+        return s.base + s.sizes.mepred_off + k * s.sizes.mepred;
+    }
     /// AV1: kept surface `k`'s CDFs (KEPT: the discard table)
     pub fn cdf(s: Scratch, k: usize) u64 {
         return s.base + s.sizes.cdf_off + k * av1.CDF_BYTES;
@@ -502,6 +525,8 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
         .av1 => va.SUCCESS,
     };
     if (sl_ok != va.SUCCESS) return sl_ok;
+    // (B pictures only when asked for: MAX_REFS)
+    if (picType(st) == .b and !st.b_frames) return va.ERROR_INVALID_PARAMETER;
     if (st.kind == .av1) return endAv1(st, in, out);
     const recon_id = reconSurface(st);
     const recon = in.lookup.surface(recon_id) orelse return va.ERROR_INVALID_SURFACE;
@@ -592,10 +617,29 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
         .av1 => unreachable,
     };
     const in_k = st.kept.find(col_id) orelse out_k;
-    a.coloc_out = in.scratch.coloc(out_k);
-    a.coloc_in = in.scratch.coloc(in_k);
-    for ([_]u64{ a.setup, a.status, a.bitstream, a.history, a.rc_process, a.coloc_in, a.coloc_out, a.cur_luma, a.cur_chroma, a.out_luma, a.out_chroma }) |x| {
+    // the co-located motion as nvenc_drv.h 3.x says (and NVIDIA's driver
+    // does: neither on its I and P pictures): written by a reference
+    // picture, read by a B picture (H.264) or by a picture whose slices
+    // use HEVC's temporal motion vector prediction
+    const t0 = picType(st);
+    const is_ref = switch (st.kind) {
+        .h264 => st.h264_pic.pic_fields.reference_pic_flag != 0,
+        .hevc => st.hevc_pic.pic_fields.reference_pic_flag != 0,
+        .av1 => unreachable,
+    };
+    const reads_col = switch (st.kind) {
+        .h264 => t0 == .b,
+        .hevc => t0 != .i and st.hevc_slices[0].temporal_mvp,
+        .av1 => unreachable,
+    };
+    a.coloc_out = if (is_ref) in.scratch.coloc(out_k) else 0;
+    a.coloc_in = if (reads_col) in.scratch.coloc(in_k) else 0;
+    if (t0 != .i) motionBuffers(st, in.scratch, &a);
+    for ([_]u64{ a.setup, a.status, a.bitstream, a.history, a.rc_process, a.cur_luma, a.cur_chroma, a.out_luma, a.out_chroma }) |x| {
         if (!nvenc.addressable(x)) return va.ERROR_INVALID_SURFACE;
+    }
+    for ([_]u64{ a.coloc_in, a.coloc_out, a.mepred_in, a.mepred_out }) |x| {
+        if (x != 0 and !nvenc.addressable(x)) return va.ERROR_INVALID_SURFACE;
     }
 
     const room: u32 = @intCast(@min(in.coded.len - DATA_OFF, std.math.maxInt(u32)));
@@ -778,7 +822,15 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         const src = pic.reference_frames[frame.ref_frame_idx[frame.primary_ref_frame]];
         if (st.kept.find(src)) |k| prob_in = in.scratch.cdf(k);
     }
-    a.coloc_in = in.scratch.coloc(out_k);
+    // the co-located motion: this picture's own entry out; in, LAST's
+    // (the first reference's) on an inter picture, else its own (as the
+    // key frames that encoded on GB206 had it)
+    var col_k = out_k;
+    if (!frame.intra()) {
+        if (st.kept.find(pic.reference_frames[frame.ref_frame_idx[0]])) |k| col_k = k;
+        motionBuffers(st, in.scratch, &a);
+    }
+    a.coloc_in = in.scratch.coloc(col_k);
     a.coloc_out = in.scratch.coloc(out_k);
     a.av1 = .{
         .prob_in = prob_in,
@@ -793,6 +845,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
     for ([_]u64{ a.setup, a.status, a.bitstream, a.history, a.rc_process, a.coloc_in, a.cur_luma, a.cur_chroma, a.out_luma, a.out_chroma, a.av1.?.prob_in, a.av1.?.lr_left }) |x| {
         if (!nvenc.addressable(x)) return va.ERROR_INVALID_SURFACE;
     }
+    if (a.mepred_in != 0 and !nvenc.addressable(a.mepred_out)) return va.ERROR_INVALID_SURFACE;
     const room: u32 = @intCast(@min(in.coded.len - DATA_OFF, std.math.maxInt(u32)));
     av1.setup(in.setup, .{
         .frame = frame,
@@ -844,6 +897,16 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
     out.done = done;
     st.pictures += 1;
     return va.SUCCESS;
+}
+
+/// An inter picture's MEPRED buffers, as NVIDIA's driver binds them: the
+/// one the last inter picture wrote in, the other out; they swap.
+fn motionBuffers(st: *State, scratch: Scratch, a: *nvenc.PictureAddrs) void {
+    if (scratch.sizes.mepred == 0) return;
+    const w = st.mepred_flip;
+    a.mepred_out = scratch.mepred(w);
+    a.mepred_in = scratch.mepred(w ^ 1);
+    st.mepred_flip = w ^ 1;
 }
 
 /// AV1's picture done (`n` bytes so far: the OBUs and the tile data): the
@@ -961,10 +1024,11 @@ pub fn emptySegment(coded: []u8) void {
     @memcpy(coded[SEGMENT_OFF..][0..@sizeOf(ve.CodedBufferSegment)], std.mem.asBytes(&seg));
 }
 
-/// The context's scratch: history (nvenc_drv.h 2.3: at least
-/// ((width + 15) / 16 + 16) * 128 bytes; HEVC's per 64-pixel CTB, given
-/// room), KEPT co-located buffers (64 bytes a macroblock), the rate
-/// control's state.
+/// The context's scratch: history (a block for every macroblock of the
+/// picture and a row more, as NVIDIA's driver gives it:
+/// nvenc.historyBytes; AV1's own sizing when that is more), KEPT
+/// co-located buffers (64 bytes a macroblock), the rate control's state,
+/// the two MEPRED buffers (nvenc.MEPRED_BYTES_PER_MB).
 pub const ScratchSizes = struct {
     history: usize,
     history_off: usize = 0,
@@ -972,6 +1036,8 @@ pub const ScratchSizes = struct {
     coloc_off: usize,
     rc: usize,
     rc_off: usize,
+    mepred: usize = 0,
+    mepred_off: usize = 0,
     /// AV1: KEPT + 1 CDF tables (the last a discard), the four default
     /// tables, the line buffers
     cdf_off: usize = 0,
@@ -989,12 +1055,14 @@ pub fn scratchSizesFor(kind: Codec, width: u32, height: u32) ScratchSizes {
     const wmbs: usize = (width + 15) / 16;
     const hmbs: usize = (height + 15) / 16;
     const lines = av1.Lines.of(width, height);
-    const history = if (kind == .av1) lines.history else std.mem.alignForward(usize, (wmbs + 16) * 1024, 4096);
+    const history = if (kind == .av1) @max(lines.history, nvenc.historyBytes(wmbs, hmbs)) else nvenc.historyBytes(wmbs, hmbs);
     const coloc = std.mem.alignForward(usize, wmbs * hmbs * 64, 4096);
     const rc: usize = 4096;
     const coloc_off = history;
     const rc_off = coloc_off + KEPT * coloc;
-    var s = ScratchSizes{ .history = history, .coloc = coloc, .coloc_off = coloc_off, .rc = rc, .rc_off = rc_off, .total = rc_off + rc };
+    const mepred = std.mem.alignForward(usize, wmbs * hmbs * nvenc.MEPRED_BYTES_PER_MB, 4096);
+    const mepred_off = rc_off + rc;
+    var s = ScratchSizes{ .history = history, .coloc = coloc, .coloc_off = coloc_off, .rc = rc, .rc_off = rc_off, .mepred = mepred, .mepred_off = mepred_off, .total = mepred_off + 2 * mepred };
     if (kind == .av1) {
         s.cdf_off = s.total;
         s.defaults_off = s.cdf_off + (KEPT + 1) * av1.CDF_BYTES;
@@ -1070,6 +1138,48 @@ test "encode: a finished picture's segment, and CBR's filler" {
     try testing.expectEqual(@as(usize, 12), n);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 0x0c, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80 }, s[4..16]);
     try testing.expectEqual(@as(usize, 0), filler(&s, 30, 12, .hevc));
+}
+
+var b_coded: [DATA_OFF + HEADER_BYTES + 8192]u8 = undefined;
+
+test "encode: no B pictures unless asked for (GALAXY_VA_NVENC_B=1): no L1 offered, a B picture refused" {
+    try testing.expectEqual(@as(u32, h264.MAX_L0), maxRefs(va.PROFILE_H264_HIGH, false));
+    try testing.expectEqual(@as(u32, h264.MAX_L0 | (h264.MAX_L1 << 16)), maxRefs(va.PROFILE_H264_HIGH, true));
+    try testing.expectEqual(@as(u32, av1.MAX_L0), maxRefs(av1.PROFILE, false));
+    try testing.expectEqual(@as(u32, av1.MAX_L0 | (av1.MAX_L1 << 16)), maxRefs(av1.PROFILE, true));
+    var st = State.init(.h264, va.PROFILE_H264_MAIN, 48, 32, ve.RC_CQP, 0);
+    st.h264_seq = h264.testSeq(3, 2);
+    st.h264_pic = h264.testPic(0x402, 0x1000, false, 2);
+    st.have_seq = true;
+    st.have_pic = true;
+    st.h264_slices[0] = .{ .num_mb = 6, .slice_type = 1 };
+    st.slices = 1;
+    var out: EndOut = .{};
+    const in = EndIn{
+        .push = undefined,
+        .setup = undefined,
+        .setup_va = 0,
+        .coded = &b_coded,
+        .coded_va = 0,
+        .input = undefined,
+        .lookup = undefined,
+        .scratch = undefined,
+        .picture_index = 0,
+    };
+    try testing.expectEqual(va.ERROR_INVALID_PARAMETER, end(&st, in, &out));
+    try testing.expectEqual(@as(u32, 0), st.pictures);
+}
+
+test "encode: the scratch holds a whole picture's history and two MEPRED buffers" {
+    const s = scratchSizesFor(.h264, 1920, 1088);
+    try testing.expectEqual(nvenc.historyBytes(120, 68), s.history);
+    try testing.expect(s.history >= 120 * 69 * 224);
+    try testing.expect(s.mepred >= 120 * 68 * nvenc.MEPRED_BYTES_PER_MB);
+    try testing.expect(s.mepred_off >= s.rc_off + s.rc);
+    try testing.expectEqual(s.mepred_off + 2 * s.mepred, s.total);
+    const a = scratchSizesFor(.av1, 1920, 1088);
+    try testing.expect(a.history >= nvenc.historyBytes(120, 68));
+    try testing.expect(a.lines_off >= a.mepred_off + 2 * a.mepred);
 }
 
 test "encode: kept surfaces: an entry per reference, reused once no list names it" {

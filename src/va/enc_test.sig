@@ -384,7 +384,8 @@ test "enc: H.264 with B pictures through the pretend encoder: I0 P3 B1 B2, decod
     var f = ImportFake{ .k = &k };
     seen = .{};
     var d: D = .{ .node = .{ .sys = &f } };
-    try testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    // (B pictures: GALAXY_VA_NVENC_B=1)
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .nvenc_b_frames = true }));
     defer d.terminate();
     var cfg: u32 = 0;
     const attrs = [_]va.ConfigAttrib{ .{ .type = va.ATTRIB_RT_FORMAT, .value = va.RT_FORMAT_YUV420 }, .{ .type = ve.ATTRIB_RATE_CONTROL, .value = ve.RC_VBR } };
@@ -539,7 +540,8 @@ test "enc: an app's dma-bufs as encoder input: block linear read in place (16-GO
     // the engine read the app's planes where they are, at their block height
     try testing.expectEqual(nvenc.shifted(y_buf.va), seen.methods[nvenc.SET_IN_CUR_PIC >> 2]);
     try testing.expectEqual(nvenc.shifted(uv_buf.va), seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_U >> 2]);
-    try testing.expectEqual(@as(u64, 4), nvenc.get(&seen.setup, nvenc.H264.input_cfg_block_height));
+    // (16 GOBs a block: the field counts GOBs, nvenc.blockHeightField)
+    try testing.expectEqual(@as(u64, 16), nvenc.get(&seen.setup, nvenc.H264.input_cfg_block_height));
     try testing.expectEqualSlices(u32, &conversions, &d.conversions);
     writeFile("/tmp/galaxy-va-enc/h264-import-bl.264", out[0..n]);
     writeFile("/tmp/galaxy-va-enc/h264-import-bl.yuv", &y4m_a);
@@ -632,7 +634,8 @@ test "enc: AV1 through the pretend encoder: a key frame, a hidden P, a B, the P 
     var f = ImportFake{ .k = &k };
     seen = .{};
     var d: D = .{ .node = .{ .sys = &f } };
-    try testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    // (B pictures: GALAXY_VA_NVENC_B=1)
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .nvenc_b_frames = true }));
     defer d.terminate();
     // FFmpeg's questions: the AV1 attributes (Ext2 it requires)
     var attribs = [_]va.ConfigAttrib{
@@ -664,7 +667,7 @@ test "enc: AV1 through the pretend encoder: a key frame, a hidden P, a B, the P 
     var p0 = enc_av1.testPic(rec[0], coded, true, 0);
     try picture(&d, ctx, in[0], &.{ buf(ve.ENC_SEQUENCE_PARAMETER_BUFFER, &seq), buf(ve.ENC_PICTURE_PARAMETER_BUFFER, &p0), buf(ve.ENC_SLICE_PARAMETER_BUFFER, &tg) });
     try testing.expectEqual(nvenc.APPLICATION_ID_AV1, seen.app);
-    try testing.expectEqual(nvenc.CODEC_TYPE_AV1 | nvenc.CONTROL_GPTIMER_ON, seen.methods[nvenc.SET_CONTROL_PARAMS >> 2]);
+    try testing.expectEqual(nvenc.CODEC_TYPE_AV1 | nvenc.CONTROL_FORCE_OUT_PIC | nvenc.CONTROL_GPTIMER_ON, seen.methods[nvenc.SET_CONTROL_PARAMS >> 2]);
     try testing.expectEqual(@as(u64, 3), nvenc.get(&seen.setup, nvenc.Av1.pic_type));
     // the CDFs: the defaults in, the reconstruction's own table out; the line buffers bound
     try testing.expect(seen.methods[nvenc.SET_IN_AV1_PROBABILITY_DATA >> 2] != 0);
@@ -871,7 +874,7 @@ test "enc: GALAXY_VA_NVENC_RC=firmware: RCMODE CBR and the rate control struct, 
     const pic = enc_h264.testPic(s[1], coded, true, 0);
     const sl = slice264(2, 0, null, null);
     try picture(&d, ctx, s[0], &.{ buf(ve.ENC_SEQUENCE_PARAMETER_BUFFER, &seq), buf(ve.ENC_PICTURE_PARAMETER_BUFFER, &pic), buf(ve.ENC_SLICE_PARAMETER_BUFFER, &sl) });
-    try testing.expectEqual(nvenc.CODEC_TYPE_H264 | nvenc.CONTROL_GPTIMER_ON | (nvenc.RCMODE_CBR << 24), seen.methods[nvenc.SET_CONTROL_PARAMS >> 2]);
+    try testing.expectEqual(nvenc.CODEC_TYPE_H264 | nvenc.CONTROL_FORCE_OUT_PIC | nvenc.CONTROL_GPTIMER_ON | (nvenc.RCMODE_CBR << 24), seen.methods[nvenc.SET_CONTROL_PARAMS >> 2]);
     try testing.expectEqual(@as(u64, 800_000), nvenc.get(&seen.setup, nvenc.H264.rc_nal_bitrate));
     try testing.expectEqual(@as(u64, 2), nvenc.get(&seen.setup, nvenc.H264.rc_hrd_type));
     // the RC process buffer's state: the CPB three quarters full (28.4)
