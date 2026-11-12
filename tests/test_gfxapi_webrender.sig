@@ -464,12 +464,27 @@ const Nv3 = struct {
     var texels: [FUZZ_SIDE * FUZZ_SIDE * 4]u8 = undefined;
 };
 
-/// A variant's draw through the emulated RTX's 3D engine (its two stage
-/// programs compiled from the pipeline's KIR, gl3d's state, emu3d): 6
-/// vertices, 3 instances, every attribute a buffer of random floats, the
-/// uniforms and the textures as runTileSeed has them for `seed`. Null
-/// when it drew clean through the engine; else the sentence.
-fn run3d(pipe: *raster.Pipeline, uniforms: []const u32, nslots: usize, seed: u64, why: []u8) !?[]const u8 {
+/// What the variants' draws on the 3D engine came to against the CPU's.
+var cmp_runs: u32 = 0;
+var cmp_exact: u32 = 0;
+var cmp_near: u32 = 0;
+var cmp_px: u64 = 0;
+var cmp_worst: u32 = 0;
+var cmp_worst_name: [96]u8 = undefined;
+var cmp_worst_len: usize = 0;
+var px3d: [64 * 64 * 4]u8 = undefined;
+var pxcpu: [64 * 64 * 4]u8 = undefined;
+
+/// A variant's draw (6 vertices, 3 instances, every attribute a buffer of
+/// random floats, the uniforms and textures as runTileSeed has them for
+/// `seed`) with a depth test on (LEQUAL, written, the depth cleared to 1),
+/// twice: through the emulated RTX's 3D engine (its stage programs,
+/// gl3d's state, emu3d; the depth block linear), and on the CPU (the
+/// compute kernels in KIR's interpreter; the depth pitch linear). Null
+/// when the 3D engine drew it clean; else the sentence. The two pictures
+/// are compared (pixels more than 2 of 255 apart: the two rasterizers'
+/// edges differ by their grids, 1/16 and 1/256 of a pixel) into cmp_*.
+fn run3d(pipe: *raster.Pipeline, uniforms: []const u32, nslots: usize, seed: u64, name: []const u8, why: []u8) !?[]const u8 {
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
     Nv.dev.init(&Nv.arena, &Nv.view, &Nv.emu_work);
@@ -478,22 +493,38 @@ fn run3d(pipe: *raster.Pipeline, uniforms: []const u32, nslots: usize, seed: u64
     e.init(.{ .dev = Nv.dev.device(), .work = &work_mem, .cpu_work = &cpu_work, .slabs = &Nv3.slabs, .graphics = true });
     defer e.deinit();
     defer e.unloadPipeline(pipe);
-    var color = e.newImage(64, 64, .rgba8) orelse return error.OutOfMemory;
-    defer e.freeImage(&color);
-    for (&Nv3.attr_bytes) |*b| b.* = 0;
+    const engines = [2]*engine.Engine{ e, &eng };
+    var color: [2]engine.Image = undefined;
+    var depth: [2]engine.Image = undefined;
+    var ab: [2]engine.Image = undefined;
+    for (engines, 0..) |x, i| {
+        color[i] = x.newImage(64, 64, .rgba8) orelse return error.OutOfMemory;
+        depth[i] = x.newImageSamples(64, 64, .d24s8, 1) orelse return error.OutOfMemory;
+        x.fill(&color[i], color[i].bounds(), 0xff20_1008, 0);
+        x.fill(&depth[i], depth[i].bounds(), 0x00ff_ffff, 0xff00_0000);
+        ab[i] = x.newBuffer(Nv3.attr_bytes.len) orelse return error.OutOfMemory;
+    }
+    defer for (engines, 0..) |x, i| {
+        x.freeImage(&color[i]);
+        x.freeImage(&depth[i]);
+        x.freeImage(&ab[i]);
+    };
+    if (!depth[0].layout.block) return std.fmt.bufPrint(why, "the 3D engine's depth image is not block linear", .{}) catch "?";
     const fl: []f32 = @alignCast(std.mem.bytesAsSlice(f32, &Nv3.attr_bytes));
     for (fl) |*x| x.* = if (seed == 0) 0 else @bitCast(fuzzWord(r, -1.5, 1.5));
-    var ab = e.newBuffer(Nv3.attr_bytes.len) orelse return error.OutOfMemory;
-    defer e.freeImage(&ab);
-    e.writeBytes(&ab, 0, &Nv3.attr_bytes);
-    var tex: [texture.MAX_TEX]engine.Image = undefined;
+    for (engines, 0..) |x, i| x.writeBytes(&ab[i], 0, &Nv3.attr_bytes);
+    var tex: [2][texture.MAX_TEX]engine.Image = undefined;
     const ntex: usize = @min(pipe.shaders.textures, nslots);
-    for (tex[0..ntex]) |*t| {
-        t.* = e.newImage(FUZZ_SIDE, FUZZ_SIDE, .rgba8) orelse return error.OutOfMemory;
+    for (0..ntex) |j| {
         for (&Nv3.texels) |*b| b.* = if (seed == 0) 0 else r.int(u8);
-        e.write(t, 0, 0, FUZZ_SIDE, FUZZ_SIDE, &Nv3.texels, FUZZ_SIDE * 4, .rgba8);
+        for (engines, 0..) |x, i| {
+            tex[i][j] = x.newImage(FUZZ_SIDE, FUZZ_SIDE, .rgba8) orelse return error.OutOfMemory;
+            x.write(&tex[i][j], 0, 0, FUZZ_SIDE, FUZZ_SIDE, &Nv3.texels, FUZZ_SIDE * 4, .rgba8);
+        }
     }
-    defer for (tex[0..ntex]) |*t| e.freeImage(t);
+    defer for (engines, 0..) |x, i| {
+        for (tex[i][0..ntex]) |*t| x.freeImage(t);
+    };
     const nu = uniforms.len + nslots * texture.DESC_WORDS;
     if (nu > Nv3.uni.len) return error.OutOfMemory;
     @memcpy(Nv3.uni[0..uniforms.len], uniforms);
@@ -501,19 +532,43 @@ fn run3d(pipe: *raster.Pipeline, uniforms: []const u32, nslots: usize, seed: u64
     if (seed != 0) for (Nv3.uni[0..uniforms.len]) |*x| {
         x.* = fuzzWord(r, -2, 2);
     };
-    for (0..ntex) |j| texture.descriptor(.{ .img = &tex[j] }, Nv3.uni[uniforms.len + j * texture.DESC_WORDS ..][0..texture.DESC_WORDS]);
-    var d = raster.Draw{ .pipe = pipe, .color = &color, .rect = .{ .x0 = 0, .y0 = 0, .x1 = 64, .y1 = 64 }, .count = 6, .instances = 3, .center = .{ 32, 32 }, .half = .{ 32, 32 }, .uniforms = Nv3.uni[0..nu] };
-    for (0..pipe.shaders.attrs) |a| d.attrs[a] = .{ .buf = &ab, .offset = @intCast(a * 64), .stride = 16, .comps = 4, .divisor = @intFromBool(a % 2 == 1) };
-    for (0..ntex) |j| d.textures[j] = &tex[j];
+    var uni2: [2][8192]u32 = undefined;
+    for (0..2) |i| {
+        @memcpy(uni2[i][0..nu], Nv3.uni[0..nu]);
+        for (0..ntex) |j| texture.descriptor(.{ .img = &tex[i][j] }, uni2[i][uniforms.len + j * texture.DESC_WORDS ..][0..texture.DESC_WORDS]);
+    }
     const before = e.stats.graphics_draws;
-    if (!e.draw(&d)) return std.fmt.bufPrint(why, "the engine did not draw it", .{}) catch "?";
-    e.finish();
+    for (engines, 0..) |x, i| {
+        var d = raster.Draw{ .pipe = pipe, .color = &color[i], .depth = &depth[i], .depth_test = true, .depth_write = true, .depth_func = 0b011, .rect = .{ .x0 = 0, .y0 = 0, .x1 = 64, .y1 = 64 }, .count = 6, .instances = 3, .center = .{ 32, 32 }, .half = .{ 32, 32 }, .uniforms = uni2[i][0..nu] };
+        for (0..pipe.shaders.attrs) |a| d.attrs[a] = .{ .buf = &ab[i], .offset = @intCast(a * 64), .stride = 16, .comps = 4, .divisor = @intFromBool(a % 2 == 1) };
+        for (0..ntex) |j| d.textures[j] = &tex[i][j];
+        if (!x.draw(&d)) return std.fmt.bufPrint(why, "the {s} engine did not draw it", .{if (i == 0) "3D" else "CPU"}) catch "?";
+        x.finish();
+    }
     if (Nv.dev.lastError()) |le| {
         var buf: [256]u8 = undefined;
         return std.fmt.bufPrint(why, "{s}: {s}; the 3D engine: {s}", .{ @errorName(le), Nv.dev.explain(&buf), Nv3.engine3d.why }) catch "(too long)";
     }
     if (e.lost) return std.fmt.bufPrint(why, "the engine lost the GPU ({?s}); the 3D engine: {s}", .{ if (e.why) |w| @errorName(w) else null, Nv3.engine3d.why }) catch "?";
     if (e.stats.graphics_draws == before) return std.fmt.bufPrint(why, "drawn on the compute kernels ({?s})", .{if (e.why_pipe) |w| @errorName(w) else null}) catch "?";
+    // the two pictures
+    e.read(&color[0], 0, 0, 64, 64, &px3d, 256, .rgba8);
+    eng.read(&color[1], 0, 0, 64, 64, &pxcpu, 256, .rgba8);
+    var bad: u32 = 0;
+    var i: usize = 0;
+    while (i < px3d.len) : (i += 4) {
+        var worst: u8 = 0;
+        for (0..4) |c| worst = @max(worst, if (px3d[i + c] > pxcpu[i + c]) px3d[i + c] - pxcpu[i + c] else pxcpu[i + c] - px3d[i + c]);
+        if (worst > 2) bad += 1;
+    }
+    cmp_runs += 1;
+    cmp_px += bad;
+    if (bad == 0) cmp_exact += 1 else if (bad <= 64 * 64 / 20) cmp_near += 1;
+    if (bad > cmp_worst) {
+        cmp_worst = bad;
+        const nm = std.fmt.bufPrint(&cmp_worst_name, "{s} seed {d}", .{ name, seed }) catch "";
+        cmp_worst_len = nm.len;
+    }
     return null;
 }
 
@@ -722,7 +777,7 @@ fn checkProgram(c: *gles.Context, name: []const u8, features: []const u8, vs: [:
         var drew = true;
         for ([_]u64{ 0, 1, 2 }) |seed| {
             var why3: [512]u8 = undefined;
-            const bad = run3d(@constCast(ds.pipe), ds.uniforms, ds.slots.len, seed, &why3) catch |e| blk: {
+            const bad = run3d(@constCast(ds.pipe), ds.uniforms, ds.slots.len, seed, name, &why3) catch |e| blk: {
                 break :blk std.fmt.bufPrint(&why3, "{s}", .{@errorName(e)}) catch "?";
             };
             if (bad) |s| {
@@ -788,6 +843,7 @@ test "webrender: every shader variant compiles and links" {
     std.debug.print("webrender on sm_120: the largest kernel {d} KIR, {d} machine instructions; the slowest compile {d} us ({s}); inside the backend at most {d} KIR expanded, {d} MI, {d} vregs\n", .{ max_kir, max_mi, @divTrunc(max_ns, 1000), max_what[0..max_what_len], max_xkir, max_xmi, max_vregs });
     std.debug.print("webrender: {d} tile kernel runs on the emulated RTX went wrong, {d} ran past the step budget\n", .{ st.ran_bad, st.ran_long });
     try clearCompare(dir, io);
+    std.debug.print("webrender with a depth test, the 3D engine against the CPU: {d} draws, {d} the same picture, {d} more within 5% of the pixels (the rasterizers' edges), {d} beyond; {d} pixels apart in all, the most {d} of 4096 ({s})\n", .{ cmp_runs, cmp_exact, cmp_near, cmp_runs - cmp_exact - cmp_near, cmp_px, cmp_worst, cmp_worst_name[0..cmp_worst_len] });
     std.debug.print("webrender on the 3D engine: {d} variants drew through the emulated engine, {d} went wrong there ({d} runs past the step budget), {d} not taken yet:", .{ st.drawn3d, st.bad3d, st.long3d, st.not3d });
     for (st.why3d, st.why3d_n) |w, n| if (w.len != 0) std.debug.print(" {s} {d};", .{ w, n });
     std.debug.print("\n", .{});
