@@ -13,7 +13,10 @@
 //! by name (dl.sig), and the process's side of things (host.Host): PRIME
 //! out and in, sync_files (Galaxy's G_FENCE_FD), dup, poll, mmap. Opened at the
 //! first eglInitialize; without a GPU EGL has no display and the app
-//! draws in software.
+//! draws in software. EGL's X11 platform speaks over Linux's Unix sockets
+//! (x11.Wire: connect, sendmsg with SCM_RIGHTS and MSG_NOSIGNAL, read,
+//! poll; memfds for MIT-SHM), its server named by the Display or $DISPLAY
+//! (the C library's getenv, else /proc/self/environ).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,6 +24,7 @@ const gfxapi = @import("gfxapi");
 const gpu = @import("gpu");
 const egl = gfxapi.egl;
 const wayland = gfxapi.wayland;
+const x11 = gfxapi.x11;
 const node = gfxapi.node;
 const engine = gfxapi.engine;
 const thread = gfxapi.thread;
@@ -28,18 +32,21 @@ const report = gfxapi.report;
 const Host = gfxapi.host.Host;
 const libgles = @import("libgles.sig");
 const abi = @import("abi.sig");
+const libgbm = @import("libgbm.sig");
 
 pub const panic = libgles.panic;
 
 comptime {
     // (libgles' gl* entry points are this library's too)
     _ = libgles;
+    // (and GBM's: libgbm.so.1 is this file too)
+    _ = libgbm;
     // ...and every other name of Mesa's: what abi.sig answers itself, and
     // for the rest a call that does nothing (abi.Missing)
     _ = abi;
     @setEvalBranchQuota(1_000_000);
     for (abi.names) |name| {
-        if (@hasDecl(@This(), name) or @hasDecl(libgles, name) or abi.answers(name)) continue;
+        if (@hasDecl(@This(), name) or @hasDecl(libgles, name) or @hasDecl(libgbm, name) or abi.answers(name)) continue;
         @export(&abi.Missing(name).call, .{ .name = name });
     }
 }
@@ -216,6 +223,165 @@ fn waylandClient() ?*const wayland.Client {
     return if (wl_client) |*c| c else null;
 }
 
+// ── X11's socket (x11.Wire) ────────────────────────────────────────────────
+
+/// A stream socket connected to the Unix socket at `path` (abstract: in
+/// Linux's abstract namespace, as Xwayland also listens), or -errno.
+fn xConnect(ctx: ?*anyopaque, path: []const u8, abstract: bool) i32 {
+    _ = ctx;
+    var a = linux.sockaddr.un{ .path = [_]u8{0} ** 108 };
+    const off: usize = @intFromBool(abstract);
+    if (path.len + off >= a.path.len) return -36; // ENAMETOOLONG
+    @memcpy(a.path[off..][0..path.len], path);
+    const s = sysResult(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0));
+    if (s < 0) return @intCast(s);
+    const len: linux.socklen_t = if (abstract) @intCast(@offsetOf(linux.sockaddr.un, "path") + 1 + path.len) else @sizeOf(linux.sockaddr.un);
+    while (true) {
+        const r = sysResult(linux.connect(@intCast(s), @ptrCast(&a), len));
+        if (r == -4) continue; // EINTR
+        if (r < 0) {
+            _ = linux.close(@intCast(s));
+            return @intCast(r);
+        }
+        return @intCast(s);
+    }
+}
+
+/// struct iovec and the kernel's struct user_msghdr.
+const Iovec = extern struct { base: [*]const u8, len: usize };
+const Msghdr = extern struct {
+    name: ?*anyopaque = null,
+    namelen: u32 = 0,
+    iov: [*]const Iovec,
+    iovlen: usize,
+    control: ?*anyopaque = null,
+    controllen: usize = 0,
+    flags: u32 = 0,
+};
+const MAX_SEND_FDS = 4;
+
+/// `bytes` out (MSG_NOSIGNAL: a server gone is an error, never SIGPIPE),
+/// `fds` with them as SCM_RIGHTS: the bytes written, or -errno.
+fn xSend(ctx: ?*anyopaque, fd: i32, bytes: []const u8, fds: []const i32) isize {
+    _ = ctx;
+    if (fds.len > MAX_SEND_FDS) return -22; // EINVAL
+    var iov = [1]Iovec{.{ .base = bytes.ptr, .len = bytes.len }};
+    // struct cmsghdr (len, level, type) and the fds
+    var cbuf: [16 + 4 * MAX_SEND_FDS]u8 align(8) = undefined;
+    var msg = Msghdr{ .iov = &iov, .iovlen = 1 };
+    if (fds.len > 0) {
+        const len = 16 + 4 * fds.len;
+        std.mem.writeInt(u64, cbuf[0..8], len, builtin.cpu.arch.endian());
+        std.mem.writeInt(i32, cbuf[8..12], 1, builtin.cpu.arch.endian()); // SOL_SOCKET
+        std.mem.writeInt(i32, cbuf[12..16], 1, builtin.cpu.arch.endian()); // SCM_RIGHTS
+        for (fds, 0..) |f, i| std.mem.writeInt(i32, cbuf[16 + 4 * i ..][0..4], f, builtin.cpu.arch.endian());
+        msg.control = &cbuf;
+        msg.controllen = std.mem.alignForward(usize, len, 8);
+    }
+    while (true) {
+        const r = sysResult(linux.syscall3(.sendmsg, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&msg), 0x4000)); // MSG_NOSIGNAL
+        if (r == -4) continue; // EINTR
+        return @intCast(r);
+    }
+}
+
+fn xRecv(ctx: ?*anyopaque, fd: i32, buf: []u8) isize {
+    _ = ctx;
+    while (true) {
+        const r = sysResult(linux.read(fd, buf.ptr, buf.len));
+        if (r == -4) continue; // EINTR
+        return @intCast(r);
+    }
+}
+
+fn xPoll(ctx: ?*anyopaque, fd: i32, timeout_ms: i32) i32 {
+    _ = ctx;
+    var p = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    while (true) {
+        const r = sysResult(linux.poll(&p, 1, timeout_ms));
+        if (r == -4) continue; // EINTR
+        if (r < 0) return @intCast(r);
+        // (readable, or hung up: the read that follows tells which)
+        return if (r > 0) 1 else 0;
+    }
+}
+
+var display_buf: [256]u8 = undefined;
+
+/// $DISPLAY: the C library's getenv (what the app may have set), else the
+/// environment the process began with.
+fn xDisplayEnv(ctx: ?*anyopaque) ?[]const u8 {
+    _ = ctx;
+    const Getenv = *const fn ([*:0]const u8) callconv(.c) ?[*:0]const u8;
+    if (gfxapi.dl.sym(Getenv, "getenv")) |getenv| {
+        const v = std.mem.span(getenv("DISPLAY") orelse return null);
+        return if (v.len == 0) null else v;
+    }
+    if (comptime !on_linux) return null;
+    const fd = sysResult(linux.openat(linux.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    if (fd < 0) return null;
+    defer _ = linux.close(@intCast(fd));
+    var n: usize = 0;
+    while (n < env_buf.len) {
+        const r = sysResult(linux.read(@intCast(fd), env_buf[n..].ptr, env_buf.len - n));
+        if (r <= 0) break;
+        n += @intCast(r);
+    }
+    return displayOf(env_buf[0..n], &display_buf);
+}
+
+/// DISPLAY's value in an environment block (NUL-separated), copied to `out`.
+fn displayOf(block: []const u8, out: []u8) ?[]const u8 {
+    const key = "DISPLAY=";
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |kv| {
+        if (!std.mem.startsWith(u8, kv, key)) continue;
+        const v = kv[key.len..];
+        if (v.len == 0 or v.len > out.len) return null;
+        @memcpy(out[0..v.len], v);
+        return out[0..v.len];
+    }
+    return null;
+}
+
+test "libgalaxy-gl: DISPLAY from an environment block" {
+    var out: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(":3", displayOf("HOME=/\x00DISPLAY=:3\x00", &out).?);
+    try std.testing.expect(displayOf("WAYLAND_DISPLAY=wayland-0\x00", &out) == null);
+    try std.testing.expect(displayOf("DISPLAY=\x00", &out) == null);
+    try std.testing.expect(displayOf("DISPLAY=/a/very/long/path/to/a/socket:0", &out) == null);
+}
+
+/// MIT-SHM's memory: a memfd of `size` bytes, mapped shared, read-write.
+fn xShmCreate(ctx: ?*anyopaque, size: usize) ?x11.Shm {
+    _ = ctx;
+    if (size == 0) return null;
+    const fd = sysResult(linux.memfd_create("galaxy-egl-x11", 1)); // MFD_CLOEXEC
+    if (fd < 0) return null;
+    if (sysResult(linux.ftruncate(@intCast(fd), @intCast(size))) < 0) {
+        _ = linux.close(@intCast(fd));
+        return null;
+    }
+    const r = sysResult(linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, @intCast(fd), 0));
+    if (r < 0) {
+        _ = linux.close(@intCast(fd));
+        return null;
+    }
+    return .{ .fd = @intCast(fd), .mem = @as([*]u8, @ptrFromInt(@as(usize, @intCast(r))))[0..size] };
+}
+
+fn xShmDestroy(ctx: ?*anyopaque, m: x11.Shm) void {
+    _ = ctx;
+    _ = linux.munmap(m.mem.ptr, m.mem.len);
+    _ = linux.close(m.fd);
+}
+
+const x11_wire = x11.Wire{ .connect = xConnect, .send = xSend, .recv = xRecv, .poll = xPoll, .close = closeFd, .display_env = xDisplayEnv, .shm_create = xShmCreate, .shm_destroy = xShmDestroy };
+
+fn x11Wire() ?*const x11.Wire {
+    return &x11_wire;
+}
+
 fn nativeInterop() bool {
     return the_gpu.node.kind == .adreno;
 }
@@ -228,6 +394,7 @@ pub const egl_driver: ?egl.Driver = if (on_linux) .{
     .open = openDriver,
     .host = .{ .exportFd = exportFd, .importFd = importFd, .fenceFd = fenceFd, .close = closeFd, .dup = dupFd, .poll = pollFd, .map = mapFd, .unmap = unmapFd },
     .wayland = waylandClient,
+    .x11 = x11Wire,
     .native_interop = nativeInterop,
     .dma_import = dmaImport,
 } else null;
@@ -289,11 +456,11 @@ pub export fn eglCreateWindowSurface(dpy: ?*anyopaque, config: ?*const anyopaque
 }
 pub export fn eglCreatePlatformWindowSurface(dpy: ?*anyopaque, config: ?*const anyopaque, win: ?*anyopaque, attribs: ?[*]const isize) callconv(.c) ?*anyopaque {
     egl.calling("eglCreatePlatformWindowSurface");
-    return h(egl.createWindowSurface(isize, dpy, config, win, attribs));
+    return h(egl.createPlatformWindowSurface(isize, dpy, config, win, attribs));
 }
 pub export fn eglCreatePlatformWindowSurfaceEXT(dpy: ?*anyopaque, config: ?*const anyopaque, win: ?*anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
     egl.calling("eglCreatePlatformWindowSurfaceEXT");
-    return h(egl.createWindowSurface(i32, dpy, config, win, attribs));
+    return h(egl.createPlatformWindowSurface(i32, dpy, config, win, attribs));
 }
 pub export fn eglCreatePbufferSurface(dpy: ?*anyopaque, config: ?*const anyopaque, attribs: ?[*]const i32) callconv(.c) ?*anyopaque {
     egl.calling("eglCreatePbufferSurface");
@@ -957,7 +1124,7 @@ test "libgalaxy_gl: EGL and GL through their C entry points (surfaceless, a pbuf
     try std.testing.expectEqual(@as(u32, 1), eglDestroySyncKHR(dpy, native));
     var nf: i32 = 0;
     try std.testing.expectEqual(@as(u32, 1), eglQueryDmaBufFormatsEXT(dpy, 0, null, &nf));
-    try std.testing.expectEqual(@as(i32, 4), nf);
+    try std.testing.expectEqual(@as(i32, 8), nf); // (four RGB, four video planes)
     try std.testing.expectEqual(@as(u32, 1), eglSwapBuffers(dpy, pb)); // (a pbuffer's: nothing)
     try std.testing.expectEqual(@as(u32, 1), eglMakeCurrent(dpy, null, null, null));
     try std.testing.expect(eglGetCurrentContext() == null);
@@ -1026,4 +1193,540 @@ test "libgalaxy_gl: MESA export preserves the plane and returns an independent f
     try std.testing.expectEqual(@as(u32, 1), eglDestroyImageKHR(dpy, image));
     try std.testing.expectEqual(@as(i32, 11), dma_export_closed);
     try std.testing.expectEqual(@as(u32, 0), eglExportDMABUFImageMESA(dpy, image, null, null, null));
+}
+
+// ── GBM, as Xwayland's glamor uses it (xwayland-glamor-gbm.c, 24.1) ───────
+
+/// A fake PRIME in one process: an exported buffer's fd names it, and an
+/// import of that fd is the same memory (as Galaxy's render node gives).
+var prime_bufs: [16]gpu.Buffer = undefined;
+var prime_n: usize = 0;
+
+fn primeExport(_: ?*anyopaque, buf: gpu.Buffer) i64 {
+    if (prime_n == prime_bufs.len) return -24;
+    prime_bufs[prime_n] = buf;
+    prime_n += 1;
+    return @intCast(100 + prime_n - 1);
+}
+fn primeImport(_: ?*anyopaque, fd: i32) ?gpu.Buffer {
+    if (fd < 100 or fd >= 100 + @as(i32, @intCast(prime_n))) return null;
+    const pb = prime_bufs[@intCast(fd - 100)];
+    return .{ .cpu = pb.cpu, .bytes = pb.cpu.len, .kind = .external };
+}
+fn primeDup(_: ?*anyopaque, fd: i32) i32 {
+    return fd;
+}
+fn primeClose(_: ?*anyopaque, fd: i32) void {
+    _ = fd;
+}
+fn yes() bool {
+    return true;
+}
+fn no() bool {
+    return false;
+}
+
+fn gbmTestDriver() void {
+    t_eng.init(.{ .pool = &t_pool });
+    prime_n = 0;
+    gfxapi.gbm.resetForTest();
+    var host = test_host;
+    host.exportFd = primeExport;
+    host.importFd = primeImport;
+    host.dup = primeDup;
+    host.close = primeClose;
+    egl.setDriver(.{ .open = testOpen, .host = host, .wayland = noWayland, .native_interop = no, .dma_import = yes });
+}
+
+fn hasWord(list: []const u8, word: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, list, ' ');
+    while (it.next()) |w| {
+        if (std.mem.eql(u8, w, word)) return true;
+    }
+    return false;
+}
+
+/// A dma-buf EGLImage as glamor makes one of a buffer
+/// (xwl_glamor_gbm_create_pixmap_for_bo), bound to a new texture.
+fn glamorTexture(dpy: ?*anyopaque, bo: ?*anyopaque) !struct { image: ?*anyopaque, tex: u32 } {
+    const g = gfxapi.glenum;
+    const fd = libgbm.gbm_bo_get_fd_for_plane(bo, 0);
+    try std.testing.expect(fd >= 0);
+    const modifier = libgbm.gbm_bo_get_modifier(bo);
+    const attrs = [_]i32{
+        egl.WIDTH,                          @intCast(libgbm.gbm_bo_get_width(bo)),
+        egl.HEIGHT,                         @intCast(libgbm.gbm_bo_get_height(bo)),
+        egl.LINUX_DRM_FOURCC_EXT,           @bitCast(libgbm.gbm_bo_get_format(bo)),
+        egl.DMA_BUF_PLANE0_FD_EXT,          fd,
+        egl.DMA_BUF_PLANE0_OFFSET_EXT,      @intCast(libgbm.gbm_bo_get_offset(bo, 0)),
+        egl.DMA_BUF_PLANE0_PITCH_EXT,       @intCast(libgbm.gbm_bo_get_stride_for_plane(bo, 0)),
+        egl.DMA_BUF_PLANE0_MODIFIER_LO_EXT, @bitCast(@as(u32, @truncate(modifier))),
+        egl.DMA_BUF_PLANE0_MODIFIER_HI_EXT, @bitCast(@as(u32, @truncate(modifier >> 32))),
+        egl.NONE,
+    };
+    const image = eglCreateImageKHR(dpy, null, egl.LINUX_DMA_BUF_EXT, null, &attrs) orelse return error.NoImage;
+    var tex: [1]u32 = undefined;
+    libgles.glGenTextures(1, &tex);
+    libgles.glBindTexture(g.TEXTURE_2D, tex[0]);
+    libgles.glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, @intCast(g.NEAREST));
+    libgles.glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, @intCast(g.NEAREST));
+    libgles.glEGLImageTargetTexture2DOES(g.TEXTURE_2D, image);
+    try std.testing.expectEqual(egl.SUCCESS, eglGetError());
+    try std.testing.expectEqual(g.NO_ERROR, libgles.glGetError());
+    libgles.glBindTexture(g.TEXTURE_2D, 0);
+    return .{ .image = image, .tex = tex[0] };
+}
+
+/// The texture cleared to `rgba` through a framebuffer (glamor's fbo of
+/// a pixmap).
+fn clearThrough(tex: u32, rgba: [4]f32) !void {
+    const g = gfxapi.glenum;
+    var fbo: [1]u32 = undefined;
+    libgles.glGenFramebuffers(1, &fbo);
+    libgles.glBindFramebuffer(g.FRAMEBUFFER, fbo[0]);
+    libgles.glFramebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex, 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, libgles.glCheckFramebufferStatus(g.FRAMEBUFFER));
+    libgles.glClearColor(rgba[0], rgba[1], rgba[2], rgba[3]);
+    libgles.glClear(g.COLOR_BUFFER_BIT);
+    libgles.glFinish();
+    libgles.glBindFramebuffer(g.FRAMEBUFFER, 0);
+    libgles.glDeleteFramebuffers(1, &fbo);
+}
+
+test "libgbm: Xwayland's glamor on GBM: device, EGL platform, buffers with modifiers, dma-buf images" {
+    const g = gfxapi.glenum;
+    const B = gfxapi.gbm;
+    gbmTestDriver();
+    // no fd: no device
+    try std.testing.expect(libgbm.gbm_create_device(-1) == null);
+    const dev = libgbm.gbm_create_device(7) orelse return error.NoDevice;
+    defer libgbm.gbm_device_destroy(dev);
+    try std.testing.expectEqual(@as(c_int, 7), libgbm.gbm_device_get_fd(dev));
+    try std.testing.expectEqualStrings("drm", std.mem.span(libgbm.gbm_device_get_backend_name(dev).?));
+    try std.testing.expectEqual(@as(c_int, 1), libgbm.gbm_device_is_format_supported(dev, B.FORMAT_XRGB8888, B.BO_USE_RENDERING));
+    try std.testing.expectEqual(@as(c_int, 0), libgbm.gbm_device_is_format_supported(dev, 0x3631_4752, B.BO_USE_RENDERING)); // RGB565
+    try std.testing.expectEqual(@as(c_int, 1), libgbm.gbm_device_get_format_modifier_plane_count(dev, B.FORMAT_ARGB8888, 0));
+    try std.testing.expectEqual(@as(c_int, -1), libgbm.gbm_device_get_format_modifier_plane_count(dev, B.FORMAT_ARGB8888, 0x0100_0000_0000_0001));
+    // (RGB565 and the others glamor asks for at depths 15, 16, 30: none,
+    // and glamor makes a texture-only pixmap instead)
+    try std.testing.expect(libgbm.gbm_bo_create(dev, 8, 8, 0x3631_4752, B.BO_USE_RENDERING) == null);
+
+    // xwl_glamor_gbm_has_egl_extension, glamor_egl_get_display
+    const client = std.mem.span(eglQueryString(null, egl.EXTENSIONS).?);
+    try std.testing.expect(hasWord(client, "EGL_MESA_platform_gbm") and hasWord(client, "EGL_KHR_platform_gbm") and hasWord(client, "EGL_EXT_platform_base"));
+    const dpy = eglGetPlatformDisplayEXT(egl.PLATFORM_GBM_KHR, dev, null) orelse return error.NoDisplay;
+    // (eglGetDisplay of a GBM device: the same display, as Mesa detects one)
+    try std.testing.expectEqual(dpy, eglGetDisplay(dev).?);
+    try std.testing.expect(eglGetPlatformDisplayEXT(egl.PLATFORM_GBM_KHR, null, null) == null);
+    var major: i32 = 0;
+    var minor: i32 = 0;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(dpy, &major, &minor));
+    defer _ = eglTerminate(dpy);
+
+    // xwl_glamor_try_big_gl_api: no desktop GL here
+    try std.testing.expectEqual(egl.FALSE, eglBindAPI(0x30A2));
+    const core = [_]i32{ egl.CONTEXT_OPENGL_PROFILE_MASK, 1, egl.CONTEXT_MAJOR_VERSION, 3, egl.CONTEXT_MINOR_VERSION, 1, egl.NONE };
+    try std.testing.expect(eglCreateContext(dpy, null, null, &core) == null);
+    try std.testing.expect(eglCreateContext(dpy, null, null, null) == null);
+    // xwl_glamor_try_gles_api
+    try std.testing.expectEqual(egl.TRUE, eglBindAPI(egl.OPENGL_ES_API));
+    const ctx = eglCreateContext(dpy, null, null, &.{ egl.CONTEXT_CLIENT_VERSION, 2, egl.NONE }) orelse return error.NoContext;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(dpy, null, null, ctx));
+    defer _ = eglMakeCurrent(dpy, null, null, null);
+    const renderer = std.mem.span(libgles.glGetString(g.RENDERER).?);
+    try std.testing.expect(std.mem.indexOf(u8, renderer, "llvmpipe") == null and std.mem.indexOf(u8, renderer, "softpipe") == null);
+    const gl_ext = std.mem.span(libgles.glGetString(g.EXTENSIONS).?);
+    try std.testing.expect(hasWord(gl_ext, "GL_OES_EGL_image"));
+    const ext = std.mem.span(eglQueryString(dpy, egl.EXTENSIONS).?);
+    try std.testing.expect(hasWord(ext, "EGL_EXT_image_dma_buf_import") and hasWord(ext, "EGL_EXT_image_dma_buf_import_modifiers"));
+    try std.testing.expect(hasWord(ext, "EGL_KHR_surfaceless_context") and hasWord(ext, "EGL_KHR_no_config_context"));
+    try std.testing.expect(hasWord(ext, "EGL_MESA_image_dma_buf_export") and hasWord(ext, "EGL_KHR_image_pixmap"));
+    try std.testing.expectEqualStrings("Galaxy", std.mem.span(eglQueryString(dpy, egl.VENDOR).?));
+
+    // xwl_glamor_gbm_create_pixmap_internal: the compositor's modifiers
+    // (linear) and gbm_bo_create_with_modifiers2
+    const tiled = [_]u64{0x0100_0000_0000_0002};
+    try std.testing.expect(libgbm.gbm_bo_create_with_modifiers2(dev, 64, 32, B.FORMAT_ARGB8888, &tiled, 1, B.BO_USE_RENDERING) == null);
+    const linear = [_]u64{B.MOD_LINEAR};
+    const bo = libgbm.gbm_bo_create_with_modifiers2(dev, 64, 32, B.FORMAT_ARGB8888, &linear, 1, B.BO_USE_RENDERING | B.BO_USE_SCANOUT) orelse return error.NoBo;
+    try std.testing.expectEqual(@as(u64, 0), libgbm.gbm_bo_get_modifier(bo));
+    try std.testing.expectEqual(@as(c_int, 1), libgbm.gbm_bo_get_plane_count(bo));
+    try std.testing.expectEqual(@as(u32, 256), libgbm.gbm_bo_get_stride(bo));
+    try std.testing.expectEqual(@as(u32, 256), libgbm.gbm_bo_get_stride_for_plane(bo, 0));
+    try std.testing.expectEqual(@as(u32, 0), libgbm.gbm_bo_get_offset(bo, 0));
+    try std.testing.expectEqual(@as(u32, 32), libgbm.gbm_bo_get_bpp(bo));
+    try std.testing.expectEqual(dev, libgbm.gbm_bo_get_device(bo).?);
+    try std.testing.expectEqual(@as(c_int, -1), libgbm.gbm_bo_get_fd_for_plane(bo, 1));
+    try std.testing.expectEqual(libgbm.gbm_bo_get_handle(bo).u64, libgbm.gbm_bo_get_handle_for_plane(bo, 0).u64);
+
+    // its EGLImage and texture, drawn into (glamor's fbo): the buffer's memory
+    const window = try glamorTexture(dpy, bo);
+    try clearThrough(window.tex, .{ 1, 0, 0, 1 });
+    var stride: u32 = 0;
+    var map_data: ?*anyopaque = null;
+    const px: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(bo, 0, 0, 64, 32, B.BO_TRANSFER_READ, &stride, &map_data) orelse return error.NoMap);
+    try std.testing.expectEqual(@as(u32, 256), stride);
+    // (ARGB8888: bytes B, G, R, A)
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, px[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, px[31 * 256 + 63 * 4 ..][0..4]);
+    try std.testing.expect(libgbm.gbm_bo_map(bo, 0, 0, 1, 1, 1, &stride, &map_data) == null); // (one map at a time)
+    libgbm.gbm_bo_unmap(bo, map_data);
+
+    // glamor_pixmap_from_fds, DRI3 1.2 (PixmapFromBuffers, a linear
+    // modifier): a client's dma-buf (here another buffer's) imported
+    const client_bo = libgbm.gbm_bo_create(dev, 16, 8, B.FORMAT_XRGB8888, B.BO_USE_RENDERING) orelse return error.NoBo;
+    const client_fd = libgbm.gbm_bo_get_fd(client_bo);
+    var mod_data = B.ImportFdModifier{ .width = 16, .height = 8, .format = B.FORMAT_ARGB8888, .num_fds = 1, .fds = .{ client_fd, -1, -1, -1 }, .strides = .{ 64, 0, 0, 0 }, .offsets = .{ 0, 0, 0, 0 }, .modifier = 0 };
+    const imported = libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD_MODIFIER, &mod_data, B.BO_USE_RENDERING) orelse return error.NoImport;
+    try std.testing.expectEqual(@as(u64, 0), libgbm.gbm_bo_get_modifier(imported));
+    try std.testing.expectEqual(@as(u32, 64), libgbm.gbm_bo_get_stride(imported));
+    const pix = try glamorTexture(dpy, imported);
+    try clearThrough(pix.tex, .{ 0, 1, 0, 1 });
+    const cpx: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(client_bo, 0, 0, 16, 8, B.BO_TRANSFER_READ, &stride, &map_data).?);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0 }, cpx[7 * 64 + 15 * 4 ..][0..3]);
+    libgbm.gbm_bo_unmap(client_bo, map_data);
+    // (a tiled modifier, or two planes: not taken)
+    mod_data.modifier = 0x0100_0000_0000_0002;
+    try std.testing.expect(libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD_MODIFIER, &mod_data, 0) == null);
+    mod_data.modifier = 0;
+    mod_data.num_fds = 2;
+    try std.testing.expect(libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD_MODIFIER, &mod_data, 0) == null);
+
+    // DRI3 1.0's PixmapFromBuffer: GBM_BO_IMPORT_FD, no modifier
+    var fd_data = B.ImportFd{ .fd = client_fd, .width = 16, .height = 8, .stride = 64, .format = B.FORMAT_ARGB8888 };
+    const implicit = libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD, &fd_data, B.BO_USE_RENDERING) orelse return error.NoImport;
+    try std.testing.expectEqual(B.MOD_INVALID, libgbm.gbm_bo_get_modifier(implicit));
+    const pix2 = try glamorTexture(dpy, implicit);
+    // (a stride too short for the width: refused)
+    fd_data.stride = 32;
+    try std.testing.expect(libgbm.gbm_bo_import(dev, B.BO_IMPORT_FD, &fd_data, 0) == null);
+
+    // EGL_NATIVE_PIXMAP_KHR (glamor without dma-buf imports): the bo itself
+    const native = eglCreateImageKHR(dpy, null, egl.NATIVE_PIXMAP_KHR, bo, null) orelse return error.NoImage;
+    var tex: [1]u32 = undefined;
+    libgles.glGenTextures(1, &tex);
+    libgles.glBindTexture(g.TEXTURE_2D, tex[0]);
+    libgles.glEGLImageTargetTexture2DOES(g.TEXTURE_2D, native);
+    try std.testing.expectEqual(g.NO_ERROR, libgles.glGetError());
+    try clearThrough(tex[0], .{ 0, 0, 1, 1 });
+    const npx: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(bo, 0, 0, 64, 32, B.BO_TRANSFER_READ, &stride, &map_data).?);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, npx[0..4]);
+    libgbm.gbm_bo_unmap(bo, map_data);
+    try std.testing.expect(eglCreateImageKHR(dpy, null, egl.NATIVE_PIXMAP_KHR, dev, null) == null);
+
+    // xwl_glamor_gbm_destroy_pixmap: images, then buffers; the memory goes
+    // with the last name (the textures)
+    for ([_]?*anyopaque{ window.image, pix.image, pix2.image, native }) |im| try std.testing.expectEqual(egl.TRUE, eglDestroyImageKHR(dpy, im));
+    for ([_]?*anyopaque{ bo, imported, implicit, client_bo }) |x| libgbm.gbm_bo_destroy(x);
+    try std.testing.expect(libgbm.gbm_bo_get_width(bo) == 0);
+    for ([_]u32{ window.tex, pix.tex, pix2.tex, tex[0] }) |t| libgles.glDeleteTextures(1, &[_]u32{t});
+}
+
+/// glamor_add_format's check on GLES (glamor.c): a 1 x 1 texture of
+/// `internal`/`format`, uploaded, an fbo of it complete, and the
+/// implementation's read format and type what glamor reads back with.
+fn glamorFormat(internal: u32, format: u32) !void {
+    const g = gfxapi.glenum;
+    var tex: [1]u32 = undefined;
+    libgles.glGenTextures(1, &tex);
+    defer libgles.glDeleteTextures(1, &tex);
+    libgles.glBindTexture(g.TEXTURE_2D, tex[0]);
+    libgles.glTexImage2D(g.TEXTURE_2D, 0, @intCast(internal), 1, 1, 0, format, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.NO_ERROR, libgles.glGetError());
+    var fbo: [1]u32 = undefined;
+    libgles.glGenFramebuffers(1, &fbo);
+    defer libgles.glDeleteFramebuffers(1, &fbo);
+    libgles.glBindFramebuffer(g.FRAMEBUFFER, fbo[0]);
+    defer libgles.glBindFramebuffer(g.FRAMEBUFFER, 0);
+    libgles.glFramebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex[0], 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, libgles.glCheckFramebufferStatus(g.FRAMEBUFFER));
+    var rf: i32 = 0;
+    var rt: i32 = 0;
+    libgles.glGetIntegerv(g.IMPLEMENTATION_COLOR_READ_FORMAT, @ptrCast(&rf));
+    libgles.glGetIntegerv(g.IMPLEMENTATION_COLOR_READ_TYPE, @ptrCast(&rt));
+    try std.testing.expectEqual(@as(i32, @intCast(format)), rf);
+    try std.testing.expectEqual(@as(i32, @intCast(g.UNSIGNED_BYTE)), rt);
+}
+
+test "libgbm: glamor_init on GLES: the version, extensions and formats it needs" {
+    const g = gfxapi.glenum;
+    gbmTestDriver();
+    const dev = libgbm.gbm_create_device(5) orelse return error.NoDevice;
+    defer libgbm.gbm_device_destroy(dev);
+    const dpy = eglGetPlatformDisplayEXT(egl.PLATFORM_GBM_KHR, dev, null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(dpy, null, null));
+    defer _ = eglTerminate(dpy);
+    const ctx = eglCreateContext(dpy, null, null, &.{ egl.CONTEXT_CLIENT_VERSION, 2, egl.NONE }).?;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(dpy, null, null, ctx));
+    defer _ = eglMakeCurrent(dpy, null, null, null);
+    // epoxy_is_desktop_gl, epoxy_gl_version (30), epoxy_glsl_version (300)
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.span(libgles.glGetString(g.VERSION).?), "OpenGL ES 3.0"));
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.span(libgles.glGetString(g.SHADING_LANGUAGE_VERSION).?), "OpenGL ES GLSL ES 3.00"));
+    // epoxy_has_gl_extension on GL 3: glGetStringi
+    var n: i32 = 0;
+    libgles.glGetIntegerv(g.NUM_EXTENSIONS, @ptrCast(&n));
+    for ([_][]const u8{ "GL_EXT_texture_format_BGRA8888", "GL_OES_texture_border_clamp", "GL_OES_vertex_array_object", "GL_OES_EGL_image", "GL_EXT_map_buffer_range", "GL_KHR_debug" }) |want| {
+        var found = false;
+        for (0..@intCast(n)) |i| {
+            if (std.mem.eql(u8, std.mem.span(libgles.glGetStringi(g.EXTENSIONS, @intCast(i)).?), want)) found = true;
+        }
+        if (!found) std.debug.print("glamor needs {s}\n", .{want});
+        try std.testing.expect(found);
+    }
+    // glamor_setup_formats: depth 24 and 32 as BGRA, read back as BGRA;
+    // depth 8 as R8 (ES 3: RG and swizzles), read back as RED
+    try glamorFormat(g.BGRA_EXT, g.BGRA_EXT);
+    try glamorFormat(g.R8, g.RED);
+    // (the swizzle glamor binds a GL_RED source with)
+    var tex: [1]u32 = undefined;
+    libgles.glGenTextures(1, &tex);
+    libgles.glBindTexture(g.TEXTURE_2D, tex[0]);
+    libgles.glTexParameteri(g.TEXTURE_2D, g.TEXTURE_SWIZZLE_R, @intCast(g.ZERO));
+    try std.testing.expectEqual(g.NO_ERROR, libgles.glGetError());
+    libgles.glDeleteTextures(1, &tex);
+    var dims: [2]i32 = undefined;
+    libgles.glGetIntegerv(g.MAX_VIEWPORT_DIMS, &dims);
+    try std.testing.expect(dims[0] >= 4096 and dims[1] >= 4096);
+    try std.testing.expect(libgles.glGetString(g.VENDOR) != null);
+}
+
+var user_data_freed: ?*anyopaque = null;
+fn freeUserData(x: ?*gfxapi.gbm.Bo, data: ?*anyopaque) callconv(.c) void {
+    _ = x;
+    user_data_freed = data;
+}
+
+test "libgbm: user data, writes, and a gbm_surface EGL draws into" {
+    const g = gfxapi.glenum;
+    const B = gfxapi.gbm;
+    gbmTestDriver();
+    const dev = libgbm.gbm_create_device(3) orelse return error.NoDevice;
+    defer libgbm.gbm_device_destroy(dev);
+    const cursor = libgbm.gbm_bo_create(dev, 4, 4, B.FORMAT_ARGB8888, B.BO_USE_CURSOR | B.BO_USE_WRITE).?;
+    var marker: u8 = 0;
+    libgbm.gbm_bo_set_user_data(cursor, &marker, freeUserData);
+    try std.testing.expectEqual(@as(?*anyopaque, &marker), libgbm.gbm_bo_get_user_data(cursor));
+    const rows = [_]u8{0x7f} ** 64;
+    try std.testing.expectEqual(@as(c_int, 0), libgbm.gbm_bo_write(cursor, &rows, rows.len));
+    try std.testing.expectEqual(@as(c_int, -1), libgbm.gbm_bo_write(cursor, &rows, 65));
+    var stride: u32 = 0;
+    var md: ?*anyopaque = null;
+    const p: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(cursor, 1, 1, 2, 2, 1, &stride, &md).?);
+    try std.testing.expectEqual(@as(u8, 0x7f), p[0]);
+    libgbm.gbm_bo_unmap(cursor, md);
+    libgbm.gbm_bo_destroy(cursor);
+    try std.testing.expectEqual(@as(?*anyopaque, &marker), user_data_freed);
+
+    const gs = libgbm.gbm_surface_create(dev, 8, 8, B.FORMAT_XRGB8888, B.BO_USE_RENDERING | B.BO_USE_SCANOUT) orelse return error.NoSurface;
+    defer libgbm.gbm_surface_destroy(gs);
+    try std.testing.expectEqual(@as(c_int, 1), libgbm.gbm_surface_has_free_buffers(gs));
+    const dpy = eglGetPlatformDisplay(egl.PLATFORM_GBM_KHR, dev, null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(dpy, null, null));
+    defer _ = eglTerminate(dpy);
+    // (XRGB8888: the config without alpha, its native visual the format)
+    var visual: i32 = 0;
+    try std.testing.expectEqual(egl.TRUE, eglGetConfigAttrib(dpy, &egl.configs[3], egl.NATIVE_VISUAL_ID, &visual));
+    try std.testing.expectEqual(B.FORMAT_XRGB8888, @as(u32, @bitCast(visual)));
+    const surface = eglCreateWindowSurface(dpy, &egl.configs[3], gs, null) orelse return error.NoSurface;
+    try std.testing.expect(eglCreatePlatformWindowSurface(dpy, &egl.configs[3], gs, null) == null);
+    const ctx = eglCreateContext(dpy, &egl.configs[3], null, &.{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE }).?;
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(dpy, surface, surface, ctx));
+    var w: i32 = 0;
+    try std.testing.expectEqual(egl.TRUE, eglQuerySurface(dpy, surface, egl.WIDTH, &w));
+    try std.testing.expectEqual(@as(i32, 8), w);
+    var front: [3]?*B.Bo = undefined;
+    for (0..3) |frame| {
+        var age: i32 = -1;
+        try std.testing.expectEqual(egl.TRUE, eglQuerySurface(dpy, surface, egl.BUFFER_AGE_EXT, &age));
+        try std.testing.expectEqual(@as(i32, if (frame == 2) 2 else 0), age);
+        const v: f32 = @floatFromInt(frame + 1);
+        libgles.glClearColor(v / 4, 0, 0, 1);
+        libgles.glClear(g.COLOR_BUFFER_BIT);
+        try std.testing.expectEqual(egl.TRUE, eglSwapBuffers(dpy, surface));
+        front[frame] = libgbm.gbm_surface_lock_front_buffer(gs) orelse return error.NoFront;
+        const px: [*]const u8 = @ptrCast(libgbm.gbm_bo_map(front[frame], 0, 0, 8, 8, 1, &stride, &md).?);
+        try std.testing.expectEqual(@as(u8, @intFromFloat(@round(v / 4 * 255))), px[2]);
+        libgbm.gbm_bo_unmap(front[frame], md);
+        // (the one before goes back once this one is shown)
+        if (frame > 0) libgbm.gbm_surface_release_buffer(gs, front[frame - 1]);
+    }
+    try std.testing.expect(front[0] != front[1] and front[2] == front[0]);
+    try std.testing.expect(libgbm.gbm_surface_lock_front_buffer(gs) == null);
+    try std.testing.expectEqual(egl.TRUE, eglMakeCurrent(dpy, null, null, null));
+    try std.testing.expectEqual(egl.TRUE, eglDestroySurface(dpy, surface));
+    libgbm.gbm_surface_release_buffer(gs, front[2]);
+}
+
+// ── Two threads drawing at once (the driver lock) ──────────────────────────
+
+var mt_mem: [8 << 20]u8 align(4096) = undefined;
+var mt_work: [4 << 20]u8 align(64) = undefined;
+var mt_compile: [256 << 10]u8 align(64) = undefined;
+var mt_emu: gpu.EmuDevice = undefined;
+var mt_eng: engine.Engine = undefined;
+/// The threads in at the start (each waits for the other, so their calls
+/// meet).
+var mt_started = std.atomic.Value(u32).init(0);
+
+fn mtOpen() ?*engine.Engine {
+    return &mt_eng;
+}
+
+const MT_THREADS = 2;
+const MT_W = 16;
+const MT_H = 16;
+const MT_ROUNDS = 100;
+
+/// A drawing thread's: its number, the display, and what it found.
+const MtRun = struct {
+    which: u32,
+    dpy: ?*anyopaque,
+    /// rounds whose every pixel was right, and those with one wrong
+    right: u32 = 0,
+    wrong: u32 = 0,
+    /// the first wrong pixel: where, what was read, what was wanted
+    first: ?struct { round: usize, x: usize, y: usize, got: [4]u8, want: [4]u8 } = null,
+    /// a call that failed (no rounds drawn then)
+    failed: ?[]const u8 = null,
+};
+
+/// A color of thread `which`'s, round `round`'s, clear (part 0) or draw
+/// (part 1): no two threads' alike in a round, opaque.
+fn mtColor(which: u32, round: usize, part: u32) [4]u8 {
+    const k: u32 = @intCast(round);
+    return .{ @truncate(which * 120 + part * 60 + k * 5 + 1), @truncate(which * 30 + part * 90 + k * 3), @truncate(250 - which * 70 - part * 40 - k), 255 };
+}
+
+fn mtFloat(v: u8) f32 {
+    return @as(f32, @floatFromInt(v)) / 255.0;
+}
+
+fn mtShader(kind: u32, src: [*:0]const u8) u32 {
+    const s = libgles.glCreateShader(kind);
+    const parts = [_]?[*]const u8{src};
+    libgles.glShaderSource(s, 1, &parts, null);
+    libgles.glCompileShader(s);
+    return s;
+}
+
+/// One thread's: a context and a pbuffer of its own, made current here,
+/// then rounds of a clear and a draw over the left half, each in this
+/// thread's colors of the round, read back and checked whole.
+fn mtDraw(run: *MtRun) void {
+    const g = gfxapi.glenum;
+    _ = mt_started.fetchAdd(1, .acq_rel);
+    while (mt_started.load(.acquire) < MT_THREADS) std.atomic.spinLoopHint();
+    const d = run.dpy;
+    const cfg = &egl.configs[1];
+    const ctx = eglCreateContext(d, cfg, null, &.{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE }) orelse {
+        run.failed = "eglCreateContext";
+        return;
+    };
+    defer _ = eglDestroyContext(d, ctx);
+    const pb = eglCreatePbufferSurface(d, cfg, &.{ egl.WIDTH, MT_W, egl.HEIGHT, MT_H, egl.NONE }) orelse {
+        run.failed = "eglCreatePbufferSurface";
+        return;
+    };
+    defer _ = eglDestroySurface(d, pb);
+    if (eglMakeCurrent(d, pb, pb, ctx) != egl.TRUE) {
+        run.failed = "eglMakeCurrent";
+        return;
+    }
+    defer _ = eglMakeCurrent(d, null, null, null);
+    const vs = mtShader(g.VERTEX_SHADER, "#version 300 es\nin vec2 aPos;\nvoid main() { gl_Position = vec4(aPos, 0.0, 1.0); }\n");
+    defer libgles.glDeleteShader(vs);
+    const fs = mtShader(g.FRAGMENT_SHADER, "#version 300 es\nprecision mediump float;\nuniform vec4 uColor;\nout vec4 oColor;\nvoid main() { oColor = uColor; }\n");
+    defer libgles.glDeleteShader(fs);
+    const prog = libgles.glCreateProgram();
+    defer libgles.glDeleteProgram(prog);
+    libgles.glAttachShader(prog, vs);
+    libgles.glAttachShader(prog, fs);
+    libgles.glBindAttribLocation(prog, 0, "aPos");
+    libgles.glLinkProgram(prog);
+    var linked: i32 = 0;
+    libgles.glGetProgramiv(prog, g.LINK_STATUS, @ptrCast(&linked));
+    if (linked != 1) {
+        run.failed = "glLinkProgram";
+        return;
+    }
+    libgles.glUseProgram(prog);
+    const loc = libgles.glGetUniformLocation(prog, "uColor");
+    // the left half: two triangles over x in [-1, 0]
+    const quad = [_]f32{ -1, -1, 0, -1, 0, 1, -1, -1, 0, 1, -1, 1 };
+    var vbo: [1]u32 = undefined;
+    libgles.glGenBuffers(1, &vbo);
+    defer libgles.glDeleteBuffers(1, &vbo);
+    libgles.glBindBuffer(g.ARRAY_BUFFER, vbo[0]);
+    libgles.glBufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, g.STATIC_DRAW);
+    libgles.glVertexAttribPointer(0, 2, g.FLOAT, 0, 0, null);
+    libgles.glEnableVertexAttribArray(0);
+    if (loc < 0 or libgles.glGetError() != g.NO_ERROR) {
+        run.failed = "the program's setup";
+        return;
+    }
+    var px: [MT_W * MT_H * 4]u8 = undefined;
+    for (0..MT_ROUNDS) |r| {
+        const back = mtColor(run.which, r, 0);
+        const fore = mtColor(run.which, r, 1);
+        libgles.glClearColor(mtFloat(back[0]), mtFloat(back[1]), mtFloat(back[2]), 1);
+        libgles.glClear(g.COLOR_BUFFER_BIT);
+        libgles.glUniform4f(loc, mtFloat(fore[0]), mtFloat(fore[1]), mtFloat(fore[2]), 1);
+        libgles.glDrawArrays(g.TRIANGLES, 0, 6);
+        @memset(&px, 0);
+        libgles.glReadPixels(0, 0, MT_W, MT_H, g.RGBA, g.UNSIGNED_BYTE, &px);
+        var right = true;
+        for (0..MT_H) |y| {
+            for (0..MT_W) |x| {
+                const want = if (x < MT_W / 2) fore else back;
+                const got = px[(y * MT_W + x) * 4 ..][0..4].*;
+                if (std.mem.eql(u8, &got, &want)) continue;
+                if (run.first == null) run.first = .{ .round = r, .x = x, .y = y, .got = got, .want = want };
+                right = false;
+            }
+        }
+        if (right) run.right += 1 else run.wrong += 1;
+    }
+    // (an entry point that calls another: the lock entered twice)
+    if (libgles.glGetGraphicsResetStatusEXT() != g.NO_ERROR) run.failed = "glGetGraphicsResetStatusEXT";
+    if (libgles.glGetError() != g.NO_ERROR) run.failed = "a GL call (glGetError)";
+}
+
+test "libgalaxy_gl: two threads draw at once, each in its own context, and each reads back only its own pixels" {
+    mt_emu = gpu.EmuDevice.init(gpu.interp_caps, &mt_mem, &mt_work);
+    mt_eng.init(.{ .dev = mt_emu.device(), .work = &mt_compile });
+    egl.setDriver(.{ .open = mtOpen, .host = test_host, .wayland = noWayland });
+    const d = eglGetDisplay(null).?;
+    try std.testing.expectEqual(egl.TRUE, eglInitialize(d, null, null));
+    defer _ = eglTerminate(d);
+    // the lock: free between calls, re-entrant for its holder (EGL and GL
+    // calls made while this thread holds it go through)
+    try std.testing.expect(egl.driverFree());
+    egl.driverEnter();
+    egl.driverEnter();
+    try std.testing.expect(!egl.driverFree());
+    try std.testing.expectEqual(gfxapi.glenum.NO_ERROR, libgles.glGetError());
+    try std.testing.expectEqual(egl.SUCCESS, eglGetError());
+    try std.testing.expect(eglQueryString(d, egl.EXTENSIONS) != null);
+    egl.driverLeave();
+    try std.testing.expect(!egl.driverFree());
+    egl.driverLeave();
+    try std.testing.expect(egl.driverFree());
+    mt_started.store(0, .release);
+    var runs: [MT_THREADS]MtRun = undefined;
+    for (&runs, 0..) |*r, i| r.* = .{ .which = @intCast(i), .dpy = d };
+    var threads: [MT_THREADS]std.Thread = undefined;
+    for (&threads, &runs) |*t, *r| t.* = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, mtDraw, .{r});
+    for (threads) |t| t.join();
+    for (runs) |r| {
+        if (r.failed) |what| std.debug.print("thread {d}: {s} failed\n", .{ r.which, what });
+        if (r.first) |f| std.debug.print("thread {d}: {d} rounds wrong; the first at round {d}, ({d}, {d}): {any}, not {any}\n", .{ r.which, r.wrong, f.round, f.x, f.y, f.got, f.want });
+    }
+    for (runs) |r| {
+        try std.testing.expect(r.failed == null);
+        try std.testing.expectEqual(@as(u32, MT_ROUNDS), r.right);
+    }
+    // the lock let go by both, the device kept, every draw on it
+    try std.testing.expect(egl.driverFree());
+    try std.testing.expect(!mt_eng.lost);
+    try std.testing.expect(mt_eng.stats.dispatches >= MT_THREADS * MT_ROUNDS * 3);
 }

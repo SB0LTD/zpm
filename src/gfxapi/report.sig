@@ -23,11 +23,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const Kind = enum(u4) { device, missing, link, pipeline, lost, gl_error, check, egl_error, marker, slow, usage };
+pub const Kind = enum(u4) { device, missing, link, pipeline, lost, gl_error, check, egl_error, marker, slow, usage, in_flight };
 
 /// How many lines of each kind a process says (0: no such limit; a usage
 /// line is limited by time instead, one per context every USAGE_US).
-const LIMITS = [_]u8{ 4, 64, 16, 16, 4, 16, 32, 32, 16, 8, 0 };
+const LIMITS = [_]u8{ 4, 64, 16, 16, 4, 16, 32, 32, 16, 8, 0, 4 };
 
 pub var sink: ?*const fn ([]const u8) void = if (builtin.os.tag == .linux and !builtin.is_test) &stderrLine else null;
 

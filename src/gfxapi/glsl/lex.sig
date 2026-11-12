@@ -162,6 +162,12 @@ const reserved_words = [_][]const u8{
     "common",   "partition", "active",   "filter",        "image2D",  "noperspective", "patch", "sample",  "buffer",
 };
 
+/// reserved_words GLSL ES 1.00 does not reserve.
+const reserved_300_only = [_][]const u8{
+    "resource", "coherent", "restrict", "readonly", "writeonly", "subroutine", "common", "partition",
+    "active",   "filter",   "image2D",  "noperspective", "patch", "sample", "buffer",
+};
+
 /// A word's keyword, for `version` (100 or 300): a keyword of the other
 /// version only is a name there (or reserved: attribute and varying in
 /// 3.00).
@@ -183,7 +189,17 @@ pub fn keyword(word: []const u8, version: u32) Kw {
         }
     }
     for (reserved_words) |r| {
-        if (std.mem.eql(u8, word, r)) return .reserved;
+        if (std.mem.eql(u8, word, r)) {
+            // (GLSL ES 3.00's own reserved words are names in 1.00, whose
+            // list (1.00.17, 3.7) is the rest: Xwayland's Xv shaders name
+            // a float `sample`)
+            if (version < 300) {
+                for (reserved_300_only) |o| {
+                    if (std.mem.eql(u8, word, o)) return .none;
+                }
+            }
+            return .reserved;
+        }
     }
     // (names with two underscores in a row, or gl_ ones a shader declares:
     // the parser and checker say so)
@@ -341,4 +357,9 @@ test "lex: a line's tokens" {
     try std.testing.expectEqual(Kw.attribute, keyword("attribute", 100));
     try std.testing.expectEqual(Kw.none, keyword("uint", 100));
     try std.testing.expectEqual(Kw.reserved, keyword("goto", 300));
+    // (3.00's reserved words are 1.00's names: glamor's Xv `float sample;`)
+    try std.testing.expectEqual(Kw.reserved, keyword("sample", 300));
+    try std.testing.expectEqual(Kw.none, keyword("sample", 100));
+    try std.testing.expectEqual(Kw.none, keyword("patch", 100));
+    try std.testing.expectEqual(Kw.reserved, keyword("goto", 100));
 }

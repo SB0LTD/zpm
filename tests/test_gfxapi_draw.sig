@@ -14,6 +14,9 @@
 //! A second scene is larger than a bin (raster.BIN): blended triangles all
 //! over, big ones across bins under a scissor, a thin strip. Binned, not
 //! binned, and binned with lists that run over must give the same bytes.
+//!
+//! On the emulated Adreno and RTX too: a video picture's unorm16 planes
+//! (P010's R16 and GR1616, as EGLImages give them) sampled exactly.
 
 const std = @import("std");
 const gpu = @import("gpu");
@@ -26,6 +29,8 @@ const raster = gfxapi.raster;
 const g = gfxapi.glenum;
 const node = gfxapi.node;
 const program = gfxapi.program;
+/// (zpm src/va's: the layout the VA driver's pictures are in)
+const tiling = @import("va_tiling");
 
 const r = kir.r;
 
@@ -666,6 +671,614 @@ fn mutableCubeDraw(eng: *engine.Engine) !void {
     try std.testing.expect(!eng.lost);
 }
 
+/// A video picture's unorm16 planes (P010's: R16, GR1616) as EGLImages
+/// give them (the engine's memory, shared; moved out of a slab first
+/// where the engine has slabs), sampled by texelFetch and a bilinear
+/// texture(): the unorm8 GL says (v / 65535), the same on every GPU.
+const Plane = struct {
+    fn resolve(handle: ?*anyopaque) ?*engine.Image {
+        return @ptrCast(@alignCast(handle orelse return null));
+    }
+    fn to8(x: u16) u8 {
+        return @intFromFloat(@round(@as(f64, @floatFromInt(x)) * 255.0 / 65535.0));
+    }
+};
+
+fn planeSample(eng: *engine.Engine) !void {
+    objs.init();
+    ctx.init(eng, &objs);
+    defer ctx.deinit();
+    const saved = gles.egl_image;
+    gles.egl_image = Plane.resolve;
+    defer gles.egl_image = saved;
+    // R16 4 x 1, GR1616 2 x 1: each sample's unorm8 is neither of its
+    // bytes (a plane read a byte a channel, or byte-swapped, differs)
+    const y16 = [4]u16{ 0x12f0, 0x40ff, 0x00c8, 0xe000 };
+    const uv16 = [4]u16{ 0x40ff, 0x12f0, 0xe000, 0x00c8 };
+    var y_bytes: [8]u8 = undefined;
+    var uv_bytes: [8]u8 = undefined;
+    for (y16, uv16, 0..) |a, b, i| {
+        std.mem.writeInt(u16, y_bytes[i * 2 ..][0..2], a, .little);
+        std.mem.writeInt(u16, uv_bytes[i * 2 ..][0..2], b, .little);
+    }
+    var y_sh: engine.Shared = .{};
+    var uv_sh: engine.Shared = .{};
+    var y = eng.newImage(4, 1, .r16) orelse return error.OutOfMemory;
+    var uv = eng.newImage(2, 1, .rg16) orelse return error.OutOfMemory;
+    try std.testing.expect(eng.shareOwn(&y, &y_sh));
+    try std.testing.expect(eng.shareOwn(&uv, &uv_sh));
+    defer eng.freeImage(&y);
+    defer eng.freeImage(&uv);
+    eng.write(&y, 0, 0, 4, 1, &y_bytes, 8, .r16);
+    eng.write(&uv, 0, 0, 2, 1, &uv_bytes, 8, .rg16);
+
+    var names: [3]u32 = undefined;
+    ctx.genTextures(&names);
+    defer ctx.deleteTextures(&names);
+    ctx.bindTexture(g.TEXTURE_2D, names[2]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, 1, 1);
+    var fb: [1]u32 = undefined;
+    ctx.genFramebuffers(&fb);
+    defer ctx.deleteFramebuffers(&fb);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, names[2], 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, ctx.checkFramebufferStatus(g.FRAMEBUFFER));
+    for ([_]u32{ names[0], names[1] }, [_]*engine.Image{ &y, &uv }) |t, img| {
+        ctx.bindTexture(g.TEXTURE_2D, t);
+        ctx.eglImageTargetTexture2D(g.TEXTURE_2D, img);
+        ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST);
+        ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST);
+    }
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    const P = "#version 300 es\nprecision highp float; uniform highp sampler2D tex; out vec4 color; void main() { ";
+    // R16: texel 1 (the high half of word 0), texel 2 (the low half of word 1)
+    ctx.bindTexture(g.TEXTURE_2D, names[0]);
+    try sampleLayerTexture(P ++ "color = texelFetch(tex, ivec2(1, 0), 0); }", .{ Plane.to8(y16[1]), 0, 0, 255 });
+    try sampleLayerTexture(P ++ "color = texelFetch(tex, ivec2(2, 0), 0); }", .{ Plane.to8(y16[2]), 0, 0, 255 });
+    // bilinear, half way between texels 1 and 2: (16639 + 200) / 2 / 257
+    ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR);
+    try sampleLayerTexture(P ++ "color = texture(tex, vec2(0.5, 0.5)); }", .{ 33, 0, 0, 255 });
+    // GR1616: texel 1's R (bytes 0..1) and G (bytes 2..3)
+    ctx.bindTexture(g.TEXTURE_2D, names[1]);
+    try sampleLayerTexture(P ++ "color = texelFetch(tex, ivec2(1, 0), 0); }", .{ Plane.to8(uv16[2]), Plane.to8(uv16[3]), 0, 255 });
+    ctx.bindFramebuffer(g.FRAMEBUFFER, 0);
+}
+
+/// A video decoder's planes as the VA driver exports them (block linear,
+/// NVIDIA's GOBs, each swizzle: GB20x's 8- and 16-bit, Turing's), as
+/// EGLImages give them, sampled by texelFetch at every texel: each against
+/// va's tiling.sig (the layout's CPU reference) — the texel's bytes where
+/// tiling.tile put them.
+fn blockPlaneSample(eng: *engine.Engine) !void {
+    objs.init();
+    ctx.init(eng, &objs);
+    defer ctx.deinit();
+    const saved = gles.egl_image;
+    gles.egl_image = Plane.resolve;
+    defer gles.egl_image = saved;
+    const pw = 37;
+    const ph = 21;
+    const Case = struct { format: engine.Format, swizzle: tiling.Swizzle };
+    const cases = [_]Case{
+        .{ .format = .rg16, .swizzle = .turing2d }, // P010's UV
+        .{ .format = .r8, .swizzle = .blackwell8 }, // NV12's Y
+        .{ .format = .rg8, .swizzle = .blackwell16 }, // NV12's UV
+        .{ .format = .r16, .swizzle = .blackwell16 }, // P010's Y
+        .{ .format = .r8, .swizzle = .turing2d }, // GALAXY_VA_GOB=turing
+        .{ .format = .rg8, .swizzle = .blackwell8 },
+    };
+    var names: [1]u32 = undefined;
+    ctx.genTextures(&names);
+    defer ctx.deleteTextures(&names);
+    var target: [1]u32 = undefined;
+    ctx.genTextures(&target);
+    defer ctx.deleteTextures(&target);
+    ctx.bindTexture(g.TEXTURE_2D, target[0]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, pw, ph);
+    var fb: [1]u32 = undefined;
+    ctx.genFramebuffers(&fb);
+    defer ctx.deleteFramebuffers(&fb);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, target[0], 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, ctx.checkFramebufferStatus(g.FRAMEBUFFER));
+    const vs = try compileLayerShader(g.VERTEX_SHADER, "#version 300 es\nlayout(location=0) in vec4 pos; void main() { gl_Position=pos; }");
+    defer program.deleteShader(&ctx, vs);
+    const fs = try compileLayerShader(g.FRAGMENT_SHADER, "#version 300 es\nprecision highp float; uniform highp sampler2D tex; out vec4 color; void main() { color = texelFetch(tex, ivec2(gl_FragCoord.xy), 0); }");
+    defer program.deleteShader(&ctx, fs);
+    const prog = program.createProgram(&ctx);
+    defer program.deleteProgram(&ctx, prog);
+    program.attachShader(&ctx, prog, vs);
+    program.attachShader(&ctx, prog, fs);
+    program.linkProgram(&ctx, prog);
+    program.useProgram(&ctx, prog);
+    defer program.useProgram(&ctx, 0);
+    var vbuf: [1]u32 = undefined;
+    ctx.genBuffers(&vbuf);
+    for (cases) |cs| {
+        const bpp = cs.format.bytes();
+        const plane = tiling.Plane.of(pw * bpp, ph);
+        // the plane's memory: an image of whole GOB rows, filled with
+        // tiling.tile's bytes, then named as the block-linear picture
+        var img = eng.newImage(plane.pitch / bpp, plane.rows, cs.format) orelse return error.OutOfMemory;
+        var sh: engine.Shared = .{};
+        try std.testing.expect(eng.shareOwn(&img, &sh));
+        try std.testing.expectEqual(plane.pitch, img.stride);
+        var linear: [pw * 4 * ph]u8 = undefined;
+        for (&linear, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 11);
+        var tiled: [8192]u8 = undefined;
+        @memset(&tiled, 0);
+        tiling.tile(&tiled, plane, cs.swizzle, &linear, pw * bpp, pw * bpp, ph);
+        eng.write(&img, 0, 0, plane.pitch / bpp, plane.rows, tiled[0..plane.bytes()], plane.pitch, cs.format);
+        const whole_w = img.width;
+        const whole_h = img.height;
+        img.width = pw;
+        img.height = ph;
+        img.layout = .{ .block = true, .swizzle = @enumFromInt(@intFromEnum(cs.swizzle)), .gobs_log2 = tiling.BLOCK_GOBS_LOG2 };
+        ctx.bindTexture(g.TEXTURE_2D, names[0]);
+        ctx.eglImageTargetTexture2D(g.TEXTURE_2D, &img);
+        ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST);
+        ctx.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST);
+        try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+        ctx.viewportSet(0, 0, pw, ph);
+        const vertices = quad(0, 0, W, H, 0, .{ 0, 0, 0, 0 });
+        drawVerts(&ctx, vbuf[0], &vertices, g.TRIANGLES);
+        var got: [pw * ph * 4]u8 = undefined;
+        ctx.readPixels(0, 0, pw, ph, g.RGBA, g.UNSIGNED_BYTE, &got);
+        const err = ctx.getError();
+        if (err != g.NO_ERROR) std.debug.print("block-linear {s} {s}: GL {x}, pipeline {?s}, GPU {?s}\n", .{ @tagName(cs.format), @tagName(cs.swizzle), err, if (ctx.eng.why_pipe) |why| @errorName(why) else null, if (ctx.eng.why) |why| @errorName(why) else null });
+        try std.testing.expectEqual(g.NO_ERROR, err);
+        for (0..ph) |y| {
+            for (0..pw) |x| {
+                const row = linear[y * pw * bpp ..];
+                const want: [4]u8 = switch (cs.format) {
+                    .r8 => .{ row[x], 0, 0, 255 },
+                    .rg8 => .{ row[x * 2], row[x * 2 + 1], 0, 255 },
+                    .r16 => .{ Plane.to8(std.mem.readInt(u16, row[x * 2 ..][0..2], .little)), 0, 0, 255 },
+                    else => .{ Plane.to8(std.mem.readInt(u16, row[x * 4 ..][0..2], .little)), Plane.to8(std.mem.readInt(u16, row[x * 4 + 2 ..][0..2], .little)), 0, 255 },
+                };
+                const have = got[(y * pw + x) * 4 ..][0..4];
+                if (!std.mem.eql(u8, &want, have)) {
+                    std.debug.print("block-linear {s} {s} texel ({d}, {d}): {any}, not {any}\n", .{ @tagName(cs.format), @tagName(cs.swizzle), x, y, have, want });
+                    return error.BlockLinear;
+                }
+            }
+        }
+        // (unbound, and the GPU done with it, before the image goes)
+        ctx.finish();
+        ctx.bindTexture(g.TEXTURE_2D, 0);
+        ctx.deleteTextures(&names);
+        ctx.genTextures(&names);
+        img.width = whole_w;
+        img.height = whole_h;
+        eng.freeImage(&img);
+    }
+    ctx.deleteBuffers(&vbuf);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, 0);
+}
+
+// ── Uniform blocks (std140) ────────────────────────────────────────────────
+
+const block_vs: [:0]const u8 =
+    \\#version 300 es
+    \\layout(location = 0) in vec4 pos;
+    \\layout(std140) uniform Scene { vec4 tint; mat3 m; float scale[2]; } scene;
+    \\void main() { gl_Position = pos + vec4(0.0, 0.0, 0.0, scene.scale[0]); }
+;
+
+// (the fragment shader names Scene's instance otherwise; Light is
+// anonymous, its matrix row-major, its bool any non-zero word)
+const block_fs: [:0]const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\layout(std140) uniform Scene { vec4 tint; mat3 m; float scale[2]; } s;
+    \\layout(std140) uniform Light { layout(row_major) mat2 r; vec3 dir; bool on; };
+    \\out vec4 color;
+    \\void main() {
+    \\    vec3 v = s.m * vec3(1.0, 0.0, 0.0);
+    \\    color = vec4(s.tint.x * s.scale[1], v.y, (r * vec2(0.0, 1.0)).x + dir.z, on ? 1.0 : 0.0);
+    \\}
+;
+
+fn putF(bytes: []u8, at: usize, x: f32) void {
+    std.mem.writeInt(u32, bytes[at..][0..4], @bitCast(x), .little);
+}
+
+/// Two uniform blocks: GL's names, std140 offsets and strides as the
+/// queries give them, binding points, and a draw reading the members
+/// from buffer ranges (one at an offset), each pixel byte one only the
+/// right layout gives.
+fn uniformBlocks(eng: *engine.Engine) !void {
+    objs.init();
+    ctx.init(eng, &objs);
+    defer ctx.deinit();
+    const vs = try compileLayerShader(g.VERTEX_SHADER, block_vs);
+    defer program.deleteShader(&ctx, vs);
+    const fs = try compileLayerShader(g.FRAGMENT_SHADER, block_fs);
+    defer program.deleteShader(&ctx, fs);
+    const p = program.createProgram(&ctx);
+    defer program.deleteProgram(&ctx, p);
+    program.attachShader(&ctx, p, vs);
+    program.attachShader(&ctx, p, fs);
+    program.linkProgram(&ctx, p);
+    var ok: i32 = 0;
+    program.getProgramiv(&ctx, p, g.LINK_STATUS, &ok);
+    if (ok != 1) {
+        var log: [512]u8 = undefined;
+        var len: i32 = 0;
+        program.getProgramInfoLog(&ctx, p, log.len, &len, &log);
+        std.debug.print("block program: {s}\n", .{log[0..@intCast(len)]});
+        return error.Link;
+    }
+    // the blocks, their sizes, who reads them
+    var n: i32 = 0;
+    program.getProgramiv(&ctx, p, g.ACTIVE_UNIFORM_BLOCKS, &n);
+    try std.testing.expectEqual(@as(i32, 2), n);
+    const scene_ix = program.getUniformBlockIndex(&ctx, p, "Scene");
+    const light_ix = program.getUniformBlockIndex(&ctx, p, "Light");
+    try std.testing.expect(scene_ix != g.INVALID_INDEX and light_ix != g.INVALID_INDEX and scene_ix != light_ix);
+    try std.testing.expectEqual(g.INVALID_INDEX, program.getUniformBlockIndex(&ctx, p, "s"));
+    var iv: [8]i32 = undefined;
+    program.getActiveUniformBlockiv(&ctx, p, scene_ix, g.UNIFORM_BLOCK_DATA_SIZE, &iv);
+    try std.testing.expectEqual(@as(i32, 96), iv[0]); // tint 16, m 48, scale 2 x 16
+    program.getActiveUniformBlockiv(&ctx, p, light_ix, g.UNIFORM_BLOCK_DATA_SIZE, &iv);
+    try std.testing.expectEqual(@as(i32, 48), iv[0]); // r 32, dir 12, on 4
+    program.getActiveUniformBlockiv(&ctx, p, scene_ix, g.UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER, &iv);
+    try std.testing.expectEqual(@as(i32, 1), iv[0]);
+    program.getActiveUniformBlockiv(&ctx, p, light_ix, g.UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER, &iv);
+    try std.testing.expectEqual(@as(i32, 0), iv[0]);
+    program.getActiveUniformBlockiv(&ctx, p, scene_ix, g.UNIFORM_BLOCK_ACTIVE_UNIFORMS, &iv);
+    try std.testing.expectEqual(@as(i32, 3), iv[0]);
+    var name: [32]u8 = undefined;
+    var len: i32 = 0;
+    program.getActiveUniformBlockName(&ctx, p, light_ix, name.len, &len, &name);
+    try std.testing.expectEqualStrings("Light", name[0..@intCast(len)]);
+    // the members by GL's names: offsets, strides, layouts; no locations
+    const names = [_][*:0]const u8{ "Scene.tint", "Scene.m", "Scene.scale[0]", "r", "dir", "on" };
+    var idx: [names.len]u32 = undefined;
+    program.getUniformIndices(&ctx, p, names.len, &names, &idx);
+    for (idx) |ix| try std.testing.expect(ix != g.INVALID_INDEX);
+    var offsets: [names.len]i32 = undefined;
+    program.getActiveUniformsiv(&ctx, p, names.len, &idx, g.UNIFORM_OFFSET, &offsets);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 16, 64, 0, 32, 44 }, &offsets);
+    var strides: [names.len]i32 = undefined;
+    program.getActiveUniformsiv(&ctx, p, names.len, &idx, g.UNIFORM_ARRAY_STRIDE, &strides);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0, 16, 0, 0, 0 }, &strides);
+    program.getActiveUniformsiv(&ctx, p, names.len, &idx, g.UNIFORM_MATRIX_STRIDE, &strides);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 16, 0, 16, 0, 0 }, &strides);
+    var row_major: [names.len]i32 = undefined;
+    program.getActiveUniformsiv(&ctx, p, names.len, &idx, g.UNIFORM_IS_ROW_MAJOR, &row_major);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0, 0, 1, 0, 0 }, &row_major);
+    var blocks: [names.len]i32 = undefined;
+    program.getActiveUniformsiv(&ctx, p, names.len, &idx, g.UNIFORM_BLOCK_INDEX, &blocks);
+    try std.testing.expectEqual(@as(i32, @intCast(scene_ix)), blocks[0]);
+    try std.testing.expectEqual(@as(i32, @intCast(light_ix)), blocks[5]);
+    try std.testing.expectEqual(@as(i32, -1), program.getUniformLocation(&ctx, p, "Scene.tint"));
+    try std.testing.expectEqual(@as(i32, -1), program.getUniformLocation(&ctx, p, "r"));
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+
+    // the buffers: Scene at binding 3, 256 bytes into its buffer (a
+    // range), Light at binding 1 (the whole buffer)
+    var scene_bytes = [_]u8{0} ** (256 + 96);
+    putF(&scene_bytes, 256 + 0, 0.1); // tint.x
+    putF(&scene_bytes, 256 + 16 + 4, 0.6); // m[0].y
+    putF(&scene_bytes, 256 + 16 + 16, 9.0); // m[1].x (a wrong layout's)
+    putF(&scene_bytes, 256 + 64, 0.0); // scale[0]
+    putF(&scene_bytes, 256 + 80, 2.0); // scale[1]
+    var light_bytes = [_]u8{0} ** 48;
+    putF(&light_bytes, 0, 0.3); // row 0: (0.3, 0.4)
+    putF(&light_bytes, 4, 0.4);
+    putF(&light_bytes, 16, 0.8); // row 1: (0.8, 0.9): column-major would read 0.8
+    putF(&light_bytes, 20, 0.9);
+    putF(&light_bytes, 32 + 8, 0.0); // dir.z
+    std.mem.writeInt(u32, light_bytes[44..][0..4], 7, .little); // on (true)
+    var bufs: [3]u32 = undefined;
+    ctx.genBuffers(&bufs);
+    ctx.bindBuffer(g.UNIFORM_BUFFER, bufs[0]);
+    ctx.bufferData(g.UNIFORM_BUFFER, scene_bytes.len, &scene_bytes, g.STATIC_DRAW);
+    ctx.bindBuffer(g.UNIFORM_BUFFER, bufs[1]);
+    ctx.bufferData(g.UNIFORM_BUFFER, light_bytes.len, &light_bytes, g.STATIC_DRAW);
+    program.uniformBlockBinding(&ctx, p, scene_ix, 3);
+    program.uniformBlockBinding(&ctx, p, light_ix, 1);
+    ctx.bindBufferRange(g.UNIFORM_BUFFER, 3, bufs[0], 256, 96, true);
+    ctx.bindBufferRange(g.UNIFORM_BUFFER, 1, bufs[1], 0, 0, false);
+    try std.testing.expectEqual(@as(?i64, bufs[0]), ctx.getIndexed(g.UNIFORM_BUFFER_BINDING, 3));
+    try std.testing.expectEqual(@as(?i64, 256), ctx.getIndexed(g.UNIFORM_BUFFER_START, 3));
+    try std.testing.expectEqual(@as(?i64, 96), ctx.getIndexed(g.UNIFORM_BUFFER_SIZE, 3));
+    program.getActiveUniformBlockiv(&ctx, p, scene_ix, g.UNIFORM_BLOCK_BINDING, &iv);
+    try std.testing.expectEqual(@as(i32, 3), iv[0]);
+    // what GL refuses: a range off the alignment, a binding point past the last
+    ctx.bindBufferRange(g.UNIFORM_BUFFER, 3, bufs[0], 4, 96, true);
+    try std.testing.expectEqual(g.INVALID_VALUE, ctx.getError());
+    ctx.bindBufferRange(g.UNIFORM_BUFFER, program.MAX_UNIFORM_BUFFER_BINDINGS, bufs[0], 0, 0, false);
+    try std.testing.expectEqual(g.INVALID_VALUE, ctx.getError());
+    program.uniformBlockBinding(&ctx, p, scene_ix, program.MAX_UNIFORM_BUFFER_BINDINGS);
+    try std.testing.expectEqual(g.INVALID_VALUE, ctx.getError());
+
+    // the draw: r = tint.x * scale[1] = 0.2, g = m[0].y = 0.6, b = the
+    // row-major r's (0, 1) product's x = 0.4, a = on
+    var tex: [1]u32 = undefined;
+    ctx.genTextures(&tex);
+    defer ctx.deleteTextures(&tex);
+    ctx.bindTexture(g.TEXTURE_2D, tex[0]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, 1, 1);
+    var fb: [1]u32 = undefined;
+    ctx.genFramebuffers(&fb);
+    defer ctx.deleteFramebuffers(&fb);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex[0], 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, ctx.checkFramebufferStatus(g.FRAMEBUFFER));
+    program.useProgram(&ctx, p);
+    defer program.useProgram(&ctx, 0);
+    ctx.viewportSet(0, 0, 1, 1);
+    var vb: [1]u32 = undefined;
+    ctx.genBuffers(&vb);
+    const vertices = quad(0, 0, W, H, 0, .{ 0, 0, 0, 0 });
+    drawVerts(&ctx, vb[0], &vertices, g.TRIANGLES);
+    var pixel: [4]u8 = undefined;
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    try std.testing.expectEqualSlices(u8, &.{ 51, 153, 102, 255 }, &pixel);
+    // a block's buffer written again: the next draw reads the new bytes
+    putF(&light_bytes, 4, 0.0);
+    std.mem.writeInt(u32, light_bytes[44..][0..4], 0, .little);
+    ctx.bindBuffer(g.UNIFORM_BUFFER, bufs[1]);
+    ctx.bufferSubData(g.UNIFORM_BUFFER, 0, light_bytes.len, &light_bytes);
+    drawVerts(&ctx, vb[0], &vertices, g.TRIANGLES);
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqualSlices(u8, &.{ 51, 153, 0, 0 }, &pixel);
+    // the buffer gone: its binding points let go
+    ctx.deleteBuffers(&bufs);
+    try std.testing.expectEqual(@as(?i64, 0), ctx.getIndexed(g.UNIFORM_BUFFER_BINDING, 3));
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    ctx.bindFramebuffer(g.FRAMEBUFFER, 0);
+}
+
+// ── Transform feedback, occlusion queries, primitive restart ──────────────
+
+const xfb_vs: [:0]const u8 =
+    \\#version 300 es
+    \\layout(location = 0) in vec4 pos;
+    \\out vec4 vColor;
+    \\out float vExtra;
+    \\flat out int vId;
+    \\void main() {
+    \\    gl_Position = pos * 2.0;
+    \\    vColor = pos + vec4(1.0);
+    \\    vExtra = pos.x * 10.0;
+    \\    vId = gl_VertexID;
+    \\}
+;
+
+const xfb_fs: [:0]const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec4 vColor;
+    \\out vec4 color;
+    \\void main() { color = vec4(0.0, 1.0, 0.0, 1.0); }
+;
+
+const plain_vs: [:0]const u8 =
+    \\#version 300 es
+    \\layout(location = 0) in vec4 pos;
+    \\void main() { gl_Position = pos; }
+;
+
+const plain_fs: [:0]const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\out vec4 color;
+    \\void main() { color = vec4(1.0, 0.0, 1.0, 1.0); }
+;
+
+/// A program of two sources, linked (transform feedback's names before).
+fn linkPair(vs_src: [:0]const u8, fs_src: [:0]const u8, xfb: []const [*:0]const u8, mode: u32) !u32 {
+    const vs = try compileLayerShader(g.VERTEX_SHADER, vs_src);
+    defer program.deleteShader(&ctx, vs);
+    const fs = try compileLayerShader(g.FRAGMENT_SHADER, fs_src);
+    defer program.deleteShader(&ctx, fs);
+    const p = program.createProgram(&ctx);
+    program.attachShader(&ctx, p, vs);
+    program.attachShader(&ctx, p, fs);
+    if (xfb.len > 0) program.transformFeedbackVaryings(&ctx, p, @intCast(xfb.len), xfb.ptr, mode);
+    program.linkProgram(&ctx, p);
+    var ok: i32 = 0;
+    program.getProgramiv(&ctx, p, g.LINK_STATUS, &ok);
+    if (ok != 1) {
+        var log: [512]u8 = undefined;
+        var len: i32 = 0;
+        program.getProgramInfoLog(&ctx, p, log.len, &len, &log);
+        std.debug.print("program: {s}\n", .{log[0..@intCast(len)]});
+        return error.Link;
+    }
+    return p;
+}
+
+fn bufWords(eng: *engine.Engine, name: u32, n: usize) []const u32 {
+    const b = &objs.bufs[name - 1];
+    return std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(eng.hostView(&b.store, 0, n * 4))));
+}
+
+fn fbits(x: f32) u32 {
+    return @bitCast(x);
+}
+
+/// Transform feedback (interleaved: gl_Position, an output the fragment
+/// shader does not read, a flat int; separate buffers at an offset;
+/// points captured, not drawn; rasterizer discard; pause; GL's errors),
+/// its primitives query, an occlusion query (a quad behind the depth
+/// buffer: none passed; in front: some), and primitive restart.
+fn feedbackAndQueries(eng: *engine.Engine) !void {
+    objs.init();
+    ctx.init(eng, &objs);
+    defer ctx.deinit();
+    var tex: [1]u32 = undefined;
+    ctx.genTextures(&tex);
+    defer ctx.deleteTextures(&tex);
+    ctx.bindTexture(g.TEXTURE_2D, tex[0]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, 4, 4);
+    var rb: [1]u32 = undefined;
+    ctx.genRenderbuffers(&rb);
+    defer ctx.deleteRenderbuffers(&rb);
+    ctx.bindRenderbuffer(g.RENDERBUFFER, rb[0]);
+    ctx.renderbufferStorage(g.RENDERBUFFER, 0, g.DEPTH_COMPONENT16, 4, 4);
+    var fb: [1]u32 = undefined;
+    ctx.genFramebuffers(&fb);
+    defer ctx.deleteFramebuffers(&fb);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex[0], 0);
+    ctx.framebufferRenderbuffer(g.FRAMEBUFFER, g.DEPTH_ATTACHMENT, g.RENDERBUFFER, rb[0]);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, ctx.checkFramebufferStatus(g.FRAMEBUFFER));
+    ctx.viewportSet(0, 0, 4, 4);
+    ctx.clearColor(0, 0, 0, 0);
+    ctx.clear(g.COLOR_BUFFER_BIT | g.DEPTH_BUFFER_BIT);
+    var vb: [1]u32 = undefined;
+    ctx.genBuffers(&vb);
+
+    // ── interleaved: gl_Position (4), vExtra (1), vId (1): 6 words a vertex
+    const names = [_][*:0]const u8{ "gl_Position", "vExtra", "vId" };
+    const p = try linkPair(xfb_vs, xfb_fs, &names, g.INTERLEAVED_ATTRIBS);
+    defer program.deleteProgram(&ctx, p);
+    var n: i32 = 0;
+    program.getProgramiv(&ctx, p, g.TRANSFORM_FEEDBACK_VARYINGS, &n);
+    try std.testing.expectEqual(@as(i32, 3), n);
+    var vname: [32]u8 = undefined;
+    var len: i32 = 0;
+    var vsize: i32 = 0;
+    var vkind: u32 = 0;
+    program.getTransformFeedbackVarying(&ctx, p, 2, vname.len, &len, &vsize, &vkind, &vname);
+    try std.testing.expectEqualStrings("vId", vname[0..@intCast(len)]);
+    try std.testing.expectEqual(@as(u32, 0x1404), vkind); // INT
+    var out: [2]u32 = undefined;
+    ctx.genBuffers(&out);
+    ctx.bindBuffer(g.TRANSFORM_FEEDBACK_BUFFER, out[0]);
+    ctx.bufferData(g.TRANSFORM_FEEDBACK_BUFFER, 6 * 4 * 6, null, g.STATIC_READ);
+    var xfb: [1]u32 = undefined;
+    ctx.genTransformFeedbacks(&xfb);
+    ctx.bindTransformFeedback(g.TRANSFORM_FEEDBACK, xfb[0]);
+    ctx.bindBufferRange(g.TRANSFORM_FEEDBACK_BUFFER, 0, out[0], 0, 0, false);
+    var q: [2]u32 = undefined;
+    ctx.genTimerQueries(&q);
+    program.useProgram(&ctx, p);
+    ctx.beginQuery(g.TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q[0]);
+    ctx.beginTransformFeedback(g.TRIANGLES);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    // (no other program, no strip, while it runs)
+    program.useProgram(&ctx, 0);
+    try std.testing.expectEqual(g.INVALID_OPERATION, ctx.getError());
+    const tri = [_]Vert{ v(0, 0, 0, .{ 0, 0, 0, 0 }), v(W, 0, 0, .{ 0, 0, 0, 0 }), v(0, H, 0, .{ 0, 0, 0, 0 }) };
+    drawVerts(&ctx, vb[0], &tri, g.TRIANGLE_STRIP);
+    try std.testing.expectEqual(g.INVALID_OPERATION, ctx.getError());
+    // one triangle, drawn and captured; a second, rasterizer discard on:
+    // captured after it, nothing drawn
+    drawVerts(&ctx, vb[0], &tri, g.TRIANGLES);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    var pix: [4]u8 = undefined;
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pix);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, &pix);
+    ctx.clear(g.COLOR_BUFFER_BIT);
+    ctx.enable(g.RASTERIZER_DISCARD, true);
+    drawVerts(&ctx, vb[0], &tri, g.TRIANGLES);
+    ctx.enable(g.RASTERIZER_DISCARD, false);
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pix);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &pix);
+    // paused: a draw captures nothing; the buffer has room for 6 vertices
+    // and 6 are captured: a seventh is too many
+    ctx.pauseTransformFeedback();
+    drawVerts(&ctx, vb[0], &tri, g.TRIANGLES);
+    ctx.resumeTransformFeedback();
+    drawVerts(&ctx, vb[0], &tri, g.TRIANGLES);
+    try std.testing.expectEqual(g.INVALID_OPERATION, ctx.getError());
+    ctx.endTransformFeedback();
+    ctx.endQuery(g.TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    try std.testing.expectEqual(@as(?u64, 2), ctx.queryResult(q[0], g.QUERY_RESULT));
+    const words = bufWords(eng, out[0], 6 * 6);
+    for (0..6) |k| {
+        const vtx = tri[k % 3];
+        const rec = words[k * 6 ..][0..6];
+        const want = [6]u32{ fbits(vtx.x * 2), fbits(vtx.y * 2), fbits(vtx.z * 2), fbits(vtx.w * 2), fbits(vtx.x * 10), @intCast(k % 3) };
+        if (!std.mem.eql(u32, &want, rec)) {
+            std.debug.print("vertex {d}: {any}, not {any}\n", .{ k, rec, want });
+            return error.Capture;
+        }
+    }
+
+    // ── separate: vExtra into buffer 0, gl_Position into buffer 1 (64
+    // bytes in); points: captured, not drawn
+    const sep = [_][*:0]const u8{ "vExtra", "gl_Position" };
+    const p2 = try linkPair(xfb_vs, xfb_fs, &sep, g.SEPARATE_ATTRIBS);
+    defer program.deleteProgram(&ctx, p2);
+    ctx.bindBuffer(g.TRANSFORM_FEEDBACK_BUFFER, out[1]);
+    ctx.bufferData(g.TRANSFORM_FEEDBACK_BUFFER, 64 + 4 * 4 * 2, null, g.STATIC_READ);
+    ctx.bindBufferRange(g.TRANSFORM_FEEDBACK_BUFFER, 0, out[0], 0, 8, true);
+    ctx.bindBufferRange(g.TRANSFORM_FEEDBACK_BUFFER, 1, out[1], 64, 32, true);
+    program.useProgram(&ctx, p2);
+    ctx.beginTransformFeedback(g.POINTS);
+    const pts = [_]Vert{ v(W / 2, 0, 0.5, .{ 0, 0, 0, 0 }), v(0, H / 2, 0.25, .{ 0, 0, 0, 0 }) };
+    drawVerts(&ctx, vb[0], &pts, g.POINTS);
+    ctx.endTransformFeedback();
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    const w0 = bufWords(eng, out[0], 2);
+    try std.testing.expectEqualSlices(u32, &.{ fbits(pts[0].x * 10), fbits(pts[1].x * 10) }, w0);
+    const w1 = bufWords(eng, out[1], 16 + 8);
+    try std.testing.expectEqualSlices(u32, &.{ fbits(pts[0].x * 2), fbits(pts[0].y * 2), fbits(pts[0].z * 2), fbits(2), fbits(pts[1].x * 2), fbits(pts[1].y * 2), fbits(pts[1].z * 2), fbits(2) }, w1[16..]);
+    ctx.bindTransformFeedback(g.TRANSFORM_FEEDBACK, 0);
+    ctx.deleteTransformFeedbacks(&xfb);
+    try std.testing.expect(!ctx.isTransformFeedback(xfb[0]));
+    ctx.deleteBuffers(&out);
+
+    // ── an occlusion query: the depth buffer at 0.5, a quad behind it
+    // (none passes), then one in front (some pass)
+    const p3 = try linkPair(plain_vs, plain_fs, &.{}, 0);
+    defer program.deleteProgram(&ctx, p3);
+    program.useProgram(&ctx, p3);
+    ctx.enable(g.DEPTH_TEST, true);
+    ctx.depthFunc(g.LESS);
+    const mid = quad(0, 0, W, H, 0.0, .{ 0, 0, 0, 0 });
+    drawVerts(&ctx, vb[0], &mid, g.TRIANGLES);
+    ctx.beginQuery(g.ANY_SAMPLES_PASSED, q[1]);
+    try std.testing.expectEqual(@as(?i32, @intCast(q[1])), ctx.queryState(g.ANY_SAMPLES_PASSED, g.CURRENT_QUERY));
+    const behind = quad(0, 0, W, H, 0.5, .{ 0, 0, 0, 0 });
+    drawVerts(&ctx, vb[0], &behind, g.TRIANGLES);
+    ctx.endQuery(g.ANY_SAMPLES_PASSED);
+    try std.testing.expectEqual(@as(?u64, 0), ctx.queryResult(q[1], g.QUERY_RESULT));
+    try std.testing.expectEqual(@as(?u64, 1), ctx.queryResult(q[1], g.QUERY_RESULT_AVAILABLE));
+    ctx.beginQuery(g.ANY_SAMPLES_PASSED_CONSERVATIVE, q[1]);
+    try std.testing.expectEqual(g.INVALID_OPERATION, ctx.getError()); // (one name, one target)
+    ctx.beginQuery(g.ANY_SAMPLES_PASSED, q[1]);
+    const front = quad(0, 0, W / 2, H, -0.5, .{ 0, 0, 0, 0 });
+    drawVerts(&ctx, vb[0], &front, g.TRIANGLES);
+    ctx.endQuery(g.ANY_SAMPLES_PASSED);
+    try std.testing.expectEqual(@as(?u64, 1), ctx.queryResult(q[1], g.QUERY_RESULT));
+    ctx.enable(g.DEPTH_TEST, false);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+
+    // ── primitive restart (fixed index): a triangle with the restart
+    // index is not drawn; a strip goes on after it
+    ctx.clear(g.COLOR_BUFFER_BIT);
+    ctx.enable(g.PRIMITIVE_RESTART_FIXED_INDEX, true);
+    const four = [_]Vert{ v(0, 0, 0, .{ 0, 0, 0, 0 }), v(W, 0, 0, .{ 0, 0, 0, 0 }), v(0, H, 0, .{ 0, 0, 0, 0 }), v(W, H, 0, .{ 0, 0, 0, 0 }) };
+    ctx.bindBuffer(g.ARRAY_BUFFER, vb[0]);
+    ctx.bufferData(g.ARRAY_BUFFER, @intCast(four.len * @sizeOf(Vert)), &four, g.STATIC_DRAW);
+    var ib: [1]u32 = undefined;
+    ctx.genBuffers(&ib);
+    ctx.bindBuffer(g.ELEMENT_ARRAY_BUFFER, ib[0]);
+    const idx = [_]u16{ 0, 1, 0xffff, 3, 2, 1 };
+    ctx.bufferData(g.ELEMENT_ARRAY_BUFFER, @sizeOf(@TypeOf(idx)), &idx, g.STATIC_DRAW);
+    ctx.drawElements(g.TRIANGLES, 3, g.UNSIGNED_SHORT, 0, 1);
+    ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pix);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &pix);
+    ctx.drawElements(g.TRIANGLES, 3, g.UNSIGNED_SHORT, 6, 1);
+    ctx.readPixels(3, 3, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pix);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 255, 255 }, &pix);
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    ctx.deleteBuffers(&ib);
+    ctx.deleteBuffers(&vb);
+    ctx.deleteTimerQueries(&q);
+    program.useProgram(&ctx, 0);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, 0);
+}
+
 fn compileLayerShader(kind: u32, source: [:0]const u8) !u32 {
     const id = program.createShader(&ctx, kind);
     errdefer program.deleteShader(&ctx, id);
@@ -740,6 +1353,27 @@ test "draw: the scene on the emulated Adreno (ir3) gives the CPU's bytes" {
     a_gpu = .{ .node = .{ .sys = &a_fake } };
     eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
     try mutableCubeDraw(&eng_a);
+    eng_a.deinit();
+    a_gpu.close();
+    a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
+    a_fake = .{ .emu = &a_emu };
+    a_gpu = .{ .node = .{ .sys = &a_fake } };
+    eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
+    try planeSample(&eng_a);
+    eng_a.deinit();
+    a_gpu.close();
+    a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
+    a_fake = .{ .emu = &a_emu };
+    a_gpu = .{ .node = .{ .sys = &a_fake } };
+    eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
+    try uniformBlocks(&eng_a);
+    eng_a.deinit();
+    a_gpu.close();
+    a_emu = .{ .arena = &a_arena, .gpu_view = &a_view, .guard = 0 };
+    a_fake = .{ .emu = &a_emu };
+    a_gpu = .{ .node = .{ .sys = &a_fake } };
+    eng_a.init(.{ .dev = try a_gpu.open(), .compiler = AGpu.compile, .work = &ir3_work, .cpu_work = &cpu_work });
+    try feedbackAndQueries(&eng_a);
     eng_a.deinit();
     a_gpu.close();
 }
@@ -860,6 +1494,10 @@ test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CP
     try std.testing.expect(eng_rtx.stats.dispatches >= 3 * 9);
     try layeredCopy(&eng_rtx);
     try mutableCubeDraw(&eng_rtx);
+    try planeSample(&eng_rtx);
+    try blockPlaneSample(&eng_rtx);
+    try uniformBlocks(&eng_rtx);
+    try feedbackAndQueries(&eng_rtx);
     eng_rtx.deinit();
 }
 

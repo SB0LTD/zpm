@@ -89,7 +89,7 @@ pub const Device = struct {
 
 // ── The emulated GPU ────────────────────────────────────────────────────────
 
-pub const EMU_MAX_BUFFERS = 64;
+pub const EMU_MAX_BUFFERS = 128;
 
 /// Why the last submission failed on the emulated GPU (EmuDevice.fault;
 /// EmuDevice.describe puts it into words).

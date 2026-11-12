@@ -40,6 +40,7 @@ const builtin = @import("builtin");
 const gpu = @import("gpu");
 const raster = @import("raster.sig");
 const texture = @import("texture.sig");
+const blocklinear = @import("blocklinear.sig");
 const report = @import("report.sig");
 const kir = gpu.kir;
 const r = kir.r;
@@ -69,6 +70,12 @@ pub const Format = enum(u8) {
     r32ui,
     rg32ui,
     rgba32ui,
+    /// two bytes a channel (unorm16): an imported dma-buf's DRM R16 and
+    /// GR1616 (video's 10- to 16-bit planes, P010's), sampled as GL's
+    /// R16_EXT and RG16_EXT; never drawn into, copied or mipmapped (GL's
+    /// own R16 and RG16 uploads are stored as floats: texfmt.sig)
+    r16,
+    rg16,
 
     /// A color format of four bytes a pixel (RGBA8, BGRA8).
     pub fn isColor(f: Format) bool {
@@ -84,7 +91,7 @@ pub const Format = enum(u8) {
     pub fn bytes(f: Format) u32 {
         return switch (f) {
             .r8 => 1,
-            .rg8 => 2,
+            .rg8, .r16 => 2,
             .rg32f, .rg32i, .rg32ui => 8,
             .rgba32f, .rgba32i, .rgba32ui => 16,
             else => 4,
@@ -93,17 +100,20 @@ pub const Format = enum(u8) {
 
     pub fn channels(f: Format) u32 {
         return switch (f) {
-            .r8, .r32f, .r32i, .r32ui, .d24s8 => 1,
-            .rg8, .rg32f, .rg32i, .rg32ui => 2,
+            .r8, .r16, .r32f, .r32i, .r32ui, .d24s8 => 1,
+            .rg8, .rg16, .rg32f, .rg32i, .rg32ui => 2,
             else => 4,
         };
     }
 
-    pub const Kind = enum(u2) { unorm8, float, int, uint };
+    /// (texture.sig's descriptor keeps it in three bits: unorm16's bit 2
+    /// says two bytes a channel, its low two bits read as unorm8's)
+    pub const Kind = enum(u3) { unorm8, float, int, uint, unorm16 };
 
     /// What a texel's channels are.
     pub fn kind(f: Format) Kind {
         return switch (f) {
+            .r16, .rg16 => .unorm16,
             .r32f, .rg32f, .rgba32f => .float,
             .r32i, .rg32i, .rgba32i => .int,
             .r32ui, .rg32ui, .rgba32ui, .d24s8 => .uint,
@@ -164,6 +174,22 @@ pub const Image = struct {
     /// apart, from byte level_at[l]; level 0 is the image itself
     levels: u8 = 1,
     level_at: [MAX_LEVELS]u32 = [_]u32{0} ** MAX_LEVELS,
+    /// how its memory is laid out: pitch linear (the engine's own, and
+    /// most imports), or block linear (a video decoder's picture imported
+    /// with NVIDIA's modifier: `stride` its pitch in bytes, whole GOBs).
+    /// A block-linear image is only sampled (texture.sig reads the GOBs
+    /// in place): never drawn into, copied, read back or mipmapped.
+    layout: blocklinear.Layout = .{},
+    /// samples a pixel (multisampled: 2, 4, 8): a pixel's samples side by
+    /// side in its row (sample s of pixel x at x * samples + s), so a row
+    /// is width * samples pixels' bytes; `width` counts pixels
+    samples: u8 = 1,
+
+    /// Whether the engine may draw into, copy, read back or mipmap it: a
+    /// renderable format, laid out pitch linear.
+    pub fn drawable(img: *const Image) bool {
+        return img.format.renderable() and img.layout.linear();
+    }
 
     pub fn levelWidth(img: *const Image, l: u32) u32 {
         return @max(img.width >> @intCast(l), 1);
@@ -333,7 +359,9 @@ pub const CODE_BYTES = 16 * 1024;
 /// A dispatch's parameter words and bindings at most (a draw's vertex
 /// kernel has the most).
 const MAX_PARAMS = 160;
-const MAX_BIND = 3 + raster.MAX_ATTRS + texture.MAX_TEX;
+/// a kernel's bindings at most: the capture kernel's (its buffers,
+/// uniforms, element array, attributes, textures)
+const MAX_BIND = raster.MAX_CAPTURE_BUFFERS + 2 + raster.MAX_ATTRS + texture.MAX_TEX + raster.MAX_BUFFERS + raster.MAX_TARGETS;
 /// KIR instructions a kernel built here may have (a pipeline's, a GLSL
 /// shader inlined in it).
 pub const MAX_KIR = 65536;
@@ -451,7 +479,11 @@ const B_SSWAP = 19; // the source is BGRA8: R and B to RGBA8's places
 const B_DSWAP = 20;
 const B_SET = 21; // bits every source pixel gets (an opaque alpha where it has none)
 const B_WMASK = 22; // the destination's bits written (depth, stencil: the rest kept)
-const BLIT_PARAMS = 23;
+const B_SPIX = 23; // a source pixel's bytes (its samples': bpp * samples)
+const B_SSAMPLES = 24; // the source's samples, and log2 of them, averaged (colour) or sample 0 taken
+const B_SSHIFT = 25;
+const B_SAVG = 26;
+const BLIT_PARAMS = 27;
 
 fn swapRBk(k: *kir.Kernel, v: kir.V) kir.V {
     const lo = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(v), u(16))), u(0xff));
@@ -491,10 +523,10 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
         const fy = map(&k, y, B_MAPY);
         // a source pixel (in the image) as RGBA8's bytes
         const texel = struct {
-            fn f_(kk: *kir.Kernel, b: u8, ix: kir.V, iy: kir.V, bpp: kir.V, stride: kir.V, td: kir.V, hh: kir.V) kir.V {
+            fn f_(kk: *kir.Kernel, b: u8, ix: kir.V, iy: kir.V, bpp: kir.V, stride: kir.V, td: kir.V, hh: kir.V, resolve: bool) kir.V {
                 const row = kk.sel(.i32, r(td), r(kk.op2(.isub, .i32, r(kk.op2(.isub, .i32, r(hh), kir.i(1))), r(iy))), r(iy));
-                const off = kk.op3(.imad, .u32, r(row), r(stride), r(kk.op2(.imul, .u32, r(ix), r(bpp))));
-                var v = pixelLoad(kk, b, bpp, off);
+                const off = kk.op3(.imad, .u32, r(row), r(stride), r(kk.op2(.imul, .u32, r(ix), r(kk.param(.u32, B_SPIX)))));
+                var v = if (resolve) resolved(kk, b, bpp, off) else pixelLoad(kk, b, bpp, off);
                 v = kk.sel(.u32, r(kk.cmp(.u32, .ne, r(kk.param(.u32, B_SSWAP)), u(0))), r(swapRBk(kk, v)), r(v));
                 return kk.op2(.@"or", .u32, r(v), r(kk.param(.u32, B_SET)));
             }
@@ -523,10 +555,10 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
             const xb = clampI(&k, k.op2(.iadd, .i32, r(x0), kir.i(1)), sw);
             const ya = clampI(&k, y0, sh);
             const yb = clampI(&k, k.op2(.iadd, .i32, r(y0), kir.i(1)), sh);
-            const t00 = texel(&k, src, xa, ya, sbpp, sstride, s_td, sh);
-            const t10 = texel(&k, src, xb, ya, sbpp, sstride, s_td, sh);
-            const t01 = texel(&k, src, xa, yb, sbpp, sstride, s_td, sh);
-            const t11 = texel(&k, src, xb, yb, sbpp, sstride, s_td, sh);
+            const t00 = texel(&k, src, xa, ya, sbpp, sstride, s_td, sh, false);
+            const t10 = texel(&k, src, xb, ya, sbpp, sstride, s_td, sh, false);
+            const t01 = texel(&k, src, xa, yb, sbpp, sstride, s_td, sh, false);
+            const t11 = texel(&k, src, xb, yb, sbpp, sstride, s_td, sh, false);
             const bx = k.op2(.fsub, .f32, kir.f(1), r(ax));
             const by = k.op2(.fsub, .f32, kir.f(1), r(ay));
             const w00 = k.op2(.fmul, .f32, r(bx), r(by));
@@ -560,7 +592,7 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
             in = k.op2(.pand, .pred, r(in), r(k.cmp(.i32, .lt, r(ix), r(sw))));
             in = k.op2(.pand, .pred, r(in), r(k.cmp(.i32, .lt, r(iy), r(sh))));
             k.ifp(r(in));
-            k.set(out, .mov, r(texel(&k, src, ix, iy, sbpp, sstride, s_td, sh)), kir.no, kir.no);
+            k.set(out, .mov, r(texel(&k, src, ix, iy, sbpp, sstride, s_td, sh, true)), kir.no, kir.no);
             k.set(have, .mov, u(1), kir.no, kir.no);
             k.endif();
         }
@@ -588,6 +620,45 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
     }
     k.endif();
     return k;
+}
+
+/// A source pixel for a blit: its word, or (a multisampled colour source,
+/// B_SAVG) its samples' bytes averaged, rounded half up.
+fn resolved(k: *kir.Kernel, b: u8, bpp: kir.V, off: kir.V) kir.V {
+    const v = k.reg(.u32);
+    k.set(v, .mov, r(pixelLoad(k, b, bpp, off)), kir.no, kir.no);
+    const ns = k.param(.u32, B_SSAMPLES);
+    k.ifp(r(k.op2(.pand, .pred, r(k.cmp(.u32, .gt, r(ns), u(1))), r(k.cmp(.u32, .ne, r(k.param(.u32, B_SAVG)), u(0))))));
+    {
+        var sum: [4]kir.V = undefined;
+        for (&sum, 0..) |*x, ch| {
+            x.* = k.reg(.u32);
+            k.set(x.*, .bfe, r(v), u(@intCast(8 * ch)), u(8));
+        }
+        const at = k.reg(.u32);
+        k.set(at, .iadd, r(off), r(bpp), kir.no);
+        const s = k.reg(.u32);
+        k.set(s, .mov, u(1), kir.no, kir.no);
+        k.loop();
+        {
+            k.brk(r(k.cmp(.u32, .ge, r(s), r(ns))));
+            const w = pixelLoad(k, b, bpp, at);
+            for (sum, 0..) |x, ch| k.set(x, .iadd, r(x), r(k.op3(.bfe, .u32, r(w), u(@intCast(8 * ch)), u(8))), kir.no);
+            k.set(at, .iadd, r(at), r(bpp), kir.no);
+            k.set(s, .iadd, r(s), u(1), kir.no);
+        }
+        k.endloop();
+        const half = k.op2(.shr, .u32, r(ns), u(1));
+        const sh = k.param(.u32, B_SSHIFT);
+        var acc = k.mov(.u32, u(0));
+        for (sum, 0..) |x, ch| {
+            const avg = k.op2(.shr, .u32, r(k.op2(.iadd, .u32, r(x), r(half))), r(sh));
+            acc = k.op2(.@"or", .u32, r(acc), r(k.op2(.shl, .u32, r(avg), u(@intCast(8 * ch)))));
+        }
+        k.set(v, .mov, r(acc), kir.no, kir.no);
+    }
+    k.endif();
+    return v;
 }
 
 /// mip: a level from the one before, a thread a texel (a group row a
@@ -701,6 +772,34 @@ fn putPixel(b: []u8, bpp: u32, v: u32) void {
 pub const MAX_OPS = 256;
 pub const MAX_DOOMED = 128;
 const RING = 64;
+
+/// A batch's programs as said when the GPU is lost: each one's dispatches
+/// and its largest grid (groups), up to SUM_PROGS of them (`more`: the
+/// others).
+const SUM_PROGS = 24;
+const ProgSum = struct { prog: *const gpu.Program, count: u16, groups: u32 };
+const BatchSum = struct {
+    n: u8 = 0,
+    more: u16 = 0,
+    progs: [SUM_PROGS]ProgSum = undefined,
+
+    fn add(s: *BatchSum, prog: *const gpu.Program, groups: [3]u32, count: u16) void {
+        const g: u32 = @intCast(@min(@as(u64, groups[0]) * groups[1] * groups[2], std.math.maxInt(u32)));
+        for (s.progs[0..s.n]) |*p| {
+            if (p.prog == prog) {
+                p.count +|= count;
+                p.groups = @max(p.groups, g);
+                return;
+            }
+        }
+        if (s.n == SUM_PROGS) {
+            s.more +|= 1;
+            return;
+        }
+        s.progs[s.n] = .{ .prog = prog, .count = count, .groups = g };
+        s.n += 1;
+    }
+};
 /// How long a CPU access waits for the GPU before calling it lost.
 pub const TIMEOUT_US: u64 = 2_000_000;
 /// How long a batch may run before the GPU is called lost (a wait past
@@ -830,6 +929,9 @@ pub const Engine = struct {
     ran: u64 = 0,
     done_upto: u64 = 0,
     fences: [RING]gpu.Fence = [_]gpu.Fence{0} ** RING,
+    /// Each batch in flight's programs (by batch % RING): what is said
+    /// when the GPU is lost.
+    sums: [RING]BatchSum = undefined,
     doomed: [MAX_DOOMED]Doomed = undefined,
     n_doomed: usize = 0,
     stats: Stats = .{},
@@ -883,6 +985,7 @@ pub const Engine = struct {
             var w = gpu.Work.init(work_mem);
             const bin = try compiler(&k, d.caps, &w, &e.code[i]);
             e.progs[i] = try d.load(&bin);
+            e.progs[i].label = k.name;
             loaded += 1;
         }
     }
@@ -1011,6 +1114,16 @@ pub const Engine = struct {
         return e.allocImage(width, height, format, true);
     }
 
+    /// A multisampled image (samples 2, 4 or 8; 1: newImage's): a pixel's
+    /// samples side by side in its row.
+    pub fn newImageSamples(e: *Engine, width: u32, height: u32, format: Format, samples: u8) ?Image {
+        if (samples <= 1) return e.newImage(width, height, format);
+        var img = e.allocImage(width * samples, height, format, true) orelse return null;
+        img.width = width;
+        img.samples = samples;
+        return img;
+    }
+
     /// Exported images need a whole backing buffer for the dma-buf.
     pub fn newWindowImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
         return e.allocImage(width, height, format, false);
@@ -1038,6 +1151,34 @@ pub const Engine = struct {
             }
         } else if (img.own and img.buf.cpu.len != 0) e.freeBytes(img.buf, img.pooled, img.track.last);
         img.* = .{};
+    }
+
+    /// The image's memory as a GPU buffer of its own, from its byte 0,
+    /// `sh` holding it and the image its first name: an EGLImage made of
+    /// a GL texture (EGL_KHR_gl_texture_2D_image), whose dma-buf is the
+    /// whole buffer. Memory in a slab (others' images beside it) or in the
+    /// CPU pool moves first, its bytes copied. False: no GPU buffer for it.
+    pub fn shareOwn(e: *Engine, img: *Image, sh: *Shared) bool {
+        std.debug.assert(img.share == null and img.own);
+        if (img.pooled or e.slabOf(img.buf) != null) {
+            const n = img.buf.cpu.len;
+            const m = e.allocBytes(n, false) orelse return false;
+            if (m.pooled) {
+                e.pool.free(m.buf.cpu);
+                return false;
+            }
+            var moved = img.*;
+            moved.buf = m.buf;
+            moved.pooled = false;
+            moved.track = .{};
+            @memcpy(moved.buf.cpu[0..n], e.hostView(img, 0, n));
+            e.toDevice(&moved, 0, n);
+            e.freeBytes(img.buf, img.pooled, img.track.last);
+            img.* = moved;
+        }
+        sh.* = .{ .refs = 1, .buf = img.buf, .track = img.track };
+        img.share = sh;
+        return true;
     }
 
     /// An image of `levels` mipmap levels (one buffer, level after level),
@@ -1123,6 +1264,9 @@ pub const Engine = struct {
         const d = e.dev.?;
         const n = e.n_ops;
         e.n_ops = 0;
+        const sum = &e.sums[e.batch % RING];
+        sum.* = .{};
+        for (e.ops[0..n]) |op| sum.add(op.prog, op.groups, 1);
         const t0 = report.nowUs();
         const f = d.run(e.ops[0..n]) catch |err| {
             e.loseGpu(err);
@@ -1148,10 +1292,55 @@ pub const Engine = struct {
     }
 
     fn loseGpu(e: *Engine, err: anyerror) void {
-        if (!e.lost) report.say(.lost, "the GPU is lost ({s}): {s}, and GL reports a reset", .{ @errorName(err), if (e.cpu_work.len != 0) "drawing goes on on the CPU" else "nothing more is drawn" });
+        if (!e.lost) {
+            report.say(.lost, "the GPU is lost ({s}): {s}, and GL reports a reset", .{ @errorName(err), if (e.cpu_work.len != 0) "drawing goes on on the CPU" else "nothing more is drawn" });
+            e.sayInFlight();
+        }
         e.lost = true;
         if (e.why == null) e.why = err;
         e.n_ops = 0;
+    }
+
+    /// What was on the GPU when it was lost: the programs of the batches run
+    /// and not known done (a fault or hang is in one of them), largest grid
+    /// first, each with its dispatches, its code's GPU address and size,
+    /// its registers and shared memory. The address is what a GPU fault's
+    /// program counter falls in; the size and registers say which shader
+    /// it is (gfxapi's WebRender test prints them for every variant).
+    /// Legion 1110u: an Xid 13 on ~28 SMs in one of Firefox's launches,
+    /// and nothing said which kernel it was.
+    fn sayInFlight(e: *Engine) void {
+        if (e.ran <= e.done_upto) return;
+        const first = @max(e.done_upto + 1, e.ran -| (RING - 1));
+        var all: BatchSum = .{};
+        var b = first;
+        while (b <= e.ran) : (b += 1) {
+            const s = &e.sums[b % RING];
+            for (s.progs[0..s.n]) |p| all.add(p.prog, .{ p.groups, 1, 1 }, p.count);
+            all.more +|= s.more;
+        }
+        // largest grid first
+        var order: [SUM_PROGS]u8 = undefined;
+        for (0..all.n) |i| order[i] = @intCast(i);
+        var i: usize = 1;
+        while (i < all.n) : (i += 1) {
+            var j = i;
+            while (j > 0 and all.progs[order[j]].groups > all.progs[order[j - 1]].groups) : (j -= 1) {
+                std.mem.swap(u8, &order[j], &order[j - 1]);
+            }
+        }
+        var line: [520]u8 = undefined;
+        var len: usize = 0;
+        for (order[0..all.n], 0..) |k, n| {
+            const p = all.progs[k];
+            const name = if (p.prog.label.len != 0) p.prog.label else "a kernel";
+            const part = std.fmt.bufPrint(line[len..], "{s}{s} x{d} at 0x{x} ({d} B, {d} regs, {d} B shared, up to {d} groups)", .{ if (n == 0) "" else "; ", name, p.count, p.prog.code.gpu, p.prog.bin.code.len, p.prog.bin.regs, p.prog.bin.shared_bytes, p.groups }) catch {
+                all.more +|= @intCast(all.n - n);
+                break;
+            };
+            len += part.len;
+        }
+        report.say(.in_flight, "on the GPU then ({d} batch{s} not known done): {s}{s}", .{ e.ran - first + 1, if (e.ran == first) "" else "es", line[0..len], if (all.more != 0) " (and more)" else "" });
     }
 
     /// done_upto moved to the last batch run, if its fence is done.
@@ -1410,15 +1599,21 @@ pub const Engine = struct {
 
     // ── Draws ──────────────────────────────────────────────────────────────
 
-    const Stage = enum(u3) { vertex, setup, raster, bin, blit, mip, stencil };
+    const Stage = enum(u3) { vertex, setup, raster, bin, blit, mip, stencil, capture };
 
     fn build(e: *Engine, st: Stage, p: *const raster.Pipeline) kir.Kernel {
+        return e.buildFor(st, p, .{}, .triangles);
+    }
+
+    /// A kernel of p's for a variant (tiles) or primitives (setup).
+    fn buildFor(e: *Engine, st: Stage, p: *const raster.Pipeline, v: raster.Variant, kind: raster.SetupKind) kir.Kernel {
         const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
         return switch (st) {
             .vertex => raster.vertexKernel(s, p),
-            .setup => raster.setupKernel(s, p),
-            .raster => raster.rasterKernel(s, p),
-            .stencil => raster.stencilKernel(s, p),
+            .setup => raster.setupKernelFor(s, p, kind),
+            .raster => raster.rasterKernelFor(s, p, v),
+            .stencil => raster.rasterKernelFor(s, p, .{ .stencil = true, .samples = v.samples, .targets = v.targets, .lines = v.lines }),
+            .capture => raster.captureKernel(s, p),
             .bin => raster.binKernel(s),
             .blit => blitKernel(s),
             .mip => mipKernel(s),
@@ -1438,6 +1633,7 @@ pub const Engine = struct {
             var w = gpu.Work.init(e.work);
             const bin = e.compiler(&k, d.caps, &w, &e.pcode) catch |err| return e.pipeFailed(p, n, err);
             p.progs[n] = d.load(&bin) catch |err| return e.pipeFailed(p, n, err);
+            p.progs[n].?.label = k.name;
         }
         p.owner = e;
         return true;
@@ -1459,6 +1655,119 @@ pub const Engine = struct {
             report.say(.pipeline, "a program's stencil kernel does not compile or load for the GPU ({s}): its stencil draws run on the CPU", .{@errorName(err)});
             return false;
         };
+        p.progs[3].?.label = k.name;
+        return true;
+    }
+
+    /// The program of p's for a setup kind or tile variant past the ones
+    /// loadPipeline and loadStencil load (p.more), compiled and loaded at
+    /// its first draw; null when the GPU refuses it (its draws run on the
+    /// CPU).
+    fn loadMore(e: *Engine, p: *raster.Pipeline, st: Stage, v: raster.Variant, kind: raster.SetupKind) ?*gpu.Program {
+        if (st == .setup and kind == .triangles) return &p.progs[1].?;
+        if (st == .raster and v.key() == (raster.Variant{}).key()) return &p.progs[2].?;
+        if (st == .raster and v.key() == (raster.Variant{ .stencil = true }).key()) return if (e.loadStencil(p)) &p.progs[3].? else null;
+        const key = if (st == .setup) raster.setupKey(kind) else raster.tileKey(v);
+        for (p.more_key[0..p.n_more], 0..) |x, j| {
+            if (x == key) return &p.more[j].?;
+        }
+        for (p.refused_key[0..p.n_refused]) |x| {
+            if (x == key) return null;
+        }
+        var k = e.buildFor(st, p, v, kind);
+        const result: anyerror!gpu.Program = blk: {
+            k.finish() catch |err| break :blk err;
+            var w = gpu.Work.init(e.work);
+            const bin = e.compiler(&k, e.dev.?.caps, &w, &e.pcode) catch |err| break :blk err;
+            break :blk e.dev.?.load(&bin);
+        };
+        const prog = result catch |err| {
+            e.why_pipe = err;
+            if (p.n_refused < raster.Pipeline.MAX_MORE) {
+                p.refused_key[p.n_refused] = key;
+                p.n_refused += 1;
+            }
+            report.say(.pipeline, "a program's {s} kernel does not compile or load for the GPU ({s}): its draws of it run on the CPU", .{ k.name, @errorName(err) });
+            return null;
+        };
+        var slot: usize = p.n_more;
+        if (slot == raster.Pipeline.MAX_MORE) {
+            // (full: the oldest goes, once no batch runs it)
+            e.finish();
+            slot = p.evict;
+            p.evict = @intCast((slot + 1) % raster.Pipeline.MAX_MORE);
+            if (!e.lost) e.dev.?.unload(&p.more[slot].?);
+        } else p.n_more += 1;
+        p.more[slot] = prog;
+        p.more[slot].?.label = k.name;
+        p.more_key[slot] = key;
+        return &p.more[slot].?;
+    }
+
+    fn loadCapture(e: *Engine, p: *raster.Pipeline) bool {
+        if (p.progs[4] != null) return true;
+        if (p.capture_refused_by == @as(?*anyopaque, e)) return false;
+        var k = e.build(.capture, p);
+        const result: anyerror!gpu.Program = blk: {
+            k.finish() catch |err| break :blk err;
+            var w = gpu.Work.init(e.work);
+            const bin = e.compiler(&k, e.dev.?.caps, &w, &e.pcode) catch |err| break :blk err;
+            break :blk e.dev.?.load(&bin);
+        };
+        p.progs[4] = result catch |err| {
+            e.why_pipe = err;
+            p.capture_refused_by = e;
+            report.say(.pipeline, "a program's transform feedback kernel does not compile or load for the GPU ({s}): its captures run on the CPU", .{@errorName(err)});
+            return false;
+        };
+        p.progs[4].?.label = k.name;
+        return true;
+    }
+
+    /// Transform feedback: the draw's vertices (count of each instance)
+    /// through its pipeline's vertex code, the outputs it captures into
+    /// `outs` (buffer i from word bases[i]); on the GPU, or the same kernel
+    /// on the CPU. False when it could not run.
+    pub fn capture(e: *Engine, d: *const raster.Draw, outs: [raster.MAX_CAPTURE_BUFFERS]?*Image, bases: [raster.MAX_CAPTURE_BUFFERS]u32) bool {
+        if (d.count == 0 or d.instances == 0) return true;
+        if (e.zero.buf.cpu.len == 0) e.zero = e.newBuffer(256) orelse return false;
+        const p = d.pipe;
+        var uni = e.newBuffer(@max(d.uniforms.len * 4, 16)) orelse return false;
+        defer e.freeImage(&uni);
+        e.writeBytes(&uni, 0, std.mem.sliceAsBytes(d.uniforms));
+        var cp: [MAX_PARAMS]u32 = undefined;
+        const params = raster.captureParams(d, bases, &cp);
+        const ntex: usize = p.shaders.textures;
+        var bs: [MAX_BIND]*Image = undefined;
+        var writes: u32 = 0;
+        for (outs, 0..) |o, i| {
+            bs[i] = o orelse &e.zero;
+            if (o != null) writes |= @as(u32, 1) << @intCast(i);
+        }
+        const B = raster.MAX_CAPTURE_BUFFERS;
+        bs[B] = &uni;
+        bs[B + 1] = d.index orelse &e.zero;
+        for (d.attrs, 0..) |a, j| bs[B + 2 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
+        for (0..ntex) |j| bs[B + 2 + raster.MAX_ATTRS + j] = d.textures[j] orelse &e.zero;
+        const nbuf: usize = p.shaders.buffers;
+        for (0..nbuf) |j| bs[B + 2 + raster.MAX_ATTRS + ntex + j] = d.buffers[j] orelse &e.zero;
+        const bl = bs[0 .. B + 2 + raster.MAX_ATTRS + ntex + nbuf];
+        const groups = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
+        var on_gpu = e.onGpu() and e.loadPipeline(@constCast(p)) and p.owner == @as(?*anyopaque, e) and e.loadCapture(@constCast(p));
+        for (bl) |img| on_gpu = on_gpu and e.gpuUsable(img);
+        if (on_gpu) {
+            e.recordProg(&p.progs[4].?, groups, bl, writes, params, null);
+            return true;
+        }
+        if (e.cpu_work.len == 0) return false;
+        for (bl) |img| e.fetchAll(img);
+        e.stats.cpu_ops += 1;
+        var views: [MAX_BIND][]u8 = undefined;
+        for (bl, 0..) |img, j| views[j] = img.buf.cpu;
+        if (!e.runCpu(.capture, p, groups, views[0..bl.len], params)) return false;
+        for (outs) |o| {
+            if (o) |img| e.wrote(img, 0, img.buf.cpu.len);
+        }
         return true;
     }
 
@@ -1483,25 +1792,41 @@ pub const Engine = struct {
             }
             q.* = null;
         }
+        for (p.more[0..p.n_more]) |*q| {
+            if (q.*) |*prog| {
+                if (!e.lost) e.dev.?.unload(prog);
+            }
+            q.* = null;
+        }
+        p.n_more = 0;
+        p.n_refused = 0;
+        p.evict = 0;
         p.owner = null;
         p.stencil_refused_by = null;
     }
 
-    /// A draw: its vertices, triangles and pixels, on the GPU (three
-    /// dispatches in the open batch) or the CPU (KIR's interpreter, the
-    /// same kernels). False when there is no memory for it, or no way to
-    /// run it.
+    /// A draw: its vertices, primitives and pixels, on the GPU (three
+    /// dispatches in the open batch, four binned) or the CPU (KIR's
+    /// interpreter, the same kernels). The setup kernel is the one of the
+    /// draw's primitives, the tile kernel the one of its variant (stencil,
+    /// samples, colour targets, lines), each built at its first draw.
+    /// False when there is no memory for it, or no way to run it.
     pub fn draw(e: *Engine, d: *const raster.Draw) bool {
-        const ntri = d.triangles();
-        if (ntri == 0 or d.instances == 0 or d.rect.empty()) return true;
+        const nprim = d.prims();
+        const nrec = d.records();
+        if (nrec == 0 or d.instances == 0 or d.rect.empty()) return true;
         // (made at the first draw: an engine that never draws has none)
         if (e.zero.buf.cpu.len == 0) e.zero = e.newBuffer(256) orelse return false;
         const p = d.pipe;
-        var verts = e.newBuffer(@as(usize, d.instances) * d.count * p.vstride * 4) orelse return false;
+        const v = d.variant();
+        const kind = d.setupKind();
+        // (and primitive restart's word, zeroed)
+        var verts = e.newBuffer(@as(usize, d.instances) * d.count * p.vstride * 4 + 4) orelse return false;
         defer e.freeImage(&verts);
-        // (the triangle records, then the bins' lists)
+        if (raster.restartFlag(d) != raster.RESTART_NONE) e.writeBytes(&verts, d.restartWord(), &.{ 0, 0, 0, 0 });
+        // (the primitive records, then the bins' lists)
         const bins: raster.Bins = if (e.binning) raster.binsOf(d, e.bin_cap) else .{};
-        var tris = e.newBuffer((@as(usize, d.instances) * ntri * p.sstride + bins.words()) * 4) orelse return false;
+        var tris = e.newBuffer((@as(usize, d.instances) * nrec * p.sstride + bins.words()) * 4) orelse return false;
         defer e.freeImage(&tris);
         var uni = e.newBuffer(@max(d.uniforms.len * 4, 16)) orelse return false;
         defer e.freeImage(&uni);
@@ -1518,7 +1843,8 @@ pub const Engine = struct {
         const groups_b = [3]u32{ bins.x, bins.y, 1 };
         // the bindings: vertex (records, uniforms, element array,
         // attributes, textures), setup (triangles, vertices), raster
-        // (color, depth, triangles, uniforms, textures)
+        // (color, depth, triangles, uniforms, textures, the query's word,
+        // stencil, the other targets)
         const ntex: usize = p.shaders.textures;
         var vbs: [MAX_BIND]*Image = undefined;
         vbs[0] = &verts;
@@ -1527,8 +1853,8 @@ pub const Engine = struct {
         for (d.attrs, 0..) |a, j| vbs[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
         const depth = d.depth orelse &e.zero;
         const sb = [_]*Image{ &tris, &verts };
-        var rbs: [5 + texture.MAX_TEX]*Image = undefined;
-        rbs[0] = d.color;
+        var rbs: [6 + texture.MAX_TEX + raster.MAX_BUFFERS + raster.MAX_TARGETS]*Image = undefined;
+        rbs[0] = if (d.color_off) &e.zero else d.color;
         rbs[1] = depth;
         rbs[2] = &tris;
         rbs[3] = &uni;
@@ -1537,35 +1863,63 @@ pub const Engine = struct {
             vbs[3 + raster.MAX_ATTRS + j] = img;
             rbs[4 + j] = img;
         }
-        rbs[4 + ntex] = d.stencil orelse &e.zero;
-        const vb = vbs[0 .. 3 + raster.MAX_ATTRS + ntex];
-        const rb = rbs[0 .. 4 + ntex + @intFromBool(d.stencil != null)];
+        // (Vulkan's uniform and storage buffers, after the textures)
+        const nbuf: usize = p.shaders.buffers;
+        for (0..nbuf) |j| {
+            const img = d.buffers[j] orelse &e.zero;
+            vbs[3 + raster.MAX_ATTRS + ntex + j] = img;
+            rbs[4 + ntex + j] = img;
+        }
+        // (an occlusion query's word; none on: the zeros, never written)
+        rbs[4 + ntex + nbuf] = d.query orelse &e.zero;
+        var nrb: usize = 5 + ntex + nbuf;
+        if (d.stencil) |s| {
+            rbs[nrb] = s;
+            nrb += 1;
+        }
+        // (bit j: binding j written)
+        var rw: u32 = if (d.color_off) 0 else 0b01;
+        if (d.depth != null and d.depth_test and d.depth_write) rw |= 0b10;
+        if (d.query != null) rw |= @as(u32, 1) << @intCast(4 + ntex + nbuf);
+        if (d.stencil != null) {
+            rw |= @as(u32, 1) << @intCast(5 + ntex + nbuf);
+            if (d.stencil == d.depth) rw |= 0b10;
+        }
+        for (d.targets[1..]) |tg| {
+            const x = tg orelse continue;
+            rbs[nrb] = x.img;
+            rw |= @as(u32, 1) << @intCast(nrb);
+            nrb += 1;
+        }
+        const vb = vbs[0 .. 3 + raster.MAX_ATTRS + ntex + nbuf];
+        const rb = rbs[0..nrb];
         const groups_v = [3]u32{ divUp(d.count, raster.VERTEX_GROUP), d.instances, 1 };
-        const groups_s = [3]u32{ divUp(ntri, raster.SETUP_GROUP), d.instances, 1 };
+        const groups_s = [3]u32{ divUp(nprim, raster.SETUP_GROUP), d.instances, 1 };
         const groups_r = [3]u32{ divUp(d.rect.width(), raster.TILE), divUp(d.rect.height(), raster.TILE), 1 };
         var all_gpu = e.onGpu() and e.loadPipeline(@constCast(p)) and p.owner == @as(?*anyopaque, e);
-        if (all_gpu and d.stencil != null) all_gpu = e.loadStencil(@constCast(p));
+        var setup_prog: ?*gpu.Program = null;
+        var tile_prog: ?*gpu.Program = null;
+        if (all_gpu) {
+            setup_prog = e.loadMore(@constCast(p), .setup, v, kind);
+            tile_prog = e.loadMore(@constCast(p), .raster, v, kind);
+            all_gpu = setup_prog != null and tile_prog != null;
+        }
         for (vb) |img| all_gpu = all_gpu and e.gpuUsable(img);
         for (rb) |img| all_gpu = all_gpu and e.gpuUsable(img);
-        // a check: the color rows the draw covers (and the depth's)
-        var regs: [3]Region = undefined;
+        // a check: the rows the draw covers of each image it writes
+        var regs: [3 + raster.MAX_TARGETS]Region = undefined;
         var nreg: usize = 0;
         var checking = all_gpu and e.wantCheck(p.checked, @as(u64, d.rect.width()) * d.rect.height());
         if (checking) {
             @constCast(p).checked += 1;
-            regs[0] = rowsOf(d.color, d.rect.y0, d.rect.y1);
-            nreg = 1;
-            if (d.depth) |dp| {
-                if (dp != d.color and dp.height >= d.rect.y1 and dp.buf.cpu.len != 0) {
-                    regs[1] = rowsOf(dp, d.rect.y0, d.rect.y1);
-                    nreg = 2;
-                }
-            }
-            if (d.stencil) |stencil| {
-                if (stencil != d.color and stencil != d.depth and stencil.height >= d.rect.y1 and stencil.buf.cpu.len != 0) {
-                    regs[nreg] = rowsOf(stencil, d.rect.y0, d.rect.y1);
-                    nreg += 1;
-                }
+            for (rb, 0..) |img, j| {
+                const written = rw & (@as(u32, 1) << @intCast(j)) != 0 or (j == 1 and d.depth != null);
+                if (!written or img == d.query) continue;
+                var seen = false;
+                for (regs[0..nreg]) |x| seen = seen or x.img == img;
+                if (seen or img.height < d.rect.y1 or img.buf.cpu.len == 0) continue;
+                regs[nreg] = rowsOf(img, d.rect.y0, d.rect.y1);
+                nreg += 1;
             }
             checking = e.checkSave(regs[0..nreg]);
             all_gpu = all_gpu and e.onGpu();
@@ -1574,15 +1928,10 @@ pub const Engine = struct {
         // that differs)
         var recs: usize = 0;
         if (all_gpu) {
-            var rw: u32 = if (d.depth != null and d.depth_test and d.depth_write) 0b11 else 0b01;
-            if (d.stencil != null) {
-                rw |= @as(u32, 1) << @intCast(4 + ntex);
-                if (d.stencil == d.depth) rw |= 0b10;
-            }
             e.recordProg(&p.progs[0].?, groups_v, vb, 1, vparams, null);
-            e.recordProg(&p.progs[1].?, groups_s, &sb, 1, sparams, null);
+            e.recordProg(setup_prog.?, groups_s, &sb, 1, sparams, null);
             if (bins.on) e.recordProg(&e.progs[@backingInt(Prog.bin)], groups_b, &tb, 1, bparams, null);
-            e.recordProg(&p.progs[if (d.stencil != null) @as(usize, 3) else 2].?, groups_r, rb, rw, rparams, null);
+            e.recordProg(tile_prog.?, groups_r, rb, rw, rparams, null);
             if (!checking) return true;
             // the GPU's result aside, the rows back, the records cleared:
             // the CPU draws it next
@@ -1613,14 +1962,16 @@ pub const Engine = struct {
             for (vb, 0..) |img, j| views[j] = img.buf.cpu;
             if (!e.runCpu(.vertex, p, groups_v, views[0..vb.len], vparams)) break :cpu false;
             const sv = [_][]u8{ tris.buf.cpu, verts.buf.cpu };
-            if (!e.runCpu(.setup, p, groups_s, &sv, sparams)) break :cpu false;
+            if (!e.runCpuFor(.setup, p, v, kind, groups_s, &sv, sparams)) break :cpu false;
             const bv = [_][]u8{tris.buf.cpu};
             if (bins.on and !e.runCpu(.bin, p, groups_b, &bv, bparams)) break :cpu false;
-            var rv: [5 + texture.MAX_TEX][]u8 = undefined;
+            var rv: [rbs.len][]u8 = undefined;
             for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
-            if (!e.runCpu(if (d.stencil != null) .stencil else .raster, p, groups_r, rv[0..rb.len], rparams)) break :cpu false;
-            for (rb[0..2]) |img| e.wrote(img, 0, img.buf.cpu.len);
-            if (d.stencil) |stencil| e.wrote(stencil, 0, stencil.buf.cpu.len);
+            if (!e.runCpuFor(.raster, p, v, kind, groups_r, rv[0..rb.len], rparams)) break :cpu false;
+            // (the color and depth bindings as before: always marked)
+            for (rb, 0..) |img, j| {
+                if (j < 2 or rw & (@as(u32, 1) << @intCast(j)) != 0) e.wrote(img, 0, img.buf.cpu.len);
+            }
             break :cpu true;
         };
         if (!checking) return done;
@@ -1648,7 +1999,11 @@ pub const Engine = struct {
     }
 
     fn runCpu(e: *Engine, st: Stage, p: *const raster.Pipeline, groups: [3]u32, views: []const []u8, params: []const u32) bool {
-        var k = e.build(st, p);
+        return e.runCpuFor(st, p, .{}, .triangles, groups, views, params);
+    }
+
+    fn runCpuFor(e: *Engine, st: Stage, p: *const raster.Pipeline, v: raster.Variant, kind: raster.SetupKind, groups: [3]u32, views: []const []u8, params: []const u32) bool {
+        var k = e.buildFor(st, p, v, kind);
         k.finish() catch |err| {
             e.why_pipe = err;
             report.say(.pipeline, "a {s} kernel does not build ({s}): the draw is dropped", .{ @tagName(st), @errorName(err) });
@@ -1704,11 +2059,15 @@ pub const Engine = struct {
         p[B_MAPY] = @bitCast(b.dy0);
         p[B_MAPY + 1] = @bitCast(b.sy0);
         p[B_MAPY + 2] = @bitCast(b.scale_y);
-        p[B_LINEAR] = @intFromBool(b.linear);
+        p[B_LINEAR] = @intFromBool(b.linear and src.samples == 1);
         p[B_SSWAP] = @intFromBool(color and src.format == .bgra8);
         p[B_DSWAP] = @intFromBool(color and dst.format == .bgra8);
         p[B_SET] = if (color and (setOf(src) != 0 or src.format.channels() < 4)) 0xff00_0000 else 0;
         p[B_WMASK] = b.wmask;
+        p[B_SPIX] = src.format.bytes() * src.samples;
+        p[B_SSAMPLES] = src.samples;
+        p[B_SSHIFT] = std.math.log2_int(u32, src.samples);
+        p[B_SAVG] = @intFromBool(color);
         const groups = [3]u32{ divUp(a.width(), GROUP), a.height(), 1 };
         const regs = [_]Region{rowsOf(dst, a.y0, a.y1)};
         var checking = false;
@@ -1741,10 +2100,28 @@ pub const Engine = struct {
 
     /// Pixels of `rect` (GL's coordinates, inside img) become
     /// (pixel & keep) | (value & ~keep).
+    /// A multisampled image's pixels in `rect` resolved into the same
+    /// pixels of a single-sampled one (Vulkan's resolve attachments and
+    /// vkCmdResolveImage, GL's blit of a multisampled framebuffer): colour
+    /// samples averaged (each byte, rounded half up), depth and stencil
+    /// sample 0's. A blit at 1:1.
+    pub fn resolve(e: *Engine, src: *Image, dst: *Image, rect: Rect) bool {
+        const x0: i32 = @intCast(rect.x0);
+        const y0: i32 = @intCast(rect.y0);
+        return e.blit(src, dst, .{ .rect = rect, .dx0 = x0, .sx0 = @floatFromInt(x0), .scale_x = 1, .dy0 = y0, .sy0 = @floatFromInt(y0), .scale_y = 1 });
+    }
+
     pub fn fill(e: *Engine, img: *Image, rect: Rect, value: u32, keep: u32) void {
-        const a = rect.meet(img.bounds());
-        if (a.empty() or keep == 0xffff_ffff) return;
-        const op = CpuOp{ .fill = .{ .img = img.*, .rect = a, .value = value & ~keep, .keep = keep } };
+        const a0 = rect.meet(img.bounds());
+        if (a0.empty() or keep == 0xffff_ffff) return;
+        // (multisampled: every sample of the pixels, the row's samples side
+        // by side)
+        const ns = img.samples;
+        const a = Rect{ .x0 = a0.x0 * ns, .y0 = a0.y0, .x1 = a0.x1 * ns, .y1 = a0.y1 };
+        var flat = img.*;
+        flat.width *= ns;
+        flat.samples = 1;
+        const op = CpuOp{ .fill = .{ .img = flat, .rect = a, .value = value & ~keep, .keep = keep } };
         if (!e.gpuUsable(img)) {
             e.settle(img);
             return e.cpuDo(op);
@@ -1777,10 +2154,22 @@ pub const Engine = struct {
     /// coordinates; both inside their images), converted between rgba8
     /// and bgra8, or to fewer channels (R8 and RG8 from either). src and
     /// dst may be the same image only apart.
-    pub fn copy(e: *Engine, src: *Image, sx: u32, sy: u32, dst: *Image, dx: u32, dy: u32, w: u32, h: u32) void {
-        if (w == 0 or h == 0) return;
-        std.debug.assert(sx + w <= src.width and sy + h <= src.height and dx + w <= dst.width and dy + h <= dst.height);
-        const op = CpuOp{ .copy = .{ .src = src.*, .sx = sx, .sy = sy, .dst = dst.*, .dx = dx, .dy = dy, .w = w, .h = h } };
+    pub fn copy(e: *Engine, src: *Image, sx_px: u32, sy: u32, dst: *Image, dx_px: u32, dy: u32, w_px: u32, h: u32) void {
+        if (w_px == 0 or h == 0) return;
+        std.debug.assert(sx_px + w_px <= src.width and sy + h <= src.height and dx_px + w_px <= dst.width and dy + h <= dst.height);
+        // (multisampled, both alike: each pixel's samples copied)
+        std.debug.assert(src.samples == dst.samples);
+        const ns = src.samples;
+        const sx = sx_px * ns;
+        const dx = dx_px * ns;
+        const w = w_px * ns;
+        var fs = src.*;
+        var fd = dst.*;
+        fs.width *= ns;
+        fd.width *= ns;
+        fs.samples = 1;
+        fd.samples = 1;
+        const op = CpuOp{ .copy = .{ .src = fs, .sx = sx, .sy = sy, .dst = fd, .dx = dx, .dy = dy, .w = w, .h = h } };
         if (!e.gpuUsable(src) or !e.gpuUsable(dst)) {
             e.settle(src);
             e.settle(dst);
