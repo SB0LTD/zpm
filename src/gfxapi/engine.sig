@@ -2631,7 +2631,7 @@ pub const Engine = struct {
 // ── Tests (the CPU forms; the GPU's are tests/test_gfxapi.sig's) ──────────
 
 test "engine: the pool hands out, takes back and reuses" {
-    var mem: [4096]u8 align(64) = undefined;
+    var mem: [4096]u8 align(128) = undefined;
     var p = Pool.init(&mem);
     const a = p.alloc(100).?;
     const b = p.alloc(1000).?;
