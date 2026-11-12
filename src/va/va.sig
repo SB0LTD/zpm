@@ -64,6 +64,8 @@
 //!                    Media Foundation)
 //!   hevc_parse.sig, vp8_read.sig, vp9_read.sig, av1_read.sig  the same for
 //!                    HEVC, VP8, VP9 and AV1
+//!   video_enc.sig    Encoder: NV12 pictures in, H.264/VP8/VP9 bytes out
+//!                    (I then P, a key frame every gop), the same apps'
 //!   h264_stream_test.sig, hevc_parse_test.sig, video_test.sig  their tests
 //!                    on x264's, x265's and libvpx's streams
 //!   enc_vpx.sig      VP8 and VP9 encoding through VA-API: the buffers, a
@@ -105,6 +107,7 @@ pub const hevc_parse = @import("hevc_parse.sig");
 pub const vp8_read = @import("vp8_read.sig");
 pub const vp9_read = @import("vp9_read.sig");
 pub const av1_read = @import("av1_read.sig");
+pub const video_enc = @import("video_enc.sig");
 /// (the RTX converting pictures for a CPU reader; they import the `gpu` and
 /// `gfxapi` modules, so a build that names them wires those: libgalaxy_va,
 /// galaxy-pe)
@@ -148,6 +151,7 @@ test {
     _ = @import("video_test.sig");
     _ = @import("hevc_parse_test.sig");
     _ = @import("av1_read_test.sig");
+    _ = @import("video_enc_test.sig");
     _ = @import("enc_test.sig");
     _ = enc_import;
     _ = vpx_dsl;
