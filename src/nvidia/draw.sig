@@ -8,7 +8,8 @@
 //! texture times a color), each a rectangle in window pixels, replacing the
 //! target's pixels or blended over them (premultiplied alpha), inside a
 //! scissor; and the same with a rounded rectangle's coverage worked out per
-//! pixel, a mask times a gradient, and a soft dithered disc (a glow). The
+//! pixel, a mask times a gradient, a soft dithered disc (a glow) and a
+//! rounded rectangle's soft shadow. The
 //! rasterizer walks the rectangle, the texture unit filters, the
 //! render backend blends: no compute kernel.
 //!
@@ -37,7 +38,7 @@
 //!
 //! Colors are premultiplied, four floats (r, g, b, a) in [0, 1].
 //!
-//! On the emulated RTX (emu3d.sig) the interface's thirteen cases are the
+//! On the emulated RTX (emu3d.sig) the interface's fourteen cases are the
 //! CPU reference's within 2 of 255. Nothing here has run on the Legion's
 //! RTX yet.
 //!
@@ -110,8 +111,8 @@ pub const Blend = enum(u8) {
 };
 
 /// What a rectangle's pixels are.
-pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow };
-const KINDS = 8;
+pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow, shadow };
+pub const KINDS = 9;
 
 /// A rectangle's corners: x0, y0, x1, y1 (pixels; x1 and y1 past the end).
 pub const Rect = [4]f32;
@@ -146,6 +147,19 @@ pub const Gradient = struct {
     b: Color,
     c: Color,
     mid: f32 = 0.5,
+};
+
+/// What a shadow leaves alone, and gfx's ways (gpu/draw.sig's Deep, whose
+/// comment says what each is). The defaults have none of them.
+pub const Deep = struct {
+    from_x: f32 = 1e30,
+    above: f32 = -1e30,
+    below: f32 = 1e30,
+    left: f32 = -1e30,
+    right: f32 = 1e30,
+    step: f32 = 0,
+    run_from: f32 = 0,
+    run_end: f32 = -1e30,
 };
 
 // ── The 3D engine's methods (clce97.h, by address) ──────────────────────────
@@ -624,9 +638,116 @@ const FS_GLOW = VARYINGS ++
     \\EXIT
 ;
 
+/// A rounded rectangle's soft shadow, as gfx.shadowRoundRect (gpu/draw.sig's
+/// shadowAlpha): the color (straight, its alpha last) times gaussEdge of the
+/// signed distance (FS_RRECT's), nothing deeper than three sigmas inside
+/// but where Deep says. Abramowitz and Stegun's erf with its constants as
+/// immediates; the color leaves times that alpha, less DROP, not below 0.
+/// The varyings are the pixel's position. Predicates: P0 a corner row, P1
+/// deeper than three sigmas, P2 the corner's run skipped, P3 and P4 the
+/// distance stepped, P5 x >= 0, P6 drawn whole.
+/// P1: -centre x, y, -k x, y; P2: -radius, -3 sigma, 1 / (sigma sqrt 2),
+/// Deep's from_x; then its above, below, the alpha drawn whole, 3 sigma;
+/// then 1 / its step (0: none), the step, its left, its right; then the
+/// run's column as the distance takes it (its x less the centre's, less k,
+/// and that held to 0 and squared), its run_from and run_end.
+const FS_SHADOW = VARYINGS ++
+    \\LDC R8, c[0x0][0x30]
+    \\LDC R9, c[0x0][0x34]
+    \\LDC R10, c[0x0][0x38]
+    \\LDC R11, c[0x0][0x3c]
+    \\LDC R12, c[0x0][0x40]
+    \\LDC R13, c[0x0][0x44]
+    \\LDC R14, c[0x0][0x48]
+    \\LDC R15, c[0x0][0x50]
+    \\LDC R16, c[0x0][0x54]
+    \\FSETP.LT.AND P0, PT, R5, R15, PT
+    \\FSETP.GT.OR P0, PT, R5, R16, P0
+    \\FADD R17, R4, R8
+    \\FADD R18, R5, R9
+    \\FADD R17, |R17|, R10
+    \\FADD R18, |R18|, R11
+    \\FMNMX R19, R17, R18, !PT
+    \\FMNMX R19, R19, RZ, PT
+    \\FMNMX R20, R17, RZ, !PT
+    \\FMNMX R21, R18, RZ, !PT
+    \\FMUL R20, R20, R20
+    \\FFMA R20, R21, R21, R20
+    \\MUFU.SQRT R20, R20
+    \\FADD R19, R19, R20
+    \\FADD R19, R19, R12
+    \\FSETP.LT.AND P1, PT, R19, R13, PT
+    \\LDC R22, c[0x0][0x70]
+    \\LDC R23, c[0x0][0x74]
+    \\LDC R24, c[0x0][0x78]
+    \\LDC R25, c[0x0][0x7c]
+    \\FFMA R23, R21, R21, R23
+    \\MUFU.SQRT R23, R23
+    \\FMNMX R22, R18, R22, !PT
+    \\FMNMX R22, R22, RZ, PT
+    \\FADD R23, R23, R22
+    \\FADD R23, R23, R12
+    \\FSETP.LT.AND P2, PT, R23, R13, P0
+    \\FSETP.GT.AND P2, PT, R4, R24, P2
+    \\FSETP.LT.AND P2, PT, R4, R25, P2
+    \\LDC R26, c[0x0][0x68]
+    \\LDC R27, c[0x0][0x6c]
+    \\LDC R28, c[0x0][0x5c]
+    \\LDC R29, c[0x0][0x60]
+    \\LDC R30, c[0x0][0x64]
+    \\FSETP.LT.AND P3, PT, R4, R26, P0
+    \\FSETP.GT.AND P4, PT, R4, R27, P0
+    \\FADD R31, R19, R28
+    \\FMUL R31, R31, R29
+    \\FADD R31, R31, 0.5
+    \\FRND.FLOOR R31, R31
+    \\FFMA R31, R31, R30, R13
+    \\FSEL R20, R31, R19, P3
+    \\FSEL R20, R31, R20, P4
+    \\FMUL R20, R20, R14
+    \\FADD R21, |R20|, RZ
+    \\FMUL R21, R21, 0.3275911
+    \\FADD R21, R21, 1
+    \\MUFU.RCP R21, R21
+    \\FMUL R22, R21, 1.061405429
+    \\FADD R22, R22, -1.453152027
+    \\FMUL R22, R22, R21
+    \\FADD R22, R22, 1.421413741
+    \\FMUL R22, R22, R21
+    \\FADD R22, R22, -0.284496736
+    \\FMUL R22, R22, R21
+    \\FADD R22, R22, 0.254829592
+    \\FMUL R22, R22, R21
+    \\FMUL R23, R20, R20
+    \\FMUL R23, R23, -1.44269504
+    \\MUFU.EX2 R23, R23
+    \\FMUL R22, R22, R23
+    \\FMUL R22, R22, 0.5
+    \\FSETP.GE.AND P5, PT, R20, RZ, PT
+    \\FADD R23, -R22, 1
+    \\FSEL R22, R22, R23, P5
+    \\FADD.SAT R22, R22, -0.0019607844
+    \\LDC R24, c[0x0][0x4c]
+    \\LDC R25, c[0x0][0x58]
+    \\FSETP.GT.AND P6, PT, R4, R24, P0
+    \\FSEL R25, R25, RZ, P6
+    \\
+++ COLOR ++
+    \\FMUL R22, R22, R11
+    \\FSEL R22, R25, R22, P1
+    \\FSEL R3, RZ, R22, P2
+    \\FFMA R0, R8, R3, -0.0019215686
+    \\FFMA R1, R9, R3, -0.0019215686
+    \\FFMA R2, R10, R3, -0.0019215686
+    \\FMNMX R0, R0, RZ, !PT
+    \\FMNMX R1, R1, RZ, !PT
+    \\FMNMX R2, R2, RZ, !PT
+    \\EXIT
+;
+
 /// The programs: the two vertex programs, then a pixel program a kind.
 const PROGRAMS = 2 + KINDS;
-const SOURCES = [PROGRAMS][]const u8{ VS_FLAT, VS_VARY, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW };
+const SOURCES = [PROGRAMS][]const u8{ VS_FLAT, VS_VARY, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW, FS_SHADOW };
 
 /// Whether a kind's programs carry varyings (all but a solid rectangle's).
 fn varies(k: Kind) bool {
@@ -1142,6 +1263,27 @@ pub const Renderer = struct {
             -cx,                  -cy,                                            inner, 1 / span,
             9.0 / (16.0 * 255.0), (0.5 / 16.0 - 0.5) * 9.0 / 255.0 - 0.5 / 255.0, 3,     outer * outer,
             -DROP,                1,
+        };
+        r.emit(rc, rc, color, &params, 0);
+    }
+
+    /// The soft shadow of the rounded rectangle `s`: `color` (straight,
+    /// its alpha last) at gpu/draw.sig's shadowAlpha, the blended color
+    /// DROP lower, as a glow's. `rc` is the shape's bounds and three sigmas
+    /// around, or less.
+    pub fn shadow(r: *Renderer, rc: Rect, s: Shape, sigma: f32, color: Color, deep: Deep, b: Blend) void {
+        if (!r.drawn(rc) or !(sigma > 0)) return;
+        r.use(.shadow, b);
+        // (no step: no corner is gfx's)
+        const stepped = deep.step > 0;
+        const qxm = @abs(deep.run_from + 0.5 - s.cx) - s.kx;
+        const oxm = @max(qxm, 0);
+        const params = [20]f32{
+            -s.cx,                               -s.cy,                                 -s.kx,                           -s.ky,
+            -s.rad,                              -3 * sigma,                            1 / (sigma * 1.41421356),        deep.from_x,
+            deep.above,                          deep.below,                            color[3] * (254.0 / 255.0),      3 * sigma,
+            if (stepped) 1 / deep.step else 0,   if (stepped) deep.step else 0,         if (stepped) deep.left else -1e30, if (stepped) deep.right else 1e30,
+            qxm,                                 oxm * oxm,                             deep.run_from,                   deep.run_end,
         };
         r.emit(rc, rc, color, &params, 0);
     }

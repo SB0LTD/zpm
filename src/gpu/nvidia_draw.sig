@@ -49,6 +49,7 @@ pub const Over = struct {
         .imageRR = &vImageRR,
         .maskGradient = &vMaskGradient,
         .glow = &vGlow,
+        .shadow = &vShadow,
         .submit = &vSubmit,
         .resubmit = &vResubmit,
         .wait = &vWait,
@@ -101,6 +102,10 @@ pub const Over = struct {
 
     fn vGlow(ctx: *anyopaque, rc: draw.Rect, cx: f32, cy: f32, inner: f32, outer: f32, color: draw.Color, b: draw.Blend) void {
         of(ctx).r.glow(rc, cx, cy, inner, outer, color, blendOf(b));
+    }
+
+    fn vShadow(ctx: *anyopaque, rc: draw.Rect, s: draw.Shape, sigma: f32, color: draw.Color, deep: draw.Deep, b: draw.Blend) void {
+        of(ctx).r.shadow(rc, shapeOf(s), sigma, color, .{ .from_x = deep.from_x, .above = deep.above, .below = deep.below, .left = deep.left, .right = deep.right, .step = deep.step, .run_from = deep.run_from, .run_end = deep.run_end }, blendOf(b));
     }
 
     fn vSubmit(ctx: *anyopaque) draw.Error!draw.Fence {
@@ -198,6 +203,223 @@ pub fn selfTest(dev: Device, o: *Over, work: *nvidia.sm120_asm.Work, log: draw.L
     return draw.selfTest(o.renderer(), log, now_us);
 }
 
+// ── On the hardware: the 3D engine step by step, each pass the CPU's too ────
+// What Galaxy runs on the Legion's RTX (NV.TXT `drawtest`), on a channel of
+// its own: first the 3D engine's object alone, then its whole state with no
+// draw, then each of the interface's cases in a pass of its own, its whole
+// target compared with the CPU reference's (draw.Reference) pixel for
+// pixel, then the fill rate. A step that does not finish ends the test
+// (its channel is gone); each line names what it was, so the kernel log
+// alone says how far the engine got and what it drew differently.
+
+/// What hardwareTest found.
+pub const Hardware = struct {
+    /// The renderer started (its programs assembled, its buffers taken).
+    started: bool = false,
+    /// SET_OBJECT BLACKWELL_B alone ran to its fence.
+    object: bool = false,
+    /// The whole state and the target, no draw, ran to its fence.
+    state: bool = false,
+    passed: u32 = 0,
+    failed: u32 = 0,
+    /// A pass did not finish (a timeout, the channel lost): nothing after
+    /// it ran.
+    lost: bool = false,
+    /// The fill rate (megapixels a second; 0: not measured).
+    mpx_per_s: u32 = 0,
+    /// The slowest case's pass, submit to fence (us).
+    slowest_us: u64 = 0,
+};
+
+pub const Clock = *const fn () u64;
+
+/// A pass may take this long before the test calls it lost (a pass is a
+/// few rectangles: microseconds on the RTX).
+pub const STEP_US: u64 = 2_000_000;
+/// A case passes when no byte of its target is further than this from the
+/// CPU's (of 255): the texture unit's filter weights have 8 bits.
+pub const TOL: u8 = 3;
+/// What the target holds before each case: a pixel no case leaves, so one
+/// the engine did not write shows.
+pub const POISON: u8 = 0xcd;
+
+fn hsay(log: draw.Log, comptime fmt: []const u8, args: anytype) void {
+    var buf: [320]u8 = undefined;
+    log(std.fmt.bufPrint(&buf, "draw: " ++ fmt, args) catch "draw: (a line too long)");
+}
+
+/// Pixels of two targets (`bytes` each, 4 a pixel) further apart than
+/// `tol` in a byte: how many, the first, the largest difference.
+pub const Diff = struct { count: u32 = 0, first: ?usize = null, largest: u8 = 0 };
+
+pub fn compare(a: []const u8, b: []const u8, tol: u8) Diff {
+    var d: Diff = .{};
+    var i: usize = 0;
+    while (i + 4 <= a.len and i + 4 <= b.len) : (i += 4) {
+        var worst: u8 = 0;
+        for (0..4) |k| {
+            const x = a[i + k];
+            const y = b[i + k];
+            worst = @max(worst, if (x > y) x - y else y - x);
+        }
+        d.largest = @max(d.largest, worst);
+        if (worst > tol) {
+            if (d.first == null) d.first = i / 4;
+            d.count += 1;
+        }
+    }
+    return d;
+}
+
+fn word(b: []const u8, px: usize) u32 {
+    return std.mem.readInt(u32, b[px * 4 ..][0..4], .little);
+}
+
+/// The test on `dev` (a channel the 3D engine's object is on), in `o` (the
+/// caller's storage); `model` is the CPU's reference, with 64 KiB of
+/// memory or more.
+pub fn hardwareTest(dev: Device, o: *Over, work: *nvidia.sm120_asm.Work, model: *draw.Reference, log: draw.Log, now_us: Clock) Hardware {
+    var res: Hardware = .{};
+    o.init(dev, work, .{ .stream_bytes = 64 * 1024, .rects = 256, .textures = 31 }) catch |e| {
+        hsay(log, "the renderer did not start ({s}): nothing sent", .{@errorName(e)});
+        return res;
+    };
+    defer o.deinit();
+    res.started = true;
+    const rtx = o.renderer();
+    hsay(log, "the renderer is up: {d} programs (2 vertex, {d} pixel) at 0x{x}, records at 0x{x}, pushbuffer at 0x{x}", .{ nv.KINDS + 2, nv.KINDS, o.r.code.va, o.r.records.va, o.r.pb.va });
+
+    // 1. The 3D engine's object bound to its subchannel, nothing else.
+    {
+        var p = nvidia.push.Push{ .buf = o.r.pb.words() };
+        p.setObject(nv.SUBCH, nv.BLACKWELL_B);
+        const t0 = now_us();
+        dev.run(o.r.pb, @intCast(p.len), STEP_US) catch |e| {
+            hsay(log, "step 1, SET_OBJECT BLACKWELL_B (0x{x}) on subchannel {d}: FAILED ({s} after {d} us): the channel did not take the 3D engine's object", .{ nv.BLACKWELL_B, nv.SUBCH, @errorName(e), now_us() - t0 });
+            res.lost = true;
+            return res;
+        };
+        res.object = true;
+        hsay(log, "step 1, SET_OBJECT BLACKWELL_B (0x{x}) on subchannel {d}: done in {d} us", .{ nv.BLACKWELL_B, nv.SUBCH, now_us() - t0 });
+    }
+
+    const bytes = draw.CASE_W * draw.CASE_H * 4;
+    const pixels = rtx.alloc(bytes) orelse {
+        hsay(log, "no memory for the target", .{});
+        res.failed = 1;
+        return res;
+    };
+    defer rtx.free(pixels);
+    const tex_buf = rtx.alloc(draw.CaseTextures.BYTES) orelse {
+        hsay(log, "no memory for the textures", .{});
+        res.failed = 1;
+        return res;
+    };
+    defer rtx.free(tex_buf);
+    const tex = draw.CaseTextures.fill(tex_buf);
+    rtx.toDevice(tex_buf, 0, draw.CaseTextures.BYTES);
+    const t = draw.Target{ .va = pixels.va, .width = draw.CASE_W, .height = draw.CASE_H, .pitch = draw.CASE_W * 4, .format = .bgra8 };
+
+    // 2. The engine's whole state and the target, no draw: the target
+    // must come back as it went.
+    {
+        @memset(pixels.cpu[0..bytes], POISON);
+        rtx.toDevice(pixels, 0, bytes);
+        rtx.begin(t);
+        const t0 = now_us();
+        rtx.run(STEP_US) catch |e| {
+            hsay(log, "step 2, the engine's state ({d} dwords: the pools, the stages off, the target at 0x{x}), no draw: FAILED ({s} after {d} us)", .{ o.r.stats.stream_dwords, t.va, @errorName(e), now_us() - t0 });
+            res.lost = true;
+            return res;
+        };
+        res.state = true;
+        rtx.fromDevice(pixels, 0, bytes);
+        const p0 = word(pixels.cpu, 0);
+        hsay(log, "step 2, the engine's state ({d} dwords), no draw: done in {d} us; the target {s} (first pixel {x:0>8})", .{ o.r.stats.stream_dwords, now_us() - t0, if (p0 == 0xcdcdcdcd) "untouched, as it should be" else "CHANGED, though nothing was drawn", p0 });
+    }
+
+    // 3. The cases, each against the CPU's.
+    for (draw.cases, 1..) |c, n| {
+        @memset(pixels.cpu[0..bytes], POISON);
+        rtx.toDevice(pixels, 0, bytes);
+        draw.record(rtx, t, tex, c);
+        const t0 = now_us();
+        rtx.run(STEP_US) catch |e| {
+            const st = rtx.stats();
+            hsay(log, "case {d} '{s}': FAILED: the pass did not finish ({s} after {d} us; {d} rectangles, {d} dwords): the cases after it are not run", .{ n, c.name, @errorName(e), now_us() - t0, st.rects, st.stream_dwords });
+            res.failed += 1;
+            res.lost = true;
+            break;
+        };
+        const us = now_us() - t0;
+        res.slowest_us = @max(res.slowest_us, us);
+        rtx.fromDevice(pixels, 0, bytes);
+        // (the same pass on the CPU)
+        model.reset();
+        const m = model.renderer();
+        const mp = m.alloc(bytes) orelse {
+            hsay(log, "the reference has no memory: not compared", .{});
+            res.failed += 1;
+            continue;
+        };
+        const mt = m.alloc(draw.CaseTextures.BYTES) orelse {
+            hsay(log, "the reference has no memory: not compared", .{});
+            res.failed += 1;
+            continue;
+        };
+        const mtex = draw.CaseTextures.fill(mt);
+        draw.record(m, .{ .va = mp.va, .width = t.width, .height = t.height, .pitch = t.pitch, .format = t.format }, mtex, c);
+        m.run(STEP_US) catch {};
+        const st = rtx.stats();
+        const d = compare(pixels.cpu[0..bytes], mp.cpu[0..bytes], TOL);
+        if (d.first) |at| {
+            res.failed += 1;
+            const row = at - at % draw.CASE_W;
+            hsay(log, "case {d} '{s}': FAILED in {d} us: {d} of {d} pixels differ from the CPU's by more than {d} of 255 (most {d}); the first at ({d}, {d}): the RTX {x:0>8}, the CPU {x:0>8}; that row's first pixels: the RTX {x:0>8} {x:0>8} {x:0>8} {x:0>8}, the CPU {x:0>8} {x:0>8} {x:0>8} {x:0>8}", .{
+                n,                     c.name,                    us,                        d.count,                   draw.CASE_W * draw.CASE_H, TOL, d.largest, at % draw.CASE_W, at / draw.CASE_W, word(pixels.cpu, at), word(mp.cpu, at),
+                word(pixels.cpu, row), word(pixels.cpu, row + 1), word(pixels.cpu, row + 2), word(pixels.cpu, row + 3), word(mp.cpu, row),         word(mp.cpu, row + 1), word(mp.cpu, row + 2), word(mp.cpu, row + 3),
+            });
+        } else {
+            res.passed += 1;
+            hsay(log, "case {d} '{s}': PASS in {d} us ({d} rectangles, {d} dwords; at most {d} of 255 from the CPU's)", .{ n, c.name, us, st.rects, st.stream_dwords, d.largest });
+        }
+    }
+
+    // 4. How fast it fills: a 1024 x 1024 target, an image the same size
+    // over it once and a half-transparent color 31 times (32 megapixels
+    // blended), as draw.selfTest measures it.
+    if (!res.lost and res.failed == 0) speed: {
+        const N = 1024;
+        const big = rtx.alloc(N * N * 4) orelse {
+            hsay(log, "the fill rate: no memory for it, not measured", .{});
+            break :speed;
+        };
+        defer rtx.free(big);
+        const src = rtx.alloc(N * N * 4) orelse {
+            hsay(log, "the fill rate: no memory for it, not measured", .{});
+            break :speed;
+        };
+        defer rtx.free(src);
+        for (0..N * N) |i| std.mem.writeInt(u32, src.cpu[i * 4 ..][0..4], 0xff000000 | @as(u32, @truncate(i *% 2654435761)), .little);
+        rtx.toDevice(src, 0, N * N * 4);
+        rtx.begin(.{ .va = big.va, .width = N, .height = N, .pitch = N * 4, .format = .bgra8 });
+        rtx.image(.{ 0, 0, N, N }, .{ .va = src.va, .width = N, .height = N, .pitch = N * 4, .format = .bgra8, .filter = .linear }, .{ 0, 0, N, N }, .{ 1, 1, 1, 1 }, .replace);
+        for (0..31) |_| rtx.fill(.{ 0, 0, N, N }, .{ 0.01, 0.01, 0.01, 0.02 }, .over);
+        const t0 = now_us();
+        rtx.run(5 * STEP_US) catch |e| {
+            hsay(log, "the fill rate: the pass did not finish ({s})", .{@errorName(e)});
+            res.lost = true;
+            break :speed;
+        };
+        const us = @max(now_us() - t0, 1);
+        res.mpx_per_s = @intCast(@min(@as(u64, 32) * N * N / us, std.math.maxInt(u32)));
+        rtx.fromDevice(big, 0, 16);
+        hsay(log, "the fill rate: 32 megapixels blended in {d} us, {d} megapixels a second (first pixel {x:0>8})", .{ us, res.mpx_per_s, word(big.cpu, 0) });
+    }
+    hsay(log, "{d} of {d} cases passed, {d} failed{s}", .{ res.passed, draw.cases.len, res.failed, if (res.lost) "; a pass did not finish" else "" });
+    return res;
+}
+
 // ── Tests: the emulated RTX through the interface ───────────────────────────
 
 const testing = std.testing;
@@ -217,6 +439,21 @@ const T = struct {
         engine = .{};
         dev = .{ .arena = &arena, .gpu_view = &gpu_view, .work = &work, .gr3d = &engine };
         return dev.device();
+    }
+
+    var ticks: u64 = 0;
+    fn clock() u64 {
+        ticks += 7;
+        return ticks;
+    }
+
+    fn silent(_: []const u8) void {}
+
+    fn loud(line: []const u8) void {
+        if (std.mem.indexOf(u8, line, "FAILED") != null or std.mem.indexOf(u8, line, "CHANGED") != null) {
+            var buf: [400]u8 = undefined;
+            std.debug.print("{s}\n  {s} {s}\n", .{ line, engine.why, nvidia.sm120_emu.explain(&work, &buf) });
+        }
     }
 
     fn quiet(line: []const u8) void {
@@ -264,4 +501,32 @@ test "nvidia_draw: every case's whole target is the reference's, within 2 of 255
         }
         T.over.renderer().free(pixels[0]);
     }
+}
+
+test "nvidia_draw: the hardware test, step by step, on the emulated RTX: every case the CPU's" {
+    const res = hardwareTest(T.fresh(), &T.over, &T.asm_work, &T.model, &T.loud, &T.clock);
+    try testing.expect(res.started and res.object and res.state);
+    try testing.expectEqual(@as(u32, draw.cases.len), res.passed);
+    try testing.expectEqual(@as(u32, 0), res.failed);
+    try testing.expect(!res.lost);
+    // (the fill rate's 8 MiB are more than the emulated RTX's arena holds)
+    try testing.expectEqual(@as(u32, 0), res.mpx_per_s);
+}
+
+test "nvidia_draw: the hardware test stops at step 1 when the channel has no 3D engine" {
+    T.engine = .{};
+    T.dev = .{ .arena = &T.arena, .gpu_view = &T.gpu_view, .work = &T.work };
+    const res = hardwareTest(T.dev.device(), &T.over, &T.asm_work, &T.model, &T.silent, &T.clock);
+    try testing.expect(res.started and !res.object and !res.state and res.lost);
+    try testing.expectEqual(@as(u32, 0), res.passed);
+}
+
+test "nvidia_draw: compare counts the pixels further apart than the tolerance" {
+    const a = [_]u8{ 10, 10, 10, 255, 0, 0, 0, 255, 9, 9, 9, 9 };
+    const b = [_]u8{ 12, 10, 10, 255, 0, 9, 0, 255, 9, 9, 9, 9 };
+    const d = compare(&a, &b, 3);
+    try testing.expectEqual(@as(u32, 1), d.count);
+    try testing.expectEqual(@as(?usize, 1), d.first);
+    try testing.expectEqual(@as(u8, 9), d.largest);
+    try testing.expectEqual(@as(?usize, null), compare(&a, &a, 0).first);
 }
