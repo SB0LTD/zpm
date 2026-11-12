@@ -106,6 +106,8 @@ test {
     _ = @import("driver_test.sig");
     _ = @import("driver_10bit_test.sig");
     _ = @import("hevc_stream_test.sig");
+    _ = @import("h264_stream_test.sig");
+    _ = @import("video_test.sig");
     _ = @import("enc_test.sig");
     _ = enc_import;
 }
