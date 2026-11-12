@@ -78,6 +78,10 @@ pub const enc_av1 = @import("enc_av1.sig");
 pub const enc_import = @import("enc_import.sig");
 pub const convert = @import("convert.sig");
 pub const driver = @import("driver.sig");
+pub const vpx_dsl = @import("vpx_dsl.sig");
+pub const vpx_bool = @import("vpx_bool.sig");
+pub const vp8_kernels = @import("vp8_kernels.sig");
+pub const enc_vp8 = @import("enc_vp8.sig");
 
 test {
     _ = vaapi;
@@ -108,4 +112,10 @@ test {
     _ = @import("hevc_stream_test.sig");
     _ = @import("enc_test.sig");
     _ = enc_import;
+    _ = vpx_dsl;
+    _ = vpx_bool;
+    _ = vp8_kernels;
+    _ = enc_vp8;
+    _ = @import("enc_vpx.sig");
+    _ = @import("vpx_driver_test.sig");
 }

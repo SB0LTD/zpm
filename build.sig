@@ -1259,6 +1259,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // The VA driver's VP8 and VP9 encoders: their kernels on KIR's
+    // interpreter and the emulated RTX, byte for byte against the CPU's.
+    _ = try addTest(ctx, test_gfxapi, "test-gfxapi-va-vpx", "src/va/vpx_gpu.sig", &.{
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     _ = try addTest(ctx, test_gfxapi, "test-gfxapi-egl", "tests/test_gfxapi_egl.sig", &.{
         importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
         importEntry("va_tiling", "src/va/tiling.sig"),
