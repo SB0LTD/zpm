@@ -509,6 +509,8 @@ pub const Adapter = struct {
             },
             .count = g.count,
             .instances = g.instances,
+            .cull = g.cull,
+            .front_ccw = g.front_ccw,
             .depth = if (g.depth) |z| .{
                 .va = z.va,
                 .width = z.width,

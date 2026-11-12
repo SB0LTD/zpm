@@ -2070,6 +2070,10 @@ pub const Engine = struct {
             },
             .count = d.count,
             .instances = d.instances,
+            // (GL's winding is in its window, y up; a flipped target's
+            // rows run the other way, so its front face is the other)
+            .cull = d.cull,
+            .front_ccw = d.front_ccw != flip,
         };
         e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, d.depth);
         e.stats.graphics_draws += 1;

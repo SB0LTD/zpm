@@ -1688,7 +1688,7 @@ test "draw: the drawtest boot's hardware test on the emulated RTX, step 4 (edges
     try std.testing.expect(res.started and res.object and res.state and !res.lost);
     try std.testing.expectEqual(@as(u32, 0), res.failed);
     try std.testing.expect(!res.edge_skipped);
-    try std.testing.expectEqual(@as(u32, 6), res.edge_scenes);
+    try std.testing.expectEqual(@as(u32, 2 * gpu.nvidia_draw.EDGE_SCENES), res.edge_scenes);
     try std.testing.expectEqual(@as(u32, 0), res.edge_cover_apart);
     try std.testing.expectEqual(@as(u32, 0), res.edge_depth_apart);
     try std.testing.expectEqual(@as(u32, 0), res.edge_equal_apart);

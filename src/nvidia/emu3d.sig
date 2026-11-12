@@ -211,7 +211,12 @@ pub const Engine = struct {
         try g.need(g.reg(gr.SET_VIEWPORT_Z_CLIP) <= 1, "a depth clip range other than -w..w or 0..w");
         try g.need(g.reg(gr.SET_PROVOKING_VERTEX) <= 1, "a provoking vertex other than the first or the last");
         try g.need(g.reg(gr.SET_WINDOW_OFFSET_X) == 0 and g.reg(gr.SET_WINDOW_OFFSET_X + 4) == 0 and g.reg(gr.SET_WINDOW_CLIP_ENABLE) == 0, "a window offset or window clips: not modelled");
-        try g.need(g.reg(gr.OGL_SET_CULL) == 0 and g.reg(gr.SET_FRONT_POLYGON_MODE) == 0x1b02 and g.reg(gr.SET_FRONT_POLYGON_MODE + 4) == 0x1b02, "culling, or polygons not filled: not modelled");
+        try g.need(g.reg(gr.SET_FRONT_POLYGON_MODE) == 0x1b02 and g.reg(gr.SET_FRONT_POLYGON_MODE + 4) == 0x1b02, "polygons not filled: not modelled");
+        try g.need(g.reg(gr.OGL_SET_CULL) == 0 or switch (g.reg(gl3d.OGL_SET_CULL_FACE)) {
+            gl3d.CULL_FRONT, gl3d.CULL_BACK, gl3d.CULL_FRONT_AND_BACK => true,
+            else => false,
+        }, "a culled face other than FRONT, BACK or FRONT_AND_BACK");
+        try g.need(g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CW or g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW, "a front face other than CW or CCW");
         const topo = g.reg(gr.SET_PRIMITIVE_TOPOLOGY);
         try g.need(g.reg(gr.SET_PRIMITIVE_TOPOLOGY_CONTROL) == 1 and topo >= 4 and topo <= 6, "not triangles, a strip or a fan by SET_PRIMITIVE_TOPOLOGY");
         try g.need(g.reg(gr.SET_DRAW_CONTROL_A) == gr.DRAW_CONTROL and g.reg(gr.SET_DRAW_CONTROL_A + 4) >= 1, "SET_DRAW_CONTROL is not instances from the first");
@@ -538,6 +543,7 @@ pub const Engine = struct {
         var tri = tri0;
         var area = edge(win[tri[0]], win[tri[1]], win[tri[2]]);
         if (area == 0) return;
+        if (g.culled(area)) return;
         if (area < 0) {
             std.mem.swap(usize, &tri[1], &tri[2]);
             area = -area;
@@ -603,6 +609,14 @@ pub const Engine = struct {
             win[k] = g.win[v];
         }
         return planeOf(zc, w, win, @floatCast(g.zscale), @floatCast(g.zoffset), area);
+    }
+
+    /// Whether a triangle whose grid places give `area` (edge(v0, v1, v2):
+    /// > 0 counter-clockwise as the window's coordinates count, x right
+    /// and y as the rows grow) is culled, as OGL_SET_CULL, OGL_SET_CULL_FACE
+    /// and OGL_SET_FRONT_FACE say.
+    fn culled(g: *const Engine, area: i64) bool {
+        return cullOf(area, g.reg(gr.OGL_SET_CULL) != 0, g.reg(gl3d.OGL_SET_CULL_FACE), g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW);
     }
 
     /// Whether a pixel's depth (window units) is in the viewport's depth
@@ -829,6 +843,19 @@ pub fn planeOf(zc: [3]f32, w_in: [3]f32, win: [3][2]i64, zs: f32, zo: f32, area:
     const d1 = z[1] - z[0];
     const d2 = z[2] - z[0];
     return .{ .z0 = z[0], .gx = (d1 * ey2 - d2 * ey1) * idet, .gy = (d2 * ex1 - d1 * ex2) * idet, .x0 = fx[0], .y0 = fy[0] };
+}
+
+/// Whether a triangle of `area` (edge(v0, v1, v2) on the grid) is culled:
+/// front when its winding (counter-clockwise: area > 0) is the front's.
+pub fn cullOf(area: i64, on: bool, face: u32, front_ccw: bool) bool {
+    if (!on or area == 0) return false;
+    const front = (area > 0) == front_ccw;
+    return switch (face) {
+        gl3d.CULL_FRONT => front,
+        gl3d.CULL_BACK => !front,
+        gl3d.CULL_FRONT_AND_BACK => true,
+        else => false,
+    };
 }
 
 /// Whether a pixel's depth (window units) is in the viewport's depth range

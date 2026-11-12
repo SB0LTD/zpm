@@ -159,7 +159,21 @@ pub const Draw = struct {
     count: u32,
     instances: u32 = 1,
     depth: ?Depth = null,
+    /// Faces culled: bit 0 front, bit 1 back.
+    cull: u2 = 0,
+    /// Front faces counter-clockwise in the window's coordinates (x
+    /// right, y as the rows grow).
+    front_ccw: bool = true,
 };
+
+/// OGL_SET_CULL_FACE (cl9097.h): the faces culled when OGL_SET_CULL is on.
+pub const OGL_SET_CULL_FACE: u32 = 0x1920;
+pub const CULL_FRONT: u32 = 0x404;
+pub const CULL_BACK: u32 = 0x405;
+pub const CULL_FRONT_AND_BACK: u32 = 0x408;
+/// OGL_SET_FRONT_FACE's values.
+pub const FRONT_CW: u32 = 0x900;
+pub const FRONT_CCW: u32 = 0x901;
 
 fn one(p: *Push, m: u32, v: u32) void {
     p.immediate(SUBCH, m, v);
@@ -192,6 +206,15 @@ pub fn emit(p: *Push, d: *const Draw) void {
     one(p, gr.SET_VIEWPORT_Z_CLIP, SET_VIEWPORT_SCALE_Z_CLIP_GL);
     gr.setScissor(p, d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
     one(p, gr.SET_PROVOKING_VERTEX, PROVOKING_LAST);
+    one(p, gr.OGL_SET_FRONT_FACE, if (d.front_ccw) FRONT_CCW else FRONT_CW);
+    if (d.cull != 0) {
+        one(p, OGL_SET_CULL_FACE, switch (d.cull) {
+            1 => CULL_FRONT,
+            2 => CULL_BACK,
+            else => CULL_FRONT_AND_BACK,
+        });
+        one(p, gr.OGL_SET_CULL, 1);
+    } else one(p, gr.OGL_SET_CULL, 0);
     if (d.depth) |z| {
         many(p, SET_ZT_A, &.{ @truncate(z.va >> 32), @truncate(z.va), ZT_S8Z24, @as(u32, z.gobs_log2) << 4, 0 });
         many(p, SET_ZT_SIZE_A, &.{ z.width, z.height, 0x1_0001 });

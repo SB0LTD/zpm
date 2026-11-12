@@ -474,10 +474,18 @@ const E_PITCH = EW * 4;
 const E_DEPTH_BYTES = (E_PITCH / 64) * ((EH + 31) / 32) * (512 << E_GOBS);
 /// The quads, in pixels (x right, y the target's rows), and their
 /// corners' clip z.
-const edge_scenes = [_]struct { name: []const u8, pts: [4][2]f32 }{
+/// `cull`: the faces culled (bit 0 front, bit 1 back), front faces
+/// counter-clockwise as the target's coordinates count; then the second
+/// triangle is wound the other way, so one of the two is culled.
+/// Scenes step 4 draws (each rows up and flipped).
+pub const EDGE_SCENES = edge_scenes.len;
+const EdgeScene = struct { name: []const u8, pts: [4][2]f32, cull: u2 = 0 };
+const edge_scenes = [_]EdgeScene{
     .{ .name = "a 45-degree edge through pixel centres", .pts = .{ .{ 8, 4 }, .{ 32, 4 }, .{ 32, 28 }, .{ 8, 28 } } },
     .{ .name = "off-grid corners", .pts = .{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } } },
     .{ .name = "steep, sub-pixel corners", .pts = .{ .{ 40.5, 2.25 }, .{ 61.0078125, 30.0039 }, .{ 12.25, 30.5 }, .{ 3.1, 1.9 } } },
+    .{ .name = "culling: back faces (front counter-clockwise)", .pts = .{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } }, .cull = 2 },
+    .{ .name = "culling: front faces", .pts = .{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } }, .cull = 1 },
 };
 const edge_z = [4]f32{ -0.3, 0.2117, 0.7, 0.0931 };
 
@@ -495,10 +503,11 @@ const E = struct {
 };
 
 /// The scene's six vertices (clip space: the triangles (0, 1, 2) and
-/// (0, 2, 3) of the quad).
-fn edgeVerts(pts: [4][2]f32) [6][4]f32 {
+/// (0, 2, 3) of the quad; with culling, (0, 3, 2), wound the other way).
+fn edgeVerts(sc: EdgeScene) [6][4]f32 {
+    const pts = sc.pts;
     var v: [6][4]f32 = undefined;
-    const tris = [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
+    const tris = if (sc.cull != 0) [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 3, 2 } } else [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
     for (tris, 0..) |t, n| {
         for (t, 0..) |c, j| v[n * 3 + j] = .{ 2 * pts[c][0] / EW - 1, 2 * pts[c][1] / EH - 1, edge_z[c], 1 };
     }
@@ -508,7 +517,7 @@ fn edgeVerts(pts: [4][2]f32) [6][4]f32 {
 /// The model's picture of a scene drawn with depth LESS (written) over a
 /// depth of 1, viewport `vp` (scale x, y, offset x, y), depth scale and
 /// offset 0.5 (GL's -1 .. 1 to 0 .. 1).
-fn edgeModel(verts: *const [6][4]f32, vp: [4]f32, m: *EdgeModel) void {
+fn edgeModel(verts: *const [6][4]f32, vp: [4]f32, cull: u2, m: *EdgeModel) void {
     @memset(&m.hits, 0);
     @memset(&m.z, 0xff_ffff);
     const zs: f32 = 0.5;
@@ -525,6 +534,11 @@ fn edgeModel(verts: *const [6][4]f32, vp: [4]f32, m: *EdgeModel) void {
         }
         var area = model3d.edge(win[0], win[1], win[2]);
         if (area == 0) continue;
+        if (model3d.cullOf(area, cull != 0, switch (cull) {
+            1 => nvidia.gl3d.CULL_FRONT,
+            2 => nvidia.gl3d.CULL_BACK,
+            else => nvidia.gl3d.CULL_FRONT_AND_BACK,
+        }, true)) continue;
         if (area < 0) {
             std.mem.swap([2]i64, &win[1], &win[2]);
             std.mem.swap(f32, &zc[1], &zc[2]);
@@ -629,10 +643,10 @@ fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res:
     for ([_]bool{ false, true }) |flipped| {
         for (edge_scenes) |sc| {
             const vpw = [4]f32{ EW / 2, if (flipped) -@as(f32, EH / 2) else EH / 2, EW / 2, if (flipped) @as(f32, EH) - EH / 2 else EH / 2 };
-            E.verts = edgeVerts(sc.pts);
+            E.verts = edgeVerts(sc);
             @memcpy(vb.cpu[0 .. 6 * 16], std.mem.sliceAsBytes(&E.verts));
             d.toDevice(vb, 0, 6 * 16);
-            edgeModel(&E.verts, vpw, &E.m);
+            edgeModel(&E.verts, vpw, sc.cull, &E.m);
             var cover_apart: u32 = 0;
             var depth_apart: u32 = 0;
             var equal_apart: u32 = 0;
@@ -660,6 +674,8 @@ fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res:
                     .offset = .{ vpw[2], vpw[3], 0.5 },
                     .scissor = .{ 0, 0, EW, EH },
                     .count = 6,
+                    .cull = sc.cull,
+                    .front_ccw = true,
                     .depth = .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = pass == 0, .func = if (pass == 0) 1 else 2 },
                 };
                 const t0 = now_us();

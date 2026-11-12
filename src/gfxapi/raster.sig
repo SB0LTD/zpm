@@ -238,6 +238,10 @@ pub const Shaders = struct {
     /// the fragment code writes gl_FragDepth (FragmentIO.depth): the
     /// depth and stencil tests come after it (no early rejection)
     frag_depth: bool = false,
+    /// the fragment code reads gl_FrontFacing (FragmentIO.front_facing):
+    /// the compute kernels give it (the 3D engine's pixel programs do not
+    /// read the facing yet)
+    front_facing: bool = false,
     /// clip distances the vertex code writes (VertexIO.clip): each
     /// interpolated as a varying is, and a sample where one is below 0 is
     /// not drawn (the half-space clipped away, per pixel)
@@ -873,7 +877,6 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
         if (d.depth == null or sten != d.depth.?) return "a stencil image apart from the depth image";
         if (!std.meta.eql(d.stencil_front, d.stencil_back)) return "two-sided stencil";
     }
-    if (d.cull != 0) return "culling";
     if (d.restart) return "primitive restart";
     if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
     for (d.targets[1..]) |t| if (t != null) return "more than one colour target";
@@ -892,6 +895,7 @@ pub fn pipelineWhyNot(sh: Shaders) ?[]const u8 {
     if (sh.capture.len != 0) return "transform feedback";
     if (sh.point_size or sh.point_coord) return "points";
     if (sh.frag_depth) return "gl_FragDepth";
+    if (sh.front_facing) return "gl_FrontFacing";
     if (sh.clips != 0) return "clip distances";
     if (sh.varyings > nvidia_gl.MAX_VARYINGS) return "more varyings than 32 vectors";
     return null;

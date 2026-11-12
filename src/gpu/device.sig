@@ -349,6 +349,12 @@ pub const Graphics = struct {
     /// The depth-stencil target (block linear, depth in bits 0..23 and
     /// stencil in 24..31) and its tests; null: none.
     depth: ?Depth = null,
+    /// Faces culled: bit 0 front, bit 1 back.
+    cull: u2 = 0,
+    /// Front faces wind counter-clockwise as the target's coordinates
+    /// count (x right, y as its rows grow: the window's after the
+    /// viewport).
+    front_ccw: bool = true,
 
     pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8 };
     pub const StencilOp = enum(u8) { keep, zero, replace, incr, decr, invert, incr_wrap, decr_wrap };
