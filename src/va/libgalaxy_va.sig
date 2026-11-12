@@ -105,12 +105,18 @@ fn stop(msg: []const u8, ra: ?usize) noreturn {
 /// a KIR kernel; the build wires the `gpu` and `gfxapi` modules); this
 /// file's tests convert on the CPU (convert.Cpu), without those modules.
 /// RGB pictures an encode reads (screen captures) are converted on the RTX
-/// too (enc_rgb: another KIR kernel, its own GPU context).
-const Conv = if (builtin.is_test) @import("convert.sig").Cpu else @import("enc_rgb.sig").WithRgb(
-    @import("gpu_convert.sig").Gpu(@import("gfxapi").node.Linux),
+/// too (enc_rgb: another KIR kernel, its own GPU context), and VP8 and VP9
+/// are encoded there (vpx_gpu: the encoders' kernels, their own GPU
+/// context; the CPU runs the same kernels when the GPU cannot).
+const Conv = if (builtin.is_test) @import("convert.sig").Cpu else @import("vpx_gpu.sig").WithVpx(
+    @import("enc_rgb.sig").WithRgb(
+        @import("gpu_convert.sig").Gpu(@import("gfxapi").node.Linux),
+        @import("gfxapi").node.Gpu(@import("gfxapi").node.Linux, &.{.sm_120}),
+        @import("convert.sig").Say,
+        @import("convert.sig").Done,
+    ),
     @import("gfxapi").node.Gpu(@import("gfxapi").node.Linux, &.{.sm_120}),
     @import("convert.sig").Say,
-    @import("convert.sig").Done,
 );
 const D = driver.DriverWith(node.Linux, Conv);
 
@@ -312,6 +318,10 @@ pub fn optionsOf(block: []const u8) driver.Options {
         } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_RC")) {
             // ("firmware": the encoder's own CBR/VBR, enc_rc.sig)
             o.nvenc_rc_firmware = std.ascii.eqlIgnoreCase(v, "firmware");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_ENCODE")) {
+            o.vpx_encode = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_GPU")) {
+            o.vpx_gpu = !std.mem.eql(u8, v, "0");
         }
     }
     o.hevc_blackwell = hevc_bw orelse all_bw orelse o.hevc_blackwell;
@@ -628,6 +638,11 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expectEqual(codec.Blackwell.off, optionsOf("GALAXY_VA_AV1_BLACKWELL=0").av1_blackwell);
     try testing.expectEqual(codec.Blackwell.full, optionsOf("GALAXY_VA_HEVC_BLACKWELL=bogus").hevc_blackwell);
     try testing.expectEqual(codec.Control.nvk, optionsOf("GALAXY_VA_CONTROL=bogus").control);
+    // VP8 and VP9 encoding: on, on the RTX; each switch off by itself
+    try testing.expect(none.vpx_encode and none.vpx_gpu);
+    const vpx = optionsOf("GALAXY_VA_VPX_GPU=0\x00");
+    try testing.expect(vpx.vpx_encode and !vpx.vpx_gpu);
+    try testing.expect(!optionsOf("GALAXY_VA_VPX_ENCODE=0\x00").vpx_encode);
 }
 
 test "libgalaxy_va: init without Galaxy's RTX fails cleanly" {

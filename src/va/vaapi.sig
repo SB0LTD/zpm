@@ -38,6 +38,7 @@ pub const ERROR_RESOLUTION_NOT_SUPPORTED: Status = 0x13;
 pub const ERROR_UNIMPLEMENTED: Status = 0x14;
 pub const ERROR_INVALID_IMAGE_FORMAT: Status = 0x16;
 pub const ERROR_DECODING_ERROR: Status = 0x17;
+pub const ERROR_ENCODING_ERROR: Status = 0x18;
 pub const ERROR_INVALID_VALUE: Status = 0x19;
 pub const ERROR_HW_BUSY: Status = 0x22;
 pub const ERROR_UNSUPPORTED_MEMORY_TYPE: Status = 0x24;

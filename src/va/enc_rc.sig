@@ -49,7 +49,8 @@ const nvenc = @import("nvenc.sig");
 pub const Mode = enum { cqp, cbr, vbr };
 /// The firmware's QP[] order: P, B, I.
 pub const Type = enum(u2) { p = 0, b = 1, i = 2 };
-pub const Scale = enum { h26x, av1 };
+/// The quantizer domains: H.26x's QP, AV1's (and VP9's) q index, VP8's.
+pub const Scale = enum { h26x, av1, vp8 };
 
 /// I pictures' qstep this much finer than P's, B's this much coarser.
 pub const IP_RATIO: f64 = 1.4;
@@ -62,6 +63,8 @@ pub fn qstep(scale: Scale, q: f64) f64 {
     return switch (scale) {
         .h26x => std.math.pow(f64, 2.0, (q - 4.0) / 6.0),
         .av1 => 4.0 * std.math.pow(f64, 1.0243, q),
+        // (VP8's AC table: 4 at 0, 157 at 127)
+        .vp8 => 4.0 * std.math.pow(f64, 1.0293, q),
     };
 }
 
@@ -70,11 +73,16 @@ pub fn qOf(scale: Scale, step: f64) f64 {
     return switch (scale) {
         .h26x => 4.0 + 6.0 * std.math.log2(s),
         .av1 => @log(s / 4.0) / @log(1.0243),
+        .vp8 => @log(s / 4.0) / @log(1.0293),
     };
 }
 
 pub fn qMax(scale: Scale) i32 {
-    return if (scale == .av1) 255 else 51;
+    return switch (scale) {
+        .h26x => 51,
+        .av1 => 255,
+        .vp8 => 127,
+    };
 }
 
 /// What the next picture is planned as.
@@ -182,6 +190,7 @@ pub const Controller = struct {
         const bpp = avg / px;
         var q0: f64 = if (c.initial_qp != 0) @floatFromInt(c.initial_qp) else if (bpp < 0.03) 40 else if (bpp < 0.06) 35 else if (bpp < 0.12) 31 else if (bpp < 0.25) 27 else 23;
         if (c.scale == .av1 and c.initial_qp == 0) q0 = q0 * 255.0 / 51.0;
+        if (c.scale == .vp8 and c.initial_qp == 0) q0 = q0 * 127.0 / 51.0;
         c.base_step = qstep(c.scale, q0);
         // size models: a P picture of `avg` bits at that scale, an I
         // picture four of them, a B picture half
@@ -264,7 +273,11 @@ pub const Controller = struct {
         const per_unit = c.expect(t, 1.0);
         var q: i32 = @intFromFloat(@round(qOf(c.scale, per_unit / @max(target, 1.0))));
         const ti = @intFromEnum(t);
-        const step_limit: i32 = if (c.scale == .av1) MAX_QP_STEP * 5 else MAX_QP_STEP;
+        const step_limit: i32 = switch (c.scale) {
+            .h26x => MAX_QP_STEP,
+            .av1 => MAX_QP_STEP * 5,
+            .vp8 => MAX_QP_STEP * 3,
+        };
         if (c.last_qp[ti] >= 0) {
             const lo = c.last_qp[ti] - step_limit;
             // (the buffer near empty: climb as far as it takes)
