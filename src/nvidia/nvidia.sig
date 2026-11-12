@@ -16,16 +16,28 @@ pub const sm120_asm = @import("sm120_asm.sig");
 pub const sm120_sched = @import("sm120_sched.sig");
 pub const sm120_latency = @import("sm120_latency.sig");
 pub const qmd = @import("qmd.sig");
+/// A graphics program's header (the 3D engine's vertex and pixel stages).
+pub const sph = @import("sph.sig");
 pub const push = @import("push.sig");
 pub const sm120_emu = @import("sm120_emu.sig");
 pub const device = @import("device.sig");
+/// The emulated RTX's 3D engine (what EmuDevice does with draw.sig's methods).
+pub const emu3d = @import("emu3d.sig");
+/// Rectangles drawn by the RTX's 3D engine (the methods, the programs, a
+/// renderer over any Device).
+pub const draw = @import("draw.sig");
+pub const gl3d = @import("gl3d.sig");
 
 test {
     _ = sm120;
     _ = sm120_asm;
     _ = sm120_sched;
     _ = qmd;
+    _ = sph;
     _ = push;
     _ = sm120_emu;
     _ = device;
+    _ = emu3d;
+    _ = draw;
+    _ = gl3d;
 }

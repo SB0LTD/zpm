@@ -201,6 +201,15 @@ pub const Push = struct {
         p.len += 1 + data.len;
     }
 
+    /// One method whose data (13 bits at most) rides in the header: a
+    /// single dword.
+    pub fn immediate(p: *Push, subch: u32, m: u32, data: u32) void {
+        if (data > 0x1fff) return p.method(subch, m, &.{data});
+        if (!p.room(1)) return;
+        p.buf[p.len] = headerImmd(subch, m, data);
+        p.len += 1;
+    }
+
     /// A 64-bit address to an _A/_B method pair (the upper word first).
     fn address(p: *Push, subch: u32, m: u32, va: u64) void {
         p.method(subch, m, &.{ @truncate(va >> 32), @truncate(va) });

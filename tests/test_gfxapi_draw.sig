@@ -1452,6 +1452,24 @@ test "draw: stencil operations on emulated Adreno and RTX with separate and pack
     }
 }
 
+test "draw: stencil operations through the emulated RTX's 3D engine (packed depth-stencil, block linear), separate ones on the compute kernels" {
+    for ([_]bool{ false, true }) |separate| {
+        Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+        Rtx.dev.withEngine(&Rtx3d.engine3d);
+        eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+        defer eng_rtx.deinit();
+        stencilScene(&eng_rtx, separate) catch |e| {
+            std.debug.print("stencil scene (separate {}): {s}; the 3D engine: {s}\n", .{ separate, @errorName(e), Rtx3d.engine3d.why });
+            return e;
+        };
+        try std.testing.expect(eng_rtx.why_pipe == null);
+        try std.testing.expect(!eng_rtx.lost);
+        std.debug.print("stencil scene (separate {}): {d} draws through the 3D engine, {d} on the compute kernels\n", .{ separate, eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws });
+        for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("stencil scene: on the compute kernels: {s}\n", .{w});
+        if (!separate) try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
+    }
+}
+
 test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CPU's bytes" {
     const want = try cpuOut();
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
@@ -1499,6 +1517,181 @@ test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CP
     try uniformBlocks(&eng_rtx);
     try feedbackAndQueries(&eng_rtx);
     eng_rtx.deinit();
+}
+
+// ── The emulated RTX's 3D engine (Config.graphics) ─────────────────────────
+
+/// Pixels of two outputs more than `tol` apart in a channel: how many, the
+/// first, the largest difference.
+fn apart(want: []const u8, got: []const u8, width: usize, tol: u8, what: []const u8) u32 {
+    var n: u32 = 0;
+    var most: u8 = 0;
+    var i: usize = 0;
+    while (i < want.len) : (i += 4) {
+        var worst: u8 = 0;
+        for (0..4) |c| worst = @max(worst, if (want[i + c] > got[i + c]) want[i + c] - got[i + c] else got[i + c] - want[i + c]);
+        most = @max(most, worst);
+        if (worst <= tol) continue;
+        if (n < 4) std.debug.print("{s}: pixel ({d}, {d}): the CPU {any}, the 3D engine {any}\n", .{ what, (i / 4) % width, (i / 4) / width, want[i..][0..4], got[i..][0..4] });
+        n += 1;
+    }
+    std.debug.print("{s}: {d} pixels more than {d} apart (the most {d})\n", .{ what, n, tol, most });
+    return n;
+}
+
+const Rtx3d = struct {
+    var engine3d: @import("nvidia").emu3d.Engine = .{};
+};
+var out_rtx3d: Out = .{};
+
+test "draw: the scene through the emulated RTX's 3D engine where it draws, the compute kernels the rest: the CPU's picture" {
+    const want = try cpuOut();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    try std.testing.expect(eng_rtx.onGpu() and eng_rtx.graphics);
+    scene(&eng_rtx, &out_rtx3d) catch |e| {
+        std.debug.print("rtx 3D scene: {s}; the engine lost the GPU {} ({?s}), its pipeline error {?s}; the 3D engine: {s}\n", .{ @errorName(e), eng_rtx.lost, if (eng_rtx.why) |w| @errorName(w) else null, if (eng_rtx.why_pipe) |w| @errorName(w) else null, Rtx3d.engine3d.why });
+        return e;
+    };
+    if (Rtx.dev.lastError()) |e| {
+        var buf: [512]u8 = undefined;
+        std.debug.print("sm120_emu: {s}: {s}; the 3D engine: {s}\n", .{ @errorName(e), Rtx.dev.explain(&buf), Rtx3d.engine3d.why });
+    }
+    std.debug.print("3D engine: draws {d} through it, {d} on the compute kernels; the emulated engine drew {d}, {d} pixels\n", .{ eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws, Rtx3d.engine3d.draws, Rtx3d.engine3d.pixels });
+    for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("3D engine: a draw on the compute kernels: {s}\n", .{w});
+    if (eng_rtx.why_pipe) |w| std.debug.print("3D engine: a pipeline refused: {s}\n", .{@errorName(w)});
+    try std.testing.expect(eng_rtx.why_pipe == null);
+    try std.testing.expect(!eng_rtx.lost);
+    try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
+    try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
+    // (the hardware's blending and interpolation are not KIR's exact
+    // arithmetic: within a step or two of 255)
+    try std.testing.expectEqual(@as(u32, 0), apart(&want.fbo, &out_rtx3d.fbo, W, 2, "fbo"));
+    try std.testing.expectEqual(@as(u32, 0), apart(&want.win, &out_rtx3d.win, WW, 2, "window"));
+    eng_rtx.deinit();
+}
+
+/// Two triangles sharing an edge (their corners' depths apart: a sloped
+/// plane each), added (ONE, ONE) into a cleared target twice: first each
+/// on the 3D engine or on the compute kernels as `on3d` says, the depth
+/// tested LESS and written; then each on the other rasterizer, the depth
+/// tested EQUAL. A pixel of the pair is hit by both passes (128) when
+/// the two rasterizers cover it alike and give it the same depth bits;
+/// once (64), or twice in a pass, is a crack, a double hit or z-fighting.
+fn sharedEdge(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, pts: [4][2]f32, on3d: [2]bool, out: []u8) !void {
+    e.fill(img, img.bounds(), 0, 0);
+    e.fill(depth, depth.bounds(), 0x00ff_ffff, 0xff00_0000);
+    var verts: [6][4]f32 = undefined;
+    const tris = [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
+    const zs = [4]f32{ -0.3, 0.2117, 0.7, 0.0931 };
+    for (tris, 0..) |t, n| {
+        for (t, 0..) |c, j| verts[n * 3 + j] = .{ nx(pts[c][0], W), nx(pts[c][1], H), zs[c], 1 };
+    }
+    e.writeBytes(ab, 0, std.mem.sliceAsBytes(&verts));
+    const quarter = [_]u32{ @bitCast(@as(f32, 0.25)), 0, 0, 0 };
+    const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+    for (0..2) |pass| {
+        for (0..2) |n| {
+            const hw = on3d[n] == (pass == 0);
+            e.compute_only = !hw;
+            const before = e.stats.graphics_draws;
+            var d = raster.Draw{ .pipe = &solid, .color = img, .depth = depth, .depth_test = true, .depth_write = pass == 0, .depth_func = if (pass == 0) 0b001 else 0b010, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 3, .first = @intCast(n * 3), .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .uniforms = &quarter, .blend = add };
+            d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+            if (!e.draw(&d)) return error.NotDrawn;
+            e.finish();
+            if (e.lost or e.why_pipe != null) return error.EngineLost;
+            if (e.stats.graphics_draws - before != @intFromBool(hw)) {
+                for (e.said_compute) |w| if (w.len != 0) std.debug.print("shared edge: on the compute kernels: {s}\n", .{w});
+                return error.WrongRasterizer;
+            }
+        }
+    }
+    e.compute_only = false;
+    e.read(img, 0, 0, W, H, out, W * 4, .rgba8);
+}
+
+/// A pixel's red as hits: 0, 1 (64), 2 (128), else 3.
+fn hits(red: u8) u8 {
+    if (red == 0) return 0;
+    if (red >= 62 and red <= 66) return 1;
+    if (red >= 126 and red <= 130) return 2;
+    return 3;
+}
+
+test "draw: two triangles sharing an edge, one on the RTX's 3D engine and one on the compute kernels: no gap, no pixel twice, the same depth" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    const e = &eng_rtx;
+    var img = e.newImage(W, H, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&img);
+    var depth = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer e.freeImage(&depth);
+    try std.testing.expect(depth.layout.block);
+    var ab = e.newBuffer(6 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    // (a 45-degree edge through pixel centers: the tie rule decides each;
+    // corners off any grid coarser than 1/256: the snapping decides)
+    const shapes = [_][4][2]f32{
+        .{ .{ 8, 4 }, .{ 32, 4 }, .{ 32, 28 }, .{ 8, 28 } },
+        .{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } },
+        .{ .{ 40.5, 2.25 }, .{ 61.0078125, 30.0039 }, .{ 12.25, 30.5 }, .{ 3.1, 1.9 } },
+    };
+    const combos = [_][2]bool{ .{ true, true }, .{ false, false }, .{ true, false }, .{ false, true } };
+    var pics: [combos.len][W * H * 4]u8 = undefined;
+    for ([_]bool{ false, true }) |top_down| {
+        img.top_down = top_down;
+        depth.top_down = top_down;
+        for (shapes, 0..) |s, si| {
+            for (combos, 0..) |c, ci| sharedEdge(e, &img, &depth, &ab, s, c, &pics[ci]) catch |err| {
+                std.debug.print("shared edge: shape {d} ({any}, top down {}): {s}; the 3D engine: {s}\n", .{ si, c, top_down, @errorName(err), Rtx3d.engine3d.why });
+                return err;
+            };
+            var count: [4]u32 = @splat(0);
+            for (0..W * H) |p| count[hits(pics[0][p * 4])] += 1;
+            var differ: [combos.len]u32 = @splat(0);
+            for (1..combos.len) |ci| {
+                for (0..W * H) |p| differ[ci] += @intFromBool(hits(pics[0][p * 4]) != hits(pics[ci][p * 4]));
+            }
+            std.debug.print("shared edge: shape {d} (top down {}): {d} pixels hit by both passes, {d} by one, {d} otherwise; pixels apart from both-first-on-3D: both first on compute {d}, split {d} and {d}\n", .{ si, top_down, count[2], count[1], count[3], differ[1], differ[2], differ[3] });
+            try std.testing.expectEqual(@as(u32, 0), count[1]);
+            try std.testing.expectEqual(@as(u32, 0), count[3]);
+            try std.testing.expect(count[2] > 0);
+            if (si == 0) try std.testing.expectEqual(@as(u32, 24 * 24), count[2]);
+            for (1..combos.len) |ci| try std.testing.expectEqual(@as(u32, 0), differ[ci]);
+        }
+    }
+}
+
+const HwTest = struct {
+    var over: gpu.nvidia_draw.Over = undefined;
+    var kst: gpu.nvidia_device.kir_sm120.State = .{};
+    var mem: [64 * 1024]u8 = undefined;
+    var model: gpu.draw.Reference = .{ .mem = &mem };
+    var ticks: u64 = 0;
+    fn clock() u64 {
+        ticks += 7;
+        return ticks;
+    }
+    fn say(line: []const u8) void {
+        if (std.mem.indexOf(u8, line, "edges") != null or std.mem.indexOf(u8, line, "FAILED") != null) std.debug.print("[nv] {s}\n", .{line});
+    }
+};
+
+test "draw: the drawtest boot's hardware test on the emulated RTX, step 4 (edges) too: the 3D engine's edges and depth are the compute path's, exactly" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    const gd = Rtx.dev.device();
+    const res = gpu.nvidia_draw.hardwareTest(Rtx.dev.raw.device(), gd, &HwTest.over, &HwTest.kst, &HwTest.model, &HwTest.say, &HwTest.clock);
+    try std.testing.expect(res.started and res.object and res.state and !res.lost);
+    try std.testing.expectEqual(@as(u32, 0), res.failed);
+    try std.testing.expect(!res.edge_skipped);
+    try std.testing.expectEqual(@as(u32, 2 * gpu.nvidia_draw.EDGE_SCENES), res.edge_scenes);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_cover_apart);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_depth_apart);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_equal_apart);
 }
 
 // ── GALAXY_GL_CHECK: the GPU's work against the CPU's ──────────────────────

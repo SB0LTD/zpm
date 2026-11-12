@@ -4460,6 +4460,8 @@ pub const Context = struct {
                 .saturate = c.blend_src_rgb == g.SRC_ALPHA_SATURATE,
                 .eq_rgb = equationOf(c.blend_eq_rgb).?,
                 .eq_a = equationOf(c.blend_eq_a).?,
+                .gl = .{ c.blend_src_rgb, c.blend_dst_rgb, c.blend_src_a, c.blend_dst_a },
+                .constant = bc,
             };
         }
         d.keep = colorKeep(color.format, c.color_mask);

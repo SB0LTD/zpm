@@ -262,3 +262,53 @@ test "derivatives: on the emulated Adreno (ir3), the CPU's bytes" {
     try check(&out_a);
     try std.testing.expectEqualSlices(u8, &want.fbo, &out_a.fbo);
 }
+
+// ── The emulated RTX's 3D engine: quads of pixels, helpers among them ───────
+
+const Nv3 = struct {
+    const nvidia = @import("nvidia");
+    var arena: [32 << 20]u8 align(4096) = undefined;
+    var view: [32 << 20]u8 align(4096) = undefined;
+    var emu_work: nvidia.sm120_emu.Work = undefined;
+    var dev: gpu.nvidia_device.Emu = undefined;
+    var engine3d: nvidia.emu3d.Engine = .{};
+    var work: [gpu.nvidia_device.kir_sm120.WORK_BYTES]u8 align(64) = undefined;
+    var slabs: [16]engine.Slab = undefined;
+    var eng: engine.Engine = undefined;
+    var out: Out = .{};
+};
+
+test "derivatives: through the emulated RTX's 3D engine (pixel warps of quads), the CPU's picture where GL defines it" {
+    const want = try cpuOut();
+    Nv3.dev.init(&Nv3.arena, &Nv3.view, &Nv3.emu_work);
+    Nv3.dev.withEngine(&Nv3.engine3d);
+    Nv3.eng.init(.{ .dev = Nv3.dev.device(), .work = &Nv3.work, .cpu_work = &cpu_work, .slabs = &Nv3.slabs, .graphics = true });
+    try std.testing.expect(Nv3.eng.graphics);
+    try scene(&Nv3.eng, &Nv3.out);
+    if (Nv3.dev.lastError()) |e| {
+        var buf: [512]u8 = undefined;
+        std.debug.print("sm120_emu: {s}: {s}; the 3D engine: {s}\n", .{ @errorName(e), Nv3.dev.explain(&buf), Nv3.engine3d.why });
+    }
+    try std.testing.expect(Nv3.eng.why_pipe == null and !Nv3.eng.lost);
+    try std.testing.expectEqual(@as(u64, 4), Nv3.eng.stats.graphics_draws);
+    Nv3.eng.deinit();
+    // (GL's undefined, not compared: mode 2's derivative under divergent
+    // flow, and mode 3's after a discard (the hardware's discarded pixels
+    // run on as helpers and the derivative is taken, the tile kernel
+    // gives 0): there only the discarded rows, the clear colour)
+    var bad: u32 = 0;
+    for (0..H) |y| for (0..W) |x| {
+        if (x < 16 and y >= 16) continue;
+        if (x >= 16 and y >= 19) continue;
+        const a = px(&want.fbo, x, y);
+        const b = px(&Nv3.out.fbo, x, y);
+        for (0..4) |c| {
+            const d = @as(i32, a[c]) - @as(i32, b[c]);
+            if (@abs(d) > 2) {
+                if (bad < 4) std.debug.print("pixel ({d}, {d}): the CPU {any}, the 3D engine {any}\n", .{ x, y, a, b });
+                bad += 1;
+            }
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 0), bad);
+}

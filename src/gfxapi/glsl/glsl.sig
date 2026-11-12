@@ -80,7 +80,7 @@ pub const Scratch = struct {
     /// fit (`out` says why in its overflow).
     pub fn interface(s: *Scratch, out: *Iface) bool {
         const c = &s.checker;
-        out.* = .{ .stage = s.stage, .version = s.pre.version, .has_main = c.has_main, .frag_color = c.uses_frag_color, .frag_data = c.uses_frag_data, .point_size = c.uses_point_size, .point_coord = c.uses_point_coord, .frag_depth = c.uses_frag_depth };
+        out.* = .{ .stage = s.stage, .version = s.pre.version, .has_main = c.has_main, .frag_color = c.uses_frag_color, .frag_data = c.uses_frag_data, .point_size = c.uses_point_size, .point_coord = c.uses_point_coord, .frag_depth = c.uses_frag_depth, .front_facing = c.uses_front_facing };
         for (c.inputs[0..c.ninputs]) |v| out.add(v, .input, c.syms[v.sym].used, c);
         for (c.outputs[0..c.noutputs]) |v| out.add(v, .output, c.syms[v.sym].used, c);
         for (c.uniforms[0..c.nuniforms]) |v| {
@@ -139,6 +139,8 @@ pub const Iface = struct {
     point_size: bool = false,
     point_coord: bool = false,
     frag_depth: bool = false,
+    /// gl_FrontFacing read
+    front_facing: bool = false,
     vars: [MAX_IVARS]IVar = undefined,
     n: usize = 0,
     blocks: [sema.MAX_BLOCKS]IBlock = undefined,

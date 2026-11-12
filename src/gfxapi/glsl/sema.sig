@@ -677,6 +677,8 @@ pub const Checker = struct {
     uses_point_size: bool = false,
     uses_point_coord: bool = false,
     uses_frag_depth: bool = false,
+    /// gl_FrontFacing read (fragment)
+    uses_front_facing: bool = false,
 
     fn node(c: *Checker, i: u32) *Node {
         return &c.p.nodes[i];
@@ -1413,6 +1415,7 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "gl_PointSize")) c.uses_point_size = true;
         if (std.mem.eql(u8, name, "gl_PointCoord")) c.uses_point_coord = true;
         if (std.mem.eql(u8, name, "gl_FragDepth")) c.uses_frag_depth = true;
+        if (std.mem.eql(u8, name, "gl_FrontFacing")) c.uses_front_facing = true;
     }
 
     fn binaryExpr(c: *Checker, nd: *Node) Type {

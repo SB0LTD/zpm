@@ -55,7 +55,7 @@ pub const FORMAT: u32 = 0x4758_5042;
 pub const MAGIC = "GXPRGBIN".*;
 /// Bump when what a section holds changes shape (the driver build id
 /// changes with the sources anyway).
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2; // (2: the pipeline section also says whether the pixel code reads gl_FrontFacing)
 pub const HEADER_BYTES = 48;
 pub const CHECK_SEED: u64 = 0x6761_6c61_7879_6762; // "galaxygb"
 

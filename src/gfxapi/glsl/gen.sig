@@ -209,6 +209,8 @@ const Gen = struct {
     quads: bool = false,
     odd_x: V = .none,
     odd_y: V = .none,
+    quad_x: u32 = raster.QUAD_X,
+    quad_y: u32 = raster.QUAD_Y,
     nderivs: u32 = 0,
     /// a derivative was generated
     derivatives: bool = false,
@@ -1843,7 +1845,7 @@ const Gen = struct {
         }
         const k = g.k;
         const xv = asF32(g, x);
-        const o = k.shfl(.f32, .xor, r(xv), u(if (up) raster.QUAD_Y else raster.QUAD_X));
+        const o = k.shfl(.f32, .xor, r(xv), u(if (up) g.quad_y else g.quad_x));
         g.st.derivs[g.nderivs] = @intCast(k.n - 1);
         g.nderivs += 1;
         const odd = if (up) g.odd_y else g.odd_x;
@@ -2589,6 +2591,8 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     g.quads = io.quads and io.odd_x != .none and io.odd_y != .none;
     g.odd_x = io.odd_x;
     g.odd_y = io.odd_y;
+    g.quad_x = io.quad_x;
+    g.quad_y = io.quad_y;
     const v4 = sema.vecT(.float, 4);
     g.declare(.{ .name = "gl_FragCoord", .ty = v4, .at = g.imms(v4, &.{ r(io.frag_coord[0]), r(io.frag_coord[1]), r(io.frag_coord[2]), r(io.frag_coord[3]) }).at, .ro = true });
     g.declare(.{ .name = "gl_FrontFacing", .ty = BOOL, .at = g.imms(BOOL, &.{if (io.front_facing == .none) u(1) else r(io.front_facing)}).at, .ro = true });
