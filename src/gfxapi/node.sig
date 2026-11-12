@@ -17,7 +17,10 @@
 //!   answers an import of this context's own buffer, or of one imported
 //!   before, with the same handle: such an entry is counted, not doubled.
 //! - **Fence files** (G_FENCE_FD): a sync_file of the last submission, for
-//!   EGL_ANDROID_native_fence_sync.
+//!   EGL_ANDROID_native_fence_sync. The Adreno's kernel always makes them;
+//!   the RTX's (nv_drm) since Galaxy's sync_files of a channel's fences:
+//!   open asks for one of fence 0 (signalled) to know (`native_fences`),
+//!   and an older PC kernel's EINVAL leaves them off.
 //!
 //! The open file is the program's own GPU context (its own page table).
 //! G_INFO's chip says which GPU answered; each GPU's raw Device is a view
@@ -149,6 +152,9 @@ pub fn Node(comptime Sys: type) type {
         /// Which GPU answered (open: G_INFO's chip).
         kind: Kind = .adreno,
         dma_import: bool = false,
+        /// The kernel makes sync_files of this context's fences (G_FENCE_FD):
+        /// the Adreno's always, the RTX's when open's probe got one.
+        native_fences: bool = false,
         /// What the kernel's buffers come in: 4 KiB pages on the Adreno,
         /// 2 MiB on the RTX.
         unit: usize = PAGE,
@@ -198,6 +204,7 @@ pub fn Node(comptime Sys: type) type {
             g.kind = kind.?;
             var probe = [_]u8{0} ** 32;
             g.dma_import = g.kind == .adreno or g.call(G_BUFFER_INFO, &probe) == 0;
+            g.native_fences = g.kind == .adreno or g.probeFenceFd();
             g.unit = if (g.kind == .nvidia) NV_UNIT else PAGE;
             g.line = g.sys.cacheLine();
             return i;
@@ -470,8 +477,18 @@ pub fn Node(comptime Sys: type) type {
             return null;
         }
 
+        /// Whether the kernel makes a sync_file of fence 0 (one signalled
+        /// already): the file closed again at once.
+        fn probeFenceFd(g: *Self) bool {
+            var a = [_]u8{0} ** 8;
+            if (g.call(G_FENCE_FD, &a) != 0) return false;
+            g.sys.close(@bitCast(rd32(&a, 4)));
+            return true;
+        }
+
         /// A sync_file of the last submission (of any of this process's
-        /// GPU work: one in-order ring), or -errno.
+        /// GPU work: one in-order ring on the Adreno; on the RTX, this
+        /// context's own channel, which runs all of it), or -errno.
         pub fn fenceFd(g: *Self) i64 {
             var a = [_]u8{0} ** 8;
             wr32(&a, 0, g.last_seq);
@@ -835,6 +852,10 @@ pub const Fake = struct {
     exports: u32 = 0,
     prime_imports: u32 = 0,
     fence_fds: u32 = 0,
+    /// G_FENCE_FD answered (false: an older PC kernel's EINVAL).
+    fence_files: bool = true,
+    /// Descriptors closed.
+    closes: u32 = 0,
     reserved: usize = 0,
     import_va: u64 = 0x80_0000_0000,
 
@@ -845,7 +866,9 @@ pub const Fake = struct {
     pub fn open(k: *Fake, _: [*:0]const u8) i64 {
         return if (k.present) 3 else -2;
     }
-    pub fn close(_: *Fake, _: i32) void {}
+    pub fn close(k: *Fake, _: i32) void {
+        k.closes += 1;
+    }
 
     pub fn ioctl(k: *Fake, _: i32, req: u32, a: []u8) i64 {
         if (k.hung and req != G_INFO and req != G_FREE) return -EIO;
@@ -910,6 +933,7 @@ pub const Fake = struct {
                 k.emu.device().wait(rd32(a, 0), 0) catch return -EINVAL;
             },
             G_FENCE_FD => {
+                if (!k.fence_files) return -EINVAL;
                 k.fence_fds += 1;
                 wr32(a, 4, 300 + rd32(a, 0));
             },
@@ -1021,6 +1045,33 @@ test "node: RTX PRIME import maps a shared buffer and counts repeated imports" {
     try std.testing.expectEqual(@as(u32, 1), k.live);
     g.freeIn(second.handle);
     try std.testing.expectEqual(@as(u32, 0), k.live);
+}
+
+test "node: native fences: the Adreno's always; the RTX's when the kernel makes a sync_file of fence 0" {
+    var k: Fake = undefined;
+    var g = testNode(&k);
+    _ = try g.open();
+    try std.testing.expect(g.native_fences);
+    try std.testing.expectEqual(@as(u32, 0), k.fence_fds); // (the Adreno's: no probe)
+    g.close();
+    g = testNode(&k);
+    k.chip = CHIP_GB206;
+    _ = try g.open();
+    try std.testing.expect(g.native_fences);
+    try std.testing.expectEqual(@as(u32, 1), k.fence_fds);
+    try std.testing.expectEqual(@as(u32, 1), k.closes); // (the probe's file)
+    try std.testing.expect(!g.lost);
+    try std.testing.expectEqual(@as(i64, 300), g.fenceFd());
+    g.close();
+    // an older PC kernel: G_FENCE_FD's EINVAL leaves them off, the GPU up
+    g = testNode(&k);
+    k.chip = CHIP_GB206;
+    k.fence_files = false;
+    _ = try g.open();
+    try std.testing.expect(!g.native_fences);
+    try std.testing.expect(!g.lost);
+    try std.testing.expectEqual(@as(i64, -EINVAL), g.fenceFd());
+    g.close();
 }
 
 test "node: buffers, an import, an export, a hang, no GPU" {
