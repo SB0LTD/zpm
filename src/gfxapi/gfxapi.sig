@@ -47,6 +47,7 @@ pub const dl = @import("dl.sig");
 pub const host = @import("host.sig");
 pub const raster = @import("raster.sig");
 pub const program = @import("program.sig");
+pub const progbin = @import("progbin.sig");
 pub const texture = @import("texture.sig");
 pub const blocklinear = @import("blocklinear.sig");
 pub const texfmt = @import("texfmt.sig");
@@ -62,6 +63,7 @@ test {
     _ = thread;
     _ = dl;
     _ = program;
+    _ = progbin;
     _ = texture;
     _ = blocklinear;
     _ = texfmt;

@@ -59,6 +59,11 @@ pub const MAX_ATTRS = raster.MAX_ATTRS;
 pub const VENDOR_STRING: [:0]const u8 = "Galaxy";
 pub const VERSION_STRING: [:0]const u8 = "OpenGL ES 3.0 Galaxy 0.1";
 pub const GLSL_STRING: [:0]const u8 = "OpenGL ES GLSL ES 3.00";
+/// GL_RENDERER, on a GPU (the RTX, the Adreno) and on the CPU: each ends
+/// with the driver build's tag (progbin.BUILD_TAG), so WebRender's shader
+/// cache, which names programs by GL_RENDERER, starts anew with each build.
+pub const RENDERER_GPU: [:0]const u8 = "Galaxy (GPU) " ++ program.progbin.BUILD_TAG;
+pub const RENDERER_CPU: [:0]const u8 = "Galaxy (CPU) " ++ program.progbin.BUILD_TAG;
 /// What GL_EXTENSIONS names: what the driver has (WebRender asks for
 /// BGRA and external textures in ESSL 3.00; GLSL ES 1.00 programs for
 /// derivatives and texture LOD; ES 2 apps for sized renderbuffers and
@@ -83,6 +88,8 @@ pub const EXTENSIONS = [_][:0]const u8{
     "GL_OES_texture_border_clamp",
     "GL_EXT_texture_border_clamp",
     "GL_OES_vertex_array_object",
+    // (program binaries, ES 3.0's core too: WebRender's shader disk cache)
+    "GL_OES_get_program_binary",
     "GL_EXT_map_buffer_range",
     // (a lost GPU: glGetGraphicsResetStatus, the reset strategy, and
     // CONTEXT_LOST once; the n-forms of ReadPixels and GetUniform)
@@ -1280,7 +1287,7 @@ pub const Context = struct {
     pub fn getString(c: *Context, name: u32) ?[*:0]const u8 {
         return switch (name) {
             g.VENDOR => VENDOR_STRING.ptr,
-            g.RENDERER => if (c.eng.onGpu()) "Galaxy (GPU)" else "Galaxy (CPU)",
+            g.RENDERER => if (c.eng.onGpu()) RENDERER_GPU.ptr else RENDERER_CPU.ptr,
             g.VERSION => VERSION_STRING.ptr,
             g.SHADING_LANGUAGE_VERSION => GLSL_STRING.ptr,
             g.EXTENSIONS => EXTENSIONS_STRING.ptr,
@@ -1588,7 +1595,10 @@ pub const Context = struct {
             g.MAX_VERTEX_ATTRIBS => int(MAX_ATTRS),
             g.CURRENT_PROGRAM => int(c.program),
             g.SHADER_COMPILER => boolean(true),
-            g.NUM_SHADER_BINARY_FORMATS, g.NUM_PROGRAM_BINARY_FORMATS => int(0),
+            g.NUM_SHADER_BINARY_FORMATS => int(0),
+            // (program binaries: one format, the driver's own, program.sig)
+            g.NUM_PROGRAM_BINARY_FORMATS => int(1),
+            g.PROGRAM_BINARY_FORMATS => int(program.progbin.FORMAT),
             g.MAX_VERTEX_UNIFORM_VECTORS => int(program.MAX_VERTEX_UNIFORM_VECTORS),
             g.MAX_FRAGMENT_UNIFORM_VECTORS => int(program.MAX_FRAGMENT_UNIFORM_VECTORS),
             g.MAX_VERTEX_UNIFORM_COMPONENTS => int(program.MAX_VERTEX_UNIFORM_VECTORS * 4),
