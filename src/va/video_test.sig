@@ -20,6 +20,7 @@ const D = driver.Driver(*Fake);
 const HIGH = @embedFile("testdata/h264_high.h264");
 const VP9 = @embedFile("testdata/vp9_96x64.ivf");
 const VP8 = @embedFile("testdata/vp8_96x64.ivf");
+const HEVC = @embedFile("testdata/hevc_128x96.hevc");
 const vp9r = @import("vp9_read.sig");
 const vp8r = @import("vp8_read.sig");
 var vp9_frames: u32 = 0;
@@ -259,4 +260,62 @@ test "video: a VP9 superframe's index splits it" {
     try std.testing.expectEqual(@as(u32, 2), f.sizes[1]);
     const one = vp9r.Frames.of(sf[0..5]);
     try std.testing.expectEqual(@as(u32, 1), one.n);
+}
+
+test "video: x265's open-GOP HEVC stream through the decoder: 30 pictures out, each once" {
+    var k = Fake{ .decoder = fakeDecode };
+    var d: D = .{ .node = .{ .sys = &k } };
+    try std.testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    try std.testing.expectEqual(video.Status.ok, dec.init(&d, .hevc));
+    defer dec.deinit();
+    var starts: [64]usize = undefined;
+    var n: usize = 0;
+    var pending: ?usize = null;
+    var i: usize = 0;
+    while (i + 5 < HEVC.len) : (i += 1) {
+        if (!(HEVC[i] == 0 and HEVC[i + 1] == 0 and HEVC[i + 2] == 1)) continue;
+        const at_ = if (i > 0 and HEVC[i - 1] == 0) i - 1 else i;
+        const t = (HEVC[i + 3] >> 1) & 0x3f;
+        if (t <= 21 and (t <= 9 or t >= 16)) {
+            if (HEVC[i + 5] & 0x80 != 0) {
+                starts[n] = pending orelse at_;
+                n += 1;
+            }
+            pending = null;
+        } else if (pending == null) pending = at_;
+        i += 2;
+    }
+    var buf: [128 * 96 * 3 / 2]u8 = undefined;
+    var shown: u32 = 0;
+    var seen = [_]bool{false} ** 30;
+    var kk: usize = 0;
+    while (kk < n) {
+        const au = HEVC[starts[kk]..if (kk + 1 < n) starts[kk + 1] else HEVC.len];
+        const st = dec.push(au, @intCast(kk), 1);
+        if (st == .full) {
+            const o = dec.next() orelse return error.FullButEmpty;
+            seen[@intCast(o.pts)] = true;
+            try std.testing.expect(dec.read(&buf, 128, .nv12));
+            shown += 1;
+            continue;
+        }
+        try std.testing.expectEqual(video.Status.ok, st);
+        kk += 1;
+        while (dec.next()) |o| {
+            seen[@intCast(o.pts)] = true;
+            try std.testing.expect(dec.read(&buf, 128, .nv12));
+            shown += 1;
+        }
+    }
+    try std.testing.expectEqual(video.Status.ok, dec.drain());
+    while (dec.next()) |o| {
+        seen[@intCast(o.pts)] = true;
+        try std.testing.expect(dec.read(&buf, 128, .nv12));
+        shown += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 30), shown);
+    for (seen) |s| try std.testing.expect(s);
+    try std.testing.expectEqual(@as(u64, 30), dec.decoded);
+    try std.testing.expectEqual(@as(u64, 0), dec.errors);
 }

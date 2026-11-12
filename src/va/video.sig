@@ -24,6 +24,7 @@ const h264 = @import("h264_parse.sig");
 const vp9r = @import("vp9_read.sig");
 const vav9 = @import("vaapi_vp9.sig");
 const vp8r = @import("vp8_read.sig");
+const hevcp = @import("hevc_parse.sig");
 const vav8 = @import("vaapi_vp8.sig");
 
 pub const Codec = enum(u32) { h264 = 1, hevc = 2, vp8 = 3, vp9 = 4, av1 = 5, _ };
@@ -107,6 +108,9 @@ pub fn Decoder(comptime D: type) type {
         /// and the frame being read
         vp8: vp8r.State = .{},
         vp8_frame: vp8r.Frame = .{},
+        /// HEVC: the reader's state and one picture's VA buffers
+        hs: hevcp.State = .{},
+        hpic: hevcp.Picture = .{},
         /// pictures decoded, failed
         decoded: u64 = 0,
         errors: u64 = 0,
@@ -115,7 +119,7 @@ pub fn Decoder(comptime D: type) type {
         pub fn init(self: *Self, drv: *D, codec: Codec) Status {
             self.* = .{ .drv = drv, .codec = codec };
             return switch (codec) {
-                .h264, .vp8, .vp9 => .ok,
+                .h264, .hevc, .vp8, .vp9 => .ok,
                 else => .unsupported,
             };
         }
@@ -227,6 +231,7 @@ pub fn Decoder(comptime D: type) type {
                 .h264 => self.pushH264(au, pts, duration),
                 .vp9 => self.pushVp9(au, pts, duration),
                 .vp8 => self.pushVp8(au, pts, duration),
+                .hevc => self.pushHevc(au, pts, duration),
                 else => .unsupported,
             };
         }
@@ -495,6 +500,100 @@ pub fn Decoder(comptime D: type) type {
             return st == va.SUCCESS;
         }
 
+        // ── HEVC ─────────────────────────────────────────────────────────
+
+        fn hevcOutput(ctx: *anyopaque, surface: u32, pts: i64, duration: i64) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const v = self.hpic.visible;
+            const i = self.indexOf(surface) orelse return;
+            self.queued[i] = true;
+            const o = Out{ .surface = surface, .pts = pts, .duration = duration, .visible = v, .depth = self.depth };
+            if (self.q_len < QUEUE) {
+                self.queue[(self.q_head + self.q_len) % QUEUE] = o;
+                self.q_len += 1;
+            } else if (self.o_len < MAX_SURFACES) {
+                self.overflow[self.o_len] = o;
+                self.o_len += 1;
+            }
+        }
+
+        fn hcb(self: *Self) hevcp.Callbacks {
+            return .{ .ctx = self, .surface = takeSurface, .output = hevcOutput, .released = released };
+        }
+
+        fn pushHevc(self: *Self, au: []const u8, pts: i64, duration: i64) Status {
+            if (self.o_len > 0) return .full;
+            if (self.count > 0 and self.freeSurfaces() == 0) return .full;
+            // the parameter sets first, so the surfaces fit the picture
+            var it = hevcp.NalIter.init(au);
+            var first: ?hevcp.SliceHeader = null;
+            while (it.next()) |nal| {
+                if (nal.len < 2 or nal[0] & 1 != 0 or nal[1] >> 3 != 0) continue;
+                const t = (nal[0] >> 1) & 0x3f;
+                if (t == hevcp.SPS_NUT) {
+                    var sp: hevcp.Sps = .{};
+                    hevcp.parseSps(nal, &sp) catch continue;
+                    self.hs.sps[sp.id] = sp;
+                } else if (t == hevcp.PPS_NUT) {
+                    var pp: hevcp.Pps = .{};
+                    hevcp.parsePps(nal, &self.hs.sps, &pp) catch continue;
+                    self.hs.pps[pp.id] = pp;
+                } else if (t <= 21 and (t <= 9 or t >= 16)) {
+                    var hd: hevcp.SliceHeader = undefined;
+                    hevcp.parseSlice(nal, &self.hs.sps, &self.hs.pps, &hd) catch |e| return switch (e) {
+                        error.NoParameterSet => .more,
+                        error.Unsupported => .unsupported,
+                        else => .bad,
+                    };
+                    first = hd;
+                    break;
+                }
+            }
+            const hd = first orelse return .more;
+            const sps = &self.hs.sps[self.hs.pps[hd.pps_id].sps_id];
+            if (sps.chroma_format_idc != 1 or sps.bit_depth_luma != sps.bit_depth_chroma) return .unsupported;
+            const depth = sps.bit_depth_luma;
+            if (depth != 8 and depth != 10) return .unsupported;
+            const prof: va.Profile = if (depth == 10) va.PROFILE_HEVC_MAIN10 else va.PROFILE_HEVC_MAIN;
+            const dpb: u32 = sps.max_dec_pic_buffering;
+            const want_n = @min(dpb + 2 + QUEUE / 2, MAX_SURFACES);
+            if (self.count == 0 or sps.width != self.width or sps.height != self.height or depth != self.depth or want_n > self.count) {
+                if (self.count > 0) {
+                    hevcp.drain(&self.hs, self.hcb());
+                    if (self.q_len > 0 or self.o_len > 0) return .full;
+                    hevcp.reset(&self.hs, self.hcb());
+                }
+                const st = self.setup(prof, sps.width, sps.height, depth, dpb);
+                if (st != .ok) return st;
+            }
+            const got = hevcp.take(&self.hs, au, pts, duration, self.hcb(), &self.hpic) catch |e| return switch (e) {
+                error.Unsupported => .unsupported,
+                error.NoParameterSet => .more,
+                else => .bad,
+            };
+            if (!got) return .more;
+            var bufs: [2 + 2 * hevcp.MAX_SLICES]Buf = undefined;
+            var n: usize = 0;
+            bufs[n] = .{ .kind = va.PICTURE_PARAMETER_BUFFER, .size = @sizeOf(va.PictureParameterBufferHEVC), .data = std.mem.asBytes(&self.hpic.pic) };
+            n += 1;
+            bufs[n] = .{ .kind = va.IQ_MATRIX_BUFFER, .size = @sizeOf(va.IQMatrixBufferHEVC), .data = std.mem.asBytes(&self.hpic.iq) };
+            n += 1;
+            for (0..self.hpic.count) |k| {
+                bufs[n] = .{ .kind = va.SLICE_PARAMETER_BUFFER, .size = @sizeOf(va.SliceParameterBufferHEVC), .data = std.mem.asBytes(&self.hpic.slices[k]) };
+                n += 1;
+                bufs[n] = .{ .kind = va.SLICE_DATA_BUFFER, .size = @intCast(self.hpic.data[k].len), .data = self.hpic.data[k] };
+                n += 1;
+            }
+            if (self.decodeBufs(self.hpic.surface, bufs[0..n])) {
+                hevcp.finish(&self.hs, &self.hpic, self.hcb());
+                self.decoded += 1;
+                return .ok;
+            }
+            hevcp.abandon(&self.hs, self.hcb());
+            self.errors += 1;
+            return .failed;
+        }
+
         fn decodeH264(self: *Self) bool {
             const d = self.drv;
             const p = &self.pic;
@@ -527,6 +626,7 @@ pub fn Decoder(comptime D: type) type {
             if (self.o_len > 0) return .full;
             switch (self.codec) {
                 .h264 => h264.drain(&self.h, self.cb()),
+                .hevc => hevcp.drain(&self.hs, self.hcb()),
                 else => {},
             }
             return if (self.o_len > 0) .full else .ok;
@@ -540,6 +640,7 @@ pub fn Decoder(comptime D: type) type {
             self.queued = [_]bool{false} ** MAX_SURFACES;
             switch (self.codec) {
                 .h264 => h264.reset(&self.h, self.cb()),
+                .hevc => hevcp.reset(&self.hs, self.hcb()),
                 .vp9 => {
                     // (decoding restarts at the next key frame)
                     self.vp9_slots = [_]u32{vp9r.INVALID} ** 8;
