@@ -120,6 +120,22 @@ pub fn needsQuads(blob: []const u8) bool {
     return false;
 }
 
+/// Whether a pixel shader writes its depth (oDepth, SV_Depth and the
+/// conservative SV_DepthGreaterEqual/LessEqual): raster.Shaders.frag_depth.
+pub fn writesDepth(blob: []const u8) bool {
+    const c = dxbc.Container.parse(blob) catch return false;
+    const p = c.program() catch return false;
+    if (p.stage != .pixel) return false;
+    var rd = p.reader();
+    while (rd.next() catch return false) |i| {
+        for (i.operands[0..i.n]) |o| switch (o.reg) {
+            .output_depth, .output_depth_greater_equal, .output_depth_less_equal => return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
 /// The varyings a pixel shader interpolates flat (D3D's `constant`
 /// interpolation): bit i for varying word i (raster.Shaders.flat).
 pub fn flatVaryings(blob: []const u8, lay: Layout) u64 {
@@ -268,12 +284,15 @@ pub fn fragment(blob: []const u8, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
         const e = sig.get(i) orelse break;
         // (fxc writes SV_Target's system value as 0: it is known by name)
         const target = e.sys == .target or std.ascii.eqlIgnoreCase(e.name, "SV_Target");
-        if (!target or e.index != 0 or e.register >= MAX_REGS) continue;
+        if (!target or e.index >= raster.MAX_TARGETS or e.register >= MAX_REGS) continue;
+        // (SV_Target0 is the color; SV_Target1..7 the other targets')
         for (0..4) |c| {
             const v = g.outs[e.register][c];
-            io.color[c] = k.mov(.f32, if (v == .none) f(if (c == 3) 1 else 0) else r(v));
+            const x = k.mov(.f32, if (v == .none) f(if (c == 3) 1 else 0) else r(v));
+            if (e.index == 0) io.color[c] = x else io.colors[e.index][c] = x;
         }
     }
+    if (g.depth_out != .none) io.depth = k.mov(.f32, r(g.depth_out));
     for (0..4) |c| {
         if (io.color[c] == .none) io.color[c] = k.mov(.f32, f(if (c == 3) 1 else 0));
     }
@@ -309,6 +328,8 @@ const Gen = struct {
     res_dim: [128]u8,
     res_kind: [128]texture.Kind,
     discard: V,
+    /// oDepth (SV_Depth): the depth the pixel shader writes, none if not
+    depth_out: V,
     quads: bool,
     /// if and loop nesting: derivatives only at 0
     depth: u32,
@@ -333,6 +354,7 @@ const Gen = struct {
             .res_dim = [_]u8{0} ** 128,
             .res_kind = [_]texture.Kind{.float} ** 128,
             .discard = .none,
+            .depth_out = .none,
             .quads = false,
             .depth = 0,
             .failed = false,
@@ -614,6 +636,15 @@ const Gen = struct {
                     g.outs[n][c] = v;
                 }
                 return g.outs[n][c];
+            },
+            .output_depth, .output_depth_greater_equal, .output_depth_less_equal => {
+                if (c != 0) return .none;
+                if (g.depth_out == .none) {
+                    const v = g.k.reg(.u32);
+                    g.k.set(v, .mov, u(0), no, no);
+                    g.depth_out = v;
+                }
+                return g.depth_out;
             },
             else => {
                 _ = g.fail("a destination register {s}", .{@tagName(o.reg)});
@@ -1113,6 +1144,7 @@ pub const Pair = struct {
             .textures = textures,
             .flat = flatVaryings(p.ps, p.ps_lay orelse p.lay),
             .quads = needsQuads(p.ps),
+            .frag_depth = writesDepth(p.ps),
             .vertex = vtx,
             .fragment = frag,
         };
