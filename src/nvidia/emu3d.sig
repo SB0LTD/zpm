@@ -53,6 +53,10 @@ const SLOTS = 16;
 const VERTICES = 96;
 /// A program's instructions, at most.
 const CODE = emu.MAX_INSTRS;
+/// The vertices clipping a triangle against w > 0 makes, at most.
+const CLIPPED = 2;
+/// The plane a triangle is clipped against: w at least this.
+const W_MIN: f64 = 1.0 / 1048576.0; // (2^-20: the same in f32)
 
 const POSITION = sph.ATTR_POSITION / 4;
 const GENERIC = sph.ATTR_GENERIC / 4;
@@ -104,10 +108,17 @@ pub const Engine = struct {
     stats: emu.Stats = .{},
     // A draw's working storage.
     vin: [VERTICES][emu.ATTR_WORDS]u32 = undefined,
-    vout: [VERTICES][emu.ATTR_WORDS]u32 = undefined,
+    /// The run's vertices' outputs, then those clipping makes (CLIPPED a
+    /// triangle at most, made again for each).
+    vout: [VERTICES + CLIPPED][emu.ATTR_WORDS]u32 = undefined,
     vstored: [VERTICES][emu.ATTR_WORDS / 32]u32 = undefined,
+    win: [VERTICES + CLIPPED][2]i64 = undefined,
+    vp: [4]f64 = .{ 0, 0, 0, 0 },
     pin: [emu.MAX_THREADS][emu.ATTR_WORDS]u32 = undefined,
     killed: [emu.MAX_THREADS]bool = undefined,
+    /// A queued pixel the triangle does not cover: run (a quad's helper,
+    /// for its neighbours' derivatives), never written.
+    helper: [emu.MAX_THREADS]bool = undefined,
     at: [emu.MAX_THREADS][2]u32 = undefined,
     queued: u32 = 0,
     /// Each stage's code, read once a draw.
@@ -401,16 +412,8 @@ pub const Engine = struct {
                 var vs = emu.Stage{ .kind = .vertex, .header = &g.vhead, .in = g.vin[0..nv], .out = g.vout[0..nv], .stored = g.vstored[0..nv], .cbufs = vcb };
                 try emu.stageBegin(g.host.work, @intCast(nv));
                 try emu.stageRun(g.host.work, &g.host.mem, &vs, @intCast(nv), &stats);
-                var win: [VERTICES][2]i64 = undefined;
-                for (0..nv) |v| {
-                    const w = g.vfloat(v, POSITION + 3);
-                    try g.need(w > 0, "a vertex at or behind the eye (w not above 0): clipping is not modelled");
-                    // (the rasterizer's grid: 1/256 of a pixel)
-                    win[v] = .{
-                        @as(i64, @intFromFloat(@round((g.vfloat(v, POSITION) / w * sx + ox) * 256))),
-                        @as(i64, @intFromFloat(@round((g.vfloat(v, POSITION + 1) / w * sy + oy) * 256))),
-                    };
-                }
+                g.vp = .{ sx, sy, ox, oy };
+                for (0..nv) |v| g.project(v);
                 // the pixel program from here
                 try g.load(gr.STAGE_PIXEL, g.pcode[0 .. 2 * g.pn]);
                 g.queued = 0;
@@ -424,7 +427,7 @@ pub const Engine = struct {
                         else => .{ q + 1, q + 2, 0 },
                     };
                     const flat = if (last) tri0[2] else tri0[0];
-                    try g.triangle(t, pcb, clip, &win, tri0, flat, &stats);
+                    try g.clipped(t, pcb, clip, tri0, flat, &stats);
                 }
                 try g.shade(t, pcb, &stats);
                 p0 += np;
@@ -433,8 +436,80 @@ pub const Engine = struct {
         g.draws += 1;
     }
 
+    /// Vertex v's window place, on the rasterizer's grid (1/256 of a pixel);
+    /// one at or behind the eye is never projected (clipped first). Clamped
+    /// far out (the guard band's work is the hardware's).
+    fn project(g: *Engine, v: usize) void {
+        // (behind the plane: never drawn, but given a place all the same)
+        const w = @max(g.vfloat(v, POSITION + 3), W_MIN);
+        g.win[v] = .{
+            gridOf((g.vfloat(v, POSITION) / w * g.vp[0] + g.vp[2]) * 256),
+            gridOf((g.vfloat(v, POSITION + 1) / w * g.vp[1] + g.vp[3]) * 256),
+        };
+    }
+
+    /// A window coordinate on the grid, held far out (the edge functions'
+    /// products stay in 64 bits); not a number is 0.
+    fn gridOf(x: f64) i64 {
+        const lim: f64 = 1 << 29;
+        if (x != x) return 0;
+        return @intFromFloat(std.math.clamp(@round(x), -lim, lim));
+    }
+
+    /// A triangle clipped against w >= W_MIN (as the hardware clips
+    /// against the eye's plane), then rasterized: whole, nothing, or as one
+    /// or two triangles over vertices made where its edges cross the plane
+    /// (every output word carried linearly in clip space; the flat ones
+    /// the provoking vertex's).
+    fn clipped(g: *Engine, t: Target, cb: [qmd.CBUFS][]const u8, clip: Clip, tri: [3]usize, flat: usize, stats: *emu.Stats) anyerror!void {
+        var kept: [3]bool = undefined;
+        var n_in: u32 = 0;
+        for (tri, 0..) |v, k| {
+            const w = g.vfloat(v, POSITION + 3);
+            kept[k] = w >= W_MIN;
+            n_in += @intFromBool(kept[k]);
+        }
+        if (n_in == 3) return g.triangle(t, cb, clip, tri, flat, stats);
+        if (n_in == 0) return;
+        // the polygon's vertices in order: kept ones, and one where each
+        // edge crosses the plane
+        var poly: [4]usize = undefined;
+        var n: usize = 0;
+        var made: usize = 0;
+        for (0..3) |k| {
+            const a = tri[k];
+            const b = tri[(k + 1) % 3];
+            if (kept[k]) {
+                poly[n] = a;
+                n += 1;
+            }
+            if (kept[k] != kept[(k + 1) % 3]) {
+                const wa = g.vfloat(a, POSITION + 3);
+                const wb = g.vfloat(b, POSITION + 3);
+                const s = (W_MIN - wa) / (wb - wa);
+                const o = VERTICES + made;
+                for (0..emu.ATTR_WORDS) |word| {
+                    const x = g.vfloat(a, word) + (g.vfloat(b, word) - g.vfloat(a, word)) * s;
+                    g.vout[o][word] = @bitCast(@as(f32, @floatCast(x)));
+                }
+                // (flat words: the provoking vertex's bits)
+                for (GENERIC..GENERIC_END) |word| {
+                    if (sph.interpOf(&g.phead, @intCast((word - GENERIC) / 4), @intCast((word - GENERIC) % 4)) == .constant) g.vout[o][word] = g.vout[flat][word];
+                }
+                g.vout[o][POSITION + 3] = @bitCast(@as(f32, @floatCast(W_MIN)));
+                g.project(o);
+                poly[n] = o;
+                n += 1;
+                made += 1;
+            }
+        }
+        var k: usize = 1;
+        while (k + 1 < n) : (k += 1) try g.triangle(t, cb, clip, .{ poly[0], poly[k], poly[k + 1] }, flat, stats);
+    }
+
     /// One triangle's covered pixels queued (and shaded as the queue fills).
-    fn triangle(g: *Engine, t: Target, cb: [qmd.CBUFS][]const u8, clip: Clip, win: *const [VERTICES][2]i64, tri0: [3]usize, flat: usize, stats: *emu.Stats) anyerror!void {
+    fn triangle(g: *Engine, t: Target, cb: [qmd.CBUFS][]const u8, clip: Clip, tri0: [3]usize, flat: usize, stats: *emu.Stats) anyerror!void {
+        const win = &g.win;
         var tri = tri0;
         var area = edge(win[tri[0]], win[tri[1]], win[tri[2]]);
         if (area == 0) return;
@@ -449,27 +524,53 @@ pub const Engine = struct {
         const x1 = @min(clip.x1, @divFloor(@max(a[0], b[0], c[0]), 256) + 1);
         const y0 = @max(clip.y0, @divFloor(@min(a[1], b[1], c[1]), 256));
         const y1 = @min(clip.y1, @divFloor(@max(a[1], b[1], c[1]), 256) + 1);
-        var py = y0;
-        while (py < y1) : (py += 1) {
-            var px = x0;
-            while (px < x1) : (px += 1) {
-                const p = [2]i64{ px * 256 + 128, py * 256 + 128 };
-                // (each edge's function at the centre: the weight of
-                // the vertex across from it)
-                const e = [3]i64{ edge(b, c, p), edge(c, a, p), edge(a, b, p) };
-                if (!inside(e[0], b, c) or !inside(e[1], c, a) or !inside(e[2], a, b)) continue;
-                const fa: f64 = @floatFromInt(area);
-                const bary = [3]f64{ @as(f64, @floatFromInt(e[0])) / fa, @as(f64, @floatFromInt(e[1])) / fa, @as(f64, @floatFromInt(e[2])) / fa };
-                if (!g.carry(tri, flat, bary, @intCast(px), @intCast(py))) continue;
+        // The pixels go by 2 x 2 quads, as the hardware's pixel warps take
+        // them: a quad with any pixel covered runs all four (lanes 4q ..
+        // 4q + 3: x across in bit 0, y down in bit 1), the others helpers.
+        const fa: f64 = @floatFromInt(area);
+        var qy = y0 & ~@as(i64, 1);
+        while (qy < y1) : (qy += 2) {
+            var qx = x0 & ~@as(i64, 1);
+            while (qx < x1) : (qx += 2) {
+                var cov: [4]bool = undefined;
+                var bary: [4][3]f64 = undefined;
+                var any = false;
+                for (0..4) |l| {
+                    const px = qx + @as(i64, @intCast(l & 1));
+                    const py = qy + @as(i64, @intCast(l >> 1));
+                    const p = [2]i64{ px * 256 + 128, py * 256 + 128 };
+                    // (each edge's function at the centre: the weight of
+                    // the vertex across from it)
+                    const e = [3]i64{ edge(b, c, p), edge(c, a, p), edge(a, b, p) };
+                    bary[l] = .{ @as(f64, @floatFromInt(e[0])) / fa, @as(f64, @floatFromInt(e[1])) / fa, @as(f64, @floatFromInt(e[2])) / fa };
+                    cov[l] = px >= x0 and px < x1 and py >= y0 and py < y1 and inside(e[0], b, c) and inside(e[1], c, a) and inside(e[2], a, b) and g.depthIn(tri, bary[l]);
+                    any = any or cov[l];
+                }
+                if (!any) continue;
+                for (0..4) |l| {
+                    const px = qx + @as(i64, @intCast(l & 1));
+                    const py = qy + @as(i64, @intCast(l >> 1));
+                    // (a helper outside the target is never written: its
+                    // place is kept in range)
+                    g.carry(tri, flat, bary[l], @intCast(@max(px, 0)), @intCast(@max(py, 0)), !cov[l]);
+                }
                 if (g.queued == emu.MAX_THREADS) try g.shade(t, cb, stats);
             }
         }
     }
 
-    /// A covered pixel queued: the attribute words its thread will read,
-    /// carried across the triangle as the pixel program's header says.
-    /// False: its depth is outside the clip volume (not drawn).
-    fn carry(g: *Engine, tri: [3]usize, flat: usize, bary: [3]f64, px: u32, py: u32) bool {
+    /// Whether a point's depth (its barycentric weights' on `tri`) is in
+    /// the clip volume.
+    fn depthIn(g: *const Engine, tri: [3]usize, bary: [3]f64) bool {
+        var z: f64 = 0;
+        for (tri, 0..) |v, k| z += bary[k] * g.vfloat(v, POSITION + 2) / g.vfloat(v, POSITION + 3);
+        return z >= g.zlo and z <= g.zhi;
+    }
+
+    /// A pixel queued (a helper: not covered, run for its quad, never
+    /// written): the attribute words its thread will read, carried across
+    /// the triangle as the pixel program's header says.
+    fn carry(g: *Engine, tri: [3]usize, flat: usize, bary: [3]f64, px: u32, py: u32, helper: bool) void {
         const n = g.queued;
         const in = &g.pin[n];
         in.* = @splat(0xdead_beef);
@@ -484,8 +585,7 @@ pub const Engine = struct {
             z += bary[k] * g.vfloat(v, POSITION + 2) * inv[k];
             w += bary[k] * inv[k];
         }
-        // (the depth in the clip volume, carried in window units)
-        if (z < g.zlo or z > g.zhi) return false;
+        // (the depth, carried in window units)
         in[POSITION + 2] = @bitCast(@as(f32, @floatCast(z * g.zscale + g.zoffset)));
         in[POSITION + 3] = @bitCast(@as(f32, @floatCast(w)));
         for (GENERIC..GENERIC_END) |word| {
@@ -506,8 +606,8 @@ pub const Engine = struct {
             }
         }
         g.at[n] = .{ px, py };
+        g.helper[n] = helper;
         g.queued = n + 1;
-        return true;
     }
 
     /// The queued pixels' threads run, and their colors written.
@@ -534,7 +634,7 @@ pub const Engine = struct {
         const ct = g.reg(gr.SET_CT_WRITE);
         const mask: u4 = @intCast((ct & 1) | ((ct >> 4) & 1) << 1 | ((ct >> 8) & 1) << 2 | ((ct >> 12) & 1) << 3);
         for (0..n) |k| {
-            if (g.killed[k]) continue;
+            if (g.killed[k] or g.helper[k]) continue;
             var color: [4]f32 = undefined;
             for (&color, 0..) |*ch, r| ch.* = @bitCast(emu.threadReg(g.host.work, @intCast(k), @intCast(r)));
             write(t, g.at[k][0], g.at[k][1], color, bl, mask);

@@ -80,6 +80,8 @@ fn openDriver() ?*engine.Engine {
     if (opened) return if (the_engine.lost) null else &the_engine;
     if (refused) return null;
     the_gpu = .{ .node = .{ .sys = .{} } };
+    const want3d = envAsked("GALAXY_GL_3D=");
+    the_gpu.want_graphics = want3d;
     const d = the_gpu.open() catch |err| {
         report.say(.device, "no GPU ({s}): EGL has no display, and the app draws in software", .{@errorName(err)});
         refused = true;
@@ -94,7 +96,13 @@ fn openDriver() ?*engine.Engine {
         .slabs = &driver_slabs,
         .cpu_work = &cpu_work,
         .check = if (check_px) |px| .{ .mem = anonymous(CHECK_BYTES), .max_px = px } else .{},
+        .graphics = d.caps.graphics,
     });
+    if (want3d) {
+        if (the_engine.graphics) {
+            report.say(.device, "the RTX's 3D engine draws what it takes (GALAXY_GL_3D): its rasterizer, texture units and blender; the compute kernels the rest", .{});
+        } else report.say(.device, "GALAXY_GL_3D asked, but the GPU offers no 3D engine (NV.TXT draw3d): the compute kernels draw", .{});
+    }
     if (!the_engine.onGpu()) {
         // (the kernels did not load: no GPU drawing at all)
         report.say(.device, "the GPU's kernels did not load ({s}): EGL has no display, and the app draws in software", .{if (the_engine.why) |w| @errorName(w) else "?"});
@@ -135,6 +143,39 @@ fn checkAsked() ?u32 {
         n += @intCast(r);
     }
     return checkOf(env_buf[0..n]);
+}
+
+/// Whether `key` (with its '=') is set to 1 or on in the process's
+/// environment (/proc/self/environ).
+fn envAsked(key: []const u8) bool {
+    if (comptime !on_linux) return false;
+    const fd = sysResult(linux.openat(linux.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    if (fd < 0) return false;
+    defer _ = linux.close(@intCast(fd));
+    var n: usize = 0;
+    while (n < env_buf.len) {
+        const r = sysResult(linux.read(@intCast(fd), env_buf[n..].ptr, env_buf.len - n));
+        if (r <= 0) break;
+        n += @intCast(r);
+    }
+    return onIn(env_buf[0..n], key);
+}
+
+/// `key` set to 1 or on in an environment block.
+fn onIn(block: []const u8, key: []const u8) bool {
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |kv| {
+        if (!std.mem.startsWith(u8, kv, key)) continue;
+        const v = std.mem.trim(u8, kv[key.len..], " ");
+        return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on");
+    }
+    return false;
+}
+
+test "libgalaxy-gl: GALAXY_GL_3D from an environment block" {
+    try std.testing.expect(onIn("A=1\x00GALAXY_GL_3D=1\x00", "GALAXY_GL_3D="));
+    try std.testing.expect(!onIn("GALAXY_GL_3D=0", "GALAXY_GL_3D="));
+    try std.testing.expect(!onIn("HOME=/\x00", "GALAXY_GL_3D="));
 }
 
 /// GALAXY_GL_CHECK's pixels in an environment block (NUL-separated).

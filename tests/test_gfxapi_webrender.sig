@@ -448,8 +448,200 @@ fn head(s: []const u8, lines: usize) []const u8 {
     return s;
 }
 
-/// What a set of programs came to.
-const Stats = struct { failed: usize = 0, ran_bad: usize = 0, ran_long: usize = 0, no_code: usize = 0, reported: usize = 0 };
+/// What a set of programs came to (and on the 3D engine: drawn through
+/// it, not eligible yet, a draw that went wrong there).
+const Stats = struct { failed: usize = 0, ran_bad: usize = 0, ran_long: usize = 0, no_code: usize = 0, reported: usize = 0, drawn3d: usize = 0, not3d: usize = 0, bad3d: usize = 0, long3d: usize = 0, why3d: [8][]const u8 = @splat(""), why3d_n: [8]usize = @splat(0) };
+
+// ── The emulated RTX's 3D engine (the PC's GL draws through BLACKWELL_B) ────
+
+const Nv3 = struct {
+    const nvidia = @import("nvidia");
+    var engine3d: nvidia.emu3d.Engine = .{};
+    var slabs: [16]engine.Slab = undefined;
+    var eng: engine.Engine = undefined;
+    var attr_bytes: [64 * 1024]u8 align(16) = undefined;
+    var uni: [8192]u32 = undefined;
+    var texels: [FUZZ_SIDE * FUZZ_SIDE * 4]u8 = undefined;
+};
+
+/// A variant's draw through the emulated RTX's 3D engine (its two stage
+/// programs compiled from the pipeline's KIR, gl3d's state, emu3d): 6
+/// vertices, 3 instances, every attribute a buffer of random floats, the
+/// uniforms and the textures as runTileSeed has them for `seed`. Null
+/// when it drew clean through the engine; else the sentence.
+fn run3d(pipe: *raster.Pipeline, uniforms: []const u32, nslots: usize, seed: u64, why: []u8) !?[]const u8 {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    Nv.dev.init(&Nv.arena, &Nv.view, &Nv.emu_work);
+    Nv.dev.withEngine(&Nv3.engine3d);
+    const e = &Nv3.eng;
+    e.init(.{ .dev = Nv.dev.device(), .work = &work_mem, .cpu_work = &cpu_work, .slabs = &Nv3.slabs, .graphics = true });
+    defer e.deinit();
+    defer e.unloadPipeline(pipe);
+    var color = e.newImage(64, 64, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&color);
+    for (&Nv3.attr_bytes) |*b| b.* = 0;
+    const fl: []f32 = @alignCast(std.mem.bytesAsSlice(f32, &Nv3.attr_bytes));
+    for (fl) |*x| x.* = if (seed == 0) 0 else @bitCast(fuzzWord(r, -1.5, 1.5));
+    var ab = e.newBuffer(Nv3.attr_bytes.len) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    e.writeBytes(&ab, 0, &Nv3.attr_bytes);
+    var tex: [texture.MAX_TEX]engine.Image = undefined;
+    const ntex: usize = @min(pipe.shaders.textures, nslots);
+    for (tex[0..ntex]) |*t| {
+        t.* = e.newImage(FUZZ_SIDE, FUZZ_SIDE, .rgba8) orelse return error.OutOfMemory;
+        for (&Nv3.texels) |*b| b.* = if (seed == 0) 0 else r.int(u8);
+        e.write(t, 0, 0, FUZZ_SIDE, FUZZ_SIDE, &Nv3.texels, FUZZ_SIDE * 4, .rgba8);
+    }
+    defer for (tex[0..ntex]) |*t| e.freeImage(t);
+    const nu = uniforms.len + nslots * texture.DESC_WORDS;
+    if (nu > Nv3.uni.len) return error.OutOfMemory;
+    @memcpy(Nv3.uni[0..uniforms.len], uniforms);
+    @memset(Nv3.uni[uniforms.len..nu], 0);
+    if (seed != 0) for (Nv3.uni[0..uniforms.len]) |*x| {
+        x.* = fuzzWord(r, -2, 2);
+    };
+    for (0..ntex) |j| texture.descriptor(.{ .img = &tex[j] }, Nv3.uni[uniforms.len + j * texture.DESC_WORDS ..][0..texture.DESC_WORDS]);
+    var d = raster.Draw{ .pipe = pipe, .color = &color, .rect = .{ .x0 = 0, .y0 = 0, .x1 = 64, .y1 = 64 }, .count = 6, .instances = 3, .center = .{ 32, 32 }, .half = .{ 32, 32 }, .uniforms = Nv3.uni[0..nu] };
+    for (0..pipe.shaders.attrs) |a| d.attrs[a] = .{ .buf = &ab, .offset = @intCast(a * 64), .stride = 16, .comps = 4, .divisor = @intFromBool(a % 2 == 1) };
+    for (0..ntex) |j| d.textures[j] = &tex[j];
+    const before = e.stats.graphics_draws;
+    if (!e.draw(&d)) return std.fmt.bufPrint(why, "the engine did not draw it", .{}) catch "?";
+    e.finish();
+    if (Nv.dev.lastError()) |le| {
+        var buf: [256]u8 = undefined;
+        return std.fmt.bufPrint(why, "{s}: {s}; the 3D engine: {s}", .{ @errorName(le), Nv.dev.explain(&buf), Nv3.engine3d.why }) catch "(too long)";
+    }
+    if (e.lost) return std.fmt.bufPrint(why, "the engine lost the GPU ({?s}); the 3D engine: {s}", .{ if (e.why) |w| @errorName(w) else null, Nv3.engine3d.why }) catch "?";
+    if (e.stats.graphics_draws == before) return std.fmt.bufPrint(why, "drawn on the compute kernels ({?s})", .{if (e.why_pipe) |w| @errorName(w) else null}) catch "?";
+    return null;
+}
+
+// ── ps_clear through GL, on the CPU and on the emulated 3D engine ──────────
+
+const CW = 64;
+const CH = 48;
+var objs3: gles.Objects = undefined;
+var ctx3: gles.Context = undefined;
+var clear_cpu: [CW * CH * 4]u8 = undefined;
+var clear_3d: [CW * CH * 4]u8 = undefined;
+
+/// WebRender's ps_clear as WebRender draws it (an instance a rectangle: its
+/// corners and color, aPosition the unit quad's six vertices; uTransform
+/// an orthographic projection), into an RGBA8 framebuffer: four rectangles,
+/// overlapping, at whole and half pixels. Its pixels into `out`.
+fn clearDraw(c: *gles.Context, vs: [:0]const u8, fs: [:0]const u8, out: []u8) !void {
+    const sv = program.createShader(c, g.VERTEX_SHADER);
+    const sf = program.createShader(c, g.FRAGMENT_SHADER);
+    defer program.deleteShader(c, sv);
+    defer program.deleteShader(c, sf);
+    for ([_]u32{ sv, sf }, [_][:0]const u8{ vs, fs }) |s, src| {
+        const parts = [_]?[*]const u8{src.ptr};
+        program.shaderSource(c, s, 1, &parts, null);
+        program.compileShader(c, s);
+    }
+    const p = program.createProgram(c);
+    defer program.deleteProgram(c, p);
+    program.attachShader(c, p, sv);
+    program.attachShader(c, p, sf);
+    program.linkProgram(c, p);
+    var ok: i32 = 0;
+    program.getProgramiv(c, p, g.LINK_STATUS, &ok);
+    if (ok != 1) return error.LinkFailed;
+    program.useProgram(c, p);
+    var tex: [1]u32 = undefined;
+    c.genTextures(&tex);
+    c.bindTexture(g.TEXTURE_2D, tex[0]);
+    c.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, CW, CH);
+    var fb: [1]u32 = undefined;
+    c.genFramebuffers(&fb);
+    c.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    c.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex[0], 0);
+    if (c.checkFramebufferStatus(g.FRAMEBUFFER) != g.FRAMEBUFFER_COMPLETE) return error.Incomplete;
+    c.viewportSet(0, 0, CW, CH);
+    c.clearColor(0.1, 0.2, 0.3, 1);
+    c.clear(g.COLOR_BUFFER_BIT);
+    var bufs: [2]u32 = undefined;
+    c.genBuffers(&bufs);
+    const quad = [_]f32{ 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1 };
+    // (x0, y0, x1, y1, r, g, b, a) an instance
+    const inst = [_]f32{
+        2,    3,    30,   20,   1,    0, 0, 1,
+        20.5, 10.5, 50.5, 40.5, 0,    1, 0, 0.5,
+        40,   0,    64,   48,   0,    0, 1, 1,
+        0,    30,   16,   48,   0.25, 0.5, 0.75, 1,
+    };
+    const loc_pos = program.getAttribLocation(c, p, "aPosition");
+    const loc_rect = program.getAttribLocation(c, p, "aRect");
+    const loc_color = program.getAttribLocation(c, p, "aColor");
+    if (loc_pos < 0 or loc_rect < 0 or loc_color < 0) return error.NoAttribute;
+    c.bindBuffer(g.ARRAY_BUFFER, bufs[0]);
+    c.bufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, g.STATIC_DRAW);
+    c.vertexAttribPointer(@intCast(loc_pos), 2, g.FLOAT, false, 8, 0, false);
+    c.enableVertexAttribArray(@intCast(loc_pos), true);
+    c.bindBuffer(g.ARRAY_BUFFER, bufs[1]);
+    c.bufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(inst)), &inst, g.STATIC_DRAW);
+    c.vertexAttribPointer(@intCast(loc_rect), 4, g.FLOAT, false, 32, 0, false);
+    c.vertexAttribPointer(@intCast(loc_color), 4, g.FLOAT, false, 32, 16, false);
+    for ([_]i32{ loc_rect, loc_color }) |l| {
+        c.enableVertexAttribArray(@intCast(l), true);
+        c.vertexAttribDivisor(@intCast(l), 1);
+    }
+    const ortho = [16]f32{ 2.0 / @as(f32, CW), 0, 0, 0, 0, 2.0 / @as(f32, CH), 0, 0, 0, 0, -1, 0, -1, -1, 0, 1 };
+    const loc_t = program.getUniformLocation(c, p, "uTransform");
+    if (loc_t < 0) return error.NoUniform;
+    program.uniformMatrix(c, loc_t, 1, false, 4, 4, @ptrCast(&ortho));
+    c.drawArrays(g.TRIANGLES, 0, 6, 4);
+    c.readPixels(0, 0, CW, CH, g.RGBA, g.UNSIGNED_BYTE, out.ptr);
+    if (c.getError() != g.NO_ERROR) return error.GlError;
+    c.finish();
+}
+
+/// ps_clear on the CPU and on the emulated RTX's 3D engine: the same
+/// pixels within `tol`; how many differ.
+fn clearCompare(dir: std.Io.Dir, io: std.Io) !void {
+    var v: ?Variant = null;
+    for (variants) |x| {
+        if (std.mem.eql(u8, x.name, "ps_clear")) v = x;
+    }
+    const pc = v orelse return error.NoPsClear;
+    const vs = try build(dir, io, pc, true, &vs_buf, &builder);
+    const fs = try build(dir, io, pc, false, &fs_buf, &builder);
+    try clearDraw(&ctx, vs, fs, &clear_cpu);
+    Nv.dev.init(&Nv.arena, &Nv.view, &Nv.emu_work);
+    Nv.dev.withEngine(&Nv3.engine3d);
+    const e = &Nv3.eng;
+    e.init(.{ .dev = Nv.dev.device(), .work = &work_mem, .cpu_work = &cpu_work, .slabs = &Nv3.slabs, .graphics = true });
+    defer e.deinit();
+    objs3.init();
+    ctx3.init(e, &objs3);
+    defer ctx3.deinit();
+    try clearDraw(&ctx3, vs, fs, &clear_3d);
+    var bad: u32 = 0;
+    var most: u8 = 0;
+    var i: usize = 0;
+    while (i < clear_cpu.len) : (i += 1) {
+        const d = if (clear_cpu[i] > clear_3d[i]) clear_cpu[i] - clear_3d[i] else clear_3d[i] - clear_cpu[i];
+        most = @max(most, d);
+        if (d > 2) {
+            if (bad < 4) std.debug.print("ps_clear: byte {d} (pixel {d}, {d}): the CPU {d}, the 3D engine {d}\n", .{ i, (i / 4) % CW, (i / 4) / CW, clear_cpu[i], clear_3d[i] });
+            bad += 1;
+        }
+    }
+    std.debug.print("webrender ps_clear: {d} draw(s) through the emulated 3D engine ({d} on the compute kernels), {d} bytes more than 2 from the CPU's (the most {d}); the emulated engine shaded {d} pixels\n", .{ e.stats.graphics_draws, e.stats.compute_draws, bad, most, Nv3.engine3d.pixels });
+    try std.testing.expect(e.stats.graphics_draws >= 1);
+    try std.testing.expectEqual(@as(u32, 0), bad);
+}
+
+fn note3d(stats: *Stats, why: []const u8) void {
+    for (&stats.why3d, &stats.why3d_n) |*w, *n| {
+        if (w.len == 0) w.* = why;
+        if (w.ptr == why.ptr) {
+            n.* += 1;
+            return;
+        }
+    }
+}
 
 /// One program (`vs` and `fs`, named `name` [`features`]): compiled and
 /// linked through GL's objects, its draw kernels built and compiled for
@@ -521,6 +713,30 @@ fn checkProgram(c: *gles.Context, name: []const u8, features: []const u8, vs: [:
         }
     }
     std.debug.print("\n", .{});
+    // through the emulated RTX's 3D engine, where the pipeline is one it
+    // takes: neutral inputs and random ones
+    if (raster.pipelineWhyNot(ds.pipe.shaders)) |w| {
+        stats.not3d += 1;
+        note3d(stats, w);
+    } else {
+        var drew = true;
+        for ([_]u64{ 0, 1, 2 }) |seed| {
+            var why3: [512]u8 = undefined;
+            const bad = run3d(@constCast(ds.pipe), ds.uniforms, ds.slots.len, seed, &why3) catch |e| blk: {
+                break :blk std.fmt.bufPrint(&why3, "{s}", .{@errorName(e)}) catch "?";
+            };
+            if (bad) |s| {
+                if (std.mem.startsWith(u8, s, "Timeout")) {
+                    stats.long3d += 1;
+                    continue;
+                }
+                drew = false;
+                stats.bad3d += 1;
+                std.debug.print("3D   {s} [{s}] on the emulated 3D engine, seed {d}: {s}\n", .{ name, features, seed, s });
+            }
+        }
+        if (drew) stats.drawn3d += 1;
+    }
     // the tile kernel on the emulated RTX, the warps in each order,
     // with neutral inputs (seed 0) and random ones
     for ([_]u64{ 0, 1, 2, 3 }) |seed| {
@@ -571,6 +787,11 @@ test "webrender: every shader variant compiles and links" {
     std.debug.print("webrender: {d} of {d} variants link; {d} kernels do not compile ({d} not required)\n", .{ selected.len - st.failed, selected.len, st.no_code, st.reported });
     std.debug.print("webrender on sm_120: the largest kernel {d} KIR, {d} machine instructions; the slowest compile {d} us ({s}); inside the backend at most {d} KIR expanded, {d} MI, {d} vregs\n", .{ max_kir, max_mi, @divTrunc(max_ns, 1000), max_what[0..max_what_len], max_xkir, max_xmi, max_vregs });
     std.debug.print("webrender: {d} tile kernel runs on the emulated RTX went wrong, {d} ran past the step budget\n", .{ st.ran_bad, st.ran_long });
+    try clearCompare(dir, io);
+    std.debug.print("webrender on the 3D engine: {d} variants drew through the emulated engine, {d} went wrong there ({d} runs past the step budget), {d} not taken yet:", .{ st.drawn3d, st.bad3d, st.long3d, st.not3d });
+    for (st.why3d, st.why3d_n) |w, n| if (w.len != 0) std.debug.print(" {s} {d};", .{ w, n });
+    std.debug.print("\n", .{});
+    try std.testing.expectEqual(@as(usize, 0), st.bad3d);
     try std.testing.expectEqual(@as(usize, 0), st.failed);
     try std.testing.expectEqual(@as(usize, 0), st.no_code);
     try std.testing.expectEqual(@as(usize, 0), st.ran_bad);

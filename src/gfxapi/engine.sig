@@ -1855,6 +1855,17 @@ pub const Engine = struct {
     }
 
     pub fn unloadPipeline(e: *Engine, p: *raster.Pipeline) void {
+        if (p.gfx_owner == @as(?*anyopaque, e)) {
+            e.finish();
+            for (&p.gfx) |*q| {
+                if (q.*) |*prog| {
+                    if (!e.lost) e.dev.?.unload(prog);
+                }
+                q.* = null;
+            }
+            p.gfx_owner = null;
+        }
+        if (p.gfx_refused_by == @as(?*anyopaque, e)) p.gfx_refused_by = null;
         if (p.owner != @as(?*anyopaque, e)) return;
         e.finish();
         for (&p.progs) |*q| {
@@ -1874,13 +1885,6 @@ pub const Engine = struct {
         p.evict = 0;
         p.owner = null;
         p.stencil_refused_by = null;
-        for (&p.gfx) |*q| {
-            if (q.*) |*prog| {
-                if (!e.lost) e.dev.?.unload(prog);
-            }
-            q.* = null;
-        }
-        p.gfx_refused_by = null;
     }
 
     // ── The GPU's graphics pipeline (the RTX's 3D engine) ─────────────────
@@ -1890,7 +1894,7 @@ pub const Engine = struct {
     /// and loaded at its first draw there. False when either does not
     /// compile or load (p's draws then stay on the compute kernels).
     fn loadGraphics(e: *Engine, p: *raster.Pipeline) bool {
-        if (p.gfx[1] != null) return true;
+        if (p.gfx[1] != null) return p.gfx_owner == @as(?*anyopaque, e);
         if (p.gfx_refused_by == @as(?*anyopaque, e)) return false;
         const d = e.dev.?;
         const gl = gpu.nvidia_gl;
@@ -1919,6 +1923,7 @@ pub const Engine = struct {
                 break :blk err;
             };
             p.gfx = .{ vprog, pprog };
+            p.gfx_owner = e;
             p.gfx[0].?.label = "gl_vertex_stage";
             p.gfx[1].?.label = "gl_pixel_stage";
         };

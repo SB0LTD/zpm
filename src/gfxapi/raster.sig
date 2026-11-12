@@ -162,6 +162,11 @@ pub const FragmentIO = struct {
     /// (quads) preds: the pixel is its quad's right one, its top one
     odd_x: V = .none,
     odd_y: V = .none,
+    /// (quads) the lanes its neighbours across and up are, xor: the tile
+    /// kernel's (QUAD_X, QUAD_Y), or a GPU's pixel warps' (the 3D engine:
+    /// 1 and 2, a quad's four lanes together)
+    quad_x: u32 = QUAD_X,
+    quad_y: u32 = QUAD_Y,
     varying: [MAX_VARYINGS]V = undefined,
     /// gl_FragCoord: x + 0.5, y + 0.5, depth, 1/w
     frag_coord: [4]V = undefined,
@@ -326,6 +331,7 @@ pub const Pipeline = struct {
     /// pixel), loaded by `owner` at the first draw that may use them; the
     /// engine that could not compile or load them.
     gfx: [2]?gpu.Program = .{ null, null },
+    gfx_owner: ?*anyopaque = null,
     gfx_refused_by: ?*anyopaque = null,
     /// draws of it checked against the CPU (the engine's Check)
     checked: u8 = 0,
@@ -834,13 +840,7 @@ pub const STAGE_PARAMS = VERTEX_PARAMS + 2;
 /// Why a draw is not one the 3D engine draws yet (its pipeline's or its
 /// own), or null: the compute kernels draw those.
 pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
-    const sh = d.pipe.shaders;
-    if (sh.quads) return "its fragment code takes derivatives";
-    if (sh.capture.len != 0) return "transform feedback";
-    if (sh.point_size or sh.point_coord) return "points";
-    if (sh.frag_depth) return "gl_FragDepth";
-    if (sh.clips != 0) return "clip distances";
-    if (sh.varyings > nvidia_gl.MAX_VARYINGS) return "more varyings than 32 vectors";
+    if (pipelineWhyNot(d.pipe.shaders)) |why| return why;
     if (d.topology != .triangles and d.topology != .strip and d.topology != .fan) return "points or lines";
     if (d.depth != null or d.depth_test or d.stencil != null) return "a depth or stencil test";
     if (d.cull != 0) return "culling";
@@ -854,6 +854,16 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     if (d.blend) |b| {
         if (b.gl[0] == 0xffff) return "a blend not given as GL's factors";
     }
+    return null;
+}
+
+/// Why a pipeline's draws are none the 3D engine draws yet, or null.
+pub fn pipelineWhyNot(sh: Shaders) ?[]const u8 {
+    if (sh.capture.len != 0) return "transform feedback";
+    if (sh.point_size or sh.point_coord) return "points";
+    if (sh.frag_depth) return "gl_FragDepth";
+    if (sh.clips != 0) return "clip distances";
+    if (sh.varyings > nvidia_gl.MAX_VARYINGS) return "more varyings than 32 vectors";
     return null;
 }
 
@@ -934,6 +944,19 @@ pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     const iw = k.load(.f32, io_m.at(b.io, nvidia_gl.POSITION + 12), u(0));
     const wv = k.div(f(1), r(iw));
     var io = FragmentIO{ .uniforms = b.uni, .textures = b.tex, .buffers = b.buf };
+    if (sh.quads) {
+        // A pixel warp's quads: lanes 4q .. 4q + 3 are a 2 x 2 block, x
+        // across in bit 0, the target's rows down in bit 1 (GL's up, unless
+        // the target is flipped). The engine runs helper pixels to fill them.
+        const lane = k.lane();
+        io.quads = true;
+        io.quad_x = 1;
+        io.quad_y = 2;
+        io.odd_x = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(lane), u(1))), u(0));
+        const down = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(lane), u(2))), u(0));
+        const flipped = k.cmp(.u32, .ne, r(k.param(.u32, P_FLIP)), u(0));
+        io.odd_y = k.sel(.pred, r(flipped), r(k.op1(.pnot, .pred, r(down))), r(down));
+    }
     for (0..sh.varyings) |j| {
         const at = varyingAt(j);
         io.varying[j] = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0)

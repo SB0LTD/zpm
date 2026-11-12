@@ -2447,6 +2447,15 @@ const Ctx = struct {
         var active: [MAX_GPR + 1]u16 = undefined;
         var n_active: usize = 0;
         var used = [_]u64{ 0, 0, 0, 0 };
+        // (a pixel program's output registers R0.. are the outputs' alone:
+        // nothing else ever writes them, so the copies into them at EXIT
+        // never race a write still in flight on another path)
+        if (c.opts.stage == .pixel) {
+            for (w.outv, 0..) |v, r| {
+                if (v == NOV) continue;
+                for (0..r + 1) |x| setBit(&used, @intCast(x));
+            }
+        }
         for (units) |u| {
             if (w.cls[u] == .p and !w.spilled[u]) continue;
             var i: usize = 0;
@@ -2629,22 +2638,21 @@ const Ctx = struct {
             }
             if (scratch + 1 < w.npreds) return error.TooManyRegs;
             var spilled_dst: ?u16 = null;
-            // (a pixel program's outputs into R0.., through registers past
-            // every one in use, so no copy overwrites one not made yet)
+            // (a pixel program's outputs into R0.., which the allocation
+            // keeps for them: no copy overwrites another's source)
             if (c.opts.stage == .pixel and std.mem.eql(u8, m.op, "EXIT")) {
-                const hi: u32 = @as(u32, top) + 1;
-                for (0..2) |pass| for (w.outv, 0..) |v, r| {
+                _ = top;
+                for (w.outv, 0..) |v, r| {
                     if (v == NOV) continue;
-                    if (hi + r > MAX_GPR) return error.TooManyRegs;
                     if (m.guard != .none) {
                         t.str("@");
                         c.printOpd(&t, m.guard, map[0..n_map], null);
                         t.str(" ");
                     }
-                    t.reg("MOV R", @intCast(if (pass == 0) hi + r else r));
-                    t.reg(", R", if (pass == 0) c.physOf(v) else @as(u32, @intCast(hi + r)));
+                    t.reg("MOV R", @intCast(r));
+                    t.reg(", R", c.physOf(v));
                     t.str("\n");
-                };
+                }
             }
             if (m.guard != .none) {
                 t.str("@");
