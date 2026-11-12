@@ -297,7 +297,8 @@ pub fn wrap(buf: gpu.Buffer, width: u32, height: u32, stride: u32, format: Forma
 // ── The pool: CPU memory for images when the GPU gives none ───────────────
 
 pub const MAX_SPANS = 1024;
-const POOL_ALIGN = 64;
+/// (128: a 3D engine's colour target starts on 128 bytes)
+const POOL_ALIGN = 128;
 
 /// The caller's bytes, handed out first fit (64-byte aligned) and taken
 /// back in any order; the spans in use kept sorted.
@@ -824,6 +825,54 @@ pub fn compileAny(k: *const kir.Kernel, caps: gpu.Caps, work: *gpu.Work, out: []
 }
 
 /// What `init` needs.
+/// The channels of format `f` a draw writes, from the bits it keeps
+/// (Draw.keep, the pixel word's): bit 0 red .. bit 3 alpha.
+fn maskOf(f: Format, keep: u32) u4 {
+    // (each channel's byte in the pixel word; none: not there)
+    const at: [4]?u5 = switch (f) {
+        .bgra8 => .{ 16, 8, 0, 24 },
+        .rg8 => .{ 0, 8, null, null },
+        .r8 => .{ 0, null, null, null },
+        else => .{ 0, 8, 16, 24 },
+    };
+    var m: u4 = 0;
+    for (at, 0..) |sh, c| {
+        const s = sh orelse continue;
+        if ((keep >> s) & 0xff == 0) m |= @as(u4, 1) << @intCast(c);
+    }
+    return m;
+}
+
+/// GL's blend as the GPU's blender is told it.
+fn blendOf(b: raster.Blend) gpu.GraphicsBlend {
+    const eq = struct {
+        fn of(x: raster.Equation) gpu.BlendEquation {
+            return switch (x) {
+                .add => .add,
+                .subtract => .subtract,
+                .reverse_subtract => .reverse_subtract,
+                .min => .min,
+                .max => .max,
+            };
+        }
+        fn factor(v: u32) gpu.BlendFactor {
+            inline for (std.enums.values(gpu.BlendFactor)) |x| {
+                if (@intFromEnum(x) == v) return x;
+            }
+            return .one;
+        }
+    };
+    return .{
+        .src_rgb = eq.factor(b.gl[0]),
+        .dst_rgb = eq.factor(b.gl[1]),
+        .src_a = eq.factor(b.gl[2]),
+        .dst_a = eq.factor(b.gl[3]),
+        .eq_rgb = eq.of(b.eq_rgb),
+        .eq_a = eq.of(b.eq_a),
+        .constant = b.constant,
+    };
+}
+
 pub const Config = struct {
     /// The GPU; none: everything on the CPU.
     dev: ?gpu.Device = null,
@@ -842,6 +891,10 @@ pub const Config = struct {
     cpu_work: []u8 = &.{},
     /// The GPU's work checked against the CPU's (off: no memory).
     check: Check = .{},
+    /// Draws through the GPU's graphics pipeline (Caps.graphics: the RTX's
+    /// 3D engine) where a draw is one it takes; else every draw is the
+    /// compute kernels'.
+    graphics: bool = false,
 };
 
 const SLAB_BYTES = 2 << 20;
@@ -890,6 +943,11 @@ pub const Stats = struct {
     wait_us: u64 = 0,
     /// draws done on the CPU (cpu_ops counts them too)
     cpu_draws: u64 = 0,
+    /// draws through the GPU's graphics pipeline (the 3D engine), and
+    /// draws the graphics pipeline was on for that the compute kernels
+    /// drew (raster.stageWhyNot)
+    graphics_draws: u64 = 0,
+    compute_draws: u64 = 0,
 };
 
 pub const Engine = struct {
@@ -912,6 +970,15 @@ pub const Engine = struct {
     /// the CPU form of each op (for a batch the GPU could not run); a
     /// draw's has none: lost with the GPU (GL reports the reset)
     op_cpu: [MAX_OPS]?CpuOp = undefined,
+    /// each op's draw through the graphics pipeline (Dispatch.graphics)
+    op_gfx: [MAX_OPS]gpu.Graphics = undefined,
+    /// graphics dispatches in the open batch (Caps.max_graphics a run)
+    n_gfx: u32 = 0,
+    /// Draws go through the GPU's graphics pipeline where they may
+    /// (Config.graphics and Caps.graphics), and what was said of it.
+    graphics: bool = false,
+    said_graphics: bool = false,
+    said_compute: [8][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
     work: []u8 = &.{},
     cpu_work: []u8 = &.{},
@@ -957,6 +1024,7 @@ pub const Engine = struct {
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
         e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .check = cfg.check };
+        if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
         for (e.slabs) |*slab| slab.* = .{};
         const d = cfg.dev orelse return;
         e.loadAll(d, cfg.compiler, cfg.work) catch |err| {
@@ -1131,7 +1199,8 @@ pub const Engine = struct {
 
     fn allocImage(e: *Engine, width: u32, height: u32, format: Format, shareable: bool) ?Image {
         if (width == 0 or height == 0) return null;
-        const stride = std.mem.alignForward(u32, width * format.bytes(), 4);
+        // (rows 128 bytes apart where the 3D engine may draw into it)
+        const stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.renderable()) 128 else 4);
         const m = e.allocBytes(@as(usize, stride) * height, shareable) orelse return null;
         return .{ .buf = m.buf, .width = width, .height = height, .stride = stride, .format = format, .own = true, .pooled = m.pooled };
     }
@@ -1264,6 +1333,7 @@ pub const Engine = struct {
         const d = e.dev.?;
         const n = e.n_ops;
         e.n_ops = 0;
+        e.n_gfx = 0;
         const sum = &e.sums[e.batch % RING];
         sum.* = .{};
         for (e.ops[0..n]) |op| sum.add(op.prog, op.groups, 1);
@@ -1299,6 +1369,7 @@ pub const Engine = struct {
         e.lost = true;
         if (e.why == null) e.why = err;
         e.n_ops = 0;
+        e.n_gfx = 0;
     }
 
     /// What was on the GPU when it was lost: the programs of the batches run
@@ -1803,6 +1874,175 @@ pub const Engine = struct {
         p.evict = 0;
         p.owner = null;
         p.stencil_refused_by = null;
+        for (&p.gfx) |*q| {
+            if (q.*) |*prog| {
+                if (!e.lost) e.dev.?.unload(prog);
+            }
+            q.* = null;
+        }
+        p.gfx_refused_by = null;
+    }
+
+    // ── The GPU's graphics pipeline (the RTX's 3D engine) ─────────────────
+
+    /// p's two programs for the 3D engine (raster.pixelStage, then
+    /// raster.vertexStage storing what the pixel program reads), compiled
+    /// and loaded at its first draw there. False when either does not
+    /// compile or load (p's draws then stay on the compute kernels).
+    fn loadGraphics(e: *Engine, p: *raster.Pipeline) bool {
+        if (p.gfx[1] != null) return true;
+        if (p.gfx_refused_by == @as(?*anyopaque, e)) return false;
+        const d = e.dev.?;
+        const gl = gpu.nvidia_gl;
+        const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
+        const result: anyerror!void = blk: {
+            var w = gpu.Work.init(e.work);
+            const st = &(w.take(gpu.nvidia_device.kir_sm120.State, 1) orelse break :blk error.OutOfMemory)[0];
+            st.asm_work.sched = .{};
+            var pk = raster.pixelStage(s, p);
+            pk.finish() catch |err| break :blk err;
+            const pbin = gl.compileStage(&pk, d.caps, st, .pixel, 0, &e.pcode) catch |err| break :blk err;
+            const reads = st.io.loads;
+            const pprog = d.load(&pbin) catch |err| break :blk err;
+            st.asm_work.sched = .{};
+            var vk = raster.vertexStage(s, p, &reads);
+            vk.finish() catch |err| {
+                d.unload(&pprog);
+                break :blk err;
+            };
+            const vbin = gl.compileStage(&vk, d.caps, st, .vertex, 0, &e.pcode) catch |err| {
+                d.unload(&pprog);
+                break :blk err;
+            };
+            const vprog = d.load(&vbin) catch |err| {
+                d.unload(&pprog);
+                break :blk err;
+            };
+            p.gfx = .{ vprog, pprog };
+            p.gfx[0].?.label = "gl_vertex_stage";
+            p.gfx[1].?.label = "gl_pixel_stage";
+        };
+        result catch |err| {
+            e.why_pipe = err;
+            p.gfx_refused_by = e;
+            report.say(.pipeline, "a program does not compile or load for the GPU's 3D engine ({s}): its draws stay on the compute kernels", .{@errorName(err)});
+            return false;
+        };
+        return true;
+    }
+
+    /// The draw on the GPU's 3D engine, or null when it is not one it takes
+    /// (the compute kernels draw it). Said once a reason, per engine.
+    fn graphicsDraw(e: *Engine, d: *const raster.Draw) ?bool {
+        if (!e.graphics or !e.onGpu()) return null;
+        if (raster.stageWhyNot(d)) |why| {
+            e.stats.compute_draws += 1;
+            e.sayCompute(why);
+            return null;
+        }
+        const p = @constCast(d.pipe);
+        if (!e.loadGraphics(p)) {
+            e.sayCompute("its program did not compile for the 3D engine");
+            return null;
+        }
+        // the bindings: the vertex kernel's, its first the stage's words
+        var bs: [MAX_BIND]*Image = undefined;
+        bs[0] = &e.zero;
+        var uni = e.newBuffer(@max(d.uniforms.len * 4, 16)) orelse return false;
+        defer e.freeImage(&uni);
+        e.writeBytes(&uni, 0, std.mem.sliceAsBytes(d.uniforms));
+        bs[1] = &uni;
+        bs[2] = d.index orelse &e.zero;
+        for (d.attrs, 0..) |a, j| bs[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
+        const ntex: usize = p.shaders.textures;
+        const nbuf: usize = p.shaders.buffers;
+        for (0..ntex) |j| bs[3 + raster.MAX_ATTRS + j] = d.textures[j] orelse &e.zero;
+        for (0..nbuf) |j| bs[3 + raster.MAX_ATTRS + ntex + j] = d.buffers[j] orelse &e.zero;
+        const nb = 3 + raster.MAX_ATTRS + ntex + nbuf;
+        for (bs[0..nb]) |img| {
+            if (!e.gpuUsable(img)) return null;
+        }
+        const t = d.color;
+        if (!e.gpuUsable(t)) return null;
+        if (t.buf.gpu % 128 != 0 or t.stride % 128 != 0) {
+            e.stats.compute_draws += 1;
+            e.sayCompute("a target whose address or rows are not on 128 bytes");
+            return null;
+        }
+        var pw: [MAX_PARAMS]u32 = undefined;
+        const params = raster.stageParams(d, &pw);
+        // GL's window (y up) as the target's rows: flipped for a top-down
+        // image; the scissor the draw's rectangle
+        const H: f32 = @floatFromInt(t.height);
+        const flip = t.top_down;
+        const rc = d.rect;
+        const g = gpu.Graphics{
+            .vertex = &p.gfx[0].?,
+            .va = t.buf.gpu,
+            .width = t.width,
+            .height = t.height,
+            .stride = t.stride,
+            .format = switch (t.format) {
+                .rgba8 => .rgba8,
+                .bgra8 => .bgra8,
+                .rg8 => .rg8,
+                else => .r8,
+            },
+            .mask = maskOf(t.format, d.keep),
+            .blend = if (d.blend) |b| blendOf(b) else null,
+            .scale = .{ d.half[0], if (flip) -d.half[1] else d.half[1], d.depth_scale },
+            .offset = .{ d.center[0], if (flip) H - d.center[1] else d.center[1], d.depth_bias },
+            .scissor = if (flip) .{ rc.x0, t.height - rc.y1, rc.x1, t.height - rc.y0 } else .{ rc.x0, rc.y0, rc.x1, rc.y1 },
+            .topology = switch (d.topology) {
+                .strip => .strip,
+                .fan => .fan,
+                else => .triangles,
+            },
+            .count = d.count,
+            .instances = d.instances,
+        };
+        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t);
+        e.stats.graphics_draws += 1;
+        if (!e.said_graphics) {
+            e.said_graphics = true;
+            report.say(.pipeline, "draws through the GPU's 3D engine (the RTX's BLACKWELL_B: its rasterizer and blender), the compute kernels for what it does not take yet", .{});
+        }
+        return true;
+    }
+
+    /// Why a draw went to the compute kernels while the 3D engine was on:
+    /// said once a reason.
+    fn sayCompute(e: *Engine, why: []const u8) void {
+        for (&e.said_compute) |*s| {
+            if (s.len != 0 and s.ptr == why.ptr) return;
+            if (s.len == 0) {
+                s.* = why;
+                report.say(.pipeline, "a draw on the compute kernels, not the 3D engine: {s}", .{why});
+                return;
+            }
+        }
+    }
+
+    /// A draw through the graphics pipeline in the open batch: the pixel
+    /// program as its dispatch's, `g` kept beside it; its bindings read,
+    /// the target written.
+    fn recordGraphics(e: *Engine, pixel: *const gpu.Program, g: gpu.Graphics, bufs: []const *Image, params: []const u32, target: *Image) void {
+        if (e.n_gfx >= e.dev.?.caps.max_graphics) e.flush();
+        e.room();
+        const i = e.n_ops;
+        for (bufs, 0..) |img, j| {
+            e.op_bufs[i][j] = img.buf;
+            img.trk().last = e.batch;
+        }
+        target.trk().last = e.batch;
+        target.trk().gpu_wrote = true;
+        @memcpy(e.op_params[i][0..params.len], params);
+        e.op_gfx[i] = g;
+        e.ops[i] = .{ .prog = pixel, .groups = .{ 1, 1, 1 }, .buffers = e.op_bufs[i][0..bufs.len], .params = e.op_params[i][0..params.len], .graphics = &e.op_gfx[i] };
+        e.op_cpu[i] = null;
+        e.n_ops += 1;
+        e.n_gfx += 1;
+        e.stats.dispatches += 1;
     }
 
     /// A draw: its vertices, primitives and pixels, on the GPU (three
@@ -1817,6 +2057,7 @@ pub const Engine = struct {
         if (nrec == 0 or d.instances == 0 or d.rect.empty()) return true;
         // (made at the first draw: an engine that never draws has none)
         if (e.zero.buf.cpu.len == 0) e.zero = e.newBuffer(256) orelse return false;
+        if (e.graphicsDraw(d)) |done| return done;
         const p = d.pipe;
         const v = d.variant();
         const kind = d.setupKind();

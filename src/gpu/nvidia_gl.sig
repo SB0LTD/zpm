@@ -28,6 +28,7 @@ const nvidia = @import("nvidia");
 const sph = nvidia.sph;
 
 pub const Stage = kir_sm120.Stage;
+pub const StageIO = kir_sm120.StageIO;
 pub const OUT_AT = kir_sm120.OUT_AT;
 pub const KILL_AT = kir_sm120.KILL_AT;
 

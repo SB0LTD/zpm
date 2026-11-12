@@ -1501,6 +1501,59 @@ test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CP
     eng_rtx.deinit();
 }
 
+// ── The emulated RTX's 3D engine (Config.graphics) ─────────────────────────
+
+/// Pixels of two outputs more than `tol` apart in a channel: how many, the
+/// first, the largest difference.
+fn apart(want: []const u8, got: []const u8, width: usize, tol: u8, what: []const u8) u32 {
+    var n: u32 = 0;
+    var most: u8 = 0;
+    var i: usize = 0;
+    while (i < want.len) : (i += 4) {
+        var worst: u8 = 0;
+        for (0..4) |c| worst = @max(worst, if (want[i + c] > got[i + c]) want[i + c] - got[i + c] else got[i + c] - want[i + c]);
+        most = @max(most, worst);
+        if (worst <= tol) continue;
+        if (n < 4) std.debug.print("{s}: pixel ({d}, {d}): the CPU {any}, the 3D engine {any}\n", .{ what, (i / 4) % width, (i / 4) / width, want[i..][0..4], got[i..][0..4] });
+        n += 1;
+    }
+    std.debug.print("{s}: {d} pixels more than {d} apart (the most {d})\n", .{ what, n, tol, most });
+    return n;
+}
+
+const Rtx3d = struct {
+    var engine3d: @import("nvidia").emu3d.Engine = .{};
+};
+var out_rtx3d: Out = .{};
+
+test "draw: the scene through the emulated RTX's 3D engine where it draws, the compute kernels the rest: the CPU's picture" {
+    const want = try cpuOut();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    try std.testing.expect(eng_rtx.onGpu() and eng_rtx.graphics);
+    scene(&eng_rtx, &out_rtx3d) catch |e| {
+        std.debug.print("rtx 3D scene: {s}; the engine lost the GPU {} ({?s}), its pipeline error {?s}; the 3D engine: {s}\n", .{ @errorName(e), eng_rtx.lost, if (eng_rtx.why) |w| @errorName(w) else null, if (eng_rtx.why_pipe) |w| @errorName(w) else null, Rtx3d.engine3d.why });
+        return e;
+    };
+    if (Rtx.dev.lastError()) |e| {
+        var buf: [512]u8 = undefined;
+        std.debug.print("sm120_emu: {s}: {s}; the 3D engine: {s}\n", .{ @errorName(e), Rtx.dev.explain(&buf), Rtx3d.engine3d.why });
+    }
+    std.debug.print("3D engine: draws {d} through it, {d} on the compute kernels; the emulated engine drew {d}, {d} pixels\n", .{ eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws, Rtx3d.engine3d.draws, Rtx3d.engine3d.pixels });
+    for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("3D engine: a draw on the compute kernels: {s}\n", .{w});
+    if (eng_rtx.why_pipe) |w| std.debug.print("3D engine: a pipeline refused: {s}\n", .{@errorName(w)});
+    try std.testing.expect(eng_rtx.why_pipe == null);
+    try std.testing.expect(!eng_rtx.lost);
+    try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
+    try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
+    // (the hardware's blending and interpolation are not KIR's exact
+    // arithmetic: within a step or two of 255)
+    try std.testing.expectEqual(@as(u32, 0), apart(&want.fbo, &out_rtx3d.fbo, W, 2, "fbo"));
+    try std.testing.expectEqual(@as(u32, 0), apart(&want.win, &out_rtx3d.win, WW, 2, "window"));
+    eng_rtx.deinit();
+}
+
 // ── GALAXY_GL_CHECK: the GPU's work against the CPU's ──────────────────────
 
 var check_mem: [4 << 20]u8 align(64) = undefined;

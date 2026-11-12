@@ -76,6 +76,7 @@
 
 const std = @import("std");
 const gpu = @import("gpu");
+const nvidia_gl = gpu.nvidia_gl;
 const engine = @import("engine.sig");
 const texture = @import("texture.sig");
 const kir = gpu.kir;
@@ -321,6 +322,11 @@ pub const Pipeline = struct {
     /// the engine whose GPU refused them (their draws run on the CPU, not
     /// compiled again at every draw)
     refused_by: ?*anyopaque = null,
+    /// The GPU's graphics pipeline's programs (the 3D engine's: vertex,
+    /// pixel), loaded by `owner` at the first draw that may use them; the
+    /// engine that could not compile or load them.
+    gfx: [2]?gpu.Program = .{ null, null },
+    gfx_refused_by: ?*anyopaque = null,
     /// draws of it checked against the CPU (the engine's Check)
     checked: u8 = 0,
     /// The other kernels its draws needed (on the owner's GPU): setup
@@ -444,6 +450,11 @@ pub const Blend = struct {
     saturate: bool = false,
     eq_rgb: Equation = .add,
     eq_a: Equation = .add,
+    /// The same as GL named them (src_rgb, dst_rgb, src_a, dst_a: GL's
+    /// enums) and the constant colour: what a GPU's blender is told (the
+    /// 3D engine's draws). 0xffff: not known (a factor made otherwise).
+    gl: [4]u32 = .{ 0xffff, 0xffff, 0xffff, 0xffff },
+    constant: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 pub const StencilOp = enum(u3) { keep, zero, replace, incr, decr, invert, incr_wrap, decr_wrap };
@@ -805,6 +816,148 @@ fn vertexOf(k: *kir.Kernel, b_idx: u8, x: V) V {
     }
     k.endif();
     return v;
+}
+
+// ── The 3D engine's programs (a GPU's graphics pipeline: nvidia_gl) ──────────
+// The draw's two shader stages as the RTX's vertex and pixel programs: the
+// rasterizer, the attribute interpolation and the blender are the
+// engine's, the shader code and the attribute fetch the KIR's. Both have
+// the vertex kernel's bindings (binding 0 the stage's attribute words, not
+// memory) and its parameters, then STAGE_PARAMS more.
+
+/// The pixel program's: the target's height, and whether its rows are
+/// flipped (a top-down image: GL's y = height - the engine's).
+const P_HEIGHT = VERTEX_PARAMS;
+const P_FLIP = VERTEX_PARAMS + 1;
+pub const STAGE_PARAMS = VERTEX_PARAMS + 2;
+
+/// Why a draw is not one the 3D engine draws yet (its pipeline's or its
+/// own), or null: the compute kernels draw those.
+pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
+    const sh = d.pipe.shaders;
+    if (sh.quads) return "its fragment code takes derivatives";
+    if (sh.capture.len != 0) return "transform feedback";
+    if (sh.point_size or sh.point_coord) return "points";
+    if (sh.frag_depth) return "gl_FragDepth";
+    if (sh.clips != 0) return "clip distances";
+    if (sh.varyings > nvidia_gl.MAX_VARYINGS) return "more varyings than 32 vectors";
+    if (d.topology != .triangles and d.topology != .strip and d.topology != .fan) return "points or lines";
+    if (d.depth != null or d.depth_test or d.stencil != null) return "a depth or stencil test";
+    if (d.cull != 0) return "culling";
+    if (d.restart) return "primitive restart";
+    if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
+    for (d.targets[1..]) |t| if (t != null) return "more than one colour target";
+    if (d.query != null) return "an occlusion query";
+    if (d.alpha_to_coverage or d.sample_mask & 1 == 0) return "alpha to coverage or a sample mask";
+    if (d.bias_factor != 0 or d.bias_units != 0) return "depth bias";
+    if (!d.color.drawable()) return "a target the engine does not draw into";
+    if (d.blend) |b| {
+        if (b.gl[0] == 0xffff) return "a blend not given as GL's factors";
+    }
+    return null;
+}
+
+/// The pixel program's parameters: the vertex kernel's, then its own.
+pub fn stageParams(d: *const Draw, out: []u32) []u32 {
+    _ = vertexParams(d, out);
+    out[P_HEIGHT] = d.color.height;
+    out[P_FLIP] = @intFromBool(d.color.top_down);
+    return out[0..STAGE_PARAMS];
+}
+
+/// The bindings both programs declare, in the vertex kernel's order:
+/// the stage's words (0), the uniforms, the element array, each
+/// attribute's buffer, the textures, the buffers.
+const StageBindings = struct { io: u8, uni: u8, idx: u8, attr: [MAX_ATTRS]u8, tex: u8, buf: u8 };
+
+fn stageBindings(k: *kir.Kernel, sh: Shaders) StageBindings {
+    var b: StageBindings = undefined;
+    b.io = k.binding();
+    b.uni = k.binding();
+    b.idx = k.binding();
+    for (&b.attr) |*x| x.* = k.binding();
+    b.tex = k.bindings;
+    for (0..sh.textures) |_| _ = k.binding();
+    b.buf = k.bindings;
+    for (0..sh.buffers) |_| _ = k.binding();
+    return b;
+}
+
+/// Varying j's attribute word: generic vector j / 4, component j % 4.
+pub fn varyingAt(j: usize) u32 {
+    return nvidia_gl.generic(@intCast(j / 4), @intCast(j % 4));
+}
+
+/// The vertex program: the vertex's index (the engine's: 0 .. count - 1)
+/// through the element array as the vertex kernel takes it, the
+/// attributes fetched, the shader's vertex code; the clip-space position
+/// and each varying the pixel program reads (`reads`: its StageIO.loads)
+/// stored.
+pub fn vertexStage(s: kir.Storage, p: *const Pipeline, reads: *const [8]u32) kir.Kernel {
+    var k = kir.Kernel.init(s, "gl_vertex_stage", .{ 1, 1, 1 });
+    const sh = p.shaders;
+    const b = stageBindings(&k, sh);
+    const x = k.load(.u32, nvidia_gl.ioMem(b.io, nvidia_gl.VERTEX_ID, false), u(0));
+    const inst = k.load(.u32, nvidia_gl.ioMem(b.io, nvidia_gl.INSTANCE_ID, false), u(0));
+    const v = vertexOf(&k, b.idx, x);
+    var io = VertexIO{ .vertex_id = v, .instance_id = inst, .uniforms = b.uni, .textures = b.tex, .buffers = b.buf };
+    for (0..sh.attrs) |a| io.attr[a] = fetch(&k, b.attr[a], @intCast(V_ATTR + a * V_ATTR_WORDS), v, inst);
+    sh.vertex(sh.ctx, &k, &io);
+    for (0..4) |c| {
+        const val: Arg = if (io.position[c] == .none) f(if (c == 3) 1 else 0) else r(io.position[c]);
+        k.store(.f32, nvidia_gl.ioMem(b.io, nvidia_gl.POSITION + 4 * @as(u32, @intCast(c)), false), u(0), val);
+    }
+    for (0..sh.varyings) |j| {
+        const at = varyingAt(j);
+        if (!nvidia_gl.StageIO.has(reads, at)) continue;
+        // (a flat integer varying's bits as they are)
+        const ty: kir.Ty = if (io.varying[j] == .none) .u32 else k.tys[@intFromEnum(io.varying[j])];
+        const val: Arg = if (io.varying[j] == .none) u(0) else r(io.varying[j]);
+        k.store(ty, nvidia_gl.ioMem(b.io, at, false), u(0), val);
+    }
+    return k;
+}
+
+/// The pixel program: the varyings (flat ones the provoking vertex's
+/// bits, the rest carried in perspective), gl_FragCoord (y flipped back
+/// to GL's for a top-down target), the shader's fragment code; its colour
+/// into the target (the engine clamps and blends), a discard a KILL.
+pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
+    var k = kir.Kernel.init(s, "gl_pixel_stage", .{ 1, 1, 1 });
+    const sh = p.shaders;
+    const b = stageBindings(&k, sh);
+    const io_m = struct {
+        fn at(bb: u8, a: u32) kir.Mem {
+            return nvidia_gl.ioMem(bb, a, false);
+        }
+    };
+    const iw = k.load(.f32, io_m.at(b.io, nvidia_gl.POSITION + 12), u(0));
+    const wv = k.div(f(1), r(iw));
+    var io = FragmentIO{ .uniforms = b.uni, .textures = b.tex, .buffers = b.buf };
+    for (0..sh.varyings) |j| {
+        const at = varyingAt(j);
+        io.varying[j] = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0)
+            k.load(.f32, nvidia_gl.ioMem(b.io, at, true), u(0))
+        else
+            k.op2(.fmul, .f32, r(k.load(.f32, io_m.at(b.io, at), u(0))), r(wv));
+    }
+    const X = k.load(.f32, io_m.at(b.io, nvidia_gl.POSITION), u(0));
+    const yh = k.load(.f32, io_m.at(b.io, nvidia_gl.POSITION + 4), u(0));
+    const yf = k.op2(.fsub, .f32, r(k.cvt(.u32, .f32, .rne, r(k.param(.u32, P_HEIGHT)))), r(yh));
+    const Y = k.sel(.f32, r(k.cmp(.u32, .ne, r(k.param(.u32, P_FLIP)), u(0))), r(yf), r(yh));
+    const z = k.load(.f32, io_m.at(b.io, nvidia_gl.POSITION + 8), u(0));
+    io.frag_coord = .{ X, Y, z, iw };
+    sh.fragment(sh.ctx, &k, &io);
+    if (io.discard != .none) {
+        k.ifp(r(io.discard));
+        k.store(.u32, io_m.at(b.io, nvidia_gl.KILL_AT), u(0), u(0));
+        k.endif();
+    }
+    for (0..4) |c| {
+        const val: Arg = if (io.color[c] == .none) f(0) else r(io.color[c]);
+        k.store(.f32, io_m.at(b.io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c))), u(0), val);
+    }
+    return k;
 }
 
 /// Transform feedback: a thread per vertex of each instance (as the
