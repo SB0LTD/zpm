@@ -346,8 +346,32 @@ pub const Graphics = struct {
     /// its attributes and any element array itself), `instances` times.
     count: u32,
     instances: u32 = 1,
+    /// The depth-stencil target (block linear, depth in bits 0..23 and
+    /// stencil in 24..31) and its tests; null: none.
+    depth: ?Depth = null,
 
     pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8 };
+    pub const StencilOp = enum(u8) { keep, zero, replace, incr, decr, invert, incr_wrap, decr_wrap };
+    pub const Stencil = struct {
+        /// NEVER 0 .. ALWAYS 7 (bit 0 less, 1 equal, 2 greater)
+        func: u3 = 7,
+        reference: u8 = 0,
+        value_mask: u8 = 0xff,
+        write_mask: u8 = 0xff,
+        fail: StencilOp = .keep,
+        zfail: StencilOp = .keep,
+        zpass: StencilOp = .keep,
+    };
+    pub const Depth = struct {
+        va: u64,
+        width: u32,
+        height: u32,
+        gobs_log2: u3,
+        tested: bool,
+        write: bool,
+        func: u3 = 1,
+        stencil: ?Stencil = null,
+    };
     pub const Topology = enum(u8) { triangles, strip, fan };
 };
 

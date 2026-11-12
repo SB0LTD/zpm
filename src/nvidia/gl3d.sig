@@ -94,6 +94,43 @@ pub const Blend = struct {
 
 pub const Topology = enum(u32) { triangles = 4, strip = 5, fan = 6 };
 
+// The depth-stencil target and its tests (cl9097.h's methods).
+pub const SET_ZT_A: u32 = 0x0fe0; // address (high), then low, format, block size, array pitch
+pub const SET_ZT_SIZE_A: u32 = 0x1228; // width, height, third dimension
+/// SET_ZT_FORMAT: S8Z24 (depth in bits 0..23, stencil 24..31: GL's
+/// DEPTH24_STENCIL8 as the engine keeps it; Mesa's Z24_UNORM_S8_UINT).
+pub const ZT_S8Z24: u32 = 0x14;
+pub const SET_STENCIL_OP_FAIL: u32 = 0x1384; // fail, zfail, zpass, func, ref, func mask, write mask
+
+/// GL's stencil operations, as the engine takes them (the GL enums).
+pub const StencilOp = enum(u32) { keep = 0x1e00, zero = 0, replace = 0x1e01, incr = 0x1e02, decr = 0x1e03, invert = 0x150a, incr_wrap = 0x8507, decr_wrap = 0x8508 };
+
+pub const Stencil = struct {
+    /// NEVER 0 .. ALWAYS 7 (bit 0 less, 1 equal, 2 greater: GL's order)
+    func: u3 = 7,
+    reference: u8 = 0,
+    value_mask: u8 = 0xff,
+    write_mask: u8 = 0xff,
+    fail: StencilOp = .keep,
+    zfail: StencilOp = .keep,
+    zpass: StencilOp = .keep,
+};
+
+/// A depth-stencil target: block linear (whole 64-byte GOBs across,
+/// blocks of 2^gobs_log2 GOBs), S8Z24.
+pub const Depth = struct {
+    va: u64,
+    width: u32,
+    height: u32,
+    gobs_log2: u3,
+    tested: bool,
+    write: bool,
+    /// NEVER 0 .. ALWAYS 7 (the OGL value is 0x200 + it)
+    func: u3 = 1,
+    /// one for both faces (two-sided stencil is not sent)
+    stencil: ?Stencil = null,
+};
+
 /// A program as the engine is told of it: its header's address, its
 /// registers, the 256-byte blocks to prefetch (header and code).
 pub const Prog = struct { va: u64, registers: u32, bytes: u64 };
@@ -121,6 +158,7 @@ pub const Draw = struct {
     topology: Topology = .triangles,
     count: u32,
     instances: u32 = 1,
+    depth: ?Depth = null,
 };
 
 fn one(p: *Push, m: u32, v: u32) void {
@@ -154,6 +192,18 @@ pub fn emit(p: *Push, d: *const Draw) void {
     one(p, gr.SET_VIEWPORT_Z_CLIP, SET_VIEWPORT_SCALE_Z_CLIP_GL);
     gr.setScissor(p, d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
     one(p, gr.SET_PROVOKING_VERTEX, PROVOKING_LAST);
+    if (d.depth) |z| {
+        many(p, SET_ZT_A, &.{ @truncate(z.va >> 32), @truncate(z.va), ZT_S8Z24, @as(u32, z.gobs_log2) << 4, 0 });
+        many(p, SET_ZT_SIZE_A, &.{ z.width, z.height, 0x1_0001 });
+        one(p, gr.SET_ZT_SELECT, 1);
+        one(p, gr.SET_DEPTH_TEST, @intFromBool(z.tested));
+        one(p, gr.SET_DEPTH_WRITE, @intFromBool(z.write));
+        many(p, gr.SET_DEPTH_FUNC, &.{0x200 + @as(u32, z.func)});
+        if (z.stencil) |s| {
+            one(p, gr.SET_STENCIL_TEST, 1);
+            many(p, SET_STENCIL_OP_FAIL, &.{ @intFromEnum(s.fail), @intFromEnum(s.zfail), @intFromEnum(s.zpass), 0x200 + @as(u32, s.func), s.reference, s.value_mask, s.write_mask });
+        }
+    }
     one(p, gr.SET_PRIMITIVE_TOPOLOGY, @intFromEnum(d.topology));
     // the blend
     if (d.blend) |b| {

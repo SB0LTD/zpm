@@ -509,6 +509,24 @@ pub const Adapter = struct {
             },
             .count = g.count,
             .instances = g.instances,
+            .depth = if (g.depth) |z| .{
+                .va = z.va,
+                .width = z.width,
+                .height = z.height,
+                .gobs_log2 = z.gobs_log2,
+                .tested = z.tested,
+                .write = z.write,
+                .func = z.func,
+                .stencil = if (z.stencil) |zs| .{
+                    .func = zs.func,
+                    .reference = zs.reference,
+                    .value_mask = zs.value_mask,
+                    .write_mask = zs.write_mask,
+                    .fail = stencilOpOf(zs.fail),
+                    .zfail = stencilOpOf(zs.zfail),
+                    .zpass = stencilOpOf(zs.zpass),
+                } else null,
+            } else null,
         };
     }
 
@@ -656,6 +674,19 @@ fn factorOf(f: gpu.BlendFactor) gl3d.Factor {
         .one_minus_constant_color => .one_minus_constant_color,
         .constant_alpha => .constant_alpha,
         .one_minus_constant_alpha => .one_minus_constant_alpha,
+    };
+}
+
+fn stencilOpOf(o: gpu.Graphics.StencilOp) gl3d.StencilOp {
+    return switch (o) {
+        .keep => .keep,
+        .zero => .zero,
+        .replace => .replace,
+        .incr => .incr,
+        .decr => .decr,
+        .invert => .invert,
+        .incr_wrap => .incr_wrap,
+        .decr_wrap => .decr_wrap,
     };
 }
 

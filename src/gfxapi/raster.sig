@@ -78,6 +78,7 @@ const std = @import("std");
 const gpu = @import("gpu");
 const nvidia_gl = gpu.nvidia_gl;
 const engine = @import("engine.sig");
+const blocklinear = @import("blocklinear.sig");
 const texture = @import("texture.sig");
 const kir = gpu.kir;
 const V = kir.V;
@@ -842,7 +843,15 @@ pub const STAGE_PARAMS = VERTEX_PARAMS + 2;
 pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     if (pipelineWhyNot(d.pipe.shaders)) |why| return why;
     if (d.topology != .triangles and d.topology != .strip and d.topology != .fan) return "points or lines";
-    if (d.depth != null or d.depth_test or d.stencil != null) return "a depth or stencil test";
+    if (d.depth) |z| {
+        if (!z.layout.block or z.samples != 1) return "a depth image the 3D engine cannot draw into (not block linear: a depth texture, or multisampled)";
+        if (z.top_down != d.color.top_down) return "a depth image flipped against its colour target";
+        if (z.width < d.color.width or z.height < d.color.height) return "a depth image smaller than its colour target";
+    } else if (d.depth_test) return "a depth test with no depth image";
+    if (d.stencil) |sten| {
+        if (d.depth == null or sten != d.depth.?) return "a stencil image apart from the depth image";
+        if (!std.meta.eql(d.stencil_front, d.stencil_back)) return "two-sided stencil";
+    }
     if (d.cull != 0) return "culling";
     if (d.restart) return "primitive restart";
     if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
@@ -1736,8 +1745,13 @@ const R_S_BACK = 66;
 const R_QUERY = 73; // an occlusion query on: a pixel written sets its word
 const R_SAMPLE_MASK = 74; // multisampled: the samples drawn, alpha to coverage on
 const R_A2C = 75;
+/// the depth image and the stencil image block linear (the 3D engine's
+/// layout: engine.Image.layout): 0 pitch linear, else 1 + log2 of a
+/// block's GOBs (32-bit texels: Turing2D's swizzle)
+const R_D_BL = 76;
+const R_S_BL = 77;
 /// targets 1 .. MAX_TARGETS - 1: each target 0's words (TF) in turn
-const R_TGT = 76;
+const R_TGT = 78;
 const TGT_WORDS = 9;
 pub const RASTER_PARAMS = R_TGT + (MAX_TARGETS - 1) * TGT_WORDS;
 
@@ -1774,6 +1788,20 @@ pub fn stencilKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
 fn rowOf(k: *kir.Kernel, y: V, td: u16, h: u16) V {
     const flipped = k.op2(.isub, .i32, r(k.op2(.isub, .i32, r(k.param(.i32, h)), i(1))), r(y));
     return k.sel(.i32, r(k.cmp(.u32, .ne, r(k.param(.u32, td)), u(0))), r(flipped), r(y));
+}
+
+/// A depth or stencil image's word of pixel (x, y) (GL's row, flipped for
+/// a top-down image), in bytes: pitch linear (`stride` words a row), or
+/// block linear where the `bl` word says (the 3D engine's layout, which a
+/// depth target must have there).
+fn dsOffset(k: *kir.Kernel, y: V, x: V, td: u16, h: u16, stride: u16, bl: u16) V {
+    const row = rowOf(k, y, td, h);
+    const linear = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(row), r(k.param(.u32, stride)), r(x))), u(2));
+    const blw = k.param(.u32, bl);
+    const pitch = k.op2(.shl, .u32, r(k.param(.u32, stride)), u(2));
+    const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(blw), u(1))), u(1));
+    const block = blocklinear.address(k, r(pitch), r(gobs), u(0), r(k.op2(.shl, .u32, r(x), u(2))), r(row));
+    return k.sel(.u32, r(k.cmp(.u32, .ne, r(blw), u(0))), r(block), r(linear));
 }
 
 /// A colour word's channel as 0..1.
@@ -1966,9 +1994,9 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
         c_off[tt] = k.op3(.imad, .u32, r(rowOf(&k, py, tw(tt, .topdown), tw(tt, .height))), r(k.param(.u32, tw(tt, .stride))), r(k.op2(.imul, .u32, r(pxs), r(bpp[tt]))));
     }
     const d_on = k.cmp(.u32, .ne, r(k.param(.u32, R_DEPTH)), u(0));
-    const d_off = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(rowOf(&k, py, R_D_TOPDOWN, R_D_HEIGHT)), r(k.param(.u32, R_D_STRIDE)), r(pxs))), u(2));
+    const d_off = dsOffset(&k, py, pxs, R_D_TOPDOWN, R_D_HEIGHT, R_D_STRIDE, R_D_BL);
     const s_on = if (stencil_enabled) k.cmp(.u32, .ne, r(k.param(.u32, R_STENCIL)), u(0)) else .none;
-    const s_off = if (stencil_enabled) k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(rowOf(&k, py, R_S_TOPDOWN, R_S_HEIGHT)), r(k.param(.u32, R_S_STRIDE)), r(pxs))), u(2)) else .none;
+    const s_off = if (stencil_enabled) dsOffset(&k, py, pxs, R_S_TOPDOWN, R_S_HEIGHT, R_S_STRIDE, R_S_BL) else .none;
     const shared_ds = if (stencil_enabled) k.cmp(.u32, .ne, r(k.param(.u32, R_DS_SHARED)), u(0)) else .none;
     // Multisampled, the samples' words live in shared memory (each
     // thread its own): a slot a target, the depth word, the stencil word,
@@ -2706,6 +2734,11 @@ pub fn vertexParams(d: *const Draw, out: []u32) []u32 {
     return out[0..n];
 }
 
+/// An image's R_D_BL / R_S_BL word.
+pub fn blWord(img: *const engine.Image) u32 {
+    return if (img.layout.block) @as(u32, img.layout.gobs_log2) + 1 else 0;
+}
+
 /// Primitive restart's word (a byte offset after the draw's vertex
 /// records, Draw.restartWord), or RESTART_NONE: strips and fans with an
 /// element array and restart on.
@@ -2774,6 +2807,7 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
         out[R_D_STRIDE] = dp.stride / 4;
         out[R_D_TOPDOWN] = @intFromBool(dp.top_down);
         out[R_D_HEIGHT] = dp.height;
+        out[R_D_BL] = blWord(dp);
     }
     out[R_DFUNC] = d.depth_func;
     out[R_DWRITE] = @intFromBool(d.depth_write);
@@ -2784,6 +2818,7 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
         out[R_S_STRIDE] = stencil.stride / 4;
         out[R_S_TOPDOWN] = @intFromBool(stencil.top_down);
         out[R_S_HEIGHT] = stencil.height;
+        out[R_S_BL] = blWord(stencil);
         out[R_DS_SHARED] = @intFromBool(d.depth == stencil);
         for ([_]Stencil{ d.stencil_front, d.stencil_back }, [_]usize{ R_S_FRONT, R_S_BACK }) |face, start| {
             const words = [_]u32{ face.func, face.reference, face.value_mask, face.write_mask, @backingInt(face.fail), @backingInt(face.depth_fail), @backingInt(face.pass) };

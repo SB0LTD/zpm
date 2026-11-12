@@ -413,7 +413,11 @@ fn fillKernel(s: kir.Storage, masked: bool) kir.Kernel {
     const x = k.op3(.imad, .u32, r(k.gid(0)), u(GROUP), r(k.tid(0)));
     k.ifp(r(k.cmp(.u32, .lt, r(x), r(w))));
     const row = k.op2(.iadd, .u32, r(y0), r(k.gid(1)));
-    const off = k.op3(.imad, .u32, r(row), r(stride), r(k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(x0), r(x))), r(bpp))));
+    const xb = k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(x0), r(x))), r(bpp));
+    // (param 7: block linear, 1 + log2 of a block's GOBs; 0 pitch linear)
+    const bl = k.param(.u32, 7);
+    const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(bl), u(1))), u(1));
+    const off = k.sel(.u32, r(k.cmp(.u32, .ne, r(bl), u(0))), r(blocklinear.address(&k, r(stride), r(gobs), u(0), r(xb), r(row))), r(k.op2(.iadd, .u32, r(k.op2(.imul, .u32, r(row), r(stride))), r(xb))));
     var v = value;
     if (masked) {
         const keep = k.param(.u32, 5);
@@ -843,6 +847,25 @@ fn maskOf(f: Format, keep: u32) u4 {
     return m;
 }
 
+/// A face's stencil state as the GPU is told it.
+fn stencilOf(s: raster.Stencil) gpu.Graphics.Stencil {
+    const op = struct {
+        fn of(x: raster.StencilOp) gpu.Graphics.StencilOp {
+            return switch (x) {
+                .keep => .keep,
+                .zero => .zero,
+                .replace => .replace,
+                .incr => .incr,
+                .decr => .decr,
+                .invert => .invert,
+                .incr_wrap => .incr_wrap,
+                .decr_wrap => .decr_wrap,
+            };
+        }
+    };
+    return .{ .func = s.func, .reference = s.reference, .value_mask = s.value_mask, .write_mask = s.write_mask, .fail = op.of(s.fail), .zfail = op.of(s.depth_fail), .zpass = op.of(s.pass) };
+}
+
 /// GL's blend as the GPU's blender is told it.
 fn blendOf(b: raster.Blend) gpu.GraphicsBlend {
     const eq = struct {
@@ -1185,11 +1208,28 @@ pub const Engine = struct {
     /// A multisampled image (samples 2, 4 or 8; 1: newImage's): a pixel's
     /// samples side by side in its row.
     pub fn newImageSamples(e: *Engine, width: u32, height: u32, format: Format, samples: u8) ?Image {
+        if (samples <= 1 and format == .d24s8 and e.graphics) return e.newDepthImage(width, height);
         if (samples <= 1) return e.newImage(width, height, format);
         var img = e.allocImage(width * samples, height, format, true) orelse return null;
         img.width = width;
         img.samples = samples;
         return img;
+    }
+
+    /// A depth-stencil renderbuffer where the GPU's 3D engine may draw: block
+    /// linear (its depth targets have no pitch-linear form), 32-bit texels
+    /// in Turing2D's swizzle, blocks of up to 16 GOBs; `stride` its pitch
+    /// in bytes (whole GOBs). Both the 3D engine and the compute raster
+    /// (raster.dsOffset) read and write it in place; fills of it go block
+    /// linear too.
+    pub fn newDepthImage(e: *Engine, width: u32, height: u32) ?Image {
+        if (width == 0 or height == 0) return null;
+        const pitch = std.mem.alignForward(u32, width * 4, 64);
+        var gobs: u3 = 0;
+        while (gobs < 4 and (@as(u32, 8) << gobs) < height) gobs += 1;
+        const bytes = blocklinear.planeBytes(pitch, height, gobs);
+        const m = e.allocBytes(@intCast(bytes), true) orelse return null;
+        return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = .{ .block = true, .swizzle = .turing2d, .gobs_log2 = gobs } };
     }
 
     /// Exported images need a whole backing buffer for the dma-buf.
@@ -1255,7 +1295,8 @@ pub const Engine = struct {
     pub fn newImageChain(e: *Engine, width: u32, height: u32, format: Format, levels: u32) ?Image {
         if (width == 0 or height == 0 or levels == 0 or levels > MAX_LEVELS) return null;
         var img = Image{ .width = width, .height = height, .format = format, .levels = @intCast(levels) };
-        img.stride = std.mem.alignForward(u32, width * format.bytes(), 4);
+        // (level 0 rows 128 bytes apart where the 3D engine may draw into it)
+        img.stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.renderable()) 128 else 4);
         var at: usize = 0;
         for (0..levels) |l| {
             img.level_at[l] = @intCast(at);
@@ -1533,6 +1574,8 @@ pub const Engine = struct {
     /// The memory rows of GL rows y0 .. y1 of img (flipped in a top-down
     /// image), whole.
     fn rowsOf(img: *Image, y0: u32, y1: u32) Region {
+        // (block linear: rows are not runs of bytes; the whole image)
+        if (img.layout.block) return .{ .img = img, .off = 0, .len = img.buf.cpu.len, .stride = img.stride };
         const a = img.rowOf(y0);
         const b = img.rowOf(y1 - 1);
         const lo = @min(a, b);
@@ -1981,7 +2024,21 @@ pub const Engine = struct {
         const H: f32 = @floatFromInt(t.height);
         const flip = t.top_down;
         const rc = d.rect;
+        if (d.depth) |z| {
+            if (!e.gpuUsable(z)) return null;
+        }
         const g = gpu.Graphics{
+            .depth = if (d.depth) |z| .{
+                .va = z.buf.gpu,
+                .width = z.width,
+                .height = z.height,
+                .gobs_log2 = z.layout.gobs_log2,
+                .tested = d.depth_test or d.stencil != null,
+                .write = d.depth_test and d.depth_write,
+                // (no depth test: every pixel passes it)
+                .func = if (d.depth_test) d.depth_func else 7,
+                .stencil = if (d.stencil != null) stencilOf(d.stencil_front) else null,
+            } else null,
             .vertex = &p.gfx[0].?,
             .va = t.buf.gpu,
             .width = t.width,
@@ -2006,7 +2063,7 @@ pub const Engine = struct {
             .count = d.count,
             .instances = d.instances,
         };
-        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t);
+        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, d.depth);
         e.stats.graphics_draws += 1;
         if (!e.said_graphics) {
             e.said_graphics = true;
@@ -2031,7 +2088,7 @@ pub const Engine = struct {
     /// A draw through the graphics pipeline in the open batch: the pixel
     /// program as its dispatch's, `g` kept beside it; its bindings read,
     /// the target written.
-    fn recordGraphics(e: *Engine, pixel: *const gpu.Program, g: gpu.Graphics, bufs: []const *Image, params: []const u32, target: *Image) void {
+    fn recordGraphics(e: *Engine, pixel: *const gpu.Program, g: gpu.Graphics, bufs: []const *Image, params: []const u32, target: *Image, depth: ?*Image) void {
         if (e.n_gfx >= e.dev.?.caps.max_graphics) e.flush();
         e.room();
         const i = e.n_ops;
@@ -2041,6 +2098,10 @@ pub const Engine = struct {
         }
         target.trk().last = e.batch;
         target.trk().gpu_wrote = true;
+        if (depth) |z| {
+            z.trk().last = e.batch;
+            z.trk().gpu_wrote = true;
+        }
         @memcpy(e.op_params[i][0..params.len], params);
         e.op_gfx[i] = g;
         e.ops[i] = .{ .prog = pixel, .groups = .{ 1, 1, 1 }, .buffers = e.op_bufs[i][0..bufs.len], .params = e.op_params[i][0..params.len], .graphics = &e.op_gfx[i] };
@@ -2284,6 +2345,11 @@ pub const Engine = struct {
     pub fn blit(e: *Engine, src: *Image, dst: *Image, b: Blit) bool {
         const a = b.rect.meet(dst.bounds());
         if (a.empty()) return true;
+        // (a block-linear depth image: not blitted yet)
+        if (src.layout.block or dst.layout.block) {
+            report.say(.pipeline, "a blit of a block-linear depth image (the 3D engine's): not done", .{});
+            return false;
+        }
         const color = src.format.renderable() and dst.format.renderable();
         const d0: i32 = @intCast(dst.rowOf(a.y0));
         var p: [BLIT_PARAMS]u32 = undefined;
@@ -2375,7 +2441,7 @@ pub const Engine = struct {
         // (memory rows: a top-down image's GL rows are flipped)
         const y0 = if (img.top_down) img.height - a.y1 else a.y0;
         const groups = [3]u32{ std.math.divCeil(u32, a.width(), GROUP) catch unreachable, a.height(), 1 };
-        const p = [_]u32{ a.x0, y0, a.width(), img.stride, value & ~keep, keep, img.format.bytes() };
+        const p = [_]u32{ a.x0, y0, a.width(), img.stride, value & ~keep, keep, img.format.bytes(), raster.blWord(img) };
         const prog: Prog = if (keep == 0) .fill else .fill_masked;
         const regs = [_]Region{rowsOf(img, a.y0, a.y1)};
         const checking = e.checkFirst(prog, @as(u64, a.width()) * a.height(), &regs);
@@ -2584,6 +2650,22 @@ pub const Engine = struct {
             .fill => |*f| {
                 const img = &f.img;
                 const bpp = img.format.bytes();
+                if (img.layout.block) {
+                    // (a block-linear depth image: pixel by pixel; its words
+                    // where the layout puts them)
+                    if (img.gpuWrote()) e.fromDevice(img, 0, img.buf.cpu.len);
+                    var yy = f.rect.y0;
+                    while (yy < f.rect.y1) : (yy += 1) {
+                        var xx = f.rect.x0;
+                        while (xx < f.rect.x1) : (xx += 1) {
+                            const at = blocklinear.addressCpu(img.stride, img.layout.gobs_log2, img.layout.swizzle, xx * 4, img.rowOf(yy));
+                            const w = &img.words()[at / 4];
+                            w.* = (w.* & f.keep) | f.value;
+                        }
+                    }
+                    e.toDevice(img, 0, img.buf.cpu.len);
+                    return;
+                }
                 var y = f.rect.y0;
                 while (y < f.rect.y1) : (y += 1) {
                     const off = @as(usize, img.rowOf(y)) * img.stride + @as(usize, f.rect.x0) * bpp;

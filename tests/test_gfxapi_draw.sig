@@ -1452,6 +1452,24 @@ test "draw: stencil operations on emulated Adreno and RTX with separate and pack
     }
 }
 
+test "draw: stencil operations through the emulated RTX's 3D engine (packed depth-stencil, block linear), separate ones on the compute kernels" {
+    for ([_]bool{ false, true }) |separate| {
+        Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+        Rtx.dev.withEngine(&Rtx3d.engine3d);
+        eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+        defer eng_rtx.deinit();
+        stencilScene(&eng_rtx, separate) catch |e| {
+            std.debug.print("stencil scene (separate {}): {s}; the 3D engine: {s}\n", .{ separate, @errorName(e), Rtx3d.engine3d.why });
+            return e;
+        };
+        try std.testing.expect(eng_rtx.why_pipe == null);
+        try std.testing.expect(!eng_rtx.lost);
+        std.debug.print("stencil scene (separate {}): {d} draws through the 3D engine, {d} on the compute kernels\n", .{ separate, eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws });
+        for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("stencil scene: on the compute kernels: {s}\n", .{w});
+        if (!separate) try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
+    }
+}
+
 test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CPU's bytes" {
     const want = try cpuOut();
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
