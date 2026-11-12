@@ -555,12 +555,17 @@ fn run3d(pipe: *raster.Pipeline, uniforms: []const u32, nslots: usize, seed: u64
     e.read(&color[0], 0, 0, 64, 64, &px3d, 256, .rgba8);
     eng.read(&color[1], 0, 0, 64, 64, &pxcpu, 256, .rgba8);
     var bad: u32 = 0;
+    var first: ?usize = null;
     var i: usize = 0;
     while (i < px3d.len) : (i += 4) {
         var worst: u8 = 0;
         for (0..4) |c| worst = @max(worst, if (px3d[i + c] > pxcpu[i + c]) px3d[i + c] - pxcpu[i + c] else pxcpu[i + c] - px3d[i + c]);
-        if (worst > 2) bad += 1;
+        if (worst > 2) {
+            bad += 1;
+            if (first == null) first = i;
+        }
     }
+    if (first) |at| std.debug.print("3D apart: {s} seed {d}: {d} pixels; the first ({d}, {d}): 3D {any}, CPU {any}\n", .{ name, seed, bad, at / 4 % 64, at / 4 / 64, px3d[at..][0..4], pxcpu[at..][0..4] });
     cmp_runs += 1;
     cmp_px += bad;
     if (bad == 0) cmp_exact += 1 else if (bad <= 64 * 64 / 20) cmp_near += 1;

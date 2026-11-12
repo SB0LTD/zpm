@@ -5,14 +5,18 @@
 //! 1. **vertex** (a thread per vertex of each instance): the attributes
 //!    fetched (any of GL's formats, a constant where an array is off, an
 //!    instance's where the divisor says), the shader's vertex code, then
-//!    clip to window space: the position snapped to 1/16 pixel (GL's 4
-//!    subpixel bits), depth through the depth range, 1/w, the varyings
+//!    clip to window space: the position snapped to 1/256 pixel (the RTX
+//!    3D engine's 8 subpixel bits, rounded to nearest even, y as its
+//!    viewport has it: so a frame whose draws are split between the 3D
+//!    engine and these kernels covers every edge's pixels the same on
+//!    both), depth through the depth range, 1/w, the varyings
 //!    multiplied by 1/w (perspective) or kept (flat).
 //! 2. **setup** (a thread per triangle): the topology's vertices (lists,
 //!    strips, fans; the last vertex provokes), the signed area exact in
 //!    64 bits, culling, the triangle turned counter-clockwise, its pixel
 //!    box, three edge equations in integers with a tie rule (a pixel on
-//!    an edge two triangles share is drawn by exactly one), and plane
+//!    an edge two triangles share is drawn by exactly one: the 3D
+//!    engine's top-left rule, in its rows), and plane
 //!    equations for depth, 1/w and each varying.
 //! 3. **bin** (a group per BIN x BIN pixels, a thread per triangle at a
 //!    time): the triangles whose boxes meet the bin, listed in order; a
@@ -91,8 +95,16 @@ const no = kir.no;
 
 /// Pixels a side of a tile: a group of TILE * TILE threads.
 pub const TILE = 8;
-/// Subpixel steps a pixel (4 bits, GL's SUBPIXEL_BITS).
-pub const SUB = 16;
+/// Subpixel steps a pixel: 8 bits, the RTX 3D engine's grid (emu3d's
+/// model of it), so that a triangle drawn here and its neighbour drawn by
+/// the 3D engine meet without a gap or a pixel drawn twice.
+pub const SUB = 256;
+pub const SUB_SHIFT = 8;
+/// Lines' grid (their diamond-exit rule's, in 32-bit sums): 1/16 pixel.
+const LSUB = 16;
+const LSHIFT = 4;
+/// sample_pos's grid: 1/16 pixel.
+const SPOS = 16;
 /// How far from the origin (pixels) a vertex may lie; past it, its
 /// triangle is dropped (a guard band in place of clipping).
 pub const GUARD: f32 = 24576;
@@ -104,8 +116,10 @@ pub const MAX_UNIFORM_WORDS = 1024;
 /// Buffers a pipeline's shaders may read and write besides the uniform
 /// words (Vulkan's uniform and storage buffers): bound after the textures.
 pub const MAX_BUFFERS = 32;
-/// A tile's edge constants are clamped to +-LIMIT: the 32-bit per-pixel
-/// part then never overflows (fixed coordinates < 2^19, steps < 2^7).
+/// A tile's edge values, in whole pixels' steps (the value over SUB, the
+/// remainder deciding ties alone: tileSteps), are clamped to +-LIMIT: the
+/// 32-bit per-pixel part (an edge's coefficients < 2^24 on the guard
+/// band, steps < TILE) then never overflows.
 const LIMIT: u32 = 1 << 29;
 
 pub const VERTEX_GROUP = 64;
@@ -385,7 +399,7 @@ pub fn tileKey(v: Variant) u32 {
     return 2 << 20 | v.key();
 }
 
-// a vertex's record: x, y (1/16 pixel, i32), depth (window), 1/w (< 0:
+// a vertex's record: x, y (1/SUB pixel, i32), depth (window), 1/w (< 0:
 // the vertex is out), then the varyings, the clip distances (as the
 // varyings: times 1/w) and the point size
 const VREC = 4;
@@ -715,7 +729,12 @@ const V_POINTS = C_BASE + MAX_CAPTURE_BUFFERS;
 /// primitive restart in a strip or fan: the byte of the word after the
 /// records, set where a vertex is the restart index (RESTART_NONE: none)
 const V_FLAG = V_POINTS + 1;
-pub const VERTEX_PARAMS = V_FLAG + 1;
+/// a top-down target's height in 1/SUB pixels, else 0: y is then the 3D
+/// engine's (its viewport's rows run down: V_HY and V_CY are its),
+/// snapped, and mirrored into GL's y on the grid, so both rasterizers
+/// snap a vertex to the same place
+const V_FLIPY = V_FLAG + 1;
+pub const VERTEX_PARAMS = V_FLIPY + 1;
 pub const RESTART_NONE: u32 = 0xffff_ffff;
 /// A restart index's vertex record's x (no vertex snaps there).
 const RESTART_X: u32 = 0x8000_0000;
@@ -773,7 +792,9 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         const xs = k.sel(.f32, r(ok), r(xw), f(0));
         const ys = k.sel(.f32, r(ok), r(yw), f(0));
         const xf = k.cvt(.f32, .i32, .rne, r(k.op2(.fmul, .f32, r(xs), f(SUB))));
-        const yf = k.cvt(.f32, .i32, .rne, r(k.op2(.fmul, .f32, r(ys), f(SUB))));
+        const yh = k.cvt(.f32, .i32, .rne, r(k.op2(.fmul, .f32, r(ys), f(SUB))));
+        const flipy = k.param(.i32, V_FLIPY);
+        const yf = k.sel(.i32, r(k.cmp(.i32, .ne, r(flipy), i(0))), r(k.op2(.isub, .i32, r(flipy), r(yh))), r(yh));
         const rec = k.op3(.imad, .u32, r(inst), r(count), r(x));
         const base = k.op2(.shl, .u32, r(k.op2(.imul, .u32, r(rec), r(k.param(.u32, V_STRIDE)))), u(2));
         // (the restart index's record: marked for the strip's setup, and
@@ -1109,7 +1130,8 @@ const T_RECT = 7; // x0, y0, x1, y1 (exclusive)
 const T_BIAS = 11; // depth bias: factor, units (times 2^-24), clamp
 const T_MS = 14; // multisampled: boxes take every pixel a sample may be in
 const T_FLAG = 15; // primitive restart's word in the vertex records (V_FLAG)
-pub const SETUP_PARAMS = 16;
+const T_FLIPY = 16; // a top-down target: the tie rule's side mirrored
+pub const SETUP_PARAMS = 17;
 
 /// bindings: 0 triangle records (written), 1 vertex records
 pub fn setupKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
@@ -1230,7 +1252,7 @@ pub fn setupKernelFor(s: kir.Storage, p: *const Pipeline, kind: SetupKind) kir.K
             },
             .points => {
                 const a = sv.vertex(t);
-                // the side in 1/16 pixel, halved (rounded: an even side's
+                // the side in 1/SUB pixel, halved (rounded: an even side's
                 // corners on whole pixels' edges)
                 const size = if (p.shaders.point_size) k.load(.f32, memAt(b_v, 4 * p.vSize()), r(a.base)) else k.mov(.f32, f(1));
                 const h = k.cvt(.f32, .i32, .rne, r(k.op2(.fmul, .f32, r(size), f(SUB / 2))));
@@ -1257,7 +1279,7 @@ pub fn setupKernelFor(s: kir.Storage, p: *const Pipeline, kind: SetupKind) kir.K
     return k;
 }
 
-/// A vertex as setup reads it: x, y (1/16 pixel), depth, 1/w, and its
+/// A vertex as setup reads it: x, y (1/SUB pixel), depth, 1/w, and its
 /// record's byte offset (the varyings' place).
 const SVert = struct {
     x: V,
@@ -1266,7 +1288,7 @@ const SVert = struct {
     w: V,
     base: V,
 
-    /// The same vertex moved by (dx, dy) 1/16 pixels (negated: -).
+    /// The same vertex moved by (dx, dy) 1/SUB pixels (negated: -).
     fn moved(a: SVert, k: *kir.Kernel, dx: V, dy: V, neg: bool) SVert {
         const op: kir.Op = if (neg) .isub else .iadd;
         var o = a;
@@ -1276,6 +1298,14 @@ const SVert = struct {
     }
     fn at(a: SVert, k: *kir.Kernel, dx: V, dy: V) SVert {
         return a.moved(k, dx, dy, false);
+    }
+    /// The same vertex on the lines' grid (1/LSUB pixel), rounded.
+    fn onLineGrid(a: SVert, k: *kir.Kernel) SVert {
+        const half: i32 = SUB / LSUB / 2;
+        var o = a;
+        o.x = k.op2(.shr, .i32, r(k.op2(.iadd, .i32, r(a.x), i(half))), u(SUB_SHIFT - LSHIFT));
+        o.y = k.op2(.shr, .i32, r(k.op2(.iadd, .i32, r(a.y), i(half))), u(SUB_SHIFT - LSHIFT));
+        return o;
     }
 };
 
@@ -1323,7 +1353,7 @@ const Corners = struct {
     }
 };
 
-/// A point's sprite: its center (1/16 pixel) and side (pixels), for
+/// A point's sprite: its center (1/SUB pixel) and side (pixels), for
 /// gl_PointCoord's planes.
 const Sprite = struct { x: V, y: V, size: V };
 
@@ -1397,7 +1427,7 @@ fn writeTri(k: *kir.Kernel, p: *const Pipeline, b_out: u8, b_v: u8, rec: V, c_in
     const nhi = k.op2(.isub, .i32, r(k.op2(.isub, .i32, i(0), r(area.hi))), r(k.sel(.u32, r(k.cmp(.u32, .ne, r(area.lo), u(0))), u(1), u(0))));
     const alo = k.sel(.u32, r(neg), r(nlo), r(area.lo));
     const ahi = k.sel(.i32, r(neg), r(nhi), r(area.hi));
-    // the box, in pixels whose centers (x * 16 + 8) it may hold
+    // the box, in pixels whose centers (x * SUB + SUB / 2) it may hold
     const xmin = k.op2(.imin, .i32, r(k.op2(.imin, .i32, r(c.vx[0]), r(c.vx[1]))), r(c.vx[2]));
     const xmax = k.op2(.imax, .i32, r(k.op2(.imax, .i32, r(c.vx[0]), r(c.vx[1]))), r(c.vx[2]));
     const ymin = k.op2(.imin, .i32, r(k.op2(.imin, .i32, r(c.vy[0]), r(c.vy[1]))), r(c.vy[2]));
@@ -1405,25 +1435,30 @@ fn writeTri(k: *kir.Kernel, p: *const Pipeline, b_out: u8, b_v: u8, rec: V, c_in
     // (multisampled: every sample is within half a pixel of its center,
     // so the box is one pixel larger each way; the tile kernel's edge
     // test is exact)
-    const px0 = k.op2(.imax, .i32, r(k.op2(.shr, .i32, r(k.op2(.iadd, .i32, r(xmin), i(7))), u(4))), r(k.param(.i32, T_RECT)));
-    const py0 = k.op2(.imax, .i32, r(k.op2(.shr, .i32, r(k.op2(.iadd, .i32, r(ymin), i(7))), u(4))), r(k.param(.i32, T_RECT + 1)));
-    const px1 = k.op2(.imin, .i32, r(k.op2(.shr, .i32, r(k.op2(.isub, .i32, r(xmax), i(8))), u(4))), r(k.op2(.isub, .i32, r(k.param(.i32, T_RECT + 2)), i(1))));
-    const py1 = k.op2(.imin, .i32, r(k.op2(.shr, .i32, r(k.op2(.isub, .i32, r(ymax), i(8))), u(4))), r(k.op2(.isub, .i32, r(k.param(.i32, T_RECT + 3)), i(1))));
+    const px0 = k.op2(.imax, .i32, r(k.op2(.shr, .i32, r(k.op2(.iadd, .i32, r(xmin), i(SUB / 2 - 1))), u(SUB_SHIFT))), r(k.param(.i32, T_RECT)));
+    const py0 = k.op2(.imax, .i32, r(k.op2(.shr, .i32, r(k.op2(.iadd, .i32, r(ymin), i(SUB / 2 - 1))), u(SUB_SHIFT))), r(k.param(.i32, T_RECT + 1)));
+    const px1 = k.op2(.imin, .i32, r(k.op2(.shr, .i32, r(k.op2(.isub, .i32, r(xmax), i(SUB / 2))), u(SUB_SHIFT))), r(k.op2(.isub, .i32, r(k.param(.i32, T_RECT + 2)), i(1))));
+    const py1 = k.op2(.imin, .i32, r(k.op2(.shr, .i32, r(k.op2(.isub, .i32, r(ymax), i(SUB / 2))), u(SUB_SHIFT))), r(k.op2(.isub, .i32, r(k.param(.i32, T_RECT + 3)), i(1))));
     const ms = k.cmp(.u32, .ne, r(k.param(.u32, T_MS)), u(0));
     const base = k.op2(.shl, .u32, r(k.op2(.imul, .u32, r(rec), r(k.param(.u32, T_SSTRIDE)))), u(2));
     st(k, b_out, base, S_VALID, .u32, r(k.sel(.u32, r(valid), u(1), u(0))));
-    st(k, b_out, base, S_BOX, .i32, r(k.sel(.i32, r(ms), r(k.op2(.imax, .i32, r(k.op2(.shr, .i32, r(xmin), u(4))), r(k.param(.i32, T_RECT)))), r(px0))));
-    st(k, b_out, base, S_BOX + 1, .i32, r(k.sel(.i32, r(ms), r(k.op2(.imax, .i32, r(k.op2(.shr, .i32, r(ymin), u(4))), r(k.param(.i32, T_RECT + 1)))), r(py0))));
-    st(k, b_out, base, S_BOX + 2, .i32, r(k.sel(.i32, r(ms), r(k.op2(.imin, .i32, r(k.op2(.shr, .i32, r(xmax), u(4))), r(k.op2(.isub, .i32, r(k.param(.i32, T_RECT + 2)), i(1))))), r(px1))));
-    st(k, b_out, base, S_BOX + 3, .i32, r(k.sel(.i32, r(ms), r(k.op2(.imin, .i32, r(k.op2(.shr, .i32, r(ymax), u(4))), r(k.op2(.isub, .i32, r(k.param(.i32, T_RECT + 3)), i(1))))), r(py1))));
+    st(k, b_out, base, S_BOX, .i32, r(k.sel(.i32, r(ms), r(k.op2(.imax, .i32, r(k.op2(.shr, .i32, r(xmin), u(SUB_SHIFT))), r(k.param(.i32, T_RECT)))), r(px0))));
+    st(k, b_out, base, S_BOX + 1, .i32, r(k.sel(.i32, r(ms), r(k.op2(.imax, .i32, r(k.op2(.shr, .i32, r(ymin), u(SUB_SHIFT))), r(k.param(.i32, T_RECT + 1)))), r(py0))));
+    st(k, b_out, base, S_BOX + 2, .i32, r(k.sel(.i32, r(ms), r(k.op2(.imin, .i32, r(k.op2(.shr, .i32, r(xmax), u(SUB_SHIFT))), r(k.op2(.isub, .i32, r(k.param(.i32, T_RECT + 2)), i(1))))), r(px1))));
+    st(k, b_out, base, S_BOX + 3, .i32, r(k.sel(.i32, r(ms), r(k.op2(.imin, .i32, r(k.op2(.shr, .i32, r(ymax), u(SUB_SHIFT))), r(k.op2(.isub, .i32, r(k.param(.i32, T_RECT + 3)), i(1))))), r(py1))));
     // the edges a -> b (0 -> 1, 1 -> 2, 2 -> 0): A = ay - by, B = bx - ax;
-    // a pixel on an edge is in when A > 0, or A == 0 and B > 0
+    // a pixel on an edge is in when A > 0, or A == 0 and B > 0: the 3D
+    // engine's top-left rule (emu3d's `inside`) in its rows. A top-down
+    // target's rows run the other way to GL's y here (the vertex kernel
+    // mirrored y): the rule mirrored, B < 0.
+    const flipped = k.cmp(.u32, .ne, r(k.param(.u32, T_FLIPY)), u(0));
     for (0..3) |e| {
         const a = e;
         const b = (e + 1) % 3;
         const A = k.op2(.isub, .i32, r(c.vy[a]), r(c.vy[b]));
         const B = k.op2(.isub, .i32, r(c.vx[b]), r(c.vx[a]));
-        const tie = k.op2(.por, .pred, r(k.cmp(.i32, .gt, r(A), i(0))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(A), i(0))), r(k.cmp(.i32, .gt, r(B), i(0))))));
+        const side = k.sel(.i32, r(flipped), r(k.op2(.isub, .i32, i(0), r(B))), r(B));
+        const tie = k.op2(.por, .pred, r(k.cmp(.i32, .gt, r(A), i(0))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(A), i(0))), r(k.cmp(.i32, .gt, r(side), i(0))))));
         const w0: u32 = @intCast(S_EDGE + 5 * e);
         st(k, b_out, base, w0, .i32, r(A));
         st(k, b_out, base, w0 + 1, .i32, r(B));
@@ -1445,8 +1480,8 @@ fn writeTri(k: *kir.Kernel, p: *const Pipeline, b_out: u8, b_v: u8, rec: V, c_in
     const ey1 = k.op2(.fsub, .f32, r(fy[1]), r(fy[0]));
     const ex2 = k.op2(.fsub, .f32, r(fx[2]), r(fx[0]));
     const ey2 = k.op2(.fsub, .f32, r(fy[2]), r(fy[0]));
-    // the determinant from the exact area (in pixels^2: / 256)
-    const det = k.op2(.fmul, .f32, r(k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(ahi))), f(4294967296.0))), r(k.cvt(.u32, .f32, .rne, r(alo))))), f(1.0 / 256.0));
+    // the determinant from the exact area (in pixels^2: / SUB^2)
+    const det = k.op2(.fmul, .f32, r(k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(ahi))), f(4294967296.0))), r(k.cvt(.u32, .f32, .rne, r(alo))))), f(1.0 / @as(f32, SUB * SUB)));
     const idet = k.div(f(1), r(k.sel(.f32, r(valid), r(det), f(1))));
     const Plane = struct {
         fn slopes(kk: *kir.Kernel, v0: V, v1: V, v2: V, x1: V, y1: V, x2: V, y2: V, id: V) [2]V {
@@ -1537,8 +1572,11 @@ const L_TPOS = S_EDGE + 9;
 /// Line record `rec` from a to b: GL's and Vulkan's diamond-exit rule
 /// (rasterKernelFor's lines): its varyings along it, t the fragment
 /// center's projection (perspective-correct, as GL says).
-fn writeLine(k: *kir.Kernel, p: *const Pipeline, b_out: u8, b_v: u8, rec: V, a: SVert, b: SVert) void {
+fn writeLine(k: *kir.Kernel, p: *const Pipeline, b_out: u8, b_v: u8, rec: V, a_sub: SVert, b_sub: SVert) void {
     const sh = p.shaders;
+    // (the ends on the lines' grid, 1/LSUB pixel: rounded from 1/SUB)
+    const a = a_sub.onLineGrid(k);
+    const b = b_sub.onLineGrid(k);
     var valid = k.op2(.pand, .pred, r(k.cmp(.f32, .gt, r(a.w), f(0))), r(k.cmp(.f32, .gt, r(b.w), f(0))));
     const dx = k.op2(.isub, .i32, r(b.x), r(a.x));
     const dy = k.op2(.isub, .i32, r(b.y), r(a.y));
@@ -1569,12 +1607,12 @@ fn writeLine(k: *kir.Kernel, p: *const Pipeline, b_out: u8, b_v: u8, rec: V, a: 
     st(k, b_out, base, L_TPOS, .u32, r(k.sel(.u32, r(tpos), u(1), u(0))));
     st(k, b_out, base, S_FRONT, .u32, u(1));
     // planes: v0 + (v1 - v0) * t, t = ((X, Y) - a) . d / |d|^2
-    const fx = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(a.x))), f(1.0 / @as(f32, SUB)));
-    const fy = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(a.y))), f(1.0 / @as(f32, SUB)));
+    const fx = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(a.x))), f(1.0 / @as(f32, LSUB)));
+    const fy = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(a.y))), f(1.0 / @as(f32, LSUB)));
     st(k, b_out, base, S_XY, .f32, r(fx));
     st(k, b_out, base, S_XY + 1, .f32, r(fy));
-    const ddx = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(dx))), f(1.0 / @as(f32, SUB)));
-    const ddy = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(dy))), f(1.0 / @as(f32, SUB)));
+    const ddx = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(dx))), f(1.0 / @as(f32, LSUB)));
+    const ddy = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(dy))), f(1.0 / @as(f32, LSUB)));
     const l2 = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(ddx), r(ddx))), r(k.op2(.fmul, .f32, r(ddy), r(ddy))));
     const il2 = k.div(f(1), r(k.sel(.f32, r(valid), r(l2), f(1))));
     const kx = k.op2(.fmul, .f32, r(ddx), r(il2));
@@ -1910,6 +1948,24 @@ fn stencilUpdate(k: *kir.Kernel, front: V, spass: V, dpass: V, stencil: V) void 
 }
 
 /// A primitive record's plane at (dx, dy) from its first corner.
+/// An edge's value `c` at a tile's first pixel (64 bits, on the 1/SUB
+/// grid: c = SUB q + rem, 0 <= rem < SUB) in whole steps: the pixel
+/// (lx, ly) of the tile is in exactly when `.c` + A lx + B ly >= 0. Its
+/// value c + SUB (A lx + B ly) is then > 0, or 0 where the tie rule
+/// (`bias` 0) lets it in: with rem > 0 that is q + s >= 0; with rem 0,
+/// q + s >= 1 (or >= 0 on a tie). Clamped to +-LIMIT; `below`: every
+/// pixel of the tile out.
+fn tileSteps(k: *kir.Kernel, c: W64, bias: V) struct { c: V, below: V } {
+    const q_lo = k.op2(.@"or", .u32, r(k.op2(.shr, .u32, r(c.lo), u(SUB_SHIFT))), r(k.op2(.shl, .u32, r(c.hi), u(32 - SUB_SHIFT))));
+    const q_hi = k.op2(.shr, .i32, r(c.hi), u(SUB_SHIFT));
+    const rem = k.op2(.@"and", .u32, r(c.lo), u(SUB - 1));
+    const strict = k.op2(.pand, .pred, r(k.cmp(.i32, .ne, r(bias), i(0))), r(k.cmp(.u32, .eq, r(rem), u(0))));
+    const above = k.op2(.por, .pred, r(k.cmp(.i32, .gt, r(q_hi), i(0))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(q_hi), i(0))), r(k.cmp(.u32, .gt, r(q_lo), u(LIMIT))))));
+    const below = k.op2(.por, .pred, r(k.cmp(.i32, .lt, r(q_hi), i(-1))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(q_hi), i(-1))), r(k.cmp(.u32, .lt, r(q_lo), u(@as(u32, 0) -% LIMIT))))));
+    const c32 = k.sel(.i32, r(above), u(LIMIT), r(k.sel(.i32, r(below), u(@as(u32, 0) -% LIMIT), r(q_lo))));
+    return .{ .c = k.op2(.isub, .i32, r(c32), r(k.sel(.i32, r(strict), i(1), i(0)))), .below = below };
+}
+
 fn plane(k: *kir.Kernel, b: u8, bs: V, word: u32, dx: V, dy: V) V {
     const a0 = k.load(.f32, memAt(b, word * 4), r(bs));
     const gx = k.load(.f32, memAt(b, (word + 1) * 4), r(bs));
@@ -2115,11 +2171,9 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
     k.set(touched, .mov, u(0), no, no);
     const ntri = k.param(.u32, R_NTRI);
     const sstride = k.param(.u32, R_SSTRIDE);
-    const lx16 = k.op2(.shl, .i32, r(lx), u(4));
-    const ly16 = k.op2(.shl, .i32, r(ly), u(4));
-    // the tile's first pixel center, in 1/16 pixel
-    const tcx = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(tx0), u(4))), i(SUB / 2));
-    const tcy = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(ty0), u(4))), i(SUB / 2));
+    // the tile's first pixel center, in 1/SUB pixel
+    const tcx = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(tx0), u(SUB_SHIFT))), i(SUB / 2));
+    const tcy = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(ty0), u(SUB_SHIFT))), i(SUB / 2));
     const tx1 = k.op2(.iadd, .i32, r(tx0), i(TILE - 1));
     const ty1 = k.op2(.iadd, .i32, r(ty0), i(TILE - 1));
     // The triangles that may reach the tile: its bin's list, or every
@@ -2179,14 +2233,16 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
             var cmask: V = .none;
             var out_tile = k.mov(.pred, u(0));
             if (v.lines) {
-                const cov = lineCover(&k, b_t, base, tcx, tcy, lx16, ly16, px, py);
+                const cov = lineCover(&k, b_t, base, tx0, ty0, lx, ly, px, py);
                 covered = k.op2(.pand, .pred, r(covered), r(cov.covered));
                 out_tile = cov.out_tile;
             } else {
-                // each edge's value at the tile's first center in 64 bits;
-                // a tile wholly outside one edge, the next triangle; else
-                // clamped, and each pixel's in 32 bits (each sample's: the
-                // pixel's and a constant)
+                // each edge's value at the tile's first center in 64 bits
+                // (exact on the 1/SUB grid); a pixel's is it plus SUB
+                // times a 32-bit step, so the whole steps alone (tileSteps)
+                // decide each pixel's side in 32 bits; a tile wholly
+                // outside one edge, the next triangle. Multisampled: each
+                // sample's value at the tile's first pixel, the same way.
                 var scov: [MAX_SAMPLES]V = @splat(inside);
                 for (0..3) |e| {
                     const w0: u32 = @intCast(S_EDGE + 5 * e);
@@ -2196,20 +2252,18 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
                     const ay = ld(&k, b_t, base, w0 + 3, .i32);
                     const bias = ld(&k, b_t, base, w0 + 4, .i32);
                     const c64 = add64(&k, mul64(&k, r(A), r(k.op2(.isub, .i32, r(tcx), r(ax)))), mul64(&k, r(B), r(k.op2(.isub, .i32, r(tcy), r(ay)))));
-                    const above = k.op2(.por, .pred, r(k.cmp(.i32, .gt, r(c64.hi), i(0))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(c64.hi), i(0))), r(k.cmp(.u32, .gt, r(c64.lo), u(LIMIT))))));
-                    const below = k.op2(.por, .pred, r(k.cmp(.i32, .lt, r(c64.hi), i(-1))), r(k.op2(.pand, .pred, r(k.cmp(.i32, .eq, r(c64.hi), i(-1))), r(k.cmp(.u32, .lt, r(c64.lo), u(@as(u32, 0) -% LIMIT))))));
-                    out_tile = k.op2(.por, .pred, r(out_tile), r(below));
-                    const c32 = k.sel(.i32, r(above), u(LIMIT), r(c64.lo));
-                    const ev = k.op2(.iadd, .i32, r(k.op2(.iadd, .i32, r(c32), r(k.op2(.imul, .i32, r(A), r(lx16))))), r(k.op2(.imul, .i32, r(B), r(ly16))));
+                    const ts = tileSteps(&k, c64, bias);
+                    out_tile = k.op2(.por, .pred, r(out_tile), r(ts.below));
+                    const step = k.op2(.iadd, .i32, r(k.op2(.imul, .i32, r(A), r(lx))), r(k.op2(.imul, .i32, r(B), r(ly))));
                     if (!ms) {
-                        covered = k.op2(.pand, .pred, r(covered), r(k.cmp(.i32, .ge, r(k.op2(.iadd, .i32, r(ev), r(bias))), i(0))));
+                        covered = k.op2(.pand, .pred, r(covered), r(k.cmp(.i32, .ge, r(k.op2(.iadd, .i32, r(ts.c), r(step))), i(0))));
                     } else {
-                        const eb = k.op2(.iadd, .i32, r(ev), r(bias));
                         for (0..S) |sm| {
-                            const ox: i32 = @as(i32, spos[sm][0]) - SUB / 2;
-                            const oy: i32 = @as(i32, spos[sm][1]) - SUB / 2;
-                            const at = k.op2(.iadd, .i32, r(k.op2(.iadd, .i32, r(eb), r(k.op2(.imul, .i32, r(A), i(ox))))), r(k.op2(.imul, .i32, r(B), i(oy))));
-                            scov[sm] = k.op2(.pand, .pred, r(scov[sm]), r(k.cmp(.i32, .ge, r(at), i(0))));
+                            const ox = k.mov(.i32, i(@as(i32, spos[sm][0]) * (SUB / SPOS) - SUB / 2));
+                            const oy = k.mov(.i32, i(@as(i32, spos[sm][1]) * (SUB / SPOS) - SUB / 2));
+                            const cs = add64(&k, c64, add64(&k, mul64(&k, r(A), r(ox)), mul64(&k, r(B), r(oy))));
+                            const ss = tileSteps(&k, cs, bias);
+                            scov[sm] = k.op2(.pand, .pred, r(scov[sm]), r(k.cmp(.i32, .ge, r(k.op2(.iadd, .i32, r(ss.c), r(step))), i(0))));
                         }
                     }
                 }
@@ -2310,8 +2364,8 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
                     var shade = k.mov(.pred, u(0));
                     for (0..S) |sm| {
                         const smu: u32 = @intCast(sm);
-                        const ox: f32 = (@as(f32, @floatFromInt(spos[sm][0])) - SUB / 2) / SUB;
-                        const oy: f32 = (@as(f32, @floatFromInt(spos[sm][1])) - SUB / 2) / SUB;
+                        const ox: f32 = (@as(f32, @floatFromInt(spos[sm][0])) - SPOS / 2) / SPOS;
+                        const oy: f32 = (@as(f32, @floatFromInt(spos[sm][1])) - SPOS / 2) / SPOS;
                         const zs = k.op2(.fadd, .f32, r(k.op2(.fadd, .f32, r(z), r(k.op2(.fmul, .f32, r(gzx), f(ox))))), r(k.op2(.fmul, .f32, r(gzy), f(oy))));
                         k.store(.f32, sOff(ms_base, SLOT, zslot, smu), r(lane4), r(zs));
                         var ok = k.op2(.pand, .pred, r(bitOn(&k, cmask, @as(u32, 1) << @intCast(sm))), r(zRange(&k, zs, zmin, zmax, clip_ok)));
@@ -2550,14 +2604,19 @@ fn clamped(k: *kir.Kernel, c: [4]V) [4]V {
 }
 
 /// GL's and Vulkan's diamond-exit rule for the line record at `base`, at
-/// each pixel of the tile (its center in 1/16 pixel): the line crosses
+/// each pixel of the tile (its center in 1/LSUB pixel): the line crosses
 /// the pixel's diamond (|x - cx| + |y - cy| < 1/2, as the square
 /// |u - uc|, |v - vc| < 8 in u = x + y, v = x - y) and does not end in it.
 /// The ends nudged by (d, d'), d >> d' > 0: on the square's edges a
 /// coordinate tie counts the low side in; on its corners, the side of
 /// tpos. Separating axes: u, v, and the line's normal (its function g at
 /// the corners, gC -+ 8 max(|dx|, |dy|)).
-fn lineCover(k: *kir.Kernel, b_t: u8, base: V, tcx: V, tcy: V, lx16: V, ly16: V, px: V, py: V) struct { covered: V, out_tile: V } {
+fn lineCover(k: *kir.Kernel, b_t: u8, base: V, tx0: V, ty0: V, lx: V, ly: V, px: V, py: V) struct { covered: V, out_tile: V } {
+    // (on the lines' grid, 1/LSUB pixel)
+    const lx16 = k.op2(.shl, .i32, r(lx), u(LSHIFT));
+    const ly16 = k.op2(.shl, .i32, r(ly), u(LSHIFT));
+    const tcx = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(tx0), u(LSHIFT))), i(LSUB / 2));
+    const tcy = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(ty0), u(LSHIFT))), i(LSUB / 2));
     const ua = ld(k, b_t, base, L_UA, .i32);
     const va = ld(k, b_t, base, L_VA, .i32);
     const ub = ld(k, b_t, base, L_UB, .i32);
@@ -2579,8 +2638,8 @@ fn lineCover(k: *kir.Kernel, b_t: u8, base: V, tcx: V, tcy: V, lx16: V, ly16: V,
     const lo_ok = k.cmp(.i32, .le, r(k.op2(.iadd, .i32, r(k.op2(.isub, .i32, r(gc), r(m8))), r(one_if_not))), i(0));
     const hi_ok = k.cmp(.i32, .ge, r(k.op2(.iadd, .i32, r(gc), r(m8))), r(k.sel(.i32, r(tpos), i(1), i(0))));
     // the center in u and v
-    const cx = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(px), u(4))), i(SUB / 2));
-    const cy = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(py), u(4))), i(SUB / 2));
+    const cx = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(px), u(LSHIFT))), i(LSUB / 2));
+    const cy = k.op2(.iadd, .i32, r(k.op2(.shl, .i32, r(py), u(LSHIFT))), i(LSUB / 2));
     const uc = k.op2(.iadd, .i32, r(cx), r(cy));
     const vc = k.op2(.isub, .i32, r(cx), r(cy));
     const inRange = struct {
@@ -2706,10 +2765,15 @@ pub fn vertexParams(d: *const Draw, out: []u32) []u32 {
     out[V_FIRST] = if (d.index == null) d.first else 0;
     out[V_INDEX_SIZE] = if (d.index != null) d.index_size else 0;
     out[V_INDEX_OFF] = d.index_offset;
+    // (a top-down target: y as the 3D engine's viewport has it, rows down;
+    // the same words engine.graphicsDraw gives it)
+    const flip = d.color.top_down;
+    const H: f32 = @floatFromInt(d.color.height);
     out[V_CX] = fbits(d.center[0]);
-    out[V_CY] = fbits(d.center[1]);
+    out[V_CY] = fbits(if (flip) H - d.center[1] else d.center[1]);
     out[V_HX] = fbits(d.half[0]);
-    out[V_HY] = fbits(d.half[1]);
+    out[V_HY] = fbits(if (flip) -d.half[1] else d.half[1]);
+    out[V_FLIPY] = if (flip) d.color.height * SUB else 0;
     out[V_ZS] = fbits(d.depth_scale);
     out[V_ZB] = fbits(d.depth_bias);
     out[V_STRIDE] = d.pipe.vstride;
@@ -2757,7 +2821,7 @@ pub fn captureParams(d: *const Draw, bases: [MAX_CAPTURE_BUFFERS]u32, out: []u32
 
 pub fn setupParams(d: *const Draw, out: []u32) []u32 {
     const rect = d.rect;
-    const p = [_]u32{ d.prims(), d.count, @backingInt(d.topology), d.cull, @intFromBool(d.front_ccw), d.pipe.vstride, d.pipe.sstride, rect.x0, rect.y0, rect.x1, rect.y1, fbits(d.bias_factor), fbits(d.bias_units), fbits(d.bias_clamp), @intFromBool(d.samples() > 1), restartFlag(d) };
+    const p = [_]u32{ d.prims(), d.count, @backingInt(d.topology), d.cull, @intFromBool(d.front_ccw), d.pipe.vstride, d.pipe.sstride, rect.x0, rect.y0, rect.x1, rect.y1, fbits(d.bias_factor), fbits(d.bias_units), fbits(d.bias_clamp), @intFromBool(d.samples() > 1), restartFlag(d), @intFromBool(d.color.top_down) };
     comptime std.debug.assert(p.len == SETUP_PARAMS);
     @memcpy(out[0..p.len], &p);
     return out[0..p.len];

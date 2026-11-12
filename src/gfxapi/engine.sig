@@ -1000,6 +1000,9 @@ pub const Engine = struct {
     /// Draws go through the GPU's graphics pipeline where they may
     /// (Config.graphics and Caps.graphics), and what was said of it.
     graphics: bool = false,
+    /// Draws kept on the compute kernels for now (tests: a frame split
+    /// between the two rasterizers on purpose).
+    compute_only: bool = false,
     said_graphics: bool = false,
     said_compute: [8][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
@@ -1983,6 +1986,11 @@ pub const Engine = struct {
     /// (the compute kernels draw it). Said once a reason, per engine.
     fn graphicsDraw(e: *Engine, d: *const raster.Draw) ?bool {
         if (!e.graphics or !e.onGpu()) return null;
+        if (e.compute_only) {
+            e.stats.compute_draws += 1;
+            e.sayCompute("kept there (Engine.compute_only)");
+            return null;
+        }
         if (raster.stageWhyNot(d)) |why| {
             e.stats.compute_draws += 1;
             e.sayCompute(why);
