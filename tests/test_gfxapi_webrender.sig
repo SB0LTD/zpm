@@ -576,6 +576,159 @@ test "webrender: every shader variant compiles and links" {
     try std.testing.expectEqual(@as(usize, 0), st.ran_bad);
 }
 
+// ── Program binaries: WebRender's shader disk cache ────────────────────────
+//
+// Each variant linked as WebRender links it with its cache on (the
+// binary hint, the shaders detached and deleted after the link), its
+// binary got, and taken into a new program as WebRender's next start
+// takes it from disk: the program links, answers every interface query
+// alike, gives back the same binary byte for byte, and its pipeline's
+// draw kernels (vertex and tile, sm_120) are the same code. A damaged
+// copy is refused (not linked, no GL error), so WebRender compiles again.
+
+var bin_buf: [3 << 20]u8 = undefined;
+var bin_again: [3 << 20]u8 = undefined;
+var code_b: [engine.PIPE_CODE]u8 align(16) = undefined;
+
+/// A pipeline stage's sm_120 code (into `out`).
+fn stageCode(pipe: *const raster.Pipeline, st: Stage, out: []u8) ![]const u8 {
+    const storage = kir.Storage{ .insts = &k_insts, .tys = &k_tys };
+    var k = switch (st) {
+        .vertex => raster.vertexKernel(storage, pipe),
+        .setup => raster.setupKernel(storage, pipe),
+        .raster => raster.rasterKernel(storage, pipe),
+    };
+    try k.finish();
+    var w = gpu.Work.init(&work_mem);
+    const bin = try gpu.compile(&k, targets[1].caps, &w, out);
+    return bin.code;
+}
+
+fn iv(c: *gles.Context, p: u32, q: u32) i32 {
+    var x: i32 = 0;
+    program.getProgramiv(c, p, q, &x);
+    return x;
+}
+
+/// One variant through the binary round trip; what went wrong, or null.
+fn binaryRoundTrip(c: *gles.Context, vs: [:0]const u8, fs: [:0]const u8) !?[]const u8 {
+    const sv = program.createShader(c, g.VERTEX_SHADER);
+    const sf = program.createShader(c, g.FRAGMENT_SHADER);
+    for ([_]u32{ sv, sf }, [_][:0]const u8{ vs, fs }) |s, src| {
+        const parts = [_]?[*]const u8{src.ptr};
+        program.shaderSource(c, s, 1, &parts, null);
+        program.compileShader(c, s);
+    }
+    const a = program.createProgram(c);
+    defer program.deleteProgram(c, a);
+    program.attachShader(c, a, sv);
+    program.attachShader(c, a, sf);
+    program.programParameteri(c, a, g.PROGRAM_BINARY_RETRIEVABLE_HINT, 1);
+    program.linkProgram(c, a);
+    program.detachShader(c, a, sv);
+    program.detachShader(c, a, sf);
+    program.deleteShader(c, sv);
+    program.deleteShader(c, sf);
+    if (iv(c, a, g.LINK_STATUS) != 1) return "the link from source failed";
+    const blen = iv(c, a, g.PROGRAM_BINARY_LENGTH);
+    if (blen <= program.progbin.HEADER_BYTES or blen > bin_buf.len) return "PROGRAM_BINARY_LENGTH";
+    var len: i32 = 0;
+    var fmt: u32 = 0;
+    program.getProgramBinary(c, a, bin_buf.len, &len, &fmt, &bin_buf);
+    if (c.getError() != g.NO_ERROR or len != blen or fmt != program.progbin.FORMAT) return "glGetProgramBinary";
+    const bin = bin_buf[0..@intCast(len)];
+    const b = program.createProgram(c);
+    defer program.deleteProgram(c, b);
+    program.programBinary(c, b, fmt, bin.ptr, len);
+    if (c.getError() != g.NO_ERROR) return "glProgramBinary raised an error";
+    if (iv(c, b, g.LINK_STATUS) != 1) return "the binary was refused";
+    // the interface, as every query gives it
+    for ([_]u32{ g.ACTIVE_ATTRIBUTES, g.ACTIVE_UNIFORMS, g.ACTIVE_UNIFORM_BLOCKS, g.ACTIVE_UNIFORM_MAX_LENGTH, g.ACTIVE_ATTRIBUTE_MAX_LENGTH, g.PROGRAM_BINARY_LENGTH }) |q| {
+        if (iv(c, a, q) != iv(c, b, q)) return "a program query differs";
+    }
+    for (0..@intCast(iv(c, a, g.ACTIVE_UNIFORMS))) |i| {
+        var na: [256]u8 = undefined;
+        var nb: [256]u8 = undefined;
+        var la: i32 = 0;
+        var lb: i32 = 0;
+        var sa: i32 = 0;
+        var sb: i32 = 0;
+        var ka: u32 = 0;
+        var kb: u32 = 0;
+        program.getActiveUniform(c, a, @intCast(i), na.len, &la, &sa, &ka, &na);
+        program.getActiveUniform(c, b, @intCast(i), nb.len, &lb, &sb, &kb, &nb);
+        if (!std.mem.eql(u8, na[0..@intCast(la)], nb[0..@intCast(lb)]) or sa != sb or ka != kb) return "an active uniform differs";
+        na[@intCast(la)] = 0;
+        const loc_a = program.getUniformLocation(c, a, @ptrCast(&na));
+        const loc_b = program.getUniformLocation(c, b, @ptrCast(&na));
+        if (loc_a != loc_b) return "a uniform location differs";
+    }
+    for (0..@intCast(iv(c, a, g.ACTIVE_ATTRIBUTES))) |i| {
+        var na: [256]u8 = undefined;
+        var la: i32 = 0;
+        var sa: i32 = 0;
+        var ka: u32 = 0;
+        program.getActiveAttrib(c, a, @intCast(i), na.len, &la, &sa, &ka, &na);
+        na[@intCast(la)] = 0;
+        if (program.getAttribLocation(c, a, @ptrCast(&na)) != program.getAttribLocation(c, b, @ptrCast(&na))) return "an attribute location differs";
+    }
+    // the same binary again
+    var len2: i32 = 0;
+    program.getProgramBinary(c, b, bin_again.len, &len2, &fmt, &bin_again);
+    if (!std.mem.eql(u8, bin, bin_again[0..@intCast(len2)])) return "the binary of the binary differs";
+    // the same draw kernels
+    for ([_]Stage{ .vertex, .raster }) |st| {
+        program.useProgram(c, a);
+        const da = program.drawState(c) orelse return "no pipeline (source)";
+        const code_a = try stageCode(da.pipe, st, &code);
+        program.useProgram(c, b);
+        const db = program.drawState(c) orelse return "no pipeline (binary)";
+        const cb = try stageCode(db.pipe, st, &code_b);
+        program.useProgram(c, 0);
+        if (!std.mem.eql(u8, code_a, cb)) return if (st == .vertex) "the vertex kernel differs" else "the tile kernel differs";
+    }
+    // a damaged copy: refused, without an error, WebRender then compiles again
+    bin[bin.len / 2] ^= 0x01;
+    program.programBinary(c, b, fmt, bin.ptr, len);
+    if (c.getError() != g.NO_ERROR) return "a damaged binary raised an error";
+    if (iv(c, b, g.LINK_STATUS) != 0) return "a damaged binary was taken";
+    return null;
+}
+
+test "webrender: every variant's program binary round-trips (the shader disk cache)" {
+    const io = std.testing.io;
+    var fba = std.heap.FixedBufferAllocator.init(&env_mem);
+    const res = std.testing.environ.getAlloc(fba.allocator(), "GFXAPI_WR_RES") catch |e| {
+        std.debug.print("webrender binaries: GFXAPI_WR_RES: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    var dir = std.Io.Dir.cwd().openDir(io, res, .{}) catch |e| {
+        std.debug.print("webrender binaries: {s}: {s}\n", .{ res, @errorName(e) });
+        return error.SkipZigTest;
+    };
+    defer dir.close(io);
+    eng.init(.{ .pool = &pool_mem, .cpu_work = &cpu_work });
+    defer eng.deinit();
+    objs.init();
+    const c = &ctx;
+    c.init(&eng, &objs);
+    defer c.deinit();
+    const selected = try selectedVariants(io, fba.allocator());
+    var bad: usize = 0;
+    var largest: i32 = 0;
+    for (selected) |v| {
+        const vs = try build(dir, io, v, true, &vs_buf, &builder);
+        const fs = try build(dir, io, v, false, &fs_buf, &builder);
+        if (try binaryRoundTrip(c, vs, fs)) |why| {
+            bad += 1;
+            std.debug.print("BIN  {s} [{s}]: {s}\n", .{ v.name, v.features, why });
+        }
+        largest = @max(largest, @as(i32, @intCast(vs.len + fs.len)));
+    }
+    std.debug.print("webrender binaries: {d} of {d} variants round-trip (largest sources {d} B)\n", .{ selected.len - bad, selected.len, largest });
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
 // ── Prebuilt program sets (Xwayland's glamor) ─────────────────────────────
 //
 // GFXAPI_GLAMOR_SHADERS: a directory of programs as glamor builds them on a

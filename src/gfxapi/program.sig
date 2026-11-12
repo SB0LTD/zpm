@@ -23,6 +23,11 @@
 //! them, from copies of the sources the link kept. The link generates
 //! both once to check them (what cannot be generated fails the link).
 //!
+//! Program binaries (glGetProgramBinary, glProgramBinary: WebRender's
+//! shader disk cache): what a link made, in progbin.sig's format, taken
+//! back as that link; one from another driver build or GPU, or damaged,
+//! is refused (see "Program binaries" below).
+//!
 //! Shaders and programs share one namespace, as GL says; names are the
 //! process's (one table), each object its share group's (another share
 //! group's name is no name). A shader keeps its source and log in a text
@@ -40,6 +45,7 @@ const engine = @import("engine.sig");
 const report = @import("report.sig");
 const raster = @import("raster.sig");
 const texture = @import("texture.sig");
+pub const progbin = @import("progbin.sig");
 pub const glsl = @import("glsl/glsl.sig");
 const kir = gpu.kir;
 const Context = gles.Context;
@@ -877,7 +883,7 @@ pub fn getProgramiv(c: *Context, prog: u32, pname: u32, out: *i32) void {
             break :blk @intCast(m);
         },
         g.PROGRAM_BINARY_RETRIEVABLE_HINT => @intFromBool(p.binary_hint),
-        g.PROGRAM_BINARY_LENGTH => 0,
+        g.PROGRAM_BINARY_LENGTH => if (p.linked) @intCast(binaryLength(p)) else 0,
         else => return c.fail(g.INVALID_ENUM),
     };
 }
@@ -888,6 +894,326 @@ pub fn getProgramInfoLog(c: *Context, prog: u32, buf_size: i32, length: ?*i32, o
     _ = programOf(c, prog) orelse return;
     if (buf_size < 0) return c.fail(g.INVALID_VALUE);
     copyOut(poolText(objs[prog - 1].log), buf_size, length, out);
+}
+
+// ── Program binaries ───────────────────────────────────────────────────────
+//
+// glGetProgramBinary writes what the link made (progbin.sig's format: the
+// interface tables, the pipeline's flags, both stages' kept code) and
+// glProgramBinary takes it back, refusing a binary of another driver
+// build, of another GPU, or a damaged one: then the program is not linked
+// and its log says why (no GL error: GL ES 3.0 lets a binary be refused
+// so, and the app links from source again). A binary taken is a link as
+// the one that wrote it: the same locations, uniforms (their values zero,
+// as after a link), blocks (each at binding 0, as after a link) and
+// transform feedback, without compiling or checking the code again; the
+// draws' kernels are made from the kept code at the first draw, as after
+// a link.
+
+/// The bytes glGetProgramBinary writes for a linked program.
+fn binaryLength(p: *const Program) usize {
+    var w = progbin.Writer.counter();
+    encodeBinary(p, &w);
+    return w.n;
+}
+
+fn gpuIdOf(c: *Context) u64 {
+    return progbin.gpuId(if (c.eng.dev) |d| d.caps else null);
+}
+
+fn putName(w: *progbin.Writer, n: Name) void {
+    w.u_16(n.at);
+    w.u_16(n.len);
+}
+
+fn encodeBinary(p: *const Program, w: *progbin.Writer) void {
+    const l = &p.out;
+    w.begin(progbin.LINK);
+    w.u_32(l.version);
+    w.u_32(@intCast(l.nnames));
+    w.bytes(l.names[0..l.nnames]);
+    w.u_32(@intCast(l.nattribs));
+    for (l.attribs[0..l.nattribs]) |a| {
+        putName(w, a.name);
+        w.u_32(a.ty.bits());
+        w.u_32(a.loc);
+    }
+    w.u_32(@intCast(l.nuniforms));
+    for (l.uniforms[0..l.nuniforms]) |u| {
+        putName(w, u.name);
+        w.u_32(u.ty.bits());
+        w.u_32(u.loc);
+        w.u_32(u.word);
+        w.u_8(u.stages);
+        putName(w, u.api);
+        w.u_16(@bitCast(u.block));
+        w.u_32(u.offset);
+        w.u_32(u.array_stride);
+        w.u_32(u.matrix_stride);
+        w.flag(u.row_major);
+    }
+    w.u_32(@intCast(l.nlocs));
+    for (l.locs[0..l.nlocs]) |x| w.u_16(x);
+    w.u_32(@intCast(l.nvaryings));
+    for (l.varyings[0..l.nvaryings]) |v| {
+        putName(w, v.name);
+        w.u_32(v.ty.bits());
+        w.flag(v.flat);
+        w.u_32(v.word);
+    }
+    w.u_32(l.vary_words);
+    w.u_32(@intCast(l.noutputs));
+    for (l.outputs[0..l.noutputs]) |o| {
+        putName(w, o.name);
+        w.u_32(o.ty.bits());
+        w.u_32(o.loc);
+    }
+    w.flag(l.frag_color);
+    w.flag(l.frag_data);
+    w.u_32(l.nwords);
+    w.u_32(@intCast(l.nslots));
+    for (l.slots[0..l.nslots]) |sl| {
+        w.u_32(sl.word);
+        var bits: u8 = 0;
+        for ([_]bool{ sl.external, sl.array, sl.volume, sl.cube, sl.shadow, sl.unsupported }, 0..) |b, i| bits |= @as(u8, @intFromBool(b)) << @intCast(i);
+        w.u_8(bits);
+        w.u_8(@intCast(@backingInt(sl.kind)));
+    }
+    w.u_32(@intCast(l.nblocks));
+    for (l.blocks[0..l.nblocks]) |b| {
+        putName(w, b.name);
+        w.u_32(b.size);
+        w.u_8(b.stages);
+        w.u_32(b.members);
+    }
+    w.u_32(@intCast(l.naliases));
+    for (l.aliases[0..l.naliases]) |a| {
+        putName(w, a.name);
+        w.u_32(a.word);
+    }
+    w.u_32(@intCast(l.nxfb));
+    for (l.xfb[0..l.nxfb]) |x| {
+        putName(w, x.name);
+        w.u_32(x.ty.bits());
+        w.u_8(x.buffer);
+        w.u_32(x.word);
+    }
+    w.u_32(@intCast(l.ncapture));
+    for (l.capture[0..l.ncapture]) |cp| {
+        w.flag(cp.position);
+        w.u_8(cp.src);
+        w.u_8(cp.buffer);
+        w.u_16(cp.word);
+    }
+    for (l.xfb_stride) |x| w.u_32(x);
+    w.u_32(l.xfb_mode);
+    w.end();
+    const sh = &p.pipe.shaders;
+    w.begin(progbin.PIPE);
+    w.flag(sh.quads);
+    w.flag(sh.point_size);
+    w.flag(sh.point_coord);
+    w.flag(sh.frag_depth);
+    w.end();
+    w.begin(progbin.VSRC);
+    w.bytes(poolText(p.vs_src));
+    w.end();
+    w.begin(progbin.FSRC);
+    w.bytes(poolText(p.fs_src));
+    w.end();
+}
+
+/// A name read back: inside the names read.
+fn getName(r: *progbin.Reader, nnames: usize) Name {
+    const n = Name{ .at = r.u_16(), .len = r.u_16() };
+    if (@as(usize, n.at) + n.len > nnames) r.bad = true;
+    return n;
+}
+
+/// A type read back: one of GLSL's bases.
+fn getType(r: *progbin.Reader) Type {
+    const bits = r.u_32();
+    if (bits & 0x1f > @backingInt(glsl.Base.err)) {
+        r.bad = true;
+        return .{};
+    }
+    return Type.of(bits);
+}
+
+fn elemsOf(t: Type) u32 {
+    return if (t.array != 0) t.array else 1;
+}
+
+/// The LINK section into the program's tables, each count and index
+/// checked against them (what a draw or a query indexes stays inside).
+fn decodeLinked(l: *Linked, r: *progbin.Reader) bool {
+    l.version = r.u_32();
+    if (l.version != 100 and l.version != 300) return false;
+    l.nnames = r.count(PROGRAM_NAMES);
+    const names = r.bytes(l.nnames);
+    if (r.bad) return false;
+    @memcpy(l.names[0..l.nnames], names);
+    const nn = l.nnames;
+    l.nattribs = r.count(MAX_ATTRIBS);
+    for (l.attribs[0..l.nattribs]) |*a| {
+        a.* = .{ .name = getName(r, nn), .ty = getType(r), .loc = r.u_32() };
+        if (r.bad or a.loc + slotsOf(a.ty) > MAX_ATTRIBS) return false;
+    }
+    l.nuniforms = r.count(MAX_UNIFORMS);
+    for (l.uniforms[0..l.nuniforms]) |*u| {
+        u.* = .{ .name = getName(r, nn), .ty = getType(r), .loc = r.u_32(), .word = r.u_32(), .stages = r.u_8() };
+        u.api = getName(r, nn);
+        u.block = @bitCast(r.u_16());
+        u.offset = r.u_32();
+        u.array_stride = r.u_32();
+        u.matrix_stride = r.u_32();
+        u.row_major = r.flag();
+    }
+    l.nlocs = r.count(MAX_LOCATIONS);
+    for (l.locs[0..l.nlocs]) |*x| {
+        x.* = r.u_16();
+        if (x.* >= l.nuniforms) return false;
+    }
+    l.nvaryings = r.count(MAX_VARYINGS);
+    for (l.varyings[0..l.nvaryings]) |*v| {
+        v.* = .{ .name = getName(r, nn), .ty = getType(r), .flat = r.flag(), .word = r.u_32() };
+    }
+    l.vary_words = r.u_32();
+    if (r.bad or l.vary_words > raster.MAX_VARYINGS) return false;
+    for (l.varyings[0..l.nvaryings]) |v| {
+        if (v.word + wordsOf(v.ty) > l.vary_words) return false;
+    }
+    l.noutputs = r.count(MAX_OUTPUTS);
+    for (l.outputs[0..l.noutputs]) |*o| {
+        o.* = .{ .name = getName(r, nn), .ty = getType(r), .loc = r.u_32() };
+        if (r.bad or o.loc + elemsOf(o.ty) > MAX_OUTPUTS) return false;
+    }
+    l.frag_color = r.flag();
+    l.frag_data = r.flag();
+    l.nwords = r.u_32();
+    if (r.bad or l.nwords > UNIFORM_WORDS) return false;
+    l.nslots = r.count(texture.MAX_TEX);
+    for (l.slots[0..l.nslots]) |*sl| {
+        const word = r.u_32();
+        const bits = r.u_8();
+        const kind = r.u_8();
+        if (r.bad or word >= l.nwords or bits >= 1 << 6 or kind > @backingInt(texture.Kind.uint)) return false;
+        sl.* = .{ .word = word, .external = bits & 1 != 0, .array = bits & 2 != 0, .volume = bits & 4 != 0, .cube = bits & 8 != 0, .shadow = bits & 16 != 0, .unsupported = bits & 32 != 0, .kind = @fromBackingInt(@intCast(kind)) };
+    }
+    l.nblocks = r.count(MAX_BLOCKS);
+    for (l.blocks[0..l.nblocks]) |*b| {
+        b.* = .{ .name = getName(r, nn), .size = r.u_32(), .stages = r.u_8(), .members = r.u_32() };
+        if (r.bad or b.size > MAX_UNIFORM_BLOCK_SIZE) return false;
+    }
+    // (the uniforms, now their blocks and words are known)
+    for (l.uniforms[0..l.nuniforms]) |u| {
+        if (u.word + wordsOf(u.ty) > l.nwords) return false;
+        if (u.block >= 0) {
+            if (u.block >= l.nblocks) return false;
+        } else if (u.block != -1 or u.loc + elemsOf(u.ty) > l.nlocs) return false;
+    }
+    l.naliases = r.count(MAX_ALIASES);
+    for (l.aliases[0..l.naliases]) |*a| {
+        a.* = .{ .name = getName(r, nn), .word = r.u_32() };
+        if (a.word >= l.nwords) return false;
+    }
+    l.nxfb = r.count(MAX_XFB);
+    for (l.xfb[0..l.nxfb]) |*x| {
+        x.* = .{ .name = getName(r, nn), .ty = getType(r), .buffer = r.u_8(), .word = r.u_32() };
+        if (r.bad or x.buffer >= raster.MAX_CAPTURE_BUFFERS) return false;
+    }
+    l.ncapture = r.count(l.capture.len);
+    for (l.capture[0..l.ncapture]) |*cp| {
+        cp.* = .{ .position = r.flag(), .src = r.u_8(), .buffer = r.u_8(), .word = r.u_16() };
+        if (r.bad or cp.buffer >= raster.MAX_CAPTURE_BUFFERS or cp.word >= MAX_XFB_COMPONENTS) return false;
+        if (if (cp.position) cp.src >= 4 else cp.src >= l.vary_words) return false;
+    }
+    for (&l.xfb_stride) |*x| {
+        x.* = r.u_32();
+        if (x.* > MAX_XFB_COMPONENTS) return false;
+    }
+    l.xfb_mode = r.u_32();
+    if (l.xfb_mode != g.INTERLEAVED_ATTRIBS and l.xfb_mode != g.SEPARATE_ATTRIBS) return false;
+    // (the values: zero, as after a link)
+    @memset(l.values[0..l.nwords], 0);
+    return r.done();
+}
+
+/// A binary's program into `p` (its tables, pipeline and kept code), or
+/// why not. The header is checked before anything is read.
+fn decodeBinary(c: *Context, p: *Program, bin: []const u8) ?progbin.Refusal {
+    if (progbin.check(bin, gpuIdOf(c))) |why| return why;
+    var r = progbin.Reader.of(bin);
+    var link_s = r.section(progbin.LINK);
+    if (!decodeLinked(&p.out, &link_s)) return .malformed;
+    var pipe_s = r.section(progbin.PIPE);
+    const f = PipeFlags{ .quads = pipe_s.flag(), .point_size = pipe_s.flag(), .point_coord = pipe_s.flag(), .frag_depth = pipe_s.flag() };
+    if (!pipe_s.done()) return .malformed;
+    var vs_s = r.section(progbin.VSRC);
+    const vs = vs_s.bytes(vs_s.b.len);
+    var fs_s = r.section(progbin.FSRC);
+    const fs = fs_s.bytes(fs_s.b.len);
+    if (!r.done() or vs.len == 0 or fs.len == 0) return .malformed;
+    if (vs.len > glsl.MAX_SOURCE or fs.len > glsl.MAX_SOURCE) return .too_large;
+    p.vs_src = poolKeep(vs) orelse return .too_large;
+    p.fs_src = poolKeep(fs) orelse return .too_large;
+    makePipe(p, f);
+    return null;
+}
+
+/// glGetProgramBinary: the linked program's binary into `out` (bufSize at
+/// least PROGRAM_BINARY_LENGTH), its format progbin.FORMAT.
+pub fn getProgramBinary(c: *Context, prog: u32, buf_size: i32, length: ?*i32, format: ?*u32, out: ?[*]u8) void {
+    start();
+    defer unlock();
+    if (length) |x| x.* = 0;
+    const p = programOf(c, prog) orelse return;
+    if (buf_size < 0) return c.fail(g.INVALID_VALUE);
+    if (!p.linked) return c.fail(g.INVALID_OPERATION);
+    const n = binaryLength(p);
+    if (@as(usize, @intCast(buf_size)) < n) return c.fail(g.INVALID_OPERATION);
+    const buf = out orelse return c.fail(g.INVALID_OPERATION);
+    var w = progbin.Writer.into(buf[0..n]);
+    encodeBinary(p, &w);
+    const bin = w.finish(gpuIdOf(c)) orelse return c.fail(g.INVALID_OPERATION);
+    if (length) |x| x.* = @intCast(bin.len);
+    if (format) |x| x.* = progbin.FORMAT;
+}
+
+/// glProgramBinary: a binary glGetProgramBinary wrote, taken as a link,
+/// or refused (the program then not linked, its log saying why).
+pub fn programBinary(c: *Context, prog: u32, format: u32, binary: ?[*]const u8, length: i32) void {
+    start();
+    defer unlock();
+    const p = programOf(c, prog) orelse return;
+    if (format != progbin.FORMAT) return c.fail(g.INVALID_ENUM);
+    if (length < 0 or (length > 0 and binary == null)) return c.fail(g.INVALID_VALUE);
+    if (c.feedbackOf()) |t| {
+        if (t.active and t.program == prog) return c.fail(g.INVALID_OPERATION);
+    }
+    const o = &objs[prog - 1];
+    p.unloadPipe();
+    p.vs_src = .{};
+    p.fs_src = .{};
+    p.linked = false;
+    p.validated = false;
+    const bin: []const u8 = if (length == 0) &.{} else binary.?[0..@intCast(length)];
+    if (decodeBinary(c, p, bin)) |why| {
+        // (whatever was read goes: the program is not linked)
+        p.vs_src = .{};
+        p.fs_src = .{};
+        p.has_pipe = false;
+        report.say(.link, "a program binary was refused: {s}", .{why.text()});
+        var buf: [160]u8 = undefined;
+        setLog(o, std.fmt.bufPrint(&buf, "0:0: error: {s}\n", .{why.text()}) catch why.text());
+        return;
+    }
+    p.linked = true;
+    p.eng = c.eng;
+    var whose: report.Whose = .{};
+    for (p.out.uniforms[0..p.out.nuniforms]) |u| whose.see(p.out.name(u.name));
+    c.usage.linked(whose);
+    setLog(o, "");
 }
 
 // ── The link ───────────────────────────────────────────────────────────────
@@ -958,6 +1284,18 @@ fn link(p: *Program, log: *glsl.pp.Log) bool {
     p.fs_src = poolDup(&objs[p.fs - 1].source) orelse return outOfPool(log);
     var quads = false;
     if (!checkCode(p, log, &quads)) return false;
+    makePipe(p, .{ .quads = quads, .point_size = vs.point_size, .point_coord = fs.point_coord, .frag_depth = fs.frag_depth });
+    return true;
+}
+
+/// What the pipeline takes from the shaders' code rather than from the
+/// interface: a program binary keeps these too.
+const PipeFlags = struct { quads: bool = false, point_size: bool = false, point_coord: bool = false, frag_depth: bool = false };
+
+/// The linked program's pipeline (its draws' kernels come from the kept
+/// sources when the engine builds them).
+fn makePipe(p: *Program, f: PipeFlags) void {
+    const l = &p.out;
     var attrs: u32 = 0;
     for (l.attribs[0..l.nattribs]) |a| attrs = @max(attrs, a.loc + slotsOf(a.ty));
     var flat: u64 = 0;
@@ -965,9 +1303,8 @@ fn link(p: *Program, log: *glsl.pp.Log) bool {
         if (!v.flat) continue;
         for (0..wordsOf(v.ty)) |w| flat |= @as(u64, 1) << @intCast(v.word + w);
     }
-    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .textures = @intCast(l.nslots), .quads = quads, .capture = l.capture[0..l.ncapture], .capture_stride = l.xfb_stride, .point_size = vs.point_size, .point_coord = fs.point_coord, .frag_depth = fs.frag_depth, .vertex = emitVertex, .fragment = emitFragment });
+    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .textures = @intCast(l.nslots), .quads = f.quads, .capture = l.capture[0..l.ncapture], .capture_stride = l.xfb_stride, .point_size = f.point_size, .point_coord = f.point_coord, .frag_depth = f.frag_depth, .vertex = emitVertex, .fragment = emitFragment });
     p.has_pipe = true;
-    return true;
 }
 
 fn outOfPool(log: *glsl.pp.Log) bool {

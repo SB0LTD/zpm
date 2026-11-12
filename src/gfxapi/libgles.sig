@@ -1683,16 +1683,19 @@ pub export fn glGetProgramInfoLog(prog: u32, buf_size: i32, length: ?*i32, log: 
 pub export fn glGetProgramBinary(prog: u32, buf_size: i32, length: ?*i32, format: ?*u32, binary: ?*anyopaque) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    _ = .{ prog, buf_size, format, binary };
-    if (length) |l| l.* = 0;
-    // (no binary formats)
-    if (cur()) |c| c.fail(g.INVALID_OPERATION);
+    if (cur()) |c| program.getProgramBinary(c, prog, buf_size, length, format, @ptrCast(binary));
 }
 pub export fn glProgramBinary(prog: u32, format: u32, binary: ?*const anyopaque, length: i32) callconv(.c) void {
     driverEnter();
     defer driverLeave();
-    _ = .{ prog, format, binary, length };
-    if (cur()) |c| c.fail(g.INVALID_ENUM);
+    if (cur()) |c| program.programBinary(c, prog, format, @ptrCast(binary), length);
+}
+// (OES_get_program_binary's names for the same calls)
+pub export fn glGetProgramBinaryOES(prog: u32, buf_size: i32, length: ?*i32, format: ?*u32, binary: ?*anyopaque) callconv(.c) void {
+    glGetProgramBinary(prog, buf_size, length, format, binary);
+}
+pub export fn glProgramBinaryOES(prog: u32, format: u32, binary: ?*const anyopaque, length: i32) callconv(.c) void {
+    glProgramBinary(prog, format, binary, length);
 }
 pub export fn glBindAttribLocation(prog: u32, index: u32, name: [*:0]const u8) callconv(.c) void {
     driverEnter();
@@ -3018,4 +3021,256 @@ test "libgles: timer query lifecycle, 64-bit timestamp and elapsed results" {
     glDeleteQueriesEXT(2, &ids);
     try std.testing.expectEqual(@as(u8, 0), glIsQueryEXT(ids[0]));
     try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+// ── Program binaries (WebRender's shader disk cache) ───────────────────────
+
+var bin_a: [16384]u8 = undefined;
+var bin_b: [16384]u8 = undefined;
+var bin_bad: [16384]u8 = undefined;
+
+/// The 8 x 8 window drawn with `p` (the quad, its colours and uniforms),
+/// read back.
+fn binaryScene(p: u32, out: *[8 * 8 * 4]u8) !void {
+    glUseProgram(p);
+    glUniform2f(glGetUniformLocation(p, "uOffset"), 0.25, 0);
+    const tints = [_]f32{ 1, 0.5, 0.25, 1, 0.25, 1, 0.5, 1 };
+    glUniform4fv(glGetUniformLocation(p, "uTint"), 2, &tints);
+    glUniform1i(glGetUniformLocation(p, "uTex"), 0);
+    glClearColor(0, 0, 0, 0);
+    glClear(g.COLOR_BUFFER_BIT);
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    glReadPixels(0, 0, 8, 8, g.RGBA, g.UNSIGNED_BYTE, out);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+/// A binary glProgramBinary refuses: no GL error, the program not linked
+/// (not usable), its log saying `why`.
+fn binaryRefused(p: u32, bin: []const u8, why: []const u8) !void {
+    glProgramBinary(p, program.progbin.FORMAT, @ptrCast(bin.ptr), @intCast(bin.len));
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    var n: i32 = 0;
+    glGetProgramiv(p, g.LINK_STATUS, @ptrCast(&n));
+    try std.testing.expectEqual(@as(i32, 0), n);
+    glGetProgramiv(p, g.PROGRAM_BINARY_LENGTH, @ptrCast(&n));
+    try std.testing.expectEqual(@as(i32, 0), n);
+    var log: [256]u8 = undefined;
+    var len: i32 = 0;
+    glGetProgramInfoLog(p, log.len, &len, &log);
+    if (std.mem.indexOf(u8, log[0..@intCast(len)], why) == null) {
+        std.debug.print("refused binary: want `{s}`, log `{s}`\n", .{ why, log[0..@intCast(len)] });
+        return error.TestUnexpectedResult;
+    }
+    glUseProgram(p);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+}
+
+/// A copy of the binary `src`, its `bytes` bytes at `at` set to `value`,
+/// its checksum made good again (what is tested is the field, not the
+/// checksum).
+fn binaryEdited(src: []const u8, at: usize, value: u64, bytes: usize) []u8 {
+    const x = bin_bad[0..src.len];
+    @memcpy(x, src);
+    switch (bytes) {
+        4 => std.mem.writeInt(u32, x[at..][0..4], @intCast(value), .little),
+        8 => std.mem.writeInt(u64, x[at..][0..8], value, .little),
+        else => unreachable,
+    }
+    std.mem.writeInt(u64, x[40..48], program.progbin.checksum(x), .little);
+    return x;
+}
+
+test "libgles: program binaries: a round trip draws alike; damage, another build or GPU refused" {
+    t_eng.init(.{ .pool = &border_pool, .cpu_work = &border_work });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    var win = t_eng.newImage(8, 8, .rgba8).?;
+    defer t_eng.freeImage(&win);
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    t_ctx.setSurface(&win, &win, null);
+    const E = std.testing.expectEqual;
+    const pb = program.progbin;
+    // the queries: one format, the driver's; the extension and its names
+    var n: i32 = 0;
+    glGetIntegerv(g.NUM_PROGRAM_BINARY_FORMATS, @ptrCast(&n));
+    try E(@as(i32, 1), n);
+    glGetIntegerv(g.PROGRAM_BINARY_FORMATS, @ptrCast(&n));
+    try E(@as(i32, @intCast(pb.FORMAT)), n);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(glGetString(g.EXTENSIONS).?), "GL_OES_get_program_binary") != null);
+    try E(@as(?*const anyopaque, @ptrCast(&glProgramBinaryOES)), getProcAddress("glProgramBinaryOES"));
+    try E(@as(?*const anyopaque, @ptrCast(&glGetProgramBinaryOES)), getProcAddress("glGetProgramBinaryOES"));
+    try E(@as(?*const anyopaque, @ptrCast(&glProgramBinary)), getProcAddress("glProgramBinary"));
+
+    // what the scene draws: a quad, colour per vertex, a flat varying,
+    // a uniform array, a sampler
+    var vao: [1]u32 = undefined;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao[0]);
+    var buf: [1]u32 = undefined;
+    glGenBuffers(1, &buf);
+    glBindBuffer(g.ARRAY_BUFFER, buf[0]);
+    const V = extern struct { x: f32, y: f32, r: f32, g: f32, b: f32, a: f32 };
+    const quad = [_]V{
+        .{ .x = 0, .y = 0, .r = 1, .g = 0, .b = 0, .a = 1 },  .{ .x = 1, .y = 0, .r = 0, .g = 1, .b = 0, .a = 1 },
+        .{ .x = 1, .y = 1, .r = 0, .g = 0, .b = 1, .a = 1 },  .{ .x = 0, .y = 0, .r = 1, .g = 0, .b = 0, .a = 1 },
+        .{ .x = 1, .y = 1, .r = 0, .g = 0, .b = 1, .a = 1 },  .{ .x = 0, .y = 1, .r = 1, .g = 1, .b = 1, .a = 0.5 },
+    };
+    glBufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, g.STATIC_DRAW);
+    glVertexAttribPointer(0, 2, g.FLOAT, 0, @sizeOf(V), null);
+    glVertexAttribPointer(3, 4, g.FLOAT, 0, @sizeOf(V), @ptrFromInt(8));
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(3);
+    var tex: [1]u32 = undefined;
+    glGenTextures(1, &tex);
+    glBindTexture(g.TEXTURE_2D, tex[0]);
+    const texel = [_]u8{ 64, 128, 255, 255 };
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA), 1, 1, 0, g.RGBA, g.UNSIGNED_BYTE, &texel);
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, @intCast(g.NEAREST));
+
+    // linked from source, as WebRender links: the hint, the attribute
+    // bound, the shaders detached and deleted after the link
+    const vs = newShader(g.VERTEX_SHADER,
+        \\#version 300 es
+        \\in vec2 aPos;
+        \\in vec4 aColor;
+        \\uniform vec2 uOffset;
+        \\out vec4 vColor;
+        \\flat out int vSel;
+        \\void main() {
+        \\    vColor = aColor;
+        \\    vSel = aPos.x > 0.5 ? 1 : 0;
+        \\    gl_Position = vec4(aPos * 2.0 - 1.0 + uOffset, 0.0, 1.0);
+        \\}
+    );
+    const fs = newShader(g.FRAGMENT_SHADER,
+        \\#version 300 es
+        \\precision mediump float;
+        \\uniform vec4 uTint[2];
+        \\uniform sampler2D uTex;
+        \\in vec4 vColor;
+        \\flat in int vSel;
+        \\out vec4 o;
+        \\void main() { o = vColor * uTint[vSel] + texture(uTex, vec2(0.5)) * 0.25; }
+    );
+    try shaderOk(vs);
+    try shaderOk(fs);
+    const a = glCreateProgram();
+    glAttachShader(a, vs);
+    glAttachShader(a, fs);
+    glBindAttribLocation(a, 3, "aColor");
+    glProgramParameteri(a, g.PROGRAM_BINARY_RETRIEVABLE_HINT, 1);
+    glGetProgramiv(a, g.PROGRAM_BINARY_RETRIEVABLE_HINT, @ptrCast(&n));
+    try E(@as(i32, 1), n);
+    // (no binary before the link)
+    glGetProgramiv(a, g.PROGRAM_BINARY_LENGTH, @ptrCast(&n));
+    try E(@as(i32, 0), n);
+    var len: i32 = -1;
+    var fmt: u32 = 0;
+    glGetProgramBinary(a, bin_a.len, &len, &fmt, &bin_a);
+    try E(g.INVALID_OPERATION, glGetError());
+    try E(@as(i32, 0), len);
+    glLinkProgram(a);
+    try linkOk(a);
+    glDetachShader(a, vs);
+    glDetachShader(a, fs);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    var blen: i32 = 0;
+    glGetProgramiv(a, g.PROGRAM_BINARY_LENGTH, @ptrCast(&blen));
+    try std.testing.expect(blen > pb.HEADER_BYTES and blen <= bin_a.len);
+    // (a buffer one byte short: no binary)
+    glGetProgramBinary(a, blen - 1, &len, &fmt, &bin_a);
+    try E(g.INVALID_OPERATION, glGetError());
+    glGetProgramBinary(a, -1, &len, &fmt, &bin_a);
+    try E(g.INVALID_VALUE, glGetError());
+    glGetProgramBinaryOES(a, bin_a.len, &len, &fmt, &bin_a);
+    try E(g.NO_ERROR, glGetError());
+    try E(blen, len);
+    try E(pb.FORMAT, fmt);
+    const bin = bin_a[0..@intCast(len)];
+    try std.testing.expectEqualStrings("GXPRGBIN", bin[0..8]);
+    try std.testing.expect(pb.check(bin, pb.gpuId(null)) == null);
+    var px_a: [8 * 8 * 4]u8 = undefined;
+    try binaryScene(a, &px_a);
+    // (it drew: the quad's colours, not the clear)
+    var lit: usize = 0;
+    for (0..64) |i| lit += @intFromBool(px_a[i * 4 + 3] != 0);
+    try std.testing.expect(lit > 32);
+
+    // the binary in a new program: linked, the same interface, the same
+    // pixels, the same binary again
+    const prog_b = glCreateProgram();
+    glProgramBinary(prog_b, fmt, @ptrCast(bin.ptr), len);
+    try E(g.NO_ERROR, glGetError());
+    try linkOk(prog_b);
+    glGetProgramiv(prog_b, g.ATTACHED_SHADERS, @ptrCast(&n));
+    try E(@as(i32, 0), n);
+    for ([_][*:0]const u8{ "aPos", "aColor" }) |nm| try E(glGetAttribLocation(a, nm), glGetAttribLocation(prog_b, nm));
+    try E(@as(i32, 3), glGetAttribLocation(prog_b, "aColor"));
+    for ([_][*:0]const u8{ "uOffset", "uTint", "uTint[1]", "uTex", "nothing" }) |nm| try E(glGetUniformLocation(a, nm), glGetUniformLocation(prog_b, nm));
+    for ([_]u32{ g.ACTIVE_UNIFORMS, g.ACTIVE_ATTRIBUTES, g.ACTIVE_UNIFORM_MAX_LENGTH, g.PROGRAM_BINARY_LENGTH }) |q| {
+        var x: i32 = 0;
+        var y: i32 = 0;
+        glGetProgramiv(a, q, @ptrCast(&x));
+        glGetProgramiv(prog_b, q, @ptrCast(&y));
+        try E(x, y);
+    }
+    // (uniform values start at zero, as after a link)
+    var f: [4]f32 = undefined;
+    glGetUniformfv(prog_b, glGetUniformLocation(prog_b, "uOffset"), &f);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, f[0..2]);
+    var px_b: [8 * 8 * 4]u8 = undefined;
+    try binaryScene(prog_b, &px_b);
+    try std.testing.expectEqualSlices(u8, &px_a, &px_b);
+    glGetProgramBinary(prog_b, bin_b.len, &len, &fmt, &bin_b);
+    try std.testing.expectEqualSlices(u8, bin, bin_b[0..@intCast(len)]);
+
+    // refused, cleanly: GL's errors for the call itself ...
+    glProgramBinary(prog_b, 0x875F, @ptrCast(bin.ptr), @intCast(bin.len)); // (Mesa's format)
+    try E(g.INVALID_ENUM, glGetError());
+    glProgramBinary(prog_b, pb.FORMAT, @ptrCast(bin.ptr), -1);
+    try E(g.INVALID_VALUE, glGetError());
+    glProgramBinary(12345, pb.FORMAT, @ptrCast(bin.ptr), @intCast(bin.len));
+    try E(g.INVALID_VALUE, glGetError());
+    // (prog_b is still linked: those calls changed nothing)
+    try linkOk(prog_b);
+    // ... and for what the binary holds: no GL error, the program not
+    // linked, the reason in its log
+    try binaryRefused(prog_b, bin[0..0], "shorter than its header");
+    try binaryRefused(prog_b, bin[0 .. bin.len - 1], "length");
+    @memcpy(bin_bad[0..bin.len], bin);
+    bin_bad[bin.len - 5] ^= 0x20; // (a byte of the fragment shader's code)
+    try binaryRefused(prog_b, bin_bad[0..bin.len], "checksum");
+    @memset(bin_bad[0..bin.len], 0);
+    try binaryRefused(prog_b, bin_bad[0..bin.len], "not a Galaxy program binary");
+    try binaryRefused(prog_b, binaryEdited(bin, 8, pb.VERSION + 1, 4), "format version");
+    try binaryRefused(prog_b, binaryEdited(bin, 24, pb.DRIVER_BUILD ^ 1, 8), "another driver build");
+    try binaryRefused(prog_b, binaryEdited(bin, 32, pb.gpuId(null) ^ 1, 8), "another GPU");
+    // (a checksum that holds over tables that do not: the attributes'
+    // count past the table, after the version, the names' count and names)
+    const names_n = std.mem.readInt(u32, bin[pb.HEADER_BYTES + 12 ..][0..4], .little);
+    try binaryRefused(prog_b, binaryEdited(bin, pb.HEADER_BYTES + 16 + names_n, 0xffff, 4), "not a program's");
+    // WebRender's way on: link the program from source again
+    const vs2 = newShader(g.VERTEX_SHADER, "#version 300 es\nin vec2 aPos;\nvoid main() { gl_Position = vec4(aPos, 0.0, 1.0); }");
+    const fs2 = newShader(g.FRAGMENT_SHADER, "#version 300 es\nprecision mediump float;\nout vec4 o;\nvoid main() { o = vec4(1.0); }");
+    glAttachShader(prog_b, vs2);
+    glAttachShader(prog_b, fs2);
+    glLinkProgram(prog_b);
+    try linkOk(prog_b);
+    // and a good binary over a program that has shaders: taken
+    glProgramBinary(prog_b, pb.FORMAT, @ptrCast(bin.ptr), @intCast(bin.len));
+    try linkOk(prog_b);
+    try binaryScene(prog_b, &px_b);
+    try std.testing.expectEqualSlices(u8, &px_a, &px_b);
+    glUseProgram(0);
+    glDeleteProgram(a);
+    glDeleteProgram(prog_b);
+    glDeleteShader(vs2);
+    glDeleteShader(fs2);
+    glDeleteTextures(1, &tex);
+    glDeleteBuffers(1, &buf);
+    glDeleteVertexArrays(1, &vao);
+    try E(g.NO_ERROR, glGetError());
 }

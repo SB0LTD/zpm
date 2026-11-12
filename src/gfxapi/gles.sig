@@ -83,6 +83,8 @@ pub const EXTENSIONS = [_][:0]const u8{
     "GL_OES_texture_border_clamp",
     "GL_EXT_texture_border_clamp",
     "GL_OES_vertex_array_object",
+    // (program binaries, ES 3.0's core too: WebRender's shader disk cache)
+    "GL_OES_get_program_binary",
     "GL_EXT_map_buffer_range",
     // (a lost GPU: glGetGraphicsResetStatus, the reset strategy, and
     // CONTEXT_LOST once; the n-forms of ReadPixels and GetUniform)
@@ -1588,7 +1590,10 @@ pub const Context = struct {
             g.MAX_VERTEX_ATTRIBS => int(MAX_ATTRS),
             g.CURRENT_PROGRAM => int(c.program),
             g.SHADER_COMPILER => boolean(true),
-            g.NUM_SHADER_BINARY_FORMATS, g.NUM_PROGRAM_BINARY_FORMATS => int(0),
+            g.NUM_SHADER_BINARY_FORMATS => int(0),
+            // (program binaries: one format, the driver's own, program.sig)
+            g.NUM_PROGRAM_BINARY_FORMATS => int(1),
+            g.PROGRAM_BINARY_FORMATS => int(program.progbin.FORMAT),
             g.MAX_VERTEX_UNIFORM_VECTORS => int(program.MAX_VERTEX_UNIFORM_VECTORS),
             g.MAX_FRAGMENT_UNIFORM_VECTORS => int(program.MAX_FRAGMENT_UNIFORM_VECTORS),
             g.MAX_VERTEX_UNIFORM_COMPONENTS => int(program.MAX_VERTEX_UNIFORM_VECTORS * 4),
