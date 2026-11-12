@@ -26,6 +26,7 @@ pub const emu3d = @import("emu3d.sig");
 /// Rectangles drawn by the RTX's 3D engine (the methods, the programs, a
 /// renderer over any Device).
 pub const draw = @import("draw.sig");
+pub const gl3d = @import("gl3d.sig");
 
 test {
     _ = sm120;
@@ -38,4 +39,5 @@ test {
     _ = device;
     _ = emu3d;
     _ = draw;
+    _ = gl3d;
 }

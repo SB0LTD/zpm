@@ -25,6 +25,8 @@ pub const draw = @import("draw.sig");
 pub const adreno_draw = @import("adreno_draw.sig");
 /// The RTX's 3D engine as a draw.Renderer (the adapter over nvidia/draw.sig).
 pub const nvidia_draw = @import("nvidia_draw.sig");
+/// GL-shaped draws on the RTX's 3D engine: KIR graphics stages and their headers.
+pub const nvidia_gl = @import("nvidia_gl.sig");
 
 // KIR
 pub const Ty = kir.Ty;
@@ -54,6 +56,10 @@ pub const Binary = device.Binary;
 pub const Program = device.Program;
 pub const Dispatch = device.Dispatch;
 pub const Stamp = device.Stamp;
+pub const Graphics = device.Graphics;
+pub const GraphicsBlend = device.GraphicsBlend;
+pub const BlendFactor = device.BlendFactor;
+pub const BlendEquation = device.BlendEquation;
 pub const Error = device.Error;
 pub const Fence = device.Fence;
 pub const Device = device.Device;
@@ -90,4 +96,5 @@ test {
     _ = draw;
     _ = adreno_draw;
     _ = nvidia_draw;
+    _ = nvidia_gl;
 }

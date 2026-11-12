@@ -45,6 +45,8 @@ const nv = nvidia.device;
 const qmd = nvidia.qmd;
 const push = nvidia.push;
 const emu = nvidia.sm120_emu;
+const gl3d = nvidia.gl3d;
+const sph = nvidia.sph;
 
 /// Buffers an adapter tracks (allocated and not freed).
 pub const MAX_BUFFERS = 512;
@@ -61,7 +63,11 @@ const CBUF_AT = 0x200;
 /// launch, then the end.
 const SETUP_DWORDS = 64;
 const DWORDS_PER_DISPATCH = 8;
-const PB_DWORDS = SETUP_DWORDS + DWORDS_PER_DISPATCH * MAX_DISPATCHES;
+/// Graphics dispatches a run takes (Caps.max_graphics), and the dwords
+/// each takes (the 3D engine's whole state, the draw, the waits).
+pub const MAX_GRAPHICS = 64;
+const DWORDS_PER_GRAPHICS = gl3d.MAX_DWORDS + 16;
+const PB_DWORDS = SETUP_DWORDS + DWORDS_PER_DISPATCH * MAX_DISPATCHES + DWORDS_PER_GRAPHICS * MAX_GRAPHICS;
 /// Zeros after a program (the SMs' prefetch reads past its end; the
 /// emulated RTX reads to its first all-zero instruction).
 const CODE_GAP = 256;
@@ -95,6 +101,15 @@ pub fn rtx5070(vram: u64) gpu.Caps {
         .indirect = true,
         .max_run = MAX_DISPATCHES,
     };
+}
+
+/// The same with the 3D engine offered (Caps.graphics: a channel with a
+/// BLACKWELL_B object on it).
+pub fn withGraphics(c: gpu.Caps) gpu.Caps {
+    var x = c;
+    x.graphics = true;
+    x.max_graphics = MAX_GRAPHICS;
+    return x;
 }
 
 const Slot = struct {
@@ -146,6 +161,11 @@ pub const Adapter = struct {
     /// Each dispatch's end timed (Device.profile).
     profiling: bool = false,
     indirect_progs: ?IndirectProgs = null,
+    /// A page of zeros for the 3D engine (made at the first graphics
+    /// dispatch).
+    zero: nv.Buffer = .{},
+    /// Graphics dispatches run.
+    draws: u64 = 0,
     lost: u64 = 0,
     last_error: ?anyerror = null,
 
@@ -310,8 +330,26 @@ pub const Adapter = struct {
         a.barriers = 0;
         // (the patch kernels' QMDs, in the slots after the dispatches')
         var extra: usize = 0;
+        var graphics: u32 = 0;
         for (ds, 0..) |d0, i| {
             var d = d0;
+            if (d.graphics) |g| {
+                // (the 3D engine draws in the dispatch's place: what came
+                // before it done first, and done itself before what comes
+                // after: WAIT_FOR_IDLE on either side)
+                if (!a.caps.graphics) return error.Unsupported;
+                graphics += 1;
+                if (graphics > MAX_GRAPHICS) return error.Unsupported;
+                try a.graphicsSlot(s, i, d, g);
+                p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
+                gl3d.emit(&p, &a.drawOf(s, i, d, g));
+                p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
+                p.invalidateShaderCaches();
+                a.barriers += 2;
+                hz = .{};
+                a.draws += 1;
+                continue;
+            }
             if (d.indirect) |ind| {
                 // the counts into this dispatch's QMD and cbuf0, by the
                 // patch kernel, once what came before is done; its launch
@@ -402,6 +440,76 @@ pub const Adapter = struct {
             const cb: []u32 = @alignCast(std.mem.bytesAsSlice(u32, s.slots.cpu[at + CBUF_AT ..][0..qmd.CBUF0_MAX_BYTES]));
             _ = qmd.cbuf0Into(cb, d.groups, bin.group, params[0..n]) catch return error.BadProgram;
         }
+    }
+
+    /// A graphics dispatch's constant buffer 0 (both stages') into slot
+    /// `slot`'s place for it, laid out as a launch's: the bindings, then the
+    /// parameter words.
+    fn graphicsSlot(a: *Adapter, s: *Set, slot: usize, d: gpu.Dispatch, g: *const gpu.Graphics) gpu.Error!void {
+        const vb = &g.vertex.bin;
+        const pb = &d.prog.bin;
+        if (vb.extra[EXTRA_STAGE] != 1 or pb.extra[EXTRA_STAGE] != 2) return error.BadProgram;
+        if (d.buffers.len != vb.bindings or d.buffers.len != pb.bindings) return error.BadProgram;
+        const nw = @max(vb.param_words, pb.param_words);
+        if (d.params.len < nw) return error.BadProgram;
+        if (a.zero.cpu.len == 0) {
+            a.zero = a.vram.alloc(4096) catch return error.OutOfMemory;
+            @memset(a.zero.cpu, 0);
+            a.vram.toDevice(a.zero, 0, 4096);
+        }
+        var params: [qmd.MAX_BIG_PARAMS]u8 = undefined;
+        var n: usize = 0;
+        if (8 * d.buffers.len + 4 * nw > params.len) return error.BadProgram;
+        for (d.buffers) |b| {
+            std.mem.writeInt(u64, params[n..][0..8], b.gpu, .little);
+            n += 8;
+        }
+        for (d.params[0..nw]) |w| {
+            std.mem.writeInt(u32, params[n..][0..4], w, .little);
+            n += 4;
+        }
+        const at = slot * SLOT_BYTES + CBUF_AT;
+        const cb: []u32 = @alignCast(std.mem.bytesAsSlice(u32, s.slots.cpu[at..][0..qmd.CBUF0_MAX_BYTES]));
+        _ = qmd.cbuf0Into(cb, .{ 1, 1, 1 }, .{ 1, 1, 1 }, params[0..n]) catch return error.BadProgram;
+    }
+
+    /// A graphics dispatch as the 3D engine's state.
+    fn drawOf(a: *const Adapter, s: *const Set, slot: usize, d: gpu.Dispatch, g: *const gpu.Graphics) gl3d.Draw {
+        const nw = @max(g.vertex.bin.param_words, d.prog.bin.param_words);
+        return .{
+            .vertex = .{ .va = g.vertex.code.gpu, .registers = @max(g.vertex.bin.regs, 16), .bytes = g.vertex.bin.code.len },
+            .pixel = .{ .va = d.prog.code.gpu, .registers = @max(d.prog.bin.regs, 16), .bytes = d.prog.bin.code.len },
+            .cb_va = s.slots.va + slot * SLOT_BYTES + CBUF_AT,
+            .cb_bytes = qmd.cbuf0Bytes(8 * d.buffers.len + 4 * nw),
+            .zero_va = a.zero.va,
+            .target = .{ .va = g.va, .width = g.width, .height = g.height, .pitch = g.stride },
+            .format = switch (g.format) {
+                .rgba8 => .rgba8,
+                .bgra8 => .bgra8,
+                .r8 => .r8,
+                .rg8 => .rg8,
+            },
+            .mask = g.mask,
+            .blend = if (g.blend) |b| .{
+                .src_rgb = factorOf(b.src_rgb),
+                .dst_rgb = factorOf(b.dst_rgb),
+                .src_a = factorOf(b.src_a),
+                .dst_a = factorOf(b.dst_a),
+                .eq_rgb = equationOf(b.eq_rgb),
+                .eq_a = equationOf(b.eq_a),
+                .constant = b.constant,
+            } else null,
+            .scale = g.scale,
+            .offset = g.offset,
+            .scissor = g.scissor,
+            .topology = switch (g.topology) {
+                .triangles => .triangles,
+                .strip => .strip,
+                .fan => .fan,
+            },
+            .count = g.count,
+            .instances = g.instances,
+        };
     }
 
     const IndirectProgs = struct { patch: gpu.Program, nop: gpu.Program };
@@ -522,6 +630,45 @@ pub const Adapter = struct {
 /// A gpu.Device over Galaxy's raw NVIDIA devices: `vram` (the GPU's own
 /// memory, which also submits) and `host` (system memory the GPU maps, or
 /// none). `a` holds the adapter's state and must outlive the Device.
+/// The 3D engine's subchannel (nvidia/draw.sig's: NVK's).
+fn gl3dSubch() u32 {
+    return nvidia.draw.SUBCH;
+}
+
+/// Binary.extra's stage word (gpu/nvidia_gl: 1 vertex, 2 pixel).
+const EXTRA_STAGE = 6;
+
+/// GL's factor as the 3D engine takes it.
+fn factorOf(f: gpu.BlendFactor) gl3d.Factor {
+    return switch (f) {
+        .zero => .zero,
+        .one => .one,
+        .src_color => .src_color,
+        .one_minus_src_color => .one_minus_src_color,
+        .src_alpha => .src_alpha,
+        .one_minus_src_alpha => .one_minus_src_alpha,
+        .dst_alpha => .dst_alpha,
+        .one_minus_dst_alpha => .one_minus_dst_alpha,
+        .dst_color => .dst_color,
+        .one_minus_dst_color => .one_minus_dst_color,
+        .src_alpha_saturate => .src_alpha_saturate,
+        .constant_color => .constant_color,
+        .one_minus_constant_color => .one_minus_constant_color,
+        .constant_alpha => .constant_alpha,
+        .one_minus_constant_alpha => .one_minus_constant_alpha,
+    };
+}
+
+fn equationOf(e: gpu.BlendEquation) gl3d.Equation {
+    return switch (e) {
+        .add => .add,
+        .subtract => .subtract,
+        .reverse_subtract => .reverse_subtract,
+        .min => .min,
+        .max => .max,
+    };
+}
+
 pub fn over(a: *Adapter, vram: nv.Device, host: ?nv.Device, caps: gpu.Caps) gpu.Device {
     a.* = .{ .vram = vram, .host = host, .caps = caps };
     return a.device();
@@ -537,6 +684,16 @@ pub fn over(a: *Adapter, vram: nv.Device, host: ?nv.Device, caps: gpu.Caps) gpu.
 pub const Emu = struct {
     raw: nv.EmuDevice,
     adapter: Adapter = .{},
+    /// The emulated 3D engine, when there is one (withEngine): the device's
+    /// caps then offer graphics dispatches.
+    engine: ?*nvidia.emu3d.Engine = null,
+
+    /// The emulated RTX with its 3D engine (`g`, the caller's: about 2 MB).
+    pub fn withEngine(e: *Emu, g: *nvidia.emu3d.Engine) void {
+        g.* = .{};
+        e.engine = g;
+        e.raw.gr3d = g;
+    }
 
     /// `work` may be undefined memory (a static `= undefined`): its
     /// control fields are set here (the step budget, the hazard checks at
@@ -556,7 +713,7 @@ pub const Emu = struct {
 
     pub fn device(e: *Emu) gpu.Device {
         e.raw.work.strict = true;
-        return over(&e.adapter, e.raw.device(), null, emuCaps());
+        return over(&e.adapter, e.raw.device(), null, if (e.engine != null) withGraphics(emuCaps()) else emuCaps());
     }
 
     /// What went wrong in the last run's kernel, as a sentence.
@@ -621,6 +778,125 @@ test "kir_sm120's work fits the 16 MiB Galaxy's gfx_render compiles in (WebRende
     }
     std.debug.print("the rest {d} KiB; WORK_BYTES {d} KiB\n", .{ rest >> 10, kir_sm120.WORK_BYTES >> 10 });
     try testing.expect(kir_sm120.WORK_BYTES <= 16 << 20);
+}
+
+// ── Graphics dispatches: the 3D engine (nvidia_gl's programs, gl3d's state) ──
+
+const GT = struct {
+    var engine: nvidia.emu3d.Engine = .{};
+    var vcode: [64 * 1024]u8 align(16) = undefined;
+    var pcode: [64 * 1024]u8 align(16) = undefined;
+};
+
+/// A vertex program: vertex i's x, y and color from a buffer of six
+/// floats a vertex (binding 1), stored as the position and generic 0.
+fn glVertex(k: *kir.Kernel) void {
+    const gl = @import("nvidia_gl.sig");
+    const io = k.binding();
+    const vb = k.binding();
+    const vid = k.load(.u32, gl.ioMem(io, gl.VERTEX_ID, false), u(0));
+    const base = k.op2(.imul, .u32, r(vid), u(24));
+    var v: [6]kir.V = undefined;
+    for (&v, 0..) |*x, j| {
+        var m = kir.global(vb, 32);
+        m.imm = @intCast(4 * j);
+        x.* = k.load(.f32, m, r(base));
+    }
+    for (0..4) |c| k.store(.f32, gl.ioMem(io, gl.POSITION + 4 * @as(u32, @intCast(c)), false), u(0), switch (c) {
+        0 => r(v[0]),
+        1 => r(v[1]),
+        2 => kf(0),
+        else => kf(1),
+    });
+    for (0..4) |c| k.store(.f32, gl.ioMem(io, gl.generic(0, @intCast(c)), false), u(0), r(v[2 + c]));
+}
+
+/// The pixel program: generic 0 in perspective, as the color.
+fn glPixel(k: *kir.Kernel) void {
+    const gl = @import("nvidia_gl.sig");
+    const io = k.binding();
+    _ = k.binding();
+    const iw = k.load(.f32, gl.ioMem(io, gl.POSITION + 12, false), u(0));
+    const w = k.div(kf(1), r(iw));
+    for (0..4) |c| {
+        const x = k.op2(.fmul, .f32, r(k.load(.f32, gl.ioMem(io, gl.generic(0, @intCast(c)), false), u(0))), r(w));
+        k.store(.f32, gl.ioMem(io, gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), u(0), r(x));
+    }
+}
+
+test "graphics dispatches: a quad's colors carried across it by the emulated 3D engine, then blended over" {
+    const gl = @import("nvidia_gl.sig");
+    T.dev.init(&T.arena, &T.view, &T.work);
+    T.dev.withEngine(&GT.engine);
+    const d = T.dev.device();
+    try testing.expect(d.caps.graphics);
+    var vk = newKernel("vs", .{ 1, 1, 1 });
+    glVertex(&vk);
+    try vk.finish();
+    T.st.asm_work.sched = .{};
+    const vbin = try gl.compileStage(&vk, d.caps, &T.st, .vertex, 0, &GT.vcode);
+    var pk = newKernel("ps", .{ 1, 1, 1 });
+    glPixel(&pk);
+    try pk.finish();
+    T.st.asm_work.sched = .{};
+    const pbin = try gl.compileStage(&pk, d.caps, &T.st, .pixel, 0, &GT.pcode);
+    const vp = try d.load(&vbin);
+    const pp = try d.load(&pbin);
+    const W = 32;
+    const H = 16;
+    const target = try d.alloc(W * H * 4, .host);
+    const vb = try d.alloc(6 * 6 * 4, .host);
+    // two triangles over the whole target: red 0 at the left edge to 1 at
+    // the right, green 0.5, blue 1 at the top to 0 at the bottom, alpha 1
+    const quad = [6][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 } };
+    const fl: []f32 = @alignCast(std.mem.bytesAsSlice(f32, vb.cpu[0 .. 6 * 6 * 4]));
+    for (quad, 0..) |q, i| fl[6 * i ..][0..6].* = .{ q[0], q[1], (q[0] + 1) / 2, 0.5, (1 - q[1]) / 2, 1 };
+    d.toDevice(vb, 0, 6 * 6 * 4);
+    @memset(target.cpu[0 .. W * H * 4], 0x11);
+    d.toDevice(target, 0, W * H * 4);
+    var g = gpu.Graphics{
+        .vertex = &vp,
+        .va = target.gpu,
+        .width = W,
+        .height = H,
+        .stride = W * 4,
+        .format = .rgba8,
+        .scale = .{ W / 2, H / 2, 0.5 },
+        .offset = .{ W / 2, H / 2, 0.5 },
+        .scissor = .{ 0, 0, W, H },
+        .count = 6,
+    };
+    try runWait(d, &.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }});
+    d.fromDevice(target, 0, W * H * 4);
+    for (0..H) |y| for (0..W) |x| {
+        const px = target.cpu[(y * W + x) * 4 ..][0..4];
+        const want_r: f32 = (@as(f32, @floatFromInt(x)) + 0.5) / W * 255;
+        // (y down in the target: clip y -1 is row 0, where blue is 1)
+        const want_b: f32 = (1 - (@as(f32, @floatFromInt(y)) + 0.5) / H) * 255;
+        try testing.expect(@abs(@as(f32, @floatFromInt(px[0])) - want_r) <= 1);
+        try testing.expect(@abs(@as(i32, px[1]) - 128) <= 1);
+        try testing.expect(@abs(@as(f32, @floatFromInt(px[2])) - want_b) <= 1);
+        try testing.expectEqual(@as(u8, 255), px[3]);
+    };
+    // Over it: a half-transparent black quad, GL's SRC_ALPHA,
+    // ONE_MINUS_SRC_ALPHA for color and ONE, ONE_MINUS_SRC_ALPHA for alpha,
+    // only red and alpha written.
+    for (0..6) |i| fl[6 * i + 2 ..][0..4].* = .{ 0, 0, 0, 0.5 };
+    d.toDevice(vb, 0, 6 * 6 * 4);
+    g.blend = .{ .src_rgb = .src_alpha, .dst_rgb = .one_minus_src_alpha, .src_a = .one, .dst_a = .one_minus_src_alpha };
+    g.mask = 0b1001;
+    const before = target.cpu[0..4].*;
+    try runWait(d, &.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }});
+    d.fromDevice(target, 0, W * H * 4);
+    try testing.expect(@abs(@as(i32, target.cpu[0]) - @divTrunc(@as(i32, before[0]), 2)) <= 1);
+    try testing.expectEqual(before[1], target.cpu[1]);
+    try testing.expectEqual(before[2], target.cpu[2]);
+    try testing.expectEqual(@as(u8, 255), target.cpu[3]);
+    try testing.expect(T.dev.adapter.draws == 2);
+    d.free(target);
+    d.free(vb);
+    d.unload(&vp);
+    d.unload(&pp);
 }
 
 test "a buffer's raw handle: the device under the adapter's, not the adapter's slot" {

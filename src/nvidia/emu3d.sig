@@ -17,6 +17,14 @@
 //! held to): centres at halves, unnormalized texels clamped to the edge,
 //! a blend in floats rounded to the nearest of 256 steps.
 //!
+//! GL's draws too (gl3d.sig, gpu/nvidia_gl): triangles, strips and fans of
+//! any length (the vertex program run on up to VERTICES vertices at a
+//! time, a primitive's that came before run again), instances, the
+//! provoking vertex first or last, GL's blend factors and equations and
+//! the constant colour, the channels written, RG8 targets, the depth's
+//! clip volume (-w..w or 0..w: a pixel whose depth falls outside is not
+//! drawn) and the depth carried to the pixel program in window units.
+//!
 //! It is as strict as it can be: state the renderer does not send, or
 //! sends with another value, is a refused stream with the reason kept
 //! (`why`), so a renderer that drifts from what NVK does fails here and
@@ -40,10 +48,11 @@ const gr = @import("draw.sig");
 const METHODS = 0x1000;
 const GROUPS = 5;
 const SLOTS = 16;
-/// The vertices of one draw, at most.
-const VERTICES = 64;
+/// The vertices the vertex program runs on at once (a draw's primitives
+/// go by in runs of as many as their vertices fit).
+const VERTICES = 96;
 /// A program's instructions, at most.
-const CODE = 256;
+const CODE = emu.MAX_INSTRS;
 
 const POSITION = sph.ATTR_POSITION / 4;
 const GENERIC = sph.ATTR_GENERIC / 4;
@@ -63,8 +72,11 @@ const Target = struct {
     /// Pixels a row and rows.
     width: u32,
     height: u32,
-    format: gr.Format,
+    format: Fmt,
 };
+
+/// A colour target's pixels: the renderer's three, and GL's RG8.
+const Fmt = enum { rgba8, bgra8, r8, rg8 };
 
 const Clip = struct { x0: i64, y0: i64, x1: i64, y1: i64 };
 
@@ -98,7 +110,17 @@ pub const Engine = struct {
     killed: [emu.MAX_THREADS]bool = undefined,
     at: [emu.MAX_THREADS][2]u32 = undefined,
     queued: u32 = 0,
-    code: [CODE * 2]u64 = undefined,
+    /// Each stage's code, read once a draw.
+    vcode: [CODE * 2]u64 = undefined,
+    pcode: [CODE * 2]u64 = undefined,
+    vn: usize = 0,
+    pn: usize = 0,
+    /// The draw's provoking vertex is the last (else the first), and its
+    /// depth range for the pixels (window units).
+    zlo: f64 = 0,
+    zhi: f64 = 1,
+    zscale: f64 = 1,
+    zoffset: f64 = 0,
     vhead: [sph.WORDS]u32 = undefined,
     phead: [sph.WORDS]u32 = undefined,
     host: Host = undefined,
@@ -164,16 +186,19 @@ pub const Engine = struct {
         try g.need(g.reg(gr.SET_ANTI_ALIAS) == 0 and g.reg(gr.SET_ANTI_ALIAS_SAMPLE_POSITIONS) == 0x8888_8888, "more than one sample, or a sample not at the pixel's centre");
         try g.need(g.reg(gr.SET_VIEWPORT_PIXEL) == 0 and g.reg(gr.SET_WINDOW_ORIGIN) == 0, "pixel centres not at halves, or the origin not the top left");
         try g.need(g.reg(gr.SET_VIEWPORT_SCALE_OFFSET) == 1 and g.reg(gr.SET_VIEWPORT_COORDINATE_SWIZZLE) == 0x6420, "no viewport transform, or a swizzled one");
+        try g.need(g.reg(gr.SET_VIEWPORT_Z_CLIP) <= 1, "a depth clip range other than -w..w or 0..w");
+        try g.need(g.reg(gr.SET_PROVOKING_VERTEX) <= 1, "a provoking vertex other than the first or the last");
         try g.need(g.reg(gr.SET_WINDOW_OFFSET_X) == 0 and g.reg(gr.SET_WINDOW_OFFSET_X + 4) == 0 and g.reg(gr.SET_WINDOW_CLIP_ENABLE) == 0, "a window offset or window clips: not modelled");
         try g.need(g.reg(gr.OGL_SET_CULL) == 0 and g.reg(gr.SET_FRONT_POLYGON_MODE) == 0x1b02 and g.reg(gr.SET_FRONT_POLYGON_MODE + 4) == 0x1b02, "culling, or polygons not filled: not modelled");
-        try g.need(g.reg(gr.SET_PRIMITIVE_TOPOLOGY_CONTROL) == 1 and g.reg(gr.SET_PRIMITIVE_TOPOLOGY) == gr.TOPOLOGY_TRIANGLE_STRIP, "not a triangle strip by SET_PRIMITIVE_TOPOLOGY");
-        try g.need(g.reg(gr.SET_DRAW_CONTROL_A) == gr.DRAW_CONTROL and g.reg(gr.SET_DRAW_CONTROL_A + 4) == 1, "SET_DRAW_CONTROL is not one instance, the first");
+        const topo = g.reg(gr.SET_PRIMITIVE_TOPOLOGY);
+        try g.need(g.reg(gr.SET_PRIMITIVE_TOPOLOGY_CONTROL) == 1 and topo >= 4 and topo <= 6, "not triangles, a strip or a fan by SET_PRIMITIVE_TOPOLOGY");
+        try g.need(g.reg(gr.SET_DRAW_CONTROL_A) == gr.DRAW_CONTROL and g.reg(gr.SET_DRAW_CONTROL_A + 4) >= 1, "SET_DRAW_CONTROL is not instances from the first");
         try g.need(g.reg(gr.SET_DA_OUTPUT) == 0x1000 and g.reg(gr.SET_VERTEX_ID_BASE) == 0 and g.reg(gr.SET_GLOBAL_BASE_VERTEX_INDEX) == 0 and g.reg(gr.SET_GLOBAL_BASE_VERTEX_INDEX + 4) == 0, "the vertex's index would not count from the draw's first vertex");
         for (0..16) |j| {
             const n: u32 = @intCast(j);
             try g.need(g.reg(gr.SET_VERTEX_STREAM_A_FORMAT + 16 * n) & 0x1000 == 0 and g.reg(gr.SET_VERTEX_STREAM_B_FORMAT + 16 * n) & 0x1000 == 0, "a vertex stream is on: not modelled");
         }
-        try g.need(g.reg(gr.SET_BLEND_STATE_PER_TARGET) == 1 and g.reg(gr.SET_CT_WRITE) == 0x1111 and g.reg(gr.SET_COLOR_CLAMP) == 1 and g.reg(gr.SET_LOGIC_OP) == 0 and g.reg(gr.SET_ALPHA_TEST) == 0, "the color write is not: every channel, clamped, per-target blend state, no logic op, no alpha test");
+        try g.need(g.reg(gr.SET_BLEND_STATE_PER_TARGET) == 1 and g.reg(gr.SET_CT_WRITE) & ~@as(u32, 0x1111) == 0 and g.reg(gr.SET_COLOR_CLAMP) == 1 and g.reg(gr.SET_LOGIC_OP) == 0 and g.reg(gr.SET_ALPHA_TEST) == 0, "the color write is not: channels on or off, clamped, per-target blend state, no logic op, no alpha test");
         for ([_]u32{ 0, 2, 3, 4 }) |j| try g.need(g.reg(gr.SET_PIPELINE_SHADER + 64 * j) & 1 == 0, "a stage other than the vertex and the pixel one is on: not modelled");
     }
 
@@ -183,10 +208,11 @@ pub const Engine = struct {
         const va = @as(u64, g.reg(a) & 0xff) << 32 | g.reg(a + 4);
         const pitch = g.reg(a + 8);
         const height = g.reg(a + 12);
-        const format: gr.Format = switch (g.reg(a + 16)) {
+        const format: Fmt = switch (g.reg(a + 16)) {
             0xcf => .bgra8,
             0xd5 => .rgba8,
             0xf3 => .r8,
+            0xea => .rg8,
             else => return g.refuse("a color target format the renderer does not use"),
         };
         try g.need(g.reg(a + 20) == gr.TARGET_MEMORY_PITCH and g.reg(a + 24) == 1 and g.reg(a + 28) == 0 and g.reg(a + 32) == 0, "the color target is not one layer of rows of bytes (LAYOUT_PITCH)");
@@ -194,7 +220,7 @@ pub const Engine = struct {
         try g.need(va % 128 == 0 and pitch % 128 == 0 and pitch != 0 and height != 0, "the color target's address or its rows are not multiples of 128 bytes");
         try g.need(g.reg(gr.SET_COLOR_COMPRESSION) == 0, "color compression on plain memory");
         const bytes = g.host.mem.find(va, @as(usize, pitch) * height) orelse return g.refuse("the color target's memory is not mapped");
-        return .{ .bytes = bytes, .pitch = pitch, .width = pitch / @as(u32, if (format == .r8) 1 else 4), .height = height, .format = format };
+        return .{ .bytes = bytes, .pitch = pitch, .width = pitch / pixelBytes(format), .height = height, .format = format };
     }
 
     /// Where pixels may be written: the surface's clip, the viewport's,
@@ -224,10 +250,11 @@ pub const Engine = struct {
         return c;
     }
 
-    /// Stage j's program read from GPU memory and loaded into the
-    /// emulator: its header into `head`, the group its constant buffers
-    /// bind to returned.
-    fn program(g: *Engine, j: u32, kind: sph.Stage, head: *[sph.WORDS]u32) anyerror!u32 {
+    /// Stage j's program read from GPU memory into `code` (loaded into the
+    /// emulator before its stage runs: `load`): its header into `head`, its
+    /// instructions' count into `n`, the group its constant buffers bind to
+    /// returned.
+    fn program(g: *Engine, j: u32, kind: sph.Stage, head: *[sph.WORDS]u32, code: []u64, n_out: *usize) anyerror!u32 {
         const sh = g.reg(gr.SET_PIPELINE_SHADER + 64 * j);
         try g.need(sh & 1 != 0 and (sh >> 4) & 0xf == j, "the vertex or the pixel stage is off, or its type is not its index");
         const va = @as(u64, g.reg(gr.SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * j) & 0xff) << 32 | g.reg(gr.SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * j + 4);
@@ -242,19 +269,25 @@ pub const Engine = struct {
         while (n < CODE) : (n += 1) {
             const ib = g.host.mem.find(va + sph.CODE_AT + n * 16, 16) orelse break;
             if (std.mem.allEqual(u8, ib, 0)) break;
-            g.code[2 * n] = std.mem.readInt(u64, ib[0..8], .little);
-            g.code[2 * n + 1] = std.mem.readInt(u64, ib[8..16], .little);
+            code[2 * n] = std.mem.readInt(u64, ib[0..8], .little);
+            code[2 * n + 1] = std.mem.readInt(u64, ib[8..16], .little);
         }
-        try g.need(n != 0 and n < CODE, "a program with no code after its header, or more than 256 instructions");
+        try g.need(n != 0 and n < CODE, "a program with no code after its header, or more instructions than the emulator holds");
         // (what the engine prefetches must reach the code's end)
         const blocks = g.reg(gr.SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * j + 8) & 0x7f;
         try g.need(blocks != 0, "a program with nothing to prefetch (SET_PIPELINE_PROGRAM_PREFETCH)");
-        try emu.loadWords(g.host.work, g.code[0 .. 2 * n]);
-        const registers = g.reg(gr.SET_PIPELINE_REGISTER_COUNT + 64 * j) & 0x1ff;
-        if (g.host.work.top) |top| try g.need(registers > top, "a stage's register count is below the registers its program touches");
+        n_out.* = n;
         const group = g.reg(gr.SET_PIPELINE_REGISTER_COUNT + 64 * j + 4) & 7;
         try g.need(group < GROUPS, "a stage's binding group past 4");
         return group;
+    }
+
+    /// Stage j's code (read by `program`) into the emulator, its register
+    /// count checked against what the code touches.
+    fn load(g: *Engine, j: u32, code: []const u64) anyerror!void {
+        try emu.loadWords(g.host.work, code);
+        const registers = g.reg(gr.SET_PIPELINE_REGISTER_COUNT + 64 * j) & 0x1ff;
+        if (g.host.work.top) |top| try g.need(registers > top, "a stage's register count is below the registers its program touches");
     }
 
     /// A group's bound constant buffers, as a Stage takes them.
@@ -276,12 +309,18 @@ pub const Engine = struct {
         return @as(f32, @bitCast(g.vout[v][word]));
     }
 
-    /// DRAW_VERTEX_ARRAY_BEGIN_END: `count` vertices from `first`, a
-    /// triangle strip.
+    /// DRAW_VERTEX_ARRAY_BEGIN_END: `count` vertices from `first`, as
+    /// SET_PRIMITIVE_TOPOLOGY says (triangles, a strip, a fan), as many
+    /// instances as SET_DRAW_CONTROL_B says.
     fn draw(g: *Engine, first: u32, count: u32) anyerror!void {
         g.why = "";
         try g.validate();
-        try g.need(count >= 3 and count <= VERTICES, "a draw of fewer than 3 vertices or more than 64: not modelled");
+        const topo = g.reg(gr.SET_PRIMITIVE_TOPOLOGY);
+        const instances = g.reg(gr.SET_DRAW_CONTROL_A + 4);
+        const prims: u32 = switch (topo) {
+            4 => count / 3,
+            else => if (count >= 3) count - 2 else 0,
+        };
         const t = try g.target();
         const clip = g.clipOf(t);
         var stats = emu.Stats{};
@@ -293,87 +332,144 @@ pub const Engine = struct {
             g.stats.cycles = @max(g.stats.cycles, stats.cycles);
         }
 
-        // The vertex program, a thread a vertex: no stream is on, so all
-        // it is given is its index and the instance's.
-        const vgroup = try g.program(gr.STAGE_VERTEX, .vertex, &g.vhead);
-        for (0..count) |v| {
-            g.vin[v] = @splat(0);
-            g.vin[v][sph.ATTR_VERTEX_ID / 4] = first + @as(u32, @intCast(v));
-            g.vin[v][sph.ATTR_INSTANCE_ID / 4] = 0;
-        }
-        var vs = emu.Stage{ .kind = .vertex, .header = &g.vhead, .in = g.vin[0..count], .out = g.vout[0..count], .stored = g.vstored[0..count], .cbufs = try g.buffers(vgroup) };
-        try emu.stageBegin(g.host.work, count);
-        try emu.stageRun(g.host.work, &g.host.mem, &vs, count, &stats);
-
-        // The pixel program, and what it reads against what was stored.
-        const pgroup = try g.program(gr.STAGE_PIXEL, .pixel, &g.phead);
-        try g.need(g.phead[18] & 0xf == 0xf and g.phead[18] >> 4 == 0, "the pixel program does not write all four channels of target 0 alone");
+        // The two programs, and what the pixel one reads against what the
+        // vertex one stores.
+        const vgroup = try g.program(gr.STAGE_VERTEX, .vertex, &g.vhead, &g.vcode, &g.vn);
+        const pgroup = try g.program(gr.STAGE_PIXEL, .pixel, &g.phead, &g.pcode, &g.pn);
+        try g.need(g.phead[18] & 0xf != 0 and g.phead[18] >> 4 == 0, "the pixel program does not write target 0 alone");
         for (GENERIC..GENERIC_END) |word| {
             const read = sph.interpOf(&g.phead, @intCast((word - GENERIC) / 4), @intCast((word - GENERIC) % 4)) != .unused;
-            const was = g.stored(0, word);
+            const was = sph.bit(&g.vhead, 400 + @as(u32, @intCast(word)));
             // (NVK: a varying stored that no pixel program reads raises
             // "Out Of Range Address" on the hardware and kills the channel)
             if (was and !read) return g.refuse("the vertex program stores a varying the pixel program does not read (NVK: Out Of Range Address on the hardware)");
             if (read and !was) return g.refuse("the pixel program reads a varying the vertex program does not store");
         }
-        const cb = try g.buffers(pgroup);
+        const vcb = try g.buffers(vgroup);
+        const pcb = try g.buffers(pgroup);
 
-        // The viewport: clip space to window pixels.
+        // The viewport: clip space to window pixels and depth.
         const sx = g.float(gr.SET_VIEWPORT_SCALE_X);
         const sy = g.float(gr.SET_VIEWPORT_SCALE_X + 4);
+        g.zscale = g.float(gr.SET_VIEWPORT_SCALE_X + 8);
         const ox = g.float(gr.SET_VIEWPORT_SCALE_X + 12);
         const oy = g.float(gr.SET_VIEWPORT_SCALE_X + 16);
-        var win: [VERTICES][2]i64 = undefined;
-        for (0..count) |v| {
-            const w = g.vfloat(v, POSITION + 3);
-            try g.need(w > 0, "a vertex at or behind the eye (w not above 0): clipping is not modelled");
-            // (the rasterizer's grid: 1/256 of a pixel)
-            win[v] = .{
-                @as(i64, @intFromFloat(@round((g.vfloat(v, POSITION) / w * sx + ox) * 256))),
-                @as(i64, @intFromFloat(@round((g.vfloat(v, POSITION + 1) / w * sy + oy) * 256))),
-            };
-        }
+        g.zoffset = g.float(gr.SET_VIEWPORT_SCALE_X + 20);
+        g.zlo = if (g.reg(gr.SET_VIEWPORT_Z_CLIP) == 0) -1 else 0;
+        g.zhi = 1;
+        const last = g.reg(gr.SET_PROVOKING_VERTEX) == 1;
 
-        g.queued = 0;
-        for (0..count - 2) |i| {
-            var tri = [3]usize{ i, i + 1, i + 2 };
-            const flat = i; // (the provoking vertex: the first)
-            var area = edge(win[tri[0]], win[tri[1]], win[tri[2]]);
-            if (area == 0) continue;
-            if (area < 0) {
-                std.mem.swap(usize, &tri[1], &tri[2]);
-                area = -area;
-            }
-            const a = win[tri[0]];
-            const b = win[tri[1]];
-            const c = win[tri[2]];
-            const x0 = @max(clip.x0, @divFloor(@min(a[0], b[0], c[0]), 256));
-            const x1 = @min(clip.x1, @divFloor(@max(a[0], b[0], c[0]), 256) + 1);
-            const y0 = @max(clip.y0, @divFloor(@min(a[1], b[1], c[1]), 256));
-            const y1 = @min(clip.y1, @divFloor(@max(a[1], b[1], c[1]), 256) + 1);
-            var py = y0;
-            while (py < y1) : (py += 1) {
-                var px = x0;
-                while (px < x1) : (px += 1) {
-                    const p = [2]i64{ px * 256 + 128, py * 256 + 128 };
-                    // (each edge's function at the centre: the weight of
-                    // the vertex across from it)
-                    const e = [3]i64{ edge(b, c, p), edge(c, a, p), edge(a, b, p) };
-                    if (!inside(e[0], b, c) or !inside(e[1], c, a) or !inside(e[2], a, b)) continue;
-                    const fa: f64 = @floatFromInt(area);
-                    const bary = [3]f64{ @as(f64, @floatFromInt(e[0])) / fa, @as(f64, @floatFromInt(e[1])) / fa, @as(f64, @floatFromInt(e[2])) / fa };
-                    g.carry(tri, flat, bary, @intCast(px), @intCast(py));
-                    if (g.queued == emu.MAX_THREADS) try g.shade(t, cb, &stats);
+        // (vertices a run of primitives takes, at most)
+        const per: u32 = switch (topo) {
+            4 => VERTICES / 3,
+            else => VERTICES - 2,
+        };
+        var inst: u32 = 0;
+        while (inst < instances) : (inst += 1) {
+            var p0: u32 = 0;
+            while (p0 < prims) {
+                const np = @min(per, prims - p0);
+                // the run's vertices, as indices into the draw's
+                var idx: [VERTICES]u32 = undefined;
+                var nv: usize = 0;
+                switch (topo) {
+                    4 => for (0..3 * np) |k| {
+                        idx[nv] = 3 * p0 + @as(u32, @intCast(k));
+                        nv += 1;
+                    },
+                    5 => for (0..np + 2) |k| {
+                        idx[nv] = p0 + @as(u32, @intCast(k));
+                        nv += 1;
+                    },
+                    else => {
+                        idx[0] = 0;
+                        nv = 1;
+                        for (0..np + 1) |k| {
+                            idx[nv] = p0 + 1 + @as(u32, @intCast(k));
+                            nv += 1;
+                        }
+                    },
                 }
+                // The vertex program, a thread a vertex: no stream is on,
+                // so all it is given is its index and the instance's.
+                try g.load(gr.STAGE_VERTEX, g.vcode[0 .. 2 * g.vn]);
+                for (0..nv) |v| {
+                    g.vin[v] = @splat(0);
+                    g.vin[v][sph.ATTR_VERTEX_ID / 4] = first + idx[v];
+                    g.vin[v][sph.ATTR_INSTANCE_ID / 4] = inst;
+                }
+                var vs = emu.Stage{ .kind = .vertex, .header = &g.vhead, .in = g.vin[0..nv], .out = g.vout[0..nv], .stored = g.vstored[0..nv], .cbufs = vcb };
+                try emu.stageBegin(g.host.work, @intCast(nv));
+                try emu.stageRun(g.host.work, &g.host.mem, &vs, @intCast(nv), &stats);
+                var win: [VERTICES][2]i64 = undefined;
+                for (0..nv) |v| {
+                    const w = g.vfloat(v, POSITION + 3);
+                    try g.need(w > 0, "a vertex at or behind the eye (w not above 0): clipping is not modelled");
+                    // (the rasterizer's grid: 1/256 of a pixel)
+                    win[v] = .{
+                        @as(i64, @intFromFloat(@round((g.vfloat(v, POSITION) / w * sx + ox) * 256))),
+                        @as(i64, @intFromFloat(@round((g.vfloat(v, POSITION + 1) / w * sy + oy) * 256))),
+                    };
+                }
+                // the pixel program from here
+                try g.load(gr.STAGE_PIXEL, g.pcode[0 .. 2 * g.pn]);
+                g.queued = 0;
+                for (0..np) |k| {
+                    const q: usize = k;
+                    // (each primitive's vertices in GL's order: the
+                    // provoking one is the first or the last of them)
+                    const tri0: [3]usize = switch (topo) {
+                        4 => .{ 3 * q, 3 * q + 1, 3 * q + 2 },
+                        5 => if ((p0 + k) % 2 == 0) .{ q, q + 1, q + 2 } else .{ q + 1, q, q + 2 },
+                        else => .{ q + 1, q + 2, 0 },
+                    };
+                    const flat = if (last) tri0[2] else tri0[0];
+                    try g.triangle(t, pcb, clip, &win, tri0, flat, &stats);
+                }
+                try g.shade(t, pcb, &stats);
+                p0 += np;
             }
         }
-        try g.shade(t, cb, &stats);
         g.draws += 1;
+    }
+
+    /// One triangle's covered pixels queued (and shaded as the queue fills).
+    fn triangle(g: *Engine, t: Target, cb: [qmd.CBUFS][]const u8, clip: Clip, win: *const [VERTICES][2]i64, tri0: [3]usize, flat: usize, stats: *emu.Stats) anyerror!void {
+        var tri = tri0;
+        var area = edge(win[tri[0]], win[tri[1]], win[tri[2]]);
+        if (area == 0) return;
+        if (area < 0) {
+            std.mem.swap(usize, &tri[1], &tri[2]);
+            area = -area;
+        }
+        const a = win[tri[0]];
+        const b = win[tri[1]];
+        const c = win[tri[2]];
+        const x0 = @max(clip.x0, @divFloor(@min(a[0], b[0], c[0]), 256));
+        const x1 = @min(clip.x1, @divFloor(@max(a[0], b[0], c[0]), 256) + 1);
+        const y0 = @max(clip.y0, @divFloor(@min(a[1], b[1], c[1]), 256));
+        const y1 = @min(clip.y1, @divFloor(@max(a[1], b[1], c[1]), 256) + 1);
+        var py = y0;
+        while (py < y1) : (py += 1) {
+            var px = x0;
+            while (px < x1) : (px += 1) {
+                const p = [2]i64{ px * 256 + 128, py * 256 + 128 };
+                // (each edge's function at the centre: the weight of
+                // the vertex across from it)
+                const e = [3]i64{ edge(b, c, p), edge(c, a, p), edge(a, b, p) };
+                if (!inside(e[0], b, c) or !inside(e[1], c, a) or !inside(e[2], a, b)) continue;
+                const fa: f64 = @floatFromInt(area);
+                const bary = [3]f64{ @as(f64, @floatFromInt(e[0])) / fa, @as(f64, @floatFromInt(e[1])) / fa, @as(f64, @floatFromInt(e[2])) / fa };
+                if (!g.carry(tri, flat, bary, @intCast(px), @intCast(py))) continue;
+                if (g.queued == emu.MAX_THREADS) try g.shade(t, cb, stats);
+            }
+        }
     }
 
     /// A covered pixel queued: the attribute words its thread will read,
     /// carried across the triangle as the pixel program's header says.
-    fn carry(g: *Engine, tri: [3]usize, flat: usize, bary: [3]f64, px: u32, py: u32) void {
+    /// False: its depth is outside the clip volume (not drawn).
+    fn carry(g: *Engine, tri: [3]usize, flat: usize, bary: [3]f64, px: u32, py: u32) bool {
         const n = g.queued;
         const in = &g.pin[n];
         in.* = @splat(0xdead_beef);
@@ -388,7 +484,9 @@ pub const Engine = struct {
             z += bary[k] * g.vfloat(v, POSITION + 2) * inv[k];
             w += bary[k] * inv[k];
         }
-        in[POSITION + 2] = @bitCast(@as(f32, @floatCast(z)));
+        // (the depth in the clip volume, carried in window units)
+        if (z < g.zlo or z > g.zhi) return false;
+        in[POSITION + 2] = @bitCast(@as(f32, @floatCast(z * g.zscale + g.zoffset)));
         in[POSITION + 3] = @bitCast(@as(f32, @floatCast(w)));
         for (GENERIC..GENERIC_END) |word| {
             switch (sph.interpOf(&g.phead, @intCast((word - GENERIC) / 4), @intCast((word - GENERIC) % 4))) {
@@ -409,6 +507,7 @@ pub const Engine = struct {
         }
         g.at[n] = .{ px, py };
         g.queued = n + 1;
+        return true;
     }
 
     /// The queued pixels' threads run, and their colors written.
@@ -419,17 +518,26 @@ pub const Engine = struct {
         var ps = emu.Stage{ .kind = .pixel, .header = &g.phead, .in = g.pin[0..n], .killed = g.killed[0..n], .cbufs = cb, .ctx = g, .sample = &sampleCall };
         try emu.stageBegin(g.host.work, n);
         try emu.stageRun(g.host.work, &g.host.mem, &ps, n, stats);
-        const blended = g.reg(gr.SET_BLEND) & 1 != 0;
-        if (blended) {
-            // (the one blend the renderer has: premultiplied source over)
-            const want = [7]u32{ 1, gr.BLEND_FUNC_ADD, gr.BLEND_ONE, gr.BLEND_ONE_MINUS_SRC_ALPHA, gr.BLEND_FUNC_ADD, gr.BLEND_ONE, gr.BLEND_ONE_MINUS_SRC_ALPHA };
-            for (want, 0..) |v, k| try g.need(g.reg(gr.SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA + 4 * @as(u32, @intCast(k))) == v, "a blend other than premultiplied source over: not modelled");
+        var bl: ?Blend = null;
+        if (g.reg(gr.SET_BLEND) & 1 != 0) {
+            const b = gr.SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA;
+            try g.need(g.reg(b) == 1, "the alpha's blend not separate (SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA)");
+            var x = Blend{ .ops = undefined, .constant = undefined };
+            for (0..6) |k| {
+                x.ops[k] = g.reg(b + 4 + 4 * @as(u32, @intCast(k)));
+                const ok = if (k % 3 == 0) equationOk(x.ops[k]) else factorOk(x.ops[k]);
+                try g.need(ok, "a blend factor or equation that is not one of GL's");
+            }
+            for (0..4) |k| x.constant[k] = @floatCast(g.float(gr.SET_BLEND_CONST_RED + 4 * @as(u32, @intCast(k))));
+            bl = x;
         }
+        const ct = g.reg(gr.SET_CT_WRITE);
+        const mask: u4 = @intCast((ct & 1) | ((ct >> 4) & 1) << 1 | ((ct >> 8) & 1) << 2 | ((ct >> 12) & 1) << 3);
         for (0..n) |k| {
             if (g.killed[k]) continue;
             var color: [4]f32 = undefined;
             for (&color, 0..) |*ch, r| ch.* = @bitCast(emu.threadReg(g.host.work, @intCast(k), @intCast(r)));
-            write(t, g.at[k][0], g.at[k][1], color, blended);
+            write(t, g.at[k][0], g.at[k][1], color, bl, mask);
         }
         g.pixels += n;
     }
@@ -556,21 +664,87 @@ fn quantize(v: f32) u8 {
     return @intFromFloat(@floor(std.math.clamp(v, 0, 1) * 255 + 0.5));
 }
 
-/// The pixel (x, y) after `src` is drawn there: replaced, or premultiplied
-/// source over what it holds.
-fn write(t: Target, x: u32, y: u32, src: [4]f32, over: bool) void {
+/// A blend as the target's state has it: the equations and factors (rgb's
+/// equation, source, destination, then alpha's), the constant colour.
+const Blend = struct { ops: [6]u32, constant: [4]f32 };
+
+fn equationOk(v: u32) bool {
+    return v == 0x8006 or v == 0x8007 or v == 0x8008 or v == 0x800a or v == 0x800b;
+}
+
+fn factorOk(v: u32) bool {
+    return (v >= 0x4300 and v <= 0x4308) or v == 0x4000 or v == 0x4001 or (v >= 0xc001 and v <= 0xc004);
+}
+
+/// GL's factor for channel `ch` (3: alpha), from the source, the
+/// destination and the constant.
+fn factor(v: u32, ch: usize, s: [4]f32, d: [4]f32, k: [4]f32) f32 {
+    return switch (v) {
+        0x4000 => 0,
+        0x4001 => 1,
+        0x4300 => s[ch],
+        0x4301 => 1 - s[ch],
+        0x4302 => s[3],
+        0x4303 => 1 - s[3],
+        0x4304 => d[3],
+        0x4305 => 1 - d[3],
+        0x4306 => d[ch],
+        0x4307 => 1 - d[ch],
+        0x4308 => if (ch == 3) 1 else @min(s[3], 1 - d[3]),
+        0xc001 => k[ch],
+        0xc002 => 1 - k[ch],
+        0xc003 => k[3],
+        else => 1 - k[3],
+    };
+}
+
+fn equation(v: u32, a: f32, fa: f32, b: f32, fb: f32) f32 {
+    return switch (v) {
+        0x8006 => a * fa + b * fb,
+        0x8007 => @min(a, b),
+        0x8008 => @max(a, b),
+        0x800a => a * fa - b * fb,
+        else => b * fb - a * fa,
+    };
+}
+
+fn pixelBytes(f: Fmt) u32 {
+    return switch (f) {
+        .r8 => 1,
+        .rg8 => 2,
+        else => 4,
+    };
+}
+
+/// The pixel (x, y) after `src` is drawn there: replaced, or blended with
+/// what it holds (`bl`: GL's arithmetic in floats, the colour clamped to
+/// [0, 1] first), the channels `mask` names alone written.
+fn write(t: Target, x: u32, y: u32, src0: [4]f32, bl: ?Blend, mask: u4) void {
     const one: f32 = 1.0 / 255.0;
-    const at = @as(usize, y) * t.pitch + @as(usize, x) * @as(usize, if (t.format == .r8) 1 else 4);
-    if (t.format == .r8) {
-        const dst = @as(f32, @floatFromInt(t.bytes[at])) * one;
-        t.bytes[at] = quantize(if (over) src[0] + dst * (1 - src[3]) else src[0]);
-        return;
-    }
-    // (where each of r, g, b, a is among the pixel's bytes)
-    const order: [4]u8 = if (t.format == .bgra8) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
+    const at = @as(usize, y) * t.pitch + @as(usize, x) * pixelBytes(t.format);
+    // (where each of r, g, b, a is among the pixel's bytes; none: not kept)
+    const order: [4]?u8 = switch (t.format) {
+        .bgra8 => .{ 2, 1, 0, 3 },
+        .rgba8 => .{ 0, 1, 2, 3 },
+        .rg8 => .{ 0, 1, null, null },
+        .r8 => .{ 0, null, null, null },
+    };
+    var src: [4]f32 = undefined;
+    for (&src, src0) |*o, v| o.* = if (v != v) 0 else std.math.clamp(v, 0, 1);
+    var dst: [4]f32 = .{ 0, 0, 0, 1 };
     for (order, 0..) |byte, ch| {
-        const dst = @as(f32, @floatFromInt(t.bytes[at + byte])) * one;
-        t.bytes[at + byte] = quantize(if (over) src[ch] + dst * (1 - src[3]) else src[ch]);
+        if (byte) |b| dst[ch] = @as(f32, @floatFromInt(t.bytes[at + b])) * one;
+    }
+    for (order, 0..) |byte, ch| {
+        const b = byte orelse continue;
+        if ((mask >> @intCast(ch)) & 1 == 0) continue;
+        const v = if (bl) |bx| blk: {
+            const base: usize = if (ch == 3) 3 else 0;
+            const fs = factor(bx.ops[base + 1], ch, src, dst, bx.constant);
+            const fd = factor(bx.ops[base + 2], ch, src, dst, bx.constant);
+            break :blk equation(bx.ops[base], src[ch], fs, dst[ch], fd);
+        } else src[ch];
+        t.bytes[at + b] = quantize(v);
     }
 }
 
@@ -630,8 +804,9 @@ test "a texel through the header's sources, the filter at a centre and between t
 test "a pixel written: replaced, and premultiplied source over" {
     var bytes = [_]u8{ 255, 0, 0, 255 } ** 2; // blue, opaque (b, g, r, a)
     const t = Target{ .bytes = &bytes, .pitch = 8, .width = 2, .height = 1, .format = .bgra8 };
-    write(t, 0, 0, .{ 0, 0.5, 0, 0.5 }, true);
+    const over = Blend{ .ops = .{ 0x8006, 0x4001, 0x4303, 0x8006, 0x4001, 0x4303 }, .constant = .{ 0, 0, 0, 0 } };
+    write(t, 0, 0, .{ 0, 0.5, 0, 0.5 }, over, 0xf);
     try testing.expectEqualSlices(u8, &.{ 128, 128, 0, 255 }, bytes[0..4]);
-    write(t, 1, 0, .{ 1, 0.5, 0, 0.25 }, false);
+    write(t, 1, 0, .{ 1, 0.5, 0, 0.25 }, null, 0xf);
     try testing.expectEqualSlices(u8, &.{ 0, 128, 255, 64 }, bytes[4..8]);
 }

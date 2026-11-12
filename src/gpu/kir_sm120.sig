@@ -184,6 +184,8 @@ const Opd = union(enum) {
     label: u16,
     bar: u8,
     ur4,
+    /// An attribute word's byte address (a graphics stage's a[...]).
+    attr: u32,
 };
 
 const Kind = enum(u8) { inst, label, dead };
@@ -285,6 +287,10 @@ pub const State = struct {
     asm_work: sm120_asm.Work = .{},
     /// What the last compile made (for tests and reports).
     stats: Stats = .{},
+    /// A stage's: what its program loads and stores (Stage).
+    io: StageIO = .{},
+    /// A pixel program's output registers (virtual: copied to R0.. at EXIT).
+    outv: [MAX_OUTPUTS]u16 = @splat(NOV),
 };
 
 /// The bytes of a device.Work that `compile` takes (its State, aligned).
@@ -310,6 +316,61 @@ pub const Options = struct {
     /// paths: Galaxy's frame kernels' square root), else kir.expandSqrt's
     /// (exact for any frsq within its bound, about twice as long).
     native_sqrt: bool = true,
+    /// What the kernel is: a compute kernel (a QMD launches it), or the
+    /// 3D engine's vertex or pixel program (see Stage).
+    stage: Stage = .compute,
+    /// A stage's attribute words and outputs: the binding its loads and
+    /// stores name (one the kernel declares, never bound to memory).
+    stage_io: u8 = 0xff,
+};
+
+/// A graphics stage's program (the 3D engine's; its header, sph.sig, is the
+/// caller's, made from what State.io says the program does). Its inputs
+/// and outputs are KIR loads and stores through Options.stage_io, at the
+/// byte address `imm` (the address 0 register-free: `u(0)`), 32 bits each:
+///
+/// - **vertex**: a load is ALD a[imm] (the vertex's index 0x2fc, the
+///   instance's 0x2f8), a store AST a[imm] (the position 0x70..0x7c, generic
+///   vector n's component c at 0x80 + 16n + 4c).
+/// - **pixel**: a load is IPA a[imm]: .PASS (carried across the triangle,
+///   as the header says: in perspective a varying arrives over w, and the
+///   KIR multiplies by w itself), or .CONSTANT where the address has FLAT
+///   (flat: the provoking vertex's). The position's words are the
+///   pixel's centre, its depth and 1/w. A store at OUT_AT + 4r is output
+///   register r (target t's channel c is r = 4t + c), whatever is stored
+///   last before EXIT (an output never stored is 0); a store at KILL_AT
+///   (any value) discards the pixel (KILL: the thread runs on, its outputs
+///   unwritten).
+///
+/// Ids, groups, shared memory, barriers and collectives are compute's
+/// alone (Unsupported in a stage).
+pub const Stage = enum(u8) { compute, vertex, pixel };
+pub const OUT_AT: u32 = 0x1000;
+pub const KILL_AT: u32 = 0x2000;
+/// A pixel program's load of a word flat (IPA.CONSTANT): its address | FLAT.
+pub const FLAT: u32 = 0x10000;
+/// Pixel outputs: eight targets of four channels.
+pub const MAX_OUTPUTS = 32;
+
+/// What a stage's program loads and stores (after dead code is dropped):
+/// attribute words (bit i: the word at byte 4i), those loaded flat, the
+/// output registers written, whether it discards.
+pub const StageIO = struct {
+    loads: [8]u32 = @splat(0),
+    flat: [8]u32 = @splat(0),
+    stores: [8]u32 = @splat(0),
+    outputs: u32 = 0,
+    kills: bool = false,
+
+    pub fn has(set: *const [8]u32, at: u32) bool {
+        const i = at / 4;
+        return i < 256 and (set[i / 32] >> @intCast(i % 32)) & 1 != 0;
+    }
+
+    fn add(set: *[8]u32, at: u32) void {
+        const i = at / 4;
+        if (i < 256) set[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+    }
 };
 
 /// Binary.extra's words for sm_120.
@@ -373,7 +434,9 @@ pub fn compileText(k: *const kir.Kernel, caps: device.Caps, st: *State, opts: Op
     try c.lower();
     c.dce();
     try c.liveness();
+    c.stageLive();
     try c.allocate();
+    c.stageIO();
     return c.emitText();
 }
 
@@ -933,6 +996,7 @@ const Ctx = struct {
         }
         try c.groups();
         try c.prologue();
+        try c.stageOutputs();
         var regions: [MAX_DEPTH * 2]Region = undefined;
         var sp: usize = 0;
         var idx: usize = 0;
@@ -1040,7 +1104,8 @@ const Ctx = struct {
             switch (in.op) {
                 .ld, .st, .atom, .cas => {
                     const m: kir.Mem = @bitCast(in.aux);
-                    if (m.space == .global) {
+                    // (a stage's inputs and outputs are not memory)
+                    if (m.space == .global and !c.isStageIO(m)) {
                         used[m.binding] = true;
                         c.global = true;
                     }
@@ -1929,8 +1994,113 @@ const Ctx = struct {
         };
     }
 
+    // ── A graphics stage's inputs and outputs (Stage) ───────────────────
+
+    fn isStageIO(c: *const Ctx, m: kir.Mem) bool {
+        return c.opts.stage != .compute and m.space == .global and m.binding == c.opts.stage_io;
+    }
+
+    /// A pixel program's outputs: a register each, 0 from the start, kept
+    /// to the end (stageLive) and copied to R0.. at each EXIT (emitText).
+    fn stageOutputs(c: *Ctx) Error!void {
+        const w = c.w;
+        w.outv = @splat(NOV);
+        if (c.opts.stage != .pixel) return;
+        for (c.insts()) |in| {
+            if (in.op != .st) continue;
+            const m: kir.Mem = @bitCast(in.aux);
+            if (!c.isStageIO(m) or m.imm < OUT_AT or m.imm >= KILL_AT) continue;
+            const r = (m.imm - OUT_AT) / 4;
+            if (r >= MAX_OUTPUTS) return error.Unsupported;
+            if (w.outv[r] != NOV) continue;
+            const v = try c.newV(.r);
+            w.outv[r] = v;
+            try c.eff("MOV", 1, &.{ R(v), .rz });
+        }
+    }
+
+    fn stageLoad(c: *Ctx, in: kir.Inst, m: kir.Mem) Error!void {
+        if (m.width_log2 != 5 or isReg(in.a)) return error.Unsupported;
+        const addr: u32 = m.imm + switch (in.a) {
+            .imm => |x| x,
+            else => 0,
+        };
+        const flat = addr & FLAT != 0;
+        switch (c.opts.stage) {
+            .vertex => try c.ins("ALD", 1, &.{ c.dst(in), .{ .attr = addr & ~FLAT } }),
+            .pixel => try c.ins(if (flat) "IPA.CONSTANT" else "IPA.PASS", 1, &.{ c.dst(in), .{ .attr = addr & ~FLAT } }),
+            .compute => unreachable,
+        }
+    }
+
+    fn stageStore(c: *Ctx, in: kir.Inst, m: kir.Mem) Error!void {
+        if (m.width_log2 != 5 or isReg(in.a)) return error.Unsupported;
+        const addr: u32 = m.imm + switch (in.a) {
+            .imm => |x| x,
+            else => 0,
+        };
+        switch (c.opts.stage) {
+            .vertex => try c.eff("AST", 0, &.{ .{ .attr = addr }, try c.reg(in.b) }),
+            .pixel => {
+                if (addr >= KILL_AT) return c.eff("KILL", 0, &.{});
+                if (addr < OUT_AT) return error.Unsupported;
+                try c.eff("MOV", 1, &.{ R(c.w.outv[(addr - OUT_AT) / 4]), c.src(in.b) });
+            },
+            .compute => unreachable,
+        }
+    }
+
+    /// The outputs live to the program's end: nothing else takes their
+    /// registers, whichever EXIT a thread leaves by.
+    fn stageLive(c: *Ctx) void {
+        const w = c.w;
+        if (c.opts.stage != .pixel) return;
+        for (w.outv) |v| {
+            if (v == NOV) continue;
+            if (w.first[v] == std.math.maxInt(u32)) w.first[v] = 0;
+            w.last[v] = @intCast(w.n_mi);
+        }
+    }
+
+    /// What the program loads and stores, from its live instructions.
+    fn stageIO(c: *Ctx) void {
+        const w = c.w;
+        w.io = .{};
+        if (c.opts.stage == .compute) return;
+        for (w.mi[0..w.n_mi]) |*m| {
+            if (m.kind != .inst) continue;
+            if (std.mem.eql(u8, m.op, "KILL")) w.io.kills = true;
+            for (m.o[0..m.n]) |o| {
+                if (o != .attr) continue;
+                if (std.mem.startsWith(u8, m.op, "AST")) {
+                    StageIO.add(&w.io.stores, o.attr);
+                } else {
+                    StageIO.add(&w.io.loads, o.attr);
+                    if (std.mem.eql(u8, m.op, "IPA.CONSTANT")) StageIO.add(&w.io.flat, o.attr);
+                }
+            }
+        }
+        for (w.outv, 0..) |v, r| {
+            if (v != NOV) w.io.outputs |= @as(u32, 1) << @intCast(r);
+        }
+    }
+
+    /// The highest general register allocated.
+    fn topRegister(c: *const Ctx) u8 {
+        const w = c.w;
+        var top: u8 = 0;
+        for (0..w.nv) |vi| {
+            if (w.lead[vi] != vi or w.first[vi] == std.math.maxInt(u32)) continue;
+            if (w.cls[vi] == .p and !w.spilled[vi]) continue;
+            const sz: u8 = if (w.cls[vi] == .p) 1 else w.size[vi];
+            top = @max(top, w.phys[vi] + sz - 1);
+        }
+        return top;
+    }
+
     fn load(c: *Ctx, in: kir.Inst) Error!void {
         const m: kir.Mem = @bitCast(in.aux);
+        if (c.isStageIO(m)) return c.stageLoad(in, m);
         if (m.width_log2 < 3) return error.BadOperand;
         if (m.space == .global) {
             const ad = try c.gaddr(m, in.a);
@@ -1943,6 +2113,7 @@ const Ctx = struct {
 
     fn store(c: *Ctx, in: kir.Inst) Error!void {
         var m: kir.Mem = @bitCast(in.aux);
+        if (c.isStageIO(m)) return c.stageStore(in, m);
         m.signed = false;
         if (m.width_log2 < 3) return error.BadOperand;
         const v: Opd = if (m.width_log2 >= 6) R(vOf(in.b)) else try c.reg(in.b);
@@ -2418,6 +2589,7 @@ const Ctx = struct {
 
     fn emitText(c: *Ctx) Error![]const u8 {
         const w = c.w;
+        const top = c.topRegister();
         var t = Text{ .buf = &w.text };
         t.str(".params ");
         t.dec(8 * @as(u32, c.k.bindings) + 4 * @as(u32, c.k.param_words));
@@ -2457,6 +2629,23 @@ const Ctx = struct {
             }
             if (scratch + 1 < w.npreds) return error.TooManyRegs;
             var spilled_dst: ?u16 = null;
+            // (a pixel program's outputs into R0.., through registers past
+            // every one in use, so no copy overwrites one not made yet)
+            if (c.opts.stage == .pixel and std.mem.eql(u8, m.op, "EXIT")) {
+                const hi: u32 = @as(u32, top) + 1;
+                for (0..2) |pass| for (w.outv, 0..) |v, r| {
+                    if (v == NOV) continue;
+                    if (hi + r > MAX_GPR) return error.TooManyRegs;
+                    if (m.guard != .none) {
+                        t.str("@");
+                        c.printOpd(&t, m.guard, map[0..n_map], null);
+                        t.str(" ");
+                    }
+                    t.reg("MOV R", @intCast(if (pass == 0) hi + r else r));
+                    t.reg(", R", if (pass == 0) c.physOf(v) else @as(u32, @intCast(hi + r)));
+                    t.str("\n");
+                };
+            }
             if (m.guard != .none) {
                 t.str("@");
                 c.printOpd(&t, m.guard, map[0..n_map], null);
@@ -2531,6 +2720,11 @@ const Ctx = struct {
             .imm => |x| t.hex(x),
             .cbuf => |x| {
                 t.str("c[0x0][");
+                t.hex(x);
+                t.str("]");
+            },
+            .attr => |x| {
+                t.str("a[");
                 t.hex(x);
                 t.str("]");
             },
