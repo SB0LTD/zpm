@@ -351,7 +351,9 @@ test "gfxapi: a buffer a batch still uses is freed after it; a lost GPU's batch 
     ctx.readPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &px);
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, &px);
     try std.testing.expectEqual(runs, Flaky.runs);
-    try std.testing.expectEqualStrings("Galaxy (CPU)", std.mem.span(ctx.getString(g.RENDERER).?));
+    // (the CPU's renderer now, with the driver build's tag as on the GPU)
+    try std.testing.expectEqualStrings(gles.RENDERER_CPU, std.mem.span(ctx.getString(g.RENDERER).?));
+    try std.testing.expectEqualStrings("Galaxy (CPU) " ++ gfxapi.progbin.BUILD_TAG, gles.RENDERER_CPU);
     eng_f.freeImage(&b);
 }
 

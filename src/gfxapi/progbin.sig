@@ -29,9 +29,17 @@
 //!
 //! The driver build id is the hash, taken at compile time, of the sources
 //! that decide what a link makes and how the engine reads it (this file,
-//! program.sig, raster.sig, texture.sig and the GLSL front end), the Sig
-//! compiler's version and the CPU architecture: any change to them is
-//! another build, whose binaries the old one refuses and the reverse.
+//! program.sig, raster.sig, texture.sig and the GLSL front end) and the
+//! Sig compiler's version: any change to them is another build, whose
+//! binaries the old one refuses and the reverse. (Not the CPU: the format
+//! is the same on each, so the PC's and the Surface's drivers built from
+//! one source are one build, with one tag.)
+//!
+//! GL_RENDERER ends with that build's tag, "gx-" and the id's low 32 bits
+//! in hex (BUILD_TAG), on every path (a GPU, the CPU): WebRender's cache
+//! names each program by GL_RENDERER and its source, so a new driver build
+//! names its programs anew and never asks for the old build's binaries
+//! (which it would refuse, and WebRender would never write again).
 //!
 //! Allocation-free: the writer counts or fills the caller's buffer; the
 //! reader walks the caller's bytes.
@@ -103,11 +111,14 @@ pub const DRIVER_BUILD: u64 = blk: {
     var h: @Vector(8, u64) = @splat(VERSION);
     for (BUILD_FILES) |f| h = mixLanes(h, @embedFile(f));
     h = mixLanes(h, builtin.zig_version_string);
-    h = mixLanes(h, @tagName(builtin.cpu.arch));
     var r: u64 = 0xcbf2_9ce4_8422_2325;
     for (0..8) |j| r = (r ^ h[j]) *% 0x0000_0100_0000_01B3;
     break :blk r;
 };
+
+/// This build's tag, as GL_RENDERER ends: "gx-" and DRIVER_BUILD's low 32
+/// bits, 8 hex digits.
+pub const BUILD_TAG = std.fmt.comptimePrint("gx-{x:0>8}", .{@as(u32, @truncate(DRIVER_BUILD))});
 
 /// The GPU a binary is for: the device's vendor, ISA and name, or the CPU
 /// (an engine without a device). A GPU lost since stays the engine's.
@@ -388,4 +399,7 @@ test "progbin: header, sections, checksum, refusals" {
     ws.end();
     try std.testing.expect(ws.finish(gid) == null);
     try std.testing.expect(DRIVER_BUILD != 0);
+    // (the tag: "gx-" and the id's low 32 bits)
+    try std.testing.expect(std.mem.startsWith(u8, BUILD_TAG, "gx-"));
+    try std.testing.expectEqual(@as(u32, @truncate(DRIVER_BUILD)), try std.fmt.parseInt(u32, BUILD_TAG[3..], 16));
 }

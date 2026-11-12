@@ -3102,6 +3102,13 @@ test "libgles: program binaries: a round trip draws alike; damage, another build
     try E(@as(?*const anyopaque, @ptrCast(&glProgramBinaryOES)), getProcAddress("glProgramBinaryOES"));
     try E(@as(?*const anyopaque, @ptrCast(&glGetProgramBinaryOES)), getProcAddress("glGetProgramBinaryOES"));
     try E(@as(?*const anyopaque, @ptrCast(&glProgramBinary)), getProcAddress("glProgramBinary"));
+    // GL_RENDERER ends with the driver build's tag (WebRender's cache key
+    // changes with each build), the same on the GPU's renderer and the
+    // CPU's: "gx-" and the build id's low 32 bits
+    const renderer = std.mem.span(glGetString(g.RENDERER).?);
+    try std.testing.expectEqualStrings("Galaxy (CPU) " ++ pb.BUILD_TAG, renderer);
+    try std.testing.expect(std.mem.endsWith(u8, gles.RENDERER_GPU, pb.BUILD_TAG) and std.mem.startsWith(u8, gles.RENDERER_GPU, "Galaxy (GPU) gx-"));
+    try E(@as(usize, 11), pb.BUILD_TAG.len);
 
     // what the scene draws: a quad, colour per vertex, a flat varying,
     // a uniform array, a sampler
