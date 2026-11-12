@@ -564,7 +564,11 @@ pub const Engine = struct {
     fn depthIn(g: *const Engine, tri: [3]usize, bary: [3]f64) bool {
         var z: f64 = 0;
         for (tri, 0..) |v, k| z += bary[k] * g.vfloat(v, POSITION + 2) / g.vfloat(v, POSITION + 3);
-        return z >= g.zlo and z <= g.zhi;
+        // (the hardware clips the triangle, not each pixel: a pixel of one
+        // on the plane (WebRender's ps_clear: z = w) is in, whatever the
+        // last bit of its interpolation)
+        const eps = 1e-5;
+        return z >= g.zlo - eps and z <= g.zhi + eps;
     }
 
     /// A pixel queued (a helper: not covered, run for its quad, never
