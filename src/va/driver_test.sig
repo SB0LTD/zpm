@@ -637,6 +637,177 @@ test "driver: an AV1 config makes an AV1 context with the module's buffers" {
     try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
 }
 
+// ── A lost video channel ────────────────────────────────────────────────────
+
+const av1 = @import("av1.sig");
+
+/// An AV1 key frame of 256 x 128 (one tile); `intrabc`: screen content
+/// with intrabc, whose EndPicture waits for the decode (libaom's choice
+/// for a test pattern, pc-1111e's clip).
+fn av1Key(target: u32, intrabc: bool) av1.PictureParameterBufferAV1 {
+    var p = av1.PictureParameterBufferAV1{};
+    p.seq_info_fields = .{ .enable_order_hint = 1, .enable_cdef = 1, .subsampling_x = 1, .subsampling_y = 1, .enable_filter_intra = 1, .enable_intra_edge_filter = 1 };
+    p.order_hint_bits_minus_1 = 6;
+    p.frame_width_minus1 = 255;
+    p.frame_height_minus1 = 127;
+    p.current_frame = target;
+    p.pic_info_fields = .{ .frame_type = 0, .show_frame = 1, .error_resilient_mode = 1, .uniform_tile_spacing_flag = 1, .allow_screen_content_tools = @intFromBool(intrabc), .allow_intrabc = @intFromBool(intrabc) };
+    p.base_qindex = 100;
+    p.cdef_bits = 1;
+    p.cdef_damping_minus_3 = 2;
+    p.cdef_y_strengths[0] = (5 << 2) | 3;
+    p.filter_level = .{ 10, 12 };
+    p.mode_control_fields = .{ .tx_mode = 2 };
+    return p;
+}
+
+/// An AV1 inter frame referencing `ref` in every slot, as FFmpeg's next
+/// packet after a key frame.
+fn av1Inter(target: u32, ref: u32) av1.PictureParameterBufferAV1 {
+    var p = av1Key(target, false);
+    p.pic_info_fields = .{ .frame_type = 1, .show_frame = 1, .uniform_tile_spacing_flag = 1 };
+    p.order_hint = 1;
+    p.ref_frame_map = [_]u32{ref} ** 8;
+    p.ref_frame_idx = .{ 0, 1, 2, 3, 4, 5, 6 };
+    p.primary_ref_frame = 0;
+    return p;
+}
+
+/// One AV1 picture as FFmpeg's vaapi_av1 hands it (parameters, one tile's
+/// parameters and data): Begin, Render and End must all answer SUCCESS,
+/// the channel lost or not (an EndPicture failure is what crashed FFmpeg
+/// 6.1.2 on pc-1111e: av1dec.c's skip_mode_params read a NULL header).
+fn decodeAv1(d: *TestDriver, ctx: u32, pic: *const av1.PictureParameterBufferAV1, surface: u32) !void {
+    const tile = av1.SliceParameterBufferAV1{ .slice_data_size = 6, .slice_data_offset = 2, .tile_row = 0, .tile_column = 0 };
+    const data = [_]u8{ 0, 0, 1, 2, 3, 4, 5, 6 };
+    var ids: [3]u32 = undefined;
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(va.PICTURE_PARAMETER_BUFFER, @sizeOf(av1.PictureParameterBufferAV1), 1, pic, &ids[0]));
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(va.SLICE_PARAMETER_BUFFER, @sizeOf(av1.SliceParameterBufferAV1), 1, &tile, &ids[1]));
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(va.SLICE_DATA_BUFFER, data.len, 1, &data, &ids[2]));
+    try testing.expectEqual(va.SUCCESS, d.beginPicture(ctx, surface));
+    try testing.expectEqual(va.SUCCESS, d.renderPicture(ctx, ids[0..1]));
+    try testing.expectEqual(va.SUCCESS, d.renderPicture(ctx, ids[1..3]));
+    try testing.expectEqual(va.SUCCESS, d.endPicture(ctx));
+    for (ids) |id| try testing.expectEqual(va.SUCCESS, d.destroyBuffer(id));
+}
+
+test "driver: the video channel lost mid-decode (AV1, EndPicture waiting): EndPicture answers SUCCESS, every reader LOST_STATUS, nothing NULL as success" {
+    var k = Fake{};
+    var d: TestDriver = .{ .node = .{ .sys = &k } };
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    var cfg: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createConfig(av1.PROFILE, va.ENTRYPOINT_VLD, &.{}, &cfg));
+    var s: [4]u32 = undefined;
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, 256, 128, &s, &.{}));
+    var ctx: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createContext(cfg, 256, 128, &ctx));
+
+    // A key frame before the loss: decoded, read through a derived image.
+    try decodeAv1(&d, ctx, &av1Key(s[0], true), s[0]);
+    try testing.expectEqual(va.SUCCESS, d.syncSurface(s[0], SYNC_NS));
+    var derived: va.Image = undefined;
+    try testing.expectEqual(va.SUCCESS, d.deriveImage(s[0], &derived));
+
+    // The next key frame: taken, then the channel faults under it, found
+    // by EndPicture's own wait (intrabc). EndPicture still says SUCCESS.
+    k.vfault_at = k.n_submits + 1;
+    try decodeAv1(&d, ctx, &av1Key(s[1], true), s[1]);
+    try testing.expect(k.vlost and d.node.lost);
+    const submitted = k.n_submits;
+
+    // Its readers: each an error, every out written or left alone, never a
+    // NULL or an empty descriptor as SUCCESS.
+    var status: u32 = 0xdead;
+    try testing.expectEqual(driver.LOST_STATUS, d.querySurfaceStatus(s[1], &status));
+    try testing.expectEqual(va.SURFACE_READY, status);
+    try testing.expectEqual(driver.LOST_STATUS, d.syncSurface(s[1], SYNC_NS));
+    var desc = std.mem.zeroes(va.DrmPrimeDescriptor);
+    try testing.expectEqual(driver.LOST_STATUS, d.exportSurfaceHandle(s[1], va.MEM_TYPE_DRM_PRIME_2, va.EXPORT_SURFACE_COMPOSED_LAYERS, &desc));
+    try testing.expectEqual(@as(u32, 0), desc.num_objects);
+    try testing.expectEqual(@as(u32, 0), desc.num_layers);
+    var img: va.Image = undefined;
+    try testing.expectEqual(driver.LOST_STATUS, d.deriveImage(s[1], &img));
+    var own: va.Image = undefined;
+    try testing.expectEqual(va.SUCCESS, d.createImage(&va.NV12_FORMAT, 256, 128, &own));
+    try testing.expectEqual(driver.LOST_STATUS, d.getImage(s[1], 0, 0, 256, 128, own.image_id));
+    try testing.expectEqual(va.SUCCESS, d.destroyImage(own.image_id));
+
+    // FFmpeg goes on with the next packets (an inter frame, a key frame):
+    // all taken, none submitted, each lost at its sync.
+    try decodeAv1(&d, ctx, &av1Inter(s[2], s[1]), s[2]);
+    try decodeAv1(&d, ctx, &av1Key(s[3], true), s[3]);
+    try decodeAv1(&d, ctx, &av1Inter(s[1], s[3]), s[1]);
+    try testing.expectEqual(submitted, k.n_submits);
+    for (s[1..]) |id| try testing.expectEqual(driver.LOST_STATUS, d.syncSurface(id, SYNC_NS));
+
+    // The picture made before the loss is still there: its sync, its
+    // derived image mapped (a real pointer, the picture: black, as the
+    // fake decoder writes nothing), its export (real fds).
+    try testing.expectEqual(va.SUCCESS, d.syncSurface(s[0], SYNC_NS));
+    status = 0xdead;
+    try testing.expectEqual(va.SUCCESS, d.querySurfaceStatus(s[0], &status));
+    try testing.expectEqual(va.SURFACE_READY, status);
+    var p: ?*anyopaque = null;
+    try testing.expectEqual(va.SUCCESS, d.mapBuffer(derived.buf, &p));
+    try testing.expect(p != null);
+    try testing.expectEqual(@as(u8, 16), @as([*]const u8, @ptrCast(p.?))[0]);
+    try testing.expectEqual(va.SUCCESS, d.unmapBuffer(derived.buf));
+    try testing.expectEqual(va.SUCCESS, d.destroyImage(derived.image_id));
+    desc = std.mem.zeroes(va.DrmPrimeDescriptor);
+    try testing.expectEqual(va.SUCCESS, d.exportSurfaceHandle(s[0], va.MEM_TYPE_DRM_PRIME_2, va.EXPORT_SURFACE_COMPOSED_LAYERS, &desc));
+    try testing.expect(desc.num_objects >= 1 and desc.objects[0].fd >= 0 and desc.num_layers == 1);
+
+    // A new context or surface on this display fails cleanly (the open
+    // file's channel stays lost); the old ones go cleanly.
+    var ctx2: u32 = 0xabc;
+    try testing.expectEqual(driver.LOST_STATUS, d.createContext(cfg, 256, 128, &ctx2));
+    try testing.expectEqual(@as(u32, 0xabc), ctx2);
+    var more: [1]u32 = .{0xabc};
+    try testing.expectEqual(driver.LOST_STATUS, d.createSurfaces(va.RT_FORMAT_YUV420, 256, 128, &more, &.{}));
+    try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
+    try testing.expectEqual(va.SUCCESS, d.destroySurfaces(&s));
+    try testing.expect(d.told_lost);
+}
+
+test "driver: the video channel lost under an H.264 decode: found at the next submission and at the sync, never at EndPicture" {
+    var k = Fake{ .decoder = fakeDecode };
+    seen = .{};
+    var d: TestDriver = .{ .node = .{ .sys = &k } };
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    var cfg: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createConfig(va.PROFILE_H264_MAIN, va.ENTRYPOINT_VLD, &.{}, &cfg));
+    var s: [3]u32 = undefined;
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, 40, 24, &s, &.{}));
+    var ctx: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createContext(cfg, 40, 24, &ctx));
+    try decodeOne(&d, ctx, &testPic(s[0], 0), s[0]);
+    try testing.expectEqual(va.SUCCESS, d.syncSurface(s[0], SYNC_NS));
+    try expectPicture(&d, s[0], 0);
+
+    // Picture 1 is taken and faults the channel (nothing waits for it
+    // yet); picture 2's submission finds the channel lost (EIO).
+    k.vfault_at = k.n_submits + 1;
+    try decodeOne(&d, ctx, &testPic(s[1], 1), s[1]);
+    try testing.expect(!d.node.lost);
+    try decodeOne(&d, ctx, &testPic(s[2], 2), s[2]);
+    try testing.expect(d.node.lost);
+    const submitted = k.n_submits;
+    // (round the frame slots: no slot is waited for, nothing submitted)
+    for (3..9) |n| try decodeOne(&d, ctx, &testPic(s[n % 2 + 1], @intCast(n)), s[n % 2 + 1]);
+    try testing.expectEqual(submitted, k.n_submits);
+    try testing.expectEqual(driver.LOST_STATUS, d.syncSurface(s[1], SYNC_NS));
+    try testing.expectEqual(driver.LOST_STATUS, d.syncSurface(s[2], SYNC_NS));
+    var desc = std.mem.zeroes(va.DrmPrimeDescriptor);
+    try testing.expectEqual(driver.LOST_STATUS, d.exportSurfaceHandle(s[1], va.MEM_TYPE_DRM_PRIME_2, 0, &desc));
+    try testing.expectEqual(@as(u32, 0), desc.num_objects);
+    // (the picture before the loss: still decoded, still read)
+    try testing.expectEqual(va.SUCCESS, d.syncSurface(s[0], SYNC_NS));
+    try expectPicture(&d, s[0], 0);
+    try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
+}
+
 // ── Encoding ────────────────────────────────────────────────────────────────
 
 /// What the pretend encoder saw of the last picture.
