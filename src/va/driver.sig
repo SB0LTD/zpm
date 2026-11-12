@@ -24,7 +24,11 @@
 //!   decoder's scratch (H.264: co-located motion for every picture slot,
 //!   macroblock history, history; a module's: what scratchBytes says).
 //! - **BeginPicture** takes the next frame slot (waiting for its last
-//!   decode); **RenderPicture** keeps the picture parameters and scaling
+//!   decode, FRAMES pictures back) and does what a codec module asked to
+//!   do after the context's last decode (End.wait: VP9's backward
+//!   adaptation, AV1's intrabc fixup), that decode waited for first: so
+//!   the decoder runs while the app makes the next picture, and
+//!   EndPicture never waits; **RenderPicture** keeps the picture parameters and scaling
 //!   lists and writes each slice into the slot's bitstream with a start
 //!   code in front (VA hands slices without one), its offset in the slice
 //!   table; **EndPicture** gives the target and each reference a picture
@@ -38,6 +42,15 @@
 //!
 //! VA buffers live in a fixed pool reserved at init: SMALL_BUFFERS of 64
 //! KiB (parameters) and LARGE_BUFFERS of 16 MiB (slice data, images).
+//!
+//! The pipeline: up to FRAMES pictures of a context in flight on the
+//! decoder's one channel (in order, so a picture whose reference is still
+//! decoding runs after it), and the driver waits only for a frame slot
+//! coming round, a module's step after a decode, and what the app asks
+//! (a sync, a map, an image, an export, an encode's input). With
+//! GALAXY_VA_DEBUG each decode context says at its end how deep the
+//! pipeline ran, the waits that slept (the driver's own and the app's, a
+//! picture), and the decoder's cycles a picture (Stats).
 //!
 //! What an encode is here (the RTX's NVENC, encode.sig and nvenc.sig):
 //!
@@ -121,6 +134,10 @@ pub const SYNC_NS: i64 = 2_000_000_000;
 
 pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264, HEVC, VP8, VP9, AV1) and NVENC (H.264, HEVC), zpm";
 
+/// vaMapBuffer2's flags (VA_MAPBUFFER_FLAG_READ, _WRITE).
+pub const MAP_READ: u32 = 1;
+pub const MAP_WRITE: u32 = 2;
+
 /// Coded buffers at once (the kernel's buffers).
 pub const MAX_CODED = 16;
 /// An encode frame slot: the pushbuffer, then the picture setup.
@@ -201,6 +218,14 @@ pub const Options = struct {
     vp9_intra_top: bool = true,
     /// GALAXY_VA_VP9_STREAM_LEN: what VP9's stream_len counts (vp9.StreamLen)
     vp9_stream_len: vp9.StreamLen = .frame,
+    /// GALAXY_VA_SERIAL=1: a module's step after a decode (End.wait) done
+    /// at its EndPicture, waiting for the decode there, as before the
+    /// pipeline (one boot can time both)
+    serial_after: bool = false,
+    /// GALAXY_VA_SCRATCH=vram: H.264's decoder-only buffers (co-located
+    /// motion, macroblock history, history: the CPU never touches them)
+    /// in VRAM, beside the frame slots in system memory
+    h264_scratch_vram: bool = false,
     /// GALAXY_VA_ENCODE=0: no encode entrypoints
     encode: bool = true,
     /// GALAXY_VA_NVENC_MAGIC: the encoder setup's magic word (nvenc.MAGIC)
@@ -290,6 +315,15 @@ const Context = struct {
     coloc_off: usize = 0,
     mbhist_off: usize = 0,
     history_off: usize = 0,
+    /// where H.264's offsets above count from: the work buffer, or (with
+    /// GALAXY_VA_SCRATCH=vram) `vram_scratch` less coloc_off
+    scratch_base: u64 = 0,
+    vram_scratch: Buf = .{},
+    /// a module's step due after its last decode (End.wait), and that
+    /// decode's fence: done at the next BeginPicture
+    after_due: bool = false,
+    after_fence: u32 = 0,
+    stats: Stats = .{},
     /// each frame slot's last decode: fence, surface, number
     frame_fence: [FRAMES]u32 = [_]u32{0} ** FRAMES,
     frame_surface: [FRAMES]u16 = [_]u16{NONE} ** FRAMES,
@@ -321,6 +355,75 @@ const Context = struct {
 
     fn frameBytes(c: *const Context, f: usize) []u8 {
         return c.work.bytes()[f * FRAME_BYTES ..][0..FRAME_BYTES];
+    }
+
+    fn moduleScratch(c: *const Context) codec.Scratch {
+        return .{ .cpu = c.work.bytes()[c.scratch_off..][0..c.scratch_bytes], .va = c.work.va + c.scratch_off };
+    }
+};
+
+/// A decode context's pipeline, counted (GALAXY_VA_DEBUG's line at its
+/// end: Stats.line).
+pub const Stats = struct {
+    pictures: u32 = 0,
+    /// the first and last submissions' times (with GALAXY_VA_DEBUG)
+    first_ns: i64 = 0,
+    last_ns: i64 = 0,
+    /// decodes of the channel not yet seen done at each submission (it
+    /// included; with GALAXY_VA_DEBUG a look at the one before tells),
+    /// summed, and the most
+    in_flight_sum: u64 = 0,
+    in_flight_max: u32 = 0,
+    /// the driver's own waits that slept: for a frame slot, for a
+    /// module's step after a decode; their time
+    slot_waits: u32 = 0,
+    after_waits: u32 = 0,
+    own_ns: u64 = 0,
+    /// the channel's counts at the first picture (the app's waits: all
+    /// since, less the driver's own)
+    mark: node.WaitStats = .{},
+    /// the decoder's statuses read, and their cycle counts
+    statuses: u32 = 0,
+    cycles_sum: u64 = 0,
+    cycles_max: u32 = 0,
+
+    /// The driver's own waits between two counts of the channel's, as
+    /// `why`'s.
+    pub fn own(s: *Stats, why: enum { slot, after }, from: node.WaitStats, to: node.WaitStats) void {
+        const n = to.blocked -% from.blocked;
+        switch (why) {
+            .slot => s.slot_waits +%= n,
+            .after => s.after_waits +%= n,
+        }
+        s.own_ns +%= to.blocked_ns -% from.blocked_ns;
+    }
+
+    pub fn status(s: *Stats, cycles: u32) void {
+        s.statuses +%= 1;
+        s.cycles_sum +%= cycles;
+        s.cycles_max = @max(s.cycles_max, cycles);
+    }
+
+    /// The summary, for a context of `codec_name` `width` x `height`, the
+    /// channel's counts now being `now`.
+    pub fn line(s: *const Stats, buf: []u8, codec_name: []const u8, width: u32, height: u32, now: node.WaitStats) []const u8 {
+        const n: u64 = @max(s.pictures, 1);
+        const own_n: u64 = @as(u64, s.slot_waits) + s.after_waits;
+        const all_n: u64 = now.blocked -% s.mark.blocked;
+        const all_ns: u64 = now.blocked_ns -% s.mark.blocked_ns;
+        const app_n = all_n -| own_n;
+        const app_ns = all_ns -| s.own_ns;
+        const span: u64 = @intCast(@max(s.last_ns - s.first_ns, 0));
+        const rate: u64 = if (span > 0 and s.pictures > 1) @as(u64, s.pictures - 1) * 1_000_000_000 / span else 0;
+        const depth10 = s.in_flight_sum * 10 / n;
+        const own100 = own_n * 100 / n;
+        const app100 = app_n * 100 / n;
+        return std.fmt.bufPrint(buf, "galaxy-va: {s} {d}x{d} pipeline: {d} pictures, {d}/s; in flight at submit avg {d}.{d} max {d}; waits that slept a picture: the driver's {d}.{d:0>2} (frame slot {d}, after a decode {d}; {d} ms), the app's {d}.{d:0>2} ({d}; {d} ms); decoder cycles avg {d} max {d} ({d} statuses)\n", .{
+            codec_name,       width,            height,              s.pictures,  rate,
+            depth10 / 10,     depth10 % 10,     s.in_flight_max,     own100 / 100, own100 % 100,
+            s.slot_waits,     s.after_waits,    s.own_ns / 1_000_000, app100 / 100, app100 % 100,
+            app_n,            app_ns / 1_000_000, s.cycles_sum / @max(s.statuses, 1), s.cycles_max, s.statuses,
+        }) catch buf[0..0];
     }
 };
 
@@ -1009,10 +1112,18 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const mbhist_off = std.mem.alignForward(usize, coloc_off + sz.coloc, 4096);
             const history_off = std.mem.alignForward(usize, mbhist_off + sz.mbhist, 4096);
             const total = history_off + sz.history;
-            const work = d.node.alloc(total, 0) orelse return va.ERROR_ALLOCATION_FAILED;
-            if (!nvdec.addressable(work.va) or !nvdec.addressable(work.va + work.len - 256)) {
+            // (GALAXY_VA_SCRATCH=vram: the frame slots alone in system
+            // memory, the decoder's own buffers in VRAM)
+            const vram = d.opts.h264_scratch_vram;
+            const work = d.node.alloc(if (vram) coloc_off else total, 0) orelse return va.ERROR_ALLOCATION_FAILED;
+            var scratch: Buf = .{};
+            if (vram) scratch = d.node.alloc(total - coloc_off, node.G_VRAM) orelse .{};
+            if (!nvdec.addressable(work.va) or !nvdec.addressable(work.va + work.len - 256) or
+                (vram and (scratch.handle == 0 or !nvdec.addressable(scratch.va) or !nvdec.addressable(scratch.va + scratch.len - 256))))
+            {
                 var w = work;
                 d.node.free(&w);
+                d.node.free(&scratch);
                 return va.ERROR_ALLOCATION_FAILED;
             }
             d.contexts[i] = .{
@@ -1025,9 +1136,12 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 .coloc_off = coloc_off,
                 .mbhist_off = mbhist_off,
                 .history_off = history_off,
+                .scratch_base = if (vram) scratch.va - coloc_off else work.va,
+                .vram_scratch = scratch,
             };
             out.* = CONTEXT_BASE + @as(u32, @intCast(i));
             d.debug("context {d}x{d}: work buffer {d} MiB", .{ width, height, work.len >> 20 });
+            if (vram) d.debug("h264 scratch in VRAM: {d} MiB", .{scratch.len >> 20});
             return va.SUCCESS;
         }
 
@@ -1145,6 +1259,11 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                     _ = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
                 }
             }
+            if (d.opts.debug and c.stats.pictures != 0) {
+                var buf: [512]u8 = undefined;
+                d.node.sys.say(c.stats.line(&buf, @tagName(c.codec), c.width_mbs * 16, c.height_mbs * 16, d.node.vstats));
+            }
+            d.node.free(&c.vram_scratch);
             d.node.free(&c.work);
             c.* = .{};
             return va.SUCCESS;
@@ -1236,6 +1355,18 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             } else out.* = d.storage(i).ptr;
             b.mapped = true;
             return va.SUCCESS;
+        }
+
+        /// vaMapBuffer2: `flags` VA's (MAP_READ, MAP_WRITE; 0 both). A
+        /// derived image mapped to read only: its picture is not converted
+        /// back for the decoder, an export or the encoder (nothing wrote it).
+        pub fn mapBufferFor(d: *Self, id: u32, out: *?*anyopaque, flags: u32) va.Status {
+            const i = d.bufferIndex(id) orelse return va.ERROR_INVALID_BUFFER;
+            const si = d.buffers[i].surface;
+            const stale = si != NONE and d.surfaces[si].tiled_stale;
+            const st = d.mapBuffer(id, out);
+            if (st == va.SUCCESS and si != NONE and flags & (MAP_READ | MAP_WRITE) == MAP_READ) d.surfaces[si].tiled_stale = stale;
+            return st;
         }
 
         pub fn unmapBuffer(d: *Self, id: u32) va.Status {
@@ -1350,6 +1481,9 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const si = d.surfaceIndex(surface) orelse return va.ERROR_INVALID_SURFACE;
             const c = &d.contexts[ci];
             c.target = NONE;
+            // (the channel's counts: the frame slot's wait below is told
+            // apart from the app's)
+            const mark = d.node.vstats;
             if (c.encoding) {
                 // the next frame slot, once its last encode is done
                 const f = c.next_frame;
@@ -1383,6 +1517,14 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             c.target = si;
             c.target_id = surface;
             c.frame = f;
+            c.stats.own(.slot, mark, d.node.vstats);
+            // (the context's last decode's step after it, due now: that
+            // decode ran while the app made this picture)
+            const after = d.finishAfter(c);
+            if (after != va.SUCCESS) {
+                c.target = NONE;
+                return after;
+            }
             switch (c.codec) {
                 .hevc => hevc.begin(&c.hevc),
                 .vp8 => vp8.begin(&c.vp8),
@@ -1550,10 +1692,10 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 .pic_setup = base + PIC_OFF,
                 .bitstream = base + STREAM_OFF,
                 .slice_offsets = base + SLICES_OFF,
-                .coloc = c.work.va + c.coloc_off,
-                .history = c.work.va + c.history_off,
+                .coloc = c.scratch_base + c.coloc_off,
+                .history = c.scratch_base + c.history_off,
                 .status = base + STATUS_OFF,
-                .mbhist = c.work.va + c.mbhist_off,
+                .mbhist = c.scratch_base + c.mbhist_off,
                 .luma = undefined,
                 .chroma = undefined,
                 .picture_index = c.decodes,
@@ -1589,6 +1731,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             c.frame_serial[f] = d.serial;
             c.next_frame = (f + 1) % FRAMES;
             c.decodes +%= 1;
+            d.noteSubmit(c, fence);
             return va.SUCCESS;
         }
 
@@ -1637,6 +1780,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             c.frame_serial[f] = d.serial;
             c.next_frame = (f + 1) % FRAMES;
             c.decodes +%= 1;
+            d.noteSubmit(c, fence);
             // (AV1's film grain: the graded picture written into another
             // surface by the same decode, done with its fence)
             if (e.display) |id| if (d.surfaceIndex(id)) |di| {
@@ -1652,6 +1796,16 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 ds.field_coded = false;
                 ds.fields = 3;
             };
+            // (the module's step after this decode waits for the context's
+            // next BeginPicture, the decoder running meanwhile; with
+            // GALAXY_VA_SERIAL=1 here, as before)
+            if (e.wait and !d.opts.serial_after) {
+                c.after_due = true;
+                c.after_fence = fence;
+                e.wait = false;
+            }
+            const mark = d.node.vstats;
+            defer c.stats.own(.after, mark, d.node.vstats);
             if (e.wait) {
                 const w = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
                 if (w != va.SUCCESS and w != va.ERROR_DECODING_ERROR) return w;
@@ -1664,6 +1818,50 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 }
             }
             return va.SUCCESS;
+        }
+
+        /// The step a module asked for after the context's last decode
+        /// (End.wait), that decode waited for first; nothing due: nothing.
+        fn finishAfter(d: *Self, c: *Context) va.Status {
+            if (!c.after_due) return va.SUCCESS;
+            c.after_due = false;
+            const mark = d.node.vstats;
+            const w = d.node.vwait(c.after_fence, d.node.sys.nowNs() + SYNC_NS);
+            c.stats.own(.after, mark, d.node.vstats);
+            switch (w) {
+                .done => {},
+                .timeout => return va.ERROR_TIMEDOUT,
+                // (the channel lost: nothing comes of the decode; its
+                // picture's readers are told)
+                .lost => return va.SUCCESS,
+            }
+            const scratch = c.moduleScratch();
+            switch (c.codec) {
+                .hevc => hevc.after(&c.hevc, scratch),
+                .vp8 => vp8.after(&c.vp8, scratch),
+                .vp9 => vp9.after(&c.vp9, scratch),
+                .av1 => av1.after(&c.av1, scratch),
+                .h264 => {},
+            }
+            return va.SUCCESS;
+        }
+
+        /// A picture of context `c` submitted with `fence`: counted, and
+        /// (GALAXY_VA_DEBUG) timed, with one look at the channel's picture
+        /// before it to tell how many are still in flight.
+        fn noteSubmit(d: *Self, c: *Context, fence: u32) void {
+            const s = &c.stats;
+            s.pictures +%= 1;
+            if (s.pictures == 1) s.mark = d.node.vstats;
+            if (!d.opts.debug) return;
+            const now = d.node.sys.nowNs();
+            if (s.pictures == 1) s.first_ns = now;
+            s.last_ns = now;
+            const prev = fence -% 1;
+            if (prev != 0 and prev != d.node.vstats.done) _ = d.node.vwait(prev, 0);
+            const n = fence -% d.node.vstats.done;
+            s.in_flight_sum +%= n;
+            s.in_flight_max = @max(s.in_flight_max, n);
         }
 
         /// An encode's picture: the input current, the headers, setup and
@@ -1804,6 +2002,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             if (c.used and c.frame_serial[s.frame] == s.serial) {
                 const at = c.frameBytes(s.frame)[STATUS_OFF..][0..@sizeOf(nvdec.Status)];
                 const st = std.mem.bytesToValue(nvdec.Status, at);
+                c.stats.status(st.cycle_count);
                 if (st.failed()) {
                     d.errors += 1;
                     // (nothing decoded at all: the caller is told; a few

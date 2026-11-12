@@ -55,6 +55,8 @@
 //!   driver.sig       the VA-API objects and calls over the node
 //!   driver_test.sig  the driver against the fake node's pretend decoder
 //!                    and encoder
+//!   driver_pipeline_test.sig  pictures in flight, the waits, VP9's
+//!                    adaptation at the next BeginPicture
 //!   hevc_stream_test.sig  the slice-header parse on x265's real stream
 
 pub const vaapi = @import("vaapi.sig");
@@ -105,6 +107,7 @@ test {
     _ = driver;
     _ = @import("driver_test.sig");
     _ = @import("driver_10bit_test.sig");
+    _ = @import("driver_pipeline_test.sig");
     _ = @import("hevc_stream_test.sig");
     _ = @import("enc_test.sig");
     _ = enc_import;

@@ -85,6 +85,17 @@ pub const Buf = struct {
 
 pub const Wait = enum { done, timeout, lost };
 
+/// The decoder channel's waits (G_VWAIT with a deadline), counted for
+/// GALAXY_VA_DEBUG: those that found their fence done (one call, no
+/// sleep), those that found it running and slept, and how long; and the
+/// newest fence seen done, by a wait or a look.
+pub const WaitStats = struct {
+    ready: u32 = 0,
+    blocked: u32 = 0,
+    blocked_ns: u64 = 0,
+    done: u32 = 0,
+};
+
 pub fn Node(comptime Sys: type) type {
     return struct {
         const Self = @This();
@@ -93,6 +104,7 @@ pub fn Node(comptime Sys: type) type {
         fd: i32 = -1,
         /// the GPU hung or went away: nothing more is asked of it
         lost: bool = false,
+        vstats: WaitStats = .{},
 
         /// A call: 0 or -errno. EIO or ENODEV on a call other than
         /// G_VSUBMIT or G_ESUBMIT (whose ENODEV only says there is no
@@ -188,6 +200,25 @@ pub fn Node(comptime Sys: type) type {
 
         fn waitOn(n: *Self, req: u32, fence: u32, deadline_ns: i64) Wait {
             if (n.lost) return .lost;
+            // (the decoder's waits counted: one whose fence is done costs
+            // one call; one still running is a look, then a timed sleep)
+            if (req != G_VWAIT) return n.waitCall(req, fence, deadline_ns);
+            const w = n.waitCall(req, fence, 0);
+            if (w == .done) {
+                n.sawDone(fence);
+                if (deadline_ns != 0) n.vstats.ready += 1;
+                return .done;
+            }
+            if (w != .timeout or deadline_ns == 0) return w;
+            const t0 = n.sys.nowNs();
+            const r = n.waitCall(req, fence, deadline_ns);
+            n.vstats.blocked += 1;
+            n.vstats.blocked_ns +%= @intCast(@max(n.sys.nowNs() - t0, 0));
+            if (r == .done) n.sawDone(fence);
+            return r;
+        }
+
+        fn waitCall(n: *Self, req: u32, fence: u32, deadline_ns: i64) Wait {
             var a = [_]u8{0} ** 16;
             wr32(&a, 0, fence);
             wr64(&a, 8, @bitCast(deadline_ns));
@@ -199,6 +230,12 @@ pub fn Node(comptime Sys: type) type {
                 n.lost = true;
                 return .lost;
             }
+        }
+
+        /// The decoder's `fence` done: so is every one before it (one
+        /// channel, in order).
+        fn sawDone(n: *Self, fence: u32) void {
+            if (@as(i32, @bitCast(fence -% n.vstats.done)) > 0) n.vstats.done = fence;
         }
 
         /// The buffer as a dma-buf fd, or -errno.

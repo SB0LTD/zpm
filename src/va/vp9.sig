@@ -2164,7 +2164,7 @@ test "vp9: three libvpx clips, frame by frame, against libvpx" {
 //   CLIP3: 64x64, three frames, error resilient.
 
 // (made by gentest.py from libvpx v1.14.0's decode of the clips)
-const ClipFrame = struct {
+pub const ClipFrame = struct {
     bytes: []const u8,
     uncompressed: u8,
     compressed: u16,
@@ -2189,7 +2189,7 @@ const ClipFrame = struct {
     counts: []const [2]u32,
 };
 
-const CLIP = [_]ClipFrame{
+pub const CLIP = [_]ClipFrame{
     .{
         .bytes = "\x82\x49\x83\x42\x00\x1f\xf0\x03\xf4\x04\x38\x24\x1c\x18\x42\x10\x02\xa0\x7f\x91\xa6\x2f\xdd\xf7" ++
             "\x45\xf8\xed\xe9\xd9\xb8\x05\x8f\xad\xd1\x78\xd3\x9f\x2b\xf7\xfd\xf6\x7d\x2d\xeb\xb7\xa7\x69\xb0" ++
