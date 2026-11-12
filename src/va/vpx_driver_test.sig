@@ -313,3 +313,170 @@ test "vpx: VP8 CBR: the rate control holds the stream near its rate" {
     // the quantizer moved from the app's 40
     try testing.expect(qs[N - 1] != 40 or qs[N / 2] != 40);
 }
+
+// ── VP9 ─────────────────────────────────────────────────────────────────────
+
+const enc_vp9 = @import("enc_vp9.sig");
+
+fn reconOf9(c: anytype, slot: usize, out: []u8) void {
+    const lay = c.vpx.vp9.lay;
+    const mem = c.vpx_cpu.bytes();
+    const cw = (W + 1) / 2;
+    const ch = (H + 1) / 2;
+    for (0..H) |y| @memcpy(out[y * W ..][0..W], mem[lay.yOff(slot) + y * lay.ys ..][0..W]);
+    for (0..ch) |y| @memcpy(out[W * H + y * cw ..][0..cw], mem[lay.uOff(slot) + y * lay.cs ..][0..cw]);
+    for (0..ch) |y| @memcpy(out[W * H + cw * ch + y * cw ..][0..cw], mem[lay.vOff(slot) + y * lay.cs ..][0..cw]);
+}
+
+test "vpx: VP9 through the driver as FFmpeg's vp9_vaapi sends it: a key frame, inter frames, CQP; the stream is the encoder's" {
+    var k = Fake{};
+    var d: D = .{ .node = .{ .sys = &k } };
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    var cfg: u32 = 0;
+    const attrs = [_]va.ConfigAttrib{ .{ .type = va.ATTRIB_RT_FORMAT, .value = va.RT_FORMAT_YUV420 }, .{ .type = ve.ATTRIB_RATE_CONTROL, .value = ve.RC_CQP } };
+    try testing.expectEqual(va.SUCCESS, d.createConfig(vav9.PROFILE_VP9_PROFILE0, ve.ENTRYPOINT_ENC_SLICE, &attrs, &cfg));
+    var in: [FRAMES]u32 = undefined;
+    var rec: [2]u32 = undefined;
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, W, H, &in, &.{}));
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, W, H, &rec, &.{}));
+    var ctx: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createContext(cfg, W, H, &ctx));
+    var coded: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(ve.ENC_CODED_BUFFER, 1 << 20, 1, null, &coded));
+    for (0..FRAMES) |n| try putInput(&d, in[n], @intCast(n));
+
+    // the same pictures straight through enc_vp9 (the CPU engine)
+    var ref_enc = try enc_vp9.Encoder.init(W, H);
+    const lay = ref_enc.lay;
+    var mem_buf: [64 << 10]u8 = @splat(0);
+    var info_buf: [16 << 10]u8 = @splat(0);
+    var scratch_buf: [128 << 10]u8 = undefined;
+    const Q = 96;
+
+    var seq = std.mem.zeroes(enc_vpx.SeqVp9);
+    seq.max_frame_width = W;
+    seq.max_frame_height = H;
+    seq.intra_period = 30;
+    var n_ivf = ivfHeader(&ivf, "VP90", FRAMES);
+    for (0..FRAMES) |n| {
+        var pic = std.mem.zeroes(enc_vpx.PicVp9);
+        pic.frame_width_src = W;
+        pic.frame_height_src = H;
+        pic.frame_width_dst = W;
+        pic.frame_height_dst = H;
+        pic.reconstructed_frame = rec[n & 1];
+        for (&pic.reference_frames) |*r| r.* = va.INVALID_ID;
+        pic.coded_buf = coded;
+        pic.refresh_frame_flags = 0xff;
+        pic.luma_ac_qindex = Q;
+        if (n == 0) {
+            pic.ref_flags = 1; // force_kf
+        } else {
+            pic.reference_frames[0] = rec[(n - 1) & 1];
+            pic.ref_flags = 1 << 1; // ref_frame_ctrl_l0: LAST, slot 0
+            pic.pic_flags = 1; // inter
+        }
+        pic.pic_flags |= 1 << 1; // shown
+        var ids: [2]u32 = undefined;
+        ids[0] = try createBuf(&d, ve.ENC_SEQUENCE_PARAMETER_BUFFER, &seq);
+        ids[1] = try createBuf(&d, ve.ENC_PICTURE_PARAMETER_BUFFER, &pic);
+        try testing.expectEqual(va.SUCCESS, d.beginPicture(ctx, in[n]));
+        try testing.expectEqual(va.SUCCESS, d.renderPicture(ctx, &ids));
+        try testing.expectEqual(va.SUCCESS, d.endPicture(ctx));
+        for (ids) |id| try testing.expectEqual(va.SUCCESS, d.destroyBuffer(id));
+        try testing.expectEqual(va.SUCCESS, d.syncSurface(in[n], 1_000_000_000));
+        var p: ?*anyopaque = null;
+        try testing.expectEqual(va.SUCCESS, d.mapBuffer(coded, &p));
+        const seg: *const ve.CodedBufferSegment = @ptrCast(@alignCast(p.?));
+        try testing.expectEqual(@as(u32, 0), seg.status);
+        const data: [*]const u8 = @ptrCast(seg.buf.?);
+        const got = data[0..seg.size];
+        try testing.expectEqual(va.SUCCESS, d.unmapBuffer(coded));
+        // the uncompressed header: frame marker, profile 0, not an existing
+        // frame, the frame type, shown, error resilient; a key frame's sync
+        try testing.expectEqual(@as(u8, 0b10_00_0), got[0] >> 3);
+        try testing.expectEqual(n != 0, got[0] & 0b100 != 0);
+        try testing.expect(got[0] & 0b11 == 0b11);
+        if (n == 0) try testing.expectEqualSlices(u8, &.{ 0x49, 0x83, 0x42 }, got[1..4]);
+        // the encoder alone, on the surface's own picture
+        const ci = ctx - driver.CONTEXT_BASE;
+        const c = &d.contexts[ci];
+        const s = &d.surfaces[in[n] - driver.SURFACE_BASE];
+        const sw = s.layout.swizzles(.blackwell);
+        const surf = enc_vp9.Surface{ .luma = 0, .chroma = @intCast(s.layout.chroma_offset), .pitch_luma = s.layout.luma.pitch, .pitch_chroma = s.layout.chroma.pitch, .swz_luma = @intFromEnum(sw[0]), .swz_chroma = @intFromEnum(sw[1]), .gobs = tiling.BLOCK_GOBS_LOG2 };
+        var eng = enc_vp9.CpuEngine{ .mem = mem_buf[0..lay.mem_bytes], .info = info_buf[0..lay.info_bytes], .surf = s.tiled.bytes() };
+        const st = try enc_vp9.encodeFrame(&ref_enc, &eng, surf, .{ .key = n == 0, .q = Q }, &mine, &scratch_buf);
+        try testing.expectEqualSlices(u8, mine[0..st.bytes], got);
+        if (n > 0) try testing.expect(st.inter_blocks > 0);
+        n_ivf += ivfFrame(ivf[n_ivf..], got, n);
+        reconOf9(c, c.vpx.vp9.lastSlot(), recon[n * FRAME_BYTES ..][0..FRAME_BYTES]);
+        try testing.expect(c.vpx_engine == .cpu);
+    }
+    enc_test.writeFile("/tmp/galaxy-va-enc/vp9.ivf", ivf[0..n_ivf]);
+    enc_test.writeFile("/tmp/galaxy-va-enc/vp9-recon.yuv", &recon);
+    enc_test.writeFile("/tmp/galaxy-va-enc/vp9-input.yuv", &yuv);
+    try testing.expectEqual(va.SUCCESS, d.destroyBuffer(coded));
+    try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
+}
+
+test "vpx: VP9 CBR: the rate control holds the stream near its rate" {
+    var k = Fake{};
+    var d: D = .{ .node = .{ .sys = &k } };
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    var cfg: u32 = 0;
+    const attrs = [_]va.ConfigAttrib{.{ .type = ve.ATTRIB_RATE_CONTROL, .value = ve.RC_CBR }};
+    try testing.expectEqual(va.SUCCESS, d.createConfig(vav9.PROFILE_VP9_PROFILE0, ve.ENTRYPOINT_ENC_SLICE, &attrs, &cfg));
+    var in: [FRAMES]u32 = undefined;
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, W, H, &in, &.{}));
+    var ctx: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createContext(cfg, W, H, &ctx));
+    var coded: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createBuffer(ve.ENC_CODED_BUFFER, 1 << 20, 1, null, &coded));
+    for (0..FRAMES) |n| try putInput(&d, in[n], @intCast(n));
+    var seq = std.mem.zeroes(enc_vpx.SeqVp9);
+    seq.max_frame_width = W;
+    seq.max_frame_height = H;
+    seq.bits_per_second = 60_000;
+    seq.intra_period = 30;
+    var rc = std.mem.zeroes(ve.RateControl);
+    rc.bits_per_second = 60_000;
+    rc.target_percentage = 100;
+    var fr = std.mem.zeroes(ve.FrameRate);
+    fr.framerate = 30 | (1 << 16);
+    var total: usize = 0;
+    const N = 60;
+    var qs: [N]u8 = undefined;
+    for (0..N) |n| {
+        var pic = std.mem.zeroes(enc_vpx.PicVp9);
+        pic.coded_buf = coded;
+        pic.reconstructed_frame = in[0];
+        for (&pic.reference_frames) |*r| r.* = va.INVALID_ID;
+        pic.refresh_frame_flags = 0xff;
+        pic.luma_ac_qindex = 120;
+        pic.ref_flags = if (n == 0) 1 else (1 << 1);
+        pic.pic_flags = @as(u32, @intFromBool(n != 0)) | (1 << 1);
+        var ids = [_]u32{
+            try createBuf(&d, ve.ENC_SEQUENCE_PARAMETER_BUFFER, &seq),
+            try createBuf(&d, ve.ENC_PICTURE_PARAMETER_BUFFER, &pic),
+            try miscBuf(&d, ve.MISC_RATE_CONTROL, &rc),
+            try miscBuf(&d, ve.MISC_FRAME_RATE, &fr),
+        };
+        try testing.expectEqual(va.SUCCESS, d.beginPicture(ctx, in[n % FRAMES]));
+        try testing.expectEqual(va.SUCCESS, d.renderPicture(ctx, &ids));
+        try testing.expectEqual(va.SUCCESS, d.endPicture(ctx));
+        for (ids) |id| try testing.expectEqual(va.SUCCESS, d.destroyBuffer(id));
+        var p: ?*anyopaque = null;
+        try testing.expectEqual(va.SUCCESS, d.mapBuffer(coded, &p));
+        const seg: *const ve.CodedBufferSegment = @ptrCast(@alignCast(p.?));
+        total += seg.size;
+        try testing.expectEqual(va.SUCCESS, d.unmapBuffer(coded));
+        qs[n] = d.contexts[ctx - driver.CONTEXT_BASE].vpx.vp9.last.q;
+    }
+    // the stream within half of the target either way; the quantizer moved
+    // from the app's 120
+    const rate = @as(f64, @floatFromInt(total * 8)) / (@as(f64, N) / 30.0);
+    try testing.expect(rate > 60_000 * 0.5 and rate < 60_000 * 1.5);
+    try testing.expect(qs[N - 1] != 120 or qs[N / 2] != 120);
+}

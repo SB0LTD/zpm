@@ -638,6 +638,11 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expectEqual(codec.Blackwell.off, optionsOf("GALAXY_VA_AV1_BLACKWELL=0").av1_blackwell);
     try testing.expectEqual(codec.Blackwell.full, optionsOf("GALAXY_VA_HEVC_BLACKWELL=bogus").hevc_blackwell);
     try testing.expectEqual(codec.Control.nvk, optionsOf("GALAXY_VA_CONTROL=bogus").control);
+    // VP8 and VP9 encoding: on, on the RTX; each switch off by itself
+    try testing.expect(none.vpx_encode and none.vpx_gpu);
+    const vpx = optionsOf("GALAXY_VA_VPX_GPU=0\x00");
+    try testing.expect(vpx.vpx_encode and !vpx.vpx_gpu);
+    try testing.expect(!optionsOf("GALAXY_VA_VPX_ENCODE=0\x00").vpx_encode);
 }
 
 test "libgalaxy_va: init without Galaxy's RTX fails cleanly" {

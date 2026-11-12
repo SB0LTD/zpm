@@ -23,6 +23,8 @@ const dsl = @import("vpx_dsl.sig");
 const vk = @import("vpx_kir.sig");
 const k8 = @import("vp8_kernels.sig");
 const enc_vp8 = @import("enc_vp8.sig");
+const k9 = @import("vp9_kernels.sig");
+const enc_vp9 = @import("enc_vp9.sig");
 const enc_vpx = @import("enc_vpx.sig");
 
 const kir = gpu.kir;
@@ -70,9 +72,41 @@ pub fn loadVp8(dev: gpu.Device, s: *Scratch, work: []u8, compile: anytype, out: 
     }
 }
 
+pub const Vp9Kernel = enc_vp9.Kernel;
+pub const VP9_KERNELS = std.enums.values(Vp9Kernel).len;
+
+/// The KIR of VP9 kernel `which`, into `s` (finished: verified).
+pub fn vp9Kir(s: *Scratch, which: Vp9Kernel) kir.Error!kir.Kernel {
+    var k = kir.Kernel.init(.{ .insts = &s.insts, .tys = &s.tys }, @tagName(which), .{ dsl.GROUP, 1, 1 });
+    switch (which) {
+        .load => try vk.build(k8.load, &k, 3, k9.PARAMS),
+        .motion => try vk.build(k9.motion, &k, 3, k9.PARAMS),
+        .luma16 => try vk.build(k9.luma16, &k, 3, k9.PARAMS),
+        .luma8 => try vk.build(k9.luma8, &k, 3, k9.PARAMS),
+        .chroma16 => try vk.build(k9.chroma16, &k, 3, k9.PARAMS),
+        .chroma8 => try vk.build(k9.chroma8, &k, 3, k9.PARAMS),
+        .lfv => try vk.build(k9.lfv, &k, 3, k9.PARAMS),
+        .lfh => try vk.build(k9.lfh, &k, 3, k9.PARAMS),
+    }
+    return k;
+}
+
+/// VP9's kernels compiled and loaded on `dev` (as loadVp8).
+pub fn loadVp9(dev: gpu.Device, s: *Scratch, work: []u8, compile: anytype, out: *[VP9_KERNELS]gpu.Program) !void {
+    var made: usize = 0;
+    errdefer for (out[0..made]) |*p| dev.unload(p);
+    for (std.enums.values(Vp9Kernel), 0..) |which, i| {
+        const k = try vp9Kir(s, which);
+        var w = gpu.Work.init(work);
+        const bin = try compile(&k, dev.caps, &w, &s.code);
+        out[i] = try dev.load(&bin);
+        made += 1;
+    }
+}
+
 /// The engine of one context: its buffers on the device, a run's
-/// dispatches gathered.
-pub fn Engine(comptime K: type, comptime n_kernels: usize) type {
+/// dispatches gathered (`n_params` of each dispatch's parameters).
+pub fn Engine(comptime K: type, comptime n_kernels: usize, comptime n_params: usize) type {
     return struct {
         const Self = @This();
         pub const MAX_BATCH = 256;
@@ -94,7 +128,7 @@ pub fn Engine(comptime K: type, comptime n_kernels: usize) type {
                 .prog = &e.progs[@intFromEnum(k)],
                 .groups = .{ @max(1, (threads + dsl.GROUP - 1) / dsl.GROUP), 1, 1 },
                 .buffers = &e.bufs,
-                .params = e.params[e.n][0..k8.ENC_PARAMS],
+                .params = e.params[e.n][0..n_params],
             };
             e.n += 1;
             e.dispatches += 1;
@@ -117,7 +151,8 @@ pub fn Engine(comptime K: type, comptime n_kernels: usize) type {
     };
 }
 
-pub const Vp8Engine = Engine(Vp8Kernel, VP8_KERNELS);
+pub const Vp8Engine = Engine(Vp8Kernel, VP8_KERNELS, k8.ENC_PARAMS);
+pub const Vp9Engine = Engine(Vp9Kernel, VP9_KERNELS, k9.PARAMS);
 
 // ── The shared library's converter, with the encoders' engine ──────────────
 
@@ -138,13 +173,17 @@ pub fn WithVpx(comptime Inner: type, comptime Node: type, comptime Say: type) ty
         node: Node = undefined,
         state: enum { closed, open, failed } = .closed,
         dev: gpu.Device = undefined,
+        /// each codec's kernels: built at its first picture
+        built: [2]enum { no, yes, failed } = .{ .no, .no },
         vp8: [VP8_KERNELS]gpu.Program = undefined,
+        vp9: [VP9_KERNELS]gpu.Program = undefined,
         scratch: Scratch = .{},
         work: [gpu.nvidia_device.kir_sm120.WORK_BYTES]u8 align(64) = undefined,
         // (set when the GPU opens: a default with pointers in it would put
         // the whole converter in the library's read-only data)
         ctx: [MAX_CONTEXTS]Ctx = undefined,
         engine8: Vp8Engine = undefined,
+        engine9: Vp9Engine = undefined,
 
         /// A context's buffers on the GPU.
         const Ctx = struct {
@@ -174,13 +213,29 @@ pub fn WithVpx(comptime Inner: type, comptime Node: type, comptime Say: type) ty
                 return false;
             };
             for (&c.ctx) |*x| x.* = .{};
-            loadVp8(c.dev, &c.scratch, &c.work, Node.compile, &c.vp8) catch |e| {
-                say.line("the VP8 kernels failed to build ({s}): the CPU encodes", .{@errorName(e)});
-                c.node.close();
-                c.state = .failed;
+            c.built = .{ .no, .no };
+            c.state = .open;
+            return true;
+        }
+
+        /// The codec's kernels, built (once) on the open GPU.
+        fn kernels(c: *Self, codec: enc_vpx.Codec, say: Say) bool {
+            const b = &c.built[@intFromEnum(codec)];
+            switch (b.*) {
+                .yes => return true,
+                .failed => return false,
+                .no => {},
+            }
+            const r = switch (codec) {
+                .vp8 => loadVp8(c.dev, &c.scratch, &c.work, Node.compile, &c.vp8),
+                .vp9 => loadVp9(c.dev, &c.scratch, &c.work, Node.compile, &c.vp9),
+            };
+            r catch |e| {
+                say.line("the {s} kernels failed to build ({s}): the CPU encodes", .{ @tagName(codec), @errorName(e) });
+                b.* = .failed;
                 return false;
             };
-            c.state = .open;
+            b.* = .yes;
             return true;
         }
 
@@ -214,6 +269,7 @@ pub fn WithVpx(comptime Inner: type, comptime Node: type, comptime Say: type) ty
         pub fn vpxFrame(c: *Self, slot: u8, job: enc_vpx.GpuJob, say: Say) enc_vpx.GpuDone {
             if (slot >= MAX_CONTEXTS or job.surface_fd < 0 or !c.open(say)) return .unavailable;
             const st = job.state;
+            if (!c.kernels(st.codec, say)) return .unavailable;
             switch (st.codec) {
                 .vp8 => {
                     const lay = st.vp8.lay;
@@ -226,7 +282,17 @@ pub fn WithVpx(comptime Inner: type, comptime Node: type, comptime Say: type) ty
                     const r = enc_vp8.encodeFrame(&st.vp8, &c.engine8, job.surface, job.plan.vp8, job.out, job.scratch) catch |e| return c.failed(e, say);
                     return .{ .done = r.bytes };
                 },
-                .vp9 => return .unavailable,
+                .vp9 => {
+                    const lay = st.vp9.lay;
+                    const fresh = !c.ctx[slot].have or c.ctx[slot].mem.bytes < lay.mem_bytes;
+                    const x = c.buffers(slot, lay.mem_bytes, lay.info_bytes) orelse return .unavailable;
+                    if (job.fresh or fresh) enc_vp9.restart(&st.vp9);
+                    const surf = c.node.importFd(job.surface_fd) orelse return .unavailable;
+                    defer c.dev.free(surf);
+                    c.engine9 = .{ .dev = c.dev, .progs = &c.vp9, .bufs = .{ x.mem, x.info, surf } };
+                    const r = enc_vp9.encodeFrame(&st.vp9, &c.engine9, job.surface, job.plan.vp9, job.out, job.scratch) catch |e| return c.failed(e, say);
+                    return .{ .done = r.bytes };
+                },
             }
         }
 
@@ -244,7 +310,8 @@ pub fn WithVpx(comptime Inner: type, comptime Node: type, comptime Say: type) ty
         pub fn deinit(c: *Self) void {
             if (c.state == .open) {
                 for (&c.ctx) |*x| c.release(x);
-                for (&c.vp8) |*p| c.dev.unload(p);
+                if (c.built[0] == .yes) for (&c.vp8) |*p| c.dev.unload(p);
+                if (c.built[1] == .yes) for (&c.vp9) |*p| c.dev.unload(p);
                 c.node.close();
             }
             c.state = .closed;
@@ -348,6 +415,55 @@ fn vp8Both(dev: gpu.Device, work: []u8, compile: anytype, w: u32, h: u32, frames
     }
 }
 
+/// As vp8Both, for VP9 (`q`: its quantizer index).
+fn vp9Both(dev: gpu.Device, work: []u8, compile: anytype, w: u32, h: u32, frames: u32, q: u8) !void {
+    var progs: [VP9_KERNELS]gpu.Program = undefined;
+    try loadVp9(dev, &t_build, work, compile, &progs);
+    defer for (&progs) |*p| dev.unload(p);
+
+    const layout = tiling.Nv12.of(w, std.mem.alignForward(u32, h, 128));
+    const lin = tiling.Linear.of(w, h);
+    const sw = layout.swizzles(.blackwell);
+    const surf = enc_vp9.Surface{ .luma = 0, .chroma = @intCast(layout.chroma_offset), .pitch_luma = layout.luma.pitch, .pitch_chroma = layout.chroma.pitch, .swz_luma = @intFromEnum(sw[0]), .swz_chroma = @intFromEnum(sw[1]), .gobs = tiling.BLOCK_GOBS_LOG2 };
+    var cpu_enc = try enc_vp9.Encoder.init(w, h);
+    var gpu_enc = try enc_vp9.Encoder.init(w, h);
+    const L = cpu_enc.lay;
+    var cpu = enc_vp9.CpuEngine{ .mem = t_mem[0..L.mem_bytes], .info = t_info[0..L.info_bytes], .surf = t_surf[0..@intCast(layout.bytes)] };
+    @memset(cpu.mem, 0);
+    @memset(cpu.info, 0);
+    const mem = try dev.alloc(L.mem_bytes, .host);
+    defer dev.free(mem);
+    const info = try dev.alloc(L.info_bytes, .host);
+    defer dev.free(info);
+    const sbuf = try dev.alloc(layout.bytes, .host);
+    defer dev.free(sbuf);
+    @memset(mem.cpu, 0);
+    @memset(info.cpu, 0);
+    dev.toDevice(mem, 0, mem.bytes);
+    dev.toDevice(info, 0, info.bytes);
+    var g = Vp9Engine{ .dev = dev, .progs = &progs, .bufs = .{ mem, info, sbuf } };
+    for (0..frames) |f| {
+        picture(&t_yuv, w, h, @intCast(f * 3), @intCast(f));
+        toSurface(&t_yuv, &t_nv12, &t_surf, layout, lin, w, h);
+        @memcpy(sbuf.cpu[0..@intCast(layout.bytes)], t_surf[0..@intCast(layout.bytes)]);
+        dev.toDevice(sbuf, 0, sbuf.bytes);
+        const pic = enc_vp9.Picture{ .key = f == 0, .q = q, .search_range = 6 };
+        const a = try enc_vp9.encodeFrame(&cpu_enc, &cpu, surf, pic, &t_out_cpu, &t_scratch);
+        const b = try enc_vp9.encodeFrame(&gpu_enc, &g, surf, pic, &t_out_gpu, &t_scratch);
+        dev.fromDevice(mem, 0, mem.bytes);
+        if (!std.mem.eql(u8, cpu.mem, mem.cpu[0..L.mem_bytes])) {
+            for (cpu.mem, 0..) |x, i| if (x != mem.cpu[i]) {
+                std.debug.print("vp9 frame {d}: memory differs first at {d} (cpu {d}, gpu {d})\n", .{ f, i, x, mem.cpu[i] });
+                break;
+            };
+            return error.Differs;
+        }
+        try testing.expectEqualSlices(u8, cpu.info, info.cpu[0..L.info_bytes]);
+        try testing.expectEqualSlices(u8, t_out_cpu[0..a.bytes], t_out_gpu[0..b.bytes]);
+        if (f > 0) try testing.expect(!a.key and a.inter_blocks > 0);
+    }
+}
+
 var emu_mem: [24 << 20]u8 align(4096) = undefined;
 var emu_work: [16 << 20]u8 align(64) = undefined;
 var compile_work: [gpu.nvidia_device.kir_sm120.WORK_BYTES]u8 align(64) = undefined;
@@ -378,9 +494,30 @@ test "vpx_gpu: VP8's kernels compiled to sm_120 on the emulated RTX encode as th
     };
 }
 
-test "vpx_gpu: the VP8 kernels' sizes" {
+test "vpx_gpu: VP9's kernels on KIR's interpreter (EmuDevice) encode as the CPU does, byte for byte" {
+    var e = gpu.EmuDevice.init(gpu.interp_caps, &emu_mem, &emu_work);
+    try vp9Both(e.device(), &compile_work, gpu.compile, 72, 40, 3, 90);
+}
+
+test "vpx_gpu: VP9's kernels compiled to sm_120 on the emulated RTX encode as the CPU does, byte for byte" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    const dev = Rtx.dev.device();
+    vp9Both(dev, &compile_work, gpu.compile, 72, 40, 3, 90) catch |err| {
+        if (Rtx.dev.lastError()) |le| {
+            var buf: [512]u8 = undefined;
+            std.debug.print("sm120_emu: {s}: {s}\n", .{ @errorName(le), Rtx.dev.explain(&buf) });
+        }
+        return err;
+    };
+}
+
+test "vpx_gpu: the kernels' sizes" {
     for (std.enums.values(Vp8Kernel)) |which| {
         const k = try vp8Kir(&t_build, which);
         std.debug.print("vp8 {s}: {d} KIR instructions, {d} registers\n", .{ @tagName(which), k.n, k.nv });
+    }
+    for (std.enums.values(Vp9Kernel)) |which| {
+        const k = try vp9Kir(&t_build, which);
+        std.debug.print("vp9 {s}: {d} KIR instructions, {d} registers\n", .{ @tagName(which), k.n, k.nv });
     }
 }
