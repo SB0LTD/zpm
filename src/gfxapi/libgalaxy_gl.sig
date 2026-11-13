@@ -105,6 +105,9 @@ fn openDriver() ?*engine.Engine {
     if (the_engine.check.mem.len != 0) {
         report.say(.device, "drawing on {s}; each kernel's first runs of up to {d} pixels checked against the CPU (GALAXY_GL_CHECK)", .{ d.caps.name, the_engine.check.max_px });
     } else report.say(.device, "drawing on {s}", .{d.caps.name});
+    if (the_gpu.node.kind == .nvidia) {
+        report.say(.device, "native fences (EGL_ANDROID_native_fence_sync): {s}", .{if (the_gpu.node.native_fences) "on, sync_files of this context's channel" else "off: the kernel makes no sync_files on this GPU"});
+    }
     return &the_engine;
 }
 
@@ -382,8 +385,15 @@ fn x11Wire() ?*const x11.Wire {
     return &x11_wire;
 }
 
+/// EGL_ANDROID_native_fence_sync: the kernel makes sync_files of this
+/// context's fences (the Adreno's always; the RTX's on a kernel with
+/// nv_drm's sync_files, node.sig's probe), and polls any it is handed.
+/// Firefox's dma-buf surfaces (FenceSet, FenceWait) use it whenever
+/// eglDupNativeFenceFDANDROID resolves, advertised or not: without it,
+/// their eglCreateSync of a native fence fails (BAD_ATTRIBUTE) and
+/// FenceSet falls back to glFinish.
 fn nativeInterop() bool {
-    return the_gpu.node.kind == .adreno;
+    return opened and the_gpu.node.native_fences;
 }
 fn dmaImport() bool {
     return the_gpu.node.dma_import;
@@ -1224,6 +1234,84 @@ fn yes() bool {
 }
 fn no() bool {
     return false;
+}
+
+/// A sync_file the fence test's kernel made (fds from 60): signalled once
+/// `fence_signalled`; closes counted.
+var fence_signalled = false;
+var fence_closes: u32 = 0;
+var fence_next_fd: i32 = 60;
+fn fenceTestFence(ctx: ?*anyopaque) i64 {
+    _ = ctx;
+    fence_next_fd += 1;
+    return fence_next_fd;
+}
+fn fenceTestPoll(ctx: ?*anyopaque, fd: i32, ms: i32) i32 {
+    _ = .{ ctx, fd, ms };
+    return @intFromBool(fence_signalled);
+}
+fn fenceTestClose(ctx: ?*anyopaque, fd: i32) void {
+    _ = .{ ctx, fd };
+    fence_closes += 1;
+}
+
+test "libgalaxy_gl: Firefox's dma-buf fences: FenceSet's native fence out, FenceWait's in and waited for; without native fences, BAD_ATTRIBUTE" {
+    // (widget/gtk/DMABufSurface.cpp: FenceSet makes an
+    // EGL_SYNC_NATIVE_FENCE_ANDROID and dups its fd; FenceWait makes one of
+    // that fd and waits FOREVER. Firefox calls them whenever
+    // eglDupNativeFenceFDANDROID resolves, whatever the extension string.)
+    t_eng.init(.{ .pool = &t_pool });
+    var host = test_host;
+    host.fenceFd = fenceTestFence;
+    host.poll = fenceTestPoll;
+    host.close = fenceTestClose;
+    fence_signalled = false;
+    fence_closes = 0;
+    egl.setDriver(.{ .open = testOpen, .host = host, .wayland = noWayland, .native_interop = yes, .dma_import = yes });
+    const dpy = eglGetDisplay(null);
+    try std.testing.expectEqual(@as(u32, 1), eglInitialize(dpy, null, null));
+    try std.testing.expect(hasWord(std.mem.span(eglQueryString(dpy, egl.EXTENSIONS).?), "EGL_ANDROID_native_fence_sync"));
+    const ctx = eglCreateContext(dpy, &egl.configs[1], null, &.{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE });
+    try std.testing.expectEqual(@as(u32, 1), eglMakeCurrent(dpy, null, null, ctx));
+    // FenceSet: a fence of the work so far, as a sync_file
+    const set = eglCreateSyncKHR(dpy, egl.SYNC_NATIVE_FENCE_ANDROID, null);
+    try std.testing.expect(set != null);
+    const fd = eglDupNativeFenceFDANDROID(dpy, set);
+    try std.testing.expectEqual(@as(i32, 61), fd);
+    // FenceWait (another process, or the same one's compositor side): the
+    // fd handed in, owned by the sync, waited for as the kernel says
+    const in_attribs = [_]i32{ egl.SYNC_NATIVE_FENCE_FD_ANDROID, fd, egl.NONE };
+    const wait = eglCreateSyncKHR(dpy, egl.SYNC_NATIVE_FENCE_ANDROID, &in_attribs);
+    try std.testing.expect(wait != null);
+    var v: i32 = 0;
+    try std.testing.expectEqual(@as(u32, 1), eglGetSyncAttribKHR(dpy, wait, egl.SYNC_STATUS, &v));
+    try std.testing.expectEqual(egl.UNSIGNALED, v);
+    try std.testing.expectEqual(egl.TIMEOUT_EXPIRED, eglClientWaitSyncKHR(dpy, wait, 0, 1000));
+    fence_signalled = true;
+    try std.testing.expectEqual(egl.CONDITION_SATISFIED, eglClientWaitSyncKHR(dpy, wait, 0, egl.FOREVER));
+    try std.testing.expectEqual(@as(u32, 1), eglDestroySyncKHR(dpy, wait));
+    try std.testing.expectEqual(@as(u32, 1), fence_closes); // (the fd it owned)
+    try std.testing.expectEqual(@as(u32, 1), eglDestroySyncKHR(dpy, set));
+    try std.testing.expectEqual(@as(u32, 1), eglMakeCurrent(dpy, null, null, null));
+    try std.testing.expectEqual(@as(u32, 1), eglDestroyContext(dpy, ctx));
+    try std.testing.expectEqual(@as(u32, 1), eglTerminate(dpy));
+    // A GPU whose kernel makes no sync_files (the RTX before nv_drm's,
+    // pc-1111h): not advertised, and both of Firefox's calls refused
+    // (FenceSet then glFinish()es)
+    t_eng.init(.{ .pool = &t_pool });
+    egl.setDriver(.{ .open = testOpen, .host = host, .wayland = noWayland, .native_interop = no, .dma_import = yes });
+    const d2 = eglGetDisplay(null);
+    try std.testing.expectEqual(@as(u32, 1), eglInitialize(d2, null, null));
+    try std.testing.expect(!hasWord(std.mem.span(eglQueryString(d2, egl.EXTENSIONS).?), "EGL_ANDROID_native_fence_sync"));
+    const c2 = eglCreateContext(d2, &egl.configs[1], null, &.{ egl.CONTEXT_CLIENT_VERSION, 3, egl.NONE });
+    try std.testing.expectEqual(@as(u32, 1), eglMakeCurrent(d2, null, null, c2));
+    try std.testing.expect(eglCreateSyncKHR(d2, egl.SYNC_NATIVE_FENCE_ANDROID, null) == null);
+    try std.testing.expectEqual(egl.BAD_ATTRIBUTE, eglGetError());
+    try std.testing.expect(eglCreateSyncKHR(d2, egl.SYNC_NATIVE_FENCE_ANDROID, &in_attribs) == null);
+    try std.testing.expectEqual(egl.BAD_ATTRIBUTE, eglGetError());
+    try std.testing.expectEqual(@as(u32, 1), eglMakeCurrent(d2, null, null, null));
+    try std.testing.expectEqual(@as(u32, 1), eglDestroyContext(d2, c2));
+    try std.testing.expectEqual(@as(u32, 1), eglTerminate(d2));
 }
 
 fn gbmTestDriver() void {
