@@ -26,6 +26,11 @@
 //!   S2R R5, SR_TID.X
 //!   IMAD.WIDE.U32 R2, R5, 0x4, R2
 //!
+//! A vertex or a pixel program's code is assembled the same way (its
+//! attribute loads and stores, interpolations, textures and discards are
+//! sm120.sig's graphics forms; no headers: it has no parameters or stack).
+//! What goes in front of it, in place of a QMD, is sph.sig's header.
+//!
 //! Allocation-free: the caller owns the output words and the working
 //! storage (Work).
 
@@ -277,6 +282,107 @@ test "a kernel without control fields: scheduled, ptxas's bits below the fields,
     try testing.expect(LDCU.get(110, 3) != 7);
     try testing.expect(IMAD.get(116, 6) & (@as(u64, 1) << @intCast(S2R.get(110, 3))) != 0);
     try testing.expect(STG.get(116, 6) & (@as(u64, 1) << @intCast(LDCU.get(110, 3))) != 0);
+}
+
+/// A textured rectangle's vertex program: a position and a texture
+/// coordinate from the vertex buffers' attributes 0 and 1, stored as the
+/// position and generic vector 0's x and y.
+const VERTEX =
+    \\ALD.128 R4, a[0x80]               // attribute 0: x, y, z, w
+    \\ALD.64 R8, a[0x90]                // attribute 1: u, v
+    \\AST.128 a[0x70], R4               // the position
+    \\AST.64 a[0x80], R8                // generic 0
+    \\EXIT
+;
+
+/// Its pixel program: u and v carried in perspective (each interpolated
+/// over w, times the reciprocal of 1/w, rounded to zero as NAK has it), a
+/// texel through the handle in constant buffer 1, pixels under half alpha
+/// discarded. Render target 0's colour is what R0..R3 hold at EXIT.
+const PIXEL =
+    \\IPA.PASS R0, a[0x7c]              // 1/w
+    \\IPA.PASS R4, a[0x80]              // u/w
+    \\IPA.PASS R5, a[0x84]              // v/w
+    \\MUFU.RCP R0, R0
+    \\FMUL.RZ R4, R4, R0
+    \\FMUL.RZ R5, R5, R0
+    \\LDC R6, c[0x1][0x10]              // the texture's handle
+    \\TEX.B.DXY R2, R0, R4, R6, 2D      // red, green in R0, R1; blue, alpha in R2, R3
+    \\FSETP.LT.AND P0, PT, R3, 0.5, PT
+    \\@P0 KILL
+    \\EXIT
+;
+
+/// The kernel's words decoded and printed: `want`, a line an instruction.
+fn expectListing(want: []const u8, k: Kernel) !void {
+    var lines = std.mem.splitScalar(u8, want, '\n');
+    for (0..k.count) |i| {
+        const in = try sm120.decode(k.code[2 * i], k.code[2 * i + 1], i * 16);
+        var buf: [160]u8 = undefined;
+        try testing.expectEqualStrings(lines.next() orelse return error.TestUnexpectedResult, try sm120.format(&in, &buf));
+    }
+    try testing.expect(lines.next() == null);
+}
+
+test "a vertex and a pixel program without control fields: scheduled, checked, their words decoded" {
+    // (nvdisasm takes every word of both, fields and all, and prints these
+    // lines. If the model changes them, check the new words with it.)
+    var out: [64]u64 = undefined;
+    // Each load releases a scoreboard for its registers. Each store waits
+    // on its load's and releases one for its reads (never one for a write:
+    // the word cannot carry it). EXIT waits on the stores', and carries
+    // none itself.
+    const v = try assemble(VERTEX, &out, &test_work);
+    try testing.expect(v.scheduled);
+    try testing.expectEqual(@as(u32, 5), v.count);
+    try testing.expectEqual(@as(usize, 16), v.code.len); // (padded to a line, as a kernel is)
+    try testing.expectEqual(@as(u32, 12), v.registers); // (R9: 9 + 3)
+    try testing.expectEqual(@as(u32, 0), (try sched.check(test_work.instrs[0..5], test_work.slots[0..5], &test_work.sched)).open);
+    try expectListing(
+        \\[B------:R-:W0:-:S01] ALD.128 R4, a[0x80]
+        \\[B------:R-:W1:-:S01] ALD.64 R8, a[0x90]
+        \\[B0-----:R0:W-:-:S01] AST.128 a[0x70], R4
+        \\[B-1----:R1:W-:-:S02] AST.64 a[0x80], R8
+        \\[B01----:R-:W-:-:S01] EXIT
+    , v);
+    try testing.expectEqual(@as(u64, 0x0000_7004_ff00_7322), v.code[4]);
+    try testing.expectEqual(@as(u64, 0x0011_c200_0000_0cff), v.code[5]);
+    // The interpolations, the reciprocal, the handle's load and the texture
+    // each release a scoreboard. The compare stalls 14 cycles for the
+    // discard's guard (the predicate's 13 and NAK's one), the discard
+    // carries no scoreboard, and EXIT waits on the texture's reads.
+    const f = try assemble(PIXEL, &out, &test_work);
+    try testing.expectEqual(@as(u32, 11), f.count);
+    try testing.expectEqual(@as(u32, 12), f.registers); // (the handle's vector, counted to R9)
+    try testing.expectEqual(@as(u32, 0), (try sched.check(test_work.instrs[0..11], test_work.slots[0..11], &test_work.sched)).open);
+    try expectListing(
+        \\[B------:R-:W0:-:S01] IPA.PASS R0, a[0x7c]
+        \\[B------:R-:W1:-:S01] IPA.PASS R4, a[0x80]
+        \\[B------:R-:W2:-:S01] IPA.PASS R5, a[0x84]
+        \\[B0-----:R0:W3:-:S02] MUFU.RCP R0, R0
+        \\[B-1-3--:R-:W-:-:S01] FMUL.RZ R4, R4, R0
+        \\[B--2---:R-:W-:-:S01] FMUL.RZ R5, R5, R0
+        \\[B------:R-:W1:-:S04] LDC R6, c[0x1][0x10]
+        \\[B01----:R0:W1:-:S02] TEX.B.DXY R2, R0, R4, R6, 2D
+        \\[B-1----:R-:W-:-:S14] FSETP.LT.AND P0, PT, R3, 0.5, PT
+        \\[B------:R-:W-:-:S01] @P0 KILL
+        \\[B0-----:R-:W-:-:S01] EXIT
+    , f);
+    // with the author's fields on every line, they are kept (the reference's
+    // words for the same instructions)
+    const k = try assemble(
+        \\[B------:R-:W-:Y:S01] IPA.PASS R0, a[0x7c]
+        \\[B------:R-:W-:Y:S01] TEX.B.DXY.NODEP R2, R0, R4, R6, 2D
+        \\[B------:R-:W-:Y:S01] @!P0 KILL
+        \\[B------:R-:W-:Y:S01] EXIT
+    , &out, &test_work);
+    try testing.expect(!k.scheduled);
+    try testing.expectEqualSlices(u64, &.{
+        0x000000ff00007326, 0x000fe200000e001f,
+        0x20ffff0604007d61, 0x000fe2000c1e3f02,
+        0x000000000000895b, 0x000fe20003800000,
+        0x000000000000794d, 0x000fe20003800000,
+    }, k.code[0..8]);
 }
 
 test "ptxas's kernels from their listings (Galaxy's probes, the coverage and LFM3-shaped ones): its words, registers, stack, parameters" {

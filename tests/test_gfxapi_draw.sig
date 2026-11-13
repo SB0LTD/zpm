@@ -1452,6 +1452,24 @@ test "draw: stencil operations on emulated Adreno and RTX with separate and pack
     }
 }
 
+test "draw: stencil operations through the emulated RTX's 3D engine (packed depth-stencil, block linear), separate ones on the compute kernels" {
+    for ([_]bool{ false, true }) |separate| {
+        Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+        Rtx.dev.withEngine(&Rtx3d.engine3d);
+        eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+        defer eng_rtx.deinit();
+        stencilScene(&eng_rtx, separate) catch |e| {
+            std.debug.print("stencil scene (separate {}): {s}; the 3D engine: {s}\n", .{ separate, @errorName(e), Rtx3d.engine3d.why });
+            return e;
+        };
+        try std.testing.expect(eng_rtx.why_pipe == null);
+        try std.testing.expect(!eng_rtx.lost);
+        std.debug.print("stencil scene (separate {}): {d} draws through the 3D engine, {d} on the compute kernels\n", .{ separate, eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws });
+        for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("stencil scene: on the compute kernels: {s}\n", .{w});
+        if (!separate) try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
+    }
+}
+
 test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CPU's bytes" {
     const want = try cpuOut();
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
@@ -1499,6 +1517,417 @@ test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CP
     try uniformBlocks(&eng_rtx);
     try feedbackAndQueries(&eng_rtx);
     eng_rtx.deinit();
+}
+
+// ── The emulated RTX's 3D engine (Config.graphics) ─────────────────────────
+
+/// Pixels of two outputs more than `tol` apart in a channel: how many, the
+/// first, the largest difference.
+fn apart(want: []const u8, got: []const u8, width: usize, tol: u8, what: []const u8) u32 {
+    var n: u32 = 0;
+    var most: u8 = 0;
+    var i: usize = 0;
+    while (i < want.len) : (i += 4) {
+        var worst: u8 = 0;
+        for (0..4) |c| worst = @max(worst, if (want[i + c] > got[i + c]) want[i + c] - got[i + c] else got[i + c] - want[i + c]);
+        most = @max(most, worst);
+        if (worst <= tol) continue;
+        if (n < 4) std.debug.print("{s}: pixel ({d}, {d}): the CPU {any}, the 3D engine {any}\n", .{ what, (i / 4) % width, (i / 4) / width, want[i..][0..4], got[i..][0..4] });
+        n += 1;
+    }
+    std.debug.print("{s}: {d} pixels more than {d} apart (the most {d})\n", .{ what, n, tol, most });
+    return n;
+}
+
+const Rtx3d = struct {
+    var engine3d: @import("nvidia").emu3d.Engine = .{};
+};
+var out_rtx3d: Out = .{};
+
+test "draw: the scene through the emulated RTX's 3D engine where it draws, the compute kernels the rest: the CPU's picture" {
+    const want = try cpuOut();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    try std.testing.expect(eng_rtx.onGpu() and eng_rtx.graphics);
+    scene(&eng_rtx, &out_rtx3d) catch |e| {
+        std.debug.print("rtx 3D scene: {s}; the engine lost the GPU {} ({?s}), its pipeline error {?s}; the 3D engine: {s}\n", .{ @errorName(e), eng_rtx.lost, if (eng_rtx.why) |w| @errorName(w) else null, if (eng_rtx.why_pipe) |w| @errorName(w) else null, Rtx3d.engine3d.why });
+        return e;
+    };
+    if (Rtx.dev.lastError()) |e| {
+        var buf: [512]u8 = undefined;
+        std.debug.print("sm120_emu: {s}: {s}; the 3D engine: {s}\n", .{ @errorName(e), Rtx.dev.explain(&buf), Rtx3d.engine3d.why });
+    }
+    std.debug.print("3D engine: draws {d} through it, {d} on the compute kernels; the emulated engine drew {d}, {d} pixels\n", .{ eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws, Rtx3d.engine3d.draws, Rtx3d.engine3d.pixels });
+    for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("3D engine: a draw on the compute kernels: {s}\n", .{w});
+    if (eng_rtx.why_pipe) |w| std.debug.print("3D engine: a pipeline refused: {s}\n", .{@errorName(w)});
+    try std.testing.expect(eng_rtx.why_pipe == null);
+    try std.testing.expect(!eng_rtx.lost);
+    try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
+    try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
+    // (the hardware's blending and interpolation are not KIR's exact
+    // arithmetic: within a step or two of 255)
+    try std.testing.expectEqual(@as(u32, 0), apart(&want.fbo, &out_rtx3d.fbo, W, 2, "fbo"));
+    try std.testing.expectEqual(@as(u32, 0), apart(&want.win, &out_rtx3d.win, WW, 2, "window"));
+    eng_rtx.deinit();
+}
+
+/// Two triangles sharing an edge (their corners' depths apart: a sloped
+/// plane each), added (ONE, ONE) into a cleared target twice: first each
+/// on the 3D engine or on the compute kernels as `on3d` says, the depth
+/// tested LESS and written; then each on the other rasterizer, the depth
+/// tested EQUAL. A pixel of the pair is hit by both passes (128) when
+/// the two rasterizers cover it alike and give it the same depth bits;
+/// once (64), or twice in a pass, is a crack, a double hit or z-fighting.
+fn sharedEdge(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, pts: [4][2]f32, on3d: [2]bool, out: []u8) !void {
+    e.fill(img, img.bounds(), 0, 0);
+    e.fill(depth, depth.bounds(), 0x00ff_ffff, 0xff00_0000);
+    var verts: [6][4]f32 = undefined;
+    const tris = [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
+    const zs = [4]f32{ -0.3, 0.2117, 0.7, 0.0931 };
+    for (tris, 0..) |t, n| {
+        for (t, 0..) |c, j| verts[n * 3 + j] = .{ nx(pts[c][0], W), nx(pts[c][1], H), zs[c], 1 };
+    }
+    e.writeBytes(ab, 0, std.mem.sliceAsBytes(&verts));
+    const quarter = [_]u32{ @bitCast(@as(f32, 0.25)), 0, 0, 0 };
+    const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+    for (0..2) |pass| {
+        for (0..2) |n| {
+            const hw = on3d[n] == (pass == 0);
+            e.compute_only = !hw;
+            const before = e.stats.graphics_draws;
+            var d = raster.Draw{ .pipe = &solid, .color = img, .depth = depth, .depth_test = true, .depth_write = pass == 0, .depth_func = if (pass == 0) 0b001 else 0b010, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 3, .first = @intCast(n * 3), .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .uniforms = &quarter, .blend = add };
+            d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+            if (!e.draw(&d)) return error.NotDrawn;
+            e.finish();
+            if (e.lost or e.why_pipe != null) return error.EngineLost;
+            if (e.stats.graphics_draws - before != @intFromBool(hw)) {
+                for (e.said_compute) |w| if (w.len != 0) std.debug.print("shared edge: on the compute kernels: {s}\n", .{w});
+                return error.WrongRasterizer;
+            }
+        }
+    }
+    e.compute_only = false;
+    e.read(img, 0, 0, W, H, out, W * 4, .rgba8);
+}
+
+/// A pixel's red as hits: 0, 1 (64), 2 (128), else 3.
+fn hits(red: u8) u8 {
+    if (red == 0) return 0;
+    if (red >= 62 and red <= 66) return 1;
+    if (red >= 126 and red <= 130) return 2;
+    return 3;
+}
+
+test "draw: two triangles sharing an edge, one on the RTX's 3D engine and one on the compute kernels: no gap, no pixel twice, the same depth" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    const e = &eng_rtx;
+    var img = e.newImage(W, H, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&img);
+    var depth = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer e.freeImage(&depth);
+    try std.testing.expect(depth.layout.block);
+    var ab = e.newBuffer(6 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    // (a 45-degree edge through pixel centers: the tie rule decides each;
+    // corners off any grid coarser than 1/256: the snapping decides)
+    const shapes = [_][4][2]f32{
+        .{ .{ 8, 4 }, .{ 32, 4 }, .{ 32, 28 }, .{ 8, 28 } },
+        .{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } },
+        .{ .{ 40.5, 2.25 }, .{ 61.0078125, 30.0039 }, .{ 12.25, 30.5 }, .{ 3.1, 1.9 } },
+    };
+    const combos = [_][2]bool{ .{ true, true }, .{ false, false }, .{ true, false }, .{ false, true } };
+    var pics: [combos.len][W * H * 4]u8 = undefined;
+    for ([_]bool{ false, true }) |top_down| {
+        img.top_down = top_down;
+        depth.top_down = top_down;
+        for (shapes, 0..) |s, si| {
+            for (combos, 0..) |c, ci| sharedEdge(e, &img, &depth, &ab, s, c, &pics[ci]) catch |err| {
+                std.debug.print("shared edge: shape {d} ({any}, top down {}): {s}; the 3D engine: {s}\n", .{ si, c, top_down, @errorName(err), Rtx3d.engine3d.why });
+                return err;
+            };
+            var count: [4]u32 = @splat(0);
+            for (0..W * H) |p| count[hits(pics[0][p * 4])] += 1;
+            var differ: [combos.len]u32 = @splat(0);
+            for (1..combos.len) |ci| {
+                for (0..W * H) |p| differ[ci] += @intFromBool(hits(pics[0][p * 4]) != hits(pics[ci][p * 4]));
+            }
+            std.debug.print("shared edge: shape {d} (top down {}): {d} pixels hit by both passes, {d} by one, {d} otherwise; pixels apart from both-first-on-3D: both first on compute {d}, split {d} and {d}\n", .{ si, top_down, count[2], count[1], count[3], differ[1], differ[2], differ[3] });
+            try std.testing.expectEqual(@as(u32, 0), count[1]);
+            try std.testing.expectEqual(@as(u32, 0), count[3]);
+            try std.testing.expect(count[2] > 0);
+            if (si == 0) try std.testing.expectEqual(@as(u32, 24 * 24), count[2]);
+            for (1..combos.len) |ci| try std.testing.expectEqual(@as(u32, 0), differ[ci]);
+        }
+    }
+}
+
+const HwTest = struct {
+    var over: gpu.nvidia_draw.Over = undefined;
+    var kst: gpu.nvidia_device.kir_sm120.State = .{};
+    var mem: [64 * 1024]u8 = undefined;
+    var model: gpu.draw.Reference = .{ .mem = &mem };
+    var ticks: u64 = 0;
+    fn clock() u64 {
+        ticks += 7;
+        return ticks;
+    }
+    fn say(line: []const u8) void {
+        if (std.mem.indexOf(u8, line, "edges") != null or std.mem.indexOf(u8, line, "step 5") != null or std.mem.indexOf(u8, line, "FAILED") != null) std.debug.print("[nv] {s}\n", .{line});
+    }
+};
+
+test "draw: the drawtest boot's hardware test on the emulated RTX, step 4 (edges) too: the 3D engine's edges and depth are the compute path's, exactly" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    const gd = Rtx.dev.device();
+    const res = gpu.nvidia_draw.hardwareTest(Rtx.dev.raw.device(), gd, &HwTest.over, &HwTest.kst, &HwTest.model, &HwTest.say, &HwTest.clock);
+    try std.testing.expect(res.started and res.object and res.state and !res.lost);
+    try std.testing.expectEqual(@as(u32, 0), res.failed);
+    try std.testing.expect(!res.edge_skipped);
+    try std.testing.expectEqual(@as(u32, 2 * gpu.nvidia_draw.EDGE_SCENES), res.edge_scenes);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_cover_apart);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_depth_apart);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_equal_apart);
+    // (step 5: every feature scene drawn, each the model's)
+    try std.testing.expect(!res.feature_skipped);
+    try std.testing.expectEqual(@as(u32, gpu.nvidia_draw.FEATURE_SCENES), res.feature_scenes);
+    try std.testing.expectEqual(@as(u32, 0), res.feature_apart);
+}
+
+// ── What the 3D engine draws beyond the scene, each against the CPU ───────
+
+const Feat = struct {
+    /// gl_FragDepth: x / 64 + y / 128 at the pixel's centre (exact in
+    /// f32: no rounding for an FFMA to differ in), the colour the
+    /// uniforms'.
+    fn fragDepth(_: ?*const anyopaque, k: *kir.Kernel, io: *raster.FragmentIO) void {
+        Uniform.fragment(null, k, io);
+        const x = k.op2(.fmul, .f32, r(io.frag_coord[0]), kir.f(1.0 / 64.0));
+        const y = k.op2(.fmul, .f32, r(io.frag_coord[1]), kir.f(1.0 / 128.0));
+        io.depth = k.op2(.fadd, .f32, r(x), r(y));
+    }
+
+    /// Several colour targets: output 0 the uniforms', output 1 across x,
+    /// output 3 up y (output 2 not written: draw buffer 2 is NONE).
+    fn mrt(_: ?*const anyopaque, k: *kir.Kernel, io: *raster.FragmentIO) void {
+        Uniform.fragment(null, k, io);
+        const x = k.op2(.fmul, .f32, r(io.frag_coord[0]), kir.f(1.0 / 64.0));
+        const y = k.op2(.fmul, .f32, r(io.frag_coord[1]), kir.f(1.0 / 32.0));
+        io.colors[1] = .{ x, k.mov(.f32, kir.f(0.25)), k.mov(.f32, kir.f(0)), k.mov(.f32, kir.f(1)) };
+        io.colors[3] = .{ k.mov(.f32, kir.f(0.5)), y, .none, .none };
+    }
+
+    /// gl_FrontFacing: red for a front face, green for a back one.
+    fn facing(_: ?*const anyopaque, k: *kir.Kernel, io: *raster.FragmentIO) void {
+        io.color = .{ k.sel(.f32, r(io.front_facing), kir.f(1), kir.f(0)), k.sel(.f32, r(io.front_facing), kir.f(0), kir.f(1)), k.mov(.f32, kir.f(0)), k.mov(.f32, kir.f(1)) };
+    }
+};
+
+var frag_depth_pipe = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .frag_depth = true, .vertex = Uniform.vertex, .fragment = Feat.fragDepth });
+var facing_pipe = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .front_facing = true, .vertex = Uniform.vertex, .fragment = Feat.facing });
+var mrt_pipe = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .vertex = Uniform.vertex, .fragment = Feat.mrt });
+/// (solid's own copy: a pipeline keeps the programs it was loaded with on
+/// the engine that drew it last, and the tests before re-make that engine)
+var feat_solid = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .vertex = Uniform.vertex, .fragment = Uniform.fragment });
+const feat_pipes = [_]*raster.Pipeline{ &frag_depth_pipe, &feat_solid, &facing_pipe, &mrt_pipe };
+
+/// The features, a scene each.
+const Feature = enum { frag_depth, front_facing, two_sided_stencil, mrt, restart };
+const all_features = [_]Feature{ .frag_depth, .front_facing, .two_sided_stencil, .mrt, .restart };
+/// A feature scene's pictures: target 0 (RGBA8), then for `mrt` targets
+/// 1 (BGRA8) and 3 (RG8) as their bytes.
+const FEAT_PIC = W * H * 4;
+
+fn rgba(c: [4]f32) [4]u32 {
+    return .{ @bitCast(c[0]), @bitCast(c[1]), @bitCast(c[2]), @bitCast(c[3]) };
+}
+
+/// A triangle list's vertices (x, y in pixels; z clip) into `ab`, drawn
+/// with `d0`'s state; finished before the next.
+fn featDraw(e: *engine.Engine, d0: raster.Draw, ab: *engine.Image, pts: []const [3]f32) !void {
+    var verts: [12][4]f32 = undefined;
+    for (pts, 0..) |p, n| verts[n] = .{ nx(p[0], W), nx(p[1], H), p[2], 1 };
+    e.writeBytes(ab, 0, std.mem.sliceAsBytes(verts[0..pts.len]));
+    var d = d0;
+    d.rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H };
+    d.count = @intCast(pts.len);
+    d.center = .{ W / 2, H / 2 };
+    d.half = .{ W / 2, H / 2 };
+    d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+    if (!e.draw(&d)) return error.NotDrawn;
+    e.finish();
+    if (e.lost or e.why_pipe != null) return error.EngineLost;
+}
+
+/// The whole target as two triangles at clip depth z.
+fn fullQuad(z: f32) [6][3]f32 {
+    return .{ .{ 0, 0, z }, .{ W, 0, z }, .{ W, H, z }, .{ 0, 0, z }, .{ W, H, z }, .{ 0, H, z } };
+}
+
+/// A feature's scene into `img` (with `depth`, packed depth-stencil),
+/// read into `out`; the draws the 3D engine took.
+fn featureScene(e: *engine.Engine, f: Feature, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, out: []u8) !u64 {
+    e.fill(img, img.bounds(), 0, 0);
+    e.fill(depth, depth.bounds(), 0x00ff_ffff, 0xff00_0000);
+    @memset(out, 0);
+    const before = e.stats.graphics_draws;
+    const red = rgba(.{ 1, 0, 0, 1 });
+    const green = rgba(.{ 0, 1, 0, 1 });
+    switch (f) {
+        // gl_FragDepth written LESS over 1; then a plane at window depth
+        // 0.6, LESS: green where the written depth is above it (a slanted
+        // line across the target: each pixel's word decides)
+        .frag_depth => {
+            const q = fullQuad(0.9);
+            try featDraw(e, .{ .pipe = &frag_depth_pipe, .color = img, .depth = depth, .depth_test = true, .depth_write = true, .uniforms = &red }, ab, &q);
+            const p = fullQuad(0.2);
+            try featDraw(e, .{ .pipe = &feat_solid, .color = img, .depth = depth, .depth_test = true, .depth_write = true, .uniforms = &green }, ab, &p);
+            // (and EQUAL against the words gl_FragDepth wrote: the same
+            // pixels again, blue added where the depth is the program's)
+            const blue_add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+            const blue = rgba(.{ 0, 0, 1, 0 });
+            try featDraw(e, .{ .pipe = &frag_depth_pipe, .color = img, .depth = depth, .depth_test = true, .depth_func = 0b010, .uniforms = &blue, .blend = blue_add }, ab, &q);
+        },
+        // gl_FrontFacing: a counter-clockwise triangle and a clockwise one
+        // sharing an off-grid edge; then front faces clockwise
+        .front_facing => {
+            const pts = [_][3]f32{ .{ 2.3, 1.7, 0 }, .{ 30.61, 3.2, 0 }, .{ 9.9, 30.4, 0 }, .{ 30.61, 3.2, 0 }, .{ 9.9, 30.4, 0 }, .{ 61.2, 29.05, 0 } };
+            try featDraw(e, .{ .pipe = &facing_pipe, .color = img }, ab, &pts);
+            const lower = [_][3]f32{ .{ 33, 1, 0 }, .{ 62, 1, 0 }, .{ 62, 12, 0 }, .{ 33, 1, 0 }, .{ 33, 12, 0 }, .{ 62, 12, 0 } };
+            try featDraw(e, .{ .pipe = &facing_pipe, .color = img, .front_ccw = false }, ab, &lower);
+        },
+        // two-sided stencil: the whole target (front: INCR_WRAP), a
+        // clockwise triangle over it (back: EQUAL 1 under 0x0f, INVERT
+        // written under 0xf0) in the same draw; then each stencil value
+        // made a colour (EQUAL against 1, 0xf1 and 0xf0... drawn in turn)
+        .two_sided_stencil => {
+            const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+            const quarter = rgba(.{ 0.25, 0, 0, 0 });
+            const front = raster.Stencil{ .func = 7, .pass = .incr_wrap };
+            const back = raster.Stencil{ .func = 2, .reference = 1, .value_mask = 0x0f, .write_mask = 0xf0, .pass = .invert };
+            var pts: [9][3]f32 = undefined;
+            const q = fullQuad(0);
+            @memcpy(pts[0..6], &q);
+            pts[6] = .{ 6.4, 4.1, 0 };
+            pts[7] = .{ 27.3, 29.6, 0 };
+            pts[8] = .{ 57.75, 2.5, 0 };
+            try featDraw(e, .{ .pipe = &feat_solid, .color = img, .depth = depth, .stencil = depth, .stencil_front = front, .stencil_back = back, .uniforms = &quarter, .blend = add }, ab, &pts);
+            const looks = [_]struct { u8, [4]f32 }{ .{ 0x01, .{ 0, 0.5, 0, 0 } }, .{ 0xf1, .{ 0, 0, 0.5, 0 } } };
+            for (looks) |lk| {
+                const col = rgba(lk[1]);
+                const eq = raster.Stencil{ .func = 2, .reference = lk[0] };
+                try featDraw(e, .{ .pipe = &feat_solid, .color = img, .depth = depth, .stencil = depth, .stencil_front = eq, .stencil_back = eq, .uniforms = &col, .blend = add }, ab, &q);
+            }
+        },
+        // several colour targets: 0 (RGBA8, replaced), 1 (BGRA8, added
+        // over a grey), 2 none, 3 (RG8, green kept, not blended); a
+        // triangle over part of them, then the whole target
+        .mrt => {
+            var t1 = e.newImage(W, H, .bgra8) orelse return error.OutOfMemory;
+            defer e.freeImage(&t1);
+            var t3 = e.newImage(W, H, .rg8) orelse return error.OutOfMemory;
+            defer e.freeImage(&t3);
+            t1.top_down = img.top_down;
+            t3.top_down = img.top_down;
+            e.fill(&t1, t1.bounds(), 0x4040_4040, 0);
+            e.fill(&t3, t3.bounds(), 0x0000_8020, 0);
+            const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+            const col = rgba(.{ 0.25, 0.5, 0.75, 1 });
+            var d = raster.Draw{ .pipe = &mrt_pipe, .color = img, .uniforms = &col, .blend = add };
+            d.targets[1] = .{ .img = &t1 };
+            d.targets[3] = .{ .img = &t3, .keep = 0x0000_ff00, .blend = false };
+            const tri = [_][3]f32{ .{ 3.5, 2.25, 0 }, .{ 50.2, 9.9, 0 }, .{ 20.75, 30.1, 0 } };
+            try featDraw(e, d, ab, &tri);
+            const q = fullQuad(0);
+            try featDraw(e, d, ab, &q);
+            e.read(&t1, 0, 0, W, H, out[FEAT_PIC..][0..FEAT_PIC], W * 4, .bgra8);
+            e.read(&t3, 0, 0, W, H, out[2 * FEAT_PIC ..][0 .. W * H * 2], W * 2, .rg8);
+        },
+        // indexed (the engine's index buffer) with primitive restart: two
+        // strips in one draw (the second begun at an odd place: its
+        // winding starts anew), two fans in another; red front, green back
+        .restart => {
+            const pts = [_][2]f32{
+                .{ 2, 2 },   .{ 4, 14 },  .{ 12, 3 },  .{ 14, 15 },
+                .{ 20, 2 },  .{ 22, 14 }, .{ 30, 3 },  .{ 31, 16 },
+                .{ 38, 4 },  .{ 50, 8 },  .{ 60, 2 },  .{ 62, 10 },
+                .{ 56, 16 }, .{ 46, 20 }, .{ 58, 22 }, .{ 52, 30 },
+                .{ 40, 30 },
+            };
+            var verts: [pts.len][4]f32 = undefined;
+            for (pts, 0..) |p, n| verts[n] = .{ nx(p[0], W), nx(p[1], H), 0, 1 };
+            e.writeBytes(ab, 0, std.mem.sliceAsBytes(&verts));
+            const R = 0xffff;
+            const idx = [_]u16{ 7, 0, 1, 2, 3, R, 4, 5, 6, 7, 8, 9, 10, 11, 12, R, 13, 14, 15, 16 };
+            var ib = e.newBuffer(@sizeOf(@TypeOf(idx))) orelse return error.OutOfMemory;
+            defer e.freeImage(&ib);
+            e.writeBytes(&ib, 0, std.mem.sliceAsBytes(&idx));
+            for ([_]struct { raster.Topology, u32, u32 }{ .{ .strip, 2, 10 }, .{ .fan, 22, 9 } }) |dr| {
+                var d = raster.Draw{ .pipe = &facing_pipe, .color = img, .index = &ib, .index_size = 2, .index_offset = dr[1], .topology = dr[0], .restart = true, .count = dr[2] };
+                d.rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H };
+                d.center = .{ W / 2, H / 2 };
+                d.half = .{ W / 2, H / 2 };
+                d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+                if (!e.draw(&d)) return error.NotDrawn;
+                e.finish();
+                if (e.lost or e.why_pipe != null) return error.EngineLost;
+            }
+        },
+    }
+    e.read(img, 0, 0, W, H, out[0..FEAT_PIC], W * 4, .rgba8);
+    return e.stats.graphics_draws - before;
+}
+
+var fpool_mem: [8 << 20]u8 align(64) = undefined;
+var eng_fcpu: engine.Engine = undefined;
+
+test "draw: features through the emulated RTX's 3D engine (gl_FragDepth, gl_FrontFacing, two-sided stencil, several colour targets, indexed with primitive restart): every draw on the engine, the CPU's bytes" {
+    Rtx3d.engine3d = .{};
+    eng_fcpu.init(.{ .pool = &fpool_mem, .cpu_work = &cpu_work });
+    defer eng_fcpu.deinit();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer for (feat_pipes) |p| {
+        eng_rtx.unloadPipeline(p);
+        eng_fcpu.unloadPipeline(p);
+    };
+    var imgs: [2][3]engine.Image = undefined;
+    for ([_]*engine.Engine{ &eng_fcpu, &eng_rtx }, 0..) |e, n| {
+        imgs[n][0] = e.newImage(W, H, .rgba8) orelse return error.OutOfMemory;
+        imgs[n][1] = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+        imgs[n][2] = e.newBuffer(20 * 16) orelse return error.OutOfMemory;
+    }
+    try std.testing.expect(imgs[1][1].layout.block);
+    var pics: [2][3 * FEAT_PIC]u8 = undefined;
+    for (all_features) |f| {
+        for ([_]bool{ false, true }) |top_down| {
+            var on3d: [2]u64 = undefined;
+            for ([_]*engine.Engine{ &eng_fcpu, &eng_rtx }, 0..) |e, n| {
+                imgs[n][0].top_down = top_down;
+                imgs[n][1].top_down = top_down;
+                on3d[n] = featureScene(e, f, &imgs[n][0], &imgs[n][1], &imgs[n][2], &pics[n]) catch |err| {
+                    std.debug.print("feature {s} (top down {}): {s}; the 3D engine: {s}\n", .{ @tagName(f), top_down, @errorName(err), Rtx3d.engine3d.why });
+                    return err;
+                };
+            }
+            for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("feature {s}: a draw on the compute kernels: {s}\n", .{ @tagName(f), w });
+            var drawn: u32 = 0;
+            for (0..W * H) |p| drawn += @intFromBool(!std.mem.allEqual(u8, pics[0][p * 4 ..][0..4], 0));
+            std.debug.print("feature {s} (top down {}): {d} draws on the 3D engine, {d} pixels drawn\n", .{ @tagName(f), top_down, on3d[1], drawn });
+            try std.testing.expect(on3d[1] > 0 and drawn > 0);
+            // (blending in floats: within 1 of 255)
+            try std.testing.expectEqual(@as(u32, 0), apart(&pics[0], &pics[1], W, if (f == .mrt) 1 else 0, @tagName(f)));
+        }
+        // (every draw of the scene went through the engine)
+        try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
+        try std.testing.expectEqual(@as(u64, 0), eng_rtx.stats.compute_draws);
+    }
 }
 
 // ── GALAXY_GL_CHECK: the GPU's work against the CPU's ──────────────────────

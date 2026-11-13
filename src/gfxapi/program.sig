@@ -1014,6 +1014,7 @@ fn encodeBinary(p: *const Program, w: *progbin.Writer) void {
     w.flag(sh.point_size);
     w.flag(sh.point_coord);
     w.flag(sh.frag_depth);
+    w.flag(sh.front_facing);
     w.end();
     w.begin(progbin.VSRC);
     w.bytes(poolText(p.vs_src));
@@ -1147,7 +1148,7 @@ fn decodeBinary(c: *Context, p: *Program, bin: []const u8) ?progbin.Refusal {
     var link_s = r.section(progbin.LINK);
     if (!decodeLinked(&p.out, &link_s)) return .malformed;
     var pipe_s = r.section(progbin.PIPE);
-    const f = PipeFlags{ .quads = pipe_s.flag(), .point_size = pipe_s.flag(), .point_coord = pipe_s.flag(), .frag_depth = pipe_s.flag() };
+    const f = PipeFlags{ .quads = pipe_s.flag(), .point_size = pipe_s.flag(), .point_coord = pipe_s.flag(), .frag_depth = pipe_s.flag(), .front_facing = pipe_s.flag() };
     if (!pipe_s.done()) return .malformed;
     var vs_s = r.section(progbin.VSRC);
     const vs = vs_s.bytes(vs_s.b.len);
@@ -1284,13 +1285,13 @@ fn link(p: *Program, log: *glsl.pp.Log) bool {
     p.fs_src = poolDup(&objs[p.fs - 1].source) orelse return outOfPool(log);
     var quads = false;
     if (!checkCode(p, log, &quads)) return false;
-    makePipe(p, .{ .quads = quads, .point_size = vs.point_size, .point_coord = fs.point_coord, .frag_depth = fs.frag_depth });
+    makePipe(p, .{ .quads = quads, .point_size = vs.point_size, .point_coord = fs.point_coord, .frag_depth = fs.frag_depth, .front_facing = fs.front_facing });
     return true;
 }
 
 /// What the pipeline takes from the shaders' code rather than from the
 /// interface: a program binary keeps these too.
-const PipeFlags = struct { quads: bool = false, point_size: bool = false, point_coord: bool = false, frag_depth: bool = false };
+const PipeFlags = struct { quads: bool = false, point_size: bool = false, point_coord: bool = false, frag_depth: bool = false, front_facing: bool = false };
 
 /// The linked program's pipeline (its draws' kernels come from the kept
 /// sources when the engine builds them).
@@ -1303,7 +1304,7 @@ fn makePipe(p: *Program, f: PipeFlags) void {
         if (!v.flat) continue;
         for (0..wordsOf(v.ty)) |w| flat |= @as(u64, 1) << @intCast(v.word + w);
     }
-    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .textures = @intCast(l.nslots), .quads = f.quads, .capture = l.capture[0..l.ncapture], .capture_stride = l.xfb_stride, .point_size = f.point_size, .point_coord = f.point_coord, .frag_depth = f.frag_depth, .vertex = emitVertex, .fragment = emitFragment });
+    p.pipe = raster.Pipeline.init(.{ .ctx = p, .attrs = @intCast(attrs), .varyings = @intCast(l.vary_words), .flat = flat, .textures = @intCast(l.nslots), .quads = f.quads, .capture = l.capture[0..l.ncapture], .capture_stride = l.xfb_stride, .point_size = f.point_size, .point_coord = f.point_coord, .frag_depth = f.frag_depth, .front_facing = f.front_facing, .vertex = emitVertex, .fragment = emitFragment });
     p.has_pipe = true;
 }
 

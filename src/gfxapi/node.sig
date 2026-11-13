@@ -77,6 +77,10 @@ pub const G_SUBMIT: u32 = 0xc010_4704;
 pub const G_WAIT: u32 = 0x4010_4705;
 pub const G_IMPORT: u32 = 0xc020_4706;
 pub const G_FENCE_FD: u32 = 0xc008_4707;
+/// The context's channel with the RTX's 3D engine on it (Galaxy's nv_drm,
+/// _IOW('G', 14, u32)): 0 once it is there; -EOPNOTSUPP when the GPU
+/// offers none.
+pub const G_GRAPHICS: u32 = 0x4004_470e;
 pub const G_VERSION: u32 = 1;
 /// G_ALLOC's flags: write-combined for the CPU (the Adreno's); in VRAM
 /// (the RTX's; without it, system memory the GPU maps).
@@ -214,6 +218,14 @@ pub fn Node(comptime Sys: type) type {
             g.unit = if (g.kind == .nvidia) NV_UNIT else PAGE;
             g.line = g.sys.cacheLine();
             return i;
+        }
+
+        /// The RTX's 3D engine on this context's channel (G_GRAPHICS): true
+        /// once it is there, false when the GPU offers none.
+        pub fn graphics(g: *Self) bool {
+            if (g.kind != .nvidia) return false;
+            var a = [_]u8{0} ** 4;
+            return g.call(G_GRAPHICS, &a) == 0;
         }
 
         pub fn info(g: *Self) ?Info {
@@ -682,6 +694,9 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
         node: Node(Sys),
         over: gpu.adreno_device.Over = undefined,
         nv: if (with_nv) gpu.nvidia_device.Adapter else void = if (with_nv) .{} else {},
+        /// Ask for the RTX's 3D engine at open (GALAXY_GL_3D): the Device's
+        /// caps then offer graphics dispatches if the kernel gave it.
+        want_graphics: bool = false,
 
         pub const Error = Node(Sys).OpenError;
 
@@ -695,7 +710,9 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
                     return g.over.device();
                 },
                 .nvidia => if (with_nv) {
-                    return gpu.nvidia_device.over(&g.nv, g.node.nvDevice(.vram), g.node.nvDevice(.system), gpu.nvidia_device.rtx5070(@as(u64, info.vram_mib) << 20));
+                    var caps = gpu.nvidia_device.rtx5070(@as(u64, info.vram_mib) << 20);
+                    if (g.want_graphics and g.node.graphics()) caps = gpu.nvidia_device.withGraphics(caps);
+                    return gpu.nvidia_device.over(&g.nv, g.node.nvDevice(.vram), g.node.nvDevice(.system), caps);
                 },
             }
             g.node.close();
