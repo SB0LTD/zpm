@@ -59,6 +59,17 @@
 //!   driver_pipeline_test.sig  pictures in flight, the waits, VP9's
 //!                    adaptation at the next BeginPicture
 //!   hevc_stream_test.sig  the slice-header parse on x265's real stream
+//!   h264_parse.sig   an H.264 stream read as a VA client reads it: parameter
+//!                    sets, slice headers, POC, the DPB, output order
+//!   video.sig        Decoder: a bitstream in, pictures out (display order),
+//!                    for apps that hold no VA buffers (Galaxy's Windows
+//!                    Media Foundation)
+//!   hevc_parse.sig, vp8_read.sig, vp9_read.sig, av1_read.sig  the same for
+//!                    HEVC, VP8, VP9 and AV1
+//!   video_enc.sig    Encoder: NV12 pictures in, H.264/VP8/VP9 bytes out
+//!                    (I then P, a key frame every gop), the same apps'
+//!   h264_stream_test.sig, hevc_parse_test.sig, video_test.sig  their tests
+//!                    on x264's, x265's and libvpx's streams
 //!   enc_vpx.sig      VP8 and VP9 encoding through VA-API: the buffers, a
 //!                    picture's plan; vpx_driver_test.sig through the driver
 //!   vpx_dsl.sig      the encoders' kernels' language: one source, run on
@@ -92,6 +103,18 @@ pub const enc_av1 = @import("enc_av1.sig");
 pub const enc_import = @import("enc_import.sig");
 pub const convert = @import("convert.sig");
 pub const driver = @import("driver.sig");
+pub const h264_parse = @import("h264_parse.sig");
+pub const video = @import("video.sig");
+pub const hevc_parse = @import("hevc_parse.sig");
+pub const vp8_read = @import("vp8_read.sig");
+pub const vp9_read = @import("vp9_read.sig");
+pub const av1_read = @import("av1_read.sig");
+pub const video_enc = @import("video_enc.sig");
+/// (the RTX converting pictures for a CPU reader; they import the `gpu` and
+/// `gfxapi` modules, so a build that names them wires those: libgalaxy_va,
+/// galaxy-pe)
+pub const gpu_convert = @import("gpu_convert.sig");
+pub const enc_rgb = @import("enc_rgb.sig");
 pub const vpx_dsl = @import("vpx_dsl.sig");
 pub const vpx_bool = @import("vpx_bool.sig");
 pub const vp8_kernels = @import("vp8_kernels.sig");
@@ -127,6 +150,11 @@ test {
     _ = @import("driver_10bit_test.sig");
     _ = @import("driver_pipeline_test.sig");
     _ = @import("hevc_stream_test.sig");
+    _ = @import("h264_stream_test.sig");
+    _ = @import("video_test.sig");
+    _ = @import("hevc_parse_test.sig");
+    _ = @import("av1_read_test.sig");
+    _ = @import("video_enc_test.sig");
     _ = @import("enc_test.sig");
     _ = enc_import;
     _ = vpx_dsl;

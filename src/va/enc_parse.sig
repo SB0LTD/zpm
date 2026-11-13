@@ -20,6 +20,8 @@ pub const Reader = struct {
     bit: u3 = 0,
     zeros: u8 = 0,
     bad: bool = false,
+    /// emulation prevention bytes skipped so far
+    epb: u32 = 0,
 
     pub fn init(data: []const u8) Reader {
         return .{ .data = data };
@@ -30,6 +32,7 @@ pub const Reader = struct {
         if (r.bit == 0 and r.zeros >= 2 and r.pos < r.data.len and r.data[r.pos] == 3) {
             r.pos += 1;
             r.zeros = 0;
+            r.epb += 1;
         }
         if (r.pos >= r.data.len) return null;
         return r.data[r.pos];
