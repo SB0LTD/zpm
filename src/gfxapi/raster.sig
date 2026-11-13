@@ -236,7 +236,8 @@ pub const Shaders = struct {
     /// two planes more in a primitive's record
     point_coord: bool = false,
     /// the fragment code writes gl_FragDepth (FragmentIO.depth): the
-    /// depth and stencil tests come after it (no early rejection)
+    /// depth and stencil tests come after it (no early rejection); on the
+    /// 3D engine its pixel program's depth output
     frag_depth: bool = false,
     /// the fragment code reads gl_FrontFacing (FragmentIO.front_facing):
     /// the compute kernels give it (the 3D engine's pixel programs do not
@@ -894,7 +895,6 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
 pub fn pipelineWhyNot(sh: Shaders) ?[]const u8 {
     if (sh.capture.len != 0) return "transform feedback";
     if (sh.point_size or sh.point_coord) return "points";
-    if (sh.frag_depth) return "gl_FragDepth";
     if (sh.front_facing) return "gl_FrontFacing";
     if (sh.clips != 0) return "clip distances";
     if (sh.varyings > nvidia_gl.MAX_VARYINGS) return "more varyings than 32 vectors";
@@ -1014,6 +1014,10 @@ pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         const val: Arg = if (io.color[c] == .none) f(0) else r(io.color[c]);
         k.store(.f32, io_m.at(b.io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c))), u(0), val);
     }
+    // gl_FragDepth: the engine tests it in place of the interpolated depth
+    // (late tests: the header says the program writes it), clamped to
+    // 0..1 as the compute raster's depthWord clamps it
+    if (sh.frag_depth) k.store(.f32, io_m.at(b.io, nvidia_gl.DEPTH_AT), u(0), r(if (io.depth == .none) z else io.depth));
     return k;
 }
 

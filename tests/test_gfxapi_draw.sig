@@ -1676,7 +1676,7 @@ const HwTest = struct {
         return ticks;
     }
     fn say(line: []const u8) void {
-        if (std.mem.indexOf(u8, line, "edges") != null or std.mem.indexOf(u8, line, "FAILED") != null) std.debug.print("[nv] {s}\n", .{line});
+        if (std.mem.indexOf(u8, line, "edges") != null or std.mem.indexOf(u8, line, "step 5") != null or std.mem.indexOf(u8, line, "FAILED") != null) std.debug.print("[nv] {s}\n", .{line});
     }
 };
 
@@ -1692,6 +1692,135 @@ test "draw: the drawtest boot's hardware test on the emulated RTX, step 4 (edges
     try std.testing.expectEqual(@as(u32, 0), res.edge_cover_apart);
     try std.testing.expectEqual(@as(u32, 0), res.edge_depth_apart);
     try std.testing.expectEqual(@as(u32, 0), res.edge_equal_apart);
+    // (step 5: every feature scene drawn, each the model's)
+    try std.testing.expect(!res.feature_skipped);
+    try std.testing.expectEqual(@as(u32, gpu.nvidia_draw.FEATURE_SCENES), res.feature_scenes);
+    try std.testing.expectEqual(@as(u32, 0), res.feature_apart);
+}
+
+// ── What the 3D engine draws beyond the scene, each against the CPU ───────
+
+const Feat = struct {
+    /// gl_FragDepth: x / 64 + y / 128 at the pixel's centre (exact in
+    /// f32: no rounding for an FFMA to differ in), the colour the
+    /// uniforms'.
+    fn fragDepth(_: ?*const anyopaque, k: *kir.Kernel, io: *raster.FragmentIO) void {
+        Uniform.fragment(null, k, io);
+        const x = k.op2(.fmul, .f32, r(io.frag_coord[0]), kir.f(1.0 / 64.0));
+        const y = k.op2(.fmul, .f32, r(io.frag_coord[1]), kir.f(1.0 / 128.0));
+        io.depth = k.op2(.fadd, .f32, r(x), r(y));
+    }
+};
+
+var frag_depth_pipe = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .frag_depth = true, .vertex = Uniform.vertex, .fragment = Feat.fragDepth });
+/// (solid's own copy: a pipeline keeps the programs it was loaded with on
+/// the engine that drew it last, and the tests before re-make that engine)
+var feat_solid = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .vertex = Uniform.vertex, .fragment = Uniform.fragment });
+const feat_pipes = [_]*raster.Pipeline{ &frag_depth_pipe, &feat_solid };
+
+/// The features, a scene each.
+const Feature = enum { frag_depth };
+const all_features = [_]Feature{.frag_depth};
+
+fn rgba(c: [4]f32) [4]u32 {
+    return .{ @bitCast(c[0]), @bitCast(c[1]), @bitCast(c[2]), @bitCast(c[3]) };
+}
+
+/// A triangle list's vertices (x, y in pixels; z clip) into `ab`, drawn
+/// with `d0`'s state; finished before the next.
+fn featDraw(e: *engine.Engine, d0: raster.Draw, ab: *engine.Image, pts: []const [3]f32) !void {
+    var verts: [12][4]f32 = undefined;
+    for (pts, 0..) |p, n| verts[n] = .{ nx(p[0], W), nx(p[1], H), p[2], 1 };
+    e.writeBytes(ab, 0, std.mem.sliceAsBytes(verts[0..pts.len]));
+    var d = d0;
+    d.rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H };
+    d.count = @intCast(pts.len);
+    d.center = .{ W / 2, H / 2 };
+    d.half = .{ W / 2, H / 2 };
+    d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+    if (!e.draw(&d)) return error.NotDrawn;
+    e.finish();
+    if (e.lost or e.why_pipe != null) return error.EngineLost;
+}
+
+/// The whole target as two triangles at clip depth z.
+fn fullQuad(z: f32) [6][3]f32 {
+    return .{ .{ 0, 0, z }, .{ W, 0, z }, .{ W, H, z }, .{ 0, 0, z }, .{ W, H, z }, .{ 0, H, z } };
+}
+
+/// A feature's scene into `img` (with `depth`, packed depth-stencil),
+/// read into `out`; the draws the 3D engine took.
+fn featureScene(e: *engine.Engine, f: Feature, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, out: []u8) !u64 {
+    e.fill(img, img.bounds(), 0, 0);
+    e.fill(depth, depth.bounds(), 0x00ff_ffff, 0xff00_0000);
+    const before = e.stats.graphics_draws;
+    const red = rgba(.{ 1, 0, 0, 1 });
+    const green = rgba(.{ 0, 1, 0, 1 });
+    switch (f) {
+        // gl_FragDepth written LESS over 1; then a plane at window depth
+        // 0.6, LESS: green where the written depth is above it (a slanted
+        // line across the target: each pixel's word decides)
+        .frag_depth => {
+            const q = fullQuad(0.9);
+            try featDraw(e, .{ .pipe = &frag_depth_pipe, .color = img, .depth = depth, .depth_test = true, .depth_write = true, .uniforms = &red }, ab, &q);
+            const p = fullQuad(0.2);
+            try featDraw(e, .{ .pipe = &feat_solid, .color = img, .depth = depth, .depth_test = true, .depth_write = true, .uniforms = &green }, ab, &p);
+            // (and EQUAL against the words gl_FragDepth wrote: the same
+            // pixels again, blue added where the depth is the program's)
+            const blue_add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+            const blue = rgba(.{ 0, 0, 1, 0 });
+            try featDraw(e, .{ .pipe = &frag_depth_pipe, .color = img, .depth = depth, .depth_test = true, .depth_func = 0b010, .uniforms = &blue, .blend = blue_add }, ab, &q);
+        },
+    }
+    e.read(img, 0, 0, W, H, out, W * 4, .rgba8);
+    return e.stats.graphics_draws - before;
+}
+
+var fpool_mem: [8 << 20]u8 align(64) = undefined;
+var eng_fcpu: engine.Engine = undefined;
+
+test "draw: features through the emulated RTX's 3D engine (gl_FragDepth): every draw on the engine, the CPU's bytes" {
+    Rtx3d.engine3d = .{};
+    eng_fcpu.init(.{ .pool = &fpool_mem, .cpu_work = &cpu_work });
+    defer eng_fcpu.deinit();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer for (feat_pipes) |p| {
+        eng_rtx.unloadPipeline(p);
+        eng_fcpu.unloadPipeline(p);
+    };
+    var imgs: [2][3]engine.Image = undefined;
+    for ([_]*engine.Engine{ &eng_fcpu, &eng_rtx }, 0..) |e, n| {
+        imgs[n][0] = e.newImage(W, H, .rgba8) orelse return error.OutOfMemory;
+        imgs[n][1] = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+        imgs[n][2] = e.newBuffer(12 * 16) orelse return error.OutOfMemory;
+    }
+    try std.testing.expect(imgs[1][1].layout.block);
+    var pics: [2][W * H * 4]u8 = undefined;
+    for (all_features) |f| {
+        for ([_]bool{ false, true }) |top_down| {
+            var on3d: [2]u64 = undefined;
+            for ([_]*engine.Engine{ &eng_fcpu, &eng_rtx }, 0..) |e, n| {
+                imgs[n][0].top_down = top_down;
+                imgs[n][1].top_down = top_down;
+                on3d[n] = featureScene(e, f, &imgs[n][0], &imgs[n][1], &imgs[n][2], &pics[n]) catch |err| {
+                    std.debug.print("feature {s} (top down {}): {s}; the 3D engine: {s}\n", .{ @tagName(f), top_down, @errorName(err), Rtx3d.engine3d.why });
+                    return err;
+                };
+            }
+            for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("feature {s}: a draw on the compute kernels: {s}\n", .{ @tagName(f), w });
+            var drawn: u32 = 0;
+            for (0..W * H) |p| drawn += @intFromBool(!std.mem.allEqual(u8, pics[0][p * 4 ..][0..4], 0));
+            std.debug.print("feature {s} (top down {}): {d} draws on the 3D engine, {d} pixels drawn\n", .{ @tagName(f), top_down, on3d[1], drawn });
+            try std.testing.expect(on3d[1] > 0 and drawn > 0);
+            try std.testing.expectEqual(@as(u32, 0), apart(&pics[0], &pics[1], W, 0, @tagName(f)));
+        }
+        // (every draw of the scene went through the engine)
+        try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
+        try std.testing.expectEqual(@as(u64, 0), eng_rtx.stats.compute_draws);
+    }
 }
 
 // ── GALAXY_GL_CHECK: the GPU's work against the CPU's ──────────────────────

@@ -289,8 +289,10 @@ pub const State = struct {
     stats: Stats = .{},
     /// A stage's: what its program loads and stores (Stage).
     io: StageIO = .{},
-    /// A pixel program's output registers (virtual: copied to R0.. at EXIT).
+    /// A pixel program's output registers (virtual: copied at EXIT to the
+    /// registers `outreg` names, NAK's order: see stageOutputs).
     outv: [MAX_OUTPUTS]u16 = @splat(NOV),
+    outreg: [MAX_OUTPUTS]u8 = @splat(0),
 };
 
 /// The bytes of a device.Work that `compile` takes (its State, aligned).
@@ -337,8 +339,12 @@ pub const Options = struct {
 ///   KIR multiplies by w itself), or .CONSTANT where the address has FLAT
 ///   (flat: the provoking vertex's). The position's words are the
 ///   pixel's centre, its depth and 1/w. A store at OUT_AT + 4r is output
-///   register r (target t's channel c is r = 4t + c), whatever is stored
-///   last before EXIT (an output never stored is 0); a store at KILL_AT
+///   r (target t's channel c is r = 4t + c; DEPTH_OUT, gl_FragDepth),
+///   whatever is stored last before EXIT (an output never stored is 0).
+///   At EXIT the outputs are in the registers NAK leaves them in: four
+///   for each target with any channel stored (in the targets' order,
+///   packed: a target never stored takes none), then the sample mask's,
+///   then the depth's. A store at KILL_AT
 ///   (any value) discards the pixel (KILL: the thread runs on, its outputs
 ///   unwritten).
 ///
@@ -349,17 +355,22 @@ pub const OUT_AT: u32 = 0x1000;
 pub const KILL_AT: u32 = 0x2000;
 /// A pixel program's load of a word flat (IPA.CONSTANT): its address | FLAT.
 pub const FLAT: u32 = 0x10000;
-/// Pixel outputs: eight targets of four channels.
-pub const MAX_OUTPUTS = 32;
+/// Pixel outputs: eight targets of four channels, then the depth.
+pub const MAX_OUTPUTS = 33;
+/// gl_FragDepth's output (window depth, 0..1: the engine clamps it).
+pub const DEPTH_OUT = 32;
+pub const DEPTH_AT: u32 = OUT_AT + 4 * DEPTH_OUT;
 
 /// What a stage's program loads and stores (after dead code is dropped):
 /// attribute words (bit i: the word at byte 4i), those loaded flat, the
-/// output registers written, whether it discards.
+/// colour outputs written (bit 4t + c; all four of a target written at
+/// all), whether it writes the depth, whether it discards.
 pub const StageIO = struct {
     loads: [8]u32 = @splat(0),
     flat: [8]u32 = @splat(0),
     stores: [8]u32 = @splat(0),
     outputs: u32 = 0,
+    depth: bool = false,
     kills: bool = false,
 
     pub fn has(set: *const [8]u32, at: u32) bool {
@@ -2001,20 +2012,42 @@ const Ctx = struct {
     }
 
     /// A pixel program's outputs: a register each, 0 from the start, kept
-    /// to the end (stageLive) and copied to R0.. at each EXIT (emitText).
+    /// to the end (stageLive) and copied at each EXIT (emitText) to where
+    /// NAK leaves them (`outreg`): the four channels of each target the
+    /// program stores to at all, packed in the targets' order (a channel
+    /// never stored is 0: the header names whole targets, as NAK's does),
+    /// then the sample mask's register (never written here), then the
+    /// depth's.
     fn stageOutputs(c: *Ctx) Error!void {
         const w = c.w;
         w.outv = @splat(NOV);
+        w.outreg = @splat(0);
         if (c.opts.stage != .pixel) return;
+        var targets: u8 = 0;
+        var depth = false;
         for (c.insts()) |in| {
             if (in.op != .st) continue;
             const m: kir.Mem = @bitCast(in.aux);
             if (!c.isStageIO(m) or m.imm < OUT_AT or m.imm >= KILL_AT) continue;
             const r = (m.imm - OUT_AT) / 4;
             if (r >= MAX_OUTPUTS) return error.Unsupported;
-            if (w.outv[r] != NOV) continue;
+            if (r == DEPTH_OUT) depth = true else targets |= @as(u8, 1) << @intCast(r / 4);
+        }
+        var next: u8 = 0;
+        for (0..8) |t| {
+            if ((targets >> @intCast(t)) & 1 == 0) continue;
+            for (0..4) |ch| {
+                const v = try c.newV(.r);
+                w.outv[4 * t + ch] = v;
+                w.outreg[4 * t + ch] = next;
+                next += 1;
+                try c.eff("MOV", 1, &.{ R(v), .rz });
+            }
+        }
+        if (depth) {
             const v = try c.newV(.r);
-            w.outv[r] = v;
+            w.outv[DEPTH_OUT] = v;
+            w.outreg[DEPTH_OUT] = next + 1;
             try c.eff("MOV", 1, &.{ R(v), .rz });
         }
     }
@@ -2080,9 +2113,10 @@ const Ctx = struct {
                 }
             }
         }
-        for (w.outv, 0..) |v, r| {
+        for (w.outv[0..DEPTH_OUT], 0..) |v, r| {
             if (v != NOV) w.io.outputs |= @as(u32, 1) << @intCast(r);
         }
+        w.io.depth = w.outv[DEPTH_OUT] != NOV;
     }
 
     /// The highest general register allocated.
@@ -2453,7 +2487,7 @@ const Ctx = struct {
         if (c.opts.stage == .pixel) {
             for (w.outv, 0..) |v, r| {
                 if (v == NOV) continue;
-                for (0..r + 1) |x| setBit(&used, @intCast(x));
+                for (0..@as(usize, w.outreg[r]) + 1) |x| setBit(&used, @intCast(x));
             }
         }
         for (units) |u| {
@@ -2649,7 +2683,7 @@ const Ctx = struct {
                         c.printOpd(&t, m.guard, map[0..n_map], null);
                         t.str(" ");
                     }
-                    t.reg("MOV R", @intCast(r));
+                    t.reg("MOV R", w.outreg[r]);
                     t.reg(", R", c.physOf(v));
                     t.str("\n");
                 }

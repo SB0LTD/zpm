@@ -23,7 +23,10 @@
 //! provoking vertex first or last, GL's blend factors and equations and
 //! the constant colour, the channels written, RG8 targets, the depth's
 //! clip volume (-w..w or 0..w: a pixel whose depth falls outside is not
-//! drawn) and the depth carried to the pixel program in window units.
+//! drawn) and the depth carried to the pixel program in window units; a
+//! pixel program that writes the depth (its header's bit, its register
+//! after the colours' and the sample mask's) has it tested and written in
+//! place of the plane's, clamped to 0..1.
 //!
 //! It is as strict as it can be: state the renderer does not send, or
 //! sends with another value, is a refused stream with the reason kept
@@ -689,12 +692,18 @@ pub const Engine = struct {
         const ct = g.reg(gr.SET_CT_WRITE);
         const mask: u4 = @intCast((ct & 1) | ((ct >> 4) & 1) << 1 | ((ct >> 8) & 1) << 2 | ((ct >> 12) & 1) << 3);
         const zt = try g.depthTarget();
+        // (a program that writes the depth (gl_FragDepth): its register
+        // after the colours' and the sample mask's, as NAK leaves them)
+        var targets: u32 = 0;
+        for (0..8) |tt| targets += @intFromBool((g.phead[18] >> @intCast(4 * tt)) & 0xf != 0);
+        const writes_depth = sph.bit(&g.phead, 609);
         for (0..n) |k| {
             if (g.killed[k] or g.helper[k]) continue;
             // (the depth and stencil tests, late: in the pixels' order, so
             // a later primitive's pixel tests against an earlier one's)
             if (zt) |z| {
-                if (!g.depthStencil(z, g.at[k][0], g.at[k][1], g.zw[k])) continue;
+                const zw: f32 = if (writes_depth) shaderDepth(@bitCast(emu.threadReg(g.host.work, @intCast(k), @intCast(4 * targets + 1)))) else g.zw[k];
+                if (!g.depthStencil(z, g.at[k][0], g.at[k][1], zw)) continue;
             }
             var color: [4]f32 = undefined;
             for (&color, 0..) |*ch, r| ch.* = @bitCast(emu.threadReg(g.host.work, @intCast(k), @intCast(r)));
@@ -872,6 +881,14 @@ pub fn depthInRange(z: f32, zlo: f32, zhi: f32, zs: f32, zo: f32) bool {
 /// half in f32 would round it up).
 pub fn depthWord(z: f32) u32 {
     return @intFromFloat(rne(std.math.clamp(z, 0, 1) * 16777215.0));
+}
+
+/// A depth a pixel program wrote (gl_FragDepth) as the engine takes it:
+/// clamped to the viewport's 0..1, not a number 0 (as gfxapi's compute
+/// raster's fmax and fmin give it).
+pub fn shaderDepth(z: f32) f32 {
+    if (z != z) return 0;
+    return std.math.clamp(z, 0, 1);
 }
 
 /// x rounded to the nearest whole number, ties to even (as cvt's .rne).

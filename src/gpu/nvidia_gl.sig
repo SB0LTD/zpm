@@ -31,6 +31,10 @@ pub const Stage = kir_sm120.Stage;
 pub const StageIO = kir_sm120.StageIO;
 pub const OUT_AT = kir_sm120.OUT_AT;
 pub const KILL_AT = kir_sm120.KILL_AT;
+/// A pixel program's gl_FragDepth: a store here is the pixel's window
+/// depth (the engine clamps it to 0..1 and tests it in place of the
+/// interpolated one).
+pub const DEPTH_AT = kir_sm120.DEPTH_AT;
 
 /// Binary.extra's word saying which stage a binary is (kir_sm120.Stage).
 pub const EXTRA_STAGE = 6;
@@ -82,7 +86,7 @@ pub fn header(stage: Stage, io: *const kir_sm120.StageIO) [sph.WORDS]u32 {
             return sph.vertex(v);
         },
         .pixel => {
-            var p = sph.Pixel{ .kills = io.kills, .targets = @splat(0) };
+            var p = sph.Pixel{ .kills = io.kills, .targets = @splat(0), .writes_depth = io.depth };
             for (0..3) |c| {
                 if (has(&io.loads, POSITION + 4 * @as(u32, @intCast(c)))) p.frag_coord |= @as(u3, 1) << @intCast(c);
             }
@@ -171,6 +175,33 @@ test "nvidia_gl: a pixel program reads a varying in perspective and one flat, wr
     try testing.expectEqual(sph.Interp.constant, sph.interpOf(head, 1, 2));
     try testing.expectEqual(sph.Interp.unused, sph.interpOf(head, 1, 0));
     try testing.expect(sph.bit(head, 15));
-    // (red, green, alpha: blue never stored, so not an output)
-    try testing.expectEqual(@as(u32, 0b1011), bin.extra[EXTRA_OUTPUTS]);
+    // (red, green, alpha stored: the whole of target 0 an output, as
+    // NAK's headers name it, blue 0)
+    try testing.expectEqual(@as(u32, 0b1111), bin.extra[EXTRA_OUTPUTS]);
+    try testing.expectEqual(@as(u32, 0xf), head[18]);
+    try testing.expect(!sph.bit(head, 609));
+}
+
+test "nvidia_gl: a pixel program writing target 2 alone and the depth: its registers packed (R0..R3, then the depth in R5)" {
+    var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
+    const io = k.binding();
+    const z = k.load(.f32, ioMem(io, POSITION + 8, false), u(0));
+    k.store(.f32, ioMem(io, OUT_AT + 4 * 9, false), u(0), f(0.5));
+    k.store(.f32, ioMem(io, DEPTH_AT, false), u(0), r(k.op2(.fmul, .f32, r(z), f(0.25))));
+    try k.finish();
+    T.st.asm_work.sched = .{};
+    const bin = try compileStage(&k, rtx(), &T.st, .pixel, io, &T.out);
+    const text = try kir_sm120.compileText(&k, rtx(), &T.st, .{ .stage = .pixel, .stage_io = io });
+    const head: *const [sph.WORDS]u32 = @ptrCast(@alignCast(bin.code[0..sph.BYTES]));
+    // (target 2's four channels, nothing else; the depth written)
+    try testing.expectEqual(@as(u32, 0xf00), head[18]);
+    try testing.expect(sph.bit(head, 609) and !sph.bit(head, 608));
+    try testing.expectEqual(@as(u32, 0xf00), bin.extra[EXTRA_OUTPUTS]);
+    // the outputs copied to R0..R3 and R5 at EXIT
+    for ([_][]const u8{ "MOV R0,", "MOV R1,", "MOV R2,", "MOV R3,", "MOV R5," }) |want| {
+        if (std.mem.indexOf(u8, text, want) == null) {
+            std.debug.print("{s}\n", .{text});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
