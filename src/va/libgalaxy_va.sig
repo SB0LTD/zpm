@@ -46,8 +46,11 @@
 //! GALAXY_VA_NVENC_MAGIC=hex sets another; the status says BAD_MAGIC when
 //! wrong), the input's block height, the codec type numbers for HEVC, the
 //! ME/MD tuning, and how many bytes the engine says it wrote. On pc-1111h
-//! (GB206) intra pictures encoded and every inter picture failed; the
-//! inter setup is now NVIDIA's own driver's (nvenc.meControl), unbooted.
+//! and pc-all (GB206) no NVENC picture encoded, intra ones included
+//! (H.264's IDR lost its channel, Xid 47; HEVC's and AV1's reported ucode
+//! errors 13 and 3); the H.264 setup is now laid out as NVIDIA's own
+//! driver's (nvenc.H264_*_OFF, MD/Q/ME controls), unbooted; each
+//! picture's status words are said (encode.reportLine).
 //!
 //! Untested until a boot on the PC — everything that touches the real
 //! decoder: that GB206's NVCFB0 takes Ada's methods and Ada's

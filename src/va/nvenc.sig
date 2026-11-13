@@ -147,10 +147,8 @@ pub const REF_SLOTS = 16;
 /// An unused entry of pic_control's l0[]/l1[] (the lists of reference
 /// slots): -2, as NVIDIA's own driver writes it (every unused entry of
 /// grc's IDR and P setups is 0xfe; see meControl for where they come
-/// from). This driver wrote -1 there before, and every inter picture
-/// failed on GB206 (pc-1111h; with the other differences meControl and
-/// the MEPRED buffers name: which of them the firmware minded is not
-/// known).
+/// from). This driver wrote -1 there before (every picture failed on
+/// GB206, pc-1111h: see meControl).
 pub const LIST_NONE: u8 = 0xfe;
 /// An unused entry of temp_dist_l0[]/l1[] (NVIDIA's driver: -1), and of
 /// dist_scale_factor[][] (-1 as a 16-bit value).
@@ -319,6 +317,12 @@ pub const H264 = struct {
     pub const rc_single_frame_vbv: F = .{ .bit = 1480, .width = 8 };
     pub const rc_i_size_ratio_x: F = .{ .bit = 1512, .width = 8 };
     pub const rc_i_size_ratio_y: F = .{ .bit = 1520, .width = 8 };
+    // (the statistics' offsets, the strip)
+    pub const slice_stat_offset: F = .{ .bit = 3488, .width = 32 };
+    pub const mpec_stat_offset: F = .{ .bit = 3520, .width = 32 };
+    pub const strips_in_frame: F = .{ .bit = 3608, .width = 8 };
+    pub const slice_encoding_row_start: F = .{ .bit = 3616, .width = 16 };
+    pub const slice_encoding_row_num: F = .{ .bit = 3632, .width = 16 };
 };
 
 pub const H264Slice = struct {
@@ -390,6 +394,8 @@ pub const H264Md = struct {
     pub const intra_most_prob_force_on: F = .{ .bit = 434, .width = 1 };
     pub const early_intra_mode_control: F = .{ .bit = 435, .width = 2 };
     pub const ip_search_mode: F = .{ .bit = 442, .width = 3 };
+    pub const rdo_level: F = .{ .bit = 480, .width = 3 };
+    pub const tu_search_num: F = .{ .bit = 483, .width = 3 };
 };
 
 pub const H264Quant = struct {
@@ -404,21 +410,56 @@ pub const Stat = struct {
     pub const error_status: F = .{ .bit = 32, .width = 2 };
     pub const ucode_error_status: F = .{ .bit = 34, .width = 30 };
     pub const total_bit_count: F = .{ .bit = 64, .width = 32 };
+    pub const pic_type: F = .{ .bit = 128, .width = 16 };
     pub const num_slices: F = .{ .bit = 144, .width = 16 };
     pub const avg_qp: F = .{ .bit = 176, .width = 16 };
+    pub const cycle_count: F = .{ .bit = 192, .width = 32 };
     pub const bitstream_start_pos: F = .{ .bit = 256, .width = 32 };
     pub const last_valid_byte_offset: F = .{ .bit = 288, .width = 32 };
     pub const hrd_fullness: F = .{ .bit = 224, .width = 32 };
+    pub const intra_mb_count: F = .{ .bit = 320, .width = 16 };
+    pub const inter_mb_count: F = .{ .bit = 336, .width = 16 };
     pub const total_intra_cost: F = .{ .bit = 416, .width = 32 };
     pub const total_inter_cost: F = .{ .bit = 448, .width = 32 };
 };
 
-/// nvenc_h265_pic_stat_s: nvenc_pic_stat_s's first 64 bytes, then its own
-/// counts (the costs further on).
+/// nvenc_h265_pic_stat_s: nvenc_pic_stat_s's first 40 bytes, then its own
+/// counts (32x32 CUs intra and inter, 16x16, 8x8; the costs further on).
 pub const H265Stat = struct {
+    pub const intra_cu32x32_count: F = .{ .bit = 320, .width = 32 };
+    pub const inter_cu32x32_count: F = .{ .bit = 352, .width = 32 };
     pub const total_intra_cost: F = .{ .bit = 576, .width = 32 };
     pub const total_inter_cost: F = .{ .bit = 608, .width = 32 };
 };
+
+/// nvenc_drv.h's ERROR_CODES ("used across all codecs"): what
+/// ucode_error_status holds, by number. ASSUMED GB206's firmware numbers
+/// them as Ada's header does.
+pub const UCODE_ERRORS = [_][]const u8{
+    "none",                     "GPTMR_TIMEOUT",           "MAGIC_NUMBER_MISMATCH",  "PICSETUP_OFFSET",
+    "ENC_STATUS_OUTPUT_OFFSET", "OUTPUT_BITSTREAM_OFFSET", "INSUFFICIENT_WRDMA_BUF", "MDP_ERROR",
+    "RDO_ERROR",                "ME_PROGRAMMING",          "ME_HW",                  "TFBIF_TIMEOUT",
+    "SKIP_ENCODING",            "INPUT_BITSTREAM_OFFSET",  "INPUT_HISTORY_OFFSET",   "MEPRED_OFFSET",
+    "EXTHINT_OFFSET",           "REFPIC_OFFSET",           "QPMAP_OFFSET",           "COLLOC_OFFSET",
+    "PROB_OFFSET",              "ENTROPY_OFFSET",          "FILTER_OFFSET",          "SSIM_RDO_OFFSET",
+    "RC_ERROR",                 "SMALLE_BS_OVERFLOW",      "SMALLE_METHODSERROR",    "ENTROPY_ERR",
+    "RECON_OVERFLOW",
+};
+
+/// The name of ucode error `e`.
+pub fn ucodeErrorName(e: u32) []const u8 {
+    if (e < UCODE_ERRORS.len) return UCODE_ERRORS[e];
+    if (e == ENC_ERROR_H264_BAD_MAGIC) return "H264_BAD_MAGIC";
+    if (e >> 28 == 3) return "H264_OS_ERROR";
+    return "unknown";
+}
+
+/// What the driver writes into the status's picture_index before a
+/// picture (the engine writes SET_PICTURE_INDEX's value there): the
+/// status unwritten reads back as this, not as a clean picture.
+pub fn statusPoison(picture_index: u32) u32 {
+    return ~picture_index;
+}
 
 /// nvenc_av1_pic_stat_s.
 pub const Av1Stat = struct {
@@ -587,6 +628,12 @@ pub const H265 = struct {
     pub const rc_single_frame_vbv: F = .{ .bit = 1512, .width = 8 };
     pub const rc_i_size_ratio_x: F = .{ .bit = 1544, .width = 8 };
     pub const rc_i_size_ratio_y: F = .{ .bit = 1552, .width = 8 };
+    // (the statistics' offsets, the strip)
+    pub const slice_stat_offset: F = .{ .bit = 3456, .width = 32 };
+    pub const mpec_stat_offset: F = .{ .bit = 3488, .width = 32 };
+    pub const strips_in_frame: F = .{ .bit = 5552, .width = 8 };
+    pub const slice_encoding_row_start: F = .{ .bit = 5568, .width = 16 };
+    pub const slice_encoding_row_num: F = .{ .bit = 5584, .width = 16 };
 };
 
 pub const H265Slice = struct {
@@ -638,6 +685,12 @@ pub const H265Md = struct {
     pub const pskip_enable: F = .{ .bit = 272, .width = 1 };
     pub const mv_cost_enable: F = .{ .bit = 625, .width = 1 };
     pub const ip_search_mode: F = .{ .bit = 627, .width = 4 };
+    pub const early_termination_ip1: F = .{ .bit = 633, .width = 1 };
+    pub const tu_search_num_cu16: F = .{ .bit = 634, .width = 3 };
+    pub const tu_search_num_cu32: F = .{ .bit = 637, .width = 3 };
+    /// 4x4, 8x8, 16x16, 32x32: 4 bits each, consecutive
+    pub const intra_ssd_cnt_4x4: F = .{ .bit = 748, .width = 4 };
+    pub const rdo_level: F = .{ .bit = 764, .width = 3 };
 };
 
 pub const H265Quant = struct {
@@ -833,25 +886,106 @@ pub const Av1Tile = struct {
 
 /// One picture's setup area (SET_IN_DRV_PIC_SETUP; 256-byte aligned): the
 /// top-level setup, then the slice controls, the ME, MD and quantisation
-/// controls, each at a fixed offset the setup names.
+/// controls, each at an offset the setup names.
 pub const SETUP_BYTES: usize = 0x1000;
-pub const SLICE_CONTROL_OFF: u32 = 0x400;
 /// the most slices a picture has (VA's slice parameter buffers)
 pub const MAX_SLICES = 16;
-pub const ME_CONTROL_OFF: u32 = SLICE_CONTROL_OFF + MAX_SLICES * H264Slice.SIZE;
-pub const MD_CONTROL_OFF: u32 = ME_CONTROL_OFF + Me.SIZE;
-pub const Q_CONTROL_OFF: u32 = MD_CONTROL_OFF + H264Md.SIZE;
 
-/// AV1's tile controls (tile_control_offset): where H.264's and HEVC's
-/// slice controls are; a picture has at most MAX_TILES.
-pub const TILE_CONTROL_OFF: u32 = SLICE_CONTROL_OFF;
+/// H.264's controls where NVIDIA's own driver puts them: grc's setups
+/// (see ME_NVIDIA) have the 512-byte setup, the slice control at 0x300,
+/// MD at 0x400, quantisation at 0x500, ME at 0x600, and nothing past
+/// 0x6c0. This driver put them at 0x400 (slices), 0xc00 (ME), 0xcc0 (MD)
+/// and 0xd40 (Q) before, and no H.264 picture ever encoded on GB206: the
+/// firmware's limits on these offsets are not known, NVIDIA's are known to
+/// work. Pictures of more than two slices (FFmpeg sends one) take theirs
+/// past the ME control (H264_SLICE_OFF_MANY).
+pub const H264_SLICE_OFF: u32 = 0x300;
+pub const H264_MD_OFF: u32 = 0x400;
+pub const H264_Q_OFF: u32 = 0x500;
+pub const H264_ME_OFF: u32 = 0x600;
+pub const H264_SLICE_OFF_MANY: u32 = 0x700;
+
+/// Where `slices` slice controls go.
+pub fn h264SliceOff(slices: usize) u32 {
+    return if (slices <= 2) H264_SLICE_OFF else H264_SLICE_OFF_MANY;
+}
+
+/// HEVC's controls (no NVIDIA setup of HEVC's is known): as near the
+/// 1024-byte setup as they fit, the slice controls last: MD 0x400,
+/// quantisation 0x480, ME 0x500, slices 0x600.
+pub const H265_MD_OFF: u32 = 0x400;
+pub const H265_Q_OFF: u32 = 0x480;
+pub const H265_ME_OFF: u32 = 0x500;
+pub const H265_SLICE_OFF: u32 = 0x600;
+
+/// AV1's tile controls (tile_control_offset); a picture has at most
+/// MAX_TILES.
+pub const TILE_CONTROL_OFF: u32 = 0x400;
 pub const MAX_TILES = 16;
 
+/// The statistics' offsets in the status buffer (SET_OUT_ENC_STATUS is
+/// nvenc_stat_data_s: the 128-byte picture status, then the slice
+/// statistics, then the MPEC statistics): what NVIDIA's driver writes
+/// (grc: 0x80 and 0x80 + 16 * 65539). The firmware writes them only when
+/// SET_CONTROL_PARAMS' SLICE_STAT_ON / MPEC_STAT_ON ask (this driver asks
+/// neither); left 0 before, they named the picture status itself.
+pub const SLICE_STAT_OFF: u32 = 0x80;
+pub const MPEC_STAT_OFF: u32 = 0x80 + 16 * ((4096 / 16) * (4096 / 16) + 3);
+
 comptime {
-    std.debug.assert(H265.SIZE <= SLICE_CONTROL_OFF);
+    std.debug.assert(H264.SIZE <= H264_SLICE_OFF);
+    std.debug.assert(H264_SLICE_OFF + 2 * H264Slice.SIZE <= H264_MD_OFF);
+    std.debug.assert(H264_MD_OFF + H264Md.SIZE <= H264_Q_OFF);
+    std.debug.assert(H264_Q_OFF + H264Quant.SIZE <= H264_ME_OFF);
+    std.debug.assert(H264_ME_OFF + Me.SIZE <= H264_SLICE_OFF_MANY);
+    std.debug.assert(H264_SLICE_OFF_MANY + MAX_SLICES * H264Slice.SIZE <= SETUP_BYTES);
+    std.debug.assert(H265.SIZE <= H265_MD_OFF);
+    std.debug.assert(H265_MD_OFF + H265Md.SIZE <= H265_Q_OFF);
+    std.debug.assert(H265_Q_OFF + H265Quant.SIZE <= H265_ME_OFF);
+    std.debug.assert(H265_ME_OFF + Me.SIZE <= H265_SLICE_OFF);
+    std.debug.assert(H265_SLICE_OFF + MAX_SLICES * H265Slice.SIZE <= SETUP_BYTES);
     std.debug.assert(Av1.SIZE <= TILE_CONTROL_OFF);
     std.debug.assert(TILE_CONTROL_OFF + MAX_TILES * Av1Tile.SIZE <= SETUP_BYTES);
-    std.debug.assert(Q_CONTROL_OFF + H264Quant.SIZE <= SETUP_BYTES);
+    std.debug.assert(MPEC_STAT_OFF == 0x1000b0);
+}
+
+/// The MD control of NVIDIA's own H.264 setups (grc's, at its
+/// md_control_offset 0x400), byte for byte; nvenc_drv.h reads it as: all
+/// intra 4x4, 8x8, 16x16 and chroma modes; every L0 partition down to
+/// 4x4, L1 and bi-predicted partitions to 8x8, P skip; intra NxN bias 24,
+/// most-probable-mode bias 4, MV cost, early intra mode control (16x16
+/// DC, H, V), intra search mode 7, early termination, priority intra
+/// type 3, one SSD candidate for each intra size, RDO level 1, two
+/// transform searches. This driver's own before had rdo_level,
+/// tu_search_num and the SSD counts 0. P pictures: grc turns the 4x4
+/// intra modes off (H264Md.intra_luma4x4_mode_enable 0).
+pub const MD_NVIDIA_H264 = [_]u8{
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x03, 0x7f, 0x0f, 0x0f, 0x08, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xea, 0x9c, 0x00, 0x00, 0x8b, 0x08, 0x11, 0x00, 0x00, 0x00,
+} ++ [_]u8{0} ** 64;
+
+/// The quantisation control of NVIDIA's H.264 setups (grc's, at 0x500),
+/// byte for byte: its QPP run vectors and costs, and the dead zones (4x4
+/// and 8x8, luma intra and inter, chroma). This driver's own before was
+/// all zero.
+pub const Q_NVIDIA_H264 = [_]u8{
+    0x6b, 0x05, 0xff, 0xaa, 0xaa, 0xff, 0x0f, 0x00, 0x04, 0x06, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0x03, 0x6e, 0x03, 0x34, 0x03, 0xaa, 0x02, 0x6e, 0x03, 0x34, 0x03, 0xaa, 0x02, 0x00, 0x02,
+    0x34, 0x03, 0xaa, 0x02, 0x00, 0x02, 0x9a, 0x01, 0xaa, 0x02, 0x00, 0x02, 0x9a, 0x01, 0x9a, 0x01,
+    0xaa, 0x02, 0x4a, 0x02, 0x22, 0x02, 0xc8, 0x01, 0x4a, 0x02, 0x22, 0x02, 0xc8, 0x01, 0x56, 0x01,
+    0x22, 0x02, 0xc8, 0x01, 0x56, 0x01, 0x24, 0x01, 0xc8, 0x01, 0x56, 0x01, 0x24, 0x01, 0x12, 0x01,
+    0xaa, 0x02, 0x56, 0x01, 0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02,
+    0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02, 0xaa, 0x02,
+    0xaa, 0x02, 0xaa, 0x02, 0x56, 0x01, 0x56, 0x01, 0x56, 0x01, 0x56, 0x01, 0x56, 0x01, 0x56, 0x01,
+    0x56, 0x01, 0x56, 0x01, 0x56, 0x01, 0x56, 0x01, 0x56, 0x01, 0x56, 0x01, 0x56, 0x01, 0x56, 0x01,
+    0x56, 0x01, 0x56, 0x01,
+} ++ [_]u8{0} ** 44;
+
+comptime {
+    std.debug.assert(MD_NVIDIA_H264.len == H264Md.SIZE);
+    std.debug.assert(Q_NVIDIA_H264.len == H264Quant.SIZE);
 }
 
 /// The ME control every picture uses: NVIDIA's own, byte for byte.
@@ -879,12 +1013,14 @@ comptime {
 ///
 /// This driver's own control before had every one of mbc_mb_size, the FBM
 /// winner counts, the part-decision and merge-candidate counts zero (the
-/// motion search configured to keep no winner), and it failed on every
-/// inter picture on GB206 (pc-1111h: H.264 lost its channel to an NVENC
-/// error, HEVC and AV1 reported ucode errors) while every intra picture,
-/// where the motion search does not run, encoded. HEVC's and AV1's
-/// setups name the same struct (nvenc_me_control_s); these values are
-/// H.264's tuning, valid for them too (the CU8/CU64 decisions left off).
+/// motion search configured to keep no winner). (pc-1111h was read then
+/// as intra pictures encoding and inter ones failing; they did not: the
+/// driver's "an encode failed" line for picture k comes after picture
+/// k+1 is submitted, FFmpeg syncing one behind, and the first such line
+/// was the IDR's. No NVENC picture of any codec has encoded on GB206 yet:
+/// pc-1111h and pc-all.) HEVC's and AV1's setups name the same struct
+/// (nvenc_me_control_s); these values are H.264's tuning, valid for them
+/// too (the CU8/CU64 decisions left off).
 pub const ME_NVIDIA = [Me.SIZE]u8{
     0x26, 0x40, 0x07, 0x00, 0x01, 0x40, 0x00, 0x08, 0xff, 0x1f, 0xff, 0x07, 0x00, 0x00, 0x90, 0x28,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xa4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1111,8 +1247,9 @@ pub fn push(out: []u32, a: PictureAddrs) usize {
     put(out, &n, SET_OUT_REF_PIC_CHROMA, shifted(a.out_chroma));
     put(out, &n, SET_IN_CUR_PIC, shifted(a.cur_luma));
     put(out, &n, SET_IN_CUR_PIC_CHROMA_U, shifted(a.cur_chroma));
-    // (semi-planar: V is interleaved with U; the same plane)
-    put(out, &n, SET_IN_CUR_PIC_CHROMA_V, shifted(a.cur_chroma));
+    // (semi-planar, input_cfg's memory_mode 0: V is interleaved with U,
+    // and NVIDIA's driver sends no SET_IN_CUR_PIC_CHROMA_V: grc's jobs
+    // bind CHROMA_U only)
     if (a.mepred_in != 0) put(out, &n, SET_IN_MEPRED_DATA, shifted(a.mepred_in));
     if (a.mepred_out != 0) put(out, &n, SET_OUT_MEPRED_DATA, shifted(a.mepred_out));
     for (0..REF_SLOTS) |i| {
@@ -1141,6 +1278,13 @@ pub const StatKind = enum { h264, hevc, av1 };
 
 /// What the engine said of a picture (its status).
 pub const Result = struct {
+    /// the status's picture_index: SET_PICTURE_INDEX's value once the
+    /// engine wrote the status (statusPoison's before)
+    picture_index: u32 = 0,
+    /// 2 on every picture of NVIDIA's own driver too, the encoded ones
+    /// included (switch-frame-tap: grc's 129 jobs and its own live
+    /// frames, decoded bit for bit): routine, not a failure. This driver
+    /// took it for one before and dropped every picture's slices.
     error_status: u32,
     ucode_error: u32,
     bits: u32,
@@ -1148,6 +1292,10 @@ pub const Result = struct {
     avg_qp: u32,
     start: u32,
     last_valid: u32 = 0,
+    cycles: u32 = 0,
+    /// intra and inter macroblocks (H.264), 32x32 CUs (HEVC)
+    intra_count: u32 = 0,
+    inter_count: u32 = 0,
     /// the best intra and inter modes' summed SATDs (the rate control's
     /// complexity measure; 0 when the engine wrote none)
     intra_cost: u32 = 0,
@@ -1165,6 +1313,7 @@ pub const Result = struct {
     pub fn ofKind(stat: []const u8, kind: StatKind) Result {
         if (kind == .av1) {
             return .{
+                .picture_index = @intCast(get(stat, Stat.picture_index)),
                 .error_status = @intCast(get(stat, Av1Stat.error_status)),
                 .ucode_error = @intCast(get(stat, Av1Stat.ucode_error_status)),
                 .bits = @intCast(get(stat, Av1Stat.total_bit_count)),
@@ -1179,7 +1328,9 @@ pub const Result = struct {
             };
         }
         const costs = if (kind == .hevc) [2]F{ H265Stat.total_intra_cost, H265Stat.total_inter_cost } else [2]F{ Stat.total_intra_cost, Stat.total_inter_cost };
+        const counts = if (kind == .hevc) [2]F{ H265Stat.intra_cu32x32_count, H265Stat.inter_cu32x32_count } else [2]F{ Stat.intra_mb_count, Stat.inter_mb_count };
         return .{
+            .picture_index = @intCast(get(stat, Stat.picture_index)),
             .error_status = @intCast(get(stat, Stat.error_status)),
             .ucode_error = @intCast(get(stat, Stat.ucode_error_status)),
             .bits = @intCast(get(stat, Stat.total_bit_count)),
@@ -1187,13 +1338,23 @@ pub const Result = struct {
             .avg_qp = @intCast(get(stat, Stat.avg_qp)),
             .start = @intCast(get(stat, Stat.bitstream_start_pos)),
             .last_valid = @intCast(get(stat, Stat.last_valid_byte_offset)),
+            .cycles = @intCast(get(stat, Stat.cycle_count)),
+            .intra_count = @intCast(get(stat, counts[0])),
+            .inter_count = @intCast(get(stat, counts[1])),
             .intra_cost = @intCast(get(stat, costs[0])),
             .inter_cost = @intCast(get(stat, costs[1])),
         };
     }
 
+    /// The picture is lost: the firmware said why (ucode_error_status), or
+    /// wrote no bits. error_status is not looked at (2 is routine).
     pub fn failed(r: Result) bool {
-        return r.error_status != 0 or r.ucode_error != 0;
+        return r.ucode_error != 0 or r.bits == 0;
+    }
+
+    /// Whether the engine wrote this status (its picture index came back).
+    pub fn written(r: Result, picture_index: u32) bool {
+        return r.picture_index == picture_index;
     }
 
     /// The bytes of slices the engine wrote (its bit count, whole bytes).
@@ -1274,7 +1435,7 @@ test "nvenc: a picture's pushbuffer, word by word" {
     a.ref_chroma[3] = 0x5_0010_0000;
     var out: [PUSH_DWORDS_MAX]u32 = undefined;
     const n = push(&out, a);
-    try testing.expectEqual(@as(usize, 2 * 19), n);
+    try testing.expectEqual(@as(usize, 2 * 18), n);
     const want = [_]u32{
         0x2001_0000, 0x001f_cfb7, // SET_OBJECT
         0x2001_0080, 1, // SET_APPLICATION_ID H264
@@ -1285,11 +1446,14 @@ test "nvenc: a picture's pushbuffer, word by word" {
         0x2001_01c7, 0x200_0011, // SET_OUT_BITSTREAM
     };
     try testing.expectEqualSlices(u32, &want, out[0..want.len]);
-    // the reference in slot 3, then EXECUTE
-    try testing.expectEqual(header(0, SET_IN_REF_PIC0_LUMA + 12, 1), out[32]);
-    try testing.expectEqual(@as(u32, 0x500_0000), out[33]);
-    try testing.expectEqual(header(0, SET_IN_REF_PIC0_CHROMA + 12, 1), out[34]);
-    try testing.expectEqual(@as(u32, 0x2001_00c0), out[36]);
+    // the reference in slot 3, then EXECUTE; no CHROMA_V (semi-planar:
+    // NVIDIA's driver sends CHROMA_U alone)
+    try testing.expectEqual(header(0, SET_IN_REF_PIC0_LUMA + 12, 1), out[30]);
+    try testing.expectEqual(@as(u32, 0x500_0000), out[31]);
+    try testing.expectEqual(header(0, SET_IN_REF_PIC0_CHROMA + 12, 1), out[32]);
+    try testing.expectEqual(@as(u32, 0x2001_00c0), out[34]);
+    var k0: usize = 0;
+    while (k0 < n) : (k0 += 2) try testing.expect(out[k0] != header(0, SET_IN_CUR_PIC_CHROMA_V, 1));
 
     // an inter picture as NVIDIA's driver sends it: the MEPRED buffers in
     // and out, no co-located motion (a P picture that is not a reference
@@ -1299,7 +1463,7 @@ test "nvenc: a picture's pushbuffer, word by word" {
     a.mepred_in = 0x1_0050_0000;
     a.mepred_out = 0x1_0060_0000;
     const m = push(&out, a);
-    try testing.expectEqual(@as(usize, 2 * 19), m);
+    try testing.expectEqual(@as(usize, 2 * 18), m);
     var saw_in = false;
     var saw_out = false;
     var k: usize = 0;
