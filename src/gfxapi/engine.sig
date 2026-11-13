@@ -840,9 +840,28 @@ pub const Config = struct {
     /// Scratch for KIR's interpreter, which draws on the CPU (no GPU, or
     /// it is lost); none: such draws are refused.
     cpu_work: []u8 = &.{},
+    /// Room to keep the CPU's kernels once built (a pipeline's are the
+    /// same instructions at every draw); none: built for each draw.
+    cpu_kernels: []kir.Inst = &.{},
     /// The GPU's work checked against the CPU's (off: no memory).
     check: Check = .{},
 };
+
+/// A kernel the CPU ran, kept in Config.cpu_kernels: what it was built
+/// for, and where its instructions are.
+const CpuKernel = struct {
+    p: ?*const raster.Pipeline = null,
+    sig: u64 = 0,
+    st: u3 = 0,
+    v: raster.Variant = .{},
+    kind: raster.SetupKind = .triangles,
+    off: u32 = 0,
+    len: u32 = 0,
+    nv: u16 = 0,
+    group: [3]u32 = .{ 0, 0, 0 },
+    shared: u32 = 0,
+};
+const CPU_KERNELS = 96;
 
 const SLAB_BYTES = 2 << 20;
 const MAX_SLAB_OBJECT = 256 << 10;
@@ -915,6 +934,12 @@ pub const Engine = struct {
     compiler: Compiler = compileAny,
     work: []u8 = &.{},
     cpu_work: []u8 = &.{},
+    /// the CPU's kernels kept (Config.cpu_kernels): the instructions, how
+    /// many are used, and what each kernel is
+    cpu_insts: []kir.Inst = &.{},
+    cpu_used: usize = 0,
+    cpu_kept: [CPU_KERNELS]CpuKernel = [_]CpuKernel{.{}} ** CPU_KERNELS,
+    cpu_nkept: usize = 0,
     /// a pipeline's kernel as it is built, and its code as compiled
     kir_insts: [MAX_KIR]kir.Inst = undefined,
     kir_tys: [MAX_KIR]kir.Ty = undefined,
@@ -956,7 +981,7 @@ pub const Engine = struct {
     /// The engine in place (it must stay at `e`): the kernels compiled and
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
-        e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .check = cfg.check };
+        e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
         for (e.slabs) |*slab| slab.* = .{};
         const d = cfg.dev orelse return;
         e.loadAll(d, cfg.compiler, cfg.work) catch |err| {
@@ -1784,6 +1809,7 @@ pub const Engine = struct {
     }
 
     pub fn unloadPipeline(e: *Engine, p: *raster.Pipeline) void {
+        e.forgetCpu(p);
         if (p.owner != @as(?*anyopaque, e)) return;
         e.finish();
         for (&p.progs) |*q| {
@@ -1963,27 +1989,22 @@ pub const Engine = struct {
             if (!e.runCpu(.vertex, p, groups_v, views[0..vb.len], vparams)) break :cpu false;
             const sv = [_][]u8{ tris.buf.cpu, verts.buf.cpu };
             if (!e.runCpuFor(.setup, p, v, kind, groups_s, &sv, sparams)) break :cpu false;
-            const bv = [_][]u8{tris.buf.cpu};
-            if (bins.on and !e.runCpu(.bin, p, groups_b, &bv, bparams)) break :cpu false;
             var rv: [rbs.len][]u8 = undefined;
             for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
-            // (unbinned: the tile kernel over the primitives' boxes only,
-            // and not at all when none is drawn; raster.recordsBox)
-            var groups_c = groups_r;
+            // (the tile kernel over the primitives' boxes only, unbinned,
+            // and not at all when none is drawn: raster.recordsBox. The
+            // interpreter's cost is per tile; bins only save the GPU's.)
+            const box = raster.recordsBox(d, tris.buf.cpu) orelse {
+                for (rb, 0..) |img, j| {
+                    if (j < 2 or rw & (@as(u32, 1) << @intCast(j)) != 0) e.wrote(img, 0, img.buf.cpu.len);
+                }
+                break :cpu true;
+            };
+            var dc = d.*;
+            dc.rect = box;
             var cp: [MAX_PARAMS]u32 = undefined;
-            var cparams = rparams;
-            if (!bins.on) {
-                const box = raster.recordsBox(d, tris.buf.cpu) orelse {
-                    for (rb, 0..) |img, j| {
-                        if (j < 2 or rw & (@as(u32, 1) << @intCast(j)) != 0) e.wrote(img, 0, img.buf.cpu.len);
-                    }
-                    break :cpu true;
-                };
-                var dc = d.*;
-                dc.rect = box;
-                cparams = raster.rasterParams(&dc, bins, &cp);
-                groups_c = .{ divUp(box.width(), raster.TILE), divUp(box.height(), raster.TILE), 1 };
-            }
+            const cparams = raster.rasterParams(&dc, .{}, &cp);
+            const groups_c = [3]u32{ divUp(box.width(), raster.TILE), divUp(box.height(), raster.TILE), 1 };
             if (!e.runCpuFor(.raster, p, v, kind, groups_c, rv[0..rb.len], cparams)) break :cpu false;
             // (the color and depth bindings as before: always marked)
             for (rb, 0..) |img, j| {
@@ -2019,21 +2040,83 @@ pub const Engine = struct {
         return e.runCpuFor(st, p, .{}, .triangles, groups, views, params);
     }
 
+    /// A pipeline's kernels kept for the CPU go with it (a new pipeline
+    /// may come at the same address).
+    fn forgetCpu(e: *Engine, p: *const raster.Pipeline) void {
+        for (e.cpu_kept[0..e.cpu_nkept]) |*c| {
+            if (c.p == p) c.p = null;
+        }
+    }
+
+    /// What a pipeline's kernels are built from (its shaders): a kept
+    /// kernel of another pipeline at the same address does not match.
+    fn pipeSig(p: *const raster.Pipeline) u64 {
+        return std.hash.Wyhash.hash(p.vstride, std.mem.asBytes(&p.shaders));
+    }
+
+    fn keptCpu(e: *Engine, st: Stage, p: *const raster.Pipeline, v: raster.Variant, kind: raster.SetupKind) ?*const CpuKernel {
+        const sig = pipeSig(p);
+        for (e.cpu_kept[0..e.cpu_nkept]) |*c| {
+            if (c.p == p and c.sig == sig and c.st == @intFromEnum(st) and std.meta.eql(c.v, v) and c.kind == kind) return c;
+        }
+        return null;
+    }
+
+    /// A kernel just built kept for the next draws (the room full: all of
+    /// them let go, then this one).
+    fn keepCpu(e: *Engine, st: Stage, p: *const raster.Pipeline, v: raster.Variant, kind: raster.SetupKind, k: *const kir.Kernel) ?*const CpuKernel {
+        const code = k.code();
+        if (code.len > e.cpu_insts.len) return null;
+        if (e.cpu_used + code.len > e.cpu_insts.len or e.cpu_nkept == CPU_KERNELS) {
+            e.cpu_used = 0;
+            e.cpu_nkept = 0;
+        }
+        @memcpy(e.cpu_insts[e.cpu_used..][0..code.len], code);
+        const c = &e.cpu_kept[e.cpu_nkept];
+        c.* = .{ .p = p, .sig = pipeSig(p), .st = @intFromEnum(st), .v = v, .kind = kind, .off = @intCast(e.cpu_used), .len = @intCast(code.len), .nv = k.nv, .group = k.group, .shared = k.shared_bytes };
+        e.cpu_used += code.len;
+        e.cpu_nkept += 1;
+        return c;
+    }
+
     fn runCpuFor(e: *Engine, st: Stage, p: *const raster.Pipeline, v: raster.Variant, kind: raster.SetupKind, groups: [3]u32, views: []const []u8, params: []const u32) bool {
-        var k = e.buildFor(st, p, v, kind);
-        k.finish() catch |err| {
-            e.why_pipe = err;
-            report.say(.pipeline, "a {s} kernel does not build ({s}): the draw is dropped", .{ @tagName(st), @errorName(err) });
-            return false;
+        // (the pipeline's kernel as built before, else built now and kept)
+        var run_code: []const kir.Inst = undefined;
+        var run_nv: u16 = 0;
+        var run_group: [3]u32 = undefined;
+        var run_shared: u32 = 0;
+        var k: kir.Kernel = undefined;
+        // (a pipeline's stages only: the engine's own kernels have no pipeline)
+        const per_pipe = switch (st) {
+            .vertex, .setup, .raster, .stencil, .capture => true,
+            .bin, .blit, .mip => false,
         };
+        if (if (per_pipe) e.keptCpu(st, p, v, kind) else null) |c| {
+            run_code = e.cpu_insts[c.off..][0..c.len];
+            run_nv = c.nv;
+            run_group = c.group;
+            run_shared = c.shared;
+        } else {
+            k = e.buildFor(st, p, v, kind);
+            k.finish() catch |err| {
+                e.why_pipe = err;
+                report.say(.pipeline, "a {s} kernel does not build ({s}): the draw is dropped", .{ @tagName(st), @errorName(err) });
+                return false;
+            };
+            run_code = k.code();
+            run_nv = k.nv;
+            run_group = k.group;
+            run_shared = k.shared_bytes;
+            if (per_pipe) _ = e.keepCpu(st, p, v, kind, &k);
+        }
         var w = gpu.Work.init(e.cpu_work);
         var trap: gpu.interp.Trap = .{};
         var stats: gpu.interp.Stats = .{};
         gpu.interp.run(.{
-            .code = k.code(),
-            .regs = k.nv,
-            .group = k.group,
-            .shared_bytes = k.shared_bytes,
+            .code = run_code,
+            .regs = run_nv,
+            .group = run_group,
+            .shared_bytes = run_shared,
             .groups = groups,
             .bindings = views,
             .params = params,
