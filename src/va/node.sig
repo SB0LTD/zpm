@@ -302,6 +302,13 @@ pub const Fake = struct {
     has_decoder: bool = true,
     has_encoder: bool = true,
     hung: bool = false,
+    /// the video channel faults at this G_VSUBMIT (1: the first, the
+    /// init's probe; 0: never): that one is taken, never done, and from
+    /// then on every G_VSUBMIT and G_VWAIT fails with EIO, as nv_drm's
+    /// for a context whose channel GSP-RM recovered from a fault (the
+    /// context's other calls go on)
+    vfault_at: u32 = 0,
+    vlost: bool = false,
     /// a submission's fence is done only once waited for (the GPU is busy)
     hold: bool = false,
     decoder: ?*const fn (*Fake, Submit) void = null,
@@ -382,11 +389,19 @@ pub const Fake = struct {
             },
             G_VSUBMIT => {
                 if (!k.has_decoder) return -ENODEV;
+                if (k.vlost) return -EIO;
                 const s = Submit{ .handle = rd32(a, 0), .offset = rd32(a, 4), .dwords = rd32(a, 8) };
                 if (s.handle == 0 or s.handle >= k.bufs.len or k.bufs[s.handle].mem.len == 0) return -2;
                 if (s.dwords == 0 or s.offset % 4 != 0 or s.offset + s.dwords * 4 > k.bufs[s.handle].mem.len) return -EINVAL;
                 if (k.n_submits < k.submits.len) k.submits[k.n_submits] = s;
                 k.n_submits += 1;
+                if (k.n_submits == k.vfault_at) {
+                    // (taken, then the channel faults: its fence never comes)
+                    k.vlost = true;
+                    k.fence += 1;
+                    wr32(a, 12, k.fence);
+                    return 0;
+                }
                 if (k.decoder) |d| d(k, s);
                 k.fence += 1;
                 if (!k.hold) k.done = k.fence;
@@ -394,6 +409,7 @@ pub const Fake = struct {
             },
             G_VWAIT => {
                 k.waits += 1;
+                if (k.vlost) return -EIO;
                 const f = rd32(a, 0);
                 if (f > k.fence) return -EINVAL;
                 if (f <= k.done) return 0;

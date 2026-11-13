@@ -36,6 +36,22 @@
 //!   fence (G_VWAIT) and reads the decoder's status (errors counted; said
 //!   on stderr with GALAXY_VA_DEBUG). Nothing is copied.
 //!
+//! A lost video channel (GSP-RM recovered it from a fault or a hang, or
+//! the GPU went; nv_drm's EIO): the app never crashes for it. A picture
+//! is VA's asynchronous work, so its outcome is told where VA tells it:
+//! Begin/Render/EndPicture keep answering SUCCESS (nothing more is
+//! submitted; a picture in flight is marked lost, not failed back), and
+//! every call that reads a lost picture (vaSyncSurface, the status query,
+//! the export, a derived image, vaGetImage) answers LOST_STATUS
+//! (OPERATION_FAILED), never a NULL or an empty descriptor as SUCCESS.
+//! EndPicture must not fail: FFmpeg 6.1's AV1 decoder keeps no reference
+//! of a picture whose end_frame failed, and the next inter frame's
+//! skip_mode_params (av1dec.c:282) then reads order_hint through a NULL
+//! frame header (pc-1111e: ffmpeg's SIGSEGV at libavcodec+0x14f1dc, cr2
+//! 0x19). Pictures decoded before the loss stay readable; a new context
+//! or surface on the display fails cleanly (the channel is the open
+//! file's: a new VADisplay, a new open of the node, gets a fresh one).
+//!
 //! VA buffers live in a fixed pool reserved at init: SMALL_BUFFERS of 64
 //! KiB (parameters) and LARGE_BUFFERS of 16 MiB (slice data, images).
 //!
@@ -118,6 +134,9 @@ pub const MIN_SIZE = 16;
 /// How long a sync waits for a decode (NVK's watchdog ends a wedged one
 /// far sooner).
 pub const SYNC_NS: i64 = 2_000_000_000;
+/// What a call that reads a picture lost with the video channel answers
+/// (and a new context or surface after the loss).
+pub const LOST_STATUS: va.Status = va.ERROR_OPERATION_FAILED;
 
 pub const VENDOR = "Galaxy VA-API driver for the RTX's NVDEC (H.264, HEVC, VP8, VP9, AV1) and NVENC (H.264, HEVC), zpm";
 
@@ -264,6 +283,9 @@ const Surface = struct {
     field_coded: bool = false,
     /// its last decode's status said nothing came out right
     failed: bool = false,
+    /// its last decode was lost with the video channel (it faulted under
+    /// it, or the picture came after): LOST_STATUS to every reader
+    lost: bool = false,
     /// an encode reading its block-linear copy, not yet seen done
     enc_pending: bool = false,
     enc_fence: u32 = 0,
@@ -381,6 +403,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         /// said went wrong
         serial: u32 = 0,
         errors: u32 = 0,
+        /// the video channel's loss said (once)
+        told_lost: bool = false,
 
         // ── Saying things ───────────────────────────────────────────────
 
@@ -691,7 +715,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             for (out, 0..) |*id, k| {
                 const i = d.makeSurface(width, height, sample_bytes) orelse {
                     for (out[0..k]) |made| d.dropSurface(@intCast(made - SURFACE_BASE));
-                    return va.ERROR_ALLOCATION_FAILED;
+                    return d.lostOr(va.ERROR_ALLOCATION_FAILED);
                 };
                 id.* = SURFACE_BASE + i;
             }
@@ -743,7 +767,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const st = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
             if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
             const s = &d.surfaces[si];
-            if (!d.ensureLinear(s)) return va.ERROR_ALLOCATION_FAILED;
+            if (!d.ensureLinear(s)) return d.lostOr(va.ERROR_ALLOCATION_FAILED);
             if (!s.linear_stale) return st;
             if (!d.convertSurface(s, .to_linear)) return va.ERROR_OPERATION_FAILED;
             s.linear_stale = false;
@@ -995,6 +1019,12 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         pub fn createContext(d: *Self, config: u32, width: u32, height: u32, out: *u32) va.Status {
             const cfg = d.configOf(config) orelse return va.ERROR_INVALID_CONFIG;
             if (width == 0 or height == 0 or width > MAX_SIZE or height > MAX_SIZE) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
+            // (the channel is the open file's and stays lost: a context
+            // here would only fail later; a new VADisplay gets a new one)
+            if (d.node.lost) {
+                d.say("no new context: the video channel is lost (a new VA display opens a fresh one)", .{});
+                return LOST_STATUS;
+            }
             const i = for (d.contexts, 0..) |c, i| {
                 if (!c.used) break i;
             } else return va.ERROR_ALLOCATION_FAILED;
@@ -1198,7 +1228,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             } else return va.ERROR_ALLOCATION_FAILED;
             const i = d.newBuffer(0) orelse return va.ERROR_ALLOCATION_FAILED;
             const want = @max(encode.DATA_OFF + @as(usize, @intCast(bytes)), encode.DATA_OFF + encode.HEADER_BYTES + (1 << 20));
-            const buf = d.node.alloc(want, 0) orelse return va.ERROR_ALLOCATION_FAILED;
+            const buf = d.node.alloc(want, 0) orelse return d.lostOr(va.ERROR_ALLOCATION_FAILED);
             d.coded[k] = .{ .used = true, .buf = buf };
             encode.emptySegment(buf.bytes());
             d.buffers[i] = .{ .used = true, .type = ve.ENC_CODED_BUFFER, .size = size, .count = count, .coded = @intCast(k) };
@@ -1228,9 +1258,12 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 // copy, converted on the GPU if a decode came since; the
                 // app may write it, so the picture is converted back
                 // before the decoder, an export or the encoder reads it)
+                const s = &d.surfaces[b.surface];
+                // (its surface gone under it: no pointer to hand out)
+                if (!s.used) return va.ERROR_INVALID_SURFACE;
                 const st = d.syncLinear(b.surface);
                 if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
-                const s = &d.surfaces[b.surface];
+                if (s.linear.handle == 0) return LOST_STATUS;
                 s.tiled_stale = true;
                 out.* = s.linear.cpu;
             } else out.* = d.storage(i).ptr;
@@ -1366,18 +1399,19 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 return va.SUCCESS;
             }
             // The next frame slot, once its last decode is done (that
-            // surface's picture copied out now if nobody synced it).
+            // surface's picture copied out now if nobody synced it). (The
+            // channel lost: nothing is waited for or submitted any more;
+            // the picture is taken, and lost at its EndPicture.)
             const f = c.next_frame;
-            if (c.frame_fence[f] != 0) {
+            if (c.frame_fence[f] != 0 and !d.node.lost) {
                 const old = c.frame_surface[f];
                 const deadline = d.node.sys.nowNs() + SYNC_NS;
                 if (old != NONE and d.surfaces[old].pending and d.surfaces[old].serial == c.frame_serial[f]) {
                     const st = d.complete(old, deadline);
-                    if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+                    if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR and !d.node.lost) return st;
                 } else switch (d.node.vwait(c.frame_fence[f], deadline)) {
-                    .done => {},
+                    .done, .lost => {},
                     .timeout => return va.ERROR_TIMEDOUT,
-                    .lost => return va.ERROR_OPERATION_FAILED,
                 }
             }
             c.target = si;
@@ -1405,6 +1439,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             if (c.target == NONE) return va.ERROR_OPERATION_FAILED;
             for (ids) |id| {
                 const bi = d.bufferIndex(id) orelse return va.ERROR_INVALID_BUFFER;
+                // (the channel lost: the picture will not be made)
+                if (!c.encoding and d.node.lost) continue;
                 const st = d.take(c, bi);
                 if (st != va.SUCCESS) {
                     if (c.bad == va.SUCCESS) c.bad = st;
@@ -1488,6 +1524,12 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             if (c.target == NONE) return va.ERROR_OPERATION_FAILED;
             if (c.bad != va.SUCCESS) return c.bad;
             if (c.encoding) return d.endEncode(ci, c);
+            // (the channel lost: the picture is lost with it, told at its
+            // sync; failing here crashes FFmpeg 6.1's AV1 decoder)
+            if (d.node.lost) {
+                d.loseSurface(c.target);
+                return va.SUCCESS;
+            }
             if (c.codec != .h264) return d.endModule(ci, c);
             if (!c.have_pic or c.slices == 0) return va.ERROR_INVALID_PARAMETER;
             const pic = &c.pic;
@@ -1568,6 +1610,10 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             }
             const n = nvdec.h264Push(words(frame.ptr, PUSH_OFF, nvdec.PUSH_DWORDS), a);
             const fence = d.node.vsubmit(c.work, @intCast(f * FRAME_BYTES + PUSH_OFF), @intCast(n)) catch |e| {
+                if (e == error.Lost) {
+                    d.loseSurface(si);
+                    return va.SUCCESS;
+                }
                 d.say("a decode was not submitted ({s})", .{@errorName(e)});
                 return if (e == error.NoDecoder) va.ERROR_UNIMPLEMENTED else va.ERROR_OPERATION_FAILED;
             };
@@ -1581,6 +1627,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             s.frame = f;
             s.serial = d.serial;
             s.failed = false;
+            s.lost = false;
             s.field_coded = field;
             s.fields = if (!field or second) 3 else this;
             s.field_frame_num = pic.frame_num;
@@ -1618,6 +1665,11 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             }
             std.debug.assert(e.dwords <= PUSH_DWORDS_MAX);
             const fence = d.node.vsubmit(c.work, @intCast(f * FRAME_BYTES + PUSH_OFF), @intCast(e.dwords)) catch |err| {
+                if (err == error.Lost) {
+                    d.loseSurface(si);
+                    if (e.display) |id| if (d.surfaceIndex(id)) |di| d.loseSurface(di);
+                    return va.SUCCESS;
+                }
                 d.say("a decode was not submitted ({s})", .{@errorName(err)});
                 return if (err == error.NoDecoder) va.ERROR_UNIMPLEMENTED else va.ERROR_OPERATION_FAILED;
             };
@@ -1630,6 +1682,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             s.frame = f;
             s.serial = d.serial;
             s.failed = false;
+            s.lost = false;
             s.field_coded = false;
             s.fields = 3;
             c.frame_fence[f] = fence;
@@ -1649,11 +1702,15 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 ds.frame = f;
                 ds.serial = d.serial;
                 ds.failed = false;
+                ds.lost = false;
                 ds.field_coded = false;
                 ds.fields = 3;
             };
             if (e.wait) {
                 const w = d.complete(si, d.node.sys.nowNs() + SYNC_NS);
+                // (the channel lost under it: the picture is lost, told at
+                // its sync, not here: pc-1111e's AV1 crash in FFmpeg)
+                if (d.surfaces[si].lost) return va.SUCCESS;
                 if (w != va.SUCCESS and w != va.ERROR_DECODING_ERROR) return w;
                 switch (c.codec) {
                     .hevc => hevc.after(&c.hevc, scratch),
@@ -1789,14 +1846,14 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         /// decoder wrote it.)
         fn complete(d: *Self, si: u16, deadline: i64) va.Status {
             const s = &d.surfaces[si];
+            if (s.lost) return LOST_STATUS;
             if (!s.pending) return if (s.failed) va.ERROR_DECODING_ERROR else va.SUCCESS;
             switch (d.node.vwait(s.fence, deadline)) {
                 .done => {},
                 .timeout => return va.ERROR_TIMEDOUT,
                 .lost => {
-                    s.pending = false;
-                    d.say("the GPU was lost during a decode", .{});
-                    return va.ERROR_OPERATION_FAILED;
+                    d.loseSurface(si);
+                    return LOST_STATUS;
                 },
             }
             s.pending = false;
@@ -1813,6 +1870,25 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 }
             }
             return if (s.failed) va.ERROR_DECODING_ERROR else va.SUCCESS;
+        }
+
+        /// Surface `si`'s picture lost with the video channel: nothing to
+        /// wait for, LOST_STATUS to its readers until a decode remakes it.
+        fn loseSurface(d: *Self, si: u16) void {
+            const s = &d.surfaces[si];
+            s.pending = false;
+            s.lost = true;
+            s.linear_stale = true;
+            if (!d.told_lost) {
+                d.told_lost = true;
+                d.say("the GPU was lost during a decode (its video channel): pictures from now on fail at their sync, export or image read, never at EndPicture", .{});
+            }
+        }
+
+        /// LOST_STATUS once the channel is lost (a refused allocation is
+        /// the loss, not memory), `otherwise` before.
+        fn lostOr(d: *Self, otherwise: va.Status) va.Status {
+            return if (d.node.lost) LOST_STATUS else otherwise;
         }
 
         pub fn syncSurface(d: *Self, surface: u32, timeout_ns: i64) va.Status {
@@ -1846,8 +1922,10 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                     return va.SUCCESS;
                 }
             }
+            // (a lost picture: nothing renders it any more, and it is not
+            // there to read)
             status.* = va.SURFACE_READY;
-            return va.SUCCESS;
+            return if (d.surfaces[si].lost) LOST_STATUS else va.SUCCESS;
         }
 
         /// Picture slots: those of surfaces no longer the target or a
@@ -2000,7 +2078,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 if (!b.used) break i;
             } else return va.ERROR_ALLOCATION_FAILED;
             const s = &d.surfaces[si];
-            if (!d.ensureLinear(s)) return va.ERROR_ALLOCATION_FAILED;
+            if (s.lost) return LOST_STATUS;
+            if (!d.ensureLinear(s)) return d.lostOr(va.ERROR_ALLOCATION_FAILED);
             d.buffers[bi] = .{ .used = true, .type = va.IMAGE_BUFFER, .size = s.linear_layout.bytes, .count = 1, .surface = si };
             const id = IMAGE_BASE + @as(u32, ii);
             const bid = BUFFER_BASE + @as(u32, @intCast(bi));
