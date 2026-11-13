@@ -355,8 +355,28 @@ pub const Graphics = struct {
     /// count (x right, y as its rows grow: the window's after the
     /// viewport).
     front_ccw: bool = true,
+    /// Colour targets 1 .. 7 (the pixel program's output t into target
+    /// t; null: none): as wide and high as target 0, rows of `stride`
+    /// bytes from `va`.
+    more: [7]?ColorTarget = @splat(null),
+    /// Indexed: `count` indices of `size` bytes from index `first` of the
+    /// buffer at `va` (`bytes` long), each the vertex's index the vertex
+    /// program reads; with `restart`, the type's largest begins a strip
+    /// or a fan anew. Null: the vertices' indices 0 .. count - 1.
+    index: ?Index = null,
+
+    pub const Index = struct { va: u64, bytes: u32, size: u8, first: u32, restart: bool = false };
 
     pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8 };
+    pub const ColorTarget = struct {
+        va: u64,
+        stride: u32,
+        format: TargetFormat,
+        /// the channels written (bit 0 red .. bit 3 alpha)
+        mask: u4 = 0xf,
+        /// `blend` applies to it (else its colour replaces the pixel's)
+        blend: bool = true,
+    };
     pub const StencilOp = enum(u8) { keep, zero, replace, incr, decr, invert, incr_wrap, decr_wrap };
     pub const Stencil = struct {
         /// NEVER 0 .. ALWAYS 7 (bit 0 less, 1 equal, 2 greater)
@@ -376,7 +396,10 @@ pub const Graphics = struct {
         tested: bool,
         write: bool,
         func: u3 = 1,
+        /// the front faces' stencil (both faces' unless `back_stencil`)
         stencil: ?Stencil = null,
+        /// the back faces' (two-sided stencil); null: the front's
+        back_stencil: ?Stencil = null,
     };
     pub const Topology = enum(u8) { triangles, strip, fan };
 };

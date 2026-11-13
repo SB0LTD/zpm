@@ -236,11 +236,12 @@ pub const Shaders = struct {
     /// two planes more in a primitive's record
     point_coord: bool = false,
     /// the fragment code writes gl_FragDepth (FragmentIO.depth): the
-    /// depth and stencil tests come after it (no early rejection)
+    /// depth and stencil tests come after it (no early rejection); on the
+    /// 3D engine its pixel program's depth output
     frag_depth: bool = false,
     /// the fragment code reads gl_FrontFacing (FragmentIO.front_facing):
-    /// the compute kernels give it (the 3D engine's pixel programs do not
-    /// read the facing yet)
+    /// the compute kernels' setup gives it, the 3D engine's pixel program
+    /// reads its facing word
     front_facing: bool = false,
     /// clip distances the vertex code writes (VertexIO.clip): each
     /// interpolated as a varying is, and a sample where one is below 0 is
@@ -875,11 +876,14 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     } else if (d.depth_test) return "a depth test with no depth image";
     if (d.stencil) |sten| {
         if (d.depth == null or sten != d.depth.?) return "a stencil image apart from the depth image";
-        if (!std.meta.eql(d.stencil_front, d.stencil_back)) return "two-sided stencil";
     }
-    if (d.restart) return "primitive restart";
+    if (d.index != null and (d.index_size == 0 or d.index_offset % d.index_size != 0)) return "an element array offset not on its indices' size";
     if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
-    for (d.targets[1..]) |t| if (t != null) return "more than one colour target";
+    for (d.targets[1..]) |tt| {
+        const t = tt orelse continue;
+        if (!t.img.drawable()) return "a colour target the engine does not draw into";
+        if (t.img.width != d.color.width or t.img.height != d.color.height or t.img.top_down != d.color.top_down or t.img.samples != 1) return "colour targets of different sizes or orientations";
+    }
     if (d.query != null) return "an occlusion query";
     if (d.alpha_to_coverage or d.sample_mask & 1 == 0) return "alpha to coverage or a sample mask";
     if (d.bias_factor != 0 or d.bias_units != 0) return "depth bias";
@@ -894,16 +898,19 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
 pub fn pipelineWhyNot(sh: Shaders) ?[]const u8 {
     if (sh.capture.len != 0) return "transform feedback";
     if (sh.point_size or sh.point_coord) return "points";
-    if (sh.frag_depth) return "gl_FragDepth";
-    if (sh.front_facing) return "gl_FrontFacing";
     if (sh.clips != 0) return "clip distances";
     if (sh.varyings > nvidia_gl.MAX_VARYINGS) return "more varyings than 32 vectors";
     return null;
 }
 
-/// The pixel program's parameters: the vertex kernel's, then its own.
+/// The pixel program's parameters: the vertex kernel's, then its own. An
+/// indexed draw is the engine's (its index buffer, primitive restart): the
+/// vertex's index it gives is the element already, so the program reads
+/// no element array.
 pub fn stageParams(d: *const Draw, out: []u32) []u32 {
     _ = vertexParams(d, out);
+    out[V_INDEX_SIZE] = 0;
+    out[V_FIRST] = if (d.index == null) d.first else 0;
     out[P_HEIGHT] = d.color.height;
     out[P_FLIP] = @intFromBool(d.color.top_down);
     return out[0..STAGE_PARAMS];
@@ -1004,6 +1011,9 @@ pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     const Y = k.sel(.f32, r(k.cmp(.u32, .ne, r(k.param(.u32, P_FLIP)), u(0))), r(yf), r(yh));
     const z = k.load(.f32, io_m.at(b.io, nvidia_gl.POSITION + 8), u(0));
     io.frag_coord = .{ X, Y, z, iw };
+    // gl_FrontFacing: the engine's facing word (flat, non-zero for a
+    // front face: OGL_SET_FRONT_FACE's, as culling's)
+    if (sh.front_facing) io.front_facing = k.cmp(.u32, .ne, r(k.load(.u32, nvidia_gl.ioMem(b.io, nvidia_gl.FRONT_FACE, true), u(0))), u(0));
     sh.fragment(sh.ctx, &k, &io);
     if (io.discard != .none) {
         k.ifp(r(io.discard));
@@ -1014,6 +1024,21 @@ pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         const val: Arg = if (io.color[c] == .none) f(0) else r(io.color[c]);
         k.store(.f32, io_m.at(b.io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c))), u(0), val);
     }
+    // outputs 1 .. 7 the code writes: into targets 1 .. 7 (a draw that
+    // binds a target the code never writes stays on the compute kernels,
+    // which give it 0: engine.graphicsDraw)
+    for (1..MAX_TARGETS) |t| {
+        const col = io.colors[t];
+        if (col[0] == .none and col[1] == .none and col[2] == .none and col[3] == .none) continue;
+        for (0..4) |c| {
+            const val: Arg = if (col[c] == .none) f(0) else r(col[c]);
+            k.store(.f32, io_m.at(b.io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(4 * t + c))), u(0), val);
+        }
+    }
+    // gl_FragDepth: the engine tests it in place of the interpolated depth
+    // (late tests: the header says the program writes it), clamped to
+    // 0..1 as the compute raster's depthWord clamps it
+    if (sh.frag_depth) k.store(.f32, io_m.at(b.io, nvidia_gl.DEPTH_AT), u(0), r(if (io.depth == .none) z else io.depth));
     return k;
 }
 
@@ -1186,8 +1211,12 @@ pub fn setupKernelFor(s: kir.Storage, p: *const Pipeline, kind: SetupKind) kir.K
                 k.ifp(r(any));
                 k.ifp(r(k.cmp(.u32, .ne, r(k.load(.u32, kir.global(b_v, 32), r(k.op2(.imin, .u32, r(flag_at), u(RESTART_NONE - 3))))), u(0))));
                 {
+                    // (from vertex t down: a fan restarted at t begins at
+                    // t + 1, so its triangle t is (t + 1, t + 1, t + 2),
+                    // nothing; a strip's triangle t holds the restart and
+                    // is dropped anyway)
                     const j = k.reg(.u32);
-                    k.set(j, .mov, r(t), no, no);
+                    k.set(j, .iadd, r(t), u(1), no);
                     k.loop();
                     {
                         k.brk(r(k.cmp(.u32, .eq, r(j), u(0))));

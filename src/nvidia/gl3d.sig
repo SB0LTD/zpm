@@ -10,17 +10,20 @@
 //! - constant buffer 0 of both stages: the binding addresses and the
 //!   parameter words, laid out as a compute launch's (qmd.cbuf0Into), so a
 //!   program reads them as a kernel does;
-//! - the colour target (rows of bytes: RGBA8, BGRA8, RG8, R8), the
-//!   channels written, the blend (GL's factors and equations, the
-//!   constant colour), the viewport (x, y and depth: GL's -w..w clip
+//! - up to eight colour targets (rows of bytes: RGBA8, BGRA8, RG8, R8;
+//!   the pixel program's output t into target t), each's channels
+//!   written and blend on or off; the blend (GL's factors and equations,
+//!   the constant colour), the viewport (x, y and depth: GL's -w..w clip
 //!   volume), the scissor;
+//! - the depth-stencil target (S8Z24, block linear), the depth test and
+//!   write, the stencil of both faces; culling and the front face;
 //! - the primitives: triangles, a strip or a fan of `count` vertices, the
 //!   vertex's index 0 .. count - 1 (the programs fetch their attributes
 //!   and the element array themselves), `instances` times.
 //!
-//! Not yet (the GL layer keeps such draws on its compute kernels): depth
-//! and stencil targets and tests, more than one colour target, culling,
-//! points and lines, multisampling.
+//! Not yet (the GL layer keeps such draws on its compute kernels): points
+//! and lines, multisampling, primitive restart, depth textures, depth
+//! bias, clip distances.
 //!
 //! Nothing here has run on the Legion's RTX; the emulated engine (emu3d)
 //! runs it.
@@ -94,6 +97,24 @@ pub const Blend = struct {
 
 pub const Topology = enum(u32) { triangles = 4, strip = 5, fan = 6 };
 
+// An indexed draw (cl9097.h, clc597.h; NVK's on Turing and later): the
+// index buffer's address, its size, the indices' size, primitive restart,
+// then SET_DRAW_CONTROL_A .. DRAW_INDEX_BUFFER_BEGIN_END_B in one method
+// (the control word, the instances, the first index, the count: the last
+// draws).
+pub const SET_INDEX_BUFFER_A: u32 = 0x17c8; // address (high), low
+pub const SET_INDEX_BUFFER_SIZE_A: u32 = 0x0238; // bytes (high), low
+pub const SET_INDEX_BUFFER_E: u32 = 0x17d8; // 0 one byte, 1 two, 2 four
+pub const SET_DA_PRIMITIVE_RESTART_INDEX: u32 = 0x1648;
+pub const DRAW_INDEX_BUFFER_BEGIN_END_A: u32 = 0x0268;
+pub const DRAW_INDEX_BUFFER_BEGIN_END_B: u32 = 0x026c;
+
+/// The draw's indices: rows of `size`-byte indices from `va` (`bytes` of
+/// them), from index `first`; with `restart`, the type's largest value
+/// begins a strip or a fan anew (GL's PRIMITIVE_RESTART_FIXED_INDEX).
+/// The vertex's index the vertex program reads is the index.
+pub const Index = struct { va: u64, bytes: u32, size: u8, first: u32, restart: bool = false };
+
 // The depth-stencil target and its tests (cl9097.h's methods).
 pub const SET_ZT_A: u32 = 0x0fe0; // address (high), then low, format, block size, array pitch
 pub const SET_ZT_SIZE_A: u32 = 0x1228; // width, height, third dimension
@@ -101,6 +122,13 @@ pub const SET_ZT_SIZE_A: u32 = 0x1228; // width, height, third dimension
 /// DEPTH24_STENCIL8 as the engine keeps it; Mesa's Z24_UNORM_S8_UINT).
 pub const ZT_S8Z24: u32 = 0x14;
 pub const SET_STENCIL_OP_FAIL: u32 = 0x1384; // fail, zfail, zpass, func, ref, func mask, write mask
+/// The back faces' stencil (cl9097.h): on with SET_TWO_SIDED_STENCIL_TEST
+/// (NVK keeps it on always), else the front's state is both faces'.
+pub const SET_TWO_SIDED_STENCIL_TEST: u32 = 0x1594;
+pub const SET_BACK_STENCIL_OP_FAIL: u32 = 0x1598; // fail, zfail, zpass, func
+pub const SET_BACK_STENCIL_FUNC_REF: u32 = 0x0f54;
+pub const SET_BACK_STENCIL_MASK: u32 = 0x0f58; // the write mask
+pub const SET_BACK_STENCIL_FUNC_MASK: u32 = 0x0f5c;
 
 /// GL's stencil operations, as the engine takes them (the GL enums).
 pub const StencilOp = enum(u32) { keep = 0x1e00, zero = 0, replace = 0x1e01, incr = 0x1e02, decr = 0x1e03, invert = 0x150a, incr_wrap = 0x8507, decr_wrap = 0x8508 };
@@ -127,8 +155,11 @@ pub const Depth = struct {
     write: bool,
     /// NEVER 0 .. ALWAYS 7 (the OGL value is 0x200 + it)
     func: u3 = 1,
-    /// one for both faces (two-sided stencil is not sent)
+    /// the front faces' stencil (with `stencil` set, both faces' unless
+    /// `back` is)
     stencil: ?Stencil = null,
+    /// the back faces' (two-sided stencil), null: the front's
+    back: ?Stencil = null,
 };
 
 /// A program as the engine is told of it: its header's address, its
@@ -164,7 +195,34 @@ pub const Draw = struct {
     /// Front faces counter-clockwise in the window's coordinates (x
     /// right, y as the rows grow).
     front_ccw: bool = true,
+    /// Colour targets 1 .. 7 (null: none; one inside the highest is sent
+    /// off: format 0): as wide and high as target 0.
+    more: [7]?More = @splat(null),
+    /// Indexed (the hardware's index buffer and primitive restart), else
+    /// the vertices' indices 0 .. count - 1.
+    index: ?Index = null,
 };
+
+/// A colour target past the first: rows of `pitch` bytes from `va` (128
+/// bytes apart, as the first's), its format, channels and blend.
+pub const More = struct {
+    va: u64,
+    pitch: u32,
+    format: Format,
+    mask: u4 = 0xf,
+    /// The draw's blend applies to it (else its colour replaces).
+    blend: bool = true,
+};
+
+/// SET_CT_SELECT: `count` targets, slot t its own target t (draw.sig's
+/// setup sends it for one).
+pub fn ctSelect(count: u32) u32 {
+    return 0x0fac_6880 | count;
+}
+
+fn ctWrite(mask: u4) u32 {
+    return @as(u32, mask & 1) | @as(u32, (mask >> 1) & 1) << 4 | @as(u32, (mask >> 2) & 1) << 8 | @as(u32, (mask >> 3) & 1) << 12;
+}
 
 /// OGL_SET_CULL_FACE (cl9097.h): the faces culled when OGL_SET_CULL is on.
 pub const OGL_SET_CULL_FACE: u32 = 0x1920;
@@ -200,7 +258,23 @@ pub fn emit(p: *Push, d: *const Draw) void {
     gr.target(p, .{ .va = d.target.va, .width = d.target.width, .height = d.target.height, .pitch = d.target.pitch, .format = .bgra8 });
     // the target's own format, its channels
     many(p, gr.SET_COLOR_TARGET_A + 16, &.{targetFormat(d.format)});
-    many(p, gr.SET_CT_WRITE, &.{@as(u32, d.mask & 1) | @as(u32, (d.mask >> 1) & 1) << 4 | @as(u32, (d.mask >> 2) & 1) << 8 | @as(u32, (d.mask >> 3) & 1) << 12});
+    many(p, gr.SET_CT_WRITE, &.{ctWrite(d.mask)});
+    // the other colour targets (the pixel program's outputs 1 .. 7): each
+    // its memory, format, channels and blend; CT_SELECT counts to the last
+    var count: u32 = 1;
+    for (d.more, 1..) |m, ti| {
+        const x = m orelse continue;
+        const t: u32 = @intCast(ti);
+        many(p, gr.SET_COLOR_TARGET_A + 64 * t, &.{ @truncate(x.va >> 32), @truncate(x.va), x.pitch, d.target.height, targetFormat(x.format), gr.TARGET_MEMORY_PITCH, 1, 0, 0 });
+        one(p, gr.SET_COLOR_COMPRESSION + 4 * t, 0);
+        one(p, gr.SET_CT_WRITE + 4 * t, ctWrite(x.mask));
+        if (d.blend) |b| {
+            one(p, gr.SET_BLEND + 4 * t, @intFromBool(x.blend));
+            if (x.blend) many(p, gr.SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA + 32 * t, &.{ 1, @intFromEnum(b.eq_rgb), @intFromEnum(b.src_rgb), @intFromEnum(b.dst_rgb), @intFromEnum(b.eq_a), @intFromEnum(b.src_a), @intFromEnum(b.dst_a) });
+        } else one(p, gr.SET_BLEND + 4 * t, 0);
+        count = t + 1;
+    }
+    many(p, gr.SET_CT_SELECT, &.{ctSelect(count)});
     // the viewport: x, y and depth; GL's clip volume (-w <= z <= w)
     many(p, gr.SET_VIEWPORT_SCALE_X, &.{ bits(d.scale[0]), bits(d.scale[1]), bits(d.scale[2]), bits(d.offset[0]), bits(d.offset[1]), bits(d.offset[2]) });
     one(p, gr.SET_VIEWPORT_Z_CLIP, SET_VIEWPORT_SCALE_Z_CLIP_GL);
@@ -225,6 +299,12 @@ pub fn emit(p: *Push, d: *const Draw) void {
         if (z.stencil) |s| {
             one(p, gr.SET_STENCIL_TEST, 1);
             many(p, SET_STENCIL_OP_FAIL, &.{ @intFromEnum(s.fail), @intFromEnum(s.zfail), @intFromEnum(s.zpass), 0x200 + @as(u32, s.func), s.reference, s.value_mask, s.write_mask });
+            // the back faces' (the front's again when one-sided), as NVK
+            // sends them with two-sided stencil on
+            const b = z.back orelse s;
+            one(p, SET_TWO_SIDED_STENCIL_TEST, 1);
+            many(p, SET_BACK_STENCIL_OP_FAIL, &.{ @intFromEnum(b.fail), @intFromEnum(b.zfail), @intFromEnum(b.zpass), 0x200 + @as(u32, b.func) });
+            many(p, SET_BACK_STENCIL_FUNC_REF, &.{ b.reference, b.write_mask, b.value_mask });
         }
     }
     one(p, gr.SET_PRIMITIVE_TOPOLOGY, @intFromEnum(d.topology));
@@ -244,12 +324,35 @@ pub fn emit(p: *Push, d: *const Draw) void {
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_VERTEX, 1);
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_PIXEL, 1);
     one(p, gr.INVALIDATE_SHADER_CACHES_NO_WFI, 0x1001); // the code and the constants
+    if (d.index) |ix| {
+        many(p, SET_INDEX_BUFFER_A, &.{ @truncate(ix.va >> 32), @truncate(ix.va) });
+        many(p, SET_INDEX_BUFFER_SIZE_A, &.{ 0, ix.bytes });
+        one(p, SET_INDEX_BUFFER_E, switch (ix.size) {
+            1 => 0,
+            2 => 1,
+            else => 2,
+        });
+        one(p, gr.SET_DA_PRIMITIVE_RESTART, @intFromBool(ix.restart));
+        many(p, SET_DA_PRIMITIVE_RESTART_INDEX, &.{restartIndex(ix.size)});
+        many(p, gr.SET_DRAW_CONTROL_A, &.{ gr.DRAW_CONTROL, d.instances, ix.first, d.count });
+        return;
+    }
     many(p, gr.SET_DRAW_CONTROL_A, &.{ gr.DRAW_CONTROL, d.instances });
     many(p, gr.DRAW_VERTEX_ARRAY_BEGIN_END_A, &.{ 0, d.count });
 }
 
-/// Dwords emit takes at most (draw.sig's state, and the draw's own).
-pub const MAX_DWORDS = 900;
+/// The fixed restart index of `size`-byte indices: the type's largest.
+pub fn restartIndex(size: u8) u32 {
+    return switch (size) {
+        1 => 0xff,
+        2 => 0xffff,
+        else => 0xffff_ffff,
+    };
+}
+
+/// Dwords emit takes at most (draw.sig's state, and the draw's own: 26
+/// a colour target past the first).
+pub const MAX_DWORDS = 1100;
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -278,4 +381,13 @@ test "gl3d: a draw's stream fits, ends in its draw, names its programs and buffe
     const w = p.words();
     try testing.expectEqualSlices(u32, &.{ push.header(SUBCH, gr.DRAW_VERTEX_ARRAY_BEGIN_END_A, 2), 0, 6 }, w[w.len - 3 ..]);
     try testing.expect(w.len < MAX_DWORDS);
+    // every colour target, a depth target with two-sided stencil: fits
+    var all = d;
+    for (&all.more) |*m| m.* = .{ .va = 0x10_0002_0000, .pitch = 256, .format = .bgra8 };
+    all.depth = .{ .va = 0x10_0003_0000, .width = 64, .height = 32, .gobs_log2 = 2, .tested = true, .write = true, .stencil = .{}, .back = .{} };
+    p = Push{ .buf = &buf };
+    emit(&p, &all);
+    try p.check();
+    try testing.expect(p.words().len < MAX_DWORDS);
+    try testing.expectEqual(@as(u32, 0x0fac_6888), ctSelect(8));
 }

@@ -483,11 +483,14 @@ pub const Adapter = struct {
             .cb_bytes = qmd.cbuf0Bytes(8 * d.buffers.len + 4 * nw),
             .zero_va = a.zero.va,
             .target = .{ .va = g.va, .width = g.width, .height = g.height, .pitch = g.stride },
-            .format = switch (g.format) {
-                .rgba8 => .rgba8,
-                .bgra8 => .bgra8,
-                .r8 => .r8,
-                .rg8 => .rg8,
+            .format = formatOf(g.format),
+            .index = if (g.index) |ix| .{ .va = ix.va, .bytes = ix.bytes, .size = ix.size, .first = ix.first, .restart = ix.restart } else null,
+            .more = more: {
+                var m: [7]?gl3d.More = @splat(null);
+                for (g.more, 0..) |x, t| {
+                    if (x) |c| m[t] = .{ .va = c.va, .pitch = c.stride, .format = formatOf(c.format), .mask = c.mask, .blend = c.blend };
+                }
+                break :more m;
             },
             .mask = g.mask,
             .blend = if (g.blend) |b| .{
@@ -519,15 +522,8 @@ pub const Adapter = struct {
                 .tested = z.tested,
                 .write = z.write,
                 .func = z.func,
-                .stencil = if (z.stencil) |zs| .{
-                    .func = zs.func,
-                    .reference = zs.reference,
-                    .value_mask = zs.value_mask,
-                    .write_mask = zs.write_mask,
-                    .fail = stencilOpOf(zs.fail),
-                    .zfail = stencilOpOf(zs.zfail),
-                    .zpass = stencilOpOf(zs.zpass),
-                } else null,
+                .stencil = if (z.stencil) |zs| stencilOf(zs) else null,
+                .back = if (z.back_stencil) |zs| stencilOf(zs) else null,
             } else null,
         };
     }
@@ -676,6 +672,27 @@ fn factorOf(f: gpu.BlendFactor) gl3d.Factor {
         .one_minus_constant_color => .one_minus_constant_color,
         .constant_alpha => .constant_alpha,
         .one_minus_constant_alpha => .one_minus_constant_alpha,
+    };
+}
+
+fn formatOf(f: gpu.Graphics.TargetFormat) gl3d.Format {
+    return switch (f) {
+        .rgba8 => .rgba8,
+        .bgra8 => .bgra8,
+        .r8 => .r8,
+        .rg8 => .rg8,
+    };
+}
+
+fn stencilOf(s: gpu.Graphics.Stencil) gl3d.Stencil {
+    return .{
+        .func = s.func,
+        .reference = s.reference,
+        .value_mask = s.value_mask,
+        .write_mask = s.write_mask,
+        .fail = stencilOpOf(s.fail),
+        .zfail = stencilOpOf(s.zfail),
+        .zpass = stencilOpOf(s.zpass),
     };
 }
 
