@@ -269,7 +269,11 @@ fn options() driver.Options {
     return optionsOf(env_buf[0..n]);
 }
 
-/// GALAXY_VA_DEBUG (set and not "0": say things on stderr), GALAXY_VA_GOB
+/// GALAXY_VA_DEBUG (set and not "0": say things on stderr, each decode
+/// context's pipeline at its end), GALAXY_VA_SERIAL ("1": a module's step
+/// after a decode at its EndPicture, as before the pipeline),
+/// GALAXY_VA_SCRATCH ("vram": H.264's decoder-only buffers in VRAM),
+/// GALAXY_VA_GOB
 /// ("turing": Turing's GOB layout instead of Blackwell's), GALAXY_VA_PROBE
 /// ("0": no decoder probe at init), GALAXY_VA_BLACKWELL and
 /// GALAXY_VA_{HEVC,VP9,AV1}_BLACKWELL (Blackwell's additions, codec.Blackwell:
@@ -300,6 +304,10 @@ pub fn optionsOf(block: []const u8) driver.Options {
             o.gob = if (std.ascii.eqlIgnoreCase(v, "turing")) .turing else .blackwell;
         } else if (std.mem.eql(u8, k, "GALAXY_VA_PROBE")) {
             o.probe = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_SERIAL")) {
+            o.serial_after = std.mem.eql(u8, v, "1");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_SCRATCH")) {
+            o.h264_scratch_vram = std.ascii.eqlIgnoreCase(v, "vram");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_BLACKWELL")) {
             all_bw = codec.Blackwell.parse(v);
         } else if (std.mem.eql(u8, k, "GALAXY_VA_HEVC_BLACKWELL")) {
@@ -476,8 +484,10 @@ fn vaMapBuffer(ctx: *va.DriverContext, id: u32, out: ?*?*anyopaque) callconv(.c)
 }
 
 fn vaMapBuffer2(ctx: *va.DriverContext, id: u32, out: ?*?*anyopaque, flags: u32) callconv(.c) va.Status {
-    _ = flags;
-    return vaMapBuffer(ctx, id, out);
+    // (a read-only map of a derived image: nothing converted back)
+    const d = enter(ctx);
+    defer leave(ctx);
+    return d.mapBufferFor(id, out orelse return va.ERROR_INVALID_PARAMETER, flags);
 }
 
 fn vaUnmapBuffer(ctx: *va.DriverContext, id: u32) callconv(.c) va.Status {
@@ -666,4 +676,13 @@ test "libgalaxy_va: init without Galaxy's RTX fails cleanly" {
     try testing.expectEqual(@as(?*anyopaque, null), ctx.pDriverData);
     try testing.expect(vt.vaTerminate == null);
     for (taken) |t| try testing.expect(!t);
+}
+
+test "libgalaxy_va: the pipeline's switches" {
+    const none = optionsOf("HOME=/root\x00");
+    try testing.expect(!none.serial_after and !none.h264_scratch_vram);
+    const both = optionsOf("GALAXY_VA_SERIAL=1\x00GALAXY_VA_SCRATCH=VRAM\x00");
+    try testing.expect(both.serial_after and both.h264_scratch_vram);
+    try testing.expect(!optionsOf("GALAXY_VA_SERIAL=0\x00GALAXY_VA_SCRATCH=sys\x00").serial_after);
+    try testing.expect(!optionsOf("GALAXY_VA_SCRATCH=sys\x00").h264_scratch_vram);
 }

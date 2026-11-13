@@ -25,8 +25,10 @@
 //!       side buffers into `slot.aux`, the pushbuffer into `slot.push`
 //!       (EndPicture); va.SUCCESS and `out` filled, or why not.
 //!       `End.dwords` is the pushbuffer's length; `End.wait` asks the
-//!       driver to wait for this decode before the next and then call
-//!       `after` (VP9's backward adaptation reads the decoder's counts).
+//!       driver to call `after` once this decode is done and before the
+//!       context's next picture is begun (VP9's backward adaptation reads
+//!       the decoder's counts): the driver waits at that BeginPicture, so
+//!       the decoder runs while the app makes the next picture.
 //!   pub fn after(st: *State, scratch: Scratch) void: that decode is done.
 //!
 //! Modules use nvdec.sig's `header`, `shifted`, `SLOTS`, `Status` and the
