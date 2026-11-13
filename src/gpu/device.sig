@@ -395,8 +395,14 @@ pub const Graphics = struct {
         zfail: StencilOp = .keep,
         zpass: StencilOp = .keep,
     };
+    /// Block linear, 32-bit words, depth in bits 0..23 (the RTX's X8Z24;
+    /// bits 24..31 the engine's), and for a stencil test its stencil a
+    /// plane of its own (`stencil_va`: S8, Blackwell's 8-bit GOBs, whole
+    /// GOBs across, the depth's block height): Blackwell refuses a
+    /// combined depth-stencil target (nvidia/gl3d.sig).
     pub const Depth = struct {
         va: u64,
+        stencil_va: ?u64 = null,
         width: u32,
         height: u32,
         gobs_log2: u3,

@@ -91,8 +91,10 @@ const Fmt = enum { rgba8, bgra8, r8, rg8 };
 
 const Clip = struct { x0: i64, y0: i64, x1: i64, y1: i64 };
 
-/// The depth-stencil target as gl3d sends it: S8Z24, block linear.
-const ZT = struct { bytes: []u8, pitch: u32, width: u32, height: u32, gobs: u3 };
+/// The depth target as gl3d sends it: block linear, 32-bit words, depth
+/// in bits 0..23 (X8Z24, or S8Z24 with STENCIL_IS_SEPARATE), and its
+/// stencil plane (S8, Blackwell's 8-bit GOBs) when there is one.
+const ZT = struct { bytes: []u8, pitch: u32, width: u32, height: u32, gobs: u3, stencil: ?[]u8 = null, s_pitch: u32 = 0 };
 const STENCIL_TWO_SIDE = gl3d.SET_TWO_SIDED_STENCIL_TEST;
 
 /// A texture as its header and its sampler describe it.
@@ -214,6 +216,7 @@ pub const Engine = struct {
         try g.need(cts & 0xf >= 1 and cts & 0xf <= 8 and cts & ~@as(u32, 0xf) == gl3d.ctSelect(0) and g.reg(gr.SET_CT_MRT_ENABLE) == 1, "not 1 to 8 color targets, slot t target t (SET_CT_SELECT, SET_CT_MRT_ENABLE)");
         try g.need(g.reg(gr.SET_ZT_SELECT) <= 1 and g.reg(gr.SET_DEPTH_BOUNDS_TEST) == 0, "more than one depth target, or a depth bounds test: not modelled");
         try g.need(g.reg(gr.SET_ZT_SELECT) == 1 or (g.reg(gr.SET_DEPTH_TEST) == 0 and g.reg(gr.SET_STENCIL_TEST) == 0), "a depth or stencil test with no depth target (SET_ZT_SELECT)");
+        try g.need(g.reg(gr.SET_STENCIL_TEST) == 0 or g.reg(gl3d.SET_ZT_A + 8) & gl3d.ZT_STENCIL_IS_SEPARATE != 0, "a stencil test with no stencil plane (X8Z24 has none)");
         try g.need(g.reg(STENCIL_TWO_SIDE) <= 1, "SET_TWO_SIDED_STENCIL_TEST neither on nor off");
         try g.need(g.reg(gr.SET_RASTER_ENABLE) == 1, "the rasterizer is off (SET_RASTER_ENABLE)");
         try g.need(g.reg(gr.SET_ANTI_ALIAS) == 0 and g.reg(gr.SET_ANTI_ALIAS_SAMPLE_POSITIONS) == 0x8888_8888, "more than one sample, or a sample not at the pixel's centre");
@@ -300,7 +303,7 @@ pub const Engine = struct {
 
     /// The colour targets' layouts as the hardware takes them: all alike,
     /// and block linear when a depth target is selected. A pitch colour
-    /// target beside a depth target is the class's data error 0x12,
+    /// target beside a depth target is the class's data error
     /// RT_LINEAR_WITH_ZETA: the Legion's RTX lost its channel to it (Xid
     /// 69, pc-all's drawtest step 4).
     fn layoutsAgree(g: *Engine, t: Target) error{BadStream}!void {
@@ -311,25 +314,46 @@ pub const Engine = struct {
         }
     }
 
-    /// The depth-stencil target, when one is selected: S8Z24, block linear
-    /// (Turing2D's 32-bit swizzle), as SET_ZT_A .. and SET_ZT_SIZE_A .. say.
+    /// The depth target, when one is selected, as SET_ZT_A .. and
+    /// SET_ZT_SIZE_A .. say: block linear (Turing2D's 32-bit GOBs), X8Z24,
+    /// or S8Z24 with its stencil the SET_ST_* plane (Blackwell's 8-bit
+    /// GOBs). A combined depth-stencil target (the stencil in the depth's
+    /// words: Z24S8, or S8Z24 without STENCIL_IS_SEPARATE) is refused as
+    /// the RTX refused it: pc-full2's first draw with one lost the channel
+    /// (GSP-RM: class 0xce97, method 0x274 data 6, error code 0x13, Xid
+    /// 69); NVK never sends one on Blackwell (nvk_use_separate_zs).
     fn depthTarget(g: *Engine) error{BadStream}!?ZT {
         if (g.reg(gr.SET_ZT_SELECT) == 0) return null;
         const a = gl3d.SET_ZT_A;
         const va = @as(u64, g.reg(a) & 0xff) << 32 | g.reg(a + 4);
-        try g.need(g.reg(a + 8) == gl3d.ZT_S8Z24, "a depth target format other than S8Z24: not modelled");
+        const fmt = g.reg(a + 8);
+        const separate = fmt == gl3d.ZT_S8Z24 | gl3d.ZT_STENCIL_IS_SEPARATE;
+        try g.need(fmt == gl3d.ZT_X8Z24 or separate, "a depth target whose stencil shares its words (Z24S8, or S8Z24 without STENCIL_IS_SEPARATE): Blackwell refuses the draw (class error 0x13 at the draw, Xid 69: pc-full2); X8Z24, or S8Z24 with its stencil a plane of its own");
         const bs = g.reg(a + 12);
         try g.need(bs & 0xf == 0 and (bs >> 8) & 0xf == 0 and (bs >> 4) & 0xf <= 5, "a depth target's blocks not one GOB wide and deep");
         const gobs: u3 = @intCast((bs >> 4) & 0xf);
         const w = g.reg(gl3d.SET_ZT_SIZE_A);
         const h = g.reg(gl3d.SET_ZT_SIZE_A + 4);
-        try g.need(w != 0 and h != 0 and g.reg(gl3d.SET_ZT_SIZE_A + 8) == 0x1_0001, "a depth target with no size, or more than one layer");
+        const c = g.reg(gl3d.SET_ZT_SIZE_A + 8);
+        try g.need(w != 0 and h != 0 and (c == 1 or c == 0x1_0001), "a depth target with no size, or more than one layer");
         try g.need(va % 512 == 0, "a depth target not on a GOB");
         const pitch = (w * 4 + 63) / 64 * 64;
         const rows_per_block = @as(u32, 8) << gobs;
-        const bytes = @as(usize, pitch / 64) * ((h + rows_per_block - 1) / rows_per_block) * (@as(usize, 512) << gobs);
+        const blocks_down = (h + rows_per_block - 1) / rows_per_block;
+        const bytes = @as(usize, pitch / 64) * blocks_down * (@as(usize, 512) << gobs);
         const mem = g.host.mem.find(va, bytes) orelse return g.refuse("the depth target's memory is not mapped");
-        return .{ .bytes = mem, .pitch = pitch, .width = w, .height = h, .gobs = gobs };
+        var z = ZT{ .bytes = mem, .pitch = pitch, .width = w, .height = h, .gobs = gobs };
+        if (separate) {
+            const st = gl3d.SET_ST_A;
+            const sva = @as(u64, g.reg(st) & 0xff) << 32 | g.reg(st + 4);
+            try g.need(g.reg(st + 8) == bs and sva % 512 == 0, "a stencil plane not on a GOB, or its blocks not the depth's");
+            const sw = g.reg(gl3d.SET_ST_SIZE_A);
+            try g.need(sw >= w and sw % 64 == 0 and g.reg(gl3d.SET_ST_SIZE_A + 4) >= h, "a stencil plane narrower or shorter than the depth, or not whole GOBs across");
+            const sbytes = @as(usize, sw / 64) * blocks_down * (@as(usize, 512) << gobs);
+            z.stencil = g.host.mem.find(sva, sbytes) orelse return g.refuse("the stencil plane's memory is not mapped");
+            z.s_pitch = sw;
+        }
+        return z;
     }
 
     /// Where pixels may be written: the surface's clip, the viewport's,
@@ -682,7 +706,7 @@ pub const Engine = struct {
         if (area == 0) return;
         if (g.culled(area)) return;
         // (front: wound as OGL_SET_FRONT_FACE says, as culling has it)
-        const front = (area > 0) == (g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW);
+        const front = (area > 0) == gl3d.frontCcwOf(g.reg(gr.OGL_SET_FRONT_FACE));
         if (area < 0) {
             std.mem.swap(usize, &tri[1], &tri[2]);
             area = -area;
@@ -755,7 +779,7 @@ pub const Engine = struct {
     /// and y as the rows grow) is culled, as OGL_SET_CULL, OGL_SET_CULL_FACE
     /// and OGL_SET_FRONT_FACE say.
     fn culled(g: *const Engine, area: i64) bool {
-        return cullOf(area, g.reg(gr.OGL_SET_CULL) != 0, g.reg(gl3d.OGL_SET_CULL_FACE), g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW);
+        return cullOf(area, g.reg(gr.OGL_SET_CULL) != 0, g.reg(gl3d.OGL_SET_CULL_FACE), gl3d.frontCcwOf(g.reg(gr.OGL_SET_FRONT_FACE)));
     }
 
     /// Whether a pixel's depth (window units) is in the viewport's depth
@@ -866,8 +890,9 @@ pub const Engine = struct {
         const w = std.mem.readInt(u32, z.bytes[at..][0..4], .little);
         const zq = depthWord(zw);
         const old_z = w & 0xff_ffff;
-        var stencil: u32 = w >> 24;
-        const st_on = g.reg(gr.SET_STENCIL_TEST) & 1 != 0;
+        const s_at = if (z.stencil != null) blAddress8(z.s_pitch, z.gobs, x, y) else 0;
+        var stencil: u32 = if (z.stencil) |sb| sb[s_at] else 0;
+        const st_on = g.reg(gr.SET_STENCIL_TEST) & 1 != 0 and z.stencil != null;
         const back = !front and g.reg(STENCIL_TWO_SIDE) & 1 != 0;
         // (each face's: the ops and the func, the reference, the value
         // mask, the write mask)
@@ -889,7 +914,9 @@ pub const Engine = struct {
             const v = stencilOp(op, stencil, ref);
             stencil = (v & wm) | (stencil & ~wm & 0xff);
         }
-        std.mem.writeInt(u32, z.bytes[at..][0..4], (stencil << 24) | new_z, .little);
+        // (bits 24..31 of a depth word kept: X8Z24's X8, S8Z24's unused)
+        std.mem.writeInt(u32, z.bytes[at..][0..4], (w & 0xff00_0000) | new_z, .little);
+        if (z.stencil) |sb| sb[s_at] = @intCast(stencil & 0xff);
         return s_pass and d_pass;
     }
 
@@ -1151,6 +1178,19 @@ fn stencilOp(op: u32, v: u32, ref: u32) u32 {
     };
 }
 
+/// Byte `x` of row `y` of a block-linear plane of 8-bit texels on
+/// Blackwell (`pitch` bytes across, blocks of 2^gobs GOBs): its GOBs are
+/// swizzled (x/8)*64 + y*8 + x%8 (drm_fourcc.h's GB20x 8-bpp sector
+/// layout; gfxapi blocklinear's Blackwell8, NVDEC's luma on the Legion).
+pub fn blAddress8(pitch: u32, gobs: u3, x: u32, y: u32) usize {
+    const shift: u5 = @as(u5, gobs) + 3;
+    const block = (y >> shift) * (pitch / 64) + x / 64;
+    const gob = (y >> 3) & ((@as(u32, 1) << gobs) - 1);
+    const ix = x % 64;
+    const inner = (ix / 8) * 64 + (y % 8) * 8 + ix % 8;
+    return (@as(usize, block) << (@as(u6, gobs) + 9)) + gob * 512 + inner;
+}
+
 /// Byte `xb` of row `y` of a block-linear surface (`pitch` bytes across,
 /// blocks of 2^gobs GOBs, Turing2D's swizzle: 32-bit texels).
 pub fn blAddress(pitch: u32, gobs: u3, xb: u32, y: u32) usize {
@@ -1308,6 +1348,14 @@ test "a pixel written: replaced, and premultiplied source over" {
     try testing.expectEqualSlices(u8, &.{ 128, 128, 0, 255 }, bytes[0..4]);
     write(t, 1, 0, .{ 1, 0.5, 0, 0.25 }, null, 0xf);
     try testing.expectEqualSlices(u8, &.{ 0, 128, 255, 64 }, bytes[4..8]);
+}
+
+test "a stencil plane's byte lands where Blackwell's 8-bit GOB puts it" {
+    // (row 9, byte 21, two GOBs a block: the second GOB, its column 2,
+    // row 1, byte 5)
+    try testing.expectEqual(@as(usize, 512 + 2 * 64 + 1 * 8 + 5), blAddress8(64, 1, 21, 9));
+    // (the next GOB across: the next block)
+    try testing.expectEqual(@as(usize, 1024), blAddress8(128, 1, 64, 0));
 }
 
 test "a block-linear target's pixel lands where its GOB puts it" {

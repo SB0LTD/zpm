@@ -505,13 +505,16 @@ pub fn hardwareTestWith(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.
 //   pixels covered against the model's;
 // - 4b culling (OGL_SET_CULL_FACE, OGL_SET_CULL), as 4a;
 // - 4c depth LESS, written: the colour target block linear (the engine
-//   refuses a depth target beside a pitch one: RT_LINEAR_WITH_ZETA, the
-//   Legion's Xid 69 at pc-all's first triangle) and an S8Z24 depth target;
-//   the target and the depth come back and are put beside the model's
-//   pixel for pixel, exactly;
+//   refuses a depth target beside a pitch one: RT_LINEAR_WITH_ZETA) and an
+//   X8Z24 depth target (Blackwell refuses a combined depth-stencil format:
+//   pc-full2's class error 0x13 at the draw); the target and the depth
+//   come back and are put beside the model's pixel for pixel, exactly;
 // - 4d depth EQUAL (not written) against the model's depths: the engine
 //   draws exactly the pixels whose depth it makes the same as the compute
-//   path does.
+//   path does;
+// - 4e as 4c, the depth target S8Z24 with its stencil a plane of its own
+//   (STENCIL_IS_SEPARATE, SET_ST_*: NVK's form of a Blackwell D24S8
+//   image), the stencil test off.
 
 pub const EW = 64;
 pub const EH = 32;
@@ -519,6 +522,10 @@ pub const EH = 32;
 pub const E_GOBS: u3 = 2;
 pub const E_PITCH = EW * 4;
 pub const E_DEPTH_BYTES = (E_PITCH / 64) * ((EH + 31) / 32) * (512 << E_GOBS);
+/// The stencil plane (S8, Blackwell's 8-bit GOBs, the depth's blocks): a
+/// byte a pixel, whole GOBs across.
+pub const E_S_PITCH = (EW + 63) / 64 * 64;
+pub const E_S_BYTES = (E_S_PITCH / 64) * ((EH + 31) / 32) * (512 << E_GOBS);
 /// The quads, in pixels (x right, y the target's rows), and their
 /// corners' clip z.
 /// `cull`: the faces culled (bit 0 front, bit 1 back), front faces
@@ -645,20 +652,21 @@ pub fn edgePixel(k: *kir.Kernel) void {
 }
 
 /// Step 4's groups (the prose above).
-const EdgeGroup = enum { triangles, culling, depth_less, depth_equal };
+const EdgeGroup = enum { triangles, culling, depth_less, depth_equal, depth_less_separate };
 const EdgeGroupOf = struct { g: EdgeGroup, label: []const u8, what: []const u8 };
 const edge_groups = [_]EdgeGroupOf{
     .{ .g = .triangles, .label = "4a", .what = "triangles: nvidia_gl's programs, TRIANGLES, the viewport's depth, the provoking vertex, the front face; a pitch target, no depth" },
     .{ .g = .culling, .label = "4b", .what = "culling: OGL_SET_CULL_FACE, OGL_SET_CULL; a pitch target, no depth" },
-    .{ .g = .depth_less, .label = "4c", .what = "depth LESS, written: a block-linear colour target, an S8Z24 depth target (SET_ZT_*, SET_DEPTH_*)" },
-    .{ .g = .depth_equal, .label = "4d", .what = "depth EQUAL against the compute path's depths, not written (block linear)" },
+    .{ .g = .depth_less, .label = "4c", .what = "depth LESS, written: a block-linear colour target, an X8Z24 depth target (SET_ZT_*, SET_DEPTH_*)" },
+    .{ .g = .depth_equal, .label = "4d", .what = "depth EQUAL against the compute path's depths, not written (block linear, X8Z24)" },
+    .{ .g = .depth_less_separate, .label = "4e", .what = "depth LESS, written: S8Z24 with its stencil a plane of its own (STENCIL_IS_SEPARATE, SET_ST_*), the stencil test off" },
 };
 
 fn inGroup(g: EdgeGroup, sc: EdgeScene) bool {
     return switch (g) {
         .triangles => sc.cull == 0,
         .culling => sc.cull != 0,
-        .depth_less, .depth_equal => true,
+        .depth_less, .depth_equal, .depth_less_separate => true,
     };
 }
 
@@ -759,7 +767,12 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
     defer d.free(target);
     const depth = d.alloc(E_DEPTH_BYTES, .host) catch return noMemory(log, res);
     defer d.free(depth);
-    const block = grp.g == .depth_less or grp.g == .depth_equal;
+    const block = grp.g != .triangles and grp.g != .culling;
+    const less = grp.g != .depth_equal;
+    const splane = d.alloc(E_S_BYTES, .host) catch return noMemory(log, res);
+    defer d.free(splane);
+    @memset(splane.cpu[0..E_S_BYTES], 0);
+    d.toDevice(splane, 0, E_S_BYTES);
     const add = gpu.GraphicsBlend{ .src_rgb = .one, .dst_rgb = .one, .src_a = .one, .dst_a = .one };
     hsay(log, "step {s}, edges: {s}", .{ grp.label, grp.what });
     for ([_]bool{ false, true }) |flipped| {
@@ -776,7 +789,7 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
             d.toDevice(target, 0, E_DEPTH_BYTES);
             if (block) {
                 for (0..EH) |y| for (0..EW) |x| {
-                    std.mem.writeInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], if (grp.g == .depth_less) 0xff_ffff else E.m.z[y * EW + x], .little);
+                    std.mem.writeInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], if (less) 0xff_ffff else E.m.z[y * EW + x], .little);
                 };
                 d.toDevice(depth, 0, E_DEPTH_BYTES);
             }
@@ -795,7 +808,7 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
                 .count = 6,
                 .cull = sc.cull,
                 .front_ccw = true,
-                .depth = if (block) .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = grp.g == .depth_less, .func = if (grp.g == .depth_less) 1 else 2 } else null,
+                .depth = if (block) .{ .va = depth.gpu, .stencil_va = if (grp.g == .depth_less_separate) splane.gpu else null, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = less, .func = if (less) 1 else 2 } else null,
             };
             const t0 = now_us();
             const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {
@@ -849,7 +862,7 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
             const verdict = if (cover_apart + depth_apart + equal_apart == 0) "EXACT" else "APART";
             switch (grp.g) {
                 .triangles, .culling => hsay(log, "step {s}, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, in {d} us: {s}", .{ grp.label, sc.name, fl, drawn, want, cover_apart, now_us() - t0, verdict }),
-                .depth_less => hsay(log, "step {s}, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, {d} depths apart, in {d} us: {s}", .{ grp.label, sc.name, fl, drawn, want, cover_apart, depth_apart, now_us() - t0, verdict }),
+                .depth_less, .depth_less_separate => hsay(log, "step {s}, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, {d} depths apart, in {d} us: {s}", .{ grp.label, sc.name, fl, drawn, want, cover_apart, depth_apart, now_us() - t0, verdict }),
                 .depth_equal => hsay(log, "step {s}, edges, '{s}'{s}: depth EQUAL against the compute path's depths: {d} pixels otherwise, in {d} us: {s}", .{ grp.label, sc.name, fl, equal_apart, now_us() - t0, verdict }),
             }
         }
@@ -1165,6 +1178,8 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
     defer d.free(target);
     const depth = d.alloc(E_DEPTH_BYTES, .host) catch return featuresNoMemory(log, res);
     defer d.free(depth);
+    const splane = d.alloc(E_S_BYTES, .host) catch return featuresNoMemory(log, res);
+    defer d.free(splane);
     const target2 = d.alloc(EW * EH * 4, .host) catch return featuresNoMemory(log, res);
     defer d.free(target2);
     const ibuf = d.alloc(64, .host) catch return featuresNoMemory(log, res);
@@ -1204,6 +1219,9 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
             std.mem.writeInt(u32, depth.cpu[at..][0..4], 0xff_ffff, .little);
         };
         d.toDevice(depth, 0, E_DEPTH_BYTES);
+        @memset(splane.cpu[0..E_S_BYTES], 0);
+        d.toDevice(splane, 0, E_S_BYTES);
+        const stencil = sc.kind == .two_sided_stencil;
         var g = gpu.Graphics{
             .vertex = &vp,
             .va = target.gpu,
@@ -1216,7 +1234,7 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
             .offset = .{ EW / 2, EH / 2, 0.5 },
             .scissor = .{ 0, 0, EW, EH },
             .count = nverts,
-            .depth = if (block) .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 } else null,
+            .depth = if (block) .{ .va = depth.gpu, .stencil_va = if (stencil) splane.gpu else null, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 } else null,
         };
         featureGraphics(sc.kind, &g);
         if (sc.kind == .mrt) g.more[1] = .{ .va = target2.gpu, .stride = EW * 4, .format = .bgra8 };
@@ -1239,6 +1257,7 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
         d.fromDevice(target, 0, E_DEPTH_BYTES);
         d.fromDevice(target2, 0, EW * EH * 4);
         d.fromDevice(depth, 0, E_DEPTH_BYTES);
+        d.fromDevice(splane, 0, E_S_BYTES);
         var apart: u32 = 0;
         var drawn: u32 = 0;
         var want: u32 = 0;
@@ -1247,7 +1266,11 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
             const i = y * EW + x;
             const got = target.cpu[pixelAt(block, x, y)..][0..4].*;
             const at = pixelAt(true, x, y);
-            const w = if (block) std.mem.readInt(u32, depth.cpu[at..][0..4], .little) else F.m.z[i] | @as(u32, F.m.s[i]) << 24;
+            // (the depth in bits 0..23 of its word; the stencil its plane's
+            // byte, 0 with none)
+            const zw = if (block) std.mem.readInt(u32, depth.cpu[at..][0..4], .little) & 0xff_ffff else F.m.z[i];
+            const sv: u32 = if (stencil) splane.cpu[model3d.blAddress8(E_S_PITCH, E_GOBS, @intCast(x), @intCast(y))] else F.m.s[i];
+            const w = zw | sv << 24;
             const mc = F.m.color[i];
             drawn += @intFromBool(!std.mem.allEqual(u8, &got, 0));
             want += @intFromBool(!std.mem.allEqual(u8, &mc, 0));

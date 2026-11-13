@@ -1824,7 +1824,7 @@ const PcAll = struct {
     var pcode: [16 * 1024]u8 align(16) = undefined;
 };
 
-test "draw: the pc-all stream (a depth target beside a pitch colour target) is refused by the adapter before it is sent, and by the emulated engine (RT_LINEAR_WITH_ZETA); block linear is drawn" {
+test "draw: the pc-all and pc-full2 streams (depth beside a pitch colour target; a combined depth-stencil format) are refused by the adapter before they are sent, and by the emulated engine; block linear with X8Z24 is drawn" {
     const nv = @import("nvidia");
     const nd = gpu.nvidia_draw;
     const gl = gpu.nvidia_gl;
@@ -1892,11 +1892,62 @@ test "draw: the pc-all stream (a depth target beside a pitch colour target) is r
     });
     try p.check();
     const raw = Lossy.inner;
-    const pb = try raw.alloc(p.len * 4);
+    const pb = try raw.alloc(nv.gl3d.MAX_DWORDS * 4);
     defer raw.free(pb);
     @memcpy(pb.words()[0..p.len], p.words());
     try std.testing.expect(std.meta.isError(raw.run(pb, @intCast(p.len), nd.STEP_US)));
     try std.testing.expect(std.mem.startsWith(u8, Rtx3d.engine3d.why, "RT_LINEAR_WITH_ZETA"));
+    // (pc-full2's stream: block-linear colour, but the combined Z24S8 depth
+    // format pc-all and pc-full2 sent: refused as the RTX refused it, class
+    // error 0x13 at the draw; X8Z24 in its place is drawn)
+    // (a whole-target quad in clip space, the bindings' constant buffer
+    // as the adapter lays it out: so the programs run and pixels reach the
+    // depth target)
+    const whole = [6][4]f32{ .{ -1, -1, 0, 1 }, .{ 1, -1, 0, 1 }, .{ 1, 1, 0, 1 }, .{ -1, -1, 0, 1 }, .{ 1, 1, 0, 1 }, .{ -1, 1, 0, 1 } };
+    @memcpy(vb.cpu[0 .. 6 * 16], std.mem.sliceAsBytes(&whole));
+    d.toDevice(vb, 0, 6 * 16);
+    const cbb = try raw.alloc(nv.qmd.CBUF0_MAX_BYTES);
+    defer raw.free(cbb);
+    var params: [16]u8 = undefined;
+    std.mem.writeInt(u64, params[0..8], vb.gpu, .little);
+    std.mem.writeInt(u64, params[8..16], vb.gpu, .little);
+    _ = try nv.qmd.cbuf0Into(@alignCast(std.mem.bytesAsSlice(u32, cbb.cpu[0..nv.qmd.CBUF0_MAX_BYTES])), .{ 1, 1, 1 }, .{ 1, 1, 1 }, &params);
+    raw.toDevice(cbb, 0, nv.qmd.CBUF0_MAX_BYTES);
+    var dr = nv.gl3d.Draw{
+        .vertex = .{ .va = vp.code.gpu, .registers = 16, .bytes = vbin.code.len },
+        .pixel = .{ .va = pp.code.gpu, .registers = 16, .bytes = pbin.code.len },
+        .cb_va = cbb.va,
+        .cb_bytes = nv.qmd.cbuf0Bytes(16),
+        .zero_va = target.gpu,
+        .target = .{ .va = target.gpu, .width = nd.EW, .height = nd.EH, .pitch = nd.E_PITCH },
+        .format = .rgba8,
+        .color_gobs = nd.E_GOBS,
+        .scale = .{ nd.EW / 2, nd.EH / 2, 0.5 },
+        .offset = .{ nd.EW / 2, nd.EH / 2, 0.5 },
+        .scissor = .{ 0, 0, nd.EW, nd.EH },
+        .count = 6,
+        .depth = .{ .va = depth.gpu, .width = nd.EW, .height = nd.EH, .gobs_log2 = nd.E_GOBS, .tested = true, .write = true },
+    };
+    for ([_]u32{ nv.gl3d.ZT_Z24S8, nv.gl3d.ZT_S8Z24, nv.gl3d.ZT_X8Z24 }) |fmt| {
+        p = nv.push.Push{ .buf = &buf };
+        nv.gl3d.emit(&p, &dr);
+        try p.check();
+        const zt = std.mem.indexOfScalar(u32, p.words(), nv.push.header(nv.draw.SUBCH, nv.gl3d.SET_ZT_A, 5)).?;
+        try std.testing.expectEqual(nv.gl3d.ZT_X8Z24, p.buf[zt + 3]);
+        p.buf[zt + 3] = fmt;
+        @memcpy(pb.words()[0..p.len], p.words());
+        const ran = raw.run(pb, @intCast(p.len), nd.STEP_US);
+        if (fmt == nv.gl3d.ZT_X8Z24) {
+            ran catch |e| {
+                std.debug.print("X8Z24 raw: {s}: {s}\n", .{ @errorName(e), Rtx3d.engine3d.why });
+                return e;
+            };
+        } else {
+            if (std.mem.indexOf(u8, Rtx3d.engine3d.why, "stencil shares its words") == null) std.debug.print("format {x}: the engine: {s}\n", .{ fmt, Rtx3d.engine3d.why });
+            try std.testing.expect(std.meta.isError(ran));
+            try std.testing.expect(std.mem.indexOf(u8, Rtx3d.engine3d.why, "stencil shares its words") != null);
+        }
+    }
 }
 
 // ── What the 3D engine draws beyond the scene, each against the CPU ───────

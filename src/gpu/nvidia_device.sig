@@ -545,6 +545,7 @@ pub const Adapter = struct {
             .front_ccw = g.front_ccw,
             .depth = if (g.depth) |z| .{
                 .va = z.va,
+                .stencil_va = z.stencil_va,
                 .width = z.width,
                 .height = z.height,
                 .gobs_log2 = z.gobs_log2,
