@@ -376,7 +376,10 @@ pub const Graphics = struct {
         tested: bool,
         write: bool,
         func: u3 = 1,
+        /// the front faces' stencil (both faces' unless `back_stencil`)
         stencil: ?Stencil = null,
+        /// the back faces' (two-sided stencil); null: the front's
+        back_stencil: ?Stencil = null,
     };
     pub const Topology = enum(u8) { triangles, strip, fan };
 };

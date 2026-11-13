@@ -46,6 +46,8 @@ pub const EXTRA_OUTPUTS = 7;
 pub const POSITION = sph.ATTR_POSITION;
 pub const VERTEX_ID = sph.ATTR_VERTEX_ID;
 pub const INSTANCE_ID = sph.ATTR_INSTANCE_ID;
+/// A pixel's facing (load it flat: non-zero for a front face).
+pub const FRONT_FACE = sph.ATTR_FRONT_FACE;
 pub fn generic(n: u32, c: u32) u32 {
     return sph.generic(n, c);
 }

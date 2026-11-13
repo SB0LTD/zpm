@@ -101,6 +101,13 @@ pub const SET_ZT_SIZE_A: u32 = 0x1228; // width, height, third dimension
 /// DEPTH24_STENCIL8 as the engine keeps it; Mesa's Z24_UNORM_S8_UINT).
 pub const ZT_S8Z24: u32 = 0x14;
 pub const SET_STENCIL_OP_FAIL: u32 = 0x1384; // fail, zfail, zpass, func, ref, func mask, write mask
+/// The back faces' stencil (cl9097.h): on with SET_TWO_SIDED_STENCIL_TEST
+/// (NVK keeps it on always), else the front's state is both faces'.
+pub const SET_TWO_SIDED_STENCIL_TEST: u32 = 0x1594;
+pub const SET_BACK_STENCIL_OP_FAIL: u32 = 0x1598; // fail, zfail, zpass, func
+pub const SET_BACK_STENCIL_FUNC_REF: u32 = 0x0f54;
+pub const SET_BACK_STENCIL_MASK: u32 = 0x0f58; // the write mask
+pub const SET_BACK_STENCIL_FUNC_MASK: u32 = 0x0f5c;
 
 /// GL's stencil operations, as the engine takes them (the GL enums).
 pub const StencilOp = enum(u32) { keep = 0x1e00, zero = 0, replace = 0x1e01, incr = 0x1e02, decr = 0x1e03, invert = 0x150a, incr_wrap = 0x8507, decr_wrap = 0x8508 };
@@ -127,8 +134,11 @@ pub const Depth = struct {
     write: bool,
     /// NEVER 0 .. ALWAYS 7 (the OGL value is 0x200 + it)
     func: u3 = 1,
-    /// one for both faces (two-sided stencil is not sent)
+    /// the front faces' stencil (with `stencil` set, both faces' unless
+    /// `back` is)
     stencil: ?Stencil = null,
+    /// the back faces' (two-sided stencil), null: the front's
+    back: ?Stencil = null,
 };
 
 /// A program as the engine is told of it: its header's address, its
@@ -225,6 +235,12 @@ pub fn emit(p: *Push, d: *const Draw) void {
         if (z.stencil) |s| {
             one(p, gr.SET_STENCIL_TEST, 1);
             many(p, SET_STENCIL_OP_FAIL, &.{ @intFromEnum(s.fail), @intFromEnum(s.zfail), @intFromEnum(s.zpass), 0x200 + @as(u32, s.func), s.reference, s.value_mask, s.write_mask });
+            // the back faces' (the front's again when one-sided), as NVK
+            // sends them with two-sided stencil on
+            const b = z.back orelse s;
+            one(p, SET_TWO_SIDED_STENCIL_TEST, 1);
+            many(p, SET_BACK_STENCIL_OP_FAIL, &.{ @intFromEnum(b.fail), @intFromEnum(b.zfail), @intFromEnum(b.zpass), 0x200 + @as(u32, b.func) });
+            many(p, SET_BACK_STENCIL_FUNC_REF, &.{ b.reference, b.write_mask, b.value_mask });
         }
     }
     one(p, gr.SET_PRIMITIVE_TOPOLOGY, @intFromEnum(d.topology));

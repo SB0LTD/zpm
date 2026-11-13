@@ -252,6 +252,9 @@ pub const Stage = struct {
     /// clears the bits first; a word no thread stored is left as it was.
     out: [][ATTR_WORDS]u32 = &.{},
     stored: [][ATTR_WORDS / 32]u32 = &.{},
+    /// A pixel program's facing, a thread each (IPA.CONSTANT a[0x3fc]: all
+    /// ones for a front face, 0 for a back one). Empty: the word traps.
+    front: []const bool = &.{},
     /// A pixel program's threads that executed KILL: their colour is not
     /// to be written. stageRun clears them first. (The thread itself runs
     /// on to its EXIT, as the hardware's does: see `stageLane`.)
@@ -1539,7 +1542,9 @@ fn attrFits(offset: u32, words: u32) bool {
 ///   word is carried. Not run: .STATE (NAK never emits it; what it reads
 ///   is not known), .CENTROID and .OFFSET (a Stage has the centre's words
 ///   only), a predicate result (NAK: "what is this for?"), an address past
-///   0x2fc (the front face at 0x3fc, the barycentrics).
+///   0x2fc (the barycentrics) but the facing's: IPA.CONSTANT a[0x3fc]
+///   reads the Stage's `front` (all ones for a front face, 0 for a back
+///   one: NAK takes it as non-zero), with no header bit for it.
 /// - PIXLD: a pixel's samples. Not run in any form: a Stage says nothing
 ///   of a pixel's samples.
 /// - KILL: the pixel discarded, where the guard says. Not run: KILL with
@@ -1592,7 +1597,7 @@ fn stageOp(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Erro
         op.sub = if (in.has("PASS")) 0 else if (in.has("CONSTANT")) 1 else if (in.has("STATE")) 2 else return error.BadInstruction;
         if (op.sub == 2) op.refuse = .form;
         if (offset or in.has("CENTROID")) op.refuse = .no_data;
-        if (a.offset / 4 >= ATTR_WORDS) op.refuse = .address;
+        if (a.offset / 4 >= ATTR_WORDS and a.offset != sph.ATTR_FRONT_FACE) op.refuse = .address;
         return;
     }
     const load_ = eql(name, "ALD");
@@ -2272,6 +2277,13 @@ fn stageLane(c: *Ctx, wi: u32, t: u32, op: *const Op) Error!void {
             }
         },
         .ipa => {
+            // (the facing: flat, as NAK reads it; no header bit for it)
+            if (first == sph.ATTR_FRONT_FACE / 4) {
+                if (op.sub != 1) return mismatch(c, t, .interpolation, first);
+                if (t >= s.front.len) return refuse(c, c.pc, t, .unsupported, .no_data, sph.ATTR_FRONT_FACE);
+                put(c, wi, t, op.d[0], if (s.front[t]) 0xffff_ffff else 0);
+                return;
+            }
             if (s.header) |h| switch (pixelReads(h, first)) {
                 .none => return mismatch(c, t, .load_undeclared, first),
                 .word => {},
@@ -4232,6 +4244,23 @@ test "a stage refuses a load its header does not declare" {
     _ = try runStage(&S.vertex(&header, 1), 1);
 }
 
+test "a pixel program's facing: IPA.CONSTANT a[0x3fc], all ones for a front face, 0 for a back one; read carried, refused" {
+    const S = StageTest;
+    for (0..2) |t| S.in[t] = @splat(0);
+    const fronts = [_]bool{ true, false };
+    var ps = S.pixel(null, 2);
+    ps.front = &fronts;
+    try loadText(&test_work, "IPA.CONSTANT R0, a[0x3fc]\nEXIT");
+    _ = try runStage(&ps, 2);
+    try testing.expectEqual(@as(u32, 0xffff_ffff), threadReg(&test_work, 0, 0));
+    try testing.expectEqual(@as(u32, 0), threadReg(&test_work, 1, 0));
+    // (under a header: still no bit of it needed)
+    const header = sph.pixel(.{ .targets = @splat(0) });
+    ps.header = &header;
+    _ = try runStage(&ps, 2);
+    try expectRefused("IPA.PASS R0, a[0x3fc]\nEXIT", &ps, error.HeaderMismatch, .interpolation);
+}
+
 test "a stage refuses a store its header does not declare, and an end without one it declares" {
     const S = StageTest;
     for (0..4) |t| S.in[t] = @splat(0);
@@ -4389,7 +4418,8 @@ test "a texture instruction without its callback, and the forms that are not run
         .{ "IPA.PASS R0, P1, a[0x80]", &pixel, .form },
         .{ "IPA.PASS.CENTROID R0, a[0x80]", &pixel, .no_data },
         .{ "IPA.PASS.OFFSET R0, a[0x80], R9", &pixel, .no_data },
-        .{ "IPA.CONSTANT R6, a[0x3fc]", &pixel, .address },
+        .{ "IPA.CONSTANT R6, a[0x3fc]", &pixel, .no_data },
+        .{ "IPA.CONSTANT R6, a[0x3f8]", &pixel, .address },
         .{ "PIXLD R0", &pixel, .no_data },
         .{ "PIXLD.COVMASK R0", &pixel, .no_data },
         .{ "PIXLD.MY_INDEX R0, P0", &pixel, .no_data },

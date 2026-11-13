@@ -90,8 +90,7 @@ const Clip = struct { x0: i64, y0: i64, x1: i64, y1: i64 };
 
 /// The depth-stencil target as gl3d sends it: S8Z24, block linear.
 const ZT = struct { bytes: []u8, pitch: u32, width: u32, height: u32, gobs: u3 };
-/// SET_STENCIL_TWO_SIDE_ENABLE (cl9097.h): never sent; refused if on.
-const STENCIL_TWO_SIDE: u32 = 0x1594;
+const STENCIL_TWO_SIDE = gl3d.SET_TWO_SIDED_STENCIL_TEST;
 
 /// A texture as its header and its sampler describe it.
 const Tex = struct {
@@ -126,8 +125,9 @@ pub const Engine = struct {
     pin: [emu.MAX_THREADS][emu.ATTR_WORDS]u32 = undefined,
     killed: [emu.MAX_THREADS]bool = undefined,
     /// Each queued pixel's window depth, and whether its triangle faces
-    /// front (for the stencil's two faces: one state for both here).
+    /// front (the pixel program's facing, the stencil's two faces).
     zw: [emu.MAX_THREADS]f32 = undefined,
+    front: [emu.MAX_THREADS]bool = undefined,
     /// A queued pixel the triangle does not cover: run (a quad's helper,
     /// for its neighbours' derivatives), never written.
     helper: [emu.MAX_THREADS]bool = undefined,
@@ -206,7 +206,7 @@ pub const Engine = struct {
         try g.need(g.reg(gr.SET_CT_SELECT) & 0x7f == 1 and g.reg(gr.SET_CT_MRT_ENABLE) == 1, "not one color target in slot 0 (SET_CT_SELECT, SET_CT_MRT_ENABLE)");
         try g.need(g.reg(gr.SET_ZT_SELECT) <= 1 and g.reg(gr.SET_DEPTH_BOUNDS_TEST) == 0, "more than one depth target, or a depth bounds test: not modelled");
         try g.need(g.reg(gr.SET_ZT_SELECT) == 1 or (g.reg(gr.SET_DEPTH_TEST) == 0 and g.reg(gr.SET_STENCIL_TEST) == 0), "a depth or stencil test with no depth target (SET_ZT_SELECT)");
-        try g.need(g.reg(STENCIL_TWO_SIDE) == 0, "two-sided stencil: not modelled");
+        try g.need(g.reg(STENCIL_TWO_SIDE) <= 1, "SET_TWO_SIDED_STENCIL_TEST neither on nor off");
         try g.need(g.reg(gr.SET_RASTER_ENABLE) == 1, "the rasterizer is off (SET_RASTER_ENABLE)");
         try g.need(g.reg(gr.SET_ANTI_ALIAS) == 0 and g.reg(gr.SET_ANTI_ALIAS_SAMPLE_POSITIONS) == 0x8888_8888, "more than one sample, or a sample not at the pixel's centre");
         try g.need(g.reg(gr.SET_VIEWPORT_PIXEL) == 0 and g.reg(gr.SET_WINDOW_ORIGIN) == 0, "pixel centres not at halves, or the origin not the top left");
@@ -547,6 +547,8 @@ pub const Engine = struct {
         var area = edge(win[tri[0]], win[tri[1]], win[tri[2]]);
         if (area == 0) return;
         if (g.culled(area)) return;
+        // (front: wound as OGL_SET_FRONT_FACE says, as culling has it)
+        const front = (area > 0) == (g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW);
         if (area < 0) {
             std.mem.swap(usize, &tri[1], &tri[2]);
             area = -area;
@@ -589,7 +591,7 @@ pub const Engine = struct {
                     const py = qy + @as(i64, @intCast(l >> 1));
                     // (a helper outside the target is never written: its
                     // place is kept in range)
-                    g.carry(tri, flat, bary[l], zpx[l], @intCast(@max(px, 0)), @intCast(@max(py, 0)), !cov[l]);
+                    g.carry(tri, flat, bary[l], zpx[l], @intCast(@max(px, 0)), @intCast(@max(py, 0)), !cov[l], front);
                 }
                 if (g.queued == emu.MAX_THREADS) try g.shade(t, cb, stats);
             }
@@ -631,7 +633,7 @@ pub const Engine = struct {
     /// A pixel queued (a helper: not covered, run for its quad, never
     /// written): the attribute words its thread will read, carried across
     /// the triangle as the pixel program's header says.
-    fn carry(g: *Engine, tri: [3]usize, flat: usize, bary: [3]f64, zpix: f32, px: u32, py: u32, helper: bool) void {
+    fn carry(g: *Engine, tri: [3]usize, flat: usize, bary: [3]f64, zpix: f32, px: u32, py: u32, helper: bool, front: bool) void {
         const n = g.queued;
         const in = &g.pin[n];
         in.* = @splat(0xdead_beef);
@@ -665,6 +667,7 @@ pub const Engine = struct {
         }
         g.at[n] = .{ px, py };
         g.helper[n] = helper;
+        g.front[n] = front;
         g.queued = n + 1;
     }
 
@@ -673,7 +676,7 @@ pub const Engine = struct {
         const n = g.queued;
         g.queued = 0;
         if (n == 0) return;
-        var ps = emu.Stage{ .kind = .pixel, .header = &g.phead, .in = g.pin[0..n], .killed = g.killed[0..n], .cbufs = cb, .ctx = g, .sample = &sampleCall };
+        var ps = emu.Stage{ .kind = .pixel, .header = &g.phead, .in = g.pin[0..n], .front = g.front[0..n], .killed = g.killed[0..n], .cbufs = cb, .ctx = g, .sample = &sampleCall };
         try emu.stageBegin(g.host.work, n);
         try emu.stageRun(g.host.work, &g.host.mem, &ps, n, stats);
         var bl: ?Blend = null;
@@ -703,7 +706,7 @@ pub const Engine = struct {
             // a later primitive's pixel tests against an earlier one's)
             if (zt) |z| {
                 const zw: f32 = if (writes_depth) shaderDepth(@bitCast(emu.threadReg(g.host.work, @intCast(k), @intCast(4 * targets + 1)))) else g.zw[k];
-                if (!g.depthStencil(z, g.at[k][0], g.at[k][1], zw)) continue;
+                if (!g.depthStencil(z, g.at[k][0], g.at[k][1], zw, g.front[k])) continue;
             }
             var color: [4]f32 = undefined;
             for (&color, 0..) |*ch, r| ch.* = @bitCast(emu.threadReg(g.host.work, @intCast(k), @intCast(r)));
@@ -714,9 +717,10 @@ pub const Engine = struct {
 
     /// The depth and stencil tests of a pixel at (x, y) with window depth
     /// `zw` (clamped to 0..1, as the viewport's z clip holds it), the
-    /// target's word updated as the state says; whether the colour is
-    /// written.
-    fn depthStencil(g: *Engine, z: ZT, x: u32, y: u32, zw: f32) bool {
+    /// target's word updated as the state says (a back face's stencil by
+    /// the back state when SET_TWO_SIDED_STENCIL_TEST is on); whether the
+    /// colour is written.
+    fn depthStencil(g: *Engine, z: ZT, x: u32, y: u32, zw: f32, front: bool) bool {
         if (x >= z.width or y >= z.height) return false;
         const at = blAddress(z.pitch, z.gobs, x * 4, y);
         const w = std.mem.readInt(u32, z.bytes[at..][0..4], .little);
@@ -724,21 +728,25 @@ pub const Engine = struct {
         const old_z = w & 0xff_ffff;
         var stencil: u32 = w >> 24;
         const st_on = g.reg(gr.SET_STENCIL_TEST) & 1 != 0;
+        const back = !front and g.reg(STENCIL_TWO_SIDE) & 1 != 0;
+        // (each face's: the ops and the func, the reference, the value
+        // mask, the write mask)
         const s = gl3d.SET_STENCIL_OP_FAIL;
+        const b = gl3d.SET_BACK_STENCIL_OP_FAIL;
+        const ops = if (back) [4]u32{ g.reg(b), g.reg(b + 4), g.reg(b + 8), g.reg(b + 12) } else [4]u32{ g.reg(s), g.reg(s + 4), g.reg(s + 8), g.reg(s + 12) };
+        const ref = (if (back) g.reg(gl3d.SET_BACK_STENCIL_FUNC_REF) else g.reg(s + 16)) & 0xff;
+        const vm = (if (back) g.reg(gl3d.SET_BACK_STENCIL_FUNC_MASK) else g.reg(s + 20)) & 0xff;
+        const wm = (if (back) g.reg(gl3d.SET_BACK_STENCIL_MASK) else g.reg(s + 24)) & 0xff;
         // (the stencil test: reference against the value, both masked)
         var s_pass = true;
-        if (st_on) {
-            const vm = g.reg(s + 20) & 0xff;
-            s_pass = funcPasses(g.reg(s + 12), g.reg(s + 16) & vm, stencil & vm);
-        }
+        if (st_on) s_pass = funcPasses(ops[3], ref & vm, stencil & vm);
         const d_on = g.reg(gr.SET_DEPTH_TEST) & 1 != 0;
         const d_pass = !d_on or funcPasses(g.reg(gr.SET_DEPTH_FUNC), zq, old_z);
         var new_z = old_z;
         if (s_pass and d_pass and d_on and g.reg(gr.SET_DEPTH_WRITE) & 1 != 0) new_z = zq;
         if (st_on) {
-            const op = g.reg(s + if (!s_pass) @as(u32, 0) else if (!d_pass) @as(u32, 4) else @as(u32, 8));
-            const wm = g.reg(s + 24) & 0xff;
-            const v = stencilOp(op, stencil, g.reg(s + 16) & 0xff);
+            const op = ops[if (!s_pass) 0 else if (!d_pass) 1 else 2];
+            const v = stencilOp(op, stencil, ref);
             stencil = (v & wm) | (stencil & ~wm & 0xff);
         }
         std.mem.writeInt(u32, z.bytes[at..][0..4], (stencil << 24) | new_z, .little);

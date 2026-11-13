@@ -1710,17 +1710,23 @@ const Feat = struct {
         const y = k.op2(.fmul, .f32, r(io.frag_coord[1]), kir.f(1.0 / 128.0));
         io.depth = k.op2(.fadd, .f32, r(x), r(y));
     }
+
+    /// gl_FrontFacing: red for a front face, green for a back one.
+    fn facing(_: ?*const anyopaque, k: *kir.Kernel, io: *raster.FragmentIO) void {
+        io.color = .{ k.sel(.f32, r(io.front_facing), kir.f(1), kir.f(0)), k.sel(.f32, r(io.front_facing), kir.f(0), kir.f(1)), k.mov(.f32, kir.f(0)), k.mov(.f32, kir.f(1)) };
+    }
 };
 
 var frag_depth_pipe = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .frag_depth = true, .vertex = Uniform.vertex, .fragment = Feat.fragDepth });
+var facing_pipe = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .front_facing = true, .vertex = Uniform.vertex, .fragment = Feat.facing });
 /// (solid's own copy: a pipeline keeps the programs it was loaded with on
 /// the engine that drew it last, and the tests before re-make that engine)
 var feat_solid = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .vertex = Uniform.vertex, .fragment = Uniform.fragment });
-const feat_pipes = [_]*raster.Pipeline{ &frag_depth_pipe, &feat_solid };
+const feat_pipes = [_]*raster.Pipeline{ &frag_depth_pipe, &feat_solid, &facing_pipe };
 
 /// The features, a scene each.
-const Feature = enum { frag_depth };
-const all_features = [_]Feature{.frag_depth};
+const Feature = enum { frag_depth, front_facing, two_sided_stencil };
+const all_features = [_]Feature{ .frag_depth, .front_facing, .two_sided_stencil };
 
 fn rgba(c: [4]f32) [4]u32 {
     return .{ @bitCast(c[0]), @bitCast(c[1]), @bitCast(c[2]), @bitCast(c[3]) };
@@ -1771,6 +1777,37 @@ fn featureScene(e: *engine.Engine, f: Feature, img: *engine.Image, depth: *engin
             const blue = rgba(.{ 0, 0, 1, 0 });
             try featDraw(e, .{ .pipe = &frag_depth_pipe, .color = img, .depth = depth, .depth_test = true, .depth_func = 0b010, .uniforms = &blue, .blend = blue_add }, ab, &q);
         },
+        // gl_FrontFacing: a counter-clockwise triangle and a clockwise one
+        // sharing an off-grid edge; then front faces clockwise
+        .front_facing => {
+            const pts = [_][3]f32{ .{ 2.3, 1.7, 0 }, .{ 30.61, 3.2, 0 }, .{ 9.9, 30.4, 0 }, .{ 30.61, 3.2, 0 }, .{ 9.9, 30.4, 0 }, .{ 61.2, 29.05, 0 } };
+            try featDraw(e, .{ .pipe = &facing_pipe, .color = img }, ab, &pts);
+            const lower = [_][3]f32{ .{ 33, 1, 0 }, .{ 62, 1, 0 }, .{ 62, 12, 0 }, .{ 33, 1, 0 }, .{ 33, 12, 0 }, .{ 62, 12, 0 } };
+            try featDraw(e, .{ .pipe = &facing_pipe, .color = img, .front_ccw = false }, ab, &lower);
+        },
+        // two-sided stencil: the whole target (front: INCR_WRAP), a
+        // clockwise triangle over it (back: EQUAL 1 under 0x0f, INVERT
+        // written under 0xf0) in the same draw; then each stencil value
+        // made a colour (EQUAL against 1, 0xf1 and 0xf0... drawn in turn)
+        .two_sided_stencil => {
+            const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+            const quarter = rgba(.{ 0.25, 0, 0, 0 });
+            const front = raster.Stencil{ .func = 7, .pass = .incr_wrap };
+            const back = raster.Stencil{ .func = 2, .reference = 1, .value_mask = 0x0f, .write_mask = 0xf0, .pass = .invert };
+            var pts: [9][3]f32 = undefined;
+            const q = fullQuad(0);
+            @memcpy(pts[0..6], &q);
+            pts[6] = .{ 6.4, 4.1, 0 };
+            pts[7] = .{ 27.3, 29.6, 0 };
+            pts[8] = .{ 57.75, 2.5, 0 };
+            try featDraw(e, .{ .pipe = &feat_solid, .color = img, .depth = depth, .stencil = depth, .stencil_front = front, .stencil_back = back, .uniforms = &quarter, .blend = add }, ab, &pts);
+            const looks = [_]struct { u8, [4]f32 }{ .{ 0x01, .{ 0, 0.5, 0, 0 } }, .{ 0xf1, .{ 0, 0, 0.5, 0 } } };
+            for (looks) |lk| {
+                const col = rgba(lk[1]);
+                const eq = raster.Stencil{ .func = 2, .reference = lk[0] };
+                try featDraw(e, .{ .pipe = &feat_solid, .color = img, .depth = depth, .stencil = depth, .stencil_front = eq, .stencil_back = eq, .uniforms = &col, .blend = add }, ab, &q);
+            }
+        },
     }
     e.read(img, 0, 0, W, H, out, W * 4, .rgba8);
     return e.stats.graphics_draws - before;
@@ -1779,7 +1816,7 @@ fn featureScene(e: *engine.Engine, f: Feature, img: *engine.Image, depth: *engin
 var fpool_mem: [8 << 20]u8 align(64) = undefined;
 var eng_fcpu: engine.Engine = undefined;
 
-test "draw: features through the emulated RTX's 3D engine (gl_FragDepth): every draw on the engine, the CPU's bytes" {
+test "draw: features through the emulated RTX's 3D engine (gl_FragDepth, gl_FrontFacing, two-sided stencil): every draw on the engine, the CPU's bytes" {
     Rtx3d.engine3d = .{};
     eng_fcpu.init(.{ .pool = &fpool_mem, .cpu_work = &cpu_work });
     defer eng_fcpu.deinit();

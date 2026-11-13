@@ -36,6 +36,11 @@ pub const ATTR_POSITION: u32 = 0x70;
 pub const ATTR_GENERIC: u32 = 0x80;
 pub const ATTR_INSTANCE_ID: u32 = 0x2f8;
 pub const ATTR_VERTEX_ID: u32 = 0x2fc;
+/// A pixel's facing (IPA.CONSTANT: non-zero for a front face). No bit of
+/// the header names it: NAK marks nothing for it (FragmentIoInfo's
+/// mark_attr_read leaves 0x300 on but 0x3a0..0x3bf alone), nouveau's
+/// header leaves its FACE out.
+pub const ATTR_FRONT_FACE: u32 = 0x3fc;
 pub const GENERICS = 32;
 
 /// A generic component's address.

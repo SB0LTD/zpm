@@ -751,11 +751,15 @@ fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res:
 // apart and how.
 
 pub const FEATURE_SCENES = feature_scenes.len;
-const FeatureKind = enum { frag_depth };
+const FeatureKind = enum { frag_depth, front_facing, two_sided_stencil };
 const FeatureScene = struct { name: []const u8, kind: FeatureKind };
 const feature_scenes = [_]FeatureScene{
     .{ .name = "gl_FragDepth (x / 64 + y / 128 written, depth LESS over 1)", .kind = .frag_depth },
+    .{ .name = "gl_FrontFacing (red front, green back; off-grid corners)", .kind = .front_facing },
+    .{ .name = "two-sided stencil (front INCR_WRAP; back INVERT, EQUAL 1 under 0x0f, written 0xf0)", .kind = .two_sided_stencil },
 };
+/// The most vertices a scene draws.
+const FEATURE_VERTS = 9;
 
 /// What the model gives a scene: each pixel's colour (RGBA bytes), depth
 /// word and stencil.
@@ -767,16 +771,98 @@ const FeatureModel = struct {
 
 const F = struct {
     var m: FeatureModel = .{};
-    var verts: [6][4]f32 = undefined;
+    var verts: [FEATURE_VERTS][4]f32 = undefined;
 };
 
-/// The whole target as two triangles (clip space, z 0), counter-clockwise
-/// as its rows count.
-fn featureVerts() [6][4]f32 {
-    const c = [4][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 } };
-    var v: [6][4]f32 = undefined;
-    for ([_]usize{ 0, 1, 2, 0, 2, 3 }, 0..) |k, n| v[n] = .{ c[k][0], c[k][1], 0, 1 };
-    return v;
+/// A point in pixels (x right, y the rows) as clip space, z 0.
+fn clipOf(x: f32, y: f32) [4]f32 {
+    return .{ 2 * x / EW - 1, 2 * y / EH - 1, 0, 1 };
+}
+
+/// A scene's triangles into `v`; how many vertices. The whole target is
+/// two triangles counter-clockwise as its rows count (front faces).
+fn featureVerts(kind: FeatureKind, v: *[FEATURE_VERTS][4]f32) u32 {
+    const whole = [_][2]f32{ .{ 0, 0 }, .{ EW, 0 }, .{ EW, EH }, .{ 0, 0 }, .{ EW, EH }, .{ 0, EH } };
+    switch (kind) {
+        .frag_depth => {
+            for (whole, 0..) |p, n| v[n] = clipOf(p[0], p[1]);
+            return 6;
+        },
+        // a front face (counter-clockwise) on the left, a back face
+        // (clockwise) on the right, sharing an off-grid edge
+        .front_facing => {
+            const pts = [_][2]f32{ .{ 2.3, 1.7 }, .{ 40.61, 3.2 }, .{ 9.9, 30.4 }, .{ 40.61, 3.2 }, .{ 9.9, 30.4 }, .{ 61.2, 29.05 } };
+            for (pts, 0..) |p, n| v[n] = clipOf(p[0], p[1]);
+            return 6;
+        },
+        // the whole target (front), then a back face over part of it
+        .two_sided_stencil => {
+            for (whole, 0..) |p, n| v[n] = clipOf(p[0], p[1]);
+            const back = [_][2]f32{ .{ 6.4, 4.1 }, .{ 27.3, 29.6 }, .{ 57.75, 2.5 } };
+            for (back, 0..) |p, n| v[6 + n] = clipOf(p[0], p[1]);
+            return 9;
+        },
+    }
+}
+
+/// Triangle t of `v` in the model's window (the viewport over the whole
+/// target, rows down): its grid places, and whether it faces front
+/// (counter-clockwise, OGL_SET_FRONT_FACE CCW) and covers anything.
+const ModelTri = struct {
+    win: [3][2]i64,
+    front: bool,
+    area: i64,
+
+    fn of(v: []const [4]f32, t: usize) ModelTri {
+        const vp = [4]f32{ EW / 2, EH / 2, EW / 2, EH / 2 };
+        var m: ModelTri = undefined;
+        for (0..3) |k| m.win[k] = model3d.windowOf(v[3 * t + k][0], v[3 * t + k][1], v[3 * t + k][3], vp);
+        m.area = model3d.edge(m.win[0], m.win[1], m.win[2]);
+        m.front = m.area > 0;
+        if (m.area < 0) std.mem.swap([2]i64, &m.win[1], &m.win[2]);
+        return m;
+    }
+
+    /// Whether pixel (x, y)'s centre is covered (the top-left rule).
+    fn covers(m: ModelTri, x: usize, y: usize) bool {
+        if (m.area == 0) return false;
+        const p = [2]i64{ @as(i64, @intCast(x)) * 256 + 128, @as(i64, @intCast(y)) * 256 + 128 };
+        const a = m.win[0];
+        const b = m.win[1];
+        const c = m.win[2];
+        return model3d.inside(model3d.edge(b, c, p), b, c) and model3d.inside(model3d.edge(c, a, p), c, a) and model3d.inside(model3d.edge(a, b, p), a, b);
+    }
+};
+
+/// The two-sided stencil scene's state: front faces, back faces.
+const stencil_front = gpu.Graphics.Stencil{ .func = 7, .zpass = .incr_wrap };
+const stencil_back = gpu.Graphics.Stencil{ .func = 2, .reference = 0x01, .value_mask = 0x0f, .write_mask = 0xf0, .zpass = .invert };
+
+/// GL's stencil operation on `v` (gpu.Graphics' op), reference `ref`.
+fn stencilOpOf(op: gpu.Graphics.StencilOp, v: u8, ref: u8) u8 {
+    return switch (op) {
+        .keep => v,
+        .zero => 0,
+        .replace => ref,
+        .incr => v +| 1,
+        .decr => v -| 1,
+        .invert => ~v,
+        .incr_wrap => v +% 1,
+        .decr_wrap => v -% 1,
+    };
+}
+
+/// Whether one face's stencil test passes on `s`.
+fn stencilPasses(st: gpu.Graphics.Stencil, s: u8) bool {
+    const a = st.reference & st.value_mask;
+    const b = s & st.value_mask;
+    return (a < b and st.func & 1 != 0) or (a == b and st.func & 2 != 0) or (a > b and st.func & 4 != 0);
+}
+
+/// One face's stencil test and update of `s` (depth ALWAYS: it passes).
+fn stencilStep(st: gpu.Graphics.Stencil, s: u8) u8 {
+    const v = stencilOpOf(if (stencilPasses(st, s)) st.zpass else st.fail, s, st.reference);
+    return (v & st.write_mask) | (s & ~st.write_mask);
 }
 
 /// gl_FragDepth's value at pixel (x, y): its centre's x / 64 + y / 128
@@ -791,8 +877,16 @@ fn featurePixel(k: *kir.Kernel, kind: FeatureKind) void {
     const io = k.binding();
     _ = k.binding();
     const color = [4]f32{ 0.25, 0, 0, 0 };
-    for (color, 0..) |x, c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(x));
+    if (kind == .front_facing) {
+        // (red front, green back: the facing word, flat, non-zero front)
+        const face = k.load(.u32, nvidia_gl.ioMem(io, nvidia_gl.FRONT_FACE, true), kir.u(0));
+        const front = k.cmp(.u32, .ne, kir.r(face), kir.u(0));
+        k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT, false), kir.u(0), kir.r(k.sel(.f32, kir.r(front), kir.f(0.25), kir.f(0))));
+        k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4, false), kir.u(0), kir.r(k.sel(.f32, kir.r(front), kir.f(0), kir.f(0.25))));
+        for (2..4) |c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(0));
+    } else for (color, 0..) |x, c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(x));
     switch (kind) {
+        .front_facing, .two_sided_stencil => {},
         .frag_depth => {
             const x = k.load(.f32, nvidia_gl.ioMem(io, nvidia_gl.POSITION, false), kir.u(0));
             const y = k.load(.f32, nvidia_gl.ioMem(io, nvidia_gl.POSITION + 4, false), kir.u(0));
@@ -815,6 +909,24 @@ fn featureModel(kind: FeatureKind, m: *FeatureModel) void {
             m.z[y * EW + x] = q;
             m.color[y * EW + x] = .{ 64, 0, 0, 0 };
         },
+        .front_facing => for (0..2) |t| {
+            const tri = ModelTri.of(&F.verts, t);
+            for (0..EH) |y| for (0..EW) |x| {
+                if (!tri.covers(x, y)) continue;
+                m.color[y * EW + x] = if (tri.front) .{ 64, 0, 0, 0 } else .{ 0, 64, 0, 0 };
+            };
+        },
+        // (red added a pass: ONE + ONE; each face's stencil in order)
+        .two_sided_stencil => for (0..3) |t| {
+            const tri = ModelTri.of(&F.verts, t);
+            for (0..EH) |y| for (0..EW) |x| {
+                if (!tri.covers(x, y)) continue;
+                const i = y * EW + x;
+                const st = if (tri.front) stencil_front else stencil_back;
+                if (stencilPasses(st, m.s[i])) m.color[i][0] +|= 64;
+                m.s[i] = stencilStep(st, m.s[i]);
+            };
+        },
     }
 }
 
@@ -825,6 +937,13 @@ fn featureGraphics(kind: FeatureKind, g: *gpu.Graphics) void {
             g.depth.?.tested = true;
             g.depth.?.write = true;
             g.depth.?.func = 1;
+        },
+        .front_facing => {},
+        .two_sided_stencil => {
+            g.depth.?.tested = true;
+            g.depth.?.stencil = stencil_front;
+            g.depth.?.back_stencil = stencil_back;
+            g.blend = .{ .src_rgb = .one, .dst_rgb = .one, .src_a = .one, .dst_a = .one };
         },
     }
 }
@@ -855,16 +974,16 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
         return;
     };
     defer d.unload(&vp);
-    const vb = d.alloc(6 * 16, .host) catch return featuresNoMemory(log, res);
+    const vb = d.alloc(FEATURE_VERTS * 16, .host) catch return featuresNoMemory(log, res);
     defer d.free(vb);
     const target = d.alloc(EW * EH * 4, .host) catch return featuresNoMemory(log, res);
     defer d.free(target);
     const depth = d.alloc(E_DEPTH_BYTES, .host) catch return featuresNoMemory(log, res);
     defer d.free(depth);
-    F.verts = featureVerts();
-    @memcpy(vb.cpu[0 .. 6 * 16], std.mem.sliceAsBytes(&F.verts));
-    d.toDevice(vb, 0, 6 * 16);
     for (feature_scenes) |sc| {
+        const nverts = featureVerts(sc.kind, &F.verts);
+        @memcpy(vb.cpu[0 .. nverts * 16], std.mem.sliceAsBytes(F.verts[0..nverts]));
+        d.toDevice(vb, 0, nverts * 16);
         var pk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "features_ps", .{ 1, 1, 1 });
         featurePixel(&pk, sc.kind);
         const pbin = blk: {
@@ -900,7 +1019,7 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
             .scale = .{ EW / 2, EH / 2, 0.5 },
             .offset = .{ EW / 2, EH / 2, 0.5 },
             .scissor = .{ 0, 0, EW, EH },
-            .count = 6,
+            .count = nverts,
             .depth = .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 },
         };
         featureGraphics(sc.kind, &g);

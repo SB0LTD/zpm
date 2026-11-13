@@ -2046,6 +2046,7 @@ pub const Engine = struct {
                 // (no depth test: every pixel passes it)
                 .func = if (d.depth_test) d.depth_func else 7,
                 .stencil = if (d.stencil != null) stencilOf(d.stencil_front) else null,
+                .back_stencil = if (d.stencil != null) stencilOf(d.stencil_back) else null,
             } else null,
             .vertex = &p.gfx[0].?,
             .va = t.buf.gpu,

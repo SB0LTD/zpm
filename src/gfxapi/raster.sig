@@ -240,8 +240,8 @@ pub const Shaders = struct {
     /// 3D engine its pixel program's depth output
     frag_depth: bool = false,
     /// the fragment code reads gl_FrontFacing (FragmentIO.front_facing):
-    /// the compute kernels give it (the 3D engine's pixel programs do not
-    /// read the facing yet)
+    /// the compute kernels' setup gives it, the 3D engine's pixel program
+    /// reads its facing word
     front_facing: bool = false,
     /// clip distances the vertex code writes (VertexIO.clip): each
     /// interpolated as a varying is, and a sample where one is below 0 is
@@ -876,7 +876,6 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     } else if (d.depth_test) return "a depth test with no depth image";
     if (d.stencil) |sten| {
         if (d.depth == null or sten != d.depth.?) return "a stencil image apart from the depth image";
-        if (!std.meta.eql(d.stencil_front, d.stencil_back)) return "two-sided stencil";
     }
     if (d.restart) return "primitive restart";
     if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
@@ -895,7 +894,6 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
 pub fn pipelineWhyNot(sh: Shaders) ?[]const u8 {
     if (sh.capture.len != 0) return "transform feedback";
     if (sh.point_size or sh.point_coord) return "points";
-    if (sh.front_facing) return "gl_FrontFacing";
     if (sh.clips != 0) return "clip distances";
     if (sh.varyings > nvidia_gl.MAX_VARYINGS) return "more varyings than 32 vectors";
     return null;
@@ -1004,6 +1002,9 @@ pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     const Y = k.sel(.f32, r(k.cmp(.u32, .ne, r(k.param(.u32, P_FLIP)), u(0))), r(yf), r(yh));
     const z = k.load(.f32, io_m.at(b.io, nvidia_gl.POSITION + 8), u(0));
     io.frag_coord = .{ X, Y, z, iw };
+    // gl_FrontFacing: the engine's facing word (flat, non-zero for a
+    // front face: OGL_SET_FRONT_FACE's, as culling's)
+    if (sh.front_facing) io.front_facing = k.cmp(.u32, .ne, r(k.load(.u32, nvidia_gl.ioMem(b.io, nvidia_gl.FRONT_FACE, true), u(0))), u(0));
     sh.fragment(sh.ctx, &k, &io);
     if (io.discard != .none) {
         k.ifp(r(io.discard));

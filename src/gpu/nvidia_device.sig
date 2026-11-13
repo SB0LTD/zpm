@@ -519,15 +519,8 @@ pub const Adapter = struct {
                 .tested = z.tested,
                 .write = z.write,
                 .func = z.func,
-                .stencil = if (z.stencil) |zs| .{
-                    .func = zs.func,
-                    .reference = zs.reference,
-                    .value_mask = zs.value_mask,
-                    .write_mask = zs.write_mask,
-                    .fail = stencilOpOf(zs.fail),
-                    .zfail = stencilOpOf(zs.zfail),
-                    .zpass = stencilOpOf(zs.zpass),
-                } else null,
+                .stencil = if (z.stencil) |zs| stencilOf(zs) else null,
+                .back = if (z.back_stencil) |zs| stencilOf(zs) else null,
             } else null,
         };
     }
@@ -676,6 +669,18 @@ fn factorOf(f: gpu.BlendFactor) gl3d.Factor {
         .one_minus_constant_color => .one_minus_constant_color,
         .constant_alpha => .constant_alpha,
         .one_minus_constant_alpha => .one_minus_constant_alpha,
+    };
+}
+
+fn stencilOf(s: gpu.Graphics.Stencil) gl3d.Stencil {
+    return .{
+        .func = s.func,
+        .reference = s.reference,
+        .value_mask = s.value_mask,
+        .write_mask = s.write_mask,
+        .fail = stencilOpOf(s.fail),
+        .zfail = stencilOpOf(s.zfail),
+        .zpass = stencilOpOf(s.zpass),
     };
 }
 
