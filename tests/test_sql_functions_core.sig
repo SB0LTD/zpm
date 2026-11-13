@@ -373,7 +373,24 @@ fn numerics() void {
     value("SELECT trim_scale(8.4100)",1700,"8.41");
     value("SELECT sin(1)",701,"0.8414709848078965");
     value("SELECT cos(0)",701,"1");
-    value("SELECT tan(1)",701,"1.5574077246549023");
+    // PostgreSQL's double-precision math can vary with the host math library.
+    // The macOS result differs from this reference by one representable value.
+    const tangent_query = "SELECT tan(1)";
+    if (run(tangent_query)) {
+        const shape = r.row_count == 1 and r.column_count == 1;
+        check(tangent_query, shape);
+        if (shape) {
+            check(tangent_query, sql.typeOid(r.column_types[0]) == 701 and r.column_typmods[0] == -1);
+            const cell = r.rows[0].cells[0];
+            if (cell == .float8) {
+                const expected: u64 = @bitCast(@as(f64, 1.5574077246549023));
+                const actual: u64 = @bitCast(cell.float8);
+                check(tangent_query, actual >= expected - 1 and actual <= expected + 1);
+            } else {
+                fail(tangent_query, "expected a float8 value", .{});
+            }
+        }
+    }
     value("SELECT cot(0.5)",701,"1.830487721712452");
     value("SELECT asin(1)",701,"1.5707963267948966");
     value("SELECT acos(1)",701,"0");
