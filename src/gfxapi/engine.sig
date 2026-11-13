@@ -1967,7 +1967,24 @@ pub const Engine = struct {
             if (bins.on and !e.runCpu(.bin, p, groups_b, &bv, bparams)) break :cpu false;
             var rv: [rbs.len][]u8 = undefined;
             for (rb, 0..) |img, j| rv[j] = img.buf.cpu;
-            if (!e.runCpuFor(.raster, p, v, kind, groups_r, rv[0..rb.len], rparams)) break :cpu false;
+            // (unbinned: the tile kernel over the primitives' boxes only,
+            // and not at all when none is drawn; raster.recordsBox)
+            var groups_c = groups_r;
+            var cp: [MAX_PARAMS]u32 = undefined;
+            var cparams = rparams;
+            if (!bins.on) {
+                const box = raster.recordsBox(d, tris.buf.cpu) orelse {
+                    for (rb, 0..) |img, j| {
+                        if (j < 2 or rw & (@as(u32, 1) << @intCast(j)) != 0) e.wrote(img, 0, img.buf.cpu.len);
+                    }
+                    break :cpu true;
+                };
+                var dc = d.*;
+                dc.rect = box;
+                cparams = raster.rasterParams(&dc, bins, &cp);
+                groups_c = .{ divUp(box.width(), raster.TILE), divUp(box.height(), raster.TILE), 1 };
+            }
+            if (!e.runCpuFor(.raster, p, v, kind, groups_c, rv[0..rb.len], cparams)) break :cpu false;
             // (the color and depth bindings as before: always marked)
             for (rb, 0..) |img, j| {
                 if (j < 2 or rw & (@as(u32, 1) << @intCast(j)) != 0) e.wrote(img, 0, img.buf.cpu.len);
