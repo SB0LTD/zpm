@@ -382,7 +382,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     }
     nvenc.set(buf, H.refpic_cfg_tiled_16x16, 1);
     nvenc.set(buf, H.outputpic_cfg_tiled_16x16, 1);
-    nvenc.set(buf, H.input_cfg_block_height, s.input.block_height);
+    nvenc.set(buf, H.input_cfg_block_height, nvenc.blockHeightField(s.input.block_height));
     // sps_data
     const min_cb = @as(u32, seq.log2_min_luma_coding_block_size_minus3);
     const ctb = ctbLog2(seq);
@@ -475,8 +475,12 @@ pub fn setup(buf: []u8, s: Setup) void {
     // the lists: slots, distances, and each entry's place in the RPS
     for (0..8) |k| {
         const kk: u32 = @intCast(k);
-        nvenc.set(buf, nvenc.at(H.l0, kk), 0xff);
-        nvenc.set(buf, nvenc.at(H.l1, kk), 0xff);
+        // (unused: the lists -2 and the distances -1, as NVIDIA's driver
+        // writes H.264's; nvenc.LIST_NONE)
+        nvenc.set(buf, nvenc.at(H.l0, kk), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(H.l1, kk), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(H.temp_dist_l0, kk), nvenc.DIST_NONE);
+        nvenc.set(buf, nvenc.at(H.temp_dist_l1, kk), nvenc.DIST_NONE);
         nvenc.set(buf, nvenc.at(H.poc_entry_l0, kk), 0xff);
         nvenc.set(buf, nvenc.at(H.poc_entry_l1, kk), 0xff);
     }
