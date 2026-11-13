@@ -769,7 +769,9 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         k.store(.f32, memAt(b_out, 8), r(base), r(zw));
         k.store(.f32, memAt(b_out, 12), r(base), r(k.sel(.f32, r(ok), r(iw), f(-1))));
         for (0..sh.varyings) |j| {
-            const val = io.varying[j];
+            // (a varying the vertex code never wrote: 0, as a Direct3D
+            // vertex shader's unwritten output components read)
+            const val = if (io.varying[j] == .none) k.mov(.f32, f(0)) else io.varying[j];
             const out = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0) val else k.op2(.fmul, .f32, r(val), r(iw));
             k.store(.f32, memAt(b_out, @intCast(16 + 4 * j)), r(base), r(out));
         }
