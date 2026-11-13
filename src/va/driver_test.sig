@@ -710,11 +710,13 @@ test "driver: the video channel lost mid-decode (AV1, EndPicture waiting): EndPi
     var derived: va.Image = undefined;
     try testing.expectEqual(va.SUCCESS, d.deriveImage(s[0], &derived));
 
-    // The next key frame: taken, then the channel faults under it, found
-    // by EndPicture's own wait (intrabc). EndPicture still says SUCCESS.
+    // The next key frame: taken, then the channel faults under it. With
+    // pipelined decodes (#171) EndPicture no longer waits, so the loss is
+    // found at the picture's first reader, not here. EndPicture still says
+    // SUCCESS.
     k.vfault_at = k.n_submits + 1;
     try decodeAv1(&d, ctx, &av1Key(s[1], true), s[1]);
-    try testing.expect(k.vlost and d.node.lost);
+    try testing.expect(k.vlost);
     const submitted = k.n_submits;
 
     // Its readers: each an error, every out written or left alone, never a
