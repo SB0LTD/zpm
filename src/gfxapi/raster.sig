@@ -883,13 +883,13 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
     for (d.targets[1..]) |tt| {
         const t = tt orelse continue;
-        if (!t.img.drawable()) return "a colour target the engine does not draw into";
+        if (!t.img.gpuDrawable()) return "a colour target the engine does not draw into";
         if (t.img.width != d.color.width or t.img.height != d.color.height or t.img.top_down != d.color.top_down or t.img.samples != 1) return "colour targets of different sizes or orientations";
     }
     if (d.query != null) return "an occlusion query";
     if (d.alpha_to_coverage or d.sample_mask & 1 == 0) return "alpha to coverage or a sample mask";
     if (d.bias_factor != 0 or d.bias_units != 0) return "depth bias";
-    if (!d.color.drawable()) return "a target the engine does not draw into";
+    if (!d.color.gpuDrawable()) return "a target the engine does not draw into";
     if (d.blend) |b| {
         if (b.gl[0] == 0xffff) return "a blend not given as GL's factors";
     }
@@ -1825,11 +1825,13 @@ const R_D_BL = 76;
 const R_S_BL = 77;
 /// targets 1 .. MAX_TARGETS - 1: each target 0's words (TF) in turn
 const R_TGT = 78;
-const TGT_WORDS = 9;
-pub const RASTER_PARAMS = R_TGT + (MAX_TARGETS - 1) * TGT_WORDS;
+const TGT_WORDS = 10;
+/// target 0's layout word (TF.bl: colourBlWord), after the other targets'
+const R_C_BL = R_TGT + (MAX_TARGETS - 1) * TGT_WORDS;
+pub const RASTER_PARAMS = R_C_BL + 1;
 
 /// A colour target's words.
-const TF = enum(u8) { stride, topdown, height, bpp, shift_r, shift_b, keep, no_alpha, blend };
+const TF = enum(u8) { stride, topdown, height, bpp, shift_r, shift_b, keep, no_alpha, blend, bl };
 
 fn tw(t: usize, fld: TF) u16 {
     if (t == 0) return switch (fld) {
@@ -1842,6 +1844,7 @@ fn tw(t: usize, fld: TF) u16 {
         .keep => R_KEEP,
         .no_alpha => R_NO_ALPHA,
         .blend => R_BLEND,
+        .bl => R_C_BL,
     };
     return @intCast(R_TGT + (t - 1) * TGT_WORDS + @intFromEnum(fld));
 }
@@ -2082,7 +2085,16 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
         bpp[tt] = k.param(.u32, tw(tt, .bpp));
         wide[tt] = k.cmp(.u32, .eq, r(bpp[tt]), u(4));
         pair[tt] = k.cmp(.u32, .eq, r(bpp[tt]), u(2));
-        c_off[tt] = k.op3(.imad, .u32, r(rowOf(&k, py, tw(tt, .topdown), tw(tt, .height))), r(k.param(.u32, tw(tt, .stride))), r(k.op2(.imul, .u32, r(pxs), r(bpp[tt]))));
+        // (rows of bytes, or block linear where the target's layout word
+        // says: colourBlWord, the RTX's GOBs for its texel size)
+        const row = rowOf(&k, py, tw(tt, .topdown), tw(tt, .height));
+        const xb = k.op2(.imul, .u32, r(pxs), r(bpp[tt]));
+        const stride = k.param(.u32, tw(tt, .stride));
+        const linear = k.op3(.imad, .u32, r(row), r(stride), r(xb));
+        const blw = k.param(.u32, tw(tt, .bl));
+        const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(k.op2(.@"and", .u32, r(blw), u(0xff))), u(1))), u(1));
+        const block = blocklinear.address(&k, r(stride), r(gobs), r(k.op2(.shr, .u32, r(blw), u(8))), r(xb), r(row));
+        c_off[tt] = k.sel(.u32, r(k.cmp(.u32, .ne, r(blw), u(0))), r(block), r(linear));
     }
     const d_on = k.cmp(.u32, .ne, r(k.param(.u32, R_DEPTH)), u(0));
     const d_off = dsOffset(&k, py, pxs, R_D_TOPDOWN, R_D_HEIGHT, R_D_STRIDE, R_D_BL);
@@ -2833,6 +2845,13 @@ pub fn vertexParams(d: *const Draw, out: []u32) []u32 {
     return out[0..n];
 }
 
+/// A colour image's layout word (TF.bl): 0 rows of bytes; else 1 + log2 of
+/// a block's GOBs, and its GOBs' swizzle (blocklinear.Swizzle) from bit 8.
+pub fn colourBlWord(img: *const engine.Image) u32 {
+    if (!img.layout.block) return 0;
+    return (@as(u32, img.layout.gobs_log2) + 1) | @as(u32, @intFromEnum(img.layout.swizzle)) << 8;
+}
+
 /// An image's R_D_BL / R_S_BL word.
 pub fn blWord(img: *const engine.Image) u32 {
     return if (img.layout.block) @as(u32, img.layout.gobs_log2) + 1 else 0;
@@ -2933,6 +2952,7 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
     out[R_BPP] = d.color.format.bytes();
     out[R_C_TOPDOWN] = @intFromBool(d.color.top_down);
     out[R_C_HEIGHT] = d.color.height;
+    out[R_C_BL] = colourBlWord(d.color);
     out[R_SHIFT_R] = if (d.color.format == .bgra8) 16 else 0;
     out[R_SHIFT_B] = if (d.color.format == .bgra8) 0 else 16;
     out[R_KEEP] = d.keep;
@@ -2977,6 +2997,7 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
         w[@intFromEnum(TF.keep)] = x.keep;
         w[@intFromEnum(TF.no_alpha)] = @intFromBool(img.no_alpha or img.format.channels() < 4);
         w[@intFromEnum(TF.blend)] = @intFromBool(x.blend and d.blend != null);
+        w[@intFromEnum(TF.bl)] = colourBlWord(img);
     }
     if (d.blend) |b| {
         out[R_BLEND] = 1;

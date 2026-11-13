@@ -2195,6 +2195,53 @@ test "draw: features through the emulated RTX's 3D engine (gl_FragDepth, gl_Fron
     }
 }
 
+test "draw: block-linear colour targets: the compute raster and the RTX's 3D engine draw into one as into rows, fills and reads see the same pixels" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&feat_solid);
+    const e = &eng_rtx;
+    var rows = e.newImage(W, H, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&rows);
+    var block = e.newBlockImage(W, H, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&block);
+    try std.testing.expect(block.layout.block and !rows.layout.block);
+    var ab = e.newBuffer(16 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+    const col = rgba(.{ 0.25, 0.5, 0.125, 0.25 });
+    const pts = [_][3]f32{ .{ 2.3, 1.7, 0 }, .{ 40.61, 3.2, 0 }, .{ 9.9, 30.4, 0 }, .{ 40.61, 3.2, 0 }, .{ 9.9, 30.4, 0 }, .{ 61.2, 29.05, 0 } };
+    var pics: [2][2][W * H * 4]u8 = undefined;
+    for ([_]bool{ true, false }, 0..) |compute, ci| {
+        for ([_]*engine.Image{ &rows, &block }, 0..) |img, n| {
+            for ([_]bool{ false, true }) |top_down| {
+                img.top_down = top_down;
+                e.compute_only = compute;
+                e.fill(img, img.bounds(), 0x2010_3040, 0);
+                // (a fill of part of it too: the fill kernel's layout)
+                e.fill(img, .{ .x0 = 5, .y0 = 3, .x1 = 37, .y1 = 19 }, 0x0405_0607, 0);
+                const before = e.stats.graphics_draws;
+                try featDraw(e, .{ .pipe = &feat_solid, .color = img, .uniforms = &col, .blend = add }, &ab, &pts);
+                // (the 3D engine draws into either layout; compute_only keeps
+                // the draw on the compute raster)
+                if (e.stats.graphics_draws - before != @intFromBool(!compute)) {
+                    for (e.said_compute) |w| if (w.len != 0) std.debug.print("block-linear targets: on the compute kernels: {s}\n", .{w});
+                    std.debug.print("block-linear targets: the 3D engine: {s}\n", .{Rtx3d.engine3d.why});
+                }
+                try std.testing.expectEqual(@as(u64, @intFromBool(!compute)), e.stats.graphics_draws - before);
+                e.read(img, 0, 0, W, H, &pics[ci][n], W * 4, .rgba8);
+            }
+        }
+        // (the block-linear target's pixels are the rows')
+        try std.testing.expectEqual(@as(u32, 0), apart(&pics[ci][0], &pics[ci][1], W, 0, if (compute) "block linear, compute" else "block linear, 3D engine"));
+    }
+    // (and the compute raster's are the engine's, within a step)
+    try std.testing.expectEqual(@as(u32, 0), apart(&pics[0][1], &pics[1][1], W, 1, "block linear, compute against the 3D engine"));
+    e.compute_only = false;
+}
+
 // ── GALAXY_GL_CHECK: the GPU's work against the CPU's ──────────────────────
 
 var check_mem: [4 << 20]u8 align(64) = undefined;

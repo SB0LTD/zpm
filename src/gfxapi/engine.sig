@@ -191,6 +191,14 @@ pub const Image = struct {
         return img.format.renderable() and img.layout.linear();
     }
 
+    /// A colour target the GPU's draws write: rows, or block linear with
+    /// 32-bit texels in Turing2D's GOBs (Engine.newBlockImage: the compute
+    /// raster and the RTX's 3D engine both draw into it). GL's other paths
+    /// (copies, blits, completeness) still take `drawable`, rows alone.
+    pub fn gpuDrawable(img: *const Image) bool {
+        return img.format.renderable() and (img.layout.linear() or (img.layout.swizzle == .turing2d and img.format.bytes() == 4));
+    }
+
     pub fn levelWidth(img: *const Image, l: u32) u32 {
         return @max(img.width >> @intCast(l), 1);
     }
@@ -1271,6 +1279,27 @@ pub const Engine = struct {
         return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = .{ .block = true, .swizzle = .turing2d, .gobs_log2 = gobs } };
     }
 
+    /// A colour image block linear from the start (32-bit texels: RGBA8,
+    /// BGRA8; Turing2D's GOBs, as the RTX's 3D engine and its texture
+    /// units take them), for a render target the GPU draws: the compute
+    /// raster writes it (raster.colourBlWord), fills, reads and texture
+    /// sampling read it in place, and the 3D engine may draw into it with
+    /// a depth target beside it (it refuses depth beside rows:
+    /// RT_LINEAR_WITH_ZETA). Null for another format or with no memory.
+    /// Not for an image an outside reader takes as rows (a window's, a
+    /// dma-buf's without a block-linear modifier).
+    pub fn newBlockImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
+        if (width == 0 or height == 0 or format.bytes() != 4 or !format.renderable()) return null;
+        // (rows on 128 bytes and the image on a page, as the 3D engine's
+        // targets must be: whole GOBs, a GOB's 512 bytes aligned)
+        const pitch = std.mem.alignForward(u32, width * 4, 128);
+        var gobs: u3 = 0;
+        while (gobs < 4 and (@as(u32, 8) << gobs) < height) gobs += 1;
+        const bytes = blocklinear.planeBytes(pitch, height, gobs);
+        const m = e.allocBytes(@intCast(bytes), false) orelse return null;
+        return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = format, .own = true, .pooled = m.pooled, .layout = .{ .block = true, .swizzle = .turing2d, .gobs_log2 = gobs } };
+    }
+
     /// Exported images need a whole backing buffer for the dma-buf.
     pub fn newWindowImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
         return e.allocImage(width, height, format, false);
@@ -2043,9 +2072,9 @@ pub const Engine = struct {
             e.sayCompute("a depth or stencil image beside a colour image of rows (the 3D engine draws depth only into block-linear colour: RT_LINEAR_WITH_ZETA)");
             return null;
         }
-        if (d.color.layout.block) {
+        if (d.color.layout.block and (d.color.layout.swizzle != .turing2d or d.color.format.bytes() != 4)) {
             e.stats.compute_draws += 1;
-            e.sayCompute("a block-linear colour image (the 3D engine is given rows)");
+            e.sayCompute("a block-linear colour image of 8- or 16-bit texels (Blackwell's GOBs for them: not given to the 3D engine yet)");
             return null;
         }
         const p = @constCast(d.pipe);
@@ -2106,6 +2135,11 @@ pub const Engine = struct {
                 e.sayCompute("a target whose address or rows are not on 128 bytes");
                 return null;
             }
+            if (x.img.layout.block != t.layout.block or (x.img.layout.block and x.img.format.bytes() != 4)) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("colour targets of both layouts (rows and block linear) in one draw");
+                return null;
+            }
             more[j] = .{ .va = x.img.buf.gpu, .stride = x.img.stride, .format = targetFormatOf(x.img.format), .mask = maskOf(x.img.format, x.keep), .blend = x.blend };
             more_imgs[j] = x.img;
         }
@@ -2121,6 +2155,7 @@ pub const Engine = struct {
         const g = gpu.Graphics{
             .more = more,
             .index = index,
+            .gobs_log2 = if (t.layout.block) t.layout.gobs_log2 else null,
             .depth = if (d.depth) |z| .{
                 .va = z.buf.gpu,
                 .width = z.width,
@@ -2719,6 +2754,21 @@ pub const Engine = struct {
         // (opaque: an image without alpha, or one of fewer channels read
         // as RGBA; read as itself, its bytes alone are kept)
         const set: u32 = if (img.format.renderable() and (setOf(img) != 0 or img.format.channels() < 4)) 0xff00_0000 else 0;
+        if (img.layout.block) {
+            // (block linear: each pixel where its GOB puts it)
+            if (img.gpuWrote()) e.fromDevice(img, 0, img.buf.cpu.len);
+            for (0..h) |j| {
+                const row = img.rowOf(y + @as(u32, @intCast(j)));
+                const d = dst[j * dst_stride ..][0 .. @as(usize, w) * db];
+                for (0..w) |i| {
+                    const at = blocklinear.addressCpu(img.stride, img.layout.gobs_log2, img.layout.swizzle, (x + @as(u32, @intCast(i))) * sb, row);
+                    const v = getPixel(img.buf.cpu[at..], sb) | set;
+                    putPixel(d[i * db ..], db, if (swap) swapRB(v) else v);
+                }
+            }
+            e.stats.cpu_ops += 1;
+            return;
+        }
         for (0..h) |j| {
             const row = img.rowOf(y + @as(u32, @intCast(j)));
             const off = @as(usize, row) * img.stride + @as(usize, x) * sb;
