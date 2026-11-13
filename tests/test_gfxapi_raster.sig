@@ -28,6 +28,8 @@ const f = kir.f;
 
 var pool_mem: [16 << 20]u8 align(64) = undefined;
 var cpu_work: [8 << 20]u8 align(64) = undefined;
+/// the CPU's kernels kept between draws (every CPU test draws with them)
+var cpu_kernels: [1 << 15]kir.Inst = undefined;
 
 const Rtx = struct {
     const nvidia = @import("nvidia");
@@ -43,10 +45,10 @@ const Where = enum { cpu, rtx };
 
 fn open(e: *engine.Engine, w: Where) !void {
     switch (w) {
-        .cpu => e.init(.{ .pool = &pool_mem, .cpu_work = &cpu_work }),
+        .cpu => e.init(.{ .pool = &pool_mem, .cpu_work = &cpu_work, .cpu_kernels = &cpu_kernels }),
         .rtx => {
             Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
-            e.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &Rtx.slabs });
+            e.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .cpu_kernels = &cpu_kernels, .slabs = &Rtx.slabs });
             try std.testing.expect(e.onGpu());
         },
     }

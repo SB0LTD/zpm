@@ -813,7 +813,9 @@ pub fn vertexKernel(s: kir.Storage, p: *const Pipeline) kir.Kernel {
         k.store(.f32, memAt(b_out, 8), r(base), r(zw));
         k.store(.f32, memAt(b_out, 12), r(base), r(k.sel(.f32, r(ok), r(iw), f(-1))));
         for (0..sh.varyings) |j| {
-            const val = io.varying[j];
+            // (a varying the vertex code never wrote: 0, as a Direct3D
+            // vertex shader's unwritten output components read)
+            const val = if (io.varying[j] == .none) k.mov(.f32, f(0)) else io.varying[j];
             const out = if (sh.flat & (@as(u64, 1) << @intCast(j)) != 0) val else k.op2(.fmul, .f32, r(val), r(iw));
             k.store(.f32, memAt(b_out, @intCast(16 + 4 * j)), r(base), r(out));
         }
@@ -2876,6 +2878,42 @@ fn factorWords(fc: Factor, rgb: bool, out: []u32) void {
         out[3] = fbits(fc.ksa);
         out[4] = fbits(fc.kda);
     }
+}
+
+/// The pixels a draw's primitive records may touch (the setup kernel's
+/// records, read on the CPU): the union of the drawn ones' boxes, within
+/// `d.rect`; null when none is drawn. The CPU runs the tile kernel over
+/// that only: a tile no primitive meets keeps its pixels, so the result is
+/// the same bytes, and a few small quads in a 2048-square texture cache
+/// page no longer cost a pass over every tile of it.
+pub fn recordsBox(d: *const Draw, recs: []const u8) ?engine.Rect {
+    const n = @as(usize, d.records()) * d.instances;
+    const stride: usize = d.pipe.sstride;
+    var x0: i32 = std.math.maxInt(i32);
+    var y0: i32 = std.math.maxInt(i32);
+    var x1: i32 = std.math.minInt(i32);
+    var y1: i32 = std.math.minInt(i32);
+    var any = false;
+    for (0..n) |ri| {
+        const base = ri * stride * 4;
+        if (base + (S_BOX + 4) * 4 > recs.len) break;
+        if (std.mem.readInt(u32, recs[base + S_VALID * 4 ..][0..4], .little) == 0) continue;
+        const bx0 = std.mem.readInt(i32, recs[base + S_BOX * 4 ..][0..4], .little);
+        const by0 = std.mem.readInt(i32, recs[base + (S_BOX + 1) * 4 ..][0..4], .little);
+        const bx1 = std.mem.readInt(i32, recs[base + (S_BOX + 2) * 4 ..][0..4], .little);
+        const by1 = std.mem.readInt(i32, recs[base + (S_BOX + 3) * 4 ..][0..4], .little);
+        if (bx1 < bx0 or by1 < by0) continue;
+        any = true;
+        x0 = @min(x0, bx0);
+        y0 = @min(y0, by0);
+        x1 = @max(x1, bx1);
+        y1 = @max(y1, by1);
+    }
+    if (!any) return null;
+    // (a box is inclusive; a rect's far edges are not)
+    const box = engine.Rect{ .x0 = @intCast(@max(x0, 0)), .y0 = @intCast(@max(y0, 0)), .x1 = @intCast(@max(x1 + 1, 0)), .y1 = @intCast(@max(y1 + 1, 0)) };
+    const m = box.meet(d.rect);
+    return if (m.empty()) null else m;
 }
 
 pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
