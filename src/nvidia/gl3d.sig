@@ -10,9 +10,9 @@
 //! - constant buffer 0 of both stages: the binding addresses and the
 //!   parameter words, laid out as a compute launch's (qmd.cbuf0Into), so a
 //!   program reads them as a kernel does;
-//! - up to eight colour targets (rows of bytes: RGBA8, BGRA8, RG8, R8;
-//!   the pixel program's output t into target t), each's channels
-//!   written and blend on or off; the blend (GL's factors and equations,
+//! - up to eight colour targets (rows of bytes, or block linear: RGBA8,
+//!   BGRA8, RG8, R8; the pixel program's output t into target t), each's
+//!   channels written and blend on or off; the blend (GL's factors and equations,
 //!   the constant colour), the viewport (x, y and depth: GL's -w..w clip
 //!   volume), the scissor;
 //! - the depth-stencil target (S8Z24, block linear), the depth test and
@@ -22,11 +22,21 @@
 //!   and the element array themselves), `instances` times.
 //!
 //! Not yet (the GL layer keeps such draws on its compute kernels): points
-//! and lines, multisampling, primitive restart, depth textures, depth
-//! bias, clip distances.
+//! and lines, multisampling, depth textures, depth bias, clip distances.
 //!
-//! Nothing here has run on the Legion's RTX; the emulated engine (emu3d)
-//! runs it.
+//! **A depth target needs block-linear colour targets.** The engine
+//! refuses a draw whose colour target is rows of bytes (LAYOUT_PITCH)
+//! while a depth target is selected: a class error, data error 0x12
+//! RT_LINEAR_WITH_ZETA (nouveau's nv50_data_error_names; nvc0's
+//! validate_fb asserts no depth beside a linear colour buffer; NVK draws
+//! a linear image with depth through a tiled shadow). GSP-RM then recovers
+//! the channel with Xid 69 (ROBUST_CHANNEL_GR_CLASS_ERROR). The Legion's
+//! RTX did exactly that at the drawtest's first triangle (pc-all, step 4:
+//! a pitch target and an S8Z24 depth target). whyNot says so before a
+//! draw is sent; emu3d refuses such a stream the same way.
+//!
+//! The rectangles (draw.sig) have run on the Legion's RTX bit for bit;
+//! these draws only on the emulated engine (emu3d) so far.
 //!
 //! Allocation-free.
 
@@ -177,6 +187,12 @@ pub const Draw = struct {
     zero_va: u64,
     target: gr.Target,
     format: Format,
+    /// The colour targets' layout: null rows of `target.pitch` bytes
+    /// (LAYOUT_PITCH); else block linear (one GOB wide and deep, blocks of
+    /// 2^n GOBs high: 8 << n rows), `target.pitch` bytes across (whole
+    /// GOBs, 64 bytes), the target at a GOB (512 bytes). A depth target
+    /// needs it (RT_LINEAR_WITH_ZETA).
+    color_gobs: ?u3 = null,
     /// The channels written: bit 0 red .. bit 3 alpha.
     mask: u4 = 0xf,
     blend: ?Blend = null,
@@ -204,7 +220,8 @@ pub const Draw = struct {
 };
 
 /// A colour target past the first: rows of `pitch` bytes from `va` (128
-/// bytes apart, as the first's), its format, channels and blend.
+/// bytes apart, as the first's; block linear as the first is, with
+/// Draw.color_gobs), its format, channels and blend.
 pub const More = struct {
     va: u64,
     pitch: u32,
@@ -233,6 +250,44 @@ pub const CULL_FRONT_AND_BACK: u32 = 0x408;
 pub const FRONT_CW: u32 = 0x900;
 pub const FRONT_CCW: u32 = 0x901;
 
+/// SET_COLOR_TARGET_MEMORY: block linear (LAYOUT_BLOCKLINEAR, 0 in bit
+/// 12), one GOB wide and deep, 2^gobs GOBs high.
+pub fn blockMemory(gobs: u3) u32 {
+    return @as(u32, gobs) << 4;
+}
+
+/// Colour target t's nine words (SET_COLOR_TARGET_A .. _LAYER): rows of
+/// `pitch` bytes (the width is the pitch, LAYOUT_PITCH), or block linear
+/// (the width in pixels: the pitch over the pixel's bytes, as NVK sends).
+pub fn targetWords(va: u64, pitch: u32, height: u32, f: Format, gobs: ?u3) [9]u32 {
+    return if (gobs) |n|
+        .{ @truncate(va >> 32), @truncate(va), pitch / formatBytes(f), height, targetFormat(f), blockMemory(n), 1, 0, 0 }
+    else
+        .{ @truncate(va >> 32), @truncate(va), pitch, height, targetFormat(f), gr.TARGET_MEMORY_PITCH, 1, 0, 0 };
+}
+
+/// Why the engine would refuse `d` (a class error: GSP-RM recovers the
+/// channel, Xid 69), or null. Checked before a draw is sent.
+pub fn whyNot(d: *const Draw) ?[]const u8 {
+    if (d.depth != null and d.color_gobs == null)
+        return "a depth target beside colour targets of rows of bytes (LAYOUT_PITCH): the engine's data error RT_LINEAR_WITH_ZETA (Xid 69)";
+    if (d.target.va % 128 != 0 or d.target.pitch % 128 != 0 or d.target.pitch == 0 or d.target.height == 0)
+        return "a colour target whose address or rows are not on 128 bytes (RT_INVALID_ALIGNMENT)";
+    if (d.color_gobs) |n| {
+        if (n > 5 or d.target.va % 512 != 0 or d.target.pitch % 64 != 0 or d.target.pitch % formatBytes(d.format) != 0)
+            return "a block-linear colour target not on a GOB, or its blocks over 32 GOBs high";
+    }
+    for (d.more) |mm| {
+        const m = mm orelse continue;
+        if (m.va % 128 != 0 or m.pitch % 128 != 0) return "a colour target whose address or rows are not on 128 bytes (RT_INVALID_ALIGNMENT)";
+        if (d.color_gobs != null and (m.va % 512 != 0 or m.pitch % formatBytes(m.format) != 0)) return "a block-linear colour target not on a GOB";
+    }
+    if (d.depth) |z| {
+        if (z.gobs_log2 > 5 or z.va % 512 != 0 or z.width == 0 or z.height == 0) return "a depth target not on a GOB, with no size, or its blocks over 32 GOBs high";
+    }
+    return null;
+}
+
 fn one(p: *Push, m: u32, v: u32) void {
     p.immediate(SUBCH, m, v);
 }
@@ -256,8 +311,10 @@ pub const PROVOKING_LAST: u32 = 1;
 pub fn emit(p: *Push, d: *const Draw) void {
     gr.setup(p, d.zero_va, d.zero_va, d.zero_va, 1);
     gr.target(p, .{ .va = d.target.va, .width = d.target.width, .height = d.target.height, .pitch = d.target.pitch, .format = .bgra8 });
-    // the target's own format, its channels
-    many(p, gr.SET_COLOR_TARGET_A + 16, &.{targetFormat(d.format)});
+    // the target's own format (and layout, when block linear), its channels
+    if (d.color_gobs) |n| {
+        many(p, gr.SET_COLOR_TARGET_A, &targetWords(d.target.va, d.target.pitch, d.target.height, d.format, n));
+    } else many(p, gr.SET_COLOR_TARGET_A + 16, &.{targetFormat(d.format)});
     many(p, gr.SET_CT_WRITE, &.{ctWrite(d.mask)});
     // the other colour targets (the pixel program's outputs 1 .. 7): each
     // its memory, format, channels and blend; CT_SELECT counts to the last
@@ -265,7 +322,7 @@ pub fn emit(p: *Push, d: *const Draw) void {
     for (d.more, 1..) |m, ti| {
         const x = m orelse continue;
         const t: u32 = @intCast(ti);
-        many(p, gr.SET_COLOR_TARGET_A + 64 * t, &.{ @truncate(x.va >> 32), @truncate(x.va), x.pitch, d.target.height, targetFormat(x.format), gr.TARGET_MEMORY_PITCH, 1, 0, 0 });
+        many(p, gr.SET_COLOR_TARGET_A + 64 * t, &targetWords(x.va, x.pitch, d.target.height, x.format, d.color_gobs));
         one(p, gr.SET_COLOR_COMPRESSION + 4 * t, 0);
         one(p, gr.SET_CT_WRITE + 4 * t, ctWrite(x.mask));
         if (d.blend) |b| {
@@ -390,4 +447,35 @@ test "gl3d: a draw's stream fits, ends in its draw, names its programs and buffe
     try p.check();
     try testing.expect(p.words().len < MAX_DWORDS);
     try testing.expectEqual(@as(u32, 0x0fac_6888), ctSelect(8));
+}
+
+test "gl3d: a depth target beside a pitch colour target is refused before it is sent (RT_LINEAR_WITH_ZETA, the Legion's Xid 69); block linear is taken" {
+    var d = Draw{
+        .vertex = .{ .va = 0x10_0000_0000, .registers = 24, .bytes = 0x300 },
+        .pixel = .{ .va = 0x10_0000_1000, .registers = 32, .bytes = 0x200 },
+        .cb_va = 0x10_0000_2000,
+        .cb_bytes = 0x400,
+        .zero_va = 0x10_0000_3000,
+        .target = .{ .va = 0x10_0001_0000, .width = 64, .height = 32, .pitch = 256 },
+        .format = .rgba8,
+        .scale = .{ 32, 16, 0.5 },
+        .offset = .{ 32, 16, 0.5 },
+        .scissor = .{ 0, 0, 64, 32 },
+        .count = 6,
+    };
+    try testing.expectEqual(@as(?[]const u8, null), whyNot(&d));
+    d.depth = .{ .va = 0x10_0003_0000, .width = 64, .height = 32, .gobs_log2 = 2, .tested = true, .write = true };
+    try testing.expect(std.mem.indexOf(u8, whyNot(&d).?, "RT_LINEAR_WITH_ZETA") != null);
+    d.color_gobs = 2;
+    try testing.expectEqual(@as(?[]const u8, null), whyNot(&d));
+    // (the stream: target 0 block linear, its width in pixels)
+    var buf: [MAX_DWORDS]u32 = undefined;
+    var p = Push{ .buf = &buf };
+    emit(&p, &d);
+    try p.check();
+    const want = [_]u32{ push.header(SUBCH, gr.SET_COLOR_TARGET_A, 9), 0x10, 0x0001_0000, 64, 32, 0xd5, 0x20, 1, 0, 0 };
+    try testing.expect(std.mem.indexOf(u32, p.words(), &want) != null);
+    // (a target off a GOB is refused as block linear)
+    d.target.va += 128;
+    try testing.expect(whyNot(&d) != null);
 }

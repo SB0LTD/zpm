@@ -2033,6 +2033,21 @@ pub const Engine = struct {
             e.sayCompute(why);
             return null;
         }
+        // (the engine refuses a depth target beside a colour target of rows
+        // of bytes: its data error RT_LINEAR_WITH_ZETA, the channel lost to
+        // Xid 69: the Legion's drawtest, pc-all. GL's colour images are
+        // rows, so their depth and stencil draws stay on the compute
+        // kernels until a block-linear colour shadow takes them there)
+        if (d.depth != null) {
+            e.stats.compute_draws += 1;
+            e.sayCompute("a depth or stencil image beside a colour image of rows (the 3D engine draws depth only into block-linear colour: RT_LINEAR_WITH_ZETA)");
+            return null;
+        }
+        if (d.color.layout.block) {
+            e.stats.compute_draws += 1;
+            e.sayCompute("a block-linear colour image (the 3D engine is given rows)");
+            return null;
+        }
         const p = @constCast(d.pipe);
         if (!e.loadGraphics(p)) {
             e.sayCompute("its program did not compile for the 3D engine");

@@ -76,11 +76,14 @@ const Bound = struct { valid: bool = false, va: u64 = 0, size: u32 = 0 };
 
 const Target = struct {
     bytes: []u8,
+    /// Bytes a row (rows of bytes), or across (block linear: whole GOBs).
     pitch: u32,
     /// Pixels a row and rows.
     width: u32,
     height: u32,
     format: Fmt,
+    /// Block linear, blocks of 2^gobs GOBs high (null: rows of bytes).
+    gobs: ?u3 = null,
 };
 
 /// A colour target's pixels: the renderer's three, and GL's RG8.
@@ -258,10 +261,23 @@ pub const Engine = struct {
             0xea => .rg8,
             else => return g.refuse("a color target format the renderer does not use"),
         };
-        try g.need(g.reg(a + 20) == gr.TARGET_MEMORY_PITCH and g.reg(a + 24) == 1 and g.reg(a + 28) == 0 and g.reg(a + 32) == 0, "the color target is not one layer of rows of bytes (LAYOUT_PITCH)");
+        try g.need(g.reg(a + 24) == 1 and g.reg(a + 28) == 0 and g.reg(a + 32) == 0, "the color target is not one layer");
+        try g.need(g.reg(gr.SET_COLOR_COMPRESSION + 4 * i) == 0, "color compression on plain memory");
+        const mem = g.reg(a + 20);
+        if (mem != gr.TARGET_MEMORY_PITCH) {
+            // block linear (NVK's: one GOB wide and deep, the width in
+            // pixels), in Turing2D's GOBs as the depth target
+            try g.need(mem & ~@as(u32, 0xf0) == 0 and (mem >> 4) & 0xf <= 5, "the color target is neither rows of bytes (LAYOUT_PITCH) nor block linear one GOB wide and deep");
+            const gobs: u3 = @intCast((mem >> 4) & 0xf);
+            const across = pitch * pixelBytes(format);
+            try g.need(va % 512 == 0 and across % 64 == 0 and pitch != 0 and height != 0, "a block-linear color target not on a GOB, or its rows not whole GOBs across");
+            const rows_per_block = @as(u32, 8) << gobs;
+            const size = @as(usize, across / 64) * ((height + rows_per_block - 1) / rows_per_block) * (@as(usize, 512) << gobs);
+            const bytes = g.host.mem.find(va, size) orelse return g.refuse("the color target's memory is not mapped");
+            return .{ .bytes = bytes, .pitch = across, .width = pitch, .height = height, .format = format, .gobs = gobs };
+        }
         // (NVK: the hardware "gets grumpy" otherwise)
         try g.need(va % 128 == 0 and pitch % 128 == 0 and pitch != 0 and height != 0, "the color target's address or its rows are not multiples of 128 bytes");
-        try g.need(g.reg(gr.SET_COLOR_COMPRESSION + 4 * i) == 0, "color compression on plain memory");
         const bytes = g.host.mem.find(va, @as(usize, pitch) * height) orelse return g.refuse("the color target's memory is not mapped");
         return .{ .bytes = bytes, .pitch = pitch, .width = pitch / pixelBytes(format), .height = height, .format = format };
     }
@@ -280,6 +296,19 @@ pub const Engine = struct {
         }
         for (0..4) |k| x.constant[k] = @floatCast(g.float(gr.SET_BLEND_CONST_RED + 4 * @as(u32, @intCast(k))));
         return x;
+    }
+
+    /// The colour targets' layouts as the hardware takes them: all alike,
+    /// and block linear when a depth target is selected. A pitch colour
+    /// target beside a depth target is the class's data error 0x12,
+    /// RT_LINEAR_WITH_ZETA: the Legion's RTX lost its channel to it (Xid
+    /// 69, pc-all's drawtest step 4).
+    fn layoutsAgree(g: *Engine, t: Target) error{BadStream}!void {
+        try g.need(g.reg(gr.SET_ZT_SELECT) == 0 or t.gobs != null, "RT_LINEAR_WITH_ZETA: a depth target beside a color target of rows of bytes (LAYOUT_PITCH); the RTX refuses the draw (class error, Xid 69)");
+        for (1..g.reg(gr.SET_CT_SELECT) & 0xf) |ti| {
+            const x = (try g.targetAt(@intCast(ti))) orelse continue;
+            try g.need((x.gobs == null) == (t.gobs == null), "color targets of both layouts in one draw (rows of bytes and block linear)");
+        }
     }
 
     /// The depth-stencil target, when one is selected: S8Z24, block linear
@@ -445,6 +474,7 @@ pub const Engine = struct {
         const ib: ?IndexBuffer = if (indexed) try g.indexBuffer(first, count) else null;
         try g.need(g.reg(gr.SET_DA_PRIMITIVE_RESTART) <= 1, "SET_DA_PRIMITIVE_RESTART neither on nor off");
         const t = try g.target();
+        try g.layoutsAgree(t);
         const clip = g.clipOf(t);
         var stats = emu.Stats{};
         defer {
@@ -1190,7 +1220,7 @@ fn pixelBytes(f: Fmt) u32 {
 /// [0, 1] first), the channels `mask` names alone written.
 fn write(t: Target, x: u32, y: u32, src0: [4]f32, bl: ?Blend, mask: u4) void {
     const one: f32 = 1.0 / 255.0;
-    const at = @as(usize, y) * t.pitch + @as(usize, x) * pixelBytes(t.format);
+    const at = if (t.gobs) |n| blAddress(t.pitch, n, x * pixelBytes(t.format), y) else @as(usize, y) * t.pitch + @as(usize, x) * pixelBytes(t.format);
     // (where each of r, g, b, a is among the pixel's bytes; none: not kept)
     const order: [4]?u8 = switch (t.format) {
         .bgra8 => .{ 2, 1, 0, 3 },
@@ -1278,4 +1308,14 @@ test "a pixel written: replaced, and premultiplied source over" {
     try testing.expectEqualSlices(u8, &.{ 128, 128, 0, 255 }, bytes[0..4]);
     write(t, 1, 0, .{ 1, 0.5, 0, 0.25 }, null, 0xf);
     try testing.expectEqualSlices(u8, &.{ 0, 128, 255, 64 }, bytes[4..8]);
+}
+
+test "a block-linear target's pixel lands where its GOB puts it" {
+    var bytes = [_]u8{0} ** 1024;
+    const t = Target{ .bytes = &bytes, .pitch = 64, .width = 16, .height = 16, .format = .rgba8, .gobs = 1 };
+    // (pixel (5, 9): byte 20 of row 9, the second GOB of the block)
+    write(t, 5, 9, .{ 1, 0, 0, 1 }, null, 0xf);
+    const at = blAddress(64, 1, 20, 9);
+    try testing.expectEqual(@as(usize, 512 + 64 + 16 + 4), at);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, bytes[at..][0..4]);
 }

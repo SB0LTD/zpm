@@ -326,12 +326,19 @@ pub const Stamp = struct { buf: Buffer, off: u64 };
 /// and those after it see its own.
 pub const Graphics = struct {
     vertex: *const Program,
-    /// The colour target: rows of `stride` bytes from `va`.
+    /// The colour target: rows of `stride` bytes from `va`, or block
+    /// linear (`gobs_log2`).
     va: u64,
     width: u32,
     height: u32,
     stride: u32,
     format: TargetFormat,
+    /// The colour targets (this and `more`) block linear: one GOB wide
+    /// and deep, blocks of 2^n GOBs high, `stride` bytes across (whole
+    /// GOBs), Turing2D's GOBs as the depth target's; null: rows of bytes.
+    /// The RTX's 3D engine draws with a depth target only into block-linear
+    /// colour targets (RT_LINEAR_WITH_ZETA: nvidia/gl3d.whyNot).
+    gobs_log2: ?u3 = null,
     /// The channels written (bit 0 red .. bit 3 alpha).
     mask: u4 = 0xf,
     blend: ?GraphicsBlend = null,

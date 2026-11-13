@@ -251,6 +251,21 @@ pub const Hardware = struct {
     feature_apart: u32 = 0,
     /// Step 5 did not get to draw, or a scene of it did not.
     feature_skipped: bool = false,
+    /// Steps 4 and 5's draws that lost the channel (each a group of step 4,
+    /// or a scene of step 5: TestOptions.reopen went on after it), and the
+    /// first of them ("": none).
+    groups_lost: u32 = 0,
+    lost_group: []const u8 = "",
+};
+
+/// What hardwareTestWith may do beyond hardwareTest.
+pub const TestOptions = struct {
+    /// After a draw of steps 4 or 5 loses the channel (GSP-RM recovered
+    /// it): a fresh channel with the 3D engine on it and gpu/nvidia_device's
+    /// adapter over it (its buffers its own), or null. With it, the
+    /// groups after the lost one still run, each naming itself; without
+    /// it (or when it gives null) the test ends there.
+    reopen: ?*const fn () ?gpu.Device = null,
 };
 
 pub const Clock = *const fn () u64;
@@ -266,7 +281,7 @@ pub const TOL: u8 = 3;
 pub const POISON: u8 = 0xcd;
 
 fn hsay(log: draw.Log, comptime fmt: []const u8, args: anytype) void {
-    var buf: [320]u8 = undefined;
+    var buf: [480]u8 = undefined;
     log(std.fmt.bufPrint(&buf, "draw: " ++ fmt, args) catch "draw: (a line too long)");
 }
 
@@ -306,6 +321,12 @@ fn word(b: []const u8, px: usize) u32 {
 /// it draws as galaxy-gl's GL draws go (gl3d's state, nvidia_gl's
 /// programs); null, step 4 is not run.
 pub fn hardwareTest(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.State, model: *draw.Reference, log: draw.Log, now_us: Clock) Hardware {
+    return hardwareTestWith(dev, gd, o, kst, model, log, now_us, .{});
+}
+
+/// hardwareTest, with `opts` (a lost draw of steps 4 and 5 goes on, on a
+/// fresh channel, when opts.reopen gives one).
+pub fn hardwareTestWith(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.State, model: *draw.Reference, log: draw.Log, now_us: Clock, opts: TestOptions) Hardware {
     var res: Hardware = .{};
     const work = &kst.asm_work;
     o.init(dev, work, .{ .stream_bytes = 64 * 1024, .rects = 256, .textures = 31 }) catch |e| {
@@ -415,13 +436,14 @@ pub fn hardwareTest(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.Stat
 
     // 4. The rasterizers side by side (edges), before the fill rate's big
     // buffers.
+    var gdev = gd;
     if (!res.lost) {
-        if (gd) |d| edges(d, kst, log, now_us, &res) else res.edge_skipped = true;
+        if (gdev) |d| gdev = edges(d, kst, log, now_us, &res, opts) else res.edge_skipped = true;
     }
     // 5. What else galaxy-gl's draws put on the 3D engine, each against
     // the model.
     if (!res.lost) {
-        if (gd) |d| features(d, kst, log, now_us, &res) else res.feature_skipped = true;
+        if (gdev) |d| features(d, kst, log, now_us, &res, opts) else res.feature_skipped = true;
     }
 
     // 6. How fast it fills: a 1024 x 1024 target, an image the same size
@@ -457,6 +479,7 @@ pub fn hardwareTest(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.Stat
     }
     hsay(log, "{d} of {d} cases passed, {d} failed{s}", .{ res.passed, draw.cases.len, res.failed, if (res.lost) "; a pass did not finish" else "" });
     if (res.feature_scenes != 0) hsay(log, "features: {d} scenes; against the model: {d} pixels apart: {s}", .{ res.feature_scenes, res.feature_apart, if (res.feature_apart == 0) "the 3D engine draws them as the compute kernels do" else "the 3D engine does NOT draw them as the compute kernels do: the lines above say where" });
+    if (res.groups_lost != 0) hsay(log, "{d} group(s) of steps 4 and 5 lost the channel, the first {s}: the lines above say which and what each sent", .{ res.groups_lost, res.lost_group });
     if (res.edge_scenes != 0) hsay(log, "edges: {d} scenes; against the compute path's rule: {d} pixels covered otherwise, {d} depths apart, {d} depth EQUAL tests otherwise: {s}", .{ res.edge_scenes, res.edge_cover_apart, res.edge_depth_apart, res.edge_equal_apart, if (res.edge_cover_apart + res.edge_depth_apart + res.edge_equal_apart == 0) "the 3D engine IS the model (1/256 grid, top-left rule, depth plane): draws may be split between it and the compute kernels" else "the 3D engine is NOT the model: the lines above say where" });
     return res;
 }
@@ -472,19 +495,30 @@ pub fn hardwareTest(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.Stat
 // it bit for bit. Here the real engine draws the same scenes as that
 // test: two triangles sharing an edge (through pixel centres, and off any
 // grid coarser than 1/256), corners at different depths, rows up and
-// flipped, added ONE + ONE with depth LESS (written); its target and its
-// depth (S8Z24, block linear) come back and are put beside the model's
-// pixel for pixel, exactly. Then the model's depths go into the depth
-// target and the engine draws the scene again with depth EQUAL (not
-// written): it draws exactly the pixels whose depth it makes the same as
-// the compute path does.
+// flipped, added ONE + ONE.
+//
+// In groups, each a kind of state the rectangles (step 3) never sent, each
+// draw a push of its own, so a draw the engine refuses names its group:
+//
+// - 4a triangles: nvidia_gl's programs, TRIANGLES, the viewport's depth,
+//   the provoking vertex, the front face; a pitch target, no depth: the
+//   pixels covered against the model's;
+// - 4b culling (OGL_SET_CULL_FACE, OGL_SET_CULL), as 4a;
+// - 4c depth LESS, written: the colour target block linear (the engine
+//   refuses a depth target beside a pitch one: RT_LINEAR_WITH_ZETA, the
+//   Legion's Xid 69 at pc-all's first triangle) and an S8Z24 depth target;
+//   the target and the depth come back and are put beside the model's
+//   pixel for pixel, exactly;
+// - 4d depth EQUAL (not written) against the model's depths: the engine
+//   draws exactly the pixels whose depth it makes the same as the compute
+//   path does.
 
-const EW = 64;
-const EH = 32;
+pub const EW = 64;
+pub const EH = 32;
 /// The depth target's blocks: 4 GOBs (32 rows), its pitch 256 bytes.
-const E_GOBS: u3 = 2;
-const E_PITCH = EW * 4;
-const E_DEPTH_BYTES = (E_PITCH / 64) * ((EH + 31) / 32) * (512 << E_GOBS);
+pub const E_GOBS: u3 = 2;
+pub const E_PITCH = EW * 4;
+pub const E_DEPTH_BYTES = (E_PITCH / 64) * ((EH + 31) / 32) * (512 << E_GOBS);
 /// The quads, in pixels (x right, y the target's rows), and their
 /// corners' clip z.
 /// `cull`: the faces culled (bit 0 front, bit 1 back), front faces
@@ -528,9 +562,10 @@ fn edgeVerts(sc: EdgeScene) [6][4]f32 {
 }
 
 /// The model's picture of a scene drawn with depth LESS (written) over a
-/// depth of 1, viewport `vp` (scale x, y, offset x, y), depth scale and
+/// depth of 1 (`depth`; else no depth test: each triangle's pixels
+/// counted), viewport `vp` (scale x, y, offset x, y), depth scale and
 /// offset 0.5 (GL's -1 .. 1 to 0 .. 1).
-fn edgeModel(verts: *const [6][4]f32, vp: [4]f32, cull: u2, m: *EdgeModel) void {
+fn edgeModel(verts: *const [6][4]f32, vp: [4]f32, cull: u2, depth: bool, m: *EdgeModel) void {
     @memset(&m.hits, 0);
     @memset(&m.z, 0xff_ffff);
     const zs: f32 = 0.5;
@@ -569,8 +604,10 @@ fn edgeModel(verts: *const [6][4]f32, vp: [4]f32, cull: u2, m: *EdgeModel) void 
             if (!model3d.depthInRange(z, -1, 1, zs, zo)) continue;
             const q = model3d.depthWord(z);
             const i = py * EW + px;
-            if (q >= m.z[i]) continue;
-            m.z[i] = q;
+            if (depth) {
+                if (q >= m.z[i]) continue;
+                m.z[i] = q;
+            }
             m.hits[i] += 1;
         };
     }
@@ -584,7 +621,9 @@ fn hitsOf(red: u8) u8 {
     return 3;
 }
 
-fn edgeVertex(k: *kir.Kernel) void {
+/// Step 4's vertex program: the vertex's clip position from binding 1
+/// (16 bytes a vertex), by its index.
+pub fn edgeVertex(k: *kir.Kernel) void {
     const io = k.binding();
     const vb = k.binding();
     const vid = k.load(.u32, nvidia_gl.ioMem(io, nvidia_gl.VERTEX_ID, false), kir.u(0));
@@ -597,147 +636,225 @@ fn edgeVertex(k: *kir.Kernel) void {
     }
 }
 
-fn edgePixel(k: *kir.Kernel) void {
+/// Step 4's pixel program: a quarter of red (a hit, added ONE + ONE).
+pub fn edgePixel(k: *kir.Kernel) void {
     const io = k.binding();
     _ = k.binding();
     const color = [4]f32{ 0.25, 0, 0, 0 };
     for (color, 0..) |x, c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(x));
 }
 
-fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res: *Hardware) void {
-    if (!d.caps.graphics) {
+/// Step 4's groups (the prose above).
+const EdgeGroup = enum { triangles, culling, depth_less, depth_equal };
+const EdgeGroupOf = struct { g: EdgeGroup, label: []const u8, what: []const u8 };
+const edge_groups = [_]EdgeGroupOf{
+    .{ .g = .triangles, .label = "4a", .what = "triangles: nvidia_gl's programs, TRIANGLES, the viewport's depth, the provoking vertex, the front face; a pitch target, no depth" },
+    .{ .g = .culling, .label = "4b", .what = "culling: OGL_SET_CULL_FACE, OGL_SET_CULL; a pitch target, no depth" },
+    .{ .g = .depth_less, .label = "4c", .what = "depth LESS, written: a block-linear colour target, an S8Z24 depth target (SET_ZT_*, SET_DEPTH_*)" },
+    .{ .g = .depth_equal, .label = "4d", .what = "depth EQUAL against the compute path's depths, not written (block linear)" },
+};
+
+fn inGroup(g: EdgeGroup, sc: EdgeScene) bool {
+    return switch (g) {
+        .triangles => sc.cull == 0,
+        .culling => sc.cull != 0,
+        .depth_less, .depth_equal => true,
+    };
+}
+
+/// The draws step 4 makes (each group's scenes, rows up and flipped).
+pub const EDGE_RUNS = blk: {
+    var n: u32 = 0;
+    for (edge_groups) |g| {
+        for (edge_scenes) |sc| n += 2 * @as(u32, @intFromBool(inGroup(g.g, sc)));
+    }
+    break :blk n;
+};
+
+/// Byte offset of pixel (x, y) of a 64 x 32 RGBA8 target: rows, or block
+/// linear as the depth target (E_GOBS).
+fn pixelAt(block: bool, x: usize, y: usize) usize {
+    return if (block) model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y)) else (y * EW + x) * 4;
+}
+
+fn edges(d0: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res: *Hardware, opts: TestOptions) ?gpu.Device {
+    if (!d0.caps.graphics) {
         hsay(log, "step 4, edges: the device offers no graphics dispatches: not run", .{});
         res.edge_skipped = true;
-        return;
+        return d0;
     }
     var vk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "edges_vs", .{ 1, 1, 1 });
     edgeVertex(&vk);
-    var pk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "edges_ps", .{ 1, 1, 1 });
     const vbin = blk: {
         vk.finish() catch |e| break :blk e;
         st.asm_work.sched = .{};
-        break :blk nvidia_gl.compileStage(&vk, d.caps, st, .vertex, 0, &E.vcode);
+        break :blk nvidia_gl.compileStage(&vk, d0.caps, st, .vertex, 0, &E.vcode);
     } catch |e| {
         hsay(log, "step 4, edges: the vertex program did not compile ({s}): not run", .{@errorName(e)});
         res.edge_skipped = true;
-        return;
+        return d0;
     };
     // (the vertex program's KIR is spent: its storage is the pixel's now)
-    pk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "edges_ps", .{ 1, 1, 1 });
+    var pk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "edges_ps", .{ 1, 1, 1 });
     edgePixel(&pk);
     const pbin = blk: {
         pk.finish() catch |e| break :blk e;
         st.asm_work.sched = .{};
-        break :blk nvidia_gl.compileStage(&pk, d.caps, st, .pixel, 0, &E.pcode);
+        break :blk nvidia_gl.compileStage(&pk, d0.caps, st, .pixel, 0, &E.pcode);
     } catch |e| {
         hsay(log, "step 4, edges: the pixel program did not compile ({s}): not run", .{@errorName(e)});
         res.edge_skipped = true;
-        return;
+        return d0;
     };
-    const vp = d.load(&vbin) catch |e| {
-        hsay(log, "step 4, edges: the vertex program did not load ({s}): not run", .{@errorName(e)});
+    var d = d0;
+    for (edge_groups) |grp| {
+        switch (edgeGroup(d, &vbin, &pbin, grp, log, now_us, res)) {
+            .done => {},
+            .stop => return d,
+            .lost => {
+                res.groups_lost += 1;
+                if (res.lost_group.len == 0) res.lost_group = grp.label;
+                d = reopened(opts, log, grp.label) orelse {
+                    res.lost = true;
+                    return null;
+                };
+            },
+        }
+    }
+    return d;
+}
+
+/// A fresh channel after a draw lost one (opts.reopen), said; null: none.
+fn reopened(opts: TestOptions, log: draw.Log, label: []const u8) ?gpu.Device {
+    const r = opts.reopen orelse {
+        hsay(log, "step {s} lost the channel: nothing after it runs", .{label});
+        return null;
+    };
+    const nd = r() orelse {
+        hsay(log, "step {s} lost the channel, and no fresh one was had: nothing after it runs", .{label});
+        return null;
+    };
+    hsay(log, "step {s} lost the channel: what follows runs on a fresh one", .{label});
+    return nd;
+}
+
+const Outcome = enum { done, stop, lost };
+
+fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, grp: EdgeGroupOf, log: draw.Log, now_us: Clock, res: *Hardware) Outcome {
+    const vp = d.load(vbin) catch |e| {
+        hsay(log, "step {s}, edges: the vertex program did not load ({s}): not run", .{ grp.label, @errorName(e) });
         res.edge_skipped = true;
-        return;
+        return .stop;
     };
     defer d.unload(&vp);
-    const pp = d.load(&pbin) catch |e| {
-        hsay(log, "step 4, edges: the pixel program did not load ({s}): not run", .{@errorName(e)});
+    const pp = d.load(pbin) catch |e| {
+        hsay(log, "step {s}, edges: the pixel program did not load ({s}): not run", .{ grp.label, @errorName(e) });
         res.edge_skipped = true;
-        return;
+        return .stop;
     };
     defer d.unload(&pp);
     const vb = d.alloc(6 * 16, .host) catch return noMemory(log, res);
     defer d.free(vb);
-    const target = d.alloc(EW * EH * 4, .host) catch return noMemory(log, res);
+    const target = d.alloc(E_DEPTH_BYTES, .host) catch return noMemory(log, res);
     defer d.free(target);
     const depth = d.alloc(E_DEPTH_BYTES, .host) catch return noMemory(log, res);
     defer d.free(depth);
+    const block = grp.g == .depth_less or grp.g == .depth_equal;
     const add = gpu.GraphicsBlend{ .src_rgb = .one, .dst_rgb = .one, .src_a = .one, .dst_a = .one };
+    hsay(log, "step {s}, edges: {s}", .{ grp.label, grp.what });
     for ([_]bool{ false, true }) |flipped| {
         for (edge_scenes) |sc| {
+            if (!inGroup(grp.g, sc)) continue;
+            const fl = if (flipped) " (flipped)" else "";
             const vpw = [4]f32{ EW / 2, if (flipped) -@as(f32, EH / 2) else EH / 2, EW / 2, if (flipped) @as(f32, EH) - EH / 2 else EH / 2 };
             E.verts = edgeVerts(sc);
             @memcpy(vb.cpu[0 .. 6 * 16], std.mem.sliceAsBytes(&E.verts));
             d.toDevice(vb, 0, 6 * 16);
-            edgeModel(&E.verts, vpw, sc.cull, &E.m);
+            edgeModel(&E.verts, vpw, sc.cull, block, &E.m);
+            // the target cleared; the depth 1 (LESS) or the model's (EQUAL)
+            @memset(target.cpu[0..E_DEPTH_BYTES], 0);
+            d.toDevice(target, 0, E_DEPTH_BYTES);
+            if (block) {
+                for (0..EH) |y| for (0..EW) |x| {
+                    std.mem.writeInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], if (grp.g == .depth_less) 0xff_ffff else E.m.z[y * EW + x], .little);
+                };
+                d.toDevice(depth, 0, E_DEPTH_BYTES);
+            }
+            const g = gpu.Graphics{
+                .vertex = &vp,
+                .va = target.gpu,
+                .width = EW,
+                .height = EH,
+                .stride = E_PITCH,
+                .format = .rgba8,
+                .gobs_log2 = if (block) E_GOBS else null,
+                .blend = add,
+                .scale = .{ vpw[0], vpw[1], 0.5 },
+                .offset = .{ vpw[2], vpw[3], 0.5 },
+                .scissor = .{ 0, 0, EW, EH },
+                .count = 6,
+                .cull = sc.cull,
+                .front_ccw = true,
+                .depth = if (block) .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = grp.g == .depth_less, .func = if (grp.g == .depth_less) 1 else 2 } else null,
+            };
+            const t0 = now_us();
+            const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {
+                hsay(log, "step {s}, edges, '{s}'{s}: the draw was not sent ({s}): not run", .{ grp.label, sc.name, fl, @errorName(e) });
+                if (e == error.DeviceLost) return .lost;
+                res.edge_skipped = true;
+                continue;
+            };
+            d.wait(fence, STEP_US) catch |e| {
+                hsay(log, "step {s}, edges, '{s}'{s}: FAILED: the draw did not finish ({s} after {d} us): the channel is lost; the group sent {s}", .{ grp.label, sc.name, fl, @errorName(e), now_us() - t0, grp.what });
+                return .lost;
+            };
+            d.fromDevice(target, 0, E_DEPTH_BYTES);
+            if (block) d.fromDevice(depth, 0, E_DEPTH_BYTES);
             var cover_apart: u32 = 0;
             var depth_apart: u32 = 0;
             var equal_apart: u32 = 0;
             var want: u32 = 0;
             var drawn: u32 = 0;
             var listed: u32 = 0;
-            for (0..2) |pass| {
-                // the target cleared; the depth 1 (pass 0) or the model's
-                @memset(target.cpu[0 .. EW * EH * 4], 0);
-                d.toDevice(target, 0, EW * EH * 4);
-                for (0..EH) |y| for (0..EW) |x| {
-                    const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
-                    std.mem.writeInt(u32, depth.cpu[at..][0..4], if (pass == 0) 0xff_ffff else E.m.z[y * EW + x], .little);
-                };
-                d.toDevice(depth, 0, E_DEPTH_BYTES);
-                const g = gpu.Graphics{
-                    .vertex = &vp,
-                    .va = target.gpu,
-                    .width = EW,
-                    .height = EH,
-                    .stride = EW * 4,
-                    .format = .rgba8,
-                    .blend = add,
-                    .scale = .{ vpw[0], vpw[1], 0.5 },
-                    .offset = .{ vpw[2], vpw[3], 0.5 },
-                    .scissor = .{ 0, 0, EW, EH },
-                    .count = 6,
-                    .cull = sc.cull,
-                    .front_ccw = true,
-                    .depth = .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = pass == 0, .func = if (pass == 0) 1 else 2 },
-                };
-                const t0 = now_us();
-                const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {
-                    hsay(log, "step 4, edges, '{s}'{s}: the draw was not sent ({s}): not run", .{ sc.name, if (flipped) " (flipped)" else "", @errorName(e) });
-                    if (e == error.DeviceLost) res.lost = true else res.edge_skipped = true;
-                    return;
-                };
-                d.wait(fence, STEP_US) catch |e| {
-                    hsay(log, "step 4, edges, '{s}'{s}: FAILED: the draw did not finish ({s} after {d} us): nothing after it runs", .{ sc.name, if (flipped) " (flipped)" else "", @errorName(e), now_us() - t0 });
-                    res.lost = true;
-                    return;
-                };
-                d.fromDevice(target, 0, EW * EH * 4);
-                d.fromDevice(depth, 0, E_DEPTH_BYTES);
-                for (0..EH) |y| for (0..EW) |x| {
-                    const i = y * EW + x;
-                    const h = hitsOf(target.cpu[i * 4]);
-                    const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
-                    const z = std.mem.readInt(u32, depth.cpu[at..][0..4], .little) & 0xff_ffff;
-                    const mh = E.m.hits[i];
-                    if (pass == 0) {
-                        want += @intFromBool(mh != 0);
-                        drawn += @intFromBool(h != 0);
-                        const cov = h != mh;
-                        const dep = !cov and mh != 0 and z != E.m.z[i];
-                        cover_apart += @intFromBool(cov);
-                        depth_apart += @intFromBool(dep);
-                        if ((cov or dep) and listed < 3) {
-                            listed += 1;
-                            hsay(log, "step 4, edges, '{s}'{s}: ({d}, {d}): the 3D engine {d} hit(s) depth {x:0>6}, the compute path's {d} depth {x:0>6}", .{ sc.name, if (flipped) " (flipped)" else "", x, y, h, z, mh, E.m.z[i] });
-                        }
-                    } else {
-                        const eq = (h != 0) != (mh != 0);
-                        equal_apart += @intFromBool(eq);
-                        if (eq and listed < 6) {
-                            listed += 1;
-                            hsay(log, "step 4, edges, '{s}'{s}, depth EQUAL against the compute path's depth {x:0>6}: ({d}, {d}) {s}", .{ sc.name, if (flipped) " (flipped)" else "", E.m.z[i], x, y, if (h != 0) "drawn, the compute path's rule has no pixel there" else "NOT drawn: the engine's depth there is not the compute path's" });
-                        }
+            for (0..EH) |y| for (0..EW) |x| {
+                const i = y * EW + x;
+                const at = pixelAt(block, x, y);
+                const h = hitsOf(target.cpu[at]);
+                const z = if (block) std.mem.readInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], .little) & 0xff_ffff else 0;
+                const mh = E.m.hits[i];
+                if (grp.g != .depth_equal) {
+                    want += @intFromBool(mh != 0);
+                    drawn += @intFromBool(h != 0);
+                    const cov = h != mh;
+                    const dep = block and !cov and mh != 0 and z != E.m.z[i];
+                    cover_apart += @intFromBool(cov);
+                    depth_apart += @intFromBool(dep);
+                    if ((cov or dep) and listed < 3) {
+                        listed += 1;
+                        hsay(log, "step {s}, edges, '{s}'{s}: ({d}, {d}): the 3D engine {d} hit(s) depth {x:0>6}, the compute path's {d} depth {x:0>6}", .{ grp.label, sc.name, fl, x, y, h, z, mh, E.m.z[i] });
                     }
-                };
-            }
+                } else {
+                    const eq = (h != 0) != (mh != 0);
+                    equal_apart += @intFromBool(eq);
+                    if (eq and listed < 6) {
+                        listed += 1;
+                        hsay(log, "step {s}, edges, '{s}'{s}, depth EQUAL against the compute path's depth {x:0>6}: ({d}, {d}) {s}", .{ grp.label, sc.name, fl, E.m.z[i], x, y, if (h != 0) "drawn, the compute path's rule has no pixel there" else "NOT drawn: the engine's depth there is not the compute path's" });
+                    }
+                }
+            };
             res.edge_scenes += 1;
             res.edge_cover_apart += cover_apart;
             res.edge_depth_apart += depth_apart;
             res.edge_equal_apart += equal_apart;
-            hsay(log, "step 4, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, {d} depths apart; depth EQUAL against the compute path's depths: {d} pixels otherwise: {s}", .{ sc.name, if (flipped) " (flipped)" else "", drawn, want, cover_apart, depth_apart, equal_apart, if (cover_apart + depth_apart + equal_apart == 0) "EXACT" else "APART" });
+            const verdict = if (cover_apart + depth_apart + equal_apart == 0) "EXACT" else "APART";
+            switch (grp.g) {
+                .triangles, .culling => hsay(log, "step {s}, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, in {d} us: {s}", .{ grp.label, sc.name, fl, drawn, want, cover_apart, now_us() - t0, verdict }),
+                .depth_less => hsay(log, "step {s}, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, {d} depths apart, in {d} us: {s}", .{ grp.label, sc.name, fl, drawn, want, cover_apart, depth_apart, now_us() - t0, verdict }),
+                .depth_equal => hsay(log, "step {s}, edges, '{s}'{s}: depth EQUAL against the compute path's depths: {d} pixels otherwise, in {d} us: {s}", .{ grp.label, sc.name, fl, equal_apart, now_us() - t0, verdict }),
+            }
         }
     }
+    return .done;
 }
 
 // ── 5. What else galaxy-gl's draws put on the 3D engine ─────────────────────
@@ -975,6 +1092,12 @@ fn featureModel(kind: FeatureKind, m: *FeatureModel) void {
     }
 }
 
+/// Whether a scene draws with a depth target (its colour target then block
+/// linear: RT_LINEAR_WITH_ZETA); the others draw into rows with none.
+fn featureDepth(kind: FeatureKind) bool {
+    return kind == .frag_depth or kind == .two_sided_stencil;
+}
+
 /// A scene's state beside the target and the depth.
 fn featureGraphics(kind: FeatureKind, g: *gpu.Graphics) void {
     switch (kind) {
@@ -997,11 +1120,28 @@ fn near(a: u8, b: u8) bool {
     return (if (a > b) a - b else b - a) <= 2;
 }
 
-fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res: *Hardware) void {
-    if (!d.caps.graphics) {
+fn features(d0: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res: *Hardware, opts: TestOptions) void {
+    if (!d0.caps.graphics) {
         res.feature_skipped = true;
         return;
     }
+    var d = d0;
+    var from: usize = 0;
+    while (featuresFrom(d, from, st, log, now_us, res)) |lost| {
+        // (scene `lost` lost the channel: the ones after it on a fresh one)
+        res.groups_lost += 1;
+        if (res.lost_group.len == 0) res.lost_group = "5";
+        d = reopened(opts, log, "5") orelse {
+            res.lost = true;
+            return;
+        };
+        from = lost + 1;
+    }
+}
+
+/// Step 5's scenes from `from` on: null when they ran (or could not), else
+/// the scene whose draw lost the channel.
+fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res: *Hardware) ?usize {
     var vk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "features_vs", .{ 1, 1, 1 });
     edgeVertex(&vk);
     const vbin = blk: {
@@ -1011,17 +1151,17 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
     } catch |e| {
         hsay(log, "step 5, features: the vertex program did not compile ({s}): not run", .{@errorName(e)});
         res.feature_skipped = true;
-        return;
+        return null;
     };
     const vp = d.load(&vbin) catch |e| {
         hsay(log, "step 5, features: the vertex program did not load ({s}): not run", .{@errorName(e)});
         res.feature_skipped = true;
-        return;
+        return null;
     };
     defer d.unload(&vp);
     const vb = d.alloc(FEATURE_VERTS * 16, .host) catch return featuresNoMemory(log, res);
     defer d.free(vb);
-    const target = d.alloc(EW * EH * 4, .host) catch return featuresNoMemory(log, res);
+    const target = d.alloc(E_DEPTH_BYTES, .host) catch return featuresNoMemory(log, res);
     defer d.free(target);
     const depth = d.alloc(E_DEPTH_BYTES, .host) catch return featuresNoMemory(log, res);
     defer d.free(depth);
@@ -1031,7 +1171,9 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
     defer d.free(ibuf);
     @memcpy(ibuf.cpu[0 .. restart_indices.len * 2], std.mem.sliceAsBytes(&restart_indices));
     d.toDevice(ibuf, 0, 64);
-    for (feature_scenes) |sc| {
+    for (feature_scenes, 0..) |sc, si| {
+        if (si < from) continue;
+        const block = featureDepth(sc.kind);
         const nverts = featureVerts(sc.kind, &F.verts);
         @memcpy(vb.cpu[0 .. nverts * 16], std.mem.sliceAsBytes(F.verts[0..nverts]));
         d.toDevice(vb, 0, nverts * 16);
@@ -1053,8 +1195,8 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
         };
         defer d.unload(&pp);
         featureModel(sc.kind, &F.m);
-        @memset(target.cpu[0 .. EW * EH * 4], 0);
-        d.toDevice(target, 0, EW * EH * 4);
+        @memset(target.cpu[0..E_DEPTH_BYTES], 0);
+        d.toDevice(target, 0, E_DEPTH_BYTES);
         @memset(target2.cpu[0 .. EW * EH * 4], 0);
         d.toDevice(target2, 0, EW * EH * 4);
         for (0..EH) |y| for (0..EW) |x| {
@@ -1069,11 +1211,12 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
             .height = EH,
             .stride = EW * 4,
             .format = .rgba8,
+            .gobs_log2 = if (block) E_GOBS else null,
             .scale = .{ EW / 2, EH / 2, 0.5 },
             .offset = .{ EW / 2, EH / 2, 0.5 },
             .scissor = .{ 0, 0, EW, EH },
             .count = nverts,
-            .depth = .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 },
+            .depth = if (block) .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 } else null,
         };
         featureGraphics(sc.kind, &g);
         if (sc.kind == .mrt) g.more[1] = .{ .va = target2.gpu, .stride = EW * 4, .format = .bgra8 };
@@ -1085,19 +1228,15 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
         const t0 = now_us();
         const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {
             hsay(log, "step 5, '{s}': the draw was not sent ({s}): not run", .{ sc.name, @errorName(e) });
-            if (e == error.DeviceLost) {
-                res.lost = true;
-                return;
-            }
+            if (e == error.DeviceLost) return si;
             res.feature_skipped = true;
             continue;
         };
         d.wait(fence, STEP_US) catch |e| {
-            hsay(log, "step 5, '{s}': FAILED: the draw did not finish ({s} after {d} us): nothing after it runs", .{ sc.name, @errorName(e), now_us() - t0 });
-            res.lost = true;
-            return;
+            hsay(log, "step 5, '{s}': FAILED: the draw did not finish ({s} after {d} us): the channel is lost ({s})", .{ sc.name, @errorName(e), now_us() - t0, if (block) "a block-linear colour target, an S8Z24 depth target" else "a pitch target, no depth" });
+            return si;
         };
-        d.fromDevice(target, 0, EW * EH * 4);
+        d.fromDevice(target, 0, E_DEPTH_BYTES);
         d.fromDevice(target2, 0, EW * EH * 4);
         d.fromDevice(depth, 0, E_DEPTH_BYTES);
         var apart: u32 = 0;
@@ -1106,9 +1245,9 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
         var listed: u32 = 0;
         for (0..EH) |y| for (0..EW) |x| {
             const i = y * EW + x;
-            const got = target.cpu[i * 4 ..][0..4].*;
-            const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
-            const w = std.mem.readInt(u32, depth.cpu[at..][0..4], .little);
+            const got = target.cpu[pixelAt(block, x, y)..][0..4].*;
+            const at = pixelAt(true, x, y);
+            const w = if (block) std.mem.readInt(u32, depth.cpu[at..][0..4], .little) else F.m.z[i] | @as(u32, F.m.s[i]) << 24;
             const mc = F.m.color[i];
             drawn += @intFromBool(!std.mem.allEqual(u8, &got, 0));
             want += @intFromBool(!std.mem.allEqual(u8, &mc, 0));
@@ -1129,16 +1268,19 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
         res.feature_apart += apart;
         hsay(log, "step 5, '{s}': the 3D engine drew {d} pixels, the model {d}; {d} pixels apart (colour, depth word or stencil) in {d} us: {s}", .{ sc.name, drawn, want, apart, now_us() - t0, if (apart == 0) "EXACT" else "APART" });
     }
+    return null;
 }
 
-fn featuresNoMemory(log: draw.Log, res: *Hardware) void {
+fn featuresNoMemory(log: draw.Log, res: *Hardware) ?usize {
     hsay(log, "step 5, features: no memory for its buffers: not run", .{});
     res.feature_skipped = true;
+    return null;
 }
 
-fn noMemory(log: draw.Log, res: *Hardware) void {
+fn noMemory(log: draw.Log, res: *Hardware) Outcome {
     hsay(log, "step 4, edges: no memory for its buffers: not run", .{});
     res.edge_skipped = true;
+    return .stop;
 }
 
 // ── Tests: the emulated RTX through the interface ───────────────────────────
@@ -1146,8 +1288,8 @@ fn noMemory(log: draw.Log, res: *Hardware) void {
 const testing = std.testing;
 
 const T = struct {
-    var arena: [8 << 20]u8 align(4096) = undefined;
-    var gpu_view: [8 << 20]u8 align(4096) = undefined;
+    var arena: [16 << 20]u8 align(4096) = undefined;
+    var gpu_view: [16 << 20]u8 align(4096) = undefined;
     var work: nvidia.sm120_emu.Work = .{};
     var engine: nvidia.emu3d.Engine = .{};
     var dev: nvidia.device.EmuDevice = undefined;
@@ -1233,8 +1375,8 @@ test "nvidia_draw: the hardware test, step by step, on the emulated RTX: every c
     try testing.expect(!res.lost);
     // (step 4 needs the adapter: tests/test_gfxapi_draw.sig runs it)
     try testing.expect(res.edge_skipped);
-    // (the fill rate's 8 MiB are more than the emulated RTX's arena holds)
-    try testing.expectEqual(@as(u32, 0), res.mpx_per_s);
+    // (the fill rate measured, its 8 MiB in the emulated RTX's arena)
+    try testing.expect(res.mpx_per_s > 0);
 }
 
 test "nvidia_draw: the hardware test stops at step 1 when the channel has no 3D engine" {

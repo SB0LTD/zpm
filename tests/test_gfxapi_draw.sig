@@ -1452,7 +1452,7 @@ test "draw: stencil operations on emulated Adreno and RTX with separate and pack
     }
 }
 
-test "draw: stencil operations through the emulated RTX's 3D engine (packed depth-stencil, block linear), separate ones on the compute kernels" {
+test "draw: stencil operations with the emulated RTX's 3D engine on: on the compute kernels (a depth-stencil image beside GL's colour rows is RT_LINEAR_WITH_ZETA), the CPU's bytes" {
     for ([_]bool{ false, true }) |separate| {
         Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
         Rtx.dev.withEngine(&Rtx3d.engine3d);
@@ -1466,7 +1466,11 @@ test "draw: stencil operations through the emulated RTX's 3D engine (packed dept
         try std.testing.expect(!eng_rtx.lost);
         std.debug.print("stencil scene (separate {}): {d} draws through the 3D engine, {d} on the compute kernels\n", .{ separate, eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws });
         for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("stencil scene: on the compute kernels: {s}\n", .{w});
-        if (!separate) try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
+        // (the engine would lose the channel to such a draw: Xid 69, the
+        // Legion's drawtest, pc-all; nvidia_draw's step 4c draws depth into
+        // block-linear colour instead)
+        try std.testing.expectEqual(@as(u64, 0), eng_rtx.stats.graphics_draws);
+        try std.testing.expect(eng_rtx.stats.compute_draws > 0);
     }
 }
 
@@ -1579,6 +1583,12 @@ test "draw: the scene through the emulated RTX's 3D engine where it draws, the c
 /// tested EQUAL. A pixel of the pair is hit by both passes (128) when
 /// the two rasterizers cover it alike and give it the same depth bits;
 /// once (64), or twice in a pass, is a crack, a double hit or z-fighting.
+/// (GL's colour images are rows, and the 3D engine takes a depth target
+/// only beside block-linear colour (RT_LINEAR_WITH_ZETA: the Legion lost
+/// its channel to it, Xid 69), so the engine keeps every one of these
+/// draws on the compute kernels however `on3d` asks: none may reach the
+/// 3D engine. nvidia_draw's steps 4c and 4d hold the 3D engine's depth to
+/// the compute path's, with block-linear colour.)
 fn sharedEdge(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, pts: [4][2]f32, on3d: [2]bool, out: []u8) !void {
     e.fill(img, img.bounds(), 0, 0);
     e.fill(depth, depth.bounds(), 0x00ff_ffff, 0xff00_0000);
@@ -1601,7 +1611,7 @@ fn sharedEdge(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *
             if (!e.draw(&d)) return error.NotDrawn;
             e.finish();
             if (e.lost or e.why_pipe != null) return error.EngineLost;
-            if (e.stats.graphics_draws - before != @intFromBool(hw)) {
+            if (e.stats.graphics_draws != before) {
                 for (e.said_compute) |w| if (w.len != 0) std.debug.print("shared edge: on the compute kernels: {s}\n", .{w});
                 return error.WrongRasterizer;
             }
@@ -1619,7 +1629,7 @@ fn hits(red: u8) u8 {
     return 3;
 }
 
-test "draw: two triangles sharing an edge, one on the RTX's 3D engine and one on the compute kernels: no gap, no pixel twice, the same depth" {
+test "draw: two triangles sharing an edge with depth, the RTX's 3D engine on: every draw kept on the compute kernels (RT_LINEAR_WITH_ZETA), no gap, no pixel twice, the same depth" {
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
     Rtx.dev.withEngine(&Rtx3d.engine3d);
     eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
@@ -1688,7 +1698,7 @@ test "draw: the drawtest boot's hardware test on the emulated RTX, step 4 (edges
     try std.testing.expect(res.started and res.object and res.state and !res.lost);
     try std.testing.expectEqual(@as(u32, 0), res.failed);
     try std.testing.expect(!res.edge_skipped);
-    try std.testing.expectEqual(@as(u32, 2 * gpu.nvidia_draw.EDGE_SCENES), res.edge_scenes);
+    try std.testing.expectEqual(gpu.nvidia_draw.EDGE_RUNS, res.edge_scenes);
     try std.testing.expectEqual(@as(u32, 0), res.edge_cover_apart);
     try std.testing.expectEqual(@as(u32, 0), res.edge_depth_apart);
     try std.testing.expectEqual(@as(u32, 0), res.edge_equal_apart);
@@ -1696,6 +1706,197 @@ test "draw: the drawtest boot's hardware test on the emulated RTX, step 4 (edges
     try std.testing.expect(!res.feature_skipped);
     try std.testing.expectEqual(@as(u32, gpu.nvidia_draw.FEATURE_SCENES), res.feature_scenes);
     try std.testing.expectEqual(@as(u32, 0), res.feature_apart);
+}
+
+// ── The drawtest's steps 4 and 5: a lost group, the pc-all stream ─────────
+
+/// A raw device over the emulated RTX that loses the channel (its wait
+/// says DeviceLost) at the first push selecting a depth target, once, as
+/// the Legion's RTX did at pc-all's first triangle; adapters over it.
+const Lossy = struct {
+    const nv = @import("nvidia");
+    const nd = gpu.nvidia_draw;
+    var inner: nv.device.Device = undefined;
+    var armed = false;
+    var lose_next = false;
+    var lost: u32 = 0;
+    var tag: u8 = 0;
+    var adapters: [2]gpu.nvidia_device.Adapter = .{ .{}, .{} };
+    var next: usize = 0;
+    const vt = nv.device.Device.VTable{ .alloc = alloc, .free = free, .submit = submit, .wait = wait, .toDevice = toDev, .fromDevice = fromDev };
+
+    fn device() nv.device.Device {
+        return .{ .ctx = @ptrCast(&tag), .vtable = &vt };
+    }
+    fn alloc(_: *anyopaque, size: usize) ?nv.device.Buffer {
+        return inner.vtable.alloc(inner.ctx, size);
+    }
+    fn free(_: *anyopaque, b: nv.device.Buffer) void {
+        inner.vtable.free(inner.ctx, b);
+    }
+    fn submit(_: *anyopaque, pb: nv.device.Buffer, dwords: u32) nv.device.Error!nv.device.Fence {
+        const zt = nv.push.headerImmd(nv.draw.SUBCH, nv.draw.SET_ZT_SELECT, 1);
+        if (armed and std.mem.indexOfScalar(u32, pb.words()[0..dwords], zt) != null) {
+            armed = false;
+            lose_next = true;
+        }
+        return inner.vtable.submit(inner.ctx, pb, dwords);
+    }
+    fn wait(_: *anyopaque, f: nv.device.Fence, t: u64) nv.device.Error!void {
+        if (lose_next) {
+            lose_next = false;
+            lost += 1;
+            return error.DeviceLost;
+        }
+        return inner.vtable.wait(inner.ctx, f, t);
+    }
+    fn toDev(_: *anyopaque, b: nv.device.Buffer, o: usize, l: usize) void {
+        inner.vtable.toDevice(inner.ctx, b, o, l);
+    }
+    fn fromDev(_: *anyopaque, b: nv.device.Buffer, o: usize, l: usize) void {
+        inner.vtable.fromDevice(inner.ctx, b, o, l);
+    }
+    /// The emulated RTX with its 3D engine, afresh, under it.
+    fn fresh() void {
+        Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+        Rtx3d.engine3d = .{};
+        Rtx.dev.withEngine(&Rtx3d.engine3d);
+        inner = Rtx.dev.raw.device();
+        next = 0;
+        armed = false;
+    }
+    /// gpu/nvidia_device's adapter over it (a fresh one each time; the one
+    /// before released: its channel lost).
+    fn adapter() gpu.Device {
+        if (next != 0) adapters[(next - 1) % adapters.len].release();
+        const a = &adapters[next % adapters.len];
+        next += 1;
+        a.* = .{};
+        return gpu.nvidia_device.over(a, device(), null, gpu.nvidia_device.withGraphics(gpu.nvidia_device.rtx5070(0)));
+    }
+    fn last() *gpu.nvidia_device.Adapter {
+        return &adapters[(next - 1) % adapters.len];
+    }
+    fn reopen() ?gpu.Device {
+        return adapter();
+    }
+    var said_lost: bool = false;
+    var said_fresh: bool = false;
+    fn say(line: []const u8) void {
+        if (std.mem.indexOf(u8, line, "step 4c") != null and std.mem.indexOf(u8, line, "FAILED") != null) said_lost = true;
+        if (std.mem.indexOf(u8, line, "runs on a fresh one") != null) said_fresh = true;
+        if (std.mem.indexOf(u8, line, "APART") != null or std.mem.indexOf(u8, line, "lost") != null) std.debug.print("[nv] {s}\n", .{line});
+    }
+    fn silent(_: []const u8) void {}
+};
+
+test "draw: the drawtest's lost group is named, and with a fresh channel the groups after it run (step 4c lost as pc-all's first triangle was)" {
+    const nd = gpu.nvidia_draw;
+    Lossy.fresh();
+    Lossy.armed = true;
+    Lossy.lost = 0;
+    Lossy.said_lost = false;
+    Lossy.said_fresh = false;
+    const res = nd.hardwareTestWith(Lossy.device(), Lossy.adapter(), &HwTest.over, &HwTest.kst, &HwTest.model, &Lossy.say, &HwTest.clock, .{ .reopen = &Lossy.reopen });
+    try std.testing.expectEqual(@as(u32, 1), Lossy.lost);
+    try std.testing.expect(Lossy.said_lost and Lossy.said_fresh);
+    try std.testing.expect(!res.lost);
+    try std.testing.expectEqual(@as(u32, 1), res.groups_lost);
+    try std.testing.expectEqualStrings("4c", res.lost_group);
+    // (4a and 4b ran before it; 4d and step 5 after it, on the fresh one)
+    try std.testing.expect(res.edge_scenes > 0 and res.edge_scenes < nd.EDGE_RUNS);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_cover_apart + res.edge_depth_apart + res.edge_equal_apart);
+    try std.testing.expectEqual(@as(u32, nd.FEATURE_SCENES), res.feature_scenes);
+    try std.testing.expectEqual(@as(u32, 0), res.feature_apart);
+    // (without reopen the test ends at the lost group)
+    Lossy.fresh();
+    Lossy.armed = true;
+    const end = nd.hardwareTest(Lossy.device(), Lossy.adapter(), &HwTest.over, &HwTest.kst, &HwTest.model, &Lossy.silent, &HwTest.clock);
+    try std.testing.expect(end.lost);
+    try std.testing.expectEqualStrings("4c", end.lost_group);
+    try std.testing.expectEqual(@as(u32, 0), end.feature_scenes);
+}
+
+const PcAll = struct {
+    var insts: [256]kir.Inst = undefined;
+    var tys: [512]kir.Ty = undefined;
+    var vcode: [16 * 1024]u8 align(16) = undefined;
+    var pcode: [16 * 1024]u8 align(16) = undefined;
+};
+
+test "draw: the pc-all stream (a depth target beside a pitch colour target) is refused by the adapter before it is sent, and by the emulated engine (RT_LINEAR_WITH_ZETA); block linear is drawn" {
+    const nv = @import("nvidia");
+    const nd = gpu.nvidia_draw;
+    const gl = gpu.nvidia_gl;
+    Lossy.fresh();
+    const d = Lossy.adapter();
+    const st = &HwTest.kst;
+    var vk = kir.Kernel.init(.{ .insts = &PcAll.insts, .tys = &PcAll.tys }, "edges_vs", .{ 1, 1, 1 });
+    nd.edgeVertex(&vk);
+    try vk.finish();
+    st.asm_work.sched = .{};
+    const vbin = try gl.compileStage(&vk, d.caps, st, .vertex, 0, &PcAll.vcode);
+    var pk = kir.Kernel.init(.{ .insts = &PcAll.insts, .tys = &PcAll.tys }, "edges_ps", .{ 1, 1, 1 });
+    nd.edgePixel(&pk);
+    try pk.finish();
+    st.asm_work.sched = .{};
+    const pbin = try gl.compileStage(&pk, d.caps, st, .pixel, 0, &PcAll.pcode);
+    const vp = try d.load(&vbin);
+    defer d.unload(&vp);
+    const pp = try d.load(&pbin);
+    defer d.unload(&pp);
+    const vb = try d.alloc(6 * 16, .host);
+    defer d.free(vb);
+    const target = try d.alloc(nd.E_DEPTH_BYTES, .host);
+    defer d.free(target);
+    const depth = try d.alloc(nd.E_DEPTH_BYTES, .host);
+    defer d.free(depth);
+    var gr = gpu.Graphics{
+        .vertex = &vp,
+        .va = target.gpu,
+        .width = nd.EW,
+        .height = nd.EH,
+        .stride = nd.E_PITCH,
+        .format = .rgba8,
+        .scale = .{ nd.EW / 2, nd.EH / 2, 0.5 },
+        .offset = .{ nd.EW / 2, nd.EH / 2, 0.5 },
+        .scissor = .{ 0, 0, nd.EW, nd.EH },
+        .count = 6,
+        .depth = .{ .va = depth.gpu, .width = nd.EW, .height = nd.EH, .gobs_log2 = nd.E_GOBS, .tested = true, .write = true },
+    };
+    const runs = Lossy.last().runs;
+    try std.testing.expectError(error.Unsupported, d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &gr }}));
+    try std.testing.expectEqual(runs, Lossy.last().runs);
+    try std.testing.expect(std.mem.indexOf(u8, Lossy.last().refused.?, "RT_LINEAR_WITH_ZETA") != null);
+    // (block linear: drawn)
+    gr.gobs_log2 = nd.E_GOBS;
+    const f = try d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &gr }});
+    try d.wait(f, nd.STEP_US);
+    // (the same stream sent raw, past the adapter: the emulated engine
+    // refuses it, as the hardware did)
+    var buf: [nv.gl3d.MAX_DWORDS]u32 = undefined;
+    var p = nv.push.Push{ .buf = &buf };
+    nv.gl3d.emit(&p, &.{
+        .vertex = .{ .va = vp.code.gpu, .registers = 16, .bytes = vbin.code.len },
+        .pixel = .{ .va = pp.code.gpu, .registers = 16, .bytes = pbin.code.len },
+        .cb_va = target.gpu,
+        .cb_bytes = 0x400,
+        .zero_va = target.gpu,
+        .target = .{ .va = target.gpu, .width = nd.EW, .height = nd.EH, .pitch = nd.E_PITCH },
+        .format = .rgba8,
+        .scale = .{ nd.EW / 2, nd.EH / 2, 0.5 },
+        .offset = .{ nd.EW / 2, nd.EH / 2, 0.5 },
+        .scissor = .{ 0, 0, nd.EW, nd.EH },
+        .count = 6,
+        .depth = .{ .va = depth.gpu, .width = nd.EW, .height = nd.EH, .gobs_log2 = nd.E_GOBS, .tested = true, .write = true },
+    });
+    try p.check();
+    const raw = Lossy.inner;
+    const pb = try raw.alloc(p.len * 4);
+    defer raw.free(pb);
+    @memcpy(pb.words()[0..p.len], p.words());
+    try std.testing.expect(std.meta.isError(raw.run(pb, @intCast(p.len), nd.STEP_US)));
+    try std.testing.expect(std.mem.startsWith(u8, Rtx3d.engine3d.why, "RT_LINEAR_WITH_ZETA"));
 }
 
 // ── What the 3D engine draws beyond the scene, each against the CPU ───────
@@ -1885,7 +2086,7 @@ fn featureScene(e: *engine.Engine, f: Feature, img: *engine.Image, depth: *engin
 var fpool_mem: [8 << 20]u8 align(64) = undefined;
 var eng_fcpu: engine.Engine = undefined;
 
-test "draw: features through the emulated RTX's 3D engine (gl_FragDepth, gl_FrontFacing, two-sided stencil, several colour targets, indexed with primitive restart): every draw on the engine, the CPU's bytes" {
+test "draw: features through the emulated RTX's 3D engine (gl_FragDepth, gl_FrontFacing, two-sided stencil, several colour targets, indexed with primitive restart): every draw without depth on the engine, the depth ones on the compute kernels (RT_LINEAR_WITH_ZETA), the CPU's bytes" {
     Rtx3d.engine3d = .{};
     eng_fcpu.init(.{ .pool = &fpool_mem, .cpu_work = &cpu_work });
     defer eng_fcpu.deinit();
@@ -1920,13 +2121,17 @@ test "draw: features through the emulated RTX's 3D engine (gl_FragDepth, gl_Fron
             var drawn: u32 = 0;
             for (0..W * H) |p| drawn += @intFromBool(!std.mem.allEqual(u8, pics[0][p * 4 ..][0..4], 0));
             std.debug.print("feature {s} (top down {}): {d} draws on the 3D engine, {d} pixels drawn\n", .{ @tagName(f), top_down, on3d[1], drawn });
-            try std.testing.expect(on3d[1] > 0 and drawn > 0);
+            // (a scene with a depth-stencil image stays on the compute
+            // kernels: RT_LINEAR_WITH_ZETA beside GL's colour rows)
+            const with_depth = f == .frag_depth or f == .two_sided_stencil;
+            try std.testing.expect(drawn > 0);
+            if (with_depth) try std.testing.expectEqual(@as(u64, 0), on3d[1]) else try std.testing.expect(on3d[1] > 0);
             // (blending in floats: within 1 of 255)
             try std.testing.expectEqual(@as(u32, 0), apart(&pics[0], &pics[1], W, if (f == .mrt) 1 else 0, @tagName(f)));
         }
-        // (every draw of the scene went through the engine)
+        // (every draw the engine took reached the emulated engine; the
+        // compute kernels drew only the depth scenes)
         try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
-        try std.testing.expectEqual(@as(u64, 0), eng_rtx.stats.compute_draws);
     }
 }
 
