@@ -879,7 +879,11 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     }
     if (d.restart) return "primitive restart";
     if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
-    for (d.targets[1..]) |t| if (t != null) return "more than one colour target";
+    for (d.targets[1..]) |tt| {
+        const t = tt orelse continue;
+        if (!t.img.drawable()) return "a colour target the engine does not draw into";
+        if (t.img.width != d.color.width or t.img.height != d.color.height or t.img.top_down != d.color.top_down or t.img.samples != 1) return "colour targets of different sizes or orientations";
+    }
     if (d.query != null) return "an occlusion query";
     if (d.alpha_to_coverage or d.sample_mask & 1 == 0) return "alpha to coverage or a sample mask";
     if (d.bias_factor != 0 or d.bias_units != 0) return "depth bias";
@@ -1014,6 +1018,17 @@ pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     for (0..4) |c| {
         const val: Arg = if (io.color[c] == .none) f(0) else r(io.color[c]);
         k.store(.f32, io_m.at(b.io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c))), u(0), val);
+    }
+    // outputs 1 .. 7 the code writes: into targets 1 .. 7 (a draw that
+    // binds a target the code never writes stays on the compute kernels,
+    // which give it 0: engine.graphicsDraw)
+    for (1..MAX_TARGETS) |t| {
+        const col = io.colors[t];
+        if (col[0] == .none and col[1] == .none and col[2] == .none and col[3] == .none) continue;
+        for (0..4) |c| {
+            const val: Arg = if (col[c] == .none) f(0) else r(col[c]);
+            k.store(.f32, io_m.at(b.io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(4 * t + c))), u(0), val);
+        }
     }
     // gl_FragDepth: the engine tests it in place of the interpolated depth
     // (late tests: the header says the program writes it), clamped to

@@ -831,6 +831,17 @@ pub fn compileAny(k: *const kir.Kernel, caps: gpu.Caps, work: *gpu.Work, out: []
 /// What `init` needs.
 /// The channels of format `f` a draw writes, from the bits it keeps
 /// (Draw.keep, the pixel word's): bit 0 red .. bit 3 alpha.
+/// A colour target's format as the 3D engine takes it (draw.sig's: RGBA8,
+/// BGRA8, RG8, R8; renderable() has no other).
+fn targetFormatOf(f: Format) gpu.Graphics.TargetFormat {
+    return switch (f) {
+        .rgba8 => .rgba8,
+        .bgra8 => .bgra8,
+        .rg8 => .rg8,
+        else => .r8,
+    };
+}
+
 fn maskOf(f: Format, keep: u32) u4 {
     // (each channel's byte in the pixel word; none: not there)
     const at: [4]?u5 = switch (f) {
@@ -2035,7 +2046,30 @@ pub const Engine = struct {
         if (d.depth) |z| {
             if (!e.gpuUsable(z)) return null;
         }
+        // the colour targets past the first: each the output the code
+        // writes into it (one it never writes: the compute kernels give it
+        // 0, the engine would leave it), its channels and its blend
+        var more: [7]?gpu.Graphics.ColorTarget = @splat(null);
+        var more_imgs: [7]?*Image = @splat(null);
+        const written = p.gfx[1].?.bin.extra[gpu.nvidia_gl.EXTRA_OUTPUTS];
+        for (d.targets[1..], 0..) |tt, j| {
+            const x = tt orelse continue;
+            if ((written >> @intCast(4 * (j + 1))) & 0xf == 0) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("a colour target the fragment code never writes");
+                return null;
+            }
+            if (!e.gpuUsable(x.img)) return null;
+            if (x.img.buf.gpu % 128 != 0 or x.img.stride % 128 != 0) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("a target whose address or rows are not on 128 bytes");
+                return null;
+            }
+            more[j] = .{ .va = x.img.buf.gpu, .stride = x.img.stride, .format = targetFormatOf(x.img.format), .mask = maskOf(x.img.format, x.keep), .blend = x.blend };
+            more_imgs[j] = x.img;
+        }
         const g = gpu.Graphics{
+            .more = more,
             .depth = if (d.depth) |z| .{
                 .va = z.buf.gpu,
                 .width = z.width,
@@ -2053,12 +2087,7 @@ pub const Engine = struct {
             .width = t.width,
             .height = t.height,
             .stride = t.stride,
-            .format = switch (t.format) {
-                .rgba8 => .rgba8,
-                .bgra8 => .bgra8,
-                .rg8 => .rg8,
-                else => .r8,
-            },
+            .format = targetFormatOf(t.format),
             .mask = maskOf(t.format, d.keep),
             .blend = if (d.blend) |b| blendOf(b) else null,
             .scale = .{ d.half[0], if (flip) -d.half[1] else d.half[1], d.depth_scale },
@@ -2076,7 +2105,7 @@ pub const Engine = struct {
             .cull = d.cull,
             .front_ccw = d.front_ccw != flip,
         };
-        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, d.depth);
+        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, d.depth, &more_imgs);
         e.stats.graphics_draws += 1;
         if (!e.said_graphics) {
             e.said_graphics = true;
@@ -2101,7 +2130,7 @@ pub const Engine = struct {
     /// A draw through the graphics pipeline in the open batch: the pixel
     /// program as its dispatch's, `g` kept beside it; its bindings read,
     /// the target written.
-    fn recordGraphics(e: *Engine, pixel: *const gpu.Program, g: gpu.Graphics, bufs: []const *Image, params: []const u32, target: *Image, depth: ?*Image) void {
+    fn recordGraphics(e: *Engine, pixel: *const gpu.Program, g: gpu.Graphics, bufs: []const *Image, params: []const u32, target: *Image, depth: ?*Image, more: []const ?*Image) void {
         if (e.n_gfx >= e.dev.?.caps.max_graphics) e.flush();
         e.room();
         const i = e.n_ops;
@@ -2114,6 +2143,11 @@ pub const Engine = struct {
         if (depth) |z| {
             z.trk().last = e.batch;
             z.trk().gpu_wrote = true;
+        }
+        for (more) |mi| {
+            const m = mi orelse continue;
+            m.trk().last = e.batch;
+            m.trk().gpu_wrote = true;
         }
         @memcpy(e.op_params[i][0..params.len], params);
         e.op_gfx[i] = g;

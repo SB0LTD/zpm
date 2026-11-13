@@ -10,17 +10,20 @@
 //! - constant buffer 0 of both stages: the binding addresses and the
 //!   parameter words, laid out as a compute launch's (qmd.cbuf0Into), so a
 //!   program reads them as a kernel does;
-//! - the colour target (rows of bytes: RGBA8, BGRA8, RG8, R8), the
-//!   channels written, the blend (GL's factors and equations, the
-//!   constant colour), the viewport (x, y and depth: GL's -w..w clip
+//! - up to eight colour targets (rows of bytes: RGBA8, BGRA8, RG8, R8;
+//!   the pixel program's output t into target t), each's channels
+//!   written and blend on or off; the blend (GL's factors and equations,
+//!   the constant colour), the viewport (x, y and depth: GL's -w..w clip
 //!   volume), the scissor;
+//! - the depth-stencil target (S8Z24, block linear), the depth test and
+//!   write, the stencil of both faces; culling and the front face;
 //! - the primitives: triangles, a strip or a fan of `count` vertices, the
 //!   vertex's index 0 .. count - 1 (the programs fetch their attributes
 //!   and the element array themselves), `instances` times.
 //!
-//! Not yet (the GL layer keeps such draws on its compute kernels): depth
-//! and stencil targets and tests, more than one colour target, culling,
-//! points and lines, multisampling.
+//! Not yet (the GL layer keeps such draws on its compute kernels): points
+//! and lines, multisampling, primitive restart, depth textures, depth
+//! bias, clip distances.
 //!
 //! Nothing here has run on the Legion's RTX; the emulated engine (emu3d)
 //! runs it.
@@ -174,7 +177,31 @@ pub const Draw = struct {
     /// Front faces counter-clockwise in the window's coordinates (x
     /// right, y as the rows grow).
     front_ccw: bool = true,
+    /// Colour targets 1 .. 7 (null: none; one inside the highest is sent
+    /// off: format 0): as wide and high as target 0.
+    more: [7]?More = @splat(null),
 };
+
+/// A colour target past the first: rows of `pitch` bytes from `va` (128
+/// bytes apart, as the first's), its format, channels and blend.
+pub const More = struct {
+    va: u64,
+    pitch: u32,
+    format: Format,
+    mask: u4 = 0xf,
+    /// The draw's blend applies to it (else its colour replaces).
+    blend: bool = true,
+};
+
+/// SET_CT_SELECT: `count` targets, slot t its own target t (draw.sig's
+/// setup sends it for one).
+pub fn ctSelect(count: u32) u32 {
+    return 0x0fac_6880 | count;
+}
+
+fn ctWrite(mask: u4) u32 {
+    return @as(u32, mask & 1) | @as(u32, (mask >> 1) & 1) << 4 | @as(u32, (mask >> 2) & 1) << 8 | @as(u32, (mask >> 3) & 1) << 12;
+}
 
 /// OGL_SET_CULL_FACE (cl9097.h): the faces culled when OGL_SET_CULL is on.
 pub const OGL_SET_CULL_FACE: u32 = 0x1920;
@@ -210,7 +237,23 @@ pub fn emit(p: *Push, d: *const Draw) void {
     gr.target(p, .{ .va = d.target.va, .width = d.target.width, .height = d.target.height, .pitch = d.target.pitch, .format = .bgra8 });
     // the target's own format, its channels
     many(p, gr.SET_COLOR_TARGET_A + 16, &.{targetFormat(d.format)});
-    many(p, gr.SET_CT_WRITE, &.{@as(u32, d.mask & 1) | @as(u32, (d.mask >> 1) & 1) << 4 | @as(u32, (d.mask >> 2) & 1) << 8 | @as(u32, (d.mask >> 3) & 1) << 12});
+    many(p, gr.SET_CT_WRITE, &.{ctWrite(d.mask)});
+    // the other colour targets (the pixel program's outputs 1 .. 7): each
+    // its memory, format, channels and blend; CT_SELECT counts to the last
+    var count: u32 = 1;
+    for (d.more, 1..) |m, ti| {
+        const x = m orelse continue;
+        const t: u32 = @intCast(ti);
+        many(p, gr.SET_COLOR_TARGET_A + 64 * t, &.{ @truncate(x.va >> 32), @truncate(x.va), x.pitch, d.target.height, targetFormat(x.format), gr.TARGET_MEMORY_PITCH, 1, 0, 0 });
+        one(p, gr.SET_COLOR_COMPRESSION + 4 * t, 0);
+        one(p, gr.SET_CT_WRITE + 4 * t, ctWrite(x.mask));
+        if (d.blend) |b| {
+            one(p, gr.SET_BLEND + 4 * t, @intFromBool(x.blend));
+            if (x.blend) many(p, gr.SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA + 32 * t, &.{ 1, @intFromEnum(b.eq_rgb), @intFromEnum(b.src_rgb), @intFromEnum(b.dst_rgb), @intFromEnum(b.eq_a), @intFromEnum(b.src_a), @intFromEnum(b.dst_a) });
+        } else one(p, gr.SET_BLEND + 4 * t, 0);
+        count = t + 1;
+    }
+    many(p, gr.SET_CT_SELECT, &.{ctSelect(count)});
     // the viewport: x, y and depth; GL's clip volume (-w <= z <= w)
     many(p, gr.SET_VIEWPORT_SCALE_X, &.{ bits(d.scale[0]), bits(d.scale[1]), bits(d.scale[2]), bits(d.offset[0]), bits(d.offset[1]), bits(d.offset[2]) });
     one(p, gr.SET_VIEWPORT_Z_CLIP, SET_VIEWPORT_SCALE_Z_CLIP_GL);
@@ -264,8 +307,9 @@ pub fn emit(p: *Push, d: *const Draw) void {
     many(p, gr.DRAW_VERTEX_ARRAY_BEGIN_END_A, &.{ 0, d.count });
 }
 
-/// Dwords emit takes at most (draw.sig's state, and the draw's own).
-pub const MAX_DWORDS = 900;
+/// Dwords emit takes at most (draw.sig's state, and the draw's own: 26
+/// a colour target past the first).
+pub const MAX_DWORDS = 1100;
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -294,4 +338,13 @@ test "gl3d: a draw's stream fits, ends in its draw, names its programs and buffe
     const w = p.words();
     try testing.expectEqualSlices(u32, &.{ push.header(SUBCH, gr.DRAW_VERTEX_ARRAY_BEGIN_END_A, 2), 0, 6 }, w[w.len - 3 ..]);
     try testing.expect(w.len < MAX_DWORDS);
+    // every colour target, a depth target with two-sided stencil: fits
+    var all = d;
+    for (&all.more) |*m| m.* = .{ .va = 0x10_0002_0000, .pitch = 256, .format = .bgra8 };
+    all.depth = .{ .va = 0x10_0003_0000, .width = 64, .height = 32, .gobs_log2 = 2, .tested = true, .write = true, .stencil = .{}, .back = .{} };
+    p = Push{ .buf = &buf };
+    emit(&p, &all);
+    try p.check();
+    try testing.expect(p.words().len < MAX_DWORDS);
+    try testing.expectEqual(@as(u32, 0x0fac_6888), ctSelect(8));
 }

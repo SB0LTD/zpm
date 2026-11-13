@@ -483,11 +483,13 @@ pub const Adapter = struct {
             .cb_bytes = qmd.cbuf0Bytes(8 * d.buffers.len + 4 * nw),
             .zero_va = a.zero.va,
             .target = .{ .va = g.va, .width = g.width, .height = g.height, .pitch = g.stride },
-            .format = switch (g.format) {
-                .rgba8 => .rgba8,
-                .bgra8 => .bgra8,
-                .r8 => .r8,
-                .rg8 => .rg8,
+            .format = formatOf(g.format),
+            .more = more: {
+                var m: [7]?gl3d.More = @splat(null);
+                for (g.more, 0..) |x, t| {
+                    if (x) |c| m[t] = .{ .va = c.va, .pitch = c.stride, .format = formatOf(c.format), .mask = c.mask, .blend = c.blend };
+                }
+                break :more m;
             },
             .mask = g.mask,
             .blend = if (g.blend) |b| .{
@@ -669,6 +671,15 @@ fn factorOf(f: gpu.BlendFactor) gl3d.Factor {
         .one_minus_constant_color => .one_minus_constant_color,
         .constant_alpha => .constant_alpha,
         .one_minus_constant_alpha => .one_minus_constant_alpha,
+    };
+}
+
+fn formatOf(f: gpu.Graphics.TargetFormat) gl3d.Format {
+    return switch (f) {
+        .rgba8 => .rgba8,
+        .bgra8 => .bgra8,
+        .r8 => .r8,
+        .rg8 => .rg8,
     };
 }
 

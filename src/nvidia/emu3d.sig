@@ -203,7 +203,8 @@ pub const Engine = struct {
     fn validate(g: *Engine) error{BadStream}!void {
         try g.need(g.reg(gr.SET_RENDER_ENABLE_C) == 1, "rendering is not enabled (SET_RENDER_ENABLE_C)");
         try g.need(g.reg(gr.CHECK_SPH_VERSION) == 0x0003_0003 and g.reg(gr.CHECK_AAM_VERSION) == 0x0002_0002, "the header and attribute map versions were not checked (CHECK_SPH_VERSION, CHECK_AAM_VERSION)");
-        try g.need(g.reg(gr.SET_CT_SELECT) & 0x7f == 1 and g.reg(gr.SET_CT_MRT_ENABLE) == 1, "not one color target in slot 0 (SET_CT_SELECT, SET_CT_MRT_ENABLE)");
+        const cts = g.reg(gr.SET_CT_SELECT);
+        try g.need(cts & 0xf >= 1 and cts & 0xf <= 8 and cts & ~@as(u32, 0xf) == gl3d.ctSelect(0) and g.reg(gr.SET_CT_MRT_ENABLE) == 1, "not 1 to 8 color targets, slot t target t (SET_CT_SELECT, SET_CT_MRT_ENABLE)");
         try g.need(g.reg(gr.SET_ZT_SELECT) <= 1 and g.reg(gr.SET_DEPTH_BOUNDS_TEST) == 0, "more than one depth target, or a depth bounds test: not modelled");
         try g.need(g.reg(gr.SET_ZT_SELECT) == 1 or (g.reg(gr.SET_DEPTH_TEST) == 0 and g.reg(gr.SET_STENCIL_TEST) == 0), "a depth or stencil test with no depth target (SET_ZT_SELECT)");
         try g.need(g.reg(STENCIL_TWO_SIDE) <= 1, "SET_TWO_SIDED_STENCIL_TEST neither on nor off");
@@ -228,13 +229,21 @@ pub const Engine = struct {
             const n: u32 = @intCast(j);
             try g.need(g.reg(gr.SET_VERTEX_STREAM_A_FORMAT + 16 * n) & 0x1000 == 0 and g.reg(gr.SET_VERTEX_STREAM_B_FORMAT + 16 * n) & 0x1000 == 0, "a vertex stream is on: not modelled");
         }
-        try g.need(g.reg(gr.SET_BLEND_STATE_PER_TARGET) == 1 and g.reg(gr.SET_CT_WRITE) & ~@as(u32, 0x1111) == 0 and g.reg(gr.SET_COLOR_CLAMP) == 1 and g.reg(gr.SET_LOGIC_OP) == 0 and g.reg(gr.SET_ALPHA_TEST) == 0, "the color write is not: channels on or off, clamped, per-target blend state, no logic op, no alpha test");
+        try g.need(g.reg(gr.SET_BLEND_STATE_PER_TARGET) == 1 and g.reg(gr.SET_COLOR_CLAMP) == 1 and g.reg(gr.SET_LOGIC_OP) == 0 and g.reg(gr.SET_ALPHA_TEST) == 0, "the color write is not: clamped, per-target blend state, no logic op, no alpha test");
+        for (0..cts & 0xf) |ti| try g.need(g.reg(gr.SET_CT_WRITE + 4 * @as(u32, @intCast(ti))) & ~@as(u32, 0x1111) == 0, "a target's channels not each on or off (SET_CT_WRITE)");
         for ([_]u32{ 0, 2, 3, 4 }) |j| try g.need(g.reg(gr.SET_PIPELINE_SHADER + 64 * j) & 1 == 0, "a stage other than the vertex and the pixel one is on: not modelled");
     }
 
     /// Color target 0: rows of bytes, where memory is.
     fn target(g: *Engine) error{BadStream}!Target {
-        const a = gr.SET_COLOR_TARGET_A;
+        return try g.targetAt(0) orelse g.refuse("color target 0 is off (format 0)");
+    }
+
+    /// Color target `i` (null: off, its format 0): rows of bytes, where
+    /// memory is.
+    fn targetAt(g: *Engine, i: u32) error{BadStream}!?Target {
+        const a = gr.SET_COLOR_TARGET_A + 64 * i;
+        if (g.reg(a + 16) == 0) return null;
         const va = @as(u64, g.reg(a) & 0xff) << 32 | g.reg(a + 4);
         const pitch = g.reg(a + 8);
         const height = g.reg(a + 12);
@@ -248,9 +257,25 @@ pub const Engine = struct {
         try g.need(g.reg(a + 20) == gr.TARGET_MEMORY_PITCH and g.reg(a + 24) == 1 and g.reg(a + 28) == 0 and g.reg(a + 32) == 0, "the color target is not one layer of rows of bytes (LAYOUT_PITCH)");
         // (NVK: the hardware "gets grumpy" otherwise)
         try g.need(va % 128 == 0 and pitch % 128 == 0 and pitch != 0 and height != 0, "the color target's address or its rows are not multiples of 128 bytes");
-        try g.need(g.reg(gr.SET_COLOR_COMPRESSION) == 0, "color compression on plain memory");
+        try g.need(g.reg(gr.SET_COLOR_COMPRESSION + 4 * i) == 0, "color compression on plain memory");
         const bytes = g.host.mem.find(va, @as(usize, pitch) * height) orelse return g.refuse("the color target's memory is not mapped");
         return .{ .bytes = bytes, .pitch = pitch, .width = pitch / pixelBytes(format), .height = height, .format = format };
+    }
+
+    /// Target i's blend (null: off), as its SET_BLEND and per-target state
+    /// say.
+    fn blendAt(g: *Engine, i: u32) error{BadStream}!?Blend {
+        if (g.reg(gr.SET_BLEND + 4 * i) & 1 == 0) return null;
+        const b = gr.SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA + 32 * i;
+        try g.need(g.reg(b) == 1, "the alpha's blend not separate (SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA)");
+        var x = Blend{ .ops = undefined, .constant = undefined };
+        for (0..6) |k| {
+            x.ops[k] = g.reg(b + 4 + 4 * @as(u32, @intCast(k)));
+            const ok = if (k % 3 == 0) equationOk(x.ops[k]) else factorOk(x.ops[k]);
+            try g.need(ok, "a blend factor or equation that is not one of GL's");
+        }
+        for (0..4) |k| x.constant[k] = @floatCast(g.float(gr.SET_BLEND_CONST_RED + 4 * @as(u32, @intCast(k))));
+        return x;
     }
 
     /// The depth-stencil target, when one is selected: S8Z24, block linear
@@ -387,7 +412,7 @@ pub const Engine = struct {
         // vertex one stores.
         const vgroup = try g.program(gr.STAGE_VERTEX, .vertex, &g.vhead, &g.vcode, &g.vn);
         const pgroup = try g.program(gr.STAGE_PIXEL, .pixel, &g.phead, &g.pcode, &g.pn);
-        try g.need(g.phead[18] & 0xf != 0 and g.phead[18] >> 4 == 0, "the pixel program does not write target 0 alone");
+        try g.need(g.phead[18] & 0xf != 0, "the pixel program does not write target 0");
         for (GENERIC..GENERIC_END) |word| {
             const read = sph.interpOf(&g.phead, @intCast((word - GENERIC) / 4), @intCast((word - GENERIC) % 4)) != .unused;
             const was = sph.bit(&g.vhead, 400 + @as(u32, @intCast(word)));
@@ -679,26 +704,29 @@ pub const Engine = struct {
         var ps = emu.Stage{ .kind = .pixel, .header = &g.phead, .in = g.pin[0..n], .front = g.front[0..n], .killed = g.killed[0..n], .cbufs = cb, .ctx = g, .sample = &sampleCall };
         try emu.stageBegin(g.host.work, n);
         try emu.stageRun(g.host.work, &g.host.mem, &ps, n, stats);
-        var bl: ?Blend = null;
-        if (g.reg(gr.SET_BLEND) & 1 != 0) {
-            const b = gr.SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA;
-            try g.need(g.reg(b) == 1, "the alpha's blend not separate (SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA)");
-            var x = Blend{ .ops = undefined, .constant = undefined };
-            for (0..6) |k| {
-                x.ops[k] = g.reg(b + 4 + 4 * @as(u32, @intCast(k)));
-                const ok = if (k % 3 == 0) equationOk(x.ops[k]) else factorOk(x.ops[k]);
-                try g.need(ok, "a blend factor or equation that is not one of GL's");
-            }
-            for (0..4) |k| x.constant[k] = @floatCast(g.float(gr.SET_BLEND_CONST_RED + 4 * @as(u32, @intCast(k))));
-            bl = x;
+        // Each colour target SET_CT_SELECT counts that the program writes:
+        // its memory, blend, channels, and the registers its output is in
+        // (four for each target the header names, in order, as NAK leaves
+        // them; a target it does not write is left as it is).
+        const Out = struct { t: Target, bl: ?Blend, mask: u4, reg: u32 };
+        var outs: [8]Out = undefined;
+        var n_out: usize = 0;
+        var targets: u32 = 0;
+        for (0..8) |ti| {
+            const i: u32 = @intCast(ti);
+            if ((g.phead[18] >> @intCast(4 * i)) & 0xf == 0) continue;
+            const base = 4 * targets;
+            targets += 1;
+            if (i >= g.reg(gr.SET_CT_SELECT) & 0xf) continue;
+            const tt = (if (i == 0) t else try g.targetAt(i)) orelse continue;
+            const ct = g.reg(gr.SET_CT_WRITE + 4 * i);
+            const mask: u4 = @intCast((ct & 1) | ((ct >> 4) & 1) << 1 | ((ct >> 8) & 1) << 2 | ((ct >> 12) & 1) << 3);
+            outs[n_out] = .{ .t = tt, .bl = try g.blendAt(i), .mask = mask, .reg = base };
+            n_out += 1;
         }
-        const ct = g.reg(gr.SET_CT_WRITE);
-        const mask: u4 = @intCast((ct & 1) | ((ct >> 4) & 1) << 1 | ((ct >> 8) & 1) << 2 | ((ct >> 12) & 1) << 3);
         const zt = try g.depthTarget();
         // (a program that writes the depth (gl_FragDepth): its register
         // after the colours' and the sample mask's, as NAK leaves them)
-        var targets: u32 = 0;
-        for (0..8) |tt| targets += @intFromBool((g.phead[18] >> @intCast(4 * tt)) & 0xf != 0);
         const writes_depth = sph.bit(&g.phead, 609);
         for (0..n) |k| {
             if (g.killed[k] or g.helper[k]) continue;
@@ -708,9 +736,12 @@ pub const Engine = struct {
                 const zw: f32 = if (writes_depth) shaderDepth(@bitCast(emu.threadReg(g.host.work, @intCast(k), @intCast(4 * targets + 1)))) else g.zw[k];
                 if (!g.depthStencil(z, g.at[k][0], g.at[k][1], zw, g.front[k])) continue;
             }
-            var color: [4]f32 = undefined;
-            for (&color, 0..) |*ch, r| ch.* = @bitCast(emu.threadReg(g.host.work, @intCast(k), @intCast(r)));
-            write(t, g.at[k][0], g.at[k][1], color, bl, mask);
+            for (outs[0..n_out]) |o| {
+                if (g.at[k][0] >= o.t.width or g.at[k][1] >= o.t.height) continue;
+                var color: [4]f32 = undefined;
+                for (&color, 0..) |*ch, r| ch.* = @bitCast(emu.threadReg(g.host.work, @intCast(k), @intCast(o.reg + r)));
+                write(o.t, g.at[k][0], g.at[k][1], color, o.bl, o.mask);
+            }
         }
         g.pixels += n;
     }

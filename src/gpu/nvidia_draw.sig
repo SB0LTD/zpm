@@ -751,20 +751,22 @@ fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res:
 // apart and how.
 
 pub const FEATURE_SCENES = feature_scenes.len;
-const FeatureKind = enum { frag_depth, front_facing, two_sided_stencil };
+const FeatureKind = enum { frag_depth, front_facing, two_sided_stencil, mrt };
 const FeatureScene = struct { name: []const u8, kind: FeatureKind };
 const feature_scenes = [_]FeatureScene{
     .{ .name = "gl_FragDepth (x / 64 + y / 128 written, depth LESS over 1)", .kind = .frag_depth },
     .{ .name = "gl_FrontFacing (red front, green back; off-grid corners)", .kind = .front_facing },
     .{ .name = "two-sided stencil (front INCR_WRAP; back INVERT, EQUAL 1 under 0x0f, written 0xf0)", .kind = .two_sided_stencil },
+    .{ .name = "several colour targets (0 RGBA8, 1 off, 2 BGRA8: output 2 into it)", .kind = .mrt },
 };
 /// The most vertices a scene draws.
 const FEATURE_VERTS = 9;
 
-/// What the model gives a scene: each pixel's colour (RGBA bytes), depth
-/// word and stencil.
+/// What the model gives a scene: each pixel's colour (RGBA bytes; and
+/// target 2's bytes, BGRA8, for `mrt`), depth word and stencil.
 const FeatureModel = struct {
     color: [EW * EH][4]u8 = undefined,
+    color2: [EW * EH][4]u8 = undefined,
     z: [EW * EH]u32 = undefined,
     s: [EW * EH]u8 = undefined,
 };
@@ -784,7 +786,7 @@ fn clipOf(x: f32, y: f32) [4]f32 {
 fn featureVerts(kind: FeatureKind, v: *[FEATURE_VERTS][4]f32) u32 {
     const whole = [_][2]f32{ .{ 0, 0 }, .{ EW, 0 }, .{ EW, EH }, .{ 0, 0 }, .{ EW, EH }, .{ 0, EH } };
     switch (kind) {
-        .frag_depth => {
+        .frag_depth, .mrt => {
             for (whole, 0..) |p, n| v[n] = clipOf(p[0], p[1]);
             return 6;
         },
@@ -887,6 +889,11 @@ fn featurePixel(k: *kir.Kernel, kind: FeatureKind) void {
     } else for (color, 0..) |x, c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(x));
     switch (kind) {
         .front_facing, .two_sided_stencil => {},
+        // (output 2: green a half, alpha three quarters; output 1 none)
+        .mrt => {
+            const c2 = [4]f32{ 0, 0.5, 0, 0.75 };
+            for (c2, 0..) |x, c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(8 + c)), false), kir.u(0), kir.f(x));
+        },
         .frag_depth => {
             const x = k.load(.f32, nvidia_gl.ioMem(io, nvidia_gl.POSITION, false), kir.u(0));
             const y = k.load(.f32, nvidia_gl.ioMem(io, nvidia_gl.POSITION + 4, false), kir.u(0));
@@ -900,6 +907,7 @@ fn featurePixel(k: *kir.Kernel, kind: FeatureKind) void {
 /// 1, the stencil 0).
 fn featureModel(kind: FeatureKind, m: *FeatureModel) void {
     @memset(&m.color, .{ 0, 0, 0, 0 });
+    @memset(&m.color2, .{ 0, 0, 0, 0 });
     @memset(&m.z, 0xff_ffff);
     @memset(&m.s, 0);
     switch (kind) {
@@ -908,6 +916,11 @@ fn featureModel(kind: FeatureKind, m: *FeatureModel) void {
             if (q >= 0xff_ffff) continue;
             m.z[y * EW + x] = q;
             m.color[y * EW + x] = .{ 64, 0, 0, 0 };
+        },
+        .mrt => {
+            @memset(&m.color, .{ 64, 0, 0, 0 });
+            // (BGRA8's bytes: blue, green, red, alpha)
+            @memset(&m.color2, .{ 0, 128, 0, 191 });
         },
         .front_facing => for (0..2) |t| {
             const tri = ModelTri.of(&F.verts, t);
@@ -939,6 +952,7 @@ fn featureGraphics(kind: FeatureKind, g: *gpu.Graphics) void {
             g.depth.?.func = 1;
         },
         .front_facing => {},
+        .mrt => {},
         .two_sided_stencil => {
             g.depth.?.tested = true;
             g.depth.?.stencil = stencil_front;
@@ -980,6 +994,8 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
     defer d.free(target);
     const depth = d.alloc(E_DEPTH_BYTES, .host) catch return featuresNoMemory(log, res);
     defer d.free(depth);
+    const target2 = d.alloc(EW * EH * 4, .host) catch return featuresNoMemory(log, res);
+    defer d.free(target2);
     for (feature_scenes) |sc| {
         const nverts = featureVerts(sc.kind, &F.verts);
         @memcpy(vb.cpu[0 .. nverts * 16], std.mem.sliceAsBytes(F.verts[0..nverts]));
@@ -1004,6 +1020,8 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
         featureModel(sc.kind, &F.m);
         @memset(target.cpu[0 .. EW * EH * 4], 0);
         d.toDevice(target, 0, EW * EH * 4);
+        @memset(target2.cpu[0 .. EW * EH * 4], 0);
+        d.toDevice(target2, 0, EW * EH * 4);
         for (0..EH) |y| for (0..EW) |x| {
             const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
             std.mem.writeInt(u32, depth.cpu[at..][0..4], 0xff_ffff, .little);
@@ -1023,6 +1041,7 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
             .depth = .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 },
         };
         featureGraphics(sc.kind, &g);
+        if (sc.kind == .mrt) g.more[1] = .{ .va = target2.gpu, .stride = EW * 4, .format = .bgra8 };
         const t0 = now_us();
         const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {
             hsay(log, "step 5, '{s}': the draw was not sent ({s}): not run", .{ sc.name, @errorName(e) });
@@ -1039,6 +1058,7 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
             return;
         };
         d.fromDevice(target, 0, EW * EH * 4);
+        d.fromDevice(target2, 0, EW * EH * 4);
         d.fromDevice(depth, 0, E_DEPTH_BYTES);
         var apart: u32 = 0;
         var drawn: u32 = 0;
@@ -1052,14 +1072,17 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
             const mc = F.m.color[i];
             drawn += @intFromBool(!std.mem.allEqual(u8, &got, 0));
             want += @intFromBool(!std.mem.allEqual(u8, &mc, 0));
-            const color_ok = near(got[0], mc[0]) and near(got[1], mc[1]) and near(got[2], mc[2]) and near(got[3], mc[3]);
+            const got2 = target2.cpu[i * 4 ..][0..4].*;
+            const mc2 = F.m.color2[i];
+            const color_ok = near(got[0], mc[0]) and near(got[1], mc[1]) and near(got[2], mc[2]) and near(got[3], mc[3]) and
+                near(got2[0], mc2[0]) and near(got2[1], mc2[1]) and near(got2[2], mc2[2]) and near(got2[3], mc2[3]);
             const z_ok = w & 0xff_ffff == F.m.z[i];
             const s_ok = w >> 24 == F.m.s[i];
             if (color_ok and z_ok and s_ok) continue;
             apart += 1;
             if (listed < 4) {
                 listed += 1;
-                hsay(log, "step 5, '{s}': ({d}, {d}): the 3D engine {x:0>2}{x:0>2}{x:0>2}{x:0>2} depth {x:0>6} stencil {x:0>2}, the model {x:0>2}{x:0>2}{x:0>2}{x:0>2} depth {x:0>6} stencil {x:0>2}", .{ sc.name, x, y, got[0], got[1], got[2], got[3], w & 0xff_ffff, w >> 24, mc[0], mc[1], mc[2], mc[3], F.m.z[i], F.m.s[i] });
+                hsay(log, "step 5, '{s}': ({d}, {d}): the 3D engine {x:0>2}{x:0>2}{x:0>2}{x:0>2} (target 2 {x:0>2}{x:0>2}{x:0>2}{x:0>2}) depth {x:0>6} stencil {x:0>2}, the model {x:0>2}{x:0>2}{x:0>2}{x:0>2} ({x:0>2}{x:0>2}{x:0>2}{x:0>2}) depth {x:0>6} stencil {x:0>2}", .{ sc.name, x, y, got[0], got[1], got[2], got[3], got2[0], got2[1], got2[2], got2[3], w & 0xff_ffff, w >> 24, mc[0], mc[1], mc[2], mc[3], mc2[0], mc2[1], mc2[2], mc2[3], F.m.z[i], F.m.s[i] });
             }
         };
         res.feature_scenes += 1;

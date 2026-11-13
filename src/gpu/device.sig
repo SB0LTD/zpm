@@ -355,8 +355,21 @@ pub const Graphics = struct {
     /// count (x right, y as its rows grow: the window's after the
     /// viewport).
     front_ccw: bool = true,
+    /// Colour targets 1 .. 7 (the pixel program's output t into target
+    /// t; null: none): as wide and high as target 0, rows of `stride`
+    /// bytes from `va`.
+    more: [7]?ColorTarget = @splat(null),
 
     pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8 };
+    pub const ColorTarget = struct {
+        va: u64,
+        stride: u32,
+        format: TargetFormat,
+        /// the channels written (bit 0 red .. bit 3 alpha)
+        mask: u4 = 0xf,
+        /// `blend` applies to it (else its colour replaces the pixel's)
+        blend: bool = true,
+    };
     pub const StencilOp = enum(u8) { keep, zero, replace, incr, decr, invert, incr_wrap, decr_wrap };
     pub const Stencil = struct {
         /// NEVER 0 .. ALWAYS 7 (bit 0 less, 1 equal, 2 greater)
