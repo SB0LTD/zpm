@@ -877,7 +877,7 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     if (d.stencil) |sten| {
         if (d.depth == null or sten != d.depth.?) return "a stencil image apart from the depth image";
     }
-    if (d.restart) return "primitive restart";
+    if (d.index != null and (d.index_size == 0 or d.index_offset % d.index_size != 0)) return "an element array offset not on its indices' size";
     if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
     for (d.targets[1..]) |tt| {
         const t = tt orelse continue;
@@ -903,9 +903,14 @@ pub fn pipelineWhyNot(sh: Shaders) ?[]const u8 {
     return null;
 }
 
-/// The pixel program's parameters: the vertex kernel's, then its own.
+/// The pixel program's parameters: the vertex kernel's, then its own. An
+/// indexed draw is the engine's (its index buffer, primitive restart): the
+/// vertex's index it gives is the element already, so the program reads
+/// no element array.
 pub fn stageParams(d: *const Draw, out: []u32) []u32 {
     _ = vertexParams(d, out);
+    out[V_INDEX_SIZE] = 0;
+    out[V_FIRST] = if (d.index == null) d.first else 0;
     out[P_HEIGHT] = d.color.height;
     out[P_FLIP] = @intFromBool(d.color.top_down);
     return out[0..STAGE_PARAMS];
@@ -1206,8 +1211,12 @@ pub fn setupKernelFor(s: kir.Storage, p: *const Pipeline, kind: SetupKind) kir.K
                 k.ifp(r(any));
                 k.ifp(r(k.cmp(.u32, .ne, r(k.load(.u32, kir.global(b_v, 32), r(k.op2(.imin, .u32, r(flag_at), u(RESTART_NONE - 3))))), u(0))));
                 {
+                    // (from vertex t down: a fan restarted at t begins at
+                    // t + 1, so its triangle t is (t + 1, t + 1, t + 2),
+                    // nothing; a strip's triangle t holds the restart and
+                    // is dropped anyway)
                     const j = k.reg(.u32);
-                    k.set(j, .mov, r(t), no, no);
+                    k.set(j, .iadd, r(t), u(1), no);
                     k.loop();
                     {
                         k.brk(r(k.cmp(.u32, .eq, r(j), u(0))));

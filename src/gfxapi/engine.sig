@@ -2068,8 +2068,18 @@ pub const Engine = struct {
             more[j] = .{ .va = x.img.buf.gpu, .stride = x.img.stride, .format = targetFormatOf(x.img.format), .mask = maskOf(x.img.format, x.keep), .blend = x.blend };
             more_imgs[j] = x.img;
         }
+        // an indexed draw: the engine's index buffer (its vertex reuse, and
+        // primitive restart), the element array's offset its first index
+        const index: ?gpu.Graphics.Index = if (d.index) |ib| .{
+            .va = ib.buf.gpu,
+            .bytes = @intCast(@min(ib.buf.cpu.len, std.math.maxInt(u32))),
+            .size = d.index_size,
+            .first = d.index_offset / d.index_size,
+            .restart = d.restart,
+        } else null;
         const g = gpu.Graphics{
             .more = more,
+            .index = index,
             .depth = if (d.depth) |z| .{
                 .va = z.buf.gpu,
                 .width = z.width,

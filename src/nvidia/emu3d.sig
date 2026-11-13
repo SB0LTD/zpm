@@ -177,7 +177,11 @@ pub const Engine = struct {
         if (m >= bind and m < bind + 32 * GROUPS and (m - bind) % 32 == 0) return g.bindBuffer((m - bind) / 32, v);
         if (m == gr.DRAW_VERTEX_ARRAY_BEGIN_END_B) {
             g.host = host;
-            return g.draw(g.reg(gr.DRAW_VERTEX_ARRAY_BEGIN_END_A), v);
+            return g.draw(g.reg(gr.DRAW_VERTEX_ARRAY_BEGIN_END_A), v, false);
+        }
+        if (m == gl3d.DRAW_INDEX_BUFFER_BEGIN_END_B) {
+            g.host = host;
+            return g.draw(g.reg(gl3d.DRAW_INDEX_BUFFER_BEGIN_END_A), v, true);
         }
     }
 
@@ -385,18 +389,61 @@ pub const Engine = struct {
         return @as(f32, @bitCast(g.vout[v][word]));
     }
 
-    /// DRAW_VERTEX_ARRAY_BEGIN_END: `count` vertices from `first`, as
-    /// SET_PRIMITIVE_TOPOLOGY says (triangles, a strip, a fan), as many
-    /// instances as SET_DRAW_CONTROL_B says.
-    fn draw(g: *Engine, first: u32, count: u32) anyerror!void {
+    /// The index buffer as SET_INDEX_BUFFER_A, _SIZE_A and _E say: its
+    /// bytes, and an index's size.
+    const IndexBuffer = struct { bytes: []const u8, size: u32 };
+
+    fn indexBuffer(g: *Engine, first: u32, count: u32) error{BadStream}!IndexBuffer {
+        const va = @as(u64, g.reg(gl3d.SET_INDEX_BUFFER_A) & 0xff) << 32 | g.reg(gl3d.SET_INDEX_BUFFER_A + 4);
+        const limit = @as(u64, g.reg(gl3d.SET_INDEX_BUFFER_SIZE_A) & 0xff) << 32 | g.reg(gl3d.SET_INDEX_BUFFER_SIZE_A + 4);
+        const size: u32 = switch (g.reg(gl3d.SET_INDEX_BUFFER_E) & 3) {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            else => return g.refuse("an index size other than 1, 2 or 4 bytes (SET_INDEX_BUFFER_E)"),
+        };
+        try g.need(va % size == 0, "an index buffer not on its indices' size");
+        try g.need((@as(u64, first) + count) * size <= limit, "indices past the index buffer's size (SET_INDEX_BUFFER_SIZE): not modelled");
+        const bytes = g.host.mem.find(va, @intCast(limit)) orelse return g.refuse("the index buffer's memory is not mapped");
+        return .{ .bytes = bytes, .size = size };
+    }
+
+    /// Index `at` of the buffer.
+    fn indexAt(ib: IndexBuffer, at: u32) u32 {
+        return switch (ib.size) {
+            1 => ib.bytes[at],
+            2 => std.mem.readInt(u16, ib.bytes[2 * at ..][0..2], .little),
+            else => std.mem.readInt(u32, ib.bytes[4 * at ..][0..4], .little),
+        };
+    }
+
+    /// What a draw's primitives are drawn with (draw's, for its runs).
+    const DrawCtx = struct {
+        t: Target,
+        clip: Clip,
+        vcb: [qmd.CBUFS][]const u8,
+        pcb: [qmd.CBUFS][]const u8,
+        vp: [4]f64,
+        topo: u32,
+        last: bool,
+        /// Indexed: the vertex's index the buffer's, else its place.
+        ib: ?IndexBuffer,
+    };
+
+    /// DRAW_VERTEX_ARRAY_BEGIN_END: `count` vertices from `first`; or
+    /// (indexed) DRAW_INDEX_BUFFER_BEGIN_END: `count` indices from index
+    /// `first` of the index buffer, each the vertex's index, the strip or
+    /// the fan begun again past each one SET_DA_PRIMITIVE_RESTART_INDEX
+    /// names when SET_DA_PRIMITIVE_RESTART is on (a list's partial
+    /// primitive dropped). As SET_PRIMITIVE_TOPOLOGY says (triangles, a
+    /// strip, a fan), as many instances as SET_DRAW_CONTROL_B says.
+    fn draw(g: *Engine, first: u32, count: u32, indexed: bool) anyerror!void {
         g.why = "";
         try g.validate();
         const topo = g.reg(gr.SET_PRIMITIVE_TOPOLOGY);
         const instances = g.reg(gr.SET_DRAW_CONTROL_A + 4);
-        const prims: u32 = switch (topo) {
-            4 => count / 3,
-            else => if (count >= 3) count - 2 else 0,
-        };
+        const ib: ?IndexBuffer = if (indexed) try g.indexBuffer(first, count) else null;
+        try g.need(g.reg(gr.SET_DA_PRIMITIVE_RESTART) <= 1, "SET_DA_PRIMITIVE_RESTART neither on nor off");
         const t = try g.target();
         const clip = g.clipOf(t);
         var stats = emu.Stats{};
@@ -434,14 +481,47 @@ pub const Engine = struct {
         g.zlo = if (g.reg(gr.SET_VIEWPORT_Z_CLIP) == 0) -1 else 0;
         g.zhi = 1;
         const last = g.reg(gr.SET_PROVOKING_VERTEX) == 1;
+        const dc = DrawCtx{ .t = t, .clip = clip, .vcb = vcb, .pcb = pcb, .vp = .{ sx, sy, ox, oy }, .topo = topo, .last = last, .ib = ib };
+        const restart = indexed and g.reg(gr.SET_DA_PRIMITIVE_RESTART) & 1 != 0;
+        const restart_at = g.reg(gl3d.SET_DA_PRIMITIVE_RESTART_INDEX);
+        var inst: u32 = 0;
+        while (inst < instances) : (inst += 1) {
+            if (!restart) {
+                try g.segment(&dc, first, count, inst, &stats);
+                continue;
+            }
+            // (the primitives between restart indices, each run begun anew)
+            var at: u32 = 0;
+            while (at < count) {
+                var end = at;
+                while (end < count and indexAt(ib.?, first + end) != restart_at) end += 1;
+                try g.segment(&dc, first + at, end - at, inst, &stats);
+                at = end + 1;
+            }
+        }
+        g.draws += 1;
+    }
 
+    /// One run of primitives (a draw's, or a restarted strip's or fan's):
+    /// `count` vertices from `first` (indexed: indices from index
+    /// `first`), instance `inst`.
+    fn segment(g: *Engine, dc: *const DrawCtx, first: u32, count: u32, inst: u32, stats: *emu.Stats) anyerror!void {
+        const topo = dc.topo;
+        const t = dc.t;
+        const clip = dc.clip;
+        const vcb = dc.vcb;
+        const pcb = dc.pcb;
+        const last = dc.last;
+        const prims: u32 = switch (topo) {
+            4 => count / 3,
+            else => if (count >= 3) count - 2 else 0,
+        };
         // (vertices a run of primitives takes, at most)
         const per: u32 = switch (topo) {
             4 => VERTICES / 3,
             else => VERTICES - 2,
         };
-        var inst: u32 = 0;
-        while (inst < instances) : (inst += 1) {
+        {
             var p0: u32 = 0;
             while (p0 < prims) {
                 const np = @min(per, prims - p0);
@@ -471,13 +551,13 @@ pub const Engine = struct {
                 try g.load(gr.STAGE_VERTEX, g.vcode[0 .. 2 * g.vn]);
                 for (0..nv) |v| {
                     g.vin[v] = @splat(0);
-                    g.vin[v][sph.ATTR_VERTEX_ID / 4] = first + idx[v];
+                    g.vin[v][sph.ATTR_VERTEX_ID / 4] = if (dc.ib) |ib| indexAt(ib, first + idx[v]) else first + idx[v];
                     g.vin[v][sph.ATTR_INSTANCE_ID / 4] = inst;
                 }
                 var vs = emu.Stage{ .kind = .vertex, .header = &g.vhead, .in = g.vin[0..nv], .out = g.vout[0..nv], .stored = g.vstored[0..nv], .cbufs = vcb };
                 try emu.stageBegin(g.host.work, @intCast(nv));
-                try emu.stageRun(g.host.work, &g.host.mem, &vs, @intCast(nv), &stats);
-                g.vp = .{ sx, sy, ox, oy };
+                try emu.stageRun(g.host.work, &g.host.mem, &vs, @intCast(nv), stats);
+                g.vp = dc.vp;
                 for (0..nv) |v| g.project(v);
                 // the pixel program from here
                 try g.load(gr.STAGE_PIXEL, g.pcode[0 .. 2 * g.pn]);
@@ -494,13 +574,12 @@ pub const Engine = struct {
                         else => .{ 0, q + 1, q + 2 },
                     };
                     const flat = if (last) tri0[2] else tri0[0];
-                    try g.clipped(t, pcb, clip, tri0, flat, &stats);
+                    try g.clipped(t, pcb, clip, tri0, flat, stats);
                 }
-                try g.shade(t, pcb, &stats);
+                try g.shade(t, pcb, stats);
                 p0 += np;
             }
         }
-        g.draws += 1;
     }
 
     /// Vertex v's window place, on the rasterizer's grid (1/256 of a pixel);

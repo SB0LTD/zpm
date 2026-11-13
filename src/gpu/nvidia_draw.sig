@@ -751,14 +751,18 @@ fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res:
 // apart and how.
 
 pub const FEATURE_SCENES = feature_scenes.len;
-const FeatureKind = enum { frag_depth, front_facing, two_sided_stencil, mrt };
+const FeatureKind = enum { frag_depth, front_facing, two_sided_stencil, mrt, restart };
 const FeatureScene = struct { name: []const u8, kind: FeatureKind };
 const feature_scenes = [_]FeatureScene{
     .{ .name = "gl_FragDepth (x / 64 + y / 128 written, depth LESS over 1)", .kind = .frag_depth },
     .{ .name = "gl_FrontFacing (red front, green back; off-grid corners)", .kind = .front_facing },
     .{ .name = "two-sided stencil (front INCR_WRAP; back INVERT, EQUAL 1 under 0x0f, written 0xf0)", .kind = .two_sided_stencil },
     .{ .name = "several colour targets (0 RGBA8, 1 off, 2 BGRA8: output 2 into it)", .kind = .mrt },
+    .{ .name = "indexed strips with primitive restart (16-bit, from index 1; the second strip at an odd place; red front, green back)", .kind = .restart },
 };
+/// The restart scene's indices (16-bit; drawn from index 1: the first is
+/// not the draw's): two strips, 0xffff between them.
+const restart_indices = [_]u16{ 7, 0, 1, 2, 3, 0xffff, 4, 5, 6, 7, 8 };
 /// The most vertices a scene draws.
 const FEATURE_VERTS = 9;
 
@@ -796,6 +800,12 @@ fn featureVerts(kind: FeatureKind, v: *[FEATURE_VERTS][4]f32) u32 {
             const pts = [_][2]f32{ .{ 2.3, 1.7 }, .{ 40.61, 3.2 }, .{ 9.9, 30.4 }, .{ 40.61, 3.2 }, .{ 9.9, 30.4 }, .{ 61.2, 29.05 } };
             for (pts, 0..) |p, n| v[n] = clipOf(p[0], p[1]);
             return 6;
+        },
+        // two strips' vertices (the indices make the strips)
+        .restart => {
+            const pts = [_][2]f32{ .{ 2.5, 2.25 }, .{ 5.1, 28.7 }, .{ 17.3, 3.6 }, .{ 21.9, 29.4 }, .{ 30.2, 1.1 }, .{ 33.3, 27.6 }, .{ 44.7, 4.05 }, .{ 49.5, 30.2 }, .{ 61.6, 2.9 } };
+            for (pts, 0..) |p, n| v[n] = clipOf(p[0], p[1]);
+            return pts.len;
         },
         // the whole target (front), then a back face over part of it
         .two_sided_stencil => {
@@ -879,7 +889,7 @@ fn featurePixel(k: *kir.Kernel, kind: FeatureKind) void {
     const io = k.binding();
     _ = k.binding();
     const color = [4]f32{ 0.25, 0, 0, 0 };
-    if (kind == .front_facing) {
+    if (kind == .front_facing or kind == .restart) {
         // (red front, green back: the facing word, flat, non-zero front)
         const face = k.load(.u32, nvidia_gl.ioMem(io, nvidia_gl.FRONT_FACE, true), kir.u(0));
         const front = k.cmp(.u32, .ne, kir.r(face), kir.u(0));
@@ -888,7 +898,7 @@ fn featurePixel(k: *kir.Kernel, kind: FeatureKind) void {
         for (2..4) |c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(0));
     } else for (color, 0..) |x, c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(x));
     switch (kind) {
-        .front_facing, .two_sided_stencil => {},
+        .front_facing, .two_sided_stencil, .restart => {},
         // (output 2: green a half, alpha three quarters; output 1 none)
         .mrt => {
             const c2 = [4]f32{ 0, 0.5, 0, 0.75 };
@@ -916,6 +926,28 @@ fn featureModel(kind: FeatureKind, m: *FeatureModel) void {
             if (q >= 0xff_ffff) continue;
             m.z[y * EW + x] = q;
             m.color[y * EW + x] = .{ 64, 0, 0, 0 };
+        },
+        // (each strip from its first index: an odd triangle's first two
+        // vertices swapped, GL's order, its facing from that)
+        .restart => {
+            var at: usize = 1;
+            while (at < restart_indices.len) {
+                var end = at;
+                while (end < restart_indices.len and restart_indices[end] != 0xffff) end += 1;
+                var j: usize = 0;
+                while (at + j + 2 < end) : (j += 1) {
+                    const a: usize = restart_indices[at + j];
+                    const b: usize = restart_indices[at + j + 1];
+                    const c: usize = restart_indices[at + j + 2];
+                    const tri = if (j % 2 == 0) [3][4]f32{ F.verts[a], F.verts[b], F.verts[c] } else [3][4]f32{ F.verts[b], F.verts[a], F.verts[c] };
+                    const mt = ModelTri.of(&tri, 0);
+                    for (0..EH) |y| for (0..EW) |x| {
+                        if (!mt.covers(x, y)) continue;
+                        m.color[y * EW + x] = if (mt.front) .{ 64, 0, 0, 0 } else .{ 0, 64, 0, 0 };
+                    };
+                }
+                at = end + 1;
+            }
         },
         .mrt => {
             @memset(&m.color, .{ 64, 0, 0, 0 });
@@ -951,8 +983,7 @@ fn featureGraphics(kind: FeatureKind, g: *gpu.Graphics) void {
             g.depth.?.write = true;
             g.depth.?.func = 1;
         },
-        .front_facing => {},
-        .mrt => {},
+        .front_facing, .mrt, .restart => {},
         .two_sided_stencil => {
             g.depth.?.tested = true;
             g.depth.?.stencil = stencil_front;
@@ -996,6 +1027,10 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
     defer d.free(depth);
     const target2 = d.alloc(EW * EH * 4, .host) catch return featuresNoMemory(log, res);
     defer d.free(target2);
+    const ibuf = d.alloc(64, .host) catch return featuresNoMemory(log, res);
+    defer d.free(ibuf);
+    @memcpy(ibuf.cpu[0 .. restart_indices.len * 2], std.mem.sliceAsBytes(&restart_indices));
+    d.toDevice(ibuf, 0, 64);
     for (feature_scenes) |sc| {
         const nverts = featureVerts(sc.kind, &F.verts);
         @memcpy(vb.cpu[0 .. nverts * 16], std.mem.sliceAsBytes(F.verts[0..nverts]));
@@ -1042,6 +1077,11 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
         };
         featureGraphics(sc.kind, &g);
         if (sc.kind == .mrt) g.more[1] = .{ .va = target2.gpu, .stride = EW * 4, .format = .bgra8 };
+        if (sc.kind == .restart) {
+            g.topology = .strip;
+            g.count = restart_indices.len - 1;
+            g.index = .{ .va = ibuf.gpu, .bytes = 64, .size = 2, .first = 1, .restart = true };
+        }
         const t0 = now_us();
         const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {
             hsay(log, "step 5, '{s}': the draw was not sent ({s}): not run", .{ sc.name, @errorName(e) });

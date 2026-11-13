@@ -97,6 +97,24 @@ pub const Blend = struct {
 
 pub const Topology = enum(u32) { triangles = 4, strip = 5, fan = 6 };
 
+// An indexed draw (cl9097.h, clc597.h; NVK's on Turing and later): the
+// index buffer's address, its size, the indices' size, primitive restart,
+// then SET_DRAW_CONTROL_A .. DRAW_INDEX_BUFFER_BEGIN_END_B in one method
+// (the control word, the instances, the first index, the count: the last
+// draws).
+pub const SET_INDEX_BUFFER_A: u32 = 0x17c8; // address (high), low
+pub const SET_INDEX_BUFFER_SIZE_A: u32 = 0x0238; // bytes (high), low
+pub const SET_INDEX_BUFFER_E: u32 = 0x17d8; // 0 one byte, 1 two, 2 four
+pub const SET_DA_PRIMITIVE_RESTART_INDEX: u32 = 0x1648;
+pub const DRAW_INDEX_BUFFER_BEGIN_END_A: u32 = 0x0268;
+pub const DRAW_INDEX_BUFFER_BEGIN_END_B: u32 = 0x026c;
+
+/// The draw's indices: rows of `size`-byte indices from `va` (`bytes` of
+/// them), from index `first`; with `restart`, the type's largest value
+/// begins a strip or a fan anew (GL's PRIMITIVE_RESTART_FIXED_INDEX).
+/// The vertex's index the vertex program reads is the index.
+pub const Index = struct { va: u64, bytes: u32, size: u8, first: u32, restart: bool = false };
+
 // The depth-stencil target and its tests (cl9097.h's methods).
 pub const SET_ZT_A: u32 = 0x0fe0; // address (high), then low, format, block size, array pitch
 pub const SET_ZT_SIZE_A: u32 = 0x1228; // width, height, third dimension
@@ -180,6 +198,9 @@ pub const Draw = struct {
     /// Colour targets 1 .. 7 (null: none; one inside the highest is sent
     /// off: format 0): as wide and high as target 0.
     more: [7]?More = @splat(null),
+    /// Indexed (the hardware's index buffer and primitive restart), else
+    /// the vertices' indices 0 .. count - 1.
+    index: ?Index = null,
 };
 
 /// A colour target past the first: rows of `pitch` bytes from `va` (128
@@ -303,8 +324,30 @@ pub fn emit(p: *Push, d: *const Draw) void {
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_VERTEX, 1);
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_PIXEL, 1);
     one(p, gr.INVALIDATE_SHADER_CACHES_NO_WFI, 0x1001); // the code and the constants
+    if (d.index) |ix| {
+        many(p, SET_INDEX_BUFFER_A, &.{ @truncate(ix.va >> 32), @truncate(ix.va) });
+        many(p, SET_INDEX_BUFFER_SIZE_A, &.{ 0, ix.bytes });
+        one(p, SET_INDEX_BUFFER_E, switch (ix.size) {
+            1 => 0,
+            2 => 1,
+            else => 2,
+        });
+        one(p, gr.SET_DA_PRIMITIVE_RESTART, @intFromBool(ix.restart));
+        many(p, SET_DA_PRIMITIVE_RESTART_INDEX, &.{restartIndex(ix.size)});
+        many(p, gr.SET_DRAW_CONTROL_A, &.{ gr.DRAW_CONTROL, d.instances, ix.first, d.count });
+        return;
+    }
     many(p, gr.SET_DRAW_CONTROL_A, &.{ gr.DRAW_CONTROL, d.instances });
     many(p, gr.DRAW_VERTEX_ARRAY_BEGIN_END_A, &.{ 0, d.count });
+}
+
+/// The fixed restart index of `size`-byte indices: the type's largest.
+pub fn restartIndex(size: u8) u32 {
+    return switch (size) {
+        1 => 0xff,
+        2 => 0xffff,
+        else => 0xffff_ffff,
+    };
 }
 
 /// Dwords emit takes at most (draw.sig's state, and the draw's own: 26

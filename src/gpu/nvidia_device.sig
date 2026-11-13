@@ -484,6 +484,7 @@ pub const Adapter = struct {
             .zero_va = a.zero.va,
             .target = .{ .va = g.va, .width = g.width, .height = g.height, .pitch = g.stride },
             .format = formatOf(g.format),
+            .index = if (g.index) |ix| .{ .va = ix.va, .bytes = ix.bytes, .size = ix.size, .first = ix.first, .restart = ix.restart } else null,
             .more = more: {
                 var m: [7]?gl3d.More = @splat(null);
                 for (g.more, 0..) |x, t| {

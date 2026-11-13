@@ -1736,8 +1736,8 @@ var feat_solid = raster.Pipeline.init(.{ .attrs = 1, .varyings = 0, .vertex = Un
 const feat_pipes = [_]*raster.Pipeline{ &frag_depth_pipe, &feat_solid, &facing_pipe, &mrt_pipe };
 
 /// The features, a scene each.
-const Feature = enum { frag_depth, front_facing, two_sided_stencil, mrt };
-const all_features = [_]Feature{ .frag_depth, .front_facing, .two_sided_stencil, .mrt };
+const Feature = enum { frag_depth, front_facing, two_sided_stencil, mrt, restart };
+const all_features = [_]Feature{ .frag_depth, .front_facing, .two_sided_stencil, .mrt, .restart };
 /// A feature scene's pictures: target 0 (RGBA8), then for `mrt` targets
 /// 1 (BGRA8) and 3 (RG8) as their bytes.
 const FEAT_PIC = W * H * 4;
@@ -1847,6 +1847,36 @@ fn featureScene(e: *engine.Engine, f: Feature, img: *engine.Image, depth: *engin
             e.read(&t1, 0, 0, W, H, out[FEAT_PIC..][0..FEAT_PIC], W * 4, .bgra8);
             e.read(&t3, 0, 0, W, H, out[2 * FEAT_PIC ..][0 .. W * H * 2], W * 2, .rg8);
         },
+        // indexed (the engine's index buffer) with primitive restart: two
+        // strips in one draw (the second begun at an odd place: its
+        // winding starts anew), two fans in another; red front, green back
+        .restart => {
+            const pts = [_][2]f32{
+                .{ 2, 2 },   .{ 4, 14 },  .{ 12, 3 },  .{ 14, 15 },
+                .{ 20, 2 },  .{ 22, 14 }, .{ 30, 3 },  .{ 31, 16 },
+                .{ 38, 4 },  .{ 50, 8 },  .{ 60, 2 },  .{ 62, 10 },
+                .{ 56, 16 }, .{ 46, 20 }, .{ 58, 22 }, .{ 52, 30 },
+                .{ 40, 30 },
+            };
+            var verts: [pts.len][4]f32 = undefined;
+            for (pts, 0..) |p, n| verts[n] = .{ nx(p[0], W), nx(p[1], H), 0, 1 };
+            e.writeBytes(ab, 0, std.mem.sliceAsBytes(&verts));
+            const R = 0xffff;
+            const idx = [_]u16{ 7, 0, 1, 2, 3, R, 4, 5, 6, 7, 8, 9, 10, 11, 12, R, 13, 14, 15, 16 };
+            var ib = e.newBuffer(@sizeOf(@TypeOf(idx))) orelse return error.OutOfMemory;
+            defer e.freeImage(&ib);
+            e.writeBytes(&ib, 0, std.mem.sliceAsBytes(&idx));
+            for ([_]struct { raster.Topology, u32, u32 }{ .{ .strip, 2, 10 }, .{ .fan, 22, 9 } }) |dr| {
+                var d = raster.Draw{ .pipe = &facing_pipe, .color = img, .index = &ib, .index_size = 2, .index_offset = dr[1], .topology = dr[0], .restart = true, .count = dr[2] };
+                d.rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H };
+                d.center = .{ W / 2, H / 2 };
+                d.half = .{ W / 2, H / 2 };
+                d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+                if (!e.draw(&d)) return error.NotDrawn;
+                e.finish();
+                if (e.lost or e.why_pipe != null) return error.EngineLost;
+            }
+        },
     }
     e.read(img, 0, 0, W, H, out[0..FEAT_PIC], W * 4, .rgba8);
     return e.stats.graphics_draws - before;
@@ -1855,7 +1885,7 @@ fn featureScene(e: *engine.Engine, f: Feature, img: *engine.Image, depth: *engin
 var fpool_mem: [8 << 20]u8 align(64) = undefined;
 var eng_fcpu: engine.Engine = undefined;
 
-test "draw: features through the emulated RTX's 3D engine (gl_FragDepth, gl_FrontFacing, two-sided stencil, several colour targets): every draw on the engine, the CPU's bytes" {
+test "draw: features through the emulated RTX's 3D engine (gl_FragDepth, gl_FrontFacing, two-sided stencil, several colour targets, indexed with primitive restart): every draw on the engine, the CPU's bytes" {
     Rtx3d.engine3d = .{};
     eng_fcpu.init(.{ .pool = &fpool_mem, .cpu_work = &cpu_work });
     defer eng_fcpu.deinit();
@@ -1871,7 +1901,7 @@ test "draw: features through the emulated RTX's 3D engine (gl_FragDepth, gl_Fron
     for ([_]*engine.Engine{ &eng_fcpu, &eng_rtx }, 0..) |e, n| {
         imgs[n][0] = e.newImage(W, H, .rgba8) orelse return error.OutOfMemory;
         imgs[n][1] = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
-        imgs[n][2] = e.newBuffer(12 * 16) orelse return error.OutOfMemory;
+        imgs[n][2] = e.newBuffer(20 * 16) orelse return error.OutOfMemory;
     }
     try std.testing.expect(imgs[1][1].layout.block);
     var pics: [2][3 * FEAT_PIC]u8 = undefined;

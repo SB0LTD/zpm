@@ -359,6 +359,13 @@ pub const Graphics = struct {
     /// t; null: none): as wide and high as target 0, rows of `stride`
     /// bytes from `va`.
     more: [7]?ColorTarget = @splat(null),
+    /// Indexed: `count` indices of `size` bytes from index `first` of the
+    /// buffer at `va` (`bytes` long), each the vertex's index the vertex
+    /// program reads; with `restart`, the type's largest begins a strip
+    /// or a fan anew. Null: the vertices' indices 0 .. count - 1.
+    index: ?Index = null,
+
+    pub const Index = struct { va: u64, bytes: u32, size: u8, first: u32, restart: bool = false };
 
     pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8 };
     pub const ColorTarget = struct {
