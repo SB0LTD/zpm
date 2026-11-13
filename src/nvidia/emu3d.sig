@@ -888,10 +888,11 @@ pub const Engine = struct {
     /// colour is written.
     fn depthStencil(g: *Engine, z: ZT, x: u32, y: u32, zw: f32, front: bool) bool {
         if (x >= z.width or y >= z.height) return false;
-        // (a float depth's word where Turing2D puts it; a 24-bit one where
-        // the stand-in for Blackwell's Z24 GOBs does: z24Address)
-        const at = if (z.float) blAddress(z.pitch, z.gobs, x * 4, y) else z24Address(z.pitch, z.gobs, x, y);
-        const w = std.mem.readInt(u32, z.bytes[at..][0..4], .little);
+        // (a float depth's word where Turing2D puts it; a 24-bit one's
+        // three bytes where Blackwell's Z24 GOBs do: z24Bytes)
+        const at = blAddress(z.pitch, z.gobs, x * 4, y);
+        const zb = z24Bytes(z.pitch, z.gobs, x, y);
+        const w = if (z.float) std.mem.readInt(u32, z.bytes[at..][0..4], .little) else @as(u32, z.bytes[zb[0]]) | @as(u32, z.bytes[zb[1]]) << 8 | @as(u32, z.bytes[zb[2]]) << 16;
         const zq = if (z.float) depthBits(zw) else depthWord(zw);
         const old_z = if (z.float) w else w & 0xff_ffff;
         const s_at = if (z.stencil != null) blAddress8(z.s_pitch, z.gobs, x, y) else 0;
@@ -918,9 +919,11 @@ pub const Engine = struct {
             const v = stencilOp(op, stencil, ref);
             stencil = (v & wm) | (stencil & ~wm & 0xff);
         }
-        // (bits 24..31 of a 24-bit depth's word kept: X8Z24's X8, S8Z24's
-        // unused; a float depth is its whole word)
-        std.mem.writeInt(u32, z.bytes[at..][0..4], if (z.float) new_z else (w & 0xff00_0000) | new_z, .little);
+        if (z.float) {
+            std.mem.writeInt(u32, z.bytes[at..][0..4], new_z, .little);
+        } else for (zb, 0..) |zbyte, k| {
+            z.bytes[zbyte] = @truncate(new_z >> @intCast(8 * k));
+        }
         if (z.stencil) |sb| sb[s_at] = @intCast(stencil & 0xff);
         return s_pass and d_pass;
     }
@@ -1071,18 +1074,54 @@ pub fn depthBits(z: f32) u32 {
     return if (c == 0) 0 else @bitCast(c);
 }
 
-/// Where a 24-bit depth's word is (X8Z24, S8Z24): a STAND-IN. Blackwell
-/// keeps 24-bit depths in GOBs of their own (Mesa nil's BlackwellZ24, the
-/// copy engine's BPP_BL_24), whose layout is not public: pc-full3 read
-/// them back through Turing2D's addresses scrambled, and a CPU clear of
-/// 0x00ffffff words failed a quarter of the LESS tests (bytes of a word
-/// read as another pixel's). The emulated engine keeps them in Turing2D's
-/// order with the rows of each pair swapped, so a test that reads or
-/// writes a 24-bit depth plane from the CPU as Turing2D's fails here as
-/// it did on the RTX: only the engine touches a 24-bit depth plane.
-pub fn z24Address(pitch: u32, gobs: u3, x: u32, y: u32) usize {
-    return blAddress(pitch, gobs, x * 4, y ^ 1);
+/// Blackwell's Z24 GOBs (Mesa nil's BlackwellZ24, the copy engine's
+/// BPP_BL_24: X8Z24, S8Z24 and the like), as pc-full4's probe read them
+/// off the Legion's RTX (the drawtest's step 4f: each pixel's id written
+/// as its depth, the first two GOBs logged; all 256 pixels there fit).
+/// A GOB is a 32-bit one's 16 x 8 pixels in 512 bytes, blocks and GOBs as
+/// Turing2D's; inside it, each half (8 pixels across, 256 bytes) is 64
+/// bytes the depths do not use, then two groups of 4 x 8 pixels, 96 bytes
+/// each: three 32-byte sectors of ten packed 24-bit depths (low byte
+/// first) and two bytes. Sectors 0 and 2 end in the upper two bytes of an
+/// eleventh pixel; sector 1 ends in those two pixels' low bytes (where
+/// the probe's ids could not show: its low bytes were all 0; step 4g now
+/// tells them apart). Which pixel is which slot: z24_slots, the right
+/// group (x & 4) with rows 2 and 5 in another order.
+pub fn z24Bytes(pitch: u32, gobs: u3, x: u32, y: u32) [3]usize {
+    const shift: u5 = @as(u5, gobs) + 3;
+    const block = (y >> shift) * (pitch / 64) + (x * 4) / 64;
+    const gob = (y >> 3) & ((@as(u32, 1) << gobs) - 1);
+    const base = (@as(usize, block) << (@as(u6, gobs) + 9)) + gob * 512 + ((x & 15) >> 3) * 256 + 64 + ((x >> 2) & 1) * 96;
+    const t = (if ((x >> 2) & 1 != 0) z24_slots_right else z24_slots_left)[y & 7][x & 3];
+    const sector: usize = t >> 4;
+    const slot: usize = t & 15;
+    if (slot == SPLIT) return .{ base + 32 + 30 + sector / 2, base + sector * 32 + 30, base + sector * 32 + 31 };
+    return .{ base + sector * 32 + 3 * slot, base + sector * 32 + 3 * slot + 1, base + sector * 32 + 3 * slot + 2 };
 }
+
+/// A Z24 group's pixels (4 across, 8 down) as sector << 4 | slot (SPLIT:
+/// the pixel whose upper bytes end the sector).
+const SPLIT = 15;
+const z24_slots_left = [8][4]u8{
+    .{ 0x00, 0x01, 0x02, 0x03 },
+    .{ 0x04, 0x05, 0x06, 0x07 },
+    .{ 0x08, 0x09, 0x0f, 0x10 },
+    .{ 0x11, 0x12, 0x13, 0x14 },
+    .{ 0x15, 0x16, 0x17, 0x18 },
+    .{ 0x20, 0x21, 0x2f, 0x19 },
+    .{ 0x22, 0x23, 0x24, 0x25 },
+    .{ 0x26, 0x27, 0x28, 0x29 },
+};
+const z24_slots_right = [8][4]u8{
+    .{ 0x00, 0x01, 0x02, 0x03 },
+    .{ 0x04, 0x05, 0x06, 0x07 },
+    .{ 0x10, 0x0f, 0x08, 0x09 },
+    .{ 0x11, 0x12, 0x13, 0x14 },
+    .{ 0x15, 0x16, 0x17, 0x18 },
+    .{ 0x19, 0x2f, 0x20, 0x21 },
+    .{ 0x22, 0x23, 0x24, 0x25 },
+    .{ 0x26, 0x27, 0x28, 0x29 },
+};
 
 /// A depth a pixel program wrote (gl_FragDepth) as the engine takes it:
 /// clamped to the viewport's 0..1, not a number 0 (as gfxapi's compute
@@ -1380,11 +1419,25 @@ test "a float depth's bits keep the depths' order; a 24-bit depth is not where T
     try testing.expectEqual(@as(u32, 0), depthBits(-0.0));
     try testing.expectEqual(@as(u32, 0x3f80_0000), depthBits(2));
     try testing.expect(depthBits(0.25) < depthBits(0.2500001) and depthBits(0.1) < depthBits(0.9));
-    // (the stand-in for Blackwell's Z24 GOBs: no pixel of the first GOB
-    // where Turing2D's would be)
+}
+
+test "Blackwell's Z24 GOB: every pixel's three bytes its own, inside the GOB, none in the 64 unused bytes of a half; pc-full4's probe bytes where the table puts them" {
+    var used = [_]bool{false} ** 512;
     for (0..8) |y| for (0..16) |x| {
-        try testing.expect(z24Address(256, 2, @intCast(x), @intCast(y)) != blAddress(256, 2, @intCast(x * 4), @intCast(y)));
+        for (z24Bytes(256, 2, @intCast(x), @intCast(y))) |b| {
+            try testing.expect(b < 512 and b % 256 >= 64 and !used[b]);
+            used[b] = true;
+        }
     };
+    // (pc-full4: bytes 64.. began 00 08 00 | 00 18 00: pixels (0, 0) and
+    // (1, 0), upper bytes x << 4 | 8 and y * 4; byte 94 held (2, 2)'s 28 08,
+    // byte 60 + 64 (3, 5)'s 38)
+    try testing.expectEqual([3]usize{ 64, 65, 66 }, z24Bytes(256, 2, 0, 0));
+    try testing.expectEqual([3]usize{ 67, 68, 69 }, z24Bytes(256, 2, 1, 0));
+    try testing.expectEqual(@as(usize, 94), z24Bytes(256, 2, 2, 2)[1]);
+    try testing.expectEqual(@as(usize, 124), z24Bytes(256, 2, 3, 5)[1]);
+    // (the second GOB down: rows 8..15)
+    try testing.expectEqual(@as(usize, 512 + 64), z24Bytes(256, 2, 0, 8)[0]);
 }
 
 test "a stencil plane's byte lands where Blackwell's 8-bit GOB puts it" {
