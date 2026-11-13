@@ -207,12 +207,13 @@ test "driver: profiles, entrypoints, attributes, and Firefox's probe" {
     // looks for)
     try testing.expectEqualSlices(va.Profile, &.{ 13, 6, 7, 17, 18, 14, 19, 21, 32 }, profiles[0..@intCast(n)]);
     // Firefox's vaapitest: each profile's entrypoints, then a config of
-    // (profile, VLD) with no attributes; H.264, HEVC and AV1 also encode
+    // (profile, VLD) with no attributes; H.264, HEVC, AV1, VP8 and VP9
+    // also encode
     for (profiles[0..@intCast(n)]) |p| {
         var eps: [4]va.Entrypoint = undefined;
         var m: i32 = 0;
         try testing.expectEqual(va.SUCCESS, d.queryConfigEntrypoints(p, &eps, &m));
-        if (p == 14 or p == va.PROFILE_VP9_PROFILE_0 or p == va.PROFILE_HEVC_MAIN10 or p == va.PROFILE_VP9_PROFILE_2) {
+        if (p == va.PROFILE_HEVC_MAIN10 or p == va.PROFILE_VP9_PROFILE_2) {
             try testing.expectEqualSlices(va.Entrypoint, &.{va.ENTRYPOINT_VLD}, eps[0..@intCast(m)]);
         } else {
             try testing.expectEqualSlices(va.Entrypoint, &.{ va.ENTRYPOINT_VLD, ve.ENTRYPOINT_ENC_SLICE }, eps[0..@intCast(m)]);
@@ -234,7 +235,7 @@ test "driver: profiles, entrypoints, attributes, and Firefox's probe" {
     var cfg: u32 = 0;
     try testing.expectEqual(va.ERROR_UNSUPPORTED_PROFILE, d.createConfig(va.PROFILE_NONE, va.ENTRYPOINT_VLD, &.{}, &cfg));
     try testing.expectEqual(va.ERROR_UNSUPPORTED_ENTRYPOINT, d.createConfig(va.PROFILE_H264_MAIN, 7, &.{}, &cfg)); // EncPicture
-    try testing.expectEqual(va.ERROR_UNSUPPORTED_ENTRYPOINT, d.createConfig(va.PROFILE_VP9_PROFILE_0, ve.ENTRYPOINT_ENC_SLICE, &.{}, &cfg));
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_ENTRYPOINT, d.createConfig(va.PROFILE_VP9_PROFILE_2, ve.ENTRYPOINT_ENC_SLICE, &.{}, &cfg));
     try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, d.createConfig(va.PROFILE_H264_MAIN, va.ENTRYPOINT_VLD, &.{.{ .type = va.ATTRIB_RT_FORMAT, .value = 0x2 }}, &cfg));
     var attribs = [_]va.ConfigAttrib{ .{ .type = va.ATTRIB_RT_FORMAT, .value = 0 }, .{ .type = va.ATTRIB_MAX_PICTURE_WIDTH, .value = 0 }, .{ .type = 40, .value = 0 } };
     try testing.expectEqual(va.SUCCESS, d.getConfigAttributes(va.PROFILE_H264_HIGH, va.ENTRYPOINT_VLD, &attribs));
@@ -1091,7 +1092,7 @@ test "driver: encode's attributes as FFmpeg asks, configs, and a GPU without an 
     try testing.expectEqual(va.ATTRIB_NOT_SUPPORTED, attribs[7].value); // (HEVC's only)
     try testing.expectEqual(va.SUCCESS, d.getConfigAttributes(va.PROFILE_HEVC_MAIN, ve.ENTRYPOINT_ENC_SLICE, attribs[7..8]));
     try testing.expectEqual(enc_hevc.FEATURES, attribs[7].value);
-    try testing.expectEqual(va.ERROR_UNSUPPORTED_ENTRYPOINT, d.getConfigAttributes(va.PROFILE_VP9_PROFILE_0, ve.ENTRYPOINT_ENC_SLICE, &attribs));
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_ENTRYPOINT, d.getConfigAttributes(va.PROFILE_VP9_PROFILE_2, ve.ENTRYPOINT_ENC_SLICE, &attribs));
     // configs: one rate control mode of these, packed headers of these
     var cfg: u32 = 0;
     const cbr = [_]va.ConfigAttrib{ .{ .type = va.ATTRIB_RT_FORMAT, .value = va.RT_FORMAT_YUV420 }, .{ .type = ve.ATTRIB_RATE_CONTROL, .value = ve.RC_CBR }, .{ .type = ve.ATTRIB_ENC_PACKED_HEADERS, .value = ve.PACKED_HEADER_SEQUENCE | ve.PACKED_HEADER_MISC } };

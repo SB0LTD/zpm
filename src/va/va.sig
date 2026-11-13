@@ -2,7 +2,8 @@
 //! (NVDEC, NVCFB0 on GB206): H.264, HEVC Main and Main10, VP9 profiles 0
 //! and 2, AV1 Main (8- and 10-bit, film grain), zero copy (VRAM, block
 //! linear, exported with NVIDIA's modifiers),
-//! and its encoder (NVENC, NVCFB7): H.264 and HEVC Main, in
+//! and its encoder (NVENC, NVCFB7): H.264 and HEVC Main; VP8 and VP9
+//! encoders of its own on the GPU's compute engine (KIR kernels), in
 //! pure Sig: no C, no C library, no allocator. libgalaxy_va.sig is the shared library's root
 //! (galaxy_drv_video.so) and says what works and what waits for a boot.
 //!
@@ -56,6 +57,17 @@
 //!   driver_test.sig  the driver against the fake node's pretend decoder
 //!                    and encoder
 //!   hevc_stream_test.sig  the slice-header parse on x265's real stream
+//!   enc_vpx.sig      VP8 and VP9 encoding through VA-API: the buffers, a
+//!                    picture's plan; vpx_driver_test.sig through the driver
+//!   vpx_dsl.sig      the encoders' kernels' language: one source, run on
+//!                    the CPU or built as KIR (vpx_kir.sig); vpx_gpu.sig
+//!                    runs them on the RTX (the shared library's)
+//!   vpx_bool.sig     the boolean coder VP8 and VP9 write with
+//!   vp8_kernels.sig  VP8's pixel work; enc_vp8.sig its frames and
+//!                    bitstream (vp8_tables.sig)
+//!   vp9_kernels.sig  VP9's pixel work (vp9_tx.sig: libvpx's transforms);
+//!                    enc_vp9.sig its frames and bitstream
+//!                    (vp9_enc_tables.sig)
 
 pub const vaapi = @import("vaapi.sig");
 pub const nvdec = @import("nvdec.sig");
@@ -78,6 +90,12 @@ pub const enc_av1 = @import("enc_av1.sig");
 pub const enc_import = @import("enc_import.sig");
 pub const convert = @import("convert.sig");
 pub const driver = @import("driver.sig");
+pub const vpx_dsl = @import("vpx_dsl.sig");
+pub const vpx_bool = @import("vpx_bool.sig");
+pub const vp8_kernels = @import("vp8_kernels.sig");
+pub const enc_vp8 = @import("enc_vp8.sig");
+pub const vp9_kernels = @import("vp9_kernels.sig");
+pub const enc_vp9 = @import("enc_vp9.sig");
 
 test {
     _ = vaapi;
@@ -108,4 +126,14 @@ test {
     _ = @import("hevc_stream_test.sig");
     _ = @import("enc_test.sig");
     _ = enc_import;
+    _ = vpx_dsl;
+    _ = vpx_bool;
+    _ = vp8_kernels;
+    _ = enc_vp8;
+    _ = vp9_kernels;
+    _ = @import("vp9_tx.sig");
+    _ = @import("vp9_enc_tables.sig");
+    _ = enc_vp9;
+    _ = @import("enc_vpx.sig");
+    _ = @import("vpx_driver_test.sig");
 }
