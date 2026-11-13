@@ -403,6 +403,10 @@ pub const Graphics = struct {
     pub const Depth = struct {
         va: u64,
         stencil_va: ?u64 = null,
+        /// 32-bit float depths (ZF32: Turing2D's GOBs, the CPU may read
+        /// and write them); else 24-bit (Blackwell's own Z24 GOBs, whose
+        /// layout is not public: the engine's alone).
+        float: bool = false,
         width: u32,
         height: u32,
         gobs_log2: u3,

@@ -256,6 +256,11 @@ pub const Hardware = struct {
     /// first of them ("": none).
     groups_lost: u32 = 0,
     lost_group: []const u8 = "",
+    /// Step 4f (the Z24 probe): the pixels drawn, and those whose id is
+    /// where Turing2D's GOBs would put it (2048 of 2048: Blackwell's Z24
+    /// GOBs are Turing2D's after all).
+    z24_drawn: u32 = 0,
+    z24_placed: u32 = 0,
 };
 
 /// What hardwareTestWith may do beyond hardwareTest.
@@ -505,16 +510,22 @@ pub fn hardwareTestWith(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.
 //   pixels covered against the model's;
 // - 4b culling (OGL_SET_CULL_FACE, OGL_SET_CULL), as 4a;
 // - 4c depth LESS, written: the colour target block linear (the engine
-//   refuses a depth target beside a pitch one: RT_LINEAR_WITH_ZETA) and an
-//   X8Z24 depth target (Blackwell refuses a combined depth-stencil format:
-//   pc-full2's class error 0x13 at the draw); the target and the depth
-//   come back and are put beside the model's pixel for pixel, exactly;
+//   refuses a depth target beside a pitch one: RT_LINEAR_WITH_ZETA) and a
+//   ZF32 depth target (Blackwell refuses a combined depth-stencil format:
+//   pc-full2's class error 0x13; and its 24-bit depths live in GOBs of
+//   their own the CPU cannot read: pc-full3); the target and the depth
+//   (float bits) come back and are put beside the model's pixel for
+//   pixel, exactly;
 // - 4d depth EQUAL (not written) against the model's depths: the engine
 //   draws exactly the pixels whose depth it makes the same as the compute
 //   path does;
-// - 4e as 4c, the depth target S8Z24 with its stencil a plane of its own
-//   (STENCIL_IS_SEPARATE, SET_ST_*: NVK's form of a Blackwell D24S8
-//   image), the stencil test off.
+// - 4e as 4c, the depth target ZF32_X24S8 with its stencil a plane of its
+//   own (STENCIL_IS_SEPARATE, SET_ST_*: NVK's form of a Blackwell D32S8
+//   image), the stencil test off;
+// - 4f a probe, not a comparison: every pixel's gl_FragDepth an id of the
+//   pixel ((y * 64 + x) * 4096 + 2048 as a 24-bit depth) written ALWAYS
+//   into an X8Z24 plane the CPU zeroed, and its first two GOBs logged as
+//   words: Blackwell's Z24 GOB layout, read off a boot.
 
 pub const EW = 64;
 pub const EH = 32;
@@ -545,7 +556,9 @@ const edge_z = [4]f32{ -0.3, 0.2117, 0.7, 0.0931 };
 
 /// What the model gives a scene: each pixel's hits (0, 1; 2 would be a
 /// pixel drawn twice) and depth word (0xffffff: none).
-const EdgeModel = struct { hits: [EW * EH]u8 = undefined, z: [EW * EH]u32 = undefined };
+const EdgeModel = struct { hits: [EW * EH]u8 = undefined, z: [EW * EH]u32 = undefined, zf: [EW * EH]u32 = undefined };
+/// 1.0's bits: a float depth plane's clear.
+const ONE_BITS: u32 = 0x3f80_0000;
 
 const E = struct {
     var insts: [256]kir.Inst = undefined;
@@ -575,6 +588,7 @@ fn edgeVerts(sc: EdgeScene) [6][4]f32 {
 fn edgeModel(verts: *const [6][4]f32, vp: [4]f32, cull: u2, depth: bool, m: *EdgeModel) void {
     @memset(&m.hits, 0);
     @memset(&m.z, 0xff_ffff);
+    @memset(&m.zf, ONE_BITS);
     const zs: f32 = 0.5;
     const zo: f32 = 0.5;
     for (0..2) |t| {
@@ -614,6 +628,7 @@ fn edgeModel(verts: *const [6][4]f32, vp: [4]f32, cull: u2, depth: bool, m: *Edg
             if (depth) {
                 if (q >= m.z[i]) continue;
                 m.z[i] = q;
+                m.zf[i] = model3d.depthBits(z);
             }
             m.hits[i] += 1;
         };
@@ -652,14 +667,15 @@ pub fn edgePixel(k: *kir.Kernel) void {
 }
 
 /// Step 4's groups (the prose above).
-const EdgeGroup = enum { triangles, culling, depth_less, depth_equal, depth_less_separate };
+const EdgeGroup = enum { triangles, culling, depth_less, depth_equal, depth_less_separate, z24_probe };
 const EdgeGroupOf = struct { g: EdgeGroup, label: []const u8, what: []const u8 };
 const edge_groups = [_]EdgeGroupOf{
     .{ .g = .triangles, .label = "4a", .what = "triangles: nvidia_gl's programs, TRIANGLES, the viewport's depth, the provoking vertex, the front face; a pitch target, no depth" },
     .{ .g = .culling, .label = "4b", .what = "culling: OGL_SET_CULL_FACE, OGL_SET_CULL; a pitch target, no depth" },
-    .{ .g = .depth_less, .label = "4c", .what = "depth LESS, written: a block-linear colour target, an X8Z24 depth target (SET_ZT_*, SET_DEPTH_*)" },
-    .{ .g = .depth_equal, .label = "4d", .what = "depth EQUAL against the compute path's depths, not written (block linear, X8Z24)" },
-    .{ .g = .depth_less_separate, .label = "4e", .what = "depth LESS, written: S8Z24 with its stencil a plane of its own (STENCIL_IS_SEPARATE, SET_ST_*), the stencil test off" },
+    .{ .g = .depth_less, .label = "4c", .what = "depth LESS, written: a block-linear colour target, a ZF32 depth target (SET_ZT_*, SET_DEPTH_*)" },
+    .{ .g = .depth_equal, .label = "4d", .what = "depth EQUAL against the compute path's depths, not written (block linear, ZF32)" },
+    .{ .g = .depth_less_separate, .label = "4e", .what = "depth LESS, written: ZF32_X24S8 with its stencil a plane of its own (STENCIL_IS_SEPARATE, SET_ST_*), the stencil test off" },
+    .{ .g = .z24_probe, .label = "4f", .what = "a probe of Blackwell's Z24 GOBs: each pixel's id as its gl_FragDepth, ALWAYS, into an X8Z24 plane zeroed; its first two GOBs logged" },
 };
 
 fn inGroup(g: EdgeGroup, sc: EdgeScene) bool {
@@ -667,6 +683,7 @@ fn inGroup(g: EdgeGroup, sc: EdgeScene) bool {
         .triangles => sc.cull == 0,
         .culling => sc.cull != 0,
         .depth_less, .depth_equal, .depth_less_separate => true,
+        .z24_probe => false,
     };
 }
 
@@ -716,7 +733,8 @@ fn edges(d0: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res
     };
     var d = d0;
     for (edge_groups) |grp| {
-        switch (edgeGroup(d, &vbin, &pbin, grp, log, now_us, res)) {
+        const outcome = if (grp.g == .z24_probe) z24Probe(d, st, &vbin, grp, log, now_us, res) else edgeGroup(d, &vbin, &pbin, grp, log, now_us, res);
+        switch (outcome) {
             .done => {},
             .stop => return d,
             .lost => {
@@ -789,7 +807,7 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
             d.toDevice(target, 0, E_DEPTH_BYTES);
             if (block) {
                 for (0..EH) |y| for (0..EW) |x| {
-                    std.mem.writeInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], if (less) 0xff_ffff else E.m.z[y * EW + x], .little);
+                    std.mem.writeInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], if (less) ONE_BITS else E.m.zf[y * EW + x], .little);
                 };
                 d.toDevice(depth, 0, E_DEPTH_BYTES);
             }
@@ -808,7 +826,7 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
                 .count = 6,
                 .cull = sc.cull,
                 .front_ccw = true,
-                .depth = if (block) .{ .va = depth.gpu, .stencil_va = if (grp.g == .depth_less_separate) splane.gpu else null, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = less, .func = if (less) 1 else 2 } else null,
+                .depth = if (block) .{ .va = depth.gpu, .stencil_va = if (grp.g == .depth_less_separate) splane.gpu else null, .float = true, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = less, .func = if (less) 1 else 2 } else null,
             };
             const t0 = now_us();
             const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {
@@ -829,29 +847,33 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
             var want: u32 = 0;
             var drawn: u32 = 0;
             var listed: u32 = 0;
+            // (the largest difference of a covered pixel's depth bits from
+            // the model's: float ulps)
+            var ulps: u32 = 0;
             for (0..EH) |y| for (0..EW) |x| {
                 const i = y * EW + x;
                 const at = pixelAt(block, x, y);
                 const h = hitsOf(target.cpu[at]);
-                const z = if (block) std.mem.readInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], .little) & 0xff_ffff else 0;
+                const z = if (block) std.mem.readInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], .little) else 0;
                 const mh = E.m.hits[i];
                 if (grp.g != .depth_equal) {
                     want += @intFromBool(mh != 0);
                     drawn += @intFromBool(h != 0);
                     const cov = h != mh;
-                    const dep = block and !cov and mh != 0 and z != E.m.z[i];
+                    const dep = block and !cov and mh != 0 and z != E.m.zf[i];
+                    if (block and !cov and mh != 0) ulps = @max(ulps, if (z > E.m.zf[i]) z - E.m.zf[i] else E.m.zf[i] - z);
                     cover_apart += @intFromBool(cov);
                     depth_apart += @intFromBool(dep);
                     if ((cov or dep) and listed < 3) {
                         listed += 1;
-                        hsay(log, "step {s}, edges, '{s}'{s}: ({d}, {d}): the 3D engine {d} hit(s) depth {x:0>6}, the compute path's {d} depth {x:0>6}", .{ grp.label, sc.name, fl, x, y, h, z, mh, E.m.z[i] });
+                        hsay(log, "step {s}, edges, '{s}'{s}: ({d}, {d}): the 3D engine {d} hit(s) depth {x:0>8}, the compute path's {d} depth {x:0>8}", .{ grp.label, sc.name, fl, x, y, h, z, mh, E.m.zf[i] });
                     }
                 } else {
                     const eq = (h != 0) != (mh != 0);
                     equal_apart += @intFromBool(eq);
                     if (eq and listed < 6) {
                         listed += 1;
-                        hsay(log, "step {s}, edges, '{s}'{s}, depth EQUAL against the compute path's depth {x:0>6}: ({d}, {d}) {s}", .{ grp.label, sc.name, fl, E.m.z[i], x, y, if (h != 0) "drawn, the compute path's rule has no pixel there" else "NOT drawn: the engine's depth there is not the compute path's" });
+                        hsay(log, "step {s}, edges, '{s}'{s}, depth EQUAL against the compute path's depth {x:0>8}: ({d}, {d}) {s}", .{ grp.label, sc.name, fl, E.m.zf[i], x, y, if (h != 0) "drawn, the compute path's rule has no pixel there" else "NOT drawn: the engine's depth there is not the compute path's" });
                     }
                 }
             };
@@ -862,11 +884,113 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
             const verdict = if (cover_apart + depth_apart + equal_apart == 0) "EXACT" else "APART";
             switch (grp.g) {
                 .triangles, .culling => hsay(log, "step {s}, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, in {d} us: {s}", .{ grp.label, sc.name, fl, drawn, want, cover_apart, now_us() - t0, verdict }),
-                .depth_less, .depth_less_separate => hsay(log, "step {s}, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, {d} depths apart, in {d} us: {s}", .{ grp.label, sc.name, fl, drawn, want, cover_apart, depth_apart, now_us() - t0, verdict }),
+                .depth_less, .depth_less_separate => hsay(log, "step {s}, edges, '{s}'{s}: the 3D engine covered {d} pixels, the compute path's rule {d}: {d} covered otherwise, {d} depths apart (the most {d} ulps), in {d} us: {s}", .{ grp.label, sc.name, fl, drawn, want, cover_apart, depth_apart, ulps, now_us() - t0, verdict }),
                 .depth_equal => hsay(log, "step {s}, edges, '{s}'{s}: depth EQUAL against the compute path's depths: {d} pixels otherwise, in {d} us: {s}", .{ grp.label, sc.name, fl, equal_apart, now_us() - t0, verdict }),
+                .z24_probe => {},
             }
         }
     }
+    return .done;
+}
+
+/// Step 4f's pixel program: a quarter of red, and gl_FragDepth the pixel's
+/// id as a 24-bit depth: ((y * 64 + x) * 4096 + 2048) / (2^24 - 1), so a
+/// depth's bits 12..23 are y * 64 + x however the engine rounds it.
+pub fn probePixel(k: *kir.Kernel) void {
+    const io = k.binding();
+    _ = k.binding();
+    const color = [4]f32{ 0.25, 0, 0, 0 };
+    for (color, 0..) |c, n| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(n)), false), kir.u(0), kir.f(c));
+    const x = k.load(.f32, nvidia_gl.ioMem(io, nvidia_gl.POSITION, false), kir.u(0));
+    const y = k.load(.f32, nvidia_gl.ioMem(io, nvidia_gl.POSITION + 4, false), kir.u(0));
+    const px = k.op2(.fadd, .f32, kir.r(x), kir.f(-0.5));
+    const py = k.op2(.fadd, .f32, kir.r(y), kir.f(-0.5));
+    const id = k.op2(.fadd, .f32, kir.r(k.op2(.fmul, .f32, kir.r(py), kir.f(EW))), kir.r(px));
+    const v = k.op2(.fadd, .f32, kir.r(k.op2(.fmul, .f32, kir.r(id), kir.f(4096))), kir.f(2048));
+    const z = k.op2(.fmul, .f32, kir.r(v), kir.f(1.0 / 16777215.0));
+    k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.DEPTH_AT, false), kir.u(0), kir.r(z));
+}
+
+/// A probe's depth word read as the pixel id it holds (bits 12..23).
+pub fn probeId(w: u32) u32 {
+    return (w & 0xff_ffff) >> 12;
+}
+
+/// Step 4f: Blackwell's Z24 GOBs read off. The whole target drawn ALWAYS
+/// into an X8Z24 plane the CPU zeroed (zeros are zeros in any layout),
+/// each pixel's depth its id; then how many pixels' ids are where
+/// Turing2D's 32-bit GOBs would put them, and the first two GOBs' words,
+/// for the layout to be worked out from a boot's log.
+fn z24Probe(d: gpu.Device, st: *kir_sm120.State, vbin: *const gpu.Binary, grp: EdgeGroupOf, log: draw.Log, now_us: Clock, res: *Hardware) Outcome {
+    var pk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "z24_probe_ps", .{ 1, 1, 1 });
+    probePixel(&pk);
+    const pbin = blk: {
+        pk.finish() catch |e| break :blk e;
+        st.asm_work.sched = .{};
+        break :blk nvidia_gl.compileStage(&pk, d.caps, st, .pixel, 0, &E.pcode);
+    } catch |e| {
+        hsay(log, "step {s}: the probe's pixel program did not compile ({s}): not run", .{ grp.label, @errorName(e) });
+        return .done;
+    };
+    const vp = d.load(vbin) catch return .done;
+    defer d.unload(&vp);
+    const pp = d.load(&pbin) catch return .done;
+    defer d.unload(&pp);
+    const vb = d.alloc(6 * 16, .host) catch return noMemory(log, res);
+    defer d.free(vb);
+    const target = d.alloc(E_DEPTH_BYTES, .host) catch return noMemory(log, res);
+    defer d.free(target);
+    const depth = d.alloc(E_DEPTH_BYTES, .host) catch return noMemory(log, res);
+    defer d.free(depth);
+    hsay(log, "step {s}: {s}", .{ grp.label, grp.what });
+    const whole = [6][4]f32{ .{ -1, -1, 0, 1 }, .{ 1, -1, 0, 1 }, .{ 1, 1, 0, 1 }, .{ -1, -1, 0, 1 }, .{ 1, 1, 0, 1 }, .{ -1, 1, 0, 1 } };
+    @memcpy(vb.cpu[0 .. 6 * 16], std.mem.sliceAsBytes(&whole));
+    d.toDevice(vb, 0, 6 * 16);
+    @memset(target.cpu[0..E_DEPTH_BYTES], 0);
+    d.toDevice(target, 0, E_DEPTH_BYTES);
+    @memset(depth.cpu[0..E_DEPTH_BYTES], 0);
+    d.toDevice(depth, 0, E_DEPTH_BYTES);
+    const g = gpu.Graphics{
+        .vertex = &vp,
+        .va = target.gpu,
+        .width = EW,
+        .height = EH,
+        .stride = E_PITCH,
+        .format = .rgba8,
+        .gobs_log2 = E_GOBS,
+        .scale = .{ EW / 2, EH / 2, 0.5 },
+        .offset = .{ EW / 2, EH / 2, 0.5 },
+        .scissor = .{ 0, 0, EW, EH },
+        .count = 6,
+        .depth = .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = true, .func = 7 },
+    };
+    const t0 = now_us();
+    const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {
+        hsay(log, "step {s}: the draw was not sent ({s}): not run", .{ grp.label, @errorName(e) });
+        return if (e == error.DeviceLost) .lost else .done;
+    };
+    d.wait(fence, STEP_US) catch |e| {
+        hsay(log, "step {s}: FAILED: the draw did not finish ({s} after {d} us): the channel is lost; the group sent {s}", .{ grp.label, @errorName(e), now_us() - t0, grp.what });
+        return .lost;
+    };
+    d.fromDevice(target, 0, E_DEPTH_BYTES);
+    d.fromDevice(depth, 0, E_DEPTH_BYTES);
+    var drawn: u32 = 0;
+    var placed: u32 = 0;
+    for (0..EH) |y| for (0..EW) |x| {
+        drawn += @intFromBool(hitsOf(target.cpu[pixelAt(true, x, y)]) != 0);
+        const zw = std.mem.readInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], .little);
+        placed += @intFromBool(probeId(zw) == y * EW + x);
+    };
+    hsay(log, "step {s}: the 3D engine drew {d} of {d} pixels; {d} pixels' ids are where Turing2D's 32-bit GOBs put them (a word's bits 12..23 its pixel's y * 64 + x), in {d} us; the first two GOBs' words:", .{ grp.label, drawn, EW * EH, placed, now_us() - t0 });
+    var off: usize = 0;
+    while (off < 1024) : (off += 32) {
+        var ws: [8]u32 = undefined;
+        for (&ws, 0..) |*x, n| x.* = std.mem.readInt(u32, depth.cpu[off + 4 * n ..][0..4], .little);
+        hsay(log, "step {s}: Z24 bytes {d}: {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}", .{ grp.label, off, ws[0], ws[1], ws[2], ws[3], ws[4], ws[5], ws[6], ws[7] });
+    }
+    res.z24_placed = placed;
+    res.z24_drawn = drawn;
     return .done;
 }
 
@@ -1050,10 +1174,11 @@ fn featureModel(kind: FeatureKind, m: *FeatureModel) void {
     @memset(&m.color2, .{ 0, 0, 0, 0 });
     @memset(&m.z, 0xff_ffff);
     @memset(&m.s, 0);
+    if (featureFloat(kind)) @memset(&m.z, ONE_BITS);
     switch (kind) {
         .frag_depth => for (0..EH) |y| for (0..EW) |x| {
-            const q = model3d.depthWord(model3d.shaderDepth(fragDepthOf(x, y)));
-            if (q >= 0xff_ffff) continue;
+            const q = model3d.depthBits(model3d.shaderDepth(fragDepthOf(x, y)));
+            if (q >= ONE_BITS) continue;
             m.z[y * EW + x] = q;
             m.color[y * EW + x] = .{ 64, 0, 0, 0 };
         },
@@ -1107,6 +1232,10 @@ fn featureModel(kind: FeatureKind, m: *FeatureModel) void {
 
 /// Whether a scene draws with a depth target (its colour target then block
 /// linear: RT_LINEAR_WITH_ZETA); the others draw into rows with none.
+fn featureFloat(kind: FeatureKind) bool {
+    return kind == .frag_depth;
+}
+
 fn featureDepth(kind: FeatureKind) bool {
     return kind == .frag_depth or kind == .two_sided_stencil;
 }
@@ -1216,7 +1345,7 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
         d.toDevice(target2, 0, EW * EH * 4);
         for (0..EH) |y| for (0..EW) |x| {
             const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
-            std.mem.writeInt(u32, depth.cpu[at..][0..4], 0xff_ffff, .little);
+            std.mem.writeInt(u32, depth.cpu[at..][0..4], if (featureFloat(sc.kind)) ONE_BITS else 0xff_ffff, .little);
         };
         d.toDevice(depth, 0, E_DEPTH_BYTES);
         @memset(splane.cpu[0..E_S_BYTES], 0);
@@ -1234,7 +1363,7 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
             .offset = .{ EW / 2, EH / 2, 0.5 },
             .scissor = .{ 0, 0, EW, EH },
             .count = nverts,
-            .depth = if (block) .{ .va = depth.gpu, .stencil_va = if (stencil) splane.gpu else null, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 } else null,
+            .depth = if (block) .{ .va = depth.gpu, .stencil_va = if (stencil) splane.gpu else null, .float = featureFloat(sc.kind), .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 } else null,
         };
         featureGraphics(sc.kind, &g);
         if (sc.kind == .mrt) g.more[1] = .{ .va = target2.gpu, .stride = EW * 4, .format = .bgra8 };
@@ -1268,9 +1397,11 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
             const at = pixelAt(true, x, y);
             // (the depth in bits 0..23 of its word; the stencil its plane's
             // byte, 0 with none)
-            const zw = if (block) std.mem.readInt(u32, depth.cpu[at..][0..4], .little) & 0xff_ffff else F.m.z[i];
+            // (a float depth is its whole word; a 24-bit one (the stencil
+            // scene's, never written: the CPU's own words) its low 24 bits)
+            const zword = std.mem.readInt(u32, depth.cpu[at..][0..4], .little);
+            const zw = if (!block) F.m.z[i] else if (featureFloat(sc.kind)) zword else zword & 0xff_ffff;
             const sv: u32 = if (stencil) splane.cpu[model3d.blAddress8(E_S_PITCH, E_GOBS, @intCast(x), @intCast(y))] else F.m.s[i];
-            const w = zw | sv << 24;
             const mc = F.m.color[i];
             drawn += @intFromBool(!std.mem.allEqual(u8, &got, 0));
             want += @intFromBool(!std.mem.allEqual(u8, &mc, 0));
@@ -1278,13 +1409,13 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
             const mc2 = F.m.color2[i];
             const color_ok = near(got[0], mc[0]) and near(got[1], mc[1]) and near(got[2], mc[2]) and near(got[3], mc[3]) and
                 near(got2[0], mc2[0]) and near(got2[1], mc2[1]) and near(got2[2], mc2[2]) and near(got2[3], mc2[3]);
-            const z_ok = w & 0xff_ffff == F.m.z[i];
-            const s_ok = w >> 24 == F.m.s[i];
+            const z_ok = zw == F.m.z[i];
+            const s_ok = sv == F.m.s[i];
             if (color_ok and z_ok and s_ok) continue;
             apart += 1;
             if (listed < 4) {
                 listed += 1;
-                hsay(log, "step 5, '{s}': ({d}, {d}): the 3D engine {x:0>2}{x:0>2}{x:0>2}{x:0>2} (target 2 {x:0>2}{x:0>2}{x:0>2}{x:0>2}) depth {x:0>6} stencil {x:0>2}, the model {x:0>2}{x:0>2}{x:0>2}{x:0>2} ({x:0>2}{x:0>2}{x:0>2}{x:0>2}) depth {x:0>6} stencil {x:0>2}", .{ sc.name, x, y, got[0], got[1], got[2], got[3], got2[0], got2[1], got2[2], got2[3], w & 0xff_ffff, w >> 24, mc[0], mc[1], mc[2], mc[3], mc2[0], mc2[1], mc2[2], mc2[3], F.m.z[i], F.m.s[i] });
+                hsay(log, "step 5, '{s}': ({d}, {d}): the 3D engine {x:0>2}{x:0>2}{x:0>2}{x:0>2} (target 2 {x:0>2}{x:0>2}{x:0>2}{x:0>2}) depth {x:0>8} stencil {x:0>2}, the model {x:0>2}{x:0>2}{x:0>2}{x:0>2} ({x:0>2}{x:0>2}{x:0>2}{x:0>2}) depth {x:0>8} stencil {x:0>2}", .{ sc.name, x, y, got[0], got[1], got[2], got[3], got2[0], got2[1], got2[2], got2[3], zw, sv, mc[0], mc[1], mc[2], mc[3], mc2[0], mc2[1], mc2[2], mc2[3], F.m.z[i], F.m.s[i] });
             }
         };
         res.feature_scenes += 1;

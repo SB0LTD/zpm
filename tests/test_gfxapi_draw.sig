@@ -1699,6 +1699,13 @@ test "draw: the drawtest boot's hardware test on the emulated RTX, step 4 (edges
     try std.testing.expectEqual(@as(u32, 0), res.failed);
     try std.testing.expect(!res.edge_skipped);
     try std.testing.expectEqual(gpu.nvidia_draw.EDGE_RUNS, res.edge_scenes);
+    // (step 4f, the Z24 probe: every pixel drawn, and none of their ids
+    // where Turing2D's GOBs would put them: the emulated engine keeps 24-bit
+    // depths in a stand-in layout, as the RTX keeps them in its own (pc-full3
+    // read X8Z24 back through Turing2D's addresses scrambled). A step that
+    // read or wrote a 24-bit depth plane from the CPU fails here.)
+    try std.testing.expectEqual(@as(u32, gpu.nvidia_draw.EW * gpu.nvidia_draw.EH), res.z24_drawn);
+    try std.testing.expectEqual(@as(u32, 0), res.z24_placed);
     try std.testing.expectEqual(@as(u32, 0), res.edge_cover_apart);
     try std.testing.expectEqual(@as(u32, 0), res.edge_depth_apart);
     try std.testing.expectEqual(@as(u32, 0), res.edge_equal_apart);

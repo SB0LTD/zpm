@@ -161,6 +161,13 @@ pub const SET_ZT_SIZE_A: u32 = 0x1228; // width, height, third dimension
 pub const ZT_X8Z24: u32 = 0x15;
 pub const ZT_S8Z24: u32 = 0x16;
 pub const ZT_Z24S8: u32 = 0x14;
+/// SET_ZT_FORMAT's 32-bit float depths: ZF32 alone, ZF32_X24S8 (with
+/// STENCIL_IS_SEPARATE: NVK's D32_SFLOAT_S8_UINT on Blackwell). Their GOBs
+/// are Turing2D's, as a 32-bit colour target's (Mesa nil's GOBType::choose:
+/// only the 24-bit depth formats get BlackwellZ24 GOBs, whose layout is not
+/// public: pc-full3 read X8Z24 depths back scrambled through Turing2D's).
+pub const ZT_ZF32: u32 = 0x0a;
+pub const ZT_ZF32_X24S8: u32 = 0x19;
 /// SET_ZT_FORMAT_STENCIL_IS_SEPARATE (clcd97.h on): the stencil is the
 /// SET_ST_* plane.
 pub const ZT_STENCIL_IS_SEPARATE: u32 = 1 << 8;
@@ -202,6 +209,10 @@ pub const Depth = struct {
     /// 8-bit GOBs, stencilPitch(width) bytes across, as many GOBs a block
     /// as the depth's), or null: no stencil.
     stencil_va: ?u64 = null,
+    /// 32-bit float depths (ZF32: Turing2D's GOBs, the CPU can read and
+    /// write them), else 24-bit (X8Z24 / S8Z24: Blackwell's own Z24 GOBs,
+    /// for the engine alone: the CPU must not read or write them).
+    float: bool = false,
     width: u32,
     height: u32,
     gobs_log2: u3,
@@ -416,7 +427,10 @@ pub fn emit(p: *Push, d: *const Draw) void {
         // (as NVK sends a Blackwell depth image: X8Z24 alone, or S8Z24
         // with its stencil the SET_ST_* plane; the width in words of a
         // whole-GOB row; one layer; no compression, no sparse)
-        const fmt = if (z.stencil_va != null) ZT_S8Z24 | ZT_STENCIL_IS_SEPARATE else ZT_X8Z24;
+        const fmt = if (z.float)
+            (if (z.stencil_va != null) ZT_ZF32_X24S8 | ZT_STENCIL_IS_SEPARATE else ZT_ZF32)
+        else
+            (if (z.stencil_va != null) ZT_S8Z24 | ZT_STENCIL_IS_SEPARATE else ZT_X8Z24);
         many(p, SET_ZT_A, &.{ @truncate(z.va >> 32), @truncate(z.va), fmt, @as(u32, z.gobs_log2) << 4, 0 });
         many(p, SET_ZT_SIZE_A, &.{ (z.width * 4 + 63) / 64 * 16, z.height, 1 });
         one(p, SET_ZT_LAYER, 0);
@@ -566,6 +580,12 @@ test "gl3d: what the Legion refused (depth beside pitch colour, a combined depth
     try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, SET_ZT_A, 5), 0x10, 0x0003_0000, ZT_S8Z24 | ZT_STENCIL_IS_SEPARATE, 0x20, 0 }) != null);
     try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, SET_ST_A, 4), 0x10, 0x0004_0000, 0x20, 0 }) != null);
     try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, SET_ST_SIZE_A, 2), 64, 32 }) != null);
+    // (float depths: ZF32)
+    d.depth.?.float = true;
+    p = Push{ .buf = &buf };
+    emit(&p, &d);
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, SET_ZT_A, 5), 0x10, 0x0003_0000, ZT_ZF32_X24S8 | ZT_STENCIL_IS_SEPARATE, 0x20, 0 }) != null);
+    d.depth.?.float = false;
     // (front counter-clockwise in the target's rows: the engine's CW)
     try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{push.headerImmd(SUBCH, gr.OGL_SET_FRONT_FACE, FRONT_CW)}) != null);
     try testing.expect(frontCcwOf(frontFaceWord(true)) and !frontCcwOf(frontFaceWord(false)));

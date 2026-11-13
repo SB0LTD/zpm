@@ -546,6 +546,7 @@ pub const Adapter = struct {
             .depth = if (g.depth) |z| .{
                 .va = z.va,
                 .stencil_va = z.stencil_va,
+                .float = z.float,
                 .width = z.width,
                 .height = z.height,
                 .gobs_log2 = z.gobs_log2,

@@ -94,7 +94,7 @@ const Clip = struct { x0: i64, y0: i64, x1: i64, y1: i64 };
 /// The depth target as gl3d sends it: block linear, 32-bit words, depth
 /// in bits 0..23 (X8Z24, or S8Z24 with STENCIL_IS_SEPARATE), and its
 /// stencil plane (S8, Blackwell's 8-bit GOBs) when there is one.
-const ZT = struct { bytes: []u8, pitch: u32, width: u32, height: u32, gobs: u3, stencil: ?[]u8 = null, s_pitch: u32 = 0 };
+const ZT = struct { bytes: []u8, pitch: u32, width: u32, height: u32, gobs: u3, stencil: ?[]u8 = null, s_pitch: u32 = 0, float: bool = false };
 const STENCIL_TWO_SIDE = gl3d.SET_TWO_SIDED_STENCIL_TEST;
 
 /// A texture as its header and its sampler describe it.
@@ -327,8 +327,10 @@ pub const Engine = struct {
         const a = gl3d.SET_ZT_A;
         const va = @as(u64, g.reg(a) & 0xff) << 32 | g.reg(a + 4);
         const fmt = g.reg(a + 8);
-        const separate = fmt == gl3d.ZT_S8Z24 | gl3d.ZT_STENCIL_IS_SEPARATE;
-        try g.need(fmt == gl3d.ZT_X8Z24 or separate, "a depth target whose stencil shares its words (Z24S8, or S8Z24 without STENCIL_IS_SEPARATE): Blackwell refuses the draw (class error 0x13 at the draw, Xid 69: pc-full2); X8Z24, or S8Z24 with its stencil a plane of its own");
+        const sep = gl3d.ZT_STENCIL_IS_SEPARATE;
+        const separate = fmt == gl3d.ZT_S8Z24 | sep or fmt == gl3d.ZT_ZF32_X24S8 | sep;
+        const is_float = fmt == gl3d.ZT_ZF32 or fmt == gl3d.ZT_ZF32_X24S8 | sep;
+        try g.need(fmt == gl3d.ZT_X8Z24 or fmt == gl3d.ZT_ZF32 or separate, "a depth target whose stencil shares its words (Z24S8, or S8Z24 / ZF32_X24S8 without STENCIL_IS_SEPARATE): Blackwell refuses the draw (class error 0x13 at the draw, Xid 69: pc-full2); X8Z24 or ZF32, or S8Z24 / ZF32_X24S8 with its stencil a plane of its own");
         const bs = g.reg(a + 12);
         try g.need(bs & 0xf == 0 and (bs >> 8) & 0xf == 0 and (bs >> 4) & 0xf <= 5, "a depth target's blocks not one GOB wide and deep");
         const gobs: u3 = @intCast((bs >> 4) & 0xf);
@@ -342,7 +344,7 @@ pub const Engine = struct {
         const blocks_down = (h + rows_per_block - 1) / rows_per_block;
         const bytes = @as(usize, pitch / 64) * blocks_down * (@as(usize, 512) << gobs);
         const mem = g.host.mem.find(va, bytes) orelse return g.refuse("the depth target's memory is not mapped");
-        var z = ZT{ .bytes = mem, .pitch = pitch, .width = w, .height = h, .gobs = gobs };
+        var z = ZT{ .bytes = mem, .pitch = pitch, .width = w, .height = h, .gobs = gobs, .float = is_float };
         if (separate) {
             const st = gl3d.SET_ST_A;
             const sva = @as(u64, g.reg(st) & 0xff) << 32 | g.reg(st + 4);
@@ -886,10 +888,12 @@ pub const Engine = struct {
     /// colour is written.
     fn depthStencil(g: *Engine, z: ZT, x: u32, y: u32, zw: f32, front: bool) bool {
         if (x >= z.width or y >= z.height) return false;
-        const at = blAddress(z.pitch, z.gobs, x * 4, y);
+        // (a float depth's word where Turing2D puts it; a 24-bit one where
+        // the stand-in for Blackwell's Z24 GOBs does: z24Address)
+        const at = if (z.float) blAddress(z.pitch, z.gobs, x * 4, y) else z24Address(z.pitch, z.gobs, x, y);
         const w = std.mem.readInt(u32, z.bytes[at..][0..4], .little);
-        const zq = depthWord(zw);
-        const old_z = w & 0xff_ffff;
+        const zq = if (z.float) depthBits(zw) else depthWord(zw);
+        const old_z = if (z.float) w else w & 0xff_ffff;
         const s_at = if (z.stencil != null) blAddress8(z.s_pitch, z.gobs, x, y) else 0;
         var stencil: u32 = if (z.stencil) |sb| sb[s_at] else 0;
         const st_on = g.reg(gr.SET_STENCIL_TEST) & 1 != 0 and z.stencil != null;
@@ -914,8 +918,9 @@ pub const Engine = struct {
             const v = stencilOp(op, stencil, ref);
             stencil = (v & wm) | (stencil & ~wm & 0xff);
         }
-        // (bits 24..31 of a depth word kept: X8Z24's X8, S8Z24's unused)
-        std.mem.writeInt(u32, z.bytes[at..][0..4], (w & 0xff00_0000) | new_z, .little);
+        // (bits 24..31 of a 24-bit depth's word kept: X8Z24's X8, S8Z24's
+        // unused; a float depth is its whole word)
+        std.mem.writeInt(u32, z.bytes[at..][0..4], if (z.float) new_z else (w & 0xff00_0000) | new_z, .little);
         if (z.stencil) |sb| sb[s_at] = @intCast(stencil & 0xff);
         return s_pass and d_pass;
     }
@@ -1056,6 +1061,27 @@ pub fn depthInRange(z: f32, zlo: f32, zhi: f32, zs: f32, zo: f32) bool {
 /// half in f32 would round it up).
 pub fn depthWord(z: f32) u32 {
     return @intFromFloat(rne(std.math.clamp(z, 0, 1) * 16777215.0));
+}
+
+/// A float depth (ZF32) as the engine keeps it: the window depth clamped
+/// to 0..1, its bits (0 for a negative zero). Its order is the depths'
+/// (non-negative floats compare as their bits do).
+pub fn depthBits(z: f32) u32 {
+    const c = std.math.clamp(z, 0, 1);
+    return if (c == 0) 0 else @bitCast(c);
+}
+
+/// Where a 24-bit depth's word is (X8Z24, S8Z24): a STAND-IN. Blackwell
+/// keeps 24-bit depths in GOBs of their own (Mesa nil's BlackwellZ24, the
+/// copy engine's BPP_BL_24), whose layout is not public: pc-full3 read
+/// them back through Turing2D's addresses scrambled, and a CPU clear of
+/// 0x00ffffff words failed a quarter of the LESS tests (bytes of a word
+/// read as another pixel's). The emulated engine keeps them in Turing2D's
+/// order with the rows of each pair swapped, so a test that reads or
+/// writes a 24-bit depth plane from the CPU as Turing2D's fails here as
+/// it did on the RTX: only the engine touches a 24-bit depth plane.
+pub fn z24Address(pitch: u32, gobs: u3, x: u32, y: u32) usize {
+    return blAddress(pitch, gobs, x * 4, y ^ 1);
 }
 
 /// A depth a pixel program wrote (gl_FragDepth) as the engine takes it:
@@ -1348,6 +1374,17 @@ test "a pixel written: replaced, and premultiplied source over" {
     try testing.expectEqualSlices(u8, &.{ 128, 128, 0, 255 }, bytes[0..4]);
     write(t, 1, 0, .{ 1, 0.5, 0, 0.25 }, null, 0xf);
     try testing.expectEqualSlices(u8, &.{ 0, 128, 255, 64 }, bytes[4..8]);
+}
+
+test "a float depth's bits keep the depths' order; a 24-bit depth is not where Turing2D's GOBs put a word" {
+    try testing.expectEqual(@as(u32, 0), depthBits(-0.0));
+    try testing.expectEqual(@as(u32, 0x3f80_0000), depthBits(2));
+    try testing.expect(depthBits(0.25) < depthBits(0.2500001) and depthBits(0.1) < depthBits(0.9));
+    // (the stand-in for Blackwell's Z24 GOBs: no pixel of the first GOB
+    // where Turing2D's would be)
+    for (0..8) |y| for (0..16) |x| {
+        try testing.expect(z24Address(256, 2, @intCast(x), @intCast(y)) != blAddress(256, 2, @intCast(x * 4), @intCast(y)));
+    };
 }
 
 test "a stencil plane's byte lands where Blackwell's 8-bit GOB puts it" {
