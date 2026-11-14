@@ -241,7 +241,7 @@ fn checkOn(dev: gpu.Device, scratch: *Scratch, compile: anytype) !void {
     defer dev.unload(&prog);
     const shapes = [_][3]u32{ .{ 37, 21, 1 }, .{ 64, 16, 1 }, .{ 130, 33, 1 }, .{ 37, 21, 2 }, .{ 70, 40, 2 } };
     for (shapes) |sh| {
-        for ([_]tiling.Gob{ .blackwell, .turing }) |gob| {
+        for ([_]tiling.Gob{ .blackwell, .turing, .b8, .b16, .swapped }) |gob| {
             const layout = tiling.Nv12.ofDepth(sh[0], sh[1], @intCast(sh[2]));
             const lin = tiling.Linear.ofDepth(sh[0], sh[1], @intCast(sh[2]));
             const t = try dev.alloc(layout.bytes, .host);

@@ -413,6 +413,14 @@ pub fn reconSurface(st: *const State) u32 {
     };
 }
 
+/// Whether the HEVC sequence uses temporal MVP: the app's packed SPS
+/// says so when it gave one (that is what goes into the stream), else
+/// its sequence parameters.
+pub fn hevcTemporalMvp(st: *const State) bool {
+    if (st.hevc_params.have_sps) return st.hevc_params.temporal_mvp;
+    return st.hevc_seq.seq_fields.sps_temporal_mvp_enabled_flag != 0;
+}
+
 /// The picture's type for the rate control.
 pub fn picType(st: *const State) enc_rc.Type {
     return switch (st.kind) {
@@ -647,10 +655,17 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
     };
     const reads_col = switch (st.kind) {
         .h264 => t0 == .b,
-        .hevc => t0 != .i and st.hevc_slices[0].temporal_mvp,
+        .hevc => t0 != .i and st.hevc_slices[0].temporal_mvp and hevcTemporalMvp(st),
         .av1 => unreachable,
     };
-    const writes_col = is_ref and (st.kind != .h264 or st.b_frames);
+    // (HEVC: only a sequence with temporal MVP has a later picture read
+    // it; FEATURES offers none, so FFmpeg's sequences bind no co-located
+    // buffer, which GB206 refused on every picture: pc-full8)
+    const writes_col = is_ref and switch (st.kind) {
+        .h264 => st.b_frames,
+        .hevc => hevcTemporalMvp(st),
+        .av1 => unreachable,
+    };
     a.coloc_out = if (writes_col) in.scratch.coloc(out_k) else 0;
     a.coloc_in = if (reads_col) in.scratch.coloc(in_k) else 0;
     if (t0 != .i) motionBuffers(st, in.scratch, &a);
@@ -1363,6 +1378,20 @@ test "encode: no B pictures unless asked for (GALAXY_VA_NVENC_B=1): no L1 offere
     };
     try testing.expectEqual(va.ERROR_INVALID_PARAMETER, end(&st, in, &out));
     try testing.expectEqual(@as(u32, 0), st.pictures);
+}
+
+test "encode: HEVC binds a co-located buffer only for a sequence with temporal MVP, which the features do not offer" {
+    try testing.expectEqual(@as(u32, 0), hevc.FEATURES & hevc.FEATURES_TEMPORAL_MVP);
+    var st = State.init(.hevc, va.PROFILE_HEVC_MAIN, 64, 64, ve.RC_CQP, 0);
+    st.hevc_seq = std.mem.zeroes(hevc.Seq);
+    try testing.expect(!hevcTemporalMvp(&st));
+    st.hevc_seq.seq_fields.sps_temporal_mvp_enabled_flag = 1;
+    try testing.expect(hevcTemporalMvp(&st));
+    // an app's packed SPS is what the stream carries: it decides
+    st.hevc_params = .{ .have_sps = true, .temporal_mvp = false };
+    try testing.expect(!hevcTemporalMvp(&st));
+    st.hevc_params.temporal_mvp = true;
+    try testing.expect(hevcTemporalMvp(&st));
 }
 
 test "encode: the scratch holds a whole picture's history and two MEPRED buffers" {

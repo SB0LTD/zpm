@@ -49,9 +49,19 @@ const LIST = h264.LIST;
 pub const DPB = MAX_L0 + MAX_L1 + 1;
 
 /// VAConfigAttribValEncHEVCFeatures this driver answers: AMP, SAO,
-/// temporal MVP, strong intra smoothing, CU QP delta supported (1), the
-/// rest not (0); two bits each, in va_enc_hevc.h's order.
-pub const FEATURES: u32 = (1 << 4) | (1 << 6) | (1 << 10) | (1 << 12) | (1 << 22);
+/// strong intra smoothing, CU QP delta supported (1), the rest not (0);
+/// two bits each, in va_enc_hevc.h's order.
+///
+/// Temporal MVP (bits 10-11) is not offered: FFmpeg reads this and then
+/// writes sps_temporal_mvp_enabled_flag 0, so no picture writes or reads
+/// the co-located motion buffers. With it offered, every HEVC picture on
+/// GB206 failed, the IDR first, with ucode error 19 COLLOC_OFFSET and no
+/// slice bytes (pc-full8); no NVENC picture of any codec has encoded with
+/// a co-located buffer bound on GB206, and H.264, which binds none
+/// without B pictures, encodes.
+pub const FEATURES: u32 = (1 << 4) | (1 << 6) | (1 << 12) | (1 << 22);
+/// The temporal MVP bits of FEATURES (none: see FEATURES).
+pub const FEATURES_TEMPORAL_MVP: u32 = 3 << 10;
 /// VAConfigAttribValEncHEVCBlockSizes: CTBs 32 (max and min), CBs from
 /// 16, transforms 4 to 32, hierarchy depth up to 2.
 ///

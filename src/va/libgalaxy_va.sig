@@ -89,6 +89,7 @@ const driver = @import("driver.sig");
 const codec = @import("codec.sig");
 const vp9 = @import("vp9.sig");
 const node = @import("node.sig");
+const tiling = @import("tiling.sig");
 const linux = std.os.linux;
 
 /// A failed check in the driver: one line on stderr, then the program
@@ -277,7 +278,8 @@ fn options() driver.Options {
 /// after a decode at its EndPicture, as before the pipeline),
 /// GALAXY_VA_SCRATCH ("vram": H.264's decoder-only buffers in VRAM),
 /// GALAXY_VA_GOB
-/// ("turing": Turing's GOB layout instead of Blackwell's), GALAXY_VA_PROBE
+/// ("turing": Turing's GOB layout instead of Blackwell's; "b8", "b16",
+/// "swapped": test readings of the encoder's input, tiling.Gob), GALAXY_VA_PROBE
 /// ("0": no decoder probe at init), GALAXY_VA_BLACKWELL and
 /// GALAXY_VA_{HEVC,VP9,AV1}_BLACKWELL (Blackwell's additions, codec.Blackwell:
 /// "full" or "1" the default, "buffer", "fields", "off" or "0"; a codec's own
@@ -304,7 +306,7 @@ pub fn optionsOf(block: []const u8) driver.Options {
         if (std.mem.eql(u8, k, "GALAXY_VA_DEBUG")) {
             o.debug = v.len != 0 and !std.mem.eql(u8, v, "0");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_GOB")) {
-            o.gob = if (std.ascii.eqlIgnoreCase(v, "turing")) .turing else .blackwell;
+            o.gob = tiling.Gob.named(v);
         } else if (std.mem.eql(u8, k, "GALAXY_VA_PROBE")) {
             o.probe = !std.mem.eql(u8, v, "0");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_SERIAL")) {
@@ -642,6 +644,10 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expect(!none.debug and none.probe and none.gob == .blackwell);
     const all = optionsOf("GALAXY_VA_DEBUG=1\x00GALAXY_VA_GOB=Turing\x00GALAXY_VA_PROBE=0\x00");
     try testing.expect(all.debug and !all.probe and all.gob == .turing);
+    try testing.expectEqual(tiling.Gob.b8, optionsOf("GALAXY_VA_GOB=b8").gob);
+    try testing.expectEqual(tiling.Gob.b16, optionsOf("GALAXY_VA_GOB=B16").gob);
+    try testing.expectEqual(tiling.Gob.swapped, optionsOf("GALAXY_VA_GOB=swapped").gob);
+    try testing.expectEqual(tiling.Gob.blackwell, optionsOf("GALAXY_VA_GOB=other").gob);
     try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
     try testing.expect(none.encode and none.nvenc_magic == null);
     const enc = optionsOf("GALAXY_VA_ENCODE=0\x00GALAXY_VA_NVENC_MAGIC=0xc9b70006\x00");
