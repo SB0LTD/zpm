@@ -108,12 +108,19 @@ pub const APPLICATION_ID_H264: u32 = 1;
 pub const APPLICATION_ID_H265: u32 = 3;
 pub const APPLICATION_ID_AV1: u32 = 7;
 
-/// SET_CONTROL_PARAMS' CODEC_TYPE (3:0): clc9b7.h names only H264 (3),
-/// NVDEC's number for it. HEVC's and AV1's are ASSUMED NVDEC's too (7,
-/// 10).
+/// SET_CONTROL_PARAMS' CODEC_TYPE (3:0): clc9b7.h names only H264 (3).
+/// HEVC's is 4 and AV1's 5, not NVDEC's 7 and 10 as this driver assumed
+/// before: NVIDIA's own driver on GB206 (captured in WSL, driver 592.15)
+/// writes 0x11001303, 0x11001104 and 0x11041905. With 7 and 10 every
+/// HEVC picture stopped with ucode error 19 and every AV1 picture with
+/// ucode error 3 (pc-full8 to pc-full12).
 pub const CODEC_TYPE_H264: u32 = 3;
-pub const CODEC_TYPE_H265: u32 = 7;
-pub const CODEC_TYPE_AV1: u32 = 10;
+pub const CODEC_TYPE_H265: u32 = 4;
+pub const CODEC_TYPE_AV1: u32 = 5;
+/// The setup's pic_control `codec` field NVIDIA's driver writes on GB206:
+/// 0 for H.264, 5 for HEVC, 7 for AV1 (meaning not public).
+pub const PIC_CODEC_H265: u32 = 5;
+pub const PIC_CODEC_AV1: u32 = 7;
 /// GPTIMER_ON (12): the watchdog, its timeout the setup's
 /// gpTimer_timeout_val.
 pub const CONTROL_GPTIMER_ON: u32 = 1 << 12;
@@ -697,9 +704,25 @@ pub const H265Quant = struct {
     pub const SIZE = 16;
 };
 
-/// nvenc_av1_drv_pic_setup_s (768 bytes: its MD and ME controls inside).
+/// nvenc_av1_drv_pic_setup_s as GB206 has it: nvenc_drv.h's (768 bytes)
+/// with a fourth 32-byte surface configuration after outputpic_cfg, which
+/// puts everything from the sequence header through the MD control 32
+/// bytes later, and an MD control 4 bytes longer, which puts the ME
+/// control and the GP timer 36 bytes later: 800 bytes. Found in NVIDIA's
+/// own driver's setups (captured in WSL, driver 592.15): its tile-control
+/// offset 0x400 at byte 0x150 (nvenc_drv.h: 0x130), its ME control at
+/// 0x25c, its GP timer at 0x31c; the sequence and frame header, rate
+/// control and picture control fields read sensibly at +32.
 pub const Av1 = struct {
-    pub const SIZE = 768;
+    pub const SIZE = 800;
+    /// GB206's fourth surface configuration, between outputpic_cfg and
+    /// the sequence header (NVIDIA's driver fills it as outputpic_cfg)
+    pub const extra_cfg_frame_width_minus1: F = .{ .bit = 800, .width = 16 };
+    pub const extra_cfg_frame_height_minus1: F = .{ .bit = 816, .width = 16 };
+    pub const extra_cfg_sfc_pitch: F = .{ .bit = 832, .width = 16 };
+    pub const extra_cfg_sfc_pitch_chroma: F = .{ .bit = 848, .width = 16 };
+    pub const extra_cfg_block_height: F = .{ .bit = 1024, .width = 7 };
+    pub const extra_cfg_tiled_16x16: F = .{ .bit = 1031, .width = 1 };
     pub const magic: F = .{ .bit = 0, .width = 32 };
     pub const refpic_cfg_frame_width_minus1: F = .{ .bit = 32, .width = 16 };
     pub const refpic_cfg_frame_height_minus1: F = .{ .bit = 48, .width = 16 };
@@ -722,128 +745,128 @@ pub const Av1 = struct {
     pub const outputpic_cfg_block_height: F = .{ .bit = 768, .width = 7 };
     pub const outputpic_cfg_tiled_16x16: F = .{ .bit = 775, .width = 1 };
     // seqhdr_data
-    pub const min_cu_size: F = .{ .bit = 800, .width = 2 };
-    pub const max_cu_size: F = .{ .bit = 802, .width = 2 };
-    pub const chroma_format_idc: F = .{ .bit = 804, .width = 2 };
-    pub const bit_depth_minus_8: F = .{ .bit = 807, .width = 4 };
-    pub const input_bit_depth_minus8: F = .{ .bit = 811, .width = 4 };
-    pub const enable_cdef: F = .{ .bit = 828, .width = 1 };
-    pub const enable_restoration: F = .{ .bit = 829, .width = 1 };
+    pub const min_cu_size: F = .{ .bit = 1056, .width = 2 };
+    pub const max_cu_size: F = .{ .bit = 1058, .width = 2 };
+    pub const chroma_format_idc: F = .{ .bit = 1060, .width = 2 };
+    pub const bit_depth_minus_8: F = .{ .bit = 1063, .width = 4 };
+    pub const input_bit_depth_minus8: F = .{ .bit = 1067, .width = 4 };
+    pub const enable_cdef: F = .{ .bit = 1084, .width = 1 };
+    pub const enable_restoration: F = .{ .bit = 1085, .width = 1 };
     // framehdr_data
-    pub const frame_type: F = .{ .bit = 832, .width = 2 };
-    pub const disable_cdf_update: F = .{ .bit = 834, .width = 1 };
-    pub const allow_high_precision_mv: F = .{ .bit = 837, .width = 1 };
-    pub const is_filter_switchable: F = .{ .bit = 839, .width = 1 };
-    pub const frame_end_update_cdf: F = .{ .bit = 841, .width = 1 };
-    pub const interp_filter: F = .{ .bit = 842, .width = 3 };
-    pub const delta_q_present_flag: F = .{ .bit = 845, .width = 1 };
-    pub const frame_tx_mode: F = .{ .bit = 854, .width = 2 };
-    pub const frame_reference_mode: F = .{ .bit = 856, .width = 2 };
-    pub const skip_mode_flag: F = .{ .bit = 858, .width = 1 };
-    pub const reduced_tx_set_flag: F = .{ .bit = 860, .width = 1 };
-    pub const coded_lossless: F = .{ .bit = 861, .width = 1 };
-    pub const bicompound_enable: F = .{ .bit = 873, .width = 1 };
-    pub const unicompound_enable: F = .{ .bit = 874, .width = 1 };
-    pub const mc_hfilter: F = .{ .bit = 875, .width = 4 };
-    pub const mc_vfilter: F = .{ .bit = 879, .width = 4 };
-    pub const segmentation_enable: F = .{ .bit = 883, .width = 1 };
+    pub const frame_type: F = .{ .bit = 1088, .width = 2 };
+    pub const disable_cdf_update: F = .{ .bit = 1090, .width = 1 };
+    pub const allow_high_precision_mv: F = .{ .bit = 1093, .width = 1 };
+    pub const is_filter_switchable: F = .{ .bit = 1095, .width = 1 };
+    pub const frame_end_update_cdf: F = .{ .bit = 1097, .width = 1 };
+    pub const interp_filter: F = .{ .bit = 1098, .width = 3 };
+    pub const delta_q_present_flag: F = .{ .bit = 1101, .width = 1 };
+    pub const frame_tx_mode: F = .{ .bit = 1110, .width = 2 };
+    pub const frame_reference_mode: F = .{ .bit = 1112, .width = 2 };
+    pub const skip_mode_flag: F = .{ .bit = 1114, .width = 1 };
+    pub const reduced_tx_set_flag: F = .{ .bit = 1116, .width = 1 };
+    pub const coded_lossless: F = .{ .bit = 1117, .width = 1 };
+    pub const bicompound_enable: F = .{ .bit = 1129, .width = 1 };
+    pub const unicompound_enable: F = .{ .bit = 1130, .width = 1 };
+    pub const mc_hfilter: F = .{ .bit = 1131, .width = 4 };
+    pub const mc_vfilter: F = .{ .bit = 1135, .width = 4 };
+    pub const segmentation_enable: F = .{ .bit = 1139, .width = 1 };
     /// [8] bytes
-    pub const ref_frame_sign_bias: F = .{ .bit = 896, .width = 8 };
+    pub const ref_frame_sign_bias: F = .{ .bit = 1152, .width = 8 };
     /// [4] bytes: luma vertical, horizontal; U; V
-    pub const lf_filter_level: F = .{ .bit = 960, .width = 8 };
+    pub const lf_filter_level: F = .{ .bit = 1216, .width = 8 };
     /// [8] signed bytes
-    pub const lf_ref_delta: F = .{ .bit = 992, .width = 8 };
-    pub const lf_mode_delta_0: F = .{ .bit = 1056, .width = 8 };
-    pub const lf_mode_delta_1: F = .{ .bit = 1064, .width = 8 };
-    pub const lf_update_ref_delta_flag: F = .{ .bit = 1072, .width = 8 };
-    pub const lf_update_mode_delta0: F = .{ .bit = 1080, .width = 1 };
-    pub const lf_update_mode_delta1: F = .{ .bit = 1081, .width = 1 };
-    pub const lf_delta_enabled: F = .{ .bit = 1082, .width = 1 };
-    pub const lf_sharpness: F = .{ .bit = 1083, .width = 3 };
-    pub const cdef_damping_minus_3: F = .{ .bit = 1088, .width = 2 };
+    pub const lf_ref_delta: F = .{ .bit = 1248, .width = 8 };
+    pub const lf_mode_delta_0: F = .{ .bit = 1312, .width = 8 };
+    pub const lf_mode_delta_1: F = .{ .bit = 1320, .width = 8 };
+    pub const lf_update_ref_delta_flag: F = .{ .bit = 1328, .width = 8 };
+    pub const lf_update_mode_delta0: F = .{ .bit = 1336, .width = 1 };
+    pub const lf_update_mode_delta1: F = .{ .bit = 1337, .width = 1 };
+    pub const lf_delta_enabled: F = .{ .bit = 1338, .width = 1 };
+    pub const lf_sharpness: F = .{ .bit = 1339, .width = 3 };
+    pub const cdef_damping_minus_3: F = .{ .bit = 1344, .width = 2 };
     /// y_strength_0..3, 6 bits each, consecutive
-    pub const cdef_y_strength_0: F = .{ .bit = 1090, .width = 6 };
-    pub const cdef_bits: F = .{ .bit = 1138, .width = 2 };
+    pub const cdef_y_strength_0: F = .{ .bit = 1346, .width = 6 };
+    pub const cdef_bits: F = .{ .bit = 1394, .width = 2 };
     /// uv_strength_0..3, 6 bits each, consecutive
-    pub const cdef_uv_strength_0: F = .{ .bit = 1140, .width = 6 };
-    pub const cdef_y_strength_num_minus_1: F = .{ .bit = 1190, .width = 3 };
-    pub const cdef_uv_strength_num_minus_1: F = .{ .bit = 1193, .width = 3 };
-    pub const cdef_combined_idx_minus_1: F = .{ .bit = 1196, .width = 3 };
-    pub const cdef_combined_luma_idx: F = .{ .bit = 1216, .width = 24 };
-    pub const cdef_combined_chroma_idx: F = .{ .bit = 1248, .width = 24 };
-    pub const base_q_idx: F = .{ .bit = 1280, .width = 8 };
-    pub const delta_y_dc: F = .{ .bit = 1288, .width = 8 };
-    pub const delta_uv_dc: F = .{ .bit = 1296, .width = 8 };
-    pub const delta_uv_ac: F = .{ .bit = 1304, .width = 8 };
-    pub const y_lr_type: F = .{ .bit = 1312, .width = 2 };
-    pub const uv_lr_type: F = .{ .bit = 1314, .width = 2 };
-    pub const y_lr_unit_size: F = .{ .bit = 1316, .width = 2 };
-    pub const uv_lr_unit_size: F = .{ .bit = 1318, .width = 2 };
-    pub const lr_codebook_enable: F = .{ .bit = 1320, .width = 16 };
+    pub const cdef_uv_strength_0: F = .{ .bit = 1396, .width = 6 };
+    pub const cdef_y_strength_num_minus_1: F = .{ .bit = 1446, .width = 3 };
+    pub const cdef_uv_strength_num_minus_1: F = .{ .bit = 1449, .width = 3 };
+    pub const cdef_combined_idx_minus_1: F = .{ .bit = 1452, .width = 3 };
+    pub const cdef_combined_luma_idx: F = .{ .bit = 1472, .width = 24 };
+    pub const cdef_combined_chroma_idx: F = .{ .bit = 1504, .width = 24 };
+    pub const base_q_idx: F = .{ .bit = 1536, .width = 8 };
+    pub const delta_y_dc: F = .{ .bit = 1544, .width = 8 };
+    pub const delta_uv_dc: F = .{ .bit = 1552, .width = 8 };
+    pub const delta_uv_ac: F = .{ .bit = 1560, .width = 8 };
+    pub const y_lr_type: F = .{ .bit = 1568, .width = 2 };
+    pub const uv_lr_type: F = .{ .bit = 1570, .width = 2 };
+    pub const y_lr_unit_size: F = .{ .bit = 1572, .width = 2 };
+    pub const uv_lr_unit_size: F = .{ .bit = 1574, .width = 2 };
+    pub const lr_codebook_enable: F = .{ .bit = 1576, .width = 16 };
     // rate_control (nvenc_av1_rc_s)
-    pub const rc_hrd_type: F = .{ .bit = 1344, .width = 8 };
-    pub const rc_qp_p: F = .{ .bit = 1352, .width = 8 };
-    pub const rc_qp_b: F = .{ .bit = 1360, .width = 8 };
-    pub const rc_qp_i: F = .{ .bit = 1368, .width = 8 };
-    pub const rc_min_qp_p: F = .{ .bit = 1376, .width = 8 };
-    pub const rc_min_qp_b: F = .{ .bit = 1384, .width = 8 };
-    pub const rc_min_qp_i: F = .{ .bit = 1392, .width = 8 };
-    pub const rc_max_qp_p: F = .{ .bit = 1400, .width = 8 };
-    pub const rc_max_qp_b: F = .{ .bit = 1408, .width = 8 };
-    pub const rc_max_qp_i: F = .{ .bit = 1416, .width = 8 };
-    pub const rc_max_qpd: F = .{ .bit = 1424, .width = 8 };
-    pub const rc_base_qpd: F = .{ .bit = 1432, .width = 8 };
-    pub const rc_rhopbi: F = .{ .bit = 1440, .width = 32 };
-    pub const rc_framerate: F = .{ .bit = 1536, .width = 32 };
-    pub const rc_buffersize: F = .{ .bit = 1568, .width = 32 };
-    pub const rc_nal_cpb_size: F = .{ .bit = 1600, .width = 32 };
-    pub const rc_nal_bitrate: F = .{ .bit = 1632, .width = 32 };
-    pub const rc_vcl_cpb_size: F = .{ .bit = 1664, .width = 32 };
-    pub const rc_vcl_bitrate: F = .{ .bit = 1696, .width = 32 };
-    pub const rc_gop_length: F = .{ .bit = 1728, .width = 32 };
-    pub const rc_np: F = .{ .bit = 1760, .width = 32 };
-    pub const rc_bmin: F = .{ .bit = 1792, .width = 32 };
-    pub const rc_ravg: F = .{ .bit = 1824, .width = 32 };
-    pub const rc_r: F = .{ .bit = 1856, .width = 32 };
-    pub const rc_ab_alpha: F = .{ .bit = 1888, .width = 8 };
-    pub const rc_i_size_ratio_x: F = .{ .bit = 1960, .width = 8 };
-    pub const rc_i_size_ratio_y: F = .{ .bit = 1968, .width = 8 };
+    pub const rc_hrd_type: F = .{ .bit = 1600, .width = 8 };
+    pub const rc_qp_p: F = .{ .bit = 1608, .width = 8 };
+    pub const rc_qp_b: F = .{ .bit = 1616, .width = 8 };
+    pub const rc_qp_i: F = .{ .bit = 1624, .width = 8 };
+    pub const rc_min_qp_p: F = .{ .bit = 1632, .width = 8 };
+    pub const rc_min_qp_b: F = .{ .bit = 1640, .width = 8 };
+    pub const rc_min_qp_i: F = .{ .bit = 1648, .width = 8 };
+    pub const rc_max_qp_p: F = .{ .bit = 1656, .width = 8 };
+    pub const rc_max_qp_b: F = .{ .bit = 1664, .width = 8 };
+    pub const rc_max_qp_i: F = .{ .bit = 1672, .width = 8 };
+    pub const rc_max_qpd: F = .{ .bit = 1680, .width = 8 };
+    pub const rc_base_qpd: F = .{ .bit = 1688, .width = 8 };
+    pub const rc_rhopbi: F = .{ .bit = 1696, .width = 32 };
+    pub const rc_framerate: F = .{ .bit = 1792, .width = 32 };
+    pub const rc_buffersize: F = .{ .bit = 1824, .width = 32 };
+    pub const rc_nal_cpb_size: F = .{ .bit = 1856, .width = 32 };
+    pub const rc_nal_bitrate: F = .{ .bit = 1888, .width = 32 };
+    pub const rc_vcl_cpb_size: F = .{ .bit = 1920, .width = 32 };
+    pub const rc_vcl_bitrate: F = .{ .bit = 1952, .width = 32 };
+    pub const rc_gop_length: F = .{ .bit = 1984, .width = 32 };
+    pub const rc_np: F = .{ .bit = 2016, .width = 32 };
+    pub const rc_bmin: F = .{ .bit = 2048, .width = 32 };
+    pub const rc_ravg: F = .{ .bit = 2080, .width = 32 };
+    pub const rc_r: F = .{ .bit = 2112, .width = 32 };
+    pub const rc_ab_alpha: F = .{ .bit = 2144, .width = 8 };
+    pub const rc_i_size_ratio_x: F = .{ .bit = 2216, .width = 8 };
+    pub const rc_i_size_ratio_y: F = .{ .bit = 2224, .width = 8 };
     // pic_control
     /// l0[4], l1[3], temp_dist_l0[4], temp_dist_l1[3], poc_entry_l0[4],
     /// poc_entry_l1[3]: bytes
-    pub const l0: F = .{ .bit = 2112, .width = 8 };
-    pub const l1: F = .{ .bit = 2144, .width = 8 };
-    pub const temp_dist_l0: F = .{ .bit = 2168, .width = 8 };
-    pub const temp_dist_l1: F = .{ .bit = 2200, .width = 8 };
-    pub const poc_entry_l0: F = .{ .bit = 2224, .width = 8 };
-    pub const poc_entry_l1: F = .{ .bit = 2256, .width = 8 };
-    pub const pic_output_flag: F = .{ .bit = 2338, .width = 1 };
-    pub const num_ref_idx_l0_active: F = .{ .bit = 2341, .width = 3 };
-    pub const num_ref_idx_l1_active: F = .{ .bit = 2344, .width = 3 };
-    pub const tile_idx_start: F = .{ .bit = 2347, .width = 8 };
-    pub const num_strip_tiles_minus1: F = .{ .bit = 2355, .width = 8 };
-    pub const max_tu_depth_inter: F = .{ .bit = 2368, .width = 2 };
-    pub const max_tu_depth_intra: F = .{ .bit = 2370, .width = 2 };
-    pub const num_tiles_minus1: F = .{ .bit = 2372, .width = 8 };
-    pub const enable_source_image_padding: F = .{ .bit = 2380, .width = 1 };
-    pub const prob_tables_offset: F = .{ .bit = 2400, .width = 32 };
-    pub const tile_control_offset: F = .{ .bit = 2432, .width = 32 };
-    pub const hist_buf_size: F = .{ .bit = 2464, .width = 32 };
-    pub const bitstream_buf_size: F = .{ .bit = 2496, .width = 32 };
-    pub const bitstream_start_pos: F = .{ .bit = 2528, .width = 32 };
-    pub const pic_type: F = .{ .bit = 2560, .width = 2 };
-    pub const ref_pic_flag: F = .{ .bit = 2562, .width = 1 };
-    pub const codec: F = .{ .bit = 2563, .width = 3 };
-    pub const num_tile_cols: F = .{ .bit = 2567, .width = 8 };
-    pub const num_tile_rows: F = .{ .bit = 2575, .width = 8 };
-    pub const ctx_update_tile_id: F = .{ .bit = 2583, .width = 8 };
-    pub const strips_in_frame: F = .{ .bit = 2824, .width = 8 };
-    pub const strip_width_in_sbs: F = .{ .bit = 2832, .width = 16 };
-    pub const strip_height_in_sbs: F = .{ .bit = 2848, .width = 16 };
+    pub const l0: F = .{ .bit = 2368, .width = 8 };
+    pub const l1: F = .{ .bit = 2400, .width = 8 };
+    pub const temp_dist_l0: F = .{ .bit = 2424, .width = 8 };
+    pub const temp_dist_l1: F = .{ .bit = 2456, .width = 8 };
+    pub const poc_entry_l0: F = .{ .bit = 2480, .width = 8 };
+    pub const poc_entry_l1: F = .{ .bit = 2512, .width = 8 };
+    pub const pic_output_flag: F = .{ .bit = 2594, .width = 1 };
+    pub const num_ref_idx_l0_active: F = .{ .bit = 2597, .width = 3 };
+    pub const num_ref_idx_l1_active: F = .{ .bit = 2600, .width = 3 };
+    pub const tile_idx_start: F = .{ .bit = 2603, .width = 8 };
+    pub const num_strip_tiles_minus1: F = .{ .bit = 2611, .width = 8 };
+    pub const max_tu_depth_inter: F = .{ .bit = 2624, .width = 2 };
+    pub const max_tu_depth_intra: F = .{ .bit = 2626, .width = 2 };
+    pub const num_tiles_minus1: F = .{ .bit = 2628, .width = 8 };
+    pub const enable_source_image_padding: F = .{ .bit = 2636, .width = 1 };
+    pub const prob_tables_offset: F = .{ .bit = 2656, .width = 32 };
+    pub const tile_control_offset: F = .{ .bit = 2688, .width = 32 };
+    pub const hist_buf_size: F = .{ .bit = 2720, .width = 32 };
+    pub const bitstream_buf_size: F = .{ .bit = 2752, .width = 32 };
+    pub const bitstream_start_pos: F = .{ .bit = 2784, .width = 32 };
+    pub const pic_type: F = .{ .bit = 2816, .width = 2 };
+    pub const ref_pic_flag: F = .{ .bit = 2818, .width = 1 };
+    pub const codec: F = .{ .bit = 2819, .width = 3 };
+    pub const num_tile_cols: F = .{ .bit = 2823, .width = 8 };
+    pub const num_tile_rows: F = .{ .bit = 2831, .width = 8 };
+    pub const ctx_update_tile_id: F = .{ .bit = 2839, .width = 8 };
+    pub const strips_in_frame: F = .{ .bit = 3080, .width = 8 };
+    pub const strip_width_in_sbs: F = .{ .bit = 3088, .width = 16 };
+    pub const strip_height_in_sbs: F = .{ .bit = 3104, .width = 16 };
     /// the MD and ME controls, inside the setup
-    pub const MD_CONTROL_OFF = 408;
-    pub const ME_CONTROL_OFF = 568;
-    pub const gp_timer_timeout_val: F = .{ .bit = 6080, .width = 32 };
+    pub const MD_CONTROL_OFF = 440;
+    pub const ME_CONTROL_OFF = 604;
+    pub const gp_timer_timeout_val: F = .{ .bit = 6368, .width = 32 };
 };
 
 /// nvenc_av1_md_control_s.
@@ -1518,4 +1541,51 @@ test "nvenc: the history covers the picture, the input's block height counts GOB
     try testing.expectEqual(@as(u7, 2), blockHeightField(1));
     try testing.expectEqual(@as(u7, 1), blockHeightField(0));
     try testing.expectEqual(@as(u7, 16), blockHeightField(4));
+}
+
+// NVIDIA's own driver's first setups on GB206 (captured in WSL, driver
+// 592.15, FFmpeg's av1_nvenc and hevc_nvenc on 1080p testsrc2: a key frame,
+// an IDR), their first 1024 bytes: the layout this file reads them with
+// must make sense of them.
+const NV_AV1_KEY = @embedFile("testdata/nvenc-gb206-av1-key.bin");
+const NV_HEVC_IDR = @embedFile("testdata/nvenc-gb206-hevc-idr.bin");
+
+test "nvenc: NVIDIA's own GB206 AV1 setup reads right with Av1 (the fourth surface configuration, 800 bytes)" {
+    const b = NV_AV1_KEY;
+    const A = Av1;
+    try testing.expectEqual(@as(u64, MAGIC), get(b, A.magic));
+    try testing.expectEqual(@as(u64, 1919), get(b, A.outputpic_cfg_frame_width_minus1));
+    // the fourth configuration: the reconstruction's
+    try testing.expectEqual(@as(u64, 1919), get(b, A.extra_cfg_frame_width_minus1));
+    try testing.expectEqual(@as(u64, 1079), get(b, A.extra_cfg_frame_height_minus1));
+    try testing.expectEqual(@as(u64, 1920), get(b, A.extra_cfg_sfc_pitch));
+    // the sequence header 4:2:0, 8 bits; the picture control's tiles,
+    // sizes, type and codec field
+    try testing.expectEqual(@as(u64, 1), get(b, A.chroma_format_idc));
+    try testing.expectEqual(@as(u64, 0), get(b, A.bit_depth_minus_8));
+    try testing.expectEqual(@as(u64, 0x400), get(b, A.tile_control_offset));
+    try testing.expectEqual(@as(u64, 0x4f_bb00), get(b, A.bitstream_buf_size));
+    try testing.expectEqual(@as(u64, 3), get(b, A.pic_type));
+    try testing.expectEqual(@as(u64, 1), get(b, A.ref_pic_flag));
+    try testing.expectEqual(@as(u64, PIC_CODEC_AV1), get(b, A.codec));
+    try testing.expectEqual(@as(u64, 1), get(b, A.num_tile_cols));
+    try testing.expectEqual(@as(u64, 1), get(b, A.strips_in_frame));
+    // the ME control where it starts (its first word as H.264's) and the
+    // GP timer after it (bit 31 set, as NVIDIA's driver sets it)
+    try testing.expectEqual(@as(u32, 0x0007_4002), std.mem.readInt(u32, b[A.ME_CONTROL_OFF..][0..4], .little));
+    try testing.expect(get(b, A.gp_timer_timeout_val) >> 31 == 1);
+    try testing.expect(A.ME_CONTROL_OFF + Me.SIZE + 4 == A.SIZE);
+}
+
+test "nvenc: NVIDIA's own GB206 HEVC setup reads right with H265" {
+    const b = NV_HEVC_IDR;
+    const H = H265;
+    try testing.expectEqual(@as(u64, MAGIC), get(b, H.magic));
+    try testing.expectEqual(@as(u64, 1087), get(b, H.outputpic_cfg_frame_height_minus1));
+    try testing.expectEqual(@as(u64, 3), get(b, H.pic_type));
+    try testing.expectEqual(@as(u64, 19), get(b, H.nal_unit_type));
+    try testing.expectEqual(@as(u64, PIC_CODEC_H265), get(b, H.codec));
+    try testing.expectEqual(@as(u64, 11), get(b, H.ceil_log2_pic_size_in_ctbs));
+    try testing.expectEqual(@as(u64, 0), get(b, H.sps_temporal_mvp_enabled_flag));
+    try testing.expect(get(b, H.gp_timer_timeout_val) >> 31 == 1);
 }

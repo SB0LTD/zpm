@@ -584,6 +584,14 @@ pub fn setup(buf: []u8, s: Setup) void {
     }
     nvenc.set(buf, A.refpic_cfg_tiled_16x16, 1);
     nvenc.set(buf, A.outputpic_cfg_tiled_16x16, 1);
+    // (GB206's fourth surface configuration, as NVIDIA's driver fills it:
+    // the reconstruction's)
+    nvenc.set(buf, A.extra_cfg_frame_width_minus1, nvenc.get(buf, A.outputpic_cfg_frame_width_minus1));
+    nvenc.set(buf, A.extra_cfg_frame_height_minus1, nvenc.get(buf, A.outputpic_cfg_frame_height_minus1));
+    nvenc.set(buf, A.extra_cfg_sfc_pitch, nvenc.get(buf, A.outputpic_cfg_sfc_pitch));
+    nvenc.set(buf, A.extra_cfg_sfc_pitch_chroma, nvenc.get(buf, A.outputpic_cfg_sfc_pitch_chroma));
+    nvenc.set(buf, A.extra_cfg_tiled_16x16, 1);
+    nvenc.set(buf, A.codec, nvenc.PIC_CODEC_AV1);
     nvenc.set(buf, A.input_cfg_block_height, nvenc.blockHeightField(s.input.block_height));
     // seqhdr_data: CUs 16 to 64 (the engine's range), 8-bit 4:2:0
     nvenc.set(buf, A.min_cu_size, 1);
