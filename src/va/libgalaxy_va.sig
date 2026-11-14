@@ -662,6 +662,7 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expect(!optionsOf("GALAXY_VA_NVENC_TRY=coloctight").nvenc_try.coloc_apart);
     const tt = optionsOf("GALAXY_VA_NVENC_TRY=hevctemplate,av1template").nvenc_try;
     try testing.expect(tt.hevc_template and tt.av1_template and !none_t.hevc_template and !none_t.av1_template);
+    try testing.expect(optionsOf("GALAXY_VA_NVENC_TRY=hevcslice0").nvenc_try.hevc_slice0 and !none_t.hevc_slice0);
     try testing.expect(optionsOf("GALAXY_VA_NVENC_DUMP=1").nvenc_dump and !optionsOf("GALAXY_VA_NVENC_DUMP=0").nvenc_dump and !none.nvenc_dump);
     try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
     try testing.expect(none.encode and none.nvenc_magic == null);

@@ -366,6 +366,8 @@ pub const Setup = struct {
     magic: u32 = nvenc.MAGIC,
     /// NVIDIA's own captured setup as the base (encode.Try.hevc_template)
     template: bool = false,
+    /// NVIDIA's slice mode (encode.Try.hevc_slice0)
+    slice0: bool = false,
 };
 
 /// pic_type: 0 P, 1 B, 2 I, 3 IDR (VA's coding_type: 1 I, 2 P, 3 B).
@@ -411,8 +413,14 @@ pub fn setup(buf: []u8, s: Setup) void {
         nvenc.set(buf, c[2], p.pitch_luma);
         nvenc.set(buf, c[3], p.pitch_chroma);
     }
-    nvenc.set(buf, H.refpic_cfg_tiled_16x16, 1);
-    nvenc.set(buf, H.outputpic_cfg_tiled_16x16, 1);
+    // the reference and reconstructed pictures block linear, 2 GOBs a
+    // block (the surfaces' own layout), as NVIDIA's own driver lays them
+    // out on GB206 for every codec (the WSL capture); "tiled 16x16" (the
+    // engine's macroblock layout, which H.264 encodes with) faulted HEVC's
+    // engine on its first picture and AV1's at its second reference
+    // (pc-full13 to pc-full16, NVIDIA's own setup as the base included)
+    nvenc.set(buf, H.refpic_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
+    nvenc.set(buf, H.outputpic_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
     nvenc.set(buf, H.input_cfg_block_height, nvenc.blockHeightField(s.input.block_height));
     // sps_data
     const min_cb = @as(u32, seq.log2_min_luma_coding_block_size_minus3);
@@ -544,14 +552,16 @@ pub fn setup(buf: []u8, s: Setup) void {
     // (the pic_control codec field NVIDIA's driver writes on GB206)
     nvenc.set(buf, H.codec, nvenc.PIC_CODEC_H265);
     nvenc.set(buf, H.ref_pic_flag, pf.reference_pic_flag);
-    nvenc.set(buf, H.slice_mode, 1);
+    // (static slices as this driver's slice controls say; NVIDIA's driver
+    // writes dynamic slices, no size limit, no strip rows: Try.hevc_slice0)
+    nvenc.set(buf, H.slice_mode, @intFromBool(!s.slice0));
     const ctb_size = @as(u32, 1) << @intCast(ctb);
     const ctbs = ((w + ctb_size - 1) / ctb_size) * ((h + ctb_size - 1) / ctb_size);
     nvenc.set(buf, H.ceil_log2_pic_size_in_ctbs, std.math.log2_int_ceil(u32, @max(ctbs, 1)));
     // the whole picture one strip of its CTB rows (as H.264's), the
     // statistics where nvenc_h265_stat_data_s has them
     nvenc.set(buf, H.strips_in_frame, 1);
-    nvenc.set(buf, H.slice_encoding_row_num, (h + ctb_size - 1) / ctb_size);
+    if (!s.slice0) nvenc.set(buf, H.slice_encoding_row_num, (h + ctb_size - 1) / ctb_size);
     nvenc.set(buf, H.slice_stat_offset, nvenc.SLICE_STAT_OFF);
     nvenc.set(buf, H.mpec_stat_offset, nvenc.MPEC_STAT_OFF);
     nvenc.set(buf, H.short_term_ref_pic_set_sps_flag, 0);
@@ -608,6 +618,10 @@ test "enc_hevc: on NVIDIA's own setup (Try.hevc_template): its bytes kept where 
     try testing.expectEqual(@as(u64, nvenc.H265_SLICE_OFF), nvenc.get(&buf, H.slice_control_offset));
     try testing.expectEqual(@as(u64, nvenc.H265_WP_OFF), nvenc.get(&buf, H.wp_control_offset));
     try testing.expectEqual(@as(u64, 4096), nvenc.get(&buf, H.hist_buf_size));
+    // (the reference and reconstructed pictures block linear, as NVIDIA's)
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.outputpic_cfg_tiled_16x16));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&buf, H.outputpic_cfg_block_height));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&buf, H.refpic_cfg_block_height));
 }
 
 pub fn testSeq(w: u16, h: u16) Seq {
