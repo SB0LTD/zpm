@@ -653,10 +653,10 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expectEqual(tiling.Gob.b16, optionsOf("GALAXY_VA_GOB=B16").gob);
     try testing.expectEqual(tiling.Gob.swapped, optionsOf("GALAXY_VA_GOB=swapped").gob);
     try testing.expectEqual(tiling.Gob.blackwell, optionsOf("GALAXY_VA_GOB=other").gob);
-    const t = optionsOf("GALAXY_VA_NVENC_TRY=colocboth,tiles300 av1nocolin,setup4k").nvenc_try;
-    try testing.expect(t.hevc_coloc == .both and t.av1_tiles_at == 768 and !t.av1_key_colin and t.setup_4k);
+    const t = optionsOf("GALAXY_VA_NVENC_TRY=colocboth,tiles300 av1coloc,setup4k").nvenc_try;
+    try testing.expect(t.hevc_coloc == .both and t.av1_tiles_at == 800 and t.av1_coloc and t.setup_4k);
     const none_t = optionsOf("GALAXY_VA_NVENC_TRY=").nvenc_try;
-    try testing.expect(none_t.hevc_coloc == .out and none_t.av1_tiles_at == 0x400 and none_t.av1_key_colin and !none_t.setup_4k and none_t.coloc_apart);
+    try testing.expect(none_t.hevc_coloc == .tmvp and none_t.av1_tiles_at == 0x400 and !none_t.av1_coloc and !none_t.setup_4k and none_t.coloc_apart);
     try testing.expect(!optionsOf("GALAXY_VA_NVENC_TRY=coloctight").nvenc_try.coloc_apart);
     try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
     try testing.expect(none.encode and none.nvenc_magic == null);

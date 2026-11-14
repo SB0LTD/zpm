@@ -507,23 +507,26 @@ pub const Scratch = struct {
 /// and pc-full10's (no co-located buffer, temporal MVP off) faulted the
 /// engine (exception 47); AV1 (co-located in and out the same buffer, tile
 /// controls at 0x400, the setup 0x800 into its frame slot) stopped with
-/// ucode error 3 PICSETUP_OFFSET. A comma-separated list of the words
-/// below; the defaults are the readings nvenc_drv.h's text supports.
+/// ucode error 3 PICSETUP_OFFSET. Those were the wrong CODEC_TYPE (7 and
+/// 10 for 4 and 5) and, for AV1, a setup laid out as Ada's (nvenc.sig).
+/// The defaults are now what NVIDIA's own driver does on GB206 (captured
+/// in WSL): no co-located buffer for HEVC or AV1. A comma-separated list
+/// of the words below.
 pub const Try = struct {
-    /// HEVC's co-located motion buffers. `out` (the default, the word
-    /// "colocout"): out on every reference picture (nvenc_drv.h 2.2: the
-    /// engine writes it for reference pictures; FORCE_OUTCOL writes it for
-    /// others), in only for temporal MVP. `both` ("colocboth"): in as well
-    /// on every picture (another kept entry when there is no collocated
-    /// picture). `tmvp` ("coloctmvp"): both only with temporal MVP, as
-    /// pc-full9 and pc-full10 did.
-    hevc_coloc: enum { out, both, tmvp } = .out,
+    /// HEVC's co-located motion buffers. `tmvp` (the default, the word
+    /// "coloctmvp"): only with temporal MVP, which FEATURES does not offer,
+    /// so none, as NVIDIA's driver binds none on I, P and B pictures.
+    /// `out` ("colocout"): out on every reference picture. `both`
+    /// ("colocboth"): in as well on every picture (another kept entry when
+    /// there is no collocated picture).
+    hevc_coloc: enum { out, both, tmvp } = .tmvp,
     /// AV1's tile controls: at TILE_CONTROL_OFF (0x400), or right after
     /// nvenc_av1_drv_pic_setup_s's 768 bytes ("tiles300")
     av1_tiles_at: u32 = nvenc.TILE_CONTROL_OFF,
-    /// AV1's key frames bind no co-located input ("av1nocolin"); by
-    /// default their own output entry is bound as the input too
-    av1_key_colin: bool = true,
+    /// AV1's co-located buffers bound ("av1coloc": in, the first
+    /// reference's or its own, and out); by default none, as NVIDIA's
+    /// driver binds none
+    av1_coloc: bool = false,
     /// the setup 4 KiB aligned in its frame slot ("setup4k"; the driver's)
     setup_4k: bool = false,
     /// the co-located buffers apart from the history and 1 MiB aligned
@@ -540,7 +543,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "colocboth")) t.hevc_coloc = .both;
             if (std.ascii.eqlIgnoreCase(w, "coloctmvp")) t.hevc_coloc = .tmvp;
             if (std.ascii.eqlIgnoreCase(w, "tiles300")) t.av1_tiles_at = nvenc.Av1.SIZE;
-            if (std.ascii.eqlIgnoreCase(w, "av1nocolin")) t.av1_key_colin = false;
+            if (std.ascii.eqlIgnoreCase(w, "av1coloc")) t.av1_coloc = true;
             if (std.ascii.eqlIgnoreCase(w, "setup4k")) t.setup_4k = true;
             if (std.ascii.eqlIgnoreCase(w, "coloctight")) t.coloc_apart = false;
         }
@@ -927,8 +930,8 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         if (st.kept.find(pic.reference_frames[frame.ref_frame_idx[0]])) |k| col_k = k;
         motionBuffers(st, in.scratch, &a);
     }
-    a.coloc_in = if (frame.intra() and !in.try_.av1_key_colin) 0 else in.scratch.coloc(col_k);
-    a.coloc_out = in.scratch.coloc(out_k);
+    a.coloc_in = if (in.try_.av1_coloc) in.scratch.coloc(col_k) else 0;
+    a.coloc_out = if (in.try_.av1_coloc) in.scratch.coloc(out_k) else 0;
     a.av1 = .{
         .prob_in = prob_in,
         .prob_out = in.scratch.cdf(out_k),

@@ -532,6 +532,8 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, H.bitstream_buf_size, s.bitstream_room);
     nvenc.set(buf, H.bitstream_start_pos, s.bitstream_start);
     nvenc.set(buf, H.pic_type, picType(pic));
+    // (the pic_control codec field NVIDIA's driver writes on GB206)
+    nvenc.set(buf, H.codec, nvenc.PIC_CODEC_H265);
     nvenc.set(buf, H.ref_pic_flag, pf.reference_pic_flag);
     nvenc.set(buf, H.slice_mode, 1);
     const ctb_size = @as(u32, 1) << @intCast(ctb);

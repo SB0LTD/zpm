@@ -2069,7 +2069,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 var line: [400]u8 = undefined;
                 d.say("{s}", .{encode.setupLine(&line, c.enc.kind, frame[setup_off..][0..nvenc.SETUP_BYTES])});
                 const t = d.opts.nvenc_try;
-                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 key frame co-located in {s}, setup at 0x{x} of its slot", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_key_colin) "bound" else "none", setup_off });
+                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 co-located {s}, setup at 0x{x} of its slot", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_coloc) "bound" else "none", setup_off });
                 d.say("first picture's methods: {s}", .{encode.pushLine(&line, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords])});
             }
             const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {

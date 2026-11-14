@@ -1342,11 +1342,11 @@ test "driver: HEVC through the fake encoder: the driver's VPS, SPS and PPS, the 
     try testing.expectEqual(@as(u64, 0xc9b7_0006), nvenc.get(&enc_seen.setup, nvenc.H265.magic));
     try testing.expectEqual(@as(u64, 3), nvenc.get(&enc_seen.setup, nvenc.H265.pic_type));
     try testing.expectEqual(@as(u64, 19), nvenc.get(&enc_seen.setup, nvenc.H265.nal_unit_type));
-    // (a reference picture: its co-located motion out, as nvenc_drv.h 2.2
-    // says the engine writes it, the engine faulting without on GB206;
-    // no input without temporal MVP: encode.Try's default)
-    try testing.expect(enc_seen.methods[nvenc.SET_OUT_COLOC_DATA >> 2] != 0);
+    // (no co-located buffer, as NVIDIA's driver binds none for HEVC on
+    // GB206; its codec type 4, not NVDEC's 7)
+    try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_OUT_COLOC_DATA >> 2]);
     try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_IN_COLOC_DATA >> 2]);
+    try testing.expectEqual(@as(u64, nvenc.PIC_CODEC_H265), nvenc.get(&enc_seen.setup, nvenc.H265.codec));
     try testing.expectEqual(@as(u64, 2), nvenc.get(&enc_seen.setup, nvenc.H265.max_cu_size));
     try testing.expectEqual(@as(u64, 4), nvenc.get(enc_seen.setup[nvenc.H265_SLICE_OFF..], nvenc.H265Slice.num_ctus));
     var out: [4 << 10]u8 = undefined;
