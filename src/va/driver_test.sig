@@ -1305,7 +1305,7 @@ test "driver: HEVC through the fake encoder: the driver's VPS, SPS and PPS, the 
     var k = Fake{ .encoder = fakeEncode };
     enc_seen = .{};
     var d: TestDriver = .{ .node = .{ .sys = &k } };
-    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .nvenc_magic = 0xc9b7_0006 }));
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .nvenc_magic = 0xc9b7_0006, .nvenc_dump = true }));
     defer d.terminate();
     var cfg: u32 = 0;
     try testing.expectEqual(va.SUCCESS, d.createConfig(va.PROFILE_HEVC_MAIN, ve.ENTRYPOINT_ENC_SLICE, &.{}, &cfg));

@@ -364,6 +364,8 @@ pub const Setup = struct {
     bitstream_room: u32,
     history_bytes: u32,
     magic: u32 = nvenc.MAGIC,
+    /// NVIDIA's own captured setup as the base (encode.Try.hevc_template)
+    template: bool = false,
 };
 
 /// pic_type: 0 P, 1 B, 2 I, 3 IDR (VA's coding_type: 1 I, 2 P, 3 B).
@@ -385,6 +387,13 @@ pub fn setup(buf: []u8, s: Setup) void {
     @memset(buf[0..nvenc.SETUP_BYTES], 0);
     const pic = s.pic;
     const seq = s.seq;
+    if (s.template) {
+        // (NVIDIA's own setup for the same kind of picture; every field
+        // this driver knows is written over it below)
+        const intra = picType(pic) >= 2;
+        @memcpy(buf[0..0x400], if (intra) nvenc.NV_HEVC_IDR[0..0x400] else nvenc.NV_HEVC_P[0..0x400]);
+        for (0..s.slices.len) |i| @memcpy(buf[nvenc.H265_SLICE_OFF + i * nvenc.H265Slice.SIZE ..][0..nvenc.H265Slice.SIZE], if (intra) &nvenc.SLICE_NVIDIA_HEVC_I else &nvenc.SLICE_NVIDIA_HEVC_P);
+    }
     const pf = pic.pic_fields;
     const sf = seq.seq_fields;
     const w: u32 = seq.pic_width_in_luma_samples;
@@ -550,6 +559,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, H.nal_unit_type, pic.nal_unit_type);
     nvenc.set(buf, H.nuh_temporal_id_plus1, 1);
     nvenc.set(buf, H.gp_timer_timeout_val, nvenc.GPTIMER_TIMEOUT);
+    nvenc.set(buf, H.wp_control_offset, nvenc.H265_WP_OFF);
     for (s.slices, 0..) |sl, i| {
         const c = buf[nvenc.H265_SLICE_OFF + i * nvenc.H265Slice.SIZE ..];
         const L = nvenc.H265Slice;
@@ -582,6 +592,23 @@ pub fn setup(buf: []u8, s: Setup) void {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "enc_hevc: on NVIDIA's own setup (Try.hevc_template): its bytes kept where this driver writes nothing, this driver's fields over them" {
+    const seq = testSeq(1920, 1088);
+    const pic = testPic(0x401, 0x1000, true, 0);
+    const sl = Slice{ .num_ctu = 60 * 34, .slice_type = 2 };
+    var buf: [nvenc.SETUP_BYTES]u8 = undefined;
+    const planes = h264.Planes{ .luma = 0, .chroma = 0, .pitch_luma = 1920, .pitch_chroma = 1920 };
+    setup(&buf, .{ .seq = &seq, .pic = &pic, .slices = &.{sl}, .input = planes, .recon = planes, .ref_ids = [_]u32{va.INVALID_ID} ** nvenc.REF_SLOTS, .ref_poc = [_]i32{0} ** nvenc.REF_SLOTS, .qp = 33, .gop_length = 120, .framerate = 30, .bitstream_start = 0, .bitstream_room = 1 << 22, .history_bytes = 4096, .template = true });
+    // (NVIDIA's: a byte no field names)
+    try testing.expectEqual(nvenc.NV_HEVC_IDR[0x2ad], buf[0x2ad]);
+    // (this driver's: the picture, the QP, the offsets)
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&buf, H.pic_type));
+    try testing.expectEqual(@as(u64, 33), nvenc.get(buf[nvenc.H265_SLICE_OFF..], nvenc.H265Slice.qp_avr));
+    try testing.expectEqual(@as(u64, nvenc.H265_SLICE_OFF), nvenc.get(&buf, H.slice_control_offset));
+    try testing.expectEqual(@as(u64, nvenc.H265_WP_OFF), nvenc.get(&buf, H.wp_control_offset));
+    try testing.expectEqual(@as(u64, 4096), nvenc.get(&buf, H.hist_buf_size));
+}
 
 pub fn testSeq(w: u16, h: u16) Seq {
     var s = std.mem.zeroes(Seq);

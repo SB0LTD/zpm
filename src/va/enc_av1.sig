@@ -593,12 +593,19 @@ pub const Setup = struct {
     magic: u32 = nvenc.MAGIC,
     /// where the tile controls go in the setup (encode.Try.av1_tiles_at)
     tiles_at: u32 = nvenc.TILE_CONTROL_OFF,
+    /// NVIDIA's own captured setup as the base (encode.Try.av1_template)
+    template: bool = false,
 };
 
 pub fn setup(buf: []u8, s: Setup) void {
     @memset(buf[0..nvenc.SETUP_BYTES], 0);
     const f = s.frame;
     const pic = s.pic;
+    if (s.template) {
+        // (NVIDIA's own setup for the same kind of frame; every field this
+        // driver knows is written over it below)
+        @memcpy(buf[0..0x400], if (f.intra()) nvenc.NV_AV1_KEY[0..0x400] else nvenc.NV_AV1_P[0..0x400]);
+    }
     nvenc.set(buf, A.magic, s.magic);
     const cfgs = [_][4]nvenc.F{
         .{ A.refpic_cfg_frame_width_minus1, A.refpic_cfg_frame_height_minus1, A.refpic_cfg_sfc_pitch, A.refpic_cfg_sfc_pitch_chroma },
@@ -762,13 +769,9 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(t, T.tile_end_update_cdf, 1);
     // MD: every partition, transform size and base intra mode; every
     // transform type (both stages)
-    const md = buf[A.MD_CONTROL_OFF..];
-    const M = nvenc.Av1Md;
-    for ([_]nvenc.F{ M.cu8x8_part_2Nx2N_enable, M.cu16x16_part_2Nx2N_enable, M.cu32x32_part_2Nx2N_enable, M.cu64x64_part_2Nx2N_enable, M.tusize_4x4_enable, M.tusize_8x8_enable, M.tusize_16x16_enable, M.tusize_32x32_enable, M.tusize_64x64_enable, M.mv_cost_enable }) |fl| nvenc.set(md, fl, 1);
-    for (0..5) |k| nvenc.set(md, nvenc.at(M.intra_luma_base_mode_4x4_enable, @intCast(k)), 0x1fff);
-    nvenc.set(md, M.tx_type_search_mask, 0xffff);
-    nvenc.set(md, nvenc.at(M.tx_type_search_mask, 1), 0xffff);
-    nvenc.meControl(buf[A.ME_CONTROL_OFF..]);
+    // MD and ME: NVIDIA's own on GB206 (the same on every frame)
+    @memcpy(buf[A.MD_CONTROL_OFF..][0..nvenc.MD_NVIDIA_AV1.len], &nvenc.MD_NVIDIA_AV1);
+    @memcpy(buf[A.ME_CONTROL_OFF..][0..nvenc.ME_NVIDIA_AV1.len], &nvenc.ME_NVIDIA_AV1);
 }
 
 // ── The CDFs and the context's buffers ──────────────────────────────────────
