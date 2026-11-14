@@ -291,7 +291,7 @@ test "enc_rgb: the KIR kernel on EmuDevice against the CPU's conversion, odd siz
     defer dev.unload(&prog);
     const shapes = [_][2]u32{ .{ 37, 21 }, .{ 64, 16 }, .{ 130, 33 } };
     for (shapes) |sh| {
-        for ([_]tiling.Gob{ .blackwell, .turing }) |gob| {
+        for ([_]tiling.Gob{ .blackwell, .turing, .b8, .b16, .swapped }) |gob| {
             for ([_]enc_import.RgbOrder{ .bgrx, .rgbx }) |order| {
                 const layout = tiling.Nv12.of(sh[0], sh[1]);
                 const pitch = sh[0] * 4 + 12;
