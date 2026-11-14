@@ -561,6 +561,8 @@ pub const Setup = struct {
     bitstream_room: u32,
     history_bytes: u32,
     magic: u32 = nvenc.MAGIC,
+    /// where the tile controls go in the setup (encode.Try.av1_tiles_at)
+    tiles_at: u32 = nvenc.TILE_CONTROL_OFF,
 };
 
 pub fn setup(buf: []u8, s: Setup) void {
@@ -681,7 +683,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, A.pic_output_flag, @intFromBool(pic.picture_flags.disable_frame_recon == 0));
     nvenc.set(buf, A.max_tu_depth_inter, 2);
     nvenc.set(buf, A.max_tu_depth_intra, 0);
-    nvenc.set(buf, A.tile_control_offset, nvenc.TILE_CONTROL_OFF);
+    nvenc.set(buf, A.tile_control_offset, s.tiles_at);
     nvenc.set(buf, A.hist_buf_size, s.history_bytes);
     nvenc.set(buf, A.bitstream_buf_size, s.bitstream_room);
     nvenc.set(buf, A.bitstream_start_pos, s.bitstream_start);
@@ -699,7 +701,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, A.strip_height_in_sbs, f.size.sb_rows);
     nvenc.set(buf, A.gp_timer_timeout_val, nvenc.GPTIMER_TIMEOUT);
     // the one tile
-    const t = buf[nvenc.TILE_CONTROL_OFF..];
+    const t = buf[s.tiles_at..];
     const T = nvenc.Av1Tile;
     nvenc.set(t, T.tile_bot_sbx, f.size.sb_cols - 1);
     nvenc.set(t, T.tile_bot_sby, f.size.sb_rows - 1);

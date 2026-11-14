@@ -166,6 +166,8 @@ pub const MAX_CODED = 16;
 pub const ENC_FRAME_BYTES: usize = 0x2000;
 pub const ENC_PUSH_OFF: usize = 0;
 pub const ENC_SETUP_OFF: usize = 0x800;
+/// The setup's place with GALAXY_VA_NVENC_TRY=setup4k (4 KiB aligned).
+pub const ENC_SETUP_OFF_4K: usize = 0x1000;
 
 // Each kind of object's ids: base + index.
 pub const CONFIG_BASE: u32 = 0x100;
@@ -258,6 +260,9 @@ pub const Options = struct {
     /// GALAXY_VA_NVENC_RC=firmware: the encoder firmware's own rate
     /// control for CBR and VBR (enc_rc.sig), not the driver's
     nvenc_rc_firmware: bool = false,
+    /// GALAXY_VA_NVENC_TRY: readings of HEVC's and AV1's setups for a test
+    /// boot (encode.Try)
+    nvenc_try: encode.Try = .{},
     /// GALAXY_VA_VPX_ENCODE=0: no VP8 or VP9 encode entrypoints
     vpx_encode: bool = true,
     /// GALAXY_VA_VPX_GPU=0: VP8 and VP9 encode on the CPU, not the RTX
@@ -2035,11 +2040,12 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             if (st != va.SUCCESS) return st;
             const frame = c.work.bytes()[f * ENC_FRAME_BYTES ..][0..ENC_FRAME_BYTES];
             const base = c.work.va + f * ENC_FRAME_BYTES;
+            const setup_off: usize = if (d.opts.nvenc_try.setup_4k) ENC_SETUP_OFF_4K else ENC_SETUP_OFF;
             var out: encode.EndOut = .{};
             st = encode.end(&c.enc, .{
                 .push = words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX),
-                .setup = frame[ENC_SETUP_OFF..][0..nvenc.SETUP_BYTES],
-                .setup_va = base + ENC_SETUP_OFF,
+                .setup = frame[setup_off..][0..nvenc.SETUP_BYTES],
+                .setup_va = base + setup_off,
                 .coded = cb.buf.bytes(),
                 .coded_va = cb.buf.va,
                 .input = input,
@@ -2051,6 +2057,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 },
                 .picture_index = c.decodes,
                 .magic = d.opts.nvenc_magic orelse nvenc.MAGIC,
+                .try_ = d.opts.nvenc_try,
             }, &out);
             if (st != va.SUCCESS) {
                 d.debug("encode picture refused ({x})", .{st});
@@ -2060,7 +2067,9 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 // (the context's first picture: its setup and methods, for
                 // the boot log)
                 var line: [400]u8 = undefined;
-                d.say("{s}", .{encode.setupLine(&line, c.enc.kind, frame[ENC_SETUP_OFF..][0..nvenc.SETUP_BYTES])});
+                d.say("{s}", .{encode.setupLine(&line, c.enc.kind, frame[setup_off..][0..nvenc.SETUP_BYTES])});
+                const t = d.opts.nvenc_try;
+                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, av1 tiles at 0x{x}, av1 key frame co-located in {s}, setup at 0x{x} of its slot", .{ @tagName(t.hevc_coloc), t.av1_tiles_at, if (t.av1_key_colin) "bound" else "none", setup_off });
                 d.say("first picture's methods: {s}", .{encode.pushLine(&line, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords])});
             }
             const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {
@@ -2812,6 +2821,7 @@ comptime {
     std.debug.assert(nvdec.PUSH_DWORDS <= PUSH_DWORDS_MAX and hevc.PUSH_DWORDS <= PUSH_DWORDS_MAX and av1.PUSH_DWORDS <= PUSH_DWORDS_MAX);
     std.debug.assert(ENC_PUSH_OFF + nvenc.PUSH_DWORDS_MAX * 4 <= ENC_SETUP_OFF and ENC_SETUP_OFF % 256 == 0);
     std.debug.assert(ENC_SETUP_OFF + nvenc.SETUP_BYTES <= ENC_FRAME_BYTES and ENC_FRAME_BYTES % 256 == 0);
+    std.debug.assert(ENC_SETUP_OFF_4K % 4096 == 0 and ENC_SETUP_OFF_4K + nvenc.SETUP_BYTES <= ENC_FRAME_BYTES);
 }
 
 /// `n` dwords at byte `off` of mapped GPU memory.
