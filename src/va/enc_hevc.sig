@@ -536,6 +536,29 @@ pub fn setup(buf: []u8, s: Setup) void {
             nvenc.set(buf, nvenc.at(lf[li][2], kk), e);
         }
     }
+    // P and B pictures: the distance-scale table (256 x td[i] / td[j] for
+    // L0's entries, rows past them -1), the DiffPicOrderCnt-zero flags,
+    // L0's count and order, as NVIDIA's own driver writes them on GB206
+    // (the WSL capture); left zero, the engine read VA 0 at the first P
+    // picture (pc-full17)
+    if (picType(pic) < 2) {
+        var td: [8]i32 = undefined;
+        var n: usize = 0;
+        for (l0) |id| {
+            if (id == va.INVALID_ID or n == td.len) continue;
+            const slot = std.mem.indexOfScalar(u32, &s.ref_ids, id) orelse continue;
+            td[n] = std.math.clamp(cur - s.ref_poc[slot], -128, 127);
+            n += 1;
+        }
+        for (0..8) |i| for (0..8) |j| {
+            const v: i32 = if (i >= n) -1 else if (j >= n or td[j] == 0) 0 else std.math.clamp(@divTrunc(256 * td[i], td[j]), -32768, 32767);
+            nvenc.set(buf, nvenc.at(H.dist_scale_factor, @intCast(i * 8 + j)), @as(u16, @bitCast(@as(i16, @intCast(v)))));
+        };
+        const zero_flags: u8 = @truncate(@as(u16, 0xff) << @intCast(@min(n, 8)));
+        for (0..8) |k| nvenc.set(buf, nvenc.at(H.diff_pic_order_cnt_zero, @intCast(k)), zero_flags);
+        nvenc.set(buf, H.ref_count_gb206, n);
+        for (0..n) |k| nvenc.set(buf, nvenc.at(H.ref_order_gb206, @intCast(k)), k + 1);
+    }
     nvenc.set(buf, H.pic_output_flag, 1);
     const poc_lsb = @as(u32, @bitCast(cur)) & ((@as(u32, 1) << @intCast(@as(u32, prm.log2_max_poc_lsb_minus4) + 4)) - 1);
 
@@ -689,6 +712,11 @@ test "enc_hevc: a P picture's setup: the RPS, the lists, the slice" {
     var buf: [nvenc.SETUP_BYTES]u8 = undefined;
     const planes = h264.Planes{ .luma = 0, .chroma = 0, .pitch_luma = 64, .pitch_chroma = 64 };
     setup(&buf, .{ .seq = &seq, .pic = &pic, .slices = &.{sl}, .input = planes, .recon = planes, .ref_ids = refs, .ref_poc = poc, .qp = 33, .gop_length = 30, .framerate = 30, .bitstream_start = 100, .bitstream_room = 1 << 20, .history_bytes = 4096 });
+    // (one L0 entry: the distance-scale table, the zero flags, the count
+    // and order byte for byte as NVIDIA's own first P picture has them)
+    try testing.expectEqualSlices(u8, nvenc.NV_HEVC_P[0xf4..0x17c], buf[0xf4..0x17c]);
+    try testing.expectEqualSlices(u8, nvenc.NV_HEVC_P[0x288..0x28c], buf[0x288..0x28c]);
+    try testing.expectEqualSlices(u8, nvenc.NV_HEVC_P[0x2dc..0x2e4], buf[0x2dc..0x2e4]);
     try testing.expectEqual(@as(u64, 63), nvenc.get(&buf, H.input_cfg_frame_width_minus1));
     try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.min_cu_size));
     try testing.expectEqual(@as(u64, 2), nvenc.get(&buf, H.max_cu_size));

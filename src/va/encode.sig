@@ -538,8 +538,10 @@ pub const Try = struct {
     /// the same for AV1 (a key or inter frame's: "av1template")
     av1_template: bool = false,
     /// HEVC's slice mode as NVIDIA's driver writes it: dynamic, no strip
-    /// rows ("hevcslice0")
-    hevc_slice0: bool = false,
+    /// rows (the default: with it the first HEVC picture encoded on GB206,
+    /// pc-full17; static slices faulted the engine); "hevcslicestatic"
+    /// for this driver's static slices
+    hevc_slice0: bool = true,
     /// the co-located buffers apart from the history and 1 MiB aligned
     /// (scratchSizesPlaced; the default), or packed after the history as
     /// before pc-full12 ("coloctight")
@@ -560,6 +562,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "hevctemplate")) t.hevc_template = true;
             if (std.ascii.eqlIgnoreCase(w, "av1template")) t.av1_template = true;
             if (std.ascii.eqlIgnoreCase(w, "hevcslice0")) t.hevc_slice0 = true;
+            if (std.ascii.eqlIgnoreCase(w, "hevcslicestatic")) t.hevc_slice0 = false;
         }
         return t;
     }
