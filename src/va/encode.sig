@@ -477,6 +477,9 @@ pub const Scratch = struct {
     pub fn rcProcess(s: Scratch) u64 {
         return s.base + s.sizes.rc_off;
     }
+    pub fn rcData(s: Scratch) u64 {
+        return s.base + s.sizes.rcdata_off;
+    }
     pub fn coloc(s: Scratch, k: usize) u64 {
         if (s.sizes.coloc_align != 0) return std.mem.alignForward(u64, s.base + s.sizes.coloc_off, s.sizes.coloc_align) + k * s.sizes.coloc;
         return s.base + s.sizes.coloc_off + k * s.sizes.coloc;
@@ -734,6 +737,10 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
     a.coloc_out = if (writes_col) in.scratch.coloc(out_k) else 0;
     a.coloc_in = if (reads_col) in.scratch.coloc(col_k) else 0;
     if (t0 != .i) motionBuffers(st, in.scratch, &a);
+    if (st.kind == .hevc) {
+        a.rc_data = in.scratch.rcData();
+        a.cur_chroma_v = a.cur_chroma;
+    }
     for ([_]u64{ a.setup, a.status, a.bitstream, a.history, a.rc_process, a.cur_luma, a.cur_chroma, a.out_luma, a.out_chroma }) |x| {
         if (!nvenc.addressable(x)) return va.ERROR_INVALID_SURFACE;
     }
@@ -947,6 +954,8 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
     }
     if (a.coloc_in != 0 and !nvenc.addressable(a.coloc_in)) return va.ERROR_INVALID_SURFACE;
     if (a.mepred_in != 0 and !nvenc.addressable(a.mepred_out)) return va.ERROR_INVALID_SURFACE;
+    a.rc_data = in.scratch.rcData();
+    a.cur_chroma_v = a.cur_chroma;
     const room: u32 = @intCast(@min(in.coded.len - SLICES_OFF, std.math.maxInt(u32)));
     av1.setup(in.setup, .{
         .frame = frame,
@@ -1299,6 +1308,9 @@ pub const ScratchSizes = struct {
     rc_off: usize,
     mepred: usize = 0,
     mepred_off: usize = 0,
+    /// the RC data buffer (SET_IN_RCDATA: HEVC, AV1)
+    rcdata: usize = RCDATA_BYTES,
+    rcdata_off: usize = 0,
     /// AV1: KEPT + 1 CDF tables (the last a discard), the four default
     /// tables, the line buffers
     cdf_off: usize = 0,
@@ -1311,6 +1323,11 @@ pub const ScratchSizes = struct {
 pub fn scratchSizes(width: u32, height: u32) ScratchSizes {
     return scratchSizesFor(.h264, width, height);
 }
+
+/// The RC data buffer: nvenc_rc_pic_stat_s (256 bytes) and a record a
+/// macroblock row, with room to spare (NVIDIA's driver gives it 4 KiB for
+/// H.264 and HEVC at 1080p, 8 KiB for AV1).
+pub const RCDATA_BYTES: usize = 64 << 10;
 
 /// How far apart (and aligned) the co-located buffers go with
 /// Try.coloc_apart.
@@ -1336,7 +1353,8 @@ pub fn scratchSizesPlaced(kind: Codec, width: u32, height: u32, apart: bool) Scr
     const rc_off = coloc_off + KEPT * coloc;
     const mepred = std.mem.alignForward(usize, wmbs * hmbs * nvenc.MEPRED_BYTES_PER_MB, 4096);
     const mepred_off = rc_off + rc;
-    var s = ScratchSizes{ .history = history, .coloc = coloc, .coloc_off = coloc_off, .rc = rc, .rc_off = rc_off, .mepred = mepred, .mepred_off = mepred_off, .total = mepred_off + 2 * mepred };
+    const rcdata_off = mepred_off + 2 * mepred;
+    var s = ScratchSizes{ .history = history, .coloc = coloc, .coloc_off = coloc_off, .rc = rc, .rc_off = rc_off, .mepred = mepred, .mepred_off = mepred_off, .rcdata_off = rcdata_off, .total = rcdata_off + RCDATA_BYTES };
     if (kind == .av1) {
         s.cdf_off = s.total;
         s.defaults_off = s.cdf_off + (KEPT + 1) * av1.CDF_BYTES;
@@ -1349,6 +1367,7 @@ pub fn scratchSizesPlaced(kind: Codec, width: u32, height: u32, apart: bool) Scr
         const gap = KEPT * coloc;
         s.rc_off -= gap;
         s.mepred_off -= gap;
+        s.rcdata_off -= gap;
         if (kind == .av1) {
             s.cdf_off -= gap;
             s.defaults_off -= gap;
@@ -1500,7 +1519,8 @@ test "encode: the scratch holds a whole picture's history and two MEPRED buffers
     try testing.expect(s.history >= 120 * 69 * 224);
     try testing.expect(s.mepred >= 120 * 68 * nvenc.MEPRED_BYTES_PER_MB);
     try testing.expect(s.mepred_off >= s.rc_off + s.rc);
-    try testing.expectEqual(s.mepred_off + 2 * s.mepred, s.total);
+    try testing.expectEqual(s.mepred_off + 2 * s.mepred, s.rcdata_off);
+    try testing.expectEqual(s.rcdata_off + RCDATA_BYTES, s.total);
     const a = scratchSizesFor(.av1, 1920, 1088);
     try testing.expect(a.history >= nvenc.historyBytes(120, 68));
     try testing.expect(a.lines_off >= a.mepred_off + 2 * a.mepred);

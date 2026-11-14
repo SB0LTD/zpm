@@ -1213,6 +1213,14 @@ pub const PictureAddrs = struct {
     /// the input picture's planes (block linear)
     cur_luma: u64,
     cur_chroma: u64,
+    /// SET_IN_CUR_PIC_CHROMA_V (0: not sent): semi-planar, the same as
+    /// cur_chroma, as NVIDIA's driver sends it on GB206 (HEVC, AV1)
+    cur_chroma_v: u64 = 0,
+    /// SET_IN_RCDATA (0: not sent): the rate control's statistics buffer
+    /// (nvenc_rc_pic_stat_s, then a record a macroblock row), which NVIDIA's
+    /// driver binds on every picture on GB206; without it AV1's engine read
+    /// VA 0 and HEVC's faulted (pc-full13)
+    rc_data: u64 = 0,
     /// the reconstructed picture's planes (the engine's layout)
     out_luma: u64,
     out_chroma: u64,
@@ -1270,6 +1278,8 @@ pub fn push(out: []u32, a: PictureAddrs) usize {
     put(out, &n, SET_OUT_REF_PIC_CHROMA, shifted(a.out_chroma));
     put(out, &n, SET_IN_CUR_PIC, shifted(a.cur_luma));
     put(out, &n, SET_IN_CUR_PIC_CHROMA_U, shifted(a.cur_chroma));
+    if (a.cur_chroma_v != 0) put(out, &n, SET_IN_CUR_PIC_CHROMA_V, shifted(a.cur_chroma_v));
+    if (a.rc_data != 0) put(out, &n, SET_IN_RCDATA, shifted(a.rc_data));
     // (semi-planar, input_cfg's memory_mode 0: V is interleaved with U,
     // and NVIDIA's driver sends no SET_IN_CUR_PIC_CHROMA_V: grc's jobs
     // bind CHROMA_U only)
