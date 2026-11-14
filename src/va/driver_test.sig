@@ -881,8 +881,9 @@ fn pcmSlice(k: *Fake, m: []const u32, setup: []const u8, out: []u8) usize {
     const cp = tiling.Plane.of(pitch, @intCast(h / 2));
     const luma = at(k, m, nvenc.SET_IN_CUR_PIC, @intCast(lp.bytes()));
     const chroma = at(k, m, nvenc.SET_IN_CUR_PIC_CHROMA_U, @intCast(cp.bytes()));
-    tiling.detile(&pcm_y, w, luma, lp, .blackwell8, w, h);
-    tiling.detile(&pcm_uv, w, chroma, cp, .blackwell16, w, h / 2);
+    // (GB206's NVENC reads its input in Turing's GOBs: pc-full9)
+    tiling.detile(&pcm_y, w, luma, lp, .turing2d, w, h);
+    tiling.detile(&pcm_uv, w, chroma, cp, .turing2d, w, h / 2);
     const pic_type = nvenc.get(setup, H.pic_type);
     const idr = pic_type == 3;
     const intra = pic_type >= 2;
@@ -1178,8 +1179,11 @@ test "driver: H.264 through the fake encoder: an IDR then a P picture, the strea
     const in0 = &d.surfaces[surfaces[0] - SURFACE_BASE];
     const rec0 = &d.surfaces[surfaces[2] - SURFACE_BASE];
     const cb = &d.coded[d.buffers[coded - driver.BUFFER_BASE].coded];
-    try testing.expectEqual(nvenc.shifted(in0.tiled.va), enc_seen.methods[nvenc.SET_IN_CUR_PIC >> 2]);
-    try testing.expectEqual(nvenc.shifted(in0.tiled.va + in0.layout.chroma_offset), enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_U >> 2]);
+    // (the engine reads the frame slot's Turing copy of the input, not
+    // the surface's Blackwell-laid picture)
+    try testing.expect(c.enc_input[0].handle != 0);
+    try testing.expectEqual(nvenc.shifted(c.enc_input[0].va), enc_seen.methods[nvenc.SET_IN_CUR_PIC >> 2]);
+    try testing.expectEqual(nvenc.shifted(c.enc_input[0].va + in0.layout.chroma_offset), enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_U >> 2]);
     try testing.expectEqual(nvenc.shifted(rec0.tiled.va), enc_seen.methods[nvenc.SET_OUT_REF_PIC_LUMA >> 2]);
     // (the engine's slices 256-byte aligned, past the headers' room)
     try testing.expectEqual(nvenc.shifted(cb.buf.va + encode.SLICES_OFF), enc_seen.methods[nvenc.SET_OUT_BITSTREAM >> 2]);

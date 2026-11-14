@@ -453,6 +453,15 @@ pub const Input = struct {
     rows: u32,
     width: u32,
     height: u32,
+    /// the surface's own picture when the engine reads a copy of it (the
+    /// driver's Turing copy, driver.nvencInput), 0 when it reads `luma`:
+    /// what a reconstruction must not overwrite
+    surface_luma: u64 = 0,
+
+    /// The surface's own picture (its luma plane).
+    pub fn own(i: Input) u64 {
+        return if (i.surface_luma != 0) i.surface_luma else i.luma;
+    }
 };
 
 /// The context's buffers for the engine: one allocation (`base` on the
@@ -554,7 +563,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
     if (st.kind == .av1) return endAv1(st, in, out);
     const recon_id = reconSurface(st);
     const recon = in.lookup.surface(recon_id) orelse return va.ERROR_INVALID_SURFACE;
-    if (recon.luma == in.input.luma) return va.ERROR_INVALID_SURFACE;
+    if (recon.luma == in.input.own()) return va.ERROR_INVALID_SURFACE;
 
     // The stream: the driver's parameter sets (no packed ones came), then
     // the app's packed headers.
@@ -774,7 +783,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
     const recon_id = pic.reconstructed_frame;
     const recon = in.lookup.surface(recon_id) orelse return va.ERROR_INVALID_SURFACE;
     const inp = in.input;
-    if (recon.luma == inp.luma) return va.ERROR_INVALID_SURFACE;
+    if (recon.luma == inp.own()) return va.ERROR_INVALID_SURFACE;
     if (width > inp.pitch_luma or height > inp.rows) return va.ERROR_RESOLUTION_NOT_SUPPORTED;
     const key = pic.picture_flags.frame_type == 0;
     if (key) as.hidden = null;

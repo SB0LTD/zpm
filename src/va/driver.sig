@@ -384,6 +384,11 @@ const Context = struct {
     encoding: bool = false,
     enc: encode.State = undefined,
     enc_scratch: encode.ScratchSizes = undefined,
+    /// NVENC's input, a copy for each frame slot laid out in Turing's
+    /// GOBs (driver.Self.nvencInput: GB206's NVENC reads its input
+    /// so), made at the slot's first picture; their dma-buf fds
+    enc_input: [FRAMES]Buf = [_]Buf{.{}} ** FRAMES,
+    enc_input_fd: [FRAMES]i32 = [_]i32{-1} ** FRAMES,
     /// VP8 and VP9 (enc_vpx.sig): the state, the packer's scratch, the
     /// CPU engine's memory (made when the CPU encodes), which engine has
     /// the frame store
@@ -915,18 +920,25 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         }
 
         fn convertSurface(d: *Self, s: *Surface, dir: convert.Direction) bool {
+            return d.convertWith(s, s.tiled, null, d.opts.gob, dir);
+        }
+
+        /// A conversion between the surface's linear copy and `tiled` (its
+        /// own picture, or another buffer of its layout: `tiled_fd` that
+        /// buffer's dma-buf), the block-linear side in `gob`'s layouts.
+        fn convertWith(d: *Self, s: *Surface, tiled: Buf, tiled_fd: ?i32, gob: tiling.Gob, dir: convert.Direction) bool {
             var job = convert.Job{
-                .tiled = s.tiled,
+                .tiled = tiled,
                 .layout = s.layout,
                 .linear = s.linear,
                 .lin = s.linear_layout,
                 .width = s.width,
                 .height = s.height,
-                .gob = d.opts.gob,
+                .gob = gob,
                 .dir = dir,
             };
             if (Conv.wants_fds) {
-                job.tiled_fd = d.surfaceFd(s) orelse return false;
+                job.tiled_fd = tiled_fd orelse (d.surfaceFd(s) orelse return false);
                 if (s.linear_fd < 0) {
                     const fd = d.node.exportFd(s.linear);
                     if (fd < 0) return false;
@@ -937,7 +949,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const done = d.conv.run(job, .{ .ctx = d, .f = sayLine });
             d.conversions[@intFromEnum(done)] += 1;
             if (done == .failed) return false;
-            d.debug("{s} {d}x{d} converted {s} on the {s}", .{ if (s.layout.sample_bytes == 2) "P010" else "NV12", s.width, s.height, @tagName(dir), @tagName(done) });
+            d.debug("{s} {d}x{d} converted {s}{s} on the {s}", .{ if (s.layout.sample_bytes == 2) "P010" else "NV12", s.width, s.height, @tagName(dir), if (tiled_fd != null) " (the encoder's input)" else "", @tagName(done) });
             return true;
         }
 
@@ -1057,20 +1069,30 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         /// An RGB surface's picture into its NV12 planes, on the GPU (the
         /// converter's `rgb`), before the encode reads them.
         fn convertRgb(d: *Self, si: u16) va.Status {
+            const s = &d.surfaces[si];
+            const st = d.convertRgbTo(si, s.tiled, null, d.opts.gob);
+            if (st != va.SUCCESS) return st;
+            s.tiled_stale = false;
+            s.linear_stale = true;
+            return va.SUCCESS;
+        }
+
+        /// The RGB picture's NV12 planes into `dst` (the surface's own
+        /// picture, or the encoder's input copy: `dst_fd` its dma-buf), in
+        /// `gob`'s layouts.
+        fn convertRgbTo(d: *Self, si: u16, dst: Buf, dst_fd: ?i32, gob: tiling.Gob) va.Status {
             if (!@hasDecl(Conv, "rgb")) return va.ERROR_UNSUPPORTED_MEMORY_TYPE;
             const s = &d.surfaces[si];
             const pic = d.imports[si].rgb.?;
-            var job = enc_import.RgbJob{ .dst = s.tiled.bytes(), .layout = s.layout, .gob = d.opts.gob, .src = pic.buf.bytes(), .src_offset = pic.offset, .src_pitch = pic.pitch, .order = pic.order, .width = s.width, .height = s.height };
+            var job = enc_import.RgbJob{ .dst = dst.bytes(), .layout = s.layout, .gob = gob, .src = pic.buf.bytes(), .src_offset = pic.offset, .src_pitch = pic.pitch, .order = pic.order, .width = s.width, .height = s.height };
             if (Conv.wants_fds) {
-                job.dst_fd = d.surfaceFd(s) orelse return va.ERROR_OPERATION_FAILED;
+                job.dst_fd = dst_fd orelse (d.surfaceFd(s) orelse return va.ERROR_OPERATION_FAILED);
                 job.src_fd = pic.fd;
             }
             if (d.conv.rgb(job, .{ .ctx = d, .f = sayLine }) == .failed) {
                 d.say("an RGB picture could not be converted on the GPU: not encoded", .{});
                 return va.ERROR_OPERATION_FAILED;
             }
-            s.tiled_stale = false;
-            s.linear_stale = true;
             return va.SUCCESS;
         }
 
@@ -1317,6 +1339,10 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 if (c.enc.tally.pictures != 0 or c.enc.tally.lost != 0) {
                     var line: [320]u8 = undefined;
                     d.say("{s}", .{c.enc.tally.line(&line, c.enc.kind)});
+                }
+                for (&c.enc_input, &c.enc_input_fd) |*b, fd| {
+                    if (fd >= 0) d.node.sys.close(fd);
+                    d.node.free(b);
                 }
                 d.node.free(&c.work);
                 c.* = .{};
@@ -2003,12 +2029,12 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             // (an app's linear dma-buf changes behind the driver: converted
             // every time)
             if (d.imports[si].used and d.imports[si].layout == .linear) s.tiled_stale = true;
-            st = if (d.imports[si].rgb != null) d.convertRgb(si) else d.syncTiled(si);
-            if (st != va.SUCCESS) return st;
             const f = c.frame;
+            var input: encode.Input = undefined;
+            st = d.nvencInput(c, si, f, &input);
+            if (st != va.SUCCESS) return st;
             const frame = c.work.bytes()[f * ENC_FRAME_BYTES ..][0..ENC_FRAME_BYTES];
             const base = c.work.va + f * ENC_FRAME_BYTES;
-            const input = d.encodeInput(si);
             var out: encode.EndOut = .{};
             st = encode.end(&c.enc, .{
                 .push = words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX),
@@ -2249,6 +2275,68 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             enc_vpx.done(&c.vpx, pl, bytes);
             c.decodes +%= 1;
             d.debug("{s} picture {d} on the {s}: {s}, q {d}, {d} bytes{s}", .{ @tagName(c.vpx.codec), c.decodes, @tagName(on), if (pl.key) "key" else "inter", pl.q, bytes, if (full) " (the coded buffer is too small)" else "" });
+            return va.SUCCESS;
+        }
+
+        /// NVENC's input for frame slot `f`, in `out`.
+        ///
+        /// GB206's NVENC reads its input's GOBs as Turing lays them out:
+        /// pc-full9 encoded H.264 at PSNR 38.4 from a Turing upload and at
+        /// 26.6..27.7 from Blackwell's, b8, b16 or swapped (testsrc2, 4
+        /// Mbit/s), while its NVDEC writes Blackwell's and every other
+        /// reader (the converter, the GL driver, an export's modifier)
+        /// takes Blackwell's. So the picture goes into the slot's own
+        /// Turing copy first: an upload (its linear copy current) in one
+        /// GPU pass, a decoded picture in two (into the linear copy, then
+        /// out), an RGB capture straight from its pixels. Read in place: a
+        /// surface already in Turing's layouts (GALAXY_VA_GOB=turing), and
+        /// an app's block-linear dma-buf, as its planes lie (an app that
+        /// hands Blackwell-laid planes has them read as Turing's).
+        fn nvencInput(d: *Self, c: *Context, si: u16, f: u8, out: *encode.Input) va.Status {
+            const s = &d.surfaces[si];
+            const im = d.imports[si];
+            const sw = s.layout.swizzles(d.opts.gob);
+            if ((im.used and im.layout == .block_linear and im.rgb == null) or (sw[0] == .turing2d and sw[1] == .turing2d)) {
+                const st = if (im.rgb != null) d.convertRgb(si) else d.syncTiled(si);
+                if (st != va.SUCCESS) return st;
+                out.* = d.encodeInput(si);
+                return va.SUCCESS;
+            }
+            // the slot's copy (made once; again if a bigger picture comes)
+            const bytes: usize = @intCast(s.layout.bytes);
+            if (c.enc_input[f].handle != 0 and c.enc_input[f].len < bytes) {
+                if (c.enc_input_fd[f] >= 0) d.node.sys.close(c.enc_input_fd[f]);
+                c.enc_input_fd[f] = -1;
+                d.node.free(&c.enc_input[f]);
+            }
+            if (c.enc_input[f].handle == 0) {
+                c.enc_input[f] = d.node.alloc(bytes, node.G_VRAM) orelse return d.lostOr(va.ERROR_ALLOCATION_FAILED);
+                if (Conv.wants_fds) {
+                    const fd = d.node.exportFd(c.enc_input[f]);
+                    if (fd < 0) {
+                        d.say("the encoder input's dma-buf was refused ({d})", .{fd});
+                        d.node.free(&c.enc_input[f]);
+                        return va.ERROR_OPERATION_FAILED;
+                    }
+                    c.enc_input_fd[f] = @intCast(fd);
+                }
+            }
+            const dst = c.enc_input[f];
+            const fd = c.enc_input_fd[f];
+            if (im.rgb != null) {
+                const st = d.convertRgbTo(si, dst, fd, .turing);
+                if (st != va.SUCCESS) return st;
+            } else {
+                // (a decode into it done and brought into the linear copy;
+                // an app's write is there already)
+                const st = d.syncLinear(si);
+                if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+                if (!d.convertWith(s, dst, fd, .turing, .to_tiled)) return va.ERROR_OPERATION_FAILED;
+            }
+            out.* = d.encodeInput(si);
+            out.surface_luma = out.luma;
+            out.luma = dst.va;
+            out.chroma = dst.va + s.layout.chroma_offset;
             return va.SUCCESS;
         }
 
