@@ -166,6 +166,8 @@ pub const MAX_CODED = 16;
 pub const ENC_FRAME_BYTES: usize = 0x2000;
 pub const ENC_PUSH_OFF: usize = 0;
 pub const ENC_SETUP_OFF: usize = 0x800;
+/// How many pictures of each encode context GALAXY_VA_NVENC_DUMP prints.
+pub const DUMP_PICTURES = 4;
 /// The setup's place with GALAXY_VA_NVENC_TRY=setup4k (4 KiB aligned).
 pub const ENC_SETUP_OFF_4K: usize = 0x1000;
 
@@ -263,6 +265,11 @@ pub const Options = struct {
     /// GALAXY_VA_NVENC_TRY: readings of HEVC's and AV1's setups for a test
     /// boot (encode.Try)
     nvenc_try: encode.Try = .{},
+    /// GALAXY_VA_NVENC_DUMP (set, not "0"): each encode context's first
+    /// DUMP_PICTURES pictures' setups (every nonzero 32-byte row, in hex)
+    /// and methods on stderr ("dump" lines), to set against what NVIDIA's
+    /// own driver gives the engine (zpm tools/nvcap.sig)
+    nvenc_dump: bool = false,
     /// GALAXY_VA_VPX_ENCODE=0: no VP8 or VP9 encode entrypoints
     vpx_encode: bool = true,
     /// GALAXY_VA_VPX_GPU=0: VP8 and VP9 encode on the CPU, not the RTX
@@ -2071,6 +2078,18 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 const t = d.opts.nvenc_try;
                 d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 co-located {s}, setup at 0x{x} of its slot", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_coloc) "bound" else "none", setup_off });
                 d.say("first picture's methods: {s}", .{encode.pushLine(&line, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords])});
+            }
+            if (d.opts.nvenc_dump and c.decodes < DUMP_PICTURES) {
+                const setup = frame[setup_off..][0..nvenc.SETUP_BYTES];
+                var row: usize = 0;
+                while (row < setup.len) : (row += 32) {
+                    const r = setup[row..][0..32];
+                    if (std.mem.allEqual(u8, r, 0)) continue;
+                    const hex = std.fmt.bytesToHex(r.*, .lower);
+                    d.say("dump {s} {d} setup {x:0>4}: {s}", .{ @tagName(c.enc.kind), c.decodes, row, &hex });
+                }
+                var mline: [1600]u8 = undefined;
+                d.say("dump {s} {d} methods: {s}", .{ @tagName(c.enc.kind), c.decodes, encode.pushLine(&mline, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords]) });
             }
             const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {
                 d.say("an encode was not submitted ({s})", .{@errorName(e)});

@@ -340,6 +340,8 @@ pub fn optionsOf(block: []const u8) driver.Options {
         } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_RC")) {
             // ("firmware": the encoder's own CBR/VBR, enc_rc.sig)
             o.nvenc_rc_firmware = std.ascii.eqlIgnoreCase(v, "firmware");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_DUMP")) {
+            o.nvenc_dump = v.len != 0 and !std.mem.eql(u8, v, "0");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_TRY")) {
             // (readings of HEVC's and AV1's setups for a test boot)
             o.nvenc_try = encode.Try.parse(v);
@@ -658,6 +660,9 @@ test "libgalaxy_va: options from an environment block" {
     const none_t = optionsOf("GALAXY_VA_NVENC_TRY=").nvenc_try;
     try testing.expect(none_t.hevc_coloc == .tmvp and none_t.av1_tiles_at == 0x400 and !none_t.av1_coloc and !none_t.setup_4k and none_t.coloc_apart);
     try testing.expect(!optionsOf("GALAXY_VA_NVENC_TRY=coloctight").nvenc_try.coloc_apart);
+    const tt = optionsOf("GALAXY_VA_NVENC_TRY=hevctemplate,av1template").nvenc_try;
+    try testing.expect(tt.hevc_template and tt.av1_template and !none_t.hevc_template and !none_t.av1_template);
+    try testing.expect(optionsOf("GALAXY_VA_NVENC_DUMP=1").nvenc_dump and !optionsOf("GALAXY_VA_NVENC_DUMP=0").nvenc_dump and !none.nvenc_dump);
     try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
     try testing.expect(none.encode and none.nvenc_magic == null);
     const enc = optionsOf("GALAXY_VA_ENCODE=0\x00GALAXY_VA_NVENC_MAGIC=0xc9b70006\x00");

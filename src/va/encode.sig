@@ -532,6 +532,11 @@ pub const Try = struct {
     av1_coloc: bool = false,
     /// the setup 4 KiB aligned in its frame slot ("setup4k"; the driver's)
     setup_4k: bool = false,
+    /// NVIDIA's own captured setup (an I or P picture's) as the base of
+    /// every HEVC setup, this driver's fields over it ("hevctemplate")
+    hevc_template: bool = false,
+    /// the same for AV1 (a key or inter frame's: "av1template")
+    av1_template: bool = false,
     /// the co-located buffers apart from the history and 1 MiB aligned
     /// (scratchSizesPlaced; the default), or packed after the history as
     /// before pc-full12 ("coloctight")
@@ -549,6 +554,8 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "av1coloc")) t.av1_coloc = true;
             if (std.ascii.eqlIgnoreCase(w, "setup4k")) t.setup_4k = true;
             if (std.ascii.eqlIgnoreCase(w, "coloctight")) t.coloc_apart = false;
+            if (std.ascii.eqlIgnoreCase(w, "hevctemplate")) t.hevc_template = true;
+            if (std.ascii.eqlIgnoreCase(w, "av1template")) t.av1_template = true;
         }
         return t;
     }
@@ -812,6 +819,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
                 .bitstream_room = room,
                 .history_bytes = @intCast(in.scratch.sizes.history),
                 .magic = in.magic,
+                .template = in.try_.hevc_template,
             });
             a.application_id = nvenc.APPLICATION_ID_H265;
             a.codec_type = nvenc.CODEC_TYPE_H265;
@@ -979,6 +987,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         .history_bytes = @intCast(in.scratch.sizes.history),
         .magic = in.magic,
         .tiles_at = in.try_.av1_tiles_at,
+        .template = in.try_.av1_template,
     });
     if (st.firmware_rc and st.rate.active()) a.rc_mode = firmware(st, in, enc_rc.RcFields.of(nvenc.Av1), q);
 
