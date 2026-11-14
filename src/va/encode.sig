@@ -915,10 +915,19 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
     };
     for (pic.reference_frames, 0..) |id, i| {
         if (id == va.INVALID_ID) continue;
-        const s = in.lookup.surface(id) orelse continue;
+        if (in.lookup.surface(id) == null) continue;
         ref_ids[i] = id;
-        a.ref_luma[i] = s.luma;
-        a.ref_chroma[i] = s.chroma;
+    }
+    // (the engine's references in enc_av1.refOrder's order, as the
+    // setup's lists number them)
+    {
+        var order: [7]u3 = undefined;
+        const n_order = av1.refOrder(frame, pic, &order);
+        for (order[0..n_order], 0..) |slot, k| {
+            const s = in.lookup.surface(pic.reference_frames[slot]) orelse return va.ERROR_INVALID_SURFACE;
+            a.ref_luma[k] = s.luma;
+            a.ref_chroma[k] = s.chroma;
+        }
     }
     const out_k = st.kept.take(recon_id, &ref_ids) orelse return va.ERROR_MAX_NUM_EXCEEDED;
     if (!as.defaults_written) {

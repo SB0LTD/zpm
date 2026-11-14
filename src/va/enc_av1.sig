@@ -465,6 +465,36 @@ pub fn listOf(ctrl: u32, max: usize, out: []u3) usize {
     return n;
 }
 
+/// The reference slots an inter picture's lists name, each once, in list
+/// order (L0's, then L1's; no list given: LAST alone), into `out`: the
+/// engine's references go by this order, SET_IN_REF_PIC0 + 4k for the k-th
+/// and the lists' entries k, as NVIDIA's own driver numbers them on GB206
+/// (captured in WSL: its l0 holds 0, 1, 2 and SET_IN_REF_PIC0, +4, +8 the
+/// most recent first). By VA's slot numbers instead, AV1's engine read VA 0
+/// at the picture with a second reference (pc-full13, pc-full14).
+pub fn refOrder(f: Frame, pic: *const Pic, out: *[7]u3) usize {
+    if (f.intra()) return 0;
+    var n: usize = 0;
+    var names: [7]u3 = undefined;
+    const ctrls = [2]u32{ pic.ref_frame_ctrl_l0, pic.ref_frame_ctrl_l1 };
+    const maxes = [2]usize{ MAX_L0, MAX_L1 };
+    for (ctrls, 0..) |ctrl, li| {
+        var m = listOf(ctrl, maxes[li], &names);
+        if (li == 0 and m == 0) {
+            names[0] = 1;
+            m = 1;
+        }
+        for (names[0..m]) |name| {
+            const slot: u3 = @intCast(f.ref_frame_idx[name - 1]);
+            if (std.mem.indexOfScalar(u3, out[0..n], slot) == null) {
+                out[n] = slot;
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
 /// A loop-filter level for `qindex` when the app leaves it to the driver
 /// (libaom's picking from the quantiser, rounded: 0 at the lowest
 /// quantisers, 63 at the highest).
@@ -592,6 +622,9 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, A.extra_cfg_sfc_pitch_chroma, nvenc.get(buf, A.outputpic_cfg_sfc_pitch_chroma));
     nvenc.set(buf, A.extra_cfg_tiled_16x16, 1);
     nvenc.set(buf, A.codec, nvenc.PIC_CODEC_AV1);
+    // (the word NVIDIA's driver writes 16 bytes past the GP timer on GB206,
+    // as 8 past HEVC's: 0x999; meaning not public)
+    std.mem.writeInt(u16, buf[0x32c..][0..2], 0x999, .little);
     nvenc.set(buf, A.input_cfg_block_height, nvenc.blockHeightField(s.input.block_height));
     // seqhdr_data: CUs 16 to 64 (the engine's range), 8-bit 4:2:0
     nvenc.set(buf, A.min_cu_size, 1);
@@ -664,6 +697,8 @@ pub fn setup(buf: []u8, s: Setup) void {
         nvenc.set(buf, nvenc.at(A.poc_entry_l1, @intCast(k)), 0xff);
     }
     var counts = [2]usize{ 0, 0 };
+    var order: [7]u3 = undefined;
+    const n_order = refOrder(f, pic, &order);
     if (!f.intra()) {
         var names: [7]u3 = undefined;
         const ctrls = [2]u32{ pic.ref_frame_ctrl_l0, pic.ref_frame_ctrl_l1 };
@@ -679,7 +714,10 @@ pub fn setup(buf: []u8, s: Setup) void {
             for (names[0..n], 0..) |name, k| {
                 const kk: u32 = @intCast(k);
                 const slot = f.ref_frame_idx[name - 1];
-                nvenc.set(buf, nvenc.at(fields[li][0], kk), slot);
+                // (the entry: the slot's place in refOrder, the engine's
+                // reference number)
+                const at = std.mem.indexOfScalar(u3, order[0..n_order], @intCast(slot)).?;
+                nvenc.set(buf, nvenc.at(fields[li][0], kk), at);
                 nvenc.setSigned(buf, nvenc.at(fields[li][1], kk), std.math.clamp(relDist(f, f.order_hint, f.slot_hint[slot]), -128, 127));
                 nvenc.set(buf, nvenc.at(fields[li][2], kk), name - 1);
             }
@@ -872,6 +910,27 @@ test "enc_av1: a key frame's header, bit by bit" {
     const m = frameHeaderObu(&out, f, w.bytes().len + 3).?;
     try testing.expectEqual(n + 3, m);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, out[n..m]);
+}
+
+test "enc_av1: references numbered in list order, each slot once, whatever VA's slots" {
+    const seq = testSeq();
+    var pic = testPic(0x403, 0x1000, false, 2);
+    // LAST in slot 3, LAST2 in slot 6, GOLDEN in slot 3 again
+    pic.ref_frame_idx = .{ 3, 6, 0, 3, 0, 0, 0 };
+    pic.ref_frame_ctrl_l0 = 1 | (2 << 3) | (4 << 6);
+    pic.ref_frame_ctrl_l1 = 0;
+    const f = frameOf(&seq, &pic, 120, true, false, .{ 1, 0, 4, 0, 0, 0, 0, 0 });
+    var order: [7]u3 = undefined;
+    const n = refOrder(f, &pic, &order);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualSlices(u3, &.{ 3, 6 }, order[0..n]);
+    var b: [nvenc.SETUP_BYTES]u8 = undefined;
+    const planes = h264.Planes{ .luma = 0, .chroma = 0, .pitch_luma = 256, .pitch_chroma = 256 };
+    setup(&b, .{ .frame = f, .pic = &pic, .input = planes, .recon = planes, .ref_ids = .{va.INVALID_ID} ** 8, .framerate = 30, .gop_length = 120, .bitstream_start = 64, .bitstream_room = 1 << 20, .history_bytes = 1 << 20 });
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&b, A.num_ref_idx_l0_active));
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(A.l0, 0)));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&b, nvenc.at(A.l0, 1)));
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(A.l0, 2))); // GOLDEN: slot 3 again
 }
 
 test "enc_av1: an inter frame's setup: the lists by name, sign bias, the tile" {
