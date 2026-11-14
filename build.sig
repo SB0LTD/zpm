@@ -1845,6 +1845,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     // Net module tests — each module tested individually with its own imports resolved
     _ = try addTest(ctx, test_all, "test-net-checksum", "src/net/checksum.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-ethernet", "src/net/ethernet.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-net-i219", "src/net/i219.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-ipv4", "src/net/ipv4.sig", &.{
         importEntry("net_checksum", "src/net/checksum.sig"),
     });
