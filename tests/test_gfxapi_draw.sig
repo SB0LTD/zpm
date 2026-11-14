@@ -332,8 +332,12 @@ test "draw: the scene on the CPU (the interpreter on the images' memory)" {
 }
 
 fn stencilValue(eng: *engine.Engine, rb: u32) u32 {
+    // (pixel (2, 2) as d24s8's word, whatever the image's form: rows,
+    // block linear, or float depth with its S8 plane)
     const img = &ctx.objs.rbs[rb - 1].img;
-    return std.mem.readInt(u32, eng.hostView(img, 10 * 4, 4)[0..4], .little);
+    var word: [4]u8 = undefined;
+    eng.read(img, 2, 2, 1, 1, &word, 4, .d24s8);
+    return std.mem.readInt(u32, &word, .little);
 }
 
 fn stencilScene(eng: *engine.Engine, separate: bool) !void {
@@ -1452,7 +1456,7 @@ test "draw: stencil operations on emulated Adreno and RTX with separate and pack
     }
 }
 
-test "draw: stencil operations with the emulated RTX's 3D engine on: on the compute kernels (a depth-stencil image beside GL's colour rows is RT_LINEAR_WITH_ZETA), the CPU's bytes" {
+test "draw: stencil operations with the emulated RTX's 3D engine on: the framebuffer's texture made block linear, its float depth-stencil (packed or separate renderbuffers) drawn by the 3D engine, the CPU's bytes" {
     for ([_]bool{ false, true }) |separate| {
         Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
         Rtx.dev.withEngine(&Rtx3d.engine3d);
@@ -1466,11 +1470,13 @@ test "draw: stencil operations with the emulated RTX's 3D engine on: on the comp
         try std.testing.expect(!eng_rtx.lost);
         std.debug.print("stencil scene (separate {}): {d} draws through the 3D engine, {d} on the compute kernels\n", .{ separate, eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws });
         for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("stencil scene: on the compute kernels: {s}\n", .{w});
-        // (the engine would lose the channel to such a draw: Xid 69, the
-        // Legion's drawtest, pc-all; nvidia_draw's step 4c draws depth into
-        // block-linear colour instead)
-        try std.testing.expectEqual(@as(u64, 0), eng_rtx.stats.graphics_draws);
-        try std.testing.expect(eng_rtx.stats.compute_draws > 0);
+        // (the texture made block linear at the first depth draw, so the
+        // engine takes every draw (RT_LINEAR_WITH_ZETA beside rows lost the
+        // Legion's channel: Xid 69, pc-all); the renderbuffers float depth
+        // with their S8 planes)
+        try std.testing.expectEqual(@as(u32, 1), eng_rtx.stats.promoted);
+        try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
+        try std.testing.expectEqual(@as(u64, 0), eng_rtx.stats.compute_draws);
     }
 }
 
@@ -1634,6 +1640,7 @@ test "draw: two triangles sharing an edge with depth, the RTX's 3D engine on: ev
     Rtx.dev.withEngine(&Rtx3d.engine3d);
     eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
     defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&solid);
     const e = &eng_rtx;
     var img = e.newImage(W, H, .rgba8) orelse return error.OutOfMemory;
     defer e.freeImage(&img);
@@ -2242,6 +2249,177 @@ test "draw: block-linear colour targets: the compute raster and the RTX's 3D eng
     e.compute_only = false;
 }
 
+// ── Float depth (ZF32 + S8): depth and stencil on the 3D engine ───────────
+
+var eng_zcpu: engine.Engine = undefined;
+var zpool_mem: [8 << 20]u8 align(64) = undefined;
+
+/// A float depth image (ZF32 + S8) from an engine without the 3D engine
+/// (the CPU's): the same form, which its compute raster draws as the
+/// RTX's does.
+fn floatDepthOn(e: *engine.Engine, w: u32, h: u32) ?engine.Image {
+    const was = e.depth_float;
+    e.depth_float = true;
+    defer e.depth_float = was;
+    return e.newDepthImage(w, h);
+}
+
+test "draw: depth- and stencil-tested draws into block-linear colour with a float depth image (ZF32 + S8) go to the RTX's 3D engine; the compute raster's float form and the CPU's give the same bytes" {
+    Rtx3d.engine3d = .{};
+    eng_zcpu.init(.{ .pool = &zpool_mem, .cpu_work = &cpu_work });
+    defer eng_zcpu.deinit();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer for (feat_pipes) |p| {
+        eng_rtx.unloadPipeline(p);
+        eng_zcpu.unloadPipeline(p);
+    };
+    try std.testing.expect(eng_rtx.depth_float);
+    // [0] the CPU (rows of colour, a float depth image), [1] the RTX's
+    // compute raster and [2] its 3D engine (block-linear colour, the
+    // engine's float depth image)
+    var imgs: [3][3]engine.Image = undefined;
+    imgs[0] = .{ eng_zcpu.newImage(W, H, .rgba8) orelse return error.OutOfMemory, floatDepthOn(&eng_zcpu, W, H) orelse return error.OutOfMemory, eng_zcpu.newBuffer(20 * 16) orelse return error.OutOfMemory };
+    for (1..3) |n| imgs[n] = .{ eng_rtx.newBlockImage(W, H, .rgba8) orelse return error.OutOfMemory, eng_rtx.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory, eng_rtx.newBuffer(20 * 16) orelse return error.OutOfMemory };
+    defer {
+        for (&imgs[0]) |*im| eng_zcpu.freeImage(im);
+        for (imgs[1..]) |*row| for (row) |*im| eng_rtx.freeImage(im);
+    }
+    for (imgs) |row| try std.testing.expect(row[1].depth_float and row[1].layout.block and row[1].s8_at % 512 == 0);
+    const depth_va = imgs[2][1].buf.gpu;
+    var pics: [3][3 * FEAT_PIC]u8 = undefined;
+    for ([_]Feature{ .frag_depth, .two_sided_stencil }) |f| {
+        for ([_]bool{ false, true }) |top_down| {
+            var on3d: [3]u64 = undefined;
+            for (0..3) |n| {
+                const e = if (n == 0) &eng_zcpu else &eng_rtx;
+                e.compute_only = n == 1;
+                imgs[n][0].top_down = top_down;
+                imgs[n][1].top_down = top_down;
+                const compute_before = e.stats.compute_draws;
+                on3d[n] = featureScene(e, f, &imgs[n][0], &imgs[n][1], &imgs[n][2], &pics[n]) catch |err| {
+                    std.debug.print("float depth: feature {s} (top down {}, run {d}): {s}; the 3D engine: {s}\n", .{ @tagName(f), top_down, n, @errorName(err), Rtx3d.engine3d.why });
+                    return err;
+                };
+                if (n == 2 and e.stats.compute_draws != compute_before) {
+                    for (e.said_compute) |w| if (w.len != 0) std.debug.print("float depth: on the compute kernels: {s}\n", .{w});
+                    return error.WrongRasterizer;
+                }
+            }
+            eng_rtx.compute_only = false;
+            std.debug.print("float depth: feature {s} (top down {}): {d} draws on the 3D engine\n", .{ @tagName(f), top_down, on3d[2] });
+            // (every draw of the scene on the engine: its depth tests, its
+            // gl_FragDepth, its two-sided stencil in the S8 plane)
+            try std.testing.expectEqual(@as(u64, 0), on3d[1]);
+            try std.testing.expectEqual(@as(u64, 3), on3d[2]);
+            try std.testing.expectEqual(@as(u32, 0), apart(pics[0][0..FEAT_PIC], pics[1][0..FEAT_PIC], W, 0, "float depth: the CPU against the RTX's compute raster"));
+            try std.testing.expectEqual(@as(u32, 0), apart(pics[1][0..FEAT_PIC], pics[2][0..FEAT_PIC], W, 1, "float depth: the compute raster against the 3D engine"));
+        }
+    }
+    // (the engine's depth image stayed where it was made, in its one form:
+    // nothing moved it between layouts)
+    try std.testing.expectEqual(depth_va, imgs[2][1].buf.gpu);
+    try std.testing.expect(imgs[2][1].depth_float and imgs[2][1].layout.block);
+    try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
+}
+
+/// Two triangles with sloped depths (a plane each, corners apart in z)
+/// drawn LESS (the depth written, a quarter added) into `img` and the
+/// float depth image `depth`, then EQUAL (another quarter where the
+/// depth is the pass's own): all on the 3D engine or all on the compute
+/// raster, as `engine3d` says.
+fn slopedPasses(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, pts: [4][2]f32, engine3d: bool) !void {
+    e.fill(img, img.bounds(), 0, 0);
+    e.fillDepth(depth, depth.bounds(), 1.0, 0, 0xff);
+    var verts: [6][4]f32 = undefined;
+    const tris = [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
+    const zs = [4]f32{ -0.3, 0.2117, 0.7, 0.0931 };
+    for (tris, 0..) |t, n| {
+        for (t, 0..) |c, j| verts[n * 3 + j] = .{ nx(pts[c][0], W), nx(pts[c][1], H), zs[c], 1 };
+    }
+    e.writeBytes(ab, 0, std.mem.sliceAsBytes(&verts));
+    const quarter = [_]u32{ @bitCast(@as(f32, 0.25)), 0, 0, 0 };
+    const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+    e.compute_only = !engine3d;
+    defer e.compute_only = false;
+    for (0..2) |pass| {
+        const before = e.stats.graphics_draws;
+        var d = raster.Draw{ .pipe = &solid, .color = img, .depth = depth, .depth_test = true, .depth_write = pass == 0, .depth_func = if (pass == 0) 0b001 else 0b010, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 6, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .uniforms = &quarter, .blend = add };
+        d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+        if (!e.draw(&d)) return error.NotDrawn;
+        e.finish();
+        if (e.lost or e.why_pipe != null) return error.EngineLost;
+        if (e.stats.graphics_draws - before != @intFromBool(engine3d)) {
+            for (e.said_compute) |w| if (w.len != 0) std.debug.print("sloped passes: on the compute kernels: {s}\n", .{w});
+            return error.WrongRasterizer;
+        }
+    }
+}
+
+test "draw: the compute raster's float depth is the 3D engine's within 3 ulps (pc-full4's spread), over the same pixels; each path's EQUAL pass meets its own LESS pass's depths" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&solid);
+    const e = &eng_rtx;
+    var img = e.newBlockImage(W, H, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&img);
+    var zd: [2]engine.Image = undefined;
+    for (&zd) |*z| z.* = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer for (&zd) |*z| e.freeImage(z);
+    var ab = e.newBuffer(6 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    const shapes = [_][4][2]f32{
+        .{ .{ 8, 4 }, .{ 32, 4 }, .{ 32, 28 }, .{ 8, 28 } },
+        .{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } },
+        .{ .{ 40.5, 2.25 }, .{ 61.0078125, 30.0039 }, .{ 12.25, 30.5 }, .{ 3.1, 1.9 } },
+    };
+    var words: [2][W * H]u32 = undefined;
+    var pic: [W * H * 4]u8 = undefined;
+    const one: u32 = @bitCast(@as(f32, 1.0));
+    for ([_]bool{ false, true }) |top_down| {
+        img.top_down = top_down;
+        for (&zd) |*z| z.top_down = top_down;
+        for (shapes, 0..) |s, si| {
+            for (0..2) |n| {
+                slopedPasses(e, &img, &zd[n], &ab, s, n == 1) catch |err| {
+                    std.debug.print("float depth ulps: shape {d} (top down {}, engine {}): {s}; the 3D engine: {s}\n", .{ si, top_down, n == 1, @errorName(err), Rtx3d.engine3d.why });
+                    if (e.why_pipe) |w| std.debug.print("float depth ulps: the engine's pipeline: {s}, lost {}\n", .{ @errorName(w), e.lost });
+                    return err;
+                };
+                e.readDepthBits(&zd[n], 0, 0, W, H, &words[n], null);
+                // (every pixel the LESS pass wrote met by the EQUAL pass on
+                // the same path: hit twice, 128)
+                e.read(&img, 0, 0, W, H, &pic, W * 4, .rgba8);
+                var covered: u32 = 0;
+                for (0..W * H) |p| {
+                    if (words[n][p] == one) continue;
+                    covered += 1;
+                    try std.testing.expectEqual(@as(u32, 2), hits(pic[p * 4]));
+                }
+                try std.testing.expect(covered > 0);
+            }
+            var most: u32 = 0;
+            var differ: u32 = 0;
+            for (0..W * H) |p| {
+                const a = words[0][p];
+                const b = words[1][p];
+                // (the same pixels covered: GL's rule on both)
+                try std.testing.expectEqual(a == one, b == one);
+                const ulps = if (a > b) a - b else b - a;
+                most = @max(most, ulps);
+                differ += @intFromBool(ulps != 0);
+            }
+            std.debug.print("float depth ulps: shape {d} (top down {}): {d} pixels apart, at most {d} ulps\n", .{ si, top_down, differ, most });
+            try std.testing.expect(most <= 3);
+        }
+    }
+}
+
 // ── GALAXY_GL_CHECK: the GPU's work against the CPU's ──────────────────────
 
 var check_mem: [4 << 20]u8 align(64) = undefined;
@@ -2587,4 +2765,134 @@ test "draw: bins on the emulated Adreno (ir3) give the CPU's bytes" {
     try std.testing.expect(eng_a.stats.dispatches >= 4 * 3);
     eng_a.deinit();
     a_gpu.close();
+}
+
+// ── GL's render targets made block linear once (Engine.promote) ────────────
+
+/// Frames of a framebuffer object (an RGBA8 texture, a DEPTH24_STENCIL8
+/// renderbuffer) through GL: each cleared, a red quad at depth 0.5, a
+/// green triangle in front of it, a blue quad behind (LESS: hidden);
+/// after frame `upload_at` a texSubImage2D into the target (an op that
+/// takes rows). The last frame's pixels read into `out`.
+fn depthFrames(frames: u32, upload_at: ?u32, out: []u8) !struct { tex: *engine.Image, depth: *engine.Image } {
+    var tex: [1]u32 = undefined;
+    ctx.genTextures(&tex);
+    ctx.bindTexture(g.TEXTURE_2D, tex[0]);
+    ctx.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, W, H);
+    var rb: [1]u32 = undefined;
+    ctx.genRenderbuffers(&rb);
+    ctx.bindRenderbuffer(g.RENDERBUFFER, rb[0]);
+    ctx.renderbufferStorage(g.RENDERBUFFER, 0, g.DEPTH24_STENCIL8, W, H);
+    var fb: [1]u32 = undefined;
+    ctx.genFramebuffers(&fb);
+    ctx.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    ctx.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex[0], 0);
+    ctx.framebufferRenderbuffer(g.FRAMEBUFFER, g.DEPTH_STENCIL_ATTACHMENT, g.RENDERBUFFER, rb[0]);
+    if (ctx.checkFramebufferStatus(g.FRAMEBUFFER) != g.FRAMEBUFFER_COMPLETE) return error.Incomplete;
+    ctx.viewportSet(0, 0, W, H);
+    var buffer: [1]u32 = undefined;
+    ctx.genBuffers(&buffer);
+    const quads = [_]f32{
+        // red: the whole target at z 0 (window 0.5)
+        -1, -1, 0,   1, 1,  -1, 0,   1, 1,  1,  0,   1, -1, -1, 0,   1, 1,  1,  0,   1, -1, 1,  0,   1,
+        // green: a triangle in front (z -0.5)
+        -0.8, -0.8, -0.5, 1, 0.6, -0.7, -0.5, 1, -0.2, 0.9, -0.5, 1,
+        // blue: the whole target behind (z 0.6)
+        -1, -1, 0.6, 1, 1,  -1, 0.6, 1, 1,  1,  0.6, 1, -1, -1, 0.6, 1, 1,  1,  0.6, 1, -1, 1,  0.6, 1,
+    };
+    ctx.bindBuffer(g.ARRAY_BUFFER, buffer[0]);
+    ctx.bufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(quads)), &quads, g.STATIC_DRAW);
+    ctx.vertexAttribPointer(0, 4, g.FLOAT, false, 16, 0, false);
+    ctx.enableVertexAttribArray(0, true);
+    const cols = [3][4]u32{ rgba(.{ 1, 0, 0, 1 }), rgba(.{ 0, 1, 0, 1 }), rgba(.{ 0, 0, 1, 1 }) };
+    const firsts = [3]i32{ 0, 6, 9 };
+    const counts = [3]i32{ 6, 3, 6 };
+    const grey = [_]u8{0x80} ** (4 * 4 * 4);
+    for (0..frames) |fi| {
+        ctx.clearColor(0, 0, 0, 1);
+        ctx.clearDepth(1);
+        ctx.clear(g.COLOR_BUFFER_BIT | g.DEPTH_BUFFER_BIT);
+        ctx.enable(g.DEPTH_TEST, true);
+        ctx.depthFunc(g.LESS);
+        for (cols, firsts, counts) |col, first, count| {
+            ctx.usePipeline(&solid, &col);
+            ctx.drawArrays(g.TRIANGLES, first, count, 1);
+        }
+        if (upload_at) |at| if (fi == at) {
+            ctx.bindTexture(g.TEXTURE_2D, tex[0]);
+            ctx.texSubImage2D(g.TEXTURE_2D, 0, 0, 0, 4, 4, g.RGBA, g.UNSIGNED_BYTE, &grey);
+        };
+        try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    }
+    ctx.enable(g.DEPTH_TEST, false);
+    ctx.readPixels(0, 0, W, H, g.RGBA, g.UNSIGNED_BYTE, @ptrCast(out.ptr));
+    try std.testing.expectEqual(g.NO_ERROR, ctx.getError());
+    return .{ .tex = &objs.tex[tex[0] - 1].img, .depth = &objs.rbs[rb[0] - 1].img };
+}
+
+/// The frames' pixels as GL draws them: red, green over it, no blue.
+fn checkDepthFrame(out: []const u8) !void {
+    var red: u32 = 0;
+    var green: u32 = 0;
+    for (0..W * H) |p| {
+        const px_ = out[p * 4 ..][0..4];
+        if (px_[2] != 0) return error.BlueShowed;
+        red += @intFromBool(px_[0] == 255 and px_[1] == 0);
+        green += @intFromBool(px_[1] == 255 and px_[0] == 0);
+    }
+    try std.testing.expect(green > 100 and red > 100 and red + green == W * H);
+}
+
+var eng_gcpu: engine.Engine = undefined;
+
+test "draw: GL's depth-tested frames into a framebuffer object on the RTX: its texture made block linear once, its depth float, every depth draw on the 3D engine, nothing moved between layouts frame by frame; an upload moves it back to rows once and for good" {
+    // (the CPU's frames: the picture each run must give)
+    var want: [W * H * 4]u8 = undefined;
+    eng_gcpu.init(.{ .pool = &zpool_mem, .cpu_work = &cpu_work });
+    {
+        objs.init();
+        ctx.init(&eng_gcpu, &objs);
+        defer ctx.deinit();
+        defer eng_gcpu.unloadPipeline(&solid);
+        _ = try depthFrames(1, null, &want);
+    }
+    eng_gcpu.deinit();
+    try checkDepthFrame(&want);
+    for ([_]?u32{ null, 1 }) |upload_at| {
+        Rtx3d.engine3d = .{};
+        Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+        Rtx.dev.withEngine(&Rtx3d.engine3d);
+        eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+        defer eng_rtx.deinit();
+        objs.init();
+        ctx.init(&eng_rtx, &objs);
+        defer ctx.deinit();
+        defer eng_rtx.unloadPipeline(&solid);
+        const frames = 4;
+        var got: [W * H * 4]u8 = undefined;
+        const imgs = depthFrames(frames, upload_at, &got) catch |err| {
+            std.debug.print("GL frames (upload at {?d}): {s}; the 3D engine: {s}\n", .{ upload_at, @errorName(err), Rtx3d.engine3d.why });
+            return err;
+        };
+        const s = eng_rtx.stats;
+        std.debug.print("GL frames (upload at {?d}): {d} draws on the 3D engine, {d} on the compute kernels; promoted {d}, back to rows {d}\n", .{ upload_at, s.graphics_draws, s.compute_draws, s.promoted, s.demoted });
+        for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("GL frames: on the compute kernels: {s}\n", .{w});
+        try std.testing.expect(imgs.depth.depth_float);
+        // (made block linear at the first depth draw, never again)
+        try std.testing.expectEqual(@as(u32, 1), s.promoted);
+        if (upload_at) |at| {
+            // (the upload moved it back once; its frames after it on the
+            // compute kernels, the ones before on the engine)
+            try std.testing.expectEqual(@as(u32, 1), s.demoted);
+            try std.testing.expect(!imgs.tex.layout.block and imgs.tex.no_block);
+            try std.testing.expectEqual(@as(u64, 3 * (at + 1)), s.graphics_draws);
+            try std.testing.expectEqual(@as(u64, 3 * (frames - at - 1)), s.compute_draws);
+        } else {
+            try std.testing.expectEqual(@as(u32, 0), s.demoted);
+            try std.testing.expect(imgs.tex.layout.block);
+            try std.testing.expectEqual(@as(u64, 3 * frames), s.graphics_draws);
+            try std.testing.expectEqual(@as(u64, 0), s.compute_draws);
+        }
+        try std.testing.expectEqual(@as(u32, 0), apart(&want, &got, W, 0, "GL frames: the CPU against the RTX"));
+    }
 }
