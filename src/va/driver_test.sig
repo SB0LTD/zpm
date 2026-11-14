@@ -1347,6 +1347,10 @@ test "driver: HEVC through the fake encoder: the driver's VPS, SPS and PPS, the 
     try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_OUT_COLOC_DATA >> 2]);
     try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_IN_COLOC_DATA >> 2]);
     try testing.expectEqual(@as(u64, nvenc.PIC_CODEC_H265), nvenc.get(&enc_seen.setup, nvenc.H265.codec));
+    // (the RC data buffer and the input's V plane, as NVIDIA's driver
+    // binds them: the engine faulted without, pc-full13)
+    try testing.expect(enc_seen.methods[nvenc.SET_IN_RCDATA >> 2] != 0);
+    try testing.expectEqual(enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_U >> 2], enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_V >> 2]);
     try testing.expectEqual(@as(u64, 2), nvenc.get(&enc_seen.setup, nvenc.H265.max_cu_size));
     try testing.expectEqual(@as(u64, 4), nvenc.get(enc_seen.setup[nvenc.H265_SLICE_OFF..], nvenc.H265Slice.num_ctus));
     var out: [4 << 10]u8 = undefined;
