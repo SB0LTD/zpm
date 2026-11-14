@@ -656,7 +656,8 @@ test "libgalaxy_va: options from an environment block" {
     const t = optionsOf("GALAXY_VA_NVENC_TRY=colocboth,tiles300 av1nocolin,setup4k").nvenc_try;
     try testing.expect(t.hevc_coloc == .both and t.av1_tiles_at == 768 and !t.av1_key_colin and t.setup_4k);
     const none_t = optionsOf("GALAXY_VA_NVENC_TRY=").nvenc_try;
-    try testing.expect(none_t.hevc_coloc == .out and none_t.av1_tiles_at == 0x400 and none_t.av1_key_colin and !none_t.setup_4k);
+    try testing.expect(none_t.hevc_coloc == .out and none_t.av1_tiles_at == 0x400 and none_t.av1_key_colin and !none_t.setup_4k and none_t.coloc_apart);
+    try testing.expect(!optionsOf("GALAXY_VA_NVENC_TRY=coloctight").nvenc_try.coloc_apart);
     try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
     try testing.expect(none.encode and none.nvenc_magic == null);
     const enc = optionsOf("GALAXY_VA_ENCODE=0\x00GALAXY_VA_NVENC_MAGIC=0xc9b70006\x00");
