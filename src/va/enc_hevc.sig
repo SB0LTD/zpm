@@ -571,36 +571,12 @@ pub fn setup(buf: []u8, s: Setup) void {
         nvenc.set(c, L.collocated_ref_idx, if (s.collocated_id != va.INVALID_ID) sl.collocatedIdx(s.collocated_id) else 0);
         nvenc.set(c, L.cabac_init_flag, @intFromBool(sl.cabac_init and prm.cabac_init_present));
     }
-    nvenc.meControl(buf[nvenc.H265_ME_OFF..]);
-    const md = buf[nvenc.H265_MD_OFF..];
-    const D = nvenc.H265Md;
-    for ([_]nvenc.F{ D.luma4x4_modes, D.luma8x8_modes, D.luma16x16_modes, D.luma32x32_modes, D.luma64x64_modes }) |f| nvenc.set(md, f, 0xffff_ffff);
-    nvenc.set(md, D.luma_modes_leftbits, 0x3fff_ffff);
-    nvenc.set(md, D.cu16x16_part_2Nx2N_enable, 1);
-    nvenc.set(md, D.cu32x32_part_2Nx2N_enable, 1);
-    nvenc.set(md, D.cu64x64_part_2Nx2N_enable, @intFromBool(ctb == 6));
-    nvenc.set(md, D.intra_mode_4x4_enable, 1);
-    nvenc.set(md, D.intra_mode_8x8_enable, 1);
-    nvenc.set(md, D.intra_mode_16x16_enable, 1);
-    nvenc.set(md, D.intra_mode_32x32_enable, @intFromBool(ctb >= 5));
-    nvenc.set(md, D.intra_mode_64x64_enable, @intFromBool(ctb == 6));
-    nvenc.set(md, D.chroma_modes, 0x1f);
-    nvenc.set(md, D.tusize_4x4_enable, 1);
-    nvenc.set(md, D.tusize_8x8_enable, 1);
-    nvenc.set(md, D.tusize_16x16_enable, 1);
-    nvenc.set(md, D.tusize_32x32_enable, @intFromBool(min_tb + seq.log2_diff_max_min_transform_block_size >= 3));
-    nvenc.set(md, D.pskip_enable, 1);
-    nvenc.set(md, D.mv_cost_enable, 1);
-    nvenc.set(md, D.ip_search_mode, 0xf);
-    // the mode decision's search depth as NVIDIA's H.264 MD control sets
-    // its own (MD_NVIDIA_H264: RDO level 1, two transform searches, one
-    // SSD candidate for each intra size, early termination); this
-    // driver left them 0 before
-    nvenc.set(md, D.rdo_level, 1);
-    nvenc.set(md, D.tu_search_num_cu16, 2);
-    nvenc.set(md, D.tu_search_num_cu32, 2);
-    for (0..4) |k| nvenc.set(md, .{ .bit = D.intra_ssd_cnt_4x4.bit + 4 * @as(u32, @intCast(k)), .width = 4 }, 1);
-    nvenc.set(md, D.early_termination_ip1, 1);
+    // ME, MD and quantisation controls: NVIDIA's own on GB206 (CTBs of
+    // 32, as BLOCK_SIZES offers), and the setup bytes no field names
+    @memcpy(buf[nvenc.H265_ME_OFF..][0..nvenc.ME_NVIDIA_HEVC.len], &nvenc.ME_NVIDIA_HEVC);
+    @memcpy(buf[nvenc.H265_MD_OFF..][0..nvenc.MD_NVIDIA_HEVC.len], &nvenc.MD_NVIDIA_HEVC);
+    @memcpy(buf[nvenc.H265_Q_OFF..][0..nvenc.Q_NVIDIA_HEVC.len], &nvenc.Q_NVIDIA_HEVC);
+    for (nvenc.HEVC_EXTRAS) |e| buf[e[0]] = (buf[e[0]] & ~@as(u8, @intCast(e[2]))) | @as(u8, @intCast(e[1]));
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -722,7 +698,9 @@ test "enc_hevc: the controls near the setup, one strip of the CTB rows, the MD's
     try testing.expectEqual(@as(u64, nvenc.H265_Q_OFF), nvenc.get(&buf, H.q_control_offset));
     try testing.expectEqual(@as(u64, nvenc.H265_ME_OFF), nvenc.get(&buf, H.me_control_offset));
     try testing.expect(nvenc.get(&buf, H.me_control_offset) + nvenc.Me.SIZE <= 0x600);
-    try testing.expectEqualSlices(u8, &nvenc.ME_NVIDIA, buf[nvenc.H265_ME_OFF..][0..nvenc.Me.SIZE]);
+    try testing.expectEqualSlices(u8, &nvenc.ME_NVIDIA_HEVC, buf[nvenc.H265_ME_OFF..][0..nvenc.Me.SIZE]);
+    try testing.expectEqualSlices(u8, &nvenc.MD_NVIDIA_HEVC, buf[nvenc.H265_MD_OFF..][0..nvenc.MD_NVIDIA_HEVC.len]);
+    try testing.expectEqual(@as(u8, 0x99), buf[0x314]);
     try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.strips_in_frame));
     try testing.expectEqual(@as(u64, 34), nvenc.get(&buf, H.slice_encoding_row_num)); // 1088 / 32
     try testing.expectEqual(@as(u64, 0x80), nvenc.get(&buf, H.slice_stat_offset));
@@ -731,8 +709,7 @@ test "enc_hevc: the controls near the setup, one strip of the CTB rows, the MD's
     const md = buf[nvenc.H265_MD_OFF..];
     try testing.expectEqual(@as(u64, 1), nvenc.get(md, nvenc.H265Md.rdo_level));
     try testing.expectEqual(@as(u64, 2), nvenc.get(md, nvenc.H265Md.tu_search_num_cu16));
-    try testing.expectEqual(@as(u64, 2), nvenc.get(md, nvenc.H265Md.tu_search_num_cu32));
-    try testing.expectEqual(@as(u64, 0x1111), nvenc.get(md, .{ .bit = nvenc.H265Md.intra_ssd_cnt_4x4.bit, .width = 16 }));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(md, nvenc.H265Md.tu_search_num_cu32));
     try testing.expectEqual(@as(u64, 60 * 34), nvenc.get(buf[nvenc.H265_SLICE_OFF..], nvenc.H265Slice.num_ctus));
     // (the controls do not overlap the setup or each other)
     for (buf[nvenc.H265.SIZE - 8 .. nvenc.H265.SIZE]) |x| try testing.expectEqual(@as(u8, 0), x);
