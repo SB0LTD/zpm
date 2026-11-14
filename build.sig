@@ -1846,6 +1846,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-net-checksum", "src/net/checksum.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-ethernet", "src/net/ethernet.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-i219", "src/net/i219.sig", &.{});
+
+    // Hyper-V guest support: VMBus and the synthetic devices over it (each
+    // file imports vmbus.sig beside it)
+    _ = try addTest(ctx, test_all, "test-hyperv-vmbus", "src/hyperv/vmbus.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-keyboard", "src/hyperv/keyboard.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-mouse", "src/hyperv/mouse.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-storage", "src/hyperv/storage.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-network", "src/hyperv/network.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-ipv4", "src/net/ipv4.sig", &.{
         importEntry("net_checksum", "src/net/checksum.sig"),
     });
