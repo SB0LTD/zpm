@@ -619,15 +619,21 @@ pub fn setup(buf: []u8, s: Setup) void {
         nvenc.set(buf, c[2], p.pitch_luma);
         nvenc.set(buf, c[3], p.pitch_chroma);
     }
-    nvenc.set(buf, A.refpic_cfg_tiled_16x16, 1);
-    nvenc.set(buf, A.outputpic_cfg_tiled_16x16, 1);
+    // the reference and reconstructed pictures block linear, 2 GOBs a
+    // block (the surfaces' own layout), as NVIDIA's own driver lays them
+    // out on GB206 for every codec (the WSL capture); "tiled 16x16" (the
+    // engine's macroblock layout, which H.264 encodes with) faulted HEVC's
+    // engine on its first picture and AV1's at its second reference
+    // (pc-full13 to pc-full16, NVIDIA's own setup as the base included)
+    nvenc.set(buf, A.refpic_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
+    nvenc.set(buf, A.outputpic_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
     // (GB206's fourth surface configuration, as NVIDIA's driver fills it:
     // the reconstruction's)
     nvenc.set(buf, A.extra_cfg_frame_width_minus1, nvenc.get(buf, A.outputpic_cfg_frame_width_minus1));
     nvenc.set(buf, A.extra_cfg_frame_height_minus1, nvenc.get(buf, A.outputpic_cfg_frame_height_minus1));
     nvenc.set(buf, A.extra_cfg_sfc_pitch, nvenc.get(buf, A.outputpic_cfg_sfc_pitch));
     nvenc.set(buf, A.extra_cfg_sfc_pitch_chroma, nvenc.get(buf, A.outputpic_cfg_sfc_pitch_chroma));
-    nvenc.set(buf, A.extra_cfg_tiled_16x16, 1);
+    nvenc.set(buf, A.extra_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
     nvenc.set(buf, A.codec, nvenc.PIC_CODEC_AV1);
     // (the word NVIDIA's driver writes 16 bytes past the GP timer on GB206,
     // as 8 past HEVC's: 0x999; meaning not public)
@@ -950,6 +956,10 @@ test "enc_av1: an inter frame's setup: the lists by name, sign bias, the tile" {
     const planes = h264.Planes{ .luma = 0, .chroma = 0, .pitch_luma = 256, .pitch_chroma = 256 };
     setup(&b, .{ .frame = f, .pic = &pic, .input = planes, .recon = planes, .ref_ids = .{va.INVALID_ID} ** 8, .framerate = 30, .gop_length = 120, .bitstream_start = 64, .bitstream_room = 1 << 20, .history_bytes = 1 << 20 });
     try testing.expectEqual(@as(u64, 1), nvenc.get(&b, A.pic_type)); // B
+    // (the reference and reconstructed pictures block linear, as NVIDIA's)
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&b, A.outputpic_cfg_tiled_16x16));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&b, A.outputpic_cfg_block_height));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&b, A.extra_cfg_block_height));
     try testing.expectEqual(@as(u64, 2), nvenc.get(&b, A.num_ref_idx_l0_active));
     try testing.expectEqual(@as(u64, 1), nvenc.get(&b, A.num_ref_idx_l1_active));
     try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(A.l0, 0)));

@@ -2088,8 +2088,13 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                     const hex = std.fmt.bytesToHex(r.*, .lower);
                     d.say("dump {s} {d} setup {x:0>4}: {s}", .{ @tagName(c.enc.kind), c.decodes, row, &hex });
                 }
-                var mline: [1600]u8 = undefined;
-                d.say("dump {s} {d} methods: {s}", .{ @tagName(c.enc.kind), c.decodes, encode.pushLine(&mline, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords]) });
+                // (ten methods a line: the log cuts long lines)
+                var mline: [400]u8 = undefined;
+                const all = words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords];
+                var at: usize = 0;
+                while (at < all.len) : (at += 20) {
+                    d.say("dump {s} {d} methods {d}: {s}", .{ @tagName(c.enc.kind), c.decodes, at / 2, encode.pushLine(&mline, all[at..@min(all.len, at + 20)]) });
+                }
             }
             const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {
                 d.say("an encode was not submitted ({s})", .{@errorName(e)});

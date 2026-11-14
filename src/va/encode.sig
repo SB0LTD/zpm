@@ -537,6 +537,9 @@ pub const Try = struct {
     hevc_template: bool = false,
     /// the same for AV1 (a key or inter frame's: "av1template")
     av1_template: bool = false,
+    /// HEVC's slice mode as NVIDIA's driver writes it: dynamic, no strip
+    /// rows ("hevcslice0")
+    hevc_slice0: bool = false,
     /// the co-located buffers apart from the history and 1 MiB aligned
     /// (scratchSizesPlaced; the default), or packed after the history as
     /// before pc-full12 ("coloctight")
@@ -556,6 +559,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "coloctight")) t.coloc_apart = false;
             if (std.ascii.eqlIgnoreCase(w, "hevctemplate")) t.hevc_template = true;
             if (std.ascii.eqlIgnoreCase(w, "av1template")) t.av1_template = true;
+            if (std.ascii.eqlIgnoreCase(w, "hevcslice0")) t.hevc_slice0 = true;
         }
         return t;
     }
@@ -820,6 +824,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
                 .history_bytes = @intCast(in.scratch.sizes.history),
                 .magic = in.magic,
                 .template = in.try_.hevc_template,
+                .slice0 = in.try_.hevc_slice0,
             });
             a.application_id = nvenc.APPLICATION_ID_H265;
             a.codec_type = nvenc.CODEC_TYPE_H265;
