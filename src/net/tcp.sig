@@ -35,7 +35,13 @@ const ipv4 = @import("net_ipv4");
 
 pub const HEADER_MIN: usize = 20;
 pub const HEADER_MAX: usize = 60; // With options
-pub const MAX_CONNECTIONS: usize = 32;
+/// Connections at once, for every app and the kernel together. 32 ran out
+/// in Galaxy with one Firefox window on a news site (81 connects refused in
+/// a minute, then every other page and the assistant's searches failed): a
+/// browser keeps several connections to each of a page's many hosts. Each
+/// slot is static (RECV_BUF_SIZE + SEND_BUF_SIZE, 544 KiB): 128 is 68 MiB.
+/// Handles are u8 and callers keep 0xff as "no slot", so at most 254.
+pub const MAX_CONNECTIONS: usize = 128;
 pub const RECV_BUF_SIZE: usize = 512 * 1024; // the window: at 64 KiB a download ran at ~2-3 MB/s (window / round trip)
 pub const SEND_BUF_SIZE: usize = 32 * 1024;
 pub const DEFAULT_MSS: u16 = 1460; // Ethernet MTU - IP(20) - TCP(20)
@@ -1889,6 +1895,23 @@ test "tcp: timeout and fast-recovery window arithmetic" {
     rtt.update(100_000);
     try testing.expect(rtt.has_sample);
     try testing.expectEqual(@as(u32, 100_000 << 3), rtt.srtt);
+}
+
+test "tcp: a browser's burst of connects fits; the slot after the last is refused" {
+    resetPool();
+    var handles: [MAX_CONNECTIONS]u8 = undefined;
+    for (&handles, 0..) |*h, i| {
+        h.* = connect(CLIENT_IP, SERVER_IP, @intCast(443 + (i % 8))) orelse return error.Pool;
+        for (handles[0..i]) |o| {
+            try testing.expect(o != h.*);
+            try testing.expect(localPort(o) != localPort(h.*));
+        }
+    }
+    try testing.expect(MAX_CONNECTIONS >= 128);
+    try testing.expect(connect(CLIENT_IP, SERVER_IP, 443) == null);
+    abort(handles[17]);
+    try testing.expect(connect(CLIENT_IP, SERVER_IP, 443) != null);
+    for (handles) |h| abort(h);
 }
 
 test "tcp: connect and listen allocate slots; abort frees them" {
