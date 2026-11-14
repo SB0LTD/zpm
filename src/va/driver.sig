@@ -1295,7 +1295,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         fn createEncodeContext(d: *Self, i: u8, config: u32, cfg: *const Config, width: u32, height: u32, out: *u32) va.Status {
             if (enc_vpx.supported(cfg.profile)) |vk| return d.createVpxContext(i, config, cfg, vk, width, height, out);
             const kind = encode.supported(cfg.profile) orelse return va.ERROR_UNSUPPORTED_PROFILE;
-            const sz = encode.scratchSizesFor(kind, width, height);
+            const sz = encode.scratchSizesPlaced(kind, width, height, d.opts.nvenc_try.coloc_apart);
             const scratch_off = FRAMES * ENC_FRAME_BYTES;
             var work = d.node.alloc(scratch_off + sz.total, 0) orelse return va.ERROR_ALLOCATION_FAILED;
             if (!nvenc.addressable(work.va) or !nvenc.addressable(work.va + work.len - 256)) {
@@ -2069,7 +2069,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 var line: [400]u8 = undefined;
                 d.say("{s}", .{encode.setupLine(&line, c.enc.kind, frame[setup_off..][0..nvenc.SETUP_BYTES])});
                 const t = d.opts.nvenc_try;
-                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, av1 tiles at 0x{x}, av1 key frame co-located in {s}, setup at 0x{x} of its slot", .{ @tagName(t.hevc_coloc), t.av1_tiles_at, if (t.av1_key_colin) "bound" else "none", setup_off });
+                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 key frame co-located in {s}, setup at 0x{x} of its slot", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_key_colin) "bound" else "none", setup_off });
                 d.say("first picture's methods: {s}", .{encode.pushLine(&line, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords])});
             }
             const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {

@@ -478,6 +478,7 @@ pub const Scratch = struct {
         return s.base + s.sizes.rc_off;
     }
     pub fn coloc(s: Scratch, k: usize) u64 {
+        if (s.sizes.coloc_align != 0) return std.mem.alignForward(u64, s.base + s.sizes.coloc_off, s.sizes.coloc_align) + k * s.sizes.coloc;
         return s.base + s.sizes.coloc_off + k * s.sizes.coloc;
     }
     /// MEPRED buffer `k` (0, 1)
@@ -525,6 +526,10 @@ pub const Try = struct {
     av1_key_colin: bool = true,
     /// the setup 4 KiB aligned in its frame slot ("setup4k"; the driver's)
     setup_4k: bool = false,
+    /// the co-located buffers apart from the history and 1 MiB aligned
+    /// (scratchSizesPlaced; the default), or packed after the history as
+    /// before pc-full12 ("coloctight")
+    coloc_apart: bool = true,
 
     /// The words of `v` (others ignored).
     pub fn parse(v: []const u8) Try {
@@ -537,6 +542,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "tiles300")) t.av1_tiles_at = nvenc.Av1.SIZE;
             if (std.ascii.eqlIgnoreCase(w, "av1nocolin")) t.av1_key_colin = false;
             if (std.ascii.eqlIgnoreCase(w, "setup4k")) t.setup_4k = true;
+            if (std.ascii.eqlIgnoreCase(w, "coloctight")) t.coloc_apart = false;
         }
         return t;
     }
@@ -1282,6 +1288,10 @@ pub const ScratchSizes = struct {
     history_off: usize = 0,
     coloc: usize,
     coloc_off: usize,
+    /// the co-located buffers apart (Try.coloc_apart): each this aligned
+    /// by its GPU address (the scratch keeps room to align the first);
+    /// 0, packed after the history
+    coloc_align: usize = 0,
     rc: usize,
     rc_off: usize,
     mepred: usize = 0,
@@ -1299,7 +1309,20 @@ pub fn scratchSizes(width: u32, height: u32) ScratchSizes {
     return scratchSizesFor(.h264, width, height);
 }
 
+/// How far apart (and aligned) the co-located buffers go with
+/// Try.coloc_apart.
+pub const COLOC_APART: usize = 1 << 20;
+
 pub fn scratchSizesFor(kind: Codec, width: u32, height: u32) ScratchSizes {
+    return scratchSizesPlaced(kind, width, height, false);
+}
+
+/// The scratch's layout; `apart`: the co-located buffers last, each
+/// COLOC_APART aligned by GPU address and that long, clear of the history
+/// whatever the engine takes it to need (Try.coloc_apart: HEVC's
+/// co-located output packed after the history, 8 KiB aligned, stopped
+/// with COLLOC_OFFSET on pc-full8 and pc-full11).
+pub fn scratchSizesPlaced(kind: Codec, width: u32, height: u32, apart: bool) ScratchSizes {
     const wmbs: usize = (width + 15) / 16;
     const hmbs: usize = (height + 15) / 16;
     const lines = av1.Lines.of(width, height);
@@ -1317,6 +1340,22 @@ pub fn scratchSizesFor(kind: Codec, width: u32, height: u32) ScratchSizes {
         s.lines_off = s.defaults_off + 4 * av1.CDF_BYTES;
         s.lines = lines;
         s.total = s.lines_off + 3 * lines.above + 3 * lines.left;
+    }
+    if (apart) {
+        // (the rest moved down over where the co-located buffers were)
+        const gap = KEPT * coloc;
+        s.rc_off -= gap;
+        s.mepred_off -= gap;
+        if (kind == .av1) {
+            s.cdf_off -= gap;
+            s.defaults_off -= gap;
+            s.lines_off -= gap;
+        }
+        s.total -= gap;
+        s.coloc = std.mem.alignForward(usize, coloc, COLOC_APART);
+        s.coloc_off = std.mem.alignForward(usize, s.total, 4096);
+        s.coloc_align = COLOC_APART;
+        s.total = s.coloc_off + COLOC_APART + KEPT * s.coloc;
     }
     return s;
 }
@@ -1462,6 +1501,28 @@ test "encode: the scratch holds a whole picture's history and two MEPRED buffers
     const a = scratchSizesFor(.av1, 1920, 1088);
     try testing.expect(a.history >= nvenc.historyBytes(120, 68));
     try testing.expect(a.lines_off >= a.mepred_off + 2 * a.mepred);
+}
+
+test "encode: the co-located buffers apart: last, aligned by GPU address, inside the scratch" {
+    for ([_]Codec{ .h264, .hevc, .av1 }) |kind| {
+        const t = scratchSizesFor(kind, 1920, 1088);
+        const s = scratchSizesPlaced(kind, 1920, 1088, true);
+        try testing.expectEqual(t.history, s.history);
+        try testing.expectEqual(t.rc_off - KEPT * t.coloc, s.rc_off);
+        try testing.expect(s.coloc_off >= s.mepred_off + 2 * s.mepred);
+        if (kind == .av1) try testing.expect(s.coloc_off >= s.lines_off + 3 * s.lines.above + 3 * s.lines.left);
+        var cpu: [1]u8 = undefined;
+        for ([_]u64{ 0x40_eee0_8000, 0x41_0000_0000, 0x40_0012_3400 }) |base| {
+            const sc = Scratch{ .base = base, .cpu = &cpu, .sizes = s };
+            for (0..KEPT) |k| {
+                const a = sc.coloc(k);
+                try testing.expectEqual(@as(u64, 0), a % COLOC_APART);
+                try testing.expect(a >= base + s.coloc_off and a + s.coloc <= base + s.total);
+                // (clear of the history: at least 1 MiB past it)
+                try testing.expect(a >= base + s.history + COLOC_APART);
+            }
+        }
+    }
 }
 
 test "encode: kept surfaces: an entry per reference, reused once no list names it" {
