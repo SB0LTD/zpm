@@ -119,7 +119,9 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     // live too: its size is the buffer's)
     const bytes: u64 = if (img.buf.cpu.len != 0) img.buf.cpu.len else if (img.buf.gpu != 0) img.buf.bytes else 0;
     if (img.width == 0 or bytes == 0) return;
-    const fmt = img.format;
+    // (a float depth image, engine.Image.depth_float: its depth plane read
+    // as R32F, the depths themselves; its words never d24s8's)
+    const fmt: @TypeOf(img.format) = if (img.depth_float) .r32f else img.format;
     out[D_W] = img.width;
     out[D_H] = img.height;
     out[D_STRIDE] = img.stride;

@@ -326,12 +326,19 @@ pub const Stamp = struct { buf: Buffer, off: u64 };
 /// and those after it see its own.
 pub const Graphics = struct {
     vertex: *const Program,
-    /// The colour target: rows of `stride` bytes from `va`.
+    /// The colour target: rows of `stride` bytes from `va`, or block
+    /// linear (`gobs_log2`).
     va: u64,
     width: u32,
     height: u32,
     stride: u32,
     format: TargetFormat,
+    /// The colour targets (this and `more`) block linear: one GOB wide
+    /// and deep, blocks of 2^n GOBs high, `stride` bytes across (whole
+    /// GOBs), Turing2D's GOBs as the depth target's; null: rows of bytes.
+    /// The RTX's 3D engine draws with a depth target only into block-linear
+    /// colour targets (RT_LINEAR_WITH_ZETA: nvidia/gl3d.whyNot).
+    gobs_log2: ?u3 = null,
     /// The channels written (bit 0 red .. bit 3 alpha).
     mask: u4 = 0xf,
     blend: ?GraphicsBlend = null,
@@ -388,8 +395,18 @@ pub const Graphics = struct {
         zfail: StencilOp = .keep,
         zpass: StencilOp = .keep,
     };
+    /// Block linear, 32-bit words, depth in bits 0..23 (the RTX's X8Z24;
+    /// bits 24..31 the engine's), and for a stencil test its stencil a
+    /// plane of its own (`stencil_va`: S8, Blackwell's 8-bit GOBs, whole
+    /// GOBs across, the depth's block height): Blackwell refuses a
+    /// combined depth-stencil target (nvidia/gl3d.sig).
     pub const Depth = struct {
         va: u64,
+        stencil_va: ?u64 = null,
+        /// 32-bit float depths (ZF32: Turing2D's GOBs, the CPU may read
+        /// and write them); else 24-bit (Blackwell's own Z24 GOBs, whose
+        /// layout is not public: the engine's alone).
+        float: bool = false,
         width: u32,
         height: u32,
         gobs_log2: u3,

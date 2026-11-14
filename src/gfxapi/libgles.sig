@@ -25,18 +25,35 @@ const Context = gles.Context;
 /// A failed check in the driver (on Linux): one line on stderr, then the
 /// program ends, as after a failed assertion in a C driver. No stack walk
 /// and no thread-local state (std's default handler has both), so the
-/// library needs nothing of the C library that loaded it.
+/// library needs nothing of the C library that loaded it. The line says
+/// where it failed as an offset from this function (`at stop+0x...`): the
+/// same build unstripped (`nm` for stop's address, plus the offset, into
+/// `addr2line`) gives the source line, wherever the program or library
+/// was loaded.
 pub const panic = if (builtin.os.tag == .linux) std.debug.FullPanic(stop) else std.debug.FullPanic(std.debug.defaultPanic);
 
 fn stop(msg: []const u8, ra: ?usize) noreturn {
     @branchHint(.cold);
-    _ = ra;
     const linux = std.os.linux;
-    const head = "libGLESv2 (Galaxy): ";
-    _ = linux.write(2, head, head.len);
-    _ = linux.write(2, msg.ptr, msg.len);
-    _ = linux.write(2, "\n", 1);
+    var line: [320]u8 = undefined;
+    const out = stopLine(&line, msg, ra orelse @returnAddress(), @intFromPtr(&stop));
+    _ = linux.write(2, out.ptr, out.len);
     linux.exit_group(134);
+}
+
+/// stop's line: the message and where, from stop's own address.
+fn stopLine(buf: []u8, msg: []const u8, at: usize, base: usize) []const u8 {
+    const sign: u8 = if (at >= base) '+' else '-';
+    const off = if (at >= base) at - base else base - at;
+    return std.fmt.bufPrint(buf, "libGLESv2 (Galaxy): {s} (at stop{c}0x{x})\n", .{ msg, sign, off }) catch msg;
+}
+
+test "libgles: a failed check's line says where, from stop" {
+    var buf: [320]u8 = undefined;
+    try std.testing.expectEqualStrings("libGLESv2 (Galaxy): integer overflow (at stop+0x1a2b)\n", stopLine(&buf, "integer overflow", 0x10_1a2b, 0x10_0000));
+    try std.testing.expectEqualStrings("libGLESv2 (Galaxy): x (at stop-0x10)\n", stopLine(&buf, "x", 0xff0, 0x1000));
+    var small: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("too long a message", stopLine(&small, "too long a message", 1, 0));
 }
 
 // ── The current context, per thread (thread.sig) ───────────────────────────

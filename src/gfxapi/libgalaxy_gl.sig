@@ -88,6 +88,12 @@ fn openDriver() ?*engine.Engine {
         return null;
     };
     const check_px = checkAsked();
+    // (GALAXY_GL_ZF32=0: depth renderbuffers packed 24-bit, every depth
+    // and stencil draw on the compute kernels)
+    const zf32 = !envRefused("GALAXY_GL_ZF32=");
+    // (GALAXY_GL_BLOCK=0: GL's render targets stay rows, depth and
+    // stencil draws into them on the compute kernels)
+    const block = !envRefused("GALAXY_GL_BLOCK=");
     the_engine.init(.{
         .dev = d,
         .compiler = G.compile,
@@ -97,10 +103,14 @@ fn openDriver() ?*engine.Engine {
         .cpu_work = &cpu_work,
         .check = if (check_px) |px| .{ .mem = anonymous(CHECK_BYTES), .max_px = px } else .{},
         .graphics = d.caps.graphics,
+        .depth_float = zf32,
+        .block_targets = block,
     });
     if (want3d) {
         if (the_engine.graphics) {
             report.say(.device, "the RTX's 3D engine draws what it takes (GALAXY_GL_3D): its rasterizer, texture units and blender; the compute kernels the rest", .{});
+            if (!the_engine.depth_float) report.say(.device, "depth renderbuffers packed 24-bit (GALAXY_GL_ZF32=0): depth and stencil draws on the compute kernels", .{});
+            if (!the_engine.block_targets) report.say(.device, "GL's render targets kept rows (GALAXY_GL_BLOCK=0): depth and stencil draws on the compute kernels", .{});
         } else report.say(.device, "GALAXY_GL_3D asked, but the GPU offers no 3D engine (NV.TXT draw3d): the compute kernels draw", .{});
     }
     if (!the_engine.onGpu()) {
@@ -165,6 +175,32 @@ fn envAsked(key: []const u8) bool {
 }
 
 /// `key` set to 1 or on in an environment block.
+/// Whether the environment turns `key` (a switch on by default) off: 0
+/// or off.
+fn envRefused(key: []const u8) bool {
+    if (comptime !on_linux) return false;
+    const fd = sysResult(linux.openat(linux.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    if (fd < 0) return false;
+    defer _ = linux.close(@intCast(fd));
+    var n: usize = 0;
+    while (n < env_buf.len) {
+        const r = sysResult(linux.read(@intCast(fd), env_buf[n..].ptr, env_buf.len - n));
+        if (r <= 0) break;
+        n += @intCast(r);
+    }
+    return offIn(env_buf[0..n], key);
+}
+
+fn offIn(block: []const u8, key: []const u8) bool {
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |kv| {
+        if (!std.mem.startsWith(u8, kv, key)) continue;
+        const v = std.mem.trim(u8, kv[key.len..], " ");
+        return std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off");
+    }
+    return false;
+}
+
 fn onIn(block: []const u8, key: []const u8) bool {
     var it = std.mem.splitScalar(u8, block, 0);
     while (it.next()) |kv| {
@@ -179,6 +215,10 @@ test "libgalaxy-gl: GALAXY_GL_3D from an environment block" {
     try std.testing.expect(onIn("A=1\x00GALAXY_GL_3D=1\x00", "GALAXY_GL_3D="));
     try std.testing.expect(!onIn("GALAXY_GL_3D=0", "GALAXY_GL_3D="));
     try std.testing.expect(!onIn("HOME=/\x00", "GALAXY_GL_3D="));
+    // (switches on by default: off only when said)
+    try std.testing.expect(offIn("A=1\x00GALAXY_GL_ZF32=0\x00", "GALAXY_GL_ZF32="));
+    try std.testing.expect(!offIn("GALAXY_GL_ZF32=1", "GALAXY_GL_ZF32="));
+    try std.testing.expect(!offIn("HOME=/\x00", "GALAXY_GL_ZF32="));
 }
 
 /// GALAXY_GL_CHECK's pixels in an environment block (NUL-separated).
