@@ -46,8 +46,11 @@
 //! GALAXY_VA_NVENC_MAGIC=hex sets another; the status says BAD_MAGIC when
 //! wrong), the input's block height, the codec type numbers for HEVC, the
 //! ME/MD tuning, and how many bytes the engine says it wrote. On pc-1111h
-//! (GB206) intra pictures encoded and every inter picture failed; the
-//! inter setup is now NVIDIA's own driver's (nvenc.meControl), unbooted.
+//! and pc-all (GB206) no NVENC picture encoded, intra ones included
+//! (H.264's IDR lost its channel, Xid 47; HEVC's and AV1's reported ucode
+//! errors 13 and 3); the H.264 setup is now laid out as NVIDIA's own
+//! driver's (nvenc.H264_*_OFF, MD/Q/ME controls), unbooted; each
+//! picture's status words are said (encode.reportLine).
 //!
 //! Untested until a boot on the PC — everything that touches the real
 //! decoder: that GB206's NVCFB0 takes Ada's methods and Ada's
@@ -86,6 +89,8 @@ const driver = @import("driver.sig");
 const codec = @import("codec.sig");
 const vp9 = @import("vp9.sig");
 const node = @import("node.sig");
+const tiling = @import("tiling.sig");
+const encode = @import("encode.sig");
 const linux = std.os.linux;
 
 /// A failed check in the driver: one line on stderr, then the program
@@ -274,7 +279,8 @@ fn options() driver.Options {
 /// after a decode at its EndPicture, as before the pipeline),
 /// GALAXY_VA_SCRATCH ("vram": H.264's decoder-only buffers in VRAM),
 /// GALAXY_VA_GOB
-/// ("turing": Turing's GOB layout instead of Blackwell's), GALAXY_VA_PROBE
+/// ("turing": Turing's GOB layout instead of Blackwell's; "b8", "b16",
+/// "swapped": test readings of the encoder's input, tiling.Gob), GALAXY_VA_PROBE
 /// ("0": no decoder probe at init), GALAXY_VA_BLACKWELL and
 /// GALAXY_VA_{HEVC,VP9,AV1}_BLACKWELL (Blackwell's additions, codec.Blackwell:
 /// "full" or "1" the default, "buffer", "fields", "off" or "0"; a codec's own
@@ -284,7 +290,8 @@ fn options() driver.Options {
 /// default, "tiles"), GALAXY_VA_ENCODE ("0": no
 /// encode entrypoints), GALAXY_VA_NVENC_MAGIC (hex: the encoder setup's
 /// magic word), GALAXY_VA_NVENC_RC ("firmware": the encoder's own rate
-/// control), GALAXY_VA_NVENC_B ("1": B pictures on the encoder), from an
+/// control), GALAXY_VA_NVENC_B ("1": B pictures on the encoder),
+/// GALAXY_VA_NVENC_TRY (readings of HEVC's and AV1's setups: encode.Try), from an
 /// environment block. Values not understood leave the
 /// default.
 pub fn optionsOf(block: []const u8) driver.Options {
@@ -301,7 +308,7 @@ pub fn optionsOf(block: []const u8) driver.Options {
         if (std.mem.eql(u8, k, "GALAXY_VA_DEBUG")) {
             o.debug = v.len != 0 and !std.mem.eql(u8, v, "0");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_GOB")) {
-            o.gob = if (std.ascii.eqlIgnoreCase(v, "turing")) .turing else .blackwell;
+            o.gob = tiling.Gob.named(v);
         } else if (std.mem.eql(u8, k, "GALAXY_VA_PROBE")) {
             o.probe = !std.mem.eql(u8, v, "0");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_SERIAL")) {
@@ -333,6 +340,11 @@ pub fn optionsOf(block: []const u8) driver.Options {
         } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_RC")) {
             // ("firmware": the encoder's own CBR/VBR, enc_rc.sig)
             o.nvenc_rc_firmware = std.ascii.eqlIgnoreCase(v, "firmware");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_DUMP")) {
+            o.nvenc_dump = v.len != 0 and !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_TRY")) {
+            // (readings of HEVC's and AV1's setups for a test boot)
+            o.nvenc_try = encode.Try.parse(v);
         } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_ENCODE")) {
             o.vpx_encode = !std.mem.eql(u8, v, "0");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_GPU")) {
@@ -639,6 +651,18 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expect(!none.debug and none.probe and none.gob == .blackwell);
     const all = optionsOf("GALAXY_VA_DEBUG=1\x00GALAXY_VA_GOB=Turing\x00GALAXY_VA_PROBE=0\x00");
     try testing.expect(all.debug and !all.probe and all.gob == .turing);
+    try testing.expectEqual(tiling.Gob.b8, optionsOf("GALAXY_VA_GOB=b8").gob);
+    try testing.expectEqual(tiling.Gob.b16, optionsOf("GALAXY_VA_GOB=B16").gob);
+    try testing.expectEqual(tiling.Gob.swapped, optionsOf("GALAXY_VA_GOB=swapped").gob);
+    try testing.expectEqual(tiling.Gob.blackwell, optionsOf("GALAXY_VA_GOB=other").gob);
+    const t = optionsOf("GALAXY_VA_NVENC_TRY=colocboth,tiles300 av1coloc,setup4k").nvenc_try;
+    try testing.expect(t.hevc_coloc == .both and t.av1_tiles_at == 800 and t.av1_coloc and t.setup_4k);
+    const none_t = optionsOf("GALAXY_VA_NVENC_TRY=").nvenc_try;
+    try testing.expect(none_t.hevc_coloc == .tmvp and none_t.av1_tiles_at == 0x400 and !none_t.av1_coloc and !none_t.setup_4k and none_t.coloc_apart);
+    try testing.expect(!optionsOf("GALAXY_VA_NVENC_TRY=coloctight").nvenc_try.coloc_apart);
+    const tt = optionsOf("GALAXY_VA_NVENC_TRY=hevctemplate,av1template").nvenc_try;
+    try testing.expect(tt.hevc_template and tt.av1_template and !none_t.hevc_template and !none_t.av1_template);
+    try testing.expect(optionsOf("GALAXY_VA_NVENC_DUMP=1").nvenc_dump and !optionsOf("GALAXY_VA_NVENC_DUMP=0").nvenc_dump and !none.nvenc_dump);
     try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
     try testing.expect(none.encode and none.nvenc_magic == null);
     const enc = optionsOf("GALAXY_VA_ENCODE=0\x00GALAXY_VA_NVENC_MAGIC=0xc9b70006\x00");

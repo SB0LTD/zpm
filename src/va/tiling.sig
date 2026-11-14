@@ -59,19 +59,43 @@ pub const Swizzle = enum {
 };
 
 /// Which GPU generation's layouts the decoder writes.
+///
+/// `b8`, `b16` and `swapped` are readings for a test boot, not layouts
+/// any decoder writes: every 8- and 16-bit plane in Blackwell's 8-bit
+/// swizzle, every one in its 16-bit swizzle, or the two the other way
+/// round (Y 16-bit, UV 8-bit). Uploads made under them are what NVENC
+/// is asked to read, so one boot can try each reading of the encoder's
+/// input: which in-GOB swizzle GB206's NVENC reads is not public, and
+/// with Blackwell's (the one NVDEC writes) H.264 came out at PSNR 27
+/// (pc-full8: testsrc2 at 4 Mbit/s, chroma worst, P pictures mostly
+/// intra), as a picture read with its 64x8 GOBs scrambled would.
 pub const Gob = enum {
     turing,
     blackwell,
+    b8,
+    b16,
+    swapped,
 
     /// The swizzle of a plane of `texel` bytes a texel (drm_fourcc.h's
     /// GB20x sector layouts: 8 bpp, 16 bpp, and 32+ bpp as before GB20x).
     pub fn forTexel(g: Gob, texel: u32) Swizzle {
-        if (g == .turing) return .turing2d;
-        return switch (texel) {
-            1 => .blackwell8,
-            2 => .blackwell16,
-            else => .turing2d,
+        if (g == .turing or texel > 2) return .turing2d;
+        return switch (g) {
+            .turing => unreachable,
+            .blackwell => if (texel == 1) .blackwell8 else .blackwell16,
+            .b8 => .blackwell8,
+            .b16 => .blackwell16,
+            .swapped => if (texel == 1) .blackwell16 else .blackwell8,
         };
+    }
+
+    /// GALAXY_VA_GOB's value: "turing", "b8", "b16", "swapped"; anything
+    /// else Blackwell's.
+    pub fn named(v: []const u8) Gob {
+        inline for (.{ Gob.turing, Gob.b8, Gob.b16, Gob.swapped }) |g| {
+            if (std.ascii.eqlIgnoreCase(v, @tagName(g))) return g;
+        }
+        return .blackwell;
     }
     /// NV12's planes: Y (R8), UV (GR88).
     pub fn luma(g: Gob) Swizzle {
@@ -81,6 +105,23 @@ pub const Gob = enum {
         return g.forTexel(2);
     }
 };
+
+test "tiling: the GOB readings: each plane's swizzle" {
+    const S = Swizzle;
+    const cases = [_]struct { Gob, S, S, S }{
+        .{ .blackwell, .blackwell8, .blackwell16, .turing2d },
+        .{ .turing, .turing2d, .turing2d, .turing2d },
+        .{ .b8, .blackwell8, .blackwell8, .turing2d },
+        .{ .b16, .blackwell16, .blackwell16, .turing2d },
+        .{ .swapped, .blackwell16, .blackwell8, .turing2d },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c[1], c[0].luma());
+        try std.testing.expectEqual(c[2], c[0].chroma());
+        // (P010's UV pairs: 32-bit, Turing's on every reading)
+        try std.testing.expectEqual(c[3], c[0].forTexel(4));
+    }
+}
 
 // ── DRM format modifiers (drm_fourcc.h) ─────────────────────────────────────
 

@@ -851,6 +851,10 @@ fn fakeEncode(k: *Fake, sub: Fake.Submit) void {
     const out = at(k, &m, nvenc.SET_OUT_BITSTREAM, start + (64 << 10))[start..];
     const n = if (h264) pcmSlice(k, &m, setup, out) else fakeHevcSlice(out);
     const stat = at(k, &m, nvenc.SET_OUT_ENC_STATUS, nvenc.Stat.SIZE);
+    // (as NVIDIA's engine writes every picture's: its index back, and
+    // error_status 2, routine)
+    nvenc.set(stat, nvenc.Stat.picture_index, m[nvenc.SET_PICTURE_INDEX >> 2]);
+    nvenc.set(stat, nvenc.Stat.error_status, 2);
     nvenc.set(stat, nvenc.Stat.total_bit_count, n * 8);
     nvenc.set(stat, nvenc.Stat.num_slices, 1);
 }
@@ -877,8 +881,9 @@ fn pcmSlice(k: *Fake, m: []const u32, setup: []const u8, out: []u8) usize {
     const cp = tiling.Plane.of(pitch, @intCast(h / 2));
     const luma = at(k, m, nvenc.SET_IN_CUR_PIC, @intCast(lp.bytes()));
     const chroma = at(k, m, nvenc.SET_IN_CUR_PIC_CHROMA_U, @intCast(cp.bytes()));
-    tiling.detile(&pcm_y, w, luma, lp, .blackwell8, w, h);
-    tiling.detile(&pcm_uv, w, chroma, cp, .blackwell16, w, h / 2);
+    // (GB206's NVENC reads its input in Turing's GOBs: pc-full9)
+    tiling.detile(&pcm_y, w, luma, lp, .turing2d, w, h);
+    tiling.detile(&pcm_uv, w, chroma, cp, .turing2d, w, h / 2);
     const pic_type = nvenc.get(setup, H.pic_type);
     const idr = pic_type == 3;
     const intra = pic_type >= 2;
@@ -899,7 +904,7 @@ fn pcmSlice(k: *Fake, m: []const u32, setup: []const u8, out: []u8) usize {
     wr.flag(false);
     if (idr) wr.flag(false);
     const init_qp = 26 + signExtend(nvenc.get(setup, H.pic_init_qp_minus26), 6);
-    const qp: i32 = @intCast(nvenc.get(setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H264Slice.qp_avr));
+    const qp: i32 = @intCast(nvenc.get(setup[@intCast(nvenc.get(setup, H.slice_control_offset))..], nvenc.H264Slice.qp_avr));
     wr.se(qp - init_qp);
     // (deblocking off: the samples stay exact)
     if (nvenc.get(setup, H.deblocking_filter_control_present_flag) != 0) wr.ue(1);
@@ -1174,34 +1179,41 @@ test "driver: H.264 through the fake encoder: an IDR then a P picture, the strea
     const in0 = &d.surfaces[surfaces[0] - SURFACE_BASE];
     const rec0 = &d.surfaces[surfaces[2] - SURFACE_BASE];
     const cb = &d.coded[d.buffers[coded - driver.BUFFER_BASE].coded];
-    try testing.expectEqual(nvenc.shifted(in0.tiled.va), enc_seen.methods[nvenc.SET_IN_CUR_PIC >> 2]);
-    try testing.expectEqual(nvenc.shifted(in0.tiled.va + in0.layout.chroma_offset), enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_U >> 2]);
+    // (the engine reads the frame slot's Turing copy of the input, not
+    // the surface's Blackwell-laid picture)
+    try testing.expect(c.enc_input[0].handle != 0);
+    try testing.expectEqual(nvenc.shifted(c.enc_input[0].va), enc_seen.methods[nvenc.SET_IN_CUR_PIC >> 2]);
+    try testing.expectEqual(nvenc.shifted(c.enc_input[0].va + in0.layout.chroma_offset), enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_U >> 2]);
     try testing.expectEqual(nvenc.shifted(rec0.tiled.va), enc_seen.methods[nvenc.SET_OUT_REF_PIC_LUMA >> 2]);
-    try testing.expectEqual(nvenc.shifted(cb.buf.va + encode.DATA_OFF), enc_seen.methods[nvenc.SET_OUT_BITSTREAM >> 2]);
+    // (the engine's slices 256-byte aligned, past the headers' room)
+    try testing.expectEqual(nvenc.shifted(cb.buf.va + encode.SLICES_OFF), enc_seen.methods[nvenc.SET_OUT_BITSTREAM >> 2]);
     try testing.expectEqual(nvenc.shifted(cb.buf.va + encode.STATUS_OFF), enc_seen.methods[nvenc.SET_OUT_ENC_STATUS >> 2]);
     try testing.expectEqual(nvenc.shifted(c.work.va + driver.ENC_SETUP_OFF), enc_seen.methods[nvenc.SET_IN_DRV_PIC_SETUP >> 2]);
     try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_IN_REF_PIC0_LUMA >> 2]);
-    // (an intra picture: no motion search buffers, its co-located motion
-    // written, none read; the lists empty, as NVIDIA's driver leaves them)
+    // (an intra picture: no motion search buffers, no co-located motion
+    // in or out without B pictures, as NVIDIA's driver binds them on its
+    // I and P pictures; the lists empty, as it leaves them)
     try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_IN_MEPRED_DATA >> 2]);
     try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_IN_COLOC_DATA >> 2]);
-    try testing.expect(enc_seen.methods[nvenc.SET_OUT_COLOC_DATA >> 2] != 0);
+    try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_OUT_COLOC_DATA >> 2]);
+    try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_V >> 2]);
     try testing.expectEqual(@as(u64, nvenc.LIST_NONE), nvenc.get(&enc_seen.setup, nvenc.at(nvenc.H264.l0, 0)));
-    try testing.expectEqualSlices(u8, &nvenc.ME_NVIDIA, enc_seen.setup[nvenc.ME_CONTROL_OFF..][0..nvenc.Me.SIZE]);
+    try testing.expectEqualSlices(u8, &nvenc.ME_NVIDIA, enc_seen.setup[nvenc.H264_ME_OFF..][0..nvenc.Me.SIZE]);
     // (the history: the whole picture's blocks, NVIDIA's driver's size)
     try testing.expectEqual(@as(u64, nvenc.historyBytes(3, 2)), nvenc.get(&enc_seen.setup, nvenc.H264.hist_buf_size));
     try testing.expectEqual(@as(u64, 3), nvenc.get(&enc_seen.setup, nvenc.H264.pic_type)); // IDR
     try testing.expectEqual(@as(u64, 66), nvenc.get(&enc_seen.setup, nvenc.H264.profile_idc));
-    try testing.expectEqual(@as(u64, 6), nvenc.get(enc_seen.setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H264Slice.num_mb));
+    try testing.expectEqual(@as(u64, 6), nvenc.get(enc_seen.setup[nvenc.H264_SLICE_OFF..], nvenc.H264Slice.num_mb));
     // (CBR at 500 kb/s: the rate control's QP, an intra picture's at or
     // below the app's initial 28)
-    try testing.expect(nvenc.get(enc_seen.setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H264Slice.qp_avr) <= 28);
+    try testing.expect(nvenc.get(enc_seen.setup[nvenc.H264_SLICE_OFF..], nvenc.H264Slice.qp_avr) <= 28);
     // FFmpeg's async path: vaSyncBuffer on the coded buffer, then map it
     try testing.expectEqual(va.SUCCESS, d.syncBuffer(coded, std.math.maxInt(i64)));
     var n = try codedBytes(&d, coded, &enc_stream);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 0x67, 66, 0xc0, 31 }, enc_stream[0..8]);
     const header_bytes = cb.header_bytes;
-    try testing.expectEqual(@as(u64, header_bytes), nvenc.get(&enc_seen.setup, nvenc.H264.bitstream_start_pos));
+    // (the engine starts at its buffer's start; the headers end there)
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&enc_seen.setup, nvenc.H264.bitstream_start_pos));
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 0x65 }, enc_stream[header_bytes..][0..5]);
 
     // ── a P picture referencing the IDR's reconstruction ──
@@ -1233,8 +1245,8 @@ test "driver: H.264 through the fake encoder: an IDR then a P picture, the strea
         try testing.expect(x == nvenc.shifted(scratch_va + sz.mepred_off) or x == nvenc.shifted(scratch_va + sz.mepred_off + sz.mepred));
     }
     try testing.expect(sz.mepred >= 6 * nvenc.MEPRED_BYTES_PER_MB);
-    try testing.expectEqualSlices(u8, &nvenc.ME_NVIDIA, enc_seen.setup[nvenc.ME_CONTROL_OFF..][0..nvenc.Me.SIZE]);
-    try testing.expectEqual(@as(u64, 1), nvenc.get(enc_seen.setup[nvenc.ME_CONTROL_OFF..], nvenc.MeTail.fbm_op_winner_num_p_frame));
+    try testing.expectEqualSlices(u8, &nvenc.ME_NVIDIA, enc_seen.setup[nvenc.H264_ME_OFF..][0..nvenc.Me.SIZE]);
+    try testing.expectEqual(@as(u64, 1), nvenc.get(enc_seen.setup[nvenc.H264_ME_OFF..], nvenc.MeTail.fbm_op_winner_num_p_frame));
     // the old path: vaSyncSurface on the input fills the coded buffer too
     try testing.expectEqual(va.SUCCESS, d.syncSurface(surfaces[1], SYNC_NS));
     const m1 = try codedBytes(&d, coded, enc_stream[n..]);
@@ -1284,7 +1296,7 @@ test "driver: H.264 with the app's packed headers: its SPS, PPS and SEI, none of
     try testing.expectEqualSlices(u8, &sei, out[np..][0..sei.len]);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 0x65 }, out[np + sei.len ..][0..5]);
     // (CQP: the app's QP, pic_init_qp + slice_qp_delta)
-    try testing.expectEqual(@as(u64, 30), nvenc.get(enc_seen.setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H264Slice.qp_avr));
+    try testing.expectEqual(@as(u64, 30), nvenc.get(enc_seen.setup[nvenc.H264_SLICE_OFF..], nvenc.H264Slice.qp_avr));
     writeFile("/tmp/galaxy-va-enc/h264-packed.264", out[0..n]);
     writeFile("/tmp/galaxy-va-enc/h264-packed.yuv", &yuv);
 }
@@ -1293,7 +1305,7 @@ test "driver: HEVC through the fake encoder: the driver's VPS, SPS and PPS, the 
     var k = Fake{ .encoder = fakeEncode };
     enc_seen = .{};
     var d: TestDriver = .{ .node = .{ .sys = &k } };
-    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .nvenc_magic = 0xc9b7_0006 }));
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .nvenc_magic = 0xc9b7_0006, .nvenc_dump = true }));
     defer d.terminate();
     var cfg: u32 = 0;
     try testing.expectEqual(va.SUCCESS, d.createConfig(va.PROFILE_HEVC_MAIN, ve.ENTRYPOINT_ENC_SLICE, &.{}, &cfg));
@@ -1330,8 +1342,17 @@ test "driver: HEVC through the fake encoder: the driver's VPS, SPS and PPS, the 
     try testing.expectEqual(@as(u64, 0xc9b7_0006), nvenc.get(&enc_seen.setup, nvenc.H265.magic));
     try testing.expectEqual(@as(u64, 3), nvenc.get(&enc_seen.setup, nvenc.H265.pic_type));
     try testing.expectEqual(@as(u64, 19), nvenc.get(&enc_seen.setup, nvenc.H265.nal_unit_type));
+    // (no co-located buffer, as NVIDIA's driver binds none for HEVC on
+    // GB206; its codec type 4, not NVDEC's 7)
+    try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_OUT_COLOC_DATA >> 2]);
+    try testing.expectEqual(@as(u32, 0), enc_seen.methods[nvenc.SET_IN_COLOC_DATA >> 2]);
+    try testing.expectEqual(@as(u64, nvenc.PIC_CODEC_H265), nvenc.get(&enc_seen.setup, nvenc.H265.codec));
+    // (the RC data buffer and the input's V plane, as NVIDIA's driver
+    // binds them: the engine faulted without, pc-full13)
+    try testing.expect(enc_seen.methods[nvenc.SET_IN_RCDATA >> 2] != 0);
+    try testing.expectEqual(enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_U >> 2], enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_V >> 2]);
     try testing.expectEqual(@as(u64, 2), nvenc.get(&enc_seen.setup, nvenc.H265.max_cu_size));
-    try testing.expectEqual(@as(u64, 4), nvenc.get(enc_seen.setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H265Slice.num_ctus));
+    try testing.expectEqual(@as(u64, 4), nvenc.get(enc_seen.setup[nvenc.H265_SLICE_OFF..], nvenc.H265Slice.num_ctus));
     var out: [4 << 10]u8 = undefined;
     const n = try codedBytes(&d, coded, &out);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 0x40, 0x01 }, out[0..6]);

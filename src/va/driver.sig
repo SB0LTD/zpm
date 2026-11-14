@@ -166,6 +166,10 @@ pub const MAX_CODED = 16;
 pub const ENC_FRAME_BYTES: usize = 0x2000;
 pub const ENC_PUSH_OFF: usize = 0;
 pub const ENC_SETUP_OFF: usize = 0x800;
+/// How many pictures of each encode context GALAXY_VA_NVENC_DUMP prints.
+pub const DUMP_PICTURES = 4;
+/// The setup's place with GALAXY_VA_NVENC_TRY=setup4k (4 KiB aligned).
+pub const ENC_SETUP_OFF_4K: usize = 0x1000;
 
 // Each kind of object's ids: base + index.
 pub const CONFIG_BASE: u32 = 0x100;
@@ -258,6 +262,14 @@ pub const Options = struct {
     /// GALAXY_VA_NVENC_RC=firmware: the encoder firmware's own rate
     /// control for CBR and VBR (enc_rc.sig), not the driver's
     nvenc_rc_firmware: bool = false,
+    /// GALAXY_VA_NVENC_TRY: readings of HEVC's and AV1's setups for a test
+    /// boot (encode.Try)
+    nvenc_try: encode.Try = .{},
+    /// GALAXY_VA_NVENC_DUMP (set, not "0"): each encode context's first
+    /// DUMP_PICTURES pictures' setups (every nonzero 32-byte row, in hex)
+    /// and methods on stderr ("dump" lines), to set against what NVIDIA's
+    /// own driver gives the engine (zpm tools/nvcap.sig)
+    nvenc_dump: bool = false,
     /// GALAXY_VA_VPX_ENCODE=0: no VP8 or VP9 encode entrypoints
     vpx_encode: bool = true,
     /// GALAXY_VA_VPX_GPU=0: VP8 and VP9 encode on the CPU, not the RTX
@@ -384,6 +396,11 @@ const Context = struct {
     encoding: bool = false,
     enc: encode.State = undefined,
     enc_scratch: encode.ScratchSizes = undefined,
+    /// NVENC's input, a copy for each frame slot laid out in Turing's
+    /// GOBs (driver.Self.nvencInput: GB206's NVENC reads its input
+    /// so), made at the slot's first picture; their dma-buf fds
+    enc_input: [FRAMES]Buf = [_]Buf{.{}} ** FRAMES,
+    enc_input_fd: [FRAMES]i32 = [_]i32{-1} ** FRAMES,
     /// VP8 and VP9 (enc_vpx.sig): the state, the packer's scratch, the
     /// CPU engine's memory (made when the CPU encodes), which engine has
     /// the frame store
@@ -530,7 +547,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         // ── Saying things ───────────────────────────────────────────────
 
         fn say(d: *Self, comptime fmt: []const u8, args: anytype) void {
-            var buf: [320]u8 = undefined;
+            var buf: [512]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "galaxy-va: " ++ fmt ++ "\n", args) catch return;
             d.node.sys.say(line);
         }
@@ -915,18 +932,25 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         }
 
         fn convertSurface(d: *Self, s: *Surface, dir: convert.Direction) bool {
+            return d.convertWith(s, s.tiled, null, d.opts.gob, dir);
+        }
+
+        /// A conversion between the surface's linear copy and `tiled` (its
+        /// own picture, or another buffer of its layout: `tiled_fd` that
+        /// buffer's dma-buf), the block-linear side in `gob`'s layouts.
+        fn convertWith(d: *Self, s: *Surface, tiled: Buf, tiled_fd: ?i32, gob: tiling.Gob, dir: convert.Direction) bool {
             var job = convert.Job{
-                .tiled = s.tiled,
+                .tiled = tiled,
                 .layout = s.layout,
                 .linear = s.linear,
                 .lin = s.linear_layout,
                 .width = s.width,
                 .height = s.height,
-                .gob = d.opts.gob,
+                .gob = gob,
                 .dir = dir,
             };
             if (Conv.wants_fds) {
-                job.tiled_fd = d.surfaceFd(s) orelse return false;
+                job.tiled_fd = tiled_fd orelse (d.surfaceFd(s) orelse return false);
                 if (s.linear_fd < 0) {
                     const fd = d.node.exportFd(s.linear);
                     if (fd < 0) return false;
@@ -937,7 +961,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const done = d.conv.run(job, .{ .ctx = d, .f = sayLine });
             d.conversions[@intFromEnum(done)] += 1;
             if (done == .failed) return false;
-            d.debug("{s} {d}x{d} converted {s} on the {s}", .{ if (s.layout.sample_bytes == 2) "P010" else "NV12", s.width, s.height, @tagName(dir), @tagName(done) });
+            d.debug("{s} {d}x{d} converted {s}{s} on the {s}", .{ if (s.layout.sample_bytes == 2) "P010" else "NV12", s.width, s.height, @tagName(dir), if (tiled_fd != null) " (the encoder's input)" else "", @tagName(done) });
             return true;
         }
 
@@ -1057,20 +1081,30 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         /// An RGB surface's picture into its NV12 planes, on the GPU (the
         /// converter's `rgb`), before the encode reads them.
         fn convertRgb(d: *Self, si: u16) va.Status {
+            const s = &d.surfaces[si];
+            const st = d.convertRgbTo(si, s.tiled, null, d.opts.gob);
+            if (st != va.SUCCESS) return st;
+            s.tiled_stale = false;
+            s.linear_stale = true;
+            return va.SUCCESS;
+        }
+
+        /// The RGB picture's NV12 planes into `dst` (the surface's own
+        /// picture, or the encoder's input copy: `dst_fd` its dma-buf), in
+        /// `gob`'s layouts.
+        fn convertRgbTo(d: *Self, si: u16, dst: Buf, dst_fd: ?i32, gob: tiling.Gob) va.Status {
             if (!@hasDecl(Conv, "rgb")) return va.ERROR_UNSUPPORTED_MEMORY_TYPE;
             const s = &d.surfaces[si];
             const pic = d.imports[si].rgb.?;
-            var job = enc_import.RgbJob{ .dst = s.tiled.bytes(), .layout = s.layout, .gob = d.opts.gob, .src = pic.buf.bytes(), .src_offset = pic.offset, .src_pitch = pic.pitch, .order = pic.order, .width = s.width, .height = s.height };
+            var job = enc_import.RgbJob{ .dst = dst.bytes(), .layout = s.layout, .gob = gob, .src = pic.buf.bytes(), .src_offset = pic.offset, .src_pitch = pic.pitch, .order = pic.order, .width = s.width, .height = s.height };
             if (Conv.wants_fds) {
-                job.dst_fd = d.surfaceFd(s) orelse return va.ERROR_OPERATION_FAILED;
+                job.dst_fd = dst_fd orelse (d.surfaceFd(s) orelse return va.ERROR_OPERATION_FAILED);
                 job.src_fd = pic.fd;
             }
             if (d.conv.rgb(job, .{ .ctx = d, .f = sayLine }) == .failed) {
                 d.say("an RGB picture could not be converted on the GPU: not encoded", .{});
                 return va.ERROR_OPERATION_FAILED;
             }
-            s.tiled_stale = false;
-            s.linear_stale = true;
             return va.SUCCESS;
         }
 
@@ -1268,7 +1302,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         fn createEncodeContext(d: *Self, i: u8, config: u32, cfg: *const Config, width: u32, height: u32, out: *u32) va.Status {
             if (enc_vpx.supported(cfg.profile)) |vk| return d.createVpxContext(i, config, cfg, vk, width, height, out);
             const kind = encode.supported(cfg.profile) orelse return va.ERROR_UNSUPPORTED_PROFILE;
-            const sz = encode.scratchSizesFor(kind, width, height);
+            const sz = encode.scratchSizesPlaced(kind, width, height, d.opts.nvenc_try.coloc_apart);
             const scratch_off = FRAMES * ENC_FRAME_BYTES;
             var work = d.node.alloc(scratch_off + sz.total, 0) orelse return va.ERROR_ALLOCATION_FAILED;
             if (!nvenc.addressable(work.va) or !nvenc.addressable(work.va + work.len - 256)) {
@@ -1313,6 +1347,14 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 }
                 for (&d.surfaces) |*s| {
                     if (s.used and s.enc_pending) _ = d.waitEncodeInput(s, d.node.sys.nowNs() + SYNC_NS);
+                }
+                if (c.enc.tally.pictures != 0 or c.enc.tally.lost != 0) {
+                    var line: [320]u8 = undefined;
+                    d.say("{s}", .{c.enc.tally.line(&line, c.enc.kind)});
+                }
+                for (&c.enc_input, &c.enc_input_fd) |*b, fd| {
+                    if (fd >= 0) d.node.sys.close(fd);
+                    d.node.free(b);
                 }
                 d.node.free(&c.work);
                 c.* = .{};
@@ -1510,8 +1552,15 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 .timeout => return va.ERROR_TIMEDOUT,
                 .lost => {
                     cb.pending = false;
+                    // (the coded buffer is still memory: what the engine
+                    // wrote of the picture's status before the loss, if
+                    // anything, says what it made of it)
+                    const r = encode.statusOf(cb.buf.bytes(), cb.done.kind);
+                    var line: [400]u8 = undefined;
+                    d.say("the GPU was lost during an encode: {s}", .{encode.reportLine(&line, cb.done, r)});
+                    const c = &d.contexts[cb.ctx];
+                    if (c.used and c.encoding) c.enc.tally.lost += 1;
                     encode.emptySegment(cb.buf.bytes());
-                    d.say("the GPU was lost during an encode", .{});
                     return va.ERROR_OPERATION_FAILED;
                 },
             }
@@ -1519,10 +1568,16 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const c = &d.contexts[cb.ctx];
             const est: ?*encode.State = if (c.used and c.encoding) &c.enc else null;
             const f = encode.finish(est, cb.buf.bytes(), cb.done);
+            // the first pictures and every failure said in full (the
+            // engine's status words), the rest counted for the context's
+            // last line
+            const say_it = if (est) |e| e.tally.count(cb.done, f.result) else true;
+            var line: [400]u8 = undefined;
             if (f.result.failed()) {
                 d.errors += 1;
-                d.say("an encode failed: error_status {x}, ucode error {x}{s}", .{ f.result.error_status, f.result.ucode_error, if (f.result.ucode_error == nvenc.ENC_ERROR_H264_BAD_MAGIC) " (bad magic: the setup is not the firmware's; GALAXY_VA_NVENC_MAGIC)" else "" });
+                if (say_it) d.say("an encode failed: {s}{s}", .{ encode.reportLine(&line, cb.done, f.result), if (f.result.ucode_error == nvenc.ENC_ERROR_H264_BAD_MAGIC) " (bad magic: the setup is not the firmware's; GALAXY_VA_NVENC_MAGIC)" else "" });
             } else {
+                if (say_it) d.say("encode done: {s}", .{encode.reportLine(&line, cb.done, f.result)});
                 d.debug("encode done: {d} bytes ({d} of headers), {d} slices, average QP {d}{s}", .{ f.bytes, cb.header_bytes, f.result.slices, f.result.avg_qp, if (f.overflow) ", cut: the coded buffer is too small" else "" });
             }
             return va.SUCCESS;
@@ -1986,17 +2041,18 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             // (an app's linear dma-buf changes behind the driver: converted
             // every time)
             if (d.imports[si].used and d.imports[si].layout == .linear) s.tiled_stale = true;
-            st = if (d.imports[si].rgb != null) d.convertRgb(si) else d.syncTiled(si);
-            if (st != va.SUCCESS) return st;
             const f = c.frame;
+            var input: encode.Input = undefined;
+            st = d.nvencInput(c, si, f, &input);
+            if (st != va.SUCCESS) return st;
             const frame = c.work.bytes()[f * ENC_FRAME_BYTES ..][0..ENC_FRAME_BYTES];
             const base = c.work.va + f * ENC_FRAME_BYTES;
-            const input = d.encodeInput(si);
+            const setup_off: usize = if (d.opts.nvenc_try.setup_4k) ENC_SETUP_OFF_4K else ENC_SETUP_OFF;
             var out: encode.EndOut = .{};
             st = encode.end(&c.enc, .{
                 .push = words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX),
-                .setup = frame[ENC_SETUP_OFF..][0..nvenc.SETUP_BYTES],
-                .setup_va = base + ENC_SETUP_OFF,
+                .setup = frame[setup_off..][0..nvenc.SETUP_BYTES],
+                .setup_va = base + setup_off,
                 .coded = cb.buf.bytes(),
                 .coded_va = cb.buf.va,
                 .input = input,
@@ -2008,10 +2064,32 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 },
                 .picture_index = c.decodes,
                 .magic = d.opts.nvenc_magic orelse nvenc.MAGIC,
+                .try_ = d.opts.nvenc_try,
             }, &out);
             if (st != va.SUCCESS) {
                 d.debug("encode picture refused ({x})", .{st});
                 return st;
+            }
+            if (c.decodes == 0) {
+                // (the context's first picture: its setup and methods, for
+                // the boot log)
+                var line: [400]u8 = undefined;
+                d.say("{s}", .{encode.setupLine(&line, c.enc.kind, frame[setup_off..][0..nvenc.SETUP_BYTES])});
+                const t = d.opts.nvenc_try;
+                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 co-located {s}, setup at 0x{x} of its slot", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_coloc) "bound" else "none", setup_off });
+                d.say("first picture's methods: {s}", .{encode.pushLine(&line, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords])});
+            }
+            if (d.opts.nvenc_dump and c.decodes < DUMP_PICTURES) {
+                const setup = frame[setup_off..][0..nvenc.SETUP_BYTES];
+                var row: usize = 0;
+                while (row < setup.len) : (row += 32) {
+                    const r = setup[row..][0..32];
+                    if (std.mem.allEqual(u8, r, 0)) continue;
+                    const hex = std.fmt.bytesToHex(r.*, .lower);
+                    d.say("dump {s} {d} setup {x:0>4}: {s}", .{ @tagName(c.enc.kind), c.decodes, row, &hex });
+                }
+                var mline: [1600]u8 = undefined;
+                d.say("dump {s} {d} methods: {s}", .{ @tagName(c.enc.kind), c.decodes, encode.pushLine(&mline, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords]) });
             }
             const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {
                 d.say("an encode was not submitted ({s})", .{@errorName(e)});
@@ -2225,6 +2303,68 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             enc_vpx.done(&c.vpx, pl, bytes);
             c.decodes +%= 1;
             d.debug("{s} picture {d} on the {s}: {s}, q {d}, {d} bytes{s}", .{ @tagName(c.vpx.codec), c.decodes, @tagName(on), if (pl.key) "key" else "inter", pl.q, bytes, if (full) " (the coded buffer is too small)" else "" });
+            return va.SUCCESS;
+        }
+
+        /// NVENC's input for frame slot `f`, in `out`.
+        ///
+        /// GB206's NVENC reads its input's GOBs as Turing lays them out:
+        /// pc-full9 encoded H.264 at PSNR 38.4 from a Turing upload and at
+        /// 26.6..27.7 from Blackwell's, b8, b16 or swapped (testsrc2, 4
+        /// Mbit/s), while its NVDEC writes Blackwell's and every other
+        /// reader (the converter, the GL driver, an export's modifier)
+        /// takes Blackwell's. So the picture goes into the slot's own
+        /// Turing copy first: an upload (its linear copy current) in one
+        /// GPU pass, a decoded picture in two (into the linear copy, then
+        /// out), an RGB capture straight from its pixels. Read in place: a
+        /// surface already in Turing's layouts (GALAXY_VA_GOB=turing), and
+        /// an app's block-linear dma-buf, as its planes lie (an app that
+        /// hands Blackwell-laid planes has them read as Turing's).
+        fn nvencInput(d: *Self, c: *Context, si: u16, f: u8, out: *encode.Input) va.Status {
+            const s = &d.surfaces[si];
+            const im = d.imports[si];
+            const sw = s.layout.swizzles(d.opts.gob);
+            if ((im.used and im.layout == .block_linear and im.rgb == null) or (sw[0] == .turing2d and sw[1] == .turing2d)) {
+                const st = if (im.rgb != null) d.convertRgb(si) else d.syncTiled(si);
+                if (st != va.SUCCESS) return st;
+                out.* = d.encodeInput(si);
+                return va.SUCCESS;
+            }
+            // the slot's copy (made once; again if a bigger picture comes)
+            const bytes: usize = @intCast(s.layout.bytes);
+            if (c.enc_input[f].handle != 0 and c.enc_input[f].len < bytes) {
+                if (c.enc_input_fd[f] >= 0) d.node.sys.close(c.enc_input_fd[f]);
+                c.enc_input_fd[f] = -1;
+                d.node.free(&c.enc_input[f]);
+            }
+            if (c.enc_input[f].handle == 0) {
+                c.enc_input[f] = d.node.alloc(bytes, node.G_VRAM) orelse return d.lostOr(va.ERROR_ALLOCATION_FAILED);
+                if (Conv.wants_fds) {
+                    const fd = d.node.exportFd(c.enc_input[f]);
+                    if (fd < 0) {
+                        d.say("the encoder input's dma-buf was refused ({d})", .{fd});
+                        d.node.free(&c.enc_input[f]);
+                        return va.ERROR_OPERATION_FAILED;
+                    }
+                    c.enc_input_fd[f] = @intCast(fd);
+                }
+            }
+            const dst = c.enc_input[f];
+            const fd = c.enc_input_fd[f];
+            if (im.rgb != null) {
+                const st = d.convertRgbTo(si, dst, fd, .turing);
+                if (st != va.SUCCESS) return st;
+            } else {
+                // (a decode into it done and brought into the linear copy;
+                // an app's write is there already)
+                const st = d.syncLinear(si);
+                if (st != va.SUCCESS and st != va.ERROR_DECODING_ERROR) return st;
+                if (!d.convertWith(s, dst, fd, .turing, .to_tiled)) return va.ERROR_OPERATION_FAILED;
+            }
+            out.* = d.encodeInput(si);
+            out.surface_luma = out.luma;
+            out.luma = dst.va;
+            out.chroma = dst.va + s.layout.chroma_offset;
             return va.SUCCESS;
         }
 
@@ -2700,6 +2840,7 @@ comptime {
     std.debug.assert(nvdec.PUSH_DWORDS <= PUSH_DWORDS_MAX and hevc.PUSH_DWORDS <= PUSH_DWORDS_MAX and av1.PUSH_DWORDS <= PUSH_DWORDS_MAX);
     std.debug.assert(ENC_PUSH_OFF + nvenc.PUSH_DWORDS_MAX * 4 <= ENC_SETUP_OFF and ENC_SETUP_OFF % 256 == 0);
     std.debug.assert(ENC_SETUP_OFF + nvenc.SETUP_BYTES <= ENC_FRAME_BYTES and ENC_FRAME_BYTES % 256 == 0);
+    std.debug.assert(ENC_SETUP_OFF_4K % 4096 == 0 and ENC_SETUP_OFF_4K + nvenc.SETUP_BYTES <= ENC_FRAME_BYTES);
 }
 
 /// `n` dwords at byte `off` of mapped GPU memory.
