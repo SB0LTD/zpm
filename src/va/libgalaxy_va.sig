@@ -90,6 +90,7 @@ const codec = @import("codec.sig");
 const vp9 = @import("vp9.sig");
 const node = @import("node.sig");
 const tiling = @import("tiling.sig");
+const encode = @import("encode.sig");
 const linux = std.os.linux;
 
 /// A failed check in the driver: one line on stderr, then the program
@@ -289,7 +290,8 @@ fn options() driver.Options {
 /// default, "tiles"), GALAXY_VA_ENCODE ("0": no
 /// encode entrypoints), GALAXY_VA_NVENC_MAGIC (hex: the encoder setup's
 /// magic word), GALAXY_VA_NVENC_RC ("firmware": the encoder's own rate
-/// control), GALAXY_VA_NVENC_B ("1": B pictures on the encoder), from an
+/// control), GALAXY_VA_NVENC_B ("1": B pictures on the encoder),
+/// GALAXY_VA_NVENC_TRY (readings of HEVC's and AV1's setups: encode.Try), from an
 /// environment block. Values not understood leave the
 /// default.
 pub fn optionsOf(block: []const u8) driver.Options {
@@ -338,6 +340,9 @@ pub fn optionsOf(block: []const u8) driver.Options {
         } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_RC")) {
             // ("firmware": the encoder's own CBR/VBR, enc_rc.sig)
             o.nvenc_rc_firmware = std.ascii.eqlIgnoreCase(v, "firmware");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_TRY")) {
+            // (readings of HEVC's and AV1's setups for a test boot)
+            o.nvenc_try = encode.Try.parse(v);
         } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_ENCODE")) {
             o.vpx_encode = !std.mem.eql(u8, v, "0");
         } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_GPU")) {
@@ -648,6 +653,10 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expectEqual(tiling.Gob.b16, optionsOf("GALAXY_VA_GOB=B16").gob);
     try testing.expectEqual(tiling.Gob.swapped, optionsOf("GALAXY_VA_GOB=swapped").gob);
     try testing.expectEqual(tiling.Gob.blackwell, optionsOf("GALAXY_VA_GOB=other").gob);
+    const t = optionsOf("GALAXY_VA_NVENC_TRY=colocboth,tiles300 av1nocolin,setup4k").nvenc_try;
+    try testing.expect(t.hevc_coloc == .both and t.av1_tiles_at == 768 and !t.av1_key_colin and t.setup_4k);
+    const none_t = optionsOf("GALAXY_VA_NVENC_TRY=").nvenc_try;
+    try testing.expect(none_t.hevc_coloc == .out and none_t.av1_tiles_at == 0x400 and none_t.av1_key_colin and !none_t.setup_4k);
     try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
     try testing.expect(none.encode and none.nvenc_magic == null);
     const enc = optionsOf("GALAXY_VA_ENCODE=0\x00GALAXY_VA_NVENC_MAGIC=0xc9b70006\x00");

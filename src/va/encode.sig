@@ -499,6 +499,49 @@ pub const Scratch = struct {
     }
 };
 
+/// GALAXY_VA_NVENC_TRY: readings of the engine's setup for a test boot.
+/// HEVC and AV1 have not encoded a picture on GB206 and nothing public
+/// says which the firmware wants: pc-full8's HEVC (co-located out bound,
+/// temporal MVP on) stopped with ucode error 19 COLLOC_OFFSET; pc-full9's
+/// and pc-full10's (no co-located buffer, temporal MVP off) faulted the
+/// engine (exception 47); AV1 (co-located in and out the same buffer, tile
+/// controls at 0x400, the setup 0x800 into its frame slot) stopped with
+/// ucode error 3 PICSETUP_OFFSET. A comma-separated list of the words
+/// below; the defaults are the readings nvenc_drv.h's text supports.
+pub const Try = struct {
+    /// HEVC's co-located motion buffers. `out` (the default, the word
+    /// "colocout"): out on every reference picture (nvenc_drv.h 2.2: the
+    /// engine writes it for reference pictures; FORCE_OUTCOL writes it for
+    /// others), in only for temporal MVP. `both` ("colocboth"): in as well
+    /// on every picture (another kept entry when there is no collocated
+    /// picture). `tmvp` ("coloctmvp"): both only with temporal MVP, as
+    /// pc-full9 and pc-full10 did.
+    hevc_coloc: enum { out, both, tmvp } = .out,
+    /// AV1's tile controls: at TILE_CONTROL_OFF (0x400), or right after
+    /// nvenc_av1_drv_pic_setup_s's 768 bytes ("tiles300")
+    av1_tiles_at: u32 = nvenc.TILE_CONTROL_OFF,
+    /// AV1's key frames bind no co-located input ("av1nocolin"); by
+    /// default their own output entry is bound as the input too
+    av1_key_colin: bool = true,
+    /// the setup 4 KiB aligned in its frame slot ("setup4k"; the driver's)
+    setup_4k: bool = false,
+
+    /// The words of `v` (others ignored).
+    pub fn parse(v: []const u8) Try {
+        var t = Try{};
+        var it = std.mem.tokenizeAny(u8, v, ", ");
+        while (it.next()) |w| {
+            if (std.ascii.eqlIgnoreCase(w, "colocout")) t.hevc_coloc = .out;
+            if (std.ascii.eqlIgnoreCase(w, "colocboth")) t.hevc_coloc = .both;
+            if (std.ascii.eqlIgnoreCase(w, "coloctmvp")) t.hevc_coloc = .tmvp;
+            if (std.ascii.eqlIgnoreCase(w, "tiles300")) t.av1_tiles_at = nvenc.Av1.SIZE;
+            if (std.ascii.eqlIgnoreCase(w, "av1nocolin")) t.av1_key_colin = false;
+            if (std.ascii.eqlIgnoreCase(w, "setup4k")) t.setup_4k = true;
+        }
+        return t;
+    }
+};
+
 pub const EndIn = struct {
     /// the frame slot's pushbuffer and setup area (CPU, GPU)
     push: []u32,
@@ -511,6 +554,7 @@ pub const EndIn = struct {
     scratch: Scratch,
     picture_index: u32,
     magic: u32 = nvenc.MAGIC,
+    try_: Try = .{},
 };
 
 /// What the finished picture needs to know (kept with its coded buffer).
@@ -662,21 +706,24 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
         .hevc => st.hevc_pic.pic_fields.reference_pic_flag != 0,
         .av1 => unreachable,
     };
+    const tmvp_reads = st.kind == .hevc and t0 != .i and st.hevc_slices[0].temporal_mvp and hevcTemporalMvp(st);
     const reads_col = switch (st.kind) {
         .h264 => t0 == .b,
-        .hevc => t0 != .i and st.hevc_slices[0].temporal_mvp and hevcTemporalMvp(st),
+        .hevc => tmvp_reads or in.try_.hevc_coloc == .both,
         .av1 => unreachable,
     };
-    // (HEVC: only a sequence with temporal MVP has a later picture read
-    // it; FEATURES offers none, so FFmpeg's sequences bind no co-located
-    // buffer, which GB206 refused on every picture: pc-full8)
+    // (HEVC: on every reference picture unless Try says otherwise: the
+    // engine faulted without it, pc-full9 and pc-full10)
     const writes_col = is_ref and switch (st.kind) {
         .h264 => st.b_frames,
-        .hevc => hevcTemporalMvp(st),
+        .hevc => in.try_.hevc_coloc != .tmvp or hevcTemporalMvp(st),
         .av1 => unreachable,
     };
+    // (an input with no collocated picture: another kept entry, never the
+    // one being written)
+    const col_k = if (in_k == out_k and !tmvp_reads) (out_k + 1) % KEPT else in_k;
     a.coloc_out = if (writes_col) in.scratch.coloc(out_k) else 0;
-    a.coloc_in = if (reads_col) in.scratch.coloc(in_k) else 0;
+    a.coloc_in = if (reads_col) in.scratch.coloc(col_k) else 0;
     if (t0 != .i) motionBuffers(st, in.scratch, &a);
     for ([_]u64{ a.setup, a.status, a.bitstream, a.history, a.rc_process, a.cur_luma, a.cur_chroma, a.out_luma, a.out_chroma }) |x| {
         if (!nvenc.addressable(x)) return va.ERROR_INVALID_SURFACE;
@@ -874,7 +921,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         if (st.kept.find(pic.reference_frames[frame.ref_frame_idx[0]])) |k| col_k = k;
         motionBuffers(st, in.scratch, &a);
     }
-    a.coloc_in = in.scratch.coloc(col_k);
+    a.coloc_in = if (frame.intra() and !in.try_.av1_key_colin) 0 else in.scratch.coloc(col_k);
     a.coloc_out = in.scratch.coloc(out_k);
     a.av1 = .{
         .prob_in = prob_in,
@@ -886,9 +933,10 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         .cdef_left = in.scratch.line(4),
         .lr_left = in.scratch.line(5),
     };
-    for ([_]u64{ a.setup, a.status, a.bitstream, a.history, a.rc_process, a.coloc_in, a.cur_luma, a.cur_chroma, a.out_luma, a.out_chroma, a.av1.?.prob_in, a.av1.?.lr_left }) |x| {
+    for ([_]u64{ a.setup, a.status, a.bitstream, a.history, a.rc_process, a.cur_luma, a.cur_chroma, a.out_luma, a.out_chroma, a.av1.?.prob_in, a.av1.?.lr_left }) |x| {
         if (!nvenc.addressable(x)) return va.ERROR_INVALID_SURFACE;
     }
+    if (a.coloc_in != 0 and !nvenc.addressable(a.coloc_in)) return va.ERROR_INVALID_SURFACE;
     if (a.mepred_in != 0 and !nvenc.addressable(a.mepred_out)) return va.ERROR_INVALID_SURFACE;
     const room: u32 = @intCast(@min(in.coded.len - SLICES_OFF, std.math.maxInt(u32)));
     av1.setup(in.setup, .{
@@ -903,6 +951,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         .bitstream_room = room,
         .history_bytes = @intCast(in.scratch.sizes.history),
         .magic = in.magic,
+        .tiles_at = in.try_.av1_tiles_at,
     });
     if (st.firmware_rc and st.rate.active()) a.rc_mode = firmware(st, in, enc_rc.RcFields.of(nvenc.Av1), q);
 
