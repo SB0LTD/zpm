@@ -579,6 +579,15 @@ pub const H265 = struct {
     pub const l0: F = .{ .bit = 1696, .width = 8 };
     pub const l1: F = .{ .bit = 1760, .width = 8 };
     pub const temp_dist_l0: F = .{ .bit = 1824, .width = 8 };
+    /// dist_scale_factor[8][8] (16-bit), diff_pic_order_cnt_zero (8
+    /// bytes, as NVIDIA's driver writes them: each 0xff << the L0 count),
+    /// and two GB206 words no header names: L0's count (0x288) and its
+    /// entries' order, 1..n (0x2dc). Found in NVIDIA's own setups (the WSL
+    /// capture); left zero, P pictures read VA 0 (pc-full17).
+    pub const dist_scale_factor: F = .{ .bit = 1952, .width = 16 };
+    pub const diff_pic_order_cnt_zero: F = .{ .bit = 2976, .width = 8 };
+    pub const ref_count_gb206: F = .{ .bit = 5184, .width = 32 };
+    pub const ref_order_gb206: F = .{ .bit = 5856, .width = 8 };
     pub const pic_output_flag: F = .{ .bit = 3105, .width = 1 };
     pub const pic_order_cnt_lsb: F = .{ .bit = 3120, .width = 16 };
     pub const num_forced_slices_minus1: F = .{ .bit = 3136, .width = 8 };
@@ -1069,6 +1078,9 @@ pub const NV_HEVC_IDR = @embedFile("testdata/nvenc-gb206-hevc-idr.bin");
 pub const NV_HEVC_P = @embedFile("testdata/nvenc-gb206-hevc-p.bin");
 pub const NV_AV1_KEY = @embedFile("testdata/nvenc-gb206-av1-key.bin");
 pub const NV_AV1_P = @embedFile("testdata/nvenc-gb206-av1-p.bin");
+/// NVIDIA's AV1 P frames with two and with three references.
+pub const NV_AV1_P2 = @embedFile("testdata/nvenc-gb206-av1-p2.bin");
+pub const NV_AV1_P3 = @embedFile("testdata/nvenc-gb206-av1-p3.bin");
 
 /// HEVC's controls as NVIDIA's own driver writes them on GB206 (captured
 /// in WSL, driver 592.15, hevc_nvenc at 1080p: CTBs of 32, CBs from 16; the

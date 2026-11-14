@@ -604,7 +604,15 @@ pub fn setup(buf: []u8, s: Setup) void {
     if (s.template) {
         // (NVIDIA's own setup for the same kind of frame; every field this
         // driver knows is written over it below)
-        @memcpy(buf[0..0x400], if (f.intra()) nvenc.NV_AV1_KEY[0..0x400] else nvenc.NV_AV1_P[0..0x400]);
+        // (by the frame's reference count: NVIDIA's frame with as many)
+        var order: [7]u3 = undefined;
+        const nrefs = refOrder(f, pic, &order);
+        const t = if (f.intra()) nvenc.NV_AV1_KEY else switch (nrefs) {
+            0, 1 => nvenc.NV_AV1_P,
+            2 => nvenc.NV_AV1_P2,
+            else => nvenc.NV_AV1_P3,
+        };
+        @memcpy(buf[0..0x400], t[0..0x400]);
     }
     nvenc.set(buf, A.magic, s.magic);
     const cfgs = [_][4]nvenc.F{
