@@ -431,25 +431,44 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, H.pic_order_cnt_lsb, first.pic_order_cnt_lsb);
     nvenc.set(buf, H.idr_pic_id, first.idr_pic_id);
     nvenc.setSigned(buf, H.delta_pic_order_cnt_bottom, first.delta_pic_order_cnt_bottom);
+    // the controls where NVIDIA's driver puts them (nvenc.H264_*_OFF)
+    const slice_off = nvenc.h264SliceOff(s.slices.len);
     nvenc.set(buf, H.num_forced_slices_minus1, s.slices.len - 1);
-    nvenc.set(buf, H.slice_control_offset, nvenc.SLICE_CONTROL_OFF);
-    nvenc.set(buf, H.me_control_offset, nvenc.ME_CONTROL_OFF);
-    nvenc.set(buf, H.md_control_offset, nvenc.MD_CONTROL_OFF);
-    nvenc.set(buf, H.q_control_offset, nvenc.Q_CONTROL_OFF);
+    nvenc.set(buf, H.slice_control_offset, slice_off);
+    nvenc.set(buf, H.me_control_offset, nvenc.H264_ME_OFF);
+    nvenc.set(buf, H.md_control_offset, nvenc.H264_MD_OFF);
+    nvenc.set(buf, H.q_control_offset, nvenc.H264_Q_OFF);
     nvenc.set(buf, H.hist_buf_size, s.history_bytes);
     nvenc.set(buf, H.bitstream_buf_size, s.bitstream_room);
     nvenc.set(buf, H.bitstream_start_pos, s.bitstream_start);
     nvenc.set(buf, H.pic_type, picType(pic, first));
     nvenc.set(buf, H.ref_pic_flag, @intFromBool(pf.reference_pic_flag != 0));
     nvenc.set(buf, H.b_as_ref, @intFromBool(first.slice_type == 1 and pf.reference_pic_flag != 0));
-    // static slices: the slice controls' macroblock counts
-    nvenc.set(buf, H.slice_mode, 1);
-    nvenc.set(buf, H.base_view, 1);
+    // One slice: as NVIDIA's driver sends it, dynamic slice mode (0) with
+    // max_slice_size the picture's macroblocks (grc: 3600 at 720p, 8160
+    // at 1080p) and a slice control naming them all. More: static slices
+    // (1), the slice controls' macroblock counts. (This driver sent
+    // static slices, base_view 1 and no CABAC zero words before; grc
+    // sends base_view 0 and, with CABAC, cabac_zero_word_enable 1.)
+    const mbs = (s.width / 16) * (s.height / 16);
+    if (s.slices.len == 1) {
+        nvenc.set(buf, H.max_slice_size, mbs);
+    } else {
+        nvenc.set(buf, H.slice_mode, 1);
+    }
+    nvenc.set(buf, H.cabac_zero_word_enable, @intFromBool(pf.entropy_coding_mode_flag != 0));
     nvenc.set(buf, H.e4byte_start_code, 1);
+    // the whole picture is one strip of its macroblock rows (Ada's and
+    // later firmware split a picture into strips between engines)
+    nvenc.set(buf, H.strips_in_frame, 1);
+    nvenc.set(buf, H.slice_encoding_row_num, s.height / 16);
+    nvenc.set(buf, H.slice_stat_offset, nvenc.SLICE_STAT_OFF);
+    nvenc.set(buf, H.mpec_stat_offset, nvenc.MPEC_STAT_OFF);
     nvenc.set(buf, H.gp_timer_timeout_val, nvenc.GPTIMER_TIMEOUT);
-    // the slice controls
+    // the slice controls (grc's: the slice's macroblocks, its QP; nothing
+    // forced intra, an IDR's slice included)
     for (s.slices, 0..) |sl, i| {
-        const c = buf[nvenc.SLICE_CONTROL_OFF + i * nvenc.H264Slice.SIZE ..];
+        const c = buf[slice_off + i * nvenc.H264Slice.SIZE ..];
         const L = nvenc.H264Slice;
         nvenc.set(c, L.num_mb, sl.num_mb);
         nvenc.set(c, L.qp_avr, s.qp);
@@ -457,41 +476,28 @@ pub fn setup(buf: []u8, s: Setup) void {
         nvenc.set(c, L.qp_slice_max, s.qp);
         nvenc.setSigned(c, L.slice_alpha_c0_offset_div2, sl.alpha);
         nvenc.setSigned(c, L.slice_beta_offset_div2, sl.beta);
-        nvenc.set(c, L.force_intra, @intFromBool(sl.slice_type == 2));
         nvenc.set(c, L.disable_deblocking_filter_idc, sl.deblock_idc);
         nvenc.set(c, L.cabac_init_idc, sl.cabac_init_idc);
         nvenc.set(c, L.num_ref_idx_active_override_flag, @intFromBool(sl.override));
         nvenc.set(c, L.num_ref_idx_l0_active_minus1, sl.l0_minus1);
         nvenc.set(c, L.num_ref_idx_l1_active_minus1, sl.l1_minus1);
     }
-    nvenc.meControl(buf[nvenc.ME_CONTROL_OFF..]);
-    const md = buf[nvenc.MD_CONTROL_OFF..];
+    nvenc.meControl(buf[nvenc.H264_ME_OFF..]);
+    // MD and quantisation: NVIDIA's, then what VA's parameters forbid off
+    const md = buf[nvenc.H264_MD_OFF..];
+    @memcpy(md[0..nvenc.H264Md.SIZE], &nvenc.MD_NVIDIA_H264);
+    @memcpy(buf[nvenc.H264_Q_OFF..][0..nvenc.H264Quant.SIZE], &nvenc.Q_NVIDIA_H264);
     const D = nvenc.H264Md;
     const t8 = pf.transform_8x8_mode_flag != 0;
-    nvenc.set(md, D.intra_luma4x4_mode_enable, 0x1ff);
-    nvenc.set(md, D.intra_luma8x8_mode_enable, if (t8) 0x1ff else 0);
-    nvenc.set(md, D.intra_luma16x16_mode_enable, 0xf);
-    nvenc.set(md, D.intra_chroma_mode_enable, 0xf);
-    nvenc.set(md, D.l0_part_16x16_enable, 1);
-    nvenc.set(md, D.l0_part_16x8_enable, 1);
-    nvenc.set(md, D.l0_part_8x16_enable, 1);
-    nvenc.set(md, D.l0_part_8x8_enable, 1);
-    // (B pictures: the same partitions for L1 and bi-prediction; direct
-    // mode as the slice header says, B_Skip with it)
-    for (0..4) |p| {
-        const pp: u32 = @intCast(p);
-        nvenc.set(md, .{ .bit = D.l1_part_16x16_enable.bit + pp, .width = 1 }, 1);
-        nvenc.set(md, .{ .bit = D.bi_part_16x16_enable.bit + pp, .width = 1 }, 1);
-    }
+    // (grc's P pictures search no 4x4 intra modes)
+    if (first.slice_type == 0) nvenc.set(md, D.intra_luma4x4_mode_enable, 0);
+    if (!t8) nvenc.set(md, D.intra_luma8x8_mode_enable, 0);
+    // (Constrained Baseline and Main: 4x4 intra and 16x16 only)
+    if (!t8) nvenc.set(md, D.ip_search_mode, 5);
     if (first.slice_type == 1) {
         nvenc.set(md, D.bdirect_mode, if (first.direct_spatial) 1 else 2);
         nvenc.set(md, D.bskip_enable, 1);
     }
-    nvenc.set(md, D.pskip_enable, 1);
-    nvenc.set(md, D.mv_cost_enable, 1);
-    // which intra sizes to search: 4x4, 16x16, and 8x8 with the 8x8 transform
-    nvenc.set(md, D.ip_search_mode, if (t8) 7 else 5);
-    // (the quantisation control left zero: no QPP, no dead zones)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -611,21 +617,70 @@ test "enc_h264: the setup from VA's parameters" {
     try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.pic_type)); // P
     try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.ref_pic_flag));
     try testing.expectEqual(@as(u64, 37), nvenc.get(&buf, H.bitstream_start_pos));
-    try testing.expectEqual(@as(u64, nvenc.SLICE_CONTROL_OFF), nvenc.get(&buf, H.slice_control_offset));
+    try testing.expectEqual(@as(u64, nvenc.H264_SLICE_OFF), nvenc.get(&buf, H.slice_control_offset));
     try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.num_forced_slices_minus1));
-    const c = buf[nvenc.SLICE_CONTROL_OFF..];
+    const c = buf[nvenc.H264_SLICE_OFF..];
     try testing.expectEqual(@as(u64, 6), nvenc.get(c, nvenc.H264Slice.num_mb));
     try testing.expectEqual(@as(u64, 30), nvenc.get(c, nvenc.H264Slice.qp_avr));
     try testing.expectEqual(@as(u64, 0xf), nvenc.get(c, nvenc.H264Slice.slice_alpha_c0_offset_div2));
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H264Slice.force_intra));
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H264Slice.disable_slice_header));
-    const md = buf[nvenc.MD_CONTROL_OFF..];
-    try testing.expectEqual(@as(u64, 0x1ff), nvenc.get(md, nvenc.H264Md.intra_luma4x4_mode_enable));
+    // the MD control NVIDIA's (a P picture: no 4x4 intra search, as grc's;
+    // Main: no 8x8 transform, no 8x8 intra), its RDO and transform search;
+    // the quantisation control NVIDIA's
+    const md = buf[nvenc.H264_MD_OFF..];
+    try testing.expectEqual(@as(u64, 0), nvenc.get(md, nvenc.H264Md.intra_luma4x4_mode_enable));
     try testing.expectEqual(@as(u64, 0), nvenc.get(md, nvenc.H264Md.intra_luma8x8_mode_enable));
+    try testing.expectEqual(@as(u64, 0xf), nvenc.get(md, nvenc.H264Md.intra_luma16x16_mode_enable));
     try testing.expectEqual(@as(u64, 5), nvenc.get(md, nvenc.H264Md.ip_search_mode));
-    const me = buf[nvenc.ME_CONTROL_OFF..];
+    try testing.expectEqual(@as(u64, 1), nvenc.get(md, nvenc.H264Md.rdo_level));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(md, nvenc.H264Md.tu_search_num));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(md, nvenc.H264Md.pskip_enable));
+    try testing.expectEqualSlices(u8, &nvenc.Q_NVIDIA_H264, buf[nvenc.H264_Q_OFF..][0..nvenc.H264Quant.SIZE]);
+    // the controls where NVIDIA's driver has them; one slice: dynamic
+    // mode over the picture's macroblocks; one strip of all its rows; the
+    // statistics past the picture status; the engine's slices from the
+    // bitstream buffer's start
+    try testing.expectEqual(@as(u64, nvenc.H264_MD_OFF), nvenc.get(&buf, H.md_control_offset));
+    try testing.expectEqual(@as(u64, nvenc.H264_Q_OFF), nvenc.get(&buf, H.q_control_offset));
+    try testing.expectEqual(@as(u64, nvenc.H264_ME_OFF), nvenc.get(&buf, H.me_control_offset));
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.slice_mode));
+    try testing.expectEqual(@as(u64, 6), nvenc.get(&buf, H.max_slice_size));
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.base_view));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.cabac_zero_word_enable));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.strips_in_frame));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&buf, H.slice_encoding_row_num));
+    try testing.expectEqual(@as(u64, 0x80), nvenc.get(&buf, H.slice_stat_offset));
+    try testing.expectEqual(@as(u64, 0x1000b0), nvenc.get(&buf, H.mpec_stat_offset));
+    const me = buf[nvenc.H264_ME_OFF..];
     try testing.expectEqual(@as(u64, 4), nvenc.get(me, nvenc.Me.hint_type4));
     try testing.expectEqual(va.SUCCESS, check(va.PROFILE_H264_MAIN, &seq, &pic));
+
+    // an IDR (High, 8x8): every intra mode NVIDIA's MD control has, the
+    // slice not forced intra (grc's IDR slice is not); NVIDIA's ME
+    var idr = testPic(0x400, 0x1000, true, 0);
+    idr.pic_fields.transform_8x8_mode_flag = 1;
+    idr.pic_fields.entropy_coding_mode_flag = 0;
+    const si = Slice{ .num_mb = 6, .slice_type = 2 };
+    setup(&buf, .{ .profile = va.PROFILE_H264_HIGH, .seq = &seq, .pic = &idr, .slices = &.{si}, .width = 48, .height = 32, .input = .{ .luma = 0, .chroma = 0, .pitch_luma = 64, .pitch_chroma = 64 }, .recon = .{ .luma = 0, .chroma = 0, .pitch_luma = 64, .pitch_chroma = 64 }, .ref_ids = [_]u32{va.INVALID_ID} ** nvenc.REF_SLOTS, .ref_poc = [_]i32{0} ** nvenc.REF_SLOTS, .qp = 30, .gop_length = 30, .framerate = 30, .bitstream_start = 0, .bitstream_room = 1 << 20, .history_bytes = 4096 });
+    try testing.expectEqualSlices(u8, &nvenc.MD_NVIDIA_H264, buf[nvenc.H264_MD_OFF..][0..nvenc.H264Md.SIZE]);
+    try testing.expectEqualSlices(u8, &nvenc.ME_NVIDIA, buf[nvenc.H264_ME_OFF..][0..nvenc.Me.SIZE]);
+    try testing.expectEqual(@as(u64, 0), nvenc.get(buf[nvenc.H264_SLICE_OFF..], nvenc.H264Slice.force_intra));
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&buf, H.pic_type));
+    // (CAVLC: no CABAC zero words)
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.cabac_zero_word_enable));
+    // (nothing of the setup past its 512 bytes but the controls)
+    for (buf[H.SIZE..nvenc.H264_SLICE_OFF]) |x| try testing.expectEqual(@as(u8, 0), x);
+
+    // three slices: static slices (their macroblock counts), past the ME
+    const three = [_]Slice{ .{ .num_mb = 2, .slice_type = 2 }, .{ .num_mb = 2, .slice_type = 2 }, .{ .num_mb = 2, .slice_type = 2 } };
+    setup(&buf, .{ .profile = va.PROFILE_H264_HIGH, .seq = &seq, .pic = &idr, .slices = &three, .width = 48, .height = 32, .input = .{ .luma = 0, .chroma = 0, .pitch_luma = 64, .pitch_chroma = 64 }, .recon = .{ .luma = 0, .chroma = 0, .pitch_luma = 64, .pitch_chroma = 64 }, .ref_ids = [_]u32{va.INVALID_ID} ** nvenc.REF_SLOTS, .ref_poc = [_]i32{0} ** nvenc.REF_SLOTS, .qp = 30, .gop_length = 30, .framerate = 30, .bitstream_start = 0, .bitstream_room = 1 << 20, .history_bytes = 4096 });
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.slice_mode));
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.max_slice_size));
+    try testing.expectEqual(@as(u64, nvenc.H264_SLICE_OFF_MANY), nvenc.get(&buf, H.slice_control_offset));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&buf, H.num_forced_slices_minus1));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(buf[nvenc.H264_SLICE_OFF_MANY + 2 * nvenc.H264Slice.SIZE ..], nvenc.H264Slice.num_mb));
+    try testing.expectEqualSlices(u8, &nvenc.ME_NVIDIA, buf[nvenc.H264_ME_OFF..][0..nvenc.Me.SIZE]);
     pic.pic_fields.transform_8x8_mode_flag = 1;
     try testing.expectEqual(va.ERROR_INVALID_PARAMETER, check(va.PROFILE_H264_MAIN, &seq, &pic));
 }

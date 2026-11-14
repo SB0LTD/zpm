@@ -134,6 +134,10 @@ fn fakeEncode(k: *Fake, sub: Fake.Submit) void {
         else => blob(out, &.{ 0x12, 0x34, 0x56, 0x78, 0x9a }),
     };
     const stat = at(k, &m, nvenc.SET_OUT_ENC_STATUS, nvenc.Stat.SIZE);
+    // (as NVIDIA's engine writes every picture's: its index back, and
+    // error_status 2, routine)
+    nvenc.set(stat, nvenc.Stat.picture_index, m[nvenc.SET_PICTURE_INDEX >> 2]);
+    nvenc.set(stat, nvenc.Stat.error_status, 2);
     if (seen.app == nvenc.APPLICATION_ID_AV1) {
         nvenc.set(stat, nvenc.Av1Stat.total_bit_count, n * 8);
         nvenc.set(stat, nvenc.Av1Stat.num_tiles, 1);
@@ -201,7 +205,7 @@ fn pcmSlice(k: *Fake, m: []const u32, setup: []const u8, out: []u8) usize {
         if (idr) wr.flag(false);
     }
     const init_qp = 26 + signExtend(nvenc.get(setup, H.pic_init_qp_minus26), 6);
-    const qp: i32 = @intCast(nvenc.get(setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H264Slice.qp_avr));
+    const qp: i32 = @intCast(nvenc.get(setup[@intCast(nvenc.get(setup, H.slice_control_offset))..], nvenc.H264Slice.qp_avr));
     wr.se(qp - init_qp);
     if (nvenc.get(setup, H.deblocking_filter_control_present_flag) != 0) wr.ue(1);
     for (0..(h + 15) / 16) |my| {
@@ -616,7 +620,7 @@ test "enc: HEVC B picture's setup: the RPS both sides, the lists, the collocated
     try testing.expectEqual(@as(u64, 1), nvenc.get(&b, nvenc.at(H.poc_entry_l1, 0))); // S1's first: entry 1
     try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(H.poc_entry_l0, 0)));
     try testing.expectEqual(@as(u64, 4), nvenc.get(&b, H.pic_order_cnt_lsb));
-    const c = b[nvenc.SLICE_CONTROL_OFF..];
+    const c = b[nvenc.H265_SLICE_OFF..];
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.slice_type));
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.collocated_from_l0_flag));
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.collocated_ref_idx));

@@ -10,9 +10,16 @@
 //!
 //!   0x0000  VACodedBufferSegment (what vaMapBuffer returns)
 //!   0x0100  the engine's status (nvenc_pic_stat_s; SET_OUT_ENC_STATUS)
-//!   0x1100  the stream: the headers the driver writes or the app packed,
-//!           then the engine's slices from bitstream_start_pos on
-//!           (SET_OUT_BITSTREAM is 0x1100), then any filler
+//!   0x1100  the headers' room (HEADER_BYTES): the headers the driver
+//!           writes or the app packed end at its end
+//!   0x5100  the engine's slices (SET_OUT_BITSTREAM; bitstream_start_pos
+//!           0, as NVIDIA's driver has it), then any filler
+//!
+//! The stream (what vaMapBuffer's segment names) begins where the headers
+//! do: the engine starts at a 256-byte aligned address, at offset 0, and
+//! nothing is moved after it. (This driver had the engine start
+//! bitstream_start_pos bytes, the headers' length, into the stream before:
+//! an odd offset such as 268, which no NVIDIA job is known to use.)
 //!
 //! The input picture is the engine's as it lies in memory (`Input`: block
 //! linear planes, any block height); a picture that needs a pass first
@@ -53,6 +60,11 @@ pub const STATUS_OFF: usize = 0x100;
 pub const DATA_OFF: usize = 0x1100;
 /// the headers' room ahead of the engine's slices
 pub const HEADER_BYTES: usize = 16 << 10;
+/// where the engine's slices go (SET_OUT_BITSTREAM)
+pub const SLICES_OFF: usize = DATA_OFF + HEADER_BYTES;
+comptime {
+    std.debug.assert(SLICES_OFF % 256 == 0);
+}
 
 /// RateControl's modes this driver answers.
 pub const RC_MODES: u32 = ve.RC_CQP | ve.RC_CBR | ve.RC_VBR;
@@ -187,6 +199,8 @@ pub const State = struct {
     packed_waiting: bool = false,
     bad: va.Status = va.SUCCESS,
     pictures: u32 = 0,
+    /// what the engine said of the context's pictures
+    tally: Tally = .{},
 
     pub fn init(kind: Codec, profile: va.Profile, width: u32, height: u32, rc_mode: u32, packed_headers: u32) State {
         var st = State{ .kind = kind, .profile = profile, .width = width, .height = height, .packed_headers = packed_headers };
@@ -489,6 +503,8 @@ pub const Done = struct {
     qp: i32 = 0,
     /// the stream's bytes the driver wrote (headers) ahead of the engine's
     header_bytes: u32 = 0,
+    /// SET_PICTURE_INDEX's value (the status names it once written)
+    picture_index: u32 = 0,
     /// AV1: where the frame header and the tile group's size are, the
     /// frame (for a rewrite with the engine's QP and loop-filter level),
     /// and a hidden picture to show after this one
@@ -570,7 +586,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
         .codec_type = undefined,
         .setup = in.setup_va,
         .status = in.coded_va + STATUS_OFF,
-        .bitstream = in.coded_va + DATA_OFF,
+        .bitstream = in.coded_va + SLICES_OFF,
         .history = in.scratch.history(),
         .rc_process = in.scratch.rcProcess(),
         .coloc_in = undefined,
@@ -617,10 +633,12 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
         .av1 => unreachable,
     };
     const in_k = st.kept.find(col_id) orelse out_k;
-    // the co-located motion as nvenc_drv.h 3.x says (and NVIDIA's driver
-    // does: neither on its I and P pictures): written by a reference
-    // picture, read by a B picture (H.264) or by a picture whose slices
-    // use HEVC's temporal motion vector prediction
+    // the co-located motion as nvenc_drv.h 3.x says: written by a
+    // reference picture, read by a B picture (H.264) or by a picture whose
+    // slices use HEVC's temporal motion vector prediction. H.264 without
+    // B pictures (GALAXY_VA_NVENC_B unset) binds neither, as NVIDIA's
+    // driver binds neither on its I and P pictures (grc); this driver
+    // bound SET_OUT_COLOC_DATA on every H.264 reference before.
     const t0 = picType(st);
     const is_ref = switch (st.kind) {
         .h264 => st.h264_pic.pic_fields.reference_pic_flag != 0,
@@ -632,7 +650,8 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
         .hevc => t0 != .i and st.hevc_slices[0].temporal_mvp,
         .av1 => unreachable,
     };
-    a.coloc_out = if (is_ref) in.scratch.coloc(out_k) else 0;
+    const writes_col = is_ref and (st.kind != .h264 or st.b_frames);
+    a.coloc_out = if (writes_col) in.scratch.coloc(out_k) else 0;
     a.coloc_in = if (reads_col) in.scratch.coloc(in_k) else 0;
     if (t0 != .i) motionBuffers(st, in.scratch, &a);
     for ([_]u64{ a.setup, a.status, a.bitstream, a.history, a.rc_process, a.cur_luma, a.cur_chroma, a.out_luma, a.out_chroma }) |x| {
@@ -642,12 +661,12 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
         if (x != 0 and !nvenc.addressable(x)) return va.ERROR_INVALID_SURFACE;
     }
 
-    const room: u32 = @intCast(@min(in.coded.len - DATA_OFF, std.math.maxInt(u32)));
+    const room: u32 = @intCast(@min(in.coded.len - SLICES_OFF, std.math.maxInt(u32)));
     const input_planes = h264.Planes{ .luma = a.cur_luma, .chroma = a.cur_chroma, .pitch_luma = inp.pitch_luma, .pitch_chroma = inp.pitch_chroma, .block_height = inp.block_height };
     const recon_planes = h264.Planes{ .luma = recon.luma, .chroma = recon.chroma, .pitch_luma = recon.pitch_luma, .pitch_chroma = recon.pitch_chroma };
     const fps = st.rate.fps_num / @max(st.rate.fps_den, 1);
     const t = picType(st);
-    var done = Done{ .kind = st.kind, .type = t };
+    var done = Done{ .kind = st.kind, .type = t, .picture_index = in.picture_index };
     switch (st.kind) {
         .h264 => {
             const pic = &st.h264_pic;
@@ -672,7 +691,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
                 .qp = qp,
                 .gop_length = if (seq.intra_period != 0) seq.intra_period else 0xffff_ffff,
                 .framerate = fps,
-                .bitstream_start = @intCast(n),
+                .bitstream_start = 0,
                 .bitstream_room = room,
                 .history_bytes = @intCast(in.scratch.sizes.history),
                 .magic = in.magic,
@@ -702,7 +721,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
                 .qp = qp,
                 .gop_length = if (seq.intra_period != 0) seq.intra_period else 0xffff_ffff,
                 .framerate = fps,
-                .bitstream_start = @intCast(n),
+                .bitstream_start = 0,
                 .bitstream_room = room,
                 .history_bytes = @intCast(in.scratch.sizes.history),
                 .magic = in.magic,
@@ -714,9 +733,11 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
         },
         .av1 => unreachable,
     }
-    // a clean status, an empty segment until the engine is done
-    @memset(in.coded[STATUS_OFF..DATA_OFF], 0);
-    @memset(in.coded[SEGMENT_OFF..][0..@sizeOf(ve.CodedBufferSegment)], 0);
+    // the headers end where the engine's slices begin
+    placeHeaders(in.coded, n);
+    // a clean status (its picture index poisoned: unwritten, it says so),
+    // an empty segment until the engine is done
+    clearStatus(in.coded, in.picture_index);
     out.dwords = nvenc.push(in.push, a);
     out.header_bytes = @intCast(n);
     out.qp = @intCast(done.qp);
@@ -794,7 +815,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         .codec_type = nvenc.CODEC_TYPE_AV1,
         .setup = in.setup_va,
         .status = in.coded_va + STATUS_OFF,
-        .bitstream = in.coded_va + DATA_OFF,
+        .bitstream = in.coded_va + SLICES_OFF,
         .history = in.scratch.history(),
         .rc_process = in.scratch.rcProcess(),
         .coloc_in = undefined,
@@ -823,8 +844,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         if (st.kept.find(src)) |k| prob_in = in.scratch.cdf(k);
     }
     // the co-located motion: this picture's own entry out; in, LAST's
-    // (the first reference's) on an inter picture, else its own (as the
-    // key frames that encoded on GB206 had it)
+    // (the first reference's) on an inter picture, else its own
     var col_k = out_k;
     if (!frame.intra()) {
         if (st.kept.find(pic.reference_frames[frame.ref_frame_idx[0]])) |k| col_k = k;
@@ -846,7 +866,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         if (!nvenc.addressable(x)) return va.ERROR_INVALID_SURFACE;
     }
     if (a.mepred_in != 0 and !nvenc.addressable(a.mepred_out)) return va.ERROR_INVALID_SURFACE;
-    const room: u32 = @intCast(@min(in.coded.len - DATA_OFF, std.math.maxInt(u32)));
+    const room: u32 = @intCast(@min(in.coded.len - SLICES_OFF, std.math.maxInt(u32)));
     av1.setup(in.setup, .{
         .frame = frame,
         .pic = pic,
@@ -855,7 +875,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         .ref_ids = ref_ids,
         .framerate = st.rate.fps_num / @max(st.rate.fps_den, 1),
         .gop_length = if (seq.intra_period != 0) seq.intra_period else 0xffff_ffff,
-        .bitstream_start = @intCast(n),
+        .bitstream_start = 0,
         .bitstream_room = room,
         .history_bytes = @intCast(in.scratch.sizes.history),
         .magic = in.magic,
@@ -865,7 +885,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
     // After it: the slots it refreshes hold its order hint; shown, or
     // hidden until the picture before it is out (then shown with a
     // show_existing_frame, unless the app packs its own headers).
-    var done = Done{ .kind = .av1, .type = t, .qp = q, .header_bytes = @intCast(n), .av1_fh_off = fh_off, .av1_fh_room = fh_room, .av1_tg_size_off = tg_size_off, .av1_frame = frame };
+    var done = Done{ .kind = .av1, .type = t, .qp = q, .header_bytes = @intCast(n), .picture_index = in.picture_index, .av1_fh_off = fh_off, .av1_fh_room = fh_room, .av1_tg_size_off = tg_size_off, .av1_frame = frame };
     var first_slot: ?u3 = null;
     for (0..8) |i| {
         if (frame.refresh & (@as(u8, 1) << @intCast(i)) == 0) continue;
@@ -888,8 +908,8 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
     }
     as.prev_shown = show;
 
-    @memset(in.coded[STATUS_OFF..DATA_OFF], 0);
-    @memset(in.coded[SEGMENT_OFF..][0..@sizeOf(ve.CodedBufferSegment)], 0);
+    placeHeaders(in.coded, n);
+    clearStatus(in.coded, in.picture_index);
     out.dwords = nvenc.push(in.push, a);
     out.header_bytes = @intCast(n);
     out.qp = q;
@@ -897,6 +917,26 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
     out.done = done;
     st.pictures += 1;
     return va.SUCCESS;
+}
+
+/// The `n` bytes of headers written at the headers' room's start moved
+/// to its end, against the engine's slices (SLICES_OFF).
+fn placeHeaders(coded: []u8, n: usize) void {
+    const room = coded[DATA_OFF..SLICES_OFF];
+    if (n != 0) std.mem.copyBackwards(u8, room[HEADER_BYTES - n ..], room[0..n]);
+}
+
+/// Where the stream of a picture with `header_bytes` of headers begins in
+/// its coded buffer.
+pub fn streamOff(header_bytes: u32) usize {
+    return SLICES_OFF - header_bytes;
+}
+
+/// The status cleared, its picture index poisoned; the segment empty.
+fn clearStatus(coded: []u8, picture_index: u32) void {
+    @memset(coded[STATUS_OFF..DATA_OFF], 0);
+    std.mem.writeInt(u32, coded[STATUS_OFF..][0..4], nvenc.statusPoison(picture_index), .little);
+    @memset(coded[SEGMENT_OFF..][0..@sizeOf(ve.CodedBufferSegment)], 0);
 }
 
 /// An inter picture's MEPRED buffers, as NVIDIA's driver binds them: the
@@ -970,34 +1010,169 @@ pub const Finished = struct {
 /// was): the segment vaMapBuffer returns, filled; the rate control (its
 /// context's, if it still has one) told; CBR's filler appended.
 pub fn finish(st: ?*State, coded: []u8, done: Done) Finished {
-    const r = nvenc.Result.ofKind(coded[STATUS_OFF..][0..nvenc.Stat.SIZE], switch (done.kind) {
-        .h264 => .h264,
-        .hevc => .hevc,
-        .av1 => .av1,
-    });
+    const r = statusOf(coded, done.kind);
+    if (coded.len < SLICES_OFF or done.header_bytes > HEADER_BYTES) {
+        // (no picture of end()'s fits: nothing to say)
+        emptySegment(coded);
+        return .{ .bytes = 0, .result = r, .overflow = false };
+    }
     const header_bytes = done.header_bytes;
-    const room = coded.len - DATA_OFF;
+    const at = streamOff(header_bytes);
+    const stream = coded[at..];
+    const room = stream.len;
     var n: usize = header_bytes + @as(usize, r.bytes());
     const overflow = n > room;
     if (overflow) n = room;
     if (r.failed()) n = header_bytes;
-    if (done.kind == .av1 and !r.failed()) n = finishAv1(coded[DATA_OFF..], n, r, done);
+    if (done.kind == .av1 and !r.failed()) n = finishAv1(stream, n, r, done);
     var pad_bytes: u32 = 0;
-    if (st) |s| {
+    // (a lost picture is not the rate control's to learn from: told it
+    // was the headers' size, it took the QP down to 1 on every one of
+    // them, pc-1111h)
+    if (st != null and !r.failed()) {
+        const s = st.?;
         const pad = s.rate.done(done.type, @as(u64, n) * 8, done.qp, r.intra_cost, r.inter_cost);
-        if (pad > 0 and !r.failed()) {
+        if (pad > 0) {
             const want: usize = @intCast(pad / 8);
-            pad_bytes = @intCast(filler(coded[DATA_OFF..], n, want, done.kind));
+            pad_bytes = @intCast(filler(stream, n, want, done.kind));
             n += pad_bytes;
         }
     }
     var seg = std.mem.zeroes(ve.CodedBufferSegment);
     seg.size = @intCast(n);
     seg.status = if (overflow) ve.CODED_BUF_STATUS_SLICE_OVERFLOW_MASK else 0;
-    seg.buf = coded.ptr + DATA_OFF;
+    seg.buf = coded.ptr + at;
     seg.next = null;
     @memcpy(coded[SEGMENT_OFF..][0..@sizeOf(ve.CodedBufferSegment)], std.mem.asBytes(&seg));
     return .{ .bytes = @intCast(n), .result = r, .overflow = overflow, .pad_bytes = pad_bytes };
+}
+
+/// The engine's status of the picture in `coded` (the codec's struct).
+pub fn statusOf(coded: []const u8, kind: Codec) nvenc.Result {
+    return nvenc.Result.ofKind(coded[STATUS_OFF..][0..nvenc.Stat.SIZE], switch (kind) {
+        .h264 => .h264,
+        .hevc => .hevc,
+        .av1 => .av1,
+    });
+}
+
+/// A context's pictures as the engine reported them (for the driver's
+/// lines: the first pictures and every failure said, the rest counted).
+pub const Tally = struct {
+    pictures: u32 = 0,
+    encoded: u32 = 0,
+    failed: u32 = 0,
+    /// pictures whose status the engine never wrote (its index unchanged)
+    unwritten: u32 = 0,
+    /// pictures lost with the channel
+    lost: u32 = 0,
+    slice_bytes: u64 = 0,
+    said: u32 = 0,
+    first_failed: u32 = 0,
+    first_ucode: u32 = 0,
+    last_ucode: u32 = 0,
+    /// pictures said in full: the first SAY_FIRST, then failures up to
+    /// SAY_MAX lines in all
+    pub const SAY_FIRST = 4;
+    pub const SAY_MAX = 24;
+
+    /// The picture `done` counted; whether to say it.
+    pub fn count(t: *Tally, done: Done, r: nvenc.Result) bool {
+        t.pictures += 1;
+        if (!r.written(done.picture_index)) t.unwritten += 1;
+        if (r.failed()) {
+            if (t.failed == 0) {
+                t.first_failed = done.picture_index;
+                t.first_ucode = r.ucode_error;
+            }
+            t.failed += 1;
+            t.last_ucode = r.ucode_error;
+        } else {
+            t.encoded += 1;
+            t.slice_bytes += r.bytes();
+        }
+        const say = t.said < SAY_MAX and (t.pictures <= SAY_FIRST or r.failed());
+        if (say) t.said += 1;
+        return say;
+    }
+
+    /// The context's pictures in one line.
+    pub fn line(t: *const Tally, buf: []u8, kind: Codec) []const u8 {
+        return std.fmt.bufPrint(buf, "{s} encode context done: {d} pictures, {d} encoded ({d} B of slices), {d} failed (the first: picture {d}, ucode error {d} {s}; the last's {d} {s}), {d} statuses never written, {d} lost with the channel", .{
+            @tagName(kind), t.pictures,                         t.encoded,     t.slice_bytes,
+            t.failed,       t.first_failed,                     t.first_ucode, nvenc.ucodeErrorName(t.first_ucode),
+            t.last_ucode,   nvenc.ucodeErrorName(t.last_ucode), t.unwritten,   t.lost,
+        }) catch buf[0..0];
+    }
+};
+
+/// A picture's setup in a line (the first picture's, for the boot log):
+/// the magic, the three surfaces' sizes, the controls' offsets, the
+/// bitstream's start and room, the history, the strip.
+pub fn setupLine(buf: []u8, kind: Codec, setup: []const u8) []const u8 {
+    const g = nvenc.get;
+    return switch (kind) {
+        .h264 => blk: {
+            const H = nvenc.H264;
+            break :blk std.fmt.bufPrint(buf, "h264 setup: magic {x}, input {d}x{d} pitch {d} block height {d}, recon {d}x{d} pitch {d}, pic_type {d}, slice mode {d} max {d}, controls slice {x} md {x} q {x} me {x}, start {d} room {d}, history {d}, strips {d} rows {d}, stats {x}/{x}, timer {d}", .{
+                g(setup, H.magic),                                g(setup, H.input_cfg_frame_width_minus1) + 1,      g(setup, H.input_cfg_frame_height_minus1) + 1, g(setup, H.input_cfg_sfc_pitch), g(setup, H.input_cfg_block_height),
+                g(setup, H.outputpic_cfg_frame_width_minus1) + 1, g(setup, H.outputpic_cfg_frame_height_minus1) + 1, g(setup, H.outputpic_cfg_sfc_pitch),           g(setup, H.pic_type),            g(setup, H.slice_mode),
+                g(setup, H.max_slice_size),                       g(setup, H.slice_control_offset),                  g(setup, H.md_control_offset),                 g(setup, H.q_control_offset),    g(setup, H.me_control_offset),
+                g(setup, H.bitstream_start_pos),                  g(setup, H.bitstream_buf_size),                    g(setup, H.hist_buf_size),                     g(setup, H.strips_in_frame),     g(setup, H.slice_encoding_row_num),
+                g(setup, H.slice_stat_offset),                    g(setup, H.mpec_stat_offset),                      g(setup, H.gp_timer_timeout_val),
+            }) catch buf[0..0];
+        },
+        .hevc => blk: {
+            const H = nvenc.H265;
+            break :blk std.fmt.bufPrint(buf, "hevc setup: magic {x}, input {d}x{d} pitch {d} block height {d}, recon {d}x{d} pitch {d}, pic_type {d} nal {d}, cu {d}..{d} tu {d}..{d}, controls slice {x} md {x} q {x} me {x}, start {d} room {d}, history {d}, ctbs log2 {d}, strips {d} rows {d}, timer {d}", .{
+                g(setup, H.magic),                                g(setup, H.input_cfg_frame_width_minus1) + 1,      g(setup, H.input_cfg_frame_height_minus1) + 1, g(setup, H.input_cfg_sfc_pitch),    g(setup, H.input_cfg_block_height),
+                g(setup, H.outputpic_cfg_frame_width_minus1) + 1, g(setup, H.outputpic_cfg_frame_height_minus1) + 1, g(setup, H.outputpic_cfg_sfc_pitch),           g(setup, H.pic_type),               g(setup, H.nal_unit_type),
+                g(setup, H.min_cu_size),                          g(setup, H.max_cu_size),                           g(setup, H.min_tu_size),                       g(setup, H.max_tu_size),            g(setup, H.slice_control_offset),
+                g(setup, H.md_control_offset),                    g(setup, H.q_control_offset),                      g(setup, H.me_control_offset),                 g(setup, H.bitstream_start_pos),    g(setup, H.bitstream_buf_size),
+                g(setup, H.hist_buf_size),                        g(setup, H.ceil_log2_pic_size_in_ctbs),            g(setup, H.strips_in_frame),                   g(setup, H.slice_encoding_row_num), g(setup, H.gp_timer_timeout_val),
+            }) catch buf[0..0];
+        },
+        .av1 => blk: {
+            const A = nvenc.Av1;
+            break :blk std.fmt.bufPrint(buf, "av1 setup: magic {x}, input {d}x{d} pitch {d}, frame type {d}, tiles at {x}, start {d} room {d}, history {d}, strips {d} ({d}x{d} SBs), timer {d}", .{
+                g(setup, A.magic),               g(setup, A.input_cfg_frame_width_minus1) + 1, g(setup, A.input_cfg_frame_height_minus1) + 1, g(setup, A.input_cfg_sfc_pitch), g(setup, A.frame_type),
+                g(setup, A.tile_control_offset), g(setup, A.bitstream_start_pos),              g(setup, A.bitstream_buf_size),                g(setup, A.hist_buf_size),       g(setup, A.strips_in_frame),
+                g(setup, A.strip_width_in_sbs),  g(setup, A.strip_height_in_sbs),              g(setup, A.gp_timer_timeout_val),
+            }) catch buf[0..0];
+        },
+    };
+}
+
+/// A picture's pushbuffer as methods and values in a line ("700=1103 ...").
+pub fn pushLine(buf: []u8, push: []const u32) []const u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i + 1 < push.len) : (i += 2) {
+        const m = (push[i] & 0x1fff) << 2;
+        const s = std.fmt.bufPrint(buf[w..], "{x}={x} ", .{ m, push[i + 1] }) catch break;
+        w += s.len;
+    }
+    return buf[0..w];
+}
+
+/// What the engine said of one picture, in a line: whether it wrote the
+/// status at all (the picture index came back), its error words (and
+/// their names), the bits it reports, where it says it wrote them, its
+/// counts.
+pub fn reportLine(buf: []u8, done: Done, r: nvenc.Result) []const u8 {
+    const t = switch (done.type) {
+        .i => "I",
+        .p => "P",
+        .b => "B",
+    };
+    const verdict = if (!r.written(done.picture_index)) "NO STATUS (the engine never wrote it)" else if (r.failed()) "FAILED" else "encoded";
+    return std.fmt.bufPrint(buf, "{s} picture {d} ({s}, QP {d}): {s}; status index {x}, error_status {d} (2 is routine), ucode error {d} {s}; {d} bits ({d} B of slices after {d} B of headers), slices {d}, avg QP {d}, start {d}, last valid {d}, intra/inter {d}/{d}, cycles {d}", .{
+        @tagName(done.kind),                 done.picture_index, t,              done.qp,
+        verdict,                             r.picture_index,    r.error_status, r.ucode_error,
+        nvenc.ucodeErrorName(r.ucode_error), r.bits,             r.bytes(),      done.header_bytes,
+        r.slices,                            r.avg_qp,           r.start,        r.last_valid,
+        r.intra_count,                       r.inter_count,      r.cycles,
+    }) catch buf[0..0];
 }
 
 /// A filler data NAL unit of about `want` bytes after the `at` bytes of
@@ -1116,22 +1291,42 @@ test "encode: packed headers without emulation bytes get them" {
 }
 
 test "encode: a finished picture's segment, and CBR's filler" {
-    var coded: [DATA_OFF + 64]u8 align(16) = undefined;
+    var coded: [SLICES_OFF + 64]u8 align(16) = undefined;
     @memset(&coded, 0);
     var st = State.init(.h264, va.PROFILE_H264_MAIN, 48, 32, ve.RC_CQP, 0);
+    // (error_status 2, as on every picture of NVIDIA's own: no failure)
+    std.mem.writeInt(u32, coded[STATUS_OFF + 4 ..][0..4], 2, .little);
     std.mem.writeInt(u32, coded[STATUS_OFF + 8 ..][0..4], 20 * 8 + 3, .little);
     const f = finish(&st, &coded, .{ .header_bytes = 30 });
     try testing.expectEqual(@as(u32, 51), f.bytes);
-    try testing.expect(!f.overflow);
+    try testing.expect(!f.overflow and !f.result.failed());
     const seg = std.mem.bytesToValue(ve.CodedBufferSegment, coded[0..@sizeOf(ve.CodedBufferSegment)]);
     try testing.expectEqual(@as(u32, 51), seg.size);
-    try testing.expectEqual(@intFromPtr(&coded) + DATA_OFF, @intFromPtr(seg.buf.?));
+    // (the stream: the 30 bytes of headers right before the engine's
+    // slices)
+    try testing.expectEqual(@intFromPtr(&coded) + SLICES_OFF - 30, @intFromPtr(seg.buf.?));
     try testing.expectEqual(@as(?*anyopaque, null), seg.next);
     // too big for the buffer: cut, and said
     std.mem.writeInt(u32, coded[STATUS_OFF + 8 ..][0..4], 1000 * 8, .little);
     const g = finish(&st, &coded, .{ .header_bytes = 30, .type = .p });
     try testing.expect(g.overflow);
-    try testing.expectEqual(@as(u32, 64), g.bytes);
+    try testing.expectEqual(@as(u32, 30 + 64), g.bytes);
+    // a ucode error, or no bits: the headers alone, the rate control not
+    // told
+    const frames = st.rate.frames;
+    std.mem.writeInt(u32, coded[STATUS_OFF + 4 ..][0..4], 2 | (13 << 2), .little);
+    const h = finish(&st, &coded, .{ .header_bytes = 30, .type = .p });
+    try testing.expect(h.result.failed());
+    try testing.expectEqual(@as(u32, 30), h.bytes);
+    try testing.expectEqual(@as(u32, 13), h.result.ucode_error);
+    std.mem.writeInt(u32, coded[STATUS_OFF + 4 ..][0..4], 2, .little);
+    std.mem.writeInt(u32, coded[STATUS_OFF + 8 ..][0..4], 0, .little);
+    try testing.expect(finish(&st, &coded, .{ .header_bytes = 30, .type = .p }).result.failed());
+    try testing.expectEqual(frames, st.rate.frames);
+    // (a buffer too small for any picture: an empty segment)
+    var tiny: [DATA_OFF + 64]u8 align(16) = undefined;
+    @memset(&tiny, 0);
+    try testing.expectEqual(@as(u32, 0), finish(null, &tiny, .{ .header_bytes = 30 }).bytes);
     // a filler NAL unit
     var s: [32]u8 = undefined;
     const n = filler(&s, 4, 12, .h264);
@@ -1193,4 +1388,69 @@ test "encode: kept surfaces: an entry per reference, reused once no list names i
     const live2 = [_]u32{0x401};
     try testing.expectEqual(@as(?u8, 0), k.take(0x402, &live2));
     try testing.expectEqual(@as(?u8, 1), k.find(0x401));
+}
+
+test "encode: the engine's report: a status never written, error_status 2 no failure, a ucode error named, the context's tally" {
+    var coded: [SLICES_OFF + 256]u8 align(16) = undefined;
+    @memset(&coded, 0);
+    // (EndPicture's clean status: the picture index poisoned)
+    clearStatus(&coded, 7);
+    var r = statusOf(&coded, .hevc);
+    try testing.expect(!r.written(7));
+    try testing.expect(r.failed());
+    var line: [400]u8 = undefined;
+    const done = Done{ .kind = .hevc, .type = .i, .qp = 25, .header_bytes = 99, .picture_index = 7 };
+    try testing.expect(std.mem.indexOf(u8, reportLine(&line, done, r), "NO STATUS") != null);
+    // the engine's: its index, error_status 2, 4000 bits: encoded
+    std.mem.writeInt(u32, coded[STATUS_OFF..][0..4], 7, .little);
+    std.mem.writeInt(u32, coded[STATUS_OFF + 4 ..][0..4], 2, .little);
+    std.mem.writeInt(u32, coded[STATUS_OFF + 8 ..][0..4], 4000, .little);
+    r = statusOf(&coded, .hevc);
+    try testing.expect(r.written(7) and !r.failed());
+    const ok = reportLine(&line, done, r);
+    try testing.expect(std.mem.indexOf(u8, ok, "hevc picture 7 (I, QP 25): encoded") != null);
+    try testing.expect(std.mem.indexOf(u8, ok, "4000 bits (500 B of slices after 99 B of headers)") != null);
+    // ucode error 13: failed, and named as nvenc_drv.h's ERROR_CODES do
+    std.mem.writeInt(u32, coded[STATUS_OFF + 4 ..][0..4], 2 | (13 << 2), .little);
+    r = statusOf(&coded, .hevc);
+    try testing.expect(r.failed());
+    try testing.expect(std.mem.indexOf(u8, reportLine(&line, done, r), "ucode error 13 INPUT_BITSTREAM_OFFSET") != null);
+    try testing.expectEqualStrings("GPTMR_TIMEOUT", nvenc.ucodeErrorName(1));
+    try testing.expectEqualStrings("PICSETUP_OFFSET", nvenc.ucodeErrorName(3));
+    try testing.expectEqualStrings("H264_BAD_MAGIC", nvenc.ucodeErrorName(nvenc.ENC_ERROR_H264_BAD_MAGIC));
+    // the tally: the first SAY_FIRST pictures said, then failures only
+    var t = Tally{};
+    var good = r;
+    good.ucode_error = 0;
+    var said: u32 = 0;
+    for (0..10) |k| {
+        var d = done;
+        d.picture_index = @intCast(k);
+        good.picture_index = @intCast(k);
+        if (t.count(d, if (k == 6) r else good)) said += 1;
+    }
+    try testing.expectEqual(@as(u32, Tally.SAY_FIRST + 1), said);
+    try testing.expectEqual(@as(u32, 9), t.encoded);
+    try testing.expectEqual(@as(u32, 1), t.failed);
+    try testing.expectEqual(@as(u32, 6), t.first_failed);
+    try testing.expectEqual(@as(u32, 13), t.first_ucode);
+    try testing.expect(std.mem.indexOf(u8, t.line(&line, .hevc), "10 pictures, 9 encoded (4500 B of slices), 1 failed (the first: picture 6, ucode error 13") != null);
+}
+
+test "encode: the headers placed against the engine's slices, the stream where the segment says" {
+    var coded: [SLICES_OFF + 64]u8 align(16) = undefined;
+    @memset(&coded, 0);
+    const hdr = [_]u8{ 0, 0, 0, 1, 0x67, 1, 2, 3 };
+    @memcpy(coded[DATA_OFF..][0..hdr.len], &hdr);
+    placeHeaders(&coded, hdr.len);
+    try testing.expectEqualSlices(u8, &hdr, coded[SLICES_OFF - hdr.len .. SLICES_OFF]);
+    try testing.expectEqual(SLICES_OFF - hdr.len, streamOff(hdr.len));
+    // the engine's slice right after them: one stream
+    coded[SLICES_OFF] = 0xaa;
+    std.mem.writeInt(u32, coded[STATUS_OFF + 8 ..][0..4], 8, .little);
+    const f = finish(null, &coded, .{ .header_bytes = hdr.len });
+    try testing.expectEqual(@as(u32, hdr.len + 1), f.bytes);
+    const seg = std.mem.bytesToValue(ve.CodedBufferSegment, coded[0..@sizeOf(ve.CodedBufferSegment)]);
+    const p: [*]const u8 = @ptrCast(seg.buf.?);
+    try testing.expectEqualSlices(u8, &(hdr ++ [_]u8{0xaa}), p[0..seg.size]);
 }

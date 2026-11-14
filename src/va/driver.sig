@@ -530,7 +530,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         // ── Saying things ───────────────────────────────────────────────
 
         fn say(d: *Self, comptime fmt: []const u8, args: anytype) void {
-            var buf: [320]u8 = undefined;
+            var buf: [512]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "galaxy-va: " ++ fmt ++ "\n", args) catch return;
             d.node.sys.say(line);
         }
@@ -1314,6 +1314,10 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 for (&d.surfaces) |*s| {
                     if (s.used and s.enc_pending) _ = d.waitEncodeInput(s, d.node.sys.nowNs() + SYNC_NS);
                 }
+                if (c.enc.tally.pictures != 0 or c.enc.tally.lost != 0) {
+                    var line: [320]u8 = undefined;
+                    d.say("{s}", .{c.enc.tally.line(&line, c.enc.kind)});
+                }
                 d.node.free(&c.work);
                 c.* = .{};
                 return va.SUCCESS;
@@ -1510,8 +1514,15 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 .timeout => return va.ERROR_TIMEDOUT,
                 .lost => {
                     cb.pending = false;
+                    // (the coded buffer is still memory: what the engine
+                    // wrote of the picture's status before the loss, if
+                    // anything, says what it made of it)
+                    const r = encode.statusOf(cb.buf.bytes(), cb.done.kind);
+                    var line: [400]u8 = undefined;
+                    d.say("the GPU was lost during an encode: {s}", .{encode.reportLine(&line, cb.done, r)});
+                    const c = &d.contexts[cb.ctx];
+                    if (c.used and c.encoding) c.enc.tally.lost += 1;
                     encode.emptySegment(cb.buf.bytes());
-                    d.say("the GPU was lost during an encode", .{});
                     return va.ERROR_OPERATION_FAILED;
                 },
             }
@@ -1519,10 +1530,16 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const c = &d.contexts[cb.ctx];
             const est: ?*encode.State = if (c.used and c.encoding) &c.enc else null;
             const f = encode.finish(est, cb.buf.bytes(), cb.done);
+            // the first pictures and every failure said in full (the
+            // engine's status words), the rest counted for the context's
+            // last line
+            const say_it = if (est) |e| e.tally.count(cb.done, f.result) else true;
+            var line: [400]u8 = undefined;
             if (f.result.failed()) {
                 d.errors += 1;
-                d.say("an encode failed: error_status {x}, ucode error {x}{s}", .{ f.result.error_status, f.result.ucode_error, if (f.result.ucode_error == nvenc.ENC_ERROR_H264_BAD_MAGIC) " (bad magic: the setup is not the firmware's; GALAXY_VA_NVENC_MAGIC)" else "" });
+                if (say_it) d.say("an encode failed: {s}{s}", .{ encode.reportLine(&line, cb.done, f.result), if (f.result.ucode_error == nvenc.ENC_ERROR_H264_BAD_MAGIC) " (bad magic: the setup is not the firmware's; GALAXY_VA_NVENC_MAGIC)" else "" });
             } else {
+                if (say_it) d.say("encode done: {s}", .{encode.reportLine(&line, cb.done, f.result)});
                 d.debug("encode done: {d} bytes ({d} of headers), {d} slices, average QP {d}{s}", .{ f.bytes, cb.header_bytes, f.result.slices, f.result.avg_qp, if (f.overflow) ", cut: the coded buffer is too small" else "" });
             }
             return va.SUCCESS;
@@ -2012,6 +2029,13 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             if (st != va.SUCCESS) {
                 d.debug("encode picture refused ({x})", .{st});
                 return st;
+            }
+            if (c.decodes == 0) {
+                // (the context's first picture: its setup and methods, for
+                // the boot log)
+                var line: [400]u8 = undefined;
+                d.say("{s}", .{encode.setupLine(&line, c.enc.kind, frame[ENC_SETUP_OFF..][0..nvenc.SETUP_BYTES])});
+                d.say("first picture's methods: {s}", .{encode.pushLine(&line, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords])});
             }
             const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {
                 d.say("an encode was not submitted ({s})", .{@errorName(e)});
