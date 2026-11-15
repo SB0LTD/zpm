@@ -93,6 +93,12 @@ pub fn maxRefs(profile: va.Profile, b_frames: bool) u32 {
     return if (b_frames) MAX_REFS_B else MAX_REFS;
 }
 
+/// The packed headers HEVC's config offers: no parameter sets, so the
+/// driver writes its own (enc_hevc.ownChoices) and the engine's slice data
+/// agrees with them; an app may still pack them (createConfig takes
+/// PACKED_HEADERS), "apppps" offers them as before.
+pub const PACKED_HEADERS_HEVC_OFFERED: u32 = ve.PACKED_HEADER_MISC | ve.PACKED_HEADER_RAW_DATA;
+
 /// The packed headers a codec takes.
 pub fn packedHeaders(kind: Codec) u32 {
     return if (kind == .av1) av1.PACKED_HEADERS else PACKED_HEADERS;
@@ -542,6 +548,12 @@ pub const Try = struct {
     /// pc-full17; static slices faulted the engine); "hevcslicestatic"
     /// for this driver's static slices
     hevc_slice0: bool = true,
+    /// HEVC's config offers the app's packed SPS and PPS ("apppps"; by
+    /// default it does not: PACKED_HEADERS_HEVC_OFFERED)
+    hevc_app_pps: bool = false,
+    /// the driver's own HEVC PPS with NVIDIA's sign hiding, transform skip
+    /// and transform depth too ("nvpps"; enc_hevc.ownChoices)
+    hevc_nv_pps: bool = false,
     /// HEVC's and AV1's reference and reconstruction configurations with
     /// bottom-field offsets, as NVIDIA's driver writes them (the default;
     /// nvenc.setBottomFields), or none ("nobotoff")
@@ -568,6 +580,8 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "hevcslice0")) t.hevc_slice0 = true;
             if (std.ascii.eqlIgnoreCase(w, "hevcslicestatic")) t.hevc_slice0 = false;
             if (std.ascii.eqlIgnoreCase(w, "nobotoff")) t.bottom_fields = false;
+            if (std.ascii.eqlIgnoreCase(w, "apppps")) t.hevc_app_pps = true;
+            if (std.ascii.eqlIgnoreCase(w, "nvpps")) t.hevc_nv_pps = true;
         }
         return t;
     }
@@ -640,6 +654,9 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
     const recon = in.lookup.surface(recon_id) orelse return va.ERROR_INVALID_SURFACE;
     if (recon.luma == in.input.own()) return va.ERROR_INVALID_SURFACE;
 
+    // (HEVC: the driver's own parameter sets in effect, no packed SPS
+    // came: its choices, for the PPS it writes and the setup alike)
+    if (st.kind == .hevc and !st.hevc_params.have_sps) hevc.ownChoices(&st.hevc_seq, &st.hevc_pic, in.try_.hevc_nv_pps);
     // The stream: the driver's parameter sets (no packed ones came), then
     // the app's packed headers.
     const data = in.coded[DATA_OFF..];
@@ -1092,6 +1109,14 @@ fn finishAv1(stream: []u8, n0: usize, r: nvenc.Result, done: Done) usize {
         if (r.av1_lf_level != f.lf[0] and !(r.av1_lf_level == 0 and f.lf[0] == 0)) {
             const l: u6 = @intCast(@min(r.av1_lf_level, 63));
             f.lf = .{ l, l, if (l == 0) 0 else f.lf[2], if (l == 0) 0 else f.lf[3] };
+            changed = true;
+        }
+        // (the CDEF damping the engine used: NVIDIA's setups all say 2,
+        // its headers 1 or 0, from this status word; with the setup's
+        // value in the header every AV1 picture decoded at 26 dB,
+        // pc-full19 and pc-full20)
+        if (r.bits != 0 and r.av1_cdef_damping_minus_3 != f.cdef_damping_minus_3) {
+            f.cdef_damping_minus_3 = @intCast(r.av1_cdef_damping_minus_3 & 3);
             changed = true;
         }
         if (changed) {
@@ -1658,4 +1683,31 @@ test "encode: the headers placed against the engine's slices, the stream where t
     const seg = std.mem.bytesToValue(ve.CodedBufferSegment, coded[0..@sizeOf(ve.CodedBufferSegment)]);
     const p: [*]const u8 = @ptrCast(seg.buf.?);
     try testing.expectEqualSlices(u8, &(hdr ++ [_]u8{0xaa}), p[0..seg.size]);
+}
+
+test "encode: AV1's frame header takes the CDEF damping the engine reports (NVIDIA's driver does: its setups 2, its headers 1)" {
+    const seq = av1.testSeq();
+    const pic = av1.testPic(0x400, 0x1000, true, 0);
+    var f = av1.frameOf(&seq, &pic, 120, true, false, .{0} ** 8);
+    f.cdef_damping_minus_3 = 2;
+    var probe: [512]u8 = undefined;
+    const room: u32 = @intCast(av1.frameHeaderObu(&probe, f, 0).? - 5 + 2);
+    var stream = [_]u8{0} ** 128;
+    const n = av1.frameHeaderObu(&stream, f, room).?;
+    const tg = n;
+    const done = Done{ .kind = .av1, .header_bytes = @intCast(n + 4), .av1_fh_off = 0, .av1_fh_room = room, .av1_tg_size_off = @intCast(tg), .av1_frame = f };
+    _ = finishAv1(&stream, n + 4 + 16, .{ .picture_index = 0, .error_status = 0, .ucode_error = 0, .slices = 1, .avg_qp = 120, .start = 0, .bits = 128, .av1_qindex = 120, .av1_lf_level = f.lf[0], .av1_cdef_damping_minus_3 = 1 }, done);
+    var want_f = f;
+    want_f.cdef_damping_minus_3 = 1;
+    var want = [_]u8{0} ** 128;
+    const m = av1.frameHeaderObu(&want, want_f, room).?;
+    try testing.expectEqual(n, m);
+    try testing.expectEqualSlices(u8, want[0..m], stream[0..m]);
+    // (the same damping: the header left as it was)
+    var again = [_]u8{0} ** 128;
+    _ = av1.frameHeaderObu(&again, f, room).?;
+    _ = finishAv1(&again, n + 4 + 16, .{ .picture_index = 0, .error_status = 0, .ucode_error = 0, .slices = 1, .avg_qp = 120, .start = 0, .bits = 128, .av1_qindex = 120, .av1_lf_level = f.lf[0], .av1_cdef_damping_minus_3 = 2 }, done);
+    var same = [_]u8{0} ** 128;
+    _ = av1.frameHeaderObu(&same, f, room).?;
+    try testing.expectEqualSlices(u8, same[0..n], again[0..n]);
 }
