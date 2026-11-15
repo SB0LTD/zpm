@@ -368,6 +368,9 @@ pub const Setup = struct {
     template: bool = false,
     /// NVIDIA's slice mode (encode.Try.hevc_slice0)
     slice0: bool = false,
+    /// bottom-field offsets on the reference and reconstruction
+    /// configurations (encode.Try.bottom_fields)
+    bottom_fields: bool = false,
 };
 
 /// pic_type: 0 P, 1 B, 2 I, 3 IDR (VA's coding_type: 1 I, 2 P, 3 B).
@@ -435,6 +438,10 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, H.refpic_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
     nvenc.set(buf, H.outputpic_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
     nvenc.set(buf, H.input_cfg_block_height, nvenc.blockHeightField(s.input.block_height));
+    if (s.bottom_fields) {
+        nvenc.setBottomFields(buf, 0, h, s.recon.pitch_luma, s.recon.pitch_chroma);
+        nvenc.setBottomFields(buf, 512, h, s.recon.pitch_luma, s.recon.pitch_chroma);
+    }
     // sps_data
     const min_cb = @as(u32, seq.log2_min_luma_coding_block_size_minus3);
     const ctb = ctbLog2(seq);

@@ -1213,6 +1213,19 @@ pub fn historyBytes(wmbs: usize, hmbs: usize) usize {
 /// less with any other reading); the GPU's other classes take log2, and
 /// this driver wrote log2 (1) before. ASSUMED the same on GB206 (its
 /// input_bl_mode 0 is the same "GPU BL").
+/// A surface configuration's bottom-field offsets (its words 5 and 7:
+/// luma's and chroma's second field, in 256-byte units), as NVIDIA's own
+/// driver writes them on GB206 for progressive HEVC and AV1 pictures too:
+/// half the picture (its height a multiple of 16) down. NVIDIA fills them
+/// on the reference and reconstruction configurations (AV1's fourth too),
+/// none on the input (the WSL captures: 0xff0 and 0x7f8 at 1920x1080);
+/// `cfg_bit` is the configuration's first bit (its word 0).
+pub fn setBottomFields(buf: []u8, cfg_bit: u32, height: u32, pitch_luma: u32, pitch_chroma: u32) void {
+    const h = (height + 15) & ~@as(u32, 15);
+    set(buf, .{ .bit = cfg_bit + 160, .width = 32 }, pitch_luma * (h / 2) / 256);
+    set(buf, .{ .bit = cfg_bit + 224, .width = 32 }, pitch_chroma * (h / 4) / 256);
+}
+
 pub fn blockHeightField(gobs_log2: u7) u7 {
     return @as(u7, 1) << @intCast(@min(gobs_log2, 5));
 }
@@ -1705,4 +1718,12 @@ test "nvenc: NVIDIA's own GB206 HEVC setup reads right with H265" {
     try testing.expectEqual(@as(u64, 11), get(b, H.ceil_log2_pic_size_in_ctbs));
     try testing.expectEqual(@as(u64, 0), get(b, H.sps_temporal_mvp_enabled_flag));
     try testing.expect(get(b, H.gp_timer_timeout_val) >> 31 == 1);
+}
+
+test "nvenc: bottom-field offsets as NVIDIA's driver writes them at 1920x1080 (the WSL captures)" {
+    var b = [_]u8{0} ** 0x80;
+    setBottomFields(&b, 512, 1080, 1920, 1920);
+    try std.testing.expectEqual(@as(u32, 0xff0), std.mem.readInt(u32, b[0x54..0x58], .little));
+    try std.testing.expectEqual(@as(u32, 0x7f8), std.mem.readInt(u32, b[0x5c..0x60], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, b[0x50..0x54], .little));
 }

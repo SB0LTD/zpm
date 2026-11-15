@@ -542,6 +542,10 @@ pub const Try = struct {
     /// pc-full17; static slices faulted the engine); "hevcslicestatic"
     /// for this driver's static slices
     hevc_slice0: bool = true,
+    /// HEVC's and AV1's reference and reconstruction configurations with
+    /// bottom-field offsets, as NVIDIA's driver writes them (the default;
+    /// nvenc.setBottomFields), or none ("nobotoff")
+    bottom_fields: bool = true,
     /// the co-located buffers apart from the history and 1 MiB aligned
     /// (scratchSizesPlaced; the default), or packed after the history as
     /// before pc-full12 ("coloctight")
@@ -563,6 +567,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "av1template")) t.av1_template = true;
             if (std.ascii.eqlIgnoreCase(w, "hevcslice0")) t.hevc_slice0 = true;
             if (std.ascii.eqlIgnoreCase(w, "hevcslicestatic")) t.hevc_slice0 = false;
+            if (std.ascii.eqlIgnoreCase(w, "nobotoff")) t.bottom_fields = false;
         }
         return t;
     }
@@ -828,6 +833,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
                 .magic = in.magic,
                 .template = in.try_.hevc_template,
                 .slice0 = in.try_.hevc_slice0,
+                .bottom_fields = in.try_.bottom_fields,
             });
             a.application_id = nvenc.APPLICATION_ID_H265;
             a.codec_type = nvenc.CODEC_TYPE_H265;
@@ -997,6 +1003,7 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         .magic = in.magic,
         .tiles_at = in.try_.av1_tiles_at,
         .template = in.try_.av1_template,
+        .bottom_fields = in.try_.bottom_fields,
     });
     if (st.firmware_rc and st.rate.active()) a.rc_mode = firmware(st, in, enc_rc.RcFields.of(nvenc.Av1), q);
 
