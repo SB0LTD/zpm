@@ -554,6 +554,9 @@ pub const Try = struct {
     /// the driver's own HEVC PPS with NVIDIA's sign hiding, transform skip
     /// and transform depth too ("nvpps"; enc_hevc.ownChoices)
     hevc_nv_pps: bool = false,
+    /// HEVC P pictures with no AMP, inter transform depth 0 and three merge
+    /// candidates ("hevcp3"; enc_hevc.p3Choices)
+    hevc_p3: bool = false,
     /// AV1 with no loop filter and no CDEF strengths ("av1nofilter")
     av1_nofilter: bool = false,
     /// HEVC's and AV1's reference and reconstruction configurations with
@@ -590,6 +593,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "nobotoff")) t.bottom_fields = false;
             if (std.ascii.eqlIgnoreCase(w, "apppps")) t.hevc_app_pps = true;
             if (std.ascii.eqlIgnoreCase(w, "nvpps")) t.hevc_nv_pps = true;
+            if (std.ascii.eqlIgnoreCase(w, "hevcp3")) t.hevc_p3 = true;
             if (std.ascii.eqlIgnoreCase(w, "av1nofilter")) t.av1_nofilter = true;
             if (std.ascii.eqlIgnoreCase(w, "turingall")) t.turing_all = true;
         }
@@ -667,6 +671,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
     // (HEVC: the driver's own parameter sets in effect, no packed SPS
     // came: its choices, for the PPS it writes and the setup alike)
     if (st.kind == .hevc and !st.hevc_params.have_sps) hevc.ownChoices(&st.hevc_seq, &st.hevc_pic, st.hevc_slices[0..st.slices], in.try_.hevc_nv_pps);
+    if (st.kind == .hevc and in.try_.hevc_p3) hevc.p3Choices(&st.hevc_seq, st.hevc_slices[0..st.slices]);
     // The stream: the driver's parameter sets (no packed ones came), then
     // the app's packed headers.
     const data = in.coded[DATA_OFF..];
