@@ -1353,11 +1353,22 @@ test "driver: HEVC through the fake encoder: the driver's VPS, SPS and PPS, the 
     try testing.expectEqual(enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_U >> 2], enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_V >> 2]);
     try testing.expectEqual(@as(u64, 2), nvenc.get(&enc_seen.setup, nvenc.H265.max_cu_size));
     try testing.expectEqual(@as(u64, 4), nvenc.get(enc_seen.setup[nvenc.H265_SLICE_OFF..], nvenc.H265Slice.num_ctus));
+    // (HEVC's engine reads the surface where it is, in Blackwell's GOBs:
+    // no Turing copy, which only H.264's engine reads; pc-full23)
+    const c = &d.contexts[ctx - CONTEXT_BASE];
+    const in0 = &d.surfaces[surfaces[0] - SURFACE_BASE];
+    try testing.expectEqual(@as(u32, 0), c.enc_input[0].handle);
+    try testing.expectEqual(nvenc.shifted(in0.tiled.va), enc_seen.methods[nvenc.SET_IN_CUR_PIC >> 2]);
+    try testing.expectEqual(nvenc.shifted(in0.tiled.va + in0.layout.chroma_offset), enc_seen.methods[nvenc.SET_IN_CUR_PIC_CHROMA_U >> 2]);
+    // (the PPS's init_qp 26 and the setup's 0, as NVIDIA's: the engine
+    // writes slice_qp_delta against 26; testPic asked 30)
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&enc_seen.setup, nvenc.H265.pic_init_qp_minus26));
     var out: [4 << 10]u8 = undefined;
     const n = try codedBytes(&d, coded, &out);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 0x40, 0x01 }, out[0..6]);
     const cb = &d.coded[d.buffers[coded - driver.BUFFER_BASE].coded];
     try testing.expectEqual(@as(usize, cb.header_bytes + 8), n);
+    try testing.expectEqual(@as(?i32, 0), enc_hevc.ppsInitQpMinus26(out[0..cb.header_bytes]));
     // (the parameter sets alone, for ffmpeg's trace_headers)
     writeFile("/tmp/galaxy-va-enc/hevc-headers.265", out[0..cb.header_bytes]);
     for (ids) |id| try testing.expectEqual(va.SUCCESS, d.destroyBuffer(id));

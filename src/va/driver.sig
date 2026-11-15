@@ -397,8 +397,9 @@ const Context = struct {
     enc: encode.State = undefined,
     enc_scratch: encode.ScratchSizes = undefined,
     /// NVENC's input, a copy for each frame slot laid out in Turing's
-    /// GOBs (driver.Self.nvencInput: GB206's NVENC reads its input
-    /// so), made at the slot's first picture; their dma-buf fds
+    /// GOBs (driver.Self.nvencInput: GB206's H.264 engine reads its input
+    /// so; HEVC and AV1 read the surface itself), made at the slot's first
+    /// picture; their dma-buf fds
     enc_input: [FRAMES]Buf = [_]Buf{.{}} ** FRAMES,
     enc_input_fd: [FRAMES]i32 = [_]i32{-1} ** FRAMES,
     /// VP8 and VP9 (enc_vpx.sig): the state, the packer's scratch, the
@@ -2332,11 +2333,19 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         /// surface already in Turing's layouts (GALAXY_VA_GOB=turing), and
         /// an app's block-linear dma-buf, as its planes lie (an app that
         /// hands Blackwell-laid planes has them read as Turing's).
+        /// That is H.264's engine only: HEVC's reads Blackwell's GOBs (luma
+        /// 8-bit, chroma 16-bit), as the surfaces lie: pc-full23's HEVC
+        /// IDR, decoded, is its source read so and not read as Turing's
+        /// (CTB luma MAD 3 against 23), and AV1's 26 dB is the same
+        /// mix-up's (testsrc2 through it: luma 28.8 dB, AV1 measured 28.8).
+        /// So HEVC and AV1 read the surface in place (encode.Try.turing_all:
+        /// the copy for them too, as before).
         fn nvencInput(d: *Self, c: *Context, si: u16, f: u8, out: *encode.Input) va.Status {
             const s = &d.surfaces[si];
             const im = d.imports[si];
             const sw = s.layout.swizzles(d.opts.gob);
-            if ((im.used and im.layout == .block_linear and im.rgb == null) or (sw[0] == .turing2d and sw[1] == .turing2d)) {
+            const wants_turing = c.enc.kind == .h264 or d.opts.nvenc_try.turing_all;
+            if (!wants_turing or (im.used and im.layout == .block_linear and im.rgb == null) or (sw[0] == .turing2d and sw[1] == .turing2d)) {
                 const st = if (im.rgb != null) d.convertRgb(si) else d.syncTiled(si);
                 if (st != va.SUCCESS) return st;
                 out.* = d.encodeInput(si);

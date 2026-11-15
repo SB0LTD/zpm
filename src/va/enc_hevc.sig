@@ -385,11 +385,24 @@ pub const Setup = struct {
 /// packed PPS (depth 1: groups of 16x16 in 32x32 CTBs) the engine's
 /// pictures did not decode: "cu_qp_delta -1094995529 is outside the valid
 /// range" at the first CTBs of the IDR, every frame zero (pc-full20).
+/// The PPS's init_qp_minus26 is 0, as NVIDIA's own driver writes it: the
+/// engine writes each slice's slice_qp_delta against 26 whatever the
+/// setup's pic_init_qp_minus26 says (QP 30 gave delta 4, QP 28 gave 2), so
+/// a PPS saying 30 (FFmpeg's pic_init_qp) had the decoder at QP 34, its
+/// CABAC contexts wrong from the first CTB: the 5 dB pictures of pc-full19
+/// to pc-full23 (pc-full23's IDR decodes to its source at init_qp 0). The
+/// difference moves into the slices' qp_delta, so the QP asked for (init
+/// plus delta) stays what the app asked.
 /// `nvidia` also takes NVIDIA's sign hiding, transform skip and transform
 /// hierarchy depth 3 (encode.Try.hevc_nv_pps). Applied to the VA
 /// parameters themselves, so the PPS written and the setup agree.
-pub fn ownChoices(seq: *Seq, pic: *Pic, nvidia: bool) void {
+pub fn ownChoices(seq: *Seq, pic: *Pic, slices: []Slice, nvidia: bool) void {
     pic.diff_cu_qp_delta_depth = 0;
+    const shift = @as(i32, pic.pic_init_qp) - 26;
+    if (shift != 0) {
+        for (slices) |*s| s.qp_delta = @intCast(std.math.clamp(@as(i32, s.qp_delta) + shift, -128, 127));
+        pic.pic_init_qp = 26;
+    }
     if (!nvidia) return;
     pic.pic_fields.sign_data_hiding_enabled_flag = 1;
     pic.pic_fields.transform_skip_enabled_flag = 1;
@@ -822,16 +835,46 @@ test "enc_hevc: the controls near the setup, one strip of the CTB rows, the MD's
     for (buf[nvenc.H265.SIZE - 8 .. nvenc.H265.SIZE]) |x| try testing.expectEqual(@as(u8, 0), x);
 }
 
+/// (tests) The init_qp_minus26 of the PPS in an Annex B stream.
+pub fn ppsInitQpMinus26(stream: []const u8) ?i32 {
+    var i: usize = 0;
+    while (i + 5 < stream.len) : (i += 1) {
+        if (!(stream[i] == 0 and stream[i + 1] == 0 and stream[i + 2] == 1 and (stream[i + 3] >> 1) & 0x3f == 34)) continue;
+        var r = enc_parse.Reader.init(stream[i + 3 ..]);
+        _ = r.u(16);
+        _ = r.ue(); // pps id
+        _ = r.ue(); // sps id
+        _ = r.u(7); // dependent slices, output flag, extra bits, sign hiding, cabac init
+        _ = r.ue();
+        _ = r.ue();
+        return r.se();
+    }
+    return null;
+}
+
 test "enc_hevc: the driver's own choices: one quantisation group per CTB (NVIDIA's), the rest of NVIDIA's PPS on asking" {
     var seq = testSeq(64, 48);
     var pic = testPic(0x400, 0x1000, true, 0);
     pic.pic_fields.cu_qp_delta_enabled_flag = 1;
     pic.diff_cu_qp_delta_depth = 1;
-    ownChoices(&seq, &pic, false);
+    // (FFmpeg's CQP 30 IDR: pic_init_qp 30, slice_qp_delta 0; a P slice 33)
+    var sls = [_]Slice{ .{ .num_ctu = 2, .slice_type = 2 }, .{ .num_ctu = 2, .slice_type = 2, .qp_delta = 3 } };
+    ownChoices(&seq, &pic, &sls, false);
     try testing.expectEqual(@as(u8, 0), pic.diff_cu_qp_delta_depth);
     try testing.expectEqual(@as(u1, 0), pic.pic_fields.sign_data_hiding_enabled_flag);
     try testing.expectEqual(@as(u8, 2), seq.max_transform_hierarchy_depth_inter);
-    ownChoices(&seq, &pic, true);
+    // (init_qp 26, as NVIDIA's PPS and the engine's slice headers have it;
+    // the QPs asked for the same: 30 and 33)
+    try testing.expectEqual(@as(u8, 26), pic.pic_init_qp);
+    try testing.expectEqual(@as(i8, 4), sls[0].qp_delta);
+    try testing.expectEqual(@as(i8, 7), sls[1].qp_delta);
+    var ps: [256]u8 = undefined;
+    const n = writeHeadersSized(&ps, &seq, &pic, 64, 48).?;
+    try testing.expectEqual(@as(?i32, 0), ppsInitQpMinus26(ps[0..n]));
+    // (again on the same picture: nothing moves twice)
+    ownChoices(&seq, &pic, &sls, false);
+    try testing.expectEqual(@as(i8, 4), sls[0].qp_delta);
+    ownChoices(&seq, &pic, &sls, true);
     try testing.expectEqual(@as(u1, 1), pic.pic_fields.sign_data_hiding_enabled_flag);
     try testing.expectEqual(@as(u1, 1), pic.pic_fields.transform_skip_enabled_flag);
     try testing.expectEqual(@as(u8, 3), seq.max_transform_hierarchy_depth_intra);
@@ -840,6 +883,7 @@ test "enc_hevc: the driver's own choices: one quantisation group per CTB (NVIDIA
     const sl = Slice{ .num_ctu = 4, .slice_type = 2 };
     setup(&buf, .{ .seq = &seq, .pic = &pic, .slices = &.{sl}, .input = planes, .recon = planes, .ref_ids = [_]u32{va.INVALID_ID} ** nvenc.REF_SLOTS, .ref_poc = [_]i32{0} ** nvenc.REF_SLOTS, .qp = 30, .gop_length = 120, .framerate = 30, .bitstream_start = 0, .bitstream_room = 1 << 22, .history_bytes = 4096 });
     try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.diff_cu_qp_delta_depth));
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.pic_init_qp_minus26));
     try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.cu_qp_delta_enabled_flag));
     try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.sign_data_hiding_enabled_flag));
     try testing.expectEqual(@as(u64, 3), nvenc.get(&buf, H.max_transform_depth_inter));
