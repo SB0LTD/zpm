@@ -709,6 +709,13 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             if (!supported(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
             if (ep == ve.ENTRYPOINT_ENC_SLICE and d.encodes(profile)) {
                 for (attribs) |*a| a.value = encodeAttribute(profile, a.type);
+                // (HEVC: the driver's own parameter sets unless "apppps":
+                // encode.PACKED_HEADERS_HEVC_OFFERED)
+                if (profile == va.PROFILE_HEVC_MAIN and !d.opts.nvenc_try.hevc_app_pps) {
+                    for (attribs) |*a| if (a.type == ve.ATTRIB_ENC_PACKED_HEADERS) {
+                        a.value = encode.PACKED_HEADERS_HEVC_OFFERED;
+                    };
+                }
                 // (B pictures on NVENC only when asked for: encode.MAX_REFS)
                 if (d.opts.nvenc_b_frames and encode.supported(profile) != null) {
                     for (attribs) |*a| if (a.type == ve.ATTRIB_ENC_MAX_REF_FRAMES) {

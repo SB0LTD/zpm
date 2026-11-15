@@ -379,6 +379,24 @@ pub const Setup = struct {
 /// capture: its P pictures' setups say 0 while its bitstream says P, 1).
 /// With HEVC's own 1 there, the engine took a P picture for a B one and
 /// read L1's unbound reference at VA 0 (pc-full17, pc-full18).
+/// The driver's own choices where it writes the parameter sets (the app
+/// packed none): one quantisation group per CTB (diff_cu_qp_delta_depth
+/// 0), as NVIDIA's own driver writes its PPS on GB206. With FFmpeg's
+/// packed PPS (depth 1: groups of 16x16 in 32x32 CTBs) the engine's
+/// pictures did not decode: "cu_qp_delta -1094995529 is outside the valid
+/// range" at the first CTBs of the IDR, every frame zero (pc-full20).
+/// `nvidia` also takes NVIDIA's sign hiding, transform skip and transform
+/// hierarchy depth 3 (encode.Try.hevc_nv_pps). Applied to the VA
+/// parameters themselves, so the PPS written and the setup agree.
+pub fn ownChoices(seq: *Seq, pic: *Pic, nvidia: bool) void {
+    pic.diff_cu_qp_delta_depth = 0;
+    if (!nvidia) return;
+    pic.pic_fields.sign_data_hiding_enabled_flag = 1;
+    pic.pic_fields.transform_skip_enabled_flag = 1;
+    seq.max_transform_hierarchy_depth_inter = 3;
+    seq.max_transform_hierarchy_depth_intra = 3;
+}
+
 pub fn engineSliceType(slice_type: u8) u8 {
     return switch (slice_type) {
         0 => 1,
@@ -802,4 +820,27 @@ test "enc_hevc: the controls near the setup, one strip of the CTB rows, the MD's
     try testing.expectEqual(@as(u64, 60 * 34), nvenc.get(buf[nvenc.H265_SLICE_OFF..], nvenc.H265Slice.num_ctus));
     // (the controls do not overlap the setup or each other)
     for (buf[nvenc.H265.SIZE - 8 .. nvenc.H265.SIZE]) |x| try testing.expectEqual(@as(u8, 0), x);
+}
+
+test "enc_hevc: the driver's own choices: one quantisation group per CTB (NVIDIA's), the rest of NVIDIA's PPS on asking" {
+    var seq = testSeq(64, 48);
+    var pic = testPic(0x400, 0x1000, true, 0);
+    pic.pic_fields.cu_qp_delta_enabled_flag = 1;
+    pic.diff_cu_qp_delta_depth = 1;
+    ownChoices(&seq, &pic, false);
+    try testing.expectEqual(@as(u8, 0), pic.diff_cu_qp_delta_depth);
+    try testing.expectEqual(@as(u1, 0), pic.pic_fields.sign_data_hiding_enabled_flag);
+    try testing.expectEqual(@as(u8, 2), seq.max_transform_hierarchy_depth_inter);
+    ownChoices(&seq, &pic, true);
+    try testing.expectEqual(@as(u1, 1), pic.pic_fields.sign_data_hiding_enabled_flag);
+    try testing.expectEqual(@as(u1, 1), pic.pic_fields.transform_skip_enabled_flag);
+    try testing.expectEqual(@as(u8, 3), seq.max_transform_hierarchy_depth_intra);
+    var buf: [nvenc.SETUP_BYTES]u8 = undefined;
+    const planes = h264.Planes{ .luma = 0, .chroma = 0, .pitch_luma = 64, .pitch_chroma = 64 };
+    const sl = Slice{ .num_ctu = 4, .slice_type = 2 };
+    setup(&buf, .{ .seq = &seq, .pic = &pic, .slices = &.{sl}, .input = planes, .recon = planes, .ref_ids = [_]u32{va.INVALID_ID} ** nvenc.REF_SLOTS, .ref_poc = [_]i32{0} ** nvenc.REF_SLOTS, .qp = 30, .gop_length = 120, .framerate = 30, .bitstream_start = 0, .bitstream_room = 1 << 22, .history_bytes = 4096 });
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&buf, H.diff_cu_qp_delta_depth));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.cu_qp_delta_enabled_flag));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&buf, H.sign_data_hiding_enabled_flag));
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&buf, H.max_transform_depth_inter));
 }
