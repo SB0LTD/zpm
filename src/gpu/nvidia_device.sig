@@ -40,10 +40,11 @@
 //! (sm_120) or `tu102` (sm_75: the RTX 2080 Ti). For sm_75 the run is the
 //! same pushbuffer with TURING_COMPUTE_A's methods (push.Push.sm) and each
 //! QMD is version 02_02 (qmd.buildFor); constant buffer 0 keeps this
-//! layout. Not offered there: the 3D engine (its class and texture words
-//! are other ones, not ported) and indirect dispatches (the patch kernel
-//! is prebuilt sm_120 code writing a v05_00 QMD's words). `Emu.setSm`
-//! makes the emulated card a Turing one. Nothing sm_75 has run on a card.
+//! layout. An indirect dispatch's patch kernel is the same KIR compiled
+//! for sm_75, writing a version 02_02 QMD's words (indirectPatchKernel75).
+//! Not offered there: the 3D engine (its class and texture words are
+//! other ones, not ported). `Emu.setSm` makes the emulated card a Turing
+//! one. Nothing sm_75 has run on a card.
 //!
 //! Allocation-free: the adapter's state is the caller's (Adapter, Emu).
 
@@ -115,15 +116,15 @@ pub fn rtx5070(vram: u64) gpu.Caps {
 }
 
 /// The RTX 2080 Ti's (TU102, Turing) caps, `vram` bytes of VRAM: compute
-/// kernels compiled for sm_75. No indirect dispatches and no graphics
-/// (see the header). Proven on the emulated card only.
+/// kernels compiled for sm_75, stamps and indirect dispatches as on the
+/// RTX 5070. No graphics (see the header). Proven on the emulated card
+/// only.
 pub fn tu102(vram: u64) gpu.Caps {
     var c = rtx5070(vram);
     c.target = .sm_75;
     c.name = "RTX 2080 Ti (TU102, sm_75)";
     // (a Turing SM's largest split, 64 KiB, none of it reserved)
     c.shared_bytes = qmd.maxKernelShared(.sm_75);
-    c.indirect = false;
     return c;
 }
 
@@ -572,10 +573,15 @@ pub const Adapter = struct {
                 extra += 1;
                 const qva = s.slots.va + i * SLOT_BYTES;
                 const nop_va = pp.nop.code.gpu;
-                // (the patch writes the program address's low words only)
-                if (nop_va >> 36 != d.prog.code.gpu >> 36 or nop_va >> 40 != d.prog.code.gpu >> 40) return error.Unsupported;
+                const on_turing = a.sm() == .sm_75;
+                // (the patch writes the program address's low words only:
+                // version 05_00's two shifted ones, version 02_02's low 32
+                // bits)
+                if (on_turing) {
+                    if (nop_va >> 32 != d.prog.code.gpu >> 32) return error.Unsupported;
+                } else if (nop_va >> 36 != d.prog.code.gpu >> 36 or nop_va >> 40 != d.prog.code.gpu >> 40) return error.Unsupported;
                 const pb = [3]gpu.Buffer{ ind.buf, .{ .gpu = qva, .bytes = SLOT_BYTES }, .{ .gpu = qva + CBUF_AT + qmd.CB_GRID, .bytes = 12 } };
-                const pw = [3]u32{ @intCast(ind.off), @truncate(nop_va >> 4), @truncate(nop_va >> 8) };
+                const pw = if (on_turing) [3]u32{ @intCast(ind.off), @truncate(nop_va), 0 } else [3]u32{ @intCast(ind.off), @truncate(nop_va >> 4), @truncate(nop_va >> 8) };
                 try a.buildSlot(s, ps, .{ .prog = &pp.patch, .groups = .{ 1, 1, 1 }, .buffers = &pb, .params = &pw }, null);
                 p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
                 p.invalidateShaderCaches();
@@ -755,8 +761,8 @@ pub const Adapter = struct {
     /// loaded at the first indirect dispatch.
     fn indirectProgs(a: *Adapter, ctx: *anyopaque) gpu.Error!*const IndirectProgs {
         if (a.indirect_progs == null) {
-            const patch = try load(ctx, &indirectPatchBinary());
-            const nop = load(ctx, &nopBinary()) catch |e| {
+            const patch = try load(ctx, &indirectPatchBinaryFor(a.sm()));
+            const nop = load(ctx, &nopBinaryFor(a.sm())) catch |e| {
                 unload(ctx, &patch);
                 return e;
             };
@@ -2844,6 +2850,69 @@ pub fn indirectPatchKernel(k: *kir.Kernel) void {
     k.endif();
 }
 
+/// The same for a version 02_02 QMD (Turing): CTA_RASTER_WIDTH is word
+/// 12, CTA_RASTER_HEIGHT and CTA_RASTER_DEPTH the low halves of words 13
+/// and 14; a zero count's nop program goes into PROGRAM_ADDRESS_LOWER,
+/// word 48 (param 1: the address's low 32 bits; its upper bits are the
+/// dispatch's own program's, which run() checks).
+pub fn indirectPatchKernel75(k: *kir.Kernel) void {
+    const cnt = k.binding();
+    const q = k.binding();
+    const cb = k.binding();
+    const off = k.param(.u32, 0);
+    var m = kir.global(cnt, 32);
+    const x = k.load(.u32, m, r(off));
+    m.imm = 4;
+    const y = k.load(.u32, m, r(off));
+    m.imm = 8;
+    const z = k.load(.u32, m, r(off));
+    const zero = k.op2(.por, .pred, r(k.cmp(.u32, .eq, r(x), u(0))), r(k.op2(.por, .pred, r(k.cmp(.u32, .eq, r(y), u(0))), r(k.cmp(.u32, .eq, r(z), u(0))))));
+    const gx = k.sel(.u32, r(zero), u(1), r(x));
+    const gy = k.sel(.u32, r(zero), u(1), r(y));
+    const gz = k.sel(.u32, r(zero), u(1), r(z));
+    k.store(.u32, kir.global(q, 32), u(12 * 4), r(gx));
+    k.store(.u32, kir.global(q, 16), u(13 * 4), r(gy));
+    k.store(.u32, kir.global(q, 16), u(14 * 4), r(gz));
+    k.store(.u32, kir.global(cb, 32), u(0), r(gx));
+    k.store(.u32, kir.global(cb, 32), u(4), r(gy));
+    k.store(.u32, kir.global(cb, 32), u(8), r(gz));
+    k.ifp(r(zero));
+    k.store(.u32, kir.global(q, 32), u(48 * 4), r(k.param(.u32, 1)));
+    k.endif();
+}
+comptime {
+    // (the words the two patch kernels write are these fields')
+    if (qmd.F.GRID_WIDTH[1] != 39 * 32 or qmd.F.GRID_HEIGHT[1] != 40 * 32 or qmd.F.GRID_DEPTH[1] != 41 * 32) @compileError("the patch kernel's grid words are not version 05_00's");
+    if (qmd.F.PROGRAM_ADDRESS_LOWER_SHIFTED4[1] != 32 * 32 or qmd.F.PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED[1] != 59 * 32) @compileError("the patch kernel's program words are not version 05_00's");
+    if (qmd.F2.CTA_RASTER_WIDTH[1] != 12 * 32 or qmd.F2.CTA_RASTER_HEIGHT[1] != 13 * 32 or qmd.F2.CTA_RASTER_DEPTH[1] != 14 * 32) @compileError("the patch kernel's grid words are not version 02_02's");
+    if (qmd.F2.PROGRAM_ADDRESS_LOWER[1] != 48 * 32) @compileError("the patch kernel's program word is not version 02_02's");
+}
+
+/// kir_sm120's binaries of indirectPatchKernel75 and of the nop program
+/// for sm_75 (the test below keeps them so).
+const indirect_patch_code75 = [_]u64{
+    0x0000e000ff007b82, 0x000e020000000a00, 0x0000e200ff027b82, 0x000e420000000a00,
+    0x0000e400ff047b82, 0x000e820000000a00, 0x0000e600ff067b82, 0x000ec40000000800,
+    0x0000000106007825, 0x009fcc00078e0000, 0x0000003f00067981, 0x0000c2000c1ee900,
+    0x0000043f00077981, 0x000944000c1ee900, 0x0000083f00007981, 0x011102000c1ee900,
+    0x000000ff0600720c, 0x008fc20003f02070, 0x000000ff0700720c, 0x020fda0003f22070,
+    0x000000ff0000720c, 0x010fda0000f22470, 0x000000000000781c, 0x000fda0000703f74,
+    0x0000000106017807, 0x001fc80004000000, 0x0000000107067807, 0x000fc20004000000,
+    0x0000000100007807, 0x000fc20004000000, 0x0000300102007986, 0x0021c8000c10e93f,
+    0x0000340602007986, 0x0003c2000c10e53f, 0x0000380002007986, 0x0007c2000c10e53f,
+    0x0000000104007986, 0x0045c2000c10e93f, 0x0000040604007986, 0x0009c2000c10e93f,
+    0x0000080004007986, 0x000bc4000c10e93f, 0x0000e700ff000b82, 0x028ec40000000800,
+    0x0000c00002000986, 0x0087c4000c10e93f, 0x000000000000794d, 0x01ffc20003800000,
+};
+const indirect_patch_regs75: u32 = 10;
+const nop_code75 = [_]u64{
+    0x000000000000794d, 0x000fc20003800000, 0x000000000000794d, 0x000fc20003800000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+};
+const nop_regs75: u32 = 3;
+
 const indirect_patch_code = [_]u64{
     0x0000e000ff007b82, 0x000e020000000a00, 0x0000e600ff027b82, 0x000e420000000800,
     0x0000e200ff047b82, 0x000e820000000a00, 0x0000e400ff067b82, 0x000ec20000000a00,
@@ -2871,33 +2940,87 @@ const nop_code = [_]u64{
 };
 const nop_regs: u32 = 3;
 
-fn prebuilt(code: []const u64, regs: u32, bindings: u8, params: u16) gpu.Binary {
-    return .{ .target = .sm_120, .code = std.mem.sliceAsBytes(code), .regs = regs, .shared_bytes = 0, .group = .{ 1, 1, 1 }, .bindings = bindings, .param_words = params };
+fn prebuilt(target: gpu.Target, code: []const u64, regs: u32, bindings: u8, params: u16) gpu.Binary {
+    return .{ .target = target, .code = std.mem.sliceAsBytes(code), .regs = regs, .shared_bytes = 0, .group = .{ 1, 1, 1 }, .bindings = bindings, .param_words = params };
 }
 fn indirectPatchBinary() gpu.Binary {
-    return prebuilt(&indirect_patch_code, indirect_patch_regs, 3, 3);
+    return prebuilt(.sm_120, &indirect_patch_code, indirect_patch_regs, 3, 3);
 }
 fn nopBinary() gpu.Binary {
-    return prebuilt(&nop_code, nop_regs, 0, 0);
+    return prebuilt(.sm_120, &nop_code, nop_regs, 0, 0);
+}
+/// The patch kernel and the nop program for a shader model.
+fn indirectPatchBinaryFor(model: push.Sm) gpu.Binary {
+    return if (model == .sm_75) prebuilt(.sm_75, &indirect_patch_code75, indirect_patch_regs75, 3, 2) else indirectPatchBinary();
+}
+fn nopBinaryFor(model: push.Sm) gpu.Binary {
+    return if (model == .sm_75) prebuilt(.sm_75, &nop_code75, nop_regs75, 0, 0) else nopBinary();
 }
 
-test "indirect dispatch: the prebuilt patch and nop kernels are kir_sm120's" {
-    const caps = emuCaps();
-    for (0..2) |which| {
-        var k = newKernel(if (which == 0) "vk_indirect_patch" else "vk_nop", .{ 1, 1, 1 });
-        if (which == 0) indirectPatchKernel(&k) else k.ret();
-        try k.finish();
-        const bin = try kir_sm120.compileIn(&k, caps, &T.st, &T.code, .{});
-        const words: []const u64 = @alignCast(std.mem.bytesAsSlice(u64, bin.code));
-        const want = if (which == 0) indirectPatchBinary() else nopBinary();
-        const matches = std.mem.eql(u8, bin.code, want.code) and bin.regs == want.regs and bin.extra[kir_sm120.EXTRA_STACK] == 0;
-        if (!matches) {
-            std.debug.print("{s}: regs {d}, code:\n", .{ k.name, bin.regs });
-            for (words) |w| std.debug.print("0x{x:0>16}, ", .{w});
-            std.debug.print("\n", .{});
-            return error.TestUnexpectedResult;
+test "indirect dispatch: the prebuilt patch and nop kernels are kir_sm120's, for sm_120 and for sm_75" {
+    var bad = false;
+    for ([_]push.Sm{ .sm_120, .sm_75 }) |model| {
+        const caps = emuCapsFor(model);
+        for (0..2) |which| {
+            var k = newKernel(if (which == 0) "vk_indirect_patch" else "vk_nop", .{ 1, 1, 1 });
+            if (which != 0) k.ret() else if (model == .sm_75) indirectPatchKernel75(&k) else indirectPatchKernel(&k);
+            try k.finish();
+            const bin = try kir_sm120.compileIn(&k, caps, &T.st, &T.code, .{});
+            const words: []const u64 = @alignCast(std.mem.bytesAsSlice(u64, bin.code));
+            const want = if (which == 0) indirectPatchBinaryFor(model) else nopBinaryFor(model);
+            const matches = std.mem.eql(u8, bin.code, want.code) and bin.regs == want.regs and bin.target == want.target and bin.param_words == want.param_words and bin.extra[kir_sm120.EXTRA_STACK] == 0;
+            if (!matches) {
+                std.debug.print("{s} for {s}: regs {d}, params {d}, code:\n", .{ k.name, model.name(), bin.regs, bin.param_words });
+                for (words, 0..) |w, i| std.debug.print("0x{x:0>16},{s}", .{ w, if (i % 4 == 3) "\n" else " " });
+                std.debug.print("\n", .{});
+                bad = true;
+            }
         }
     }
+    if (bad) return error.TestUnexpectedResult;
+}
+
+/// An indirect dispatch on the emulated card of the test's generation: a
+/// kernel marks each group that ran and counts them; the counts come from
+/// a buffer (as a GPU would have written them), three shapes, one of them
+/// zero (nothing runs: the nop program's one group).
+fn indirectDispatch() !void {
+    const d = freshEmu();
+    try testing.expect(d.caps.indirect);
+    var k = newKernel("marks", .{ 1, 1, 1 });
+    const O = k.binding();
+    const g = k.op3(.imad, .u32, r(k.gid(1)), u(8), r(k.gid(0)));
+    k.store(.u32, kir.global(O, 32), r(k.op2(.shl, .u32, r(g), u(2))), r(k.op2(.iadd, .u32, r(g), u(0x1000))));
+    _ = k.atomic(.u32, .add, kir.global(O, 32), u(63 * 4), u(1));
+    // (the grid as the kernel reads it: %nctaid, patched in cbuf0 too)
+    k.store(.u32, kir.global(O, 32), u(62 * 4), r(k.op3(.imad, .u32, r(k.gsize(1)), u(256), r(k.gsize(0)))));
+    try k.finish();
+    const bin = try kir_sm120.compileIn(&k, d.caps, &T.st, &T.code, .{});
+    const prog = try d.load(&bin);
+    const out = try d.alloc(256, .host);
+    const cnt = try d.alloc(64, .host);
+    for ([_][3]u32{ .{ 3, 2, 1 }, .{ 0, 5, 1 }, .{ 8, 1, 1 }, .{ 2, 2, 0 } }) |c| {
+        @memset(out.cpu, 0);
+        d.toDevice(out, 0, out.bytes);
+        @memset(cnt.cpu, 0xee);
+        for (c, 0..) |v, j| std.mem.writeInt(u32, cnt.cpu[16 + 4 * j ..][0..4], v, .little);
+        d.toDevice(cnt, 0, cnt.bytes);
+        // (the dispatch's own counts are not read: the buffer's are)
+        try runWait(d, &.{.{ .prog = &prog, .groups = .{ 7, 7, 7 }, .buffers = &.{out}, .params = &.{}, .indirect = .{ .buf = cnt, .off = 16 } }});
+        d.fromDevice(out, 0, out.bytes);
+        const w = words32(out);
+        const n = c[0] * c[1] * c[2];
+        try testing.expectEqual(n, w[63]);
+        for (0..62) |i| {
+            const ran = n != 0 and i % 8 < c[0] and i / 8 < c[1];
+            try testing.expectEqual(if (ran) @as(u32, @intCast(i)) + 0x1000 else 0, w[i]);
+        }
+        try testing.expectEqual(if (n != 0) c[0] | c[1] << 8 else 0, w[62]);
+    }
+}
+
+test "indirect dispatch on the emulated RTX: the counts the buffer holds run, a zero count runs nothing" {
+    try indirectDispatch();
 }
 
 // ── sm_75 (Turing: the RTX 2080 Ti) ─────────────────────────────────────────
@@ -2947,12 +3070,18 @@ test "sm_75: memory forms, atomics, barriers, shuffles, votes, control flow, ids
     try idsParams();
 }
 
-test "sm_75: Turing's forms in the text; the other generation's binary, indirect dispatch and graphics refused; a divergent collective without WARPSYNC" {
+test "sm_75: an indirect dispatch on the emulated Turing card: its patch kernel writes the version 02_02 QMD" {
+    turing();
+    defer blackwell();
+    try indirectDispatch();
+}
+
+test "sm_75: Turing's forms in the text; the other generation's binary and graphics refused; a divergent collective without WARPSYNC" {
     turing();
     defer blackwell();
     const d = freshEmu();
     try testing.expectEqual(gpu.Target.sm_75, d.caps.target);
-    try testing.expect(!d.caps.indirect and !d.caps.graphics);
+    try testing.expect(d.caps.indirect and !d.caps.graphics);
     try testing.expect(!withGraphics(d.caps).graphics);
     try testing.expectEqual(qmd.MAX_SHARED_SM75, d.caps.shared_bytes);
     var k = newKernel("one", .{ 32, 1, 1 });
@@ -2981,8 +3110,6 @@ test "sm_75: Turing's forms in the text; the other generation's binary, indirect
     try runWait(d, &.{.{ .prog = &prog, .groups = .{ 1, 1, 1 }, .buffers = &.{b}, .params = &.{} }});
     d.fromDevice(b, 0, 128);
     for (words32(b), 0..) |x, i| try testing.expectEqual(@as(u32, @intCast(i + @min(i, 7))), x);
-    // indirect dispatch: not offered, refused
-    try testing.expectError(error.Unsupported, d.run(&.{.{ .prog = &prog, .groups = .{ 1, 1, 1 }, .buffers = &.{b}, .params = &.{}, .indirect = .{ .buf = b, .off = 0 } }}));
     // the kernel compiled for sm_120 does not load on the Turing card ...
     const bin120 = try kir_sm120.compileIn(&k, emuCaps(), &T.st, &T.code, .{});
     try testing.expectEqual(gpu.Target.sm_120, bin120.target);

@@ -107,8 +107,7 @@ pub const CHIP_X1_45: u32 = 0x4303_0c00;
 /// over nouveau's chipset number, GB206 (sm_120).
 pub const CHIP_GB206: u32 = 0x10de_01b6;
 /// The RTX 2080 Ti's (nv_dev's id for TU102, Turing: sm_75). Compute
-/// kernels only: its caps offer no 3D engine and no indirect dispatch
-/// (gpu.nvidia_device.tu102).
+/// kernels only: its caps offer no 3D engine (gpu.nvidia_device.tu102).
 pub const CHIP_TU102: u32 = 0x10de_0162;
 
 /// The GPUs this client knows.
@@ -1157,7 +1156,7 @@ test "node: RTX PRIME import maps a shared buffer and counts repeated imports" {
     try std.testing.expectEqual(@as(u32, 0), k.live);
 }
 
-test "node: a Turing card (TU102) is an NVIDIA node with sm_75 caps, no 3D engine and no indirect dispatch; an image without the sm_75 backend refuses it" {
+test "node: a Turing card (TU102) is an NVIDIA node with sm_75 caps and no 3D engine; an image without the sm_75 backend refuses it" {
     try std.testing.expectEqual(Kind.nvidia, kindOf(CHIP_TU102).?);
     try std.testing.expectEqual(@as(u32, 0x10de_0000 | 0x162), CHIP_TU102);
     var k: Fake = undefined;
@@ -1167,7 +1166,7 @@ test "node: a Turing card (TU102) is an NVIDIA node with sm_75 caps, no 3D engin
     g.want_graphics = true;
     const d = try g.open();
     try std.testing.expectEqual(gpu.Target.sm_75, d.caps.target);
-    try std.testing.expect(!d.caps.graphics and !d.caps.indirect);
+    try std.testing.expect(!d.caps.graphics and d.caps.indirect);
     g.node.close();
     // (the Legion's card through the same image: sm_120, as before)
     g = Both{ .node = testNode(&k) };
