@@ -564,6 +564,12 @@ pub const Try = struct {
     /// (scratchSizesPlaced; the default), or packed after the history as
     /// before pc-full12 ("coloctight")
     coloc_apart: bool = true,
+    /// HEVC and AV1 read the frame slot's Turing copy of the input, as
+    /// H.264 does ("turingall"; before pc-full24). By default they read
+    /// the surface where it is, in Blackwell's GOBs: pc-full23's HEVC IDR
+    /// matches its source read so (luma b8, chroma b16) and not read as
+    /// Turing's; only GB206's H.264 engine reads Turing's (driver.nvencInput)
+    turing_all: bool = false,
 
     /// The words of `v` (others ignored).
     pub fn parse(v: []const u8) Try {
@@ -585,6 +591,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "apppps")) t.hevc_app_pps = true;
             if (std.ascii.eqlIgnoreCase(w, "nvpps")) t.hevc_nv_pps = true;
             if (std.ascii.eqlIgnoreCase(w, "av1nofilter")) t.av1_nofilter = true;
+            if (std.ascii.eqlIgnoreCase(w, "turingall")) t.turing_all = true;
         }
         return t;
     }
@@ -659,7 +666,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
 
     // (HEVC: the driver's own parameter sets in effect, no packed SPS
     // came: its choices, for the PPS it writes and the setup alike)
-    if (st.kind == .hevc and !st.hevc_params.have_sps) hevc.ownChoices(&st.hevc_seq, &st.hevc_pic, in.try_.hevc_nv_pps);
+    if (st.kind == .hevc and !st.hevc_params.have_sps) hevc.ownChoices(&st.hevc_seq, &st.hevc_pic, st.hevc_slices[0..st.slices], in.try_.hevc_nv_pps);
     // The stream: the driver's parameter sets (no packed ones came), then
     // the app's packed headers.
     const data = in.coded[DATA_OFF..];
