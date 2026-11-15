@@ -255,6 +255,12 @@ pub const Gpu = struct {
         return g.create(.video, null, bytes, null);
     }
 
+    /// The same at GPU address `va` (in a range `reserve` kept).
+    pub fn allocVideoAt(g: *Gpu, bytes: u64, va: u64) Error!Region {
+        if (va % nv.ALLOCATION_UNIT != 0) return error.BadMemory;
+        return g.create(.video, null, bytes, va);
+    }
+
     /// The allocation destroyed (its GPU address unmapped with it).
     pub fn release(g: *Gpu, r: Region) void {
         if (r.handle == 0) return;

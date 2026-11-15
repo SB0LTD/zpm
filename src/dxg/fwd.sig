@@ -57,6 +57,11 @@ pub const Op = enum(u32) {
     /// chan. Answer: a = the channel's last finished fence, b = 1 when the
     /// channel faulted (lost: open another).
     state = 8,
+    /// b: GPU address, c: bytes. The GPU's own memory (VRAM) there: the
+    /// guest has no view of it, the GPU reads and writes it at full speed
+    /// (a frame drawn there and copied out, gfx_pipe's). Answer: a = a
+    /// handle; `unmap` gives it back.
+    map_video = 9,
     _,
 };
 

@@ -61,6 +61,7 @@ pub const Server = struct {
             .close => s.closeChannel(r.chan),
             .submit => s.submit(r),
             .state => s.state(r.chan),
+            .map_video => s.mapVideo(r),
             _ => .{ .status = @intFromEnum(fwd.Status.invalid) },
         };
     }
@@ -105,6 +106,18 @@ pub const Server = struct {
             if (m.handle == 0) break m;
         } else return fail(.busy);
         slot.* = s.mapGuest(r.a, r.b, r.c) orelse return fail(.refused);
+        return .{ .a = slot.handle };
+    }
+
+    fn mapVideo(s: *Server, r: fwd.Request) fwd.Response {
+        if (!s.window or !fwd.inWindow(r.b, r.c)) return fail(.invalid);
+        const slot = for (&s.maps) |*m| {
+            if (m.handle == 0) break m;
+        } else return fail(.busy);
+        slot.* = s.gpu.allocVideoAt(r.c, r.b) catch |e| {
+            s.say("fwd: VRAM {d} KiB at 0x{x}: {s}", .{ r.c >> 10, r.b, @errorName(e) });
+            return fail(.refused);
+        };
         return .{ .a = slot.handle };
     }
 
