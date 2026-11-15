@@ -539,11 +539,12 @@ pub const Try = struct {
     /// the setup 4 KiB aligned in its frame slot ("setup4k"; the driver's)
     setup_4k: bool = false,
     /// NVIDIA's own captured setup (an I or P picture's) as the base of
-    /// every HEVC setup, this driver's fields over it: the default, with
-    /// hevc_nv_pps (pc-full25b: with both, HEVC's P picture decoded at 42.8
-    /// dB, NVIDIA's own encoder 44.5; without, garbage, 7 dB);
-    /// "nohevctemplate" for this driver's setup alone
-    hevc_template: bool = true,
+    /// every HEVC setup, this driver's fields over it ("hevctemplate").
+    /// Not needed: NVIDIA's PPS choices (hevc_nv_pps) alone gave the same
+    /// stream to the last decimal (pc-full27: 1080p 41.52 dB either way, the
+    /// small streams the same), so the driver carries no captured bytes it
+    /// does not need; "nohevctemplate" is the default's name for it
+    hevc_template: bool = false,
     /// the same for AV1 (a key or inter frame's: "av1template")
     av1_template: bool = false,
     /// HEVC's slice mode as NVIDIA's driver writes it: dynamic, no strip
