@@ -554,6 +554,8 @@ pub const Try = struct {
     /// the driver's own HEVC PPS with NVIDIA's sign hiding, transform skip
     /// and transform depth too ("nvpps"; enc_hevc.ownChoices)
     hevc_nv_pps: bool = false,
+    /// AV1 with no loop filter and no CDEF strengths ("av1nofilter")
+    av1_nofilter: bool = false,
     /// HEVC's and AV1's reference and reconstruction configurations with
     /// bottom-field offsets, as NVIDIA's driver writes them (the default;
     /// nvenc.setBottomFields), or none ("nobotoff")
@@ -582,6 +584,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "nobotoff")) t.bottom_fields = false;
             if (std.ascii.eqlIgnoreCase(w, "apppps")) t.hevc_app_pps = true;
             if (std.ascii.eqlIgnoreCase(w, "nvpps")) t.hevc_nv_pps = true;
+            if (std.ascii.eqlIgnoreCase(w, "av1nofilter")) t.av1_nofilter = true;
         }
         return t;
     }
@@ -674,7 +677,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
                 n += h264.writePps(data[n..HEADER_BYTES], st.profile, &st.h264_pic) orelse return va.ERROR_NOT_ENOUGH_BUFFER;
             },
             .hevc => {
-                n += hevc.writeHeadersSized(data[n..HEADER_BYTES], &st.hevc_seq, &st.hevc_pic, st.width, st.height) orelse return va.ERROR_NOT_ENOUGH_BUFFER;
+                n += hevc.writeHeadersSized(data[n..HEADER_BYTES], &st.hevc_seq, &st.hevc_pic, @min(st.width, in.input.width), @min(st.height, in.input.height)) orelse return va.ERROR_NOT_ENOUGH_BUFFER;
                 // (the driver's own parameter sets: their defaults)
                 st.hevc_params = .{};
             },
@@ -907,7 +910,16 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
     const t = av1.rcType(pic);
     const plan = st.rate.plan(t, pic.base_qindex);
     const q: u8 = @intCast(std.math.clamp(plan.qp, 1, 255));
-    const frame = av1.frameOf(seq, pic, q, show, showable, as.slot_hint);
+    var frame = av1.frameOf(seq, pic, q, show, showable, as.slot_hint);
+    // ("av1nofilter": no loop filter and no CDEF strengths, in the setup
+    // and the header alike: whether AV1's 26 dB (pc-full19..21) lives in
+    // the filters)
+    if (in.try_.av1_nofilter) {
+        frame.lf = .{ 0, 0, 0, 0 };
+        frame.cdef_bits = 0;
+        frame.cdef_y = .{0} ** 8;
+        frame.cdef_uv = .{0} ** 8;
+    }
 
     // The stream: a temporal delimiter (a new temporal unit), the
     // sequence header at a key frame (the app's, or the driver's), the
