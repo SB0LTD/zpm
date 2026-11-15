@@ -539,8 +539,11 @@ pub const Try = struct {
     /// the setup 4 KiB aligned in its frame slot ("setup4k"; the driver's)
     setup_4k: bool = false,
     /// NVIDIA's own captured setup (an I or P picture's) as the base of
-    /// every HEVC setup, this driver's fields over it ("hevctemplate")
-    hevc_template: bool = false,
+    /// every HEVC setup, this driver's fields over it: the default, with
+    /// hevc_nv_pps (pc-full25b: with both, HEVC's P picture decoded at 42.8
+    /// dB, NVIDIA's own encoder 44.5; without, garbage, 7 dB);
+    /// "nohevctemplate" for this driver's setup alone
+    hevc_template: bool = true,
     /// the same for AV1 (a key or inter frame's: "av1template")
     av1_template: bool = false,
     /// HEVC's slice mode as NVIDIA's driver writes it: dynamic, no strip
@@ -552,8 +555,9 @@ pub const Try = struct {
     /// default it does not: PACKED_HEADERS_HEVC_OFFERED)
     hevc_app_pps: bool = false,
     /// the driver's own HEVC PPS with NVIDIA's sign hiding, transform skip
-    /// and transform depth too ("nvpps"; enc_hevc.ownChoices)
-    hevc_nv_pps: bool = false,
+    /// and transform depth too (enc_hevc.ownChoices): the default, with
+    /// hevc_template; "nonvpps" for FFmpeg's choices there
+    hevc_nv_pps: bool = true,
     /// HEVC P pictures with no AMP, inter transform depth 0 and three merge
     /// candidates ("hevcp3"; enc_hevc.p3Choices)
     hevc_p3: bool = false,
@@ -587,12 +591,14 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "setup4k")) t.setup_4k = true;
             if (std.ascii.eqlIgnoreCase(w, "coloctight")) t.coloc_apart = false;
             if (std.ascii.eqlIgnoreCase(w, "hevctemplate")) t.hevc_template = true;
+            if (std.ascii.eqlIgnoreCase(w, "nohevctemplate")) t.hevc_template = false;
             if (std.ascii.eqlIgnoreCase(w, "av1template")) t.av1_template = true;
             if (std.ascii.eqlIgnoreCase(w, "hevcslice0")) t.hevc_slice0 = true;
             if (std.ascii.eqlIgnoreCase(w, "hevcslicestatic")) t.hevc_slice0 = false;
             if (std.ascii.eqlIgnoreCase(w, "nobotoff")) t.bottom_fields = false;
             if (std.ascii.eqlIgnoreCase(w, "apppps")) t.hevc_app_pps = true;
             if (std.ascii.eqlIgnoreCase(w, "nvpps")) t.hevc_nv_pps = true;
+            if (std.ascii.eqlIgnoreCase(w, "nonvpps")) t.hevc_nv_pps = false;
             if (std.ascii.eqlIgnoreCase(w, "hevcp3")) t.hevc_p3 = true;
             if (std.ascii.eqlIgnoreCase(w, "av1nofilter")) t.av1_nofilter = true;
             if (std.ascii.eqlIgnoreCase(w, "turingall")) t.turing_all = true;
