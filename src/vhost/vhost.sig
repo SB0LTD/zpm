@@ -17,6 +17,13 @@
 //! descriptors, no event index. One connection at a time; a request is
 //! handled to its end before the next.
 //!
+//! Polling (`poll_us`): after a request the backend keeps reading the
+//! queues for that long with the used ring's NO_NOTIFY flag up, so a
+//! driver that honours it sends a burst of requests without a doorbell
+//! each (a doorbell is a VM exit, dear under nested virtualization: KVM in
+//! WSL). Then the flag comes down, the queues are read once more (a
+//! request made meanwhile rang no doorbell) and the backend sleeps.
+//!
 //! `guestBytes` gives the device a guest-physical range as this process's
 //! memory (the GPU forwarding maps it for the GPU).
 //!
@@ -110,6 +117,8 @@ pub const Backend = struct {
     /// Requests handled (for the log).
     handled: u64 = 0,
     log: ?*const fn (line: []const u8) void = null,
+    /// How long to keep polling the queues after a request (us; 0: never).
+    poll_us: u64 = 0,
 
     /// Listens on Unix socket `path` (replaced if it exists), for a
     /// device with `nqueues` virtqueues.
@@ -154,12 +163,14 @@ pub const Backend = struct {
                     return e;
                 };
             }
+            var got: usize = 0;
             for (fds[1..n], 0..) |f, k| {
                 if (f.revents & linux.POLL.IN == 0) continue;
                 var v: u64 = 0;
                 _ = linux.read(f.fd, @ptrCast(&v), 8);
-                b.drain(which[k], h);
+                got += b.drain(which[k], h);
             }
+            if (got != 0 and b.poll_us != 0) b.pollAwhile(h);
         }
     }
 
@@ -347,9 +358,32 @@ pub const Backend = struct {
     // ── Requests ───────────────────────────────────────────────────────────
 
     /// Every request the guest has made available on queue `qi`, handled.
-    fn drain(b: *Backend, qi: u32, h: Handler) void {
+    /// The queues read for `poll_us` after the last request, doorbells off.
+    fn pollAwhile(b: *Backend, h: Handler) void {
+        b.setNoNotify(true);
+        var last = nowUs();
+        while (nowUs() - last < b.poll_us) {
+            var got: usize = 0;
+            for (0..b.nqueues) |qi| got += b.drain(@intCast(qi), h);
+            if (got != 0) last = nowUs() else std.atomic.spinLoopHint();
+        }
+        b.setNoNotify(false);
+        fullFence();
+        for (0..b.nqueues) |qi| _ = b.drain(@intCast(qi), h);
+    }
+
+    fn setNoNotify(b: *Backend, on: bool) void {
+        for (b.queues[0..b.nqueues]) |q| {
+            const used = q.used orelse continue;
+            const flags: *volatile u16 = @ptrCast(@alignCast(used));
+            flags.* = if (on) USED_NO_NOTIFY else 0;
+        }
+    }
+
+    fn drain(b: *Backend, qi: u32, h: Handler) usize {
         const q = &b.queues[qi];
-        if (!q.enabled or q.desc == null or q.avail == null or q.used == null or q.num == 0) return;
+        if (!q.enabled or q.desc == null or q.avail == null or q.used == null or q.num == 0) return 0;
+        var count: usize = 0;
         const avail = q.avail.?;
         const used_idx: *volatile u16 = @ptrCast(@alignCast(q.used.? + 2));
         const used_ring: [*]volatile UsedElem = @ptrCast(@alignCast(q.used.? + 4));
@@ -386,14 +420,25 @@ pub const Backend = struct {
             used_idx.* = u +% 1;
             q.last_avail +%= 1;
             b.handled += 1;
+            count += 1;
             signal = true;
         }
         if (signal and q.call >= 0) {
             var one: u64 = 1;
             _ = linux.write(q.call, @ptrCast(&one), 8);
         }
+        return count;
     }
 };
+
+/// The used ring's flag that tells the driver not to ring (virtio 1.x).
+const USED_NO_NOTIFY: u16 = 1;
+
+fn nowUs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1000;
+}
 
 var fence_word: u32 = 0;
 fn fullFence() void {

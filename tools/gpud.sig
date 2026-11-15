@@ -68,6 +68,8 @@ pub fn main(init: std.process.Init) void {
     server.init(&g, .{ .ctx = &dummy, .bytes = guestBytes }, rings[0..rings_len]);
     server.log = logLine;
     backend.log = logLine;
+    // (a frame's passes come in bursts: no doorbell each, 2 ms of polling)
+    backend.poll_us = 2000;
     backend.listen(std.mem.span(argv[1]), 1) catch {
         out("cannot listen on {s}", .{std.mem.span(argv[1])});
         linux.exit(1);
