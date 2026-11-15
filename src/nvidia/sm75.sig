@@ -221,9 +221,233 @@ test "sm_75's latencies: NAK's model before it had a chip's tables" {
     try testing.expect((try sched.usesOf(&try sm120.parse("IADD3 R0, PT, PT, R1, R2, RZ"))).dsts()[0].cat < sched.CAT75);
 }
 
+// ── Galaxy's bench kernels for sm_75 ────────────────────────────────────────
+//
+// nv_bench's four (NV.TXT `bench`: local memory, fill, copy, matmul) are
+// ptxas's sm_120 code on the Legion. These are the same kernels written by
+// hand for sm_75 (no ptxas for it here), compact, not ptxas's unrolled
+// ones: the same parameters at constant buffer 0's 0x380 (nv_bench's
+// structs), the same results (its checks), with Turing's forms: plain
+// [R.64] addresses, IADD3, no uniform registers. Each is text (what the
+// assembler takes) and words (what Galaxy's kernel carries; a test keeps
+// them the assembler's).
+
+/// A kernel as Galaxy's nv_kernels.Kernel has one: its words, the QMD's
+/// register count, its stack and parameter bytes.
+pub const Probe = struct { code: []const u64, registers: u32, stack: u32 = 0, params: u32 = 0 };
+
+/// fill(dst: u64, n: u32, seed: u32): dst[i] = (i * 0x9e3779b1) ^ seed, a
+/// grid-stride loop (thread i0 = ctaid.x * ntid.x + tid.x, then every
+/// nctaid.x * ntid.x th word).
+pub const FILL_TEXT =
+    \\.params 16
+    \\S2R R3, SR_TID.X
+    \\S2R R8, SR_CTAID.X
+    \\LDC R6, c[0x0][0x360]
+    \\LDC R9, c[0x0][0x370]
+    \\LDC R10, c[0x0][0x388]
+    \\IMAD R0, R6, R8, R3
+    \\IMAD R6, R6, R9, RZ
+    \\ISETP.GE.U32.AND P0, PT, R0, R10, PT
+    \\@P0 EXIT
+    \\LDC.64 R4, c[0x0][0x380]
+    \\LDC R11, c[0x0][0x38c]
+    \\loop:
+    \\IMAD R7, R0, -0x61c8864f, RZ
+    \\IMAD.WIDE.U32 R2, R0, 0x4, R4
+    \\IADD3 R0, PT, PT, R6, R0, RZ
+    \\LOP3.LUT R7, R7, R11, RZ, 0x3c, !PT
+    \\ISETP.GE.U32.AND P0, PT, R0, R10, PT
+    \\STG.E.STRONG.SYS [R2.64], R7
+    \\@!P0 BRA `(loop)
+    \\EXIT
+    \\hang:
+    \\BRA `(hang)
+;
+
+/// copy(dst: u64, src: u64, n4: u32): n4 16-byte words, the same loop.
+pub const COPY_TEXT =
+    \\.params 20
+    \\S2R R3, SR_TID.X
+    \\S2R R11, SR_CTAID.X
+    \\LDC R10, c[0x0][0x360]
+    \\LDC R18, c[0x0][0x370]
+    \\LDC R19, c[0x0][0x390]
+    \\IMAD R0, R10, R11, R3
+    \\IMAD R10, R10, R18, RZ
+    \\ISETP.GE.U32.AND P0, PT, R0, R19, PT
+    \\@P0 EXIT
+    \\LDC.64 R8, c[0x0][0x380]
+    \\LDC.64 R6, c[0x0][0x388]
+    \\loop:
+    \\IMAD.WIDE.U32 R2, R0, 0x10, R6
+    \\LDG.E.128.STRONG.SYS R12, [R2.64]
+    \\IMAD.WIDE.U32 R4, R0, 0x10, R8
+    \\IADD3 R0, PT, PT, R10, R0, RZ
+    \\ISETP.GE.U32.AND P0, PT, R0, R19, PT
+    \\STG.E.128.STRONG.SYS [R4.64], R12
+    \\@!P0 BRA `(loop)
+    \\EXIT
+    \\hang:
+    \\BRA `(hang)
+;
+
+/// local(out: u64): a 64-byte array on the thread's stack (local memory:
+/// the stack's top is constant buffer 0's 0x37c), word (tid + j) & 15 of
+/// it written tid * 16 + j for j = 0..15, then summed: out[tid] = tid *
+/// 256 + 120.
+pub const LOCAL_TEXT =
+    \\.params 8
+    \\.stack 64
+    \\LDC R1, c[0x0][0x37c]
+    \\S2R R19, SR_TID.X
+    \\IADD3 R1, PT, PT, R1, -0x40, RZ
+    \\IMAD R0, R19, 0x10, RZ
+    \\MOV R2, RZ
+    \\store:
+    \\IADD3 R3, PT, PT, R19, R2, RZ
+    \\LOP3.LUT R3, R3, 0xf, RZ, 0xc0, !PT
+    \\IMAD R3, R3, 0x4, R1
+    \\IADD3 R4, PT, PT, R0, R2, RZ
+    \\IADD3 R2, PT, PT, R2, 0x1, RZ
+    \\STL [R3], R4
+    \\ISETP.LT.U32.AND P0, PT, R2, 0x10, PT
+    \\@P0 BRA `(store)
+    \\MOV R2, RZ
+    \\MOV R5, RZ
+    \\sum:
+    \\IMAD R3, R2, 0x4, R1
+    \\IADD3 R2, PT, PT, R2, 0x1, RZ
+    \\LDL R4, [R3]
+    \\ISETP.LT.U32.AND P0, PT, R2, 0x10, PT
+    \\IADD3 R5, PT, PT, R5, R4, RZ
+    \\@P0 BRA `(sum)
+    \\LDC.64 R6, c[0x0][0x380]
+    \\IMAD.WIDE.U32 R6, R19, 0x4, R6
+    \\STG.E.STRONG.SYS [R6.64], R5
+    \\EXIT
+    \\hang:
+    \\BRA `(hang)
+;
+
+/// matmul(c: u64, a: u64, b: u64, n: u32): c[row][col] = the sum over k of
+/// a[row][k] * b[k][col] in fp32, fused, one thread an element (row =
+/// ctaid.y * ntid.y + tid.y, col the same in x), naive.
+pub const MATMUL_TEXT =
+    \\.params 28
+    \\S2R R7, SR_TID.Y
+    \\S2R R3, SR_TID.X
+    \\S2R R8, SR_CTAID.Y
+    \\S2R R9, SR_CTAID.X
+    \\LDC R0, c[0x0][0x360]
+    \\LDC R2, c[0x0][0x364]
+    \\LDC R5, c[0x0][0x398]
+    \\IMAD R2, R2, R8, R7
+    \\IMAD R0, R0, R9, R3
+    \\ISETP.GE.U32.AND P0, PT, R2, R5, PT
+    \\ISETP.GE.U32.OR P0, PT, R0, R5, P0
+    \\@P0 EXIT
+    \\LDC.64 R10, c[0x0][0x388]
+    \\LDC.64 R12, c[0x0][0x390]
+    \\LDC.64 R14, c[0x0][0x380]
+    \\IMAD R7, R2, R5, RZ
+    \\MOV R4, RZ
+    \\MOV R6, RZ
+    \\loop:
+    \\IADD3 R16, PT, PT, R7, R6, RZ
+    \\IMAD R18, R6, R5, R0
+    \\IMAD.WIDE.U32 R16, R16, 0x4, R10
+    \\IMAD.WIDE.U32 R18, R18, 0x4, R12
+    \\IADD3 R6, PT, PT, R6, 0x1, RZ
+    \\LDG.E.STRONG.SYS R20, [R16.64]
+    \\LDG.E.STRONG.SYS R21, [R18.64]
+    \\ISETP.LT.U32.AND P0, PT, R6, R5, PT
+    \\FFMA R4, R20, R21, R4
+    \\@P0 BRA `(loop)
+    \\IADD3 R7, PT, PT, R7, R0, RZ
+    \\IMAD.WIDE.U32 R14, R7, 0x4, R14
+    \\STG.E.STRONG.SYS [R14.64], R4
+    \\EXIT
+    \\hang:
+    \\BRA `(hang)
+;
+
+const FILL_CODE = [_]u64{
+    0x0000000000037919, 0x000e020000002100, 0x0000000000087919, 0x000e420000002500,
+    0x0000d800ff067b82, 0x000e820000000800, 0x0000dc00ff097b82, 0x000ec20000000800,
+    0x0000e200ff0a7b82, 0x000f020000000800, 0x0000000806007224, 0x007fc800078e0203,
+    0x0000000906067224, 0x008fc400078e02ff, 0x0000000a0000720c, 0x010fda0003f06070,
+    0x000000000000094d, 0x000fc80003800000, 0x0000e000ff047b82, 0x000e020000000a00,
+    0x0000e300ff0b7b82, 0x000e420000000800, 0x9e3779b100077824, 0x000fc200078e02ff,
+    0x0000000400027825, 0x001fc800078e0004, 0x0000000006007210, 0x000fc20007ffe0ff,
+    0x0000000b07077212, 0x002fca00078e3cff, 0x0000000a0000720c, 0x000fc20003f06070,
+    0x0000000702007986, 0x0001d8000c11693f, 0xffffff9000008947, 0x001fc8000383ffff,
+    0x000000000000794d, 0x000fc20003800000, 0xfffffff000007947, 0x000fc2000383ffff,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+};
+const COPY_CODE = [_]u64{
+    0x0000000000037919, 0x000e020000002100, 0x00000000000b7919, 0x000e420000002500,
+    0x0000d800ff0a7b82, 0x000e820000000800, 0x0000dc00ff127b82, 0x000ec20000000800,
+    0x0000e400ff137b82, 0x000f020000000800, 0x0000000b0a007224, 0x007fc800078e0203,
+    0x000000120a0a7224, 0x008fc400078e02ff, 0x000000130000720c, 0x010fda0003f06070,
+    0x000000000000094d, 0x000fc80003800000, 0x0000e000ff087b82, 0x000e020000000a00,
+    0x0000e200ff067b82, 0x000e440000000a00, 0x0000001000027825, 0x002fcc00078e0006,
+    0x0000003f020c7981, 0x000282000c1f6d00, 0x0000001000047825, 0x001fc800078e0008,
+    0x000000000a007210, 0x000fcc0007ffe0ff, 0x000000130000720c, 0x000fc20003f06070,
+    0x0000000c04007986, 0x0041d8000c116d3f, 0xffffff9000008947, 0x003fc8000383ffff,
+    0x000000000000794d, 0x000fc20003800000, 0xfffffff000007947, 0x000fc2000383ffff,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+};
+const LOCAL_CODE = [_]u64{
+    0x0000df00ff017b82, 0x000e020000000800, 0x0000000000137919, 0x000e420000002100,
+    0xffffffc001017810, 0x001fc20007ffe0ff, 0x0000001013007824, 0x002fc200078e02ff,
+    0x000000ff00027202, 0x000fcc0000000f00, 0x0000000213037210, 0x000fcc0007ffe0ff,
+    0x0000000f03037812, 0x000fcc00078ec0ff, 0x0000000403037824, 0x000fc200078e0201,
+    0x0000000200047210, 0x000fc80007ffe0ff, 0x0000000102027810, 0x000fc40007ffe0ff,
+    0x0000000403007987, 0x0001c8000810083f, 0x000000100200780c, 0x000fda0003f01070,
+    0xffffff8000000947, 0x001fc8000383ffff, 0x000000ff00027202, 0x000fc20000000f00,
+    0x000000ff00057202, 0x000fca0000000f00, 0x0000000402037824, 0x000fc800078e0201,
+    0x0000000102027810, 0x000fc40007ffe0ff, 0x0000003f03047983, 0x0000480008100800,
+    0x000000100200780c, 0x000fc20003f01070, 0x0000000405057210, 0x002fd80007ffe0ff,
+    0xffffffa000000947, 0x001fc8000383ffff, 0x0000e000ff067b82, 0x000e040000000a00,
+    0x0000000413067825, 0x001fcc00078e0006, 0x0000000506007986, 0x0001c4000c11693f,
+    0x000000000000794d, 0x001fc20003800000, 0xfffffff000007947, 0x000fc2000383ffff,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+};
+const MATMUL_CODE = [_]u64{
+    0x0000000000077919, 0x000e020000002200, 0x0000000000037919, 0x000e420000002100,
+    0x0000000000087919, 0x000e820000002600, 0x0000000000097919, 0x000ec20000002500,
+    0x0000d800ff007b82, 0x000f020000000800, 0x0000d900ff027b82, 0x000f420000000800,
+    0x0000e600ff057b82, 0x000f440000000800, 0x0000000802027224, 0x025fc200078e0207,
+    0x0000000900007224, 0x01afca00078e0203, 0x000000050200720c, 0x000fda0003f06070,
+    0x000000050000720c, 0x000fda0000706470, 0x000000000000094d, 0x000fc80003800000,
+    0x0000e200ff0a7b82, 0x000e020000000a00, 0x0000e400ff0c7b82, 0x000e420000000a00,
+    0x0000e000ff0e7b82, 0x000e820000000a00, 0x0000000502077224, 0x000fc200078e02ff,
+    0x000000ff00047202, 0x000fc20000000f00, 0x000000ff00067202, 0x000fcc0000000f00,
+    0x0000000607107210, 0x000fc20007ffe0ff, 0x0000000506127224, 0x000fca00078e0200,
+    0x0000000410107825, 0x001fc200078e000a, 0x0000000412127825, 0x002fc200078e000c,
+    0x0000000106067810, 0x000fc80007ffe0ff, 0x0000003f10147981, 0x000042000c1f6900,
+    0x0000003f12157981, 0x000702000c1f6900, 0x000000050600720c, 0x000fc20003f01070,
+    0x0000001514047223, 0x012fd80000000004, 0xffffff6000000947, 0x00dfc8000383ffff,
+    0x0000000007077210, 0x000fcc0007ffe0ff, 0x00000004070e7825, 0x000fcc00078e000e,
+    0x000000040e007986, 0x0001c4000c11693f, 0x000000000000794d, 0x001fc20003800000,
+    0xfffffff000007947, 0x000fc2000383ffff, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
+};
+pub const FILL = Probe{ .code = &FILL_CODE, .registers = 14, .params = 16 };
+pub const COPY = Probe{ .code = &COPY_CODE, .registers = 22, .params = 20 };
+pub const LOCAL = Probe{ .code = &LOCAL_CODE, .registers = 22, .stack = 64, .params = 8 };
+pub const MATMUL = Probe{ .code = &MATMUL_CODE, .registers = 24, .params = 28 };
+
 var asm_work: sm120_asm.Work = .{};
 var emu_work: emu.Work = .{};
-var arena: [1 << 20]u8 align(4096) = undefined;
+var arena: [4 << 20]u8 align(4096) = undefined;
 
 test "M4 for sm_75: assembled and scheduled, then launched on an emulated Turing GPU" {
     var code: [64]u64 = undefined;
@@ -288,4 +512,133 @@ test "M4 for sm_75: assembled and scheduled, then launched on an emulated Turing
     const n6 = try push.batchPushFor(.sm_75, @alignCast(pb), &.{sys.va + 0x3_0000}, null, sys.va + 0x2_0000, 0x1234);
     d.toDevice(sys, 0, sys.cpu.len);
     try testing.expectError(error.BadStream, dev.execute(sys.va + 0x1_0000, @intCast(n6)));
+}
+
+// ── The bench kernels: assembled, then run as nv_bench runs them ────────────
+
+const Run = struct { grid: [3]u32 = .{ 1, 1, 1 }, block: [3]u32 = .{ 1, 1, 1 }, params: []const u8 = &.{}, local: ?push.Local = null, local_bytes: u32 = 0 };
+
+/// One launch on the emulated Turing GPU, as Galaxy lays it out in its
+/// system memory `sys` (the pushbuffer at 0x1_0000, the semaphore at
+/// 0x2_0000, the QMD at 0x3_0000 with constant buffer 0 behind it, the
+/// code at 0x4_0000).
+fn run75(dev: *device.EmuDevice, sys: device.Buffer, k: Probe, r: Run) !void {
+    const d = dev.device();
+    @memset(sys.cpu[0x4_0000..][0..0x2000], 0);
+    @memcpy(sys.cpu[0x4_0000..][0 .. k.code.len * 8], std.mem.sliceAsBytes(k.code));
+    const q: *[qmd.QMD_WORDS]u32 = @ptrCast(@alignCast(sys.cpu[0x3_0000..].ptr));
+    try qmd.buildFor(.sm_75, q, .{ .prog_va = sys.va + 0x4_0000, .prog_bytes = k.code.len * 8, .cbuf_va = sys.va + 0x3_0200, .registers = k.registers, .grid = r.grid, .block = r.block, .local_bytes = r.local_bytes });
+    const cb: *[qmd.CBUF0_WORDS]u32 = @ptrCast(@alignCast(sys.cpu[0x3_0200..].ptr));
+    try qmd.cbuf0(cb, r.grid, r.block, r.params);
+    const pb = std.mem.bytesAsSlice(u32, sys.cpu[0x1_0000..][0 .. 64 * 4]);
+    const n = try push.batchPushFor(.sm_75, @alignCast(pb), &.{sys.va + 0x3_0000}, r.local, sys.va + 0x2_0000, 0x1234);
+    std.mem.writeInt(u32, sys.cpu[0x2_0000..][0..4], 0, .little);
+    d.toDevice(sys, 0, sys.cpu.len);
+    dev.execute(sys.va + 0x1_0000, @intCast(n)) catch |e| {
+        var buf: [512]u8 = undefined;
+        std.debug.print("{s}\n", .{emu.explain(&emu_work, &buf)});
+        return e;
+    };
+    d.fromDevice(sys, 0, sys.cpu.len);
+    try testing.expectEqual(@as(u32, 0x1234), std.mem.readInt(u32, sys.cpu[0x2_0000..][0..4], .little));
+}
+
+fn fillWord(i: u32, seed: u32) u32 {
+    return (i *% 0x9e37_79b1) ^ seed;
+}
+fn aOf(r: u32, k: u32) f32 {
+    return @floatFromInt(@as(i32, @intCast((r * 3 + k) % 7)) - 3);
+}
+fn bOf(k: u32, c: u32) f32 {
+    return @floatFromInt(@as(i32, @intCast((k * 3 + c * 2) % 5)) - 2);
+}
+fn cOf(r: u32, c: u32, n: u32) f32 {
+    var s: f32 = 0;
+    var k: u32 = 0;
+    while (k < n) : (k += 1) s += aOf(r, k) * bOf(k, c);
+    return s;
+}
+
+test "the bench kernels for sm_75: their words are the assembler's" {
+    var bad = false;
+    inline for (.{ .{ "fill", FILL_TEXT, FILL }, .{ "copy", COPY_TEXT, COPY }, .{ "local", LOCAL_TEXT, LOCAL }, .{ "matmul", MATMUL_TEXT, MATMUL } }) |c| {
+        var code: [256]u64 = undefined;
+        const k = try sm120_asm.assembleFor(.sm_75, c[1], &code, &asm_work);
+        try testing.expect(k.scheduled);
+        try testing.expectEqual(c[2].stack, k.stack);
+        try testing.expectEqual(c[2].params, k.params);
+        if (!std.mem.eql(u64, c[2].code, k.code) or c[2].registers != k.registers) {
+            std.debug.print("{s} for sm_75: registers {d}, {d} words:\n", .{ c[0], k.registers, k.code.len });
+            for (k.code, 0..) |w, i| std.debug.print("0x{x:0>16},{s}", .{ w, if (i % 4 == 3) "\n" else " " });
+            std.debug.print("\n", .{});
+            bad = true;
+        }
+    }
+    if (bad) return error.TestUnexpectedResult;
+}
+
+test "the bench kernels for sm_75 on an emulated Turing GPU: nv_bench's checks (local memory, fill and copy, matmul)" {
+    emu_work.check_hazards = true;
+    emu_work.strict = true;
+    var dev = device.EmuDevice{ .arena = &arena, .work = &emu_work, .sm = .sm_75, .tpcs = 1, .warps_per_sm = 32 };
+    const d = dev.device();
+    const sys = dev.allocAt(0x20_0000_0000, 0x6_0000) orelse return error.OutOfMemory;
+    @memset(sys.cpu, 0);
+    // local: 32 threads, a 64-byte stack array each, local memory sized as
+    // Galaxy sizes it
+    {
+        const out = try d.alloc(4096);
+        const s = qmd.localSize(LOCAL.stack, dev.warps_per_sm, dev.sms_per_tpc, dev.tpcs);
+        const lm = try d.alloc(@intCast(s.total));
+        const p = extern struct { out: u64 }{ .out = out.va };
+        try run75(&dev, sys, LOCAL, .{ .block = .{ 32, 1, 1 }, .params = std.mem.asBytes(&p), .local = .{ .va = lm.va, .per_tpc = s.per_tpc }, .local_bytes = s.per_thread });
+        d.fromDevice(out, 0, 128);
+        for (out.words()[0..32], 0..) |v, t| try testing.expectEqual(@as(u32, @intCast(t)) * 256 + 120, v);
+    }
+    // fill and copy: 64 KiB filled by 8 CTAs of 256 (8 words a thread),
+    // copied in 16-byte words, every word checked
+    {
+        const count: u32 = 16384;
+        const src = try d.alloc(count * 4);
+        const dst = try d.alloc(count * 4);
+        const fp = extern struct { dst: u64, n: u32, seed: u32 }{ .dst = src.va, .n = count, .seed = 0x5eed_6a1a };
+        try run75(&dev, sys, FILL, .{ .grid = .{ 8, 1, 1 }, .block = .{ 256, 1, 1 }, .params = std.mem.asBytes(&fp) });
+        const cp = extern struct { dst: u64, src: u64, n4: u32 }{ .dst = dst.va, .src = src.va, .n4 = count / 4 };
+        try run75(&dev, sys, COPY, .{ .grid = .{ 4, 1, 1 }, .block = .{ 256, 1, 1 }, .params = std.mem.asBytes(&cp)[0..20] });
+        d.fromDevice(dst, 0, dst.cpu.len);
+        for (dst.words()[0..count], 0..) |v, i| {
+            if (v != fillWord(@intCast(i), 0x5eed_6a1a)) {
+                std.debug.print("copy: word {d} is {x}\n", .{ i, v });
+                return error.TestUnexpectedResult;
+            }
+        }
+        // (a grid with more threads than words: the ones past the end exit)
+        @memset(dst.cpu, 0);
+        d.toDevice(dst, 0, dst.cpu.len);
+        const few = extern struct { dst: u64, n: u32, seed: u32 }{ .dst = dst.va, .n = 100, .seed = 7 };
+        try run75(&dev, sys, FILL, .{ .grid = .{ 2, 1, 1 }, .block = .{ 256, 1, 1 }, .params = std.mem.asBytes(&few) });
+        d.fromDevice(dst, 0, dst.cpu.len);
+        for (dst.words()[0..200], 0..) |v, i| try testing.expectEqual(if (i < 100) fillWord(@intCast(i), 7) else 0, v);
+    }
+    // matmul: 32 x 32 of small integers, every element exact
+    {
+        const n: u32 = 32;
+        const a = try d.alloc(n * n * 4);
+        const b = try d.alloc(n * n * 4);
+        const c = try d.alloc(n * n * 4);
+        for (0..n) |r| {
+            for (0..n) |k| {
+                a.words()[r * n + k] = @bitCast(aOf(@intCast(r), @intCast(k)));
+                b.words()[r * n + k] = @bitCast(bOf(@intCast(r), @intCast(k)));
+            }
+        }
+        d.toDevice(a, 0, a.cpu.len);
+        d.toDevice(b, 0, b.cpu.len);
+        const mp = extern struct { c: u64, a: u64, b: u64, n: u32 }{ .c = c.va, .a = a.va, .b = b.va, .n = n };
+        try run75(&dev, sys, MATMUL, .{ .grid = .{ n / 16, n / 16, 1 }, .block = .{ 16, 16, 1 }, .params = std.mem.asBytes(&mp)[0..28] });
+        d.fromDevice(c, 0, c.cpu.len);
+        for (0..n) |r| {
+            for (0..n) |col| try testing.expectEqual(@as(u32, @bitCast(cOf(@intCast(r), @intCast(col), n))), c.words()[r * n + col]);
+        }
+    }
 }
