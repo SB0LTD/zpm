@@ -622,6 +622,9 @@ pub const Setup = struct {
     tiles_at: u32 = nvenc.TILE_CONTROL_OFF,
     /// NVIDIA's own captured setup as the base (encode.Try.av1_template)
     template: bool = false,
+    /// bottom-field offsets on the reference, reconstruction and fourth
+    /// configurations (encode.Try.bottom_fields)
+    bottom_fields: bool = false,
 };
 
 pub fn setup(buf: []u8, s: Setup) void {
@@ -669,6 +672,8 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, A.extra_cfg_sfc_pitch, nvenc.get(buf, A.outputpic_cfg_sfc_pitch));
     nvenc.set(buf, A.extra_cfg_sfc_pitch_chroma, nvenc.get(buf, A.outputpic_cfg_sfc_pitch_chroma));
     nvenc.set(buf, A.extra_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
+    if (s.bottom_fields) for ([_]u32{ 0, 512, 768 }) |cfg|
+        nvenc.setBottomFields(buf, cfg, f.size.height, s.recon.pitch_luma, s.recon.pitch_chroma);
     nvenc.set(buf, A.codec, nvenc.PIC_CODEC_AV1);
     // (the word NVIDIA's driver writes 16 bytes past the GP timer on GB206,
     // as 8 past HEVC's: 0x999; meaning not public)
