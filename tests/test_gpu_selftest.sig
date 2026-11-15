@@ -180,13 +180,11 @@ test "self-test on the emulated RTX 2080 Ti (kir_sm120 for sm_75; sm120_emu as a
         return error.TestUnexpectedResult;
     }
     try std.testing.expectEqual(@as(u32, @intCast(selftest.caseCount())), res.passed + res.skipped);
-    // (skipped, and said so in the log: the cases with a shuffle, vote or
-    // ballot in divergent control flow, which sm_75 does not compile)
+    // (none skipped: a shuffle, vote or ballot in divergent control flow
+    // compiles for sm_75 as NAK compiles it, with no WARPSYNC)
     try std.testing.expectEqual(SM75_SKIPPED, res.skipped);
 }
-/// The self-test's cases kir_sm120 refuses for sm_75 (error.Unsupported:
-/// a collective in divergent flow needs WARPSYNC, unsettled for Turing).
-const SM75_SKIPPED: u32 = 3;
+const SM75_SKIPPED: u32 = 0;
 
 // ── The emulated Adreno ─────────────────────────────────────────────────────
 

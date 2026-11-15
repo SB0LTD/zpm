@@ -78,10 +78,14 @@
 //! two-source add, IMNMX, plain BSSY and BSYNC, BAR.SYNC, F2F for a half's
 //! rounding to nearest, global addresses without a descriptor (and so no
 //! descriptor loaded), ptxas's .SYS scope on global loads and stores. A
-//! collective in divergent control flow, which sm_120 makes safe with
-//! WARPSYNC, is error.Unsupported on sm_75: NAK's encoder has a WARPSYNC
-//! with its mask register in bits 32..39, ptxas's sm_120 word (sm120.sig's)
-//! has it in 24..31, and nothing here settles which a Turing SM takes.
+//! collective (a shuffle, vote or ballot) in divergent control flow stands
+//! where it is, as NAK compiles Vulkan's subgroup operations (from_nir.rs:
+//! OpVote and OpShfl pushed with nothing before them; NVK passes the
+//! conformance tests on Turing so): the convergence barriers of structured
+//! flow keep a region's lanes together, and the collective is among them.
+//! sm_120 adds ptxas's WARPSYNC on the active mask first; sm_75 does not,
+//! because NAK never emits one and its encoder's has the mask register in
+//! bits 32..39 where ptxas's sm_120 word (sm120.sig's) has it in 24..31.
 //! Constant buffer 0 keeps Galaxy's
 //! layout on both (parameters from 0x380: it is this compiler's own
 //! convention, not CUDA's for the chip). Nothing sm_75 has run on a card.
@@ -1745,6 +1749,9 @@ const Ctx = struct {
         if (c.nobar > 0) c.w.stats.nobar_collectives += 1;
         if (c.div_depth == 0) return;
         c.w.stats.div_collectives += 1;
+        // (sm_75, NAK's way: the collective where it stands, among the
+        // lanes the region's convergence barrier keeps together)
+        if (!c.gen.ptxas_sync) return;
         const next = c.label();
         try c.bra(.none, next);
         try c.at(next);

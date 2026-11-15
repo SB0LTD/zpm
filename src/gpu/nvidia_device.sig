@@ -2378,14 +2378,10 @@ fn casBallots() !void {
     k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
     m.imm = 64 + 12 * NT;
     k.store(.u32, m, r(off), r(k.ballot(r(p), 1)));
-    // (sm_75 compiles no collective in divergent flow: the words there
-    // stay zero on both)
-    if (T.sm == .sm_120) {
-        k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(y), u(2))), u(0))));
-        m.imm = 64 + 16 * NT;
-        k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
-        k.endif();
-    }
+    k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(y), u(2))), u(0))));
+    m.imm = 64 + 16 * NT;
+    k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
+    k.endif();
     try same(caps, &k, .{ 2, 1, 1 }, &.{}, 16 + 5 * NT, null);
     try std.testing.expectEqual(@as(u32, 2 * 64), X.ref[2]);
     try std.testing.expectEqual(@as(u32, 64), X.ref[4 + 3]);
@@ -2951,7 +2947,7 @@ test "sm_75: memory forms, atomics, barriers, shuffles, votes, control flow, ids
     try idsParams();
 }
 
-test "sm_75: Turing's forms in the text; the other generation's binary, indirect dispatch, graphics and a divergent collective refused" {
+test "sm_75: Turing's forms in the text; the other generation's binary, indirect dispatch and graphics refused; a divergent collective without WARPSYNC" {
     turing();
     defer blackwell();
     const d = freshEmu();
@@ -2997,7 +2993,8 @@ test "sm_75: Turing's forms in the text; the other generation's binary, indirect
     const bin75 = try kir_sm120.compileIn(&k, emuCapsFor(.sm_75), &T.st, &T.code, .{});
     try testing.expectError(error.BadProgram, d120.load(&bin75));
     // a collective in divergent flow: sm_120 makes it safe with WARPSYNC;
-    // sm_75 has no settled word for it, and refuses
+    // sm_75 has it where it stands, as NAK does (its results against the
+    // interpreter are the control-flow and ballot kernels' above)
     var k2 = newKernel("divergent", .{ 32, 1, 1 });
     const o2 = k2.binding();
     const t2 = k2.tid(0);
@@ -3011,5 +3008,16 @@ test "sm_75: Turing's forms in the text; the other generation's binary, indirect
     try k2.finish();
     _ = try kir_sm120.compileIn(&k2, emuCaps(), &T.st, &T.code, .{});
     try testing.expect(T.st.stats.div_collectives > 0);
-    try testing.expectError(error.Unsupported, kir_sm120.compileIn(&k2, emuCapsFor(.sm_75), &T.st, &T.code, .{}));
+    try testing.expect(std.mem.indexOf(u8, try kir_sm120.compileText(&k2, emuCaps(), &T.st, .{}), "WARPSYNC") != null);
+    const text75 = try kir_sm120.compileText(&k2, emuCapsFor(.sm_75), &T.st, .{});
+    try testing.expect(T.st.stats.div_collectives > 0);
+    try testing.expect(std.mem.indexOf(u8, text75, "WARPSYNC") == null);
+    try testing.expect(std.mem.indexOf(u8, text75, "VOTE.ANY") != null);
+    // (and it runs: each thread's sum of the ballots it saw, as the
+    // interpreter's)
+    turing();
+    var got: [NT * 4]u8 align(4) = undefined;
+    try runBoth(emuCapsFor(.sm_75), &k2, .{ 1, 1, 1 }, &.{}, 32 * 4, &got, .{});
+    const g32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, got[0 .. 32 * 4]));
+    for (0..32) |i| try testing.expectEqual(X.ref[i], g32[i]);
 }

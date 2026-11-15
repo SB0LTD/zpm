@@ -77,7 +77,8 @@
 //! LDCU, the uniform datapath, BRA.U, constant-buffer ALU sources), and so
 //! are the graphics stages' (Turing's texture words differ) and WARPSYNC
 //! (NAK's encoder has its mask register in bits 32..39, ptxas's sm_120
-//! word, this file's, in 24..31: unsettled for Turing, so not emitted).
+//! word, this file's, in 24..31, and NVK never emits it: a shuffle or vote
+//! in divergent flow stands where it is on sm_75, kir_sm120).
 //! There is no ptxas here to compare sm_75 words with: its tests
 //! (sm75.sig) check words worked out by hand from NAK's fields. Nothing of
 //! sm_75 has run on a card yet.
