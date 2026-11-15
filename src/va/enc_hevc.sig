@@ -371,6 +371,19 @@ pub const Setup = struct {
 };
 
 /// pic_type: 0 P, 1 B, 2 I, 3 IDR (VA's coding_type: 1 I, 2 P, 3 B).
+/// The engine's slice type for HEVC's (0 B, 1 P, 2 I): H.264's numbers,
+/// 0 P, 1 B, 2 I, as NVIDIA's own driver writes them on GB206 (the WSL
+/// capture: its P pictures' setups say 0 while its bitstream says P, 1).
+/// With HEVC's own 1 there, the engine took a P picture for a B one and
+/// read L1's unbound reference at VA 0 (pc-full17, pc-full18).
+pub fn engineSliceType(slice_type: u8) u8 {
+    return switch (slice_type) {
+        0 => 1,
+        1 => 0,
+        else => 2,
+    };
+}
+
 pub fn picType(pic: *const Pic) u2 {
     if (pic.pic_fields.idr_pic_flag != 0) return 3;
     return switch (pic.pic_fields.coding_type) {
@@ -600,7 +613,7 @@ pub fn setup(buf: []u8, s: Setup) void {
         nvenc.set(c, L.qp_avr, s.qp);
         nvenc.set(c, L.qp_slice_min, s.qp);
         nvenc.set(c, L.qp_slice_max, s.qp);
-        nvenc.set(c, L.slice_type, sl.slice_type);
+        nvenc.set(c, L.slice_type, engineSliceType(sl.slice_type));
         nvenc.set(c, L.five_minus_max_num_merge_cand, 5 - @min(sl.max_num_merge_cand, 5));
         nvenc.set(c, L.slice_deblocking_filter_disabled_flag, @intFromBool(sl.deblocking_disabled));
         nvenc.set(c, L.slice_loop_filter_across_slices_enabled_flag, @intFromBool(sl.loop_filter_across_slices));
@@ -738,7 +751,7 @@ test "enc_hevc: a P picture's setup: the RPS, the lists, the slice" {
     try testing.expectEqual(@as(u64, 2), nvenc.get(&buf, H.ceil_log2_pic_size_in_ctbs)); // 2x2 CTBs of 32
     const c = buf[nvenc.H265_SLICE_OFF..];
     try testing.expectEqual(@as(u64, 4), nvenc.get(c, nvenc.H265Slice.num_ctus));
-    try testing.expectEqual(@as(u64, 1), nvenc.get(c, nvenc.H265Slice.slice_type));
+    try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.slice_type)); // P, the engine's 0
     try testing.expectEqual(@as(u64, 1), nvenc.get(c, nvenc.H265Slice.slice_sao_luma_flag));
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.five_minus_max_num_merge_cand));
     // (nothing forced intra: the picture type says it)

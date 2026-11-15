@@ -465,13 +465,40 @@ pub fn listOf(ctrl: u32, max: usize, out: []u3) usize {
     return n;
 }
 
-/// The reference slots an inter picture's lists name, each once, in list
-/// order (L0's, then L1's; no list given: LAST alone), into `out`: the
-/// engine's references go by this order, SET_IN_REF_PIC0 + 4k for the k-th
-/// and the lists' entries k, as NVIDIA's own driver numbers them on GB206
-/// (captured in WSL: its l0 holds 0, 1, 2 and SET_IN_REF_PIC0, +4, +8 the
-/// most recent first). By VA's slot numbers instead, AV1's engine read VA 0
-/// at the picture with a second reference (pc-full13, pc-full14).
+/// The reference names (1..7) an inter picture's lists use, each once,
+/// in list order (L0's, then L1's; no list given: LAST alone), into
+/// `out`. The engine numbers its references by name, LAST 0 .. ALTREF 6:
+/// the lists' entries, poc_entry and SET_IN_REF_PIC0 + 4 x (name - 1), as
+/// NVIDIA's own driver writes them on GB206 (the WSL captures: every list
+/// entry equals its poc_entry, and its B frames' L0 holds 3, 1, 0 =
+/// GOLDEN, LAST2, LAST). Numbered by VA's slots (pc-full13, pc-full14) or
+/// in list order (pc-full18) while poc_entry said the name, the engine read
+/// VA 0 at the first picture with GOLDEN.
+pub fn refNames(f: Frame, pic: *const Pic, out: *[7]u3) usize {
+    if (f.intra()) return 0;
+    var n: usize = 0;
+    var names: [7]u3 = undefined;
+    const ctrls = [2]u32{ pic.ref_frame_ctrl_l0, pic.ref_frame_ctrl_l1 };
+    const maxes = [2]usize{ MAX_L0, MAX_L1 };
+    for (ctrls, 0..) |ctrl, li| {
+        var m = listOf(ctrl, maxes[li], &names);
+        if (li == 0 and m == 0) {
+            names[0] = 1;
+            m = 1;
+        }
+        for (names[0..m]) |name| {
+            if (std.mem.indexOfScalar(u3, out[0..n], name) == null) {
+                out[n] = name;
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
+/// The reference slots (VA's) an inter picture's lists name, each once, in
+/// list order: how many distinct pictures it reads (NVIDIA's template by
+/// that count).
 pub fn refOrder(f: Frame, pic: *const Pic, out: *[7]u3) usize {
     if (f.intra()) return 0;
     var n: usize = 0;
@@ -703,23 +730,22 @@ pub fn setup(buf: []u8, s: Setup) void {
     // rate control: the driver's qindex (encode.sig puts the firmware's
     // in when it runs it)
     enc_rc.constQp(buf, enc_rc.RcFields.of(A), f.qindex, s.framerate, s.gop_length);
-    // pic_control: the lists, by reference name through ref_frame_idx to
-    // the slot; poc_entry the name's index (LAST 0 .. ALTREF 6)
-    // (unused: the lists -2 and the distances -1, as NVIDIA's driver
-    // writes H.264's; nvenc.LIST_NONE)
+    // pic_control: the lists and poc_entry both the reference's name
+    // (LAST 0 .. ALTREF 6; see refNames), the distance through
+    // ref_frame_idx to the slot's order hint
+    // (unused: the lists, distances and poc_entry -1, as NVIDIA's driver
+    // writes AV1's on GB206)
     for (0..4) |k| {
-        nvenc.set(buf, nvenc.at(A.l0, @intCast(k)), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(A.l0, @intCast(k)), 0xff);
         nvenc.set(buf, nvenc.at(A.temp_dist_l0, @intCast(k)), nvenc.DIST_NONE);
         nvenc.set(buf, nvenc.at(A.poc_entry_l0, @intCast(k)), 0xff);
     }
     for (0..3) |k| {
-        nvenc.set(buf, nvenc.at(A.l1, @intCast(k)), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(A.l1, @intCast(k)), 0xff);
         nvenc.set(buf, nvenc.at(A.temp_dist_l1, @intCast(k)), nvenc.DIST_NONE);
         nvenc.set(buf, nvenc.at(A.poc_entry_l1, @intCast(k)), 0xff);
     }
     var counts = [2]usize{ 0, 0 };
-    var order: [7]u3 = undefined;
-    const n_order = refOrder(f, pic, &order);
     if (!f.intra()) {
         var names: [7]u3 = undefined;
         const ctrls = [2]u32{ pic.ref_frame_ctrl_l0, pic.ref_frame_ctrl_l1 };
@@ -735,10 +761,7 @@ pub fn setup(buf: []u8, s: Setup) void {
             for (names[0..n], 0..) |name, k| {
                 const kk: u32 = @intCast(k);
                 const slot = f.ref_frame_idx[name - 1];
-                // (the entry: the slot's place in refOrder, the engine's
-                // reference number)
-                const at = std.mem.indexOfScalar(u3, order[0..n_order], @intCast(slot)).?;
-                nvenc.set(buf, nvenc.at(fields[li][0], kk), at);
+                nvenc.set(buf, nvenc.at(fields[li][0], kk), name - 1);
                 nvenc.setSigned(buf, nvenc.at(fields[li][1], kk), std.math.clamp(relDist(f, f.order_hint, f.slot_hint[slot]), -128, 127));
                 nvenc.set(buf, nvenc.at(fields[li][2], kk), name - 1);
             }
@@ -947,7 +970,11 @@ test "enc_av1: references numbered in list order, each slot once, whatever VA's 
     try testing.expectEqual(@as(u64, 3), nvenc.get(&b, A.num_ref_idx_l0_active));
     try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(A.l0, 0)));
     try testing.expectEqual(@as(u64, 1), nvenc.get(&b, nvenc.at(A.l0, 1)));
-    try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(A.l0, 2))); // GOLDEN: slot 3 again
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&b, nvenc.at(A.l0, 2))); // GOLDEN, by name
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&b, nvenc.at(A.poc_entry_l0, 2)));
+    try testing.expectEqual(@as(u64, 0xff), nvenc.get(&b, nvenc.at(A.l0, 3)));
+    var names: [7]u3 = undefined;
+    try testing.expectEqualSlices(u3, &.{ 1, 2, 4 }, names[0..refNames(f, &pic, &names)]);
 }
 
 test "enc_av1: an inter frame's setup: the lists by name, sign bias, the tile" {
@@ -971,8 +998,8 @@ test "enc_av1: an inter frame's setup: the lists by name, sign bias, the tile" {
     try testing.expectEqual(@as(u64, 2), nvenc.get(&b, A.num_ref_idx_l0_active));
     try testing.expectEqual(@as(u64, 1), nvenc.get(&b, A.num_ref_idx_l1_active));
     try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(A.l0, 0)));
-    try testing.expectEqual(@as(u64, 1), nvenc.get(&b, nvenc.at(A.l0, 1)));
-    try testing.expectEqual(@as(u64, 2), nvenc.get(&b, nvenc.at(A.l1, 0)));
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&b, nvenc.at(A.l0, 1))); // GOLDEN
+    try testing.expectEqual(@as(u64, 4), nvenc.get(&b, nvenc.at(A.l1, 0))); // BWDREF
     try testing.expectEqual(@as(u64, 3), nvenc.get(&b, nvenc.at(A.poc_entry_l0, 1))); // GOLDEN
     try testing.expectEqual(@as(u64, 4), nvenc.get(&b, nvenc.at(A.poc_entry_l1, 0))); // BWDREF
     try testing.expectEqual(@as(u64, 0xfe), nvenc.get(&b, nvenc.at(A.temp_dist_l1, 0))); // 2 - 4
