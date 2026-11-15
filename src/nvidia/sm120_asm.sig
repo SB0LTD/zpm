@@ -31,6 +31,10 @@
 //! sm120.sig's graphics forms; no headers: it has no parameters or stack).
 //! What goes in front of it, in place of a QMD, is sph.sig's header.
 //!
+//! `assembleFor` takes the shader model: sm_75 (Turing) kernels are the
+//! same text with Turing's forms (sm120.sig says which differ) and
+//! Turing's schedule (sm120_sched.sig).
+//!
 //! Allocation-free: the caller owns the output words and the working
 //! storage (Work).
 
@@ -105,6 +109,8 @@ fn classify(raw: []const u8) Error!Line {
 const Label = struct { name: []const u8, before: u32 };
 
 pub const Work = struct {
+    /// The shader model of the last kernel assembled (`assembleFor` sets it).
+    sm: sm120.Sm = .sm_120,
     instrs: [MAX_INSTRS]sm120.Instr = undefined,
     slots: [MAX_INSTRS]sched.Slot = undefined,
     /// Each instruction's byte address (after the schedule's NOPs).
@@ -120,8 +126,15 @@ fn nop(stall: u4) sm120.Word {
 }
 
 /// `text`'s kernel into `out` (two u64 an instruction, the count rounded up
-/// to 8).
+/// to 8), for sm_120.
 pub fn assemble(text: []const u8, out: []u64, work: *Work) Error!Kernel {
+    return assembleFor(.sm_120, text, out, work);
+}
+
+/// The same for shader model `sm`.
+pub fn assembleFor(sm: sm120.Sm, text: []const u8, out: []u64, work: *Work) Error!Kernel {
+    work.sm = sm;
+    work.sched.sm = sm;
     const labels = &work.labels;
     var n_labels: usize = 0;
     var k = Kernel{ .code = out[0..0], .count = 0, .registers = 0 };
@@ -181,7 +194,7 @@ pub fn assemble(text: []const u8, out: []u64, work: *Work) Error!Kernel {
             if (target == null) return error.UnknownLabel;
         }
         in.control = work.slots[i].control;
-        const w = try sm120.encode(in, work.at[i], target);
+        const w = try sm120.encodeFor(sm, in, work.at[i], target);
         out[slot * 2] = w.lo();
         out[slot * 2 + 1] = w.hi();
         slot += 1;

@@ -56,6 +56,32 @@
 //! 1e9, %.20e from there, +INF with its trailing space), prints as
 //! nvdisasm prints it.
 //!
+//! sm_75 (Turing: the RTX 20 series) is the same instruction format, as
+//! every SM from Volta on: NAK has one encoder for them all and tells them
+//! apart by `e.sm`. `encodeFor` and `decodeFor` take the shader model, and
+//! the codecs differ for sm_75 exactly where NAK's do:
+//!
+//! - a branch's distance is whole in 34..81 (sm_100 splits it);
+//! - a uniform register is six bits (URZ is 63), and the memory forms
+//!   always carry one: global addresses are [Ra.64(+URb)+offset] with no
+//!   descriptor, LDL, STL (0x987), LDS, STS (0x988) and ATOMS (0x98c) have
+//!   it too, bit 91 set;
+//! - global memory's ordering and scope are two fields (79..80 and
+//!   77..78), not sm_80's one;
+//! - a global atomic's address has its .64 at bit 70 and a 24-bit offset;
+//! - integer min and max are IMNMX (0x017); BSSY and BSYNC have no
+//!   .RECONVERGENT; BAR is SYNC alone.
+//!
+//! Forms NAK does not emit for Turing are refused for sm_75 (the
+//! two-source IADD, MOV.64, VIMNMX, I2FP, F2IP, F2FP, HMNMX2, CALL, RET,
+//! LDCU, the uniform datapath, BRA.U, constant-buffer ALU sources), and so
+//! are the graphics stages' (Turing's texture words differ) and WARPSYNC
+//! (NAK's encoder has its mask register in bits 32..39, ptxas's sm_120
+//! word, this file's, in 24..31: unsettled for Turing, so not emitted).
+//! There is no ptxas here to compare sm_75 words with: its tests
+//! (sm75.sig) check words worked out by hand from NAK's fields. Nothing of
+//! sm_75 has run on a card yet.
+//!
 //! Allocation-free: instructions are plain values parsed in place from the
 //! caller's text; decoded ones point only at static strings.
 
@@ -73,6 +99,13 @@ pub const Error = error{
     /// A branch whose label is not known.
     NoTarget,
 };
+
+/// The shader model an instruction is for (chips.sig's: sm_75 is Turing,
+/// sm_120 consumer Blackwell).
+pub const Sm = @import("chips.sig").Sm;
+
+/// URZ as sm_75's six-bit fields hold it.
+const URZ_SM75: u64 = 63;
 
 // ── Words ───────────────────────────────────────────────────────────────────
 
@@ -703,9 +736,22 @@ const Cx = struct {
     used: u32 = 0,
     pc: u64,
     target: ?u64 = null,
+    /// The shader model the word is for.
+    sm: Sm = .sm_120,
 
     fn enc(cx: *const Cx) bool {
         return cx.dir == .enc;
+    }
+
+    /// sm_75: Turing's forms.
+    fn old(cx: *const Cx) bool {
+        return cx.sm == .sm_75;
+    }
+
+    /// What a form this shader model has not is: a syntax error when
+    /// written, an unknown word when read.
+    fn refuse(cx: *const Cx) Error {
+        return if (cx.enc()) error.Syntax else error.Unknown;
     }
 
     fn get(cx: *const Cx, at: u7, n: u7) u64 {
@@ -1109,8 +1155,18 @@ const Cx = struct {
     }
 
     /// A branch target: the low 8 bits of the distance in 16..23, the rest
-    /// in 34..81 (sm_100's split).
+    /// in 34..81 (sm_100's split). Before sm_100 the distance is whole in
+    /// 34..81.
     fn branch(cx: *Cx) Error!void {
+        if (cx.old()) {
+            if (cx.enc()) {
+                const rel = try cx.relTo();
+                if (rel < -(1 << 47) or rel >= (1 << 47)) return error.OutOfRange;
+                cx.w.put(34, 48, @as(u64, @bitCast(rel)) & 0xffff_ffff_ffff);
+                return;
+            }
+            return cx.pushTarget(@as(i64, @bitCast(cx.get(34, 48) << 16)) >> 16);
+        }
         if (cx.enc()) {
             const bits: u64 = @bitCast(try cx.relTo());
             cx.w.put(16, 8, bits & 0xff);
@@ -1149,7 +1205,13 @@ const Cx = struct {
             if (a.wide) |b| cx.w.bit(b, x.wide);
             if (a.desc) |d| cx.w.put(d, 8, x.desc.?);
             if (a.ureg) |u| {
-                if (a.ureg_always) cx.w.put(u, 8, x.ureg orelse RZ) else {
+                if (cx.old()) {
+                    // (six bits, always there: URZ when none is written)
+                    if (x.ureg) |r| {
+                        if (r >= URZ_SM75) return error.OutOfRange;
+                    }
+                    cx.w.put(u, 6, x.ureg orelse URZ_SM75);
+                } else if (a.ureg_always) cx.w.put(u, 8, x.ureg orelse RZ) else {
                     cx.w.put(u, 8, x.ureg orelse 0);
                     cx.w.bit(91, x.ureg != null);
                 }
@@ -1163,7 +1225,10 @@ const Cx = struct {
         if (a.wide) |b| x.wide = cx.get(b, 1) == 1;
         if (a.desc) |d| x.desc = @intCast(cx.get(d, 8));
         if (a.ureg) |u| {
-            if (a.ureg_always or cx.get(91, 1) == 1) x.ureg = @intCast(cx.get(u, 8));
+            if (cx.old()) {
+                const n = cx.get(u, 6);
+                if (n != URZ_SM75) x.ureg = @intCast(n);
+            } else if (a.ureg_always or cx.get(91, 1) == 1) x.ureg = @intCast(cx.get(u, 8));
         }
         const raw = cx.get(a.off_at, a.off_n);
         const shift: u6 = @intCast(64 - @as(u7, a.off_n));
@@ -1572,6 +1637,12 @@ const ORDERS_ST = [_][]const []const u8{
     &.{ "MMIO", "SYS" },            &.{ "SYS", "ORDERED" },             &.{ "STRONG", "SYS", "ORDERED" },
     &.{ "MMIO", "SYS", "ORDERED" },
 };
+/// Before sm_80, global memory's ordering (79..80: weak unprinted) and
+/// scope (77..78: the CTA's unprinted) are fields of their own (NAK's
+/// set_mem_order): LDG.E.STRONG.SYS is how NAK reads and writes buffers.
+const ORDER_SM75 = [_][]const u8{ "CONSTANT", "", "STRONG", "MMIO" };
+const SCOPE_SM75 = [_][]const u8{ "", "SM", "GPU", "SYS" };
+
 /// Global memory's eviction priority (84..86): evict first, normal, last,
 /// last use, unchanged, no allocate.
 const EVICT = [_][]const u8{ "EF", "", "EL", "LU", "EU", "NA", "?", "?" };
@@ -1631,6 +1702,7 @@ fn cExit(cx: *Cx) Error!void {
 /// predicate.
 fn cBra(cx: *Cx) Error!void {
     if (try cx.derived("U", cx.get(0, 12) == 0x547)) {
+        if (cx.old()) return cx.refuse();
         cx.put(0, 12, 0x547);
         _ = try cx.predNot(24, true);
         cx.put(32, 1, 1);
@@ -1666,7 +1738,8 @@ fn cRet(cx: *Cx) Error!void {
 /// BSSY(.RECONVERGENT) Bn, `(join): where the warp's threads meet again.
 fn cBssy(cx: *Cx) Error!void {
     cx.put(0, 12, 0x945);
-    _ = try cx.flag(73, "RECONVERGENT");
+    // (sm_75: NAK's BSSY, bit 73 clear)
+    if (!cx.old()) _ = try cx.flag(73, "RECONVERGENT");
     try cx.barrier(16);
     try cx.rel30();
     cx.put(87, 3, PT);
@@ -1674,7 +1747,7 @@ fn cBssy(cx: *Cx) Error!void {
 
 fn cBsync(cx: *Cx) Error!void {
     cx.put(0, 12, 0x941);
-    _ = try cx.flag(73, "RECONVERGENT");
+    if (!cx.old()) _ = try cx.flag(73, "RECONVERGENT");
     try cx.barrier(16);
     cx.put(87, 3, PT);
 }
@@ -1698,6 +1771,13 @@ fn cBar(cx: *Cx) Error!void {
     cx.put(0, 12, 0xb1d);
     // (BAR.RED and BAR.SCAN have more fields: not covered; ARV does not
     // defer)
+    if (cx.old()) {
+        // (NAK's control barrier: the opcode and zeros, BAR.SYNC 0x0)
+        _ = try cx.mod(77, 2, &.{ "SYNC", "?", "?", "?" });
+        const id = try cx.imm(54, 4, .hex);
+        if (id != 0) return cx.refuse();
+        return;
+    }
     const arv = (try cx.mod(77, 2, &.{ "SYNC", "ARV", "?", "?" })) == 1;
     if (try cx.flag(80, "DEFER_BLOCKING")) {
         if (arv) return if (cx.enc()) error.Syntax else error.Unknown;
@@ -1796,10 +1876,15 @@ fn global(cx: *Cx, load: bool) Error!void {
     cx.put(72, 1, 1);
     _ = try cx.mod(84, 3, &EVICT);
     _ = try cx.mod(73, 3, &SIZES);
-    try cx.modParts(77, 4, if (load) &ORDERS else &ORDERS_ST);
+    if (cx.old()) {
+        _ = try cx.mod(79, 2, &ORDER_SM75);
+        _ = try cx.mod(77, 2, &SCOPE_SM75);
+    } else try cx.modParts(77, 4, if (load) &ORDERS else &ORDERS_ST);
     if (load) _ = try cx.reg(16);
     const at: u7 = if (load) 32 else 64;
-    const desc = if (cx.enc()) blk: {
+    // (sm_75 has no descriptors: a load's bit 76 is clear, a descriptor
+    // written is refused by the address)
+    const desc = if (cx.old()) false else if (cx.enc()) blk: {
         const o = cx.peek() orelse return error.Syntax;
         break :blk o == .addr and o.addr.desc != null;
     } else cx.get(76, 1) == 1;
@@ -1822,14 +1907,23 @@ fn cLdl(cx: *Cx) Error!void {
     cx.put(0, 12, 0x983);
     _ = try cx.mod(73, 3, &SIZES);
     _ = try cx.reg(16);
-    _ = try cx.addr(.{});
+    if (cx.old()) {
+        // (NAK's local load from sm_73: a uniform register in 32, bit 91)
+        _ = try cx.addr(.{ .ureg = 32 });
+        cx.put(91, 1, 1);
+    } else _ = try cx.addr(.{});
     cx.put(84, 3, 1);
 }
 
+/// STL [Ra+offset], Rd. sm_120's is ptxas's 0x387; sm_75's NAK's 0x987,
+/// with a uniform register in 64.
 fn cStl(cx: *Cx) Error!void {
-    cx.put(0, 12, 0x387);
+    cx.put(0, 12, if (cx.old()) 0x987 else 0x387);
     _ = try cx.mod(73, 3, &SIZES);
-    _ = try cx.addr(.{});
+    if (cx.old()) {
+        _ = try cx.addr(.{ .ureg = 64 });
+        cx.put(91, 1, 1);
+    } else _ = try cx.addr(.{});
     _ = try cx.reg(32);
     cx.put(84, 3, 1);
 }
@@ -1840,11 +1934,22 @@ fn cLds(cx: *Cx) Error!void {
     _ = try cx.mod(73, 3, &SIZES);
     _ = try cx.reg(16);
     _ = try cx.addr(.{ .ureg = 32 });
+    // (sm_75: the uniform register is always there, URZ or not)
+    if (cx.old()) cx.put(91, 1, 1);
 }
 
 /// STS [Ra(+URb)+offset], Rd: with a uniform register the opcode is 0x988
 /// and it sits in 64.
 fn cSts(cx: *Cx) Error!void {
+    if (cx.old()) {
+        // (NAK's shared store from sm_73: 0x988, the uniform register in 64)
+        cx.put(0, 12, 0x988);
+        _ = try cx.mod(73, 3, &SIZES);
+        _ = try cx.addr(.{ .ureg = 64 });
+        _ = try cx.reg(32);
+        cx.put(91, 1, 1);
+        return;
+    }
     const with_u = if (cx.enc()) blk: {
         const o = cx.peek() orelse return error.Syntax;
         break :blk o == .addr and o.addr.ureg != null;
@@ -1858,7 +1963,8 @@ fn cSts(cx: *Cx) Error!void {
 // Moves and integers -----------------------------------------------------------
 
 fn cMov(cx: *Cx) Error!void {
-    if (try cx.derived("64", cx.get(9, 3) == 2)) {
+    if (try cx.derived("64", !cx.old() and cx.get(9, 3) == 2)) {
+        if (cx.old()) return cx.refuse();
         // MOV.64 Rd, imm64: the immediate in bits 24..87
         cx.put(0, 12, 0x402);
         _ = try cx.reg(16);
@@ -1920,6 +2026,9 @@ fn cImad(cx: *Cx) Error!void {
     const op9 = cx.get(0, 9);
     const wide = cx.sense("WIDE", op9 == 0x025);
     const hi = cx.sense("HI", op9 == 0x027);
+    // (NAK has IMAD, 0x024, and IMAD.WIDE, 0x025: a high word is the wide
+    // product's on sm_75)
+    if (hi and cx.old()) return cx.refuse();
     _ = try cx.reg(16);
     try alu(cx, .{ .op = if (wide) 0x025 else if (hi) 0x027 else 0x024, .a = SINT, .b = SINT, .c = SINT, .ureg_c = true });
     cx.put(81, 3, PT);
@@ -2089,6 +2198,7 @@ fn cPrmt(cx: *Cx) Error!void {
 /// SEL(.64) Rd, a, b, P: a where P, else b (.64: register pairs).
 fn cSel(cx: *Cx) Error!void {
     if (try cx.derived("64", cx.get(0, 12) == 0x607)) {
+        if (cx.old()) return cx.refuse();
         cx.put(0, 12, 0x607);
         _ = try cx.reg(16);
         try cx.srcReg(24, SLOT_A, .none);
@@ -2108,6 +2218,15 @@ fn cVimnmx(cx: *Cx) Error!void {
     _ = try cx.predNot(87, false);
     cx.put(81, 6, 0x3f);
     _ = try cx.mod(72, 1, &.{ "U32", "S32" });
+}
+
+/// IMNMX.S32/U32 Rd, a, b, Pmin (before sm_90; NAK's OpIMnMx): min when
+/// the predicate is true, else max. The signedness is bit 73.
+fn cImnmx(cx: *Cx) Error!void {
+    _ = try cx.reg(16);
+    try alu(cx, .{ .op = 0x017, .a = INT, .b = SINT });
+    _ = try cx.predNot(87, false);
+    _ = try cx.mod(73, 1, &.{ "U32", "S32" });
 }
 
 fn oneSource(cx: *Cx, op: u9) Error!void {
@@ -2274,7 +2393,7 @@ fn cMufu(cx: *Cx) Error!void {
 
 fn hmods(cx: *Cx, f32_bit: bool) Error!void {
     if (f32_bit) _ = try cx.flag(78, "F32");
-    _ = try cx.flag(85, "BF16_V2");
+    if (!cx.old()) _ = try cx.flag(85, "BF16_V2");
     _ = try cx.flag(80, "FTZ");
     _ = try cx.flag(77, "SAT");
 }
@@ -2415,6 +2534,19 @@ fn cAtomg(cx: *Cx) Error!void {
     _ = try cx.mod(87, 4, &ATOM_OPS);
     _ = try cx.mod(84, 3, &.{ "?", "" });
     _ = try cx.mod(73, 3, &ATOM_TYPES);
+    if (cx.old()) {
+        // (NAK's from sm_73 to sm_89: no descriptor, the address's .64 at
+        // bit 70, a uniform register in 64, the offset 24 bits)
+        _ = try cx.mod(79, 2, &ORDER_SM75);
+        _ = try cx.mod(77, 2, &SCOPE_SM75);
+        _ = try cx.pred(81, false);
+        _ = try cx.reg(16);
+        const x = try cx.addr(.{ .ureg = 64, .wide = 70 });
+        if (!x.wide) return cx.refuse();
+        _ = try cx.reg(32);
+        cx.put(91, 1, 1);
+        return;
+    }
     try cx.modParts(77, 4, &ORDERS);
     _ = try cx.pred(81, false);
     _ = try cx.reg(16);
@@ -2430,11 +2562,15 @@ fn cAtomg(cx: *Cx) Error!void {
 /// .X4 ..) and the uniform register's form (0x98c) are not covered.
 fn cAtoms(cx: *Cx) Error!void {
     if (cx.enc() and cx.written("CAS")) return cAtomsCas(cx);
-    cx.put(0, 12, 0x38c);
+    // (sm_75: NAK's 0x98c, with a uniform register in 64)
+    cx.put(0, 12, if (cx.old()) 0x98c else 0x38c);
     _ = try cx.mod(87, 4, &ATOM_OPS);
     _ = try cx.mod(73, 3, &ATOM_TYPES);
     _ = try cx.reg(16);
-    _ = try cx.addr(.{});
+    if (cx.old()) {
+        _ = try cx.addr(.{ .ureg = 64 });
+        cx.put(91, 1, 1);
+    } else _ = try cx.addr(.{});
     _ = try cx.reg(32);
 }
 
@@ -2449,7 +2585,10 @@ fn cAtomgCas(cx: *Cx) Error!void {
     try cx.always("CAS");
     _ = try cx.mod(84, 3, &.{ "?", "" });
     _ = try cx.mod(73, 3, &ATOM_TYPES);
-    try cx.modParts(77, 4, &ORDERS);
+    if (cx.old()) {
+        _ = try cx.mod(79, 2, &ORDER_SM75);
+        _ = try cx.mod(77, 2, &SCOPE_SM75);
+    } else try cx.modParts(77, 4, &ORDERS);
     _ = try cx.pred(81, false);
     _ = try cx.reg(16);
     _ = try cx.addr(.{});
@@ -2689,94 +2828,105 @@ const Form = struct {
     alu: bool = false,
     /// On the uniform datapath: its guard is a uniform predicate.
     uniform: bool = false,
+    /// sm_75 has it too, with this codec (NAK emits it for Turing).
+    t: bool = false,
+    /// sm_75 alone has it.
+    t_only: bool = false,
     codec: Codec,
+
+    fn on(f: *const Form, sm: Sm) bool {
+        return if (sm == .sm_75) f.t or f.t_only else !f.t_only;
+    }
 };
 
 const FORMS = [_]Form{
-    .{ .name = "NOP", .opcode = 0x918, .codec = cNop },
-    .{ .name = "EXIT", .opcode = 0x94d, .codec = cExit },
-    .{ .name = "BRA", .opcode = 0x947, .codec = cBra },
+    .{ .name = "NOP", .opcode = 0x918, .t = true, .codec = cNop },
+    .{ .name = "EXIT", .opcode = 0x94d, .t = true, .codec = cExit },
+    .{ .name = "BRA", .opcode = 0x947, .t = true, .codec = cBra },
     .{ .name = "BRA", .opcode = 0x547, .codec = cBra },
     .{ .name = "CALL", .opcode = 0x944, .codec = cCall },
     .{ .name = "RET", .opcode = 0x950, .codec = cRet },
-    .{ .name = "BSSY", .opcode = 0x945, .codec = cBssy },
-    .{ .name = "BSYNC", .opcode = 0x941, .codec = cBsync },
+    .{ .name = "BSSY", .opcode = 0x945, .t = true, .codec = cBssy },
+    .{ .name = "BSYNC", .opcode = 0x941, .t = true, .codec = cBsync },
     .{ .name = "WARPSYNC", .opcode = 0x348, .codec = cWarpsync },
-    .{ .name = "BAR", .opcode = 0xb1d, .codec = cBar },
-    .{ .name = "S2R", .opcode = 0x919, .codec = cS2r },
+    .{ .name = "BAR", .opcode = 0xb1d, .t = true, .codec = cBar },
+    .{ .name = "S2R", .opcode = 0x919, .t = true, .codec = cS2r },
     .{ .name = "S2UR", .opcode = 0x9c3, .uniform = true, .codec = cS2ur },
-    .{ .name = "CS2R", .opcode = 0x805, .codec = cCs2r },
+    .{ .name = "CS2R", .opcode = 0x805, .t = true, .codec = cCs2r },
     .{ .name = "R2UR", .opcode = 0x2ca, .codec = cR2ur },
-    .{ .name = "LDC", .opcode = 0xb82, .codec = cLdcR },
+    .{ .name = "LDC", .opcode = 0xb82, .t = true, .codec = cLdcR },
     .{ .name = "LDCU", .opcode = 0x7ac, .uniform = true, .codec = cLdcU },
-    .{ .name = "LDG", .opcode = 0x981, .codec = cLdg },
-    .{ .name = "STG", .opcode = 0x986, .codec = cStg },
-    .{ .name = "LDL", .opcode = 0x983, .codec = cLdl },
+    .{ .name = "LDG", .opcode = 0x981, .t = true, .codec = cLdg },
+    .{ .name = "STG", .opcode = 0x986, .t = true, .codec = cStg },
+    .{ .name = "LDL", .opcode = 0x983, .t = true, .codec = cLdl },
     .{ .name = "STL", .opcode = 0x387, .codec = cStl },
-    .{ .name = "LDS", .opcode = 0x984, .codec = cLds },
+    .{ .name = "STL", .opcode = 0x987, .t_only = true, .codec = cStl },
+    .{ .name = "LDS", .opcode = 0x984, .t = true, .codec = cLds },
     .{ .name = "STS", .opcode = 0x388, .codec = cSts },
-    .{ .name = "STS", .opcode = 0x988, .codec = cSts },
-    .{ .name = "PLOP3", .opcode = 0x81c, .codec = cPlop3 },
+    .{ .name = "STS", .opcode = 0x988, .t = true, .codec = cSts },
+    .{ .name = "PLOP3", .opcode = 0x81c, .t = true, .codec = cPlop3 },
     .{ .name = "UPLOP3", .opcode = 0x89c, .uniform = true, .codec = cUplop3 },
     .{ .name = "SEL", .opcode = 0x607, .codec = cSel },
-    .{ .name = "SHFL", .opcode = 0x389, .codec = cShfl },
-    .{ .name = "SHFL", .opcode = 0x589, .codec = cShfl },
-    .{ .name = "SHFL", .opcode = 0x989, .codec = cShfl },
-    .{ .name = "SHFL", .opcode = 0xf89, .codec = cShfl },
-    .{ .name = "VOTE", .opcode = 0x806, .codec = cVote },
+    .{ .name = "SHFL", .opcode = 0x389, .t = true, .codec = cShfl },
+    .{ .name = "SHFL", .opcode = 0x589, .t = true, .codec = cShfl },
+    .{ .name = "SHFL", .opcode = 0x989, .t = true, .codec = cShfl },
+    .{ .name = "SHFL", .opcode = 0xf89, .t = true, .codec = cShfl },
+    .{ .name = "VOTE", .opcode = 0x806, .t = true, .codec = cVote },
     .{ .name = "VOTEU", .opcode = 0x886, .codec = cVoteu },
     .{ .name = "HMMA", .opcode = 0x23c, .codec = cHmma },
     .{ .name = "IMMA", .opcode = 0x237, .codec = cImma },
-    .{ .name = "MOV", .opcode = 0x002, .alu = true, .codec = cMov },
+    .{ .name = "MOV", .opcode = 0x002, .t = true, .alu = true, .codec = cMov },
     .{ .name = "UMOV", .opcode = 0x082, .alu = true, .uniform = true, .codec = cUmov },
     .{ .name = "IADD", .opcode = 0x035, .alu = true, .codec = cIadd },
-    .{ .name = "IADD3", .opcode = 0x010, .alu = true, .codec = cIadd3 },
+    .{ .name = "IADD3", .opcode = 0x010, .t = true, .alu = true, .codec = cIadd3 },
     .{ .name = "UIADD3", .opcode = 0x090, .alu = true, .uniform = true, .codec = cUiadd3 },
-    .{ .name = "IMAD", .opcode = 0x024, .alu = true, .codec = cImad },
-    .{ .name = "IMAD", .opcode = 0x025, .alu = true, .codec = cImad },
+    .{ .name = "IMAD", .opcode = 0x024, .t = true, .alu = true, .codec = cImad },
+    .{ .name = "IMAD", .opcode = 0x025, .t = true, .alu = true, .codec = cImad },
     .{ .name = "IMAD", .opcode = 0x027, .alu = true, .codec = cImad },
-    .{ .name = "ISETP", .opcode = 0x00c, .alu = true, .codec = cIsetp },
+    .{ .name = "ISETP", .opcode = 0x00c, .t = true, .alu = true, .codec = cIsetp },
     .{ .name = "UISETP", .opcode = 0x08c, .alu = true, .uniform = true, .codec = cUisetp },
-    .{ .name = "LOP3", .opcode = 0x012, .alu = true, .codec = cLop3 },
+    .{ .name = "LOP3", .opcode = 0x012, .t = true, .alu = true, .codec = cLop3 },
     .{ .name = "ULOP3", .opcode = 0x092, .alu = true, .uniform = true, .codec = cUlop3 },
-    .{ .name = "LEA", .opcode = 0x011, .alu = true, .codec = cLea },
+    .{ .name = "LEA", .opcode = 0x011, .t = true, .alu = true, .codec = cLea },
     .{ .name = "ULEA", .opcode = 0x091, .alu = true, .uniform = true, .codec = cUlea },
-    .{ .name = "SHF", .opcode = 0x019, .alu = true, .codec = cShf },
+    .{ .name = "SHF", .opcode = 0x019, .t = true, .alu = true, .codec = cShf },
     .{ .name = "USHF", .opcode = 0x099, .alu = true, .uniform = true, .codec = cUshf },
-    .{ .name = "PRMT", .opcode = 0x016, .alu = true, .codec = cPrmt },
-    .{ .name = "SEL", .opcode = 0x007, .alu = true, .codec = cSel },
+    .{ .name = "PRMT", .opcode = 0x016, .t = true, .alu = true, .codec = cPrmt },
+    .{ .name = "SEL", .opcode = 0x007, .t = true, .alu = true, .codec = cSel },
     .{ .name = "VIMNMX", .opcode = 0x048, .alu = true, .codec = cVimnmx },
-    .{ .name = "IABS", .opcode = 0x013, .alu = true, .codec = cIabs },
-    .{ .name = "POPC", .opcode = 0x109, .alu = true, .codec = cPopc },
-    .{ .name = "BREV", .opcode = 0x101, .alu = true, .codec = cBrev },
-    .{ .name = "FLO", .opcode = 0x100, .alu = true, .codec = cFlo },
-    .{ .name = "IDP", .opcode = 0x026, .alu = true, .codec = cIdp },
-    .{ .name = "FFMA", .opcode = 0x023, .alu = true, .codec = cFfma },
+    .{ .name = "IMNMX", .opcode = 0x017, .alu = true, .t_only = true, .codec = cImnmx },
+    .{ .name = "IABS", .opcode = 0x013, .t = true, .alu = true, .codec = cIabs },
+    .{ .name = "POPC", .opcode = 0x109, .t = true, .alu = true, .codec = cPopc },
+    .{ .name = "BREV", .opcode = 0x101, .t = true, .alu = true, .codec = cBrev },
+    .{ .name = "FLO", .opcode = 0x100, .t = true, .alu = true, .codec = cFlo },
+    .{ .name = "IDP", .opcode = 0x026, .t = true, .alu = true, .codec = cIdp },
+    .{ .name = "FFMA", .opcode = 0x023, .t = true, .alu = true, .codec = cFfma },
     .{ .name = "UFFMA", .opcode = 0x055, .alu = true, .uniform = true, .codec = cUffma },
-    .{ .name = "FADD", .opcode = 0x021, .alu = true, .codec = cFadd },
-    .{ .name = "FMUL", .opcode = 0x020, .alu = true, .codec = cFmul },
-    .{ .name = "FMNMX", .opcode = 0x009, .alu = true, .codec = cFmnmx },
+    .{ .name = "FADD", .opcode = 0x021, .t = true, .alu = true, .codec = cFadd },
+    .{ .name = "FMUL", .opcode = 0x020, .t = true, .alu = true, .codec = cFmul },
+    .{ .name = "FMNMX", .opcode = 0x009, .t = true, .alu = true, .codec = cFmnmx },
     .{ .name = "FSEL", .opcode = 0x008, .alu = true, .codec = cFsel },
-    .{ .name = "FSETP", .opcode = 0x00b, .alu = true, .codec = cFsetp },
+    .{ .name = "FSETP", .opcode = 0x00b, .t = true, .alu = true, .codec = cFsetp },
     .{ .name = "FCHK", .opcode = 0x102, .alu = true, .codec = cFchk },
-    .{ .name = "MUFU", .opcode = 0x108, .alu = true, .codec = cMufu },
-    .{ .name = "HADD2", .opcode = 0x030, .alu = true, .codec = cHadd2 },
-    .{ .name = "HMUL2", .opcode = 0x032, .alu = true, .codec = cHmul2 },
-    .{ .name = "HFMA2", .opcode = 0x031, .alu = true, .codec = cHfma2 },
+    .{ .name = "MUFU", .opcode = 0x108, .t = true, .alu = true, .codec = cMufu },
+    .{ .name = "HADD2", .opcode = 0x030, .t = true, .alu = true, .codec = cHadd2 },
+    .{ .name = "HMUL2", .opcode = 0x032, .t = true, .alu = true, .codec = cHmul2 },
+    .{ .name = "HFMA2", .opcode = 0x031, .t = true, .alu = true, .codec = cHfma2 },
     .{ .name = "HMNMX2", .opcode = 0x040, .alu = true, .codec = cHmnmx2 },
     .{ .name = "F2FP", .opcode = 0x03e, .alu = true, .codec = cF2fp },
-    .{ .name = "F2I", .opcode = 0x105, .alu = true, .codec = cF2i },
-    .{ .name = "F2I", .opcode = 0x111, .alu = true, .codec = cF2i },
-    .{ .name = "I2F", .opcode = 0x106, .alu = true, .codec = cI2f },
-    .{ .name = "I2F", .opcode = 0x112, .alu = true, .codec = cI2f },
-    .{ .name = "F2F", .opcode = 0x104, .alu = true, .codec = cF2f },
-    .{ .name = "F2F", .opcode = 0x110, .alu = true, .codec = cF2f },
+    .{ .name = "F2I", .opcode = 0x105, .t = true, .alu = true, .codec = cF2i },
+    .{ .name = "F2I", .opcode = 0x111, .t = true, .alu = true, .codec = cF2i },
+    .{ .name = "I2F", .opcode = 0x106, .t = true, .alu = true, .codec = cI2f },
+    .{ .name = "I2F", .opcode = 0x112, .t = true, .alu = true, .codec = cI2f },
+    .{ .name = "F2F", .opcode = 0x104, .t = true, .alu = true, .codec = cF2f },
+    .{ .name = "F2F", .opcode = 0x110, .t = true, .alu = true, .codec = cF2f },
     .{ .name = "I2FP", .opcode = 0x045, .alu = true, .codec = cI2fp },
-    .{ .name = "FRND", .opcode = 0x107, .alu = true, .codec = cFrnd },
-    .{ .name = "ATOMG", .opcode = 0x9a8, .codec = cAtomg },
+    .{ .name = "FRND", .opcode = 0x107, .t = true, .alu = true, .codec = cFrnd },
+    .{ .name = "ATOMG", .opcode = 0x9a8, .t = true, .codec = cAtomg },
     .{ .name = "ATOMS", .opcode = 0x38c, .codec = cAtoms },
-    .{ .name = "ATOMG", .opcode = 0x3a9, .codec = cAtomgCas },
-    .{ .name = "ATOMS", .opcode = 0x38d, .codec = cAtomsCas },
+    .{ .name = "ATOMS", .opcode = 0x98c, .t_only = true, .codec = cAtoms },
+    .{ .name = "ATOMG", .opcode = 0x3a9, .t = true, .codec = cAtomgCas },
+    .{ .name = "ATOMS", .opcode = 0x38d, .t = true, .codec = cAtomsCas },
     .{ .name = "F2IP", .opcode = 0x043, .alu = true, .codec = cF2ip },
     .{ .name = "ALD", .opcode = 0x321, .codec = cAld },
     .{ .name = "AST", .opcode = 0x322, .codec = cAst },
@@ -2788,20 +2938,32 @@ const FORMS = [_]Form{
 };
 
 fn formOf(name: []const u8) ?*const Form {
+    return formFor(.sm_120, name);
+}
+
+/// `name`'s form on shader model `sm` (its first: the codec tells the
+/// others of the name apart).
+fn formFor(sm: Sm, name: []const u8) ?*const Form {
     for (&FORMS) |*f| {
-        if (eql(f.name, name)) return f;
+        if (f.on(sm) and eql(f.name, name)) return f;
     }
     return null;
 }
 
-fn formAt(op12: u12) ?*const Form {
+fn formAt(sm: Sm, op12: u12) ?*const Form {
     for (&FORMS) |*f| {
-        if (!f.alu and f.opcode == op12) return f;
+        if (f.on(sm) and !f.alu and f.opcode == op12) return f;
     }
     for (&FORMS) |*f| {
-        if (f.alu and f.opcode == op12 & 0x1ff) return f;
+        if (f.on(sm) and f.alu and f.opcode == op12 & 0x1ff) return f;
     }
     return null;
+}
+
+/// Whether shader model `sm` has an instruction called `name` at all (a
+/// compiler asks before it picks one of two spellings).
+pub fn has(sm: Sm, name: []const u8) bool {
+    return formFor(sm, name) != null;
 }
 
 /// Whether `in` runs on the uniform datapath (its guard a uniform
@@ -2816,10 +2978,16 @@ pub fn isUniform(in: *const Instr) bool {
 /// `in`'s 128 bits, as the instruction at byte `pc` of its kernel; a branch
 /// goes to byte `target` (or to its own .target operand).
 pub fn encode(in: *const Instr, pc: u64, target: ?u64) Error!Word {
-    const form = formOf(in.op) orelse return error.Unknown;
+    return encodeFor(.sm_120, in, pc, target);
+}
+
+/// The same for shader model `sm`: an instruction it has not is
+/// error.Unknown, a form of one it has not error.Syntax.
+pub fn encodeFor(sm: Sm, in: *const Instr, pc: u64, target: ?u64) Error!Word {
+    const form = formFor(sm, in.op) orelse return error.Unknown;
     // (a uniform op's guard is a uniform predicate, a warp op's a warp one)
     if (in.uguard != form.uniform and (in.guard.n != PT or in.guard.not)) return error.Syntax;
-    var cx = Cx{ .dir = .enc, .in = in.*, .pc = pc, .target = target };
+    var cx = Cx{ .dir = .enc, .in = in.*, .pc = pc, .target = target, .sm = sm };
     cx.w.put(12, 3, in.guard.n);
     cx.w.bit(15, in.guard.not);
     try form.codec(&cx);
@@ -2835,14 +3003,19 @@ pub fn encode(in: *const Instr, pc: u64, target: ?u64) Error!Word {
 /// and `mods` are static strings, its numbers `.imm`. A word with any bit
 /// this module does not account for is error.Unknown.
 pub fn decode(lo: u64, hi: u64, pc: u64) Error!Instr {
+    return decodeFor(.sm_120, lo, hi, pc);
+}
+
+/// The same for shader model `sm`.
+pub fn decodeFor(sm: Sm, lo: u64, hi: u64, pc: u64) Error!Instr {
     const w = Word.of(lo, hi);
-    const form = formAt(@intCast(w.get(0, 12))) orelse return error.Unknown;
-    var cx = Cx{ .dir = .dec, .w = w, .in = .{ .op = form.name, .uguard = form.uniform }, .pc = pc };
+    const form = formAt(sm, @intCast(w.get(0, 12))) orelse return error.Unknown;
+    var cx = Cx{ .dir = .dec, .w = w, .in = .{ .op = form.name, .uguard = form.uniform }, .pc = pc, .sm = sm };
     cx.in.control = Control.of(w);
     if (cx.in.control.read == 6 or cx.in.control.write == 6) return error.Unknown;
     cx.in.guard = .{ .n = @intCast(w.get(12, 3)), .not = w.get(15, 1) == 1 };
     try form.codec(&cx);
-    const again = try encode(&cx.in, pc, null);
+    const again = try encodeFor(sm, &cx.in, pc, null);
     if (again.bits != w.bits) return error.Unknown;
     return cx.in;
 }

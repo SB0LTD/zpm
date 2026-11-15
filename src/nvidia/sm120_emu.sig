@@ -84,6 +84,11 @@
 //! a compute launch's in a stage, or one stage's in the other, is
 //! error.BadInstruction. `explain` says which.
 //!
+//! `Work.sm` makes it sm_75 (Turing): the words are decoded as sm_75's
+//! (sm120.decodeFor) and every timing check is sm120_sched's sm_75 model
+//! (there are no NVIDIA tables for it here, so the hardware's level and the
+//! strict one are the same). The instructions mean the same on both.
+//!
 //! Allocation-free: the caller owns the Work (about 9 MB: keep it static).
 //! A Stage's attribute words are the caller's too.
 
@@ -660,6 +665,8 @@ const WarpT = struct {
 };
 
 pub const Work = struct {
+    /// The shader model the code is for (its words' forms, its timing).
+    sm: sm120.Sm = .sm_120,
     ops: [MAX_INSTRS]Op = undefined,
     n_ops: u32 = 0,
     /// The highest general register the code touches.
@@ -707,7 +714,7 @@ pub fn load(w: *Work, ins: []const Instr, targets: []const ?u64) Error!void {
     w.n_ops = @intCast(ins.len);
     w.top = null;
     for (ins, 0..) |*in, i| {
-        w.ops[i] = compile(in, targets[i], ins.len) catch |e| bad(in, e);
+        w.ops[i] = compile(w.sm, in, targets[i], ins.len) catch |e| bad(in, e);
         if (w.ops[i].top) |r| w.top = if (w.top) |x| @max(x, r) else r;
     }
 }
@@ -723,7 +730,7 @@ pub fn loadWords(w: *Work, words: []const u64) Error!void {
     if (n > MAX_INSTRS) return error.TooManyInstructions;
     for (0..n) |i| {
         w.tgt[i] = null;
-        w.src[i] = sm120.decode(words[2 * i], words[2 * i + 1], i * 16) catch {
+        w.src[i] = sm120.decodeFor(w.sm, words[2 * i], words[2 * i + 1], i * 16) catch {
             // (an invalid instruction with the word's control field)
             w.src[i] = .{ .op = "", .control = sm120.Control.of(sm120.Word.of(words[2 * i], words[2 * i + 1])) };
             continue;
@@ -1031,7 +1038,7 @@ const UNIFORM = [_]struct { []const u8, []const u8 }{
 
 const HINTS = [_][]const u8{ "WARPSYNC", "MEMBAR", "ERRBAR", "CCTL", "NANOSLEEP", "YIELD", "CGAERRBAR", "FENCE" };
 
-fn compile(in: *const Instr, given: ?u64, n_code: usize) Error!Op {
+fn compile(sm: sm120.Sm, in: *const Instr, given: ?u64, n_code: usize) Error!Op {
     var op = Op{ .guard = in.guard, .control = in.control };
     var name = in.op;
     for (UNIFORM) |u| {
@@ -1049,7 +1056,7 @@ fn compile(in: *const Instr, given: ?u64, n_code: usize) Error!Op {
         if (op.refuse == .none) op.refuse = .form;
         return op;
     }
-    op.uses = sched.usesOf(in) catch fallbackUses(&op, in);
+    op.uses = sched.usesOfFor(sm, in) catch fallbackUses(&op, in);
     // (an LDC's index register is read too: NAK's category, decoupled)
     if (op.kind == .ldc and op.s[0].index != RZ and !reads(&op.uses, .gpr, op.s[0].index)) add(&op.uses, false, .gpr, op.s[0].index, @intFromEnum(lat.Reg.decoupled));
     op.top = sm120.highestGpr(in);
@@ -2489,7 +2496,7 @@ fn entry(file: sched.File, kind: sched.Kind, second: u8, first: u8) u8 {
 /// What a pair needs: NVIDIA's cycles as the tables have them, or (strict)
 /// sm120_sched's, with NAK's padding.
 fn need(w: *const Work, kind: sched.Kind, first: sched.Use, dec: bool, second: sched.Use) sched.Need {
-    if (w.strict) return sched.need(kind, first, dec, second);
+    if (w.strict or w.sm == .sm_75) return sched.need(kind, first, dec, second);
     const e = entry(first.file, kind, second.cat, first.cat);
     if (e == lat.N) return .{ .cycles = WORST, .sb = dec };
     return .{ .cycles = e & ~lat.SB, .sb = e & lat.SB != 0 };
@@ -2767,10 +2774,58 @@ fn fmul(a: f32, b: f32, r: Round) f32 {
 }
 
 fn ffma(a: f32, b: f32, c: f32, r: Round) f32 {
-    if (r == .rn) return @mulAdd(f32, a, b, c);
+    if (r == .rn) return fma32(a, b, c);
     // (a * b is exact in f64)
     const s = twoSum(@as(f64, a) * b, c);
     return roundTo(f32, s[0], s[1], r);
+}
+
+/// a * b + c with one rounding to nearest, in software, as gpu's
+/// kir_interp has it: the product is exact in f64, the sum is rounded to
+/// odd there, and the rounding to f32 is then the right one (53 >= 24 +
+/// 2). Not the host's @mulAdd: where the CPU has no fused multiply-add
+/// (Galaxy's kernel is built for the baseline x86-64) it is a library
+/// call that may round twice, and the emulated SM then differed from a
+/// real one, and from the interpreter, by one unit in the last place on
+/// ties (found by the self-test on the twin in QEMU: -8388609 * 1.5 + a
+/// denormal).
+pub fn fma32(a: f32, b: f32, c: f32) f32 {
+    const p = @as(f64, a) * @as(f64, b);
+    const cd: f64 = c;
+    if (!std.math.isFinite(p) or !std.math.isFinite(cd)) return @floatCast(p + cd);
+    const s = p + cd;
+    if (p == 0 or cd == 0) return @floatCast(s);
+    const e = twoSum(p, cd)[1];
+    var sb: u64 = @bitCast(s);
+    if (e != 0 and sb & 1 == 0) {
+        if ((e > 0) == (s > 0)) sb += 1 else sb -= 1;
+    }
+    return @floatCast(@as(f64, @bitCast(sb)));
+}
+
+test "FFMA rounds once whatever the host's fused multiply-add does: the twin's case, and the host's own on random words" {
+    // (the case QEMU's twin found: the product is a tie in f32, and the
+    // denormal added decides it)
+    const a: f32 = @bitCast(@as(u32, 0xcb00_0001));
+    const b: f32 = @bitCast(@as(u32, 0x3fc0_0000));
+    const c: f32 = @bitCast(@as(u32, 0x0040_0000));
+    try std.testing.expectEqual(@as(u32, 0xcb40_0001), @as(u32, @bitCast(ffma(a, b, c, .rn))));
+    try std.testing.expectEqual(@as(u32, 0xcb40_0002), @as(u32, @bitCast(ffma(a, b, -c, .rn))));
+    var rng = std.Random.DefaultPrng.init(75);
+    const rand = rng.random();
+    var n: usize = 0;
+    while (n < 200_000) : (n += 1) {
+        const x: f32 = @bitCast(rand.int(u32));
+        const y: f32 = @bitCast(rand.int(u32));
+        const z0: f32 = @bitCast(rand.int(u32));
+        // (z near -x * y half the time, where a second rounding shows)
+        const z = if (n & 1 == 0) -(x * y) else z0;
+        const want = @mulAdd(f32, x, y, z);
+        const got = fma32(x, y, z);
+        if (std.math.isNan(want)) {
+            try std.testing.expect(std.math.isNan(got));
+        } else try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+    }
 }
 
 fn roundInt(x: f64, r: Round) f64 {
@@ -4598,7 +4653,7 @@ test "the graphics stages' reads and writes: sm120_sched's, the emulator's own t
         "TLD.B.LL R2, R0, R4, R6, 2D",
     }) |text| {
         const in = try sm120.parse(text);
-        const op = try compile(&in, null, 1);
+        const op = try compile(.sm_120, &in, null, 1);
         const theirs = try sched.usesOf(&in);
         const own = fallbackUses(&op, &in);
         errdefer std.debug.print("\"{s}\"\n", .{text});
@@ -4614,13 +4669,13 @@ test "the graphics stages' reads and writes: sm120_sched's, the emulator's own t
     }
     // a texture's registers: the channels' and no more; two coordinates,
     // the handle, a fetch's level
-    const all = try compile(&try sm120.parse("TEX.B.DXY R2, R0, R4, R6, 2D"), null, 1);
+    const all = try compile(.sm_120, &try sm120.parse("TEX.B.DXY R2, R0, R4, R6, 2D"), null, 1);
     try testing.expectEqual(@as(usize, 4), all.uses.dsts().len);
     try testing.expectEqual(@as(usize, 3), all.uses.srcs().len);
     try testing.expectEqual(@as(?u8, 6), all.top);
-    const two = try compile(&try sm120.parse("TEX.B.LZ RZ, R0, R4, R6, 2D, 0x3"), null, 1);
+    const two = try compile(.sm_120, &try sm120.parse("TEX.B.LZ RZ, R0, R4, R6, 2D, 0x3"), null, 1);
     try testing.expectEqual(@as(usize, 2), two.uses.dsts().len);
-    const level = try compile(&try sm120.parse("TLD.B.LL R2, R0, R4, R6, 2D"), null, 1);
+    const level = try compile(.sm_120, &try sm120.parse("TLD.B.LL R2, R0, R4, R6, 2D"), null, 1);
     try testing.expectEqual(@as(usize, 4), level.uses.srcs().len);
     try testing.expectEqual(@as(?u8, 7), level.top);
 }
