@@ -13,6 +13,7 @@ extern "c" fn dlopen(name: [*:0]const u8, flags: c_int) ?*anyopaque;
 extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
 extern "c" fn printf(fmt: [*:0]const u8, ...) c_int;
 extern "c" fn fflush(f: ?*anyopaque) c_int;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 const RTLD_NOW = 2;
 const N = 1 << 18; // dwords (1 MiB)
@@ -61,6 +62,19 @@ pub fn main() void {
     step("cuMemAlloc", cuMemAlloc(&mem, N * 4));
     _ = printf("cudaprobe: memory at 0x%llx\n", mem);
     step("cuMemsetD32", cuMemsetD32(mem, 0x5a5a1234, N));
+    // CUDAPROBE_LOOP=n: n more fills, each waited for (the GPFIFO ring
+    // wraps after 1024 entries: how NVIDIA's driver rings past it)
+    if (getenv("CUDAPROBE_LOOP")) |s| {
+        const n = std.fmt.parseInt(u32, std.mem.span(s), 10) catch 0;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            if (cuMemsetD32(mem, 0x5a5a1234, N) != 0 or cuCtxSynchronize() != 0) {
+                _ = printf("cudaprobe: loop failed at %u\n", i);
+                std.process.exit(1);
+            }
+        }
+        if (mark) |m| m("loop");
+    }
     step("cuCtxSynchronize", cuCtxSynchronize());
     step("cuMemcpyDtoH", cuMemcpyDtoH(&host, mem, N * 4));
     var bad: usize = 0;
