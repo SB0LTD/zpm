@@ -34,6 +34,17 @@
 //! the QMDs and the code decoded and run by sm120_emu, its hazard checks at
 //! NAK's level (strict).
 //!
+//! # Turing (sm_75)
+//!
+//! The caps' target says which generation the adapter drives: `rtx5070`
+//! (sm_120) or `tu102` (sm_75: the RTX 2080 Ti). For sm_75 the run is the
+//! same pushbuffer with TURING_COMPUTE_A's methods (push.Push.sm) and each
+//! QMD is version 02_02 (qmd.buildFor); constant buffer 0 keeps this
+//! layout. Not offered there: the 3D engine (its class and texture words
+//! are other ones, not ported) and indirect dispatches (the patch kernel
+//! is prebuilt sm_120 code writing a v05_00 QMD's words). `Emu.setSm`
+//! makes the emulated card a Turing one. Nothing sm_75 has run on a card.
+//!
 //! Allocation-free: the adapter's state is the caller's (Adapter, Emu).
 
 const std = @import("std");
@@ -103,9 +114,34 @@ pub fn rtx5070(vram: u64) gpu.Caps {
     };
 }
 
+/// The RTX 2080 Ti's (TU102, Turing) caps, `vram` bytes of VRAM: compute
+/// kernels compiled for sm_75. No indirect dispatches and no graphics
+/// (see the header). Proven on the emulated card only.
+pub fn tu102(vram: u64) gpu.Caps {
+    var c = rtx5070(vram);
+    c.target = .sm_75;
+    c.name = "RTX 2080 Ti (TU102, sm_75)";
+    // (a Turing SM's largest split, 64 KiB, none of it reserved)
+    c.shared_bytes = qmd.maxKernelShared(.sm_75);
+    c.indirect = false;
+    return c;
+}
+
+/// A shader model's caps: `tu102` for sm_75, `rtx5070` for sm_120.
+pub fn capsFor(sm: push.Sm, vram: u64) gpu.Caps {
+    return if (sm == .sm_75) tu102(vram) else rtx5070(vram);
+}
+
+/// The shader model a caps' target is (sm_120 for any but sm_75).
+pub fn smOf(t: gpu.Target) push.Sm {
+    return if (t == .sm_75) .sm_75 else .sm_120;
+}
+
 /// The same with the 3D engine offered (Caps.graphics: a channel with a
-/// BLACKWELL_B object on it).
+/// BLACKWELL_B object on it). Blackwell only: Turing's caps come back as
+/// they are.
 pub fn withGraphics(c: gpu.Caps) gpu.Caps {
+    if (c.target != .sm_120) return c;
     var x = c;
     x.graphics = true;
     x.max_graphics = MAX_GRAPHICS;
@@ -275,6 +311,11 @@ pub const Adapter = struct {
         return .{ .ctx = a, .vtable = &vtable, .caps = a.caps };
     }
 
+    /// The shader model the adapter drives (its caps' target).
+    fn sm(a: *const Adapter) push.Sm {
+        return smOf(a.caps.target);
+    }
+
     /// The raw device's handle of `b`, one of this adapter's buffers: what
     /// the driver under it (gfxapi's node: Galaxy's render node) knows it
     /// by, which a dma-buf export names. A gpu.Buffer's own handle is the
@@ -409,7 +450,10 @@ pub const Adapter = struct {
 
     fn load(ctx: *anyopaque, bin: *const gpu.Binary) gpu.Error!gpu.Program {
         const a = self(ctx);
-        if (bin.target != .sm_120 or bin.code.len == 0 or bin.code.len % 16 != 0) return error.BadProgram;
+        // (the card's own generation's code only: sm_120 words are not
+        // sm_75's)
+        if (bin.target != a.caps.target or kir_sm120.genOf(bin.target) == null) return error.BadProgram;
+        if (bin.code.len == 0 or bin.code.len % 16 != 0) return error.BadProgram;
         if (bin.regs == 0 or bin.regs > 255) return error.BadProgram;
         if (bin.extra[kir_sm120.EXTRA_STACK] != 0) return error.Unsupported;
         if (8 * @as(u32, bin.bindings) + 4 * @as(u32, bin.param_words) > qmd.MAX_BIG_PARAMS) return error.BadProgram;
@@ -421,7 +465,6 @@ pub const Adapter = struct {
             free(ctx, code);
             return error.BadProgram;
         }
-        _ = a;
         return .{ .bin = bin.*, .code = code };
     }
 
@@ -455,7 +498,7 @@ pub const Adapter = struct {
         try a.setUp(s);
         if (a.profiling and s.ends.cpu.len == 0) s.ends = a.rawOf(true).alloc(16 * MAX_DISPATCHES) catch return error.OutOfMemory;
         s.profiled = a.profiling;
-        var p = push.Push{ .buf = s.pb.words() };
+        var p = push.Push{ .buf = s.pb.words(), .sm = a.sm() };
         p.computeSetup(.{});
         p.invalidateShaderCaches();
         p.reportTimestamp(s.stamps.va, 1);
@@ -518,6 +561,7 @@ pub const Adapter = struct {
                 drawn = .{};
             }
             if (d.indirect) |ind| {
+                if (!a.caps.indirect) return error.Unsupported;
                 // the counts into this dispatch's QMD and cbuf0, by the
                 // patch kernel, once what came before is done; its launch
                 // then reads them (the QMD built here with a 1x1x1 grid)
@@ -575,7 +619,7 @@ pub const Adapter = struct {
     /// Dispatch d's QMD and cbuf0 into slot `slot` of set s (`profile`:
     /// its end timed into ends[profile]).
     fn buildSlot(a: *Adapter, s: *Set, slot: usize, d: gpu.Dispatch, timed: ?usize) gpu.Error!void {
-        _ = a;
+        const model = a.sm();
         const bin = &d.prog.bin;
         // (a dispatch may pass more words than its kernel reads, as on
         // the Adreno and the interpreter: GL hands every draw kernel
@@ -587,7 +631,7 @@ pub const Adapter = struct {
             const at = slot * SLOT_BYTES;
             const q: *[qmd.QMD_WORDS]u32 = @ptrCast(@alignCast(s.slots.cpu[at..][0..qmd.QMD_BYTES]));
             const param_bytes = 8 * d.buffers.len + 4 * words.len;
-            qmd.build(q, .{
+            qmd.buildFor(model, q, .{
                 .cbuf_bytes = qmd.cbuf0Bytes(param_bytes),
                 .prog_va = d.prog.code.gpu,
                 .prog_bytes = bin.code.len,
@@ -598,8 +642,8 @@ pub const Adapter = struct {
                 .shared_bytes = bin.shared_bytes,
             }) catch return error.BadProgram;
             if (d.stamp) |st| {
-                qmd.releaseStamp(q, st.buf.gpu + st.off, 1);
-            } else if (timed != null) qmd.releaseStamp(q, s.ends.va + i * 16, @intCast(i));
+                qmd.releaseStampFor(model, q, st.buf.gpu + st.off, 1);
+            } else if (timed != null) qmd.releaseStampFor(model, q, s.ends.va + i * 16, @intCast(i));
             var params: [qmd.MAX_BIG_PARAMS]u8 = undefined;
             var n: usize = 0;
             for (d.buffers) |b| {
@@ -761,7 +805,7 @@ pub const Adapter = struct {
             a.timer_value = host.alloc(16) catch return error.OutOfMemory;
             a.timer_push = commands;
         }
-        var p = push.Push{ .buf = a.timer_push.words() };
+        var p = push.Push{ .buf = a.timer_push.words(), .sm = a.sm() };
         p.computeSetup(.{});
         p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
         p.reportTimestamp(a.timer_value.va, 1);
@@ -934,12 +978,21 @@ pub const Emu = struct {
         work.strict = true;
         work.reverse_warps = false;
         work.max_steps = emu.DEFAULT_MAX_STEPS;
+        work.sm = .sm_120;
         e.* = .{ .raw = .{ .arena = arena, .gpu_view = gpu_view, .work = work, .tpcs = 1 } };
+    }
+
+    /// The emulated card's generation, before `device`: sm_75 makes it a
+    /// Turing one (an RTX 2080 Ti's SMs: sm_75 words and latencies,
+    /// TURING_COMPUTE_A's methods, version 02_02 QMDs).
+    pub fn setSm(e: *Emu, model: push.Sm) void {
+        e.raw.sm = model;
     }
 
     pub fn device(e: *Emu) gpu.Device {
         e.raw.work.strict = true;
-        return over(&e.adapter, e.raw.device(), null, if (e.engine != null) withGraphics(emuCaps()) else emuCaps());
+        const caps = emuCapsFor(e.raw.sm);
+        return over(&e.adapter, e.raw.device(), null, if (e.engine != null) withGraphics(caps) else caps);
     }
 
     /// What went wrong in the last run's kernel, as a sentence.
@@ -956,8 +1009,14 @@ pub const Emu = struct {
 
 /// The emulated RTX's caps: the RTX 5070's, a 64 MiB emulated VRAM.
 pub fn emuCaps() gpu.Caps {
-    var c = rtx5070(64 << 20);
-    c.name = "emulated RTX (sm120_emu)";
+    return emuCapsFor(.sm_120);
+}
+
+/// The emulated card's caps as a generation's: the RTX 5070's, or the RTX
+/// 2080 Ti's for sm_75.
+pub fn emuCapsFor(model: push.Sm) gpu.Caps {
+    var c = capsFor(model, 64 << 20);
+    c.name = if (model == .sm_75) "emulated RTX 2080 Ti (sm120_emu, sm_75)" else "emulated RTX (sm120_emu)";
     return c;
 }
 
@@ -986,10 +1045,14 @@ const T = struct {
     var tys: [8192]kir.Ty = undefined;
     var asm_work: nvidia.sm120_asm.Work = .{};
     var words: [2 * nvidia.sm120_asm.MAX_INSTRS]u64 = undefined;
+    /// The generation the emulated card is in the test running (sm_75 in
+    /// the Turing tests at the end, which set it back).
+    var sm: push.Sm = .sm_120;
 };
 
 fn freshEmu() gpu.Device {
     T.dev.init(&T.arena, &T.view, &T.work);
+    T.dev.setSm(T.sm);
     return T.dev.device();
 }
 
@@ -1273,12 +1336,16 @@ test "a buffer freed twice: the second free names nothing, and the buffer made i
 }
 
 test "Emu over an emulator Work left undefined (a static `= undefined`): its controls are set by init" {
+    // (the shader model too: a Work that says sm_75 from an earlier use, or
+    // from memory nothing set, is this device's again at its first stream)
+    T.work.sm = .sm_75;
     @memset(std.mem.asBytes(&T.work.max_steps), 0);
     T.work.check_hazards = false;
     T.work.trap = .{ .what = .timeout };
     const d = freshEmu();
     try testing.expectEqual(emu.DEFAULT_MAX_STEPS, T.work.max_steps);
     try testing.expect(T.work.check_hazards and T.work.strict);
+    try testing.expectEqual(push.Sm.sm_120, T.work.sm);
     var k = newKernel("one", .{ 32, 1, 1 });
     const o = k.binding();
     const t = k.tid(0);
@@ -1320,6 +1387,10 @@ fn words32(b: gpu.Buffer) []u32 {
 }
 
 test "a first kernel: out[i] = b[i] * 2.5 + a[i] + n through the adapter, QMDs and pushbuffer on the emulated RTX" {
+    try firstKernel();
+}
+
+fn firstKernel() !void {
     const d = freshEmu();
     var k = newKernel("axpy", .{ 64, 1, 1 });
     const A = k.binding();
@@ -1343,7 +1414,7 @@ test "a first kernel: out[i] = b[i] * 2.5 + a[i] + n through the adapter, QMDs a
     };
     var work = gpu.Work.init(&W.mem);
     const bin = try gpu.compile(&k, d.caps, &work, &T.code);
-    try testing.expectEqual(gpu.Target.sm_120, bin.target);
+    try testing.expectEqual(if (T.sm == .sm_75) gpu.Target.sm_75 else gpu.Target.sm_120, bin.target);
     const prog = try d.load(&bin);
     const ba = try d.alloc(512, .upload);
     const bb = try d.alloc(512, .upload);
@@ -1689,7 +1760,7 @@ const X = struct {
 const Src = union(enum) { reg, imm: u32, pred };
 
 fn caseCaps(flush: bool) gpu.Caps {
-    var c = emuCaps();
+    var c = emuCapsFor(T.sm);
     if (flush) c.denormals = .flush;
     return c;
 }
@@ -1876,6 +1947,10 @@ fn cvtAux(from: kir.Ty, to: kir.Ty, round: kir.Round) u32 {
 }
 
 test "every integer op equals the interpreter (registers and immediates in each slot)" {
+    try intOps();
+}
+
+fn intOps() !void {
     for ([_]bool{ false, true }) |flush| {
         const caps = caseCaps(flush);
         fillInts(0x1234);
@@ -1929,6 +2004,10 @@ test "every integer op equals the interpreter (registers and immediates in each 
 }
 
 test "every float op equals the interpreter, denormals kept and flushed" {
+    try floatOps();
+}
+
+fn floatOps() !void {
     for ([_]bool{ false, true }) |flush| {
         const caps = caseCaps(flush);
         fillFloats(0x51ce);
@@ -1960,6 +2039,10 @@ test "every float op equals the interpreter, denormals kept and flushed" {
 }
 
 test "fsin and fcos within their bounds" {
+    try sinCos();
+}
+
+fn sinCos() !void {
     const caps = caseCaps(false);
     var s: u32 = 9;
     for (0..3) |j| {
@@ -1969,6 +2052,10 @@ test "fsin and fcos within their bounds" {
 }
 
 test "every conversion equals the interpreter, in each rounding" {
+    try conversions();
+}
+
+fn conversions() !void {
     for ([_]bool{ false, true }) |flush| {
         const caps = caseCaps(flush);
         const tys = [_]kir.Ty{ .u32, .i32, .f32, .f16 };
@@ -1994,6 +2081,10 @@ test "every conversion equals the interpreter, in each rounding" {
 }
 
 test "fdiv and fsqrt bit-exact: kir.expandDiv's fused path, sqrt native and expanded, denormals kept and flushed" {
+    try divSqrt();
+}
+
+fn divSqrt() !void {
     var s: u32 = 0xd1;
     for ([_]bool{ false, true }) |flush| {
         const caps = caseCaps(flush);
@@ -2058,6 +2149,10 @@ fn lin(k: *kir.Kernel) kir.V {
 }
 
 test "memory: 8- to 128-bit loads and stores, signed, global and shared, immediate and register addresses" {
+    try memoryForms();
+}
+
+fn memoryForms() !void {
     const caps = caseCaps(false);
     fillInts(0x3e3);
     var k = newKernel("memory", .{ 64, 1, 1 });
@@ -2135,6 +2230,10 @@ test "memory: 8- to 128-bit loads and stores, signed, global and shared, immedia
 }
 
 test "atomics, barriers, shuffles, votes" {
+    try atomicsWarp();
+}
+
+fn atomicsWarp() !void {
     const caps = caseCaps(false);
     fillInts(0xa70);
     {
@@ -2213,6 +2312,10 @@ test "atomics, barriers, shuffles, votes" {
 }
 
 test "atomics and, or, xor and compare-and-swap (CAS loops, global and shared); ballots" {
+    try casBallots();
+}
+
+fn casBallots() !void {
     const caps = caseCaps(false);
     fillInts(0xca5);
     var k = newKernel("cas", .{ 64, 1, 1 });
@@ -2275,16 +2378,24 @@ test "atomics and, or, xor and compare-and-swap (CAS loops, global and shared); 
     k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
     m.imm = 64 + 12 * NT;
     k.store(.u32, m, r(off), r(k.ballot(r(p), 1)));
-    k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(y), u(2))), u(0))));
-    m.imm = 64 + 16 * NT;
-    k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
-    k.endif();
+    // (sm_75 compiles no collective in divergent flow: the words there
+    // stay zero on both)
+    if (T.sm == .sm_120) {
+        k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(y), u(2))), u(0))));
+        m.imm = 64 + 16 * NT;
+        k.store(.u32, m, r(off), r(k.ballot(r(p), 0)));
+        k.endif();
+    }
     try same(caps, &k, .{ 2, 1, 1 }, &.{}, 16 + 5 * NT, null);
     try std.testing.expectEqual(@as(u32, 2 * 64), X.ref[2]);
     try std.testing.expectEqual(@as(u32, 64), X.ref[4 + 3]);
 }
 
 test "control flow: divergent ifs, loops with brk and cont, nesting, an early ret" {
+    try controlFlow();
+}
+
+fn controlFlow() !void {
     for ([_]bool{ false, true }) |flush| {
         const caps = caseCaps(flush);
         fillInts(0xc0f);
@@ -2362,6 +2473,10 @@ test "control flow: divergent ifs, loops with brk and cont, nesting, an early re
 }
 
 test "ids, parameters and predicates past the six registers" {
+    try idsParams();
+}
+
+fn idsParams() !void {
     const caps = caseCaps(false);
     fillInts(0x1d5);
     {
@@ -2414,6 +2529,10 @@ test "ids, parameters and predicates past the six registers" {
 }
 
 test "fneg and fabs: source modifiers where the op takes them (FADD, FMNMX, FSETP, F2I), instructions where not (FMUL, FFMA)" {
+    try modifiers();
+}
+
+fn modifiers() !void {
     for ([_]bool{ false, true }) |flush| {
         const caps = caseCaps(flush);
         fillFloats(0xab5);
@@ -2783,4 +2902,114 @@ test "indirect dispatch: the prebuilt patch and nop kernels are kir_sm120's" {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+// ── sm_75 (Turing: the RTX 2080 Ti) ─────────────────────────────────────────
+//
+// The kernels above compiled for sm_75 (kir_sm120's SM75) and run on the
+// emulated card as a Turing one (EmuDevice.sm: sm_75's decoder and
+// latencies, TURING_COMPUTE_A's methods, version 02_02 QMDs), against the
+// interpreter. They show the compiler, the encoder, the decoder, the
+// scheduler and the launch agree with each other and with KIR's meaning.
+// They do not show a TU102 takes the words: nothing here has run on one,
+// and there is no ptxas output for sm_75 to compare with (sm75.sig).
+
+fn turing() void {
+    T.sm = .sm_75;
+}
+
+fn blackwell() void {
+    T.sm = .sm_120;
+}
+
+test "sm_75: a first kernel through the adapter, version 02_02 QMDs and Turing's pushbuffer, timed and profiled" {
+    turing();
+    defer blackwell();
+    try firstKernel();
+}
+
+test "sm_75: every integer and float op and every conversion equals the interpreter" {
+    turing();
+    defer blackwell();
+    const before = X.cases;
+    try intOps();
+    try floatOps();
+    try sinCos();
+    try conversions();
+    try divSqrt();
+    try modifiers();
+    std.debug.print("sm_75 ops: {d} kernels equal the interpreter\n", .{X.cases - before});
+}
+
+test "sm_75: memory forms, atomics, barriers, shuffles, votes, control flow, ids and parameters equal the interpreter" {
+    turing();
+    defer blackwell();
+    try memoryForms();
+    try atomicsWarp();
+    try casBallots();
+    try controlFlow();
+    try idsParams();
+}
+
+test "sm_75: Turing's forms in the text; the other generation's binary, indirect dispatch, graphics and a divergent collective refused" {
+    turing();
+    defer blackwell();
+    const d = freshEmu();
+    try testing.expectEqual(gpu.Target.sm_75, d.caps.target);
+    try testing.expect(!d.caps.indirect and !d.caps.graphics);
+    try testing.expect(!withGraphics(d.caps).graphics);
+    try testing.expectEqual(qmd.MAX_SHARED_SM75, d.caps.shared_bytes);
+    var k = newKernel("one", .{ 32, 1, 1 });
+    const o = k.binding();
+    const t = k.tid(0);
+    const sum = k.op2(.iadd, .u32, r(t), r(k.op2(.imin, .u32, r(t), u(7))));
+    k.store(.u32, kir.global(o, 32), r(k.op2(.shl, .u32, r(t), u(2))), r(sum));
+    try k.finish();
+    const text = try kir_sm120.compileText(&k, d.caps, &T.st, .{});
+    for ([_][]const u8{ "desc[", "LDCU", "VIMNMX", "IADD R", ".RECONVERGENT" }) |not| {
+        if (std.mem.indexOf(u8, text, not) != null) {
+            std.debug.print("sm_75 text has {s}:\n{s}\n", .{ not, text });
+            return error.TestUnexpectedResult;
+        }
+    }
+    for ([_][]const u8{ "STG.E.SYS [", "IADD3 ", "IMNMX.U32 " }) |has| {
+        if (std.mem.indexOf(u8, text, has) == null) {
+            std.debug.print("sm_75 text lacks {s}:\n{s}\n", .{ has, text });
+            return error.TestUnexpectedResult;
+        }
+    }
+    const bin = try kir_sm120.compileIn(&k, d.caps, &T.st, &T.code, .{});
+    try testing.expectEqual(gpu.Target.sm_75, bin.target);
+    const prog = try d.load(&bin);
+    const b = try d.alloc(128, .host);
+    try runWait(d, &.{.{ .prog = &prog, .groups = .{ 1, 1, 1 }, .buffers = &.{b}, .params = &.{} }});
+    d.fromDevice(b, 0, 128);
+    for (words32(b), 0..) |x, i| try testing.expectEqual(@as(u32, @intCast(i + @min(i, 7))), x);
+    // indirect dispatch: not offered, refused
+    try testing.expectError(error.Unsupported, d.run(&.{.{ .prog = &prog, .groups = .{ 1, 1, 1 }, .buffers = &.{b}, .params = &.{}, .indirect = .{ .buf = b, .off = 0 } }}));
+    // the kernel compiled for sm_120 does not load on the Turing card ...
+    const bin120 = try kir_sm120.compileIn(&k, emuCaps(), &T.st, &T.code, .{});
+    try testing.expectEqual(gpu.Target.sm_120, bin120.target);
+    try testing.expectError(error.BadProgram, d.load(&bin120));
+    // ... nor Turing's on a Blackwell one
+    blackwell();
+    const d120 = freshEmu();
+    const bin75 = try kir_sm120.compileIn(&k, emuCapsFor(.sm_75), &T.st, &T.code, .{});
+    try testing.expectError(error.BadProgram, d120.load(&bin75));
+    // a collective in divergent flow: sm_120 makes it safe with WARPSYNC;
+    // sm_75 has no settled word for it, and refuses
+    var k2 = newKernel("divergent", .{ 32, 1, 1 });
+    const o2 = k2.binding();
+    const t2 = k2.tid(0);
+    const p = k2.cmp(.u32, .ne, r(k2.op2(.@"and", .u32, r(t2), u(1))), u(0));
+    const acc = k2.mov(.u32, u(0));
+    k2.loop();
+    k2.brk(r(k2.cmp(.u32, .ge, r(acc), r(t2))));
+    k2.set(acc, .iadd, r(acc), r(k2.ballot(r(p), 0)), no);
+    k2.endloop();
+    k2.store(.u32, kir.global(o2, 32), r(k2.op2(.shl, .u32, r(t2), u(2))), r(acc));
+    try k2.finish();
+    _ = try kir_sm120.compileIn(&k2, emuCaps(), &T.st, &T.code, .{});
+    try testing.expect(T.st.stats.div_collectives > 0);
+    try testing.expectError(error.Unsupported, kir_sm120.compileIn(&k2, emuCapsFor(.sm_75), &T.st, &T.code, .{}));
 }

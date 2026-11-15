@@ -167,6 +167,27 @@ test "self-test on the emulated RTX (kir_sm120, sm120_emu with its hazard checks
     try expectAllPass(res);
 }
 
+test "self-test on the emulated RTX 2080 Ti (kir_sm120 for sm_75; sm120_emu as a Turing card: sm_75 words, version 02_02 QMDs, TURING_COMPUTE_A)" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.setSm(.sm_75);
+    Log.reset();
+    const d = Rtx.dev.device();
+    try std.testing.expectEqual(gpu.Target.sm_75, d.caps.target);
+    const res = selftest.runWith(gpu.all_targets, d, &work, Log.line, .{ .timeout_us = TIMEOUT_US, .stop_when_lost = false, .on_failure = rtxFailure });
+    std.debug.print("sm_75 self-test: {d} passed, {d} failed, {d} skipped\n", .{ res.passed, res.failed, res.skipped });
+    if (res.failed != 0 or res.lost) {
+        std.debug.print("first failure: {s}\n", .{res.firstFailure()});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(u32, @intCast(selftest.caseCount())), res.passed + res.skipped);
+    // (skipped, and said so in the log: the cases with a shuffle, vote or
+    // ballot in divergent control flow, which sm_75 does not compile)
+    try std.testing.expectEqual(SM75_SKIPPED, res.skipped);
+}
+/// The self-test's cases kir_sm120 refuses for sm_75 (error.Unsupported:
+/// a collective in divergent flow needs WARPSYNC, unsettled for Turing).
+const SM75_SKIPPED: u32 = 3;
+
 // ── The emulated Adreno ─────────────────────────────────────────────────────
 
 var ir3_work: gpu.kir_ir3.Work = undefined;

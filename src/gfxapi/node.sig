@@ -106,6 +106,10 @@ pub const CHIP_X1_45: u32 = 0x4303_0c00;
 /// The RTX 5070 Laptop GPU's (nv_dev.CHIP_GB206): NVIDIA's PCI vendor id
 /// over nouveau's chipset number, GB206 (sm_120).
 pub const CHIP_GB206: u32 = 0x10de_01b6;
+/// The RTX 2080 Ti's (nv_dev's id for TU102, Turing: sm_75). Compute
+/// kernels only: its caps offer no 3D engine and no indirect dispatch
+/// (gpu.nvidia_device.tu102).
+pub const CHIP_TU102: u32 = 0x10de_0162;
 
 /// The GPUs this client knows.
 pub const Kind = enum { adreno, nvidia };
@@ -114,7 +118,7 @@ pub const Kind = enum { adreno, nvidia };
 pub fn kindOf(chip: u32) ?Kind {
     return switch (chip) {
         CHIP_X1_45 => .adreno,
-        CHIP_GB206 => .nvidia,
+        CHIP_GB206, CHIP_TU102 => .nvidia,
         else => null,
     };
 }
@@ -741,7 +745,11 @@ fn has(comptime targets: []const gpu.Target, comptime t: gpu.Target) bool {
 /// sm_120). The adapters' state is here: a Gpu stays where it is made.
 pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
     const with_ir3 = has(targets, .ir3_a7xx);
-    const with_nv = has(targets, .sm_120);
+    // (the PC's NVIDIA cards: Blackwell's sm_120, Turing's sm_75; an image
+    // may link either backend list)
+    const with_sm120 = has(targets, .sm_120);
+    const with_sm75 = has(targets, .sm_75);
+    const with_nv = with_sm120 or with_sm75;
     return struct {
         const Self = @This();
 
@@ -763,8 +771,9 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
                     g.over = gpu.adreno_device.Over.initWith(g.node.device(), gpu.adreno_device.x1_45_caps(@as(u64, 8) << 30), g.node.importer());
                     return g.over.device();
                 },
-                .nvidia => if (with_nv) {
-                    var caps = gpu.nvidia_device.rtx5070(@as(u64, info.vram_mib) << 20);
+                .nvidia => if (with_nv and (if (info.chip == CHIP_TU102) with_sm75 else with_sm120)) {
+                    const vram = @as(u64, info.vram_mib) << 20;
+                    var caps = if (info.chip == CHIP_TU102) gpu.nvidia_device.tu102(vram) else gpu.nvidia_device.rtx5070(vram);
                     if (g.want_graphics and g.node.graphics()) caps = gpu.nvidia_device.withGraphics(caps);
                     const dev = gpu.nvidia_device.over(&g.nv, g.node.nvDevice(.vram), g.node.nvDevice(.system), caps);
                     // (images in VRAM no CPU reaches: the forwarded RTX's)
@@ -1146,6 +1155,31 @@ test "node: RTX PRIME import maps a shared buffer and counts repeated imports" {
     try std.testing.expectEqual(@as(u32, 1), k.live);
     g.freeIn(second.handle);
     try std.testing.expectEqual(@as(u32, 0), k.live);
+}
+
+test "node: a Turing card (TU102) is an NVIDIA node with sm_75 caps, no 3D engine and no indirect dispatch; an image without the sm_75 backend refuses it" {
+    try std.testing.expectEqual(Kind.nvidia, kindOf(CHIP_TU102).?);
+    try std.testing.expectEqual(@as(u32, 0x10de_0000 | 0x162), CHIP_TU102);
+    var k: Fake = undefined;
+    const Both = Gpu(*Fake, &.{ .sm_120, .sm_75 });
+    var g = Both{ .node = testNode(&k) };
+    k.chip = CHIP_TU102;
+    g.want_graphics = true;
+    const d = try g.open();
+    try std.testing.expectEqual(gpu.Target.sm_75, d.caps.target);
+    try std.testing.expect(!d.caps.graphics and !d.caps.indirect);
+    g.node.close();
+    // (the Legion's card through the same image: sm_120, as before)
+    g = Both{ .node = testNode(&k) };
+    k.chip = CHIP_GB206;
+    const d2 = try g.open();
+    try std.testing.expectEqual(gpu.Target.sm_120, d2.caps.target);
+    g.node.close();
+    // an image with the sm_120 backend alone has nothing to compile for it
+    const Legion = Gpu(*Fake, &.{.sm_120});
+    var l = Legion{ .node = testNode(&k) };
+    k.chip = CHIP_TU102;
+    try std.testing.expectError(error.Unsupported, l.open());
 }
 
 test "node: a buffer freed twice does not free the buffer made in its entry since" {

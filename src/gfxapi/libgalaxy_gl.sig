@@ -54,7 +54,8 @@ comptime {
 // ── The driver ─────────────────────────────────────────────────────────────
 
 const on_linux = builtin.os.tag == .linux;
-const targets: []const gpu.Target = if (builtin.cpu.arch == .aarch64) &.{.ir3_a7xx} else &.{.sm_120};
+// (the PC's NVIDIA cards: Blackwell's sm_120 and Turing's sm_75, one backend)
+const targets: []const gpu.Target = if (builtin.cpu.arch == .aarch64) &.{.ir3_a7xx} else &.{ .sm_120, .sm_75 };
 const work_bytes = if (builtin.cpu.arch == .aarch64) gpu.kir_ir3.WORK_BYTES else gpu.nvidia_device.kir_sm120.WORK_BYTES;
 const G = node.Gpu(node.Linux, targets);
 
