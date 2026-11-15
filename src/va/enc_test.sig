@@ -134,6 +134,10 @@ fn fakeEncode(k: *Fake, sub: Fake.Submit) void {
         else => blob(out, &.{ 0x12, 0x34, 0x56, 0x78, 0x9a }),
     };
     const stat = at(k, &m, nvenc.SET_OUT_ENC_STATUS, nvenc.Stat.SIZE);
+    // (as NVIDIA's engine writes every picture's: its index back, and
+    // error_status 2, routine)
+    nvenc.set(stat, nvenc.Stat.picture_index, m[nvenc.SET_PICTURE_INDEX >> 2]);
+    nvenc.set(stat, nvenc.Stat.error_status, 2);
     if (seen.app == nvenc.APPLICATION_ID_AV1) {
         nvenc.set(stat, nvenc.Av1Stat.total_bit_count, n * 8);
         nvenc.set(stat, nvenc.Av1Stat.num_tiles, 1);
@@ -201,7 +205,7 @@ fn pcmSlice(k: *Fake, m: []const u32, setup: []const u8, out: []u8) usize {
         if (idr) wr.flag(false);
     }
     const init_qp = 26 + signExtend(nvenc.get(setup, H.pic_init_qp_minus26), 6);
-    const qp: i32 = @intCast(nvenc.get(setup[nvenc.SLICE_CONTROL_OFF..], nvenc.H264Slice.qp_avr));
+    const qp: i32 = @intCast(nvenc.get(setup[@intCast(nvenc.get(setup, H.slice_control_offset))..], nvenc.H264Slice.qp_avr));
     wr.se(qp - init_qp);
     if (nvenc.get(setup, H.deblocking_filter_control_present_flag) != 0) wr.ue(1);
     for (0..(h + 15) / 16) |my| {
@@ -616,8 +620,8 @@ test "enc: HEVC B picture's setup: the RPS both sides, the lists, the collocated
     try testing.expectEqual(@as(u64, 1), nvenc.get(&b, nvenc.at(H.poc_entry_l1, 0))); // S1's first: entry 1
     try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(H.poc_entry_l0, 0)));
     try testing.expectEqual(@as(u64, 4), nvenc.get(&b, H.pic_order_cnt_lsb));
-    const c = b[nvenc.SLICE_CONTROL_OFF..];
-    try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.slice_type));
+    const c = b[nvenc.H265_SLICE_OFF..];
+    try testing.expectEqual(@as(u64, 1), nvenc.get(c, nvenc.H265Slice.slice_type)); // B, the engine's 1
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.collocated_from_l0_flag));
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.collocated_ref_idx));
     try testing.expectEqual(va.ERROR_MAX_NUM_EXCEEDED, enc_hevc.checkSlices(&.{.{ .slice_type = 0, .l1_minus1 = 1 }}));
@@ -883,4 +887,73 @@ test "enc: GALAXY_VA_NVENC_RC=firmware: RCMODE CBR and the rate control struct, 
     try testing.expectEqual(@as(u64, 600_000 * 16), nvenc.get(st, nvenc.Persistent.nal_cpb_fullness));
     try testing.expectEqual(va.SUCCESS, d.destroyBuffer(coded));
     try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
+}
+
+test "enc: HEVC B picture's reference tables as NVIDIA's driver writes them (the WSL capture's POC 1)" {
+    // POC 0 in slot 0, POC 3 in slot 1, POC 2 in slot 2; this B picture at
+    // POC 1: L0 [POC 0], L1 [POC 2, POC 3]. NVIDIA's setup: L1's entries
+    // are references 2 and 1 (the slots' rank), the scale table
+    // [[256 -512 -256] [-128 256 128] [-256 512 256]], the DiffPicOrderCnt
+    // bytes 00 00 fe..., the count 3, the order bits 1 2 4.
+    const seq = enc_hevc.testSeq(64, 48);
+    var pic = enc_hevc.testPic(0x403, 0x1000, false, 1);
+    pic.pic_fields.coding_type = 3;
+    pic.pic_fields.reference_pic_flag = 0;
+    pic.nal_unit_type = 0;
+    pic.reference_frames[0] = .{ .picture_id = 0x400, .pic_order_cnt = 0, .flags = 0 };
+    pic.reference_frames[1] = .{ .picture_id = 0x401, .pic_order_cnt = 3, .flags = 0 };
+    pic.reference_frames[2] = .{ .picture_id = 0x402, .pic_order_cnt = 2, .flags = 0 };
+    var sl = enc_hevc.Slice{ .num_ctu = 4, .slice_type = 0, .l1_minus1 = 1, .collocated_from_l0 = false };
+    sl.ref0[0] = 0x400;
+    sl.ref1[0] = 0x402;
+    sl.ref1[1] = 0x401;
+    var refs = [_]u32{va.INVALID_ID} ** nvenc.REF_SLOTS;
+    refs[0] = 0x400;
+    refs[1] = 0x401;
+    refs[2] = 0x402;
+    var poc = [_]i32{0} ** nvenc.REF_SLOTS;
+    poc[1] = 3;
+    poc[2] = 2;
+    var b: [nvenc.SETUP_BYTES]u8 = undefined;
+    const planes = enc_h264.Planes{ .luma = 0, .chroma = 0, .pitch_luma = 64, .pitch_chroma = 64 };
+    enc_hevc.setup(&b, .{ .seq = &seq, .pic = &pic, .slices = &.{sl}, .input = planes, .recon = planes, .ref_ids = refs, .ref_poc = poc, .collocated_id = va.INVALID_ID, .qp = 30, .gop_length = 30, .framerate = 30, .bitstream_start = 0, .bitstream_room = 1 << 20, .history_bytes = 4096 });
+    const H = nvenc.H265;
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&b, nvenc.at(H.poc_entry_l1, 0)));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&b, nvenc.at(H.poc_entry_l1, 1)));
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(H.poc_entry_l0, 0)));
+    const want = [3][3]i16{ .{ 256, -512, -256 }, .{ -128, 256, 128 }, .{ -256, 512, 256 } };
+    for (want, 0..) |row, i| for (row, 0..) |v, j| {
+        try testing.expectEqual(@as(u64, @as(u16, @bitCast(v))), nvenc.get(&b, nvenc.at(H.dist_scale_factor, @intCast(i * 8 + j))));
+    };
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(H.dist_scale_factor, 3)));
+    try testing.expectEqual(@as(u64, 0xffff), nvenc.get(&b, nvenc.at(H.dist_scale_factor, 3 * 8)));
+    try testing.expectEqual(@as(u64, 0x00), nvenc.get(&b, nvenc.at(H.diff_pic_order_cnt_zero, 0)));
+    try testing.expectEqual(@as(u64, 0x00), nvenc.get(&b, nvenc.at(H.diff_pic_order_cnt_zero, 1)));
+    try testing.expectEqual(@as(u64, 0xfe), nvenc.get(&b, nvenc.at(H.diff_pic_order_cnt_zero, 2)));
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&b, H.ref_count_gb206));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&b, nvenc.at(H.ref_order_gb206, 0)));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&b, nvenc.at(H.ref_order_gb206, 1)));
+    try testing.expectEqual(@as(u64, 4), nvenc.get(&b, nvenc.at(H.ref_order_gb206, 2)));
+}
+
+test "enc: HEVC's own SPS a whole number of CTBs (720p coded 736 rows, NVIDIA's), the input at its own size" {
+    var seq = enc_hevc.testSeq(1280, 720);
+    seq.log2_min_luma_coding_block_size_minus3 = 1; // CB 16
+    seq.log2_diff_max_min_luma_coding_block_size = 1; // CTB 32
+    var pic = enc_hevc.testPic(0x400, 0x1000, true, 0);
+    var sl = [_]enc_hevc.Slice{.{ .num_ctu = 920, .slice_type = 2 }};
+    enc_hevc.ownChoices(&seq, &pic, &sl, true);
+    try testing.expectEqual(@as(u16, 736), seq.pic_height_in_luma_samples);
+    try testing.expectEqual(@as(u16, 1280), seq.pic_width_in_luma_samples);
+    var b: [nvenc.SETUP_BYTES]u8 = undefined;
+    const planes = enc_h264.Planes{ .luma = 0, .chroma = 0, .pitch_luma = 1280, .pitch_chroma = 1280 };
+    enc_hevc.setup(&b, .{ .seq = &seq, .pic = &pic, .slices = &sl, .input = planes, .recon = planes, .ref_ids = [_]u32{va.INVALID_ID} ** nvenc.REF_SLOTS, .ref_poc = [_]i32{0} ** nvenc.REF_SLOTS, .qp = 30, .gop_length = 30, .framerate = 30, .bitstream_start = 0, .bitstream_room = 1 << 20, .history_bytes = 4096, .input_width = 1280, .input_height = 720 });
+    const H = nvenc.H265;
+    try testing.expectEqual(@as(u64, 735), nvenc.get(&b, H.refpic_cfg_frame_height_minus1));
+    try testing.expectEqual(@as(u64, 735), nvenc.get(&b, H.outputpic_cfg_frame_height_minus1));
+    try testing.expectEqual(@as(u64, 719), nvenc.get(&b, H.input_cfg_frame_height_minus1));
+    // (the SPS: 736 rows, an 8-row window off the bottom, as NVIDIA's)
+    var out: [512]u8 = undefined;
+    const n = enc_hevc.writeHeadersSized(&out, &seq, &pic, 1280, 720).?;
+    try testing.expect(n > 0);
 }

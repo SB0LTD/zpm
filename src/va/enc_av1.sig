@@ -465,6 +465,63 @@ pub fn listOf(ctrl: u32, max: usize, out: []u3) usize {
     return n;
 }
 
+/// The reference names (1..7) an inter picture's lists use, each once,
+/// in list order (L0's, then L1's; no list given: LAST alone), into
+/// `out`. The engine numbers its references by name, LAST 0 .. ALTREF 6:
+/// the lists' entries, poc_entry and SET_IN_REF_PIC0 + 4 x (name - 1), as
+/// NVIDIA's own driver writes them on GB206 (the WSL captures: every list
+/// entry equals its poc_entry, and its B frames' L0 holds 3, 1, 0 =
+/// GOLDEN, LAST2, LAST). Numbered by VA's slots (pc-full13, pc-full14) or
+/// in list order (pc-full18) while poc_entry said the name, the engine read
+/// VA 0 at the first picture with GOLDEN.
+pub fn refNames(f: Frame, pic: *const Pic, out: *[7]u3) usize {
+    if (f.intra()) return 0;
+    var n: usize = 0;
+    var names: [7]u3 = undefined;
+    const ctrls = [2]u32{ pic.ref_frame_ctrl_l0, pic.ref_frame_ctrl_l1 };
+    const maxes = [2]usize{ MAX_L0, MAX_L1 };
+    for (ctrls, 0..) |ctrl, li| {
+        var m = listOf(ctrl, maxes[li], &names);
+        if (li == 0 and m == 0) {
+            names[0] = 1;
+            m = 1;
+        }
+        for (names[0..m]) |name| {
+            if (std.mem.indexOfScalar(u3, out[0..n], name) == null) {
+                out[n] = name;
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
+/// The reference slots (VA's) an inter picture's lists name, each once, in
+/// list order: how many distinct pictures it reads (NVIDIA's template by
+/// that count).
+pub fn refOrder(f: Frame, pic: *const Pic, out: *[7]u3) usize {
+    if (f.intra()) return 0;
+    var n: usize = 0;
+    var names: [7]u3 = undefined;
+    const ctrls = [2]u32{ pic.ref_frame_ctrl_l0, pic.ref_frame_ctrl_l1 };
+    const maxes = [2]usize{ MAX_L0, MAX_L1 };
+    for (ctrls, 0..) |ctrl, li| {
+        var m = listOf(ctrl, maxes[li], &names);
+        if (li == 0 and m == 0) {
+            names[0] = 1;
+            m = 1;
+        }
+        for (names[0..m]) |name| {
+            const slot: u3 = @intCast(f.ref_frame_idx[name - 1]);
+            if (std.mem.indexOfScalar(u3, out[0..n], slot) == null) {
+                out[n] = slot;
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
 /// A loop-filter level for `qindex` when the app leaves it to the driver
 /// (libaom's picking from the quantiser, rounded: 0 at the lowest
 /// quantisers, 63 at the highest).
@@ -561,12 +618,32 @@ pub const Setup = struct {
     bitstream_room: u32,
     history_bytes: u32,
     magic: u32 = nvenc.MAGIC,
+    /// where the tile controls go in the setup (encode.Try.av1_tiles_at)
+    tiles_at: u32 = nvenc.TILE_CONTROL_OFF,
+    /// NVIDIA's own captured setup as the base (encode.Try.av1_template)
+    template: bool = false,
+    /// bottom-field offsets on the reference, reconstruction and fourth
+    /// configurations (encode.Try.bottom_fields)
+    bottom_fields: bool = false,
 };
 
 pub fn setup(buf: []u8, s: Setup) void {
     @memset(buf[0..nvenc.SETUP_BYTES], 0);
     const f = s.frame;
     const pic = s.pic;
+    if (s.template) {
+        // (NVIDIA's own setup for the same kind of frame; every field this
+        // driver knows is written over it below)
+        // (by the frame's reference count: NVIDIA's frame with as many)
+        var order: [7]u3 = undefined;
+        const nrefs = refOrder(f, pic, &order);
+        const t = if (f.intra()) nvenc.NV_AV1_KEY else switch (nrefs) {
+            0, 1 => nvenc.NV_AV1_P,
+            2 => nvenc.NV_AV1_P2,
+            else => nvenc.NV_AV1_P3,
+        };
+        @memcpy(buf[0..0x400], t[0..0x400]);
+    }
     nvenc.set(buf, A.magic, s.magic);
     const cfgs = [_][4]nvenc.F{
         .{ A.refpic_cfg_frame_width_minus1, A.refpic_cfg_frame_height_minus1, A.refpic_cfg_sfc_pitch, A.refpic_cfg_sfc_pitch_chroma },
@@ -580,8 +657,27 @@ pub fn setup(buf: []u8, s: Setup) void {
         nvenc.set(buf, c[2], p.pitch_luma);
         nvenc.set(buf, c[3], p.pitch_chroma);
     }
-    nvenc.set(buf, A.refpic_cfg_tiled_16x16, 1);
-    nvenc.set(buf, A.outputpic_cfg_tiled_16x16, 1);
+    // the reference and reconstructed pictures block linear, 2 GOBs a
+    // block (the surfaces' own layout), as NVIDIA's own driver lays them
+    // out on GB206 for every codec (the WSL capture); "tiled 16x16" (the
+    // engine's macroblock layout, which H.264 encodes with) faulted HEVC's
+    // engine on its first picture and AV1's at its second reference
+    // (pc-full13 to pc-full16, NVIDIA's own setup as the base included)
+    nvenc.set(buf, A.refpic_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
+    nvenc.set(buf, A.outputpic_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
+    // (GB206's fourth surface configuration, as NVIDIA's driver fills it:
+    // the reconstruction's)
+    nvenc.set(buf, A.extra_cfg_frame_width_minus1, nvenc.get(buf, A.outputpic_cfg_frame_width_minus1));
+    nvenc.set(buf, A.extra_cfg_frame_height_minus1, nvenc.get(buf, A.outputpic_cfg_frame_height_minus1));
+    nvenc.set(buf, A.extra_cfg_sfc_pitch, nvenc.get(buf, A.outputpic_cfg_sfc_pitch));
+    nvenc.set(buf, A.extra_cfg_sfc_pitch_chroma, nvenc.get(buf, A.outputpic_cfg_sfc_pitch_chroma));
+    nvenc.set(buf, A.extra_cfg_block_height, nvenc.blockHeightField(h264.INPUT_BLOCK_HEIGHT));
+    if (s.bottom_fields) for ([_]u32{ 0, 512, 768 }) |cfg|
+        nvenc.setBottomFields(buf, cfg, f.size.height, s.recon.pitch_luma, s.recon.pitch_chroma);
+    nvenc.set(buf, A.codec, nvenc.PIC_CODEC_AV1);
+    // (the word NVIDIA's driver writes 16 bytes past the GP timer on GB206,
+    // as 8 past HEVC's: 0x999; meaning not public)
+    std.mem.writeInt(u16, buf[0x32c..][0..2], 0x999, .little);
     nvenc.set(buf, A.input_cfg_block_height, nvenc.blockHeightField(s.input.block_height));
     // seqhdr_data: CUs 16 to 64 (the engine's range), 8-bit 4:2:0
     nvenc.set(buf, A.min_cu_size, 1);
@@ -639,17 +735,18 @@ pub fn setup(buf: []u8, s: Setup) void {
     // rate control: the driver's qindex (encode.sig puts the firmware's
     // in when it runs it)
     enc_rc.constQp(buf, enc_rc.RcFields.of(A), f.qindex, s.framerate, s.gop_length);
-    // pic_control: the lists, by reference name through ref_frame_idx to
-    // the slot; poc_entry the name's index (LAST 0 .. ALTREF 6)
-    // (unused: the lists -2 and the distances -1, as NVIDIA's driver
-    // writes H.264's; nvenc.LIST_NONE)
+    // pic_control: the lists and poc_entry both the reference's name
+    // (LAST 0 .. ALTREF 6; see refNames), the distance through
+    // ref_frame_idx to the slot's order hint
+    // (unused: the lists, distances and poc_entry -1, as NVIDIA's driver
+    // writes AV1's on GB206)
     for (0..4) |k| {
-        nvenc.set(buf, nvenc.at(A.l0, @intCast(k)), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(A.l0, @intCast(k)), 0xff);
         nvenc.set(buf, nvenc.at(A.temp_dist_l0, @intCast(k)), nvenc.DIST_NONE);
         nvenc.set(buf, nvenc.at(A.poc_entry_l0, @intCast(k)), 0xff);
     }
     for (0..3) |k| {
-        nvenc.set(buf, nvenc.at(A.l1, @intCast(k)), nvenc.LIST_NONE);
+        nvenc.set(buf, nvenc.at(A.l1, @intCast(k)), 0xff);
         nvenc.set(buf, nvenc.at(A.temp_dist_l1, @intCast(k)), nvenc.DIST_NONE);
         nvenc.set(buf, nvenc.at(A.poc_entry_l1, @intCast(k)), 0xff);
     }
@@ -669,7 +766,7 @@ pub fn setup(buf: []u8, s: Setup) void {
             for (names[0..n], 0..) |name, k| {
                 const kk: u32 = @intCast(k);
                 const slot = f.ref_frame_idx[name - 1];
-                nvenc.set(buf, nvenc.at(fields[li][0], kk), slot);
+                nvenc.set(buf, nvenc.at(fields[li][0], kk), name - 1);
                 nvenc.setSigned(buf, nvenc.at(fields[li][1], kk), std.math.clamp(relDist(f, f.order_hint, f.slot_hint[slot]), -128, 127));
                 nvenc.set(buf, nvenc.at(fields[li][2], kk), name - 1);
             }
@@ -681,7 +778,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, A.pic_output_flag, @intFromBool(pic.picture_flags.disable_frame_recon == 0));
     nvenc.set(buf, A.max_tu_depth_inter, 2);
     nvenc.set(buf, A.max_tu_depth_intra, 0);
-    nvenc.set(buf, A.tile_control_offset, nvenc.TILE_CONTROL_OFF);
+    nvenc.set(buf, A.tile_control_offset, s.tiles_at);
     nvenc.set(buf, A.hist_buf_size, s.history_bytes);
     nvenc.set(buf, A.bitstream_buf_size, s.bitstream_room);
     nvenc.set(buf, A.bitstream_start_pos, s.bitstream_start);
@@ -699,7 +796,7 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(buf, A.strip_height_in_sbs, f.size.sb_rows);
     nvenc.set(buf, A.gp_timer_timeout_val, nvenc.GPTIMER_TIMEOUT);
     // the one tile
-    const t = buf[nvenc.TILE_CONTROL_OFF..];
+    const t = buf[s.tiles_at..];
     const T = nvenc.Av1Tile;
     nvenc.set(t, T.tile_bot_sbx, f.size.sb_cols - 1);
     nvenc.set(t, T.tile_bot_sby, f.size.sb_rows - 1);
@@ -714,13 +811,9 @@ pub fn setup(buf: []u8, s: Setup) void {
     nvenc.set(t, T.tile_end_update_cdf, 1);
     // MD: every partition, transform size and base intra mode; every
     // transform type (both stages)
-    const md = buf[A.MD_CONTROL_OFF..];
-    const M = nvenc.Av1Md;
-    for ([_]nvenc.F{ M.cu8x8_part_2Nx2N_enable, M.cu16x16_part_2Nx2N_enable, M.cu32x32_part_2Nx2N_enable, M.cu64x64_part_2Nx2N_enable, M.tusize_4x4_enable, M.tusize_8x8_enable, M.tusize_16x16_enable, M.tusize_32x32_enable, M.tusize_64x64_enable, M.mv_cost_enable }) |fl| nvenc.set(md, fl, 1);
-    for (0..5) |k| nvenc.set(md, nvenc.at(M.intra_luma_base_mode_4x4_enable, @intCast(k)), 0x1fff);
-    nvenc.set(md, M.tx_type_search_mask, 0xffff);
-    nvenc.set(md, nvenc.at(M.tx_type_search_mask, 1), 0xffff);
-    nvenc.meControl(buf[A.ME_CONTROL_OFF..]);
+    // MD and ME: NVIDIA's own on GB206 (the same on every frame)
+    @memcpy(buf[A.MD_CONTROL_OFF..][0..nvenc.MD_NVIDIA_AV1.len], &nvenc.MD_NVIDIA_AV1);
+    @memcpy(buf[A.ME_CONTROL_OFF..][0..nvenc.ME_NVIDIA_AV1.len], &nvenc.ME_NVIDIA_AV1);
 }
 
 // ── The CDFs and the context's buffers ──────────────────────────────────────
@@ -864,6 +957,31 @@ test "enc_av1: a key frame's header, bit by bit" {
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, out[n..m]);
 }
 
+test "enc_av1: references numbered in list order, each slot once, whatever VA's slots" {
+    const seq = testSeq();
+    var pic = testPic(0x403, 0x1000, false, 2);
+    // LAST in slot 3, LAST2 in slot 6, GOLDEN in slot 3 again
+    pic.ref_frame_idx = .{ 3, 6, 0, 3, 0, 0, 0 };
+    pic.ref_frame_ctrl_l0 = 1 | (2 << 3) | (4 << 6);
+    pic.ref_frame_ctrl_l1 = 0;
+    const f = frameOf(&seq, &pic, 120, true, false, .{ 1, 0, 4, 0, 0, 0, 0, 0 });
+    var order: [7]u3 = undefined;
+    const n = refOrder(f, &pic, &order);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualSlices(u3, &.{ 3, 6 }, order[0..n]);
+    var b: [nvenc.SETUP_BYTES]u8 = undefined;
+    const planes = h264.Planes{ .luma = 0, .chroma = 0, .pitch_luma = 256, .pitch_chroma = 256 };
+    setup(&b, .{ .frame = f, .pic = &pic, .input = planes, .recon = planes, .ref_ids = .{va.INVALID_ID} ** 8, .framerate = 30, .gop_length = 120, .bitstream_start = 64, .bitstream_room = 1 << 20, .history_bytes = 1 << 20 });
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&b, A.num_ref_idx_l0_active));
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(A.l0, 0)));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&b, nvenc.at(A.l0, 1)));
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&b, nvenc.at(A.l0, 2))); // GOLDEN, by name
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&b, nvenc.at(A.poc_entry_l0, 2)));
+    try testing.expectEqual(@as(u64, 0xff), nvenc.get(&b, nvenc.at(A.l0, 3)));
+    var names: [7]u3 = undefined;
+    try testing.expectEqualSlices(u3, &.{ 1, 2, 4 }, names[0..refNames(f, &pic, &names)]);
+}
+
 test "enc_av1: an inter frame's setup: the lists by name, sign bias, the tile" {
     const seq = testSeq();
     var pic = testPic(0x403, 0x1000, false, 2);
@@ -878,11 +996,15 @@ test "enc_av1: an inter frame's setup: the lists by name, sign bias, the tile" {
     const planes = h264.Planes{ .luma = 0, .chroma = 0, .pitch_luma = 256, .pitch_chroma = 256 };
     setup(&b, .{ .frame = f, .pic = &pic, .input = planes, .recon = planes, .ref_ids = .{va.INVALID_ID} ** 8, .framerate = 30, .gop_length = 120, .bitstream_start = 64, .bitstream_room = 1 << 20, .history_bytes = 1 << 20 });
     try testing.expectEqual(@as(u64, 1), nvenc.get(&b, A.pic_type)); // B
+    // (the reference and reconstructed pictures block linear, as NVIDIA's)
+    try testing.expectEqual(@as(u64, 0), nvenc.get(&b, A.outputpic_cfg_tiled_16x16));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&b, A.outputpic_cfg_block_height));
+    try testing.expectEqual(@as(u64, 2), nvenc.get(&b, A.extra_cfg_block_height));
     try testing.expectEqual(@as(u64, 2), nvenc.get(&b, A.num_ref_idx_l0_active));
     try testing.expectEqual(@as(u64, 1), nvenc.get(&b, A.num_ref_idx_l1_active));
     try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(A.l0, 0)));
-    try testing.expectEqual(@as(u64, 1), nvenc.get(&b, nvenc.at(A.l0, 1)));
-    try testing.expectEqual(@as(u64, 2), nvenc.get(&b, nvenc.at(A.l1, 0)));
+    try testing.expectEqual(@as(u64, 3), nvenc.get(&b, nvenc.at(A.l0, 1))); // GOLDEN
+    try testing.expectEqual(@as(u64, 4), nvenc.get(&b, nvenc.at(A.l1, 0))); // BWDREF
     try testing.expectEqual(@as(u64, 3), nvenc.get(&b, nvenc.at(A.poc_entry_l0, 1))); // GOLDEN
     try testing.expectEqual(@as(u64, 4), nvenc.get(&b, nvenc.at(A.poc_entry_l1, 0))); // BWDREF
     try testing.expectEqual(@as(u64, 0xfe), nvenc.get(&b, nvenc.at(A.temp_dist_l1, 0))); // 2 - 4
