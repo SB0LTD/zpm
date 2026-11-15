@@ -20,8 +20,13 @@ pub const kmt = @import("kmt.sig");
 pub const nv = @import("nv.sig");
 pub const gpu = @import("gpu.sig");
 pub const device = @import("device.sig");
+/// Forwarding the GPU to a virtual machine: the protocol (plain data, for
+/// the guest too) and the host's server.
+pub const fwd = @import("fwd.sig");
+pub const fwd_server = @import("fwd_server.sig");
 
 pub const Gpu = gpu.Gpu;
+pub const Channel = gpu.Channel;
 pub const DxgDevice = device.DxgDevice;
 
 test {
@@ -29,4 +34,6 @@ test {
     _ = nv;
     _ = gpu;
     _ = device;
+    _ = fwd;
+    _ = fwd_server;
 }

@@ -6,7 +6,8 @@
 //! Buffers come out of system memory the caller gives (`init`: page-aligned,
 //! shared or private), each one its own allocation the GPU maps (rounded up
 //! to 64 KiB); the CPU's view is the same bytes, so toDevice and fromDevice
-//! are barriers only. A submission is Gpu.submit; its fence, Gpu's.
+//! are barriers only. A submission runs on the Channel given; its fence,
+//! the channel's.
 //!
 //! Allocation-free: the block list is fixed (MAX_BUFFERS), the memory the
 //! caller's.
@@ -16,12 +17,14 @@ const nvidia = @import("nvidia");
 const nvd = nvidia.device;
 const gpu_mod = @import("gpu.sig");
 const Gpu = gpu_mod.Gpu;
+const Channel = gpu_mod.Channel;
 
 pub const MAX_BUFFERS = 1024;
 const UNIT: usize = 64 << 10;
 
 pub const DxgDevice = struct {
     gpu: *Gpu,
+    channel: *Channel,
     memory: []align(4096) u8,
     /// The memory's pieces in address order: each free or a buffer's.
     blocks: [MAX_BUFFERS]Block = undefined,
@@ -30,9 +33,9 @@ pub const DxgDevice = struct {
 
     const Block = struct { off: usize, len: usize, used: bool, handle: u32 = 0, va: u64 = 0 };
 
-    pub fn init(d: *DxgDevice, g: *Gpu, memory: []align(4096) u8) void {
+    pub fn init(d: *DxgDevice, g: *Gpu, c: *Channel, memory: []align(4096) u8) void {
         const len = memory.len / UNIT * UNIT;
-        d.* = .{ .gpu = g, .memory = memory[0..len] };
+        d.* = .{ .gpu = g, .channel = c, .memory = memory[0..len] };
         d.blocks[0] = .{ .off = 0, .len = len, .used = false };
         d.n = 1;
     }
@@ -99,12 +102,12 @@ pub const DxgDevice = struct {
         const d: *DxgDevice = @ptrCast(@alignCast(ctx));
         if (d.lost) return error.DeviceLost;
         barrierNow();
-        return d.gpu.submit(pb.va, dwords) catch error.SubmitFailed;
+        return d.channel.submit(pb.va, dwords) catch error.SubmitFailed;
     }
 
     fn wait(ctx: *anyopaque, f: nvd.Fence, timeout_us: u64) nvd.Error!void {
         const d: *DxgDevice = @ptrCast(@alignCast(ctx));
-        d.gpu.wait(f, timeout_us) catch |e| {
+        d.channel.wait(f, timeout_us) catch |e| {
             if (e == error.DeviceLost) d.lost = true;
             return if (e == error.DeviceLost) error.DeviceLost else error.Timeout;
         };
