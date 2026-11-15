@@ -171,10 +171,24 @@ pub const Gpu = struct {
         if (g.adapter == 0) return error.NoNvidiaAdapter;
     }
 
-    /// The paging queue's work up to `value` done (maps, residency).
+    /// The paging queue's work up to `value` done (maps, residency): a
+    /// first touch of a big piece of memory (a guest's RAM, pinned page by
+    /// page) takes milliseconds. Gives up after 5 s (the GPU would then
+    /// fault on the memory, and the channel says so).
     fn pagingDone(g: *Gpu, value: u64) void {
         var spins: u32 = 0;
-        while (g.paging_fence.* < value and spins < 2_000_000) : (spins += 1) std.atomic.spinLoopHint();
+        var slept_us: u64 = 0;
+        while (g.paging_fence.* < value) {
+            if (spins < 20_000) {
+                spins += 1;
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            if (slept_us >= 5_000_000) return;
+            const ts: linux.timespec = .{ .sec = 0, .nsec = 50_000 };
+            _ = linux.nanosleep(&ts, null);
+            slept_us += 50;
+        }
     }
 
     fn nextVa(g: *Gpu, bytes: u64) Error!u64 {
