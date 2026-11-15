@@ -209,6 +209,7 @@ pub fn main(init: std.process.Init) void {
 
     const mode: []const u8 = if (argv.len < 2) "" else std.mem.span(argv[1]);
     if (std.mem.eql(u8, mode, "bisect3d")) bisect3d(ring, client);
+    if (std.mem.eql(u8, mode, "bench3d")) bench3d();
     if (std.mem.eql(u8, mode, "draw")) {
         // 4. the 3D engine (the rasteriser), step by step, each pass's
         // pixels compared with the CPU reference's
@@ -241,4 +242,78 @@ pub fn main(init: std.process.Init) void {
     ch.close();
     g.close();
     linux.exit(if (res.failed == 0) 0 else 3);
+}
+
+// â”€â”€ bench3d: what a frame's pass costs on the 3D engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+var bench_work: nvidia.sm120_asm.Work = .{};
+var bench_r: nvidia.draw.Renderer = undefined;
+
+/// Timings of one pass each (submit to fence, 5 runs, the best): a 1280 x
+/// 800 image read from system memory, then from VRAM, into a VRAM target
+/// and a system-memory one; 48 retargets (each a WAIT_FOR_IDLE) with a
+/// small blur between; 266 small rectangles.
+fn bench3d() noreturn {
+    const W = 1280;
+    const H = 800;
+    const bytes = W * H * 4;
+    const arena = mapMemory(64 << 20);
+    dev.init(&g, &ch, arena);
+    const d = dev.device();
+    bench_r.init(d, &bench_work, .{ .stream_bytes = 512 * 1024, .rects = 1024, .textures = 255 }) catch |e| {
+        out("bench: renderer: {s}\n", .{@errorName(e)});
+        linux.exit(1);
+    };
+    const sys_img = d.alloc(bytes) catch linux.exit(1);
+    const sys_tgt = d.alloc(bytes) catch linux.exit(1);
+    for (0..W * H) |i| std.mem.writeInt(u32, sys_img.cpu[i * 4 ..][0..4], @intCast(0xff00_0000 | (i *% 2654435761) & 0xffffff), .little);
+    const vimg = g.allocVideo(std.mem.alignForward(u64, bytes, 64 << 10)) catch linux.exit(1);
+    const vtgt = g.allocVideo(std.mem.alignForward(u64, bytes, 64 << 10)) catch linux.exit(1);
+    const scratch = g.allocVideo(4 << 20) catch linux.exit(1);
+    const full = [4]f32{ 0, 0, W, H };
+    const one = [4]f32{ 1, 1, 1, 1 };
+    const Tex = nvidia.draw.Texture;
+    const Tgt = nvidia.draw.Target;
+    const tex_sys = Tex{ .va = sys_img.va, .width = W, .height = H, .pitch = W * 4, .format = .bgra8, .filter = .nearest };
+    const tex_vid = Tex{ .va = vimg.va, .width = W, .height = H, .pitch = W * 4, .format = .bgra8, .filter = .nearest };
+    const t_vid = Tgt{ .va = vtgt.va, .width = W, .height = H, .pitch = W * 4 };
+    const t_sys = Tgt{ .va = sys_tgt.va, .width = W, .height = H, .pitch = W * 4 };
+    const cases = [_][]const u8{ "empty pass (VRAM target)", "image sys -> VRAM", "image VRAM -> VRAM", "image sys -> sys", "image VRAM -> sys", "48 retargets + blurs (VRAM)", "266 rects 64x64 over (VRAM)" };
+    for (cases, 0..) |name, k| {
+        var best: u64 = std.math.maxInt(u64);
+        for (0..5) |_| {
+            bench_r.begin(if (k == 3 or k == 4) t_sys else t_vid);
+            switch (k) {
+                0 => {},
+                1 => bench_r.image(full, tex_sys, full, one, .replace),
+                2 => bench_r.image(full, tex_vid, full, one, .replace),
+                3 => bench_r.image(full, tex_sys, full, one, .replace),
+                4 => bench_r.image(full, tex_vid, full, one, .replace),
+                5 => {
+                    const st = Tgt{ .va = scratch.va, .width = 320, .height = 64, .pitch = 2048 };
+                    const sx = Tex{ .va = scratch.va, .width = 320, .height = 64, .pitch = 2048, .format = .bgra8, .filter = .linear };
+                    for (0..48) |_| {
+                        bench_r.retarget(st);
+                        _ = bench_r.box(.{ 0, 0, 320, 64 }, sx, true, 6, .replace);
+                    }
+                    bench_r.retarget(t_vid);
+                },
+                else => {
+                    for (0..266) |i| {
+                        const x: f32 = @floatFromInt((i * 97) % (W - 64));
+                        const y: f32 = @floatFromInt((i * 53) % (H - 64));
+                        bench_r.fill(.{ x, y, x + 64, y + 64 }, .{ 0.2, 0.3, 0.4, 0.5 }, .over);
+                    }
+                },
+            }
+            const t0 = nowUs();
+            bench_r.run(2_000_000) catch |e| {
+                out("bench {s}: {s}\n", .{ name, @errorName(e) });
+                linux.exit(1);
+            };
+            best = @min(best, nowUs() - t0);
+        }
+        out("bench: {s}: {d} us\n", .{ name, best });
+    }
+    linux.exit(0);
 }

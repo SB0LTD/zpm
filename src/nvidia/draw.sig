@@ -8,8 +8,13 @@
 //! texture times a color), each a rectangle in window pixels, replacing the
 //! target's pixels or blended over them (premultiplied alpha), inside a
 //! scissor; and the same with a rounded rectangle's coverage worked out per
-//! pixel, a mask times a gradient, a soft dithered disc (a glow) and a
-//! rounded rectangle's soft shadow. The
+//! pixel, a mask times a gradient, a soft dithered disc (a glow), a
+//! rounded rectangle's soft shadow, a box blur along a row or a column, and
+//! frosted glass (gfx's glassRoundRect: a blurred backdrop, a tint, a rim
+//! and an edge inside a rounded rectangle). A pass may draw into several
+//! targets in turn (retarget: the engine idle and its texture cache emptied
+//! between them), so a backdrop is downsampled, blurred and composited in
+//! one submission. The
 //! rasterizer walks the rectangle, the texture unit filters, the
 //! render backend blends: no compute kernel.
 //!
@@ -111,8 +116,8 @@ pub const Blend = enum(u8) {
 };
 
 /// What a rectangle's pixels are.
-pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow, shadow };
-pub const KINDS = 9;
+pub const Kind = enum(u8) { solid, image, mask, rrect, ring, image_rr, mask_grad, glow, shadow, box, glass };
+pub const KINDS = 11;
 
 /// A rectangle's corners: x0, y0, x1, y1 (pixels; x1 and y1 past the end).
 pub const Rect = [4]f32;
@@ -216,6 +221,8 @@ pub const SET_ANTI_ALIAS_SAMPLE_POSITIONS: u32 = 0x11e0;
 pub const SET_CT_SELECT: u32 = 0x121c;
 pub const SET_SAMPLER_BINDING: u32 = 0x1234;
 pub const INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI: u32 = 0x1288;
+/// The engine's work so far finished before the next method (NVC797's).
+pub const WAIT_FOR_IDLE: u32 = 0x0110;
 pub const SET_SHADING_RATE_INDEX_SURFACE: u32 = 0x12a8;
 pub const SET_DEPTH_TEST: u32 = 0x12cc;
 pub const SET_SHADE_MODE: u32 = 0x12d4;
@@ -408,6 +415,15 @@ const COLOR =
 /// in registers `dx` and `dy` (kept), -k in `kx` and `ky`, -radius in
 /// `rad`; the coverage lands in `out`, and `t1` and `t2` are used.
 fn coverage(comptime dx: u8, comptime dy: u8, comptime kx: u8, comptime ky: u8, comptime rad: u8, comptime out: u8, comptime t1: u8, comptime t2: u8) []const u8 {
+    return distance(dx, dy, kx, ky, rad, out, t1, t2) ++ std.fmt.comptimePrint(
+        \\FADD.SAT R{[out]d}, -R{[out]d}, 0.5
+        \\
+    , .{ .out = out });
+}
+
+/// The signed distance itself (coverage's, before the coverage is taken
+/// from it), into `out`.
+fn distance(comptime dx: u8, comptime dy: u8, comptime kx: u8, comptime ky: u8, comptime rad: u8, comptime out: u8, comptime t1: u8, comptime t2: u8) []const u8 {
     return std.fmt.comptimePrint(
         \\FADD R{[t1]d}, |R{[dx]d}|, R{[kx]d}
         \\FADD R{[t2]d}, |R{[dy]d}|, R{[ky]d}
@@ -420,7 +436,6 @@ fn coverage(comptime dx: u8, comptime dy: u8, comptime kx: u8, comptime ky: u8, 
         \\MUFU.SQRT R{[t1]d}, R{[t1]d}
         \\FADD R{[out]d}, R{[out]d}, R{[t1]d}
         \\FADD R{[out]d}, R{[out]d}, R{[rad]d}
-        \\FADD.SAT R{[out]d}, -R{[out]d}, 0.5
         \\
     , .{ .dx = dx, .dy = dy, .kx = kx, .ky = ky, .rad = rad, .out = out, .t1 = t1, .t2 = t2 });
 }
@@ -754,9 +769,225 @@ const FS_SHADOW = VARYINGS ++
     \\EXIT
 ;
 
+/// A box blur along a row or a column, as gfx.boxBlur's one pass: the
+/// mean of the 2n + 1 texels around the pixel (the edge's texel for those
+/// past it), each channel rounded down as gfx's. Taps in pairs: a sample
+/// halfway between two texels (the linear sampler) is their mean, worth
+/// two; up to six pairs a side (n up to 12). The varyings are the texture
+/// coordinates (the target's pixel is its texel). Alpha leaves 1.
+/// P1: the direction x, y (one of them 1), 1 / (2n + 1), the rounding's
+/// bias; then six (offset, weight) pairs (weight 0: no tap).
+const FS_BOX = VARYINGS ++
+    \\LDC R12, c[0x0][0x30]
+    \\LDC R13, c[0x0][0x34]
+    \\LDC R14, c[0x0][0x38]
+    \\LDC R15, c[0x0][0x3c]
+    \\MOV R16, R4
+    \\MOV R17, R5
+    \\LDC R6, c[0x0][0x80]
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\MOV R8, R0
+    \\MOV R9, R1
+    \\MOV R10, R2
+    \\
+++
+    \\LDC R18, c[0x0][0x40]
+    \\LDC R19, c[0x0][0x44]
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\FADD R18, RZ, -R18
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\LDC R18, c[0x0][0x48]
+    \\LDC R19, c[0x0][0x4c]
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\FADD R18, RZ, -R18
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\LDC R18, c[0x0][0x50]
+    \\LDC R19, c[0x0][0x54]
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\FADD R18, RZ, -R18
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\LDC R18, c[0x0][0x58]
+    \\LDC R19, c[0x0][0x5c]
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\FADD R18, RZ, -R18
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\LDC R18, c[0x0][0x60]
+    \\LDC R19, c[0x0][0x64]
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\FADD R18, RZ, -R18
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\LDC R18, c[0x0][0x68]
+    \\LDC R19, c[0x0][0x6c]
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\FADD R18, RZ, -R18
+    \\FFMA R4, R12, R18, R16
+    \\FFMA R5, R13, R18, R17
+    \\TEX.B.DXY R2, R0, R4, R6, 2D
+    \\FFMA R8, R0, R19, R8
+    \\FFMA R9, R1, R19, R9
+    \\FFMA R10, R2, R19, R10
+    \\FFMA R0, R8, R14, R15
+    \\FFMA R1, R9, R14, R15
+    \\FFMA R2, R10, R14, R15
+    \\MOV R3, 0x3f800000
+    \\EXIT
+;
+
+/// Frosted glass over the target, as gfx's glassShapePx with no arrow: the
+/// blurred backdrop (a half-size texture, its texel at half the pixel's
+/// distance from (bx0, by0)), the tint (straight, top to bottom by the
+/// row's place in the shape) over it, a white rim just inside the edge,
+/// all that by the shape's coverage times the opacity, then the edge's
+/// hairline over. With cov the coverage and ea the hairline's alpha it
+/// leaves premultiplied for `over`: color cov (1 - ea) col + ea edge,
+/// alpha 1 - (1 - cov)(1 - ea). Nothing (0) outside. The varyings are the
+/// pixel's position.
+/// The color: the tint at the top. P1: -centre x, y, -k x, y; -radius, the
+/// shape's top, 1 / its height, the rim at the top; the rim's change to
+/// the bottom, the tint's change (r, g, b); its alpha's, the edge (r, g,
+/// b); the edge's alpha, the opacity, bx0, by0.
+const FS_GLASS = VARYINGS ++
+    \\MOV R24, R4
+    \\MOV R25, R5
+    \\LDC R12, c[0x0][0x30]
+    \\LDC R13, c[0x0][0x34]
+    \\LDC R14, c[0x0][0x38]
+    \\LDC R15, c[0x0][0x3c]
+    \\LDC R16, c[0x0][0x40]
+    \\FADD R26, R24, R12
+    \\FADD R27, R25, R13
+    \\
+++ distance(26, 27, 14, 15, 16, 20, 21, 22) ++
+    \\LDC R12, c[0x0][0x44]
+    \\LDC R13, c[0x0][0x48]
+    \\FADD R21, R25, -R12
+    \\FMUL R21, R21, R13
+    \\FADD.SAT R21, R21, RZ
+    \\
+++ COLOR ++
+    \\LDC R12, c[0x0][0x54]
+    \\LDC R13, c[0x0][0x58]
+    \\LDC R14, c[0x0][0x5c]
+    \\LDC R15, c[0x0][0x60]
+    \\FFMA R8, R12, R21, R8
+    \\FFMA R9, R13, R21, R9
+    \\FFMA R10, R14, R21, R10
+    \\FFMA R11, R15, R21, R11
+    \\LDC R12, c[0x0][0x4c]
+    \\LDC R13, c[0x0][0x50]
+    \\FFMA R22, R13, R21, R12
+    \\LDC R12, c[0x0][0x78]
+    \\LDC R13, c[0x0][0x7c]
+    \\FADD R4, R24, -R12
+    \\FMUL R4, R4, 0.5
+    \\FADD R5, R25, -R13
+    \\FMUL R5, R5, 0.5
+    \\
+++ SAMPLE ++
+    \\FADD R23, RZ, -R11
+    \\FADD R23, R23, 1
+    \\FMUL R0, R0, R23
+    \\FFMA R0, R8, R11, R0
+    \\FMUL R1, R1, R23
+    \\FFMA R1, R9, R11, R1
+    \\FMUL R2, R2, R23
+    \\FFMA R2, R10, R11, R2
+    \\FADD R12, R20, 0.8
+    \\FADD R12, |R12|, RZ
+    \\FMUL R12, R12, 1.25
+    \\FADD.SAT R12, -R12, 1
+    \\FMUL R12, R12, R22
+    \\FADD R13, RZ, -R12
+    \\FADD R13, R13, 1
+    \\FFMA R0, R0, R13, R12
+    \\FFMA R1, R1, R13, R12
+    \\FFMA R2, R2, R13, R12
+    \\LDC R14, c[0x0][0x74]
+    \\FADD.SAT R15, -R20, 0.5
+    \\FMUL R15, R15, R14
+    \\FADD R16, |R20|, RZ
+    \\FADD.SAT R16, -R16, 1
+    \\FMUL R16, R16, R14
+    \\LDC R17, c[0x0][0x70]
+    \\FMUL R16, R16, R17
+    \\FADD R17, RZ, -R16
+    \\FADD R17, R17, 1
+    \\FMUL R18, R15, R17
+    \\LDC R8, c[0x0][0x64]
+    \\LDC R9, c[0x0][0x68]
+    \\LDC R10, c[0x0][0x6c]
+    \\FMUL R8, R8, R16
+    \\FMUL R9, R9, R16
+    \\FMUL R10, R10, R16
+    \\FFMA R0, R0, R18, R8
+    \\FFMA R1, R1, R18, R9
+    \\FFMA R2, R2, R18, R10
+    \\FADD R19, RZ, -R15
+    \\FADD R19, R19, 1
+    \\FMUL R19, R19, R17
+    \\FADD R3, RZ, -R19
+    \\FADD R3, R3, 1
+    \\EXIT
+;
+
 /// The programs: the two vertex programs, then a pixel program a kind.
 const PROGRAMS = 2 + KINDS;
-const SOURCES = [PROGRAMS][]const u8{ VS_FLAT, VS_VARY, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW, FS_SHADOW };
+const SOURCES = [PROGRAMS][]const u8{ VS_FLAT, VS_VARY, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW, FS_SHADOW, FS_BOX, FS_GLASS };
 
 /// Whether a kind's programs carry varyings (all but a solid rectangle's).
 fn varies(k: Kind) bool {
@@ -1029,6 +1260,8 @@ pub const Stats = struct {
     programs: u32 = 0,
     bindings: u32 = 0,
     stream_dwords: u32 = 0,
+    /// Targets the pass went on into (retarget).
+    targets: u32 = 0,
 };
 
 pub const Renderer = struct {
@@ -1274,6 +1507,82 @@ pub const Renderer = struct {
             -DROP,                1,
         };
         r.emit(rc, rc, color, &params, 0);
+    }
+
+    /// The pass goes on into another target: the engine idle first and its
+    /// texture cache emptied, so what was drawn before is read right as a
+    /// texture after (a backdrop downsampled, then blurred, then
+    /// composited, in one submission).
+    pub fn retarget(r: *Renderer, t: Target) void {
+        if (!r.in_pass) return;
+        one(&r.p, WAIT_FOR_IDLE, 0);
+        one(&r.p, INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI, 0);
+        if (!targetFits(t)) r.bad = true;
+        r.t = t;
+        target(&r.p, t);
+        r.stats.targets += 1;
+    }
+
+    /// The most a box blur's radius may be (six pairs of taps a side).
+    pub const BOX_MAX_RADIUS = 12;
+
+    /// One box blur pass of radius `n` along a row (`horizontal`) or a
+    /// column over `rc`, reading `src` texel for pixel (gfx.boxBlur's, its
+    /// rounding down too). False: a radius past BOX_MAX_RADIUS.
+    pub fn box(r: *Renderer, rc: Rect, src: Texture, horizontal: bool, n: u32, b: Blend) bool {
+        if (n == 0 or n > BOX_MAX_RADIUS) return false;
+        if (!r.drawn(rc)) return true;
+        r.use(.box, b);
+        var t = src;
+        t.filter = .linear;
+        var params = [_]f32{0} ** 16;
+        params[0] = if (horizontal) 1 else 0;
+        params[1] = if (horizontal) 0 else 1;
+        params[2] = 1 / @as(f32, @floatFromInt(2 * n + 1));
+        params[3] = -0.499 / 255.0;
+        var j: u32 = 0;
+        var a: u32 = 1;
+        while (a <= n) : (j += 1) {
+            if (a + 1 <= n) {
+                params[4 + 2 * j] = @as(f32, @floatFromInt(a)) + 0.5;
+                params[5 + 2 * j] = 2;
+                a += 2;
+            } else {
+                params[4 + 2 * j] = @floatFromInt(a);
+                params[5 + 2 * j] = 1;
+                a += 1;
+            }
+        }
+        r.emit(rc, rc, .{ 0, 0, 0, 0 }, &params, r.bind(t));
+        return true;
+    }
+
+    /// How frosted glass looks (gfx.Glass's, straight colors in [0, 1]).
+    pub const GlassLook = struct {
+        tint_top: Color,
+        tint_bottom: Color,
+        rim_top: f32,
+        rim_bottom: f32,
+        edge: Color,
+        opacity: f32,
+    };
+
+    /// Frosted glass in the rounded rectangle `s` (top `top`, height `h`)
+    /// over `rc` (its bounds and a pixel around): `blurred` the backdrop,
+    /// half size, its texel (0, 0) at the target's (bx0, by0) (FS_GLASS).
+    pub fn glass(r: *Renderer, rc: Rect, blurred: Texture, bx0: f32, by0: f32, s: Shape, top: f32, h: f32, look: GlassLook) void {
+        if (!r.drawn(rc) or !(h > 0)) return;
+        r.use(.glass, .over);
+        var t = blurred;
+        t.filter = .linear;
+        const params = [20]f32{
+            -s.cx,                                    -s.cy,                                    -s.kx,                                    -s.ky,
+            -s.rad,                                   top,                                      1 / h,                                    look.rim_top,
+            look.rim_bottom - look.rim_top,           look.tint_bottom[0] - look.tint_top[0],   look.tint_bottom[1] - look.tint_top[1],   look.tint_bottom[2] - look.tint_top[2],
+            look.tint_bottom[3] - look.tint_top[3],   look.edge[0],                             look.edge[1],                             look.edge[2],
+            look.edge[3],                             look.opacity,                             bx0,                                      by0,
+        };
+        r.emit(rc, rc, look.tint_top, &params, r.bind(t));
     }
 
     /// The soft shadow of the rounded rectangle `s`: `color` (straight,
@@ -1540,4 +1849,192 @@ test "a target the engine would misread is refused: by the renderer, and by the 
     T.r.begin(.{ .va = T.pixels.va, .width = 64, .height = 32, .pitch = 256 });
     T.r.fill(.{ 0, 0, 8, 8 }, .{ 1, 1, 1, 1 }, .replace);
     try testing.expectError(error.DeviceLost, T.r.run(1_000_000));
+}
+
+// ── Blur and glass on the emulated RTX ──────────────────────────────────────
+
+/// gfx.boxBlur's one pass along a line of `n` (its mean: the sum times
+/// ceil(65536 / win), shifted down 16; the edge's texel past the ends).
+fn refBoxLine(line: []const u32, out: []u32, radius: u32) void {
+    const n: i32 = @intCast(line.len);
+    const rad: i32 = @intCast(radius);
+    const win = radius * 2 + 1;
+    const inv: u32 = (65536 + win - 1) / win;
+    for (out, 0..) |*o, i| {
+        var s = [3]u32{ 0, 0, 0 };
+        var k: i32 = -rad;
+        while (k <= rad) : (k += 1) {
+            const px = line[@intCast(std.math.clamp(@as(i32, @intCast(i)) + k, 0, n - 1))];
+            s[0] += px & 0xff;
+            s[1] += (px >> 8) & 0xff;
+            s[2] += (px >> 16) & 0xff;
+        }
+        var v: u32 = 0xff00_0000;
+        for (0..3) |c| v |= @as(u32, @min((s[c] * inv) >> 16, 255)) << @intCast(8 * c);
+        o.* = v;
+    }
+}
+
+fn channelsWithin(a: u32, b: u32, tol: i32) bool {
+    for (0..4) |c| {
+        const x: i32 = @intCast((a >> @intCast(8 * c)) & 0xff);
+        const y: i32 = @intCast((b >> @intCast(8 * c)) & 0xff);
+        if (@abs(x - y) > tol) return false;
+    }
+    return true;
+}
+
+/// A busy picture: stripes over a ramp, every channel different.
+fn testPicture(x: u32, y: u32) u32 {
+    const r: u32 = (x * 37 + y * 11) % 256;
+    const g: u32 = if ((x / 3) % 2 == 0) 230 else 20;
+    const b: u32 = (y * 29 + x * 3) % 256;
+    return 0xff00_0000 | r << 16 | g << 8 | b;
+}
+
+test "a box blur on the emulated RTX: gfx's mean, the edge's texels past the ends" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    const src = try d.alloc(32 * 4 * 8);
+    for (0..8) |y| for (0..32) |x| std.mem.writeInt(u32, src.cpu[(y * 32 + x) * 4 ..][0..4], testPicture(@intCast(x), @intCast(y)), .little);
+    d.toDevice(src, 0, 32 * 4 * 8);
+    const tex = Texture{ .va = src.va, .width = 32, .height = 8, .pitch = 128, .format = .bgra8, .filter = .nearest };
+    for ([_]u32{ 1, 3, 6, 12 }) |radius| {
+        T.r.begin(t);
+        try testing.expect(T.r.box(.{ 0, 0, 32, 8 }, tex, true, radius, .replace));
+        try T.finish();
+        for (0..8) |y| {
+            var line: [32]u32 = undefined;
+            var want: [32]u32 = undefined;
+            for (&line, 0..) |*p, x| p.* = testPicture(@intCast(x), @intCast(y));
+            refBoxLine(&line, &want, radius);
+            for (want, 0..) |w, x| {
+                const got = T.at(@intCast(x), @intCast(y));
+                if (!channelsWithin(w, got, 1)) {
+                    std.debug.print("radius {d}, pixel ({d}, {d}): gfx {x:0>8}, the RTX {x:0>8}\n", .{ radius, x, y, w, got });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+    try testing.expect(!T.r.box(.{ 0, 0, 32, 8 }, tex, true, Renderer.BOX_MAX_RADIUS + 1, .replace));
+}
+
+test "two targets in one pass: a row blur into a scratch, a column blur of it back, one submission" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    const src = try d.alloc(32 * 4 * 16);
+    const mid = try d.alloc(32 * 4 * 16);
+    for (0..16) |y| for (0..32) |x| std.mem.writeInt(u32, src.cpu[(y * 32 + x) * 4 ..][0..4], testPicture(@intCast(x), @intCast(y)), .little);
+    d.toDevice(src, 0, 32 * 4 * 16);
+    const tex = Texture{ .va = src.va, .width = 32, .height = 16, .pitch = 128, .format = .bgra8, .filter = .nearest };
+    const mid_t = Target{ .va = mid.va, .width = 32, .height = 16, .pitch = 128 };
+    const mid_tex = Texture{ .va = mid.va, .width = 32, .height = 16, .pitch = 128, .format = .bgra8, .filter = .nearest };
+    T.r.begin(t);
+    T.r.fill(.{ 0, 0, 64, 32 }, .{ 0, 0, 0, 1 }, .replace);
+    T.r.retarget(mid_t);
+    _ = T.r.box(.{ 0, 0, 32, 16 }, tex, true, 3, .replace);
+    T.r.retarget(t);
+    _ = T.r.box(.{ 0, 0, 32, 16 }, mid_tex, false, 3, .replace);
+    try testing.expectEqual(@as(u32, 2), T.r.stats.targets);
+    try T.finish();
+    // the reference: rows, then columns
+    var rows: [16][32]u32 = undefined;
+    for (0..16) |y| {
+        var line: [32]u32 = undefined;
+        for (&line, 0..) |*p, x| p.* = testPicture(@intCast(x), @intCast(y));
+        refBoxLine(&line, &rows[y], 3);
+    }
+    for (0..32) |x| {
+        var col: [16]u32 = undefined;
+        var want: [16]u32 = undefined;
+        for (&col, 0..) |*p, y| p.* = rows[y][x];
+        refBoxLine(&col, &want, 3);
+        for (want, 0..) |w, y| {
+            const got = T.at(@intCast(x), @intCast(y));
+            if (!channelsWithin(w, got, 1)) {
+                std.debug.print("pixel ({d}, {d}): gfx {x:0>8}, the RTX {x:0>8}\n", .{ x, y, w, got });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    // (the rest of the target as the fill left it)
+    try expectPixel(0xff00_0000, 40, 20);
+}
+
+/// FS_GLASS's arithmetic on the CPU (gfx's glassShapePx with no arrow, in
+/// floats): what the pixel at (x, y) over `under` becomes.
+fn refGlass(under: u32, blur: u32, x: u32, y: u32, s: Shape, top: f32, h: f32, look: Renderer.GlassLook) u32 {
+    const px = @as(f32, @floatFromInt(x)) + 0.5;
+    const py = @as(f32, @floatFromInt(y)) + 0.5;
+    const qx = @abs(px - s.cx) - s.kx;
+    const qy = @abs(py - s.cy) - s.ky;
+    const d = @sqrt(@max(qx, 0) * @max(qx, 0) + @max(qy, 0) * @max(qy, 0)) + @min(@max(qx, qy), 0) - s.rad;
+    const v = std.math.clamp((py - top) / h, 0, 1);
+    var tint: [4]f32 = undefined;
+    for (0..4) |c| tint[c] = look.tint_top[c] + (look.tint_bottom[c] - look.tint_top[c]) * v;
+    const rim_a = look.rim_top + (look.rim_bottom - look.rim_top) * v;
+    const k = std.math.clamp(1 - @abs(d + 0.8) * 1.25, 0, 1) * rim_a;
+    const cov = std.math.clamp(0.5 - d, 0, 1) * look.opacity;
+    const ea = std.math.clamp(1 - @abs(d), 0, 1) * look.opacity * look.edge[3];
+    var out: u32 = 0xff00_0000;
+    for (0..3) |c| {
+        const sh: u5 = @intCast(16 - 8 * c);
+        const b = @as(f32, @floatFromInt((blur >> sh) & 0xff)) / 255;
+        const u = @as(f32, @floatFromInt((under >> sh) & 0xff)) / 255;
+        var col = b * (1 - tint[3]) + tint[c] * tint[3];
+        col = col * (1 - k) + k;
+        const src = col * cov * (1 - ea) + look.edge[c] * ea;
+        const a = 1 - (1 - cov) * (1 - ea);
+        const res = src + u * (1 - a);
+        out |= @as(u32, @intFromFloat(@round(std.math.clamp(res, 0, 1) * 255))) << sh;
+    }
+    return out;
+}
+
+test "frosted glass on the emulated RTX: the backdrop blurred, tinted, its rim and edge, as gfx's arithmetic" {
+    const t = try T.start();
+    defer T.r.deinit();
+    const d = T.dev.device();
+    // the blurred backdrop: one color (so the half-size sampling does not
+    // matter), a busy target under it
+    const blurred = try d.alloc(32 * 4 * 16);
+    for (0..32 * 16) |i| std.mem.writeInt(u32, blurred.cpu[i * 4 ..][0..4], 0xff40_80c0, .little);
+    d.toDevice(blurred, 0, 32 * 4 * 16);
+    const btex = Texture{ .va = blurred.va, .width = 32, .height = 16, .pitch = 128, .format = .bgra8, .filter = .linear };
+    const look = Renderer.GlassLook{
+        .tint_top = .{ 1, 1, 1, 150.0 / 255.0 },
+        .tint_bottom = .{ 1, 1, 1, 110.0 / 255.0 },
+        .rim_top = 200.0 / 255.0,
+        .rim_bottom = 40.0 / 255.0,
+        .edge = .{ 58.0 / 255.0, 51.0 / 255.0, 85.0 / 255.0, 22.0 / 255.0 },
+        .opacity = 0.9,
+    };
+    const s = Shape.of(6.25, 4.5, 40, 20, 7);
+    T.r.begin(t);
+    // the picture under it
+    T.r.fill(.{ 0, 0, 64, 32 }, .{ 0.1, 0.5, 0.3, 1 }, .replace);
+    T.r.glass(.{ 5, 3, 48, 26 }, btex, 0, 0, s, 4.5, 20, look);
+    try T.finish();
+    const under: u32 = 0xff1a_804d;
+    var worst: i32 = 0;
+    for (3..26) |y| for (5..48) |x| {
+        const want = refGlass(under, 0xff40_80c0, @intCast(x), @intCast(y), s, 4.5, 20, look);
+        const got = T.at(@intCast(x), @intCast(y));
+        for (0..4) |c| {
+            const a: i32 = @intCast((want >> @intCast(8 * c)) & 0xff);
+            const b: i32 = @intCast((got >> @intCast(8 * c)) & 0xff);
+            worst = @max(worst, @as(i32, @intCast(@abs(a - b))));
+        }
+        if (!channelsWithin(want, got, 1)) {
+            std.debug.print("pixel ({d}, {d}): the arithmetic {x:0>8}, the RTX {x:0>8}\n", .{ x, y, want, got });
+            return error.TestUnexpectedResult;
+        }
+    };
+    // (inside, away from the edge: the backdrop under the tint; outside:
+    // the picture untouched)
+    try testing.expect(T.at(25, 14) != under);
+    try expectPixel(under, 2, 2);
 }
