@@ -396,6 +396,17 @@ pub const Setup = struct {
 /// `nvidia` also takes NVIDIA's sign hiding, transform skip and transform
 /// hierarchy depth 3 (encode.Try.hevc_nv_pps). Applied to the VA
 /// parameters themselves, so the PPS written and the setup agree.
+/// "hevcp3" (encode.Try.hevc_p3): the P-picture settings the engine's P
+/// slice data decoded best under when re-headed in WSL (pc-full24's small
+/// stream: 6.8 dB as written, 25.7 with them): no AMP partitions, inter
+/// transform depth 0, three merge candidates. Into the VA parameters, so
+/// the SPS, the slice headers and the setup all say them.
+pub fn p3Choices(seq: *Seq, slices: []Slice) void {
+    seq.seq_fields.amp_enabled_flag = 0;
+    seq.max_transform_hierarchy_depth_inter = 0;
+    for (slices) |*s| s.max_num_merge_cand = 3;
+}
+
 pub fn ownChoices(seq: *Seq, pic: *Pic, slices: []Slice, nvidia: bool) void {
     pic.diff_cu_qp_delta_depth = 0;
     const shift = @as(i32, pic.pic_init_qp) - 26;
