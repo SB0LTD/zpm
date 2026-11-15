@@ -661,7 +661,9 @@ test "libgalaxy_va: options from an environment block" {
     try testing.expect(none_t.hevc_coloc == .tmvp and none_t.av1_tiles_at == 0x400 and !none_t.av1_coloc and !none_t.setup_4k and none_t.coloc_apart);
     try testing.expect(!optionsOf("GALAXY_VA_NVENC_TRY=coloctight").nvenc_try.coloc_apart);
     const tt = optionsOf("GALAXY_VA_NVENC_TRY=hevctemplate,av1template").nvenc_try;
-    try testing.expect(tt.hevc_template and tt.av1_template and !none_t.hevc_template and !none_t.av1_template);
+    try testing.expect(tt.hevc_template and tt.av1_template and none_t.hevc_template and !none_t.av1_template);
+    try testing.expect(none_t.hevc_nv_pps and !optionsOf("GALAXY_VA_NVENC_TRY=nohevctemplate,nonvpps").nvenc_try.hevc_template);
+    try testing.expect(!optionsOf("GALAXY_VA_NVENC_TRY=nonvpps").nvenc_try.hevc_nv_pps);
     try testing.expect(none_t.hevc_slice0 and !optionsOf("GALAXY_VA_NVENC_TRY=hevcslicestatic").nvenc_try.hevc_slice0);
     try testing.expect(optionsOf("GALAXY_VA_NVENC_DUMP=1").nvenc_dump and !optionsOf("GALAXY_VA_NVENC_DUMP=0").nvenc_dump and !none.nvenc_dump);
     try testing.expect(!optionsOf("GALAXY_VA_DEBUG=0").debug);
