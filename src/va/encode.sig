@@ -934,15 +934,16 @@ fn endAv1(st: *State, in: EndIn, out: *EndOut) va.Status {
         if (in.lookup.surface(id) == null) continue;
         ref_ids[i] = id;
     }
-    // (the engine's references in enc_av1.refOrder's order, as the
-    // setup's lists number them)
+    // (the engine's references by name, LAST 0 .. ALTREF 6, as the
+    // setup's lists number them: enc_av1.refNames)
     {
-        var order: [7]u3 = undefined;
-        const n_order = av1.refOrder(frame, pic, &order);
-        for (order[0..n_order], 0..) |slot, k| {
+        var names: [7]u3 = undefined;
+        const n_names = av1.refNames(frame, pic, &names);
+        for (names[0..n_names]) |name| {
+            const slot = frame.ref_frame_idx[name - 1];
             const s = in.lookup.surface(pic.reference_frames[slot]) orelse return va.ERROR_INVALID_SURFACE;
-            a.ref_luma[k] = s.luma;
-            a.ref_chroma[k] = s.chroma;
+            a.ref_luma[name - 1] = s.luma;
+            a.ref_chroma[name - 1] = s.chroma;
         }
     }
     const out_k = st.kept.take(recon_id, &ref_ids) orelse return va.ERROR_MAX_NUM_EXCEEDED;

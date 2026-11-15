@@ -621,7 +621,7 @@ test "enc: HEVC B picture's setup: the RPS both sides, the lists, the collocated
     try testing.expectEqual(@as(u64, 0), nvenc.get(&b, nvenc.at(H.poc_entry_l0, 0)));
     try testing.expectEqual(@as(u64, 4), nvenc.get(&b, H.pic_order_cnt_lsb));
     const c = b[nvenc.H265_SLICE_OFF..];
-    try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.slice_type));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(c, nvenc.H265Slice.slice_type)); // B, the engine's 1
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.collocated_from_l0_flag));
     try testing.expectEqual(@as(u64, 0), nvenc.get(c, nvenc.H265Slice.collocated_ref_idx));
     try testing.expectEqual(va.ERROR_MAX_NUM_EXCEEDED, enc_hevc.checkSlices(&.{.{ .slice_type = 0, .l1_minus1 = 1 }}));
