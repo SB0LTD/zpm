@@ -368,6 +368,10 @@ pub const Setup = struct {
     template: bool = false,
     /// NVIDIA's slice mode (encode.Try.hevc_slice0)
     slice0: bool = false,
+    /// the input picture's own size (0: the coded size): the input
+    /// configuration's, the coded picture a whole number of CTBs
+    input_width: u32 = 0,
+    input_height: u32 = 0,
     /// bottom-field offsets on the reference and reconstruction
     /// configurations (encode.Try.bottom_fields)
     bottom_fields: bool = false,
@@ -408,6 +412,13 @@ pub fn p3Choices(seq: *Seq, slices: []Slice) void {
 }
 
 pub fn ownChoices(seq: *Seq, pic: *Pic, slices: []Slice, nvidia: bool) void {
+    // A whole number of CTBs, as NVIDIA's driver codes it on GB206: 720p
+    // as 1280x736 with an 8-row conformance window (writeHeadersSized
+    // crops to the input's size); 720 rows, a part CTB row, decoded at
+    // 21.5 dB (pc-full26). (1080p is 1088 either way.)
+    const ctb = @as(u32, 1) << @intCast(ctbLog2(seq));
+    seq.pic_width_in_luma_samples = @intCast(std.mem.alignForward(u32, seq.pic_width_in_luma_samples, ctb));
+    seq.pic_height_in_luma_samples = @intCast(std.mem.alignForward(u32, seq.pic_height_in_luma_samples, ctb));
     pic.diff_cu_qp_delta_depth = 0;
     const shift = @as(i32, pic.pic_init_qp) - 26;
     if (shift != 0) {
@@ -466,8 +477,12 @@ pub fn setup(buf: []u8, s: Setup) void {
     };
     for (cfgs, 0..) |c, i| {
         const p = if (i == 1) s.input else s.recon;
-        nvenc.set(buf, c[0], w - 1);
-        nvenc.set(buf, c[1], h - 1);
+        // (the input at its own size, the coded picture a whole number of
+        // CTBs around it: NVIDIA's 720p is input 1280x720 in 1280x736)
+        const cw = if (i == 1 and s.input_width > 0) @min(w, s.input_width) else w;
+        const ch = if (i == 1 and s.input_height > 0) @min(h, s.input_height) else h;
+        nvenc.set(buf, c[0], cw - 1);
+        nvenc.set(buf, c[1], ch - 1);
         nvenc.set(buf, c[2], p.pitch_luma);
         nvenc.set(buf, c[3], p.pitch_chroma);
     }
@@ -573,7 +588,28 @@ pub fn setup(buf: []u8, s: Setup) void {
     }
     nvenc.set(buf, H.st_num_negative_pics, nneg);
     nvenc.set(buf, H.st_num_positive_pics, npos);
-    // the lists: slots, distances, and each entry's place in the RPS
+    // The references this picture reads, numbered as NVIDIA's driver
+    // numbers them on GB206: the slots of L0's and L1's entries, each once,
+    // by rank (ascending slot); poc_entry, the distance-scale table and the
+    // order bits all go by that number (the WSL capture's B pictures: L1
+    // [poc 2, poc 3] in slots 4 and 2 are references 2 and 1; numbered by
+    // the RPS instead, B pictures decoded at ~30 dB, pc-full26)
+    var used_slots: [nvenc.REF_SLOTS]u8 = undefined;
+    var n_refs: usize = 0;
+    var n_l: [2]usize = .{ 0, 0 };
+    for ([2][]const u32{ l0, l1 }, 0..) |l, li| {
+        for (l) |id| {
+            if (id == va.INVALID_ID) continue;
+            const slot: u8 = @intCast(std.mem.indexOfScalar(u32, &s.ref_ids, id) orelse continue);
+            n_l[li] += 1;
+            if (std.mem.indexOfScalar(u8, used_slots[0..n_refs], slot) == null and n_refs < used_slots.len) {
+                used_slots[n_refs] = slot;
+                n_refs += 1;
+            }
+        }
+    }
+    std.mem.sort(u8, used_slots[0..n_refs], {}, std.sort.asc(u8));
+    // the lists: slots, distances, and each entry's reference number
     for (0..8) |k| {
         const kk: u32 = @intCast(k);
         // (unused: the lists -2 and the distances -1, as NVIDIA's driver
@@ -594,7 +630,7 @@ pub fn setup(buf: []u8, s: Setup) void {
             nvenc.set(buf, nvenc.at(lf[li][0], kk), slot);
             nvenc.setSigned(buf, nvenc.at(lf[li][1], kk), std.math.clamp(cur - s.ref_poc[slot], -128, 127));
             const su: u8 = @intCast(slot);
-            const e: u32 = if (std.mem.indexOfScalar(u8, neg[0..nneg], su)) |e0| @intCast(e0) else if (std.mem.indexOfScalar(u8, pos[0..npos], su)) |e1| nneg + @as(u32, @intCast(e1)) else continue;
+            const e = std.mem.indexOfScalar(u8, used_slots[0..n_refs], su) orelse continue;
             nvenc.set(buf, nvenc.at(lf[li][2], kk), e);
         }
     }
@@ -603,23 +639,23 @@ pub fn setup(buf: []u8, s: Setup) void {
     // L0's count and order, as NVIDIA's own driver writes them on GB206
     // (the WSL capture); left zero, the engine read VA 0 at the first P
     // picture (pc-full17)
+    // (by reference number: td[k] = this picture's POC - reference k's;
+    // [i][j] = round(256 td[j] / td[i]), columns past the references 0,
+    // rows past them -1; the DiffPicOrderCnt bytes: 0 for L1's entries,
+    // then 0xff << L0's; the count; the order bits 1 << k. With one
+    // reference the old reading (256, k + 1) is the same.)
     if (picType(pic) < 2) {
-        var td: [8]i32 = undefined;
-        var n: usize = 0;
-        for (l0) |id| {
-            if (id == va.INVALID_ID or n == td.len) continue;
-            const slot = std.mem.indexOfScalar(u32, &s.ref_ids, id) orelse continue;
-            td[n] = std.math.clamp(cur - s.ref_poc[slot], -128, 127);
-            n += 1;
-        }
+        const n = @min(n_refs, 8);
+        var td: [8]i32 = .{0} ** 8;
+        for (used_slots[0..n], 0..) |slot, k| td[k] = std.math.clamp(cur - s.ref_poc[slot], -128, 127);
         for (0..8) |i| for (0..8) |j| {
-            const v: i32 = if (i >= n) -1 else if (j >= n or td[j] == 0) 0 else std.math.clamp(@divTrunc(256 * td[i], td[j]), -32768, 32767);
+            const v: i32 = if (i >= n) -1 else if (j >= n or td[i] == 0) 0 else std.math.clamp(@as(i32, @intFromFloat(@round(256.0 * @as(f32, @floatFromInt(td[j])) / @as(f32, @floatFromInt(td[i]))))), -32768, 32767);
             nvenc.set(buf, nvenc.at(H.dist_scale_factor, @intCast(i * 8 + j)), @as(u16, @bitCast(@as(i16, @intCast(v)))));
         };
-        const zero_flags: u8 = @truncate(@as(u16, 0xff) << @intCast(@min(n, 8)));
-        for (0..8) |k| nvenc.set(buf, nvenc.at(H.diff_pic_order_cnt_zero, @intCast(k)), zero_flags);
+        const rest: u8 = @truncate(@as(u16, 0xff) << @intCast(@min(n_l[0], 8)));
+        for (0..8) |k| nvenc.set(buf, nvenc.at(H.diff_pic_order_cnt_zero, @intCast(k)), if (k < n_l[1]) 0 else rest);
         nvenc.set(buf, H.ref_count_gb206, n);
-        for (0..n) |k| nvenc.set(buf, nvenc.at(H.ref_order_gb206, @intCast(k)), k + 1);
+        for (0..n) |k| nvenc.set(buf, nvenc.at(H.ref_order_gb206, @intCast(k)), @as(u64, 1) << @intCast(k));
     }
     nvenc.set(buf, H.pic_output_flag, 1);
     const poc_lsb = @as(u32, @bitCast(cur)) & ((@as(u32, 1) << @intCast(@as(u32, prm.log2_max_poc_lsb_minus4) + 4)) - 1);

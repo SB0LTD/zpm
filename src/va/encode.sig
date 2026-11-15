@@ -871,6 +871,8 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
                 .magic = in.magic,
                 .template = in.try_.hevc_template,
                 .slice0 = in.try_.hevc_slice0,
+                .input_width = inp.width,
+                .input_height = inp.height,
                 .bottom_fields = in.try_.bottom_fields,
             });
             a.application_id = nvenc.APPLICATION_ID_H265;
