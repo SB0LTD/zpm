@@ -42,6 +42,9 @@ pub const Error = kmt.Error || error{
     BadMemory,
     /// The work did not complete in time.
     Timeout,
+    /// The host moved the progress fence past everything submitted: the
+    /// channel faulted (the GPU's error, as the host marks it).
+    DeviceLost,
 };
 
 pub const NVIDIA: u32 = 0x10de;
@@ -75,6 +78,13 @@ pub const Options = struct {
     engine: Engine = .graphics_compute,
     /// Which NVIDIA adapter (when there are several).
     index: u32 = 0,
+    /// The kind of client the host makes the context for (D3DKMT's client
+    /// hint: 1 OpenGL, 4 Vulkan, 5 CUDA, 10 Direct3D 10+): NVIDIA's CUDA
+    /// driver says CUDA.
+    client: u32 = 5,
+    /// The engines the queue's channel gets objects for (nv.queue's
+    /// field): Direct3D 12's direct queue's, the 3D engine and compute.
+    engines: u32 = nv.ENGINES_DIRECT,
 };
 
 /// Memory the GPU maps: its GPU address, the CPU's view (empty for video
@@ -133,21 +143,21 @@ pub const Gpu = struct {
         var rv = kmt.ReserveGpuVa{ .adapter = g.adapter, .base = VA_BASE, .size = VA_BYTES };
         _ = try kmt.call(g.fd, .reserve_gpu_va, &rv);
 
-        nv.context(&g.ctx_data, opts.name);
+        nv.context(&g.ctx_data, opts.name, opts.client);
         var cc = kmt.CreateContextVirtual{
             .device = g.device,
             .node_ordinal = @intFromEnum(opts.engine),
             .flags = kmt.CONTEXT_DISABLE_GPU_TIMEOUT | kmt.CONTEXT_HW_QUEUE_SUPPORTED,
             .priv = @intFromPtr(&g.ctx_data),
             .priv_size = nv.CONTEXT_BYTES,
-            .client_hint = 5,
+            .client_hint = opts.client,
         };
         _ = try kmt.call(g.fd, .create_context_virtual, &cc);
         g.context = cc.context;
 
         g.ring = try g.map(ring_memory[0..RING_BYTES], .ring);
         @memset(g.ring.cpu[0..GPFIFO_BYTES], 0);
-        nv.queue(&g.queue_data, g.ring.va, GPFIFO_BYTES, g.ring.handle);
+        nv.queue(&g.queue_data, opts.engines, g.ring.va, GPFIFO_BYTES, g.ring.handle);
         var hq = kmt.CreateHwQueue{
             .context = g.context,
             .flags = 1,
@@ -327,7 +337,10 @@ pub const Gpu = struct {
     pub fn wait(g: *Gpu, f: u64, timeout_us: u64) Error!void {
         var spins: u32 = 0;
         var slept_us: u64 = 0;
-        while (g.progress.* < f) {
+        while (true) {
+            const p = g.progress.*;
+            if (p > g.fence) return error.DeviceLost;
+            if (p >= f) return;
             if (spins < 20_000) {
                 spins += 1;
                 std.atomic.spinLoopHint();

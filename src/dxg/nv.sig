@@ -39,11 +39,12 @@ fn head(b: []u8, kind: u32) void {
 
 pub const CONTEXT_BYTES = 3200;
 
-/// A context's data: the process's name (ASCII at 0x28, UTF-16 at 0x128,
-/// up to 63 characters) and NVIDIA's constant fields.
-pub fn context(b: *[CONTEXT_BYTES]u8, name: []const u8) void {
+/// A context's data: the client's kind (as the call's client hint: 5 for
+/// CUDA, NVIDIA's), the process's name (ASCII at 0x28, UTF-16 at 0x128, up
+/// to 63 characters) and NVIDIA's constant fields.
+pub fn context(b: *[CONTEXT_BYTES]u8, name: []const u8, client: u32) void {
     head(b, KIND_OBJECT);
-    put(b, 0x10, 5);
+    put(b, 0x10, client);
     put(b, 0x18, 3);
     put(b, 0x1c, 0xc);
     const n = @min(name.len, 63);
@@ -58,11 +59,20 @@ pub fn context(b: *[CONTEXT_BYTES]u8, name: []const u8) void {
 
 pub const QUEUE_BYTES = 140;
 
-/// A hardware queue's data: its GPFIFO ring (the GPU address, the bytes,
-/// the allocation holding it).
-pub fn queue(b: *[QUEUE_BYTES]u8, gpfifo_va: u64, gpfifo_bytes: u32, ring_allocation: u32) void {
+/// The engines a hardware queue's channel gets objects for (the queue
+/// data's field at 0x10): NVIDIA's CUDA driver asks 0xa00 (compute and
+/// copy), its Direct3D 12 driver 0x900 for a direct queue and 0xe01 for a
+/// compute one. On a CUDA context the host takes 0x900 (the 3D engine and
+/// compute: zpm's draw and compute self-tests both pass on it), refuses
+/// 0xb00, and gives no 3D object for 0xa00 or 0xe01.
+pub const ENGINES_CUDA: u32 = 0xa00;
+pub const ENGINES_DIRECT: u32 = 0x900;
+
+/// A hardware queue's data: the engines its channel gets, its GPFIFO ring
+/// (the GPU address, the bytes, the allocation holding it).
+pub fn queue(b: *[QUEUE_BYTES]u8, engines: u32, gpfifo_va: u64, gpfifo_bytes: u32, ring_allocation: u32) void {
     head(b, KIND_OBJECT);
-    put(b, 0x10, 0xa00);
+    put(b, 0x10, engines);
     put64(b, 0x18, gpfifo_va);
     put(b, 0x20, gpfifo_bytes);
     put(b, 0x24, ring_allocation);
@@ -158,7 +168,7 @@ fn word(b: []const u8, off: usize) u32 {
 
 test "a context's data: the header, the name twice, the constants" {
     var b: [CONTEXT_BYTES]u8 = undefined;
-    context(&b, "cudaprobe");
+    context(&b, "cudaprobe", 5);
     try testing.expectEqual(MAGIC, word(&b, 0));
     try testing.expectEqual(@as(u32, 0xc80), word(&b, 8));
     try testing.expectEqual(@as(u32, 0x61647563), word(&b, 0x28)); // "cuda"
@@ -169,7 +179,7 @@ test "a context's data: the header, the name twice, the constants" {
 
 test "a hardware queue's data is NVIDIA's (queue 0 of cudaprobe's trace)" {
     var b: [QUEUE_BYTES]u8 = undefined;
-    queue(&b, 0x2_0060_0000, 0x2000, 0x4000_0440);
+    queue(&b, ENGINES_CUDA, 0x2_0060_0000, 0x2000, 0x4000_0440);
     const want = [_]u32{ MAGIC, 0x10000, 0x8c, MAGIC2, 0xa00, 0, 0x60_0000, 2, 0x2000, 0x4000_0440 };
     for (want, 0..) |w, i| try testing.expectEqual(w, word(&b, 4 * i));
 }

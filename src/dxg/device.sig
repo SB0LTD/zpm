@@ -104,7 +104,10 @@ pub const DxgDevice = struct {
 
     fn wait(ctx: *anyopaque, f: nvd.Fence, timeout_us: u64) nvd.Error!void {
         const d: *DxgDevice = @ptrCast(@alignCast(ctx));
-        d.gpu.wait(f, timeout_us) catch return error.Timeout;
+        d.gpu.wait(f, timeout_us) catch |e| {
+            if (e == error.DeviceLost) d.lost = true;
+            return if (e == error.DeviceLost) error.DeviceLost else error.Timeout;
+        };
         barrierNow();
     }
 

@@ -2,9 +2,16 @@
 //! library, no libc:
 //!   1. a host semaphore release run and waited for (Gpu.submit, wait);
 //!   2. 1100 submissions in a row: the GPFIFO ring (1024 entries) wraps;
-//!   3. zpm's GPU self-test (KIR kernels compiled for sm_120, run through
-//!      gpu.nvidia_device over dxg's DxgDevice, every result checked
-//!      against KIR's interpreter).
+//!   3. `selftest`: zpm's GPU self-test (KIR kernels compiled for sm_120,
+//!      run through gpu.nvidia_device over dxg's DxgDevice, every result
+//!      checked against KIR's interpreter);
+//!   4. `draw` (`draw edges`): the 3D engine's hardware test
+//!      (gpu.nvidia_draw.hardwareTest: each case drawn by the rasteriser and
+//!      compared pixel for pixel with the CPU's, then the fill rate);
+//!   `bisect3d`: which method of the 3D engine's state a channel faults on.
+//! DXGTEST_CLIENT (the context's client kind, default 5) and
+//! DXGTEST_ENGINES (the queue's engines, hex, default 900) for trying
+//! others.
 //!
 //!   sig build-exe -target x86_64-linux -OReleaseSafe
 //!     --dep dxg --dep gpu --dep nvidia -Mroot=tools/dxgtest.sig
@@ -12,7 +19,7 @@
 //!     --dep nvidia --dep adreno --dep amdgpu -Mgpu=src/gpu/gpu.sig
 //!     -Mnvidia=src/nvidia/nvidia.sig -Madreno=src/adreno/adreno.sig
 //!     -Mamdgpu=src/amdgpu/amdgpu.sig --name dxgtest
-//!   ./dxgtest [selftest]
+//!   ./dxgtest [selftest | draw [edges] | bisect3d]
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -89,16 +96,90 @@ fn probeFence(r: dxg.gpu.Region, mem: []align(4096) u8) void {
     }
 }
 
+/// Which method of the 3D engine's state (nvidia.draw.setup, then a
+/// target) the channel faults on: the first N methods sent on a fresh
+/// channel each time, N bisected.
+fn bisect3d(ring: []align(4096) u8, client: u32) noreturn {
+    const mem = mapMemory(4 << 20);
+    var words: [4096]u32 = undefined;
+    var starts: [1024]usize = undefined; // each method header's index
+    var nstarts: usize = 0;
+    var lo: usize = 0; // methods known good
+    var hi: usize = 0; // methods known bad (set after the first full run)
+    var round: u32 = 0;
+    var have_hi = false;
+    while (true) : (round += 1) {
+        g.close();
+        g.open(ring, .{ .name = "zpm-dxgtest", .client = client, .engines = engines }) catch |e| {
+            out("bisect: open: {s}\n", .{@errorName(e)});
+            linux.exit(1);
+        };
+        const r = g.mapSystem(mem) catch linux.exit(1);
+        // the state, built at this mapping's addresses
+        var p = push.Push{ .buf = &words };
+        nvidia.draw.setup(&p, r.va + 0x10_0000, r.va + 0x11_0000, r.va + 0x12_0000, 64);
+        nvidia.draw.target(&p, .{ .va = r.va + 0x20_0000, .width = 64, .height = 32, .pitch = 256, .format = .bgra8 });
+        p.check() catch linux.exit(1);
+        if (nstarts == 0) {
+            var i: usize = 0;
+            while (i < p.len) {
+                starts[nstarts] = i;
+                nstarts += 1;
+                const h = push.parseHeader(words[i]);
+                i += 1 + (if (h.op == 4) 0 else h.count);
+            }
+            hi = nstarts;
+        }
+        const n = if (!have_hi) nstarts else (lo + hi) / 2;
+        const dwords: usize = if (n >= nstarts) p.len else starts[n];
+        const pb: [*]u32 = @ptrCast(@alignCast(mem.ptr));
+        @memcpy(pb[0..dwords], words[0..dwords]);
+        const f = g.submit(r.va, @intCast(dwords)) catch linux.exit(1);
+        const ok = if (g.wait(f, 500_000)) |_| true else |_| false;
+        out("bisect: first {d} of {d} methods: {s}\n", .{ n, nstarts, if (ok) "ok" else "FAULT" });
+        if (!have_hi) {
+            if (ok) {
+                out("bisect: the whole state runs\n", .{});
+                linux.exit(0);
+            }
+            have_hi = true;
+            continue;
+        }
+        if (ok) lo = n else hi = n;
+        if (hi - lo <= 1) {
+            const at = starts[lo];
+            const h = push.parseHeader(words[at]);
+            out("bisect: method {d} faults: subchannel {d}, method 0x{x}, op {d}, {d} words:", .{ lo, h.subch, h.method, h.op, h.count });
+            const cnt: usize = if (h.op == 4) 0 else h.count;
+            for (words[at + 1 ..][0..@min(cnt, 8)]) |w| out(" {x}", .{w});
+            out("\n", .{});
+            linux.exit(0);
+        }
+    }
+}
+
 var g: dxg.Gpu = .{};
+var engines: u32 = 0;
 var dev: dxg.DxgDevice = undefined;
 var adapter: gpu.nvidia_device.Adapter = .{};
 var work: gpu.selftest.Work = undefined;
+var over3d: gpu.nvidia_draw.Over = undefined;
+var kst: gpu.nvidia_device.kir_sm120.State = undefined;
+var model: gpu.draw.Reference = undefined;
 
 pub fn main(init: std.process.Init) void {
     const argv = init.minimal.args.vector;
     const ring = mapMemory(dxg.gpu.RING_BYTES);
     const t0 = nowUs();
-    g.open(ring, .{ .name = "zpm-dxgtest" }) catch |e| {
+    // DXGTEST_CLIENT: the context's client kind (default CUDA's 5)
+    var client: u32 = 5;
+    engines = dxg.nv.ENGINES_DIRECT;
+    for (init.minimal.environ.block.slice) |e| {
+        const kv = std.mem.span(e orelse continue);
+        if (std.mem.startsWith(u8, kv, "DXGTEST_CLIENT=")) client = std.fmt.parseInt(u32, kv[15..], 10) catch 5;
+        if (std.mem.startsWith(u8, kv, "DXGTEST_ENGINES=")) engines = std.fmt.parseInt(u32, kv[16..], 16) catch engines;
+    }
+    g.open(ring, .{ .name = "zpm-dxgtest", .client = client, .engines = engines }) catch |e| {
         out("dxgtest: open: {s} (call {x}, status {d})\n", .{ @errorName(e), dxg.kmt.last_nr, dxg.kmt.last_status });
         linux.exit(1);
     };
@@ -161,7 +242,25 @@ pub fn main(init: std.process.Init) void {
     }
     out("2. {d} submissions (ring entries {d}): {d} wrong, {d} us each\n", .{ i, g.put, bad, (nowUs() - t2) / @max(i, 1) });
 
-    if (argv.len < 2 or !std.mem.eql(u8, std.mem.span(argv[1]), "selftest")) {
+    const mode: []const u8 = if (argv.len < 2) "" else std.mem.span(argv[1]);
+    if (std.mem.eql(u8, mode, "bisect3d")) bisect3d(ring, client);
+    if (std.mem.eql(u8, mode, "draw")) {
+        // 4. the 3D engine (the rasteriser), step by step, each pass's
+        // pixels compared with the CPU reference's
+        const arena = mapMemory(256 << 20);
+        dev.init(&g, arena);
+        const d = gpu.nvidia_device.over(&adapter, dev.device(), null, gpu.nvidia_device.withGraphics(gpu.nvidia_device.rtx5070(arena.len)));
+        model = .{ .mem = mapMemory(64 << 20) };
+        // ("draw edges": step 4 too, the graphics dispatches through the
+        // GPU-neutral adapter)
+        const edges = argv.len > 2 and std.mem.eql(u8, std.mem.span(argv[2]), "edges");
+        const t4 = nowUs();
+        const h = gpu.nvidia_draw.hardwareTest(dev.device(), if (edges) d else null, &over3d, &kst, &model, logLine, nowUs);
+        out("4. 3D engine: started {}, object {}, state {}, {d} passed, {d} failed, lost {}, {d} Mpx/s ({d} ms)\n", .{ h.started, h.object, h.state, h.passed, h.failed, h.lost, h.mpx_per_s, (nowUs() - t4) / 1000 });
+        g.close();
+        linux.exit(if (h.failed == 0 and !h.lost and h.object) 0 else 3);
+    }
+    if (!std.mem.eql(u8, mode, "selftest")) {
         g.close();
         return;
     }
