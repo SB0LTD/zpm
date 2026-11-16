@@ -2078,7 +2078,7 @@ pub const Engine = struct {
         const H: f32 = @floatFromInt(t.height);
         const flip = t.top_down;
         const rc = d.rect;
-        if (d.depth) |z| {
+        if (if (raster.depthUsed(d)) d.depth else null) |z| {
             if (!e.graphics_depth) {
                 e.stats.compute_draws += 1;
                 e.sayCompute("a depth target (the 3D engine's depth is off here: GALAXY_GL_3D_DEPTH=0)");
@@ -2120,7 +2120,7 @@ pub const Engine = struct {
         const g = gpu.Graphics{
             .more = more,
             .index = index,
-            .depth = if (d.depth) |z| .{
+            .depth = if (if (raster.depthUsed(d)) d.depth else null) |z| .{
                 .va = z.buf.gpu,
                 .width = z.width,
                 .height = z.height,

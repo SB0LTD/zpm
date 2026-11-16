@@ -866,16 +866,23 @@ const P_HEIGHT = VERTEX_PARAMS;
 const P_FLIP = VERTEX_PARAMS + 1;
 pub const STAGE_PARAMS = VERTEX_PARAMS + 2;
 
+/// The draw reads or writes its depth image: the depth test is on, or the
+/// stencil's (GL writes depth only where it tests it). A depth image merely
+/// attached (WebGL's canvas has one whatever the page does) takes no part.
+pub fn depthUsed(d: *const Draw) bool {
+    return d.depth != null and (d.depth_test or d.stencil != null);
+}
+
 /// Why a draw is not one the 3D engine draws yet (its pipeline's or its
 /// own), or null: the compute kernels draw those.
 pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     if (pipelineWhyNot(d.pipe.shaders)) |why| return why;
     if (d.topology != .triangles and d.topology != .strip and d.topology != .fan) return "points or lines";
-    if (d.depth) |z| {
+    if (if (depthUsed(d)) d.depth else null) |z| {
         if (!z.layout.block or z.samples != 1) return "a depth image the 3D engine cannot draw into (not block linear: a depth texture, or multisampled)";
         if (z.top_down != d.color.top_down) return "a depth image flipped against its colour target";
         if (z.width < d.color.width or z.height < d.color.height) return "a depth image smaller than its colour target";
-    } else if (d.depth_test) return "a depth test with no depth image";
+    } else if (d.depth_test and d.depth == null) return "a depth test with no depth image";
     if (d.stencil) |sten| {
         if (d.depth == null or sten != d.depth.?) return "a stencil image apart from the depth image";
     }

@@ -2276,3 +2276,39 @@ test "draw: bins on the emulated Adreno (ir3) give the CPU's bytes" {
     eng_a.deinit();
     a_gpu.close();
 }
+
+// (last: it shares eng_rtx and the `solid` pipeline with the 3D tests
+// before it, and leaves them torn down)
+test "draw: a depth image attached but not tested goes to the 3D engine without it, with the 3D engine's depth off (GALAXY_GL_3D_DEPTH=0)" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true, .graphics_depth = false });
+    defer eng_rtx.deinit();
+    const e = &eng_rtx;
+    try std.testing.expect(e.onGpu() and e.graphics and !e.graphics_depth);
+    var img = e.newImage(W, H, .rgba8) orelse return error.NoImage;
+    defer e.freeImage(&img);
+    // (WebGL's canvas: a depth renderbuffer, pitch linear with the 3D
+    // engine's depth off)
+    var depth = e.newImageSamples(W, H, .d24s8, 1) orelse return error.NoImage;
+    defer e.freeImage(&depth);
+    try std.testing.expect(!depth.layout.block);
+    var ab = e.newBuffer(3 * 16) orelse return error.NoImage;
+    defer e.freeImage(&ab);
+    const verts = [3][4]f32{ .{ -1, -1, 0, 1 }, .{ 3, -1, 0, 1 }, .{ -1, 3, 0, 1 } };
+    e.writeBytes(&ab, 0, std.mem.sliceAsBytes(&verts));
+    const quarter = [_]u32{ @bitCast(@as(f32, 0.25)), 0, 0, 0 };
+    for ([_]bool{ false, true }) |tested| {
+        const g0 = e.stats.graphics_draws;
+        const c0 = e.stats.compute_draws;
+        var d = raster.Draw{ .pipe = &solid, .color = &img, .depth = &depth, .depth_test = tested, .depth_write = tested, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 3, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .uniforms = &quarter };
+        d.attrs[0] = .{ .buf = &ab, .stride = 16, .comps = 4 };
+        try std.testing.expect(e.draw(&d));
+        e.finish();
+        try std.testing.expect(!e.lost and e.why_pipe == null);
+        // untested: the 3D engine, the depth image left out; tested: the
+        // compute kernels (its depth is off here)
+        try std.testing.expectEqual(@as(u32, @intFromBool(!tested)), e.stats.graphics_draws - g0);
+        try std.testing.expectEqual(@as(u32, @intFromBool(tested)), e.stats.compute_draws - c0);
+    }
+}
