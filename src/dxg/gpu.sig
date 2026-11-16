@@ -99,6 +99,10 @@ pub const ChannelOptions = struct {
     /// fence to (its low 32 bits, after the work): for a reader that cannot
     /// see the progress fence (a guest, through mapped memory). 0: none.
     notify: u64 = 0,
+    /// The context's private data as it is (another driver's, recorded),
+    /// instead of nv.context's; and the call's flags (0: ours).
+    context_data: ?*const [nv.CONTEXT_BYTES]u8 = null,
+    context_flags: u32 = 0,
 };
 
 /// Memory the GPU maps: its GPU address, the CPU's view (empty for video
@@ -342,11 +346,11 @@ pub const Channel = struct {
     pub fn open(c: *Channel, g: *Gpu, ring_memory: []align(4096) u8, opts: ChannelOptions) Error!void {
         c.* = .{ .gpu = g, .notify = opts.notify };
         errdefer c.close();
-        nv.context(&c.ctx_data, opts.name, opts.client);
+        if (opts.context_data) |cd| c.ctx_data = cd.* else nv.context(&c.ctx_data, opts.name, opts.client);
         var cc = kmt.CreateContextVirtual{
             .device = g.device,
             .node_ordinal = @intFromEnum(opts.engine),
-            .flags = kmt.CONTEXT_DISABLE_GPU_TIMEOUT | kmt.CONTEXT_HW_QUEUE_SUPPORTED,
+            .flags = if (opts.context_flags != 0) opts.context_flags else kmt.CONTEXT_DISABLE_GPU_TIMEOUT | kmt.CONTEXT_HW_QUEUE_SUPPORTED,
             .priv = @intFromPtr(&c.ctx_data),
             .priv_size = nv.CONTEXT_BYTES,
             .client_hint = opts.client,

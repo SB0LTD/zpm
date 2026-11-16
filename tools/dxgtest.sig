@@ -123,12 +123,38 @@ fn openAll(ring: []align(4096) u8, client: u32) void {
         out("dxgtest: open: {s} (call {x}, status {d})\n", .{ @errorName(e), dxg.kmt.last_nr, dxg.kmt.last_status });
         linux.exit(1);
     };
-    ch.open(&g, ring, .{ .name = "zpm-dxgtest", .client = client, .engines = engines }) catch |e| {
+    ch.open(&g, ring, .{ .name = "zpm-dxgtest", .client = client, .engines = engines, .context_data = if (ctx_loaded) &ctx_data else null, .context_flags = ctx_flags }) catch |e| {
         out("dxgtest: channel: {s} (call {x}, status {d})\n", .{ @errorName(e), dxg.kmt.last_nr, dxg.kmt.last_status });
         linux.exit(1);
     };
 }
 var engines: u32 = 0;
+/// DXGTEST_CTXDATA=file: the context's private data as recorded (3200
+/// bytes), DXGTEST_CTXFLAGS=hex: the call's flags.
+var ctx_data: [dxg.nv.CONTEXT_BYTES]u8 = undefined;
+var ctx_loaded = false;
+/// DXGTEST_PRELUDE=file ((method, value) u32 pairs; DXGTEST_FROM / _TO:
+/// the part sent): gl3d.prelude.
+var prelude_buf: [2048][2]u32 = undefined;
+var prelude_n: usize = 0;
+var prelude_from: usize = 0;
+var prelude_to: usize = 1 << 30;
+
+fn loadPrelude(path: [*:0]const u8) void {
+    const fd: isize = @bitCast(linux.open(path, .{ .ACCMODE = .RDONLY }, 0));
+    if (fd < 0) return;
+    defer _ = linux.close(@intCast(fd));
+    const n = linux.read(@intCast(fd), std.mem.sliceAsBytes(&prelude_buf).ptr, @sizeOf(@TypeOf(prelude_buf)));
+    prelude_n = n / 8;
+}
+var ctx_flags: u32 = 0;
+
+fn loadCtx(path: [*:0]const u8) void {
+    const fd: isize = @bitCast(linux.open(path, .{ .ACCMODE = .RDONLY }, 0));
+    if (fd < 0) return;
+    defer _ = linux.close(@intCast(fd));
+    if (linux.read(@intCast(fd), &ctx_data, ctx_data.len) == ctx_data.len) ctx_loaded = true;
+}
 var dev: dxg.DxgDevice = undefined;
 var adapter: gpu.nvidia_device.Adapter = .{};
 var work: gpu.selftest.Work = undefined;
@@ -147,6 +173,17 @@ pub fn main(init: std.process.Init) void {
         const kv = std.mem.span(e orelse continue);
         if (std.mem.startsWith(u8, kv, "DXGTEST_CLIENT=")) client = std.fmt.parseInt(u32, kv[15..], 10) catch 5;
         if (std.mem.startsWith(u8, kv, "DXGTEST_ENGINES=")) engines = std.fmt.parseInt(u32, kv[16..], 16) catch engines;
+        if (std.mem.startsWith(u8, kv, "DXGTEST_CTXDATA=")) loadCtx(@ptrCast(kv[16..].ptr));
+        if (std.mem.startsWith(u8, kv, "DXGTEST_CTXFLAGS=")) ctx_flags = std.fmt.parseInt(u32, kv[17..], 16) catch 0;
+        if (std.mem.startsWith(u8, kv, "DXGTEST_PRELUDE=")) loadPrelude(@ptrCast(kv[16..].ptr));
+        if (std.mem.startsWith(u8, kv, "DXGTEST_FROM=")) prelude_from = std.fmt.parseInt(usize, kv[13..], 10) catch 0;
+        if (std.mem.startsWith(u8, kv, "DXGTEST_TO=")) prelude_to = std.fmt.parseInt(usize, kv[11..], 10) catch prelude_to;
+    }
+    if (prelude_n != 0) {
+        const to = @min(prelude_to, prelude_n);
+        const from = @min(prelude_from, to);
+        nvidia.gl3d.prelude = prelude_buf[from..to];
+        out("prelude: methods {d}..{d} of {d}\n", .{ from, to, prelude_n });
     }
     openAll(ring, client);
     out("open: {x}:{x} (adapter {x}), device {x}, context {x}, queue {x}, ring 0x{x}, progress at 0x{x} = {d} ({d} us)\n", .{

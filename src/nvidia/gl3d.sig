@@ -39,7 +39,14 @@
 //! it sends them (below): not the memory, not the documented state. Left:
 //! what that driver does to its context at creation, most likely binding
 //! zcull's context-switch storage (an escape), without which the engine
-//! writes zcull's state to address 0.
+//! writes zcull's state to address 0. Ruled out after that (dxgtest:
+//! DXGTEST_CTXDATA/CTXFLAGS, ENGINES=1900, DXGTEST_PRELUDE): NVIDIA's own
+//! context data, flags and client hint, its direct queue's engines
+//! (0x1900), and its 3D context's reset state without the methods that
+//! hold addresses (which the replay could not tell apart well). Left: what
+//! its depth binding does through MME macros (LOAD_ROOT_TABLE, methods
+//! 0x3800 on: macros its user-mode driver loads at the context's start),
+//! and the address-bearing state.
 //! The depth state below is NVIDIA's D3D12 driver's for D24S8 (format, layer,
 //! compression, sparse). The emulated engine (emu3d) runs all of it.
 //!
@@ -285,8 +292,14 @@ pub const SET_CONSTANT_BUFFER_SELECTOR_A = gr.SET_CONSTANT_BUFFER_SELECTOR_A;
 /// SET_PROVOKING_VERTEX: GL's flat varyings are the last vertex's.
 pub const PROVOKING_LAST: u32 = 1;
 
+/// State sent before each draw's own, as (method, value) pairs: for finding
+/// on hardware which of another driver's state a draw needs (dxgtest's
+/// DXGTEST_PRELUDE); empty otherwise.
+pub var prelude: []const [2]u32 = &.{};
+
 /// The whole of a draw: state, programs, buffers, the draw.
 pub fn emit(p: *Push, d: *const Draw) void {
+    for (prelude) |mv| one(p, mv[0], mv[1]);
     gr.setup(p, d.zero_va, d.zero_va, d.zero_va, 1);
     gr.target(p, .{ .va = d.target.va, .width = d.target.width, .height = d.target.height, .pitch = d.target.pitch, .format = .bgra8 });
     // the target's own format, its channels
