@@ -26,6 +26,7 @@ pub const Nr = enum(u8) {
     make_resident = 0x0b,
     map_gpu_va = 0x0c,
     escape = 0x0d,
+    get_device_state = 0x0e,
     destroy_allocation2 = 0x13,
     close_adapter = 0x15,
     create_hw_queue = 0x18,
@@ -121,6 +122,26 @@ pub const CreateDevice = extern struct {
 };
 
 pub const DestroyDevice = extern struct { device: Handle };
+
+/// d3dkmt_getdevicestate; state_type 1 (execution: `seq` low word the
+/// state) or 5 (the page fault: where, from which stage, how).
+pub const GetDeviceState = extern struct {
+    device: Handle,
+    state_type: u32,
+    seq: u64 = 0,
+    stage: u32 = 0,
+    bind_entry: u32 = 0,
+    flags: u32 = 0,
+    error_code: u32 = 0,
+    va: u64 = 0,
+    rest: [16]u8 = [_]u8{0} ** 16,
+};
+pub const DEVICESTATE_EXECUTION: u32 = 1;
+pub const DEVICESTATE_PAGE_FAULT: u32 = 5;
+
+comptime {
+    if (@sizeOf(GetDeviceState) != 56) @compileError("d3dkmt_getdevicestate is 56 bytes");
+}
 
 /// D3DDDI_CREATECONTEXTFLAGS
 pub const CONTEXT_DISABLE_GPU_TIMEOUT: u32 = 1 << 2;

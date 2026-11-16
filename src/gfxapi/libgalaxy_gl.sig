@@ -81,6 +81,8 @@ fn openDriver() ?*engine.Engine {
     if (refused) return null;
     the_gpu = .{ .node = .{ .sys = .{} } };
     const want3d = envAsked("GALAXY_GL_3D=");
+    // (Galaxy's: the 3D engine without its depth unit, a forwarded RTX's)
+    const no_depth3d = envSaysOff("GALAXY_GL_3D_DEPTH=");
     the_gpu.want_graphics = want3d;
     const d = the_gpu.open() catch |err| {
         report.say(.device, "no GPU ({s}): EGL has no display, and the app draws in software", .{@errorName(err)});
@@ -97,6 +99,7 @@ fn openDriver() ?*engine.Engine {
         .cpu_work = &cpu_work,
         .check = if (check_px) |px| .{ .mem = anonymous(CHECK_BYTES), .max_px = px } else .{},
         .graphics = d.caps.graphics,
+        .graphics_depth = !no_depth3d,
     });
     if (want3d) {
         if (the_engine.graphics) {
@@ -150,6 +153,35 @@ fn checkAsked() ?u32 {
 
 /// Whether `key` (with its '=') is set to 1 or on in the process's
 /// environment (/proc/self/environ).
+/// The environment's `key` is 0 or off (unset: false).
+fn envSaysOff(key: []const u8) bool {
+    if (comptime !on_linux) return false;
+    if (!envAsked(key)) {
+        // (envAsked read the block: is the key there at all, and off?)
+        return offIn(env_last, key);
+    }
+    return false;
+}
+
+fn offIn(block: []const u8, key: []const u8) bool {
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |kv| {
+        if (!std.mem.startsWith(u8, kv, key)) continue;
+        const v = std.mem.trim(u8, kv[key.len..], " ");
+        return std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off");
+    }
+    return false;
+}
+
+test "libgalaxy-gl: GALAXY_GL_3D_DEPTH off from an environment block" {
+    try std.testing.expect(offIn("A=1\x00GALAXY_GL_3D_DEPTH=0\x00", "GALAXY_GL_3D_DEPTH="));
+    try std.testing.expect(!offIn("GALAXY_GL_3D_DEPTH=1", "GALAXY_GL_3D_DEPTH="));
+    try std.testing.expect(!offIn("HOME=/\x00", "GALAXY_GL_3D_DEPTH="));
+}
+
+/// The environment block envAsked read last.
+var env_last: []const u8 = &.{};
+
 fn envAsked(key: []const u8) bool {
     if (comptime !on_linux) return false;
     const fd = sysResult(linux.openat(linux.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
@@ -161,6 +193,7 @@ fn envAsked(key: []const u8) bool {
         if (r <= 0) break;
         n += @intCast(r);
     }
+    env_last = env_buf[0..n];
     return onIn(env_buf[0..n], key);
 }
 

@@ -264,6 +264,13 @@ pub const SET_USER_CLIP_OP: u32 = 0x1940;
 pub const SET_PRIMITIVE_TOPOLOGY_CONTROL: u32 = 0x1948;
 pub const SET_WINDOW_CLIP_ENABLE: u32 = 0x194c;
 pub const SET_ZCULL_BOUNDS: u32 = 0x196c;
+/// Zcull's depth and stencil culling (Z_ENABLE bit 0, STENCIL_ENABLE bit
+/// 4): off, as NVIDIA's D3D12 driver sets it in its context's first state
+/// (a WSL host's context leaves it on, for that driver's zcull storage).
+pub const SET_ZCULL: u32 = 0x1968;
+/// The depth unit's writes kept from zcull (ENABLE bit 0, NO_STALL bit 4:
+/// 0x11, NVIDIA's D3D12 driver's first state).
+pub const SET_ZCULL_ROP_BYPASS: u32 = 0x02e4;
 pub const SET_PRIMITIVE_TOPOLOGY: u32 = 0x1970;
 pub const SET_CLIP_ID_TEST: u32 = 0x197c;
 pub const SET_DEPTH_BOUNDS_TEST: u32 = 0x19bc;
@@ -1187,6 +1194,8 @@ pub fn setup(p: *Push, zero_va: u64, samplers_va: u64, headers_va: u64, headers:
     one(p, SET_API_MANDATED_EARLY_Z, 0);
     one(p, SET_POST_Z_PS_IMASK, 0);
     one(p, SET_ZCULL_BOUNDS, 0);
+    one(p, SET_ZCULL, 0);
+    one(p, SET_ZCULL_ROP_BYPASS, 0x11);
     many(p, SET_DRAW_CONTROL_A, &.{ DRAW_CONTROL, 1 }); // and one instance
 }
 

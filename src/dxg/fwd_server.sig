@@ -37,6 +37,8 @@ pub const Server = struct {
     served: u64 = 0,
     submits: u64 = 0,
     log: ?*const fn (line: []const u8) void = null,
+    /// Channels whose loss the log has told.
+    told: [fwd.MAX_CHANNELS]bool = [_]bool{false} ** fwd.MAX_CHANNELS,
 
     pub fn init(s: *Server, g: *gpu.Gpu, guest: Guest, rings: []align(4096) u8) void {
         s.* = .{ .gpu = g, .guest = guest, .rings = rings };
@@ -142,6 +144,7 @@ pub const Server = struct {
                 return fail(.refused);
             };
             s.open[k] = true;
+            s.told[k] = false;
             s.say("fwd: channel {d} open", .{k});
             return .{ .chan = k };
         }
@@ -160,9 +163,22 @@ pub const Server = struct {
         return .{};
     }
 
+    /// Channel `k` found lost: what dxgkrnl says of it, in the log (once).
+    fn sayLost(s: *Server, k: u32) void {
+        if (k >= fwd.MAX_CHANNELS or s.told[k]) return;
+        s.told[k] = true;
+        const c = &s.chans[k];
+        if (s.gpu.fault()) |f| {
+            s.say("fwd: channel {d} lost at fence {d} (submitted {d}): device execution state {d}, page fault at 0x{x} (stage {d}, flags 0x{x}, code 0x{x})", .{ k, c.completed(), c.fence, f.execution, f.va, f.stage, f.flags, f.code });
+        } else s.say("fwd: channel {d} lost at fence {d} (submitted {d}); no device state", .{ k, c.completed(), c.fence });
+    }
+
     fn submit(s: *Server, r: fwd.Request) fwd.Response {
         const c = s.channel(r.chan) orelse return fail(.invalid);
-        if (c.lost()) return fail(.lost);
+        if (c.lost()) {
+            s.sayLost(r.chan);
+            return fail(.lost);
+        }
         if (r.b == 0 or r.b > 0x1f_ffff or r.a < fwd.WINDOW_START or r.a >= fwd.WINDOW_END) return fail(.invalid);
         const f = c.submit(r.a, @intCast(r.b)) catch return fail(.refused);
         s.submits += 1;
@@ -171,6 +187,7 @@ pub const Server = struct {
 
     fn state(s: *Server, k: u32) fwd.Response {
         const c = s.channel(k) orelse return fail(.invalid);
+        if (c.lost()) s.sayLost(k);
         return .{ .chan = k, .a = c.completed(), .b = @intFromBool(c.lost()) };
     }
 

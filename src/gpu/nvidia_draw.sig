@@ -604,6 +604,13 @@ fn edgePixel(k: *kir.Kernel) void {
     for (color, 0..) |x, c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(x));
 }
 
+/// Step 4 with a depth target (false: none, to tell the engine's depth
+/// from the rest when a draw faults).
+pub var edges_depth = true;
+/// Step 4's depth target at this address instead (non-zero: memory of the
+/// caller's, VRAM say, which the CPU does not fill: a fault test only).
+pub var edges_depth_va: u64 = 0;
+
 fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res: *Hardware) void {
     if (!d.caps.graphics) {
         hsay(log, "step 4, edges: the device offers no graphics dispatches: not run", .{});
@@ -689,7 +696,7 @@ fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res:
                     .count = 6,
                     .cull = sc.cull,
                     .front_ccw = true,
-                    .depth = .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = pass == 0, .func = if (pass == 0) 1 else 2 },
+                    .depth = if (!edges_depth) null else .{ .va = if (edges_depth_va != 0) edges_depth_va else depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = pass == 0, .func = if (pass == 0) 1 else 2 },
                 };
                 const t0 = now_us();
                 const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| {

@@ -25,8 +25,16 @@
 //! and lines, multisampling, primitive restart, depth textures, depth
 //! bias, clip distances.
 //!
-//! Nothing here has run on the Legion's RTX; the emulated engine (emu3d)
-//! runs it.
+//! On the Legion's RTX through /dev/dxg (WSL, 11-16): draws without a depth
+//! target run (dxgtest `draw edges nodepth`: all ten edge scenes). Any
+//! draw with a depth target bound faults the channel there (a write fault,
+//! no address), tested or not, depth-only or not, in system memory or
+//! VRAM, with zcull off and compression off: the host driver's linear
+//! buffers are not memory its depth unit takes (NVIDIA's own D3D12 depth
+//! surfaces are allocations of another type: 0x8012, format 0x17). Galaxy's
+//! GL keeps depth draws on the compute kernels there (GALAXY_GL_3D_DEPTH=0).
+//! The depth state below is NVIDIA's D3D12 driver's for D24S8 (format, layer,
+//! compression, sparse). The emulated engine (emu3d) runs all of it.
 //!
 //! Allocation-free.
 
@@ -118,9 +126,21 @@ pub const Index = struct { va: u64, bytes: u32, size: u8, first: u32, restart: b
 // The depth-stencil target and its tests (cl9097.h's methods).
 pub const SET_ZT_A: u32 = 0x0fe0; // address (high), then low, format, block size, array pitch
 pub const SET_ZT_SIZE_A: u32 = 0x1228; // width, height, third dimension
+/// The depth target's layer, its compression (the memory's PTE kind is
+/// generic: none), and sparse off: NVK sends all three with every depth
+/// target. Left to the context's defaults, a WSL host's (its D3D driver's
+/// golden context) compresses depth and the engine writes the compression
+/// data through an address nobody set: a page fault at 0 on the first
+/// depth-tested draw (the RTX over /dev/dxg, 11-16).
+pub const SET_ZT_LAYER: u32 = 0x179c;
+pub const SET_Z_COMPRESSION: u32 = 0x19cc;
+pub const SET_ZT_SPARSE: u32 = 0x1208;
 /// SET_ZT_FORMAT: S8Z24 (depth in bits 0..23, stencil 24..31: GL's
 /// DEPTH24_STENCIL8 as the engine keeps it; Mesa's Z24_UNORM_S8_UINT).
-pub const ZT_S8Z24: u32 = 0x14;
+/// Blackwell's value (clcd97.h: V_S8Z24 0x16, V_Z24S8 0x14; what NVIDIA's
+/// D3D12 driver sends for D24S8, 11-16), stencil in the same surface (bit
+/// 8 clear).
+pub const ZT_S8Z24: u32 = 0x16;
 pub const SET_STENCIL_OP_FAIL: u32 = 0x1384; // fail, zfail, zpass, func, ref, func mask, write mask
 /// The back faces' stencil (cl9097.h): on with SET_TWO_SIDED_STENCIL_TEST
 /// (NVK keeps it on always), else the front's state is both faces'.
@@ -292,6 +312,9 @@ pub fn emit(p: *Push, d: *const Draw) void {
     if (d.depth) |z| {
         many(p, SET_ZT_A, &.{ @truncate(z.va >> 32), @truncate(z.va), ZT_S8Z24, @as(u32, z.gobs_log2) << 4, 0 });
         many(p, SET_ZT_SIZE_A, &.{ z.width, z.height, 0x1_0001 });
+        one(p, SET_ZT_LAYER, 0);
+        one(p, SET_Z_COMPRESSION, 0);
+        one(p, SET_ZT_SPARSE, 0);
         one(p, gr.SET_ZT_SELECT, 1);
         one(p, gr.SET_DEPTH_TEST, @intFromBool(z.tested));
         one(p, gr.SET_DEPTH_WRITE, @intFromBool(z.write));

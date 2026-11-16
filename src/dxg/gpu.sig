@@ -270,6 +270,25 @@ pub const Gpu = struct {
     }
 
     /// Closes the device (its channels first: Channel.close).
+    /// What dxgkrnl says of the device: its execution state (1 active, 3
+    /// hung, 6 DMA fault, 7 a page fault ...) and the last page fault's
+    /// address, stage and flags (null: it did not answer).
+    pub const Fault = struct { execution: u32, va: u64, stage: u32, flags: u32, code: u32 };
+
+    pub fn fault(g: *Gpu) ?Fault {
+        var ex = kmt.GetDeviceState{ .device = g.device, .state_type = kmt.DEVICESTATE_EXECUTION };
+        _ = kmt.call(g.fd, .get_device_state, &ex) catch return null;
+        var pf = kmt.GetDeviceState{ .device = g.device, .state_type = kmt.DEVICESTATE_PAGE_FAULT };
+        const got = if (kmt.call(g.fd, .get_device_state, &pf)) |_| true else |_| false;
+        return .{
+            .execution = @truncate(ex.seq),
+            .va = if (got) pf.va else 0,
+            .stage = if (got) pf.stage else 0,
+            .flags = if (got) pf.flags else 0,
+            .code = if (got) pf.error_code else 0,
+        };
+    }
+
     pub fn close(g: *Gpu) void {
         if (g.fd < 0) return;
         if (g.paging_queue != 0) {

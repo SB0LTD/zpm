@@ -102,6 +102,7 @@ export fn ioctl(fd: c_int, req: c_ulong, arg: usize) callconv(.c) c_int {
     if (nr == SUBMIT_COMMAND) submitted(nr, my, a, 0, 8);
     if (nr == SUBMIT_TO_HW_QUEUE) submitted(nr, my, a, 16, 24);
     lock.store(0, .release);
+    if (nr == SUBMIT_TO_HW_QUEUE) snapSubmit();
 
     const rc = real_ioctl.?(fd, req, arg);
 
@@ -112,6 +113,23 @@ export fn ioctl(fd: c_int, req: c_ulong, arg: usize) callconv(.c) c_int {
     // (259: STATUS_PENDING, a map or residency the paging fence finishes)
     if (rc == 0 or rc == 259) learn(nr, a[0..size]);
     return rc;
+}
+
+/// DXGTRACE_SNAP_SUBMITS=N (with DXGTRACE_SNAP): a step at each of the
+/// first N hardware-queue doorbells, so a program that marks nothing (a
+/// GL demo through NVIDIA's D3D12 driver) leaves the pushbuffers it wrote
+/// before each in the snapshots.
+var snap_submits: u32 = 0;
+
+fn snapSubmit() void {
+    const v = getenv("DXGTRACE_SNAP_SUBMITS") orelse return;
+    const most = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return;
+    if (snap_submits >= most) return;
+    snap_submits += 1;
+    var buf: [32]u8 = undefined;
+    const t = std.fmt.bufPrint(buf[0 .. buf.len - 1], "submit {d}", .{snap_submits}) catch return;
+    buf[t.len] = 0;
+    dxgtrace_mark(@ptrCast(&buf));
 }
 
 /// A note in the trace from the traced program (cudaprobe calls it, found

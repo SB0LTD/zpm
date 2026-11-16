@@ -220,9 +220,17 @@ pub fn main(init: std.process.Init) void {
         // ("draw edges": step 4 too, the graphics dispatches through the
         // GPU-neutral adapter)
         const edges = argv.len > 2 and std.mem.eql(u8, std.mem.span(argv[2]), "edges");
+        // ("draw edges nodepth": step 4's draws without their depth target)
+        if (argv.len > 3 and std.mem.eql(u8, std.mem.span(argv[3]), "nodepth")) gpu.nvidia_draw.edges_depth = false;
+        // ("draw edges vramdepth": step 4's depth target in VRAM)
+        if (argv.len > 3 and std.mem.eql(u8, std.mem.span(argv[3]), "vramdepth")) {
+            const z = g.allocVideo(1 << 20) catch linux.exit(1);
+            gpu.nvidia_draw.edges_depth_va = z.va;
+        }
         const t4 = nowUs();
         const h = gpu.nvidia_draw.hardwareTest(dev.device(), if (edges) d else null, &over3d, &kst, &model, logLine, nowUs);
         out("4. 3D engine: started {}, object {}, state {}, {d} passed, {d} failed, lost {}, {d} Mpx/s ({d} ms)\n", .{ h.started, h.object, h.state, h.passed, h.failed, h.lost, h.mpx_per_s, (nowUs() - t4) / 1000 });
+        if (h.lost or h.failed != 0) if (g.fault()) |pf| out("   the device: execution state {d}, page fault at 0x{x} (stage {d}, flags 0x{x}, code 0x{x})\n", .{ pf.execution, pf.va, pf.stage, pf.flags, pf.code });
         ch.close();
         g.close();
         linux.exit(if (h.failed == 0 and !h.lost and h.object) 0 else 3);

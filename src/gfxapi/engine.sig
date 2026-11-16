@@ -932,6 +932,12 @@ pub const Config = struct {
     /// 3D engine) where a draw is one it takes; else every draw is the
     /// compute kernels'.
     graphics: bool = false,
+    /// Draws with a depth target through the graphics pipeline too (false:
+    /// the compute kernels draw them, and depth images stay pitch linear).
+    /// Galaxy turns it off where the engine's depth unit cannot have the
+    /// memory it needs: the RTX forwarded to a virtual machine, whose
+    /// memory is the host driver's linear buffers (GALAXY_GL_3D_DEPTH=0).
+    graphics_depth: bool = true,
 };
 
 /// A kernel the CPU ran, kept in Config.cpu_kernels: what it was built
@@ -1033,6 +1039,8 @@ pub const Engine = struct {
     /// Draws kept on the compute kernels for now (tests: a frame split
     /// between the two rasterizers on purpose).
     compute_only: bool = false,
+    /// Config.graphics_depth.
+    graphics_depth: bool = true,
     said_graphics: bool = false,
     said_compute: [8][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
@@ -1087,6 +1095,7 @@ pub const Engine = struct {
     pub fn init(e: *Engine, cfg: Config) void {
         e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
         if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
+        e.graphics_depth = cfg.graphics_depth;
         for (e.slabs) |*slab| slab.* = .{};
         const d = cfg.dev orelse return;
         e.loadAll(d, cfg.compiler, cfg.work) catch |err| {
@@ -1247,7 +1256,7 @@ pub const Engine = struct {
     /// A multisampled image (samples 2, 4 or 8; 1: newImage's): a pixel's
     /// samples side by side in its row.
     pub fn newImageSamples(e: *Engine, width: u32, height: u32, format: Format, samples: u8) ?Image {
-        if (samples <= 1 and format == .d24s8 and e.graphics) return e.newDepthImage(width, height);
+        if (samples <= 1 and format == .d24s8 and e.graphics and e.graphics_depth) return e.newDepthImage(width, height);
         if (samples <= 1) return e.newImage(width, height, format);
         var img = e.allocImage(width * samples, height, format, true) orelse return null;
         img.width = width;
@@ -2070,6 +2079,11 @@ pub const Engine = struct {
         const flip = t.top_down;
         const rc = d.rect;
         if (d.depth) |z| {
+            if (!e.graphics_depth) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("a depth target (the 3D engine's depth is off here: GALAXY_GL_3D_DEPTH=0)");
+                return null;
+            }
             if (!e.gpuUsable(z)) return null;
         }
         // the colour targets past the first: each the output the code
