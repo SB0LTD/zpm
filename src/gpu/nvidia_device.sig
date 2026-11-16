@@ -116,6 +116,8 @@ const Slot = struct {
     raw: nv.Buffer = .{},
     /// From the host device (else VRAM).
     on_host: bool = false,
+    /// From the GPU-only device (VRAM no CPU reaches: Adapter.gpu_only).
+    gpu_only: bool = false,
     used: bool = false,
     /// Its reuses: a buffer's handle carries the generation it was made
     /// in (bits 16..31), so a handle kept past its free (a double free)
@@ -144,6 +146,9 @@ const Set = struct {
 pub const Adapter = struct {
     vram: nv.Device = undefined,
     host: ?nv.Device = null,
+    /// VRAM with no CPU view, for gpu.Kind.device (cpu empty); null: such
+    /// buffers come from `vram`.
+    gpu_only: ?nv.Device = null,
     caps: gpu.Caps = undefined,
     bufs: [MAX_BUFFERS]Slot = [_]Slot{.{}} ** MAX_BUFFERS,
     /// Frees (and lookups) of a handle whose buffer had gone: refused.
@@ -226,11 +231,24 @@ pub const Adapter = struct {
         const on_host = kind == .host and a.host != null;
         for (&a.bufs, 0..) |*s, i| {
             if (s.used) continue;
+            // (.device: VRAM with no CPU view where there is such a device:
+            // the type says cpu may be empty)
+            if (kind == .device) if (a.gpu_only) |go| {
+                if (go.alloc(@intCast(bytes))) |raw| {
+                    s.* = .{ .raw = raw, .gpu_only = true, .used = true, .gen = s.gen };
+                    return .{ .gpu = raw.va, .cpu = raw.cpu, .bytes = bytes, .handle = handleAt(a, i), .kind = kind };
+                } else |_| {}
+            };
             const raw = a.rawOf(on_host).alloc(@intCast(bytes)) catch return null;
             s.* = .{ .raw = raw, .on_host = on_host, .used = true, .gen = s.gen };
             return .{ .gpu = raw.va, .cpu = raw.cpu, .bytes = bytes, .handle = handleAt(a, i), .kind = kind };
         }
         return null;
+    }
+
+    /// The raw device slot `s`'s buffer came from.
+    fn rawFor(a: *Adapter, s: *const Slot) nv.Device {
+        return if (s.gpu_only) a.gpu_only.? else a.rawOf(s.on_host);
     }
 
     /// The slot buffer `b` is in, if it is still that buffer's: a handle
@@ -252,7 +270,7 @@ pub const Adapter = struct {
     fn free(ctx: *anyopaque, b: gpu.Buffer) void {
         const a = self(ctx);
         const s = a.slotOf(b) orelse return;
-        a.rawOf(s.on_host).free(s.raw);
+        a.rawFor(s).free(s.raw);
         s.* = .{ .gen = s.gen +% 1 };
     }
 
@@ -265,13 +283,13 @@ pub const Adapter = struct {
     fn toDevice(ctx: *anyopaque, b: gpu.Buffer, off: u64, len: u64) void {
         const a = self(ctx);
         const s = a.slotOf(b) orelse return;
-        a.rawOf(s.on_host).toDevice(s.raw, @intCast(off), @intCast(len));
+        a.rawFor(s).toDevice(s.raw, @intCast(off), @intCast(len));
     }
 
     fn fromDevice(ctx: *anyopaque, b: gpu.Buffer, off: u64, len: u64) void {
         const a = self(ctx);
         const s = a.slotOf(b) orelse return;
-        a.rawOf(s.on_host).fromDevice(s.raw, @intCast(off), @intCast(len));
+        a.rawFor(s).fromDevice(s.raw, @intCast(off), @intCast(len));
     }
 
     fn load(ctx: *anyopaque, bin: *const gpu.Binary) gpu.Error!gpu.Program {

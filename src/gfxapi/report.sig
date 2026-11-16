@@ -131,6 +131,9 @@ pub const Gpu = struct {
     wait_us: u64 = 0,
     /// draws done on the CPU (the GPU lost, or it did not take a program)
     cpu_draws: u64 = 0,
+    /// images in VRAM now; bytes moved between VRAM and their shadows
+    vram_images: u32 = 0,
+    vram_bytes: u64 = 0,
 };
 
 /// What a GL context is used for: counters (the context's own thread
@@ -236,13 +239,17 @@ pub const Usage = struct {
                 n += part.len;
             }
             var es: [32]u8 = undefined;
+            // (images in VRAM: a discrete GPU's; said when there are some)
+            var vb: [64]u8 = undefined;
+            const moved = gpu.vram_bytes -| then.vram_bytes;
+            const vram = if (gpu.vram_images == 0 and moved == 0) "" else std.fmt.bufPrint(&vb, "; {d} images in VRAM, {d} kB to and from their shadows", .{ gpu.vram_images, (moved +| 512) / 1024 }) catch "";
             const asked = if (u.es == 0) "" else std.fmt.bufPrint(&es, " (ES {d} asked{s})", .{ u.es, if (u.robust) ", robust" else "" }) catch "";
             sayIn(1024, .usage, "context {d}{s} in {d}.{d} s on {s}{s}{s}: " ++
                 "{d} swaps ({d} ms in them); " ++
                 "{d} draws ({d} indexed, {d} instances, {d} triangles, {d} on the CPU); " ++
                 "{d} uploads, {d} kB; " ++
                 "programs: {d} linked, {d} WebRender's, {d} the layers compositor's{s}; " ++
-                "GPU: {d} batches of {d} kernel runs, {d} ms submitting, {d} ms waiting in {d} waits ({d} ms at most between two swaps)", .{
+                "GPU: {d} batches of {d} kernel runs, {d} ms submitting, {d} ms waiting in {d} waits ({d} ms at most between two swaps){s}", .{
                 u.id,
                 asked,
                 span / 1_000_000,
@@ -269,6 +276,7 @@ pub const Usage = struct {
                 (gpu.wait_us -| then.wait_us) / 1000,
                 gpu.waits -| then.waits,
                 u.swap_wait_us / 1000,
+                vram,
             });
         }
         u.since_us = @max(now_us, 1);

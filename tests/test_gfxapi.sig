@@ -217,6 +217,28 @@ test "gfxapi: the scenario on EmuDevice gives the CPU's bytes, in few batches" {
     eng_emu.deinit();
 }
 
+var emu_vram: [8 << 20]u8 align(4096) = undefined;
+
+test "gfxapi: the scenario with its images in VRAM (a discrete GPU) gives the CPU's bytes" {
+    const want = try cpuOut();
+    var caps = emuCaps();
+    caps.memory = .discrete;
+    emu = gpu.EmuDevice.init(caps, &emu_mem, &emu_work);
+    emu.shadow = &emu_shadow;
+    emu.vram = &emu_vram;
+    eng_emu.init(.{ .dev = emu.device(), .work = &compile_mem });
+    try std.testing.expect(eng_emu.onGpu() and eng_emu.vram_images);
+    try scenario(&eng_emu, &out_emu);
+    try check(&out_emu);
+    try std.testing.expectEqualSlices(u8, &want.win, &out_emu.win);
+    try std.testing.expectEqualSlices(u8, &want.tex, &out_emu.tex);
+    try std.testing.expectEqualSlices(u32, &want.depth, &out_emu.depth);
+    // (the texture and the depth image in VRAM, moved between it and
+    // their shadows by gfx_words; the windows' buffers in system memory)
+    try std.testing.expect(eng_emu.stats.vram_copies > 0);
+    eng_emu.deinit();
+}
+
 // ── The emulated Adreno, through Galaxy's calls ───────────────────────────
 
 var a_arena: [16 << 20]u8 align(4096) = undefined;
