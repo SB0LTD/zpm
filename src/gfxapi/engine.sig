@@ -184,11 +184,46 @@ pub const Image = struct {
     /// side in its row (sample s of pixel x at x * samples + s), so a row
     /// is width * samples pixels' bytes; `width` counts pixels
     samples: u8 = 1,
+    /// A depth-stencil image (d24s8) in the RTX 3D engine's float form
+    /// (Engine.newDepthImage with Config.depth_float): its depth 32-bit
+    /// floats (ZF32: the window depth clamped to 0..1, its bits; +0 for
+    /// -0), block linear in Turing2D's GOBs as `layout` says, and its
+    /// stencil a byte plane of its own (S8) from byte `s8_at`: block
+    /// linear in Blackwell's 8-bit GOBs, s8Pitch() bytes across, the
+    /// depth's block height. The compute raster (raster.R_D_FLOAT,
+    /// R_S_BYTE), fills, reads and the 3D engine (ZF32_X24S8 with
+    /// STENCIL_IS_SEPARATE) all take it in place, so a depth buffer's
+    /// draws need not move between layouts.
+    depth_float: bool = false,
+    s8_at: u32 = 0,
+    /// A GL render target moved back to rows (Engine.toRows: an op that
+    /// takes rows alone met it): never made block linear again, so no
+    /// image goes back and forth between layouts.
+    no_block: bool = false,
+
+    /// A float depth image's stencil plane: bytes across (whole 8-bit
+    /// GOBs: nvidia gl3d.stencilPitch).
+    pub fn s8Pitch(img: *const Image) u32 {
+        return std.mem.alignForward(u32, img.width, 64);
+    }
+
+    /// A float depth image's stencil plane's layout.
+    pub fn s8Layout(img: *const Image) blocklinear.Layout {
+        return .{ .block = true, .swizzle = .blackwell8, .gobs_log2 = img.layout.gobs_log2 };
+    }
 
     /// Whether the engine may draw into, copy, read back or mipmap it: a
     /// renderable format, laid out pitch linear.
     pub fn drawable(img: *const Image) bool {
         return img.format.renderable() and img.layout.linear();
+    }
+
+    /// A colour target the GPU's draws write: rows, or block linear with
+    /// 32-bit texels in Turing2D's GOBs (Engine.newBlockImage: the compute
+    /// raster and the RTX's 3D engine both draw into it). GL's other paths
+    /// (copies, blits, completeness) still take `drawable`, rows alone.
+    pub fn gpuDrawable(img: *const Image) bool {
+        return img.format.renderable() and (img.layout.linear() or (img.layout.swizzle == .turing2d and img.format.bytes() == 4));
     }
 
     pub fn levelWidth(img: *const Image, l: u32) u32 {
@@ -414,10 +449,14 @@ fn fillKernel(s: kir.Storage, masked: bool) kir.Kernel {
     k.ifp(r(k.cmp(.u32, .lt, r(x), r(w))));
     const row = k.op2(.iadd, .u32, r(y0), r(k.gid(1)));
     const xb = k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(x0), r(x))), r(bpp));
-    // (param 7: block linear, 1 + log2 of a block's GOBs; 0 pitch linear)
+    // (param 7: block linear, 1 + log2 of a block's GOBs, the swizzle from
+    // bit 8 (raster.colourBlWord); 0 pitch linear. param 8: the plane's
+    // first byte in the binding: a float depth image's S8 plane)
     const bl = k.param(.u32, 7);
-    const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(bl), u(1))), u(1));
-    const off = k.sel(.u32, r(k.cmp(.u32, .ne, r(bl), u(0))), r(blocklinear.address(&k, r(stride), r(gobs), u(0), r(xb), r(row))), r(k.op2(.iadd, .u32, r(k.op2(.imul, .u32, r(row), r(stride))), r(xb))));
+    const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(k.op2(.@"and", .u32, r(bl), u(0xff))), u(1))), u(1));
+    const swz = k.op2(.shr, .u32, r(bl), u(8));
+    const at = k.sel(.u32, r(k.cmp(.u32, .ne, r(bl), u(0))), r(blocklinear.address(&k, r(stride), r(gobs), r(swz), r(xb), r(row))), r(k.op2(.iadd, .u32, r(k.op2(.imul, .u32, r(row), r(stride))), r(xb))));
+    const off = k.op2(.iadd, .u32, r(at), r(k.param(.u32, 8)));
     var v = value;
     if (masked) {
         const keep = k.param(.u32, 5);
@@ -440,6 +479,35 @@ fn fillKernel(s: kir.Storage, masked: bool) kir.Kernel {
 ///   6 dstep (i32), 7 dstride (bytes), 8 w, 9 keep, 10 ~keep, 11 bits set
 ///   in every pixel (an opaque alpha, from an image without one), 12 the
 ///   source's bytes a pixel, 13 the destination's.
+/// Byte `xb` of memory row `row` of an image `stride` bytes a row, laid
+/// out as layout word `blw` says (raster.colourBlWord: 0 rows, else block
+/// linear with its block height): Turing2D's GOBs alone, the 32-bit
+/// colour images' (GL's render targets made block linear: Engine.promote
+/// and newBlockImage), in fewer instructions than blocklinear.address's
+/// every swizzle (the blit kernel computes five). The ops that use it
+/// take other block-linear images on the CPU (copyable).
+fn layoutAt(k: *kir.Kernel, blw: kir.V, stride: kir.V, xb: kir.V, row: kir.V) kir.V {
+    const linear = k.op3(.imad, .u32, r(row), r(stride), r(xb));
+    const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(k.op2(.@"and", .u32, r(blw), u(0xff))), u(1))), u(1));
+    const by = k.op2(.shr, .u32, r(row), r(k.op2(.iadd, .u32, r(gobs), u(3))));
+    const block = k.op3(.imad, .u32, r(by), r(k.op2(.shr, .u32, r(stride), u(6))), r(k.op2(.shr, .u32, r(xb), u(6))));
+    const gob = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(row), u(3))), r(k.op2(.isub, .u32, r(k.op2(.shl, .u32, u(1), r(gobs))), u(1))));
+    const base = k.op2(.@"or", .u32, r(k.op2(.shl, .u32, r(block), r(k.op2(.iadd, .u32, r(gobs), u(9))))), r(k.op2(.shl, .u32, r(gob), u(9))));
+    // (x/32)*256 + (y/4)*128 + ((x%32)/16)*64 + (y%4)*16 + x%16
+    var t = k.op2(.shl, .u32, r(k.op3(.bfe, .u32, r(xb), u(5), u(1))), u(8));
+    t = k.op2(.@"or", .u32, r(t), r(k.op2(.shl, .u32, r(k.op3(.bfe, .u32, r(row), u(2), u(1))), u(7))));
+    t = k.op2(.@"or", .u32, r(t), r(k.op2(.shl, .u32, r(k.op3(.bfe, .u32, r(xb), u(4), u(1))), u(6))));
+    t = k.op2(.@"or", .u32, r(t), r(k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(row), u(3))), u(4))));
+    t = k.op2(.@"or", .u32, r(t), r(k.op2(.@"and", .u32, r(xb), u(15))));
+    return k.sel(.u32, r(k.cmp(.u32, .ne, r(blw), u(0))), r(k.op2(.iadd, .u32, r(base), r(t))), r(linear));
+}
+
+/// Whether the copy and blit kernels take img's layout (layoutAt): rows,
+/// or Turing2D's GOBs.
+fn kernelLayout(img: *const Image) bool {
+    return !img.layout.block or img.layout.swizzle == .turing2d;
+}
+
 fn copyKernel(s: kir.Storage) kir.Kernel {
     var k = kir.Kernel.init(s, "gfx_copy", .{ GROUP, 1, 1 });
     const src = k.binding();
@@ -451,8 +519,12 @@ fn copyKernel(s: kir.Storage) kir.Kernel {
     const dbpp = k.param(.u32, 13);
     const srow = k.op3(.imad, .i32, r(y), r(k.param(.i32, 2)), r(k.param(.i32, 1)));
     const drow = k.op3(.imad, .i32, r(y), r(k.param(.i32, 6)), r(k.param(.i32, 5)));
-    const sat = k.op3(.imad, .u32, r(srow), r(k.param(.u32, 3)), r(k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(k.param(.u32, 0)), r(x))), r(sbpp))));
-    const dat = k.op3(.imad, .u32, r(drow), r(k.param(.u32, 7)), r(k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(k.param(.u32, 4)), r(x))), r(dbpp))));
+    const sxb = k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(k.param(.u32, 0)), r(x))), r(sbpp));
+    const dxb = k.op2(.imul, .u32, r(k.op2(.iadd, .u32, r(k.param(.u32, 4)), r(x))), r(dbpp));
+    // (params 14, 15: each image's layout word, raster.colourBlWord: a
+    // block-linear one's pixel where its GOB puts it)
+    const sat = layoutAt(&k, k.param(.u32, 14), k.param(.u32, 3), sxb, srow);
+    const dat = layoutAt(&k, k.param(.u32, 15), k.param(.u32, 7), dxb, drow);
     const v = pixelLoad(&k, src, sbpp, sat);
     const lo = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(v), u(16))), u(0xff));
     const hi = k.op2(.@"and", .u32, r(k.op2(.shl, .u32, r(v), u(16))), u(0xff_0000));
@@ -488,7 +560,11 @@ const B_SPIX = 23; // a source pixel's bytes (its samples': bpp * samples)
 const B_SSAMPLES = 24; // the source's samples, and log2 of them, averaged (colour) or sample 0 taken
 const B_SSHIFT = 25;
 const B_SAVG = 26;
-const BLIT_PARAMS = 27;
+/// the source's and the destination's layout words (raster.colourBlWord:
+/// a block-linear colour image's pixels where its GOBs put them)
+const B_SBL = 27;
+const B_DBL = 28;
+const BLIT_PARAMS = 29;
 
 fn swapRBk(k: *kir.Kernel, v: kir.V) kir.V {
     const lo = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(v), u(16))), u(0xff));
@@ -530,7 +606,7 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
         const texel = struct {
             fn f_(kk: *kir.Kernel, b: u8, ix: kir.V, iy: kir.V, bpp: kir.V, stride: kir.V, td: kir.V, hh: kir.V, resolve: bool) kir.V {
                 const row = kk.sel(.i32, r(td), r(kk.op2(.isub, .i32, r(kk.op2(.isub, .i32, r(hh), kir.i(1))), r(iy))), r(iy));
-                const off = kk.op3(.imad, .u32, r(row), r(stride), r(kk.op2(.imul, .u32, r(ix), r(kk.param(.u32, B_SPIX)))));
+                const off = layoutAt(kk, kk.param(.u32, B_SBL), stride, kk.op2(.imul, .u32, r(ix), r(kk.param(.u32, B_SPIX))), row);
                 var v = if (resolve) resolved(kk, b, bpp, off) else pixelLoad(kk, b, bpp, off);
                 v = kk.sel(.u32, r(kk.cmp(.u32, .ne, r(kk.param(.u32, B_SSWAP)), u(0))), r(swapRBk(kk, v)), r(v));
                 return kk.op2(.@"or", .u32, r(v), r(kk.param(.u32, B_SET)));
@@ -606,7 +682,7 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
         {
             const dbpp = k.param(.u32, B_DBPP);
             const drow = k.op3(.imad, .i32, r(k.gid(1)), r(k.param(.i32, B_DSTEP)), r(k.param(.i32, B_DROW)));
-            const doff = k.op3(.imad, .u32, r(drow), r(k.param(.u32, B_DSTRIDE)), r(k.op2(.imul, .u32, r(x), r(dbpp))));
+            const doff = layoutAt(&k, k.param(.u32, B_DBL), k.param(.u32, B_DSTRIDE), k.op2(.imul, .u32, r(x), r(dbpp)), drow);
             var v = k.sel(.u32, r(k.cmp(.u32, .ne, r(k.param(.u32, B_DSWAP)), u(0))), r(swapRBk(&k, out)), r(out));
             const wmask = k.param(.u32, B_WMASK);
             const partial = k.cmp(.u32, .ne, r(wmask), u(0xffff_ffff));
@@ -772,6 +848,54 @@ fn putPixel(b: []u8, bpp: u32, v: u32) void {
     for (0..bpp) |n| b[n] = @truncate(v >> @intCast(8 * n));
 }
 
+/// A depth (0..1, clamped) as d24s8's 24 bits, rounded to nearest even
+/// (gles.sig's unorm, Mesa's _mesa_float_to_unorm).
+pub fn unorm24(x: f32) u32 {
+    const c: f64 = if (x != x) 0 else std.math.clamp(@as(f64, x), 0, 1);
+    const t = c * 16777215.0;
+    var n = @floor(t);
+    const d = t - n;
+    if (d > 0.5 or (d == 0.5 and @mod(n, 2) == 1)) n += 1;
+    return @intFromFloat(n);
+}
+
+/// A depth as a float depth image keeps it (ZF32): clamped to 0..1, its
+/// bits, +0 for -0 (nvidia emu3d.depthBits; raster.depthWord's float
+/// form). Non-negative floats order as their bits do.
+pub fn depthBits(z: f32) u32 {
+    const c = if (z != z) 0 else std.math.clamp(z, 0, 1);
+    return if (c == 0) 0 else @bitCast(c);
+}
+
+/// Byte `xb` of memory row `row` of img: rows, or where its block-linear
+/// layout puts it.
+fn byteAt(img: *const Image, xb: u32, row: u32) usize {
+    if (img.layout.block) return blocklinear.addressCpu(img.stride, img.layout.gobs_log2, img.layout.swizzle, xb, row);
+    return @as(usize, row) * img.stride + xb;
+}
+
+/// A depth-stencil image's pixel (x, y: GL's) in its CPU memory: the
+/// depth word (float bits, or 24 bits) and the stencil.
+fn depthStencilAt(img: *const Image, x: u32, y: u32) struct { bits: u32, stencil: u8 } {
+    const row = img.rowOf(y);
+    const at = if (img.layout.block) blocklinear.addressCpu(img.stride, img.layout.gobs_log2, img.layout.swizzle, x * 4, row) else @as(usize, row) * img.stride + @as(usize, x) * 4;
+    const word = std.mem.readInt(u32, img.buf.cpu[at..][0..4], .little);
+    if (!img.depth_float) return .{ .bits = word & 0x00ff_ffff, .stencil = @truncate(word >> 24) };
+    const s_at = img.s8_at + blocklinear.addressCpu(img.s8Pitch(), img.layout.gobs_log2, .blackwell8, x, row);
+    return .{ .bits = word, .stencil = img.buf.cpu[s_at] };
+}
+
+/// A float depth image's word as d24s8's 24 bits (the raster's depthWord
+/// of the same depth).
+fn floatTo24(bits: u32) u32 {
+    const z: f32 = @bitCast(bits);
+    const t: f32 = (if (z != z) 0 else std.math.clamp(z, 0, 1)) * 16777215.0;
+    var n = @floor(t);
+    const d = t - n;
+    if (d > 0.5 or (d == 0.5 and @mod(n, 2) == 1)) n += 1;
+    return @intFromFloat(n);
+}
+
 // ── The engine ─────────────────────────────────────────────────────────────
 
 pub const MAX_OPS = 256;
@@ -932,6 +1056,20 @@ pub const Config = struct {
     /// 3D engine) where a draw is one it takes; else every draw is the
     /// compute kernels'.
     graphics: bool = false,
+    /// With `graphics`: depth-stencil renderbuffers in the 3D engine's
+    /// float form (Image.depth_float: ZF32 + an S8 plane), which the
+    /// compute raster draws in place too, so depth- and stencil-tested
+    /// draws into block-linear colour go to the 3D engine. Off: packed
+    /// 24-bit depth (the engine leaves every depth draw to the compute
+    /// kernels). GALAXY_GL_ZF32=0 turns it off.
+    depth_float: bool = true,
+    /// With `graphics`: a GL colour image a depth- or stencil-tested draw
+    /// writes (an FBO's texture or renderbuffer: RGBA8, BGRA8) made block
+    /// linear once, in place (Engine.promote), so the 3D engine takes the
+    /// draw (it draws depth only beside block-linear colour). Off: GL's
+    /// colour images stay rows, such draws on the compute kernels.
+    /// GALAXY_GL_BLOCK=0 turns it off.
+    block_targets: bool = true,
 };
 
 /// A kernel the CPU ran, kept in Config.cpu_kernels: what it was built
@@ -1001,6 +1139,10 @@ pub const Stats = struct {
     /// drew (raster.stageWhyNot)
     graphics_draws: u64 = 0,
     compute_draws: u64 = 0,
+    /// GL colour images made block linear (Engine.promote), and moved back
+    /// to rows (Engine.toRows): each image at most once each way
+    promoted: u32 = 0,
+    demoted: u32 = 0,
 };
 
 pub const Engine = struct {
@@ -1030,11 +1172,17 @@ pub const Engine = struct {
     /// Draws go through the GPU's graphics pipeline where they may
     /// (Config.graphics and Caps.graphics), and what was said of it.
     graphics: bool = false,
+    /// Config.depth_float, where `graphics` is on.
+    depth_float: bool = false,
+    /// Config.block_targets, where `graphics` is on.
+    block_targets: bool = false,
     /// Draws kept on the compute kernels for now (tests: a frame split
     /// between the two rasterizers on purpose).
     compute_only: bool = false,
     said_graphics: bool = false,
     said_compute: [8][]const u8 = @splat(""),
+    said_promote: bool = false,
+    said_rows: [8][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
     work: []u8 = &.{},
     cpu_work: []u8 = &.{},
@@ -1078,7 +1226,7 @@ pub const Engine = struct {
     /// again on the CPU writes where the GPU would have, whatever a table
     /// holds since)
     const CpuOp = union(enum) {
-        fill: struct { img: Image, rect: Rect, value: u32, keep: u32 },
+        fill: struct { img: Image, rect: Rect, value: u32, keep: u32, base: u32 = 0 },
         copy: struct { src: Image, sx: u32, sy: u32, dst: Image, dx: u32, dy: u32, w: u32, h: u32 },
     };
 
@@ -1087,6 +1235,8 @@ pub const Engine = struct {
     pub fn init(e: *Engine, cfg: Config) void {
         e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
         if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
+        e.depth_float = e.graphics and cfg.depth_float;
+        e.block_targets = e.graphics and cfg.block_targets;
         for (e.slabs) |*slab| slab.* = .{};
         const d = cfg.dev orelse return;
         e.loadAll(d, cfg.compiler, cfg.work) catch |err| {
@@ -1100,8 +1250,8 @@ pub const Engine = struct {
         var loaded: usize = 0;
         errdefer for (e.progs[0..loaded]) |*p| d.unload(p);
         for (0..N_PROGS) |i| {
-            var insts: [512]kir.Inst = undefined;
-            var tys: [512]kir.Ty = undefined;
+            var insts: [768]kir.Inst = undefined;
+            var tys: [768]kir.Ty = undefined;
             const s = kir.Storage{ .insts = &insts, .tys = &tys };
             var k = switch (@as(Prog, @fromBackingInt(@intCast(i)))) {
                 .fill => fillKernel(s, false),
@@ -1261,14 +1411,124 @@ pub const Engine = struct {
     /// in bytes (whole GOBs). Both the 3D engine and the compute raster
     /// (raster.dsOffset) read and write it in place; fills of it go block
     /// linear too.
+    ///
+    /// With Config.depth_float (the default where the 3D engine draws):
+    /// the float form (Image.depth_float): the ZF32 plane, then the S8
+    /// plane on its own GOBs, the image on a page (the engine's depth and
+    /// stencil targets on 512 bytes).
     pub fn newDepthImage(e: *Engine, width: u32, height: u32) ?Image {
         if (width == 0 or height == 0) return null;
         const pitch = std.mem.alignForward(u32, width * 4, 64);
         var gobs: u3 = 0;
         while (gobs < 4 and (@as(u32, 8) << gobs) < height) gobs += 1;
         const bytes = blocklinear.planeBytes(pitch, height, gobs);
+        const layout = blocklinear.Layout{ .block = true, .swizzle = .turing2d, .gobs_log2 = gobs };
+        if (e.depth_float) {
+            const s8_bytes = blocklinear.planeBytes(std.mem.alignForward(u32, width, 64), height, gobs);
+            const m = e.allocBytes(@intCast(bytes + s8_bytes), false) orelse return null;
+            return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = layout, .depth_float = true, .s8_at = @intCast(bytes) };
+        }
         const m = e.allocBytes(@intCast(bytes), true) orelse return null;
-        return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = .{ .block = true, .swizzle = .turing2d, .gobs_log2 = gobs } };
+        return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = layout };
+    }
+
+    /// A colour image block linear from the start (32-bit texels: RGBA8,
+    /// BGRA8; Turing2D's GOBs, as the RTX's 3D engine and its texture
+    /// units take them), for a render target the GPU draws: the compute
+    /// raster writes it (raster.colourBlWord), fills, reads and texture
+    /// sampling read it in place, and the 3D engine may draw into it with
+    /// a depth target beside it (it refuses depth beside rows:
+    /// RT_LINEAR_WITH_ZETA). Null for another format or with no memory.
+    /// Not for an image an outside reader takes as rows (a window's, a
+    /// dma-buf's without a block-linear modifier).
+    pub fn newBlockImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
+        if (width == 0 or height == 0 or format.bytes() != 4 or !format.renderable()) return null;
+        // (rows on 128 bytes and the image on a page, as the 3D engine's
+        // targets must be: whole GOBs, a GOB's 512 bytes aligned)
+        const pitch = std.mem.alignForward(u32, width * 4, 128);
+        var gobs: u3 = 0;
+        while (gobs < 4 and (@as(u32, 8) << gobs) < height) gobs += 1;
+        const bytes = blocklinear.planeBytes(pitch, height, gobs);
+        const m = e.allocBytes(@intCast(bytes), false) orelse return null;
+        return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = format, .own = true, .pooled = m.pooled, .layout = .{ .block = true, .swizzle = .turing2d, .gobs_log2 = gobs } };
+    }
+
+    /// Whether `img` is a GL colour image promote() would move: the 3D
+    /// engine on with Config.block_targets, 32-bit colour in rows, made by
+    /// the engine, not shared (no EGLImage, dma-buf or texture view names
+    /// it: exported images stay rows), one level, one sample, and never
+    /// moved back to rows before.
+    pub fn promotable(e: *const Engine, img: *const Image) bool {
+        return e.block_targets and e.onGpu() and img.live() and img.format.bytes() == 4 and img.format.renderable() and
+            img.layout.linear() and !img.no_block and img.own and img.share == null and img.levels == 1 and
+            img.samples == 1 and !img.pooled and !img.depth_float;
+    }
+
+    /// A GL render target made block linear in place (Turing2D's GOBs, as
+    /// newBlockImage's), so the 3D engine may draw depth- and
+    /// stencil-tested draws into it: its pixels copied on the GPU (the copy
+    /// kernel reads and writes either layout), the old memory freed once
+    /// the batches using it are done. Once only: an image moved back to
+    /// rows (toRows) stays rows. False: not one to move (promotable), or no
+    /// GPU memory for it.
+    pub fn promote(e: *Engine, img: *Image) bool {
+        if (!e.promotable(img)) return false;
+        var blk = e.newBlockImage(img.width, img.height, img.format) orelse return false;
+        if (blk.pooled or !e.gpuUsable(img)) {
+            e.freeImage(&blk);
+            return false;
+        }
+        blk.top_down = img.top_down;
+        blk.no_alpha = img.no_alpha;
+        e.copy(img, 0, 0, &blk, 0, 0, img.width, img.height);
+        e.freeBytes(img.buf, img.pooled, img.lastBatch());
+        img.buf = blk.buf;
+        img.stride = blk.stride;
+        img.layout = blk.layout;
+        img.track = blk.track;
+        e.stats.promoted += 1;
+        if (!e.said_promote) {
+            e.said_promote = true;
+            report.say(.pipeline, "GL render targets of depth- and stencil-tested draws made block linear (once each, in place): the 3D engine draws them with a float depth image (GALAXY_GL_BLOCK=0: rows)", .{});
+        }
+        return true;
+    }
+
+    /// A block-linear GL colour image back to rows, in place, for an op
+    /// that takes rows alone (`why`: said once a reason): its pixels
+    /// copied, and marked never to be made block linear again (no image
+    /// moves between layouts frame after frame). True when it is rows
+    /// (already, or now); false: no memory to move it.
+    pub fn toRows(e: *Engine, img: *Image, why: []const u8) bool {
+        if (!img.layout.block or !img.format.renderable() or img.depth_float) return true;
+        // (memory others name too: an imported block-linear dma-buf; its
+        // readers take its layout from the modifier)
+        if (img.share != null) return false;
+        var rows = e.allocImage(img.width, img.height, img.format, true) orelse return false;
+        rows.top_down = img.top_down;
+        rows.no_alpha = img.no_alpha;
+        e.copy(img, 0, 0, &rows, 0, 0, img.width, img.height);
+        e.freeBytes(img.buf, img.pooled, img.lastBatch());
+        img.buf = rows.buf;
+        img.stride = rows.stride;
+        img.pooled = rows.pooled;
+        img.layout = .{};
+        img.track = rows.track;
+        img.no_block = true;
+        e.stats.demoted += 1;
+        e.sayRows(why);
+        return true;
+    }
+
+    fn sayRows(e: *Engine, why: []const u8) void {
+        for (&e.said_rows) |*s| {
+            if (s.len != 0 and s.ptr == why.ptr) return;
+            if (s.len == 0) {
+                s.* = why;
+                report.say(.pipeline, "a block-linear render target moved back to rows, once and for good: {s}", .{why});
+                return;
+            }
+        }
     }
 
     /// Exported images need a whole backing buffer for the dma-buf.
@@ -1308,6 +1568,8 @@ pub const Engine = struct {
     /// CPU pool moves first, its bytes copied. False: no GPU buffer for it.
     pub fn shareOwn(e: *Engine, img: *Image, sh: *Shared) bool {
         std.debug.assert(img.share == null and img.own);
+        // (a dma-buf's readers take rows: exported images stay rows)
+        if (img.layout.block and img.format.renderable() and !e.toRows(img, "exported (an EGLImage of a GL texture)")) return false;
         if (img.pooled or e.slabOf(img.buf) != null) {
             const n = img.buf.cpu.len;
             const m = e.allocBytes(n, false) orelse return false;
@@ -1357,6 +1619,7 @@ pub const Engine = struct {
     }
 
     pub fn mipmapLayers(e: *Engine, img: *Image, base: u32, last: u32, base_layers: u32, volume: bool) bool {
+        if (img.layout.block and img.format.renderable() and !e.toRows(img, "glGenerateMipmap")) return false;
         var layers = base_layers;
         var l = base;
         while (l < last) : (l += 1) {
@@ -2033,6 +2296,37 @@ pub const Engine = struct {
             e.sayCompute(why);
             return null;
         }
+        // (the engine refuses a depth target beside a colour target of rows
+        // of bytes: its data error RT_LINEAR_WITH_ZETA, the channel lost to
+        // Xid 69: the Legion's drawtest, pc-all. A depth or stencil draw
+        // goes to it only into block-linear colour (GL's render targets the
+        // GPU draws: Engine.newBlockImage), with its depth in the float form
+        // the compute raster shares (ZF32 + S8: Image.depth_float); Z24's
+        // GOBs are the engine's alone, so a packed depth image's draws stay
+        // on the compute kernels, each depth buffer on one path)
+        const zimg = d.depth orelse d.stencil;
+        if (zimg) |z| {
+            if (!d.color.layout.block) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("a depth or stencil image beside a colour image of rows (the 3D engine draws depth only into block-linear colour: RT_LINEAR_WITH_ZETA)");
+                return null;
+            }
+            if (!z.depth_float) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("a packed 24-bit depth image (Config.depth_float off, or not a renderbuffer the engine made): the engine's Z24 GOBs are not the compute raster's");
+                return null;
+            }
+            if (z.buf.gpu % 512 != 0) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("a depth image not on a GOB (512 bytes)");
+                return null;
+            }
+        }
+        if (d.color.layout.block and (d.color.layout.swizzle != .turing2d or d.color.format.bytes() != 4)) {
+            e.stats.compute_draws += 1;
+            e.sayCompute("a block-linear colour image of 8- or 16-bit texels (Blackwell's GOBs for them: not given to the 3D engine yet)");
+            return null;
+        }
         const p = @constCast(d.pipe);
         if (!e.loadGraphics(p)) {
             e.sayCompute("its program did not compile for the 3D engine");
@@ -2069,8 +2363,11 @@ pub const Engine = struct {
         const H: f32 = @floatFromInt(t.height);
         const flip = t.top_down;
         const rc = d.rect;
-        if (d.depth) |z| {
+        if (zimg) |z| {
             if (!e.gpuUsable(z)) return null;
+        }
+        if (d.stencil) |st| {
+            if (!e.gpuUsable(st) or !st.depth_float or st.buf.gpu % 512 != 0) return null;
         }
         // the colour targets past the first: each the output the code
         // writes into it (one it never writes: the compute kernels give it
@@ -2091,6 +2388,11 @@ pub const Engine = struct {
                 e.sayCompute("a target whose address or rows are not on 128 bytes");
                 return null;
             }
+            if (x.img.layout.block != t.layout.block or (x.img.layout.block and x.img.format.bytes() != 4)) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("colour targets of both layouts (rows and block linear) in one draw");
+                return null;
+            }
             more[j] = .{ .va = x.img.buf.gpu, .stride = x.img.stride, .format = targetFormatOf(x.img.format), .mask = maskOf(x.img.format, x.keep), .blend = x.blend };
             more_imgs[j] = x.img;
         }
@@ -2106,8 +2408,13 @@ pub const Engine = struct {
         const g = gpu.Graphics{
             .more = more,
             .index = index,
-            .depth = if (d.depth) |z| .{
+            .gobs_log2 = if (t.layout.block) t.layout.gobs_log2 else null,
+            .depth = if (zimg) |z| .{
                 .va = z.buf.gpu,
+                // (ZF32, and for a stencil test ZF32_X24S8 with the S8
+                // plane: STENCIL_IS_SEPARATE)
+                .float = true,
+                .stencil_va = if (d.stencil) |st| st.buf.gpu + st.s8_at else null,
                 .width = z.width,
                 .height = z.height,
                 .gobs_log2 = z.layout.gobs_log2,
@@ -2141,7 +2448,12 @@ pub const Engine = struct {
             .cull = d.cull,
             .front_ccw = d.front_ccw != flip,
         };
-        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, d.depth, &more_imgs);
+        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, zimg, &more_imgs);
+        // (a stencil image apart from the depth image: its S8 plane written)
+        if (d.stencil) |st| if (st != zimg) {
+            st.trk().last = e.batch;
+            st.trk().gpu_wrote = true;
+        };
         e.stats.graphics_draws += 1;
         if (!e.said_graphics) {
             e.said_graphics = true;
@@ -2502,8 +2814,10 @@ pub const Engine = struct {
     pub fn blit(e: *Engine, src: *Image, dst: *Image, b: Blit) bool {
         const a = b.rect.meet(dst.bounds());
         if (a.empty()) return true;
-        // (a block-linear depth image: not blitted yet)
-        if (src.layout.block or dst.layout.block) {
+        // (a block-linear colour image: its pixels where its GOBs put them,
+        // B_SBL / B_DBL; a block-linear depth image (the 3D engine's, a
+        // float one's S8 plane): not blitted yet)
+        if ((src.layout.block and !src.format.renderable()) or (dst.layout.block and !dst.format.renderable()) or src.depth_float or dst.depth_float or !kernelLayout(src) or !kernelLayout(dst)) {
             report.say(.pipeline, "a blit of a block-linear depth image (the 3D engine's): not done", .{});
             return false;
         }
@@ -2537,6 +2851,8 @@ pub const Engine = struct {
         p[B_SSAMPLES] = src.samples;
         p[B_SSHIFT] = std.math.log2_int(u32, src.samples);
         p[B_SAVG] = @intFromBool(color);
+        p[B_SBL] = raster.colourBlWord(src);
+        p[B_DBL] = raster.colourBlWord(dst);
         const groups = [3]u32{ divUp(a.width(), GROUP), a.height(), 1 };
         const regs = [_]Region{rowsOf(dst, a.y0, a.y1)};
         var checking = false;
@@ -2580,17 +2896,55 @@ pub const Engine = struct {
         return e.blit(src, dst, .{ .rect = rect, .dx0 = x0, .sx0 = @floatFromInt(x0), .scale_x = 1, .dy0 = y0, .sy0 = @floatFromInt(y0), .scale_y = 1 });
     }
 
+    /// A depth-stencil image's pixels as d24s8's words say (depth in the
+    /// low 24 bits, stencil in the top 8; a float depth image's planes
+    /// given each its part: fillDepth).
     pub fn fill(e: *Engine, img: *Image, rect: Rect, value: u32, keep: u32) void {
+        if (img.depth_float) {
+            const depth: ?f32 = if (keep & 0x00ff_ffff != 0x00ff_ffff) @as(f32, @floatFromInt(value & 0x00ff_ffff)) / 16777215.0 else null;
+            return e.fillDepth(img, rect, depth, @truncate(value >> 24), @truncate(~keep >> 24));
+        }
+        e.fillPlane(img, rect, value, keep, img.*, 0);
+    }
+
+    /// A depth clear of a depth-stencil image: `depth` (0..1) where not
+    /// null, the stencil's `smask` bits from `stencil`. A float depth
+    /// image (Image.depth_float) gets the depth's float bits in its ZF32
+    /// plane and the stencil in its S8 plane, each a fill of its own; a
+    /// packed one its d24s8 words.
+    pub fn fillDepth(e: *Engine, img: *Image, rect: Rect, depth: ?f32, stencil: u8, smask: u8) void {
+        if (!img.depth_float) {
+            var value: u32 = @as(u32, stencil & smask) << 24;
+            var written: u32 = @as(u32, smask) << 24;
+            if (depth) |z| {
+                value |= unorm24(z);
+                written |= 0x00ff_ffff;
+            }
+            return e.fillPlane(img, rect, value, ~written, img.*, 0);
+        }
+        if (depth) |z| e.fillPlane(img, rect, depthBits(z), 0, img.*, 0);
+        if (smask != 0) {
+            var s8 = img.*;
+            s8.format = .r8;
+            s8.stride = img.s8Pitch();
+            s8.layout = img.s8Layout();
+            e.fillPlane(img, rect, stencil & smask, ~@as(u32, smask) & 0xff, s8, img.s8_at);
+        }
+    }
+
+    /// Pixels of `rect` of `plane` (img's memory as one plane of it: img
+    /// itself, or a float depth image's S8 plane from byte `base`).
+    fn fillPlane(e: *Engine, img: *Image, rect: Rect, value: u32, keep: u32, plane: Image, base: u32) void {
         const a0 = rect.meet(img.bounds());
         if (a0.empty() or keep == 0xffff_ffff) return;
         // (multisampled: every sample of the pixels, the row's samples side
         // by side)
         const ns = img.samples;
         const a = Rect{ .x0 = a0.x0 * ns, .y0 = a0.y0, .x1 = a0.x1 * ns, .y1 = a0.y1 };
-        var flat = img.*;
+        var flat = plane;
         flat.width *= ns;
         flat.samples = 1;
-        const op = CpuOp{ .fill = .{ .img = flat, .rect = a, .value = value & ~keep, .keep = keep } };
+        const op = CpuOp{ .fill = .{ .img = flat, .rect = a, .value = value & ~keep, .keep = keep, .base = base } };
         if (!e.gpuUsable(img)) {
             e.settle(img);
             return e.cpuDo(op);
@@ -2598,7 +2952,7 @@ pub const Engine = struct {
         // (memory rows: a top-down image's GL rows are flipped)
         const y0 = if (img.top_down) img.height - a.y1 else a.y0;
         const groups = [3]u32{ std.math.divCeil(u32, a.width(), GROUP) catch unreachable, a.height(), 1 };
-        const p = [_]u32{ a.x0, y0, a.width(), img.stride, value & ~keep, keep, img.format.bytes(), raster.blWord(img) };
+        const p = [_]u32{ a.x0, y0, a.width(), plane.stride, value & ~keep, keep, plane.format.bytes(), raster.colourBlWord(&plane), base };
         const prog: Prog = if (keep == 0) .fill else .fill_masked;
         const regs = [_]Region{rowsOf(img, a.y0, a.y1)};
         const checking = e.checkFirst(prog, @as(u64, a.width()) * a.height(), &regs);
@@ -2639,7 +2993,7 @@ pub const Engine = struct {
         fs.samples = 1;
         fd.samples = 1;
         const op = CpuOp{ .copy = .{ .src = fs, .sx = sx, .sy = sy, .dst = fd, .dx = dx, .dy = dy, .w = w, .h = h } };
-        if (!e.gpuUsable(src) or !e.gpuUsable(dst)) {
+        if (!e.gpuUsable(src) or !e.gpuUsable(dst) or !kernelLayout(src) or !kernelLayout(dst)) {
             e.settle(src);
             e.settle(dst);
             return e.cpuDo(op);
@@ -2649,7 +3003,7 @@ pub const Engine = struct {
         const d0: i32 = @intCast(dst.rowOf(dy));
         const ss: i32 = if (src.top_down) -1 else 1;
         const ds: i32 = if (dst.top_down) -1 else 1;
-        const p = [_]u32{ sx, @bitCast(s0), @bitCast(ss), src.stride, dx, @bitCast(d0), @bitCast(ds), dst.stride, w, keep, ~keep, setOf(src), src.format.bytes(), dst.format.bytes() };
+        const p = [_]u32{ sx, @bitCast(s0), @bitCast(ss), src.stride, dx, @bitCast(d0), @bitCast(ds), dst.stride, w, keep, ~keep, setOf(src), src.format.bytes(), dst.format.bytes(), raster.colourBlWord(src), raster.colourBlWord(dst) };
         const regs = [_]Region{rowsOf(dst, dy, dy + h)};
         const checking = e.checkFirst(.copy, @as(u64, w) * h, &regs);
         if (!e.gpuUsable(src) or !e.gpuUsable(dst)) return e.cpuDo(op);
@@ -2665,6 +3019,7 @@ pub const Engine = struct {
     /// `src[j * src_stride ..]`, in `src_format` (converted to img's).
     pub fn write(e: *Engine, img: *Image, x: u32, y: u32, w: u32, h: u32, src: []const u8, src_stride: usize, src_format: Format) void {
         if (w == 0 or h == 0) return;
+        if (img.layout.block and img.format.renderable()) _ = e.toRows(img, "an upload into it (texSubImage)");
         e.settle(img);
         // (the same format: rows copied; rgba8 and bgra8: red and blue swapped)
         const bpp: usize = img.format.bytes();
@@ -2704,6 +3059,36 @@ pub const Engine = struct {
         // (opaque: an image without alpha, or one of fewer channels read
         // as RGBA; read as itself, its bytes alone are kept)
         const set: u32 = if (img.format.renderable() and (setOf(img) != 0 or img.format.channels() < 4)) 0xff00_0000 else 0;
+        if (img.depth_float) {
+            // (a float depth image read as d24s8's words: the depth as its
+            // 24 bits, the stencil from its plane; readDepthBits: the
+            // floats themselves)
+            if (img.gpuWrote()) e.fromDevice(img, 0, img.buf.cpu.len);
+            for (0..h) |j| {
+                const d = dst[j * dst_stride ..][0 .. @as(usize, w) * db];
+                for (0..w) |i| {
+                    const zs = depthStencilAt(img, x + @as(u32, @intCast(i)), y + @as(u32, @intCast(j)));
+                    putPixel(d[i * db ..], db, floatTo24(zs.bits) | @as(u32, zs.stencil) << 24);
+                }
+            }
+            e.stats.cpu_ops += 1;
+            return;
+        }
+        if (img.layout.block) {
+            // (block linear: each pixel where its GOB puts it)
+            if (img.gpuWrote()) e.fromDevice(img, 0, img.buf.cpu.len);
+            for (0..h) |j| {
+                const row = img.rowOf(y + @as(u32, @intCast(j)));
+                const d = dst[j * dst_stride ..][0 .. @as(usize, w) * db];
+                for (0..w) |i| {
+                    const at = blocklinear.addressCpu(img.stride, img.layout.gobs_log2, img.layout.swizzle, (x + @as(u32, @intCast(i))) * sb, row);
+                    const v = getPixel(img.buf.cpu[at..], sb) | set;
+                    putPixel(d[i * db ..], db, if (swap) swapRB(v) else v);
+                }
+            }
+            e.stats.cpu_ops += 1;
+            return;
+        }
         for (0..h) |j| {
             const row = img.rowOf(y + @as(u32, @intCast(j)));
             const off = @as(usize, row) * img.stride + @as(usize, x) * sb;
@@ -2727,10 +3112,27 @@ pub const Engine = struct {
         e.stats.cpu_ops += 1;
     }
 
+    /// A depth-stencil image's depth words of a rectangle (GL's
+    /// coordinates), row by row into `out` (w a row): a float depth
+    /// image's float bits, a packed one's 24 bits; and the stencil bytes
+    /// into `stencil` when given.
+    pub fn readDepthBits(e: *Engine, img: *Image, x: u32, y: u32, w: u32, h: u32, out: []u32, stencil: ?[]u8) void {
+        e.settle(img);
+        if (img.gpuWrote()) e.fromDevice(img, 0, img.buf.cpu.len);
+        for (0..h) |j| {
+            for (0..w) |i| {
+                const zs = depthStencilAt(img, x + @as(u32, @intCast(i)), y + @as(u32, @intCast(j)));
+                out[j * w + i] = zs.bits;
+                if (stencil) |s| s[j * w + i] = zs.stencil;
+            }
+        }
+    }
+
     /// img's bytes [off, off + len) for the CPU, once no batch in flight
     /// uses img (fetched, if the GPU wrote it). After the CPU writes into
     /// it: `wrote`.
     pub fn hostView(e: *Engine, img: *Image, off: usize, len: usize) []u8 {
+        e.rowsForCpu(img);
         e.settle(img);
         if (img.gpuWrote()) e.fromDevice(img, off, len);
         return img.buf.cpu[off..][0..len];
@@ -2739,8 +3141,17 @@ pub const Engine = struct {
     /// The same at once, whatever batches in flight use img (GL's
     /// MAP_UNSYNCHRONIZED_BIT: the caller keeps off what they use).
     pub fn hostViewNow(e: *Engine, img: *Image, off: usize, len: usize) []u8 {
+        e.rowsForCpu(img);
         if (img.gpuWrote()) e.fromDevice(img, off, len);
         return img.buf.cpu[off..][0..len];
+    }
+
+    /// A render target made block linear (promote) back to rows before
+    /// the CPU takes its bytes as rows (hostView's callers: GL's texture
+    /// re-specification, CopyImageSubData's CPU form, ...).
+    fn rowsForCpu(e: *Engine, img: *Image) void {
+        if (img.layout.block and img.format.renderable() and img.format.bytes() == 4 and img.share == null and !img.depth_float)
+            _ = e.toRows(img, "the CPU took its bytes as rows (a texture re-specified or copied by the CPU)");
     }
 
     /// Whether a batch not known done uses img.
@@ -2808,16 +3219,16 @@ pub const Engine = struct {
                 const img = &f.img;
                 const bpp = img.format.bytes();
                 if (img.layout.block) {
-                    // (a block-linear depth image: pixel by pixel; its words
-                    // where the layout puts them)
+                    // (a block-linear image or plane: pixel by pixel; each
+                    // where the layout puts it, from the plane's first byte)
                     if (img.gpuWrote()) e.fromDevice(img, 0, img.buf.cpu.len);
                     var yy = f.rect.y0;
                     while (yy < f.rect.y1) : (yy += 1) {
                         var xx = f.rect.x0;
                         while (xx < f.rect.x1) : (xx += 1) {
-                            const at = blocklinear.addressCpu(img.stride, img.layout.gobs_log2, img.layout.swizzle, xx * 4, img.rowOf(yy));
-                            const w = &img.words()[at / 4];
-                            w.* = (w.* & f.keep) | f.value;
+                            const at = f.base + blocklinear.addressCpu(img.stride, img.layout.gobs_log2, img.layout.swizzle, xx * bpp, img.rowOf(yy));
+                            const px = img.buf.cpu[at..];
+                            putPixel(px, bpp, (getPixel(px, bpp) & f.keep) | f.value);
                         }
                     }
                     e.toDevice(img, 0, img.buf.cpu.len);
@@ -2825,7 +3236,7 @@ pub const Engine = struct {
                 }
                 var y = f.rect.y0;
                 while (y < f.rect.y1) : (y += 1) {
-                    const off = @as(usize, img.rowOf(y)) * img.stride + @as(usize, f.rect.x0) * bpp;
+                    const off = f.base + @as(usize, img.rowOf(y)) * img.stride + @as(usize, f.rect.x0) * bpp;
                     const len = @as(usize, f.rect.width()) * bpp;
                     // (the GPU's writes first, the CPU's after: a lost GPU
                     // leaves its memory as it was)
@@ -2848,6 +3259,26 @@ pub const Engine = struct {
                 const set = setOf(&c.src);
                 const sb = c.src.format.bytes();
                 const db = c.dst.format.bytes();
+                if (c.src.layout.block or c.dst.layout.block) {
+                    // (block linear on either side: pixel by pixel, each
+                    // where its layout puts it)
+                    if (c.src.gpuWrote()) e.fromDevice(&c.src, 0, c.src.buf.cpu.len);
+                    if (c.dst.gpuWrote()) e.fromDevice(&c.dst, 0, c.dst.buf.cpu.len);
+                    for (0..c.h) |j| {
+                        const jj: u32 = @intCast(j);
+                        const sr = c.src.rowOf(c.sy + jj);
+                        const dr = c.dst.rowOf(c.dy + jj);
+                        for (0..c.w) |i| {
+                            const ii: u32 = @intCast(i);
+                            const so = byteAt(&c.src, (c.sx + ii) * sb, sr);
+                            const do_ = byteAt(&c.dst, (c.dx + ii) * db, dr);
+                            const v = getPixel(c.src.buf.cpu[so..], sb) | set;
+                            putPixel(c.dst.buf.cpu[do_..], db, if (swap) swapRB(v) else v);
+                        }
+                    }
+                    e.toDevice(&c.dst, 0, c.dst.buf.cpu.len);
+                    return;
+                }
                 for (0..c.h) |j| {
                     const jj: u32 = @intCast(j);
                     const so = @as(usize, c.src.rowOf(c.sy + jj)) * c.src.stride + @as(usize, c.sx) * sb;

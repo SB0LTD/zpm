@@ -1710,7 +1710,7 @@ pub const Context = struct {
                 const layer = if (face != null) 0 else a.layer;
                 if (!mip.img.live() or layer >= mip.layers) return .{ .img = null, .ok = false };
                 const ok = switch (want) {
-                    .color => mip.img.drawable() and renderableInternal(mip.internal) and !mip.srgb,
+                    .color => mip.img.gpuDrawable() and renderableInternal(mip.internal) and !mip.srgb,
                     .depth => hasDepth(mip.internal),
                     .stencil => hasStencil(mip.internal),
                 };
@@ -1722,7 +1722,7 @@ pub const Context = struct {
                 const rb = c.rbOf(a.name) orelse return .{ .img = null, .ok = false };
                 if (!rb.img.live()) return .{ .img = null, .ok = false };
                 const ok = switch (want) {
-                    .color => rb.img.drawable(),
+                    .color => rb.img.gpuDrawable(),
                     .depth => hasDepth(rb.internal),
                     .stencil => hasStencil(rb.internal),
                 };
@@ -1874,12 +1874,20 @@ pub const Context = struct {
         const simg = if (stencil and smask != 0) v.stencil else null;
         const dval = unorm(clamp01(d), 24);
         const sval = (@as(u32, @bitCast(s)) & 0xff) << 24;
+        const sbyte: u8 = @truncate(@as(u32, @bitCast(s)));
         if (dimg != null and simg != null and dimg.? == simg.?) {
+            // (a float depth image: its ZF32 and S8 planes, the depth's
+            // float itself, not its 24 bits)
+            if (dimg.?.depth_float) return c.eng.fillDepth(dimg.?, a, clamp01(d), sbyte, @intCast(smask));
             const write = 0x00ff_ffff | (smask << 24);
             return c.eng.fill(dimg.?, a, dval | sval, ~write);
         }
-        if (dimg) |im| c.eng.fill(im, a, dval, 0xff00_0000);
-        if (simg) |im| c.eng.fill(im, a, sval, ~(smask << 24));
+        if (dimg) |im| {
+            if (im.depth_float) c.eng.fillDepth(im, a, clamp01(d), 0, 0) else c.eng.fill(im, a, dval, 0xff00_0000);
+        }
+        if (simg) |im| {
+            if (im.depth_float) c.eng.fillDepth(im, a, null, sbyte, @intCast(smask)) else c.eng.fill(im, a, sval, ~(smask << 24));
+        }
     }
 
     /// glClearBufferfv: COLOR (buffer: a draw buffer) or DEPTH (0).
@@ -2472,7 +2480,9 @@ pub const Context = struct {
         const l: u32 = @intCast(level);
         const mip = c.textureLevel(t, l) orelse return c.fail(g.INVALID_OPERATION);
         if (!mip.img.live() or @as(i64, x) + w > mip.img.levelWidth(mip.level) or @as(i64, y) + h > mip.img.levelHeight(mip.level)) return c.fail(g.INVALID_VALUE);
-        // (a block-linear EGLImage is only sampled)
+        // (a render target made block linear: rows again, once and for
+        // good (Engine.toRows); a block-linear EGLImage is only sampled)
+        if (mip.img.layout.block and mip.img.share == null) _ = c.eng.toRows(mip.img, "an upload into it (texSubImage)");
         if (!mip.img.layout.linear()) return c.fail(g.INVALID_OPERATION);
         const up = texfmt.subUpload(mip.img.format, format, ty) orelse return c.fail(if (texfmt.known(format, ty)) g.INVALID_OPERATION else g.INVALID_ENUM);
         if (w == 0 or h == 0) return;
@@ -2688,6 +2698,9 @@ pub const Context = struct {
         }
         if (!t.img.live()) return c.fail(g.INVALID_OPERATION);
         if (base >= engine.MAX_LEVELS or t.defined & (@as(u16, 1) << @intCast(base)) == 0) return c.fail(g.INVALID_OPERATION);
+        // (a render target made block linear: rows again, once and for
+        // good, for the mipmap kernel and the chain's copies)
+        if (t.img.layout.block and !c.eng.toRows(&t.img, "glGenerateMipmap")) return c.fail(g.OUT_OF_MEMORY);
         if (!t.img.drawable()) return c.fail(g.INVALID_OPERATION);
         const full = fullLevels(&t.img);
         var last: u32 = @min(full - 1, @as(u32, @intCast(@max(t.params.max_level, 0))));
@@ -3289,7 +3302,9 @@ pub const Context = struct {
         if (level != 0 or dx < 0 or dy < 0 or w < 0 or h < 0) return c.fail(g.INVALID_VALUE);
         if (@as(i64, dx) + w > t.img.width or @as(i64, dy) + h > t.img.height) return c.fail(g.INVALID_VALUE);
         const s = c.readSource() orelse return;
-        if (!copyable(s.img.format, t.img.format) or t.srgb or !t.img.layout.linear() or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
+        // (the copy kernel writes a render target made block linear in
+        // place; a block-linear EGLImage is only sampled)
+        if (!copyable(s.img.format, t.img.format) or t.srgb or (t.img.layout.block and t.img.share != null) or s.img == &t.img) return c.fail(g.INVALID_OPERATION);
         c.copyFrom(s.img, s.v, x, y, w, h, &t.img, dx, dy);
     }
 
@@ -4449,6 +4464,17 @@ pub const Context = struct {
             d.stencil = v.stencil;
             d.stencil_front = c.stencil_front.draw(c.stencil_mask);
             d.stencil_back = c.stencil_back.draw(c.stencil_back_mask);
+        }
+        // A depth- or stencil-tested draw into a framebuffer object's
+        // colour images: each made block linear once, in place
+        // (Engine.promote, Config.block_targets), so the 3D engine takes
+        // the draw beside its float depth image (it draws depth only beside
+        // block-linear colour). The window's images, exported and shared
+        // ones stay rows; an op that takes rows alone moves one back once.
+        if ((d.depth != null or d.stencil != null) and c.draw_fb != 0 and c.eng.block_targets) {
+            for (v.color) |ci| {
+                if (ci) |im| _ = c.eng.promote(im);
+            }
         }
         if (c.enabled & bitOf(g.BLEND) != 0) {
             const bc = c.blend_color;

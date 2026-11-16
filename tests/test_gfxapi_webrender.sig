@@ -539,7 +539,10 @@ fn run3d(pipe: *raster.Pipeline, uniforms: []const u32, nslots: usize, seed: u64
     }
     const before = e.stats.graphics_draws;
     for (engines, 0..) |x, i| {
-        var d = raster.Draw{ .pipe = pipe, .color = &color[i], .depth = &depth[i], .depth_test = true, .depth_write = true, .depth_func = 0b011, .rect = .{ .x0 = 0, .y0 = 0, .x1 = 64, .y1 = 64 }, .count = 6, .instances = 3, .center = .{ 32, 32 }, .half = .{ 32, 32 }, .uniforms = uni2[i][0..nu] };
+        // (no depth: GL's colour images are rows, and the 3D engine takes a
+        // depth target only beside block-linear colour (RT_LINEAR_WITH_ZETA),
+        // so a depth-tested draw goes to the compute kernels by design)
+        var d = raster.Draw{ .pipe = pipe, .color = &color[i], .rect = .{ .x0 = 0, .y0 = 0, .x1 = 64, .y1 = 64 }, .count = 6, .instances = 3, .center = .{ 32, 32 }, .half = .{ 32, 32 }, .uniforms = uni2[i][0..nu] };
         for (0..pipe.shaders.attrs) |a| d.attrs[a] = .{ .buf = &ab[i], .offset = @intCast(a * 64), .stride = 16, .comps = 4, .divisor = @intFromBool(a % 2 == 1) };
         for (0..ntex) |j| d.textures[j] = &tex[i][j];
         if (!x.draw(&d)) return std.fmt.bufPrint(why, "the {s} engine did not draw it", .{if (i == 0) "3D" else "CPU"}) catch "?";
@@ -550,7 +553,13 @@ fn run3d(pipe: *raster.Pipeline, uniforms: []const u32, nslots: usize, seed: u64
         return std.fmt.bufPrint(why, "{s}: {s}; the 3D engine: {s}", .{ @errorName(le), Nv.dev.explain(&buf), Nv3.engine3d.why }) catch "(too long)";
     }
     if (e.lost) return std.fmt.bufPrint(why, "the engine lost the GPU ({?s}); the 3D engine: {s}", .{ if (e.why) |w| @errorName(w) else null, Nv3.engine3d.why }) catch "?";
-    if (e.stats.graphics_draws == before) return std.fmt.bufPrint(why, "drawn on the compute kernels ({?s})", .{if (e.why_pipe) |w| @errorName(w) else null}) catch "?";
+    if (e.stats.graphics_draws == before) {
+        var said: []const u8 = "";
+        for (e.said_compute) |w| if (w.len != 0) {
+            said = w;
+        };
+        return std.fmt.bufPrint(why, "drawn on the compute kernels ({?s}; {s})", .{ if (e.why_pipe) |w| @errorName(w) else null, said }) catch "?";
+    }
     // the two pictures
     e.read(&color[0], 0, 0, 64, 64, &px3d, 256, .rgba8);
     eng.read(&color[1], 0, 0, 64, 64, &pxcpu, 256, .rgba8);
