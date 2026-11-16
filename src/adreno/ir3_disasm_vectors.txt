@@ -303,3 +303,6 @@
 600 c7660002_01e1b100 ldib.b.untyped.1d.u32.4.imm.base0 r0.z, r0.y+29, 0
 600 c7a60809_16e77100 stib.b.untyped.1d.u32.4.imm.base0 r2.y, r5.z+30, 4
 600 c7a60002_01e1b100 ldib.b.untyped.1d.u32.4.imm.base0 r0.z, r0.y+30, 0
+# cat5: sam with immediate slots (the same file's a6xx vectors)
+600 a0c01f04_0cc00005 sam (f32)(xyzw)r1.x, r0.z, s#6, t#6
+600 a0c00f00_04400002 sam (f16)(xyzw)hr0.x, hr0.y, s#2, t#2

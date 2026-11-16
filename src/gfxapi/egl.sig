@@ -12,7 +12,18 @@
 //! - **Displays.** EGL_DEFAULT_DISPLAY and EGL_PLATFORM_SURFACELESS_MESA
 //!   are the surfaceless display (pbuffers, surfaceless contexts). A
 //!   wl_display (eglGetDisplay of one, or EGL_PLATFORM_WAYLAND_KHR) is a
-//!   Wayland display: window surfaces of wl_egl_windows.
+//!   Wayland display: window surfaces of wl_egl_windows. An Xlib Display
+//!   (eglGetDisplay of one, or EGL_PLATFORM_X11_KHR, whose
+//!   EGL_DEFAULT_DISPLAY is $DISPLAY) is an X11 display (x11.sig): window
+//!   surfaces of X windows, over a connection of EGL's own. The default
+//!   display, as Mesa's on X11, takes X windows too: it connects to
+//!   $DISPLAY at its first window surface (or native visual asked), so
+//!   Firefox on X11 (which asks EGL_DEFAULT_DISPLAY for everything,
+//!   window surfaces and its GPU process's offscreen contexts) draws there.
+//!   A gbm_device (gbm.sig: eglGetDisplay of one, or EGL_PLATFORM_GBM_KHR)
+//!   is a GBM display: surfaceless contexts, pbuffers, window surfaces of
+//!   gbm_surfaces, and EGL_KHR_image_pixmap's images of gbm_bos
+//!   (Xwayland's glamor).
 //! - **Configs.** Four: ARGB8888 and XRGB8888 (DRM's fourcc is the native
 //!   visual), each with and without depth 24 + stencil 8; windows and
 //!   pbuffers; OpenGL ES 2 and 3. eglChooseConfig matches and sorts as
@@ -28,22 +39,39 @@
 //!   sync_file fd, polled; owned and closed with the sync).
 //! - **Images.** EGL_KHR_image_base with EGL_EXT_image_dma_buf_import
 //!   (and _modifiers): a single-plane linear ARGB8888, XRGB8888, ABGR8888
-//!   or XBGR8888 dma-buf, imported into this context (PRIME), as GL's
-//!   textures and renderbuffers (gles: OES_EGL_image) name it, the memory
-//!   shared and freed with its last name.
+//!   or XBGR8888 dma-buf, or one plane of a video picture (R8 and GR88:
+//!   NV12's; R16 and GR1616: P010's), pitch linear or block linear with
+//!   NVIDIA's DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D modifiers (Galaxy's
+//!   VA driver exports the RTX decoder's pictures so: sampled where the
+//!   decoder wrote them, blocklinear.sig), imported into this context (PRIME),
+//!   as GL's textures and renderbuffers (gles: OES_EGL_image) name it, the
+//!   memory shared and freed with its last name. EGL_KHR_gl_texture_2D_image:
+//!   a texture's level 0 as an image, its memory moved to a buffer of its
+//!   own. EGL_MESA_image_dma_buf_export: either kind out as one linear
+//!   plane (Firefox's dma-buf surfaces: a texture made, exported, imported
+//!   by its compositor).
 //!
-//! EGL's calls take one lock (its tables are the process's); GL calls take
-//! none.
+//! - **The driver lock.** One lock for the process, the outermost: every
+//!   EGL call and every GL call (libgles.sig's entry points) holds it from
+//!   start to end. A process's contexts share the engine, its GPU device
+//!   and these tables, and an app may have contexts current on several
+//!   threads at once (Firefox: WebGL and Canvas2D on one, WebRender on
+//!   another), so their calls take turns. Re-entrant for the thread
+//!   holding it (a GL call that ends in EGL, a forwarding entry point).
+//!   program.sig's lock is taken inside it, never around it.
 //!
 //! Allocation-free: fixed tables (MAX_*), in this file's memory.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const engine = @import("engine.sig");
+const blocklinear = @import("blocklinear.sig");
 const gles = @import("gles.sig");
 const report = @import("report.sig");
 const thread = @import("thread.sig");
 const wayland = @import("wayland.sig");
+const x11 = @import("x11.sig");
+const gbm = @import("gbm.sig");
 const Host = @import("host.sig").Host;
 const Engine = engine.Engine;
 const Image = engine.Image;
@@ -113,6 +141,7 @@ pub const NON_CONFORMANT_CONFIG: i32 = 0x3051;
 
 pub const PBUFFER_BIT: i32 = 0x0001;
 pub const WINDOW_BIT: i32 = 0x0004;
+pub const STREAM_BIT_KHR: i32 = 0x0800;
 pub const OPENGL_ES_BIT: i32 = 0x0001;
 pub const OPENGL_ES2_BIT: i32 = 0x0004;
 pub const OPENGL_ES3_BIT: i32 = 0x0040;
@@ -170,6 +199,12 @@ pub const EXTENSIONS: i32 = 0x3055;
 pub const CLIENT_APIS: i32 = 0x308D;
 pub const PLATFORM_WAYLAND_KHR: u32 = 0x31D8;
 pub const PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
+pub const PLATFORM_X11_KHR: u32 = 0x31D5;
+pub const PLATFORM_X11_SCREEN_KHR: i32 = 0x31D6;
+/// EGL_PLATFORM_GBM_KHR (EGL_PLATFORM_GBM_MESA: the same number)
+pub const PLATFORM_GBM_KHR: u32 = 0x31D7;
+/// EGL_KHR_image_pixmap's target: a native pixmap (a gbm_bo here)
+pub const NATIVE_PIXMAP_KHR: u32 = 0x30B0;
 
 // syncs
 pub const SYNC_FENCE: u32 = 0x30F9;
@@ -201,10 +236,19 @@ pub const IMAGE_PRESERVED_KHR: i32 = 0x30D2;
 const MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 pub const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
 pub const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258;
-pub const dma_buf_formats = [_]u32{ wayland.DRM_FORMAT_ARGB8888, wayland.DRM_FORMAT_XRGB8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888 };
+// a video picture's planes, each imported alone (VA-API's PRIME
+// descriptors as Firefox imports them: SEPARATE_LAYERS)
+pub const DRM_FORMAT_R8: u32 = 0x2020_3852; // 'R8  '
+pub const DRM_FORMAT_GR88: u32 = 0x3838_5247; // 'GR88': R in byte 0, G in 1
+pub const DRM_FORMAT_R16: u32 = 0x2036_3152; // 'R16 '
+pub const DRM_FORMAT_GR1616: u32 = 0x3233_5247; // 'GR32': R in bytes 0..1, G in 2..3
+pub const dma_buf_formats = [_]u32{ wayland.DRM_FORMAT_ARGB8888, wayland.DRM_FORMAT_XRGB8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_R8, DRM_FORMAT_GR88, DRM_FORMAT_R16, DRM_FORMAT_GR1616 };
+// EGL_KHR_gl_texture_2D_image
+pub const GL_TEXTURE_2D_KHR: u32 = 0x30B1;
+pub const GL_TEXTURE_LEVEL_KHR: i32 = 0x30BC;
 
 pub const VERSION_STRING: [:0]const u8 = "1.5 Galaxy";
-pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_device_base EGL_EXT_device_enumeration EGL_EXT_device_query EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_wayland EGL_MESA_platform_surfaceless";
+pub const CLIENT_EXTENSIONS: [:0]const u8 = "EGL_EXT_client_extensions EGL_EXT_device_base EGL_EXT_device_enumeration EGL_EXT_device_query EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_EXT_platform_x11 EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_gbm EGL_KHR_platform_wayland EGL_KHR_platform_x11 EGL_MESA_platform_gbm EGL_MESA_platform_surfaceless";
 /// The one device's extensions (eglQueryDeviceStringEXT's EXTENSIONS).
 pub const DEVICE_EXTENSIONS: [:0]const u8 = "EGL_EXT_device_drm EGL_EXT_device_drm_render_node";
 pub const DEVICE_EXT: i32 = 0x322C;
@@ -212,7 +256,12 @@ pub const DRM_DEVICE_FILE_EXT: i32 = 0x3233;
 pub const DRM_RENDER_NODE_FILE_EXT: i32 = 0x3377;
 /// The render node every display draws through.
 pub const RENDER_NODE: [:0]const u8 = "/dev/dri/renderD128";
-pub const DISPLAY_EXTENSIONS: [:0]const u8 = "EGL_ANDROID_native_fence_sync EGL_EXT_buffer_age EGL_EXT_create_context_robustness EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers EGL_EXT_swap_buffers_with_damage EGL_KHR_create_context EGL_KHR_fence_sync EGL_KHR_get_all_proc_addresses EGL_KHR_image_base EGL_KHR_no_config_context EGL_KHR_surfaceless_context EGL_KHR_swap_buffers_with_damage EGL_KHR_wait_sync";
+const DISPLAY_COMMON = "EGL_EXT_buffer_age EGL_EXT_create_context_robustness EGL_EXT_swap_buffers_with_damage EGL_KHR_create_context EGL_KHR_fence_sync EGL_KHR_get_all_proc_addresses EGL_KHR_image_pixmap EGL_KHR_no_config_context EGL_KHR_partial_update EGL_KHR_stream EGL_KHR_stream_consumer_gltexture EGL_KHR_stream_producer_eglsurface EGL_KHR_surfaceless_context EGL_KHR_swap_buffers_with_damage EGL_KHR_wait_sync";
+const FENCE_EXTENSIONS = " EGL_ANDROID_native_fence_sync";
+const DMA_EXTENSIONS = " EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers EGL_KHR_gl_texture_2D_image EGL_KHR_image_base EGL_MESA_image_dma_buf_export";
+pub const DISPLAY_EXTENSIONS: [:0]const u8 = DISPLAY_COMMON ++ FENCE_EXTENSIONS ++ DMA_EXTENSIONS;
+const ANDROID_EXTENSIONS = " EGL_ANDROID_get_native_client_buffer EGL_ANDROID_image_native_buffer";
+const ANGLE_EXTENSIONS = " EGL_ANGLE_query_surface_pointer";
 
 pub const MAX_DISPLAYS = 8;
 pub const MAX_CONTEXTS = 32;
@@ -231,8 +280,39 @@ pub const Driver = struct {
     host: Host,
     /// libwayland-client (null: not in this process).
     wayland: *const fn () ?*const wayland.Client,
+    /// The socket calls EGL's X11 platform speaks over (null: no X11).
+    x11: ?*const fn () ?*const x11.Wire = null,
+    /// Whether EGL can import dma-bufs and exchange native fence FDs.
+    native_interop: *const fn () bool = allInterop,
+    dma_import: ?*const fn () bool = null,
+    android: ?AndroidInterop = null,
+    surface_pointer: ?*const fn (*const Surface, i32) ?SurfacePointer = null,
 };
 
+pub const SurfacePointer = struct { value: ?*anyopaque };
+
+pub const AndroidBuffer = struct {
+    fd: i32,
+    width: i32,
+    height: i32,
+    fourcc: u32,
+    pitch: i32,
+    offset: i32 = 0,
+    modifier: u64 = 0,
+};
+
+pub const AndroidInterop = struct {
+    /// Convert an AHardwareBuffer to its native client-buffer handle.
+    clientBuffer: *const fn (*const anyopaque) ?*anyopaque,
+    /// Validate and retain a client buffer, then return its dma-buf layout.
+    /// The descriptor remains borrowed until release.
+    retain: *const fn (*anyopaque) ?AndroidBuffer,
+    release: *const fn (*anyopaque) void,
+};
+
+fn allInterop() bool {
+    return true;
+}
 const root = @import("root");
 
 /// The library root's (libgalaxy_gl.sig: `egl_driver`), until a test sets
@@ -243,9 +323,16 @@ pub fn setDriver(d: Driver) void {
     driver = d;
 }
 
-// ── The lock ───────────────────────────────────────────────────────────────
+// ── The driver lock ────────────────────────────────────────────────────────
 
+/// The futex word (0 free, 1 held, 2 held with waiters).
 var lock_word = std.atomic.Value(u32).init(0);
+/// The thread holding the lock (its thread.key(), never 0), or 0. Only
+/// the holder stores its own key, and clears it before letting go: a
+/// thread that reads its own key here holds the lock.
+var lock_owner = std.atomic.Value(usize).init(0);
+/// How many times the holder has entered (only the holder touches it).
+var lock_depth: u32 = 0;
 
 /// The tables are filled at the first EGL call (under the lock): left
 /// undefined, they take no room in the library's file (its .bss), where
@@ -259,16 +346,68 @@ fn fillTables() void {
     for (&syncs) |*s| s.* = .{};
     for (&eimages) |*m| m.* = .{};
     gles.egl_image = resolveImage;
+    gles.stream_changed = signalStreams;
     tables_ready = true;
 }
 
+/// An EGL call's lock: the driver lock, and the tables at the first.
 fn lock() void {
-    take();
+    driverEnter();
     if (!tables_ready) fillTables();
 }
 
+fn unlock() void {
+    driverLeave();
+}
+
+/// The driver lock taken by the calling thread (again, if it holds it
+/// already): what every EGL and GL entry point does first. The thread is
+/// told by thread.key() (its thread pointer: one load), as a context's
+/// thread is.
+pub fn driverEnter() void {
+    const me = thread.key();
+    if (lock_owner.load(.monotonic) == me) {
+        lock_depth += 1;
+        return;
+    }
+    take();
+    lock_owner.store(me, .monotonic);
+    lock_depth = 1;
+}
+
+/// driverEnter's undone; the lock let go at the outermost.
+pub fn driverLeave() void {
+    std.debug.assert(lock_owner.load(.monotonic) == thread.key() and lock_depth != 0);
+    lock_depth -= 1;
+    if (lock_depth != 0) return;
+    lock_owner.store(0, .monotonic);
+    give();
+}
+
+/// Whether no thread holds the driver lock (a test's check).
+pub fn driverFree() bool {
+    return lock_word.load(.acquire) == 0 and lock_owner.load(.monotonic) == 0;
+}
+
+/// The driver lock let go entirely by the thread holding it, however deep,
+/// to wait for what another thread does under it (a stream's next frame);
+/// how deep it was, for driverResume.
+fn driverSuspend() u32 {
+    const depth = lock_depth;
+    lock_depth = 0;
+    lock_owner.store(0, .monotonic);
+    give();
+    return depth;
+}
+
+fn driverResume(depth: u32) void {
+    take();
+    lock_owner.store(thread.key(), .monotonic);
+    lock_depth = depth;
+}
+
 /// A futex mutex (0 free, 1 held, 2 held with waiters): once a thread has
-/// waited it takes the lock by swapping in 2, so the unlock that follows
+/// waited it takes the lock by swapping in 2, so the give that follows
 /// always wakes the next.
 fn take() void {
     if (lock_word.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
@@ -279,10 +418,23 @@ fn take() void {
     }
 }
 
-fn unlock() void {
+fn give() void {
     if (lock_word.swap(0, .release) == 2 and comptime builtin.os.tag == .linux) {
         _ = std.os.linux.syscall3(.futex, @intFromPtr(&lock_word.raw), 129, 1); // FUTEX_WAKE_PRIVATE
     }
+}
+
+/// The driver's engine for GBM (gbm.sig), opened as eglInitialize opens
+/// it: null without a GPU (the caller holds the driver lock).
+pub fn gbmEngine() ?*Engine {
+    const drv = driver orelse return null;
+    return drv.open();
+}
+
+/// The process's side of things for GBM (dma-bufs out and in, dup).
+pub fn gbmHost() ?Host {
+    const drv = driver orelse return null;
+    return drv.host;
 }
 
 // ── Errors (per thread) ────────────────────────────────────────────────────
@@ -314,6 +466,8 @@ pub fn calling(name: []const u8) void {
 }
 
 fn errorName(e: i32) []const u8 {
+    if (e == BAD_STREAM_KHR) return "BAD_STREAM_KHR";
+    if (e == BAD_STATE_KHR) return "BAD_STATE_KHR";
     const names = [_][]const u8{ "SUCCESS", "NOT_INITIALIZED", "BAD_ACCESS", "BAD_ALLOC", "BAD_ATTRIBUTE", "BAD_CONFIG", "BAD_CONTEXT", "BAD_CURRENT_SURFACE", "BAD_DISPLAY", "BAD_MATCH", "BAD_NATIVE_PIXMAP", "BAD_NATIVE_WINDOW", "BAD_PARAMETER", "BAD_SURFACE", "CONTEXT_LOST" };
     const i = e - SUCCESS;
     return if (i >= 0 and i < names.len) names[@intCast(i)] else "error";
@@ -353,7 +507,7 @@ pub const Config = struct {
             CONFIG_ID => c.id,
             CONFIG_CAVEAT, TRANSPARENT_TYPE => NONE,
             COLOR_BUFFER_TYPE => RGB_BUFFER,
-            SURFACE_TYPE => WINDOW_BIT | PBUFFER_BIT,
+            SURFACE_TYPE => WINDOW_BIT | PBUFFER_BIT | STREAM_BIT_KHR,
             RENDERABLE_TYPE, CONFORMANT => OPENGL_ES2_BIT | OPENGL_ES3_BIT,
             NATIVE_VISUAL_ID => @bitCast(if (c.alpha) wayland.DRM_FORMAT_ARGB8888 else wayland.DRM_FORMAT_XRGB8888),
             NATIVE_VISUAL_TYPE => NONE,
@@ -505,7 +659,9 @@ pub fn configOf(handle: ?*const anyopaque) ?*const Config {
 
 // ── Displays ───────────────────────────────────────────────────────────────
 
-pub const Platform = enum { surfaceless, wayland };
+/// gbm: a GBM device's (EGL_PLATFORM_GBM_KHR): surfaceless contexts,
+/// pbuffers and window surfaces of gbm_surfaces.
+pub const Platform = enum { surfaceless, wayland, x11, gbm };
 
 pub const Display = struct {
     used: bool = false,
@@ -515,7 +671,14 @@ pub const Display = struct {
     eng: ?*Engine = null,
     client: ?*const wayland.Client = null,
     wl: wayland.Display = undefined,
-    /// terminated with objects still current: the Wayland state goes with the last
+    /// the X server's connection (an X11 display's, or the default one's
+    /// once it took an X window), while x11_up
+    xc: x11.Conn = undefined,
+    x11_up: bool = false,
+    /// (the default display tried $DISPLAY once already)
+    x11_tried: bool = false,
+    /// terminated with objects still current: the Wayland (or X11) state
+    /// goes with the last
     terminating: bool = false,
 };
 
@@ -551,10 +714,39 @@ pub fn getDisplay(native: ?*anyopaque) ?*Display {
     lock();
     defer unlock();
     const n = native orelse return ok(?*Display, displayFor(.surfaceless, null));
-    const drv = driver orelse return ok(?*Display, null);
-    const c = drv.wayland() orelse return ok(?*Display, null);
-    if (!c.isDisplay(n)) return ok(?*Display, null);
-    return ok(?*Display, displayFor(.wayland, n));
+    // (a GBM device of ours, as Mesa tells one: before anything reads it
+    // as another platform's)
+    if (gbm.deviceOf(n) != null) return ok(?*Display, displayFor(.gbm, n));
+    const drv = driver orelse return failWhy(?*Display, BAD_DISPLAY, null, "no EGL driver");
+    const c = drv.wayland();
+    if (c) |wc| {
+        if (wc.isDisplay(n)) return ok(?*Display, displayFor(.wayland, n));
+    }
+    // (not a wl_display: an Xlib Display, as Mesa takes it)
+    if (x11Wire() != null and x11.isXlibDisplay(n)) return ok(?*Display, displayFor(.x11, n));
+    if (c == null) return failWhy(?*Display, BAD_DISPLAY, null, "no libwayland-client symbols, and not an Xlib Display");
+    return failWhy(?*Display, BAD_PARAMETER, null, "native display is neither a wl_display nor an Xlib Display");
+}
+
+/// The driver's X11 socket calls, if it has them.
+fn x11Wire() ?*const x11.Wire {
+    const drv = driver orelse return null;
+    const f = drv.x11 orelse return null;
+    return f();
+}
+
+/// The X server's connection of a display that takes X windows: an X11
+/// display's, or the default (surfaceless) display's, which connects to
+/// $DISPLAY at its first need (once). Null otherwise.
+fn xconn(d: *Display) ?*x11.Conn {
+    if (d.x11_up) return if (d.xc.live()) &d.xc else null;
+    if (d.platform != .surfaceless or d.x11_tried or !d.initialized) return null;
+    d.x11_tried = true;
+    const wire = x11Wire() orelse return null;
+    const name = wire.display_env(wire.ctx) orelse return null;
+    if (!d.xc.open(wire, name, null)) return null;
+    d.x11_up = true;
+    return &d.xc;
 }
 
 /// eglGetPlatformDisplay (and the EXT one).
@@ -570,6 +762,20 @@ pub fn getPlatformDisplay(platform: u32, native: ?*anyopaque) ?*Display {
             // (EGL_DEFAULT_DISPLAY would mean a connection of EGL's own: not made)
             const n = native orelse return fail(?*Display, BAD_PARAMETER, null);
             return ok(?*Display, displayFor(.wayland, n));
+        },
+        PLATFORM_X11_KHR => {
+            // (an Xlib Display, or EGL_DEFAULT_DISPLAY: $DISPLAY)
+            if (x11Wire() == null) return failWhy(?*Display, BAD_PARAMETER, null, "no X11 in this driver");
+            if (native) |n| {
+                if (!x11.isXlibDisplay(n)) return failWhy(?*Display, BAD_PARAMETER, null, "not an Xlib Display");
+            }
+            return ok(?*Display, displayFor(.x11, native));
+        },
+        PLATFORM_GBM_KHR => {
+            // (a gbm_device of this library's: gbm_create_device's)
+            const n = native orelse return failWhy(?*Display, BAD_PARAMETER, null, "EGL_PLATFORM_GBM_KHR needs a gbm_device");
+            if (gbm.deviceOf(n) == null) return failWhy(?*Display, BAD_PARAMETER, null, "not a gbm_device of this driver's");
+            return ok(?*Display, displayFor(.gbm, n));
         },
         else => return fail(?*Display, BAD_PARAMETER, null),
     }
@@ -589,6 +795,18 @@ pub fn initialize(handle: ?*anyopaque, major: ?*i32, minor: ?*i32) bool {
             if (!c.isDisplay(d.native.?)) return failWhy(bool, BAD_DISPLAY, false, "not a wl_display");
             if (!d.wl.init(c, drv.host, @ptrCast(d.native.?))) return failWhy(bool, NOT_INITIALIZED, false, "the compositor offers no dma-bufs this driver can show");
             d.client = c;
+        }
+        if (d.platform == .x11 and !d.x11_up) {
+            const wire = x11Wire() orelse return failWhy(bool, NOT_INITIALIZED, false, "no X11 in this driver");
+            var name: []const u8 = undefined;
+            var screen: ?u32 = null;
+            if (d.native) |n| {
+                const xn = x11.xlibName(n);
+                name = xn.name;
+                screen = xn.screen;
+            } else name = wire.display_env(wire.ctx) orelse return failWhy(bool, NOT_INITIALIZED, false, "DISPLAY is not set");
+            if (!d.xc.open(wire, name, screen)) return failWhy(bool, NOT_INITIALIZED, false, "no X server to show windows on");
+            d.x11_up = true;
         }
         d.terminating = false;
         d.eng = eng;
@@ -624,8 +842,11 @@ pub fn terminate(handle: ?*anyopaque) bool {
     for (&eimages) |*m| {
         if (m.alive and m.display == d) dropImage(m);
     }
+    for (&streams) |*s| {
+        if (s.display == d) dropStream(s);
+    }
     d.initialized = false;
-    d.terminating = d.platform == .wayland;
+    d.terminating = d.platform == .wayland or d.x11_up;
     reapDisplay(d);
     return ok(bool, true);
 }
@@ -639,7 +860,10 @@ fn reapDisplay(d: *Display) void {
     for (&contexts) |*c| {
         if (c.used and c.display == d) return;
     }
-    d.wl.deinit();
+    if (d.platform == .wayland) d.wl.deinit();
+    if (d.x11_up) d.xc.close();
+    d.x11_up = false;
+    d.x11_tried = false;
     d.terminating = false;
 }
 
@@ -710,15 +934,276 @@ pub fn queryString(handle: ?*anyopaque, name: i32) ?[*:0]const u8 {
         VENDOR => ok(?[*:0]const u8, "Galaxy"),
         VERSION => ok(?[*:0]const u8, VERSION_STRING.ptr),
         CLIENT_APIS => ok(?[*:0]const u8, "OpenGL_ES"),
-        EXTENSIONS => ok(?[*:0]const u8, DISPLAY_EXTENSIONS.ptr),
+        EXTENSIONS => ok(?[*:0]const u8, displayExtensions(driver.?)),
         else => fail(?[*:0]const u8, BAD_PARAMETER, null),
     };
+}
+
+fn displayExtensions(drv: Driver) [*:0]const u8 {
+    const dma = hasDmaImport(drv);
+    const mask = @as(usize, @intFromBool(drv.native_interop())) |
+        (@as(usize, @intFromBool(dma)) << 1) |
+        (@as(usize, @intFromBool(dma and drv.android != null)) << 2) |
+        (@as(usize, @intFromBool(drv.surface_pointer != null)) << 3);
+    const variants = comptime blk: {
+        var strings: [16][*:0]const u8 = undefined;
+        for (&strings, 0..) |*out, i| {
+            out.* = DISPLAY_COMMON ++ (if (i & 1 != 0) FENCE_EXTENSIONS else "") ++
+                (if (i & 2 != 0) DMA_EXTENSIONS else "") ++
+                (if (i & 4 != 0) ANDROID_EXTENSIONS else "") ++
+                (if (i & 8 != 0) ANGLE_EXTENSIONS else "");
+        }
+        break :blk strings;
+    };
+    return variants[mask];
+}
+
+fn hasDmaImport(drv: Driver) bool {
+    return (drv.dma_import orelse drv.native_interop)();
 }
 
 fn ready(handle: ?*anyopaque) ?*Display {
     const d = displayOf(handle) orelse return fail(?*Display, BAD_DISPLAY, null);
     if (!d.initialized) return fail(?*Display, NOT_INITIALIZED, null);
     return d;
+}
+
+// EGL_KHR_stream defines the stream object. Its producer and consumer are
+// supplied by separate extensions.
+const CONSUMER_LATENCY_USEC_KHR: i32 = 0x3210;
+const PRODUCER_FRAME_KHR: u32 = 0x3212;
+const CONSUMER_FRAME_KHR: u32 = 0x3213;
+const STREAM_STATE_KHR: i32 = 0x3214;
+const STREAM_STATE_CREATED_KHR: i32 = 0x3215;
+const STREAM_STATE_CONNECTING_KHR: i32 = 0x3216;
+const STREAM_STATE_EMPTY_KHR: i32 = 0x3217;
+const STREAM_STATE_NEW_FRAME_AVAILABLE_KHR: i32 = 0x3218;
+const STREAM_STATE_OLD_FRAME_AVAILABLE_KHR: i32 = 0x3219;
+const STREAM_STATE_DISCONNECTED_KHR: i32 = 0x321A;
+const BAD_STREAM_KHR: i32 = 0x321B;
+const BAD_STATE_KHR: i32 = 0x321C;
+const CONSUMER_ACQUIRE_TIMEOUT_USEC_KHR: i32 = 0x321E;
+
+pub const Stream = struct {
+    display: ?*Display = null,
+    latency_us: i32 = 0,
+    timeout_us: i32 = 0,
+    serial: u64 = 0,
+    texture: ?*gles.Tex = null,
+    share: usize = 0,
+    producer: ?*Surface = null,
+    disconnected: bool = false,
+    mailbox: Image = .{},
+    produced: u64 = 0,
+    consumed: u64 = 0,
+};
+
+var streams: [32]Stream = [_]Stream{.{}} ** 32;
+var stream_serial: u64 = 0;
+var stream_event = std.atomic.Value(u32).init(0);
+
+fn signalStreams() void {
+    _ = stream_event.fetchAdd(1, .release);
+    if (comptime builtin.os.tag == .linux) {
+        _ = std.os.linux.syscall3(.futex, @intFromPtr(&stream_event.raw), 129, std.math.maxInt(i32));
+    }
+}
+
+fn dropStream(s: *Stream) void {
+    if (s.producer) |p| p.stream = null;
+    const eng = s.display.?.eng.?;
+    if (s.texture) |t| {
+        if (t.stream_owner == @as(?*anyopaque, s)) {
+            t.defined = 0;
+            t.stream_owner = null;
+        }
+    }
+    eng.freeImage(&s.mailbox);
+    s.* = .{};
+    signalStreams();
+}
+
+fn streamState(s: *const Stream) i32 {
+    if (s.disconnected) return STREAM_STATE_DISCONNECTED_KHR;
+    const t = s.texture orelse return STREAM_STATE_CREATED_KHR;
+    if (!t.named or t.stream_owner != @as(?*const anyopaque, s)) return STREAM_STATE_DISCONNECTED_KHR;
+    if (s.producer == null) return STREAM_STATE_CONNECTING_KHR;
+    if (s.produced == 0) return STREAM_STATE_EMPTY_KHR;
+    return if (s.produced == s.consumed) STREAM_STATE_OLD_FRAME_AVAILABLE_KHR else STREAM_STATE_NEW_FRAME_AVAILABLE_KHR;
+}
+
+fn streamOf(handle: ?*anyopaque, d: *Display) ?*Stream {
+    const p = @intFromPtr(handle orelse return null);
+    const base = @intFromPtr(&streams[0]);
+    if (p < base or p >= base + @sizeOf(@TypeOf(streams)) or (p - base) % @sizeOf(Stream) != 0) return null;
+    const s: *Stream = @ptrFromInt(p);
+    return if (s.display == d) s else null;
+}
+
+fn streamAttribute(s: *Stream, attribute: i32, value: i32) i32 {
+    switch (attribute) {
+        CONSUMER_LATENCY_USEC_KHR => {
+            if (value < 0) return BAD_PARAMETER;
+            s.latency_us = value;
+            return SUCCESS;
+        },
+        CONSUMER_ACQUIRE_TIMEOUT_USEC_KHR => {
+            s.timeout_us = value;
+            return SUCCESS;
+        },
+        STREAM_STATE_KHR, @as(i32, PRODUCER_FRAME_KHR), @as(i32, CONSUMER_FRAME_KHR) => return BAD_ACCESS,
+        else => return BAD_ATTRIBUTE,
+    }
+}
+
+pub fn createStream(handle: ?*anyopaque, attribs: ?[*]const i32) ?*Stream {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return null;
+    var stream = Stream{ .display = d };
+    if (attribs) |list| {
+        var i: usize = 0;
+        while (list[i] != NONE) : (i += 2) {
+            const err = streamAttribute(&stream, list[i], list[i + 1]);
+            if (err != SUCCESS) return fail(?*Stream, err, null);
+        }
+    }
+    for (&streams) |*s| {
+        if (s.display != null) continue;
+        stream_serial +%= 1;
+        stream.serial = stream_serial;
+        s.* = stream;
+        return ok(?*Stream, s);
+    }
+    return fail(?*Stream, BAD_ALLOC, null);
+}
+
+pub fn destroyStream(handle: ?*anyopaque, stream: ?*anyopaque) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const s = streamOf(stream, d) orelse return fail(bool, BAD_STREAM_KHR, false);
+    dropStream(s);
+    return ok(bool, true);
+}
+
+pub fn setStreamAttrib(handle: ?*anyopaque, stream: ?*anyopaque, attribute: i32, value: i32) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const s = streamOf(stream, d) orelse return fail(bool, BAD_STREAM_KHR, false);
+    if (streamState(s) == STREAM_STATE_DISCONNECTED_KHR) return fail(bool, BAD_STATE_KHR, false);
+    const err = streamAttribute(s, attribute, value);
+    return if (err == SUCCESS) ok(bool, true) else fail(bool, err, false);
+}
+
+pub fn queryStream(handle: ?*anyopaque, stream: ?*anyopaque, attribute: i32, value: ?*i32) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const s = streamOf(stream, d) orelse return fail(bool, BAD_STREAM_KHR, false);
+    const out = value orelse return fail(bool, BAD_PARAMETER, false);
+    out.* = switch (attribute) {
+        CONSUMER_LATENCY_USEC_KHR => s.latency_us,
+        CONSUMER_ACQUIRE_TIMEOUT_USEC_KHR => s.timeout_us,
+        STREAM_STATE_KHR => streamState(s),
+        else => return fail(bool, BAD_ATTRIBUTE, false),
+    };
+    return ok(bool, true);
+}
+
+pub fn queryStreamU64(handle: ?*anyopaque, stream: ?*anyopaque, attribute: u32, value: ?*u64) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const s = streamOf(stream, d) orelse return fail(bool, BAD_STREAM_KHR, false);
+    const out = value orelse return fail(bool, BAD_PARAMETER, false);
+    if (attribute != PRODUCER_FRAME_KHR and attribute != CONSUMER_FRAME_KHR) return fail(bool, BAD_ATTRIBUTE, false);
+    out.* = if (attribute == PRODUCER_FRAME_KHR) s.produced else s.consumed;
+    return ok(bool, true);
+}
+
+fn currentOn(d: *Display) ?*Context {
+    const t = thread.get() orelse return null;
+    if (t.display != @as(?*anyopaque, d)) return null;
+    return @ptrCast(@alignCast(t.context orelse return null));
+}
+
+pub fn connectStreamTexture(handle: ?*anyopaque, stream: ?*anyopaque) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const s = streamOf(stream, d) orelse return fail(bool, BAD_STREAM_KHR, false);
+    if (streamState(s) != STREAM_STATE_CREATED_KHR) return fail(bool, BAD_STATE_KHR, false);
+    const c = currentOn(d) orelse return fail(bool, BAD_ACCESS, false);
+    const t = c.gl.streamTexture() orelse return fail(bool, BAD_ACCESS, false);
+    d.eng.?.freeImage(&t.img);
+    t.defined = 0;
+    t.stream_owner = s;
+    s.texture = t;
+    s.share = c.share;
+    signalStreams();
+    return ok(bool, true);
+}
+
+fn streamClock() u64 {
+    if (comptime builtin.os.tag != .linux) return 0;
+    const linux = std.os.linux;
+    var ts: linux.timespec = undefined;
+    if (linux.errno(linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+pub fn consumeStream(handle: ?*anyopaque, stream: ?*anyopaque, acquire: bool) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const s = streamOf(stream, d) orelse return fail(bool, BAD_STREAM_KHR, false);
+    const c = currentOn(d) orelse return fail(bool, BAD_ACCESS, false);
+    if (s.share != c.share or s.texture == null) return fail(bool, BAD_ACCESS, false);
+    // An acquire implicitly releases the old frame before waiting for
+    // another. Failed acquisition also leaves the texture incomplete.
+    const t = s.texture.?;
+    if (t.stream_owner != @as(?*anyopaque, s)) return fail(bool, BAD_STATE_KHR, false);
+    const eng = d.eng.?;
+    eng.freeImage(&t.img);
+    t.defined = 0;
+    const serial = s.serial;
+    const timeout = s.timeout_us;
+    const start = if (acquire and timeout > 0) streamClock() else 0;
+    const deadline = start + @as(u64, @intCast(@max(timeout, 0))) * 1000;
+    while (acquire and timeout != 0) {
+        const epoch = stream_event.load(.acquire);
+        const state = streamState(s);
+        if (state != STREAM_STATE_EMPTY_KHR and state != STREAM_STATE_OLD_FRAME_AVAILABLE_KHR) break;
+        if (comptime builtin.os.tag != .linux) break;
+        const now = if (timeout > 0) streamClock() else 0;
+        if (timeout > 0 and (start == 0 or now == 0 or now >= deadline)) break;
+        const remaining = deadline -| now;
+        const ts = std.os.linux.timespec{ .sec = @intCast(remaining / 1_000_000_000), .nsec = @intCast(remaining % 1_000_000_000) };
+        // (the frame comes from another thread's calls, under the lock:
+        // let it go while waiting, however deep this thread holds it)
+        const depth = driverSuspend();
+        _ = std.os.linux.syscall4(.futex, @intFromPtr(&stream_event.raw), 128, epoch, if (timeout < 0) 0 else @intFromPtr(&ts));
+        driverResume(depth);
+        if (streamOf(stream, d) == null or s.serial != serial) return fail(bool, BAD_STREAM_KHR, false);
+    }
+    const state = streamState(s);
+    if (state != STREAM_STATE_NEW_FRAME_AVAILABLE_KHR and state != STREAM_STATE_OLD_FRAME_AVAILABLE_KHR and
+        (acquire or state != STREAM_STATE_EMPTY_KHR)) return fail(bool, BAD_STATE_KHR, false);
+    if (acquire) {
+        const frame = &s.mailbox;
+        t.img = eng.newImage(frame.width, frame.height, frame.format) orelse return fail(bool, BAD_ALLOC, false);
+        t.img.no_alpha = frame.no_alpha;
+        eng.copy(frame, 0, 0, &t.img, 0, 0, frame.width, frame.height);
+        t.internal = 0x8058; // RGBA8
+        t.levels = 1;
+        t.defined = 1;
+        t.fswz = .{ 0, 1, 2, 3 };
+        t.srgb = false;
+        s.consumed = s.produced;
+    }
+    return ok(bool, true);
 }
 
 pub fn getConfigs(handle: ?*anyopaque, out: ?[*]?*const anyopaque, size: i32, num: ?*i32) bool {
@@ -752,9 +1237,14 @@ pub fn chooseConfig(handle: ?*anyopaque, attribs: ?[*]const i32, out: ?[*]?*cons
 pub fn getConfigAttrib(handle: ?*anyopaque, config: ?*const anyopaque, a: i32, value: ?*i32) bool {
     lock();
     defer unlock();
-    _ = ready(handle) orelse return false;
+    const d = ready(handle) orelse return false;
     const c = configOf(config) orelse return fail(bool, BAD_CONFIG, false);
-    const v = c.attrib(a) orelse return fail(bool, BAD_ATTRIBUTE, false);
+    var v = c.attrib(a) orelse return fail(bool, BAD_ATTRIBUTE, false);
+    // (on X the native visual is the server's: TrueColor, of depth 24 for
+    // XRGB, 32 for ARGB, as Firefox matches them with XGetVisualInfo)
+    if (a == NATIVE_VISUAL_ID or a == NATIVE_VISUAL_TYPE) {
+        if (xconn(d)) |xc| v = if (a == NATIVE_VISUAL_TYPE) x11.TRUE_COLOR else @bitCast(if (c.alpha) xc.setup.visual32 else xc.setup.visual24);
+    }
     if (value) |p| p.* = v;
     return ok(bool, true);
 }
@@ -777,6 +1267,8 @@ pub const Context = struct {
 };
 
 var contexts: [MAX_CONTEXTS]Context = undefined;
+/// contexts made so far: each one's number in its usage lines (report.sig)
+var contexts_made: u32 = 0;
 var shares: [MAX_SHARE]gles.Objects = undefined;
 var share_users: [MAX_SHARE]u32 = [_]u32{0} ** MAX_SHARE;
 
@@ -808,6 +1300,7 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
     var major: i32 = 1;
     var minor: i32 = 0;
     var lose = false;
+    var debug = false;
     if (attribs) |list| {
         var i: usize = 0;
         while (list[i] != NONE) : (i += 2) {
@@ -815,12 +1308,19 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
             switch (list[i]) {
                 CONTEXT_MAJOR_VERSION => major = v,
                 CONTEXT_MINOR_VERSION => minor = v,
-                CONTEXT_FLAGS_KHR => if (v & ~@as(i32, 7) != 0) return fail(?*Context, BAD_ATTRIBUTE, null),
+                CONTEXT_FLAGS_KHR => {
+                    if (v & ~@as(i32, 7) != 0) return fail(?*Context, BAD_ATTRIBUTE, null);
+                    debug = v & 1 != 0; // EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR
+                },
+                CONTEXT_OPENGL_DEBUG => {
+                    if (v != FALSE and v != TRUE) return fail(?*Context, BAD_ATTRIBUTE, null);
+                    debug = v == TRUE;
+                },
                 CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY, CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT => {
                     if (v != NO_RESET_NOTIFICATION and v != LOSE_CONTEXT_ON_RESET) return fail(?*Context, BAD_ATTRIBUTE, null);
                     lose = v == LOSE_CONTEXT_ON_RESET;
                 },
-                CONTEXT_OPENGL_DEBUG, CONTEXT_OPENGL_ROBUST_ACCESS, CONTEXT_OPENGL_ROBUST_ACCESS_EXT, CONTEXT_OPENGL_NO_ERROR_KHR, CONTEXT_PRIORITY_LEVEL_IMG => {},
+                CONTEXT_OPENGL_ROBUST_ACCESS, CONTEXT_OPENGL_ROBUST_ACCESS_EXT, CONTEXT_OPENGL_NO_ERROR_KHR, CONTEXT_PRIORITY_LEVEL_IMG => {},
                 else => return failWhy(?*Context, BAD_ATTRIBUTE, null, "an attribute this driver does not take"),
             }
         }
@@ -849,6 +1349,12 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
     c.* = .{ .used = true, .display = d, .config = cfg, .share = share, .major = major };
     c.gl.init(eng, &shares[share]);
     c.gl.lose_on_reset = lose;
+    c.gl.debug_context = debug;
+    c.gl.debug.enabled = debug;
+    contexts_made +%= 1;
+    c.gl.usage.id = contexts_made;
+    c.gl.usage.es = @intCast(major);
+    c.gl.usage.robust = lose;
     share_users[share] += 1;
     return ok(?*Context, c);
 }
@@ -856,6 +1362,7 @@ pub fn createContext(handle: ?*anyopaque, config: ?*const anyopaque, share_ctx: 
 fn freeContext(c: *Context) void {
     c.gl.deinit();
     share_users[c.share] -= 1;
+    if (share_users[c.share] == 0) signalStreams();
     const d = c.display;
     c.* = .{};
     if (d) |x| reapDisplay(x);
@@ -893,8 +1400,15 @@ pub const Surface = struct {
     used: bool = false,
     display: ?*Display = null,
     config: *const Config = &configs[0],
-    kind: enum { window, pbuffer } = .pbuffer,
+    kind: enum { window, xwindow, pbuffer, stream, gbm } = .pbuffer,
+    stream: ?*Stream = null,
     win: wayland.Window = undefined,
+    /// an X window's (kind xwindow)
+    xwin: x11.Window = undefined,
+    /// a gbm_surface's (kind gbm): its buffers are the back buffers
+    gsurf: ?*gbm.Surface = null,
+    age_queried: bool = false,
+    damage_set: bool = false,
     /// a pbuffer's color
     color: Image = .{},
     /// depth and stencil (configs with them), the size of the color
@@ -943,15 +1457,17 @@ fn windowAttribs(comptime T: type, attribs: ?[*]const T) bool {
     return true;
 }
 
-/// eglCreateWindowSurface and eglCreatePlatformWindowSurface: `native` is
-/// a wl_egl_window.
+/// eglCreateWindowSurface: `native` is a wl_egl_window, or on a display
+/// that takes X windows (an X11 one, the default one) an X Window (its id
+/// as the pointer's value).
 pub fn createWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*const anyopaque, native: ?*anyopaque, attribs: ?[*]const T) ?*Surface {
     lock();
     defer unlock();
     const d = ready(handle) orelse return null;
     const cfg = configOf(config) orelse return fail(?*Surface, BAD_CONFIG, null);
     if (!windowAttribs(T, attribs)) return fail(?*Surface, BAD_ATTRIBUTE, null);
-    if (d.platform != .wayland) return fail(?*Surface, BAD_NATIVE_WINDOW, null);
+    if (d.platform == .gbm) return gbmWindowSurface(d, cfg, native);
+    if (d.platform != .wayland) return xWindowSurface(d, cfg, native);
     const n: *wayland.EglWindow = @ptrCast(@alignCast(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null)));
     if (n.driver_private != null) return failWhy(?*Surface, BAD_ALLOC, null, "the wl_egl_window has a surface already");
     const s = newSurface(d, cfg) orelse return failWhy(?*Surface, BAD_ALLOC, null, "every surface slot is in use");
@@ -960,6 +1476,51 @@ pub fn createWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*cons
         s.* = .{};
         return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "the window's Wayland surface could not be set up");
     }
+    return ok(?*Surface, s);
+}
+
+/// eglCreatePlatformWindowSurface (and the EXT one): as eglCreateWindowSurface,
+/// but on X (EGL_KHR_platform_x11) `native` points to the Window.
+pub fn createPlatformWindowSurface(comptime T: type, handle: ?*anyopaque, config: ?*const anyopaque, native: ?*anyopaque, attribs: ?[*]const T) ?*Surface {
+    lock();
+    defer unlock();
+    if (displayOf(handle)) |d| {
+        // (EGL_KHR_platform_gbm's native window is the gbm_surface itself)
+        if (d.platform != .wayland and d.platform != .gbm) {
+            const p: *const c_ulong = @ptrCast(@alignCast(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null)));
+            return createWindowSurface(T, handle, config, @ptrFromInt(p.*), attribs);
+        }
+    }
+    return createWindowSurface(T, handle, config, native, attribs);
+}
+
+/// A window surface over X window `native` (its id as the pointer's value).
+fn xWindowSurface(d: *Display, cfg: *const Config, native: ?*anyopaque) ?*Surface {
+    const xid_wide = @intFromPtr(native orelse return fail(?*Surface, BAD_NATIVE_WINDOW, null));
+    if (xid_wide > 0x1fff_ffff) return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "not an X window id");
+    const xid: u32 = @intCast(xid_wide);
+    const xc = xconn(d) orelse return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "no X server for this display's windows");
+    for (&surfaces) |*o| {
+        if (o.used and !o.doomed and o.display == d and o.kind == .xwindow and o.xwin.xid == xid) return failWhy(?*Surface, BAD_ALLOC, null, "the X window has a surface already");
+    }
+    const s = newSurface(d, cfg) orelse return failWhy(?*Surface, BAD_ALLOC, null, "every surface slot is in use");
+    s.kind = .xwindow;
+    if (!s.xwin.init(xc, d.eng.?, driver.?.host, xid, cfg.alpha)) {
+        s.* = .{};
+        return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "the X window could not be drawn on");
+    }
+    return ok(?*Surface, s);
+}
+
+/// A window surface over gbm_surface `native`: its buffers drawn into in
+/// turn (gbm.sig), one EGL surface a gbm_surface.
+fn gbmWindowSurface(d: *Display, cfg: *const Config, native: ?*anyopaque) ?*Surface {
+    const gs = gbm.surfaceOf(native) orelse return failWhy(?*Surface, BAD_NATIVE_WINDOW, null, "not a gbm_surface of this driver's");
+    if (gs.egl_bound) return failWhy(?*Surface, BAD_ALLOC, null, "the gbm_surface has an EGL surface already");
+    const s = newSurface(d, cfg) orelse return failWhy(?*Surface, BAD_ALLOC, null, "every surface slot is in use");
+    s.kind = .gbm;
+    s.gsurf = gs;
+    gs.egl_bound = true;
     return ok(?*Surface, s);
 }
 
@@ -986,24 +1547,54 @@ pub fn createPbufferSurface(handle: ?*anyopaque, config: ?*const anyopaque, attr
     }
     if (w < 0 or h < 0) return fail(?*Surface, BAD_PARAMETER, null);
     if (w > MAX_SIZE or h > MAX_SIZE) return fail(?*Surface, BAD_ALLOC, null);
-    const s = newSurface(d, cfg) orelse return fail(?*Surface, BAD_ALLOC, null);
-    s.kind = .pbuffer;
-    s.width = @intCast(w);
-    s.height = @intCast(h);
+    return ok(?*Surface, offscreenSurface(d, cfg, @intCast(w), @intCast(h)) orelse return fail(?*Surface, BAD_ALLOC, null));
+}
+
+fn offscreenSurface(d: *Display, cfg: *const Config, w: u32, h: u32) ?*Surface {
+    const s = newSurface(d, cfg) orelse return null;
+    s.width = w;
+    s.height = h;
     const eng = d.eng.?;
     // (a 0 x 0 pbuffer has a pixel behind it: GL needs a framebuffer)
     s.color = eng.newImage(@max(s.width, 1), @max(s.height, 1), .rgba8) orelse {
         s.* = .{};
-        return fail(?*Surface, BAD_ALLOC, null);
+        return null;
     };
     s.color.no_alpha = !cfg.alpha;
     if (cfg.depth) {
         s.depth = eng.newImage(@max(s.width, 1), @max(s.height, 1), .d24s8) orelse {
             eng.freeImage(&s.color);
             s.* = .{};
-            return fail(?*Surface, BAD_ALLOC, null);
+            return null;
         };
     }
+    return s;
+}
+
+pub fn createStreamProducerSurface(handle: ?*anyopaque, config: ?*const anyopaque, stream: ?*anyopaque, attribs: ?[*]const i32) ?*Surface {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return null;
+    const st = streamOf(stream, d) orelse return fail(?*Surface, BAD_STREAM_KHR, null);
+    const cfg = configOf(config) orelse return fail(?*Surface, BAD_CONFIG, null);
+    if (streamState(st) != STREAM_STATE_CONNECTING_KHR) return fail(?*Surface, BAD_STATE_KHR, null);
+    var w: i32 = 0;
+    var h: i32 = 0;
+    const list = attribs orelse return fail(?*Surface, BAD_PARAMETER, null);
+    var i: usize = 0;
+    while (list[i] != NONE) : (i += 2) {
+        switch (list[i]) {
+            WIDTH => w = list[i + 1],
+            HEIGHT => h = list[i + 1],
+            else => return fail(?*Surface, BAD_ATTRIBUTE, null),
+        }
+    }
+    if (w < 1 or h < 1) return fail(?*Surface, BAD_PARAMETER, null);
+    if (w > MAX_SIZE or h > MAX_SIZE) return fail(?*Surface, BAD_ALLOC, null);
+    const s = offscreenSurface(d, cfg, @intCast(w), @intCast(h)) orelse return fail(?*Surface, BAD_ALLOC, null);
+    s.kind = .stream;
+    s.stream = st;
+    st.producer = s;
     return ok(?*Surface, s);
 }
 
@@ -1011,6 +1602,13 @@ fn freeSurface(s: *Surface) void {
     const d = s.display.?;
     const eng = d.eng.?;
     if (s.kind == .window) s.win.deinit();
+    if (s.kind == .xwindow) s.xwin.deinit();
+    if (s.gsurf) |gs| gbm.unbind(gs);
+    if (s.stream) |st| {
+        st.producer = null;
+        st.disconnected = true;
+        signalStreams();
+    }
     eng.freeImage(&s.color);
     eng.freeImage(&s.depth);
     s.* = .{};
@@ -1023,14 +1621,19 @@ pub fn destroySurface(handle: ?*anyopaque, surface: ?*anyopaque) bool {
     const d = ready(handle) orelse return false;
     const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
     s.doomed = true;
-    if (s.ctx == null) freeSurface(s) else if (s.kind == .window) s.win.detach();
+    if (s.ctx == null) freeSurface(s) else if (s.kind == .window) s.win.detach() else if (s.kind == .xwindow) s.xwin.detach();
     return ok(bool, true);
 }
 
 /// The surface's color image to draw to now (a window's back buffer), and
 /// its depth image (made or remade at the color's size).
 fn images(s: *Surface) ?struct { color: *Image, depth: ?*Image } {
-    const color: *Image = if (s.kind == .window) (s.win.backImage() orelse return null) else &s.color;
+    const color: *Image = switch (s.kind) {
+        .window => s.win.backImage() orelse return null,
+        .xwindow => s.xwin.backImage() orelse return null,
+        .gbm => gbm.backImage(s.gsurf.?) orelse return null,
+        else => &s.color,
+    };
     if (!s.config.depth) return .{ .color = color, .depth = null };
     const eng = s.display.?.eng.?;
     if (s.depth.width != color.width or s.depth.height != color.height) {
@@ -1043,12 +1646,24 @@ fn images(s: *Surface) ?struct { color: *Image, depth: ?*Image } {
 
 /// The context's default framebuffer from its surfaces, as they are now.
 fn bindSurfaces(c: *Context) bool {
+    // A failed rebind must leave no pointers to submitted or freed images.
+    c.gl.setSurface(null, null, null);
     const draw = c.draw orelse {
-        c.gl.setSurface(null, null, null);
         c.gl.revalidate = null;
         return true;
     };
-    c.gl.revalidate = if (draw.kind == .window) .{ .ctx = c, .f = revalidateWindow, .stale = &draw.win.resized } else null;
+    c.gl.revalidate = switch (draw.kind) {
+        .window => .{ .ctx = c, .f = revalidateWindow, .stale = &draw.win.resized },
+        .xwindow => .{ .ctx = c, .f = revalidateWindow, .stale = &draw.xwin.resized },
+        .gbm => .{ .ctx = c, .f = revalidateWindow, .stale = &draw.gsurf.?.stale },
+        else => null,
+    };
+    // (an X window's binding is fresh from here: its size is asked below)
+    if (draw.kind == .xwindow) draw.xwin.resized.store(false, .release);
+    if (draw.kind == .gbm) draw.gsurf.?.stale.store(false, .release);
+    if (c.read) |r| {
+        if (r.kind == .xwindow) r.xwin.resized.store(false, .release);
+    }
     const di = images(draw) orelse return false;
     var ri = di;
     if (c.read) |r| {
@@ -1060,13 +1675,17 @@ fn bindSurfaces(c: *Context) bool {
 
 /// GL is about to reach the default framebuffer of a window that was
 /// resized: the back buffer, not shown yet, gives way to one of the new
-/// size (on the thread drawing; EGL's lock is not taken: the surface is
-/// this thread's while current).
+/// size (on the thread drawing, inside its GL call: the driver lock is
+/// held already).
 fn revalidateWindow(p: *anyopaque) void {
     const c: *Context = @ptrCast(@alignCast(p));
     const s = c.draw orelse return;
-    if (s.kind != .window) return;
-    s.win.dropBack();
+    switch (s.kind) {
+        .window => s.win.dropBack(),
+        .xwindow => s.xwin.dropBack(),
+        .gbm => {},
+        else => return,
+    }
     _ = bindSurfaces(c);
 }
 
@@ -1076,8 +1695,18 @@ pub fn querySurface(handle: ?*anyopaque, surface: ?*anyopaque, a: i32, value: ?*
     const d = ready(handle) orelse return false;
     const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
     const v: i32 = switch (a) {
-        WIDTH => @intCast(if (s.kind == .window) s.win.wanted()[0] else s.width),
-        HEIGHT => @intCast(if (s.kind == .window) s.win.wanted()[1] else s.height),
+        WIDTH => @intCast(switch (s.kind) {
+            .window => s.win.wanted()[0],
+            .xwindow => s.xwin.wanted()[0],
+            .gbm => s.gsurf.?.width,
+            else => s.width,
+        }),
+        HEIGHT => @intCast(switch (s.kind) {
+            .window => s.win.wanted()[1],
+            .xwindow => s.xwin.wanted()[1],
+            .gbm => s.gsurf.?.height,
+            else => s.height,
+        }),
         CONFIG_ID => s.config.id,
         RENDER_BUFFER => BACK_BUFFER,
         SWAP_BEHAVIOR => BUFFER_DESTROYED,
@@ -1090,11 +1719,34 @@ pub fn querySurface(handle: ?*anyopaque, surface: ?*anyopaque, a: i32, value: ?*
             // (the back buffer of the surface drawn on this thread)
             const t = thread.get() orelse return fail(bool, BAD_SURFACE, false);
             if (t.draw != @as(?*anyopaque, s)) return fail(bool, BAD_SURFACE, false);
-            break :blk if (s.kind == .window) s.win.age() else 0;
+            s.age_queried = true;
+            break :blk switch (s.kind) {
+                .window => s.win.age(),
+                .xwindow => s.xwin.age(),
+                .gbm => gbm.age(s.gsurf.?),
+                else => 0,
+            };
         },
-        else => return fail(bool, BAD_ATTRIBUTE, false),
+        else => {
+            if (driver.?.surface_pointer) |query| {
+                if (query(s, a) != null) return fail(bool, BAD_PARAMETER, false);
+            }
+            return fail(bool, BAD_ATTRIBUTE, false);
+        },
     };
     if (value) |p| p.* = v;
+    return ok(bool, true);
+}
+
+pub fn querySurfacePointer(handle: ?*anyopaque, surface: ?*anyopaque, attribute: i32, value: ?*?*anyopaque) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
+    const out = value orelse return fail(bool, BAD_PARAMETER, false);
+    const query = driver.?.surface_pointer orelse return fail(bool, BAD_PARAMETER, false);
+    const result = query(s, attribute) orelse return fail(bool, BAD_PARAMETER, false);
+    out.* = result.value;
     return ok(bool, true);
 }
 
@@ -1182,6 +1834,13 @@ pub fn makeCurrent(handle: ?*anyopaque, draw_h: ?*anyopaque, read_h: ?*anyopaque
     t.gl = &c.gl;
     if (!bindSurfaces(c)) {
         release(t);
+        // (the GPU lost: a window's new buffers cannot be the compositor's
+        // dma-bufs. The app hears its context is lost, as at a swap, and
+        // starts over without it: Firefox then draws in software, where
+        // BAD_ALLOC had it try the same window again and again)
+        if (d.eng) |eng| {
+            if (eng.lost) return failWhy(bool, CONTEXT_LOST, false, "the GPU is lost: the window has no buffer to show");
+        }
         return failWhy(bool, BAD_ALLOC, false, "no memory for the surface's buffers");
     }
     return ok(bool, true);
@@ -1216,8 +1875,11 @@ pub fn releaseThread() bool {
     return true;
 }
 
-/// eglWaitClient and eglWaitGL: the current context's work done.
+/// eglWaitClient and eglWaitGL: the current context's work done (under
+/// the lock, as a GL call: the engine is every context's).
 pub fn waitClient() bool {
+    lock();
+    defer unlock();
     const t = thread.get() orelse return ok(bool, true);
     if (t.gl) |g| g.finish();
     return ok(bool, true);
@@ -1226,6 +1888,22 @@ pub fn waitClient() bool {
 // ── Swaps ──────────────────────────────────────────────────────────────────
 
 /// eglSwapBuffers (damage: none) and eglSwapBuffersWithDamage.
+pub fn setDamageRegion(handle: ?*anyopaque, surface: ?*anyopaque, rects: ?[*]const i32, n: i32) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const s = surfaceOf(surface, d) orelse return fail(bool, BAD_SURFACE, false);
+    const t = thread.get() orelse return fail(bool, BAD_MATCH, false);
+    if ((s.kind != .window and s.kind != .xwindow and s.kind != .gbm) or t.draw != @as(?*anyopaque, s)) return fail(bool, BAD_MATCH, false);
+    if (!s.age_queried or s.damage_set) return fail(bool, BAD_ACCESS, false);
+    if (n < 0 or (n != 0 and rects == null)) return fail(bool, BAD_PARAMETER, false);
+    // Wayland retains the back buffer's contents for the age it reports.
+    // There is no tile restoration to limit. The caller bounds its draws;
+    // swap damage, which describes a different region, is sent separately.
+    s.damage_set = true;
+    return ok(bool, true);
+}
+
 pub fn swapBuffers(handle: ?*anyopaque, surface: ?*anyopaque, damage: []const [4]i32) bool {
     lock();
     defer unlock();
@@ -1235,10 +1913,53 @@ pub fn swapBuffers(handle: ?*anyopaque, surface: ?*anyopaque, damage: []const [4
     const c: *Context = @ptrCast(@alignCast(t.context orelse return fail(bool, BAD_SURFACE, false)));
     if (c.draw != s) return fail(bool, BAD_SURFACE, false);
     if (s.kind == .pbuffer) return ok(bool, true);
-    if (!s.win.swap(damage)) return fail(bool, BAD_NATIVE_WINDOW, false);
-    // the context draws on the next back buffer
-    if (!bindSurfaces(c)) return fail(bool, BAD_ALLOC, false);
+    // (timed for the context's usage line: report.sig)
+    const began = report.nowUs();
+    if (s.kind == .stream) {
+        const st = s.stream orelse return fail(bool, BAD_CURRENT_SURFACE, false);
+        const state = streamState(st);
+        if (state != STREAM_STATE_EMPTY_KHR and state != STREAM_STATE_NEW_FRAME_AVAILABLE_KHR and
+            state != STREAM_STATE_OLD_FRAME_AVAILABLE_KHR) return fail(bool, BAD_CURRENT_SURFACE, false);
+        const eng = d.eng.?;
+        const frame = &s.color;
+        if (!st.mailbox.live()) {
+            st.mailbox = eng.newImage(frame.width, frame.height, frame.format) orelse return fail(bool, BAD_ALLOC, false);
+            st.mailbox.no_alpha = frame.no_alpha;
+        }
+        eng.copy(frame, 0, 0, &st.mailbox, 0, 0, frame.width, frame.height);
+        eng.finish();
+        if (eng.lost) return fail(bool, CONTEXT_LOST, false);
+        st.produced +%= 1;
+        signalStreams();
+        swapped(c, began);
+        return ok(bool, true);
+    }
+    const shown = switch (s.kind) {
+        .xwindow => s.xwin.swap(damage),
+        .gbm => blk: {
+            // (the GPU's work on it submitted: the dma-buf's fence covers it)
+            c.gl.flush();
+            break :blk gbm.swap(s.gsurf.?);
+        },
+        else => s.win.swap(damage),
+    };
+    if (!shown) return fail(bool, BAD_NATIVE_WINDOW, false);
+    s.age_queried = false;
+    s.damage_set = false;
+    // the context draws on the next back buffer: an X window's is taken at
+    // the next drawing (revalidate), at the window's size then; a
+    // gbm_surface's too (the app may release one first)
+    if (s.kind == .xwindow or s.kind == .gbm) {
+        c.gl.setSurface(null, null, null);
+    } else if (!bindSurfaces(c)) return fail(bool, BAD_ALLOC, false);
+    swapped(c, began);
     return ok(bool, true);
+}
+
+/// A swap of c's, begun at `began_us`, counted for its usage line.
+fn swapped(c: *Context, began_us: u64) void {
+    const now = report.nowUs();
+    c.gl.usageSwap(now, now -| began_us);
 }
 
 pub fn swapInterval(handle: ?*anyopaque, interval: i32) bool {
@@ -1249,6 +1970,7 @@ pub fn swapInterval(handle: ?*anyopaque, interval: i32) bool {
     const sp = t.draw orelse return fail(bool, BAD_SURFACE, false);
     const s: *Surface = @ptrCast(@alignCast(sp));
     if (s.kind == .window) s.win.interval = @intCast(std.math.clamp(interval, 0, 1));
+    if (s.kind == .xwindow) s.xwin.interval = @intCast(std.math.clamp(interval, 0, 1));
     return ok(bool, true);
 }
 
@@ -1294,6 +2016,7 @@ pub fn createSync(comptime T: type, handle: ?*anyopaque, ty: u32, attribs: ?[*]c
     defer unlock();
     const d = ready(handle) orelse return null;
     if (ty != SYNC_FENCE and ty != SYNC_NATIVE_FENCE_ANDROID) return fail(?*Sync, BAD_ATTRIBUTE, null);
+    if (ty == SYNC_NATIVE_FENCE_ANDROID and !driver.?.native_interop()) return fail(?*Sync, BAD_ATTRIBUTE, null);
     var fd: i32 = NO_NATIVE_FENCE_FD_ANDROID;
     if (attribs) |list| {
         var i: usize = 0;
@@ -1345,21 +2068,18 @@ pub fn destroySync(handle: ?*anyopaque, sync: ?*anyopaque) bool {
 }
 
 /// eglClientWaitSync: CONDITION_SATISFIED, TIMEOUT_EXPIRED, or FALSE.
-/// The lock is not held while waiting.
+/// The lock is held while waiting: the flush and the wait are the engine's
+/// (every context's), and what is waited for is the GPU's (or a fence
+/// fd's), which no other thread's call has to move. Other threads' calls
+/// wait their turn meanwhile.
 pub fn clientWaitSync(handle: ?*anyopaque, sync: ?*anyopaque, flags: i32, timeout_ns: u64) i32 {
     lock();
-    const d = ready(handle) orelse {
-        unlock();
-        return @intCast(FALSE);
-    };
-    const s = syncOf(sync, d) orelse {
-        unlock();
-        return fail(i32, BAD_PARAMETER, @intCast(FALSE));
-    };
+    defer unlock();
+    const d = ready(handle) orelse return @intCast(FALSE);
+    const s = syncOf(sync, d) orelse return fail(i32, BAD_PARAMETER, @intCast(FALSE));
     const m = s.mark;
     const fd = s.fd;
     const eng = d.eng.?;
-    unlock();
     if (flags & SYNC_FLUSH_COMMANDS_BIT != 0) {
         if (thread.gl()) |g| g.flush();
     }
@@ -1408,6 +2128,12 @@ pub const EImage = struct {
     display: ?*Display = null,
     img: Image = .{},
     shared: engine.Shared = .{},
+    // An independent reference for the MESA export API (a texture's:
+    // exported at its first export).
+    fd: i32 = -1,
+    /// its DRM format (0: none, so no export: a float texture's)
+    fourcc: i32 = 0,
+    offset: i32 = 0,
 };
 
 var eimages: [MAX_IMAGES]EImage = undefined;
@@ -1433,28 +2159,73 @@ fn resolveImage(handle: ?*anyopaque) ?*Image {
 
 fn dropImage(m: *EImage) void {
     m.alive = false;
+    if (m.fd >= 0) {
+        const h = driver.?.host;
+        h.close(h.ctx, m.fd);
+        m.fd = -1;
+    }
     // (the memory goes with the last of GL's names too)
     m.display.?.eng.?.freeImage(&m.img);
 }
 
-/// A dma-buf fourcc as the engine's format, and whether it has alpha.
+/// A dma-buf fourcc as the engine's format, and whether it has alpha
+/// (or no alpha byte to ignore: a plane's).
 fn fourccOf(f: u32) ?struct { format: engine.Format, alpha: bool } {
     return switch (f) {
         wayland.DRM_FORMAT_ARGB8888 => .{ .format = .bgra8, .alpha = true },
         wayland.DRM_FORMAT_XRGB8888 => .{ .format = .bgra8, .alpha = false },
         DRM_FORMAT_ABGR8888 => .{ .format = .rgba8, .alpha = true },
         DRM_FORMAT_XBGR8888 => .{ .format = .rgba8, .alpha = false },
+        DRM_FORMAT_R8 => .{ .format = .r8, .alpha = true },
+        DRM_FORMAT_GR88 => .{ .format = .rg8, .alpha = true },
+        DRM_FORMAT_R16 => .{ .format = .r16, .alpha = true },
+        DRM_FORMAT_GR1616 => .{ .format = .rg16, .alpha = true },
         else => null,
     };
 }
 
-/// eglCreateImage and eglCreateImageKHR: EGL_LINUX_DMA_BUF_EXT, one plane.
-/// The fd stays the caller's (the buffer is imported, not the file kept).
+/// An image's memory as a dma-buf's fourcc (0: none has its layout).
+fn fourccFor(img: *const Image) u32 {
+    return switch (img.format) {
+        .rgba8 => if (img.no_alpha) DRM_FORMAT_XBGR8888 else DRM_FORMAT_ABGR8888,
+        .bgra8 => if (img.no_alpha) wayland.DRM_FORMAT_XRGB8888 else wayland.DRM_FORMAT_ARGB8888,
+        .r8 => DRM_FORMAT_R8,
+        .rg8 => DRM_FORMAT_GR88,
+        .r16 => DRM_FORMAT_R16,
+        .rg16 => DRM_FORMAT_GR1616,
+        else => 0,
+    };
+}
+
+/// eglCreateImage and eglCreateImageKHR: EGL_LINUX_DMA_BUF_EXT, one plane
+/// (the fd stays the caller's; the image holds its own copy for export),
+/// or EGL_GL_TEXTURE_2D_KHR, a texture of `ctx`.
 pub fn createImage(comptime T: type, handle: ?*anyopaque, ctx: ?*anyopaque, target: u32, buffer: ?*anyopaque, attribs: ?[*]const T) ?*EImage {
     lock();
     defer unlock();
     const d = ready(handle) orelse return null;
+    if (target == GL_TEXTURE_2D_KHR) return textureImage(T, d, ctx, buffer, attribs);
+    if (target == NATIVE_PIXMAP_KHR) return pixmapImage(T, d, ctx, buffer, attribs);
+    if (target == 0x3140) { // EGL_NATIVE_BUFFER_ANDROID
+        if (ctx != null) return fail(?*EImage, BAD_CONTEXT, null);
+        const client = buffer orelse return fail(?*EImage, BAD_PARAMETER, null);
+        const drv = driver.?;
+        const android = drv.android orelse return fail(?*EImage, BAD_PARAMETER, null);
+        if (!hasDmaImport(drv)) return fail(?*EImage, BAD_PARAMETER, null);
+        const buf = android.retain(client) orelse return fail(?*EImage, BAD_PARAMETER, null);
+        if (buf.modifier != 0 and buf.modifier != MOD_INVALID) {
+            android.release(client);
+            return fail(?*EImage, BAD_PARAMETER, null);
+        }
+        const image = importImage(d, buf.fd, buf.width, buf.height, buf.fourcc, buf.pitch, buf.offset, .{}) orelse {
+            android.release(client);
+            return fail(?*EImage, if (getError() == BAD_ALLOC) BAD_ALLOC else BAD_PARAMETER, null);
+        };
+        image.shared.external = .{ .context = client, .release = android.release };
+        return image;
+    }
     if (target != LINUX_DMA_BUF_EXT or ctx != null or buffer != null) return fail(?*EImage, BAD_PARAMETER, null);
+    if (!hasDmaImport(driver.?)) return fail(?*EImage, BAD_PARAMETER, null);
     var width: i64 = -1;
     var height: i64 = -1;
     var fourcc: i64 = -1;
@@ -1482,22 +2253,119 @@ pub fn createImage(comptime T: type, handle: ?*anyopaque, ctx: ?*anyopaque, targ
         }
     }
     if (width < 0 or height < 0 or fourcc < 0 or fd < 0 or offset < 0 or pitch < 0) return fail(?*EImage, BAD_PARAMETER, null);
-    const f = fourccOf(@truncate(@as(u64, @bitCast(fourcc)))) orelse return fail(?*EImage, BAD_MATCH, null);
+    const code = std.math.cast(u32, fourcc) orelse return fail(?*EImage, BAD_PARAMETER, null);
     if ((mod_lo == null) != (mod_hi == null)) return fail(?*EImage, BAD_PARAMETER, null);
+    // The modifier: none (linear), linear, or NVIDIA's block-linear 2D
+    // (a video decoder's picture: Galaxy's VA driver exports its planes
+    // so, sampled here where the decoder wrote them). Any other: BAD_MATCH.
+    var layout: blocklinear.Layout = .{};
     if (mod_lo) |lo| {
         const m = @as(u64, mod_hi.?) << 32 | lo;
-        if (m != 0 and m != MOD_INVALID) return fail(?*EImage, BAD_MATCH, null);
+        if (m != MOD_INVALID) layout = blocklinear.parseModifier(m) orelse return fail(?*EImage, BAD_MATCH, null);
     }
-    if (width == 0 or height == 0 or width > MAX_SIZE or height > MAX_SIZE) return fail(?*EImage, BAD_PARAMETER, null);
-    if (pitch < width * 4 or @mod(pitch, 4) != 0 or @mod(offset, 4) != 0) return fail(?*EImage, BAD_ACCESS, null);
+    return importImage(d, fd, width, height, code, pitch, offset, layout);
+}
+
+/// EGL_KHR_gl_texture_2D_image: level 0 of texture `buffer` (its name)
+/// of `ctx`'s share group.
+fn textureImage(comptime T: type, d: *Display, ctx: ?*anyopaque, buffer: ?*anyopaque, attribs: ?[*]const T) ?*EImage {
+    if (!hasDmaImport(driver.?)) return fail(?*EImage, BAD_PARAMETER, null);
+    const c = contextOf(ctx, d) orelse return fail(?*EImage, BAD_CONTEXT, null);
+    if (attribs) |list| {
+        var i: usize = 0;
+        while (list[i] != NONE) : (i += 2) {
+            const v: i64 = @intCast(list[i + 1]);
+            switch (@as(i32, @intCast(list[i]))) {
+                // (level 0 only: an image of a mipmap level is not had)
+                GL_TEXTURE_LEVEL_KHR => if (v != 0) return fail(?*EImage, BAD_MATCH, null),
+                IMAGE_PRESERVED_KHR => {},
+                else => return fail(?*EImage, BAD_ATTRIBUTE, null),
+            }
+        }
+    }
+    const name = std.math.cast(u32, @intFromPtr(buffer)) orelse return fail(?*EImage, BAD_PARAMETER, null);
     const slot = for (&eimages) |*x| {
         if (!x.alive and x.shared.refs == 0) break x;
     } else return fail(?*EImage, BAD_ALLOC, null);
+    const tex = c.gl.textureImage(name, &slot.shared) catch |e| return fail(?*EImage, switch (e) {
+        error.BadParameter => BAD_PARAMETER,
+        error.BadMatch => BAD_MATCH,
+        error.BadAccess => BAD_ACCESS,
+        error.BadAlloc => BAD_ALLOC,
+    }, null);
+    // (the texture's memory is held by the slot's Shared now: this name too)
+    slot.alive = true;
+    slot.display = d;
+    slot.fd = -1;
+    slot.offset = 0;
+    slot.fourcc = @bitCast(fourccFor(tex));
+    slot.img = engine.alias(tex);
+    return ok(?*EImage, slot);
+}
+
+/// EGL_KHR_image_pixmap: a gbm_bo (the native pixmap of a GBM display,
+/// and of any other: a buffer is the driver's own memory), its memory
+/// itself, no dma-buf between (an imported buffer's imported now).
+fn pixmapImage(comptime T: type, d: *Display, ctx: ?*anyopaque, buffer: ?*anyopaque, attribs: ?[*]const T) ?*EImage {
+    if (ctx != null) return fail(?*EImage, BAD_CONTEXT, null);
+    if (attribs) |list| {
+        var i: usize = 0;
+        while (list[i] != NONE) : (i += 2) {
+            if (@as(i32, @intCast(list[i])) != IMAGE_PRESERVED_KHR) return fail(?*EImage, BAD_ATTRIBUTE, null);
+        }
+    }
+    const bo = gbm.boOf(buffer) orelse return failWhy(?*EImage, BAD_PARAMETER, null, "not a gbm_bo of this driver's");
+    const img = gbm.memory(bo) orelse return failWhy(?*EImage, BAD_ALLOC, null, "the gbm_bo's dma-buf could not be imported");
+    const slot = for (&eimages) |*x| {
+        if (!x.alive and x.shared.refs == 0) break x;
+    } else return fail(?*EImage, BAD_ALLOC, null);
+    // (its dma-buf for EGL_MESA_image_dma_buf_export: the buffer's own, if
+    // it has one yet; else exported at the first export)
     const h = driver.?.host;
-    const whole = h.importFd(h.ctx, @intCast(fd)) orelse return fail(?*EImage, BAD_PARAMETER, null);
-    slot.* = .{ .alive = true, .display = d };
-    const need = offset + pitch * (height - 1) + width * 4;
-    if (need > @as(i64, @intCast(whole.bytes))) {
+    const fd: i32 = if (bo.fd >= 0) h.dup(h.ctx, bo.fd) else -1;
+    slot.* = .{ .alive = true, .display = d, .fd = if (fd >= 0) fd else -1, .fourcc = @bitCast(bo.format), .offset = @intCast(bo.offset) };
+    slot.img = engine.alias(img);
+    // (a texture's rows are memory's from row 0: the buffer's own order)
+    slot.img.top_down = false;
+    return ok(?*EImage, slot);
+}
+
+pub fn androidClientBuffer(buffer: ?*const anyopaque) ?*anyopaque {
+    lock();
+    defer unlock();
+    const native = buffer orelse return fail(?*anyopaque, BAD_PARAMETER, null);
+    const drv = driver orelse return fail(?*anyopaque, BAD_PARAMETER, null);
+    const android = drv.android orelse return fail(?*anyopaque, BAD_PARAMETER, null);
+    const client = android.clientBuffer(native) orelse return fail(?*anyopaque, BAD_PARAMETER, null);
+    return ok(?*anyopaque, client);
+}
+
+/// One plane of a dma-buf as an image, laid out `layout` (pitch linear,
+/// or block linear: `pitch` then the plane's bytes across, whole GOBs).
+fn importImage(d: *Display, fd: i64, width: i64, height: i64, code: u32, pitch: i64, offset: i64, layout: blocklinear.Layout) ?*EImage {
+    const f = fourccOf(code) orelse return fail(?*EImage, BAD_MATCH, null);
+    const bpp: i64 = f.format.bytes();
+    if (fd < 0 or offset < 0 or width <= 0 or height <= 0 or width > MAX_SIZE or height > MAX_SIZE) return fail(?*EImage, BAD_PARAMETER, null);
+    // (rows of whole words: a texel is read from its aligned word; a
+    // block-linear plane's rows are whole GOBs)
+    if (pitch < width * bpp or @mod(pitch, 4) != 0 or @mod(offset, 4) != 0) return fail(?*EImage, BAD_ACCESS, null);
+    if (layout.block and @mod(pitch, 64) != 0) return fail(?*EImage, BAD_ACCESS, null);
+    const slot = for (&eimages) |*x| {
+        if (!x.alive and x.shared.refs == 0) break x;
+    } else return fail(?*EImage, BAD_ALLOC, null);
+    if (fd > std.math.maxInt(i32) or offset > std.math.maxInt(i32) or pitch > std.math.maxInt(i32))
+        return fail(?*EImage, BAD_PARAMETER, null);
+    const h = driver.?.host;
+    const saved_fd = h.dup(h.ctx, @intCast(fd));
+    if (saved_fd < 0) return fail(?*EImage, BAD_ALLOC, null);
+    const whole = h.importFd(h.ctx, @intCast(fd)) orelse {
+        h.close(h.ctx, saved_fd);
+        return fail(?*EImage, BAD_PARAMETER, null);
+    };
+    slot.* = .{ .alive = true, .display = d, .fd = saved_fd, .fourcc = @bitCast(code), .offset = @intCast(offset) };
+    // (a block-linear plane: whole blocks down)
+    const need: i64 = if (layout.block) offset + @as(i64, @intCast(blocklinear.planeBytes(@intCast(pitch), @intCast(height), layout.gobs_log2))) else offset + pitch * (height - 1) + width * bpp;
+    if (@as(u64, @intCast(need)) > whole.bytes or @as(u64, @intCast(need)) > whole.cpu.len) {
         // (the import goes again: a picture larger than its buffer)
         slot.img = engine.adopt(&slot.shared, whole, 0, 1, 1, 4, f.format);
         dropImage(slot);
@@ -1505,6 +2373,7 @@ pub fn createImage(comptime T: type, handle: ?*anyopaque, ctx: ?*anyopaque, targ
     }
     slot.img = engine.adopt(&slot.shared, whole, @intCast(offset), @intCast(width), @intCast(height), @intCast(pitch), f.format);
     slot.img.no_alpha = !f.alpha;
+    slot.img.layout = layout;
     return ok(?*EImage, slot);
 }
 
@@ -1517,11 +2386,50 @@ pub fn destroyImage(handle: ?*anyopaque, image: ?*anyopaque) bool {
     return ok(bool, true);
 }
 
+/// Export metadata for the single-plane images supported here: the
+/// modifier is the image's layout's (DRM_FORMAT_MOD_LINEAR, or an
+/// imported block-linear plane's own).
+pub fn exportDmaBufQuery(handle: ?*anyopaque, image: ?*anyopaque, fourcc: ?*i32, planes: ?*i32, modifier: ?*u64) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const m = imageOf(image, d) orelse return fail(bool, BAD_PARAMETER, false);
+    if (m.fourcc == 0) return fail(bool, BAD_MATCH, false);
+    if (fourcc) |p| p.* = m.fourcc;
+    if (planes) |p| p.* = 1;
+    if (modifier) |p| p.* = blocklinear.modifierOf(m.img.layout);
+    return ok(bool, true);
+}
+
+pub fn exportDmaBuf(handle: ?*anyopaque, image: ?*anyopaque, fd: ?*i32, stride: ?*i32, offset: ?*i32) bool {
+    lock();
+    defer unlock();
+    const d = ready(handle) orelse return false;
+    const m = imageOf(image, d) orelse return fail(bool, BAD_PARAMETER, false);
+    if (m.fourcc == 0) return fail(bool, BAD_MATCH, false);
+    if (fd) |p| {
+        const h = driver.?.host;
+        if (m.fd < 0) {
+            // (a texture's buffer, out the first time: the whole of it)
+            const got = h.exportFd(h.ctx, (m.img.share orelse &m.shared).buf);
+            if (got < 0) return fail(bool, BAD_ALLOC, false);
+            m.fd = @intCast(got);
+        }
+        const copy = h.dup(h.ctx, m.fd);
+        if (copy < 0) return fail(bool, BAD_ALLOC, false);
+        p.* = copy;
+    }
+    if (stride) |p| p.* = @intCast(m.img.stride);
+    if (offset) |p| p.* = m.offset;
+    return ok(bool, true);
+}
+
 /// eglQueryDmaBufFormatsEXT: the fourccs an image takes.
 pub fn queryDmaBufFormats(handle: ?*anyopaque, max: i32, formats: ?[*]i32, num: ?*i32) bool {
     lock();
     defer unlock();
     _ = ready(handle) orelse return false;
+    if (!hasDmaImport(driver.?)) return fail(bool, BAD_PARAMETER, false);
     const n = num orelse return fail(bool, BAD_PARAMETER, false);
     if (max < 0 or (max > 0 and formats == null)) return fail(bool, BAD_PARAMETER, false);
     const k: usize = if (max == 0) dma_buf_formats.len else @min(dma_buf_formats.len, @as(usize, @intCast(max)));
@@ -1532,19 +2440,43 @@ pub fn queryDmaBufFormats(handle: ?*anyopaque, max: i32, formats: ?[*]i32, num: 
     return ok(bool, true);
 }
 
-/// eglQueryDmaBufModifiersEXT: linear only, for every format; none
-/// external only.
+/// The modifiers a format is imported with: linear for every one; and
+/// for a video plane (R8, GR88, R16, GR1616), NVIDIA's block-linear 2D in
+/// GOB_2 blocks with each swizzle (Turing's, GB20x's 8- and 16-bit: what
+/// an RTX's decoder writes). None external only (sampled as TEXTURE_2D).
+pub fn modifiersOf(format: u32) []const u64 {
+    const S = struct {
+        const linear = [_]u64{blocklinear.MOD_LINEAR};
+        const video = [_]u64{
+            blocklinear.MOD_LINEAR,
+            blocklinear.modifierOf(.{ .block = true, .swizzle = .turing2d, .gobs_log2 = 1 }),
+            blocklinear.modifierOf(.{ .block = true, .swizzle = .blackwell8, .gobs_log2 = 1 }),
+            blocklinear.modifierOf(.{ .block = true, .swizzle = .blackwell16, .gobs_log2 = 1 }),
+        };
+    };
+    return switch (format) {
+        DRM_FORMAT_R8, DRM_FORMAT_GR88, DRM_FORMAT_R16, DRM_FORMAT_GR1616 => &S.video,
+        else => &S.linear,
+    };
+}
+
+/// eglQueryDmaBufModifiersEXT: `modifiersOf` the format.
 pub fn queryDmaBufModifiers(handle: ?*anyopaque, format: i32, max: i32, modifiers: ?[*]u64, external_only: ?[*]u32, num: ?*i32) bool {
     lock();
     defer unlock();
     _ = ready(handle) orelse return false;
+    if (!hasDmaImport(driver.?)) return fail(bool, BAD_PARAMETER, false);
     const n = num orelse return fail(bool, BAD_PARAMETER, false);
     if (fourccOf(@bitCast(format)) == null) return fail(bool, BAD_PARAMETER, false);
     if (max < 0 or (max > 0 and modifiers == null)) return fail(bool, BAD_PARAMETER, false);
+    const all = modifiersOf(@bitCast(format));
+    const k: usize = if (max == 0) all.len else @min(all.len, @as(usize, @intCast(max)));
     if (max > 0) {
-        modifiers.?[0] = 0;
-        if (external_only) |e| e[0] = FALSE;
+        for (0..k) |i| {
+            modifiers.?[i] = all[i];
+            if (external_only) |e| e[i] = FALSE;
+        }
     }
-    n.* = 1;
+    n.* = @intCast(k);
     return ok(bool, true);
 }

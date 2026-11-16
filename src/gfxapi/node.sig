@@ -17,7 +17,10 @@
 //!   answers an import of this context's own buffer, or of one imported
 //!   before, with the same handle: such an entry is counted, not doubled.
 //! - **Fence files** (G_FENCE_FD): a sync_file of the last submission, for
-//!   EGL_ANDROID_native_fence_sync.
+//!   EGL_ANDROID_native_fence_sync. The Adreno's kernel always makes them;
+//!   the RTX's (nv_drm) since Galaxy's sync_files of a channel's fences:
+//!   open asks for one of fence 0 (signalled) to know (`native_fences`),
+//!   and an older PC kernel's EINVAL leaves them off.
 //!
 //! The open file is the program's own GPU context (its own page table).
 //! G_INFO's chip says which GPU answered; each GPU's raw Device is a view
@@ -42,6 +45,7 @@
 //! Allocation-free: fixed tables (MAX_BUFFERS entries, MAX_PIECES each).
 
 const std = @import("std");
+const report = @import("report.sig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const gpu = @import("gpu");
@@ -67,10 +71,16 @@ pub const G_INFO: u32 = 0x8020_4700;
 pub const G_RESERVE: u32 = 0xc010_4701;
 pub const G_ALLOC: u32 = 0xc020_4702;
 pub const G_FREE: u32 = 0x4004_4703;
+pub const G_UNRESERVE: u32 = 0x4008_4708;
+pub const G_BUFFER_INFO: u32 = 0xc020_4709;
 pub const G_SUBMIT: u32 = 0xc010_4704;
 pub const G_WAIT: u32 = 0x4010_4705;
 pub const G_IMPORT: u32 = 0xc020_4706;
 pub const G_FENCE_FD: u32 = 0xc008_4707;
+/// The context's channel with the RTX's 3D engine on it (Galaxy's nv_drm,
+/// _IOW('G', 14, u32)): 0 once it is there; -EOPNOTSUPP when the GPU
+/// offers none.
+pub const G_GRAPHICS: u32 = 0x4004_470e;
 pub const G_VERSION: u32 = 1;
 /// G_ALLOC's flags: write-combined for the CPU (the Adreno's); in VRAM
 /// (the RTX's; without it, system memory the GPU maps).
@@ -145,6 +155,10 @@ pub fn Node(comptime Sys: type) type {
         lost: bool = false,
         /// Which GPU answered (open: G_INFO's chip).
         kind: Kind = .adreno,
+        dma_import: bool = false,
+        /// The kernel makes sync_files of this context's fences (G_FENCE_FD):
+        /// the Adreno's always, the RTX's when open's probe got one.
+        native_fences: bool = false,
         /// What the kernel's buffers come in: 4 KiB pages on the Adreno,
         /// 2 MiB on the RTX.
         unit: usize = PAGE,
@@ -155,12 +169,19 @@ pub fn Node(comptime Sys: type) type {
         /// the fence of the last submission (0: none yet)
         last_seq: u32 = 0,
         buffers: [MAX_BUFFERS]Entry = [_]Entry{.{}} ** MAX_BUFFERS,
+        /// Handles refused as their buffer's gone (entryOf).
+        stale: u32 = 0,
 
         const Entry = struct {
             used: bool = false,
+            /// The entry's reuses: a handle carries the generation it was
+            /// made in (bits 16..30), so one kept past its buffer's free
+            /// names no other buffer (handleOf, entryOf).
+            gen: u16 = 0,
             /// names held (an import of the same kernel buffer again)
             refs: u32 = 1,
             va: u64 = 0,
+            reserved: bool = false,
             cpu: usize = 0,
             /// Bytes mapped here (every piece, rounded to whole units; 0
             /// for an import, which is the program's own memory).
@@ -191,9 +212,20 @@ pub fn Node(comptime Sys: type) type {
                 return error.Unsupported;
             }
             g.kind = kind.?;
+            var probe = [_]u8{0} ** 32;
+            g.dma_import = g.kind == .adreno or g.call(G_BUFFER_INFO, &probe) == 0;
+            g.native_fences = g.kind == .adreno or g.probeFenceFd();
             g.unit = if (g.kind == .nvidia) NV_UNIT else PAGE;
             g.line = g.sys.cacheLine();
             return i;
+        }
+
+        /// The RTX's 3D engine on this context's channel (G_GRAPHICS): true
+        /// once it is there, false when the GPU offers none.
+        pub fn graphics(g: *Self) bool {
+            if (g.kind != .nvidia) return false;
+            var a = [_]u8{0} ** 4;
+            return g.call(G_GRAPHICS, &a) == 0;
         }
 
         pub fn info(g: *Self) ?Info {
@@ -307,7 +339,11 @@ pub fn Node(comptime Sys: type) type {
             wr64(&a, 0, size);
             wr32(&a, 8, flags);
             wr64(&a, 16, at);
-            if (g.call(G_ALLOC, &a) != 0) return null;
+            const result = g.call(G_ALLOC, &a);
+            if (result != 0) {
+                report.say(.egl_error, "render-node allocation of {d} bytes failed: {d}", .{ size, result });
+                return null;
+            }
             return .{ .handle = rd32(&a, 12), .va = rd64(&a, 16), .off = rd64(&a, 24) };
         }
 
@@ -320,7 +356,21 @@ pub fn Node(comptime Sys: type) type {
         fn release(g: *Self, e: *Entry) void {
             if (e.len != 0) g.sys.unmap(e.cpu, e.len);
             for (e.handles[0..e.n]) |h| g.freeHandle(h);
+            if (e.reserved and g.kind == .nvidia) {
+                var a: [8]u8 = undefined;
+                wr64(&a, 0, e.va);
+                _ = g.call(G_UNRESERVE, &a);
+            }
+            // (the entry is free, its generation moved on)
+            const gen = e.gen +% 1;
             e.* = .{};
+            e.gen = gen;
+        }
+
+        /// Entry idx's handle: its index + 1, and the entry's generation
+        /// above (15 bits: a handle stays a positive 32-bit number).
+        fn handleOf(g: *const Self, idx: usize) u32 {
+            return @as(u32, @intCast(idx + 1)) | @as(u32, g.buffers[idx].gen & 0x7fff) << 16;
         }
 
         fn freeEntry(g: *Self) ?usize {
@@ -339,20 +389,26 @@ pub fn Node(comptime Sys: type) type {
             // (whole units: the RTX's pieces must start on 2 MiB)
             const piece = std.mem.alignForward(usize, @max(g.piece, g.unit), g.unit);
             if (g.fd < 0 or g.lost or size == 0 or size > MAX_PIECES * piece) return null;
-            const idx = g.freeEntry() orelse return null;
+            const idx = g.freeEntry() orelse {
+                report.say(.egl_error, "render-node buffer table is full allocating {d} bytes", .{size});
+                return null;
+            };
             const e = &g.buffers[idx];
             // (asked of the kernel in pages, which it rounds up to its
             // units; mapped, and laid out, in its units)
             const need = std.mem.alignForward(usize, size, PAGE);
             const len = std.mem.alignForward(usize, size, g.unit);
-            e.* = .{ .used = true, .first = @min(len, piece) };
+            e.* = .{ .used = true, .first = @min(len, piece), .gen = g.buffers[idx].gen };
             if (len <= piece) {
                 const p = g.newPiece(need, 0, flags) orelse return g.undo(e);
                 e.handles[0] = p.handle;
                 e.n = 1;
                 e.va = p.va;
                 const at = g.sys.mapBuffer(g.fd, 0, len, p.off);
-                if (at < 0) return g.undo(e);
+                if (at < 0) {
+                    report.say(.egl_error, "render-node mmap of {d} bytes failed: {d}", .{ len, at });
+                    return g.undo(e);
+                }
                 e.cpu = @intCast(at);
                 e.len = len;
             } else {
@@ -361,6 +417,7 @@ pub fn Node(comptime Sys: type) type {
                 wr64(&r, 0, len);
                 if (g.call(G_RESERVE, &r) != 0) return g.undo(e);
                 e.va = rd64(&r, 8);
+                e.reserved = true;
                 const span = g.sys.reserve(len);
                 if (span < 0) return g.undo(e);
                 e.cpu = @intCast(span);
@@ -374,7 +431,7 @@ pub fn Node(comptime Sys: type) type {
                     if (g.sys.mapBuffer(g.fd, want, part, p.off) != @as(i64, @intCast(want))) return g.undo(e);
                 }
             }
-            return .{ .va = e.va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..size], .handle = @intCast(idx + 1) };
+            return .{ .va = e.va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..size], .handle = g.handleOf(idx) };
         }
 
         fn undo(g: *Self, e: *Entry) ?Made {
@@ -382,9 +439,21 @@ pub fn Node(comptime Sys: type) type {
             return null;
         }
 
+        /// The entry a handle names, if its generation is the entry's. A
+        /// handle kept past its buffer's free (freed twice, used after the
+        /// free) is refused, and said once, instead of reaching the buffer
+        /// made in that entry since: entries are reused at once, the first
+        /// free one first, and freeing the wrong one takes a buffer the
+        /// GPU is still using from under it.
         fn entryOf(g: *Self, handle: u32) ?*Entry {
-            if (handle == 0 or handle > MAX_BUFFERS) return null;
-            const e = &g.buffers[handle - 1];
+            const idx = handle & 0xffff;
+            if (idx == 0 or idx > MAX_BUFFERS or handle >> 31 != 0) return null;
+            const e = &g.buffers[idx - 1];
+            if (e.gen & 0x7fff != handle >> 16) {
+                if (g.stale == 0) report.say(.egl_error, "a buffer handle used after its buffer was freed (handle 0x{x}, its entry now generation {d}): refused (said once)", .{ handle, e.gen & 0x7fff });
+                g.stale += 1;
+                return null;
+            }
             return if (e.used) e else null;
         }
 
@@ -398,7 +467,7 @@ pub fn Node(comptime Sys: type) type {
         /// buffer of this context: its GPU address, mapped here; null when
         /// the kernel refuses it.
         pub fn importFd(g: *Self, fd: i32) ?Buffer {
-            if (g.fd < 0 or g.lost or g.kind != .adreno) return null;
+            if (g.fd < 0 or g.lost or !g.dma_import) return null;
             const size_i = g.sys.fdSize(fd);
             if (size_i <= 0) return null;
             const size: usize = @intCast(size_i);
@@ -410,10 +479,18 @@ pub fn Node(comptime Sys: type) type {
             for (&g.buffers, 0..) |*e, i| {
                 if (e.used and e.n == 1 and e.handles[0] == kh) {
                     e.refs += 1;
-                    return .{ .va = e.va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..@min(size, e.len)], .handle = @intCast(i + 1) };
+                    return .{ .va = e.va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..@min(size, e.len)], .handle = g.handleOf(i) };
                 }
             }
             const idx = g.freeEntry() orelse return g.dropHandle(kh);
+            if (g.kind == .nvidia) {
+                var info_buf = [_]u8{0} ** 32;
+                wr32(&info_buf, 0, kh);
+                if (g.call(G_BUFFER_INFO, &info_buf) != 0) return g.dropHandle(kh);
+                const len = std.math.cast(usize, rd64(&info_buf, 24)) orelse return g.dropHandle(kh);
+                if (len < size or len % g.unit != 0) return g.dropHandle(kh);
+                return g.mapImported(idx, kh, rd64(&info_buf, 8), rd64(&info_buf, 16), len, size);
+            }
             var gi = [_]u8{0} ** 24;
             wr32(&gi, 0, kh);
             wr32(&gi, 4, 1); // MSM_INFO_GET_IOVA
@@ -422,12 +499,16 @@ pub fn Node(comptime Sys: type) type {
             wr32(&gi, 4, 0); // MSM_INFO_GET_OFFSET
             if (g.call(MSM_GEM_INFO, &gi) != 0) return g.dropHandle(kh);
             const len = std.mem.alignForward(usize, size, PAGE);
-            const at = g.sys.mapBuffer(g.fd, 0, len, rd64(&gi, 8));
+            return g.mapImported(idx, kh, va, rd64(&gi, 8), len, size);
+        }
+
+        fn mapImported(g: *Self, idx: usize, kh: u32, va: u64, off: u64, len: usize, size: usize) ?Buffer {
+            const at = g.sys.mapBuffer(g.fd, 0, len, off);
             if (at < 0) return g.dropHandle(kh);
             const e = &g.buffers[idx];
-            e.* = .{ .used = true, .va = va, .cpu = @intCast(at), .len = len, .first = len, .n = 1 };
+            e.* = .{ .used = true, .va = va, .cpu = @intCast(at), .len = len, .first = len, .n = 1, .gen = g.buffers[idx].gen };
             e.handles[0] = kh;
-            return .{ .va = va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..size], .handle = @intCast(idx + 1) };
+            return .{ .va = va, .cpu = @as([*]u8, @ptrFromInt(e.cpu))[0..size], .handle = g.handleOf(idx) };
         }
 
         fn dropHandle(g: *Self, kh: u32) ?Buffer {
@@ -435,8 +516,18 @@ pub fn Node(comptime Sys: type) type {
             return null;
         }
 
+        /// Whether the kernel makes a sync_file of fence 0 (one signalled
+        /// already): the file closed again at once.
+        fn probeFenceFd(g: *Self) bool {
+            var a = [_]u8{0} ** 8;
+            if (g.call(G_FENCE_FD, &a) != 0) return false;
+            g.sys.close(@bitCast(rd32(&a, 4)));
+            return true;
+        }
+
         /// A sync_file of the last submission (of any of this process's
-        /// GPU work: one in-order ring), or -errno.
+        /// GPU work: one in-order ring on the Adreno; on the RTX, this
+        /// context's own channel, which runs all of it), or -errno.
         pub fn fenceFd(g: *Self) i64 {
             var a = [_]u8{0} ** 8;
             wr32(&a, 0, g.last_seq);
@@ -492,9 +583,9 @@ pub fn Node(comptime Sys: type) type {
             wr64(&a, 24, start);
             if (g.call(G_IMPORT, &a) != 0) return null;
             const e = &g.buffers[idx];
-            e.* = .{ .used = true, .va = rd64(&a, 16), .n = 1 };
+            e.* = .{ .used = true, .va = rd64(&a, 16), .n = 1, .gen = g.buffers[idx].gen };
             e.handles[0] = rd32(&a, 12);
-            return .{ .va = e.va + (at - start), .cpu = cpu, .handle = @intCast(idx + 1) };
+            return .{ .va = e.va + (at - start), .cpu = cpu, .handle = g.handleOf(idx) };
         }
 
         fn importCall(ctx: *anyopaque, cpu: []u8, writable: bool) ?Buffer {
@@ -603,6 +694,9 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
         node: Node(Sys),
         over: gpu.adreno_device.Over = undefined,
         nv: if (with_nv) gpu.nvidia_device.Adapter else void = if (with_nv) .{} else {},
+        /// Ask for the RTX's 3D engine at open (GALAXY_GL_3D): the Device's
+        /// caps then offer graphics dispatches if the kernel gave it.
+        want_graphics: bool = false,
 
         pub const Error = Node(Sys).OpenError;
 
@@ -616,7 +710,9 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
                     return g.over.device();
                 },
                 .nvidia => if (with_nv) {
-                    return gpu.nvidia_device.over(&g.nv, g.node.nvDevice(.vram), g.node.nvDevice(.system), gpu.nvidia_device.rtx5070(@as(u64, info.vram_mib) << 20));
+                    var caps = gpu.nvidia_device.rtx5070(@as(u64, info.vram_mib) << 20);
+                    if (g.want_graphics and g.node.graphics()) caps = gpu.nvidia_device.withGraphics(caps);
+                    return gpu.nvidia_device.over(&g.nv, g.node.nvDevice(.vram), g.node.nvDevice(.system), caps);
                 },
             }
             g.node.close();
@@ -644,8 +740,13 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
         /// A dma-buf as a gpu.Buffer of this GPU (freed as any of its
         /// buffers), or null.
         pub fn importFd(g: *Self, fd: i32) ?gpu.Buffer {
-            if (g.node.kind != .adreno) return null;
             const b = g.node.importFd(fd) orelse return null;
+            if (with_nv and g.node.kind == .nvidia) {
+                return g.nv.adoptHost(.{ .va = b.va, .cpu = b.cpu, .handle = b.handle }) orelse {
+                    g.node.freeIn(b.handle);
+                    return null;
+                };
+            }
             return .{ .gpu = b.va, .cpu = b.cpu, .bytes = b.cpu.len, .handle = b.handle, .kind = .host };
         }
 
@@ -781,6 +882,7 @@ fn wr64(b: []u8, o: usize, v: u64) void {
 /// bytes; PRIME gives fd 100 + the kernel's handle.
 pub const Fake = struct {
     emu: *adreno.device.EmuDevice,
+    chip: u32 = CHIP_X1_45,
     present: bool = true,
     hung: bool = false,
     /// Waits run out (the GPU is slow).
@@ -794,6 +896,10 @@ pub const Fake = struct {
     exports: u32 = 0,
     prime_imports: u32 = 0,
     fence_fds: u32 = 0,
+    /// G_FENCE_FD answered (false: an older PC kernel's EINVAL).
+    fence_files: bool = true,
+    /// Descriptors closed.
+    closes: u32 = 0,
     reserved: usize = 0,
     import_va: u64 = 0x80_0000_0000,
 
@@ -804,17 +910,28 @@ pub const Fake = struct {
     pub fn open(k: *Fake, _: [*:0]const u8) i64 {
         return if (k.present) 3 else -2;
     }
-    pub fn close(_: *Fake, _: i32) void {}
+    pub fn close(k: *Fake, _: i32) void {
+        k.closes += 1;
+    }
 
     pub fn ioctl(k: *Fake, _: i32, req: u32, a: []u8) i64 {
         if (k.hung and req != G_INFO and req != G_FREE) return -EIO;
         switch (req) {
             G_INFO => {
                 wr32(a, 0, G_VERSION);
-                wr32(a, 4, CHIP_X1_45);
+                wr32(a, 4, k.chip);
                 wr32(a, 12, @intFromBool(k.hung));
             },
             G_RESERVE => wr64(a, 8, k.emu.va_base + k.next()),
+            G_BUFFER_INFO => {
+                const handle = rd32(a, 0);
+                if (handle == 0) return 0;
+                if (handle >= k.pieces.len or k.pieces[handle].va == 0) return -EINVAL;
+                const buf = k.pieces[handle];
+                wr64(a, 8, buf.va);
+                wr64(a, 16, @as(u64, handle) << 32);
+                wr64(a, 24, buf.cpu.len);
+            },
             G_ALLOC => {
                 k.allocs += 1;
                 if (k.allocs == k.fail_alloc) return -12;
@@ -860,6 +977,7 @@ pub const Fake = struct {
                 k.emu.device().wait(rd32(a, 0), 0) catch return -EINVAL;
             },
             G_FENCE_FD => {
+                if (!k.fence_files) return -EINVAL;
                 k.fence_fds += 1;
                 wr32(a, 4, 300 + rd32(a, 0));
             },
@@ -951,6 +1069,82 @@ test "node: the calls' numbers are galaxy_gpu_drm's and DRM's" {
     try std.testing.expectEqual(@as(u32, 0x80000), DRM_CLOEXEC);
 }
 
+test "node: RTX PRIME import maps a shared buffer and counts repeated imports" {
+    var k: Fake = undefined;
+    var g = testNode(&k);
+    k.chip = CHIP_GB206;
+    _ = try g.open();
+    defer g.close();
+    try std.testing.expect(g.dma_import);
+    const external = g.newPiece(NV_UNIT, 0, 0).?;
+    const fd: i32 = @intCast(100 + external.handle);
+    const first = g.importFd(fd).?;
+    const second = g.importFd(fd).?;
+    try std.testing.expectEqual(external.va, first.va);
+    try std.testing.expectEqual(NV_UNIT, first.cpu.len);
+    try std.testing.expectEqual(first.handle, second.handle);
+    first.cpu[17] = 42;
+    try std.testing.expectEqual(@as(u8, 42), second.cpu[17]);
+    g.freeIn(first.handle);
+    try std.testing.expectEqual(@as(u32, 1), k.live);
+    g.freeIn(second.handle);
+    try std.testing.expectEqual(@as(u32, 0), k.live);
+}
+
+test "node: a buffer freed twice does not free the buffer made in its entry since" {
+    var k: Fake = undefined;
+    var g = testNode(&k);
+    _ = try g.open();
+    const d = g.device();
+    const a = try d.alloc(5000);
+    d.free(a);
+    // (its entry is the first free one: the next buffer takes it)
+    const b = try d.alloc(9000);
+    try std.testing.expectEqual(a.handle & 0xffff, b.handle & 0xffff);
+    try std.testing.expect(a.handle != b.handle);
+    const kh = g.buffers[(b.handle & 0xffff) - 1].handles[0];
+    // the first buffer freed again, and asked for as a dma-buf: refused,
+    // and the second is whole (its entry, its kernel buffer, its export)
+    d.free(a);
+    try std.testing.expectEqual(@as(u32, 1), g.stale);
+    try std.testing.expectEqual(@as(i64, -EINVAL), g.exportFd(a.handle));
+    try std.testing.expect(g.buffers[(b.handle & 0xffff) - 1].used);
+    try std.testing.expectEqual(kh, g.buffers[(b.handle & 0xffff) - 1].handles[0]);
+    try std.testing.expectEqual(@as(i64, 100 + kh), g.exportFd(b.handle));
+    b.cpu[0] = 9;
+    d.toDevice(b, 0, 1);
+    try std.testing.expectEqual(@as(u8, 9), test_gpu_view[@intFromPtr(b.cpu.ptr) - @intFromPtr(&test_arena)]);
+    d.free(b);
+    try std.testing.expect(!g.buffers[(b.handle & 0xffff) - 1].used);
+}
+
+test "node: native fences: the Adreno's always; the RTX's when the kernel makes a sync_file of fence 0" {
+    var k: Fake = undefined;
+    var g = testNode(&k);
+    _ = try g.open();
+    try std.testing.expect(g.native_fences);
+    try std.testing.expectEqual(@as(u32, 0), k.fence_fds); // (the Adreno's: no probe)
+    g.close();
+    g = testNode(&k);
+    k.chip = CHIP_GB206;
+    _ = try g.open();
+    try std.testing.expect(g.native_fences);
+    try std.testing.expectEqual(@as(u32, 1), k.fence_fds);
+    try std.testing.expectEqual(@as(u32, 1), k.closes); // (the probe's file)
+    try std.testing.expect(!g.lost);
+    try std.testing.expectEqual(@as(i64, 300), g.fenceFd());
+    g.close();
+    // an older PC kernel: G_FENCE_FD's EINVAL leaves them off, the GPU up
+    g = testNode(&k);
+    k.chip = CHIP_GB206;
+    k.fence_files = false;
+    _ = try g.open();
+    try std.testing.expect(!g.native_fences);
+    try std.testing.expect(!g.lost);
+    try std.testing.expectEqual(@as(i64, -EINVAL), g.fenceFd());
+    g.close();
+}
+
 test "node: buffers, an import, an export, a hang, no GPU" {
     var k: Fake = undefined;
     var g = testNode(&k);
@@ -966,7 +1160,7 @@ test "node: buffers, an import, an export, a hang, no GPU" {
     try std.testing.expectEqual(@as(u8, 7), test_gpu_view[@intFromPtr(b.cpu.ptr) - @intFromPtr(&test_arena)]);
     // an export: the buffer's kernel handle as PRIME's
     const fd = g.exportFd(b.handle);
-    try std.testing.expectEqual(@as(i64, 100 + g.buffers[b.handle - 1].handles[0]), fd);
+    try std.testing.expectEqual(@as(i64, 100 + g.buffers[(b.handle & 0xffff) - 1].handles[0]), fd);
     try std.testing.expectEqual(@as(i64, -EINVAL), g.exportFd(77));
     // an import: the CPU's bytes in place, at their offset in the page
     var mine: [3 * PAGE]u8 align(PAGE) = undefined;

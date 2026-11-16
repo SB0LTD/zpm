@@ -120,7 +120,64 @@ The model stays on the safe side of each.
   - Warps: `SHFL` (`IDX`, `UP`, `DOWN`, `BFLY`; lane and clamp registers or immediates), `VOTE` (`ALL`, `ANY`, `EQ`), `BAR.SYNC.DEFER_BLOCKING` and `BAR.ARV`, `WARPSYNC`, `S2R`, `CS2R`.
   - Control flow: `BRA` (with a predicate), `BRA.U`, `BSSY` and `BSYNC` (`.RECONVERGENT`), `CALL.REL.NOINC`, `RET.REL.NODEC`, `EXIT`, `NOP`.
   - Tensor cores: `HMMA.16816.F32`, `HMMA.16816.F32.BF16`, `HMMA.1688.F16`, `IMMA.16832.S8.S8`, `IMMA.16832.U8.S8`, `IMMA.16816.S8.S8`.
-- **Not covered:** what ptxas emits for warp-collective code it can't prove converged (`BRA.DIV`, `WARPSYNC.COLLECTIVE`, `MATCH`, `REDUX`), `BAR.RED` and `BAR.SCAN`, `BAR` with its barrier in a register, `LDS`'s scaled index (`[R9.X4]`), a 32-bit register in a global address (`.U32`), negative constant offsets, `MUFU.RCP64H` and `RSQ64H`, int4 `IMMA`, `FFMA.FMZ`, 64-bit and float atomics, `RED`, `ATOMG.CAS`, textures and surfaces.
+- **Not covered:** what ptxas emits for warp-collective code it can't prove converged (`BRA.DIV`, `WARPSYNC.COLLECTIVE`, `MATCH`, `REDUX`), `BAR.RED` and `BAR.SCAN`, `BAR` with its barrier in a register, `LDS`'s scaled index (`[R9.X4]`), a 32-bit register in a global address (`.U32`), negative constant offsets, `MUFU.RCP64H` and `RSQ64H`, int4 `IMMA`, `FFMA.FMZ`, 64-bit and float atomics, `RED`, `ATOMG.CAS`, surfaces, and of the graphics stages' instructions all but those below.
+
+### The graphics stages
+
+A vertex and a pixel program need seven instructions beside the ALU's: `ALD`, `AST`, `IPA`, `PIXLD`, `KILL`, `TEX` and `TLD`. ptxas compiles compute kernels only, so there is no output of its to compare with. Their fields are NAK's (`sm70_encode.rs`), and their text is nvdisasm's reading of raw words, the same from CUDA 13.1 and 13.4. `testdata/sm120_gfx_raw.txt` holds 189 such words, with the `FMUL.RZ`, `MUFU.RCP` and `EXIT` a pixel program has beside them. The tests assemble each line's text to its word, control field included, then decode the word and print it as nvdisasm did. What goes in front of such a program is `sph.sig`'s header.
+
+- **Attributes.** An address is in bytes: the position at 0x70..0x7c, generic vector n at 0x80 + 16n, the instance's and the vertex's index at 0x2f8 and 0x2fc.
+  - Loads: `ALD R0, a[0x2fc]`, and two to four words into consecutive registers with `.64`, `.96` and `.128` (`ALD.128 R4, a[0x80]`). `.O` reads an output back. Another vertex's attributes take a vertex register last (`ALD.O R4, a[0x88], R4`). An index register goes with `.P`, patch attributes (`ALD.P R5, a[R7+0x20]`), and with `.PHYS`, a physical address (`ALD.PHYS R5, a[R7]`), and with nothing else.
+  - Stores: `AST.128 a[0x70], R4`, the address first, then the first of the registers; `AST.64`, `AST.96`, `AST.P`, `AST.PHYS`, a vertex register last.
+- **A pixel's inputs:** `IPA.PASS R0, a[0x7c]`, `IPA.CONSTANT R6, a[0x3fc]` and `IPA.STATE`, at the pixel's centre, at the centroid (`IPA.PASS.CENTROID R1, a[0x80]`) or at an offset in a register (`IPA.PASS.OFFSET R5, a[0x80], R9`). A predicate result is printed after the destination when there is one (`IPA.PASS R5, P0, a[0x80]`). Perspective isn't in the instruction. The header's map says how a word is carried, and the program multiplies by the reciprocal of `a[0x7c]`: `MUFU.RCP R0, R0`, then `FMUL.RZ R1, R1, R0`.
+- **A pixel's samples:** `PIXLD R0` (their count), `PIXLD.COVMASK R0`, `.CENTROID_OFFSET`, `.MY_INDEX`, `.INNER_COVERAGE`, with a predicate result too (`PIXLD.COVMASK R5, P0`).
+- **Discard:** `KILL`, `@P0 KILL` and `@!P0 KILL` (by the guard, as NAK writes it), or by its own predicate (`KILL P1`, `KILL !P0`).
+- **Textures** are bindless: the handle is in a register.
+  - `TEX.B.DXY R2, R0, R4, R6, 2D` is NAK's `texture()` on sm_120. The second destination is printed first (R2: blue and alpha), then the first (R0: red and green), the coordinates (R4, R5), the handle (R6) and the dimension: `1D`, `2D`, `3D`, `CUBE`, `ARRAY_1D`, `ARRAY_2D`, `ARRAY_CUBE`.
+  - The channel mask is printed when it isn't all four, and the second destination is `RZ` when the mask leaves it none: `TEX.B.DXY RZ, R0, R4, R6, 2D, 0x3`. A fault predicate goes first when there is one (`TEX.B.DXY P0, R12, R10, R7, R9, 2D`), and a uniform register after the handle.
+  - Modifiers print in this order: `.SCR`, `.B`, `.F16.RN` or `.F16.RZ`, the level of detail (`.LZ`, `.LB`, `.LL`, `.LC`, `.LB.LC`, and `.ULB`, `.ULL`, `.ULC`, `.ULB.LC`, `.LB.ULC`), `.AOFFI` or `.UAOFFI`, `.UAI`, `.DC`, the eviction priority (`.EF`, `.EL`, `.LU`, `.EU`, `.NA`), `.NDV` or `.DXY`, `.NODEP`. So `TEX.B.LZ R2, R0, R4, R6, 2D` and `TEX.B.DXY.NODEP R2, R0, R4, R6, 2D`.
+  - A texel fetch is `TLD.B.LZ R2, R0, R4, R6, 2D`, with `.LL` or `.ULL` for the level, then the offsets, the eviction priority, `.MS` or `.UMS`, `.CL` and `.NODEP`. It has no cubes.
+- **Refused,** because nvdisasm calls the word illegal or prints part of it as invalid: an index register without `.P` or `.PHYS`; `.PHYS` without one, with `.P`, or of more than one word; `.P` with a vertex register (`AST.P` takes one without an index); `IPA` at place 3 or frequency 3; `PIXLD`'s values 5 to 7; a texture source that is `RZ`; derivative mode 2, dimension 6, levels 11 to 15, eviction 6 and 7; `AST` with a write scoreboard, and `KILL` with any.
+- **The control fields.** All seven are variable latency, in NAK's categories: attribute loads and stores, `IPA` and `PIXLD` as memory is (`decoupled_agu`), textures and `KILL` as `decoupled`, a texture's uniform register as `tex`. Three choices here go beyond what NAK says, each to the safe side:
+  - a texture's sources count as the longest vector, four registers each (their real lengths depend on the dimension and the modes), and each destination as at least one register;
+  - `KILL`'s own predicate, which NAK never uses, is read as a decoupled one, a predicate's worst case;
+  - `AST` and `KILL` get no scoreboard they can't carry from the model itself: `AST` writes no register, and `KILL` touches none. `EXIT`, as every branch does, waits on what is still out, so the `EXIT` after the last store carries the stores' read scoreboards.
+
+  The tests schedule a five-instruction vertex program and an eleven-instruction pixel program (two interpolations in perspective, a texture, a discard under its guard), check them against the model, and pin the result. nvdisasm takes every word of both.
+- **Not covered:** the forms with a uniform index (`ALD` 0x521, `AST` 0x522, `IPA` 0x526) and `IPA`'s offset as an immediate (0x926); `AL2P`; the other texture ops (`TLD4`, `TXD`, `TXQ`, `TMML`) and the 0xf6x forms without `.B`; the geometry and tessellation stages' `OUT`, `ISBERD` and `ISBEWR`; `LDTRAM`. An instruction holds eight modifiers, so the few texture words nvdisasm prints with more (`TEX.SCR.B.F16.RN.LZ.AOFFI.DC.EF.DXY.NODEP`) aren't read. The emulator doesn't run any of these yet. Nothing here has run on the RTX.
+
+### Graphics stages in the emulator
+
+`sm120_emu.sig` runs a vertex and a pixel program, for the emulated 3D engine the driver is tested against before the RTX. `stageBegin` starts the threads (every register garbage: nothing is preloaded in either stage) and `stageRun` runs them to `EXIT` in warps of 32, with the timing checks a compute launch gets. A `Stage` carries what the engine gives the threads and takes back:
+
+- **In:** a thread's attribute words. A vertex program loads them with `ALD` (the engine writes the vertex's index at word 0x2fc / 4, a vertex buffer's words where the streams put them). A pixel program reads them with `IPA`, already carried across the triangle by the engine as the header says.
+- **Out:** the words a vertex program stores with `AST`, and a bit for each word a thread stored. A pixel program's colour is what R0..R3 hold at `EXIT` (`threadReg`), and `killed` says which pixels `KILL` discarded.
+- **Constant buffers,** as a launch has them, and two callbacks into the engine: `sample` for `TEX` and `fetch` for `TLD`.
+
+What each instruction does there:
+
+- `ALD` and `AST` move one to four words between a thread's words and its registers. A vector starts where NAK starts one: two words at a multiple of 8, three or four at a multiple of 16.
+- `IPA.PASS` and `IPA.CONSTANT` read the pixel's word at its centre. Nothing in the instruction multiplies it: perspective is the header's, and the program's own `FMUL.RZ` by `MUFU.RCP` of `a[0x7c]`.
+- `KILL` marks the pixel discarded where its guard says. The thread runs on to its `EXIT`, as NAK has it (a demotion, not an end).
+- `TEX.B` (with `.LZ`, `.NDV`, `.DXY`, `.NODEP`) calls `sample` with the handle and two float coordinates; `TLD.B.LZ` and `.LL` call `fetch` with the handle, two integers and the level. The channels the mask names go to registers in order: the first two from the first destination, the rest from the second. The level of detail and the derivatives are the engine's: the callback is given one pixel's coordinates.
+
+With the program's header (`sph.sig`) in the Stage, the emulator holds the program to it, as `error.HeaderMismatch`:
+
+- a word loaded or stored that the header doesn't declare, a store outside the range of stored words it gives, a load after a store when it says there is none, a discard it doesn't declare;
+- a word read flat (`IPA.CONSTANT`) that the header carries across the triangle, or the other way;
+- at the end, a word the header declares stored that a thread never stored, and an output register (a colour's, the sample mask's, the depth's) a pixel that wasn't discarded never wrote.
+
+A header of the other kind, or a pixel header that doesn't read the position's w, is a bad launch.
+
+The control fields are checked as a kernel's are. All of these set scoreboards, and nothing may read a result, or overwrite a register a store still reads, before a wait on the right one. A texture is held to the registers it really touches (two coordinates, the handle, a result register per channel), which are among the ones `sm120_sched` schedules for. One check is a stage's own: an `EXIT` must issue with no scoreboard still out, as NAK schedules it.
+
+What it refuses, each with a sentence from `explain`:
+
+- **Not this stage's** (`error.BadInstruction`): a graphics instruction in a compute launch; `BAR`, shared memory and the thread's or the CTA's special registers in a stage; `ALD` and `AST` in a pixel program; `IPA`, `PIXLD` and `KILL` in a vertex program.
+- **No data in a Stage** (`error.Unsupported`): `PIXLD` in every form (a Stage says nothing of a pixel's samples), `IPA.CENTROID` and `IPA.OFFSET`, an attribute past 0x2fc (the front face, the barycentrics), local memory, a constant buffer past the eighth, a texture instruction without its callback.
+- **Not known well enough to run** (`error.Unsupported`): `IPA.STATE`, a predicate result from `IPA`, `KILL` with its own predicate, `ALD.O`, the patch and physical forms, a vertex register, a vector NAK would have split, and of the textures every dimension but `2D`, a level from a register for `TEX`, texel offsets, `.DC`, `.SCR`, `.UAI`, the `.F16` pair, the eviction priorities, `.MS`, `.UMS`, `.CL`, a fault predicate and a uniform register.
+
+Not checked: a register read before anything wrote it, the register count the engine programs for the stage, and whether vectors sit at the registers NAK aligns them to. None of this has been compared with the hardware.
 
 ## Writing kernels: the syntax
 

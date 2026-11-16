@@ -168,6 +168,7 @@ const cases = [_]Case{
     // loses the device and ends the run)
     .{ .name = "global atomics", .run = caseAtomics },
     .{ .name = "shared atomics", .run = caseSharedAtomics },
+    .{ .name = "compare-and-swap and ballots", .run = caseCas },
     .{ .name = "divergent if/else", .run = caseDivergentIf },
     .{ .name = "divergent loops", .run = caseLoops },
 };
@@ -1669,6 +1670,7 @@ fn caseVotes(s: *Suite, name: []const u8) void {
 const atom_ops = [_]struct { kind: kir.Atom, ty: Ty }{
     .{ .kind = .add, .ty = .u32 }, .{ .kind = .min, .ty = .u32 }, .{ .kind = .max, .ty = .u32 }, .{ .kind = .xchg, .ty = .u32 },
     .{ .kind = .add, .ty = .i32 }, .{ .kind = .min, .ty = .i32 }, .{ .kind = .max, .ty = .i32 }, .{ .kind = .xchg, .ty = .i32 },
+    .{ .kind = .@"and", .ty = .u32 }, .{ .kind = .@"or", .ty = .u32 }, .{ .kind = .xor, .ty = .u32 },
 };
 const contended = [_]struct { kind: kir.Atom, ty: Ty, init: u32 }{
     .{ .kind = .add, .ty = .u32, .init = 0 },
@@ -1685,7 +1687,7 @@ fn caseAtomics(s: *Suite, name: []const u8) void {
     const lane = s.linear(&k);
     const off = k.op2(.shl, .u32, r(lane), u(2));
     const v = k.load(.u32, kir.global(IN0, 32), r(off));
-    const CNT = 16 * L;
+    const CNT = 2 * @as(u32, atom_ops.len) * L;
     const TICK = CNT + 128;
     const SLOTS = TICK + 1;
     // each lane its own word: the old values are the first contents
@@ -1693,7 +1695,7 @@ fn caseAtomics(s: *Suite, name: []const u8) void {
         const val = k.op2(.xor, .u32, r(v), u(@as(u32, @intCast(q)) *% 0x1111_1111));
         const o = k.op2(.iadd, .u32, r(off), u(@as(u32, @intCast(q)) * L * 4));
         const old = k.atomic(a.ty, a.kind, kir.global(OUT, 32), r(o), r(val));
-        Suite.put(&k, off, @intCast(8 + q), L, .u32, old);
+        Suite.put(&k, off, @intCast(atom_ops.len + q), L, .u32, old);
     }
     // the whole grid on 16 words of each kind: only the end is defined
     const slot4 = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(lane), u(15))), u(2));
@@ -1714,6 +1716,43 @@ fn caseAtomics(s: *Suite, name: []const u8) void {
     };
     s.w.want[TICK] = 0;
     @memset(s.w.want[SLOTS..][0..L], 0);
+    if (!s.execute(name, &k, .{ 4, 1, 1 }, &.{}, words, null)) return;
+    s.compare(name, .{ .lanes = 0, .words = words }, &.{}, "");
+}
+
+/// Compare-and-swap (each lane's own word: swapped where its guess is
+/// right, kept where not; a counter the whole grid increments by CAS
+/// loops) and ballots (the whole subgroup, the second word, divergent).
+fn caseCas(s: *Suite, name: []const u8) void {
+    const G = s.group;
+    const L: u32 = 4 * G;
+    var k = s.begin(name, .{ G, 1, 1 });
+    const lane = s.linear(&k);
+    const off = k.op2(.shl, .u32, r(lane), u(2));
+    const v = k.load(.u32, kir.global(IN0, 32), r(off));
+    const w1 = k.load(.u32, kir.global(IN1, 32), r(off));
+    const cur = k.load(.u32, kir.global(OUT, 32), r(off));
+    const odd = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(lane), u(1))), u(0));
+    const guess = k.sel(.u32, r(odd), r(cur), r(k.op2(.xor, .u32, r(cur), u(1))));
+    const old = k.cas(.u32, kir.global(OUT, 32), r(off), r(guess), r(w1));
+    Suite.put(&k, off, 1, L, .u32, old);
+    const p = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(v), u(1))), u(0));
+    Suite.put(&k, off, 2, L, .u32, k.ballot(r(p), 0));
+    Suite.put(&k, off, 3, L, .u32, k.ballot(r(p), 1));
+    k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(w1), u(2))), u(0))));
+    Suite.put(&k, off, 4, L, .u32, k.ballot(r(p), 0));
+    k.endif();
+    const CNT = 5 * L;
+    const exp = k.mov(.u32, u(0));
+    k.loop();
+    const got = k.cas(.u32, kir.global(OUT, 32), u(CNT * 4), r(exp), r(k.op2(.iadd, .u32, r(exp), u(1))));
+    k.brk(r(k.cmp(.u32, .eq, r(got), r(exp))));
+    k.set(exp, .mov, r(got), no, no);
+    k.endloop();
+    fillRandom(s);
+    const words: usize = CNT + 1;
+    fillPattern(s.w.want[0..words]);
+    s.w.want[CNT] = 0;
     if (!s.execute(name, &k, .{ 4, 1, 1 }, &.{}, words, null)) return;
     s.compare(name, .{ .lanes = 0, .words = words }, &.{}, "");
 }

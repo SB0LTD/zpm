@@ -8,7 +8,10 @@
 //! nothing, as with Mesa's no-op table.
 //!
 //! The current context is per thread (thread.sig: a fixed table keyed by
-//! the thread pointer, no thread-local storage).
+//! the thread pointer, no thread-local storage). Every entry point holds
+//! the driver lock (egl.sig's, re-entrant) for its whole call: the
+//! process's contexts share one engine and one GPU device, and an app may
+//! have contexts current on several threads at once.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -54,6 +57,11 @@ inline fn cur() ?*Context {
     return thread.gl();
 }
 
+// ── The driver lock (egl.sig), taken first by every entry point ────────────
+
+const driverEnter = gfxapi.egl.driverEnter;
+const driverLeave = gfxapi.egl.driverLeave;
+
 /// eglGetProcAddress's answer for a GL name: the entry point, or null.
 pub fn getProcAddress(name: [*:0]const u8) ?*const anyopaque {
     const s = std.mem.span(name);
@@ -98,62 +106,89 @@ fn count(n: i32) ?usize {
 // ── The entry points ───────────────────────────────────────────────────────
 
 pub export fn glGetError() callconv(.c) u32 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.NO_ERROR;
     return c.getError();
 }
 pub export fn glGetGraphicsResetStatus() callconv(.c) u32 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.NO_ERROR;
     return c.getGraphicsResetStatus();
 }
 pub export fn glGetGraphicsResetStatusEXT() callconv(.c) u32 {
+    driverEnter();
+    defer driverLeave();
     return glGetGraphicsResetStatus();
 }
 pub export fn glGetGraphicsResetStatusKHR() callconv(.c) u32 {
+    driverEnter();
+    defer driverLeave();
     return glGetGraphicsResetStatus();
 }
 pub export fn glGetString(name: u32) callconv(.c) ?[*:0]const u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return null;
     return c.getString(name);
 }
 pub export fn glGetStringi(name: u32, index: u32) callconv(.c) ?[*:0]const u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return null;
     return c.getStringi(name, index);
 }
 pub export fn glEnable(cap: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.enable(cap, true);
 }
 pub export fn glDisable(cap: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.enable(cap, false);
 }
 pub export fn glIsEnabled(cap: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(c.isEnabled(cap));
 }
 pub export fn glHint(target: u32, mode: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.hint(target, mode);
 }
 pub export fn glPixelStorei(pname: u32, param: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.pixelStore(pname, param);
 }
 pub export fn glFlush() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.flush();
 }
 pub export fn glFinish() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.finish();
 }
 pub export fn glGetIntegerv(pname: u32, data: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const p = data orelse return;
     c.getIntegers(pname, p[0..4]);
 }
 pub export fn glGetInteger64v(pname: u32, data: ?[*]i64) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const p = data orelse return;
     var v: [4]i32 = undefined;
-    const x = c.get(pname) orelse {
-        if (c.err == g.NO_ERROR) c.err = g.INVALID_ENUM;
-        return;
-    };
+    const x = c.get(pname) orelse return c.invalidEnum("glGetInteger64v", pname);
     if (x.kind == .int) {
         @memcpy(p[0..x.n], x.i[0..x.n]);
         return;
@@ -162,258 +197,982 @@ pub export fn glGetInteger64v(pname: u32, data: ?[*]i64) callconv(.c) void {
     for (0..x.n) |i| p[i] = v[i];
 }
 pub export fn glGetFloatv(pname: u32, data: ?[*]f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const p = data orelse return;
     c.getFloats(pname, p[0..4]);
 }
 pub export fn glGetBooleanv(pname: u32, data: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const p = data orelse return;
     c.getBooleans(pname, p[0..4]);
 }
 
 pub export fn glClearColor(r: f32, gr: f32, bl: f32, a: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.clearColor(r, gr, bl, a);
 }
 pub export fn glClearDepthf(d: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.clearDepth(d);
 }
 pub export fn glClearStencil(s: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.clearStencil(s);
 }
+pub export fn glStencilFunc(func: u32, reference: i32, mask: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.stencilFuncSeparate(g.FRONT_AND_BACK, func, reference, mask);
+}
+pub export fn glStencilFuncSeparate(face: u32, func: u32, reference: i32, mask: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.stencilFuncSeparate(face, func, reference, mask);
+}
+pub export fn glStencilOp(fail: u32, depth_fail: u32, pass: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.stencilOpSeparate(g.FRONT_AND_BACK, fail, depth_fail, pass);
+}
+pub export fn glStencilOpSeparate(face: u32, fail: u32, depth_fail: u32, pass: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.stencilOpSeparate(face, fail, depth_fail, pass);
+}
 pub export fn glColorMask(r: u8, gr: u8, bl: u8, a: u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.colorMask(b(r), b(gr), b(bl), b(a));
 }
 pub export fn glDepthMask(flag: u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.depthMask(b(flag));
 }
 pub export fn glStencilMask(mask: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.stencilMaskSeparate(0x0408, mask);
 }
 pub export fn glStencilMaskSeparate(face: u32, mask: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.stencilMaskSeparate(face, mask);
 }
 pub export fn glViewport(x: i32, y: i32, w: i32, h: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.viewportSet(x, y, w, h);
 }
 pub export fn glScissor(x: i32, y: i32, w: i32, h: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.scissorSet(x, y, w, h);
 }
 pub export fn glClear(mask: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.clear(mask);
 }
 pub export fn glClearBufferfv(buffer: u32, drawbuffer: i32, value: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const v = value orelse return;
-    c.clearBufferf(buffer, drawbuffer, v[0 .. if (buffer == g.COLOR) 4 else 1]);
+    c.clearBufferf(buffer, drawbuffer, v[0..if (buffer == g.COLOR) 4 else 1]);
 }
 pub export fn glClearBufferiv(buffer: u32, drawbuffer: i32, value: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const v = value orelse return;
-    c.clearBufferi(buffer, drawbuffer, v[0 .. if (buffer == g.COLOR) 4 else 1]);
+    c.clearBufferi(buffer, drawbuffer, v[0..if (buffer == g.COLOR) 4 else 1]);
 }
 pub export fn glClearBufferuiv(buffer: u32, drawbuffer: i32, value: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     _ = value;
     if (cur()) |c| c.clearBufferu(buffer, drawbuffer);
 }
 pub export fn glClearBufferfi(buffer: u32, drawbuffer: i32, depth: f32, stencil: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.clearBufferfi(buffer, drawbuffer, depth, stencil);
 }
 pub export fn glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.readPixels(x, y, w, h, format, ty, pixels);
 }
 pub export fn glReadnPixels(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, buf_size: i32, pixels: ?*anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.readnPixels(x, y, w, h, format, ty, buf_size, pixels);
 }
 pub export fn glReadnPixelsEXT(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, buf_size: i32, pixels: ?*anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     glReadnPixels(x, y, w, h, format, ty, buf_size, pixels);
 }
 pub export fn glReadnPixelsKHR(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, buf_size: i32, pixels: ?*anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     glReadnPixels(x, y, w, h, format, ty, buf_size, pixels);
 }
 
 pub export fn glGenTextures(n: i32, out: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (out) |p| c.genTextures(p[0..k]);
 }
 pub export fn glDeleteTextures(n: i32, names: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (names) |p| c.deleteTextures(p[0..k]);
 }
 pub export fn glIsTexture(name: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(c.isTexture(name));
 }
 pub export fn glActiveTexture(unit: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.activeTexture(unit);
 }
 pub export fn glBindTexture(target: u32, name: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.bindTexture(target, name);
 }
 pub export fn glTexImage2D(target: u32, level: i32, internal: i32, w: i32, h: i32, border: i32, format: u32, ty: u32, pixels: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.texImage2D(target, level, internal, w, h, border, format, ty, pixels);
 }
 pub export fn glTexSubImage2D(target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.texSubImage2D(target, level, x, y, w, h, format, ty, pixels);
 }
 pub export fn glTexStorage2D(target: u32, levels: i32, internal: u32, w: i32, h: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.texStorage2D(target, levels, internal, w, h);
 }
 pub export fn glTexStorage2DEXT(target: u32, levels: i32, internal: u32, w: i32, h: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     glTexStorage2D(target, levels, internal, w, h);
 }
+pub export fn glTexStorage3D(target: u32, levels: i32, internal: u32, w: i32, h: i32, depth: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.texStorage3D(target, levels, internal, w, h, depth);
+}
+pub export fn glTexStorage3DEXT(target: u32, levels: i32, internal: u32, w: i32, h: i32, depth: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    glTexStorage3D(target, levels, internal, w, h, depth);
+}
+pub export fn glTexSubImage3D(target: u32, level: i32, x: i32, y: i32, z: i32, w: i32, h: i32, depth: i32, format: u32, ty: u32, pixels: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.texSubImage3D(target, level, x, y, z, w, h, depth, format, ty, pixels);
+}
+pub export fn glTexImage3D(target: u32, level: i32, internal: i32, w: i32, h: i32, depth: i32, border: i32, format: u32, ty: u32, pixels: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.texImage3D(target, level, internal, w, h, depth, border, format, ty, pixels);
+}
 pub export fn glTexParameteri(target: u32, pname: u32, param: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.texParameteri(target, pname, param);
 }
 pub export fn glTexParameterf(target: u32, pname: u32, param: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     glTexParameteri(target, pname, @intFromFloat(std.math.clamp(@round(param), -2147483648.0, 2147483647.0)));
 }
 pub export fn glTexParameteriv(target: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
-    if (params) |p| glTexParameteri(target, pname, p[0]);
+    driverEnter();
+    defer driverLeave();
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.texBorder(target, borderNormalized(p));
+        return;
+    }
+    glTexParameteri(target, pname, p[0]);
 }
 pub export fn glTexParameterfv(target: u32, pname: u32, params: ?[*]const f32) callconv(.c) void {
-    if (params) |p| glTexParameterf(target, pname, p[0]);
+    driverEnter();
+    defer driverLeave();
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.texBorder(target, borderFloats(p));
+        return;
+    }
+    glTexParameterf(target, pname, p[0]);
+}
+/// glTexParameterIiv and Iuiv (ES 3.2, OES/EXT_texture_border_clamp): the
+/// border color's integers as they are; anything else as glTexParameteriv.
+pub export fn glTexParameterIiv(target: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.texBorder(target, .{ @bitCast(p[0]), @bitCast(p[1]), @bitCast(p[2]), @bitCast(p[3]) });
+        return;
+    }
+    glTexParameteri(target, pname, p[0]);
+}
+pub export fn glTexParameterIuiv(target: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glTexParameterIiv(target, pname, @ptrCast(params));
+}
+pub export fn glTexParameterIivOES(target: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    glTexParameterIiv(target, pname, params);
+}
+pub export fn glTexParameterIuivOES(target: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glTexParameterIiv(target, pname, @ptrCast(params));
+}
+pub export fn glTexParameterIivEXT(target: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    glTexParameterIiv(target, pname, params);
+}
+pub export fn glTexParameterIuivEXT(target: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glTexParameterIiv(target, pname, @ptrCast(params));
 }
 pub export fn glGetTexParameteriv(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getTexBorder(target) orelse return;
+        if (params) |p| putNormalized(w, p);
+        return;
+    }
     const v = c.getTexParameteri(target, pname) orelse return;
     if (params) |p| p[0] = v;
 }
 pub export fn glGetTexParameterfv(target: u32, pname: u32, params: ?[*]f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getTexBorder(target) orelse return;
+        if (params) |p| putWords(w, @ptrCast(p));
+        return;
+    }
     const v = c.getTexParameteri(target, pname) orelse return;
     if (params) |p| p[0] = @floatFromInt(v);
 }
+pub export fn glGetTexParameterIiv(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getTexBorder(target) orelse return;
+        if (params) |p| putWords(w, @ptrCast(p));
+        return;
+    }
+    const v = c.getTexParameteri(target, pname) orelse return;
+    if (params) |p| p[0] = v;
+}
+pub export fn glGetTexParameterIuiv(target: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, @ptrCast(params));
+}
+pub export fn glGetTexParameterIivOES(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, params);
+}
+pub export fn glGetTexParameterIuivOES(target: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, @ptrCast(params));
+}
+pub export fn glGetTexParameterIivEXT(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, params);
+}
+pub export fn glGetTexParameterIuivEXT(target: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetTexParameterIiv(target, pname, @ptrCast(params));
+}
+
+/// glTexParameteriv's border color: integers mapped to [-1, 1] (the
+/// signed normalized conversion), as floats' bits.
+fn borderNormalized(p: [*]const i32) [4]u32 {
+    var out: [4]u32 = undefined;
+    for (&out, 0..) |*o, i| {
+        const v: f32 = @floatCast(@max(@as(f64, @floatFromInt(p[i])) / 2147483647.0, -1.0));
+        o.* = @bitCast(v);
+    }
+    return out;
+}
+
+fn borderFloats(p: [*]const f32) [4]u32 {
+    return .{ @bitCast(p[0]), @bitCast(p[1]), @bitCast(p[2]), @bitCast(p[3]) };
+}
+
+fn putNormalized(w: [4]u32, p: [*]i32) void {
+    for (w, 0..) |x, i| {
+        const v: f64 = std.math.clamp(@as(f64, @as(f32, @bitCast(x))), -1.0, 1.0);
+        p[i] = @intFromFloat(@round(v * 2147483647.0));
+    }
+}
+
+fn putWords(w: [4]u32, p: [*]u32) void {
+    for (w, 0..) |x, i| p[i] = x;
+}
 pub export fn glGenerateMipmap(target: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.generateMipmap(target);
 }
 pub export fn glGenSamplers(n: i32, out: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (out) |p| c.genSamplers(p[0..k]);
 }
 pub export fn glDeleteSamplers(n: i32, names: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (names) |p| c.deleteSamplers(p[0..k]);
 }
 pub export fn glIsSampler(name: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(c.isSampler(name));
 }
 pub export fn glBindSampler(unit: u32, name: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.bindSampler(unit, name);
 }
 pub export fn glSamplerParameteri(name: u32, pname: u32, param: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.samplerParameteri(name, pname, param);
 }
 pub export fn glSamplerParameterf(name: u32, pname: u32, param: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     glSamplerParameteri(name, pname, @intFromFloat(std.math.clamp(@round(param), -2147483648.0, 2147483520.0)));
 }
 pub export fn glSamplerParameteriv(name: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
-    if (params) |p| glSamplerParameteri(name, pname, p[0]);
+    driverEnter();
+    defer driverLeave();
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.samplerBorder(name, borderNormalized(p));
+        return;
+    }
+    glSamplerParameteri(name, pname, p[0]);
 }
 pub export fn glSamplerParameterfv(name: u32, pname: u32, params: ?[*]const f32) callconv(.c) void {
-    if (params) |p| glSamplerParameterf(name, pname, p[0]);
+    driverEnter();
+    defer driverLeave();
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.samplerBorder(name, borderFloats(p));
+        return;
+    }
+    glSamplerParameterf(name, pname, p[0]);
+}
+pub export fn glSamplerParameterIiv(name: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const p = params orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        if (cur()) |c| c.samplerBorder(name, .{ @bitCast(p[0]), @bitCast(p[1]), @bitCast(p[2]), @bitCast(p[3]) });
+        return;
+    }
+    glSamplerParameteri(name, pname, p[0]);
+}
+pub export fn glSamplerParameterIuiv(name: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glSamplerParameterIiv(name, pname, @ptrCast(params));
+}
+pub export fn glSamplerParameterIivOES(name: u32, pname: u32, params: ?[*]const i32) callconv(.c) void {
+    glSamplerParameterIiv(name, pname, params);
+}
+pub export fn glSamplerParameterIuivOES(name: u32, pname: u32, params: ?[*]const u32) callconv(.c) void {
+    glSamplerParameterIiv(name, pname, @ptrCast(params));
+}
+pub export fn glGetSamplerParameterIiv(name: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getSamplerBorder(name) orelse return;
+        if (params) |p| putWords(w, @ptrCast(p));
+        return;
+    }
+    const v = c.getSamplerParameteri(name, pname) orelse return;
+    if (params) |p| p[0] = v;
+}
+pub export fn glGetSamplerParameterIuiv(name: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetSamplerParameterIiv(name, pname, @ptrCast(params));
+}
+pub export fn glGetSamplerParameterIivOES(name: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    glGetSamplerParameterIiv(name, pname, params);
+}
+pub export fn glGetSamplerParameterIuivOES(name: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    glGetSamplerParameterIiv(name, pname, @ptrCast(params));
 }
 pub export fn glGetSamplerParameteriv(name: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getSamplerBorder(name) orelse return;
+        if (params) |p| putNormalized(w, p);
+        return;
+    }
     const v = c.getSamplerParameteri(name, pname) orelse return;
     if (params) |p| p[0] = v;
 }
 pub export fn glGetSamplerParameterfv(name: u32, pname: u32, params: ?[*]f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
+    if (pname == g.TEXTURE_BORDER_COLOR) {
+        const w = c.getSamplerBorder(name) orelse return;
+        if (params) |p| putWords(w, @ptrCast(p));
+        return;
+    }
     const v = c.getSamplerParameteri(name, pname) orelse return;
     if (params) |p| p[0] = @floatFromInt(v);
 }
 pub export fn glEGLImageTargetTexture2DOES(target: u32, image: ?*anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.eglImageTargetTexture2D(target, image);
 }
 pub export fn glEGLImageTargetRenderbufferStorageOES(target: u32, image: ?*anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.eglImageTargetRenderbufferStorage(target, image);
 }
+pub export fn glCopyImageSubDataEXT(sn: u32, st: u32, sl: i32, sx: i32, sy: i32, sz: i32, dn: u32, dt: u32, dl: i32, dx: i32, dy: i32, dz: i32, w: i32, h: i32, depth: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.copyImageSubData(sn, st, sl, sx, sy, sz, dn, dt, dl, dx, dy, dz, w, h, depth);
+}
+
 pub export fn glCopyTexSubImage2D(target: u32, level: i32, dx: i32, dy: i32, x: i32, y: i32, w: i32, h: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.copyTexSubImage2D(target, level, dx, dy, x, y, w, h);
 }
+pub export fn glCopyTexSubImage3D(target: u32, level: i32, dx: i32, dy: i32, dz: i32, x: i32, y: i32, w: i32, h: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.copyTexSubImage3D(target, level, dx, dy, dz, x, y, w, h);
+}
 pub export fn glCopyTexImage2D(target: u32, level: i32, internal: u32, x: i32, y: i32, w: i32, h: i32, border: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.copyTexImage2D(target, level, internal, x, y, w, h, border);
 }
 
 pub export fn glGenBuffers(n: i32, out: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (out) |p| c.genBuffers(p[0..k]);
 }
 pub export fn glDeleteBuffers(n: i32, names: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (names) |p| c.deleteBuffers(p[0..k]);
 }
 pub export fn glIsBuffer(name: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(c.isBuffer(name));
 }
 pub export fn glBindBuffer(target: u32, name: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.bindBuffer(target, name);
 }
+pub export fn glCopyBufferSubData(read_target: u32, write_target: u32, read_offset: isize, write_offset: isize, size: isize) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.copyBufferSubData(read_target, write_target, read_offset, write_offset, size);
+}
+// GL ES 3.0's queries (one name space with EXT_disjoint_timer_query's)
+pub export fn glGenQueries(n: i32, ids: ?[*]u32) callconv(.c) void {
+    glGenQueriesEXT(n, ids);
+}
+pub export fn glDeleteQueries(n: i32, ids: ?[*]const u32) callconv(.c) void {
+    glDeleteQueriesEXT(n, ids);
+}
+pub export fn glIsQuery(id: u32) callconv(.c) u8 {
+    return glIsQueryEXT(id);
+}
+pub export fn glBeginQuery(target: u32, id: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.beginQuery(target, id);
+}
+pub export fn glEndQuery(target: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.endQuery(target);
+}
+pub export fn glGetQueryiv(target: u32, pname: u32, out: ?*i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (c.queryState(target, pname)) |v| {
+        if (out) |p| p.* = v;
+    }
+}
+pub export fn glGetQueryObjectuiv(id: u32, pname: u32, out: ?*u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (c.queryResult(id, pname)) |v| {
+        if (out) |p| p.* = @intCast(@min(v, std.math.maxInt(u32)));
+    }
+}
+
+// GL ES 3.0's transform feedback
+pub export fn glGenTransformFeedbacks(n: i32, ids: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (ids) |p| c.genTransformFeedbacks(p[0..k]);
+}
+pub export fn glDeleteTransformFeedbacks(n: i32, ids: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (ids) |p| c.deleteTransformFeedbacks(p[0..k]);
+}
+pub export fn glIsTransformFeedback(id: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return 0;
+    return @intFromBool(c.isTransformFeedback(id));
+}
+pub export fn glBindTransformFeedback(target: u32, id: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.bindTransformFeedback(target, id);
+}
+pub export fn glBeginTransformFeedback(mode: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.beginTransformFeedback(mode);
+}
+pub export fn glEndTransformFeedback() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.endTransformFeedback();
+}
+pub export fn glPauseTransformFeedback() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.pauseTransformFeedback();
+}
+pub export fn glResumeTransformFeedback() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.resumeTransformFeedback();
+}
+pub export fn glTransformFeedbackVaryings(prog: u32, n: i32, names: ?[*]const [*:0]const u8, mode: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const list = names orelse if (n == 0) @as([*]const [*:0]const u8, undefined) else return c.fail(g.INVALID_VALUE);
+    program.transformFeedbackVaryings(c, prog, n, list, mode);
+}
+pub export fn glGetTransformFeedbackVarying(prog: u32, index: u32, buf_size: i32, length: ?*i32, size: ?*i32, kind: ?*u32, name: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| program.getTransformFeedbackVarying(c, prog, index, buf_size, length, size, kind, name);
+}
+
+pub export fn glGetInternalformativ(target: u32, internalformat: u32, pname: u32, buf_size: i32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    _ = internalformat;
+    const k = count(buf_size) orelse return;
+    c.internalformat(target, pname, if (params) |p| p[0..k] else &.{});
+}
+
+// (no compressed formats: GL ES 3.0's ETC2 and EAC are not decoded yet, so
+// an upload says so rather than leaving its texture empty)
+pub export fn glCompressedTexImage2D(target: u32, level: i32, internal: u32, w: i32, h: i32, border: i32, size: i32, data: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    _ = .{ target, level, internal, w, h, border, size, data };
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+pub export fn glCompressedTexSubImage2D(target: u32, level: i32, x: i32, y: i32, w: i32, h: i32, format: u32, size: i32, data: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    _ = .{ target, level, x, y, w, h, format, size, data };
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+pub export fn glCompressedTexImage3D(target: u32, level: i32, internal: u32, w: i32, h: i32, depth: i32, border: i32, size: i32, data: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    _ = .{ target, level, internal, w, h, depth, border, size, data };
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+pub export fn glCompressedTexSubImage3D(target: u32, level: i32, x: i32, y: i32, z: i32, w: i32, h: i32, depth: i32, format: u32, size: i32, data: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    _ = .{ target, level, x, y, z, w, h, depth, format, size, data };
+    if (cur()) |c| c.fail(g.INVALID_ENUM);
+}
+
+pub export fn glGenQueriesEXT(n: i32, ids: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (ids) |p| c.genTimerQueries(p[0..k]);
+}
+pub export fn glDeleteQueriesEXT(n: i32, ids: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const k = count(n) orelse return;
+    if (ids) |p| c.deleteTimerQueries(p[0..k]);
+}
+pub export fn glIsQueryEXT(id: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return 0;
+    return @intFromBool(c.isTimerQuery(id));
+}
+pub export fn glBeginQueryEXT(target: u32, id: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.beginQuery(target, id);
+}
+pub export fn glEndQueryEXT(target: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.endQuery(target);
+}
+pub export fn glQueryCounterEXT(id: u32, target: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.timerCounter(id, target);
+}
+pub export fn glGetQueryivEXT(target: u32, pname: u32, out: ?*i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (c.timerState(target, pname)) |v| {
+        if (out) |p| p.* = v;
+    }
+}
+fn getTimerResult(comptime T: type, id: u32, pname: u32, out: ?*T) void {
+    const c = cur() orelse return;
+    if (c.timerResult(id, pname)) |v| {
+        if (out) |p| p.* = @intCast(@min(v, std.math.maxInt(T)));
+    }
+}
+pub export fn glGetQueryObjectivEXT(id: u32, pname: u32, out: ?*i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    getTimerResult(i32, id, pname, out);
+}
+pub export fn glGetQueryObjectuivEXT(id: u32, pname: u32, out: ?*u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    getTimerResult(u32, id, pname, out);
+}
+pub export fn glGetQueryObjecti64vEXT(id: u32, pname: u32, out: ?*i64) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    getTimerResult(i64, id, pname, out);
+}
+pub export fn glGetQueryObjectui64vEXT(id: u32, pname: u32, out: ?*u64) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    getTimerResult(u64, id, pname, out);
+}
+
+pub export fn glDebugMessageCallbackKHR(callback: ?gles.debug_output.Callback, user: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    c.debug.callback = callback;
+    c.debug.user = user;
+}
+
+pub export fn glDebugMessageControlKHR(src: u32, kind: u32, sev: u32, n: i32, ids: ?[*]const u32, enabled: u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const dbg = gles.debug_output;
+    if ((src != dbg.ANY and !dbg.source(src)) or (kind != dbg.ANY and !dbg.msgType(kind)) or
+        (sev != dbg.ANY and !dbg.severity(sev))) return c.fail(g.INVALID_ENUM);
+    if (n < 0 or (n > 0 and ids == null)) return c.fail(g.INVALID_VALUE);
+    if (n > 0 and (src == dbg.ANY or kind == dbg.ANY or sev != dbg.ANY))
+        return c.fail(g.INVALID_OPERATION);
+    const list: []const u32 = if (n == 0) &.{} else ids.?[0..@intCast(n)];
+    if (!c.debug.control(src, kind, sev, list, enabled != 0)) c.fail(g.OUT_OF_MEMORY);
+}
+
+pub export fn glDebugMessageInsertKHR(src: u32, kind: u32, id: u32, sev: u32, length: i32, text: ?[*]const u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const dbg = gles.debug_output;
+    if (src != dbg.APPLICATION and src != dbg.THIRD_PARTY) return c.fail(g.INVALID_ENUM);
+    if (!dbg.msgType(kind) or kind == 0x8269 or kind == 0x826A or !dbg.severity(sev)) return c.fail(g.INVALID_ENUM);
+    const p = text orelse return c.fail(g.INVALID_VALUE);
+    var n: usize = if (length < 0) 0 else @intCast(length);
+    if (length < 0) {
+        while (n < dbg.MAX_TEXT and p[n] != 0) n += 1;
+    }
+    if (n >= dbg.MAX_TEXT) return c.fail(g.INVALID_VALUE);
+    c.debug.emit(src, kind, id, sev, p[0..n]);
+}
+
+pub export fn glGetDebugMessageLogKHR(n: u32, size: i32, sources: ?[*]u32, types: ?[*]u32, ids: ?[*]u32, severities: ?[*]u32, lengths: ?[*]i32, text: ?[*]u8) callconv(.c) u32 {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return 0;
+    if (size < 0 and text != null) {
+        c.fail(g.INVALID_VALUE);
+        return 0;
+    }
+    return c.debug.read(n, @intCast(@max(size, 0)), sources, types, ids, severities, lengths, text);
+}
+
+pub export fn glPushDebugGroupKHR(src: u32, id: u32, length: i32, text: ?[*]const u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const dbg = gles.debug_output;
+    if (src != dbg.APPLICATION and src != dbg.THIRD_PARTY) return c.fail(g.INVALID_ENUM);
+    const p = text orelse return c.fail(g.INVALID_VALUE);
+    var n: usize = if (length < 0) 0 else @intCast(length);
+    if (length < 0) {
+        while (n < dbg.MAX_TEXT and p[n] != 0) n += 1;
+    }
+    if (n >= dbg.MAX_TEXT) return c.fail(g.INVALID_VALUE);
+    if (!c.debug.push(src, id, p[0..n])) c.fail(0x0503); // STACK_OVERFLOW
+}
+
+pub export fn glPopDebugGroupKHR() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (!c.debug.pop()) c.fail(0x0504); // STACK_UNDERFLOW
+}
+
+fn setObjectLabel(c: *Context, label: *gles.debug_output.Label, length: i32, text: ?[*]const u8) void {
+    const p = text orelse {
+        label.set(&.{});
+        return;
+    };
+    const max = gles.debug_output.MAX_LABEL_LENGTH;
+    var n: usize = if (length < 0) 0 else @intCast(length);
+    if (length < 0) {
+        while (n < max and p[n] != 0) n += 1;
+    }
+    if (n >= max) return c.fail(g.INVALID_VALUE);
+    label.set(p[0..n]);
+}
+
+pub export fn glObjectLabelKHR(identifier: u32, name: u32, length: i32, text: ?[*]const u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const label = c.objectLabel(identifier, name) orelse return;
+    setObjectLabel(c, label, length, text);
+}
+
+pub export fn glGetObjectLabelKHR(identifier: u32, name: u32, size: i32, length: ?*i32, text: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (size < 0) return c.fail(g.INVALID_VALUE);
+    const label = c.objectLabel(identifier, name) orelse return;
+    label.get(size, length, text);
+}
+
+pub export fn glObjectPtrLabelKHR(ptr: ?*const anyopaque, length: i32, text: ?[*]const u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const label = c.pointerLabel(ptr) orelse return;
+    setObjectLabel(c, label, length, text);
+}
+
+pub export fn glGetObjectPtrLabelKHR(ptr: ?*const anyopaque, size: i32, length: ?*i32, text: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (size < 0) return c.fail(g.INVALID_VALUE);
+    const label = c.pointerLabel(ptr) orelse return;
+    label.get(size, length, text);
+}
+
+pub export fn glGetPointervKHR(pname: u32, out: ?*?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const p = out orelse return;
+    p.* = switch (pname) {
+        0x8244 => if (c.debug.callback) |cb| @ptrCast(cb) else null,
+        0x8245 => c.debug.user,
+        else => return c.fail(g.INVALID_ENUM),
+    };
+}
+
+pub export fn glInsertEventMarkerEXT(length: i32, marker: ?[*]const u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.debugMarker(.event, length, marker);
+}
+
+pub export fn glPushGroupMarkerEXT(length: i32, marker: ?[*]const u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.debugMarker(.push, length, marker);
+}
+
+pub export fn glPopGroupMarkerEXT() callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.debugMarker(.pop, 0, null);
+}
+
+pub export fn glMemoryBarrier(barriers: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.clientMappedBarrier(barriers);
+}
+
+pub export fn glBufferStorageEXT(target: u32, size: isize, data: ?*const anyopaque, flags: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.bufferStorage(target, size, data, flags);
+}
+
 pub export fn glBufferData(target: u32, size: isize, data: ?*const anyopaque, usage: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.bufferData(target, size, data, usage);
 }
 pub export fn glBufferSubData(target: u32, offset: isize, size: isize, data: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.bufferSubData(target, offset, size, data);
 }
 pub export fn glGetBufferParameteriv(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const v = c.getBufferParameter(target, pname) orelse return;
     if (params) |p| p[0] = @truncate(v);
 }
 pub export fn glGetBufferParameteri64v(target: u32, pname: u32, params: ?[*]i64) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const v = c.getBufferParameter(target, pname) orelse return;
     if (params) |p| p[0] = v;
 }
 pub export fn glMapBufferRange(target: u32, offset: isize, length: isize, access: u32) callconv(.c) ?*anyopaque {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return null;
     return c.mapBufferRange(target, offset, length, access);
 }
 pub export fn glUnmapBuffer(target: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return 0;
     return @intFromBool(c.unmapBuffer(target));
 }
 pub export fn glFlushMappedBufferRange(target: u32, offset: isize, length: isize) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.flushMappedBufferRange(target, offset, length);
 }
+// (GL_EXT_map_buffer_range's names: ES 3.0's calls)
+pub export fn glMapBufferRangeEXT(target: u32, offset: isize, length: isize, access: u32) callconv(.c) ?*anyopaque {
+    return glMapBufferRange(target, offset, length, access);
+}
+pub export fn glFlushMappedBufferRangeEXT(target: u32, offset: isize, length: isize) callconv(.c) void {
+    glFlushMappedBufferRange(target, offset, length);
+}
 pub export fn glGetBufferPointerv(target: u32, pname: u32, params: ?*?*anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const v = c.getBufferPointer(target, pname);
     if (params) |p| p.* = v;
 }
 
 pub export fn glBlitFramebuffer(src_x0: i32, src_y0: i32, src_x1: i32, src_y1: i32, dst_x0: i32, dst_y0: i32, dst_x1: i32, dst_y1: i32, mask: u32, filter: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.blitFramebuffer(src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1, mask, filter);
 }
 
 pub export fn glFenceSync(condition: u32, flags: u32) callconv(.c) ?*anyopaque {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return null;
     return c.fenceSync(condition, flags);
 }
 pub export fn glClientWaitSync(sync: ?*anyopaque, flags: u32, timeout: u64) callconv(.c) u32 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.WAIT_FAILED;
     return c.clientWaitSync(sync, flags, timeout);
 }
 pub export fn glWaitSync(sync: ?*anyopaque, flags: u32, timeout: u64) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.waitSync(sync, flags, timeout);
 }
 pub export fn glDeleteSync(sync: ?*anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.deleteSync(sync);
 }
 pub export fn glIsSync(sync: ?*anyopaque) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return 0;
     return @intFromBool(c.isSync(sync));
 }
 pub export fn glGetSynciv(sync: ?*anyopaque, pname: u32, buf_size: i32, length: ?*i32, values: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const v = c.getSync(sync, pname) orelse return;
     if (buf_size < 1) return;
@@ -422,75 +1181,116 @@ pub export fn glGetSynciv(sync: ?*anyopaque, pname: u32, buf_size: i32, length: 
 }
 
 pub export fn glGenRenderbuffers(n: i32, out: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (out) |p| c.genRenderbuffers(p[0..k]);
 }
 pub export fn glDeleteRenderbuffers(n: i32, names: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (names) |p| c.deleteRenderbuffers(p[0..k]);
 }
 pub export fn glIsRenderbuffer(name: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(c.isRenderbuffer(name));
 }
 pub export fn glBindRenderbuffer(target: u32, name: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.bindRenderbuffer(target, name);
 }
 pub export fn glRenderbufferStorage(target: u32, internal: u32, w: i32, h: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.renderbufferStorage(target, 0, internal, w, h);
 }
 pub export fn glRenderbufferStorageMultisample(target: u32, samples: i32, internal: u32, w: i32, h: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.renderbufferStorage(target, samples, internal, w, h);
 }
 pub export fn glGetRenderbufferParameteriv(target: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const v = c.getRenderbufferParameter(target, pname) orelse return;
     if (params) |p| p[0] = v;
 }
 
 pub export fn glGenFramebuffers(n: i32, out: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (out) |p| c.genFramebuffers(p[0..k]);
 }
 pub export fn glDeleteFramebuffers(n: i32, names: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (names) |p| c.deleteFramebuffers(p[0..k]);
 }
 pub export fn glIsFramebuffer(name: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(c.isFramebuffer(name));
 }
 pub export fn glBindFramebuffer(target: u32, name: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.bindFramebuffer(target, name);
 }
 pub export fn glFramebufferTexture2D(target: u32, attachment: u32, textarget: u32, name: u32, level: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.framebufferTexture2D(target, attachment, textarget, name, level);
 }
+pub export fn glFramebufferTextureLayer(target: u32, attachment: u32, name: u32, level: i32, layer: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.framebufferTextureLayer(target, attachment, name, level, layer);
+}
 pub export fn glFramebufferRenderbuffer(target: u32, attachment: u32, rbtarget: u32, name: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.framebufferRenderbuffer(target, attachment, rbtarget, name);
 }
 pub export fn glCheckFramebufferStatus(target: u32) callconv(.c) u32 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return 0;
     return c.checkFramebufferStatus(target);
 }
 pub export fn glDrawBuffers(n: i32, bufs: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (bufs) |p| c.drawBuffers(p[0..k]) else if (k == 0) c.drawBuffers(&.{});
 }
 pub export fn glReadBuffer(src: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.readBuffer(src);
 }
 pub export fn glInvalidateFramebuffer(target: u32, n: i32, attachments: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (attachments) |p| c.invalidateFramebuffer(target, p[0..k]);
 }
 pub export fn glInvalidateSubFramebuffer(target: u32, n: i32, attachments: ?[*]const u32, x: i32, y: i32, w: i32, h: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     _ = x;
     _ = y;
     const c = cur() orelse return;
@@ -502,100 +1302,193 @@ pub export fn glInvalidateSubFramebuffer(target: u32, n: i32, attachments: ?[*]c
     if (attachments) |p| c.invalidateFramebuffer(target, p[0..k]);
 }
 pub export fn glGetFramebufferAttachmentParameteriv(target: u32, attachment: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const v = c.getFramebufferAttachmentParameter(target, attachment, pname) orelse return;
     if (params) |p| p[0] = v;
 }
 
 pub export fn glGenVertexArrays(n: i32, out: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (out) |p| c.genVertexArrays(p[0..k]);
 }
 pub export fn glDeleteVertexArrays(n: i32, names: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const k = count(n) orelse return;
     if (names) |p| c.deleteVertexArrays(p[0..k]);
 }
 pub export fn glBindVertexArray(name: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.bindVertexArray(name);
 }
 pub export fn glIsVertexArray(name: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(c.isVertexArray(name));
 }
+// (GL_OES_vertex_array_object's names: ES 3.0's calls)
+pub export fn glGenVertexArraysOES(n: i32, out: ?[*]u32) callconv(.c) void {
+    glGenVertexArrays(n, out);
+}
+pub export fn glDeleteVertexArraysOES(n: i32, names: ?[*]const u32) callconv(.c) void {
+    glDeleteVertexArrays(n, names);
+}
+pub export fn glBindVertexArrayOES(name: u32) callconv(.c) void {
+    glBindVertexArray(name);
+}
+pub export fn glIsVertexArrayOES(name: u32) callconv(.c) u8 {
+    return glIsVertexArray(name);
+}
 pub export fn glVertexAttribPointer(index: u32, size: i32, ty: u32, normalized: u8, stride: i32, pointer: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.vertexAttribPointer(index, size, ty, b(normalized), stride, @intFromPtr(pointer), false);
 }
 pub export fn glVertexAttribIPointer(index: u32, size: i32, ty: u32, stride: i32, pointer: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.vertexAttribPointer(index, size, ty, false, stride, @intFromPtr(pointer), true);
 }
 pub export fn glEnableVertexAttribArray(index: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.enableVertexAttribArray(index, true);
 }
 pub export fn glDisableVertexAttribArray(index: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.enableVertexAttribArray(index, false);
 }
 pub export fn glVertexAttribDivisor(index: u32, divisor: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.vertexAttribDivisor(index, divisor);
 }
 fn fattr(index: u32, x: f32, y: f32, z: f32, w: f32) void {
     if (cur()) |c| c.vertexAttrib(index, .{ @bitCast(x), @bitCast(y), @bitCast(z), @bitCast(w) }, false);
 }
 pub export fn glVertexAttrib1f(index: u32, x: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     fattr(index, x, 0, 0, 1);
 }
 pub export fn glVertexAttrib2f(index: u32, x: f32, y: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     fattr(index, x, y, 0, 1);
 }
 pub export fn glVertexAttrib3f(index: u32, x: f32, y: f32, z: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     fattr(index, x, y, z, 1);
 }
 pub export fn glVertexAttrib4f(index: u32, x: f32, y: f32, z: f32, w: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     fattr(index, x, y, z, w);
 }
 pub export fn glVertexAttrib1fv(index: u32, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (v) |p| fattr(index, p[0], 0, 0, 1);
 }
 pub export fn glVertexAttrib2fv(index: u32, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (v) |p| fattr(index, p[0], p[1], 0, 1);
 }
 pub export fn glVertexAttrib3fv(index: u32, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (v) |p| fattr(index, p[0], p[1], p[2], 1);
 }
 pub export fn glVertexAttrib4fv(index: u32, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (v) |p| fattr(index, p[0], p[1], p[2], p[3]);
 }
 pub export fn glVertexAttribI4i(index: u32, x: i32, y: i32, z: i32, w: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.vertexAttrib(index, .{ @bitCast(x), @bitCast(y), @bitCast(z), @bitCast(w) }, true);
 }
 pub export fn glVertexAttribI4ui(index: u32, x: u32, y: u32, z: u32, w: u32) callconv(.c) void {
-    if (cur()) |c| c.vertexAttrib(index, .{ x, y, z, w }, true);
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.vertexAttribUnsigned(index, .{ x, y, z, w });
 }
 pub export fn glVertexAttribI4iv(index: u32, v: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (v) |p| glVertexAttribI4i(index, p[0], p[1], p[2], p[3]);
 }
 pub export fn glVertexAttribI4uiv(index: u32, v: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (v) |p| glVertexAttribI4ui(index, p[0], p[1], p[2], p[3]);
 }
 pub export fn glGetVertexAttribiv(index: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
-    const v = c.getVertexAttrib(index, pname) orelse return;
-    if (params) |p| p[0] = v;
+    if (params) |p| c.vertexAttribValues(i32, index, pname, p);
+}
+pub export fn glGetVertexAttribfv(index: u32, pname: u32, params: ?[*]f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (params) |p| c.vertexAttribValues(f32, index, pname, p);
+}
+pub export fn glGetVertexAttribIiv(index: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (params) |p| c.vertexAttribValues(i32, index, pname, p);
+}
+pub export fn glGetVertexAttribIuiv(index: u32, pname: u32, params: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    if (params) |p| c.vertexAttribValues(u32, index, pname, p);
+}
+pub export fn glGetVertexAttribPointerv(index: u32, pname: u32, params: ?*?*anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const pointer = c.vertexAttribPointerValue(index, pname) orelse return;
+    if (params) |p| p.* = @ptrFromInt(pointer);
 }
 pub export fn glDrawArrays(mode: u32, first: i32, n: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.drawArrays(mode, first, n, 1);
 }
 pub export fn glDrawArraysInstanced(mode: u32, first: i32, n: i32, instances: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.drawArrays(mode, first, n, instances);
 }
 pub export fn glDrawElements(mode: u32, n: i32, ty: u32, indices: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.drawElements(mode, n, ty, @intFromPtr(indices), 1);
 }
 pub export fn glDrawElementsInstanced(mode: u32, n: i32, ty: u32, indices: ?*const anyopaque, instances: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.drawElements(mode, n, ty, @intFromPtr(indices), instances);
 }
 pub export fn glDrawRangeElements(mode: u32, start: u32, end: u32, n: i32, ty: u32, indices: ?*const anyopaque) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     if (end < start) {
         if (c.err == g.NO_ERROR) c.err = g.INVALID_VALUE;
@@ -604,173 +1497,310 @@ pub export fn glDrawRangeElements(mode: u32, start: u32, end: u32, n: i32, ty: u
     c.drawElements(mode, n, ty, @intFromPtr(indices), 1);
 }
 pub export fn glBlendFunc(src: u32, dst: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.blendFunc(src, dst, src, dst);
 }
 pub export fn glBlendFuncSeparate(src_rgb: u32, dst_rgb: u32, src_a: u32, dst_a: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.blendFunc(src_rgb, dst_rgb, src_a, dst_a);
 }
 pub export fn glBlendEquation(mode: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.blendEquation(mode, mode);
 }
 pub export fn glBlendEquationSeparate(rgb: u32, a: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.blendEquation(rgb, a);
 }
 pub export fn glBlendColor(r: f32, gr: f32, bl: f32, a: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.blendColor(r, gr, bl, a);
 }
 pub export fn glDepthFunc(func: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.depthFunc(func);
 }
+pub export fn glPolygonOffset(factor: f32, units: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.polygonOffset(factor, units);
+}
+pub export fn glSampleCoverage(value: f32, invert: u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.sampleCoverage(value, invert != 0);
+}
+pub export fn glLineWidth(w: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.lineWidth(w);
+}
 pub export fn glDepthRangef(n: f32, f_: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.depthRange(n, f_);
 }
 pub export fn glCullFace(mode: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.cullFace(mode);
 }
 pub export fn glFrontFace(mode: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| c.frontFace(mode);
 }
 
 // ── Shaders and programs (program.sig) ─────────────────────────────────────
 
 pub export fn glCreateShader(kind: u32) callconv(.c) u32 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return 0;
     return program.createShader(c, kind);
 }
 pub export fn glDeleteShader(shader: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.deleteShader(c, shader);
 }
 pub export fn glIsShader(shader: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(program.isShader(c, shader));
 }
 pub export fn glShaderSource(shader: u32, n: i32, strings: ?[*]const ?[*]const u8, lengths: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.shaderSource(c, shader, n, strings, lengths);
 }
 pub export fn glCompileShader(shader: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.compileShader(c, shader);
 }
 pub export fn glGetShaderiv(shader: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const out = params orelse return;
     program.getShaderiv(c, shader, pname, &out[0]);
 }
 pub export fn glGetShaderInfoLog(shader: u32, buf_size: i32, length: ?*i32, log: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getShaderInfoLog(c, shader, buf_size, length, log);
 }
 pub export fn glGetShaderSource(shader: u32, buf_size: i32, length: ?*i32, source: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getShaderSource(c, shader, buf_size, length, source);
 }
 pub export fn glGetShaderPrecisionFormat(shader_type: u32, precision_type: u32, range: ?*[2]i32, precision: ?*i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getShaderPrecisionFormat(c, shader_type, precision_type, range, precision);
 }
 pub export fn glReleaseShaderCompiler() callconv(.c) void {}
 pub export fn glShaderBinary(n: i32, shaders: ?[*]const u32, format: u32, binary: ?*const anyopaque, length: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     _ = .{ n, shaders, format, binary, length };
     // (no binary formats)
     if (cur()) |c| c.fail(g.INVALID_ENUM);
 }
 pub export fn glCreateProgram() callconv(.c) u32 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return 0;
     return program.createProgram(c);
 }
 pub export fn glDeleteProgram(prog: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.deleteProgram(c, prog);
 }
 pub export fn glIsProgram(prog: u32) callconv(.c) u8 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return g.FALSE;
     return @intFromBool(program.isProgram(c, prog));
 }
 pub export fn glAttachShader(prog: u32, shader: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.attachShader(c, prog, shader);
 }
 pub export fn glDetachShader(prog: u32, shader: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.detachShader(c, prog, shader);
 }
 pub export fn glGetAttachedShaders(prog: u32, max_count: i32, n: ?*i32, shaders: ?[*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getAttachedShaders(c, prog, max_count, n, shaders);
 }
 pub export fn glLinkProgram(prog: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.linkProgram(c, prog);
 }
 pub export fn glValidateProgram(prog: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.validateProgram(c, prog);
 }
 pub export fn glUseProgram(prog: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.useProgram(c, prog);
 }
 pub export fn glProgramParameteri(prog: u32, pname: u32, value: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.programParameteri(c, prog, pname, value);
 }
 pub export fn glGetProgramiv(prog: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return;
     const out = params orelse return;
     program.getProgramiv(c, prog, pname, &out[0]);
 }
 pub export fn glGetProgramInfoLog(prog: u32, buf_size: i32, length: ?*i32, log: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getProgramInfoLog(c, prog, buf_size, length, log);
 }
 pub export fn glGetProgramBinary(prog: u32, buf_size: i32, length: ?*i32, format: ?*u32, binary: ?*anyopaque) callconv(.c) void {
-    _ = .{ prog, buf_size, format, binary };
-    if (length) |l| l.* = 0;
-    // (no binary formats)
-    if (cur()) |c| c.fail(g.INVALID_OPERATION);
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| program.getProgramBinary(c, prog, buf_size, length, format, @ptrCast(binary));
 }
 pub export fn glProgramBinary(prog: u32, format: u32, binary: ?*const anyopaque, length: i32) callconv(.c) void {
-    _ = .{ prog, format, binary, length };
-    if (cur()) |c| c.fail(g.INVALID_ENUM);
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| program.programBinary(c, prog, format, @ptrCast(binary), length);
+}
+// (OES_get_program_binary's names for the same calls)
+pub export fn glGetProgramBinaryOES(prog: u32, buf_size: i32, length: ?*i32, format: ?*u32, binary: ?*anyopaque) callconv(.c) void {
+    glGetProgramBinary(prog, buf_size, length, format, binary);
+}
+pub export fn glProgramBinaryOES(prog: u32, format: u32, binary: ?*const anyopaque, length: i32) callconv(.c) void {
+    glProgramBinary(prog, format, binary, length);
 }
 pub export fn glBindAttribLocation(prog: u32, index: u32, name: [*:0]const u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.bindAttribLocation(c, prog, index, name);
 }
 pub export fn glGetAttribLocation(prog: u32, name: [*:0]const u8) callconv(.c) i32 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return -1;
     return program.getAttribLocation(c, prog, name);
 }
 pub export fn glGetActiveAttrib(prog: u32, index: u32, buf_size: i32, length: ?*i32, size: ?*i32, kind: ?*u32, name: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getActiveAttrib(c, prog, index, buf_size, length, size, kind, name);
 }
 pub export fn glGetUniformLocation(prog: u32, name: [*:0]const u8) callconv(.c) i32 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return -1;
     return program.getUniformLocation(c, prog, name);
 }
 pub export fn glGetActiveUniform(prog: u32, index: u32, buf_size: i32, length: ?*i32, size: ?*i32, kind: ?*u32, name: ?[*]u8) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getActiveUniform(c, prog, index, buf_size, length, size, kind, name);
 }
 pub export fn glGetActiveUniformsiv(prog: u32, n: i32, indices: [*]const u32, pname: u32, params: [*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getActiveUniformsiv(c, prog, n, indices, pname, params);
 }
 pub export fn glGetUniformIndices(prog: u32, n: i32, names: [*]const [*:0]const u8, indices: [*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getUniformIndices(c, prog, n, names, indices);
 }
 pub export fn glGetFragDataLocation(prog: u32, name: [*:0]const u8) callconv(.c) i32 {
+    driverEnter();
+    defer driverLeave();
     const c = cur() orelse return -1;
     return program.getFragDataLocation(c, prog, name);
 }
-// (uniform blocks: none yet, so no index names one)
+// (uniform blocks, std140: program.sig)
 pub export fn glGetUniformBlockIndex(prog: u32, name: [*:0]const u8) callconv(.c) u32 {
-    _ = .{ prog, name };
-    return g.INVALID_INDEX;
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return g.INVALID_INDEX;
+    return program.getUniformBlockIndex(c, prog, name);
 }
 pub export fn glUniformBlockBinding(prog: u32, index: u32, binding: u32) callconv(.c) void {
-    _ = .{ prog, index, binding };
-    if (cur()) |c| c.fail(g.INVALID_VALUE);
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| program.uniformBlockBinding(c, prog, index, binding);
 }
 pub export fn glGetActiveUniformBlockiv(prog: u32, index: u32, pname: u32, params: ?[*]i32) callconv(.c) void {
-    _ = .{ prog, index, pname, params };
-    if (cur()) |c| c.fail(g.INVALID_VALUE);
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const out = params orelse return c.fail(g.INVALID_VALUE);
+    program.getActiveUniformBlockiv(c, prog, index, pname, out);
 }
 pub export fn glGetActiveUniformBlockName(prog: u32, index: u32, buf_size: i32, length: ?*i32, name: ?[*]u8) callconv(.c) void {
-    _ = .{ prog, index, buf_size, length, name };
-    if (cur()) |c| c.fail(g.INVALID_VALUE);
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| program.getActiveUniformBlockName(c, prog, index, buf_size, length, name);
+}
+pub export fn glBindBufferBase(target: u32, index: u32, buffer: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.bindBufferRange(target, index, buffer, 0, 0, false);
+}
+pub export fn glBindBufferRange(target: u32, index: u32, buffer: u32, offset: isize, size: isize) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    if (cur()) |c| c.bindBufferRange(target, index, buffer, offset, size, true);
+}
+pub export fn glGetIntegeri_v(pname: u32, index: u32, data: ?[*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const v = c.getIndexed(pname, index) orelse return;
+    if (data) |p| p[0] = @truncate(v);
+}
+pub export fn glGetInteger64i_v(pname: u32, index: u32, data: ?[*]i64) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
+    const c = cur() orelse return;
+    const v = c.getIndexed(pname, index) orelse return;
+    if (data) |p| p[0] = v;
 }
 pub export fn glGetUniformfv(prog: u32, loc: i32, params: [*]f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getUniform(c, prog, loc, .f, std.math.maxInt(usize), @ptrCast(params));
 }
 pub export fn glGetUniformiv(prog: u32, loc: i32, params: [*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getUniform(c, prog, loc, .i, std.math.maxInt(usize), @ptrCast(params));
 }
 pub export fn glGetUniformuiv(prog: u32, loc: i32, params: [*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     if (cur()) |c| program.getUniform(c, prog, loc, .u, std.math.maxInt(usize), params);
 }
 
@@ -781,27 +1811,43 @@ fn getnUniform(prog: u32, loc: i32, want: program.Data, buf_size: i32, params: [
     program.getUniform(c, prog, loc, want, @intCast(buf_size), params);
 }
 pub export fn glGetnUniformfv(prog: u32, loc: i32, buf_size: i32, params: [*]f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     getnUniform(prog, loc, .f, buf_size, @ptrCast(params));
 }
 pub export fn glGetnUniformfvEXT(prog: u32, loc: i32, buf_size: i32, params: [*]f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     getnUniform(prog, loc, .f, buf_size, @ptrCast(params));
 }
 pub export fn glGetnUniformfvKHR(prog: u32, loc: i32, buf_size: i32, params: [*]f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     getnUniform(prog, loc, .f, buf_size, @ptrCast(params));
 }
 pub export fn glGetnUniformiv(prog: u32, loc: i32, buf_size: i32, params: [*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     getnUniform(prog, loc, .i, buf_size, @ptrCast(params));
 }
 pub export fn glGetnUniformivEXT(prog: u32, loc: i32, buf_size: i32, params: [*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     getnUniform(prog, loc, .i, buf_size, @ptrCast(params));
 }
 pub export fn glGetnUniformivKHR(prog: u32, loc: i32, buf_size: i32, params: [*]i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     getnUniform(prog, loc, .i, buf_size, @ptrCast(params));
 }
 pub export fn glGetnUniformuiv(prog: u32, loc: i32, buf_size: i32, params: [*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     getnUniform(prog, loc, .u, buf_size, params);
 }
 pub export fn glGetnUniformuivKHR(prog: u32, loc: i32, buf_size: i32, params: [*]u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     getnUniform(prog, loc, .u, buf_size, params);
 }
 
@@ -823,114 +1869,180 @@ fn uniMat(loc: i32, n: i32, transpose: u8, cols: u32, rows: u32, data: ?[*]const
     program.uniformMatrix(c, loc, n, transpose != 0, cols, rows, @ptrCast(d));
 }
 pub export fn glUniform1f(loc: i32, x: f32) callconv(.c) void {
-    const v = [1]u32{ @bitCast(x) };
+    driverEnter();
+    defer driverLeave();
+    const v = [1]u32{@bitCast(x)};
     uni(loc, 1, 1, .f, &v);
 }
 pub export fn glUniform1fv(loc: i32, n: i32, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 1, .f, v);
 }
 pub export fn glUniform1i(loc: i32, x: i32) callconv(.c) void {
-    const v = [1]u32{ @bitCast(x) };
+    driverEnter();
+    defer driverLeave();
+    const v = [1]u32{@bitCast(x)};
     uni(loc, 1, 1, .i, &v);
 }
 pub export fn glUniform1iv(loc: i32, n: i32, v: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 1, .i, v);
 }
 pub export fn glUniform1ui(loc: i32, x: u32) callconv(.c) void {
-    const v = [1]u32{ x };
+    driverEnter();
+    defer driverLeave();
+    const v = [1]u32{x};
     uni(loc, 1, 1, .u, &v);
 }
 pub export fn glUniform1uiv(loc: i32, n: i32, v: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 1, .u, v);
 }
 pub export fn glUniform2f(loc: i32, x: f32, y: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const v = [2]u32{ @bitCast(x), @bitCast(y) };
     uni(loc, 1, 2, .f, &v);
 }
 pub export fn glUniform2fv(loc: i32, n: i32, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 2, .f, v);
 }
 pub export fn glUniform2i(loc: i32, x: i32, y: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const v = [2]u32{ @bitCast(x), @bitCast(y) };
     uni(loc, 1, 2, .i, &v);
 }
 pub export fn glUniform2iv(loc: i32, n: i32, v: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 2, .i, v);
 }
 pub export fn glUniform2ui(loc: i32, x: u32, y: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const v = [2]u32{ x, y };
     uni(loc, 1, 2, .u, &v);
 }
 pub export fn glUniform2uiv(loc: i32, n: i32, v: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 2, .u, v);
 }
 pub export fn glUniform3f(loc: i32, x: f32, y: f32, z: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const v = [3]u32{ @bitCast(x), @bitCast(y), @bitCast(z) };
     uni(loc, 1, 3, .f, &v);
 }
 pub export fn glUniform3fv(loc: i32, n: i32, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 3, .f, v);
 }
 pub export fn glUniform3i(loc: i32, x: i32, y: i32, z: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const v = [3]u32{ @bitCast(x), @bitCast(y), @bitCast(z) };
     uni(loc, 1, 3, .i, &v);
 }
 pub export fn glUniform3iv(loc: i32, n: i32, v: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 3, .i, v);
 }
 pub export fn glUniform3ui(loc: i32, x: u32, y: u32, z: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const v = [3]u32{ x, y, z };
     uni(loc, 1, 3, .u, &v);
 }
 pub export fn glUniform3uiv(loc: i32, n: i32, v: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 3, .u, v);
 }
 pub export fn glUniform4f(loc: i32, x: f32, y: f32, z: f32, w: f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const v = [4]u32{ @bitCast(x), @bitCast(y), @bitCast(z), @bitCast(w) };
     uni(loc, 1, 4, .f, &v);
 }
 pub export fn glUniform4fv(loc: i32, n: i32, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 4, .f, v);
 }
 pub export fn glUniform4i(loc: i32, x: i32, y: i32, z: i32, w: i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const v = [4]u32{ @bitCast(x), @bitCast(y), @bitCast(z), @bitCast(w) };
     uni(loc, 1, 4, .i, &v);
 }
 pub export fn glUniform4iv(loc: i32, n: i32, v: ?[*]const i32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 4, .i, v);
 }
 pub export fn glUniform4ui(loc: i32, x: u32, y: u32, z: u32, w: u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     const v = [4]u32{ x, y, z, w };
     uni(loc, 1, 4, .u, &v);
 }
 pub export fn glUniform4uiv(loc: i32, n: i32, v: ?[*]const u32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uni(loc, n, 4, .u, v);
 }
 pub export fn glUniformMatrix2fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uniMat(loc, n, transpose, 2, 2, v);
 }
 pub export fn glUniformMatrix3fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uniMat(loc, n, transpose, 3, 3, v);
 }
 pub export fn glUniformMatrix4fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uniMat(loc, n, transpose, 4, 4, v);
 }
 pub export fn glUniformMatrix2x3fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uniMat(loc, n, transpose, 2, 3, v);
 }
 pub export fn glUniformMatrix3x2fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uniMat(loc, n, transpose, 3, 2, v);
 }
 pub export fn glUniformMatrix2x4fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uniMat(loc, n, transpose, 2, 4, v);
 }
 pub export fn glUniformMatrix4x2fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uniMat(loc, n, transpose, 4, 2, v);
 }
 pub export fn glUniformMatrix3x4fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uniMat(loc, n, transpose, 3, 4, v);
 }
 pub export fn glUniformMatrix4x3fv(loc: i32, n: i32, transpose: u8, v: ?[*]const f32) callconv(.c) void {
+    driverEnter();
+    defer driverLeave();
     uniMat(loc, n, transpose, 4, 3, v);
 }
 
@@ -952,6 +2064,16 @@ test "libgles: GL through its C entry points, on the CPU" {
     try std.testing.expect(makeCurrent(&t_ctx));
     defer _ = makeCurrent(null);
     try std.testing.expectEqual(@as(?*Context, &t_ctx), getCurrent());
+    glPopGroupMarkerEXT();
+    glPushGroupMarkerEXT(0, "outer");
+    glPushGroupMarkerEXT(0, null);
+    glInsertEventMarkerEXT(2, "hi");
+    try std.testing.expectEqual(@as(u32, 2), t_ctx.marker_depth);
+    glPopGroupMarkerEXT();
+    glPopGroupMarkerEXT();
+    glPopGroupMarkerEXT();
+    try std.testing.expectEqual(@as(u32, 0), t_ctx.marker_depth);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
     // (no surface yet: the default framebuffer is undefined)
     try std.testing.expectEqual(g.FRAMEBUFFER_UNDEFINED, glCheckFramebufferStatus(g.FRAMEBUFFER));
     glClear(g.COLOR_BUFFER_BIT);
@@ -1033,10 +2155,130 @@ test "libgles: robustness: the extensions, the strategy, a reset told once, the 
     try std.testing.expectEqual(g.NO_ERROR, glGetGraphicsResetStatus());
 }
 
+test "libgles: framebuffer copies reach the selected array or volume mip and layer" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var source = t_eng.newImage(4, 4, .rgba8).?;
+    defer t_eng.freeImage(&source);
+    t_ctx.setSurface(&source, &source, null);
+    glClearColor(0, 1, 0, 1);
+    glClear(g.COLOR_BUFFER_BIT);
+    var names: [2]u32 = undefined;
+    glGenTextures(2, &names);
+    glBindTexture(g.TEXTURE_2D_ARRAY, names[0]);
+    glTexStorage3D(g.TEXTURE_2D_ARRAY, 2, g.RGBA8, 4, 4, 3);
+    glCopyTexSubImage3D(g.TEXTURE_2D_ARRAY, 1, 0, 0, 2, -1, 0, 2, 2);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    var framebuffer: [1]u32 = undefined;
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(g.READ_FRAMEBUFFER, framebuffer[0]);
+    glFramebufferTextureLayer(g.READ_FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[0], 1, 2);
+    var pixels: [16]u8 = undefined;
+    glReadPixels(0, 0, 2, 2, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 255, 0, 255, 0, 0, 0, 0, 0, 255, 0, 255 }, &pixels);
+    glFramebufferTextureLayer(g.READ_FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[0], 1, 1);
+    glReadPixels(0, 0, 2, 2, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &pixels);
+    glBindFramebuffer(g.READ_FRAMEBUFFER, 0);
+    glCopyTexSubImage3D(g.TEXTURE_2D_ARRAY, 1, 0, 0, 3, 0, 0, 2, 2);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glBindTexture(g.TEXTURE_3D, names[1]);
+    glTexStorage3D(g.TEXTURE_3D, 3, g.RGBA8, 4, 4, 4);
+    glCopyTexSubImage3D(g.TEXTURE_3D, 1, 0, 0, 1, 0, 0, 2, 2);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    glBindFramebuffer(g.READ_FRAMEBUFFER, framebuffer[0]);
+    glFramebufferTextureLayer(g.READ_FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[1], 1, 1);
+    glReadPixels(0, 0, 2, 2, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255 }, &pixels);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: buffer copies preserve bindings, reject overlap and respect maps" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [2]u32 = undefined;
+    glGenBuffers(2, &names);
+    glBindBuffer(g.COPY_READ_BUFFER, names[0]);
+    const bytes = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    glBufferData(g.COPY_READ_BUFFER, bytes.len, &bytes, g.STATIC_DRAW);
+    glBindBuffer(g.COPY_WRITE_BUFFER, names[1]);
+    glBufferData(g.COPY_WRITE_BUFFER, bytes.len, null, g.STATIC_DRAW);
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, 2, 3, 4);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    const mapped = glMapBufferRange(g.COPY_WRITE_BUFFER, 0, bytes.len, 1).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 2, 3, 4, 5, 0 }, @as([*]const u8, @ptrCast(mapped))[0..bytes.len]);
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, 0, 0, 1);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+    try std.testing.expectEqual(@as(u8, 1), glUnmapBuffer(g.COPY_WRITE_BUFFER));
+    glBindBuffer(g.COPY_WRITE_BUFFER, names[0]);
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, 0, 2, 4);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, 0, 4, 4);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    const copied = glMapBufferRange(g.COPY_READ_BUFFER, 0, bytes.len, 1).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 0, 1, 2, 3 }, @as([*]const u8, @ptrCast(copied))[0..bytes.len]);
+    try std.testing.expectEqual(@as(u8, 1), glUnmapBuffer(g.COPY_READ_BUFFER));
+    glCopyBufferSubData(g.COPY_READ_BUFFER, g.COPY_WRITE_BUFFER, std.math.maxInt(isize), 0, 1);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    var binding: i32 = 0;
+    glGetIntegerv(g.COPY_READ_BUFFER, @ptrCast(&binding));
+    try std.testing.expectEqual(@as(i32, @intCast(names[0])), binding);
+}
+
+test "libgles: vertex attribute queries keep vector types, VAO offsets and untouched outputs on errors" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var floats: [4]f32 = undefined;
+    var ints: [4]i32 = undefined;
+    var uints: [4]u32 = undefined;
+    glGetVertexAttribfv(3, g.CURRENT_VERTEX_ATTRIB, &floats);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 1 }, &floats);
+    glVertexAttrib4f(3, 0.5, -1.5, 2.5, 1);
+    glGetVertexAttribfv(3, g.CURRENT_VERTEX_ATTRIB, &floats);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, -1.5, 2.5, 1 }, &floats);
+    glGetVertexAttribiv(3, g.CURRENT_VERTEX_ATTRIB, &ints);
+    try std.testing.expectEqualSlices(i32, &.{ 1, -2, 3, 1 }, &ints);
+    glVertexAttribI4i(3, -5, 6, -7, 8);
+    glGetVertexAttribIiv(3, g.CURRENT_VERTEX_ATTRIB, &ints);
+    try std.testing.expectEqualSlices(i32, &.{ -5, 6, -7, 8 }, &ints);
+    glGetVertexAttribfv(3, g.CURRENT_VERTEX_ATTRIB, &floats);
+    try std.testing.expectEqualSlices(f32, &.{ -5, 6, -7, 8 }, &floats);
+    glVertexAttribI4ui(3, 0xffffffff, 0x80000000, 2, 3);
+    glGetVertexAttribIuiv(3, g.CURRENT_VERTEX_ATTRIB, &uints);
+    try std.testing.expectEqualSlices(u32, &.{ 0xffffffff, 0x80000000, 2, 3 }, &uints);
+    glGetVertexAttribfv(3, g.CURRENT_VERTEX_ATTRIB, &floats);
+    try std.testing.expect(floats[0] > 4e9 and floats[1] > 2e9);
+    const offset: usize = if (@sizeOf(usize) == 8) 0x123456789 else 0x12345;
+    glVertexAttribPointer(3, 2, g.FLOAT, 0, 16, @ptrFromInt(offset));
+    var pointer: ?*anyopaque = null;
+    glGetVertexAttribPointerv(3, g.VERTEX_ATTRIB_ARRAY_POINTER, &pointer);
+    try std.testing.expectEqual(offset, @intFromPtr(pointer));
+    glGetVertexAttribPointerv(3, g.FLOAT, &pointer);
+    try std.testing.expectEqual(g.INVALID_ENUM, glGetError());
+    try std.testing.expectEqual(offset, @intFromPtr(pointer));
+    uints = @splat(99);
+    glGetVertexAttribIuiv(gles.MAX_ATTRS, g.CURRENT_VERTEX_ATTRIB, &uints);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    try std.testing.expectEqualSlices(u32, &.{ 99, 99, 99, 99 }, &uints);
+}
+
 test "libgles: getProcAddress finds every entry point, and nothing else" {
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glClear)), getProcAddress("glClear"));
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glTexStorage2DEXT)), getProcAddress("glTexStorage2DEXT"));
-    try std.testing.expect(getProcAddress("glBeginTransformFeedback") == null);
+    try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glBeginTransformFeedback)), getProcAddress("glBeginTransformFeedback"));
+    try std.testing.expect(getProcAddress("glDispatchCompute") == null);
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glUniformMatrix4x3fv)), getProcAddress("glUniformMatrix4x3fv"));
     try std.testing.expect(getProcAddress("getProcAddress") == null);
     try std.testing.expectEqual(@as(?*const anyopaque, @ptrCast(&glReadnPixelsEXT)), getProcAddress("glReadnPixelsEXT"));
@@ -1109,7 +2351,8 @@ test "libgles: shaders, programs and uniforms through the C entry points" {
     glGetShaderiv(vs, g.SHADER_SOURCE_LENGTH, @ptrCast(&n));
     try E(@as(i32, @intCast(vs_src.len + 1)), n);
     // the fragment shader in two parts, each NUL-terminated
-    const fparts = [_]?[*]const u8{ "#version 300 es\nprecision mediump float;\n",
+    const fparts = [_]?[*]const u8{
+        "#version 300 es\nprecision mediump float;\n",
         \\uniform sampler2D sColor;
         \\uniform bool uOn;
         \\in vec4 vColor;
@@ -1283,6 +2526,146 @@ test "libgles: a GLSL ES 1.00 program, as WebGL 1 writes them" {
     try std.testing.expectEqual(g.NO_ERROR, glGetError());
 }
 
+var border_work: [8 << 20]u8 align(64) = undefined;
+var border_pool: [2 << 20]u8 align(64) = undefined;
+
+fn nearPx(want: [4]u8, got: [4]u8) bool {
+    for (want, got) |x, y| {
+        if (@abs(@as(i32, x) - y) > 1) return false;
+    }
+    return true;
+}
+
+/// The 8 x 8 window's pixel (x, y) from the bottom, RGBA.
+fn borderPx(x: i32, y: i32) [4]u8 {
+    var px: [4]u8 = undefined;
+    glReadPixels(x, y, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &px);
+    return px;
+}
+
+test "libgles: OES_texture_border_clamp: past the texture, its border color (glamor's RepeatNone)" {
+    t_eng.init(.{ .pool = &border_pool, .cpu_work = &border_work });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    var win = t_eng.newImage(8, 8, .rgba8).?;
+    defer t_eng.freeImage(&win);
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    t_ctx.setSurface(&win, &win, null);
+    const ext = std.mem.span(glGetString(g.EXTENSIONS).?);
+    for ([_][]const u8{ "GL_OES_texture_border_clamp", "GL_OES_vertex_array_object", "GL_EXT_map_buffer_range", "GL_EXT_texture_format_BGRA8888" }) |e| {
+        try std.testing.expect(std.mem.indexOf(u8, ext, e) != null);
+    }
+    // (the quad's texture coordinates run from -0.5 to 1.5: a texel of
+    // the 2 x 2 texture is 2 x 2 pixels, the texture the middle 4 x 4)
+    const vs = newShader(g.VERTEX_SHADER,
+        \\#version 300 es
+        \\in vec2 aPos;
+        \\out vec2 vUv;
+        \\void main() { vUv = aPos * 2.0 - 0.5; gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0); }
+    );
+    const fs = newShader(g.FRAGMENT_SHADER,
+        \\#version 300 es
+        \\precision mediump float;
+        \\uniform sampler2D uTex;
+        \\in vec2 vUv;
+        \\out vec4 o;
+        \\void main() { o = texture(uTex, vUv); }
+    );
+    try shaderOk(vs);
+    try shaderOk(fs);
+    const p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glBindAttribLocation(p, 0, "aPos");
+    glLinkProgram(p);
+    try linkOk(p);
+    glUseProgram(p);
+    glUniform1i(glGetUniformLocation(p, "uTex"), 0);
+    var vao: [1]u32 = undefined;
+    glGenVertexArraysOES(1, &vao);
+    glBindVertexArrayOES(vao[0]);
+    try std.testing.expectEqual(g.TRUE, glIsVertexArrayOES(vao[0]));
+    var buf: [1]u32 = undefined;
+    glGenBuffers(1, &buf);
+    glBindBuffer(g.ARRAY_BUFFER, buf[0]);
+    const quad = [_]f32{ 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1 };
+    glBufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, g.STATIC_DRAW);
+    glVertexAttribPointer(0, 2, g.FLOAT, 0, 8, null);
+    glEnableVertexAttribArray(0);
+
+    var tex: [1]u32 = undefined;
+    glGenTextures(1, &tex);
+    glBindTexture(g.TEXTURE_2D, tex[0]);
+    const white = [_]u8{255} ** 16;
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA), 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, &white);
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, @intCast(g.NEAREST));
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, @intCast(g.NEAREST));
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, @intCast(g.CLAMP_TO_BORDER));
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_T, @intCast(g.CLAMP_TO_BORDER));
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    // the default border: transparent black
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, borderPx(0, 0));
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, borderPx(3, 4));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, borderPx(7, 5));
+    // a border color, read back as given
+    const blue = [_]f32{ 0, 0, 1, 0.5 };
+    glTexParameterfv(g.TEXTURE_2D, g.TEXTURE_BORDER_COLOR, &blue);
+    var back: [4]f32 = undefined;
+    glGetTexParameterfv(g.TEXTURE_2D, g.TEXTURE_BORDER_COLOR, &back);
+    try std.testing.expectEqualSlices(f32, &blue, &back);
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expect(nearPx(.{ 0, 0, 255, 128 }, borderPx(0, 0)));
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, borderPx(4, 3));
+    // S clamped to the edge, T to the border: left and right are the
+    // texture's edge, top and bottom the border
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, @intCast(g.CLAMP_TO_EDGE));
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, borderPx(0, 4));
+    try std.testing.expect(nearPx(.{ 0, 0, 255, 128 }, borderPx(4, 0)));
+    // bilinear: the edge texel blended with the border
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, @intCast(g.CLAMP_TO_BORDER));
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, @intCast(g.LINEAR));
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    const edge = borderPx(2, 4);
+    try std.testing.expect(edge[0] > 0 and edge[0] < 255 and edge[2] == 255);
+    // a BGRA texture: the border is still R, G, B, A
+    const bgra = [_]u8{ 0, 255, 0, 255 } ** 4;
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.BGRA_EXT), 2, 2, 0, g.BGRA_EXT, g.UNSIGNED_BYTE, &bgra);
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, @intCast(g.NEAREST));
+    const red = [_]i32{ 2147483647, 0, 0, 2147483647 };
+    glTexParameteriv(g.TEXTURE_2D, g.TEXTURE_BORDER_COLOR, &red);
+    var ired: [4]i32 = undefined;
+    glGetTexParameteriv(g.TEXTURE_2D, g.TEXTURE_BORDER_COLOR, &ired);
+    try std.testing.expectEqualSlices(i32, &red, &ired);
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, borderPx(0, 0));
+    try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, borderPx(4, 4));
+    // a sampler object's border over the texture's
+    var smp: [1]u32 = undefined;
+    glGenSamplers(1, &smp);
+    glSamplerParameteri(smp[0], g.TEXTURE_MIN_FILTER, @intCast(g.NEAREST));
+    glSamplerParameteri(smp[0], g.TEXTURE_MAG_FILTER, @intCast(g.NEAREST));
+    glSamplerParameteri(smp[0], g.TEXTURE_WRAP_S, @intCast(g.CLAMP_TO_BORDER));
+    glSamplerParameteri(smp[0], g.TEXTURE_WRAP_T, @intCast(g.CLAMP_TO_BORDER));
+    const grey = [_]f32{ 0.5, 0.5, 0.5, 1 };
+    glSamplerParameterfv(smp[0], g.TEXTURE_BORDER_COLOR, &grey);
+    glBindSampler(0, smp[0]);
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    try std.testing.expect(nearPx(.{ 128, 128, 128, 255 }, borderPx(7, 7)));
+    glBindSampler(0, 0);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    glDeleteSamplers(1, &smp);
+    glDeleteTextures(1, &tex);
+    glDeleteBuffers(1, &buf);
+    glDeleteVertexArraysOES(1, &vao);
+    glDeleteProgram(p);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+}
+
 test "libgles: texture formats and sampler objects through the C entry points" {
     t_eng.init(.{ .pool = &t_pool });
     t_objs.init();
@@ -1338,5 +2721,563 @@ test "libgles: texture formats and sampler objects through the C entry points" {
     glGetIntegerv(g.SAMPLER_BINDING, @ptrCast(&v));
     try E(@as(i32, 0), v);
     try E(g.FALSE, glIsSampler(s[0]));
+    try E(g.NO_ERROR, glGetError());
+}
+
+test "libgles: CopyImageSubDataEXT copies a texture subrectangle without changing bindings" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [2]u32 = undefined;
+    glGenTextures(2, &names);
+    const pixels = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    glBindTexture(g.TEXTURE_2D, names[0]);
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA8), 2, 1, 0, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    glBindTexture(g.TEXTURE_2D, names[1]);
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA8), 2, 1, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    glCopyImageSubDataEXT(names[0], g.TEXTURE_2D, 0, 1, 0, 0, names[1], g.TEXTURE_2D, 0, 0, 0, 0, 1, 1, 1);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    var fb: [1]u32 = undefined;
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    glFramebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, names[1], 0);
+    var result: [8]u8 = undefined;
+    glReadPixels(0, 0, 2, 1, g.RGBA, g.UNSIGNED_BYTE, &result);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8, 0, 0, 0, 0 }, &result);
+    glCopyImageSubDataEXT(names[0], g.TEXTURE_2D, 0, 1, 0, 0, names[1], g.TEXTURE_2D, 0, 0, 0, 0, 2, 1, 1);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+}
+
+test "libgles: immutable buffer storage enforces update and mapping flags" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var name: [1]u32 = undefined;
+    glGenBuffers(1, &name);
+    glBindBuffer(g.ARRAY_BUFFER, name[0]);
+    const bytes = [_]u8{ 3, 2, 1, 0 };
+    glBufferStorageEXT(g.ARRAY_BUFFER, bytes.len, &bytes, 1);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    var imm: [1]i32 = undefined;
+    glGetBufferParameteriv(g.ARRAY_BUFFER, 0x821F, &imm);
+    try std.testing.expectEqual(@as(i32, 1), imm[0]);
+    glBufferSubData(g.ARRAY_BUFFER, 0, bytes.len, &bytes);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+    glBufferData(g.ARRAY_BUFFER, bytes.len, null, g.STATIC_DRAW);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+    try std.testing.expect(glMapBufferRange(g.ARRAY_BUFFER, 0, bytes.len, 2) == null);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+    const mapped: [*]const u8 = @ptrCast(glMapBufferRange(g.ARRAY_BUFFER, 0, bytes.len, 1).?);
+    try std.testing.expectEqualSlices(u8, &bytes, mapped[0..bytes.len]);
+    try std.testing.expectEqual(@as(u8, 1), glUnmapBuffer(g.ARRAY_BUFFER));
+}
+
+test "libgles: persistent buffer mapping survives a server update and barrier" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var name: [1]u32 = undefined;
+    glGenBuffers(1, &name);
+    glBindBuffer(g.ARRAY_BUFFER, name[0]);
+    const read_persistent: u32 = 0x41;
+    glBufferStorageEXT(g.ARRAY_BUFFER, 8, null, read_persistent | 0x100);
+    const ptr: [*]const u8 = @ptrCast(glMapBufferRange(g.ARRAY_BUFFER, 0, 8, read_persistent).?);
+    const bytes = [_]u8{ 4, 3, 2, 1 };
+    glBufferSubData(g.ARRAY_BUFFER, 2, bytes.len, &bytes);
+    glMemoryBarrier(0x4000);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    try std.testing.expectEqualSlices(u8, &bytes, ptr[2..6]);
+    try std.testing.expectEqual(@as(u8, 1), glUnmapBuffer(g.ARRAY_BUFFER));
+}
+
+test "libgles: cube-map size queries and storage obey the same limit" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+
+    const query = 0x851C; // GL_MAX_CUBE_MAP_TEXTURE_SIZE
+    var limit = [_]i32{ -1, -1, -1, -1 };
+    var wide = [_]i64{ -1, -1, -1, -1 };
+    var float = [_]f32{ -1, -1, -1, -1 };
+    var boolean = [_]u8{ 2, 2, 2, 2 };
+    glGetIntegerv(query, &limit);
+    glGetInteger64v(query, &wide);
+    glGetFloatv(query, &float);
+    glGetBooleanv(query, &boolean);
+    try std.testing.expectEqual([4]i32{ gles.MAX_SIZE, -1, -1, -1 }, limit);
+    try std.testing.expectEqual([4]i64{ gles.MAX_SIZE, -1, -1, -1 }, wide);
+    try std.testing.expectEqual([4]f32{ gles.MAX_SIZE, -1, -1, -1 }, float);
+    try std.testing.expectEqual([4]u8{ 1, 2, 2, 2 }, boolean);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+
+    var names: [2]u32 = undefined;
+    glGenTextures(names.len, &names);
+    glBindTexture(g.TEXTURE_CUBE_MAP, names[0]);
+    const face = g.TEXTURE_CUBE_MAP_POSITIVE_X;
+    const oversized = limit[0] + 1;
+    glTexImage2D(face, 0, g.RGBA8, oversized, oversized, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    // The test pool is too small for a maximum-sized image. Allocation
+    // failure here confirms that the exact boundary passed validation.
+    glTexImage2D(face, 0, g.RGBA8, limit[0], limit[0], 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.OUT_OF_MEMORY, glGetError());
+    glTexImage2D(face, 0, g.RGBA8, 2, 1, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    const last = std.math.log2_int(u32, @intCast(limit[0]));
+    glTexImage2D(face, last, g.RGBA8, 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glTexImage2D(face, last, g.RGBA8, 1, 1, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+
+    glBindTexture(g.TEXTURE_CUBE_MAP, names[1]);
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 1, g.RGBA8, oversized, oversized);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 1, g.RGBA8, limit[0], limit[0]);
+    try std.testing.expectEqual(g.OUT_OF_MEMORY, glGetError());
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 1, g.RGBA8, 2, 1);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 2, g.RGBA8, 2, 2);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: copy array slices to cube faces and volume mips" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [3]u32 = undefined;
+    glGenTextures(names.len, &names);
+    glBindTexture(g.TEXTURE_2D_ARRAY, names[0]);
+    glTexStorage3D(g.TEXTURE_2D_ARRAY, 2, g.RGBA8, 2, 2, 3);
+    glBindTexture(g.TEXTURE_CUBE_MAP, names[1]);
+    glTexStorage2D(g.TEXTURE_CUBE_MAP, 2, g.RGBA8, 2, 2);
+    glBindTexture(g.TEXTURE_3D, names[2]);
+    glTexStorage3D(g.TEXTURE_3D, 2, g.RGBA8, 2, 2, 4);
+    const pixels = [_]u8{ 99, 99, 99, 99, 1, 2, 3, 4, 5, 6, 7, 8 };
+    glPixelStorei(g.UNPACK_SKIP_IMAGES, 1);
+    glTexSubImage3D(g.TEXTURE_2D_ARRAY, 1, 0, 0, 1, 1, 1, 2, g.RGBA, g.UNSIGNED_BYTE, &pixels);
+    glPixelStorei(g.UNPACK_SKIP_IMAGES, 0);
+    glCopyImageSubDataEXT(names[0], g.TEXTURE_2D_ARRAY, 1, 0, 0, 1, names[1], g.TEXTURE_CUBE_MAP, 1, 0, 0, 4, 1, 1, 2);
+    glCopyImageSubDataEXT(names[1], g.TEXTURE_CUBE_MAP, 1, 0, 0, 4, names[2], g.TEXTURE_3D, 1, 0, 0, 0, 1, 1, 2);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    const volume = &t_objs.tex[names[2] - 1].img;
+    try std.testing.expectEqualSlices(u8, pixels[4..], t_eng.hostView(volume, volume.level_at[1], 8));
+    glCopyImageSubDataEXT(names[1], g.TEXTURE_CUBE_MAP, 1, 0, 0, 4, names[2], g.TEXTURE_3D, 1, 0, 0, 1, 1, 1, 2);
+    try std.testing.expectEqual(g.INVALID_VALUE, glGetError());
+}
+
+test "libgles: mutable array definitions preserve compatible mips" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [1]u32 = undefined;
+    glGenTextures(1, &names);
+    glBindTexture(g.TEXTURE_2D_ARRAY, names[0]);
+    const mip = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    glTexImage3D(g.TEXTURE_2D_ARRAY, 0, g.RGBA8, 2, 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    glTexImage3D(g.TEXTURE_2D_ARRAY, 1, g.RGBA8, 1, 1, 2, 0, g.RGBA, g.UNSIGNED_BYTE, &mip);
+    glTexImage3D(g.TEXTURE_2D_ARRAY, 0, g.RGBA8, 2, 2, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    const tex = &t_objs.tex[names[0] - 1];
+    try std.testing.expectEqualSlices(u8, &mip, t_eng.hostView(&tex.img, tex.img.level_at[1], mip.len));
+    glTexImage3D(g.TEXTURE_2D_ARRAY, 0, g.RGBA8, 4, 4, 2, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    glTexSubImage3D(g.TEXTURE_2D_ARRAY, 1, 0, 0, 0, 1, 1, 2, g.RGBA, g.UNSIGNED_BYTE, &mip);
+    var fb: [1]u32 = undefined;
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    glFramebufferTextureLayer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, names[0], 1, 1);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, glCheckFramebufferStatus(g.FRAMEBUFFER));
+    var pixel: [4]u8 = undefined;
+    glReadPixels(0, 0, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &pixel);
+    try std.testing.expectEqualSlices(u8, mip[4..], &pixel);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: a non-base mip can be defined before level zero with its own format" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var names: [2]u32 = undefined;
+    glGenTextures(2, &names);
+    glPixelStorei(g.UNPACK_ALIGNMENT, 1);
+    glBindTexture(g.TEXTURE_2D, names[0]);
+    const red = [_]u8{ 13, 42, 81 };
+    glTexImage2D(g.TEXTURE_2D, 2, g.R8, 3, 1, 0, g.RED, g.UNSIGNED_BYTE, &red);
+    glTexImage2D(g.TEXTURE_2D, 0, g.RGBA8, 4, 4, 0, g.RGBA, g.UNSIGNED_BYTE, null);
+    glBindTexture(g.TEXTURE_2D, names[1]);
+    glTexStorage2D(g.TEXTURE_2D, 1, g.R8, 3, 1);
+    glCopyImageSubDataEXT(names[0], g.TEXTURE_2D, 2, 0, 0, 0, names[1], g.TEXTURE_2D, 0, 0, 0, 0, 3, 1, 1);
+    const dst = &t_objs.tex[names[1] - 1].img;
+    try std.testing.expectEqualSlices(u8, &red, t_eng.hostView(dst, 0, red.len));
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: KHR debug logs a message and restores filters on group pop" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    const dbg = gles.debug_output;
+    glEnable(dbg.OUTPUT);
+    glPushDebugGroupKHR(dbg.APPLICATION, 1, -1, "group");
+    glDebugMessageControlKHR(dbg.APPLICATION, dbg.ERROR, dbg.ANY, 0, null, 0);
+    glDebugMessageInsertKHR(dbg.APPLICATION, dbg.ERROR, 2, dbg.HIGH, -1, "hidden");
+    glPopDebugGroupKHR();
+    glDebugMessageInsertKHR(dbg.APPLICATION, dbg.ERROR, 3, dbg.HIGH, -1, "visible");
+    var ids: [4]u32 = undefined;
+    var text: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 3), glGetDebugMessageLogKHR(4, text.len, null, null, &ids, null, null, &text));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 3 }, ids[0..3]);
+    try std.testing.expectEqualSlices(u8, "group\x00group\x00visible\x00", text[0..20]);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+test "libgles: KHR labels are truncated on read and cleared on object reuse" {
+    t_eng.init(.{ .pool = &t_pool });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var name: [1]u32 = undefined;
+    glGenBuffers(1, &name);
+    glBindBuffer(g.ARRAY_BUFFER, name[0]);
+    glObjectLabelKHR(0x82E0, name[0], -1, "vertex data");
+    var text: [7]u8 = undefined;
+    var len: i32 = 0;
+    glGetObjectLabelKHR(0x82E0, name[0], text.len, &len, &text);
+    try std.testing.expectEqual(@as(i32, 6), len);
+    try std.testing.expectEqualStrings("vertex", std.mem.sliceTo(&text, 0));
+    glDeleteBuffers(1, &name);
+    glBindBuffer(g.ARRAY_BUFFER, name[0]);
+    glGetObjectLabelKHR(0x82E0, name[0], text.len, &len, &text);
+    try std.testing.expectEqual(@as(i32, 0), len);
+    const sync = glFenceSync(g.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    try std.testing.expect(sync != null);
+    glObjectPtrLabelKHR(sync, -1, "fence");
+    glGetObjectPtrLabelKHR(sync, text.len, &len, &text);
+    try std.testing.expectEqualStrings("fence", std.mem.sliceTo(&text, 0));
+    glDeleteSync(sync);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+const TestTimerDev = @typeInfo(@TypeOf(t_eng.dev)).optional.child;
+var test_timer_tick: u64 = 0;
+
+fn testTimerSample(_: *anyopaque, _: u64) error{ OutOfMemory, SubmitFailed, Timeout, DeviceLost, BadProgram, Unsupported }!u64 {
+    test_timer_tick += 100;
+    return test_timer_tick;
+}
+
+test "libgles: timer query lifecycle, 64-bit timestamp and elapsed results" {
+    t_eng.init(.{ .pool = &t_pool });
+    var vt: TestTimerDev.VTable = undefined;
+    vt.timestampNs = testTimerSample;
+    t_eng.dev = .{ .ctx = &test_timer_tick, .vtable = &vt, .caps = undefined };
+    test_timer_tick = 0x1_0000_0000;
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    var ids: [2]u32 = undefined;
+    glGenQueriesEXT(2, &ids);
+    try std.testing.expectEqual(@as(u8, 0), glIsQueryEXT(ids[0]));
+    glBeginQueryEXT(gles.TIME_ELAPSED_EXT, ids[0]);
+    try std.testing.expectEqual(@as(u8, 1), glIsQueryEXT(ids[0]));
+    glEndQueryEXT(gles.TIME_ELAPSED_EXT);
+    var value: u64 = 0;
+    glGetQueryObjectui64vEXT(ids[0], 0x8866, &value);
+    try std.testing.expectEqual(@as(u64, 100), value);
+    glQueryCounterEXT(ids[1], gles.TIMESTAMP_EXT);
+    glGetQueryObjectui64vEXT(ids[1], 0x8866, &value);
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0000 + 300), value);
+    var now: [1]i64 = undefined;
+    glGetInteger64v(gles.TIMESTAMP_EXT, &now);
+    try std.testing.expectEqual(@as(i64, 0x1_0000_0000 + 400), now[0]);
+    glDeleteQueriesEXT(2, &ids);
+    try std.testing.expectEqual(@as(u8, 0), glIsQueryEXT(ids[0]));
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+// ── Program binaries (WebRender's shader disk cache) ───────────────────────
+
+var bin_a: [16384]u8 = undefined;
+var bin_b: [16384]u8 = undefined;
+var bin_bad: [16384]u8 = undefined;
+
+/// The 8 x 8 window drawn with `p` (the quad, its colours and uniforms),
+/// read back.
+fn binaryScene(p: u32, out: *[8 * 8 * 4]u8) !void {
+    glUseProgram(p);
+    glUniform2f(glGetUniformLocation(p, "uOffset"), 0.25, 0);
+    const tints = [_]f32{ 1, 0.5, 0.25, 1, 0.25, 1, 0.5, 1 };
+    glUniform4fv(glGetUniformLocation(p, "uTint"), 2, &tints);
+    glUniform1i(glGetUniformLocation(p, "uTex"), 0);
+    glClearColor(0, 0, 0, 0);
+    glClear(g.COLOR_BUFFER_BIT);
+    glDrawArrays(g.TRIANGLES, 0, 6);
+    glReadPixels(0, 0, 8, 8, g.RGBA, g.UNSIGNED_BYTE, out);
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+}
+
+/// A binary glProgramBinary refuses: no GL error, the program not linked
+/// (not usable), its log saying `why`.
+fn binaryRefused(p: u32, bin: []const u8, why: []const u8) !void {
+    glProgramBinary(p, program.progbin.FORMAT, @ptrCast(bin.ptr), @intCast(bin.len));
+    try std.testing.expectEqual(g.NO_ERROR, glGetError());
+    var n: i32 = 0;
+    glGetProgramiv(p, g.LINK_STATUS, @ptrCast(&n));
+    try std.testing.expectEqual(@as(i32, 0), n);
+    glGetProgramiv(p, g.PROGRAM_BINARY_LENGTH, @ptrCast(&n));
+    try std.testing.expectEqual(@as(i32, 0), n);
+    var log: [256]u8 = undefined;
+    var len: i32 = 0;
+    glGetProgramInfoLog(p, log.len, &len, &log);
+    if (std.mem.indexOf(u8, log[0..@intCast(len)], why) == null) {
+        std.debug.print("refused binary: want `{s}`, log `{s}`\n", .{ why, log[0..@intCast(len)] });
+        return error.TestUnexpectedResult;
+    }
+    glUseProgram(p);
+    try std.testing.expectEqual(g.INVALID_OPERATION, glGetError());
+}
+
+/// A copy of the binary `src`, its `bytes` bytes at `at` set to `value`,
+/// its checksum made good again (what is tested is the field, not the
+/// checksum).
+fn binaryEdited(src: []const u8, at: usize, value: u64, bytes: usize) []u8 {
+    const x = bin_bad[0..src.len];
+    @memcpy(x, src);
+    switch (bytes) {
+        4 => std.mem.writeInt(u32, x[at..][0..4], @intCast(value), .little),
+        8 => std.mem.writeInt(u64, x[at..][0..8], value, .little),
+        else => unreachable,
+    }
+    std.mem.writeInt(u64, x[40..48], program.progbin.checksum(x), .little);
+    return x;
+}
+
+test "libgles: program binaries: a round trip draws alike; damage, another build or GPU refused" {
+    t_eng.init(.{ .pool = &border_pool, .cpu_work = &border_work });
+    t_objs.init();
+    t_ctx.init(&t_eng, &t_objs);
+    defer t_ctx.deinit();
+    var win = t_eng.newImage(8, 8, .rgba8).?;
+    defer t_eng.freeImage(&win);
+    try std.testing.expect(makeCurrent(&t_ctx));
+    defer _ = makeCurrent(null);
+    t_ctx.setSurface(&win, &win, null);
+    const E = std.testing.expectEqual;
+    const pb = program.progbin;
+    // the queries: one format, the driver's; the extension and its names
+    var n: i32 = 0;
+    glGetIntegerv(g.NUM_PROGRAM_BINARY_FORMATS, @ptrCast(&n));
+    try E(@as(i32, 1), n);
+    glGetIntegerv(g.PROGRAM_BINARY_FORMATS, @ptrCast(&n));
+    try E(@as(i32, @intCast(pb.FORMAT)), n);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(glGetString(g.EXTENSIONS).?), "GL_OES_get_program_binary") != null);
+    try E(@as(?*const anyopaque, @ptrCast(&glProgramBinaryOES)), getProcAddress("glProgramBinaryOES"));
+    try E(@as(?*const anyopaque, @ptrCast(&glGetProgramBinaryOES)), getProcAddress("glGetProgramBinaryOES"));
+    try E(@as(?*const anyopaque, @ptrCast(&glProgramBinary)), getProcAddress("glProgramBinary"));
+    // GL_RENDERER ends with the driver build's tag (WebRender's cache key
+    // changes with each build), the same on the GPU's renderer and the
+    // CPU's: "gx-" and the build id's low 32 bits
+    const renderer = std.mem.span(glGetString(g.RENDERER).?);
+    try std.testing.expectEqualStrings("Galaxy (CPU) " ++ pb.BUILD_TAG, renderer);
+    try std.testing.expect(std.mem.endsWith(u8, gles.RENDERER_GPU, pb.BUILD_TAG) and std.mem.startsWith(u8, gles.RENDERER_GPU, "Galaxy (GPU) gx-"));
+    try E(@as(usize, 11), pb.BUILD_TAG.len);
+
+    // what the scene draws: a quad, colour per vertex, a flat varying,
+    // a uniform array, a sampler
+    var vao: [1]u32 = undefined;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao[0]);
+    var buf: [1]u32 = undefined;
+    glGenBuffers(1, &buf);
+    glBindBuffer(g.ARRAY_BUFFER, buf[0]);
+    const V = extern struct { x: f32, y: f32, r: f32, g: f32, b: f32, a: f32 };
+    const quad = [_]V{
+        .{ .x = 0, .y = 0, .r = 1, .g = 0, .b = 0, .a = 1 },  .{ .x = 1, .y = 0, .r = 0, .g = 1, .b = 0, .a = 1 },
+        .{ .x = 1, .y = 1, .r = 0, .g = 0, .b = 1, .a = 1 },  .{ .x = 0, .y = 0, .r = 1, .g = 0, .b = 0, .a = 1 },
+        .{ .x = 1, .y = 1, .r = 0, .g = 0, .b = 1, .a = 1 },  .{ .x = 0, .y = 1, .r = 1, .g = 1, .b = 1, .a = 0.5 },
+    };
+    glBufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, g.STATIC_DRAW);
+    glVertexAttribPointer(0, 2, g.FLOAT, 0, @sizeOf(V), null);
+    glVertexAttribPointer(3, 4, g.FLOAT, 0, @sizeOf(V), @ptrFromInt(8));
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(3);
+    var tex: [1]u32 = undefined;
+    glGenTextures(1, &tex);
+    glBindTexture(g.TEXTURE_2D, tex[0]);
+    const texel = [_]u8{ 64, 128, 255, 255 };
+    glTexImage2D(g.TEXTURE_2D, 0, @intCast(g.RGBA), 1, 1, 0, g.RGBA, g.UNSIGNED_BYTE, &texel);
+    glTexParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, @intCast(g.NEAREST));
+
+    // linked from source, as WebRender links: the hint, the attribute
+    // bound, the shaders detached and deleted after the link
+    const vs = newShader(g.VERTEX_SHADER,
+        \\#version 300 es
+        \\in vec2 aPos;
+        \\in vec4 aColor;
+        \\uniform vec2 uOffset;
+        \\out vec4 vColor;
+        \\flat out int vSel;
+        \\void main() {
+        \\    vColor = aColor;
+        \\    vSel = aPos.x > 0.5 ? 1 : 0;
+        \\    gl_Position = vec4(aPos * 2.0 - 1.0 + uOffset, 0.0, 1.0);
+        \\}
+    );
+    const fs = newShader(g.FRAGMENT_SHADER,
+        \\#version 300 es
+        \\precision mediump float;
+        \\uniform vec4 uTint[2];
+        \\uniform sampler2D uTex;
+        \\in vec4 vColor;
+        \\flat in int vSel;
+        \\out vec4 o;
+        \\void main() { o = vColor * uTint[vSel] + texture(uTex, vec2(0.5)) * 0.25; }
+    );
+    try shaderOk(vs);
+    try shaderOk(fs);
+    const a = glCreateProgram();
+    glAttachShader(a, vs);
+    glAttachShader(a, fs);
+    glBindAttribLocation(a, 3, "aColor");
+    glProgramParameteri(a, g.PROGRAM_BINARY_RETRIEVABLE_HINT, 1);
+    glGetProgramiv(a, g.PROGRAM_BINARY_RETRIEVABLE_HINT, @ptrCast(&n));
+    try E(@as(i32, 1), n);
+    // (no binary before the link)
+    glGetProgramiv(a, g.PROGRAM_BINARY_LENGTH, @ptrCast(&n));
+    try E(@as(i32, 0), n);
+    var len: i32 = -1;
+    var fmt: u32 = 0;
+    glGetProgramBinary(a, bin_a.len, &len, &fmt, &bin_a);
+    try E(g.INVALID_OPERATION, glGetError());
+    try E(@as(i32, 0), len);
+    glLinkProgram(a);
+    try linkOk(a);
+    glDetachShader(a, vs);
+    glDetachShader(a, fs);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    var blen: i32 = 0;
+    glGetProgramiv(a, g.PROGRAM_BINARY_LENGTH, @ptrCast(&blen));
+    try std.testing.expect(blen > pb.HEADER_BYTES and blen <= bin_a.len);
+    // (a buffer one byte short: no binary)
+    glGetProgramBinary(a, blen - 1, &len, &fmt, &bin_a);
+    try E(g.INVALID_OPERATION, glGetError());
+    glGetProgramBinary(a, -1, &len, &fmt, &bin_a);
+    try E(g.INVALID_VALUE, glGetError());
+    glGetProgramBinaryOES(a, bin_a.len, &len, &fmt, &bin_a);
+    try E(g.NO_ERROR, glGetError());
+    try E(blen, len);
+    try E(pb.FORMAT, fmt);
+    const bin = bin_a[0..@intCast(len)];
+    try std.testing.expectEqualStrings("GXPRGBIN", bin[0..8]);
+    try std.testing.expect(pb.check(bin, pb.gpuId(null)) == null);
+    var px_a: [8 * 8 * 4]u8 = undefined;
+    try binaryScene(a, &px_a);
+    // (it drew: the quad's colours, not the clear)
+    var lit: usize = 0;
+    for (0..64) |i| lit += @intFromBool(px_a[i * 4 + 3] != 0);
+    try std.testing.expect(lit > 32);
+
+    // the binary in a new program: linked, the same interface, the same
+    // pixels, the same binary again
+    const prog_b = glCreateProgram();
+    glProgramBinary(prog_b, fmt, @ptrCast(bin.ptr), len);
+    try E(g.NO_ERROR, glGetError());
+    try linkOk(prog_b);
+    glGetProgramiv(prog_b, g.ATTACHED_SHADERS, @ptrCast(&n));
+    try E(@as(i32, 0), n);
+    for ([_][*:0]const u8{ "aPos", "aColor" }) |nm| try E(glGetAttribLocation(a, nm), glGetAttribLocation(prog_b, nm));
+    try E(@as(i32, 3), glGetAttribLocation(prog_b, "aColor"));
+    for ([_][*:0]const u8{ "uOffset", "uTint", "uTint[1]", "uTex", "nothing" }) |nm| try E(glGetUniformLocation(a, nm), glGetUniformLocation(prog_b, nm));
+    for ([_]u32{ g.ACTIVE_UNIFORMS, g.ACTIVE_ATTRIBUTES, g.ACTIVE_UNIFORM_MAX_LENGTH, g.PROGRAM_BINARY_LENGTH }) |q| {
+        var x: i32 = 0;
+        var y: i32 = 0;
+        glGetProgramiv(a, q, @ptrCast(&x));
+        glGetProgramiv(prog_b, q, @ptrCast(&y));
+        try E(x, y);
+    }
+    // (uniform values start at zero, as after a link)
+    var f: [4]f32 = undefined;
+    glGetUniformfv(prog_b, glGetUniformLocation(prog_b, "uOffset"), &f);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, f[0..2]);
+    var px_b: [8 * 8 * 4]u8 = undefined;
+    try binaryScene(prog_b, &px_b);
+    try std.testing.expectEqualSlices(u8, &px_a, &px_b);
+    glGetProgramBinary(prog_b, bin_b.len, &len, &fmt, &bin_b);
+    try std.testing.expectEqualSlices(u8, bin, bin_b[0..@intCast(len)]);
+
+    // refused, cleanly: GL's errors for the call itself ...
+    glProgramBinary(prog_b, 0x875F, @ptrCast(bin.ptr), @intCast(bin.len)); // (Mesa's format)
+    try E(g.INVALID_ENUM, glGetError());
+    glProgramBinary(prog_b, pb.FORMAT, @ptrCast(bin.ptr), -1);
+    try E(g.INVALID_VALUE, glGetError());
+    glProgramBinary(12345, pb.FORMAT, @ptrCast(bin.ptr), @intCast(bin.len));
+    try E(g.INVALID_VALUE, glGetError());
+    // (prog_b is still linked: those calls changed nothing)
+    try linkOk(prog_b);
+    // ... and for what the binary holds: no GL error, the program not
+    // linked, the reason in its log
+    try binaryRefused(prog_b, bin[0..0], "shorter than its header");
+    try binaryRefused(prog_b, bin[0 .. bin.len - 1], "length");
+    @memcpy(bin_bad[0..bin.len], bin);
+    bin_bad[bin.len - 5] ^= 0x20; // (a byte of the fragment shader's code)
+    try binaryRefused(prog_b, bin_bad[0..bin.len], "checksum");
+    @memset(bin_bad[0..bin.len], 0);
+    try binaryRefused(prog_b, bin_bad[0..bin.len], "not a Galaxy program binary");
+    try binaryRefused(prog_b, binaryEdited(bin, 8, pb.VERSION + 1, 4), "format version");
+    try binaryRefused(prog_b, binaryEdited(bin, 24, pb.DRIVER_BUILD ^ 1, 8), "another driver build");
+    try binaryRefused(prog_b, binaryEdited(bin, 32, pb.gpuId(null) ^ 1, 8), "another GPU");
+    // (a checksum that holds over tables that do not: the attributes'
+    // count past the table, after the version, the names' count and names)
+    const names_n = std.mem.readInt(u32, bin[pb.HEADER_BYTES + 12 ..][0..4], .little);
+    try binaryRefused(prog_b, binaryEdited(bin, pb.HEADER_BYTES + 16 + names_n, 0xffff, 4), "not a program's");
+    // WebRender's way on: link the program from source again
+    const vs2 = newShader(g.VERTEX_SHADER, "#version 300 es\nin vec2 aPos;\nvoid main() { gl_Position = vec4(aPos, 0.0, 1.0); }");
+    const fs2 = newShader(g.FRAGMENT_SHADER, "#version 300 es\nprecision mediump float;\nout vec4 o;\nvoid main() { o = vec4(1.0); }");
+    glAttachShader(prog_b, vs2);
+    glAttachShader(prog_b, fs2);
+    glLinkProgram(prog_b);
+    try linkOk(prog_b);
+    // and a good binary over a program that has shaders: taken
+    glProgramBinary(prog_b, pb.FORMAT, @ptrCast(bin.ptr), @intCast(bin.len));
+    try linkOk(prog_b);
+    try binaryScene(prog_b, &px_b);
+    try std.testing.expectEqualSlices(u8, &px_a, &px_b);
+    glUseProgram(0);
+    glDeleteProgram(a);
+    glDeleteProgram(prog_b);
+    glDeleteShader(vs2);
+    glDeleteShader(fs2);
+    glDeleteTextures(1, &tex);
+    glDeleteBuffers(1, &buf);
+    glDeleteVertexArrays(1, &vao);
     try E(g.NO_ERROR, glGetError());
 }

@@ -32,7 +32,7 @@ const Rig = struct {
 };
 
 fn caps() gpu.Caps {
-    return adreno_device.x1_45_caps(Rig.arena.len);
+    return adreno_device.emuCaps(Rig.arena.len);
 }
 
 fn newKernel(name: []const u8, group: [3]u32) kir.Kernel {
@@ -40,10 +40,10 @@ fn newKernel(name: []const u8, group: [3]u32) kir.Kernel {
 }
 
 /// The kernel on the interpreter, buffers in place.
-fn runInterp(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u32) !interp.Stats {
+fn runInterp(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u32, target: gpu.Caps) !interp.Stats {
     var w = gpu.Work.init(&Rig.interp_mem);
     var trap: interp.Trap = .{};
-    return interp.runKernel(k, caps(), groups, bufs, params, &w, &trap) catch |e| {
+    return interp.runKernel(k, target, groups, bufs, params, &w, &trap) catch |e| {
         std.debug.print("{s}: interpreter trap {s} at pc {d} thread {d} offset {d}\n", .{ k.name, @tagName(trap.what), trap.pc, trap.thread, trap.offset });
         return e;
     };
@@ -81,12 +81,12 @@ fn checkBinary(name: []const u8, bin: *const gpu.Binary) !void {
 }
 
 /// The kernel on the emulated Adreno: buffers copied in, run, copied back.
-fn runEmu(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u32) !EmuRun {
+fn runEmu(k: *kir.Kernel, groups: [3]u32, bufs: []const []u8, params: []const u32, target: gpu.Caps) !EmuRun {
     // (a fresh device per run: buffers do not pile up)
     Rig.emu.init(&Rig.arena, &Rig.view);
     emu_ready = true;
     const d = Rig.emu.device();
-    const bin = kir_ir3.compileWith(k, d.caps, &Rig.work, &Rig.out) catch |e| {
+    const bin = kir_ir3.compileWith(k, target, &Rig.work, &Rig.out) catch |e| {
         std.debug.print("{s}: compile: {s}\n{s}\n", .{ k.name, @errorName(e), kir_ir3.source(&Rig.work) });
         return e;
     };
@@ -134,6 +134,7 @@ const floats = [_]u32{
     0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x3f000000, 0x3fc00000, 0x40200000, 0xc0200000,
     0x40600000, 0x00000001, 0x80800000, 0x007fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0x7f7fffff,
     0x4b000001, 0x4f000000, 0xcf000001, 0x4f800000, 0x501502f9, 0xd01502f9, 0x3effffff, 0x42fe0000,
+    0x807fffff, 0x33000000, 0x33800000, 0xb3800000, 0x387fe000, 0x38800000,
 };
 
 const N = 512;
@@ -203,6 +204,8 @@ fn operand(k: *kir.Kernel, ty: kir.Ty, binding: u8, off: kir.V) kir.V {
 }
 
 fn checkOp(c: OpCaseX) !void {
+    var target = caps();
+    if (c.flush_denormals) target.denormals = .flush;
     const pool: []const u32 = if (c.float_pool) &floats else &ints;
     const in = inputs(pool, 0x51ed + @as(u32, @intFromEnum(c.op)) * 977 + c.aux);
     var outs: [2][N]u32 = undefined;
@@ -236,7 +239,7 @@ fn checkOp(c: OpCaseX) !void {
         var cb = in.b;
         var cc = in.c;
         const bufs = [_][]u8{ std.mem.sliceAsBytes(&ca), std.mem.sliceAsBytes(&cb), std.mem.sliceAsBytes(&cc), std.mem.sliceAsBytes(&outs[way]) };
-        if (way == 0) _ = try runInterp(&k, .{ N / 128, 1, 1 }, &bufs, &.{}) else _ = try runEmu(&k, .{ N / 128, 1, 1 }, &bufs, &.{});
+        if (way == 0) _ = try runInterp(&k, .{ N / 128, 1, 1 }, &bufs, &.{}, target) else _ = try runEmu(&k, .{ N / 128, 1, 1 }, &bufs, &.{}, target);
     }
     var bad: usize = 0;
     for (0..N) |i| {
@@ -270,6 +273,7 @@ const OpCaseX = struct {
     aux: u32 = 0,
     dst: kir.Ty,
     float_pool: bool = false,
+    flush_denormals: bool = false,
     how: Cmp = .exact,
     imm: u32 = 0,
     form: Form = .rrr,
@@ -358,7 +362,7 @@ fn bfeImm(k: *kir.Kernel, ty: kir.Ty, off: u32, width: u32) !void {
         var ca = in.a;
         @memset(&outs[way], 0);
         const bufs = [_][]u8{ std.mem.sliceAsBytes(&ca), std.mem.sliceAsBytes(&outs[way]) };
-        if (way == 0) _ = try runInterp(k, .{ N / 128, 1, 1 }, &bufs, &.{}) else _ = try runEmu(k, .{ N / 128, 1, 1 }, &bufs, &.{});
+        if (way == 0) _ = try runInterp(k, .{ N / 128, 1, 1 }, &bufs, &.{}, caps()) else _ = try runEmu(k, .{ N / 128, 1, 1 }, &bufs, &.{}, caps());
     }
     for (0..N) |i| if (outs[0][i] != outs[1][i]) {
         std.debug.print("bfe {s} off {d} width {d}: a={x}: ir3 {x}, interp {x}\n{s}\n", .{ @tagName(ty), off, width, in.a[i], outs[1][i], outs[0][i], kir_ir3.source(&Rig.work) });
@@ -390,6 +394,12 @@ test "exact fdiv and fsqrt (kir's mul/add-only expansions) equal the interpreter
     try checkOp(withImm(flt2("fdiv imm", .fdiv), fb(3.0), .rri));
     try checkOp(withImm(flt2("fdiv imm", .fdiv), fb(-0.75), .rir));
     try checkOp(flt1("fsqrt", .fsqrt, .nan_any));
+    var div_flush = flt2("fdiv flush", .fdiv);
+    div_flush.flush_denormals = true;
+    try checkOp(div_flush);
+    var sqrt_flush = flt1("fsqrt flush", .fsqrt, .nan_any);
+    sqrt_flush.flush_denormals = true;
+    try checkOp(sqrt_flush);
     // random operands, many more of them
     var seed: u32 = 1234;
     for (0..8) |round| {
@@ -599,8 +609,8 @@ fn both(k: *kir.Kernel, groups: [3]u32, init: []const []const u8, params: []cons
         @memcpy(sa[i], x);
         @memcpy(sb[i], x);
     }
-    _ = try runInterp(k, groups, sa[0..init.len], params);
-    const run = try runEmu(k, groups, sb[0..init.len], params);
+    _ = try runInterp(k, groups, sa[0..init.len], params, caps());
+    const run = try runEmu(k, groups, sb[0..init.len], params, caps());
     for (0..init.len) |i| {
         if (!sameBuffers(sa[i], sb[i])) {
             const wa: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, sa[i][0 .. sa[i].len & ~@as(usize, 3)]));
@@ -767,7 +777,7 @@ test "loads and stores: 8, 16, 32, 64 and 128 bits, signed and unsigned, f16, la
 }
 
 test "atomics, global and shared, contended" {
-    for ([_]kir.Atom{ .add, .min, .max, .xchg }) |kind| {
+    for ([_]kir.Atom{ .add, .min, .max, .xchg, .@"and", .@"or", .xor }) |kind| {
         for ([_]kir.Ty{ .u32, .i32 }) |ty| {
             var k = newKernel("atomics", .{ 64, 1, 1 });
             const g = k.binding();
@@ -805,6 +815,55 @@ test "atomics, global and shared, contended" {
             _ = try both(&k, .{ 3, 1, 1 }, &.{ &words, &out }, &.{});
         }
     }
+}
+
+test "compare-and-swap (CAS loops, global and shared; swapped and kept) and ballots" {
+    var k = newKernel("cas", .{ 64, 1, 1 });
+    const g = k.binding();
+    const o = k.binding();
+    const t = k.tid(0);
+    const gid = k.gid(0);
+    const gl = k.op2(.iadd, .u32, r(t), r(k.op2(.shl, .u32, r(gid), u(6))));
+    const val = k.op2(.imul, .u32, r(gl), u(0x9e3779b9));
+    const sh = k.sharedAlloc(16, 4);
+    var ms = kir.shared(32);
+    ms.imm = @intCast(sh);
+    const first = k.cmp(.u32, .eq, r(t), u(0));
+    k.ifp(r(first));
+    k.store(.u32, ms, u(0), u(0));
+    k.endif();
+    k.barrier();
+    // an increment by compare-and-swap, every lane contending
+    for ([_]kir.Mem{ kir.global(g, 32), ms }) |m| {
+        const exp = k.mov(.u32, u(0));
+        k.loop();
+        const got = k.cas(.u32, m, u(0), r(exp), r(k.op2(.iadd, .u32, r(exp), u(1))));
+        k.brk(r(k.cmp(.u32, .eq, r(got), r(exp))));
+        k.set(exp, .mov, r(got), no, no);
+        k.endloop();
+    }
+    k.barrier();
+    const final = k.load(.u32, ms, u(0));
+    // each lane's own word (4 + its index): swapped by odd lanes
+    const ob = k.op2(.shl, .u32, r(gl), u(4));
+    const own = k.op2(.iadd, .u32, r(ob), u(16));
+    k.store(.u32, kir.global(g, 32), r(own), r(val));
+    const odd = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(t), u(1))), u(0));
+    const want = k.sel(.u32, r(odd), r(val), r(k.op2(.iadd, .u32, r(val), u(1))));
+    const old = k.cas(.u32, kir.global(g, 32), r(own), r(want), r(t));
+    const p = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(val), u(0x100))), u(0));
+    const b0 = k.ballot(r(p), 0);
+    const b1 = k.ballot(r(p), 1);
+    const v = k.vec(.u32, 4);
+    k.set(kir.Kernel.at(v, 0), .mov, r(old), no, no);
+    k.set(kir.Kernel.at(v, 1), .mov, r(final), no, no);
+    k.set(kir.Kernel.at(v, 2), .mov, r(b0), no, no);
+    k.set(kir.Kernel.at(v, 3), .mov, r(b1), no, no);
+    k.store(.u32, kir.global(o, 128), r(ob), r(v));
+    var words = zeros(16 + 3 * 64 * 16);
+    var out = zeros(3 * 64 * 16);
+    _ = try both(&k, .{ 3, 1, 1 }, &.{ &words, &out }, &.{});
+    try std.testing.expectEqual(@as(u32, 3 * 64), std.mem.readInt(u32, Bufs.a[0][0..4], .little));
 }
 
 test "shuffles: idx, xor, up, down; immediate, uniform and per-lane operands" {
@@ -1400,7 +1459,7 @@ fn q4kCase(comptime tokens: comptime_int, rows: u32, blocks: u32) !void {
     d.fromDevice(out_kir, 0, out_kir.bytes);
     // the interpreter too (KIR's definition), on the CPU's copies
     var interp_out = zeros(8 * 64 * 4);
-    _ = try runInterp(&k, groups, &.{ w.cpu, aq.cpu, ad.cpu, abs.cpu, interp_out[0..out_kir.cpu.len] }, &params);
+    _ = try runInterp(&k, groups, &.{ w.cpu, aq.cpu, ad.cpu, abs.cpu, interp_out[0..out_kir.cpu.len] }, &params, caps());
     try std.testing.expectEqualSlices(u8, out_hand.cpu, out_kir.cpu);
     try std.testing.expect(sameBuffers(out_kir.cpu, interp_out[0..out_kir.cpu.len]));
     var name_buf: [64]u8 = undefined;

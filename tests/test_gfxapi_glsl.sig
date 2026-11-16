@@ -488,3 +488,163 @@ test "glsl draw: on the emulated Adreno (ir3), the CPU's bytes" {
     eng_a.deinit();
     a_gpu.close();
 }
+
+// ── What a context says of its use (report.Usage) ──────────────────────────
+
+/// A program with two of WebRender's sampler names, drawn as WebRender
+/// draws: a quad of six indices, once per instance.
+const vs_w: [:0]const u8 =
+    \\#version 300 es
+    \\in vec2 aPos;
+    \\in vec4 aColor;
+    \\uniform mat4 uTransform;
+    \\void main() { gl_Position = uTransform * vec4(aPos + aColor.xy, 0.0, 1.0); }
+;
+
+const fs_w: [:0]const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\uniform sampler2D sColor0;
+    \\uniform sampler2D sGpuCache;
+    \\out vec4 oColor;
+    \\void main() { oColor = texelFetch(sColor0, ivec2(0, 0), 0) + texelFetch(sGpuCache, ivec2(1, 1), 0); }
+;
+
+var fake_us: u64 = 0;
+fn fakeClock() u64 {
+    return fake_us;
+}
+
+var said: [4096]u8 = undefined;
+var said_len: usize = 0;
+fn hear(line: []const u8) void {
+    const n = @min(line.len, said.len - said_len);
+    @memcpy(said[said_len..][0..n], line[0..n]);
+    said_len += n;
+}
+
+fn has(text: []const u8, part: []const u8) bool {
+    return std.mem.indexOf(u8, text, part) != null;
+}
+
+test "usage: a context's draws, uploads and programs, said once in five seconds" {
+    const report = gfxapi.report;
+    said_len = 0;
+    report.sink = &hear;
+    defer report.sink = null;
+    const real_clock = report.clock;
+    report.clock = &fakeClock;
+    defer report.clock = real_clock;
+    fake_us = 50_000_000;
+
+    var caps = gpu.interp_caps;
+    caps.coherent = false;
+    emu = gpu.EmuDevice.init(caps, &emu_mem, &emu_work);
+    emu.shadow = &emu_shadow;
+    eng_emu.init(.{ .dev = emu.device(), .work = &compile_mem, .cpu_work = &cpu_work });
+    defer eng_emu.deinit();
+    try std.testing.expect(eng_emu.onGpu());
+    objs.init();
+    const c = &ctx;
+    c.init(&eng_emu, &objs);
+    defer c.deinit();
+    c.usage.id = 7;
+    c.usage.es = 3;
+    var out: Out = .{};
+
+    var tex: [2]u32 = undefined;
+    c.genTextures(&tex);
+    c.bindTexture(g.TEXTURE_2D, tex[0]);
+    c.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, W, H);
+    var fb: [1]u32 = undefined;
+    c.genFramebuffers(&fb);
+    c.bindFramebuffer(g.FRAMEBUFFER, fb[0]);
+    c.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex[0], 0);
+    try std.testing.expectEqual(g.FRAMEBUFFER_COMPLETE, c.checkFramebufferStatus(g.FRAMEBUFFER));
+    c.viewportSet(0, 0, W, H);
+    c.clearColor(0, 0, 0, 0);
+    c.clear(g.COLOR_BUFFER_BIT);
+    // the first flush begins the time counted: nothing is said
+    c.flush();
+    try std.testing.expectEqual(@as(usize, 0), said_len);
+
+    // a program linked, a texture uploaded (16 x 16 RGBA8: 1 kB), one
+    // indexed draw of three instances (six triangles)
+    const vw = shader(c, g.VERTEX_SHADER, vs_w, &out);
+    const fw = shader(c, g.FRAGMENT_SHADER, fs_w, &out);
+    const pw = link(c, vw, fw, &out);
+    if (out.log_len > 0) std.debug.print("{s}\n", .{out.log[0..out.log_len]});
+    try std.testing.expectEqual(@as(u32, 0), out.errors);
+    program.useProgram(c, pw);
+    const proj = [16]f32{ 1.0 / 16.0, 0, 0, 0, 0, 1.0 / 16.0, 0, 0, 0, 0, 1, 0, -1, -1, 0, 1 };
+    program.uniformMatrix(c, loc(c, pw, "uTransform"), 1, false, 4, 4, @ptrCast(&proj));
+    c.bindTexture(g.TEXTURE_2D, tex[1]);
+    c.texStorage2D(g.TEXTURE_2D, 1, g.RGBA8, 16, 16);
+    const texels: [16 * 16 * 4]u8 = @splat(0x40);
+    c.texSubImage2D(g.TEXTURE_2D, 0, 0, 0, 16, 16, g.RGBA, g.UNSIGNED_BYTE, &texels);
+    var vao: [1]u32 = undefined;
+    c.genVertexArrays(&vao);
+    c.bindVertexArray(vao[0]);
+    var bufs: [3]u32 = undefined;
+    c.genBuffers(&bufs);
+    const quad = [_]f32{ 0, 0, 4, 0, 0, 4, 4, 4 };
+    c.bindBuffer(g.ARRAY_BUFFER, bufs[0]);
+    c.bufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, g.STATIC_DRAW);
+    c.vertexAttribPointer(0, 2, g.FLOAT, false, 8, 0, false);
+    c.enableVertexAttribArray(0, true);
+    const shifts = [_]f32{ 0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0 };
+    c.bindBuffer(g.ARRAY_BUFFER, bufs[1]);
+    c.bufferData(g.ARRAY_BUFFER, @sizeOf(@TypeOf(shifts)), &shifts, g.STATIC_DRAW);
+    c.vertexAttribPointer(1, 4, g.FLOAT, false, 16, 0, false);
+    c.enableVertexAttribArray(1, true);
+    c.vertexAttribDivisor(1, 1);
+    const idx = [_]u16{ 0, 1, 3, 0, 3, 2 };
+    c.bindBuffer(g.ELEMENT_ARRAY_BUFFER, bufs[2]);
+    c.bufferData(g.ELEMENT_ARRAY_BUFFER, @sizeOf(@TypeOf(idx)), &idx, g.STATIC_DRAW);
+    c.drawElements(g.TRIANGLES, 6, g.UNSIGNED_SHORT, 0, 3);
+    try std.testing.expectEqual(g.NO_ERROR, c.getError());
+    try std.testing.expect(eng_emu.why_pipe == null);
+    // (drawn: the texel's 0x40 twice over, at the third instance's quad)
+    var px4: [4]u8 = undefined;
+    c.readPixels(17, 1, 1, 1, g.RGBA, g.UNSIGNED_BYTE, &px4);
+    try std.testing.expectEqual([4]u8{ 0x80, 0x80, 0x80, 0x80 }, px4);
+
+    // two seconds on, then four: nothing yet, however often it is asked
+    fake_us += 2_000_000;
+    c.flush();
+    fake_us += 2_000_000;
+    for (0..100) |_| c.finish();
+    try std.testing.expectEqual(@as(usize, 0), said_len);
+    // five and a half: the line
+    fake_us += 1_500_000;
+    c.finish();
+    const line = said[0..said_len];
+    std.debug.print("{s}", .{line});
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    try std.testing.expect(has(line, "]: context 7 (ES 3 asked) in 5.5 s on the GPU ("));
+    try std.testing.expect(has(line, "): 0 swaps (0 ms in them); 1 draws (1 indexed, 3 instances, 6 triangles, 0 on the CPU); 1 uploads, 1 kB; programs: 1 linked, 1 WebRender's, 0 the layers compositor's, names seen: sColor0 sGpuCache; GPU: "));
+    try std.testing.expect(!has(line, "GPU: 0 batches"));
+    // at once again, and four seconds later: no second line
+    c.finish();
+    fake_us += 4_000_000;
+    c.drawElements(g.TRIANGLES, 6, g.UNSIGNED_SHORT, 0, 2);
+    c.finish();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, said[0..said_len], "\n"));
+    // a second and a bit later: the second line, of what was done since
+    // the first (the program is still the context's one)
+    fake_us += 1_200_000;
+    c.flush();
+    const both = said[0..said_len];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, both, "\n"));
+    try std.testing.expect(has(both[line.len..], " in 5.2 s on the GPU ("));
+    try std.testing.expect(has(both[line.len..], "1 draws (1 indexed, 2 instances, 4 triangles, 0 on the CPU); 0 uploads, 0 kB; programs: 1 linked, 1 WebRender's"));
+    // a stretch in which the context does nothing: nothing said
+    fake_us += 30_000_000;
+    c.finish();
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, said[0..said_len], "\n"));
+
+    program.useProgram(c, 0);
+    program.deleteProgram(c, pw);
+    program.deleteShader(c, vw);
+    program.deleteShader(c, fw);
+}

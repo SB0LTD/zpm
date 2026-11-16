@@ -46,8 +46,10 @@
 //!   not uniform (an if, a loop's exit, a return or discard on a value
 //!   that differs between pixels) GL leaves them undefined: here they
 //!   are 0 (`flattenDerivs`).
-//! - Not yet: cube, 3D, array and shadow samplers (they read 0), a sampler
-//!   chosen at run time, gl_FragDepth, gl_PointSize.
+//! - gl_PointSize, gl_PointCoord and gl_FragDepth through the raster's
+//!   VertexIO and FragmentIO; outputs at locations 1.. (gl_FragData[n],
+//!   gl_FragColor to every draw buffer) as FragmentIO.colors.
+//! - Not yet: a sampler chosen at run time.
 //!
 //! Allocation-free: its tables are the Scratch's (Store).
 
@@ -207,6 +209,8 @@ const Gen = struct {
     quads: bool = false,
     odd_x: V = .none,
     odd_y: V = .none,
+    quad_x: u32 = raster.QUAD_X,
+    quad_y: u32 = raster.QUAD_Y,
     nderivs: u32 = 0,
     /// a derivative was generated
     derivatives: bool = false,
@@ -287,12 +291,12 @@ const Gen = struct {
 
     fn isMut(g: *Gen, a: Arg) bool {
         if (a != .reg or a.reg == .none) return false;
-        const x = @intFromEnum(a.reg);
+        const x = @backingInt(a.reg);
         return g.st.mut[x >> 3] & (@as(u8, 1) << @intCast(x & 7)) != 0;
     }
 
     fn markMut(g: *Gen, v: V) void {
-        const x = @intFromEnum(v);
+        const x = @backingInt(v);
         g.st.mut[x >> 3] |= @as(u8, 1) << @intCast(x & 7);
     }
 
@@ -300,7 +304,7 @@ const Gen = struct {
     /// change it); anything else as it is.
     fn snap(g: *Gen, a: Arg) Arg {
         if (!g.isMut(a)) return a;
-        return r(g.k.mov(g.k.tys[@intFromEnum(a.reg)], a));
+        return r(g.k.mov(g.k.tys[@backingInt(a.reg)], a));
     }
 
     fn snapVal(g: *Gen, v0: Val) Val {
@@ -659,7 +663,6 @@ const Gen = struct {
         return null;
     }
 
-
     // ── Arithmetic on operands (immediates folded where exact) ─────────────
 
     fn fop2(g: *Gen, op: kir.Op, a: Arg, b: Arg) Arg {
@@ -949,7 +952,7 @@ const Gen = struct {
     }
 
     fn binary(g: *Gen, nd: *Node, t: Type) Val {
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         switch (op) {
             .and_and, .or_or => {
                 const a = g.cond(nd.a);
@@ -1088,7 +1091,7 @@ const Gen = struct {
 
     fn unary(g: *Gen, nd: *Node, t: Type) Val {
         const a = g.rv(g.expr(nd.a));
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         if (op == .plus) return a;
         const n = g.size(t);
         const at = g.alloc(n);
@@ -1124,7 +1127,7 @@ const Gen = struct {
 
     fn assign(g: *Gen, nd: *Node) Val {
         const dst = g.expr(nd.a);
-        const op: Kind = @enumFromInt(nd.op);
+        const op: Kind = @fromBackingInt(@intCast(nd.op));
         if (op == .assign) {
             const v = g.rv(g.expr(nd.b));
             g.store(dst, v);
@@ -1842,7 +1845,7 @@ const Gen = struct {
         }
         const k = g.k;
         const xv = asF32(g, x);
-        const o = k.shfl(.f32, .xor, r(xv), u(if (up) raster.QUAD_Y else raster.QUAD_X));
+        const o = k.shfl(.f32, .xor, r(xv), u(if (up) g.quad_y else g.quad_x));
         g.st.derivs[g.nderivs] = @intCast(k.n - 1);
         g.nderivs += 1;
         const odd = if (up) g.odd_y else g.odd_x;
@@ -1894,17 +1897,22 @@ const Gen = struct {
     /// gradients (the *Grad ones), or implicit: in a fragment shader the
     /// derivatives of (s, t) through the quad, plus the bias argument if
     /// there is one; elsewhere the base level.
-    fn lodOf(g: *Gen, which: TexFn, args: []Val, s: Arg, t: Arg, kind: texture.Kind) texture.Lod {
+    fn lodOf(g: *Gen, which: TexFn, args: []Val, s: Arg, t: Arg, depth: ?Arg, cube: ?texture.CubeProjection, kind: texture.Kind) texture.Lod {
         if (kind != .float) return .base;
         switch (which) {
-            .textureLod, .textureLodOffset, .textureProjLod, .textureProjLodOffset, .texture2DLod, .texture2DProjLod, .texture2DLodEXT, .texture2DProjLodEXT => {
+            .textureLod, .textureLodOffset, .textureProjLod, .textureProjLodOffset, .texture2DLod, .texture2DProjLod, .texture2DLodEXT, .texture2DProjLodEXT, .textureCubeLod, .textureCubeLodEXT => {
                 return .{ .level = if (args.len > 2) g.cp(g.rv(args[2]).at, 0) else f(0) };
             },
-            .textureGrad, .textureGradOffset, .textureProjGrad, .textureProjGradOffset, .texture2DGradEXT, .texture2DProjGradEXT => {
+            .textureGrad, .textureGradOffset, .textureProjGrad, .textureProjGradOffset, .texture2DGradEXT, .texture2DProjGradEXT, .textureCubeGradEXT => {
                 if (args.len < 4) return .base;
                 const dx = g.rv(args[2]);
                 const dy = g.rv(args[3]);
-                return .{ .grad = .{ .dsdx = g.cp(dx.at, 0), .dtdx = g.cp(dx.at, 1), .dsdy = g.cp(dy.at, 0), .dtdy = g.cp(dy.at, 1), .bias = f(0) } };
+                if (cube) |p| {
+                    const x = texture.cubeGradient(g.k, p, g.cp(dx.at, 0), g.cp(dx.at, 1), g.cp(dx.at, 2));
+                    const y = texture.cubeGradient(g.k, p, g.cp(dy.at, 0), g.cp(dy.at, 1), g.cp(dy.at, 2));
+                    return .{ .grad = .{ .dsdx = x[0], .dtdx = x[1], .dsdy = y[0], .dtdy = y[1], .bias = f(0) } };
+                }
+                return .{ .grad = .{ .dsdx = g.cp(dx.at, 0), .dtdx = g.cp(dx.at, 1), .dsdy = g.cp(dy.at, 0), .dtdy = g.cp(dy.at, 1), .bias = f(0), .drdx = if (depth != null) g.cp(dx.at, 2) else f(0), .drdy = if (depth != null) g.cp(dy.at, 2) else f(0) } };
             },
             else => {},
         }
@@ -1916,7 +1924,16 @@ const Gen = struct {
         const bias = if (bias_at < args.len) g.cp(g.rv(args[bias_at]).at, 0) else f(0);
         // (the program runs whole quads: derivatives are its neighbours')
         g.derivatives = true;
-        return .{ .grad = .{ .dsdx = g.deriv(s, false), .dtdx = g.deriv(t, false), .dsdy = g.deriv(s, true), .dtdy = g.deriv(t, true), .bias = bias } };
+        if (cube) |projection| {
+            const coords = g.rv(args[1]);
+            const x = g.cp(coords.at, 0);
+            const y = g.cp(coords.at, 1);
+            const z = g.cp(coords.at, 2);
+            const dx = texture.cubeGradient(g.k, projection, g.deriv(x, false), g.deriv(y, false), g.deriv(z, false));
+            const dy = texture.cubeGradient(g.k, projection, g.deriv(x, true), g.deriv(y, true), g.deriv(z, true));
+            return .{ .grad = .{ .dsdx = dx[0], .dtdx = dx[1], .dsdy = dy[0], .dtdy = dy[1], .bias = bias } };
+        }
+        return .{ .grad = .{ .dsdx = g.deriv(s, false), .dtdx = g.deriv(t, false), .dsdy = g.deriv(s, true), .dtdy = g.deriv(t, true), .bias = bias, .drdx = if (depth) |z| g.deriv(z, false) else f(0), .drdy = if (depth) |z| g.deriv(z, true) else f(0) } };
     }
 
     /// A constant ivec2 argument (an offset): its two ints.
@@ -1944,17 +1961,21 @@ const Gen = struct {
         const slot = sa.imm;
         const base = args[0].ty.base;
         const kind: texture.Kind = switch (base) {
-            .isampler2D => .int,
-            .usampler2D => .uint,
+            .isampler2D, .isampler2DArray, .isampler3D, .isamplerCube => .int,
+            .usampler2D, .usampler2DArray, .usampler3D, .usamplerCube => .uint,
             else => .float,
         };
-        // (cube, 3D, array and shadow samplers: not yet; zeros, and alpha 1)
+        const shadow = base == .sampler2DShadow or base == .sampler2DArrayShadow or base == .samplerCubeShadow;
+        const array = base == .sampler2DArray or base == .isampler2DArray or base == .usampler2DArray or base == .sampler2DArrayShadow;
+        const volume = base == .sampler3D or base == .isampler3D or base == .usampler3D;
+        const cube = base == .samplerCube or base == .isamplerCube or base == .usamplerCube or base == .samplerCubeShadow;
+        const layered = array or volume;
         const two_d = base == .sampler2D or base == .isampler2D or base == .usampler2D or base == .samplerExternalOES;
-        if (slot == NO_SLOT or !two_d) {
+        if (slot == NO_SLOT or !(two_d or layered or cube or shadow)) {
             if (n == 4) g.put(at, 3, if (kind == .float) f(1) else u(1));
             return out;
         }
-        const ts = texture.Slot{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS };
+        var ts = texture.Slot{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS, .volume = volume, .cube = cube };
         const k = g.k;
         var res: [4]Arg = undefined;
         switch (which) {
@@ -1963,18 +1984,28 @@ const Gen = struct {
                 const sz = texture.size(k, ts, lod);
                 g.put(at, 0, sz[0]);
                 if (n > 1) g.put(at, 1, sz[1]);
+                if (layered and n > 2) g.put(at, 2, texture.layerSize(k, ts, lod));
                 return out;
             },
             .texelFetch, .texelFetchOffset => {
                 const p = g.rv(args[1]);
                 const off = if (which == .texelFetchOffset) g.offsetOf(args[3]) else [2]i32{ 0, 0 };
                 const lod = if (args.len > 2) g.cp(g.rv(args[2]).at, 0) else u(0);
-                res = texture.fetch(k, ts, g.cp(p.at, 0), g.cp(p.at, 1), kind, off, lod);
+                if (volume and which == .texelFetchOffset) ts.offset_z = g.offsetZ(args[3]);
+                res = texture.fetchArray(k, ts, g.cp(p.at, 0), g.cp(p.at, 1), if (layered) g.cp(p.at, 2) else null, kind, off, lod);
             },
             else => {
                 const p = g.rv(args[1]);
                 var s = g.cp(p.at, 0);
                 var tt = g.cp(p.at, 1);
+                var z: ?Arg = if (layered) g.cp(p.at, 2) else null;
+                if (shadow) ts.shadow = g.cp(p.at, if (array or cube) 3 else 2);
+                const projection = if (cube) texture.cubeProject(k, s, tt, g.cp(p.at, 2)) else null;
+                if (projection) |uv| {
+                    s = uv.s;
+                    tt = uv.t;
+                    z = uv.face;
+                }
                 const proj = switch (which) {
                     .textureProj, .textureProjOffset, .textureProjLod, .textureProjLodOffset, .textureProjGrad, .textureProjGradOffset, .texture2DProj, .texture2DProjLod, .texture2DProjLodEXT, .texture2DProjGradEXT => true,
                     else => false,
@@ -1983,6 +2014,8 @@ const Gen = struct {
                     const q = g.cp(p.at, g.size(p.ty) - 1);
                     s = g.fop2(.fdiv, s, q);
                     tt = g.fop2(.fdiv, tt, q);
+                    if (volume) z = g.fop2(.fdiv, z.?, q);
+                    if (ts.shadow) |reference| ts.shadow = g.fop2(.fdiv, reference, q);
                 }
                 // the offset: after the coordinates, a lod, or two gradients
                 const off_at: ?usize = switch (which) {
@@ -1992,11 +2025,19 @@ const Gen = struct {
                     else => null,
                 };
                 const off = if (off_at) |ix| (if (ix < args.len) g.offsetOf(args[ix]) else [2]i32{ 0, 0 }) else [2]i32{ 0, 0 };
-                res = texture.sample(k, ts, s, tt, kind, off, g.lodOf(which, args, s, tt, kind));
+                if (volume) {
+                    if (off_at) |ix| ts.offset_z = g.offsetZ(args[ix]);
+                }
+                res = texture.sampleArray(k, ts, s, tt, z, kind, off, g.lodOf(which, args, s, tt, if (volume) z else null, projection, kind));
             },
         }
         for (0..@min(n, 4)) |ix| g.put(at, @intCast(ix), res[ix]);
         return out;
+    }
+
+    fn offsetZ(g: *Gen, v: Val) i32 {
+        const arg = g.cp(g.rv(v).at, 2);
+        return if (arg == .imm) @bitCast(arg.imm) else 0;
     }
 
     fn dot(g: *Gen, a: Val, b: Val) Arg {
@@ -2351,7 +2392,7 @@ fn kty(b: Base) Ty {
 }
 
 fn isSampler(b: Base) bool {
-    return @intFromEnum(b) >= @intFromEnum(Base.sampler2D) and @intFromEnum(b) <= @intFromEnum(Base.samplerExternalOES);
+    return @backingInt(b) >= @backingInt(Base.sampler2D) and @backingInt(b) <= @backingInt(Base.samplerExternalOES);
 }
 
 fn sameReg(a: Arg, b: Arg) bool {
@@ -2363,6 +2404,37 @@ fn sameReg(a: Arg, b: Arg) bool {
 /// An output variable (its index in vars): its varying's first scalar
 /// (vertex) or location (fragment).
 const Out = struct { var_ix: u32, word: u32, loc: u32 };
+
+/// A uniform: its words (loaded at the start when small), its samplers
+/// their texture slots; zeros where the program has none of it.
+fn uniformGlobal(g: *Gen, name: []const u8, t: Type) void {
+    const word = g.lay.uniform(g.lay.ctx, name) orelse {
+        const z = g.zeros(t);
+        // (an unused sampler: no slot)
+        for (0..g.size(t)) |ix| {
+            if (isSampler(g.baseAt(t, @intCast(ix)))) g.put(z.at, @intCast(ix), u(NO_SLOT));
+        }
+        g.declare(.{ .name = name, .ty = t, .at = z.at, .ro = true });
+        return;
+    };
+    if (g.hasSampler(t)) {
+        // samplers are their texture slots; the rest is loaded
+        const n = g.size(t);
+        const at = g.alloc(n);
+        for (0..n) |ix| {
+            const i_: u32 = @intCast(ix);
+            const b = g.baseAt(t, i_);
+            g.put(at, i_, if (isSampler(b)) u(g.lay.sampler(g.lay.ctx, word + i_) orelse NO_SLOT) else g.loadUni(b, word + i_, no));
+        }
+        g.declare(.{ .name = name, .ty = t, .at = at, .ro = true });
+        return;
+    }
+    const mem = Val{ .ty = t, .mem = true, .word = word };
+    if (g.size(t) <= PRELOAD_WORDS and !g.hasArray(t)) {
+        const loaded = g.rv(mem);
+        g.declare(.{ .name = name, .ty = t, .at = loaded.at, .ro = true });
+    } else g.declare(.{ .name = name, .ty = t, .mem = true, .word = word, .ro = true });
+}
 
 /// The globals in order (inputs, outputs, uniforms, plain ones), the
 /// functions noted; main's node, or 0.
@@ -2382,6 +2454,18 @@ fn globals(g: *Gen, vio: ?*raster.VertexIO, fio: ?*raster.FragmentIO, outs: *[64
             }
             continue;
         }
+        if (dn.kind == .block_decl) {
+            // a uniform block: its instance a struct uniform, or (anonymous)
+            // each member a uniform of its own (the program's words: its
+            // draws copy the block's buffer into them)
+            const st = Type.of(dn.ty);
+            if (st.base != .structure) continue;
+            if (dn.b != 0) {
+                const vn = g.node(dn.b);
+                uniformGlobal(g, g.text(vn.tok), st);
+            } else for (s.checker.structFields(st)) |fd| uniformGlobal(g, fd.name, fd.ty);
+            continue;
+        }
         if (dn.kind != .decl) continue;
         var v = dn.b;
         while (v != 0) : (v = g.node(v).next) {
@@ -2390,32 +2474,7 @@ fn globals(g: *Gen, vio: ?*raster.VertexIO, fio: ?*raster.FragmentIO, outs: *[64
             const name = g.text(vn.tok);
             const q = vn.flags;
             if (q & Q.uniform != 0) {
-                const word = g.lay.uniform(g.lay.ctx, name) orelse {
-                    const z = g.zeros(t);
-                    // (an unused sampler: no slot)
-                    for (0..g.size(t)) |ix| {
-                        if (isSampler(g.baseAt(t, @intCast(ix)))) g.put(z.at, @intCast(ix), u(NO_SLOT));
-                    }
-                    g.declare(.{ .name = name, .ty = t, .at = z.at, .ro = true });
-                    continue;
-                };
-                if (g.hasSampler(t)) {
-                    // samplers are their texture slots; the rest is loaded
-                    const n = g.size(t);
-                    const at = g.alloc(n);
-                    for (0..n) |ix| {
-                        const i_: u32 = @intCast(ix);
-                        const b = g.baseAt(t, i_);
-                        g.put(at, i_, if (isSampler(b)) u(g.lay.sampler(g.lay.ctx, word + i_) orelse NO_SLOT) else g.loadUni(b, word + i_, no));
-                    }
-                    g.declare(.{ .name = name, .ty = t, .at = at, .ro = true });
-                    continue;
-                }
-                const mem = Val{ .ty = t, .mem = true, .word = word };
-                if (g.size(t) <= PRELOAD_WORDS and !g.hasArray(t)) {
-                    const loaded = g.rv(mem);
-                    g.declare(.{ .name = name, .ty = t, .at = loaded.at, .ro = true });
-                } else g.declare(.{ .name = name, .ty = t, .mem = true, .word = word, .ro = true });
+                uniformGlobal(g, name, t);
                 continue;
             }
             const is_in = q & Q.in != 0 or (q & Q.varying != 0 and g.stage == .fragment);
@@ -2478,7 +2537,7 @@ fn begin(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, log: *pp.Log, stage: sem
 
 /// A component as an f32 register (a register's bits, or an immediate's).
 fn asF32(g: *Gen, a: Arg) V {
-    if (a == .reg and a.reg != .none and g.k.tys[@intFromEnum(a.reg)] == .f32) return a.reg;
+    if (a == .reg and a.reg != .none and g.k.tys[@backingInt(a.reg)] == .f32) return a.reg;
     return g.k.mov(.f32, a);
 }
 
@@ -2500,6 +2559,7 @@ pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexI
     g.bind("gl_Position", sema.vecT(.float, 4), null, false);
     const pos_ix = g.nvars - 1;
     g.bind("gl_PointSize", FLOAT, null, false);
+    const psize_ix = g.nvars - 1;
     g.declare(.{ .name = "gl_VertexID", .ty = INT, .at = g.imms(INT, &.{r(k.mov(.i32, r(io.vertex_id)))}).at, .ro = true });
     g.declare(.{ .name = "gl_InstanceID", .ty = INT, .at = g.imms(INT, &.{r(k.mov(.i32, r(io.instance_id)))}).at, .ro = true });
     var outs: [64]Out = undefined;
@@ -2509,6 +2569,7 @@ pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexI
     runMain(&g, main);
     const pos = g.st.vars[pos_ix];
     for (0..4) |c| io.position[c] = asF32(&g, g.cp(pos.at, @intCast(c)));
+    if (s.checker.uses_point_size) io.point_size = asF32(&g, g.cp(g.st.vars[psize_ix].at, 0));
     for (outs[0..nouts]) |o| {
         if (o.word == 0xffff_ffff) continue;
         const v = g.st.vars[o.var_ix];
@@ -2530,10 +2591,13 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     g.quads = io.quads and io.odd_x != .none and io.odd_y != .none;
     g.odd_x = io.odd_x;
     g.odd_y = io.odd_y;
+    g.quad_x = io.quad_x;
+    g.quad_y = io.quad_y;
     const v4 = sema.vecT(.float, 4);
     g.declare(.{ .name = "gl_FragCoord", .ty = v4, .at = g.imms(v4, &.{ r(io.frag_coord[0]), r(io.frag_coord[1]), r(io.frag_coord[2]), r(io.frag_coord[3]) }).at, .ro = true });
     g.declare(.{ .name = "gl_FrontFacing", .ty = BOOL, .at = g.imms(BOOL, &.{if (io.front_facing == .none) u(1) else r(io.front_facing)}).at, .ro = true });
-    g.declare(.{ .name = "gl_PointCoord", .ty = sema.vecT(.float, 2), .at = g.imms(sema.vecT(.float, 2), &.{ f(0), f(0) }).at, .ro = true });
+    const pc = [2]Arg{ if (io.point_coord[0] == .none) f(0) else r(io.point_coord[0]), if (io.point_coord[1] == .none) f(0) else r(io.point_coord[1]) };
+    g.declare(.{ .name = "gl_PointCoord", .ty = sema.vecT(.float, 2), .at = g.imms(sema.vecT(.float, 2), &pc).at, .ro = true });
     g.bind("gl_FragColor", v4, null, false);
     const color_ix = g.nvars - 1;
     var fd_t = v4;
@@ -2541,6 +2605,7 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     g.bind("gl_FragData", fd_t, null, false);
     const data_ix = g.nvars - 1;
     g.bind("gl_FragDepth", FLOAT, null, false);
+    const depth_ix = g.nvars - 1;
     g.discard = k.reg(.pred);
     k.set(g.discard, .mov, u(0), no, no);
     var outs: [64]Out = undefined;
@@ -2548,24 +2613,45 @@ pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     const main = globals(&g, null, io, &outs, &nouts);
     g.nglobals = g.nvars;
     runMain(&g, main);
-    // the color: location 0's output, else gl_FragColor (or gl_FragData[0])
-    var color: [4]Arg = .{ f(0), f(0), f(0), f(1) };
+    // the colors: location n's output, else gl_FragData[n], else
+    // gl_FragColor (every draw buffer's); location 0 (0, 0, 0, 1) without
+    const NT = raster.MAX_TARGETS;
+    var color: [NT][4]Arg = undefined;
+    var have = [_]bool{false} ** NT;
+    color[0] = .{ f(0), f(0), f(0), f(1) };
+    have[0] = true;
     if (s.checker.uses_frag_data) {
-        for (0..4) |c| color[c] = g.cp(g.st.vars[data_ix].at, @intCast(c));
+        for (0..4) |t| {
+            for (0..4) |c| color[t][c] = g.cp(g.st.vars[data_ix].at, @intCast(4 * t + c));
+            have[t] = true;
+        }
     } else if (s.checker.version < 300) {
-        for (0..4) |c| color[c] = g.cp(g.st.vars[color_ix].at, @intCast(c));
+        for (0..NT) |t| {
+            for (0..4) |c| color[t][c] = g.cp(g.st.vars[color_ix].at, @intCast(c));
+            have[t] = true;
+        }
     }
     for (outs[0..nouts]) |o| {
-        if (o.loc != 0) continue;
         const v = g.st.vars[o.var_ix];
-        const n = @min(g.size(v.ty.elem()), 4);
-        for (0..n) |ix| {
-            const i_: u32 = @intCast(ix);
-            color[ix] = g.convert(g.cp(v.at, i_), g.baseAt(v.ty, i_), .float);
+        const elem = g.size(v.ty.elem());
+        const n_el: u32 = if (v.ty.array != 0) v.ty.array else 1;
+        for (0..n_el) |j| {
+            const loc = o.loc + @as(u32, @intCast(j));
+            if (loc >= NT) break;
+            color[loc] = .{ f(0), f(0), f(0), f(1) };
+            have[loc] = true;
+            for (0..@min(elem, 4)) |ix| {
+                const i_: u32 = @intCast(j * elem + ix);
+                color[loc][ix] = g.convert(g.cp(v.at, i_), g.baseAt(v.ty, i_), .float);
+            }
         }
-        break;
     }
-    for (0..4) |c| io.color[c] = asF32(&g, color[c]);
+    for (0..4) |c| io.color[c] = asF32(&g, color[0][c]);
+    for (1..NT) |t| {
+        if (!have[t]) continue;
+        for (0..4) |c| io.colors[t][c] = asF32(&g, color[t][c]);
+    }
+    if (s.checker.uses_frag_depth) io.depth = asF32(&g, g.cp(g.st.vars[depth_ix].at, 0));
     io.discard = g.discard;
     io.derivatives = g.derivatives;
     if (g.nderivs > 0) flattenDerivs(k, lo, g.st, g.st.derivs[0..g.nderivs]);
@@ -2644,7 +2730,7 @@ fn flattenDerivs(k: *kir.Kernel, lo: usize, st: *Store, derivs: []const u32) voi
     }
     const isDiv = struct {
         fn f_(set: []const u8, a: Arg) bool {
-            return a == .reg and a.reg != .none and bitOf(set, @intFromEnum(a.reg));
+            return a == .reg and a.reg != .none and bitOf(set, @backingInt(a.reg));
         }
     }.f_;
     var changed = true;
@@ -2701,7 +2787,7 @@ fn flattenDerivs(k: *kir.Kernel, lo: usize, st: *Store, derivs: []const u32) voi
                     if (!d) continue;
                     const nregs: usize = if (in.op == .ld) kir.memRegs(@bitCast(in.aux)) else 1;
                     for (0..nregs) |j| {
-                        const v = @as(usize, @intFromEnum(in.dst)) + j;
+                        const v = @as(usize, @backingInt(in.dst)) + j;
                         if (v >= FLOW_BITS or bitOf(&st.div, v)) continue;
                         setBit(&st.div, v);
                         changed = true;

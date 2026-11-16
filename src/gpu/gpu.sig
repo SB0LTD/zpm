@@ -17,6 +17,16 @@ pub const interp = @import("kir_interp.sig");
 pub const emu_device = @import("emu_device.sig");
 /// The RTX as a Device (Galaxy's driver or the emulated RTX), running kir_sm120.
 pub const nvidia_device = @import("nvidia_device.sig");
+/// Rectangles through a GPU's graphics pipeline: the types, the Renderer
+/// every GPU's pipeline is called through, the CPU reference and the
+/// self-test's cases.
+pub const draw = @import("draw.sig");
+/// The Adreno's graphics pipeline (adreno/draw.sig) as a draw.Renderer.
+pub const adreno_draw = @import("adreno_draw.sig");
+/// The RTX's 3D engine as a draw.Renderer (the adapter over nvidia/draw.sig).
+pub const nvidia_draw = @import("nvidia_draw.sig");
+/// GL-shaped draws on the RTX's 3D engine: KIR graphics stages and their headers.
+pub const nvidia_gl = @import("nvidia_gl.sig");
 
 // KIR
 pub const Ty = kir.Ty;
@@ -45,6 +55,11 @@ pub const Hazards = device.Hazards;
 pub const Binary = device.Binary;
 pub const Program = device.Program;
 pub const Dispatch = device.Dispatch;
+pub const Stamp = device.Stamp;
+pub const Graphics = device.Graphics;
+pub const GraphicsBlend = device.GraphicsBlend;
+pub const BlendFactor = device.BlendFactor;
+pub const BlendEquation = device.BlendEquation;
 pub const Error = device.Error;
 pub const Fence = device.Fence;
 pub const Device = device.Device;
@@ -78,4 +93,8 @@ test {
     _ = adreno_device;
     _ = kir_gcn4;
     _ = amd_device;
+    _ = draw;
+    _ = adreno_draw;
+    _ = nvidia_draw;
+    _ = nvidia_gl;
 }

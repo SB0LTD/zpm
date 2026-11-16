@@ -45,8 +45,16 @@ pub const Caps = struct {
     /// zero-copy import of CPU memory (unified)
     import: bool,
     timestamp_hz: u64,
+    /// Dispatch.stamp is written (a GPU clock sample after the dispatch).
+    stamps: bool = false,
+    /// Dispatch.indirect is read on the GPU, when the dispatch runs.
+    indirect: bool = false,
     /// The most dispatches one run takes.
     max_run: u32 = 256,
+    /// Dispatch.graphics is drawn by the GPU's graphics pipeline (its
+    /// stage programs: nvidia_gl's), at most `max_graphics` a run.
+    graphics: bool = false,
+    max_graphics: u32 = 0,
 };
 
 /// The interpreter's default: an ideal GPU (fused, denormals kept, a
@@ -67,6 +75,8 @@ pub const interp_caps = Caps{
     .dot4 = true,
     .import = true,
     .timestamp_hz = 1_000_000_000,
+    .stamps = true,
+    .indirect = true,
 };
 
 pub const Kind = enum {
@@ -150,13 +160,22 @@ pub const Hazards = struct {
     /// Whether `d` must wait for the dispatches before it; then the barrier
     /// is counted as taken. d's accesses are noted either way.
     pub fn barrierBefore(h: *Hazards, d: *const Dispatch) bool {
-        var need = h.full;
+        // (a stamp waits for everything before it, and is a write; an
+        // indirect dispatch's counts are a read)
+        var need = h.full or d.stamp != null;
+        if (d.indirect) |ind| {
+            if (meets(h.written[0..h.nw], .{ ind.buf.gpu + ind.off, ind.buf.gpu + ind.off + 12 })) need = true;
+        }
         for (d.buffers, 0..) |b, i| {
             const r = rangeOf(b);
             if (meets(h.written[0..h.nw], r)) need = true;
             if (writes(d, i) and meets(h.read[0..h.nr], r)) need = true;
         }
         if (need) h.* = .{};
+        if (d.stamp) |s| {
+            h.written[h.nw] = .{ s.buf.gpu + s.off, s.buf.gpu + s.off + 16 };
+            h.nw += 1;
+        }
         for (d.buffers, 0..) |b, i| {
             const r = rangeOf(b);
             if (writes(d, i)) {
@@ -272,7 +291,9 @@ test "device: barriers only where a dispatch meets what came before" {
     try std.testing.expect(h.barrierBefore(&.{ .prog = &prog_rw, .groups = .{ 1, 1, 1 }, .buffers = &.{ .{ .gpu = 0x2080, .bytes = 16 }, c }, .params = &.{} }));
 }
 /// A Binary placed in device memory.
-pub const Program = struct { bin: Binary, code: Buffer };
+/// A loaded kernel. `label`: a name for logs (the kernel's), the caller's
+/// to set; loaders leave it empty.
+pub const Program = struct { bin: Binary, code: Buffer, label: []const u8 = "" };
 
 pub const Dispatch = struct {
     prog: *const Program,
@@ -281,6 +302,135 @@ pub const Dispatch = struct {
     buffers: []const Buffer,
     /// the u32 words after them
     params: []const u32,
+    /// Where caps.stamps: once this dispatch and every one before it are
+    /// done, 16 bytes at buf+off (8-aligned): u32 1, u32 0, then the GPU
+    /// clock (u64, caps.timestamp_hz ticks). Vulkan's timestamp queries.
+    stamp: ?Stamp = null,
+    /// Where caps.indirect: the group counts are the three u32 at
+    /// buf+off (4-aligned) as the dispatches before this one left them
+    /// (`groups` is not read); a count of 0 runs nothing. Vulkan's
+    /// vkCmdDispatchIndirect without the CPU.
+    indirect: ?Stamp = null,
+    /// A draw through the graphics pipeline in the dispatch's place
+    /// (Caps.graphics): see Graphics.
+    graphics: ?*const Graphics = null,
+};
+
+pub const Stamp = struct { buf: Buffer, off: u64 };
+
+/// A draw through the GPU's graphics pipeline (Caps.graphics), in a run's
+/// place among its dispatches: the dispatch's `prog` is the pixel program,
+/// `vertex` the vertex one (both compiled for the same bindings and
+/// parameter words: the dispatch's buffers and params are both stages'),
+/// `groups` is not read. It sees the writes of the dispatches before it,
+/// and those after it see its own.
+pub const Graphics = struct {
+    vertex: *const Program,
+    /// The colour target: rows of `stride` bytes from `va`.
+    va: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: TargetFormat,
+    /// The channels written (bit 0 red .. bit 3 alpha).
+    mask: u4 = 0xf,
+    blend: ?GraphicsBlend = null,
+    /// window = clip / w * scale + offset: x, y in pixels from the target's
+    /// first row, depth; GL's clip volume (-w <= z <= w).
+    scale: [3]f32,
+    offset: [3]f32,
+    /// [x0, x1) x [y0, y1) of the target's rows.
+    scissor: [4]u32,
+    topology: Topology = .triangles,
+    /// The vertices' indices 0 .. count - 1 (the vertex program fetches
+    /// its attributes and any element array itself), `instances` times.
+    count: u32,
+    instances: u32 = 1,
+    /// The depth-stencil target (block linear, depth in bits 0..23 and
+    /// stencil in 24..31) and its tests; null: none.
+    depth: ?Depth = null,
+    /// Faces culled: bit 0 front, bit 1 back.
+    cull: u2 = 0,
+    /// Front faces wind counter-clockwise as the target's coordinates
+    /// count (x right, y as its rows grow: the window's after the
+    /// viewport).
+    front_ccw: bool = true,
+    /// Colour targets 1 .. 7 (the pixel program's output t into target
+    /// t; null: none): as wide and high as target 0, rows of `stride`
+    /// bytes from `va`.
+    more: [7]?ColorTarget = @splat(null),
+    /// Indexed: `count` indices of `size` bytes from index `first` of the
+    /// buffer at `va` (`bytes` long), each the vertex's index the vertex
+    /// program reads; with `restart`, the type's largest begins a strip
+    /// or a fan anew. Null: the vertices' indices 0 .. count - 1.
+    index: ?Index = null,
+
+    pub const Index = struct { va: u64, bytes: u32, size: u8, first: u32, restart: bool = false };
+
+    pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8 };
+    pub const ColorTarget = struct {
+        va: u64,
+        stride: u32,
+        format: TargetFormat,
+        /// the channels written (bit 0 red .. bit 3 alpha)
+        mask: u4 = 0xf,
+        /// `blend` applies to it (else its colour replaces the pixel's)
+        blend: bool = true,
+    };
+    pub const StencilOp = enum(u8) { keep, zero, replace, incr, decr, invert, incr_wrap, decr_wrap };
+    pub const Stencil = struct {
+        /// NEVER 0 .. ALWAYS 7 (bit 0 less, 1 equal, 2 greater)
+        func: u3 = 7,
+        reference: u8 = 0,
+        value_mask: u8 = 0xff,
+        write_mask: u8 = 0xff,
+        fail: StencilOp = .keep,
+        zfail: StencilOp = .keep,
+        zpass: StencilOp = .keep,
+    };
+    pub const Depth = struct {
+        va: u64,
+        width: u32,
+        height: u32,
+        gobs_log2: u3,
+        tested: bool,
+        write: bool,
+        func: u3 = 1,
+        /// the front faces' stencil (both faces' unless `back_stencil`)
+        stencil: ?Stencil = null,
+        /// the back faces' (two-sided stencil); null: the front's
+        back_stencil: ?Stencil = null,
+    };
+    pub const Topology = enum(u8) { triangles, strip, fan };
+};
+
+/// GL's blend factors (their GL numbers) and equations.
+pub const BlendFactor = enum(u16) {
+    zero = 0,
+    one = 1,
+    src_color = 0x300,
+    one_minus_src_color = 0x301,
+    src_alpha = 0x302,
+    one_minus_src_alpha = 0x303,
+    dst_alpha = 0x304,
+    one_minus_dst_alpha = 0x305,
+    dst_color = 0x306,
+    one_minus_dst_color = 0x307,
+    src_alpha_saturate = 0x308,
+    constant_color = 0x8001,
+    one_minus_constant_color = 0x8002,
+    constant_alpha = 0x8003,
+    one_minus_constant_alpha = 0x8004,
+};
+pub const BlendEquation = enum(u8) { add, subtract, reverse_subtract, min, max };
+pub const GraphicsBlend = struct {
+    src_rgb: BlendFactor = .one,
+    dst_rgb: BlendFactor = .zero,
+    src_a: BlendFactor = .one,
+    dst_a: BlendFactor = .zero,
+    eq_rgb: BlendEquation = .add,
+    eq_a: BlendEquation = .add,
+    constant: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 pub const Error = error{ OutOfMemory, SubmitFailed, Timeout, DeviceLost, BadProgram, Unsupported };
@@ -312,6 +462,8 @@ pub const Device = struct {
         /// For the last run, profiled: each dispatch's end, ns after the
         /// run's start, into `out` (as many as it ran); 0: none.
         dispatchNs: ?*const fn (ctx: *anyopaque, out: []u64) usize = null,
+        /// A GPU-clock sample ordered after prior commands.
+        timestampNs: ?*const fn (ctx: *anyopaque, timeout_us: u64) Error!u64 = null,
     };
 
     /// A buffer of `bytes`, or error.OutOfMemory.

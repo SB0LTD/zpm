@@ -9,7 +9,13 @@
 //!   d1-run <model.gguf> ask <threads> <set_size> @request.json
 //!   d1-run <model.gguf> serve <threads> <port> [set_size] [address]
 //!   d1-run <model.gguf> tokens <text>
+//!   d1-run <model.gguf> emu <threads> <set_size> @request.json
 //!
+//! `emu` answers the request on the CPU and then with its passes on an
+//! emulated GPU of discrete memory (lfm3_any on gpu.EmuDevice, the kernels
+//! interpreted: minutes to hours, by the request's tokens), prints both
+//! and how far the probabilities are apart, and fails when an answer's
+//! best option differs or a probability is more than 0.02 away.
 //! `ask` prints the answers (the endpoint's JSON) and a timing line. `serve`
 //! answers POST /v1/systemone (and GET /health) on 127.0.0.1:<port> (a QEMU
 //! twin's user network reaches the host's loopback; another address, such
@@ -27,6 +33,9 @@ const codec = @import("lfm3_tokenizer");
 const indexes = @import("tokenizer_index");
 const worker = @import("worker_thread");
 const d1 = @import("d1_system_one");
+const gpu = @import("gpu");
+const any = @import("lfm3_any");
+const pages = @import("page_region");
 
 const capacity = 512;
 /// One pass holds the state and up to 16 questions: 2048 tokens.
@@ -61,6 +70,16 @@ var body_buffer: [256 * 1024]u8 = undefined;
 var answer_buffer: [256 * 1024]u8 = undefined;
 var token_buffer: [limits.batch]u32 = undefined;
 var pool: Pool = .{};
+// (the `emu` mode's: an emulated GPU, whose memory is pages of the OS's
+// taken when the mode runs, and the GPU runner's work)
+const Backend = any.Backend(capacity);
+const EMU_MEM = 1 << 30;
+const EMU_VRAM = 3 << 30;
+const EMU_WORK = 256 << 20;
+var emu: gpu.EmuDevice = undefined;
+var any_work: any.Work = .{};
+var answers_emu: [d1.MAX_QUESTIONS]d1.Answer = undefined;
+var answer_buffer_emu: [256 * 1024]u8 = undefined;
 
 const Memory = struct {
     bytes: []const u8,
@@ -286,6 +305,65 @@ pub fn main(init: std.process.Init) !void {
         try out.writeAll(written);
         try out.print("\ntiming set_size={d} first_ms={d:.1} warm_ms={d:.1}\n", .{ set_size, warm, elapsed });
         try out.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, mode, "emu")) {
+        const set_text = try argv.next() orelse return error.InvalidArguments;
+        const default_set = try std.fmt.parseInt(usize, set_text, 10);
+        const raw = try argv.next() orelse return error.ExpectedText;
+        const body = if (raw.len > 1 and raw[0] == '@')
+            try std.Io.Dir.cwd().readFile(init.io, raw[1..], &body_buffer)
+        else
+            raw;
+        var elapsed: f64 = 0;
+        const written = try answer(init.io, &loaded, body, default_set, &elapsed);
+        try out.print("cpu ({d:.1} ms):\n{s}\n", .{ elapsed, written });
+        try out.flush();
+        const questions = request.list();
+        const set_size = if (request.set_size != 0) request.set_size else default_set;
+
+        var caps = gpu.interp_caps;
+        caps.memory = .discrete;
+        caps.import = false;
+        var region = try pages.reserve(EMU_MEM + EMU_VRAM + EMU_WORK);
+        defer region.close();
+        emu = gpu.EmuDevice.init(caps, region.bytes[0..EMU_MEM], region.bytes[EMU_MEM + EMU_VRAM ..]);
+        emu.vram = region.bytes[EMU_MEM..][0..EMU_VRAM];
+        var backend = Backend.init(emu.device(), &plan, &index, source, .{ .max_batch = limits.batch, .attention_tokens = 8 }, &any_work) catch |e| {
+            try out.print("emulated GPU: init {s}\n", .{@errorName(e)});
+            try out.flush();
+            return e;
+        };
+        defer backend.deinit();
+        var gpu_cache = try backend.newCache(limits.context);
+        defer backend.freeCache(&gpu_cache);
+        var on_gpu = d1.GpuRunner(Backend, any.Cache){ .backend = &backend, .cache = &gpu_cache };
+        const runner = on_gpu.runner();
+        const started = now(init.io);
+        const usage = d1.askOn(capacity, limits, &loaded.model, loaded.tokens, &work, &loaded.cache, &scratch, request.state, questions, set_size, &answers_emu, pool.parallel(), &runner) catch |e| {
+            try out.print("emulated GPU: {s} ({s}; device: {s}, trap {s} at {d})\n", .{
+                @errorName(e),
+                if (on_gpu.failed) |x| @errorName(x) else "-",
+                if (emu.last_error) |x| @errorName(x) else "-",
+                @tagName(emu.trap.what),
+                emu.trap.pc,
+            });
+            try out.flush();
+            return e;
+        };
+        const emu_ms = milliseconds(now(init.io) - started);
+        const written_emu = d1.writeAnswers(questions, &answers_emu, usage, &answer_buffer_emu) orelse return error.AnswerTooLong;
+        try out.print("emulated GPU ({d:.1} s, {d} tokens in {d} passes, {d} dispatches):\n{s}\n", .{ emu_ms / 1000.0, usage.input_tokens, usage.passes, backend.total_dispatches, written_emu });
+        var worst: f32 = 0;
+        var same: usize = 0;
+        for (answers[0..questions.len], answers_emu[0..questions.len]) |*a, *b| {
+            if (a.best == b.best and a.count == b.count) same += 1;
+            for (a.probabilities[0..a.count], b.probabilities[0..a.count]) |x, y| worst = @max(worst, @abs(x - y));
+        }
+        try out.print("compare questions={d} same_best={d} worst_probability_difference={d:.6}\n", .{ questions.len, same, worst });
+        try out.flush();
+        if (same != questions.len or !(worst <= 0.02)) return error.EmulatedGpuDiffers;
         return;
     }
 

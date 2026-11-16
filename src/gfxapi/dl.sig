@@ -46,7 +46,9 @@ const DT_VERSYM = 0x6ffffff0;
 /// The program's first definition of `name` (dlsym(RTLD_DEFAULT, name)),
 /// or null.
 pub fn lookup(name: [*:0]const u8) ?*anyopaque {
-    if (hostDlsym()) |f| return f(null, name);
+    if (hostDlsym()) |f| {
+        if (f(null, name)) |symbol| return symbol;
+    }
     const iter = hostIterate() orelse return null;
     var s = Search{ .name = std.mem.span(name) };
     _ = iter(&each, &s);

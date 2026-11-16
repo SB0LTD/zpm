@@ -44,7 +44,10 @@
 //!    edge. Vectors (64- and 128-bit loads and stores) get aligned runs of
 //!    2 or 4 registers, addresses aligned pairs. Predicates get P0..P5;
 //!    when more are live, the rest live in general registers (0 or 1) and
-//!    are moved through P6 where an instruction reads or writes one.
+//!    are moved through scratch predicates (P6 down) where an instruction
+//!    reads or writes one: P5 and P6 at first, and as many more (P3..P6
+//!    at most) as the instruction reading the most of them needs (a
+//!    PLOP3's three and a guard), taken from the allocation.
 //! 6. **Dead code** (results nothing reads, after the folds) is dropped,
 //!    and the text goes to sm120_asm.
 //!
@@ -104,7 +107,7 @@ const sm120_asm = nvidia.sm120_asm;
 pub const MAX_INSTS = 16384;
 pub const MAX_VREGS = 16384;
 /// Machine instructions and labels before the text.
-pub const MAX_MI = 16384;
+pub const MAX_MI = 20480;
 pub const MAX_LOOPS = 256;
 pub const MAX_DEPTH = 32;
 pub const TEXT_BYTES = 1536 * 1024;
@@ -114,6 +117,9 @@ pub const MAX_GPR: u8 = 252;
 /// Predicates allocated (P6 is the scratch for those in registers).
 const PREDS: u8 = 6;
 const SCRATCH_P: u8 = 6;
+/// Predicates allocated at least when some live in registers: P3..P6 are
+/// then scratch, enough for a PLOP3's three and a guard.
+const MIN_PREDS: u8 = 3;
 
 pub const Error = kir.Error || sm120_asm.Error || error{
     /// A KIR form this backend does not compile (see the op's lowering).
@@ -178,6 +184,8 @@ const Opd = union(enum) {
     label: u16,
     bar: u8,
     ur4,
+    /// An attribute word's byte address (a graphics stage's a[...]).
+    attr: u32,
 };
 
 const Kind = enum(u8) { inst, label, dead };
@@ -220,6 +228,7 @@ const Region = struct {
     /// A loop that desyncs (counted in Ctx.nobar while open).
     desync: bool = false,
     rotated: bool = false,
+    single_pass: bool = false,
     /// The address-reuse depth outside the region.
     rdepth: u8 = 0,
 };
@@ -263,10 +272,13 @@ pub const State = struct {
     phys: [MAX_VREGS]u8 = undefined,
     /// A predicate kept in a general register (its `home`).
     spilled: [MAX_VREGS]bool = undefined,
+    /// Predicates allocated (P0 up); the rest to P6 are scratch.
+    npreds: u8 = PREDS,
     /// liveness's scratch: a unit's definitions in a loop so far, and
     /// whether the loop carries it (Ctx.carriedIn).
     defs: [MAX_VREGS]u16 = undefined,
     carry: [MAX_VREGS]bool = undefined,
+    label_at: [1 << 16]u16 = undefined,
     order: [MAX_VREGS]u16 = undefined,
     loops: [MAX_LOOPS][2]u32 = undefined,
     n_loops: usize = 0,
@@ -275,6 +287,12 @@ pub const State = struct {
     asm_work: sm120_asm.Work = .{},
     /// What the last compile made (for tests and reports).
     stats: Stats = .{},
+    /// A stage's: what its program loads and stores (Stage).
+    io: StageIO = .{},
+    /// A pixel program's output registers (virtual: copied at EXIT to the
+    /// registers `outreg` names, NAK's order: see stageOutputs).
+    outv: [MAX_OUTPUTS]u16 = @splat(NOV),
+    outreg: [MAX_OUTPUTS]u8 = @splat(0),
 };
 
 /// The bytes of a device.Work that `compile` takes (its State, aligned).
@@ -300,6 +318,70 @@ pub const Options = struct {
     /// paths: Galaxy's frame kernels' square root), else kir.expandSqrt's
     /// (exact for any frsq within its bound, about twice as long).
     native_sqrt: bool = true,
+    /// What the kernel is: a compute kernel (a QMD launches it), or the
+    /// 3D engine's vertex or pixel program (see Stage).
+    stage: Stage = .compute,
+    /// A stage's attribute words and outputs: the binding its loads and
+    /// stores name (one the kernel declares, never bound to memory).
+    stage_io: u8 = 0xff,
+};
+
+/// A graphics stage's program (the 3D engine's; its header, sph.sig, is the
+/// caller's, made from what State.io says the program does). Its inputs
+/// and outputs are KIR loads and stores through Options.stage_io, at the
+/// byte address `imm` (the address 0 register-free: `u(0)`), 32 bits each:
+///
+/// - **vertex**: a load is ALD a[imm] (the vertex's index 0x2fc, the
+///   instance's 0x2f8), a store AST a[imm] (the position 0x70..0x7c, generic
+///   vector n's component c at 0x80 + 16n + 4c).
+/// - **pixel**: a load is IPA a[imm]: .PASS (carried across the triangle,
+///   as the header says: in perspective a varying arrives over w, and the
+///   KIR multiplies by w itself), or .CONSTANT where the address has FLAT
+///   (flat: the provoking vertex's). The position's words are the
+///   pixel's centre, its depth and 1/w. A store at OUT_AT + 4r is output
+///   r (target t's channel c is r = 4t + c; DEPTH_OUT, gl_FragDepth),
+///   whatever is stored last before EXIT (an output never stored is 0).
+///   At EXIT the outputs are in the registers NAK leaves them in: four
+///   for each target with any channel stored (in the targets' order,
+///   packed: a target never stored takes none), then the sample mask's,
+///   then the depth's. A store at KILL_AT
+///   (any value) discards the pixel (KILL: the thread runs on, its outputs
+///   unwritten).
+///
+/// Ids, groups, shared memory, barriers and collectives are compute's
+/// alone (Unsupported in a stage).
+pub const Stage = enum(u8) { compute, vertex, pixel };
+pub const OUT_AT: u32 = 0x1000;
+pub const KILL_AT: u32 = 0x2000;
+/// A pixel program's load of a word flat (IPA.CONSTANT): its address | FLAT.
+pub const FLAT: u32 = 0x10000;
+/// Pixel outputs: eight targets of four channels, then the depth.
+pub const MAX_OUTPUTS = 33;
+/// gl_FragDepth's output (window depth, 0..1: the engine clamps it).
+pub const DEPTH_OUT = 32;
+pub const DEPTH_AT: u32 = OUT_AT + 4 * DEPTH_OUT;
+
+/// What a stage's program loads and stores (after dead code is dropped):
+/// attribute words (bit i: the word at byte 4i), those loaded flat, the
+/// colour outputs written (bit 4t + c; all four of a target written at
+/// all), whether it writes the depth, whether it discards.
+pub const StageIO = struct {
+    loads: [8]u32 = @splat(0),
+    flat: [8]u32 = @splat(0),
+    stores: [8]u32 = @splat(0),
+    outputs: u32 = 0,
+    depth: bool = false,
+    kills: bool = false,
+
+    pub fn has(set: *const [8]u32, at: u32) bool {
+        const i = at / 4;
+        return i < 256 and (set[i / 32] >> @intCast(i % 32)) & 1 != 0;
+    }
+
+    fn add(set: *[8]u32, at: u32) void {
+        const i = at / 4;
+        if (i < 256) set[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+    }
 };
 
 /// Binary.extra's words for sm_120.
@@ -363,7 +445,9 @@ pub fn compileText(k: *const kir.Kernel, caps: device.Caps, st: *State, opts: Op
     try c.lower();
     c.dce();
     try c.liveness();
+    c.stageLive();
     try c.allocate();
+    c.stageIO();
     return c.emitText();
 }
 
@@ -603,9 +687,9 @@ const Ctx = struct {
 
     fn uniformOp(c: *const Ctx, in: kir.Inst) bool {
         switch (in.op) {
-            .tid, .lane, .atom => return false,
+            .tid, .lane, .atom, .cas => return false,
             .gid, .gsize, .subgroup, .param => return true,
-            .vote => return true,
+            .vote, .ballot => return true,
             .shfl => return @as(kir.Shfl, @enumFromInt(in.aux)) == .idx and c.uniformArg(in.b),
             else => {},
         }
@@ -923,6 +1007,7 @@ const Ctx = struct {
         }
         try c.groups();
         try c.prologue();
+        try c.stageOutputs();
         var regions: [MAX_DEPTH * 2]Region = undefined;
         var sp: usize = 0;
         var idx: usize = 0;
@@ -966,7 +1051,7 @@ const Ctx = struct {
                     if (in.op == .brk and idx + 1 < c.n and w.insts[idx + 1].op == .endloop and s + 1 == sp and !r.has_cont) {
                         r.rotated = true;
                         if (p == .pt) {
-                            if (!p.pt) try c.bra(.none, r.l_top);
+                            if (p.pt) r.single_pass = true else try c.bra(.none, r.l_top);
                         } else try c.bra(negate(p), r.l_top);
                         continue;
                     }
@@ -1028,9 +1113,10 @@ const Ctx = struct {
         var used = [_]bool{false} ** 256;
         for (c.insts()) |in| {
             switch (in.op) {
-                .ld, .st, .atom => {
+                .ld, .st, .atom, .cas => {
                     const m: kir.Mem = @bitCast(in.aux);
-                    if (m.space == .global) {
+                    // (a stage's inputs and outputs are not memory)
+                    if (m.space == .global and !c.isStageIO(m)) {
                         used[m.binding] = true;
                         c.global = true;
                     }
@@ -1059,14 +1145,14 @@ const Ctx = struct {
         if (to - from > limit) return false;
         for (c.w.insts[from..to]) |in| {
             switch (in.op) {
-                .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .fdiv, .fsqrt => return false,
+                .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .ballot, .fdiv, .fsqrt => return false,
                 .sel, .pand, .por, .pnot, .icmp, .fcmp => return false,
                 else => {},
             }
             // (a few ops lower to several instructions with predicates of
             // their own)
             if (in.op == .bfe and !(in.b == .imm and in.c == .imm)) return false;
-            if (in.op == .atom) return false;
+            if (in.op == .atom or in.op == .cas) return false;
         }
         return true;
     }
@@ -1194,9 +1280,13 @@ const Ctx = struct {
         if (r.desync) c.nobar -= 1;
         try c.at(r.l_cont);
         if (!r.rotated) try c.bra(.none, r.l_top);
-        if (w.n_loops == MAX_LOOPS) return error.TooBig;
-        w.loops[w.n_loops] = .{ r.top_at, @intCast(w.n_mi - 1) };
-        w.n_loops += 1;
+        // Switches and inlined returns use a loop with an unconditional
+        // exit. With no back edge their temporaries are not loop-carried.
+        if (!r.single_pass) {
+            if (w.n_loops == MAX_LOOPS) return error.TooBig;
+            w.loops[w.n_loops] = .{ r.top_at, @intCast(w.n_mi - 1) };
+            w.n_loops += 1;
+        }
         try c.at(r.l_end);
         if (r.bssy) |b| {
             try c.eff("BSYNC.RECONVERGENT", 0, &.{.{ .bar = b }});
@@ -1403,6 +1493,7 @@ const Ctx = struct {
             .ld => try c.load(in),
             .st => try c.store(in),
             .atom => try c.atom(in),
+            .cas => try c.cas(in),
             .barrier => try c.eff("BAR.SYNC.DEFER_BLOCKING", 0, &.{.{ .imm = 0 }}),
             .shfl => {
                 const mode: kir.Shfl = @enumFromInt(in.aux);
@@ -1434,6 +1525,13 @@ const Ctx = struct {
                 const p = try c.pred(in.a);
                 try c.drainIfDivergent();
                 try c.eff(name, 1, &.{ pdst(in), p });
+            },
+            .ballot => {
+                // (a warp of 32: words past the first are 0)
+                if (in.aux != 0) return c.ins("MOV", 1, &.{ c.dst(in), .{ .imm = 0 } });
+                const p = try c.pred(in.a);
+                try c.drainIfDivergent();
+                try c.eff("VOTE.ANY", 2, &.{ c.dst(in), .{ .pt = true }, p });
             },
             .fsqrt => try c.sqrtNative(in),
             .fdiv => return error.Unsupported,
@@ -1907,8 +2005,136 @@ const Ctx = struct {
         };
     }
 
+    // ── A graphics stage's inputs and outputs (Stage) ───────────────────
+
+    fn isStageIO(c: *const Ctx, m: kir.Mem) bool {
+        return c.opts.stage != .compute and m.space == .global and m.binding == c.opts.stage_io;
+    }
+
+    /// A pixel program's outputs: a register each, 0 from the start, kept
+    /// to the end (stageLive) and copied at each EXIT (emitText) to where
+    /// NAK leaves them (`outreg`): the four channels of each target the
+    /// program stores to at all, packed in the targets' order (a channel
+    /// never stored is 0: the header names whole targets, as NAK's does),
+    /// then the sample mask's register (never written here), then the
+    /// depth's.
+    fn stageOutputs(c: *Ctx) Error!void {
+        const w = c.w;
+        w.outv = @splat(NOV);
+        w.outreg = @splat(0);
+        if (c.opts.stage != .pixel) return;
+        var targets: u8 = 0;
+        var depth = false;
+        for (c.insts()) |in| {
+            if (in.op != .st) continue;
+            const m: kir.Mem = @bitCast(in.aux);
+            if (!c.isStageIO(m) or m.imm < OUT_AT or m.imm >= KILL_AT) continue;
+            const r = (m.imm - OUT_AT) / 4;
+            if (r >= MAX_OUTPUTS) return error.Unsupported;
+            if (r == DEPTH_OUT) depth = true else targets |= @as(u8, 1) << @intCast(r / 4);
+        }
+        var next: u8 = 0;
+        for (0..8) |t| {
+            if ((targets >> @intCast(t)) & 1 == 0) continue;
+            for (0..4) |ch| {
+                const v = try c.newV(.r);
+                w.outv[4 * t + ch] = v;
+                w.outreg[4 * t + ch] = next;
+                next += 1;
+                try c.eff("MOV", 1, &.{ R(v), .rz });
+            }
+        }
+        if (depth) {
+            const v = try c.newV(.r);
+            w.outv[DEPTH_OUT] = v;
+            w.outreg[DEPTH_OUT] = next + 1;
+            try c.eff("MOV", 1, &.{ R(v), .rz });
+        }
+    }
+
+    fn stageLoad(c: *Ctx, in: kir.Inst, m: kir.Mem) Error!void {
+        if (m.width_log2 != 5 or isReg(in.a)) return error.Unsupported;
+        const addr: u32 = m.imm + switch (in.a) {
+            .imm => |x| x,
+            else => 0,
+        };
+        const flat = addr & FLAT != 0;
+        switch (c.opts.stage) {
+            .vertex => try c.ins("ALD", 1, &.{ c.dst(in), .{ .attr = addr & ~FLAT } }),
+            .pixel => try c.ins(if (flat) "IPA.CONSTANT" else "IPA.PASS", 1, &.{ c.dst(in), .{ .attr = addr & ~FLAT } }),
+            .compute => unreachable,
+        }
+    }
+
+    fn stageStore(c: *Ctx, in: kir.Inst, m: kir.Mem) Error!void {
+        if (m.width_log2 != 5 or isReg(in.a)) return error.Unsupported;
+        const addr: u32 = m.imm + switch (in.a) {
+            .imm => |x| x,
+            else => 0,
+        };
+        switch (c.opts.stage) {
+            .vertex => try c.eff("AST", 0, &.{ .{ .attr = addr }, try c.reg(in.b) }),
+            .pixel => {
+                if (addr >= KILL_AT) return c.eff("KILL", 0, &.{});
+                if (addr < OUT_AT) return error.Unsupported;
+                try c.eff("MOV", 1, &.{ R(c.w.outv[(addr - OUT_AT) / 4]), c.src(in.b) });
+            },
+            .compute => unreachable,
+        }
+    }
+
+    /// The outputs live to the program's end: nothing else takes their
+    /// registers, whichever EXIT a thread leaves by.
+    fn stageLive(c: *Ctx) void {
+        const w = c.w;
+        if (c.opts.stage != .pixel) return;
+        for (w.outv) |v| {
+            if (v == NOV) continue;
+            if (w.first[v] == std.math.maxInt(u32)) w.first[v] = 0;
+            w.last[v] = @intCast(w.n_mi);
+        }
+    }
+
+    /// What the program loads and stores, from its live instructions.
+    fn stageIO(c: *Ctx) void {
+        const w = c.w;
+        w.io = .{};
+        if (c.opts.stage == .compute) return;
+        for (w.mi[0..w.n_mi]) |*m| {
+            if (m.kind != .inst) continue;
+            if (std.mem.eql(u8, m.op, "KILL")) w.io.kills = true;
+            for (m.o[0..m.n]) |o| {
+                if (o != .attr) continue;
+                if (std.mem.startsWith(u8, m.op, "AST")) {
+                    StageIO.add(&w.io.stores, o.attr);
+                } else {
+                    StageIO.add(&w.io.loads, o.attr);
+                    if (std.mem.eql(u8, m.op, "IPA.CONSTANT")) StageIO.add(&w.io.flat, o.attr);
+                }
+            }
+        }
+        for (w.outv[0..DEPTH_OUT], 0..) |v, r| {
+            if (v != NOV) w.io.outputs |= @as(u32, 1) << @intCast(r);
+        }
+        w.io.depth = w.outv[DEPTH_OUT] != NOV;
+    }
+
+    /// The highest general register allocated.
+    fn topRegister(c: *const Ctx) u8 {
+        const w = c.w;
+        var top: u8 = 0;
+        for (0..w.nv) |vi| {
+            if (w.lead[vi] != vi or w.first[vi] == std.math.maxInt(u32)) continue;
+            if (w.cls[vi] == .p and !w.spilled[vi]) continue;
+            const sz: u8 = if (w.cls[vi] == .p) 1 else w.size[vi];
+            top = @max(top, w.phys[vi] + sz - 1);
+        }
+        return top;
+    }
+
     fn load(c: *Ctx, in: kir.Inst) Error!void {
         const m: kir.Mem = @bitCast(in.aux);
+        if (c.isStageIO(m)) return c.stageLoad(in, m);
         if (m.width_log2 < 3) return error.BadOperand;
         if (m.space == .global) {
             const ad = try c.gaddr(m, in.a);
@@ -1921,6 +2147,7 @@ const Ctx = struct {
 
     fn store(c: *Ctx, in: kir.Inst) Error!void {
         var m: kir.Mem = @bitCast(in.aux);
+        if (c.isStageIO(m)) return c.stageStore(in, m);
         m.signed = false;
         if (m.width_log2 < 3) return error.BadOperand;
         const v: Opd = if (m.width_log2 >= 6) R(vOf(in.b)) else try c.reg(in.b);
@@ -1945,6 +2172,9 @@ const Ctx = struct {
                 .min => if (sgn) "ATOMG.E.MIN.S32.STRONG.GPU" else "ATOMG.E.MIN.STRONG.GPU",
                 .max => if (sgn) "ATOMG.E.MAX.S32.STRONG.GPU" else "ATOMG.E.MAX.STRONG.GPU",
                 .xchg => "ATOMG.E.EXCH.STRONG.GPU",
+                .@"and" => "ATOMG.E.AND.STRONG.GPU",
+                .@"or" => "ATOMG.E.OR.STRONG.GPU",
+                .xor => "ATOMG.E.XOR.STRONG.GPU",
             };
             try c.eff(name, 2, &.{ .{ .pt = true }, c.dst(in), ad, v });
         } else {
@@ -1954,8 +2184,29 @@ const Ctx = struct {
                 .min => if (sgn) "ATOMS.MIN.S32" else "ATOMS.MIN",
                 .max => if (sgn) "ATOMS.MAX.S32" else "ATOMS.MAX",
                 .xchg => "ATOMS.EXCH",
+                .@"and" => "ATOMS.AND",
+                .@"or" => "ATOMS.OR",
+                .xor => "ATOMS.XOR",
             };
             try c.eff(name, 1, &.{ c.dst(in), ad, v });
+        }
+    }
+
+    /// A compare-and-swap: ptxas's atom.cas.b32. The global form has no
+    /// descriptor (its Rc takes the descriptor's bits): the plain 64-bit
+    /// address, [Ra+offset].
+    fn cas(c: *Ctx, in: kir.Inst) Error!void {
+        const m: kir.Mem = @bitCast(in.aux);
+        const expect = try c.reg(in.b);
+        const v = try c.reg(in.c);
+        if (m.space == .global) {
+            var ad = try c.gaddr(m, in.a);
+            ad.mem.desc = false;
+            ad.mem.wide = false;
+            try c.eff("ATOMG.E.CAS.STRONG.GPU", 2, &.{ .{ .pt = true }, c.dst(in), ad, expect, v });
+        } else {
+            const ad = try c.saddr(m, in.a);
+            try c.eff("ATOMS.CAS", 1, &.{ c.dst(in), ad, expect, v });
         }
     }
 
@@ -2007,6 +2258,7 @@ const Ctx = struct {
         @memset(w.first[0..nv], std.math.maxInt(u32));
         @memset(w.last[0..nv], 0);
         for (w.mi[0..w.n_mi], 0..) |*m, i| {
+            if (m.kind == .label) w.label_at[m.o[0].label] = @intCast(i);
             if (m.kind != .inst) continue;
             const pos: u32 = @intCast(i);
             const S = struct {
@@ -2048,6 +2300,7 @@ const Ctx = struct {
                     // referenced inside, and live before or after it
                     if (l < s or f > e) continue;
                     if (check and w.carry[vi] != c.carried(@intCast(vi), s, e)) @panic("kir_sm120: carriedIn and carried disagree");
+                    if (f >= s and l <= e and w.carry[vi] and c.blockTemporary(@intCast(vi), f, l)) continue;
                     if (f < s or l > e or w.carry[vi]) {
                         if (f > s or l < e) {
                             w.first[vi] = @min(f, s);
@@ -2058,6 +2311,22 @@ const Ctx = struct {
                 }
             }
         }
+    }
+
+    /// A scalar whose first access defines it cannot read an earlier
+    /// iteration's value unless a branch enters after that definition.
+    fn blockTemporary(c: *const Ctx, v: u16, first: u32, last: u32) bool {
+        const w = c.w;
+        if (w.size[v] != 1 or w.mi[first].guard != .none or !c.writtenAt(v, first) or c.readAt(v, first)) return false;
+        for (w.mi[0..w.n_mi], 0..) |m, pos| {
+            if (m.kind != .inst or (pos >= first and pos <= last)) continue;
+            for (m.o[0..m.n]) |operand| {
+                if (operand != .label) continue;
+                const target = w.label_at[operand.label];
+                if (target > first and target <= last) return false;
+            }
+        }
+        return true;
     }
 
     /// `carried` for every unit at once (w.carry), in one pass over the
@@ -2196,13 +2465,31 @@ const Ctx = struct {
                 preds = PREDS - 1;
                 continue;
             }
+            // An instruction reads its spilled predicates through scratch
+            // ones (P6 down), its guard too: one reading more than the
+            // scratch left (a PLOP3 of three, a compare's accumulator and
+            // a guard) takes another predicate from the allocation.
+            if (spills > 0 and c.scratchNeed() > SCRATCH_P + 1 - preds and preds > MIN_PREDS) {
+                preds -= 1;
+                continue;
+            }
             w.stats.spills = spills;
             break;
         }
+        w.npreds = preds;
         // general registers: spilled predicates are homed in them
         var active: [MAX_GPR + 1]u16 = undefined;
         var n_active: usize = 0;
         var used = [_]u64{ 0, 0, 0, 0 };
+        // (a pixel program's output registers R0.. are the outputs' alone:
+        // nothing else ever writes them, so the copies into them at EXIT
+        // never race a write still in flight on another path)
+        if (c.opts.stage == .pixel) {
+            for (w.outv, 0..) |v, r| {
+                if (v == NOV) continue;
+                for (0..@as(usize, w.outreg[r]) + 1) |x| setBit(&used, @intCast(x));
+            }
+        }
         for (units) |u| {
             if (w.cls[u] == .p and !w.spilled[u]) continue;
             var i: usize = 0;
@@ -2223,6 +2510,31 @@ const Ctx = struct {
             active[n_active] = u;
             n_active += 1;
         }
+    }
+
+    /// The most scratch predicates an instruction needs: its distinct
+    /// spilled predicates read, its guard's among them.
+    fn scratchNeed(c: *const Ctx) u8 {
+        const w = c.w;
+        var most: u8 = 0;
+        for (w.mi[0..w.n_mi]) |*m| {
+            if (m.kind != .inst) continue;
+            var seen: [8]u16 = undefined;
+            var n: u8 = 0;
+            const reads = m.o[m.nd..m.n];
+            for (reads) |o| {
+                if (o != .pred or o.pred.v == NOV or !w.spilled[o.pred.v]) continue;
+                if (std.mem.indexOfScalar(u16, seen[0..n], o.pred.v) == null and n < seen.len) {
+                    seen[n] = o.pred.v;
+                    n += 1;
+                }
+            }
+            if (m.guard == .pred and w.spilled[m.guard.pred.v]) {
+                if (std.mem.indexOfScalar(u16, seen[0..n], m.guard.pred.v) == null) n += 1;
+            }
+            most = @max(most, n);
+        }
+        return most;
     }
 
     /// Whether unit `u` is read by the instruction at `pos` (so a value
@@ -2320,6 +2632,7 @@ const Ctx = struct {
 
     fn emitText(c: *Ctx) Error![]const u8 {
         const w = c.w;
+        const top = c.topRegister();
         var t = Text{ .buf = &w.text };
         t.str(".params ");
         t.dec(8 * @as(u32, c.k.bindings) + 4 * @as(u32, c.k.param_words));
@@ -2352,13 +2665,29 @@ const Ctx = struct {
                     if (x.v == m.guard.pred.v) have = true;
                 }
                 if (!have) {
-                    if (scratch < PREDS - 1) return error.TooManyRegs;
+                    if (scratch < w.npreds) return error.TooManyRegs;
                     try c.spillRead(&t, m.guard.pred.v, scratch, &map, &n_map);
                     scratch -= 1;
                 }
             }
-            if (scratch + 2 < SCRATCH_P) return error.TooManyRegs;
+            if (scratch + 1 < w.npreds) return error.TooManyRegs;
             var spilled_dst: ?u16 = null;
+            // (a pixel program's outputs into R0.., which the allocation
+            // keeps for them: no copy overwrites another's source)
+            if (c.opts.stage == .pixel and std.mem.eql(u8, m.op, "EXIT")) {
+                _ = top;
+                for (w.outv, 0..) |v, r| {
+                    if (v == NOV) continue;
+                    if (m.guard != .none) {
+                        t.str("@");
+                        c.printOpd(&t, m.guard, map[0..n_map], null);
+                        t.str(" ");
+                    }
+                    t.reg("MOV R", w.outreg[r]);
+                    t.reg(", R", c.physOf(v));
+                    t.str("\n");
+                }
+            }
             if (m.guard != .none) {
                 t.str("@");
                 c.printOpd(&t, m.guard, map[0..n_map], null);
@@ -2433,6 +2762,11 @@ const Ctx = struct {
             .imm => |x| t.hex(x),
             .cbuf => |x| {
                 t.str("c[0x0][");
+                t.hex(x);
+                t.str("]");
+            },
+            .attr => |x| {
+                t.str("a[");
                 t.hex(x);
                 t.str("]");
             },
