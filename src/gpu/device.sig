@@ -332,6 +332,11 @@ pub const Graphics = struct {
     height: u32,
     stride: u32,
     format: TargetFormat,
+    /// Every colour target in blocks of 2^blocks GOBs (block linear,
+    /// Turing2D's swizzle; `stride` then the bytes across: width's bytes
+    /// in whole GOBs), not rows; null: rows. NVIDIA's 3D engine takes a
+    /// depth target only beside colour targets in blocks.
+    blocks: ?u3 = null,
     /// The channels written (bit 0 red .. bit 3 alpha).
     mask: u4 = 0xf,
     blend: ?GraphicsBlend = null,

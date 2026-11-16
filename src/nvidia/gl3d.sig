@@ -215,6 +215,11 @@ pub const Draw = struct {
     zero_va: u64,
     target: gr.Target,
     format: Format,
+    /// Every colour target in blocks of 2^n GOBs (block linear: `pitch`
+    /// then the target's width in bytes, whole GOBs), not rows; null:
+    /// rows. A depth target is bound beside targets in blocks alone (see
+    /// the top: the host driver's context stops the channel otherwise).
+    target_gobs: ?u3 = null,
     /// The channels written: bit 0 red .. bit 3 alpha.
     mask: u4 = 0xf,
     blend: ?Blend = null,
@@ -252,6 +257,12 @@ pub const More = struct {
     blend: bool = true,
 };
 
+/// SET_COLOR_TARGET_MEMORY for a target in blocks: one GOB wide and deep,
+/// 2^gobs high, LAYOUT_BLOCKLINEAR (bit 12 clear).
+pub fn targetMemory(gobs: u3) u32 {
+    return @as(u32, gobs) << 4;
+}
+
 /// SET_CT_SELECT: `count` targets, slot t its own target t (draw.sig's
 /// setup sends it for one).
 pub fn ctSelect(count: u32) u32 {
@@ -267,6 +278,13 @@ pub const OGL_SET_CULL_FACE: u32 = 0x1920;
 pub const CULL_FRONT: u32 = 0x404;
 pub const CULL_BACK: u32 = 0x405;
 pub const CULL_FRONT_AND_BACK: u32 = 0x408;
+/// SET_WINDOW_ORIGIN's FLIP_Y (the origin the top left, MODE 0): the
+/// engine counts OGL_SET_FRONT_FACE's winding with y up (OpenGL's window;
+/// NVK's Vulkan the same) unless it is set; Draw.front_ccw counts it as
+/// the rows grow. Without it the RTX drew every face the other way round
+/// (dxgtest `draw edges`: the culling, gl_FrontFacing and two-sided
+/// stencil scenes; 11-16).
+pub const WINDOW_FLIP_Y: u32 = 0x10;
 /// OGL_SET_FRONT_FACE's values.
 pub const FRONT_CW: u32 = 0x900;
 pub const FRONT_CCW: u32 = 0x901;
@@ -302,8 +320,13 @@ pub fn emit(p: *Push, d: *const Draw) void {
     for (prelude) |mv| one(p, mv[0], mv[1]);
     gr.setup(p, d.zero_va, d.zero_va, d.zero_va, 1);
     gr.target(p, .{ .va = d.target.va, .width = d.target.width, .height = d.target.height, .pitch = d.target.pitch, .format = .bgra8 });
-    // the target's own format, its channels
+    // the target's own format, its channels; in blocks: its width in
+    // pixels (the engine's own pitch: whole GOBs) and its blocks
     many(p, gr.SET_COLOR_TARGET_A + 16, &.{targetFormat(d.format)});
+    if (d.target_gobs) |gobs| {
+        one(p, gr.SET_COLOR_TARGET_A + 8, d.target.width);
+        one(p, gr.SET_COLOR_TARGET_A + 20, targetMemory(gobs));
+    }
     many(p, gr.SET_CT_WRITE, &.{ctWrite(d.mask)});
     // the other colour targets (the pixel program's outputs 1 .. 7): each
     // its memory, format, channels and blend; CT_SELECT counts to the last
@@ -311,7 +334,8 @@ pub fn emit(p: *Push, d: *const Draw) void {
     for (d.more, 1..) |m, ti| {
         const x = m orelse continue;
         const t: u32 = @intCast(ti);
-        many(p, gr.SET_COLOR_TARGET_A + 64 * t, &.{ @truncate(x.va >> 32), @truncate(x.va), x.pitch, d.target.height, targetFormat(x.format), gr.TARGET_MEMORY_PITCH, 1, 0, 0 });
+        const across, const memory = if (d.target_gobs) |gobs| .{ d.target.width, targetMemory(gobs) } else .{ x.pitch, gr.TARGET_MEMORY_PITCH };
+        many(p, gr.SET_COLOR_TARGET_A + 64 * t, &.{ @truncate(x.va >> 32), @truncate(x.va), across, d.target.height, targetFormat(x.format), memory, 1, 0, 0 });
         one(p, gr.SET_COLOR_COMPRESSION + 4 * t, 0);
         one(p, gr.SET_CT_WRITE + 4 * t, ctWrite(x.mask));
         if (d.blend) |b| {
@@ -326,6 +350,9 @@ pub fn emit(p: *Push, d: *const Draw) void {
     one(p, gr.SET_VIEWPORT_Z_CLIP, SET_VIEWPORT_SCALE_Z_CLIP_GL);
     gr.setScissor(p, d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
     one(p, gr.SET_PROVOKING_VERTEX, PROVOKING_LAST);
+    // (the front face as the rows count: FLIP_Y, the window's origin still
+    // its top left)
+    one(p, gr.SET_WINDOW_ORIGIN, WINDOW_FLIP_Y);
     one(p, gr.OGL_SET_FRONT_FACE, if (d.front_ccw) FRONT_CCW else FRONT_CW);
     if (d.cull != 0) {
         one(p, OGL_SET_CULL_FACE, switch (d.cull) {

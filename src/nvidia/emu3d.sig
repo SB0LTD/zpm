@@ -81,6 +81,15 @@ const Target = struct {
     width: u32,
     height: u32,
     format: Fmt,
+    /// In blocks of 2^gobs GOBs (block linear, `pitch` the bytes across in
+    /// whole GOBs); null: rows of `pitch` bytes.
+    gobs: ?u3 = null,
+
+    /// Where pixel (x, y)'s bytes are.
+    fn at(t: Target, x: u32, y: u32) usize {
+        const xb = x * pixelBytes(t.format);
+        return if (t.gobs) |g| blAddress(t.pitch, g, xb, y) else @as(usize, y) * t.pitch + xb;
+    }
 };
 
 /// A colour target's pixels: the renderer's three, and GL's RG8.
@@ -88,7 +97,8 @@ const Fmt = enum { rgba8, bgra8, r8, rg8 };
 
 const Clip = struct { x0: i64, y0: i64, x1: i64, y1: i64 };
 
-/// The depth-stencil target as gl3d sends it: S8Z24, block linear.
+/// The depth-stencil target as gl3d sends it: S8Z24, block linear in
+/// Blackwell's depth GOBs (BLACKWELL_Z24).
 const ZT = struct { bytes: []u8, pitch: u32, width: u32, height: u32, gobs: u3 };
 const STENCIL_TWO_SIDE = gl3d.SET_TWO_SIDED_STENCIL_TEST;
 
@@ -214,7 +224,7 @@ pub const Engine = struct {
         try g.need(g.reg(STENCIL_TWO_SIDE) <= 1, "SET_TWO_SIDED_STENCIL_TEST neither on nor off");
         try g.need(g.reg(gr.SET_RASTER_ENABLE) == 1, "the rasterizer is off (SET_RASTER_ENABLE)");
         try g.need(g.reg(gr.SET_ANTI_ALIAS) == 0 and g.reg(gr.SET_ANTI_ALIAS_SAMPLE_POSITIONS) == 0x8888_8888, "more than one sample, or a sample not at the pixel's centre");
-        try g.need(g.reg(gr.SET_VIEWPORT_PIXEL) == 0 and g.reg(gr.SET_WINDOW_ORIGIN) == 0, "pixel centres not at halves, or the origin not the top left");
+        try g.need(g.reg(gr.SET_VIEWPORT_PIXEL) == 0 and g.reg(gr.SET_WINDOW_ORIGIN) & ~gl3d.WINDOW_FLIP_Y == 0, "pixel centres not at halves, or the origin not the top left (FLIP_Y: the faces only, frontCcw)");
         try g.need(g.reg(gr.SET_VIEWPORT_SCALE_OFFSET) == 1 and g.reg(gr.SET_VIEWPORT_COORDINATE_SWIZZLE) == 0x6420, "no viewport transform, or a swizzled one");
         try g.need(g.reg(gr.SET_VIEWPORT_Z_CLIP) <= 1, "a depth clip range other than -w..w or 0..w");
         try g.need(g.reg(gr.SET_PROVOKING_VERTEX) <= 1, "a provoking vertex other than the first or the last");
@@ -249,7 +259,7 @@ pub const Engine = struct {
         const a = gr.SET_COLOR_TARGET_A + 64 * i;
         if (g.reg(a + 16) == 0) return null;
         const va = @as(u64, g.reg(a) & 0xff) << 32 | g.reg(a + 4);
-        const pitch = g.reg(a + 8);
+        const across = g.reg(a + 8);
         const height = g.reg(a + 12);
         const format: Fmt = switch (g.reg(a + 16)) {
             0xcf => .bgra8,
@@ -258,12 +268,29 @@ pub const Engine = struct {
             0xea => .rg8,
             else => return g.refuse("a color target format the renderer does not use"),
         };
-        try g.need(g.reg(a + 20) == gr.TARGET_MEMORY_PITCH and g.reg(a + 24) == 1 and g.reg(a + 28) == 0 and g.reg(a + 32) == 0, "the color target is not one layer of rows of bytes (LAYOUT_PITCH)");
-        // (NVK: the hardware "gets grumpy" otherwise)
-        try g.need(va % 128 == 0 and pitch % 128 == 0 and pitch != 0 and height != 0, "the color target's address or its rows are not multiples of 128 bytes");
+        const memory = g.reg(a + 20);
+        try g.need(g.reg(a + 24) == 1 and g.reg(a + 28) == 0 and g.reg(a + 32) == 0, "the color target is not one layer");
         try g.need(g.reg(gr.SET_COLOR_COMPRESSION + 4 * i) == 0, "color compression on plain memory");
-        const bytes = g.host.mem.find(va, @as(usize, pitch) * height) orelse return g.refuse("the color target's memory is not mapped");
-        return .{ .bytes = bytes, .pitch = pitch, .width = pitch / pixelBytes(format), .height = height, .format = format };
+        if (memory == gr.TARGET_MEMORY_PITCH) {
+            // rows of bytes: the width is the pitch (NVK: the hardware
+            // "gets grumpy" unless both are on 128 bytes)
+            try g.need(va % 128 == 0 and across % 128 == 0 and across != 0 and height != 0, "the color target's address or its rows are not multiples of 128 bytes");
+            // (the host driver's context stops the channel on a depth
+            // target beside rows of bytes; nouveau's nvc0 never binds one)
+            try g.need(g.reg(gr.SET_ZT_SELECT) == 0, "a depth target beside a colour target in rows of bytes (LAYOUT_PITCH)");
+            const bytes = g.host.mem.find(va, @as(usize, across) * height) orelse return g.refuse("the color target's memory is not mapped");
+            return .{ .bytes = bytes, .pitch = across, .width = across / pixelBytes(format), .height = height, .format = format };
+        }
+        // in blocks: one GOB wide and deep, up to 32 high; the width in
+        // pixels, the pitch its bytes in whole GOBs
+        try g.need(memory & 0xf == 0 and (memory >> 8) & 0xf == 0 and (memory >> 4) & 0xf <= 5 and memory & ~@as(u32, 0xff) == 0, "a color target's blocks not one GOB wide and deep, or not LAYOUT_PITCH or BLOCKLINEAR");
+        try g.need(va % 512 == 0 and across != 0 and height != 0, "a color target in blocks not on a GOB, or empty");
+        const gobs: u3 = @intCast((memory >> 4) & 0xf);
+        const pitch = (across * pixelBytes(format) + 63) / 64 * 64;
+        const rows_per_block = @as(u32, 8) << gobs;
+        const n = @as(usize, pitch / 64) * ((height + rows_per_block - 1) / rows_per_block) * (@as(usize, 512) << gobs);
+        const bytes = g.host.mem.find(va, n) orelse return g.refuse("the color target's memory is not mapped");
+        return .{ .bytes = bytes, .pitch = pitch, .width = across, .height = height, .format = format, .gobs = gobs };
     }
 
     /// Target i's blend (null: off), as its SET_BLEND and per-target state
@@ -652,7 +679,7 @@ pub const Engine = struct {
         if (area == 0) return;
         if (g.culled(area)) return;
         // (front: wound as OGL_SET_FRONT_FACE says, as culling has it)
-        const front = (area > 0) == (g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW);
+        const front = (area > 0) == g.frontCcw();
         if (area < 0) {
             std.mem.swap(usize, &tri[1], &tri[2]);
             area = -area;
@@ -725,7 +752,17 @@ pub const Engine = struct {
     /// and y as the rows grow) is culled, as OGL_SET_CULL, OGL_SET_CULL_FACE
     /// and OGL_SET_FRONT_FACE say.
     fn culled(g: *const Engine, area: i64) bool {
-        return cullOf(area, g.reg(gr.OGL_SET_CULL) != 0, g.reg(gl3d.OGL_SET_CULL_FACE), g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW);
+        return cullOf(area, g.reg(gr.OGL_SET_CULL) != 0, g.reg(gl3d.OGL_SET_CULL_FACE), g.frontCcw());
+    }
+
+    /// Whether the front faces wind counter-clockwise as the window's
+    /// coordinates count (x right, y as the rows grow). OGL_SET_FRONT_FACE
+    /// counts with y up (OpenGL's window, the RTX as measured: dxgtest
+    /// `draw edges`, 11-16) unless SET_WINDOW_ORIGIN's FLIP_Y turns it
+    /// to the rows' way, as gl3d sends it.
+    fn frontCcw(g: *const Engine) bool {
+        const ccw = g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW;
+        return ccw == (g.reg(gr.SET_WINDOW_ORIGIN) & gl3d.WINDOW_FLIP_Y != 0);
     }
 
     /// Whether a pixel's depth (window units) is in the viewport's depth
@@ -832,8 +869,7 @@ pub const Engine = struct {
     /// colour is written.
     fn depthStencil(g: *Engine, z: ZT, x: u32, y: u32, zw: f32, front: bool) bool {
         if (x >= z.width or y >= z.height) return false;
-        const at = blAddress(z.pitch, z.gobs, x * 4, y);
-        const w = std.mem.readInt(u32, z.bytes[at..][0..4], .little);
+        const w = zRead(z.bytes, z.pitch, z.gobs, x, y);
         const zq = depthWord(zw);
         const old_z = w & 0xff_ffff;
         var stencil: u32 = w >> 24;
@@ -859,7 +895,7 @@ pub const Engine = struct {
             const v = stencilOp(op, stencil, ref);
             stencil = (v & wm) | (stencil & ~wm & 0xff);
         }
-        std.mem.writeInt(u32, z.bytes[at..][0..4], (stencil << 24) | new_z, .little);
+        zWrite(z.bytes, z.pitch, z.gobs, x, y, (stencil << 24) | new_z);
         return s_pass and d_pass;
     }
 
@@ -1133,6 +1169,52 @@ pub fn blAddress(pitch: u32, gobs: u3, xb: u32, y: u32) usize {
     return (@as(usize, block) << (@as(u6, gobs) + 9)) + gob * 512 + inner;
 }
 
+/// Blackwell's depth-stencil GOB for 24-bit depth (nil's BlackwellZ24,
+/// which nil names and copies none of), as the RTX 5070's 3D engine
+/// writes it (measured: dxgtest `draw edges zprobe` and `zprobes`, 11-16;
+/// the table put every byte of a 64 x 32 target right): a GOB is 16
+/// pixels across (64 bytes of S8Z24) and 8 rows, two halves of 256 bytes
+/// (x % 16 below 8, then the rest); a half holds its 8 x 8 pixels'
+/// stencils (row by row) in its first 64 bytes, then their depths three
+/// bytes each, 4 x 8 pixels a 96 bytes (not each in order: two pixels of
+/// each 96 split across 32-byte sectors). Entry (y % 8) * 8 + x % 8: the
+/// offsets in the half of the depth's low, middle and high bytes, and of
+/// the stencil.
+pub const BLACKWELL_Z24 = [64][4]u8{
+    .{ 64, 65, 66, 0 }, .{ 67, 68, 69, 1 }, .{ 70, 71, 72, 2 }, .{ 73, 74, 75, 3 }, .{ 160, 161, 162, 4 }, .{ 163, 164, 165, 5 }, .{ 166, 167, 168, 6 }, .{ 169, 170, 171, 7 },
+    .{ 76, 77, 78, 8 }, .{ 79, 80, 81, 9 }, .{ 82, 83, 84, 10 }, .{ 85, 86, 87, 11 }, .{ 172, 173, 174, 12 }, .{ 175, 176, 177, 13 }, .{ 178, 179, 180, 14 }, .{ 181, 182, 183, 15 },
+    .{ 88, 89, 90, 16 }, .{ 91, 92, 93, 17 }, .{ 126, 94, 95, 18 }, .{ 96, 97, 98, 19 }, .{ 192, 193, 194, 20 }, .{ 222, 190, 191, 21 }, .{ 184, 185, 186, 22 }, .{ 187, 188, 189, 23 },
+    .{ 99, 100, 101, 24 }, .{ 102, 103, 104, 25 }, .{ 105, 106, 107, 26 }, .{ 108, 109, 110, 27 }, .{ 195, 196, 197, 28 }, .{ 198, 199, 200, 29 }, .{ 201, 202, 203, 30 }, .{ 204, 205, 206, 31 },
+    .{ 111, 112, 113, 32 }, .{ 114, 115, 116, 33 }, .{ 117, 118, 119, 34 }, .{ 120, 121, 122, 35 }, .{ 207, 208, 209, 36 }, .{ 210, 211, 212, 37 }, .{ 213, 214, 215, 38 }, .{ 216, 217, 218, 39 },
+    .{ 128, 129, 130, 40 }, .{ 131, 132, 133, 41 }, .{ 127, 158, 159, 42 }, .{ 123, 124, 125, 43 }, .{ 219, 220, 221, 44 }, .{ 223, 254, 255, 45 }, .{ 224, 225, 226, 46 }, .{ 227, 228, 229, 47 },
+    .{ 134, 135, 136, 48 }, .{ 137, 138, 139, 49 }, .{ 140, 141, 142, 50 }, .{ 143, 144, 145, 51 }, .{ 230, 231, 232, 52 }, .{ 233, 234, 235, 53 }, .{ 236, 237, 238, 54 }, .{ 239, 240, 241, 55 },
+    .{ 146, 147, 148, 56 }, .{ 149, 150, 151, 57 }, .{ 152, 153, 154, 58 }, .{ 155, 156, 157, 59 }, .{ 242, 243, 244, 60 }, .{ 245, 246, 247, 61 }, .{ 248, 249, 250, 62 }, .{ 251, 252, 253, 63 },
+};
+
+/// Where pixel (x, y)'s depth bytes (low, middle, high) and its stencil
+/// are in a depth target of BLACKWELL_Z24 GOBs: `pitch` bytes across
+/// (whole GOBs: 16 pixels each), blocks of 2^gobs GOBs.
+pub fn zBytes(pitch: u32, gobs: u3, x: u32, y: u32) [4]usize {
+    const shift: u5 = @as(u5, gobs) + 3;
+    const block = (y >> shift) * (pitch / 64) + x / 16;
+    const gob = (y >> 3) & ((@as(u32, 1) << gobs) - 1);
+    const base = (@as(usize, block) << (@as(u6, gobs) + 9)) + @as(usize, gob) * 512 + ((x % 16) / 8) * 256;
+    const e = BLACKWELL_Z24[(y % 8) * 8 + x % 8];
+    return .{ base + e[0], base + e[1], base + e[2], base + e[3] };
+}
+
+/// Pixel (x, y)'s word of such a target as S8Z24 (stencil in bits 24..31).
+pub fn zRead(bytes: []const u8, pitch: u32, gobs: u3, x: u32, y: u32) u32 {
+    const a = zBytes(pitch, gobs, x, y);
+    return @as(u32, bytes[a[0]]) | @as(u32, bytes[a[1]]) << 8 | @as(u32, bytes[a[2]]) << 16 | @as(u32, bytes[a[3]]) << 24;
+}
+
+/// Pixel (x, y) of such a target set to the S8Z24 word `w`.
+pub fn zWrite(bytes: []u8, pitch: u32, gobs: u3, x: u32, y: u32, w: u32) void {
+    const a = zBytes(pitch, gobs, x, y);
+    for (a, 0..) |at, i| bytes[at] = @truncate(w >> @intCast(8 * i));
+}
+
 /// A blend as the target's state has it: the equations and factors (rgb's
 /// equation, source, destination, then alpha's), the constant colour.
 const Blend = struct { ops: [6]u32, constant: [4]f32 };
@@ -1190,7 +1272,7 @@ fn pixelBytes(f: Fmt) u32 {
 /// [0, 1] first), the channels `mask` names alone written.
 fn write(t: Target, x: u32, y: u32, src0: [4]f32, bl: ?Blend, mask: u4) void {
     const one: f32 = 1.0 / 255.0;
-    const at = @as(usize, y) * t.pitch + @as(usize, x) * pixelBytes(t.format);
+    const at = t.at(x, y);
     // (where each of r, g, b, a is among the pixel's bytes; none: not kept)
     const order: [4]?u8 = switch (t.format) {
         .bgra8 => .{ 2, 1, 0, 3 },

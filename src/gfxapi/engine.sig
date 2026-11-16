@@ -380,7 +380,7 @@ pub const Pool = struct {
 /// Threads per group (a row of pixels: one thread each).
 pub const GROUP = 64;
 
-const Prog = enum(u8) { fill, fill_masked, copy, bin, blit, mip, words };
+const Prog = enum(u8) { fill, fill_masked, copy, bin, blit, mip, words, twin_in, twin_out, ztwin_in, ztwin_out };
 const N_PROGS = @typeInfo(Prog).@"enum".field_names.len;
 /// A program's code as the backend emits it (ir3, sm_120 or KIR's own).
 pub const CODE_BYTES = 16 * 1024;
@@ -505,6 +505,80 @@ fn wordsKernel(s: kir.Storage) kir.Kernel {
     const v = k.reg(.u32);
     k.setAux(v, .ld, r(k.op2(.iadd, .u32, r(k.param(.u32, 0)), r(b))), kir.no, kir.no, @bitCast(kir.global(src, 32)));
     k.store(.u32, kir.global(dst, 32), r(k.op2(.iadd, .u32, r(k.param(.u32, 1)), r(b))), r(v));
+    k.endif();
+    return k;
+}
+
+/// twin_in, twin_out: an image's rows into its block-linear twin (in),
+/// or the twin back into the rows (out), a 32-bit word a thread, a row
+/// of groups a row: bindings 0 the image's memory, 1 the twin; params 0
+/// the image's stride (bytes), 1 the words of a row, 2 the twin's pitch
+/// (bytes, whole GOBs), 3 its blocks' GOBs (log2). Turing2D's swizzle:
+/// the 3D engine's for its colour and depth targets.
+fn twinKernel(s: kir.Storage, comptime in: bool) kir.Kernel {
+    var k = kir.Kernel.init(s, if (in) "gfx_twin_in" else "gfx_twin_out", .{ GROUP, 1, 1 });
+    const mem = k.binding();
+    const bl = k.binding();
+    const w = k.op3(.imad, .u32, r(k.gid(0)), u(GROUP), r(k.tid(0)));
+    k.ifp(r(k.cmp(.u32, .lt, r(w), r(k.param(.u32, 1)))));
+    const y = k.gid(1);
+    const xb = k.op2(.shl, .u32, r(w), u(2));
+    const at_rows = k.op3(.imad, .u32, r(y), r(k.param(.u32, 0)), r(xb));
+    const at_blocks = blocklinear.address(&k, r(k.param(.u32, 2)), r(k.param(.u32, 3)), u(@intFromEnum(blocklinear.Swizzle.turing2d)), r(xb), r(y));
+    const v = k.reg(.u32);
+    if (in) {
+        k.setAux(v, .ld, r(at_rows), kir.no, kir.no, @bitCast(kir.global(mem, 32)));
+        k.store(.u32, kir.global(bl, 32), r(at_blocks), r(v));
+    } else {
+        k.setAux(v, .ld, r(at_blocks), kir.no, kir.no, @bitCast(kir.global(bl, 32)));
+        k.store(.u32, kir.global(mem, 32), r(at_rows), r(v));
+    }
+    k.endif();
+    return k;
+}
+
+/// ztwin_in, ztwin_out: a depth image's S8Z24 words (Turing2D's blocks:
+/// the compute raster's, raster.dsOffset) into its twin in the RTX's depth
+/// GOBs (in), or back (out), a pixel a thread, a row of groups a row:
+/// bindings 0 the image, 1 the twin, 2 the GOB's table (gpu.blackwell_z24:
+/// a half GOB's pixel's offsets as one word, low byte first); params 0
+/// both's pitch (bytes), 1 their blocks' GOBs (log2), 2 the width.
+fn zTwinKernel(s: kir.Storage, comptime in: bool) kir.Kernel {
+    var k = kir.Kernel.init(s, if (in) "gfx_ztwin_in" else "gfx_ztwin_out", .{ GROUP, 1, 1 });
+    const img = k.binding();
+    const tw = k.binding();
+    const tab = k.binding();
+    const x = k.op3(.imad, .u32, r(k.gid(0)), u(GROUP), r(k.tid(0)));
+    k.ifp(r(k.cmp(.u32, .lt, r(x), r(k.param(.u32, 2)))));
+    const y = k.gid(1);
+    const pitch = k.param(.u32, 0);
+    const gobs = k.param(.u32, 1);
+    const at = blocklinear.address(&k, r(pitch), r(gobs), u(@intFromEnum(blocklinear.Swizzle.turing2d)), r(k.op2(.shl, .u32, r(x), u(2))), r(y));
+    // the twin: the GOB's place as the image's, then the half and the table
+    const block = k.op3(.imad, .u32, r(k.op2(.shr, .u32, r(y), r(k.op2(.iadd, .u32, r(gobs), u(3))))), r(k.op2(.shr, .u32, r(pitch), u(6))), r(k.op2(.shr, .u32, r(x), u(4))));
+    const gob = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(y), u(3))), r(k.op2(.isub, .u32, r(k.op2(.shl, .u32, u(1), r(gobs))), u(1))));
+    var base = k.op2(.shl, .u32, r(block), r(k.op2(.iadd, .u32, r(gobs), u(9))));
+    base = k.op2(.iadd, .u32, r(base), r(k.op2(.shl, .u32, r(gob), u(9))));
+    base = k.op2(.iadd, .u32, r(base), r(k.op2(.shl, .u32, r(k.op3(.bfe, .u32, r(x), u(3), u(1))), u(8))));
+    const entry = k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(y), u(7))), u(3))), r(k.op2(.@"and", .u32, r(x), u(7))));
+    const e = k.reg(.u32);
+    k.setAux(e, .ld, r(k.op2(.shl, .u32, r(entry), u(2))), kir.no, kir.no, @bitCast(kir.global(tab, 32)));
+    var places: [4]kir.V = undefined;
+    for (&places, 0..) |*pl, i| pl.* = k.op2(.iadd, .u32, r(base), r(k.op3(.bfe, .u32, r(e), u(@intCast(8 * i)), u(8))));
+    if (in) {
+        const w = k.reg(.u32);
+        k.setAux(w, .ld, r(at), kir.no, kir.no, @bitCast(kir.global(img, 32)));
+        for (places, 0..) |pl, i| k.store(.u32, kir.global(tw, 8), r(pl), r(k.op2(.shr, .u32, r(w), u(@intCast(8 * i)))));
+    } else {
+        var w = k.reg(.u32);
+        k.setAux(w, .ld, r(places[0]), kir.no, kir.no, @bitCast(kir.global(tw, 8)));
+        for (places[1..], 1..) |pl, i| {
+            const b = k.reg(.u32);
+            k.setAux(b, .ld, r(pl), kir.no, kir.no, @bitCast(kir.global(tw, 8)));
+            w = k.op2(.@"or", .u32, r(w), r(k.op2(.shl, .u32, r(b), u(@intCast(8 * i)))));
+        }
+        k.store(.u32, kir.global(img, 32), r(at), r(w));
+    }
     k.endif();
     return k;
 }
@@ -1057,6 +1131,43 @@ pub const Stats = struct {
     /// Copies between images' VRAM and their shadows (gfx_words), bytes.
     vram_copies: u64 = 0,
     vram_bytes: u64 = 0,
+    /// Copies between colour images and their block-linear twins (into
+    /// the twin, out of it).
+    twins_in: u64 = 0,
+    twins_out: u64 = 0,
+};
+
+/// Colour images drawn into beside a depth target on the 3D engine at
+/// once, each with its block-linear twin (a depth draw into one more
+/// stays on the compute kernels).
+pub const MAX_TWINS = 16;
+
+/// An image's block-linear twin in VRAM: NVIDIA's 3D engine draws beside
+/// a depth target into colour targets in blocks alone (the host driver's
+/// context stops the channel on rows: nvidia/gl3d.sig), while the
+/// engine's images are rows (what the compute kernels, the CPU, the
+/// windows and dma-bufs read). A depth draw draws into the twin, loaded
+/// from the rows when they are newer; the rows take the twin back before
+/// anything else uses the image on the GPU or the CPU, and at every
+/// batch's end (what a window or a dma-buf's reader sees).
+const Twin = struct {
+    /// a depth image's (S8Z24 in Turing2D's blocks, the twin in the RTX's
+    /// depth GOBs: ztwin_in), not a colour image's
+    depth: bool = false,
+    width: u32 = 0,
+    /// the image's memory (its GPU address: whose twin it is)
+    mem: gpu.Buffer = .{},
+    stride: u32 = 0,
+    row_words: u32 = 0,
+    rows: u32 = 0,
+    /// the twin: `pitch` bytes across (whole GOBs), blocks of 2^gobs GOBs
+    bl: gpu.Buffer = .{},
+    pitch: u32 = 0,
+    gobs: u3 = 0,
+    /// the twin holds pixels the rows do not (drawn since)
+    new: bool = false,
+    /// the rows hold pixels the twin does not
+    old: bool = true,
 };
 
 pub const Engine = struct {
@@ -1095,6 +1206,11 @@ pub const Engine = struct {
     vram_images: bool = false,
     /// Images in VRAM now, and their bytes (stats).
     vram_count: u32 = 0,
+    /// The block-linear twins of colour images (Twin).
+    twins: [MAX_TWINS]Twin = [_]Twin{.{}} ** MAX_TWINS,
+    n_twins: u32 = 0,
+    /// gpu.blackwell_z24 for ztwin's kernels (made at the first depth twin)
+    ztable: Image = .{},
     said_graphics: bool = false,
     said_compute: [8][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
@@ -1175,6 +1291,10 @@ pub const Engine = struct {
                 .blit => blitKernel(s),
                 .mip => mipKernel(s),
                 .words => wordsKernel(s),
+                .twin_in => twinKernel(s, true),
+                .twin_out => twinKernel(s, false),
+                .ztwin_in => zTwinKernel(s, true),
+                .ztwin_out => zTwinKernel(s, false),
             };
             try k.finish();
             var w = gpu.Work.init(work_mem);
@@ -1189,6 +1309,10 @@ pub const Engine = struct {
     /// free first).
     pub fn deinit(e: *Engine) void {
         e.finish();
+        for (&e.twins) |*t| {
+            if (t.bl.gpu != 0) e.dropTwin(t);
+        }
+        e.freeImage(&e.ztable);
         e.freeImage(&e.zero);
         e.reap(true);
         if (e.dev) |d| {
@@ -1363,6 +1487,7 @@ pub const Engine = struct {
             sh.refs -= 1;
             if (sh.refs == 0) {
                 if (sh.external != null) e.settle(img);
+                e.dropTwinOf(img, false);
                 e.freeBytes(sh.buf, sh.pooled, sh.track.last);
                 if (sh.external) |external| {
                     sh.external = null;
@@ -1370,10 +1495,14 @@ pub const Engine = struct {
                 }
             }
         } else if (img.own and img.vram != null) {
+            e.dropTwinOf(img, false);
             e.freeBytes(img.vram.?, false, img.track.last);
             e.freeBytes(img.host, false, img.track.last);
             e.vram_count -|= 1;
-        } else if (img.own and img.buf.cpu.len != 0) e.freeBytes(img.buf, img.pooled, img.track.last);
+        } else if (img.own and img.buf.cpu.len != 0) {
+            e.dropTwinOf(img, false);
+            e.freeBytes(img.buf, img.pooled, img.track.last);
+        }
         img.* = .{};
     }
 
@@ -1385,6 +1514,7 @@ pub const Engine = struct {
     pub fn shareOwn(e: *Engine, img: *Image, sh: *Shared) bool {
         std.debug.assert(img.share == null and img.own);
         e.fromVram(img);
+        e.dropTwinOf(img, true);
         if (img.pooled or e.slabOf(img.buf) != null) {
             const n = img.buf.cpu.len;
             const m = e.allocBytes(n, false) orelse return false;
@@ -1487,6 +1617,7 @@ pub const Engine = struct {
 
     /// Run what is recorded (it goes on while the CPU does).
     pub fn flush(e: *Engine) void {
+        e.twinsOut();
         if (e.n_ops == 0) return;
         const d = e.dev.?;
         const n = e.n_ops;
@@ -1659,7 +1790,8 @@ pub const Engine = struct {
 
     /// Room for one more op in the open batch.
     fn room(e: *Engine) void {
-        if (e.n_ops == MAX_OPS) e.flush();
+        // (room kept for the twins' copies out at the batch's end)
+        if (e.n_ops + MAX_TWINS >= MAX_OPS) e.flush();
     }
 
     fn record(e: *Engine, prog: Prog, groups: [3]u32, bufs: []const *Image, params: []const u32, cpu: CpuOp) void {
@@ -1669,13 +1801,19 @@ pub const Engine = struct {
     /// A dispatch of `prog` in the open batch; `writes`: the bindings it
     /// writes (bit i, binding i).
     fn recordProg(e: *Engine, prog: *const gpu.Program, groups: [3]u32, bufs: []const *Image, writes: u32, params: []const u32, cpu: ?CpuOp) void {
-        for (bufs) |img| e.vramIn(img);
+        for (bufs) |img| {
+            e.twinOut(img);
+            e.vramIn(img);
+        }
         e.room();
         const i = e.n_ops;
         for (bufs, 0..) |img, j| {
             e.op_bufs[i][j] = img.buf;
             img.trk().last = e.batch;
-            if (writes & (@as(u32, 1) << @intCast(j)) != 0) gpuWrites(img);
+            if (writes & (@as(u32, 1) << @intCast(j)) != 0) {
+                gpuWrites(img);
+                e.twinStale(img);
+            }
         }
         @memcpy(e.op_params[i][0..params.len], params);
         e.ops[i] = .{ .prog = prog, .groups = groups, .buffers = e.op_bufs[i][0..bufs.len], .params = e.op_params[i][0..params.len] };
@@ -2148,6 +2286,10 @@ pub const Engine = struct {
         const H: f32 = @floatFromInt(t.height);
         const flip = t.top_down;
         const rc = d.rect;
+        // a depth target: the colour targets drawn in their block-linear
+        // twins (Twin)
+        var twin: ?*Twin = null;
+        var ztwin: ?*Twin = null;
         if (if (raster.depthUsed(d)) d.depth else null) |z| {
             if (!e.graphics_depth) {
                 e.stats.compute_draws += 1;
@@ -2155,6 +2297,16 @@ pub const Engine = struct {
                 return null;
             }
             if (!e.gpuUsable(z)) return null;
+            twin = e.twinFor(t) orelse {
+                e.stats.compute_draws += 1;
+                e.sayCompute("a depth target, and no block-linear twin for the colour target (VRAM, or MAX_TWINS)");
+                return null;
+            };
+            ztwin = e.twinFor(z) orelse {
+                e.stats.compute_draws += 1;
+                e.sayCompute("a depth target, and no twin in the RTX's depth layout for it (VRAM, or MAX_TWINS)");
+                return null;
+            };
         }
         // the colour targets past the first: each the output the code
         // writes into it (one it never writes: the compute kernels give it
@@ -2176,6 +2328,17 @@ pub const Engine = struct {
                 return null;
             }
             more[j] = .{ .va = x.img.buf.gpu, .stride = x.img.stride, .format = targetFormatOf(x.img.format), .mask = maskOf(x.img.format, x.keep), .blend = x.blend };
+            if (twin != null) {
+                // (in blocks every target is as wide and high as the first)
+                const xt = if (x.img.width == t.width and x.img.height == t.height) e.twinFor(x.img) else null;
+                const tw = xt orelse {
+                    e.stats.compute_draws += 1;
+                    e.sayCompute("a depth target, and no block-linear twin for a colour target past the first (its size, VRAM, or MAX_TWINS)");
+                    return null;
+                };
+                more[j].?.va = tw.bl.gpu;
+                more[j].?.stride = tw.pitch;
+            }
             more_imgs[j] = x.img;
         }
         // an indexed draw: the engine's index buffer (its vertex reuse, and
@@ -2191,7 +2354,7 @@ pub const Engine = struct {
             .more = more,
             .index = index,
             .depth = if (if (raster.depthUsed(d)) d.depth else null) |z| .{
-                .va = z.buf.gpu,
+                .va = if (ztwin) |zt| zt.bl.gpu else z.buf.gpu,
                 .width = z.width,
                 .height = z.height,
                 .gobs_log2 = z.layout.gobs_log2,
@@ -2203,10 +2366,11 @@ pub const Engine = struct {
                 .back_stencil = if (d.stencil != null) stencilOf(d.stencil_back) else null,
             } else null,
             .vertex = &p.gfx[0].?,
-            .va = t.buf.gpu,
+            .va = if (twin) |tw| tw.bl.gpu else t.buf.gpu,
             .width = t.width,
             .height = t.height,
-            .stride = t.stride,
+            .stride = if (twin) |tw| tw.pitch else t.stride,
+            .blocks = if (twin) |tw| tw.gobs else null,
             .format = targetFormatOf(t.format),
             .mask = maskOf(t.format, d.keep),
             .blend = if (d.blend) |b| blendOf(b) else null,
@@ -2225,7 +2389,7 @@ pub const Engine = struct {
             .cull = d.cull,
             .front_ccw = d.front_ccw != flip,
         };
-        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, d.depth, &more_imgs);
+        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, d.depth, &more_imgs, twin != null);
         e.stats.graphics_draws += 1;
         if (!e.said_graphics) {
             e.said_graphics = true;
@@ -2250,11 +2414,29 @@ pub const Engine = struct {
     /// A draw through the graphics pipeline in the open batch: the pixel
     /// program as its dispatch's, `g` kept beside it; its bindings read,
     /// the target written.
-    fn recordGraphics(e: *Engine, pixel: *const gpu.Program, g: gpu.Graphics, bufs: []const *Image, params: []const u32, target: *Image, depth: ?*Image, more: []const ?*Image) void {
-        for (bufs) |img| e.vramIn(img);
-        e.vramIn(target);
-        if (depth) |z| e.vramIn(z);
-        for (more) |mi| if (mi) |m| e.vramIn(m);
+    /// `twinned`: the colour targets drawn are their block-linear twins.
+    fn recordGraphics(e: *Engine, pixel: *const gpu.Program, g: gpu.Graphics, bufs: []const *Image, params: []const u32, target: *Image, depth: ?*Image, more: []const ?*Image, twinned: bool) void {
+        for (bufs) |img| {
+            e.twinOut(img);
+            e.vramIn(img);
+        }
+        if (depth) |z| {
+            if (twinned) e.twinLoad(z) else {
+                e.twinOut(z);
+                e.vramIn(z);
+            }
+        }
+        if (twinned) {
+            e.twinLoad(target);
+            for (more) |mi| if (mi) |m| e.twinLoad(m);
+        } else {
+            e.twinOut(target);
+            e.vramIn(target);
+            for (more) |mi| if (mi) |m| {
+                e.twinOut(m);
+                e.vramIn(m);
+            };
+        }
         if (e.n_gfx >= e.dev.?.caps.max_graphics) e.flush();
         e.room();
         const i = e.n_ops;
@@ -2264,14 +2446,17 @@ pub const Engine = struct {
         }
         target.trk().last = e.batch;
         gpuWrites(target);
+        e.twinDrawn(target, twinned);
         if (depth) |z| {
             z.trk().last = e.batch;
             gpuWrites(z);
+            e.twinDrawn(z, twinned);
         }
         for (more) |mi| {
             const m = mi orelse continue;
             m.trk().last = e.batch;
             gpuWrites(m);
+            e.twinDrawn(m, twinned);
         }
         @memcpy(e.op_params[i][0..params.len], params);
         e.op_gfx[i] = g;
@@ -2887,6 +3072,7 @@ pub const Engine = struct {
     /// shared beyond the engine (an EGLImage's dma-buf) is one buffer.
     fn fromVram(e: *Engine, img: *Image) void {
         const v = img.vram orelse return;
+        e.dropTwinOf(img, true);
         e.settle(img);
         e.vramOut(img);
         e.freeBytes(v, false, img.track.last);
@@ -2916,6 +3102,7 @@ pub const Engine = struct {
     /// `img`'s VRAM down into its shadow if the GPU wrote it since (the
     /// open batch run and waited for).
     fn vramOut(e: *Engine, img: *Image) void {
+        e.twinOut(img);
         const v = img.vram orelse return;
         const t = img.trk();
         if (!t.shadow_old) return;
@@ -2923,6 +3110,140 @@ pub const Engine = struct {
         e.recordWords(v, 0, img.host, 0, img.host.cpu.len);
         t.last = e.batch;
         e.finish();
+    }
+
+    // ── Block-linear twins (Twin) ──────────────────────────────────────────
+
+    fn twinOf(e: *Engine, img: *const Image) ?*Twin {
+        if (img.buf.gpu == 0) return null;
+        for (&e.twins) |*t| {
+            if (t.bl.gpu != 0 and t.mem.gpu == img.buf.gpu) return t;
+        }
+        return null;
+    }
+
+    /// img's twin, made at its first depth draw (in VRAM, Turing2D's
+    /// blocks of up to 16 GOBs as a depth image's), or null: none to be
+    /// had (the image's kind, VRAM, MAX_TWINS).
+    fn twinFor(e: *Engine, img: *Image) ?*Twin {
+        if (img.samples != 1) return null;
+        // a depth image (newDepthImage's): its twin in the RTX's depth GOBs,
+        // the same blocks; a colour image's in Turing2D's blocks
+        const depth = img.layout.block;
+        if (depth and (img.format != .d24s8 or img.layout.swizzle != .turing2d)) return null;
+        if (!depth and !img.layout.linear()) return null;
+        if (depth and e.ztable.buf.cpu.len == 0) {
+            e.ztable = e.newBuffer(256) orelse return null;
+            var words: [64]u32 = undefined;
+            for (gpu.blackwell_z24, 0..) |t, i| words[i] = @as(u32, t[0]) | @as(u32, t[1]) << 8 | @as(u32, t[2]) << 16 | @as(u32, t[3]) << 24;
+            e.writeBytes(&e.ztable, 0, std.mem.sliceAsBytes(&words));
+        }
+        const row_bytes = img.width * img.format.bytes();
+        const row_words = (row_bytes + 3) / 4;
+        if (e.twinOf(img)) |t| {
+            if (t.depth == depth and t.stride == img.stride and t.rows == img.height and t.row_words == row_words) return t;
+            e.dropTwin(t);
+        }
+        const slot = for (&e.twins) |*t| {
+            if (t.bl.gpu == 0) break t;
+        } else return null;
+        const pitch = if (depth) img.stride else std.mem.alignForward(u32, row_bytes, 64);
+        var gobs: u3 = 0;
+        if (depth) gobs = img.layout.gobs_log2 else while (gobs < 4 and (@as(u32, 8) << gobs) < img.height) gobs += 1;
+        const v = e.dev.?.alloc(blocklinear.planeBytes(pitch, img.height, gobs), .device) catch return null;
+        if (v.gpu == 0) {
+            e.dev.?.free(v);
+            return null;
+        }
+        slot.* = .{ .depth = depth, .width = img.width, .mem = img.buf, .stride = img.stride, .row_words = row_words, .rows = img.height, .bl = v, .pitch = pitch, .gobs = gobs };
+        e.n_twins += 1;
+        return slot;
+    }
+
+    /// Before a depth draw into img's twin: what the CPU wrote of its
+    /// shadow up to VRAM, then the rows into the twin where they are newer.
+    fn twinLoad(e: *Engine, img: *Image) void {
+        e.vramIn(img);
+        const t = e.twinOf(img) orelse return;
+        if (!t.old) return;
+        e.room();
+        e.recordTwin(.twin_in, t);
+        t.old = false;
+        img.trk().last = e.batch;
+    }
+
+    /// img's twin back into its rows where it is newer: before anything
+    /// else uses the image.
+    fn twinOut(e: *Engine, img: *Image) void {
+        const t = e.twinOf(img) orelse return;
+        if (!t.new) return;
+        // (room may end the batch, which takes the twin back itself)
+        e.room();
+        if (t.new) e.recordTwin(.twin_out, t);
+        t.new = false;
+        img.trk().last = e.batch;
+        gpuWrites(img);
+    }
+
+    /// Every twin drawn in the open batch back into its rows, at the
+    /// batch's end (room() keeps MAX_TWINS ops for it): what a window's or
+    /// a dma-buf's reader sees is the rows.
+    fn twinsOut(e: *Engine) void {
+        if (e.lost) return;
+        for (&e.twins) |*t| {
+            if (t.bl.gpu == 0 or !t.new) continue;
+            e.recordTwin(.twin_out, t);
+            t.new = false;
+        }
+    }
+
+    /// img's rows written another way (the CPU, a compute kernel, a draw
+    /// without depth): its twin older.
+    fn twinStale(e: *Engine, img: *const Image) void {
+        const t = e.twinOf(img) orelse return;
+        t.old = true;
+        t.new = false;
+    }
+
+    /// After a draw into img: into its twin (`twinned`), or its rows.
+    fn twinDrawn(e: *Engine, img: *const Image, twinned: bool) void {
+        const t = e.twinOf(img) orelse return;
+        if (twinned) {
+            t.new = true;
+            t.old = false;
+        } else t.old = true;
+    }
+
+    /// img's twin let go (its memory going; or moving: `keep`, what was
+    /// drawn into the twin back into the rows first).
+    fn dropTwinOf(e: *Engine, img: *Image, keep: bool) void {
+        const t = e.twinOf(img) orelse return;
+        if (keep) e.twinOut(img);
+        e.dropTwin(t);
+    }
+
+    fn dropTwin(e: *Engine, t: *Twin) void {
+        e.freeBytes(t.bl, false, e.batch);
+        t.* = .{};
+        e.n_twins -|= 1;
+    }
+
+    /// A twin_in or twin_out dispatch in the open batch (room made).
+    fn recordTwin(e: *Engine, prog_in: Prog, t: *const Twin) void {
+        const i = e.n_ops;
+        const prog: Prog = if (!t.depth) prog_in else if (prog_in == .twin_in) .ztwin_in else .ztwin_out;
+        const gx = ((if (t.depth) t.width else t.row_words) + GROUP - 1) / GROUP;
+        e.op_bufs[i][0] = t.mem;
+        e.op_bufs[i][1] = t.bl;
+        e.op_bufs[i][2] = e.ztable.buf;
+        const nb: usize = if (t.depth) 3 else 2;
+        const p = if (t.depth) [_]u32{ t.pitch, t.gobs, t.width, 0 } else [_]u32{ t.stride, t.row_words, t.pitch, t.gobs };
+        @memcpy(e.op_params[i][0..p.len], &p);
+        e.ops[i] = .{ .prog = &e.progs[@backingInt(prog)], .groups = .{ gx, t.rows, 1 }, .buffers = e.op_bufs[i][0..nb], .params = e.op_params[i][0..p.len] };
+        e.op_cpu[i] = null;
+        e.n_ops += 1;
+        e.stats.dispatches += 1;
+        if (prog_in == .twin_in) e.stats.twins_in += 1 else e.stats.twins_out += 1;
     }
 
     /// A gfx_words dispatch in the open batch: `bytes` (whole words) from
@@ -2948,6 +3269,7 @@ pub const Engine = struct {
     }
 
     fn toDevice(e: *Engine, img: *const Image, off: usize, len: usize) void {
+        e.twinStale(img);
         if (img.vram != null) {
             // (noted: VRAM takes it before the image's next GPU use)
             const t = @constCast(img).trk();
@@ -2975,6 +3297,10 @@ pub const Engine = struct {
 
     fn fromDevice(e: *Engine, img: *const Image, off: usize, len: usize) void {
         if (!e.gpuUsable(img)) return;
+        if (img.vram == null) if (e.twinOf(img)) |t| if (t.new) {
+            e.twinOut(@constCast(img));
+            e.finish();
+        };
         if (img.vram != null) {
             e.vramOut(@constCast(img));
             e.dev.?.fromDevice(img.host, off, len);

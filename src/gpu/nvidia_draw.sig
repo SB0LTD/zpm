@@ -485,6 +485,21 @@ const EH = 32;
 const E_GOBS: u3 = 2;
 const E_PITCH = EW * 4;
 const E_DEPTH_BYTES = (E_PITCH / 64) * ((EH + 31) / 32) * (512 << E_GOBS);
+
+/// Where pixel (x, y) of an EW x EH colour target is: in blocks as the
+/// depth target's (beside a depth target the engine takes colour in
+/// blocks alone: gl3d.sig), or rows of E_PITCH bytes. (EW x EH RGBA8 in
+/// E_GOBS blocks is as many bytes as in rows.)
+/// Depth words two units apart at most: the RTX interpolates depth in
+/// floats and lands up to two units of 2^-24 off the model at some pixels
+/// (measured 11-16); the emulated engine is the model.
+fn depthNear(a: u32, b: u32) bool {
+    return @max(a, b) - @min(a, b) <= 2;
+}
+
+fn colorAt(blocks: bool, x: usize, y: usize) usize {
+    return if (blocks) model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y)) else (y * EW + x) * 4;
+}
 /// The quads, in pixels (x right, y the target's rows), and their
 /// corners' clip z.
 /// `cull`: the faces culled (bit 0 front, bit 1 back), front faces
@@ -611,6 +626,84 @@ pub var edges_depth = true;
 /// caller's, VRAM say, which the CPU does not fill: a fault test only).
 pub var edges_depth_va: u64 = 0;
 
+/// Step 5 replaced by a probe of the depth target's layout (non-null: its
+/// E_DEPTH_BYTES out here), over memory of 0xa5 bytes: z_probe_stencil
+/// false, the whole EW x EH target drawn once, depth ALWAYS and written,
+/// each pixel's depth word (y + 0xc0) << 16 | (x + 0x40) << 8 | 0x80 + x %
+/// 4 + 4 * (y % 8), its stencil 0x3c; true, the first GOB's 16 x 8 pixels
+/// one draw each (scissored), pixel (x, y)'s stencil x + 16 y. Where each
+/// byte lands is the engine's depth layout (nil names Blackwell's for
+/// 24-bit depth BlackwellZ24, and copies none of it).
+pub var z_probe: ?[]u8 = null;
+pub var z_probe_stencil = false;
+
+fn zProbePixel(k: *kir.Kernel) void {
+    const io = k.binding();
+    _ = k.binding();
+    for ([4]f32{ 0.25, 0, 0, 0 }, 0..) |x, c| k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), kir.u(0), kir.f(x));
+    // (pixel centres: x + 1/2; every value below 2^24, exact in f32)
+    const px = k.load(.f32, nvidia_gl.ioMem(io, nvidia_gl.POSITION, false), kir.u(0));
+    const py = k.load(.f32, nvidia_gl.ioMem(io, nvidia_gl.POSITION + 4, false), kir.u(0));
+    const xi = k.cvt(.f32, .u32, .rz, kir.r(px));
+    const yi = k.cvt(.f32, .u32, .rz, kir.r(py));
+    const low = k.op2(.iadd, .u32, kir.r(k.op2(.@"and", .u32, kir.r(xi), kir.u(3))), kir.r(k.op2(.shl, .u32, kir.r(k.op2(.@"and", .u32, kir.r(yi), kir.u(7))), kir.u(2))));
+    const mid = k.op2(.shl, .u32, kir.r(k.op2(.iadd, .u32, kir.r(xi), kir.u(0x40))), kir.u(8));
+    const high = k.op2(.shl, .u32, kir.r(k.op2(.iadd, .u32, kir.r(yi), kir.u(0xc0))), kir.u(16));
+    const zw = k.op2(.@"or", .u32, kir.r(k.op2(.@"or", .u32, kir.r(high), kir.r(mid))), kir.r(k.op2(.iadd, .u32, kir.r(low), kir.u(0x80))));
+    const v = k.cvt(.u32, .f32, .rne, kir.r(zw));
+    k.store(.f32, nvidia_gl.ioMem(io, nvidia_gl.DEPTH_AT, false), kir.u(0), kir.r(k.div(kir.r(v), kir.f(16777215))));
+}
+
+fn zProbe(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, vp: *const gpu.Program, vb: gpu.Buffer, target: gpu.Buffer, depth: gpu.Buffer, out: []u8) void {
+    const nverts = featureVerts(.frag_depth, &F.verts);
+    @memcpy(vb.cpu[0 .. nverts * 16], std.mem.sliceAsBytes(F.verts[0..nverts]));
+    d.toDevice(vb, 0, nverts * 16);
+    var pk = kir.Kernel.init(.{ .insts = &E.insts, .tys = &E.tys }, "z_probe_ps", .{ 1, 1, 1 });
+    zProbePixel(&pk);
+    const pbin = blk: {
+        pk.finish() catch |e| break :blk e;
+        st.asm_work.sched = .{};
+        break :blk nvidia_gl.compileStage(&pk, d.caps, st, .pixel, 0, &E.pcode);
+    } catch |e| return hsay(log, "z probe: the pixel program did not compile ({s})", .{@errorName(e)});
+    const pp = d.load(&pbin) catch |e| return hsay(log, "z probe: the pixel program did not load ({s})", .{@errorName(e)});
+    defer d.unload(&pp);
+    @memset(target.cpu[0 .. EW * EH * 4], 0);
+    d.toDevice(target, 0, EW * EH * 4);
+    @memset(depth.cpu[0..E_DEPTH_BYTES], 0xa5);
+    d.toDevice(depth, 0, E_DEPTH_BYTES);
+    const s = gpu.Graphics.Stencil{ .func = 7, .reference = 0x3c, .fail = .replace, .zfail = .replace, .zpass = .replace };
+    var g = gpu.Graphics{
+        .vertex = vp,
+        .va = target.gpu,
+        .width = EW,
+        .height = EH,
+        .stride = EW * 4,
+        .blocks = E_GOBS,
+        .format = .rgba8,
+        .scale = .{ EW / 2, EH / 2, 0.5 },
+        .offset = .{ EW / 2, EH / 2, 0.5 },
+        .scissor = .{ 0, 0, EW, EH },
+        .count = nverts,
+        .depth = .{ .va = depth.gpu, .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = true, .write = true, .func = 7, .stencil = s },
+    };
+    var n_draws: u32 = 1;
+    if (z_probe_stencil) n_draws = 128;
+    for (0..n_draws) |i| {
+        if (z_probe_stencil) {
+            const x: u32 = @intCast(i % 16);
+            const y: u32 = @intCast(i / 16);
+            g.scissor = .{ x, y, x + 1, y + 1 };
+            g.depth.?.stencil.?.reference = @intCast(i);
+        }
+        const fence = d.run(&.{.{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g }}) catch |e| return hsay(log, "z probe: not sent ({s})", .{@errorName(e)});
+        d.wait(fence, STEP_US) catch |e| return hsay(log, "z probe: did not finish ({s})", .{@errorName(e)});
+    }
+    d.fromDevice(depth, 0, E_DEPTH_BYTES);
+    const n = @min(out.len, E_DEPTH_BYTES);
+    @memcpy(out[0..n], depth.cpu[0..n]);
+    hsay(log, "z probe: {d} bytes of the depth target", .{n});
+}
+
 fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res: *Hardware) void {
     if (!d.caps.graphics) {
         hsay(log, "step 4, edges: the device offers no graphics dispatches: not run", .{});
@@ -678,8 +771,7 @@ fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res:
                 @memset(target.cpu[0 .. EW * EH * 4], 0);
                 d.toDevice(target, 0, EW * EH * 4);
                 for (0..EH) |y| for (0..EW) |x| {
-                    const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
-                    std.mem.writeInt(u32, depth.cpu[at..][0..4], if (pass == 0) 0xff_ffff else E.m.z[y * EW + x], .little);
+                    model3d.zWrite(depth.cpu, E_PITCH, E_GOBS, @intCast(x), @intCast(y), if (pass == 0) 0xff_ffff else E.m.z[y * EW + x]);
                 };
                 d.toDevice(depth, 0, E_DEPTH_BYTES);
                 const g = gpu.Graphics{
@@ -688,6 +780,7 @@ fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res:
                     .width = EW,
                     .height = EH,
                     .stride = EW * 4,
+                    .blocks = if (edges_depth) E_GOBS else null,
                     .format = .rgba8,
                     .blend = add,
                     .scale = .{ vpw[0], vpw[1], 0.5 },
@@ -713,15 +806,16 @@ fn edges(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res:
                 d.fromDevice(depth, 0, E_DEPTH_BYTES);
                 for (0..EH) |y| for (0..EW) |x| {
                     const i = y * EW + x;
-                    const h = hitsOf(target.cpu[i * 4]);
-                    const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
-                    const z = std.mem.readInt(u32, depth.cpu[at..][0..4], .little) & 0xff_ffff;
+                    const h = hitsOf(target.cpu[colorAt(edges_depth, x, y)]);
+                    const z = model3d.zRead(depth.cpu, E_PITCH, E_GOBS, @intCast(x), @intCast(y)) & 0xff_ffff;
                     const mh = E.m.hits[i];
                     if (pass == 0) {
                         want += @intFromBool(mh != 0);
                         drawn += @intFromBool(h != 0);
                         const cov = h != mh;
-                        const dep = !cov and mh != 0 and z != E.m.z[i];
+                        // (the RTX interpolates depth up to two units off
+                        // the model at some pixels: its rounding)
+                        const dep = !cov and mh != 0 and !depthNear(z, E.m.z[i]);
                         cover_apart += @intFromBool(cov);
                         depth_apart += @intFromBool(dep);
                         if ((cov or dep) and listed < 3) {
@@ -1038,6 +1132,7 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
     defer d.free(ibuf);
     @memcpy(ibuf.cpu[0 .. restart_indices.len * 2], std.mem.sliceAsBytes(&restart_indices));
     d.toDevice(ibuf, 0, 64);
+    if (z_probe) |zp| return zProbe(d, st, log, &vp, vb, target, depth, zp);
     for (feature_scenes) |sc| {
         const nverts = featureVerts(sc.kind, &F.verts);
         @memcpy(vb.cpu[0 .. nverts * 16], std.mem.sliceAsBytes(F.verts[0..nverts]));
@@ -1065,8 +1160,7 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
         @memset(target2.cpu[0 .. EW * EH * 4], 0);
         d.toDevice(target2, 0, EW * EH * 4);
         for (0..EH) |y| for (0..EW) |x| {
-            const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
-            std.mem.writeInt(u32, depth.cpu[at..][0..4], 0xff_ffff, .little);
+            model3d.zWrite(depth.cpu, E_PITCH, E_GOBS, @intCast(x), @intCast(y), 0xff_ffff);
         };
         d.toDevice(depth, 0, E_DEPTH_BYTES);
         var g = gpu.Graphics{
@@ -1075,6 +1169,7 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
             .width = EW,
             .height = EH,
             .stride = EW * 4,
+            .blocks = E_GOBS,
             .format = .rgba8,
             .scale = .{ EW / 2, EH / 2, 0.5 },
             .offset = .{ EW / 2, EH / 2, 0.5 },
@@ -1113,17 +1208,16 @@ fn features(d: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, r
         var listed: u32 = 0;
         for (0..EH) |y| for (0..EW) |x| {
             const i = y * EW + x;
-            const got = target.cpu[i * 4 ..][0..4].*;
-            const at = model3d.blAddress(E_PITCH, E_GOBS, @intCast(x * 4), @intCast(y));
-            const w = std.mem.readInt(u32, depth.cpu[at..][0..4], .little);
+            const got = target.cpu[colorAt(true, x, y)..][0..4].*;
+            const w = model3d.zRead(depth.cpu, E_PITCH, E_GOBS, @intCast(x), @intCast(y));
             const mc = F.m.color[i];
             drawn += @intFromBool(!std.mem.allEqual(u8, &got, 0));
             want += @intFromBool(!std.mem.allEqual(u8, &mc, 0));
-            const got2 = target2.cpu[i * 4 ..][0..4].*;
+            const got2 = target2.cpu[colorAt(true, x, y)..][0..4].*;
             const mc2 = F.m.color2[i];
             const color_ok = near(got[0], mc[0]) and near(got[1], mc[1]) and near(got[2], mc[2]) and near(got[3], mc[3]) and
                 near(got2[0], mc2[0]) and near(got2[1], mc2[1]) and near(got2[2], mc2[2]) and near(got2[3], mc2[3]);
-            const z_ok = w & 0xff_ffff == F.m.z[i];
+            const z_ok = depthNear(w & 0xff_ffff, F.m.z[i]);
             const s_ok = w >> 24 == F.m.s[i];
             if (color_ok and z_ok and s_ok) continue;
             apart += 1;
