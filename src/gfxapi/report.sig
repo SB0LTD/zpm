@@ -27,7 +27,7 @@ pub const Kind = enum(u4) { device, missing, link, pipeline, lost, gl_error, che
 
 /// How many lines of each kind a process says (0: no such limit; a usage
 /// line is limited by time instead, one per context every USAGE_US).
-const LIMITS = [_]u8{ 4, 64, 16, 16, 4, 16, 32, 32, 16, 8, 0, 4 };
+const LIMITS = [_]u8{ 4, 64, 16, 16, 4, 16, 32, 32, 16, 8, 0, 24 };
 
 pub var sink: ?*const fn ([]const u8) void = if (builtin.os.tag == .linux and !builtin.is_test) &stderrLine else null;
 

@@ -1137,10 +1137,10 @@ pub const Stats = struct {
     twins_out: u64 = 0,
 };
 
-/// Colour images drawn into beside a depth target on the 3D engine at
-/// once, each with its block-linear twin (a depth draw into one more
-/// stays on the compute kernels).
-pub const MAX_TWINS = 16;
+/// Images with a twin at once (colour and depth: Firefox's WebRender draws
+/// its tiles with depth too); past it the twin used longest ago, holding
+/// nothing its image does not, goes.
+pub const MAX_TWINS = 64;
 
 /// An image's block-linear twin in VRAM: NVIDIA's 3D engine draws beside
 /// a depth target into colour targets in blocks alone (the host driver's
@@ -1168,6 +1168,8 @@ const Twin = struct {
     new: bool = false,
     /// the rows hold pixels the twin does not
     old: bool = true,
+    /// the batch that last drew into it (which twin goes first)
+    used: u64 = 0,
 };
 
 pub const Engine = struct {
@@ -1209,10 +1211,12 @@ pub const Engine = struct {
     /// The block-linear twins of colour images (Twin).
     twins: [MAX_TWINS]Twin = [_]Twin{.{}} ** MAX_TWINS,
     n_twins: u32 = 0,
+    /// why twinFor gave none, last (said once a reason)
+    twin_why: []const u8 = "",
     /// gpu.blackwell_z24 for ztwin's kernels (made at the first depth twin)
     ztable: Image = .{},
     said_graphics: bool = false,
-    said_compute: [8][]const u8 = @splat(""),
+    said_compute: [16][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
     work: []u8 = &.{},
     cpu_work: []u8 = &.{},
@@ -1701,6 +1705,11 @@ pub const Engine = struct {
             len += part.len;
         }
         report.say(.in_flight, "on the GPU then ({d} batch{s} not known done): {s}{s}", .{ e.ran - first + 1, if (e.ran == first) "" else "es", line[0..len], if (all.more != 0) " (and more)" else "" });
+        // (the twins then: their images' memory and their own, a line each)
+        for (e.twins) |t| {
+            if (t.bl.gpu == 0) continue;
+            report.say(.in_flight, "a {s} twin: the image's memory 0x{x} ({d} B, {d} rows of {d} B), the twin's 0x{x} ({d} B){s}{s}", .{ if (t.depth) "depth" else "colour", t.mem.gpu, t.mem.bytes, t.rows, t.stride, t.bl.gpu, t.bl.bytes, if (t.new) ", newer" else "", if (t.old) ", older" else "" });
+        }
     }
 
     /// done_upto moved to the last batch run, if its fence is done.
@@ -2299,12 +2308,14 @@ pub const Engine = struct {
             if (!e.gpuUsable(z)) return null;
             twin = e.twinFor(t) orelse {
                 e.stats.compute_draws += 1;
-                e.sayCompute("a depth target, and no block-linear twin for the colour target (VRAM, or MAX_TWINS)");
+                e.sayCompute("a depth target, and no block-linear twin for the colour target");
+                e.sayCompute(e.twin_why);
                 return null;
             };
             ztwin = e.twinFor(z) orelse {
                 e.stats.compute_draws += 1;
-                e.sayCompute("a depth target, and no twin in the RTX's depth layout for it (VRAM, or MAX_TWINS)");
+                e.sayCompute("a depth target, and no twin in the RTX's depth layout for it");
+                e.sayCompute(e.twin_why);
                 return null;
             };
         }
@@ -3126,12 +3137,15 @@ pub const Engine = struct {
     /// blocks of up to 16 GOBs as a depth image's), or null: none to be
     /// had (the image's kind, VRAM, MAX_TWINS).
     fn twinFor(e: *Engine, img: *Image) ?*Twin {
+        e.twin_why = "multisampled";
         if (img.samples != 1) return null;
         // a depth image (newDepthImage's): its twin in the RTX's depth GOBs,
         // the same blocks; a colour image's in Turing2D's blocks
         const depth = img.layout.block;
+        e.twin_why = "not S8Z24 in Turing2D's blocks, nor rows";
         if (depth and (img.format != .d24s8 or img.layout.swizzle != .turing2d)) return null;
         if (!depth and !img.layout.linear()) return null;
+        e.twin_why = "no memory for the depth layout's table";
         if (depth and e.ztable.buf.cpu.len == 0) {
             e.ztable = e.newBuffer(256) orelse return null;
             var words: [64]u32 = undefined;
@@ -3141,21 +3155,37 @@ pub const Engine = struct {
         const row_bytes = img.width * img.format.bytes();
         const row_words = (row_bytes + 3) / 4;
         if (e.twinOf(img)) |t| {
-            if (t.depth == depth and t.stride == img.stride and t.rows == img.height and t.row_words == row_words) return t;
+            if (t.depth == depth and t.stride == img.stride and t.rows == img.height and t.row_words == row_words) {
+                t.used = e.batch;
+                return t;
+            }
             e.dropTwin(t);
         }
+        e.twin_why = "MAX_TWINS images have one, each used in this batch";
         const slot = for (&e.twins) |*t| {
             if (t.bl.gpu == 0) break t;
-        } else return null;
+        } else blk: {
+            // (none free: the one used longest ago that holds nothing new,
+            // and none this batch uses: a draw's other targets' among them)
+            var lru: ?*Twin = null;
+            for (&e.twins) |*t| {
+                if (t.new or t.used == e.batch) continue;
+                if (lru == null or t.used < lru.?.used) lru = t;
+            }
+            const t = lru orelse return null;
+            e.dropTwin(t);
+            break :blk t;
+        };
         const pitch = if (depth) img.stride else std.mem.alignForward(u32, row_bytes, 64);
         var gobs: u3 = 0;
         if (depth) gobs = img.layout.gobs_log2 else while (gobs < 4 and (@as(u32, 8) << gobs) < img.height) gobs += 1;
+        e.twin_why = "no VRAM for it";
         const v = e.dev.?.alloc(blocklinear.planeBytes(pitch, img.height, gobs), .device) catch return null;
         if (v.gpu == 0) {
             e.dev.?.free(v);
             return null;
         }
-        slot.* = .{ .depth = depth, .width = img.width, .mem = img.buf, .stride = img.stride, .row_words = row_words, .rows = img.height, .bl = v, .pitch = pitch, .gobs = gobs };
+        slot.* = .{ .depth = depth, .width = img.width, .mem = img.buf, .stride = img.stride, .row_words = row_words, .rows = img.height, .bl = v, .pitch = pitch, .gobs = gobs, .used = e.batch };
         e.n_twins += 1;
         return slot;
     }
@@ -3211,6 +3241,7 @@ pub const Engine = struct {
         if (twinned) {
             t.new = true;
             t.old = false;
+            t.used = e.batch;
         } else t.old = true;
     }
 
