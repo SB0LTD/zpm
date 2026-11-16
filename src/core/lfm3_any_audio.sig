@@ -62,6 +62,7 @@ const Programs = struct {
     input: ?Program = null,
     bias: ?Program = null,
     residual: ?Program = null,
+    copy: ?Program = null,
 };
 
 const Matrix = struct { offset: u32, row_bytes: u32, rows: u32, blocks: u32, tensor: u16 };
@@ -119,7 +120,7 @@ pub fn Depth(comptime tensor_capacity: usize) type {
             if (!self.imported and self.weights.bytes != 0) self.dev.free(self.weights);
             self.weights = .{};
             for (&self.k.q80) |*p| self.unload(p);
-            const progs = [_]*?Program{ &self.k.quant, &self.k.norm, &self.k.norm2, &self.k.head, &self.k.attend, &self.k.attend_gated, &self.k.glu, &self.k.input, &self.k.bias, &self.k.residual };
+            const progs = [_]*?Program{ &self.k.quant, &self.k.norm, &self.k.norm2, &self.k.head, &self.k.attend, &self.k.attend_gated, &self.k.glu, &self.k.input, &self.k.bias, &self.k.residual, &self.k.copy };
             for (progs) |p| self.unload(p);
         }
 
@@ -165,6 +166,7 @@ pub fn Depth(comptime tensor_capacity: usize) type {
             try self.build(&self.k.glu, kernels.gluGgml(s, caps));
             try self.build(&self.k.input, kernels.depthInput(s, caps));
             try self.build(&self.k.bias, kernels.addBias(s, caps));
+            try self.build(&self.k.copy, kernels.copy(s, caps));
             try self.build(&self.k.residual, kernels.residual(s, caps, false));
         }
 
@@ -179,15 +181,9 @@ pub fn Depth(comptime tensor_capacity: usize) type {
                     }
                 }
             }
+            // (VRAM without a CPU view: through staging and the copy kernel)
             self.weights = try self.dev.alloc(std.mem.alignForward(u64, size, 16), .device);
-            if (self.weights.cpu.len < size) return error.Unsupported; // (VRAM without a view: as lfm3_any, not yet here)
-            var at: u64 = 0;
-            while (at < size) {
-                const n: usize = @intCast(@min(size - at, 4 << 20));
-                if (!self.file.read(at, self.weights.cpu[@intCast(at)..][0..n])) return error.StorageNotMapped;
-                at += n;
-            }
-            self.dev.toDevice(self.weights, 0, size);
+            try any.fillWeights(self.dev, self.file, self.weights, if (self.k.copy) |*c| c else null, self.work);
         }
 
         fn allocBuffers(self: *Self) Error!void {

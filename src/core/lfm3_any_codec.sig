@@ -253,15 +253,9 @@ pub fn Codec(comptime tensor_capacity: usize) type {
                     }
                 }
             }
+            // (VRAM without a CPU view: through staging and the copy kernel)
             self.weights = try self.dev.alloc(std.mem.alignForward(u64, size, 16), .device);
-            if (self.weights.cpu.len < size) return error.Unsupported; // (VRAM without a view: as lfm3_any_audio, not yet here)
-            var at: u64 = 0;
-            while (at < size) {
-                const n: usize = @intCast(@min(size - at, 4 << 20));
-                if (!self.file.read(at, self.weights.cpu[@intCast(at)..][0..n])) return error.StorageNotMapped;
-                at += n;
-            }
-            self.dev.toDevice(self.weights, 0, size);
+            try any.fillWeights(self.dev, self.file, self.weights, if (self.k.copy) |*c| c else null, self.work);
         }
 
         /// The windows' sections (bytes): conv, keys, values.

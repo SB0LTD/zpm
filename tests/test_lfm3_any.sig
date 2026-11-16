@@ -879,8 +879,21 @@ var audio_index: gguf.Index(AUDIO_CAPACITY) = .{};
 var audio_plan: gen.Plan = .{};
 var depth_work: gen.DepthWorkspace(gen.lfm3_audio_limits) = .{};
 
+/// A discrete GPU's VRAM for the audio parts' weights (the mmproj, 304 MB)
+/// and buffers: none of it has a CPU view (the forwarded RTX's case).
+var audio_vram: [384 << 20]u8 align(4096) = undefined;
+
+/// Caps of a discrete GPU (the RTX's: fused, no import).
+fn discreteCaps() gpu.Caps {
+    var caps = gpu.interp_caps;
+    caps.memory = .discrete;
+    caps.import = false;
+    return caps;
+}
+
 fn depthAgainstCpu(caps: gpu.Caps, src: gguf.Source, tolerance: f64) !void {
     emu = gpu.EmuDevice.init(caps, &mem, &interp_work);
+    if (caps.memory == .discrete) emu.vram = &audio_vram;
     var depth = any_audio.Depth(AUDIO_CAPACITY).init(emu.device(), &audio_plan, &audio_index, src, .{}, &work) catch |e| {
         std.debug.print("depth init: {s}\n", .{@errorName(e)});
         return e;
@@ -949,6 +962,9 @@ test "LFM3-Audio's depthformer on the GPU (when its mmproj is here): projectStat
     caps.mad = .unfused;
     caps.subgroup = 64;
     try depthAgainstCpu(caps, src, 0);
+    // a discrete GPU (the forwarded RTX): the weights staged into VRAM
+    // without a CPU view, through the copy kernel; the CPU's bits still
+    try depthAgainstCpu(discreteCaps(), src, 0);
 }
 
 // ── locate: where the GPU parts from the CPU ────────────────────────────────
