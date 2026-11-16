@@ -1552,6 +1552,24 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("page_region", "src/platform/page_region.sig"),
         },
     });
+    // voicebench: LFM3-Audio's depthformer on the real GPU behind /dev/dxg
+    // (WSL), its weights in VRAM without a CPU view, timed and profiled.
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/voicebench.sig",
+        .output_name = "voicebench",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("gpu", "src/gpu/gpu.sig"),
+            importEntry("dxg", "src/dxg/dxg.sig"),
+            importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
+            importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+            importEntry("lfm3_any_audio", "src/core/lfm3_any_audio.sig"),
+        },
+    });
     // LFM3-Audio's hearing encoder on any GPU (lfm3_any_hear, its kernels in
     // lfm3_kir_hear) against lfm3_audio_encoder; the new kernels on the
     // emulated RTX and Adreno against the interpreter.

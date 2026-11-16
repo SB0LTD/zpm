@@ -29,6 +29,7 @@ pub const Gpu = gpu.Gpu;
 pub const Channel = gpu.Channel;
 pub const VideoChannel = gpu.VideoChannel;
 pub const DxgDevice = device.DxgDevice;
+pub const VramDevice = device.VramDevice;
 
 test {
     _ = kmt;
