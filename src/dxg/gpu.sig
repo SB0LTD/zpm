@@ -508,6 +508,58 @@ pub const Channel = struct {
     }
 };
 
+/// A video engine's channel (NVDEC, NVENC): a legacy context of its own on
+/// the engine's node, fed by submit_command (nv.sig's VideoEngine: NVIDIA's
+/// own decode and encode do so on WSL). The engine is bound on
+/// subchannel 4 by the host; work runs in order, and the host keeps no
+/// fence for it: a pushbuffer ends with the engine's own semaphore release
+/// where its caller wants to see it finish.
+pub const VideoChannel = struct {
+    gpu: *Gpu = undefined,
+    context: kmt.Handle = 0,
+    engine: nv.VideoEngine = .decoder,
+    ctx_data: [nv.VIDEO_CONTEXT_BYTES]u8 = undefined,
+    submit_data: [nv.VIDEO_SUBMIT_BYTES]u8 = undefined,
+
+    pub fn open(c: *VideoChannel, g: *Gpu, e: nv.VideoEngine) Error!void {
+        c.* = .{ .gpu = g, .engine = e };
+        nv.videoContext(&c.ctx_data, e);
+        var cc = kmt.CreateContextVirtual{
+            .device = g.device,
+            .node_ordinal = nv.videoNode(e),
+            .flags = 0,
+            .priv = @intFromPtr(&c.ctx_data),
+            .priv_size = nv.VIDEO_CONTEXT_BYTES,
+            .client_hint = 1,
+        };
+        _ = try kmt.call(g.fd, .create_context_virtual, &cc);
+        c.context = cc.context;
+    }
+
+    /// Runs `dwords` of pushbuffer at GPU address `va` (memory the GPU
+    /// maps for this device).
+    pub fn submit(c: *VideoChannel, va: u64, dwords: u32) Error!void {
+        nv.videoSubmit(&c.submit_data, va, dwords);
+        var s = kmt.SubmitCommand{
+            .command_buffer = va,
+            .command_length = dwords * 4,
+            .broadcast_context_count = 1,
+            .priv = @intFromPtr(&c.submit_data),
+            .priv_size = nv.VIDEO_SUBMIT_BYTES,
+        };
+        s.broadcast_context[0] = c.context;
+        fullFence();
+        _ = try kmt.call(c.gpu.fd, .submit_command, &s);
+    }
+
+    pub fn close(c: *VideoChannel) void {
+        if (c.context == 0 or c.gpu.fd < 0) return;
+        var d = kmt.DestroyContext{ .context = c.context };
+        _ = kmt.call(c.gpu.fd, .destroy_context, &d) catch {};
+        c.context = 0;
+    }
+};
+
 var fence_word: u32 = 0;
 /// A full barrier: the ring's entries are in memory before the doorbell.
 fn fullFence() void {

@@ -268,6 +268,43 @@ pub fn main(init: std.process.Init) void {
     const mode: []const u8 = if (argv.len < 2) "" else std.mem.span(argv[1]);
     if (std.mem.eql(u8, mode, "bisect3d")) bisect3d(ring, client);
     if (std.mem.eql(u8, mode, "bench3d")) bench3d();
+    // ("vengine dec|enc SUBCH METHOD VALUE ...": those methods on a video
+    // engine's own channel (dxg.VideoChannel: its legacy context, through
+    // submit_command), then a look at the semaphore word ("hi", "lo": its
+    // address's halves) for 2 s)
+    if (std.mem.eql(u8, mode, "vengine") and argv.len > 2) {
+        const e: dxg.nv.VideoEngine = if (std.mem.eql(u8, std.mem.span(argv[2]), "enc")) .encoder else .decoder;
+        var vc: dxg.VideoChannel = .{};
+        vc.open(&g, e) catch |err| {
+            out("vengine: no context ({s}, status {d})\n", .{ @errorName(err), dxg.kmt.last_status });
+            linux.exit(3);
+        };
+        sem.* = 0;
+        var nw: u32 = 0;
+        var ai: usize = 3;
+        while (ai + 2 < argv.len) : (ai += 3) {
+            const s = std.fmt.parseInt(u32, std.mem.span(argv[ai]), 16) catch 0;
+            const m = std.fmt.parseInt(u32, std.mem.span(argv[ai + 1]), 16) catch 0;
+            const vs = std.mem.span(argv[ai + 2]);
+            const sem_va = r.va + 0x8_0000;
+            const v = if (std.mem.eql(u8, vs, "hi")) @as(u32, @truncate(sem_va >> 32)) else if (std.mem.eql(u8, vs, "lo")) @as(u32, @truncate(sem_va)) else std.fmt.parseInt(u32, vs, 16) catch 0;
+            pb[0x800 + nw] = push.header(s, m, 1);
+            pb[0x801 + nw] = v;
+            nw += 2;
+        }
+        vc.submit(r.va + 0x2000, nw) catch |err| {
+            out("vengine: not sent ({s}, status {d})\n", .{ @errorName(err), dxg.kmt.last_status });
+            linux.exit(3);
+        };
+        const tv = nowUs();
+        while (sem.* == 0 and nowUs() - tv < 2_000_000) {}
+        out("vengine {s}: context {x}, {d} methods sent; the semaphore word 0x{x} after {d} us\n", .{ @tagName(e), vc.context, nw / 2, sem.*, nowUs() - tv });
+        if (g.fault()) |pf| out("   the device: execution state {d}, page fault at 0x{x} (stage {d}, flags 0x{x}, code 0x{x})\n", .{ pf.execution, pf.va, pf.stage, pf.flags, pf.code });
+        vc.close();
+        ch.close();
+        g.close();
+        linux.exit(if (sem.* != 0) 0 else 3);
+    }
     // ("vprobe SUBCH METHOD VALUE ...": those methods (hex) on the channel,
     // one each, then the host's fence: whether the channel's engine takes
     // them; a video engine's own channel (DXGTEST_NODE, _CTXDATA,

@@ -27,6 +27,7 @@ pub const fwd_server = @import("fwd_server.sig");
 
 pub const Gpu = gpu.Gpu;
 pub const Channel = gpu.Channel;
+pub const VideoChannel = gpu.VideoChannel;
 pub const DxgDevice = device.DxgDevice;
 
 test {

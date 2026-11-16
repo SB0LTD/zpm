@@ -16,6 +16,38 @@ const gpu = @import("gpu.sig");
 
 pub const MAX_MAPS = 4096;
 
+/// A video channel's fence pushbuffers: 64 KiB of its ring memory, slots of
+/// 32 bytes (a submission's fence is read by the engine after the guest's
+/// work: one slot a submission, reused 2048 submissions on).
+pub const VIDEO_FENCE_BYTES = 64 << 10;
+pub const VIDEO_FENCE_SLOT = 32;
+
+/// A video engine's fence: its semaphore release of `value` (32 bits) at
+/// `va` (NVDEC's and NVENC's SEMAPHORE_A..C and SEMAPHORE_D: release, one
+/// word), on subchannel 4.
+pub fn videoFence(va: u64, value: u32) [8]u32 {
+    const sub = @import("nv.sig").VIDEO_SUBCH;
+    return .{
+        hdr(sub, 0x240), @truncate(va >> 32),
+        hdr(sub, 0x244), @truncate(va),
+        hdr(sub, 0x248), value,
+        hdr(sub, 0x304), 0,
+    };
+}
+
+fn hdr(sub: u32, method: u32) u32 {
+    return (1 << 29) | (1 << 16) | (sub << 13) | (method >> 2);
+}
+
+test "fwd_server: a video channel's fence pushbuffer" {
+    const w = videoFence(0x40_0000_1008, 7);
+    try std.testing.expectEqual(@as(u32, 0x2001_8090), w[0]);
+    try std.testing.expectEqual(@as(u32, 0x40), w[1]);
+    try std.testing.expectEqual(@as(u32, 0x1008), w[3]);
+    try std.testing.expectEqual(@as(u32, 7), w[5]);
+    try std.testing.expectEqual(@as(u32, 0x2001_80c1), w[6]);
+}
+
 /// Guest-physical memory as this process's (null: not guest RAM, or not one
 /// piece).
 pub const Guest = struct {
@@ -32,6 +64,13 @@ pub const Server = struct {
     status: gpu.Region = .{},
     chans: [fwd.MAX_CHANNELS]gpu.Channel = undefined,
     open: [fwd.MAX_CHANNELS]bool = [_]bool{false} ** fwd.MAX_CHANNELS,
+    /// A video channel's (fwd.Engine.decoder, .encoder): its engine's own
+    /// context (gpu.VideoChannel), the ring memory's first page mapped for
+    /// the fence pushbuffers written after each submission, the last fence.
+    video: [fwd.MAX_CHANNELS]bool = [_]bool{false} ** fwd.MAX_CHANNELS,
+    vchans: [fwd.MAX_CHANNELS]gpu.VideoChannel = undefined,
+    vfence_pb: [fwd.MAX_CHANNELS]gpu.Region = [_]gpu.Region{.{}} ** fwd.MAX_CHANNELS,
+    vfence: [fwd.MAX_CHANNELS]u32 = [_]u32{0} ** fwd.MAX_CHANNELS,
     maps: [MAX_MAPS]gpu.Region = [_]gpu.Region{.{}} ** MAX_MAPS,
     /// Requests served, submissions, and the last refusal (for the log).
     served: u64 = 0,
@@ -59,7 +98,7 @@ pub const Server = struct {
             .status_page => s.statusPage(r),
             .map => s.map(r),
             .unmap => s.unmap(r),
-            .open => s.openChannel(),
+            .open => s.openChannel(r.a),
             .close => s.closeChannel(r.chan),
             .submit => s.submit(r),
             .state => s.state(r.chan),
@@ -133,12 +172,15 @@ pub const Server = struct {
         return fail(.invalid);
     }
 
-    fn openChannel(s: *Server) fwd.Response {
+    fn openChannel(s: *Server, engine: u64) fwd.Response {
         if (s.status_va == 0) return fail(.invalid);
+        const want: fwd.Engine = @enumFromInt(engine);
+        if (want != .graphics and want != .decoder and want != .encoder) return fail(.invalid);
         var k: u32 = 1;
         while (k < fwd.MAX_CHANNELS) : (k += 1) {
             if (s.open[k]) continue;
             const ring: []align(4096) u8 = @alignCast(s.rings[k * gpu.RING_BYTES ..][0..gpu.RING_BYTES]);
+            if (want != .graphics) return s.openVideo(k, ring, if (want == .decoder) .decoder else .encoder);
             s.chans[k].open(s.gpu, ring, .{ .name = "galaxy-vm", .notify = s.status_va + fwd.fenceOffset(k) }) catch |e| {
                 s.say("fwd: channel {d}: {s}", .{ k, @errorName(e) });
                 return fail(.refused);
@@ -151,16 +193,69 @@ pub const Server = struct {
         return fail(.busy);
     }
 
+    /// Channel `k` a video engine's: its context, and a page of the ring
+    /// memory (unused by it otherwise) for the fence pushbuffers.
+    fn openVideo(s: *Server, k: u32, ring: []align(4096) u8, e: @import("nv.sig").VideoEngine) fwd.Response {
+        s.vchans[k].open(s.gpu, e) catch |err| {
+            s.say("fwd: channel {d} ({s}): {s}", .{ k, @tagName(e), @errorName(err) });
+            return fail(.refused);
+        };
+        s.vfence_pb[k] = s.gpu.mapSystem(ring[0..VIDEO_FENCE_BYTES]) catch |err| {
+            s.vchans[k].close();
+            s.say("fwd: channel {d} ({s}): its fence page: {s}", .{ k, @tagName(e), @errorName(err) });
+            return fail(.refused);
+        };
+        s.vfence[k] = 0;
+        s.open[k] = true;
+        s.video[k] = true;
+        s.told[k] = false;
+        s.say("fwd: channel {d} open: the video {s}", .{ k, @tagName(e) });
+        return .{ .chan = k };
+    }
+
     fn channel(s: *Server, k: u32) ?*gpu.Channel {
-        if (k == 0 or k >= fwd.MAX_CHANNELS or !s.open[k]) return null;
+        if (k == 0 or k >= fwd.MAX_CHANNELS or !s.open[k] or s.video[k]) return null;
         return &s.chans[k];
     }
 
     fn closeChannel(s: *Server, k: u32) fwd.Response {
+        if (k != 0 and k < fwd.MAX_CHANNELS and s.open[k] and s.video[k]) {
+            s.closeVideo(k);
+            return .{};
+        }
         const c = s.channel(k) orelse return fail(.invalid);
         c.close();
         s.open[k] = false;
         return .{};
+    }
+
+    fn closeVideo(s: *Server, k: u32) void {
+        s.vchans[k].close();
+        s.gpu.release(s.vfence_pb[k]);
+        s.vfence_pb[k] = .{};
+        s.open[k] = false;
+        s.video[k] = false;
+    }
+
+    /// A video channel's submission: the guest's pushbuffer, then the fence
+    /// (the engine's semaphore release of the channel's next fence to its
+    /// word in the status page, on subchannel 4: the host's own binding of
+    /// the engine, beside the guest's on 0), each a submit_command.
+    fn submitVideo(s: *Server, k: u32, r: fwd.Request) fwd.Response {
+        s.vchans[k].submit(r.a, @intCast(r.b)) catch {
+            s.say("fwd: channel {d} (video): submit refused, status {d}", .{ k, @import("kmt.sig").last_status });
+            return fail(.refused);
+        };
+        s.vfence[k] +%= 1;
+        const f = s.vfence[k];
+        const slot = f % (VIDEO_FENCE_BYTES / VIDEO_FENCE_SLOT);
+        const pb: [*]volatile u32 = @ptrCast(@alignCast(s.vfence_pb[k].cpu.ptr + slot * VIDEO_FENCE_SLOT));
+        const at = s.status_va + fwd.fenceOffset(k);
+        const words = videoFence(at, f);
+        for (words, 0..) |w, i| pb[i] = w;
+        s.vchans[k].submit(s.vfence_pb[k].va + slot * VIDEO_FENCE_SLOT, words.len) catch return fail(.refused);
+        s.submits += 1;
+        return .{ .chan = k, .a = f };
     }
 
     /// Channel `k` found lost: what dxgkrnl says of it, in the log (once).
@@ -174,6 +269,10 @@ pub const Server = struct {
     }
 
     fn submit(s: *Server, r: fwd.Request) fwd.Response {
+        if (r.chan != 0 and r.chan < fwd.MAX_CHANNELS and s.open[r.chan] and s.video[r.chan]) {
+            if (r.b == 0 or r.b > 0x1f_ffff or r.a < fwd.WINDOW_START or r.a >= fwd.WINDOW_END) return fail(.invalid);
+            return s.submitVideo(r.chan, r);
+        }
         const c = s.channel(r.chan) orelse return fail(.invalid);
         if (c.lost()) {
             s.sayLost(r.chan);
@@ -186,6 +285,12 @@ pub const Server = struct {
     }
 
     fn state(s: *Server, k: u32) fwd.Response {
+        if (k != 0 and k < fwd.MAX_CHANNELS and s.open[k] and s.video[k]) {
+            // (the host keeps no fence of a video channel's: its word in
+            // the status page is the one; no loss is seen from here)
+            const w: u32 = if (s.status.cpu.len >= fwd.fenceOffset(k) + 4) std.mem.readInt(u32, s.status.cpu[fwd.fenceOffset(k)..][0..4], .little) else 0;
+            return .{ .chan = k, .a = w };
+        }
         const c = s.channel(k) orelse return fail(.invalid);
         if (c.lost()) s.sayLost(k);
         return .{ .chan = k, .a = c.completed(), .b = @intFromBool(c.lost()) };
@@ -195,6 +300,10 @@ pub const Server = struct {
     pub fn reset(s: *Server) void {
         for (&s.open, 0..) |*o, k| {
             if (!o.*) continue;
+            if (s.video[k]) {
+                s.closeVideo(@intCast(k));
+                continue;
+            }
             s.chans[k].close();
             o.* = false;
         }
