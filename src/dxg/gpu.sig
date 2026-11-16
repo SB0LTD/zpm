@@ -85,6 +85,10 @@ pub const Options = struct {
     index: u32 = 0,
 };
 
+/// A context's private data at most (NVIDIA's video contexts' are 3569
+/// bytes, its CUDA contexts' CONTEXT_BYTES).
+pub const MAX_CONTEXT_BYTES = 4096;
+
 pub const ChannelOptions = struct {
     name: []const u8 = "zpm",
     engine: Engine = .graphics_compute,
@@ -101,8 +105,13 @@ pub const ChannelOptions = struct {
     notify: u64 = 0,
     /// The context's private data as it is (another driver's, recorded),
     /// instead of nv.context's; and the call's flags (0: ours).
-    context_data: ?*const [nv.CONTEXT_BYTES]u8 = null,
+    context_data: ?[]const u8 = null,
     context_flags: u32 = 0,
+    /// The node the context is on, instead of `engine`'s (the host's
+    /// numbering: NVIDIA's video contexts are on nodes of their own).
+    node: ?u32 = null,
+    /// create_hw_queue's flags (NVIDIA's CUDA queues 1, its encoder's 0).
+    queue_flags: u32 = 1,
 };
 
 /// Memory the GPU maps: its GPU address, the CPU's view (empty for video
@@ -337,7 +346,7 @@ pub const Channel = struct {
     put: u64 = 0,
     /// The last submission's fence.
     fence: u64 = 0,
-    ctx_data: [nv.CONTEXT_BYTES]u8 = undefined,
+    ctx_data: [MAX_CONTEXT_BYTES]u8 = undefined,
     queue_data: [nv.QUEUE_BYTES]u8 = undefined,
     submit_data: [nv.SUBMIT_BYTES]u8 = undefined,
 
@@ -346,13 +355,18 @@ pub const Channel = struct {
     pub fn open(c: *Channel, g: *Gpu, ring_memory: []align(4096) u8, opts: ChannelOptions) Error!void {
         c.* = .{ .gpu = g, .notify = opts.notify };
         errdefer c.close();
-        if (opts.context_data) |cd| c.ctx_data = cd.* else nv.context(&c.ctx_data, opts.name, opts.client);
+        var ctx_len: u32 = nv.CONTEXT_BYTES;
+        if (opts.context_data) |cd| {
+            if (cd.len > MAX_CONTEXT_BYTES) return error.BadMemory;
+            @memcpy(c.ctx_data[0..cd.len], cd);
+            ctx_len = @intCast(cd.len);
+        } else nv.context(c.ctx_data[0..nv.CONTEXT_BYTES], opts.name, opts.client);
         var cc = kmt.CreateContextVirtual{
             .device = g.device,
-            .node_ordinal = @intFromEnum(opts.engine),
+            .node_ordinal = opts.node orelse @intFromEnum(opts.engine),
             .flags = if (opts.context_flags != 0) opts.context_flags else kmt.CONTEXT_DISABLE_GPU_TIMEOUT | kmt.CONTEXT_HW_QUEUE_SUPPORTED,
             .priv = @intFromPtr(&c.ctx_data),
-            .priv_size = nv.CONTEXT_BYTES,
+            .priv_size = ctx_len,
             .client_hint = opts.client,
         };
         _ = try kmt.call(g.fd, .create_context_virtual, &cc);
@@ -363,7 +377,7 @@ pub const Channel = struct {
         nv.queue(&c.queue_data, opts.engines, c.ring.va, GPFIFO_BYTES, c.ring.handle);
         var hq = kmt.CreateHwQueue{
             .context = c.context,
-            .flags = 1,
+            .flags = opts.queue_flags,
             .priv_size = nv.QUEUE_BYTES,
             .priv = @intFromPtr(&c.queue_data),
         };

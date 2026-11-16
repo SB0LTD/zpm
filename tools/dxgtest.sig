@@ -123,16 +123,20 @@ fn openAll(ring: []align(4096) u8, client: u32) void {
         out("dxgtest: open: {s} (call {x}, status {d})\n", .{ @errorName(e), dxg.kmt.last_nr, dxg.kmt.last_status });
         linux.exit(1);
     };
-    ch.open(&g, ring, .{ .name = "zpm-dxgtest", .client = client, .engines = engines, .context_data = if (ctx_loaded) &ctx_data else null, .context_flags = ctx_flags }) catch |e| {
+    ch.open(&g, ring, .{ .name = "zpm-dxgtest", .client = client, .engines = engines, .context_data = if (ctx_len != 0) ctx_data[0..ctx_len] else null, .context_flags = ctx_flags, .node = node, .queue_flags = queue_flags }) catch |e| {
         out("dxgtest: channel: {s} (call {x}, status {d})\n", .{ @errorName(e), dxg.kmt.last_nr, dxg.kmt.last_status });
         linux.exit(1);
     };
 }
 var engines: u32 = 0;
-/// DXGTEST_CTXDATA=file: the context's private data as recorded (3200
-/// bytes), DXGTEST_CTXFLAGS=hex: the call's flags.
-var ctx_data: [dxg.nv.CONTEXT_BYTES]u8 = undefined;
-var ctx_loaded = false;
+/// DXGTEST_CTXDATA=file: the context's private data as recorded (any
+/// length up to MAX_CONTEXT_BYTES), DXGTEST_CTXFLAGS=hex: the call's
+/// flags; DXGTEST_NODE=n: the context's node; DXGTEST_QFLAGS=hex: the
+/// queue's flags.
+var ctx_data: [dxg.gpu.MAX_CONTEXT_BYTES]u8 = undefined;
+var ctx_len: usize = 0;
+var node: ?u32 = null;
+var queue_flags: u32 = 1;
 /// DXGTEST_PRELUDE=file ((method, value) u32 pairs; DXGTEST_FROM / _TO:
 /// the part sent): gl3d.prelude.
 var prelude_buf: [2048][2]u32 = undefined;
@@ -166,7 +170,8 @@ fn loadCtx(path: [*:0]const u8) void {
     const fd: isize = @bitCast(linux.open(path, .{ .ACCMODE = .RDONLY }, 0));
     if (fd < 0) return;
     defer _ = linux.close(@intCast(fd));
-    if (linux.read(@intCast(fd), &ctx_data, ctx_data.len) == ctx_data.len) ctx_loaded = true;
+    ctx_len = linux.read(@intCast(fd), &ctx_data, ctx_data.len);
+    if (ctx_len > ctx_data.len) ctx_len = 0;
 }
 var dev: dxg.DxgDevice = undefined;
 var adapter: gpu.nvidia_device.Adapter = .{};
@@ -188,6 +193,8 @@ pub fn main(init: std.process.Init) void {
         if (std.mem.startsWith(u8, kv, "DXGTEST_ENGINES=")) engines = std.fmt.parseInt(u32, kv[16..], 16) catch engines;
         if (std.mem.startsWith(u8, kv, "DXGTEST_CTXDATA=")) loadCtx(@ptrCast(kv[16..].ptr));
         if (std.mem.startsWith(u8, kv, "DXGTEST_CTXFLAGS=")) ctx_flags = std.fmt.parseInt(u32, kv[17..], 16) catch 0;
+        if (std.mem.startsWith(u8, kv, "DXGTEST_NODE=")) node = std.fmt.parseInt(u32, kv[13..], 10) catch null;
+        if (std.mem.startsWith(u8, kv, "DXGTEST_QFLAGS=")) queue_flags = std.fmt.parseInt(u32, kv[15..], 16) catch 1;
         if (std.mem.startsWith(u8, kv, "DXGTEST_PRELUDE=")) loadPrelude(@ptrCast(kv[16..].ptr));
         if (std.mem.startsWith(u8, kv, "DXGTEST_POSTLUDE=")) loadPostlude(@ptrCast(kv[17..].ptr));
         if (std.mem.startsWith(u8, kv, "DXGTEST_FROM=")) prelude_from = std.fmt.parseInt(usize, kv[13..], 10) catch 0;
@@ -261,6 +268,66 @@ pub fn main(init: std.process.Init) void {
     const mode: []const u8 = if (argv.len < 2) "" else std.mem.span(argv[1]);
     if (std.mem.eql(u8, mode, "bisect3d")) bisect3d(ring, client);
     if (std.mem.eql(u8, mode, "bench3d")) bench3d();
+    // ("vprobe SUBCH METHOD VALUE ...": those methods (hex) on the channel,
+    // one each, then the host's fence: whether the channel's engine takes
+    // them; a video engine's own channel (DXGTEST_NODE, _CTXDATA,
+    // _CTXFLAGS, _QFLAGS, _ENGINES) answers with its fence, a channel with
+    // no such engine is lost)
+    if (std.mem.eql(u8, mode, "vprobe")) {
+        sem.* = 0;
+        var nw: u32 = 0;
+        var ai: usize = 2;
+        while (ai + 2 < argv.len) : (ai += 3) {
+            const s = std.fmt.parseInt(u32, std.mem.span(argv[ai]), 16) catch 0;
+            const m = std.fmt.parseInt(u32, std.mem.span(argv[ai + 1]), 16) catch 0;
+            // ("hi", "lo": the semaphore word's GPU address, its halves)
+            const vs = std.mem.span(argv[ai + 2]);
+            const sem_va = r.va + 0x8_0000;
+            const v = if (std.mem.eql(u8, vs, "hi")) @as(u32, @truncate(sem_va >> 32)) else if (std.mem.eql(u8, vs, "lo")) @as(u32, @truncate(sem_va)) else std.fmt.parseInt(u32, vs, 16) catch 0;
+            pb[0x400 + nw] = push.header(s, m, 1);
+            pb[0x401 + nw] = v;
+            nw += 2;
+        }
+        const vf = ch.submit(r.va + 0x1000, nw) catch |e| {
+            out("vprobe: not sent ({s}, status {d})\n", .{ @errorName(e), dxg.kmt.last_status });
+            linux.exit(3);
+        };
+        const tv = nowUs();
+        while (ch.progress.* < vf and nowUs() - tv < 2_000_000) {}
+        const done = ch.progress.* >= vf and ch.progress.* < 0x4000_0000;
+        out("vprobe: {d} methods, fence {d}: progress {d} after {d} us: {s}; the semaphore word 0x{x}\n", .{ nw / 2, vf, ch.progress.*, nowUs() - tv, if (done) "TAKEN" else "NOT TAKEN", sem.* });
+        if (!done) if (g.fault()) |pf| out("   the device: execution state {d}, page fault at 0x{x} (stage {d}, flags 0x{x}, code 0x{x})\n", .{ pf.execution, pf.va, pf.stage, pf.flags, pf.code });
+        ch.close();
+        g.close();
+        linux.exit(if (done) 0 else 3);
+    }
+    // ("nodes": each of the adapter's nodes, KMTQAITYPE_NODEMETADATA:
+    // its engine type, DXGK_ENGINE_TYPE: 1 3D, 2 video decode, 3 video
+    // encode, 4 video processing, 6 copy; and its name)
+    if (std.mem.eql(u8, mode, "nodes")) {
+        var ni: u32 = 0;
+        while (ni < 16) : (ni += 1) {
+            var md: [96]u8 = @splat(0);
+            var ok = false;
+            for ([_]u32{ 76, 78, 80, 84, 88 }) |size| {
+                @memset(&md, 0);
+                std.mem.writeInt(u32, md[0..4], ni, .little);
+                var q = dxg.kmt.QueryAdapterInfo{ .adapter = g.adapter, .type = 24, .data = @intFromPtr(&md), .size = size };
+                if (dxg.kmt.call(g.fd, .query_adapter_info, &q)) |_| {
+                    ok = true;
+                    break;
+                } else |e| out("node {d}, {d} bytes: {s} (status {d})\n", .{ ni, size, @errorName(e), dxg.kmt.last_status });
+            }
+            if (!ok) break;
+            var name: [32]u8 = undefined;
+            for (&name, 0..) |*c, k| c.* = md[8 + 2 * k];
+            const end = std.mem.indexOfScalar(u8, &name, 0) orelse name.len;
+            out("node {d}: engine type {d}, '{s}', flags 0x{x}\n", .{ ni, std.mem.readInt(u32, md[4..8], .little), name[0..end], std.mem.readInt(u32, md[72..76], .little) });
+        }
+        ch.close();
+        g.close();
+        return;
+    }
     if (std.mem.eql(u8, mode, "draw")) {
         // 4. the 3D engine (the rasteriser), step by step, each pass's
         // pixels compared with the CPU reference's
