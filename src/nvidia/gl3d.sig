@@ -33,6 +33,13 @@
 //! buffers are not memory its depth unit takes (NVIDIA's own D3D12 depth
 //! surfaces are allocations of another type: 0x8012, format 0x17). Galaxy's
 //! GL keeps depth draws on the compute kernels there (GALAXY_GL_3D_DEPTH=0).
+//! Later the same day: NVIDIA's own depth allocation (its D3D12 driver's,
+//! made from the recorded private data: dxgtest `draw edges blobdepth`)
+//! faults the same way, and so does every depth method NVIDIA sends set as
+//! it sends them (below): not the memory, not the documented state. Left:
+//! what that driver does to its context at creation, most likely binding
+//! zcull's context-switch storage (an escape), without which the engine
+//! writes zcull's state to address 0.
 //! The depth state below is NVIDIA's D3D12 driver's for D24S8 (format, layer,
 //! compression, sparse). The emulated engine (emu3d) runs all of it.
 //!
@@ -135,6 +142,12 @@ pub const SET_ZT_SIZE_A: u32 = 0x1228; // width, height, third dimension
 pub const SET_ZT_LAYER: u32 = 0x179c;
 pub const SET_Z_COMPRESSION: u32 = 0x19cc;
 pub const SET_ZT_SPARSE: u32 = 0x1208;
+/// The stencil's compression, depth and stencil read only (both off), a
+/// colour target drawn as the depth surface (off): NVIDIA's D3D12 driver
+/// sends each with a depth target (11-16).
+pub const SET_STENCIL_COMPRESSION: u32 = 0x111c;
+pub const SET_ZT_READ_ONLY: u32 = 0x07f8;
+pub const SET_COLOR_RENDER_TO_ZETA_SURFACE: u32 = 0x02b8;
 /// SET_ZT_FORMAT: S8Z24 (depth in bits 0..23, stencil 24..31: GL's
 /// DEPTH24_STENCIL8 as the engine keeps it; Mesa's Z24_UNORM_S8_UINT).
 /// Blackwell's value (clcd97.h: V_S8Z24 0x16, V_Z24S8 0x14; what NVIDIA's
@@ -314,6 +327,9 @@ pub fn emit(p: *Push, d: *const Draw) void {
         many(p, SET_ZT_SIZE_A, &.{ z.width, z.height, 0x1_0001 });
         one(p, SET_ZT_LAYER, 0);
         one(p, SET_Z_COMPRESSION, 0);
+        one(p, SET_STENCIL_COMPRESSION, 0);
+        one(p, SET_ZT_READ_ONLY, 0);
+        one(p, SET_COLOR_RENDER_TO_ZETA_SURFACE, 0);
         one(p, SET_ZT_SPARSE, 0);
         one(p, gr.SET_ZT_SELECT, 1);
         one(p, gr.SET_DEPTH_TEST, @intFromBool(z.tested));

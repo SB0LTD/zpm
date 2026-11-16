@@ -222,6 +222,22 @@ pub fn main(init: std.process.Init) void {
         const edges = argv.len > 2 and std.mem.eql(u8, std.mem.span(argv[2]), "edges");
         // ("draw edges nodepth": step 4's draws without their depth target)
         if (argv.len > 3 and std.mem.eql(u8, std.mem.span(argv[3]), "nodepth")) gpu.nvidia_draw.edges_depth = false;
+        // ("draw edges blobdepth FILE": step 4's depth target an allocation
+        // made with NVIDIA's private data from FILE: its D3D12 driver's
+        // depth surface, recorded)
+        if (argv.len > 4 and std.mem.eql(u8, std.mem.span(argv[3]), "blobdepth")) {
+            var data: [dxg.nv.ALLOCATION_BYTES]u8 = undefined;
+            const fd: isize = @bitCast(linux.open(argv[4], .{ .ACCMODE = .RDONLY }, 0));
+            if (fd < 0) linux.exit(1);
+            const got = linux.read(@intCast(fd), &data, data.len);
+            if (got != data.len) linux.exit(1);
+            const z = g.allocWith(&data, 0x80000, null) catch |e| {
+                out("blobdepth: {s} (status {d})\n", .{ @errorName(e), dxg.kmt.last_status });
+                linux.exit(1);
+            };
+            out("blobdepth: allocation at 0x{x}\n", .{z.va});
+            gpu.nvidia_draw.edges_depth_va = z.va;
+        }
         // ("draw edges vramdepth": step 4's depth target in VRAM)
         if (argv.len > 3 and std.mem.eql(u8, std.mem.span(argv[3]), "vramdepth")) {
             const z = g.allocVideo(1 << 20) catch linux.exit(1);

@@ -203,6 +203,19 @@ pub const Gpu = struct {
     fn create(g: *Gpu, memory: nv.Memory, sysmem: ?[]u8, bytes: u64, at: ?u64) Error!Region {
         if (bytes == 0 or bytes % nv.ALLOCATION_UNIT != 0) return error.BadMemory;
         nv.allocation(&g.alloc_data, memory, bytes);
+        return g.createAs(sysmem, bytes, at);
+    }
+
+    /// An allocation with NVIDIA's private data `data` as it is (a
+    /// surface of a kind the linear buffers are not: a depth target, from
+    /// a recording), `bytes` of it mapped at `at`.
+    pub fn allocWith(g: *Gpu, data: []const u8, bytes: u64, at: ?u64) Error!Region {
+        if (data.len != nv.ALLOCATION_BYTES or bytes == 0 or bytes % nv.ALLOCATION_UNIT != 0) return error.BadMemory;
+        @memcpy(&g.alloc_data, data);
+        return g.createAs(null, bytes, at);
+    }
+
+    fn createAs(g: *Gpu, sysmem: ?[]u8, bytes: u64, at: ?u64) Error!Region {
         var info = kmt.AllocationInfo2{
             .sysmem = if (sysmem) |m| @intFromPtr(m.ptr) else 0,
             .priv = @intFromPtr(&g.alloc_data),
