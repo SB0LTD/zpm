@@ -140,6 +140,19 @@ var prelude_n: usize = 0;
 var prelude_from: usize = 0;
 var prelude_to: usize = 1 << 30;
 
+/// DXGTEST_POSTLUDE=file: (method, value) u32 pairs sent after the depth
+/// target's binding (gl3d.postlude).
+var postlude_buf: [256][2]u32 = undefined;
+
+fn loadPostlude(path: [*:0]const u8) void {
+    const fd: isize = @bitCast(linux.open(path, .{ .ACCMODE = .RDONLY }, 0));
+    if (fd < 0) return;
+    defer _ = linux.close(@intCast(fd));
+    const n = linux.read(@intCast(fd), std.mem.sliceAsBytes(&postlude_buf).ptr, @sizeOf(@TypeOf(postlude_buf)));
+    nvidia.gl3d.postlude = postlude_buf[0 .. n / 8];
+    out("postlude: {d} methods\n", .{n / 8});
+}
+
 fn loadPrelude(path: [*:0]const u8) void {
     const fd: isize = @bitCast(linux.open(path, .{ .ACCMODE = .RDONLY }, 0));
     if (fd < 0) return;
@@ -176,6 +189,7 @@ pub fn main(init: std.process.Init) void {
         if (std.mem.startsWith(u8, kv, "DXGTEST_CTXDATA=")) loadCtx(@ptrCast(kv[16..].ptr));
         if (std.mem.startsWith(u8, kv, "DXGTEST_CTXFLAGS=")) ctx_flags = std.fmt.parseInt(u32, kv[17..], 16) catch 0;
         if (std.mem.startsWith(u8, kv, "DXGTEST_PRELUDE=")) loadPrelude(@ptrCast(kv[16..].ptr));
+        if (std.mem.startsWith(u8, kv, "DXGTEST_POSTLUDE=")) loadPostlude(@ptrCast(kv[17..].ptr));
         if (std.mem.startsWith(u8, kv, "DXGTEST_FROM=")) prelude_from = std.fmt.parseInt(usize, kv[13..], 10) catch 0;
         if (std.mem.startsWith(u8, kv, "DXGTEST_TO=")) prelude_to = std.fmt.parseInt(usize, kv[11..], 10) catch prelude_to;
     }

@@ -25,28 +25,26 @@
 //! and lines, multisampling, primitive restart, depth textures, depth
 //! bias, clip distances.
 //!
-//! On the Legion's RTX through /dev/dxg (WSL, 11-16): draws without a depth
-//! target run (dxgtest `draw edges nodepth`: all ten edge scenes). Any
-//! draw with a depth target bound faults the channel there (a write fault,
-//! no address), tested or not, depth-only or not, in system memory or
-//! VRAM, with zcull off and compression off: the host driver's linear
-//! buffers are not memory its depth unit takes (NVIDIA's own D3D12 depth
-//! surfaces are allocations of another type: 0x8012, format 0x17). Galaxy's
-//! GL keeps depth draws on the compute kernels there (GALAXY_GL_3D_DEPTH=0).
-//! Later the same day: NVIDIA's own depth allocation (its D3D12 driver's,
-//! made from the recorded private data: dxgtest `draw edges blobdepth`)
-//! faults the same way, and so does every depth method NVIDIA sends set as
-//! it sends them (below): not the memory, not the documented state. Left:
-//! what that driver does to its context at creation, most likely binding
-//! zcull's context-switch storage (an escape), without which the engine
-//! writes zcull's state to address 0. Ruled out after that (dxgtest:
-//! DXGTEST_CTXDATA/CTXFLAGS, ENGINES=1900, DXGTEST_PRELUDE): NVIDIA's own
-//! context data, flags and client hint, its direct queue's engines
-//! (0x1900), and its 3D context's reset state without the methods that
-//! hold addresses (which the replay could not tell apart well). Left: what
-//! its depth binding does through MME macros (LOAD_ROOT_TABLE, methods
-//! 0x3800 on: macros its user-mode driver loads at the context's start),
-//! and the address-bearing state.
+//! On the Legion's RTX through /dev/dxg (WSL, 11-16): a draw with a depth
+//! target bound and a colour target in rows (LAYOUT_PITCH, as gr.target
+//! binds every target) stops the channel: the host driver reports it as a
+//! write fault at 0 (flags 0x4b, code 0x1), but no memory is involved: it
+//! is the engine refusing the state. A colour target in blocks
+//! (block-linear) with the same depth target draws: dxgtest `draw edges
+//! vramdepth` with DXGTEST_POSTLUDE making target 0 64 x 32 in one-GOB
+//! blocks ran all ten edge scenes with no depth apart, and gl_FragDepth.
+//! Rows and blocks mixed across targets stop it the same way, as does a
+//! target smaller than the draw. Nouveau's nvc0 binds a depth target only
+//! when no colour target is linear: the same rule. Bare metal (our own
+//! context) does not stop on it, so the host driver's context reports what
+//! ours leaves masked. Galaxy's GL keeps depth draws on the compute
+//! kernels over /dev/dxg (GALAXY_GL_3D_DEPTH=0) until its depth draws have
+//! colour targets in blocks. Not the cause, each tried (dxgtest's
+//! DXGTEST_PRELUDE, _POSTLUDE, _CTXDATA, _CTXFLAGS, ENGINES=1900): zcull
+//! (NVIDIA's macros' region, storage, LOAD_ZCULL, decoded from its MME
+//! macros), compression, the memory (VRAM, NVIDIA's own depth allocation),
+//! NVIDIA's context data and engines, and all 592 of its 3D context's
+//! reset methods that hold no address.
 //! The depth state below is NVIDIA's D3D12 driver's for D24S8 (format, layer,
 //! compression, sparse). The emulated engine (emu3d) runs all of it.
 //!
@@ -296,6 +294,8 @@ pub const PROVOKING_LAST: u32 = 1;
 /// on hardware which of another driver's state a draw needs (dxgtest's
 /// DXGTEST_PRELUDE); empty otherwise.
 pub var prelude: []const [2]u32 = &.{};
+/// State sent last, before the draw itself (the same use).
+pub var postlude: []const [2]u32 = &.{};
 
 /// The whole of a draw: state, programs, buffers, the draw.
 pub fn emit(p: *Push, d: *const Draw) void {
@@ -386,9 +386,11 @@ pub fn emit(p: *Push, d: *const Draw) void {
         });
         one(p, gr.SET_DA_PRIMITIVE_RESTART, @intFromBool(ix.restart));
         many(p, SET_DA_PRIMITIVE_RESTART_INDEX, &.{restartIndex(ix.size)});
+        for (postlude) |mv| one(p, mv[0], mv[1]);
         many(p, gr.SET_DRAW_CONTROL_A, &.{ gr.DRAW_CONTROL, d.instances, ix.first, d.count });
         return;
     }
+    for (postlude) |mv| one(p, mv[0], mv[1]);
     many(p, gr.SET_DRAW_CONTROL_A, &.{ gr.DRAW_CONTROL, d.instances });
     many(p, gr.DRAW_VERTEX_ARRAY_BEGIN_END_A, &.{ 0, d.count });
 }
