@@ -633,6 +633,64 @@ fn rewoundOidReplay() !void {
     try check(try sameDatabase(&db, &restarted) and try sameCatalog(&db, &restarted));
 }
 
+fn replayCardinality() !void {
+    var producer: DB = .{};
+    var replayed: DB = .{};
+    var log: Log = .{};
+    const initial = try producer.begin();
+    try run(&producer, initial, "CREATE TABLE t(id INT PRIMARY KEY, label TEXT, flag BOOL)");
+    try run(&producer, initial, "INSERT INTO t VALUES(1,'old',NULL),(2,'old',NULL),(3,'old',NULL),(4,'old',NULL),(5,'old',NULL),(6,'old',NULL),(7,'old',NULL),(8,'old',NULL)");
+    try log.commit(&producer, initial);
+    var result: DB.Result = .{};
+    var mixed: [1024]u8 = undefined;
+    var mixed_used: usize = 0;
+    for ([_][]const u8{ "DELETE FROM t WHERE id=1", "INSERT INTO t VALUES(9,'new',TRUE)", "UPDATE t SET label='changed' WHERE id=8" }) |source| {
+        try producer.executeChanges(source, &result, &mixed, &mixed_used, null, null);
+    }
+    var truncated: [1024]u8 = undefined;
+    var truncated_used: usize = 0;
+    try producer.executeChanges("TRUNCATE t", &result, &truncated, &truncated_used, null, null);
+    try producer.executeChanges("INSERT INTO t VALUES(10,'after',FALSE),(11,'after',NULL)", &result, &truncated, &truncated_used, null, null);
+
+    try replayed.applyChangeRecord(log.record(0), &scratch);
+    try check(replayed.tables[0].summary.rows == 8 and replayed.tables[0].row_used == 8);
+    try replayed.applyChangeRecord(mixed[0..mixed_used], &scratch);
+    try check(replayed.tables[0].summary.rows == 8 and replayed.tables[0].row_used == 8);
+    try replayed.applyChangeRecord(truncated[0..truncated_used], &scratch);
+    try check(replayed.tables[0].summary.rows == 2 and replayed.tables[0].row_used == 2);
+    try check(try sameDatabase(&producer, &replayed));
+
+    // An invalid or disagreeing seed cannot admit an overflowing record.
+    var full: DB = .{};
+    try full.applyChangeRecord(log.record(0), &scratch);
+    const summary = full.tables[0].summary;
+    const old_csn = full.csn;
+    var overflow: Builder = .{};
+    overflow.row(3, oid, 40, 40, "overflow");
+    for (0..3) |mode| {
+        full.tables[0].summary = summary;
+        switch (mode) {
+            0 => full.tables[0].summary.valid = false,
+            1 => full.tables[0].summary.rows = 0,
+            else => full.tables[0].summary.csn = full.csn + 1,
+        }
+        if (full.applyChangeRecord(overflow.record(), &scratch)) |_| return error.FullReplayAccepted else |err| try check(err == error.ChangeRecordConflict);
+        try check(full.csn == old_csn and full.tables[0].row_used == 8);
+    }
+    full.tables[0].summary = summary;
+
+    // Legacy or pinned history can occupy a row slot after DELETE. Such a
+    // row must stay out of the logical capacity count during validation.
+    const reader = try full.begin();
+    full.txs[reader].pin = .{ .csn = full.csn };
+    try full.execute("DELETE FROM t WHERE id=1", &result);
+    full.abort(reader);
+    try check(full.tables[0].summary.rows == 7 and full.tables[0].row_used == 8);
+    try full.applyChangeRecord(overflow.record(), &scratch);
+    try check(full.tables[0].summary.rows == 8 and full.tables[0].row_used == 8);
+    try check(try integer(&full, "SELECT id FROM t WHERE id=40") == 40);
+}
+
 pub fn main(init: std.process.Init) !void {
     try roundTrips();
     try corruption();
@@ -642,6 +700,7 @@ pub fn main(init: std.process.Init) !void {
     try oidConflicts();
     try keyedIndexCollision();
     try rewoundOidReplay();
+    try replayCardinality();
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-change-log\",\"pass\":true,\"assertions\":{d},\"rejected_flips\":{d},\"accepted_flips\":{d}}}\n", .{ assertions, rejected_flips, accepted_flips });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
