@@ -18,7 +18,7 @@ import pytds
 
 SERVER_VERSION = "16.0.4325.4"
 DRIVER_VERSION = "1.17.1"
-IMAGE = "mcr.microsoft.com/mssql/server@sha256:e10cd49443c94dbdcb7a050987db22ff4d8c87052ac53768abe1ed848d3fcef6"
+IMAGE = "mcr.microsoft.com/mssql/server@sha256:4525e3efac9f3e241cb003bb2ff2a82818b502f37e12049d788b1a9fa7e13b7f"
 PROBE_SHA256 = "21f7bd63c830788e20b8c265728d38244c0e90b90710380d90e26cad1b5efa74"
 EXPECTED_ROWS = {
     "TSQL.IDENTIFIERS": [[1]],

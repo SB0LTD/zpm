@@ -15,7 +15,7 @@ jobs:
     env:
       RAMSQL_REVISION: e692402ec3aaeee616c0e53d57fd948c90a6e383
       RAMSQL_ARCHIVE_SHA256: 3384824febe9841326287fa620919d4a6ad2137ae0fba08b5a9ce9444b4f43cd
-      ORACLE_IMAGE: mcr.microsoft.com/mssql/server@sha256:e10cd49443c94dbdcb7a050987db22ff4d8c87052ac53768abe1ed848d3fcef6
+      ORACLE_IMAGE: mcr.microsoft.com/mssql/server@sha256:4525e3efac9f3e241cb003bb2ff2a82818b502f37e12049d788b1a9fa7e13b7f
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,6 +26,10 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           mkdir -p evidence
+          oracle_digest="${ORACLE_IMAGE##*@sha256:}"
+          curl --fail --location --retry 3 --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "https://mcr.microsoft.com/v2/mssql/server/manifests/sha256:$oracle_digest" --output evidence/sqlserver-manifest.json
+          printf '%s  %s\n' "$oracle_digest" evidence/sqlserver-manifest.json | sha256sum --check --strict -
           candidate="$RUNNER_TEMP/ramsql"
           source_archive="$RUNNER_TEMP/ramsql-$RAMSQL_REVISION.tar.gz"
           curl --fail --location --retry 3 "https://github.com/SB0LTD/ramsql/archive/$RAMSQL_REVISION.tar.gz" --output "$source_archive"

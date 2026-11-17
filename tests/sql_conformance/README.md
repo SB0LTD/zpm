@@ -45,7 +45,7 @@ failures separately from SQL mismatches.
 python -m pip install python-tds==1.17.1
 export ZPM_SQLSERVER_ORACLE_PASSWORD="$(python -c 'import secrets; print("ZpmSql!1" + secrets.token_urlsafe(24))')"
 export MSSQL_SA_PASSWORD="$ZPM_SQLSERVER_ORACLE_PASSWORD"
-image=mcr.microsoft.com/mssql/server@sha256:e10cd49443c94dbdcb7a050987db22ff4d8c87052ac53768abe1ed848d3fcef6
+image=mcr.microsoft.com/mssql/server@sha256:4525e3efac9f3e241cb003bb2ff2a82818b502f37e12049d788b1a9fa7e13b7f
 container="$(docker run --detach --rm --publish 127.0.0.1::1433 \
   --env ACCEPT_EULA=Y --env MSSQL_PID=Developer --env MSSQL_SA_PASSWORD "$image")"
 trap 'docker stop "$container" >/dev/null' EXIT
