@@ -1058,17 +1058,17 @@ fn routedStartupContracts() !void {
         var db: RoutedDB = .{};
         var session: RoutedSession = .{};
         try session.configureAuthentication(&verifier, scram_nonce);
-        var startup = routedStartup(database, false);
-        const frame_len = startup.len;
-        startup.append(query_packet.slice());
+        var startup_packet = routedStartup(database, false);
+        const frame_len = startup_packet.len;
+        startup_packet.append(query_packet.slice());
         for (0..frame_len) |prefix| {
-            const partial = try session.handle(&db, startup.bytes[0..prefix], &output);
+            const partial = try session.handle(&db, startup_packet.bytes[0..prefix], &output);
             try check(partial.consumed == 0 and partial.written == 0 and !partial.close and db.calls == 0);
         }
-        const initial = try session.handle(&db, startup.bytes[0..startup.len], &output);
+        const initial = try session.handle(&db, startup_packet.bytes[0..startup_packet.len], &output);
         try check(initial.consumed == frame_len and !initial.close and db.calls == 0 and db.sql_calls == 0);
         try tags(output[0..initial.written], "R");
-        @memset(startup.bytes[0..startup.len], 0);
+        @memset(startup_packet.bytes[0..startup_packet.len], 0);
         try authFirst(&session, &db);
         try check(db.calls == 0);
         const final = try session.handle(&db, proof.slice(), &output);
@@ -1094,17 +1094,17 @@ fn routedStartupContracts() !void {
     try state(output[0..denied.written], "28P01");
 
     var trusted: RoutedSession = .{};
-    const startup = routedStartup(null, false);
-    const accepted = try trusted.handle(&db, startup.bytes[0..startup.len], &output);
+    const startup_packet = routedStartup(null, false);
+    const accepted = try trusted.handle(&db, startup_packet.bytes[0..startup_packet.len], &output);
     try check(!accepted.close and db.calls == 1 and db.method == .trusted and db.default_database and db.expected_option);
     try tags(output[0..accepted.written], "RSSSSSSSKZ");
 
-    var malformed: RoutedSession = .{};
+    var invalid_startup: RoutedSession = .{};
     const duplicate = routedStartup("beta", true);
-    const rejected = try malformed.handle(&db, duplicate.bytes[0..duplicate.len], &output);
+    const rejected = try invalid_startup.handle(&db, duplicate.bytes[0..duplicate.len], &output);
     try check(rejected.close and db.calls == 1);
     try state(output[0..rejected.written], "08P01");
-    try check((try malformed.handle(&db, startup.bytes[0..startup.len], &output)).close and db.calls == 1);
+    try check((try invalid_startup.handle(&db, startup_packet.bytes[0..startup_packet.len], &output)).close and db.calls == 1);
 }
 
 fn authenticationContracts() !void {
