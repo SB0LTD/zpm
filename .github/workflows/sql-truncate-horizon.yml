@@ -1,0 +1,71 @@
+name: TRUNCATE horizon qualification
+
+on:
+  push:
+    branches: [ci/sql-truncate-horizon-20261117]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZPM_SOURCE_REVISION: 145361dac8faac04deb9824ad7e904fcd356d69b
+  SIG_TAG: sig-0.6.5-zig0.17.0.3c72687
+  SIG_ASSET: sig-0.6.5-zig0.17.0.3c72687-x86_64-linux.tar.xz
+  SIG_SHA256: 179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a
+
+jobs:
+  contracts:
+    name: SQL ${{ matrix.group }} contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: change-log
+            tests: change_log
+          - group: mvcc
+            tests: mvcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.ZPM_SOURCE_REVISION }}
+      - name: Verify source and install Sig
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ZPM_SOURCE_REVISION"
+          mkdir -p evidence "$RUNNER_TEMP/sig-toolchain"
+          archive="$RUNNER_TEMP/$SIG_ASSET"
+          curl --fail --location --retry 3 "https://github.com/SB0LTD/sig/releases/download/$SIG_TAG/$SIG_ASSET" --output "$archive"
+          printf '%s  %s\n' "$SIG_SHA256" "$archive" | sha256sum --check --strict -
+          tar -xf "$archive" -C "$RUNNER_TEMP/sig-toolchain"
+          compiler=$(find "$RUNNER_TEMP/sig-toolchain" -type f -name sig -perm -u+x -print -quit)
+          test -n "$compiler"
+          lib="$(dirname "$(dirname "$compiler")")/lib"
+          test -f "$lib/std/std.sig"
+          echo "SIG=$compiler" >> "$GITHUB_ENV"
+          echo "SIG_LIB_DIR=$lib" >> "$GITHUB_ENV"
+          "$compiler" version | tee evidence/sig-version.txt
+          printf '%s\n' "$ZPM_SOURCE_REVISION" > evidence/zpm-revision.txt
+          printf '%s  %s\n' "$SIG_SHA256" "$SIG_ASSET" > evidence/sig-archive-sha256.txt
+      - name: Compile and execute ReleaseSafe assertions
+        shell: bash
+        env:
+          CONTRACTS: ${{ matrix.tests }}
+        run: |
+          set -euo pipefail
+          for contract in $CONTRACTS; do
+            binary="$RUNNER_TEMP/zpm-sql-$contract"
+            "$SIG" build-exe --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe --dep sql "-Mroot=tests/test_sql_$contract.sig" -Msql=src/core/sql.sig "-femit-bin=$binary" 2>&1 | tee "evidence/$contract-build.txt"
+            "$binary" 2>&1 | tee "evidence/$contract-result.txt"
+            grep -E 'PASS|"pass":true' "evidence/$contract-result.txt"
+            sha256sum "$binary" >> evidence/contract-binary-sha256.txt
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: truncate-horizon-${{ matrix.group }}
+          path: evidence/
+          if-no-files-found: error
