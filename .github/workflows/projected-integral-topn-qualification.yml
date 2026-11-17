@@ -32,7 +32,7 @@ jobs:
         run: |
           mkdir evidence
           "$SIG" version | tee evidence/sig-version.log
-          "$SIG" build run-contract-sql-projected-filter run-contract-sql-integer-topk run-contract-sql-parallel-read \
+          "$SIG" build run-contract-sql-projected-filter run-contract-sql-integer-topk run-contract-parallel-read \
             --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
       - uses: actions/upload-artifact@v4
         if: always()
