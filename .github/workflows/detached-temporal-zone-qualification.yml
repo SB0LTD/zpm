@@ -1,0 +1,57 @@
+name: Detached temporal zone qualification
+
+on:
+  push:
+    branches: [fix/detached-temporal-zone-20261118]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 16
+      - name: Install checksum-verified Sig
+        shell: bash
+        run: |
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-x86_64-linux.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" -o "$RUNNER_TEMP/$asset"
+          echo "179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a  $RUNNER_TEMP/$asset" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sdk"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig | head -n 1)
+          standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' | head -n 1)
+          test -x "$compiler"
+          test -f "$standard"
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+      - name: Require the original resolver misroute and corrected eligibility
+        shell: bash
+        run: |
+          mkdir evidence
+          baseline="$RUNNER_TEMP/baseline"
+          git worktree add --detach "$baseline" 5d2d7db6
+          fixture="$PWD/tests/test_sql_detached_temporal_zone.sig"
+          for mode in red green; do
+            source="$PWD/src/core/sql.sig"
+            if [ "$mode" = red ]; then source="$baseline/src/core/sql.sig"; fi
+            "$SIG" build-exe --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe --stack 16777216 \
+              -femit-bin="$RUNNER_TEMP/check-$mode" --dep sql "-Mroot=$fixture" "-Msql=$source" \
+              2>&1 | tee "evidence/build-$mode.log"
+          done
+          if "$RUNNER_TEMP/check-red" >evidence/red.log 2>&1; then
+            echo 'Expected the original routing contract to fail'
+            exit 1
+          fi
+          grep -F 'wrong resolver route: SELECT v::timestamptz FROM datetimes' evidence/red.log
+          "$RUNNER_TEMP/check-green" 2>&1 | tee evidence/green.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: detached-temporal-zone-contract
+          path: evidence/
