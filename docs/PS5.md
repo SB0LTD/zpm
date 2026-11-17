@@ -2,7 +2,9 @@
 
 `src/ps5/` is what a kernel and a libkernel need to run a decrypted PS5 executable natively on an x86-64 computer: no emulator, no relinking step, no translation of the program's code. A PS5 is an x86-64 machine, so the code runs as it is. What has to be supplied is what the code talks to: a kernel that answers its system calls, and libraries bound by Sony's hashed names.
 
-This is the groundwork: the names, the kernel's ABI, and a loader that reads PS5 files and binds them. Not here yet: the libraries a game imports (libkernel first) and anything about graphics. Galaxy's kernel uses `abi.sig` for its PS5 personality (`src/kernel/galaxy_ps5.sig` there). Nothing uses the loader yet; it has been run only on files its own tests make, never on a real game.
+What is here: the names, the kernel's ABI, a loader that reads PS5 files and binds them, a first libkernel, and the runtime that puts them together. A small program in the PS5's format loads, prints and exits, both in a test here and on Galaxy's kernel. Not here: every library but libkernel, the modules a game bundles, a game's own threads, and anything about graphics. The loader has been run only on files made for its tests, never on a real game.
+
+Galaxy's kernel uses `abi.sig` for its PS5 personality (`src/kernel/galaxy_ps5.sig` there), and its PS5 runtime binary is `runtime.sig` with a `_start`.
 
 Everything is allocation-free: plain values, comptime tables, caller-provided buffers.
 
@@ -14,7 +16,10 @@ Everything is allocation-free: plain values, comptime tables, caller-provided bu
 | `abi.sig` | The PS5 kernel's system call ABI as data: the convention, every call's number and name, FreeBSD's errno values, open and mmap flags, clock ids, the structures (`struct stat`, directory entries, `thr_param`, `_umtx_time`), and the conversions to the values a Linux-shaped kernel service takes. |
 | `elf.sig` | A PS5 (or PS4) executable or module read as a file: segments, thread storage, the dynamic tables, and the modules and libraries it names. A view of the file's bytes with every offset checked. |
 | `link.sig` | The linker: modules given addresses, copied in, their exports entered in one table keyed by NID, their relocations applied and imports bound, thread storage laid out. |
-| `fixture.sig` | Small PS5 files made in memory, for the tests. |
+| `fixture.sig` | Small PS5 files made in memory, for the tests. `hello()` is a whole program with real code: it prints through an imported `write`, calls a library a host may not have, and exits. |
+| `sys.sig` | The system calls as a program makes them: the number in `rax`, the carry flag folded into a negative errno. x86-64 only. |
+| `libkernel.sig` | The PS5's kernel library in Sig, a first set of 34 functions: files, sleeps, clocks, memory, the process, the stack protector's canary, `__tls_get_addr`. |
+| `runtime.sig` | The program a kernel starts for a PS5 executable. It loads and links the game in its own process, binds imports to libkernel or to a stand-in that names what is missing, makes the first thread's storage, and jumps to the game. |
 | `ps5.sig` | The module root. |
 
 ## NIDs
@@ -88,6 +93,19 @@ try linker.link();
 
 The host supplies four functions: `reserve` (zeroed writable memory at a multiple of 16 KiB), `protect`, `builtin` and `missing`. The linker writes into the address space it runs in.
 
+## The runtime and libkernel
+
+`runtime.start(ap)` is a PS5 process's whole start. A host gives it FreeBSD's argument block; `argv[1]` is the executable.
+
+1. It maps the file and runs the linker with libkernel as `builtin`.
+2. For an import nothing provides, `missing` writes a **stand-in**: 16 bytes of code that load the import's number and jump to one routine, which prints `not implemented: library:NID was called` once and returns 0. A game that only passes through such a call carries on, and the log lists what it wanted.
+3. It maps the first thread's storage, with FreeBSD's control block at the thread pointer (`fs:0` is its own address), and sets FS.
+4. It switches to a 2 MiB stack and jumps to the entry with `rdi` the argument block and `rsi` a clean-up function.
+
+libkernel's functions are ordinary Sig functions with the C calling convention, listed in one comptime table keyed by NID. POSIX names answer -1 and `errno`; `sceKernel` names answer `0x80020000 + errno`. Both `libkernel` and `libScePosix` resolve to the same table. A game's `/app0` is the folder its executable is in.
+
+Both files make system calls, so they run only under a kernel that speaks the PS5's ABI. Their tests here cover what does not: the export table, error encoding, path mapping, and a stand-in's bytes.
+
 ## Sources
 
 - FreeBSD 11.0's sources (BSD licence): the convention, the base numbers, the structures.
@@ -103,6 +121,6 @@ Open projects were read as documentation only. There is no Sony code, key or fir
 sig build test-ps5
 ```
 
-The tests hash published names to their NIDs, check the structures' sizes and offsets against FreeBSD 11's, and check each conversion. For the loader they build an executable and a module in memory, load and link them, and check every bound word and the thread storage. Galaxy's twin test (`galaxy/bench/test-ps5.sh` there) runs a program that makes the system calls for real.
+The tests hash published names to their NIDs, check the structures' sizes and offsets against FreeBSD 11's, and check each conversion. For the loader they build an executable and a module in memory, load and link them, and check every bound word and the thread storage. On an x86-64 Linux host one test goes further: it loads the hello program into executable memory, binds its imports to functions in the test, and calls its entry, so a file in the PS5's format really runs. Galaxy's twin test (`galaxy/bench/test-ps5.sh` there) runs a program that makes the system calls for real.
 
 What the tests cannot show: that a real game's files load. The reader and linker follow what open loaders document, and no retail file has been through them.

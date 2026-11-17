@@ -70,11 +70,12 @@ pub const Host = struct {
 
 pub const NAME_MAX = 47;
 
-const Name = struct {
+/// A module's or library's name, kept by value (the file it came from goes).
+pub const Name = struct {
     bytes: [NAME_MAX]u8 = undefined,
     len: u8 = 0,
 
-    fn of(s: []const u8) Name {
+    pub fn of(s: []const u8) Name {
         var n = Name{};
         n.len = @intCast(@min(s.len, NAME_MAX));
         @memcpy(n.bytes[0..n.len], s[0..n.len]);
@@ -642,4 +643,75 @@ test "tables that are full say so" {
     // (and none of its exports went in)
     try std.testing.expectEqual(@as(u32, 0), l.export_count);
     try std.testing.expect(l.lookup("libTest", nid.of("a")) == null);
+}
+
+// A whole program run for real: the hello fixture's code is the CPU's own,
+// so on an x86-64 Linux host the test can load it into executable memory,
+// bind its imports to functions here, and call its entry.
+const Ran = struct {
+    var text: [64]u8 = undefined;
+    var text_len: usize = 0;
+    var fd: c_int = -1;
+    var exit_code: c_int = -1;
+    var stand_in_calls: u32 = 0;
+
+    fn write(to: c_int, bytes: [*]const u8, n: usize) callconv(.c) isize {
+        fd = to;
+        text_len = @min(n, text.len);
+        @memcpy(text[0..text_len], bytes[0..text_len]);
+        return @intCast(n);
+    }
+    fn exit(code: c_int) callconv(.c) void {
+        exit_code = code;
+    }
+    fn standIn() callconv(.c) u64 {
+        stand_in_calls += 1;
+        return 0;
+    }
+
+    fn reserve(_: ?*anyopaque, want: u64, size: u64) ?u64 {
+        if (want != 0) return null;
+        const os = std.os.linux;
+        // (Linux's pages are 4 KiB: a page more, and the first address in
+        // it that is a multiple of the PS5's 16 KiB)
+        const r = os.mmap(null, @intCast(size + elf.PAGE), .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        return if (os.errno(r) != .SUCCESS) null else std.mem.alignForward(u64, r, elf.PAGE);
+    }
+    fn protect(_: ?*anyopaque, addr: u64, size: u64, read: bool, wr: bool, exec: bool) bool {
+        const os = std.os.linux;
+        const r = os.mprotect(@ptrFromInt(@as(usize, @intCast(addr))), @intCast(size), .{ .READ = read, .WRITE = wr, .EXEC = exec });
+        return os.errno(r) == .SUCCESS;
+    }
+    fn builtin(_: ?*anyopaque, lib: []const u8, n: nid.Nid) ?u64 {
+        if (!std.mem.eql(u8, lib, "libkernel")) return null;
+        if (n == nid.of("write")) return @intFromPtr(&write);
+        if (n == nid.of("_exit")) return @intFromPtr(&exit);
+        return null;
+    }
+    fn missing(_: ?*anyopaque, _: []const u8, _: []const u8, _: nid.Nid) ?u64 {
+        return @intFromPtr(&standIn);
+    }
+};
+
+test "the hello program, loaded and run: it prints through its imports and exits" {
+    const native = @import("builtin");
+    if (native.cpu.arch != .x86_64 or native.os.tag != .linux) return error.SkipZigTest;
+
+    var buf: [fixture.SIZE]u8 = undefined;
+    const file = fixture.hello(&buf, "hello from a PS5 program\n");
+    var modules: [2]Module = undefined;
+    var libraries: [4]Name = undefined;
+    var exports: [16]Export = undefined;
+    var l = Linker.init(.{ .reserve = Ran.reserve, .protect = Ran.protect, .builtin = Ran.builtin, .missing = Ran.missing }, .{ .modules = &modules, .libraries = &libraries, .exports = &exports });
+    const exe = try l.load("eboot.bin", file);
+    try l.link();
+    try std.testing.expectEqual(@as(u32, 2), l.stats.from_host);
+    try std.testing.expectEqual(@as(u32, 1), l.stats.stand_ins);
+
+    const entry: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void = @ptrFromInt(@as(usize, @intCast(l.loaded()[exe].entry)));
+    entry(null, null);
+    try std.testing.expectEqual(@as(c_int, 1), Ran.fd);
+    try std.testing.expectEqualStrings("hello from a PS5 program\n", Ran.text[0..Ran.text_len]);
+    try std.testing.expectEqual(@as(u32, 1), Ran.stand_in_calls);
+    try std.testing.expectEqual(@as(c_int, 0), Ran.exit_code);
 }

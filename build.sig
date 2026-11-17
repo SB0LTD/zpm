@@ -1133,7 +1133,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     //    (NIDs), their kernel's system call ABI as data, and a loader that
     //    reads their files and binds them ──
     _ = try ctx.addModule("ps5", "src/ps5/ps5.sig");
-    const test_ps5 = try ctx.addStep("test-ps5", "Hash published names to their NIDs; check the PS5 kernel ABI's structures and conversions; load and link PS5 files made in memory", &noopStep);
+    const test_ps5 = try ctx.addStep("test-ps5", "Hash published names to their NIDs; check the PS5 kernel ABI's structures and conversions; load, link and run PS5 files made in memory", &noopStep);
     try ctx.addDependency(test_all, test_ps5);
     _ = try addTest(ctx, test_ps5, "test-ps5-module", "src/ps5/ps5.sig", &.{});
 

@@ -12,7 +12,12 @@
 //!         the PS4's): segments, tables, the modules and libraries named;
 //!   link — modules loaded into one address space and bound to each other
 //!         and to the host's own libraries by NID, with thread storage;
-//!   fixture — small PS5 files made in memory, for tests.
+//!   fixture — small PS5 files made in memory, for tests;
+//!   sys — the system calls as a program makes them (x86-64);
+//!   libkernel — the PS5's kernel library in Sig: files, memory, time, the
+//!         process (a first set);
+//!   runtime — the program a kernel starts for a PS5 executable: it loads
+//!         and links the game in its own process and jumps to it.
 //!
 //! No Sony code, keys or firmware: the formats are documented in public
 //! (FreeBSD's sources, open loaders), and the input is a program its owner
@@ -26,6 +31,10 @@ pub const abi = @import("abi.sig");
 pub const elf = @import("elf.sig");
 pub const link = @import("link.sig");
 pub const fixture = @import("fixture.sig");
+// (x86-64 only: they are that CPU's instructions. Nothing above needs them.)
+pub const sys = @import("sys.sig");
+pub const libkernel = @import("libkernel.sig");
+pub const runtime = @import("runtime.sig");
 
 test {
     _ = nid;
@@ -33,4 +42,8 @@ test {
     _ = elf;
     _ = link;
     _ = fixture;
+    if (@import("builtin").cpu.arch == .x86_64) {
+        _ = libkernel;
+        _ = runtime;
+    }
 }
