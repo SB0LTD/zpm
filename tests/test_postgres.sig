@@ -1363,6 +1363,42 @@ fn storeContracts() !void {
 
 var oversized_session: Session = .{};
 var oversized_db: DB = .{};
+fn vacuumContracts() !void {
+    var store: Store = .{};
+    var connection: Store.Connection = .{ .store = &store, .id = 1 };
+    var session: StoreSession = .{};
+    _ = try storeStartup(&session, &connection, "");
+    try commandTag(try storeQuery(&session, &connection, "CREATE SCHEMA upkeep"), "CREATE SCHEMA");
+    try commandTag(try storeQuery(&session, &connection, "CREATE TABLE upkeep.fact(id INTEGER PRIMARY KEY,v INTEGER)"), "CREATE TABLE");
+    try commandTag(try storeQuery(&session, &connection, "INSERT INTO upkeep.fact VALUES(1,10)"), "INSERT 0 1");
+
+    const reader = try store.database.begin();
+    try store.database.beginModes(reader, .{ .isolation = .repeatable_read });
+    var held: DB.Result = .{};
+    try store.database.statement(reader, "SELECT v FROM upkeep.fact WHERE id=1", &held, .{});
+    try check(held.row_count == 1 and held.rows[0].cells[0].integer == 10);
+    try commandTag(try storeQuery(&session, &connection, "UPDATE upkeep.fact SET v=20 WHERE id=1"), "UPDATE 1");
+    const before = store.database.tables[0].version_used;
+    try check(before == 2);
+    try commandTag(try storeQuery(&session, &connection, "VACUUM upkeep.fact"), "VACUUM");
+    try check(store.database.tables[0].version_used == before);
+    try store.database.statement(reader, "SELECT v FROM upkeep.fact WHERE id=1", &held, .{});
+    try check(held.row_count == 1 and held.rows[0].cells[0].integer == 10);
+    store.database.abort(reader);
+
+    var record: [1024]u8 = undefined;
+    var used: usize = 0;
+    try store.database.executeChanges("VACUUM upkeep.fact", &held, &record, &used, null, null);
+    try check(used == 0 and held.command == .vacuum and store.database.tables[0].version_used == 1);
+    _ = try storeQuery(&session, &connection, "SELECT v FROM upkeep.fact WHERE id=1");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 20);
+    try commandTag(try storeQuery(&session, &connection, "BEGIN READ ONLY"), "BEGIN");
+    try state(try storeQuery(&session, &connection, "VACUUM upkeep.fact"), "25001");
+    try commandTag(try storeQuery(&session, &connection, "ROLLBACK"), "ROLLBACK");
+    try state(try storeQuery(&session, &connection, "VACUUM upkeep.missing"), "42P01");
+    try state(try storeQuery(&session, &connection, "VACUUM (FULL) upkeep.fact"), "0A000");
+}
+
 fn oversizedFrames() !void {
     try startup(&oversized_session, &oversized_db);
     var header:[5]u8=.{ 'Q',0,0,0,0 };
@@ -1464,6 +1500,7 @@ pub fn main(init: std.process.Init) !void {
     try oversizedFrames();
     try roleAuthenticationContracts();
     try storeContracts();
+    try vacuumContracts();
     try returningOnce();
     try characterDescriptions();
     try normal();

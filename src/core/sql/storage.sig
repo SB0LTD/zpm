@@ -1345,8 +1345,12 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// Reclamation case 2 at the Raw's horizon (Wave 1: its current csn).
         pub fn vacuum(table: *Table, horizon: u64) usize {
+            return vacuumRange(table, horizon, 0, table.version_high);
+        }
+
+        pub fn vacuumRange(table: *Table, horizon: u64, first: usize, end: usize) usize {
             var freed: usize = 0;
-            for (0..table.version_high) |index| {
+            for (first..end) |index| {
                 const version = &table.versions[index];
                 if (version.row == 0 or version.xmax_csn == 0 or version.xmax_csn > horizon) continue;
                 reclaimVersion(table, @intCast(index));

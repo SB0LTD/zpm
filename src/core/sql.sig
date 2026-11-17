@@ -2003,7 +2003,7 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
             switch (parsed.*) {
-                .control => |command| return self.runControl(slot, original, command, result),
+                .control => |command| return self.runControl(slot, original, command, snap, result),
                 .session => |*command| return self.runSession(slot, original, command, snap, result, mode),
                 else => {},
             }
@@ -6766,8 +6766,29 @@ pub fn Database(comptime config: Config) type {
 
         // ---- statements --------------------------------------------------
 
-        fn runControl(self: *Self, slot: u16, source: []const u8, command: ast.Control, result: *Result) Error!void {
+        fn runControl(self: *Self, slot: u16, source: []const u8, command: ast.Control, snap: Snapshot, result: *Result) Error!void {
             switch (command) {
+                .vacuum => |spec| {
+                    if (self.dialect != .postgres) return error.UnsupportedStatement;
+                    if (!self.statement_implicit) return error.ActiveSqlTransaction;
+                    const context = self.bindContext(source, .standard, snap);
+                    const index = try B.resolveQualified(&context, spec.schema, spec.name);
+                    const table = &self.tables[index];
+                    if (table.relkind != 'r' and table.relkind != 'm') return error.WrongObjectType;
+                    const owner = self.catalog_objects.owner(table.oid, snap);
+                    const role = self.session.role;
+                    if (role != CO.bootstrap_role and !self.catalog_objects.memberOf(role, owner, true, snap)) return error.InsufficientPrivilege;
+                    try self.lockTable(slot, index, .share_update_exclusive);
+                    const horizon_csn = self.horizon();
+                    var first: usize = 0;
+                    while (first < table.version_high) {
+                        const count = @min(table.version_high - first, 256);
+                        try self.session.checkpoints(count);
+                        _ = S.vacuumRange(table, horizon_csn, first, first + count);
+                        first += count;
+                    }
+                    self.outcome = .{ .command = .vacuum, .noop = true };
+                },
                 // Already in a transaction block: PostgreSQL warns and ignores it.
                 // An implicit (autocommit) statement cannot open a block: it
                 // would commit at once while the caller believes it is open.
@@ -8471,6 +8492,7 @@ pub fn Database(comptime config: Config) type {
             };
             var out: Control = .none;
             switch (command) {
+                .vacuum => {}, // The statement path owns the relation lock and interruption state.
                 .begin => |modes| out = .{ .begin = modes },
                 .commit => out = .commit,
                 .rollback => out = .rollback,
