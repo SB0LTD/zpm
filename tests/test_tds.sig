@@ -429,6 +429,7 @@ fn nativeApply() !void {
     _ = try execute(&session, &db,
         "SELECT a.id,x.k FROM apply_left a CROSS APPLY(SELECT b.id AS k FROM apply_right b WHERE b.id<=a.id) AS x ORDER BY a.id,x.k");
     try check(session.result.row_count == 3);
+    try check(session.result.non_null_columns.isSet(0) and session.result.non_null_columns.isSet(1));
     for ([_][2]i64{ .{ 1, 1 }, .{ 3, 1 }, .{ 3, 2 } }, session.result.rows[0..3]) |wanted, row| {
         try check(row.cells[0].integer == wanted[0] and row.cells[1].integer == wanted[1]);
     }
@@ -457,6 +458,13 @@ fn nativeIntegerDeclarations() !void {
     try readColumn(&result, 1, 0x26, 4, "");
     try check(try result.numeric(1) == 0xd1 and try result.numeric(1) == 4 and try result.numeric(4) == 1);
     try check(try result.numeric(1) == 0xfd and try result.numeric(2) == 0x10);
+
+    var uninitialized: Reader = .{ .source = try execute(&session, &db, "DECLARE @unset INT; SELECT @unset") };
+    try check(try uninitialized.numeric(1) == 0xfd and try uninitialized.numeric(2) == 1);
+    try check(try uninitialized.numeric(2) == 0 and try uninitialized.numeric(8) == 0);
+    try check(try uninitialized.numeric(1) == 0x81 and try uninitialized.numeric(2) == 1);
+    try readColumn(&uninitialized, 1, 0x26, 4, "");
+    try check(try uninitialized.numeric(1) == 0xd1 and try uninitialized.numeric(1) == 0);
 
     _ = try execute(&session, &db,
         "declare @lo INT=-2147483648; DECLARE @hi INTEGER=2147483647; DECLARE @_maybe INT=NULL; SELECT @LO lo,@hi hi,@_maybe n,'@lo; @hi' s /* @unused */");

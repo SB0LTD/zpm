@@ -616,7 +616,7 @@ pub fn Session(comptime DB: type) type {
             return .{ .integer = if (token[0] == '-') -@as(i64, magnitude) else magnitude };
         }
 
-        /// Collect typed, initialized INT locals in reusable per-batch scratch.
+        /// Collect typed INT locals in reusable per-batch scratch.
         /// The bounded literal transport used by RPC can carry the typed value
         /// without changing quoted strings, bracket names or comments. Only
         /// one engine statement follows these declarations, so a lock retry
@@ -637,10 +637,11 @@ pub fn Session(comptime DB: type) type {
                 }
                 const data_type = trimSpace(declaration[name_end..]);
                 const assignment = takeBatchWord(data_type, "INT") orelse takeBatchWord(data_type, "INTEGER") orelse return error.BadDeclaration;
-                if (assignment.len == 0 or assignment[0] != '=') return error.BadDeclaration;
-                var end: usize = 1;
+                const initialized = assignment.len != 0 and assignment[0] == '=';
+                if (!initialized and assignment.len != 0 and assignment[0] != ';') return error.BadDeclaration;
+                var end: usize = @intFromBool(initialized);
                 while (end < assignment.len and assignment[end] != ';') end += 1;
-                const value = try intInitializer(trimSpace(assignment[1..end]));
+                const value: RpcValue = if (initialized) try intInitializer(trimSpace(assignment[1..end])) else .{ .null_value = {} };
                 var parameter: Parameter = .{ .name_len = name.len };
                 @memcpy(parameter.name[0..name.len], name);
                 const literal_start = values_len;
@@ -649,6 +650,7 @@ pub fn Session(comptime DB: type) type {
                 try append(&self.rpc_values, &values_len, " AS INTEGER))");
                 parameter.literal_offset = literal_start;
                 parameter.literal_len = values_len - literal_start;
+                parameter.supplied = initialized;
                 self.rpc_parameters[count.*] = parameter;
                 count.* += 1;
                 source = if (end < assignment.len) trimSpace(assignment[end + 1 ..]) else "";
@@ -669,7 +671,9 @@ pub fn Session(comptime DB: type) type {
             }, @errorName(err));
             for (0..count) |index| {
                 const more = query.len != 0 or index + 1 < count;
-                try writer.done(0x10 | (if (more) @as(u16, 1) else 0), 1);
+                const initialized = self.rpc_parameters[index].supplied;
+                const flags: u16 = (if (initialized) @as(u16, 0x10) else 0) | (if (more) @as(u16, 1) else 0);
+                try writer.done(flags, @intFromBool(initialized));
             }
             if (query.len != 0) try self.batchQuery(db, query, writer);
         }
