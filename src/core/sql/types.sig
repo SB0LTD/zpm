@@ -21,6 +21,9 @@ pub const Config = struct {
     external_storage: bool = false,
     /// Place dense row values in a separate caller-owned external span.
     split_external_versions: bool = false,
+    /// Experimental integer/OID/DATE banks in split external storage.
+    /// Mixed banks serialize table DDL and reject copy-on-write ALTER.
+    integral_external_versions: bool = false,
     /// Query cells are a separately bound caller-owned runtime budget.
     external_workspace: bool = false,
     /// Result rows are bound independently by each serialized caller/session.

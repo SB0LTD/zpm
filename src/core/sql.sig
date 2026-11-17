@@ -219,6 +219,8 @@ pub fn Database(comptime config: Config) type {
 
     const V = types.Values(config);
     const S = storage.Storage(config);
+    if (config.integral_external_versions and !S.integral_enabled)
+        @compileError("integral_external_versions requires split external storage");
     const A = ast.Ast(config);
     const P = parser_module.Parser(config);
     const B = binder_module.Binder(config);
@@ -259,6 +261,7 @@ pub fn Database(comptime config: Config) type {
         pub const StorageRowSlot = S.RowSlot;
         pub const StorageVersion = S.Version;
         pub const StorageVersionRow = S.VersionRow;
+        pub const integralRowWords = S.integralRowWords;
         pub const ReplayScratch = C.Scratch;
         pub const Snapshot = storage.Snapshot;
         pub const LockSet = L.Set;
@@ -919,7 +922,8 @@ pub fn Database(comptime config: Config) type {
         };
 
         const storage_fields = .{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" } ++
-            (if (S.split_versions) .{"version_rows"} else .{});
+            (if (S.split_versions) .{"version_rows"} else .{}) ++
+            (if (S.integral_enabled) .{"integral_rows"} else .{});
 
         const BackingLayout = struct {
             offsets: [config.tables][storage_fields.len]usize,
@@ -929,7 +933,14 @@ pub fn Database(comptime config: Config) type {
             key_index: [config.tables]usize,
         };
 
-        pub const TableBudget = struct { rows: usize, versions: usize };
+        pub const TableBudget = struct {
+            rows: usize,
+            versions: usize,
+            /// Zero selects dense rows. A nonzero integral bank reserves
+            /// this many u64 words per version, including the null bitmap.
+            /// CREATE uses the first compatible free bank in caller order.
+            integral_row_words: usize = 0,
+        };
 
         fn appendLayout(cursor: *usize, comptime T: type, count: usize) Error!usize {
             const aligned = @addWithOverflow(cursor.*, @alignOf(T) - 1);
@@ -970,7 +981,13 @@ pub fn Database(comptime config: Config) type {
                 const index_slots = @mulWithOverflow(ki, S.bound_indexes);
                 if (index_slots[1] != 0) return error.InvalidParameterValue;
                 offsets[8] = if (S.bound_indexes != 0) try appendLayout(&cursor, u32, index_slots[0]) else cursor;
-                if (comptime S.split_versions) offsets[9] = try appendLayout(&cursor, S.VersionRow, versions);
+                if (!S.integral_enabled and budget.integral_row_words != 0) return error.InvalidParameterValue;
+                if (comptime S.split_versions) offsets[9] = try appendLayout(&cursor, S.VersionRow, if (budget.integral_row_words == 0) versions else 0);
+                if (comptime S.integral_enabled) {
+                    const words = @mulWithOverflow(versions, budget.integral_row_words);
+                    if (words[1] != 0) return error.InvalidParameterValue;
+                    offsets[10] = try appendLayout(&cursor, u64, words[0]);
+                }
             }
             layout.refs = try appendLayout(&cursor, u32, refs);
             layout.bytes = cursor;
@@ -1046,7 +1063,9 @@ pub fn Database(comptime config: Config) type {
             for (&backings, layout.offsets, layout.row_index, layout.key_index, budgets) |*backing, offsets, ri, ki, budget| backing.* = .{
                 .rows = try storageView(S.RowSlot, bytes, offsets[0], budget.rows),
                 .versions = try storageView(S.Version, bytes, offsets[1], budget.versions),
-                .version_rows = if (comptime S.split_versions) try storageView(S.VersionRow, bytes, offsets[9], budget.versions) else {},
+                .version_rows = if (comptime S.split_versions) try storageView(S.VersionRow, bytes, offsets[9], if (budget.integral_row_words == 0) budget.versions else 0) else {},
+                .integral_rows = if (comptime S.integral_enabled) try storageView(u64, bytes, offsets[10], budget.versions * budget.integral_row_words) else {},
+                .integral_row_words = if (S.integral_enabled) budget.integral_row_words else {},
                 .row_index = try storageView(u32, bytes, offsets[2], ri),
                 .key_index = try storageView(u32, bytes, offsets[3], ki),
                 .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) budget.rows * config.columns else 0),
@@ -1098,6 +1117,10 @@ pub fn Database(comptime config: Config) type {
                 table.rows = backing.rows;
                 table.versions = backing.versions;
                 if (comptime S.split_versions) table.version_rows = backing.version_rows;
+                if (comptime S.integral_enabled) {
+                    table.integral_rows = backing.integral_rows;
+                    table.integral_row_words = backing.integral_row_words;
+                }
                 table.row_index = backing.row_index;
                 table.key_index = backing.key_index;
                 table.scan_values = backing.scan_values;
@@ -1133,6 +1156,7 @@ pub fn Database(comptime config: Config) type {
             for (&self.tables, &source.tables) |*dst, *src| if (src.live) {
                 if (dst.rows.len < src.row_high or dst.versions.len < src.version_high or dst.row_index.len == 0 or dst.key_index.len == 0) return error.WorkspaceCapacity;
                 if (!S.indexFits(dst, src.index_count, src.version_used)) return error.WorkspaceCapacity;
+                if (!S.schemaFits(dst, src.columns[0..src.column_count])) return error.WorkspaceCapacity;
             };
             self.copyState(source);
         }
@@ -4084,7 +4108,28 @@ pub fn Database(comptime config: Config) type {
             if (M.write_capacity - self.txs[slot].write_len < count) return error.WriteSetCapacity;
         }
 
+        /// The experimental heterogeneous banks are chosen in WAL order.
+        /// Overlapping table DDL can commit in a different order from slot
+        /// acquisition. Replay also makes DROP slots available immediately.
+        fn fenceBankPlacement(self: *Self, slot: u16, creating: bool) Error!void {
+            if (!S.anyIntegralBank(&self.tables)) return;
+            for (&self.txs, 0..) |*tx, owner| {
+                if (owner == slot or !tx.active) continue;
+                for (tx.writes[0..tx.write_len]) |entry| switch (entry.kind) {
+                    .create_table, .drop_table, .alter_table => return error.SerializationFailure,
+                    else => {},
+                };
+            }
+            if (creating) {
+                self.reclaimTables(self.horizon());
+                for (&self.tables) |*table| {
+                    if (table.live and (table.pending_drop or table.dead_csn != 0)) return error.SerializationFailure;
+                }
+            }
+        }
+
         fn createTable(self: *Self, slot: u16, create: *const B.Create, snap: Snapshot, source: []const u8) Error!usize {
+            try self.fenceBankPlacement(slot, true);
             const tx = &self.txs[slot];
             // CREATE TABLE AS / MATERIALIZED VIEW read their sources first,
             // so a lock wait parks before anything is written.
@@ -4103,9 +4148,10 @@ pub fn Database(comptime config: Config) type {
                 return self.park(slot, waits);
             };
             try self.reserveWrites(slot, 2 + create.count);
+            const columns = create.columns[0..create.count];
             var destination: ?usize = null;
             for (0..2) |attempt| {
-                for (&self.tables, 0..) |*table, index| if (!table.live) {
+                for (&self.tables, 0..) |*table, index| if (!table.live and S.createBankFits(table, columns, create.extras.index_count)) {
                     destination = index;
                     break;
                 };
@@ -4116,7 +4162,7 @@ pub fn Database(comptime config: Config) type {
             if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
             const table = &self.tables[index];
             if (!S.indexFits(table, create.extras.index_count, 0)) return error.IndexCapacity;
-            S.reset(table, change_log.first_oid + self.oid_counter, create.name, create.columns[0..create.count]);
+            S.reset(table, change_log.first_oid + self.oid_counter, create.name, columns);
             table.namespace = create.namespace;
             S.setConstraints(table, create.constraints[0..create.constraint_count]);
             S.setExtras(table, &create.extras);
@@ -4209,6 +4255,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {
+            try self.fenceBankPlacement(slot, false);
             try self.lockTable(slot, index, .access_exclusive);
             const tx = &self.txs[slot];
             const table = &self.tables[index];
@@ -4335,6 +4382,9 @@ pub fn Database(comptime config: Config) type {
         /// free table slot (TableCapacity, 54000) until the old one is
         /// reclaimed after commit.
         fn alterTable(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            // ALTER acquires a new bank live and replays in place. Even a
+            // dense bank move can change later heterogeneous CREATE choices.
+            if (S.anyIntegralBank(&self.tables)) return error.UnsupportedStatement;
             try self.lockTable(slot, alter.table, .access_exclusive);
             const tx = &self.txs[slot];
             try self.reserveWrites(slot, 3 + 2 * config.columns);
@@ -5800,13 +5850,14 @@ pub fn Database(comptime config: Config) type {
         /// earlier one's key change); rolled-back slices were truncated.
         fn encodeWrites(self: *const Self, writer: *change_log.Writer, slot: u16) Error!void {
             const tx = &self.txs[slot];
+            var row_scratch: S.VersionRowScratch = undefined;
             for (tx.writes[0..tx.write_len]) |entry| {
                 switch (entry.kind) {
                     .insert, .update => {
                         const table = &self.tables[entry.table];
                         const version = &table.versions[entry.new];
                         const tag: change_log.Op = if (entry.kind == .insert) .insert else .update;
-                        try C.encodeRow(writer, tag, table.oid, table.rows[version.row - 1].rowid, S.versionValues(table, entry.new));
+                        try C.encodeRow(writer, tag, table.oid, table.rows[version.row - 1].rowid, S.versionValues(table, entry.new, &row_scratch));
                     },
                     .delete => {
                         const table = &self.tables[entry.table];
@@ -8263,6 +8314,9 @@ pub fn Database(comptime config: Config) type {
         /// decoded and validated against `scratch` before anything changes.
         /// Replay runs before any transaction starts.
         pub fn applyChangeRecord(self: *Self, record: []const u8, scratch: *ReplayScratch) Error!void {
+            if (S.anyIntegralBank(&self.tables)) for (&self.txs) |*tx| {
+                if (tx.active) return error.InvalidParameterValue;
+            };
             if (comptime config.external_workspace) if (self.workspace.query.cells.len == 0) return error.InvalidParameterValue;
             if (comptime config.external_storage) if (self.workspace.query.refs.len == 0) return error.InvalidParameterValue;
             try C.apply(self, record, scratch);

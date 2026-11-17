@@ -1478,9 +1478,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (!knownNamespace(scratch, definition.namespace)) return error.ChangeRecordConflict;
                         if (definition.oid < first_oid or definition.oid >= 0xfffffffe or oidTaken(db, scratch, definition.oid, width)) return error.ChangeRecordConflict;
                         if (nameTaken(scratch, definition.name.slice(), definition.namespace)) return error.ChangeRecordConflict;
+                        const columns = definition.columns[0..definition.count];
                         var free: ?usize = null;
                         for (&scratch.tables, 0..) |*vt, index| {
-                            if (!vt.live and free == null) free = index;
+                            if (!vt.live and free == null and S.createBankFits(&db.tables[index], columns, definition.extras.index_count)) free = index;
                         }
                         const index = free orelse return error.ChangeRecordConflict;
                         if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
@@ -1502,6 +1503,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.alter_table) => {
                         const index = try findVTable(scratch, try reader.int(u32));
+                        if (S.anyIntegralBank(&db.tables)) return error.ChangeRecordConflict;
                         const vt = &scratch.tables[index];
                         var definition: Definition = .{ .oid = vt.oid, .name = .{}, .columns = @splat(.{}), .count = 0 };
                         try decodeDefinition(&reader, &definition);
@@ -1781,9 +1783,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 switch (tag) {
                     @intFromEnum(Op.create_table) => {
                         const definition = try decodeCreate(&reader);
-                        for (&db.tables, 0..) |*table, index| if (!table.live) {
+                        const columns = definition.columns[0..definition.count];
+                        for (&db.tables, 0..) |*table, index| if (!table.live and S.createBankFits(table, columns, definition.extras.index_count)) {
                             if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
-                            S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
+                            S.reset(table, definition.oid, definition.name, columns);
                             table.namespace = definition.namespace;
                             S.setConstraints(table, definition.constraints[0..definition.constraint_count]);
                             S.setExtras(table, &definition.extras);
