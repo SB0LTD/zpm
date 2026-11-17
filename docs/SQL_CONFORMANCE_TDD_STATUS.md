@@ -2,16 +2,16 @@
 
 ## Native wire checkpoint — 17 November 2026
 
-The unchanged 118-program inventory now has independent PostgreSQL and MySQL
-wire results for RAMSQL `f6c6867a1d776b96657c3ad3405b4927e48cfc9b` with ZPM
-`df5e8da5f85c1f4ff70dfec735e722cc3d625ac2`. The Windows ReleaseSafe executable
-has SHA-256 `eff4a6531a7af99d72afec5a1d1d10baf89dda5c761b216124c38a908320ce62`.
+The unchanged 118-program inventory has independent native wire results for
+RAMSQL `13294c5246dce4ef6ab23af55c1679b7d189af42` with ZPM
+`5f674e9e561d208bed7f29338b462d257e482165`. The Windows ReleaseSafe executable
+has SHA-256 `790e66db2485374d01104610a4ade911c67d349a9ea2382811af67c7011626f2`.
 
 | Native reference | Matched | Open cases |
 | --- | ---: | --- |
 | PostgreSQL 18.3 | 104 of 106 | `PG.DDL.DATABASE`, `PG.TX.TWO_PHASE` |
-| MySQL Community 8.4.13 | 3 of 6 | `MYSQL.TYPES`, `MYSQL.AUTO_INCREMENT`, `MYSQL.REPLACE_UPSERT` |
-| SQL Server 2022 CU28 | 0 of 6 | `IDENTIFIERS`, `TOP`, `FUNCTIONS` differ in metadata. `OUTPUT`, `APPLY`, `PROCEDURAL` fail on feature SQL. |
+| MySQL Community 8.4.13 | 4 of 6 | `MYSQL.TYPES`, `MYSQL.AUTO_INCREMENT` |
+| SQL Server 2022 CU28 | 3 of 6 | `OUTPUT`, `APPLY`, `PROCEDURAL` fail on feature SQL. |
 
 The PostgreSQL enum, domain and composite case now matches. The wire audit
 normalizes dynamic OIDs through each server's own type catalog and retains the
@@ -21,17 +21,19 @@ The older requirement to match a particular dynamically assigned OID came from
 the historical core-only fixture below.
 
 The native PostgreSQL inventory report SHA-256 is
-`297ebd021df3147fd63bf77c0e4f320568fb484831bb6bc312b3d4c2f84a08cf`.
+`e968964adfda572ecf90a75a4f59b7a9c107705eaef572af2321de5131db6813`.
 The native MySQL report SHA-256 is
-`7a2b058d7c418d2fbd0e675a46226d57ee72c09546b043c278bd7b323be908b2`.
-The Linux artifact in the SQL Server run returned identical rows for the
-bracket alias, TOP and scalar function probes. SQL Server marks their
-non-null INT projections as fixed-length, and its unnamed scalar results
-carry empty labels. The RAMSQL variable-length INT metadata and generated
-function labels keep all three probes failing under the strict comparator.
-The [RAMSQL qualification PR](https://github.com/SB0LTD/ramsql/pull/64) and
-[SQL Server comparison](https://github.com/benor1470/dbMeter/actions/runs/44157665404)
-track the exact platform and remaining native evidence.
+`3968cae8b53cca49e11322fce7e2e6316db558de8e15062c18655f1b78be120b`.
+The MySQL primary-key `REPLACE` trace also matches repeated keys, defaults,
+failed-statement rollback, explicit rollback, cross-session visibility,
+same-key writer blocking and replay of the committed result.
+The trace SHA-256 is `7e883970bdf955f59b392d1aac9adce8b3e4c04875f6e56ecc50dfc1a7907716`.
+
+The Linux SQL Server comparison matches result metadata and values for the
+bracket alias, TOP and scalar function cases, plus all 24 setup observations.
+The exact Linux executable SHA-256 is
+`0cd3819f3d3236664f3588935a55d73d150b5c863b781af163f7b16a0c92b00c`.
+[Native SQL Server run](https://github.com/benor1470/dbMeter/actions/runs/44161329548)
 
 ## Catalog and security candidate (lane B11, wave 3) - 5 November 2026
 

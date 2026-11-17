@@ -10,7 +10,8 @@ require their own versioned native oracles. See the
 [latest recorded checkpoint](checkpoint_20261101.json).
 
 On 17 November 2026, the current RAMSQL candidate matched 104 of 106 native
-PostgreSQL 18.3 probes and three of six native MySQL 8.4.13 probes. The frozen
+PostgreSQL 18.3 probes, four of six native MySQL 8.4.13 probes and three of six
+native SQL Server 2022 CU28 probes. The frozen
 fixture and historical core-only classification are preserved. See the
 [native wire checkpoint](../../docs/SQL_CONFORMANCE_TDD_STATUS.md#native-wire-checkpoint--17-november-2026).
 
