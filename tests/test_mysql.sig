@@ -3,7 +3,7 @@ const std = @import("std");
 const sql = @import("sql");
 const mysql = @import("mysql");
 const db_store = @import("db_store");
-const Raw = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 4, .text_bytes = 64 });
+const Raw = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 4, .text_bytes = 64, .integer_bits = 32 });
 const Store = db_store.Store(Raw);
 const DB = Store.Connection;
 const Session = mysql.Session(DB);
@@ -111,7 +111,7 @@ fn typedResultsAndErrors() !void {
     var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
-    _ = try command(&session, &db, "CREATE TABLE data (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
+    _ = try command(&session, &db, "CREATE TABLE data (id BIGINT PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
     try check(output[4] == 0);
     _ = try command(&session, &db, "INSERT INTO data VALUES (-9223372036854775808, 'עברית😀', TRUE, NULL)");
     try check(output[4] == 0 and output[5] == 1);
@@ -259,12 +259,14 @@ fn nativeIdentifierAndLimit() !void {
     _ = try command(&session, &db, "SELECT 1 AS `value`");
     try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 1);
     try same(session.result.column_names[0].slice(), "value");
+    try check(session.result.column_types[0] == .integer);
     _ = try command(&session, &db, "CREATE TABLE `tdd_a`(`id` INT PRIMARY KEY,`v``x` INT)");
     try check(output[4] == 0);
     _ = try command(&session, &db, "INSERT INTO `tdd_a`(`id`,`v``x`) VALUES(1,10),(2,20),(3,30),(4,40)");
     try check(output[4] == 0);
     _ = try command(&session, &db, "SELECT id FROM tdd_a ORDER BY id LIMIT 1,2");
     try check(session.result.row_count == 2 and session.result.rows[0].cells[0].integer == 2 and session.result.rows[1].cells[0].integer == 3);
+    try check(session.result.column_types[0] == .integer32);
     _ = try command(&session, &db, "SELECT `a`.`v``x` AS `x``y` FROM `tdd_a` AS `a` ORDER BY `a`.`id` DESC LIMIT 1,1");
     try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 30);
     try same(session.result.column_names[0].slice(), "x`y");
@@ -323,11 +325,73 @@ fn nativeGrammarAndReplay() !void {
         try check(err == error.UnsupportedLogVersion);
 }
 
+fn nativeSignedIntegerLiterals() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    const probes = [_]struct { query: []const u8, values: [4]i64 }{
+        .{ .query = "SELECT 0,1,-1,+1", .values = .{ 0, 1, -1, 1 } },
+        .{ .query = "SELECT -0,0001,-0001,(-(1))", .values = .{ 0, 1, -1, -1 } },
+        .{
+            .query = "SELECT 2147483647,2147483648,-2147483648,-2147483649",
+            .values = .{ 2147483647, 2147483648, -2147483648, -2147483649 },
+        },
+        .{
+            .query = "SELECT 9223372036854775807,-9223372036854775808,-(2147483648),+(-9223372036854775808)",
+            .values = .{ 9223372036854775807, -9223372036854775808, -2147483648, -9223372036854775808 },
+        },
+    };
+    for (probes) |probe| {
+        _ = try command(&session, &db, probe.query);
+        try check(session.result.row_count == 1 and session.result.column_count == probe.values.len);
+        for (probe.values, 0..) |expected, index| {
+            try check(session.result.column_types[index] == .integer);
+            try check(session.result.rows[0].cells[index].integer == expected);
+        }
+    }
+    _ = try command(&session, &db, "CREATE TABLE signed_values(i INT PRIMARY KEY)");
+    try check(output[4] == 0);
+    _ = try command(&session, &db, "INSERT INTO signed_values VALUES(7)");
+    try check(output[4] == 0);
+    const reply = try command(&session, &db, "SELECT i,1,-1,+1 FROM signed_values WHERE i=7");
+    try check(session.result.row_count == 1 and session.result.column_count == 4);
+    var reader: Reader = .{ .source = output[0..reply.written] };
+    try same(try reader.next(), &.{4});
+    for ([_]u8{ 3, 8, 8, 8 }, [_]i64{ 7, 1, -1, 1 }, 0..) |kind, expected, index| {
+        const metadata = try reader.next();
+        try check(metadata.len >= 13 and metadata[metadata.len - 6] == kind);
+        try check(metadata[metadata.len - 5] & 32 == 0 and metadata[metadata.len - 3] == 0);
+        try check(session.result.rows[0].cells[index].integer == expected);
+    }
+    const shared = try command(&session, &db, "SELECT SUBSTRING('abcdef',2,3), LAG(i,1) OVER (ORDER BY i) FROM signed_values");
+    try check(shared.written > 0 and output[4] == 2);
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[1] == .null_value);
+    try same(session.result.rows[0].cells[0].text.slice(), "bcd");
+    var result: Raw.Result = .{};
+    store.database.dialect = .mysql;
+    try store.database.execute("SELECT CAST(1 AS DECIMAL(5,2)), 9223372036854775808, 18446744073709551616, -9223372036854775809", &result);
+    try check(result.row_count == 1 and result.column_count == 4);
+    for (result.column_types[0..4], result.rows[0].cells[0..4]) |kind, cell| try check(kind == .numeric and cell == .numeric);
+    if (store.database.execute("SELECT -(-9223372036854775808)", &result)) |_| return error.UnexpectedIntegerOverflow else |err|
+        try check(err == error.IntegerOverflow);
+
+    for ([_]sql.Dialect{ .postgres, .tds }) |dialect| {
+        store.database.dialect = dialect;
+        try store.database.execute("SELECT 1,-1,CAST(1 AS BIGINT)", &result);
+        try check(result.column_types[0] == .integer32 and result.column_types[1] == .integer32 and result.column_types[2] == .integer);
+    }
+    store.database.dialect = .mysql;
+    try store.database.executeLegacy("SELECT i FROM signed_values WHERE i=7", &result);
+    try check(result.column_types[0] == .integer32);
+}
+
 pub fn main(init: std.process.Init) !void {
     try handshakeAndFragmentation();
     try typedResultsAndErrors();
     try nativeIdentifierAndLimit();
     try nativeGrammarAndReplay();
+    try nativeSignedIntegerLiterals();
     try transactionsAndOutputPreflight();
     try concurrentCommittedVisibility();
     try malformedAndFuzz();
