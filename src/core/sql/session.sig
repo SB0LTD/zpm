@@ -275,6 +275,8 @@ pub fn Sessions(comptime config: types.Config) type {
             names: [config.columns]Name = @splat(.{}),
             column_types: [config.columns]types.DataType = @splat(.integer),
             typmods: [config.columns]i32 = @splat(-1),
+            has_nominal_types: bool = false,
+            nominal_types: [config.columns]types.NominalColumnType = undefined,
             base: usize = 0,
             count: usize = 0,
             /// 0 before the first row, 1..count on a row, count+1 after the last.

@@ -682,8 +682,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 scratch: *Scratch,
                 next_oid: *u32,
 
-                pub fn objectOidTaken(self: *const @This(), oid: u32) bool {
-                    return oidTaken(self.db, self.scratch, oid, 1);
+                pub fn objectOidTaken(self: *const @This(), oid: u32, width: u32) bool {
+                    return oidTaken(self.db, self.scratch, oid, width);
                 }
 
                 pub fn objectRelationNameTaken(self: *const @This(), namespace: u32, name: []const u8) bool {
@@ -784,7 +784,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         }
 
         fn nameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
-            return relationNameTaken(scratch, name, namespace) or scratch.object_overlay.domainNameTaken(namespace, name);
+            return relationNameTaken(scratch, name, namespace) or scratch.object_overlay.userTypeNameTaken(namespace, name);
         }
 
         fn findVSchema(scratch: *Scratch, oid: u32) Error!usize {
@@ -1933,7 +1933,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.object_create) => {
                         const object = try O.decodeCreate(record, &reader.position);
                         db.catalog_objects.applyCreate(&object, db.epoch, db.cid, csn);
-                        const width = catalog_objects.oidWidth(object.kind);
+                        const width = object.oidWidth();
                         if (width != 0) db.oid_counter = @max(db.oid_counter, object.oid + width - first_oid);
                     },
                     @intFromEnum(Op.object_drop) => {

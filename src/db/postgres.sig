@@ -1442,8 +1442,9 @@ pub fn Session(comptime DB: type) type {
                 try w.u32be(0);
                 try w.u16be(0);
                 const data_type = self.result.column_types[i];
-                try w.u32be(T.oid(data_type));
-                try w.u16be(@bitCast(T.length(data_type)));
+                const nominal = if (@hasDecl(DB.Result, "nominalColumnType")) self.result.nominalColumnType(i) else null;
+                try w.u32be(if (nominal) |identity| identity.oid else T.oid(data_type));
+                try w.u16be(@bitCast(if (nominal) |identity| identity.len else T.length(data_type)));
                 const typmod: i32 = if (@hasField(DB.Result, "column_typmods")) self.result.column_typmods[i] else -1;
                 try w.u32be(@bitCast(typmod));
                 if (portal_value) |v| {
@@ -1516,6 +1517,8 @@ pub fn Session(comptime DB: type) type {
                 .create_extension => "CREATE EXTENSION",
                 .create_domain => "CREATE DOMAIN",
                 .drop_domain => "DROP DOMAIN",
+                .create_type => "CREATE TYPE",
+                .drop_type => "DROP TYPE",
                 else => null,
             };
         }
@@ -1738,6 +1741,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "WrongObjectType")) return "42809";
     if (equal(name, "DependentObjects")) return "2BP01";
     if (equal(name, "UndefinedObject")) return "42704";
+    if (equal(name, "InvalidName")) return "42602";
     if (equal(name, "BadCopyFormat")) return "22P04";
     if (equal(name, "InvalidBinaryRepresentation")) return "22P03";
     if (equal(name, "StringDataRightTruncation")) return "22001";
