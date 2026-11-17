@@ -78,6 +78,7 @@ pub fn Exec(comptime config: types.Config) type {
             gathered_rows: usize = 0,
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
+            rollup_folded_leaves: usize = 0,
             probes: usize = 0,
             window_frame_rows:usize=0,
             window_prefix_rows:usize=0,
@@ -3111,6 +3112,26 @@ pub fn Exec(comptime config: types.Config) type {
                 }
             }
 
+            fn rollupCanFold(self: *const Query, p: *const B.Plan) bool {
+                if (p.key_count < 2 or p.where != none or !self.prefixJoinsSafe(p) or !repeatablePool(self.pool)) return false;
+                for (p.keys[0..p.key_count]) |id| {
+                    const key = self.pool.nodes[id];
+                    if (key.kind != .column or key.level != 0) return false;
+                    const table = &self.tables[p.sources[key.relation].table.?];
+                    if (!table.columns[key.column].not_null) return false;
+                }
+                for (p.aggs[0..p.agg_count], 0..) |agg, index| {
+                    if (!p.aggregate_required[index]) continue;
+                    if (agg.distinct or agg.filter != none) return false;
+                    if (agg.kind == .count_star) continue;
+                    if (agg.kind != .count and !(value_module.integral(agg.arg_ty) and
+                        (agg.kind == .avg or (agg.kind == .sum and agg.ty != .int8)))) return false;
+                    const arg = self.pool.nodes[agg.arg];
+                    if (arg.kind != .column or arg.level != 0) return false;
+                }
+                return true;
+            }
+
             /// One input evaluation, independent exact aggregate state at every
             /// prefix. The level tag separates real NULL keys from rolled NULLs.
             fn groupingRollup(self:*Query,p:*const B.Plan,outer:?*const E.Context) Error!List {
@@ -3132,7 +3153,11 @@ pub fn Exec(comptime config: types.Config) type {
                 const buckets=try self.refs(slots);@memset(self.work.refs[buckets..][0..slots],absent);
                 const tickets=try self.refs(capacity);var groups:usize=0;
                 var keys:[config.columns]V.Cell=@splat(.null_value);
-                _=try self.rollupRecord(p,keys[0..p.key_count],0,buckets,slots,tickets,&groups,capacity,record_cells,ordinary_cells,&distinct);
+                const total = try self.rollupRecord(p,keys[0..p.key_count],0,buckets,slots,tickets,&groups,capacity,record_cells,ordinary_cells,&distinct);
+                // PK joins admit at most one tuple per fact row. Exact wide
+                // sums and counts of these rows can be added in any order.
+                const fold = streamed and self.rollupCanFold(p);
+                const first_prefix = if (fold) p.key_count else 0;
                 var ctx=self.context(outer);var cursor:StreamCursor=.{};var row_index:usize=0;
                 const early=streamed and p.source_count>1 and self.earlyAvailable(p.where,p.source_count-1) and self.prefixJoinsSafe(p);
                 if(streamed) self.prepareStreamCursor(p,&cursor,early);
@@ -3147,7 +3172,7 @@ pub fn Exec(comptime config: types.Config) type {
                         if(agg.kind==.count_star){allowed[index]=true;continue;}
                         values[index]=try E.eval(&ctx,agg.arg);allowed[index]=values[index]!=.null_value;
                     }
-                    for(0..p.key_count+1) |prefix| {
+                    for(first_prefix..p.key_count+1) |prefix| {
                         const at=try self.rollupRecord(p,keys[0..p.key_count],prefix,buckets,slots,tickets,&groups,capacity,record_cells,ordinary_cells,&distinct);
                         const states=self.accumulators(at+@as(u32,@intCast(p.key_count+p.agg_count+1)),p.agg_count);
                         const seen=self.distinctWords(at+@as(u32,@intCast(ordinary_cells)),distinct.words);
@@ -3163,6 +3188,30 @@ pub fn Exec(comptime config: types.Config) type {
                             try self.accumulate(&agg,state,&values[index]);
                         }
                     }
+                }
+                if (fold) {
+                    // Derive subtotals once per leaf (the first ticket is the
+                    // grand total). Reusing the same records keeps the existing
+                    // group memory bound. Non-null leaf keys distinguish levels.
+                    const leaves = groups - 1;
+                    const state_offset: u32 = @intCast(p.key_count + p.agg_count + 1);
+                    for (self.work.refs[tickets + 1..][0..leaves]) |leaf| {
+                        const leaf_keys = self.work.cells[leaf..][0..p.key_count];
+                        const input = self.accumulators(leaf + state_offset, p.agg_count);
+                        for (0..p.key_count) |prefix| {
+                            const parent = if (prefix == 0) total else try self.rollupRecord(
+                                p, leaf_keys, prefix, buckets, slots, tickets, &groups,
+                                capacity, record_cells, ordinary_cells, &distinct,
+                            );
+                            const states = self.accumulators(parent + state_offset, p.agg_count);
+                            for (states, input) |*state, *delta| {
+                                try self.session.checkpoint();
+                                state.count += delta.count;
+                                state.wide += delta.wide;
+                            }
+                        }
+                    }
+                    self.work.stream_stats.rollup_folded_leaves += leaves;
                 }
                 if(groups>1) {
                     const scratch=try self.refs(groups);const sorter:GroupSorter=.{.query=self,.width=p.key_count};

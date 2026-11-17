@@ -33,13 +33,52 @@ fn reject(q:[]const u8,wanted:sql.Error) !void {
 const Cancel=struct {remaining:usize,fn poll(raw:?*anyopaque) sql.Error!void {
     const self:*Cancel=@ptrCast(@alignCast(raw.?));if(self.remaining==0) return error.QueryCanceled;self.remaining-=1;
 }};
+
+fn foldedRollup() !void {
+    try run("CREATE TABLE measures(id INTEGER PRIMARY KEY, dim_id INTEGER, band INTEGER NOT NULL, amount BIGINT)");
+    const select = "SELECT d.label,m.band,GROUPING(d.label,m.band),COUNT(*),COUNT(m.amount),SUM(m.amount),AVG(m.amount) FROM measures m JOIN dim d ON d.id=m.dim_id GROUP BY ";
+    const order = " ORDER BY d.label NULLS LAST,m.band NULLS LAST,GROUPING(d.label,m.band)";
+    const rollup = select ++ "ROLLUP(d.label,m.band)" ++ order;
+    const sets = select ++ "GROUPING SETS ((d.label,m.band),(d.label),())" ++ order;
+    try run(rollup);
+    try check(result.row_count == 1 and result.rows[0].cells[3].integer == 0);
+    try check(result.rows[0].cells[5] == .null_value and result.rows[0].cells[6] == .null_value);
+    try run("INSERT INTO measures VALUES (1,1,9,9223372036854775807),(2,2,9,9223372036854775807),(3,2,10,-7),(4,1,10,NULL),(5,3,3,NULL),(6,4,3,8)");
+    try run(rollup);
+    try check(db.workspace.query.stream_stats.rollup_folded_leaves == 3);
+    const folded = result;
+    try run(sets);
+    try check(result.row_count == folded.row_count and result.column_count == folded.column_count);
+    for (result.rows[0..result.row_count], folded.rows[0..folded.row_count]) |*actual, *expected| {
+        for (actual.cells[0..result.column_count], expected.cells[0..result.column_count]) |*a, *b| {
+            try check(Db.compareCells(a, b) == 0);
+        }
+    }
+    var control: sql.ExecutionControl = .{};
+    db.session.control = &control;
+    defer db.session.control = null;
+    try run(rollup);
+    const used = control.used;
+    try check(used > 1);
+    control.reset(used - 1);
+    try reject(rollup, error.QueryWorkLimit);
+    try check(control.used == used - 1);
+    var cancel: Cancel = .{ .remaining = used - 1 };
+    control.context = &cancel;
+    control.poll = Cancel.poll;
+    control.poll_interval = 1;
+    control.reset(0);
+    try reject(rollup, error.QueryCanceled);
+}
+
 pub fn main() !void {
     try run("CREATE TABLE fact(id INTEGER PRIMARY KEY,k INTEGER,v INTEGER)");
     try run("INSERT INTO fact VALUES(1,1,10),(2,1,10),(3,1,30),(4,2,5),(5,2,NULL),(6,NULL,7)");
-    try run("CREATE TABLE dim(id INTEGER PRIMARY KEY,label TEXT)");
+    try run("CREATE TABLE dim(id INTEGER PRIMARY KEY,label TEXT NOT NULL)");
     try run("INSERT INTO dim VALUES(1,'north'),(2,'north'),(3,'south')");
     var fixtures=std.mem.splitScalar(u8,@embedFile("evidence/rollup-pg16.tsv"),'\n');
     while(fixtures.next()) |line| {if(line.len==0) continue;const tab=std.mem.indexOfScalar(u8,line,'\t') orelse return error.InvalidFixture;try fixture(line[0..tab],line[tab+1..]);}
+    try foldedRollup();
     try run("SELECT k,v,COUNT(*),SUM(v),GROUPING(k,v) FROM fact GROUP BY ROLLUP(k,v) ORDER BY k NULLS LAST,v NULLS LAST,GROUPING(k,v)");
     try check(result.row_count==9);
     var total_count:i64=0;
