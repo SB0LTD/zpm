@@ -218,6 +218,31 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(response['transaction'], 'T')
         self.assertTrue(pg.sock.sent.startswith(b'Q'))
 
+    def test_copy_stream_compares_formats_and_data_independent_of_frames(self):
+        header = message(b'H', struct.pack('!BHHH', 0, 2, 0, 0))
+        tail = message(b'c', b'') + message(b'C', b'COPY 1\0') + message(b'Z', b'T')
+        pg = Pg.__new__(Pg)
+        pg.sock = FragmentedSocket(header + message(b'd', b'"a","b"\n') + tail)
+        first = pg.query('COPY sample TO STDOUT WITH (FORMAT CSV)')
+        pg.sock = FragmentedSocket(header + message(b'd', b'"a",') + message(b'd', b'"b"\n') + tail)
+        second = pg.query('COPY sample TO STDOUT WITH (FORMAT CSV)')
+        self.assertEqual(first['copy'], {'formats': [0, 0, 0], 'hex': b'"a","b"\n'.hex()})
+        self.assertTrue(equivalent([first], [second], True))
+        second['copy']['hex'] = b'a,"b"\n'.hex()
+        self.assertFalse(equivalent([first], [second], True))
+        pg.sock = FragmentedSocket(header + tail[5:])
+        with self.assertRaisesRegex(ValueError, 'Incomplete COPY output'):
+            pg.query('COPY sample TO STDOUT')
+
+    def test_explain_structure_compares_cardinality_across_different_plans(self):
+        baseline = dict(result([['[{"Plan":{"Node Type":"Index Scan","Actual Rows":1.00,"Actual Loops":1}}]']]),
+                        command='EXPLAIN', columns=[['QUERY PLAN', 114, -1, -1, 0]])
+        current = dict(baseline, rows=[['[{"Plan":{"Node Type":"Sequential Scan","Actual Rows":1,"Actual Loops":1}}]']])
+        self.assertTrue(equivalent([baseline], [current], False, 'explain_structure'))
+        for invalid in [current['rows'][0][0].replace('Rows":1', 'Rows":2'),
+                        current['rows'][0][0].replace('Loops":1', 'Loops":0'), '[]', None]:
+            self.assertFalse(equivalent([baseline], [dict(current, rows=[[invalid]])], False, 'explain_structure'))
+
     def test_error_fields_and_connection_loss(self):
         self.assertEqual(Pg.error(b'SERROR\0C22012\0Mdivision by zero\0\0'),
                          {'sqlstate': '22012', 'message': 'division by zero'})
