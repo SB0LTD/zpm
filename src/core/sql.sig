@@ -1395,6 +1395,7 @@ pub fn Database(comptime config: Config) type {
                 for (nodes) |node| switch (node.kind) {
                     .at_zone => return true,
                     .text_literal => if (inputNeedsZoneResolver(node.ty)) return true,
+                    .function => if (node.func == .json_table_column and inputNeedsZoneResolver(node.cast_type)) return true,
                     .cast => {
                         if (node.a == ast.none) {
                             if (inputNeedsZoneResolver(node.cast_type)) return true;

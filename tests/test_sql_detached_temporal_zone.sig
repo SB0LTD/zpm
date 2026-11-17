@@ -72,6 +72,9 @@ pub fn main() !void {
     try expectSerialized("SELECT (a::timestamptz[])[1] FROM datetimes", zoned);
     try expectSerialized("SELECT lower(r::tstzrange) FROM datetimes", zoned);
     try expectSerialized("SELECT v::timetz FROM datetimes", .{ .timetz = .{ .us = 12 * hour, .zone = -7200 } });
+    try expectSerialized(
+        "SELECT v FROM JSON_TABLE('\"2000-01-15 12:00:00 Test/Plus2\"', '$' COLUMNS (v TIMESTAMPTZ PATH '$')) AS jt",
+        zoned);
     try checkRoute("SELECT TIMETZ '12:00+02'", true);
     try checkRoute("SELECT s AT TIME ZONE 'UTC' FROM datetimes", true);
     try expectDetached("SELECT s::timestamptz FROM datetimes");
@@ -79,5 +82,6 @@ pub fn main() !void {
     try expectDetached("SELECT z::time FROM datetimes");
     try expectDetached("SELECT (t::timestamptz[])[1] FROM datetimes");
     try expectDetached("SELECT to_timestamp(0)");
+    try expectDetached("SELECT v FROM JSON_TABLE('1', '$' COLUMNS (v INT PATH '$')) AS jt");
     std.debug.print("PASS detached temporal resolver eligibility and typed conversions\n", .{});
 }
