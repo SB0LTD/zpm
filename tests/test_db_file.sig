@@ -113,6 +113,9 @@ pub fn main(init: std.process.Init) !void {
     replay = .{};
     const twice = try log.recover(&file, &scratch, &replay, Replay.apply);
     try check(twice.sequence == 2 and !twice.truncated_tail);
+    const first_frame: log.Frame = .{ .offset = 0, .sequence = 1, .kind = 1, .payload_len = "durable transaction".len };
+    try check(std.mem.eql(u8, try log.readFrame(&file, &scratch, first_frame), "durable transaction"));
+    try check(try file.length() == twice.valid_bytes);
     var empty: [0]u8 = .{};
     try check(try file.readAt(0, &empty) == 0);
     try check(try file.readAt(try file.length(), &scratch) == 0);
