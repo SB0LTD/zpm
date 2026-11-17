@@ -4195,6 +4195,7 @@ pub fn Exec(comptime config: types.Config) type {
             result.clear(0);
             result.command = .select;
             result.column_count = p.count;
+            result.non_null_columns = p.non_null_columns;
             for (0..p.count) |column| {
                 result.column_names[column] = p.names[column];
                 result.column_types[column] = types.dataTypeOf(p.tys[column]);
@@ -4760,6 +4761,7 @@ pub fn Exec(comptime config: types.Config) type {
             result.clear(0);
             result.command = .select;
             result.column_count = query.count;
+            result.non_null_columns = query.non_null_columns;
             if (query.has_nominal_types) result.setNominalTypes(query.nominal_types[0..query.count]);
             for (0..query.count) |index| {
                 result.column_names[index] = query.names[index];

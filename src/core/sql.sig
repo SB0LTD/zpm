@@ -89,6 +89,7 @@
 //! module and sql/*.sig may ever use are std.fmt.parseFloat(T, s) and
 //! std.fmt.float.render(buf, value, options); float_text.sig uses exactly
 //! those two (REAL/DOUBLE input and shortest round-trip output).
+const std = @import("std");
 const types = @import("sql/types.sig");
 const ast = @import("sql/ast.sig");
 const lexer = @import("sql/lexer.sig");
@@ -295,6 +296,8 @@ pub fn Database(comptime config: Config) type {
             create_query_data: bool = false,
             column_names: [config.columns]Name = @splat(.{}),
             column_types: [config.columns]DataType = @splat(.integer),
+            /// Nullability proven by the binder for this result shape.
+            non_null_columns: std.StaticBitSet(config.columns) = .empty,
             /// PostgreSQL atttypmod of each column (-1 when none).
             column_typmods: [config.columns]i32 = @splat(-1),
             /// Advanced catalog types can share the built-in value storage
@@ -391,6 +394,7 @@ pub fn Database(comptime config: Config) type {
                 self.command = .none;
                 self.create_query_data = false;
                 self.has_nominal_types = false;
+                self.non_null_columns = .empty;
             }
 
             pub fn setNominalTypes(self: *Result, columns: []const types.NominalColumnType) void {
@@ -429,6 +433,7 @@ pub fn Database(comptime config: Config) type {
                 self.affected_rows = source.affected_rows;
                 self.command = source.command;
                 self.create_query_data = source.create_query_data;
+                self.non_null_columns = source.non_null_columns;
                 self.has_nominal_types = false;
                 if (source.has_nominal_types) self.setNominalTypes(source.nominal_types[0..source.column_count]);
                 @memcpy(self.column_names[0..source.column_count], source.column_names[0..source.column_count]);
@@ -1187,6 +1192,7 @@ pub fn Database(comptime config: Config) type {
                 switch(plan) {
                     .simple=>|select| {
                         result.column_count=select.count;
+                        result.non_null_columns=select.non_null_columns;
                         @memcpy(result.column_names[0..select.count],select.names[0..select.count]);
                         @memcpy(result.column_types[0..select.count],select.types[0..select.count]);
                         @memcpy(result.column_typmods[0..select.count],select.typmods[0..select.count]);
@@ -1195,6 +1201,7 @@ pub fn Database(comptime config: Config) type {
                     .general=>|root| {
                         const query=&self.workspace.plans.items[root];
                         result.column_count=query.count;
+                        result.non_null_columns=query.non_null_columns;
                         for(0..query.count) |i| {
                             result.column_names[i]=query.names[i];result.column_types[i]=types.dataTypeOf(query.tys[i]);
                             result.column_typmods[i]=query.typmods[i];
@@ -9115,6 +9122,7 @@ pub fn Database(comptime config: Config) type {
             }
             if (bound == .select) {
                 result.column_count = bound.select.count;
+                result.non_null_columns = bound.select.non_null_columns;
                 if (bound.select.has_nominal_types) result.setNominalTypes(bound.select.nominal_types[0..bound.select.count]);
                 for (0..bound.select.count) |index| {
                     result.column_names[index] = bound.select.names[index];
@@ -9125,6 +9133,7 @@ pub fn Database(comptime config: Config) type {
             if (bound == .query) {
                 const plan = &self.workspace.plans.items[bound.query];
                 result.column_count = plan.count;
+                result.non_null_columns = plan.non_null_columns;
                 for (0..plan.count) |index| {
                     result.column_names[index] = plan.names[index];
                     result.column_types[index] = types.dataTypeOf(plan.tys[index]);
