@@ -4045,10 +4045,10 @@ test "a vertex stage: the assembler's rectangle program stores each vertex's pos
         }
         if (pass == 0) continue;
         // (scheduled, the first store waits on its load's scoreboard and
-        // sets the same one again for its own reads: the wait counts first)
+        // sets the reads' one, 5, for its own reads)
         const ast = test_work.ops[2].control;
         try testing.expectEqual(Kind.ast, test_work.ops[2].kind);
-        try testing.expect(ast.read != NONE and ast.wait & (@as(u6, 1) << ast.read) != 0);
+        try testing.expect(ast.read == 5 and ast.wait != 0 and ast.wait & (@as(u6, 1) << ast.read) == 0);
     }
 }
 

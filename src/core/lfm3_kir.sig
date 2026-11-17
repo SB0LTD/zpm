@@ -104,6 +104,19 @@ pub const HEAD_SIZE = 128;
 pub const SCORE_CHUNK = 64;
 /// Positions one attnValues workgroup sums.
 pub const VALUE_CHUNK = 256;
+/// Positions attnValues loads before it adds them, at most (a divisor of
+/// VALUE_CHUNK): valueUnroll's for a tile of `rows`.
+pub const VALUE_UNROLL = 32;
+
+/// Positions an attnValues iteration loads for a tile of `rows` rows: as
+/// many as about 96 registers of loaded values and weights hold (each
+/// iteration waits out about one memory round trip: 32 for a decode
+/// token's two heads, 8 for a prefill tile's eight rows).
+pub fn valueUnroll(rows: usize) u32 {
+    var u: u32 = VALUE_UNROLL;
+    while (u > 4 and u * (1 + @as(u32, @intCast(rows))) > 96) u /= 2;
+    return u;
+}
 /// Rows (heads x tokens) one attention workgroup takes at most.
 pub const MAX_ROWS = 8;
 /// Threads of the row kernels (norms, quantization, residual).
@@ -2120,9 +2133,10 @@ pub fn attnSoftmax(s: kir.Storage, caps: Caps) Error!kir.Kernel {
 
 /// Sums weight * f16 value in position order over one chunk of
 /// VALUE_CHUNK positions (aligned) for a tile of `hg` heads by `tt` tokens:
-/// thread j has elements j and j + 64 of every row. Each row's partial for
-/// the chunk goes to partial[row][chunk - first chunk]. Groups:
-/// valueGroups.
+/// thread j has elements 2j and 2j + 1 of every row (one 32-bit load a
+/// position: two 16-bit loads made the kernel three times slower on the
+/// RTX). Each row's partial for the chunk goes to partial[row][chunk -
+/// first chunk]. Groups: valueGroups.
 pub fn attnValues(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel {
     if (hg * tt == 0 or hg * tt > MAX_ROWS) return error.Unsupported;
     var k = begin(s, "lfm3_attn_values", 64);
@@ -2148,24 +2162,44 @@ pub fn attnValues(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel
     }
     b.if_(b.icmp(.u32, .le, R(cs), R(tile.end)));
     {
-        const vaddr = b.add(R(kvBlock(&b, true, tile.kvh)), R(b.shl(R(t), 1)));
+        const vaddr = b.add(R(kvBlock(&b, true, tile.kvh)), R(b.shl(R(t), 2)));
         const p = b.mov(.u32, R(cs));
+        // valueUnroll positions an iteration: every load of theirs first
+        // (positions past the chunk's end read its last one, and add
+        // nothing), then each added in position order, the CPU's: a
+        // backend's loop branch waits for every load in flight, so one
+        // position an iteration waited out a memory round trip each.
+        const unroll = valueUnroll(n);
         b.loop();
         {
-            const vo = b.add(R(vaddr), R(b.shl(R(p), 8)));
-            const v0 = b.half(b.ld(KV, .u32, R(vo), 0, 4), false);
-            const v1 = b.half(b.ld(KV, .u32, R(vo), 128, 4), false);
-            // (a key in the hole adds nothing: left out, as the CPU leaves it)
-            const seen_p = attnSeen(&b, p);
-            for (0..n) |r| {
-                const row = tile.rows[r];
-                const in = b.pand(b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(p), R(row.first))), b.icmp(.u32, .le, R(p), R(row.last))), seen_p);
-                const rel = b.sel(.u32, in, R(b.sub(R(p), R(row.first))), U(0));
-                const w = b.ld(S, .f32, R(b.add(R(srow[r]), R(b.shl(R(rel), 2)))), 0, 5);
-                b.set(acc[r][0], .sel, .f32, R(b.fadd(R(acc[r][0]), R(b.fmul(R(w), R(v0))))), R(acc[r][0]), R(in));
-                b.set(acc[r][1], .sel, .f32, R(b.fadd(R(acc[r][1]), R(b.fmul(R(w), R(v1))))), R(acc[r][1]), R(in));
+            var v0: [VALUE_UNROLL]V = undefined;
+            var v1: [VALUE_UNROLL]V = undefined;
+            var w: [VALUE_UNROLL][MAX_ROWS]V = undefined;
+            var in: [VALUE_UNROLL][MAX_ROWS]V = undefined;
+            for (0..unroll) |u| {
+                const pu = if (u == 0) p else b.add(R(p), U(@intCast(u)));
+                const valid = b.icmp(.u32, .le, R(pu), R(ce));
+                const pc = b.umin(R(pu), R(ce));
+                const vo = b.add(R(vaddr), R(b.shl(R(pc), 8)));
+                const vw = b.ld(KV, .u32, R(vo), 0, 5);
+                v0[u] = b.half(vw, false);
+                v1[u] = b.half(vw, true);
+                // (a key in the hole adds nothing: left out, as the CPU leaves it)
+                const seen_p = b.pand(attnSeen(&b, pc), valid);
+                for (0..n) |r| {
+                    const row = tile.rows[r];
+                    in[u][r] = b.pand(b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(pc), R(row.first))), b.icmp(.u32, .le, R(pc), R(row.last))), seen_p);
+                    const rel = b.sel(.u32, in[u][r], R(b.sub(R(pc), R(row.first))), U(0));
+                    w[u][r] = b.ld(S, .f32, R(b.add(R(srow[r]), R(b.shl(R(rel), 2)))), 0, 5);
+                }
             }
-            b.set(p, .iadd, .u32, R(p), U(1), NO);
+            for (0..unroll) |u| {
+                for (0..n) |r| {
+                    b.set(acc[r][0], .sel, .f32, R(b.fadd(R(acc[r][0]), R(b.fmul(R(w[u][r]), R(v0[u]))))), R(acc[r][0]), R(in[u][r]));
+                    b.set(acc[r][1], .sel, .f32, R(b.fadd(R(acc[r][1]), R(b.fmul(R(w[u][r]), R(v1[u]))))), R(acc[r][1]), R(in[u][r]));
+                }
+            }
+            b.set(p, .iadd, .u32, R(p), U(unroll), NO);
             b.brk(b.icmp(.u32, .gt, R(p), R(ce)));
         }
         b.endloop();
@@ -2176,9 +2210,9 @@ pub fn attnValues(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel
             const first_chunk = b.shr(R(row.first), cshift);
             const meets = b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(chunk), R(first_chunk))), b.icmp(.u32, .le, R(cs), R(row.last)));
             b.if_(meets);
-            const po = b.add(R(b.add(R(rowOffset(&b, tile.token[r], tile.head[r], chunks_bytes)), R(b.shl(R(b.sub(R(chunk), R(first_chunk))), 9)))), R(b.shl(R(t), 2)));
+            const po = b.add(R(b.add(R(rowOffset(&b, tile.token[r], tile.head[r], chunks_bytes)), R(b.shl(R(b.sub(R(chunk), R(first_chunk))), 9)))), R(b.shl(R(t), 3)));
             b.st(P, R(po), 0, 5, acc[r][0]);
-            b.st(P, R(po), 256, 5, acc[r][1]);
+            b.st(P, R(po), 4, 5, acc[r][1]);
             b.endif();
         }
     }

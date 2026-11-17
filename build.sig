@@ -1552,6 +1552,25 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("page_region", "src/platform/page_region.sig"),
         },
     });
+    // brainbench: LFM3's brain on the real GPU behind /dev/dxg (WSL), its
+    // weights in VRAM without a CPU view: checked against the CPU, prompt
+    // reading and decode timed, a step and a prompt chunk profiled.
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/brainbench.sig",
+        .output_name = "brainbench",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("gpu", "src/gpu/gpu.sig"),
+            importEntry("dxg", "src/dxg/dxg.sig"),
+            importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+            importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+            importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+        },
+    });
     // voicebench: LFM3-Audio's depthformer on the real GPU behind /dev/dxg
     // (WSL), its weights in VRAM without a CPU view, timed and profiled.
     _ = try ctx.addCompileStep(.{

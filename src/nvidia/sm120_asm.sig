@@ -329,8 +329,8 @@ test "a vertex and a pixel program without control fields: scheduled, checked, t
     // lines. If the model changes them, check the new words with it.)
     var out: [64]u64 = undefined;
     // Each load releases a scoreboard for its registers. Each store waits
-    // on its load's and releases one for its reads (never one for a write:
-    // the word cannot carry it). EXIT waits on the stores', and carries
+    // on its load's and releases the reads' (5, every read's: never one for
+    // a write, the word cannot carry it). EXIT waits on it, and carries
     // none itself.
     const v = try assemble(VERTEX, &out, &test_work);
     try testing.expect(v.scheduled);
@@ -341,12 +341,12 @@ test "a vertex and a pixel program without control fields: scheduled, checked, t
     try expectListing(
         \\[B------:R-:W0:-:S01] ALD.128 R4, a[0x80]
         \\[B------:R-:W1:-:S01] ALD.64 R8, a[0x90]
-        \\[B0-----:R0:W-:-:S01] AST.128 a[0x70], R4
-        \\[B-1----:R1:W-:-:S02] AST.64 a[0x80], R8
-        \\[B01----:R-:W-:-:S01] EXIT
+        \\[B0-----:R5:W-:-:S01] AST.128 a[0x70], R4
+        \\[B-1----:R5:W-:-:S02] AST.64 a[0x80], R8
+        \\[B-----5:R-:W-:-:S01] EXIT
     , v);
     try testing.expectEqual(@as(u64, 0x0000_7004_ff00_7322), v.code[4]);
-    try testing.expectEqual(@as(u64, 0x0011_c200_0000_0cff), v.code[5]);
+    try testing.expectEqual(@as(u64, 0x001b_c200_0000_0cff), v.code[5]);
     // The interpolations, the reciprocal, the handle's load and the texture
     // each release a scoreboard. The compare stalls 14 cycles for the
     // discard's guard (the predicate's 13 and NAK's one), the discard
@@ -359,14 +359,14 @@ test "a vertex and a pixel program without control fields: scheduled, checked, t
         \\[B------:R-:W0:-:S01] IPA.PASS R0, a[0x7c]
         \\[B------:R-:W1:-:S01] IPA.PASS R4, a[0x80]
         \\[B------:R-:W2:-:S01] IPA.PASS R5, a[0x84]
-        \\[B0-----:R0:W3:-:S02] MUFU.RCP R0, R0
-        \\[B-1-3--:R-:W-:-:S01] FMUL.RZ R4, R4, R0
+        \\[B0-----:R5:W0:-:S02] MUFU.RCP R0, R0
+        \\[B01----:R-:W-:-:S01] FMUL.RZ R4, R4, R0
         \\[B--2---:R-:W-:-:S01] FMUL.RZ R5, R5, R0
-        \\[B------:R-:W1:-:S04] LDC R6, c[0x1][0x10]
-        \\[B01----:R0:W1:-:S02] TEX.B.DXY R2, R0, R4, R6, 2D
-        \\[B-1----:R-:W-:-:S14] FSETP.LT.AND P0, PT, R3, 0.5, PT
+        \\[B------:R-:W0:-:S04] LDC R6, c[0x1][0x10]
+        \\[B0----5:R5:W0:-:S02] TEX.B.DXY R2, R0, R4, R6, 2D
+        \\[B0-----:R-:W-:-:S14] FSETP.LT.AND P0, PT, R3, 0.5, PT
         \\[B------:R-:W-:-:S01] @P0 KILL
-        \\[B0-----:R-:W-:-:S01] EXIT
+        \\[B-----5:R-:W-:-:S01] EXIT
     , f);
     // with the author's fields on every line, they are kept (the reference's
     // words for the same instructions)

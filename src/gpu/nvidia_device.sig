@@ -397,7 +397,8 @@ pub const Adapter = struct {
             // meets; the others run with it)
             if (hz.barrierBefore(&d) and i > 0 and d.indirect == null) {
                 p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
-                p.invalidateShaderCaches();
+                // (the code is the run's, as at its start: the SMs keep it)
+                p.invalidateDataCaches();
                 a.barriers += 1;
             }
             p.launch(s.slots.va + i * SLOT_BYTES);
@@ -1762,8 +1763,12 @@ test "fdiv and fsqrt bit-exact: kir.expandDiv's fused path, sqrt native and expa
 
 /// `k` on both, every output word the same (or only those `pick` says).
 fn same(caps: gpu.Caps, k: *kir.Kernel, groups: [3]u32, params: []const u32, out_words: usize, pick: ?[]const usize) !void {
+    return sameWith(caps, k, groups, params, out_words, pick, .{});
+}
+
+fn sameWith(caps: gpu.Caps, k: *kir.Kernel, groups: [3]u32, params: []const u32, out_words: usize, pick: ?[]const usize, opts: kir_sm120.Options) !void {
     var got: [16 * NT * 4]u8 align(4) = undefined;
-    try runBoth(caps, k, groups, params, out_words * 4, &got, .{});
+    try runBoth(caps, k, groups, params, out_words * 4, &got, opts);
     const g32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, got[0 .. out_words * 4]));
     var bad: usize = 0;
     if (pick) |idx| {
@@ -2138,7 +2143,9 @@ test "ids, parameters and predicates past the six registers" {
         // (and the predicates read again, in reverse, after all are made)
         for (0..10) |j| acc = k.op2(.xor, .u32, r(acc), r(k.sel(.u32, r(p[9 - j]), u(@as(u32, 1) << @intCast(16 + j)), u(0))));
         k.store(.u32, kir.global(O, 32), r(off), r(acc));
-        try same(caps, &k, .{ 2, 1, 1 }, &.{}, NT, null);
+        // (in KIR's order: scheduled, the predicates are used as they are
+        // made, and none needs a register)
+        try sameWith(caps, &k, .{ 2, 1, 1 }, &.{}, NT, null, .{ .schedule = false });
         try testing.expect(T.st.stats.spills > 0);
     }
 }
@@ -2460,24 +2467,24 @@ pub fn indirectPatchKernel(k: *kir.Kernel) void {
 }
 
 const indirect_patch_code = [_]u64{
-    0x00006b00ff0477ac, 0x000e020008000a00, 0x0000e000ff007b82, 0x000e420000000a00,
-    0x0000e200ff027b82, 0x000e820000000a00, 0x0000e400ff047b82, 0x000ec20000000a00,
-    0x0000e600ff067b82, 0x000f040000000800, 0x0000000106007825, 0x012fcc00078e0000,
-    0x0000000400067981, 0x001042000c1e1900, 0x0000040400077981, 0x000944000c1e1900,
-    0x0000080400007981, 0x011102000c1e1900, 0x000000ff0600720c, 0x002fc20003f02070,
-    0x000000ff0700720c, 0x020fca0003f22070, 0x000000ff0000720c, 0x010fca0000f22470,
-    0x000000000000781c, 0x000fca0000703f74, 0x0000000106017807, 0x001fc20004000000,
-    0x0000000107067807, 0x000fc20004000000, 0x0000000100007807, 0x000fc80004000000,
-    0x00009c0102007986, 0x0041c2000c101904, 0x0000a00602007986, 0x0003c2000c101504,
-    0x0000a40002007986, 0x0005c2000c101504, 0x0000000104007986, 0x0087c2000c101904,
-    0x0000040604007986, 0x0009c2000c101904, 0x0000080004007986, 0x000bc4000c101904,
-    0x0000e700ff000b82, 0x024e840000000800, 0x0000800002000986, 0x0045c4000c101904,
-    0x0000e800ff000b82, 0x004e840000000800, 0x0000ec0002000986, 0x0045c4000c101904,
-    0x000000000000794d, 0x01ffc20003800000, 0x0000000000007918, 0x000fc00000000000,
+    0x0000e000ff007b82, 0x000e020000000a00, 0x0000e600ff027b82, 0x000e420000000800,
+    0x0000e200ff047b82, 0x000e820000000a00, 0x0000e400ff067b82, 0x000ec20000000a00,
+    0x00006b00ff0477ac, 0x000f020008000a00, 0x0000000102007825, 0x003fcc00078e0000,
+    0x0000040400027981, 0x010a02000c1e1900, 0x0000000400037981, 0x000a44000c1e1900,
+    0x0000080400007981, 0x020b02000c1e1900, 0x000000ff0200720c, 0x001fc20003f02070,
+    0x000000ff0300720c, 0x002fc80003f22070, 0x000000ff0000720c, 0x010fca0000702470,
+    0x000000000000781c, 0x000fca0000f01f74, 0x0000000103017807, 0x020fc20004000000,
+    0x0000000102027807, 0x000fc20004000000, 0x0000000100007807, 0x000fce0004000000,
+    0x0000e700ff030b82, 0x000e020000000800, 0x0000e800ff080b82, 0x000e420000000800,
+    0x00009c0104007986, 0x004bc2000c101904, 0x0000a00204007986, 0x000bc2000c101504,
+    0x0000a40004007986, 0x000bc2000c101504, 0x0000000106007986, 0x008bc2000c101904,
+    0x0000040206007986, 0x000bc2000c101904, 0x0000080006007986, 0x000bc2000c101904,
+    0x0000800304000986, 0x001bc2000c101904, 0x0000ec0804000986, 0x002bc4000c101904,
+    0x000000000000794d, 0x020fc20003800000, 0x0000000000007918, 0x000fc00000000000,
     0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
     0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
 };
-const indirect_patch_regs: u32 = 10;
+const indirect_patch_regs: u32 = 11;
 const nop_code = [_]u64{
     0x000000000000794d, 0x000fc20003800000, 0x000000000000794d, 0x000fc20003800000,
     0x0000000000007918, 0x000fc00000000000, 0x0000000000007918, 0x000fc00000000000,
