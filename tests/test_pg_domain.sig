@@ -3,7 +3,7 @@ const std = @import("std");
 const sql = @import("sql");
 const pg = @import("postgres");
 const Store = @import("db_store").Store(DB);
-const DB = sql.Database(.{ .tables = 4, .columns = 4, .rows_per_table = 4, .work_rows = 512, .text_bytes = 64, .transactions = 4 });
+const DB = sql.Database(.{ .tables = 4, .columns = 4, .rows_per_table = 4, .work_rows = 512, .text_bytes = 64, .name_bytes = 64, .transactions = 4 });
 const Session = pg.Session(Store.Connection);
 
 var source: DB = .{};
