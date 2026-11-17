@@ -4678,22 +4678,22 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         /// Admit fixed TDS INT4 only from bound expressions that cannot
-        /// produce NULL. A table is supplied only for a direct, non-extended
-        /// FROM item. Conversions and general expressions remain nullable.
-        fn fixedInt4(context: *const Context, table: ?usize, id: u16) bool {
+        /// produce NULL. The relation map contains only direct, non-extended
+        /// FROM items. Conversions and general expressions remain nullable.
+        fn fixedInt4(context: *const Context, tables: []const ?usize, id: u16) bool {
             if (id == none) return false;
             const node = context.node(id);
             if (node.ty != .int4 or node.planned_null) return false;
             return switch (node.kind) {
                 .int_literal => true,
                 .unary => signedLiteral(context, id) != null,
-                .column => if (table) |index| blk: {
+                .column => if (node.level == 0 and node.relation < tables.len) blk: {
+                    const index = tables[node.relation] orelse break :blk false;
                     const source = &context.tables[index];
-                    break :blk node.level == 0 and node.relation == 0 and source.relkind == 'r' and
-                        node.column < source.column_count and source.columns[node.column].not_null;
+                    break :blk source.relkind == 'r' and node.column < source.column_count and source.columns[node.column].not_null;
                 } else false,
                 .function => node.func == .tds_isnull and
-                    fixedInt4(context, table, context.node(node.b).next),
+                    fixedInt4(context, tables, context.node(node.b).next),
                 else => false,
             };
         }
@@ -4719,7 +4719,7 @@ pub fn Binder(comptime config: types.Config) type {
                         out.names[out.count] = column.name;
                         out.types[out.count] = column.data_type;
                         out.typmods[out.count] = column.typmod;
-                        if (context.dialect == .tds and fixedInt4(context, out.table, id))
+                        if (context.dialect == .tds and fixedInt4(context, &.{out.table}, id))
                             out.non_null_columns.set(out.count);
                         out.count += 1;
                     }
@@ -4741,7 +4741,7 @@ pub fn Binder(comptime config: types.Config) type {
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
                 out.typmods[out.count] = outputTypmod(context, target.expr);
-                if (context.dialect == .tds and fixedInt4(context, out.table, target.expr))
+                if (context.dialect == .tds and fixedInt4(context, &.{out.table}, target.expr))
                     out.non_null_columns.set(out.count);
                 out.count += 1;
             }
@@ -6806,9 +6806,17 @@ pub fn Binder(comptime config: types.Config) type {
             bindTies(q, p, order[0..order_count]);
             p.constant_source_safe=!q.distinct and q.order_count==0 and !q.limit_present and !q.offset_present;
             try lowerWindows(context,id);
-            if (context.dialect == .tds and !p.grouped and !p.general_join and p.source_count <= 1 and p.window_count == 0) {
-                const table = if (p.source_count == 1) p.sources[0].table else null;
-                for (p.targets[0..p.count], 0..) |target, column| if (fixedInt4(context, table, target)) {
+            if (context.dialect == .tds and !p.grouped and p.window_count == 0) {
+                var direct: [config.relations]?usize = @splat(null);
+                for (p.sources[0..p.source_count], 0..) |operand, index| {
+                    if (operand.group_end != none) {
+                        @memset(&direct, null);
+                        break;
+                    }
+                    if (operand.join == .right or operand.join == .full) @memset(direct[0..index], null);
+                    if (operand.join != .left and operand.join != .full) direct[index] = operand.table;
+                }
+                for (p.targets[0..p.count], 0..) |target, column| if (fixedInt4(context, direct[0..p.source_count], target)) {
                     p.non_null_columns.set(column);
                 };
             }

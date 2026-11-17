@@ -3030,8 +3030,12 @@ pub fn Parser(comptime config: types.Config) type {
             } else if (try self.takeWord("INNER")) {
                 try self.expectWord("JOIN");
             } else if (!natural and try self.takeWord("CROSS")) {
+                if (self.tokens.dialect == .tds and self.rawWord("apply")) return self.applyOperand(out, .cross);
                 try self.expectWord("JOIN");
                 kind = .cross;
+            } else if (!natural and self.tokens.dialect == .tds and try self.takeWord("OUTER")) {
+                if (!self.rawWord("apply")) return error.Syntax;
+                return self.applyOperand(out, .left);
             } else if (self.isWord("LEFT") or self.isWord("RIGHT") or self.isWord("FULL")) {
                 kind = if (self.isWord("LEFT")) .left else if (self.isWord("RIGHT")) .right else .full;
                 try self.advance();
@@ -3062,6 +3066,19 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 try self.expectSymbol(.rparen);
             } else return error.Syntax;
+            return true;
+        }
+
+        /// APPLY is a correlated right operand without an ON predicate.
+        /// OUTER APPLY null-extends that operand when it produces no rows.
+        fn applyOperand(self: *Self, out: *Ast.Select, kind: ast.JoinKind) Error!bool {
+            self.last_native_syntax = self.current.start;
+            try self.advance();
+            if (!self.isSymbol(.lparen)) return error.UnsupportedStatement;
+            const index = out.item_count;
+            try self.fromItem(out, kind);
+            if (out.item_count != index + 1 or out.items[index].query == none or out.items[index].alias == null) return error.Syntax;
+            out.items[index].lateral = true;
             return true;
         }
 

@@ -393,10 +393,56 @@ fn nativeIntNullability() !void {
     var outer_join: Reader = .{ .source = try execute(&session, &db,
         "SELECT TOP (1) a.id,b.id AS absent FROM int_meta a LEFT JOIN int_meta b ON a.id=b.id+100 ORDER BY a.id") };
     try check(try outer_join.numeric(1) == 0x81 and try outer_join.numeric(2) == 2);
-    try readColumn(&outer_join, 1, 0x26, 4, "id");
+    try readColumn(&outer_join, 0, 0x38, null, "id");
     try readColumn(&outer_join, 1, 0x26, 4, "absent");
-    try check(try outer_join.numeric(1) == 0xd1 and try outer_join.numeric(1) == 4 and try outer_join.numeric(4) == 0xffffffff);
+    try check(try outer_join.numeric(1) == 0xd1 and try outer_join.numeric(4) == 0xffffffff);
     try check(try outer_join.numeric(1) == 0 and try outer_join.numeric(1) == 0xfd);
+}
+
+fn nativeApply() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    _ = try execute(&session, &db, "CREATE TABLE apply_left(id INT PRIMARY KEY)");
+    _ = try execute(&session, &db, "INSERT INTO apply_left VALUES(1),(3)");
+    _ = try execute(&session, &db, "CREATE TABLE apply_right(id INT PRIMARY KEY)");
+    _ = try execute(&session, &db, "INSERT INTO apply_right VALUES(1),(2)");
+
+    const statement = "SELECT a.id,x.v FROM apply_left a CROSS APPLY(SELECT a.id+1 AS v)x";
+    var cross: Reader = .{ .source = try execute(&session, &db, statement) };
+    try check(try cross.numeric(1) == 0x81 and try cross.numeric(2) == 2);
+    try readColumn(&cross, 0, 0x38, null, "id");
+    try readColumn(&cross, 1, 0x26, 4, "v");
+    try check(try cross.numeric(1) == 0xd1 and try cross.numeric(4) == 1);
+    try check(try cross.numeric(1) == 4 and try cross.numeric(4) == 2);
+    try check(try cross.numeric(1) == 0xd1 and try cross.numeric(4) == 3);
+    try check(try cross.numeric(1) == 4 and try cross.numeric(4) == 4 and try cross.numeric(1) == 0xfd);
+
+    const outer = "SELECT a.id,x.v FROM apply_left a OUTER APPLY(SELECT a.id+1 AS v WHERE a.id=1)x ORDER BY a.id";
+    _ = try execute(&session, &db, outer);
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[1].integer == 2);
+    try check(session.result.rows[1].cells[0].integer == 3 and session.result.rows[1].cells[1] == .null_value);
+    _ = try execute(&session, &db, "SELECT a.id,x.v FROM apply_left a CROSS APPLY(SELECT a.id+1 AS v WHERE a.id=1)x");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 1);
+
+    _ = try execute(&session, &db,
+        "SELECT a.id,x.k FROM apply_left a CROSS APPLY(SELECT b.id AS k FROM apply_right b WHERE b.id<=a.id) AS x ORDER BY a.id,x.k");
+    try check(session.result.row_count == 3);
+    for ([_][2]i64{ .{ 1, 1 }, .{ 3, 1 }, .{ 3, 2 } }, session.result.rows[0..3]) |wanted, row| {
+        try check(row.cells[0].integer == wanted[0] and row.cells[1].integer == wanted[1]);
+    }
+    for ([_][]const u8{
+        "SELECT a.id FROM apply_left a CROSS APPLY(SELECT a.id AS v)",
+        "SELECT a.id FROM apply_left a OUTER APPLY apply_right b",
+        "CREATE VIEW saved_apply AS SELECT a.id FROM apply_left a CROSS APPLY(SELECT a.id AS v)x",
+    }) |invalid| try check((try execute(&session, &db, invalid))[0] == 0xaa);
+
+    store.database.dialect = .postgres;
+    var result: Raw.Result = .{};
+    if (store.database.execute(statement, &result)) |_| return error.UnexpectedDialectSyntax else |err| try check(err == error.Syntax);
+    try store.database.execute("SELECT a.id,x.v FROM apply_left a CROSS JOIN LATERAL(SELECT a.id+1 AS v)x", &result);
+    try check(result.row_count == 2 and result.rows[0].cells[1].integer == 2 and result.rows[1].cells[1].integer == 4);
 }
 
 fn transactionManagerAndPreflight() !void {
@@ -753,6 +799,7 @@ pub fn main(init: std.process.Init) !void {
     try nativeIdentifiersAndTop();
     try nativeDateAddAndIsNull();
     try nativeIntNullability();
+    try nativeApply();
     try outputFragmentation();
     try transactionManagerAndPreflight();
     try concurrentCommittedVisibility();
