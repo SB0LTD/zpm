@@ -733,6 +733,21 @@ pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8
 /// representation. A zero OID denotes ordinary built-in metadata.
 pub const NominalColumnType = struct { oid: u32 = 0, len: i16 = 0 };
 
+/// The durable typmod constraints shared by table and composite definitions.
+/// An array's typmod belongs to its element type.
+pub fn validTypeTypmod(comptime config: Config, data_type: DataType, typmod: i32) bool {
+    return switch (elementData(data_type) orelse data_type) {
+        .numeric => typmod == -1 or blk: {
+            const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(typmod) orelse break :blk false;
+            break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
+        },
+        .timestamp, .timestamptz, .time, .timetz => typmod >= -1 and typmod <= 6,
+        .varchar, .bpchar => character.validTypmod(typmod),
+        .bit, .varbit => bit_string.validTypmod(typmod),
+        else => typmod == -1,
+    };
+}
+
 pub fn typeInfo(data_type: DataType) TypeInfo {
     if (elementData(data_type)) |element| {
         const base = baseInfo(element);

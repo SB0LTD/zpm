@@ -2728,7 +2728,7 @@ pub fn Database(comptime config: Config) type {
             const command: CommandTag = switch (object_statement.*) {
                 .create_domain => |*domain| blk: {
                     var object: O.Object = .{ .kind = .domain, .domain = domain.spec };
-                    try self.createUserType(slot, source, domain.name, &object, null, snap);
+                    try self.createUserType(slot, source, domain.name, &object, .none, snap);
                     break :blk .create_domain;
                 },
                 .drop_domain => |*drop| blk: {
@@ -2737,7 +2737,12 @@ pub fn Database(comptime config: Config) type {
                 },
                 .create_enum => |*enumeration| blk: {
                     var object: O.Object = .{ .kind = .enum_type };
-                    try self.createUserType(slot, source, enumeration.name, &object, enumeration.labels, snap);
+                    try self.createUserType(slot, source, enumeration.name, &object, .{ .enum_labels = enumeration.labels }, snap);
+                    break :blk .create_type;
+                },
+                .create_composite => |*definition| blk: {
+                    var object: O.Object = .{ .kind = .composite_type };
+                    try self.createUserType(slot, source, definition.name, &object, .{ .composite_fields = definition.fields }, snap);
                     break :blk .create_type;
                 },
                 .drop_type => |*drop| blk: {
@@ -2840,7 +2845,9 @@ pub fn Database(comptime config: Config) type {
             if (self.catalog_objects.userTypeNameTaken(namespace, name, latest)) return error.DuplicateObject;
         }
 
-        fn createUserType(self: *Self, slot: u16, source: []const u8, qualified: CO.Qualified, object: *O.Object, labels: ?CO.Span, snap: Snapshot) Error!void {
+        const UserTypePayload = union(enum) { none, enum_labels: CO.Span, composite_fields: CO.Span };
+
+        fn createUserType(self: *Self, slot: u16, source: []const u8, qualified: CO.Qualified, object: *O.Object, payload: UserTypePayload, snap: Snapshot) Error!void {
             if (self.dialect != .postgres or self.routine_frame != null) return error.UnsupportedStatement;
             if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
             const namespace = try self.typeNamespace(source, qualified, snap);
@@ -2856,16 +2863,21 @@ pub fn Database(comptime config: Config) type {
             if (owner != CO.bootstrap_role and self.catalog_objects.byOid(.role, owner, latest) == null) return error.SerializationFailure;
             const name = objectName(source, qualified.name);
             if (name.len == 0) return error.Syntax;
+            if (name.len > config.text_bytes) return error.NameCapacity;
             if (self.pendingTypeName(namespace, name.slice(), snap)) |other| return self.objectPark(slot, other);
             if (self.typeNameOccupied(namespace, name.slice(), latest)) return error.DuplicateObject;
+            if (object.kind == .composite_type and self.catalog.findIn(namespace, name.slice(), latest) != null) return error.TableExists;
             object.target = namespace;
             object.owner = owner;
             object.name = name;
-            const limit: usize = @min(config.name_bytes, O.text_capacity);
+            const limit: usize = @min(config.name_bytes, config.text_bytes, O.text_capacity);
             var found = false;
             var prefix: usize = 1;
             while (prefix <= limit) : (prefix += 1) {
-                const length = @min(@as(usize, name.len), limit - prefix);
+                var length = @min(@as(usize, name.len), limit - prefix);
+                // A generated array identifier must not split a UTF-8
+                // sequence when making room for an underscore prefix.
+                while (length > 0 and length < name.len and name.bytes[length] & 0xc0 == 0x80) length -= 1;
                 @memset(object.text[0..prefix], '_');
                 @memcpy(object.text[prefix..][0..length], name.slice()[0..length]);
                 object.text_len = @intCast(prefix + length);
@@ -2877,12 +2889,19 @@ pub fn Database(comptime config: Config) type {
                 break;
             }
             if (!found) return error.NameCapacity;
-            if (labels) |label_span| {
-                object.split = object.text_len;
-                const labels_source = source[label_span.start..][0..label_span.len];
-                const encoded = try CO.encodeEnumLabels(labels_source, object.text[object.split..], @min(config.name_bytes, config.text_bytes));
-                object.enum_label_count = encoded.count;
-                object.text_len = @intCast(@as(usize, object.split) + encoded.bytes);
+            switch (payload) {
+                .none => {},
+                .enum_labels => |label_span| {
+                    object.split = object.text_len;
+                    const labels_source = source[label_span.start..][0..label_span.len];
+                    const encoded = try CO.encodeEnumLabels(labels_source, object.text[object.split..], @min(config.name_bytes, config.text_bytes));
+                    object.enum_label_count = encoded.count;
+                    object.text_len = @intCast(@as(usize, object.split) + encoded.bytes);
+                },
+                .composite_fields => |field_span| {
+                    object.split = object.text_len;
+                    try self.encodeCompositeFields(source[field_span.start..][0..field_span.len], object);
+                },
             }
             try self.reserveWrites(slot, 1);
             const width = object.oidWidth();
@@ -2890,6 +2909,23 @@ pub fn Database(comptime config: Config) type {
             object.oid = change_log.first_oid + self.oid_counter;
             _ = try self.objectInsert(slot, object, false, snap);
             self.oid_counter += width;
+        }
+
+        fn encodeCompositeFields(self: *Self, source: []const u8, object: *O.Object) Error!void {
+            var next: ?usize = 0;
+            var used: usize = 0;
+            while (next) |position| {
+                const field = (try P.parseCompositeFieldAt(source, position, &self.workspace.nodes)) orelse break;
+                if (object.composite_field_count == config.columns) return error.ColumnCapacity;
+                const name = identName(source, field.name);
+                if (name.len > config.text_bytes) return error.NameCapacity;
+                const data_type = types.dataTypeOf(field.spec.ty);
+                if (!types.validTypeTypmod(config, data_type, field.spec.typmod)) return error.UnsupportedStatement;
+                try CO.appendCompositeField(object.text[object.split..], &used, .{ .name = name.slice(), .oid = types.typeOid(data_type), .typmod = field.spec.typmod });
+                object.composite_field_count += 1;
+                next = field.next;
+            }
+            object.text_len = @intCast(@as(usize, object.split) + used);
         }
 
         fn dropTypes(self: *Self, slot: u16, source: []const u8, drop: *const CO.DropTypes, domain_only: bool, snap: Snapshot) Error!void {
@@ -2904,7 +2940,8 @@ pub fn Database(comptime config: Config) type {
                 const wanted = objectName(source, name.name);
                 if (self.catalog_objects.pendingUserTypeName(namespace, wanted.slice(), snap)) |other| return self.objectPark(slot, other);
                 const index = self.catalog_objects.byName(.domain, namespace, wanted.slice(), snap) orelse
-                    self.catalog_objects.byName(.enum_type, namespace, wanted.slice(), snap) orelse {
+                    self.catalog_objects.byName(.enum_type, namespace, wanted.slice(), snap) orelse
+                    self.catalog_objects.byName(.composite_type, namespace, wanted.slice(), snap) orelse {
                     if (self.catalog_objects.userTypeNameTaken(namespace, wanted.slice(), snap)) return error.UnsupportedStatement;
                     if (drop.if_exists) continue;
                     return error.UndefinedObject;
@@ -3027,7 +3064,7 @@ pub fn Database(comptime config: Config) type {
                                 if (listed == oid) return error.DependentObjects;
                             }
                         },
-                        .relation, .fdw, .server, .publication, .domain, .enum_type => if (o.owner == oid) return error.DependentObjects,
+                        .relation, .fdw, .server, .publication, .domain, .enum_type, .composite_type => if (o.owner == oid) return error.DependentObjects,
                         else => {},
                     }
                 }
@@ -3855,6 +3892,10 @@ pub fn Database(comptime config: Config) type {
                 return self.park(slot, waits);
             }
             if (self.catalog.find(name.slice(), snap) != null) return error.TableExists;
+            if (self.catalog_objects.pendingCompositeRelationName(catalog_module.public_namespace, name.slice(), snap)) |other| return self.objectPark(slot, other);
+            var latest = snap;
+            latest.csn = self.csn;
+            if (self.catalog_objects.byName(.composite_type, catalog_module.public_namespace, name.slice(), latest) != null) return error.TableExists;
             try self.reserveWrites(slot, 3);
             var destination: ?usize = null;
             for (0..2) |attempt| {
@@ -4304,11 +4345,28 @@ pub fn Database(comptime config: Config) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return self.fillViewRows(&self.session,self.seq_snap,&self.workspace.nodes,view,sink);
         }
+        fn compositeCatalogRows(self: *const Self, view: catalog_module.View, snapshot: Snapshot, sink: *X.RowSink) Error!void {
+            for (&self.catalog_objects.items) |*object| {
+                if (object.kind != .composite_type or !O.visible(object, snapshot)) continue;
+                const relation = object.compositeRelationOid();
+                if (view == .pg_class) {
+                    try sink.add(&.{ intCell(relation), nameCell(object.name.slice()), intCell(object.target), nameCell("c"), intCell(object.composite_field_count) });
+                    continue;
+                }
+                var fields = object.compositeFields();
+                var ordinal: i64 = 1;
+                while (fields.next()) |field| : (ordinal += 1) {
+                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), nameCell(""), nameCell(""), boolCell(false) });
+                }
+            }
+        }
+
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
             const database = session_values.database;
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snapshot, &relations);
             const public: i64 = catalog_module.public_namespace;
+            if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
             switch (view) {
                 .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
                 .pg_type => {
@@ -4316,21 +4374,24 @@ pub fn Database(comptime config: Config) type {
                         const data_type = @field(DataType, field);
                         const info = types.typeInfo(data_type);
                         const category: [1]u8 = .{info.category};
-                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false) });
+                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0) });
                         if (types.arrayData(data_type)) |array_type| {
                             const array_info = types.typeInfo(array_type);
-                            try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false) });
+                            try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0) });
                         }
                     }
                     for (&self.catalog_objects.items) |*object| {
                         if (!CO.userType(object.kind) or !O.visible(object, snapshot)) continue;
-                        if (object.kind == .domain) {
-                            const info = types.typeInfo(types.dataTypeOf(object.domain.base));
-                            try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), nameCell("d"), nameCell("N"), intCell(object.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null) });
-                        } else {
-                            try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), nameCell("e"), nameCell("E"), intCell(object.oid + 1), nameCell(","), nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false) });
+                        switch (object.kind) {
+                            .domain => {
+                                const info = types.typeInfo(types.dataTypeOf(object.domain.base));
+                                try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), nameCell("d"), nameCell("N"), intCell(object.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null), intCell(0) });
+                            },
+                            .enum_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), nameCell("e"), nameCell("E"), intCell(object.oid + 1), nameCell(","), nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(0) }),
+                            .composite_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(-1), nameCell("c"), nameCell("C"), intCell(object.oid + 1), nameCell(","), nameCell("record_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(object.compositeRelationOid()) }),
+                            else => unreachable,
                         }
-                        try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false) });
+                        try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false), intCell(0) });
                     }
                 },
                 .pg_enum => for (&self.catalog_objects.items) |*object| {

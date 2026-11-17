@@ -152,7 +152,7 @@ fn sqlContracts() !void {
     try rejects(&primary, "SELECT 'z'::enums.\"Mood\" = 'z'::enums.\"Mood\"", error.UnsupportedStatement);
     try rejects(&primary, "SELECT CAST('z'::text AS enums.\"Mood\")", error.UnsupportedStatement);
     try rejects(&primary, "ALTER TYPE enums.\"Mood\" ADD VALUE 'q'", error.UnsupportedStatement);
-    try rejects(&primary, "CREATE TYPE composites AS (a integer)", error.UnsupportedStatement);
+    try rejects(&primary, "CREATE TYPE composites AS (a enums.\"Mood\")", error.UnsupportedStatement);
     try rejects(&primary, "DROP DOMAIN enums.\"Mood\"", error.WrongObjectType);
     try rejects(&primary, "DROP ROLE enumowner", error.DependentObjects);
     try rejects(&primary, "DROP SCHEMA enums RESTRICT", error.DependentObjects);

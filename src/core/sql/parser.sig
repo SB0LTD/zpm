@@ -303,6 +303,26 @@ pub fn Parser(comptime config: types.Config) type {
             return .{ .spec = spec, .end = end };
         }
 
+        pub const CompositeFieldAt = struct { name: ast.Ident, spec: TypeSpec, next: ?usize };
+
+        /// One composite attribute in a body already delimited by CREATE
+        /// TYPE. Use the same built-in names, arrays and typmods as columns.
+        pub fn parseCompositeFieldAt(source: []const u8, start: usize, pool: *Ast.Pool) Error!?CompositeFieldAt {
+            var self = Self{ .tokens = .{ .source = source, .position = start, .text_limit = config.text_bytes }, .pool = pool, .source = source, .mode = .standard };
+            try self.advance();
+            if (self.current.kind == .end) return null;
+            const name = try self.identifier();
+            if (!typeWord(self.current)) {
+                if (self.current.kind == .word or self.current.kind == .quoted_word) return error.UnsupportedStatement;
+                return error.Syntax;
+            }
+            const spec = try self.typeName();
+            if (self.current.kind == .end) return .{ .name = name, .spec = spec, .next = null };
+            if (!try self.takeSymbol(.comma)) return error.UnsupportedStatement;
+            if (self.current.kind == .end) return error.Syntax;
+            return .{ .name = name, .spec = spec, .next = self.current.start - self.current.prefix };
+        }
+
         fn statement(self: *Self) Error!Ast.Statement {
             if (self.mode == .standard) if (try catalog_objects.parseWithDialect(self.source, config.name_bytes, config.text_bytes, self.tokens.dialect)) |object| return .{ .catalog_object = object };
             if (try self.takeWord("CREATE")) {
