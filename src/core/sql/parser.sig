@@ -3807,8 +3807,10 @@ pub fn Parser(comptime config: types.Config) type {
                 call.func = .tds_isnull;
             }
             var first: u16 = none;
+            var close_end = self.current.end;
             if (try self.takeSymbol(.star)) {
                 call.star = true;
+                close_end = self.current.end;
                 try self.expectSymbol(.rparen);
             } else if (!try self.takeSymbol(.rparen)) {
                 if (self.mode == .standard and try self.takeWord("DISTINCT")) {
@@ -3828,6 +3830,7 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 // Aggregate ORDER BY inside the call (B11).
                 if (self.mode == .standard and self.isWord("ORDER")) self.pool.nodes[node].order = try self.aggregateOrder(node);
+                close_end = self.current.end;
                 try self.expectSymbol(.rparen);
             }
             // WITHIN GROUP (ORDER BY ...) of an ordered-set aggregate (B11).
@@ -3855,6 +3858,13 @@ pub fn Parser(comptime config: types.Config) type {
                 self.pool.nodes[node].window=try self.windowSpec(node,true);
             }
             const n = &self.pool.nodes[node];
+            if (self.tokens.dialect == .mysql and !name.quoted and
+                (types.keyword(raw_name, "count") or types.keyword(raw_name, "min") or
+                    types.keyword(raw_name, "max") or types.keyword(raw_name, "sum")))
+            {
+                const start = name.span.start;
+                n.text = .{ .start = start, .end = close_end, .len = close_end - start };
+            }
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
             return node;
         }
@@ -4425,6 +4435,20 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.lparen);
                     const inner = try self.expression();
                     try self.expectWord("AS");
+                    if (self.mode == .standard and self.tokens.dialect == .mysql and
+                        (self.rawWord("signed") or self.rawWord("unsigned")))
+                    {
+                        const target: ast.Type = if (self.rawWord("unsigned")) .mysql_bigint_unsigned else .int8;
+                        try self.advance();
+                        _ = try self.takeWord("INTEGER");
+                        const end = self.current.end;
+                        try self.expectSymbol(.rparen);
+                        self.last_native_syntax = token.start;
+                        return self.pool.add(.{
+                            .kind = .cast, .cast_type = target, .typmod = ast.mysql_integer_cast_typmod, .a = inner,
+                            .text = .{ .start = token.start, .end = end, .len = end - token.start },
+                        });
+                    }
                     const target = try self.castTarget(inner);
                     try self.expectSymbol(.rparen);
                     return target;

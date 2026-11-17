@@ -519,6 +519,68 @@ fn unsignedField(reader: *Reader) !void {
         metadata[metadata.len - 5] == 0x20 and metadata[metadata.len - 4] == 0 and metadata[metadata.len - 3] == 0);
 }
 
+fn unsignedSumAndCasts(session: *Session, db: *DB) !void {
+    const aggregate = try command(session, db, "SELECT COUNT(*),MIN(id),MAX(id),SUM(id) FROM unsigned_values");
+    var result: Reader = .{ .source = output[0..aggregate.written] };
+    try same(try result.next(), &.{4});
+    for ([_][]const u8{ "COUNT(*)", "MIN(id)", "MAX(id)", "SUM(id)" }, 0..) |name, column|
+        try same(session.result.column_names[column].slice(), name);
+    const count = try result.next();
+    try check(count[count.len - 6] == 8 and count[count.len - 5] == 0);
+    try unsignedField(&result);
+    try unsignedField(&result);
+    const sum = try result.next();
+    try check(sum[sum.len - 10] == 43 and sum[sum.len - 6] == 246 and
+        sum[sum.len - 5] == 0 and sum[sum.len - 4] == 0 and sum[sum.len - 3] == 0);
+    try check((try result.next())[0] == 0xfe);
+    try same(try result.next(), "\x013\x010\x1418446744073709551615\x1427670116110564327423");
+    try check((try result.next())[0] == 0xfe and result.pos == result.source.len);
+
+    for ([_][]const u8{
+        "SELECT SUM(v) AS `Exact_Total` FROM unsigned_values WHERE id=0",
+        "SELECT SUM(v) AS `Exact_Total` FROM unsigned_values WHERE id=-1",
+    }) |statement| {
+        const empty = try command(session, db, statement);
+        var nullable: Reader = .{ .source = output[0..empty.written] };
+        try same(try nullable.next(), &.{1});
+        const metadata = try nullable.next();
+        try check(metadata[metadata.len - 6] == 246);
+        try same(session.result.column_names[0].slice(), "Exact_Total");
+        try check((try nullable.next())[0] == 0xfe);
+        try same(try nullable.next(), &.{0xfb});
+        try check((try nullable.next())[0] == 0xfe);
+    }
+    _ = try command(session, db,
+        "SELECT SUM(v) AS exact_total,COUNT(v) FROM unsigned_values GROUP BY id=0 ORDER BY COUNT(v)");
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[0] == .null_value);
+    try check(session.result.rows[1].cells[0].numeric.coef() == 18446744073709551616 and
+        session.result.rows[1].cells[1].integer == 2);
+
+    const casted = try command(session, db, "SELECT CAST(-1 AS UNSIGNED) AS u,CAST(18446744073709551615 AS SIGNED) AS s");
+    var casts: Reader = .{ .source = output[0..casted.written] };
+    try same(try casts.next(), &.{2});
+    try unsignedField(&casts);
+    const signed = try casts.next();
+    try check(signed[signed.len - 6] == 8 and signed[signed.len - 5] == 0);
+    try same(session.result.column_names[0].slice(), "u");
+    try same(session.result.column_names[1].slice(), "s");
+    try check((try casts.next())[0] == 0xfe);
+    try same(try casts.next(), "\x1418446744073709551615\x02-1");
+    try check((try casts.next())[0] == 0xfe);
+
+    _ = try command(session, db,
+        "SELECT CAST(id AS SIGNED INTEGER),CAST(v AS UNSIGNED INTEGER) AS value FROM unsigned_values WHERE id=9223372036854775808");
+    try same(session.result.column_names[0].slice(), "CAST(id AS SIGNED INTEGER)");
+    try same(session.result.column_names[1].slice(), "value");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == -9223372036854775808 and
+        session.result.rows[0].cells[1].numeric.coef() == 18446744073709551615);
+    _ = try command(session, db, "SELECT CAST(CAST(-1 AS UNSIGNED) AS SIGNED),CAST(NULL AS UNSIGNED)");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == -1 and
+        session.result.column_types[1] == .mysql_bigint_unsigned and session.result.rows[0].cells[1] == .null_value);
+    _ = try command(session, db, "SELECT id FROM unsigned_values WHERE id=CAST(-1 AS UNSIGNED)");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].numeric.coef() == 18446744073709551615);
+}
+
 fn nativeBigintUnsigned() !void {
     const create = "CREATE TABLE unsigned_values(id BIGINT UNSIGNED PRIMARY KEY,v BIGINT UNSIGNED)";
     const insert = "INSERT INTO unsigned_values VALUES(0,NULL),(9223372036854775808,18446744073709551615),(18446744073709551615,1)";
@@ -558,6 +620,7 @@ fn nativeBigintUnsigned() !void {
     _ = try command(&session, &db, "SELECT MIN(id),MAX(id),COUNT(*) FROM unsigned_values");
     try check(session.result.row_count == 1 and session.result.rows[0].cells[0].numeric.coef() == 0 and
         session.result.rows[0].cells[1].numeric.coef() == 18446744073709551615 and session.result.rows[0].cells[2].integer == 3);
+    try unsignedSumAndCasts(&session, &db);
 
     for ([_][]const u8{
         "INSERT INTO unsigned_values VALUES(1,-1)",
@@ -572,8 +635,9 @@ fn nativeBigintUnsigned() !void {
     try check(output[4] == 0xff and output[5] == 0x26 and output[6] == 4);
     for ([_][]const u8{
         "SELECT id+1 FROM unsigned_values",
-        "SELECT SUM(id) FROM unsigned_values",
-        "SELECT CAST(-1 AS UNSIGNED)",
+        "SELECT SUM(id) OVER () FROM unsigned_values",
+        "SELECT CAST('1' AS UNSIGNED)",
+        "SELECT CAST(1.5 AS UNSIGNED)",
         "ALTER TABLE unsigned_values ADD COLUMN extra BIGINT UNSIGNED",
         "ALTER TABLE unsigned_values ALTER COLUMN v SET DEFAULT 0",
         "CREATE TABLE unsigned_default(id BIGINT UNSIGNED DEFAULT 0)",
@@ -585,6 +649,8 @@ fn nativeBigintUnsigned() !void {
     try check(session.result.row_count == 1 and session.result.rows[0].cells[0].numeric.coef() == 0 and
         session.result.rows[0].cells[1] == .null_value);
     _ = try command(&session, &db, "UPDATE unsigned_values SET v=9223372036854775808 WHERE id=0");
+    try check(output[4] == 0 and output[5] == 1);
+    _ = try command(&session, &db, "UPDATE unsigned_values SET v=CAST(-1 AS UNSIGNED) WHERE id=0");
     try check(output[4] == 0 and output[5] == 1);
 
     store = .{};
@@ -598,6 +664,7 @@ fn nativeBigintUnsigned() !void {
         insert,
         "UPDATE unsigned_values SET v=18446744073709551615 WHERE id=0",
         "DELETE FROM unsigned_values WHERE id=9223372036854775808",
+        "CREATE TABLE exact_total AS SELECT SUM(id) AS total FROM unsigned_values",
     }) |statement| {
         var used: usize = 0;
         try store.database.executeChanges(statement, &result, &record, &used, null, null);
@@ -608,10 +675,17 @@ fn nativeBigintUnsigned() !void {
         result.column_types[1] == .mysql_bigint_unsigned);
     try check(result.rows[0].cells[0].numeric.coef() == 0 and result.rows[0].cells[1].numeric.coef() == 18446744073709551615 and
         result.rows[1].cells[0].numeric.coef() == 18446744073709551615 and result.rows[1].cells[1].numeric.coef() == 1);
+    try syntax_recovered.execute("SELECT total FROM exact_total", &result);
+    try check(result.column_types[0] == .numeric and result.column_typmods[0] == -1 and
+        result.row_count == 1 and result.rows[0].cells[0].numeric.coef() == 18446744073709551615);
     syntax_recovered.dialect = .postgres;
     try syntax_recovered.execute("SELECT id FROM unsigned_values WHERE id=18446744073709551615", &result);
     try check(result.row_count == 1 and result.column_types[0] == .numeric and
         result.rows[0].cells[0].numeric.coef() == 18446744073709551615);
+    try syntax_recovered.execute("SELECT CAST(-1 AS BIGINT)", &result);
+    try check(result.row_count == 1 and result.column_types[0] == .integer and result.rows[0].cells[0].integer == -1);
+    if (syntax_recovered.execute("SELECT CAST(-1 AS UNSIGNED)", &result)) |_| return error.UnexpectedDialectSyntax else |err|
+        try check(err == error.UndefinedObject);
 }
 
 pub fn main(init: std.process.Init) !void {

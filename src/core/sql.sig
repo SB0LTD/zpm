@@ -357,6 +357,15 @@ pub fn Database(comptime config: Config) type {
                     switch (self.column_types[column]) {
                         .integer, .integer32, .boolean, .text => continue,
                         .mysql_bigint_unsigned => if (mode == .mysql) continue,
+                        .numeric => if (mode == .mysql and self.column_typmods[column] == ast.mysql_unsigned_sum_typmod) {
+                            for (self.rows[0..self.row_count]) |*row| {
+                                const cell = &row.cells[column];
+                                if (cell.* == .null_value) continue;
+                                if (cell.* != .numeric or cell.numeric.special != .finite or cell.numeric.dscale != 0 or
+                                    cell.numeric.coef() > std.math.maxInt(u128)) return error.TypeMismatch;
+                            }
+                            continue;
+                        },
                         .date => if (mode == .tds) continue,
                         .smallint, .oid => {
                             self.column_types[column] = .integer;

@@ -1196,6 +1196,7 @@ pub fn Eval(comptime config: types.Config) type {
                         try ctx.session.checkpoint();return .{.date=@intCast(n.integer)};
                     }
                     const value = try eval(ctx, n.a);
+                    if (n.typmod == ast.mysql_integer_cast_typmod) return Io.mysqlIntegerCast(value, n.cast_type);
                     const converted = try cast(value, node(ctx, n.a).ty, n.cast_type, n.typmod, ctx.session);
                     if (n.domain_cast) {
                         if (converted == .null_value) {
