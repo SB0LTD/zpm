@@ -2350,8 +2350,8 @@ pub fn Exec(comptime config: types.Config) type {
                         start: usize,
                         count: usize,
 
-                        fn run(context: *anyopaque) void {
-                            const part: *const Partition = @ptrCast(@alignCast(context));
+                        fn run(raw: *anyopaque) void {
+                            const part: *const Partition = @ptrCast(@alignCast(raw));
                             part.scan.accumulate(part.start, part.count);
                         }
                     };
