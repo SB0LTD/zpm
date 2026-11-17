@@ -4280,9 +4280,9 @@ pub fn Binder(comptime config: types.Config) type {
             const wanted = toName(context, name);
             if (schema) |qualifier| {
                 const schema_name = toName(context, qualifier);
-                return catalog.findView(schema_name.slice(), wanted.slice());
+                return context.catalog.findSystemView(schema_name.slice(), wanted.slice());
             }
-            return catalog.findView(null, wanted.slice());
+            return context.catalog.findSystemView(null, wanted.slice());
         }
 
         /// The OID of a schema name: pg_catalog, public, information_schema

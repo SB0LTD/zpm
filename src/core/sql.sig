@@ -127,6 +127,8 @@ pub const Tokenizer = lexer.Tokenizer;
 pub const Config = types.Config;
 /// Per-statement session values (TimeZone, zone resolver, clocks).
 pub const Session = value_module.Session;
+pub const DatabaseCatalogRow = catalog_module.DatabaseCatalogRow;
+pub const DatabaseCatalogProvider = catalog_module.DatabaseCatalogProvider;
 pub const Zone = temporal_module.Zone;
 pub const ZoneResolver = temporal_module.Resolver;
 pub const Interval = temporal_module.Interval;
@@ -882,7 +884,7 @@ pub fn Database(comptime config: Config) type {
                         if (cte) continue;
                     }
                     const schema_name = if (item.schema) |qualifier| identName(text, qualifier) else Name{};
-                    if (catalog_module.findView(if (item.schema != null) schema_name.slice() else null, name.slice())) |view| {
+                    if (catalog.findSystemView(if (item.schema != null) schema_name.slice() else null, name.slice())) |view| {
                         if (view == .pg_authid and !privileged) return error.InsufficientPrivilege;
                         continue;
                     }
@@ -1398,6 +1400,13 @@ pub fn Database(comptime config: Config) type {
         /// User schemas (Config.schemas); visibility is the catalog's.
         schemas: [config.schemas]Schema = @splat(.{}),
         catalog: K = .{},
+
+        /// Borrow the embedding's cluster catalogue while serving statements.
+        /// The embedding keeps the provider and its rows consistent for the
+        /// duration of each SQL call, including detached execution.
+        pub fn setDatabaseCatalog(self: *Self, provider: ?DatabaseCatalogProvider) void {
+            self.catalog.databases = provider;
+        }
         /// Roles, grants, policies, comments, wrappers, servers and
         /// publications (catalog_objects.sig, B11 wave 3).
         catalog_objects: O = .{},
@@ -4892,6 +4901,14 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
+            if (view == .pg_database) {
+                const provider = self.catalog.databases orelse return error.UndefinedTable;
+                for (0..provider.capacity) |index| {
+                    const entry = provider.row(provider.context, index) orelse continue;
+                    try sink.add(&.{ intCell(entry.oid), nameCell(entry.name), intCell(entry.owner) });
+                }
+                return;
+            }
             const database = session_values.database;
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snapshot, &relations);
