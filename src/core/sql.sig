@@ -1382,8 +1382,8 @@ pub fn Database(comptime config: Config) type {
 
             fn castNeedsZoneResolver(from: types.Type, to: types.Type) bool {
                 if (types.elementType(from)) |element| {
-                    const target = types.elementType(to) orelse return false;
-                    return value_module.characterType(element) and inputNeedsZoneResolver(target);
+                    const target_element = types.elementType(to) orelse return false;
+                    return value_module.characterType(element) and inputNeedsZoneResolver(target_element);
                 }
                 return (from == .unknown or value_module.characterType(from)) and inputNeedsZoneResolver(to);
             }
