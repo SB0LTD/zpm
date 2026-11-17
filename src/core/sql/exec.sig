@@ -70,6 +70,7 @@ pub fn Exec(comptime config: types.Config) type {
             factor_selected_rows: usize = 0,
             factor_sparse_predicates: usize = 0,
             typed_group_plans: usize = 0,
+            narrow_typed_group_plans: usize = 0,
             typed_group_channels: usize = 0,
             dimension_group_plans:usize=0,
             dimension_group_keys:usize=0,
@@ -2275,6 +2276,95 @@ pub fn Exec(comptime config: types.Config) type {
                 return try self.finish(p,out);
             }
 
+            const PresentGroupMeasures = struct {
+                columns: [2]u16 = undefined,
+                aggregate_measures: [config.columns]?u8 = undefined,
+                count: usize = 0,
+            };
+
+            fn presentGroupMeasures(table: *const S.Table, key_column: u16, transitions: []const Transition) ?PresentGroupMeasures {
+                const rows = table.summary.rows;
+                if (rows == 0 or rows != @as(i64, @intCast(table.scan_high)) or table.summary.columns[key_column].nonnull != rows) return null;
+                var out: PresentGroupMeasures = .{};
+                for (transitions, out.aggregate_measures[0..transitions.len]) |transition, *measure| {
+                    measure.* = null;
+                    if (transition.kind == .count_star) continue;
+                    if (table.summary.columns[transition.column].nonnull != rows) return null;
+                    if (transition.kind == .count) continue;
+                    var index: usize = 0;
+                    while (index < out.count and out.columns[index] != transition.column) : (index += 1) {}
+                    if (index == out.count) {
+                        if (out.count == out.columns.len or !sumPrefixesFitI64(table, transition.column)) return null;
+                        out.columns[index] = transition.column;
+                        out.count += 1;
+                    }
+                    measure.* = @intCast(index);
+                }
+                return if (out.count == 0) null else out;
+            }
+
+            /// Dense, all-present published columns need only one row count
+            /// per group and a signed total per distinct measure. The bounded
+            /// channel count keeps the hot loop unrolled and honors the wider
+            /// state or sparse/null executor when the proof fails.
+            noinline fn scanPresentGroups(self: *Query, comptime measure_count: usize, p: *const B.Plan, outer: ?*const E.Context,
+                table: *const S.Table, key_column: u16, bounds: S.IntegerBounds, measures: *const PresentGroupMeasures) Error!?List {
+                const Bucket = struct { rows: i64 = 0, totals: [measure_count]i64 = @splat(0) };
+                const span_wide = @as(i128, bounds.high) - bounds.low + 1;
+                const cell_budget = self.work.cell_high - self.work.cell_low;
+                const ref_budget = self.work.ref_high - self.work.ref_low;
+                const bucket_cells = (@sizeOf(Bucket) + @sizeOf(V.Cell) - 1) / @sizeOf(V.Cell);
+                const budget = @min(cell_budget / (bucket_cells + 1 + p.agg_count + p.width), ref_budget / 2);
+                if (span_wide <= 0 or span_wide > budget) return null;
+                const span: usize = @intCast(span_wide);
+                const state_cells = (span * @sizeOf(Bucket) + @sizeOf(V.Cell) - 1) / @sizeOf(V.Cell);
+                const at = try self.cells(state_cells);
+                const data: [*]Bucket = @ptrCast(@alignCast(&self.work.cells[at]));
+                const buckets = data[0..span];
+                for (buckets) |*bucket| bucket.* = .{};
+
+                const keys = table.scan_values[@as(usize, key_column) * table.rows.len ..][0..table.scan_high];
+                var sums: [measure_count][]const i64 = undefined;
+                inline for (0..measure_count) |index| {
+                    sums[index] = table.scan_values[@as(usize, measures.columns[index]) * table.rows.len ..][0..table.scan_high];
+                }
+                var start: usize = 0;
+                while (start < table.scan_high) : (start += 64) {
+                    const count = @min(@as(usize, 64), table.scan_high - start);
+                    try self.session.checkpoints(count);
+                    self.work.stream_stats.rows += count;
+                    for (keys[start..][0..count], start..) |key_value, slot| {
+                        // The observed key bounds and admitted span prove
+                        // this offset in [0, span), even at int64 endpoints.
+                        const bucket = &buckets[@intCast(@as(u64, @bitCast(key_value)) -% @as(u64, @bitCast(bounds.low)))];
+                        bucket.rows += 1;
+                        inline for (0..measure_count) |index| bucket.totals[index] += sums[index][slot];
+                    }
+                }
+                var out: List = .{};
+                var groups: usize = 0;
+                for (buckets, 0..) |*bucket, index| {
+                    if (bucket.rows == 0) continue;
+                    try self.session.checkpoint();
+                    const group_at = try self.cells(1 + p.agg_count);
+                    self.work.cells[group_at] = .{ .integer = @intCast(@as(i128, bounds.low) + index) };
+                    var states: [config.columns]Accumulator = undefined;
+                    for (measures.aggregate_measures[0..p.agg_count], states[0..p.agg_count]) |measure, *state| {
+                        const total = if (measure) |which| bucket.totals[which] else 0;
+                        state.* = .{ .count = bucket.rows, .integer = total, .wide = total };
+                    }
+                    try self.projectGroup(p, group_at, states[0..p.agg_count], outer, &out);
+                    groups += 1;
+                }
+                self.work.stream_stats.typed_group_plans += 1;
+                self.work.stream_stats.narrow_typed_group_plans += 1;
+                self.work.stream_stats.typed_group_channels += p.agg_count;
+                self.work.stream_stats.groups += groups;
+                self.work.stream_stats.scratch_cells = @max(self.work.stream_stats.scratch_cells, state_cells + groups * (1 + p.agg_count + p.width));
+                self.work.stream_stats.scratch_refs = @max(self.work.stream_stats.scratch_refs, groups * 2);
+                return try self.finish(p, out);
+            }
+
             /// A general typed state vector per admitted integral key. Multiple
             /// SUM/AVG channels stay on committed columns through aggregation;
             /// Cells are constructed only for final groups. No input-sized rows.
@@ -2294,6 +2384,13 @@ pub fn Exec(comptime config: types.Config) type {
                     if(rows*@as(i128,@min(amounts.low,0)) < -9223372036854775808 or rows*@as(i128,@max(amounts.high,0))>9223372036854775807) return null;
                 };
                 const bounds=table.integer_bounds[key.column];if(!bounds.known) return null;
+                if (presentGroupMeasures(table, key.column, transitions[0..p.agg_count])) |*measures| {
+                    const narrowed = if (measures.count == 1)
+                        try self.scanPresentGroups(1, p, outer, table, key.column, bounds, measures)
+                    else
+                        try self.scanPresentGroups(2, p, outer, table, key.column, bounds, measures);
+                    if (narrowed) |rows| return rows;
+                }
                 const span128=@as(i128,bounds.high)-bounds.low+1;
                 const stride=factor_header+p.agg_count*@sizeOf(FactorAggregate);
                 const per_bucket=(stride+@sizeOf(V.Cell)-1)/@sizeOf(V.Cell)+1+p.agg_count+p.width;

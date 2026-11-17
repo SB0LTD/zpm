@@ -56,6 +56,56 @@ const Cancel=struct {
     calls:usize=0,
     fn poll(raw:?*anyopaque) sql.Error!void {const self:*Cancel=@ptrCast(@alignCast(raw.?));self.calls+=1;if(fast.workspace.query.stream_stats.rows>=64) return error.QueryCanceled;}
 };
+fn narrowPresentGroups() !void {
+    try execute("DROP TABLE fact");
+    try execute("CREATE TABLE fact(id INT PRIMARY KEY,k BIGINT,a BIGINT,b INT,c BIGINT,label TEXT)");
+    try execute("INSERT INTO fact VALUES " ++
+        "(1,-9223372036854775808,-5000,-7,4,'x')," ++
+        "(2,-9223372036854775808,7000,8,7,'y')," ++
+        "(3,-9223372036854775806,9,-3,8,'z')");
+    const narrow = "SELECT k,COUNT(*),COUNT(label),SUM(b),SUM(a),AVG(a),COUNT(a) FROM fact " ++
+        "GROUP BY k ORDER BY k NULLS FIRST";
+    try execute(narrow);
+    try check(fast.workspace.query.stream_stats.narrow_typed_group_plans == 1);
+    try check(fast.workspace.query.stream_stats.rows == 3 and fr.row_count == 2);
+    try check(fr.rows[0].cells[0].integer == -9223372036854775808);
+    try check(fr.rows[0].cells[1].integer == 2 and fr.rows[0].cells[3].integer == 1);
+
+    try execute("WITH totals AS (SELECT k,SUM(b) AS units,SUM(a) AS total FROM fact GROUP BY k) " ++
+        "SELECT k,units,total FROM totals ORDER BY total DESC,k LIMIT 1");
+    try check(fast.workspace.query.stream_stats.narrow_typed_group_plans == 1);
+    try execute("SELECT k,SUM(a),AVG(a),COUNT(*) FROM fact GROUP BY k ORDER BY k");
+    try check(fast.workspace.query.stream_stats.narrow_typed_group_plans == 1);
+    try execute("SELECT k,SUM(a),SUM(b),SUM(c) FROM fact GROUP BY k ORDER BY k");
+    try check(fast.workspace.query.stream_stats.typed_group_plans == 1 and fast.workspace.query.stream_stats.narrow_typed_group_plans == 0);
+
+    const pinned = try fast.begin();
+    const snapshot: Fast.Snapshot = .{ .csn = fast.csn };
+    fast.txs[pinned].pin = snapshot;
+    try fast.execute("UPDATE fact SET a=123 WHERE id=1", &fr);
+    var reader: Fast.ReadContext = .{};
+    reader.workspace.query.refs = &refs;
+    try reader.execute(&fast, narrow, snapshot, &fr);
+    try slow.execute(narrow, &sr);
+    try same();
+    try check(reader.workspace.query.stream_stats.narrow_typed_group_plans == 0);
+    fast.abort(pinned);
+    try slow.execute("UPDATE fact SET a=123 WHERE id=1", &sr);
+    try execute(narrow);
+    try check(fast.workspace.query.stream_stats.narrow_typed_group_plans == 1);
+
+    try execute("UPDATE fact SET a=NULL WHERE id=1");
+    try execute(narrow);
+    try check(fast.workspace.query.stream_stats.typed_group_plans == 1 and fast.workspace.query.stream_stats.narrow_typed_group_plans == 0);
+    try execute("UPDATE fact SET a=123 WHERE id=1");
+    try execute("UPDATE fact SET label=NULL WHERE id=2");
+    try execute(narrow);
+    try check(fast.workspace.query.stream_stats.narrow_typed_group_plans == 0);
+    try execute("UPDATE fact SET label='y',a=9223372036854775807 WHERE id=2");
+    try execute(narrow);
+    try check(fast.workspace.query.stream_stats.typed_group_plans == 1 and fast.workspace.query.stream_stats.narrow_typed_group_plans == 0);
+}
+
 pub fn main() !void {
     @memset(std.mem.asBytes(&memory),0xa5);
     try fast.bindMemory(&memory[0],n+16,(n+16)*2,8192);try slow.bindMemory(&memory[1],n+16,(n+16)*2,8192);
@@ -127,6 +177,7 @@ pub fn main() !void {
         try check(fr.row_count==1 and std.mem.eql(u8,fr.rows[0].cells[4].text.slice(),"18446744073709551614"));
         try execute("DELETE FROM fact");try execute(query);try check(fr.row_count==0);
     }
+    try narrowPresentGroups();
     try small.bindMemory(&small_memory,2,4,128);
     try small.execute("CREATE TABLE fact(id INT PRIMARY KEY,k BIGINT,a BIGINT,b INT,c BIGINT,label TEXT)",&small_result);
     try small.execute("INSERT INTO fact VALUES(1,0,10,20,30,'x'),(2,0,11,21,31,NULL)",&small_result);
