@@ -2280,6 +2280,7 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 try self.expectWord("VALUE");
             }
+            try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("DEFAULT")) {
                 try self.expectWord("VALUES");
                 out.source = .default_values;
@@ -2352,6 +2353,20 @@ pub fn Parser(comptime config: types.Config) type {
         /// RETURNING targets: `*`, `t.*` or expressions with aliases.
         fn returningClause(self: *Self, out: *Ast.Returning) Error!void {
             if (self.mode != .standard or !try self.takeWord("RETURNING")) return;
+            if (out.output) return error.UnsupportedStatement;
+            try self.returningTargets(out);
+        }
+
+        fn outputClause(self: *Self, out: *Ast.Returning) Error!void {
+            if (self.mode != .standard or self.tokens.dialect != .tds or !self.rawWord("output")) return;
+            self.last_native_syntax = self.current.start;
+            try self.advance();
+            out.output = true;
+            try self.returningTargets(out);
+            if (self.isWord("INTO") or self.rawWord("output")) return error.UnsupportedStatement;
+        }
+
+        fn returningTargets(self: *Self, out: *Ast.Returning) Error!void {
             while (true) {
                 if (out.count == config.columns) return error.ColumnCapacity;
                 var target: Ast.Target = .{};
@@ -3246,6 +3261,7 @@ pub fn Parser(comptime config: types.Config) type {
         /// UPDATE / DELETE target alias: AS label, or a bare identifier that
         /// is not a PostgreSQL reserved word.
         fn targetAlias(self: *Self) Error!?ast.Ident {
+            if (self.tokens.dialect == .tds and self.rawWord("output")) return null;
             if (try self.takeWord("AS")) return try self.label();
             if (self.current.kind == .quoted_word) return try self.identifier();
             if (self.current.kind == .word and !lexer.reserved(self.current.keyword) and !reservedWord(self.current.raw(self.source))) return try self.identifier();
@@ -3274,6 +3290,7 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.setItem(&out.assignments, &out.count);
                 if (!try self.takeSymbol(.comma)) break;
             }
+            try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("FROM")) out.from = try self.fromBlock();
             out.where = try self.where();
             try self.returningClause(&out.returning);
@@ -3290,6 +3307,7 @@ pub fn Parser(comptime config: types.Config) type {
                 out.table = try self.identifier();
             }
             if (self.mode == .standard) out.alias = try self.targetAlias();
+            try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("USING")) out.using = try self.fromBlock();
             out.where = try self.where();
             try self.returningClause(&out.returning);

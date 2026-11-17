@@ -399,6 +399,82 @@ fn nativeIntNullability() !void {
     try check(try outer_join.numeric(1) == 0 and try outer_join.numeric(1) == 0xfd);
 }
 
+fn nativeOutput() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    try check((try execute(&session, &db, "CREATE TABLE image_data(id INT PRIMARY KEY,v INT)"))[0] == 0xfd);
+    var inserted: Reader = .{ .source = try execute(&session, &db,
+        "INSERT INTO image_data OUTPUT INSERTED.* VALUES(1,10),(2,NULL)") };
+    try check(try inserted.numeric(1) == 0x81 and try inserted.numeric(2) == 2);
+    try readColumn(&inserted, 0, 0x38, null, "id");
+    try readColumn(&inserted, 1, 0x26, 4, "v");
+    try check(try inserted.numeric(1) == 0xd1 and try inserted.numeric(4) == 1);
+    try check(try inserted.numeric(1) == 4 and try inserted.numeric(4) == 10);
+    try check(try inserted.numeric(1) == 0xd1 and try inserted.numeric(4) == 2 and try inserted.numeric(1) == 0);
+    try check(try inserted.numeric(1) == 0xfd and session.result.affected_rows == 2);
+
+    var native: Reader = .{ .source = try execute(&session, &db,
+        "UPDATE image_data SET v=2 OUTPUT inserted.id WHERE id=1") };
+    try check(try native.numeric(1) == 0x81 and try native.numeric(2) == 1);
+    try readColumn(&native, 0, 0x38, null, "id");
+    try check(try native.numeric(1) == 0xd1 and try native.numeric(4) == 1 and try native.numeric(1) == 0xfd);
+    try check(session.result.affected_rows == 1);
+
+    var updated: Reader = .{ .source = try execute(&session, &db,
+        "UPDATE image_data SET v=20 OUTPUT [DELETED].v AS old_v, inserted.v AS new_v WHERE id=1") };
+    try check(try updated.numeric(1) == 0x81 and try updated.numeric(2) == 2);
+    try readColumn(&updated, 1, 0x26, 4, "old_v");
+    try readColumn(&updated, 1, 0x26, 4, "new_v");
+    try check(try updated.numeric(1) == 0xd1 and try updated.numeric(1) == 4 and try updated.numeric(4) == 2);
+    try check(try updated.numeric(1) == 4 and try updated.numeric(4) == 20 and try updated.numeric(1) == 0xfd);
+
+    var empty: Reader = .{ .source = try execute(&session, &db,
+        "UPDATE image_data SET v=99 OUTPUT deleted.id WHERE id=0") };
+    try check(try empty.numeric(1) == 0x81 and try empty.numeric(2) == 1);
+    try readColumn(&empty, 0, 0x38, null, "id");
+    try check(try empty.numeric(1) == 0xfd and session.result.affected_rows == 0);
+
+    for ([_][]const u8{
+        "UPDATE image_data SET v=100 OUTPUT inserted.id INTO sink WHERE id=1",
+        "UPDATE image_data SET v=100 OUTPUT v WHERE id=1",
+        "UPDATE image_data SET v=100 OUTPUT inserted.v+1 WHERE id=1",
+        "INSERT INTO image_data OUTPUT deleted.id VALUES(3,30)",
+        "DELETE FROM image_data OUTPUT inserted.id WHERE id=2",
+        "UPDATE image_data SET id=1 OUTPUT deleted.id WHERE id=2",
+    }) |statement| try check((try execute(&session, &db, statement))[0] == 0xaa);
+    try check((try execute(&session, &db, "SELECT id,v FROM image_data ORDER BY id"))[0] == 0x81);
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[1].integer == 20 and
+        session.result.rows[1].cells[0].integer == 2 and session.result.rows[1].cells[1] == .null_value);
+
+    var deleted: Reader = .{ .source = try execute(&session, &db,
+        "DELETE FROM image_data OUTPUT DELETED.* WHERE id=2") };
+    try check(try deleted.numeric(1) == 0x81 and try deleted.numeric(2) == 2);
+    try readColumn(&deleted, 0, 0x38, null, "id");
+    try readColumn(&deleted, 1, 0x26, 4, "v");
+    try check(try deleted.numeric(1) == 0xd1 and try deleted.numeric(4) == 2 and try deleted.numeric(1) == 0);
+    try check(try deleted.numeric(1) == 0xfd and session.result.affected_rows == 1);
+
+    var postgres: DB = .{ .store = &store, .id = 2 };
+    var result: Raw.Result = .{};
+    if (postgres.execute("UPDATE image_data SET v=3 OUTPUT inserted.id", &result)) |_| {
+        return error.TdsContractFailed;
+    } else |err| try check(err == error.Syntax);
+    try postgres.execute("UPDATE image_data SET v=21 RETURNING id,v", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 1 and result.rows[0].cells[1].integer == 21);
+    try postgres.execute("CREATE FUNCTION image_passthrough() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$", &result);
+    try postgres.execute("CREATE TRIGGER image_update BEFORE UPDATE ON image_data FOR EACH ROW EXECUTE FUNCTION image_passthrough()", &result);
+    try check((try execute(&session, &db, "UPDATE image_data SET v=222 OUTPUT inserted.id WHERE id=1"))[0] == 0xaa);
+    try postgres.execute("CREATE TABLE image_child(id INT PRIMARY KEY, parent INT REFERENCES image_data(id) ON DELETE CASCADE)", &result);
+    try postgres.execute("INSERT INTO image_child VALUES(10,1)", &result);
+    try check((try execute(&session, &db, "DELETE FROM image_data OUTPUT deleted.id WHERE id=1"))[0] == 0xaa);
+    try postgres.execute("SELECT v FROM image_data WHERE id=1", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 21);
+    try postgres.execute("SELECT parent FROM image_child WHERE id=10", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 1);
+}
+
 fn transactionManagerAndPreflight() !void {
     store = .{};
     var db: DB = .{ .store = &store, .id = 1 };
@@ -753,6 +829,7 @@ pub fn main(init: std.process.Init) !void {
     try nativeIdentifiersAndTop();
     try nativeDateAddAndIsNull();
     try nativeIntNullability();
+    try nativeOutput();
     try outputFragmentation();
     try transactionManagerAndPreflight();
     try concurrentCommittedVisibility();

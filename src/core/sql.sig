@@ -668,6 +668,7 @@ pub fn Database(comptime config: Config) type {
             names: [config.columns]Name = @splat(.{}),
             types: [config.columns]DataType = @splat(.integer),
             typmods: [config.columns]i32 = @splat(-1),
+            non_null_columns: std.StaticBitSet(config.columns) = .empty,
         };
 
         pub const Outcome = struct {
@@ -1721,6 +1722,7 @@ pub fn Database(comptime config: Config) type {
             const returned = &self.outcome.returning;
             if (returned.count == 0) return;
             result.column_count = returned.count;
+            result.non_null_columns = returned.non_null_columns;
             @memcpy(result.column_names[0..returned.count], returned.names[0..returned.count]);
             @memcpy(result.column_types[0..returned.count], returned.types[0..returned.count]);
             @memcpy(result.column_typmods[0..returned.count], returned.typmods[0..returned.count]);
@@ -2157,6 +2159,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
+                    if (insert.returning.output) try self.validateTsqlOutput(insert.table, .insert, snap);
                     if (insert.replace) try self.validateMysqlReplace(slot, insert.table, snap);
                     if (insert.replace or insert.conflict.action != .none) try self.ssiRead(slot, insert.table);
                     try self.lockSources(slot);
@@ -2173,6 +2176,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .update => |*update| blk: {
                     try self.lockTable(slot, update.table, .row_exclusive);
+                    if (update.returning.output) try self.validateTsqlOutput(update.table, .update, snap);
                     try self.ssiRead(slot, update.table);
                     try self.lockSources(slot);
                     if (try self.insteadNothing(update.table, '2', update.returning.count != 0, snap)) break :blk 0;
@@ -2184,6 +2188,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .delete => |*delete| blk: {
                     try self.lockTable(slot, delete.table, .row_exclusive);
+                    if (delete.returning.output) try self.validateTsqlOutput(delete.table, .delete, snap);
                     try self.ssiRead(slot, delete.table);
                     try self.lockSources(slot);
                     if (try self.insteadNothing(delete.table, '4', delete.returning.count != 0, snap)) break :blk 0;
@@ -2451,8 +2456,8 @@ pub fn Database(comptime config: Config) type {
             return out;
         }
 
-        /// RETURNING: one row per row this statement wrote, in write order
-        /// (new versions for INSERT/UPDATE, the deleted version for DELETE).
+        /// RETURNING: one row per write (new for INSERT/UPDATE, old for
+        /// DELETE). T-SQL OUTPUT carries an image selector per result column.
         /// The statement's write slice survives a park, so a resumed
         /// statement emits every row exactly once. Every value is computed
         /// into the workspace first; a failure leaves the result untouched.
@@ -2466,6 +2471,7 @@ pub fn Database(comptime config: Config) type {
             for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index))) {
                 count += 1;
             };
+            if (list.output and count != self.outcome.affected) return error.UnsupportedStatement;
             if (count > result_capacity) return error.RowCapacity;
             const work = &self.workspace.query;
             if (fresh) X.resetWork(work);
@@ -2476,11 +2482,20 @@ pub fn Database(comptime config: Config) type {
             for (writes) |entry| {
                 if (!rowWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
                 const table = &self.tables[entry.table];
-                ctx.row = &table.versions[if (entry.kind == .delete) entry.old else entry.new].cells;
-                for (list.targets[0..width], 0..) |id, column| work.cells[base + row * width + column] = try E.eval(&ctx, id);
+                if (list.output) {
+                    try self.session.checkpoint();
+                    for (list.targets[0..width], 0..) |id, column| {
+                        const version = if (list.deleted_columns.isSet(column)) entry.old else entry.new;
+                        const source_column = self.workspace.nodes.nodes[id].column;
+                        work.cells[base + row * width + column] = table.versions[version].cells[source_column];
+                    }
+                } else {
+                    ctx.row = &table.versions[if (entry.kind == .delete) entry.old else entry.new].cells;
+                    for (list.targets[0..width], 0..) |id, column| work.cells[base + row * width + column] = try E.eval(&ctx, id);
+                }
                 row += 1;
             }
-            var returned: Returned = .{ .count = width, .rows = count, .base = base };
+            var returned: Returned = .{ .count = width, .rows = count, .base = base, .non_null_columns = list.non_null_columns };
             @memcpy(returned.names[0..width], list.names[0..width]);
             @memcpy(returned.types[0..width], list.types[0..width]);
             @memcpy(returned.typmods[0..width], list.typmods[0..width]);
@@ -2489,6 +2504,38 @@ pub fn Database(comptime config: Config) type {
 
         fn rowWrite(kind: anytype) bool {
             return kind == .insert or kind == .update or kind == .delete;
+        }
+
+        fn validateTsqlOutput(self: *const Self, index: usize, command: CommandTag, snap: Snapshot) Error!void {
+            const rule: u8, const event: u8 = switch (command) {
+                .insert => .{ '3', routine_catalog.tg_insert },
+                .update => .{ '2', routine_catalog.tg_update },
+                .delete => .{ '4', routine_catalog.tg_delete },
+                else => unreachable,
+            };
+            const oid = self.tables[index].oid;
+            // OUTPUT without INTO must reject a trigger for this event. Rules
+            // and cascades can change which writes correspond to the DML.
+            for (&self.objects.triggers) |*trigger| {
+                if (trigger.live and trigger.table_oid == oid and trigger.tgtype & event != 0 and
+                    trigger.stamp.visible(snap)) return error.UnsupportedStatement;
+            }
+            if (self.ruleKind(index, rule, snap) != .none) return error.UnsupportedStatement;
+            if (command == .insert) return;
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const other = &self.tables[found.slot];
+                for (other.constraints[0..other.constraint_count]) |constraint| {
+                    if (constraint.kind != .foreign or constraint.ref_oid != oid) continue;
+                    const action = if (command == .update) constraint.on_update else constraint.on_delete;
+                    switch (action) {
+                        .no_action, .restrict => {},
+                        .cascade, .set_null, .set_default => return error.UnsupportedStatement,
+                    }
+                }
+            }
         }
 
         /// Reclamation horizon covers running bodies, parked statements and
@@ -9116,6 +9163,7 @@ pub fn Database(comptime config: Config) type {
             };
             if (returning) |list| {
                 result.column_count = list.count;
+                result.non_null_columns = list.non_null_columns;
                 @memcpy(result.column_names[0..list.count], list.names[0..list.count]);
                 @memcpy(result.column_types[0..list.count], list.types[0..list.count]);
                 @memcpy(result.column_typmods[0..list.count], list.typmods[0..list.count]);
