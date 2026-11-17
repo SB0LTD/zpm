@@ -53,7 +53,14 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Routines, triggers and rules (B11 wave 3).
     pg_proc, pg_trigger, pg_rewrite, pg_rules,
     // Catalog objects (B11 wave 3, catalog_objects.sig).
-    pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum };
+    pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database };
+
+pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
+pub const DatabaseCatalogProvider = struct {
+    context: ?*const anyopaque = null,
+    capacity: usize,
+    row: *const fn (?*const anyopaque, usize) ?DatabaseCatalogRow,
+};
 
 pub const ViewColumn = struct { name: []const u8, ty: types.Type };
 
@@ -68,6 +75,7 @@ const pg_type_columns = [_]ViewColumn{
 };
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name) };
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
+const pg_database_columns = [_]ViewColumn{ col("oid", .oid), col("datname", .name), col("datdba", .oid) };
 const pg_class_columns = [_]ViewColumn{ col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .text), col("relnatts", .int2) };
 const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .text), col("attgenerated", .text), col("atthasdef", .boolean) };
 const pg_index_columns = [_]ViewColumn{ col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text) };
@@ -109,6 +117,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
     return switch (view) {
         .pg_type => &pg_type_columns,
         .pg_enum => &pg_enum_columns,
+        .pg_database => &pg_database_columns,
         .pg_namespace => &pg_namespace_columns,
         .pg_class => &pg_class_columns,
         .pg_attribute => &pg_attribute_columns,
@@ -181,6 +190,12 @@ pub fn Catalog(comptime config: types.Config) type {
         pub const Cell = CV.Cell;
 
         relations: [4]SC.Table = @splat(.{}),
+        databases: ?DatabaseCatalogProvider = null,
+
+        pub fn findSystemView(self: *const Self, schema: ?[]const u8, name: []const u8) ?View {
+            if (self.databases != null and types.same(schema orelse "pg_catalog", "pg_catalog") and types.same(name, "pg_database")) return .pg_database;
+            return findView(schema, name);
+        }
 
         pub fn relation(self: *Self, which: Relation) *SC.Table {
             return &self.relations[@intFromEnum(which)];
