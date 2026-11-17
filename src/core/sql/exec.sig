@@ -110,6 +110,7 @@ pub fn Exec(comptime config: types.Config) type {
         pub const ReadStats = struct {
             projected_filter_scans: usize = 0,
             projected_filter_rows: usize = 0,
+            projected_topk_scans: usize = 0,
             key_probes: usize = 0,
             key_walks: usize = 0,
             key_fallbacks: usize = 0,
@@ -4955,7 +4956,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// cached ranks. The heap moves only slot IDs; one spare key slot is
         /// recycled on rejection/replacement. NULL placement and stable row-slot
         /// order match Sorter/StableSorter. Keep this stack frame off point reads.
-        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!usize {
+        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats, comptime projected: bool) Error!usize {
             var entries: [integer_topk_capacity + 1]IntegerEntry = undefined;
             var keys: [config.columns]IntegerOrder = undefined;
             const current = committed_only and table.summary.valid and table.summary.csn <= snap.csn;
@@ -4971,17 +4972,35 @@ pub fn Exec(comptime config: types.Config) type {
             var used: usize = 0;
             var spare: u32 = @intCast(count);
             const sorter: IntegerSorter = .{ .entries = &entries, .count = query.order_count, .session = ctx.session };
+            const projected_values = if (projected)
+                table.scan_values[keys[0].column * table.rows.len ..][0..table.row_high]
+            else &.{};
+            if (projected) stats.projected_topk_scans += 1;
             rows: for (0..table.row_high) |slot| {
                 try ctx.session.checkpoint();
-                const version = S.visibleAt(table, slot, snap) orelse continue;
-                if (!try keep(ctx, query.where, S.borrowVersionRow(table, version, row_scratch))) continue;
+                const full = used == count;
+                var projected_rank: u64 = undefined;
+                const version: u32 = if (projected) blk: {
+                    if (table.scan_live[slot] == 0) continue;
+                    projected_rank = @as(u64, @bitCast(projected_values[slot])) ^ 0x8000000000000000;
+                    if (keys[0].descending) projected_rank = ~projected_rank;
+                    // Slot order breaks ties in both paths. A later slot
+                    // matching the heap root cannot displace it.
+                    if (full and projected_rank >= entries[indices[0]].keys[0].rank) continue;
+                    break :blk @intCast(slot);
+                } else blk: {
+                    const visible = S.visibleAt(table, slot, snap) orelse continue;
+                    if (!try keep(ctx, query.where, S.borrowVersionRow(table, visible, row_scratch))) continue;
+                    break :blk visible;
+                };
                 const candidate: u32 = if (used < count) @intCast(used) else spare;
                 const entry = &entries[candidate];
                 entry.version = version;
-                entry.ordinal = table.versions[version].row;
-                const full = used == count;
+                entry.ordinal = if (projected) @intCast(slot + 1) else table.versions[version].row;
                 var relation: i8 = 0;
-                for (keys[0..query.order_count], 0..) |key, column| {
+                if (projected) {
+                    entry.keys[0] = .{ .rank = projected_rank, .null_rank = keys[0].nulls_first };
+                } else for (keys[0..query.order_count], 0..) |key, column| {
                     var temporary: V.Cell = undefined;
                     const value = S.borrowVersionCell(table, version, key.column, &temporary);
                     const is_null = !key.nonnull and value.* == .null_value;
@@ -4999,13 +5018,29 @@ pub fn Exec(comptime config: types.Config) type {
                         if (relation > 0) continue :rows;
                     }
                     entry.keys[column] = normalized;
-                }
-                if (full and relation == 0 and entry.ordinal >= entries[indices[0]].ordinal) continue;
+                };
+                if (!projected and full and relation == 0 and entry.ordinal >= entries[indices[0]].ordinal) continue;
                 const removed = try sort_module.offerTopKSlot(indices[0..count], &used, candidate, &sorter);
                 if (full) spare = removed;
             }
-            for (indices[0..used]) |*id| id.* = entries[id.*].version;
+            for (indices[0..used]) |*id| {
+                const selected = entries[id.*].version;
+                id.* = if (projected) S.visibleAt(table, selected, snap) orelse unreachable else selected;
+            }
             return used;
+        }
+
+        fn canProjectIntegerTopK(table: *const S.Table, pool: *const Ast.Pool, query: *const B.Select,
+            snap: storage.Snapshot, committed_only: bool) bool {
+            if (comptime !S.compact_enabled) return false;
+            // The published live map agrees with visibility at this
+            // snapshot. Resolve versions only for the retained slots.
+            if (!S.hasCompactScan(table) or !committed_only or !table.summary.valid or
+                table.summary.csn > snap.csn or table.scan_high != table.row_high or
+                table.truncate_csn > snap.csn or snap.own(table.pending_truncate.owner) or
+                query.where != none or query.order_count != 1) return false;
+            const column = pool.nodes[query.order[0].expr].column;
+            return table.columns[column].not_null or table.summary.columns[column].nonnull == table.summary.rows;
         }
 
         const KeyInterval = struct { low: i128, high: i128, exact: bool = true };
@@ -5248,7 +5283,10 @@ pub fn Exec(comptime config: types.Config) type {
                   };
                   if (top_k and query.limit <= integer_topk_capacity and integerOrder(pool, query)) {
                     if (comptime observing) observation.operation = .integer_top_k;
-                    found = try integerTopK(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats);
+                    found = if (canProjectIntegerTopK(table, pool, query, snap, committed_only))
+                        try integerTopK(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats, true)
+                    else
+                        try integerTopK(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats, false);
                   } else for (0..table.row_high) |slot| {
                     try session.checkpoint();
                     const version = S.visibleAt(table, slot, snap) orelse continue;
