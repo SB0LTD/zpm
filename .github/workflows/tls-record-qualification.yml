@@ -13,11 +13,11 @@ jobs:
     timeout-minutes: 15
     env:
       BASELINE: c17529d836bc94336e29aef959b06f91974a4e11
-      CANDIDATE: 9c1eb3b0c3d6f6b3c2d8452fe287f53f97120aa0
+      CANDIDATE: e2063a7f7f756edbdc439e5360c860b136fc87b6
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          fetch-depth: 5
+          fetch-depth: 8
           persist-credentials: false
       - name: Install checksum-verified Sig compiler and standard library
         shell: bash
@@ -41,7 +41,7 @@ jobs:
         run: |
           set -euo pipefail
           git merge-base --is-ancestor "$CANDIDATE" HEAD
-          test "$(git rev-parse "$CANDIDATE^")" = "$BASELINE"
+          test "$(git rev-parse "$CANDIDATE~2")" = "$BASELINE"
           printf 'workflow=%s\nbaseline=%s\ncandidate=%s\n' "$GITHUB_SHA" "$BASELINE" "$CANDIDATE" | tee evidence/source.log
           git worktree add --detach "$RUNNER_TEMP/baseline" "$BASELINE"
           git worktree add --detach "$RUNNER_TEMP/candidate" "$CANDIDATE"
