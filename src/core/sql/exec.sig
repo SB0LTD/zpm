@@ -5037,8 +5037,10 @@ pub fn Exec(comptime config: types.Config) type {
             if (version != null and result.rows.len == 0) return error.WorkspaceCapacity;
             writeHeader(query, result);
             if (version) |entry| {
-                const cells = &table.versions[entry].cells;
-                for (columns, 0..) |column, index| result.rows[0].cells[index] = cells[column];
+                var scratch: V.Cell = undefined;
+                for (columns, 0..) |column, index| {
+                    result.rows[0].cells[index] = S.borrowVersionCell(table, entry, column, &scratch).*;
+                }
                 result.row_count = 1;
             }
         }

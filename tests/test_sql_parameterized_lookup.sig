@@ -4,6 +4,8 @@ const sql = @import("sql");
 
 const DB = sql.Database(.{
     .external_storage = true,
+    .split_external_versions = true,
+    .integral_external_versions = true,
     .external_workspace = true,
     .external_results = true,
     .tables = 8,
@@ -17,6 +19,15 @@ const DB = sql.Database(.{
 const main_bytes = DB.backingBytes(32, 64, 4096) catch unreachable;
 const read_bytes = DB.ReadContext.backingBytes(64) catch unreachable;
 var backing: [main_bytes]u8 align(16) = undefined;
+const packed_budgets: [8]DB.TableBudget = init: {
+    var budgets: [8]DB.TableBudget = @splat(.{ .rows = 4, .versions = 8 });
+    budgets[0].integral_row_words = 3;
+    break :init budgets;
+};
+const packed_bytes = DB.backingBytesFor(packed_budgets, 4096) catch unreachable;
+var packed_backing: [packed_bytes]u8 align(16) = undefined;
+var packed_db: DB = .{};
+var packed_workspace: [768]DB.Cell = undefined;
 var workspace: [768]DB.Cell = undefined;
 var context: DB.ReadContext = .{};
 var scratch: [read_bytes]u8 align(16) = undefined;
@@ -199,6 +210,20 @@ fn admission() !void {
     try check(result.row_count == 0);
 }
 
+fn packedBank() !void {
+    try packed_db.bindMemoryFor(&packed_backing, packed_budgets, 4096);
+    try packed_db.bindWorkspace(&packed_workspace);
+    try packed_db.execute("CREATE TABLE packed_points (id INT PRIMARY KEY, qty INT, day DATE)", &expected);
+    try packed_db.execute("INSERT INTO packed_points VALUES(-1,NULL,DATE '2024-02-29')", &expected);
+    try check(packed_db.tables[0].live and packed_db.tables[0].version_rows.len == 0);
+    context.session.role = 10;
+    const snapshot: DB.Snapshot = .{ .csn = packed_db.csn };
+    try check(try context.preparePrimaryKey(&packed_db, "SELECT day AS leap_day,qty,id,day FROM packed_points WHERE id=$1", snapshot, .integer32));
+    try check(try context.runPrimaryKey(&packed_db, snapshot, &minus_one, &result));
+    try packed_db.execute("SELECT day AS leap_day,qty,id,day FROM packed_points WHERE id=-1", &expected);
+    try compare();
+}
+
 pub fn main() !void {
     try db.bindMemory(&backing, 32, 64, 4096);
     try db.bindWorkspace(&workspace);
@@ -217,5 +242,6 @@ pub fn main() !void {
         std.debug.print("admission after {d} assertions: {s}\n", .{ assertions, @errorName(err) });
         return err;
     };
+    try packedBank();
     std.debug.print("{{\"suite\":\"sql-parameterized-lookup\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
 }
