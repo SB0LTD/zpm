@@ -2,16 +2,16 @@
 
 ## Native wire checkpoint — 17 November 2026
 
-The unchanged 118-program inventory has independent native wire results for
-RAMSQL `13294c5246dce4ef6ab23af55c1679b7d189af42` with ZPM
-`5f674e9e561d208bed7f29338b462d257e482165`. The Windows ReleaseSafe executable
-has SHA-256 `790e66db2485374d01104610a4ade911c67d349a9ea2382811af67c7011626f2`.
+The unchanged 118-program inventory has independent native wire results.
+The PostgreSQL and MySQL runs use RAMSQL `13294c5246dce4ef6ab23af55c1679b7d189af42`
+with ZPM `5f674e9e561d208bed7f29338b462d257e482165`. The Windows ReleaseSafe
+executable has SHA-256 `790e66db2485374d01104610a4ade911c67d349a9ea2382811af67c7011626f2`.
 
 | Native reference | Matched | Open cases |
 | --- | ---: | --- |
 | PostgreSQL 18.3 | 104 of 106 | `PG.DDL.DATABASE`, `PG.TX.TWO_PHASE` |
 | MySQL Community 8.4.13 | 4 of 6 | `MYSQL.TYPES`, `MYSQL.AUTO_INCREMENT` |
-| SQL Server 2022 CU28 | 3 of 6 | `OUTPUT`, `APPLY`, `PROCEDURAL` fail on feature SQL. |
+| SQL Server 2022 CU28 | 6 of 6 | The original six smoke programs pass. Broader dialect work is tracked below. |
 
 The PostgreSQL enum, domain and composite case now matches. The wire audit
 normalizes dynamic OIDs through each server's own type catalog and retains the
@@ -29,11 +29,14 @@ failed-statement rollback, explicit rollback, cross-session visibility,
 same-key writer blocking and replay of the committed result.
 The trace SHA-256 is `7e883970bdf955f59b392d1aac9adce8b3e4c04875f6e56ecc50dfc1a7907716`.
 
-The Linux SQL Server comparison matches result metadata and values for the
-bracket alias, TOP and scalar function cases, plus all 24 setup observations.
-The exact Linux executable SHA-256 is
-`0cd3819f3d3236664f3588935a55d73d150b5c863b781af163f7b16a0c92b00c`.
-[Native SQL Server run](https://github.com/benor1470/dbMeter/actions/runs/44161329548)
+The Linux SQL Server comparison uses RAMSQL `1a8dbb6846a5eb1df1ab96f141184731af904332`
+and ZPM `e3b7c13c07fafe4a3951b581c3ce203b81281d9a`. The six cases and all 24
+setup observations match native values, row counts and result metadata. The
+new cases exercise direct OUTPUT row images, a correlated CROSS APPLY derived
+query and a batch-scoped INT declaration. The executable SHA-256 is
+`fb19425bd3950e3ab85827e6378c44d828fed993a71f2a77dc03ddaaafd9c36a` and the report
+SHA-256 is `5c8425c05c1377fc10a4891988fe4593c3d4d96bf9b520a6aba5eb81dab4669f`.
+[Native SQL Server run](https://github.com/benor1470/dbMeter/actions/runs/44165836087)
 
 ## Catalog and security candidate (lane B11, wave 3) - 5 November 2026
 
