@@ -672,6 +672,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .create_schema => .create_schema,
                 .drop_schema => .drop_schema,
                 .control => |control| switch (control) {
+                    .vacuum => .vacuum,
                     .begin, .set_transaction => .begin,
                     .commit => .commit,
                     .rollback, .rollback_to => .rollback,
@@ -4178,7 +4179,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// A user table, optionally schema-qualified (public by default,
         /// as the default search_path).
-        fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
+        pub fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
             // PostgreSQL reports a relation in a missing schema as 42P01.
             const namespace = qualifierNamespace(context, schema) catch |err| return if (err == error.UndefinedSchema) error.TableNotFound else err;
             const wanted = toName(context, name);

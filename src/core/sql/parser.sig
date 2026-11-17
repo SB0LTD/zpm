@@ -996,6 +996,12 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// Transaction control and session commands (the store executes them).
         fn controlStatement(self: *Self) Error!ast.Control {
+            if (self.mode == .standard and try self.takeRaw("vacuum")) {
+                if (self.current.kind == .end or self.isSymbol(.lparen)) return error.UnsupportedStatement;
+                const target = try self.qualifiedName();
+                self.finish() catch return error.UnsupportedStatement;
+                return .{ .vacuum = .{ .schema = target.schema, .name = target.name } };
+            }
             // Trailing text after plain transaction control stays an
             // unsupported statement (0A000), as before the pipeline split.
             if (try self.takeWord("BEGIN")) {

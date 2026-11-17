@@ -381,6 +381,220 @@ pub fn Database(comptime config: Config) type {
             }
         };
 
+        /// Optional caller-owned cache for complete typed read results. Bind
+        /// after storage recovery. The database object and backing storage
+        /// must outlive it. Replacing or restoring the database requires a
+        /// new cache, even if the committed sequence number is unchanged.
+        pub const ReadResultCache = struct {
+            const Cache = @This();
+            const ways = 4;
+
+            pub const Entry = struct {
+                valid: bool = false,
+                csn: u64 = 0,
+                hash: u64 = 0,
+                key_length: usize = 0,
+                database_name: [64]u8 = undefined,
+                database_name_length: usize = 0,
+                workspace_cells: usize = 0,
+                workspace_refs: usize = 0,
+                output_rows: usize = 0,
+                result: Result = .{},
+            };
+
+            pub const Layout = struct {
+                entries: usize,
+                bytes: usize,
+                entry_offset: usize,
+                key_offset: usize,
+                key_bytes: usize,
+                row_offset: usize,
+                row_count: usize,
+            };
+
+            pub const Stats = struct {
+                hits: u64 = 0,
+                misses: u64 = 0,
+                publications: u64 = 0,
+                contention: u64 = 0,
+            };
+
+            database: *const Self,
+            entries: []Entry,
+            keys: []u8,
+            storage_spans: [4]StorageSpan,
+            key_capacity: usize,
+            rows_per_entry: usize,
+            busy: u8 = 0,
+            victim: usize = 0,
+            counters: Stats = .{},
+
+            /// Byte layout for one aligned caller-owned cache region.
+            pub fn layout(entries: usize, key_bytes_per_entry: usize, rows_per_entry: usize) Error!Layout {
+                if (entries == 0 or key_bytes_per_entry == 0 or rows_per_entry == 0 or
+                    (!config.external_results and rows_per_entry > Result.default_row_capacity)) return error.InvalidParameterValue;
+                const key_bytes = @mulWithOverflow(entries, key_bytes_per_entry);
+                const row_count = @mulWithOverflow(entries, if (config.external_results) rows_per_entry else 0);
+                if (key_bytes[1] != 0 or row_count[1] != 0) return error.InvalidParameterValue;
+                var bytes: usize = 0;
+                const entry_offset = try appendLayout(&bytes, Entry, entries);
+                const key_offset = try appendLayout(&bytes, u8, key_bytes[0]);
+                const row_offset = if (config.external_results) try appendLayout(&bytes, Row, row_count[0]) else bytes;
+                return .{ .entries = entries, .bytes = bytes, .entry_offset = entry_offset, .key_offset = key_offset,
+                    .key_bytes = key_bytes[0], .row_offset = row_offset, .row_count = row_count[0] };
+            }
+
+            /// Largest complete cache within the caller's byte budget.
+            pub fn layoutForBytes(byte_budget: usize, key_bytes_per_entry: usize, rows_per_entry: usize) Error!Layout {
+                const one = try layout(1, key_bytes_per_entry, rows_per_entry);
+                if (one.bytes > byte_budget) return error.WorkspaceCapacity;
+                var low: usize = 1;
+                var high = byte_budget / @sizeOf(Entry);
+                while (low < high) {
+                    const middle = low + (high - low + 1) / 2;
+                    const candidate = layout(middle, key_bytes_per_entry, rows_per_entry) catch {
+                        high = middle - 1;
+                        continue;
+                    };
+                    if (candidate.bytes <= byte_budget) low = middle else high = middle - 1;
+                }
+                return layout(low, key_bytes_per_entry, rows_per_entry);
+            }
+
+            pub fn bindMemory(cache: *Cache, db: *const Self, bytes: []u8, entries: usize, key_bytes_per_entry: usize, rows_per_entry: usize) Error!void {
+                const memory = try layout(entries, key_bytes_per_entry, rows_per_entry);
+                if (bytes.len < memory.bytes) return error.WorkspaceCapacity;
+                const entry_storage = try storageView(Entry, bytes, memory.entry_offset, memory.entries);
+                const key_storage = bytes[memory.key_offset..][0..memory.key_bytes];
+                const row_storage: []Row = if (comptime config.external_results) try storageView(Row, bytes, memory.row_offset, memory.row_count) else &.{};
+                try cache.init(db, entry_storage, key_storage, row_storage, rows_per_entry);
+            }
+
+            /// Snapshot of completed cache activity. Ineligible reads bypass
+            /// the cache, and a contended access is counted separately.
+            pub fn stats(cache: *const Cache) Stats {
+                return .{
+                    .hits = @atomicLoad(u64, &cache.counters.hits, .monotonic),
+                    .misses = @atomicLoad(u64, &cache.counters.misses, .monotonic),
+                    .publications = @atomicLoad(u64, &cache.counters.publications, .monotonic),
+                    .contention = @atomicLoad(u64, &cache.counters.contention, .monotonic),
+                };
+            }
+
+            /// Use a stable cache pointer for its lifetime. Each slot reserves
+            /// an equal part of keys and, for external results, row_storage.
+            /// For inline results pass empty row_storage.
+            pub fn init(cache: *Cache, db: *const Self, entries: []Entry, keys: []u8, row_storage: []Row, rows_per_entry: usize) Error!void {
+                if (entries.len == 0 or keys.len < entries.len or rows_per_entry == 0) return error.InvalidParameterValue;
+                if (comptime config.external_results) {
+                    if (rows_per_entry > row_storage.len / entries.len) return error.InvalidParameterValue;
+                } else if (row_storage.len != 0 or rows_per_entry > Result.default_row_capacity) return error.InvalidParameterValue;
+                const spans = [_]StorageSpan{ try ReadContext.objectSpan(cache), try ReadContext.span(entries), try ReadContext.span(keys), try ReadContext.span(row_storage) };
+                for (spans, 0..) |part, index| {
+                    try ReadContext.disjointDatabase(db, part);
+                    for (spans[0..index]) |earlier| if (ReadContext.overlaps(part, earlier)) return error.InvalidParameterValue;
+                }
+                cache.* = .{ .database = db, .entries = entries, .keys = keys, .storage_spans = spans,
+                    .key_capacity = keys.len / entries.len, .rows_per_entry = rows_per_entry };
+                for (entries, 0..) |*entry, index| {
+                    entry.valid = false;
+                    if (comptime config.external_results) entry.result.rows = row_storage[index * rows_per_entry ..][0..rows_per_entry];
+                }
+            }
+
+            fn validateContext(cache: *const Cache, context: *const ReadContext, result: *const Result) Error!void {
+                const spans = [_]StorageSpan{ try ReadContext.objectSpan(context), try ReadContext.objectSpan(result),
+                    try ReadContext.span(context.source), try ReadContext.span(context.session.database), try ReadContext.span(context.workspace.query.cells[0..]),
+                    try ReadContext.span(context.workspace.query.refs[0..]), try ReadContext.span(result.rows[0..]) };
+                for (cache.storage_spans) |part| {
+                    for (spans) |other| if (ReadContext.overlaps(part, other)) return error.InvalidParameterValue;
+                }
+            }
+
+            fn hashSource(source: []const u8) u64 {
+                var hash: u64 = 14695981039346656037;
+                for (source) |byte| hash = (hash ^ byte) *% 1099511628211;
+                return hash;
+            }
+
+            fn bucket(cache: *const Cache, hash: u64) usize {
+                const groups = (cache.entries.len - 1) / ways + 1;
+                return @as(usize, @intCast(hash % groups)) * ways;
+            }
+
+            fn lock(cache: *Cache) bool {
+                if (@cmpxchgStrong(u8, &cache.busy, 0, 1, .acquire, .monotonic) == null) return true;
+                _ = @atomicRmw(u64, &cache.counters.contention, .Add, 1, .monotonic);
+                return false;
+            }
+
+            fn unlock(cache: *Cache) void {
+                @atomicStore(u8, &cache.busy, 0, .release);
+            }
+
+            fn key(cache: *const Cache, index: usize) []u8 {
+                return cache.keys[index * cache.key_capacity ..][0..cache.key_capacity];
+            }
+
+            fn sameKey(cache: *const Cache, index: usize, context: *const ReadContext, hash: u64, result: *const Result) bool {
+                const entry = &cache.entries[index];
+                return entry.valid and entry.csn == context.snapshot.csn and entry.hash == hash and
+                    entry.workspace_cells == context.workspace.query.cells.len and
+                    entry.workspace_refs == context.workspace.query.refs.len and entry.output_rows == result.rows.len and
+                    types.same(entry.database_name[0..entry.database_name_length], context.session.database) and
+                    types.same(cache.key(index)[0..entry.key_length], context.source);
+            }
+
+            fn get(cache: *Cache, context: *const ReadContext, hash: u64, result: *Result) Error!bool {
+                if (!cache.lock()) return false;
+                defer cache.unlock();
+                const first = cache.bucket(hash);
+                for (first..@min(first + ways, cache.entries.len)) |index| {
+                    if (!cache.sameKey(index, context, hash, result)) continue;
+                    const entry = &cache.entries[index];
+                    if (entry.result.row_count > result.rows.len) return false;
+                    // A hit still honors a pending cancel before exposing rows.
+                    if (context.session.control) |execution_control| {
+                        if (execution_control.poll) |poll| try poll(execution_control.context);
+                    }
+                    try result.copyFromChecked(&entry.result);
+                    _ = @atomicRmw(u64, &cache.counters.hits, .Add, 1, .monotonic);
+                    return true;
+                }
+                _ = @atomicRmw(u64, &cache.counters.misses, .Add, 1, .monotonic);
+                return false;
+            }
+
+            fn put(cache: *Cache, context: *const ReadContext, hash: u64, result: *const Result) Error!void {
+                if (result.command != .select or result.row_count > cache.rows_per_entry or !cache.lock()) return;
+                defer cache.unlock();
+                const first = cache.bucket(hash);
+                const end = @min(first + ways, cache.entries.len);
+                const csn = context.snapshot.csn;
+                var reusable: ?usize = null;
+                for (first..end) |index| {
+                    if (cache.sameKey(index, context, hash, result)) return;
+                    if (!cache.entries[index].valid or cache.entries[index].csn != csn) reusable = index;
+                }
+                const index = reusable orelse first + cache.victim % (end - first);
+                cache.victim +%= 1;
+                const entry = &cache.entries[index];
+                entry.valid = false;
+                try entry.result.copyFromChecked(result);
+                @memcpy(cache.key(index)[0..context.source.len], context.source);
+                @memcpy(entry.database_name[0..context.session.database.len], context.session.database);
+                entry.key_length = context.source.len;
+                entry.database_name_length = context.session.database.len;
+                entry.workspace_cells = context.workspace.query.cells.len;
+                entry.workspace_refs = context.workspace.query.refs.len;
+                entry.output_rows = result.rows.len;
+                entry.csn = csn;
+                entry.hash = hash;
+                entry.valid = true;
+                _ = @atomicRmw(u64, &cache.counters.publications, .Add, 1, .monotonic);
+            }
+        };
+
         /// RETURNING rows of a completed mutation, staged in the statement
         /// workspace (`rows` x `count` cells at `base`) until written.
         pub const Returned = struct {
@@ -669,6 +883,7 @@ pub fn Database(comptime config: Config) type {
             /// `source` plus expanded view texts (inside the workspace).
             effective:[]const u8=&.{},
             snapshot:Snapshot=.{.csn=0},
+            last_result_reused: bool = false,
 
             pub fn backingBytes(rows:usize) Error!usize {
                 return Context.backingBytesFor(rows,try Self.queryReferenceCount(rows));
@@ -710,6 +925,18 @@ pub fn Database(comptime config: Config) type {
             fn overlaps(a:StorageSpan,b:StorageSpan) bool {
                 return a.start<a.end and b.start<b.end and a.start<b.end and b.start<a.end;
             }
+            fn disjointDatabase(db: *const Self, part: StorageSpan) Error!void {
+                if (overlaps(part, try objectSpan(db))) return error.InvalidParameterValue;
+                if (comptime config.external_workspace) {
+                    if (overlaps(part, try span(db.workspace.query.cells[0..]))) return error.InvalidParameterValue;
+                }
+                if (comptime config.external_storage) {
+                    if (overlaps(part, try span(db.workspace.query.refs[0..]))) return error.InvalidParameterValue;
+                }
+                for (&db.tables) |*table| inline for (.{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" }) |name| {
+                    if (overlaps(part, try span(@field(table, name)[0..]))) return error.InvalidParameterValue;
+                };
+            }
             fn validate(self:*Context,db:*const Self,source:[]const u8,result:?*Result) Error!void {
                 const cells=self.workspace.query.cells[0..];const refs=self.workspace.query.refs[0..];
                 if(cells.len<2*config.columns or refs.len==0) return error.WorkspaceCapacity;
@@ -719,13 +946,11 @@ pub fn Database(comptime config: Config) type {
                     if(config.external_storage) try span(refs) else empty,
                     if(result) |out| try objectSpan(out) else empty,
                     if(config.external_results and result!=null) try span(result.?.rows) else empty};
-                const db_span=try objectSpan(db);const source_span=try span(source);
+                const source_span=try span(source);
                 for(mutable,0..) |part,index| {
-                    if(overlaps(part,db_span) or overlaps(part,source_span)) return error.InvalidParameterValue;
+                    if(overlaps(part,source_span)) return error.InvalidParameterValue;
                     for(mutable[0..index]) |earlier| if(overlaps(part,earlier)) return error.InvalidParameterValue;
-                    for(&db.tables) |*table| inline for(.{"rows","versions","row_index","key_index","scan_values","scan_nonnull","scan_live","scan_presence","index_slots"}) |name| {
-                        if(overlaps(part,try span(@field(table,name)[0..]))) return error.InvalidParameterValue;
-                    };
+                    try disjointDatabase(db, part);
                 }
             }
             /// Callbacks in session (clock/zone resolver/control) must themselves
@@ -741,6 +966,7 @@ pub fn Database(comptime config: Config) type {
                 try self.describeResult(result);
             }
             fn prepareMode(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
+                self.last_result_reused = false;
                 try self.validate(db,source,null);
                 self.prepared=null;
                 self.preparation_error=null;self.database=db;self.source=source;self.snapshot=snapshot;
@@ -771,11 +997,35 @@ pub fn Database(comptime config: Config) type {
                 self.database=db;self.source=source;self.effective=expanded;self.snapshot=snapshot;
             }
             pub fn run(self:*Context,result:*Result) Error!void {
+                return self.runWithCache(result, null);
+            }
+
+            /// Reuse a previously completed result when the caller already
+            /// holds the same database read ownership required by run().
+            pub fn runCached(self: *Context, result: *Result, cache: *ReadResultCache) Error!void {
+                return self.runWithCache(result, cache);
+            }
+
+            fn runWithCache(self: *Context, result: *Result, cache: ?*ReadResultCache) Error!void {
+                self.last_result_reused = false;
                 const db=self.database orelse return error.InvalidParameterValue;
                 try self.validate(db,self.source,result);
                 if(self.preparation_error) |err| return err;
                 const plan=self.prepared orelse return error.InvalidParameterValue;
                 if(config.external_results and result.rows.len==0) return error.InvalidParameterValue;
+                const cache_hash: ?u64 = if (cache) |candidate| cache_key: {
+                    if (candidate.database != db or self.source.len > candidate.key_capacity or
+                        self.session.database.len > 64 or !self.cacheable(db, plan)) break :cache_key null;
+                    try candidate.validateContext(self, result);
+                    const hash = ReadResultCache.hashSource(self.source);
+                    if (try candidate.get(self, hash, result)) {
+                        self.last_result_reused = true;
+                        self.workspace.query.read_stats = .{};
+                        self.workspace.query.stream_stats = .{};
+                        return;
+                    }
+                    break :cache_key hash;
+                } else null;
                 self.workspace.query.views=.{.ptr=self,.rows=readViewRows};
                 self.workspace.query.read_stats=.{};
                 switch(plan) {
@@ -784,6 +1034,88 @@ pub fn Database(comptime config: Config) type {
                     .general=>|root| try X.runQuery(&db.tables,self.effective,&self.workspace.nodes,&self.workspace.plans,root,self.snapshot,result,
                         &self.session,&self.workspace.query,self.snapshot.epoch==0),
                 }
+                if (cache_hash) |hash| try cache.?.put(self, hash, result);
+            }
+
+            fn cacheableType(ty: ast.Type) bool {
+                return switch (ty) {
+                    .unknown, .int2, .int4, .int8, .numeric, .boolean, .text,
+                    .name, .varchar, .bpchar, .date, .timestamp, .timestamptz => true,
+                    else => false,
+                };
+            }
+
+            fn cacheableAggregate(kind: ast.Agg) bool {
+                return switch (kind) {
+                    .count, .count_star, .sum, .avg, .min, .max => true,
+                    else => false,
+                };
+            }
+
+            fn cacheable(self: *const Context, db: *const Self, plan: Plan) bool {
+                const session = &self.session;
+                if (plan != .general or self.dialect != .postgres or self.snapshot.epoch != 0 or
+                    self.snapshot.csn != db.csn or self.effective.ptr != self.source.ptr or
+                    session.role != CO.bootstrap_role or session.session_role != CO.bootstrap_role or
+                    session.zone.kind != .utc or session.resolver.lookup != null or session.params != null or
+                    session.engine != null or session.routines != null or session.routine_frame != null or
+                    (session.control != null and session.control.?.max_work != 0)) return false;
+
+                // Positive allowlist: unknown functions, user routines,
+                // clocks, session/sequence state, sampling and catalog scans
+                // execute normally. Inspect nested blocks and window inputs.
+                const pool = &self.workspace.nodes;
+                for (pool.nodes[0..pool.len]) |*node| {
+                    if (!cacheableType(node.ty)) return false;
+                    switch (node.kind) {
+                        .null_literal, .bool_literal, .int_literal, .text_literal, .decimal_literal,
+                        .column, .unary, .binary, .and_op, .or_op, .not_op, .test_op,
+                        .between, .in_list, .like, .case_expr, .when_arm, .coalesce, .nullif => {},
+                        .cast => switch (node.ty) {
+                            .date, .timestamp, .timestamptz => {
+                                if (!node.date_bound) {
+                                    if (node.a == ast.none) return false;
+                                    switch (pool.nodes[node.a].ty) {
+                                        .date, .timestamp, .timestamptz => {},
+                                        else => return false,
+                                    }
+                                }
+                            },
+                            else => {},
+                        },
+                        .aggregate => if (!cacheableAggregate(node.agg)) return false,
+                        .function => switch (node.func) {
+                            .to_char, .round, .grouping, .window_call => {},
+                            else => return false,
+                        },
+                        else => return false,
+                    }
+                }
+
+                const plans = &self.workspace.plans;
+                for (plans.ctes[0..plans.cte_len]) |*cte| if (cte.recursive) return false;
+                var analytical = false;
+                for (plans.items[0..plans.len]) |*block| {
+                    analytical = analytical or block.grouped or block.window_count != 0;
+                    if (block.function != ast.none or block.dml != B.no_dml or block.correlated or
+                        block.set_op != .none or block.values != ast.none) return false;
+                    if ((block.limit != 0xffffffffffffffff or block.offset != 0 or
+                        block.limit_expr != ast.none or block.offset_expr != ast.none) and block.order_count == 0) return false;
+                    for (block.sources[0..block.source_count]) |*source| {
+                        if (source.view != null or source.sample_method != 0 or source.lateral) return false;
+                        if (source.table) |index| {
+                            const table = &db.tables[index];
+                            if (table.relkind != 'r' or table.namespace != catalog_module.public_namespace) return false;
+                        }
+                    }
+                    for (block.aggs[0..block.agg_count]) |aggregate| if (!cacheableAggregate(aggregate.kind)) return false;
+                    for (block.windows[0..block.window_count]) |*window| switch (window.kind) {
+                        .rank, .dense_rank => {},
+                        .aggregate => if (!cacheableAggregate(window.aggregate.kind)) return false,
+                        else => return false,
+                    };
+                }
+                return analytical;
             }
             /// Describe an already bound read without running expressions,
             /// acquiring row locks or touching the database's shared workspace.
@@ -1685,7 +2017,7 @@ pub fn Database(comptime config: Config) type {
             try self.session.checkpoint();
             if (explain != null and self.dialect != .postgres) return error.UnsupportedStatement;
             switch (parsed.*) {
-                .control => |command| return self.runControl(slot, original, command, result),
+                .control => |command| return self.runControl(slot, original, command, snap, result),
                 .session => |*command| return self.runSession(slot, original, command, snap, result, mode),
                 else => {},
             }
@@ -6731,8 +7063,29 @@ pub fn Database(comptime config: Config) type {
 
         // ---- statements --------------------------------------------------
 
-        fn runControl(self: *Self, slot: u16, source: []const u8, command: ast.Control, result: *Result) Error!void {
+        fn runControl(self: *Self, slot: u16, source: []const u8, command: ast.Control, snap: Snapshot, result: *Result) Error!void {
             switch (command) {
+                .vacuum => |spec| {
+                    if (self.dialect != .postgres) return error.UnsupportedStatement;
+                    if (!self.statement_implicit) return error.ActiveSqlTransaction;
+                    const context = self.bindContext(source, .standard, snap);
+                    const index = try B.resolveQualified(&context, spec.schema, spec.name);
+                    const table = &self.tables[index];
+                    if (table.relkind != 'r' and table.relkind != 'm') return error.WrongObjectType;
+                    const owner = self.catalog_objects.owner(table.oid, snap);
+                    const role = self.session.role;
+                    if (role != CO.bootstrap_role and !self.catalog_objects.memberOf(role, owner, true, snap)) return error.InsufficientPrivilege;
+                    try self.lockTable(slot, index, .share_update_exclusive);
+                    const horizon_csn = self.horizon();
+                    var first: usize = 0;
+                    while (first < table.version_high) {
+                        const count = @min(table.version_high - first, 256);
+                        try self.session.checkpoints(count);
+                        _ = S.vacuumRange(table, horizon_csn, first, first + count);
+                        first += count;
+                    }
+                    self.outcome = .{ .command = .vacuum, .noop = true };
+                },
                 // Already in a transaction block: PostgreSQL warns and ignores it.
                 // An implicit (autocommit) statement cannot open a block: it
                 // would commit at once while the caller believes it is open.
@@ -8436,6 +8789,7 @@ pub fn Database(comptime config: Config) type {
             };
             var out: Control = .none;
             switch (command) {
+                .vacuum => {}, // The statement path owns the relation lock and interruption state.
                 .begin => |modes| out = .{ .begin = modes },
                 .commit => out = .commit,
                 .rollback => out = .rollback,
