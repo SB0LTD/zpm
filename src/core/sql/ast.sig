@@ -254,6 +254,10 @@ pub const regclass_typmod: i32 = -2;
 pub const regtype_typmod: i32 = -3;
 /// Wire metadata for MySQL DATE_ADD returning its fixed date string.
 pub const mysql_date_text_typmod: i32 = -4;
+/// Result metadata for MySQL's scale-zero unsigned integer SUM.
+pub const mysql_unsigned_sum_typmod: i32 = -5;
+/// Contextual MySQL CAST(... AS SIGNED/UNSIGNED), distinct from assignment.
+pub const mysql_integer_cast_typmod: i32 = -6;
 
 /// Node.reg: an OID-valued expression known to be a regclass / regtype.
 pub const Reg = enum(u8) { none, regclass, regtype };

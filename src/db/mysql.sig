@@ -146,8 +146,8 @@ const Writer = struct {
         try self.decimalMagnitude(magnitude, value < 0);
     }
 
-    fn decimalMagnitude(self: *Writer, value: u64, negative: bool) Error!void {
-        var scratch: [21]u8 = undefined;
+    fn decimalMagnitude(self: *Writer, value: anytype, negative: bool) Error!void {
+        var scratch: [if (@TypeOf(value) == u64) 21 else 40]u8 = undefined;
         var position = scratch.len;
         var magnitude = value;
         while (true) {
@@ -320,13 +320,14 @@ pub fn Session(comptime DB: type) type {
                 try writer.string(self.result.column_names[column].slice());
                 try writer.string(""); // original name
                 try writer.byte(0x0c);
-                try writer.number(45, 2);
                 const kind = self.result.column_types[column];
+                try writer.number(if (kind == .numeric) 63 else 45, 2);
                 try writer.number(switch (kind) {
                     .integer, .mysql_bigint_unsigned => 20,
                     .integer32 => 11,
                     .boolean => 1,
                     .date => 10,
+                    .numeric => 43, // SUM(BIGINT UNSIGNED) DECIMAL(42,0) plus sign
                     else => 65535,
                 }, 4);
                 try writer.byte(switch (kind) {
@@ -334,6 +335,7 @@ pub fn Session(comptime DB: type) type {
                     .integer32 => 3,
                     .boolean => 1,
                     .date => 10,
+                    .numeric => 246, // MYSQL_TYPE_NEWDECIMAL
                     .bpchar => 254,
                     else => 253,
                 });
@@ -345,10 +347,16 @@ pub fn Session(comptime DB: type) type {
             try writer.eof(flags);
             for (self.result.rows[0..self.result.row_count]) |*row| {
                 start = try writer.packet();
-                for (row.cells[0..self.result.column_count]) |*cell| switch (cell.*) {
+                for (row.cells[0..self.result.column_count], 0..) |*cell, column| switch (cell.*) {
                     .null_value => try writer.byte(0xfb),
                     .integer => |value| try writer.decimal(value),
-                    .numeric => |*value| try writer.decimalMagnitude(@intCast(value.coef()), false),
+                    .numeric => |*value| {
+                        if (self.result.column_types[column] == .numeric) {
+                            try writer.decimalMagnitude(@as(u128, @intCast(value.coef())), value.negative);
+                        } else {
+                            try writer.decimalMagnitude(@as(u64, @intCast(value.coef())), false);
+                        }
+                    },
                     .boolean => |value| try writer.string(if (value) "1" else "0"),
                     .text => |*value| try writer.string(value.slice()),
                     // textify() rendered every other type as text.

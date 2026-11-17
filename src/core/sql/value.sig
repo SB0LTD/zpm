@@ -548,6 +548,22 @@ pub fn Io(comptime config: types.Config) type {
             return .{ .numeric = value };
         }
 
+        /// MySQL explicit integer casts preserve the 64-bit pattern.
+        /// Assignment still uses checkedUnsigned/checkedInteger.
+        pub fn mysqlIntegerCast(cell: V.Cell, target: Type) Error!V.Cell {
+            const bits: u64 = switch (cell) {
+                .null_value => return .null_value,
+                .integer => |signed| @bitCast(signed),
+                .numeric => |*unsigned| types.mysqlUnsignedValue(unsigned) orelse return error.TypeMismatch,
+                else => return error.TypeMismatch,
+            };
+            if (target == .int8) return .{ .integer = @bitCast(bits) };
+            if (target != .mysql_bigint_unsigned) return error.TypeMismatch;
+            var value: numeric.Numeric = .{};
+            value.setCoef(bits);
+            return .{ .numeric = value };
+        }
+
         pub fn parse(ty: Type, typmod: i32, input: []const u8, session: *const Session) Error!V.Cell {
             const cell: V.Cell = switch (ty) {
                 .int2, .int4, .int8 => .{ .integer = blk: {
