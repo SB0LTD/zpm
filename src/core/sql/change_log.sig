@@ -1464,7 +1464,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 vt.primary = table.primary_column;
                 vt.base_next_rowid = table.next_rowid;
                 vt.next_rowid = table.next_rowid;
-                vt.live_rows = S.liveRows(table);
+                // Replay updates committed summaries with every published row
+                // transition. Cross-check the count against occupied slots:
+                // legacy or pinned state can retain rows with no live version.
+                const summary = &table.summary;
+                vt.live_rows = if (summary.valid and summary.csn != 0 and summary.csn <= db.csn and
+                    summary.rows >= 0 and @as(u64, @intCast(summary.rows)) == table.row_used)
+                    table.row_used
+                else
+                    S.liveRows(table);
                 vt.relkind = table.relkind;
                 vt.index_count = table.index_count;
                 for (table.indexes[0..table.index_count], 0..) |*index, position| vt.index_oids[position] = index.oid;
