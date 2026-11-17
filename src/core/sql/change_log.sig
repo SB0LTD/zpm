@@ -1845,9 +1845,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         fn retire(db: anytype, table: *S.Table, version: u32, csn: u64) void {
             const entry = &table.versions[version];
-            entry.xmax = .{ .epoch = db.epoch };
-            entry.xmax_cid = db.cid;
-            entry.xmax_csn = csn;
+            entry.markDeletion(.{ .epoch = db.epoch }, db.cid);
+            entry.publishDeletion(csn);
             S.reclaimVersion(table, version);
         }
 
