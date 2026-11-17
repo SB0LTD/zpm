@@ -38,11 +38,19 @@ pub const HEADER_MAX: usize = 60; // With options
 /// Connections at once, for every app and the kernel together. 32 ran out
 /// in Galaxy with one Firefox window on a news site (81 connects refused in
 /// a minute, then every other page and the assistant's searches failed): a
-/// browser keeps several connections to each of a page's many hosts. Each
-/// slot is static (RECV_BUF_SIZE + SEND_BUF_SIZE, 544 KiB): 128 is 68 MiB.
+/// browser keeps several connections to each of a page's many hosts.
 /// Handles are u8 and callers keep 0xff as "no slot", so at most 254.
 pub const MAX_CONNECTIONS: usize = 128;
-pub const RECV_BUF_SIZE: usize = 512 * 1024; // the window: at 64 KiB a download ran at ~2-3 MB/s (window / round trip)
+/// A big receive window: at 64 KiB a download ran at ~2-3 MB/s (window /
+/// round trip). Every slot's own was 512 KiB, 128 of them 68 MiB with the
+/// send buffers: more than the Surface's kernel could hold. Now a slot
+/// starts with SMALL_RECV_SIZE of its own and borrows one of BIG_WINDOWS
+/// big ones once its data fills half of that (a download, or an app
+/// behind on reading), until the slot is freed; idle keep-alive
+/// connections never take one. 128 x 96 KiB + 32 x 512 KiB = 28 MiB.
+pub const RECV_BUF_SIZE: usize = 512 * 1024;
+pub const SMALL_RECV_SIZE: usize = 64 * 1024;
+pub const BIG_WINDOWS: usize = 32;
 pub const SEND_BUF_SIZE: usize = 32 * 1024;
 pub const DEFAULT_MSS: u16 = 1460; // Ethernet MTU - IP(20) - TCP(20)
 pub const MAX_WINDOW: u32 = 1073741824; // 1GB with scaling
@@ -281,11 +289,18 @@ pub const Connection = struct {
     retransmits: u32,
 
     send_buf: [SEND_BUF_SIZE]u8,
-    recv_buf: [RECV_BUF_SIZE]u8,
+    /// The receive ring while the slot has no big window.
+    recv_small: [SMALL_RECV_SIZE]u8,
+    /// The big window this slot borrowed (an index into big_windows), or
+    /// NO_BIG_WINDOW.
+    big: u8,
 
     /// Reset everything but the buffers (their contents are dead once the
-    /// counters are zero; clearing 96 KB per connection would be waste).
+    /// counters are zero; clearing 96 KB per connection would be waste),
+    /// and give back a borrowed big window.
     pub fn reset(self: *Connection) void {
+        if (self.big < BIG_WINDOWS) big_window_used[self.big] = false;
+        self.big = NO_BIG_WINDOW;
         self.state = .closed;
         self.active = false;
         self.user_closed = false;
@@ -381,7 +396,20 @@ pub const Connection = struct {
     }
 
     fn rcvFree(self: *const Connection) usize {
-        return RECV_BUF_SIZE - self.rcv_count;
+        return self.recvCap() - self.rcv_count;
+    }
+
+    /// The receive ring: the borrowed big window, or the slot's own.
+    fn recvRing(self: *Connection) []u8 {
+        return if (self.big < BIG_WINDOWS) &big_windows[self.big] else &self.recv_small;
+    }
+
+    fn recvView(self: *const Connection) []const u8 {
+        return if (self.big < BIG_WINDOWS) &big_windows[self.big] else &self.recv_small;
+    }
+
+    fn recvCap(self: *const Connection) usize {
+        return if (self.big < BIG_WINDOWS) RECV_BUF_SIZE else SMALL_RECV_SIZE;
     }
 
     fn dataEnd(self: *const Connection) u32 {
@@ -416,13 +444,19 @@ pub const Connection = struct {
 
 var connections: [MAX_CONNECTIONS]Connection = undefined;
 var pool_ready = false;
+const NO_BIG_WINDOW: u8 = 0xFF;
+var big_windows: [BIG_WINDOWS][RECV_BUF_SIZE]u8 = undefined;
+var big_window_used: [BIG_WINDOWS]bool = @splat(false);
 var clock_us: u64 = 0;
 var isn_key: u64 = 0x9E37_79B9_7F4A_7C15;
 var next_local_port: u16 = 49152;
 
 fn pool() *[MAX_CONNECTIONS]Connection {
     if (!pool_ready) {
-        for (&connections) |*c| c.reset();
+        for (&connections) |*c| {
+            c.big = NO_BIG_WINDOW;
+            c.reset();
+        }
         pool_ready = true;
     }
     return &connections;
@@ -567,14 +601,14 @@ pub fn recv(handle: u8, buf: []u8) usize {
     const c = conn(handle) orelse return 0;
     const n = @min(buf.len, c.rcv_count);
     if (n == 0) return 0;
-    ringRead(&c.recv_buf, c.rcv_head, buf[0..n]);
-    c.rcv_head = (c.rcv_head + n) % RECV_BUF_SIZE;
+    ringRead(c.recvView(), c.rcv_head, buf[0..n]);
+    c.rcv_head = (c.rcv_head + n) % c.recvCap();
     c.rcv_count -= n;
     // Window update when the right edge can move by a meaningful amount.
     if (c.synchronized() and !c.fin_received) {
         const edge = c.rcv_nxt +% advertisedWindow(c);
         const moved = edge -% c.rcv_adv;
-        if (seqGt(edge, c.rcv_adv) and moved >= @min(@as(u32, RECV_BUF_SIZE / 2), 2 * @as(u32, c.mss))) {
+        if (seqGt(edge, c.rcv_adv) and moved >= @min(@as(u32, @intCast(c.recvCap() / 2)), 2 * @as(u32, c.mss))) {
             c.ack_now = true;
         }
     }
@@ -586,7 +620,7 @@ pub fn peek(handle: u8, buf: []u8) usize {
     const c = conn(handle) orelse return 0;
     const n = @min(buf.len, c.rcv_count);
     if (n == 0) return 0;
-    ringRead(&c.recv_buf, c.rcv_head, buf[0..n]);
+    ringRead(c.recvView(), c.rcv_head, buf[0..n]);
     return n;
 }
 
@@ -1157,11 +1191,12 @@ fn receive(c: *Connection, seg: *const Segment, payload_in: []const u8) void {
         }
     }
 
+    if (c.rcv_count + payload.len > SMALL_RECV_SIZE / 2) growWindow(c);
     const free = c.rcvFree();
     if (seq == c.rcv_nxt) {
         const take = @min(payload.len, free);
         if (take > 0) {
-            ringWrite(&c.recv_buf, (c.rcv_head + c.rcv_count) % RECV_BUF_SIZE, payload[0..take]);
+            ringWrite(c.recvRing(), (c.rcv_head + c.rcv_count) % c.recvCap(), payload[0..take]);
             c.rcv_count += take;
             c.rcv_nxt +%= @intCast(take);
             c.total_recv += take;
@@ -1217,7 +1252,7 @@ fn receive(c: *Connection, seg: *const Segment, payload_in: []const u8) void {
             c.ooo_valid = false; // new range is nearer: replace
         }
     }
-    ringWrite(&c.recv_buf, (c.rcv_head + c.rcv_count + off) % RECV_BUF_SIZE, payload);
+    ringWrite(c.recvRing(), (c.rcv_head + c.rcv_count + off) % c.recvCap(), payload);
     if (!c.ooo_valid) {
         c.ooo_valid = true;
         c.ooo_start = seq;
@@ -1225,6 +1260,22 @@ fn receive(c: *Connection, seg: *const Segment, payload_in: []const u8) void {
     } else {
         if (seqLt(seq, c.ooo_start)) c.ooo_start = seq;
         if (seqGt(end, c.ooo_end)) c.ooo_end = end;
+    }
+}
+
+/// Borrow a free big window for `c`, if it has none and one is free: its
+/// ring moves over from the head (in-order and out-of-order bytes keep
+/// their offsets from it). The window only grows, so nothing advertised is
+/// taken back; the next ACK offers the rest.
+fn growWindow(c: *Connection) void {
+    if (c.big < BIG_WINDOWS) return;
+    for (&big_window_used, 0..) |*used, i| {
+        if (used.*) continue;
+        used.* = true;
+        ringRead(&c.recv_small, c.rcv_head, big_windows[i][0..SMALL_RECV_SIZE]);
+        c.rcv_head = 0;
+        c.big = @intCast(i);
+        return;
     }
 }
 
@@ -1628,6 +1679,7 @@ fn wireSend(pkt: []const u8) void {
 
 fn resetPool() void {
     for (pool()) |*c| c.reset();
+    big_window_used = @splat(false);
     clock_us = 1_000_000;
     wire = Wire{};
     t_have_server = false;
@@ -1807,6 +1859,52 @@ test "tcp: connection refused and unreachable peer time out" {
     try testing.expect(run(200_000, &pkt, R.closed));
     try testing.expectEqual(CloseReason.timeout, closeReason(t_client));
     abort(t_client);
+}
+
+test "tcp: big windows are borrowed by the slots that fill, and given back" {
+    resetPool();
+    var pkt: [1600]u8 = undefined;
+    try openPair(&pkt);
+    // An idle connection keeps its own small window.
+    try testing.expectEqual(SMALL_RECV_SIZE, pool()[t_server].recvCap());
+    // Data the reader is behind on: the server's slot borrows a big one,
+    // the bytes already queued keep their order.
+    var buf: [4096]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var sent: usize = 0;
+    var step: usize = 0;
+    while (step < 2_000 and sent < 3 * SMALL_RECV_SIZE) : (step += 1) {
+        sent += send(t_client, buf[sent % buf.len ..]);
+        tick(clock_us + 1000, &pkt, wireSend);
+        wire.deliver(clock_us);
+    }
+    try testing.expectEqual(RECV_BUF_SIZE, pool()[t_server].recvCap());
+    try testing.expect(pool()[t_server].rcv_count > SMALL_RECV_SIZE);
+    var got: [4096]u8 = undefined;
+    var at: usize = 0;
+    while (at < sent) {
+        const n = recv(t_server, &got);
+        if (n == 0) {
+            tick(clock_us + 1000, &pkt, wireSend);
+            wire.deliver(clock_us);
+            continue;
+        }
+        for (got[0..n], at..) |b, k| try testing.expectEqual(@as(u8, @truncate((k % buf.len) *% 7)), b);
+        at += n;
+    }
+    // Every big window taken: the next slot stays small; a freed slot's
+    // window is taken again.
+    const big = pool()[t_server].big;
+    for (&big_window_used) |*u| u.* = true;
+    const other = connect(CLIENT_IP, SERVER_IP, 443) orelse return error.Pool;
+    growWindow(&pool()[other]);
+    try testing.expectEqual(SMALL_RECV_SIZE, pool()[other].recvCap());
+    abort(t_server);
+    try testing.expect(!big_window_used[big]);
+    growWindow(&pool()[other]);
+    try testing.expectEqual(RECV_BUF_SIZE, pool()[other].recvCap());
+    abort(other);
+    resetPool();
 }
 
 test "tcp: zero window stalls then resumes" {
