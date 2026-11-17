@@ -1451,12 +1451,19 @@ pub fn Session(comptime DB: type) type {
         /// The engine's own command tag for the last statement, when it has one.
         fn completed(self: *const Self) []const u8 {
             if (!@hasField(DB.Result, "command")) return "";
+            const create_query_data = if (comptime @hasField(DB.Result, "create_query_data")) self.result.create_query_data else false;
             return switch (self.result.command) {
                 .select => "select",
                 .insert => "insert",
                 .update => "update",
                 .delete => "delete",
+                .merge => "merge",
                 .create_table => "create",
+                .create_table_as => if (create_query_data) "select_created" else "CREATE TABLE AS",
+                .create_materialized_view => if (create_query_data) "select_created" else "CREATE MATERIALIZED VIEW",
+                .refresh_materialized_view => "REFRESH MATERIALIZED VIEW",
+                .create_index => "CREATE INDEX",
+                .create_view => "CREATE VIEW",
                 .drop_table => "drop",
                 .create_sequence => "create_sequence",
                 .drop_sequence => "drop_sequence",
@@ -1471,6 +1478,7 @@ pub fn Session(comptime DB: type) type {
                 .savepoint => "savepoint",
                 .release => "release",
                 .set => "set",
+                .set_constraints => "SET CONSTRAINTS",
                 .show => "show",
                 .reset => "reset",
                 .lock_table => "lock_table",
@@ -1539,6 +1547,9 @@ pub fn Session(comptime DB: type) type {
                 try w.append("CREATE SCHEMA");
             } else if (equal(completed_command, "drop_schema")) {
                 try w.append("DROP SCHEMA");
+            } else if (equal(completed_command, "select_created")) {
+                try w.append("SELECT ");
+                try w.number(@intCast(affected));
             } else if (isCommand(completed_command, source, "select")) {
                 try w.append("SELECT ");
                 try w.number(@intCast(row_count));
@@ -1550,6 +1561,9 @@ pub fn Session(comptime DB: type) type {
                 try w.number(@intCast(affected));
             } else if (isCommand(completed_command, source, "delete")) {
                 try w.append("DELETE ");
+                try w.number(@intCast(affected));
+            } else if (equal(completed_command, "merge")) {
+                try w.append("MERGE ");
                 try w.number(@intCast(affected));
             } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (equal(completed_command, "savepoint")) try w.append("SAVEPOINT") else if (equal(completed_command, "release")) try w.append("RELEASE") else if (equal(completed_command, "show")) try w.append("SHOW") else if (equal(completed_command, "reset")) try w.append("RESET") else if (equal(completed_command, "set")) try w.append("SET") else if (equal(completed_command, "begin")) try w.append("BEGIN") else if (equal(completed_command, "commit")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (equal(completed_command, "rollback")) try w.append("ROLLBACK") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
             try w.byte(0);

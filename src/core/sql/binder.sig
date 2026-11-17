@@ -7173,7 +7173,7 @@ pub fn Binder(comptime config: types.Config) type {
                     // pg_catalog / information_schema are not writable here.
                     if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
                     if (context.catalog.findIn(namespace, table_name.slice(), context.snapshot) != null) {
-                        if (create.if_not_exists) return .{ .noop = .create_table };
+                        if (create.if_not_exists) return .{ .noop = if (create.as_query != none) .create_table_as else .create_table };
                         return error.TableExists;
                     }
                     if (create.invalid_definition) return error.Syntax;

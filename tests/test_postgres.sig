@@ -1123,6 +1123,92 @@ fn commandTag(bytes: []const u8, wanted: []const u8) !void {
     return error.MissingCommandTag;
 }
 
+fn completedStoreCommand(s: *StoreSession, db: *Store.Connection, source: []const u8, expected: []const u8, extended_query: bool) !void {
+    if (!extended_query) {
+        const bytes = try storeQuery(s, db, source);
+        try tags(bytes, "CZ");
+        try commandTag(bytes, expected);
+        return;
+    }
+    var parse_packet = Packet.init('P');
+    parse_packet.string("");
+    parse_packet.string(source);
+    parse_packet.number16(0);
+    const parsed = try storeSend(s, db, &parse_packet);
+    try tags(store_output[0..parsed.written], "1");
+
+    var bind_packet = Packet.init('B');
+    bind_packet.string("");
+    bind_packet.string("");
+    bind_packet.number16(0);
+    bind_packet.number16(0);
+    bind_packet.number16(0);
+    const bound = try storeSend(s, db, &bind_packet);
+    try tags(store_output[0..bound.written], "2");
+
+    var execute_packet = Packet.init('E');
+    execute_packet.string("");
+    execute_packet.number32(0);
+    const executed = try storeSend(s, db, &execute_packet);
+    const bytes = store_output[0..executed.written];
+    try tags(bytes, "C");
+    try commandTag(bytes, expected);
+
+    var sync_packet = Packet.init('S');
+    const synchronized = try storeSend(s, db, &sync_packet);
+    try tags(store_output[0..synchronized.written], "Z");
+}
+
+/// PostgreSQL 18.3 reports affected rows for MERGE and the source rows of
+/// populated CREATE AS statements. Their result sets remain empty.
+fn nativeCommandCompletions(extended_query: bool) !void {
+    var store: Store = .{};
+    var db: Store.Connection = .{ .store = &store, .id = 1 };
+    defer db.disconnect();
+    var session: StoreSession = .{};
+    _ = try storeStartup(&session, &db, "");
+    const fixture = [_]struct { source: []const u8, completion: []const u8 }{
+        .{ .source = "CREATE TABLE completion_src (id INT PRIMARY KEY, value INT)", .completion = "CREATE TABLE" },
+        .{ .source = "INSERT INTO completion_src VALUES (1,11),(2,22),(3,33)", .completion = "INSERT 0 3" },
+        .{ .source = "BEGIN", .completion = "BEGIN" },
+        .{ .source = "SET CONSTRAINTS ALL IMMEDIATE", .completion = "SET CONSTRAINTS" },
+        .{ .source = "COMMIT", .completion = "COMMIT" },
+        .{ .source = "CREATE INDEX completion_ix ON completion_src (value)", .completion = "CREATE INDEX" },
+        .{ .source = "CREATE INDEX IF NOT EXISTS completion_ix ON completion_src (value)", .completion = "CREATE INDEX" },
+        .{ .source = "CREATE INDEX completion_adv ON completion_src ((value+1)) INCLUDE (id) WHERE value IS NOT NULL", .completion = "CREATE INDEX" },
+        .{ .source = "CREATE VIEW completion_view AS SELECT id FROM completion_src", .completion = "CREATE VIEW" },
+    };
+    for (fixture) |command| try completedStoreCommand(&session, &db, command.source, command.completion, extended_query);
+    try tags(try storeQuery(&session, &db, "DROP VIEW completion_view"), "CZ");
+
+    try completedStoreCommand(&session, &db, "CREATE TEMP TABLE completion_copy AS SELECT id FROM completion_src", "SELECT 3", extended_query);
+    try completedStoreCommand(&session, &db, "DROP TABLE completion_copy", "DROP TABLE", extended_query);
+    try completedStoreCommand(&session, &db, "CREATE TABLE completion_copy AS SELECT id FROM completion_src WHERE FALSE", "SELECT 0", extended_query);
+    try completedStoreCommand(&session, &db, "CREATE TABLE IF NOT EXISTS completion_copy AS SELECT id FROM completion_src", "CREATE TABLE AS", extended_query);
+    try completedStoreCommand(&session, &db, "DROP TABLE completion_copy", "DROP TABLE", extended_query);
+    try completedStoreCommand(&session, &db, "CREATE TABLE completion_copy AS SELECT id FROM completion_src WITH NO DATA", "CREATE TABLE AS", extended_query);
+    try completedStoreCommand(&session, &db, "DROP TABLE completion_copy", "DROP TABLE", extended_query);
+
+    try completedStoreCommand(&session, &db, "CREATE MATERIALIZED VIEW completion_mv AS SELECT id FROM completion_src", "SELECT 3", extended_query);
+    try completedStoreCommand(&session, &db, "REFRESH MATERIALIZED VIEW completion_mv", "REFRESH MATERIALIZED VIEW", extended_query);
+    try tags(try storeQuery(&session, &db, "DROP MATERIALIZED VIEW completion_mv"), "CZ");
+    try completedStoreCommand(&session, &db, "CREATE MATERIALIZED VIEW completion_mv AS SELECT id FROM completion_src WHERE FALSE", "SELECT 0", extended_query);
+    try tags(try storeQuery(&session, &db, "DROP MATERIALIZED VIEW completion_mv"), "CZ");
+    try completedStoreCommand(&session, &db, "CREATE MATERIALIZED VIEW completion_mv AS SELECT id FROM completion_src WITH NO DATA", "CREATE MATERIALIZED VIEW", extended_query);
+    try tags(try storeQuery(&session, &db, "DROP MATERIALIZED VIEW completion_mv"), "CZ");
+
+    try completedStoreCommand(&session, &db, "CREATE TABLE completion_dst (id INT PRIMARY KEY, value INT)", "CREATE TABLE", extended_query);
+    try completedStoreCommand(&session, &db, "INSERT INTO completion_dst VALUES (1,0),(2,0)", "INSERT 0 2", extended_query);
+    const merge_source = "MERGE INTO completion_dst d USING completion_src s ON d.id=s.id ";
+    try completedStoreCommand(&session, &db, merge_source ++
+        "WHEN MATCHED AND s.id=2 THEN DELETE WHEN MATCHED THEN UPDATE SET value=s.value " ++
+        "WHEN NOT MATCHED THEN INSERT (id,value) VALUES (s.id,s.value)", "MERGE 3", extended_query);
+    try completedStoreCommand(&session, &db, merge_source ++
+        "WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED THEN DO NOTHING", "MERGE 0", extended_query);
+    try tags(try storeQuery(&session, &db, "SELECT id,value FROM completion_dst ORDER BY id"), "TDDCZ");
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[1].integer == 11 and session.result.rows[1].cells[1].integer == 33);
+}
+
 /// SCRAM proof and committed catalog policy both precede readiness. The
 /// authenticated role stays connection-local across other sessions' statements.
 fn roleAuthenticationContracts() !void {
@@ -1402,6 +1488,8 @@ pub fn main(init: std.process.Init) !void {
     try detachedCandidates();
     try oversizedFrames();
     try roleAuthenticationContracts();
+    try nativeCommandCompletions(false);
+    try nativeCommandCompletions(true);
     try storeContracts();
     try returningOnce();
     try characterDescriptions();
