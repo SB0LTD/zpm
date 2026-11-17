@@ -698,10 +698,11 @@ pub fn Ast(comptime config: types.Config) type {
             alias: ?Ident = null,
         };
 
-        /// RETURNING target list (count 0: none).
+        /// RETURNING or T-SQL OUTPUT target list (count 0: none).
         pub const Returning = struct {
             targets: [config.columns]Target = undefined,
             count: usize = 0,
+            output: bool = false,
         };
 
         pub const InsertSource = enum { values, query, default_values };

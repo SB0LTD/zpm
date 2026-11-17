@@ -95,6 +95,9 @@ pub fn Binder(comptime config: types.Config) type {
             types: [config.columns]types.DataType = undefined,
             typmods: [config.columns]i32 = undefined,
             count: usize = 0,
+            output: bool = false,
+            deleted_columns: std.StaticBitSet(config.columns) = .empty,
+            non_null_columns: std.StaticBitSet(config.columns) = .empty,
         };
 
         /// VALUES: `rows` is the first values_row node; item p of every row
@@ -4501,13 +4504,33 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// RETURNING over the target table's row (`*`, `t.*`, expressions);
         /// `alias` (INSERT ... AS alias) replaces the table name.
-        fn bindReturning(context: *const Context, index: usize, list: *const Ast.Returning, table_alias: ?ast.Ident) Error!Returning {
-            var out: Returning = .{};
+        fn bindReturning(context: *const Context, index: usize, list: *const Ast.Returning, table_alias: ?ast.Ident, mutation: types.CommandTag) Error!Returning {
+            var out: Returning = .{ .output = list.output };
             if (list.count == 0) return out;
             var scope = tableScope(context, index);
             if (table_alias) |name| scope.rels[0].name = toName(context, name);
             const entry = &context.tables[index];
+            if (list.output and (context.dialect != .tds or context.nested_dml or entry.relkind != 'r')) return error.UnsupportedStatement;
             for (list.targets[0..list.count]) |*target| {
+                var deleted = false;
+                if (list.output) {
+                    // Direct pseudo-table columns only, including the
+                    // qualified star. Unqualified columns can never select
+                    // from either image by accident.
+                    if (target.expr == none) return error.ColumnNotFound;
+                    const node = context.node(target.expr);
+                    if (node.kind != .column) return error.UnsupportedStatement;
+                    const qualifier = toName(context, node.qualifier);
+                    if (types.keyword(qualifier.slice(), "deleted")) {
+                        if (mutation == .insert) return error.ColumnNotFound;
+                        deleted = true;
+                    } else if (!types.keyword(qualifier.slice(), "inserted") or mutation == .delete) {
+                        return error.ColumnNotFound;
+                    }
+                    // Both images share the schema. Bind one relation at a
+                    // time and keep the image selector with the result column.
+                    scope.rels[0].name = qualifier;
+                }
                 if (target.star) {
                     if (target.expr != none) {
                         const qualifier = toName(context, context.node(target.expr).qualifier);
@@ -4519,6 +4542,9 @@ pub fn Binder(comptime config: types.Config) type {
                         out.names[out.count] = column.name;
                         out.types[out.count] = column.data_type;
                         out.typmods[out.count] = column.typmod;
+                        if (deleted) out.deleted_columns.set(out.count);
+                        if (list.output and fixedInt4(context, index, out.targets[out.count]))
+                            out.non_null_columns.set(out.count);
                         out.count += 1;
                     }
                     continue;
@@ -4529,6 +4555,9 @@ pub fn Binder(comptime config: types.Config) type {
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
                 out.typmods[out.count] = outputTypmod(context, target.expr);
+                if (deleted) out.deleted_columns.set(out.count);
+                if (list.output and fixedInt4(context, index, target.expr))
+                    out.non_null_columns.set(out.count);
                 out.count += 1;
             }
             return out;
@@ -7533,7 +7562,8 @@ pub fn Binder(comptime config: types.Config) type {
                         if (entry.relkind == 'p') return error.UnsupportedStatement;
                         try bindConflict(context, index, entry, insert.alias, conflict, &out.conflict);
                     }
-                    out.returning = try bindReturning(context, index, &insert.returning, insert.alias);
+                    if (insert.returning.output and insert.conflict != null) return error.UnsupportedStatement;
+                    out.returning = try bindReturning(context, index, &insert.returning, insert.alias, .insert);
                     return .{ .insert = out };
                 },
                 .select => |index| {
@@ -7583,7 +7613,8 @@ pub fn Binder(comptime config: types.Config) type {
                     const needed = assignedDefaults(context, &out.values);
                     try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
                     try bindChecks(context, index, entry, &out.checks);
-                    out.returning = try bindReturning(context, index, &update.returning, update.alias);
+                    if (update.returning.output and out.from != none) return error.UnsupportedStatement;
+                    out.returning = try bindReturning(context, index, &update.returning, update.alias, .update);
                     return .{ .update = out };
                 },
                 .delete => |*delete| {
@@ -7594,7 +7625,8 @@ pub fn Binder(comptime config: types.Config) type {
                     var out: Delete = .{ .table = index, .where = none, .key = none };
                     if (delete.using != none) try bindSources(context, delete.using, &scope, &out.using, &out.offsets);
                     out.where = try bindWhere(context, &scope, delete.where);
-                    out.returning = try bindReturning(context, index, &delete.returning, delete.alias);
+                    if (delete.returning.output and out.using != none) return error.UnsupportedStatement;
+                    out.returning = try bindReturning(context, index, &delete.returning, delete.alias, .delete);
                     if (out.using == none) out.key = primaryKey(context, &context.tables[index], out.where);
                     return .{ .delete = out };
                 },
