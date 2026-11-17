@@ -1541,6 +1541,7 @@ pub fn Session(comptime DB: type) type {
                 .drop_sequence => "drop_sequence",
                 .truncate => "truncate",
                 .vacuum => "VACUUM",
+                .analyze => "ANALYZE",
                 .alter_table => "alter_table",
                 .alter_sequence => "alter_sequence",
                 .create_schema => "create_schema",

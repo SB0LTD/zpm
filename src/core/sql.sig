@@ -7065,17 +7065,23 @@ pub fn Database(comptime config: Config) type {
 
         fn runControl(self: *Self, slot: u16, source: []const u8, command: ast.Control, snap: Snapshot, result: *Result) Error!void {
             switch (command) {
-                .vacuum => |spec| {
+                .maintenance => |spec| {
                     if (self.dialect != .postgres) return error.UnsupportedStatement;
-                    if (!self.statement_implicit) return error.ActiveSqlTransaction;
+                    if (spec.operation == .vacuum and !self.statement_implicit) return error.ActiveSqlTransaction;
                     const context = self.bindContext(source, .standard, snap);
                     const index = try B.resolveQualified(&context, spec.schema, spec.name);
                     const table = &self.tables[index];
                     if (table.relkind != 'r' and table.relkind != 'm') return error.WrongObjectType;
+                    if (self.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
                     const owner = self.catalog_objects.owner(table.oid, snap);
                     const role = self.session.role;
                     if (role != CO.bootstrap_role and !self.catalog_objects.memberOf(role, owner, true, snap)) return error.InsufficientPrivilege;
                     try self.lockTable(slot, index, .share_update_exclusive);
+                    if (spec.operation == .analyze) {
+                        try self.analyzeTable(table);
+                        self.outcome = .{ .command = .analyze, .noop = true };
+                        return;
+                    }
                     const horizon_csn = self.horizon();
                     var first: usize = 0;
                     while (first < table.version_high) {
@@ -7125,6 +7131,25 @@ pub fn Database(comptime config: Config) type {
                     self.outcome = .{ .command = .reset };
                 },
             }
+        }
+
+        fn analyzeTable(self: *Self, table: *S.Table) Error!void {
+            // Build the committed statistics off to the side. Existing rollups
+            // and historical integer bounds have their own maintenance rules.
+            if (!table.summary.valid) return error.UnsupportedStatement;
+            const committed: Snapshot = .{ .csn = self.csn };
+            var summary: S.Summary = .{ .valid = true, .csn = committed.csn };
+            var first: usize = 0;
+            while (first < table.row_high) {
+                const count = @min(table.row_high - first, 256);
+                try self.session.checkpoints(count);
+                for (first..first + count) |row| {
+                    const version = S.visibleAt(table, row, committed) orelse continue;
+                    S.observeSummary(&summary, table.versions[version].cells[0..table.column_count], table.primary_column, true, committed.csn);
+                }
+                first += count;
+            }
+            table.summary = summary;
         }
 
         fn runSession(self: *Self, slot: u16, source: []const u8, command: *const A.SessionCommand, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
@@ -8789,7 +8814,7 @@ pub fn Database(comptime config: Config) type {
             };
             var out: Control = .none;
             switch (command) {
-                .vacuum => {}, // The statement path owns the relation lock and interruption state.
+                .maintenance => {}, // The statement path owns the relation lock and interruption state.
                 .begin => |modes| out = .{ .begin = modes },
                 .commit => out = .commit,
                 .rollback => out = .rollback,

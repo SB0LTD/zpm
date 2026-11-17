@@ -672,7 +672,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .create_schema => .create_schema,
                 .drop_schema => .drop_schema,
                 .control => |control| switch (control) {
-                    .vacuum => .vacuum,
+                    .maintenance => |spec| if (spec.operation == .vacuum) .vacuum else .analyze,
                     .begin, .set_transaction => .begin,
                     .commit => .commit,
                     .rollback, .rollback_to => .rollback,

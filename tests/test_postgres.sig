@@ -1486,6 +1486,26 @@ fn vacuumContracts() !void {
     try commandTag(try storeQuery(&session, &connection, "ROLLBACK"), "ROLLBACK");
     try state(try storeQuery(&session, &connection, "VACUUM upkeep.missing"), "42P01");
     try state(try storeQuery(&session, &connection, "VACUUM (FULL) upkeep.fact"), "0A000");
+
+    try commandTag(try storeQuery(&session, &connection, "INSERT INTO upkeep.fact VALUES(2,100),(3,NULL)"), "INSERT 0 2");
+    try commandTag(try storeQuery(&session, &connection, "DELETE FROM upkeep.fact WHERE id=3"), "DELETE 1");
+    try check(store.database.tables[0].summary.primary_bounds.high == 3);
+    {
+        var budget: sql.ExecutionControl = .{ .max_work = 1 };
+        store.database.session.control = &budget;
+        defer store.database.session.control = null;
+        if (store.database.execute("ANALYZE upkeep.fact", &held)) |_| return error.UnboundedAnalysis else |err| try check(err == error.QueryWorkLimit);
+        try check(store.database.tables[0].summary.primary_bounds.high == 3);
+    }
+    try commandTag(try storeQuery(&session, &connection, "ANALYZE upkeep.fact"), "ANALYZE");
+    const summary = &store.database.tables[0].summary;
+    try check(summary.rows == 2 and summary.columns[1].nonnull == 2 and summary.columns[1].total == 120);
+    try check(summary.primary_bounds.low == 1 and summary.primary_bounds.high == 2);
+    try commandTag(try storeQuery(&session, &connection, "BEGIN READ ONLY"), "BEGIN");
+    try commandTag(try storeQuery(&session, &connection, "ANALYSE upkeep.fact"), "ANALYZE");
+    try commandTag(try storeQuery(&session, &connection, "ROLLBACK"), "ROLLBACK");
+    try store.database.executeChanges("ANALYZE upkeep.fact", &held, &record, &used, null, null);
+    try check(used == 0 and held.command == .analyze);
 }
 
 fn oversizedFrames() !void {

@@ -1090,23 +1090,27 @@ pub fn Storage(comptime config: types.Config) type {
 
         fn changeSummary(table: *Table, cells: *const [config.columns]V.Cell, add: bool, csn: u64) void {
             if (!table.summary.valid) return;
+            observeSummary(&table.summary, cells[0..table.column_count], table.primary_column, add, csn);
+            summarizeGroups(table, cells, add);
+        }
+
+        pub fn observeSummary(summary: *Summary, cells: []const V.Cell, primary_column: ?usize, add: bool, csn: u64) void {
             const sign: i64 = if (add) 1 else -1;
-            table.summary.rows += sign;
-            table.summary.csn = csn;
-            if (add) if (table.primary_column) |primary| {
+            summary.rows += sign;
+            summary.csn = csn;
+            if (add) if (primary_column) |primary| {
                 const value = &cells[primary];
                 if (value.* == .integer) {
-                    const bounds = &table.summary.primary_bounds;
+                    const bounds = &summary.primary_bounds;
                     if (!bounds.known) bounds.* = .{ .known = true, .low = value.integer, .high = value.integer }
                     else { bounds.low = @min(bounds.low, value.integer); bounds.high = @max(bounds.high, value.integer); }
                 }
             };
-            for (cells[0..table.column_count], table.summary.columns[0..table.column_count]) |*cell, *column| {
+            for (cells, summary.columns[0..cells.len]) |*cell, *column| {
                 if (cell.* == .null_value) continue;
                 column.nonnull += sign;
                 if (cell.* == .integer) column.total += @as(i128, cell.integer) * sign;
             }
-            summarizeGroups(table, cells, add);
         }
 
         pub fn initSummary(table: *Table, csn: u64) void {
