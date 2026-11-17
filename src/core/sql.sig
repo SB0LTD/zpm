@@ -2426,6 +2426,19 @@ pub fn Database(comptime config: Config) type {
             return identName(source, objectIdent(ident));
         }
 
+        /// Resolve an authenticated username against the committed role catalog.
+        /// Roles with a finite connection limit require admission accounting
+        /// that this API does not provide, so they cannot log in here.
+        pub fn authenticatedRole(self: *const Self, username: []const u8) ?u32 {
+            const snapshot: Snapshot = .{ .csn = self.csn };
+            const role = self.catalog_objects.roleByName(username, snapshot) orelse return null;
+            if (role == CO.bootstrap_role) return role;
+            const index = self.catalog_objects.byOid(.role, role, snapshot) orelse return null;
+            const entry = &self.catalog_objects.items[index];
+            if (entry.flags & CO.role_login == 0 or @as(i32, @bitCast(entry.grant_flags)) >= 0) return null;
+            return role;
+        }
+
         /// The current role holds every privilege (bootstrap or superuser).
         fn privilegedRole(self: *const Self, snap: Snapshot) bool {
             return self.session.role == CO.bootstrap_role or self.catalog_objects.superuser(self.session.role, snap);

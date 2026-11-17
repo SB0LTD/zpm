@@ -497,6 +497,16 @@ pub fn Store(comptime Raw: type) type {
                 return if (self.in_transaction) self.tx else null;
             }
 
+            /// Install the identity verified by the wire authenticator before
+            /// exposing the session. The caller holds the normal store lock.
+            pub fn bindAuthenticatedRole(self: *Connection, username: []const u8) !void {
+                if (comptime !has_engine_session or !@hasDecl(Raw, "authenticatedRole")) return error.AuthenticationFailed;
+                if (self.id == 0 or self.in_transaction or self.tx != null or self.pending.active or
+                    self.engine_session.values.role != 0)
+                    return error.AuthenticationFailed;
+                self.engine_session.session_role = self.store.database.authenticatedRole(username) orelse return error.AuthenticationFailed;
+            }
+
             /// Backend pid reported with this session's NOTIFY (codec-set).
             pub fn setBackendPid(self: *Connection, pid: u32) void {
                 if (comptime has_engine_session) self.engine_session.pid = pid;
