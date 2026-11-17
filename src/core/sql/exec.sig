@@ -91,6 +91,8 @@ pub fn Exec(comptime config: types.Config) type {
             dimension_date_group_plans: usize = 0,
             dimension_date_keys: usize = 0,
             rollup_folded_leaves: usize = 0,
+            joined_projection_plans: usize = 0,
+            joined_topk_plans: usize = 0,
             probes: usize = 0,
             window_frame_rows:usize=0,
             window_prefix_rows:usize=0,
@@ -494,45 +496,53 @@ pub fn Exec(comptime config: types.Config) type {
             /// Outer joins and volatile/computed/subquery predicates retain the
             /// original path. An OR moves only when all its inputs are present.
             fn earlyAvailable(self: *const Query, id: u16, stage: usize) bool {
+                return self.availableAtStage(id, stage, false);
+            }
+
+            fn availableAtStage(self: *const Query, id: u16, stage: usize, comptime require_infallible: bool) bool {
                 if (id == none) return true;
                 const n = self.pool.nodes[id];
                 return switch (n.kind) {
                     .row_compare => blk: {
-                        if (n.a != none) break :blk self.earlyAvailable(n.a, stage);
+                        if (n.a != none) break :blk self.availableAtStage(n.a, stage, require_infallible);
                         var item = n.b;
                         while (item != none) : (item = self.pool.nodes[item].next) {
                             const pair = self.pool.nodes[item];
-                            if (!self.earlyAvailable(pair.a, stage) or !self.earlyAvailable(pair.b, stage)) break :blk false;
+                            if (!self.availableAtStage(pair.a, stage, require_infallible) or !self.availableAtStage(pair.b, stage, require_infallible)) break :blk false;
                         }
                         break :blk true;
                     },
                     .row_constructor, .row_in => blk: {
+                        if (require_infallible and n.kind == .row_constructor) break :blk false;
                         var item = n.b;
-                        while (item != none) : (item = self.pool.nodes[item].next) if (!self.earlyAvailable(item, stage)) break :blk false;
+                        while (item != none) : (item = self.pool.nodes[item].next) if (!self.availableAtStage(item, stage, require_infallible)) break :blk false;
                         break :blk true;
                     },
                     .column => n.level == 0 and n.relation <= stage,
-                    .null_literal, .bool_literal, .int_literal, .text_literal, .decimal_literal => true,
+                    .param => require_infallible and self.session.params != null and n.integer >= 1 and n.integer <= config.statement_parameters,
+                    .null_literal, .bool_literal, .int_literal => true,
+                    .text_literal => !require_infallible or n.ty == .unknown or n.ty == .text or (n.ty == .date and n.date_bound),
+                    .decimal_literal => !require_infallible,
                     .binary => switch (n.op) {
-                        .eq, .ne, .lt, .le, .gt, .ge => self.earlyAvailable(n.a, stage) and self.earlyAvailable(n.b, stage),
+                        .eq, .ne, .lt, .le, .gt, .ge => self.availableAtStage(n.a, stage, require_infallible) and self.availableAtStage(n.b, stage, require_infallible),
                         else => false,
                     },
-                    .and_op, .or_op => self.earlyAvailable(n.a, stage) and self.earlyAvailable(n.b, stage),
-                    .not_op, .test_op => self.earlyAvailable(n.a, stage),
+                    .and_op, .or_op => self.availableAtStage(n.a, stage, require_infallible) and self.availableAtStage(n.b, stage, require_infallible),
+                    .not_op, .test_op => self.availableAtStage(n.a, stage, require_infallible),
                     else => false,
                 };
             }
 
-            fn earlyKeep(self: *const Query, ctx: *E.Context, id: u16, stage: usize) Error!bool {
+            fn earlyKeep(self: *const Query, ctx: *E.Context, id: u16, stage: usize, comptime require_infallible: bool) Error!bool {
                 if (id == none) return true;
                 const n = self.pool.nodes[id];
-                if (n.kind == .and_op) return try self.earlyKeep(ctx, n.a, stage) and try self.earlyKeep(ctx, n.b, stage);
-                return !self.earlyAvailable(id, stage) or (try E.truth(ctx, id)) == true;
+                if (n.kind == .and_op) return try self.earlyKeep(ctx, n.a, stage, require_infallible) and try self.earlyKeep(ctx, n.b, stage, require_infallible);
+                return !self.availableAtStage(id, stage, require_infallible) or (try E.truth(ctx, id)) == true;
             }
 
             fn joinKeep(self: *const Query, ctx: *E.Context, id: u16, stage: usize, last: bool, early: bool) Error!bool {
                 if (last) return keep(ctx, id, null);
-                return !early or try self.earlyKeep(ctx, id, stage);
+                return !early or try self.earlyKeep(ctx, id, stage, false);
             }
 
             /// Left-deep joins prune eligible WHERE conjuncts at their first
@@ -739,11 +749,15 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn projectRow(self: *Query, p: *const B.Plan, ctx: *E.Context, out: *List) Error!void {
                 const at = try self.cells(p.width);
+                try self.writeProjection(p, ctx, at);
+                try self.push(out, at);
+            }
+
+            fn writeProjection(self: *Query, p: *const B.Plan, ctx: *E.Context, at: u32) Error!void {
                 for (p.targets[0..p.width], 0..) |id, column| {
                     const value:V.Cell = if(p.required[column]) try E.eval(ctx,id) else .null_value;
                     self.work.cells[at + column] = value;
                 }
-                try self.push(out, at);
             }
 
             fn project(self: *Query, p: *const B.Plan, tuples: Tuples, outer: ?*const E.Context) Error!List {
@@ -1737,7 +1751,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// Scan one fact row and resolve unique-key inner dimensions using
             /// borrowed version cells. Scratch depends on group cardinality,
             /// not on fact cardinality or left-deep intermediate tuple counts.
-            fn nextStreamTuple(self:*Query,p:*const B.Plan,ctx:*E.Context,cursor:*StreamCursor,early:bool) Error!bool {
+            fn nextStreamTuple(self:*Query,p:*const B.Plan,ctx:*E.Context,cursor:*StreamCursor,early:bool,comptime require_infallible:bool) Error!bool {
                 const table=&self.tables[p.sources[0].table.?];
                 scan: while(cursor.next<cursor.high or cursor.prefix_mask!=0) {
                     var current:usize=undefined;
@@ -1784,7 +1798,7 @@ pub fn Exec(comptime config: types.Config) type {
                     const fact_cells=self.streamFactRow(table,cursor,current) orelse continue;
                     if(cursor.prefix==null) self.work.stream_stats.rows+=1;
                     ctx.row=null;ctx.tuple[0]=fact_cells;
-                    if(p.source_count>1 and early and !try self.earlyKeep(ctx,p.where,0)) continue;
+                    if(p.source_count>1 and early and !try self.earlyKeep(ctx,p.where,0,require_infallible)) continue;
                     for(p.sources[1..p.source_count],1..) |*source,stage| {
                         try self.session.checkpoint();
                         var key_value:V.Cell=undefined;
@@ -1795,7 +1809,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const visible=S.lookupVersionAt(dimension,key,self.snap) orelse continue :scan;
                         ctx.tuple[stage]=S.borrowVersionRow(dimension,visible,&cursor.version_rows[stage]);
                         if(source.on!=none and (try E.truth(ctx,source.on))!=true) continue :scan;
-                        if(stage+1<p.source_count and early and !try self.earlyKeep(ctx,p.where,stage)) continue :scan;
+                        if(stage+1<p.source_count and early and !try self.earlyKeep(ctx,p.where,stage,require_infallible)) continue :scan;
                     }
                     if(try keep(ctx,p.where,null)) return true;
                 }
@@ -2890,7 +2904,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.stream_stats.summary_rows += @intCast(table.summary.rows);
                         self.work.stream_stats.summary_plans += 1;
                     } else {
-                        while(try self.nextStreamTuple(p,&ctx,&cursor,early)) {
+                        while(try self.nextStreamTuple(p,&ctx,&cursor,early,false)) {
                             if(distinct.active) try self.addDistinctAggregates(p,&ctx,states[0..p.agg_count],&distinct,self.distinctWords(bitmap_at,distinct.words))
                             else try self.addAggregates(p,&ctx,states[0..p.agg_count]);
                         }
@@ -2930,7 +2944,7 @@ pub fn Exec(comptime config: types.Config) type {
                         break;
                     }
                 }
-                while(try self.nextStreamTuple(p,&ctx,&cursor,early)) {
+                while(try self.nextStreamTuple(p,&ctx,&cursor,early,false)) {
                     if (groups == 0) {
                         if (capacity == 0) return error.WorkspaceCapacity;
                         buckets = try self.refs(slots);
@@ -3415,6 +3429,99 @@ pub fn Exec(comptime config: types.Config) type {
                 _ = try sort_module.mergeSort(self.handles(list), self.work.refs[scratch..][0..list.count], &sorter);
             }
 
+            fn streamProjectionEligible(self: *const Query, p: *const B.Plan, outer: ?*const E.Context) bool {
+                if (outer != null or p.correlated or p.general_join or p.grouped or p.source_count < 2 or
+                    p.distinct != .none or p.with_ties or !self.repeatable()) return false;
+                for (p.sources[0..p.source_count], 0..) |source, index| {
+                    if (source.table == null or source.sample_method != 0) return false;
+                    if (index != 0 and (source.join != .inner or source.probe == none)) return false;
+                }
+                // Interleave join stages only when their predicates cannot
+                // fail, except for shared query control checkpoints.
+                if (!self.prefixJoinsSafe(p) or !self.availableAtStage(p.where, p.source_count - 1, true)) return false;
+                for (p.targets[0..p.width], p.required[0..p.width]) |id, required| {
+                    if (!required) continue;
+                    const n = self.pool.nodes[id];
+                    // The different projection order must not run a
+                    // volatile expression or raise an expression error.
+                    switch (n.kind) {
+                        .column => if (n.level != 0 or n.relation >= p.source_count) return false,
+                        .null_literal, .bool_literal, .int_literal => {},
+                        else => return false,
+                    }
+                }
+                return true;
+            }
+
+            const JoinedTopSorter = struct {
+                sorter: RowSorter,
+                ordinal_column: usize,
+
+                pub fn order(self: *const JoinedTopSorter, a: u32, b: u32) Error!i8 {
+                    const comparison = try self.sorter.order(a, b);
+                    if (comparison != 0) return comparison;
+                    // Match the materialized stable sort when every SQL
+                    // sort key ties, regardless of heap slot reuse.
+                    const row_cells = self.sorter.query.work.cells;
+                    return V.compare(&row_cells[a + self.ordinal_column], &row_cells[b + self.ordinal_column]);
+                }
+            };
+
+            /// Keep OFFSET+LIMIT rows and one spare in caller-owned storage.
+            /// The existing sorter orders SQL values and all NULL modes.
+            fn topJoinedProjection(self: *Query, p: *const B.Plan, ctx: *E.Context, cursor: *StreamCursor, wanted: u64) Error!?List {
+                const capacity: usize = @intCast(@min(wanted, @as(u64, @intCast(cursor.high))));
+                if (capacity == 0) return List{};
+                const stride = p.width + 1;
+                if (capacity >= (self.work.cell_high - self.work.cell_low) / stride or
+                    capacity > (self.work.ref_high - self.work.ref_low) / 2) return null;
+                var candidate = try self.cells((capacity + 1) * stride);
+                const heap_start = try self.refs(capacity);
+                const sorter: JoinedTopSorter = .{
+                    .sorter = .{ .query = self, .keys = &p.order, .key_count = p.order_count },
+                    .ordinal_column = p.width,
+                };
+                const heap = self.work.refs[heap_start..][0..capacity];
+                var kept: usize = 0;
+                var ordinal: i64 = 0;
+                while (try self.nextStreamTuple(p, ctx, cursor, true, true)) {
+                    try self.writeProjection(p, ctx, candidate);
+                    self.work.cells[candidate + p.width] = .{ .integer = ordinal };
+                    ordinal += 1;
+                    const full = kept == capacity;
+                    const reusable = try sort_module.offerTopKSlot(heap, &kept, candidate, &sorter);
+                    candidate = if (full) reusable else candidate + @as(u32, @intCast(stride));
+                }
+                if (kept > 1) {
+                    const at = self.mark();
+                    defer self.release(at);
+                    const scratch = try self.refs(kept);
+                    _ = try sort_module.mergeSort(heap[0..kept], self.work.refs[scratch..][0..kept], &sorter);
+                }
+                const skip: u32 = @intCast(@min(p.offset, @as(u64, @intCast(kept))));
+                self.work.stream_stats.joined_topk_plans += 1;
+                return .{ .start = heap_start + skip, .count = @as(u32, @intCast(kept)) - skip };
+            }
+
+            fn streamProjection(self: *Query, p: *const B.Plan) Error!List {
+                var ctx = self.context(null);
+                var cursor: StreamCursor = .{};
+                // The admitted WHERE and join expressions can be checked
+                // early. Also allow a compact prefix to reject a whole
+                // block before the first tuple or dimension probe.
+                self.prepareStreamCursor(p, &cursor, false);
+                const wanted = p.offset +| p.limit;
+                self.work.stream_stats.joined_projection_plans += 1;
+                if (p.order_count != 0 and p.limit != 0xffffffffffffffff) {
+                    if (try self.topJoinedProjection(p, &ctx, &cursor, wanted)) |rows| return rows;
+                }
+                var out: List = .{ .start = @intCast(self.work.ref_low) };
+                while ((p.order_count != 0 or out.count < wanted) and try self.nextStreamTuple(p, &ctx, &cursor, true, true)) {
+                    try self.projectRow(p, &ctx, &out);
+                }
+                return self.finish(p, out);
+            }
+
             /// ORDER BY, DISTINCT / DISTINCT ON (first row of each run of
             /// equal values, NULLs equal), OFFSET and LIMIT.
             fn finish(self: *Query, p: *const B.Plan, input: List) Error!List {
@@ -3537,7 +3644,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const early=streamed and p.source_count>1 and self.earlyAvailable(p.where,p.source_count-1) and self.prefixJoinsSafe(p);
                 if(streamed) self.prepareStreamCursor(p,&cursor,early);
                 while(true) {
-                    if(streamed) {if(!try self.nextStreamTuple(p,&ctx,&cursor,early)) break;}
+                    if(streamed) {if(!try self.nextStreamTuple(p,&ctx,&cursor,early,false)) break;}
                     else {if(row_index==tuples.count) break;try self.session.checkpoint();self.setTuple(p,&ctx,&cursor.version_rows,tuples,row_index);row_index+=1;}
                     for(p.keys[0..p.key_count],0..) |id,index| keys[index]=try E.eval(&ctx,id);
                     var values:[config.columns]V.Cell=undefined;var allowed:[config.columns]bool=@splat(false);
@@ -4162,6 +4269,7 @@ pub fn Exec(comptime config: types.Config) type {
                     };
                     return self.groupingRollup(p,outer);
                 }
+               if (self.streamProjectionEligible(p, outer)) return self.streamProjection(p);
                 if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
                     const at=self.mark();const stats=self.work.stream_stats;
                     if(self.nestedFactorGroup(p,outer)) |result| {if(result) |rows| return rows;} else |err| {
