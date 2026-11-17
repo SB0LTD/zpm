@@ -104,7 +104,6 @@ const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 const sequence = @import("sequence.sig");
-const character = @import("character.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
 const array = @import("array.sig");
@@ -690,6 +689,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     return tableNameTaken(self.scratch, name, namespace);
                 }
 
+                pub fn objectSequenceNameTaken(self: *const @This(), namespace: u32, name: []const u8) bool {
+                    return sequenceNameTaken(self.scratch, name, namespace);
+                }
+
                 pub fn noteObjectOid(self: *const @This(), oid: u32) void {
                     self.next_oid.* = @max(self.next_oid.*, oid + 1);
                 }
@@ -777,10 +780,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
             return false;
         }
 
-        fn relationNameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
-            if (tableNameTaken(scratch, name, namespace)) return true;
+        fn sequenceNameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
             if (namespace == public_namespace) for (&scratch.seqs) |*seq| if (seq.live and types.same(seq.name.slice(), name)) return true;
             return false;
+        }
+
+        fn relationNameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
+            return tableNameTaken(scratch, name, namespace) or sequenceNameTaken(scratch, name, namespace);
         }
 
         fn nameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
@@ -1334,18 +1340,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (types.same(previous.name.slice(), column.name.slice())) return error.InvalidChangeRecord;
                 column.data_type = types.typeFromOid(try reader.int(u32)) orelse return error.UnsupportedLogVersion;
                 column.typmod = try reader.int(i32);
-                // An array column's typmod is its element type's.
-                const typmod_ok = switch (types.elementData(column.data_type) orelse column.data_type) {
-                    .numeric => column.typmod == -1 or blk: {
-                        const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(column.typmod) orelse break :blk false;
-                        break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
-                    },
-                    .timestamp, .timestamptz, .time, .timetz => column.typmod >= -1 and column.typmod <= 6,
-                    .varchar, .bpchar => character.validTypmod(column.typmod),
-                    .bit, .varbit => bit_string.validTypmod(column.typmod),
-                    else => column.typmod == -1,
-                };
-                if (!typmod_ok) return error.InvalidChangeRecord;
+                if (!types.validTypeTypmod(config, column.data_type, column.typmod)) return error.InvalidChangeRecord;
                 var flags = try reader.int(u8);
                 if (version == extensions_format_version) {
                     column.virtual = flags & 0x20 != 0;
@@ -1675,7 +1670,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             if (definition.spec.cache <= 1) return error.InvalidChangeRecord;
                         }
                         if (definition.oid < first_oid or definition.oid == 0xffffffff or oidTaken(db, scratch, definition.oid, 1)) return error.ChangeRecordConflict;
-                        if (relationNameTaken(scratch, definition.name.slice(), public_namespace)) return error.ChangeRecordConflict;
+                        if (relationNameTaken(scratch, definition.name.slice(), public_namespace) or
+                            scratch.object_overlay.compositeRelationNameTaken(public_namespace, definition.name.slice())) return error.ChangeRecordConflict;
                         if (definition.owner != 0) {
                             const owner = try findVTable(scratch, definition.owner);
                             if (definition.owner_column >= scratch.tables[owner].column_count) return error.ChangeRecordConflict;

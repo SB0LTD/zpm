@@ -23,7 +23,10 @@
 //! and all ordered labels have one MVCC lifetime and contiguous OID range.
 //! ALTER TYPE, general enum expressions, enum storage and composite types
 //! require separate type-system support.
-//! The packed array name and exact enum labels share Config.object_text_bytes.
+//! Composite CREATE/DROP publishes a catalog relation and typed attributes.
+//! Field descriptors and enum labels share Config.object_text_bytes with
+//! the generated array name, in their respective object kind. Composite
+//! values and typed tables have a separate execution/storage contract.
 //!
 //!   70 object_create kind u8, oid u32, target u32, grantee u32, sub i32,
 //!                    owner u32, flags u32, grant_flags u32, name (len u8 +
@@ -33,13 +36,17 @@
 //!                    comparison u8, signed CHECK bound i64
 //!                    enum only: version u8, label_count u16
 //!                    (text is array name then length-prefixed labels)
+//!                    composite only: version u8, field_count u16
+//!                    (text is array name then fields: name len u8 + bytes,
+//!                    built-in type OID u32, typmod i32)
 //!   71 object_drop   kind u8, oid u32, target u32, grantee u32, sub i32
 //!
 //! Kinds and keys: 1 role (oid), 2 member (target role, grantee member),
 //! 3 acl (target table, grantee role or 0 PUBLIC), 4 relation (target
 //! table), 5 policy (oid), 6 comment (grantee classoid, target object, sub
 //! column), 7 fdw (oid), 8 server (oid), 9 publication (oid), 10 domain
-//! (oid, namespace), 11 enum (oid, namespace). Types append a versioned payload.
+//! (oid, namespace), 11 enum (oid, namespace), 12 composite (oid, namespace).
+//! Types append a versioned payload.
 //!
 //! Roles are SQL-level: the bootstrap superuser (OID 10, `ramsql`) is the
 //! role every wire session runs as (RAMSQL authenticates one SCRAM user and
@@ -70,10 +77,10 @@ pub const class_policy: u32 = 3256;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, _ };
 
 pub fn userType(kind: Kind) bool {
-    return kind == .domain or kind == .enum_type;
+    return kind == .domain or kind == .enum_type or kind == .composite_type;
 }
 
 pub const enum_label_bytes: usize = 63;
@@ -92,6 +99,52 @@ pub const EnumLabels = struct {
 };
 
 pub const EncodedEnumLabels = struct { bytes: usize, count: u16 };
+
+pub const CompositeField = struct { name: []const u8, oid: u32, typmod: i32 };
+
+const composite_field_header = 1 + @sizeOf(u32) + @sizeOf(i32);
+
+fn fieldWord(raw: []const u8) u32 {
+    var value: u32 = 0;
+    for (raw[0..4], 0..) |byte, index| value |= @as(u32, byte) << @intCast(index * 8);
+    return value;
+}
+
+pub const CompositeFields = struct {
+    bytes: []const u8,
+
+    pub fn next(self: *CompositeFields) ?CompositeField {
+        if (self.bytes.len == 0) return null;
+        const name_len: usize = self.bytes[0];
+        const payload = self.bytes[1 + name_len ..];
+        const field: CompositeField = .{
+            .name = self.bytes[1..][0..name_len],
+            .oid = fieldWord(payload),
+            .typmod = @bitCast(fieldWord(payload[4..])),
+        };
+        self.bytes = payload[8..];
+        return field;
+    }
+};
+
+/// Appends one already-bound built-in attribute. WAL validates the same
+/// sequence independently before publishing the enclosing catalog object.
+pub fn appendCompositeField(output: []u8, used: *usize, field: CompositeField) Error!void {
+    const name_len = field.name.len;
+    if (name_len == 0 or name_len > 255) return error.InvalidName;
+    for (field.name) |byte| if (byte == 0) return error.InvalidName;
+    var earlier: CompositeFields = .{ .bytes = output[0..used.*] };
+    while (earlier.next()) |prior| if (types.same(prior.name, field.name)) return error.DuplicateColumn;
+    const length = name_len + composite_field_header;
+    if (length > output.len - used.*) return error.TextCapacity;
+    const encoded = output[used.*..][0..length];
+    encoded[0] = @intCast(name_len);
+    @memcpy(encoded[1..][0..name_len], field.name);
+    for ([_]u32{ field.oid, @bitCast(field.typmod) }, 0..) |word, index| {
+        for (0..4) |byte| encoded[1 + name_len + index * 4 + byte] = @truncate(word >> @intCast(byte * 8));
+    }
+    used.* += length;
+}
 
 /// Freeze exact decoded label bytes into one caller-owned catalog payload.
 pub fn encodeEnumLabels(source: []const u8, output: []u8, label_capacity: usize) Error!EncodedEnumLabels {
@@ -293,6 +346,7 @@ pub const Server = struct {
 pub const Publication = struct { name: Ident = .{}, flags: u32 = pub_default };
 pub const CreateDomain = struct { name: Qualified, spec: Domain };
 pub const CreateEnum = struct { name: Qualified, labels: Span };
+pub const CreateComposite = struct { name: Qualified, fields: Span };
 pub const DropTypes = struct { names: [list_capacity]Qualified = @splat(.{}), count: usize = 0, if_exists: bool = false };
 
 pub const Statement = union(enum) {
@@ -316,6 +370,7 @@ pub const Statement = union(enum) {
     create_domain: CreateDomain,
     drop_domain: DropTypes,
     create_enum: CreateEnum,
+    create_composite: CreateComposite,
     drop_type: DropTypes,
 };
 
@@ -333,7 +388,7 @@ pub fn parse(source: []const u8, comptime name_bytes: usize, comptime text_bytes
             // Enum literals are checked against the PostgreSQL label limit
             // after decoding, independently of expression text capacity.
             p.tokens.text_limit = source.len;
-            return .{ .create_enum = try p.createEnum() };
+            return try p.createType();
         }
         if (try p.take("role")) return .{ .create_role = try p.roleSpec(.role, true) };
         if (p.word("user")) {
@@ -549,9 +604,15 @@ const Parser = struct {
         return .{ .name = name, .spec = spec };
     }
 
-    fn createEnum(self: *Parser) Error!CreateEnum {
+    fn createType(self: *Parser) Error!Statement {
         const name = try self.qualified();
-        if (!try self.take("as") or !try self.take("enum")) return error.UnsupportedStatement;
+        if (!try self.take("as")) return error.UnsupportedStatement;
+        if (try self.take("enum")) return .{ .create_enum = .{ .name = name, .labels = try self.enumBody() } };
+        if (!self.symbol(.lparen)) return error.UnsupportedStatement;
+        return .{ .create_composite = .{ .name = name, .fields = try self.compositeBody() } };
+    }
+
+    fn enumBody(self: *Parser) Error!Span {
         if (!self.symbol(.lparen)) return error.Syntax;
         const start = self.current.end;
         try self.advance();
@@ -564,7 +625,26 @@ const Parser = struct {
         const end = self.current.start;
         try self.expectSymbol(.rparen);
         try self.finish();
-        return .{ .name = name, .labels = .{ .start = start, .len = end - start } };
+        return .{ .start = start, .len = end - start };
+    }
+
+    fn compositeBody(self: *Parser) Error!Span {
+        const start = self.current.end;
+        try self.advance();
+        var depth: usize = 1;
+        while (true) {
+            if (self.atEnd()) return error.Syntax;
+            if (self.symbol(.lparen)) depth += 1;
+            if (self.symbol(.rparen)) {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+            try self.advance();
+        }
+        const end = self.current.start;
+        try self.advance();
+        try self.finish();
+        return .{ .start = start, .len = end - start };
     }
 
     fn dropTypes(self: *Parser) Error!DropTypes {
@@ -1159,18 +1239,28 @@ pub fn Objects(comptime config: types.Config) type {
             /// name from the packed label sequence.
             domain: Domain = .{},
             enum_label_count: u16 = 0,
+            composite_field_count: u16 = 0,
 
             pub fn oidWidth(self: *const Object) u32 {
+                if (self.kind == .composite_type) return 3;
                 if (userType(self.kind)) return 2 + @as(u32, self.enum_label_count);
                 return @intFromBool(ownsOid(self.kind));
             }
 
             pub fn arrayName(self: *const Object) []const u8 {
-                return if (self.kind == .enum_type) self.text[0..self.split] else self.textSlice();
+                return if (self.kind == .domain) self.textSlice() else self.text[0..self.split];
             }
 
             pub fn enumLabels(self: *const Object) EnumLabels {
                 return .{ .bytes = self.text[self.split..self.text_len] };
+            }
+
+            pub fn compositeFields(self: *const Object) CompositeFields {
+                return .{ .bytes = self.text[self.split..self.text_len] };
+            }
+
+            pub fn compositeRelationOid(self: *const Object) u32 {
+                return self.oid + 2;
             }
 
             pub fn textSlice(self: *const Object) []const u8 {
@@ -1226,7 +1316,7 @@ pub fn Objects(comptime config: types.Config) type {
             if (a.kind != b.kind) return false;
             return switch (a.kind) {
                 .role, .policy, .fdw, .server, .publication => a.oid == b.oid,
-                .domain, .enum_type => a.oid == b.oid and a.target == b.target,
+                .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
                 .member, .acl => a.target == b.target and a.grantee == b.grantee,
                 .relation => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
@@ -1266,6 +1356,14 @@ pub fn Objects(comptime config: types.Config) type {
             for (&self.items) |*o| {
                 const other = pendingOf(o, snap) orelse continue;
                 if (userType(o.kind) and o.target == namespace and (types.same(o.name.slice(), name) or types.same(o.arrayName(), name))) return other;
+            }
+            return null;
+        }
+
+        pub fn pendingCompositeRelationName(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) ?u16 {
+            for (&self.items) |*o| {
+                if (o.kind != .composite_type or o.target != namespace or !types.same(o.name.slice(), name)) continue;
+                if (pendingOf(o, snap)) |other| return other;
             }
             return null;
         }
@@ -1561,6 +1659,9 @@ pub fn Objects(comptime config: types.Config) type {
             } else if (o.kind == .enum_type) {
                 try writer.int(u8, 1);
                 try writer.int(u16, o.enum_label_count);
+            } else if (o.kind == .composite_type) {
+                try writer.int(u8, 1);
+                try writer.int(u16, o.composite_field_count);
             }
         }
 
@@ -1574,7 +1675,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > 11) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > 12) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1594,7 +1695,7 @@ pub fn Objects(comptime config: types.Config) type {
             const ok = switch (o.kind) {
                 .role, .fdw, .publication => o.oid != 0 and o.target == 0 and o.grantee == 0 and o.sub == 0,
                 .policy, .server => o.oid != 0 and o.grantee == 0 and o.sub == 0,
-                .domain, .enum_type => o.oid != 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
+                .domain, .enum_type, .composite_type => o.oid != 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .acl => o.oid == 0 and o.target != 0 and o.sub == 0,
                 .relation => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
@@ -1652,7 +1753,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .publication => has_name and o.flags & ~@as(u32, 63) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .domain => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.split == 0 and
                     o.text_len != 0 and o.text_len <= config.name_bytes and o.text[0] == '_' and !types.same(o.name.slice(), o.textSlice()),
-                .enum_type => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and
+                .enum_type, .composite_type => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and
                     o.split != 0 and o.split <= config.name_bytes and o.text[0] == '_' and !types.same(o.name.slice(), o.arrayName()),
                 _ => false,
             };
@@ -1671,6 +1772,11 @@ pub fn Objects(comptime config: types.Config) type {
                 if (try cursor.int(u8) != 1) return error.UnsupportedLogVersion;
                 o.enum_label_count = try cursor.int(u16);
                 try validateEnumLabels(o.text[o.split..o.text_len], o.enum_label_count);
+            } else if (o.kind == .composite_type) {
+                for (o.arrayName()) |byte| if (byte == 0) return error.InvalidChangeRecord;
+                if (try cursor.int(u8) != 1) return error.UnsupportedLogVersion;
+                o.composite_field_count = try cursor.int(u16);
+                try validateCompositeFields(o.text[o.split..o.text_len], o.composite_field_count);
             }
             return o;
         }
@@ -1687,6 +1793,26 @@ pub fn Objects(comptime config: types.Config) type {
                 var earlier: EnumLabels = .{ .bytes = bytes[0..offset] };
                 while (earlier.next()) |prior| if (types.same(prior, label)) return error.InvalidChangeRecord;
                 offset += length + 1;
+                count += 1;
+            }
+            if (count != expected) return error.InvalidChangeRecord;
+        }
+
+        fn validateCompositeFields(bytes: []const u8, expected: u16) Error!void {
+            if (expected > config.columns) return error.ChangeRecordConflict;
+            var fields: CompositeFields = .{ .bytes = bytes };
+            var count: usize = 0;
+            while (fields.bytes.len != 0) {
+                const name_len: usize = fields.bytes[0];
+                if (name_len == 0 or name_len > config.name_bytes or name_len > config.text_bytes or
+                    name_len + composite_field_header > fields.bytes.len) return error.InvalidChangeRecord;
+                const offset = bytes.len - fields.bytes.len;
+                const field = fields.next().?;
+                const data_type = types.typeFromOid(field.oid) orelse return error.InvalidChangeRecord;
+                if (!types.validTypeTypmod(config, data_type, field.typmod)) return error.InvalidChangeRecord;
+                for (field.name) |byte| if (byte == 0) return error.InvalidChangeRecord;
+                var earlier: CompositeFields = .{ .bytes = bytes[0..offset] };
+                while (earlier.next()) |prior| if (types.same(prior.name, field.name)) return error.InvalidChangeRecord;
                 count += 1;
             }
             if (count != expected) return error.InvalidChangeRecord;
@@ -1776,6 +1902,11 @@ pub fn Objects(comptime config: types.Config) type {
                 return false;
             }
 
+            pub fn compositeRelationNameTaken(self: *const Overlay, namespace: u32, name: []const u8) bool {
+                for (&self.items) |*v| if (v.live and v.kind == .composite_type and v.target == namespace and types.same(v.name.slice(), name)) return true;
+                return false;
+            }
+
             fn liveOid(self: *const Overlay, kind: Kind, oid: u32) bool {
                 for (&self.items) |*v| if (v.live and v.kind == kind and v.oid == oid) return true;
                 return false;
@@ -1792,6 +1923,7 @@ pub fn Objects(comptime config: types.Config) type {
                 }
                 if (userType(o.kind) and (self.userTypeNameTaken(o.target, o.name.slice()) or self.userTypeNameTaken(o.target, o.arrayName()) or
                     ctx.objectRelationNameTaken(o.target, o.name.slice()) or ctx.objectRelationNameTaken(o.target, o.arrayName()))) return error.ChangeRecordConflict;
+                if (o.kind == .composite_type and ctx.objectSequenceNameTaken(o.target, o.name.slice())) return error.ChangeRecordConflict;
                 for (&self.items) |*v| {
                     if (!v.live) continue;
                     const existing = asObject(v);
@@ -1854,7 +1986,7 @@ pub fn Objects(comptime config: types.Config) type {
                     .server => {
                         if (!self.liveOid(.fdw, target)) return error.ChangeRecordConflict;
                     },
-                    .domain, .enum_type => {
+                    .domain, .enum_type, .composite_type => {
                         if ((target != 2200 and target < first_oid) or !ctx.objectSchemaLive(target)) return error.ChangeRecordConflict;
                     },
                     .comment => {

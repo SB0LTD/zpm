@@ -64,7 +64,7 @@ fn col(name: []const u8, ty: types.Type) ViewColumn {
 const pg_type_columns = [_]ViewColumn{
     col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .text), col("typcategory", .text),
     col("typarray", .oid), col("typdelim", .text), col("typinput", .text), col("typbasetype", .oid), col("typelem", .oid),
-    col("typowner", .oid), col("typtypmod", .int4), col("typnotnull", .boolean),
+    col("typowner", .oid), col("typtypmod", .int4), col("typnotnull", .boolean), col("typrelid", .oid),
 };
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name) };
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
