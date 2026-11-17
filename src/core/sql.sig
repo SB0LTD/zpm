@@ -356,6 +356,7 @@ pub fn Database(comptime config: Config) type {
                 for (0..self.column_count) |column| {
                     switch (self.column_types[column]) {
                         .integer, .integer32, .boolean, .text => continue,
+                        .mysql_bigint_unsigned => if (mode == .mysql) continue,
                         .date => if (mode == .tds) continue,
                         .smallint, .oid => {
                             self.column_types[column] = .integer;
@@ -4419,6 +4420,7 @@ pub fn Database(comptime config: Config) type {
                 .pg_type => {
                     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
                         const data_type = @field(DataType, field);
+                        if (data_type == .mysql_bigint_unsigned) continue;
                         const info = types.typeInfo(data_type);
                         const category: [1]u8 = .{info.category};
                         try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0) });

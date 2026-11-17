@@ -1016,7 +1016,8 @@ pub fn Eval(comptime config: types.Config) type {
                     };
                 },
                 .decimal_literal => {
-                    if (n.ty == .float4 or n.ty == .float8) return Io.parse(n.ty, -1, n.name.span.slice(ctx.source), ctx.session);
+                    if (n.ty == .float4 or n.ty == .float8 or n.ty == .mysql_bigint_unsigned)
+                        return Io.parse(n.ty, -1, n.name.span.slice(ctx.source), ctx.session);
                     const number = try Io.parse(.numeric, -1, n.name.span.slice(ctx.source), ctx.session);
                     return if (n.ty == .numeric or n.ty == .unknown) number else Io.cast(number, .numeric, n.ty, -1, ctx.session);
                 },

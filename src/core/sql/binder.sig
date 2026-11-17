@@ -793,6 +793,13 @@ pub fn Binder(comptime config: types.Config) type {
             if (context.node(b.*).ty == .regtype) b.* = try convert(context, b.*, .oid, -1, .implicit);
             const left = context.node(a.*).ty;
             const right = context.node(b.*).ty;
+            if (left == .mysql_bigint_unsigned or right == .mysql_bigint_unsigned) {
+                // Unsigned cells already have the exact NUMERIC representation.
+                // Keep the bound column intact so equality can use its index.
+                a.* = try unsignedComparisonOperand(context, a.*);
+                b.* = try unsignedComparisonOperand(context, b.*);
+                return;
+            }
             if (left == .unknown and right == .unknown) {
                 try coerce(context, a.*, .text);
                 return coerce(context, b.*, .text);
@@ -814,6 +821,13 @@ pub fn Binder(comptime config: types.Config) type {
             const target = value.comparisonType(left, right) orelse return error.UndefinedFunction;
             a.* = try convert(context, a.*, target, -1, .implicit);
             b.* = try convert(context, b.*, target, -1, .implicit);
+        }
+
+        fn unsignedComparisonOperand(context: *const Context, id: u16) Error!u16 {
+            const ty = context.node(id).ty;
+            if (ty == .mysql_bigint_unsigned or ty == .numeric) return id;
+            if (ty != .unknown and !value.integral(ty)) return error.UnsupportedStatement;
+            return convert(context, id, .numeric, -1, .implicit);
         }
 
         fn legacyBoolean(context: *const Context, id: u16) Error!void {
@@ -966,6 +980,8 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn arithmeticType(context: *const Context, n: *ast.Node) Error!void {
+            if (context.node(n.a).ty == .mysql_bigint_unsigned or context.node(n.b).ty == .mysql_bigint_unsigned)
+                return error.UnsupportedStatement;
             if (context.node(n.a).ty == .unknown and context.node(n.b).ty == .unknown) return error.AmbiguousFunction;
             if (context.node(n.a).ty == .money or context.node(n.b).ty == .money) return moneyArithmetic(context, n);
             if (context.node(n.a).ty == .pg_lsn or context.node(n.b).ty == .pg_lsn) return lsnArithmetic(context, n);
@@ -1724,6 +1740,7 @@ pub fn Binder(comptime config: types.Config) type {
                     .int2, .int4 => .int8,
                     .int8, .numeric => .numeric,
                     .float4, .float8, .interval, .money => arg_ty,
+                    .mysql_bigint_unsigned => return error.UnsupportedStatement,
                     else => return error.UndefinedFunction,
                 },
                 .avg => switch (arg_ty) {
@@ -1731,6 +1748,7 @@ pub fn Binder(comptime config: types.Config) type {
                     .float4, .float8 => .float8,
                     // interval_avg (PostgreSQL 18).
                     .interval => .interval,
+                    .mysql_bigint_unsigned => return error.UnsupportedStatement,
                     // AVG(interval) is not provided (no interval / number).
                     else => return error.UndefinedFunction,
                 },
@@ -1738,7 +1756,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .min, .max => if (types.isArray(arg_ty)) arg_ty else switch (arg_ty) {
                     .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz, .money => arg_ty,
                     // pg_lsn_larger/smaller and xid8_larger/smaller.
-                    .pg_lsn, .xid8 => arg_ty,
+                    .pg_lsn, .xid8, .mysql_bigint_unsigned => arg_ty,
                     // network_larger/network_smaller (cidr input converts).
                     .inet, .cidr => blk: {
                         n.b = try convert(context, arg, .inet, -1, .implicit);
@@ -3715,8 +3733,14 @@ pub fn Binder(comptime config: types.Config) type {
                 .text_literal => n.ty = .unknown,
                 .decimal_literal => {
                     // Validated now (54000 beyond numeric_digits).
-                    _ = try Io.parse(.numeric, -1, n.name.span.slice(context.source), context.session);
+                    const raw = n.name.span.slice(context.source);
+                    const number = try Io.parse(.numeric, -1, raw, context.session);
                     n.ty = .numeric;
+                    if (!context.legacy and context.dialect == .mysql and config.numeric_digits >= 20) classify: {
+                        for (raw) |byte| if (byte < '0' or byte > '9') break :classify;
+                        const magnitude = types.mysqlUnsignedValue(&number.numeric) orelse break :classify;
+                        if (magnitude > 9223372036854775807) n.ty = .mysql_bigint_unsigned;
+                    }
                 },
                 .param => {
                     // `$n` of a routine body is its n-th parameter (B11 wave 3).
@@ -3752,6 +3776,16 @@ pub fn Binder(comptime config: types.Config) type {
                 .unary => {
                     try typeExpr(context, scope, n.a);
                     const ty = context.node(n.a).ty;
+                    if (ty == .mysql_bigint_unsigned) {
+                        // A sign immediately before a literal is not
+                        // unsigned column arithmetic. A negative literal
+                        // above the signed range remains exact DECIMAL.
+                        if (context.node(n.a).kind != .decimal_literal or n.op == .bit_not)
+                            return error.UnsupportedStatement;
+                        n.ty = if (n.op == .neg) .numeric else .mysql_bigint_unsigned;
+                        n.constant = isConstant(context, n.a);
+                        return;
+                    }
                     if (ty == .unknown) return error.AmbiguousFunction;
                     if (!value.numericCategory(ty) and ty != .interval) return error.UndefinedFunction;
                     if (n.op == .bit_not and !value.integral(ty)) return error.UndefinedFunction;
@@ -3861,11 +3895,31 @@ pub fn Binder(comptime config: types.Config) type {
                     if (context.node(n.a).kind == .row_constructor) return bindRowIn(context, scope, id);
                     try typeExpr(context, scope, n.a);
                     var result: ast.Type = context.node(n.a).ty;
+                    var unsigned = result == .mysql_bigint_unsigned;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
                         try typeExpr(context, scope, item);
-                        try unifyInto(&result, context.node(item).ty);
+                        unsigned = unsigned or context.node(item).ty == .mysql_bigint_unsigned;
                     }
+                    if (unsigned) {
+                        n.a = try unsignedComparisonOperand(context, n.a);
+                        var previous: u16 = none;
+                        item = n.b;
+                        while (item != none) {
+                            const following = context.node(item).next;
+                            const resolved = try unsignedComparisonOperand(context, item);
+                            if (previous == none) n.b = resolved else context.node(previous).next = resolved;
+                            context.node(resolved).next = following;
+                            previous = resolved;
+                            item = following;
+                        }
+                        n.ty = .boolean;
+                        n.constant = isConstant(context, n.a) and listConstant(context, n.b);
+                        return;
+                    }
+                    item = n.b;
+                    while (item != none) : (item = context.node(item).next)
+                        try unifyInto(&result, context.node(item).ty);
                     if (result == .unknown) result = .text;
                     if (result == .json) return error.UndefinedFunction;
                     if (value.integral(result)) {
@@ -4714,10 +4768,11 @@ pub fn Binder(comptime config: types.Config) type {
                     const entry = &context.tables[out.table.?];
                     for (entry.columns[0..entry.column_count], 0..) |*column, index| {
                         if (out.count == config.columns) return error.ColumnCapacity;
-                        const id = try context.pool.add(.{ .kind = .column, .column = @intCast(index), .ty = types.typeOfData(column.data_type), .typmod = column.typmod });
+                        const data_type = projectedDataType(context, column.data_type);
+                        const id = try context.pool.add(.{ .kind = .column, .column = @intCast(index), .ty = types.typeOfData(data_type), .typmod = column.typmod });
                         out.targets[out.count] = id;
                         out.names[out.count] = column.name;
-                        out.types[out.count] = column.data_type;
+                        out.types[out.count] = data_type;
                         out.typmods[out.count] = column.typmod;
                         if (context.dialect == .tds and fixedInt4(context, out.table, id))
                             out.non_null_columns.set(out.count);
@@ -4791,9 +4846,13 @@ pub fn Binder(comptime config: types.Config) type {
             return plansOf(context).items[rel.plan].names[column].slice();
         }
 
+        fn projectedDataType(context: *const Context, stored: types.DataType) types.DataType {
+            return if (stored == .mysql_bigint_unsigned and context.dialect != .mysql) .numeric else stored;
+        }
+
         fn relationColumnType(context: *const Context, rel: *const Relation, column: usize) ast.Type {
             if (rel.view) |view| return catalog.viewColumns(view)[column].ty;
-            if (rel.table) |index| return types.typeOfData(context.tables[index].columns[column].data_type);
+            if (rel.table) |index| return types.typeOfData(projectedDataType(context, context.tables[index].columns[column].data_type));
             return plansOf(context).items[rel.plan].tys[column];
         }
 
@@ -7393,6 +7452,10 @@ pub fn Binder(comptime config: types.Config) type {
                         for (out.columns[0..index]) |*previous|
                             if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
                         column.data_type = columnType(context, definition);
+                        if (column.data_type == .mysql_bigint_unsigned and
+                            (context.dialect != .mysql or !types.validTypeTypmod(config, column.data_type, column.typmod) or
+                                definition.default_kind != .none or create.partition_by != .none or create.inherits != null))
+                            return error.UnsupportedStatement;
                         if (definition.primary_key and column.data_type == .json) return error.UndefinedFunction;
                         const text = definition.expression.slice(context.source);
                         if (text.len > config.text_bytes) return error.TextCapacity;
@@ -7899,6 +7962,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (out.count == config.columns) return error.ColumnCapacity;
                     var column: V.Column = .{ .name = name, .not_null = definition.not_null, .typmod = definition.typmod, .default_kind = definition.default_kind };
                     column.data_type = columnType(context, definition);
+                    if (column.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;
                     switch (definition.default_kind) {
                         // Identity and stored generation need per-row values
                         // (a table rewrite); a new primary key needs an index.
@@ -8014,6 +8078,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .set_default => |*set| {
                     const position = alterColumn(&out, toName(context, set.column).slice()) orelse return error.ColumnNotFound;
                     const column = &out.columns[position];
+                    if (column.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;
                     if (column.default_kind != .none and column.default_kind != .default) return error.Syntax;
                     const text = set.expression.slice(context.source);
                     if (text.len > config.text_bytes) return error.TextCapacity;

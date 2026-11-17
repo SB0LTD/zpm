@@ -2000,10 +2000,11 @@ pub fn Parser(comptime config: types.Config) type {
                     (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
                     return error.UnsupportedStatement;
                 }
+                const mysql_bigint = self.mode == .standard and self.tokens.dialect == .mysql and self.isWord("BIGINT");
                 const spec = try self.typeName();
                 // regclass/regtype columns are outside the subset.
                 if (spec.typmod < -1) return error.UnsupportedStatement;
-                column.type_name = spec.ty;
+                column.type_name = if (mysql_bigint and spec.ty == .int8 and try self.takeRaw("unsigned")) .mysql_bigint_unsigned else spec.ty;
                 column.typmod = spec.typmod;
             }
             var has_not_null = false;
