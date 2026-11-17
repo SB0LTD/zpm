@@ -56,13 +56,16 @@ state's `session_role` (10 unless an embedding caller installs another),
 | PG.INTEGRATION.FOREIGN | CREATE / DROP FOREIGN DATA WRAPPER [NO HANDLER] [NO VALIDATOR] (superusers), CREATE [IF NOT EXISTS] / DROP SERVER [TYPE] [VERSION] (USAGE = wrapper owner); DROP ... CASCADE; pg_foreign_data_wrapper, pg_foreign_server. Catalog entries only | handlers, validators, OPTIONS, user mappings, foreign tables, IMPORT FOREIGN SCHEMA (0A000) |
 | PG.INTEGRATION.REPLICATION | CREATE PUBLICATION [FOR ALL TABLES] [WITH (publish = ..., publish_via_partition_root)], DROP PUBLICATION (superusers); pg_publication. Catalog entries only | FOR TABLE / TABLES IN SCHEMA, ALTER PUBLICATION, logical decoding, subscriptions (0A000) |
 
-`information_schema.tables` and `information_schema.columns` use the current
-role's ownership and effective table grants, including inherited and `PUBLIC`
-grants. The columns view accepts SELECT, INSERT, UPDATE, or REFERENCES. The
-tables view also accepts DELETE, TRUNCATE, or TRIGGER. The raw PostgreSQL
-catalogs retain their existing visibility. Schema ACLs for `schemata`,
-column-level grants, and privilege filtering for constraint metadata remain
-separate conformance work.
+`information_schema.tables`, `columns`, `table_constraints`, and
+`key_column_usage` use the current role's ownership and effective table
+grants, including inherited and `PUBLIC` grants. A grant of SELECT, INSERT,
+UPDATE, or REFERENCES qualifies a relation for `columns` and qualifies a
+table for `key_column_usage`. DELETE, TRUNCATE, and TRIGGER also qualify for
+`tables`, while `table_constraints` uses the `tables` grant set with SELECT
+omitted. The `tables` and `columns` views omit materialized views. Constraint
+metadata covers ordinary and partitioned tables. `pg_class` and `pg_attribute`
+expose relation metadata to ordinary roles. Schema ACLs for `schemata` and
+column-level grants remain separate conformance work.
 
 ## PG.TYPE.ENUM_DOMAIN_COMPOSITE
 

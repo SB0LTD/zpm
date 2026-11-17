@@ -3726,9 +3726,17 @@ pub fn Database(comptime config: Config) type {
                     // PostgreSQL's information-schema views use different
                     // privilege lists. This engine supports table-wide grants.
                     const column_privileges = CO.priv_select | CO.priv_insert | CO.priv_update | CO.priv_references;
+                    const constraint_privileges = CO.priv_insert | CO.priv_update | CO.priv_delete |
+                        CO.priv_truncate | CO.priv_references | CO.priv_trigger;
                     const discovery_privileges: u32 = switch (view) {
-                        .columns => column_privileges,
-                        .tables => column_privileges | CO.priv_delete | CO.priv_truncate | CO.priv_trigger,
+                        .tables, .columns => switch (table.relkind) {
+                            'r', 'v', 'f', 'p' => if (view == .tables) constraint_privileges | CO.priv_select else column_privileges,
+                            else => continue,
+                        },
+                        .table_constraints, .key_column_usage => switch (table.relkind) {
+                            'r', 'p' => if (view == .table_constraints) constraint_privileges else column_privileges,
+                            else => continue,
+                        },
                         else => 0,
                     };
                     if (discovery_privileges != 0 and !self.catalog_objects.tableHasAnyPrivilege(
@@ -3750,8 +3758,13 @@ pub fn Database(comptime config: Config) type {
                                 try sink.add(&.{ intCell(index.oid), nameCell(index.name.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(index.key_count + index.include_count)) });
                             }
                         },
-                        .tables => if (table.relkind != 'm') {
-                            try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell(if (table.relkind == 'v') "VIEW" else "BASE TABLE") });
+                        .tables => {
+                            const table_type: []const u8 = switch (table.relkind) {
+                                'v' => "VIEW",
+                                'f' => "FOREIGN",
+                                else => "BASE TABLE",
+                            };
+                            try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table_type) });
                         },
                         .pg_index => {
                             var key: [4 * config.columns]u8 = undefined;
