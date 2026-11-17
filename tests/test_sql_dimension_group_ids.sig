@@ -77,10 +77,12 @@ pub fn main() !void {
     }
     try execute(rollup_query);
     try check(fr.row_count==36 and fast.workspace.query.stream_stats.dimension_rollup_plans==1);
+    try check(fast.workspace.query.stream_stats.dimension_group_channels == 5);
     try check(fast.workspace.query.stream_stats.rollup_folded_leaves==30 and fast.workspace.query.stream_stats.gathered_rows==0);
     try check(fast.workspace.query.stream_stats.dimension_probes==37 and fast.workspace.query.stream_stats.dimension_group_rows>0);
     try execute("SELECT cu.segment,f.discount,COUNT(*),SUM(f.amount),ROUND(AVG(f.amount),2) FROM fact f JOIN customers cu ON cu.id=f.customer GROUP BY ROLLUP(cu.segment,f.discount) ORDER BY cu.segment NULLS LAST,f.discount NULLS LAST");
     try check(fr.row_count==36 and fast.workspace.query.stream_stats.dimension_rollup_plans==1);
+    try check(fast.workspace.query.stream_stats.dimension_group_channels == 2);
     try execute(rollup_select++rollup_group);
     try check(fast.workspace.query.stream_stats.dimension_rollup_plans==1);
     try execute(rollup_select++rollup_group++" HAVING COUNT(*)>1"++rollup_order++" LIMIT 12 OFFSET 1");

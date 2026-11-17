@@ -72,6 +72,7 @@ pub fn Exec(comptime config: types.Config) type {
             dimension_group_keys:usize=0,
             dimension_group_ids:usize=0,
             dimension_group_rows:usize=0,
+            dimension_group_channels: usize = 0,
             dimension_rollup_plans:usize=0,
             dimension_distinct_plans:usize=0,
             nested_factor_plans: usize = 0,
@@ -2472,6 +2473,27 @@ pub fn Exec(comptime config: types.Config) type {
 
             const DimensionGroupMode = enum { numeric, date_format, rollup };
 
+            /// Keep one state per direct transition. Wide SUM and AVG over
+            /// the same input share count and sum, with their own finalizers.
+            /// Checked int8 SUM keeps its distinct transition kind.
+            fn shareDimensionTransitions(transitions: []Transition, aggregate_channels: []u16) usize {
+                var count: usize = 0;
+                for (0..transitions.len) |index| {
+                    const transition = transitions[index];
+                    var channel: usize = 0;
+                    while (channel < count) : (channel += 1) {
+                        const candidate = transitions[channel];
+                        if (candidate.kind == transition.kind and candidate.column == transition.column) break;
+                    }
+                    if (channel == count) {
+                        transitions[count] = transition;
+                        count += 1;
+                    }
+                    aggregate_channels[index] = @intCast(channel);
+                }
+                return count;
+            }
+
             fn appendDimensionGroup(self: *Query, p: *const B.Plan, records: *List, dimension_position: usize,
                 label: V.Cell, fact_value: V.Cell, record: u32, bucket: usize) Error!void {
                 const at = try self.cells(4 + p.agg_count);
@@ -2507,7 +2529,9 @@ pub fn Exec(comptime config: types.Config) type {
                     !S.summaryKeyType(self.tables[p.sources[label.relation].table.?].columns[label.column].data_type)) return null;
                 var transitions:[config.columns]Transition=undefined;
                 if(!self.prepareTransitions(p,transitions[0..p.agg_count])) return null;
-                for(transitions[0..p.agg_count]) |item| if(item.kind==.sum_integer and table.summary.columns[item.column].nonnull!=0) {
+                var aggregate_channels: [config.columns]u16 = undefined;
+                const channel_count = shareDimensionTransitions(transitions[0..p.agg_count], aggregate_channels[0..p.agg_count]);
+                for(transitions[0..channel_count]) |item| if(item.kind==.sum_integer and table.summary.columns[item.column].nonnull!=0) {
                     const amounts=table.integer_bounds[item.column];if(!amounts.known) return null;const n=@as(i128,table.summary.rows);
                     if(n*@as(i128,@min(amounts.low,0)) < -9223372036854775808 or n*@as(i128,@max(amounts.high,0))>9223372036854775807) return null;
                 };
@@ -2517,7 +2541,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const available_refs=self.work.ref_high-self.work.ref_low;const available_cells=self.work.cell_high-self.work.cell_low;
                 if(key_span128<=0 or key_span128>=available_refs or fact_span128<=1 or fact_span128>=available_cells) return null;
                 const key_span:usize=@intCast(key_span128);const fact_span:usize=@intCast(fact_span128);
-                const stride=factor_header+p.agg_count*@sizeOf(FactorAggregate);
+                const stride=factor_header+channel_count*@sizeOf(FactorAggregate);
                 const buckets_per_label=fact_span+@intFromBool(rollup);
                 const state_bytes_product=@mulWithOverflow(buckets_per_label,stride);if(state_bytes_product[1]!=0) return null;
                 const state_bytes=state_bytes_product[0];
@@ -2555,7 +2579,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const fact_nonnull=table.summary.columns[fact_key.column].nonnull==table.summary.rows;
                 const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));
                 var nonnull:[config.columns]bool=undefined;
-                for(transitions[0..p.agg_count],0..) |item,index| nonnull[index]=item.kind==.count_star or table.summary.columns[item.column].nonnull==table.summary.rows;
+                for(transitions[0..channel_count],0..) |item,index| nonnull[index]=item.kind==.count_star or table.summary.columns[item.column].nonnull==table.summary.rows;
                 var start:usize=0;
                 while(start<table.scan_high):(start+=64) {
                     const count=@min(@as(usize,64),table.scan_high-start);try self.session.checkpoints(count);
@@ -2576,7 +2600,7 @@ pub fn Exec(comptime config: types.Config) type {
                                 if (has_key) .{.date=@intCast(scalar)} else .null_value, fact_key_id, &fact_key, &date_context, &date_values);
                         } else fact_index;
                         const state=partial+value*stride;factorRows(state).*+=1;self.work.stream_stats.dimension_group_rows+=1;
-                        for(transitions[0..p.agg_count],factorStates(state,p.agg_count),0..) |item,*channel,index| {
+                        for(transitions[0..channel_count],factorStates(state,channel_count),0..) |item,*channel,index| {
                             if(item.kind!=.count_star and !nonnull[index] and flags&(@as(u64,1)<<@intCast(item.column))==0) continue;
                             channel.count+=1;
                             if(item.kind==.sum_integer or item.kind==.sum_wide) channel.total+=table.scan_values[@as(usize,item.column)*table.rows.len+slot];
@@ -2592,20 +2616,20 @@ pub fn Exec(comptime config: types.Config) type {
                     const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);
                     if(rollup) {
                         const subtotal=partial+fact_span*stride;
-                        const subtotal_channels=factorStates(subtotal,p.agg_count);
+                        const subtotal_channels=factorStates(subtotal,channel_count);
                         var leaves:usize=0;
                         for(0..fact_span) |bucket| {
                             try self.session.checkpoint();
                             const leaf=partial+bucket*stride;
                             if(factorRows(leaf).*==0) continue;
-                            for(subtotal_channels,factorStates(leaf,p.agg_count)) |*channel,delta| {
+                            for(subtotal_channels,factorStates(leaf,channel_count)) |*channel,delta| {
                                 channel.count+=delta.count;
                                 channel.total+=delta.total;
                             }
                             leaves+=1;
                         }
                         if(leaves==0) continue;
-                        for(grand[0..p.agg_count],subtotal_channels) |*channel,delta| {
+                        for(grand[0..channel_count],subtotal_channels) |*channel,delta| {
                             channel.count+=delta.count;
                             channel.total+=delta.total;
                         }
@@ -2630,15 +2654,19 @@ pub fn Exec(comptime config: types.Config) type {
                 for(self.handles(records)) |at| {
                     const record:u32=@intCast(self.work.cells[at+2+p.agg_count].integer);const bucket:usize=@intCast(self.work.cells[at+3+p.agg_count].integer);
                     const mask:u64=if(!rollup or bucket<fact_span) 0 else if(bucket==fact_span) 1 else 3;
-                    const channels=if(rollup and mask==3) grand[0..p.agg_count] else factorStates(
-                        @as([*]u8,@ptrCast(&self.work.cells[record+1]))+bucket*stride,p.agg_count);
+                    const channels=if(rollup and mask==3) grand[0..channel_count] else factorStates(
+                        @as([*]u8,@ptrCast(&self.work.cells[record+1]))+bucket*stride,channel_count);
                     var values:[config.columns]Accumulator=undefined;
-                    for(channels,transitions[0..p.agg_count],values[0..p.agg_count]) |channel,item,*value|
+                    for (aggregate_channels[0..p.agg_count], values[0..p.agg_count]) |channel_index, *value| {
+                        const channel = channels[channel_index];
+                        const item = transitions[channel_index];
                         value.*=.{.count=channel.count,.wide=channel.total,.integer=if(item.kind==.sum_integer) @intCast(channel.total) else 0};
+                    }
                     try self.projectGroupMask(p,at,values[0..p.agg_count],outer,&out,mask);
                 }
                 const result=try self.finish(p,out);
                 self.work.stream_stats.dimension_group_plans+=1;self.work.stream_stats.dimension_group_ids+=map.groups;
+                self.work.stream_stats.dimension_group_channels += channel_count;
                 if (format_dates) self.work.stream_stats.dimension_date_group_plans += 1;
                 if(rollup) self.work.stream_stats.dimension_rollup_plans+=1;
                 self.work.stream_stats.groups+=records.count;

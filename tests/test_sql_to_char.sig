@@ -86,6 +86,7 @@ fn compactDateGroups() !void {
     try executeDateJoin(query);
     try check(fast_result.row_count == 3 and fast_result.rows[0].cells[2].integer == 3);
     try check(date_fast.workspace.query.stream_stats.dimension_date_group_plans == 1);
+    try check(date_fast.workspace.query.stream_stats.dimension_group_channels == 2);
     try check(date_fast.workspace.query.stream_stats.dimension_date_keys == 4);
     const unsupported = "SELECT r.name,to_char(f.day,'IYYY-IW'),COUNT(*)" ++ source ++
         "GROUP BY r.name,to_char(f.day,'IYYY-IW')";
