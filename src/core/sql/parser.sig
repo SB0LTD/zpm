@@ -1922,6 +1922,10 @@ pub fn Parser(comptime config: types.Config) type {
                     break;
                 }
             } else {
+                if (self.mode == .standard and !typeWord(self.current) and
+                    (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
+                    return error.UnsupportedStatement;
+                }
                 const spec = try self.typeName();
                 // regclass/regtype columns are outside the subset.
                 if (spec.typmod < -1) return error.UnsupportedStatement;
@@ -3618,10 +3622,22 @@ pub fn Parser(comptime config: types.Config) type {
         fn castTail(self: *Self, initial: u16) Error!u16 {
             var node = initial;
             while (try self.takeSymbol(.cast)) {
-                const target = try self.typeName();
-                node = try self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = node });
+                node = try self.castTarget(node);
             }
             return node;
+        }
+
+        fn castTarget(self: *Self, inner: u16) Error!u16 {
+            if (typeWord(self.current)) {
+                const next = try self.peek();
+                if (next.kind != .symbol or next.symbol != .dot) {
+                    const target = try self.typeName();
+                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                }
+            }
+            const named = try self.qualifiedName();
+            if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
+            return self.pool.add(.{ .kind = .cast, .cast_type = .unknown, .a = inner, .name = named.name, .qualifier = named.schema orelse .{} });
         }
 
         /// Parses `( expr, ... )` arguments into a list; returns its head.
@@ -4231,9 +4247,9 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.lparen);
                     const inner = try self.expression();
                     try self.expectWord("AS");
-                    const target = try self.typeName();
+                    const target = try self.castTarget(inner);
                     try self.expectSymbol(.rparen);
-                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                    return target;
                 }
                 // Bit-string constant B'...' (the quote follows the B directly):
                 // BIT without a typmod, read by bit_in.

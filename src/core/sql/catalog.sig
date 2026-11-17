@@ -61,7 +61,11 @@ fn col(name: []const u8, ty: types.Type) ViewColumn {
     return .{ .name = name, .ty = ty };
 }
 
-const pg_type_columns = [_]ViewColumn{ col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .text), col("typcategory", .text), col("typarray", .oid), col("typdelim", .text), col("typinput", .text) };
+const pg_type_columns = [_]ViewColumn{
+    col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .text), col("typcategory", .text),
+    col("typarray", .oid), col("typdelim", .text), col("typinput", .text), col("typbasetype", .oid), col("typelem", .oid),
+    col("typowner", .oid), col("typtypmod", .int4), col("typnotnull", .boolean),
+};
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name) };
 const pg_class_columns = [_]ViewColumn{ col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .text), col("relnatts", .int2) };
 const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .text), col("attgenerated", .text), col("atthasdef", .boolean) };

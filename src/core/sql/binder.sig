@@ -26,6 +26,7 @@ const parser = @import("parser.sig");
 const array_module = @import("array.sig");
 const routine_catalog = @import("routine_catalog.sig");
 const collation = @import("collation.sig");
+const catalog_objects = @import("catalog_objects.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -310,6 +311,8 @@ pub fn Binder(comptime config: types.Config) type {
             source: []const u8,
             tables: *const [config.tables]S.Table,
             catalog: *const K,
+            /// Present only when binding an independent top-level SQL read.
+            domain_catalog: ?*const catalog_objects.Objects(config) = null,
             /// Statement snapshot: every name lookup reads the catalog under it.
             snapshot: storage.Snapshot,
             pool: *Ast.Pool,
@@ -3925,6 +3928,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .cast => {
                     n.date_bound=false;
+                    if (n.cast_type == .unknown) return error.UnsupportedStatement;
                     if (n.typmod == ast.regclass_typmod or n.typmod == ast.regtype_typmod) return regCast(context, scope, n);
                     const target = n.cast_type;
                     const inner = context.node(n.a);
@@ -3961,7 +3965,7 @@ pub fn Binder(comptime config: types.Config) type {
                         _ = try Io.parseCast(target, n.typmod, text.slice(), context.session);
                     }
                     n.ty = target;
-                    n.constant = isConstant(context, n.a);
+                    n.constant = !n.domain_cast and isConstant(context, n.a);
                     const bound=context.node(n.a);
                     if(target==.date and bound.kind==.text_literal and bound.ty==.date and bound.date_bound) {
                         n.date_bound=true;n.integer=bound.integer;
@@ -4131,6 +4135,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .cast => blk: {
                     const inner = figure(context, n.a, buffer);
                     if (inner.strength > 1) break :blk inner;
+                    if (n.domain_cast) {
+                        buffer.* = toName(context, n.name);
+                        break :blk .{ .name = buffer.slice(), .strength = 1 };
+                    }
                     const named_type = types.elementType(n.cast_type) orelse n.cast_type;
                     break :blk .{ .name = types.typeInfo(types.dataTypeOf(named_type)).name, .strength = 1 };
                 },
@@ -4520,6 +4528,25 @@ pub fn Binder(comptime config: types.Config) type {
             out.plan = root;
         }
 
+        fn bindDomainCast(context: *const Context, target: u16) Error!void {
+            const n = context.node(target);
+            if (n.kind != .cast or n.cast_type != .unknown) return;
+            if (context.dialect != .postgres) return error.UnsupportedStatement;
+            const domains = context.domain_catalog orelse return error.UnsupportedStatement;
+            const namespace = try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
+            const name = toName(context, n.name);
+            const index = domains.byName(.domain, namespace, name.slice(), context.snapshot) orelse {
+                if (domains.domainNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
+                return error.UndefinedObject;
+            };
+            const info = domains.items[index].domain;
+            n.cast_type = info.base;
+            n.domain_cast = true;
+            n.domain_not_null = info.not_null;
+            n.domain_comparison = info.comparison;
+            n.integer = info.bound;
+        }
+
         fn bindSelect(context: *const Context, select: *const Ast.Select) Error!Select {
             const scope = try scopeFor(context, select.from);
             // FOR ... OF names a FROM item (42P01 otherwise; single-table locking).
@@ -4546,6 +4573,9 @@ pub fn Binder(comptime config: types.Config) type {
                     continue;
                 }
                 if (out.count == config.columns) return error.ColumnCapacity;
+                if (select.from == null and select.where == none and select.order_count == 0 and !select.limit_present) {
+                    try bindDomainCast(context, target.expr);
+                }
                 try valueExpr(context, &scope, target.expr);
                 out.targets[out.count] = target.expr;
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
