@@ -30,7 +30,8 @@ No calendar promise or universal speedup is implied. A release claiming complete
 
 ## Concrete smoke specifications
 
-Current core run: **12 smoke passes, 89 failures, 17 unexecuted scopes/comparators**.
+Historical core run on the older checkpoint: **12 smoke passes, 89 failures,
+17 unexecuted scopes/comparators**.
 The broad executable still deliberately exits with SqlConformanceIncomplete.
 The former8/93/17 result is retained at `core_smoke_results.consolidation.ndjson`;
 the earlier6/95/17 result remains at `core_smoke_results.stage4.ndjson`.
@@ -185,9 +186,8 @@ the consolidation does not fix those SQLF findings. See the
 [application feature/divergence audit](https://github.com/SB0LTD/ramsql/blob/main/docs/compatibility/FEATURE_GAPS.md)
 and [system gap plan](https://github.com/SB0LTD/ramsql/blob/main/compatibility/GAP_CLOSING_PLAN.md).
 
-The 17 unexecuted cases require scope/comparator work, not a claim of 17 proven
-engine absences. Prepared wire operations and selected session/transaction
-commands already have separate server tests. The 755 upstream standard records
+Prepared wire operations and selected session/transaction commands have separate
+server tests. The 755 upstream standard records
 still need reviewed applicability and mappings, including overloads beyond these
 118 probes. No full language or dialect closure follows from this inventory.
 
@@ -206,7 +206,28 @@ The in-process first slice is `contract-sql-distinct` in `test-sql`. The differe
 python tests/sql_conformance/audit.py --oracle-port 55491 --candidate-port 55492 --report .sig-cache/sql-audit.json
 ```
 
-Use owned disposable loopback test instances with trust authentication, matching database/user and extension/catalog setup. Each transaction fixture gets its own connection; disconnect rolls back. The harness compares typed metadata, command tags, transaction state, bags including multiplicity, NULLs and SQL errors. Cases with meaningful order must explicitly set `ordered: true`. OID-valued discovery cases need stable-object normalization before qualification; arbitrary database-local OIDs must never be equated directly. Session/cluster/COPY/native-dialect scopes are currently unexecuted and block qualification. Positive-oracle errors are reported as `oracle_invalid`. The audit always exits nonzero while only smoke coverage exists, including when every selected smoke passes. It does not silently skip gaps.
+Use owned disposable loopback test instances with trust authentication and
+matching database, user, extension and catalog setup. Each transaction fixture
+gets its own connection. Disconnect rolls back. The harness compares typed
+metadata, command tags, transaction state, bags including multiplicity, NULLs
+and SQL errors. Set `ordered: true` where the statement promises row order.
+OID-valued discovery cases need stable-object normalization before qualification.
+Positive-oracle errors are reported as `oracle_invalid`. The audit always exits
+nonzero while only smoke coverage exists, including when every selected smoke
+passes.
+
+The wire audit also reads the `COPY TO STDOUT` formats and exact byte stream
+for the fixed fixture. It accepts different `CopyData` frame boundaries. For
+`EXPLAIN (FORMAT JSON, ANALYZE)`, it validates the typed single JSON cell and
+plan structure and compares the actual number of rows produced at the root for
+one invocation. Physical operators and timing may differ. Session, cluster and
+native MySQL/T-SQL scopes still require dedicated fixtures.
+
+On 17 November 2026, this audit of the exact Windows x64 CI prerelease against
+native PostgreSQL 18.3 returned **93 passes, 10 mismatches and 15 unexecuted
+scopes**. `EXPLAIN` and `COPY ... FORCE_QUOTE` each returned `0A000` in the
+candidate. The run preserves the same 118-case inventory and records both
+servers' responses. [Audited prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.2-run.44099014318.1)
 
 `postgres18_oracle.json` records the native PostgreSQL 18.3 fixture run, including
 exact server version and manifest SHA-256 (UTF-8 with LF newlines): 102 valid programs and 16 unexecuted
@@ -226,9 +247,9 @@ fixture and fixed caller-owned test storage (8 tables, 16 columns, 32 rows/table
 64 result/work rows, 512-byte cells, 2048 expression nodes). These are test budgets,
 not production capacity claims. It checks column names, type OIDs, typmods, exact
 formatted scalar values, NULLs and row multiplicity/order after each statement.
-It does not test wire message tags, native SQL transaction commands, concurrency
-or crash durability. Such cases cannot be closed from this driver. EXPLAIN requires
-a structural comparator and remains unexecuted rather than comparing timing text.
+The core driver omits wire message tags, native SQL transaction commands,
+concurrency, crash durability, COPY streaming and EXPLAIN structure. Those
+checks run through the applicable wire and recovery suites.
 
 The broad generated suite deliberately returns an error while any feature or
 closure dimension is incomplete. Passing first-slice regressions and a red broad

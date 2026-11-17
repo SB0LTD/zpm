@@ -7,6 +7,7 @@ prevent qualification; identical rejection by both servers is NOT success.
 """
 import argparse
 from collections import Counter
+from decimal import Decimal, DecimalException
 import hashlib
 import json
 from pathlib import Path
@@ -65,6 +66,9 @@ class Pg:
         data = sql.encode() + b"\0"
         self.sock.sendall(b"Q" + struct.pack("!I", len(data) + 4) + data)
         result = {"columns": [], "rows": [], "command": None, "error": None}
+        copy_bytes = bytearray()
+        copy_formats = None
+        copy_done = False
         while True:
             kind, body = self.message()
             if kind == b"T":
@@ -88,10 +92,34 @@ class Pg:
                 result["rows"].append(row)
             elif kind == b"C":
                 result["command"] = body.rstrip(b"\0").decode()
+            elif kind == b"H":
+                if copy_formats is not None or len(body) < 3:
+                    raise ValueError("Invalid CopyOutResponse")
+                overall, count = struct.unpack("!BH", body[:3])
+                if overall not in (0, 1) or len(body) != 3 + 2 * count:
+                    raise ValueError("Invalid COPY output format")
+                formats = struct.unpack(f"!{count}H", body[3:])
+                if any(fmt not in (0, 1) for fmt in formats):
+                    raise ValueError("Invalid COPY column format")
+                copy_formats = [overall, *formats]
+            elif kind == b"d":
+                if copy_formats is None or copy_done:
+                    raise ValueError("CopyData outside COPY output")
+                copy_bytes.extend(body)
+            elif kind == b"c":
+                if copy_formats is None or copy_done or body:
+                    raise ValueError("Invalid CopyDone")
+                copy_done = True
+            elif kind in (b"G", b"W"):
+                raise ValueError("Audit fixture requires server-to-client COPY")
             elif kind == b"E":
                 result["error"] = self.error(body)
             elif kind == b"Z":
                 result["transaction"] = body.decode()
+                if copy_formats is not None and result["error"] is None:
+                    if not copy_done or not (result["command"] or "").startswith("COPY "):
+                        raise ValueError("Incomplete COPY output")
+                    result["copy"] = {"formats": copy_formats, "hex": copy_bytes.hex()}
                 return result
 
 
@@ -110,16 +138,55 @@ def run_case(port, args, manifest, case):
         connection.close()  # Disconnect aborts the isolated fixture transaction.
 
 
-def equivalent(left, right, ordered):
+def explain_measurement(result):
+    """Compare the observed final cardinality, permitting different physical plans."""
+    if result["command"] != "EXPLAIN" or result["columns"] != [["QUERY PLAN", 114, -1, -1, 0]]:
+        return None
+    if len(result["rows"]) != 1 or len(result["rows"][0]) != 1:
+        return None
+    try:
+        envelope = json.loads(result["rows"][0][0], parse_float=Decimal)
+        if not isinstance(envelope, list) or len(envelope) != 1:
+            return None
+        root = envelope[0]["Plan"]
+        pending = [root]
+        while pending:
+            node = pending.pop()
+            if not isinstance(node["Node Type"], str) or not node["Node Type"]:
+                return None
+            rows, loops = node["Actual Rows"], node["Actual Loops"]
+            if type(rows) not in (int, Decimal) or rows < 0:
+                return None
+            if type(loops) is not int or loops < 0:
+                return None
+            children = node.get("Plans", [])
+            if not isinstance(children, list):
+                return None
+            pending.extend(children)
+        rows = root["Actual Rows"]
+        if root["Actual Loops"] == 1 and rows == Decimal(rows).to_integral_value():
+            return rows
+    except (ValueError, TypeError, KeyError, DecimalException):
+        pass
+    return None
+
+
+def equivalent(left, right, ordered, comparator="exact"):
     if len(left) != len(right):
         return False
-    for a, b in zip(left, right):
+    for index, (a, b) in enumerate(zip(left, right)):
         # Object OIDs are not compared; type OIDs, typmods and formats are.
         if a["error"] or b["error"]:
             return False
         if any(a[key] != b[key] for key in ("columns", "command", "transaction")):
             return False
-        if ordered:
+        if a.get("copy") != b.get("copy"):
+            return False
+        if comparator == "explain_structure" and index == len(left) - 1:
+            actual = explain_measurement(a)
+            if actual is None or actual != explain_measurement(b):
+                return False
+        elif ordered:
             if a["rows"] != b["rows"]:
                 return False
         elif Counter(map(tuple, a["rows"])) != Counter(map(tuple, b["rows"])):
@@ -160,18 +227,23 @@ def main():
               "oracle_version": full_version["rows"], "cases": []}
     for case in selected:
         entry = {"id": case["id"], "status": "unexecuted_scope"}
-        if case["scope"] == "transaction" and case["dialect"] == "postgresql18":
+        if case["scope"] in ("transaction", "copy_protocol") and case["dialect"] == "postgresql18":
             try:
                 oracle = run_case(args.oracle_port, args, manifest, case)
+                comparator = case.get("comparator", "exact")
                 if any(item["error"] for item in oracle):
                     entry.update(status="oracle_invalid", oracle=oracle)
+                elif comparator == "explain_structure" and explain_measurement(oracle[-1]) is None:
+                    entry.update(status="oracle_invalid", oracle=oracle, detail="Invalid EXPLAIN ANALYZE plan")
+                elif case["scope"] == "copy_protocol" and oracle[-1].get("copy") is None:
+                    entry.update(status="oracle_invalid", oracle=oracle, detail="Missing COPY output")
                 elif args.oracle_only:
                     entry.update(status="oracle_valid", oracle=oracle)
-                elif case.get("comparator", "exact") != "exact":
+                elif comparator not in ("exact", "explain_structure"):
                     entry.update(status="unexecuted_comparator", oracle=oracle)
                 else:
                     candidate = run_case(args.candidate_port, args, manifest, case)
-                    passed = equivalent(oracle, candidate, case.get("ordered", False))
+                    passed = equivalent(oracle, candidate, case.get("ordered", False), comparator)
                     entry.update(status="smoke_pass" if passed else "fail", oracle=oracle, candidate=candidate)
             except (OSError, ValueError, RuntimeError) as error:
                 entry.update(status="harness_error", detail=str(error))
