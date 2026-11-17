@@ -30,6 +30,7 @@ pub const Config = struct {
     external_results: bool = false,
     /// Optional caller-backed committed integral scan projection. Old snapshots
     /// and own writes retain MVCC row scans. Currently external storage only.
+    /// TableBudget.omit_compact_scan leaves an individual table on MVCC scans.
     compact_integral_scans: bool = false,
     /// Optional conservative 256-bit presence summary per 64-row scan block
     /// and column. Borrowed external backing; exact comparisons remain required.

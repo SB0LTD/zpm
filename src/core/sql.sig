@@ -945,6 +945,9 @@ pub fn Database(comptime config: Config) type {
             /// index capacity and scans MVCC versions for the other indexes,
             /// including when enforcing uniqueness.
             secondary_hashes: ?usize = null,
+            /// Omit this slot's duplicate committed column projection.
+            /// Queries scan MVCC versions and can still use summaries.
+            omit_compact_scan: bool = false,
         };
 
         fn appendLayout(cursor: *usize, comptime T: type, count: usize) Error!usize {
@@ -976,13 +979,13 @@ pub fn Database(comptime config: Config) type {
                 offsets[1] = try appendLayout(&cursor, S.Version, versions);
                 offsets[2] = try appendLayout(&cursor, u32, ri);
                 offsets[3] = try appendLayout(&cursor, u32, ki);
-                const scan_rows = if (S.compact_enabled) rows else 0;
+                const scan_rows = if (S.compact_enabled and !budget.omit_compact_scan) rows else 0;
                 const scan_cells = @mulWithOverflow(scan_rows, config.columns);
                 if (scan_cells[1] != 0) return error.InvalidParameterValue;
                 offsets[4] = try appendLayout(&cursor, i64, scan_cells[0]);
                 offsets[5] = try appendLayout(&cursor, u64, scan_rows);
                 offsets[6] = try appendLayout(&cursor, u8, scan_rows);
-                offsets[7] = if(S.presence_enabled) try appendLayout(&cursor,u64,try S.presenceWords(rows)) else cursor;
+                offsets[7] = if (S.presence_enabled) try appendLayout(&cursor, u64, try S.presenceWords(scan_rows)) else cursor;
                 const hashes = budget.secondary_hashes orelse S.bound_indexes;
                 if (hashes > S.bound_indexes) return error.InvalidParameterValue;
                 const index_slots = @mulWithOverflow(ki, hashes);
@@ -1069,6 +1072,7 @@ pub fn Database(comptime config: Config) type {
             var backings: [config.tables]StorageBacking = undefined;
             for (&backings, layout.offsets, layout.row_index, layout.key_index, budgets) |*backing, offsets, ri, ki, budget| {
                 const hashes = budget.secondary_hashes orelse S.bound_indexes;
+                const scan_rows = if (S.compact_enabled and !budget.omit_compact_scan) budget.rows else 0;
                 backing.* = .{
                     .rows = try storageView(S.RowSlot, bytes, offsets[0], budget.rows),
                     .versions = try storageView(S.Version, bytes, offsets[1], budget.versions),
@@ -1077,10 +1081,11 @@ pub fn Database(comptime config: Config) type {
                     .integral_row_words = if (S.integral_enabled) budget.integral_row_words else {},
                     .row_index = try storageView(u32, bytes, offsets[2], ri),
                     .key_index = try storageView(u32, bytes, offsets[3], ki),
-                    .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) budget.rows * config.columns else 0),
-                    .scan_nonnull = try storageView(u64, bytes, offsets[5], if (S.compact_enabled) budget.rows else 0),
-                    .scan_live = try storageView(u8, bytes, offsets[6], if (S.compact_enabled) budget.rows else 0),
-                    .scan_presence = if(S.presence_enabled) try storageView(u64,bytes,offsets[7],try S.presenceWords(budget.rows)) else &.{},
+                    .scan_values = try storageView(i64, bytes, offsets[4], scan_rows * config.columns),
+                    .scan_nonnull = try storageView(u64, bytes, offsets[5], scan_rows),
+                    .scan_live = try storageView(u8, bytes, offsets[6], scan_rows),
+                    .scan_presence = if (S.presence_enabled) try storageView(u64, bytes, offsets[7], try S.presenceWords(scan_rows)) else &.{},
+                    .omit_compact_scan = budget.omit_compact_scan,
                     .index_slots = if (hashes != 0) try storageView(u32, bytes, offsets[8], ki * hashes) else &.{},
                     .scan_index_limit = if (hashes < S.bound_indexes) S.bound_indexes else 0,
                 };
