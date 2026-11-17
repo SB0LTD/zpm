@@ -377,6 +377,7 @@ pub fn Storage(comptime config: types.Config) type {
             /// Updates/aborts may discard a proof, never invent one. Not persisted.
             column_order: [config.columns]OrderProof = @splat(.{}),
             summary: Summary = .{},
+            /// Conservative bounds on integer cells and DATE day numbers.
             integer_bounds: [config.columns]IntegerBounds = @splat(.{}),
             rollups: [config.columns]Rollup = @splat(.{}),
             next_rowid: u64 = 0,
@@ -428,21 +429,29 @@ pub fn Storage(comptime config: types.Config) type {
             return 1 + @as(u32, @intFromBool(keyed(table)));
         }
 
+        fn observeBounds(bounds: *IntegerBounds, cell: *const V.Cell) void {
+            const value: i64 = switch (cell.*) {
+                .integer => cell.integer,
+                .date => cell.date,
+                else => return,
+            };
+            if (!bounds.known) {
+                bounds.* = .{ .known = true, .low = value, .high = value };
+            } else {
+                bounds.low = @min(bounds.low, value);
+                bounds.high = @max(bounds.high, value);
+            }
+        }
+
         /// Conservative hints recomputed from every allocated version after
-        /// a relayout: integer bounds, no order proof, no dense key directory.
+        /// a relayout: value bounds, no order proof, no dense key directory.
         pub fn rebuildHints(table: *Table) void {
             var row_scratch: VersionRowScratch = undefined;
             table.integer_bounds = @splat(.{});
             for (table.versions[0..table.version_high], 0..) |*version, index| {
                 if (version.row == 0) continue;
                 for (versionValues(table, index, &row_scratch), table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
-                    if (cell.* != .integer) continue;
-                    if (!bounds.known) {
-                        bounds.* = .{ .known = true, .low = cell.integer, .high = cell.integer };
-                    } else {
-                        bounds.low = @min(bounds.low, cell.integer);
-                        bounds.high = @max(bounds.high, cell.integer);
-                    }
+                    observeBounds(bounds, cell);
                 }
             }
             table.column_order = @splat(.{ .state = .unordered });
@@ -1365,13 +1374,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn indexKey(table: *Table, version: u32) void {
             var row_scratch: VersionRowScratch = undefined;
             for (versionValues(table, version, &row_scratch), table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
-                if (cell.* != .integer) continue;
-                if (!bounds.known) {
-                    bounds.* = .{ .known = true, .low = cell.integer, .high = cell.integer };
-                } else {
-                    bounds.low = @min(bounds.low, cell.integer);
-                    bounds.high = @max(bounds.high, cell.integer);
-                }
+                observeBounds(bounds, cell);
             }
             noteOrder(table, version);
             notePrimaryDirectory(table, version);
