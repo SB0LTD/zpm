@@ -138,7 +138,7 @@ pub fn read(file: anytype, scratch: []u8, expected: Seal, context: anytype, comp
         const bytes = scratch[0..count];
         try readExact(file, offset, bytes);
         hash.update(bytes);
-        if (receive != null) try receive(context, bytes);
+        if (comptime @TypeOf(receive) != @TypeOf(null)) try receive(context, bytes);
         offset += count;
     }
     hash.update(footer[0..8]);
