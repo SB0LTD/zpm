@@ -3786,8 +3786,13 @@ pub fn Parser(comptime config: types.Config) type {
             // Volatile sequence functions run on the general engine, which
             // evaluates every projection exactly once per row.
             const raw_name = name.span.slice(self.source);
+            if (self.tokens.dialect == .tds and !name.quoted and types.keyword(raw_name, "dateadd")) return self.tdsDateAdd(name);
             if (!name.quoted and (types.keyword(raw_name, "nextval") or types.keyword(raw_name, "setval"))) self.pool.complex = true;
             var call: ast.Node = .{ .kind = .function, .name = name };
+            if (self.tokens.dialect == .tds and !name.quoted and types.keyword(raw_name, "isnull")) {
+                self.last_native_syntax = name.span.start;
+                call.func = .tds_isnull;
+            }
             var first: u16 = none;
             if (try self.takeSymbol(.star)) {
                 call.star = true;
@@ -3839,6 +3844,32 @@ pub fn Parser(comptime config: types.Config) type {
             const n = &self.pool.nodes[node];
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
             return node;
+        }
+
+        fn tdsDateAdd(self: *Self, name: ast.Ident) Error!u16 {
+            if (self.current.kind != .word) return error.Syntax;
+            const unit = self.current.raw(self.source);
+            const part: ast.DateAddPart = blk: {
+                for ([_][]const u8{ "day", "dd", "d", "dayofyear", "dy", "y", "weekday", "dw", "w" }) |word| {
+                    if (types.keyword(unit, word)) break :blk .days;
+                }
+                for ([_][]const u8{ "week", "wk", "ww" }) |word| if (types.keyword(unit, word)) break :blk .weeks;
+                for ([_][]const u8{ "month", "mm", "m" }) |word| if (types.keyword(unit, word)) break :blk .months;
+                for ([_][]const u8{ "quarter", "qq", "q" }) |word| if (types.keyword(unit, word)) break :blk .quarters;
+                for ([_][]const u8{ "year", "yy", "yyyy" }) |word| if (types.keyword(unit, word)) break :blk .years;
+                return error.UnsupportedStatement;
+            };
+            self.last_native_syntax = name.span.start;
+            try self.advance();
+            try self.expectSymbol(.comma);
+            var parameters: ArgList = .{};
+            parameters.push(self.pool, try self.expression());
+            try self.expectSymbol(.comma);
+            parameters.push(self.pool, try self.expression());
+            try self.expectSymbol(.rparen);
+            const id = try self.callNode(name, .tds_dateadd, parameters);
+            self.pool.nodes[id].integer = @intFromEnum(part);
+            return id;
         }
 
         /// JSON_TABLE(context, 'path' [AS name] [PASSING value AS name, ...]

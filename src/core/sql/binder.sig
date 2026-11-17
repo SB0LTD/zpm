@@ -2200,6 +2200,31 @@ pub fn Binder(comptime config: types.Config) type {
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
+                .tds_dateadd => {
+                    if (context.dialect != .tds or count != 2) return error.UnsupportedStatement;
+                    const number = context.node(n.b);
+                    const date = context.node(number.next);
+                    if ((!value.integral(number.ty) and !knownNull(context, n.b)) or
+                        (date.ty != .date and !knownNull(context, number.next))) return error.UnsupportedStatement;
+                    try bindSignature(context, n, &.{ .int8, .date }, .date, false);
+                },
+                .tds_isnull => {
+                    if (context.dialect != .tds or count != 2) return error.UnsupportedStatement;
+                    const first = n.b;
+                    const second = context.node(first).next;
+                    const left = context.node(first).ty;
+                    const right = context.node(second).ty;
+                    if ((!value.integral(left) and !(left == .unknown and knownNull(context, first))) or
+                        (!value.integral(right) and !(right == .unknown and knownNull(context, second)))) return error.UnsupportedStatement;
+                    const target: ast.Type = if (left != .unknown) left else if (right != .unknown) right else .int4;
+                    const a = try convert(context, first, target, -1, .assignment);
+                    const b = try convert(context, second, target, -1, .assignment);
+                    context.node(a).next = b;
+                    context.node(b).next = none;
+                    n.b = a;
+                    n.ty = target;
+                    n.constant = isConstant(context, a) and isConstant(context, b);
+                },
                 .overlaps, .overlaps_tz => try typeOverlaps(context, n, count),
                 .aggregate_pair => unreachable,
                 .normalize, .is_normalized => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, if (n.func == .normalize) .text else .boolean, true),

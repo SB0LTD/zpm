@@ -295,6 +295,47 @@ fn nativeIdentifiersAndTop() !void {
     try check(result.rows[0].cells[0].integer == 1);
 }
 
+fn nativeDateAddAndIsNull() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    try check((try execute(&session, &db, "SELECT ISNULL(NULL,2), DATEADD(day,1,CAST('2025-01-01' AS date))"))[0] == 0x81);
+    try check(session.result.column_types[0] == .integer32 and session.result.column_types[1] == .date);
+    try check(session.result.rows[0].cells[0].integer == 2 and session.result.rows[0].cells[1].date == 9133);
+    for ([_][]const u8{
+        "DATEADD(week,-1,DATE '2025-01-05')=DATE '2024-12-29'",
+        "DATEADD(month,1,DATE '2024-01-31')=DATE '2024-02-29'",
+        "DATEADD(qq,1,DATE '2024-01-31')=DATE '2024-04-30'",
+        "DATEADD(year,1,DATE '2024-02-29')=DATE '2025-02-28'",
+        "DATEADD(day,0,DATE '9999-12-31')=DATE '9999-12-31'",
+        "DATEADD(day,NULL,DATE '2024-02-29') IS NULL",
+        "DATEADD(day,0,CAST(NULL AS DATE)) IS NULL",
+        "ISNULL(NULL,NULL) IS NULL",
+        "ISNULL(CAST(NULL AS BIGINT),2147483648)=2147483648",
+    }) |expression| {
+        var statement: [128]u8 = undefined;
+        const query = try std.fmt.bufPrint(&statement, "SELECT {s}", .{expression});
+        try check((try execute(&session, &db, query))[0] == 0x81);
+        try check(session.result.rows[0].cells[0].boolean);
+    }
+    const date_overflow = try execute(&session, &db, "SELECT DATEADD(day,-1,DATE '0001-01-01')");
+    try check(date_overflow[0] == 0xaa);
+    var date_error: Reader = .{ .source = date_overflow, .pos = 3 };
+    try check(try date_error.numeric(4) == 517);
+    const integer_overflow = try execute(&session, &db, "SELECT DATEADD(day,2147483648,DATE '2025-01-01')");
+    try check(integer_overflow[0] == 0xaa);
+    var integer_error: Reader = .{ .source = integer_overflow, .pos = 3 };
+    try check(try integer_error.numeric(4) == 8115);
+    for ([_][]const u8{
+        "SELECT DATEADD(second,1,DATE '2025-01-01')",
+        "SELECT DATEADD(day,1,'2025-01-01')",
+        "CREATE VIEW scoped_view AS SELECT DATEADD(day,1,DATE '2025-01-01') AS d",
+        "CREATE VIEW scoped_view AS SELECT ISNULL(NULL,1) AS n",
+    }) |statement| try check((try execute(&session, &db, statement))[0] == 0xaa);
+    try check(store.database.tableCount() == 0);
+}
+
 fn transactionManagerAndPreflight() !void {
     store = .{};
     var db: DB = .{ .store = &store, .id = 1 };
@@ -647,6 +688,7 @@ pub fn main(init: std.process.Init) !void {
     try typedRowsAndErrors();
     try dateResults();
     try nativeIdentifiersAndTop();
+    try nativeDateAddAndIsNull();
     try outputFragmentation();
     try transactionManagerAndPreflight();
     try concurrentCommittedVisibility();
