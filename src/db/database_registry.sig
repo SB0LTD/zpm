@@ -166,6 +166,12 @@ pub fn Registry(comptime Store: type, comptime name_capacity: usize) type {
             return self.metadataAt(self.find(name) orelse return null);
         }
 
+        /// Caller holds the registry guard for the duration of this borrow.
+        pub fn readyStoreAt(self: *const Self, index: usize) ?*const Store {
+            if (index >= self.entries.len or self.entries[index].state != .ready) return null;
+            return self.entries[index].store;
+        }
+
         /// Authorize before creating a lease. A rejected route never gives
         /// its caller a Store pointer or contributes to a database's clients.
         pub fn attach(self: *Self, name: []const u8, admission: Admission) Error!Binding {

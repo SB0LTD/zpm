@@ -305,6 +305,10 @@ pub fn Store(comptime Raw: type) type {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
         pub const PrepareFn = *const fn (?*anyopaque, []const u8) anyerror!u64;
+        pub const PreparedOperation = enum { prepare, resolve };
+        pub const PreparedCheck = if (PreparedWal != void)
+            *const fn (*const Self, *const PreparedWal.Gid, PreparedOperation) anyerror!void
+        else void;
         pub const prepared_capacity = if (PreparedWal != void) Raw.transaction_capacity else 0;
         pub const PreparedEntry = if (PreparedWal != void) struct {
             used: bool = false,
@@ -328,6 +332,9 @@ pub fn Store(comptime Raw: type) type {
         /// Uses the commit context and encode buffer. Returns the stable WAL
         /// sequence assigned to this prepare or resolution frame.
         prepare_fn: ?PrepareFn = null,
+        /// A cluster owner may enforce a shared prepared namespace and grant.
+        /// Calls run under the same serialization as WAL preparation.
+        prepared_check: if (PreparedWal != void) ?PreparedCheck else void = if (PreparedWal != void) null else {},
         prepared_limit: usize = 0,
         /// Physical store identity in this single-database engine. Startup
         /// `database` parameters are session labels and do not change it.
@@ -438,6 +445,10 @@ pub fn Store(comptime Raw: type) type {
             return null;
         }
 
+        pub fn hasPreparedGid(self: *const Self, gid: *const PreparedWal.Gid) bool {
+            return self.preparedIndex(gid) != null;
+        }
+
         pub fn preparedCount(self: *const Self) usize {
             var count: usize = 0;
             for (&self.prepared) |*entry| count += @intFromBool(entry.used);
@@ -467,6 +478,7 @@ pub fn Store(comptime Raw: type) type {
         fn prepareTransaction(self: *Self, slot: u16, gid: PreparedWal.Gid) !void {
             if (self.prepared_limit == 0 or self.prepare_fn == null) return error.ObjectNotInPrerequisiteState;
             const index = try self.freePrepared(&gid);
+            if (self.prepared_check) |check| try check(self, &gid, .prepare);
             if (self.preparedCount() >= self.prepared_limit or self.preparedCount() + 1 >= prepared_capacity) return error.TransactionCapacity;
             const at = self.wallNow() orelse return error.UnsupportedStatement;
             const payload = try self.database.prepareTransactionPayload(slot, gid, self.database_oid, at, self.encode_buffer);
@@ -477,6 +489,7 @@ pub fn Store(comptime Raw: type) type {
         }
 
         fn resolvePrepared(self: *Self, gid: PreparedWal.Gid, should_commit: bool) !void {
+            if (self.prepared_check) |check| try check(self, &gid, .resolve);
             const index = self.preparedIndex(&gid) orelse return error.UndefinedObject;
             const entry = &self.prepared[index];
             if (!self.database.canResolvePrepared(entry.metadata.owner)) return error.InsufficientPrivilege;
