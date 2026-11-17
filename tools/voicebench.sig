@@ -114,7 +114,17 @@ pub fn main(init: std.process.Init) void {
         out("open: {s}\n", .{@errorName(e)});
         linux.exit(1);
     };
-    ch.open(&g, ring, .{ .name = "zpm-voicebench" }) catch |e| {
+    // VB_NOTIFY=1: the channel writes each submission's fence to system
+    // memory as well, as gpud's channels for a guest do
+    var notify: u64 = 0;
+    for (init.minimal.environ.block.slice) |e| {
+        const kv = std.mem.span(e orelse continue);
+        if (!std.mem.startsWith(u8, kv, "VB_NOTIFY=")) continue;
+        const page: []align(4096) u8 = @alignCast(mapMemory(64 << 10));
+        notify = (g.mapSystem(page) catch linux.exit(1)).va;
+        out("the channel notifies (fences to system memory at 0x{x})\n", .{notify});
+    }
+    ch.open(&g, ring, .{ .name = "zpm-voicebench", .notify = notify }) catch |e| {
         out("channel: {s}\n", .{@errorName(e)});
         linux.exit(1);
     };
