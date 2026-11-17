@@ -294,6 +294,9 @@ pub fn main(init:std.process.Init) !void {
     try context.bindMemory(backing[0..scratch_bytes],512);
     try rejected(error.InvalidParameterValue,context.execute(db,"SELECT 1",snapshot,result));
     try context.bindMemory(&scratch[0],512);
+    try result.bindMemory(backing[0..32*@sizeOf(DB.Row)],32);
+    try rejected(error.InvalidParameterValue,context.execute(db,"SELECT 1",snapshot,result));
+    try result.bindMemory(&output[0],32);
     try context.execute(db,"SELECT COUNT(*) FROM points",snapshot,result);
     try check(result.rows[0].cells[0].integer==128);
     try context.execute(db,"SELECT COUNT(*) FROM pg_class",snapshot,result);

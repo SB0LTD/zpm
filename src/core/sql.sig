@@ -573,9 +573,9 @@ pub fn Database(comptime config: Config) type {
                 } else if (row_storage.len != 0 or rows_per_entry > Result.default_row_capacity) return error.InvalidParameterValue;
                 const spans = [_]StorageSpan{ try ReadContext.objectSpan(cache), try StorageSpan.of(entries), try StorageSpan.of(keys), try StorageSpan.of(row_storage) };
                 for (spans, 0..) |part, index| {
-                    try ReadContext.disjointDatabase(db, part);
                     for (spans[0..index]) |earlier| if (ReadContext.overlaps(part, earlier)) return error.InvalidParameterValue;
                 }
+                try ReadContext.disjointDatabase(db, &spans);
                 cache.* = .{ .database = db, .entries = entries, .keys = keys, .storage_spans = spans,
                     .key_capacity = keys.len / entries.len, .rows_per_entry = rows_per_entry };
                 for (entries, 0..) |*entry, index| {
@@ -1025,16 +1025,20 @@ pub fn Database(comptime config: Config) type {
             fn overlaps(a:StorageSpan,b:StorageSpan) bool {
                 return a.start<a.end and b.start<b.end and a.start<b.end and b.start<a.end;
             }
-            fn disjointDatabase(db: *const Self, part: StorageSpan) Error!void {
-                if (overlaps(part, try objectSpan(db))) return error.InvalidParameterValue;
+            fn disjointParts(parts: []const StorageSpan, backing_span: StorageSpan) Error!void {
+                if (backing_span.start == backing_span.end) return;
+                for (parts) |part| if (overlaps(part, backing_span)) return error.InvalidParameterValue;
+            }
+            fn disjointDatabase(db: *const Self, parts: []const StorageSpan) Error!void {
+                try disjointParts(parts, try objectSpan(db));
                 if (comptime config.external_workspace) {
-                    if (overlaps(part, try StorageSpan.of(db.workspace.query.cells[0..]))) return error.InvalidParameterValue;
+                    try disjointParts(parts, try StorageSpan.of(db.workspace.query.cells[0..]));
                 }
                 if (comptime config.external_storage) {
-                    if (overlaps(part, try StorageSpan.of(db.workspace.query.refs[0..]))) return error.InvalidParameterValue;
+                    try disjointParts(parts, try StorageSpan.of(db.workspace.query.refs[0..]));
                 }
                 for (&db.tables) |*table| inline for (storage_fields) |name| {
-                    if (overlaps(part, try StorageSpan.of(@field(table, name)[0..]))) return error.InvalidParameterValue;
+                    try disjointParts(parts, try StorageSpan.of(@field(table, name)[0..]));
                 };
             }
             fn validate(self:*Context,db:*const Self,source:[]const u8,result:?*Result) Error!void {
@@ -1050,8 +1054,8 @@ pub fn Database(comptime config: Config) type {
                 for(mutable,0..) |part,index| {
                     if(overlaps(part,source_span)) return error.InvalidParameterValue;
                     for(mutable[0..index]) |earlier| if(overlaps(part,earlier)) return error.InvalidParameterValue;
-                    try disjointDatabase(db, part);
                 }
+                try disjointDatabase(db, &mutable);
             }
             /// Callbacks in session (clock/zone resolver/control) must themselves
             /// be safe for concurrent reads. Sequence hooks are always disabled.
