@@ -470,6 +470,10 @@ fn settings() !void {
     try fails(tx, "SHOW nosuch", error.UndefinedSetting);
     try fails(tx, "SET nosuch = 1", error.UndefinedSetting);
     try expectMeta(tx, "SELECT set_config('tdd.level', '3', false)", "3", "set_config:25:-1");
+    try expectMeta(tx, "SELECT PG_CATALOG.set_config('tdd.level', '3', false)", "3", "set_config:25:-1");
+    try expect(tx, "SELECT \"pg_catalog\".\"current_setting\"('tdd.level')", "3");
+    try expect(tx, "SELECT 2 OPERATOR(pg_catalog.*) 3 + 4", "14");
+    try expect(tx, "SELECT 'tooling' OPERATOR(pg_catalog.~) '^tooling$' COLLATE pg_catalog.default", "t");
     try expect(tx, "SELECT current_setting('search_path'), current_setting('transaction_isolation')", "public|read committed");
     try commit(tx);
     tx = try db.begin();

@@ -4991,6 +4991,8 @@ pub fn Binder(comptime config: types.Config) type {
         /// Arguments are converted to the parameter types; the routine hook
         /// evaluates the body when the call runs.
         fn bindRoutineCall(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            // A pg_catalog-qualified call can never resolve a public routine.
+            if (n.qualifier.len != 0) return error.UndefinedFunction;
             const set = context.routines orelse return error.UndefinedFunction;
             const name = toName(context, n.name);
             var best: ?usize = null;

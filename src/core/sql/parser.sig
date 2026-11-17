@@ -3441,7 +3441,8 @@ pub fn Parser(comptime config: types.Config) type {
             if ((self.current.kind == .word and !lexer.reserved(self.current.keyword) and !niladic) or self.current.kind == .quoted_word) {
                 const after = try self.peek();
                 // COLLATE and SIMILAR (not lexer keywords) continue the expression.
-                if (ends(after) and !wordIs(self.source, after, "collate") and !wordIs(self.source, after, "similar") and !(typeWord(self.current) and multiwordType(self.current, after))) {
+                if (ends(after) and !wordIs(self.source, after, "collate") and !wordIs(self.source, after, "similar") and
+                    !wordIs(self.source, after, "operator") and !(typeWord(self.current) and multiwordType(self.current, after))) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .column, .name = name });
                 }
@@ -3653,8 +3654,18 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn otherTail(self: *Self, initial: u16) Error!u16 {
             var left = initial;
-            while (self.current.kind == .symbol) {
-                const op: ast.Op = switch (self.current.symbol) {
+            while (true) {
+                const qualified = self.mode == .standard and self.tokens.dialect == .postgres and
+                    self.rawWord("operator") and lparenNext(try self.peek());
+                if (qualified) {
+                    try self.advance();
+                    try self.expectSymbol(.lparen);
+                    try self.requireCatalogQualifier(try self.identifier());
+                    try self.expectSymbol(.dot);
+                    if (self.current.kind != .symbol) return error.Syntax;
+                } else if (self.current.kind != .symbol) break;
+                const symbol = self.current.symbol;
+                const op: ast.Op = switch (symbol) {
                     .concat => .concat,
                     .arrow => .arrow,
                     .arrow_text => .arrow_text,
@@ -3682,10 +3693,17 @@ pub fn Parser(comptime config: types.Config) type {
                     .at_question => .path_exists,
                     .at_at => .path_match,
                     .tilde, .regex_icase, .not_regex, .not_regex_icase => .regex_match,
-                    else => break,
+                    else => if (qualified) switch (symbol) {
+                        .plus => .add,
+                        .minus => .sub,
+                        .star => .mul,
+                        .slash => .div,
+                        .percent => .mod,
+                        else => self.comparisonOp() orelse return error.UndefinedFunction,
+                    } else break,
                 };
-                const symbol = self.current.symbol;
                 try self.advance();
+                if (qualified) try self.expectSymbol(.rparen);
                 const right = try self.additive();
                 left = try self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right,
                     .insensitive = symbol == .regex_icase or symbol == .not_regex_icase, .negated = symbol == .not_regex or symbol == .not_regex_icase });
@@ -3757,7 +3775,7 @@ pub fn Parser(comptime config: types.Config) type {
             var schema: ?ast.Ident = null;
             if (try self.takeSymbol(.dot)) {
                 schema = first;
-                name = try self.identifier();
+                name = if (self.tokens.dialect == .postgres) try self.label() else try self.identifier();
             }
             var buffer: [64]u8 = undefined;
             if (schema) |qualifier| {
@@ -3777,6 +3795,12 @@ pub fn Parser(comptime config: types.Config) type {
             if (ident.len > out.len) return null;
             identBytes(source, ident, out);
             return out[0..ident.len];
+        }
+
+        fn requireCatalogQualifier(self: *const Self, name: ast.Ident) Error!void {
+            var schema: [64]u8 = undefined;
+            const spelling = identText(self.source, name, &schema) orelse return error.UndefinedSchema;
+            if (!types.same(spelling, "pg_catalog")) return error.UnsupportedStatement;
         }
 
         fn identBytes(source: []const u8, ident: ast.Ident, out: []u8) void {
@@ -4648,6 +4672,12 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeSymbol(.dot)) {
                 if (self.mode == .standard and try self.takeSymbol(.star)) return self.pool.add(.{ .kind = .column, .star = true, .qualifier = name });
                 const column = try self.identifier();
+                if (self.mode == .standard and self.tokens.dialect == .postgres and self.isSymbol(.lparen)) {
+                    try self.requireCatalogQualifier(name);
+                    const call = try self.functionCall(column);
+                    self.pool.nodes[call].qualifier = name;
+                    return call;
+                }
                 return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = column, .qualifier = name }));
             }
             return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = name }));
