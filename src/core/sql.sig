@@ -289,6 +289,8 @@ pub fn Database(comptime config: Config) type {
             row_count: usize = 0,
             affected_rows: usize = 0,
             command: CommandTag = .none,
+            /// CREATE AS ran its source query, even if it produced zero rows.
+            create_query_data: bool = false,
             column_names: [config.columns]Name = @splat(.{}),
             column_types: [config.columns]DataType = @splat(.integer),
             /// PostgreSQL atttypmod of each column (-1 when none).
@@ -352,6 +354,7 @@ pub fn Database(comptime config: Config) type {
                 self.row_count = 0;
                 self.affected_rows = affected;
                 self.command = .none;
+                self.create_query_data = false;
             }
 
             /// Copy the observable result, without touching unused capacity.
@@ -368,6 +371,7 @@ pub fn Database(comptime config: Config) type {
                 self.row_count = source.row_count;
                 self.affected_rows = source.affected_rows;
                 self.command = source.command;
+                self.create_query_data = source.create_query_data;
                 @memcpy(self.column_names[0..source.column_count], source.column_names[0..source.column_count]);
                 @memcpy(self.column_types[0..source.column_count], source.column_types[0..source.column_count]);
                 @memcpy(self.column_typmods[0..source.column_count], source.column_typmods[0..source.column_count]);
@@ -388,7 +392,13 @@ pub fn Database(comptime config: Config) type {
             typmods: [config.columns]i32 = @splat(-1),
         };
 
-        pub const Outcome = struct { affected: usize = 0, command: CommandTag = .none, returning: Returned = .{}, noop: bool = false };
+        pub const Outcome = struct {
+            affected: usize = 0,
+            command: CommandTag = .none,
+            create_query_data: bool = false,
+            returning: Returned = .{},
+            noop: bool = false,
+        };
 
         /// A user schema slot: like a sequence slot, `creator` owns a pending
         /// CREATE or DROP; `dead_csn` marks a committed DROP until reclaimed.
@@ -1307,6 +1317,7 @@ pub fn Database(comptime config: Config) type {
             if (self.outcome.command == .select or self.outcome.command == .fetch or self.outcome.command == .show) return;
             result.clear(self.outcome.affected);
             result.command = self.outcome.command;
+            result.create_query_data = self.outcome.create_query_data;
             const returned = &self.outcome.returning;
             if (returned.count == 0) return;
             result.column_count = returned.count;
@@ -1827,7 +1838,11 @@ pub fn Database(comptime config: Config) type {
                 },
                 .select, .query, .control => unreachable,
             };
-            self.outcome = .{ .affected = affected, .command = B.command(&bound), .noop = bound == .noop };
+            const create_query_data = switch (bound) {
+                .create_table => |*create| create.plan != ast.none,
+                else => false,
+            };
+            self.outcome = .{ .affected = affected, .command = B.command(&bound), .create_query_data = create_query_data, .noop = bound == .noop };
             switch (bound) {
                 .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none, result.rows.len),
                 .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true, result.rows.len),
