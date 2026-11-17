@@ -2455,7 +2455,8 @@ pub fn Exec(comptime config: types.Config) type {
                                 const value=@as(i128,table.scan_values[@as(usize,item.column)*table.rows.len+slot])-domain.base;
                                 if(value<0 or value>=domain.span) return error.WorkspaceCapacity;
                                 const position:usize=@intCast(value);const mask=@as(u64,1)<<@as(u6,@intCast(position%64));
-                                const word=&seen[domain.offset+position/64];if(word.*&mask!=0) continue;word.*|=mask;
+                                seen[domain.offset+position/64] |= mask;
+                                continue;
                             }
                             channel.count+=1;
                             if(item.kind==.sum_integer or item.kind==.sum_wide) channel.total+=table.scan_values[@as(usize,item.column)*table.rows.len+slot];
@@ -2470,8 +2471,22 @@ pub fn Exec(comptime config: types.Config) type {
                 for(self.work.refs[map.dictionary..][0..map.groups]) |record| {
                     const bytes:[*]u8=@ptrCast(&self.work.cells[record+1+p.agg_count]);if(factorRows(bytes).*==0) continue;
                     var values:[config.columns]Accumulator=undefined;
-                    for(factorStates(bytes,p.agg_count),transitions[0..p.agg_count],values[0..p.agg_count]) |channel,item,*value|
+                    const seen = self.distinctWords(record + @as(u32, @intCast(record_base)), distinct.words);
+                    for (factorStates(bytes, p.agg_count), transitions[0..p.agg_count], p.aggs[0..p.agg_count], distinct.domains[0..p.agg_count], values[0..p.agg_count]) |channel, item, agg, domain, *value| {
                         value.*=.{.count=channel.count,.wide=channel.total,.integer=if(item.kind==.sum_integer) @intCast(channel.total) else 0};
+                        if (agg.distinct) {
+                            // Membership is idempotent. Counting set bits here removes
+                            // the duplicate branch and count update from the fact scan.
+                            const words = seen[domain.offset..][0..domain.words];
+                            var start_word: usize = 0;
+                            while (start_word < words.len) {
+                                try self.session.checkpoint();
+                                const end_word = start_word + @min(words.len - start_word, 256);
+                                for (words[start_word..end_word]) |word| value.count += @popCount(word);
+                                start_word = end_word;
+                            }
+                        }
+                    }
                     try self.projectGroup(p,record,values[0..p.agg_count],outer,&out);groups+=1;
                 }
                 const result=try self.finish(p,out);
