@@ -4393,10 +4393,7 @@ pub fn Exec(comptime config: types.Config) type {
 
         /// Runs the plan `root` and writes its rows into `result`.
         pub fn runQuery(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, root: u16, snap: storage.Snapshot, result: anytype, session: *const value_module.Session, work: *Work, committed_only: bool) Error!void {
-            work.reset();
-            var runner: Query = .{ .tables = tables, .source = source, .pool = pool, .plans = plans, .snap = snap, .session = session, .work = work, .committed_only = committed_only };
-            runner.hook = .{ .ptr = &runner, .run = Query.subquery };
-            const list = try runner.run(root, null);
+            const list = try executeQuery(tables, source, pool, plans, root, snap, session, work, committed_only);
             const p = &plans.items[root];
             if (list.count > result.rows.len) return error.RowCapacity;
             result.clear(0);
@@ -4408,15 +4405,25 @@ pub fn Exec(comptime config: types.Config) type {
                 result.column_typmods[column] = p.typmods[column];
             }
             result.row_count = list.count;
-            for (runner.handles(list), 0..) |offset, index| {
+            for (work.refs[list.start..][0..list.count], 0..) |offset, index| {
                 @memcpy(result.rows[index].cells[0..p.count], work.cells[offset..][0..p.count]);
             }
         }
         /// Runs a bound general query and leaves its output rows in `work`
         /// (INSERT ... SELECT); read them with rowAt until the next reset.
         pub fn queryRows(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, root: u16, snap: storage.Snapshot, session: *const value_module.Session, work: *Work) Error!List {
+            return executeQuery(tables, source, pool, plans, root, snap, session, work, false);
+        }
+
+        /// Execute ordinary plan operators and observe the completed root.
+        pub fn observeQuery(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, root: u16, snap: storage.Snapshot, session: *const value_module.Session, work: *Work, committed_only: bool) Error!SelectObservation {
+            const list = try executeQuery(tables, source, pool, plans, root, snap, session, work, committed_only);
+            return .{ .operation = .query_plan, .rows = list.count };
+        }
+
+        fn executeQuery(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, root: u16, snap: storage.Snapshot, session: *const value_module.Session, work: *Work, committed_only: bool) Error!List {
             work.reset();
-            var runner: Query = .{ .tables = tables, .source = source, .pool = pool, .plans = plans, .snap = snap, .session = session, .work = work };
+            var runner: Query = .{ .tables = tables, .source = source, .pool = pool, .plans = plans, .snap = snap, .session = session, .work = work, .committed_only = committed_only };
             runner.hook = .{ .ptr = &runner, .run = Query.subquery };
             return runner.run(root, null);
         }
@@ -4753,11 +4760,46 @@ pub fn Exec(comptime config: types.Config) type {
             return found;
         }
 
+        pub const SelectOperation = enum {
+            select_plan, query_plan, result, limit, primary_lookup, table_scan,
+            ordered_scan, primary_walk, compact_filter, integer_top_k, sort, lock_rows,
+
+            pub fn name(operation: SelectOperation) []const u8 {
+                return switch (operation) {
+                    .select_plan => "Select Plan",
+                    .query_plan => "Query Plan",
+                    .result => "Result",
+                    .limit => "Limit",
+                    .primary_lookup => "Primary Key Lookup",
+                    .table_scan => "Table Scan",
+                    .ordered_scan => "Ordered Table Scan",
+                    .primary_walk => "Primary Key Walk",
+                    .compact_filter => "Compact Filter Scan",
+                    .integer_top_k => "Integer Top-N Scan",
+                    .sort => "Sort",
+                    .lock_rows => "Lock Rows",
+                };
+            }
+        };
+
+        pub const SelectObservation = struct { operation: SelectOperation, rows: usize = 0 };
+
         /// `locker` (FOR UPDATE/SHARE) runs after ORDER BY and before LIMIT, as
         /// PostgreSQL's LockRows does: it returns the version to emit (the
         /// newest committed one, whose WHERE is re-checked here when it
         /// changed), null to skip the row, or WouldBlock to park.
         pub fn select(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype, session: *const value_module.Session, committed_only: bool, stats: *ReadStats, work: *Work) Error!void {
+            return selectMode(tables, source, pool, query, snap, result, locker, session, committed_only, stats, work, null);
+        }
+
+        pub fn observeSelect(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, locker: anytype, session: *const value_module.Session, committed_only: bool, stats: *ReadStats, work: *Work) Error!SelectObservation {
+            var observation: SelectObservation = .{ .operation = .limit };
+            try selectMode(tables, source, pool, query, snap, {}, locker, session, committed_only, stats, work, &observation);
+            return observation;
+        }
+
+        fn selectMode(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, query: *const B.Select, snap: storage.Snapshot, result: anytype, locker: anytype, session: *const value_module.Session, committed_only: bool, stats: *ReadStats, work: *Work, observation: anytype) Error!void {
+            const observing = @TypeOf(observation) != @TypeOf(null);
             try session.checkpoint();
             var ctx: E.Context = .{ .source = source, .pool = pool, .session = session };
             var plain = true;
@@ -4768,12 +4810,19 @@ pub fn Exec(comptime config: types.Config) type {
                 var produced = false;
                 if (query.limit != 0 and try keep(&ctx, query.where, null)) {
                     ctx.row = null;
-                    for (query.targets[0..query.count], 0..) |id, column| row[column] = try E.eval(&ctx, id);
+                    for (query.targets[0..query.count], 0..) |id, column| {
+                        const cell = try E.eval(&ctx, id);
+                        if (comptime !observing) row[column] = cell;
+                    }
                     produced = true;
                 }
-                writeHeader(query, result);
-                result.row_count = @intFromBool(produced);
-                if (produced) @memcpy(result.rows[0].cells[0..query.count], row[0..query.count]);
+                if (comptime observing) {
+                    observation.* = .{ .operation = if (query.limit == 0) .limit else .result, .rows = @intFromBool(produced) };
+                } else {
+                    writeHeader(query, result);
+                    result.row_count = @intFromBool(produced);
+                    if (produced) @memcpy(result.rows[0].cells[0..query.count], row[0..query.count]);
+                }
                 return;
             }
             const table_index = query.table.?;
@@ -4792,8 +4841,11 @@ pub fn Exec(comptime config: types.Config) type {
             const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query };
             const stable: StableSorter = .{ .base = &sorter };
             if (query.limit != 0) switch (try candidates(&ctx, table, query.key, snap)) {
-                .empty => {},
+                .empty => if (comptime observing) {
+                    observation.operation = .primary_lookup;
+                },
                 .slot => |hit| {
+                    if (comptime observing) observation.operation = .primary_lookup;
                     const version = hit.version;
                     if (try keep(&ctx, query.where, &table.versions[version].cells)) {
                         indices[0] = version;
@@ -4801,7 +4853,9 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 },
                 .scan => scan: {
+                  if (comptime observing) observation.operation = .table_scan;
                   if (layout_reverse) |reverse| {
+                    if (comptime observing) observation.operation = .ordered_scan;
                     var offset: usize = 0;
                     while (offset < table.row_high) : (offset += 1) {
                         try session.checkpoint();
@@ -4817,13 +4871,16 @@ pub fn Exec(comptime config: types.Config) type {
                   }
                   if (!locking and column_order and query.order_count != 0 and query.limit <= indices.len) {
                     if (try densePrimaryScan(&ctx, table, query, snap, indices, committed_only, stats)) |count| {
+                        if (comptime observing) observation.operation = .primary_walk;
                         found = count;ordered = true;break :scan;
                     }
                   }
                   if(!locking and !top_k) if(try projectedFilterScan(&ctx,table,query,snap,indices,committed_only,stats)) |count| {
+                    if (comptime observing) observation.operation = .compact_filter;
                     found=count;break :scan;
                   };
                   if (top_k and query.limit <= integer_topk_capacity and integerOrder(pool, query)) {
+                    if (comptime observing) observation.operation = .integer_top_k;
                     found = try integerTopK(&ctx, table, query, snap, indices, committed_only, stats);
                   } else for (0..table.row_high) |slot| {
                     try session.checkpoint();
@@ -4841,6 +4898,7 @@ pub fn Exec(comptime config: types.Config) type {
                 },
             };
             if (query.order_count != 0 and found != 0 and !ordered) {
+                if (comptime observing) observation.operation = .sort;
                 // Sort keys are evaluated for every candidate row, so an
                 // erroring key fails even when one row (or none) is compared.
                 for (query.order[0..query.order_count]) |*key| if (!simple(pool, key.expr)) {
@@ -4858,6 +4916,7 @@ pub fn Exec(comptime config: types.Config) type {
                 } else try sorter.sort(indices[0..found]);
             }
             if (locking) {
+                if (comptime observing) observation.operation = .lock_rows;
                 // LockRows: lock in output order; LIMIT counts locked rows.
                 var kept: usize = 0;
                 for (0..found) |position| {
@@ -4871,13 +4930,18 @@ pub fn Exec(comptime config: types.Config) type {
                 found = kept;
             }
             const rows: usize = if (query.limit < found) @intCast(query.limit) else found;
-            if (rows > result.rows.len) return error.WorkspaceCapacity;
+            if (comptime !observing) if (rows > result.rows.len) return error.WorkspaceCapacity;
             if (!plain) {
                 // Validation pass: projections may fail; the result is untouched.
                 for (indices[0..rows]) |version| {
                     ctx.row = &table.versions[version].cells;
                     for (query.targets[0..query.count]) |id| _ = try E.eval(&ctx, id);
                 }
+            }
+            if (comptime observing) {
+                if (query.limit < 0xffffffffffffffff) observation.operation = .limit;
+                observation.rows = rows;
+                return;
             }
             // Validation accounted for every expression and may fail/cancel.
             // Publishing the validated result must remain infallible.
