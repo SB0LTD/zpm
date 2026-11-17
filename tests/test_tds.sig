@@ -217,6 +217,44 @@ fn outputFragmentation() !void {
     try check(packets >= 5);
 }
 
+fn dateResults() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    const payload = try execute(&session, &db,
+        "SELECT DATE '0001-01-01' AS lo, DATE '2000-01-01' AS epoch, DATE '9999-12-31' AS hi, CAST(NULL AS DATE) AS empty");
+    var reader: Reader = .{ .source = payload };
+    try check(try reader.numeric(1) == 0x81 and try reader.numeric(2) == 4);
+    for ([_][]const u8{ "lo", "epoch", "hi", "empty" }) |name| {
+        _ = try reader.take(6);
+        try check(try reader.numeric(1) == 0x28);
+        try check(try reader.numeric(1) == name.len);
+        for (name) |byte| try check(try reader.numeric(2) == byte);
+    }
+    try check(try reader.numeric(1) == 0xd1);
+    for ([_]u32{ 0, 730119, 3652058 }) |date| {
+        try check(try reader.numeric(1) == 3);
+        try check(try reader.numeric(3) == date);
+    }
+    try check(try reader.numeric(1) == 0 and try reader.numeric(1) == 0xfd);
+    try check((try execute(&session, &db, "SELECT DATE 'infinity'"))[0] == 0xaa);
+    try check((try execute(&session, &db, "SELECT DATE '10000-01-01'"))[0] == 0xaa);
+    try check((try execute(&session, &db, "SELECT DATE '2024-02-29'"))[0] == 0x81);
+
+    var old: Session = .{};
+    var old_db: DB = .{ .store = &store, .id = 2 };
+    _ = try old.handle(&old_db, packet(0x12, 1, 0, &prelogin), &output);
+    var buffer: [256]u8 = undefined;
+    const login_packet = login(&buffer, 0, "ramsql");
+    number(buffer[4..8], 0x72090002);
+    try check(!(try old.handle(&old_db, packet(0x10, 1, 1, login_packet), &output)).close);
+    const legacy = try execute(&old, &old_db, "SELECT DATE '2000-01-01' AS epoch");
+    try check(legacy[0] == 0x81 and legacy[9] == 0xe7);
+    try check(old.result.column_types[0] == .text);
+    try same(old.result.rows[0].cells[0].text.slice(), "2000-01-01");
+}
+
 fn nativeIdentifiersAndTop() !void {
     store = .{};
     var db: DB = .{ .store = &store, .id = 1 };
@@ -607,6 +645,7 @@ fn malformedAndFuzz() !void {
 pub fn main(init: std.process.Init) !void {
     try loginAndFragmentation();
     try typedRowsAndErrors();
+    try dateResults();
     try nativeIdentifiersAndTop();
     try outputFragmentation();
     try transactionManagerAndPreflight();

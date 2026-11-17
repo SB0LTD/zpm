@@ -336,9 +336,19 @@ pub fn Database(comptime config: Config) type {
             /// without native metadata for the other types (MySQL/TDS, flag
             /// F-M). A value longer than Config.text_bytes is TextCapacity.
             pub fn textify(self: *Result, session: *const value_module.Session) Error!void {
+                return self.textifyColumns(session, false);
+            }
+
+            /// TDS 7.3 and later can encode DATE without formatting the cells.
+            pub fn textifyWithDate(self: *Result, session: *const value_module.Session) Error!void {
+                return self.textifyColumns(session, true);
+            }
+
+            fn textifyColumns(self: *Result, session: *const value_module.Session, keep_date: bool) Error!void {
                 for (0..self.column_count) |column| {
                     switch (self.column_types[column]) {
                         .integer, .integer32, .boolean, .text => continue,
+                        .date => if (keep_date) continue,
                         .smallint, .oid => {
                             self.column_types[column] = .integer;
                             continue;
