@@ -551,6 +551,41 @@ pub fn Eval(comptime config: types.Config) type {
 
         /// nextval/currval/setval/lastval and identity defaults through the
         /// session's sequence hook (strict: a NULL argument gives NULL).
+        fn mysqlDateAdd(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const base = try eval(ctx, n.b);
+            const amount = try eval(ctx, node(ctx, n.b).next);
+            if (base == .null_value or amount == .null_value) return .null_value;
+            const days = switch (base) {
+                .date => base.date,
+                .text, .bpchar => blk: {
+                    const text = if (base == .text) base.text.slice() else base.bpchar.slice();
+                    if (text.len != 10 or text[4] != '-' or text[7] != '-') return error.UnsupportedStatement;
+                    for (text, 0..) |byte, index| {
+                        if (index != 4 and index != 7 and (byte < '0' or byte > '9')) return error.UnsupportedStatement;
+                    }
+                    if (types.same(text[0..4], "0000")) return error.UnsupportedStatement;
+                    break :blk temporal.parseDate(text) catch return .null_value;
+                },
+                else => unreachable,
+            };
+            const earliest = temporal.dateOf(1, 1, 1);
+            const latest = temporal.dateOf(9999, 12, 31);
+            if (days < earliest or days > latest) return error.UnsupportedStatement;
+            const result = if (n.integer == 0)
+                temporal.datePlusDays(days, amount.integer) catch return .null_value
+            else blk: {
+                if (amount.integer < -120000 or amount.integer > 120000) return .null_value;
+                const stamp = try temporal.dateToTimestamp(days);
+                const shifted = temporal.timestampPlus(stamp, .{ .months = @intCast(amount.integer), .days = 0, .us = 0 }) catch return .null_value;
+                break :blk @as(i32, @intCast(@divFloor(shifted, temporal.usecs_per_day)));
+            };
+            if (result < earliest) return error.UnsupportedStatement;
+            if (result > latest) return .null_value;
+            if (n.ty == .date) return .{ .date = result };
+            var buffer: [10]u8 = undefined;
+            return Io.parse(.bpchar, -1, temporal.formatDate(result, &buffer), ctx.session);
+        }
+
         fn sequenceValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
             switch (n.func) {
@@ -1162,6 +1197,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
                 .function => switch (n.func) {
+                    .mysql_date_add => return mysqlDateAdd(ctx, n),
                     .grouping => {
                         var value:i64=0;var item=n.b;
                         while(item!=none):(item=node(ctx,item).next) {
@@ -1381,7 +1417,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .routine_param => return routineValue(ctx, n),
                     // Exec.collectAggregate / jsonTableRows read their members (B11).
                     .aggregate_input, .json_table, .json_table_passing, .json_table_column => return error.UnsupportedStatement,
-                    .none => unreachable,
+                    .none, .mysql_ifnull => unreachable,
                 },
                 // $n of an EXECUTEd SQL prepared statement (tx-session lane).
                 .param => {

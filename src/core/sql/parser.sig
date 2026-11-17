@@ -4118,6 +4118,34 @@ pub fn Parser(comptime config: types.Config) type {
             while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
         }
 
+        fn mysqlFunction(self: *Self, date_add: bool) Error!u16 {
+            const start = self.current.start;
+            self.last_native_syntax = start;
+            const name = try self.identifier();
+            try self.expectSymbol(.lparen);
+            try self.enter();
+            defer self.leave();
+            var args: ArgList = .{};
+            args.push(self.pool, try self.expression());
+            try self.expectSymbol(.comma);
+            if (date_add and !try self.takeRaw("interval")) return error.Syntax;
+            args.push(self.pool, try self.expression());
+            var months = false;
+            if (date_add and !try self.takeRaw("day")) {
+                if (!try self.takeRaw("month")) return error.UnsupportedStatement;
+                months = true;
+            }
+            const end = self.current.end;
+            try self.expectSymbol(.rparen);
+            const id = try self.callNode(name, if (date_add) .mysql_date_add else .mysql_ifnull, args);
+            const node = &self.pool.nodes[id];
+            if (!date_add) node.kind = .coalesce;
+            // Native column labels keep the original expression text.
+            node.text = .{ .start = start, .end = end, .len = end - start };
+            node.integer = @intFromBool(months);
+            return id;
+        }
+
         /// SQL-syntax functions of gram.y func_expr_common_subexpr: TRIM,
         /// SUBSTRING, POSITION and OVERLAY, plus LEFT/RIGHT (reserved join
         /// words that also name functions). The current word precedes `(`.
@@ -4385,6 +4413,10 @@ pub fn Parser(comptime config: types.Config) type {
                     return self.pool.add(.{ .kind = .function, .name = name, .func = if (session) .session_user else .current_user });
                 }
                 if (self.mode == .standard and lparenNext(try self.peek())) {
+                    if (self.tokens.dialect == .mysql) {
+                        if (self.rawWord("ifnull")) return self.mysqlFunction(false);
+                        if (self.rawWord("date_add")) return self.mysqlFunction(true);
+                    }
                     if (try self.specialFunction()) |id| return id;
                 }
                 if ((self.isWord("GREATEST") or self.isWord("LEAST")) and lparenNext(try self.peek())) {

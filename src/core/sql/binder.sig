@@ -2056,6 +2056,17 @@ pub fn Binder(comptime config: types.Config) type {
                     if(scope.saw_aggregate) |flag| flag.*=true;
                 },
                 .window_call => unreachable,
+                .mysql_ifnull => unreachable, // Parsed directly as COALESCE.
+                .mysql_date_add => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const date = context.node(n.b);
+                    const amount = context.node(date.next);
+                    if (!value.integral(amount.ty) and amount.kind != .null_literal) return error.UnsupportedStatement;
+                    if (date.ty == .unknown) try coerce(context, n.b, .text);
+                    n.ty = if (date.ty == .date) .date else if (value.characterType(date.ty)) .bpchar else return error.UnsupportedStatement;
+                    if (n.ty == .bpchar) n.typmod = ast.mysql_date_text_typmod;
+                    n.constant = listConstant(context, n.b);
+                },
                 .routine, .routine_param => {},
                 .none => return bindRoutineCall(context, n, count),
                 .aggregate_input => return,
@@ -3897,13 +3908,20 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = constant;
                 },
                 .coalesce => {
+                    const mysql = n.func == .mysql_ifnull;
                     var result: ast.Type = .unknown;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
                         try typeExpr(context, scope, item);
-                        try unifyInto(&result, context.node(item).ty);
+                        const arg = context.node(item);
+                        if (mysql and arg.ty != .int4 and arg.ty != .int8 and arg.kind != .null_literal) return error.UnsupportedStatement;
+                        const ty: ast.Type = if (mysql and mysqlSignedLiteral(context, item) != null) .int8 else arg.ty;
+                        try unifyInto(&result, ty);
                     }
-                    if (result == .unknown) result = .text;
+                    if (result == .unknown) {
+                        if (mysql) return error.UnsupportedStatement;
+                        result = .text;
+                    }
                     if (value.integral(result)) {
                         item = n.b;
                         while (item != none) : (item = context.node(item).next) try coerce(context, item, result);
@@ -4149,6 +4167,9 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn targetName(context: *const Context, id: u16) V.Name {
             var buffer: V.Name = .{};
+            const n = context.node(id);
+            if (n.func == .mysql_ifnull or n.func == .mysql_date_add)
+                return literalName(context.source[n.text.start..n.text.end]);
             const result = figure(context, id, &buffer);
             return literalName(result.name);
         }
@@ -4436,7 +4457,7 @@ pub fn Binder(comptime config: types.Config) type {
             return switch (n.kind) {
                 .column, .cast => n.typmod,
                 // A subscript keeps the array's typmod (reftypmod).
-                .function => if (n.func == .array_subscript or n.func == .xmlserialize) n.typmod else -1,
+                .function => if (n.func == .array_subscript or n.func == .xmlserialize or n.func == .mysql_date_add) n.typmod else -1,
                 else => -1,
             };
         }
