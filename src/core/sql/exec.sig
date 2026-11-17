@@ -4621,7 +4621,21 @@ pub fn Exec(comptime config: types.Config) type {
             }
         }
 
-        fn writeHeader(query: *const B.Select, result: anytype) void {
+        /// The binder proved a single integral primary-key equality and
+        /// direct output columns. A NULL key never matches.
+        pub fn selectPrimaryKey(table: *const S.Table, query: *const B.Select, columns: []const u16, key: *const V.Cell, snap: storage.Snapshot, result: anytype, session: *const value_module.Session) Error!void {
+            try session.checkpoint();
+            const version = if (key.* == .null_value) null else S.lookupVersionAt(table, key, snap);
+            if (version != null and result.rows.len == 0) return error.WorkspaceCapacity;
+            writeHeader(query, result);
+            if (version) |entry| {
+                const cells = &table.versions[entry].cells;
+                for (columns, 0..) |column, index| result.rows[0].cells[index] = cells[column];
+                result.row_count = 1;
+            }
+        }
+
+        pub fn writeHeader(query: *const B.Select, result: anytype) void {
             result.clear(0);
             result.command = .select;
             result.column_count = query.count;

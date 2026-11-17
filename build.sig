@@ -165,6 +165,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-grouping-rollup", "tests/test_sql_grouping_rollup.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-query-composition", "tests/test_sql_query_composition.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-ordered-probes", "tests/test_sql_ordered_probes.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-parameterized-lookup", "tests/test_sql_parameterized_lookup.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-compact-scan", "tests/test_sql_compact_scan.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-runtime-workspace", "tests/test_sql_runtime_workspace.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-ddl-core", "tests/test_sql_ddl_core.sig", &.{importEntry("sql", "src/core/sql.sig")});
