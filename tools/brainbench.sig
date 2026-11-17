@@ -370,6 +370,65 @@ pub fn main(init: std.process.Init) void {
         b.freeCache(&gc);
     }
 
+    // 1b. BB_ROWS: speaking's steps, rows in and the hidden state out (the
+    // speech loop: a prompt, then one embedding row a frame), the GPU's
+    // against the CPU's, step by step. Each next row is the CPU's last
+    // hidden state, scaled, on both.
+    if (env(environ, "BB_ROWS") != null) {
+        const h = plan.hidden_size;
+        out("rows: a prompt of 40, then rows\n", .{});
+        var gc = b.newCache(CONTEXT) catch |e| {
+            out("rows cache: {s}\n", .{@errorName(e)});
+            linux.exit(1);
+        };
+        var cc = executor.Cache{
+            .kv = cpu_kv[0 .. executor.requiredKvElements(&plan, LIMITS.context) catch linux.exit(1)],
+            .conv = cpu_conv[0 .. executor.requiredConvElements(&plan) catch linux.exit(1)],
+            .context = LIMITS.context,
+        };
+        cc.reset();
+        const p = tokens[0..40];
+        // (the CPU's batches are 16 tokens at most)
+        var at: usize = 0;
+        while (at + 16 < p.len) : (at += 16) {
+            _ = executor.forwardInput(CAP, LIMITS, src, &index, &plan, &unpacked, &cpu_work, &cc, .{ .tokens = p[at .. at + 16] }, .none, .{}) catch |e| {
+                out("cpu prompt: {s}\n", .{@errorName(e)});
+                linux.exit(1);
+            };
+        }
+        _ = executor.forwardInput(CAP, LIMITS, src, &index, &plan, &unpacked, &cpu_work, &cc, .{ .tokens = p[at..] }, .hidden, .{}) catch |e| {
+            out("cpu prompt: {s}\n", .{@errorName(e)});
+            linux.exit(1);
+        };
+        _ = b.forward(&gc, .{ .tokens = p }, .hidden) catch |e| {
+            out("gpu prompt: {s}\n", .{@errorName(e)});
+            linux.exit(1);
+        };
+        var row: [4096]f32 = undefined;
+        for (0..24) |step| {
+            var scale: f32 = 0;
+            var diff: f32 = 0;
+            const cpu_h = cpu_work.normalized[0..h];
+            const gpu_h = b.hidden()[0..h];
+            for (cpu_h, gpu_h) |x, y| {
+                scale = @max(scale, @abs(x));
+                diff = @max(diff, @abs(x - y));
+            }
+            out("rows step {d:2}: hidden within {e} of its largest ({e})\n", .{ step, diff / @max(scale, 1e-6), scale });
+            for (row[0..h], cpu_h) |*r, x| r.* = x * 0.25;
+            _ = executor.forwardInput(CAP, LIMITS, src, &index, &plan, &unpacked, &cpu_work, &cc, .{ .embeddings = row[0..h] }, .hidden, .{}) catch |e| {
+                out("cpu rows: {s}\n", .{@errorName(e)});
+                linux.exit(1);
+            };
+            _ = b.forward(&gc, .{ .embeddings = row[0..h] }, .hidden) catch |e| {
+                out("gpu rows: {s}\n", .{@errorName(e)});
+                linux.exit(1);
+            };
+        }
+        b.freeCache(&gc);
+        if (std.mem.eql(u8, env(environ, "BB_ROWS").?, "only")) linux.exit(0);
+    }
+
     // 2. prompt reading
     var lens: [8]usize = undefined;
     var nl: usize = 0;
