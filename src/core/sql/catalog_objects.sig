@@ -270,7 +270,11 @@ pub const Statement = union(enum) {
 /// statement (nothing is reported then: the main parser takes it).
 /// Recognized but unsupported forms are 0A000; malformed ones 42601.
 pub fn parse(source: []const u8, comptime name_bytes: usize, comptime text_bytes: usize) Error!?Statement {
-    var p: Parser = .{ .tokens = .{ .source = source, .text_limit = text_bytes }, .source = source, .name_bytes = name_bytes };
+    return parseWithDialect(source, name_bytes, text_bytes, .postgres);
+}
+
+pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime text_bytes: usize, dialect: types.Dialect) Error!?Statement {
+    var p: Parser = .{ .tokens = .{ .source = source, .text_limit = text_bytes, .dialect = dialect }, .source = source, .name_bytes = name_bytes };
     try p.advance();
     if (try p.take("create")) {
         if (try p.take("domain")) return .{ .create_domain = try p.createDomain() };
@@ -679,6 +683,7 @@ const Parser = struct {
         var depth: usize = 1;
         while (true) {
             if (self.current.kind == .end) return error.Syntax;
+            if (self.current.backtickIdentifier(self.source)) return error.UnsupportedStatement;
             if (self.symbol(.lparen)) depth += 1;
             if (self.symbol(.rparen)) {
                 depth -= 1;

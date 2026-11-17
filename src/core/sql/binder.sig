@@ -693,7 +693,7 @@ pub fn Binder(comptime config: types.Config) type {
             var out: V.Name = .{ .len = ident.len };
             const raw = ident.span.slice(context.source);
             if (ident.quoted) {
-                lexer.decodeQuotedWith(context.source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, '"', &out.bytes);
+                lexer.decodeQuotedIdentifier(context.source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, &out.bytes);
             } else for (raw, 0..) |byte, index| out.bytes[index] = types.lower(byte);
             return out;
         }
@@ -5222,7 +5222,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn bindModifyingCte(context: *const Context, cte: *const Ast.Cte, id: u8) Error!void {
             const plans = plansOf(context);
             if (plans.dml_len == config.ctes) return error.StatementTooComplex;
-            const statement = try P.parseNested(context.source, cte.dml_start, context.pool);
+            const statement = try P.parseNestedWithDialect(context.source, cte.dml_start, context.pool, context.dialect);
             var nested = context.*;
             nested.nested_dml = true;
             const bound = try bindStatement(&nested, &statement);

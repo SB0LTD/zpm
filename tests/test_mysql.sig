@@ -250,9 +250,84 @@ fn connectReady(session: *Session, db: *DB) !void {
     try check(session.authenticated);
 }
 
+fn nativeIdentifierAndLimit() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+
+    _ = try command(&session, &db, "SELECT 1 AS `value`");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 1);
+    try same(session.result.column_names[0].slice(), "value");
+    _ = try command(&session, &db, "CREATE TABLE `tdd_a`(`id` INT PRIMARY KEY,`v``x` INT)");
+    try check(output[4] == 0);
+    _ = try command(&session, &db, "INSERT INTO `tdd_a`(`id`,`v``x`) VALUES(1,10),(2,20),(3,30),(4,40)");
+    try check(output[4] == 0);
+    _ = try command(&session, &db, "SELECT id FROM tdd_a ORDER BY id LIMIT 1,2");
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[0].integer == 2 and session.result.rows[1].cells[0].integer == 3);
+    _ = try command(&session, &db, "SELECT `a`.`v``x` AS `x``y` FROM `tdd_a` AS `a` ORDER BY `a`.`id` DESC LIMIT 1,1");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 30);
+    try same(session.result.column_names[0].slice(), "x`y");
+    _ = try command(&session, &db, "SELECT id FROM tdd_a ORDER BY id LIMIT 0,0");
+    try check(session.result.row_count == 0 and session.result.column_count == 1);
+    _ = try command(&session, &db, "SELECT id FROM tdd_a ORDER BY id LIMIT 10,2");
+    try check(session.result.row_count == 0 and session.result.column_count == 1);
+    _ = try command(&session, &db, "SELECT id FROM tdd_a ORDER BY id LIMIT 2 OFFSET 1");
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[0].integer == 2);
+    for ([_][]const u8{
+        "SELECT 1 AS ``", "SELECT 1 AS `unclosed", "SELECT 1 AS `x\x00y`",
+        "SELECT 1 LIMIT -1, 1", "SELECT 1 LIMIT 1, -1", "SELECT 1 LIMIT 1, 1 OFFSET 1",
+        "SELECT 1 OFFSET 1 LIMIT 1, 1", "SELECT 1 LIMIT 1,",
+    }) |source| {
+        _ = try command(&session, &db, source);
+        try check(output[4] == 0xff and output[5] == 0x28 and output[6] == 0x04);
+    }
+
+    // Native-only grammar must not be stored as a view/definition that
+    // ordinary evaluation and recovery would later parse as PostgreSQL.
+    _ = try command(&session, &db, "CREATE VIEW v AS SELECT id FROM tdd_a LIMIT 1,2");
+    try check(output[4] == 0xff);
+    _ = try command(&session, &db, "CREATE TABLE broken(id INT CHECK (`id` >= 0))");
+    try check(output[4] == 0xff);
+    try check(store.database.tableCount() == 1);
+    _ = try command(&session, &db, "SELECT '`quoted literal`' AS \"double\"");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0] == .text);
+    try same(session.result.rows[0].cells[0].text.slice(), "`quoted literal`");
+}
+
+var syntax_recovered: Raw = .{};
+var syntax_replay: Raw.ReplayScratch = .{};
+fn nativeGrammarAndReplay() !void {
+    store = .{};
+    store.database.dialect = .mysql;
+    syntax_recovered = .{};
+    var record: [8192]u8 = undefined;
+    var result: Raw.Result = .{};
+    var used: usize = 0;
+    try store.database.executeChanges("CREATE TABLE `t``x`(`id` INT PRIMARY KEY,`v``x` INT)", &result, &record, &used, null, null);
+    try syntax_recovered.applyChangeRecord(record[0..used], &syntax_replay);
+    used = 0;
+    try store.database.executeChanges("INSERT INTO `t``x` VALUES(1,10),(2,20)", &result, &record, &used, null, null);
+    try syntax_recovered.applyChangeRecord(record[0..used], &syntax_replay);
+    try syntax_recovered.execute("SELECT \"v`x\" FROM \"t`x\" ORDER BY id LIMIT 1 OFFSET 1", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 20);
+
+    for ([_]sql.Dialect{ .postgres, .tds }) |dialect| {
+        syntax_recovered.dialect = dialect;
+        for ([_][]const u8{ "SELECT 1 AS `value`", "SELECT id FROM \"t`x\" ORDER BY id LIMIT 0,1" }) |source| {
+            if (syntax_recovered.execute(source, &result)) |_| return error.UnexpectedDialectSyntax else |err| try check(err == error.Syntax);
+        }
+    }
+    store.database.dialect = .mysql;
+    if (store.database.executeLegacy("SELECT 1 AS `value`", &result)) |_| return error.UnexpectedLegacySyntax else |err|
+        try check(err == error.UnsupportedLogVersion);
+}
+
 pub fn main(init: std.process.Init) !void {
     try handshakeAndFragmentation();
     try typedResultsAndErrors();
+    try nativeIdentifierAndLimit();
+    try nativeGrammarAndReplay();
     try transactionsAndOutputPreflight();
     try concurrentCommittedVisibility();
     try malformedAndFuzz();

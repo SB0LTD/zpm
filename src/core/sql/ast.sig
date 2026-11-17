@@ -23,7 +23,7 @@ pub const Span = struct {
 };
 
 /// An identifier as written. Unquoted names fold to lower case; quoted
-/// names keep their case and collapse `""`.
+/// names keep their case and collapse doubled delimiters.
 pub const Ident = struct {
     span: Span = .{},
     quoted: bool = false,

@@ -147,6 +147,7 @@ pub const Dialect = types.Dialect;
 pub const DataType = types.DataType;
 pub const CommandTag = types.CommandTag;
 pub const ParseMode = parser_module.Mode;
+pub const ParseOptions = parser_module.Options;
 pub const Isolation = ast.Isolation;
 pub const Characteristics = ast.Characteristics;
 pub const typeOid = types.typeOid;
@@ -974,7 +975,7 @@ pub fn Database(comptime config: Config) type {
             }
             fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
                 self.session.sequences=null;
-                var parsed=try P.parse(source,&self.workspace.nodes,.standard);
+                var parsed=try P.parseWithOptions(source,&self.workspace.nodes,.{.dialect=self.dialect});
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
                 const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role);
                 try self.session.checkpoint();
@@ -1914,7 +1915,7 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             // Routine statements (B11 wave 3) have their own grammar.
             const routine = options.mode == .standard and R.classify(source) != null;
-            const top: P.Parsed = if (routine) .{ .command = .{ .control = .commit } } else P.parseTop(source, &self.workspace.nodes, options.mode) catch |err| {
+            const top: P.Parsed = if (routine) .{ .command = .{ .control = .commit } } else P.parseTopWithOptions(source, &self.workspace.nodes, .{ .mode = options.mode, .dialect = self.dialect }) catch |err| {
                 if (options.@"resume") self.dropStatement(slot);
                 return legacy(options.mode, err);
             };
@@ -7279,7 +7280,7 @@ pub fn Database(comptime config: Config) type {
             if (self.cursors.find(state.id, name.slice()) != null) return error.DuplicatePortal;
             const index = self.cursors.free() orelse return error.SessionCapacity;
             const inner_source = source[declare.body..];
-            const inner = try P.parse(inner_source, &self.workspace.nodes, mode);
+            const inner = try P.parseWithOptions(inner_source, &self.workspace.nodes, .{ .mode = mode, .dialect = self.dialect });
             const locking = switch (inner) {
                 .select, .query => |query| self.workspace.nodes.queries[query].lock.strength != .none,
                 else => return error.Syntax,
@@ -7366,7 +7367,7 @@ pub fn Database(comptime config: Config) type {
             var params: B.Parameters = .{ .count = prepare.count };
             for (0..prepare.count) |position| params.types[position] = prepare.types[position];
             // Parse analysis now, as PostgreSQL's PREPARE (42P01, 42703 ...).
-            const inner = try P.parse(text, &self.workspace.nodes, mode);
+            const inner = try P.parseWithOptions(text, &self.workspace.nodes, .{ .mode = mode, .dialect = self.dialect });
             self.active_params = &params;
             defer self.active_params = null;
             var copy = inner;
@@ -7415,7 +7416,7 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             const text = prepared.source();
-            const inner = try P.parse(text, &self.workspace.nodes, mode);
+            const inner = try P.parseWithOptions(text, &self.workspace.nodes, .{ .mode = mode, .dialect = self.dialect });
             self.active_params = &params;
             self.session.params = @ptrCast(&self.param_values);
             defer {
@@ -8738,7 +8739,7 @@ pub fn Database(comptime config: Config) type {
             const raw = ident.span.slice(source);
             out.len = ident.len;
             if (ident.quoted) {
-                lexer.decodeQuotedWith(source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, '"', &out.bytes);
+                lexer.decodeQuotedIdentifier(source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, &out.bytes);
             } else for (raw, 0..) |byte, index| {
                 out.bytes[index] = types.lower(byte);
             }
@@ -8807,7 +8808,7 @@ pub fn Database(comptime config: Config) type {
         /// ordinary statement. Syntax errors in a control command return.
         pub fn control(self: *Self, source: []const u8) Error!Control {
             if (!controlWord(source)) return .none;
-            const parsed = try P.parse(source, &self.workspace.nodes, .standard);
+            const parsed = try P.parseWithOptions(source, &self.workspace.nodes, .{ .dialect = self.dialect });
             const command = switch (parsed) {
                 .control => |command| command,
                 else => return .none,
@@ -8868,7 +8869,7 @@ pub fn Database(comptime config: Config) type {
                 result.command = R.command(kind);
                 return;
             }
-            const top = try P.parseTop(source, &self.workspace.nodes, .standard);
+            const top = try P.parseTopWithOptions(source, &self.workspace.nodes, .{ .dialect = self.dialect });
             const parsed = top.command;
             var snap: Snapshot = .{ .csn = self.csn };
             if (slot) |owner| if (self.active(owner)) {
