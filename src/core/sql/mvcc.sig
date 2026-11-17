@@ -72,6 +72,7 @@ pub fn Mvcc(comptime config: types.Config) type {
 
         pub const Tx = struct {
             active: bool = false,
+            prepared: bool = false,
             epoch: u32 = 0,
             /// Command id of the most recent statement.
             cid: u32 = 0,

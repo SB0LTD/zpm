@@ -1105,11 +1105,14 @@ pub const SettingValue = struct {
 
 /// Transaction control and session commands; executed by the store, never
 /// by a single statement.
+pub const PreparedTransactionAction = enum { prepare, commit, rollback };
+
 pub const Control = union(enum) {
     maintenance: struct { operation: enum { vacuum, analyze }, schema: ?Ident, name: Ident },
     begin: Characteristics,
     commit: void,
     rollback: void,
+    prepared_transaction: struct { action: PreparedTransactionAction, gid: lexer.Quoted },
     savepoint: Ident,
     release: Ident,
     rollback_to: Ident,

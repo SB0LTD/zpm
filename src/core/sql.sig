@@ -96,6 +96,7 @@ const parser_module = @import("sql/parser.sig");
 const binder_module = @import("sql/binder.sig");
 const storage = @import("sql/storage.sig");
 const change_log = @import("sql/change_log.sig");
+const two_phase = @import("sql/two_phase.sig");
 const expr_module = @import("sql/expr.sig");
 const exec_module = @import("sql/exec.sig");
 const dml_module = @import("sql/dml.sig");
@@ -182,6 +183,7 @@ pub const Control = union(enum) {
     begin: Characteristics,
     commit: void,
     rollback: void,
+    prepared_transaction: struct { action: ast.PreparedTransactionAction, gid: ?two_phase.Gid },
     savepoint: ControlText,
     release: ControlText,
     rollback_to: ControlText,
@@ -261,6 +263,7 @@ pub fn Database(comptime config: Config) type {
         pub const StorageRowSlot = S.RowSlot;
         pub const StorageVersion = S.Version;
         pub const ReplayScratch = C.Scratch;
+        pub const PreparedWal = two_phase;
         pub const Snapshot = storage.Snapshot;
         pub const LockSet = L.Set;
         pub const versions_per_table = S.versions_capacity;
@@ -1727,6 +1730,18 @@ pub fn Database(comptime config: Config) type {
 
         /// Starts a transaction; returns its slot.
         pub fn begin(self: *Self) Error!u16 {
+            const slot = try self.reserveTransaction();
+            const tx = &self.txs[slot];
+            const state = self.sessionState();
+            tx.isolation = state.values.isolation;
+            tx.read_only = state.values.read_only;
+            tx.deferrable = state.values.deferrable;
+            tx.session = state.id;
+            state.beginTransaction(tx.epoch);
+            return slot;
+        }
+
+        fn reserveTransaction(self: *Self) Error!u16 {
             for (&self.txs, 0..) |*tx, slot| if (!tx.active) {
                 self.epoch +%= 1;
                 if (self.epoch == 0) self.epoch = 1;
@@ -1747,15 +1762,14 @@ pub fn Database(comptime config: Config) type {
                 tx.deferred_checks = false;
                 tx.constraints_all = null;
                 tx.constraint_mode_count = 0;
-                const state = self.sessionState();
-                tx.isolation = state.values.isolation;
-                tx.read_only = state.values.read_only;
-                tx.deferrable = state.values.deferrable;
+                tx.isolation = .read_committed;
+                tx.read_only = false;
+                tx.deferrable = false;
                 tx.snapshot_csn = null;
                 tx.snapshot_cid = 0;
-                tx.session = state.id;
+                tx.session = 0;
                 tx.ssi = null;
-                state.beginTransaction(tx.epoch);
+                tx.prepared = false;
                 return @intCast(slot);
             };
             return error.TransactionCapacity;
@@ -1779,6 +1793,210 @@ pub fn Database(comptime config: Config) type {
             var writer = try change_log.Writer.init(buffer, 0);
             try self.encodeWrites(&writer, slot);
             return buffer[0..try writer.finish()];
+        }
+
+        pub fn prepareTransactionPayload(self: *Self, slot: u16, gid: two_phase.Gid, database: u32, at: i64, buffer: []u8) Error![]const u8 {
+            if (!self.active(slot)) return error.NoActiveTransaction;
+            const tx = &self.txs[slot];
+            const state = self.ownSession(slot) orelse return error.NoActiveTransaction;
+            if (tx.prepared or tx.copy_table != null or tx.pin != null or tx.running_snap != null) return error.ObjectNotInPrerequisiteState;
+            if (tx.ssi != null or tx.seq_dirty.any() or tx.deferred_checks or state.listen_action_count != 0) return error.UnsupportedStatement;
+            for (self.notify.pending) |entry| if (entry.used and entry.slot == slot and entry.epoch == tx.epoch) return error.UnsupportedStatement;
+            for (self.cursors.slots) |cursor| if (cursor.used and cursor.hold and cursor.slot == slot and cursor.epoch == tx.epoch) return error.UnsupportedStatement;
+            for (tx.lock_list[0..tx.lock_len]) |entry| if (entry.kind == .advisory) return error.UnsupportedStatement;
+            try self.deferredViolation(slot);
+
+            const metadata: two_phase.Metadata = .{
+                .gid = gid,
+                .owner = effectiveRole(state),
+                .database = database,
+                .prepared_at = at,
+            };
+            var envelope = try two_phase.PrepareWriter.init(buffer, &metadata);
+            for (&self.tables, 0..) |*table, index| {
+                const mode = self.locks.modes[index][slot];
+                if (mode == 0) continue;
+                if (!S.committedTable(table)) return error.UnsupportedStatement;
+                try envelope.addLock(.{ .table_oid = table.oid, .rowid = 0, .mode = mode });
+            }
+            for (&self.locks.rows) |*lock| {
+                if (!lock.used) continue;
+                for (lock.holders[0..lock.count]) |holder| if (holder.slot == slot) {
+                    try envelope.addLock(.{ .table_oid = self.tables[lock.table].oid, .rowid = lock.rowid, .mode = @intFromEnum(holder.mode) });
+                    break;
+                };
+            }
+            var writer = try change_log.Writer.init(envelope.changes(), 0);
+            for (tx.writes[0..tx.write_len]) |entry| {
+                const tag: change_log.Op = switch (entry.kind) {
+                    .insert => .insert,
+                    .update => .update,
+                    .delete => .delete,
+                    else => return error.UnsupportedStatement,
+                };
+                const table = &self.tables[entry.table];
+                if (!S.committedTable(table) or table.relkind != 'r') return error.UnsupportedStatement;
+                const version = &table.versions[if (tag == .delete) entry.old else entry.new];
+                const old = if (tag == .insert) &.{} else table.versions[entry.old].cells[0..table.column_count];
+                const new = if (tag == .delete) &.{} else version.cells[0..table.column_count];
+                try C.encodePreparedRow(&writer, tag, table.oid, table.rows[version.row - 1].rowid, old, new);
+            }
+            return envelope.finish(try writer.finish());
+        }
+
+        fn effectiveRole(state: *const Sess.State) u32 {
+            return if (state.values.role == 0) state.session_role else state.values.role;
+        }
+
+        pub fn canResolvePrepared(self: *Self, owner: u32) bool {
+            const role = effectiveRole(self.sessionState());
+            return role == owner or self.catalog_objects.superuser(role, .{ .csn = self.csn });
+        }
+
+        /// After stable storage, detach the SQL session while retaining the
+        /// active transaction slot, pending row versions and all grants.
+        pub fn detachPrepared(self: *Self, slot: u16) void {
+            self.endSessionTransaction(slot, true);
+            const tx = &self.txs[slot];
+            tx.prepared = true;
+            tx.session = 0;
+            tx.sub_len = 0;
+            tx.snapshot_csn = null;
+        }
+
+        pub fn publishPrepared(self: *Self, slot: u16) void {
+            // This payload contains only prepared row changes. Sequence
+            // log-ahead values still belong to the ordinary commit stream.
+            const carried = self.seq_carried;
+            self.publishCommit(slot);
+            self.seq_carried = carried;
+        }
+
+        fn preparedTable(self: *const Self, oid: u32) Error!usize {
+            for (&self.tables, 0..) |*table, index| if (table.oid == oid and S.committedTable(table)) return index;
+            return error.ChangeRecordConflict;
+        }
+
+        /// Validate the prepared record at its place in the WAL, even if a
+        /// later decision aborts it. Before-images are matched when staged.
+        pub fn validatePrepared(self: *const Self, prepared: two_phase.Prepared) Error!void {
+            if (self.catalog_objects.roleFlags(prepared.metadata.owner, .{ .csn = self.csn }) == null) return error.ChangeRecordConflict;
+            var locks = prepared.locks;
+            while (locks.next()) |lock| _ = try self.preparedTable(lock.table_oid);
+            var reader = try C.PreparedReader.init(prepared.changes);
+            if (reader.remaining > M.write_capacity) return error.WriteSetCapacity;
+            var old: V.Row = .{};
+            var new: V.Row = .{};
+            while (try reader.next(&old, &new)) |change| {
+                const table = &self.tables[try self.preparedTable(change.oid)];
+                if (table.relkind != 'r') return error.InvalidChangeRecord;
+                if (change.tag != .insert) try validatePreparedImage(table, old.cells[0..change.old_count]);
+                if (change.tag != .delete) try validatePreparedImage(table, new.cells[0..change.new_count]);
+            }
+        }
+
+        fn validatePreparedImage(table: *const S.Table, values: []const V.Cell) Error!void {
+            if (values.len != table.column_count) return error.InvalidChangeRecord;
+            for (table.columns[0..values.len], values) |*column, *cell| {
+                V.validate(column, cell) catch return error.ChangeRecordConflict;
+            }
+        }
+
+        /// Installs a recovered PREPARE without committing it. Only recovery
+        /// calls this, under exclusive access before starting client sessions.
+        pub fn restorePrepared(self: *Self, prepared: two_phase.Prepared) Error!u16 {
+            const slot = try self.reserveTransaction();
+            var old_next: [config.tables]u64 = undefined;
+            for (&self.tables, &old_next) |*table, *next| next.* = table.next_rowid;
+            errdefer {
+                self.abort(slot);
+                for (&self.tables, old_next) |*table, next| table.next_rowid = next;
+            }
+            var table_locks = prepared.locks;
+            while (table_locks.next()) |lock| {
+                if (lock.rowid != 0) continue;
+                const index = try self.preparedTable(lock.table_oid);
+                if (self.locks.holdsTable(index, slot)) return error.InvalidChangeRecord;
+                var modes = lock.mode;
+                while (modes != 0) {
+                    const bit = @as(u8, 1) << @intCast(@ctz(modes));
+                    modes &= modes - 1;
+                    const mode: locks_module.TableMode = @enumFromInt(bit);
+                    var waits: L.Set = .{};
+                    self.locks.tableHolders(index, slot, mode, &waits);
+                    if (waits.any()) return error.ChangeRecordConflict;
+                    if (self.locks.grantTable(index, slot, mode)) try M.recordLock(self, slot, .{ .kind = .table, .table = @intCast(index), .mode = bit });
+                }
+            }
+            var reader = try C.PreparedReader.init(prepared.changes);
+            var old: V.Row = .{};
+            var new: V.Row = .{};
+            const tx = &self.txs[slot];
+            while (try reader.next(&old, &new)) |change| {
+                if (tx.cid == 0xffffffff) return error.InvalidChangeRecord;
+                tx.cid += 1;
+                try self.restorePreparedRow(slot, change, &old.cells, &new.cells);
+            }
+            var row_locks = prepared.locks;
+            while (row_locks.next()) |lock| {
+                if (lock.rowid == 0) continue;
+                const index = try self.preparedTable(lock.table_oid);
+                const table = &self.tables[index];
+                const row = S.findRow(table, lock.rowid) orelse return error.ChangeRecordConflict;
+                if (table.rows[row].newest == 0) return error.ChangeRecordConflict;
+                const newest = &table.versions[table.rows[row].newest - 1];
+                if (!self.locks.holdsTable(index, slot)) return error.InvalidChangeRecord;
+                if (newest.xmin_csn == 0 and newest.xmin.slot != slot) return error.ChangeRecordConflict;
+                if (newest.xmax.epoch != 0 and newest.xmax_csn == 0 and newest.xmax.slot != slot) return error.ChangeRecordConflict;
+                const mode: locks_module.RowMode = @enumFromInt(lock.mode);
+                if (self.locks.holdsRow(index, lock.rowid, slot, .key_share)) return error.InvalidChangeRecord;
+                var waits: L.Set = .{};
+                self.locks.rowHolders(index, lock.rowid, slot, mode, &waits);
+                if (waits.any()) return error.ChangeRecordConflict;
+                if (try self.locks.grantRow(index, lock.rowid, slot, mode)) |granted| try M.recordLock(self, slot, granted);
+            }
+            tx.prepared = true;
+            return slot;
+        }
+
+        fn restorePreparedRow(self: *Self, slot: u16, change: C.PreparedRow, old_image: *const E.Row, new_image: *const E.Row) Error!void {
+            const index = try self.preparedTable(change.oid);
+            const table = &self.tables[index];
+            if (table.relkind != 'r' or !self.locks.holdsTableMode(index, slot, .row_exclusive)) return error.InvalidChangeRecord;
+            const tx = &self.txs[slot];
+            const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
+            const row = S.findRow(table, change.rowid);
+            if (change.tag == .insert and row != null) return error.ChangeRecordConflict;
+            var previous: ?u32 = null;
+            if (change.tag != .insert) {
+                if (change.old_count != table.column_count) return error.InvalidChangeRecord;
+                const current = S.visibleAt(table, row orelse return error.ChangeRecordConflict, snap) orelse return error.ChangeRecordConflict;
+                var waits: L.Set = .{};
+                const target_row = try self.target(slot, index, current, snap, .write, &waits);
+                if (target_row != .ready or target_row.ready != current) return error.ChangeRecordConflict;
+                for (0..table.column_count) |column| {
+                    const actual = &table.versions[current].cells[column];
+                    const before = &old_image[column];
+                    if (@as(V.CellTag, actual.*) != @as(V.CellTag, before.*) or V.compare(actual, before) != 0) return error.ChangeRecordConflict;
+                }
+                previous = current;
+            }
+            if (change.tag != .delete) {
+                try validatePreparedImage(table, new_image[0..change.new_count]);
+                if (table.primary_column) |column| switch (D.keyCheck(table, &new_image[column], row orelse 0xffffffff, snap)) {
+                    .free => {},
+                    else => return error.ChangeRecordConflict,
+                };
+                const before = if (previous) |version| &table.versions[version].cells else null;
+                if ((self.uniqueTaken(slot, index, new_image, row orelse 0xffffffff, before, snap) catch return error.ChangeRecordConflict) != null) return error.ChangeRecordConflict;
+                self.exclusionTaken(slot, index, new_image, row orelse 0xffffffff, before, snap) catch return error.ChangeRecordConflict;
+            }
+            switch (change.tag) {
+                .insert => try self.placeInsert(slot, index, change.rowid, new_image, snap),
+                .update => try self.placeUpdate(slot, index, row.?, previous.?, new_image, snap),
+                .delete => try self.placeDelete(slot, index, previous.?, snap),
+                else => unreachable,
+            }
         }
 
         /// Infallible publication: stamps every write, advances csn, releases
@@ -1972,6 +2190,7 @@ pub fn Database(comptime config: Config) type {
             if (comptime config.external_storage) if (self.workspace.query.refs.len == 0) return error.InvalidParameterValue;
             if (!self.active(slot)) return error.NoActiveTransaction;
             const tx = &self.txs[slot];
+            if (tx.prepared) return error.ObjectNotInPrerequisiteState;
             // Routine statements (B11 wave 3) have their own grammar.
             const routine = options.mode == .standard and R.classify(source) != null;
             const top: P.Parsed = if (routine) .{ .command = .{ .control = .commit } } else P.parseTopWithOptions(source, &self.workspace.nodes, .{ .mode = options.mode, .dialect = self.dialect }) catch |err| {
@@ -5893,15 +6112,20 @@ pub fn Database(comptime config: Config) type {
         /// Places a new row version (key already checked). Capacity errors
         /// leave the table and write set unchanged.
         fn appendRow(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, snap: Snapshot) Error!void {
+            const rowid = self.tables[table_index].next_rowid;
+            if (rowid == 0xffffffffffffffff) return error.RowCapacity;
+            return self.placeInsert(slot, table_index, rowid, cells, snap);
+        }
+
+        fn placeInsert(self: *Self, slot: u16, table_index: usize, rowid: u64, cells: *const E.Row, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[table_index];
-            if (table.next_rowid == 0xffffffffffffffff) return error.RowCapacity;
             try self.reserveWrites(slot, 1);
             const at = self.horizon();
             try S.ensureVersions(table, 1, at);
             try S.ensureRowSlot(table, at);
-            const row = S.allocRow(table, table.next_rowid);
-            table.next_rowid += 1;
+            const row = S.allocRow(table, rowid);
+            table.next_rowid = @max(table.next_rowid, rowid + 1);
             const version = S.allocVersion(table);
             table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .cells = cells.* };
             table.rows[row].newest = version + 1;
@@ -6536,7 +6760,6 @@ pub fn Database(comptime config: Config) type {
 
         fn deleteSlot(self: *Self, slot: u16, ctx: *E.Context, delete: *const B.Delete, row: u32, snap: Snapshot, joined: ?Joined) Error!usize {
             try self.session.checkpoint();
-            const tx = &self.txs[slot];
             const table = &self.tables[delete.table];
             if (table.rows[row].newest == 0) return 0;
             const version = S.visibleAt(table, row, snap) orelse return 0;
@@ -6557,11 +6780,17 @@ pub fn Database(comptime config: Config) type {
             try self.referencedChange(slot, delete.table, &table.versions[goal].cells, null, snap);
             // A self-referencing CASCADE of this statement already deleted it.
             if (table.versions[goal].xmax.epoch != 0) return 1;
+            try self.placeDelete(slot, delete.table, goal, snap);
+            return 1;
+        }
+
+        fn placeDelete(self: *Self, slot: u16, table_index: usize, goal: u32, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            const table = &self.tables[table_index];
             try self.reserveWrites(slot, 1);
             table.versions[goal].xmax = tx.ref(slot);
             table.versions[goal].xmax_cid = snap.cid;
-            tx.push(.{ .kind = .delete, .table = @intCast(delete.table), .old = goal }) catch unreachable;
-            return 1;
+            tx.push(.{ .kind = .delete, .table = @intCast(table_index), .old = goal }) catch unreachable;
         }
 
         /// Every write in order (no coalescing: a later op may depend on an
@@ -7254,7 +7483,7 @@ pub fn Database(comptime config: Config) type {
                     if (self.statement_implicit) return error.UnsupportedStatement;
                     self.outcome = .{ .command = .begin };
                 },
-                .commit, .rollback, .savepoint, .release, .rollback_to => return error.UnsupportedStatement,
+                .commit, .rollback, .prepared_transaction, .savepoint, .release, .rollback_to => return error.UnsupportedStatement,
                 .set => |set| {
                     var name: ControlText = .{};
                     try settingName(source, set.name, &name);
@@ -8955,6 +9184,10 @@ pub fn Database(comptime config: Config) type {
             var tokens: lexer.Tokenizer = .{ .source = source, .text_limit = config.text_bytes };
             const first = tokens.next() catch return false;
             if (first.kind != .word) return false;
+            if (@import("std").ascii.eqlIgnoreCase(first.raw(source), "prepare")) {
+                const second = tokens.next() catch return false;
+                return second.isWord("TRANSACTION");
+            }
             return switch (first.keyword) {
                 .begin, .start, .commit, .end, .abort, .rollback, .savepoint, .release, .set, .show, .reset => true,
                 else => false,
@@ -8976,6 +9209,15 @@ pub fn Database(comptime config: Config) type {
                 .begin => |modes| out = .{ .begin = modes },
                 .commit => out = .commit,
                 .rollback => out = .rollback,
+                .prepared_transaction => |prepared| {
+                    var gid: ?two_phase.Gid = null;
+                    if (prepared.gid.len <= 199) {
+                        var decoded: [199]u8 = undefined;
+                        lexer.decodeQuoted(source, prepared.gid, &decoded);
+                        gid = two_phase.Gid.init(decoded[0..prepared.gid.len]) catch null;
+                    }
+                    out = .{ .prepared_transaction = .{ .action = prepared.action, .gid = gid } };
+                },
                 .savepoint => |name| {
                     out = .{ .savepoint = .{} };
                     try decodeIdent(source, name, &out.savepoint);

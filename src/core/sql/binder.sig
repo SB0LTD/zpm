@@ -679,6 +679,11 @@ pub fn Binder(comptime config: types.Config) type {
                     .begin, .set_transaction => .begin,
                     .commit => .commit,
                     .rollback, .rollback_to => .rollback,
+                    .prepared_transaction => |prepared| switch (prepared.action) {
+                        .prepare => .prepare_transaction,
+                        .commit => .commit_prepared,
+                        .rollback => .rollback_prepared,
+                    },
                     .savepoint => .savepoint,
                     .release => .release,
                     .set, .set_session_characteristics => .set,

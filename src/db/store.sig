@@ -300,9 +300,18 @@ pub fn Store(comptime Raw: type) type {
     const EngineSession = if (has_engine_session) Raw.SessionState else struct {};
     const NotificationType = if (has_engine_session) Raw.Notification else struct {};
     const has_read_cache = @hasDecl(Raw, "ReadResultCache") and has_engine_session;
+    const PreparedWal = if (@hasDecl(Raw, "PreparedWal")) Raw.PreparedWal else void;
     return struct {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
+        pub const PrepareFn = *const fn (?*anyopaque, []const u8) anyerror!u64;
+        pub const prepared_capacity = if (PreparedWal != void) Raw.transaction_capacity else 0;
+        pub const PreparedEntry = if (PreparedWal != void) struct {
+            used: bool = false,
+            sequence: u64 = 0,
+            metadata: PreparedWal.Metadata = undefined,
+            slot: ?u16 = null,
+        } else void;
         pub const ZoneProvider = struct {
             context: ?*anyopaque = null,
             /// Resolves a zone name; writes the canonical spelling and
@@ -316,6 +325,14 @@ pub fn Store(comptime Raw: type) type {
         read_result_cache: if (has_read_cache) ?*Raw.ReadResultCache else ?*void = null,
         commit_ctx: ?*anyopaque = null,
         commit_fn: ?CommitFn = null,
+        /// Uses the commit context and encode buffer. Returns the stable WAL
+        /// sequence assigned to this prepare or resolution frame.
+        prepare_fn: ?PrepareFn = null,
+        prepared_limit: usize = 0,
+        /// Physical store identity in this single-database engine. Startup
+        /// `database` parameters are session labels and do not change it.
+        database_oid: u32 = 5,
+        prepared: [prepared_capacity]PreparedEntry = @splat(.{}),
         /// Change-record encode buffer shared by every commit (callers
         /// serialize; persistence reuses its recovery buffer, so any record
         /// written is recoverable).
@@ -414,6 +431,97 @@ pub fn Store(comptime Raw: type) type {
                 };
             }
             db.publishCommit(slot);
+        }
+
+        fn preparedIndex(self: *const Self, gid: *const PreparedWal.Gid) ?usize {
+            for (&self.prepared, 0..) |*entry, index| if (entry.used and entry.metadata.gid.eql(gid)) return index;
+            return null;
+        }
+
+        pub fn preparedCount(self: *const Self) usize {
+            var count: usize = 0;
+            for (&self.prepared) |*entry| count += @intFromBool(entry.used);
+            return count;
+        }
+
+        fn freePrepared(self: *const Self, gid: *const PreparedWal.Gid) !usize {
+            if (self.preparedIndex(gid) != null) return error.DuplicateObject;
+            for (&self.prepared, 0..) |*entry, index| if (!entry.used) return index;
+            return error.TransactionCapacity;
+        }
+
+        fn flushPrepared(self: *Self, payload: []const u8) !u64 {
+            try self.storageReady();
+            const persist = self.prepare_fn orelse return error.ObjectNotInPrerequisiteState;
+            const sequence = persist(self.commit_ctx, payload) catch |err| {
+                self.storage_failed = true;
+                return err;
+            };
+            if (sequence == 0) {
+                self.storage_failed = true;
+                return error.InvalidCommitBatch;
+            }
+            return sequence;
+        }
+
+        fn prepareTransaction(self: *Self, slot: u16, gid: PreparedWal.Gid) !void {
+            if (self.prepared_limit == 0 or self.prepare_fn == null) return error.ObjectNotInPrerequisiteState;
+            const index = try self.freePrepared(&gid);
+            if (self.preparedCount() >= self.prepared_limit or self.preparedCount() + 1 >= prepared_capacity) return error.TransactionCapacity;
+            const at = self.wallNow() orelse return error.UnsupportedStatement;
+            const payload = try self.database.prepareTransactionPayload(slot, gid, self.database_oid, at, self.encode_buffer);
+            const metadata = (try PreparedWal.decode(payload)).prepare.metadata;
+            const sequence = try self.flushPrepared(payload);
+            self.database.detachPrepared(slot);
+            self.prepared[index] = .{ .used = true, .sequence = sequence, .metadata = metadata, .slot = slot };
+        }
+
+        fn resolvePrepared(self: *Self, gid: PreparedWal.Gid, should_commit: bool) !void {
+            const index = self.preparedIndex(&gid) orelse return error.UndefinedObject;
+            const entry = &self.prepared[index];
+            if (!self.database.canResolvePrepared(entry.metadata.owner)) return error.InsufficientPrivilege;
+            if (entry.metadata.database != self.database_oid) return error.UnsupportedStatement;
+            const slot = entry.slot orelse return error.ObjectNotInPrerequisiteState;
+            const payload = try PreparedWal.encodeDecision(self.encode_buffer, &.{ .gid = gid, .prepare_sequence = entry.sequence, .commit = should_commit });
+            _ = try self.flushPrepared(payload);
+            if (should_commit) self.database.publishPrepared(slot) else self.database.abort(slot);
+            entry.* = .{};
+        }
+
+        /// Startup records only ledger metadata until its decision or EOF.
+        /// The caller owns the positioned WAL coordinates for this entry.
+        pub fn rememberPrepared(self: *Self, payload: PreparedWal.Prepared, sequence: u64) !usize {
+            if (sequence == 0 or payload.metadata.database != self.database_oid) return error.ChangeRecordConflict;
+            const index = self.freePrepared(&payload.metadata.gid) catch |err| switch (err) {
+                error.DuplicateObject => return error.ChangeRecordConflict,
+                else => return err,
+            };
+            try self.database.validatePrepared(payload);
+            self.prepared[index] = .{ .used = true, .sequence = sequence, .metadata = payload.metadata };
+            return index;
+        }
+
+        pub fn recoveredDecisionIndex(self: *const Self, decision: PreparedWal.Decision) !usize {
+            const index = self.preparedIndex(&decision.gid) orelse return error.ChangeRecordConflict;
+            const entry = &self.prepared[index];
+            if (entry.sequence != decision.prepare_sequence or entry.slot != null) return error.ChangeRecordConflict;
+            return index;
+        }
+
+        pub fn restorePreparedEntry(self: *Self, index: usize, payload: PreparedWal.Prepared) !void {
+            const entry = &self.prepared[index];
+            if (!entry.used or entry.slot != null or !entry.metadata.gid.eql(&payload.metadata.gid) or
+                entry.metadata.owner != payload.metadata.owner or entry.metadata.database != payload.metadata.database or
+                entry.metadata.prepared_at != payload.metadata.prepared_at) return error.ChangeRecordConflict;
+            entry.slot = try self.database.restorePrepared(payload);
+        }
+
+        pub fn resolveRecoveredPrepared(self: *Self, index: usize, should_commit: bool) !void {
+            const entry = &self.prepared[index];
+            if (!entry.used) return error.ChangeRecordConflict;
+            if (should_commit) self.database.publishPrepared(entry.slot orelse return error.ChangeRecordConflict)
+            else if (entry.slot) |slot| self.database.abort(slot);
+            entry.* = .{};
         }
 
         pub const Pending = struct {
@@ -1007,6 +1115,41 @@ pub fn Store(comptime Raw: type) type {
                         try self.rollbackTransaction();
                         result.clear(0);
                         result.command = .rollback;
+                    },
+                    .prepared_transaction => |prepared| {
+                        if (comptime PreparedWal == void) return error.UnsupportedStatement;
+                        switch (prepared.action) {
+                            .prepare => {
+                                if (!self.in_transaction) return error.NoActiveTransaction;
+                                const slot = self.tx.?;
+                                if (self.failed) {
+                                    self.db().abort(slot);
+                                    self.endTransaction(false);
+                                    result.clear(0);
+                                    result.command = .rollback;
+                                    return;
+                                }
+                                self.store.prepareTransaction(slot, prepared.gid orelse {
+                                    self.db().abort(slot);
+                                    self.endTransaction(false);
+                                    return error.InvalidParameterValue;
+                                }) catch |err| {
+                                    self.db().abort(slot);
+                                    self.endTransaction(false);
+                                    return err;
+                                };
+                                self.endTransaction(true);
+                                result.clear(0);
+                                result.command = .prepare_transaction;
+                            },
+                            .commit, .rollback => {
+                                if (self.in_transaction or self.tx != null) return error.ActiveSqlTransaction;
+                                const should_commit = prepared.action == .commit;
+                                try self.store.resolvePrepared(prepared.gid orelse return error.InvalidParameterValue, should_commit);
+                                result.clear(0);
+                                result.command = if (should_commit) .commit_prepared else .rollback_prepared;
+                            },
+                        }
                     },
                     .savepoint => |name| {
                         if (!self.in_transaction) return error.NoActiveTransaction;

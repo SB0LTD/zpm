@@ -438,6 +438,10 @@ pub fn Parser(comptime config: types.Config) type {
                 if (try self.takeWord("ROLLBACK")) return self.legacyControl(.rollback);
                 return error.UnsupportedStatement;
             }
+            if (self.tokens.dialect == .postgres and self.rawWord("prepare") and (try self.peek()).isWord("TRANSACTION")) {
+                try self.advance();
+                return .{ .control = try self.preparedTransaction(.prepare) };
+            }
             if (self.mode == .standard) if (try self.sessionCommand()) |command| return .{ .session = command };
             return .{ .control = try self.controlStatement() };
         }
@@ -1034,6 +1038,19 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         /// Transaction control and session commands (the store executes them).
+        fn preparedTransaction(self: *Self, action: ast.PreparedTransactionAction) Error!ast.Control {
+            // GIDs have their own protocol bound, independent of column text.
+            const previous_limit = self.tokens.text_limit;
+            self.tokens.text_limit = self.source.len;
+            defer self.tokens.text_limit = previous_limit;
+            try self.advance();
+            if (self.current.kind != .string) return error.Syntax;
+            const gid = self.current.quoted();
+            try self.advance();
+            try self.finish();
+            return .{ .prepared_transaction = .{ .action = action, .gid = gid } };
+        }
+
         fn controlStatement(self: *Self) Error!ast.Control {
             if (self.mode == .standard and (self.rawWord("vacuum") or self.rawWord("analyze") or self.rawWord("analyse"))) {
                 const vacuum = self.rawWord("vacuum");
@@ -1057,7 +1074,10 @@ pub fn Parser(comptime config: types.Config) type {
                 self.finish() catch return error.UnsupportedStatement;
                 return .{ .begin = modes };
             }
-            if ((try self.takeWord("COMMIT")) or (try self.takeWord("END"))) {
+            const commit = self.isWord("COMMIT");
+            if (commit or self.isWord("END")) {
+                try self.advance();
+                if (commit and self.tokens.dialect == .postgres and self.rawWord("prepared")) return self.preparedTransaction(.commit);
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
                 self.finish() catch return error.UnsupportedStatement;
                 return .commit;
@@ -1068,6 +1088,7 @@ pub fn Parser(comptime config: types.Config) type {
                 return .rollback;
             }
             if (try self.takeWord("ROLLBACK")) {
+                if (self.tokens.dialect == .postgres and self.rawWord("prepared")) return self.preparedTransaction(.rollback);
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
                 if (try self.takeWord("TO")) {
                     _ = try self.takeWord("SAVEPOINT");

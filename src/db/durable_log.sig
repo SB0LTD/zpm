@@ -153,7 +153,7 @@ pub fn recover(file: anytype, scratch: []u8, context: anytype, comptime replay: 
 
 /// Refuses incompatible payload semantics without modifying the original WAL.
 pub fn recoverKind(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, kind: u16) !Recovery {
-    return recoverImpl(file, scratch, context, replay, try kindMask(kind), .sequence);
+    return recoverImpl(file, scratch, context, replay, null, try kindMask(kind), .sequence);
 }
 
 /// Like recoverKind, but accepts every kind whose bit is set in accepted_mask
@@ -162,20 +162,26 @@ pub fn recoverKind(file: anytype, scratch: []u8, context: anytype, comptime repl
 /// UnsupportedLogVersion before its payload is replayed.
 pub fn recoverKinds(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, accepted_mask: u32) !Recovery {
     if (accepted_mask & ~@as(u32, 1) == 0) return error.UnsupportedLogVersion;
-    return recoverImpl(file, scratch, context, replay, accepted_mask, .kind);
+    return recoverImpl(file, scratch, context, replay, null, accepted_mask, .kind);
 }
 
 /// Like recoverKinds, but calls replay(context, frame, payload). A caller
 /// may retain the frame coordinates and re-read it inside a later callback
 /// using the same scratch, after consuming the current payload.
 pub fn recoverFrames(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, accepted_mask: u32) !Recovery {
+    return recoverFramesWithFinish(file, scratch, context, replay, null, accepted_mask);
+}
+
+/// Runs the recovery finalizer after the verified frame scan and before any
+/// torn-tail repair. A finalizer error leaves the source bytes untouched.
+pub fn recoverFramesWithFinish(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, comptime finish: anytype, accepted_mask: u32) !Recovery {
     if (accepted_mask & ~@as(u32, 1) == 0) return error.UnsupportedLogVersion;
-    return recoverImpl(file, scratch, context, replay, accepted_mask, .frame);
+    return recoverImpl(file, scratch, context, replay, finish, accepted_mask, .frame);
 }
 
 const ReplayMode = enum { sequence, kind, frame };
 
-fn recoverImpl(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, accepted_mask: u32, comptime mode: ReplayMode) !Recovery {
+fn recoverImpl(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, comptime finish: anytype, accepted_mask: u32, comptime mode: ReplayMode) !Recovery {
     const length: u64 = try file.length();
     var result: Recovery = .{};
     while (result.valid_bytes < length) {
@@ -194,6 +200,7 @@ fn recoverImpl(file: anytype, scratch: []u8, context: anytype, comptime replay: 
         result.sequence = frame.sequence;
         result.valid_bytes += frame.byteCount();
     }
+    if (comptime @TypeOf(finish) != @TypeOf(null)) try finish(context);
     if (result.valid_bytes != length) {
         try file.truncate(result.valid_bytes);
         try file.sync();

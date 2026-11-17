@@ -568,9 +568,68 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try writer.op(tag);
             try writer.int(u32, oid);
             try writer.int(u64, rowid);
+            try encodeCells(writer, cells);
+        }
+
+        fn encodeCells(writer: *Writer, cells: []const V.Cell) Error!void {
             try writer.int(u8, @intCast(cells.len));
             for (cells) |*cell| try encodeValue(writer, cell);
         }
+
+        /// Prepared DML uses the same typed cell encoding as committed WAL.
+        /// Its separate envelope also records before-images for exact replay
+        /// against the committed state at the decision or end of recovery.
+        pub fn encodePreparedRow(writer: *Writer, tag: Op, oid: u32, rowid: u64, old: []const V.Cell, new: []const V.Cell) Error!void {
+            try writer.op(tag);
+            try writer.int(u32, oid);
+            try writer.int(u64, rowid);
+            if (tag != .insert) try encodeCells(writer, old);
+            if (tag != .delete) try encodeCells(writer, new);
+        }
+
+        pub const PreparedRow = struct {
+            tag: Op,
+            oid: u32,
+            rowid: u64,
+            old_count: usize = 0,
+            new_count: usize = 0,
+        };
+
+        pub const PreparedReader = struct {
+            reader: Reader,
+            remaining: u32,
+
+            pub fn init(record: []const u8) Error!PreparedReader {
+                return .{ .reader = .{ .bytes = record }, .remaining = try opCount(record) };
+            }
+
+            pub fn next(self: *PreparedReader, old: *V.Row, new: *V.Row) Error!?PreparedRow {
+                if (self.remaining == 0) {
+                    if (self.reader.position != self.reader.bytes.len) return error.InvalidChangeRecord;
+                    return null;
+                }
+                const tag: Op = switch (try self.reader.int(u8)) {
+                    @intFromEnum(Op.insert) => .insert,
+                    @intFromEnum(Op.update) => .update,
+                    @intFromEnum(Op.delete) => .delete,
+                    else => return error.InvalidChangeRecord,
+                };
+                var row: PreparedRow = .{ .tag = tag, .oid = try self.reader.int(u32), .rowid = try self.reader.int(u64) };
+                if (row.oid == 0 or row.rowid == 0 or row.rowid == 0xffffffffffffffff) return error.InvalidChangeRecord;
+                if (tag != .insert) row.old_count = try self.readCells(old);
+                if (tag != .delete) row.new_count = try self.readCells(new);
+                self.remaining -= 1;
+                return row;
+            }
+
+            fn readCells(self: *PreparedReader, row: *V.Row) Error!usize {
+                const count = try self.reader.int(u8);
+                if (count == 0 or count > config.columns) return error.InvalidChangeRecord;
+                row.* = .{};
+                for (row.cells[0..count]) |*cell| cell.* = (try decodeValue(&self.reader)).cell;
+                return count;
+            }
+        };
 
         pub fn encodeDelete(writer: *Writer, oid: u32, rowid: u64) Error!void {
             try writer.op(.delete);
