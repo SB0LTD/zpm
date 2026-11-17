@@ -1025,8 +1025,16 @@ pub fn Storage(comptime config: types.Config) type {
             return mix(table.rows[entry - 1].rowid) & (table.row_index.len - 1);
         }
 
+        inline fn versionCell(table: *const Table, version: usize, column: usize) *const V.Cell {
+            return &table.versions[version].cells[column];
+        }
+
+        pub inline fn versionCellEquals(table: *const Table, version: usize, column: usize, value: *const V.Cell) bool {
+            return V.compare(versionCell(table, version, column), value) == 0;
+        }
+
         fn keyHome(table: *const Table, entry: u32) usize {
-            return V.hash(&table.versions[entry - 1].cells[table.primary_column.?]) & (table.key_index.len - 1);
+            return V.hash(versionCell(table, entry - 1, table.primary_column.?)) & (table.key_index.len - 1);
         }
 
         /// Backward-shift deletion keeps linear probing tombstone-free.
@@ -1184,7 +1192,7 @@ pub fn Storage(comptime config: types.Config) type {
             const hint = &table.primary_directory;
             if (hint.state == .disabled) return;
             const entry = &table.versions[version];
-            const key = &entry.cells[column];
+            const key = versionCell(table, version, column);
             if (key.* != .integer) { hint.state = .disabled; return; }
             if (hint.state == .empty) {
                 if (entry.row != 1 or entry.older != 0) { hint.state = .disabled; return; }
@@ -1242,6 +1250,26 @@ pub fn Storage(comptime config: types.Config) type {
             removeAt(table, table.key_index[0..], position, keyHome);
         }
 
+        /// Probe the primary-key index using the dirty-snapshot rules shared
+        /// with secondary unique indexes. The row being updated never conflicts.
+        pub fn primaryKeyCheck(table: *const Table, key: *const V.Cell, own_slot: u32, snap: Snapshot) KeyState {
+            const column = table.primary_column orelse return .free;
+            if (key.* == .null_value) return .free;
+            var waiting: ?u16 = null;
+            const mask = table.key_index.len - 1;
+            var position = V.hash(key) & mask;
+            while (true) : (position = (position + 1) & mask) {
+                const entry = table.key_index[position];
+                if (entry == 0) break;
+                const index = entry - 1;
+                if (!versionCellEquals(table, index, column, key)) continue;
+                const version = &table.versions[index];
+                if (version.row - 1 == own_slot) continue;
+                if (classify(version, index, snap, &waiting)) |state| return state;
+            }
+            return if (waiting) |slot| .{ .wait = slot } else .free;
+        }
+
         /// Visible version whose primary key equals value. Returning the hit
         /// avoids walking its MVCC chain twice in read execution.
         pub fn lookupVersionAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
@@ -1255,7 +1283,7 @@ pub fn Storage(comptime config: types.Config) type {
                 const offset = @as(i128, value.integer) - table.primary_directory.base;
                 if (offset >= 0 and offset < table.row_high) {
                     if (visibleAt(table, @intCast(offset), snap)) |candidate| {
-                        const key = &table.versions[candidate].cells[column];
+                        const key = versionCell(table, candidate, column);
                         if (key.* == .integer and key.integer == value.integer) return candidate;
                     }
                 }
@@ -1264,9 +1292,8 @@ pub fn Storage(comptime config: types.Config) type {
             while (true) {
                 const entry = table.key_index[position];
                 if (entry == 0) return null;
-                const version = &table.versions[entry - 1];
-                if (V.compare(&version.cells[column], value) == 0) {
-                    const slot = version.row - 1;
+                if (versionCellEquals(table, entry - 1, column, value)) {
+                    const slot = table.versions[entry - 1].row - 1;
                     if (visibleAt(table, slot, snap) == entry - 1) return entry - 1;
                 }
                 position = (position + 1) & (table.key_index.len - 1);

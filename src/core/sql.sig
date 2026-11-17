@@ -4536,7 +4536,7 @@ pub fn Database(comptime config: Config) type {
                 .nothing, .none => return 0,
                 .update => return self.conflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap),
             };
-            if (table.primary_column) |column| switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
+            if (table.primary_column) |column| switch (S.primaryKeyCheck(table, &cells[column], 0xffffffff, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
                 .wait => |owner| {
@@ -4820,7 +4820,7 @@ pub fn Database(comptime config: Config) type {
             var ctx = self.evalContext("");
             try D.checkRow(&ctx, table, &checks, cells);
             const row = table.versions[old].row - 1;
-            if (table.primary_column) |column| if (V.compare(&cells[column], &table.versions[old].cells[column]) != 0) switch (D.keyCheck(table, &cells[column], row, snap)) {
+            if (table.primary_column) |column| if (!S.versionCellEquals(table, old, column, &cells[column])) switch (S.primaryKeyCheck(table, &cells[column], row, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
                 .wait => |owner| {
@@ -5041,11 +5041,7 @@ pub fn Database(comptime config: Config) type {
             const state: S.KeyState = switch (arbiter) {
                 .primary, .any => blk: {
                     const column = table.primary_column orelse break :blk .free;
-                    break :blk switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
-                        .free => .free,
-                        .taken => |version| .{ .taken = version },
-                        .wait => |owner| .{ .wait = owner },
-                    };
+                    break :blk S.primaryKeyCheck(table, &cells[column], 0xffffffff, snap);
                 },
                 .constraint => |index| S.uniqueCheck(table, &table.constraints[index], cells, 0xffffffff, snap),
                 .index => |which| S.indexUniqueCheck(table, which, cells, 0xffffffff, snap),
@@ -5443,7 +5439,7 @@ pub fn Database(comptime config: Config) type {
             tx.waiting_for = .{};
             const snap = tx.copy_snap;
             const table = &self.tables[table_index];
-            if (table.primary_column) |column| switch (D.keyCheck(table, &row.cells[column], 0xffffffff, snap)) {
+            if (table.primary_column) |column| switch (S.primaryKeyCheck(table, &row.cells[column], 0xffffffff, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
                 .wait => |owner| {
@@ -5695,7 +5691,7 @@ pub fn Database(comptime config: Config) type {
             try self.securityCheck(ctx, update.table, &cells);
             try self.partitionBound(update.table, &cells, snap);
             if (table.primary_column) |column| {
-                if (update.values[column] != ast.none) switch (D.keyCheck(table, &cells[column], row, snap)) {
+                if (update.values[column] != ast.none) switch (S.primaryKeyCheck(table, &cells[column], row, snap)) {
                     .free => {},
                     .taken => return error.PrimaryKeyViolation,
                     .wait => |owner| {
