@@ -1400,13 +1400,6 @@ pub fn Database(comptime config: Config) type {
         /// User schemas (Config.schemas); visibility is the catalog's.
         schemas: [config.schemas]Schema = @splat(.{}),
         catalog: K = .{},
-
-        /// Borrow the embedding's cluster catalogue while serving statements.
-        /// The embedding keeps the provider and its rows consistent for the
-        /// duration of each SQL call, including detached execution.
-        pub fn setDatabaseCatalog(self: *Self, provider: ?DatabaseCatalogProvider) void {
-            self.catalog.databases = provider;
-        }
         /// Roles, grants, policies, comments, wrappers, servers and
         /// publications (catalog_objects.sig, B11 wave 3).
         catalog_objects: O = .{},
@@ -1488,6 +1481,13 @@ pub fn Database(comptime config: Config) type {
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
+
+        /// Borrow the embedding's cluster catalogue while serving statements.
+        /// The embedding keeps the provider and its rows consistent for the
+        /// duration of each SQL call, including detached execution.
+        pub fn setDatabaseCatalog(self: *Self, provider: ?DatabaseCatalogProvider) void {
+            self.catalog.databases = provider;
+        }
 
         /// current_setting / set_config of caller-owned parameters: `show`
         /// writes the value (null: unknown name); `set` applies it (false:

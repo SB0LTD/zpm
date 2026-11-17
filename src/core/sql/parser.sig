@@ -85,12 +85,12 @@ pub fn Parser(comptime config: types.Config) type {
             if (options.mode != .standard or options.dialect != .postgres) return null;
             var tokens: lexer.Tokenizer = .{ .source = source, .text_limit = config.text_bytes };
             const first = try tokens.next();
-            const create = wordIs(source, first, "create");
-            if (!create and !wordIs(source, first, "drop")) return null;
+            const is_create = wordIs(source, first, "create");
+            if (!is_create and !wordIs(source, first, "drop")) return null;
             if (!wordIs(source, try tokens.next(), "database")) return null;
 
             var token = try tokens.next();
-            const if_exists = !create and wordIs(source, token, "if");
+            const if_exists = !is_create and wordIs(source, token, "if");
             if (if_exists) {
                 if (!wordIs(source, try tokens.next(), "exists")) return error.Syntax;
                 token = try tokens.next();
@@ -105,7 +105,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (end.kind == .word) return error.UnsupportedStatement;
             if (end.kind != .end) return error.Syntax;
-            return if (create) .{ .create = name } else .{ .drop = .{ .name = name, .if_exists = if_exists } };
+            return if (is_create) .{ .create = name } else .{ .drop = .{ .name = name, .if_exists = if_exists } };
         }
 
         pub const Explain = struct { analyze: bool = false };
