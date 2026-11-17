@@ -717,8 +717,10 @@ pub fn Storage(comptime config: types.Config) type {
             return null;
         }
 
-        fn relayoutCells(cells: *[config.columns]V.Cell, sources: []const u8, fills: []const V.Cell) void {
-            const old = cells.*;
+        fn relayoutVersion(destination: *Table, source: *const Table, version: usize, sources: []const u8, fills: []const V.Cell) void {
+            var old: [config.columns]V.Cell = undefined;
+            copyVersionRow(source, version, &old);
+            const cells = &destination.versions[version].cells;
             for (sources, 0..) |origin, column| cells[column] = if (origin == 0xff) fills[column] else old[origin];
             for (cells[sources.len..]) |*cell| cell.* = .null_value;
         }
@@ -737,9 +739,9 @@ pub fn Storage(comptime config: types.Config) type {
             destination.version_used = source.version_used;
             destination.version_free = source.version_free;
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
-            for (source.versions[0..source.version_high], destination.versions[0..source.version_high]) |*from, *to| {
+            for (source.versions[0..source.version_high], destination.versions[0..source.version_high], 0..) |*from, *to, version| {
                 to.* = from.*;
-                if (from.row != 0) relayoutCells(&to.cells, sources, fills);
+                if (from.row != 0) relayoutVersion(destination, source, version, sources, fills);
             }
             rebuildIndexes(destination);
             rebuildHints(destination);
@@ -748,8 +750,8 @@ pub fn Storage(comptime config: types.Config) type {
         /// Replay of ALTER TABLE in place (replay keeps no old snapshots):
         /// relayout every version, install the definition, rebuild indexes.
         pub fn redefine(table: *Table, name: V.Name, columns: []const V.Column, constraints: []const Constraint, extras: *const Extras, sources: []const u8, fills: []const V.Cell) void {
-            for (table.versions[0..table.version_high]) |*version| {
-                if (version.row != 0) relayoutCells(&version.cells, sources, fills);
+            for (table.versions[0..table.version_high], 0..) |*entry, version| {
+                if (entry.row != 0) relayoutVersion(table, table, version, sources, fills);
             }
             table.name = name;
             table.column_count = columns.len;
@@ -1045,6 +1047,11 @@ pub fn Storage(comptime config: types.Config) type {
         /// scratch per live row and keep it in scope until the last read.
         pub inline fn borrowVersionRow(table: *const Table, version: usize, _: *VersionRowScratch) *const [config.columns]V.Cell {
             return &table.versions[version].cells;
+        }
+
+        /// Materialize a row the caller can modify or retain independently.
+        pub inline fn copyVersionRow(table: *const Table, version: usize, destination: *[config.columns]V.Cell) void {
+            destination.* = table.versions[version].cells;
         }
 
         /// A single logical cell, valid until its scratch is reused.
