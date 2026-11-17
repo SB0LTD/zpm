@@ -144,7 +144,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn advance(self: *Self) Error!void {
-            if (self.current.backtickIdentifier(self.source))
+            if (self.current.dialectQuotedIdentifier(self.source))
                 self.last_native_syntax = self.current.start - 1;
             if (self.has_peek) {
                 self.current = self.peeked;
@@ -1448,7 +1448,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// Two identifiers name the same object (unquoted ones fold case).
         fn sameIdent(self: *const Self, a: ast.Ident, b: ast.Ident) bool {
-            if (self.tokens.dialect == .mysql) {
+            if (self.tokens.dialect != .postgres) {
                 if (a.len != b.len) return false;
                 var left: [config.name_bytes]u8 = undefined;
                 var right: [config.name_bytes]u8 = undefined;
@@ -2418,6 +2418,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             const top = try self.setExpression();
             const block = &self.pool.queries[top];
+            const has_core_limit = self.tokens.dialect == .tds and block.limit_present;
             if (cte_count != 0) {
                 if (block.cte_count != 0) return error.Syntax;
                 block.ctes = ctes;
@@ -2433,13 +2434,15 @@ pub fn Parser(comptime config: types.Config) type {
                     if (try self.takeWord("DESC")) key.descending = true else _ = try self.takeWord("ASC");
                     if (try self.takeWord("NULLS")) {
                         if (try self.takeWord("FIRST")) key.nulls_first = true else if (try self.takeWord("LAST")) key.nulls_first = false else return error.Syntax;
+                    } else if (has_core_limit) {
+                        key.nulls_first = !key.descending;
                     }
                     block.order[block.order_count] = key;
                     block.order_count += 1;
                     if (!try self.takeSymbol(.comma)) break;
                 }
             }
-            var limited = false;
+            var limited = has_core_limit;
             var offset_seen = false;
             while (true) {
                 if (!limited and try self.takeWord("LIMIT")) {
@@ -2460,6 +2463,7 @@ pub fn Parser(comptime config: types.Config) type {
                         try self.countClause(&block.limit, &block.negative_limit, &block.limit_expr);
                     }
                 } else if (!offset_seen and self.mode == .standard and try self.takeWord("OFFSET")) {
+                    if (has_core_limit) return error.Syntax;
                     offset_seen = true;block.offset_present=true;
                     self.pool.complex = true;
                     try self.countClause(&block.offset, &block.negative_offset, &block.offset_expr);
@@ -2589,6 +2593,11 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn setNode(self: *Self, op: ast.SetOp, all: bool, left: u16, right: u16) Error!u16 {
+            if (self.tokens.dialect == .tds) {
+                const lhs = &self.pool.queries[left];
+                const rhs = &self.pool.queries[right];
+                if ((lhs.with_ties and lhs.order_count == 0) or (rhs.with_ties and rhs.order_count == 0)) return error.Syntax;
+            }
             self.pool.complex = true;
             const index = try self.pool.newQuery();
             const block = &self.pool.queries[index];
@@ -2873,6 +2882,19 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.rparen);
                 }
             } else if (self.mode == .standard) _ = try self.takeWord("ALL");
+            if (self.tokens.dialect == .tds and self.rawWord("top")) {
+                self.last_native_syntax = self.current.start;
+                try self.advance();
+                try self.countValue(&out.limit, &out.negative_limit);
+                if (out.negative_limit or out.limit > 0x7fff_ffff_ffff_ffff) return error.InvalidRowCountInLimit;
+                out.limit_present = true;
+                if (try self.takeRaw("percent")) return error.UnsupportedStatement;
+                if (try self.takeWord("WITH")) {
+                    try self.expectWord("TIES");
+                    out.with_ties = true;
+                    self.pool.complex = true;
+                }
+            }
             var star = false;
             while (true) {
                 if (out.count == config.columns) return error.ColumnCapacity;

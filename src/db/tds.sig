@@ -537,6 +537,7 @@ pub fn Session(comptime DB: type) type {
                 error.PrimaryKeyViolation => 2627,
                 error.NotNullViolation => 515,
                 error.DatabaseBusy => 1222,
+                error.InvalidRowCountInLimit => 1014,
                 else => 102,
             }, @errorName(err));
         }
@@ -875,6 +876,7 @@ pub fn Session(comptime DB: type) type {
                 error.PrimaryKeyViolation => 2627,
                 error.NotNullViolation => 515,
                 error.DatabaseBusy => 1222,
+                error.InvalidRowCountInLimit => 1014,
                 else => 102,
             }, @errorName(err), 0xfe);
         }

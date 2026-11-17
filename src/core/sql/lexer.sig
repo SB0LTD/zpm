@@ -353,8 +353,8 @@ pub const Token = struct {
     prefix: usize = 0,
     suffix: usize = 0,
 
-    pub fn backtickIdentifier(self: Token, source: []const u8) bool {
-        return self.kind == .quoted_word and self.start > 0 and source[self.start - 1] == '`';
+    pub fn dialectQuotedIdentifier(self: Token, source: []const u8) bool {
+        return self.kind == .quoted_word and self.start > 0 and identifierQuote(source[self.start - 1]) != '"';
     }
 
     pub fn raw(self: Token, source: []const u8) []const u8 {
@@ -570,9 +570,9 @@ pub const Tokenizer = struct {
             token.suffix = 1;
             return token;
         }
-        if (byte == '"' or (byte == '`' and self.dialect == .mysql)) {
+        if (byte == '"' or (byte == '`' and self.dialect == .mysql) or (byte == '[' and self.dialect == .tds)) {
             self.position += 1;
-            var token = try self.quotedForm(byte, 255, error.NameCapacity);
+            var token = try self.quotedForm(identifierQuote(byte), 255, error.NameCapacity);
             if (token.len == 0) return error.Syntax;
             token.kind = .quoted_word;
             token.prefix = 1;
@@ -803,8 +803,12 @@ pub fn decodeQuotedWith(source: []const u8, quoted: Quoted, quote: u8, out: []u8
 
 /// Decode an identifier without discarding its source delimiters.
 pub fn decodeQuotedIdentifier(source: []const u8, quoted: Quoted, out: []u8) void {
-    const quote: u8 = if (quoted.start > 0 and source[quoted.start - 1] == '`') '`' else '"';
+    const quote = if (quoted.start > 0) identifierQuote(source[quoted.start - 1]) else '"';
     decodeQuotedWith(source, quoted, quote, out);
+}
+
+fn identifierQuote(open: u8) u8 {
+    return switch (open) { '`' => '`', '[' => ']', else => '"' };
 }
 
 /// Copies a string literal's decoded bytes (`quoted.len` of them) into

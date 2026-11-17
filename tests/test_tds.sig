@@ -217,6 +217,46 @@ fn outputFragmentation() !void {
     try check(packets >= 5);
 }
 
+fn nativeIdentifiersAndTop() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    try check((try execute(&session, &db, "SELECT 1 AS [value]"))[0] == 0x81);
+    try same(session.result.column_names[0].slice(), "value");
+    try check(session.result.rows[0].cells[0].integer == 1);
+    try check((try execute(&session, &db, "CREATE TABLE [a]]b] ([x]]y] INT PRIMARY KEY, priority INT)"))[0] == 0xfd);
+    try check((try execute(&session, &db, "INSERT INTO [a]]b] VALUES (3,7),(1,7),(4,NULL),(2,7)"))[0] == 0xfd);
+    try check((try execute(&session, &db, "SELECT TOP(2) [a]]b].[x]]y] AS [x]]z] FROM [a]]b] ORDER BY [x]]y]"))[0] == 0x81);
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[0].integer == 1 and session.result.rows[1].cells[0].integer == 2);
+    try same(session.result.column_names[0].slice(), "x]z");
+    try check((try execute(&session, &db, "SELECT TOP 0 [x]]y] FROM [a]]b]"))[0] == 0x81);
+    try check(session.result.row_count == 0);
+    try check((try execute(&session, &db, "SELECT TOP 1 [x]]y] FROM [a]]b] ORDER BY priority ASC"))[0] == 0x81);
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 4);
+    try check((try execute(&session, &db, "SELECT TOP (2) WITH TIES priority FROM [a]]b] ORDER BY priority DESC"))[0] == 0x81);
+    try check(session.result.row_count == 3);
+    for (session.result.rows[0..3]) |*row| try check(row.cells[0].integer == 7);
+    try check((try execute(&session, &db, "SELECT TOP 1 2 UNION ALL SELECT TOP 1 1 ORDER BY 1"))[0] == 0x81);
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[0].integer == 1 and session.result.rows[1].cells[0].integer == 2);
+    const negative = try execute(&session, &db, "SELECT TOP (-1) 1");
+    try check(negative[0] == 0xaa);
+    var reader: Reader = .{ .source = negative, .pos = 3 };
+    try check(try reader.numeric(4) == 1014);
+    for ([_][]const u8{
+        "SELECT TOP (1) PERCENT 1", "SELECT TOP (1) WITH TIES 1", "SELECT TOP (1) 1 LIMIT 1",
+        "SELECT TOP (1) 1 ORDER BY 1 OFFSET 1 ROWS", "SELECT 1 AS [unterminated",
+        "CREATE VIEW scoped_view AS SELECT TOP (1) 1 AS x",
+        "CREATE VIEW scoped_view AS SELECT 1 AS [x]",
+    }) |statement| try check((try execute(&session, &db, statement))[0] == 0xaa);
+    try check(store.database.tableCount() == 1);
+    var other: DB = .{ .store = &store, .id = 2 };
+    var result: Raw.Result = .{};
+    if (other.execute("SELECT 1 AS [value]", &result)) |_| return error.TdsContractFailed else |err| try check(err == error.Syntax);
+    try other.execute("SELECT (ARRAY[1,2])[1]", &result);
+    try check(result.rows[0].cells[0].integer == 1);
+}
+
 fn transactionManagerAndPreflight() !void {
     store = .{};
     var db: DB = .{ .store = &store, .id = 1 };
@@ -567,6 +607,7 @@ fn malformedAndFuzz() !void {
 pub fn main(init: std.process.Init) !void {
     try loginAndFragmentation();
     try typedRowsAndErrors();
+    try nativeIdentifiersAndTop();
     try outputFragmentation();
     try transactionManagerAndPreflight();
     try concurrentCommittedVisibility();

@@ -683,7 +683,7 @@ const Parser = struct {
         var depth: usize = 1;
         while (true) {
             if (self.current.kind == .end) return error.Syntax;
-            if (self.current.backtickIdentifier(self.source)) return error.UnsupportedStatement;
+            if (self.current.dialectQuotedIdentifier(self.source)) return error.UnsupportedStatement;
             if (self.symbol(.lparen)) depth += 1;
             if (self.symbol(.rparen)) {
                 depth -= 1;
