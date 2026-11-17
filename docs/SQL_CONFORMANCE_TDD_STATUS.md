@@ -1,5 +1,26 @@
 # SQL conformance TDD checkpoint
 
+## Native wire checkpoint — 18 November 2026
+
+RAMSQL `0af167b420edd605597bf5bb7c25dc0fc9483136` with ZPM
+`aa0250509ebb1befb9d9864bd98581f7e695f970` matched all 118 original smoke
+programs. The PostgreSQL 18.3 run used durable cluster mode with prepared
+transactions enabled and matched all 106. MySQL Community 8.4.13 and SQL
+Server 2022 CU28 each matched all six.
+
+| Report | Binary SHA-256 | Report SHA-256 |
+| --- | --- | --- |
+| PostgreSQL 18.3 on Windows x64 | `725e18c21a65f00d42d25f41e845d8bae7e31231ca99d1b1335e6889fbe74c29` | `e9e55e37977c93b353c4e707e297dff054ec2f86b02bb668b96a47892a4f4664` |
+| MySQL 8.4.13 on Windows x64 | `725e18c21a65f00d42d25f41e845d8bae7e31231ca99d1b1335e6889fbe74c29` | `63a3f23e14f3ffb62a86258f1fd89a5393dd7df0c288b191376686a72e960091` |
+| SQL Server 2022 CU28 on Linux x64 | `216383efebbb7de87560c20e39cd0e990a0518e120c39ee49ecf91f491b7f7c6` | `8b88d9c1a0833e27c359068a3ca341438f7b6f625d2bcd3f0ca03de1d07bf674` |
+
+The broader PostgreSQL 18 durable SCRAM suite matched 327 of 331 cases on the
+same revision. Four catalog queries using `regclass` failed on the detached
+read lane. Follow the replacement release matrix for closure of that regression.
+[SQL Server comparison](https://github.com/benor1470/dbMeter/actions/runs/44185665967) ·
+[PostgreSQL qualification](https://github.com/SB0LTD/ramsql/actions/runs/44185459464) ·
+[Replacement matrix](https://github.com/SB0LTD/ramsql/actions/runs/44189642358)
+
 ## Native wire checkpoint — 17 November 2026
 
 RAMSQL `b90354c8911b22a340fb68d15383205cd2ccf4b5` with ZPM
