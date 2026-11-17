@@ -23,7 +23,7 @@ pub const Span = struct {
 };
 
 /// An identifier as written. Unquoted names fold to lower case; quoted
-/// names keep their case and collapse `""`.
+/// names keep their case and collapse doubled delimiters.
 pub const Ident = struct {
     span: Span = .{},
     quoted: bool = false,
@@ -59,6 +59,8 @@ pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, n
     // Full text search @@ (tsvector @@ tsquery, either order).
     text_match };
 
+pub const DateAddPart = enum { days, weeks, months, quarters, years };
+
 /// Built-in functions bound by name.
 pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
     // String functions (B11, functions_string.sig).
@@ -67,7 +69,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     power, ln, log, log10, exp, mod, div, pi, degrees, radians, cbrt, sin, cos, tan, cot, asin, acos, atan, atan2, gcd, lcm, scale, min_scale, trim_scale,
     // Date/time functions (B11, functions_temporal.sig); *_tz are the STABLE
     // timestamptz (session time zone) overloads chosen by the binder.
-    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite,
+    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite, tds_dateadd, tds_isnull,
     // (a, b) OVERLAPS (c, d); overlaps_tz is the STABLE timestamptz + interval form.
     overlaps, overlaps_tz,
     // Internal: the (Y, X) input of a two-argument aggregate, NULL when either is.
@@ -132,7 +134,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     regexp_like, similar_to_escape,
     // Full text search (B11 text lane, text_search.sig): the first argument
     // is the regconfig name.
-    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery };
+    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -205,7 +207,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
-        .overlaps, .aggregate_pair, .normalize, .is_normalized => true,
+        .overlaps, .aggregate_pair, .normalize, .is_normalized, .mysql_date_add => true,
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
         .array_append, .array_prepend, .array_cat => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
@@ -250,6 +252,8 @@ pub fn strictFunction(func: Func) bool {
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).
 pub const regclass_typmod: i32 = -2;
 pub const regtype_typmod: i32 = -3;
+/// Wire metadata for MySQL DATE_ADD returning its fixed date string.
+pub const mysql_date_text_typmod: i32 = -4;
 
 /// Node.reg: an OID-valued expression known to be a regclass / regtype.
 pub const Reg = enum(u8) { none, regclass, regtype };
@@ -368,6 +372,14 @@ pub const Node = struct {
     planned_null: bool = false,
     /// Binder-validated DATE literal: integer stores its exact day count.
     date_bound: bool = false,
+    /// A bound, root-projection domain cast. `integer` holds the CHECK bound.
+    domain_cast: bool = false,
+    /// A root literal cast whose decoded text labels were validated by binding.
+    enum_cast: bool = false,
+    /// A root flat ROW cast. `integer` holds the declared field count.
+    flat_record_cast: bool = false,
+    domain_not_null: bool = false,
+    domain_comparison: catalog_objects.DomainComparison = .none,
     ty: Type = .unknown,
     cast_type: TypeName = .int4,
     /// Cast target typmod (-1 none).
@@ -686,10 +698,11 @@ pub fn Ast(comptime config: types.Config) type {
             alias: ?Ident = null,
         };
 
-        /// RETURNING target list (count 0: none).
+        /// RETURNING or T-SQL OUTPUT target list (count 0: none).
         pub const Returning = struct {
             targets: [config.columns]Target = undefined,
             count: usize = 0,
+            output: bool = false,
         };
 
         pub const InsertSource = enum { values, query, default_values };
@@ -720,6 +733,7 @@ pub fn Ast(comptime config: types.Config) type {
             /// INSERT ... SELECT: index into Pool.queries.
             query: u16 = none,
             overriding: Overriding = .none,
+            replace: bool = false,
             conflict: ?OnConflict = null,
             returning: Returning = .{},
         };
@@ -1093,10 +1107,14 @@ pub const SettingValue = struct {
 
 /// Transaction control and session commands; executed by the store, never
 /// by a single statement.
+pub const PreparedTransactionAction = enum { prepare, commit, rollback };
+
 pub const Control = union(enum) {
+    maintenance: struct { operation: enum { vacuum, analyze }, schema: ?Ident, name: Ident },
     begin: Characteristics,
     commit: void,
     rollback: void,
+    prepared_transaction: struct { action: PreparedTransactionAction, gid: lexer.Quoted },
     savepoint: Ident,
     release: Ident,
     rollback_to: Ident,

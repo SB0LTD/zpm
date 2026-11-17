@@ -633,6 +633,136 @@ fn rewoundOidReplay() !void {
     try check(try sameDatabase(&db, &restarted) and try sameCatalog(&db, &restarted));
 }
 
+fn replayCardinality() !void {
+    var producer: DB = .{};
+    var replayed: DB = .{};
+    var log: Log = .{};
+    const initial = try producer.begin();
+    try run(&producer, initial, "CREATE TABLE t(id INT PRIMARY KEY, label TEXT, flag BOOL)");
+    try run(&producer, initial, "INSERT INTO t VALUES(1,'old',NULL),(2,'old',NULL),(3,'old',NULL),(4,'old',NULL),(5,'old',NULL),(6,'old',NULL),(7,'old',NULL),(8,'old',NULL)");
+    try log.commit(&producer, initial);
+    var result: DB.Result = .{};
+    var mixed: [1024]u8 = undefined;
+    var mixed_used: usize = 0;
+    for ([_][]const u8{ "DELETE FROM t WHERE id=1", "INSERT INTO t VALUES(9,'new',TRUE)", "UPDATE t SET label='changed' WHERE id=8" }) |source| {
+        try producer.executeChanges(source, &result, &mixed, &mixed_used, null, null);
+    }
+    var truncated: [1024]u8 = undefined;
+    var truncated_used: usize = 0;
+    try producer.executeChanges("TRUNCATE t", &result, &truncated, &truncated_used, null, null);
+    try producer.executeChanges("INSERT INTO t VALUES(10,'after',FALSE),(11,'after',NULL)", &result, &truncated, &truncated_used, null, null);
+
+    try replayed.applyChangeRecord(log.record(0), &scratch);
+    try check(replayed.tables[0].summary.rows == 8 and replayed.tables[0].row_used == 8);
+    try replayed.applyChangeRecord(mixed[0..mixed_used], &scratch);
+    try check(replayed.tables[0].summary.rows == 8 and replayed.tables[0].row_used == 8);
+    try replayed.applyChangeRecord(truncated[0..truncated_used], &scratch);
+    try check(replayed.tables[0].summary.rows == 2 and replayed.tables[0].row_used == 2);
+    try check(try sameDatabase(&producer, &replayed));
+
+    // An invalid or disagreeing seed cannot admit an overflowing record.
+    var full: DB = .{};
+    try full.applyChangeRecord(log.record(0), &scratch);
+    const summary = full.tables[0].summary;
+    const old_csn = full.csn;
+    var overflow: Builder = .{};
+    overflow.row(3, oid, 40, 40, "overflow");
+    for (0..3) |mode| {
+        full.tables[0].summary = summary;
+        switch (mode) {
+            0 => full.tables[0].summary.valid = false,
+            1 => full.tables[0].summary.rows = 0,
+            else => full.tables[0].summary.csn = full.csn + 1,
+        }
+        if (full.applyChangeRecord(overflow.record(), &scratch)) |_| return error.FullReplayAccepted else |err| try check(err == error.ChangeRecordConflict);
+        try check(full.csn == old_csn and full.tables[0].row_used == 8);
+    }
+    full.tables[0].summary = summary;
+
+    // Legacy or pinned history can occupy a row slot after DELETE. Such a
+    // row must stay out of the logical capacity count during validation.
+    const reader = try full.begin();
+    full.txs[reader].pin = .{ .csn = full.csn };
+    try full.execute("DELETE FROM t WHERE id=1", &result);
+    full.abort(reader);
+    try check(full.tables[0].summary.rows == 7 and full.tables[0].row_used == 8);
+    try full.applyChangeRecord(overflow.record(), &scratch);
+    try check(full.tables[0].summary.rows == 8 and full.tables[0].row_used == 8);
+    try check(try integer(&full, "SELECT id FROM t WHERE id=40") == 40);
+}
+
+fn truncateCurrentHorizon() !void {
+    var primary: DB = .{};
+    var restarted: DB = .{};
+    var log: Log = .{};
+    const setup = try primary.begin();
+    try run(&primary, setup, "CREATE TABLE t(id INT PRIMARY KEY, amount INT)");
+    try run(&primary, setup, "INSERT INTO t VALUES(1,10),(2,20)");
+    try log.commit(&primary, setup);
+
+    const truncator = try primary.begin();
+    try run(&primary, truncator, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    try run(&primary, truncator, "SELECT 1");
+    const stale_reader = try primary.begin();
+    try run(&primary, stale_reader, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    try run(&primary, stale_reader, "SELECT 1");
+    const concurrent = try primary.begin();
+    try run(&primary, concurrent, "UPDATE t SET amount=11 WHERE id=1");
+    try run(&primary, concurrent, "DELETE FROM t WHERE id=2");
+    try run(&primary, concurrent, "INSERT INTO t VALUES(3,30)");
+    try log.commit(&primary, concurrent);
+
+    var result: DB.Result = .{};
+    try run(&primary, truncator, "INSERT INTO t VALUES(4,40)");
+    try primary.savepoint(truncator, "before_truncate");
+    try run(&primary, truncator, "TRUNCATE t");
+    try primary.statement(truncator, "SELECT id FROM t", &result, .{});
+    try check(result.row_count == 0);
+    try run(&primary, truncator, "INSERT INTO t VALUES(5,50)");
+    try primary.savepoint(truncator, "before_second");
+    try run(&primary, truncator, "TRUNCATE t");
+    try primary.statement(truncator, "SELECT id FROM t", &result, .{});
+    try check(result.row_count == 0);
+    _ = try primary.rollbackTo(truncator, "before_second");
+    try primary.statement(truncator, "SELECT id FROM t", &result, .{});
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 5);
+    _ = try primary.rollbackTo(truncator, "before_truncate");
+    try primary.statement(truncator, "SELECT id FROM t ORDER BY id", &result, .{});
+    try check(result.row_count == 3 and result.rows[0].cells[0].integer == 1 and
+        result.rows[1].cells[0].integer == 2 and result.rows[2].cells[0].integer == 4);
+    try run(&primary, truncator, "TRUNCATE t");
+    try run(&primary, truncator, "INSERT INTO t VALUES(5,50)");
+    try log.commit(&primary, truncator);
+    try primary.statement(stale_reader, "SELECT id FROM t", &result, .{});
+    try check(result.row_count == 0);
+    primary.abort(stale_reader);
+    try check(try integer(&primary, "SELECT COUNT(*) FROM t") == 1);
+    try check(try integer(&primary, "SELECT id FROM t") == 5);
+    try check(primary.tables[0].summary.rows == 1);
+    try log.replay(&restarted);
+    try check(try sameDatabase(&primary, &restarted));
+
+    const holder = try primary.begin();
+    try run(&primary, holder, "SELECT id FROM t");
+    const waiter = try primary.begin();
+    if (primary.statement(waiter, "TRUNCATE t", &result, .{})) |_|
+        return error.TruncateBypassedAccessShare
+    else |err| try check(err == error.WouldBlock);
+    primary.abort(waiter);
+    primary.abort(holder);
+    try check(try sameDatabase(&primary, &restarted));
+
+    const stale_binding = try primary.begin();
+    try run(&primary, stale_binding, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    try run(&primary, stale_binding, "SELECT 1");
+    try primary.execute("ALTER TABLE t ADD COLUMN extra INT", &result);
+    if (primary.statement(stale_binding, "TRUNCATE t", &result, .{})) |_|
+        return error.StaleTruncateBindingAccepted
+    else |err| try check(err == error.SerializationFailure);
+    primary.abort(stale_binding);
+    try check(try integer(&primary, "SELECT id FROM t") == 5);
+}
+
 pub fn main(init: std.process.Init) !void {
     try roundTrips();
     try corruption();
@@ -642,6 +772,8 @@ pub fn main(init: std.process.Init) !void {
     try oidConflicts();
     try keyedIndexCollision();
     try rewoundOidReplay();
+    try replayCardinality();
+    try truncateCurrentHorizon();
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-change-log\",\"pass\":true,\"assertions\":{d},\"rejected_flips\":{d},\"accepted_flips\":{d}}}\n", .{ assertions, rejected_flips, accepted_flips });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

@@ -102,10 +102,23 @@ pub fn Dml(comptime config: types.Config) type {
 
         /// `values[c]` none or a default_value node takes the column default.
         pub fn insertedRow(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived) Error!E.Row {
+            return insertedRowWithValue(ctx, table, values, derived, {});
+        }
+
+        pub const InsertValue = struct { column: usize, value: i64 };
+
+        /// An engine-owned explicit value, checked with the other assignments.
+        pub fn insertedRowWithValue(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived, replacement: anytype) Error!E.Row {
             var cells: E.Row = @splat(.null_value);
             ctx.row = null;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
                 if (column.default_kind == .generated) continue;
+                if (comptime @TypeOf(replacement) == InsertValue) {
+                    if (index == replacement.column) {
+                        cells[index] = try store(column, .{ .integer = replacement.value }, ctx.session);
+                        continue;
+                    }
+                }
                 const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, derived, index) else try E.eval(ctx, values[index]);
                 cells[index] = try store(column, evaluated, ctx.session);
             }
@@ -190,44 +203,6 @@ pub fn Dml(comptime config: types.Config) type {
             }
             try computeGenerated(ctx, table, derived, cells);
             try checkConstraints(ctx, table, derived, cells);
-        }
-
-        /// `taken` is the conflicting (newest committed or own) version.
-        pub const KeyState = union(enum) { free, taken: u32, wait: u16 };
-
-        /// Unique-index check against the newest state, like PostgreSQL's
-        /// dirty snapshot: a key is taken by a committed live row, or by a
-        /// version the snapshot's own transaction created and still holds;
-        /// a version created or deleted by another live transaction means
-        /// the inserter must wait for that transaction (`wait`).
-        pub fn keyCheck(table: *const S.Table, key: *const V.Cell, own_slot: u32, snap: storage.Snapshot) KeyState {
-            const column = table.primary_column orelse return .free;
-            if (key.* == .null_value) return .free;
-            var waiting: ?u16 = null;
-            const mask = table.key_index.len - 1;
-            var position = V.hash(key) & mask;
-            while (true) : (position = (position + 1) & mask) {
-                const entry = table.key_index[position];
-                if (entry == 0) break;
-                const version = &table.versions[entry - 1];
-                if (V.compare(&version.cells[column], key) != 0) continue;
-                if (version.row - 1 == own_slot) continue;
-                const marked = version.xmax.epoch != 0;
-                if (version.xmin_csn == 0) {
-                    if (snap.own(version.xmin)) {
-                        if (marked and snap.own(version.xmax)) continue;
-                        return .{ .taken = entry - 1 };
-                    }
-                    // Another live inserter; a version it replaced itself is
-                    // superseded by a newer indexed version.
-                    if (!marked and waiting == null) waiting = version.xmin.slot;
-                    continue;
-                }
-                if (!marked) return .{ .taken = entry - 1 };
-                if (version.xmax_csn != 0 or snap.own(version.xmax)) continue;
-                if (waiting == null) waiting = version.xmax.slot;
-            }
-            return if (waiting) |slot| .{ .wait = slot } else .free;
         }
     };
 }

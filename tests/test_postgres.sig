@@ -353,7 +353,9 @@ fn characterDescriptions() !void {
 fn commandText(bytes: []const u8, wanted: []const u8) !void {
     var frames: Frames = .{ .bytes = bytes };
     while (try frames.next()) |f| if (f.tag == 'C') {
-        try check(equal(f.body[0 .. f.body.len - 1], wanted));
+        const actual = f.body[0 .. f.body.len - 1];
+        if (!equal(actual, wanted)) std.debug.print("command completion: expected {s}, got {s}\n", .{ wanted, actual });
+        try check(equal(actual, wanted));
         return;
     };
     return error.MissingCommandComplete;
@@ -996,6 +998,118 @@ fn authChallenge(s: anytype, db: anytype) ![]const u8 {
 fn authFirst(s: anytype, db: anytype) !void {
     try check(equal(try authChallenge(s, db), "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"));
 }
+const RoutedDB = struct {
+    pub const Result = DB.Result;
+    calls: usize = 0,
+    sql_calls: usize = 0,
+    method: ?pg.StartupMethod = null,
+    default_database: bool = false,
+    expected_option: bool = false,
+
+    pub fn execute(self: *@This(), _: []const u8, _: *Result) !void {
+        self.sql_calls += 1;
+        return error.UnsupportedStatement;
+    }
+
+    pub fn startupParameter(_: *@This(), _: []const u8, _: []const u8) !void {
+        return error.LegacyStartupParameterCalled;
+    }
+
+    pub fn admitPostgresStartup(self: *@This(), request: pg.StartupAdmission) !void {
+        self.calls += 1;
+        self.method = request.method;
+        if (!equal(request.user, "user")) return error.AdmissionDenied;
+        self.default_database = equal(request.database, request.user);
+        if (!self.default_database and !equal(request.database, "beta")) return error.DatabaseNotFound;
+        var params = request.parameters();
+        while (try params.next()) |param| {
+            if (equal(param.key, "application_name") and equal(param.value, "registry")) self.expected_option = true;
+        }
+    }
+};
+
+fn routedStartup(database: ?[]const u8, duplicate: bool) Packet {
+    var packet = Packet.init(0);
+    packet.len = 4;
+    packet.number32(196608);
+    packet.string("user");
+    packet.string("user");
+    if (database) |name| {
+        packet.string("database");
+        packet.string(name);
+        if (duplicate) {
+            packet.string("database");
+            packet.string("beta");
+        }
+    }
+    packet.string("application_name");
+    packet.string("registry");
+    packet.byte(0);
+    put32(packet.bytes[0..4], @intCast(packet.len));
+    return packet;
+}
+
+fn routedStartupContracts() !void {
+    const RoutedSession = pg.Session(RoutedDB);
+    const verifier = try scram.Verifier.parse("user", scram_verifier);
+    var proof = Packet.init('p');
+    proof.append(scram_final);
+    var query_packet = Packet.init('Q');
+    query_packet.string("SELECT 1");
+
+    for ([_][]const u8{ "beta", "missing" }) |database| {
+        var db: RoutedDB = .{};
+        var session: RoutedSession = .{};
+        try session.configureAuthentication(&verifier, scram_nonce);
+        var startup_packet = routedStartup(database, false);
+        const frame_len = startup_packet.len;
+        startup_packet.append(query_packet.slice());
+        for (0..frame_len) |prefix| {
+            const partial = try session.handle(&db, startup_packet.bytes[0..prefix], &output);
+            try check(partial.consumed == 0 and partial.written == 0 and !partial.close and db.calls == 0);
+        }
+        const initial = try session.handle(&db, startup_packet.bytes[0..startup_packet.len], &output);
+        try check(initial.consumed == frame_len and !initial.close and db.calls == 0 and db.sql_calls == 0);
+        try tags(output[0..initial.written], "R");
+        @memset(startup_packet.bytes[0..startup_packet.len], 0);
+        try authFirst(&session, &db);
+        try check(db.calls == 0);
+        const final = try session.handle(&db, proof.slice(), &output);
+        try check(db.calls == 1 and db.method == .scram and !db.default_database);
+        if (equal(database, "beta")) {
+            try check(!final.close and db.expected_option);
+            try tags(output[0..final.written], "RRSSSSSSSKZ");
+        } else {
+            try check(final.close);
+            try tags(output[0..final.written], "E");
+            try state(output[0..final.written], "3D000");
+            try check((try session.handle(&db, query_packet.slice(), &output)).close and db.sql_calls == 0);
+        }
+    }
+
+    var db: RoutedDB = .{};
+    var wrong: RoutedSession = .{};
+    try wrong.configureAuthentication(&verifier, scram_nonce);
+    try authStartup(&wrong, &db, "wrong");
+    try authFirst(&wrong, &db);
+    const denied = try wrong.handle(&db, proof.slice(), &output);
+    try check(denied.close and db.calls == 0);
+    try state(output[0..denied.written], "28P01");
+
+    var trusted: RoutedSession = .{};
+    const startup_packet = routedStartup(null, false);
+    const accepted = try trusted.handle(&db, startup_packet.bytes[0..startup_packet.len], &output);
+    try check(!accepted.close and db.calls == 1 and db.method == .trusted and db.default_database and db.expected_option);
+    try tags(output[0..accepted.written], "RSSSSSSSKZ");
+
+    var invalid_startup: RoutedSession = .{};
+    const duplicate = routedStartup("beta", true);
+    const rejected = try invalid_startup.handle(&db, duplicate.bytes[0..duplicate.len], &output);
+    try check(rejected.close and db.calls == 1);
+    try state(output[0..rejected.written], "08P01");
+    try check((try invalid_startup.handle(&db, startup_packet.bytes[0..startup_packet.len], &output)).close and db.calls == 1);
+}
+
 fn authenticationContracts() !void {
     var db: DB = .{};
     var v = try scram.Verifier.parse("user", scram_verifier);
@@ -1177,6 +1291,147 @@ fn parameterStatus(bytes: []const u8, name: []const u8, value: ?[]const u8) bool
     return false;
 }
 
+fn detachedPrimaryKeys() !void {
+    var store: Store = .{};
+    var db: Store.Connection = .{ .store = &store, .id = 1 };
+    var s: StoreSession = .{};
+    var context: Raw.ReadContext = .{};
+    _ = try storeStartup(&s, &db, "");
+    _ = try storeQuery(&s, &db, "CREATE TABLE pk (id BIGINT PRIMARY KEY)");
+    _ = try storeQuery(&s, &db, "INSERT INTO pk VALUES (-9),(7)");
+    const template = "SELECT id FROM pk WHERE id=$1";
+    const replacement = "SELECT id FROM pk WHERE id=$1 AND 1=0";
+    var p = Packet.init('P');
+    p.string("");
+    p.string(template);
+    p.number16(1);
+    p.number32(20);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "1");
+    p = Packet.init('B');
+    p.string("held");
+    p.string("");
+    p.number16(1);
+    p.number16(1);
+    p.number16(1);
+    p.number32(8);
+    p.append("\xff\xff\xff\xff\xff\xff\xff\xf7");
+    p.number16(1);
+    p.number16(1);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "2");
+
+    // The unnamed Parse slot can be replaced before the named portal runs.
+    p = Packet.init('P');
+    p.string("");
+    p.string(replacement);
+    p.number16(1);
+    p.number32(20);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "1");
+    p = Packet.init('D');
+    p.byte('P');
+    p.string("held");
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "T");
+    p = Packet.init('E');
+    p.string("held");
+    p.number32(1);
+    try check(s.detachedPrimaryKey(p.slice()) == null);
+    p = Packet.init('E');
+    p.string("held");
+    p.number32(0);
+    const frame = p.slice();
+    try check(s.detachedPrimaryKey(frame[0..frame.len-1]) == null);
+    const hint = s.detachedPrimaryKey(frame) orelse return error.MissingPrimaryKeyHint;
+    try check(equal(hint.source, template) and hint.oid == 20 and hint.key == -9);
+    const snap: Raw.Snapshot = .{.csn=store.database.csn};
+    try check(db.detachedReadEligible());
+    try check(try context.preparePrimaryKey(&store.database, hint.source, snap, .integer));
+    db.read_context = &context;
+    db.running_statement = true;
+    const wire = store_output[0..(try storeSend(&s, &db, &p)).written];
+    db.read_context = null;
+    db.running_statement = false;
+    try tags(wire, "DC");
+    var frames: Frames = .{ .bytes = wire };
+    const row = (try frames.next()).?;
+    try check(u32be(row.body[2..6]) == 8 and equal(row.body[6..14], "\xff\xff\xff\xff\xff\xff\xff\xf7"));
+    try check(s.detachedPrimaryKey(frame) == null);
+
+    // NULL and signed text use the same owned candidate record. If no
+    // matching read plan is installed, Execute continues through plain SQL.
+    p = Packet.init('B');
+    p.string("empty");
+    p.string("");
+    p.number16(1);
+    p.number16(0);
+    p.number16(1);
+    p.number32(0xffffffff);
+    p.number16(0);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "2");
+    p = Packet.init('E');
+    p.string("empty");
+    p.number32(0);
+    const null_hint = s.detachedPrimaryKey(p.slice()) orelse return error.MissingPrimaryKeyHint;
+    try check(null_hint.key == null and equal(null_hint.source, replacement));
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "C");
+
+    p = Packet.init('B');
+    p.string("text");
+    p.string("");
+    p.number16(0);
+    p.number16(1);
+    p.number32(2);
+    p.append("+7");
+    p.number16(0);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "2");
+    p = Packet.init('E');
+    p.string("text");
+    p.number32(0);
+    try check((s.detachedPrimaryKey(p.slice()) orelse return error.MissingPrimaryKeyHint).key == 7);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "C");
+
+    // Describe uses the same worker AST workspace. A second Bind with the
+    // original template can still hit the independent owned plan.
+    try context.describe(&store.database, "SELECT 1", snap, &s.result);
+    p = Packet.init('P');
+    p.string("");
+    p.string(template);
+    p.number16(1);
+    p.number32(20);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "1");
+    p = Packet.init('B');
+    p.string("reused");
+    p.string("");
+    p.number16(0);
+    p.number16(1);
+    p.number32(1);
+    p.byte('7');
+    p.number16(0);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "2");
+    p = Packet.init('E');
+    p.string("reused");
+    p.number32(0);
+    const repeated = s.detachedPrimaryKey(p.slice()) orelse return error.MissingPrimaryKeyHint;
+    try check(try context.preparePrimaryKey(&store.database, repeated.source, snap, .integer));
+    try check(context.primary_key_cache_hits == 1);
+    db.read_context = &context;
+    db.running_statement = true;
+    db.engine_session.values.role = 2468;
+    try check(!try db.executeDetachedPrimaryKey(repeated.source, 20, repeated.key, "SELECT 7", &s.result));
+    db.engine_session.values.role = 0;
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "DC");
+    db.read_context = null;
+    db.running_statement = false;
+    try check(s.result.row_count == 1 and s.result.rows[0].cells[0].integer == 7);
+
+    _ = try storeQuery(&s, &db, "UPDATE pk SET id=8 WHERE id=7");
+    const after: Raw.Snapshot = .{.csn=store.database.csn};
+    const old_key: Raw.Cell = .{.integer=7};
+    try check(!try context.runPrimaryKey(&store.database, after, &old_key, &s.result));
+    try check(try context.preparePrimaryKey(&store.database, template, after, .integer));
+    try check(context.primary_key_cache_hits == 1);
+    try check(try context.runPrimaryKey(&store.database, after, &old_key, &s.result));
+    try check(s.result.row_count == 0);
+}
+
 fn commandTag(bytes: []const u8, wanted: []const u8) !void {
     var frames: Frames = .{ .bytes = bytes };
     while (try frames.next()) |f| if (f.tag == 'C') {
@@ -1184,6 +1439,93 @@ fn commandTag(bytes: []const u8, wanted: []const u8) !void {
         return;
     };
     return error.MissingCommandTag;
+}
+
+fn completedStoreCommand(s: *StoreSession, db: *Store.Connection, source: []const u8, expected: []const u8, extended_query: bool) !void {
+    errdefer std.debug.print("{s} completion for {s}\n", .{ if (extended_query) "extended" else "simple", source });
+    if (!extended_query) {
+        const bytes = try storeQuery(s, db, source);
+        try tags(bytes, "CZ");
+        try commandTag(bytes, expected);
+        return;
+    }
+    var parse_packet = Packet.init('P');
+    parse_packet.string("");
+    parse_packet.string(source);
+    parse_packet.number16(0);
+    const parsed = try storeSend(s, db, &parse_packet);
+    try tags(store_output[0..parsed.written], "1");
+
+    var bind_packet = Packet.init('B');
+    bind_packet.string("");
+    bind_packet.string("");
+    bind_packet.number16(0);
+    bind_packet.number16(0);
+    bind_packet.number16(0);
+    const bound = try storeSend(s, db, &bind_packet);
+    try tags(store_output[0..bound.written], "2");
+
+    var execute_packet = Packet.init('E');
+    execute_packet.string("");
+    execute_packet.number32(0);
+    const executed = try storeSend(s, db, &execute_packet);
+    const bytes = store_output[0..executed.written];
+    try tags(bytes, "C");
+    try commandTag(bytes, expected);
+
+    var sync_packet = Packet.init('S');
+    const synchronized = try storeSend(s, db, &sync_packet);
+    try tags(store_output[0..synchronized.written], "Z");
+}
+
+/// PostgreSQL 18.3 reports affected rows for MERGE and the source rows of
+/// populated CREATE AS statements. Their result sets remain empty.
+fn nativeCommandCompletions(extended_query: bool) !void {
+    var store: Store = .{};
+    var db: Store.Connection = .{ .store = &store, .id = 1 };
+    defer db.disconnect();
+    var session: StoreSession = .{};
+    _ = try storeStartup(&session, &db, "");
+    const fixture = [_]struct { source: []const u8, completion: []const u8 }{
+        .{ .source = "CREATE TABLE completion_src (id INT PRIMARY KEY, value INT)", .completion = "CREATE TABLE" },
+        .{ .source = "INSERT INTO completion_src VALUES (1,11),(2,22),(3,33)", .completion = "INSERT 0 3" },
+        .{ .source = "BEGIN", .completion = "BEGIN" },
+        .{ .source = "SET CONSTRAINTS ALL IMMEDIATE", .completion = "SET CONSTRAINTS" },
+        .{ .source = "COMMIT", .completion = "COMMIT" },
+        .{ .source = "CREATE INDEX completion_ix ON completion_src (value)", .completion = "CREATE INDEX" },
+        .{ .source = "CREATE INDEX IF NOT EXISTS completion_ix ON completion_src (value)", .completion = "CREATE INDEX" },
+        .{ .source = "CREATE INDEX completion_adv ON completion_src ((value+1)) INCLUDE (id) WHERE value IS NOT NULL", .completion = "CREATE INDEX" },
+        .{ .source = "CREATE VIEW completion_view AS SELECT id FROM completion_src", .completion = "CREATE VIEW" },
+    };
+    for (fixture) |command| try completedStoreCommand(&session, &db, command.source, command.completion, extended_query);
+    try tags(try storeQuery(&session, &db, "DROP VIEW completion_view"), "CZ");
+
+    try completedStoreCommand(&session, &db, "CREATE TEMP TABLE completion_copy AS SELECT id FROM completion_src", "SELECT 3", extended_query);
+    try completedStoreCommand(&session, &db, "DROP TABLE completion_copy", "DROP TABLE", extended_query);
+    try completedStoreCommand(&session, &db, "CREATE TABLE completion_copy AS SELECT id FROM completion_src WHERE FALSE", "SELECT 0", extended_query);
+    try completedStoreCommand(&session, &db, "CREATE TABLE IF NOT EXISTS completion_copy AS SELECT id FROM completion_src", "CREATE TABLE AS", extended_query);
+    try completedStoreCommand(&session, &db, "DROP TABLE completion_copy", "DROP TABLE", extended_query);
+    try completedStoreCommand(&session, &db, "CREATE TABLE completion_copy AS SELECT id FROM completion_src WITH NO DATA", "CREATE TABLE AS", extended_query);
+    try completedStoreCommand(&session, &db, "DROP TABLE completion_copy", "DROP TABLE", extended_query);
+
+    try completedStoreCommand(&session, &db, "CREATE MATERIALIZED VIEW completion_mv AS SELECT id FROM completion_src WHERE id <= 2", "SELECT 2", extended_query);
+    try completedStoreCommand(&session, &db, "REFRESH MATERIALIZED VIEW completion_mv", "REFRESH MATERIALIZED VIEW", extended_query);
+    try tags(try storeQuery(&session, &db, "DROP MATERIALIZED VIEW completion_mv"), "CZ");
+    try completedStoreCommand(&session, &db, "CREATE MATERIALIZED VIEW completion_mv AS SELECT id FROM completion_src WHERE FALSE", "SELECT 0", extended_query);
+    try tags(try storeQuery(&session, &db, "DROP MATERIALIZED VIEW completion_mv"), "CZ");
+    try completedStoreCommand(&session, &db, "CREATE MATERIALIZED VIEW completion_mv AS SELECT id FROM completion_src WITH NO DATA", "CREATE MATERIALIZED VIEW", extended_query);
+    try tags(try storeQuery(&session, &db, "DROP MATERIALIZED VIEW completion_mv"), "CZ");
+
+    try completedStoreCommand(&session, &db, "CREATE TABLE completion_dst (id INT PRIMARY KEY, value INT)", "CREATE TABLE", extended_query);
+    try completedStoreCommand(&session, &db, "INSERT INTO completion_dst VALUES (1,0),(2,0)", "INSERT 0 2", extended_query);
+    const merge_source = "MERGE INTO completion_dst d USING completion_src s ON d.id=s.id ";
+    try completedStoreCommand(&session, &db, merge_source ++
+        "WHEN MATCHED AND s.id=2 THEN DELETE WHEN MATCHED THEN UPDATE SET value=s.value " ++
+        "WHEN NOT MATCHED THEN INSERT (id,value) VALUES (s.id,s.value)", "MERGE 3", extended_query);
+    try completedStoreCommand(&session, &db, merge_source ++
+        "WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED THEN DO NOTHING", "MERGE 0", extended_query);
+    try tags(try storeQuery(&session, &db, "SELECT id,value FROM completion_dst ORDER BY id"), "TDDCZ");
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[1].integer == 11 and session.result.rows[1].cells[1].integer == 33);
 }
 
 /// SCRAM proof and committed catalog policy both precede readiness. The
@@ -1437,6 +1779,62 @@ fn storeContracts() !void {
 
 var oversized_session: Session = .{};
 var oversized_db: DB = .{};
+fn vacuumContracts() !void {
+    var store: Store = .{};
+    var connection: Store.Connection = .{ .store = &store, .id = 1 };
+    var session: StoreSession = .{};
+    _ = try storeStartup(&session, &connection, "");
+    try commandTag(try storeQuery(&session, &connection, "CREATE SCHEMA upkeep"), "CREATE SCHEMA");
+    try commandTag(try storeQuery(&session, &connection, "CREATE TABLE upkeep.fact(id INTEGER PRIMARY KEY,v INTEGER)"), "CREATE TABLE");
+    try commandTag(try storeQuery(&session, &connection, "INSERT INTO upkeep.fact VALUES(1,10)"), "INSERT 0 1");
+
+    const reader = try store.database.begin();
+    try store.database.beginModes(reader, .{ .isolation = .repeatable_read });
+    var held: DB.Result = .{};
+    try store.database.statement(reader, "SELECT v FROM upkeep.fact WHERE id=1", &held, .{});
+    try check(held.row_count == 1 and held.rows[0].cells[0].integer == 10);
+    try commandTag(try storeQuery(&session, &connection, "UPDATE upkeep.fact SET v=20 WHERE id=1"), "UPDATE 1");
+    const before = store.database.tables[0].version_used;
+    try check(before == 2);
+    try commandTag(try storeQuery(&session, &connection, "VACUUM upkeep.fact"), "VACUUM");
+    try check(store.database.tables[0].version_used == before);
+    try store.database.statement(reader, "SELECT v FROM upkeep.fact WHERE id=1", &held, .{});
+    try check(held.row_count == 1 and held.rows[0].cells[0].integer == 10);
+    store.database.abort(reader);
+
+    var record: [1024]u8 = undefined;
+    var used: usize = 0;
+    try store.database.executeChanges("VACUUM upkeep.fact", &held, &record, &used, null, null);
+    try check(used == 0 and held.command == .vacuum and store.database.tables[0].version_used == 1);
+    _ = try storeQuery(&session, &connection, "SELECT v FROM upkeep.fact WHERE id=1");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 20);
+    try commandTag(try storeQuery(&session, &connection, "BEGIN READ ONLY"), "BEGIN");
+    try state(try storeQuery(&session, &connection, "VACUUM upkeep.fact"), "25001");
+    try commandTag(try storeQuery(&session, &connection, "ROLLBACK"), "ROLLBACK");
+    try state(try storeQuery(&session, &connection, "VACUUM upkeep.missing"), "42P01");
+    try state(try storeQuery(&session, &connection, "VACUUM (FULL) upkeep.fact"), "0A000");
+
+    try commandTag(try storeQuery(&session, &connection, "INSERT INTO upkeep.fact VALUES(2,100),(3,NULL)"), "INSERT 0 2");
+    try commandTag(try storeQuery(&session, &connection, "DELETE FROM upkeep.fact WHERE id=3"), "DELETE 1");
+    try check(store.database.tables[0].summary.primary_bounds.high == 3);
+    {
+        var budget: sql.ExecutionControl = .{ .max_work = 1 };
+        store.database.session.control = &budget;
+        defer store.database.session.control = null;
+        if (store.database.execute("ANALYZE upkeep.fact", &held)) |_| return error.UnboundedAnalysis else |err| try check(err == error.QueryWorkLimit);
+        try check(store.database.tables[0].summary.primary_bounds.high == 3);
+    }
+    try commandTag(try storeQuery(&session, &connection, "ANALYZE upkeep.fact"), "ANALYZE");
+    const summary = &store.database.tables[0].summary;
+    try check(summary.rows == 2 and summary.columns[1].nonnull == 2 and summary.columns[1].total == 120);
+    try check(summary.primary_bounds.low == 1 and summary.primary_bounds.high == 2);
+    try commandTag(try storeQuery(&session, &connection, "BEGIN READ ONLY"), "BEGIN");
+    try commandTag(try storeQuery(&session, &connection, "ANALYSE upkeep.fact"), "ANALYZE");
+    try commandTag(try storeQuery(&session, &connection, "ROLLBACK"), "ROLLBACK");
+    try store.database.executeChanges("ANALYZE upkeep.fact", &held, &record, &used, null, null);
+    try check(used == 0 and held.command == .analyze);
+}
+
 fn oversizedFrames() !void {
     try startup(&oversized_session, &oversized_db);
     var header:[5]u8=.{ 'Q',0,0,0,0 };
@@ -1535,10 +1933,14 @@ pub fn main(init: std.process.Init) !void {
     try startupFraming();
     try initializedProtocolPrefixes();
     try detachedCandidates();
+    try detachedPrimaryKeys();
     try oversizedFrames();
     try roleAuthenticationContracts();
+    try nativeCommandCompletions(false);
+    try nativeCommandCompletions(true);
     try multiRoleAuthenticationContracts();
     try storeContracts();
+    try vacuumContracts();
     try returningOnce();
     try characterDescriptions();
     try normal();
@@ -1553,6 +1955,7 @@ pub fn main(init: std.process.Init) !void {
     try statementLifecycle();
     try malformed();
     try authenticationContracts();
+    try routedStartupContracts();
     try backendErrorStates();
     try fuzz();
     var report: [256]u8 = undefined;

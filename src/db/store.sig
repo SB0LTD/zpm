@@ -300,9 +300,22 @@ pub fn Store(comptime Raw: type) type {
     const EngineSession = if (has_engine_session) Raw.SessionState else struct {};
     const NotificationType = if (has_engine_session) Raw.Notification else struct {};
     const has_read_cache = @hasDecl(Raw, "ReadResultCache") and has_engine_session;
+    const PreparedWal = if (@hasDecl(Raw, "PreparedWal")) Raw.PreparedWal else void;
     return struct {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
+        pub const PrepareFn = *const fn (?*anyopaque, []const u8) anyerror!u64;
+        pub const PreparedOperation = enum { prepare, resolve };
+        pub const PreparedCheck = if (PreparedWal != void)
+            *const fn (*const Self, *const PreparedWal.Gid, PreparedOperation) anyerror!void
+        else void;
+        pub const prepared_capacity = if (PreparedWal != void) Raw.transaction_capacity else 0;
+        pub const PreparedEntry = if (PreparedWal != void) struct {
+            used: bool = false,
+            sequence: u64 = 0,
+            metadata: PreparedWal.Metadata = undefined,
+            slot: ?u16 = null,
+        } else void;
         pub const ZoneProvider = struct {
             context: ?*anyopaque = null,
             /// Resolves a zone name; writes the canonical spelling and
@@ -316,6 +329,17 @@ pub fn Store(comptime Raw: type) type {
         read_result_cache: if (has_read_cache) ?*Raw.ReadResultCache else ?*void = null,
         commit_ctx: ?*anyopaque = null,
         commit_fn: ?CommitFn = null,
+        /// Uses the commit context and encode buffer. Returns the stable WAL
+        /// sequence assigned to this prepare or resolution frame.
+        prepare_fn: ?PrepareFn = null,
+        /// A cluster owner may enforce a shared prepared namespace and grant.
+        /// Calls run under the same serialization as WAL preparation.
+        prepared_check: if (PreparedWal != void) ?PreparedCheck else void = if (PreparedWal != void) null else {},
+        prepared_limit: usize = 0,
+        /// Physical store identity in this single-database engine. Startup
+        /// `database` parameters are session labels and do not change it.
+        database_oid: u32 = 5,
+        prepared: [prepared_capacity]PreparedEntry = @splat(.{}),
         /// Change-record encode buffer shared by every commit (callers
         /// serialize; persistence reuses its recovery buffer, so any record
         /// written is recoverable).
@@ -416,6 +440,103 @@ pub fn Store(comptime Raw: type) type {
             db.publishCommit(slot);
         }
 
+        fn preparedIndex(self: *const Self, gid: *const PreparedWal.Gid) ?usize {
+            for (&self.prepared, 0..) |*entry, index| if (entry.used and entry.metadata.gid.eql(gid)) return index;
+            return null;
+        }
+
+        pub fn hasPreparedGid(self: *const Self, gid: *const PreparedWal.Gid) bool {
+            return self.preparedIndex(gid) != null;
+        }
+
+        pub fn preparedCount(self: *const Self) usize {
+            var count: usize = 0;
+            for (&self.prepared) |*entry| count += @intFromBool(entry.used);
+            return count;
+        }
+
+        fn freePrepared(self: *const Self, gid: *const PreparedWal.Gid) !usize {
+            if (self.preparedIndex(gid) != null) return error.DuplicateObject;
+            for (&self.prepared, 0..) |*entry, index| if (!entry.used) return index;
+            return error.TransactionCapacity;
+        }
+
+        fn flushPrepared(self: *Self, payload: []const u8) !u64 {
+            try self.storageReady();
+            const persist = self.prepare_fn orelse return error.ObjectNotInPrerequisiteState;
+            const sequence = persist(self.commit_ctx, payload) catch |err| {
+                self.storage_failed = true;
+                return err;
+            };
+            if (sequence == 0) {
+                self.storage_failed = true;
+                return error.InvalidCommitBatch;
+            }
+            return sequence;
+        }
+
+        fn prepareTransaction(self: *Self, slot: u16, gid: PreparedWal.Gid) !void {
+            if (self.prepared_limit == 0 or self.prepare_fn == null) return error.ObjectNotInPrerequisiteState;
+            const index = try self.freePrepared(&gid);
+            if (self.prepared_check) |check| try check(self, &gid, .prepare);
+            if (self.preparedCount() >= self.prepared_limit or self.preparedCount() + 1 >= prepared_capacity) return error.TransactionCapacity;
+            const at = self.wallNow() orelse return error.UnsupportedStatement;
+            const payload = try self.database.prepareTransactionPayload(slot, gid, self.database_oid, at, self.encode_buffer);
+            const metadata = (try PreparedWal.decode(payload)).prepare.metadata;
+            const sequence = try self.flushPrepared(payload);
+            self.database.detachPrepared(slot);
+            self.prepared[index] = .{ .used = true, .sequence = sequence, .metadata = metadata, .slot = slot };
+        }
+
+        fn resolvePrepared(self: *Self, gid: PreparedWal.Gid, should_commit: bool) !void {
+            if (self.prepared_check) |check| try check(self, &gid, .resolve);
+            const index = self.preparedIndex(&gid) orelse return error.UndefinedObject;
+            const entry = &self.prepared[index];
+            if (!self.database.canResolvePrepared(entry.metadata.owner)) return error.InsufficientPrivilege;
+            if (entry.metadata.database != self.database_oid) return error.UnsupportedStatement;
+            const slot = entry.slot orelse return error.ObjectNotInPrerequisiteState;
+            const payload = try PreparedWal.encodeDecision(self.encode_buffer, &.{ .gid = gid, .prepare_sequence = entry.sequence, .commit = should_commit });
+            _ = try self.flushPrepared(payload);
+            if (should_commit) self.database.publishPrepared(slot) else self.database.abort(slot);
+            entry.* = .{};
+        }
+
+        /// Startup records only ledger metadata until its decision or EOF.
+        /// The caller owns the positioned WAL coordinates for this entry.
+        pub fn rememberPrepared(self: *Self, payload: PreparedWal.Prepared, sequence: u64) !usize {
+            if (sequence == 0 or payload.metadata.database != self.database_oid) return error.ChangeRecordConflict;
+            const index = self.freePrepared(&payload.metadata.gid) catch |err| switch (err) {
+                error.DuplicateObject => return error.ChangeRecordConflict,
+                else => return err,
+            };
+            try self.database.validatePrepared(payload);
+            self.prepared[index] = .{ .used = true, .sequence = sequence, .metadata = payload.metadata };
+            return index;
+        }
+
+        pub fn recoveredDecisionIndex(self: *const Self, decision: PreparedWal.Decision) !usize {
+            const index = self.preparedIndex(&decision.gid) orelse return error.ChangeRecordConflict;
+            const entry = &self.prepared[index];
+            if (entry.sequence != decision.prepare_sequence or entry.slot != null) return error.ChangeRecordConflict;
+            return index;
+        }
+
+        pub fn restorePreparedEntry(self: *Self, index: usize, payload: PreparedWal.Prepared) !void {
+            const entry = &self.prepared[index];
+            if (!entry.used or entry.slot != null or !entry.metadata.gid.eql(&payload.metadata.gid) or
+                entry.metadata.owner != payload.metadata.owner or entry.metadata.database != payload.metadata.database or
+                entry.metadata.prepared_at != payload.metadata.prepared_at) return error.ChangeRecordConflict;
+            entry.slot = try self.database.restorePrepared(payload);
+        }
+
+        pub fn resolveRecoveredPrepared(self: *Self, index: usize, should_commit: bool) !void {
+            const entry = &self.prepared[index];
+            if (!entry.used) return error.ChangeRecordConflict;
+            if (should_commit) self.database.publishPrepared(entry.slot orelse return error.ChangeRecordConflict)
+            else if (entry.slot) |slot| self.database.abort(slot);
+            entry.* = .{};
+        }
+
         pub const Pending = struct {
             active: bool = false,
             fingerprint: u64 = 0,
@@ -441,6 +562,8 @@ pub fn Store(comptime Raw: type) type {
         const ReportedValue = struct { bytes: [64]u8 = @splat(0), len: u8 = 0, valid: bool = false };
 
         pub const Connection = struct {
+            pub const detached_primary_key = if (@hasDecl(Raw, "ReadContext")) @hasDecl(Raw.ReadContext, "primaryKeyMatches") else false;
+
             pub const Result = Raw.Result;
             store: *Self,
             id: u64,
@@ -480,6 +603,8 @@ pub fn Store(comptime Raw: type) type {
             sequences: SequenceSession = .{},
             /// Startup `database` (current_database(); information_schema catalogs).
             database_name: [64]u8 = @splat(0),
+            mysql_keep_zero: bool = false,
+            mysql_last_insert_id: u64 = 0,
             database_len: u8 = 0,
             /// The open COPY FROM runs in an implicit transaction.
             copy_implicit: bool = false,
@@ -517,6 +642,11 @@ pub fn Store(comptime Raw: type) type {
             pub fn takeNotification(self: *Connection, out: *NotificationType) bool {
                 if (comptime !has_engine_session) return false;
                 if (self.id == 0 or self.in_transaction or self.pending.active) return false;
+                if (comptime @hasField(@TypeOf(self.engine_session), "listener")) {
+                    // Most connections never LISTEN. Leave the shared SQL
+                    // session untouched when ReadyForQuery runs under a read grant.
+                    if (self.engine_session.listener == null) return false;
+                }
                 return self.db().takeNotification(out);
             }
 
@@ -605,6 +735,11 @@ pub fn Store(comptime Raw: type) type {
             pub fn detachedReadEligible(self:*const Connection) bool {
                 // Detached reads run as the bootstrap superuser: a session
                 // after SET ROLE keeps the serialized (privilege-checked) path.
+                if (comptime has_engine_session and @hasField(@TypeOf(self.engine_session), "listener")) {
+                    // ReadyForQuery drains a listener's committed queue. The
+                    // listener cursor belongs to the serialized SQL path.
+                    if (self.engine_session.listener != null) return false;
+                }
                 return self.detachedIdentity() and self.id!=0 and !self.failed and self.autocommit and !self.in_transaction and self.tx==null and
                     !self.pending.active and !self.running_statement and self.read_context==null;
             }
@@ -658,6 +793,8 @@ pub fn Store(comptime Raw: type) type {
                     .statement_us = self.statement_us,
                     .clock = self.store.wall_clock,
                     .database = if (self.database_len == 0) "postgres" else self.database_name[0..self.database_len],
+                    .mysql_keep_zero = self.mysql_keep_zero,
+                    .mysql_last_insert_id = self.mysql_last_insert_id,
                 };
                 if (comptime has_control) raw.session.control = if (self.running_statement) &self.execution else null;
                 if (comptime has_engine_session) {
@@ -1008,6 +1145,41 @@ pub fn Store(comptime Raw: type) type {
                         result.clear(0);
                         result.command = .rollback;
                     },
+                    .prepared_transaction => |prepared| {
+                        if (comptime PreparedWal == void) return error.UnsupportedStatement;
+                        switch (prepared.action) {
+                            .prepare => {
+                                if (!self.in_transaction) return error.NoActiveTransaction;
+                                const slot = self.tx.?;
+                                if (self.failed) {
+                                    self.db().abort(slot);
+                                    self.endTransaction(false);
+                                    result.clear(0);
+                                    result.command = .rollback;
+                                    return;
+                                }
+                                self.store.prepareTransaction(slot, prepared.gid orelse {
+                                    self.db().abort(slot);
+                                    self.endTransaction(false);
+                                    return error.InvalidParameterValue;
+                                }) catch |err| {
+                                    self.db().abort(slot);
+                                    self.endTransaction(false);
+                                    return err;
+                                };
+                                self.endTransaction(true);
+                                result.clear(0);
+                                result.command = .prepare_transaction;
+                            },
+                            .commit, .rollback => {
+                                if (self.in_transaction or self.tx != null) return error.ActiveSqlTransaction;
+                                const should_commit = prepared.action == .commit;
+                                try self.store.resolvePrepared(prepared.gid orelse return error.InvalidParameterValue, should_commit);
+                                result.clear(0);
+                                result.command = if (should_commit) .commit_prepared else .rollback_prepared;
+                            },
+                        }
+                    },
                     .savepoint => |name| {
                         if (!self.in_transaction) return error.NoActiveTransaction;
                         if (self.failed) return error.TransactionFailed;
@@ -1160,10 +1332,14 @@ pub fn Store(comptime Raw: type) type {
             fn finish(self: *Connection, slot: u16, implicit: bool, result: *Result) !void {
                 self.pending = .{};
                 self.cancel_requested = false;
-                if (!implicit) return;
-                self.tx = null;
-                try self.store.commit(slot);
-                self.store.database.lastOutcomeInto(result);
+                if (implicit) {
+                    self.tx = null;
+                    try self.store.commit(slot);
+                    self.store.database.lastOutcomeInto(result);
+                }
+                if (comptime @hasField(Result, "mysql_generated_id")) {
+                    if (self.dialect == .mysql and result.mysql_generated_id != 0) self.mysql_last_insert_id = result.mysql_generated_id;
+                }
             }
 
             fn run(self: *Connection, source: []const u8, result: *Result, slot: u16, implicit: bool, resuming: bool) !void {
@@ -1392,6 +1568,27 @@ pub fn Store(comptime Raw: type) type {
                 self.terminal(self.copy_implicit);
             }
 
+            /// Only an authorized plan installed by the detached scheduler
+            /// can bypass parsing the portal's rendered SQL.
+            pub fn executeDetachedPrimaryKey(self: *Connection, source: []const u8, oid: u32, key: ?i64, fallback: []const u8, result: *Result) !bool {
+                if (comptime !detached_primary_key) return false;
+                const context = self.read_context orelse return false;
+                if (self.id == 0 or !self.running_statement or self.failed or self.in_transaction or self.tx != null or
+                    !self.autocommit or self.pending.active or self.dialect != .postgres) return false;
+                if (comptime has_engine_session) {
+                    if (self.engine_session.values.role != 0 or self.engine_session.session_role != 10) return false;
+                }
+                const data_type: @TypeOf(@as(Result, undefined).column_types[0]) = switch (oid) {
+                    20 => .integer, 21 => .smallint, 23 => .integer32, else => return false,
+                };
+                if (!context.primaryKeyMatches(source, data_type)) return false;
+                const raw = &self.store.database;
+                const snap: Raw.Snapshot = .{.csn=raw.csn};
+                const argument: Raw.Cell = if (key) |value| .{.integer=value} else .null_value;
+                if (!try context.runPrimaryKey(raw, snap, &argument, result)) try context.execute(raw, fallback, snap, result);
+                return true;
+            }
+
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
@@ -1437,6 +1634,21 @@ pub fn Store(comptime Raw: type) type {
                 }
                 if (count != 0 and command[count - 1] == ';') count -= 1;
                 const cmd = if (long_command) "" else command[0..count];
+                if (self.dialect == .mysql) {
+                    for ([_][]const u8{ "SET SESSION SQL_MODE", "SET SQL_MODE" }) |prefix| {
+                        if (cmd.len <= prefix.len or !same(prefix, cmd[0..prefix.len])) continue;
+                        var assignment = cmd[prefix.len..];
+                        while (assignment.len != 0 and assignment[0] == ' ') assignment = assignment[1..];
+                        if (assignment.len == 0 or assignment[0] != '=') continue;
+                        assignment = assignment[1..];
+                        while (assignment.len != 0 and assignment[0] == ' ') assignment = assignment[1..];
+                        if (self.failed) return error.TransactionFailed;
+                        if (same(assignment, "'NO_AUTO_VALUE_ON_ZERO'")) self.mysql_keep_zero = true
+                        else if (same(assignment, "''")) self.mysql_keep_zero = false else return error.UnsupportedStatement;
+                        result.clear(0);
+                        return;
+                    }
+                }
                 if (same(cmd, "SET AUTOCOMMIT = 0") or same(cmd, "SET AUTOCOMMIT=0") or same(cmd, "SET AUTOCOMMIT = 1") or same(cmd, "SET AUTOCOMMIT=1")) {
                     if (self.failed) return error.TransactionFailed;
                     try self.setAutocommit(cmd[cmd.len - 1] == '1');

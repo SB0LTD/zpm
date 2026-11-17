@@ -12,6 +12,16 @@ pub const overhead: usize = header_size + trailer_size;
 const magic = "RAMSQLW1";
 const commit_magic = "CMIT";
 pub const Recovery = struct { sequence: u64 = 0, valid_bytes: u64 = 0, truncated_tail: bool = false };
+pub const Frame = struct {
+    offset: u64,
+    sequence: u64,
+    kind: u16,
+    payload_len: u32,
+
+    fn byteCount(self: Frame) u64 {
+        return @as(u64, self.payload_len) + overhead;
+    }
+};
 
 fn put(comptime T: type, out: []u8, value: T) void {
     for (0..@sizeOf(T)) |i| out[i] = @truncate(value >> @intCast(i * 8));
@@ -89,6 +99,51 @@ fn readExact(file: anytype, offset: u64, bytes: []u8) !void {
     }
 }
 
+fn kindMask(kind: u16) !u32 {
+    if (kind == 0 or kind > 31) return error.UnsupportedLogVersion;
+    return @as(u32, 1) << @intCast(kind);
+}
+
+fn readHeader(file: anytype, offset: u64, accepted_mask: u32) !Frame {
+    var header: [header_size]u8 = undefined;
+    try readExact(file, offset, &header);
+    const expected_crc = get(u32, header[24..28]);
+    @memset(header[24..28], 0);
+    if (!equal(header[0..8], magic) or checksum(&header) != expected_crc) return error.CorruptLogHeader;
+    const kind = get(u16, header[10..12]);
+    if (get(u16, header[8..10]) != 1 or (try kindMask(kind)) & accepted_mask == 0) return error.UnsupportedLogVersion;
+    if (get(u32, header[28..32]) != 0) return error.CorruptLogHeader;
+    const payload_len = get(u32, header[12..16]);
+    if (payload_len == 0) return error.InvalidPayloadLength;
+    return .{ .offset = offset, .sequence = get(u64, header[16..24]), .kind = kind, .payload_len = payload_len };
+}
+
+fn readPayload(file: anytype, frame: Frame, scratch: []u8) ![]const u8 {
+    const payload = scratch[0..frame.payload_len];
+    const start = frame.offset + header_size;
+    try readExact(file, start, payload);
+    var trailer: [trailer_size]u8 = undefined;
+    try readExact(file, start + frame.payload_len, &trailer);
+    if (get(u32, trailer[0..4]) != checksum(payload) or !equal(trailer[4..8], commit_magic) or
+        get(u64, trailer[8..16]) != frame.sequence) return error.CorruptLogRecord;
+    return payload;
+}
+
+/// Re-reads a previously observed frame into caller scratch and checks its
+/// offset, kind, sequence, payload length and checksums. Never repairs or
+/// modifies the file. The returned payload borrows the scratch buffer.
+pub fn readFrame(file: anytype, scratch: []u8, expected: Frame) ![]const u8 {
+    const accepted = try kindMask(expected.kind);
+    const length: u64 = try file.length();
+    if (expected.offset > length or length - expected.offset < header_size) return error.UnexpectedEndOfLog;
+    const frame = try readHeader(file, expected.offset, accepted);
+    if (frame.sequence == 0 or frame.sequence != expected.sequence) return error.InvalidSequence;
+    if (frame.payload_len != expected.payload_len) return error.InvalidPayloadLength;
+    if (frame.payload_len > scratch.len) return error.LogPayloadCapacity;
+    if (frame.byteCount() > length - frame.offset) return error.UnexpectedEndOfLog;
+    return readPayload(file, frame, scratch);
+}
+
 /// scratch bounds transaction bytes and is reused between records. The replay
 /// callback must apply each entire batch atomically. Semantic replay failures
 /// propagate without repairing or truncating the source. First sequence is 1.
@@ -98,8 +153,7 @@ pub fn recover(file: anytype, scratch: []u8, context: anytype, comptime replay: 
 
 /// Refuses incompatible payload semantics without modifying the original WAL.
 pub fn recoverKind(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, kind: u16) !Recovery {
-    if (kind == 0 or kind > 31) return error.UnsupportedLogVersion;
-    return recoverImpl(file, scratch, context, replay, @as(u32, 1) << @intCast(kind), false);
+    return recoverImpl(file, scratch, context, replay, null, try kindMask(kind), .sequence);
 }
 
 /// Like recoverKind, but accepts every kind whose bit is set in accepted_mask
@@ -108,40 +162,45 @@ pub fn recoverKind(file: anytype, scratch: []u8, context: anytype, comptime repl
 /// UnsupportedLogVersion before its payload is replayed.
 pub fn recoverKinds(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, accepted_mask: u32) !Recovery {
     if (accepted_mask & ~@as(u32, 1) == 0) return error.UnsupportedLogVersion;
-    return recoverImpl(file, scratch, context, replay, accepted_mask & ~@as(u32, 1), true);
+    return recoverImpl(file, scratch, context, replay, null, accepted_mask, .kind);
 }
 
-fn recoverImpl(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, accepted_mask: u32, comptime with_kind: bool) !Recovery {
+/// Like recoverKinds, but calls replay(context, frame, payload). A caller
+/// may retain the frame coordinates and re-read it inside a later callback
+/// using the same scratch, after consuming the current payload.
+pub fn recoverFrames(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, accepted_mask: u32) !Recovery {
+    return recoverFramesWithFinish(file, scratch, context, replay, null, accepted_mask);
+}
+
+/// Runs the recovery finalizer after the verified frame scan and before any
+/// torn-tail repair. A finalizer error leaves the source bytes untouched.
+pub fn recoverFramesWithFinish(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, comptime finish: anytype, accepted_mask: u32) !Recovery {
+    if (accepted_mask & ~@as(u32, 1) == 0) return error.UnsupportedLogVersion;
+    return recoverImpl(file, scratch, context, replay, finish, accepted_mask, .frame);
+}
+
+const ReplayMode = enum { sequence, kind, frame };
+
+fn recoverImpl(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, comptime finish: anytype, accepted_mask: u32, comptime mode: ReplayMode) !Recovery {
     const length: u64 = try file.length();
     var result: Recovery = .{};
     while (result.valid_bytes < length) {
         const remaining = length - result.valid_bytes;
         if (remaining < header_size) break;
-        var header: [header_size]u8 = undefined;
-        try readExact(file, result.valid_bytes, &header);
-        const expected_crc = get(u32, header[24..28]);
-        @memset(header[24..28], 0);
-        if (!equal(header[0..8], magic) or checksum(&header) != expected_crc) return error.CorruptLogHeader;
-        const kind = get(u16, header[10..12]);
-        if (get(u16, header[8..10]) != 1 or kind == 0 or kind > 31 or accepted_mask & (@as(u32, 1) << @intCast(kind)) == 0) return error.UnsupportedLogVersion;
-        if (get(u32, header[28..32]) != 0) return error.CorruptLogHeader;
-        const payload_len: usize = get(u32, header[12..16]);
-        if (payload_len == 0) return error.InvalidPayloadLength;
-        if (payload_len > scratch.len) return error.LogPayloadCapacity;
-        const sequence = get(u64, header[16..24]);
-        if (result.sequence == 0xffffffffffffffff or sequence != result.sequence + 1) return error.InvalidSequence;
-        const record_length: u64 = @as(u64, payload_len) + overhead;
-        if (record_length > remaining) break;
-        const payload = scratch[0..payload_len];
-        try readExact(file, result.valid_bytes + header_size, payload);
-        var trailer: [trailer_size]u8 = undefined;
-        try readExact(file, result.valid_bytes + header_size + payload_len, &trailer);
-        if (get(u32, trailer[0..4]) != checksum(payload) or !equal(trailer[4..8], commit_magic) or
-            get(u64, trailer[8..16]) != sequence) return error.CorruptLogRecord;
-        if (with_kind) try replay(context, kind, sequence, payload) else try replay(context, sequence, payload);
-        result.sequence = sequence;
-        result.valid_bytes += record_length;
+        const frame = try readHeader(file, result.valid_bytes, accepted_mask);
+        if (frame.payload_len > scratch.len) return error.LogPayloadCapacity;
+        if (result.sequence == 0xffffffffffffffff or frame.sequence != result.sequence + 1) return error.InvalidSequence;
+        if (frame.byteCount() > remaining) break;
+        const payload = try readPayload(file, frame, scratch);
+        switch (mode) {
+            .sequence => try replay(context, frame.sequence, payload),
+            .kind => try replay(context, frame.kind, frame.sequence, payload),
+            .frame => try replay(context, frame, payload),
+        }
+        result.sequence = frame.sequence;
+        result.valid_bytes += frame.byteCount();
     }
+    if (comptime @TypeOf(finish) != @TypeOf(null)) try finish(context);
     if (result.valid_bytes != length) {
         try file.truncate(result.valid_bytes);
         try file.sync();

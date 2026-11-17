@@ -140,6 +140,10 @@ pub fn main() !void {
     }
     try execute("SELECT c.label,COUNT(*) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.store=99 GROUP BY c.label");
     try check(fr.row_count==0 and fast.workspace.query.stream_stats.factor_plans==1);
+    try execute("SELECT c.label,COUNT(*) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.id=12 AND f.day>=DATE '2025-01-01' AND f.store=2 GROUP BY c.label");
+    try check(fr.row_count==1 and fr.rows[0].cells[1].integer==1 and fast.workspace.query.stream_stats.factor_sparse_predicates>=2);
+    try execute("SELECT c.label,COUNT(*) FROM facts f JOIN products p ON p.id=f.product JOIN categories c ON c.id=p.category WHERE f.id=38 AND f.store>=0 GROUP BY c.label");
+    try check(fr.row_count==0 and fast.workspace.query.stream_stats.factor_plans==1 and fast.workspace.query.stream_stats.factor_sparse_predicates>=1);
     // A fact-dependent extra ON cannot be evaluated once per join key.
     try execute("SELECT c.label,COUNT(*) FROM facts f JOIN products p ON p.id=f.product AND p.flag=f.store JOIN categories c ON c.id=p.category GROUP BY c.label ORDER BY c.label");
     try check(fast.workspace.query.stream_stats.factor_plans==0);

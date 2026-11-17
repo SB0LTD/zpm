@@ -19,12 +19,18 @@ pub const Config = struct {
     /// Stored-row capacity then comes from those buffers, not rows_per_table.
     /// Cells/results/schema/transaction capacities remain separately budgeted.
     external_storage: bool = false,
+    /// Place dense row values in a separate caller-owned external span.
+    split_external_versions: bool = false,
+    /// Experimental integer/OID/DATE banks in split external storage.
+    /// Mixed banks serialize table DDL and reject copy-on-write ALTER.
+    integral_external_versions: bool = false,
     /// Query cells are a separately bound caller-owned runtime budget.
     external_workspace: bool = false,
     /// Result rows are bound independently by each serialized caller/session.
     external_results: bool = false,
     /// Optional caller-backed committed integral scan projection. Old snapshots
     /// and own writes retain MVCC row scans. Currently external storage only.
+    /// TableBudget.omit_compact_scan leaves an individual table on MVCC scans.
     compact_integral_scans: bool = false,
     /// Optional conservative 256-bit presence summary per 64-row scan block
     /// and column. Borrowed external backing; exact comparisons remain required.
@@ -141,7 +147,10 @@ pub const Config = struct {
     /// table's runtime versions) u32, so its entries cover every version
     /// (no cap below the version arena). 0 binds none: CREATE INDEX is
     /// IndexCapacity (54000) and memory plans are unchanged. bindStorage
-    /// callers bind any count per table through Backing.index_slots.
+    /// callers bind hash runs through Backing.index_slots and may admit scan
+    /// fallback with Backing.scan_index_limit. A smaller
+    /// TableBudget.secondary_hashes trades hash allocation for scans of the
+    /// MVCC version arena.
     external_indexes: usize = 0,
     /// Tx-session lane (session.sig). Every limit below is SessionCapacity
     /// (54000) when exceeded, with nothing changed.
@@ -262,6 +271,7 @@ pub const Error = error{
     CannotCoerce,
     /// SQLSTATE 22P02: text is not valid input for the target type.
     InvalidTextRepresentation,
+    InvalidName,
     /// SQLSTATE 22012.
     DivisionByZero,
     /// SQLSTATE2201F: square root/power domain error.
@@ -554,12 +564,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -569,7 +579,7 @@ const type_count = @typeInfo(Type).@"enum".field_names.len;
 /// The array type of a named element type (null for an array).
 pub fn arrayData(element: DataType) ?DataType {
     const raw = @intFromEnum(element);
-    if (raw >= data_type_count) return null;
+    if (element == .mysql_bigint_unsigned or raw >= data_type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -577,19 +587,21 @@ pub fn arrayData(element: DataType) ?DataType {
 pub fn elementData(data_type: DataType) ?DataType {
     const raw = @intFromEnum(data_type);
     if (raw < array_bit or raw & ~array_bit >= data_type_count) return null;
-    return @enumFromInt(raw & ~array_bit);
+    const element: DataType = @enumFromInt(raw & ~array_bit);
+    return if (element == .mysql_bigint_unsigned) null else element;
 }
 
 pub fn arrayType(element: Type) ?Type {
     const raw = @intFromEnum(element);
-    if (element == .unknown or raw >= type_count) return null;
+    if (element == .unknown or element == .mysql_bigint_unsigned or raw >= type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
 pub fn elementType(ty: Type) ?Type {
     const raw = @intFromEnum(ty);
     if (raw < array_bit or raw & ~array_bit >= type_count or raw & ~array_bit == 0) return null;
-    return @enumFromInt(raw & ~array_bit);
+    const element: Type = @enumFromInt(raw & ~array_bit);
+    return if (element == .mysql_bigint_unsigned) null else element;
 }
 
 pub fn isArray(ty: Type) bool {
@@ -632,6 +644,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .int4 => .integer32,
         .int8 => .integer,
         .numeric => .numeric,
+        .mysql_bigint_unsigned => .mysql_bigint_unsigned,
         .float4 => .real,
         .float8 => .double,
         .boolean => .boolean,
@@ -681,6 +694,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .integer32 => .int4,
         .integer => .int8,
         .numeric => .numeric,
+        .mysql_bigint_unsigned => .mysql_bigint_unsigned,
         .real => .float4,
         .double => .float8,
         .boolean => .boolean,
@@ -728,6 +742,30 @@ pub fn typeOfData(data_type: DataType) Type {
 /// array type OID (arrays are reported for catalog fidelity only).
 pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8, array: u32 };
 
+/// Catalog identity of a projected nominal type, separate from its value
+/// representation. A zero OID denotes ordinary built-in metadata.
+pub const NominalColumnType = struct {
+    oid: u32 = 0,
+    len: i16 = 0,
+    representation: enum(u8) { scalar, flat_record } = .scalar,
+};
+
+/// The durable typmod constraints shared by table and composite definitions.
+/// An array's typmod belongs to its element type.
+pub fn validTypeTypmod(comptime config: Config, data_type: DataType, typmod: i32) bool {
+    return switch (elementData(data_type) orelse data_type) {
+        .mysql_bigint_unsigned => typmod == -1 and config.numeric_digits >= 20,
+        .numeric => typmod == -1 or blk: {
+            const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(typmod) orelse break :blk false;
+            break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
+        },
+        .timestamp, .timestamptz, .time, .timetz => typmod >= -1 and typmod <= 6,
+        .varchar, .bpchar => character.validTypmod(typmod),
+        .bit, .varbit => bit_string.validTypmod(typmod),
+        else => typmod == -1,
+    };
+}
+
 pub fn typeInfo(data_type: DataType) TypeInfo {
     if (elementData(data_type)) |element| {
         const base = baseInfo(element);
@@ -769,6 +807,9 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .timestamptz => .{ .oid = 1184, .name = "timestamptz", .len = 8, .category = 'D', .array = 1185 },
         .interval => .{ .oid = 1186, .name = "interval", .len = 16, .category = 'T', .array = 1187 },
         .numeric => .{ .oid = 1700, .name = "numeric", .len = -1, .category = 'N', .array = 1231 },
+        // PostgreSQL wire and catalog columns expose the exact NUMERIC
+        // representation. The change log encodes the unsigned type separately.
+        .mysql_bigint_unsigned => .{ .oid = 1700, .name = "numeric", .len = -1, .category = 'N', .array = 0 },
         .jsonb => .{ .oid = 3802, .name = "jsonb", .len = -1, .category = 'U', .array = 3807 },
         .bpchar => .{ .oid = 1042, .name = "bpchar", .len = -1, .category = 'S', .array = 1014 },
         .varchar => .{ .oid = 1043, .name = "varchar", .len = -1, .category = 'S', .array = 1015 },
@@ -806,6 +847,15 @@ pub fn typeOid(data_type: DataType) u32 {
     return typeInfo(data_type).oid;
 }
 
+/// BIGINT UNSIGNED deliberately reuses the exact Numeric cell format.
+/// A zero-scale finite value in the u64 range is its canonical representation.
+pub fn mysqlUnsignedValue(value: *const numeric.Numeric) ?u64 {
+    if (value.special != .finite or value.negative or value.dscale != 0) return null;
+    const magnitude = value.coef();
+    if (magnitude > 18446744073709551615) return null;
+    return @intCast(magnitude);
+}
+
 /// SQL spelling of a type (format_type with no typmod, regtype output,
 /// information_schema.columns.data_type).
 pub fn sqlTypeName(data_type: DataType) []const u8 {
@@ -820,7 +870,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .smallint => "smallint",
         .boolean => "boolean",
         .text => "text",
-        .numeric => "numeric",
+        .numeric, .mysql_bigint_unsigned => "numeric",
         .real => "real",
         .double => "double precision",
         .name => "name",
@@ -870,7 +920,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .smallint => "int2in",
         .boolean => "boolin",
         .text => "textin",
-        .numeric => "numeric_in",
+        .numeric, .mysql_bigint_unsigned => "numeric_in",
         .real => "float4in",
         .double => "float8in",
         .name => "namein",
@@ -1013,13 +1063,14 @@ pub fn typeFromOid(oid: u32) ?DataType {
 }
 
 /// How a column gets a value it is not assigned (design §4.11).
-pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, identity_by_default = 3, generated = 4 };
+pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, identity_by_default = 3, generated = 4, mysql_auto_increment = 5 };
 
 /// Statement kind of a completed (or described) statement.
 pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as, lock_table, declare_cursor, fetch, move, close_cursor, prepare, deallocate, listen, notify, unlisten, create_function, drop_function, create_procedure, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule,
     // Catalog objects (B11 wave 3).
     create_role, alter_role, drop_role, grant, revoke, grant_role, revoke_role, create_policy, alter_policy, drop_policy, comment,
-    create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension, explain };
+    create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension, explain, create_domain, drop_domain, vacuum, analyze, create_type, drop_type,
+    prepare_transaction, commit_prepared, rollback_prepared };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
@@ -1165,7 +1216,7 @@ pub fn Values(comptime config: Config) type {
                 .text, .name, .json, .varchar, .jsonpath => .text,
                 .real => .float4,
                 .double => .float8,
-                .numeric => .numeric,
+                .numeric, .mysql_bigint_unsigned => .numeric,
                 .date => .date,
                 .timestamp => .timestamp,
                 .timestamptz => .timestamptz,
@@ -1385,6 +1436,7 @@ pub fn Values(comptime config: Config) type {
                 return;
             }
             switch (column.data_type) {
+                .mysql_bigint_unsigned => if (mysqlUnsignedValue(&value.numeric) == null) return error.IntegerOverflow,
                 .varchar => if (!character.fits(value.text.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bpchar => if (!character.fits(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bit, .varbit => {

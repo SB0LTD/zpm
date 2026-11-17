@@ -14,6 +14,7 @@ pub const max_parameters: usize = 32;
 pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false, blocked: bool = false };
 /// WouldBlock never leaves handle(); it becomes Reply.blocked.
 pub const Error = error{ BufferTooSmall, MalformedPacket, RequestTooLarge, InvalidSequence, InvalidState, InvalidUnicode, UnsupportedValue, UnsupportedRpc, WouldBlock };
+const DeclarationError = Error || error{ DuplicateVariable, DeclarationCapacity, IntegerOverflow, BadDeclaration };
 
 fn le(source: []const u8) u64 {
     var value: u64 = 0;
@@ -127,6 +128,20 @@ fn joins(a: u8, b: u8) bool {
 
 fn whitespace(value: u8) bool {
     return value == ' ' or value == '\t' or value == '\r' or value == '\n';
+}
+
+fn trimSpace(source: []const u8) []const u8 {
+    var first: usize = 0;
+    while (first < source.len and whitespace(source[first])) first += 1;
+    var last = source.len;
+    while (last > first and whitespace(source[last - 1])) last -= 1;
+    return source[first..last];
+}
+
+fn takeBatchWord(source: []const u8, word: []const u8) ?[]const u8 {
+    if (source.len < word.len or !equal(source[0..word.len], word)) return null;
+    if (source.len > word.len and nameByte(source[word.len])) return null;
+    return trimSpace(source[word.len..]);
 }
 
 const Cursor = struct {
@@ -438,12 +453,26 @@ pub fn Session(comptime DB: type) type {
         }
 
 
-        /// New types (NUMERIC, REAL/DOUBLE, temporal, JSON) travel as TEXT
-        /// columns here: native metadata is not implemented (flag F-M).
-        fn textify(db: *DB, result: *DB.Result) anyerror!void {
+        fn textify(self: *const Self, db: *DB, result: *DB.Result) anyerror!void {
             if (!@hasDecl(DB.Result, "textify")) return;
             const session = if (@hasDecl(DB, "valueSession")) db.valueSession() else DB.Result.default_session;
+            if (@hasDecl(DB.Result, "textifyWithDate")) {
+                if (self.version >= 0x730a0003) return result.textifyWithDate(session);
+            }
             try result.textify(session);
+        }
+
+        /// MS-TDS DATE uses Gregorian days after 0001-01-01. SQL's DATE
+        /// field uses signed days after 2000-01-01 and includes infinities.
+        fn dateDays(days: i32) Error!u32 {
+            const ordinal = @as(i64, days) + 730119;
+            if (ordinal < 0 or ordinal > 3652058) return error.UnsupportedValue;
+            return @intCast(ordinal);
+        }
+
+        fn fixedInt4(self: *const Self, column: usize) bool {
+            if (!@hasField(DB.Result, "non_null_columns")) return false;
+            return self.result.column_types[column] == .integer32 and self.result.non_null_columns.isSet(column);
         }
 
         fn results(self: *Self, writer: *Writer, completion: u8) Error!void {
@@ -452,29 +481,43 @@ pub fn Session(comptime DB: type) type {
             for (0..self.result.column_count) |column| {
                 if (try utf16Length(self.result.column_names[column].slice()) > 255) return error.UnsupportedValue;
             }
-            for (self.result.rows[0..self.result.row_count]) |*row| for (row.cells[0..self.result.column_count]) |*cell| switch (cell.*) {
-                .text => |*value| if (try utf16Length(value.slice()) > 32767) return error.UnsupportedValue,
-                else => {},
-            };
+            for (self.result.rows[0..self.result.row_count]) |*row| {
+                for (row.cells[0..self.result.column_count], 0..) |*cell, column| {
+                    if (self.fixedInt4(column) and
+                        (cell.* != .integer or cell.integer < -2147483648 or cell.integer > 2147483647))
+                        return error.UnsupportedValue;
+                    switch (cell.*) {
+                        .text => |*value| if (try utf16Length(value.slice()) > 32767) return error.UnsupportedValue,
+                        .date => |value| { _ = try dateDays(value); },
+                        else => {},
+                    }
+                }
+            }
             if (self.result.column_count != 0) {
                 try writer.byte(0x81);
                 try writer.number(self.result.column_count, 2);
                 for (0..self.result.column_count) |column| {
+                    const fixed_int4 = self.fixedInt4(column);
                     try writer.number(0, 4); // usertype (TDS 7.2+)
-                    try writer.number(1, 2); // nullable
+                    try writer.number(if (fixed_int4) 0 else 1, 2); // fNullable
                     switch (self.result.column_types[column]) {
                         .integer => {
                             try writer.byte(0x26);
                             try writer.byte(8);
                         }, // INTN/BIGINT
                         .integer32 => {
-                            try writer.byte(0x26);
-                            try writer.byte(4);
-                        }, // INTN/INT
+                            if (fixed_int4) {
+                                try writer.byte(0x38); // INT4
+                            } else {
+                                try writer.byte(0x26); // INTN
+                                try writer.byte(4);
+                            }
+                        },
                         .boolean => {
                             try writer.byte(0x68);
                             try writer.byte(1);
                         }, // BITN
+                        .date => try writer.byte(0x28), // DATENTYPE has no metadata length
                         else => {
                             try writer.byte(0xe7); // NVARCHAR
                             try writer.number(65534, 2);
@@ -489,12 +532,12 @@ pub fn Session(comptime DB: type) type {
                     try writer.byte(0xd1);
                     for (row.cells[0..self.result.column_count], 0..) |*cell, column| switch (cell.*) {
                         .null_value => switch (self.result.column_types[column]) {
-                            .integer, .integer32, .boolean => try writer.byte(0),
+                            .integer, .integer32, .boolean, .date => try writer.byte(0),
                             else => try writer.number(0xffff, 2),
                         },
                         .integer => |value| {
                             if (self.result.column_types[column] == .integer32) {
-                                try writer.byte(4);
+                                if (!self.fixedInt4(column)) try writer.byte(4);
                                 try writer.number(@bitCast(value), 4);
                             } else {
                                 try writer.byte(8);
@@ -505,6 +548,10 @@ pub fn Session(comptime DB: type) type {
                             try writer.byte(1);
                             try writer.byte(if (value) 1 else 0);
                         },
+                        .date => |value| {
+                            try writer.byte(3);
+                            try writer.number(try dateDays(value), 3);
+                        },
                         .text => |*value| {
                             try writer.number((try utf16Length(value.slice())) * 2, 2);
                             try writer.unicode(value.slice());
@@ -514,7 +561,10 @@ pub fn Session(comptime DB: type) type {
                     };
                 }
             }
-            try writer.doneToken(completion, 0x10 | (if (completion == 0xff) @as(u16, 1) else 0), if (self.result.column_count == 0) self.result.affected_rows else self.result.row_count);
+            const create_table = if (@hasField(DB.Result, "command")) self.result.command == .create_table else false;
+            const count_flag: u16 = if (self.result.column_count == 0 and create_table) 0 else 0x10;
+            const rows = if (self.result.column_count == 0) self.result.affected_rows else self.result.row_count;
+            try writer.doneToken(completion, count_flag | (if (completion == 0xff) @as(u16, 1) else 0), rows);
         }
 
         fn batch(self: *Self, db: *DB, source: []const u8, writer: *Writer) Error!void {
@@ -523,10 +573,15 @@ pub fn Session(comptime DB: type) type {
                 return writer.failure(102, @errorName(err));
             };
             if (query.len == 0) return writer.done(0, 0);
+            if (takeBatchWord(trimSpace(query), "DECLARE") != null) return self.variableBatch(db, query, writer);
+            return self.batchQuery(db, query, writer);
+        }
+
+        fn batchQuery(self: *Self, db: *DB, query: []const u8, writer: *Writer) Error!void {
             const before = txStatus(db);
             if (db.execute(query, &self.result)) |_| {
                 try notifyTransaction(writer, before, txStatus(db), isRollback(query));
-                textify(db, &self.result) catch |err| return writer.failure(245, @errorName(err));
+                self.textify(db, &self.result) catch |err| return writer.failure(245, @errorName(err));
                 self.results(writer, 0xfd) catch |err| {
                     if (err == error.BufferTooSmall) return err;
                     try writer.failure(245, @errorName(err));
@@ -537,8 +592,90 @@ pub fn Session(comptime DB: type) type {
                 error.PrimaryKeyViolation => 2627,
                 error.NotNullViolation => 515,
                 error.DatabaseBusy => 1222,
+                error.InvalidRowCountInLimit => 1014,
+                error.IntegerOverflow => 8115,
+                error.DatetimeFieldOverflow => 517,
                 else => 102,
             }, @errorName(err));
+        }
+
+        fn intInitializer(token: []const u8) DeclarationError!RpcValue {
+            if (equal(token, "NULL")) return .{ .null_value = {} };
+            if (token.len == 0) return error.BadDeclaration;
+            const has_sign = token[0] == '+' or token[0] == '-';
+            const digits = trimSpace(token[@intFromBool(has_sign)..]);
+            if (digits.len == 0) return error.BadDeclaration;
+            var magnitude: u32 = 0;
+            const bound: u32 = if (token[0] == '-') 2147483648 else 2147483647;
+            for (digits) |digit| {
+                if (digit < '0' or digit > '9') return error.BadDeclaration;
+                const numeric: u32 = digit - '0';
+                if (magnitude > (bound - numeric) / 10) return error.IntegerOverflow;
+                magnitude = magnitude * 10 + numeric;
+            }
+            return .{ .integer = if (token[0] == '-') -@as(i64, magnitude) else magnitude };
+        }
+
+        /// Collect typed INT locals in reusable per-batch scratch.
+        /// The bounded literal transport used by RPC can carry the typed value
+        /// without changing quoted strings, bracket names or comments. Only
+        /// one engine statement follows these declarations, so a lock retry
+        /// can reconstruct all locals without running an earlier SQL action.
+        fn parseVariableBatch(self: *Self, input: []const u8, count: *usize) DeclarationError![]const u8 {
+            var source = trimSpace(input);
+            var values_len: usize = 0;
+            while (takeBatchWord(source, "DECLARE")) |declaration| {
+                if (count.* == self.rpc_parameters.len) return error.DeclarationCapacity;
+                if (declaration.len < 2 or declaration[0] != '@' or !nameByte(declaration[1]) or
+                    (declaration[1] >= '0' and declaration[1] <= '9')) return error.BadDeclaration;
+                var name_end: usize = 2;
+                while (name_end < declaration.len and nameByte(declaration[name_end])) name_end += 1;
+                if (name_end > 128 or name_end == declaration.len or !whitespace(declaration[name_end])) return error.BadDeclaration;
+                const name = declaration[0..name_end];
+                for (self.rpc_parameters[0..count.*]) |*previous| {
+                    if (equal(name, previous.name[0..previous.name_len])) return error.DuplicateVariable;
+                }
+                const data_type = trimSpace(declaration[name_end..]);
+                const assignment = takeBatchWord(data_type, "INT") orelse takeBatchWord(data_type, "INTEGER") orelse return error.BadDeclaration;
+                const initialized = assignment.len != 0 and assignment[0] == '=';
+                if (!initialized and assignment.len != 0 and assignment[0] != ';') return error.BadDeclaration;
+                var end: usize = @intFromBool(initialized);
+                while (end < assignment.len and assignment[end] != ';') end += 1;
+                const value: RpcValue = if (initialized) try intInitializer(trimSpace(assignment[1..end])) else .{ .null_value = {} };
+                var parameter: Parameter = .{ .name_len = name.len };
+                @memcpy(parameter.name[0..name.len], name);
+                const literal_start = values_len;
+                try append(&self.rpc_values, &values_len, "(CAST(");
+                try self.literal(value, &parameter, &values_len);
+                try append(&self.rpc_values, &values_len, " AS INTEGER))");
+                parameter.literal_offset = literal_start;
+                parameter.literal_len = values_len - literal_start;
+                parameter.supplied = initialized;
+                self.rpc_parameters[count.*] = parameter;
+                count.* += 1;
+                source = if (end < assignment.len) trimSpace(assignment[end + 1 ..]) else "";
+            }
+            if (source.len == 0) return source;
+            if (takeBatchWord(source, "SELECT") == null) return error.BadDeclaration;
+            return self.expand(source, count.*);
+        }
+
+        fn variableBatch(self: *Self, db: *DB, source: []const u8, writer: *Writer) Error!void {
+            var count: usize = 0;
+            const query = self.parseVariableBatch(source, &count) catch |err| return writer.failure(switch (err) {
+                error.DuplicateVariable => 134,
+                error.UnsupportedRpc => 137,
+                error.IntegerOverflow => 8115,
+                error.DeclarationCapacity => 54000,
+                else => 102,
+            }, @errorName(err));
+            for (0..count) |index| {
+                const more = query.len != 0 or index + 1 < count;
+                const initialized = self.rpc_parameters[index].supplied;
+                const flags: u16 = (if (initialized) @as(u16, 0x10) else 0) | (if (more) @as(u16, 1) else 0);
+                try writer.done(flags, @intFromBool(initialized));
+            }
+            if (query.len != 0) try self.batchQuery(db, query, writer);
         }
 
         /// Decode a bounded native RPC parameter. NVARCHAR(max) PLP chunks are
@@ -864,7 +1001,7 @@ pub fn Session(comptime DB: type) type {
             const before = txStatus(db);
             if (db.execute(query, &self.result)) |_| {
                 try notifyTransaction(writer, before, txStatus(db), isRollback(query));
-                textify(db, &self.result) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
+                self.textify(db, &self.result) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
                 self.results(writer, 0xff) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
                 try writer.byte(0x79); // RETURNSTATUS
                 try writer.number(0, 4);
@@ -875,6 +1012,9 @@ pub fn Session(comptime DB: type) type {
                 error.PrimaryKeyViolation => 2627,
                 error.NotNullViolation => 515,
                 error.DatabaseBusy => 1222,
+                error.InvalidRowCountInLimit => 1014,
+                error.IntegerOverflow => 8115,
+                error.DatetimeFieldOverflow => 517,
                 else => 102,
             }, @errorName(err), 0xfe);
         }

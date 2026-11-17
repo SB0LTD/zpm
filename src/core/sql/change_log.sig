@@ -104,7 +104,6 @@ const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
 const sequence = @import("sequence.sig");
-const character = @import("character.sig");
 const time_of_day = @import("time_of_day.sig");
 const bit_string = @import("bit_string.sig");
 const array = @import("array.sig");
@@ -123,6 +122,8 @@ fn std_zero(bytes: []const u8) bool {
 pub const format_version: u16 = 1;
 pub const header_size: usize = 8;
 pub const first_oid: u32 = 16384;
+/// Private definition code, distinct from the PostgreSQL NUMERIC wire OID.
+const mysql_unsigned_type: u32 = 0xffff_fffe;
 pub const expr_format_version: u16 = 1;
 /// create_table definitions that carry a namespace and table constraints.
 pub const definition_format_version: u16 = 2;
@@ -428,7 +429,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try writer.int(u8, @intCast(table.column_count));
             for (table.columns[0..table.column_count]) |*column| {
                 try writer.name(column.name.slice());
-                try writer.int(u32, types.typeOid(column.data_type));
+                try writer.int(u32, if (column.data_type == .mysql_bigint_unsigned) mysql_unsigned_type else types.typeOid(column.data_type));
                 try writer.int(i32, column.typmod);
                 try writer.int(u8, @as(u8, @intFromBool(column.not_null)) | (@as(u8, @intFromBool(column.primary_key)) << 1) | (@as(u8, @intFromEnum(column.default_kind)) << 2) | (@as(u8, @intFromBool(column.virtual)) << 5));
                 const text = column.expression.slice();
@@ -569,9 +570,68 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try writer.op(tag);
             try writer.int(u32, oid);
             try writer.int(u64, rowid);
+            try encodeCells(writer, cells);
+        }
+
+        fn encodeCells(writer: *Writer, cells: []const V.Cell) Error!void {
             try writer.int(u8, @intCast(cells.len));
             for (cells) |*cell| try encodeValue(writer, cell);
         }
+
+        /// Prepared DML uses the same typed cell encoding as committed WAL.
+        /// Its separate envelope also records before-images for exact replay
+        /// against the committed state at the decision or end of recovery.
+        pub fn encodePreparedRow(writer: *Writer, tag: Op, oid: u32, rowid: u64, old: []const V.Cell, new: []const V.Cell) Error!void {
+            try writer.op(tag);
+            try writer.int(u32, oid);
+            try writer.int(u64, rowid);
+            if (tag != .insert) try encodeCells(writer, old);
+            if (tag != .delete) try encodeCells(writer, new);
+        }
+
+        pub const PreparedRow = struct {
+            tag: Op,
+            oid: u32,
+            rowid: u64,
+            old_count: usize = 0,
+            new_count: usize = 0,
+        };
+
+        pub const PreparedReader = struct {
+            reader: Reader,
+            remaining: u32,
+
+            pub fn init(record: []const u8) Error!PreparedReader {
+                return .{ .reader = .{ .bytes = record }, .remaining = try opCount(record) };
+            }
+
+            pub fn next(self: *PreparedReader, old: *V.Row, new: *V.Row) Error!?PreparedRow {
+                if (self.remaining == 0) {
+                    if (self.reader.position != self.reader.bytes.len) return error.InvalidChangeRecord;
+                    return null;
+                }
+                const tag: Op = switch (try self.reader.int(u8)) {
+                    @intFromEnum(Op.insert) => .insert,
+                    @intFromEnum(Op.update) => .update,
+                    @intFromEnum(Op.delete) => .delete,
+                    else => return error.InvalidChangeRecord,
+                };
+                var row: PreparedRow = .{ .tag = tag, .oid = try self.reader.int(u32), .rowid = try self.reader.int(u64) };
+                if (row.oid == 0 or row.rowid == 0 or row.rowid == 0xffffffffffffffff) return error.InvalidChangeRecord;
+                if (tag != .insert) row.old_count = try self.readCells(old);
+                if (tag != .delete) row.new_count = try self.readCells(new);
+                self.remaining -= 1;
+                return row;
+            }
+
+            fn readCells(self: *PreparedReader, row: *V.Row) Error!usize {
+                const count = try self.reader.int(u8);
+                if (count == 0 or count > config.columns) return error.InvalidChangeRecord;
+                row.* = .{};
+                for (row.cells[0..count]) |*cell| cell.* = (try decodeValue(&self.reader)).cell;
+                return count;
+            }
+        };
 
         pub fn encodeDelete(writer: *Writer, oid: u32, rowid: u64) Error!void {
             try writer.op(.delete);
@@ -682,8 +742,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 scratch: *Scratch,
                 next_oid: *u32,
 
-                pub fn objectOidTaken(self: *const @This(), oid: u32) bool {
-                    return oidTaken(self.db, self.scratch, oid, 1);
+                pub fn objectOidTaken(self: *const @This(), oid: u32, width: u32) bool {
+                    return oidTaken(self.db, self.scratch, oid, width);
+                }
+
+                pub fn objectRelationNameTaken(self: *const @This(), namespace: u32, name: []const u8) bool {
+                    return tableNameTaken(self.scratch, name, namespace);
+                }
+
+                pub fn objectSequenceNameTaken(self: *const @This(), namespace: u32, name: []const u8) bool {
+                    return sequenceNameTaken(self.scratch, name, namespace);
                 }
 
                 pub fn noteObjectOid(self: *const @This(), oid: u32) void {
@@ -768,10 +836,22 @@ pub fn ChangeLog(comptime config: types.Config) type {
         }
 
         /// Relation names are unique per schema; sequences live in public.
-        fn nameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
+        fn tableNameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
             for (&scratch.tables) |*vt| if (vt.live and vt.namespace == namespace and types.same(vt.name.slice(), name)) return true;
+            return false;
+        }
+
+        fn sequenceNameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
             if (namespace == public_namespace) for (&scratch.seqs) |*seq| if (seq.live and types.same(seq.name.slice(), name)) return true;
             return false;
+        }
+
+        fn relationNameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
+            return tableNameTaken(scratch, name, namespace) or sequenceNameTaken(scratch, name, namespace);
+        }
+
+        fn nameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
+            return relationNameTaken(scratch, name, namespace) or scratch.object_overlay.userTypeNameTaken(namespace, name);
         }
 
         fn findVSchema(scratch: *Scratch, oid: u32) Error!usize {
@@ -1319,29 +1399,22 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 @memcpy(column.name.bytes[0..column_name.len], column_name);
                 for (out.columns[0..index]) |*previous|
                     if (types.same(previous.name.slice(), column.name.slice())) return error.InvalidChangeRecord;
-                column.data_type = types.typeFromOid(try reader.int(u32)) orelse return error.UnsupportedLogVersion;
+                const type_code = try reader.int(u32);
+                column.data_type = if (type_code == mysql_unsigned_type) .mysql_bigint_unsigned else
+                    types.typeFromOid(type_code) orelse return error.UnsupportedLogVersion;
                 column.typmod = try reader.int(i32);
-                // An array column's typmod is its element type's.
-                const typmod_ok = switch (types.elementData(column.data_type) orelse column.data_type) {
-                    .numeric => column.typmod == -1 or blk: {
-                        const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(column.typmod) orelse break :blk false;
-                        break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
-                    },
-                    .timestamp, .timestamptz, .time, .timetz => column.typmod >= -1 and column.typmod <= 6,
-                    .varchar, .bpchar => character.validTypmod(column.typmod),
-                    .bit, .varbit => bit_string.validTypmod(column.typmod),
-                    else => column.typmod == -1,
-                };
-                if (!typmod_ok) return error.InvalidChangeRecord;
+                if (!types.validTypeTypmod(config, column.data_type, column.typmod)) return error.InvalidChangeRecord;
                 var flags = try reader.int(u8);
                 if (version == extensions_format_version) {
                     column.virtual = flags & 0x20 != 0;
                     flags &= 0x1f;
                 }
-                if (flags >> 2 > 4) return error.InvalidChangeRecord;
+                if (flags >> 2 > @intFromEnum(types.DefaultKind.mysql_auto_increment)) return error.InvalidChangeRecord;
                 column.not_null = flags & 1 != 0;
                 column.primary_key = flags & 2 != 0;
                 column.default_kind = @enumFromInt(flags >> 2);
+                if (column.data_type == .mysql_bigint_unsigned and column.default_kind != .none)
+                    return error.InvalidChangeRecord;
                 if (column.primary_key) {
                     if (has_primary or !column.not_null) return error.InvalidChangeRecord;
                     has_primary = true;
@@ -1356,6 +1429,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 if ((column.default_kind == .identity_always or column.default_kind == .identity_by_default) and
                     (!column.not_null or (column.data_type != .smallint and column.data_type != .integer32 and column.data_type != .integer)))
                     return error.InvalidChangeRecord;
+                if (column.default_kind == .mysql_auto_increment and (!column.primary_key or
+                    (column.data_type != .integer32 and column.data_type != .integer))) return error.InvalidChangeRecord;
                 out.columns[index] = column;
             }
             for (out.columns[0..out.count]) |*column| if (column.virtual and column.default_kind != .generated) return error.InvalidChangeRecord;
@@ -1448,7 +1523,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 vt.primary = table.primary_column;
                 vt.base_next_rowid = table.next_rowid;
                 vt.next_rowid = table.next_rowid;
-                vt.live_rows = S.liveRows(table);
+                // Replay updates committed summaries with every published row
+                // transition. Cross-check the count against occupied slots:
+                // legacy or pinned state can retain rows with no live version.
+                const summary = &table.summary;
+                vt.live_rows = if (summary.valid and summary.csn != 0 and summary.csn <= db.csn and
+                    summary.rows >= 0 and @as(u64, @intCast(summary.rows)) == table.row_used)
+                    table.row_used
+                else
+                    S.liveRows(table);
                 vt.relkind = table.relkind;
                 vt.index_count = table.index_count;
                 for (table.indexes[0..table.index_count], 0..) |*index, position| vt.index_oids[position] = index.oid;
@@ -1478,9 +1561,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (!knownNamespace(scratch, definition.namespace)) return error.ChangeRecordConflict;
                         if (definition.oid < first_oid or definition.oid >= 0xfffffffe or oidTaken(db, scratch, definition.oid, width)) return error.ChangeRecordConflict;
                         if (nameTaken(scratch, definition.name.slice(), definition.namespace)) return error.ChangeRecordConflict;
+                        const columns = definition.columns[0..definition.count];
                         var free: ?usize = null;
                         for (&scratch.tables, 0..) |*vt, index| {
-                            if (!vt.live and free == null) free = index;
+                            if (!vt.live and free == null and S.createBankFits(&db.tables[index], columns, definition.extras.index_count)) free = index;
                         }
                         const index = free orelse return error.ChangeRecordConflict;
                         if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
@@ -1502,6 +1586,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.alter_table) => {
                         const index = try findVTable(scratch, try reader.int(u32));
+                        if (S.anyIntegralBank(&db.tables)) return error.ChangeRecordConflict;
                         const vt = &scratch.tables[index];
                         var definition: Definition = .{ .oid = vt.oid, .name = .{}, .columns = @splat(.{}), .count = 0 };
                         try decodeDefinition(&reader, &definition);
@@ -1662,7 +1747,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             if (definition.spec.cache <= 1) return error.InvalidChangeRecord;
                         }
                         if (definition.oid < first_oid or definition.oid == 0xffffffff or oidTaken(db, scratch, definition.oid, 1)) return error.ChangeRecordConflict;
-                        if (nameTaken(scratch, definition.name.slice(), public_namespace)) return error.ChangeRecordConflict;
+                        if (relationNameTaken(scratch, definition.name.slice(), public_namespace) or
+                            scratch.object_overlay.compositeRelationNameTaken(public_namespace, definition.name.slice())) return error.ChangeRecordConflict;
                         if (definition.owner != 0) {
                             const owner = try findVTable(scratch, definition.owner);
                             if (definition.owner_column >= scratch.tables[owner].column_count) return error.ChangeRecordConflict;
@@ -1748,12 +1834,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         fn writeVersion(db: anytype, table: *S.Table, slot: u32, older: u32, row: *const V.Row, csn: u64) Error!u32 {
             try S.ensureVersions(table, 1, csn);
-            const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = slot + 1, .xmin = .{ .epoch = db.epoch }, .xmin_cid = db.cid, .xmin_csn = csn, .older = older, .cells = row.cells };
-            table.rows[slot].newest = version + 1;
+            const version = S.createVersion(table, .{ .row = slot, .xmin = .{ .epoch = db.epoch }, .cid = db.cid, .csn = csn, .older = older }, &row.cells);
             S.indexKey(table, version);
             if (older == 0) {
-                S.summarize(table, &table.versions[version].cells, true, csn);
+                S.summarize(table, version, true, csn);
                 S.scanPublish(table, version, true);
             }
             return version;
@@ -1783,9 +1867,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 switch (tag) {
                     @intFromEnum(Op.create_table) => {
                         const definition = try decodeCreate(&reader);
-                        for (&db.tables, 0..) |*table, index| if (!table.live) {
+                        const columns = definition.columns[0..definition.count];
+                        for (&db.tables, 0..) |*table, index| if (!table.live and S.createBankFits(table, columns, definition.extras.index_count)) {
                             if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
-                            S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
+                            S.reset(table, definition.oid, definition.name, columns);
                             table.namespace = definition.namespace;
                             S.setConstraints(table, definition.constraints[0..definition.constraint_count]);
                             S.setExtras(table, &definition.extras);
@@ -1818,10 +1903,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         for (0..table.row_high) |slot| {
                             if (table.rows[slot].newest == 0) continue;
                             const old = S.visible(table, slot) orelse continue;
-                            S.summarize(table, &table.versions[old].cells, false, csn);
+                            S.summarize(table, old, false, csn);
                             S.scanPublish(table, old, false);
                             retire(db, table, old, csn);
                         }
+                        if (table.relkind != 'm') S.publishTruncate(table, csn);
                     },
                     @intFromEnum(Op.drop_table) => {
                         const table = try tableByOid(db, try reader.int(u32));
@@ -1846,7 +1932,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             const slot = S.findRow(table, rowid) orelse return error.ChangeRecordConflict;
                             const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
                             const new = try writeVersion(db, table, slot, old + 1, &row, csn);
-                            S.summarizeUpdate(table, &table.versions[old].cells, &table.versions[new].cells, csn);
+                            S.summarizeUpdate(table, old, new, csn);
                             S.scanPublish(table, new, true);
                             retire(db, table, old, csn);
                         }
@@ -1855,7 +1941,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const table = try tableByOid(db, try reader.int(u32));
                         const slot = S.findRow(table, try reader.int(u64)) orelse return error.ChangeRecordConflict;
                         const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
-                        S.summarize(table, &table.versions[old].cells, false, csn);
+                        S.summarize(table, old, false, csn);
                         S.scanPublish(table, old, false);
                         retire(db, table, old, csn);
                     },
@@ -1920,7 +2006,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.object_create) => {
                         const object = try O.decodeCreate(record, &reader.position);
                         db.catalog_objects.applyCreate(&object, db.epoch, db.cid, csn);
-                        if (catalog_objects.ownsOid(object.kind)) db.oid_counter = @max(db.oid_counter, object.oid + 1 - first_oid);
+                        const width = object.oidWidth();
+                        if (width != 0) db.oid_counter = @max(db.oid_counter, object.oid + width - first_oid);
                     },
                     @intFromEnum(Op.object_drop) => {
                         const key = try O.decodeDrop(record, &reader.position);

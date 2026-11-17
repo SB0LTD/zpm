@@ -14,6 +14,7 @@
 //! Bound statements keep node indices into the statement-scoped pool and
 //! text-literal spans into the source; both stay valid until the statement
 //! finishes executing. Names and catalog references are copied.
+const std = @import("std");
 const types = @import("types.sig");
 const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
@@ -26,6 +27,8 @@ const parser = @import("parser.sig");
 const array_module = @import("array.sig");
 const routine_catalog = @import("routine_catalog.sig");
 const collation = @import("collation.sig");
+const catalog_objects = @import("catalog_objects.sig");
+const flat_record = @import("flat_record.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -92,6 +95,9 @@ pub fn Binder(comptime config: types.Config) type {
             types: [config.columns]types.DataType = undefined,
             typmods: [config.columns]i32 = undefined,
             count: usize = 0,
+            output: bool = false,
+            deleted_columns: std.StaticBitSet(config.columns) = .empty,
+            non_null_columns: std.StaticBitSet(config.columns) = .empty,
         };
 
         /// VALUES: `rows` is the first values_row node; item p of every row
@@ -113,6 +119,7 @@ pub fn Binder(comptime config: types.Config) type {
             defaults: [config.columns]u16 = @splat(none),
             generated: [config.columns]u16 = @splat(none),
             conflict: Conflict = .{},
+            replace: bool = false,
             returning: Returning = .{},
             /// Bound CHECK expressions by constraint index (source: its text).
             checks: [config.table_constraints]u16 = @splat(none),
@@ -126,6 +133,9 @@ pub fn Binder(comptime config: types.Config) type {
             names: [config.columns]V.Name,
             types: [config.columns]types.DataType,
             typmods: [config.columns]i32 = @splat(-1),
+            non_null_columns: std.StaticBitSet(config.columns) = .empty,
+            has_nominal_types: bool = false,
+            nominal_types: [config.columns]types.NominalColumnType = undefined,
             count: usize,
             where: u16,
             /// Constant expression equal to the primary key (index probe), or none.
@@ -310,6 +320,8 @@ pub fn Binder(comptime config: types.Config) type {
             source: []const u8,
             tables: *const [config.tables]S.Table,
             catalog: *const K,
+            /// Present only when binding an independent top-level SQL read.
+            user_type_catalog: ?*const catalog_objects.Objects(config) = null,
             /// Statement snapshot: every name lookup reads the catalog under it.
             snapshot: storage.Snapshot,
             pool: *Ast.Pool,
@@ -546,6 +558,7 @@ pub fn Binder(comptime config: types.Config) type {
             names: [config.columns]V.Name = undefined,
             tys: [config.columns]ast.Type = undefined,
             typmods: [config.columns]i32 = undefined,
+            non_null_columns: std.StaticBitSet(config.columns) = .empty,
             order: [2 * config.columns]SortKey = undefined,
             order_count: usize = 0,
             distinct: Distinct = .none,
@@ -669,9 +682,15 @@ pub fn Binder(comptime config: types.Config) type {
                 .create_schema => .create_schema,
                 .drop_schema => .drop_schema,
                 .control => |control| switch (control) {
+                    .maintenance => |spec| if (spec.operation == .vacuum) .vacuum else .analyze,
                     .begin, .set_transaction => .begin,
                     .commit => .commit,
                     .rollback, .rollback_to => .rollback,
+                    .prepared_transaction => |prepared| switch (prepared.action) {
+                        .prepare => .prepare_transaction,
+                        .commit => .commit_prepared,
+                        .rollback => .rollback_prepared,
+                    },
                     .savepoint => .savepoint,
                     .release => .release,
                     .set, .set_session_characteristics => .set,
@@ -689,7 +708,7 @@ pub fn Binder(comptime config: types.Config) type {
             var out: V.Name = .{ .len = ident.len };
             const raw = ident.span.slice(context.source);
             if (ident.quoted) {
-                lexer.decodeQuotedWith(context.source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, '"', &out.bytes);
+                lexer.decodeQuotedIdentifier(context.source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, &out.bytes);
             } else for (raw, 0..) |byte, index| out.bytes[index] = types.lower(byte);
             return out;
         }
@@ -782,6 +801,13 @@ pub fn Binder(comptime config: types.Config) type {
             if (context.node(b.*).ty == .regtype) b.* = try convert(context, b.*, .oid, -1, .implicit);
             const left = context.node(a.*).ty;
             const right = context.node(b.*).ty;
+            if (left == .mysql_bigint_unsigned or right == .mysql_bigint_unsigned) {
+                // Unsigned cells already have the exact NUMERIC representation.
+                // Keep the bound column intact so equality can use its index.
+                a.* = try unsignedComparisonOperand(context, a.*);
+                b.* = try unsignedComparisonOperand(context, b.*);
+                return;
+            }
             if (left == .unknown and right == .unknown) {
                 try coerce(context, a.*, .text);
                 return coerce(context, b.*, .text);
@@ -803,6 +829,13 @@ pub fn Binder(comptime config: types.Config) type {
             const target = value.comparisonType(left, right) orelse return error.UndefinedFunction;
             a.* = try convert(context, a.*, target, -1, .implicit);
             b.* = try convert(context, b.*, target, -1, .implicit);
+        }
+
+        fn unsignedComparisonOperand(context: *const Context, id: u16) Error!u16 {
+            const ty = context.node(id).ty;
+            if (ty == .mysql_bigint_unsigned or ty == .numeric) return id;
+            if (ty != .unknown and !value.integral(ty)) return error.UnsupportedStatement;
+            return convert(context, id, .numeric, -1, .implicit);
         }
 
         fn legacyBoolean(context: *const Context, id: u16) Error!void {
@@ -955,6 +988,8 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn arithmeticType(context: *const Context, n: *ast.Node) Error!void {
+            if (context.node(n.a).ty == .mysql_bigint_unsigned or context.node(n.b).ty == .mysql_bigint_unsigned)
+                return error.UnsupportedStatement;
             if (context.node(n.a).ty == .unknown and context.node(n.b).ty == .unknown) return error.AmbiguousFunction;
             if (context.node(n.a).ty == .money or context.node(n.b).ty == .money) return moneyArithmetic(context, n);
             if (context.node(n.a).ty == .pg_lsn or context.node(n.b).ty == .pg_lsn) return lsnArithmetic(context, n);
@@ -1713,6 +1748,7 @@ pub fn Binder(comptime config: types.Config) type {
                     .int2, .int4 => .int8,
                     .int8, .numeric => .numeric,
                     .float4, .float8, .interval, .money => arg_ty,
+                    .mysql_bigint_unsigned => return error.UnsupportedStatement,
                     else => return error.UndefinedFunction,
                 },
                 .avg => switch (arg_ty) {
@@ -1720,6 +1756,7 @@ pub fn Binder(comptime config: types.Config) type {
                     .float4, .float8 => .float8,
                     // interval_avg (PostgreSQL 18).
                     .interval => .interval,
+                    .mysql_bigint_unsigned => return error.UnsupportedStatement,
                     // AVG(interval) is not provided (no interval / number).
                     else => return error.UndefinedFunction,
                 },
@@ -1727,7 +1764,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .min, .max => if (types.isArray(arg_ty)) arg_ty else switch (arg_ty) {
                     .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz, .money => arg_ty,
                     // pg_lsn_larger/smaller and xid8_larger/smaller.
-                    .pg_lsn, .xid8 => arg_ty,
+                    .pg_lsn, .xid8, .mysql_bigint_unsigned => arg_ty,
                     // network_larger/network_smaller (cidr input converts).
                     .inet, .cidr => blk: {
                         n.b = try convert(context, arg, .inet, -1, .implicit);
@@ -2052,6 +2089,18 @@ pub fn Binder(comptime config: types.Config) type {
                     if(scope.saw_aggregate) |flag| flag.*=true;
                 },
                 .window_call => unreachable,
+                .mysql_ifnull => unreachable, // Parsed directly as COALESCE.
+                .mysql_last_insert_id => n.ty = .mysql_bigint_unsigned,
+                .mysql_date_add => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const date = context.node(n.b);
+                    const amount = context.node(date.next);
+                    if (!value.integral(amount.ty) and amount.kind != .null_literal) return error.UnsupportedStatement;
+                    if (date.ty == .unknown) try coerce(context, n.b, .text);
+                    n.ty = if (date.ty == .date) .date else if (value.characterType(date.ty)) .bpchar else return error.UnsupportedStatement;
+                    if (n.ty == .bpchar) n.typmod = ast.mysql_date_text_typmod;
+                    n.constant = listConstant(context, n.b);
+                },
                 .routine, .routine_param => {},
                 .none => return bindRoutineCall(context, n, count),
                 .aggregate_input => return,
@@ -2194,6 +2243,31 @@ pub fn Binder(comptime config: types.Config) type {
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
+                .tds_dateadd => {
+                    if (context.dialect != .tds or count != 2) return error.UnsupportedStatement;
+                    const number = context.node(n.b);
+                    const date = context.node(number.next);
+                    if ((!value.integral(number.ty) and !knownNull(context, n.b)) or
+                        (date.ty != .date and !knownNull(context, number.next))) return error.UnsupportedStatement;
+                    try bindSignature(context, n, &.{ .int8, .date }, .date, false);
+                },
+                .tds_isnull => {
+                    if (context.dialect != .tds or count != 2) return error.UnsupportedStatement;
+                    const first = n.b;
+                    const second = context.node(first).next;
+                    const left = context.node(first).ty;
+                    const right = context.node(second).ty;
+                    if ((!value.integral(left) and !(left == .unknown and knownNull(context, first))) or
+                        (!value.integral(right) and !(right == .unknown and knownNull(context, second)))) return error.UnsupportedStatement;
+                    const target: ast.Type = if (left != .unknown) left else if (right != .unknown) right else .int4;
+                    const a = try convert(context, first, target, -1, .assignment);
+                    const b = try convert(context, second, target, -1, .assignment);
+                    context.node(a).next = b;
+                    context.node(b).next = none;
+                    n.b = a;
+                    n.ty = target;
+                    n.constant = isConstant(context, a) and isConstant(context, b);
+                },
                 .overlaps, .overlaps_tz => try typeOverlaps(context, n, count),
                 .aggregate_pair => unreachable,
                 .normalize, .is_normalized => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, if (n.func == .normalize) .text else .boolean, true),
@@ -3224,7 +3298,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn bindDefaults(context: *const Context, index: usize, entry: *const S.Table, needed: *const [config.columns]bool, defaults: *[config.columns]u16, generated: *[config.columns]u16) Error!void {
             for (entry.columns[0..entry.column_count], 0..) |*column, position| switch (column.default_kind) {
-                .none => {},
+                .none, .mysql_auto_increment => {},
                 .identity_always, .identity_by_default => defaults[position] = try context.pool.add(.{ .kind = .function, .func = .identity_next, .integer = @intCast(index), .column = @intCast(position), .ty = types.typeOfData(column.data_type) }),
                 .default => if (needed[position]) { defaults[position] = try bindExpressionText(context, column, null, storedSource(index, position)); },
                 .generated => generated[position] = try bindExpressionText(context, column, index, storedSource(index, position)),
@@ -3668,8 +3742,14 @@ pub fn Binder(comptime config: types.Config) type {
                 .text_literal => n.ty = .unknown,
                 .decimal_literal => {
                     // Validated now (54000 beyond numeric_digits).
-                    _ = try Io.parse(.numeric, -1, n.name.span.slice(context.source), context.session);
+                    const raw = n.name.span.slice(context.source);
+                    const number = try Io.parse(.numeric, -1, raw, context.session);
                     n.ty = .numeric;
+                    if (!context.legacy and context.dialect == .mysql and config.numeric_digits >= 20) classify: {
+                        for (raw) |byte| if (byte < '0' or byte > '9') break :classify;
+                        const magnitude = types.mysqlUnsignedValue(&number.numeric) orelse break :classify;
+                        if (magnitude > 9223372036854775807) n.ty = .mysql_bigint_unsigned;
+                    }
                 },
                 .param => {
                     // `$n` of a routine body is its n-th parameter (B11 wave 3).
@@ -3705,6 +3785,16 @@ pub fn Binder(comptime config: types.Config) type {
                 .unary => {
                     try typeExpr(context, scope, n.a);
                     const ty = context.node(n.a).ty;
+                    if (ty == .mysql_bigint_unsigned) {
+                        // A sign immediately before a literal is not
+                        // unsigned column arithmetic. A negative literal
+                        // above the signed range remains exact DECIMAL.
+                        if (context.node(n.a).kind != .decimal_literal or n.op == .bit_not)
+                            return error.UnsupportedStatement;
+                        n.ty = if (n.op == .neg) .numeric else .mysql_bigint_unsigned;
+                        n.constant = isConstant(context, n.a);
+                        return;
+                    }
                     if (ty == .unknown) return error.AmbiguousFunction;
                     if (!value.numericCategory(ty) and ty != .interval) return error.UndefinedFunction;
                     if (n.op == .bit_not and !value.integral(ty)) return error.UndefinedFunction;
@@ -3814,11 +3904,31 @@ pub fn Binder(comptime config: types.Config) type {
                     if (context.node(n.a).kind == .row_constructor) return bindRowIn(context, scope, id);
                     try typeExpr(context, scope, n.a);
                     var result: ast.Type = context.node(n.a).ty;
+                    var unsigned = result == .mysql_bigint_unsigned;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
                         try typeExpr(context, scope, item);
-                        try unifyInto(&result, context.node(item).ty);
+                        unsigned = unsigned or context.node(item).ty == .mysql_bigint_unsigned;
                     }
+                    if (unsigned) {
+                        n.a = try unsignedComparisonOperand(context, n.a);
+                        var previous: u16 = none;
+                        item = n.b;
+                        while (item != none) {
+                            const following = context.node(item).next;
+                            const resolved = try unsignedComparisonOperand(context, item);
+                            if (previous == none) n.b = resolved else context.node(previous).next = resolved;
+                            context.node(resolved).next = following;
+                            previous = resolved;
+                            item = following;
+                        }
+                        n.ty = .boolean;
+                        n.constant = isConstant(context, n.a) and listConstant(context, n.b);
+                        return;
+                    }
+                    item = n.b;
+                    while (item != none) : (item = context.node(item).next)
+                        try unifyInto(&result, context.node(item).ty);
                     if (result == .unknown) result = .text;
                     if (result == .json) return error.UndefinedFunction;
                     if (value.integral(result)) {
@@ -3893,13 +4003,20 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = constant;
                 },
                 .coalesce => {
+                    const mysql = n.func == .mysql_ifnull;
                     var result: ast.Type = .unknown;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
                         try typeExpr(context, scope, item);
-                        try unifyInto(&result, context.node(item).ty);
+                        const arg = context.node(item);
+                        if (mysql and arg.ty != .int4 and arg.ty != .int8 and arg.kind != .null_literal) return error.UnsupportedStatement;
+                        const ty: ast.Type = if (mysql and signedLiteral(context, item) != null) .int8 else arg.ty;
+                        try unifyInto(&result, ty);
                     }
-                    if (result == .unknown) result = .text;
+                    if (result == .unknown) {
+                        if (mysql) return error.UnsupportedStatement;
+                        result = .text;
+                    }
                     if (value.integral(result)) {
                         item = n.b;
                         while (item != none) : (item = context.node(item).next) try coerce(context, item, result);
@@ -3925,6 +4042,8 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .cast => {
                     n.date_bound=false;
+                    if (n.flat_record_cast) return;
+                    if (n.cast_type == .unknown) return error.UnsupportedStatement;
                     if (n.typmod == ast.regclass_typmod or n.typmod == ast.regtype_typmod) return regCast(context, scope, n);
                     const target = n.cast_type;
                     const inner = context.node(n.a);
@@ -3961,7 +4080,7 @@ pub fn Binder(comptime config: types.Config) type {
                         _ = try Io.parseCast(target, n.typmod, text.slice(), context.session);
                     }
                     n.ty = target;
-                    n.constant = isConstant(context, n.a);
+                    n.constant = !n.domain_cast and isConstant(context, n.a);
                     const bound=context.node(n.a);
                     if(target==.date and bound.kind==.text_literal and bound.ty==.date and bound.date_bound) {
                         n.date_bound=true;n.integer=bound.integer;
@@ -4129,8 +4248,14 @@ pub fn Binder(comptime config: types.Config) type {
                 .at_zone => .{ .name = "timezone", .strength = 2 },
                 .case_expr => .{ .name = "case", .strength = 1 },
                 .cast => blk: {
+                    if (n.flat_record_cast and context.node(n.a).kind == .row_constructor)
+                        break :blk .{ .name = "row", .strength = 2 };
                     const inner = figure(context, n.a, buffer);
                     if (inner.strength > 1) break :blk inner;
+                    if (n.domain_cast or n.enum_cast or n.flat_record_cast) {
+                        buffer.* = toName(context, n.name);
+                        break :blk .{ .name = buffer.slice(), .strength = 1 };
+                    }
                     const named_type = types.elementType(n.cast_type) orelse n.cast_type;
                     break :blk .{ .name = types.typeInfo(types.dataTypeOf(named_type)).name, .strength = 1 };
                 },
@@ -4140,6 +4265,11 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn targetName(context: *const Context, id: u16) V.Name {
             var buffer: V.Name = .{};
+            const n = context.node(id);
+            if (context.dialect == .tds and (n.kind == .cast or (n.kind == .function and
+                (n.func == .tds_isnull or n.func == .tds_dateadd)))) return .{};
+            if (n.func == .mysql_ifnull or n.func == .mysql_date_add or n.func == .mysql_last_insert_id)
+                return literalName(context.source[n.text.start..n.text.end]);
             const result = figure(context, id, &buffer);
             return literalName(result.name);
         }
@@ -4150,9 +4280,9 @@ pub fn Binder(comptime config: types.Config) type {
             const wanted = toName(context, name);
             if (schema) |qualifier| {
                 const schema_name = toName(context, qualifier);
-                return catalog.findView(schema_name.slice(), wanted.slice());
+                return context.catalog.findSystemView(schema_name.slice(), wanted.slice());
             }
-            return catalog.findView(null, wanted.slice());
+            return context.catalog.findSystemView(null, wanted.slice());
         }
 
         /// The OID of a schema name: pg_catalog, public, information_schema
@@ -4170,7 +4300,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// A user table, optionally schema-qualified (public by default,
         /// as the default search_path).
-        fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
+        pub fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
             // PostgreSQL reports a relation in a missing schema as 42P01.
             const namespace = qualifierNamespace(context, schema) catch |err| return if (err == error.UndefinedSchema) error.TableNotFound else err;
             const wanted = toName(context, name);
@@ -4427,20 +4557,40 @@ pub fn Binder(comptime config: types.Config) type {
             return switch (n.kind) {
                 .column, .cast => n.typmod,
                 // A subscript keeps the array's typmod (reftypmod).
-                .function => if (n.func == .array_subscript or n.func == .xmlserialize) n.typmod else -1,
+                .function => if (n.func == .array_subscript or n.func == .xmlserialize or n.func == .mysql_date_add) n.typmod else -1,
                 else => -1,
             };
         }
 
         /// RETURNING over the target table's row (`*`, `t.*`, expressions);
         /// `alias` (INSERT ... AS alias) replaces the table name.
-        fn bindReturning(context: *const Context, index: usize, list: *const Ast.Returning, table_alias: ?ast.Ident) Error!Returning {
-            var out: Returning = .{};
+        fn bindReturning(context: *const Context, index: usize, list: *const Ast.Returning, table_alias: ?ast.Ident, mutation: types.CommandTag) Error!Returning {
+            var out: Returning = .{ .output = list.output };
             if (list.count == 0) return out;
             var scope = tableScope(context, index);
             if (table_alias) |name| scope.rels[0].name = toName(context, name);
             const entry = &context.tables[index];
+            if (list.output and (context.dialect != .tds or context.nested_dml or entry.relkind != 'r')) return error.UnsupportedStatement;
             for (list.targets[0..list.count]) |*target| {
+                var deleted = false;
+                if (list.output) {
+                    // Direct pseudo-table columns only, including the
+                    // qualified star. Unqualified columns can never select
+                    // from either image by accident.
+                    if (target.expr == none) return error.ColumnNotFound;
+                    const node = context.node(target.expr);
+                    if (node.kind != .column) return error.UnsupportedStatement;
+                    const qualifier = toName(context, node.qualifier);
+                    if (types.keyword(qualifier.slice(), "deleted")) {
+                        if (mutation == .insert) return error.ColumnNotFound;
+                        deleted = true;
+                    } else if (!types.keyword(qualifier.slice(), "inserted") or mutation == .delete) {
+                        return error.ColumnNotFound;
+                    }
+                    // Both images share the schema. Bind one relation at a
+                    // time and keep the image selector with the result column.
+                    scope.rels[0].name = qualifier;
+                }
                 if (target.star) {
                     if (target.expr != none) {
                         const qualifier = toName(context, context.node(target.expr).qualifier);
@@ -4452,6 +4602,9 @@ pub fn Binder(comptime config: types.Config) type {
                         out.names[out.count] = column.name;
                         out.types[out.count] = column.data_type;
                         out.typmods[out.count] = column.typmod;
+                        if (deleted) out.deleted_columns.set(out.count);
+                        if (list.output and fixedInt4(context, &.{.{ .table = index }}, out.targets[out.count]))
+                            out.non_null_columns.set(out.count);
                         out.count += 1;
                     }
                     continue;
@@ -4462,6 +4615,9 @@ pub fn Binder(comptime config: types.Config) type {
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
                 out.typmods[out.count] = outputTypmod(context, target.expr);
+                if (deleted) out.deleted_columns.set(out.count);
+                if (list.output and fixedInt4(context, &.{.{ .table = index }}, target.expr))
+                    out.non_null_columns.set(out.count);
                 out.count += 1;
             }
             return out;
@@ -4520,6 +4676,127 @@ pub fn Binder(comptime config: types.Config) type {
             out.plan = root;
         }
 
+        fn recordFieldLiteral(context: *const Context, id: u16) bool {
+            const n = context.node(id);
+            return switch (n.kind) {
+                .null_literal, .int_literal, .text_literal, .bool_literal, .decimal_literal => true,
+                .unary => (n.op == .neg or n.op == .pos) and recordFieldLiteral(context, n.a),
+                else => false,
+            };
+        }
+
+        fn bindFlatRecordCast(context: *const Context, scope: *const Scope, n: *ast.Node, object: *const catalog_objects.Objects(config).Object) Error!void {
+            const row = context.node(n.a);
+            if (row.kind == .row_constructor) {
+                var item = &row.b;
+                var layout = object.compositeFields();
+                while (layout.next()) |attribute| {
+                    const id = item.*;
+                    if (id == none) return error.CannotCoerce;
+                    const data_type = types.typeFromOid(attribute.oid) orelse return error.UnsupportedStatement;
+                    if (attribute.typmod != -1 or !flat_record.supports(data_type) or !recordFieldLiteral(context, id)) return error.UnsupportedStatement;
+                    const next = context.node(id).next;
+                    try typeExpr(context, scope, id);
+                    const coerced = convert(context, id, types.typeOfData(data_type), -1, .explicit) catch |err|
+                        return if (err == error.UndefinedFunction) error.CannotCoerce else err;
+                    item.* = coerced;
+                    item = &context.node(coerced).next;
+                    item.* = next;
+                }
+                if (item.* != none) return error.CannotCoerce;
+            } else if (row.kind != .null_literal) return error.UnsupportedStatement;
+            n.cast_type = .bytea;
+            n.ty = .bytea;
+            n.flat_record_cast = true;
+            n.constant = true;
+            n.integer = object.composite_field_count;
+        }
+
+        fn bindUserTypeCast(context: *const Context, scope: *const Scope, target: u16) Error!?types.NominalColumnType {
+            const n = context.node(target);
+            if (n.kind != .cast or n.cast_type != .unknown) return null;
+            if (context.dialect != .postgres) return error.UnsupportedStatement;
+            const user_types = context.user_type_catalog orelse return error.UnsupportedStatement;
+            const namespace = try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
+            const name = toName(context, n.name);
+            if (user_types.byName(.domain, namespace, name.slice(), context.snapshot)) |index| {
+                const info = user_types.items[index].domain;
+                n.cast_type = info.base;
+                n.domain_cast = true;
+                n.domain_not_null = info.not_null;
+                n.domain_comparison = info.comparison;
+                n.integer = info.bound;
+                return null;
+            }
+            if (user_types.byName(.enum_type, namespace, name.slice(), context.snapshot)) |index| {
+                const object = &user_types.items[index];
+                const literal = context.node(n.a);
+                if (literal.kind == .text_literal) {
+                    const label = E.literalText(context.source, literal.text);
+                    var labels = object.enumLabels();
+                    while (labels.next()) |declared_label| {
+                        if (types.same(declared_label, label.slice())) break;
+                    } else return error.InvalidTextRepresentation;
+                } else if (literal.kind != .null_literal) return error.UnsupportedStatement;
+                // PostgreSQL's enum send function emits the exact label.
+                // Only the admitted root projection may use this storage
+                // representation; nested casts stay unresolved and fail.
+                n.cast_type = .text;
+                n.enum_cast = true;
+                return .{ .oid = object.oid, .len = 4 };
+            }
+            if (user_types.byName(.composite_type, namespace, name.slice(), context.snapshot)) |index| {
+                const object = &user_types.items[index];
+                try bindFlatRecordCast(context, scope, n, object);
+                return .{ .oid = object.oid, .len = -1, .representation = .flat_record };
+            }
+            if (user_types.userTypeNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
+            return error.UndefinedObject;
+        }
+
+        /// A signed literal has no computed operands. Negating a negative
+        /// literal is a separate expression on the MySQL type path.
+        fn signedLiteral(context: *const Context, id: u16) ?i64 {
+            const n = context.node(id);
+            if (n.kind == .int_literal) return n.integer;
+            if (n.kind != .unary or (n.op != .neg and n.op != .pos)) return null;
+            const operand = signedLiteral(context, n.a) orelse return null;
+            if (n.op == .pos) return operand;
+            if (operand < 0) return null;
+            return -operand;
+        }
+
+        const Int4Source = union(enum) { table: usize, query: u16 };
+
+        /// Admit fixed TDS INT4 only from bound expressions that cannot
+        /// produce NULL. The relation map contains only direct, non-extended
+        /// FROM items. Conversions and general expressions remain nullable.
+        fn fixedInt4(context: *const Context, relations: []const ?Int4Source, id: u16) bool {
+            if (id == none) return false;
+            const node = context.node(id);
+            if (node.ty != .int4 or node.planned_null) return false;
+            return switch (node.kind) {
+                .int_literal => true,
+                .unary => signedLiteral(context, id) != null,
+                .column => if (node.level == 0 and node.relation < relations.len) blk: {
+                    const origin = relations[node.relation] orelse break :blk false;
+                    switch (origin) {
+                        .table => |index| {
+                            const source = &context.tables[index];
+                            break :blk source.relkind == 'r' and node.column < source.column_count and source.columns[node.column].not_null;
+                        },
+                        .query => |index| {
+                            const source = &plansOf(context).items[index];
+                            break :blk node.column < source.count and source.non_null_columns.isSet(node.column);
+                        },
+                    }
+                } else false,
+                .function => node.func == .tds_isnull and
+                    fixedInt4(context, relations, context.node(node.b).next),
+                else => false,
+            };
+        }
+
         fn bindSelect(context: *const Context, select: *const Ast.Select) Error!Select {
             const scope = try scopeFor(context, select.from);
             // FOR ... OF names a FROM item (42P01 otherwise; single-table locking).
@@ -4531,26 +4808,42 @@ pub fn Binder(comptime config: types.Config) type {
                 }
             }
             var out: Select = .{ .table = singleTable(&scope), .targets = undefined, .names = undefined, .types = undefined, .count = 0, .where = none, .key = none, .order = undefined, .order_count = 0, .limit = select.limit, .lock = select.lock };
+            const origin: ?Int4Source = if (out.table) |index| .{ .table = index } else null;
             for (select.targets[0..select.count]) |*target| {
                 if (target.star) {
                     const entry = &context.tables[out.table.?];
                     for (entry.columns[0..entry.column_count], 0..) |*column, index| {
                         if (out.count == config.columns) return error.ColumnCapacity;
-                        const id = try context.pool.add(.{ .kind = .column, .column = @intCast(index), .ty = types.typeOfData(column.data_type), .typmod = column.typmod });
+                        const data_type = projectedDataType(context, column.data_type);
+                        const id = try context.pool.add(.{ .kind = .column, .column = @intCast(index), .ty = types.typeOfData(data_type), .typmod = column.typmod });
                         out.targets[out.count] = id;
                         out.names[out.count] = column.name;
-                        out.types[out.count] = column.data_type;
+                        out.types[out.count] = data_type;
                         out.typmods[out.count] = column.typmod;
+                        if (context.dialect == .tds and fixedInt4(context, &.{origin}, id))
+                            out.non_null_columns.set(out.count);
                         out.count += 1;
                     }
                     continue;
                 }
                 if (out.count == config.columns) return error.ColumnCapacity;
+                if (select.from == null and select.where == none and select.order_count == 0 and !select.limit_present) {
+                    if (try bindUserTypeCast(context, &scope, target.expr)) |nominal| {
+                        if (!out.has_nominal_types) @memset(&out.nominal_types, .{});
+                        out.has_nominal_types = true;
+                        out.nominal_types[out.count] = nominal;
+                    }
+                }
                 try valueExpr(context, &scope, target.expr);
+                // MySQL projects standalone signed literals as BIGINT.
+                if (!context.legacy and context.dialect == .mysql and signedLiteral(context, target.expr) != null)
+                    context.node(target.expr).ty = .int8;
                 out.targets[out.count] = target.expr;
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
                 out.typmods[out.count] = outputTypmod(context, target.expr);
+                if (context.dialect == .tds and fixedInt4(context, &.{origin}, target.expr))
+                    out.non_null_columns.set(out.count);
                 out.count += 1;
             }
             out.where = try bindWhere(context, &scope, select.where);
@@ -4599,9 +4892,13 @@ pub fn Binder(comptime config: types.Config) type {
             return plansOf(context).items[rel.plan].names[column].slice();
         }
 
+        fn projectedDataType(context: *const Context, stored: types.DataType) types.DataType {
+            return if (stored == .mysql_bigint_unsigned and context.dialect != .mysql) .numeric else stored;
+        }
+
         fn relationColumnType(context: *const Context, rel: *const Relation, column: usize) ast.Type {
             if (rel.view) |view| return catalog.viewColumns(view)[column].ty;
-            if (rel.table) |index| return types.typeOfData(context.tables[index].columns[column].data_type);
+            if (rel.table) |index| return types.typeOfData(projectedDataType(context, context.tables[index].columns[column].data_type));
             return plansOf(context).items[rel.plan].tys[column];
         }
 
@@ -5191,7 +5488,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn bindModifyingCte(context: *const Context, cte: *const Ast.Cte, id: u8) Error!void {
             const plans = plansOf(context);
             if (plans.dml_len == config.ctes) return error.StatementTooComplex;
-            const statement = try P.parseNested(context.source, cte.dml_start, context.pool);
+            const statement = try P.parseNestedWithDialect(context.source, cte.dml_start, context.pool, context.dialect);
             var nested = context.*;
             nested.nested_dml = true;
             const bound = try bindStatement(&nested, &statement);
@@ -6614,6 +6911,25 @@ pub fn Binder(comptime config: types.Config) type {
             bindTies(q, p, order[0..order_count]);
             p.constant_source_safe=!q.distinct and q.order_count==0 and !q.limit_present and !q.offset_present;
             try lowerWindows(context,id);
+            if (context.dialect == .tds and !p.grouped and p.window_count == 0) {
+                var direct: [config.relations]?Int4Source = @splat(null);
+                for (p.sources[0..p.source_count], 0..) |operand, index| {
+                    if (operand.group_end != none) {
+                        @memset(&direct, null);
+                        break;
+                    }
+                    if (operand.join == .right or operand.join == .full) @memset(direct[0..index], null);
+                    if (operand.join == .left or operand.join == .full) continue;
+                    if (operand.table) |table| {
+                        direct[index] = .{ .table = table };
+                    } else if (operand.plan != none) {
+                        direct[index] = .{ .query = operand.plan };
+                    }
+                }
+                for (p.targets[0..p.count], 0..) |target, column| if (fixedInt4(context, direct[0..p.source_count], target)) {
+                    p.non_null_columns.set(column);
+                };
+            }
             return id;
         }
 
@@ -7177,7 +7493,7 @@ pub fn Binder(comptime config: types.Config) type {
                     // pg_catalog / information_schema are not writable here.
                     if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
                     if (context.catalog.findIn(namespace, table_name.slice(), context.snapshot) != null) {
-                        if (create.if_not_exists) return .{ .noop = .create_table };
+                        if (create.if_not_exists) return .{ .noop = if (create.as_query != none) .create_table_as else .create_table };
                         return error.TableExists;
                     }
                     if (create.invalid_definition) return error.Syntax;
@@ -7188,13 +7504,18 @@ pub fn Binder(comptime config: types.Config) type {
                     // Owned sequences live in public: identity and SERIAL
                     // columns stay outside other schemas (0A000).
                     if (namespace != catalog.public_namespace) for (create.columns[0..create.count]) |*definition| {
-                        if (definition.serial != 0 or definition.default_kind == .identity_always or definition.default_kind == .identity_by_default) return error.UnsupportedStatement;
+                        if (definition.serial != 0 or definition.default_kind == .identity_always or definition.default_kind == .identity_by_default or
+                            definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
                     };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind, .virtual = definition.virtual };
                         for (out.columns[0..index]) |*previous|
                             if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
                         column.data_type = columnType(context, definition);
+                        if (column.data_type == .mysql_bigint_unsigned and
+                            (context.dialect != .mysql or !types.validTypeTypmod(config, column.data_type, column.typmod) or
+                                definition.default_kind != .none or create.partition_by != .none or create.inherits != null))
+                            return error.UnsupportedStatement;
                         if (definition.primary_key and column.data_type == .json) return error.UndefinedFunction;
                         const text = definition.expression.slice(context.source);
                         if (text.len > config.text_bytes) return error.TextCapacity;
@@ -7211,9 +7532,12 @@ pub fn Binder(comptime config: types.Config) type {
                             out.serial_count += 1;
                         }
                         switch (definition.default_kind) {
-                            .identity_always, .identity_by_default => {
+                            .identity_always, .identity_by_default, .mysql_auto_increment => {
                                 if (!integerColumn(column.data_type)) return error.TypeMismatch;
                                 if (out.identity != null) return error.UnsupportedStatement;
+                                if (definition.default_kind == .mysql_auto_increment and
+                                    (create.inherits != null or create.like != null or create.partition_by != .none or
+                                    (column.data_type != .integer32 and column.data_type != .integer))) return error.UnsupportedStatement;
                                 column.not_null = true;
                                 var options = definition.sequence;
                                 if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
@@ -7239,6 +7563,11 @@ pub fn Binder(comptime config: types.Config) type {
                         out.extras.parent = context.tables[parent_index].oid;
                     }
                     try bindTableConstraints(context, create.constraints[0..create.constraint_count], &out);
+                    if (out.identity) |identity| {
+                        const key = &out.columns[identity.column];
+                        if (key.default_kind == .mysql_auto_increment and (!key.primary_key or out.serial_count != 0))
+                            return error.InvalidTableDefinition;
+                    }
                     if (create.partition_by != .none) {
                         // Rows live in the partitions: keys and references
                         // on the partitioned table are outside the subset.
@@ -7312,7 +7641,7 @@ pub fn Binder(comptime config: types.Config) type {
                             if (first >= 1 and first < @as(i64, @intCast(count))) count = @intCast(first);
                         }
                     }
-                    var out: Insert = .{ .table = index, .count = count, .rows = insert.rows, .row_count = insert.row_count };
+                    var out: Insert = .{ .table = index, .count = count, .rows = insert.rows, .row_count = insert.row_count, .replace = insert.replace };
                     for (0..count) |position| out.mapping[position] = @intCast(mapping[position]);
                     switch (insert.source) {
                         .values => try bindValues(context, entry, &out, insert.overriding),
@@ -7327,7 +7656,8 @@ pub fn Binder(comptime config: types.Config) type {
                         if (entry.relkind == 'p') return error.UnsupportedStatement;
                         try bindConflict(context, index, entry, insert.alias, conflict, &out.conflict);
                     }
-                    out.returning = try bindReturning(context, index, &insert.returning, insert.alias);
+                    if (insert.returning.output and insert.conflict != null) return error.UnsupportedStatement;
+                    out.returning = try bindReturning(context, index, &insert.returning, insert.alias, .insert);
                     return .{ .insert = out };
                 },
                 .select => |index| {
@@ -7377,7 +7707,8 @@ pub fn Binder(comptime config: types.Config) type {
                     const needed = assignedDefaults(context, &out.values);
                     try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
                     try bindChecks(context, index, entry, &out.checks);
-                    out.returning = try bindReturning(context, index, &update.returning, update.alias);
+                    if (update.returning.output and out.from != none) return error.UnsupportedStatement;
+                    out.returning = try bindReturning(context, index, &update.returning, update.alias, .update);
                     return .{ .update = out };
                 },
                 .delete => |*delete| {
@@ -7388,7 +7719,8 @@ pub fn Binder(comptime config: types.Config) type {
                     var out: Delete = .{ .table = index, .where = none, .key = none };
                     if (delete.using != none) try bindSources(context, delete.using, &scope, &out.using, &out.offsets);
                     out.where = try bindWhere(context, &scope, delete.where);
-                    out.returning = try bindReturning(context, index, &delete.returning, delete.alias);
+                    if (delete.returning.output and out.using != none) return error.UnsupportedStatement;
+                    out.returning = try bindReturning(context, index, &delete.returning, delete.alias, .delete);
                     if (out.using == none) out.key = primaryKey(context, &context.tables[index], out.where);
                     return .{ .delete = out };
                 },
@@ -7678,6 +8010,8 @@ pub fn Binder(comptime config: types.Config) type {
             const index = found.slot;
             const entry = &context.tables[index];
             if (entry.relkind != 'r') return error.WrongObjectType;
+            for (entry.columns[0..entry.column_count]) |column| if (column.default_kind == .mysql_auto_increment)
+                return error.UnsupportedStatement;
             var out = alterOf(context, index, .alter_table);
             // Inheritance and partition definitions keep their column lists.
             if (entry.parent != 0 or hasChildren(context, entry.oid)) for (alter.actions[0..alter.count]) |*action| switch (action.*) {
@@ -7701,10 +8035,11 @@ pub fn Binder(comptime config: types.Config) type {
                     if (out.count == config.columns) return error.ColumnCapacity;
                     var column: V.Column = .{ .name = name, .not_null = definition.not_null, .typmod = definition.typmod, .default_kind = definition.default_kind };
                     column.data_type = columnType(context, definition);
+                    if (column.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;
                     switch (definition.default_kind) {
                         // Identity and stored generation need per-row values
                         // (a table rewrite); a new primary key needs an index.
-                        .identity_always, .identity_by_default, .generated => return error.UnsupportedStatement,
+                        .identity_always, .identity_by_default, .generated, .mysql_auto_increment => return error.UnsupportedStatement,
                         else => {},
                     }
                     if (definition.primary_key) return error.UnsupportedStatement;
@@ -7816,6 +8151,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .set_default => |*set| {
                     const position = alterColumn(&out, toName(context, set.column).slice()) orelse return error.ColumnNotFound;
                     const column = &out.columns[position];
+                    if (column.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;
                     if (column.default_kind != .none and column.default_kind != .default) return error.Syntax;
                     const text = set.expression.slice(context.source);
                     if (text.len > config.text_bytes) return error.TextCapacity;
@@ -8363,6 +8699,7 @@ pub fn Binder(comptime config: types.Config) type {
                 var copy = column;
                 copy.primary_key = column.primary_key and like.indexes;
                 switch (column.default_kind) {
+                    .mysql_auto_increment => return error.UnsupportedStatement,
                     .default => if (!like.defaults) {
                         copy.default_kind = .none;
                         copy.expression = .{};
@@ -8437,6 +8774,8 @@ pub fn Binder(comptime config: types.Config) type {
         fn bindMerge(context: *const Context, merge: *const Ast.Merge) Error!Bound {
             const index = try writableTable(context, try resolveQualified(context, merge.table.schema, merge.table.name), false);
             const entry = &context.tables[index];
+            if (entry.primary_column) |key| if (entry.columns[key].default_kind == .mysql_auto_increment)
+                return error.UnsupportedStatement;
             var scope = tableScope(context, index);
             if (merge.table.alias) |alias| scope.rels[0].name = toName(context, alias);
             var out: Merge = .{ .table = index, .source = none, .on = none };
@@ -8671,6 +9010,8 @@ pub fn Binder(comptime config: types.Config) type {
         pub fn bindCopy(context: *const Context, copy: *const Ast.Copy, with_defaults: bool) Error!Copy {
             const index = try writableTable(context, try resolveQualified(context, copy.table.schema, copy.table.name), false);
             const entry = &context.tables[index];
+            if (entry.primary_column) |key| if (copy.direction == .from and entry.columns[key].default_kind == .mysql_auto_increment)
+                return error.UnsupportedStatement;
             var out: Copy = .{ .table = index };
             if (copy.explicit_columns) {
                 var mapped: [config.columns]bool = @splat(false);

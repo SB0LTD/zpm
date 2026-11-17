@@ -3,6 +3,7 @@
 //! Configure SCRAM before startup for credential authentication. Trust mode is
 //! intended only for a caller that explicitly binds to a trusted interface.
 //! SQL semantics are those provided by DB; unsupported features return SQLSTATE.
+const std = @import("std");
 const scram = @import("scram");
 const sql = @import("sql");
 const pg_types = @import("pg_types.sig");
@@ -148,6 +149,62 @@ const Reader = struct {
         if (self.at != self.bytes.len) return error.ProtocolViolation;
     }
 };
+pub const StartupMethod = enum { trusted, scram };
+pub const routed_startup_capacity = 10000;
+
+/// A routed adapter handles this synchronously after verification. Its
+/// slices are borrowed for the call. Commit the route and startup options
+/// together, or release any provisional Store lease before returning error.
+pub const StartupAdmission = struct {
+    method: StartupMethod,
+    user: []const u8,
+    database: []const u8,
+    payload: []const u8,
+
+    pub fn parameters(self: StartupAdmission) StartupParameters {
+        return .{ .reader = .{ .bytes = self.payload } };
+    }
+};
+
+pub const StartupParameters = struct {
+    pub const Parameter = struct { key: []const u8, value: []const u8 };
+    reader: Reader,
+    ended: bool = false,
+
+    pub fn next(self: *StartupParameters) !?Parameter {
+        if (self.ended) return null;
+        const key = try self.reader.string();
+        if (key.len == 0) {
+            try self.reader.done();
+            self.ended = true;
+            return null;
+        }
+        return .{ .key = key, .value = try self.reader.string() };
+    }
+};
+
+fn inspectRoutedStartup(payload: []const u8, method: StartupMethod) !StartupAdmission {
+    var params: StartupParameters = .{ .reader = .{ .bytes = payload } };
+    var user: ?[]const u8 = null;
+    var database: ?[]const u8 = null;
+    while (try params.next()) |param| {
+        if (equal(param.key, "user")) {
+            if (user != null) return error.ProtocolViolation;
+            user = param.value;
+        } else if (equal(param.key, "database")) {
+            if (database != null) return error.ProtocolViolation;
+            database = param.value;
+        } else if (equal(param.key, "client_encoding") and !equal(param.value, "UTF8") and !equal(param.value, "UTF-8")) {
+            return error.UnsupportedEncoding;
+        }
+    }
+    const requested_user = user orelse return error.UserRequired;
+    if (requested_user.len == 0) return error.UserRequired;
+    const requested_db = if (database != null and database.?.len != 0) database.? else requested_user;
+    if (!std.unicode.utf8ValidateSlice(requested_user) or !std.unicode.utf8ValidateSlice(requested_db)) return error.CharacterNotInRepertoire;
+    return .{ .method = method, .user = requested_user, .database = requested_db, .payload = payload };
+}
+
 const Writer = struct {
     bytes: []u8,
     at: usize = 0,
@@ -199,8 +256,20 @@ const Writer = struct {
 };
 
 pub fn Session(comptime DB: type) type {
+    return SessionWithAdmission(DB, false);
+}
+
+/// Hosts using an existing adapter may supply an optional startup callback
+/// and caller-owned scratch. The configured scratch is required until the
+/// connection has finished startup.
+pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool) type {
     const T = pg_types.Types(DB.Result);
     const has_copy = @hasDecl(DB, "copyBegin");
+    const detects_admission = @hasDecl(DB, "admitPostgresStartup");
+    const has_admission = detects_admission or external_admission;
+    const has_primary_key = @hasDecl(DB, "executeDetachedPrimaryKey") and
+        (if (@hasDecl(DB, "detached_primary_key")) DB.detached_primary_key else true);
+    const primary_key_sql_capacity = 256;
     const CopyInfo = if (has_copy) DB.CopyInfo else struct {};
     const line_bytes: usize = if (has_copy) DB.copy_line_bytes else 1;
     const field_capacity: usize = if (has_copy) (CopyInfo{}).types.len else 1;
@@ -259,7 +328,21 @@ pub fn Session(comptime DB: type) type {
                 return self.sql[0..self.len];
             }
         };
+        pub const DetachedPrimaryKey = struct { source: []const u8, oid: u32, key: ?i64 };
+        const PrimaryKeyInput = struct {
+            // One small additional buffer per portal. Larger templates keep
+            // the existing rendered-SQL execution path.
+            sql: [primary_key_sql_capacity]u8 = undefined,
+            len: usize,
+            oid: u32,
+            key: ?i64,
+
+            fn proposal(self: *const PrimaryKeyInput) DetachedPrimaryKey {
+                return .{ .source = self.sql[0..self.len], .oid = self.oid, .key = self.key };
+            }
+        };
         const Portal = struct {
+            primary_key: if (has_primary_key) ?PrimaryKeyInput else void = if (has_primary_key) null else {},
             live: bool = false,
             name: Name = .{},
             sql: [sql_capacity]u8 = @splat(0),
@@ -281,6 +364,42 @@ pub fn Session(comptime DB: type) type {
                 return if (self.format_count == 0) 0 else self.formats[if (self.format_count == 1) 0 else c];
             }
         };
+        const AdmissionState = struct {
+            payload: if (detects_admission) [routed_startup_capacity]u8 else void = undefined,
+            external: if (external_admission) ?AdmissionHook else void = if (external_admission) null else {},
+            len: usize = 0,
+            rejected: bool = false,
+        };
+
+        pub const AdmissionHook = struct {
+            context: *anyopaque,
+            scratch: []u8,
+            admit: *const fn (*anyopaque, *DB, StartupAdmission) anyerror!void,
+            /// Optional cluster utility dispatch for one simple-query frame.
+            /// The returned slice is a static PostgreSQL command tag.
+            utility: ?*const fn (*anyopaque, *DB, []const u8) anyerror!?[]const u8 = null,
+        };
+
+        pub fn configureStartupAdmission(self: *Self, hook: AdmissionHook) !void {
+            if (comptime !external_admission) return error.UnsupportedStatement else {
+                if (self.startup or self.admission.rejected or self.admission.external != null) return error.ProtocolViolation;
+                if (hook.scratch.len < routed_startup_capacity) return error.BufferTooSmall;
+                self.admission.external = hook;
+            }
+        }
+
+        fn routing(self: *const Self) bool {
+            if (comptime detects_admission) return true;
+            if (comptime external_admission) return self.admission.external != null;
+            return false;
+        }
+
+        fn startupScratch(self: *Self) []u8 {
+            if (comptime external_admission) if (self.admission.external) |hook| return hook.scratch;
+            if (comptime detects_admission) return &self.admission.payload;
+            return &.{};
+        }
+
         startup: bool = false,
         failed: bool = false,
         oversize_remaining: usize = 0,
@@ -288,6 +407,7 @@ pub fn Session(comptime DB: type) type {
         authentication: ?scram.Server = null,
         role_authentication: bool = false,
         role_credentials: ?*const scram.Credentials = null,
+        admission: if (has_admission) AdmissionState else void = if (has_admission) .{} else {},
         statements: [statement_capacity]Statement = @splat(.{}),
         portals: [portal_capacity]Portal = @splat(.{}),
         result: DB.Result = .{},
@@ -302,6 +422,7 @@ pub fn Session(comptime DB: type) type {
         /// protocol layer intentionally owns no RNG or transport configuration.
         pub fn configureAuthentication(self: *Self, verifier: *const scram.Verifier, server_nonce: []const u8) scram.Error!void {
             if (self.startup or self.authentication != null) return error.AuthenticationState;
+            if (comptime has_admission) if (self.admission.rejected) return error.AuthenticationState;
             self.authentication = try scram.Server.init(verifier, server_nonce);
         }
 
@@ -309,7 +430,7 @@ pub fn Session(comptime DB: type) type {
         /// resolve to a SQL login role. Callers opt in before startup. The
         /// default SCRAM configuration retains the embedding's session role.
         pub fn configureRoleAuthentication(self: *Self, verifier: *const scram.Verifier, server_nonce: []const u8) scram.Error!void {
-            if (comptime !@hasDecl(DB, "bindAuthenticatedRole")) return error.AuthenticationFailed;
+            if (comptime !has_admission and !@hasDecl(DB, "bindAuthenticatedRole")) return error.AuthenticationFailed;
             try self.configureAuthentication(verifier, server_nonce);
             self.role_authentication = true;
         }
@@ -351,10 +472,36 @@ pub fn Session(comptime DB: type) type {
         /// an independent read-only context and reject unsupported plans first.
         /// Session ownership, database immutability, private Describe support,
         /// idle autocommit state and output capacity remain caller obligations.
+        fn detachedReady(self: *const Self) bool {
+            return self.startup and !self.failed and self.copy.mode==.none and self.active_portal==null and
+                self.oversize_remaining==0 and (self.authentication==null or self.authentication.?.state==.complete);
+        }
         pub fn detachedCandidate(self:*Self,input:[]const u8) ?DetachedCandidate {
-            if(!self.startup or self.failed or self.copy.mode!=.none or self.active_portal!=null or self.oversize_remaining!=0 or
-                (self.authentication!=null and self.authentication.?.state!=.complete)) return null;
+            if(!self.detachedReady()) return null;
             return self.detachedFrame(input) catch null;
+        }
+
+        /// Additional scheduling hint for unlimited Execute. Portal storage
+        /// owns the template through the complete handler call. It does not
+        /// authorize execution or replace the rendered-SQL fallback.
+        pub fn detachedPrimaryKey(self: *Self, input: []const u8) ?DetachedPrimaryKey {
+            if (comptime !has_primary_key) return null;
+            if (!self.detachedReady() or input.len < 5 or input[0] != 'E') return null;
+            const size = read32(input[1..5]);
+            if (size < 4 or size > max_packet or @as(usize,size)+1 > input.len) return null;
+            var r: Reader = .{.bytes=input[5..@as(usize,size)+1]};
+            const frame = self.executeFrame(&r) catch return null;
+            if (frame.limit != 0 or frame.portal.complete) return null;
+            if (frame.portal.primary_key) |*key| return key.proposal();
+            return null;
+        }
+
+        fn executeFrame(self: *Self, r: *Reader) !struct { portal: *Portal, limit: u32 } {
+            const name = try r.string();
+            const limit = try r.u32be();
+            try r.done();
+            if (limit > 0x7fffffff) return error.ProtocolViolation;
+            return .{ .portal = try self.portal(name), .limit = limit };
         }
         fn detachedFrame(self:*Self,input:[]const u8) !?DetachedCandidate {
             if(input.len<5) return null;
@@ -382,9 +529,9 @@ pub fn Session(comptime DB: type) type {
                     return null;
                 },
                 'E'=>{
-                    const name=try r.string();const limit=try r.u32be();try r.done();
-                    if(limit!=0) return null; // suspended portals retain their owner
-                    const portal_value=try self.portal(name);
+                    const frame=try self.executeFrame(&r);
+                    if(frame.limit!=0) return null; // suspended portals retain their owner
+                    const portal_value=frame.portal;
                     if(portal_value.complete) return .metadata;
                     return .{.execute=portal_value.source()};
                 },
@@ -406,6 +553,7 @@ pub fn Session(comptime DB: type) type {
         pub fn handle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
             if (output.len < try self.requiredCapacity()) return error.BufferTooSmall;
             if (self.oversize_remaining != 0) return self.discardOversize(db, input, output, 0);
+            if (comptime has_admission) if (self.admission.rejected) return .{ .close = true };
             if (self.authentication) |*auth| if (auth.state == .failed) return .{ .close = true };
             if (has_copy and self.copy.mode != .none) return self.copyHandle(db, input, output);
             if (!self.startup) return self.handleStartup(db, input, output);
@@ -430,11 +578,11 @@ pub fn Session(comptime DB: type) type {
             if (input.len < total) return .{};
             var close = false;
             if (self.authentication != null and self.authentication.?.state != .complete) {
-                self.authenticate(db, input[0], input[5..total], &w) catch {
+                close = self.authenticate(db, input[0], input[5..total], &w) catch blk: {
                     self.authentication.?.state = .failed;
                     w.at = 0;
                     try authenticationFailure(&w);
-                    close = true;
+                    break :blk true;
                 };
             } else {
                 const tag = input[0];
@@ -473,11 +621,11 @@ pub fn Session(comptime DB: type) type {
                 },
                 .cancel => |key| return .{ .consumed = 16, .close = true, .cancel = key },
                 .startup => |parameters| {
-                    var close = false;
-                    self.handshake(db, parameters, &writer) catch |err| {
+                    const close = self.handshake(db, parameters, &writer) catch |err| blk: {
+                        if (has_admission and self.routing()) self.admission.rejected = true;
                         writer.at = 0;
                         try failure(&writer, sqlstate(err), @errorName(err));
-                        close = true;
+                        break :blk true;
                     };
                     return .{ .consumed = 8 + parameters.len, .written = writer.at, .close = close };
                 },
@@ -489,7 +637,21 @@ pub fn Session(comptime DB: type) type {
             self.backend_secret = secret;
         }
 
-        fn handshake(self: *Self, db: *DB, payload: []const u8, w: *Writer) !void {
+        fn handshake(self: *Self, db: *DB, payload: []const u8, w: *Writer) !bool {
+            if (has_admission and self.routing()) {
+                const startup_request = try inspectRoutedStartup(payload, if (self.authentication == null) .trusted else .scram);
+                if (payload.len > routed_startup_capacity) return error.ProtocolViolation;
+                if (self.authentication != null) {
+                    @memcpy(self.startupScratch()[0..payload.len], payload);
+                    self.admission.len = payload.len;
+                    try self.offerScram(startup_request.user, w);
+                    return false;
+                }
+                if (!try self.admitStartup(db, startup_request, w)) return true;
+                try self.authenticationComplete(db, w);
+                return false;
+            }
+
             var r: Reader = .{ .bytes = payload };
             var user: ?[]const u8 = null;
             while (true) {
@@ -505,22 +667,50 @@ pub fn Session(comptime DB: type) type {
             }
             try r.done();
             if (user == null or user.?.len == 0) return error.UserRequired;
-            if (self.authentication) |*auth| {
-                if (self.role_credentials) |credentials| {
-                    try auth.selectCredentials(credentials, user.?);
-                    self.role_credentials = null;
-                } else auth.setUsername(user.?);
-                const p = try w.begin('R');
-                try w.u32be(10);
-                try w.string(scram.mechanism);
-                try w.byte(0);
-                w.end(p);
-                self.startup = true;
-                return;
-            }
-            try self.authenticationComplete(db, w);
+            if (self.authentication != null) {
+                try self.offerScram(user.?, w);
+            } else try self.authenticationComplete(db, w);
+            return false;
         }
-        fn authenticate(self: *Self, db: *DB, tag: u8, payload: []const u8, w: *Writer) !void {
+
+        fn offerScram(self: *Self, user: []const u8, w: *Writer) !void {
+            const auth = &self.authentication.?;
+            if (self.role_credentials) |credentials| {
+                try auth.selectCredentials(credentials, user);
+                self.role_credentials = null;
+            } else auth.setUsername(user);
+            const p = try w.begin('R');
+            try w.u32be(10);
+            try w.string(scram.mechanism);
+            try w.byte(0);
+            w.end(p);
+            self.startup = true;
+        }
+
+        fn admitStartup(self: *Self, db: *DB, startup_request: StartupAdmission, w: *Writer) !bool {
+            self.invokeAdmission(db, startup_request) catch |err| {
+                self.admission.rejected = true;
+                if (self.authentication) |*auth| auth.state = .failed;
+                try fatal(w, sqlstate(err), @errorName(err));
+                return false;
+            };
+            return true;
+        }
+
+        fn invokeAdmission(self: *Self, db: *DB, request: StartupAdmission) !void {
+            if (comptime external_admission) if (self.admission.external) |hook| return hook.admit(hook.context, db, request);
+            if (comptime detects_admission) return db.admitPostgresStartup(request);
+            return error.AdmissionDenied;
+        }
+
+        fn clusterCommand(self: *Self, db: *DB, source: []const u8) !?[]const u8 {
+            if (comptime external_admission) {
+                if (self.admission.external) |hook| if (hook.utility) |utility| return utility(hook.context, db, source);
+            }
+            return null;
+        }
+
+        fn authenticate(self: *Self, db: *DB, tag: u8, payload: []const u8, w: *Writer) !bool {
             if (tag != 'p' or payload.len > scram.max_message + 64) return error.AuthenticationFailed;
             const auth = &self.authentication.?;
             var message: [512]u8 = undefined;
@@ -538,7 +728,11 @@ pub fn Session(comptime DB: type) type {
                 w.end(p);
             } else if (auth.state == .challenge) {
                 const final = try auth.finish(payload, &message);
-                if (self.role_authentication) {
+                if (has_admission and self.routing()) {
+                    const startup_request = try inspectRoutedStartup(self.startupScratch()[0..self.admission.len], .scram);
+                    self.admission.len = 0;
+                    if (!try self.admitStartup(db, startup_request, w)) return true;
+                } else if (self.role_authentication) {
                     if (comptime @hasDecl(DB, "bindAuthenticatedRole")) {
                         try db.bindAuthenticatedRole(auth.verifier.identity());
                     } else return error.AuthenticationFailed;
@@ -549,6 +743,7 @@ pub fn Session(comptime DB: type) type {
                 w.end(p);
                 try self.authenticationComplete(db, w);
             } else return error.AuthenticationFailed;
+            return false;
         }
         fn authenticationComplete(self: *Self, db: *DB, w: *Writer) !void {
             const auth = try w.begin('R');
@@ -637,6 +832,10 @@ pub fn Session(comptime DB: type) type {
                         try self.startCopy(db, source, w);
                         // COPY FROM: ReadyForQuery follows CopyDone/CopyFail.
                         if (self.copy.mode == .in) return false;
+                    } else if (try self.clusterCommand(db, source)) |command_tag| {
+                        const completion = try w.begin('C');
+                        try w.string(command_tag);
+                        w.end(completion);
                     } else {
                         try self.execute(db, source);
                         if (self.result.column_count != 0) {
@@ -684,11 +883,9 @@ pub fn Session(comptime DB: type) type {
                     } else return error.ProtocolViolation;
                 },
                 'E' => {
-                    const name = try r.string();
-                    const limit = try r.u32be();
-                    try r.done();
-                    if (limit > 0x7fffffff) return error.ProtocolViolation;
-                    const p = try self.portal(name);
+                    const frame = try self.executeFrame(&r);
+                    const limit = frame.limit;
+                    const p = frame.portal;
 
                     const index = (@intFromPtr(p) - @intFromPtr(&self.portals[0])) / @sizeOf(Portal);
                     if (self.active_portal) |active| {
@@ -699,7 +896,7 @@ pub fn Session(comptime DB: type) type {
                         return false;
                     }
                     if (self.active_portal == null) {
-                        try self.execute(db, p.source());
+                        try self.executePortal(db, p, limit);
                         self.active_portal = index;
                         p.row = 0;
                         p.result_rows = self.result.row_count;
@@ -753,6 +950,18 @@ pub fn Session(comptime DB: type) type {
             }
             return false;
         }
+        fn executePortal(self: *Self, db: *DB, portal_value: *const Portal, limit: u32) !void {
+            if (comptime has_primary_key) if (limit == 0) {
+                if (portal_value.primary_key) |*key| {
+                    if (try db.executeDetachedPrimaryKey(key.proposal().source, key.oid, key.key, portal_value.source(), &self.result)) {
+                        self.commit_rolled_back = false;
+                        return;
+                    }
+                }
+            };
+            return self.execute(db, portal_value.source());
+        }
+
         fn execute(self: *Self, db: *DB, source: []const u8) !void {
             self.result.column_count = 0;
             self.result.row_count = 0;
@@ -906,7 +1115,8 @@ pub fn Session(comptime DB: type) type {
                             try sink.append(options.null_string);
                             continue;
                         }
-                        const length = T.sendText(cell, session, &text) catch return error.BufferTooSmall;
+                        const nominal = try self.nominalText(field, cell, &text);
+                        const length = nominal orelse (T.sendText(cell, session, &text) catch return error.BufferTooSmall);
                         if (options.format == .csv) {
                             const forced = if (comptime @hasDecl(CopyInfo, "forceQuoteColumn")) info.forceQuoteColumn(field) else false;
                             try pg_copy.appendCsvField(&options, text[0..length], count == 1, forced, &sink);
@@ -1399,6 +1609,8 @@ pub fn Session(comptime DB: type) type {
             var literals: [sql_capacity]u8 = undefined;
             var values: [parameter_capacity][]const u8 = undefined;
             var l: Writer = .{ .bytes = &literals };
+            var key: ?i64 = null;
+            var key_candidate = has_primary_key and count == 1 and integralParameter(s.oids[0]) and s.len <= primary_key_sql_capacity;
             for (0..count) |i| {
                 const begin = l.at;
                 const size = try r.u32be();
@@ -1408,6 +1620,9 @@ pub fn Session(comptime DB: type) type {
                     if (T.handles(s.oids[i])) {
                         l.at += T.literal(bytes, s.oids[i], fmt, l.bytes[l.at..]) catch |err| return if (err == error.BufferTooSmall) error.StatementCapacity else err;
                     } else try literal(&l, bytes, s.oids[i], fmt);
+                    if (key_candidate) {
+                        if (primaryKeyNumber(bytes, s.oids[i], fmt)) |number| key = number else key_candidate = false;
+                    }
                 }
                 values[i] = l.bytes[begin..l.at];
             }
@@ -1444,6 +1659,10 @@ pub fn Session(comptime DB: type) type {
             p.name=next.name;p.len=next.len;p.format_count=next.format_count;p.level=next.level;
             @memcpy(p.sql[0..next.len],next.sql[0..next.len]);
             @memcpy(p.formats[0..next.format_count],next.formats[0..next.format_count]);
+            if (comptime has_primary_key) {
+                p.primary_key = if (key_candidate) .{ .len = s.len, .oid = s.oids[0], .key = key } else null;
+                if (p.primary_key) |*bound_key| @memcpy(bound_key.sql[0..s.len], s.source());
+            }
             p.row=0;p.complete=false;p.result_rows=0;p.affected=0;p.rolled_back=false;p.command="";p.live=true;
             try w.empty('2');
         }
@@ -1459,8 +1678,9 @@ pub fn Session(comptime DB: type) type {
                 try w.u32be(0);
                 try w.u16be(0);
                 const data_type = self.result.column_types[i];
-                try w.u32be(T.oid(data_type));
-                try w.u16be(@bitCast(T.length(data_type)));
+                const nominal = if (@hasDecl(DB.Result, "nominalColumnType")) self.result.nominalColumnType(i) else null;
+                try w.u32be(if (nominal) |identity| identity.oid else T.oid(data_type));
+                try w.u16be(@bitCast(if (nominal) |identity| identity.len else T.length(data_type)));
                 const typmod: i32 = if (@hasField(DB.Result, "column_typmods")) self.result.column_typmods[i] else -1;
                 try w.u32be(@bitCast(typmod));
                 if (portal_value) |v| {
@@ -1470,6 +1690,13 @@ pub fn Session(comptime DB: type) type {
             }
             w.end(p);
         }
+
+        fn nominalText(self: *const Self, column_index: usize, cell: anytype, out: []u8) !?usize {
+            if (comptime @hasDecl(DB.Result, "formatNominalText"))
+                return self.result.formatNominalText(column_index, cell, out) catch error.BufferTooSmall;
+            return null;
+        }
+
         fn rows(self: *Self, db: *DB, w: *Writer, portal_value: ?*const Portal, first: usize, end: usize) !void {
             const session = valueSession(db);
             for (first..end) |row| {
@@ -1492,7 +1719,11 @@ pub fn Session(comptime DB: type) type {
                         } else try w.number(n),
                         .boolean => |b| try w.byte(if (binary) @intFromBool(b) else if (b) 't' else 'f'),
                         .text => |t| try w.append(t.slice()),
-                        else => w.at += (if (binary) T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) else T.sendText(&cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall,
+                        else => {
+                            const nominal = if (binary) null else try self.nominalText(i, &cell, w.bytes[w.at..]);
+                            const size = nominal orelse ((if (binary) T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) else T.sendText(&cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall);
+                            w.at += size;
+                        },
                     }
                     write32(w.bytes[length..][0..4], @intCast(w.at - start));
                 }
@@ -1531,23 +1762,36 @@ pub fn Session(comptime DB: type) type {
                 .create_publication => "CREATE PUBLICATION",
                 .drop_publication => "DROP PUBLICATION",
                 .create_extension => "CREATE EXTENSION",
+                .create_domain => "CREATE DOMAIN",
+                .drop_domain => "DROP DOMAIN",
+                .create_type => "CREATE TYPE",
+                .drop_type => "DROP TYPE",
                 else => null,
             };
         }
         /// The engine's own command tag for the last statement, when it has one.
         fn completed(self: *const Self) []const u8 {
             if (!@hasField(DB.Result, "command")) return "";
+            const create_query_data = if (comptime @hasField(DB.Result, "create_query_data")) self.result.create_query_data else false;
             return switch (self.result.command) {
                 .select => "select",
                 .insert => "insert",
                 .update => "update",
                 .delete => "delete",
+                .merge => "merge",
                 .explain => "EXPLAIN",
                 .create_table => "create",
+                .create_table_as => if (create_query_data) "select_created" else "CREATE TABLE AS",
+                .create_materialized_view => if (create_query_data) "select_created" else "CREATE MATERIALIZED VIEW",
+                .refresh_materialized_view => "REFRESH MATERIALIZED VIEW",
+                .create_index => "CREATE INDEX",
+                .create_view => "CREATE VIEW",
                 .drop_table => "drop",
                 .create_sequence => "create_sequence",
                 .drop_sequence => "drop_sequence",
                 .truncate => "truncate",
+                .vacuum => "VACUUM",
+                .analyze => "ANALYZE",
                 .alter_table => "alter_table",
                 .alter_sequence => "alter_sequence",
                 .create_schema => "create_schema",
@@ -1558,6 +1802,7 @@ pub fn Session(comptime DB: type) type {
                 .savepoint => "savepoint",
                 .release => "release",
                 .set => "set",
+                .set_constraints => "SET CONSTRAINTS",
                 .show => "show",
                 .reset => "reset",
                 .lock_table => "lock_table",
@@ -1566,6 +1811,9 @@ pub fn Session(comptime DB: type) type {
                 .move => "move",
                 .close_cursor => "close_cursor",
                 .prepare => "prepare",
+                .prepare_transaction => "PREPARE TRANSACTION",
+                .commit_prepared => "COMMIT PREPARED",
+                .rollback_prepared => "ROLLBACK PREPARED",
                 .deallocate => "deallocate",
                 .listen => "listen",
                 .notify => "notify",
@@ -1626,6 +1874,9 @@ pub fn Session(comptime DB: type) type {
                 try w.append("CREATE SCHEMA");
             } else if (equal(completed_command, "drop_schema")) {
                 try w.append("DROP SCHEMA");
+            } else if (equal(completed_command, "select_created")) {
+                try w.append("SELECT ");
+                try w.number(@intCast(affected));
             } else if (isCommand(completed_command, source, "select")) {
                 try w.append("SELECT ");
                 try w.number(@intCast(row_count));
@@ -1637,6 +1888,9 @@ pub fn Session(comptime DB: type) type {
                 try w.number(@intCast(affected));
             } else if (isCommand(completed_command, source, "delete")) {
                 try w.append("DELETE ");
+                try w.number(@intCast(affected));
+            } else if (equal(completed_command, "merge")) {
+                try w.append("MERGE ");
                 try w.number(@intCast(affected));
             } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (equal(completed_command, "savepoint")) try w.append("SAVEPOINT") else if (equal(completed_command, "release")) try w.append("RELEASE") else if (equal(completed_command, "show")) try w.append("SHOW") else if (equal(completed_command, "reset")) try w.append("RESET") else if (equal(completed_command, "set")) try w.append("SET") else if (equal(completed_command, "begin")) try w.append("BEGIN") else if (equal(completed_command, "commit")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (equal(completed_command, "rollback")) try w.append("ROLLBACK") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
             try w.byte(0);
@@ -1705,6 +1959,12 @@ fn sqlstate(err: anyerror) []const u8 {
 /// null means the error would fall back to 54000 (program_limit_exceeded).
 pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     const name = @errorName(err);
+    if (equal(name, "DatabaseNotFound")) return "3D000";
+    if (equal(name, "DuplicateDatabase")) return "42P04";
+    if (equal(name, "InvalidDatabaseName")) return "42602";
+    if (equal(name, "DatabaseBusy")) return "55006";
+    if (equal(name, "AdmissionDenied")) return "42501";
+    if (equal(name, "LeaseCapacity")) return "53300";
     if (equal(name, "UndefinedFunction")) return "42883";
     if (equal(name, "AmbiguousFunction")) return "42725";
     if (equal(name, "CannotCoerce")) return "42846";
@@ -1737,6 +1997,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "WrongObjectType")) return "42809";
     if (equal(name, "DependentObjects")) return "2BP01";
     if (equal(name, "UndefinedObject")) return "42704";
+    if (equal(name, "InvalidName")) return "42602";
     if (equal(name, "BadCopyFormat")) return "22P04";
     if (equal(name, "InvalidBinaryRepresentation")) return "22P03";
     if (equal(name, "StringDataRightTruncation")) return "22001";
@@ -1944,17 +2205,35 @@ fn quoted(w: *Writer, bytes: []const u8) !void {
     }
     try w.byte('\'');
 }
+fn integralParameter(oid: u32) bool {
+    return oid == 20 or oid == 21 or oid == 23;
+}
+
+fn binaryInteger(bytes: []const u8, oid: u32) !i64 {
+    const count: usize = if (oid == 20) 8 else if (oid == 21) 2 else 4;
+    if (bytes.len != count) return error.ProtocolViolation;
+    var bits: u64 = if (bytes[0] & 128 != 0) 0xffffffffffffffff else 0;
+    for (bytes) |b| bits = (bits << 8) | b;
+    return @bitCast(bits);
+}
+
+fn primaryKeyNumber(bytes: []const u8, oid: u32, format: u16) ?i64 {
+    if (format == 1) return binaryInteger(bytes, oid) catch null;
+    // The ordinary literal path already enforces integerText. Only values
+    // that fit their declared SQL type are eligible for the typed route.
+    const value = std.fmt.parseInt(i64, bytes, 10) catch return null;
+    if (oid == 21 and (value < -32768 or value > 32767)) return null;
+    if (oid == 23 and (value < -2147483648 or value > 2147483647)) return null;
+    return value;
+}
+
 fn literal(w: *Writer, bytes: []const u8, oid: u32, format: u16) !void {
     if (format == 1) {
         if (oid == 16) {
             if (bytes.len != 1 or bytes[0] > 1) return error.ProtocolViolation;
             try w.append(if (bytes[0] == 1) "TRUE" else "FALSE");
-        } else if (oid == 20 or oid == 21 or oid == 23) {
-            const count: usize = if (oid == 20) 8 else if (oid == 21) 2 else 4;
-            if (bytes.len != count) return error.ProtocolViolation;
-            var bits: u64 = if (bytes[0] & 128 != 0) 0xffffffffffffffff else 0;
-            for (bytes) |b| bits = (bits << 8) | b;
-            const value: i64 = @bitCast(bits);
+        } else if (integralParameter(oid)) {
+            const value = try binaryInteger(bytes, oid);
             // NET-01: a negative is `(-5)`, so `x-$1` never becomes `x--5`
             // (a comment) and `$1::text` casts the whole value.
             if (value < 0) try w.byte('(');

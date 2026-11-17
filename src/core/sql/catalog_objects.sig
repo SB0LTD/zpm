@@ -18,16 +18,36 @@
 //! table are `relation` / `acl` objects keyed by the table OID, and a DROP
 //! TABLE drops them in the same record.
 //!
+//! Enums support catalog CREATE/DROP, pg_type and pg_enum, and standalone
+//! literal casts with nominal result metadata. A type, its generated array
+//! and all ordered labels have one MVCC lifetime and contiguous OID range.
+//! ALTER TYPE, general enum expressions and enum storage require separate
+//! type-system support. Composite CREATE/DROP publishes a catalog relation
+//! and typed attributes. A standalone flat ROW literal can be cast to a
+//! composite with supported built-in field types.
+//! Field descriptors and enum labels share Config.object_text_bytes with
+//! the generated array name, in their respective object kind. Composite
+//! storage, nested expressions and typed tables require further support.
+//!
 //!   70 object_create kind u8, oid u32, target u32, grantee u32, sub i32,
 //!                    owner u32, flags u32, grant_flags u32, name (len u8 +
 //!                    bytes, may be empty), role_count u8 + role OIDs u32,
 //!                    text_len u16 + bytes, split u16 (<= text_len)
+//!                    domain only: version u8, base u8, not_null u8,
+//!                    comparison u8, signed CHECK bound i64
+//!                    enum only: version u8, label_count u16
+//!                    (text is array name then length-prefixed labels)
+//!                    composite only: version u8, field_count u16
+//!                    (text is array name then fields: name len u8 + bytes,
+//!                    built-in type OID u32, typmod i32)
 //!   71 object_drop   kind u8, oid u32, target u32, grantee u32, sub i32
 //!
 //! Kinds and keys: 1 role (oid), 2 member (target role, grantee member),
 //! 3 acl (target table, grantee role or 0 PUBLIC), 4 relation (target
 //! table), 5 policy (oid), 6 comment (grantee classoid, target object, sub
-//! column), 7 fdw (oid), 8 server (oid), 9 publication (oid).
+//! column), 7 fdw (oid), 8 server (oid), 9 publication (oid), 10 domain
+//! (oid, namespace), 11 enum (oid, namespace), 12 composite (oid, namespace).
+//! Types append a versioned payload.
 //!
 //! Roles are SQL-level: the bootstrap superuser (OID 10, `ramsql`) is the
 //! role every wire session runs as (RAMSQL authenticates one SCRAM user and
@@ -58,7 +78,126 @@ pub const class_policy: u32 = 3256;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, _ };
+
+pub fn userType(kind: Kind) bool {
+    return kind == .domain or kind == .enum_type or kind == .composite_type;
+}
+
+pub const enum_label_bytes: usize = 63;
+
+pub const EnumLabels = struct {
+    bytes: []const u8,
+
+    /// Iterates a catalog payload that has already passed validation.
+    pub fn next(self: *EnumLabels) ?[]const u8 {
+        if (self.bytes.len == 0) return null;
+        const len: usize = self.bytes[0];
+        const label = self.bytes[1..][0..len];
+        self.bytes = self.bytes[len + 1 ..];
+        return label;
+    }
+};
+
+pub const EncodedEnumLabels = struct { bytes: usize, count: u16 };
+
+pub const CompositeField = struct { name: []const u8, oid: u32, typmod: i32 };
+
+const composite_field_header = 1 + @sizeOf(u32) + @sizeOf(i32);
+
+fn fieldWord(raw: []const u8) u32 {
+    var value: u32 = 0;
+    for (raw[0..4], 0..) |byte, index| value |= @as(u32, byte) << @intCast(index * 8);
+    return value;
+}
+
+pub const CompositeFields = struct {
+    bytes: []const u8,
+
+    pub fn next(self: *CompositeFields) ?CompositeField {
+        if (self.bytes.len == 0) return null;
+        const name_len: usize = self.bytes[0];
+        const payload = self.bytes[1 + name_len ..];
+        const field: CompositeField = .{
+            .name = self.bytes[1..][0..name_len],
+            .oid = fieldWord(payload),
+            .typmod = @bitCast(fieldWord(payload[4..])),
+        };
+        self.bytes = payload[8..];
+        return field;
+    }
+};
+
+/// Appends one already-bound built-in attribute. WAL validates the same
+/// sequence independently before publishing the enclosing catalog object.
+pub fn appendCompositeField(output: []u8, used: *usize, field: CompositeField) Error!void {
+    const name_len = field.name.len;
+    if (name_len == 0 or name_len > 255) return error.InvalidName;
+    for (field.name) |byte| if (byte == 0) return error.InvalidName;
+    var earlier: CompositeFields = .{ .bytes = output[0..used.*] };
+    while (earlier.next()) |prior| if (types.same(prior.name, field.name)) return error.DuplicateColumn;
+    const length = name_len + composite_field_header;
+    if (length > output.len - used.*) return error.TextCapacity;
+    const encoded = output[used.*..][0..length];
+    encoded[0] = @intCast(name_len);
+    @memcpy(encoded[1..][0..name_len], field.name);
+    for ([_]u32{ field.oid, @bitCast(field.typmod) }, 0..) |word, index| {
+        for (0..4) |byte| encoded[1 + name_len + index * 4 + byte] = @truncate(word >> @intCast(byte * 8));
+    }
+    used.* += length;
+}
+
+/// Freeze exact decoded label bytes into one caller-owned catalog payload.
+pub fn encodeEnumLabels(source: []const u8, output: []u8, label_capacity: usize) Error!EncodedEnumLabels {
+    var p: Parser = .{ .tokens = .{ .source = source, .text_limit = source.len }, .source = source, .name_bytes = label_capacity };
+    try p.advance();
+    var encoded: EncodedEnumLabels = .{ .bytes = 0, .count = 0 };
+    if (p.current.kind == .end) return encoded;
+    while (true) {
+        if (encoded.count == 0xffff) return error.ProgramLimitExceeded;
+        const quoted = try p.string();
+        if (quoted.len > enum_label_bytes) return error.InvalidName;
+        if (quoted.len > label_capacity) return error.NameCapacity;
+        if (quoted.len + 1 > output.len - encoded.bytes) return error.TextCapacity;
+        const label = output[encoded.bytes + 1 ..][0..quoted.len];
+        lexer.decodeQuoted(source, quoted, label);
+        for (label) |byte| if (byte == 0) return error.InvalidName;
+        var earlier: EnumLabels = .{ .bytes = output[0..encoded.bytes] };
+        while (earlier.next()) |prior| if (types.same(prior, label)) return error.PrimaryKeyViolation;
+        output[encoded.bytes] = @intCast(label.len);
+        encoded.bytes += label.len + 1;
+        encoded.count += 1;
+        if (!try p.takeSymbol(.comma)) break;
+    }
+    if (p.current.kind != .end) return error.Syntax;
+    return encoded;
+}
+
+pub const DomainComparison = enum(u8) {
+    none = 0, eq = 1, ne = 2, lt = 3, le = 4, gt = 5, ge = 6,
+
+    fn reverse(self: DomainComparison) DomainComparison {
+        return switch (self) { .lt => .gt, .le => .ge, .gt => .lt, .ge => .le, else => self };
+    }
+
+    pub fn accepts(self: DomainComparison, value: i64, bound: i64) bool {
+        return switch (self) {
+            .none => true, .eq => value == bound, .ne => value != bound,
+            .lt => value < bound, .le => value <= bound, .gt => value > bound, .ge => value >= bound,
+        };
+    }
+};
+
+pub const Domain = struct {
+    base: types.Type = .unknown,
+    not_null: bool = false,
+    comparison: DomainComparison = .none,
+    bound: i64 = 0,
+};
+
+pub fn domainBase(base: types.Type) bool {
+    return base == .int2 or base == .int4 or base == .int8;
+}
 
 /// Role attributes (pg_authid booleans).
 pub const role_superuser: u32 = 1;
@@ -206,6 +345,10 @@ pub const Server = struct {
 };
 
 pub const Publication = struct { name: Ident = .{}, flags: u32 = pub_default };
+pub const CreateDomain = struct { name: Qualified, spec: Domain };
+pub const CreateEnum = struct { name: Qualified, labels: Span };
+pub const CreateComposite = struct { name: Qualified, fields: Span };
+pub const DropTypes = struct { names: [list_capacity]Qualified = @splat(.{}), count: usize = 0, if_exists: bool = false };
 
 pub const Statement = union(enum) {
     create_role: RoleSpec,
@@ -225,6 +368,11 @@ pub const Statement = union(enum) {
     create_publication: Publication,
     drop_publication: Drop,
     create_extension: Named,
+    create_domain: CreateDomain,
+    drop_domain: DropTypes,
+    create_enum: CreateEnum,
+    create_composite: CreateComposite,
+    drop_type: DropTypes,
 };
 
 // ---- parser -------------------------------------------------------------------
@@ -233,9 +381,20 @@ pub const Statement = union(enum) {
 /// statement (nothing is reported then: the main parser takes it).
 /// Recognized but unsupported forms are 0A000; malformed ones 42601.
 pub fn parse(source: []const u8, comptime name_bytes: usize, comptime text_bytes: usize) Error!?Statement {
-    var p: Parser = .{ .tokens = .{ .source = source, .text_limit = text_bytes }, .source = source, .name_bytes = name_bytes };
+    return parseWithDialect(source, name_bytes, text_bytes, .postgres);
+}
+
+pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime text_bytes: usize, dialect: types.Dialect) Error!?Statement {
+    var p: Parser = .{ .tokens = .{ .source = source, .text_limit = text_bytes, .dialect = dialect }, .source = source, .name_bytes = name_bytes };
     try p.advance();
     if (try p.take("create")) {
+        if (try p.take("domain")) return .{ .create_domain = try p.createDomain() };
+        if (try p.take("type")) {
+            // Enum literals are checked against the PostgreSQL label limit
+            // after decoding, independently of expression text capacity.
+            p.tokens.text_limit = source.len;
+            return try p.createType();
+        }
         if (try p.take("role")) return .{ .create_role = try p.roleSpec(.role, true) };
         if (p.word("user")) {
             try p.advance();
@@ -264,12 +423,15 @@ pub fn parse(source: []const u8, comptime name_bytes: usize, comptime text_bytes
         return null;
     }
     if (try p.take("alter")) {
+        if (p.word("domain") or p.word("type")) return error.UnsupportedStatement;
         if (try p.take("role") or try p.take("user") or try p.take("group")) return .{ .alter_role = try p.roleSpec(.role, false) };
         if (try p.take("policy")) return .{ .alter_policy = try p.policy(.alter) };
         if (try p.take("table")) return p.tableSecurity();
         return null;
     }
     if (try p.take("drop")) {
+        if (try p.take("domain")) return .{ .drop_domain = try p.dropTypes() };
+        if (try p.take("type")) return .{ .drop_type = try p.dropTypes() };
         if (try p.take("role") or try p.take("user") or try p.take("group")) return .{ .drop_role = try p.dropList() };
         if (try p.take("policy")) return .{ .drop_policy = try p.policy(.drop) };
         if (try p.take("foreign")) {
@@ -389,6 +551,120 @@ const Parser = struct {
         if (try self.take("cascade")) return true;
         _ = try self.take("restrict");
         return false;
+    }
+
+    fn domainInteger(self: *Parser) Error!i64 {
+        const negative = try self.takeSymbol(.minus);
+        if (!negative) _ = try self.takeSymbol(.plus);
+        if (self.current.kind != .integer) return error.UnsupportedStatement;
+        const magnitude = self.current.integer;
+        const limit: u64 = if (negative) 0x8000000000000000 else 0x7fffffffffffffff;
+        if (magnitude > limit) return error.NumericValueOutOfRange;
+        try self.advance();
+        return if (negative) @bitCast(0 -% magnitude) else @intCast(magnitude);
+    }
+
+    fn domainComparison(self: *Parser) Error!DomainComparison {
+        if (self.current.kind != .symbol) return error.UnsupportedStatement;
+        const op: DomainComparison = switch (self.current.symbol) {
+            .eq => .eq, .ne => .ne, .lt => .lt, .le => .le, .gt => .gt, .ge => .ge,
+            else => return error.UnsupportedStatement,
+        };
+        try self.advance();
+        return op;
+    }
+
+    fn createDomain(self: *Parser) Error!CreateDomain {
+        const name = try self.qualified();
+        _ = try self.take("as");
+        var spec: Domain = .{};
+        if (try self.take("smallint") or try self.take("int2")) {
+            spec.base = .int2;
+        } else if (try self.take("integer") or try self.take("int") or try self.take("int4")) {
+            spec.base = .int4;
+        } else if (try self.take("bigint") or try self.take("int8")) {
+            spec.base = .int8;
+        } else return error.UnsupportedStatement;
+        var null_seen = false;
+        while (!self.atEnd()) {
+            if (!null_seen and (self.word("null") or self.word("not"))) {
+                spec.not_null = try self.take("not");
+                try self.expect("null");
+                null_seen = true;
+            } else if (spec.comparison == .none and try self.take("check")) {
+                try self.expectSymbol(.lparen);
+                const value_first = try self.take("value");
+                if (!value_first) spec.bound = try self.domainInteger();
+                spec.comparison = try self.domainComparison();
+                if (value_first) {
+                    spec.bound = try self.domainInteger();
+                } else {
+                    try self.expect("value");
+                    spec.comparison = spec.comparison.reverse();
+                }
+                if (!try self.takeSymbol(.rparen)) return error.UnsupportedStatement;
+            } else return error.UnsupportedStatement;
+        }
+        try self.finish();
+        return .{ .name = name, .spec = spec };
+    }
+
+    fn createType(self: *Parser) Error!Statement {
+        const name = try self.qualified();
+        if (!try self.take("as")) return error.UnsupportedStatement;
+        if (try self.take("enum")) return .{ .create_enum = .{ .name = name, .labels = try self.enumBody() } };
+        if (!self.symbol(.lparen)) return error.UnsupportedStatement;
+        return .{ .create_composite = .{ .name = name, .fields = try self.compositeBody() } };
+    }
+
+    fn enumBody(self: *Parser) Error!Span {
+        if (!self.symbol(.lparen)) return error.Syntax;
+        const start = self.current.end;
+        try self.advance();
+        if (!self.symbol(.rparen)) {
+            while (true) {
+                _ = try self.string();
+                if (!try self.takeSymbol(.comma)) break;
+            }
+        }
+        const end = self.current.start;
+        try self.expectSymbol(.rparen);
+        try self.finish();
+        return .{ .start = start, .len = end - start };
+    }
+
+    fn compositeBody(self: *Parser) Error!Span {
+        const start = self.current.end;
+        try self.advance();
+        var depth: usize = 1;
+        while (true) {
+            if (self.atEnd()) return error.Syntax;
+            if (self.symbol(.lparen)) depth += 1;
+            if (self.symbol(.rparen)) {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+            try self.advance();
+        }
+        const end = self.current.start;
+        try self.advance();
+        try self.finish();
+        return .{ .start = start, .len = end - start };
+    }
+
+    fn dropTypes(self: *Parser) Error!DropTypes {
+        var drop: DropTypes = .{ .if_exists = try self.ifExists() };
+        while (true) {
+            if (drop.count == list_capacity) return error.ProgramLimitExceeded;
+            drop.names[drop.count] = try self.qualified();
+            drop.count += 1;
+            if (!try self.takeSymbol(.comma)) break;
+        }
+        // Catalog-only types have no stored dependents. Their generated
+        // array and enum labels always follow the owning type.
+        _ = try self.dropBehavior();
+        try self.finish();
+        return drop;
     }
 
     fn dropList(self: *Parser) Error!Drop {
@@ -568,6 +844,7 @@ const Parser = struct {
         var depth: usize = 1;
         while (true) {
             if (self.current.kind == .end) return error.Syntax;
+            if (self.current.dialectQuotedIdentifier(self.source)) return error.UnsupportedStatement;
             if (self.symbol(.lparen)) depth += 1;
             if (self.symbol(.rparen)) {
                 depth -= 1;
@@ -907,6 +1184,7 @@ pub const Cursor = struct {
             1 => u8,
             2 => u16,
             4 => u32,
+            8 => u64,
             else => @compileError("unsupported object field"),
         };
         const raw = try self.take(@sizeOf(T));
@@ -918,12 +1196,16 @@ pub const Cursor = struct {
 
 /// Kinds whose objects own an OID (allocated from the database counter).
 pub fn ownsOid(kind: Kind) bool {
-    return kind == .role or kind == .member or kind == .policy or kind == .fdw or kind == .server or kind == .publication;
+    return kind == .role or kind == .member or kind == .policy or kind == .fdw or kind == .server or kind == .publication or userType(kind);
 }
 
 /// Kinds whose objects carry a unique name.
 fn named(kind: Kind) bool {
-    return kind == .role or kind == .policy or kind == .fdw or kind == .server or kind == .publication;
+    return kind == .role or kind == .policy or kind == .fdw or kind == .server or kind == .publication or userType(kind);
+}
+
+fn scoped(kind: Kind) bool {
+    return kind == .policy or userType(kind);
 }
 
 pub fn Objects(comptime config: types.Config) type {
@@ -959,6 +1241,33 @@ pub fn Objects(comptime config: types.Config) type {
             text: [text_capacity]u8 = @splat(0),
             text_len: u16 = 0,
             split: u16 = 0,
+            /// Domain text is the array name. Enum text splits the array
+            /// name from the packed label sequence.
+            domain: Domain = .{},
+            enum_label_count: u16 = 0,
+            composite_field_count: u16 = 0,
+
+            pub fn oidWidth(self: *const Object) u32 {
+                if (self.kind == .composite_type) return 3;
+                if (userType(self.kind)) return 2 + @as(u32, self.enum_label_count);
+                return @intFromBool(ownsOid(self.kind));
+            }
+
+            pub fn arrayName(self: *const Object) []const u8 {
+                return if (self.kind == .domain) self.textSlice() else self.text[0..self.split];
+            }
+
+            pub fn enumLabels(self: *const Object) EnumLabels {
+                return .{ .bytes = self.text[self.split..self.text_len] };
+            }
+
+            pub fn compositeFields(self: *const Object) CompositeFields {
+                return .{ .bytes = self.text[self.split..self.text_len] };
+            }
+
+            pub fn compositeRelationOid(self: *const Object) u32 {
+                return self.oid + 2;
+            }
 
             pub fn textSlice(self: *const Object) []const u8 {
                 return self.text[0..self.text_len];
@@ -1013,6 +1322,7 @@ pub fn Objects(comptime config: types.Config) type {
             if (a.kind != b.kind) return false;
             return switch (a.kind) {
                 .role, .policy, .fdw, .server, .publication => a.oid == b.oid,
+                .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
                 .member, .acl => a.target == b.target and a.grantee == b.grantee,
                 .relation => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
@@ -1035,8 +1345,31 @@ pub fn Objects(comptime config: types.Config) type {
         pub fn byName(self: *const Self, kind: Kind, target: u32, name: []const u8, snap: storage.Snapshot) ?usize {
             for (&self.items, 0..) |*o, index| {
                 if (o.kind != kind or !visible(o, snap) or !types.same(o.name.slice(), name)) continue;
-                if (kind == .policy and o.target != target) continue;
+                if (scoped(kind) and o.target != target) continue;
                 return index;
+            }
+            return null;
+        }
+
+        pub fn userTypeNameTaken(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) bool {
+            for (&self.items) |*o| if (userType(o.kind) and o.target == namespace and visible(o, snap)) {
+                if (types.same(o.name.slice(), name) or types.same(o.arrayName(), name)) return true;
+            };
+            return false;
+        }
+
+        pub fn pendingUserTypeName(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) ?u16 {
+            for (&self.items) |*o| {
+                const other = pendingOf(o, snap) orelse continue;
+                if (userType(o.kind) and o.target == namespace and (types.same(o.name.slice(), name) or types.same(o.arrayName(), name))) return other;
+            }
+            return null;
+        }
+
+        pub fn pendingCompositeRelationName(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) ?u16 {
+            for (&self.items) |*o| {
+                if (o.kind != .composite_type or o.target != namespace or !types.same(o.name.slice(), name)) continue;
+                if (pendingOf(o, snap)) |other| return other;
             }
             return null;
         }
@@ -1056,7 +1389,7 @@ pub fn Objects(comptime config: types.Config) type {
             for (&self.items) |*o| {
                 const other = pendingOf(o, snap) orelse continue;
                 if (sameKey(o, key)) return other;
-                if (named(key.kind) and o.kind == key.kind and types.same(o.name.slice(), key.name.slice()) and (key.kind != .policy or o.target == key.target)) return other;
+                if (named(key.kind) and o.kind == key.kind and types.same(o.name.slice(), key.name.slice()) and (!scoped(key.kind) or o.target == key.target)) return other;
             }
             return null;
         }
@@ -1331,6 +1664,19 @@ pub fn Objects(comptime config: types.Config) type {
             try writer.int(u16, o.text_len);
             try writer.bytes(o.textSlice());
             try writer.int(u16, o.split);
+            if (o.kind == .domain) {
+                try writer.int(u8, 1);
+                try writer.int(u8, @intFromEnum(o.domain.base));
+                try writer.int(u8, @intFromBool(o.domain.not_null));
+                try writer.int(u8, @intFromEnum(o.domain.comparison));
+                try writer.int(i64, o.domain.bound);
+            } else if (o.kind == .enum_type) {
+                try writer.int(u8, 1);
+                try writer.int(u16, o.enum_label_count);
+            } else if (o.kind == .composite_type) {
+                try writer.int(u8, 1);
+                try writer.int(u16, o.composite_field_count);
+            }
         }
 
         pub fn encodeDrop(writer: anytype, o: *const Object) Error!void {
@@ -1343,7 +1689,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > 9) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > 12) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1363,6 +1709,7 @@ pub fn Objects(comptime config: types.Config) type {
             const ok = switch (o.kind) {
                 .role, .fdw, .publication => o.oid != 0 and o.target == 0 and o.grantee == 0 and o.sub == 0,
                 .policy, .server => o.oid != 0 and o.grantee == 0 and o.sub == 0,
+                .domain, .enum_type, .composite_type => o.oid != 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .acl => o.oid == 0 and o.target != 0 and o.sub == 0,
                 .relation => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
@@ -1418,10 +1765,71 @@ pub fn Objects(comptime config: types.Config) type {
                 .server => has_name and o.target != 0 and o.flags & ~(server_type | server_version) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.owner != 0 and
                     (o.flags & server_type != 0 or o.split == 0) and (o.flags & server_version != 0 or o.split == o.text_len),
                 .publication => has_name and o.flags & ~@as(u32, 63) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
+                .domain => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.split == 0 and
+                    o.text_len != 0 and o.text_len <= config.name_bytes and o.text[0] == '_' and !types.same(o.name.slice(), o.textSlice()),
+                .enum_type, .composite_type => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and
+                    o.split != 0 and o.split <= config.name_bytes and o.text[0] == '_' and !types.same(o.name.slice(), o.arrayName()),
                 _ => false,
             };
             if (!valid) return error.InvalidChangeRecord;
+            if (o.kind == .domain) {
+                for (o.textSlice()) |byte| if (byte == 0) return error.InvalidChangeRecord;
+                if (try cursor.int(u8) != 1) return error.UnsupportedLogVersion;
+                const base: types.Type = @enumFromInt(try cursor.int(u8));
+                const not_null = try cursor.int(u8);
+                const comparison = try cursor.int(u8);
+                const bound = try cursor.int(i64);
+                if (!domainBase(base) or not_null > 1 or comparison > 6 or (comparison == 0 and bound != 0)) return error.InvalidChangeRecord;
+                o.domain = .{ .base = base, .not_null = not_null != 0, .comparison = @enumFromInt(comparison), .bound = bound };
+            } else if (o.kind == .enum_type) {
+                for (o.arrayName()) |byte| if (byte == 0) return error.InvalidChangeRecord;
+                if (try cursor.int(u8) != 1) return error.UnsupportedLogVersion;
+                o.enum_label_count = try cursor.int(u16);
+                try validateEnumLabels(o.text[o.split..o.text_len], o.enum_label_count);
+            } else if (o.kind == .composite_type) {
+                for (o.arrayName()) |byte| if (byte == 0) return error.InvalidChangeRecord;
+                if (try cursor.int(u8) != 1) return error.UnsupportedLogVersion;
+                o.composite_field_count = try cursor.int(u16);
+                try validateCompositeFields(o.text[o.split..o.text_len], o.composite_field_count);
+            }
             return o;
+        }
+
+        fn validateEnumLabels(bytes: []const u8, expected: u16) Error!void {
+            var offset: usize = 0;
+            var count: usize = 0;
+            while (offset < bytes.len) {
+                const length: usize = bytes[offset];
+                if (length > bytes.len - offset - 1 or length > enum_label_bytes or
+                    length > config.name_bytes or length > config.text_bytes) return error.InvalidChangeRecord;
+                const label = bytes[offset + 1 ..][0..length];
+                for (label) |byte| if (byte == 0) return error.InvalidChangeRecord;
+                var earlier: EnumLabels = .{ .bytes = bytes[0..offset] };
+                while (earlier.next()) |prior| if (types.same(prior, label)) return error.InvalidChangeRecord;
+                offset += length + 1;
+                count += 1;
+            }
+            if (count != expected) return error.InvalidChangeRecord;
+        }
+
+        fn validateCompositeFields(bytes: []const u8, expected: u16) Error!void {
+            if (expected > config.columns) return error.ChangeRecordConflict;
+            var fields: CompositeFields = .{ .bytes = bytes };
+            var count: usize = 0;
+            while (fields.bytes.len != 0) {
+                const name_len: usize = fields.bytes[0];
+                if (name_len == 0 or name_len > config.name_bytes or name_len > config.text_bytes or
+                    name_len + composite_field_header > fields.bytes.len) return error.InvalidChangeRecord;
+                const offset = bytes.len - fields.bytes.len;
+                const field = fields.next().?;
+                const data_type = types.typeFromOid(field.oid) orelse return error.InvalidChangeRecord;
+                if (!types.validTypeTypmod(config, data_type, field.typmod)) return error.InvalidChangeRecord;
+                for (field.name) |byte| if (byte == 0) return error.InvalidChangeRecord;
+                var earlier: CompositeFields = .{ .bytes = bytes[0..offset] };
+                while (earlier.next()) |prior| if (types.same(prior.name, field.name)) return error.InvalidChangeRecord;
+                count += 1;
+            }
+            if (count != expected) return error.InvalidChangeRecord;
         }
 
         /// Replay of op 70: the first free entry (validation reserved it).
@@ -1456,13 +1864,22 @@ pub fn Objects(comptime config: types.Config) type {
             roles: [role_capacity]u32 = @splat(0),
             role_count: u8 = 0,
             name: V.Name = .{},
+            array_name: V.Name = .{},
+            oid_width: u32 = 0,
         };
 
         pub const Overlay = struct {
             items: [capacity]VObject = @splat(.{}),
 
             fn project(o: *const Object, live: bool) VObject {
-                return .{ .used = o.used, .live = live, .kind = o.kind, .oid = o.oid, .target = o.target, .grantee = o.grantee, .sub = o.sub, .owner = o.owner, .roles = o.roles, .role_count = o.role_count, .name = o.name };
+                var out: VObject = .{ .used = o.used, .live = live, .kind = o.kind, .oid = o.oid, .target = o.target, .grantee = o.grantee, .sub = o.sub, .owner = o.owner, .roles = o.roles, .role_count = o.role_count, .name = o.name };
+                out.oid_width = o.oidWidth();
+                if (userType(o.kind)) {
+                    const name = o.arrayName();
+                    out.array_name.len = name.len;
+                    @memcpy(out.array_name.bytes[0..name.len], name);
+                }
+                return out;
             }
 
             /// A replayable entry is committed and never marked: apply only
@@ -1481,8 +1898,8 @@ pub fn Objects(comptime config: types.Config) type {
             /// Any entry (also uncommitted or dead) owning an OID in [oid, oid + width).
             pub fn oidTaken(self: *const Overlay, oid: u32, width: u32) bool {
                 for (&self.items) |*v| {
-                    if (!v.used or !ownsOid(v.kind)) continue;
-                    if (v.oid >= oid and v.oid - oid < width) return true;
+                    if (!v.used or v.oid_width == 0) continue;
+                    if (@as(u64, v.oid) < @as(u64, oid) + width and @as(u64, oid) < @as(u64, v.oid) + v.oid_width) return true;
                 }
                 return false;
             }
@@ -1490,6 +1907,18 @@ pub fn Objects(comptime config: types.Config) type {
             pub fn roleExists(self: *const Overlay, oid: u32) bool {
                 if (oid == bootstrap_role) return true;
                 return self.liveOid(.role, oid);
+            }
+
+            pub fn userTypeNameTaken(self: *const Overlay, namespace: u32, name: []const u8) bool {
+                for (&self.items) |*v| if (v.live and userType(v.kind) and v.target == namespace) {
+                    if (types.same(v.name.slice(), name) or types.same(v.array_name.slice(), name)) return true;
+                };
+                return false;
+            }
+
+            pub fn compositeRelationNameTaken(self: *const Overlay, namespace: u32, name: []const u8) bool {
+                for (&self.items) |*v| if (v.live and v.kind == .composite_type and v.target == namespace and types.same(v.name.slice(), name)) return true;
+                return false;
             }
 
             fn liveOid(self: *const Overlay, kind: Kind, oid: u32) bool {
@@ -1502,14 +1931,19 @@ pub fn Objects(comptime config: types.Config) type {
             /// objectOidTaken for the record so far, and notes allocated OIDs
             /// (noteObjectOid).
             pub fn create(self: *Overlay, o: *const Object, ctx: anytype) Error!void {
-                if (ownsOid(o.kind)) {
-                    if (o.oid < first_oid or o.oid == 0xffffffff or ctx.objectOidTaken(o.oid)) return error.ChangeRecordConflict;
+                const width = o.oidWidth();
+                if (width != 0) {
+                    if (o.oid < first_oid or o.oid > 0xffffffff - width or ctx.objectOidTaken(o.oid, width)) return error.ChangeRecordConflict;
                 }
+                if (userType(o.kind) and (self.userTypeNameTaken(o.target, o.name.slice()) or self.userTypeNameTaken(o.target, o.arrayName()) or
+                    ctx.objectRelationNameTaken(o.target, o.name.slice()) or ctx.objectRelationNameTaken(o.target, o.arrayName()))) return error.ChangeRecordConflict;
+                if (o.kind == .composite_type and ctx.objectSequenceNameTaken(o.target, o.name.slice())) return error.ChangeRecordConflict;
                 for (&self.items) |*v| {
                     if (!v.live) continue;
                     const existing = asObject(v);
                     if (sameKey(&existing, o)) return error.ChangeRecordConflict;
-                    if (named(o.kind) and v.kind == o.kind and types.same(v.name.slice(), o.name.slice()) and (o.kind != .policy or v.target == o.target)) return error.ChangeRecordConflict;
+                    if (!userType(o.kind) and named(o.kind) and v.kind == o.kind and (!scoped(o.kind) or v.target == o.target) and
+                        types.same(v.name.slice(), o.name.slice())) return error.ChangeRecordConflict;
                 }
                 if (o.kind == .role and (types.same(o.name.slice(), bootstrap_name) or reservedRoleName(o.name.slice()))) return error.ChangeRecordConflict;
                 try self.references(o.kind, o.target, o.grantee, o.sub, o.owner, o.roles[0..o.role_count], ctx);
@@ -1517,7 +1951,7 @@ pub fn Objects(comptime config: types.Config) type {
                     v.* = project(o, true);
                     // A decoded version is not yet an entry: mark it taken.
                     v.used = true;
-                    if (ownsOid(o.kind)) ctx.noteObjectOid(o.oid);
+                    if (width != 0) ctx.noteObjectOid(o.oid + width - 1);
                     return;
                 };
                 return error.ChangeRecordConflict;
@@ -1565,6 +1999,9 @@ pub fn Objects(comptime config: types.Config) type {
                     },
                     .server => {
                         if (!self.liveOid(.fdw, target)) return error.ChangeRecordConflict;
+                    },
+                    .domain, .enum_type, .composite_type => {
+                        if ((target != 2200 and target < first_oid) or !ctx.objectSchemaLive(target)) return error.ChangeRecordConflict;
                     },
                     .comment => {
                         const exists = switch (grantee) {

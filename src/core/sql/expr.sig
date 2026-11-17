@@ -24,6 +24,7 @@ const geometric = @import("geometric.sig");
 const xml_module = @import("xml.sig");
 const json_eval = @import("json_eval.sig");
 const regex = @import("regex.sig");
+const flat_record = @import("flat_record.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -551,6 +552,41 @@ pub fn Eval(comptime config: types.Config) type {
 
         /// nextval/currval/setval/lastval and identity defaults through the
         /// session's sequence hook (strict: a NULL argument gives NULL).
+        fn mysqlDateAdd(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const base = try eval(ctx, n.b);
+            const amount = try eval(ctx, node(ctx, n.b).next);
+            if (base == .null_value or amount == .null_value) return .null_value;
+            const days = switch (base) {
+                .date => base.date,
+                .text, .bpchar => blk: {
+                    const text = if (base == .text) base.text.slice() else base.bpchar.slice();
+                    if (text.len != 10 or text[4] != '-' or text[7] != '-') return error.UnsupportedStatement;
+                    for (text, 0..) |byte, index| {
+                        if (index != 4 and index != 7 and (byte < '0' or byte > '9')) return error.UnsupportedStatement;
+                    }
+                    if (types.same(text[0..4], "0000")) return error.UnsupportedStatement;
+                    break :blk temporal.parseDate(text) catch return .null_value;
+                },
+                else => unreachable,
+            };
+            const earliest = temporal.dateOf(1, 1, 1);
+            const latest = temporal.dateOf(9999, 12, 31);
+            if (days < earliest or days > latest) return error.UnsupportedStatement;
+            const result = if (n.integer == 0)
+                temporal.datePlusDays(days, amount.integer) catch return .null_value
+            else blk: {
+                if (amount.integer < -120000 or amount.integer > 120000) return .null_value;
+                const stamp = try temporal.dateToTimestamp(days);
+                const shifted = temporal.timestampPlus(stamp, .{ .months = @intCast(amount.integer), .days = 0, .us = 0 }) catch return .null_value;
+                break :blk @as(i32, @intCast(@divFloor(shifted, temporal.usecs_per_day)));
+            };
+            if (result < earliest) return error.UnsupportedStatement;
+            if (result > latest) return .null_value;
+            if (n.ty == .date) return .{ .date = result };
+            var buffer: [10]u8 = undefined;
+            return Io.parse(.bpchar, -1, temporal.formatDate(result, &buffer), ctx.session);
+        }
+
         fn sequenceValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
             switch (n.func) {
@@ -980,7 +1016,8 @@ pub fn Eval(comptime config: types.Config) type {
                     };
                 },
                 .decimal_literal => {
-                    if (n.ty == .float4 or n.ty == .float8) return Io.parse(n.ty, -1, n.name.span.slice(ctx.source), ctx.session);
+                    if (n.ty == .float4 or n.ty == .float8 or n.ty == .mysql_bigint_unsigned)
+                        return Io.parse(n.ty, -1, n.name.span.slice(ctx.source), ctx.session);
                     const number = try Io.parse(.numeric, -1, n.name.span.slice(ctx.source), ctx.session);
                     return if (n.ty == .numeric or n.ty == .unknown) number else Io.cast(number, .numeric, n.ty, -1, ctx.session);
                 },
@@ -1140,6 +1177,18 @@ pub fn Eval(comptime config: types.Config) type {
                     return left;
                 },
                 .cast => {
+                    if (n.flat_record_cast) {
+                        const row = node(ctx, n.a);
+                        if (row.kind == .null_literal) return .null_value;
+                        var record: V.Text = .{};
+                        record.len = try flat_record.begin(&record.bytes, @intCast(n.integer));
+                        var field = row.b;
+                        while (field != none) : (field = node(ctx, field).next) {
+                            const cell = try eval(ctx, field);
+                            try flat_record.append(config, &record.bytes, &record.len, types.dataTypeOf(node(ctx, field).ty), &cell);
+                        }
+                        return .{ .bytea = record };
+                    }
                     if(n.cast_type==.date and n.date_bound) {
                         // The binder already parsed this literal child. Keep
                         // its observable evaluation checkpoint, then borrow
@@ -1147,7 +1196,13 @@ pub fn Eval(comptime config: types.Config) type {
                         try ctx.session.checkpoint();return .{.date=@intCast(n.integer)};
                     }
                     const value = try eval(ctx, n.a);
-                    return cast(value, node(ctx, n.a).ty, n.cast_type, n.typmod, ctx.session);
+                    const converted = try cast(value, node(ctx, n.a).ty, n.cast_type, n.typmod, ctx.session);
+                    if (n.domain_cast) {
+                        if (converted == .null_value) {
+                            if (n.domain_not_null) return error.NotNullViolation;
+                        } else if (!n.domain_comparison.accepts(converted.integer, n.integer)) return error.CheckViolation;
+                    }
+                    return converted;
                 },
                 .at_zone => {
                     const value = try eval(ctx, n.a);
@@ -1156,6 +1211,8 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
                 .function => switch (n.func) {
+                    .mysql_date_add => return mysqlDateAdd(ctx, n),
+                    .mysql_last_insert_id => return .{ .numeric = Io.Numerics.fromInt(@intCast(ctx.session.mysql_last_insert_id)) },
                     .grouping => {
                         var value:i64=0;var item=n.b;
                         while(item!=none):(item=node(ctx,item).next) {
@@ -1287,6 +1344,32 @@ pub fn Eval(comptime config: types.Config) type {
                     .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
                     .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
                     .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .tds_dateadd => {
+                        const number = try eval(ctx, n.b);
+                        const date = try eval(ctx, node(ctx, n.b).next);
+                        if (number == .null_value or date == .null_value) return .null_value;
+                        const amount = number.integer;
+                        if (amount < -2147483648 or amount > 2147483647) return error.IntegerOverflow;
+                        const first = temporal.dateOf(1, 1, 1);
+                        const last = temporal.dateOf(9999, 12, 31);
+                        if (date.date < first or date.date > last) return error.DatetimeFieldOverflow;
+                        const part: ast.DateAddPart = @enumFromInt(n.integer);
+                        const result = switch (part) {
+                            .days, .weeks => try temporal.datePlusDays(date.date, amount * (if (part == .weeks) @as(i64, 7) else 1)),
+                            .months, .quarters, .years => blk: {
+                                const months = amount * switch (part) { .months => @as(i64, 1), .quarters => 3, .years => 12, else => unreachable };
+                                if (months <= -120000 or months >= 120000) return error.DatetimeFieldOverflow;
+                                const timestamp = try temporal.dateToTimestamp(date.date);
+                                break :blk temporal.timestampToDate(try temporal.timestampPlus(timestamp, .{ .months = @intCast(months) }));
+                            },
+                        };
+                        if (result < first or result > last) return error.DatetimeFieldOverflow;
+                        return .{ .date = result };
+                    },
+                    .tds_isnull => {
+                        const value = try eval(ctx, n.b);
+                        return if (value == .null_value) eval(ctx, node(ctx, n.b).next) else value;
+                    },
                     .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
                     .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
                     .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
@@ -1375,7 +1458,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .routine_param => return routineValue(ctx, n),
                     // Exec.collectAggregate / jsonTableRows read their members (B11).
                     .aggregate_input, .json_table, .json_table_passing, .json_table_column => return error.UnsupportedStatement,
-                    .none => unreachable,
+                    .none, .mysql_ifnull => unreachable,
                 },
                 // $n of an EXECUTEd SQL prepared statement (tx-session lane).
                 .param => {

@@ -298,6 +298,25 @@ pub fn main(init:std.process.Init) !void {
     try check(result.rows[0].cells[0].integer==128);
     try context.execute(db,"SELECT COUNT(*) FROM pg_class",snapshot,result);
     try check(result.rows[0].cells[0].integer==4);
+    for ([_][]const u8{
+        "SELECT to_regclass('points')",
+        "SELECT 'points'::regclass",
+        "SELECT 1259::regclass::text",
+        "SELECT pg_get_serial_sequence('points','id')",
+        "SELECT (SELECT to_regclass('points'))",
+        "WITH names AS (SELECT 'points'::regclass AS relation) SELECT relation FROM names",
+        "SELECT current_setting('TimeZone')",
+        "SELECT set_config('application_name','detached',false)",
+        "SELECT pg_backend_pid()",
+        "SELECT pg_try_advisory_lock(91)",
+    }) |statement| {
+        try context.describe(db, statement, snapshot, result);
+        try check(result.row_count == 0 and result.column_count == 1);
+        try rejected(error.InvalidParameterValue, context.run(result));
+        try rejected(error.UnsupportedStatement, context.prepare(db, statement, snapshot));
+    }
+    try context.execute(db, "SELECT 'integer'::regtype::text", snapshot, result);
+    try check(std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "integer"));
     try context.execute(db,"SELECT COUNT(*) FROM points",snapshot,result);
     var connection:Store.Connection=.{.store=&store,.id=7,.read_context=context};
     try connection.execute("SELECT COUNT(*) FROM points",result);

@@ -38,6 +38,7 @@ const Symbol = lexer.Symbol;
 const none = ast.none;
 
 pub const Mode = enum { standard, legacy_alpha };
+pub const Options = struct { mode: Mode = .standard, dialect: types.Dialect = .postgres };
 
 pub fn Parser(comptime config: types.Config) type {
     const Ast = ast.Ast(config);
@@ -53,6 +54,8 @@ pub fn Parser(comptime config: types.Config) type {
         pool: *Ast.Pool,
         source: []const u8,
         mode: Mode = .standard,
+        /// Last consumed dialect-only token in source order.
+        last_native_syntax: ?usize = null,
         recursion: usize = 0,
         /// Inside a data-modifying WITH entry: the statement ends at `)`.
         nested: usize = 0,
@@ -62,8 +65,48 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// Parses exactly one statement. The pool is reset first.
         pub fn parse(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Ast.Statement {
-            var self = try initParser(source, pool, mode);
+            return parseWithOptions(source, pool, .{ .mode = mode });
+        }
+
+        pub fn parseWithOptions(source: []const u8, pool: *Ast.Pool, options: Options) Error!Ast.Statement {
+            var self: Self = undefined;
+            try initParser(source, pool, options, &self);
             return self.statement();
+        }
+
+        const DatabaseName = types.Values(config).Name;
+        pub const DatabaseCommand = union(enum) {
+            create: DatabaseName,
+            drop: struct { name: DatabaseName, if_exists: bool },
+        };
+
+        /// A cluster owner can recognize these utility statements without
+        /// borrowing a database workspace or changing the normal SQL parser.
+        pub fn parseDatabaseCommand(source: []const u8, options: Options) Error!?DatabaseCommand {
+            if (options.mode != .standard or options.dialect != .postgres) return null;
+            var tokens: lexer.Tokenizer = .{ .source = source, .text_limit = config.text_bytes };
+            const first = try tokens.next();
+            const is_create = wordIs(source, first, "create");
+            if (!is_create and !wordIs(source, first, "drop")) return null;
+            if (!wordIs(source, try tokens.next(), "database")) return null;
+
+            var token = try tokens.next();
+            const if_exists = !is_create and wordIs(source, token, "if");
+            if (if_exists) {
+                if (!wordIs(source, try tokens.next(), "exists")) return error.Syntax;
+                token = try tokens.next();
+            }
+            const ident = try identToken(token, .standard);
+            var name: DatabaseName = .{ .len = ident.len };
+            identBytes(source, ident, &name.bytes);
+            var end = try tokens.next();
+            if (end.kind == .symbol and end.symbol == .semicolon) {
+                end = try tokens.next();
+                if (end.kind != .end) return error.Syntax;
+            }
+            if (end.kind == .word) return error.UnsupportedStatement;
+            if (end.kind != .end) return error.Syntax;
+            return if (is_create) .{ .create = name } else .{ .drop = .{ .name = name, .if_exists = if_exists } };
         }
 
         pub const Explain = struct { analyze: bool = false };
@@ -72,9 +115,14 @@ pub fn Parser(comptime config: types.Config) type {
         /// EXPLAIN uses the normal statement parser and original source spans.
         /// Only first-level PostgreSQL statements allow this wrapper.
         pub fn parseTop(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Parsed {
-            var self = try initParser(source, pool, mode);
-            if (mode != .standard or !try self.takeRaw("explain")) return .{ .command = try self.statement() };
-            const options = try self.explainOptions();
+            return parseTopWithOptions(source, pool, .{ .mode = mode });
+        }
+
+        pub fn parseTopWithOptions(source: []const u8, pool: *Ast.Pool, options: Options) Error!Parsed {
+            var self: Self = undefined;
+            try initParser(source, pool, options, &self);
+            if (options.mode != .standard or !try self.takeRaw("explain")) return .{ .command = try self.statement() };
+            const explain = try self.explainOptions();
             if (!self.isWord("SELECT")) return error.UnsupportedStatement;
             const command = try self.statement();
             const root = switch (command) {
@@ -86,15 +134,16 @@ pub fn Parser(comptime config: types.Config) type {
                 selected.distinct or selected.distinct_on_count != 0 or selected.group_count != 0 or
                 selected.grouping_sets != none or selected.rollup or selected.having != none or selected.window_defs != none)
                 return error.UnsupportedStatement;
-            return .{ .command = command, .explain = options };
+            return .{ .command = command, .explain = explain };
         }
 
-        fn initParser(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Self {
+        fn initParser(source: []const u8, pool: *Ast.Pool, options: Options, self: *Self) Error!void {
             pool.reset();
-            if (mode == .legacy_alpha) try alpha.Recognizer(config).check(source);
-            var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes }, .pool = pool, .source = source, .mode = mode };
+            if (options.mode == .legacy_alpha) try alpha.Recognizer(config).check(source);
+            const dialect: types.Dialect = if (options.mode == .legacy_alpha) .postgres else options.dialect;
+            self.* = .{ .tokens = .{ .source = source, .text_limit = config.text_bytes, .dialect = dialect },
+                .pool = pool, .source = source, .mode = options.mode };
             try self.advance();
-            return self;
         }
 
         fn explainOptions(self: *Self) Error!Explain {
@@ -131,6 +180,8 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn advance(self: *Self) Error!void {
+            if (self.current.dialectQuotedIdentifier(self.source))
+                self.last_native_syntax = self.current.start - 1;
             if (self.has_peek) {
                 self.current = self.peeked;
                 self.tokens = self.after_peek;
@@ -201,16 +252,19 @@ pub fn Parser(comptime config: types.Config) type {
             self.recursion -= 1;
         }
 
-        fn identCurrent(self: *const Self) Error!ast.Ident {
-            const token = self.current;
+        fn identToken(token: Token, mode: Mode) Error!ast.Ident {
             if (token.kind == .quoted_word) {
                 if (token.len > config.name_bytes) return error.NameCapacity;
                 return .{ .span = .{ .start = token.start, .len = token.end - token.start }, .quoted = true, .len = token.len };
             }
-            const legacy_quantifier_name = self.mode == .legacy_alpha and (token.keyword == .any or token.keyword == .some);
+            const legacy_quantifier_name = mode == .legacy_alpha and (token.keyword == .any or token.keyword == .some);
             if (token.kind != .word or (lexer.reserved(token.keyword) and !legacy_quantifier_name)) return error.Syntax;
             if (token.len > config.name_bytes) return error.NameCapacity;
             return .{ .span = .{ .start = token.start, .len = token.len }, .len = token.len };
+        }
+
+        fn identCurrent(self: *const Self) Error!ast.Ident {
+            return identToken(self.current, self.mode);
         }
 
         fn identifier(self: *Self) Error!ast.Ident {
@@ -241,7 +295,11 @@ pub fn Parser(comptime config: types.Config) type {
         /// starts at offset `start` of `source` (B11). Parsed into the pool
         /// without resetting it; the statement ends before the entry's `)`.
         pub fn parseNested(source: []const u8, start: usize, pool: *Ast.Pool) Error!Ast.Statement {
-            var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes, .position = start }, .pool = pool, .source = source, .mode = .standard, .nested = 1 };
+            return parseNestedWithDialect(source, start, pool, .postgres);
+        }
+
+        pub fn parseNestedWithDialect(source: []const u8, start: usize, pool: *Ast.Pool, dialect: types.Dialect) Error!Ast.Statement {
+            var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes, .position = start, .dialect = dialect }, .pool = pool, .source = source, .mode = .standard, .nested = 1 };
             try self.advance();
             if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
             if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
@@ -284,8 +342,36 @@ pub fn Parser(comptime config: types.Config) type {
             return .{ .spec = spec, .end = end };
         }
 
+        pub const CompositeFieldAt = struct { name: ast.Ident, spec: TypeSpec, next: ?usize };
+
+        /// One composite attribute in a body already delimited by CREATE
+        /// TYPE. Use the same built-in names, arrays and typmods as columns.
+        pub fn parseCompositeFieldAt(source: []const u8, start: usize, pool: *Ast.Pool) Error!?CompositeFieldAt {
+            var self = Self{ .tokens = .{ .source = source, .position = start, .text_limit = config.text_bytes }, .pool = pool, .source = source, .mode = .standard };
+            try self.advance();
+            if (self.current.kind == .end) return null;
+            const name = try self.identifier();
+            if (!typeWord(self.current)) {
+                if (self.current.kind == .word or self.current.kind == .quoted_word) return error.UnsupportedStatement;
+                return error.Syntax;
+            }
+            const spec = try self.typeName();
+            if (self.current.kind == .end) return .{ .name = name, .spec = spec, .next = null };
+            if (!try self.takeSymbol(.comma)) return error.UnsupportedStatement;
+            if (self.current.kind == .end) return error.Syntax;
+            return .{ .name = name, .spec = spec, .next = self.current.start - self.current.prefix };
+        }
+
         fn statement(self: *Self) Error!Ast.Statement {
-            if (self.mode == .standard) if (try catalog_objects.parse(self.source, config.name_bytes, config.text_bytes)) |object| return .{ .catalog_object = object };
+            if (self.mode == .standard) if (try catalog_objects.parseWithDialect(self.source, config.name_bytes, config.text_bytes, self.tokens.dialect)) |object| return .{ .catalog_object = object };
+            if (self.tokens.dialect == .mysql and try self.takeRaw("replace")) {
+                _ = try self.takeWord("INTO");
+                var replacement = try self.insertTarget();
+                if (replacement.source != .values or replacement.conflict != null or replacement.returning.count != 0 or
+                    replacement.overriding != .none or replacement.alias != null) return error.UnsupportedStatement;
+                replacement.replace = true;
+                return .{ .insert = replacement };
+            }
             if (try self.takeWord("CREATE")) {
                 if (self.mode == .standard) if (try self.schemaObject()) |object| return object;
                 if (self.mode == .standard and try self.takeWord("SEQUENCE")) return .{ .create_sequence = try self.createSequence() };
@@ -399,6 +485,10 @@ pub fn Parser(comptime config: types.Config) type {
                 if (try self.takeWord("ROLLBACK")) return self.legacyControl(.rollback);
                 return error.UnsupportedStatement;
             }
+            if (self.tokens.dialect == .postgres and self.rawWord("prepare") and (try self.peek()).isWord("TRANSACTION")) {
+                try self.advance();
+                return .{ .control = try self.preparedTransaction(.prepare) };
+            }
             if (self.mode == .standard) if (try self.sessionCommand()) |command| return .{ .session = command };
             return .{ .control = try self.controlStatement() };
         }
@@ -466,7 +556,7 @@ pub fn Parser(comptime config: types.Config) type {
                 if (try self.takeSymbol(.lparen)) {
                     const start = self.tokenStart();
                     element.node = try self.expression();
-                    element.expression = self.spanTo(start);
+                    element.expression = try self.storedSpan(start);
                     try self.expectSymbol(.rparen);
                 } else {
                     element.column = try self.identifier();
@@ -497,7 +587,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeWord("WHERE")) {
                 const start = self.tokenStart();
                 out.predicate_node = try self.expression();
-                out.predicate = self.spanTo(start);
+                out.predicate = try self.storedSpan(start);
             }
             try self.finish();
             return out;
@@ -520,7 +610,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.UnsupportedStatement;
             const start = self.tokenStart();
             out.query = try self.query();
-            out.text = self.spanTo(start);
+            out.text = try self.storedSpan(start);
             if (materialized) out.with_data = try self.withData();
             if (!materialized and self.isWord("WITH")) return error.UnsupportedStatement;
             try self.finish();
@@ -710,7 +800,7 @@ pub fn Parser(comptime config: types.Config) type {
                         if (try self.takeWord("DEFAULT")) {
                             const start = self.tokenStart();
                             _ = try self.expression();
-                            try pushAction(&out, .{ .set_default = .{ .column = name, .expression = self.spanTo(start) } });
+                            try pushAction(&out, .{ .set_default = .{ .column = name, .expression = try self.storedSpan(start) } });
                         } else if (try self.takeWord("NOT")) {
                             try self.expectWord("NULL");
                             try pushAction(&out, .{ .set_not_null = name });
@@ -943,7 +1033,7 @@ pub fn Parser(comptime config: types.Config) type {
                     const ident = if (boolean_label) try self.label() else try self.identifier();
                     name.len = ident.len;
                     if (ident.quoted) {
-                        lexer.decodeQuotedWith(self.source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, '"', &name.bytes);
+                        lexer.decodeQuotedIdentifier(self.source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, &name.bytes);
                     } else for (ident.span.slice(self.source), 0..) |byte, i| name.bytes[i] = types.lower(byte);
                 }
                 copy.force_quote_count += 1;
@@ -995,7 +1085,28 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         /// Transaction control and session commands (the store executes them).
+        fn preparedTransaction(self: *Self, action: ast.PreparedTransactionAction) Error!ast.Control {
+            // GIDs have their own protocol bound, independent of column text.
+            const previous_limit = self.tokens.text_limit;
+            self.tokens.text_limit = self.source.len;
+            defer self.tokens.text_limit = previous_limit;
+            try self.advance();
+            if (self.current.kind != .string) return error.Syntax;
+            const gid = self.current.quoted();
+            try self.advance();
+            try self.finish();
+            return .{ .prepared_transaction = .{ .action = action, .gid = gid } };
+        }
+
         fn controlStatement(self: *Self) Error!ast.Control {
+            if (self.mode == .standard and (self.rawWord("vacuum") or self.rawWord("analyze") or self.rawWord("analyse"))) {
+                const vacuum = self.rawWord("vacuum");
+                try self.advance();
+                if (self.current.kind == .end or self.isSymbol(.lparen)) return error.UnsupportedStatement;
+                const target = try self.qualifiedName();
+                self.finish() catch return error.UnsupportedStatement;
+                return .{ .maintenance = .{ .operation = if (vacuum) .vacuum else .analyze, .schema = target.schema, .name = target.name } };
+            }
             // Trailing text after plain transaction control stays an
             // unsupported statement (0A000), as before the pipeline split.
             if (try self.takeWord("BEGIN")) {
@@ -1010,7 +1121,10 @@ pub fn Parser(comptime config: types.Config) type {
                 self.finish() catch return error.UnsupportedStatement;
                 return .{ .begin = modes };
             }
-            if ((try self.takeWord("COMMIT")) or (try self.takeWord("END"))) {
+            const commit = self.isWord("COMMIT");
+            if (commit or self.isWord("END")) {
+                try self.advance();
+                if (commit and self.tokens.dialect == .postgres and self.rawWord("prepared")) return self.preparedTransaction(.commit);
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
                 self.finish() catch return error.UnsupportedStatement;
                 return .commit;
@@ -1021,6 +1135,7 @@ pub fn Parser(comptime config: types.Config) type {
                 return .rollback;
             }
             if (try self.takeWord("ROLLBACK")) {
+                if (self.tokens.dialect == .postgres and self.rawWord("prepared")) return self.preparedTransaction(.rollback);
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
                 if (try self.takeWord("TO")) {
                     _ = try self.takeWord("SAVEPOINT");
@@ -1421,6 +1536,14 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// Two identifiers name the same object (unquoted ones fold case).
         fn sameIdent(self: *const Self, a: ast.Ident, b: ast.Ident) bool {
+            if (self.tokens.dialect != .postgres) {
+                if (a.len != b.len) return false;
+                var left: [config.name_bytes]u8 = undefined;
+                var right: [config.name_bytes]u8 = undefined;
+                identBytes(self.source, a, &left);
+                identBytes(self.source, b, &right);
+                return types.same(left[0..a.len], right[0..b.len]);
+            }
             const x = a.span.slice(self.source);
             const y = b.span.slice(self.source);
             if (a.quoted != b.quoted or x.len != y.len) return false;
@@ -1733,6 +1856,17 @@ pub fn Parser(comptime config: types.Config) type {
             return .{ .start = start, .len = end - start };
         }
 
+        /// Stored definitions are reparsed in standard mode during evaluation
+        /// and recovery. Admit dialect-only syntax in live statements without
+        /// storing raw text that the shared definition reader cannot parse.
+        fn storedSpan(self: *const Self, start: usize) Error!ast.Span {
+            const span = self.spanTo(start);
+            if (self.last_native_syntax) |position| {
+                if (position >= start and position < start + span.len) return error.UnsupportedStatement;
+            }
+            return span;
+        }
+
         fn tokenStart(self: *const Self) usize {
             return if (self.current.kind == .string or self.current.kind == .quoted_word) self.current.start - self.current.prefix else self.current.start;
         }
@@ -1752,7 +1886,7 @@ pub fn Parser(comptime config: types.Config) type {
             const start = self.tokenStart();
             const node = try self.expression();
             var out: Ast.ConstraintDef = .{ .name = name, .kind = .check, .node = node };
-            out.expression = self.spanTo(start);
+            out.expression = try self.storedSpan(start);
             try self.expectSymbol(.rparen);
             if (self.isWord("NO") and wordIs(self.source, try self.peek(), "inherit")) {
                 try self.advance();
@@ -1922,17 +2056,25 @@ pub fn Parser(comptime config: types.Config) type {
                     break;
                 }
             } else {
+                if (self.mode == .standard and !typeWord(self.current) and
+                    (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
+                    return error.UnsupportedStatement;
+                }
+                const mysql_bigint = self.mode == .standard and self.tokens.dialect == .mysql and self.isWord("BIGINT");
                 const spec = try self.typeName();
                 // regclass/regtype columns are outside the subset.
                 if (spec.typmod < -1) return error.UnsupportedStatement;
-                column.type_name = spec.ty;
+                column.type_name = if (mysql_bigint and spec.ty == .int8 and try self.takeRaw("unsigned")) .mysql_bigint_unsigned else spec.ty;
                 column.typmod = spec.typmod;
             }
             var has_not_null = false;
             while (true) {
                 var name: ?ast.Ident = null;
                 if (self.mode == .standard and try self.takeWord("CONSTRAINT")) name = try self.identifier();
-                if (self.mode == .standard and try self.takeWord("DEFAULT")) {
+                if (self.mode == .standard and self.tokens.dialect == .mysql and try self.takeRaw("auto_increment")) {
+                    if (name != null or column.default_kind != .none or column.serial != 0) return error.Syntax;
+                    column.default_kind = .mysql_auto_increment;
+                } else if (self.mode == .standard and try self.takeWord("DEFAULT")) {
                     if (column.default_kind != .none) {if(if_not_exists) invalid.*=true else return error.Syntax;}
                     column.default_kind = .default;
                     const start = self.tokenStart();
@@ -1940,7 +2082,7 @@ pub fn Parser(comptime config: types.Config) type {
                     self.b_expr = true;
                     defer self.b_expr = false;
                     _ = try self.other();
-                    column.expression = self.spanTo(start);
+                    column.expression = try self.storedSpan(start);
                 } else if (self.mode == .standard and try self.takeWord("GENERATED")) {
                     if (column.default_kind != .none) {if(if_not_exists) invalid.*=true else return error.Syntax;}
                     var always = true;
@@ -1960,7 +2102,7 @@ pub fn Parser(comptime config: types.Config) type {
                         try self.expectSymbol(.lparen);
                         const start = self.tokenStart();
                         _ = try self.expression();
-                        column.expression = self.spanTo(start);
+                        column.expression = try self.storedSpan(start);
                         try self.expectSymbol(.rparen);
                         // PostgreSQL 18: VIRTUAL unless STORED is written.
                         if (!try self.takeWord("STORED")) {
@@ -2175,6 +2317,10 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn insert(self: *Self) Error!Ast.Insert {
             try self.expectWord("INTO");
+            return self.insertTarget();
+        }
+
+        fn insertTarget(self: *Self) Error!Ast.Insert {
             var out: Ast.Insert = .{ .table = try self.identifier() };
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
@@ -2198,6 +2344,7 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 try self.expectWord("VALUE");
             }
+            try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("DEFAULT")) {
                 try self.expectWord("VALUES");
                 out.source = .default_values;
@@ -2270,6 +2417,20 @@ pub fn Parser(comptime config: types.Config) type {
         /// RETURNING targets: `*`, `t.*` or expressions with aliases.
         fn returningClause(self: *Self, out: *Ast.Returning) Error!void {
             if (self.mode != .standard or !try self.takeWord("RETURNING")) return;
+            if (out.output) return error.UnsupportedStatement;
+            try self.returningTargets(out);
+        }
+
+        fn outputClause(self: *Self, out: *Ast.Returning) Error!void {
+            if (self.mode != .standard or self.tokens.dialect != .tds or !self.rawWord("output")) return;
+            self.last_native_syntax = self.current.start;
+            try self.advance();
+            out.output = true;
+            try self.returningTargets(out);
+            if (self.isWord("INTO") or self.rawWord("output")) return error.UnsupportedStatement;
+        }
+
+        fn returningTargets(self: *Self, out: *Ast.Returning) Error!void {
             while (true) {
                 if (out.count == config.columns) return error.ColumnCapacity;
                 var target: Ast.Target = .{};
@@ -2368,6 +2529,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             const top = try self.setExpression();
             const block = &self.pool.queries[top];
+            const has_core_limit = self.tokens.dialect == .tds and block.limit_present;
             if (cte_count != 0) {
                 if (block.cte_count != 0) return error.Syntax;
                 block.ctes = ctes;
@@ -2383,19 +2545,36 @@ pub fn Parser(comptime config: types.Config) type {
                     if (try self.takeWord("DESC")) key.descending = true else _ = try self.takeWord("ASC");
                     if (try self.takeWord("NULLS")) {
                         if (try self.takeWord("FIRST")) key.nulls_first = true else if (try self.takeWord("LAST")) key.nulls_first = false else return error.Syntax;
+                    } else if (has_core_limit) {
+                        key.nulls_first = !key.descending;
                     }
                     block.order[block.order_count] = key;
                     block.order_count += 1;
                     if (!try self.takeSymbol(.comma)) break;
                 }
             }
-            var limited = false;
+            var limited = has_core_limit;
             var offset_seen = false;
             while (true) {
                 if (!limited and try self.takeWord("LIMIT")) {
                     limited = true;block.limit_present=true;
-                    if (!(try self.takeWord("ALL")) and !(self.mode != .standard and try self.takeWord("NULL"))) try self.countClause(&block.limit, &block.negative_limit, &block.limit_expr);
+                    if (self.tokens.dialect == .mysql and self.current.kind == .integer and (try self.peek()).symbol == .comma) {
+                        if (offset_seen) return error.Syntax;
+                        block.offset = self.current.integer;
+                        block.offset_present = true;
+                        offset_seen = true;
+                        self.pool.complex = true;
+                        try self.advance();
+                        self.last_native_syntax = self.current.start;
+                        try self.advance();
+                        if (self.current.kind != .integer) return error.Syntax;
+                        block.limit = self.current.integer;
+                        try self.advance();
+                    } else if (!(try self.takeWord("ALL")) and !(self.mode != .standard and try self.takeWord("NULL"))) {
+                        try self.countClause(&block.limit, &block.negative_limit, &block.limit_expr);
+                    }
                 } else if (!offset_seen and self.mode == .standard and try self.takeWord("OFFSET")) {
+                    if (has_core_limit) return error.Syntax;
                     offset_seen = true;block.offset_present=true;
                     self.pool.complex = true;
                     try self.countClause(&block.offset, &block.negative_offset, &block.offset_expr);
@@ -2525,6 +2704,11 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn setNode(self: *Self, op: ast.SetOp, all: bool, left: u16, right: u16) Error!u16 {
+            if (self.tokens.dialect == .tds) {
+                const lhs = &self.pool.queries[left];
+                const rhs = &self.pool.queries[right];
+                if ((lhs.with_ties and lhs.order_count == 0) or (rhs.with_ties and rhs.order_count == 0)) return error.Syntax;
+            }
             self.pool.complex = true;
             const index = try self.pool.newQuery();
             const block = &self.pool.queries[index];
@@ -2809,6 +2993,19 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.rparen);
                 }
             } else if (self.mode == .standard) _ = try self.takeWord("ALL");
+            if (self.tokens.dialect == .tds and self.rawWord("top")) {
+                self.last_native_syntax = self.current.start;
+                try self.advance();
+                try self.countValue(&out.limit, &out.negative_limit);
+                if (out.negative_limit or out.limit > 0x7fff_ffff_ffff_ffff) return error.InvalidRowCountInLimit;
+                out.limit_present = true;
+                if (try self.takeRaw("percent")) return error.UnsupportedStatement;
+                if (try self.takeWord("WITH")) {
+                    try self.expectWord("TIES");
+                    out.with_ties = true;
+                    self.pool.complex = true;
+                }
+            }
             var star = false;
             while (true) {
                 if (out.count == config.columns) return error.ColumnCapacity;
@@ -2912,8 +3109,12 @@ pub fn Parser(comptime config: types.Config) type {
             } else if (try self.takeWord("INNER")) {
                 try self.expectWord("JOIN");
             } else if (!natural and try self.takeWord("CROSS")) {
+                if (self.tokens.dialect == .tds and self.rawWord("apply")) return self.applyOperand(out, .cross);
                 try self.expectWord("JOIN");
                 kind = .cross;
+            } else if (!natural and self.tokens.dialect == .tds and try self.takeWord("OUTER")) {
+                if (!self.rawWord("apply")) return error.Syntax;
+                return self.applyOperand(out, .left);
             } else if (self.isWord("LEFT") or self.isWord("RIGHT") or self.isWord("FULL")) {
                 kind = if (self.isWord("LEFT")) .left else if (self.isWord("RIGHT")) .right else .full;
                 try self.advance();
@@ -2944,6 +3145,19 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 try self.expectSymbol(.rparen);
             } else return error.Syntax;
+            return true;
+        }
+
+        /// APPLY is a correlated right operand without an ON predicate.
+        /// OUTER APPLY null-extends that operand when it produces no rows.
+        fn applyOperand(self: *Self, out: *Ast.Select, kind: ast.JoinKind) Error!bool {
+            self.last_native_syntax = self.current.start;
+            try self.advance();
+            if (!self.isSymbol(.lparen)) return error.UnsupportedStatement;
+            const index = out.item_count;
+            try self.fromItem(out, kind);
+            if (out.item_count != index + 1 or out.items[index].query == none or out.items[index].alias == null) return error.Syntax;
+            out.items[index].lateral = true;
             return true;
         }
 
@@ -3128,6 +3342,7 @@ pub fn Parser(comptime config: types.Config) type {
         /// UPDATE / DELETE target alias: AS label, or a bare identifier that
         /// is not a PostgreSQL reserved word.
         fn targetAlias(self: *Self) Error!?ast.Ident {
+            if (self.tokens.dialect == .tds and self.rawWord("output")) return null;
             if (try self.takeWord("AS")) return try self.label();
             if (self.current.kind == .quoted_word) return try self.identifier();
             if (self.current.kind == .word and !lexer.reserved(self.current.keyword) and !reservedWord(self.current.raw(self.source))) return try self.identifier();
@@ -3156,6 +3371,7 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.setItem(&out.assignments, &out.count);
                 if (!try self.takeSymbol(.comma)) break;
             }
+            try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("FROM")) out.from = try self.fromBlock();
             out.where = try self.where();
             try self.returningClause(&out.returning);
@@ -3172,6 +3388,7 @@ pub fn Parser(comptime config: types.Config) type {
                 out.table = try self.identifier();
             }
             if (self.mode == .standard) out.alias = try self.targetAlias();
+            try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("USING")) out.using = try self.fromBlock();
             out.where = try self.where();
             try self.returningClause(&out.returning);
@@ -3558,13 +3775,17 @@ pub fn Parser(comptime config: types.Config) type {
         /// case) when it fits `out`.
         fn identText(source: []const u8, ident: ast.Ident, out: *[64]u8) ?[]const u8 {
             if (ident.len > out.len) return null;
+            identBytes(source, ident, out);
+            return out[0..ident.len];
+        }
+
+        fn identBytes(source: []const u8, ident: ast.Ident, out: []u8) void {
             const raw = ident.span.slice(source);
             if (ident.quoted) {
-                lexer.decodeQuotedWith(source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, '"', out);
+                lexer.decodeQuotedIdentifier(source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, out);
             } else for (raw, 0..) |byte, index| {
                 out[index] = types.lower(byte);
             }
-            return out[0..ident.len];
         }
 
         fn atZoneTail(self: *Self, initial: u16) Error!u16 {
@@ -3618,10 +3839,22 @@ pub fn Parser(comptime config: types.Config) type {
         fn castTail(self: *Self, initial: u16) Error!u16 {
             var node = initial;
             while (try self.takeSymbol(.cast)) {
-                const target = try self.typeName();
-                node = try self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = node });
+                node = try self.castTarget(node);
             }
             return node;
+        }
+
+        fn castTarget(self: *Self, inner: u16) Error!u16 {
+            if (typeWord(self.current)) {
+                const next = try self.peek();
+                if (next.kind != .symbol or next.symbol != .dot) {
+                    const target = try self.typeName();
+                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                }
+            }
+            const named = try self.qualifiedName();
+            if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
+            return self.pool.add(.{ .kind = .cast, .cast_type = .unknown, .a = inner, .name = named.name, .qualifier = named.schema orelse .{} });
         }
 
         /// Parses `( expr, ... )` arguments into a list; returns its head.
@@ -3664,8 +3897,20 @@ pub fn Parser(comptime config: types.Config) type {
             // Volatile sequence functions run on the general engine, which
             // evaluates every projection exactly once per row.
             const raw_name = name.span.slice(self.source);
+            if (self.tokens.dialect == .tds and !name.quoted and types.keyword(raw_name, "dateadd")) return self.tdsDateAdd(name);
+            if (self.tokens.dialect == .mysql and !name.quoted and types.keyword(raw_name, "last_insert_id")) {
+                self.last_native_syntax = name.span.start;
+                const end = self.current.end;
+                try self.expectSymbol(.rparen);
+                return self.pool.add(.{ .kind = .function, .name = name, .func = .mysql_last_insert_id,
+                    .text = .{ .start = name.span.start, .end = end, .len = end - name.span.start } });
+            }
             if (!name.quoted and (types.keyword(raw_name, "nextval") or types.keyword(raw_name, "setval"))) self.pool.complex = true;
             var call: ast.Node = .{ .kind = .function, .name = name };
+            if (self.tokens.dialect == .tds and !name.quoted and types.keyword(raw_name, "isnull")) {
+                self.last_native_syntax = name.span.start;
+                call.func = .tds_isnull;
+            }
             var first: u16 = none;
             if (try self.takeSymbol(.star)) {
                 call.star = true;
@@ -3717,6 +3962,32 @@ pub fn Parser(comptime config: types.Config) type {
             const n = &self.pool.nodes[node];
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
             return node;
+        }
+
+        fn tdsDateAdd(self: *Self, name: ast.Ident) Error!u16 {
+            if (self.current.kind != .word) return error.Syntax;
+            const unit = self.current.raw(self.source);
+            const part: ast.DateAddPart = blk: {
+                for ([_][]const u8{ "day", "dd", "d", "dayofyear", "dy", "y", "weekday", "dw", "w" }) |word| {
+                    if (types.keyword(unit, word)) break :blk .days;
+                }
+                for ([_][]const u8{ "week", "wk", "ww" }) |word| if (types.keyword(unit, word)) break :blk .weeks;
+                for ([_][]const u8{ "month", "mm", "m" }) |word| if (types.keyword(unit, word)) break :blk .months;
+                for ([_][]const u8{ "quarter", "qq", "q" }) |word| if (types.keyword(unit, word)) break :blk .quarters;
+                for ([_][]const u8{ "year", "yy", "yyyy" }) |word| if (types.keyword(unit, word)) break :blk .years;
+                return error.UnsupportedStatement;
+            };
+            self.last_native_syntax = name.span.start;
+            try self.advance();
+            try self.expectSymbol(.comma);
+            var parameters: ArgList = .{};
+            parameters.push(self.pool, try self.expression());
+            try self.expectSymbol(.comma);
+            parameters.push(self.pool, try self.expression());
+            try self.expectSymbol(.rparen);
+            const id = try self.callNode(name, .tds_dateadd, parameters);
+            self.pool.nodes[id].integer = @intFromEnum(part);
+            return id;
         }
 
         /// JSON_TABLE(context, 'path' [AS name] [PASSING value AS name, ...]
@@ -4038,6 +4309,34 @@ pub fn Parser(comptime config: types.Config) type {
             while (try self.takeSymbol(.comma)) list.push(self.pool, try self.expression());
         }
 
+        fn mysqlFunction(self: *Self, date_add: bool) Error!u16 {
+            const start = self.current.start;
+            self.last_native_syntax = start;
+            const name = try self.identifier();
+            try self.expectSymbol(.lparen);
+            try self.enter();
+            defer self.leave();
+            var args: ArgList = .{};
+            args.push(self.pool, try self.expression());
+            try self.expectSymbol(.comma);
+            if (date_add and !try self.takeRaw("interval")) return error.Syntax;
+            args.push(self.pool, try self.expression());
+            var months = false;
+            if (date_add and !try self.takeRaw("day")) {
+                if (!try self.takeRaw("month")) return error.UnsupportedStatement;
+                months = true;
+            }
+            const end = self.current.end;
+            try self.expectSymbol(.rparen);
+            const id = try self.callNode(name, if (date_add) .mysql_date_add else .mysql_ifnull, args);
+            const node = &self.pool.nodes[id];
+            if (!date_add) node.kind = .coalesce;
+            // Native column labels keep the original expression text.
+            node.text = .{ .start = start, .end = end, .len = end - start };
+            node.integer = @intFromBool(months);
+            return id;
+        }
+
         /// SQL-syntax functions of gram.y func_expr_common_subexpr: TRIM,
         /// SUBSTRING, POSITION and OVERLAY, plus LEFT/RIGHT (reserved join
         /// words that also name functions). The current word precedes `(`.
@@ -4231,9 +4530,9 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.lparen);
                     const inner = try self.expression();
                     try self.expectWord("AS");
-                    const target = try self.typeName();
+                    const target = try self.castTarget(inner);
                     try self.expectSymbol(.rparen);
-                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                    return target;
                 }
                 // Bit-string constant B'...' (the quote follows the B directly):
                 // BIT without a typmod, read by bit_in.
@@ -4305,6 +4604,10 @@ pub fn Parser(comptime config: types.Config) type {
                     return self.pool.add(.{ .kind = .function, .name = name, .func = if (session) .session_user else .current_user });
                 }
                 if (self.mode == .standard and lparenNext(try self.peek())) {
+                    if (self.tokens.dialect == .mysql) {
+                        if (self.rawWord("ifnull")) return self.mysqlFunction(false);
+                        if (self.rawWord("date_add")) return self.mysqlFunction(true);
+                    }
                     if (try self.specialFunction()) |id| return id;
                 }
                 if ((self.isWord("GREATEST") or self.isWord("LEAST")) and lparenNext(try self.peek())) {

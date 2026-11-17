@@ -53,7 +53,14 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Routines, triggers and rules (B11 wave 3).
     pg_proc, pg_trigger, pg_rewrite, pg_rules,
     // Catalog objects (B11 wave 3, catalog_objects.sig).
-    pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges };
+    pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database };
+
+pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
+pub const DatabaseCatalogProvider = struct {
+    context: ?*const anyopaque = null,
+    capacity: usize,
+    row: *const fn (?*const anyopaque, usize) ?DatabaseCatalogRow,
+};
 
 pub const ViewColumn = struct { name: []const u8, ty: types.Type };
 
@@ -61,8 +68,14 @@ fn col(name: []const u8, ty: types.Type) ViewColumn {
     return .{ .name = name, .ty = ty };
 }
 
-const pg_type_columns = [_]ViewColumn{ col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .text), col("typcategory", .text), col("typarray", .oid), col("typdelim", .text), col("typinput", .text) };
+const pg_type_columns = [_]ViewColumn{
+    col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .text), col("typcategory", .text),
+    col("typarray", .oid), col("typdelim", .text), col("typinput", .text), col("typbasetype", .oid), col("typelem", .oid),
+    col("typowner", .oid), col("typtypmod", .int4), col("typnotnull", .boolean), col("typrelid", .oid),
+};
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name) };
+const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
+const pg_database_columns = [_]ViewColumn{ col("oid", .oid), col("datname", .name), col("datdba", .oid) };
 const pg_class_columns = [_]ViewColumn{ col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .text), col("relnatts", .int2) };
 const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .text), col("attgenerated", .text), col("atthasdef", .boolean) };
 const pg_index_columns = [_]ViewColumn{ col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text) };
@@ -103,6 +116,8 @@ const table_privileges_columns = [_]ViewColumn{ col("grantor", .name), col("gran
 pub fn viewColumns(view: View) []const ViewColumn {
     return switch (view) {
         .pg_type => &pg_type_columns,
+        .pg_enum => &pg_enum_columns,
+        .pg_database => &pg_database_columns,
         .pg_namespace => &pg_namespace_columns,
         .pg_class => &pg_class_columns,
         .pg_attribute => &pg_attribute_columns,
@@ -141,7 +156,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 /// pg_catalog views resolve unqualified (pg_catalog is searched first);
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
-    const catalog_views = [_]View{ .pg_type, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
+    const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_extension, .pg_tables };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
@@ -175,6 +190,12 @@ pub fn Catalog(comptime config: types.Config) type {
         pub const Cell = CV.Cell;
 
         relations: [4]SC.Table = @splat(.{}),
+        databases: ?DatabaseCatalogProvider = null,
+
+        pub fn findSystemView(self: *const Self, schema: ?[]const u8, name: []const u8) ?View {
+            if (self.databases != null and types.same(schema orelse "pg_catalog", "pg_catalog") and types.same(name, "pg_database")) return .pg_database;
+            return findView(schema, name);
+        }
 
         pub fn relation(self: *Self, which: Relation) *SC.Table {
             return &self.relations[@intFromEnum(which)];
@@ -232,9 +253,10 @@ pub fn Catalog(comptime config: types.Config) type {
         /// A user schema named `name` visible to `snap`.
         pub fn findSchema(self: *const Self, name: []const u8, snap: storage.Snapshot) ?SchemaFound {
             const relations = self.relationConst(.relations);
+            var row_scratch: SC.VersionRowScratch = undefined;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
-                const cells = &relations.versions[version].cells;
+                const cells = SC.borrowVersionRow(relations, version, &row_scratch);
                 if (cells[2].text.bytes[0] != 'n' or !sameName(&cells[1], name)) continue;
                 return .{ .oid = @intCast(cells[0].integer), .slot = @intCast(cells[4].integer) };
             }
@@ -244,10 +266,11 @@ pub fn Catalog(comptime config: types.Config) type {
         /// Every user schema visible to `snap`, in catalog row order.
         pub fn visibleSchemas(self: *const Self, snap: storage.Snapshot, out: *[rows]SchemaFound) usize {
             const relations = self.relationConst(.relations);
+            var row_scratch: SC.VersionRowScratch = undefined;
             var count: usize = 0;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
-                const cells = &relations.versions[version].cells;
+                const cells = SC.borrowVersionRow(relations, version, &row_scratch);
                 if (cells[2].text.bytes[0] != 'n') continue;
                 out[count] = .{ .oid = @intCast(cells[0].integer), .slot = @intCast(cells[4].integer) };
                 count += 1;
@@ -259,10 +282,12 @@ pub fn Catalog(comptime config: types.Config) type {
         /// uncommitted relation row in namespace `namespace`.
         pub fn namespaceCreator(self: *const Self, namespace: u32, snap: storage.Snapshot) ?u16 {
             const relations = self.relationConst(.relations);
-            for (relations.versions[0..relations.version_high]) |*version| {
+            var row_scratch: SC.VersionRowScratch = undefined;
+            for (relations.versions[0..relations.version_high], 0..) |*version, index| {
                 if (version.row == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
                 if (version.xmax.epoch != 0) continue;
-                if (version.cells[3] == .integer and version.cells[3].integer == namespace and version.cells[2].text.bytes[0] != 'n') return version.xmin.slot;
+                const cells = SC.borrowVersionRow(relations, index, &row_scratch);
+                if (cells[3] == .integer and cells[3].integer == namespace and cells[2].text.bytes[0] != 'n') return version.xmin.slot;
             }
             return null;
         }
@@ -305,10 +330,11 @@ pub fn Catalog(comptime config: types.Config) type {
         /// catalog row order. Schemas are listed by visibleSchemas.
         pub fn visibleRelations(self: *const Self, snap: storage.Snapshot, out: *[rows]Found) usize {
             const relations = self.relationConst(.relations);
+            var row_scratch: SC.VersionRowScratch = undefined;
             var count: usize = 0;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
-                const cells = &relations.versions[version].cells;
+                const cells = SC.borrowVersionRow(relations, version, &row_scratch);
                 if (cells[2].text.bytes[0] == 'n') continue;
                 out[count] = .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
                 count += 1;
@@ -325,9 +351,10 @@ pub fn Catalog(comptime config: types.Config) type {
         /// A table or sequence named `name` in schema `namespace`.
         pub fn findIn(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) ?Found {
             const relations = self.relationConst(.relations);
+            var row_scratch: SC.VersionRowScratch = undefined;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
-                const cells = &relations.versions[version].cells;
+                const cells = SC.borrowVersionRow(relations, version, &row_scratch);
                 if (cells[2].text.bytes[0] == 'n' or cells[3].integer != namespace) continue;
                 if (sameName(&cells[1], name)) return .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
             }
@@ -341,11 +368,7 @@ pub fn Catalog(comptime config: types.Config) type {
             if (SC.findRow(table, rowid) != null) _ = SC.vacuum(table, horizon);
             if (SC.findRow(table, rowid) != null) return error.CatalogCapacity;
             const slot = SC.allocRow(table, rowid);
-            const version = SC.allocVersion(table);
-            table.versions[version] = .{ .row = slot + 1, .xmin = xmin, .xmin_cid = cid, .xmin_csn = csn };
-            for (cells, 0..) |cell, index| table.versions[version].cells[index] = cell;
-            table.rows[slot].newest = version + 1;
-            return version;
+            return SC.createVersion(table, .{ .row = slot, .xmin = xmin, .cid = cid, .csn = csn }, cells);
         }
 
         /// Writes cat_relations and cat_attributes rows for a table slot.
@@ -412,10 +435,11 @@ pub fn Catalog(comptime config: types.Config) type {
         /// uncommitted relation row with this name.
         pub fn creator(self: *const Self, name: []const u8, snap: storage.Snapshot) ?u16 {
             const relations = self.relationConst(.relations);
-            for (relations.versions[0..relations.version_high]) |*version| {
+            for (relations.versions[0..relations.version_high], 0..) |*version, index| {
                 if (version.row == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
                 if (version.xmax.epoch != 0) continue;
-                if (sameName(&version.cells[1], name)) return version.xmin.slot;
+                var temporary: CV.Cell = undefined;
+                if (sameName(SC.borrowVersionCell(relations, index, 1, &temporary), name)) return version.xmin.slot;
             }
             return null;
         }
