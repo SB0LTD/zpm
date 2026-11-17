@@ -169,6 +169,54 @@ fn quiet(store: *Store) !void {
     try check(usage.transactions == 0 and usage.row_locks == 0 and usage.table_locks == 0 and usage.pending_versions == 0);
 }
 
+fn forceQuotes(client: *Client, out: []u8) !void {
+    const all = try client.query("COPY o TO STDOUT WITH (FORMAT CSV, FORCE_QUOTE *, HEADER)");
+    try check(equal(tagOf(all).?, "COPY 3") and readyStatus(all).? == 'I');
+    try check(equal(try copyOut(all, out), "id,label\n\"1\",\"a\tb\"\n\"2\",\n\"3\",\"\"\n"));
+    const selected = try client.query("COPY o (label,id) TO STDOUT (FORCE_QUOTE (id), FORMAT CSV, NULL 'nil')");
+    try check(equal(try copyOut(selected, out), "a\tb,\"1\"\nnil,\"2\"\n,\"3\"\n"));
+    const legacy = try client.query("COPY o TO STDOUT CSV FORCE QUOTE label");
+    try check(equal(try copyOut(legacy, out), "1,\"a\tb\"\n2,\n3,\"\"\n"));
+    const query = try client.query("COPY (SELECT id AS \"Id\",label AS value FROM o ORDER BY id) TO STDOUT (FORMAT CSV, FORCE_QUOTE (\"Id\"))");
+    try check(equal(tagOf(query).?, "COPY 3"));
+    try check(equal(try copyOut(query, out), "\"1\",a\tb\n\"2\",\n\"3\",\"\"\n"));
+    const custom = try client.query(
+        "COPY (SELECT 'A!#' AS \"Part\", 'nil' AS mask, NULL::TEXT AS absent) TO STDOUT " ++
+            "(FORMAT CSV, FORCE_QUOTE ('Part'), QUOTE '!', ESCAPE '#', DELIMITER ';', NULL 'nil')",
+    );
+    try check(equal(try copyOut(custom, out), "!A#!##!;!nil!;nil\n"));
+    const first_name = try client.query("COPY (SELECT 1 AS val,2 AS val) TO STDOUT (FORMAT CSV, FORCE_QUOTE (val))");
+    try check(equal(try copyOut(first_name, out), "\"1\",2\n"));
+    const boolean_name = try client.query("COPY (SELECT 1 AS \"true\") TO STDOUT (FORMAT CSV, FORCE_QUOTE (TRUE))");
+    try check(equal(try copyOut(boolean_name, out), "\"1\"\n"));
+
+    for ([_]struct { source: []const u8, state: []const u8 }{
+        .{ .source = "COPY o TO STDOUT (FORMAT TEXT, FORCE_QUOTE *)", .state = "0A000" },
+        .{ .source = "COPY o TO STDOUT (FORMAT BINARY, FORCE_QUOTE *)", .state = "0A000" },
+        .{ .source = "COPY o FROM STDIN (FORMAT CSV, FORCE_QUOTE *)", .state = "0A000" },
+        .{ .source = "COPY o TO STDOUT (FORMAT CSV, FORCE_QUOTE)", .state = "22023" },
+        .{ .source = "COPY o TO STDOUT (FORMAT CSV, FORCE_QUOTE 'id')", .state = "22023" },
+        .{ .source = "COPY o TO STDOUT (FORMAT CSV, FORCE_QUOTE ())", .state = "42601" },
+        .{ .source = "COPY o TO STDOUT (FORMAT CSV, FORCE_QUOTE *, FORCE_QUOTE (id))", .state = "42601" },
+        .{ .source = "COPY o TO STDOUT (FORMAT CSV, FORCE_QUOTE (missing))", .state = "42703" },
+        .{ .source = "COPY o TO STDOUT (FORMAT CSV, FORCE_QUOTE (id,id))", .state = "42701" },
+        .{ .source = "COPY o (label) TO STDOUT (FORMAT CSV, FORCE_QUOTE (id))", .state = "42P10" },
+        .{ .source = "COPY (SELECT id AS named FROM o WHERE false) TO STDOUT (FORMAT CSV, FORCE_QUOTE (id))", .state = "42703" },
+        .{ .source = "COPY (SELECT 1 AS \"select\") TO STDOUT (FORMAT CSV, FORCE_QUOTE (SELECT))", .state = "42601" },
+    }) |test_case| {
+        const response = try client.query(test_case.source);
+        try check(equal(sqlstate(response) orelse "", test_case.state) and readyStatus(response).? == 'I');
+        var frames: Frames = .{ .bytes = response };
+        while (try frames.next()) |item| try check(item.tag != 'H' and item.tag != 'G' and item.tag != 'd');
+    }
+    _ = try client.query("CREATE SEQUENCE copy_quote_seq START 10");
+    const never_run = try client.query("COPY (SELECT nextval('copy_quote_seq') AS present) TO STDOUT (FORMAT CSV, FORCE_QUOTE (missing))");
+    try check(equal(sqlstate(never_run) orelse "", "42703"));
+    _ = try client.query("SELECT nextval('copy_quote_seq')");
+    try check(client.session.result.row_count == 1 and client.session.result.rows[0].cells[0].integer == 10);
+    _ = try client.query("DROP SEQUENCE copy_quote_seq");
+}
+
 fn formats() !void {
     var scratch: [256]u8 = undefined;
     var fields: [4]?[]const u8 = undefined;
@@ -402,6 +450,7 @@ fn protocol() !void {
     bytes = try a.query("COPY o TO STDOUT (FORMAT csv, HEADER)");
     try check(equal(tagOf(bytes).?, "COPY 3") and readyStatus(bytes).? == 'I');
     try check(equal(try copyOut(bytes, &out), "id,label\n1,a\tb\n2,\n3,\"\"\n"));
+    try forceQuotes(&a, &out);
     try check(equal(try copyOut(try a.query("COPY (SELECT label FROM o WHERE id = 1) TO STDOUT"), &out), "a\\tb\n"));
     const binary_out = try copyOut(try a.query("COPY o (id) TO STDOUT (FORMAT binary)"), &out);
     try check(binary_out.len == 19 + 3 * 10 + 2 and equal(binary_out[0..11], fmt.signature) and binary_out[19 + 9] == 1 and binary_out[binary_out.len - 1] == 0xff);

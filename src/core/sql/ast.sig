@@ -921,6 +921,9 @@ pub fn Ast(comptime config: types.Config) type {
             query: ?Span = null,
             direction: CopyDirection = .from,
             options: CopyOptions = .{},
+            force_quote_all: bool = false,
+            force_quote_columns: [config.columns]types.Values(config).Name = undefined,
+            force_quote_count: usize = 0,
         };
 
         /// TRUNCATE [TABLE] [ONLY] name [, ...] [RESTART | CONTINUE IDENTITY]

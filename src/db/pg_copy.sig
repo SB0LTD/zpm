@@ -312,7 +312,11 @@ pub fn appendText(options: *const Options, value: []const u8, out: *Sink) error{
 /// CR or LF, equals the NULL string, or is `\.` alone in a one-column row;
 /// quote and escape characters inside are preceded by the escape.
 pub fn appendCsv(options: *const Options, value: []const u8, single: bool, out: *Sink) error{BufferTooSmall}!void {
-    var use_quote = equal(value, options.null_string);
+    return appendCsvField(options, value, single, false, out);
+}
+
+pub fn appendCsvField(options: *const Options, value: []const u8, single: bool, force_quote: bool, out: *Sink) error{BufferTooSmall}!void {
+    var use_quote = force_quote or equal(value, options.null_string);
     if (!use_quote and single and equal(value, "\\.")) use_quote = true;
     if (!use_quote) for (value) |byte| {
         if (byte == options.delimiter or byte == options.quote or byte == '\n' or byte == '\r') {
