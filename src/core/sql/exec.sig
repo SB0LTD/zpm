@@ -41,6 +41,8 @@ pub fn Exec(comptime config: types.Config) type {
         pub const List = struct { start: u32 = 0, count: u32 = 0 };
 
         const Tuples = struct { start: u32, count: u32, width: u32 };
+        // A tuple keeps its sources live together while expressions evaluate.
+        const TupleRows = [config.relations]S.VersionRowScratch;
 
         const CteRun = struct {
             state: enum { idle, iterating, done } = .idle,
@@ -66,12 +68,17 @@ pub fn Exec(comptime config: types.Config) type {
             factor_plans: usize = 0,
             factor_keys: usize = 0,
             factor_selected_rows: usize = 0,
+            factor_sparse_predicates: usize = 0,
             typed_group_plans: usize = 0,
             typed_group_channels: usize = 0,
             dimension_group_plans:usize=0,
             dimension_group_keys:usize=0,
             dimension_group_ids:usize=0,
             dimension_group_rows:usize=0,
+            dimension_group_channels: usize = 0,
+            narrow_dimension_group_plans: usize = 0,
+            nonnull_dimension_group_plans: usize = 0,
+            dimension_rollup_plans:usize=0,
             dimension_distinct_plans:usize=0,
             nested_factor_plans: usize = 0,
             nested_factor_keys: usize = 0,
@@ -81,6 +88,9 @@ pub fn Exec(comptime config: types.Config) type {
             groups: usize = 0,
             date_key_memo_hits: usize = 0,
             date_key_memo_misses: usize = 0,
+            dimension_date_group_plans: usize = 0,
+            dimension_date_keys: usize = 0,
+            rollup_folded_leaves: usize = 0,
             probes: usize = 0,
             window_frame_rows:usize=0,
             window_prefix_rows:usize=0,
@@ -455,16 +465,16 @@ pub fn Exec(comptime config: types.Config) type {
                 return list;
             }
 
-            fn rowOf(self: *const Query, source: *const B.Source, handle: u32) [*]const V.Cell {
-                if (source.table) |index| return &self.tables[index].versions[handle].cells;
+            fn rowOf(self: *const Query, source: *const B.Source, handle: u32, scratch: *S.VersionRowScratch) [*]const V.Cell {
+                if (source.table) |index| return S.borrowVersionRow(&self.tables[index], handle, scratch);
                 return self.row(handle);
             }
 
-            fn setTuple(self: *const Query, p: *const B.Plan, ctx: *E.Context, tuples: Tuples, index: usize) void {
+            fn setTuple(self: *const Query, p: *const B.Plan, ctx: *E.Context, rows: *TupleRows, tuples: Tuples, index: usize) void {
                 const base = tuples.start + index * tuples.width;
                 for (0..tuples.width) |position| {
                     const handle = self.work.refs[base + position];
-                    ctx.tuple[position] = if (handle == absent) null else self.rowOf(&p.sources[position], handle);
+                    ctx.tuple[position] = if (handle == absent) null else self.rowOf(&p.sources[position], handle, &rows[position]);
                 }
             }
 
@@ -530,6 +540,7 @@ pub fn Exec(comptime config: types.Config) type {
             fn join(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
                 if (p.general_join) return self.joinGeneral(p, outer);
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 if (p.source_count == 0) {
                     const kept = try keep(&ctx, p.where, null);
                     return .{ .start = @intCast(self.work.ref_low), .count = @intFromBool(kept), .width = 0 };
@@ -550,7 +561,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                     var next: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = @intCast(stage + 1) };
                     for (0..current.count) |index| {
-                        self.setTuple(p, &ctx, current, index);
+                        self.setTuple(p, &ctx, &tuple_rows, current, index);
                         var any = false;
                         if (probing) {
                             ctx.row = null;
@@ -558,7 +569,7 @@ pub fn Exec(comptime config: types.Config) type {
                             if (key != .null_value) {
                                 const table = &self.tables[source.table.?];
                                 if (S.lookupKeyAt(table, &key, self.snap)) |slot| if (S.visibleAt(table, slot, self.snap)) |version| {
-                                    ctx.tuple[stage] = &table.versions[version].cells;
+                                    ctx.tuple[stage] = S.borrowVersionRow(table, version, &tuple_rows[stage]);
                                     if (source.on == none or (try E.truth(&ctx, source.on)) == true) {
                                         any = true;
                                         if (try self.joinKeep(&ctx, p.where, stage, last, early)) try self.emit(&next, current, index, version);
@@ -567,7 +578,7 @@ pub fn Exec(comptime config: types.Config) type {
                             }
                         } else for (self.handles(rows), 0..) |handle, position| {
                             try self.session.checkpoint();
-                            ctx.tuple[stage] = self.rowOf(source, handle);
+                            ctx.tuple[stage] = self.rowOf(source, handle, &tuple_rows[stage]);
                             if (stage != 0 and source.on != none and (try E.truth(&ctx, source.on)) != true) continue;
                             any = true;
                             if (tracks) self.work.refs[matched + position] = 1;
@@ -582,7 +593,7 @@ pub fn Exec(comptime config: types.Config) type {
                         for (self.handles(rows), 0..) |handle, position| {
                             if (self.work.refs[matched + position] != 0) continue;
                             for (0..stage) |slot| ctx.tuple[slot] = null;
-                            ctx.tuple[stage] = self.rowOf(source, handle);
+                            ctx.tuple[stage] = self.rowOf(source, handle, &tuple_rows[stage]);
                             if (try self.joinKeep(&ctx, p.where, stage, last, early)) try self.emit(&next, current, null, handle);
                         }
                     }
@@ -601,12 +612,13 @@ pub fn Exec(comptime config: types.Config) type {
             /// tree. No probe, early filter or streamed path applies.
             fn joinGeneral(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
                 var ctx = self.context(outer);
-                const tree = try self.joinRange(p, &ctx, outer, 0, p.source_count - 1);
+                var tuple_rows: TupleRows = undefined;
+                const tree = try self.joinRange(p, &ctx, &tuple_rows, outer, 0, p.source_count - 1);
                 if (p.where == none) return tree;
                 var out: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = tree.width };
                 for (0..tree.count) |index| {
                     try self.session.checkpoint();
-                    self.setTuple(p, &ctx, tree, index);
+                    self.setTuple(p, &ctx, &tuple_rows, tree, index);
                     if (try keep(&ctx, p.where, null)) try self.emitPair(&out, tree, index, tree, null, tree.width);
                 }
                 return out;
@@ -614,13 +626,13 @@ pub fn Exec(comptime config: types.Config) type {
 
             /// Items first..last joined left-deep; each later operand is one
             /// item or a parenthesized group (Source.group_end).
-            fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
+            fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, tuple_rows: *TupleRows, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
                 var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer));
                 var next = first + 1;
                 while (next <= last) {
                     const end: usize = if (p.sources[next].group_end != none) p.sources[next].group_end else next;
                     if (end < next or end > last) return error.UnsupportedStatement;
-                    current = try self.joinStep(p, ctx, outer, current, next, end);
+                    current = try self.joinStep(p, ctx, tuple_rows, outer, current, next, end);
                     next = end + 1;
                 }
                 return current;
@@ -655,17 +667,17 @@ pub fn Exec(comptime config: types.Config) type {
                 out.count += 1;
             }
 
-            fn setSlots(self: *const Query, p: *const B.Plan, ctx: *E.Context, tuples: Tuples, index: usize, first: usize, last: usize) void {
+            fn setSlots(self: *const Query, p: *const B.Plan, ctx: *E.Context, rows: *TupleRows, tuples: Tuples, index: usize, first: usize, last: usize) void {
                 const base = tuples.start + index * tuples.width;
                 for (first..last + 1) |slot| {
                     const handle = self.work.refs[base + slot];
-                    ctx.tuple[slot] = if (handle == absent) null else self.rowOf(&p.sources[slot], handle);
+                    ctx.tuple[slot] = if (handle == absent) null else self.rowOf(&p.sources[slot], handle, &rows[slot]);
                 }
             }
 
             /// Joins the operand of items j..end (the item's join kind and
             /// condition) to `left`.
-            fn joinStep(self: *Query, p: *const B.Plan, ctx: *E.Context, outer: ?*const E.Context, left: Tuples, j: usize, end: usize) Error!Tuples {
+            fn joinStep(self: *Query, p: *const B.Plan, ctx: *E.Context, tuple_rows: *TupleRows, outer: ?*const E.Context, left: Tuples, j: usize, end: usize) Error!Tuples {
                 const source = &p.sources[j];
                 const width: u32 = @intCast(p.source_count);
                 const lateral = source.lateral and end == j;
@@ -676,14 +688,14 @@ pub fn Exec(comptime config: types.Config) type {
                 if (lateral) {
                     lists = try self.refs(@as(usize, left.count) * 2);
                     for (0..left.count) |index| {
-                        self.setTuple(p, ctx, left, index);
+                        self.setTuple(p, ctx, tuple_rows, left, index);
                         const rows = try self.run(source.plan, ctx);
                         self.work.refs[lists + index * 2] = rows.start;
                         self.work.refs[lists + index * 2 + 1] = rows.count;
                     }
                 } else if (end == j) {
                     right = try self.leafTuples(p, j, try self.sourceRows(source, outer));
-                } else right = try self.joinRange(p, ctx, outer, j, end);
+                } else right = try self.joinRange(p, ctx, tuple_rows, outer, j, end);
                 const tracks = source.join == .right or source.join == .full;
                 if (lateral and tracks) return error.InvalidColumnReference;
                 const outer_join = source.join == .left or source.join == .full;
@@ -699,8 +711,8 @@ pub fn Exec(comptime config: types.Config) type {
                         const rows: List = .{ .start = self.work.refs[lists + li * 2], .count = self.work.refs[lists + li * 2 + 1] };
                         for (self.handles(rows)) |handle| {
                             try self.session.checkpoint();
-                            self.setTuple(p, ctx, left, li);
-                            ctx.tuple[j] = self.rowOf(source, handle);
+                            self.setTuple(p, ctx, tuple_rows, left, li);
+                            ctx.tuple[j] = self.rowOf(source, handle, &tuple_rows[j]);
                             if (source.on != none and (try E.truth(ctx, source.on)) != true) continue;
                             any = true;
                             try self.emitPair(&out, left, li, left, null, width);
@@ -708,8 +720,8 @@ pub fn Exec(comptime config: types.Config) type {
                         }
                     } else for (0..right.count) |ri| {
                         try self.session.checkpoint();
-                        self.setTuple(p, ctx, left, li);
-                        self.setSlots(p, ctx, right, ri, j, end);
+                        self.setTuple(p, ctx, tuple_rows, left, li);
+                        self.setSlots(p, ctx, tuple_rows, right, ri, j, end);
                         if (source.on != none and (try E.truth(ctx, source.on)) != true) continue;
                         any = true;
                         if (tracks) self.work.refs[matched + ri] = 1;
@@ -736,13 +748,14 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn project(self: *Query, p: *const B.Plan, tuples: Tuples, outer: ?*const E.Context) Error!List {
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 var out: List = .{ .start = @intCast(self.work.ref_low) };
                 // Without sorting, stop once OFFSET + LIMIT rows exist.
                 const lazy = p.order_count == 0 and p.distinct == .none;
                 const wanted: u64 = if (p.limit > 0xffffffffffffffff - p.offset) 0xffffffffffffffff else p.offset + p.limit;
                 for (0..tuples.count) |index| {
                     if (lazy and out.count >= wanted) break;
-                    self.setTuple(p, &ctx, tuples, index);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, index);
                     try self.projectRow(p, &ctx, &out);
                 }
                 return out;
@@ -778,11 +791,12 @@ pub fn Exec(comptime config: types.Config) type {
             /// one group, even over no rows.
             fn group(self: *Query, p: *const B.Plan, tuples: Tuples, outer: ?*const E.Context) Error!List {
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 const n = tuples.count;
                 const key_width: u32 = @intCast(p.key_count);
                 const keys = try self.cells(@as(usize, n) * key_width);
                 for (0..n) |index| {
-                    self.setTuple(p, &ctx, tuples, index);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, index);
                     for (p.keys[0..p.key_count], 0..) |key, column| self.work.cells[keys + index * key_width + column] = try E.eval(&ctx, key);
                 }
                 const order = try self.refs(n);
@@ -1203,11 +1217,12 @@ pub fn Exec(comptime config: types.Config) type {
                 var tickets: u32 = undefined;
                 var transitions: [config.columns]Transition = undefined;
                 const prepared = self.prepareTransitions(p, transitions[0..p.agg_count]);
+                var version_row: S.VersionRowScratch = undefined;
                 for (0..table.row_high) |slot| {
                     try self.session.checkpoint();
                     const version = S.visibleAt(table, slot, self.snap) orelse continue;
                     self.work.stream_stats.rows += 1;
-                    const source_cells = &table.versions[version].cells;
+                    const source_cells = S.borrowVersionRow(table, version, &version_row);
                     ctx.tuple[0] = source_cells;
                     if (!try keep(&ctx, p.where, null)) continue;
                     if (groups == 0) {
@@ -1342,6 +1357,34 @@ pub fn Exec(comptime config: types.Config) type {
                     mask |= @as(u64,@intFromBool(matched and valid)) << @intCast(i);
                 }
                 return mask;
+            }
+
+            fn refineFactorMask(self: *Query, table: *const S.Table, start: usize, count: usize,
+                selected_mask: u64, predicate: CompactPredicate) u64 {
+                // A prior selective predicate can leave fewer rows than one
+                // vector. Read only those rows of the next fact column.
+                if (@popCount(selected_mask) <= 4) {
+                    self.work.stream_stats.factor_sparse_predicates += 1;
+                    const single = [_]CompactPredicate{predicate};
+                    var remaining = selected_mask;
+                    var matched: u64 = 0;
+                    while (remaining != 0) {
+                        const bit = @ctz(remaining);
+                        remaining &= remaining - 1;
+                        if (compactKeep(table, start + bit, &single)) matched |= @as(u64, 1) << @intCast(bit);
+                    }
+                    return matched;
+                }
+                const stats = &self.work.stream_stats;
+                return selected_mask & switch (predicate.op) {
+                    .eq => comparisonMask(.eq, table, start, count, predicate, stats),
+                    .ne => comparisonMask(.ne, table, start, count, predicate, stats),
+                    .lt => comparisonMask(.lt, table, start, count, predicate, stats),
+                    .le => comparisonMask(.le, table, start, count, predicate, stats),
+                    .gt => comparisonMask(.gt, table, start, count, predicate, stats),
+                    .ge => comparisonMask(.ge, table, start, count, predicate, stats),
+                    else => unreachable,
+                };
             }
 
             const CompactFold = struct {
@@ -1491,6 +1534,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// Consume visible base-table versions directly. State grows with
             /// groups, not scanned rows. All output remains private until the
             const StreamCursor=struct {
+                version_rows: TupleRows = undefined,
                 next:usize=0,
                 high:usize=0,
                 columns:?u64=null,
@@ -1687,7 +1731,7 @@ pub fn Exec(comptime config: types.Config) type {
                     return &cursor.row;
                 };
                 const version=S.visibleAt(table,slot,self.snap) orelse return null;
-                return &table.versions[version].cells;
+                return S.borrowVersionRow(table, version, &cursor.version_rows[0]);
             }
 
             /// Scan one fact row and resolve unique-key inner dimensions using
@@ -1749,7 +1793,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const dimension=&self.tables[source.table.?];
                         self.work.stream_stats.dimension_probes+=1;
                         const visible=S.lookupVersionAt(dimension,key,self.snap) orelse continue :scan;
-                        ctx.tuple[stage]=&dimension.versions[visible].cells;
+                        ctx.tuple[stage]=S.borrowVersionRow(dimension,visible,&cursor.version_rows[stage]);
                         if(source.on!=none and (try E.truth(ctx,source.on))!=true) continue :scan;
                         if(stage+1<p.source_count and early and !try self.earlyKeep(ctx,p.where,stage)) continue :scan;
                     }
@@ -1759,10 +1803,18 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             const FactorAggregate=struct {total:i128 align(@alignOf(V.Cell))=0,count:i64=0};
-            const factor_header=(@sizeOf(i64)+@alignOf(FactorAggregate)-1)/@alignOf(FactorAggregate)*@alignOf(FactorAggregate);
+            const factor_header = factorHeader(FactorAggregate);
+            fn factorHeader(comptime Aggregate: type) usize {
+                const alignment = @alignOf(Aggregate);
+                return (@sizeOf(i64) + alignment - 1) / alignment * alignment;
+            }
             fn factorRows(bytes:[*]u8) *i64 {return @ptrCast(@alignCast(bytes));}
             fn factorStates(bytes:[*]u8,count:usize) []FactorAggregate {
-                const pointer:[*]FactorAggregate=@ptrCast(@alignCast(bytes+factor_header));return pointer[0..count];
+                return factorStatesFor(FactorAggregate, bytes, count);
+            }
+            fn factorStatesFor(comptime Aggregate: type, bytes: [*]u8, count: usize) []Aggregate {
+                const pointer: [*]Aggregate = @ptrCast(@alignCast(bytes + factorHeader(Aggregate)));
+                return pointer[0..count];
             }
             fn factorOperand(self:*const Query,id:u16,key_column:u16) bool {
                 const node=self.pool.nodes[id];
@@ -1842,11 +1894,7 @@ pub fn Exec(comptime config: types.Config) type {
                     var mask=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(mask);
                     for(predicates[0..predicate_count]) |predicate| {
                         if(mask==0) break;
-                        mask&=switch(predicate.op) {
-                            .eq=>comparisonMask(.eq,table,start,count,predicate,&self.work.stream_stats),.ne=>comparisonMask(.ne,table,start,count,predicate,&self.work.stream_stats),
-                            .lt=>comparisonMask(.lt,table,start,count,predicate,&self.work.stream_stats),.le=>comparisonMask(.le,table,start,count,predicate,&self.work.stream_stats),
-                            .gt=>comparisonMask(.gt,table,start,count,predicate,&self.work.stream_stats),.ge=>comparisonMask(.ge,table,start,count,predicate,&self.work.stream_stats),else=>unreachable,
-                        };
+                        mask = self.refineFactorMask(table, start, count, mask, predicate);
                     }
                     while(mask!=0) {
                         const i=@ctz(mask);mask&=mask-1;const slot=start+i;const flags=table.scan_nonnull[slot];
@@ -1863,6 +1911,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 var ctx=self.context(outer);var fact:[config.columns]V.Cell=undefined;
+                var tuple_rows: TupleRows = undefined;
                 var key_cells:[config.columns]*const V.Cell=undefined;
                 for(0..span) |key_index| {
                     const input=partial+key_index*stride;if(factorRows(input).*==0) continue;
@@ -1876,7 +1925,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.stream_stats.dimension_probes+=1;
                         const dimension=&self.tables[source.table.?];
                         const visible=S.lookupVersionAt(dimension,key,self.snap) orelse {matched=false;break;};
-                        ctx.tuple[stage]=&dimension.versions[visible].cells;
+                        ctx.tuple[stage]=S.borrowVersionRow(dimension,visible,&tuple_rows[stage]);
                         if(source.on!=none and (try E.truth(&ctx,source.on))!=true) {matched=false;break;}
                     }
                     if(!matched) continue;
@@ -2062,6 +2111,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 var ctx=self.context(outer);var producer_cells:[config.columns]V.Cell=undefined;var key_cells:[config.columns]*const V.Cell=undefined;
+                var dimension_row: S.VersionRowScratch = undefined;
                 for(partial,0..) |*value,index| {
                     if(value.rows==0) continue;try self.session.checkpoint();self.work.stream_stats.nested_factor_keys+=1;
                     const key_value:i64=@intCast(@as(i128,bounds.low)+index);var keep_key=true;
@@ -2074,7 +2124,7 @@ pub fn Exec(comptime config: types.Config) type {
                     producer_cells[probe.column]=.{.integer=key_value};ctx.row=null;ctx.tuple[0]=&producer_cells;
                     self.work.stream_stats.dimension_probes+=1;
                     const visible=S.lookupVersionAt(dimension,&producer_cells[probe.column],self.snap) orelse continue;
-                    ctx.tuple[1]=&dimension.versions[visible].cells;
+                    ctx.tuple[1]=S.borrowVersionRow(dimension,visible,&dimension_row);
                     if(p.sources[1].on!=none and (try E.truth(&ctx,p.sources[1].on))!=true) continue;
                     var hash:usize=2166136261;
                     for(p.keys[0..p.key_count],0..) |id,column| {key_cells[column]=E.columnRef(&ctx,&self.pool.nodes[id]);hash=(hash^(if(key_cells[column].*==.null_value) @as(usize,0x9e3779b9) else V.hash(key_cells[column])))*%16777619;}
@@ -2299,6 +2349,46 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             const DimensionMap=struct {mapping:u32,dictionary:u32,groups:usize};
+            const DateKeys = struct {
+                days: u32,
+                values: u32,
+                buckets: u32,
+                slots: usize,
+                count: usize = 0,
+            };
+
+            fn dateGroupIndex(self: *Query, keys: *DateKeys, day_index: usize, value: V.Cell, expression: u16, column: *const ast.Node, ctx: *E.Context, row_values: *[config.columns]V.Cell) Error!usize {
+                const encoded = &self.work.refs[keys.days + day_index];
+                row_values[column.column] = value;
+                ctx.tuple[0] = row_values;
+                const formatted = try E.eval(ctx, expression);
+                self.work.stream_stats.dimension_date_keys += 1;
+                const hash = if (formatted == .null_value) @as(usize, 0x9e3779b9) else V.hash(&formatted);
+                var bucket = hash & (keys.slots - 1);
+                while (true) : (bucket = (bucket + 1) & (keys.slots - 1)) {
+                    try self.session.checkpoint();
+                    self.work.stream_stats.probes += 1;
+                    const found = &self.work.refs[keys.buckets + bucket];
+                    if (found.* == absent) {
+                        const index: u32 = @intCast(keys.count);
+                        self.work.cells[keys.values + index] = formatted;
+                        found.* = index;
+                        keys.count += 1;
+                    } else if (V.compare(&formatted, &self.work.cells[keys.values + found.*]) != 0) continue;
+                    encoded.* = found.*;
+                    return found.*;
+                }
+            }
+
+            fn dimensionChain(self: *const Query, p: *const B.Plan, join_column: u16) bool {
+                for (p.sources[1..p.source_count], 1..) |source, stage| {
+                    if (source.join != .inner or source.table == null or source.probe == none or
+                        !self.factorOperand(source.probe, join_column) or !self.earlyAvailable(source.probe, stage - 1) or
+                        !self.factorOn(source.on, join_column) or !self.earlyAvailable(source.on, stage)) return false;
+                    if (self.tables[source.table.?].primary_column == null) return false;
+                }
+                return true;
+            }
             /// Inputs have already proven unique-key, nonthrowing dependencies
             /// in source order. Mapping cells own their label and zeroed payload.
             fn dimensionMap(self:*Query,p:*const B.Plan,label_id:u16,join_column:u16,keys:S.IntegerBounds,
@@ -2308,6 +2398,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const buckets=try self.refs(slots);@memset(self.work.refs[buckets..][0..slots],absent);
                 const dictionary=try self.refs(capacity);var group_ids:usize=0;
                 var ctx=self.context(null);var fact:[config.columns]V.Cell=undefined;ctx.row=null;ctx.tuple[0]=&fact;
+                var tuple_rows: TupleRows = undefined;
                 const label=self.pool.nodes[label_id];
                 for(0..key_span) |index| {
                     try self.session.checkpoint();self.work.stream_stats.dimension_group_keys+=1;
@@ -2320,7 +2411,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.stream_stats.dimension_probes+=1;
                         const dimension=&self.tables[source.table.?];
                         const visible=S.lookupVersionAt(dimension,key,self.snap) orelse {matched=false;break;};
-                        ctx.tuple[stage]=&dimension.versions[visible].cells;
+                        ctx.tuple[stage]=S.borrowVersionRow(dimension,visible,&tuple_rows[stage]);
                         if(source.on!=none and (try E.truth(&ctx,source.on))!=true) {matched=false;break;}
                     }
                     if(!matched) continue;
@@ -2353,12 +2444,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if(p.sources[1].probe==none) return null;
                 const join_key=self.pool.nodes[p.sources[1].probe];
                 if(join_key.kind!=.column or join_key.level!=0 or join_key.relation!=0 or !value_module.integral(join_key.ty)) return null;
-                for(p.sources[1..p.source_count],1..) |source,stage| {
-                    if(source.join!=.inner or source.table==null or source.probe==none or
-                        !self.factorOperand(source.probe,join_key.column) or !self.earlyAvailable(source.probe,stage-1) or
-                        !self.factorOn(source.on,join_key.column) or !self.earlyAvailable(source.on,stage)) return null;
-                    if(self.tables[source.table.?].primary_column==null) return null;
-                }
+                if (!self.dimensionChain(p, join_key.column)) return null;
                 const label=self.pool.nodes[p.keys[0]];
                 if(label.kind!=.column or label.level!=0 or label.relation==0 or label.relation>=p.source_count or
                     !S.summaryKeyType(self.tables[p.sources[label.relation].table.?].columns[label.column].data_type)) return null;
@@ -2404,7 +2490,8 @@ pub fn Exec(comptime config: types.Config) type {
                                 const value=@as(i128,table.scan_values[@as(usize,item.column)*table.rows.len+slot])-domain.base;
                                 if(value<0 or value>=domain.span) return error.WorkspaceCapacity;
                                 const position:usize=@intCast(value);const mask=@as(u64,1)<<@as(u6,@intCast(position%64));
-                                const word=&seen[domain.offset+position/64];if(word.*&mask!=0) continue;word.*|=mask;
+                                seen[domain.offset+position/64] |= mask;
+                                continue;
                             }
                             channel.count+=1;
                             if(item.kind==.sum_integer or item.kind==.sum_wide) channel.total+=table.scan_values[@as(usize,item.column)*table.rows.len+slot];
@@ -2419,8 +2506,22 @@ pub fn Exec(comptime config: types.Config) type {
                 for(self.work.refs[map.dictionary..][0..map.groups]) |record| {
                     const bytes:[*]u8=@ptrCast(&self.work.cells[record+1+p.agg_count]);if(factorRows(bytes).*==0) continue;
                     var values:[config.columns]Accumulator=undefined;
-                    for(factorStates(bytes,p.agg_count),transitions[0..p.agg_count],values[0..p.agg_count]) |channel,item,*value|
+                    const seen = self.distinctWords(record + @as(u32, @intCast(record_base)), distinct.words);
+                    for (factorStates(bytes, p.agg_count), transitions[0..p.agg_count], p.aggs[0..p.agg_count], distinct.domains[0..p.agg_count], values[0..p.agg_count]) |channel, item, agg, domain, *value| {
                         value.*=.{.count=channel.count,.wide=channel.total,.integer=if(item.kind==.sum_integer) @intCast(channel.total) else 0};
+                        if (agg.distinct) {
+                            // Membership is idempotent. Counting set bits here removes
+                            // the duplicate branch and count update from the fact scan.
+                            const words = seen[domain.offset..][0..domain.words];
+                            var start_word: usize = 0;
+                            while (start_word < words.len) {
+                                try self.session.checkpoint();
+                                const end_word = start_word + @min(words.len - start_word, 256);
+                                for (words[start_word..end_word]) |word| value.count += @popCount(word);
+                                start_word = end_word;
+                            }
+                        }
+                    }
                     try self.projectGroup(p,record,values[0..p.agg_count],outer,&out);groups+=1;
                 }
                 const result=try self.finish(p,out);
@@ -2431,85 +2532,265 @@ pub fn Exec(comptime config: types.Config) type {
                 return result;
             }
 
-            /// Collapse a unique dimension to compact group IDs once, then fold
-            /// fact measures by (group ID, integral fact key). Cells and text
-            /// hashing are outside the fact loop. No persistent derived index.
-            noinline fn dimensionGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table) Error!?List {
-                if(outer!=null or p.correlated or p.source_count!=2 or p.key_count!=2 or p.agg_count==0 or p.where!=none or
+            const DimensionGroupMode = enum { numeric, date_format, rollup };
+            const NarrowFactorAggregate = struct { total: i64 = 0, count: i64 = 0 };
+            const DimensionTransitions = struct {
+                join_column: u16,
+                fact_key_id: u16,
+                fact_key: ast.Node,
+                dimension_position: usize,
+                channels: []const Transition,
+                aggregate_channels: []const u16,
+            };
+            const DimensionScan = struct {
+                mapping: u32,
+                join_low: i64,
+                fact_low: i64,
+                fact_span: usize,
+                stride: usize,
+                join_nonnull: bool,
+                fact_nonnull: bool,
+                channel_nonnull: []const bool,
+            };
+
+            fn sumPrefixesFitI64(table: *const S.Table, column: u16) bool {
+                if (table.summary.columns[column].nonnull == 0) return true;
+                const bounds = table.integer_bounds[column];
+                if (!bounds.known) return false;
+                const rows: i128 = table.summary.rows;
+                // Every subset fits, including scan prefixes and disjoint
+                // rollup merges. The observed final sum alone is insufficient.
+                return rows * @as(i128, @min(bounds.low, 0)) >= -9223372036854775808 and
+                    rows * @as(i128, @max(bounds.high, 0)) <= 9223372036854775807;
+            }
+
+            /// Keep one state per direct transition. Wide SUM and AVG over
+            /// the same input share count and sum, with their own finalizers.
+            /// Checked int8 SUM keeps its distinct transition kind.
+            fn shareDimensionTransitions(transitions: []Transition, aggregate_channels: []u16) usize {
+                var count: usize = 0;
+                for (0..transitions.len) |index| {
+                    const transition = transitions[index];
+                    var channel: usize = 0;
+                    while (channel < count) : (channel += 1) {
+                        const candidate = transitions[channel];
+                        if (candidate.kind == transition.kind and candidate.column == transition.column) break;
+                    }
+                    if (channel == count) {
+                        transitions[count] = transition;
+                        count += 1;
+                    }
+                    aggregate_channels[index] = @intCast(channel);
+                }
+                return count;
+            }
+
+            fn appendDimensionGroup(self: *Query, p: *const B.Plan, records: *List, dimension_position: usize,
+                label: V.Cell, fact_value: V.Cell, record: u32, bucket: usize) Error!void {
+                const at = try self.cells(4 + p.agg_count);
+                self.work.cells[at + dimension_position] = label;
+                self.work.cells[at + 1 - dimension_position] = fact_value;
+                self.work.cells[at + 2 + p.agg_count] = .{ .integer = record };
+                self.work.cells[at + 3 + p.agg_count] = .{ .integer = @intCast(bucket) };
+                try self.push(records, at);
+            }
+
+            noinline fn scanDimensionGroups(self: *Query, comptime format_dates: bool, comptime Aggregate: type,
+                comptime all_nonnull: bool, table: *const S.Table, input: *const DimensionTransitions, scan: DimensionScan,
+                formatted_keys: *DateKeys) Error!void {
+                const join_column = input.join_column;
+                const fact_key = &input.fact_key;
+                const dense = table.summary.rows == @as(i64, @intCast(table.scan_high));
+                var date_values: [config.columns]V.Cell = undefined;
+                var date_context = self.context(null);
+                var start: usize = 0;
+                while (start < table.scan_high) : (start += 64) {
+                    const count = @min(@as(usize, 64), table.scan_high - start);
+                    try self.session.checkpoints(count);
+                    var selected = liveMask(table, start, count, dense);
+                    self.work.stream_stats.rows += @popCount(selected);
+                    while (selected != 0) {
+                        const bit = @ctz(selected);
+                        selected &= selected - 1;
+                        const slot = start + bit;
+                        const flags = if (all_nonnull) 0 else table.scan_nonnull[slot];
+                        if (!all_nonnull and !scan.join_nonnull and flags & (@as(u64, 1) << @intCast(join_column)) == 0) continue;
+                        const key: usize = @intCast(@as(i128, table.scan_values[@as(usize, join_column) * table.rows.len + slot]) - scan.join_low);
+                        const record = self.work.refs[scan.mapping + key];
+                        if (record == absent) continue;
+                        const partial: [*]u8 = @ptrCast(&self.work.cells[record + 1]);
+                        const has_key = all_nonnull or scan.fact_nonnull or flags & (@as(u64, 1) << @intCast(fact_key.column)) != 0;
+                        const scalar = if (has_key) table.scan_values[@as(usize, fact_key.column) * table.rows.len + slot] else 0;
+                        const fact_index: usize = if (has_key) @intCast(@as(i128, scalar) - scan.fact_low) else scan.fact_span - 1;
+                        const value = if (format_dates) blk: {
+                            const cached = self.work.refs[formatted_keys.days + fact_index];
+                            if (cached != absent) break :blk @as(usize, cached);
+                            break :blk try self.dateGroupIndex(formatted_keys, fact_index,
+                                if (has_key) .{ .date = @intCast(scalar) } else .null_value, input.fact_key_id, fact_key, &date_context, &date_values);
+                        } else fact_index;
+                        const state = partial + value * scan.stride;
+                        factorRows(state).* += 1;
+                        self.work.stream_stats.dimension_group_rows += 1;
+                        for (input.channels, factorStatesFor(Aggregate, state, input.channels.len), 0..) |item, *channel, index| {
+                            if (!all_nonnull and !scan.channel_nonnull[index] and flags & (@as(u64, 1) << @intCast(item.column)) == 0) continue;
+                            // Every channel counts exactly the group's rows when its inputs are present.
+                            if (!all_nonnull) channel.count += 1;
+                            if (item.kind == .sum_integer or item.kind == .sum_wide) channel.total += table.scan_values[@as(usize, item.column) * table.rows.len + slot];
+                        }
+                    }
+                }
+            }
+
+            /// Map unique joins to dimension group IDs once and scan compact
+            /// fact columns. The mode selects key encoding and output levels.
+            noinline fn dimensionGroup(self:*Query,comptime mode:DimensionGroupMode,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table) Error!?List {
+                const format_dates = mode == .date_format;
+                const rollup = mode == .rollup;
+                if(outer!=null or p.correlated or p.source_count<2 or p.key_count!=2 or p.agg_count==0 or p.where!=none or
                     !self.committed_only or !table.summary.valid or table.summary.rows<=0 or table.summary.csn>self.snap.csn or table.scan_high!=table.row_high) return null;
                 if(comptime config.numeric_digits<39) return null;
+                if (!format_dates and p.source_count != 2) return null;
                 const source=p.sources[1];
-                if(source.join!=.inner or source.table==null or source.probe==none) return null;
-                const dimension=&self.tables[source.table.?];if(dimension.primary_column==null) return null;
+                if(source.probe==none) return null;
                 const join_key=self.pool.nodes[source.probe];
-                if(join_key.kind!=.column or join_key.level!=0 or join_key.relation!=0 or !value_module.integral(join_key.ty) or !self.factorOn(source.on,join_key.column)) return null;
+                if(join_key.kind!=.column or join_key.level!=0 or join_key.relation!=0 or !value_module.integral(join_key.ty)) return null;
                 const fact_position:usize=if(self.pool.nodes[p.keys[0]].relation==0) 0 else 1;
                 const dimension_position=1-fact_position;
-                const fact_key=self.pool.nodes[p.keys[fact_position]];const label=self.pool.nodes[p.keys[dimension_position]];
-                if(fact_key.kind!=.column or fact_key.level!=0 or fact_key.relation!=0 or !value_module.integral(fact_key.ty) or
-                    label.kind!=.column or label.level!=0 or label.relation!=1 or !S.summaryKeyType(dimension.columns[label.column].data_type)) return null;
+                if (rollup and dimension_position != 0) return null;
+                const fact_key_id = p.keys[fact_position];
+                const fact_key = if (format_dates) (self.dateKeyMemoColumn(fact_key_id) orelse return null).* else self.pool.nodes[fact_key_id];
+                const label=self.pool.nodes[p.keys[dimension_position]];
+                if (!self.dimensionChain(p, join_key.column)) return null;
+                if(fact_key.kind!=.column or fact_key.level!=0 or fact_key.relation!=0 or (!format_dates and !value_module.integral(fact_key.ty)) or
+                    label.kind!=.column or label.level!=0 or label.relation==0 or label.relation>=p.source_count or
+                    !S.summaryKeyType(self.tables[p.sources[label.relation].table.?].columns[label.column].data_type)) return null;
                 var transitions:[config.columns]Transition=undefined;
                 if(!self.prepareTransitions(p,transitions[0..p.agg_count])) return null;
-                for(transitions[0..p.agg_count]) |item| if(item.kind==.sum_integer and table.summary.columns[item.column].nonnull!=0) {
-                    const amounts=table.integer_bounds[item.column];if(!amounts.known) return null;const n=@as(i128,table.summary.rows);
-                    if(n*@as(i128,@min(amounts.low,0)) < -9223372036854775808 or n*@as(i128,@max(amounts.high,0))>9223372036854775807) return null;
+                var aggregate_channels: [config.columns]u16 = undefined;
+                const channel_count = shareDimensionTransitions(transitions[0..p.agg_count], aggregate_channels[0..p.agg_count]);
+                const channels = transitions[0..channel_count];
+                var narrow = true;
+                for (channels) |item| {
+                    if (item.kind != .sum_integer and item.kind != .sum_wide) continue;
+                    if (sumPrefixesFitI64(table, item.column)) continue;
+                    // Preserve the canonical checked bigint transition.
+                    if (item.kind == .sum_integer) return null;
+                    narrow = false;
+                }
+                const input: DimensionTransitions = .{
+                    .join_column = join_key.column, .fact_key_id = fact_key_id, .fact_key = fact_key,
+                    .dimension_position = dimension_position, .channels = channels, .aggregate_channels = aggregate_channels[0..p.agg_count],
                 };
-                const keys=table.integer_bounds[join_key.column];const facts=table.integer_bounds[fact_key.column];
+                if (narrow) return self.dimensionGroupStates(mode, NarrowFactorAggregate, p, outer, table, &input);
+                return self.dimensionGroupStates(mode, FactorAggregate, p, outer, table, &input);
+            }
+
+            noinline fn dimensionGroupStates(self: *Query, comptime mode: DimensionGroupMode, comptime Aggregate: type,
+                p: *const B.Plan, outer: ?*const E.Context, table: *const S.Table, input: *const DimensionTransitions) Error!?List {
+                const format_dates = mode == .date_format;
+                const rollup = mode == .rollup;
+                const channel_count = input.channels.len;
+                const join_column = input.join_column;
+                const fact_key = &input.fact_key;
+                const dimension_position = input.dimension_position;
+                const keys=table.integer_bounds[join_column];const facts=table.integer_bounds[fact_key.column];
                 if(!keys.known or !facts.known) return null;
                 const key_span128=@as(i128,keys.high)-keys.low+1;const fact_span128=@as(i128,facts.high)-facts.low+2;
                 const available_refs=self.work.ref_high-self.work.ref_low;const available_cells=self.work.cell_high-self.work.cell_low;
                 if(key_span128<=0 or key_span128>=available_refs or fact_span128<=1 or fact_span128>=available_cells) return null;
                 const key_span:usize=@intCast(key_span128);const fact_span:usize=@intCast(fact_span128);
-                const stride=factor_header+p.agg_count*@sizeOf(FactorAggregate);
-                const state_bytes_product=@mulWithOverflow(fact_span,stride);if(state_bytes_product[1]!=0) return null;
+                const stride=factorHeader(Aggregate)+channel_count*@sizeOf(Aggregate);
+                const buckets_per_label=fact_span+@intFromBool(rollup);
+                const state_bytes_product=@mulWithOverflow(buckets_per_label,stride);if(state_bytes_product[1]!=0) return null;
                 const state_bytes=state_bytes_product[0];
                 const rounded=@addWithOverflow(state_bytes,@sizeOf(V.Cell)-1);if(rounded[1]!=0) return null;
                 const state_cells=rounded[0]/@sizeOf(V.Cell);
                 const output_width=4+@as(usize,p.agg_count)+p.width;
-                const output_cells=@mulWithOverflow(fact_span,output_width);if(output_cells[1]!=0) return null;
+                const output_cells=@mulWithOverflow(buckets_per_label,output_width);if(output_cells[1]!=0) return null;
                 const group_cells=@addWithOverflow(1+state_cells,output_cells[0]);if(group_cells[1]!=0) return null;
-                const output_refs=@mulWithOverflow(fact_span,@as(usize,4));if(output_refs[1]!=0) return null;
+                const output_refs=@mulWithOverflow(buckets_per_label,@as(usize,4));if(output_refs[1]!=0) return null;
                 const group_refs=@addWithOverflow(output_refs[0],@as(usize,5));if(group_refs[1]!=0) return null;
-                const capacity=@min(key_span,@min(available_cells/group_cells[0],(available_refs-key_span)/group_refs[0]));
+                // Reserve bounded day-to-key and key-to-value dictionaries.
+                // ROLLUP reserves its grand total outside the dimension map.
+                var date_slots: usize = 0;
+                if (format_dates) {
+                    if (fact_span > available_refs / 8) return null;
+                    date_slots = 2;
+                    while (date_slots < fact_span * 2) date_slots *= 2;
+                }
+                const fixed_refs: usize = switch (mode) { .numeric => 0, .date_format => date_slots + fact_span, .rollup => 4 };
+                const fixed_cells = switch (mode) { .numeric => 0, .date_format => fact_span, .rollup => output_width };
+                if (fixed_refs > available_refs - key_span or fixed_cells > available_cells) return null;
+                const capacity=@min(key_span,@min((available_cells-fixed_cells)/group_cells[0],(available_refs-key_span-fixed_refs)/group_refs[0]));
                 if(capacity==0) return null;
                 const cell_start=self.work.cell_low;const ref_start=self.work.ref_low;
-                const map=try self.dimensionMap(p,p.keys[dimension_position],join_key.column,keys,key_span,capacity,1+state_cells);
-                const key_nonnull=table.summary.columns[join_key.column].nonnull==table.summary.rows;
-                const fact_nonnull=table.summary.columns[fact_key.column].nonnull==table.summary.rows;
-                const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));
-                var nonnull:[config.columns]bool=undefined;
-                for(transitions[0..p.agg_count],0..) |item,index| nonnull[index]=item.kind==.count_star or table.summary.columns[item.column].nonnull==table.summary.rows;
-                var start:usize=0;
-                while(start<table.scan_high):(start+=64) {
-                    const count=@min(@as(usize,64),table.scan_high-start);try self.session.checkpoints(count);
-                    var selected=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(selected);
-                    while(selected!=0) {
-                        const bit=@ctz(selected);selected&=selected-1;const slot=start+bit;const flags=table.scan_nonnull[slot];
-                        if(!key_nonnull and flags&(@as(u64,1)<<@intCast(join_key.column))==0) continue;
-                        const key:usize=@intCast(@as(i128,table.scan_values[@as(usize,join_key.column)*table.rows.len+slot])-keys.low);
-                        const record=self.work.refs[map.mapping+key];if(record==absent) continue;
-                        const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);
-                        const value:usize=if(!fact_nonnull and flags&(@as(u64,1)<<@intCast(fact_key.column))==0) fact_span-1 else
-                            @intCast(@as(i128,table.scan_values[@as(usize,fact_key.column)*table.rows.len+slot])-facts.low);
-                        const state=partial+value*stride;factorRows(state).*+=1;self.work.stream_stats.dimension_group_rows+=1;
-                        for(transitions[0..p.agg_count],factorStates(state,p.agg_count),0..) |item,*channel,index| {
-                            if(item.kind!=.count_star and !nonnull[index] and flags&(@as(u64,1)<<@intCast(item.column))==0) continue;
-                            channel.count+=1;
-                            if(item.kind==.sum_integer or item.kind==.sum_wide) channel.total+=table.scan_values[@as(usize,item.column)*table.rows.len+slot];
-                        }
-                    }
+                const map=try self.dimensionMap(p,p.keys[dimension_position],join_column,keys,key_span,capacity,1+state_cells);
+                var formatted_keys: DateKeys = undefined;
+                if (format_dates) {
+                    formatted_keys = .{ .days = try self.refs(fact_span), .values = try self.cells(fact_span), .buckets = try self.refs(date_slots), .slots = date_slots };
+                    @memset(self.work.refs[formatted_keys.days..][0..fact_span], absent);
+                    @memset(self.work.refs[formatted_keys.buckets..][0..date_slots], absent);
+                }
+                const join_nonnull = table.summary.columns[join_column].nonnull == table.summary.rows;
+                const fact_nonnull = table.summary.columns[fact_key.column].nonnull == table.summary.rows;
+                var all_nonnull = join_nonnull and fact_nonnull;
+                var nonnull: [config.columns]bool = undefined;
+                for (input.channels, nonnull[0..channel_count]) |item, *present| {
+                    present.* = item.kind == .count_star or table.summary.columns[item.column].nonnull == table.summary.rows;
+                    all_nonnull = all_nonnull and present.*;
+                }
+                // The same committed snapshot guards the summary and compact
+                // columns. Row holes still require the ordinary live mask.
+                const scan: DimensionScan = .{
+                    .mapping = map.mapping, .join_low = keys.low, .fact_low = facts.low, .fact_span = fact_span, .stride = stride,
+                    .join_nonnull = join_nonnull, .fact_nonnull = fact_nonnull, .channel_nonnull = nonnull[0..channel_count],
+                };
+                if (all_nonnull) {
+                    try self.scanDimensionGroups(format_dates, Aggregate, true, table, input, scan, &formatted_keys);
+                } else {
+                    try self.scanDimensionGroups(format_dates, Aggregate, false, table, input, scan, &formatted_keys);
                 }
                 var records:List=.{};
+                const bucket_count = if (format_dates) formatted_keys.count else fact_span;
+                var grand:[if(rollup) config.columns else 0]Aggregate=@splat(.{});
+                var grand_rows: i64 = 0;
+                // Use separate bucket tags for the two synthetic levels.
+                if (rollup) try self.appendDimensionGroup(p, &records, dimension_position, .null_value, .null_value, 0, fact_span + 1);
                 for(self.work.refs[map.dictionary..][0..map.groups]) |record| {
                     const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);
-                    for(0..fact_span) |index| {
-                        const bucket=if(index==0) fact_span-1 else index-1;
+                    if(rollup) {
+                        const subtotal=partial+fact_span*stride;
+                        const subtotal_channels=factorStatesFor(Aggregate,subtotal,channel_count);
+                        var leaves:usize=0;
+                        for(0..fact_span) |bucket| {
+                            try self.session.checkpoint();
+                            const leaf=partial+bucket*stride;
+                            const leaf_rows = factorRows(leaf).*;
+                            if (leaf_rows == 0) continue;
+                            if (all_nonnull) factorRows(subtotal).* += leaf_rows;
+                            for(subtotal_channels,factorStatesFor(Aggregate,leaf,channel_count)) |*channel,delta| {
+                                if (!all_nonnull) channel.count += delta.count;
+                                channel.total+=delta.total;
+                            }
+                            leaves+=1;
+                        }
+                        if(leaves==0) continue;
+                        if (all_nonnull) grand_rows += factorRows(subtotal).*;
+                        for(grand[0..channel_count],subtotal_channels) |*channel,delta| {
+                            if (!all_nonnull) channel.count += delta.count;
+                            channel.total+=delta.total;
+                        }
+                        self.work.stream_stats.rollup_folded_leaves+=leaves;
+                        // Stable key sorting retains the prefix order when
+                        // rolled and data NULLs have equal displayed keys.
+                        try self.appendDimensionGroup(p, &records, dimension_position, self.work.cells[record], .null_value, record, fact_span);
+                    }
+                    for(0..bucket_count) |index| {
+                        const bucket=if (format_dates) index else if(index==0) fact_span-1 else index-1;
                         if(factorRows(partial+bucket*stride).*==0) continue;
-                        const at=try self.cells(4+p.agg_count);
-                        self.work.cells[at+dimension_position]=self.work.cells[record];
-                        self.work.cells[at+fact_position]=if(bucket==fact_span-1) .null_value else .{.integer=@intCast(@as(i128,facts.low)+bucket)};
-                        self.work.cells[at+2+p.agg_count]=.{.integer=record};self.work.cells[at+3+p.agg_count]=.{.integer=@intCast(bucket)};
-                        try self.push(&records,at);
+                        const fact_value: V.Cell = if (format_dates) self.work.cells[formatted_keys.values+bucket] else
+                            if (bucket == fact_span - 1) .null_value else .{ .integer = @intCast(@as(i128, facts.low) + bucket) };
+                        try self.appendDimensionGroup(p, &records, dimension_position, self.work.cells[record], fact_value, record, bucket);
                     }
                 }
                 if(records.count>1) {
@@ -2518,18 +2799,43 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 var out:List=.{};
                 for(self.handles(records)) |at| {
-                    const record:usize=@intCast(self.work.cells[at+2+p.agg_count].integer);const bucket:usize=@intCast(self.work.cells[at+3+p.agg_count].integer);
-                    const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);var values:[config.columns]Accumulator=undefined;
-                    for(factorStates(partial+bucket*stride,p.agg_count),transitions[0..p.agg_count],values[0..p.agg_count]) |channel,item,*value|
-                        value.*=.{.count=channel.count,.wide=channel.total,.integer=if(item.kind==.sum_integer) @intCast(channel.total) else 0};
-                    try self.projectGroup(p,at,values[0..p.agg_count],outer,&out);
+                    const record:u32=@intCast(self.work.cells[at+2+p.agg_count].integer);const bucket:usize=@intCast(self.work.cells[at+3+p.agg_count].integer);
+                    const mask:u64=if(!rollup or bucket<fact_span) 0 else if(bucket==fact_span) 1 else 3;
+                    const state: ?[*]u8 = if (rollup and mask == 3) null else
+                        @as([*]u8, @ptrCast(&self.work.cells[record + 1])) + bucket * stride;
+                    const channels = if (state) |bytes| factorStatesFor(Aggregate, bytes, channel_count) else grand[0..channel_count];
+                    const group_rows = if (state) |bytes| factorRows(bytes).* else grand_rows;
+                    var values:[config.columns]Accumulator=undefined;
+                    for (input.aggregate_channels, values[0..p.agg_count]) |channel_index, *value| {
+                        const channel = channels[channel_index];
+                        const item = input.channels[channel_index];
+                        value.* = .{ .count = if (all_nonnull) group_rows else channel.count, .wide = channel.total,
+                            .integer = if (item.kind == .sum_integer) @intCast(channel.total) else 0 };
+                    }
+                    try self.projectGroupMask(p,at,values[0..p.agg_count],outer,&out,mask);
                 }
                 const result=try self.finish(p,out);
                 self.work.stream_stats.dimension_group_plans+=1;self.work.stream_stats.dimension_group_ids+=map.groups;
+                self.work.stream_stats.dimension_group_channels += channel_count;
+                self.work.stream_stats.narrow_dimension_group_plans += @intFromBool(Aggregate == NarrowFactorAggregate);
+                self.work.stream_stats.nonnull_dimension_group_plans += @intFromBool(all_nonnull);
+                if (format_dates) self.work.stream_stats.dimension_date_group_plans += 1;
+                if(rollup) self.work.stream_stats.dimension_rollup_plans+=1;
                 self.work.stream_stats.groups+=records.count;
                 self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,self.work.cell_low-cell_start);
                 self.work.stream_stats.scratch_refs=@max(self.work.stream_stats.scratch_refs,self.work.ref_low-ref_start);
                 return result;
+            }
+
+            fn tryDimensionGroup(self: *Query, comptime mode: DimensionGroupMode, p: *const B.Plan, outer: ?*const E.Context, table: *const S.Table) Error!?List {
+                const at = self.mark();
+                const stats = self.work.stream_stats;
+                return self.dimensionGroup(mode, p, outer, table) catch |err| {
+                    if (err != error.WorkspaceCapacity) return err;
+                    self.release(at);
+                    self.work.stream_stats = stats;
+                    return null;
+                };
             }
 
             /// Aggregate states and projections remain private until the
@@ -2544,11 +2850,8 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 if(comptime config.dimension_group_ids and S.compact_enabled) {
-                    const at=self.mark();const stats=self.work.stream_stats;
-                    if(self.dimensionGroup(p,outer,table)) |result| {if(result) |rows| return rows;} else |err| {
-                        if(err!=error.WorkspaceCapacity) return err;
-                        self.release(at);self.work.stream_stats=stats;
-                    }
+                    if (try self.tryDimensionGroup(.numeric, p, outer, table)) |rows| return rows;
+                    if (try self.tryDimensionGroup(.date_format, p, outer, table)) |rows| return rows;
                 }
                 if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(try self.factorGroup(p,outer,table)) |rows| return rows;
                 const distinct=self.distinctLayout(p) orelse return error.WorkspaceCapacity;
@@ -2907,6 +3210,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// DISTINCT runs collapsed, and the fold runs in order.
             fn collectAggregate(self: *Query, p: *const B.Plan, agg: *const B.Agg, tuples: Tuples, order: u32, first: usize, end: usize, outer: ?*const E.Context) Error!V.Cell {
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 const at = self.mark();
                 defer self.release(at);
                 var members: [28]u16 = undefined;
@@ -2927,14 +3231,14 @@ pub fn Exec(comptime config: types.Config) type {
                 const key_base = if (ordered_set) 0 else layout.values;
                 var direct_values: [24]V.Cell = undefined;
                 if (ordered_set) {
-                    if (first < end) self.setTuple(p, &ctx, tuples, self.work.refs[order + first]);
+                    if (first < end) self.setTuple(p, &ctx, &tuple_rows, tuples, self.work.refs[order + first]);
                     for (members[0..direct], 0..) |id, index| direct_values[index] = try E.eval(&ctx, id);
                 }
                 const C = collect_module.Collect(config);
                 const hypothetical = @intFromEnum(agg.kind) >= @intFromEnum(ast.Agg.hypothetical_rank);
                 var rows: List = .{ .start = @intCast(self.work.ref_low) };
                 for (first..end) |position| {
-                    self.setTuple(p, &ctx, tuples, self.work.refs[order + position]);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, self.work.refs[order + position]);
                     if (agg.filter != none and (try E.truth(&ctx, agg.filter)) != true) continue;
                     const slot = try self.cells(width);
                     for (members[direct..][0..width], 0..) |id, column| self.work.cells[slot + column] = try E.eval(&ctx, id);
@@ -3031,12 +3335,13 @@ pub fn Exec(comptime config: types.Config) type {
             fn aggregate(self: *Query, p: *const B.Plan, agg: *const B.Agg, tuples: Tuples, order: u32, first: usize, end: usize, outer: ?*const E.Context) Error!V.Cell {
                 if (ast.collectingAggregate(agg.kind) or self.inputNode(agg.arg)) return self.collectAggregate(p, agg, tuples, order, first, end, outer);
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 var acc: Accumulator = .{};
                 const at = self.mark();
                 defer self.release(at);
                 var values: List = .{ .start = @intCast(self.work.ref_low) };
                 for (first..end) |position| {
-                    self.setTuple(p, &ctx, tuples, self.work.refs[order + position]);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, self.work.refs[order + position]);
                     if (agg.filter != none and (try E.truth(&ctx, agg.filter)) != true) continue;
                     if (agg.kind == .count_star) {
                         acc.count += 1;
@@ -3182,6 +3487,26 @@ pub fn Exec(comptime config: types.Config) type {
                 }
             }
 
+            fn rollupCanFold(self: *const Query, p: *const B.Plan) bool {
+                if (p.key_count < 2 or p.where != none or !self.prefixJoinsSafe(p) or !repeatablePool(self.pool)) return false;
+                for (p.keys[0..p.key_count]) |id| {
+                    const key = self.pool.nodes[id];
+                    if (key.kind != .column or key.level != 0) return false;
+                    const table = &self.tables[p.sources[key.relation].table.?];
+                    if (!table.columns[key.column].not_null) return false;
+                }
+                for (p.aggs[0..p.agg_count], 0..) |agg, index| {
+                    if (!p.aggregate_required[index]) continue;
+                    if (agg.distinct or agg.filter != none) return false;
+                    if (agg.kind == .count_star) continue;
+                    if (agg.kind != .count and !(value_module.integral(agg.arg_ty) and
+                        (agg.kind == .avg or (agg.kind == .sum and agg.ty != .int8)))) return false;
+                    const arg = self.pool.nodes[agg.arg];
+                    if (arg.kind != .column or arg.level != 0) return false;
+                }
+                return true;
+            }
+
             /// One input evaluation, independent exact aggregate state at every
             /// prefix. The level tag separates real NULL keys from rolled NULLs.
             fn groupingRollup(self:*Query,p:*const B.Plan,outer:?*const E.Context) Error!List {
@@ -3203,13 +3528,17 @@ pub fn Exec(comptime config: types.Config) type {
                 const buckets=try self.refs(slots);@memset(self.work.refs[buckets..][0..slots],absent);
                 const tickets=try self.refs(capacity);var groups:usize=0;
                 var keys:[config.columns]V.Cell=@splat(.null_value);
-                _=try self.rollupRecord(p,keys[0..p.key_count],0,buckets,slots,tickets,&groups,capacity,record_cells,ordinary_cells,&distinct);
+                const total = try self.rollupRecord(p,keys[0..p.key_count],0,buckets,slots,tickets,&groups,capacity,record_cells,ordinary_cells,&distinct);
+                // PK joins admit at most one tuple per fact row. Exact wide
+                // sums and counts of these rows can be added in any order.
+                const fold = streamed and self.rollupCanFold(p);
+                const first_prefix = if (fold) p.key_count else 0;
                 var ctx=self.context(outer);var cursor:StreamCursor=.{};var row_index:usize=0;
                 const early=streamed and p.source_count>1 and self.earlyAvailable(p.where,p.source_count-1) and self.prefixJoinsSafe(p);
                 if(streamed) self.prepareStreamCursor(p,&cursor,early);
                 while(true) {
                     if(streamed) {if(!try self.nextStreamTuple(p,&ctx,&cursor,early)) break;}
-                    else {if(row_index==tuples.count) break;try self.session.checkpoint();self.setTuple(p,&ctx,tuples,row_index);row_index+=1;}
+                    else {if(row_index==tuples.count) break;try self.session.checkpoint();self.setTuple(p,&ctx,&cursor.version_rows,tuples,row_index);row_index+=1;}
                     for(p.keys[0..p.key_count],0..) |id,index| keys[index]=try E.eval(&ctx,id);
                     var values:[config.columns]V.Cell=undefined;var allowed:[config.columns]bool=@splat(false);
                     for(p.aggs[0..p.agg_count],0..) |agg,index| {
@@ -3218,7 +3547,7 @@ pub fn Exec(comptime config: types.Config) type {
                         if(agg.kind==.count_star){allowed[index]=true;continue;}
                         values[index]=try E.eval(&ctx,agg.arg);allowed[index]=values[index]!=.null_value;
                     }
-                    for(0..p.key_count+1) |prefix| {
+                    for(first_prefix..p.key_count+1) |prefix| {
                         const at=try self.rollupRecord(p,keys[0..p.key_count],prefix,buckets,slots,tickets,&groups,capacity,record_cells,ordinary_cells,&distinct);
                         const states=self.accumulators(at+@as(u32,@intCast(p.key_count+p.agg_count+1)),p.agg_count);
                         const seen=self.distinctWords(at+@as(u32,@intCast(ordinary_cells)),distinct.words);
@@ -3234,6 +3563,30 @@ pub fn Exec(comptime config: types.Config) type {
                             try self.accumulate(&agg,state,&values[index]);
                         }
                     }
+                }
+                if (fold) {
+                    // Derive subtotals once per leaf (the first ticket is the
+                    // grand total). Reusing the same records keeps the existing
+                    // group memory bound. Non-null leaf keys distinguish levels.
+                    const leaves = groups - 1;
+                    const state_offset: u32 = @intCast(p.key_count + p.agg_count + 1);
+                    for (self.work.refs[tickets + 1..][0..leaves]) |leaf| {
+                        const leaf_keys = self.work.cells[leaf..][0..p.key_count];
+                        const input = self.accumulators(leaf + state_offset, p.agg_count);
+                        for (0..p.key_count) |prefix| {
+                            const parent = if (prefix == 0) total else try self.rollupRecord(
+                                p, leaf_keys, prefix, buckets, slots, tickets, &groups,
+                                capacity, record_cells, ordinary_cells, &distinct,
+                            );
+                            const states = self.accumulators(parent + state_offset, p.agg_count);
+                            for (states, input) |*state, *delta| {
+                                try self.session.checkpoint();
+                                state.count += delta.count;
+                                state.wide += delta.wide;
+                            }
+                        }
+                    }
+                    self.work.stream_stats.rollup_folded_leaves += leaves;
                 }
                 if(groups>1) {
                     const scratch=try self.refs(groups);const sorter:GroupSorter=.{.query=self,.width=p.key_count};
@@ -3333,9 +3686,10 @@ pub fn Exec(comptime config: types.Config) type {
                     if (mask == 0) _ = try self.groupingSetRecord(p, keys[0..p.key_count], set, 0, buckets, slots, tickets, &groups, capacity, record_cells, ordinary_cells, &distinct);
                 }
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 for (0..tuples.count) |row_index| {
                     try self.session.checkpoint();
-                    self.setTuple(p, &ctx, tuples, row_index);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, row_index);
                     for (p.keys[0..p.key_count], 0..) |id, index| keys[index] = try E.eval(&ctx, id);
                     var values: [config.columns]V.Cell = undefined;
                     var allowed: [config.columns]bool = @splat(false);
@@ -3802,7 +4156,12 @@ pub fn Exec(comptime config: types.Config) type {
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 if(p.window_count!=0) return self.windowCore(p,outer);
                 if (p.grouping_sets != none) return self.groupingSets(p, outer);
-                if(p.rollup) return self.groupingRollup(p,outer);
+                if(p.rollup) {
+                    if(comptime config.dimension_group_ids and S.compact_enabled) if(streamEligible(p) and self.repeatable() and !self.collectingPlan(p)) {
+                        if (try self.tryDimensionGroup(.rollup, p, outer, &self.tables[p.sources[0].table.?])) |rows| return rows;
+                    };
+                    return self.groupingRollup(p,outer);
+                }
                 if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
                     const at=self.mark();const stats=self.work.stream_stats;
                     if(self.nestedFactorGroup(p,outer)) |result| {if(result) |rows| return rows;} else |err| {
@@ -4302,6 +4661,7 @@ pub fn Exec(comptime config: types.Config) type {
             ctx: *E.Context,
             table: *const S.Table,
             query: *const B.Select,
+            row_scratch: *S.VersionRowScratch,
 
             pub fn order(self: *const Sorter, left: u32, right: u32) Error!i8 {
                 try self.ctx.session.checkpoint();
@@ -4309,13 +4669,13 @@ pub fn Exec(comptime config: types.Config) type {
                     const node = &self.ctx.pool.nodes[key.expr];
                     var av: V.Cell = undefined;
                     var bv: V.Cell = undefined;
-                    const a: *const V.Cell = if (node.kind == .column) &self.table.versions[left].cells[node.column] else blk: {
-                        self.ctx.row = &self.table.versions[left].cells;
+                    const a: *const V.Cell = if (node.kind == .column) S.borrowVersionCell(self.table, left, node.column, &av) else blk: {
+                        self.ctx.row = S.borrowVersionRow(self.table, left, self.row_scratch);
                         av = try E.eval(self.ctx, key.expr);
                         break :blk &av;
                     };
-                    const b: *const V.Cell = if (node.kind == .column) &self.table.versions[right].cells[node.column] else blk: {
-                        self.ctx.row = &self.table.versions[right].cells;
+                    const b: *const V.Cell = if (node.kind == .column) S.borrowVersionCell(self.table, right, node.column, &bv) else blk: {
+                        self.ctx.row = S.borrowVersionRow(self.table, right, self.row_scratch);
                         bv = try E.eval(self.ctx, key.expr);
                         break :blk &bv;
                     };
@@ -4387,7 +4747,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// cached ranks. The heap moves only slot IDs; one spare key slot is
         /// recycled on rejection/replacement. NULL placement and stable row-slot
         /// order match Sorter/StableSorter. Keep this stack frame off point reads.
-        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!usize {
+        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!usize {
             var entries: [integer_topk_capacity + 1]IntegerEntry = undefined;
             var keys: [config.columns]IntegerOrder = undefined;
             const current = committed_only and table.summary.valid and table.summary.csn <= snap.csn;
@@ -4406,7 +4766,7 @@ pub fn Exec(comptime config: types.Config) type {
             rows: for (0..table.row_high) |slot| {
                 try ctx.session.checkpoint();
                 const version = S.visibleAt(table, slot, snap) orelse continue;
-                if (!try keep(ctx, query.where, &table.versions[version].cells)) continue;
+                if (!try keep(ctx, query.where, S.borrowVersionRow(table, version, row_scratch))) continue;
                 const candidate: u32 = if (used < count) @intCast(used) else spare;
                 const entry = &entries[candidate];
                 entry.version = version;
@@ -4414,7 +4774,8 @@ pub fn Exec(comptime config: types.Config) type {
                 const full = used == count;
                 var relation: i8 = 0;
                 for (keys[0..query.order_count], 0..) |key, column| {
-                    const value = &table.versions[version].cells[key.column];
+                    var temporary: V.Cell = undefined;
+                    const value = S.borrowVersionCell(table, version, key.column, &temporary);
                     const is_null = !key.nonnull and value.* == .null_value;
                     var rank: u64 = if (is_null) 0 else @as(u64, @bitCast(value.integer)) ^ 0x8000000000000000;
                     if (!is_null and key.descending) rank = ~rank;
@@ -4478,7 +4839,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// density, regardless of physical layout. Probe in ORDER BY direction.
         /// A bounded failed speculation retries the ordinary scan, charging all
         /// work already done. Only repeatable plans may take this path.
-        noinline fn densePrimaryScan(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!?usize {
+        noinline fn densePrimaryScan(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!?usize {
             if (config.ordered_probe_rows == 0 or !committed_only or !table.summary.valid or table.summary.csn > snap.csn) return null;
             const column = table.primary_column orelse return null;
             const key = &ctx.pool.nodes[query.order[0].expr];
@@ -4502,7 +4863,7 @@ pub fn Exec(comptime config: types.Config) type {
                 probes += 1;stats.key_probes += 1;
                 const value: V.Cell = .{ .integer = @intCast(current) };
                 const version = S.lookupVersionAt(table, &value, snap) orelse { stats.key_fallbacks += 1; return null; };
-                if (!try keep(ctx, query.where, &table.versions[version].cells)) continue;
+                if (!try keep(ctx, query.where, S.borrowVersionRow(table, version, row_scratch))) continue;
                 indices[found] = version;found += 1;
                 if (found >= query.limit) break;
             }
@@ -4635,7 +4996,8 @@ pub fn Exec(comptime config: types.Config) type {
             const layout_reverse: ?bool = if (!locking and column_order and query.order_count != 0 and query.limit <= indices.len) layoutOrder(table, pool, query) else null;
             var ordered = layout_reverse != null;
             const top_k = !locking and column_order and query.order_count != 0 and query.limit <= indices.len and (query.limit < table.row_high / 2 or table.row_high > indices.len);
-            const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query };
+            var row_scratch: S.VersionRowScratch = undefined;
+            const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query, .row_scratch = &row_scratch };
             const stable: StableSorter = .{ .base = &sorter };
             if (query.limit != 0) switch (try candidates(&ctx, table, query.key, snap)) {
                 .empty => if (comptime observing) {
@@ -4644,7 +5006,7 @@ pub fn Exec(comptime config: types.Config) type {
                 .slot => |hit| {
                     if (comptime observing) observation.operation = .primary_lookup;
                     const version = hit.version;
-                    if (try keep(&ctx, query.where, &table.versions[version].cells)) {
+                    if (try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) {
                         indices[0] = version;
                         found = 1;
                     }
@@ -4658,7 +5020,7 @@ pub fn Exec(comptime config: types.Config) type {
                         try session.checkpoint();
                         const slot = if (reverse) table.row_high - 1 - offset else offset;
                         const version = S.visibleAt(table, slot, snap) orelse continue;
-                        if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
+                        if (!try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) continue;
                         if (found == indices.len) return error.WorkspaceCapacity;
                         indices[found] = version;
                         found += 1;
@@ -4667,7 +5029,7 @@ pub fn Exec(comptime config: types.Config) type {
                     break :scan;
                   }
                   if (!locking and column_order and query.order_count != 0 and query.limit <= indices.len) {
-                    if (try densePrimaryScan(&ctx, table, query, snap, indices, committed_only, stats)) |count| {
+                    if (try densePrimaryScan(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats)) |count| {
                         if (comptime observing) observation.operation = .primary_walk;
                         found = count;ordered = true;break :scan;
                     }
@@ -4678,11 +5040,11 @@ pub fn Exec(comptime config: types.Config) type {
                   };
                   if (top_k and query.limit <= integer_topk_capacity and integerOrder(pool, query)) {
                     if (comptime observing) observation.operation = .integer_top_k;
-                    found = try integerTopK(&ctx, table, query, snap, indices, committed_only, stats);
+                    found = try integerTopK(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats);
                   } else for (0..table.row_high) |slot| {
                     try session.checkpoint();
                     const version = S.visibleAt(table, slot, snap) orelse continue;
-                    if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
+                    if (!try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) continue;
                     if (top_k) {
                         try sort_module.offerTopK(indices[0..@intCast(query.limit)], &found, version, &stable);
                     } else {
@@ -4700,7 +5062,7 @@ pub fn Exec(comptime config: types.Config) type {
                 // erroring key fails even when one row (or none) is compared.
                 for (query.order[0..query.order_count]) |*key| if (!simple(pool, key.expr)) {
                     for (indices[0..found]) |version| {
-                        ctx.row = &table.versions[version].cells;
+                        ctx.row = S.borrowVersionRow(table, version, &row_scratch);
                         _ = try E.eval(&ctx, key.expr);
                     }
                 };
@@ -4720,7 +5082,7 @@ pub fn Exec(comptime config: types.Config) type {
                     if (kept >= query.limit) break;
                     const version = indices[position];
                     const newest = (try locker.lock(table_index, version)) orelse continue;
-                    if (newest != version and !try keep(&ctx, query.where, &table.versions[newest].cells)) continue;
+                    if (newest != version and !try keep(&ctx, query.where, S.borrowVersionRow(table, newest, &row_scratch))) continue;
                     indices[kept] = newest;
                     kept += 1;
                 }
@@ -4731,7 +5093,7 @@ pub fn Exec(comptime config: types.Config) type {
             if (!plain) {
                 // Validation pass: projections may fail; the result is untouched.
                 for (indices[0..rows]) |version| {
-                    ctx.row = &table.versions[version].cells;
+                    ctx.row = S.borrowVersionRow(table, version, &row_scratch);
                     for (query.targets[0..query.count]) |id| _ = try E.eval(&ctx, id);
                 }
             }
@@ -4748,7 +5110,7 @@ pub fn Exec(comptime config: types.Config) type {
             writeHeader(query, result);
             result.row_count = rows;
             for (0..rows) |row_index| {
-                const cells = &table.versions[indices[row_index]].cells;
+                const cells = S.borrowVersionRow(table, indices[row_index], &row_scratch);
                 ctx.row = cells;
                 for (query.targets[0..query.count], 0..) |id, column| {
                     const n = &pool.nodes[id];
@@ -4757,7 +5119,23 @@ pub fn Exec(comptime config: types.Config) type {
             }
         }
 
-        fn writeHeader(query: *const B.Select, result: anytype) void {
+        /// The binder proved a single integral primary-key equality and
+        /// direct output columns. A NULL key never matches.
+        pub fn selectPrimaryKey(table: *const S.Table, query: *const B.Select, columns: []const u16, key: *const V.Cell, snap: storage.Snapshot, result: anytype, session: *const value_module.Session) Error!void {
+            try session.checkpoint();
+            const version = if (key.* == .null_value) null else S.lookupVersionAt(table, key, snap);
+            if (version != null and result.rows.len == 0) return error.WorkspaceCapacity;
+            writeHeader(query, result);
+            if (version) |entry| {
+                var scratch: V.Cell = undefined;
+                for (columns, 0..) |column, index| {
+                    result.rows[0].cells[index] = S.borrowVersionCell(table, entry, column, &scratch).*;
+                }
+                result.row_count = 1;
+            }
+        }
+
+        pub fn writeHeader(query: *const B.Select, result: anytype) void {
             result.clear(0);
             result.command = .select;
             result.column_count = query.count;

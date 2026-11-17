@@ -287,20 +287,20 @@ pub fn Mvcc(comptime config: types.Config) type {
                 switch (entry.kind) {
                     .insert => {
                         const table = &db.tables[entry.table];
-                        S.summarize(table, &table.versions[entry.new].cells, true, csn);
+                        S.summarize(table, entry.new, true, csn);
                         S.scanPublish(table, entry.new, true);
                         table.versions[entry.new].xmin_csn = csn;
                     },
                     .update => {
                         const table = &db.tables[entry.table];
-                        S.summarizeUpdate(table, &table.versions[entry.old].cells, &table.versions[entry.new].cells, csn);
+                        S.summarizeUpdate(table, entry.old, entry.new, csn);
                         S.scanPublish(table, entry.new, true);
                         table.versions[entry.new].xmin_csn = csn;
                         table.versions[entry.old].xmax_csn = csn;
                     },
                     .delete => {
                         const table = &db.tables[entry.table];
-                        S.summarize(table, &table.versions[entry.old].cells, false, csn);
+                        S.summarize(table, entry.old, false, csn);
                         S.scanPublish(table, entry.old, false);
                         table.versions[entry.old].xmax_csn = csn;
                     },
@@ -325,7 +325,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                         const table = &db.tables[entry.table];
                         for (table.versions[0..table.version_high], 0..) |*version, index| {
                             if (!truncated(version, tx, slot, entry.old)) continue;
-                            S.summarize(table, &version.cells, false, csn);
+                            S.summarize(table, @intCast(index), false, csn);
                             S.scanPublish(table, @intCast(index), false);
                             version.xmax_csn = csn;
                         }

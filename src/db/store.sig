@@ -441,6 +441,8 @@ pub fn Store(comptime Raw: type) type {
         const ReportedValue = struct { bytes: [64]u8 = @splat(0), len: u8 = 0, valid: bool = false };
 
         pub const Connection = struct {
+            pub const detached_primary_key = if (@hasDecl(Raw, "ReadContext")) @hasDecl(Raw.ReadContext, "primaryKeyMatches") else false;
+
             pub const Result = Raw.Result;
             store: *Self,
             id: u64,
@@ -1390,6 +1392,27 @@ pub fn Store(comptime Raw: type) type {
             pub fn copyFail(self: *Connection) void {
                 if (self.id == 0) return;
                 self.terminal(self.copy_implicit);
+            }
+
+            /// Only an authorized plan installed by the detached scheduler
+            /// can bypass parsing the portal's rendered SQL.
+            pub fn executeDetachedPrimaryKey(self: *Connection, source: []const u8, oid: u32, key: ?i64, fallback: []const u8, result: *Result) !bool {
+                if (comptime !detached_primary_key) return false;
+                const context = self.read_context orelse return false;
+                if (self.id == 0 or !self.running_statement or self.failed or self.in_transaction or self.tx != null or
+                    !self.autocommit or self.pending.active or self.dialect != .postgres) return false;
+                if (comptime has_engine_session) {
+                    if (self.engine_session.values.role != 0 or self.engine_session.session_role != 10) return false;
+                }
+                const data_type: @TypeOf(@as(Result, undefined).column_types[0]) = switch (oid) {
+                    20 => .integer, 21 => .smallint, 23 => .integer32, else => return false,
+                };
+                if (!context.primaryKeyMatches(source, data_type)) return false;
+                const raw = &self.store.database;
+                const snap: Raw.Snapshot = .{.csn=raw.csn};
+                const argument: Raw.Cell = if (key) |value| .{.integer=value} else .null_value;
+                if (!try context.runPrimaryKey(raw, snap, &argument, result)) try context.execute(raw, fallback, snap, result);
+                return true;
             }
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {

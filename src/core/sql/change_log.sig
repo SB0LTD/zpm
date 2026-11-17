@@ -1486,9 +1486,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (!knownNamespace(scratch, definition.namespace)) return error.ChangeRecordConflict;
                         if (definition.oid < first_oid or definition.oid >= 0xfffffffe or oidTaken(db, scratch, definition.oid, width)) return error.ChangeRecordConflict;
                         if (nameTaken(scratch, definition.name.slice(), definition.namespace)) return error.ChangeRecordConflict;
+                        const columns = definition.columns[0..definition.count];
                         var free: ?usize = null;
                         for (&scratch.tables, 0..) |*vt, index| {
-                            if (!vt.live and free == null) free = index;
+                            if (!vt.live and free == null and S.createBankFits(&db.tables[index], columns, definition.extras.index_count)) free = index;
                         }
                         const index = free orelse return error.ChangeRecordConflict;
                         if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
@@ -1510,6 +1511,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.alter_table) => {
                         const index = try findVTable(scratch, try reader.int(u32));
+                        if (S.anyIntegralBank(&db.tables)) return error.ChangeRecordConflict;
                         const vt = &scratch.tables[index];
                         var definition: Definition = .{ .oid = vt.oid, .name = .{}, .columns = @splat(.{}), .count = 0 };
                         try decodeDefinition(&reader, &definition);
@@ -1757,12 +1759,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         fn writeVersion(db: anytype, table: *S.Table, slot: u32, older: u32, row: *const V.Row, csn: u64) Error!u32 {
             try S.ensureVersions(table, 1, csn);
-            const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = slot + 1, .xmin = .{ .epoch = db.epoch }, .xmin_cid = db.cid, .xmin_csn = csn, .older = older, .cells = row.cells };
-            table.rows[slot].newest = version + 1;
+            const version = S.createVersion(table, .{ .row = slot, .xmin = .{ .epoch = db.epoch }, .cid = db.cid, .csn = csn, .older = older }, &row.cells);
             S.indexKey(table, version);
             if (older == 0) {
-                S.summarize(table, &table.versions[version].cells, true, csn);
+                S.summarize(table, version, true, csn);
                 S.scanPublish(table, version, true);
             }
             return version;
@@ -1792,9 +1792,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 switch (tag) {
                     @intFromEnum(Op.create_table) => {
                         const definition = try decodeCreate(&reader);
-                        for (&db.tables, 0..) |*table, index| if (!table.live) {
+                        const columns = definition.columns[0..definition.count];
+                        for (&db.tables, 0..) |*table, index| if (!table.live and S.createBankFits(table, columns, definition.extras.index_count)) {
                             if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
-                            S.reset(table, definition.oid, definition.name, definition.columns[0..definition.count]);
+                            S.reset(table, definition.oid, definition.name, columns);
                             table.namespace = definition.namespace;
                             S.setConstraints(table, definition.constraints[0..definition.constraint_count]);
                             S.setExtras(table, &definition.extras);
@@ -1827,7 +1828,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         for (0..table.row_high) |slot| {
                             if (table.rows[slot].newest == 0) continue;
                             const old = S.visible(table, slot) orelse continue;
-                            S.summarize(table, &table.versions[old].cells, false, csn);
+                            S.summarize(table, old, false, csn);
                             S.scanPublish(table, old, false);
                             retire(db, table, old, csn);
                         }
@@ -1855,7 +1856,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             const slot = S.findRow(table, rowid) orelse return error.ChangeRecordConflict;
                             const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
                             const new = try writeVersion(db, table, slot, old + 1, &row, csn);
-                            S.summarizeUpdate(table, &table.versions[old].cells, &table.versions[new].cells, csn);
+                            S.summarizeUpdate(table, old, new, csn);
                             S.scanPublish(table, new, true);
                             retire(db, table, old, csn);
                         }
@@ -1864,7 +1865,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const table = try tableByOid(db, try reader.int(u32));
                         const slot = S.findRow(table, try reader.int(u64)) orelse return error.ChangeRecordConflict;
                         const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
-                        S.summarize(table, &table.versions[old].cells, false, csn);
+                        S.summarize(table, old, false, csn);
                         S.scanPublish(table, old, false);
                         retire(db, table, old, csn);
                     },

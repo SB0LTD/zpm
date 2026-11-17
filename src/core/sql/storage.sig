@@ -7,7 +7,7 @@
 //! visibility. The default arrays are inline caller-owned storage. With
 //! external_storage they are distinct caller-provided slices: their lengths,
 //! not the inline Config profile, set row/version/index capacities. Nothing
-//! allocates; values inside a version still use the configured inline cells.
+//! allocates. External storage may give dense values their own row arena.
 //!
 //! Visibility (design §4.4): a statement reads under a Snapshot {csn, tx, cid}.
 //! A version's creation is visible when it committed at or before snap.csn,
@@ -25,6 +25,7 @@
 //! capacity, dead versions are reclaimed and live slots are compacted; moved
 //! slots get a fresh generation, so a stale RowRef never resolves.
 const types = @import("types.sig");
+const mem = @import("std").mem;
 const Error = types.Error;
 
 fn pow2(minimum: usize) usize {
@@ -70,6 +71,9 @@ pub fn Storage(comptime config: types.Config) type {
         pub const reclaim_budget: usize = 64;
         pub const compact_enabled = config.compact_integral_scans and config.external_storage and config.columns <= 64;
         pub const presence_enabled = compact_enabled and config.block_presence_filters;
+        pub const split_versions = config.split_external_versions and config.external_storage;
+        pub const integral_enabled = split_versions and config.integral_external_versions;
+        pub const VersionRow = [config.columns]V.Cell;
 
         pub fn presenceWords(rows:usize) Error!usize {
             const rounded=@addWithOverflow(rows,63);if(rounded[1]!=0) return error.InvalidParameterValue;
@@ -100,7 +104,38 @@ pub fn Storage(comptime config: types.Config) type {
             xmax_csn: u64 = 0,
             /// Older version index + 1, or the next free slot + 1 while free.
             older: u32 = 0,
-            cells: [config.columns]V.Cell = @splat(.null_value),
+            cells: if (split_versions) void else VersionRow = if (split_versions) {} else @splat(.null_value),
+        };
+
+        pub const VersionOrigin = struct {
+            row: u32,
+            xmin: TxRef,
+            cid: u32,
+            csn: u64 = 0,
+            /// Previous version index + 1, or 0 for an insert.
+            older: u32 = 0,
+        };
+
+        /// Dense versions lend rows directly. Integral banks decode here.
+        pub const VersionRowScratch = if (integral_enabled) VersionRow else [0]V.Cell;
+
+        const IntegralLayout = struct {
+            offsets: [config.columns]usize = undefined,
+            bytes: usize = 0,
+
+            fn forColumns(columns: []const V.Column) ?IntegralLayout {
+                var layout: IntegralLayout = .{ .bytes = (columns.len + 7) / 8 };
+                for (columns, 0..) |column, i| {
+                    layout.offsets[i] = layout.bytes;
+                    layout.bytes += switch (column.data_type) {
+                        .smallint => @as(usize, 2),
+                        .integer32, .oid, .date => 4,
+                        .integer => 8,
+                        else => return null,
+                    };
+                }
+                return layout;
+            }
         };
 
         /// Stable reference to a directory slot. Resolves only while the slot
@@ -124,6 +159,10 @@ pub fn Storage(comptime config: types.Config) type {
         pub const Backing = struct {
             rows: []RowSlot,
             versions: []Version,
+            /// Split external banks supply one dense row for every version.
+            version_rows: if (split_versions) []VersionRow else void = if (split_versions) &.{} else {},
+            integral_rows: if (integral_enabled) []u64 else void = if (integral_enabled) &.{} else {},
+            integral_row_words: if (integral_enabled) usize else void = if (integral_enabled) 0 else {},
             row_index: []u32,
             key_index: []u32,
             scan_values: []i64 = &.{},
@@ -137,6 +176,14 @@ pub fn Storage(comptime config: types.Config) type {
             pub fn valid(self: Backing) bool {
                 const scan_cells=@mulWithOverflow(self.rows.len,config.columns);
                 if(compact_enabled and scan_cells[1]!=0) return false;
+                if (comptime integral_enabled) {
+                    if (self.integral_row_words != 0) {
+                        const required = @mulWithOverflow(self.integral_row_words, self.versions.len);
+                        if (required[1] != 0 or self.version_rows.len != 0 or self.integral_rows.len < required[0]) return false;
+                    } else if (self.integral_rows.len != 0 or self.version_rows.len < self.versions.len) return false;
+                } else if (comptime split_versions) {
+                    if (self.version_rows.len < self.versions.len) return false;
+                }
                 return self.rows.len != 0 and self.rows.len <= 0x7fffffff and
                     self.versions.len > self.rows.len and self.versions.len <= 0x7fffffff and
                     self.row_index.len >= self.rows.len * 2 and powerOfTwo(self.row_index.len) and
@@ -330,6 +377,7 @@ pub fn Storage(comptime config: types.Config) type {
             /// Updates/aborts may discard a proof, never invent one. Not persisted.
             column_order: [config.columns]OrderProof = @splat(.{}),
             summary: Summary = .{},
+            /// Conservative bounds on integer cells and DATE day numbers.
             integer_bounds: [config.columns]IntegerBounds = @splat(.{}),
             rollups: [config.columns]Rollup = @splat(.{}),
             next_rowid: u64 = 0,
@@ -350,6 +398,10 @@ pub fn Storage(comptime config: types.Config) type {
             scan_presence: []u64 = &.{},
             rows: if (config.external_storage) []RowSlot else [config.rows_per_table]RowSlot = if (config.external_storage) &.{} else @splat(.{}),
             versions: if (config.external_storage) []Version else [versions_capacity]Version = if (config.external_storage) &.{} else @splat(.{}),
+            version_rows: if (split_versions) []VersionRow else void = if (split_versions) &.{} else {},
+            integral_rows: if (integral_enabled) []u64 else void = if (integral_enabled) &.{} else {},
+            integral_row_words: if (integral_enabled) usize else void = if (integral_enabled) 0 else {},
+            integral_layout: if (integral_enabled) IntegralLayout else void = if (integral_enabled) .{} else {},
             row_index: if (config.external_storage) []u32 else [row_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
             key_index: if (config.external_storage) []u32 else [key_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
         };
@@ -377,20 +429,29 @@ pub fn Storage(comptime config: types.Config) type {
             return 1 + @as(u32, @intFromBool(keyed(table)));
         }
 
+        fn observeBounds(bounds: *IntegerBounds, cell: *const V.Cell) void {
+            const value: i64 = switch (cell.*) {
+                .integer => cell.integer,
+                .date => cell.date,
+                else => return,
+            };
+            if (!bounds.known) {
+                bounds.* = .{ .known = true, .low = value, .high = value };
+            } else {
+                bounds.low = @min(bounds.low, value);
+                bounds.high = @max(bounds.high, value);
+            }
+        }
+
         /// Conservative hints recomputed from every allocated version after
-        /// a relayout: integer bounds, no order proof, no dense key directory.
+        /// a relayout: value bounds, no order proof, no dense key directory.
         pub fn rebuildHints(table: *Table) void {
+            var row_scratch: VersionRowScratch = undefined;
             table.integer_bounds = @splat(.{});
-            for (table.versions[0..table.version_high]) |*version| {
+            for (table.versions[0..table.version_high], 0..) |*version, index| {
                 if (version.row == 0) continue;
-                for (version.cells[0..table.column_count], table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
-                    if (cell.* != .integer) continue;
-                    if (!bounds.known) {
-                        bounds.* = .{ .known = true, .low = cell.integer, .high = cell.integer };
-                    } else {
-                        bounds.low = @min(bounds.low, cell.integer);
-                        bounds.high = @max(bounds.high, cell.integer);
-                    }
+                for (versionValues(table, index, &row_scratch), table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
+                    observeBounds(bounds, cell);
                 }
             }
             table.column_order = @splat(.{ .state = .unordered });
@@ -544,11 +605,12 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         fn indexSecondary(table: *Table, version: u32) void {
+            var row_scratch: VersionRowScratch = undefined;
             if (comptime !index_storage) return;
             for (0..table.index_count) |which| {
                 const slots = slotsOf(table, which);
                 const mask = slots.len - 1;
-                var position = secondaryHash(&table.indexes[which], &table.versions[version].cells, mask);
+                var position = secondaryHash(&table.indexes[which], borrowVersionRow(table, version, &row_scratch), mask);
                 while (slots[position] != 0) position = (position + 1) & mask;
                 slots[position] = version + 1;
             }
@@ -556,6 +618,7 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// Backward-shift deletion of slot `start` of secondary index `which`.
         fn removeSecondaryAt(table: *Table, which: usize, start: usize) void {
+            var row_scratch: VersionRowScratch = undefined;
             const slots = slotsOf(table, which);
             const mask = slots.len - 1;
             var hole = start;
@@ -564,7 +627,7 @@ pub fn Storage(comptime config: types.Config) type {
                 probe = (probe + 1) & mask;
                 const entry = slots[probe];
                 if (entry == 0) break;
-                const home = secondaryHash(&table.indexes[which], &table.versions[entry - 1].cells, mask);
+                const home = secondaryHash(&table.indexes[which], borrowVersionRow(table, entry - 1, &row_scratch), mask);
                 if (((probe -% hole) & mask) <= ((probe -% home) & mask)) {
                     slots[hole] = entry;
                     hole = probe;
@@ -574,11 +637,12 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         fn unindexSecondary(table: *Table, version: u32) void {
+            var row_scratch: VersionRowScratch = undefined;
             if (comptime !index_storage) return;
             for (0..table.index_count) |which| {
                 const slots = slotsOf(table, which);
                 const mask = slots.len - 1;
-                var position = secondaryHash(&table.indexes[which], &table.versions[version].cells, mask);
+                var position = secondaryHash(&table.indexes[which], borrowVersionRow(table, version, &row_scratch), mask);
                 while (slots[position] != version + 1) {
                     if (slots[position] == 0) break;
                     position = (position + 1) & mask;
@@ -623,6 +687,7 @@ pub fn Storage(comptime config: types.Config) type {
         /// Versions visible to `snap` whose plain key columns of index
         /// `which` equal `cells`, found through the index (probe path).
         pub fn indexLookup(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, snap: Snapshot, out: []u32) usize {
+            var row_scratch: VersionRowScratch = undefined;
             if (comptime !index_storage) return 0;
             const index = &table.indexes[which];
             const slots = slotsConst(table, which);
@@ -632,7 +697,7 @@ pub fn Storage(comptime config: types.Config) type {
             while (slots[position] != 0) : (position = (position + 1) & mask) {
                 const entry = slots[position] - 1;
                 const version = &table.versions[entry];
-                if (!plainKeyEqual(index, &version.cells, cells)) continue;
+                if (!plainKeyEqual(index, borrowVersionRow(table, entry, &row_scratch), cells)) continue;
                 if (visibleAt(table, version.row - 1, snap) != entry) continue;
                 if (count < out.len) out[count] = entry;
                 count += 1;
@@ -653,11 +718,12 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// The same versions found by scanning every row (scan path).
         pub fn scanLookup(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, snap: Snapshot, out: []u32) usize {
+            var row_scratch: VersionRowScratch = undefined;
             var count: usize = 0;
             for (0..table.row_high) |slot| {
                 if (table.rows[slot].newest == 0) continue;
                 const version = visibleAt(table, slot, snap) orelse continue;
-                if (!plainKeyEqual(&table.indexes[which], &table.versions[version].cells, cells)) continue;
+                if (!plainKeyEqual(&table.indexes[which], borrowVersionRow(table, version, &row_scratch), cells)) continue;
                 if (count < out.len) out[count] = version;
                 count += 1;
             }
@@ -667,6 +733,7 @@ pub fn Storage(comptime config: types.Config) type {
         /// UNIQUE index check through the index, with exactly uniqueCheck's
         /// dirty-snapshot rules over the probed candidates.
         pub fn indexUniqueCheck(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, own_slot: u32, snap: Snapshot) KeyState {
+            var row_scratch: VersionRowScratch = undefined;
             if (comptime !index_storage) return .free;
             const index = &table.indexes[which];
             if (!index.nulls_not_distinct) for (index.keyColumns()) |column| {
@@ -680,7 +747,7 @@ pub fn Storage(comptime config: types.Config) type {
                 const entry = slots[position] - 1;
                 const version = &table.versions[entry];
                 if (version.row - 1 == own_slot) continue;
-                if (!sameColumns(index.keyColumns(), &version.cells, cells)) continue;
+                if (!sameColumns(index.keyColumns(), borrowVersionRow(table, entry, &row_scratch), cells)) continue;
                 if (classify(version, entry, snap, &waiting)) |state| return state;
             }
             return if (waiting) |slot| .{ .wait = slot } else .free;
@@ -705,8 +772,10 @@ pub fn Storage(comptime config: types.Config) type {
             return null;
         }
 
-        fn relayoutCells(cells: *[config.columns]V.Cell, sources: []const u8, fills: []const V.Cell) void {
-            const old = cells.*;
+        fn relayoutVersion(destination: *Table, source: *const Table, version: usize, sources: []const u8, fills: []const V.Cell) void {
+            var old: [config.columns]V.Cell = undefined;
+            copyVersionRow(source, version, &old);
+            const cells = mutableVersionRow(destination, version);
             for (sources, 0..) |origin, column| cells[column] = if (origin == 0xff) fills[column] else old[origin];
             for (cells[sources.len..]) |*cell| cell.* = .null_value;
         }
@@ -725,9 +794,9 @@ pub fn Storage(comptime config: types.Config) type {
             destination.version_used = source.version_used;
             destination.version_free = source.version_free;
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
-            for (source.versions[0..source.version_high], destination.versions[0..source.version_high]) |*from, *to| {
+            for (source.versions[0..source.version_high], destination.versions[0..source.version_high], 0..) |*from, *to, version| {
                 to.* = from.*;
-                if (from.row != 0) relayoutCells(&to.cells, sources, fills);
+                if (from.row != 0) relayoutVersion(destination, source, version, sources, fills);
             }
             rebuildIndexes(destination);
             rebuildHints(destination);
@@ -736,8 +805,8 @@ pub fn Storage(comptime config: types.Config) type {
         /// Replay of ALTER TABLE in place (replay keeps no old snapshots):
         /// relayout every version, install the definition, rebuild indexes.
         pub fn redefine(table: *Table, name: V.Name, columns: []const V.Column, constraints: []const Constraint, extras: *const Extras, sources: []const u8, fills: []const V.Cell) void {
-            for (table.versions[0..table.version_high]) |*version| {
-                if (version.row != 0) relayoutCells(&version.cells, sources, fills);
+            for (table.versions[0..table.version_high], 0..) |*entry, version| {
+                if (entry.row != 0) relayoutVersion(table, table, version, sources, fills);
             }
             table.name = name;
             table.column_count = columns.len;
@@ -760,7 +829,7 @@ pub fn Storage(comptime config: types.Config) type {
             for (0..table.row_high) |slot| {
                 if (table.rows[slot].newest == 0) continue;
                 if (visible(table, slot)) |version| {
-                    summarize(table, &table.versions[version].cells, true, csn);
+                    summarize(table, version, true, csn);
                     scanPublish(table, version, true);
                 } else scanPublish(table, table.rows[slot].newest - 1, false);
             }
@@ -816,11 +885,12 @@ pub fn Storage(comptime config: types.Config) type {
         /// inserter wait for it. Row `own_slot` (the row being updated) never
         /// conflicts. Scans the version arena: O(versions x key columns).
         pub fn uniqueCheck(table: *const Table, constraint: *const Constraint, cells: *const [config.columns]V.Cell, own_slot: u32, snap: Snapshot) KeyState {
+            var row_scratch: VersionRowScratch = undefined;
             if (!comparableKey(constraint, cells)) return .free;
             var waiting: ?u16 = null;
             for (table.versions[0..table.version_high], 0..) |*version, index| {
                 if (version.row == 0 or version.row - 1 == own_slot) continue;
-                if (!sameKey(constraint, &version.cells, cells)) continue;
+                if (!sameKey(constraint, borrowVersionRow(table, index, &row_scratch), cells)) continue;
                 const marked = version.xmax.epoch != 0;
                 if (version.xmin_csn == 0) {
                     if (snap.own(version.xmin)) {
@@ -842,6 +912,9 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn reset(table: *Table, oid: u32, name: V.Name, columns: []const V.Column) void {
             table.oid = oid;
             table.name = name;
+            if (comptime integral_enabled) if (integralBank(table)) {
+                table.integral_layout = IntegralLayout.forColumns(columns).?;
+            };
             table.column_count = columns.len;
             @memcpy(table.columns[0..columns.len], columns);
             table.primary_column = null;
@@ -875,6 +948,9 @@ pub fn Storage(comptime config: types.Config) type {
             destination.name = source.name;
             destination.column_count = source.column_count;
             @memcpy(destination.columns[0..source.column_count], source.columns[0..source.column_count]);
+            if (comptime integral_enabled) if (integralBank(destination)) {
+                destination.integral_layout = IntegralLayout.forColumns(destination.columns[0..destination.column_count]).?;
+            };
             destination.namespace = source.namespace;
             destination.constraint_count = source.constraint_count;
             @memcpy(destination.constraints[0..source.constraint_count], source.constraints[0..source.constraint_count]);
@@ -907,6 +983,17 @@ pub fn Storage(comptime config: types.Config) type {
             }
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
             @memcpy(destination.versions[0..source.version_high], source.versions[0..source.version_high]);
+            if (comptime split_versions) {
+                for (source.versions[0..source.version_high], 0..) |*entry, version| {
+                    if (entry.row == 0) continue;
+                    if (comptime integral_enabled) if (integralBank(destination)) {
+                        var row_scratch: VersionRowScratch = undefined;
+                        writeIntegral(destination, version, borrowVersionRow(source, version, &row_scratch));
+                        continue;
+                    };
+                    copyVersionRow(source, version, mutableVersionRow(destination, version));
+                }
+            }
             if (comptime config.external_storage) {
                 @memset(destination.row_index, 0);
                 @memset(destination.key_index, 0);
@@ -966,13 +1053,14 @@ pub fn Storage(comptime config: types.Config) type {
         /// Publication/replay only, after durable success. Private versions and
         /// aborts never alter this projection. No allocation or fallible work.
         pub fn scanPublish(table: *Table, version: u32, live: bool) void {
+            var row_scratch: VersionRowScratch = undefined;
             if (comptime compact_enabled) {
                 const entry = &table.versions[version];
                 const slot = entry.row - 1;
                 scanEnsure(table, @as(usize, slot) + 1);
                 table.scan_live[slot] = @intFromBool(live);
                 var mask: u64 = 0;
-                for (entry.cells[0..table.column_count], 0..) |*cell, column| {
+                for (versionValues(table, version, &row_scratch), 0..) |*cell, column| {
                     if (cell.* != .null_value) mask |= @as(u64, 1) << @intCast(column);
                     table.scan_values[column * table.rows.len + slot] = switch(cell.*) {
                         .integer=>cell.integer,.date=>cell.date,else=>0,
@@ -1025,8 +1113,126 @@ pub fn Storage(comptime config: types.Config) type {
             return mix(table.rows[entry - 1].rowid) & (table.row_index.len - 1);
         }
 
+        inline fn rowAtVersion(table: *const Table, version: usize) *const VersionRow {
+            if (comptime split_versions) return &table.version_rows[version];
+            return &table.versions[version].cells;
+        }
+
+        inline fn mutableVersionRow(table: *Table, version: usize) *VersionRow {
+            if (comptime split_versions) return &table.version_rows[version];
+            return &table.versions[version].cells;
+        }
+
+        pub inline fn integralBank(table: *const Table) bool {
+            if (comptime integral_enabled) return table.integral_row_words != 0;
+            return false;
+        }
+
+        pub fn anyIntegralBank(tables: *const [config.tables]Table) bool {
+            if (comptime integral_enabled) for (tables) |*table| {
+                if (integralBank(table)) return true;
+            };
+            return false;
+        }
+
+        pub fn integralRowWords(columns: []const V.Column) ?usize {
+            const layout = IntegralLayout.forColumns(columns) orelse return null;
+            return @max(1, (layout.bytes + 7) / 8);
+        }
+
+        /// The bound bank size and schema must agree before a table is installed.
+        pub fn schemaFits(table: *const Table, columns: []const V.Column) bool {
+            if (comptime integral_enabled) if (integralBank(table)) {
+                const words = integralRowWords(columns) orelse return false;
+                return words <= table.integral_row_words;
+            };
+            return true;
+        }
+
+        pub fn createBankFits(table: *const Table, columns: []const V.Column, indexes: usize) bool {
+            if (comptime integral_enabled) return schemaFits(table, columns) and indexFits(table, indexes, 0);
+            return true;
+        }
+
+        fn readIntegral(table: *const Table, version: usize, column: usize) V.Cell {
+            const stride = table.integral_row_words;
+            const bytes = mem.sliceAsBytes(table.integral_rows[version * stride ..][0..stride]);
+            const bit: u8 = @as(u8, 1) << @as(u3, @truncate(column));
+            if ((bytes[column / 8] & bit) == 0) return .null_value;
+            const at = table.integral_layout.offsets[column];
+            return switch (table.columns[column].data_type) {
+                .smallint => .{ .integer = mem.readInt(i16, bytes[at..][0..2], .little) },
+                .integer32 => .{ .integer = mem.readInt(i32, bytes[at..][0..4], .little) },
+                .oid => .{ .integer = mem.readInt(u32, bytes[at..][0..4], .little) },
+                .date => .{ .date = mem.readInt(i32, bytes[at..][0..4], .little) },
+                .integer => .{ .integer = mem.readInt(i64, bytes[at..][0..8], .little) },
+                else => unreachable,
+            };
+        }
+
+        /// Values have already passed DML coercion or change-record validation.
+        fn writeIntegral(table: *Table, version: usize, cells: []const V.Cell) void {
+            const stride = table.integral_row_words;
+            const bytes = mem.sliceAsBytes(table.integral_rows[version * stride ..][0..stride]);
+            @memset(bytes[0 .. (table.column_count + 7) / 8], 0);
+            for (cells[0..table.column_count], 0..) |*cell, column| {
+                if (cell.* == .null_value) continue;
+                const bit: u8 = @as(u8, 1) << @as(u3, @truncate(column));
+                bytes[column / 8] |= bit;
+                const at = table.integral_layout.offsets[column];
+                switch (table.columns[column].data_type) {
+                    .smallint => mem.writeInt(i16, bytes[at..][0..2], @intCast(cell.integer), .little),
+                    .integer32 => mem.writeInt(i32, bytes[at..][0..4], @intCast(cell.integer), .little),
+                    .oid => mem.writeInt(u32, bytes[at..][0..4], @intCast(cell.integer), .little),
+                    .date => mem.writeInt(i32, bytes[at..][0..4], cell.date, .little),
+                    .integer => mem.writeInt(i64, bytes[at..][0..8], cell.integer, .little),
+                    else => unreachable,
+                }
+            }
+        }
+
+        /// The view can borrow the arena or the caller's scratch. Use one
+        /// scratch per live row and keep it in scope until the last read.
+        pub inline fn borrowVersionRow(table: *const Table, version: usize, scratch: *VersionRowScratch) *const VersionRow {
+            if (comptime integral_enabled) if (integralBank(table)) {
+                copyVersionRow(table, version, scratch);
+                return scratch;
+            };
+            return rowAtVersion(table, version);
+        }
+
+        /// Materialize a row the caller can modify or retain independently.
+        pub inline fn copyVersionRow(table: *const Table, version: usize, destination: *VersionRow) void {
+            if (comptime integral_enabled) if (integralBank(table)) {
+                for (destination[0..table.column_count], 0..) |*cell, column| cell.* = readIntegral(table, version, column);
+                @memset(destination[table.column_count..], .null_value);
+                return;
+            };
+            destination.* = rowAtVersion(table, version).*;
+        }
+
+        /// A single logical cell, valid until its scratch is reused.
+        pub inline fn borrowVersionCell(table: *const Table, version: usize, column: usize, scratch: *V.Cell) *const V.Cell {
+            if (comptime integral_enabled) if (integralBank(table)) {
+                scratch.* = readIntegral(table, version, column);
+                return scratch;
+            };
+            return &rowAtVersion(table, version)[column];
+        }
+
+        /// Logical values in storage column order, excluding dense padding.
+        pub inline fn versionValues(table: *const Table, version: usize, scratch: *VersionRowScratch) []const V.Cell {
+            return borrowVersionRow(table, version, scratch)[0..table.column_count];
+        }
+
+        pub inline fn versionCellEquals(table: *const Table, version: usize, column: usize, value: *const V.Cell) bool {
+            var scratch: V.Cell = undefined;
+            return V.compare(borrowVersionCell(table, version, column, &scratch), value) == 0;
+        }
+
         fn keyHome(table: *const Table, entry: u32) usize {
-            return V.hash(&table.versions[entry - 1].cells[table.primary_column.?]) & (table.key_index.len - 1);
+            var scratch: V.Cell = undefined;
+            return V.hash(borrowVersionCell(table, entry - 1, table.primary_column.?, &scratch)) & (table.key_index.len - 1);
         }
 
         /// Backward-shift deletion keeps linear probing tombstone-free.
@@ -1074,23 +1280,25 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         /// Called only at durable publication or validated change-record replay.
-        pub fn summarize(table: *Table, cells: *const [config.columns]V.Cell, add: bool, csn: u64) void {
-            changeSummary(table, cells, add, csn);
+        pub fn summarize(table: *Table, version: u32, add: bool, csn: u64) void {
+            changeSummary(table, version, add, csn);
             if (table.summary.valid and table.summary.rows == 0) {
                 resetRollups(table);
                 table.summary.primary_bounds = .{};
             }
         }
 
-        pub fn summarizeUpdate(table: *Table, old: *const [config.columns]V.Cell, new: *const [config.columns]V.Cell, csn: u64) void {
+        pub fn summarizeUpdate(table: *Table, old: u32, new: u32, csn: u64) void {
             // An update does not empty/reinitialize the table's summaries.
             changeSummary(table, old, false, csn);
             changeSummary(table, new, true, csn);
         }
 
-        fn changeSummary(table: *Table, cells: *const [config.columns]V.Cell, add: bool, csn: u64) void {
+        fn changeSummary(table: *Table, version: u32, add: bool, csn: u64) void {
+            var row_scratch: VersionRowScratch = undefined;
             if (!table.summary.valid) return;
-            observeSummary(&table.summary, cells[0..table.column_count], table.primary_column, add, csn);
+            const cells = versionValues(table, version, &row_scratch);
+            observeSummary(&table.summary, cells, table.primary_column, add, csn);
             summarizeGroups(table, cells, add);
         }
 
@@ -1137,7 +1345,7 @@ pub fn Storage(comptime config: types.Config) type {
             };
         }
 
-        fn summarizeGroups(table: *Table, cells: *const [config.columns]V.Cell, add: bool) void {
+        fn summarizeGroups(table: *Table, cells: []const V.Cell, add: bool) void {
             if (comptime config.summary_groups != 0) {
                 const sign: i64 = if (add) 1 else -1;
                 for (table.columns[0..table.column_count], table.rollups[0..table.column_count], 0..) |definition, *rollup, key_column| {
@@ -1158,7 +1366,7 @@ pub fn Storage(comptime config: types.Config) type {
                     const group = &rollup.groups[at];
                     if (!add and group.rows == 0) { rollup.valid = false; continue; }
                     group.rows += sign;
-                    for (cells[0..table.column_count], group.columns[0..table.column_count]) |*cell, *column| {
+                    for (cells, group.columns[0..table.column_count]) |*cell, *column| {
                         if (cell.* == .null_value) continue;
                         column.nonnull += sign;
                         if (cell.* == .integer) column.total += @as(i128, cell.integer) * sign;
@@ -1168,14 +1376,9 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         pub fn indexKey(table: *Table, version: u32) void {
-            for (table.versions[version].cells[0..table.column_count], table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
-                if (cell.* != .integer) continue;
-                if (!bounds.known) {
-                    bounds.* = .{ .known = true, .low = cell.integer, .high = cell.integer };
-                } else {
-                    bounds.low = @min(bounds.low, cell.integer);
-                    bounds.high = @max(bounds.high, cell.integer);
-                }
+            var row_scratch: VersionRowScratch = undefined;
+            for (versionValues(table, version, &row_scratch), table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
+                observeBounds(bounds, cell);
             }
             noteOrder(table, version);
             notePrimaryDirectory(table, version);
@@ -1188,7 +1391,8 @@ pub fn Storage(comptime config: types.Config) type {
             const hint = &table.primary_directory;
             if (hint.state == .disabled) return;
             const entry = &table.versions[version];
-            const key = &entry.cells[column];
+            var scratch: V.Cell = undefined;
+            const key = borrowVersionCell(table, version, column, &scratch);
             if (key.* != .integer) { hint.state = .disabled; return; }
             if (hint.state == .empty) {
                 if (entry.row != 1 or entry.older != 0) { hint.state = .disabled; return; }
@@ -1203,11 +1407,16 @@ pub fn Storage(comptime config: types.Config) type {
         fn noteOrder(table: *Table, version: u32) void {
             const entry = &table.versions[version];
             for (table.column_order[0..table.column_count], 0..) |*proof, column| {
-                const value = &entry.cells[column];
+                var scratch: V.Cell = undefined;
+                const value = borrowVersionCell(table, version, column, &scratch);
                 if (entry.older != 0) {
                     if (entry.older == version + 1 or table.versions[entry.older - 1].row == 0) {
                         proof.state = .unordered;
-                    } else if (proof.state != .unordered and V.compare(value, &table.versions[entry.older - 1].cells[column]) != 0) proof.state = .unordered;
+                    } else if (proof.state != .unordered) {
+                        var previous: V.Cell = undefined;
+                        const old = borrowVersionCell(table, entry.older - 1, column, &previous);
+                        if (V.compare(value, old) != 0) proof.state = .unordered;
+                    }
                     continue;
                 }
                 // The first row after reset/full reclamation can start a new
@@ -1246,6 +1455,26 @@ pub fn Storage(comptime config: types.Config) type {
             removeAt(table, table.key_index[0..], position, keyHome);
         }
 
+        /// Probe the primary-key index using the dirty-snapshot rules shared
+        /// with secondary unique indexes. The row being updated never conflicts.
+        pub fn primaryKeyCheck(table: *const Table, key: *const V.Cell, own_slot: u32, snap: Snapshot) KeyState {
+            const column = table.primary_column orelse return .free;
+            if (key.* == .null_value) return .free;
+            var waiting: ?u16 = null;
+            const mask = table.key_index.len - 1;
+            var position = V.hash(key) & mask;
+            while (true) : (position = (position + 1) & mask) {
+                const entry = table.key_index[position];
+                if (entry == 0) break;
+                const index = entry - 1;
+                if (!versionCellEquals(table, index, column, key)) continue;
+                const version = &table.versions[index];
+                if (version.row - 1 == own_slot) continue;
+                if (classify(version, index, snap, &waiting)) |state| return state;
+            }
+            return if (waiting) |slot| .{ .wait = slot } else .free;
+        }
+
         /// Visible version whose primary key equals value. Returning the hit
         /// avoids walking its MVCC chain twice in read execution.
         pub fn lookupVersionAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
@@ -1259,7 +1488,8 @@ pub fn Storage(comptime config: types.Config) type {
                 const offset = @as(i128, value.integer) - table.primary_directory.base;
                 if (offset >= 0 and offset < table.row_high) {
                     if (visibleAt(table, @intCast(offset), snap)) |candidate| {
-                        const key = &table.versions[candidate].cells[column];
+                        var scratch: V.Cell = undefined;
+                        const key = borrowVersionCell(table, candidate, column, &scratch);
                         if (key.* == .integer and key.integer == value.integer) return candidate;
                     }
                 }
@@ -1268,9 +1498,8 @@ pub fn Storage(comptime config: types.Config) type {
             while (true) {
                 const entry = table.key_index[position];
                 if (entry == 0) return null;
-                const version = &table.versions[entry - 1];
-                if (V.compare(&version.cells[column], value) == 0) {
-                    const slot = version.row - 1;
+                if (versionCellEquals(table, entry - 1, column, value)) {
+                    const slot = table.versions[entry - 1].row - 1;
                     if (visibleAt(table, slot, snap) == entry - 1) return entry - 1;
                 }
                 position = (position + 1) & (table.key_index.len - 1);
@@ -1292,8 +1521,34 @@ pub fn Storage(comptime config: types.Config) type {
             return table.versions.len - table.version_used;
         }
 
-        /// Caller initializes every field of the returned version.
-        pub fn allocVersion(table: *Table) u32 {
+        /// Installs a logical row after the caller has reserved capacity.
+        /// Linking the version does not publish it to other snapshots.
+        /// Indexing and the transaction or replay bookkeeping are separate.
+        pub inline fn createVersion(table: *Table, origin: VersionOrigin, cells: []const V.Cell) u32 {
+            const version = allocVersion(table);
+            const full_width = cells.len == config.columns;
+            table.versions[version] = .{
+                .row = origin.row + 1,
+                .xmin = origin.xmin,
+                .xmin_cid = origin.cid,
+                .xmin_csn = origin.csn,
+                .older = origin.older,
+                .cells = if (comptime split_versions) {} else if (full_width) cells[0..config.columns].* else @splat(.null_value),
+            };
+            if (comptime integral_enabled) if (integralBank(table)) {
+                writeIntegral(table, version, cells);
+                table.rows[origin.row].newest = version + 1;
+                return version;
+            };
+            if (comptime split_versions) {
+                mutableVersionRow(table, version).* = if (full_width) cells[0..config.columns].* else @splat(.null_value);
+            }
+            if (!full_width) @memcpy(mutableVersionRow(table, version)[0..cells.len], cells);
+            table.rows[origin.row].newest = version + 1;
+            return version;
+        }
+
+        fn allocVersion(table: *Table) u32 {
             table.version_used += 1;
             if (table.version_free != 0) {
                 const version = table.version_free - 1;

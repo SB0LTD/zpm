@@ -238,9 +238,10 @@ pub fn Catalog(comptime config: types.Config) type {
         /// A user schema named `name` visible to `snap`.
         pub fn findSchema(self: *const Self, name: []const u8, snap: storage.Snapshot) ?SchemaFound {
             const relations = self.relationConst(.relations);
+            var row_scratch: SC.VersionRowScratch = undefined;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
-                const cells = &relations.versions[version].cells;
+                const cells = SC.borrowVersionRow(relations, version, &row_scratch);
                 if (cells[2].text.bytes[0] != 'n' or !sameName(&cells[1], name)) continue;
                 return .{ .oid = @intCast(cells[0].integer), .slot = @intCast(cells[4].integer) };
             }
@@ -250,10 +251,11 @@ pub fn Catalog(comptime config: types.Config) type {
         /// Every user schema visible to `snap`, in catalog row order.
         pub fn visibleSchemas(self: *const Self, snap: storage.Snapshot, out: *[rows]SchemaFound) usize {
             const relations = self.relationConst(.relations);
+            var row_scratch: SC.VersionRowScratch = undefined;
             var count: usize = 0;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
-                const cells = &relations.versions[version].cells;
+                const cells = SC.borrowVersionRow(relations, version, &row_scratch);
                 if (cells[2].text.bytes[0] != 'n') continue;
                 out[count] = .{ .oid = @intCast(cells[0].integer), .slot = @intCast(cells[4].integer) };
                 count += 1;
@@ -265,10 +267,12 @@ pub fn Catalog(comptime config: types.Config) type {
         /// uncommitted relation row in namespace `namespace`.
         pub fn namespaceCreator(self: *const Self, namespace: u32, snap: storage.Snapshot) ?u16 {
             const relations = self.relationConst(.relations);
-            for (relations.versions[0..relations.version_high]) |*version| {
+            var row_scratch: SC.VersionRowScratch = undefined;
+            for (relations.versions[0..relations.version_high], 0..) |*version, index| {
                 if (version.row == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
                 if (version.xmax.epoch != 0) continue;
-                if (version.cells[3] == .integer and version.cells[3].integer == namespace and version.cells[2].text.bytes[0] != 'n') return version.xmin.slot;
+                const cells = SC.borrowVersionRow(relations, index, &row_scratch);
+                if (cells[3] == .integer and cells[3].integer == namespace and cells[2].text.bytes[0] != 'n') return version.xmin.slot;
             }
             return null;
         }
@@ -311,10 +315,11 @@ pub fn Catalog(comptime config: types.Config) type {
         /// catalog row order. Schemas are listed by visibleSchemas.
         pub fn visibleRelations(self: *const Self, snap: storage.Snapshot, out: *[rows]Found) usize {
             const relations = self.relationConst(.relations);
+            var row_scratch: SC.VersionRowScratch = undefined;
             var count: usize = 0;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
-                const cells = &relations.versions[version].cells;
+                const cells = SC.borrowVersionRow(relations, version, &row_scratch);
                 if (cells[2].text.bytes[0] == 'n') continue;
                 out[count] = .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
                 count += 1;
@@ -331,9 +336,10 @@ pub fn Catalog(comptime config: types.Config) type {
         /// A table or sequence named `name` in schema `namespace`.
         pub fn findIn(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) ?Found {
             const relations = self.relationConst(.relations);
+            var row_scratch: SC.VersionRowScratch = undefined;
             for (0..relations.row_high) |row| {
                 const version = SC.visibleAt(relations, row, snap) orelse continue;
-                const cells = &relations.versions[version].cells;
+                const cells = SC.borrowVersionRow(relations, version, &row_scratch);
                 if (cells[2].text.bytes[0] == 'n' or cells[3].integer != namespace) continue;
                 if (sameName(&cells[1], name)) return .{ .kind = cells[2].text.bytes[0], .slot = @intCast(cells[4].integer) };
             }
@@ -347,11 +353,7 @@ pub fn Catalog(comptime config: types.Config) type {
             if (SC.findRow(table, rowid) != null) _ = SC.vacuum(table, horizon);
             if (SC.findRow(table, rowid) != null) return error.CatalogCapacity;
             const slot = SC.allocRow(table, rowid);
-            const version = SC.allocVersion(table);
-            table.versions[version] = .{ .row = slot + 1, .xmin = xmin, .xmin_cid = cid, .xmin_csn = csn };
-            for (cells, 0..) |cell, index| table.versions[version].cells[index] = cell;
-            table.rows[slot].newest = version + 1;
-            return version;
+            return SC.createVersion(table, .{ .row = slot, .xmin = xmin, .cid = cid, .csn = csn }, cells);
         }
 
         /// Writes cat_relations and cat_attributes rows for a table slot.
@@ -418,10 +420,11 @@ pub fn Catalog(comptime config: types.Config) type {
         /// uncommitted relation row with this name.
         pub fn creator(self: *const Self, name: []const u8, snap: storage.Snapshot) ?u16 {
             const relations = self.relationConst(.relations);
-            for (relations.versions[0..relations.version_high]) |*version| {
+            for (relations.versions[0..relations.version_high], 0..) |*version, index| {
                 if (version.row == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
                 if (version.xmax.epoch != 0) continue;
-                if (sameName(&version.cells[1], name)) return version.xmin.slot;
+                var temporary: CV.Cell = undefined;
+                if (sameName(SC.borrowVersionCell(relations, index, 1, &temporary), name)) return version.xmin.slot;
             }
             return null;
         }

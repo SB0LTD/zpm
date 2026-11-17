@@ -1176,6 +1176,147 @@ fn parameterStatus(bytes: []const u8, name: []const u8, value: ?[]const u8) bool
     return false;
 }
 
+fn detachedPrimaryKeys() !void {
+    var store: Store = .{};
+    var db: Store.Connection = .{ .store = &store, .id = 1 };
+    var s: StoreSession = .{};
+    var context: Raw.ReadContext = .{};
+    _ = try storeStartup(&s, &db, "");
+    _ = try storeQuery(&s, &db, "CREATE TABLE pk (id BIGINT PRIMARY KEY)");
+    _ = try storeQuery(&s, &db, "INSERT INTO pk VALUES (-9),(7)");
+    const template = "SELECT id FROM pk WHERE id=$1";
+    const replacement = "SELECT id FROM pk WHERE id=$1 AND 1=0";
+    var p = Packet.init('P');
+    p.string("");
+    p.string(template);
+    p.number16(1);
+    p.number32(20);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "1");
+    p = Packet.init('B');
+    p.string("held");
+    p.string("");
+    p.number16(1);
+    p.number16(1);
+    p.number16(1);
+    p.number32(8);
+    p.append("\xff\xff\xff\xff\xff\xff\xff\xf7");
+    p.number16(1);
+    p.number16(1);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "2");
+
+    // The unnamed Parse slot can be replaced before the named portal runs.
+    p = Packet.init('P');
+    p.string("");
+    p.string(replacement);
+    p.number16(1);
+    p.number32(20);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "1");
+    p = Packet.init('D');
+    p.byte('P');
+    p.string("held");
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "T");
+    p = Packet.init('E');
+    p.string("held");
+    p.number32(1);
+    try check(s.detachedPrimaryKey(p.slice()) == null);
+    p = Packet.init('E');
+    p.string("held");
+    p.number32(0);
+    const frame = p.slice();
+    try check(s.detachedPrimaryKey(frame[0..frame.len-1]) == null);
+    const hint = s.detachedPrimaryKey(frame) orelse return error.MissingPrimaryKeyHint;
+    try check(equal(hint.source, template) and hint.oid == 20 and hint.key == -9);
+    const snap: Raw.Snapshot = .{.csn=store.database.csn};
+    try check(db.detachedReadEligible());
+    try check(try context.preparePrimaryKey(&store.database, hint.source, snap, .integer));
+    db.read_context = &context;
+    db.running_statement = true;
+    const wire = store_output[0..(try storeSend(&s, &db, &p)).written];
+    db.read_context = null;
+    db.running_statement = false;
+    try tags(wire, "DC");
+    var frames: Frames = .{ .bytes = wire };
+    const row = (try frames.next()).?;
+    try check(u32be(row.body[2..6]) == 8 and equal(row.body[6..14], "\xff\xff\xff\xff\xff\xff\xff\xf7"));
+    try check(s.detachedPrimaryKey(frame) == null);
+
+    // NULL and signed text use the same owned candidate record. If no
+    // matching read plan is installed, Execute continues through plain SQL.
+    p = Packet.init('B');
+    p.string("empty");
+    p.string("");
+    p.number16(1);
+    p.number16(0);
+    p.number16(1);
+    p.number32(0xffffffff);
+    p.number16(0);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "2");
+    p = Packet.init('E');
+    p.string("empty");
+    p.number32(0);
+    const null_hint = s.detachedPrimaryKey(p.slice()) orelse return error.MissingPrimaryKeyHint;
+    try check(null_hint.key == null and equal(null_hint.source, replacement));
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "C");
+
+    p = Packet.init('B');
+    p.string("text");
+    p.string("");
+    p.number16(0);
+    p.number16(1);
+    p.number32(2);
+    p.append("+7");
+    p.number16(0);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "2");
+    p = Packet.init('E');
+    p.string("text");
+    p.number32(0);
+    try check((s.detachedPrimaryKey(p.slice()) orelse return error.MissingPrimaryKeyHint).key == 7);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "C");
+
+    // Describe uses the same worker AST workspace. A second Bind with the
+    // original template can still hit the independent owned plan.
+    try context.describe(&store.database, "SELECT 1", snap, &s.result);
+    p = Packet.init('P');
+    p.string("");
+    p.string(template);
+    p.number16(1);
+    p.number32(20);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "1");
+    p = Packet.init('B');
+    p.string("reused");
+    p.string("");
+    p.number16(0);
+    p.number16(1);
+    p.number32(1);
+    p.byte('7');
+    p.number16(0);
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "2");
+    p = Packet.init('E');
+    p.string("reused");
+    p.number32(0);
+    const repeated = s.detachedPrimaryKey(p.slice()) orelse return error.MissingPrimaryKeyHint;
+    try check(try context.preparePrimaryKey(&store.database, repeated.source, snap, .integer));
+    try check(context.primary_key_cache_hits == 1);
+    db.read_context = &context;
+    db.running_statement = true;
+    db.engine_session.values.role = 2468;
+    try check(!try db.executeDetachedPrimaryKey(repeated.source, 20, repeated.key, "SELECT 7", &s.result));
+    db.engine_session.values.role = 0;
+    try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "DC");
+    db.read_context = null;
+    db.running_statement = false;
+    try check(s.result.row_count == 1 and s.result.rows[0].cells[0].integer == 7);
+
+    _ = try storeQuery(&s, &db, "UPDATE pk SET id=8 WHERE id=7");
+    const after: Raw.Snapshot = .{.csn=store.database.csn};
+    const old_key: Raw.Cell = .{.integer=7};
+    try check(!try context.runPrimaryKey(&store.database, after, &old_key, &s.result));
+    try check(try context.preparePrimaryKey(&store.database, template, after, .integer));
+    try check(context.primary_key_cache_hits == 1);
+    try check(try context.runPrimaryKey(&store.database, after, &old_key, &s.result));
+    try check(s.result.row_count == 0);
+}
+
 fn commandTag(bytes: []const u8, wanted: []const u8) !void {
     var frames: Frames = .{ .bytes = bytes };
     while (try frames.next()) |f| if (f.tag == 'C') {
@@ -1606,6 +1747,7 @@ pub fn main(init: std.process.Init) !void {
     try startupFraming();
     try initializedProtocolPrefixes();
     try detachedCandidates();
+    try detachedPrimaryKeys();
     try oversizedFrames();
     try roleAuthenticationContracts();
     try nativeCommandCompletions(false);

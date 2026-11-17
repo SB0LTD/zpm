@@ -222,6 +222,8 @@ pub fn Database(comptime config: Config) type {
 
     const V = types.Values(config);
     const S = storage.Storage(config);
+    if (config.integral_external_versions and !S.integral_enabled)
+        @compileError("integral_external_versions requires split external storage");
     const A = ast.Ast(config);
     const P = parser_module.Parser(config);
     const B = binder_module.Binder(config);
@@ -261,6 +263,8 @@ pub fn Database(comptime config: Config) type {
         pub const StorageBacking = S.Backing;
         pub const StorageRowSlot = S.RowSlot;
         pub const StorageVersion = S.Version;
+        pub const StorageVersionRow = S.VersionRow;
+        pub const integralRowWords = S.integralRowWords;
         pub const ReplayScratch = C.Scratch;
         pub const Snapshot = storage.Snapshot;
         pub const LockSet = L.Set;
@@ -553,7 +557,7 @@ pub fn Database(comptime config: Config) type {
                 if (comptime config.external_results) {
                     if (rows_per_entry > row_storage.len / entries.len) return error.InvalidParameterValue;
                 } else if (row_storage.len != 0 or rows_per_entry > Result.default_row_capacity) return error.InvalidParameterValue;
-                const spans = [_]StorageSpan{ try ReadContext.objectSpan(cache), try ReadContext.span(entries), try ReadContext.span(keys), try ReadContext.span(row_storage) };
+                const spans = [_]StorageSpan{ try ReadContext.objectSpan(cache), try StorageSpan.of(entries), try StorageSpan.of(keys), try StorageSpan.of(row_storage) };
                 for (spans, 0..) |part, index| {
                     try ReadContext.disjointDatabase(db, part);
                     for (spans[0..index]) |earlier| if (ReadContext.overlaps(part, earlier)) return error.InvalidParameterValue;
@@ -568,8 +572,8 @@ pub fn Database(comptime config: Config) type {
 
             fn validateContext(cache: *const Cache, context: *const ReadContext, result: *const Result) Error!void {
                 const spans = [_]StorageSpan{ try ReadContext.objectSpan(context), try ReadContext.objectSpan(result),
-                    try ReadContext.span(context.source), try ReadContext.span(context.session.database), try ReadContext.span(context.workspace.query.cells[0..]),
-                    try ReadContext.span(context.workspace.query.refs[0..]), try ReadContext.span(result.rows[0..]) };
+                    try StorageSpan.of(context.source), try StorageSpan.of(context.session.database), try StorageSpan.of(context.workspace.query.cells[0..]),
+                    try StorageSpan.of(context.workspace.query.refs[0..]), try StorageSpan.of(result.rows[0..]) };
                 for (cache.storage_spans) |part| {
                     for (spans) |other| if (ReadContext.overlaps(part, other)) return error.InvalidParameterValue;
                 }
@@ -937,7 +941,28 @@ pub fn Database(comptime config: Config) type {
         /// buffer. No row/database snapshots are copied into this context.
         pub const ReadContext = struct {
             const Context=@This();
-            const Plan=union(enum){simple:B.Select,general:u16};
+            const PrimaryKeyPlan = struct {
+                select: B.Select,
+                projection: [config.columns]u16,
+                column: usize,
+                data_type: DataType,
+                oid: u32,
+                role: u32,
+                prepared_csn: u64,
+                snapshot: Snapshot,
+            };
+            const Plan=union(enum){simple:B.Select,general:u16,primary_key:PrimaryKeyPlan};
+            pub const primary_key_source_capacity = 256;
+            /// The retained plan's projected columns and result metadata are
+            /// independent of the AST workspace and own their template bytes.
+            const CachedPrimaryKey = struct {
+                source: [primary_key_source_capacity]u8 = undefined,
+                len: usize,
+                database: *const Self,
+                plan: PrimaryKeyPlan,
+            };
+            cached_primary_key: ?CachedPrimaryKey = null,
+            primary_key_cache_hits: usize = 0,
             workspace:Workspace=.{},
             session:value_module.Session=.{},
             dialect:Dialect=.postgres,
@@ -969,7 +994,7 @@ pub fn Database(comptime config: Config) type {
                 const required=try Context.backingBytesFor(rows,reference_count);
                 if(bytes.len<required) return error.WorkspaceCapacity;
                 const own=try objectSpan(self);
-                if(overlaps(own,try span(bytes))) return error.InvalidParameterValue;
+                if(overlaps(own,try StorageSpan.of(bytes))) return error.InvalidParameterValue;
                 const cells=try Self.storageView(Cell,bytes,0,rows*2*config.columns);
                 const refs=try Self.storageView(u32,bytes,try Self.queryWorkspaceBytes(rows),reference_count);
                 self.workspace.query.cells=cells;self.workspace.query.refs=refs;
@@ -981,25 +1006,19 @@ pub fn Database(comptime config: Config) type {
                 if(last[1]!=0) return error.InvalidParameterValue;
                 return .{.start=first,.end=last[0]};
             }
-            fn span(values:anytype) Error!StorageSpan {
-                const bytes=@mulWithOverflow(values.len,@sizeOf(@TypeOf(values[0])));
-                const last=@addWithOverflow(@intFromPtr(values.ptr),bytes[0]);
-                if(bytes[1]!=0 or last[1]!=0) return error.InvalidParameterValue;
-                return .{.start=@intFromPtr(values.ptr),.end=last[0]};
-            }
             fn overlaps(a:StorageSpan,b:StorageSpan) bool {
                 return a.start<a.end and b.start<b.end and a.start<b.end and b.start<a.end;
             }
             fn disjointDatabase(db: *const Self, part: StorageSpan) Error!void {
                 if (overlaps(part, try objectSpan(db))) return error.InvalidParameterValue;
                 if (comptime config.external_workspace) {
-                    if (overlaps(part, try span(db.workspace.query.cells[0..]))) return error.InvalidParameterValue;
+                    if (overlaps(part, try StorageSpan.of(db.workspace.query.cells[0..]))) return error.InvalidParameterValue;
                 }
                 if (comptime config.external_storage) {
-                    if (overlaps(part, try span(db.workspace.query.refs[0..]))) return error.InvalidParameterValue;
+                    if (overlaps(part, try StorageSpan.of(db.workspace.query.refs[0..]))) return error.InvalidParameterValue;
                 }
-                for (&db.tables) |*table| inline for (.{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" }) |name| {
-                    if (overlaps(part, try span(@field(table, name)[0..]))) return error.InvalidParameterValue;
+                for (&db.tables) |*table| inline for (storage_fields) |name| {
+                    if (overlaps(part, try StorageSpan.of(@field(table, name)[0..]))) return error.InvalidParameterValue;
                 };
             }
             fn validate(self:*Context,db:*const Self,source:[]const u8,result:?*Result) Error!void {
@@ -1007,11 +1026,11 @@ pub fn Database(comptime config: Config) type {
                 if(cells.len<2*config.columns or refs.len==0) return error.WorkspaceCapacity;
                 const empty:StorageSpan=.{.start=0,.end=0};
                 const mutable=[_]StorageSpan{try objectSpan(self),
-                    if(config.external_workspace) try span(cells) else empty,
-                    if(config.external_storage) try span(refs) else empty,
+                    if(config.external_workspace) try StorageSpan.of(cells) else empty,
+                    if(config.external_storage) try StorageSpan.of(refs) else empty,
                     if(result) |out| try objectSpan(out) else empty,
-                    if(config.external_results and result!=null) try span(result.?.rows) else empty};
-                const source_span=try span(source);
+                    if(config.external_results and result!=null) try StorageSpan.of(result.?.rows) else empty};
+                const source_span=try StorageSpan.of(source);
                 for(mutable,0..) |part,index| {
                     if(overlaps(part,source_span)) return error.InvalidParameterValue;
                     for(mutable[0..index]) |earlier| if(overlaps(part,earlier)) return error.InvalidParameterValue;
@@ -1021,23 +1040,23 @@ pub fn Database(comptime config: Config) type {
             /// Callbacks in session (clock/zone resolver/control) must themselves
             /// be safe for concurrent reads. Sequence hooks are always disabled.
             pub fn prepare(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot) Error!void {
-                return self.prepareMode(db,source,snapshot,false);
+                return self.prepareMode(db,source,snapshot,false,null);
             }
             /// Metadata binding is separate from executable preparation. It
             /// never leaves a metadata-only plan available to run().
             pub fn describe(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,result:*Result) Error!void {
                 defer self.prepared=null;
-                try self.prepareMode(db,source,snapshot,true);
+                try self.prepareMode(db,source,snapshot,true,null);
                 try self.describeResult(result);
             }
-            fn prepareMode(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
+            fn prepareMode(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool,params:?*const B.Parameters) Error!void {
                 self.last_result_reused = false;
                 try self.validate(db,source,null);
                 self.prepared=null;
                 self.preparation_error=null;self.database=db;self.source=source;self.snapshot=snapshot;
-                self.prepareBody(db,source,snapshot,describe_only) catch |err| {self.preparation_error=err;return err;};
+                self.prepareBody(db,source,snapshot,describe_only,params) catch |err| {self.preparation_error=err;return err;};
             }
-            fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
+            fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool,params:?*const B.Parameters) Error!void {
                 self.session.sequences=null;
                 var parsed=try P.parseWithOptions(source,&self.workspace.nodes,.{.dialect=self.dialect});
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
@@ -1047,7 +1066,7 @@ pub fn Database(comptime config: Config) type {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
-                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,
+                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,.params=params,
                     .user_type_catalog=&db.catalog_objects};
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
@@ -1061,6 +1080,130 @@ pub fn Database(comptime config: Config) type {
                 self.prepared=switch(bound){.select=>|select| .{.simple=select},.query=>|root| .{.general=root},else=>return error.UnsupportedStatement};
                 self.database=db;self.source=source;self.effective=expanded;self.snapshot=snapshot;
             }
+
+            fn directColumn(node: *const ast.Node, count: usize) bool {
+                return node.kind == .column and node.level == 0 and node.relation == 0 and node.column < count;
+            }
+
+            /// Binds a PostgreSQL integral PK lookup using a declared parameter
+            /// type and this context's role. False means use ordinary execution.
+            /// Keep the SQL buffer unchanged and the committed snapshot alive.
+            /// Replacing database contents ends the binding, even at equal CSN.
+            pub fn preparePrimaryKey(self: *Context, db: *const Self, source: []const u8, snapshot: Snapshot, parameter: DataType) Error!bool {
+                self.last_result_reused = false;
+                self.prepared = null;
+                self.preparation_error = null;
+                if (comptime config.statement_parameters == 0) return false;
+                if (self.dialect != .postgres or snapshot.epoch != 0 or snapshot.csn > db.csn) return false;
+                switch (parameter) {
+                    .smallint, .integer32, .integer => {},
+                    else => return false,
+                }
+                if (self.cached_primary_key) |*cached| {
+                    if (cached.database == db and snapshotMatches(cached.plan.snapshot, snapshot) and
+                        self.primaryKeyTableCurrent(db, &cached.plan) and cached.plan.data_type == parameter and
+                        types.same(cached.source[0..cached.len], source))
+                    {
+                        try self.validate(db, source, null);
+                        try self.session.checkpoint();
+                        self.database = db;
+                        self.source = source;
+                        self.effective = source;
+                        self.snapshot = snapshot;
+                        self.prepared = .{ .primary_key = cached.plan };
+                        self.primary_key_cache_hits +%= 1;
+                        return true;
+                    }
+                }
+                var params: B.Parameters = .{ .count = 1 };
+                params.types[0] = types.typeOfData(parameter);
+                // As with SQL PREPARE, bind types before runtime values exist.
+                self.prepareMode(db, source, snapshot, true, &params) catch |err| {
+                    if (err != error.UnsupportedStatement) return err;
+                    self.preparation_error = null;
+                    return false;
+                };
+                const bound = self.prepared.?;
+                self.prepared = null;
+                if (bound != .simple or self.effective.ptr != source.ptr) return false;
+                const select = bound.simple;
+                if (select.where == ast.none or select.order_count != 0 or select.limit != ~@as(u64, 0) or select.lock.strength != .none) return false;
+                const table = &db.tables[select.table orelse return false];
+                const primary = table.primary_column orelse return false;
+                if (table.relkind != 'r' or table.parent != 0 or db.hasChildren(table.oid, snapshot) or
+                    db.catalog_objects.rowSecurity(self.session.role, table.oid, snapshot) or table.columns[primary].data_type != parameter) return false;
+                const nodes = &self.workspace.nodes.nodes;
+                const predicate = &nodes[select.where];
+                if (predicate.kind != .binary or predicate.op != .eq) return false;
+                const left = &nodes[predicate.a];
+                const right = &nodes[predicate.b];
+                const column = if (left.kind == .param) right else left;
+                const argument = if (left.kind == .param) left else right;
+                if (!directColumn(column, table.column_count) or column.column != primary or argument.kind != .param or argument.integer != 1 or argument.ty != params.types[0]) return false;
+                var projection: [config.columns]u16 = undefined;
+                for (select.targets[0..select.count], 0..) |id, position| {
+                    const item = &nodes[id];
+                    if (!directColumn(item, table.column_count)) return false;
+                    projection[position] = item.column;
+                }
+                const plan: PrimaryKeyPlan = .{
+                    .select = select,
+                    .projection = projection,
+                    .column = primary,
+                    .data_type = parameter,
+                    .oid = table.oid,
+                    .role = self.session.role,
+                    .prepared_csn = db.csn,
+                    .snapshot = snapshot,
+                };
+                self.prepared = .{ .primary_key = plan };
+                if (source.len <= primary_key_source_capacity) {
+                    self.cached_primary_key = .{ .len=source.len, .database=db, .plan=plan };
+                    @memcpy(self.cached_primary_key.?.source[0..source.len], source);
+                }
+                return true;
+            }
+
+            /// An installed plan must match the owned template and parameter
+            /// supplied by the current portal, before checking the snapshot.
+            pub fn primaryKeyMatches(self: *const Context, source: []const u8, parameter: DataType) bool {
+                const plan = if (self.prepared) |*prepared| prepared else return false;
+                return plan.* == .primary_key and plan.primary_key.data_type == parameter and types.same(self.source, source);
+            }
+
+            fn snapshotMatches(cached: Snapshot, current: Snapshot) bool {
+                return current.epoch == 0 and cached.epoch == 0 and cached.csn == current.csn and
+                    cached.slot == current.slot and cached.cid == current.cid;
+            }
+
+            fn primaryKeyCurrent(self: *const Context, db: *const Self, snapshot: Snapshot, plan: *const PrimaryKeyPlan) bool {
+                return self.database == db and snapshotMatches(plan.snapshot, snapshot) and self.primaryKeyTableCurrent(db, plan);
+            }
+
+            fn primaryKeyTableCurrent(self: *const Context, db: *const Self, plan: *const PrimaryKeyPlan) bool {
+                if (plan.prepared_csn != db.csn or self.session.role != plan.role or self.dialect != .postgres) return false;
+                const table = &db.tables[plan.select.table.?];
+                return table.live and table.oid == plan.oid and table.primary_column == plan.column and
+                    table.columns[plan.column].data_type == plan.data_type;
+            }
+
+            /// Runs a prepared PK probe without parsing or binding again.
+            /// A stale binding returns false and leaves the result untouched.
+            /// The caller still excludes mutation for the duration of the read.
+            pub fn runPrimaryKey(self: *Context, db: *const Self, snapshot: Snapshot, key: *const Cell, result: *Result) Error!bool {
+                const prepared = if (self.prepared) |*plan| plan else return false;
+                if (prepared.* != .primary_key) return false;
+                const plan = &prepared.primary_key;
+                if (!self.primaryKeyCurrent(db, snapshot, plan)) return false;
+                try self.validate(db, self.source, result);
+                if (config.external_results and result.rows.len == 0) return error.InvalidParameterValue;
+                const table = &db.tables[plan.select.table.?];
+                if (key.* != .null_value) try V.validate(&table.columns[plan.column], key);
+                self.workspace.query.read_stats = .{};
+                try X.selectPrimaryKey(table, &plan.select, plan.projection[0..plan.select.count], key, snapshot, result, &self.session);
+                return true;
+            }
+
             pub fn run(self:*Context,result:*Result) Error!void {
                 return self.runWithCache(result, null);
             }
@@ -1098,6 +1241,7 @@ pub fn Database(comptime config: Config) type {
                         &self.session,self.snapshot.epoch==0,&self.workspace.query.read_stats,&self.workspace.query),
                     .general=>|root| try X.runQuery(&db.tables,self.effective,&self.workspace.nodes,&self.workspace.plans,root,self.snapshot,result,
                         &self.session,&self.workspace.query,self.snapshot.epoch==0),
+                    .primary_key => return error.UndefinedParameter,
                 }
                 if (cache_hash) |hash| try cache.?.put(self, hash, result);
             }
@@ -1189,17 +1333,14 @@ pub fn Database(comptime config: Config) type {
                 try self.validate(db,self.source,result);
                 if(self.preparation_error) |err| return err;
                 const plan=self.prepared orelse return error.InvalidParameterValue;
-                result.clear(0);result.command=.select;
                 switch(plan) {
-                    .simple=>|select| {
-                        result.column_count=select.count;
-                        result.non_null_columns=select.non_null_columns;
-                        @memcpy(result.column_names[0..select.count],select.names[0..select.count]);
-                        @memcpy(result.column_types[0..select.count],select.types[0..select.count]);
-                        @memcpy(result.column_typmods[0..select.count],select.typmods[0..select.count]);
-                        if (select.has_nominal_types) result.setNominalTypes(select.nominal_types[0..select.count]);
+                    .simple=>|*select| X.writeHeader(select,result),
+                    .primary_key=>|*key| {
+                        if (!self.primaryKeyCurrent(db, self.snapshot, key)) return error.InvalidParameterValue;
+                        X.writeHeader(&key.select,result);
                     },
                     .general=>|root| {
+                        result.clear(0);result.command=.select;
                         const query=&self.workspace.plans.items[root];
                         result.column_count=query.count;
                         result.non_null_columns=query.non_null_columns;
@@ -1334,15 +1475,26 @@ pub fn Database(comptime config: Config) type {
             set: *const fn (?*anyopaque, []const u8, []const u8, bool, bool) Error!bool,
         };
 
+        const storage_fields = .{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" } ++
+            (if (S.split_versions) .{"version_rows"} else .{}) ++
+            (if (S.integral_enabled) .{"integral_rows"} else .{});
+
         const BackingLayout = struct {
-            offsets: [config.tables][9]usize,
+            offsets: [config.tables][storage_fields.len]usize,
             refs: usize,
             bytes: usize,
             row_index: [config.tables]usize,
             key_index: [config.tables]usize,
         };
 
-        pub const TableBudget = struct { rows: usize, versions: usize };
+        pub const TableBudget = struct {
+            rows: usize,
+            versions: usize,
+            /// Zero selects dense rows. A nonzero integral bank reserves
+            /// this many u64 words per version, including the null bitmap.
+            /// CREATE uses the first compatible free bank in caller order.
+            integral_row_words: usize = 0,
+        };
 
         fn appendLayout(cursor: *usize, comptime T: type, count: usize) Error!usize {
             const aligned = @addWithOverflow(cursor.*, @alignOf(T) - 1);
@@ -1383,6 +1535,13 @@ pub fn Database(comptime config: Config) type {
                 const index_slots = @mulWithOverflow(ki, S.bound_indexes);
                 if (index_slots[1] != 0) return error.InvalidParameterValue;
                 offsets[8] = if (S.bound_indexes != 0) try appendLayout(&cursor, u32, index_slots[0]) else cursor;
+                if (!S.integral_enabled and budget.integral_row_words != 0) return error.InvalidParameterValue;
+                if (comptime S.split_versions) offsets[9] = try appendLayout(&cursor, S.VersionRow, if (budget.integral_row_words == 0) versions else 0);
+                if (comptime S.integral_enabled) {
+                    const words = @mulWithOverflow(versions, budget.integral_row_words);
+                    if (words[1] != 0) return error.InvalidParameterValue;
+                    offsets[10] = try appendLayout(&cursor, u64, words[0]);
+                }
             }
             layout.refs = try appendLayout(&cursor, u32, refs);
             layout.bytes = cursor;
@@ -1417,14 +1576,14 @@ pub fn Database(comptime config: Config) type {
             if (comptime !config.external_workspace) @compileError("bindWorkspace requires external_workspace");
             if (self.csn != 0 or cells.len < 2 * config.columns or cells.len > 0xffffffff) return error.InvalidParameterValue;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
-            const region = StorageSpan.of(cells);
+            const region = try StorageSpan.of(cells);
             const own: StorageSpan = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
             if (region.start < own.end and own.start < region.end) return error.InvalidParameterValue;
             if (comptime config.external_storage) {
-                const refs = StorageSpan.of(self.workspace.query.refs);
+                const refs = try StorageSpan.of(self.workspace.query.refs);
                 if (refs.start < refs.end and region.start < refs.end and refs.start < region.end) return error.InvalidParameterValue;
-                for (&self.tables) |*table| inline for (.{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" }) |field| {
-                    const part = StorageSpan.of(@field(table, field));
+                for (&self.tables) |*table| inline for (storage_fields) |field| {
+                    const part = try StorageSpan.of(@field(table, field));
                     if (part.start < part.end and region.start < part.end and part.start < region.end) return error.InvalidParameterValue;
                 };
             }
@@ -1458,6 +1617,9 @@ pub fn Database(comptime config: Config) type {
             for (&backings, layout.offsets, layout.row_index, layout.key_index, budgets) |*backing, offsets, ri, ki, budget| backing.* = .{
                 .rows = try storageView(S.RowSlot, bytes, offsets[0], budget.rows),
                 .versions = try storageView(S.Version, bytes, offsets[1], budget.versions),
+                .version_rows = if (comptime S.split_versions) try storageView(S.VersionRow, bytes, offsets[9], if (budget.integral_row_words == 0) budget.versions else 0) else {},
+                .integral_rows = if (comptime S.integral_enabled) try storageView(u64, bytes, offsets[10], budget.versions * budget.integral_row_words) else {},
+                .integral_row_words = if (S.integral_enabled) budget.integral_row_words else {},
                 .row_index = try storageView(u32, bytes, offsets[2], ri),
                 .key_index = try storageView(u32, bytes, offsets[3], ki),
                 .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) budget.rows * config.columns else 0),
@@ -1473,9 +1635,12 @@ pub fn Database(comptime config: Config) type {
             start: usize,
             end: usize,
 
-            fn of(values: anytype) StorageSpan {
+            fn of(values: anytype) Error!StorageSpan {
                 const start = @intFromPtr(values.ptr);
-                return .{ .start = start, .end = start + values.len * @sizeOf(@TypeOf(values[0])) };
+                const size = @mulWithOverflow(values.len, @sizeOf(@TypeOf(values[0])));
+                const end = @addWithOverflow(start, size[0]);
+                if (size[1] != 0 or end[1] != 0) return error.InvalidParameterValue;
+                return .{ .start = start, .end = end[0] };
             }
         };
 
@@ -1488,21 +1653,15 @@ pub fn Database(comptime config: Config) type {
             if (self.csn != 0 or refs.len == 0 or refs.len > 0x7fffffff) return error.InvalidParameterValue;
             for (&self.tables) |*table| if (table.live) return error.InvalidParameterValue;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
-            var spans: [config.tables * 9 + 3]StorageSpan = undefined;
+            var spans: [config.tables * storage_fields.len + 3]StorageSpan = undefined;
             spans[0] = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
-            spans[1] = StorageSpan.of(refs);
-            spans[spans.len - 1] = if (comptime config.external_workspace) StorageSpan.of(self.workspace.query.cells) else .{ .start = 0, .end = 0 };
+            spans[1] = try StorageSpan.of(refs);
+            spans[spans.len - 1] = if (comptime config.external_workspace) try StorageSpan.of(self.workspace.query.cells) else .{ .start = 0, .end = 0 };
             for (backings, 0..) |backing, i| {
                 if (!backing.valid()) return error.InvalidParameterValue;
-                spans[2 + i * 9] = StorageSpan.of(backing.rows);
-                spans[3 + i * 9] = StorageSpan.of(backing.versions);
-                spans[4 + i * 9] = StorageSpan.of(backing.row_index);
-                spans[5 + i * 9] = StorageSpan.of(backing.key_index);
-                spans[6 + i * 9] = StorageSpan.of(backing.scan_values);
-                spans[7 + i * 9] = StorageSpan.of(backing.scan_nonnull);
-                spans[8 + i * 9] = StorageSpan.of(backing.scan_live);
-                spans[9 + i * 9] = StorageSpan.of(backing.scan_presence);
-                spans[10 + i * 9] = StorageSpan.of(backing.index_slots);
+                inline for (storage_fields, 0..) |field, index| {
+                    spans[2 + i * storage_fields.len + index] = try StorageSpan.of(@field(backing, field));
+                }
             }
             for (spans, 0..) |a, i| for (spans[i + 1 ..]) |b| {
                 if (a.start == a.end or b.start == b.end) continue;
@@ -1511,6 +1670,11 @@ pub fn Database(comptime config: Config) type {
             for (&self.tables, backings) |*table, backing| {
                 table.rows = backing.rows;
                 table.versions = backing.versions;
+                if (comptime S.split_versions) table.version_rows = backing.version_rows;
+                if (comptime S.integral_enabled) {
+                    table.integral_rows = backing.integral_rows;
+                    table.integral_row_words = backing.integral_row_words;
+                }
                 table.row_index = backing.row_index;
                 table.key_index = backing.key_index;
                 table.scan_values = backing.scan_values;
@@ -1546,6 +1710,7 @@ pub fn Database(comptime config: Config) type {
             for (&self.tables, &source.tables) |*dst, *src| if (src.live) {
                 if (dst.rows.len < src.row_high or dst.versions.len < src.version_high or dst.row_index.len == 0 or dst.key_index.len == 0) return error.WorkspaceCapacity;
                 if (!S.indexFits(dst, src.index_count, src.version_used)) return error.WorkspaceCapacity;
+                if (!S.schemaFits(dst, src.columns[0..src.column_count])) return error.WorkspaceCapacity;
             };
             self.copyState(source);
         }
@@ -2440,12 +2605,13 @@ pub fn Database(comptime config: Config) type {
             work.ref_high -= count;
             const out: X.List = .{ .start = @intCast(work.ref_high), .count = @intCast(count) };
             var ctx = self.evalContext(source);
+            var row_scratch: S.VersionRowScratch = undefined;
             const table = &self.tables[table_index];
             var row: usize = 0;
             for (writes) |entry| {
                 if (!rowWrite(entry.kind) or entry.table != table_index) continue;
                 try self.session.checkpoint();
-                ctx.row = &table.versions[if (entry.kind == .delete) entry.old else entry.new].cells;
+                ctx.row = S.borrowVersionRow(table, if (entry.kind == .delete) entry.old else entry.new, &row_scratch);
                 const at = work.cell_high + row * width;
                 for (list.targets[0..width], 0..) |id, column| work.cells[at + column] = try E.eval(&ctx, id);
                 work.refs[out.start + row] = @intCast(at);
@@ -2478,6 +2644,8 @@ pub fn Database(comptime config: Config) type {
             const width = list.count;
             const base = try X.stageCells(work, count * width);
             var ctx = self.evalContext(source);
+            var row_scratch: S.VersionRowScratch = undefined;
+            var cell_scratch: Cell = undefined;
             var row: usize = 0;
             for (writes) |entry| {
                 if (!rowWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
@@ -2487,10 +2655,10 @@ pub fn Database(comptime config: Config) type {
                     for (list.targets[0..width], 0..) |id, column| {
                         const version = if (list.deleted_columns.isSet(column)) entry.old else entry.new;
                         const source_column = self.workspace.nodes.nodes[id].column;
-                        work.cells[base + row * width + column] = table.versions[version].cells[source_column];
+                        work.cells[base + row * width + column] = S.borrowVersionCell(table, version, source_column, &cell_scratch).*;
                     }
                 } else {
-                    ctx.row = &table.versions[if (entry.kind == .delete) entry.old else entry.new].cells;
+                    ctx.row = S.borrowVersionRow(table, if (entry.kind == .delete) entry.old else entry.new, &row_scratch);
                     for (list.targets[0..width], 0..) |id, column| work.cells[base + row * width + column] = try E.eval(&ctx, id);
                 }
                 row += 1;
@@ -4867,7 +5035,28 @@ pub fn Database(comptime config: Config) type {
             if (M.write_capacity - self.txs[slot].write_len < count) return error.WriteSetCapacity;
         }
 
+        /// The experimental heterogeneous banks are chosen in WAL order.
+        /// Overlapping table DDL can commit in a different order from slot
+        /// acquisition. Replay also makes DROP slots available immediately.
+        fn fenceBankPlacement(self: *Self, slot: u16, creating: bool) Error!void {
+            if (!S.anyIntegralBank(&self.tables)) return;
+            for (&self.txs, 0..) |*tx, owner| {
+                if (owner == slot or !tx.active) continue;
+                for (tx.writes[0..tx.write_len]) |entry| switch (entry.kind) {
+                    .create_table, .drop_table, .alter_table => return error.SerializationFailure,
+                    else => {},
+                };
+            }
+            if (creating) {
+                self.reclaimTables(self.horizon());
+                for (&self.tables) |*table| {
+                    if (table.live and (table.pending_drop or table.dead_csn != 0)) return error.SerializationFailure;
+                }
+            }
+        }
+
         fn createTable(self: *Self, slot: u16, create: *const B.Create, snap: Snapshot, source: []const u8) Error!usize {
+            try self.fenceBankPlacement(slot, true);
             const tx = &self.txs[slot];
             // CREATE TABLE AS / MATERIALIZED VIEW read their sources first,
             // so a lock wait parks before anything is written.
@@ -4887,9 +5076,10 @@ pub fn Database(comptime config: Config) type {
                 return self.park(slot, waits);
             };
             try self.reserveWrites(slot, 2 + create.count);
+            const columns = create.columns[0..create.count];
             var destination: ?usize = null;
             for (0..2) |attempt| {
-                for (&self.tables, 0..) |*table, index| if (!table.live) {
+                for (&self.tables, 0..) |*table, index| if (!table.live and S.createBankFits(table, columns, create.extras.index_count)) {
                     destination = index;
                     break;
                 };
@@ -4900,7 +5090,7 @@ pub fn Database(comptime config: Config) type {
             if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
             const table = &self.tables[index];
             if (!S.indexFits(table, create.extras.index_count, 0)) return error.IndexCapacity;
-            S.reset(table, change_log.first_oid + self.oid_counter, create.name, create.columns[0..create.count]);
+            S.reset(table, change_log.first_oid + self.oid_counter, create.name, columns);
             table.namespace = create.namespace;
             S.setConstraints(table, create.constraints[0..create.constraint_count]);
             S.setExtras(table, &create.extras);
@@ -4993,6 +5183,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {
+            try self.fenceBankPlacement(slot, false);
             try self.lockTable(slot, index, .access_exclusive);
             const tx = &self.txs[slot];
             const table = &self.tables[index];
@@ -5119,6 +5310,9 @@ pub fn Database(comptime config: Config) type {
         /// free table slot (TableCapacity, 54000) until the old one is
         /// reclaimed after commit.
         fn alterTable(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            // ALTER acquires a new bank live and replays in place. Even a
+            // dense bank move can change later heterogeneous CREATE choices.
+            if (S.anyIntegralBank(&self.tables)) return error.UnsupportedStatement;
             const source = &self.tables[alter.table];
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);
@@ -5189,11 +5383,12 @@ pub fn Database(comptime config: Config) type {
             try B.bindFlaggedChecks(&context, index, &alter.check_constraint, &checks);
             const table = &self.tables[index];
             var ctx = self.evalContext("");
+            var row_scratch: S.VersionRowScratch = undefined;
             for (0..table.row_high) |row| {
                 if (table.rows[row].newest == 0) continue;
                 const version = S.visibleAt(table, row, snap) orelse continue;
                 try self.session.checkpoint();
-                const cells = &table.versions[version].cells;
+                const cells = S.borrowVersionRow(table, version, &row_scratch);
                 for (0..table.column_count) |column| {
                     if (alter.check_not_null[column] and cells[column] == .null_value) return error.NotNullViolation;
                 }
@@ -5305,12 +5500,16 @@ pub fn Database(comptime config: Config) type {
             // snapshot (ExecCheckTupleVisible).
             if (transactionSnapshot(self.txs[slot].isolation) and !snap.own(table.versions[goal].xmin) and table.versions[goal].xmin_csn > snap.csn) return error.SerializationFailure;
             const row = table.versions[goal].row - 1;
+            const previous_row = ctx.row;
+            defer ctx.row = previous_row;
+            var row_scratch: S.VersionRowScratch = undefined;
+            const old = S.borrowVersionRow(table, goal, &row_scratch);
             ctx.tuple[1] = proposed;
-            if (!try X.keep(ctx, update.where, &table.versions[goal].cells)) {
+            if (!try X.keep(ctx, update.where, old)) {
                 if (try self.locks.grantRow(table_index, table.rows[row].rowid, slot, .update)) |granted| try M.recordLock(self, slot, granted);
                 return 0;
             }
-            return @intFromBool(try self.updateOne(slot, ctx, update, row, goal, snap));
+            return @intFromBool(try self.updateOne(slot, ctx, update, row, goal, old, snap));
         }
 
         /// A primary-key replacement is one real delete and one insert. More
@@ -5384,7 +5583,7 @@ pub fn Database(comptime config: Config) type {
                 .nothing, .none => return 0,
                 .update => return self.conflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap),
             };
-            if (table.primary_column) |column| switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
+            if (table.primary_column) |column| switch (S.primaryKeyCheck(table, &cells[column], 0xffffffff, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
                 .wait => |owner| {
@@ -5435,7 +5634,9 @@ pub fn Database(comptime config: Config) type {
                 var all = true;
                 for (constraint.keyColumns(), constraint.operators[0..constraint.column_count]) |column, operator| {
                     if (!all) break;
-                    all = try exclusionMatch(operator, &version.cells[column], &cells[column]);
+                    var temporary: V.Cell = undefined;
+                    const stored = S.borrowVersionCell(table, index, column, &temporary);
+                    all = try exclusionMatch(operator, stored, &cells[column]);
                 }
                 if (!all) continue;
                 if (S.classify(version, index, snap, &waiting)) |state| return state;
@@ -5477,7 +5678,9 @@ pub fn Database(comptime config: Config) type {
                 if (version.row == 0) continue;
                 var equal = true;
                 for (columns, key_columns) |column, source| {
-                    if (version.cells[column] == .null_value or V.compare(&version.cells[column], &key[source]) != 0) equal = false;
+                    var temporary: V.Cell = undefined;
+                    const stored = S.borrowVersionCell(table, index, column, &temporary);
+                    if (stored.* == .null_value or V.compare(stored, &key[source]) != 0) equal = false;
                 }
                 if (!equal) continue;
                 if (version.xmin_csn == 0) {
@@ -5591,7 +5794,9 @@ pub fn Database(comptime config: Config) type {
                 if (entry.row == 0) continue;
                 var equal = true;
                 for (constraint.keyColumns(), constraint.refColumns()) |column, key| {
-                    if (entry.cells[column] == .null_value or V.compare(&entry.cells[column], &old[key]) != 0) equal = false;
+                    var temporary: V.Cell = undefined;
+                    const stored = S.borrowVersionCell(child, version, column, &temporary);
+                    if (stored.* == .null_value or V.compare(stored, &old[key]) != 0) equal = false;
                 }
                 if (!equal) continue;
                 var goal = version;
@@ -5614,11 +5819,14 @@ pub fn Database(comptime config: Config) type {
                 switch (action) {
                     .no_action, .restrict => return error.ForeignKeyViolation,
                     .cascade => if (new) |cells| {
-                        var updated = child.versions[goal].cells;
+                        var updated: E.Row = undefined;
+                        S.copyVersionRow(child, goal, &updated);
                         for (constraint.keyColumns(), constraint.refColumns()) |column, key| updated[column] = try D.store(&child.columns[column], cells[key], &self.session);
                         try self.cascadeUpdate(slot, child_index, goal, &updated, .none, snap);
                     } else {
-                        try self.referencedChange(slot, child_index, &child.versions[goal].cells, null, snap);
+                        var row_scratch: S.VersionRowScratch = undefined;
+                        const prior = S.borrowVersionRow(child, goal, &row_scratch);
+                        try self.referencedChange(slot, child_index, prior, null, snap);
                         if (child.versions[goal].xmax.epoch != 0) continue;
                         try self.reserveWrites(slot, 1);
                         child.versions[goal].xmax = tx.ref(slot);
@@ -5626,7 +5834,8 @@ pub fn Database(comptime config: Config) type {
                         tx.push(.{ .kind = .delete, .table = @intCast(child_index), .old = goal }) catch unreachable;
                     },
                     .set_null, .set_default => {
-                        var updated = child.versions[goal].cells;
+                        var updated: E.Row = undefined;
+                        S.copyVersionRow(child, goal, &updated);
                         for (constraint.keyColumns()) |column| {
                             updated[column] = .null_value;
                             if (action == .set_default) {
@@ -5668,7 +5877,7 @@ pub fn Database(comptime config: Config) type {
             var ctx = self.evalContext("");
             try D.checkRow(&ctx, table, &checks, cells);
             const row = table.versions[old].row - 1;
-            if (table.primary_column) |column| if (V.compare(&cells[column], &table.versions[old].cells[column]) != 0) switch (D.keyCheck(table, &cells[column], row, snap)) {
+            if (table.primary_column) |column| if (!S.versionCellEquals(table, old, column, &cells[column])) switch (S.primaryKeyCheck(table, &cells[column], row, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
                 .wait => |owner| {
@@ -5677,10 +5886,12 @@ pub fn Database(comptime config: Config) type {
                     return self.park(slot, waits);
                 },
             };
-            if ((try self.uniqueTaken(slot, table_index, cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
-            try self.exclusionTaken(slot, table_index, cells, row, &table.versions[old].cells, snap);
-            if (check != .none) try self.checkReferences(slot, table_index, cells, if (check == .all) null else &table.versions[old].cells, snap);
-            try self.referencedChange(slot, table_index, &table.versions[old].cells, cells, snap);
+            var row_scratch: S.VersionRowScratch = undefined;
+            const old_cells = S.borrowVersionRow(table, old, &row_scratch);
+            if ((try self.uniqueTaken(slot, table_index, cells, row, old_cells, snap)) != null) return error.PrimaryKeyViolation;
+            try self.exclusionTaken(slot, table_index, cells, row, old_cells, snap);
+            if (check != .none) try self.checkReferences(slot, table_index, cells, if (check == .all) null else old_cells, snap);
+            try self.referencedChange(slot, table_index, old_cells, cells, snap);
             if (table.versions[old].xmax.epoch != 0) return;
             try self.placeUpdate(slot, table_index, row, old, cells, snap);
         }
@@ -5691,9 +5902,7 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[table_index];
             try self.reserveWrites(slot, 1);
             try S.ensureVersions(table, 1, self.horizon());
-            const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .older = old + 1, .cells = cells.* };
-            table.rows[row].newest = version + 1;
+            const version = S.createVersion(table, .{ .row = row, .xmin = tx.ref(slot), .cid = snap.cid, .older = old + 1 }, cells);
             table.versions[old].xmax = tx.ref(slot);
             table.versions[old].xmax_cid = snap.cid;
             S.indexKey(table, version);
@@ -5749,6 +5958,7 @@ pub fn Database(comptime config: Config) type {
         /// mode is DEFERRED now (statement end, SET CONSTRAINTS IMMEDIATE).
         fn deferredCheck(self: *const Self, slot: u16, start: usize, immediate_only: bool) Error!void {
             const tx = &self.txs[slot];
+            var row_scratch: S.VersionRowScratch = undefined;
             if (!tx.active or !tx.deferred_checks) return;
             const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid +% 1 };
             for (tx.writes[start..tx.write_len]) |entry| {
@@ -5757,9 +5967,9 @@ pub fn Database(comptime config: Config) type {
                 if (!table.live or table.pending_drop) continue;
                 if (entry.kind != .delete) {
                     const version = &table.versions[entry.new];
-                    if (version.row != 0 and version.xmax.epoch == 0) try self.deferredRow(slot, table, &version.cells, version.row - 1, immediate_only, snap);
+                    if (version.row != 0 and version.xmax.epoch == 0) try self.deferredRow(slot, table, S.borrowVersionRow(table, entry.new, &row_scratch), version.row - 1, immediate_only, snap);
                 }
-                if (entry.kind != .insert) try self.deferredParent(slot, table, &table.versions[entry.old].cells, immediate_only, snap);
+                if (entry.kind != .insert) try self.deferredParent(slot, table, S.borrowVersionRow(table, entry.old, &row_scratch), immediate_only, snap);
             }
         }
 
@@ -5889,11 +6099,7 @@ pub fn Database(comptime config: Config) type {
             const state: S.KeyState = switch (arbiter) {
                 .primary, .any => blk: {
                     const column = table.primary_column orelse break :blk .free;
-                    break :blk switch (D.keyCheck(table, &cells[column], 0xffffffff, snap)) {
-                        .free => .free,
-                        .taken => |version| .{ .taken = version },
-                        .wait => |owner| .{ .wait = owner },
-                    };
+                    break :blk S.primaryKeyCheck(table, &cells[column], 0xffffffff, snap);
                 },
                 .constraint => |index| S.uniqueCheck(table, &table.constraints[index], cells, 0xffffffff, snap),
                 .index => |which| S.indexUniqueCheck(table, which, cells, 0xffffffff, snap),
@@ -6006,9 +6212,7 @@ pub fn Database(comptime config: Config) type {
             try S.ensureRowSlot(table, at);
             const row = S.allocRow(table, table.next_rowid);
             table.next_rowid += 1;
-            const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .cells = cells.* };
-            table.rows[row].newest = version + 1;
+            const version = S.createVersion(table, .{ .row = row, .xmin = tx.ref(slot), .cid = snap.cid }, cells);
             S.indexKey(table, version);
             tx.push(.{ .kind = .insert, .table = @intCast(table_index), .new = version }) catch unreachable;
         }
@@ -6349,7 +6553,7 @@ pub fn Database(comptime config: Config) type {
             tx.waiting_for = .{};
             const snap = tx.copy_snap;
             const table = &self.tables[table_index];
-            if (table.primary_column) |column| switch (D.keyCheck(table, &row.cells[column], 0xffffffff, snap)) {
+            if (table.primary_column) |column| switch (S.primaryKeyCheck(table, &row.cells[column], 0xffffffff, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
                 .wait => |owner| {
@@ -6426,6 +6630,7 @@ pub fn Database(comptime config: Config) type {
             const done = tx.progress;
             const table = &self.tables[merge.table];
             var ctx = self.evalContext(source);
+            var row_scratch: S.VersionRowScratch = undefined;
             const joined = (try self.joinedRows(source, merge.source, &merge.offsets, snap)) orelse return 0;
             const work = &self.workspace.query;
             var position: usize = 0;
@@ -6439,9 +6644,9 @@ pub fn Database(comptime config: Config) type {
                 for (0..table.row_high) |target_row| {
                     if (table.rows[target_row].newest == 0) continue;
                     const version = S.visibleAt(table, target_row, snap) orelse continue;
-                    if (!try X.keep(&ctx, merge.on, &table.versions[version].cells)) continue;
+                    if (!try X.keep(&ctx, merge.on, S.borrowVersionRow(table, version, &row_scratch))) continue;
                     matched = true;
-                    try self.mergeMatched(slot, &ctx, merge, @intCast(target_row), version, false, snap);
+                    try self.mergeMatched(slot, &ctx, &row_scratch, merge, @intCast(target_row), version, false, snap);
                 }
                 if (!matched) try self.mergeInsert(slot, &ctx, merge, snap);
                 tx.progress = position + 1;
@@ -6458,18 +6663,18 @@ pub fn Database(comptime config: Config) type {
                 for (0..joined.list.count) |index| {
                     const row = X.rowAt(work, joined.list, index);
                     for (1..config.relations) |relation| ctx.tuple[relation] = row + joined.offsets[relation];
-                    if (try X.keep(&ctx, merge.on, &table.versions[version].cells)) matched = true;
+                    if (try X.keep(&ctx, merge.on, S.borrowVersionRow(table, version, &row_scratch))) matched = true;
                 }
                 if (!matched) {
                     for (1..config.relations) |relation| ctx.tuple[relation] = null;
-                    try self.mergeMatched(slot, &ctx, merge, @intCast(target_row), version, true, snap);
+                    try self.mergeMatched(slot, &ctx, &row_scratch, merge, @intCast(target_row), version, true, snap);
                 }
                 tx.progress = position + 1;
             };
             return tx.progress_affected;
         }
 
-        fn mergeMatched(self: *Self, slot: u16, ctx: *E.Context, merge: *const B.Merge, row: u32, version: u32, by_source: bool, snap: Snapshot) Error!void {
+        fn mergeMatched(self: *Self, slot: u16, ctx: *E.Context, row_scratch: *S.VersionRowScratch, merge: *const B.Merge, row: u32, version: u32, by_source: bool, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[merge.table];
             var chosen: ?*const B.MergeWhen = null;
@@ -6481,7 +6686,7 @@ pub fn Database(comptime config: Config) type {
                 .skip => return,
                 .ready => |newest| newest,
             };
-            const cells = &table.versions[goal].cells;
+            const cells = S.borrowVersionRow(table, goal, row_scratch);
             if (!by_source and goal != version and !try X.keep(ctx, merge.on, cells)) return;
             for (merge.whens[0..merge.when_count]) |*when| {
                 if (!when.matched or when.by_source != by_source) continue;
@@ -6493,7 +6698,7 @@ pub fn Database(comptime config: Config) type {
             switch (when.action) {
                 .update => {
                     const update: B.Update = .{ .table = merge.table, .values = when.values, .where = ast.none, .key = ast.none, .defaults = when.defaults, .generated = when.generated, .checks = merge.checks };
-                    if (!try self.updateOne(slot, ctx, &update, row, goal, snap)) return;
+                    if (!try self.updateOne(slot, ctx, &update, row, goal, cells, snap)) return;
                 },
                 .delete => {
                     if (self.rowHooks(merge.table, routine_catalog.tg_delete, '4', snap) and !try self.beforeRow(merge.table, routine_catalog.tg_delete, null, cells, null, snap)) return;
@@ -6555,20 +6760,21 @@ pub fn Database(comptime config: Config) type {
         fn updateRows(self: *Self, slot: u16, source: []const u8, update: *const B.Update, snap: Snapshot) Error!usize {
             const table = &self.tables[update.table];
             var ctx = self.evalContext(source);
+            var row_scratch: S.VersionRowScratch = undefined;
             var affected: usize = 0;
             const joined = try self.joinedRows(source, update.from, &update.offsets, snap);
             switch (try X.candidates(&ctx, table, update.key, snap)) {
                 .empty => {},
-                .slot => |hit| affected += try self.updateSlot(slot, &ctx, update, hit.row, snap, joined),
+                .slot => |hit| affected += try self.updateSlot(slot, &ctx, &row_scratch, update, hit.row, snap, joined),
                 .scan => {
                     const high = table.row_high;
-                    for (0..high) |row| affected += try self.updateSlot(slot, &ctx, update, @intCast(row), snap, joined);
+                    for (0..high) |row| affected += try self.updateSlot(slot, &ctx, &row_scratch, update, @intCast(row), snap, joined);
                 },
             }
             return affected;
         }
 
-        fn updateSlot(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, snap: Snapshot, joined: ?Joined) Error!usize {
+        fn updateSlot(self: *Self, slot: u16, ctx: *E.Context, row_scratch: *S.VersionRowScratch, update: *const B.Update, row: u32, snap: Snapshot, joined: ?Joined) Error!usize {
             try self.session.checkpoint();
             const table = &self.tables[update.table];
             if (table.rows[row].newest == 0) return 0;
@@ -6576,32 +6782,36 @@ pub fn Database(comptime config: Config) type {
             var waits: L.Set = .{};
             const plan = try self.target(slot, update.table, version, snap, .write, &waits);
             if (plan == .authored) return 1;
-            if (!try self.keepJoined(ctx, update.where, joined, &table.versions[version].cells)) return 0;
+            var old_cells = S.borrowVersionRow(table, version, row_scratch);
+            if (!try self.keepJoined(ctx, update.where, joined, old_cells)) return 0;
             const goal = switch (plan) {
                 .skip, .authored => return 0,
                 .wait => return self.park(slot, waits),
                 .ready => |newest| newest,
             };
-            if (goal != version and !try self.keepJoined(ctx, update.where, joined, &table.versions[goal].cells)) return 0;
-            return @intFromBool(try self.updateOne(slot, ctx, update, row, goal, snap));
+            if (goal != version) {
+                old_cells = S.borrowVersionRow(table, goal, row_scratch);
+                if (!try self.keepJoined(ctx, update.where, joined, old_cells)) return 0;
+            }
+            return @intFromBool(try self.updateOne(slot, ctx, update, row, goal, old_cells, snap));
         }
 
         /// Returns false when a BEFORE ROW trigger or a rule skipped the row.
-        fn updateOne(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, old: u32, snap: Snapshot) Error!bool {
+        fn updateOne(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, row: u32, old: u32, old_cells: *const E.Row, snap: Snapshot) Error!bool {
             const tx = &self.txs[slot];
             const table = &self.tables[update.table];
             const derived: D.Derived = .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks };
             const hooked = self.rowHooks(update.table, routine_catalog.tg_update, '2', snap);
-            var cells = if (hooked) try D.updatedRowDeferred(ctx, table, &update.values, derived, &table.versions[old].cells) else try D.updatedRow(ctx, table, &update.values, derived, &table.versions[old].cells);
+            var cells = if (hooked) try D.updatedRowDeferred(ctx, table, &update.values, derived, old_cells) else try D.updatedRow(ctx, table, &update.values, derived, old_cells);
             if (hooked) {
-                if (try self.ruleSkips(update.table, '2', &cells, &table.versions[old].cells, snap)) return false;
-                if (!try self.beforeRow(update.table, routine_catalog.tg_update, &cells, &table.versions[old].cells, &update.values, snap)) return false;
+                if (try self.ruleSkips(update.table, '2', &cells, old_cells, snap)) return false;
+                if (!try self.beforeRow(update.table, routine_catalog.tg_update, &cells, old_cells, &update.values, snap)) return false;
                 try D.finishRow(ctx, table, derived, &cells);
             }
             try self.securityCheck(ctx, update.table, &cells);
             try self.partitionBound(update.table, &cells, snap);
             if (table.primary_column) |column| {
-                if (update.values[column] != ast.none) switch (D.keyCheck(table, &cells[column], row, snap)) {
+                if (update.values[column] != ast.none) switch (S.primaryKeyCheck(table, &cells[column], row, snap)) {
                     .free => {},
                     .taken => return error.PrimaryKeyViolation,
                     .wait => |owner| {
@@ -6611,10 +6821,10 @@ pub fn Database(comptime config: Config) type {
                     },
                 };
             }
-            if ((try self.uniqueTaken(slot, update.table, &cells, row, &table.versions[old].cells, snap)) != null) return error.PrimaryKeyViolation;
-            try self.exclusionTaken(slot, update.table, &cells, row, &table.versions[old].cells, snap);
-            try self.checkReferences(slot, update.table, &cells, &table.versions[old].cells, snap);
-            try self.referencedChange(slot, update.table, &table.versions[old].cells, &cells, snap);
+            if ((try self.uniqueTaken(slot, update.table, &cells, row, old_cells, snap)) != null) return error.PrimaryKeyViolation;
+            try self.exclusionTaken(slot, update.table, &cells, row, old_cells, snap);
+            try self.checkReferences(slot, update.table, &cells, old_cells, snap);
+            try self.referencedChange(slot, update.table, old_cells, &cells, snap);
             // A referential action of this statement may have replaced it.
             if (table.versions[old].xmax.epoch != 0) return true;
             _ = tx;
@@ -6625,20 +6835,21 @@ pub fn Database(comptime config: Config) type {
         fn deleteRows(self: *Self, slot: u16, source: []const u8, delete: *const B.Delete, snap: Snapshot) Error!usize {
             const table = &self.tables[delete.table];
             var ctx = self.evalContext(source);
+            var row_scratch: S.VersionRowScratch = undefined;
             var affected: usize = 0;
             const joined = try self.joinedRows(source, delete.using, &delete.offsets, snap);
             switch (try X.candidates(&ctx, table, delete.key, snap)) {
                 .empty => {},
-                .slot => |hit| affected += try self.deleteSlot(slot, &ctx, delete, hit.row, snap, joined),
+                .slot => |hit| affected += try self.deleteSlot(slot, &ctx, &row_scratch, delete, hit.row, snap, joined),
                 .scan => {
                     const high = table.row_high;
-                    for (0..high) |row| affected += try self.deleteSlot(slot, &ctx, delete, @intCast(row), snap, joined);
+                    for (0..high) |row| affected += try self.deleteSlot(slot, &ctx, &row_scratch, delete, @intCast(row), snap, joined);
                 },
             }
             return affected;
         }
 
-        fn deleteSlot(self: *Self, slot: u16, ctx: *E.Context, delete: *const B.Delete, row: u32, snap: Snapshot, joined: ?Joined) Error!usize {
+        fn deleteSlot(self: *Self, slot: u16, ctx: *E.Context, row_scratch: *S.VersionRowScratch, delete: *const B.Delete, row: u32, snap: Snapshot, joined: ?Joined) Error!usize {
             try self.session.checkpoint();
             const tx = &self.txs[slot];
             const table = &self.tables[delete.table];
@@ -6647,18 +6858,22 @@ pub fn Database(comptime config: Config) type {
             var waits: L.Set = .{};
             const plan = try self.target(slot, delete.table, version, snap, .write, &waits);
             if (plan == .authored) return 1;
-            if (!try self.keepJoined(ctx, delete.where, joined, &table.versions[version].cells)) return 0;
+            var old_cells = S.borrowVersionRow(table, version, row_scratch);
+            if (!try self.keepJoined(ctx, delete.where, joined, old_cells)) return 0;
             const goal = switch (plan) {
                 .skip, .authored => return 0,
                 .wait => return self.park(slot, waits),
                 .ready => |newest| newest,
             };
-            if (goal != version and !try self.keepJoined(ctx, delete.where, joined, &table.versions[goal].cells)) return 0;
-            if (self.rowHooks(delete.table, routine_catalog.tg_delete, '4', snap)) {
-                if (try self.ruleSkips(delete.table, '4', null, &table.versions[goal].cells, snap)) return 0;
-                if (!try self.beforeRow(delete.table, routine_catalog.tg_delete, null, &table.versions[goal].cells, null, snap)) return 0;
+            if (goal != version) {
+                old_cells = S.borrowVersionRow(table, goal, row_scratch);
+                if (!try self.keepJoined(ctx, delete.where, joined, old_cells)) return 0;
             }
-            try self.referencedChange(slot, delete.table, &table.versions[goal].cells, null, snap);
+            if (self.rowHooks(delete.table, routine_catalog.tg_delete, '4', snap)) {
+                if (try self.ruleSkips(delete.table, '4', null, old_cells, snap)) return 0;
+                if (!try self.beforeRow(delete.table, routine_catalog.tg_delete, null, old_cells, null, snap)) return 0;
+            }
+            try self.referencedChange(slot, delete.table, old_cells, null, snap);
             // A self-referencing CASCADE of this statement already deleted it.
             if (table.versions[goal].xmax.epoch != 0) return 1;
             try self.reserveWrites(slot, 1);
@@ -6672,13 +6887,14 @@ pub fn Database(comptime config: Config) type {
         /// earlier one's key change); rolled-back slices were truncated.
         fn encodeWrites(self: *const Self, writer: *change_log.Writer, slot: u16) Error!void {
             const tx = &self.txs[slot];
+            var row_scratch: S.VersionRowScratch = undefined;
             for (tx.writes[0..tx.write_len]) |entry| {
                 switch (entry.kind) {
                     .insert, .update => {
                         const table = &self.tables[entry.table];
                         const version = &table.versions[entry.new];
                         const tag: change_log.Op = if (entry.kind == .insert) .insert else .update;
-                        try C.encodeRow(writer, tag, table.oid, table.rows[version.row - 1].rowid, version.cells[0..table.column_count]);
+                        try C.encodeRow(writer, tag, table.oid, table.rows[version.row - 1].rowid, S.versionValues(table, entry.new, &row_scratch));
                     },
                     .delete => {
                         const table = &self.tables[entry.table];
@@ -7399,12 +7615,13 @@ pub fn Database(comptime config: Config) type {
             const committed: Snapshot = .{ .csn = self.csn };
             var summary: S.Summary = .{ .valid = true, .csn = committed.csn };
             var first: usize = 0;
+            var row_scratch: S.VersionRowScratch = undefined;
             while (first < table.row_high) {
                 const count = @min(table.row_high - first, 256);
                 try self.session.checkpoints(count);
                 for (first..first + count) |row| {
                     const version = S.visibleAt(table, row, committed) orelse continue;
-                    S.observeSummary(&summary, table.versions[version].cells[0..table.column_count], table.primary_column, true, committed.csn);
+                    S.observeSummary(&summary, S.versionValues(table, version, &row_scratch), table.primary_column, true, committed.csn);
                 }
                 first += count;
             }
@@ -8557,8 +8774,8 @@ pub fn Database(comptime config: Config) type {
                 const table = &self.tables[entry.table];
                 var new_row: E.Row = undefined;
                 var old_row: E.Row = undefined;
-                if (entry.kind != .delete) new_row = table.versions[entry.new].cells;
-                if (entry.kind != .insert) old_row = table.versions[entry.old].cells;
+                if (entry.kind != .delete) S.copyVersionRow(table, entry.new, &new_row);
+                if (entry.kind != .insert) S.copyVersionRow(table, entry.old, &old_row);
                 const new: ?*E.Row = if (entry.kind != .delete) &new_row else null;
                 const old: ?*E.Row = if (entry.kind != .insert) &old_row else null;
                 for (list[0..count]) |position| {
@@ -9196,6 +9413,9 @@ pub fn Database(comptime config: Config) type {
         /// decoded and validated against `scratch` before anything changes.
         /// Replay runs before any transaction starts.
         pub fn applyChangeRecord(self: *Self, record: []const u8, scratch: *ReplayScratch) Error!void {
+            if (S.anyIntegralBank(&self.tables)) for (&self.txs) |*tx| {
+                if (tx.active) return error.InvalidParameterValue;
+            };
             if (comptime config.external_workspace) if (self.workspace.query.cells.len == 0) return error.InvalidParameterValue;
             if (comptime config.external_storage) if (self.workspace.query.refs.len == 0) return error.InvalidParameterValue;
             try C.apply(self, record, scratch);

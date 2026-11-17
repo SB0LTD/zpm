@@ -273,6 +273,27 @@ fn legacy() !void {
     if (db.executeLegacy("INSERT INTO t VALUES (1, 0)", &result)) |_| return error.LegacyAccepted else |err| try check(err == error.PrimaryKeyViolation);
 }
 
+fn dateBounds() !void {
+    var db: Small = .{};
+    var result: Small.Result = .{};
+    try db.execute("CREATE TABLE dates (id INT PRIMARY KEY, day DATE)", &result);
+    try db.execute("INSERT INTO dates VALUES (1,DATE '1999-12-31'), (2,DATE '2000-01-04'), (3,NULL)", &result);
+    try db.execute("SELECT day FROM dates WHERE id < 3 ORDER BY id", &result);
+    const first = result.rows[0].cells[0].date;
+    const last = result.rows[1].cells[0].date;
+    try check(first < last);
+    const initial = db.tables[0].integer_bounds[1];
+    try check(initial.known and initial.low == first and initial.high == last);
+    try db.execute("UPDATE dates SET day=DATE '2000-01-08' WHERE id=1 RETURNING day", &result);
+    const later = result.rows[0].cells[0].date;
+    try check(db.tables[0].integer_bounds[1].low <= last and db.tables[0].integer_bounds[1].high == later);
+    try db.execute("ALTER TABLE dates ADD COLUMN extra INT DEFAULT 7", &result);
+    const table = if (db.tables[0].column_count == 3) &db.tables[0] else &db.tables[1];
+    try check(table.column_count == 3);
+    try check(table.integer_bounds[1].known and table.integer_bounds[1].low <= last and table.integer_bounds[1].high == later);
+    try check(table.integer_bounds[2].known and table.integer_bounds[2].low == 7 and table.integer_bounds[2].high == 7);
+}
+
 pub fn main(init: std.process.Init) !void {
     try directory();
     try arena();
@@ -282,6 +303,7 @@ pub fn main(init: std.process.Init) !void {
     try complexity();
     try describe();
     try legacy();
+    try dateBounds();
     var buffer: [320]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-storage\",\"pass\":true,\"assertions\":{d},\"small_bytes\":{d},\"server_profile_bytes\":{d},\"server_versions_per_table\":{d}}}\n", .{ assertions, Small.storageBytes(), ServerProfile.storageBytes(), ServerProfile.versions_per_table });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
