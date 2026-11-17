@@ -15,6 +15,9 @@ import socket
 import struct
 
 
+FIRST_NORMAL_OBJECT_ID = 16384  # PostgreSQL 18.3 access/transam.h.
+
+
 class Pg:
     def __init__(self, port, user, database):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
@@ -133,6 +136,21 @@ def run_case(port, args, manifest, case):
             results.append(result)
             if result["error"]:
                 break
+            dynamic = sorted({column[1] for column in result["columns"]
+                              if column[1] >= FIRST_NORMAL_OBJECT_ID})
+            if dynamic:
+                result["type_identities"] = {}
+                for oid in dynamic:
+                    identity = connection.query(
+                        "SELECT n.nspname, t.typname, t.typtype FROM pg_catalog.pg_type t "
+                        "JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace "
+                        f"WHERE t.oid = {oid}::oid"
+                    )
+                    if not identity["error"] and len(identity["rows"]) == 1:
+                        result["type_identities"][str(oid)] = identity["rows"][0]
+                    else:
+                        result["type_identity_error"] = identity
+                        return results
         return results
     finally:
         connection.close()  # Disconnect aborts the isolated fixture transaction.
@@ -171,14 +189,28 @@ def explain_measurement(result):
     return None
 
 
+def comparable_columns(result):
+    columns = []
+    for name, oid, size, modifier, fmt in result["columns"]:
+        type_id = oid
+        if oid >= FIRST_NORMAL_OBJECT_ID:
+            type_id = result.get("type_identities", {}).get(str(oid))
+            if type_id is None or len(type_id) != 3 or not all(type_id):
+                return None
+        columns.append([name, type_id, size, modifier, fmt])
+    return columns
+
+
 def equivalent(left, right, ordered, comparator="exact"):
     if len(left) != len(right):
         return False
     for index, (a, b) in enumerate(zip(left, right)):
-        # Object OIDs are not compared; type OIDs, typmods and formats are.
         if a["error"] or b["error"]:
             return False
-        if any(a[key] != b[key] for key in ("columns", "command", "transaction")):
+        if any(a[key] != b[key] for key in ("command", "transaction")):
+            return False
+        wanted_columns = comparable_columns(a)
+        if wanted_columns is None or wanted_columns != comparable_columns(b):
             return False
         if a.get("copy") != b.get("copy"):
             return False
@@ -233,6 +265,8 @@ def main():
                 comparator = case.get("comparator", "exact")
                 if any(item["error"] for item in oracle):
                     entry.update(status="oracle_invalid", oracle=oracle)
+                elif any(comparable_columns(item) is None for item in oracle):
+                    entry.update(status="oracle_invalid", oracle=oracle, detail="Unresolved user-defined result type")
                 elif comparator == "explain_structure" and explain_measurement(oracle[-1]) is None:
                     entry.update(status="oracle_invalid", oracle=oracle, detail="Invalid EXPLAIN ANALYZE plan")
                 elif case["scope"] == "copy_protocol" and oracle[-1].get("copy") is None:

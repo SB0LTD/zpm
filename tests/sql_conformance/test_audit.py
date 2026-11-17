@@ -203,6 +203,18 @@ class AuditTests(unittest.TestCase):
             b['columns'][0][index] = value
             self.assertFalse(equivalent([a], [b], False))
 
+    def test_dynamic_types_compare_catalog_identity_and_preserve_wire_metadata(self):
+        a = dict(result([['red']]), columns=[['v', 19000, 4, -1, 0]],
+                 type_identities={'19000': ['public', 'color', 'e']})
+        b = dict(a, columns=[['v', 19870, 4, -1, 0]],
+                 type_identities={'19870': ['public', 'color', 'e']})
+        self.assertTrue(equivalent([a], [b], False))
+        self.assertFalse(equivalent([a], [dict(b, type_identities={})], False))
+        for wrong in (['other', 'color', 'e'], ['public', 'size', 'e'], ['public', 'color', 'c']):
+            self.assertFalse(equivalent([a], [dict(b, type_identities={'19870': wrong})], False))
+        self.assertFalse(equivalent([a], [dict(b, columns=[['v', 19870, -1, -1, 0]])], False))
+        self.assertFalse(equivalent([a], [result([['red']])], False))
+
     def test_fragmented_wire_null_empty_and_utf8(self):
         description = struct.pack('!H', 1) + b'v\0' + struct.pack('!IhIhih', 0, 0, 25, -1, -1, 0)
         data = message(b'T', description)

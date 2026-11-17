@@ -216,6 +216,13 @@ Positive-oracle errors are reported as `oracle_invalid`. The audit always exits
 nonzero while only smoke coverage exists, including when every selected smoke
 passes.
 
+For the result type in `RowDescription`, the audit compares fixed built-in OIDs
+directly and looks up dynamic OIDs in the same transaction. A dynamic type must
+resolve to the same schema, name and type kind in both catalogs. The report keeps
+the original wire OID, type size, modifier and transfer format. Failure to resolve
+a dynamic type prevents the probe from passing. [PostgreSQL type catalog](https://www.postgresql.org/docs/18/catalog-pg-type.html) ·
+[PostgreSQL 18.3 OID assignment](https://github.com/postgres/postgres/blob/REL_18_3/src/include/access/transam.h)
+
 The wire audit also reads the `COPY TO STDOUT` formats and exact byte stream
 for the fixed fixture. It accepts different `CopyData` frame boundaries. For
 `EXPLAIN (FORMAT JSON, ANALYZE)`, it validates the typed single JSON cell and
