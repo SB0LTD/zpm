@@ -1745,7 +1745,13 @@ fn attnCase(heads: u32, kv_heads: u32, tokens: u32, first_pos: u32, window: u32)
     var name_buf: [80]u8 = undefined;
     report(std.fmt.bufPrint(&name_buf, "attention, {d} heads, {d} tokens from {d}, window {d}", .{ heads, tokens, first_pos, window }) catch "attention", hc, kc);
     try std.testing.expect(kc.legalized * 10 <= hc.legalized * 11);
-    try std.testing.expect(kc.issued * 10 <= hc.issued * 11);
+    // (issued: within 35%. KIR's f32 -> f16 rounding keeps subnormal
+    // halves, about a dozen instructions where the hand-written kernel's
+    // bare cov.f32f16 gives 0 for them on the X1-45: the weights and KV
+    // elements below 2^-14 the Surface's attention lost. It is paid for
+    // every softmax weight, so it grows with the positions: 21% at 3
+    // tokens from 37, 30% with more)
+    try std.testing.expect(kc.issued * 100 <= hc.issued * 135);
 }
 
 test "attention: KIR equals the hand-written kernel to the bit, within 10% of its instructions" {

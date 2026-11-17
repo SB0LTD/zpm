@@ -109,12 +109,15 @@ pub const VALUE_CHUNK = 256;
 pub const VALUE_UNROLL = 32;
 
 /// Positions an attnValues iteration loads for a tile of `rows` rows: as
-/// many as about 96 registers of loaded values and weights hold (each
-/// iteration waits out about one memory round trip: 32 for a decode
-/// token's two heads, 8 for a prefill tile's eight rows).
-pub fn valueUnroll(rows: usize) u32 {
+/// many as the target's budget of registers for loaded values and weights
+/// holds (each iteration waits out about one memory round trip). The RTX
+/// (255 registers a thread): about 96, 32 positions for a decode token's
+/// two heads. The Adreno (its registers shared by 64 threads a wave, the
+/// kernel refused past them): about 24.
+pub fn valueUnroll(caps: Caps, rows: usize) u32 {
+    const budget: u32 = if (caps.target == .ir3_a7xx) 24 else 96;
     var u: u32 = VALUE_UNROLL;
-    while (u > 4 and u * (1 + @as(u32, @intCast(rows))) > 96) u /= 2;
+    while (u > 2 and u * (1 + @as(u32, @intCast(rows))) > budget) u /= 2;
     return u;
 }
 /// Rows (heads x tokens) one attention workgroup takes at most.
@@ -2169,7 +2172,7 @@ pub fn attnValues(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel
         // nothing), then each added in position order, the CPU's: a
         // backend's loop branch waits for every load in flight, so one
         // position an iteration waited out a memory round trip each.
-        const unroll = valueUnroll(n);
+        const unroll = valueUnroll(caps, n);
         b.loop();
         {
             var v0: [VALUE_UNROLL]V = undefined;

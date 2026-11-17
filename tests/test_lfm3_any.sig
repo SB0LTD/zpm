@@ -181,6 +181,10 @@ var vram: [48 << 20]u8 align(4096) = undefined;
 var shadow: [72 << 20]u8 align(4096) = undefined;
 var interp_work: [16 << 20]u8 align(64) = undefined;
 var emu: gpu.EmuDevice = undefined;
+/// The emulated Adreno: kir_ir3's code itself in ir3_emu (the X1-45's
+/// operand rules checked, buffers apart, its cov.f32f16 flushing as the
+/// hardware's does), not KIR's interpreter under an Adreno's Caps.
+var adreno_emu: gpu.adreno_device.Emu = undefined;
 var work: any.Work = .{};
 const unpacked: executor.PackedWeights(CAPACITY) = .{};
 
@@ -207,9 +211,13 @@ fn cpuCache(context: usize) executor.Cache {
     return .{ .kv = kv_cpu[0..kv_n], .conv = &conv_cpu, .context = context };
 }
 
-const Device = enum { ideal, unfused, discrete, noncoherent, narrow, wide };
+const Device = enum { ideal, unfused, discrete, noncoherent, narrow, wide, adreno, adreno_hw };
 
 fn makeDevice(which: Device) gpu.Device {
+    if (which == .adreno or which == .adreno_hw) {
+        adreno_emu.initWith(&mem, &.{}, which == .adreno_hw);
+        return adreno_emu.device();
+    }
     var caps = gpu.interp_caps;
     switch (which) {
         .ideal => {},
@@ -233,6 +241,7 @@ fn makeDevice(which: Device) gpu.Device {
             caps.subgroup = 128;
             caps.fused_fma = false;
         },
+        .adreno, .adreno_hw => unreachable,
     }
     emu = gpu.EmuDevice.init(caps, &mem, &interp_work);
     if (which == .discrete) emu.vram = &vram;
@@ -278,7 +287,7 @@ fn followTheCpu(which: Device, tolerance: f64, tiled_attention: bool) !f64 {
     const prompt = [_]u32{ 1, 5, 2, 7, 3, 9, 4, 4, 11, 0, 6 };
     var token = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &prompt }, .logits, .{})).?;
     const gtok = (backend.forward(&gc, .{ .tokens = &prompt }, .logits) catch |e| return failure(&backend, e)).?;
-    const prefill_ops = emu.stats.lane_ops;
+    const prefill_ops = if (which == .adreno or which == .adreno_hw) 0 else emu.stats.lane_ops;
     const prefill_dispatches = backend.dispatches;
     var worst = try compare(0, cpu_work.logits[0..VOCAB], backend.logits(), tolerance);
     try std.testing.expectEqual(token, gtok);
@@ -286,7 +295,7 @@ fn followTheCpu(which: Device, tolerance: f64, tiled_attention: bool) !f64 {
     for (1..8) |step| {
         const next = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{token} }, .logits, .{})).?;
         const gnext = (backend.forward(&gc, .{ .tokens = &.{token} }, .logits) catch |e| return failure(&backend, e)).?;
-        decode_ops += emu.stats.lane_ops;
+        decode_ops += if (which == .adreno or which == .adreno_hw) 0 else emu.stats.lane_ops;
         worst = @max(worst, try compare(step, cpu_work.logits[0..VOCAB], backend.logits(), tolerance));
         try std.testing.expectEqual(next, gnext);
         // the hidden row too
@@ -407,6 +416,16 @@ test "...on non-coherent unified memory (every hand-over checked)" {
     _ = try followTheCpu(.noncoherent, 1e-4, true);
 }
 
+test "...on the emulated Adreno: kir_ir3's code in ir3_emu, tiled and one-token attention" {
+    _ = try followTheCpu(.adreno, 1e-4, true);
+    _ = try followTheCpu(.adreno, 1e-4, false);
+}
+
+test "...on the emulated Adreno as the Surface runs it: its Caps, f32 subnormals flushed" {
+    _ = try followTheCpu(.adreno_hw, 1e-4, true);
+    _ = try followTheCpu(.adreno_hw, 1e-4, false);
+}
+
 // ── A pass with a visibility rule (d1's sets) ───────────────────────────────
 
 const SEEN_TOKENS = 80;
@@ -489,6 +508,15 @@ test "a pass with a visibility rule (d1's sets) follows the CPU's forwardSees: i
 }
 
 test "every matrix layout for one-token passes, asked for: the CPU's logits through the model" {
+    try everyLayout(.ideal);
+}
+
+test "...and as ir3 code on the emulated Adreno (the layouts the Surface's tuner picks among)" {
+    try everyLayout(.adreno);
+    try everyLayout(.adreno_hw);
+}
+
+fn everyLayout(which: Device) !void {
     // (lanes a thread, blocks an iteration, slots side by side: a shape
     // with fewer blocks than their product keeps one block and one slot)
     for ([_][3]u32{ .{ 1, 1, 1 }, .{ 2, 1, 1 }, .{ 1, 2, 1 }, .{ 4, 2, 1 }, .{ 2, 4, 1 }, .{ 1, 1, 4 }, .{ 2, 2, 2 }, .{ 4, 1, 8 } }) |lus| {
@@ -498,7 +526,7 @@ test "every matrix layout for one-token passes, asked for: the CPU's logits thro
         try fixture.initialize();
         const plan = &fixture.plan;
         const src = fixture.source();
-        var backend = try Backend.init(makeDevice(.ideal), plan, &fixture.index, src, .{ .max_batch = 16, .attention_tokens = 8, .matrix_lanes = lanes, .matrix_unroll = unroll, .matrix_slots = slots }, &work);
+        var backend = try Backend.init(makeDevice(which), plan, &fixture.index, src, .{ .max_batch = 16, .attention_tokens = 8, .matrix_lanes = lanes, .matrix_unroll = unroll, .matrix_slots = slots }, &work);
         defer backend.deinit();
         try std.testing.expect(backend.tunings().len > 0);
         for (backend.tunings()) |t| {
@@ -516,12 +544,15 @@ test "every matrix layout for one-token passes, asked for: the CPU's logits thro
         var ccache = cpuCache(CONTEXT);
         const prompt = [_]u32{ 1, 5, 2, 7 };
         var token = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &prompt }, .logits, .{})).?;
-        const gtok = (try backend.forward(&gc, .{ .tokens = &prompt }, .logits)).?;
+        const gtok = (backend.forward(&gc, .{ .tokens = &prompt }, .logits) catch |e| return failure(&backend, e)).?;
         try std.testing.expectEqual(token, gtok);
         _ = try compare(0, cpu_work.logits[0..VOCAB], backend.logits(), 1e-4);
         for (1..5) |step| {
             const next = (try executor.forwardInput(CAPACITY, LIMITS, src, &fixture.index, plan, &unpacked, &cpu_work, &ccache, .{ .tokens = &.{token} }, .logits, .{})).?;
-            const gnext = (try backend.forward(&gc, .{ .tokens = &.{token} }, .logits)).?;
+            const gnext = (backend.forward(&gc, .{ .tokens = &.{token} }, .logits) catch |e| {
+                std.debug.print("{s}: layout {d}/{d}/{d}, step {d}\n", .{ @tagName(which), lanes, unroll, slots, step });
+                return failure(&backend, e);
+            }).?;
             _ = try compare(step, cpu_work.logits[0..VOCAB], backend.logits(), 1e-4);
             try std.testing.expectEqual(next, gnext);
             token = next;
