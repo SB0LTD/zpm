@@ -212,7 +212,8 @@ pub const RecordKeys = struct {
     }
 
     /// Open exactly one complete record in place. The returned content borrows
-    /// the input until the caller reuses it. The session closes on open errors.
+    /// the input until the caller reuses it. A bad tag clears the encrypted
+    /// body. The session closes on open errors.
     pub fn openProtected(self: *RecordKeys, input: []u8) Error!Protected {
         if (self.seq == std.math.maxInt(u64)) return error.KeyUseLimit;
         if (input.len < header_bytes) return error.BadRecord;
@@ -315,9 +316,10 @@ test "protected records authenticate before exposing padded application bytes" {
     const sealed = try sender.sealProtected(&buffer, .application_data, 2, 11);
     var tampered = buffer;
     tampered[sealed.len - 1] ^= 1;
-    const original = tampered;
+    var scrubbed = tampered;
+    @memset(scrubbed[header_bytes .. sealed.len - gcm.TAG_LEN], 0);
     try testing.expectError(error.DecryptFailed, receiver.openProtected(tampered[0..sealed.len]));
-    try testing.expectEqualSlices(u8, &original, &tampered);
+    try testing.expectEqualSlices(u8, &scrubbed, &tampered);
     try testing.expectEqual(@as(u64, 0), receiver.seq);
     const replay = buffer;
     const plaintext = try receiver.openProtected(buffer[0..sealed.len]);
