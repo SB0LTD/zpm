@@ -398,6 +398,23 @@ pub fn Database(comptime config: Config) type {
                 result: Result = .{},
             };
 
+            pub const Layout = struct {
+                entries: usize,
+                bytes: usize,
+                entry_offset: usize,
+                key_offset: usize,
+                key_bytes: usize,
+                row_offset: usize,
+                row_count: usize,
+            };
+
+            pub const Stats = struct {
+                hits: u64 = 0,
+                misses: u64 = 0,
+                publications: u64 = 0,
+                contention: u64 = 0,
+            };
+
             database: *const Self,
             entries: []Entry,
             keys: []u8,
@@ -406,6 +423,59 @@ pub fn Database(comptime config: Config) type {
             rows_per_entry: usize,
             busy: u8 = 0,
             victim: usize = 0,
+            counters: Stats = .{},
+
+            /// Byte layout for one aligned caller-owned cache region.
+            pub fn layout(entries: usize, key_bytes_per_entry: usize, rows_per_entry: usize) Error!Layout {
+                if (entries == 0 or key_bytes_per_entry == 0 or rows_per_entry == 0 or
+                    (!config.external_results and rows_per_entry > Result.default_row_capacity)) return error.InvalidParameterValue;
+                const key_bytes = @mulWithOverflow(entries, key_bytes_per_entry);
+                const row_count = @mulWithOverflow(entries, if (config.external_results) rows_per_entry else 0);
+                if (key_bytes[1] != 0 or row_count[1] != 0) return error.InvalidParameterValue;
+                var bytes: usize = 0;
+                const entry_offset = try appendLayout(&bytes, Entry, entries);
+                const key_offset = try appendLayout(&bytes, u8, key_bytes[0]);
+                const row_offset = if (config.external_results) try appendLayout(&bytes, Row, row_count[0]) else bytes;
+                return .{ .entries = entries, .bytes = bytes, .entry_offset = entry_offset, .key_offset = key_offset,
+                    .key_bytes = key_bytes[0], .row_offset = row_offset, .row_count = row_count[0] };
+            }
+
+            /// Largest complete cache within the caller's byte budget.
+            pub fn layoutForBytes(byte_budget: usize, key_bytes_per_entry: usize, rows_per_entry: usize) Error!Layout {
+                const one = try layout(1, key_bytes_per_entry, rows_per_entry);
+                if (one.bytes > byte_budget) return error.WorkspaceCapacity;
+                var low: usize = 1;
+                var high = byte_budget / @sizeOf(Entry);
+                while (low < high) {
+                    const middle = low + (high - low + 1) / 2;
+                    const candidate = layout(middle, key_bytes_per_entry, rows_per_entry) catch {
+                        high = middle - 1;
+                        continue;
+                    };
+                    if (candidate.bytes <= byte_budget) low = middle else high = middle - 1;
+                }
+                return layout(low, key_bytes_per_entry, rows_per_entry);
+            }
+
+            pub fn bindMemory(cache: *Cache, db: *const Self, bytes: []u8, entries: usize, key_bytes_per_entry: usize, rows_per_entry: usize) Error!void {
+                const memory = try layout(entries, key_bytes_per_entry, rows_per_entry);
+                if (bytes.len < memory.bytes) return error.WorkspaceCapacity;
+                const entry_storage = try storageView(Entry, bytes, memory.entry_offset, memory.entries);
+                const key_storage = bytes[memory.key_offset..][0..memory.key_bytes];
+                const row_storage: []Row = if (comptime config.external_results) try storageView(Row, bytes, memory.row_offset, memory.row_count) else &.{};
+                try cache.init(db, entry_storage, key_storage, row_storage, rows_per_entry);
+            }
+
+            /// Snapshot of completed cache activity. Ineligible reads bypass
+            /// the cache, and a contended access is counted separately.
+            pub fn stats(cache: *const Cache) Stats {
+                return .{
+                    .hits = @atomicLoad(u64, &cache.counters.hits, .monotonic),
+                    .misses = @atomicLoad(u64, &cache.counters.misses, .monotonic),
+                    .publications = @atomicLoad(u64, &cache.counters.publications, .monotonic),
+                    .contention = @atomicLoad(u64, &cache.counters.contention, .monotonic),
+                };
+            }
 
             /// Use a stable cache pointer for its lifetime. Each slot reserves
             /// an equal part of keys and, for external results, row_storage.
@@ -449,7 +519,9 @@ pub fn Database(comptime config: Config) type {
             }
 
             fn lock(cache: *Cache) bool {
-                return @cmpxchgStrong(u8, &cache.busy, 0, 1, .acquire, .monotonic) == null;
+                if (@cmpxchgStrong(u8, &cache.busy, 0, 1, .acquire, .monotonic) == null) return true;
+                _ = @atomicRmw(u64, &cache.counters.contention, .Add, 1, .monotonic);
+                return false;
             }
 
             fn unlock(cache: *Cache) void {
@@ -482,8 +554,10 @@ pub fn Database(comptime config: Config) type {
                         if (control.poll) |poll| try poll(control.context);
                     }
                     try result.copyFromChecked(&entry.result);
+                    _ = @atomicRmw(u64, &cache.counters.hits, .Add, 1, .monotonic);
                     return true;
                 }
+                _ = @atomicRmw(u64, &cache.counters.misses, .Add, 1, .monotonic);
                 return false;
             }
 
@@ -513,6 +587,7 @@ pub fn Database(comptime config: Config) type {
                 entry.csn = csn;
                 entry.hash = hash;
                 entry.valid = true;
+                _ = @atomicRmw(u64, &cache.counters.publications, .Add, 1, .monotonic);
             }
         };
 

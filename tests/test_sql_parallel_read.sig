@@ -30,6 +30,8 @@ var cache: Cache = undefined;
 var cache_entries: [16]Cache.Entry = undefined;
 var cache_keys: [16 * 512]u8 = undefined;
 var cache_rows: [16 * 16]DB.Row = undefined;
+const one_cache_layout = Cache.layout(1, 512, 16) catch unreachable;
+var cache_memory: [one_cache_layout.bytes + 1]u8 align(16) = undefined;
 const grouped = "SELECT cat AS category, COUNT(DISTINCT amount) AS samples, SUM(amount) AS total FROM points GROUP BY cat ORDER BY cat";
 const concurrent_grouped = "SELECT cat, COUNT(*), SUM(amount * 2) AS weighted FROM points GROUP BY cat ORDER BY cat";
 fn insideExecution(raw:?*anyopaque) DB.SqlError!void {
@@ -231,7 +233,13 @@ fn resultCacheContracts() !void {
     try cachedRead(context, result, concurrent_grouped);
     try check(context.last_result_reused);
 
-    try cache.init(db, cache_entries[0..1], cache_keys[0..512], cache_rows[0..16], 16);
+    try rejected(error.WorkspaceCapacity, Cache.layoutForBytes(one_cache_layout.bytes - 1, 512, 16));
+    const selected = try Cache.layoutForBytes(one_cache_layout.bytes + 1, 512, 16);
+    try check(selected.entries == 1 and selected.bytes == one_cache_layout.bytes);
+    try rejected(error.InvalidParameterValue, Cache.layout(~@as(usize, 0), 512, 16));
+    try rejected(error.WorkspaceCapacity, cache.bindMemory(db, cache_memory[0 .. selected.bytes - 1], selected.entries, 512, 16));
+    try rejected(error.InvalidParameterValue, cache.bindMemory(db, cache_memory[1..], selected.entries, 512, 16));
+    try cache.bindMemory(db, &cache_memory, selected.entries, 512, 16);
     const by_store = "SELECT COUNT(*), SUM(amount) FROM points WHERE cat=0";
     try cachedRead(context, result, by_store);
     try check(!context.last_result_reused and result.rows[0].cells[0].integer == 17);
@@ -241,6 +249,8 @@ fn resultCacheContracts() !void {
     try check(!context.last_result_reused and result.rows[0].cells[0].integer == 16);
     try cachedRead(context, result, by_store);
     try check(!context.last_result_reused and result.rows[0].cells[0].integer == 17);
+    const stats = cache.stats();
+    try check(stats.hits == 1 and stats.misses == 3 and stats.publications == 3 and stats.contention == 0);
 }
 
 pub fn main(init:std.process.Init) !void {
