@@ -226,6 +226,39 @@ fn enumDescription(packet: []const u8, oid: u32, format: u8) !void {
     try check(read32(fields[19..23]) == 0xffffffff and fields[23] == 0 and fields[24] == format);
 }
 
+fn recordDescription(packet: []const u8, oid: u32, format: u8) !void {
+    const fields = try frame(packet, 'T');
+    try check(equal(fields[0..6], "\x00\x01row\x00"));
+    try check(read32(fields[12..16]) == oid and equal(fields[16..18], "\xff\xff"));
+    try check(read32(fields[18..22]) == 0xffffffff and fields[22] == 0 and fields[23] == format);
+}
+
+fn recordWire(session: *Session, connection: *Store.Connection) !void {
+    _ = try frame(try wireQuery(session, connection, "CREATE TYPE pair AS (n INTEGER, label TEXT)"), 'C');
+    const oid_msg = try wireQuery(session, connection, "SELECT oid FROM pg_type WHERE typname='pair' AND typtype='c'");
+    const oid_row = try frame(oid_msg, 'D');
+    const oid = try std.fmt.parseInt(u32, oid_row[6..], 10);
+    const selected = try wireQuery(session, connection, "SELECT ROW(1,'x')::pair");
+    try recordDescription(selected, oid, 0);
+    try check(equal(try frame(selected, 'D'), "\x00\x01\x00\x00\x00\x05(1,x)"));
+
+    const parsed = try wireMessage(session, connection, 'P', "\x00SELECT ROW(1,'x')::pair\x00\x00\x00");
+    _ = try frame(parsed, '1');
+    const bound = try wireMessage(session, connection, 'B', "\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01");
+    _ = try frame(bound, '2');
+    const described = try wireMessage(session, connection, 'D', "P\x00");
+    try recordDescription(described, oid, 1);
+    const executed = try wireMessage(session, connection, 'E', "\x00\x00\x00\x00\x00");
+    const binary = "\x00\x01\x00\x00\x00\x19" ++
+        "\x00\x00\x00\x02" ++
+        "\x00\x00\x00\x17\x00\x00\x00\x04\x00\x00\x00\x01" ++
+        "\x00\x00\x00\x19\x00\x00\x00\x01x";
+    try check(equal(try frame(executed, 'D'), binary));
+    _ = try wireMessage(session, connection, 'S', "");
+    const copied_out = try wireQuery(session, connection, "COPY (SELECT ROW(1,'x')::pair) TO STDOUT");
+    try check(equal(try frame(copied_out, 'd'), "(1,x)\n"));
+}
+
 fn wireContracts() !void {
     var connection: Store.Connection = .{ .store = &store, .id = 1 };
     var session: Session = .{};
@@ -261,6 +294,7 @@ fn wireContracts() !void {
     try check(std.mem.indexOf(u8, try frame(duplicate, 'E'), "C23505\x00") != null);
     const dropped = try wireQuery(&session, &connection, "DROP TYPE mood");
     try check(equal(try frame(dropped, 'C'), "DROP TYPE\x00"));
+    try recordWire(&session, &connection);
 }
 
 pub fn main(init: std.process.Init) !void {

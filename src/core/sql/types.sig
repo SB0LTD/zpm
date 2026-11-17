@@ -731,7 +731,11 @@ pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8
 
 /// Catalog identity of a projected nominal type, separate from its value
 /// representation. A zero OID denotes ordinary built-in metadata.
-pub const NominalColumnType = struct { oid: u32 = 0, len: i16 = 0 };
+pub const NominalColumnType = struct {
+    oid: u32 = 0,
+    len: i16 = 0,
+    representation: enum(u8) { scalar, flat_record } = .scalar,
+};
 
 /// The durable typmod constraints shared by table and composite definitions.
 /// An array's typmod belongs to its element type.

@@ -889,7 +889,8 @@ pub fn Session(comptime DB: type) type {
                             try sink.append(options.null_string);
                             continue;
                         }
-                        const length = T.sendText(cell, session, &text) catch return error.BufferTooSmall;
+                        const nominal = try self.nominalText(field, cell, &text);
+                        const length = nominal orelse (T.sendText(cell, session, &text) catch return error.BufferTooSmall);
                         if (options.format == .csv) {
                             const forced = if (comptime @hasDecl(CopyInfo, "forceQuoteColumn")) info.forceQuoteColumn(field) else false;
                             try pg_copy.appendCsvField(&options, text[0..length], count == 1, forced, &sink);
@@ -1454,6 +1455,13 @@ pub fn Session(comptime DB: type) type {
             }
             w.end(p);
         }
+
+        fn nominalText(self: *const Self, column_index: usize, cell: anytype, out: []u8) !?usize {
+            if (comptime @hasDecl(DB.Result, "formatNominalText"))
+                return self.result.formatNominalText(column_index, cell, out) catch error.BufferTooSmall;
+            return null;
+        }
+
         fn rows(self: *Self, db: *DB, w: *Writer, portal_value: ?*const Portal, first: usize, end: usize) !void {
             const session = valueSession(db);
             for (first..end) |row| {
@@ -1476,7 +1484,11 @@ pub fn Session(comptime DB: type) type {
                         } else try w.number(n),
                         .boolean => |b| try w.byte(if (binary) @intFromBool(b) else if (b) 't' else 'f'),
                         .text => |t| try w.append(t.slice()),
-                        else => w.at += (if (binary) T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) else T.sendText(&cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall,
+                        else => {
+                            const nominal = if (binary) null else try self.nominalText(i, &cell, w.bytes[w.at..]);
+                            const size = nominal orelse ((if (binary) T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) else T.sendText(&cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall);
+                            w.at += size;
+                        },
                     }
                     write32(w.bytes[length..][0..4], @intCast(w.at - start));
                 }

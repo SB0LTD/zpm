@@ -24,6 +24,7 @@ const geometric = @import("geometric.sig");
 const xml_module = @import("xml.sig");
 const json_eval = @import("json_eval.sig");
 const regex = @import("regex.sig");
+const flat_record = @import("flat_record.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -1175,6 +1176,18 @@ pub fn Eval(comptime config: types.Config) type {
                     return left;
                 },
                 .cast => {
+                    if (n.flat_record_cast) {
+                        const row = node(ctx, n.a);
+                        if (row.kind == .null_literal) return .null_value;
+                        var record: V.Text = .{};
+                        record.len = try flat_record.begin(&record.bytes, @intCast(n.integer));
+                        var field = row.b;
+                        while (field != none) : (field = node(ctx, field).next) {
+                            const cell = try eval(ctx, field);
+                            try flat_record.append(config, &record.bytes, &record.len, types.dataTypeOf(node(ctx, field).ty), &cell);
+                        }
+                        return .{ .bytea = record };
+                    }
                     if(n.cast_type==.date and n.date_bound) {
                         // The binder already parsed this literal child. Keep
                         // its observable evaluation checkpoint, then borrow

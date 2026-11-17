@@ -103,6 +103,7 @@ const mvcc_module = @import("sql/mvcc.sig");
 const locks_module = @import("sql/locks.sig");
 const catalog_module = @import("sql/catalog.sig");
 const value_module = @import("sql/value.sig");
+const flat_record = @import("sql/flat_record.sig");
 const numeric_module = @import("sql/numeric.sig");
 const temporal_module = @import("sql/temporal.sig");
 const tzif_module = @import("sql/tzif.sig");
@@ -359,8 +360,18 @@ pub fn Database(comptime config: Config) type {
                         },
                         else => {},
                     }
-                    for (self.rows[0..self.row_count]) |*row| {
-                        row.cells[column] = try ValueIo.toText(&row.cells[column], false, session);
+                    const identity = self.nominalColumnType(column);
+                    if (identity != null and identity.?.representation == .flat_record) {
+                        for (self.rows[0..self.row_count]) |*row| {
+                            if (row.cells[column] == .null_value) continue;
+                            var text: Text = .{};
+                            text.len = (try self.formatNominalText(column, &row.cells[column], &text.bytes)).?;
+                            row.cells[column] = .{ .text = text };
+                        }
+                    } else {
+                        for (self.rows[0..self.row_count]) |*row| {
+                            row.cells[column] = try ValueIo.toText(&row.cells[column], false, session);
+                        }
                     }
                     const mysql_date = mode == .mysql and (self.column_types[column] == .date or
                         (self.column_types[column] == .bpchar and self.column_typmods[column] == ast.mysql_date_text_typmod));
@@ -392,6 +403,15 @@ pub fn Database(comptime config: Config) type {
                 if (!self.has_nominal_types or column >= self.column_count) return null;
                 const identity = self.nominal_types[column];
                 return if (identity.oid != 0) identity else null;
+            }
+
+            /// A flat record carries typed field bytes in the existing Cell
+            /// bytea storage. Its nominal descriptor selects record output.
+            pub fn formatNominalText(self: *const Result, column: usize, cell: *const Cell, out: []u8) Error!?usize {
+                const identity = self.nominalColumnType(column) orelse return null;
+                if (identity.representation != .flat_record) return null;
+                if (cell.* != .bytea) return error.TypeMismatch;
+                return try flat_record.format(cell.bytea.slice(), out);
             }
 
             /// Copy the observable result, without touching unused capacity.
