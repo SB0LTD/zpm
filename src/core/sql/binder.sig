@@ -4548,6 +4548,18 @@ pub fn Binder(comptime config: types.Config) type {
             n.integer = info.bound;
         }
 
+        /// A standalone MySQL signed literal projects as BIGINT. Negating
+        /// a negative literal selects a different native numeric lane.
+        fn mysqlSignedLiteral(context: *const Context, id: u16) ?i64 {
+            const n = context.node(id);
+            if (n.kind == .int_literal) return n.integer;
+            if (n.kind != .unary or (n.op != .neg and n.op != .pos)) return null;
+            const operand = mysqlSignedLiteral(context, n.a) orelse return null;
+            if (n.op == .pos) return operand;
+            if (operand < 0) return null;
+            return -operand;
+        }
+
         fn bindSelect(context: *const Context, select: *const Ast.Select) Error!Select {
             const scope = try scopeFor(context, select.from);
             // FOR ... OF names a FROM item (42P01 otherwise; single-table locking).
@@ -4578,6 +4590,8 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindDomainCast(context, target.expr);
                 }
                 try valueExpr(context, &scope, target.expr);
+                if (!context.legacy and context.dialect == .mysql and mysqlSignedLiteral(context, target.expr) != null)
+                    context.node(target.expr).ty = .int8;
                 out.targets[out.count] = target.expr;
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
