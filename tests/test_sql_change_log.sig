@@ -719,11 +719,11 @@ fn truncateCurrentHorizon() !void {
     try primary.statement(truncator, "SELECT id FROM t", &result, .{});
     try check(result.row_count == 0);
     try run(&primary, truncator, "INSERT INTO t VALUES(5,50)");
-    try primary.savepoint(truncator, "before_second_truncate");
+    try primary.savepoint(truncator, "before_second");
     try run(&primary, truncator, "TRUNCATE t");
     try primary.statement(truncator, "SELECT id FROM t", &result, .{});
     try check(result.row_count == 0);
-    _ = try primary.rollbackTo(truncator, "before_second_truncate");
+    _ = try primary.rollbackTo(truncator, "before_second");
     try primary.statement(truncator, "SELECT id FROM t", &result, .{});
     try check(result.row_count == 1 and result.rows[0].cells[0].integer == 5);
     _ = try primary.rollbackTo(truncator, "before_truncate");
