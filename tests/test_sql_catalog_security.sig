@@ -1045,12 +1045,56 @@ fn capacities() !void {
     try smallFails("DROP ROLE IF EXISTS n1, n2, n3, n4, n5, n6, n7, n8, n9", error.ProgramLimitExceeded);
 }
 
+/// PostgreSQL exposes tables and columns according to distinct sets of
+/// privileges (REL_18_3 src/backend/catalog/information_schema.sql).
+fn relationDiscovery() !void {
+    try reset();
+    const tables = "SELECT table_name FROM information_schema.tables WHERE table_name IN ('tdd_a', 'tdd_b') ORDER BY table_name";
+    const columns = "SELECT table_name, column_name FROM information_schema.columns WHERE table_name IN ('tdd_a', 'tdd_b') ORDER BY table_name, ordinal_position";
+    const catalog = "SELECT relname FROM pg_class WHERE relname IN ('tdd_a', 'tdd_b') ORDER BY relname";
+    try run("CREATE ROLE discover_group");
+    try run("CREATE ROLE discover_reader IN ROLE discover_group");
+    try expect(tables, "tdd_a;tdd_b");
+    try expect(columns, "tdd_a|id;tdd_a|g;tdd_a|v;tdd_b|id;tdd_b|v");
+
+    try as("discover_reader");
+    try expect(tables, "");
+    try expect(columns, "");
+    try expect(catalog, "tdd_a;tdd_b");
+    try as("ramsql");
+    try run("GRANT SELECT ON tdd_a TO discover_group");
+    try run("GRANT DELETE ON tdd_b TO discover_reader");
+    try as("discover_reader");
+    try expect(tables, "tdd_a;tdd_b");
+    try expect(columns, "tdd_a|id;tdd_a|g;tdd_a|v");
+
+    try as("ramsql");
+    try run("REVOKE SELECT ON tdd_a FROM discover_group");
+    try run("REVOKE DELETE ON tdd_b FROM discover_reader");
+    try run("GRANT MAINTAIN ON tdd_a TO discover_reader");
+    try run("GRANT REFERENCES ON tdd_b TO PUBLIC");
+    try as("discover_reader");
+    try expect(tables, "tdd_b");
+    try expect(columns, "tdd_b|id;tdd_b|v");
+    try expect(catalog, "tdd_a;tdd_b");
+
+    try as("ramsql");
+    try run("REVOKE REFERENCES ON tdd_b FROM PUBLIC");
+    try run("ALTER TABLE tdd_b OWNER TO discover_reader");
+    try as("discover_reader");
+    try expect(tables, "tdd_b");
+    try expect(columns, "tdd_b|id;tdd_b|v");
+    try as("ramsql");
+    try sameState();
+}
+
 pub fn main() !void {
     try oraclePrograms();
     try namespacesAndExtensions();
     try comments();
     try roles();
     try privileges();
+    try relationDiscovery();
     try rowSecurity();
     try foreignAndPublications();
     try changeRecords();

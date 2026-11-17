@@ -3723,6 +3723,17 @@ pub fn Database(comptime config: Config) type {
                         continue;
                     }
                     const table = &self.tables[found.slot];
+                    // PostgreSQL's information-schema views use different
+                    // privilege lists. This engine supports table-wide grants.
+                    const column_privileges = CO.priv_select | CO.priv_insert | CO.priv_update | CO.priv_references;
+                    const discovery_privileges: u32 = switch (view) {
+                        .columns => column_privileges,
+                        .tables => column_privileges | CO.priv_delete | CO.priv_truncate | CO.priv_trigger,
+                        else => 0,
+                    };
+                    if (discovery_privileges != 0 and !self.catalog_objects.tableHasAnyPrivilege(
+                        session_values.role, table.oid, discovery_privileges, snapshot,
+                    )) continue;
                     const schema_name = self.namespaceName(table.namespace);
                     const name = table.name.slice();
                     const oid: i64 = table.oid;

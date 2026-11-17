@@ -56,6 +56,14 @@ state's `session_role` (10 unless an embedding caller installs another),
 | PG.INTEGRATION.FOREIGN | CREATE / DROP FOREIGN DATA WRAPPER [NO HANDLER] [NO VALIDATOR] (superusers), CREATE [IF NOT EXISTS] / DROP SERVER [TYPE] [VERSION] (USAGE = wrapper owner); DROP ... CASCADE; pg_foreign_data_wrapper, pg_foreign_server. Catalog entries only | handlers, validators, OPTIONS, user mappings, foreign tables, IMPORT FOREIGN SCHEMA (0A000) |
 | PG.INTEGRATION.REPLICATION | CREATE PUBLICATION [FOR ALL TABLES] [WITH (publish = ..., publish_via_partition_root)], DROP PUBLICATION (superusers); pg_publication. Catalog entries only | FOR TABLE / TABLES IN SCHEMA, ALTER PUBLICATION, logical decoding, subscriptions (0A000) |
 
+`information_schema.tables` and `information_schema.columns` use the current
+role's ownership and effective table grants, including inherited and `PUBLIC`
+grants. The columns view accepts SELECT, INSERT, UPDATE, or REFERENCES. The
+tables view also accepts DELETE, TRUNCATE, or TRIGGER. The raw PostgreSQL
+catalogs retain their existing visibility. Schema ACLs for `schemata`,
+column-level grants, and privilege filtering for constraint metadata remain
+separate conformance work.
+
 ## PG.TYPE.ENUM_DOMAIN_COMPOSITE
 
 Not implemented. The oracle expects the enum and composite type OIDs 18673
