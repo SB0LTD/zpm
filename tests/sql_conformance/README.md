@@ -227,8 +227,17 @@ The wire audit also reads the `COPY TO STDOUT` formats and exact byte stream
 for the fixed fixture. It accepts different `CopyData` frame boundaries. For
 `EXPLAIN (FORMAT JSON, ANALYZE)`, it validates the typed single JSON cell and
 plan structure and compares the actual number of rows produced at the root for
-one invocation. Physical operators and timing may differ. Session, cluster and
-native MySQL/T-SQL scopes still require dedicated fixtures.
+one invocation. Physical operators and timing may differ. Native MySQL/T-SQL
+scopes still require dedicated fixtures.
+
+On owned disposable clusters, pass `--disposable-admin-scopes` to include
+database creation/drop, prepared transaction lifecycle and maintenance. The
+PostgreSQL reference must have `max_prepared_transactions` enabled. Each scope
+uses unique object names and cleans up its own database, prepared transaction
+or maintenance schema. The native run with the command, COPY and EXPLAIN fixes
+executed all 106 PostgreSQL probes. It passed 102 and found four mismatches
+at `CREATE DATABASE`, `CREATE TYPE ... AS ENUM`, `PREPARE TRANSACTION` and
+`VACUUM`. The 12 native MySQL/T-SQL scopes remained unexecuted.
 
 On 17 November 2026, this audit of the exact Windows x64 CI prerelease against
 native PostgreSQL 18.3 returned **93 passes, 10 mismatches and 15 unexecuted

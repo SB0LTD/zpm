@@ -13,9 +13,11 @@ import json
 from pathlib import Path
 import socket
 import struct
+import uuid
 
 
 FIRST_NORMAL_OBJECT_ID = 16384  # PostgreSQL 18.3 access/transam.h.
+ADMIN_CASES = {"PG.DDL.DATABASE", "PG.TX.TWO_PHASE", "PG.UTILITY.MAINTENANCE"}
 
 
 class Pg:
@@ -126,16 +128,41 @@ class Pg:
                 return result
 
 
-def run_case(port, args, manifest, case):
+def run_case(port, args, manifest, case, objects):
     connection = Pg(port, args.user, args.database)
+    cleanup = None
+    results = []
     try:
-        commands = ["BEGIN"] + manifest["fixtures"][case["setup"]] + case["statements"]
-        results = []
+        setup = manifest["fixtures"][case["setup"]]
+        statements = case["statements"]
+        if case["id"] == "PG.UTILITY.MAINTENANCE":
+            schema = objects["schema"]
+            cleanup = f"DROP SCHEMA IF EXISTS {schema} CASCADE"
+            # Qualify the two fixed fixture names so maintenance can execute
+            # without depending on SET search_path support or any other schema.
+            commands = [f"CREATE SCHEMA {schema}"] + [
+                sql.replace("tdd_a", f"{schema}.tdd_a").replace("tdd_b", f"{schema}.tdd_b")
+                for sql in setup + statements
+            ]
+        elif case["id"] == "PG.DDL.DATABASE":
+            name = objects["database"]
+            cleanup = f"DROP DATABASE IF EXISTS {name}"
+            commands = setup + [sql.replace("ramsql_tdd_child", name) for sql in statements]
+        elif case["id"] == "PG.TX.TWO_PHASE":
+            gid = objects["prepared"]
+            commands = setup + [sql.replace("ramsql_tdd_tx", gid) for sql in statements]
+        else:
+            commands = ["BEGIN"] + setup + statements
         for command in commands:
             result = connection.query(command)
             results.append(result)
             if result["error"]:
                 break
+            if case["id"] == "PG.TX.TWO_PHASE":
+                if command.startswith("PREPARE TRANSACTION "):
+                    cleanup = f"ROLLBACK PREPARED '{gid}'"
+                elif command.startswith("COMMIT PREPARED "):
+                    cleanup = None
             dynamic = sorted({column[1] for column in result["columns"]
                               if column[1] >= FIRST_NORMAL_OBJECT_ID})
             if dynamic:
@@ -153,7 +180,13 @@ def run_case(port, args, manifest, case):
                         return results
         return results
     finally:
-        connection.close()  # Disconnect aborts the isolated fixture transaction.
+        try:
+            if cleanup:
+                cleaned = connection.query(cleanup)
+                if cleaned["error"] and not any(item["error"] for item in results):
+                    raise RuntimeError(f"Disposable fixture cleanup failed: {cleaned['error']}")
+        finally:
+            connection.close()  # Disconnect aborts an ordinary isolated fixture transaction.
 
 
 def explain_measurement(result):
@@ -234,6 +267,8 @@ def main():
     parser.add_argument("--user", default="postgres")
     parser.add_argument("--database", default="postgres")
     parser.add_argument("--case", action="append", help="Select stable feature IDs")
+    parser.add_argument("--disposable-admin-scopes", action="store_true",
+                        help="Also exercise database, prepared transaction, and maintenance lifecycle on owned test clusters")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     if not args.oracle_only and args.candidate_port is None:
@@ -259,9 +294,16 @@ def main():
               "oracle_version": full_version["rows"], "cases": []}
     for case in selected:
         entry = {"id": case["id"], "status": "unexecuted_scope"}
-        if case["scope"] in ("transaction", "copy_protocol") and case["dialect"] == "postgresql18":
+        regular = case["scope"] in ("transaction", "copy_protocol")
+        admin = args.disposable_admin_scopes and case["id"] in ADMIN_CASES
+        if (regular or admin) and case["dialect"] == "postgresql18":
             try:
-                oracle = run_case(args.oracle_port, args, manifest, case)
+                objects = {}
+                if admin:
+                    suffix = uuid.uuid4().hex
+                    objects = {kind: f"ramsql_tdd_{kind}_{suffix}" for kind in ("schema", "database", "prepared")}
+                    entry["fixture_objects"] = objects
+                oracle = run_case(args.oracle_port, args, manifest, case, objects)
                 comparator = case.get("comparator", "exact")
                 if any(item["error"] for item in oracle):
                     entry.update(status="oracle_invalid", oracle=oracle)
@@ -276,7 +318,7 @@ def main():
                 elif comparator not in ("exact", "explain_structure"):
                     entry.update(status="unexecuted_comparator", oracle=oracle)
                 else:
-                    candidate = run_case(args.candidate_port, args, manifest, case)
+                    candidate = run_case(args.candidate_port, args, manifest, case, objects)
                     passed = equivalent(oracle, candidate, case.get("ordered", False), comparator)
                     entry.update(status="smoke_pass" if passed else "fail", oracle=oracle, candidate=candidate)
             except (OSError, ValueError, RuntimeError) as error:
