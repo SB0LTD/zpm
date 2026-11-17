@@ -297,7 +297,7 @@ pub fn Session(comptime DB: type) type {
         fn textify(db: *DB, result: *DB.Result) anyerror!void {
             if (!@hasDecl(DB.Result, "textify")) return;
             const session = if (@hasDecl(DB, "valueSession")) db.valueSession() else DB.Result.default_session;
-            try result.textify(session);
+            if (@hasDecl(DB.Result, "textifyMysql")) try result.textifyMysql(session) else try result.textify(session);
         }
 
         fn results(self: *Self, writer: *Writer, flags: u16) Error!void {
@@ -320,16 +320,19 @@ pub fn Session(comptime DB: type) type {
                     .integer => 20,
                     .integer32 => 11,
                     .boolean => 1,
+                    .date => 10,
                     else => 65535,
                 }, 4);
                 try writer.byte(switch (kind) {
                     .integer => 8,
                     .integer32 => 3,
                     .boolean => 1,
+                    .date => 10,
+                    .bpchar => 254,
                     else => 253,
                 });
                 try writer.number(0, 2); // nullable, signed
-                try writer.byte(0); // decimals
+                try writer.byte(if (kind == .bpchar) 31 else 0); // decimals
                 try writer.number(0, 2);
                 try writer.finish(start);
             }

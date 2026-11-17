@@ -336,19 +336,23 @@ pub fn Database(comptime config: Config) type {
             /// without native metadata for the other types (MySQL/TDS, flag
             /// F-M). A value longer than Config.text_bytes is TextCapacity.
             pub fn textify(self: *Result, session: *const value_module.Session) Error!void {
-                return self.textifyColumns(session, false);
+                return self.textifyForWire(session, .generic);
             }
 
             /// TDS 7.3 and later can encode DATE without formatting the cells.
             pub fn textifyWithDate(self: *Result, session: *const value_module.Session) Error!void {
-                return self.textifyColumns(session, true);
+                return self.textifyForWire(session, .tds);
             }
 
-            fn textifyColumns(self: *Result, session: *const value_module.Session, keep_date: bool) Error!void {
+            pub fn textifyMysql(self: *Result, session: *const value_module.Session) Error!void {
+                return self.textifyForWire(session, .mysql);
+            }
+
+            fn textifyForWire(self: *Result, session: *const value_module.Session, mode: enum { generic, tds, mysql }) Error!void {
                 for (0..self.column_count) |column| {
                     switch (self.column_types[column]) {
                         .integer, .integer32, .boolean, .text => continue,
-                        .date => if (keep_date) continue,
+                        .date => if (mode == .tds) continue,
                         .smallint, .oid => {
                             self.column_types[column] = .integer;
                             continue;
@@ -358,8 +362,12 @@ pub fn Database(comptime config: Config) type {
                     for (self.rows[0..self.row_count]) |*row| {
                         row.cells[column] = try ValueIo.toText(&row.cells[column], false, session);
                     }
-                    self.column_types[column] = .text;
-                    self.column_typmods[column] = -1;
+                    const mysql_date = mode == .mysql and (self.column_types[column] == .date or
+                        (self.column_types[column] == .bpchar and self.column_typmods[column] == ast.mysql_date_text_typmod));
+                    if (!mysql_date) {
+                        self.column_types[column] = .text;
+                        self.column_typmods[column] = -1;
+                    }
                 }
                 self.has_nominal_types = false;
             }

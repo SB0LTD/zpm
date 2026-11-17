@@ -3,7 +3,7 @@ const std = @import("std");
 const sql = @import("sql");
 const mysql = @import("mysql");
 const db_store = @import("db_store");
-const Raw = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 4, .text_bytes = 64, .integer_bits = 32 });
+const Raw = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 4, .name_bytes = 63, .text_bytes = 64, .integer_bits = 32 });
 const Store = db_store.Store(Raw);
 const DB = Store.Connection;
 const Session = mysql.Session(DB);
@@ -386,12 +386,81 @@ fn nativeSignedIntegerLiterals() !void {
     try check(result.column_types[0] == .integer32);
 }
 
+fn nativeIfnullAndDateAdd() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    const statement = "SELECT IFNULL(NULL,2),DATE_ADD('2025-01-01',INTERVAL 1 DAY)";
+    const reply = try command(&session, &db, statement);
+    try check(session.result.row_count == 1 and session.result.column_count == 2);
+    try same(session.result.column_names[0].slice(), "IFNULL(NULL,2)");
+    try same(session.result.column_names[1].slice(), "DATE_ADD('2025-01-01',INTERVAL 1 DAY)");
+    var reader: Reader = .{ .source = output[0..reply.written] };
+    try same(try reader.next(), &.{2});
+    for ([_]u8{ 8, 254 }, [_]u8{ 0, 31 }) |kind, scale| {
+        const metadata = try reader.next();
+        try check(metadata.len >= 13 and metadata[metadata.len - 6] == kind);
+        try check(metadata[metadata.len - 5] & 32 == 0 and metadata[metadata.len - 3] == scale);
+    }
+    try check((try reader.next())[0] == 0xfe);
+    try same(try reader.next(), "\x012\x0a2025-01-02");
+
+    const calendar = try command(&session, &db,
+        "SELECT DATE_ADD(DATE '2024-01-31',INTERVAL 1 MONTH),DATE_ADD('2024-02-29',INTERVAL -12 MONTH)," ++
+        "DATE_ADD('9999-12-31',INTERVAL 1 DAY),DATE_ADD('2025-01-01',INTERVAL NULL DAY)");
+    reader = .{ .source = output[0..calendar.written] };
+    try same(try reader.next(), &.{4});
+    const typed = try reader.next();
+    try check(typed.len >= 13 and typed[typed.len - 6] == 10 and typed[typed.len - 3] == 0);
+    try check(session.result.row_count == 1 and session.result.column_count == 4);
+    const values = &session.result.rows[0].cells;
+    try same(values[0].text.slice(), "2024-02-29");
+    try same(values[1].text.slice(), "2023-02-28");
+    try check(values[2] == .null_value and values[3] == .null_value);
+    _ = try command(&session, &db, "SELECT IFNULL(7,9223372036854775807+1),DATE_ADD('2024-03-01',INTERVAL -1 DAY)");
+    try check(session.result.row_count == 1 and session.result.column_count == 2);
+    try check(values[0].integer == 7);
+    try same(values[1].text.slice(), "2024-02-29");
+
+    _ = try command(&session, &db, "CREATE TABLE date_values(d DATE,n INT)");
+    try check(output[4] == 0);
+    _ = try command(&session, &db, "INSERT INTO date_values VALUES(DATE '2024-01-31',1),(NULL,NULL)");
+    try check(output[4] == 0);
+    _ = try command(&session, &db,
+        "SELECT DATE_ADD(d, INTERVAL n MONTH) AS shifted, IFNULL(n,2) AS fallback FROM date_values ORDER BY n IS NULL, n");
+    try check(output[4] == 2 and session.result.row_count == 2);
+    try same(session.result.column_names[0].slice(), "shifted");
+    try same(values[0].text.slice(), "2024-02-29");
+    try check(values[1].integer == 1 and session.result.rows[1].cells[0] == .null_value);
+    try check(session.result.rows[1].cells[1].integer == 2);
+
+    for ([_][]const u8{
+        "SELECT DATE_ADD('2025-01-01',INTERVAL 1 HOUR)",
+        "SELECT DATE_ADD('2025-01-01',INTERVAL 1.9 DAY)",
+        "SELECT IFNULL(NULL,2,'extra')",
+        "CREATE TABLE saved (v INT DEFAULT IFNULL(NULL,2))",
+    }) |source| {
+        _ = try command(&session, &db, source);
+        try check(output[4] == 0xff);
+    }
+    var result: Raw.Result = .{};
+    for ([_]sql.Dialect{ .postgres, .tds }) |dialect| {
+        store.database.dialect = dialect;
+        if (store.database.execute(statement, &result)) |_| return error.UnexpectedDialectSyntax else |_| {}
+    }
+    store.database.dialect = .mysql;
+    if (store.database.executeLegacy(statement, &result)) |_| return error.UnexpectedLegacySyntax else |err|
+        try check(err == error.UnsupportedLogVersion);
+}
+
 pub fn main(init: std.process.Init) !void {
     try handshakeAndFragmentation();
     try typedResultsAndErrors();
     try nativeIdentifierAndLimit();
     try nativeGrammarAndReplay();
     try nativeSignedIntegerLiterals();
+    try nativeIfnullAndDateAdd();
     try transactionsAndOutputPreflight();
     try concurrentCommittedVisibility();
     try malformedAndFuzz();

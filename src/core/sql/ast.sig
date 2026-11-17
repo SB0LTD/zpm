@@ -132,7 +132,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     regexp_like, similar_to_escape,
     // Full text search (B11 text lane, text_search.sig): the first argument
     // is the regconfig name.
-    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery };
+    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -205,7 +205,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
-        .overlaps, .aggregate_pair, .normalize, .is_normalized => true,
+        .overlaps, .aggregate_pair, .normalize, .is_normalized, .mysql_date_add => true,
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
         .array_append, .array_prepend, .array_cat => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
@@ -250,6 +250,8 @@ pub fn strictFunction(func: Func) bool {
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).
 pub const regclass_typmod: i32 = -2;
 pub const regtype_typmod: i32 = -3;
+/// Wire metadata for MySQL DATE_ADD returning its fixed date string.
+pub const mysql_date_text_typmod: i32 = -4;
 
 /// Node.reg: an OID-valued expression known to be a regclass / regtype.
 pub const Reg = enum(u8) { none, regclass, regtype };
