@@ -21,12 +21,13 @@
 //! Enums support catalog CREATE/DROP, pg_type and pg_enum, and standalone
 //! literal casts with nominal result metadata. A type, its generated array
 //! and all ordered labels have one MVCC lifetime and contiguous OID range.
-//! ALTER TYPE, general enum expressions, enum storage and composite types
-//! require separate type-system support.
-//! Composite CREATE/DROP publishes a catalog relation and typed attributes.
+//! ALTER TYPE, general enum expressions and enum storage require separate
+//! type-system support. Composite CREATE/DROP publishes a catalog relation
+//! and typed attributes. A standalone flat ROW literal can be cast to a
+//! composite with supported built-in field types.
 //! Field descriptors and enum labels share Config.object_text_bytes with
 //! the generated array name, in their respective object kind. Composite
-//! values and typed tables have a separate execution/storage contract.
+//! storage, nested expressions and typed tables require further support.
 //!
 //!   70 object_create kind u8, oid u32, target u32, grantee u32, sub i32,
 //!                    owner u32, flags u32, grant_flags u32, name (len u8 +

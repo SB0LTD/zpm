@@ -372,6 +372,8 @@ pub const Node = struct {
     domain_cast: bool = false,
     /// A root literal cast whose decoded text labels were validated by binding.
     enum_cast: bool = false,
+    /// A root flat ROW cast. `integer` holds the declared field count.
+    flat_record_cast: bool = false,
     domain_not_null: bool = false,
     domain_comparison: catalog_objects.DomainComparison = .none,
     ty: Type = .unknown,

@@ -108,6 +108,48 @@ fn corruptRecords(existing_relation_oid: u32) !void {
     try durable("DROP TYPE secondary");
 }
 
+fn recordText(db: *DB, statement: []const u8, expected: []const u8, name: []const u8) !void {
+    try db.execute(statement, &result);
+    try check(result.row_count == 1 and result.column_count == 1 and equal(result.column_names[0].slice(), name));
+    const identity = result.nominalColumnType(0).?;
+    try check(identity.oid >= sql.change_records.first_oid and identity.len == -1 and identity.representation == .flat_record);
+    var out: [256]u8 = undefined;
+    const len = (try result.formatNominalText(0, &result.rows[0].cells[0], &out)).?;
+    try check(equal(out[0..len], expected));
+}
+
+fn flatRecordContracts() !void {
+    try durable("CREATE TYPE pair AS (n INTEGER, label TEXT)");
+    try durable("CREATE TYPE narrow_fields AS (s SMALLINT, l BIGINT, b BOOLEAN)");
+    for ([_]*DB{ &primary, &restored }) |db| {
+        try recordText(db, "SELECT ROW(1,'x')::pair", "(1,x)", "row");
+        const binary =
+            "\x00\x00\x00\x02" ++
+            "\x00\x00\x00\x17\x00\x00\x00\x04\x00\x00\x00\x01" ++
+            "\x00\x00\x00\x19\x00\x00\x00\x01x";
+        try check(equal(result.rows[0].cells[0].bytea.slice(), binary));
+        try recordText(db, "SELECT ROW(NULL,'')::pair", "(,\"\")", "row");
+        try recordText(db, "SELECT ROW(-7,' a,b()\"\\ ')::pair", "(-7,\" a,b()\"\"\\\\ \")", "row");
+        try recordText(db, "SELECT ROW(-32768,-9223372036854775808,TRUE)::narrow_fields", "(-32768,-9223372036854775808,t)", "row");
+        try recordText(db, "SELECT ROW('003','nice')::pair", "(3,nice)", "row");
+        try result.textify(DB.Result.default_session);
+        try check(result.nominalColumnType(0) == null and result.column_types[0] == .text and equal(result.rows[0].cells[0].text.slice(), "(3,nice)"));
+        try db.execute("SELECT CAST(NULL AS pair)", &result);
+        try check(result.rows[0].cells[0] == .null_value and result.nominalColumnType(0).?.representation == .flat_record);
+        try check(equal(result.column_names[0].slice(), "pair"));
+        try db.execute("DECLARE records CURSOR WITH HOLD FOR SELECT ROW(1,'x')::pair", &result);
+        try recordText(db, "FETCH NEXT FROM records", "(1,x)", "row");
+        try db.execute("CLOSE records", &result);
+    }
+    try rejects("SELECT ROW(1)::pair", error.CannotCoerce);
+    try rejects("SELECT ROW(1,'x',NULL)::pair", error.CannotCoerce);
+    try rejects("SELECT ROW('invalid','x')::pair", error.InvalidTextRepresentation);
+    try rejects("SELECT ROW(32768,1,TRUE)::narrow_fields", error.NumericValueOutOfRange);
+    try rejects("SELECT ROW(1+2,'x')::pair", error.UnsupportedStatement);
+    try rejects("SELECT ROW(1,'x')::pair::TEXT", error.UnsupportedStatement);
+    try rejects("SELECT ROW(1,'x')::pair = ROW(1,'x')::pair", error.UnsupportedStatement);
+}
+
 fn contract() !void {
     // Replay must continue to decode the old domain and enum op layouts.
     try durable("CREATE DOMAIN old_domain AS INT");
@@ -174,6 +216,7 @@ fn contract() !void {
     try check(result.row_count == 0);
     try restored.execute("SELECT oid FROM pg_type WHERE typname IN ('Point','_Point')", &result);
     try check(result.row_count == 0 and restored.oid_counter == primary.oid_counter);
+    try flatRecordContracts();
 }
 
 pub fn main(init: std.process.Init) !void {

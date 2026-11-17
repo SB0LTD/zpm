@@ -27,6 +27,7 @@ const array_module = @import("array.sig");
 const routine_catalog = @import("routine_catalog.sig");
 const collation = @import("collation.sig");
 const catalog_objects = @import("catalog_objects.sig");
+const flat_record = @import("flat_record.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -3931,6 +3932,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .cast => {
                     n.date_bound=false;
+                    if (n.flat_record_cast) return;
                     if (n.cast_type == .unknown) return error.UnsupportedStatement;
                     if (n.typmod == ast.regclass_typmod or n.typmod == ast.regtype_typmod) return regCast(context, scope, n);
                     const target = n.cast_type;
@@ -4136,9 +4138,11 @@ pub fn Binder(comptime config: types.Config) type {
                 .at_zone => .{ .name = "timezone", .strength = 2 },
                 .case_expr => .{ .name = "case", .strength = 1 },
                 .cast => blk: {
+                    if (n.flat_record_cast and context.node(n.a).kind == .row_constructor)
+                        break :blk .{ .name = "row", .strength = 2 };
                     const inner = figure(context, n.a, buffer);
                     if (inner.strength > 1) break :blk inner;
-                    if (n.domain_cast or n.enum_cast) {
+                    if (n.domain_cast or n.enum_cast or n.flat_record_cast) {
                         buffer.* = toName(context, n.name);
                         break :blk .{ .name = buffer.slice(), .strength = 1 };
                     }
@@ -4531,7 +4535,43 @@ pub fn Binder(comptime config: types.Config) type {
             out.plan = root;
         }
 
-        fn bindUserTypeCast(context: *const Context, target: u16) Error!?types.NominalColumnType {
+        fn recordFieldLiteral(context: *const Context, id: u16) bool {
+            const n = context.node(id);
+            return switch (n.kind) {
+                .null_literal, .int_literal, .text_literal, .bool_literal, .decimal_literal => true,
+                .unary => (n.op == .neg or n.op == .pos) and recordFieldLiteral(context, n.a),
+                else => false,
+            };
+        }
+
+        fn bindFlatRecordCast(context: *const Context, scope: *const Scope, n: *ast.Node, object: *const catalog_objects.Objects(config).Object) Error!void {
+            const row = context.node(n.a);
+            if (row.kind == .row_constructor) {
+                var item = &row.b;
+                var layout = object.compositeFields();
+                while (layout.next()) |attribute| {
+                    const id = item.*;
+                    if (id == none) return error.CannotCoerce;
+                    const data_type = types.typeFromOid(attribute.oid) orelse return error.UnsupportedStatement;
+                    if (attribute.typmod != -1 or !flat_record.supports(data_type) or !recordFieldLiteral(context, id)) return error.UnsupportedStatement;
+                    const next = context.node(id).next;
+                    try typeExpr(context, scope, id);
+                    const coerced = convert(context, id, types.typeOfData(data_type), -1, .explicit) catch |err|
+                        return if (err == error.UndefinedFunction) error.CannotCoerce else err;
+                    item.* = coerced;
+                    item = &context.node(coerced).next;
+                    item.* = next;
+                }
+                if (item.* != none) return error.CannotCoerce;
+            } else if (row.kind != .null_literal) return error.UnsupportedStatement;
+            n.cast_type = .bytea;
+            n.ty = .bytea;
+            n.flat_record_cast = true;
+            n.constant = true;
+            n.integer = object.composite_field_count;
+        }
+
+        fn bindUserTypeCast(context: *const Context, scope: *const Scope, target: u16) Error!?types.NominalColumnType {
             const n = context.node(target);
             if (n.kind != .cast or n.cast_type != .unknown) return null;
             if (context.dialect != .postgres) return error.UnsupportedStatement;
@@ -4564,6 +4604,11 @@ pub fn Binder(comptime config: types.Config) type {
                 n.enum_cast = true;
                 return .{ .oid = object.oid, .len = 4 };
             }
+            if (user_types.byName(.composite_type, namespace, name.slice(), context.snapshot)) |index| {
+                const object = &user_types.items[index];
+                try bindFlatRecordCast(context, scope, n, object);
+                return .{ .oid = object.oid, .len = -1, .representation = .flat_record };
+            }
             if (user_types.userTypeNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
             return error.UndefinedObject;
         }
@@ -4595,7 +4640,7 @@ pub fn Binder(comptime config: types.Config) type {
                 }
                 if (out.count == config.columns) return error.ColumnCapacity;
                 if (select.from == null and select.where == none and select.order_count == 0 and !select.limit_present) {
-                    if (try bindUserTypeCast(context, target.expr)) |nominal| {
+                    if (try bindUserTypeCast(context, &scope, target.expr)) |nominal| {
                         if (!out.has_nominal_types) @memset(&out.nominal_types, .{});
                         out.has_nominal_types = true;
                         out.nominal_types[out.count] = nominal;
