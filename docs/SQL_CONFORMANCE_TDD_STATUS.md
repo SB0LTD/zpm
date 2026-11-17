@@ -21,10 +21,14 @@ read lane. The replacement `5a51a6e1f5304a4c6228210d7538440d77f177df` and ZPM
 PostgreSQL 18.3 on Windows. RAMSQL used durable SCRAM and the reference
 restarted in immediate mode. The Windows differential report SHA-256 is
 `b7b36be202bc8af3fb63753fc9dcb56906a8822c0572e1039a53e0026160af75`.
-Hosted matrix qualification for the replacement is pending.
+The next hosted matrix combines that routing fix with the corrected streamed
+join workspace contract (`d7fe9c1a`), temporal resolver routing and the global
+prepared-transaction grant. The temporal route passed a separate two-worker
+Linux wire suite with 4,235 assertions.
 [SQL Server comparison](https://github.com/benor1470/dbMeter/actions/runs/44185665967) ·
 [PostgreSQL qualification](https://github.com/SB0LTD/ramsql/actions/runs/44185459464) ·
-[Replacement matrix](https://github.com/SB0LTD/ramsql/actions/runs/44189642358)
+[Temporal wire test](https://github.com/SB0LTD/ramsql/actions/runs/44193116121) ·
+[Combined release matrix](https://github.com/SB0LTD/ramsql/actions/runs/44195561261)
 
 ## Native wire checkpoint — 17 November 2026
 
