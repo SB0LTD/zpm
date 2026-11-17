@@ -56,9 +56,14 @@ pub fn main(init:std.process.Init) !void {
     // Unique-key grouped joins now stream without the old intermediate bank.
     try db.execute("SELECT COUNT(*) FROM facts f JOIN products p ON p.id=f.p JOIN shops s ON s.id=f.shop WHERE f.shop=3 OR s.id=2",&result);
     try check(result.row_count==1 and result.rows[0].cells[0].integer==8);
-    // The non-aggregate path retains its bounded materialization contract.
+    // Unique-key projection streams exactly the surviving rows as well.
+    try db.execute("SELECT f.id FROM facts f JOIN products p ON p.id=f.p JOIN shops s ON s.id=f.shop WHERE f.shop=3 OR s.id=2 ORDER BY f.id",&result);
+    const expected = [_]i64{ 2, 3, 34, 35, 66, 67, 98, 99 };
+    try check(result.row_count==expected.len and db.workspace.query.stream_stats.joined_projection_plans==1);
+    for (expected, result.rows[0..expected.len]) |id, row| try check(row.cells[0].integer==id);
+    // General outer joins still require a bounded intermediate bank.
     result.row_count=27;
-    if(db.execute("SELECT f.id FROM facts f JOIN products p ON p.id=f.p JOIN shops s ON s.id=f.shop WHERE f.shop=3 OR s.id=2",&result)) |_| return error.ExpectedCapacity
+    if(db.execute("SELECT f.id FROM facts f LEFT JOIN products p ON p.id=f.p LEFT JOIN shops s ON s.id=f.shop WHERE f.shop=3 OR s.id=2",&result)) |_| return error.ExpectedCapacity
         else |err| try check(err==error.WorkspaceCapacity);
     try check(result.row_count==27);
     try db.execute("DELETE FROM facts WHERE id>=2",&result);
