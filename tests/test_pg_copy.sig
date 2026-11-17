@@ -406,6 +406,18 @@ fn protocol() !void {
     const binary_out = try copyOut(try a.query("COPY o (id) TO STDOUT (FORMAT binary)"), &out);
     try check(binary_out.len == 19 + 3 * 10 + 2 and equal(binary_out[0..11], fmt.signature) and binary_out[19 + 9] == 1 and binary_out[binary_out.len - 1] == 0xff);
 
+    // Table COPY retains its schema and excludes rows inherited by SELECT.
+    _ = try a.query("CREATE SCHEMA \"Copy Source\"");
+    _ = try a.query("CREATE TABLE \"Copy Source\".o (id INTEGER PRIMARY KEY, label TEXT)");
+    _ = try a.query("INSERT INTO \"Copy Source\".o VALUES (9, 'other')");
+    try check(equal(try copyOut(try a.query("COPY \"Copy Source\".o TO STDOUT"), &out), "9\tother\n"));
+    _ = try a.query("DROP TABLE \"Copy Source\".o");
+    _ = try a.query("DROP SCHEMA \"Copy Source\"");
+    _ = try a.query("CREATE TABLE o_child () INHERITS (o)");
+    _ = try a.query("INSERT INTO o_child VALUES (80, 'inherited')");
+    try check(equal(try copyOut(try a.query("COPY o (id) TO STDOUT"), &out), "1\n2\n3\n"));
+    _ = try a.query("DROP TABLE o_child");
+
     // Disconnect mid-COPY rolls it back.
     _ = try b.handle(frame(&message, 'Q', "COPY o FROM STDIN\x00"));
     _ = try b.data("70\tgone\n");

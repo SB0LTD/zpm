@@ -652,7 +652,28 @@ pub fn Database(comptime config: Config) type {
         /// buffer. No row/database snapshots are copied into this context.
         pub const ReadContext = struct {
             const Context=@This();
-            const Plan=union(enum){simple:B.Select,general:u16};
+            const PrimaryKeyPlan = struct {
+                select: B.Select,
+                projection: [config.columns]u16,
+                column: usize,
+                data_type: DataType,
+                oid: u32,
+                role: u32,
+                prepared_csn: u64,
+                snapshot: Snapshot,
+            };
+            const Plan=union(enum){simple:B.Select,general:u16,primary_key:PrimaryKeyPlan};
+            pub const primary_key_source_capacity = 256;
+            /// The retained plan's projected columns and result metadata are
+            /// independent of the AST workspace and own their template bytes.
+            const CachedPrimaryKey = struct {
+                source: [primary_key_source_capacity]u8 = undefined,
+                len: usize,
+                database: *const Self,
+                plan: PrimaryKeyPlan,
+            };
+            cached_primary_key: ?CachedPrimaryKey = null,
+            primary_key_cache_hits: usize = 0,
             workspace:Workspace=.{},
             session:value_module.Session=.{},
             dialect:Dialect=.postgres,
@@ -719,22 +740,22 @@ pub fn Database(comptime config: Config) type {
             /// Callbacks in session (clock/zone resolver/control) must themselves
             /// be safe for concurrent reads. Sequence hooks are always disabled.
             pub fn prepare(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot) Error!void {
-                return self.prepareMode(db,source,snapshot,false);
+                return self.prepareMode(db,source,snapshot,false,null);
             }
             /// Metadata binding is separate from executable preparation. It
             /// never leaves a metadata-only plan available to run().
             pub fn describe(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,result:*Result) Error!void {
                 defer self.prepared=null;
-                try self.prepareMode(db,source,snapshot,true);
+                try self.prepareMode(db,source,snapshot,true,null);
                 try self.describeResult(result);
             }
-            fn prepareMode(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
+            fn prepareMode(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool,params:?*const B.Parameters) Error!void {
                 try self.validate(db,source,null);
                 self.prepared=null;
                 self.preparation_error=null;self.database=db;self.source=source;self.snapshot=snapshot;
-                self.prepareBody(db,source,snapshot,describe_only) catch |err| {self.preparation_error=err;return err;};
+                self.prepareBody(db,source,snapshot,describe_only,params) catch |err| {self.preparation_error=err;return err;};
             }
-            fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool) Error!void {
+            fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool,params:?*const B.Parameters) Error!void {
                 self.session.sequences=null;
                 var parsed=try P.parse(source,&self.workspace.nodes,.standard);
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
@@ -744,7 +765,7 @@ pub fn Database(comptime config: Config) type {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
-                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects};
+                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,.params=params};
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
@@ -757,6 +778,129 @@ pub fn Database(comptime config: Config) type {
                 self.prepared=switch(bound){.select=>|select| .{.simple=select},.query=>|root| .{.general=root},else=>return error.UnsupportedStatement};
                 self.database=db;self.source=source;self.effective=expanded;self.snapshot=snapshot;
             }
+
+            fn directColumn(node: *const ast.Node, count: usize) bool {
+                return node.kind == .column and node.level == 0 and node.relation == 0 and node.column < count;
+            }
+
+            /// Binds a PostgreSQL integral PK lookup using a declared parameter
+            /// type and this context's role. False means use ordinary execution.
+            /// Keep the SQL buffer unchanged and the committed snapshot alive.
+            /// Replacing database contents ends the binding, even at equal CSN.
+            pub fn preparePrimaryKey(self: *Context, db: *const Self, source: []const u8, snapshot: Snapshot, parameter: DataType) Error!bool {
+                self.prepared = null;
+                self.preparation_error = null;
+                if (comptime config.statement_parameters == 0) return false;
+                if (self.dialect != .postgres or snapshot.epoch != 0 or snapshot.csn > db.csn) return false;
+                switch (parameter) {
+                    .smallint, .integer32, .integer => {},
+                    else => return false,
+                }
+                if (self.cached_primary_key) |*cached| {
+                    if (cached.database == db and snapshotMatches(cached.plan.snapshot, snapshot) and
+                        self.primaryKeyTableCurrent(db, &cached.plan) and cached.plan.data_type == parameter and
+                        types.same(cached.source[0..cached.len], source))
+                    {
+                        try self.validate(db, source, null);
+                        try self.session.checkpoint();
+                        self.database = db;
+                        self.source = source;
+                        self.effective = source;
+                        self.snapshot = snapshot;
+                        self.prepared = .{ .primary_key = cached.plan };
+                        self.primary_key_cache_hits +%= 1;
+                        return true;
+                    }
+                }
+                var params: B.Parameters = .{ .count = 1 };
+                params.types[0] = types.typeOfData(parameter);
+                // As with SQL PREPARE, bind types before runtime values exist.
+                self.prepareMode(db, source, snapshot, true, &params) catch |err| {
+                    if (err != error.UnsupportedStatement) return err;
+                    self.preparation_error = null;
+                    return false;
+                };
+                const bound = self.prepared.?;
+                self.prepared = null;
+                if (bound != .simple or self.effective.ptr != source.ptr) return false;
+                const select = bound.simple;
+                if (select.where == ast.none or select.order_count != 0 or select.limit != ~@as(u64, 0) or select.lock.strength != .none) return false;
+                const table = &db.tables[select.table orelse return false];
+                const primary = table.primary_column orelse return false;
+                if (table.relkind != 'r' or table.parent != 0 or db.hasChildren(table.oid, snapshot) or
+                    db.catalog_objects.rowSecurity(self.session.role, table.oid, snapshot) or table.columns[primary].data_type != parameter) return false;
+                const nodes = &self.workspace.nodes.nodes;
+                const predicate = &nodes[select.where];
+                if (predicate.kind != .binary or predicate.op != .eq) return false;
+                const left = &nodes[predicate.a];
+                const right = &nodes[predicate.b];
+                const column = if (left.kind == .param) right else left;
+                const argument = if (left.kind == .param) left else right;
+                if (!directColumn(column, table.column_count) or column.column != primary or argument.kind != .param or argument.integer != 1 or argument.ty != params.types[0]) return false;
+                var projection: [config.columns]u16 = undefined;
+                for (select.targets[0..select.count], 0..) |id, position| {
+                    const item = &nodes[id];
+                    if (!directColumn(item, table.column_count)) return false;
+                    projection[position] = item.column;
+                }
+                const plan: PrimaryKeyPlan = .{
+                    .select = select,
+                    .projection = projection,
+                    .column = primary,
+                    .data_type = parameter,
+                    .oid = table.oid,
+                    .role = self.session.role,
+                    .prepared_csn = db.csn,
+                    .snapshot = snapshot,
+                };
+                self.prepared = .{ .primary_key = plan };
+                if (source.len <= primary_key_source_capacity) {
+                    self.cached_primary_key = .{ .len=source.len, .database=db, .plan=plan };
+                    @memcpy(self.cached_primary_key.?.source[0..source.len], source);
+                }
+                return true;
+            }
+
+            /// An installed plan must match the owned template and parameter
+            /// supplied by the current portal, before checking the snapshot.
+            pub fn primaryKeyMatches(self: *const Context, source: []const u8, parameter: DataType) bool {
+                const plan = if (self.prepared) |*prepared| prepared else return false;
+                return plan.* == .primary_key and plan.primary_key.data_type == parameter and types.same(self.source, source);
+            }
+
+            fn snapshotMatches(cached: Snapshot, current: Snapshot) bool {
+                return current.epoch == 0 and cached.epoch == 0 and cached.csn == current.csn and
+                    cached.slot == current.slot and cached.cid == current.cid;
+            }
+
+            fn primaryKeyCurrent(self: *const Context, db: *const Self, snapshot: Snapshot, plan: *const PrimaryKeyPlan) bool {
+                return self.database == db and snapshotMatches(plan.snapshot, snapshot) and self.primaryKeyTableCurrent(db, plan);
+            }
+
+            fn primaryKeyTableCurrent(self: *const Context, db: *const Self, plan: *const PrimaryKeyPlan) bool {
+                if (plan.prepared_csn != db.csn or self.session.role != plan.role or self.dialect != .postgres) return false;
+                const table = &db.tables[plan.select.table.?];
+                return table.live and table.oid == plan.oid and table.primary_column == plan.column and
+                    table.columns[plan.column].data_type == plan.data_type;
+            }
+
+            /// Runs a prepared PK probe without parsing or binding again.
+            /// A stale binding returns false and leaves the result untouched.
+            /// The caller still excludes mutation for the duration of the read.
+            pub fn runPrimaryKey(self: *Context, db: *const Self, snapshot: Snapshot, key: *const Cell, result: *Result) Error!bool {
+                const prepared = if (self.prepared) |*plan| plan else return false;
+                if (prepared.* != .primary_key) return false;
+                const plan = &prepared.primary_key;
+                if (!self.primaryKeyCurrent(db, snapshot, plan)) return false;
+                try self.validate(db, self.source, result);
+                if (config.external_results and result.rows.len == 0) return error.InvalidParameterValue;
+                const table = &db.tables[plan.select.table.?];
+                if (key.* != .null_value) try V.validate(&table.columns[plan.column], key);
+                self.workspace.query.read_stats = .{};
+                try X.selectPrimaryKey(table, &plan.select, plan.projection[0..plan.select.count], key, snapshot, result, &self.session);
+                return true;
+            }
+
             pub fn run(self:*Context,result:*Result) Error!void {
                 const db=self.database orelse return error.InvalidParameterValue;
                 try self.validate(db,self.source,result);
@@ -770,6 +914,7 @@ pub fn Database(comptime config: Config) type {
                         &self.session,self.snapshot.epoch==0,&self.workspace.query.read_stats,&self.workspace.query),
                     .general=>|root| try X.runQuery(&db.tables,self.effective,&self.workspace.nodes,&self.workspace.plans,root,self.snapshot,result,
                         &self.session,&self.workspace.query,self.snapshot.epoch==0),
+                    .primary_key => return error.UndefinedParameter,
                 }
             }
             /// Describe an already bound read without running expressions,
@@ -779,15 +924,14 @@ pub fn Database(comptime config: Config) type {
                 try self.validate(db,self.source,result);
                 if(self.preparation_error) |err| return err;
                 const plan=self.prepared orelse return error.InvalidParameterValue;
-                result.clear(0);result.command=.select;
                 switch(plan) {
-                    .simple=>|select| {
-                        result.column_count=select.count;
-                        @memcpy(result.column_names[0..select.count],select.names[0..select.count]);
-                        @memcpy(result.column_types[0..select.count],select.types[0..select.count]);
-                        @memcpy(result.column_typmods[0..select.count],select.typmods[0..select.count]);
+                    .simple=>|*select| X.writeHeader(select,result),
+                    .primary_key=>|*key| {
+                        if (!self.primaryKeyCurrent(db, self.snapshot, key)) return error.InvalidParameterValue;
+                        X.writeHeader(&key.select,result);
                     },
                     .general=>|root| {
+                        result.clear(0);result.command=.select;
                         const query=&self.workspace.plans.items[root];
                         result.column_count=query.count;
                         for(0..query.count) |i| {
@@ -5379,7 +5523,12 @@ pub fn Database(comptime config: Config) type {
                     if (field != 0) try appendText(select, &used, ", ");
                     try appendQuoted(select, &used, table.columns[column].name.slice());
                 }
-                try appendText(select, &used, " FROM ");
+                try appendText(select, &used, " FROM ONLY ");
+                if (copy.table.schema) |qualifier| {
+                    const namespace = identName(source, qualifier);
+                    try appendQuoted(select, &used, namespace.slice());
+                    try appendText(select, &used, ".");
+                }
                 try appendQuoted(select, &used, table.name.slice());
                 info.select_len = used;
             }
