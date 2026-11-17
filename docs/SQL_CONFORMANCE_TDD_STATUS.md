@@ -2,15 +2,16 @@
 
 ## Native wire checkpoint — 17 November 2026
 
-The unchanged 118-program inventory has independent native wire results.
-The PostgreSQL and MySQL runs use RAMSQL `13294c5246dce4ef6ab23af55c1679b7d189af42`
-with ZPM `5f674e9e561d208bed7f29338b462d257e482165`. The Windows ReleaseSafe
-executable has SHA-256 `790e66db2485374d01104610a4ade911c67d349a9ea2382811af67c7011626f2`.
+The unchanged 118-program inventory has **116 native matches** on RAMSQL
+`deb1ed41c32e65b7cdf2a86d9f2820569ed1e286` with ZPM
+`f208559a76a2e03f026221ac86c929a00da57c32`. The PostgreSQL and MySQL runs use the
+Windows ReleaseSafe executable built with Sig 0.6.5, SHA-256
+`6dcd0a1e6897a8da19fcc28e6994b0cff254c9a03e05f258f5fb0ba3cc071d7f`.
 
 | Native reference | Matched | Open cases |
 | --- | ---: | --- |
 | PostgreSQL 18.3 | 104 of 106 | `PG.DDL.DATABASE`, `PG.TX.TWO_PHASE` |
-| MySQL Community 8.4.13 | 4 of 6 | `MYSQL.TYPES`, `MYSQL.AUTO_INCREMENT` |
+| MySQL Community 8.4.13 | 6 of 6 | The original six smoke programs pass. Broader dialect work is tracked below. |
 | SQL Server 2022 CU28 | 6 of 6 | The original six smoke programs pass. Broader dialect work is tracked below. |
 
 The PostgreSQL enum, domain and composite case now matches. The wire audit
@@ -21,22 +22,27 @@ The older requirement to match a particular dynamically assigned OID came from
 the historical core-only fixture below.
 
 The native PostgreSQL inventory report SHA-256 is
-`e968964adfda572ecf90a75a4f59b7a9c107705eaef572af2321de5131db6813`.
+`449c6ca9bfb5556afdf3f92578fda05fc2b57ad23d4389a44d07033e56988d90`.
 The native MySQL report SHA-256 is
-`3968cae8b53cca49e11322fce7e2e6316db558de8e15062c18655f1b78be120b`.
+`2a962b3da5f80ac12cfdbeb0f0ae71c8697bc5866f6b2f89d29d9df97843353b`.
 The MySQL primary-key `REPLACE` trace also matches repeated keys, defaults,
 failed-statement rollback, explicit rollback, cross-session visibility,
 same-key writer blocking and replay of the committed result.
-The trace SHA-256 is `7e883970bdf955f59b392d1aac9adce8b3e4c04875f6e56ecc50dfc1a7907716`.
+The current trace SHA-256 is `e92a0f39e2fa41d6e73ec8b8d198e629ef3fa089de3e18e5eeb19622fed3e44f`.
+Separate native comparisons cover signed-primary-key `AUTO_INCREMENT`,
+including mixed inserts, session-local generated IDs and rollback, and
+`BIGINT UNSIGNED` exact values, comparisons, range errors and WAL reopen.
+The two trace hashes are `28747dc716be6486b381e11e9d89b1d25a8267b0f3c5f425f5f4d96dd656c73d`
+and `f5bf8293176044d465a30ad7e5d0eba5421a3f12d8ac22ab3cf4c7f2e5839c2a`.
 
-The Linux SQL Server comparison uses RAMSQL `1a8dbb6846a5eb1df1ab96f141184731af904332`
-and ZPM `e3b7c13c07fafe4a3951b581c3ce203b81281d9a`. The six cases and all 24
-setup observations match native values, row counts and result metadata. The
+The Linux SQL Server comparison uses the same product and ZPM revisions.
+The six cases and all 24 setup observations match native values, row counts
+and result metadata. The
 new cases exercise direct OUTPUT row images, a correlated CROSS APPLY derived
 query and a batch-scoped INT declaration. The executable SHA-256 is
-`fb19425bd3950e3ab85827e6378c44d828fed993a71f2a77dc03ddaaafd9c36a` and the report
-SHA-256 is `5c8425c05c1377fc10a4891988fe4593c3d4d96bf9b520a6aba5eb81dab4669f`.
-[Native SQL Server run](https://github.com/benor1470/dbMeter/actions/runs/44165836087)
+`bd9f39b706b54086023b8cb0205448bfda25c9901cd0b969a1bff7cb4aadb904` and the report
+SHA-256 is `dfb4365fc79db75950581d8fb3a88727552efc13bdc06eec827539b959d1b59e`.
+[Native SQL Server run](https://github.com/benor1470/dbMeter/actions/runs/44169351782)
 
 ## Catalog and security candidate (lane B11, wave 3) - 5 November 2026
 
