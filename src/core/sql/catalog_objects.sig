@@ -1547,17 +1547,25 @@ pub fn Objects(comptime config: types.Config) type {
             return self.superuser(role, snap) or self.memberOf(role, self.owner(table, snap), true, snap);
         }
 
-        /// Every privilege bit in `wanted` (pg_class_aclcheck): superusers
-        /// and the owner hold all; otherwise grants to the role, a role it
-        /// inherits from, or PUBLIC.
-        pub fn tablePrivileges(self: *const Self, role: u32, table: u32, wanted: u32, snap: storage.Snapshot) bool {
-            if (self.ownsTable(role, table, snap)) return true;
+        /// The privileges held through ownership and table-wide grants.
+        fn tablePrivilegeMask(self: *const Self, role: u32, table: u32, snap: storage.Snapshot) u32 {
+            if (self.ownsTable(role, table, snap)) return ~@as(u32, 0);
             var held: u32 = 0;
             for (&self.items) |*o| {
                 if (o.kind != .acl or o.target != table or !visible(o, snap)) continue;
                 if (o.grantee == public_role or self.memberOf(role, o.grantee, true, snap)) held |= o.flags;
             }
-            return held & wanted == wanted;
+            return held;
+        }
+
+        /// Every requested privilege is required for statement access.
+        pub fn tablePrivileges(self: *const Self, role: u32, table: u32, wanted: u32, snap: storage.Snapshot) bool {
+            return self.tablePrivilegeMask(role, table, snap) & wanted == wanted;
+        }
+
+        /// Any requested privilege suffices for information-schema discovery.
+        pub fn tableHasAnyPrivilege(self: *const Self, role: u32, table: u32, wanted: u32, snap: storage.Snapshot) bool {
+            return self.tablePrivilegeMask(role, table, snap) & wanted != 0;
         }
 
         /// Grant options held for `wanted` (owners hold them all).
