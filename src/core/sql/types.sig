@@ -21,6 +21,9 @@ pub const Config = struct {
     external_storage: bool = false,
     /// Place dense row values in a separate caller-owned external span.
     split_external_versions: bool = false,
+    /// Pack committed CSNs and pending transaction references into shared
+    /// words in split external version headers. The logical WAL is identical.
+    compact_external_version_stamps: bool = false,
     /// Experimental integer/OID/DATE banks in split external storage.
     /// Mixed banks serialize table DDL and reject copy-on-write ALTER.
     integral_external_versions: bool = false,
