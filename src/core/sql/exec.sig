@@ -5018,7 +5018,7 @@ pub fn Exec(comptime config: types.Config) type {
                         if (relation > 0) continue :rows;
                     }
                     entry.keys[column] = normalized;
-                };
+                }
                 if (!projected and full and relation == 0 and entry.ordinal >= entries[indices[0]].ordinal) continue;
                 const removed = try sort_module.offerTopKSlot(indices[0..count], &used, candidate, &sorter);
                 if (full) spare = removed;
