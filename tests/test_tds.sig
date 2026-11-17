@@ -445,6 +445,43 @@ fn nativeApply() !void {
     try check(result.row_count == 2 and result.rows[0].cells[1].integer == 2 and result.rows[1].cells[1].integer == 4);
 }
 
+fn nativeIntegerDeclarations() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    var result: Reader = .{ .source = try execute(&session, &db, "DECLARE @x INT=1; SELECT @x") };
+    try check(try result.numeric(1) == 0xfd and try result.numeric(2) == 0x11);
+    try check(try result.numeric(2) == 0 and try result.numeric(8) == 1);
+    try check(try result.numeric(1) == 0x81 and try result.numeric(2) == 1);
+    try readColumn(&result, 1, 0x26, 4, "");
+    try check(try result.numeric(1) == 0xd1 and try result.numeric(1) == 4 and try result.numeric(4) == 1);
+    try check(try result.numeric(1) == 0xfd and try result.numeric(2) == 0x10);
+
+    _ = try execute(&session, &db,
+        "declare @lo INT=-2147483648; DECLARE @hi INTEGER=2147483647; DECLARE @_maybe INT=NULL; SELECT @LO lo,@hi hi,@_maybe n,'@lo; @hi' s /* @unused */");
+    try check(session.result.column_count == 4 and session.result.row_count == 1);
+    try check(session.result.rows[0].cells[0].integer == -2147483648 and session.result.rows[0].cells[1].integer == 2147483647);
+    try check(session.result.rows[0].cells[2] == .null_value);
+    try same(session.result.rows[0].cells[3].text.slice(), "@lo; @hi");
+    try check((try execute(&session, &db, "SELECT @lo"))[0] == 0xaa);
+    for ([_]struct { source: []const u8, code: u32 }{
+        .{ .source = "DECLARE @x INT=2147483648; SELECT @x", .code = 8115 },
+        .{ .source = "DECLARE @x INT=-2147483649; SELECT @x", .code = 8115 },
+        .{ .source = "DECLARE @x INT=1; DECLARE @X INT=2; SELECT @x", .code = 134 },
+        .{ .source = "DECLARE @x INT=1; SELECT @not_declared", .code = 137 },
+        .{ .source = "DECLARE @x INT=1; CREATE TABLE x(id INT)", .code = 102 },
+    }) |failure| {
+        var rejected: Reader = .{ .source = try execute(&session, &db, failure.source) };
+        try check(try rejected.numeric(1) == 0xaa);
+        _ = try rejected.numeric(2);
+        try check(try rejected.numeric(4) == failure.code);
+    }
+    try check(store.database.tableCount() == 0);
+    _ = try execute(&session, &db, "DECLARE @x INT=2; SELECT @x+3 AS total");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 5);
+}
+
 fn transactionManagerAndPreflight() !void {
     store = .{};
     var db: DB = .{ .store = &store, .id = 1 };
@@ -800,6 +837,7 @@ pub fn main(init: std.process.Init) !void {
     try nativeDateAddAndIsNull();
     try nativeIntNullability();
     try nativeApply();
+    try nativeIntegerDeclarations();
     try outputFragmentation();
     try transactionManagerAndPreflight();
     try concurrentCommittedVisibility();

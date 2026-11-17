@@ -4203,8 +4203,8 @@ pub fn Binder(comptime config: types.Config) type {
         fn targetName(context: *const Context, id: u16) V.Name {
             var buffer: V.Name = .{};
             const n = context.node(id);
-            if (context.dialect == .tds and n.kind == .function and
-                (n.func == .tds_isnull or n.func == .tds_dateadd)) return .{};
+            if (context.dialect == .tds and (n.kind == .cast or (n.kind == .function and
+                (n.func == .tds_isnull or n.func == .tds_dateadd)))) return .{};
             if (n.func == .mysql_ifnull or n.func == .mysql_date_add)
                 return literalName(context.source[n.text.start..n.text.end]);
             const result = figure(context, id, &buffer);
