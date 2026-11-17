@@ -71,6 +71,8 @@ pub fn Exec(comptime config: types.Config) type {
             factor_sparse_predicates: usize = 0,
             typed_group_plans: usize = 0,
             narrow_typed_group_plans: usize = 0,
+            parallel_typed_group_plans: usize = 0,
+            parallel_typed_group_batches: usize = 0,
             typed_group_channels: usize = 0,
             dimension_group_plans:usize=0,
             dimension_group_keys:usize=0,
@@ -2317,13 +2319,93 @@ pub fn Exec(comptime config: types.Config) type {
                 return if (out.count == 0) null else out;
             }
 
+            const group_scan_participants = 4;
+            const group_scan_tile = 16384;
+            const group_scan_min_rows = 65536;
+            const group_scan_max_keys = 4096;
+            const group_scan_rows_per_key = 32;
+
+            fn PresentGroupScan(comptime measure_count: usize) type {
+                return struct {
+                    const Scan = @This();
+                    const Bucket = struct { rows: i64 = 0, totals: [measure_count]i64 = @splat(0) };
+
+                    keys: []const i64,
+                    sums: [measure_count][]const i64,
+                    low: u64,
+                    buckets: []Bucket,
+
+                    inline fn accumulate(scan: *const Scan, start: usize, count: usize) void {
+                        for (scan.keys[start..][0..count], start..) |key_value, slot| {
+                            // Observed bounds and the admitted span prove this
+                            // offset, including at signed integer endpoints.
+                            const bucket = &scan.buckets[@intCast(@as(u64, @bitCast(key_value)) -% scan.low)];
+                            bucket.rows += 1;
+                            inline for (0..measure_count) |index| bucket.totals[index] += scan.sums[index][slot];
+                        }
+                    }
+
+                    const Partition = struct {
+                        scan: Scan,
+                        start: usize,
+                        count: usize,
+
+                        fn run(context: *anyopaque) void {
+                            const part: *const Partition = @ptrCast(@alignCast(context));
+                            part.scan.accumulate(part.start, part.count);
+                        }
+                    };
+
+                    noinline fn runParallel(scan: Scan, query: *Query, dispatch: types.ExecutionControl.ParallelScan, partial: []Bucket,
+                        span: usize, stride: usize, participants: usize) Error!void {
+                        var partitions: [group_scan_participants]Partition = undefined;
+                        var tasks: [group_scan_participants]types.ExecutionControl.ScanTask = undefined;
+                        var start: usize = 0;
+                        while (start < scan.keys.len) : (start += group_scan_tile) {
+                            const count = @min(group_scan_tile, scan.keys.len - start);
+                            // The coordinator owns work counts, deadlines and
+                            // interrupt hooks. Workers run pure bounded slices.
+                            try query.session.checkpoints(count);
+                            for (0..participants) |index| {
+                                const lo = count * index / participants;
+                                const hi = count * (index + 1) / participants;
+                                partitions[index] = .{
+                                    .scan = scan,
+                                    .start = start + lo,
+                                    .count = hi - lo,
+                                };
+                                partitions[index].scan.buckets = partial[index * stride ..][0..span];
+                                tasks[index] = .{ .context = &partitions[index], .run = &Partition.run };
+                            }
+                            try dispatch.dispatch(dispatch.context, tasks[0..participants]);
+                            // Notice cancellation while workers owned the
+                            // tile, even when the last tile exhausted input.
+                            const control = query.session.control.?;
+                            if (control.poll) |poll| try poll(control.context);
+                            query.work.stream_stats.rows += count;
+                            query.work.stream_stats.parallel_typed_group_batches += 1;
+                        }
+                        // Each merge adds disjoint row subsets. The same
+                        // prefix bound holds for any union of those subsets.
+                        for (1..participants) |index| {
+                            for (scan.buckets, partial[index * stride ..][0..span]) |*dst, *src| {
+                                dst.rows += src.rows;
+                                inline for (0..measure_count) |measure| dst.totals[measure] += src.totals[measure];
+                            }
+                        }
+                        query.work.stream_stats.parallel_typed_group_plans += 1;
+                    }
+                };
+            }
+
             /// Dense, all-present published columns need only one row count
             /// per group and a signed total per distinct measure. The bounded
             /// channel count keeps the hot loop unrolled and honors the wider
             /// state or sparse/null executor when the proof fails.
             noinline fn scanPresentGroups(self: *Query, comptime measure_count: usize, p: *const B.Plan, outer: ?*const E.Context,
                 table: *const S.Table, key_column: u16, bounds: S.IntegerBounds, measures: *const PresentGroupMeasures) Error!?List {
-                const Bucket = struct { rows: i64 = 0, totals: [measure_count]i64 = @splat(0) };
+                const Scan = PresentGroupScan(measure_count);
+                const Bucket = Scan.Bucket;
                 const span_wide = @as(i128, bounds.high) - bounds.low + 1;
                 const cell_budget = self.work.cell_high - self.work.cell_low;
                 const ref_budget = self.work.ref_high - self.work.ref_low;
@@ -2331,28 +2413,47 @@ pub fn Exec(comptime config: types.Config) type {
                 const budget = @min(cell_budget / (bucket_cells + 1 + p.agg_count + p.width), ref_budget / 2);
                 if (span_wide <= 0 or span_wide > budget) return null;
                 const span: usize = @intCast(span_wide);
-                const state_cells = (span * @sizeOf(Bucket) + @sizeOf(V.Cell) - 1) / @sizeOf(V.Cell);
+                const scheduling = if (self.session.control) |control| control.parallel_scan else null;
+                var participants: usize = 1;
+                var stride = span;
+                if (scheduling) |dispatch| {
+                    if (table.scan_high >= group_scan_min_rows and span <= group_scan_max_keys and
+                        span <= table.scan_high / group_scan_rows_per_key) {
+                        const padded = span + (64 + @sizeOf(Bucket) - 1) / @sizeOf(Bucket);
+                        const wanted = @min(group_scan_participants, dispatch.participants);
+                        if (wanted > 1) {
+                            const available = cell_budget - span * (1 + p.agg_count + p.width);
+                            const state_count = span + (wanted - 1) * padded;
+                            if ((state_count * @sizeOf(Bucket) + @sizeOf(V.Cell) - 1) / @sizeOf(V.Cell) <= available) {
+                                participants = wanted;
+                                stride = padded;
+                            }
+                        }
+                    }
+                }
+                const state_count = span + (participants - 1) * stride;
+                const state_cells = (state_count * @sizeOf(Bucket) + @sizeOf(V.Cell) - 1) / @sizeOf(V.Cell);
                 const at = try self.cells(state_cells);
                 const data: [*]Bucket = @ptrCast(@alignCast(&self.work.cells[at]));
-                const buckets = data[0..span];
-                for (buckets) |*bucket| bucket.* = .{};
+                const partial = data[0..state_count];
+                for (partial) |*bucket| bucket.* = .{};
+                const buckets = partial[0..span];
 
                 const keys = table.scan_values[@as(usize, key_column) * table.rows.len ..][0..table.scan_high];
                 var sums: [measure_count][]const i64 = undefined;
                 inline for (0..measure_count) |index| {
                     sums[index] = table.scan_values[@as(usize, measures.columns[index]) * table.rows.len ..][0..table.scan_high];
                 }
-                var start: usize = 0;
-                while (start < table.scan_high) : (start += 64) {
-                    const count = @min(@as(usize, 64), table.scan_high - start);
-                    try self.session.checkpoints(count);
-                    self.work.stream_stats.rows += count;
-                    for (keys[start..][0..count], start..) |key_value, slot| {
-                        // The observed key bounds and admitted span prove
-                        // this offset in [0, span), even at int64 endpoints.
-                        const bucket = &buckets[@intCast(@as(u64, @bitCast(key_value)) -% @as(u64, @bitCast(bounds.low)))];
-                        bucket.rows += 1;
-                        inline for (0..measure_count) |index| bucket.totals[index] += sums[index][slot];
+                const scan: Scan = .{ .keys = keys, .sums = sums, .low = @bitCast(bounds.low), .buckets = buckets };
+                if (participants > 1) {
+                    try scan.runParallel(self, scheduling.?, partial, span, stride, participants);
+                } else {
+                    var start: usize = 0;
+                    while (start < table.scan_high) : (start += 64) {
+                        const count = @min(@as(usize, 64), table.scan_high - start);
+                        try self.session.checkpoints(count);
+                        self.work.stream_stats.rows += count;
+                        scan.accumulate(start, count);
                     }
                 }
                 var out: List = .{};

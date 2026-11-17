@@ -1,0 +1,50 @@
+name: Parallel integral group qualification
+
+on:
+  push:
+    branches: [perf/parallel-integral-group-20261117]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install checksum-verified Sig 0.6.5
+        run: |
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-x86_64-linux.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" -o "$RUNNER_TEMP/$asset"
+          echo "179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a  $RUNNER_TEMP/$asset" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sig"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sig"
+          binary=$(find "$RUNNER_TEMP/sig" -type f -name sig | head -n 1)
+          standard=$(find "$RUNNER_TEMP/sig" -type f -path '*/lib/std/std.sig' | head -n 1)
+          test -x "$binary"
+          test -f "$standard"
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$binary" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+      - name: Build and execute partitioned and existing typed grouping contracts
+        run: |
+          mkdir evidence
+          "$SIG" version | tee evidence/sig-version.log
+          "$SIG" build-exe --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe --stack 16777216 \
+            -femit-bin="$RUNNER_TEMP/parallel-group" --dep sql --dep worker_thread \
+            -Mroot=tests/test_sql_parallel_group.sig -Msql=src/core/sql.sig \
+            -Mworker_thread=src/platform/worker_thread.sig 2>&1 | tee evidence/build-parallel.log
+          "$RUNNER_TEMP/parallel-group" 2>&1 | tee evidence/parallel.log
+          "$SIG" build-exe --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe --stack 16777216 \
+            -femit-bin="$RUNNER_TEMP/typed-group" --dep sql \
+            -Mroot=tests/test_sql_typed_multi_group.sig -Msql=src/core/sql.sig 2>&1 | tee evidence/build-typed.log
+          "$RUNNER_TEMP/typed-group" 2>&1 | tee evidence/typed.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integral-group-contracts
+          path: evidence/

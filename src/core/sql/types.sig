@@ -512,8 +512,25 @@ pub const Error = error{
 /// time/interrupt state and return a terminal error. Checks never run during
 /// rollback or durable publication, so cleanup/publication stay infallible.
 pub const ExecutionControl = struct {
+    pub const ScanTask = struct {
+        context: *anyopaque,
+        run: *const fn (*anyopaque) void,
+    };
+
+    pub const ParallelScan = struct {
+        context: ?*anyopaque = null,
+        participants: usize,
+        /// Run every task exactly once with disjoint write ownership. All
+        /// started work must join before returning, including on error.
+        /// A busy scheduler can execute the batch synchronously.
+        dispatch: *const fn (?*anyopaque, []const ScanTask) Error!void,
+    };
+
     context: ?*anyopaque = null,
     poll: ?*const fn (?*anyopaque) Error!void = null,
+    /// Only install while the committed projection and caller arena are
+    /// pinned against writes for the complete statement.
+    parallel_scan: ?ParallelScan = null,
     max_work: u64 = 0,
     used: u64 = 0,
     poll_interval: u32 = 256,

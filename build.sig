@@ -140,6 +140,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-block-presence", "tests/test_sql_block_presence.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-wide-dense", "tests/test_sql_wide_dense.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-typed-multi-group", "tests/test_sql_typed_multi_group.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-parallel-group", "tests/test_sql_parallel_group.sig", &.{
+        importEntry("sql", "src/core/sql.sig"), importEntry("worker_thread", "src/platform/worker_thread.sig"),
+    });
     _ = try addContract(ctx, test_sql, "contract-sql-dimension-group-ids", "tests/test_sql_dimension_group_ids.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-to-char", "tests/test_sql_to_char.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-windows", "tests/test_sql_windows.sig", &.{importEntry("sql", "src/core/sql.sig")});
