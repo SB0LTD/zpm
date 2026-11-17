@@ -2460,7 +2460,7 @@ pub fn Database(comptime config: Config) type {
             self.statementHooks(slot, snap);
             self.routine_result = result;
             self.statement_start = start;
-            const ran = if (routine) self.routineBody(slot, source, snap, result) else self.body(slot, source, parsed, snap, result, options.mode, top.explain);
+            const ran = if (routine) self.routineBody(slot, source, snap, result) else self.body(slot, source, parsed, snap, result, .{ .mode = options.mode, .explain = top.explain });
             ran catch |err| {
                 if (err == error.WouldBlock) {
                     tx.pin = snap;
@@ -2511,7 +2511,11 @@ pub fn Database(comptime config: Config) type {
             return .{ .source = source, .pool = &self.workspace.nodes, .session = &self.session };
         }
 
-        fn body(self: *Self, slot: u16, original: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode, explain: ?P.Explain) Error!void {
+        const BodyOptions = struct { mode: ParseMode, explain: ?P.Explain = null };
+
+        fn body(self: *Self, slot: u16, original: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, execution_options: BodyOptions) Error!void {
+            const mode = execution_options.mode;
+            const explain = execution_options.explain;
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
             if (explain != null and self.dialect != .postgres) return error.UnsupportedStatement;
@@ -8135,7 +8139,7 @@ pub fn Database(comptime config: Config) type {
             };
             // PostgreSQL: FOR UPDATE/SHARE cursors cannot be SCROLL or WITH HOLD.
             if (locking and ((declare.scroll orelse false) or declare.hold)) return error.UnsupportedStatement;
-            try self.body(slot, inner_source, &inner, snap, result, mode, null);
+            try self.body(slot, inner_source, &inner, snap, result, .{ .mode = mode });
             const rows = result.row_count;
             if (rows > Sess.cursor_row_capacity - self.cursors.used_rows) return error.SessionCapacity;
             const columns = result.column_count;
@@ -8274,7 +8278,7 @@ pub fn Database(comptime config: Config) type {
                 self.active_params = null;
                 self.session.params = null;
             }
-            try self.body(slot, text, &inner, snap, result, mode, null);
+            try self.body(slot, text, &inner, snap, result, .{ .mode = mode });
         }
 
         /// current_setting / set_config / advisory locks / pg_backend_pid
@@ -8477,7 +8481,7 @@ pub fn Database(comptime config: Config) type {
             }
             if (parsed.* != .query) {
                 const result = self.routine_result orelse return error.UnsupportedStatement;
-                try self.body(slot, text, parsed, snap, result, .standard, null);
+                try self.body(slot, text, parsed, snap, result, .{ .mode = .standard });
                 const outcome = self.outcome;
                 if (capture) |out| {
                     const returned = &outcome.returning;

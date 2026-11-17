@@ -98,6 +98,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
 
     // Core modules.
     _ = try ctx.addModule("sql", "src/core/sql.sig");
+    _ = try ctx.addModule("db_store", "src/db/store.sig");
     // Contracts may import this public module; register it before those steps.
     _ = try ctx.addModule("math", "src/core/math.sig");
     const test_sql = try ctx.addStep("test-sql", "Execute bounded in-memory SQL contracts", &noopStep);
@@ -183,7 +184,6 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_packed = try ctx.addStep("test-packed-integer", "Execute immutable packed integer column contracts", &noopStep);
     try ctx.addDependency(test_all, test_packed);
     _ = try addContract(ctx, test_packed, "contract-packed-integer", "tests/test_packed_integer.sig", &.{importEntry("packed_integer", "src/core/packed_integer.sig")});
-    _ = try ctx.addModule("db_store", "src/db/store.sig");
     _ = try ctx.addModule("database_registry", "src/db/database_registry.sig");
     const pg_module = try ctx.addModule("postgres", "src/db/postgres.sig");
     try wire(ctx, pg_module, "scram", "src/db/scram.sig");
