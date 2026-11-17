@@ -405,6 +405,44 @@ pub fn Storage(comptime config: types.Config) type {
             key_index: if (config.external_storage) []u32 else [key_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
         };
 
+        /// A bound physical bank, independent of catalog and MVCC metadata.
+        pub fn backingOf(table: *const Table) Backing {
+            if (comptime !config.external_storage) @compileError("backingOf requires external storage");
+            return .{
+                .rows = table.rows,
+                .versions = table.versions,
+                .version_rows = if (comptime split_versions) table.version_rows else {},
+                .integral_rows = if (comptime integral_enabled) table.integral_rows else {},
+                .integral_row_words = if (comptime integral_enabled) table.integral_row_words else {},
+                .row_index = table.row_index,
+                .key_index = table.key_index,
+                .scan_values = table.scan_values,
+                .scan_nonnull = table.scan_nonnull,
+                .scan_live = table.scan_live,
+                .scan_presence = table.scan_presence,
+                .index_slots = table.index_slots,
+            };
+        }
+
+        /// The caller has validated each bank and its disjoint ownership.
+        pub fn bindBacking(table: *Table, backing: Backing) void {
+            if (comptime !config.external_storage) @compileError("bindBacking requires external storage");
+            table.rows = backing.rows;
+            table.versions = backing.versions;
+            if (comptime split_versions) table.version_rows = backing.version_rows;
+            if (comptime integral_enabled) {
+                table.integral_rows = backing.integral_rows;
+                table.integral_row_words = backing.integral_row_words;
+            }
+            table.row_index = backing.row_index;
+            table.key_index = backing.key_index;
+            table.scan_values = backing.scan_values;
+            table.scan_nonnull = backing.scan_nonnull;
+            table.scan_live = backing.scan_live;
+            table.scan_presence = backing.scan_presence;
+            table.index_slots = backing.index_slots;
+        }
+
         /// A table every committed reader can see (created and not dropped).
         pub fn committedTable(table: *const Table) bool {
             return table.live and !table.pending_create and table.dead_csn == 0;
