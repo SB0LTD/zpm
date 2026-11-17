@@ -68,6 +68,7 @@ pub fn Exec(comptime config: types.Config) type {
             factor_plans: usize = 0,
             factor_keys: usize = 0,
             factor_selected_rows: usize = 0,
+            factor_sparse_predicates: usize = 0,
             typed_group_plans: usize = 0,
             typed_group_channels: usize = 0,
             dimension_group_plans:usize=0,
@@ -1356,6 +1357,34 @@ pub fn Exec(comptime config: types.Config) type {
                 return mask;
             }
 
+            fn refineFactorMask(self: *Query, table: *const S.Table, start: usize, count: usize,
+                selected_mask: u64, predicate: CompactPredicate) u64 {
+                // A prior selective predicate can leave fewer rows than one
+                // vector. Read only those rows of the next fact column.
+                if (@popCount(selected_mask) <= 4) {
+                    self.work.stream_stats.factor_sparse_predicates += 1;
+                    const single = [_]CompactPredicate{predicate};
+                    var remaining = selected_mask;
+                    var matched: u64 = 0;
+                    while (remaining != 0) {
+                        const bit = @ctz(remaining);
+                        remaining &= remaining - 1;
+                        if (compactKeep(table, start + bit, &single)) matched |= @as(u64, 1) << @intCast(bit);
+                    }
+                    return matched;
+                }
+                const stats = &self.work.stream_stats;
+                return selected_mask & switch (predicate.op) {
+                    .eq => comparisonMask(.eq, table, start, count, predicate, stats),
+                    .ne => comparisonMask(.ne, table, start, count, predicate, stats),
+                    .lt => comparisonMask(.lt, table, start, count, predicate, stats),
+                    .le => comparisonMask(.le, table, start, count, predicate, stats),
+                    .gt => comparisonMask(.gt, table, start, count, predicate, stats),
+                    .ge => comparisonMask(.ge, table, start, count, predicate, stats),
+                    else => unreachable,
+                };
+            }
+
             const CompactFold = struct {
                 table: *const S.Table, domain: DenseDomain, grouped: bool, key_nonnull: bool,
                 transitions: []const Transition, nonnull: []const bool,
@@ -1855,11 +1884,7 @@ pub fn Exec(comptime config: types.Config) type {
                     var mask=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(mask);
                     for(predicates[0..predicate_count]) |predicate| {
                         if(mask==0) break;
-                        mask&=switch(predicate.op) {
-                            .eq=>comparisonMask(.eq,table,start,count,predicate,&self.work.stream_stats),.ne=>comparisonMask(.ne,table,start,count,predicate,&self.work.stream_stats),
-                            .lt=>comparisonMask(.lt,table,start,count,predicate,&self.work.stream_stats),.le=>comparisonMask(.le,table,start,count,predicate,&self.work.stream_stats),
-                            .gt=>comparisonMask(.gt,table,start,count,predicate,&self.work.stream_stats),.ge=>comparisonMask(.ge,table,start,count,predicate,&self.work.stream_stats),else=>unreachable,
-                        };
+                        mask = self.refineFactorMask(table, start, count, mask, predicate);
                     }
                     while(mask!=0) {
                         const i=@ctz(mask);mask&=mask-1;const slot=start+i;const flags=table.scan_nonnull[slot];
