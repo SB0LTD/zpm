@@ -553,6 +553,8 @@ pub fn Session(comptime DB: type) type {
                 error.NotNullViolation => 515,
                 error.DatabaseBusy => 1222,
                 error.InvalidRowCountInLimit => 1014,
+                error.IntegerOverflow => 8115,
+                error.DatetimeFieldOverflow => 517,
                 else => 102,
             }, @errorName(err));
         }
@@ -892,6 +894,8 @@ pub fn Session(comptime DB: type) type {
                 error.NotNullViolation => 515,
                 error.DatabaseBusy => 1222,
                 error.InvalidRowCountInLimit => 1014,
+                error.IntegerOverflow => 8115,
+                error.DatetimeFieldOverflow => 517,
                 else => 102,
             }, @errorName(err), 0xfe);
         }

@@ -1342,6 +1342,32 @@ pub fn Eval(comptime config: types.Config) type {
                     .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
                     .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
                     .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .tds_dateadd => {
+                        const number = try eval(ctx, n.b);
+                        const date = try eval(ctx, node(ctx, n.b).next);
+                        if (number == .null_value or date == .null_value) return .null_value;
+                        const amount = number.integer;
+                        if (amount < -2147483648 or amount > 2147483647) return error.IntegerOverflow;
+                        const first = temporal.dateOf(1, 1, 1);
+                        const last = temporal.dateOf(9999, 12, 31);
+                        if (date.date < first or date.date > last) return error.DatetimeFieldOverflow;
+                        const part: ast.DateAddPart = @enumFromInt(n.integer);
+                        const result = switch (part) {
+                            .days, .weeks => try temporal.datePlusDays(date.date, amount * (if (part == .weeks) @as(i64, 7) else 1)),
+                            .months, .quarters, .years => blk: {
+                                const months = amount * switch (part) { .months => @as(i64, 1), .quarters => 3, .years => 12, else => unreachable };
+                                if (months <= -120000 or months >= 120000) return error.DatetimeFieldOverflow;
+                                const timestamp = try temporal.dateToTimestamp(date.date);
+                                break :blk temporal.timestampToDate(try temporal.timestampPlus(timestamp, .{ .months = @intCast(months) }));
+                            },
+                        };
+                        if (result < first or result > last) return error.DatetimeFieldOverflow;
+                        return .{ .date = result };
+                    },
+                    .tds_isnull => {
+                        const value = try eval(ctx, n.b);
+                        return if (value == .null_value) eval(ctx, node(ctx, n.b).next) else value;
+                    },
                     .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
                     .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
                     .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),

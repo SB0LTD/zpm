@@ -59,6 +59,8 @@ pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, n
     // Full text search @@ (tsvector @@ tsquery, either order).
     text_match };
 
+pub const DateAddPart = enum { days, weeks, months, quarters, years };
+
 /// Built-in functions bound by name.
 pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
     // String functions (B11, functions_string.sig).
@@ -67,7 +69,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     power, ln, log, log10, exp, mod, div, pi, degrees, radians, cbrt, sin, cos, tan, cot, asin, acos, atan, atan2, gcd, lcm, scale, min_scale, trim_scale,
     // Date/time functions (B11, functions_temporal.sig); *_tz are the STABLE
     // timestamptz (session time zone) overloads chosen by the binder.
-    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite,
+    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite, tds_dateadd, tds_isnull,
     // (a, b) OVERLAPS (c, d); overlaps_tz is the STABLE timestamptz + interval form.
     overlaps, overlaps_tz,
     // Internal: the (Y, X) input of a two-argument aggregate, NULL when either is.
