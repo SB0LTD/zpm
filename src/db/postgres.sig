@@ -1473,6 +1473,7 @@ pub fn Session(comptime DB: type) type {
                 .update => "update",
                 .delete => "delete",
                 .merge => "merge",
+                .explain => "EXPLAIN",
                 .create_table => "create",
                 .create_table_as => if (create_query_data) "select_created" else "CREATE TABLE AS",
                 .create_materialized_view => if (create_query_data) "select_created" else "CREATE MATERIALIZED VIEW",

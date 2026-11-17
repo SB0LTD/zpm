@@ -1314,7 +1314,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn writeOutcome(self: *const Self, result: *Result) void {
-            if (self.outcome.command == .select or self.outcome.command == .fetch or self.outcome.command == .show) return;
+            if (self.outcome.command == .select or self.outcome.command == .fetch or self.outcome.command == .show or self.outcome.command == .explain) return;
             result.clear(self.outcome.affected);
             result.command = self.outcome.command;
             result.create_query_data = self.outcome.create_query_data;
@@ -1581,10 +1581,11 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             // Routine statements (B11 wave 3) have their own grammar.
             const routine = options.mode == .standard and R.classify(source) != null;
-            const parsed: A.Statement = if (routine) .{ .control = .commit } else P.parse(source, &self.workspace.nodes, options.mode) catch |err| {
+            const top: P.Parsed = if (routine) .{ .command = .{ .control = .commit } } else P.parseTop(source, &self.workspace.nodes, options.mode) catch |err| {
                 if (options.@"resume") self.dropStatement(slot);
                 return legacy(options.mode, err);
             };
+            const parsed = &top.command;
             var snap: Snapshot = undefined;
             if (options.@"resume") {
                 const pinned = tx.pin orelse return error.QueryCanceled;
@@ -1610,7 +1611,7 @@ pub fn Database(comptime config: Config) type {
                 self.modifying[slot] = .{};                snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
                 // The first statement that needs a snapshot fixes the
                 // transaction snapshot (REPEATABLE READ / SERIALIZABLE use it).
-                if (needsSnapshot(&parsed)) {
+                if (needsSnapshot(parsed)) {
                     if (tx.snapshot_csn == null) {
                         tx.snapshot_csn = self.csn;
                         tx.snapshot_cid = tx.cid;
@@ -1627,7 +1628,7 @@ pub fn Database(comptime config: Config) type {
             self.statementHooks(slot, snap);
             self.routine_result = result;
             self.statement_start = start;
-            const ran = if (routine) self.routineBody(slot, source, snap, result) else self.body(slot, source, &parsed, snap, result, options.mode);
+            const ran = if (routine) self.routineBody(slot, source, snap, result) else self.body(slot, source, parsed, snap, result, options.mode, top.explain);
             ran catch |err| {
                 if (err == error.WouldBlock) {
                     tx.pin = snap;
@@ -1678,9 +1679,10 @@ pub fn Database(comptime config: Config) type {
             return .{ .source = source, .pool = &self.workspace.nodes, .session = &self.session };
         }
 
-        fn body(self: *Self, slot: u16, original: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+        fn body(self: *Self, slot: u16, original: []const u8, parsed: *const A.Statement, snap: Snapshot, result: *Result, mode: ParseMode, explain: ?P.Explain) Error!void {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
+            if (explain != null and self.dialect != .postgres) return error.UnsupportedStatement;
             switch (parsed.*) {
                 .control => |command| return self.runControl(slot, original, command, result),
                 .session => |*command| return self.runSession(slot, original, command, snap, result, mode),
@@ -1696,33 +1698,24 @@ pub fn Database(comptime config: Config) type {
             var statement_copy = parsed.*;
             const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role);
             const source = try self.secureTarget(&statement_copy, expanded, original, snap);
-            const context = self.bindContext(source, mode, snap);
+            var context = self.bindContext(source, mode, snap);
+            if (explain) |options| context.describe_only = !options.analyze;
             const bound = try B.bind(&context, &statement_copy);
-            if (self.txs[slot].read_only) try readOnlyCheck(&bound, &self.workspace.plans);
+            if (self.txs[slot].read_only and (explain == null or explain.?.analyze)) try readOnlyCheck(&bound, &self.workspace.plans);
             try self.checkPrivileges(&bound, snap);
             try self.secureNewRows(&bound, source, snap);
+            if (explain) |options| return self.runExplain(slot, source, &bound, snap, result, options);
             switch (bound) {
                 .control => return error.UnsupportedStatement,
                 .select => |*select| {
                     self.outcome = .{ .affected = 0, .command = .select };
-                    if (select.table) |table| try self.lockTable(slot, table, if (select.lock.strength == .none) .access_share else .row_share);
-                    if (select.lock.strength == .none)
-                        return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, X.NoLock{}, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats, &self.workspace.query);
-                    const row_mode: locks_module.RowMode = switch (select.lock.strength) {
-                        .update, .none => .update,
-                        .no_key_update => .no_key_update,
-                        .share => .share,
-                        .key_share => .key_share,
-                    };
-                    const locker: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = row_mode, .wait = select.lock.wait };
-                    return X.select(&self.tables, source, &self.workspace.nodes, select, snap, result, locker, &self.session, self.txs[slot].write_len == 0, &self.workspace.query.read_stats, &self.workspace.query);
+                    try self.lockSelect(slot, select);
+                    return self.runBoundSelect(slot, source, select, snap, result);
                 },
                 .query => |root| {
                     self.outcome = .{ .affected = 0, .command = .select };
                     const plans = &self.workspace.plans;
-                    for (plans.items[0..plans.len]) |*plan| {
-                        for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
-                    }
+                    try self.lockSources(slot);
                     defer {
                         self.workspace.query.pinned_cells = 0;
                         self.workspace.query.pinned_refs = 0;
@@ -1849,6 +1842,111 @@ pub fn Database(comptime config: Config) type {
                 .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len),
                 else => {},
             }
+        }
+
+        fn lockSelect(self: *Self, slot: u16, select: *const B.Select) Error!void {
+            if (select.table) |table| try self.lockTable(slot, table, if (select.lock.strength == .none) .access_share else .row_share);
+        }
+
+        fn runBoundSelect(self: *Self, slot: u16, source: []const u8, select: *const B.Select, snap: Snapshot, output: anytype) Error!void {
+            if (select.lock.strength == .none) return self.executeBoundSelect(slot, source, select, snap, X.NoLock{}, output);
+            const row_mode: locks_module.RowMode = switch (select.lock.strength) {
+                .update, .none => .update,
+                .no_key_update => .no_key_update,
+                .share => .share,
+                .key_share => .key_share,
+            };
+            const locker: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = row_mode, .wait = select.lock.wait };
+            return self.executeBoundSelect(slot, source, select, snap, locker, output);
+        }
+
+        fn executeBoundSelect(self: *Self, slot: u16, source: []const u8, select: *const B.Select, snap: Snapshot, locker: anytype, output: anytype) Error!void {
+            const work = &self.workspace.query;
+            const committed_only = self.txs[slot].write_len == 0;
+            if (comptime @TypeOf(output) == *Result) {
+                try X.select(&self.tables, source, &self.workspace.nodes, select, snap, output, locker, &self.session, committed_only, &work.read_stats, work);
+            } else {
+                output.* = try X.observeSelect(&self.tables, source, &self.workspace.nodes, select, snap, locker, &self.session, committed_only, &work.read_stats, work);
+            }
+        }
+
+        const explain_column = "QUERY PLAN";
+
+        fn validateExplain(self: *const Self, bound: *const B.Bound) Error!void {
+            if (self.dialect != .postgres) return error.UnsupportedStatement;
+            if (config.name_bytes < explain_column.len) return error.NameCapacity;
+            switch (bound.*) {
+                .select => {},
+                .query => |root| {
+                    const plans = &self.workspace.plans;
+                    const plan = &plans.items[root];
+                    if (plans.dml_len != 0 or plan.grouped or plan.window_count != 0) return error.UnsupportedStatement;
+                },
+                else => return error.UnsupportedStatement,
+            }
+        }
+
+        fn explainHeader(result: *Result) void {
+            result.clear(0);
+            result.command = .explain;
+            result.column_count = 1;
+            var name: Name = .{ .len = @min(config.name_bytes, explain_column.len) };
+            @memcpy(name.bytes[0..name.len], explain_column[0..name.len]);
+            result.column_names[0] = name;
+            result.column_types[0] = .json;
+            result.column_typmods[0] = -1;
+        }
+
+        fn runExplain(self: *Self, slot: u16, source: []const u8, bound: *const B.Bound, snap: Snapshot, result: *Result, options: P.Explain) Error!void {
+            try self.validateExplain(bound);
+            const prefix = "[{\"Plan\":{\"Node Type\":\"";
+            const actual_rows = ",\"Actual Rows\":";
+            const actual_loops = ",\"Actual Loops\":1";
+            const suffix = "}}]";
+            const max_digits = (@bitSizeOf(usize) + 2) / 3;
+            const max_label = comptime blk: {
+                var longest: usize = 0;
+                for (@typeInfo(X.SelectOperation).@"enum".field_names) |field| {
+                    const operation = @field(X.SelectOperation, field);
+                    longest = @max(longest, operation.name().len);
+                }
+                break :blk longest;
+            };
+            const minimum_capacity = prefix.len + max_label + 1 + suffix.len +
+                if (options.analyze) actual_rows.len + max_digits + actual_loops.len else 0;
+            if (config.text_bytes < minimum_capacity) return error.TextCapacity;
+            if (result.rows.len == 0) return error.RowCapacity;
+
+            var observation: X.SelectObservation = .{ .operation = .select_plan };
+            switch (bound.*) {
+                .select => |*select| {
+                    try self.lockSelect(slot, select);
+                    if (options.analyze) try self.runBoundSelect(slot, source, select, snap, &observation);
+                },
+                .query => |root| {
+                    try self.lockSources(slot);
+                    observation.operation = .query_plan;
+                    if (options.analyze) observation = try X.observeQuery(&self.tables, source, &self.workspace.nodes,
+                        &self.workspace.plans, root, snap, &self.session, &self.workspace.query, self.txs[slot].write_len == 0);
+                },
+                else => unreachable,
+            }
+            var buffer: [512]u8 = undefined;
+            var text: Writer512 = .{ .out = &buffer };
+            text.add(prefix);
+            text.add(observation.operation.name());
+            text.add("\"");
+            if (options.analyze) {
+                var digits: [max_digits]u8 = undefined;
+                text.add(actual_rows);
+                text.add(formatUnsigned(observation.rows, &digits));
+                text.add(actual_loops);
+            }
+            text.add(suffix);
+            explainHeader(result);
+            result.rows[0].cells[0] = nameCell(text.slice());
+            result.row_count = 1;
+            self.outcome = .{ .command = .explain, .noop = true };
         }
 
         /// Data-modifying WITH entries (B11): each runs exactly once, in
@@ -3971,14 +4069,14 @@ pub fn Database(comptime config: Config) type {
                     at += 1;
                 }
                 var digits: [4]u8 = undefined;
-                const text = formatSmall(if (column == S.expression_key) 0 else @as(usize, column) + 1, &digits);
+                const text = formatUnsigned(if (column == S.expression_key) 0 else @as(usize, column) + 1, &digits);
                 @memcpy(out[at..][0..text.len], text);
                 at += text.len;
             }
             return out[0..at];
         }
 
-        fn formatSmall(value: usize, out: *[4]u8) []const u8 {
+        fn formatUnsigned(value: usize, out: []u8) []const u8 {
             var index: usize = out.len;
             var rest = value;
             while (true) {
@@ -6679,7 +6777,7 @@ pub fn Database(comptime config: Config) type {
             };
             // PostgreSQL: FOR UPDATE/SHARE cursors cannot be SCROLL or WITH HOLD.
             if (locking and ((declare.scroll orelse false) or declare.hold)) return error.UnsupportedStatement;
-            try self.body(slot, inner_source, &inner, snap, result, mode);
+            try self.body(slot, inner_source, &inner, snap, result, mode, null);
             const rows = result.row_count;
             if (rows > Sess.cursor_row_capacity - self.cursors.used_rows) return error.SessionCapacity;
             const columns = result.column_count;
@@ -6815,7 +6913,7 @@ pub fn Database(comptime config: Config) type {
                 self.active_params = null;
                 self.session.params = null;
             }
-            try self.body(slot, text, &inner, snap, result, mode);
+            try self.body(slot, text, &inner, snap, result, mode, null);
         }
 
         /// current_setting / set_config / advisory locks / pg_backend_pid
@@ -7018,7 +7116,7 @@ pub fn Database(comptime config: Config) type {
             }
             if (parsed.* != .query) {
                 const result = self.routine_result orelse return error.UnsupportedStatement;
-                try self.body(slot, text, parsed, snap, result, .standard);
+                try self.body(slot, text, parsed, snap, result, .standard, null);
                 const outcome = self.outcome;
                 if (capture) |out| {
                     const returned = &outcome.returning;
@@ -8260,7 +8358,8 @@ pub fn Database(comptime config: Config) type {
                 result.command = R.command(kind);
                 return;
             }
-            const parsed = try P.parse(source, &self.workspace.nodes, .standard);
+            const top = try P.parseTop(source, &self.workspace.nodes, .standard);
+            const parsed = top.command;
             var snap: Snapshot = .{ .csn = self.csn };
             if (slot) |owner| if (self.active(owner)) {
                 snap = .{ .csn = self.csn, .slot = owner, .epoch = self.txs[owner].epoch, .cid = self.txs[owner].cid +% 1 };
@@ -8276,6 +8375,11 @@ pub fn Database(comptime config: Config) type {
             var context = self.bindContext(expanded, .standard, snap);
             context.describe_only=true;
             const bound = try B.bind(&context, &statement_copy);
+            if (top.explain != null) {
+                try self.validateExplain(&bound);
+                explainHeader(result);
+                return;
+            }
             result.clear(0);
             result.command = B.command(&bound);
             const returning: ?*const B.Returning = switch (bound) {
