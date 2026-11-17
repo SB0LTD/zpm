@@ -69,7 +69,8 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         pub fn parseWithOptions(source: []const u8, pool: *Ast.Pool, options: Options) Error!Ast.Statement {
-            var self = try initParser(source, pool, options);
+            var self: Self = undefined;
+            try initParser(source, pool, options, &self);
             return self.statement();
         }
 
@@ -118,7 +119,8 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         pub fn parseTopWithOptions(source: []const u8, pool: *Ast.Pool, options: Options) Error!Parsed {
-            var self = try initParser(source, pool, options);
+            var self: Self = undefined;
+            try initParser(source, pool, options, &self);
             if (options.mode != .standard or !try self.takeRaw("explain")) return .{ .command = try self.statement() };
             const explain = try self.explainOptions();
             if (!self.isWord("SELECT")) return error.UnsupportedStatement;
@@ -135,14 +137,13 @@ pub fn Parser(comptime config: types.Config) type {
             return .{ .command = command, .explain = explain };
         }
 
-        fn initParser(source: []const u8, pool: *Ast.Pool, options: Options) Error!Self {
+        fn initParser(source: []const u8, pool: *Ast.Pool, options: Options, self: *Self) Error!void {
             pool.reset();
             if (options.mode == .legacy_alpha) try alpha.Recognizer(config).check(source);
             const dialect: types.Dialect = if (options.mode == .legacy_alpha) .postgres else options.dialect;
-            var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes, .dialect = dialect },
+            self.* = .{ .tokens = .{ .source = source, .text_limit = config.text_bytes, .dialect = dialect },
                 .pool = pool, .source = source, .mode = options.mode };
             try self.advance();
-            return self;
         }
 
         fn explainOptions(self: *Self) Error!Explain {
