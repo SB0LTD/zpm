@@ -1,0 +1,83 @@
+name: Native and packed SQL integration correctness
+
+on:
+  push:
+    branches: ['ci/native-packed-read-qual-20261117']
+
+permissions:
+  contents: read
+
+env:
+  QUALIFIED_SOURCE: dfcf236a6c45c63ebf6286de5d7356f57c3a8fee
+  SIG_TAG: sig-0.6.4-zig0.17.0.90a898d
+  SIG_ARCHIVE_SHA256: 8dd32622531b5f81dbb12502c78e187141dd42ea3553f4d9e2c09c3e82d64a89
+
+jobs:
+  contract:
+    name: Exact ${{ matrix.lane }} contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [dense, packed]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dfcf236a6c45c63ebf6286de5d7356f57c3a8fee
+
+      - name: Verify source and SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$QUALIFIED_SOURCE"
+          mkdir -p evidence "$RUNNER_TEMP/qualification-sdk"
+          asset="$SIG_TAG-x86_64-linux.tar.xz"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/SB0LTD/sig/releases/download/$SIG_TAG/$asset" \
+            --output "$RUNNER_TEMP/$asset"
+          printf '%s  %s\n' "$SIG_ARCHIVE_SHA256" "$RUNNER_TEMP/$asset" | sha256sum --check
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/qualification-sdk"
+          tool=$(find "$RUNNER_TEMP/qualification-sdk" -type f -path '*/bin/sig' -print -quit)
+          test -x "$tool"
+          library="$(dirname "$(dirname "$tool")")/lib"
+          test -f "$library/std/std.sig"
+          printf 'SIG_BIN=%s\nSIG_LIB_DIR=%s\n' "$tool" "$library" >> "$GITHUB_ENV"
+          git show -s --format='%H %P' HEAD > evidence/source.txt
+          "$tool" version | tee evidence/compiler.txt
+
+      - name: Execute scoped ReleaseSafe contracts
+        shell: bash
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          set -euo pipefail
+          ulimit -s 16384
+          contract() {
+            name=$1
+            shift
+            "$SIG_BIN" build-exe --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe --stack 16777216 \
+              "$@" "-femit-bin=$RUNNER_TEMP/$name" 2>&1 | tee "evidence/$name-compile.log"
+            "$RUNNER_TEMP/$name" 2>&1 | tee "evidence/$name-run.log"
+          }
+          if [[ "$LANE" == dense ]]; then
+            contract sql-storage --dep sql -Mroot=tests/test_sql_storage.sig -Msql=src/core/sql.sig
+            contract postgres --dep sql --dep postgres --dep scram --dep db_store \
+              -Mroot=tests/test_postgres.sig -Msql=src/core/sql.sig -Mdb_store=src/db/store.sig \
+              --dep sql --dep scram -Mpostgres=src/db/postgres.sig -Mscram=src/db/scram.sig
+            contract mysql --dep sql --dep mysql --dep db_store -Mroot=tests/test_mysql.sig \
+              -Msql=src/core/sql.sig -Mdb_store=src/db/store.sig --dep sql -Mmysql=src/db/mysql.sig
+            contract tds --dep sql --dep tds --dep db_store -Mroot=tests/test_tds.sig \
+              -Msql=src/core/sql.sig -Mdb_store=src/db/store.sig --dep sql -Mtds=src/db/tds.sig
+          else
+            for name in split_versions integral_versions parameterized_lookup; do
+              contract "$name" --dep sql "-Mroot=tests/test_sql_$name.sig" -Msql=src/core/sql.sig
+            done
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-packed-${{ matrix.lane }}-correctness
+          path: evidence/
+          if-no-files-found: error
