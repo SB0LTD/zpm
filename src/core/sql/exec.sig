@@ -83,6 +83,7 @@ pub fn Exec(comptime config: types.Config) type {
             nested_factor_plans: usize = 0,
             nested_factor_keys: usize = 0,
             presence_rejected_blocks:usize=0,
+            range_rejected_blocks: usize = 0,
             gathered_rows: usize = 0,
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
@@ -107,6 +108,7 @@ pub fn Exec(comptime config: types.Config) type {
         pub const ReadStats = struct {
             projected_filter_scans: usize = 0,
             projected_filter_rows: usize = 0,
+            range_rejected_blocks: usize = 0,
             key_probes: usize = 0,
             key_walks: usize = 0,
             key_fallbacks: usize = 0,
@@ -1314,11 +1316,26 @@ pub fn Exec(comptime config: types.Config) type {
                 return mask;
             }
 
-            fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate, stats:?*StreamStats) u64 {
+            fn comparisonMask(comptime op: ast.Op, table: *const S.Table, start: usize, count: usize, predicate: CompactPredicate, stats: anytype) u64 {
                 if(comptime S.presence_enabled and op==.eq) if(!S.blockMayContain(table,predicate.column,start,count,predicate.value)) {
-                    if(stats) |value| value.presence_rejected_blocks+=1;
+                    if (comptime @TypeOf(stats) == *StreamStats) stats.presence_rejected_blocks += 1;
                     return 0;
                 };
+                if (comptime S.block_ranges_enabled and (op == .lt or op == .le or op == .gt or op == .ge)) {
+                    if (S.scanBlockRange(table, predicate.column, start, count)) |range| {
+                        const rejected = range.low > range.high or switch (op) {
+                            .lt => range.low >= predicate.value,
+                            .le => range.low > predicate.value,
+                            .gt => range.high <= predicate.value,
+                            .ge => range.high < predicate.value,
+                            else => unreachable,
+                        };
+                        if (rejected) {
+                            stats.range_rejected_blocks += 1;
+                            return 0;
+                        }
+                    }
+                }
                 const base = @as(usize,predicate.column) * table.rows.len + start;
                 var mask: u64 = 0;
                 var i: usize = 0;
@@ -4890,12 +4907,12 @@ pub fn Exec(comptime config: types.Config) type {
                     // subsequent AND terms run only for preceding TRUE rows.
                     try ctx.session.checkpoints(@popCount(mask));
                     mask &= switch(predicate.op) {
-                        .eq=>Query.comparisonMask(.eq,table,start,count,predicate,null),
-                        .ne=>Query.comparisonMask(.ne,table,start,count,predicate,null),
-                        .lt=>Query.comparisonMask(.lt,table,start,count,predicate,null),
-                        .le=>Query.comparisonMask(.le,table,start,count,predicate,null),
-                        .gt=>Query.comparisonMask(.gt,table,start,count,predicate,null),
-                        .ge=>Query.comparisonMask(.ge,table,start,count,predicate,null),
+                        .eq=>Query.comparisonMask(.eq,table,start,count,predicate,stats),
+                        .ne=>Query.comparisonMask(.ne,table,start,count,predicate,stats),
+                        .lt=>Query.comparisonMask(.lt,table,start,count,predicate,stats),
+                        .le=>Query.comparisonMask(.le,table,start,count,predicate,stats),
+                        .gt=>Query.comparisonMask(.gt,table,start,count,predicate,stats),
+                        .ge=>Query.comparisonMask(.ge,table,start,count,predicate,stats),
                         else=>unreachable,
                     };
                     if(mask==0) break;

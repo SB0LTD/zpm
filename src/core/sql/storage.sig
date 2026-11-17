@@ -71,6 +71,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub const reclaim_budget: usize = 64;
         pub const compact_enabled = config.compact_integral_scans and config.external_storage and config.columns <= 64;
         pub const presence_enabled = compact_enabled and config.block_presence_filters;
+        pub const block_ranges_enabled = compact_enabled and config.block_range_filters;
         pub const split_versions = config.split_external_versions and config.external_storage;
         pub const integral_enabled = split_versions and config.integral_external_versions;
         pub const VersionRow = [config.columns]V.Cell;
@@ -79,6 +80,24 @@ pub fn Storage(comptime config: types.Config) type {
             const rounded=@addWithOverflow(rows,63);if(rounded[1]!=0) return error.InvalidParameterValue;
             const words=@mulWithOverflow(rounded[0]/64,config.columns*4);if(words[1]!=0) return error.InvalidParameterValue;
             return words[0];
+        }
+
+        pub const BlockRange = struct {
+            low: i64 = @import("std").math.maxInt(i64),
+            high: i64 = @import("std").math.minInt(i64),
+
+            fn include(self: *BlockRange, value: i64) void {
+                self.low = @min(self.low, value);
+                self.high = @max(self.high, value);
+            }
+        };
+
+        pub fn blockRangeCount(rows: usize) Error!usize {
+            const rounded = @addWithOverflow(rows, 63);
+            if (rounded[1] != 0) return error.InvalidParameterValue;
+            const ranges = @mulWithOverflow(rounded[0] / 64, config.columns);
+            if (ranges[1] != 0) return error.InvalidParameterValue;
+            return ranges[0];
         }
 
         comptime {
@@ -169,6 +188,7 @@ pub fn Storage(comptime config: types.Config) type {
             scan_nonnull: []u64 = &.{},
             scan_live: []u8 = &.{},
             scan_presence: []u64 = &.{},
+            scan_ranges: []BlockRange = &.{},
             /// Secondary index entry hashes: one run of key_index.len slots
             /// per bound index (at most table_indexes runs; empty binds none).
             index_slots: []u32 = &.{},
@@ -190,7 +210,8 @@ pub fn Storage(comptime config: types.Config) type {
                     self.key_index.len >= self.versions.len * 2 and powerOfTwo(self.key_index.len) and
                     self.index_slots.len % self.key_index.len == 0 and self.index_slots.len / self.key_index.len <= index_capacity and
                     (!compact_enabled or (self.scan_values.len >= scan_cells[0] and self.scan_nonnull.len >= self.rows.len and self.scan_live.len >= self.rows.len)) and
-                    (!presence_enabled or self.scan_presence.len >= (presenceWords(self.rows.len) catch return false));
+                    (!presence_enabled or self.scan_presence.len >= (presenceWords(self.rows.len) catch return false)) and
+                    (if (block_ranges_enabled) self.scan_ranges.len >= (blockRangeCount(self.rows.len) catch return false) else self.scan_ranges.len == 0);
             }
         };
 
@@ -396,6 +417,7 @@ pub fn Storage(comptime config: types.Config) type {
             scan_nonnull: []u64 = &.{},
             scan_live: []u8 = &.{},
             scan_presence: []u64 = &.{},
+            scan_ranges: []BlockRange = &.{},
             rows: if (config.external_storage) []RowSlot else [config.rows_per_table]RowSlot = if (config.external_storage) &.{} else @splat(.{}),
             versions: if (config.external_storage) []Version else [versions_capacity]Version = if (config.external_storage) &.{} else @splat(.{}),
             version_rows: if (split_versions) []VersionRow else void = if (split_versions) &.{} else {},
@@ -833,7 +855,7 @@ pub fn Storage(comptime config: types.Config) type {
                     scanPublish(table, version, true);
                 } else scanPublish(table, table.rows[slot].newest - 1, false);
             }
-            rebuildPresence(table);
+            rebuildBlockFilters(table);
         }
 
         /// Installs constraints after reset(); the caller checked capacity.
@@ -976,10 +998,13 @@ pub fn Storage(comptime config: types.Config) type {
                 @memcpy(destination.scan_live[0..source.scan_high], source.scan_live[0..source.scan_high]);
                 @memcpy(destination.scan_nonnull[0..source.scan_high], source.scan_nonnull[0..source.scan_high]);
                 for (0..config.columns) |column| @memcpy(destination.scan_values[column * destination.rows.len..][0..source.scan_high], source.scan_values[column * source.rows.len..][0..source.scan_high]);
-                if(comptime presence_enabled) {
-                    const blocks=(source.scan_high+63)/64;
-                    for(0..config.columns) |column| @memcpy(destination.scan_presence[presenceAt(destination,column,0)..][0..blocks*4],source.scan_presence[presenceAt(source,column,0)..][0..blocks*4]);
-                }
+                const blocks = (source.scan_high + 63) / 64;
+                if (comptime presence_enabled) for (0..config.columns) |column| {
+                    @memcpy(destination.scan_presence[presenceAt(destination,column,0)..][0..blocks*4],source.scan_presence[presenceAt(source,column,0)..][0..blocks*4]);
+                };
+                if (comptime block_ranges_enabled) for (0..config.columns) |column| {
+                    @memcpy(destination.scan_ranges[blockIndex(destination, column, 0)..][0..blocks], source.scan_ranges[blockIndex(source, column, 0)..][0..blocks]);
+                };
             }
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
             @memcpy(destination.versions[0..source.version_high], source.versions[0..source.version_high]);
@@ -1010,22 +1035,34 @@ pub fn Storage(comptime config: types.Config) type {
 
         fn scanEnsure(table: *Table, high: usize) void {
             if (high <= table.scan_high) return;
-            if(comptime presence_enabled) {
-                const first=(table.scan_high+63)/64;const end=(high+63)/64;
-                for(0..config.columns) |column| @memset(table.scan_presence[presenceAt(table,column,first)..][0..(end-first)*4],0);
-            }
+            if (comptime presence_enabled or block_ranges_enabled) clearBlockFilters(table, (table.scan_high + 63) / 64, (high + 63) / 64);
             @memset(table.scan_live[table.scan_high..high], 0);
             @memset(table.scan_nonnull[table.scan_high..high], 0);
             for (0..config.columns) |column| @memset(table.scan_values[column * table.rows.len + table.scan_high..column * table.rows.len + high], 0);
             table.scan_high = high;
         }
 
-        fn presenceAt(table:*const Table,column:usize,block:usize) usize {
-            return (column*((table.rows.len+63)/64)+block)*4;
+        fn blockIndex(table: *const Table, column: usize, block: usize) usize {
+            return column * ((table.rows.len + 63) / 64) + block;
         }
-        fn presenceAdd(table:*Table,slot:usize,column:usize,value:i64) void {
-            const residue:u8=@truncate(@as(u64,@bitCast(value)));
-            table.scan_presence[presenceAt(table,column,slot/64)+residue/64]|=@as(u64,1)<<@as(u6,@truncate(residue));
+        fn presenceAt(table:*const Table,column:usize,block:usize) usize {
+            return blockIndex(table, column, block) * 4;
+        }
+        fn addBlockValue(table: *Table, slot: usize, column: usize, value: i64) void {
+            const block = blockIndex(table, column, slot / 64);
+            if (comptime presence_enabled) {
+                const residue: u8 = @truncate(@as(u64, @bitCast(value)));
+                table.scan_presence[block * 4 + residue / 64] |= @as(u64, 1) << @as(u6, @truncate(residue));
+            }
+            if (comptime block_ranges_enabled) table.scan_ranges[block].include(value);
+        }
+        fn clearBlockFilters(table: *Table, first: usize, end: usize) void {
+            if (first == end) return;
+            for (0..config.columns) |column| {
+                const block = blockIndex(table, column, first);
+                if (comptime presence_enabled) @memset(table.scan_presence[block * 4 ..][0..(end - first) * 4], 0);
+                if (comptime block_ranges_enabled) @memset(table.scan_ranges[block..][0 .. end - first], .{});
+            }
         }
         /// Absence is definitive; presence can be a residue collision or a
         /// retained old/deleted value. Call only on a snapshot-safe projection.
@@ -1035,16 +1072,24 @@ pub fn Storage(comptime config: types.Config) type {
             const residue:u8=@truncate(@as(u64,@bitCast(value)));
             return table.scan_presence[presenceAt(table,column,start/64)+residue/64]&(@as(u64,1)<<@as(u6,@truncate(residue)))!=0;
         }
-        fn rebuildPresence(table:*Table) void {
-            if(comptime presence_enabled) {
+        /// Bounds widen on published writes. Values removed by UPDATE or
+        /// DELETE may persist until a rebuild, so absence remains definitive.
+        /// Call only on a snapshot-safe committed compact projection.
+        pub fn scanBlockRange(table: *const Table, column: usize, start: usize, count: usize) ?BlockRange {
+            if (comptime !block_ranges_enabled) return null;
+            if (start % 64 != 0 or count == 0 or count > 64 or start >= table.scan_high or count > table.scan_high - start) return null;
+            return table.scan_ranges[blockIndex(table, column, start / 64)];
+        }
+        fn rebuildBlockFilters(table:*Table) void {
+            if(comptime presence_enabled or block_ranges_enabled) {
                 const blocks=(table.scan_high+63)/64;
-                for(0..config.columns) |column| @memset(table.scan_presence[presenceAt(table,column,0)..][0..blocks*4],0);
+                clearBlockFilters(table, 0, blocks);
                 for(0..table.scan_high) |slot| {
                     if(table.scan_live[slot]==0) continue;
                     for(0..table.column_count) |column| {
                         const ty=table.columns[column].data_type;
                         if(ty!=.integer and ty!=.integer32 and ty!=.smallint and ty!=.oid and ty!=.date) continue;
-                        if(table.scan_nonnull[slot]&(@as(u64,1)<<@intCast(column))!=0) presenceAdd(table,slot,column,table.scan_values[column*table.rows.len+slot]);
+                        if(table.scan_nonnull[slot]&(@as(u64,1)<<@intCast(column))!=0) addBlockValue(table,slot,column,table.scan_values[column*table.rows.len+slot]);
                     }
                 }
             }
@@ -1062,10 +1107,11 @@ pub fn Storage(comptime config: types.Config) type {
                 var mask: u64 = 0;
                 for (versionValues(table, version, &row_scratch), 0..) |*cell, column| {
                     if (cell.* != .null_value) mask |= @as(u64, 1) << @intCast(column);
-                    table.scan_values[column * table.rows.len + slot] = switch(cell.*) {
+                    const value = switch(cell.*) {
                         .integer=>cell.integer,.date=>cell.date,else=>0,
                     };
-                    if(comptime presence_enabled) if(live and (cell.*==.integer or cell.*==.date)) presenceAdd(table,slot,column,table.scan_values[column*table.rows.len+slot]);
+                    table.scan_values[column * table.rows.len + slot] = value;
+                    if(comptime presence_enabled or block_ranges_enabled) if(live and (cell.*==.integer or cell.*==.date)) addBlockValue(table,slot,column,value);
                 }
                 table.scan_nonnull[slot] = mask;
             }
@@ -1644,7 +1690,7 @@ pub fn Storage(comptime config: types.Config) type {
                 write += 1;
             }
             table.row_high = write;
-            if (comptime compact_enabled) {table.scan_high = write;rebuildPresence(table);}
+            if (comptime compact_enabled) {table.scan_high = write;rebuildBlockFilters(table);}
             @memset(table.row_index[0..], 0);
             for (0..write) |slot| indexRow(table, @intCast(slot));
         }

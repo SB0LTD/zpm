@@ -34,6 +34,8 @@ pub const Config = struct {
     /// Optional conservative 256-bit presence summary per 64-row scan block
     /// and column. Borrowed external backing; exact comparisons remain required.
     block_presence_filters: bool = false,
+    /// Maintain conservative signed bounds for 64-row compact scan blocks.
+    block_range_filters: bool = false,
     /// Opt-in exact aggregate-before-unique-key-join execution. Unsupported
     /// expressions, visibility or caller-workspace budgets retain ordinary SQL.
     factorized_aggregates: bool = false,

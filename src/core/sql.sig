@@ -261,6 +261,7 @@ pub fn Database(comptime config: Config) type {
         pub const StorageRowSlot = S.RowSlot;
         pub const StorageVersion = S.Version;
         pub const StorageVersionRow = S.VersionRow;
+        pub const StorageBlockRange = S.BlockRange;
         pub const integralRowWords = S.integralRowWords;
         pub const ReplayScratch = C.Scratch;
         pub const Snapshot = storage.Snapshot;
@@ -1065,7 +1066,7 @@ pub fn Database(comptime config: Config) type {
             set: *const fn (?*anyopaque, []const u8, []const u8, bool, bool) Error!bool,
         };
 
-        const storage_fields = .{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" } ++
+        const storage_fields = .{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots", "scan_ranges" } ++
             (if (S.split_versions) .{"version_rows"} else .{}) ++
             (if (S.integral_enabled) .{"integral_rows"} else .{});
 
@@ -1125,12 +1126,13 @@ pub fn Database(comptime config: Config) type {
                 const index_slots = @mulWithOverflow(ki, S.bound_indexes);
                 if (index_slots[1] != 0) return error.InvalidParameterValue;
                 offsets[8] = if (S.bound_indexes != 0) try appendLayout(&cursor, u32, index_slots[0]) else cursor;
+                offsets[9] = if (S.block_ranges_enabled) try appendLayout(&cursor, S.BlockRange, try S.blockRangeCount(scan_rows)) else cursor;
                 if (!S.integral_enabled and budget.integral_row_words != 0) return error.InvalidParameterValue;
-                if (comptime S.split_versions) offsets[9] = try appendLayout(&cursor, S.VersionRow, if (budget.integral_row_words == 0) versions else 0);
+                if (comptime S.split_versions) offsets[10] = try appendLayout(&cursor, S.VersionRow, if (budget.integral_row_words == 0) versions else 0);
                 if (comptime S.integral_enabled) {
                     const words = @mulWithOverflow(versions, budget.integral_row_words);
                     if (words[1] != 0) return error.InvalidParameterValue;
-                    offsets[10] = try appendLayout(&cursor, u64, words[0]);
+                    offsets[11] = try appendLayout(&cursor, u64, words[0]);
                 }
             }
             layout.refs = try appendLayout(&cursor, u32, refs);
@@ -1207,8 +1209,8 @@ pub fn Database(comptime config: Config) type {
             for (&backings, layout.offsets, layout.row_index, layout.key_index, budgets) |*backing, offsets, ri, ki, budget| backing.* = .{
                 .rows = try storageView(S.RowSlot, bytes, offsets[0], budget.rows),
                 .versions = try storageView(S.Version, bytes, offsets[1], budget.versions),
-                .version_rows = if (comptime S.split_versions) try storageView(S.VersionRow, bytes, offsets[9], if (budget.integral_row_words == 0) budget.versions else 0) else {},
-                .integral_rows = if (comptime S.integral_enabled) try storageView(u64, bytes, offsets[10], budget.versions * budget.integral_row_words) else {},
+                .version_rows = if (comptime S.split_versions) try storageView(S.VersionRow, bytes, offsets[10], if (budget.integral_row_words == 0) budget.versions else 0) else {},
+                .integral_rows = if (comptime S.integral_enabled) try storageView(u64, bytes, offsets[11], budget.versions * budget.integral_row_words) else {},
                 .integral_row_words = if (S.integral_enabled) budget.integral_row_words else {},
                 .row_index = try storageView(u32, bytes, offsets[2], ri),
                 .key_index = try storageView(u32, bytes, offsets[3], ki),
@@ -1217,6 +1219,7 @@ pub fn Database(comptime config: Config) type {
                 .scan_live = try storageView(u8, bytes, offsets[6], if (S.compact_enabled) budget.rows else 0),
                 .scan_presence = if(S.presence_enabled) try storageView(u64,bytes,offsets[7],try S.presenceWords(budget.rows)) else &.{},
                 .index_slots = if (S.bound_indexes != 0) try storageView(u32, bytes, offsets[8], ki * S.bound_indexes) else &.{},
+                .scan_ranges = if (S.block_ranges_enabled) try storageView(S.BlockRange, bytes, offsets[9], try S.blockRangeCount(budget.rows)) else &.{},
             };
             try self.bindStorage(backings, try storageView(u32, bytes, layout.refs, refs));
         }
@@ -1271,6 +1274,7 @@ pub fn Database(comptime config: Config) type {
                 table.scan_nonnull = backing.scan_nonnull;
                 table.scan_live = backing.scan_live;
                 table.scan_presence = backing.scan_presence;
+                table.scan_ranges = backing.scan_ranges;
                 table.index_slots = backing.index_slots;
             }
             self.workspace.query.refs = refs;
