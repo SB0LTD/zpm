@@ -34,6 +34,8 @@ const rollup_select="SELECT cu.segment,f.discount,GROUPING(cu.segment,f.discount
 const rollup_group=" GROUP BY ROLLUP(cu.segment,f.discount)";
 const rollup_order=" ORDER BY cu.segment NULLS LAST,f.discount NULLS LAST,GROUPING(cu.segment,f.discount)";
 const rollup_query=rollup_select++rollup_group++rollup_order;
+const narrow_rollup_query = "SELECT cu.segment,f.discount,GROUPING(cu.segment,f.discount),COUNT(*),SUM(f.quantity),AVG(f.quantity)" ++
+    " FROM fact f JOIN customers cu ON cu.id=f.customer" ++ rollup_group ++ rollup_order;
 fn amount(i:usize) i64 {return if(i==1) 9223372036854775807 else if(i==38) -9223372036854775808 else @as(i64,@intCast(i))-200;}
 fn model() !void {
     var rows:[5][6]i64=@splat(@splat(0));var nq=rows;var na=rows;var nn=rows;var q=rows;var a:[5][6]i128=@splat(@splat(0));
@@ -78,8 +80,12 @@ pub fn main() !void {
     try execute(rollup_query);
     try check(fr.row_count==36 and fast.workspace.query.stream_stats.dimension_rollup_plans==1);
     try check(fast.workspace.query.stream_stats.dimension_group_channels == 5);
+    try check(fast.workspace.query.stream_stats.narrow_dimension_group_plans == 0);
     try check(fast.workspace.query.stream_stats.rollup_folded_leaves==30 and fast.workspace.query.stream_stats.gathered_rows==0);
     try check(fast.workspace.query.stream_stats.dimension_probes==37 and fast.workspace.query.stream_stats.dimension_group_rows>0);
+    try execute(narrow_rollup_query);
+    try check(fr.row_count == 36 and fast.workspace.query.stream_stats.dimension_rollup_plans == 1);
+    try check(fast.workspace.query.stream_stats.narrow_dimension_group_plans == 1);
     try execute("SELECT cu.segment,f.discount,COUNT(*),SUM(f.amount),ROUND(AVG(f.amount),2) FROM fact f JOIN customers cu ON cu.id=f.customer GROUP BY ROLLUP(cu.segment,f.discount) ORDER BY cu.segment NULLS LAST,f.discount NULLS LAST");
     try check(fr.row_count==36 and fast.workspace.query.stream_stats.dimension_rollup_plans==1);
     try check(fast.workspace.query.stream_stats.dimension_group_channels == 2);
@@ -146,6 +152,13 @@ pub fn main() !void {
     var rollup_cancel:Cancel=.{.facts=true};control=.{.context=&rollup_cancel,.poll=Cancel.poll,.poll_interval=1};
     fast.workspace.query.stream_stats=.{};fast.session.control=&control;
     try reject(rollup_query,error.QueryCanceled);fast.session.control=null;try check(rollup_cancel.calls>0);
+    rollup_cancel = .{ .facts = true };
+    control = .{ .context = &rollup_cancel, .poll = Cancel.poll, .poll_interval = 1 };
+    fast.workspace.query.stream_stats = .{};
+    fast.session.control = &control;
+    try reject(narrow_rollup_query, error.QueryCanceled);
+    fast.session.control = null;
+    try check(rollup_cancel.calls > 0);
     @memset(&fast.workspace.query.cells,.{.integer=0x55555555});try execute(query);
     try execute("UPDATE fact SET discount=0");try execute(query);
     var constrained:Fast.ReadContext=.{};constrained.workspace.query.refs=&short_refs;
@@ -153,6 +166,7 @@ pub fn main() !void {
     try execute("UPDATE fact SET discount=NULL,amount=NULL,quantity=NULL,note=NULL");try execute(query);
     for(fr.rows[0..fr.row_count]) |row| try check(row.cells[1]==.null_value and row.cells[2].integer>0 and row.cells[3].integer==0 and row.cells[4]==.null_value and row.cells[5]==.null_value and row.cells[6].integer==0);
     try check(fast.workspace.query.stream_stats.dimension_group_plans==1);
+    try check(fast.workspace.query.stream_stats.narrow_dimension_group_plans == 1);
     try execute("DELETE FROM customers WHERE id=3");try execute(query);
     try execute("INSERT INTO customers VALUES(3,'a',1)");try execute(query);
     try execute(rollup_query);try check(fast.workspace.query.stream_stats.dimension_rollup_plans==1);

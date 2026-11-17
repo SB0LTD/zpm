@@ -75,6 +75,7 @@ pub fn Exec(comptime config: types.Config) type {
             dimension_group_ids:usize=0,
             dimension_group_rows:usize=0,
             dimension_group_channels: usize = 0,
+            narrow_dimension_group_plans: usize = 0,
             dimension_rollup_plans:usize=0,
             dimension_distinct_plans:usize=0,
             nested_factor_plans: usize = 0,
@@ -1772,10 +1773,18 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             const FactorAggregate=struct {total:i128 align(@alignOf(V.Cell))=0,count:i64=0};
-            const factor_header=(@sizeOf(i64)+@alignOf(FactorAggregate)-1)/@alignOf(FactorAggregate)*@alignOf(FactorAggregate);
+            const factor_header = factorHeader(FactorAggregate);
+            fn factorHeader(comptime Aggregate: type) usize {
+                const alignment = @alignOf(Aggregate);
+                return (@sizeOf(i64) + alignment - 1) / alignment * alignment;
+            }
             fn factorRows(bytes:[*]u8) *i64 {return @ptrCast(@alignCast(bytes));}
             fn factorStates(bytes:[*]u8,count:usize) []FactorAggregate {
-                const pointer:[*]FactorAggregate=@ptrCast(@alignCast(bytes+factor_header));return pointer[0..count];
+                return factorStatesFor(FactorAggregate, bytes, count);
+            }
+            fn factorStatesFor(comptime Aggregate: type, bytes: [*]u8, count: usize) []Aggregate {
+                const pointer: [*]Aggregate = @ptrCast(@alignCast(bytes + factorHeader(Aggregate)));
+                return pointer[0..count];
             }
             fn factorOperand(self:*const Query,id:u16,key_column:u16) bool {
                 const node=self.pool.nodes[id];
@@ -2483,6 +2492,26 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             const DimensionGroupMode = enum { numeric, date_format, rollup };
+            const NarrowFactorAggregate = struct { total: i64 = 0, count: i64 = 0 };
+            const DimensionTransitions = struct {
+                join_column: u16,
+                fact_key_id: u16,
+                fact_key: ast.Node,
+                dimension_position: usize,
+                channels: []const Transition,
+                aggregate_channels: []const u16,
+            };
+
+            fn sumPrefixesFitI64(table: *const S.Table, column: u16) bool {
+                if (table.summary.columns[column].nonnull == 0) return true;
+                const bounds = table.integer_bounds[column];
+                if (!bounds.known) return false;
+                const rows: i128 = table.summary.rows;
+                // Every subset fits, including scan prefixes and disjoint
+                // rollup merges. The observed final sum alone is insufficient.
+                return rows * @as(i128, @min(bounds.low, 0)) >= -9223372036854775808 and
+                    rows * @as(i128, @max(bounds.high, 0)) <= 9223372036854775807;
+            }
 
             /// Keep one state per direct transition. Wide SUM and AVG over
             /// the same input share count and sum, with their own finalizers.
@@ -2542,17 +2571,38 @@ pub fn Exec(comptime config: types.Config) type {
                 if(!self.prepareTransitions(p,transitions[0..p.agg_count])) return null;
                 var aggregate_channels: [config.columns]u16 = undefined;
                 const channel_count = shareDimensionTransitions(transitions[0..p.agg_count], aggregate_channels[0..p.agg_count]);
-                for(transitions[0..channel_count]) |item| if(item.kind==.sum_integer and table.summary.columns[item.column].nonnull!=0) {
-                    const amounts=table.integer_bounds[item.column];if(!amounts.known) return null;const n=@as(i128,table.summary.rows);
-                    if(n*@as(i128,@min(amounts.low,0)) < -9223372036854775808 or n*@as(i128,@max(amounts.high,0))>9223372036854775807) return null;
+                const channels = transitions[0..channel_count];
+                var narrow = true;
+                for (channels) |item| {
+                    if (item.kind != .sum_integer and item.kind != .sum_wide) continue;
+                    if (sumPrefixesFitI64(table, item.column)) continue;
+                    // Preserve the canonical checked bigint transition.
+                    if (item.kind == .sum_integer) return null;
+                    narrow = false;
+                }
+                const input: DimensionTransitions = .{
+                    .join_column = join_key.column, .fact_key_id = fact_key_id, .fact_key = fact_key,
+                    .dimension_position = dimension_position, .channels = channels, .aggregate_channels = aggregate_channels[0..p.agg_count],
                 };
-                const keys=table.integer_bounds[join_key.column];const facts=table.integer_bounds[fact_key.column];
+                if (narrow) return self.dimensionGroupStates(mode, NarrowFactorAggregate, p, outer, table, &input);
+                return self.dimensionGroupStates(mode, FactorAggregate, p, outer, table, &input);
+            }
+
+            noinline fn dimensionGroupStates(self: *Query, comptime mode: DimensionGroupMode, comptime Aggregate: type,
+                p: *const B.Plan, outer: ?*const E.Context, table: *const S.Table, input: *const DimensionTransitions) Error!?List {
+                const format_dates = mode == .date_format;
+                const rollup = mode == .rollup;
+                const channel_count = input.channels.len;
+                const join_column = input.join_column;
+                const fact_key = &input.fact_key;
+                const dimension_position = input.dimension_position;
+                const keys=table.integer_bounds[join_column];const facts=table.integer_bounds[fact_key.column];
                 if(!keys.known or !facts.known) return null;
                 const key_span128=@as(i128,keys.high)-keys.low+1;const fact_span128=@as(i128,facts.high)-facts.low+2;
                 const available_refs=self.work.ref_high-self.work.ref_low;const available_cells=self.work.cell_high-self.work.cell_low;
                 if(key_span128<=0 or key_span128>=available_refs or fact_span128<=1 or fact_span128>=available_cells) return null;
                 const key_span:usize=@intCast(key_span128);const fact_span:usize=@intCast(fact_span128);
-                const stride=factor_header+channel_count*@sizeOf(FactorAggregate);
+                const stride=factorHeader(Aggregate)+channel_count*@sizeOf(Aggregate);
                 const buckets_per_label=fact_span+@intFromBool(rollup);
                 const state_bytes_product=@mulWithOverflow(buckets_per_label,stride);if(state_bytes_product[1]!=0) return null;
                 const state_bytes=state_bytes_product[0];
@@ -2577,7 +2627,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const capacity=@min(key_span,@min((available_cells-fixed_cells)/group_cells[0],(available_refs-key_span-fixed_refs)/group_refs[0]));
                 if(capacity==0) return null;
                 const cell_start=self.work.cell_low;const ref_start=self.work.ref_low;
-                const map=try self.dimensionMap(p,p.keys[dimension_position],join_key.column,keys,key_span,capacity,1+state_cells);
+                const map=try self.dimensionMap(p,p.keys[dimension_position],join_column,keys,key_span,capacity,1+state_cells);
                 var formatted_keys: DateKeys = undefined;
                 var date_values: [config.columns]V.Cell = undefined;
                 var date_context = self.context(null);
@@ -2586,19 +2636,19 @@ pub fn Exec(comptime config: types.Config) type {
                     @memset(self.work.refs[formatted_keys.days..][0..fact_span], absent);
                     @memset(self.work.refs[formatted_keys.buckets..][0..date_slots], absent);
                 }
-                const key_nonnull=table.summary.columns[join_key.column].nonnull==table.summary.rows;
+                const key_nonnull=table.summary.columns[join_column].nonnull==table.summary.rows;
                 const fact_nonnull=table.summary.columns[fact_key.column].nonnull==table.summary.rows;
                 const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));
                 var nonnull:[config.columns]bool=undefined;
-                for(transitions[0..channel_count],0..) |item,index| nonnull[index]=item.kind==.count_star or table.summary.columns[item.column].nonnull==table.summary.rows;
+                for(input.channels,0..) |item,index| nonnull[index]=item.kind==.count_star or table.summary.columns[item.column].nonnull==table.summary.rows;
                 var start:usize=0;
                 while(start<table.scan_high):(start+=64) {
                     const count=@min(@as(usize,64),table.scan_high-start);try self.session.checkpoints(count);
                     var selected=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(selected);
                     while(selected!=0) {
                         const bit=@ctz(selected);selected&=selected-1;const slot=start+bit;const flags=table.scan_nonnull[slot];
-                        if(!key_nonnull and flags&(@as(u64,1)<<@intCast(join_key.column))==0) continue;
-                        const key:usize=@intCast(@as(i128,table.scan_values[@as(usize,join_key.column)*table.rows.len+slot])-keys.low);
+                        if(!key_nonnull and flags&(@as(u64,1)<<@intCast(join_column))==0) continue;
+                        const key:usize=@intCast(@as(i128,table.scan_values[@as(usize,join_column)*table.rows.len+slot])-keys.low);
                         const record=self.work.refs[map.mapping+key];if(record==absent) continue;
                         const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);
                         const has_key = fact_nonnull or flags&(@as(u64,1)<<@intCast(fact_key.column))!=0;
@@ -2608,10 +2658,10 @@ pub fn Exec(comptime config: types.Config) type {
                             const cached = self.work.refs[formatted_keys.days + fact_index];
                             if (cached != absent) break :blk @as(usize, cached);
                             break :blk try self.dateGroupIndex(&formatted_keys, fact_index,
-                                if (has_key) .{.date=@intCast(scalar)} else .null_value, fact_key_id, &fact_key, &date_context, &date_values);
+                                if (has_key) .{.date=@intCast(scalar)} else .null_value, input.fact_key_id, fact_key, &date_context, &date_values);
                         } else fact_index;
                         const state=partial+value*stride;factorRows(state).*+=1;self.work.stream_stats.dimension_group_rows+=1;
-                        for(transitions[0..channel_count],factorStates(state,channel_count),0..) |item,*channel,index| {
+                        for(input.channels,factorStatesFor(Aggregate,state,channel_count),0..) |item,*channel,index| {
                             if(item.kind!=.count_star and !nonnull[index] and flags&(@as(u64,1)<<@intCast(item.column))==0) continue;
                             channel.count+=1;
                             if(item.kind==.sum_integer or item.kind==.sum_wide) channel.total+=table.scan_values[@as(usize,item.column)*table.rows.len+slot];
@@ -2620,20 +2670,20 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 var records:List=.{};
                 const bucket_count = if (format_dates) formatted_keys.count else fact_span;
-                var grand:[if(rollup) config.columns else 0]FactorAggregate=@splat(.{});
+                var grand:[if(rollup) config.columns else 0]Aggregate=@splat(.{});
                 // Use separate bucket tags for the two synthetic levels.
                 if (rollup) try self.appendDimensionGroup(p, &records, dimension_position, .null_value, .null_value, 0, fact_span + 1);
                 for(self.work.refs[map.dictionary..][0..map.groups]) |record| {
                     const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);
                     if(rollup) {
                         const subtotal=partial+fact_span*stride;
-                        const subtotal_channels=factorStates(subtotal,channel_count);
+                        const subtotal_channels=factorStatesFor(Aggregate,subtotal,channel_count);
                         var leaves:usize=0;
                         for(0..fact_span) |bucket| {
                             try self.session.checkpoint();
                             const leaf=partial+bucket*stride;
                             if(factorRows(leaf).*==0) continue;
-                            for(subtotal_channels,factorStates(leaf,channel_count)) |*channel,delta| {
+                            for(subtotal_channels,factorStatesFor(Aggregate,leaf,channel_count)) |*channel,delta| {
                                 channel.count+=delta.count;
                                 channel.total+=delta.total;
                             }
@@ -2665,12 +2715,12 @@ pub fn Exec(comptime config: types.Config) type {
                 for(self.handles(records)) |at| {
                     const record:u32=@intCast(self.work.cells[at+2+p.agg_count].integer);const bucket:usize=@intCast(self.work.cells[at+3+p.agg_count].integer);
                     const mask:u64=if(!rollup or bucket<fact_span) 0 else if(bucket==fact_span) 1 else 3;
-                    const channels=if(rollup and mask==3) grand[0..channel_count] else factorStates(
+                    const channels=if(rollup and mask==3) grand[0..channel_count] else factorStatesFor(Aggregate,
                         @as([*]u8,@ptrCast(&self.work.cells[record+1]))+bucket*stride,channel_count);
                     var values:[config.columns]Accumulator=undefined;
-                    for (aggregate_channels[0..p.agg_count], values[0..p.agg_count]) |channel_index, *value| {
+                    for (input.aggregate_channels, values[0..p.agg_count]) |channel_index, *value| {
                         const channel = channels[channel_index];
-                        const item = transitions[channel_index];
+                        const item = input.channels[channel_index];
                         value.*=.{.count=channel.count,.wide=channel.total,.integer=if(item.kind==.sum_integer) @intCast(channel.total) else 0};
                     }
                     try self.projectGroupMask(p,at,values[0..p.agg_count],outer,&out,mask);
@@ -2678,6 +2728,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const result=try self.finish(p,out);
                 self.work.stream_stats.dimension_group_plans+=1;self.work.stream_stats.dimension_group_ids+=map.groups;
                 self.work.stream_stats.dimension_group_channels += channel_count;
+                self.work.stream_stats.narrow_dimension_group_plans += @intFromBool(Aggregate == NarrowFactorAggregate);
                 if (format_dates) self.work.stream_stats.dimension_date_group_plans += 1;
                 if(rollup) self.work.stream_stats.dimension_rollup_plans+=1;
                 self.work.stream_stats.groups+=records.count;

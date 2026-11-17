@@ -93,6 +93,7 @@ fn compactDateGroups() !void {
     try check(fast_result.row_count == 3 and fast_result.rows[0].cells[2].integer == 3);
     try check(date_fast.workspace.query.stream_stats.dimension_date_group_plans == 1);
     try check(date_fast.workspace.query.stream_stats.dimension_group_channels == 2);
+    try check(date_fast.workspace.query.stream_stats.narrow_dimension_group_plans == 1);
     try check(date_fast.workspace.query.stream_stats.dimension_date_keys == 4);
     const unsupported = "SELECT r.name,to_char(f.day,'IYYY-IW'),COUNT(*)" ++ source ++
         "GROUP BY r.name,to_char(f.day,'IYYY-IW')";
@@ -100,6 +101,13 @@ fn compactDateGroups() !void {
         try check(err == error.UnsupportedStatement);
     }
     try check(fast_result.row_count == 3 and fast_result.rows[0].cells[2].integer == 3);
+    // A same-bucket prefix exceeds i64 before the negative input is added.
+    // A final-value-only check would select the wrong transition width.
+    try executeDateJoin("INSERT INTO fact VALUES (8,1,'2024-01-01',9223372036854775807),(9,1,'2024-01-01',-9223372036854775808)");
+    try executeDateJoin(query);
+    try check(fast_result.row_count == 3 and fast_result.rows[0].cells[2].integer == 5);
+    try check(date_fast.workspace.query.stream_stats.dimension_date_group_plans == 1);
+    try check(date_fast.workspace.query.stream_stats.narrow_dimension_group_plans == 0);
     try executeDateJoin("UPDATE fact SET store=9");
     try executeDateJoin(unsupported);
     try check(fast_result.row_count == 0 and date_fast.workspace.query.stream_stats.dimension_date_keys == 0);
