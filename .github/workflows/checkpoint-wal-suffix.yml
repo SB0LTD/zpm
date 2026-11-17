@@ -1,0 +1,62 @@
+name: Checkpoint WAL suffix contracts
+
+on:
+  push:
+    branches: [ci/wal-checkpoint-seal-20261118]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZPM_SOURCE_REVISION: e66c9492624cf7171da6b19a983c3f05860f190d
+  SIG_TAG: sig-0.6.5-zig0.17.0.3c72687
+  SIG_ASSET: sig-0.6.5-zig0.17.0.3c72687-x86_64-linux.tar.xz
+  SIG_SHA256: 179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.ZPM_SOURCE_REVISION }}
+      - name: Verify source and install Sig
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$ZPM_SOURCE_REVISION"
+          mkdir -p evidence sig-out "$RUNNER_TEMP/sig-toolchain"
+          archive="$RUNNER_TEMP/$SIG_ASSET"
+          curl --fail --location --retry 3 "https://github.com/SB0LTD/sig/releases/download/$SIG_TAG/$SIG_ASSET" --output "$archive"
+          printf '%s  %s\n' "$SIG_SHA256" "$archive" | sha256sum --check --strict -
+          tar -xf "$archive" -C "$RUNNER_TEMP/sig-toolchain"
+          compiler=$(find "$RUNNER_TEMP/sig-toolchain" -type f -name sig -perm -u+x -print -quit)
+          test -n "$compiler"
+          lib="$(dirname "$(dirname "$compiler")")/lib"
+          test -f "$lib/std/std.sig"
+          echo "SIG=$compiler" >> "$GITHUB_ENV"
+          echo "SIG_LIB_DIR=$lib" >> "$GITHUB_ENV"
+          "$compiler" version | tee evidence/sig-version.txt
+          printf '%s\n' "$ZPM_SOURCE_REVISION" > evidence/zpm-revision.txt
+          printf '%s  %s\n' "$SIG_SHA256" "$SIG_ASSET" > evidence/sig-archive-sha256.txt
+      - name: Compile and run ReleaseSafe contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_binary="$RUNNER_TEMP/contract-durable-log"
+          file_binary="$RUNNER_TEMP/contract-db-file"
+          "$SIG" build-exe --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe --dep durable_log -Mroot=tests/test_durable_log.sig -Mdurable_log=src/db/durable_log.sig "-femit-bin=$log_binary" 2>&1 | tee evidence/durable-log-build.txt
+          "$log_binary" 2>&1 | tee evidence/durable-log-result.txt
+          grep -F '"suite":"durable_log","pass":true' evidence/durable-log-result.txt
+          "$SIG" build-exe --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe --dep durable_log --dep db_file -Mroot=tests/test_db_file.sig -Mdurable_log=src/db/durable_log.sig -Mdb_file=src/platform/db_file.sig "-femit-bin=$file_binary" 2>&1 | tee evidence/db-file-build.txt
+          "$file_binary" 2>&1 | tee evidence/db-file-result.txt
+          grep -F '"suite":"db_file","pass":true' evidence/db-file-result.txt
+          sha256sum "$log_binary" "$file_binary" > evidence/contract-binary-sha256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkpoint-wal-suffix-contracts
+          path: evidence/
+          if-no-files-found: error
