@@ -71,6 +71,7 @@ pub fn Exec(comptime config: types.Config) type {
             dimension_group_keys:usize=0,
             dimension_group_ids:usize=0,
             dimension_group_rows:usize=0,
+            dimension_rollup_plans:usize=0,
             dimension_distinct_plans:usize=0,
             nested_factor_plans: usize = 0,
             nested_factor_keys: usize = 0,
@@ -2379,10 +2380,20 @@ pub fn Exec(comptime config: types.Config) type {
                 return result;
             }
 
+            fn appendDimensionGroup(self:*Query,p:*const B.Plan,records:*List,dimension_position:usize,
+                record:u32,bucket:usize,fact_span:usize,base:i64) Error!void {
+                const at=try self.cells(4+p.agg_count);
+                self.work.cells[at+dimension_position]=if(bucket>fact_span) .null_value else self.work.cells[record];
+                self.work.cells[at+1-dimension_position]=if(bucket>=fact_span-1) .null_value else .{.integer=@intCast(@as(i128,base)+bucket)};
+                self.work.cells[at+2+p.agg_count]=.{.integer=record};
+                self.work.cells[at+3+p.agg_count]=.{.integer=@intCast(bucket)};
+                try self.push(records,at);
+            }
+
             /// Collapse a unique dimension to compact group IDs once, then fold
             /// fact measures by (group ID, integral fact key). Cells and text
             /// hashing are outside the fact loop. No persistent derived index.
-            noinline fn dimensionGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table) Error!?List {
+            noinline fn dimensionGroup(self:*Query,comptime rollup:bool,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table) Error!?List {
                 if(outer!=null or p.correlated or p.source_count!=2 or p.key_count!=2 or p.agg_count==0 or p.where!=none or
                     !self.committed_only or !table.summary.valid or table.summary.rows<=0 or table.summary.csn>self.snap.csn or table.scan_high!=table.row_high) return null;
                 if(comptime config.numeric_digits<39) return null;
@@ -2393,6 +2404,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if(join_key.kind!=.column or join_key.level!=0 or join_key.relation!=0 or !value_module.integral(join_key.ty) or !self.factorOn(source.on,join_key.column)) return null;
                 const fact_position:usize=if(self.pool.nodes[p.keys[0]].relation==0) 0 else 1;
                 const dimension_position=1-fact_position;
+                if(rollup and dimension_position!=0) return null;
                 const fact_key=self.pool.nodes[p.keys[fact_position]];const label=self.pool.nodes[p.keys[dimension_position]];
                 if(fact_key.kind!=.column or fact_key.level!=0 or fact_key.relation!=0 or !value_module.integral(fact_key.ty) or
                     label.kind!=.column or label.level!=0 or label.relation!=1 or !S.summaryKeyType(dimension.columns[label.column].data_type)) return null;
@@ -2409,16 +2421,20 @@ pub fn Exec(comptime config: types.Config) type {
                 if(key_span128<=0 or key_span128>=available_refs or fact_span128<=1 or fact_span128>=available_cells) return null;
                 const key_span:usize=@intCast(key_span128);const fact_span:usize=@intCast(fact_span128);
                 const stride=factor_header+p.agg_count*@sizeOf(FactorAggregate);
-                const state_bytes_product=@mulWithOverflow(fact_span,stride);if(state_bytes_product[1]!=0) return null;
+                const buckets_per_label=fact_span+@intFromBool(rollup);
+                const state_bytes_product=@mulWithOverflow(buckets_per_label,stride);if(state_bytes_product[1]!=0) return null;
                 const state_bytes=state_bytes_product[0];
                 const rounded=@addWithOverflow(state_bytes,@sizeOf(V.Cell)-1);if(rounded[1]!=0) return null;
                 const state_cells=rounded[0]/@sizeOf(V.Cell);
                 const output_width=4+@as(usize,p.agg_count)+p.width;
-                const output_cells=@mulWithOverflow(fact_span,output_width);if(output_cells[1]!=0) return null;
+                const grand_cells=if(rollup) output_width else 0;
+                const grand_refs:usize=if(rollup) 4 else 0;
+                if(available_cells<grand_cells or available_refs-key_span<grand_refs) return null;
+                const output_cells=@mulWithOverflow(buckets_per_label,output_width);if(output_cells[1]!=0) return null;
                 const group_cells=@addWithOverflow(1+state_cells,output_cells[0]);if(group_cells[1]!=0) return null;
-                const output_refs=@mulWithOverflow(fact_span,@as(usize,4));if(output_refs[1]!=0) return null;
+                const output_refs=@mulWithOverflow(buckets_per_label,@as(usize,4));if(output_refs[1]!=0) return null;
                 const group_refs=@addWithOverflow(output_refs[0],@as(usize,5));if(group_refs[1]!=0) return null;
-                const capacity=@min(key_span,@min(available_cells/group_cells[0],(available_refs-key_span)/group_refs[0]));
+                const capacity=@min(key_span,@min((available_cells-grand_cells)/group_cells[0],(available_refs-key_span-grand_refs)/group_refs[0]));
                 if(capacity==0) return null;
                 const cell_start=self.work.cell_low;const ref_start=self.work.ref_low;
                 const map=try self.dimensionMap(p,p.keys[dimension_position],join_key.column,keys,key_span,capacity,1+state_cells);
@@ -2448,16 +2464,39 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 var records:List=.{};
+                var grand:[if(rollup) config.columns else 0]FactorAggregate=@splat(.{});
+                // Use separate bucket tags for the two synthetic levels.
+                if(rollup) try self.appendDimensionGroup(p,&records,dimension_position,0,fact_span+1,fact_span,facts.low);
                 for(self.work.refs[map.dictionary..][0..map.groups]) |record| {
                     const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);
+                    if(rollup) {
+                        const subtotal=partial+fact_span*stride;
+                        const subtotal_channels=factorStates(subtotal,p.agg_count);
+                        var leaves:usize=0;
+                        for(0..fact_span) |bucket| {
+                            try self.session.checkpoint();
+                            const leaf=partial+bucket*stride;
+                            if(factorRows(leaf).*==0) continue;
+                            for(subtotal_channels,factorStates(leaf,p.agg_count)) |*channel,delta| {
+                                channel.count+=delta.count;
+                                channel.total+=delta.total;
+                            }
+                            leaves+=1;
+                        }
+                        if(leaves==0) continue;
+                        for(grand[0..p.agg_count],subtotal_channels) |*channel,delta| {
+                            channel.count+=delta.count;
+                            channel.total+=delta.total;
+                        }
+                        self.work.stream_stats.rollup_folded_leaves+=leaves;
+                        // Stable key sorting retains the prefix order when
+                        // rolled and data NULLs have equal displayed keys.
+                        try self.appendDimensionGroup(p,&records,dimension_position,record,fact_span,fact_span,facts.low);
+                    }
                     for(0..fact_span) |index| {
                         const bucket=if(index==0) fact_span-1 else index-1;
                         if(factorRows(partial+bucket*stride).*==0) continue;
-                        const at=try self.cells(4+p.agg_count);
-                        self.work.cells[at+dimension_position]=self.work.cells[record];
-                        self.work.cells[at+fact_position]=if(bucket==fact_span-1) .null_value else .{.integer=@intCast(@as(i128,facts.low)+bucket)};
-                        self.work.cells[at+2+p.agg_count]=.{.integer=record};self.work.cells[at+3+p.agg_count]=.{.integer=@intCast(bucket)};
-                        try self.push(&records,at);
+                        try self.appendDimensionGroup(p,&records,dimension_position,record,bucket,fact_span,facts.low);
                     }
                 }
                 if(records.count>1) {
@@ -2466,14 +2505,18 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 var out:List=.{};
                 for(self.handles(records)) |at| {
-                    const record:usize=@intCast(self.work.cells[at+2+p.agg_count].integer);const bucket:usize=@intCast(self.work.cells[at+3+p.agg_count].integer);
-                    const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);var values:[config.columns]Accumulator=undefined;
-                    for(factorStates(partial+bucket*stride,p.agg_count),transitions[0..p.agg_count],values[0..p.agg_count]) |channel,item,*value|
+                    const record:u32=@intCast(self.work.cells[at+2+p.agg_count].integer);const bucket:usize=@intCast(self.work.cells[at+3+p.agg_count].integer);
+                    const mask:u64=if(!rollup or bucket<fact_span) 0 else if(bucket==fact_span) 1 else 3;
+                    const channels=if(rollup and mask==3) grand[0..p.agg_count] else factorStates(
+                        @as([*]u8,@ptrCast(&self.work.cells[record+1]))+bucket*stride,p.agg_count);
+                    var values:[config.columns]Accumulator=undefined;
+                    for(channels,transitions[0..p.agg_count],values[0..p.agg_count]) |channel,item,*value|
                         value.*=.{.count=channel.count,.wide=channel.total,.integer=if(item.kind==.sum_integer) @intCast(channel.total) else 0};
-                    try self.projectGroup(p,at,values[0..p.agg_count],outer,&out);
+                    try self.projectGroupMask(p,at,values[0..p.agg_count],outer,&out,mask);
                 }
                 const result=try self.finish(p,out);
                 self.work.stream_stats.dimension_group_plans+=1;self.work.stream_stats.dimension_group_ids+=map.groups;
+                if(rollup) self.work.stream_stats.dimension_rollup_plans+=1;
                 self.work.stream_stats.groups+=records.count;
                 self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,self.work.cell_low-cell_start);
                 self.work.stream_stats.scratch_refs=@max(self.work.stream_stats.scratch_refs,self.work.ref_low-ref_start);
@@ -2493,7 +2536,7 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 if(comptime config.dimension_group_ids and S.compact_enabled) {
                     const at=self.mark();const stats=self.work.stream_stats;
-                    if(self.dimensionGroup(p,outer,table)) |result| {if(result) |rows| return rows;} else |err| {
+                    if(self.dimensionGroup(false,p,outer,table)) |result| {if(result) |rows| return rows;} else |err| {
                         if(err!=error.WorkspaceCapacity) return err;
                         self.release(at);self.work.stream_stats=stats;
                     }
@@ -3780,7 +3823,18 @@ pub fn Exec(comptime config: types.Config) type {
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 if(p.window_count!=0) return self.windowCore(p,outer);
                 if (p.grouping_sets != none) return self.groupingSets(p, outer);
-                if(p.rollup) return self.groupingRollup(p,outer);
+                if(p.rollup) {
+                    if(comptime config.dimension_group_ids and S.compact_enabled) if(streamEligible(p) and self.repeatable() and !self.collectingPlan(p)) {
+                        const at=self.mark();const stats=self.work.stream_stats;
+                        if(self.dimensionGroup(true,p,outer,&self.tables[p.sources[0].table.?])) |result| {
+                            if(result) |rows| return rows;
+                        } else |err| {
+                            if(err!=error.WorkspaceCapacity) return err;
+                            self.release(at);self.work.stream_stats=stats;
+                        }
+                    };
+                    return self.groupingRollup(p,outer);
+                }
                 if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
                     const at=self.mark();const stats=self.work.stream_stats;
                     if(self.nestedFactorGroup(p,outer)) |result| {if(result) |rows| return rows;} else |err| {

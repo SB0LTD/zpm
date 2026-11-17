@@ -30,6 +30,10 @@ fn reject(source:[]const u8,wanted:sql.Error) !void {
     for(fr.rows[0..fr.row_count],before.rows[0..before.row_count]) |a,b| for(0..fr.column_count) |i| try check(Fast.compareCells(&a.cells[i],&b.cells[i])==0);
 }
 const query="SELECT cu.segment,f.discount,COUNT(*),COUNT(f.quantity),SUM(f.quantity),CAST(SUM(f.amount) AS TEXT),COUNT(f.note) FROM fact f JOIN customers cu ON cu.id=f.customer GROUP BY cu.segment,f.discount ORDER BY cu.segment NULLS FIRST,f.discount NULLS FIRST";
+const rollup_select="SELECT cu.segment,f.discount,GROUPING(cu.segment,f.discount),COUNT(*),COUNT(f.quantity),SUM(f.quantity),CAST(SUM(f.amount) AS TEXT),AVG(f.quantity) FROM fact f JOIN customers cu ON cu.id=f.customer";
+const rollup_group=" GROUP BY ROLLUP(cu.segment,f.discount)";
+const rollup_order=" ORDER BY cu.segment NULLS LAST,f.discount NULLS LAST,GROUPING(cu.segment,f.discount)";
+const rollup_query=rollup_select++rollup_group++rollup_order;
 fn amount(i:usize) i64 {return if(i==1) 9223372036854775807 else if(i==38) -9223372036854775808 else @as(i64,@intCast(i))-200;}
 fn model() !void {
     var rows:[5][6]i64=@splat(@splat(0));var nq=rows;var na=rows;var nn=rows;var q=rows;var a:[5][6]i128=@splat(@splat(0));
@@ -71,6 +75,23 @@ pub fn main() !void {
             if(i%23==0) "NULL" else try std.fmt.bufPrint(&value,"{d}",.{amount(i)}),
             if(i%13==0) "NULL" else try std.fmt.bufPrint(&quantity,"{d}",.{i%7}),if(i%11==0) "NULL" else "'x'"}));
     }
+    try execute(rollup_query);
+    try check(fr.row_count==36 and fast.workspace.query.stream_stats.dimension_rollup_plans==1);
+    try check(fast.workspace.query.stream_stats.rollup_folded_leaves==30 and fast.workspace.query.stream_stats.gathered_rows==0);
+    try check(fast.workspace.query.stream_stats.dimension_probes==37 and fast.workspace.query.stream_stats.dimension_group_rows>0);
+    try execute("SELECT cu.segment,f.discount,COUNT(*),SUM(f.amount),ROUND(AVG(f.amount),2) FROM fact f JOIN customers cu ON cu.id=f.customer GROUP BY ROLLUP(cu.segment,f.discount) ORDER BY cu.segment NULLS LAST,f.discount NULLS LAST");
+    try check(fr.row_count==36 and fast.workspace.query.stream_stats.dimension_rollup_plans==1);
+    try execute(rollup_select++rollup_group);
+    try check(fast.workspace.query.stream_stats.dimension_rollup_plans==1);
+    try execute(rollup_select++rollup_group++" HAVING COUNT(*)>1"++rollup_order++" LIMIT 12 OFFSET 1");
+    try check(fr.row_count==12 and fast.workspace.query.stream_stats.dimension_rollup_plans==1);
+    try execute(rollup_select++" AND cu.enabled<0"++rollup_group++rollup_order);
+    try check(fr.row_count==1 and fr.rows[0].cells[2].integer==3 and fr.rows[0].cells[3].integer==0);
+    try check(fr.rows[0].cells[5]==.null_value and fr.rows[0].cells[7]==.null_value and fast.workspace.query.stream_stats.dimension_rollup_plans==1);
+    try execute(rollup_select++" GROUP BY ROLLUP(f.discount,cu.segment)"++rollup_order);
+    try check(fast.workspace.query.stream_stats.dimension_rollup_plans==0);
+    try execute(rollup_select++" WHERE f.id<100"++rollup_group++rollup_order);
+    try check(fast.workspace.query.stream_stats.dimension_rollup_plans==0);
     try execute(query);try model();
     try check(fast.workspace.query.stream_stats.dimension_group_plans==1 and fast.workspace.query.stream_stats.dimension_group_ids==5);
     try check(fast.workspace.query.stream_stats.dimension_probes==37 and fast.workspace.query.stream_stats.gathered_rows==0);
@@ -120,6 +141,9 @@ pub fn main() !void {
         var cancel:Cancel=.{.facts=facts};control=.{.context=&cancel,.poll=Cancel.poll,.poll_interval=1};fast.workspace.query.stream_stats=.{};fast.session.control=&control;
         try reject(query,error.QueryCanceled);fast.session.control=null;try check(cancel.calls>0);
     }
+    var rollup_cancel:Cancel=.{.facts=true};control=.{.context=&rollup_cancel,.poll=Cancel.poll,.poll_interval=1};
+    fast.workspace.query.stream_stats=.{};fast.session.control=&control;
+    try reject(rollup_query,error.QueryCanceled);fast.session.control=null;try check(rollup_cancel.calls>0);
     @memset(&fast.workspace.query.cells,.{.integer=0x55555555});try execute(query);
     try execute("UPDATE fact SET discount=0");try execute(query);
     var constrained:Fast.ReadContext=.{};constrained.workspace.query.refs=&short_refs;
@@ -129,7 +153,10 @@ pub fn main() !void {
     try check(fast.workspace.query.stream_stats.dimension_group_plans==1);
     try execute("DELETE FROM customers WHERE id=3");try execute(query);
     try execute("INSERT INTO customers VALUES(3,'a',1)");try execute(query);
+    try execute(rollup_query);try check(fast.workspace.query.stream_stats.dimension_rollup_plans==1);
     try execute("DELETE FROM fact");try execute(query);try check(fr.row_count==0);
+    try execute(rollup_query);try check(fr.row_count==1 and fr.rows[0].cells[2].integer==3 and fr.rows[0].cells[3].integer==0);
+    try check(fast.workspace.query.stream_stats.dimension_rollup_plans==0);
     for([_][]const u8{"9223372036854775807","-9223372036854775808"}) |key| {
         try execute("DROP TABLE fact");try execute("DROP TABLE customers");
         try execute("CREATE TABLE fact(id INT PRIMARY KEY,customer BIGINT,discount BIGINT,amount BIGINT,quantity INT,note TEXT)");
