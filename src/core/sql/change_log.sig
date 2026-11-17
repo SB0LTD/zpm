@@ -1748,12 +1748,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         fn writeVersion(db: anytype, table: *S.Table, slot: u32, older: u32, row: *const V.Row, csn: u64) Error!u32 {
             try S.ensureVersions(table, 1, csn);
-            const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = slot + 1, .xmin = .{ .epoch = db.epoch }, .xmin_cid = db.cid, .xmin_csn = csn, .older = older, .cells = row.cells };
-            table.rows[slot].newest = version + 1;
+            const version = S.createVersion(table, .{ .row = slot, .xmin = .{ .epoch = db.epoch }, .cid = db.cid, .csn = csn, .older = older }, &row.cells);
             S.indexKey(table, version);
             if (older == 0) {
-                S.summarize(table, &table.versions[version].cells, true, csn);
+                S.summarize(table, version, true, csn);
                 S.scanPublish(table, version, true);
             }
             return version;
@@ -1818,7 +1816,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         for (0..table.row_high) |slot| {
                             if (table.rows[slot].newest == 0) continue;
                             const old = S.visible(table, slot) orelse continue;
-                            S.summarize(table, &table.versions[old].cells, false, csn);
+                            S.summarize(table, old, false, csn);
                             S.scanPublish(table, old, false);
                             retire(db, table, old, csn);
                         }
@@ -1846,7 +1844,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             const slot = S.findRow(table, rowid) orelse return error.ChangeRecordConflict;
                             const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
                             const new = try writeVersion(db, table, slot, old + 1, &row, csn);
-                            S.summarizeUpdate(table, &table.versions[old].cells, &table.versions[new].cells, csn);
+                            S.summarizeUpdate(table, old, new, csn);
                             S.scanPublish(table, new, true);
                             retire(db, table, old, csn);
                         }
@@ -1855,7 +1853,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const table = try tableByOid(db, try reader.int(u32));
                         const slot = S.findRow(table, try reader.int(u64)) orelse return error.ChangeRecordConflict;
                         const old = S.visible(table, slot) orelse return error.ChangeRecordConflict;
-                        S.summarize(table, &table.versions[old].cells, false, csn);
+                        S.summarize(table, old, false, csn);
                         S.scanPublish(table, old, false);
                         retire(db, table, old, csn);
                     },

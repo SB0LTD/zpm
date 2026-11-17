@@ -341,11 +341,7 @@ pub fn Catalog(comptime config: types.Config) type {
             if (SC.findRow(table, rowid) != null) _ = SC.vacuum(table, horizon);
             if (SC.findRow(table, rowid) != null) return error.CatalogCapacity;
             const slot = SC.allocRow(table, rowid);
-            const version = SC.allocVersion(table);
-            table.versions[version] = .{ .row = slot + 1, .xmin = xmin, .xmin_cid = cid, .xmin_csn = csn };
-            for (cells, 0..) |cell, index| table.versions[version].cells[index] = cell;
-            table.rows[slot].newest = version + 1;
-            return version;
+            return SC.createVersion(table, .{ .row = slot, .xmin = xmin, .cid = cid, .csn = csn }, cells);
         }
 
         /// Writes cat_relations and cat_attributes rows for a table slot.

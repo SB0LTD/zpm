@@ -103,6 +103,15 @@ pub fn Storage(comptime config: types.Config) type {
             cells: [config.columns]V.Cell = @splat(.null_value),
         };
 
+        pub const VersionOrigin = struct {
+            row: u32,
+            xmin: TxRef,
+            cid: u32,
+            csn: u64 = 0,
+            /// Previous version index + 1, or 0 for an insert.
+            older: u32 = 0,
+        };
+
         /// Stable reference to a directory slot. Resolves only while the slot
         /// still holds the same row (same generation).
         pub const RowRef = struct { slot: u32, generation: u32 };
@@ -760,7 +769,7 @@ pub fn Storage(comptime config: types.Config) type {
             for (0..table.row_high) |slot| {
                 if (table.rows[slot].newest == 0) continue;
                 if (visible(table, slot)) |version| {
-                    summarize(table, &table.versions[version].cells, true, csn);
+                    summarize(table, version, true, csn);
                     scanPublish(table, version, true);
                 } else scanPublish(table, table.rows[slot].newest - 1, false);
             }
@@ -972,7 +981,7 @@ pub fn Storage(comptime config: types.Config) type {
                 scanEnsure(table, @as(usize, slot) + 1);
                 table.scan_live[slot] = @intFromBool(live);
                 var mask: u64 = 0;
-                for (entry.cells[0..table.column_count], 0..) |*cell, column| {
+                for (versionValues(table, version), 0..) |*cell, column| {
                     if (cell.* != .null_value) mask |= @as(u64, 1) << @intCast(column);
                     table.scan_values[column * table.rows.len + slot] = switch(cell.*) {
                         .integer=>cell.integer,.date=>cell.date,else=>0,
@@ -1029,6 +1038,11 @@ pub fn Storage(comptime config: types.Config) type {
             return &table.versions[version].cells[column];
         }
 
+        /// Logical values in storage column order, excluding dense padding.
+        pub inline fn versionValues(table: *const Table, version: usize) []const V.Cell {
+            return table.versions[version].cells[0..table.column_count];
+        }
+
         pub inline fn versionCellEquals(table: *const Table, version: usize, column: usize, value: *const V.Cell) bool {
             return V.compare(versionCell(table, version, column), value) == 0;
         }
@@ -1082,22 +1096,23 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         /// Called only at durable publication or validated change-record replay.
-        pub fn summarize(table: *Table, cells: *const [config.columns]V.Cell, add: bool, csn: u64) void {
-            changeSummary(table, cells, add, csn);
+        pub fn summarize(table: *Table, version: u32, add: bool, csn: u64) void {
+            changeSummary(table, version, add, csn);
             if (table.summary.valid and table.summary.rows == 0) {
                 resetRollups(table);
                 table.summary.primary_bounds = .{};
             }
         }
 
-        pub fn summarizeUpdate(table: *Table, old: *const [config.columns]V.Cell, new: *const [config.columns]V.Cell, csn: u64) void {
+        pub fn summarizeUpdate(table: *Table, old: u32, new: u32, csn: u64) void {
             // An update does not empty/reinitialize the table's summaries.
             changeSummary(table, old, false, csn);
             changeSummary(table, new, true, csn);
         }
 
-        fn changeSummary(table: *Table, cells: *const [config.columns]V.Cell, add: bool, csn: u64) void {
+        fn changeSummary(table: *Table, version: u32, add: bool, csn: u64) void {
             if (!table.summary.valid) return;
+            const cells = versionValues(table, version);
             const sign: i64 = if (add) 1 else -1;
             table.summary.rows += sign;
             table.summary.csn = csn;
@@ -1109,7 +1124,7 @@ pub fn Storage(comptime config: types.Config) type {
                     else { bounds.low = @min(bounds.low, value.integer); bounds.high = @max(bounds.high, value.integer); }
                 }
             };
-            for (cells[0..table.column_count], table.summary.columns[0..table.column_count]) |*cell, *column| {
+            for (cells, table.summary.columns[0..table.column_count]) |*cell, *column| {
                 if (cell.* == .null_value) continue;
                 column.nonnull += sign;
                 if (cell.* == .integer) column.total += @as(i128, cell.integer) * sign;
@@ -1141,7 +1156,7 @@ pub fn Storage(comptime config: types.Config) type {
             };
         }
 
-        fn summarizeGroups(table: *Table, cells: *const [config.columns]V.Cell, add: bool) void {
+        fn summarizeGroups(table: *Table, cells: []const V.Cell, add: bool) void {
             if (comptime config.summary_groups != 0) {
                 const sign: i64 = if (add) 1 else -1;
                 for (table.columns[0..table.column_count], table.rollups[0..table.column_count], 0..) |definition, *rollup, key_column| {
@@ -1162,7 +1177,7 @@ pub fn Storage(comptime config: types.Config) type {
                     const group = &rollup.groups[at];
                     if (!add and group.rows == 0) { rollup.valid = false; continue; }
                     group.rows += sign;
-                    for (cells[0..table.column_count], group.columns[0..table.column_count]) |*cell, *column| {
+                    for (cells, group.columns[0..table.column_count]) |*cell, *column| {
                         if (cell.* == .null_value) continue;
                         column.nonnull += sign;
                         if (cell.* == .integer) column.total += @as(i128, cell.integer) * sign;
@@ -1315,8 +1330,26 @@ pub fn Storage(comptime config: types.Config) type {
             return table.versions.len - table.version_used;
         }
 
-        /// Caller initializes every field of the returned version.
-        pub fn allocVersion(table: *Table) u32 {
+        /// Installs a logical row after the caller has reserved capacity.
+        /// Linking the version does not publish it to other snapshots.
+        /// Indexing and the transaction or replay bookkeeping are separate.
+        pub inline fn createVersion(table: *Table, origin: VersionOrigin, cells: []const V.Cell) u32 {
+            const version = allocVersion(table);
+            const full_width = cells.len == config.columns;
+            table.versions[version] = .{
+                .row = origin.row + 1,
+                .xmin = origin.xmin,
+                .xmin_cid = origin.cid,
+                .xmin_csn = origin.csn,
+                .older = origin.older,
+                .cells = if (full_width) cells[0..config.columns].* else @splat(.null_value),
+            };
+            if (!full_width) @memcpy(table.versions[version].cells[0..cells.len], cells);
+            table.rows[origin.row].newest = version + 1;
+            return version;
+        }
+
+        fn allocVersion(table: *Table) u32 {
             table.version_used += 1;
             if (table.version_free != 0) {
                 const version = table.version_free - 1;

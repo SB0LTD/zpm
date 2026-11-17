@@ -4843,9 +4843,7 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[table_index];
             try self.reserveWrites(slot, 1);
             try S.ensureVersions(table, 1, self.horizon());
-            const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .older = old + 1, .cells = cells.* };
-            table.rows[row].newest = version + 1;
+            const version = S.createVersion(table, .{ .row = row, .xmin = tx.ref(slot), .cid = snap.cid, .older = old + 1 }, cells);
             table.versions[old].xmax = tx.ref(slot);
             table.versions[old].xmax_cid = snap.cid;
             S.indexKey(table, version);
@@ -5154,9 +5152,7 @@ pub fn Database(comptime config: Config) type {
             try S.ensureRowSlot(table, at);
             const row = S.allocRow(table, table.next_rowid);
             table.next_rowid += 1;
-            const version = S.allocVersion(table);
-            table.versions[version] = .{ .row = row + 1, .xmin = tx.ref(slot), .xmin_cid = snap.cid, .cells = cells.* };
-            table.rows[row].newest = version + 1;
+            const version = S.createVersion(table, .{ .row = row, .xmin = tx.ref(slot), .cid = snap.cid }, cells);
             S.indexKey(table, version);
             tx.push(.{ .kind = .insert, .table = @intCast(table_index), .new = version }) catch unreachable;
         }
@@ -5768,7 +5764,7 @@ pub fn Database(comptime config: Config) type {
                         const table = &self.tables[entry.table];
                         const version = &table.versions[entry.new];
                         const tag: change_log.Op = if (entry.kind == .insert) .insert else .update;
-                        try C.encodeRow(writer, tag, table.oid, table.rows[version.row - 1].rowid, version.cells[0..table.column_count]);
+                        try C.encodeRow(writer, tag, table.oid, table.rows[version.row - 1].rowid, S.versionValues(table, entry.new));
                     },
                     .delete => {
                         const table = &self.tables[entry.table];
