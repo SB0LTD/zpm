@@ -44,6 +44,23 @@ the wire and are entered with SET ROLE. `session_user` is the session
 state's `session_role` (10 unless an embedding caller installs another),
 `current_user` the SET ROLE value or the session user.
 
+### Opt-in authenticated role mapping
+
+Embedders using the shared PostgreSQL codec and store can configure a session
+with `configureRoleAuthentication`. It uses the same SCRAM verifier and fresh
+nonce as the existing configuration. After a successful proof, the store looks
+up the verifier's exact username in the committed SQL role catalog and sets the
+connection's SQL session identity before sending readiness. Ordinary roles must
+have LOGIN and an unlimited connection count. Finite role connection limits
+require admission accounting and are denied by this entry point. The bootstrap
+role is available under its exact name `ramsql` when provisioned with that
+username. Missing or ineligible roles fail the authentication exchange.
+
+`configureAuthentication` retains the caller's existing session identity.
+Credential provisioning, multi-verifier selection, TLS, database admission and
+role connection accounting remain separate. RAMSQL's current configuration
+continues to use its existing single-verifier bootstrap path.
+
 ## Scope
 
 | Program | Implemented | Not covered |

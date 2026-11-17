@@ -898,7 +898,7 @@ const scram_verifier = "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$WG5d8oPm3Otc
 const scram_nonce = "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
 const scram_first = "n,,n=user,r=rOprNGfwEbeRWgbNEkqO";
 const scram_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
-fn authStartup(s: *Session, db: *DB, username: []const u8) !void {
+fn authStartup(s: anytype, db: anytype, username: []const u8) !void {
     var p = Packet.init(0);
     p.len = 4;
     p.number32(196608);
@@ -915,7 +915,7 @@ fn authStartup(s: *Session, db: *DB, username: []const u8) !void {
     try check((try frames.next()) == null);
     try check(s.authentication.?.state == .initial);
 }
-fn authFirst(s: *Session, db: *DB) !void {
+fn authFirst(s: anytype, db: anytype) !void {
     var p = Packet.init('p');
     p.string(scram.mechanism);
     p.number32(scram_first.len);
@@ -1121,6 +1121,64 @@ fn commandTag(bytes: []const u8, wanted: []const u8) !void {
         return;
     };
     return error.MissingCommandTag;
+}
+
+/// SCRAM proof and committed catalog policy both precede readiness. The
+/// authenticated role stays connection-local across other sessions' statements.
+fn roleAuthenticationContracts() !void {
+    var store: Store = .{};
+    var admin: Store.Connection = .{ .store = &store, .id = 1 };
+    var result: Raw.Result = .{};
+    const username = "wire_reader";
+    // The SASL name in the known vector differs from the startup name.
+    // PostgreSQL identifies the login by the StartupMessage user.
+    const verifier = try scram.Verifier.parse(username, scram_verifier);
+    try admin.execute("CREATE TABLE auth_rows (id INT PRIMARY KEY)", &result);
+    try admin.execute("INSERT INTO auth_rows VALUES (7)", &result);
+    const denied = [_][]const u8{
+        "BEGIN",
+        "ROLLBACK",
+        "ALTER ROLE wire_reader LOGIN CONNECTION LIMIT 0",
+        "ALTER ROLE wire_reader CONNECTION LIMIT -1",
+    };
+    var final = Packet.init('p');
+    final.append(scram_final);
+    for (denied, 0..) |setup, index| {
+        try admin.execute(setup, &result);
+        if (index == 0) try admin.execute("CREATE ROLE wire_reader LOGIN", &result);
+        if (index == 1) try admin.execute("CREATE ROLE wire_reader NOLOGIN", &result);
+        var conn: Store.Connection = .{ .store = &store, .id = 2 };
+        defer conn.disconnect();
+        var session: StoreSession = .{};
+        try session.configureRoleAuthentication(&verifier, scram_nonce);
+        try authStartup(&session, &conn, username);
+        try authFirst(&session, &conn);
+        const reply = try storeSend(&session, &conn, &final);
+        const bytes = store_output[0..reply.written];
+        if (index != denied.len - 1) {
+            try check(reply.close and session.authentication.?.state == .failed);
+            try state(bytes, "28P01");
+            try tags(bytes, "E");
+            continue;
+        }
+        try check(!reply.close and session.authentication.?.state == .complete);
+        try tags(bytes, "RRSSSSSSSSSKZ");
+        try check(!conn.detachedReadEligible());
+        try tags(try storeQuery(&session, &conn, "SELECT current_user,session_user"), "TDCZ");
+        try check(equal(session.result.rows[0].cells[0].text.slice(), username));
+        try check(equal(session.result.rows[0].cells[1].text.slice(), username));
+        try state(try storeQuery(&session, &conn, "SELECT id FROM auth_rows"), "42501");
+        try state(try storeQuery(&session, &conn, "SET ROLE ramsql"), "42501");
+        try admin.execute("GRANT SELECT ON auth_rows TO wire_reader", &result);
+        try tags(try storeQuery(&session, &conn, "SELECT id FROM auth_rows"), "TDCZ");
+        try check(session.result.rows[0].cells[0].integer == 7);
+        try state(try storeQuery(&session, &conn, "INSERT INTO auth_rows VALUES (8)"), "42501");
+        try admin.execute("REVOKE SELECT ON auth_rows FROM wire_reader", &result);
+        try state(try storeQuery(&session, &conn, "SELECT id FROM auth_rows"), "42501");
+        try tags(try storeQuery(&session, &conn, "SELECT current_user"), "TDCZ");
+        try check(equal(session.result.rows[0].cells[0].text.slice(), username));
+    }
+    admin.disconnect();
 }
 
 // READ COMMITTED wire behavior over the real store: BackendKeyData,
@@ -1343,6 +1401,7 @@ pub fn main(init: std.process.Init) !void {
     try initializedProtocolPrefixes();
     try detachedCandidates();
     try oversizedFrames();
+    try roleAuthenticationContracts();
     try storeContracts();
     try returningOnce();
     try characterDescriptions();
