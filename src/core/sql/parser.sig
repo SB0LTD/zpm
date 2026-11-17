@@ -62,11 +62,72 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// Parses exactly one statement. The pool is reset first.
         pub fn parse(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Ast.Statement {
+            var self = try initParser(source, pool, mode);
+            return self.statement();
+        }
+
+        pub const Explain = struct { analyze: bool = false };
+        pub const Parsed = struct { command: Ast.Statement, explain: ?Explain = null };
+
+        /// EXPLAIN uses the normal statement parser and original source spans.
+        /// Only first-level PostgreSQL statements allow this wrapper.
+        pub fn parseTop(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Parsed {
+            var self = try initParser(source, pool, mode);
+            if (mode != .standard or !try self.takeRaw("explain")) return .{ .command = try self.statement() };
+            const options = try self.explainOptions();
+            if (!self.isWord("SELECT")) return error.UnsupportedStatement;
+            const command = try self.statement();
+            const root = switch (command) {
+                .select, .query => |index| index,
+                else => return error.UnsupportedStatement,
+            };
+            const selected = &pool.queries[root];
+            if (pool.query_len != 1 or selected.item_count > 1 or selected.cte_count != 0 or selected.set_op != .none or
+                selected.distinct or selected.distinct_on_count != 0 or selected.group_count != 0 or
+                selected.grouping_sets != none or selected.rollup or selected.having != none or selected.window_defs != none)
+                return error.UnsupportedStatement;
+            return .{ .command = command, .explain = options };
+        }
+
+        fn initParser(source: []const u8, pool: *Ast.Pool, mode: Mode) Error!Self {
             pool.reset();
             if (mode == .legacy_alpha) try alpha.Recognizer(config).check(source);
             var self = Self{ .tokens = .{ .source = source, .text_limit = config.text_bytes }, .pool = pool, .source = source, .mode = mode };
             try self.advance();
-            return self.statement();
+            return self;
+        }
+
+        fn explainOptions(self: *Self) Error!Explain {
+            if (!try self.takeSymbol(.lparen)) return error.UnsupportedStatement;
+            var options: Explain = .{};
+            var have_format = false;
+            var have_analyze = false;
+            while (true) {
+                if (try self.takeRaw("format")) {
+                    if (have_format or self.current.kind != .word) return error.Syntax;
+                    if (!try self.takeRaw("json")) return error.UnsupportedStatement;
+                    have_format = true;
+                } else if (try self.takeRaw("analyze") or try self.takeRaw("analyse")) {
+                    if (have_analyze) return error.Syntax;
+                    have_analyze = true;
+                    options.analyze = true;
+                    if (try self.takeRaw("false") or try self.takeRaw("off") or try self.takeExplainDigit("0")) {
+                        options.analyze = false;
+                    } else if (!try self.takeRaw("true") and !try self.takeRaw("on")) {
+                        _ = try self.takeExplainDigit("1");
+                    }
+                } else if (self.current.kind == .word) return error.UnsupportedStatement else return error.Syntax;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rparen);
+            if (!have_format) return error.UnsupportedStatement;
+            return options;
+        }
+
+        fn takeExplainDigit(self: *Self, comptime digit: []const u8) Error!bool {
+            if (self.current.kind != .integer or !types.same(self.current.raw(self.source), digit)) return false;
+            try self.advance();
+            return true;
         }
 
         fn advance(self: *Self) Error!void {

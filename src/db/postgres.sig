@@ -1456,6 +1456,7 @@ pub fn Session(comptime DB: type) type {
                 .insert => "insert",
                 .update => "update",
                 .delete => "delete",
+                .explain => "EXPLAIN",
                 .create_table => "create",
                 .drop_table => "drop",
                 .create_sequence => "create_sequence",
