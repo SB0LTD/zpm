@@ -299,6 +299,7 @@ pub fn Store(comptime Raw: type) type {
     const has_engine_session = @hasDecl(Raw, "SessionState");
     const EngineSession = if (has_engine_session) Raw.SessionState else struct {};
     const NotificationType = if (has_engine_session) Raw.Notification else struct {};
+    const has_read_cache = @hasDecl(Raw, "ReadResultCache") and has_engine_session;
     return struct {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
@@ -310,6 +311,9 @@ pub fn Store(comptime Raw: type) type {
         };
 
         database: Raw = .{},
+        /// Optional typed cache bound to this database after recovery. Install
+        /// before dispatching readers and keep it alive until they have joined.
+        read_result_cache: if (has_read_cache) ?*Raw.ReadResultCache else ?*void = null,
         commit_ctx: ?*anyopaque = null,
         commit_fn: ?CommitFn = null,
         /// Change-record encode buffer shared by every commit (callers
@@ -601,11 +605,12 @@ pub fn Store(comptime Raw: type) type {
             pub fn detachedReadEligible(self:*const Connection) bool {
                 // Detached reads run as the bootstrap superuser: a session
                 // after SET ROLE keeps the serialized (privilege-checked) path.
-                if (comptime has_engine_session) {
-                    if (self.engine_session.values.role != 0 or self.engine_session.session_role != 10) return false;
-                }
-                return self.id!=0 and !self.failed and self.autocommit and !self.in_transaction and self.tx==null and
+                return self.detachedIdentity() and self.id!=0 and !self.failed and self.autocommit and !self.in_transaction and self.tx==null and
                     !self.pending.active and !self.running_statement and self.read_context==null;
+            }
+            fn detachedIdentity(self: *const Connection) bool {
+                if (comptime has_engine_session) return self.engine_session.values.role == 0 and self.engine_session.session_role == 10;
+                return true;
             }
             /// No global Raw.session installation or mutable zone lookup hook.
             /// A caller using named-zone operations must provide a read-safe
@@ -613,6 +618,17 @@ pub fn Store(comptime Raw: type) type {
             pub fn detachedReadSession(self:*const Connection,execution_control:*ExecutionControl,statement_us:?i64) Raw.SessionValues {
                 return .{.zone=self.settings.zone,.transaction_us=statement_us,.statement_us=statement_us,
                     .clock=self.store.wall_clock,.database=if(self.database_len==0) "postgres" else self.database_name[0..self.database_len],.control=execution_control};
+            }
+
+            fn detachedCacheProfile(self: *const Connection) bool {
+                const settings = &self.engine_session.values;
+                if (self.dialect != .postgres or
+                    self.store.max_query_work != 0 or self.settings.statement_timeout_ms != 0 or
+                    self.settings.lock_timeout_ms != 0 or self.settings.date_order != .mdy or
+                    !same(self.settings.timeZone(), "UTC") or settings.isolation != .read_committed or
+                    settings.read_only or settings.deferrable or !same(settings.search_path.slice(), "\"$user\", public")) return false;
+                for (&settings.custom) |*entry| if (entry.used) return false;
+                return true;
             }
 
             /// Number of established savepoints (portal bookkeeping).
@@ -1380,12 +1396,15 @@ pub fn Store(comptime Raw: type) type {
                 if (self.id == 0) return error.InvalidConnection;
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
                 if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| {
-                    if(self.failed or self.in_transaction or self.tx!=null or !self.autocommit or self.pending.active or
+                    if(!self.detachedIdentity() or self.failed or self.in_transaction or self.tx!=null or !self.autocommit or self.pending.active or
                         context.database==null or context.database.?!=&self.store.database or !same(source,context.source)) return error.InvalidParameterValue;
                     // Metadata-only Describe invalidates executable preparation.
                     // Rebind under the same caller-held read snapshot before run.
                     if(context.prepared==null and context.preparation_error==null)
                         try context.prepare(&self.store.database,source,context.snapshot);
+                    if (comptime has_read_cache) if (self.store.read_result_cache) |cache| {
+                        if (self.detachedCacheProfile()) return context.runCached(result, cache);
+                    };
                     return context.run(result);
                 };
                 if (self.pending.active) return self.resumeStatement(source, result);
