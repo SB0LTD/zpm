@@ -177,6 +177,66 @@ fn startup(s: *Session, db: *DB) !void {
     try check(ready.consumed == p.len and s.startup and !ready.close);
     try tags(output[0..ready.written], "RSSSSSSSKZ");
 }
+
+fn startupFraming() !void {
+    var session: Session = .{};
+    var db: DB = .{};
+    const requests = "\x00\x00\x00\x08\x04\xd2\x16\x2f" ++ // SSL
+        "\x00\x00\x00\x08\x04\xd2\x16\x30" ++ // GSSENC
+        "\x00\x00\x00\x10\x04\xd2\x16\x2e\x00\x00\x00\x07\x00\x00\x00\x09" ++ // Cancel
+        "coalesced";
+    for ([_]usize{ 0, 8, 16 }, [_]usize{ 8, 8, 16 }) |offset, length| {
+        const bytes = requests[offset..];
+        for (0..length) |used| {
+            const partial = pg.classifyStartup(bytes[0..used]);
+            try check(partial == .incomplete and partial.incomplete == (if (used < 4) @as(usize, 4) else if (used < 8) @as(usize, 8) else length));
+            const reply = try session.handle(&db, bytes[0..used], &output);
+            try check(reply.consumed == 0 and reply.written == 0 and !reply.close and !session.startup);
+        }
+        const full = pg.classifyStartup(bytes);
+        if (offset == 0) try check(full == .ssl_request);
+        if (offset == 8) try check(full == .gss_request);
+        const reply = try session.handle(&db, bytes, &output);
+        try check(reply.consumed == length and !session.startup);
+        if (offset < 16) {
+            try check(!reply.close and reply.written == 1 and output[0] == 'N' and reply.cancel == null);
+        } else {
+            try check(full == .cancel and full.cancel.pid == 7 and full.cancel.secret == 9);
+            try check(reply.close and reply.written == 0 and reply.cancel != null);
+            try check(reply.cancel.?.pid == 7 and reply.cancel.?.secret == 9);
+        }
+    }
+
+    const invalid = [_]struct { bytes: []const u8, consumed: usize, code: []const u8 }{
+        .{ .bytes = "\x00\x00\x00\x03", .consumed = 4, .code = "08P01" },
+        .{ .bytes = "\x00\x01\x00\x00", .consumed = 4, .code = "08P01" },
+        .{ .bytes = "\x00\x00\x00\x07\x00\x00\x00", .consumed = 7, .code = "08P01" },
+        .{ .bytes = "\x00\x00\x00\x09\x04\xd2\x16\x2f\x00", .consumed = 9, .code = "08P01" },
+        .{ .bytes = "\x00\x00\x00\x09\x04\xd2\x16\x30\x00", .consumed = 9, .code = "08P01" },
+        .{ .bytes = "\x00\x00\x00\x08\x04\xd2\x16\x2e", .consumed = 8, .code = "0A000" },
+    };
+    for (invalid) |case| {
+        const reply = try session.handle(&db, case.bytes, &output);
+        try check(reply.consumed == case.consumed and reply.close and reply.cancel == null and !session.startup);
+        try state(output[0..reply.written], case.code);
+    }
+
+    var startup_packet = Packet.init(0);
+    startup_packet.len = 4;
+    startup_packet.number32(196608);
+    startup_packet.string("user");
+    startup_packet.string("ramsql");
+    startup_packet.byte(0);
+    const length = startup_packet.len;
+    put32(startup_packet.bytes[0..4], @intCast(length));
+    startup_packet.append("coalesced");
+    const bytes = startup_packet.bytes[0..startup_packet.len];
+    const frame = pg.classifyStartup(bytes);
+    try check(frame == .startup and equal(frame.startup, bytes[8..length]));
+    const reply = try session.handle(&db, bytes, &output);
+    try check(reply.consumed == length and !reply.close and session.startup);
+    try tags(output[0..reply.written], "RSSSSSSSKZ");
+}
 fn parse(s: *Session, db: *DB, name: []const u8, source: []const u8, oids: []const u32) ![]const u8 {
     var p = Packet.init('P');
     p.string(name);
@@ -1398,6 +1458,7 @@ fn initializedProtocolPrefixes() !void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    try startupFraming();
     try initializedProtocolPrefixes();
     try detachedCandidates();
     try oversizedFrames();
