@@ -243,6 +243,53 @@ fn countingSend(s: *CountingSession, db: *Counting, p: *Packet) ![]const u8 {
     packets += 1;
     return counting_output[0..reply.written];
 }
+/// Reuse one Describe buffer across different result shapes without executing SQL.
+fn characterDescriptions() !void {
+    var db: Counting = .{};
+    var session: CountingSession = .{};
+    var start = Packet.init(0);
+    start.len = 4;
+    start.number32(196608);
+    start.string("user");
+    start.string("ramsql");
+    start.byte(0);
+    put32(start.bytes[0..4], @intCast(start.len));
+    _ = try session.handle(&db, start.bytes[0..start.len], &counting_output);
+
+    const cases = [_]struct { source: []const u8, parameter: bool, oids: []const u32, modifiers: []const i32 }{
+        .{ .source = "SELECT $1::varchar(2)", .parameter = true, .oids = &.{1043}, .modifiers = &.{6} },
+        .{ .source = "SELECT 1 AS id,'x'::varchar(3) AS v", .parameter = false, .oids = &.{23, 1043}, .modifiers = &.{-1, 7} },
+    };
+    for (cases) |case| {
+        var parse_packet = Packet.init('P');
+        parse_packet.string("");
+        parse_packet.string(case.source);
+        parse_packet.number16(if (case.parameter) 1 else 0);
+        if (case.parameter) parse_packet.number32(1043);
+        try tags(try countingSend(&session, &db, &parse_packet), "1");
+
+        var describe_packet = Packet.init('D');
+        describe_packet.byte('S');
+        describe_packet.string("");
+        const bytes = try countingSend(&session, &db, &describe_packet);
+        try tags(bytes, "tT");
+        var frames: Frames = .{ .bytes = bytes };
+        _ = try frames.next();
+        const row = (try frames.next()).?;
+        try check(row.body.len >= 2 and row.body[0] == 0 and row.body[1] == case.oids.len);
+        var at: usize = 2;
+        for (case.oids, case.modifiers) |oid, modifier| {
+            while (at < row.body.len and row.body[at] != 0) at += 1;
+            at += 1;
+            try check(at + 18 <= row.body.len);
+            try check(u32be(row.body[at + 6 ..][0..4]) == oid);
+            try check(@as(i32, @bitCast(u32be(row.body[at + 12 ..][0..4]))) == modifier);
+            at += 18;
+        }
+        try check(at == row.body.len and db.executions == 0);
+    }
+}
+
 fn commandText(bytes: []const u8, wanted: []const u8) !void {
     var frames: Frames = .{ .bytes = bytes };
     while (try frames.next()) |f| if (f.tag == 'C') {
@@ -1298,6 +1345,7 @@ pub fn main(init: std.process.Init) !void {
     try oversizedFrames();
     try storeContracts();
     try returningOnce();
+    try characterDescriptions();
     try normal();
     try extended();
     try parameterLexicalRegions();

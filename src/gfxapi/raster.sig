@@ -871,25 +871,31 @@ pub const STAGE_PARAMS = VERTEX_PARAMS + 2;
 pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     if (pipelineWhyNot(d.pipe.shaders)) |why| return why;
     if (d.topology != .triangles and d.topology != .strip and d.topology != .fan) return "points or lines";
-    if (d.depth) |z| {
+    // (the depth-stencil target: the depth image, or with the depth test
+    // off the stencil image alone)
+    if (d.depth orelse d.stencil) |z| {
         if (!z.layout.block or z.samples != 1) return "a depth image the 3D engine cannot draw into (not block linear: a depth texture, or multisampled)";
         if (z.top_down != d.color.top_down) return "a depth image flipped against its colour target";
         if (z.width < d.color.width or z.height < d.color.height) return "a depth image smaller than its colour target";
     } else if (d.depth_test) return "a depth test with no depth image";
     if (d.stencil) |sten| {
-        if (d.depth == null or sten != d.depth.?) return "a stencil image apart from the depth image";
+        // (a stencil image apart from the depth image: the engine's
+        // stencil plane is any S8 plane, its size the depth's)
+        if (d.depth) |z| if (sten != z and !(sten.depth_float and z.depth_float and sten.width == z.width and sten.height == z.height and sten.top_down == z.top_down))
+            return "a stencil image apart from the depth image (not both float of one size)";
+        if (d.depth == null and !sten.depth_float) return "a stencil test with no float depth image (its stencil plane)";
     }
     if (d.index != null and (d.index_size == 0 or d.index_offset % d.index_size != 0)) return "an element array offset not on its indices' size";
     if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
     for (d.targets[1..]) |tt| {
         const t = tt orelse continue;
-        if (!t.img.drawable()) return "a colour target the engine does not draw into";
+        if (!t.img.gpuDrawable()) return "a colour target the engine does not draw into";
         if (t.img.width != d.color.width or t.img.height != d.color.height or t.img.top_down != d.color.top_down or t.img.samples != 1) return "colour targets of different sizes or orientations";
     }
     if (d.query != null) return "an occlusion query";
     if (d.alpha_to_coverage or d.sample_mask & 1 == 0) return "alpha to coverage or a sample mask";
     if (d.bias_factor != 0 or d.bias_units != 0) return "depth bias";
-    if (!d.color.drawable()) return "a target the engine does not draw into";
+    if (!d.color.gpuDrawable()) return "a target the engine does not draw into";
     if (d.blend) |b| {
         if (b.gl[0] == 0xffff) return "a blend not given as GL's factors";
     }
@@ -1819,17 +1825,29 @@ const R_QUERY = 73; // an occlusion query on: a pixel written sets its word
 const R_SAMPLE_MASK = 74; // multisampled: the samples drawn, alpha to coverage on
 const R_A2C = 75;
 /// the depth image and the stencil image block linear (the 3D engine's
-/// layout: engine.Image.layout): 0 pitch linear, else 1 + log2 of a
-/// block's GOBs (32-bit texels: Turing2D's swizzle)
+/// layout: engine.Image.layout): 0 pitch linear, else colourBlWord's 1 +
+/// log2 of a block's GOBs, the swizzle from bit 8 (a float depth image's
+/// S8 plane: Blackwell8)
 const R_D_BL = 76;
 const R_S_BL = 77;
 /// targets 1 .. MAX_TARGETS - 1: each target 0's words (TF) in turn
 const R_TGT = 78;
-const TGT_WORDS = 9;
-pub const RASTER_PARAMS = R_TGT + (MAX_TARGETS - 1) * TGT_WORDS;
+const TGT_WORDS = 10;
+/// target 0's layout word (TF.bl: colourBlWord), after the other targets'
+const R_C_BL = R_TGT + (MAX_TARGETS - 1) * TGT_WORDS;
+/// a float depth image (engine.Image.depth_float): its words the depths'
+/// float bits (depthWord's float form), compared and written whole; else
+/// 24 bits, stencil in the top byte
+const R_D_FLOAT = R_C_BL + 1;
+/// the stencil image a byte a pixel (a float depth image's S8 plane),
+/// from byte R_S_BASE of its binding; else stencil in each word's top
+/// byte
+const R_S_BYTE = R_C_BL + 2;
+const R_S_BASE = R_C_BL + 3;
+pub const RASTER_PARAMS = R_C_BL + 4;
 
 /// A colour target's words.
-const TF = enum(u8) { stride, topdown, height, bpp, shift_r, shift_b, keep, no_alpha, blend };
+const TF = enum(u8) { stride, topdown, height, bpp, shift_r, shift_b, keep, no_alpha, blend, bl };
 
 fn tw(t: usize, fld: TF) u16 {
     if (t == 0) return switch (fld) {
@@ -1842,6 +1860,7 @@ fn tw(t: usize, fld: TF) u16 {
         .keep => R_KEEP,
         .no_alpha => R_NO_ALPHA,
         .blend => R_BLEND,
+        .bl => R_C_BL,
     };
     return @intCast(R_TGT + (t - 1) * TGT_WORDS + @intFromEnum(fld));
 }
@@ -1864,16 +1883,18 @@ fn rowOf(k: *kir.Kernel, y: V, td: u16, h: u16) V {
 }
 
 /// A depth or stencil image's word of pixel (x, y) (GL's row, flipped for
-/// a top-down image), in bytes: pitch linear (`stride` words a row), or
+/// a top-down image), in bytes: pitch linear (`stride` bytes a row), or
 /// block linear where the `bl` word says (the 3D engine's layout, which a
-/// depth target must have there).
-fn dsOffset(k: *kir.Kernel, y: V, x: V, td: u16, h: u16, stride: u16, bl: u16) V {
+/// depth target must have there). `byte`: a byte a pixel (the S8 plane),
+/// else a word.
+fn dsOffset(k: *kir.Kernel, y: V, x: V, td: u16, h: u16, stride: u16, bl: u16, byte: V) V {
     const row = rowOf(k, y, td, h);
-    const linear = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(row), r(k.param(.u32, stride)), r(x))), u(2));
+    const xb = if (byte == .none) k.op2(.shl, .u32, r(x), u(2)) else k.sel(.u32, r(byte), r(x), r(k.op2(.shl, .u32, r(x), u(2))));
+    const pitch = k.param(.u32, stride);
+    const linear = k.op3(.imad, .u32, r(row), r(pitch), r(xb));
     const blw = k.param(.u32, bl);
-    const pitch = k.op2(.shl, .u32, r(k.param(.u32, stride)), u(2));
-    const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(blw), u(1))), u(1));
-    const block = blocklinear.address(k, r(pitch), r(gobs), u(0), r(k.op2(.shl, .u32, r(x), u(2))), r(row));
+    const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(k.op2(.@"and", .u32, r(blw), u(0xff))), u(1))), u(1));
+    const block = blocklinear.address(k, r(pitch), r(gobs), r(k.op2(.shr, .u32, r(blw), u(8))), r(xb), r(row));
     return k.sel(.u32, r(k.cmp(.u32, .ne, r(blw), u(0))), r(block), r(linear));
 }
 
@@ -1939,9 +1960,15 @@ fn bitOn(k: *kir.Kernel, w: V, bit: u32) V {
     return k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(w), u(bit))), u(0));
 }
 
-/// A depth (0..1, clamped) as the 24-bit value stored.
-fn depthWord(k: *kir.Kernel, z: V) V {
-    return k.cvt(.f32, .u32, .rne, r(k.op2(.fmul, .f32, r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(z), f(0))), f(1))), f(16777215.0))));
+/// A depth (0..1, clamped) as the value stored: 24 bits, or with
+/// `dfloat` (R_D_FLOAT) the clamped float's bits, +0 for -0 (the 3D
+/// engine's ZF32: nvidia emu3d.depthBits).
+fn depthWord(k: *kir.Kernel, z: V, dfloat: V) V {
+    const c = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(z), f(0))), f(1));
+    const d24 = k.cvt(.f32, .u32, .rne, r(k.op2(.fmul, .f32, r(c), f(16777215.0))));
+    const bits = k.mov(.u32, r(c));
+    const pos = k.sel(.u32, r(k.cmp(.u32, .eq, r(bits), u(0x8000_0000))), u(0), r(bits));
+    return k.sel(.u32, r(dfloat), r(pos), r(d24));
 }
 
 /// The depth test of dz against `depth` (R_DFUNC); passes where the test
@@ -2082,12 +2109,28 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
         bpp[tt] = k.param(.u32, tw(tt, .bpp));
         wide[tt] = k.cmp(.u32, .eq, r(bpp[tt]), u(4));
         pair[tt] = k.cmp(.u32, .eq, r(bpp[tt]), u(2));
-        c_off[tt] = k.op3(.imad, .u32, r(rowOf(&k, py, tw(tt, .topdown), tw(tt, .height))), r(k.param(.u32, tw(tt, .stride))), r(k.op2(.imul, .u32, r(pxs), r(bpp[tt]))));
+        // (rows of bytes, or block linear where the target's layout word
+        // says: colourBlWord, the RTX's GOBs for its texel size)
+        const row = rowOf(&k, py, tw(tt, .topdown), tw(tt, .height));
+        const xb = k.op2(.imul, .u32, r(pxs), r(bpp[tt]));
+        const stride = k.param(.u32, tw(tt, .stride));
+        const linear = k.op3(.imad, .u32, r(row), r(stride), r(xb));
+        const blw = k.param(.u32, tw(tt, .bl));
+        const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(k.op2(.@"and", .u32, r(blw), u(0xff))), u(1))), u(1));
+        const block = blocklinear.address(&k, r(stride), r(gobs), r(k.op2(.shr, .u32, r(blw), u(8))), r(xb), r(row));
+        c_off[tt] = k.sel(.u32, r(k.cmp(.u32, .ne, r(blw), u(0))), r(block), r(linear));
     }
     const d_on = k.cmp(.u32, .ne, r(k.param(.u32, R_DEPTH)), u(0));
-    const d_off = dsOffset(&k, py, pxs, R_D_TOPDOWN, R_D_HEIGHT, R_D_STRIDE, R_D_BL);
+    // (a float depth image: whole words of float bits; else 24 bits, the
+    // top byte a packed image's stencil)
+    const dfloat = k.cmp(.u32, .ne, r(k.param(.u32, R_D_FLOAT)), u(0));
+    const dmask = k.sel(.u32, r(dfloat), u(0xffff_ffff), u(0x00ff_ffff));
+    const d_off = dsOffset(&k, py, pxs, R_D_TOPDOWN, R_D_HEIGHT, R_D_STRIDE, R_D_BL, .none);
     const s_on = if (stencil_enabled) k.cmp(.u32, .ne, r(k.param(.u32, R_STENCIL)), u(0)) else .none;
-    const s_off = if (stencil_enabled) dsOffset(&k, py, pxs, R_S_TOPDOWN, R_S_HEIGHT, R_S_STRIDE, R_S_BL) else .none;
+    // (the stencil a byte a pixel: a float depth image's S8 plane, from
+    // its first byte in the binding; single-sampled only)
+    const s_byte = if (stencil_enabled and !ms) k.cmp(.u32, .ne, r(k.param(.u32, R_S_BYTE)), u(0)) else .none;
+    const s_off = if (stencil_enabled) k.op2(.iadd, .u32, r(dsOffset(&k, py, pxs, R_S_TOPDOWN, R_S_HEIGHT, R_S_STRIDE, R_S_BL, s_byte)), r(k.param(.u32, R_S_BASE))) else .none;
     const shared_ds = if (stencil_enabled) k.cmp(.u32, .ne, r(k.param(.u32, R_DS_SHARED)), u(0)) else .none;
     // Multisampled, the samples' words live in shared memory (each
     // thread its own): a slot a target, the depth word, the stencil word,
@@ -2139,7 +2182,11 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
         k.endif();
         if (stencil_enabled) {
             k.ifp(r(s_on));
+            k.ifp(r(s_byte));
+            k.setAux(old_s, .ld, r(s_off), no, no, @bitCast(kir.global(b_s, 8)));
+            k.els();
             k.setAux(old_s, .ld, r(s_off), no, no, @bitCast(kir.global(b_s, 32)));
+            k.endif();
             k.endif();
         }
     } else {
@@ -2195,10 +2242,10 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
             for (0..4) |c| k.set(dst[tt][c], .mov, r(val[c]), no, no);
         }
         depth = k.reg(.u32);
-        k.set(depth, .@"and", r(old_d), u(0x00ff_ffff), no);
+        k.set(depth, .@"and", r(old_d), r(dmask), no);
         if (stencil_enabled) {
             stencil = k.reg(.u32);
-            k.set(stencil, .shr, r(old_s), u(24), no);
+            k.set(stencil, .sel, r(old_s), r(k.op2(.shr, .u32, r(old_s), u(24))), r(s_byte));
         }
     }
     // bit 0: a sample passed (colour, depth), bit 1: stencil written
@@ -2336,7 +2383,7 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
                     var dpass: V = .none;
                     var spass: V = .none;
                     if (!late) {
-                        dz = depthWord(&k, z);
+                        dz = depthWord(&k, z, dfloat);
                         dpass = depthPass(&k, d_on, dz, depth);
                         pass = k.op2(.pand, .pred, r(pass), r(dpass));
                         if (stencil_enabled) {
@@ -2359,7 +2406,7 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
                         {
                             if (late) {
                                 // gl_FragDepth: the tests now
-                                dz = depthWord(&k, if (io.depth == .none) z else io.depth);
+                                dz = depthWord(&k, if (io.depth == .none) z else io.depth, dfloat);
                                 dpass = depthPass(&k, d_on, dz, depth);
                                 pass = dpass;
                                 if (stencil_enabled) {
@@ -2406,7 +2453,7 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
                         var ok = k.op2(.pand, .pred, r(bitOn(&k, cmask, @as(u32, 1) << @intCast(sm))), r(zRange(&k, zs, zmin, zmax, clip_ok)));
                         if (!late) {
                             const dword = k.load(.u32, sOff(ms_base, SLOT, dslot, smu), r(lane4));
-                            var pass = k.op2(.pand, .pred, r(ok), r(depthPass(&k, d_on, depthWord(&k, zs), k.op2(.@"and", .u32, r(dword), u(0x00ff_ffff)))));
+                            var pass = k.op2(.pand, .pred, r(ok), r(depthPass(&k, d_on, depthWord(&k, zs, dfloat), k.op2(.@"and", .u32, r(dword), r(dmask)))));
                             if (stencil_enabled) {
                                 const sword = k.load(.u32, sOff(ms_base, SLOT, sslot, smu), r(lane4));
                                 pass = k.op2(.pand, .pred, r(pass), r(stencilPass(&k, s_on, front, k.op2(.shr, .u32, r(sword), u(24)))));
@@ -2459,8 +2506,8 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
                                 k.ifp(r(k.op2(.pand, .pred, r(bit), r(zRange(&k, zs, zmin2, zmax2, clip_ok)))));
                                 {
                                     const dword = k.load(.u32, sOff(ms_base, SLOT, dslot, 0), r(sa));
-                                    const dz = depthWord(&k, if (late) zf else zs);
-                                    const dpass = depthPass(&k, d_on, dz, k.op2(.@"and", .u32, r(dword), u(0x00ff_ffff)));
+                                    const dz = depthWord(&k, if (late) zf else zs, dfloat);
+                                    const dpass = depthPass(&k, d_on, dz, k.op2(.@"and", .u32, r(dword), r(dmask)));
                                     var pass = dpass;
                                     if (stencil_enabled) {
                                         const sword = k.load(.u32, sOff(ms_base, SLOT, sslot, 0), r(sa));
@@ -2484,7 +2531,7 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
                                     }
                                     k.set(touched, .@"or", r(touched), u(1), no);
                                     k.ifp(r(dwrite));
-                                    k.store(.u32, sOff(ms_base, SLOT, dslot, 0), r(sa), r(k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(dword), u(0xff00_0000))), r(dz))));
+                                    k.store(.u32, sOff(ms_base, SLOT, dslot, 0), r(sa), r(k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(dword), r(k.op1(.not, .u32, r(dmask))))), r(dz))));
                                     k.endif();
                                     k.endif();
                                 }
@@ -2535,7 +2582,7 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
         if (!stencil_enabled) {
             k.ifp(r(dwrite));
             if (!ms) {
-                k.store(.u32, kir.global(b_d, 32), r(d_off), r(k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(old_d), u(0xff000000))), r(depth))));
+                k.store(.u32, kir.global(b_d, 32), r(d_off), r(k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(old_d), r(k.op1(.not, .u32, r(dmask))))), r(depth))));
             } else for (0..S) |sm| {
                 const smu: u32 = @intCast(sm);
                 k.store(.u32, memAt(b_d, 4 * smu), r(d_off), r(k.load(.u32, sOff(ms_base, SLOT, dslot, smu), r(lane4))));
@@ -2553,8 +2600,8 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
         const stencil_written = k.op2(.pand, .pred, r(s_on), r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(touched), u(2))), u(0))));
         k.ifp(r(k.op2(.pand, .pred, r(inside), r(k.op2(.por, .pred, r(depth_written), r(k.op2(.pand, .pred, r(shared_ds), r(stencil_written))))))));
         if (!ms) {
-            const low_depth = k.sel(.u32, r(depth_written), r(depth), r(k.op2(.@"and", .u32, r(old_d), u(0x00ffffff))));
-            const high_stencil = k.sel(.u32, r(shared_ds), r(k.op2(.shl, .u32, r(stencil), u(24))), r(k.op2(.@"and", .u32, r(old_d), u(0xff000000))));
+            const low_depth = k.sel(.u32, r(depth_written), r(depth), r(k.op2(.@"and", .u32, r(old_d), r(dmask))));
+            const high_stencil = k.sel(.u32, r(shared_ds), r(k.op2(.shl, .u32, r(stencil), u(24))), r(k.op2(.@"and", .u32, r(old_d), r(k.op1(.not, .u32, r(dmask))))));
             k.store(.u32, kir.global(b_d, 32), r(d_off), r(k.op2(.@"or", .u32, r(low_depth), r(high_stencil))));
         } else for (0..S) |sm| {
             // (the depth word's slot holds its stencil bits as they were;
@@ -2562,13 +2609,17 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
             const smu: u32 = @intCast(sm);
             const dword = k.load(.u32, sOff(ms_base, SLOT, dslot, smu), r(lane4));
             const sword = k.load(.u32, sOff(ms_base, SLOT, sslot, smu), r(lane4));
-            const both = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(dword), u(0x00ff_ffff))), r(k.op2(.@"and", .u32, r(sword), u(0xff00_0000))));
+            const both = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(dword), r(dmask))), r(k.op2(.@"and", .u32, r(sword), u(0xff00_0000))));
             k.store(.u32, memAt(b_d, 4 * smu), r(d_off), r(k.sel(.u32, r(shared_ds), r(both), r(dword))));
         }
         k.endif();
         k.ifp(r(k.op2(.pand, .pred, r(inside), r(k.op2(.pand, .pred, r(stencil_written), r(k.op1(.pnot, .pred, r(shared_ds))))))));
         if (!ms) {
+            k.ifp(r(s_byte));
+            k.store(.u32, kir.global(b_s, 8), r(s_off), r(stencil));
+            k.els();
             k.store(.u32, kir.global(b_s, 32), r(s_off), r(k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(old_s), u(0x00ffffff))), r(k.op2(.shl, .u32, r(stencil), u(24))))));
+            k.endif();
         } else for (0..S) |sm| {
             const smu: u32 = @intCast(sm);
             k.store(.u32, memAt(b_s, 4 * smu), r(s_off), r(k.load(.u32, sOff(ms_base, SLOT, sslot, smu), r(lane4))));
@@ -2833,9 +2884,11 @@ pub fn vertexParams(d: *const Draw, out: []u32) []u32 {
     return out[0..n];
 }
 
-/// An image's R_D_BL / R_S_BL word.
-pub fn blWord(img: *const engine.Image) u32 {
-    return if (img.layout.block) @as(u32, img.layout.gobs_log2) + 1 else 0;
+/// A colour image's layout word (TF.bl): 0 rows of bytes; else 1 + log2 of
+/// a block's GOBs, and its GOBs' swizzle (blocklinear.Swizzle) from bit 8.
+pub fn colourBlWord(img: *const engine.Image) u32 {
+    if (!img.layout.block) return 0;
+    return (@as(u32, img.layout.gobs_log2) + 1) | @as(u32, @intFromEnum(img.layout.swizzle)) << 8;
 }
 
 /// Primitive restart's word (a byte offset after the draw's vertex
@@ -2933,16 +2986,18 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
     out[R_BPP] = d.color.format.bytes();
     out[R_C_TOPDOWN] = @intFromBool(d.color.top_down);
     out[R_C_HEIGHT] = d.color.height;
+    out[R_C_BL] = colourBlWord(d.color);
     out[R_SHIFT_R] = if (d.color.format == .bgra8) 16 else 0;
     out[R_SHIFT_B] = if (d.color.format == .bgra8) 0 else 16;
     out[R_KEEP] = d.keep;
     out[R_NO_ALPHA] = @intFromBool(d.color.no_alpha or d.color.format.channels() < 4);
     if (d.depth) |dp| {
         out[R_DEPTH] = @intFromBool(d.depth_test);
-        out[R_D_STRIDE] = dp.stride / 4;
+        out[R_D_STRIDE] = dp.stride;
         out[R_D_TOPDOWN] = @intFromBool(dp.top_down);
         out[R_D_HEIGHT] = dp.height;
-        out[R_D_BL] = blWord(dp);
+        out[R_D_BL] = colourBlWord(dp);
+        out[R_D_FLOAT] = @intFromBool(dp.depth_float);
     }
     out[R_DFUNC] = d.depth_func;
     out[R_DWRITE] = @intFromBool(d.depth_write);
@@ -2950,11 +3005,21 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
     out[R_ZMAX] = fbits(d.zmax);
     if (d.stencil) |stencil| {
         out[R_STENCIL] = 1;
-        out[R_S_STRIDE] = stencil.stride / 4;
         out[R_S_TOPDOWN] = @intFromBool(stencil.top_down);
         out[R_S_HEIGHT] = stencil.height;
-        out[R_S_BL] = blWord(stencil);
-        out[R_DS_SHARED] = @intFromBool(d.depth == stencil);
+        if (stencil.depth_float) {
+            // (its S8 plane: a byte a pixel in Blackwell's 8-bit GOBs)
+            std.debug.assert(stencil.samples == 1);
+            const l = stencil.s8Layout();
+            out[R_S_STRIDE] = stencil.s8Pitch();
+            out[R_S_BL] = (@as(u32, l.gobs_log2) + 1) | @as(u32, @intFromEnum(l.swizzle)) << 8;
+            out[R_S_BYTE] = 1;
+            out[R_S_BASE] = stencil.s8_at;
+        } else {
+            out[R_S_STRIDE] = stencil.stride;
+            out[R_S_BL] = colourBlWord(stencil);
+        }
+        out[R_DS_SHARED] = @intFromBool(d.depth == stencil and !stencil.depth_float);
         for ([_]Stencil{ d.stencil_front, d.stencil_back }, [_]usize{ R_S_FRONT, R_S_BACK }) |face, start| {
             const words = [_]u32{ face.func, face.reference, face.value_mask, face.write_mask, @backingInt(face.fail), @backingInt(face.depth_fail), @backingInt(face.pass) };
             @memcpy(out[start..][0..words.len], &words);
@@ -2977,6 +3042,7 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
         w[@intFromEnum(TF.keep)] = x.keep;
         w[@intFromEnum(TF.no_alpha)] = @intFromBool(img.no_alpha or img.format.channels() < 4);
         w[@intFromEnum(TF.blend)] = @intFromBool(x.blend and d.blend != null);
+        w[@intFromEnum(TF.bl)] = colourBlWord(img);
     }
     if (d.blend) |b| {
         out[R_BLEND] = 1;

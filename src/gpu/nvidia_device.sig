@@ -166,6 +166,9 @@ pub const Adapter = struct {
     zero: nv.Buffer = .{},
     /// Graphics dispatches run.
     draws: u64 = 0,
+    /// Why the last graphics dispatch was refused (gl3d.whyNot:
+    /// the 3D engine would lose the channel to it), or null.
+    refused: ?[]const u8 = null,
     lost: u64 = 0,
     last_error: ?anyerror = null,
 
@@ -193,6 +196,24 @@ pub const Adapter = struct {
             return .{ .gpu = raw.va, .cpu = raw.cpu, .bytes = raw.cpu.len, .handle = handleAt(a, i), .kind = .host };
         }
         return null;
+    }
+
+    /// Every buffer the adapter took given back (its run sets, its page of
+    /// zeros, its prebuilt programs, the buffers still allocated through
+    /// it), nothing waited for: for an adapter whose channel is gone (GSP-RM
+    /// recovered it), before another adapter over a fresh channel. The
+    /// adapter is empty after (`.{}`).
+    pub fn release(a: *Adapter) void {
+        const host = a.rawOf(true);
+        for (&a.sets) |*s| {
+            if (s.slots.cpu.len != 0) a.vram.free(s.slots);
+            for ([_]nv.Buffer{ s.pb, s.stamps, s.ends }) |b| if (b.cpu.len != 0) host.free(b);
+        }
+        for ([_]nv.Buffer{ a.timer_push, a.timer_value }) |b| if (b.cpu.len != 0) host.free(b);
+        if (a.zero.cpu.len != 0) a.vram.free(a.zero);
+        // (the programs' code, the indirect patch's too, are slots here)
+        for (&a.bufs) |*s| if (s.used) a.rawOf(s.on_host).free(s.raw);
+        a.* = .{};
     }
 
     const vtable = gpu.Device.VTable{
@@ -340,9 +361,16 @@ pub const Adapter = struct {
                 if (!a.caps.graphics) return error.Unsupported;
                 graphics += 1;
                 if (graphics > MAX_GRAPHICS) return error.Unsupported;
+                const draw = a.drawOf(s, i, d, g);
+                // (a draw the engine would refuse is never sent: a class
+                // error loses the whole channel, Xid 69)
+                if (gl3d.whyNot(&draw)) |why| {
+                    a.refused = why;
+                    return error.Unsupported;
+                }
                 try a.graphicsSlot(s, i, d, g);
                 p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
-                gl3d.emit(&p, &a.drawOf(s, i, d, g));
+                gl3d.emit(&p, &draw);
                 p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
                 p.invalidateShaderCaches();
                 a.barriers += 2;
@@ -484,6 +512,7 @@ pub const Adapter = struct {
             .zero_va = a.zero.va,
             .target = .{ .va = g.va, .width = g.width, .height = g.height, .pitch = g.stride },
             .format = formatOf(g.format),
+            .color_gobs = g.gobs_log2,
             .index = if (g.index) |ix| .{ .va = ix.va, .bytes = ix.bytes, .size = ix.size, .first = ix.first, .restart = ix.restart } else null,
             .more = more: {
                 var m: [7]?gl3d.More = @splat(null);
@@ -516,6 +545,8 @@ pub const Adapter = struct {
             .front_ccw = g.front_ccw,
             .depth = if (g.depth) |z| .{
                 .va = z.va,
+                .stencil_va = z.stencil_va,
+                .float = z.float,
                 .width = z.width,
                 .height = z.height,
                 .gobs_log2 = z.gobs_log2,

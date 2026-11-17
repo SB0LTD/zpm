@@ -103,7 +103,7 @@ pub fn Ssi(comptime config: types.Config) type {
             }
         }
 
-        fn drop(self: *Self, index: usize, committed: bool) void {
+        fn unlink(self: *Self, index: usize, committed: bool) void {
             for (&self.records) |*other| {
                 if (!other.used) continue;
                 if (other.in_edges.has(index)) {
@@ -115,6 +115,10 @@ pub fn Ssi(comptime config: types.Config) type {
                     if (committed) other.out_summary = true;
                 }
             }
+        }
+
+        fn drop(self: *Self, index: usize, committed: bool) void {
+            self.unlink(index, committed);
             self.records[index] = .{};
         }
 
@@ -132,7 +136,10 @@ pub fn Ssi(comptime config: types.Config) type {
             self.records[reader].out_edges.add(writer);
             self.records[writer].in_edges.add(reader);
             if (self.records[reader].pivot() or self.records[writer].pivot()) {
+                // This transaction can no longer commit, even after a
+                // savepoint rollback. Its edges cannot constrain survivors.
                 self.records[current].doomed = true;
+                self.unlink(current, false);
                 return error.SerializationFailure;
             }
         }
@@ -143,7 +150,7 @@ pub fn Ssi(comptime config: types.Config) type {
             if (record.doomed) return error.SerializationFailure;
             record.reads.add(table);
             for (&self.records, 0..) |*other, other_index| {
-                if (!other.used or other_index == index or !other.writes.has(table)) continue;
+                if (!other.used or other.doomed or other_index == index or !other.writes.has(table)) continue;
                 if (concurrent(record, other)) try self.edge(index, index, other_index);
             }
         }
@@ -154,7 +161,7 @@ pub fn Ssi(comptime config: types.Config) type {
             if (record.doomed) return error.SerializationFailure;
             record.writes.add(table);
             for (&self.records, 0..) |*other, other_index| {
-                if (!other.used or other_index == index or !other.reads.has(table)) continue;
+                if (!other.used or other.doomed or other_index == index or !other.reads.has(table)) continue;
                 if (concurrent(other, record)) try self.edge(index, other_index, index);
             }
         }

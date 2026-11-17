@@ -175,10 +175,25 @@ fn replay() !void {
     try expectOn(&replica, "SELECT column_default FROM information_schema.columns WHERE table_name = 'x'", "NULL");
 }
 
+/// Native PostgreSQL 16 reports data_type as character_data (OID 1043).
+fn characterMetadata() !void {
+    db = .{};
+    try run("CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(3))");
+    var result: DB.Result = .{};
+    try db.execute(
+        "SELECT column_name,data_type,character_maximum_length FROM information_schema.columns WHERE table_name='t' ORDER BY ordinal_position",
+        &result,
+    );
+    try check(result.column_count == 3);
+    try check(sql.typeOid(result.column_types[1]) == 1043 and result.column_typmods[1] == -1);
+    try check(std.mem.eql(u8, try render(&result), "id|integer|NULL;v|character varying|3"));
+}
+
 pub fn main(init: std.process.Init) !void {
     try types();
     try lifecycle();
     try replay();
+    try characterMetadata();
     var buffer: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-catalog\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d}}}\n", .{ assertions, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

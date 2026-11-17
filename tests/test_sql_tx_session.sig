@@ -388,9 +388,10 @@ fn isolation() !void {
     try expect(s1, "UPDATE tdd_a SET g = 2 WHERE id = 1", "");
     try db.savepoint(s2, "before");
     try fails(s2, "UPDATE tdd_a SET g = 2 WHERE id = 2", error.SerializationFailure);
+    // The survivor can commit even while the doomed transaction remains open.
     _ = try db.rollbackTo(s2, "before");
-    try commitFails(s2, error.SerializationFailure);
     try commit(s1);
+    try commitFails(s2, error.SerializationFailure);
     try check(db.sessionUsage().serializable_records == 0);
     // Disjoint tables: no rw-conflict, both commit.
     const s3 = try db.begin();
