@@ -2382,9 +2382,10 @@ pub fn Database(comptime config: Config) type {
             if (self.pendingTypeName(namespace, name.slice(), snap)) |other| return self.objectPark(slot, other);
             if (self.domainNameOccupied(namespace, name.slice(), latest)) return error.DuplicateObject;
             var domain: O.Object = .{ .kind = .domain, .target = namespace, .owner = owner, .name = name, .domain = create.spec };
-            const limit = @min(@as(usize, config.name_bytes), O.text_capacity);
+            const limit: usize = @min(config.name_bytes, O.text_capacity);
             var found = false;
-            for (1..limit + 1) |prefix| {
+            var prefix: usize = 1;
+            while (prefix <= limit) : (prefix += 1) {
                 const length = @min(@as(usize, name.len), limit - prefix);
                 @memset(domain.text[0..prefix], '_');
                 @memcpy(domain.text[prefix..][0..length], name.slice()[0..length]);
