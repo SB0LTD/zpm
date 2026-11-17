@@ -1687,9 +1687,12 @@ fn detachedCandidates() !void {
     for(0..full.len) |length| try check(session.detachedCandidate(full[0..length])==null);
     var parse_message=Packet.init('P');parse_message.string("lookup");parse_message.string("SELECT $1::int");parse_message.number16(1);parse_message.number32(23);
     try check(session.detachedCandidate(parse_message.slice()).?==.metadata);
+    try check(!session.detachedSchedule(parse_message.slice()).?.session_only);
     _=try storeSend(&session,&connection,&parse_message);
     var bind_message=Packet.init('B');bind_message.string("bound");bind_message.string("lookup");bind_message.number16(0);bind_message.number16(1);bind_message.number32(1);bind_message.append("7");bind_message.number16(0);
     try check(session.detachedCandidate(bind_message.slice()).?==.metadata);
+    try check(session.detachedSchedule(bind_message.slice()).?.session_only);
+    try check(session.detachedSchedule(bind_message.slice()[0..4]) == null);
     _=try storeSend(&session,&connection,&bind_message);
     var description=Packet.init('D');description.byte('P');description.string("bound");
     const described=session.detachedCandidate(description.slice()).?;
@@ -1703,7 +1706,14 @@ fn detachedCandidates() !void {
     try check(session.detachedCandidate(execution.slice())==null);
     var synchronization=Packet.init('S');
     try check(session.detachedCandidate(synchronization.slice()).?==.metadata);
-    session.failed=true;try check(session.detachedCandidate(synchronization.slice())==null);session.failed=false;
+    try check(session.detachedSchedule(synchronization.slice()).?.session_only);
+    var flush = Packet.init('H');
+    try check(session.detachedSchedule(flush.slice()).?.session_only);
+    var close = Packet.init('C');
+    close.byte('P');
+    close.string("bound");
+    try check(session.detachedSchedule(close.slice()).?.session_only);
+    session.failed=true;try check(session.detachedSchedule(synchronization.slice())==null);session.failed=false;
     session.active_portal=0;try check(session.detachedCandidate(message.slice())==null);session.active_portal=null;
     session.oversize_remaining=5;try check(session.detachedCandidate(message.slice())==null);session.oversize_remaining=0;
     var transaction=Packet.init('Q');transaction.string("BEGIN");

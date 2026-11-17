@@ -364,6 +364,24 @@ pub fn Session(comptime DB: type) type {
             return self.detachedFrame(input) catch null;
         }
 
+        pub const DetachedSchedule = struct {
+            candidate: DetachedCandidate,
+            /// Bind, Close, Flush and Sync need only connection-local state
+            /// when the Store guarantees idle autocommit and no LISTEN cursor.
+            session_only: bool,
+        };
+
+        pub fn detachedSchedule(self: *Self, input: []const u8) ?DetachedSchedule {
+            const candidate = self.detachedCandidate(input) orelse return null;
+            return .{
+                .candidate = candidate,
+                .session_only = candidate == .metadata and switch (input[0]) {
+                    'B', 'C', 'H', 'S' => true,
+                    else => false,
+                },
+            };
+        }
+
         /// Additional scheduling hint for unlimited Execute. Portal storage
         /// owns the template through the complete handler call. It does not
         /// authorize execution or replace the rendered-SQL fallback.
