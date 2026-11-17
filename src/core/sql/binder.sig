@@ -1387,6 +1387,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // Discovery functions (B11 text lane).
                 .{ .name = "pg_typeof", .func = .pg_typeof },
                 .{ .name = "pg_get_serial_sequence", .func = .pg_get_serial_sequence },
+                .{ .name = "pg_table_is_visible", .func = .pg_table_is_visible },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -2344,6 +2345,10 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                 },
                 .pg_get_serial_sequence => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .text, true),
+                .pg_table_is_visible => {
+                    try bindSignature(context, n, &[_]ast.Type{.oid}, .boolean, true);
+                    n.constant = false;
+                },
                 .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => try typeTextSearchFunction(context, n, count),
                 .regexp_like => try bindSignature(context, n, if (count == 2) &[_]ast.Type{ .text, .text } else &[_]ast.Type{ .text, .text, .text }, .boolean, true),
                 .similar_to_escape => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, .text, true),
