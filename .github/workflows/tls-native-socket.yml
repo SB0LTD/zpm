@@ -22,6 +22,7 @@ jobs:
             suffix: x86_64-windows.zip
             sha256: 291a3225ff33c32e8c479471c44be6db0d811d6023d759c64e0a7d5bf810576c
     env:
+      PYTHONUTF8: "1"
       BASELINE: 2201854883403a6316e7459fc78fd06efa89fd86
       CANDIDATE: 5b2a19946d17f5cda7172e1748c36dfe010e5aa2
       SIG_ASSET_SUFFIX: ${{ matrix.suffix }}
@@ -44,7 +45,7 @@ jobs:
           evidence.mkdir()
           temp = Path(os.environ["RUNNER_TEMP"])
           baseline, candidate = os.environ["BASELINE"], os.environ["CANDIDATE"]
-          assert git("rev-parse", "HEAD^") == candidate
+          assert git("merge-base", "HEAD", candidate) == candidate
           assert git("rev-parse", candidate + "^") == baseline
           (evidence / "source.log").write_text(f"workflow={git('rev-parse', 'HEAD')}\nbaseline={baseline}\ncandidate={candidate}\n")
 
