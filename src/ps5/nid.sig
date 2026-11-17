@@ -87,8 +87,10 @@ pub fn parseIndex(s: []const u8) ?u32 {
     return n;
 }
 
-/// An index's digits, written into `buf`; the slice used.
+/// An index's digits, written into `buf`; the slice used. (Four digits
+/// hold 24 bits: more is a caller's mistake, as parseIndex reads no more.)
 pub fn indexText(i: u32, buf: *[4]u8) []const u8 {
+    std.debug.assert(i < 1 << 24);
     var n: usize = 1;
     while (n < 4 and (i >> @intCast(6 * n)) != 0) n += 1;
     for (0..n) |k| buf[k] = digits[(i >> @intCast(6 * (n - 1 - k))) & 63];
@@ -140,29 +142,38 @@ pub fn Table(comptime V: type, comptime entries: []const struct { []const u8, V 
             @setEvalBranchQuota(entries.len * 60_000 + 10_000);
             var k: [entries.len]Nid = undefined;
             var v: [entries.len]V = undefined;
+            var names: [entries.len][]const u8 = undefined;
             for (entries, 0..) |e, i| {
                 k[i] = of(e[0]);
                 v[i] = e[1];
+                names[i] = e[0];
             }
             // Insertion sort (comptime, a few hundred entries a library).
-            for (1..entries.len) |i| {
-                const kk = k[i];
-                const vv = v[i];
-                var j = i;
-                while (j > 0 and k[j - 1] > kk) : (j -= 1) {
-                    k[j] = k[j - 1];
-                    v[j] = v[j - 1];
+            // (A table of none or one is sorted as it is.)
+            if (entries.len > 1) {
+                for (1..entries.len) |i| {
+                    const kk = k[i];
+                    const vv = v[i];
+                    const nn = names[i];
+                    var j = i;
+                    while (j > 0 and k[j - 1] > kk) : (j -= 1) {
+                        k[j] = k[j - 1];
+                        v[j] = v[j - 1];
+                        names[j] = names[j - 1];
+                    }
+                    k[j] = kk;
+                    v[j] = vv;
+                    names[j] = nn;
                 }
-                k[j] = kk;
-                v[j] = vv;
-            }
-            for (1..entries.len) |i| {
-                if (k[i] == k[i - 1]) @compileError("two exports share a NID: " ++ entries[i][0]);
+                for (1..entries.len) |i| {
+                    if (k[i] == k[i - 1]) @compileError("two exports share a NID: " ++ names[i - 1] ++ " and " ++ names[i]);
+                }
             }
             break :blk .{ .keys = k, .vals = v };
         };
 
         pub fn find(n: Nid) ?V {
+            if (len == 0) return null;
             return if (index(n)) |i| vals[i] else null;
         }
 
@@ -263,4 +274,9 @@ test "an export table finds every name and nothing else" {
     try std.testing.expectEqual(@as(?u8, 4), T.find(of("memcpy")));
     try std.testing.expectEqual(@as(?u8, null), T.find(of("free")));
     for (1..T.len) |i| try std.testing.expect(T.keys[i - 1] < T.keys[i]);
+    // A library with nothing to export, or one thing, is a table too.
+    const None = Table(u8, &.{});
+    try std.testing.expectEqual(@as(?u8, null), None.find(of("exit")));
+    const One = Table(u8, &.{.{ "exit", 9 }});
+    try std.testing.expectEqual(@as(?u8, 9), One.find(of("exit")));
 }

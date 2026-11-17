@@ -519,10 +519,13 @@ pub const MAP = struct {
     pub const NO_OVERWRITE = 0x80;
     /// Sony: reserve the addresses, map nothing.
     pub const VOID = 0x100;
+    /// A thread's stack: anonymous memory, whether ANON is said or not.
     pub const STACK = 0x400;
     pub const ANON = 0x1000;
-    /// FreeBSD's own spelling of NO_OVERWRITE.
-    pub const EXCL = 0x4000;
+    /// Sony: "all that is available". (FreeBSD's MAP_EXCL has this bit, but
+    /// on a PS5 a FIXED mapping with it has been seen to replace what was
+    /// there, so it is not read as NO_OVERWRITE.)
+    pub const ALLAVAILABLE = 0x4000;
     pub const ALIGN_SHIFT = 24;
 };
 
@@ -541,9 +544,9 @@ pub const Mmap = struct {
 
 pub fn mmapToLinux(prot: u64, flags: u64) Mmap {
     var o: u64 = flags & (MAP.SHARED | MAP.PRIVATE);
-    const no_overwrite = flags & (MAP.NO_OVERWRITE | MAP.EXCL) != 0;
+    const no_overwrite = flags & MAP.NO_OVERWRITE != 0;
     if (flags & MAP.FIXED != 0) o |= if (no_overwrite) 0x10_0000 else 0x10; // MAP_FIXED_NOREPLACE, MAP_FIXED
-    if (flags & (MAP.ANON | MAP.VOID) != 0) o |= 0x20;
+    if (flags & (MAP.ANON | MAP.VOID | MAP.STACK) != 0) o |= 0x20;
     if (flags & MAP.STACK != 0) o |= 0x2_0000;
     if (flags & (MAP.NORESERVE | MAP.VOID) != 0) o |= 0x4000;
     if (o & 3 == 0) o |= MAP.PRIVATE; // (FreeBSD lets an anonymous mapping name neither)
@@ -817,6 +820,10 @@ test "mmap: anonymous, fixed without overwriting, reserved, aligned" {
     try std.testing.expect(void_.reserve and void_.prot == 0 and void_.gpu[0] and !void_.gpu[1]);
     const aligned = mmapToLinux(3, MAP.ANON | (21 << MAP.ALIGN_SHIFT));
     try std.testing.expectEqual(@as(u64, 2 << 20), aligned.alignment);
+    // A stack is anonymous memory without saying so (as a thread library
+    // asks for one), and Sony's 0x4000 with FIXED is a plain FIXED.
+    try std.testing.expectEqual(@as(u64, 0x20 | 0x2_0000 | 2), mmapToLinux(3, MAP.STACK).flags);
+    try std.testing.expectEqual(@as(u64, 0x10 | 0x20 | 2), mmapToLinux(3, MAP.ANON | MAP.FIXED | MAP.ALLAVAILABLE).flags);
     // (MAP_ALIGNED_SUPER, and a field no alignment can be)
     try std.testing.expectEqual(@as(u64, 2 << 20), mmapToLinux(3, MAP.ANON | (1 << MAP.ALIGN_SHIFT)).alignment);
     try std.testing.expectEqual(@as(u64, 0), mmapToLinux(3, MAP.ANON | (200 << MAP.ALIGN_SHIFT)).alignment);
