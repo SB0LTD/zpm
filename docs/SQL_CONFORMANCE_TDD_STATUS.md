@@ -2,6 +2,25 @@
 
 ## Native wire checkpoint — 17 November 2026
 
+RAMSQL `b90354c8911b22a340fb68d15383205cd2ccf4b5` with ZPM
+`7c56722bb354e1e44d418c6351edc08ee4539218` matches **117 of 118** unchanged
+inventory programs. PostgreSQL 18.3 matches 105 of 106 with prepared
+transactions enabled. `PG.DDL.DATABASE` is the remaining mismatch. MySQL
+Community 8.4.13 and SQL Server 2022 CU28 each match all six programs.
+
+The Windows x64 ReleaseSafe binary for PostgreSQL and MySQL has SHA-256
+`f8c9696f7e5173393ee194375f18163ea71160e22461de774b61cd9c97160f8e`.
+The PostgreSQL report SHA-256 is
+`f204d18fc2ac0c40cdd0f87c1c2e024e82729727267ad8f6f59ad81cb24f8891`.
+The MySQL report SHA-256 is
+`006cfeac025fce2008639454718e2a3909bd19de76dba6fae353f91d260fe684`.
+The SQL Server comparison uses an exact Linux binary from the same product
+revision, SHA-256 `c67e600e2ba011f8f91095fd3595a772c57815bcf7641bddb8910980b57c6600`,
+with report SHA-256 `c1607c4a9f9ff0c039eca238cb70e543405ecdb24b13e0a5c764256184817431`.
+[Native SQL Server run](https://github.com/benor1470/dbMeter/actions/runs/44175056901)
+
+### Previous combined candidate
+
 The unchanged 118-program inventory has **116 native matches** on RAMSQL
 `deb1ed41c32e65b7cdf2a86d9f2820569ed1e286` with ZPM
 `f208559a76a2e03f026221ac86c929a00da57c32`. The PostgreSQL and MySQL runs use the
