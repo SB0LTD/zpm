@@ -9,6 +9,11 @@ require their own versioned native oracles. See the
 [current TDD checkpoint](../../docs/SQL_CONFORMANCE_TDD_STATUS.md) and
 [latest recorded checkpoint](checkpoint_20261101.json).
 
+On 17 November 2026, the current RAMSQL candidate matched 104 of 106 native
+PostgreSQL 18.3 probes and three of six native MySQL 8.4.13 probes. The frozen
+fixture and historical core-only classification are preserved. See the
+[native wire checkpoint](../../docs/SQL_CONFORMANCE_TDD_STATUS.md#native-wire-checkpoint--17-november-2026).
+
 ## What this inventory proves
 
 `cases.json` defines 118 executable smoke programs with stable IDs. A smoke pass does not close a feature. `postgres18_features.json` preserves all 755 upstream feature records (459 YES, 296 NO), including bindings outside ordinary SQL. Applicability and mapping remain unreviewed; no assertion of exhaustive SQL coverage is made. The source is [PostgreSQL REL_18_3 sql_features.txt](https://github.com/postgres/postgres/blob/REL_18_3/src/backend/catalog/sql_features.txt), blob `ebe85337c2877ba927b1dee97bc54a9a80470f04`.

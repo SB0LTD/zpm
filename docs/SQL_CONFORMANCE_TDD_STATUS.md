@@ -1,5 +1,38 @@
 # SQL conformance TDD checkpoint
 
+## Native wire checkpoint — 17 November 2026
+
+The unchanged 118-program inventory now has independent PostgreSQL and MySQL
+wire results for RAMSQL `f6c6867a1d776b96657c3ad3405b4927e48cfc9b` with ZPM
+`df5e8da5f85c1f4ff70dfec735e722cc3d625ac2`. The Windows ReleaseSafe executable
+has SHA-256 `eff4a6531a7af99d72afec5a1d1d10baf89dda5c761b216124c38a908320ce62`.
+
+| Native reference | Matched | Open cases |
+| --- | ---: | --- |
+| PostgreSQL 18.3 | 104 of 106 | `PG.DDL.DATABASE`, `PG.TX.TWO_PHASE` |
+| MySQL Community 8.4.13 | 3 of 6 | `MYSQL.TYPES`, `MYSQL.AUTO_INCREMENT`, `MYSQL.REPLACE_UPSERT` |
+| SQL Server 2022 CU28 | 0 of 6 | `IDENTIFIERS`, `TOP`, `FUNCTIONS` differ in metadata. `OUTPUT`, `APPLY`, `PROCEDURAL` fail on feature SQL. |
+
+The PostgreSQL enum, domain and composite case now matches. The wire audit
+normalizes dynamic OIDs through each server's own type catalog and retains the
+raw OIDs, typmods, sizes and formats. A separate probe confirmed exact composite
+text and binary bytes with stable catalog identities before and after restart.
+The older requirement to match a particular dynamically assigned OID came from
+the historical core-only fixture below.
+
+The native PostgreSQL inventory report SHA-256 is
+`297ebd021df3147fd63bf77c0e4f320568fb484831bb6bc312b3d4c2f84a08cf`.
+The native MySQL report SHA-256 is
+`7a2b058d7c418d2fbd0e675a46226d57ee72c09546b043c278bd7b323be908b2`.
+The Linux artifact in the SQL Server run returned identical rows for the
+bracket alias, TOP and scalar function probes. SQL Server marks their
+non-null INT projections as fixed-length, and its unnamed scalar results
+carry empty labels. The RAMSQL variable-length INT metadata and generated
+function labels keep all three probes failing under the strict comparator.
+The [RAMSQL qualification PR](https://github.com/SB0LTD/ramsql/pull/64) and
+[SQL Server comparison](https://github.com/benor1470/dbMeter/actions/runs/44157665404)
+track the exact platform and remaining native evidence.
+
 ## Catalog and security candidate (lane B11, wave 3) - 5 November 2026
 
 Branch `b11/catalog-security` (rebased on 4c028a6) closes seven smoke programs
