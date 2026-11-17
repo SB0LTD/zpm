@@ -44,11 +44,13 @@ jobs:
         run: |
           if ((git rev-parse HEAD) -ne $env:ZPM_SOURCE_REVISION) { throw 'Unexpected source revision' }
           $null = New-Item -ItemType Directory -Force evidence,sig-out
+          $env:ZPM_SOURCE_REVISION > evidence/zpm-revision.txt
           $toolchain = (New-Item -ItemType Directory (Join-Path $env:RUNNER_TEMP 'sig-toolchain')).FullName
           $archive = Join-Path $env:RUNNER_TEMP $env:SIG_ASSET
           Invoke-WebRequest -Uri "https://github.com/SB0LTD/sig/releases/download/$env:SIG_TAG/$env:SIG_ASSET" -OutFile $archive
           $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $env:SIG_SHA256) { throw 'Sig archive checksum differs from its pin' }
+          $actual > evidence/sig-archive-sha256.txt
           if ($env:RUNNER_OS -eq 'Windows') {
             Expand-Archive -LiteralPath $archive -DestinationPath $toolchain
             $name = 'sig.exe'
@@ -57,14 +59,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $name = 'sig'
           }
-          $compiler = @(Get-ChildItem -Path $toolchain -Recurse -File -Filter $name)
+          $compiler = @(Get-ChildItem -Path $toolchain -Recurse -File |
+            Where-Object { $_.Name -ceq $name -and $_.Directory.Name -ceq 'bin' })
           if ($compiler.Length -ne 1) { throw 'Expected one native Sig compiler' }
           $lib = Join-Path $compiler[0].Directory.Parent.FullName 'lib'
           if (-not (Test-Path -LiteralPath (Join-Path $lib 'std/std.sig'))) { throw 'Missing Sig standard library' }
           "SIG=$($compiler[0].FullName)" >> $env:GITHUB_ENV
           "SIG_LIB_DIR=$lib" >> $env:GITHUB_ENV
-          $env:ZPM_SOURCE_REVISION > evidence/zpm-revision.txt
-          $actual > evidence/sig-archive-sha256.txt
           & $compiler[0].FullName version | Tee-Object evidence/sig-version.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Exercise native snapshot format and rejection cases
