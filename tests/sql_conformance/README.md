@@ -28,6 +28,33 @@ Every closure needs result values and exact types; NULL/empty/duplicate/order ca
 
 No calendar promise or universal speedup is implied. A release claiming complete compatibility is blocked until the declared scope has closure evidence and all unresolved applicable upstream records have been adjudicated.
 
+### Native T-SQL smoke capture
+
+Run the six original `TSQL.*` cases and their original setup against the
+official SQL Server 2022 CU28 Linux image. The harness uses a fresh transaction
+per case in `tempdb`, captures the TDS client's column metadata, rows, row counts
+and errors, and checks the returned values independently. A failed connection,
+wrong server build, invalid fixture or incorrect result exits nonzero.
+The result is limited to the six native smoke cases.
+
+```sh
+python -m pip install python-tds==1.17.1
+export ZPM_SQLSERVER_ORACLE_PASSWORD="$(python -c 'import secrets; print("ZpmSql!1" + secrets.token_urlsafe(24))')"
+export MSSQL_SA_PASSWORD="$ZPM_SQLSERVER_ORACLE_PASSWORD"
+image=mcr.microsoft.com/mssql/server@sha256:e10cd49443c94dbdcb7a050987db22ff4d8c87052ac53768abe1ed848d3fcef6
+container="$(docker run --detach --rm --publish 127.0.0.1::1433 \
+  --env ACCEPT_EULA=Y --env MSSQL_PID=Developer --env MSSQL_SA_PASSWORD "$image")"
+trap 'docker stop "$container" >/dev/null' EXIT
+port="$(docker port "$container" 1433/tcp)"
+python tests/sql_conformance/audit_tsql.py --port "${port##*:}" --wait-seconds 180 \
+  --report tsql-native.json
+```
+
+Use an x86-64 Linux runner for this image. The audit verifies build
+`16.0.4325.4` through the server before executing the fixture.
+[Microsoft container quickstart](https://learn.microsoft.com/en-us/sql/linux/install-upgrade/quickstart-install-docker),
+[SQL Server 2022 Linux release history](https://learn.microsoft.com/en-us/troubleshoot/sql/linux/release-history-2022?view=sql-server-ver15).
+
 ## Concrete smoke specifications
 
 Current core run: **12 smoke passes, 89 failures, 17 unexecuted scopes/comparators**.
