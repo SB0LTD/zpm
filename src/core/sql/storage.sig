@@ -105,6 +105,58 @@ pub fn Storage(comptime config: types.Config) type {
             /// Older version index + 1, or the next free slot + 1 while free.
             older: u32 = 0,
             cells: if (split_versions) void else VersionRow = if (split_versions) {} else @splat(.null_value),
+
+            pub const PendingChange = struct { tx: TxRef, cid: u32 };
+
+            pub inline fn creationCsn(self: *const Version) u64 {
+                return self.xmin_csn;
+            }
+
+            pub inline fn deletionCsn(self: *const Version) u64 {
+                return self.xmax_csn;
+            }
+
+            pub inline fn pendingCreation(self: *const Version) ?PendingChange {
+                if (self.creationCsn() != 0) return null;
+                return .{ .tx = self.xmin, .cid = self.xmin_cid };
+            }
+
+            pub inline fn pendingDeletion(self: *const Version) ?PendingChange {
+                if (self.deletionCsn() != 0 or !self.hasDeletion()) return null;
+                return .{ .tx = self.xmax, .cid = self.xmax_cid };
+            }
+
+            pub inline fn hasDeletion(self: *const Version) bool {
+                return self.xmax.epoch != 0;
+            }
+
+            pub inline fn creationAfter(self: *const Version, snap: Snapshot) bool {
+                return self.creationCsn() > snap.csn and !snap.own(self.xmin);
+            }
+
+            pub inline fn deletionOwnedBy(self: *const Version, snap: Snapshot) bool {
+                return snap.own(self.xmax);
+            }
+
+            /// Set the mutation owner and command. Publication sets its CSN.
+            pub inline fn markDeletion(self: *Version, tx: TxRef, cid: u32) void {
+                self.xmax = tx;
+                self.xmax_cid = cid;
+            }
+
+            pub inline fn clearDeletion(self: *Version) void {
+                self.xmax = .{};
+                self.xmax_cid = 0;
+                self.xmax_csn = 0;
+            }
+
+            pub inline fn publishCreation(self: *Version, csn: u64) void {
+                self.xmin_csn = csn;
+            }
+
+            pub inline fn publishDeletion(self: *Version, csn: u64) void {
+                self.xmax_csn = csn;
+            }
         };
 
         pub const VersionOrigin = struct {
@@ -787,18 +839,19 @@ pub fn Storage(comptime config: types.Config) type {
         /// a committed live row or a version this transaction still holds
         /// takes the key; another live transaction's version means waiting.
         pub fn classify(version: *const Version, index: usize, snap: Snapshot, waiting: *?u16) ?KeyState {
-            const marked = version.xmax.epoch != 0;
-            if (version.xmin_csn == 0) {
-                if (snap.own(version.xmin)) {
-                    if (marked and snap.own(version.xmax)) return null;
+            const marked = version.hasDeletion();
+            if (version.pendingCreation()) |creation| {
+                if (snap.own(creation.tx)) {
+                    if (marked and version.deletionOwnedBy(snap)) return null;
                     return .{ .taken = @intCast(index) };
                 }
-                if (!marked and waiting.* == null) waiting.* = version.xmin.slot;
+                if (!marked and waiting.* == null) waiting.* = creation.tx.slot;
                 return null;
             }
             if (!marked) return .{ .taken = @intCast(index) };
-            if (version.xmax_csn != 0 or snap.own(version.xmax)) return null;
-            if (waiting.* == null) waiting.* = version.xmax.slot;
+            const deletion = version.pendingDeletion() orelse return null;
+            if (snap.own(deletion.tx)) return null;
+            if (waiting.* == null) waiting.* = deletion.tx.slot;
             return null;
         }
 
@@ -1108,14 +1161,14 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         pub fn created(version: *const Version, snap: Snapshot) bool {
-            if (version.xmin_csn != 0) return version.xmin_csn <= snap.csn;
-            return snap.own(version.xmin) and version.xmin_cid < snap.cid;
+            if (version.pendingCreation()) |creation| return snap.own(creation.tx) and creation.cid < snap.cid;
+            return version.creationCsn() <= snap.csn;
         }
 
         pub fn deleted(version: *const Version, snap: Snapshot) bool {
-            if (version.xmax.epoch == 0) return false;
-            if (version.xmax_csn != 0) return version.xmax_csn <= snap.csn;
-            return snap.own(version.xmax) and version.xmax_cid < snap.cid;
+            if (!version.hasDeletion()) return false;
+            if (version.pendingDeletion()) |deletion| return snap.own(deletion.tx) and deletion.cid < snap.cid;
+            return version.deletionCsn() <= snap.csn;
         }
 
         /// The version of `slot` visible to `snap`, if any.
@@ -1647,7 +1700,8 @@ pub fn Storage(comptime config: types.Config) type {
             var freed: usize = 0;
             for (first..end) |index| {
                 const version = &table.versions[index];
-                if (version.row == 0 or version.xmax_csn == 0 or version.xmax_csn > horizon) continue;
+                const deletion_csn = version.deletionCsn();
+                if (version.row == 0 or deletion_csn == 0 or deletion_csn > horizon) continue;
                 reclaimVersion(table, @intCast(index));
                 freed += 1;
             }
@@ -1725,7 +1779,7 @@ pub fn Storage(comptime config: types.Config) type {
             var out: Stats = .{ .live_rows = liveRows(table), .row_slots = table.row_used, .row_high = table.row_high, .versions = table.version_used, .next_rowid = table.next_rowid };
             for (table.versions[0..table.version_high]) |*version| {
                 if (version.row == 0) continue;
-                if (version.xmin_csn == 0 or (version.xmax.epoch != 0 and version.xmax_csn == 0)) out.pending += 1;
+                if (version.creationCsn() == 0 or version.pendingDeletion() != null) out.pending += 1;
             }
             return out;
         }

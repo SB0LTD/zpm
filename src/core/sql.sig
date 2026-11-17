@@ -2150,8 +2150,8 @@ pub fn Database(comptime config: Config) type {
                 if (table.rows[row].newest == 0) return error.ChangeRecordConflict;
                 const newest = &table.versions[table.rows[row].newest - 1];
                 if (!self.locks.holdsTable(index, slot)) return error.InvalidChangeRecord;
-                if (newest.xmin_csn == 0 and newest.xmin.slot != slot) return error.ChangeRecordConflict;
-                if (newest.xmax.epoch != 0 and newest.xmax_csn == 0 and newest.xmax.slot != slot) return error.ChangeRecordConflict;
+                if (newest.pendingCreation()) |creation| if (creation.tx.slot != slot) return error.ChangeRecordConflict;
+                if (newest.pendingDeletion()) |deletion| if (deletion.tx.slot != slot) return error.ChangeRecordConflict;
                 const mode: locks_module.RowMode = @enumFromInt(lock.mode);
                 if (self.locks.holdsRow(index, lock.rowid, slot, .key_share)) return error.InvalidChangeRecord;
                 var waits: L.Set = .{};
@@ -5254,14 +5254,16 @@ pub fn Database(comptime config: Config) type {
             const strict = transactionSnapshot(self.txs[slot].isolation);
             while (true) {
                 const entry = &table.versions[current];
-                if (entry.xmax.epoch != 0) {
-                    if (entry.xmax_csn != 0) {
-                        if (strict and entry.xmax_csn > snap.csn) return error.SerializationFailure;
+                if (entry.hasDeletion()) {
+                    const deletion_csn = entry.deletionCsn();
+                    if (deletion_csn != 0) {
+                        if (strict and deletion_csn > snap.csn) return error.SerializationFailure;
                         current = S.successor(table, current) orelse return .skip;
                         continue;
                     }
-                    if (snap.own(entry.xmax)) return if (entry.xmax_cid == snap.cid) .authored else .skip;
-                    waits.add(entry.xmax.slot);
+                    const deletion = entry.pendingDeletion().?;
+                    if (snap.own(deletion.tx)) return if (deletion.cid == snap.cid) .authored else .skip;
+                    waits.add(deletion.tx.slot);
                 }
                 self.locks.rowHolders(table_index, table.rows[entry.row - 1].rowid, slot, mode, waits);
                 if (waits.any()) return .wait;
@@ -5443,8 +5445,7 @@ pub fn Database(comptime config: Config) type {
                 if (table.rows[row].newest == 0) continue;
                 const version = S.visibleAt(table, row, snap) orelse continue;
                 const entry = &table.versions[version];
-                entry.xmax = tx.ref(slot);
-                entry.xmax_cid = snap.cid;
+                entry.markDeletion(tx.ref(slot), snap.cid);
             }
             tx.push(.{ .kind = .truncate, .table = @intCast(index), .old = snap.cid }) catch unreachable;
         }
@@ -5561,8 +5562,7 @@ pub fn Database(comptime config: Config) type {
                     if (table.rows[row].newest == 0) continue;
                     const version = S.visibleAt(table, row, snap) orelse continue;
                     const entry = &table.versions[version];
-                    entry.xmax = tx.ref(slot);
-                    entry.xmax_cid = snap.cid;
+                    entry.markDeletion(tx.ref(slot), snap.cid);
                 }
                 tx.push(.{ .kind = .truncate, .table = index, .old = snap.cid }) catch unreachable;
             }
@@ -5794,7 +5794,9 @@ pub fn Database(comptime config: Config) type {
         fn conflictUpdate(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, update: *const B.Update, version: u32, proposed: *const E.Row, snap: Snapshot) Error!usize {
             const table = &self.tables[table_index];
             const entry = &table.versions[version];
-            if (entry.xmin_csn == 0 and snap.own(entry.xmin) and entry.xmin_cid == snap.cid) return error.CardinalityViolation;
+            if (entry.pendingCreation()) |creation| {
+                if (snap.own(creation.tx) and creation.cid == snap.cid) return error.CardinalityViolation;
+            }
             var waits: L.Set = .{};
             const goal = switch (try self.target(slot, table_index, version, snap, .write, &waits)) {
                 .wait => return self.park(slot, waits),
@@ -5803,7 +5805,7 @@ pub fn Database(comptime config: Config) type {
             };
             // REPEATABLE READ: the conflicting row must be visible to the
             // snapshot (ExecCheckTupleVisible).
-            if (transactionSnapshot(self.txs[slot].isolation) and !snap.own(table.versions[goal].xmin) and table.versions[goal].xmin_csn > snap.csn) return error.SerializationFailure;
+            if (transactionSnapshot(self.txs[slot].isolation) and table.versions[goal].creationAfter(snap)) return error.SerializationFailure;
             const row = table.versions[goal].row - 1;
             const previous_row = ctx.row;
             defer ctx.row = previous_row;
@@ -5859,8 +5861,7 @@ pub fn Database(comptime config: Config) type {
             try self.reserveWrites(slot, 2);
             const mutation = &self.txs[slot];
             const previous = &self.tables[table_index].versions[version];
-            previous.xmax = mutation.ref(slot);
-            previous.xmax_cid = snap.cid;
+            previous.markDeletion(mutation.ref(slot), snap.cid);
             mutation.push(.{ .kind = .delete, .table = @intCast(table_index), .old = version }) catch unreachable;
             return true;
         }
@@ -6004,14 +6005,14 @@ pub fn Database(comptime config: Config) type {
                     if (stored.* == .null_value or V.compare(stored, &key[source]) != 0) equal = false;
                 }
                 if (!equal) continue;
-                if (version.xmin_csn == 0) {
-                    if (!snap.own(version.xmin)) continue;
-                    if (version.xmax.epoch != 0 and snap.own(version.xmax)) continue;
+                if (version.pendingCreation()) |creation| {
+                    if (!snap.own(creation.tx) or version.deletionOwnedBy(snap)) continue;
                     return .{ .found = @intCast(index) };
                 }
-                if (version.xmax.epoch == 0) return .{ .found = @intCast(index) };
-                if (version.xmax_csn != 0 or snap.own(version.xmax)) continue;
-                if (waiting == null) waiting = version.xmax.slot;
+                if (!version.hasDeletion()) return .{ .found = @intCast(index) };
+                const deletion = version.pendingDeletion() orelse continue;
+                if (snap.own(deletion.tx)) continue;
+                if (waiting == null) waiting = deletion.tx.slot;
             }
             return if (waiting) |slot| .{ .wait = slot } else .missing;
         }
@@ -6058,7 +6059,7 @@ pub fn Database(comptime config: Config) type {
                     return self.park(slot, waits);
                 },
                 .found => |version| {
-                    if (parent.versions[version].xmin_csn == 0) return;
+                    if (parent.versions[version].creationCsn() == 0) return;
                     const rowid = parent.rows[parent.versions[version].row - 1].rowid;
                     var waits: L.Set = .{};
                     self.locks.rowHolders(parent_index, rowid, slot, .share, &waits);
@@ -6121,15 +6122,15 @@ pub fn Database(comptime config: Config) type {
                 }
                 if (!equal) continue;
                 var goal = version;
-                if (entry.xmin_csn == 0) {
-                    if (!snap.own(entry.xmin)) {
+                if (entry.pendingCreation()) |creation| {
+                    if (!snap.own(creation.tx)) {
                         var waits: L.Set = .{};
-                        waits.add(entry.xmin.slot);
+                        waits.add(creation.tx.slot);
                         return self.park(slot, waits);
                     }
-                    if (entry.xmax.epoch != 0 and snap.own(entry.xmax)) continue;
+                    if (entry.deletionOwnedBy(snap)) continue;
                 } else {
-                    if (entry.xmax.epoch != 0 and (entry.xmax_csn != 0 or snap.own(entry.xmax))) continue;
+                    if (entry.hasDeletion() and (entry.deletionCsn() != 0 or entry.deletionOwnedBy(snap))) continue;
                     var waits: L.Set = .{};
                     switch (try self.target(slot, child_index, version, snap, .write, &waits)) {
                         .wait => return self.park(slot, waits),
@@ -6148,10 +6149,9 @@ pub fn Database(comptime config: Config) type {
                         var row_scratch: S.VersionRowScratch = undefined;
                         const prior = S.borrowVersionRow(child, goal, &row_scratch);
                         try self.referencedChange(slot, child_index, prior, null, snap);
-                        if (child.versions[goal].xmax.epoch != 0) continue;
+                        if (child.versions[goal].hasDeletion()) continue;
                         try self.reserveWrites(slot, 1);
-                        child.versions[goal].xmax = tx.ref(slot);
-                        child.versions[goal].xmax_cid = snap.cid;
+                        child.versions[goal].markDeletion(tx.ref(slot), snap.cid);
                         tx.push(.{ .kind = .delete, .table = @intCast(child_index), .old = goal }) catch unreachable;
                     },
                     .set_null, .set_default => {
@@ -6213,7 +6213,7 @@ pub fn Database(comptime config: Config) type {
             try self.exclusionTaken(slot, table_index, cells, row, old_cells, snap);
             if (check != .none) try self.checkReferences(slot, table_index, cells, if (check == .all) null else old_cells, snap);
             try self.referencedChange(slot, table_index, old_cells, cells, snap);
-            if (table.versions[old].xmax.epoch != 0) return;
+            if (table.versions[old].hasDeletion()) return;
             try self.placeUpdate(slot, table_index, row, old, cells, snap);
         }
 
@@ -6224,8 +6224,7 @@ pub fn Database(comptime config: Config) type {
             try self.reserveWrites(slot, 1);
             try S.ensureVersions(table, 1, self.horizon());
             const version = S.createVersion(table, .{ .row = row, .xmin = tx.ref(slot), .cid = snap.cid, .older = old + 1 }, cells);
-            table.versions[old].xmax = tx.ref(slot);
-            table.versions[old].xmax_cid = snap.cid;
+            table.versions[old].markDeletion(tx.ref(slot), snap.cid);
             S.indexKey(table, version);
             tx.push(.{ .kind = .update, .table = @intCast(table_index), .old = old, .new = version }) catch unreachable;
         }
@@ -6288,7 +6287,7 @@ pub fn Database(comptime config: Config) type {
                 if (!table.live or table.pending_drop) continue;
                 if (entry.kind != .delete) {
                     const version = &table.versions[entry.new];
-                    if (version.row != 0 and version.xmax.epoch == 0) try self.deferredRow(slot, table, S.borrowVersionRow(table, entry.new, &row_scratch), version.row - 1, immediate_only, snap);
+                    if (version.row != 0 and !version.hasDeletion()) try self.deferredRow(slot, table, S.borrowVersionRow(table, entry.new, &row_scratch), version.row - 1, immediate_only, snap);
                 }
                 if (entry.kind != .insert) try self.deferredParent(slot, table, S.borrowVersionRow(table, entry.old, &row_scratch), immediate_only, snap);
             }
@@ -7029,10 +7028,9 @@ pub fn Database(comptime config: Config) type {
                 .delete => {
                     if (self.rowHooks(merge.table, routine_catalog.tg_delete, '4', snap) and !try self.beforeRow(merge.table, routine_catalog.tg_delete, null, cells, null, snap)) return;
                     try self.referencedChange(slot, merge.table, cells, null, snap);
-                    if (table.versions[goal].xmax.epoch == 0) {
+                    if (!table.versions[goal].hasDeletion()) {
                         try self.reserveWrites(slot, 1);
-                        table.versions[goal].xmax = tx.ref(slot);
-                        table.versions[goal].xmax_cid = snap.cid;
+                        table.versions[goal].markDeletion(tx.ref(slot), snap.cid);
                         tx.push(.{ .kind = .delete, .table = @intCast(merge.table), .old = goal }) catch unreachable;
                     }
                 },
@@ -7152,7 +7150,7 @@ pub fn Database(comptime config: Config) type {
             try self.checkReferences(slot, update.table, &cells, old_cells, snap);
             try self.referencedChange(slot, update.table, old_cells, &cells, snap);
             // A referential action of this statement may have replaced it.
-            if (table.versions[old].xmax.epoch != 0) return true;
+            if (table.versions[old].hasDeletion()) return true;
             _ = tx;
             try self.placeUpdate(slot, update.table, row, old, &cells, snap);
             if (mysqlAutoColumn(table)) |column| {
@@ -7204,7 +7202,7 @@ pub fn Database(comptime config: Config) type {
             }
             try self.referencedChange(slot, delete.table, old_cells, null, snap);
             // A self-referencing CASCADE of this statement already deleted it.
-            if (table.versions[goal].xmax.epoch != 0) return 1;
+            if (table.versions[goal].hasDeletion()) return 1;
             try self.placeDelete(slot, delete.table, goal, snap);
             return 1;
         }
@@ -7213,8 +7211,7 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             const table = &self.tables[table_index];
             try self.reserveWrites(slot, 1);
-            table.versions[goal].xmax = tx.ref(slot);
-            table.versions[goal].xmax_cid = snap.cid;
+            table.versions[goal].markDeletion(tx.ref(slot), snap.cid);
             tx.push(.{ .kind = .delete, .table = @intCast(table_index), .old = goal }) catch unreachable;
         }
 
