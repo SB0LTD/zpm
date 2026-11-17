@@ -247,6 +247,7 @@ pub fn Session(comptime DB: type) type {
         oversize_remaining: usize = 0,
         oversize_tag: u8 = 0,
         authentication: ?scram.Server = null,
+        role_authentication: bool = false,
         statements: [statement_capacity]Statement = @splat(.{}),
         portals: [portal_capacity]Portal = @splat(.{}),
         result: DB.Result = .{},
@@ -262,6 +263,15 @@ pub fn Session(comptime DB: type) type {
         pub fn configureAuthentication(self: *Self, verifier: *const scram.Verifier, server_nonce: []const u8) scram.Error!void {
             if (self.startup or self.authentication != null) return error.AuthenticationState;
             self.authentication = try scram.Server.init(verifier, server_nonce);
+        }
+
+        /// Authenticate using a verifier and require its exact username to
+        /// resolve to a SQL login role. Callers opt in before startup. The
+        /// default SCRAM configuration retains the embedding's session role.
+        pub fn configureRoleAuthentication(self: *Self, verifier: *const scram.Verifier, server_nonce: []const u8) scram.Error!void {
+            if (comptime !@hasDecl(DB, "bindAuthenticatedRole")) return error.AuthenticationFailed;
+            try self.configureAuthentication(verifier, server_nonce);
+            self.role_authentication = true;
         }
 
         /// An output of this size is sufficient before any SQL mutation occurs.
@@ -457,6 +467,11 @@ pub fn Session(comptime DB: type) type {
                 w.end(p);
             } else if (auth.state == .challenge) {
                 const final = try auth.finish(payload, &message);
+                if (self.role_authentication) {
+                    if (comptime @hasDecl(DB, "bindAuthenticatedRole")) {
+                        try db.bindAuthenticatedRole(auth.verifier.username[0..auth.verifier.username_len]);
+                    } else return error.AuthenticationFailed;
+                }
                 const p = try w.begin('R');
                 try w.u32be(12);
                 try w.append(final);
