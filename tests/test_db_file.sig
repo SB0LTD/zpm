@@ -16,6 +16,15 @@ const Replay = struct {
         try check(sequence == self.sequence + 1 and std.mem.eql(u8, payload, "durable transaction"));
         self.sequence = sequence;
     }
+
+    fn verifyCheckpoint(self: *Replay, marker: log.Frame, payload: []const u8) !void {
+        try check(marker.sequence == 1 and std.mem.eql(u8, payload, "durable transaction"));
+        self.sequence = marker.sequence;
+    }
+
+    fn applyFrame(self: *Replay, frame: log.Frame, payload: []const u8) !void {
+        return self.apply(frame.sequence, payload);
+    }
 };
 pub fn main(init: std.process.Init) !void {
     const pid: u32 = if (builtin.os.tag == .windows) Win.GetCurrentProcessId() else if (builtin.os.tag == .macos) @intCast(std.c.getpid()) else @intCast(std.os.linux.getpid());
@@ -115,6 +124,10 @@ pub fn main(init: std.process.Init) !void {
     try check(twice.sequence == 2 and !twice.truncated_tail);
     const first_frame: log.Frame = .{ .offset = 0, .sequence = 1, .kind = 1, .payload_len = "durable transaction".len };
     try check(std.mem.eql(u8, try log.readFrame(&file, &scratch, first_frame), "durable transaction"));
+    replay = .{};
+    const anchored = try log.recoverAfterFrame(&file, &scratch, first_frame, &replay, Replay.verifyCheckpoint, Replay.applyFrame, null, @as(u32, 1) << 1);
+    try check(anchored.sequence == 2 and anchored.valid_bytes == twice.valid_bytes and !anchored.truncated_tail);
+    try check(replay.sequence == 2);
     try check(try file.length() == twice.valid_bytes);
     var empty: [0]u8 = .{};
     try check(try file.readAt(0, &empty) == 0);
