@@ -1016,7 +1016,8 @@ pub fn Eval(comptime config: types.Config) type {
                     };
                 },
                 .decimal_literal => {
-                    if (n.ty == .float4 or n.ty == .float8) return Io.parse(n.ty, -1, n.name.span.slice(ctx.source), ctx.session);
+                    if (n.ty == .float4 or n.ty == .float8 or n.ty == .mysql_bigint_unsigned)
+                        return Io.parse(n.ty, -1, n.name.span.slice(ctx.source), ctx.session);
                     const number = try Io.parse(.numeric, -1, n.name.span.slice(ctx.source), ctx.session);
                     return if (n.ty == .numeric or n.ty == .unknown) number else Io.cast(number, .numeric, n.ty, -1, ctx.session);
                 },
@@ -1211,6 +1212,7 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .function => switch (n.func) {
                     .mysql_date_add => return mysqlDateAdd(ctx, n),
+                    .mysql_last_insert_id => return .{ .numeric = Io.Numerics.fromInt(@intCast(ctx.session.mysql_last_insert_id)) },
                     .grouping => {
                         var value:i64=0;var item=n.b;
                         while(item!=none):(item=node(ctx,item).next) {

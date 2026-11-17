@@ -102,10 +102,23 @@ pub fn Dml(comptime config: types.Config) type {
 
         /// `values[c]` none or a default_value node takes the column default.
         pub fn insertedRow(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived) Error!E.Row {
+            return insertedRowWithValue(ctx, table, values, derived, {});
+        }
+
+        pub const InsertValue = struct { column: usize, value: i64 };
+
+        /// An engine-owned explicit value, checked with the other assignments.
+        pub fn insertedRowWithValue(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived, replacement: anytype) Error!E.Row {
             var cells: E.Row = @splat(.null_value);
             ctx.row = null;
             for (table.columns[0..table.column_count], 0..) |*column, index| {
                 if (column.default_kind == .generated) continue;
+                if (comptime @TypeOf(replacement) == InsertValue) {
+                    if (index == replacement.column) {
+                        cells[index] = try store(column, .{ .integer = replacement.value }, ctx.session);
+                        continue;
+                    }
+                }
                 const evaluated: V.Cell = if (isDefault(ctx, values[index])) try defaultCell(ctx, table, derived, index) else try E.eval(ctx, values[index]);
                 cells[index] = try store(column, evaluated, ctx.session);
             }

@@ -134,7 +134,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     regexp_like, similar_to_escape,
     // Full text search (B11 text lane, text_search.sig): the first argument
     // is the regconfig name.
-    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add };
+    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {

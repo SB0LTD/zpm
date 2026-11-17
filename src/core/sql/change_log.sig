@@ -122,6 +122,8 @@ fn std_zero(bytes: []const u8) bool {
 pub const format_version: u16 = 1;
 pub const header_size: usize = 8;
 pub const first_oid: u32 = 16384;
+/// Private definition code, distinct from the PostgreSQL NUMERIC wire OID.
+const mysql_unsigned_type: u32 = 0xffff_fffe;
 pub const expr_format_version: u16 = 1;
 /// create_table definitions that carry a namespace and table constraints.
 pub const definition_format_version: u16 = 2;
@@ -427,7 +429,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try writer.int(u8, @intCast(table.column_count));
             for (table.columns[0..table.column_count]) |*column| {
                 try writer.name(column.name.slice());
-                try writer.int(u32, types.typeOid(column.data_type));
+                try writer.int(u32, if (column.data_type == .mysql_bigint_unsigned) mysql_unsigned_type else types.typeOid(column.data_type));
                 try writer.int(i32, column.typmod);
                 try writer.int(u8, @as(u8, @intFromBool(column.not_null)) | (@as(u8, @intFromBool(column.primary_key)) << 1) | (@as(u8, @intFromEnum(column.default_kind)) << 2) | (@as(u8, @intFromBool(column.virtual)) << 5));
                 const text = column.expression.slice();
@@ -1338,7 +1340,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 @memcpy(column.name.bytes[0..column_name.len], column_name);
                 for (out.columns[0..index]) |*previous|
                     if (types.same(previous.name.slice(), column.name.slice())) return error.InvalidChangeRecord;
-                column.data_type = types.typeFromOid(try reader.int(u32)) orelse return error.UnsupportedLogVersion;
+                const type_code = try reader.int(u32);
+                column.data_type = if (type_code == mysql_unsigned_type) .mysql_bigint_unsigned else
+                    types.typeFromOid(type_code) orelse return error.UnsupportedLogVersion;
                 column.typmod = try reader.int(i32);
                 if (!types.validTypeTypmod(config, column.data_type, column.typmod)) return error.InvalidChangeRecord;
                 var flags = try reader.int(u8);
@@ -1346,10 +1350,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     column.virtual = flags & 0x20 != 0;
                     flags &= 0x1f;
                 }
-                if (flags >> 2 > 4) return error.InvalidChangeRecord;
+                if (flags >> 2 > @intFromEnum(types.DefaultKind.mysql_auto_increment)) return error.InvalidChangeRecord;
                 column.not_null = flags & 1 != 0;
                 column.primary_key = flags & 2 != 0;
                 column.default_kind = @enumFromInt(flags >> 2);
+                if (column.data_type == .mysql_bigint_unsigned and column.default_kind != .none)
+                    return error.InvalidChangeRecord;
                 if (column.primary_key) {
                     if (has_primary or !column.not_null) return error.InvalidChangeRecord;
                     has_primary = true;
@@ -1364,6 +1370,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 if ((column.default_kind == .identity_always or column.default_kind == .identity_by_default) and
                     (!column.not_null or (column.data_type != .smallint and column.data_type != .integer32 and column.data_type != .integer)))
                     return error.InvalidChangeRecord;
+                if (column.default_kind == .mysql_auto_increment and (!column.primary_key or
+                    (column.data_type != .integer32 and column.data_type != .integer))) return error.InvalidChangeRecord;
                 out.columns[index] = column;
             }
             for (out.columns[0..out.count]) |*column| if (column.virtual and column.default_kind != .generated) return error.InvalidChangeRecord;

@@ -295,6 +295,8 @@ pub fn Database(comptime config: Config) type {
             column_count: usize = 0,
             row_count: usize = 0,
             affected_rows: usize = 0,
+            mysql_insert_id: u64 = 0,
+            mysql_generated_id: u64 = 0,
             command: CommandTag = .none,
             /// CREATE AS ran its source query, even if it produced zero rows.
             create_query_data: bool = false,
@@ -360,6 +362,7 @@ pub fn Database(comptime config: Config) type {
                 for (0..self.column_count) |column| {
                     switch (self.column_types[column]) {
                         .integer, .integer32, .boolean, .text => continue,
+                        .mysql_bigint_unsigned => if (mode == .mysql) continue,
                         .date => if (mode == .tds) continue,
                         .smallint, .oid => {
                             self.column_types[column] = .integer;
@@ -395,6 +398,8 @@ pub fn Database(comptime config: Config) type {
                 self.column_count = 0;
                 self.row_count = 0;
                 self.affected_rows = affected;
+                self.mysql_insert_id = 0;
+                self.mysql_generated_id = 0;
                 self.command = .none;
                 self.create_query_data = false;
                 self.has_nominal_types = false;
@@ -435,6 +440,8 @@ pub fn Database(comptime config: Config) type {
                 self.column_count = source.column_count;
                 self.row_count = source.row_count;
                 self.affected_rows = source.affected_rows;
+                self.mysql_insert_id = source.mysql_insert_id;
+                self.mysql_generated_id = source.mysql_generated_id;
                 self.command = source.command;
                 self.create_query_data = source.create_query_data;
                 self.non_null_columns = source.non_null_columns;
@@ -678,6 +685,8 @@ pub fn Database(comptime config: Config) type {
         pub const Outcome = struct {
             affected: usize = 0,
             command: CommandTag = .none,
+            mysql_insert_id: u64 = 0,
+            mysql_generated_id: u64 = 0,
             create_query_data: bool = false,
             returning: Returned = .{},
             noop: bool = false,
@@ -1882,6 +1891,8 @@ pub fn Database(comptime config: Config) type {
         fn writeOutcome(self: *const Self, result: *Result) void {
             if (self.outcome.command == .select or self.outcome.command == .fetch or self.outcome.command == .show or self.outcome.command == .explain) return;
             result.clear(self.outcome.affected);
+            result.mysql_insert_id = self.outcome.mysql_insert_id;
+            result.mysql_generated_id = self.outcome.mysql_generated_id;
             result.command = self.outcome.command;
             result.create_query_data = self.outcome.create_query_data;
             const returned = &self.outcome.returning;
@@ -2175,6 +2186,9 @@ pub fn Database(comptime config: Config) type {
                 tx.cid +%= 1;
                 tx.progress = 0;
                 tx.progress_affected = 0;
+                tx.mysql_insert_value = null;
+                tx.mysql_first_generated = 0;
+                tx.mysql_explicit_insert_id = 0;
                 self.modifying[slot] = .{};                snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
                 // The first statement that needs a snapshot fixes the
                 // transaction snapshot (REPEATABLE READ / SERIALIZABLE use it).
@@ -2324,6 +2338,11 @@ pub fn Database(comptime config: Config) type {
                 },
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
+                    if (mysqlAutoColumn(&self.tables[insert.table]) != null) {
+                        if (self.dialect != .mysql or insert.replace or insert.plan != ast.none or insert.rows == ast.none or
+                            insert.conflict.action != .none or insert.returning.count != 0 or self.insertHooks(insert.table, snap))
+                            return error.UnsupportedStatement;
+                    }
                     if (insert.returning.output) try self.validateTsqlOutput(insert.table, .insert, snap);
                     if (insert.replace) try self.validateMysqlReplace(slot, insert.table, snap);
                     if (insert.replace or insert.conflict.action != .none) try self.ssiRead(slot, insert.table);
@@ -2341,6 +2360,8 @@ pub fn Database(comptime config: Config) type {
                 },
                 .update => |*update| blk: {
                     try self.lockTable(slot, update.table, .row_exclusive);
+                    if (mysqlAutoColumn(&self.tables[update.table]) != null and self.dialect != .mysql)
+                        return error.UnsupportedStatement;
                     if (update.returning.output) try self.validateTsqlOutput(update.table, .update, snap);
                     try self.ssiRead(slot, update.table);
                     try self.lockSources(slot);
@@ -2408,6 +2429,11 @@ pub fn Database(comptime config: Config) type {
                 else => false,
             };
             self.outcome = .{ .affected = affected, .command = B.command(&bound), .create_query_data = create_query_data, .noop = bound == .noop };
+            if (bound == .insert) {
+                const tx = &self.txs[slot];
+                self.outcome.mysql_generated_id = tx.mysql_first_generated;
+                self.outcome.mysql_insert_id = if (tx.mysql_first_generated != 0) tx.mysql_first_generated else tx.mysql_explicit_insert_id;
+            }
             switch (bound) {
                 .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none, result.rows.len),
                 .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true, result.rows.len),
@@ -4634,6 +4660,7 @@ pub fn Database(comptime config: Config) type {
                 .pg_type => {
                     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
                         const data_type = @field(DataType, field);
+                        if (data_type == .mysql_bigint_unsigned) continue;
                         const info = types.typeInfo(data_type);
                         const category: [1]u8 = .{info.category};
                         try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0) });
@@ -5271,13 +5298,15 @@ pub fn Database(comptime config: Config) type {
             try self.reserveWrites(slot, truncate.count);
             // RESTART IDENTITY: every sequence a column of the table owns
             // (identity, SERIAL) restarts, transactionally (ALTER SEQUENCE).
-            if (truncate.restart_identity) {
+            if (truncate.restart_identity or self.dialect == .mysql) {
                 // Collect first: each restart fills another sequence slot.
                 var owned: [config.sequences]bool = @splat(false);
                 for (truncate.tables[0..truncate.count]) |index| {
                     const oid = self.tables[index].oid;
+                    const auto = mysqlAutoColumn(&self.tables[index]);
                     for (&self.seqs, 0..) |*seq, position| {
                         if (!seq.live or seq.owner != oid or seq.dead_csn != 0) continue;
+                        if (!truncate.restart_identity and (auto == null or seq.owner_column != auto.?)) continue;
                         if (seq.pending_create and seq.creator != slot) continue;
                         if (seq.pending_drop and seq.creator == slot) continue;
                         owned[position] = true;
@@ -5479,6 +5508,42 @@ pub fn Database(comptime config: Config) type {
             const tx = &self.txs[slot];
             tx.progress = position + 1;
             tx.progress_affected += affected;
+            tx.mysql_insert_value = null;
+        }
+
+        fn mysqlAutoColumn(table: *const S.Table) ?usize {
+            const index = table.primary_column orelse return null;
+            return if (table.columns[index].default_kind == .mysql_auto_increment) index else null;
+        }
+
+        fn mysqlSetCounter(self: *Self, slot: u16, sequence_index: usize, value: i64) Error!void {
+            const sequence = &self.seqs[sequence_index];
+            if (value < sequence.last_value or (value == sequence.last_value and sequence.is_called)) return;
+            try Q.set(sequence, value, true);
+            self.txs[slot].seq_dirty.add(sequence_index);
+            self.seq_carried.add(sequence_index);
+        }
+
+        fn mysqlInsertValue(self: *Self, slot: u16, ctx: *E.Context, table: usize, column: usize, id: u16) Error!D.InsertValue {
+            const tx = &self.txs[slot];
+            if (tx.mysql_insert_value) |pending| return .{ .column = column, .value = pending.value };
+            ctx.row = null;
+            const evaluated: Cell = if (id == ast.none or ctx.pool.nodes[id].kind == .default_value) .null_value else try E.eval(ctx, id);
+            const generated = evaluated == .null_value or
+                (evaluated == .integer and evaluated.integer == 0 and !self.session.mysql_keep_zero);
+            var value: i64 = undefined;
+            if (generated) {
+                const sequence_index = try self.identitySequence(table, column);
+                const sequence = &self.seqs[sequence_index];
+                if (sequence.is_called and sequence.last_value == sequence.spec.max) return error.SequenceLimit;
+                value = sequence.last_value + @as(i64, @intFromBool(sequence.is_called));
+                try self.mysqlSetCounter(slot, sequence_index, value);
+            } else {
+                if (evaluated != .integer) return error.TypeMismatch;
+                value = evaluated.integer;
+            }
+            tx.mysql_insert_value = .{ .value = value, .generated = generated };
+            return .{ .column = column, .value = value };
         }
 
         /// ON CONFLICT DO UPDATE on the conflicting row (the newest committed
@@ -5526,7 +5591,8 @@ pub fn Database(comptime config: Config) type {
                 else => return error.UnsupportedStatement,
             };
             for (table.columns[0..table.column_count]) |column| {
-                if (column.default_kind == .identity_always or column.default_kind == .identity_by_default) return error.UnsupportedStatement;
+                if (column.default_kind == .identity_always or column.default_kind == .identity_by_default or
+                    column.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
             }
             var triggers: [config.triggers]u8 = undefined;
             if (self.objects.tableTriggers(table.oid, snap, &triggers) != 0 or
@@ -5563,7 +5629,12 @@ pub fn Database(comptime config: Config) type {
             // BEFORE ROW triggers and conditional rules see the row before
             // NOT NULL, generated columns and CHECKs (B11 wave 3).
             const hooked = self.insertHooks(insert.table, snap);
-            var cells = if (hooked) try D.insertedRowDeferred(ctx, &self.tables[insert.table], values, derived) else try D.insertedRow(ctx, &self.tables[insert.table], values, derived);
+            const target_table = &self.tables[insert.table];
+            const auto = mysqlAutoColumn(target_table);
+            var cells = if (auto) |column| blk: {
+                const replacement = try self.mysqlInsertValue(slot, ctx, insert.table, column, values[column]);
+                break :blk try D.insertedRowWithValue(ctx, target_table, values, derived, replacement);
+            } else if (hooked) try D.insertedRowDeferred(ctx, target_table, values, derived) else try D.insertedRow(ctx, target_table, values, derived);
             if (hooked and try self.ruleSkips(insert.table, '3', &cells, null, snap)) return 0;
             // A partitioned table routes the row to its partition.
             const table_index = try self.routeRow(slot, insert.table, &cells, snap);
@@ -5596,6 +5667,16 @@ pub fn Database(comptime config: Config) type {
             try self.exclusionTaken(slot, table_index, &cells, 0xffffffff, null, snap);
             try self.checkReferences(slot, table_index, &cells, null, snap);
             try self.appendRow(slot, table_index, &cells, snap);
+            if (auto) |column| {
+                const tx = &self.txs[slot];
+                const allocated = tx.mysql_insert_value.?;
+                if (allocated.generated) {
+                    if (tx.mysql_first_generated == 0) tx.mysql_first_generated = @intCast(allocated.value);
+                } else {
+                    try self.mysqlSetCounter(slot, try self.identitySequence(table_index, column), allocated.value);
+                    tx.mysql_explicit_insert_id = @bitCast(allocated.value);
+                }
+            }
             return 1 + @as(usize, @intFromBool(replaced));
         }
 
@@ -6829,6 +6910,10 @@ pub fn Database(comptime config: Config) type {
             if (table.versions[old].xmax.epoch != 0) return true;
             _ = tx;
             try self.placeUpdate(slot, update.table, row, old, &cells, snap);
+            if (mysqlAutoColumn(table)) |column| {
+                if (update.values[column] != ast.none) try self.mysqlSetCounter(slot,
+                    try self.identitySequence(update.table, column), cells[column].integer);
+            }
             return true;
         }
 

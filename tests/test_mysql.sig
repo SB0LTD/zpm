@@ -15,7 +15,10 @@ var store: Store = .{};
 
 fn check(value: bool) !void {
     assertions += 1;
-    if (!value) return error.MySqlContractFailed;
+    if (!value) {
+        std.debug.print("MySQL assertion {d} failed\n", .{assertions});
+        return error.MySqlContractFailed;
+    }
 }
 
 fn same(a: []const u8, b: []const u8) !void {
@@ -372,7 +375,8 @@ fn nativeSignedIntegerLiterals() !void {
     store.database.dialect = .mysql;
     try store.database.execute("SELECT CAST(1 AS DECIMAL(5,2)), 9223372036854775808, 18446744073709551616, -9223372036854775809", &result);
     try check(result.row_count == 1 and result.column_count == 4);
-    for (result.column_types[0..4], result.rows[0].cells[0..4]) |kind, cell| try check(kind == .numeric and cell == .numeric);
+    for ([_]sql.DataType{ .numeric, .mysql_bigint_unsigned, .numeric, .numeric }, result.column_types[0..4], result.rows[0].cells[0..4]) |expected, kind, cell|
+        try check(kind == expected and cell == .numeric);
     if (store.database.execute("SELECT -(-9223372036854775808)", &result)) |_| return error.UnexpectedIntegerOverflow else |err|
         try check(err == error.IntegerOverflow);
 
@@ -509,6 +513,175 @@ fn nativeReplace() !void {
         try check(err == error.UnsupportedStatement);
 }
 
+fn nativeAutoIncrement() !void {
+    store = .{};
+    var first: DB = .{ .store = &store, .id = 1 };
+    var second: DB = .{ .store = &store, .id = 2 };
+    var a: Session = .{};
+    var b: Session = .{};
+    try connect(&a, &first);
+    try connect(&b, &second);
+    _ = try command(&a, &first, "CREATE TABLE autos(id INT AUTO_INCREMENT PRIMARY KEY,v INT NOT NULL)");
+    try check(output[4] == 0);
+    _ = try command(&a, &first, "INSERT INTO autos(v) VALUES(11)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 1);
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(10,22)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 10);
+    const last_id = try command(&a, &first, "SELECT LAST_INSERT_ID()");
+    try check(a.result.row_count == 1 and a.result.rows[0].cells[0].numeric.coef() == 1);
+    var last_id_fields: Reader = .{ .source = output[0..last_id.written] };
+    try same(try last_id_fields.next(), &.{1});
+    try unsignedField(&last_id_fields);
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(NULL,33),(0,44)");
+    try check(output[4] == 0 and output[5] == 2 and output[6] == 11);
+    _ = try command(&a, &first, "SELECT id FROM autos ORDER BY v");
+    try check(a.result.row_count == 4 and a.result.rows[2].cells[0].integer == 11 and a.result.rows[3].cells[0].integer == 12);
+    _ = try command(&b, &second, "SELECT LAST_INSERT_ID()");
+    try check(b.result.row_count == 1 and b.result.rows[0].cells[0].numeric.coef() == 0);
+
+    _ = try command(&a, &first, "UPDATE autos SET id=300 WHERE v=22");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 0);
+    _ = try command(&a, &first, "DELETE FROM autos WHERE id=1");
+    try check(output[4] == 0 and output[5] == 1);
+    _ = try command(&a, &first, "BEGIN");
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(DEFAULT,55)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 0xfc and output[7] == 45 and output[8] == 1);
+    _ = try command(&a, &first, "ROLLBACK");
+    _ = try command(&a, &first, "SELECT LAST_INSERT_ID()");
+    try check(a.result.row_count == 1 and a.result.rows[0].cells[0].numeric.coef() == 301);
+    _ = try command(&a, &first, "INSERT INTO autos(v) VALUES(66)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 0xfc and output[7] == 46 and output[8] == 1);
+    _ = try command(&a, &first, "TRUNCATE TABLE autos");
+    try check(output[4] == 0 and output[5] == 0 and output[6] == 0);
+    _ = try command(&a, &first, "SET SESSION sql_mode='NO_AUTO_VALUE_ON_ZERO'");
+    try check(output[4] == 0);
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(0,77)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 0);
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(NULL,88)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 1);
+
+    store = .{};
+    store.database.dialect = .mysql;
+    syntax_recovered = .{};
+    var record: [8192]u8 = undefined;
+    var result: Raw.Result = .{};
+    for ([_][]const u8{
+        "CREATE TABLE autos(id INT AUTO_INCREMENT PRIMARY KEY,v INT NOT NULL)",
+        "INSERT INTO autos(v) VALUES(19)",
+        "INSERT INTO autos VALUES(77,20)",
+    }) |source| {
+        var used: usize = 0;
+        try store.database.executeChanges(source, &result, &record, &used, null, null);
+        try syntax_recovered.applyChangeRecord(record[0..used], &syntax_replay);
+    }
+    try syntax_recovered.execute("SELECT id FROM autos WHERE v=19", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 1);
+    syntax_recovered.dialect = .mysql;
+    try syntax_recovered.execute("INSERT INTO autos(v) VALUES(21)", &result);
+    try check(result.mysql_insert_id == 78 and result.mysql_generated_id == 78);
+}
+
+fn unsignedField(reader: *Reader) !void {
+    const metadata = try reader.next();
+    try check(metadata.len >= 13 and metadata[metadata.len - 6] == 8 and
+        metadata[metadata.len - 5] == 0x20 and metadata[metadata.len - 4] == 0 and metadata[metadata.len - 3] == 0);
+}
+
+fn nativeBigintUnsigned() !void {
+    const create = "CREATE TABLE unsigned_values(id BIGINT UNSIGNED PRIMARY KEY,v BIGINT UNSIGNED)";
+    const insert = "INSERT INTO unsigned_values VALUES(0,NULL),(9223372036854775808,18446744073709551615),(18446744073709551615,1)";
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    _ = try command(&session, &db, create);
+    try check(output[4] == 0);
+    _ = try command(&session, &db, insert);
+    try check(output[4] == 0 and output[5] == 3);
+    const selected = try command(&session, &db, "SELECT id,v FROM unsigned_values ORDER BY id");
+    var ordered: Reader = .{ .source = output[0..selected.written] };
+    try same(try ordered.next(), &.{2});
+    try unsignedField(&ordered);
+    try unsignedField(&ordered);
+    try check((try ordered.next())[0] == 0xfe);
+    try same(try ordered.next(), "\x010\xfb");
+    try same(try ordered.next(), "\x139223372036854775808\x1418446744073709551615");
+    try same(try ordered.next(), "\x1418446744073709551615\x011");
+    try check((try ordered.next())[0] == 0xfe and ordered.pos == ordered.source.len);
+
+    const key = try command(&session, &db, "SELECT id FROM unsigned_values WHERE id=18446744073709551615");
+    var looked_up: Reader = .{ .source = output[0..key.written] };
+    try same(try looked_up.next(), &.{1});
+    try unsignedField(&looked_up);
+    try check((try looked_up.next())[0] == 0xfe);
+    try same(try looked_up.next(), "\x1418446744073709551615");
+    try check((try looked_up.next())[0] == 0xfe and looked_up.pos == looked_up.source.len);
+    _ = try command(&session, &db, "SELECT id FROM unsigned_values WHERE id=-1");
+    try check(session.result.row_count == 0);
+    _ = try command(&session, &db, "SELECT id FROM unsigned_values WHERE id IN (0,18446744073709551615) ORDER BY id");
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[0].numeric.coef() == 0 and
+        session.result.rows[1].cells[0].numeric.coef() == 18446744073709551615);
+    _ = try command(&session, &db, "SELECT id FROM unsigned_values WHERE id BETWEEN 1 AND 18446744073709551615 ORDER BY id");
+    try check(session.result.row_count == 2 and session.result.rows[0].cells[0].numeric.coef() == 9223372036854775808);
+    _ = try command(&session, &db, "SELECT MIN(id),MAX(id),COUNT(*) FROM unsigned_values");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].numeric.coef() == 0 and
+        session.result.rows[0].cells[1].numeric.coef() == 18446744073709551615 and session.result.rows[0].cells[2].integer == 3);
+
+    for ([_][]const u8{
+        "INSERT INTO unsigned_values VALUES(1,-1)",
+        "INSERT INTO unsigned_values VALUES(1,18446744073709551616)",
+        "INSERT INTO unsigned_values VALUES(1,2),(2,-1)",
+        "UPDATE unsigned_values SET v=18446744073709551616 WHERE id=0",
+    }) |statement| {
+        _ = try command(&session, &db, statement);
+        try check(output[4] == 0xff and output[5] == 0xf0 and output[6] == 4);
+    }
+    _ = try command(&session, &db, "INSERT INTO unsigned_values VALUES(18446744073709551615,4)");
+    try check(output[4] == 0xff and output[5] == 0x26 and output[6] == 4);
+    for ([_][]const u8{
+        "SELECT id+1 FROM unsigned_values",
+        "SELECT SUM(id) FROM unsigned_values",
+        "SELECT CAST(-1 AS UNSIGNED)",
+        "ALTER TABLE unsigned_values ADD COLUMN extra BIGINT UNSIGNED",
+        "ALTER TABLE unsigned_values ALTER COLUMN v SET DEFAULT 0",
+        "CREATE TABLE unsigned_default(id BIGINT UNSIGNED DEFAULT 0)",
+    }) |statement| {
+        _ = try command(&session, &db, statement);
+        try check(output[4] == 0xff);
+    }
+    _ = try command(&session, &db, "SELECT id,v FROM unsigned_values WHERE id<=1 ORDER BY id");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].numeric.coef() == 0 and
+        session.result.rows[0].cells[1] == .null_value);
+    _ = try command(&session, &db, "UPDATE unsigned_values SET v=9223372036854775808 WHERE id=0");
+    try check(output[4] == 0 and output[5] == 1);
+
+    store = .{};
+    store.database.dialect = .mysql;
+    syntax_recovered = .{};
+    syntax_recovered.dialect = .mysql;
+    var record: [8192]u8 = undefined;
+    var result: Raw.Result = .{};
+    for ([_][]const u8{
+        create,
+        insert,
+        "UPDATE unsigned_values SET v=18446744073709551615 WHERE id=0",
+        "DELETE FROM unsigned_values WHERE id=9223372036854775808",
+    }) |statement| {
+        var used: usize = 0;
+        try store.database.executeChanges(statement, &result, &record, &used, null, null);
+        try syntax_recovered.applyChangeRecord(record[0..used], &syntax_replay);
+    }
+    try syntax_recovered.execute("SELECT * FROM unsigned_values ORDER BY id", &result);
+    try check(result.row_count == 2 and result.column_types[0] == .mysql_bigint_unsigned and
+        result.column_types[1] == .mysql_bigint_unsigned);
+    try check(result.rows[0].cells[0].numeric.coef() == 0 and result.rows[0].cells[1].numeric.coef() == 18446744073709551615 and
+        result.rows[1].cells[0].numeric.coef() == 18446744073709551615 and result.rows[1].cells[1].numeric.coef() == 1);
+    syntax_recovered.dialect = .postgres;
+    try syntax_recovered.execute("SELECT id FROM unsigned_values WHERE id=18446744073709551615", &result);
+    try check(result.row_count == 1 and result.column_types[0] == .numeric and
+        result.rows[0].cells[0].numeric.coef() == 18446744073709551615);
+}
+
 pub fn main(init: std.process.Init) !void {
     try handshakeAndFragmentation();
     try typedResultsAndErrors();
@@ -517,6 +690,8 @@ pub fn main(init: std.process.Init) !void {
     try nativeSignedIntegerLiterals();
     try nativeIfnullAndDateAdd();
     try nativeReplace();
+    try nativeAutoIncrement();
+    try nativeBigintUnsigned();
     try transactionsAndOutputPreflight();
     try concurrentCommittedVisibility();
     try malformedAndFuzz();

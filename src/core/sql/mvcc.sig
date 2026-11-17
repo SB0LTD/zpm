@@ -99,6 +99,9 @@ pub fn Mvcc(comptime config: types.Config) type {
             /// resumed statement continues after them.
             progress: usize = 0,
             progress_affected: usize = 0,
+            mysql_insert_value: ?struct { value: i64, generated: bool } = null,
+            mysql_first_generated: u64 = 0,
+            mysql_explicit_insert_id: u64 = 0,
             /// The open COPY FROM statement (its statement subtransaction
             /// stays on the stack between data messages): target table,
             /// statement snapshot and rows inserted so far.
