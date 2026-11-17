@@ -149,6 +149,62 @@ const Reader = struct {
         if (self.at != self.bytes.len) return error.ProtocolViolation;
     }
 };
+pub const StartupMethod = enum { trusted, scram };
+pub const routed_startup_capacity = 10000;
+
+/// A routed adapter handles this synchronously after verification. Its
+/// slices are borrowed for the call. Commit the route and startup options
+/// together, or release any provisional Store lease before returning error.
+pub const StartupAdmission = struct {
+    method: StartupMethod,
+    user: []const u8,
+    database: []const u8,
+    payload: []const u8,
+
+    pub fn parameters(self: StartupAdmission) StartupParameters {
+        return .{ .reader = .{ .bytes = self.payload } };
+    }
+};
+
+pub const StartupParameters = struct {
+    const Parameter = struct { key: []const u8, value: []const u8 };
+    reader: Reader,
+    ended: bool = false,
+
+    pub fn next(self: *StartupParameters) !?Parameter {
+        if (self.ended) return null;
+        const key = try self.reader.string();
+        if (key.len == 0) {
+            try self.reader.done();
+            self.ended = true;
+            return null;
+        }
+        return .{ .key = key, .value = try self.reader.string() };
+    }
+};
+
+fn inspectRoutedStartup(payload: []const u8, method: StartupMethod) !StartupAdmission {
+    var params: StartupParameters = .{ .reader = .{ .bytes = payload } };
+    var user: ?[]const u8 = null;
+    var database: ?[]const u8 = null;
+    while (try params.next()) |param| {
+        if (equal(param.key, "user")) {
+            if (user != null) return error.ProtocolViolation;
+            user = param.value;
+        } else if (equal(param.key, "database")) {
+            if (database != null) return error.ProtocolViolation;
+            database = param.value;
+        } else if (equal(param.key, "client_encoding") and !equal(param.value, "UTF8") and !equal(param.value, "UTF-8")) {
+            return error.UnsupportedEncoding;
+        }
+    }
+    const requested_user = user orelse return error.UserRequired;
+    if (requested_user.len == 0) return error.UserRequired;
+    const requested_db = if (database != null and database.?.len != 0) database.? else requested_user;
+    if (!std.unicode.utf8ValidateSlice(requested_user) or !std.unicode.utf8ValidateSlice(requested_db)) return error.CharacterNotInRepertoire;
+    return .{ .method = method, .user = requested_user, .database = requested_db, .payload = payload };
+}
+
 const Writer = struct {
     bytes: []u8,
     at: usize = 0,
@@ -200,8 +256,17 @@ const Writer = struct {
 };
 
 pub fn Session(comptime DB: type) type {
+    return SessionWithAdmission(DB, false);
+}
+
+/// Hosts using an existing adapter may supply an optional startup callback
+/// and caller-owned scratch. The configured scratch is required until the
+/// connection has finished startup.
+pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool) type {
     const T = pg_types.Types(DB.Result);
     const has_copy = @hasDecl(DB, "copyBegin");
+    const detects_admission = @hasDecl(DB, "admitPostgresStartup");
+    const has_admission = detects_admission or external_admission;
     const has_primary_key = @hasDecl(DB, "executeDetachedPrimaryKey") and
         (if (@hasDecl(DB, "detached_primary_key")) DB.detached_primary_key else true);
     const primary_key_sql_capacity = 256;
@@ -299,12 +364,49 @@ pub fn Session(comptime DB: type) type {
                 return if (self.format_count == 0) 0 else self.formats[if (self.format_count == 1) 0 else c];
             }
         };
+        const AdmissionState = struct {
+            payload: if (detects_admission) [routed_startup_capacity]u8 else void = undefined,
+            external: if (external_admission) ?AdmissionHook else void = if (external_admission) null else {},
+            len: usize = 0,
+            rejected: bool = false,
+        };
+
+        pub const AdmissionHook = struct {
+            context: *anyopaque,
+            scratch: []u8,
+            admit: *const fn (*anyopaque, *DB, StartupAdmission) anyerror!void,
+            /// Optional cluster utility dispatch for one simple-query frame.
+            /// The returned slice is a static PostgreSQL command tag.
+            utility: ?*const fn (*anyopaque, *DB, []const u8) anyerror!?[]const u8 = null,
+        };
+
+        pub fn configureStartupAdmission(self: *Self, hook: AdmissionHook) !void {
+            if (comptime !external_admission) return error.UnsupportedStatement else {
+                if (self.startup or self.admission.rejected or self.admission.external != null) return error.ProtocolViolation;
+                if (hook.scratch.len < routed_startup_capacity) return error.BufferTooSmall;
+                self.admission.external = hook;
+            }
+        }
+
+        fn routing(self: *const Self) bool {
+            if (comptime detects_admission) return true;
+            if (comptime external_admission) return self.admission.external != null;
+            return false;
+        }
+
+        fn startupScratch(self: *Self) []u8 {
+            if (comptime external_admission) if (self.admission.external) |hook| return hook.scratch;
+            if (comptime detects_admission) return &self.admission.payload;
+            return &.{};
+        }
+
         startup: bool = false,
         failed: bool = false,
         oversize_remaining: usize = 0,
         oversize_tag: u8 = 0,
         authentication: ?scram.Server = null,
         role_authentication: bool = false,
+        admission: if (has_admission) AdmissionState else void = if (has_admission) .{} else {},
         statements: [statement_capacity]Statement = @splat(.{}),
         portals: [portal_capacity]Portal = @splat(.{}),
         result: DB.Result = .{},
@@ -319,6 +421,7 @@ pub fn Session(comptime DB: type) type {
         /// protocol layer intentionally owns no RNG or transport configuration.
         pub fn configureAuthentication(self: *Self, verifier: *const scram.Verifier, server_nonce: []const u8) scram.Error!void {
             if (self.startup or self.authentication != null) return error.AuthenticationState;
+            if (comptime has_admission) if (self.admission.rejected) return error.AuthenticationState;
             self.authentication = try scram.Server.init(verifier, server_nonce);
         }
 
@@ -326,7 +429,7 @@ pub fn Session(comptime DB: type) type {
         /// resolve to a SQL login role. Callers opt in before startup. The
         /// default SCRAM configuration retains the embedding's session role.
         pub fn configureRoleAuthentication(self: *Self, verifier: *const scram.Verifier, server_nonce: []const u8) scram.Error!void {
-            if (comptime !@hasDecl(DB, "bindAuthenticatedRole")) return error.AuthenticationFailed;
+            if (comptime !has_admission and !@hasDecl(DB, "bindAuthenticatedRole")) return error.AuthenticationFailed;
             try self.configureAuthentication(verifier, server_nonce);
             self.role_authentication = true;
         }
@@ -436,6 +539,7 @@ pub fn Session(comptime DB: type) type {
         pub fn handle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
             if (output.len < try self.requiredCapacity()) return error.BufferTooSmall;
             if (self.oversize_remaining != 0) return self.discardOversize(db, input, output, 0);
+            if (comptime has_admission) if (self.admission.rejected) return .{ .close = true };
             if (self.authentication) |*auth| if (auth.state == .failed) return .{ .close = true };
             if (has_copy and self.copy.mode != .none) return self.copyHandle(db, input, output);
             if (!self.startup) return self.handleStartup(db, input, output);
@@ -460,11 +564,11 @@ pub fn Session(comptime DB: type) type {
             if (input.len < total) return .{};
             var close = false;
             if (self.authentication != null and self.authentication.?.state != .complete) {
-                self.authenticate(db, input[0], input[5..total], &w) catch {
+                close = self.authenticate(db, input[0], input[5..total], &w) catch blk: {
                     self.authentication.?.state = .failed;
                     w.at = 0;
                     try authenticationFailure(&w);
-                    close = true;
+                    break :blk true;
                 };
             } else {
                 const tag = input[0];
@@ -503,11 +607,11 @@ pub fn Session(comptime DB: type) type {
                 },
                 .cancel => |key| return .{ .consumed = 16, .close = true, .cancel = key },
                 .startup => |parameters| {
-                    var close = false;
-                    self.handshake(db, parameters, &writer) catch |err| {
+                    const close = self.handshake(db, parameters, &writer) catch |err| blk: {
+                        if (has_admission and self.routing()) self.admission.rejected = true;
                         writer.at = 0;
                         try failure(&writer, sqlstate(err), @errorName(err));
-                        close = true;
+                        break :blk true;
                     };
                     return .{ .consumed = 8 + parameters.len, .written = writer.at, .close = close };
                 },
@@ -519,7 +623,21 @@ pub fn Session(comptime DB: type) type {
             self.backend_secret = secret;
         }
 
-        fn handshake(self: *Self, db: *DB, payload: []const u8, w: *Writer) !void {
+        fn handshake(self: *Self, db: *DB, payload: []const u8, w: *Writer) !bool {
+            if (has_admission and self.routing()) {
+                const startup_request = try inspectRoutedStartup(payload, if (self.authentication == null) .trusted else .scram);
+                if (payload.len > routed_startup_capacity) return error.ProtocolViolation;
+                if (self.authentication != null) {
+                    @memcpy(self.startupScratch()[0..payload.len], payload);
+                    self.admission.len = payload.len;
+                    try self.offerScram(startup_request.user, w);
+                    return false;
+                }
+                if (!try self.admitStartup(db, startup_request, w)) return true;
+                try self.authenticationComplete(db, w);
+                return false;
+            }
+
             var r: Reader = .{ .bytes = payload };
             var user: ?[]const u8 = null;
             while (true) {
@@ -535,19 +653,46 @@ pub fn Session(comptime DB: type) type {
             }
             try r.done();
             if (user == null or user.?.len == 0) return error.UserRequired;
-            if (self.authentication) |*auth| {
-                auth.setUsername(user.?);
-                const p = try w.begin('R');
-                try w.u32be(10);
-                try w.string(scram.mechanism);
-                try w.byte(0);
-                w.end(p);
-                self.startup = true;
-                return;
-            }
-            try self.authenticationComplete(db, w);
+            if (self.authentication != null) {
+                try self.offerScram(user.?, w);
+            } else try self.authenticationComplete(db, w);
+            return false;
         }
-        fn authenticate(self: *Self, db: *DB, tag: u8, payload: []const u8, w: *Writer) !void {
+
+        fn offerScram(self: *Self, user: []const u8, w: *Writer) !void {
+            self.authentication.?.setUsername(user);
+            const p = try w.begin('R');
+            try w.u32be(10);
+            try w.string(scram.mechanism);
+            try w.byte(0);
+            w.end(p);
+            self.startup = true;
+        }
+
+        fn admitStartup(self: *Self, db: *DB, startup_request: StartupAdmission, w: *Writer) !bool {
+            self.invokeAdmission(db, startup_request) catch |err| {
+                self.admission.rejected = true;
+                if (self.authentication) |*auth| auth.state = .failed;
+                try fatal(w, sqlstate(err), @errorName(err));
+                return false;
+            };
+            return true;
+        }
+
+        fn invokeAdmission(self: *Self, db: *DB, request: StartupAdmission) !void {
+            if (comptime external_admission) if (self.admission.external) |hook| return hook.admit(hook.context, db, request);
+            if (comptime detects_admission) return db.admitPostgresStartup(request);
+            return error.AdmissionDenied;
+        }
+
+        fn clusterCommand(self: *Self, db: *DB, source: []const u8) !?[]const u8 {
+            if (comptime external_admission) {
+                if (self.admission.external) |hook| if (hook.utility) |utility| return utility(hook.context, db, source);
+            }
+            return null;
+        }
+
+        fn authenticate(self: *Self, db: *DB, tag: u8, payload: []const u8, w: *Writer) !bool {
             if (tag != 'p' or payload.len > scram.max_message + 64) return error.AuthenticationFailed;
             const auth = &self.authentication.?;
             var message: [512]u8 = undefined;
@@ -565,7 +710,11 @@ pub fn Session(comptime DB: type) type {
                 w.end(p);
             } else if (auth.state == .challenge) {
                 const final = try auth.finish(payload, &message);
-                if (self.role_authentication) {
+                if (has_admission and self.routing()) {
+                    const startup_request = try inspectRoutedStartup(self.startupScratch()[0..self.admission.len], .scram);
+                    self.admission.len = 0;
+                    if (!try self.admitStartup(db, startup_request, w)) return true;
+                } else if (self.role_authentication) {
                     if (comptime @hasDecl(DB, "bindAuthenticatedRole")) {
                         try db.bindAuthenticatedRole(auth.verifier.username[0..auth.verifier.username_len]);
                     } else return error.AuthenticationFailed;
@@ -576,6 +725,7 @@ pub fn Session(comptime DB: type) type {
                 w.end(p);
                 try self.authenticationComplete(db, w);
             } else return error.AuthenticationFailed;
+            return false;
         }
         fn authenticationComplete(self: *Self, db: *DB, w: *Writer) !void {
             const auth = try w.begin('R');
@@ -664,6 +814,10 @@ pub fn Session(comptime DB: type) type {
                         try self.startCopy(db, source, w);
                         // COPY FROM: ReadyForQuery follows CopyDone/CopyFail.
                         if (self.copy.mode == .in) return false;
+                    } else if (try self.clusterCommand(db, source)) |command_tag| {
+                        const completion = try w.begin('C');
+                        try w.string(command_tag);
+                        w.end(completion);
                     } else {
                         try self.execute(db, source);
                         if (self.result.column_count != 0) {
@@ -1787,6 +1941,12 @@ fn sqlstate(err: anyerror) []const u8 {
 /// null means the error would fall back to 54000 (program_limit_exceeded).
 pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     const name = @errorName(err);
+    if (equal(name, "DatabaseNotFound")) return "3D000";
+    if (equal(name, "DuplicateDatabase")) return "42P04";
+    if (equal(name, "InvalidDatabaseName")) return "42602";
+    if (equal(name, "DatabaseBusy")) return "55006";
+    if (equal(name, "AdmissionDenied")) return "42501";
+    if (equal(name, "LeaseCapacity")) return "53300";
     if (equal(name, "UndefinedFunction")) return "42883";
     if (equal(name, "AmbiguousFunction")) return "42725";
     if (equal(name, "CannotCoerce")) return "42846";

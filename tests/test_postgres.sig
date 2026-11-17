@@ -995,6 +995,118 @@ fn authFirst(s: anytype, db: anytype) !void {
     try check(equal(challenge.body[4..], "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"));
     try check((try frames.next()) == null);
 }
+const RoutedDB = struct {
+    pub const Result = DB.Result;
+    calls: usize = 0,
+    sql_calls: usize = 0,
+    method: ?pg.StartupMethod = null,
+    default_database: bool = false,
+    expected_option: bool = false,
+
+    pub fn execute(self: *@This(), _: []const u8, _: *Result) !void {
+        self.sql_calls += 1;
+        return error.UnsupportedStatement;
+    }
+
+    pub fn startupParameter(_: *@This(), _: []const u8, _: []const u8) !void {
+        return error.LegacyStartupParameterCalled;
+    }
+
+    pub fn admitPostgresStartup(self: *@This(), request: pg.StartupAdmission) !void {
+        self.calls += 1;
+        self.method = request.method;
+        if (!equal(request.user, "user")) return error.AdmissionDenied;
+        self.default_database = equal(request.database, request.user);
+        if (!self.default_database and !equal(request.database, "beta")) return error.DatabaseNotFound;
+        var params = request.parameters();
+        while (try params.next()) |param| {
+            if (equal(param.key, "application_name") and equal(param.value, "registry")) self.expected_option = true;
+        }
+    }
+};
+
+fn routedStartup(database: ?[]const u8, duplicate: bool) Packet {
+    var packet = Packet.init(0);
+    packet.len = 4;
+    packet.number32(196608);
+    packet.string("user");
+    packet.string("user");
+    if (database) |name| {
+        packet.string("database");
+        packet.string(name);
+        if (duplicate) {
+            packet.string("database");
+            packet.string("beta");
+        }
+    }
+    packet.string("application_name");
+    packet.string("registry");
+    packet.byte(0);
+    put32(packet.bytes[0..4], @intCast(packet.len));
+    return packet;
+}
+
+fn routedStartupContracts() !void {
+    const RoutedSession = pg.Session(RoutedDB);
+    const verifier = try scram.Verifier.parse("user", scram_verifier);
+    var proof = Packet.init('p');
+    proof.append(scram_final);
+    var query_packet = Packet.init('Q');
+    query_packet.string("SELECT 1");
+
+    for ([_][]const u8{ "beta", "missing" }) |database| {
+        var db: RoutedDB = .{};
+        var session: RoutedSession = .{};
+        try session.configureAuthentication(&verifier, scram_nonce);
+        var startup = routedStartup(database, false);
+        const frame_len = startup.len;
+        startup.append(query_packet.slice());
+        for (0..frame_len) |prefix| {
+            const partial = try session.handle(&db, startup.bytes[0..prefix], &output);
+            try check(partial.consumed == 0 and partial.written == 0 and !partial.close and db.calls == 0);
+        }
+        const initial = try session.handle(&db, startup.bytes[0..startup.len], &output);
+        try check(initial.consumed == frame_len and !initial.close and db.calls == 0 and db.sql_calls == 0);
+        try tags(output[0..initial.written], "R");
+        @memset(startup.bytes[0..startup.len], 0);
+        try authFirst(&session, &db);
+        try check(db.calls == 0);
+        const final = try session.handle(&db, proof.slice(), &output);
+        try check(db.calls == 1 and db.method == .scram and !db.default_database);
+        if (equal(database, "beta")) {
+            try check(!final.close and db.expected_option);
+            try tags(output[0..final.written], "RRSSSSSSSKZ");
+        } else {
+            try check(final.close);
+            try tags(output[0..final.written], "E");
+            try state(output[0..final.written], "3D000");
+            try check((try session.handle(&db, query_packet.slice(), &output)).close and db.sql_calls == 0);
+        }
+    }
+
+    var db: RoutedDB = .{};
+    var wrong: RoutedSession = .{};
+    try wrong.configureAuthentication(&verifier, scram_nonce);
+    try authStartup(&wrong, &db, "wrong");
+    try authFirst(&wrong, &db);
+    const denied = try wrong.handle(&db, proof.slice(), &output);
+    try check(denied.close and db.calls == 0);
+    try state(output[0..denied.written], "28P01");
+
+    var trusted: RoutedSession = .{};
+    const startup = routedStartup(null, false);
+    const accepted = try trusted.handle(&db, startup.bytes[0..startup.len], &output);
+    try check(!accepted.close and db.calls == 1 and db.method == .trusted and db.default_database and db.expected_option);
+    try tags(output[0..accepted.written], "RSSSSSSSKZ");
+
+    var malformed: RoutedSession = .{};
+    const duplicate = routedStartup("beta", true);
+    const rejected = try malformed.handle(&db, duplicate.bytes[0..duplicate.len], &output);
+    try check(rejected.close and db.calls == 1);
+    try state(output[0..rejected.written], "08P01");
+    try check((try malformed.handle(&db, startup.bytes[0..startup.len], &output)).close and db.calls == 1);
+}
+
 fn authenticationContracts() !void {
     var db: DB = .{};
     var v = try scram.Verifier.parse("user", scram_verifier);
@@ -1768,6 +1880,7 @@ pub fn main(init: std.process.Init) !void {
     try statementLifecycle();
     try malformed();
     try authenticationContracts();
+    try routedStartupContracts();
     try backendErrorStates();
     try fuzz();
     var report: [256]u8 = undefined;

@@ -184,6 +184,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try ctx.addDependency(test_all, test_packed);
     _ = try addContract(ctx, test_packed, "contract-packed-integer", "tests/test_packed_integer.sig", &.{importEntry("packed_integer", "src/core/packed_integer.sig")});
     _ = try ctx.addModule("db_store", "src/db/store.sig");
+    _ = try ctx.addModule("database_registry", "src/db/database_registry.sig");
     const pg_module = try ctx.addModule("postgres", "src/db/postgres.sig");
     try wire(ctx, pg_module, "scram", "src/db/scram.sig");
     try wire(ctx, pg_module, "sql", "src/core/sql.sig");
@@ -211,6 +212,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("sql","src/core/sql.sig"),importEntry("worker_thread","src/platform/worker_thread.sig"),importEntry("db_store","src/db/store.sig")});
     const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
     try ctx.addDependency(test_all, test_db);
+    _ = try addContract(ctx, test_db, "contract-db-registry", "tests/test_db_registry.sig", &.{
+        importEntry("sql", "src/core/sql.sig"), importEntry("database_registry", "src/db/database_registry.sig"),
+    });
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
     inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock", "pg_copy", "pg_explain", "page_region" }) |name| {
         _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{

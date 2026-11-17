@@ -73,6 +73,41 @@ pub fn Parser(comptime config: types.Config) type {
             return self.statement();
         }
 
+        const DatabaseName = types.Values(config).Name;
+        pub const DatabaseCommand = union(enum) {
+            create: DatabaseName,
+            drop: struct { name: DatabaseName, if_exists: bool },
+        };
+
+        /// A cluster owner can recognize these utility statements without
+        /// borrowing a database workspace or changing the normal SQL parser.
+        pub fn parseDatabaseCommand(source: []const u8, options: Options) Error!?DatabaseCommand {
+            if (options.mode != .standard or options.dialect != .postgres) return null;
+            var tokens: lexer.Tokenizer = .{ .source = source, .text_limit = config.text_bytes };
+            const first = try tokens.next();
+            const create = wordIs(source, first, "create");
+            if (!create and !wordIs(source, first, "drop")) return null;
+            if (!wordIs(source, try tokens.next(), "database")) return null;
+
+            var token = try tokens.next();
+            const if_exists = !create and wordIs(source, token, "if");
+            if (if_exists) {
+                if (!wordIs(source, try tokens.next(), "exists")) return error.Syntax;
+                token = try tokens.next();
+            }
+            const ident = try identToken(token, .standard);
+            var name: DatabaseName = .{ .len = ident.len };
+            identBytes(source, ident, &name.bytes);
+            var end = try tokens.next();
+            if (end.kind == .symbol and end.symbol == .semicolon) {
+                end = try tokens.next();
+                if (end.kind != .end) return error.Syntax;
+            }
+            if (end.kind == .word) return error.UnsupportedStatement;
+            if (end.kind != .end) return error.Syntax;
+            return if (create) .{ .create = name } else .{ .drop = .{ .name = name, .if_exists = if_exists } };
+        }
+
         pub const Explain = struct { analyze: bool = false };
         pub const Parsed = struct { command: Ast.Statement, explain: ?Explain = null };
 
@@ -216,16 +251,19 @@ pub fn Parser(comptime config: types.Config) type {
             self.recursion -= 1;
         }
 
-        fn identCurrent(self: *const Self) Error!ast.Ident {
-            const token = self.current;
+        fn identToken(token: Token, mode: Mode) Error!ast.Ident {
             if (token.kind == .quoted_word) {
                 if (token.len > config.name_bytes) return error.NameCapacity;
                 return .{ .span = .{ .start = token.start, .len = token.end - token.start }, .quoted = true, .len = token.len };
             }
-            const legacy_quantifier_name = self.mode == .legacy_alpha and (token.keyword == .any or token.keyword == .some);
+            const legacy_quantifier_name = mode == .legacy_alpha and (token.keyword == .any or token.keyword == .some);
             if (token.kind != .word or (lexer.reserved(token.keyword) and !legacy_quantifier_name)) return error.Syntax;
             if (token.len > config.name_bytes) return error.NameCapacity;
             return .{ .span = .{ .start = token.start, .len = token.len }, .len = token.len };
+        }
+
+        fn identCurrent(self: *const Self) Error!ast.Ident {
+            return identToken(self.current, self.mode);
         }
 
         fn identifier(self: *Self) Error!ast.Ident {

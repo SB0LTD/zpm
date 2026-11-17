@@ -248,6 +248,8 @@ pub fn Database(comptime config: Config) type {
         const Self = @This();
         pub const integer_type: DataType = B.integer_type;
         pub const Name = V.Name;
+        pub const DatabaseCommand = P.DatabaseCommand;
+        pub const parseDatabaseCommand = P.parseDatabaseCommand;
         pub const Text = V.Text;
         pub const Cell = V.Cell;
         pub const CellTag = V.CellTag;
