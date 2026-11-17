@@ -258,6 +258,7 @@ pub fn Database(comptime config: Config) type {
         pub const StorageBacking = S.Backing;
         pub const StorageRowSlot = S.RowSlot;
         pub const StorageVersion = S.Version;
+        pub const StorageVersionRow = S.VersionRow;
         pub const ReplayScratch = C.Scratch;
         pub const Snapshot = storage.Snapshot;
         pub const LockSet = L.Set;
@@ -679,7 +680,7 @@ pub fn Database(comptime config: Config) type {
                 const required=try Context.backingBytesFor(rows,reference_count);
                 if(bytes.len<required) return error.WorkspaceCapacity;
                 const own=try objectSpan(self);
-                if(overlaps(own,try span(bytes))) return error.InvalidParameterValue;
+                if(overlaps(own,try StorageSpan.of(bytes))) return error.InvalidParameterValue;
                 const cells=try Self.storageView(Cell,bytes,0,rows*2*config.columns);
                 const refs=try Self.storageView(u32,bytes,try Self.queryWorkspaceBytes(rows),reference_count);
                 self.workspace.query.cells=cells;self.workspace.query.refs=refs;
@@ -691,12 +692,6 @@ pub fn Database(comptime config: Config) type {
                 if(last[1]!=0) return error.InvalidParameterValue;
                 return .{.start=first,.end=last[0]};
             }
-            fn span(values:anytype) Error!StorageSpan {
-                const bytes=@mulWithOverflow(values.len,@sizeOf(@TypeOf(values[0])));
-                const last=@addWithOverflow(@intFromPtr(values.ptr),bytes[0]);
-                if(bytes[1]!=0 or last[1]!=0) return error.InvalidParameterValue;
-                return .{.start=@intFromPtr(values.ptr),.end=last[0]};
-            }
             fn overlaps(a:StorageSpan,b:StorageSpan) bool {
                 return a.start<a.end and b.start<b.end and a.start<b.end and b.start<a.end;
             }
@@ -705,16 +700,16 @@ pub fn Database(comptime config: Config) type {
                 if(cells.len<2*config.columns or refs.len==0) return error.WorkspaceCapacity;
                 const empty:StorageSpan=.{.start=0,.end=0};
                 const mutable=[_]StorageSpan{try objectSpan(self),
-                    if(config.external_workspace) try span(cells) else empty,
-                    if(config.external_storage) try span(refs) else empty,
+                    if(config.external_workspace) try StorageSpan.of(cells) else empty,
+                    if(config.external_storage) try StorageSpan.of(refs) else empty,
                     if(result) |out| try objectSpan(out) else empty,
-                    if(config.external_results and result!=null) try span(result.?.rows) else empty};
-                const db_span=try objectSpan(db);const source_span=try span(source);
+                    if(config.external_results and result!=null) try StorageSpan.of(result.?.rows) else empty};
+                const db_span=try objectSpan(db);const source_span=try StorageSpan.of(source);
                 for(mutable,0..) |part,index| {
                     if(overlaps(part,db_span) or overlaps(part,source_span)) return error.InvalidParameterValue;
                     for(mutable[0..index]) |earlier| if(overlaps(part,earlier)) return error.InvalidParameterValue;
-                    for(&db.tables) |*table| inline for(.{"rows","versions","row_index","key_index","scan_values","scan_nonnull","scan_live","scan_presence","index_slots"}) |name| {
-                        if(overlaps(part,try span(@field(table,name)[0..]))) return error.InvalidParameterValue;
+                    for(&db.tables) |*table| inline for(storage_fields) |name| {
+                        if(overlaps(part,try StorageSpan.of(@field(table,name)[0..]))) return error.InvalidParameterValue;
                     };
                 }
             }
@@ -923,8 +918,11 @@ pub fn Database(comptime config: Config) type {
             set: *const fn (?*anyopaque, []const u8, []const u8, bool, bool) Error!bool,
         };
 
+        const storage_fields = .{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" } ++
+            (if (S.split_versions) .{"version_rows"} else .{});
+
         const BackingLayout = struct {
-            offsets: [config.tables][9]usize,
+            offsets: [config.tables][storage_fields.len]usize,
             refs: usize,
             bytes: usize,
             row_index: [config.tables]usize,
@@ -972,6 +970,7 @@ pub fn Database(comptime config: Config) type {
                 const index_slots = @mulWithOverflow(ki, S.bound_indexes);
                 if (index_slots[1] != 0) return error.InvalidParameterValue;
                 offsets[8] = if (S.bound_indexes != 0) try appendLayout(&cursor, u32, index_slots[0]) else cursor;
+                if (comptime S.split_versions) offsets[9] = try appendLayout(&cursor, S.VersionRow, versions);
             }
             layout.refs = try appendLayout(&cursor, u32, refs);
             layout.bytes = cursor;
@@ -1006,14 +1005,14 @@ pub fn Database(comptime config: Config) type {
             if (comptime !config.external_workspace) @compileError("bindWorkspace requires external_workspace");
             if (self.csn != 0 or cells.len < 2 * config.columns or cells.len > 0xffffffff) return error.InvalidParameterValue;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
-            const region = StorageSpan.of(cells);
+            const region = try StorageSpan.of(cells);
             const own: StorageSpan = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
             if (region.start < own.end and own.start < region.end) return error.InvalidParameterValue;
             if (comptime config.external_storage) {
-                const refs = StorageSpan.of(self.workspace.query.refs);
+                const refs = try StorageSpan.of(self.workspace.query.refs);
                 if (refs.start < refs.end and region.start < refs.end and refs.start < region.end) return error.InvalidParameterValue;
-                for (&self.tables) |*table| inline for (.{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" }) |field| {
-                    const part = StorageSpan.of(@field(table, field));
+                for (&self.tables) |*table| inline for (storage_fields) |field| {
+                    const part = try StorageSpan.of(@field(table, field));
                     if (part.start < part.end and region.start < part.end and part.start < region.end) return error.InvalidParameterValue;
                 };
             }
@@ -1047,6 +1046,7 @@ pub fn Database(comptime config: Config) type {
             for (&backings, layout.offsets, layout.row_index, layout.key_index, budgets) |*backing, offsets, ri, ki, budget| backing.* = .{
                 .rows = try storageView(S.RowSlot, bytes, offsets[0], budget.rows),
                 .versions = try storageView(S.Version, bytes, offsets[1], budget.versions),
+                .version_rows = if (comptime S.split_versions) try storageView(S.VersionRow, bytes, offsets[9], budget.versions) else {},
                 .row_index = try storageView(u32, bytes, offsets[2], ri),
                 .key_index = try storageView(u32, bytes, offsets[3], ki),
                 .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) budget.rows * config.columns else 0),
@@ -1062,9 +1062,12 @@ pub fn Database(comptime config: Config) type {
             start: usize,
             end: usize,
 
-            fn of(values: anytype) StorageSpan {
+            fn of(values: anytype) Error!StorageSpan {
                 const start = @intFromPtr(values.ptr);
-                return .{ .start = start, .end = start + values.len * @sizeOf(@TypeOf(values[0])) };
+                const size = @mulWithOverflow(values.len, @sizeOf(@TypeOf(values[0])));
+                const end = @addWithOverflow(start, size[0]);
+                if (size[1] != 0 or end[1] != 0) return error.InvalidParameterValue;
+                return .{ .start = start, .end = end[0] };
             }
         };
 
@@ -1077,21 +1080,15 @@ pub fn Database(comptime config: Config) type {
             if (self.csn != 0 or refs.len == 0 or refs.len > 0x7fffffff) return error.InvalidParameterValue;
             for (&self.tables) |*table| if (table.live) return error.InvalidParameterValue;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
-            var spans: [config.tables * 9 + 3]StorageSpan = undefined;
+            var spans: [config.tables * storage_fields.len + 3]StorageSpan = undefined;
             spans[0] = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
-            spans[1] = StorageSpan.of(refs);
-            spans[spans.len - 1] = if (comptime config.external_workspace) StorageSpan.of(self.workspace.query.cells) else .{ .start = 0, .end = 0 };
+            spans[1] = try StorageSpan.of(refs);
+            spans[spans.len - 1] = if (comptime config.external_workspace) try StorageSpan.of(self.workspace.query.cells) else .{ .start = 0, .end = 0 };
             for (backings, 0..) |backing, i| {
                 if (!backing.valid()) return error.InvalidParameterValue;
-                spans[2 + i * 9] = StorageSpan.of(backing.rows);
-                spans[3 + i * 9] = StorageSpan.of(backing.versions);
-                spans[4 + i * 9] = StorageSpan.of(backing.row_index);
-                spans[5 + i * 9] = StorageSpan.of(backing.key_index);
-                spans[6 + i * 9] = StorageSpan.of(backing.scan_values);
-                spans[7 + i * 9] = StorageSpan.of(backing.scan_nonnull);
-                spans[8 + i * 9] = StorageSpan.of(backing.scan_live);
-                spans[9 + i * 9] = StorageSpan.of(backing.scan_presence);
-                spans[10 + i * 9] = StorageSpan.of(backing.index_slots);
+                inline for (storage_fields, 0..) |field, index| {
+                    spans[2 + i * storage_fields.len + index] = try StorageSpan.of(@field(backing, field));
+                }
             }
             for (spans, 0..) |a, i| for (spans[i + 1 ..]) |b| {
                 if (a.start == a.end or b.start == b.end) continue;
@@ -1100,6 +1097,7 @@ pub fn Database(comptime config: Config) type {
             for (&self.tables, backings) |*table, backing| {
                 table.rows = backing.rows;
                 table.versions = backing.versions;
+                if (comptime S.split_versions) table.version_rows = backing.version_rows;
                 table.row_index = backing.row_index;
                 table.key_index = backing.key_index;
                 table.scan_values = backing.scan_values;
