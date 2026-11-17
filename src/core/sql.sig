@@ -5195,6 +5195,18 @@ pub fn Database(comptime config: Config) type {
             }
         };
 
+        const CopyQuoteNames = struct {
+            columns: [config.columns]Name,
+            count: usize,
+        };
+
+        const CopyForceQuote = union(enum) {
+            none,
+            all,
+            fields: [config.columns]bool,
+            names: CopyQuoteNames,
+        };
+
         /// What a codec needs to run a COPY. FROM: the target columns of
         /// each data field, in field order. TO: the length of the SELECT
         /// written into the caller's buffer (the codec runs it as a query).
@@ -5206,6 +5218,38 @@ pub fn Database(comptime config: Config) type {
             types: [config.columns]DataType = @splat(.integer),
             typmods: [config.columns]i32 = @splat(-1),
             select_len: usize = 0,
+            force_quote: CopyForceQuote = .none,
+
+            /// A query's output names are only known after describing it.
+            pub fn needsQuoteColumns(self: *const CopyInfo) bool {
+                return self.force_quote == .names;
+            }
+
+            pub fn resolveQuoteColumns(self: *CopyInfo, names: []const Name) Error!void {
+                const requested = switch (self.force_quote) {
+                    .names => |*list| list,
+                    else => return,
+                };
+                var fields: [config.columns]bool = @splat(false);
+                for (requested.columns[0..requested.count]) |*wanted| {
+                    for (names, 0..) |*name, field| {
+                        if (!types.same(name.slice(), wanted.slice())) continue;
+                        if (fields[field]) return error.DuplicateColumn;
+                        fields[field] = true;
+                        break;
+                    } else return error.ColumnNotFound;
+                }
+                self.force_quote = .{ .fields = fields };
+            }
+
+            pub fn forceQuoteColumn(self: *const CopyInfo, field: usize) bool {
+                return switch (self.force_quote) {
+                    .none => false,
+                    .all => true,
+                    .fields => |*fields| fields[field],
+                    .names => unreachable,
+                };
+            }
         };
 
         pub const copy_line_bytes = config.copy_line_bytes;
@@ -5216,7 +5260,9 @@ pub fn Database(comptime config: Config) type {
         /// COPY TO 0A000; newline delimiters/NULL, a text delimiter from
         /// `\.a-z0-9`, delimiter = quote and delimiter or quote inside NULL
         /// 22023. NULL longer than 64 bytes is TextCapacity (54000).
-        fn copyOptions(given: *const ast.CopyOptions, direction: ast.CopyDirection) Error!CopyOptions {
+        fn copyOptions(copy: *const A.Copy) Error!CopyOptions {
+            const given = &copy.options;
+            const direction = copy.direction;
             const binary = given.format == .binary;
             const csv = given.format == .csv;
             if (binary and given.delimiter.set) return error.Syntax;
@@ -5258,6 +5304,7 @@ pub fn Database(comptime config: Config) type {
                     out.escape = given.escape.bytes[0];
                 }
             }
+            if ((copy.force_quote_all or copy.force_quote_count != 0) and (!csv or direction != .to)) return error.UnsupportedStatement;
             for (null_text) |byte| if (byte == out.delimiter) return error.InvalidParameterValue;
             if (csv) for (null_text) |byte| if (byte == out.quote) return error.InvalidParameterValue;
             return out;
@@ -5292,12 +5339,17 @@ pub fn Database(comptime config: Config) type {
         /// columns or the given ones).
         pub fn copyInfo(self: *Self, slot: ?u16, source: []const u8, select: []u8) Error!CopyInfo {
             const copy = try self.parseCopy(source);
-            var info: CopyInfo = .{ .direction = copy.direction, .options = try copyOptions(&copy.options, copy.direction) };
+            var info: CopyInfo = .{ .direction = copy.direction, .options = try copyOptions(&copy) };
+            if (copy.force_quote_all) info.force_quote = .all;
             var snap: Snapshot = .{ .csn = self.csn };
             if (slot) |owner| if (self.active(owner)) {
                 snap = .{ .csn = self.csn, .slot = owner, .epoch = self.txs[owner].epoch, .cid = self.txs[owner].cid +% 1 };
             };
             if (copy.query) |span| {
+                if (copy.force_quote_count != 0) info.force_quote = .{ .names = .{
+                    .columns = copy.force_quote_columns,
+                    .count = copy.force_quote_count,
+                } };
                 var used: usize = 0;
                 try appendText(select, &used, span.slice(source));
                 info.select_len = used;
@@ -5305,6 +5357,7 @@ pub fn Database(comptime config: Config) type {
             }
             const context = self.bindContext(source, .standard, snap);
             const bound = try B.bindCopy(&context, &copy, false);
+            if (copy.force_quote_count != 0) info.force_quote = .{ .fields = bound.force_quote };
             const table = &self.tables[bound.table];
             info.count = bound.count;
             for (bound.mapping[0..bound.count], 0..) |column, field| {
@@ -5349,7 +5402,7 @@ pub fn Database(comptime config: Config) type {
                 if (tx.pin != null or tx.copy_table != null) return error.QueryCanceled;
                 const copy = try self.parseCopy(source);
                 if (copy.direction != .from) return error.UnsupportedStatement;
-                _ = try copyOptions(&copy.options, copy.direction);
+                _ = try copyOptions(&copy);
                 if (tx.sub_len >= M.sub_capacity) return error.SavepointCapacity;
                 tx.cid +%= 1;
                 snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
@@ -5388,7 +5441,7 @@ pub fn Database(comptime config: Config) type {
                 // COPY FROM is not supported with row-level security (0A000).
                 if (self.catalog_objects.rowSecurity(self.session.role, self.tables[bound.table].oid, snap)) return error.UnsupportedStatement;
             }
-            var info: CopyInfo = .{ .direction = .from, .options = try copyOptions(&copy.options, .from), .count = bound.count };
+            var info: CopyInfo = .{ .direction = .from, .options = try copyOptions(&copy), .count = bound.count };
             const table = &self.tables[bound.table];
             for (bound.mapping[0..bound.count], 0..) |column, field| {
                 info.names[field] = table.columns[column].name;

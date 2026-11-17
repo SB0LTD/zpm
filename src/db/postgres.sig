@@ -739,13 +739,25 @@ pub fn Session(comptime DB: type) type {
             };
         }
 
+        fn resolveCopyQuoteColumns(self: *Self, db: *DB, query: []const u8, info: *CopyInfo) !void {
+            if (comptime @hasDecl(CopyInfo, "needsQuoteColumns") and @hasDecl(CopyInfo, "resolveQuoteColumns")) {
+                if (!info.needsQuoteColumns()) return;
+                if (comptime @hasDecl(DB, "describe")) {
+                    try db.describe(query, &self.result);
+                    try info.resolveQuoteColumns(self.result.column_names[0..self.result.column_count]);
+                } else return error.UnsupportedStatement;
+            }
+        }
+
         /// COPY TO STDOUT runs its SELECT and streams CopyData; COPY FROM
         /// STDIN opens the store's COPY and sends CopyInResponse.
         fn startCopy(self: *Self, db: *DB, source: []const u8, w: *Writer) !void {
             var select: [sql_capacity + 1024]u8 = undefined;
-            const info = try db.copyDescribe(source, &select);
+            var info = try db.copyDescribe(source, &select);
             if (info.direction == .to) {
-                try self.execute(db, select[0..info.select_len]);
+                const query = select[0..info.select_len];
+                try self.resolveCopyQuoteColumns(db, query, &info);
+                try self.execute(db, query);
                 return self.copyOut(db, &info, w);
             }
             if (source.len > sql_capacity) return error.StatementCapacity;
@@ -824,7 +836,10 @@ pub fn Session(comptime DB: type) type {
                             continue;
                         }
                         const length = T.sendText(cell, session, &text) catch return error.BufferTooSmall;
-                        if (options.format == .csv) try pg_copy.appendCsv(&options, text[0..length], count == 1, &sink) else try pg_copy.appendText(&options, text[0..length], &sink);
+                        if (options.format == .csv) {
+                            const forced = if (comptime @hasDecl(CopyInfo, "forceQuoteColumn")) info.forceQuoteColumn(field) else false;
+                            try pg_copy.appendCsvField(&options, text[0..length], count == 1, forced, &sink);
+                        } else try pg_copy.appendText(&options, text[0..length], &sink);
                     }
                     try sink.byte('\n');
                     w.at += sink.at;

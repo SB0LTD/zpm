@@ -713,8 +713,12 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn columnIndex(context: *const Context, entry: *const S.Table, ident: ast.Ident) Error!usize {
             const wanted = toName(context, ident);
+            return namedColumn(entry, wanted.slice());
+        }
+
+        fn namedColumn(entry: *const S.Table, wanted: []const u8) Error!usize {
             for (entry.columns[0..entry.column_count], 0..) |*column, index|
-                if (types.same(column.name.slice(), wanted.slice())) return index;
+                if (types.same(column.name.slice(), wanted)) return index;
             return error.ColumnNotFound;
         }
 
@@ -8654,6 +8658,7 @@ pub fn Binder(comptime config: types.Config) type {
             table: usize,
             mapping: [config.columns]u8 = undefined,
             count: usize = 0,
+            force_quote: [config.columns]bool = @splat(false),
             defaults: [config.columns]u16 = @splat(none),
             generated: [config.columns]u16 = @splat(none),
             checks: [config.table_constraints]u16 = @splat(none),
@@ -8683,6 +8688,20 @@ pub fn Binder(comptime config: types.Config) type {
                     out.mapping[out.count] = @intCast(position);
                     out.count += 1;
                 }
+            }
+            if (copy.force_quote_count != 0) {
+                var requested: [config.columns]bool = @splat(false);
+                for (copy.force_quote_columns[0..copy.force_quote_count]) |*name| {
+                    const column = try namedColumn(entry, name.slice());
+                    if (entry.columns[column].default_kind == .generated) return error.InvalidColumnReference;
+                    if (requested[column]) return error.DuplicateColumn;
+                    requested[column] = true;
+                }
+                for (out.mapping[0..out.count], 0..) |column, field| {
+                    out.force_quote[field] = requested[column];
+                    requested[column] = false;
+                }
+                for (requested) |missing| if (missing) return error.InvalidColumnReference;
             }
             if (with_defaults) {
                 var needed: [config.columns]bool = @splat(true);

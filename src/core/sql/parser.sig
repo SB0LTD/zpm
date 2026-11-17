@@ -762,11 +762,11 @@ pub fn Parser(comptime config: types.Config) type {
             _ = try self.takeWord("WITH");
             if (try self.takeSymbol(.lparen)) {
                 while (true) {
-                    try self.copyGenericOption(&out.options);
+                    try self.copyGenericOption(&out);
                     if (!try self.takeSymbol(.comma)) break;
                 }
                 try self.expectSymbol(.rparen);
-            } else try self.copyLegacyOptions(&out.options);
+            } else try self.copyLegacyOptions(&out);
             if (self.isWord("WHERE")) return error.UnsupportedStatement;
             try self.finish();
             return out;
@@ -794,7 +794,8 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         /// One `name [argument]` item of the parenthesized option list.
-        fn copyGenericOption(self: *Self, options: *ast.CopyOptions) Error!void {
+        fn copyGenericOption(self: *Self, copy: *Ast.Copy) Error!void {
+            const options = &copy.options;
             if (self.current.kind != .word) return error.Syntax;
             const name = self.current.raw(self.source);
             try self.advance();
@@ -843,7 +844,9 @@ pub fn Parser(comptime config: types.Config) type {
                 var text: ast.CopyText = .{};
                 try self.copyString(&text);
                 if (!(types.keyword(text.slice(), "utf8") or types.keyword(text.slice(), "utf-8"))) return error.UnsupportedStatement;
-            } else if (types.keyword(name, "force_quote") or types.keyword(name, "force_not_null") or types.keyword(name, "force_null") or
+            } else if (types.keyword(name, "force_quote")) {
+                try self.copyForceQuote(copy, false);
+            } else if (types.keyword(name, "force_not_null") or types.keyword(name, "force_null") or
                 types.keyword(name, "default") or types.keyword(name, "on_error") or types.keyword(name, "log_verbosity") or types.keyword(name, "reject_limit"))
             {
                 return error.UnsupportedStatement;
@@ -857,7 +860,39 @@ pub fn Parser(comptime config: types.Config) type {
             return null;
         }
 
-        fn copyLegacyOptions(self: *Self, options: *ast.CopyOptions) Error!void {
+        fn copyForceQuote(self: *Self, copy: *Ast.Copy, legacy: bool) Error!void {
+            if (copy.force_quote_all or copy.force_quote_count != 0) return error.Syntax;
+            if (try self.takeSymbol(.star)) {
+                copy.force_quote_all = true;
+                return;
+            }
+            if (!legacy and !try self.takeSymbol(.lparen)) return error.InvalidParameterValue;
+            while (true) {
+                if (copy.force_quote_count == config.columns) return error.ColumnCapacity;
+                const name = &copy.force_quote_columns[copy.force_quote_count];
+                name.* = .{};
+                const token = self.current;
+                if (!legacy and token.kind == .string) {
+                    if (token.len > name.bytes.len) return error.NameCapacity;
+                    name.len = token.len;
+                    lexer.decodeQuoted(self.source, token.quoted(), name.bytes[0..name.len]);
+                    try self.advance();
+                } else {
+                    const boolean_label = !legacy and (self.rawWord("true") or self.rawWord("false") or self.rawWord("on"));
+                    const ident = if (boolean_label) try self.label() else try self.identifier();
+                    name.len = ident.len;
+                    if (ident.quoted) {
+                        lexer.decodeQuotedWith(self.source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, '"', &name.bytes);
+                    } else for (ident.span.slice(self.source), 0..) |byte, i| name.bytes[i] = types.lower(byte);
+                }
+                copy.force_quote_count += 1;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            if (!legacy) try self.expectSymbol(.rparen);
+        }
+
+        fn copyLegacyOptions(self: *Self, copy: *Ast.Copy) Error!void {
+            const options = &copy.options;
             while (self.current.kind == .word) {
                 if (try self.takeRaw("binary")) {
                     if (options.format_set) return error.Syntax;
@@ -883,7 +918,10 @@ pub fn Parser(comptime config: types.Config) type {
                 } else if (try self.takeRaw("escape")) {
                     _ = try self.takeWord("AS");
                     try self.copyString(&options.escape);
-                } else if (self.rawWord("force") or self.rawWord("freeze") or self.rawWord("encoding")) {
+                } else if (try self.takeRaw("force")) {
+                    if (!try self.takeRaw("quote")) return error.UnsupportedStatement;
+                    try self.copyForceQuote(copy, true);
+                } else if (self.rawWord("freeze") or self.rawWord("encoding")) {
                     return error.UnsupportedStatement;
                 } else return;
             }
