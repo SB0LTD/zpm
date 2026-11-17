@@ -81,6 +81,8 @@ pub fn Exec(comptime config: types.Config) type {
             groups: usize = 0,
             date_key_memo_hits: usize = 0,
             date_key_memo_misses: usize = 0,
+            dimension_date_group_plans: usize = 0,
+            dimension_date_keys: usize = 0,
             probes: usize = 0,
             window_frame_rows:usize=0,
             window_prefix_rows:usize=0,
@@ -2299,6 +2301,46 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             const DimensionMap=struct {mapping:u32,dictionary:u32,groups:usize};
+            const DateKeys = struct {
+                days: u32,
+                values: u32,
+                buckets: u32,
+                slots: usize,
+                count: usize = 0,
+            };
+
+            fn dateGroupIndex(self: *Query, keys: *DateKeys, day_index: usize, value: V.Cell, expression: u16, column: *const ast.Node, ctx: *E.Context, row_values: *[config.columns]V.Cell) Error!usize {
+                const encoded = &self.work.refs[keys.days + day_index];
+                row_values[column.column] = value;
+                ctx.tuple[0] = row_values;
+                const formatted = try E.eval(ctx, expression);
+                self.work.stream_stats.dimension_date_keys += 1;
+                const hash = if (formatted == .null_value) @as(usize, 0x9e3779b9) else V.hash(&formatted);
+                var bucket = hash & (keys.slots - 1);
+                while (true) : (bucket = (bucket + 1) & (keys.slots - 1)) {
+                    try self.session.checkpoint();
+                    self.work.stream_stats.probes += 1;
+                    const found = &self.work.refs[keys.buckets + bucket];
+                    if (found.* == absent) {
+                        const index: u32 = @intCast(keys.count);
+                        self.work.cells[keys.values + index] = formatted;
+                        found.* = index;
+                        keys.count += 1;
+                    } else if (V.compare(&formatted, &self.work.cells[keys.values + found.*]) != 0) continue;
+                    encoded.* = found.*;
+                    return found.*;
+                }
+            }
+
+            fn dimensionChain(self: *const Query, p: *const B.Plan, join_column: u16) bool {
+                for (p.sources[1..p.source_count], 1..) |source, stage| {
+                    if (source.join != .inner or source.table == null or source.probe == none or
+                        !self.factorOperand(source.probe, join_column) or !self.earlyAvailable(source.probe, stage - 1) or
+                        !self.factorOn(source.on, join_column) or !self.earlyAvailable(source.on, stage)) return false;
+                    if (self.tables[source.table.?].primary_column == null) return false;
+                }
+                return true;
+            }
             /// Inputs have already proven unique-key, nonthrowing dependencies
             /// in source order. Mapping cells own their label and zeroed payload.
             fn dimensionMap(self:*Query,p:*const B.Plan,label_id:u16,join_column:u16,keys:S.IntegerBounds,
@@ -2353,12 +2395,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if(p.sources[1].probe==none) return null;
                 const join_key=self.pool.nodes[p.sources[1].probe];
                 if(join_key.kind!=.column or join_key.level!=0 or join_key.relation!=0 or !value_module.integral(join_key.ty)) return null;
-                for(p.sources[1..p.source_count],1..) |source,stage| {
-                    if(source.join!=.inner or source.table==null or source.probe==none or
-                        !self.factorOperand(source.probe,join_key.column) or !self.earlyAvailable(source.probe,stage-1) or
-                        !self.factorOn(source.on,join_key.column) or !self.earlyAvailable(source.on,stage)) return null;
-                    if(self.tables[source.table.?].primary_column==null) return null;
-                }
+                if (!self.dimensionChain(p, join_key.column)) return null;
                 const label=self.pool.nodes[p.keys[0]];
                 if(label.kind!=.column or label.level!=0 or label.relation==0 or label.relation>=p.source_count or
                     !S.summaryKeyType(self.tables[p.sources[label.relation].table.?].columns[label.column].data_type)) return null;
@@ -2434,20 +2471,24 @@ pub fn Exec(comptime config: types.Config) type {
             /// Collapse a unique dimension to compact group IDs once, then fold
             /// fact measures by (group ID, integral fact key). Cells and text
             /// hashing are outside the fact loop. No persistent derived index.
-            noinline fn dimensionGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table) Error!?List {
-                if(outer!=null or p.correlated or p.source_count!=2 or p.key_count!=2 or p.agg_count==0 or p.where!=none or
+            noinline fn dimensionGroup(self:*Query,p:*const B.Plan,outer:?*const E.Context,table:*const S.Table,comptime format_dates: bool) Error!?List {
+                if(outer!=null or p.correlated or p.source_count<2 or p.key_count!=2 or p.agg_count==0 or p.where!=none or
                     !self.committed_only or !table.summary.valid or table.summary.rows<=0 or table.summary.csn>self.snap.csn or table.scan_high!=table.row_high) return null;
                 if(comptime config.numeric_digits<39) return null;
+                if (!format_dates and p.source_count != 2) return null;
                 const source=p.sources[1];
-                if(source.join!=.inner or source.table==null or source.probe==none) return null;
-                const dimension=&self.tables[source.table.?];if(dimension.primary_column==null) return null;
+                if(source.probe==none) return null;
                 const join_key=self.pool.nodes[source.probe];
-                if(join_key.kind!=.column or join_key.level!=0 or join_key.relation!=0 or !value_module.integral(join_key.ty) or !self.factorOn(source.on,join_key.column)) return null;
+                if(join_key.kind!=.column or join_key.level!=0 or join_key.relation!=0 or !value_module.integral(join_key.ty)) return null;
                 const fact_position:usize=if(self.pool.nodes[p.keys[0]].relation==0) 0 else 1;
                 const dimension_position=1-fact_position;
-                const fact_key=self.pool.nodes[p.keys[fact_position]];const label=self.pool.nodes[p.keys[dimension_position]];
-                if(fact_key.kind!=.column or fact_key.level!=0 or fact_key.relation!=0 or !value_module.integral(fact_key.ty) or
-                    label.kind!=.column or label.level!=0 or label.relation!=1 or !S.summaryKeyType(dimension.columns[label.column].data_type)) return null;
+                const fact_key_id = p.keys[fact_position];
+                const fact_key = if (format_dates) (self.dateKeyMemoColumn(fact_key_id) orelse return null).* else self.pool.nodes[fact_key_id];
+                const label=self.pool.nodes[p.keys[dimension_position]];
+                if (!self.dimensionChain(p, join_key.column)) return null;
+                if(fact_key.kind!=.column or fact_key.level!=0 or fact_key.relation!=0 or (!format_dates and !value_module.integral(fact_key.ty)) or
+                    label.kind!=.column or label.level!=0 or label.relation==0 or label.relation>=p.source_count or
+                    !S.summaryKeyType(self.tables[p.sources[label.relation].table.?].columns[label.column].data_type)) return null;
                 var transitions:[config.columns]Transition=undefined;
                 if(!self.prepareTransitions(p,transitions[0..p.agg_count])) return null;
                 for(transitions[0..p.agg_count]) |item| if(item.kind==.sum_integer and table.summary.columns[item.column].nonnull!=0) {
@@ -2470,10 +2511,29 @@ pub fn Exec(comptime config: types.Config) type {
                 const group_cells=@addWithOverflow(1+state_cells,output_cells[0]);if(group_cells[1]!=0) return null;
                 const output_refs=@mulWithOverflow(fact_span,@as(usize,4));if(output_refs[1]!=0) return null;
                 const group_refs=@addWithOverflow(output_refs[0],@as(usize,5));if(group_refs[1]!=0) return null;
-                const capacity=@min(key_span,@min(available_cells/group_cells[0],(available_refs-key_span)/group_refs[0]));
+                // Reserve bounded day-to-key and key-to-value dictionaries.
+                // The admitted date span includes one independent NULL day.
+                var date_slots: usize = 0;
+                if (format_dates) {
+                    if (fact_span > available_refs / 8) return null;
+                    date_slots = 2;
+                    while (date_slots < fact_span * 2) date_slots *= 2;
+                }
+                const date_refs = if (format_dates) date_slots + fact_span else 0;
+                const date_cells = if (format_dates) fact_span else 0;
+                if (date_refs > available_refs - key_span) return null;
+                const capacity=@min(key_span,@min((available_cells-date_cells)/group_cells[0],(available_refs-key_span-date_refs)/group_refs[0]));
                 if(capacity==0) return null;
                 const cell_start=self.work.cell_low;const ref_start=self.work.ref_low;
                 const map=try self.dimensionMap(p,p.keys[dimension_position],join_key.column,keys,key_span,capacity,1+state_cells);
+                var formatted_keys: DateKeys = undefined;
+                var date_values: [config.columns]V.Cell = undefined;
+                var date_context = self.context(null);
+                if (format_dates) {
+                    formatted_keys = .{ .days = try self.refs(fact_span), .values = try self.cells(fact_span), .buckets = try self.refs(date_slots), .slots = date_slots };
+                    @memset(self.work.refs[formatted_keys.days..][0..fact_span], absent);
+                    @memset(self.work.refs[formatted_keys.buckets..][0..date_slots], absent);
+                }
                 const key_nonnull=table.summary.columns[join_key.column].nonnull==table.summary.rows;
                 const fact_nonnull=table.summary.columns[fact_key.column].nonnull==table.summary.rows;
                 const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));
@@ -2489,8 +2549,15 @@ pub fn Exec(comptime config: types.Config) type {
                         const key:usize=@intCast(@as(i128,table.scan_values[@as(usize,join_key.column)*table.rows.len+slot])-keys.low);
                         const record=self.work.refs[map.mapping+key];if(record==absent) continue;
                         const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);
-                        const value:usize=if(!fact_nonnull and flags&(@as(u64,1)<<@intCast(fact_key.column))==0) fact_span-1 else
-                            @intCast(@as(i128,table.scan_values[@as(usize,fact_key.column)*table.rows.len+slot])-facts.low);
+                        const has_key = fact_nonnull or flags&(@as(u64,1)<<@intCast(fact_key.column))!=0;
+                        const scalar = if (has_key) table.scan_values[@as(usize,fact_key.column)*table.rows.len+slot] else 0;
+                        const fact_index: usize = if (has_key) @intCast(@as(i128,scalar)-facts.low) else fact_span-1;
+                        const value = if (format_dates) blk: {
+                            const cached = self.work.refs[formatted_keys.days + fact_index];
+                            if (cached != absent) break :blk @as(usize, cached);
+                            break :blk try self.dateGroupIndex(&formatted_keys, fact_index,
+                                if (has_key) .{.date=@intCast(scalar)} else .null_value, fact_key_id, &fact_key, &date_context, &date_values);
+                        } else fact_index;
                         const state=partial+value*stride;factorRows(state).*+=1;self.work.stream_stats.dimension_group_rows+=1;
                         for(transitions[0..p.agg_count],factorStates(state,p.agg_count),0..) |item,*channel,index| {
                             if(item.kind!=.count_star and !nonnull[index] and flags&(@as(u64,1)<<@intCast(item.column))==0) continue;
@@ -2500,14 +2567,16 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 var records:List=.{};
+                const bucket_count = if (format_dates) formatted_keys.count else fact_span;
                 for(self.work.refs[map.dictionary..][0..map.groups]) |record| {
                     const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);
-                    for(0..fact_span) |index| {
-                        const bucket=if(index==0) fact_span-1 else index-1;
+                    for(0..bucket_count) |index| {
+                        const bucket=if (format_dates) index else if(index==0) fact_span-1 else index-1;
                         if(factorRows(partial+bucket*stride).*==0) continue;
                         const at=try self.cells(4+p.agg_count);
                         self.work.cells[at+dimension_position]=self.work.cells[record];
-                        self.work.cells[at+fact_position]=if(bucket==fact_span-1) .null_value else .{.integer=@intCast(@as(i128,facts.low)+bucket)};
+                        self.work.cells[at+fact_position]=if (format_dates) self.work.cells[formatted_keys.values+bucket] else
+                            if(bucket==fact_span-1) .null_value else .{.integer=@intCast(@as(i128,facts.low)+bucket)};
                         self.work.cells[at+2+p.agg_count]=.{.integer=record};self.work.cells[at+3+p.agg_count]=.{.integer=@intCast(bucket)};
                         try self.push(&records,at);
                     }
@@ -2526,6 +2595,7 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 const result=try self.finish(p,out);
                 self.work.stream_stats.dimension_group_plans+=1;self.work.stream_stats.dimension_group_ids+=map.groups;
+                if (format_dates) self.work.stream_stats.dimension_date_group_plans += 1;
                 self.work.stream_stats.groups+=records.count;
                 self.work.stream_stats.scratch_cells=@max(self.work.stream_stats.scratch_cells,self.work.cell_low-cell_start);
                 self.work.stream_stats.scratch_refs=@max(self.work.stream_stats.scratch_refs,self.work.ref_low-ref_start);
@@ -2545,7 +2615,11 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 if(comptime config.dimension_group_ids and S.compact_enabled) {
                     const at=self.mark();const stats=self.work.stream_stats;
-                    if(self.dimensionGroup(p,outer,table)) |result| {if(result) |rows| return rows;} else |err| {
+                    if(self.dimensionGroup(p,outer,table,false)) |result| {if(result) |rows| return rows;} else |err| {
+                        if(err!=error.WorkspaceCapacity) return err;
+                        self.release(at);self.work.stream_stats=stats;
+                    }
+                    if(self.dimensionGroup(p,outer,table,true)) |result| {if(result) |rows| return rows;} else |err| {
                         if(err!=error.WorkspaceCapacity) return err;
                         self.release(at);self.work.stream_stats=stats;
                     }
