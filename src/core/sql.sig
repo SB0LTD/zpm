@@ -1087,10 +1087,17 @@ pub fn Database(comptime config: Config) type {
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
-                for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
+                // Metadata-only Describe does not call evaluation hooks.
+                if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
-                    // Catalog-object text needs the serialized database hook.
+                    // These catalog lookups use the serialized database hook.
+                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
+                    .current_setting,.set_config,.pg_backend_pid,
+                    .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
+                    .pg_try_advisory_xact_lock,.pg_try_advisory_xact_lock_shared,
+                    .pg_advisory_unlock,.pg_advisory_unlock_shared,
+                    .routine,.routine_param=>return error.UnsupportedStatement,
                     else=>{},
                 };
                 self.prepared=switch(bound){.select=>|select| .{.simple=select},.query=>|root| .{.general=root},else=>return error.UnsupportedStatement};
