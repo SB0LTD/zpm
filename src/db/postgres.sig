@@ -17,14 +17,53 @@ pub const parameter_capacity: usize = 32;
 /// A CancelRequest's key; the caller looks it up (the codec never does).
 pub const Cancel = struct { pid: u32, secret: u32 };
 
+const startup_version: u32 = 196608;
+const cancel_code: u32 = 80877102;
+const ssl_code: u32 = 80877103;
+const gss_code: u32 = 80877104;
+
+pub const StartupFrame = union(enum) {
+    /// Minimum number of bytes to buffer before checking again.
+    incomplete: usize,
+    invalid_length,
+    protocol_violation: usize,
+    unsupported_protocol: usize,
+    ssl_request,
+    gss_request,
+    cancel: Cancel,
+    /// The StartupMessage parameters, excluding the length and version.
+    startup: []const u8,
+};
+
+/// Classify one untyped startup frame, leaving coalesced bytes to the caller.
+/// An encryption request alone never changes session or transport state.
+pub fn classifyStartup(input: []const u8) StartupFrame {
+    if (input.len < 4) return .{ .incomplete = 4 };
+    const size: usize = read32(input[0..4]);
+    if (size < 4 or size > max_packet) return .invalid_length;
+    if (input.len < @min(size, 8)) return .{ .incomplete = @min(size, 8) };
+    if (size < 8) return .{ .protocol_violation = size };
+    if (input.len < size) return .{ .incomplete = size };
+    return switch (read32(input[4..8])) {
+        startup_version => .{ .startup = input[8..size] },
+        ssl_code => if (size == 8) .ssl_request else .{ .protocol_violation = size },
+        gss_code => if (size == 8) .gss_request else .{ .protocol_violation = size },
+        cancel_code => if (size == 16) .{ .cancel = .{ .pid = read32(input[8..12]), .secret = read32(input[12..16]) } }
+            else .{ .unsupported_protocol = size },
+        else => .{ .unsupported_protocol = size },
+    };
+}
+
 /// Inspect only the untyped startup header; never executes a session or SQL.
 pub fn isCancelHeader(input: []const u8) bool {
-    return input.len >= 8 and read32(input[0..4]) == 16 and read32(input[4..8]) == 80877102;
+    return input.len >= 8 and read32(input[0..4]) == 16 and read32(input[4..8]) == cancel_code;
 }
 
 pub fn parseCancel(input: []const u8) ?Cancel {
-    if (input.len < 16 or !isCancelHeader(input)) return null;
-    return .{ .pid = read32(input[8..12]), .secret = read32(input[12..16]) };
+    return switch (classifyStartup(input)) {
+        .cancel => |key| key,
+        else => null,
+    };
 }
 /// `blocked`: the message's statement is parked on a lock (consumed =
 /// written = 0); re-deliver the same bytes when the store reports progress.
@@ -355,7 +394,8 @@ pub fn Session(comptime DB: type) type {
             if (self.oversize_remaining != 0) return self.discardOversize(db, input, output, 0);
             if (self.authentication) |*auth| if (auth.state == .failed) return .{ .close = true };
             if (has_copy and self.copy.mode != .none) return self.copyHandle(db, input, output);
-            const prefix: usize = if (self.startup) 1 else 0;
+            if (!self.startup) return self.handleStartup(db, input, output);
+            const prefix: usize = 1;
             if (input.len < prefix + 4) return .{};
             const size = read32(input[prefix..][0..4]);
             var w: Writer = .{ .bytes = output };
@@ -363,7 +403,7 @@ pub fn Session(comptime DB: type) type {
                 // Drain a bounded oversized SQL frame without retaining it.
                 // A valid query that exceeds our budget gets a SQL error and
                 // remains synchronized, rather than an unread-body TCP reset.
-                if (self.startup and (self.authentication == null or self.authentication.?.state == .complete) and size > max_packet and size <= 16 * 1024 * 1024 and
+                if ((self.authentication == null or self.authentication.?.state == .complete) and size > max_packet and size <= 16 * 1024 * 1024 and
                     (input[0] == 'Q' or input[0] == 'P' or input[0] == 'B')) {
                     self.oversize_remaining = size - 4;
                     self.oversize_tag = input[0];
@@ -374,18 +414,8 @@ pub fn Session(comptime DB: type) type {
             }
             const total: usize = @as(usize, size) + prefix;
             if (input.len < total) return .{};
-            // Cancellation has no response in PostgreSQL: the key goes to the
-            // caller, which owns the backend-key registry.
-            if (!self.startup) if (parseCancel(input[0..total])) |key|
-                return .{ .consumed = total, .close = true, .cancel = key };
             var close = false;
-            if (!self.startup) {
-                self.handshake(db, input[4..total], &w) catch |err| {
-                    w.at = 0;
-                    try failure(&w, sqlstate(err), @errorName(err));
-                    close = true;
-                };
-            } else if (self.authentication != null and self.authentication.?.state != .complete) {
+            if (self.authentication != null and self.authentication.?.state != .complete) {
                 self.authenticate(db, input[0], input[5..total], &w) catch {
                     self.authentication.?.state = .failed;
                     w.at = 0;
@@ -408,6 +438,37 @@ pub fn Session(comptime DB: type) type {
             }
             return .{ .consumed = total, .written = w.at, .close = close };
         }
+
+        fn handleStartup(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
+            var writer: Writer = .{ .bytes = output };
+            const frame = classifyStartup(input);
+            switch (frame) {
+                .incomplete => return .{},
+                .invalid_length => {
+                    try failure(&writer, "08P01", "invalid packet length");
+                    return .{ .consumed = 4, .written = writer.at, .close = true };
+                },
+                .protocol_violation, .unsupported_protocol => |size| {
+                    const err = if (frame == .protocol_violation) error.ProtocolViolation else error.UnsupportedProtocol;
+                    try failure(&writer, sqlstate(err), @errorName(err));
+                    return .{ .consumed = size, .written = writer.at, .close = true };
+                },
+                .ssl_request, .gss_request => {
+                    try writer.byte('N');
+                    return .{ .consumed = 8, .written = writer.at };
+                },
+                .cancel => |key| return .{ .consumed = 16, .close = true, .cancel = key },
+                .startup => |parameters| {
+                    var close = false;
+                    self.handshake(db, parameters, &writer) catch |err| {
+                        writer.at = 0;
+                        try failure(&writer, sqlstate(err), @errorName(err));
+                        close = true;
+                    };
+                    return .{ .consumed = 8 + parameters.len, .written = writer.at, .close = close };
+                },
+            }
+        }
         /// RAMSQL-supplied BackendKeyData (pid, secret) sent after authentication.
         pub fn configureBackendKey(self: *Self, pid: u32, secret: u32) void {
             self.backend_pid = pid;
@@ -416,13 +477,6 @@ pub fn Session(comptime DB: type) type {
 
         fn handshake(self: *Self, db: *DB, payload: []const u8, w: *Writer) !void {
             var r: Reader = .{ .bytes = payload };
-            const version = try r.u32be();
-            if (version == 80877103 or version == 80877104) {
-                try r.done();
-                try w.byte('N');
-                return;
-            }
-            if (version != 196608) return error.UnsupportedProtocol;
             var user: ?[]const u8 = null;
             while (true) {
                 const key = try r.string();

@@ -16,6 +16,7 @@ const numeric_module = @import("numeric.sig");
 const tablesample = @import("tablesample.sig");
 const collect_module = @import("aggregates_collect.sig");
 const json_eval = @import("json_eval.sig");
+const temporal = @import("temporal.sig");
 const builtin = @import("builtin");
 const Error = types.Error;
 const none = ast.none;
@@ -78,6 +79,8 @@ pub fn Exec(comptime config: types.Config) type {
             gathered_rows: usize = 0,
             distinct_bitmap_bytes: usize = 0,
             groups: usize = 0,
+            date_key_memo_hits: usize = 0,
+            date_key_memo_misses: usize = 0,
             probes: usize = 0,
             window_frame_rows:usize=0,
             window_prefix_rows:usize=0,
@@ -906,6 +909,56 @@ pub fn Exec(comptime config: types.Config) type {
                 const node = &self.pool.nodes[id];
                 if (node.kind == .column and node.level==0 and node.relation==0) return E.columnRef(ctx,node);
                 return E.evalRef(ctx,id,temporary);
+            }
+
+            // One cache per grouping invocation and session zone. Admission
+            // proves that the exact date is the only row-dependent input.
+            const DateKeyMemo = struct {
+                const Entry = struct { day: i32, len: u8, bytes: [32]u8 };
+                const slots = 1024;
+                entries: [slots]Entry = undefined,
+
+                fn reset(self: *DateKeyMemo) void {
+                    for (&self.entries) |*entry| entry.day = temporal.date_no_begin;
+                }
+
+                fn input(self: *DateKeyMemo, ctx: *const E.Context, id: u16, column: *const ast.Node, out: *V.Cell) Error!bool {
+                    const date = E.columnRef(ctx, column);
+                    if (date.* != .date or !temporal.finiteDate(date.date)) {
+                        out.* = try E.eval(ctx, id);
+                        return false;
+                    }
+                    const day = date.date;
+                    const bits: u32 = @bitCast(day);
+                    const entry = &self.entries[bits & (slots - 1)];
+                    if (entry.day == day) {
+                        // Charge the function, cast, column and format visits.
+                        try ctx.session.checkpoints(4);
+                        out.* = .{ .text = .{} };
+                        out.text.len = entry.len;
+                        @memcpy(out.text.bytes[0..entry.len], entry.bytes[0..entry.len]);
+                        return true;
+                    }
+                    out.* = try E.eval(ctx, id);
+                    if (out.* == .text and out.text.len <= entry.bytes.len) {
+                        @memcpy(entry.bytes[0..out.text.len], out.text.slice());
+                        entry.len = @intCast(out.text.len);
+                        entry.day = day;
+                    }
+                    return false;
+                }
+            };
+
+            fn dateKeyMemoColumn(self: *const Query, id: u16) ?*const ast.Node {
+                const call = &self.pool.nodes[id];
+                if (call.kind != .function or call.func != .to_char or call.b == none) return null;
+                const cast = &self.pool.nodes[call.b];
+                if (cast.kind != .cast or cast.cast_type != .timestamptz or cast.typmod != -1 or cast.a == none or cast.next == none) return null;
+                const column = &self.pool.nodes[cast.a];
+                const format = &self.pool.nodes[cast.next];
+                if (column.kind != .column or column.level != 0 or column.ty != .date) return null;
+                if (format.kind != .text_literal or format.ty != .text or format.next != none) return null;
+                return column;
             }
 
             fn addAggregates(self: *Query, p: *const B.Plan, ctx: *E.Context, states: []Accumulator) Error!void {
@@ -2563,6 +2616,17 @@ pub fn Exec(comptime config: types.Config) type {
                 var groups: usize = 0;
                 var computed_keys: [config.columns]V.Cell = undefined;
                 var keys: [config.columns]*const V.Cell = undefined;
+                var date_memo: DateKeyMemo = .{};
+                var date_column: ?*const ast.Node = null;
+                var date_key: usize = 0;
+                for (p.keys[0..p.key_count], 0..) |key, column| {
+                    if (self.dateKeyMemoColumn(key)) |candidate| {
+                        date_column = candidate;
+                        date_key = column;
+                        date_memo.reset();
+                        break;
+                    }
+                }
                 while(try self.nextStreamTuple(p,&ctx,&cursor,early)) {
                     if (groups == 0) {
                         if (capacity == 0) return error.WorkspaceCapacity;
@@ -2572,7 +2636,14 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                     var code: usize = 2166136261;
                     for (p.keys[0..p.key_count], 0..) |key, column| {
-                        keys[column] = try self.streamInput(&ctx, key, &computed_keys[column]);
+                        if (column == date_key and date_column != null) {
+                            if (try date_memo.input(&ctx, key, date_column.?, &computed_keys[column])) {
+                                self.work.stream_stats.date_key_memo_hits += 1;
+                            } else {
+                                self.work.stream_stats.date_key_memo_misses += 1;
+                            }
+                            keys[column] = &computed_keys[column];
+                        } else keys[column] = try self.streamInput(&ctx, key, &computed_keys[column]);
                         // V.hash deliberately rejects NULL (PK users exclude it).
                         const hash: usize = if (keys[column].* == .null_value) 0x9e3779b9 else V.hash(keys[column]);
                         code = (code ^ hash) *% 16777619;

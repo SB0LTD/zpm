@@ -3,7 +3,7 @@ const std=@import("std");
 const sql=@import("sql");
 const workers=@import("worker_thread");
 const stores=@import("db_store");
-const cfg:sql.Config=.{.external_storage=true,.external_workspace=true,.external_results=true,.tables=2,.columns=4,
+const cfg:sql.Config=.{.external_storage=true,.external_workspace=true,.external_results=true,.tables=3,.columns=4,
     .rows_per_table=128,.work_rows=512,.result_rows=32,.text_bytes=24,.expr_nodes=256,.tx_writes=256,.compact_integral_scans=true};
 const DB=sql.Database(cfg);
 const main_bytes=DB.backingBytes(512,1024,8192) catch unreachable;
@@ -25,6 +25,15 @@ var snapshot:DB.Snapshot=.{.csn=0};
 var assertions:usize=0;
 var arrivals:std.atomic.Value(u32)=.init(0);
 var controls:[8]DB.ExecutionControl=@splat(.{});
+const Cache = DB.ReadResultCache;
+var cache: Cache = undefined;
+var cache_entries: [16]Cache.Entry = undefined;
+var cache_keys: [16 * 512]u8 = undefined;
+var cache_rows: [16 * 16]DB.Row = undefined;
+const one_cache_layout = Cache.layout(1, 512, 16) catch unreachable;
+var cache_memory: [one_cache_layout.bytes + 1]u8 align(16) = undefined;
+const grouped = "SELECT cat AS category, COUNT(DISTINCT amount) AS samples, SUM(amount) AS total FROM points GROUP BY cat ORDER BY cat";
+const concurrent_grouped = "SELECT cat, COUNT(*), SUM(amount * 2) AS weighted FROM points GROUP BY cat ORDER BY cat";
 fn insideExecution(raw:?*anyopaque) DB.SqlError!void {
     const index:u5=@intCast(@intFromPtr(raw.?)-1);
     _=arrivals.fetchOr(@as(u32,1)<<index,.acq_rel);
@@ -68,6 +77,182 @@ fn entry(raw:?*anyopaque) void {
     const index:usize=@intFromPtr(raw.?)-1;
     queries(index) catch {failed.store(true,.release);};
 }
+
+fn cachedRead(context: *DB.ReadContext, result: *DB.Result, source: []const u8) !void {
+    try context.prepare(db, source, .{ .csn = db.csn });
+    try context.runCached(result, &cache);
+}
+
+fn cacheReader(raw: ?*anyopaque) void {
+    const index = @intFromPtr(raw.?) - 1;
+    const context = &contexts[index];
+    const result = &results[index];
+    context.session = .{};
+    for (0..24) |_| {
+        cachedRead(context, result, concurrent_grouped) catch {
+            failed.store(true, .release);
+            return;
+        };
+        if (result.row_count != 8 or result.column_count != 3) {
+            failed.store(true, .release);
+            return;
+        }
+        for (result.rows[0..result.row_count], 0..) |*row, category| {
+            if (row.cells[0] != .integer or row.cells[0].integer != category or row.cells[1] != .integer or
+                row.cells[1].integer != (if (category == 0) @as(i64, 17) else 16) or row.cells[2] != .integer) {
+                failed.store(true, .release);
+                return;
+            }
+        }
+    }
+}
+
+fn resultCacheContracts() !void {
+    const context = &contexts[0];
+    const result = &results[0];
+    context.session = .{};
+    try rejected(error.InvalidParameterValue, cache.init(db, &cache_entries, backing[0..cache_keys.len], &cache_rows, 16));
+    try cache.init(db, &cache_entries, &cache_keys, &cache_rows, 16);
+    store.read_result_cache = &cache;
+    defer store.read_result_cache = null;
+
+    // The cache owns key bytes and copies the same typed rows/metadata into
+    // separate result backing. A cold run still executes and produces rows.
+    var query_bytes: [grouped.len]u8 = undefined;
+    @memcpy(&query_bytes, grouped);
+    try cachedRead(context, result, &query_bytes);
+    try check(!context.last_result_reused and result.row_count == 8 and result.column_count == 3);
+    @memset(&query_bytes, ' ');
+    const first_sum = result.rows[0].cells[2].integer;
+    var connection: Store.Connection = .{ .store = &store, .id = 72, .read_context = context };
+    try context.prepare(db, grouped, .{ .csn = db.csn });
+    try connection.execute(grouped, result);
+    try check(context.last_result_reused and result.rows[0].cells[2].integer == first_sum);
+    try check(result.column_types[2] == .integer and result.column_typmods[2] == -1 and std.mem.eql(u8, result.column_names[0].slice(), "category"));
+    try cachedRead(&contexts[1], &results[1], grouped);
+    try check(contexts[1].last_result_reused and results[1].rows[0].cells[2].integer == first_sum);
+    results[1].rows[0].cells[2] = .{ .integer = -1 };
+    try cachedRead(context, result, grouped);
+    try check(context.last_result_reused and result.rows[0].cells[2].integer == first_sum);
+    context.session.database = "another_database";
+    try cachedRead(context, result, grouped);
+    try check(!context.last_result_reused);
+    context.session.database = "postgres";
+    try cachedRead(context, result, grouped);
+    try check(context.last_result_reused);
+
+    // A hit must not elide real cancellation or change a smaller scratch or
+    // result limit into success. Ordinary failure leaves the entry usable.
+    var cancel: DB.ExecutionControl = .{ .poll = canceled };
+    context.session.control = &cancel;
+    try rejected(error.QueryCanceled, context.runCached(result, &cache));
+    try check(!context.last_result_reused and result.rows[0].cells[2].integer == first_sum);
+    var limited: DB.ExecutionControl = .{ .max_work = 1 };
+    context.session.control = &limited;
+    try rejected(error.QueryWorkLimit, context.runCached(result, &cache));
+    try check(!context.last_result_reused);
+    context.session.control = null;
+    try result.bindMemory(&output[0], 1);
+    try rejected(error.RowCapacity, context.runCached(result, &cache));
+    try check(!context.last_result_reused);
+    try result.bindMemory(&output[0], 32);
+
+    context.session.zone = .{ .kind = .fixed, .offset = 3600 };
+    try cachedRead(context, result, grouped);
+    try check(!context.last_result_reused);
+    context.session.zone = .{};
+    connection.settings.statement_timeout_ms = 100;
+    try connection.execute(grouped, result);
+    try check(!context.last_result_reused);
+    connection.settings.statement_timeout_ms = 0;
+    try connection.engine_session.values.search_path.set("public");
+    try connection.execute(grouped, result);
+    try check(!context.last_result_reused);
+    connection.engine_session.values = .{};
+
+    const clock_query = "SELECT COUNT(*), statement_timestamp() FROM points";
+    context.session.statement_us = 1000;
+    try cachedRead(context, result, clock_query);
+    try check(!context.last_result_reused and result.rows[0].cells[1].timestamptz == 1000);
+    context.session.statement_us = 2000;
+    try cachedRead(context, result, clock_query);
+    try check(!context.last_result_reused and result.rows[0].cells[1].timestamptz == 2000);
+
+    try db.execute("UPDATE points SET amount=0 WHERE id=0", &main_result);
+    try cachedRead(context, result, grouped);
+    try check(!context.last_result_reused and result.rows[0].cells[2].integer == first_sum + 23);
+    try cachedRead(context, result, grouped);
+    try check(context.last_result_reused);
+    try db.execute("CREATE ROLE cache_reader", &main_result);
+    try cachedRead(context, result, grouped);
+    try check(!context.last_result_reused);
+    try cachedRead(context, result, grouped);
+    try check(context.last_result_reused);
+    connection.engine_session.session_role = db.catalog_objects.roleByName("cache_reader", .{ .csn = db.csn }).?;
+    try rejected(error.InvalidParameterValue, connection.execute(grouped, result));
+    connection.read_context = null;
+    try check(!connection.detachedReadEligible());
+    try rejected(error.InsufficientPrivilege, connection.execute(grouped, result));
+    connection.disconnect();
+    db.session_state = null;
+    try db.execute("GRANT SELECT ON points TO cache_reader", &main_result);
+    try cachedRead(context, result, grouped);
+    try check(!context.last_result_reused);
+    try cachedRead(context, result, grouped);
+    try check(context.last_result_reused);
+
+    try db.execute("ALTER TABLE points ADD COLUMN report_day DATE DEFAULT DATE '2025-04-11'", &main_result);
+    try cachedRead(context, result, grouped);
+    try check(!context.last_result_reused);
+    const calendar = "SELECT to_char(report_day,'YYYY-MM'), COUNT(*) FROM points WHERE report_day BETWEEN DATE '2025-04-01' AND DATE '2025-04-30' GROUP BY 1 ORDER BY 1";
+    try cachedRead(context, result, calendar);
+    try check(!context.last_result_reused and result.row_count == 1 and result.rows[0].cells[1].integer == 129);
+    try cachedRead(context, result, calendar);
+    try check(context.last_result_reused and std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "2025-04"));
+    const window = "WITH amounts AS (SELECT cat, SUM(amount) AS total FROM points GROUP BY cat) SELECT cat, RANK() OVER (ORDER BY total DESC), ROUND(AVG(total) OVER (),2) FROM amounts ORDER BY cat";
+    try cachedRead(context, result, window);
+    try check(!context.last_result_reused and result.row_count == 8);
+    try cachedRead(context, result, window);
+    try check(context.last_result_reused and result.column_types[2] == .numeric);
+    try cachedRead(context, result, "SELECT COUNT(*) FROM pg_class");
+    try cachedRead(context, result, "SELECT COUNT(*) FROM pg_class");
+    try check(!context.last_result_reused);
+
+    if (workers.available) {
+        var threads: [8]workers.Thread = @splat(.{});
+        var started: usize = 0;
+        defer for (threads[0..started]) |*thread| thread.join() catch @panic("live cache reader");
+        for (&threads, 0..) |*thread, index| {
+            try thread.start(cacheReader, @ptrFromInt(index + 1));
+            started += 1;
+        }
+        for (&threads) |*thread| try thread.join();
+        started = 0;
+    } else for (0..8) |index| cacheReader(@ptrFromInt(index + 1));
+    try check(!failed.load(.acquire));
+    try cachedRead(context, result, concurrent_grouped);
+    try check(context.last_result_reused);
+
+    try rejected(error.WorkspaceCapacity, Cache.layoutForBytes(one_cache_layout.bytes - 1, 512, 16));
+    const selected = try Cache.layoutForBytes(one_cache_layout.bytes + 1, 512, 16);
+    try check(selected.entries == 1 and selected.bytes == one_cache_layout.bytes);
+    try rejected(error.InvalidParameterValue, Cache.layout(~@as(usize, 0), 512, 16));
+    try rejected(error.WorkspaceCapacity, cache.bindMemory(db, cache_memory[0 .. selected.bytes - 1], selected.entries, 512, 16));
+    try rejected(error.InvalidParameterValue, cache.bindMemory(db, cache_memory[1..], selected.entries, 512, 16));
+    try cache.bindMemory(db, &cache_memory, selected.entries, 512, 16);
+    const by_store = "SELECT COUNT(*), SUM(amount) FROM points WHERE cat=0";
+    try cachedRead(context, result, by_store);
+    try check(!context.last_result_reused and result.rows[0].cells[0].integer == 17);
+    try cachedRead(context, result, by_store);
+    try check(context.last_result_reused);
+    try cachedRead(context, result, "SELECT COUNT(*), SUM(amount) FROM points WHERE cat=1");
+    try check(!context.last_result_reused and result.rows[0].cells[0].integer == 16);
+    try cachedRead(context, result, by_store);
+    try check(!context.last_result_reused and result.rows[0].cells[0].integer == 17);
+    const stats = cache.stats();
+    try check(stats.hits == 1 and stats.misses == 3 and stats.publications == 3 and stats.contention == 0);
+}
+
 pub fn main(init:std.process.Init) !void {
     inline for(.{"SELECT 1","\t\x0bselect 1","-- reviewer\r\n SELECT 1","/* outer /* nested */ tail */ WITH q AS(SELECT 1) SELECT * FROM q"}) |source| try check(DB.queryCandidate(source));
     inline for(.{"","-- only comment","/* unfinished","/* x */ UPDATE points SET amount=0","\"select\"","SELECTOR","BEGIN","'SELECT 1'"}) |source| try check(!DB.queryCandidate(source));
@@ -169,6 +354,7 @@ pub fn main(init:std.process.Init) !void {
     try check(result.rows[0].cells[0].integer==107904 and context.workspace.query.stream_stats.gathered_rows==0);
     try context.execute(db,"SELECT SUM(amount*2) FROM points",.{.csn=db.csn},result);
     try check(result.rows[0].cells[0].integer==107988 and context.workspace.query.stream_stats.gathered_rows==129);
+    try resultCacheContracts();
     const message=try std.fmt.bufPrint(&text,"PASS isolated SQL read contexts: {d} assertions, {d} real queries, native_threads={s}; server integration not claimed\n",
         .{assertions,completed.load(.acquire),if(workers.available) "8" else "0"});
     try std.Io.File.stdout().writeStreamingAll(init.io,message);
