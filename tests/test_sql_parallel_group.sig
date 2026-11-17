@@ -131,7 +131,10 @@ pub fn main() !void {
     try check(team.batches == 0 and db.workspace.query.stream_stats.parallel_typed_group_plans == 0);
     try check(result.rows[0].cells[1].integer == counts[0] and result.rows[0].cells[2].integer == counts[0] - 1);
 
-    const one_measure = "SELECT k,SUM(b),COUNT(*) FROM fact GROUP BY k ORDER BY k";
+    try db.execute("UPDATE fact SET a=-30 WHERE id=0", &result);
+    // BIGINT SUM/AVG share one measure. COUNT(*) plus both projections
+    // bypasses the older two-aggregate and INT-only dense kernels.
+    const one_measure = "SELECT k,SUM(a),AVG(a),COUNT(*) FROM fact GROUP BY k ORDER BY k";
     control.parallel_scan.?.participants = 1;
     try db.execute(one_measure, &serial);
     try check(team.batches == 0);
