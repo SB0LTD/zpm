@@ -115,6 +115,7 @@ pub fn Binder(comptime config: types.Config) type {
             defaults: [config.columns]u16 = @splat(none),
             generated: [config.columns]u16 = @splat(none),
             conflict: Conflict = .{},
+            replace: bool = false,
             returning: Returning = .{},
             /// Bound CHECK expressions by constraint index (source: its text).
             checks: [config.table_constraints]u16 = @splat(none),
@@ -7472,7 +7473,7 @@ pub fn Binder(comptime config: types.Config) type {
                             if (first >= 1 and first < @as(i64, @intCast(count))) count = @intCast(first);
                         }
                     }
-                    var out: Insert = .{ .table = index, .count = count, .rows = insert.rows, .row_count = insert.row_count };
+                    var out: Insert = .{ .table = index, .count = count, .rows = insert.rows, .row_count = insert.row_count, .replace = insert.replace };
                     for (0..count) |position| out.mapping[position] = @intCast(mapping[position]);
                     switch (insert.source) {
                         .values => try bindValues(context, entry, &out, insert.overriding),

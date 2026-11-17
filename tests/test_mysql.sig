@@ -454,6 +454,61 @@ fn nativeIfnullAndDateAdd() !void {
         try check(err == error.UnsupportedLogVersion);
 }
 
+fn nativeReplace() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    _ = try command(&session, &db, "CREATE TABLE replacements (id INT PRIMARY KEY, v INT NOT NULL DEFAULT 9, note TEXT)");
+    try check(output[4] == 0);
+    _ = try command(&session, &db, "REPLACE INTO replacements VALUES (1,2,'before')");
+    try check(output[4] == 0 and output[5] == 1);
+    _ = try command(&session, &db, "REPLACE replacements(id) VALUES(1)");
+    try check(output[4] == 0 and output[5] == 2);
+    _ = try command(&session, &db, "SELECT v,note FROM replacements WHERE id=1");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 9 and session.result.rows[0].cells[1] == .null_value);
+    _ = try command(&session, &db, "REPLACE INTO replacements VALUES (1,3,NULL),(1,4,NULL)");
+    try check(output[4] == 0 and output[5] == 4);
+    _ = try command(&session, &db, "REPLACE INTO replacements VALUES (1,5,NULL),(2,NULL,NULL)");
+    try check(output[4] == 0xff);
+    _ = try command(&session, &db, "SELECT id,v FROM replacements ORDER BY id");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 1 and session.result.rows[0].cells[1].integer == 4);
+    _ = try command(&session, &db, "BEGIN");
+    try check(output[4] == 0 and db.transactionStatus() == 'T');
+    _ = try command(&session, &db, "REPLACE INTO replacements VALUES (1,7,NULL)");
+    try check(output[4] == 0 and output[5] == 2);
+    _ = try command(&session, &db, "ROLLBACK");
+    try check(output[4] == 0 and db.transactionStatus() == 'I');
+    _ = try command(&session, &db, "SELECT v FROM replacements WHERE id=1");
+    try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 4);
+    _ = try command(&session, &db, "CREATE TABLE unique_values(id INT PRIMARY KEY,v INT UNIQUE)");
+    try check(output[4] == 0);
+    _ = try command(&session, &db, "REPLACE INTO unique_values VALUES (1,2)");
+    try check(output[4] == 0xff);
+    _ = try command(&session, &db, "SELECT COUNT(*) FROM unique_values");
+    try check(session.result.rows[0].cells[0].integer == 0);
+
+    store = .{};
+    store.database.dialect = .mysql;
+    syntax_recovered = .{};
+    var record: [8192]u8 = undefined;
+    var result: Raw.Result = .{};
+    for ([_][]const u8{
+        "CREATE TABLE replay_replace(id INT PRIMARY KEY,v INT)",
+        "INSERT INTO replay_replace VALUES(1,27)",
+        "REPLACE INTO replay_replace VALUES(1,90)",
+    }) |source| {
+        var used: usize = 0;
+        try store.database.executeChanges(source, &result, &record, &used, null, null);
+        try syntax_recovered.applyChangeRecord(record[0..used], &syntax_replay);
+    }
+    try check(result.affected_rows == 2);
+    try syntax_recovered.execute("SELECT v FROM replay_replace WHERE id=1", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 90);
+    if (syntax_recovered.execute("REPLACE INTO replay_replace VALUES(1,0)", &result)) |_| return error.UnexpectedDialectSyntax else |err|
+        try check(err == error.UnsupportedStatement);
+}
+
 pub fn main(init: std.process.Init) !void {
     try handshakeAndFragmentation();
     try typedResultsAndErrors();
@@ -461,6 +516,7 @@ pub fn main(init: std.process.Init) !void {
     try nativeGrammarAndReplay();
     try nativeSignedIntegerLiterals();
     try nativeIfnullAndDateAdd();
+    try nativeReplace();
     try transactionsAndOutputPreflight();
     try concurrentCommittedVisibility();
     try malformedAndFuzz();

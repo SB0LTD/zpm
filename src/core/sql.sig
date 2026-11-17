@@ -2150,7 +2150,8 @@ pub fn Database(comptime config: Config) type {
                 },
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
-                    if (insert.conflict.action != .none) try self.ssiRead(slot, insert.table);
+                    if (insert.replace) try self.validateMysqlReplace(slot, insert.table, snap);
+                    if (insert.replace or insert.conflict.action != .none) try self.ssiRead(slot, insert.table);
                     try self.lockSources(slot);
                     // Rules and triggers (B11 wave 3).
                     const upsert = insert.conflict.action == .update;
@@ -3596,6 +3597,7 @@ pub fn Database(comptime config: Config) type {
 
         fn insertPrivileges(self: *const Self, insert: *const B.Insert, snap: Snapshot) Error!void {
             var wanted: u32 = CO.priv_insert;
+            if (insert.replace) wanted |= CO.priv_delete;
             if (insert.returning.count != 0) wanted |= CO.priv_select;
             if (insert.conflict.action == .update) wanted |= CO.priv_update;
             try self.needTable(insert.table, wanted, snap);
@@ -5257,6 +5259,53 @@ pub fn Database(comptime config: Config) type {
             return @intFromBool(try self.updateOne(slot, ctx, update, row, goal, snap));
         }
 
+        /// A primary-key replacement is one real delete and one insert. More
+        /// than one uniqueness key, trigger and foreign-key effects require
+        /// their own replacement path before those schemas can be admitted.
+        fn validateMysqlReplace(self: *const Self, slot: u16, table_index: usize, snap: Snapshot) Error!void {
+            const table = &self.tables[table_index];
+            if (self.dialect != .mysql or self.txs[slot].isolation != .read_committed or table.relkind != 'r' or
+                table.index_count != 0 or self.hasChildren(table.oid, snap) or
+                self.catalog_objects.securityFlags(table.oid, snap) & CO.rls_enabled != 0) return error.UnsupportedStatement;
+            for (table.constraints[0..table.constraint_count]) |constraint| switch (constraint.kind) {
+                .check => {},
+                .primary => if (table.primary_column == null or constraint.column_count != 1) return error.UnsupportedStatement,
+                else => return error.UnsupportedStatement,
+            };
+            for (table.columns[0..table.column_count]) |column| {
+                if (column.default_kind == .identity_always or column.default_kind == .identity_by_default) return error.UnsupportedStatement;
+            }
+            var triggers: [config.triggers]u8 = undefined;
+            if (self.objects.tableTriggers(table.oid, snap, &triggers) != 0 or
+                self.ruleKind(table_index, '3', snap) != .none or self.ruleKind(table_index, '4', snap) != .none) return error.UnsupportedStatement;
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const other = &self.tables[found.slot];
+                for (other.constraints[0..other.constraint_count]) |constraint| {
+                    if (constraint.kind == .foreign and constraint.ref_oid == table.oid) return error.UnsupportedStatement;
+                }
+            }
+        }
+
+        fn replaceMysqlConflict(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, snap: Snapshot) Error!bool {
+            const conflict = (try self.arbiterTaken(slot, table_index, .primary, cells, snap)) orelse return false;
+            var waits: L.Set = .{};
+            const version = switch (try self.target(slot, table_index, conflict, snap, .write, &waits)) {
+                .ready => |latest| latest,
+                .wait => return self.park(slot, waits),
+                .skip, .authored => return error.SerializationFailure,
+            };
+            try self.reserveWrites(slot, 2);
+            const mutation = &self.txs[slot];
+            const previous = &self.tables[table_index].versions[version];
+            previous.xmax = mutation.ref(slot);
+            previous.xmax_cid = snap.cid;
+            mutation.push(.{ .kind = .delete, .table = @intCast(table_index), .old = version }) catch unreachable;
+            return true;
+        }
+
         fn insertOne(self: *Self, slot: u16, ctx: *E.Context, insert: *const B.Insert, values: *const [config.columns]u16, derived: D.Derived, snap: Snapshot) Error!usize {
             // BEFORE ROW triggers and conditional rules see the row before
             // NOT NULL, generated columns and CHECKs (B11 wave 3).
@@ -5273,6 +5322,7 @@ pub fn Database(comptime config: Config) type {
             // Row security checks the row the triggers produced (B11 wave 3).
             try self.securityCheck(ctx, insert.table, &cells);
             const table = &self.tables[table_index];
+            const replaced = insert.replace and try self.replaceMysqlConflict(slot, table_index, &cells, snap);
             // ON CONFLICT: the arbiter is checked first (PostgreSQL's
             // speculative pre-check); other unique indexes still raise 23505.
             const conflict = &insert.conflict;
@@ -5293,7 +5343,7 @@ pub fn Database(comptime config: Config) type {
             try self.exclusionTaken(slot, table_index, &cells, 0xffffffff, null, snap);
             try self.checkReferences(slot, table_index, &cells, null, snap);
             try self.appendRow(slot, table_index, &cells, snap);
-            return 1;
+            return 1 + @as(usize, @intFromBool(replaced));
         }
 
         // ---- exclusion constraints -----------------------------------------

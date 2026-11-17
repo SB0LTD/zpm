@@ -732,6 +732,7 @@ pub fn Ast(comptime config: types.Config) type {
             /// INSERT ... SELECT: index into Pool.queries.
             query: u16 = none,
             overriding: Overriding = .none,
+            replace: bool = false,
             conflict: ?OnConflict = null,
             returning: Returning = .{},
         };

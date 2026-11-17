@@ -325,6 +325,14 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn statement(self: *Self) Error!Ast.Statement {
             if (self.mode == .standard) if (try catalog_objects.parseWithDialect(self.source, config.name_bytes, config.text_bytes, self.tokens.dialect)) |object| return .{ .catalog_object = object };
+            if (self.tokens.dialect == .mysql and try self.takeRaw("replace")) {
+                _ = try self.takeWord("INTO");
+                var replacement = try self.insertTarget();
+                if (replacement.source != .values or replacement.conflict != null or replacement.returning.count != 0 or
+                    replacement.overriding != .none or replacement.alias != null) return error.UnsupportedStatement;
+                replacement.replace = true;
+                return .{ .insert = replacement };
+            }
             if (try self.takeWord("CREATE")) {
                 if (self.mode == .standard) if (try self.schemaObject()) |object| return object;
                 if (self.mode == .standard and try self.takeWord("SEQUENCE")) return .{ .create_sequence = try self.createSequence() };
@@ -2245,6 +2253,10 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn insert(self: *Self) Error!Ast.Insert {
             try self.expectWord("INTO");
+            return self.insertTarget();
+        }
+
+        fn insertTarget(self: *Self) Error!Ast.Insert {
             var out: Ast.Insert = .{ .table = try self.identifier() };
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
