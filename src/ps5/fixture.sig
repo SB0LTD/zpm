@@ -1,0 +1,301 @@
+//! @zpm/ps5 fixture — small PS5 executables and modules made in memory, for
+//! the tests of the reader and the linker (and, with code in them, for a
+//! kernel's own test of a whole load). The opposite of the reader: names,
+//! symbols and relocations go in, a file in the PS5's dialect comes out.
+//!
+//! The layout is fixed, and a file's offsets equal its addresses:
+//!
+//!   0x0000  ELF and program headers
+//!   TEXT    code (read, execute): up to TEXT_SIZE bytes
+//!   TABLES  strings, symbols, hash, relocations, the dynamic section
+//!   DATA    data (read, write): DATA_SIZE bytes, the first `data.len` from
+//!           the file; the process or module parameter is at its end
+//!
+//! Allocation-free: fixed tables, the file written into the caller's buffer.
+
+const std = @import("std");
+const elf = @import("elf.sig");
+const nid = @import("nid.sig");
+
+pub const TEXT: u64 = 0x1000;
+pub const TEXT_SIZE: u64 = 0x1000;
+pub const TABLES: u64 = 0x2000;
+pub const DATA: u64 = 0x8000;
+pub const DATA_SIZE: u64 = 0x4000;
+/// Where the process or module parameter is.
+pub const PARAM: u64 = DATA + DATA_SIZE - 0x80;
+/// A buffer this size holds any file the builder makes.
+pub const SIZE = DATA + DATA_SIZE;
+
+const MAX_SYMS = 48;
+const MAX_RELAS = 64;
+const MAX_DYN = 48;
+
+pub const Builder = struct {
+    buf: []u8,
+    kind: elf.Kind,
+    /// Addresses in the module (0: none).
+    entry: u64 = 0,
+    init_at: u64 = 0,
+    code: []const u8 = &.{},
+    data: []const u8 = &.{},
+    strings: [2048]u8 = undefined,
+    strings_len: u32 = 1,
+    syms: [MAX_SYMS]elf.Sym = undefined,
+    sym_count: u32 = 1,
+    relas: [MAX_RELAS]elf.Rela = undefined,
+    rela_count: u32 = 0,
+    plts: [MAX_RELAS]elf.Rela = undefined,
+    plt_count: u32 = 0,
+    names: [MAX_DYN]elf.Dyn = undefined,
+    name_count: u32 = 0,
+    tls_seg: ?elf.Tls = null,
+
+    pub fn init(buf: []u8, kind: elf.Kind) Builder {
+        std.debug.assert(buf.len >= SIZE);
+        var b = Builder{ .buf = buf, .kind = kind };
+        b.strings[0] = 0;
+        b.syms[0] = std.mem.zeroes(elf.Sym);
+        return b;
+    }
+
+    fn string(b: *Builder, s: []const u8) u32 {
+        const at = b.strings_len;
+        @memcpy(b.strings[at..][0..s.len], s);
+        b.strings[at + s.len] = 0;
+        b.strings_len += @intCast(s.len + 1);
+        return at;
+    }
+
+    fn name(b: *Builder, tag: u64, text: []const u8, id: u16, version: u16) void {
+        b.names[b.name_count] = .{ .tag = tag, .val = @as(u64, id) << 48 | @as(u64, version) << 32 | b.string(text) };
+        b.name_count += 1;
+    }
+
+    fn attr(b: *Builder, tag: u64, id: u16, flags: u32) void {
+        b.names[b.name_count] = .{ .tag = tag, .val = @as(u64, id) << 48 | flags };
+        b.name_count += 1;
+    }
+
+    /// The file's own module name.
+    pub fn selfModule(b: *Builder, text: []const u8, id: u16) void {
+        b.name(elf.DT.SCE_MODULE_INFO_1, text, id, 0x0101);
+    }
+
+    pub fn neededModule(b: *Builder, text: []const u8, id: u16) u16 {
+        b.name(elf.DT.SCE_NEEDED_MODULE_1, text, id, 0x0101);
+        return id;
+    }
+
+    pub fn importLibrary(b: *Builder, text: []const u8, id: u16) u16 {
+        b.name(elf.DT.SCE_IMPORT_LIB_1, text, id, 1);
+        b.attr(elf.DT.SCE_IMPORT_LIB_ATTR, id, 9);
+        return id;
+    }
+
+    pub fn exportLibrary(b: *Builder, text: []const u8, id: u16) u16 {
+        b.name(elf.DT.SCE_EXPORT_LIB_1, text, id, 1);
+        b.attr(elf.DT.SCE_EXPORT_LIB_ATTR, id, 1);
+        return id;
+    }
+
+    fn symbol(b: *Builder, n: nid.Nid, library: u16, module: u16, value: u64, shndx: u16, bind: u8, kind: u8) u32 {
+        var text: [nid.TEXT_LEN + 10]u8 = undefined;
+        @memcpy(text[0..nid.TEXT_LEN], &nid.text(n));
+        var len: usize = nid.TEXT_LEN;
+        var digits: [4]u8 = undefined;
+        for ([_]u16{ library, module }) |id| {
+            text[len] = '#';
+            const d = nid.indexText(id, &digits);
+            @memcpy(text[len + 1 ..][0..d.len], d);
+            len += 1 + d.len;
+        }
+        const i = b.sym_count;
+        b.syms[i] = .{ .name = b.string(text[0..len]), .info = bind << 4 | kind, .other = 0, .shndx = shndx, .value = value, .size = 0 };
+        b.sym_count += 1;
+        return i;
+    }
+
+    /// A symbol another module is to provide; its index.
+    pub fn importSymbol(b: *Builder, n: nid.Nid, library: u16, module: u16, kind: u8) u32 {
+        return b.symbol(n, library, module, 0, elf.SHN_UNDEF, elf.STB_GLOBAL, kind);
+    }
+
+    /// The same, but nothing providing it is no error (it then reads as 0).
+    pub fn weakImport(b: *Builder, n: nid.Nid, library: u16, module: u16, kind: u8) u32 {
+        return b.symbol(n, library, module, 0, elf.SHN_UNDEF, elf.STB_WEAK, kind);
+    }
+
+    /// A symbol this file provides, at `value` in the module; its index.
+    pub fn exportSymbol(b: *Builder, n: nid.Nid, library: u16, module: u16, value: u64, kind: u8) u32 {
+        return b.symbol(n, library, module, value, 1, elf.STB_GLOBAL, kind);
+    }
+
+    fn rela(b: *Builder, at: u64, sym: u32, kind: u32, addend: i64) void {
+        b.relas[b.rela_count] = .{ .offset = at, .info = @as(u64, sym) << 32 | kind, .addend = addend };
+        b.rela_count += 1;
+    }
+
+    /// The word at `at` is to hold where `target` (an address in the
+    /// module) is loaded.
+    pub fn relative(b: *Builder, at: u64, target: u64) void {
+        b.rela(at, 0, elf.R.RELATIVE, @intCast(target));
+    }
+
+    /// The word at `at`: the symbol's address plus `addend`.
+    pub fn absolute(b: *Builder, at: u64, sym: u32, addend: i64) void {
+        b.rela(at, sym, elf.R.@"64", addend);
+    }
+
+    pub fn globDat(b: *Builder, at: u64, sym: u32) void {
+        b.rela(at, sym, elf.R.GLOB_DAT, 0);
+    }
+
+    /// Thread storage: the module's index, an offset in its block, and an
+    /// offset from the thread pointer.
+    pub fn tlsModule(b: *Builder, at: u64) void {
+        b.rela(at, 0, elf.R.DTPMOD64, 0);
+    }
+    pub fn tlsOffset(b: *Builder, at: u64, sym: u32, addend: i64) void {
+        b.rela(at, sym, elf.R.DTPOFF64, addend);
+    }
+    pub fn threadPointerOffset(b: *Builder, at: u64, sym: u32, addend: i64) void {
+        b.rela(at, sym, elf.R.TPOFF64, addend);
+    }
+
+    /// An imported function's slot (the PLT's relocations).
+    pub fn jumpSlot(b: *Builder, at: u64, sym: u32) void {
+        b.plts[b.plt_count] = .{ .offset = at, .info = @as(u64, sym) << 32 | elf.R.JUMP_SLOT, .addend = 0 };
+        b.plt_count += 1;
+    }
+
+    /// The thread storage's initial bytes are `filesz` bytes at `vaddr`
+    /// (in the data), then zeroes up to `memsz`.
+    pub fn tls(b: *Builder, vaddr: u64, filesz: u64, memsz: u64, alignment: u64) void {
+        b.tls_seg = .{ .vaddr = vaddr, .filesz = filesz, .memsz = memsz, .alignment = alignment };
+    }
+
+    /// Writes the file; the bytes used of the buffer.
+    pub fn finish(b: *Builder) []const u8 {
+        std.debug.assert(b.code.len <= TEXT_SIZE and b.data.len <= DATA_SIZE - 0x80);
+        const out = b.buf[0..SIZE];
+        @memset(out, 0);
+        @memcpy(out[TEXT..][0..b.code.len], b.code);
+        @memcpy(out[DATA..][0..b.data.len], b.data);
+
+        // The tables, one after another, 8-aligned.
+        var at: u64 = TABLES;
+        const strtab = at;
+        @memcpy(out[at..][0..b.strings_len], b.strings[0..b.strings_len]);
+        at = std.mem.alignForward(u64, at + b.strings_len, 8);
+        const symtab = at;
+        const sym_bytes = std.mem.sliceAsBytes(b.syms[0..b.sym_count]);
+        @memcpy(out[at..][0..sym_bytes.len], sym_bytes);
+        at += sym_bytes.len;
+        // A System V hash table with one bucket: every symbol on one chain.
+        const hash = at;
+        w32(out, at, 1);
+        w32(out, at + 4, b.sym_count);
+        w32(out, at + 8, b.sym_count - 1);
+        for (1..b.sym_count) |i| w32(out, at + 12 + 4 * i, @intCast(i - 1));
+        at = std.mem.alignForward(u64, at + 12 + 4 * @as(u64, b.sym_count), 8);
+        const rela_at = at;
+        const rela_bytes = std.mem.sliceAsBytes(b.relas[0..b.rela_count]);
+        @memcpy(out[at..][0..rela_bytes.len], rela_bytes);
+        at += rela_bytes.len;
+        const jmprel = at;
+        const plt_bytes = std.mem.sliceAsBytes(b.plts[0..b.plt_count]);
+        @memcpy(out[at..][0..plt_bytes.len], plt_bytes);
+        at += plt_bytes.len;
+
+        const dynamic = at;
+        var d = DynWriter{ .out = out, .at = at };
+        for (b.names[0..b.name_count]) |n| d.put(n.tag, n.val);
+        d.put(elf.DT.HASH, hash);
+        d.put(elf.DT.STRTAB, strtab);
+        d.put(elf.DT.STRSZ, b.strings_len);
+        d.put(elf.DT.SYMTAB, symtab);
+        d.put(elf.DT.SYMENT, @sizeOf(elf.Sym));
+        d.put(elf.DT.SCE_SYMTABSZ, sym_bytes.len);
+        if (b.rela_count != 0) {
+            d.put(elf.DT.RELA, rela_at);
+            d.put(elf.DT.RELASZ, rela_bytes.len);
+            d.put(elf.DT.RELAENT, @sizeOf(elf.Rela));
+        }
+        if (b.plt_count != 0) {
+            d.put(elf.DT.JMPREL, jmprel);
+            d.put(elf.DT.PLTRELSZ, plt_bytes.len);
+            d.put(elf.DT.PLTREL, elf.DT.RELA);
+            d.put(elf.DT.PLTGOT, DATA);
+        }
+        if (b.init_at != 0) d.put(elf.DT.INIT, b.init_at);
+        d.put(elf.DT.FLAGS, 8); // DF_BIND_NOW
+        d.put(elf.DT.NULL, 0);
+        const dynamic_size = d.at - dynamic;
+        std.debug.assert(d.at <= DATA);
+
+        // The parameter: its size, then Sony's magic at 8.
+        const exe = b.kind.isExecutable();
+        std.mem.writeInt(u64, out[PARAM..][0..8], 0x40, .little);
+        std.mem.writeInt(u32, out[PARAM + 8 ..][0..4], if (exe) 0x4942_524f else 0x3c13_f4bf, .little);
+
+        // The headers.
+        @memcpy(out[0..4], "\x7fELF");
+        out[4] = 2; // 64-bit
+        out[5] = 1; // little-endian
+        out[6] = 1;
+        out[7] = 9; // FreeBSD
+        out[8] = 2; // the PS5's ABI version
+        std.mem.writeInt(u16, out[16..18], @intFromEnum(b.kind), .little);
+        std.mem.writeInt(u16, out[18..20], 62, .little);
+        std.mem.writeInt(u32, out[20..24], 1, .little);
+        std.mem.writeInt(u64, out[24..32], b.entry, .little);
+        std.mem.writeInt(u64, out[32..40], 64, .little); // e_phoff
+        std.mem.writeInt(u16, out[52..54], 64, .little);
+        std.mem.writeInt(u16, out[54..56], @sizeOf(elf.Phdr), .little);
+        var ph = PhdrWriter{ .out = out };
+        ph.put(elf.PT.LOAD, 5, 0, d.at, d.at, elf.PAGE);
+        ph.put(elf.PT.LOAD, 6, DATA, DATA_SIZE, DATA_SIZE, elf.PAGE);
+        ph.put(elf.PT.DYNAMIC, 4, dynamic, dynamic_size, dynamic_size, 8);
+        ph.put(if (exe) elf.PT.SCE_PROCPARAM else elf.PT.SCE_MODULE_PARAM, 4, PARAM, 0x40, 0x40, 8);
+        if (b.tls_seg) |t| ph.put(elf.PT.TLS, 4, t.vaddr, t.filesz, t.memsz, t.alignment);
+        std.mem.writeInt(u16, out[56..58], ph.count, .little);
+        return out;
+    }
+};
+
+const DynWriter = struct {
+    out: []u8,
+    at: u64,
+
+    fn put(d: *DynWriter, tag: u64, val: u64) void {
+        std.mem.writeInt(u64, d.out[d.at..][0..8], tag, .little);
+        std.mem.writeInt(u64, d.out[d.at + 8 ..][0..8], val, .little);
+        d.at += 16;
+    }
+};
+
+const PhdrWriter = struct {
+    out: []u8,
+    count: u16 = 0,
+
+    fn put(p: *PhdrWriter, kind: u32, flags: u32, vaddr: u64, filesz: u64, memsz: u64, alignment: u64) void {
+        const h = elf.Phdr{ .type = kind, .flags = flags, .offset = vaddr, .vaddr = vaddr, .paddr = vaddr, .filesz = filesz, .memsz = memsz, .@"align" = alignment };
+        @memcpy(p.out[64 + @as(usize, p.count) * @sizeOf(elf.Phdr) ..][0..@sizeOf(elf.Phdr)], std.mem.asBytes(&h));
+        p.count += 1;
+    }
+};
+
+fn w32(out: []u8, at: u64, v: u32) void {
+    std.mem.writeInt(u32, out[at..][0..4], v, .little);
+}
+
+/// Where a built file's dynamic section is (for tests that damage it).
+pub fn dynamicOffset(file: []const u8) usize {
+    const phnum = std.mem.readInt(u16, file[56..58], .little);
+    for (0..phnum) |i| {
+        const ph = file[64 + i * @sizeOf(elf.Phdr) ..];
+        if (std.mem.readInt(u32, ph[0..4], .little) == elf.PT.DYNAMIC) return @intCast(std.mem.readInt(u64, ph[8..16], .little));
+    }
+    unreachable;
+}
