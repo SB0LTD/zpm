@@ -430,3 +430,27 @@ still gives12/89/17 and exits1. Updated evidence includes lexer/change-log hashe
 The preserved failing WAL and recovery gate are documented in SQL_CONDITIONAL_DDL.md.
 Fresh hosted and full durable-wire recovery remain pending; no compatibility or
 production-completeness claim follows from the earlier49 live case successes.
+
+## Native MySQL inventory
+
+`verify_mysql_inventory.py` uses PyMySQL to run the six `MYSQL.*` cases and
+their original setup from `cases.json` against native MySQL Community Server
+and a supplied RAMSQL executable. The harness owns a fresh, disposable MySQL
+instance and starts a new RAMSQL memory server per case. Both bind loopback only.
+Use an extracted [MySQL Community Server archive](https://dev.mysql.com/downloads/mysql/8.4.html?os=3)
+whose detached signature you have verified against the [published MySQL signing
+fingerprint](https://dev.mysql.com/doc/refman/8.4/en/checking-gpg-signature.html).
+
+With Python 3.11 or newer and PyMySQL 1.2.3 installed in your test environment:
+
+```powershell
+python tests/sql_conformance/verify_mysql_inventory.py `
+  --mysqld C:/path/to/mysql-8.4.13-winx64/bin/mysqld.exe --mysql-version 8.4.13 `
+  --ramsql C:/path/to/ramsql.exe --work .scratch/mysql-inventory-run
+```
+
+Choose a new work directory for each run. The JSON report retains executable and
+fixture SHA-256 digests, setup and body events, and the first differing SQL.
+Rows, field metadata, affected counts and errors are compared. A recorded gap
+makes the command exit 1. The inventory does not verify table constraints or
+persisted values beyond what its original SQL observes.
