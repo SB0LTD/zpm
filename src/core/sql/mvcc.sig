@@ -33,9 +33,9 @@ pub fn Mvcc(comptime config: types.Config) type {
         pub const write_capacity: usize = if (config.tx_writes == 0) @max(config.rows_per_table * 2, 64) else config.tx_writes;
         pub const sub_capacity: usize = config.savepoints + 1;
 
-        /// `truncate`: every row version visible to the TRUNCATE statement was
-        /// marked deleted in place with xmax = (this transaction, `old` as
-        /// command id); one entry covers the whole table.
+        /// `truncate`: the table's latest committed rows and our earlier
+        /// writes were marked deleted in place with xmax = (this transaction,
+        /// `old` as command id). One entry covers the whole table.
         /// `alter_table`: ALTER TABLE copied table slot `old` into slot `table`
         /// (same OID, new definition) at command id `new`; the old slot dies
         /// at commit, the new one is discarded at abort.

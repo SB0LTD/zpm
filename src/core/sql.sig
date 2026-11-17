@@ -5457,15 +5457,17 @@ pub fn Database(comptime config: Config) type {
             return self.fillFromPlan(slot, index, source, refresh.plan, snap);
         }
 
-        /// Marks every row version of `index` visible to `snap` deleted in
-        /// place with one truncate write entry (the caller locked it).
+        /// AccessExclusive already stabilizes the table. Retire its latest
+        /// committed rows and our earlier writes, as logical WAL replay does.
         fn truncateSlot(self: *Self, slot: u16, index: usize, snap: Snapshot) Error!void {
             try self.reserveWrites(slot, 1);
             const tx = &self.txs[slot];
             const table = &self.tables[index];
+            var current = snap;
+            current.csn = self.csn;
             for (0..table.row_high) |row| {
                 if (table.rows[row].newest == 0) continue;
-                const version = S.visibleAt(table, row, snap) orelse continue;
+                const version = S.visibleAt(table, row, current) orelse continue;
                 const entry = &table.versions[version];
                 entry.xmax = tx.ref(slot);
                 entry.xmax_cid = snap.cid;
@@ -5534,13 +5536,9 @@ pub fn Database(comptime config: Config) type {
             return 0;
         }
 
-        /// TRUNCATE (PostgreSQL ExecuteTruncate): AccessExclusive on every
-        /// target first, so a lock wait parks before any write; then every
-        /// row version visible to the statement is marked deleted in place.
-        /// One write entry per table covers all of its rows (no write-set or
-        /// version cost per row); commit publishes the marks and frees the
-        /// dead versions, abort or ROLLBACK TO clears exactly these marks.
-        /// RESTART IDENTITY is not provided (0A000).
+        /// Acquire AccessExclusive on every target before writing. One
+        /// truncate entry per table covers all latest rows. Commit stamps
+        /// those marks, and abort or ROLLBACK TO clears them.
         fn truncateTables(self: *Self, slot: u16, truncate: *const B.Truncate, snap: Snapshot) Error!void {
             for (truncate.tables[0..truncate.count]) |index| try self.lockTable(slot, index, .access_exclusive);
             // A table referenced by a foreign key of a table outside the
@@ -5559,7 +5557,6 @@ pub fn Database(comptime config: Config) type {
                     }
                 }
             }
-            try self.reserveWrites(slot, truncate.count);
             // RESTART IDENTITY: every sequence a column of the table owns
             // (identity, SERIAL) restarts, transactionally (ALTER SEQUENCE).
             if (truncate.restart_identity or self.dialect == .mysql) {
@@ -5578,18 +5575,8 @@ pub fn Database(comptime config: Config) type {
                 }
                 for (owned, 0..) |restart, position| if (restart) try self.alterSequence(slot, position, .{ .restart = true }, snap);
             }
-            const tx = &self.txs[slot];
-            for (truncate.tables[0..truncate.count]) |index| {
-                const table = &self.tables[index];
-                for (0..table.row_high) |row| {
-                    if (table.rows[row].newest == 0) continue;
-                    const version = S.visibleAt(table, row, snap) orelse continue;
-                    const entry = &table.versions[version];
-                    entry.xmax = tx.ref(slot);
-                    entry.xmax_cid = snap.cid;
-                }
-                tx.push(.{ .kind = .truncate, .table = index, .old = snap.cid }) catch unreachable;
-            }
+            try self.reserveWrites(slot, truncate.count);
+            for (truncate.tables[0..truncate.count]) |index| try self.truncateSlot(slot, index, snap);
         }
 
         /// ALTER TABLE (copy on write): AccessExclusive on the table, then

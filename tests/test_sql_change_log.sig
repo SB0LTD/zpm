@@ -691,6 +691,35 @@ fn replayCardinality() !void {
     try check(try integer(&full, "SELECT id FROM t WHERE id=40") == 40);
 }
 
+fn truncateCurrentHorizon() !void {
+    var primary: DB = .{};
+    var restarted: DB = .{};
+    var log: Log = .{};
+    const setup = try primary.begin();
+    try run(&primary, setup, "CREATE TABLE t(id INT PRIMARY KEY, amount INT)");
+    try run(&primary, setup, "INSERT INTO t VALUES(1,10),(2,20)");
+    try log.commit(&primary, setup);
+
+    const truncator = try primary.begin();
+    try run(&primary, truncator, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    try run(&primary, truncator, "SELECT 1");
+    const concurrent = try primary.begin();
+    try run(&primary, concurrent, "UPDATE t SET amount=11 WHERE id=1");
+    try run(&primary, concurrent, "DELETE FROM t WHERE id=2");
+    try run(&primary, concurrent, "INSERT INTO t VALUES(3,30)");
+    try log.commit(&primary, concurrent);
+
+    try run(&primary, truncator, "INSERT INTO t VALUES(4,40)");
+    try run(&primary, truncator, "TRUNCATE t");
+    try run(&primary, truncator, "INSERT INTO t VALUES(5,50)");
+    try log.commit(&primary, truncator);
+    try check(try integer(&primary, "SELECT COUNT(*) FROM t") == 1);
+    try check(try integer(&primary, "SELECT id FROM t") == 5);
+    try check(primary.tables[0].summary.rows == 1);
+    try log.replay(&restarted);
+    try check(try sameDatabase(&primary, &restarted));
+}
+
 pub fn main(init: std.process.Init) !void {
     try roundTrips();
     try corruption();
@@ -701,6 +730,7 @@ pub fn main(init: std.process.Init) !void {
     try keyedIndexCollision();
     try rewoundOidReplay();
     try replayCardinality();
+    try truncateCurrentHorizon();
     var buffer: [256]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-change-log\",\"pass\":true,\"assertions\":{d},\"rejected_flips\":{d},\"accepted_flips\":{d}}}\n", .{ assertions, rejected_flips, accepted_flips });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
