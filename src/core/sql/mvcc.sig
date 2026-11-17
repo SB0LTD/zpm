@@ -33,9 +33,11 @@ pub fn Mvcc(comptime config: types.Config) type {
         pub const write_capacity: usize = if (config.tx_writes == 0) @max(config.rows_per_table * 2, 64) else config.tx_writes;
         pub const sub_capacity: usize = config.savepoints + 1;
 
-        /// `truncate`: every row version visible to the TRUNCATE statement was
-        /// marked deleted in place with xmax = (this transaction, `old` as
-        /// command id); one entry covers the whole table.
+        /// `truncate`: the table's latest committed rows and our earlier
+        /// writes were marked deleted in place with xmax = (this transaction,
+        /// `old` as command id). One entry covers the whole table. `new`
+        /// saves the previous pending truncate command for savepoint rollback.
+        /// `refresh_rows` uses the same WAL operation with ordinary visibility.
         /// `alter_table`: ALTER TABLE copied table slot `old` into slot `table`
         /// (same OID, new definition) at command id `new`; the old slot dies
         /// at commit, the new one is discarded at abort.
@@ -47,7 +49,7 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// `object_insert` / `object_delete`: catalog object entry `new` /
         /// `old` (catalog_objects.sig, B11 wave 3); an insert's `table` is 1
         /// when the version took a fresh OID.
-        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_object, drop_object, object_insert, object_delete };
+        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_object, drop_object, object_insert, object_delete, refresh_rows };
 
         /// `table` is the table slot (catalog relation, sequence slot);
         /// `old`/`new` are version indices.
@@ -204,10 +206,13 @@ pub fn Mvcc(comptime config: types.Config) type {
                         tx.seq_dirty.remove(entry.table);
                     },
                     .drop_sequence => db.seqs[entry.table].pending_drop = false,
-                    .truncate => {
+                    .truncate, .refresh_rows => {
                         const table = &db.tables[entry.table];
                         for (table.versions[0..table.version_high]) |*version| {
                             if (truncated(version, tx, slot, entry.old)) clearMark(version);
+                        }
+                        if (entry.kind == .truncate) {
+                            table.pending_truncate = if (entry.new != 0) .{ .owner = tx.ref(slot), .cid = entry.new } else .{};
                         }
                     },
                     .alter_table => {
@@ -325,7 +330,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                         seq.pending_drop = false;
                         seq.dead_csn = csn;
                     },
-                    .truncate => {
+                    .truncate, .refresh_rows => {
                         const table = &db.tables[entry.table];
                         for (table.versions[0..table.version_high], 0..) |*version, index| {
                             if (!truncated(version, tx, slot, entry.old)) continue;
@@ -333,6 +338,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                             S.scanPublish(table, @intCast(index), false);
                             version.xmax_csn = csn;
                         }
+                        if (entry.kind == .truncate) S.publishTruncate(table, csn);
                     },
                     .alter_table => {
                         const old = &db.tables[entry.old];
@@ -348,6 +354,9 @@ pub fn Mvcc(comptime config: types.Config) type {
                             if (version.xmin_csn == 0 and version.xmin.epoch == tx.epoch and version.xmin.slot == slot and version.xmin_cid < entry.new) version.xmin_csn = csn;
                             if (version.xmax_csn == 0 and version.xmax.epoch == tx.epoch and version.xmax.slot == slot and version.xmax_cid < entry.new) version.xmax_csn = csn;
                         }
+                        const inherited = copy.pending_truncate;
+                        if (inherited.owner.epoch == tx.epoch and inherited.owner.slot == slot and inherited.cid < entry.new)
+                            S.publishTruncate(copy, csn);
                         S.rebuildCommitted(copy, csn);
                     },
                     .alter_sequence => {
@@ -376,7 +385,7 @@ pub fn Mvcc(comptime config: types.Config) type {
             var budget: usize = S.reclaim_budget;
             for (tx.writes[0..tx.write_len]) |entry| {
                 // A published TRUNCATE frees its table's dead versions at once.
-                if (entry.kind == .truncate) {
+                if (entry.kind == .truncate or entry.kind == .refresh_rows) {
                     const table = &db.tables[entry.table];
                     if (table.live and table.dead_csn == 0) _ = S.vacuum(table, horizon);
                     continue;

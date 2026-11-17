@@ -5471,25 +5471,29 @@ pub fn Database(comptime config: Config) type {
                 try self.alterTable(slot, &alter, snap);
                 index = self.visibleTableSlot(self.tables[index].oid, .{ .csn = snap.csn, .slot = snap.slot, .epoch = snap.epoch, .cid = snap.cid +% 1 }) orelse return error.TableNotFound;
             }
-            try self.truncateSlot(slot, index, snap);
+            try self.truncateSlot(slot, index, snap, .refresh_rows);
             if (!refresh.with_data) return 0;
             return self.fillFromPlan(slot, index, source, refresh.plan, snap);
         }
 
-        /// Marks every row version of `index` visible to `snap` deleted in
-        /// place with one truncate write entry (the caller locked it).
-        fn truncateSlot(self: *Self, slot: u16, index: usize, snap: Snapshot) Error!void {
+        /// AccessExclusive already stabilizes the table. Retire its latest
+        /// committed rows and our earlier writes, as logical WAL replay does.
+        fn truncateSlot(self: *Self, slot: u16, index: usize, snap: Snapshot, comptime kind: M.WriteKind) Error!void {
             try self.reserveWrites(slot, 1);
             const tx = &self.txs[slot];
             const table = &self.tables[index];
+            var current = snap;
+            current.csn = self.csn;
             for (0..table.row_high) |row| {
                 if (table.rows[row].newest == 0) continue;
-                const version = S.visibleAt(table, row, snap) orelse continue;
+                const version = S.visibleAt(table, row, current) orelse continue;
                 const entry = &table.versions[version];
                 entry.xmax = tx.ref(slot);
                 entry.xmax_cid = snap.cid;
             }
-            tx.push(.{ .kind = .truncate, .table = @intCast(index), .old = snap.cid }) catch unreachable;
+            const previous_cid = table.pending_truncate.cid;
+            if (comptime kind == .truncate) table.pending_truncate = .{ .owner = tx.ref(slot), .cid = snap.cid };
+            tx.push(.{ .kind = kind, .table = @intCast(index), .old = snap.cid, .new = previous_cid }) catch unreachable;
         }
 
         fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {
@@ -5553,22 +5557,23 @@ pub fn Database(comptime config: Config) type {
             return 0;
         }
 
-        /// TRUNCATE (PostgreSQL ExecuteTruncate): AccessExclusive on every
-        /// target first, so a lock wait parks before any write; then every
-        /// row version visible to the statement is marked deleted in place.
-        /// One write entry per table covers all of its rows (no write-set or
-        /// version cost per row); commit publishes the marks and frees the
-        /// dead versions, abort or ROLLBACK TO clears exactly these marks.
-        /// RESTART IDENTITY is not provided (0A000).
+        /// Acquire AccessExclusive on every target before writing. One
+        /// truncate entry per table covers all latest rows. Commit stamps
+        /// those marks, and abort or ROLLBACK TO clears them.
         fn truncateTables(self: *Self, slot: u16, truncate: *const B.Truncate, snap: Snapshot) Error!void {
             for (truncate.tables[0..truncate.count]) |index| try self.lockTable(slot, index, .access_exclusive);
-            // A table referenced by a foreign key of a table outside the
-            // list cannot be truncated (0A000; CASCADE is outside the subset).
+            var current = snap;
+            current.csn = self.csn;
+            // Check current relation identities and dependencies under the
+            // target locks. A pinned catalog snapshot may name a retired slot
+            // or miss a newly committed reference.
             var relations: [K.relation_rows]K.Found = undefined;
-            const relation_count = self.catalog.visibleRelations(snap, &relations);
+            const relation_count = self.catalog.visibleRelations(current, &relations);
             for (truncate.tables[0..truncate.count]) |index| {
+                var present = false;
                 for (relations[0..relation_count]) |found| {
                     if (found.kind == 'S') continue;
+                    present = present or found.slot == index;
                     var listed = false;
                     for (truncate.tables[0..truncate.count]) |other| listed = listed or other == found.slot;
                     if (listed) continue;
@@ -5577,8 +5582,8 @@ pub fn Database(comptime config: Config) type {
                         if (constraint.kind == .foreign and constraint.ref_oid == self.tables[index].oid) return error.UnsupportedStatement;
                     }
                 }
+                if (!present) return error.SerializationFailure;
             }
-            try self.reserveWrites(slot, truncate.count);
             // RESTART IDENTITY: every sequence a column of the table owns
             // (identity, SERIAL) restarts, transactionally (ALTER SEQUENCE).
             if (truncate.restart_identity or self.dialect == .mysql) {
@@ -5597,18 +5602,8 @@ pub fn Database(comptime config: Config) type {
                 }
                 for (owned, 0..) |restart, position| if (restart) try self.alterSequence(slot, position, .{ .restart = true }, snap);
             }
-            const tx = &self.txs[slot];
-            for (truncate.tables[0..truncate.count]) |index| {
-                const table = &self.tables[index];
-                for (0..table.row_high) |row| {
-                    if (table.rows[row].newest == 0) continue;
-                    const version = S.visibleAt(table, row, snap) orelse continue;
-                    const entry = &table.versions[version];
-                    entry.xmax = tx.ref(slot);
-                    entry.xmax_cid = snap.cid;
-                }
-                tx.push(.{ .kind = .truncate, .table = index, .old = snap.cid }) catch unreachable;
-            }
+            try self.reserveWrites(slot, truncate.count);
+            for (truncate.tables[0..truncate.count]) |index| try self.truncateSlot(slot, index, snap, .truncate);
         }
 
         /// ALTER TABLE (copy on write): AccessExclusive on the table, then
@@ -7282,7 +7277,7 @@ pub fn Database(comptime config: Config) type {
                     .drop_table => try C.encodeDrop(writer, self.tables[entry.table].oid),
                     .create_sequence => try C.encodeCreateSequence(writer, &self.seqs[entry.table]),
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
-                    .truncate => try C.encodeTruncate(writer, self.tables[entry.table].oid),
+                    .truncate, .refresh_rows => try C.encodeTruncate(writer, self.tables[entry.table].oid),
                     .alter_sequence => try C.encodeAlterSequence(writer, &self.seqs[entry.table]),
                     .create_schema => try C.encodeCreateSchema(writer, self.schemas[entry.table].oid, self.schemas[entry.table].name.slice()),
                     .drop_schema => try C.encodeDropSchema(writer, self.schemas[entry.table].oid),

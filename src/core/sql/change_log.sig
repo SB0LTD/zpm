@@ -1907,6 +1907,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             S.scanPublish(table, old, false);
                             retire(db, table, old, csn);
                         }
+                        if (table.relkind != 'm') S.publishTruncate(table, csn);
                     },
                     @intFromEnum(Op.drop_table) => {
                         const table = try tableByOid(db, try reader.int(u32));
