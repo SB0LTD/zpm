@@ -293,7 +293,9 @@ fn characterDescriptions() !void {
 fn commandText(bytes: []const u8, wanted: []const u8) !void {
     var frames: Frames = .{ .bytes = bytes };
     while (try frames.next()) |f| if (f.tag == 'C') {
-        try check(equal(f.body[0 .. f.body.len - 1], wanted));
+        const actual = f.body[0 .. f.body.len - 1];
+        if (!equal(actual, wanted)) std.debug.print("command completion: expected {s}, got {s}\n", .{ wanted, actual });
+        try check(equal(actual, wanted));
         return;
     };
     return error.MissingCommandComplete;
@@ -1124,6 +1126,7 @@ fn commandTag(bytes: []const u8, wanted: []const u8) !void {
 }
 
 fn completedStoreCommand(s: *StoreSession, db: *Store.Connection, source: []const u8, expected: []const u8, extended_query: bool) !void {
+    errdefer std.debug.print("{s} completion for {s}\n", .{ if (extended_query) "extended" else "simple", source });
     if (!extended_query) {
         const bytes = try storeQuery(s, db, source);
         try tags(bytes, "CZ");
@@ -1189,7 +1192,7 @@ fn nativeCommandCompletions(extended_query: bool) !void {
     try completedStoreCommand(&session, &db, "CREATE TABLE completion_copy AS SELECT id FROM completion_src WITH NO DATA", "CREATE TABLE AS", extended_query);
     try completedStoreCommand(&session, &db, "DROP TABLE completion_copy", "DROP TABLE", extended_query);
 
-    try completedStoreCommand(&session, &db, "CREATE MATERIALIZED VIEW completion_mv AS SELECT id FROM completion_src", "SELECT 3", extended_query);
+    try completedStoreCommand(&session, &db, "CREATE MATERIALIZED VIEW completion_mv AS SELECT id FROM completion_src WHERE id <= 2", "SELECT 2", extended_query);
     try completedStoreCommand(&session, &db, "REFRESH MATERIALIZED VIEW completion_mv", "REFRESH MATERIALIZED VIEW", extended_query);
     try tags(try storeQuery(&session, &db, "DROP MATERIALIZED VIEW completion_mv"), "CZ");
     try completedStoreCommand(&session, &db, "CREATE MATERIALIZED VIEW completion_mv AS SELECT id FROM completion_src WHERE FALSE", "SELECT 0", extended_query);
