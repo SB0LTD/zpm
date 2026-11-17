@@ -550,8 +550,8 @@ pub fn Database(comptime config: Config) type {
                     const entry = &cache.entries[index];
                     if (entry.result.row_count > result.rows.len) return false;
                     // A hit still honors a pending cancel before exposing rows.
-                    if (context.session.control) |control| {
-                        if (control.poll) |poll| try poll(control.context);
+                    if (context.session.control) |execution_control| {
+                        if (execution_control.poll) |poll| try poll(execution_control.context);
                     }
                     try result.copyFromChecked(&entry.result);
                     _ = @atomicRmw(u64, &cache.counters.hits, .Add, 1, .monotonic);
@@ -567,12 +567,12 @@ pub fn Database(comptime config: Config) type {
                 const first = cache.bucket(hash);
                 const end = @min(first + ways, cache.entries.len);
                 const csn = context.snapshot.csn;
-                var free: ?usize = null;
+                var reusable: ?usize = null;
                 for (first..end) |index| {
                     if (cache.sameKey(index, context, hash, result)) return;
-                    if (!cache.entries[index].valid or cache.entries[index].csn != csn) free = index;
+                    if (!cache.entries[index].valid or cache.entries[index].csn != csn) reusable = index;
                 }
-                const index = free orelse first + cache.victim % (end - first);
+                const index = reusable orelse first + cache.victim % (end - first);
                 cache.victim +%= 1;
                 const entry = &cache.entries[index];
                 entry.valid = false;
