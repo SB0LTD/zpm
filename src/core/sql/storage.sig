@@ -73,6 +73,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub const presence_enabled = compact_enabled and config.block_presence_filters;
         pub const split_versions = config.split_external_versions and config.external_storage;
         pub const integral_enabled = split_versions and config.integral_external_versions;
+        const compact_stamps = config.compact_external_version_stamps;
         pub const VersionRow = [config.columns]V.Cell;
 
         pub fn presenceWords(rows:usize) Error!usize {
@@ -82,6 +83,7 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         comptime {
+            if (compact_stamps and !split_versions) @compileError("compact version stamps require split external storage");
             if (versions_capacity <= config.rows_per_table) @compileError("versions_per_table must exceed rows_per_table");
             if (versions_capacity > 0x7fffffff or config.rows_per_table > 0x7fffffff) @compileError("storage capacity exceeds u32 references");
         }
@@ -96,19 +98,40 @@ pub fn Storage(comptime config: types.Config) type {
         pub const Version = struct {
             /// Directory slot + 1; 0 marks a free arena slot.
             row_link: u32 = 0,
-            xmin: TxRef = .{},
+            xmin: if (compact_stamps) void else TxRef = if (compact_stamps) {} else .{},
             xmin_cid: u32 = 0,
-            xmin_csn: u64 = 0,
-            xmax: TxRef = .{},
+            xmin_csn: if (compact_stamps) void else u64 = if (compact_stamps) {} else 0,
+            xmax: if (compact_stamps) void else TxRef = if (compact_stamps) {} else .{},
             xmax_cid: u32 = 0,
-            xmax_csn: u64 = 0,
+            xmax_csn: if (compact_stamps) void else u64 = if (compact_stamps) {} else 0,
+            creation_stamp: if (compact_stamps) u64 else void = if (compact_stamps) 0 else {},
+            deletion_stamp: if (compact_stamps) u64 else void = if (compact_stamps) 0 else {},
             /// Older version index + 1, or the next free slot + 1 while free.
             older_link: u32 = 0,
             cells: if (split_versions) void else VersionRow = if (split_versions) {} else @splat(.null_value),
 
+            // Both links admit at most 31 bits. Steal no bits from the CSN,
+            // pending owner or command, including their maximum values.
+            const committed_flag: u32 = 0x80000000;
+            const link_mask: u32 = ~committed_flag;
+            const PendingStamp = packed struct(u64) {
+                sub: u16,
+                slot: u16,
+                epoch: u32,
+
+                inline fn encode(tx: TxRef) u64 {
+                    return @bitCast(PendingStamp{ .sub = tx.sub, .slot = tx.slot, .epoch = tx.epoch });
+                }
+
+                inline fn decode(word: u64) TxRef {
+                    const stamp: PendingStamp = @bitCast(word);
+                    return .{ .sub = stamp.sub, .slot = stamp.slot, .epoch = stamp.epoch };
+                }
+            };
+
             /// One-based links use zero for an unused version or no older version.
             pub inline fn rowLink(self: *const Version) u32 {
-                return self.row_link;
+                return if (comptime compact_stamps) self.row_link & link_mask else self.row_link;
             }
 
             pub inline fn rowSlot(self: *const Version) u32 {
@@ -116,67 +139,108 @@ pub fn Storage(comptime config: types.Config) type {
             }
 
             inline fn setRowLink(self: *Version, link: u32) void {
-                self.row_link = link;
+                const state = if (comptime compact_stamps) self.row_link & committed_flag else 0;
+                self.row_link = state | link;
             }
 
             inline fn olderLink(self: *const Version) u32 {
-                return self.older_link;
+                return if (comptime compact_stamps) self.older_link & link_mask else self.older_link;
             }
 
             inline fn setOlderLink(self: *Version, link: u32) void {
-                self.older_link = link;
+                const state = if (comptime compact_stamps) self.older_link & committed_flag else 0;
+                self.older_link = state | link;
             }
 
             pub const PendingChange = struct { tx: TxRef, cid: u32 };
 
             pub inline fn creationCsn(self: *const Version) u64 {
+                if (comptime compact_stamps) return if (self.row_link & committed_flag != 0) self.creation_stamp else 0;
                 return self.xmin_csn;
             }
 
             pub inline fn deletionCsn(self: *const Version) u64 {
+                if (comptime compact_stamps) return if (self.older_link & committed_flag != 0) self.deletion_stamp else 0;
                 return self.xmax_csn;
             }
 
             pub inline fn pendingCreation(self: *const Version) ?PendingChange {
                 if (self.creationCsn() != 0) return null;
-                return .{ .tx = self.xmin, .cid = self.xmin_cid };
+                const tx = if (comptime compact_stamps) PendingStamp.decode(self.creation_stamp) else self.xmin;
+                return .{ .tx = tx, .cid = self.xmin_cid };
             }
 
             pub inline fn pendingDeletion(self: *const Version) ?PendingChange {
                 if (self.deletionCsn() != 0 or !self.hasDeletion()) return null;
-                return .{ .tx = self.xmax, .cid = self.xmax_cid };
+                const tx = if (comptime compact_stamps) PendingStamp.decode(self.deletion_stamp) else self.xmax;
+                return .{ .tx = tx, .cid = self.xmax_cid };
             }
 
             pub inline fn hasDeletion(self: *const Version) bool {
+                if (comptime compact_stamps) return self.deletion_stamp != 0;
                 return self.xmax.epoch != 0;
             }
 
             pub inline fn creationAfter(self: *const Version, snap: Snapshot) bool {
+                // A live transaction's own creations are still pending.
+                if (comptime compact_stamps) return self.creationCsn() > snap.csn;
                 return self.creationCsn() > snap.csn and !snap.own(self.xmin);
             }
 
             pub inline fn deletionOwnedBy(self: *const Version, snap: Snapshot) bool {
+                if (comptime compact_stamps) {
+                    const change = self.pendingDeletion() orelse return false;
+                    return snap.own(change.tx);
+                }
                 return snap.own(self.xmax);
             }
 
             /// Set the mutation owner and command. Publication sets its CSN.
             pub inline fn markDeletion(self: *Version, tx: TxRef, cid: u32) void {
-                self.xmax = tx;
+                if (comptime compact_stamps) {
+                    // TRUNCATE can walk an old snapshot. A newer committed
+                    // deletion stays committed and cannot become ours.
+                    if (self.older_link & committed_flag != 0) return;
+                    self.deletion_stamp = if (tx.epoch == 0) 0 else PendingStamp.encode(tx);
+                } else self.xmax = tx;
                 self.xmax_cid = cid;
             }
 
             pub inline fn clearDeletion(self: *Version) void {
-                self.xmax = .{};
+                if (comptime compact_stamps) {
+                    self.older_link &= link_mask;
+                    self.deletion_stamp = 0;
+                } else {
+                    self.xmax = .{};
+                    self.xmax_csn = 0;
+                }
                 self.xmax_cid = 0;
-                self.xmax_csn = 0;
             }
 
             pub inline fn publishCreation(self: *Version, csn: u64) void {
-                self.xmin_csn = csn;
+                if (comptime compact_stamps) {
+                    self.row_link |= committed_flag;
+                    self.creation_stamp = csn;
+                } else self.xmin_csn = csn;
             }
 
             pub inline fn publishDeletion(self: *Version, csn: u64) void {
-                self.xmax_csn = csn;
+                if (comptime compact_stamps) {
+                    self.older_link |= committed_flag;
+                    self.deletion_stamp = csn;
+                } else self.xmax_csn = csn;
+            }
+
+            inline fn initCreation(self: *Version, origin: VersionOrigin) void {
+                self.xmin_cid = origin.cid;
+                if (comptime compact_stamps) {
+                    if (origin.csn == 0) {
+                        self.creation_stamp = PendingStamp.encode(origin.xmin);
+                    } else self.publishCreation(origin.csn);
+                } else {
+                    self.xmin = origin.xmin;
+                    self.xmin_csn = origin.csn;
+                }
             }
         };
 
@@ -1639,12 +1703,10 @@ pub fn Storage(comptime config: types.Config) type {
             const full_width = cells.len == config.columns;
             table.versions[version] = .{
                 .row_link = origin.row + 1,
-                .xmin = origin.xmin,
-                .xmin_cid = origin.cid,
-                .xmin_csn = origin.csn,
                 .older_link = origin.older,
                 .cells = if (comptime split_versions) {} else if (full_width) cells[0..config.columns].* else @splat(.null_value),
             };
+            table.versions[version].initCreation(origin);
             if (comptime integral_enabled) if (integralBank(table)) {
                 writeIntegral(table, version, cells);
                 table.rows[origin.row].newest = version + 1;
