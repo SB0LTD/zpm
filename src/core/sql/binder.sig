@@ -14,6 +14,7 @@
 //! Bound statements keep node indices into the statement-scoped pool and
 //! text-literal spans into the source; both stay valid until the statement
 //! finishes executing. Names and catalog references are copied.
+const std = @import("std");
 const types = @import("types.sig");
 const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
@@ -128,6 +129,7 @@ pub fn Binder(comptime config: types.Config) type {
             names: [config.columns]V.Name,
             types: [config.columns]types.DataType,
             typmods: [config.columns]i32 = @splat(-1),
+            non_null_columns: std.StaticBitSet(config.columns) = .empty,
             has_nominal_types: bool = false,
             nominal_types: [config.columns]types.NominalColumnType = undefined,
             count: usize,
@@ -552,6 +554,7 @@ pub fn Binder(comptime config: types.Config) type {
             names: [config.columns]V.Name = undefined,
             tys: [config.columns]ast.Type = undefined,
             typmods: [config.columns]i32 = undefined,
+            non_null_columns: std.StaticBitSet(config.columns) = .empty,
             order: [2 * config.columns]SortKey = undefined,
             order_count: usize = 0,
             distinct: Distinct = .none,
@@ -3943,7 +3946,7 @@ pub fn Binder(comptime config: types.Config) type {
                         try typeExpr(context, scope, item);
                         const arg = context.node(item);
                         if (mysql and arg.ty != .int4 and arg.ty != .int8 and arg.kind != .null_literal) return error.UnsupportedStatement;
-                        const ty: ast.Type = if (mysql and mysqlSignedLiteral(context, item) != null) .int8 else arg.ty;
+                        const ty: ast.Type = if (mysql and signedLiteral(context, item) != null) .int8 else arg.ty;
                         try unifyInto(&result, ty);
                     }
                     if (result == .unknown) {
@@ -4199,6 +4202,8 @@ pub fn Binder(comptime config: types.Config) type {
         fn targetName(context: *const Context, id: u16) V.Name {
             var buffer: V.Name = .{};
             const n = context.node(id);
+            if (context.dialect == .tds and n.kind == .function and
+                (n.func == .tds_isnull or n.func == .tds_dateadd)) return .{};
             if (n.func == .mysql_ifnull or n.func == .mysql_date_add)
                 return literalName(context.source[n.text.start..n.text.end]);
             const result = figure(context, id, &buffer);
@@ -4659,16 +4664,37 @@ pub fn Binder(comptime config: types.Config) type {
             return error.UndefinedObject;
         }
 
-        /// A standalone MySQL signed literal projects as BIGINT. Negating
-        /// a negative literal selects a different native numeric lane.
-        fn mysqlSignedLiteral(context: *const Context, id: u16) ?i64 {
+        /// A signed literal has no computed operands. Negating a negative
+        /// literal is a separate expression on the MySQL type path.
+        fn signedLiteral(context: *const Context, id: u16) ?i64 {
             const n = context.node(id);
             if (n.kind == .int_literal) return n.integer;
             if (n.kind != .unary or (n.op != .neg and n.op != .pos)) return null;
-            const operand = mysqlSignedLiteral(context, n.a) orelse return null;
+            const operand = signedLiteral(context, n.a) orelse return null;
             if (n.op == .pos) return operand;
             if (operand < 0) return null;
             return -operand;
+        }
+
+        /// Admit fixed TDS INT4 only from bound expressions that cannot
+        /// produce NULL. A table is supplied only for a direct, non-extended
+        /// FROM item. Conversions and general expressions remain nullable.
+        fn fixedInt4(context: *const Context, table: ?usize, id: u16) bool {
+            if (id == none) return false;
+            const node = context.node(id);
+            if (node.ty != .int4 or node.planned_null) return false;
+            return switch (node.kind) {
+                .int_literal => true,
+                .unary => signedLiteral(context, id) != null,
+                .column => if (table) |index| blk: {
+                    const source = &context.tables[index];
+                    break :blk node.level == 0 and node.relation == 0 and source.relkind == 'r' and
+                        node.column < source.column_count and source.columns[node.column].not_null;
+                } else false,
+                .function => node.func == .tds_isnull and
+                    fixedInt4(context, table, context.node(node.b).next),
+                else => false,
+            };
         }
 
         fn bindSelect(context: *const Context, select: *const Ast.Select) Error!Select {
@@ -4692,6 +4718,8 @@ pub fn Binder(comptime config: types.Config) type {
                         out.names[out.count] = column.name;
                         out.types[out.count] = column.data_type;
                         out.typmods[out.count] = column.typmod;
+                        if (context.dialect == .tds and fixedInt4(context, out.table, id))
+                            out.non_null_columns.set(out.count);
                         out.count += 1;
                     }
                     continue;
@@ -4705,12 +4733,15 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                 }
                 try valueExpr(context, &scope, target.expr);
-                if (!context.legacy and context.dialect == .mysql and mysqlSignedLiteral(context, target.expr) != null)
+                // MySQL projects standalone signed literals as BIGINT.
+                if (!context.legacy and context.dialect == .mysql and signedLiteral(context, target.expr) != null)
                     context.node(target.expr).ty = .int8;
                 out.targets[out.count] = target.expr;
                 out.names[out.count] = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 out.types[out.count] = types.dataTypeOf(context.node(target.expr).ty);
                 out.typmods[out.count] = outputTypmod(context, target.expr);
+                if (context.dialect == .tds and fixedInt4(context, out.table, target.expr))
+                    out.non_null_columns.set(out.count);
                 out.count += 1;
             }
             out.where = try bindWhere(context, &scope, select.where);
@@ -6774,6 +6805,12 @@ pub fn Binder(comptime config: types.Config) type {
             bindTies(q, p, order[0..order_count]);
             p.constant_source_safe=!q.distinct and q.order_count==0 and !q.limit_present and !q.offset_present;
             try lowerWindows(context,id);
+            if (context.dialect == .tds and !p.grouped and !p.general_join and p.source_count <= 1 and p.window_count == 0) {
+                const table = if (p.source_count == 1) p.sources[0].table else null;
+                for (p.targets[0..p.count], 0..) |target, column| if (fixedInt4(context, table, target)) {
+                    p.non_null_columns.set(column);
+                };
+            }
             return id;
         }
 

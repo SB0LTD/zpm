@@ -455,32 +455,49 @@ pub fn Session(comptime DB: type) type {
             return @intCast(ordinal);
         }
 
+        fn fixedInt4(self: *const Self, column: usize) bool {
+            if (!@hasField(DB.Result, "non_null_columns")) return false;
+            return self.result.column_types[column] == .integer32 and self.result.non_null_columns.isSet(column);
+        }
+
         fn results(self: *Self, writer: *Writer, completion: u8) Error!void {
             // Validate all text before writing COLMETADATA, so encoding errors
             // produce a complete ERROR/DONE response instead of partial rows.
             for (0..self.result.column_count) |column| {
                 if (try utf16Length(self.result.column_names[column].slice()) > 255) return error.UnsupportedValue;
             }
-            for (self.result.rows[0..self.result.row_count]) |*row| for (row.cells[0..self.result.column_count]) |*cell| switch (cell.*) {
-                .text => |*value| if (try utf16Length(value.slice()) > 32767) return error.UnsupportedValue,
-                .date => |value| { _ = try dateDays(value); },
-                else => {},
-            };
+            for (self.result.rows[0..self.result.row_count]) |*row| {
+                for (row.cells[0..self.result.column_count], 0..) |*cell, column| {
+                    if (self.fixedInt4(column) and
+                        (cell.* != .integer or cell.integer < -2147483648 or cell.integer > 2147483647))
+                        return error.UnsupportedValue;
+                    switch (cell.*) {
+                        .text => |*value| if (try utf16Length(value.slice()) > 32767) return error.UnsupportedValue,
+                        .date => |value| { _ = try dateDays(value); },
+                        else => {},
+                    }
+                }
+            }
             if (self.result.column_count != 0) {
                 try writer.byte(0x81);
                 try writer.number(self.result.column_count, 2);
                 for (0..self.result.column_count) |column| {
+                    const fixed_int4 = self.fixedInt4(column);
                     try writer.number(0, 4); // usertype (TDS 7.2+)
-                    try writer.number(1, 2); // nullable
+                    try writer.number(if (fixed_int4) 0 else 1, 2); // fNullable
                     switch (self.result.column_types[column]) {
                         .integer => {
                             try writer.byte(0x26);
                             try writer.byte(8);
                         }, // INTN/BIGINT
                         .integer32 => {
-                            try writer.byte(0x26);
-                            try writer.byte(4);
-                        }, // INTN/INT
+                            if (fixed_int4) {
+                                try writer.byte(0x38); // INT4
+                            } else {
+                                try writer.byte(0x26); // INTN
+                                try writer.byte(4);
+                            }
+                        },
                         .boolean => {
                             try writer.byte(0x68);
                             try writer.byte(1);
@@ -505,7 +522,7 @@ pub fn Session(comptime DB: type) type {
                         },
                         .integer => |value| {
                             if (self.result.column_types[column] == .integer32) {
-                                try writer.byte(4);
+                                if (!self.fixedInt4(column)) try writer.byte(4);
                                 try writer.number(@bitCast(value), 4);
                             } else {
                                 try writer.byte(8);
@@ -529,7 +546,10 @@ pub fn Session(comptime DB: type) type {
                     };
                 }
             }
-            try writer.doneToken(completion, 0x10 | (if (completion == 0xff) @as(u16, 1) else 0), if (self.result.column_count == 0) self.result.affected_rows else self.result.row_count);
+            const create_table = if (@hasField(DB.Result, "command")) self.result.command == .create_table else false;
+            const count_flag: u16 = if (self.result.column_count == 0 and create_table) 0 else 0x10;
+            const rows = if (self.result.column_count == 0) self.result.affected_rows else self.result.row_count;
+            try writer.doneToken(completion, count_flag | (if (completion == 0xff) @as(u16, 1) else 0), rows);
         }
 
         fn batch(self: *Self, db: *DB, source: []const u8, writer: *Writer) Error!void {

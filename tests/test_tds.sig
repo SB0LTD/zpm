@@ -3,7 +3,7 @@ const std = @import("std");
 const sql = @import("sql");
 const tds = @import("tds");
 const db_store = @import("db_store");
-const Raw = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 4, .text_bytes = 64 });
+const Raw = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 4, .text_bytes = 64, .integer_bits = 32 });
 const Store = db_store.Store(Raw);
 const DB = Store.Connection;
 const Session = tds.Session(DB);
@@ -16,7 +16,10 @@ var store: Store = .{};
 
 fn check(value: bool) !void {
     assertions += 1;
-    if (!value) return error.TdsContractFailed;
+    if (!value) {
+        std.debug.print("TDS assertion {d} failed\n", .{assertions});
+        return error.TdsContractFailed;
+    }
 }
 
 fn same(a: []const u8, b: []const u8) !void {
@@ -129,6 +132,14 @@ const Reader = struct {
     }
 };
 
+fn readColumn(reader: *Reader, flags: u16, kind: u8, size: ?u8, name: []const u8) !void {
+    try check(try reader.numeric(4) == 0 and try reader.numeric(2) == flags);
+    try check(try reader.numeric(1) == kind);
+    if (size) |length| try check(try reader.numeric(1) == length);
+    try check(try reader.numeric(1) == name.len);
+    for (name) |byte| try check(try reader.numeric(2) == byte);
+}
+
 fn loginAndFragmentation() !void {
     store = .{};
     var db: DB = .{ .store = &store, .id = 1 };
@@ -158,8 +169,8 @@ fn typedRowsAndErrors() !void {
     var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
-    const created = try execute(&session, &db, "CREATE TABLE data (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
-    try check(created[0] == 0xfd);
+    const created = try execute(&session, &db, "CREATE TABLE data (id BIGINT PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
+    try check(created[0] == 0xfd and created[1] == 0);
     const inserted = try execute(&session, &db, "INSERT INTO data VALUES (-9223372036854775808, 'עברית😀', TRUE, NULL)");
     try check(inserted[0] == 0xfd and inserted[5] == 1);
     const selected = try execute(&session, &db, "SELECT * FROM data");
@@ -260,15 +271,25 @@ fn nativeIdentifiersAndTop() !void {
     var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
-    try check((try execute(&session, &db, "SELECT 1 AS [value]"))[0] == 0x81);
+    var literal: Reader = .{ .source = try execute(&session, &db, "SELECT 1 AS [value]") };
+    try check(try literal.numeric(1) == 0x81 and try literal.numeric(2) == 1);
+    try readColumn(&literal, 0, 0x38, null, "value");
+    try check(try literal.numeric(1) == 0xd1 and try literal.numeric(4) == 1 and try literal.numeric(1) == 0xfd);
     try same(session.result.column_names[0].slice(), "value");
     try check(session.result.rows[0].cells[0].integer == 1);
     try check((try execute(&session, &db, "CREATE TABLE [a]]b] ([x]]y] INT PRIMARY KEY, priority INT)"))[0] == 0xfd);
     try check((try execute(&session, &db, "INSERT INTO [a]]b] VALUES (3,7),(1,7),(4,NULL),(2,7)"))[0] == 0xfd);
-    try check((try execute(&session, &db, "SELECT TOP(2) [a]]b].[x]]y] AS [x]]z] FROM [a]]b] ORDER BY [x]]y]"))[0] == 0x81);
+    var top: Reader = .{ .source = try execute(&session, &db, "SELECT TOP(2) [a]]b].[x]]y] AS [x]]z] FROM [a]]b] ORDER BY [x]]y]") };
+    try check(try top.numeric(1) == 0x81 and try top.numeric(2) == 1);
+    try readColumn(&top, 0, 0x38, null, "x]z");
+    try check(try top.numeric(1) == 0xd1 and try top.numeric(4) == 1);
+    try check(try top.numeric(1) == 0xd1 and try top.numeric(4) == 2 and try top.numeric(1) == 0xfd);
     try check(session.result.row_count == 2 and session.result.rows[0].cells[0].integer == 1 and session.result.rows[1].cells[0].integer == 2);
     try same(session.result.column_names[0].slice(), "x]z");
-    try check((try execute(&session, &db, "SELECT TOP 0 [x]]y] FROM [a]]b]"))[0] == 0x81);
+    var empty: Reader = .{ .source = try execute(&session, &db, "SELECT TOP 0 [x]]y] FROM [a]]b]") };
+    try check(try empty.numeric(1) == 0x81 and try empty.numeric(2) == 1);
+    try readColumn(&empty, 0, 0x38, null, "x]y");
+    try check(try empty.numeric(1) == 0xfd);
     try check(session.result.row_count == 0);
     try check((try execute(&session, &db, "SELECT TOP 1 [x]]y] FROM [a]]b] ORDER BY priority ASC"))[0] == 0x81);
     try check(session.result.row_count == 1 and session.result.rows[0].cells[0].integer == 4);
@@ -300,9 +321,19 @@ fn nativeDateAddAndIsNull() !void {
     var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
-    try check((try execute(&session, &db, "SELECT ISNULL(NULL,2), DATEADD(day,1,CAST('2025-01-01' AS date))"))[0] == 0x81);
+    var metadata: Reader = .{ .source = try execute(&session, &db, "SELECT ISNULL(NULL,2), DATEADD(day,1,CAST('2025-01-01' AS date))") };
+    try check(try metadata.numeric(1) == 0x81 and try metadata.numeric(2) == 2);
+    try readColumn(&metadata, 0, 0x38, null, "");
+    try readColumn(&metadata, 1, 0x28, null, "");
+    try check(try metadata.numeric(1) == 0xd1 and try metadata.numeric(4) == 2);
+    try check(try metadata.numeric(1) == 3 and try metadata.numeric(3) == 739252 and try metadata.numeric(1) == 0xfd);
     try check(session.result.column_types[0] == .integer32 and session.result.column_types[1] == .date);
     try check(session.result.rows[0].cells[0].integer == 2 and session.result.rows[0].cells[1].date == 9133);
+    var aliases: Reader = .{ .source = try execute(&session, &db, "SELECT ISNULL(NULL,NULL) AS [value],DATEADD(day,0,CAST(NULL AS DATE)) AS [day]") };
+    try check(try aliases.numeric(1) == 0x81 and try aliases.numeric(2) == 2);
+    try readColumn(&aliases, 1, 0x26, 4, "value");
+    try readColumn(&aliases, 1, 0x28, null, "day");
+    try check(try aliases.numeric(1) == 0xd1 and try aliases.numeric(1) == 0 and try aliases.numeric(1) == 0);
     for ([_][]const u8{
         "DATEADD(week,-1,DATE '2025-01-05')=DATE '2024-12-29'",
         "DATEADD(month,1,DATE '2024-01-31')=DATE '2024-02-29'",
@@ -334,6 +365,38 @@ fn nativeDateAddAndIsNull() !void {
         "CREATE VIEW scoped_view AS SELECT ISNULL(NULL,1) AS n",
     }) |statement| try check((try execute(&session, &db, statement))[0] == 0xaa);
     try check(store.database.tableCount() == 0);
+}
+
+fn nativeIntNullability() !void {
+    store = .{};
+    var db: DB = .{ .store = &store, .id = 1 };
+    var session: Session = .{};
+    try connect(&session, &db);
+    var signed: Reader = .{ .source = try execute(&session, &db, "SELECT -9 AS lo,+7 AS hi") };
+    try check(try signed.numeric(1) == 0x81 and try signed.numeric(2) == 2);
+    try readColumn(&signed, 0, 0x38, null, "lo");
+    try readColumn(&signed, 0, 0x38, null, "hi");
+    try check(try signed.numeric(1) == 0xd1 and try signed.numeric(4) == 0xfffffff7 and try signed.numeric(4) == 7);
+    const created = try execute(&session, &db, "CREATE TABLE int_meta(id INT PRIMARY KEY,optional INT,must INT NOT NULL)");
+    try check(created[0] == 0xfd and created[1] == 0);
+    const inserted = try execute(&session, &db, "INSERT INTO int_meta VALUES(-1,NULL,8),(2,6,9)");
+    try check(inserted[0] == 0xfd and inserted[1] == 0x10 and inserted[5] == 2);
+    var mixed: Reader = .{ .source = try execute(&session, &db, "SELECT TOP (2) id,optional,must FROM int_meta ORDER BY id") };
+    try check(try mixed.numeric(1) == 0x81 and try mixed.numeric(2) == 3);
+    try readColumn(&mixed, 0, 0x38, null, "id");
+    try readColumn(&mixed, 1, 0x26, 4, "optional");
+    try readColumn(&mixed, 0, 0x38, null, "must");
+    try check(try mixed.numeric(1) == 0xd1 and try mixed.numeric(4) == 0xffffffff);
+    try check(try mixed.numeric(1) == 0 and try mixed.numeric(4) == 8);
+    try check(try mixed.numeric(1) == 0xd1 and try mixed.numeric(4) == 2);
+    try check(try mixed.numeric(1) == 4 and try mixed.numeric(4) == 6 and try mixed.numeric(4) == 9);
+    var outer_join: Reader = .{ .source = try execute(&session, &db,
+        "SELECT TOP (1) a.id,b.id AS absent FROM int_meta a LEFT JOIN int_meta b ON a.id=b.id+100 ORDER BY a.id") };
+    try check(try outer_join.numeric(1) == 0x81 and try outer_join.numeric(2) == 2);
+    try readColumn(&outer_join, 1, 0x26, 4, "id");
+    try readColumn(&outer_join, 1, 0x26, 4, "absent");
+    try check(try outer_join.numeric(1) == 0xd1 and try outer_join.numeric(1) == 4 and try outer_join.numeric(4) == 0xffffffff);
+    try check(try outer_join.numeric(1) == 0 and try outer_join.numeric(1) == 0xfd);
 }
 
 fn transactionManagerAndPreflight() !void {
@@ -487,7 +550,7 @@ fn rpcParameters() !void {
     var db: DB = .{ .store = &store, .id = 1 };
     var session: Session = .{};
     try connect(&session, &db);
-    _ = try execute(&session, &db, "CREATE TABLE binds (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
+    _ = try execute(&session, &db, "CREATE TABLE binds (id BIGINT PRIMARY KEY, name TEXT, active BOOLEAN, note TEXT)");
     var buffer: [4096]u8 = undefined;
     var builder: RpcBuilder = .{ .target = &buffer };
     try builder.begin("INSERT INTO binds VALUES (@P1, @P2, @P3, @P4)", "@P1 BIGINT,@P2 NVARCHAR(MAX),@P3 BIT,@P4 NVARCHAR(32)");
@@ -689,6 +752,7 @@ pub fn main(init: std.process.Init) !void {
     try dateResults();
     try nativeIdentifiersAndTop();
     try nativeDateAddAndIsNull();
+    try nativeIntNullability();
     try outputFragmentation();
     try transactionManagerAndPreflight();
     try concurrentCommittedVisibility();
