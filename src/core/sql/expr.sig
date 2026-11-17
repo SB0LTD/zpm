@@ -475,6 +475,11 @@ pub fn Eval(comptime config: types.Config) type {
             const first = try eval(ctx, n.b);
             if (first == .null_value) return .null_value;
             switch (n.func) {
+                .pg_table_is_visible => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const visible = hook.relation_visible orelse return error.UnsupportedStatement;
+                    return if (visible(hook.ptr, @intCast(first.integer))) |found| boolCell(found) else .null_value;
+                },
                 .to_regtype, .regtype_in => {
                     if (types.typeByName(first.text.slice())) |data_type| return .{ .integer = types.typeOid(data_type) };
                     if (n.func == .to_regtype) return .null_value;
@@ -1284,7 +1289,8 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
-                    .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
+                    .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
+                    .pg_table_is_visible => return catalogValue(ctx, n),
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
                         const config_cell = try eval(ctx, n.b);
