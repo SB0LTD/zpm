@@ -1,8 +1,7 @@
 //! Secondary indexes on caller-provided memory (external_storage, B11 wave
 //! 3 index-storage lane). Index entry hashes are slices bound inside the
-//! external region (Config.external_indexes runs per table, or any count
-//! per table through Backing.index_slots), sized from each table's runtime
-//! version budget, so an index never caps a table that has version room.
+//! external region, sized from each table's runtime version budget.
+//! Opted-in logical indexes can use MVCC scans instead of a hash run.
 //! Checks: exact memory plans; CREATE [UNIQUE] INDEX with index probes equal
 //! to scans; 23505 and atomicity; rollback and savepoint rollback with no
 //! stale entry; version reclamation and a full version arena (53200, never
@@ -36,6 +35,7 @@ var db: DB = .{};
 var replica: DB = .{};
 var recovered: DB = .{};
 var copy: DB = .{};
+var scanned: DB = .{};
 var unbindable: DB = .{};
 var odd: DB = .{};
 var odd_bare: Bare = .{};
@@ -56,6 +56,7 @@ var primary_region: [1 << 20]u8 align(@alignOf(DB.StorageVersion)) = undefined;
 var replica_region: [1 << 20]u8 align(@alignOf(DB.StorageVersion)) = undefined;
 var recovered_region: [1 << 20]u8 align(@alignOf(DB.StorageVersion)) = undefined;
 var copy_region: [1 << 20]u8 align(@alignOf(DB.StorageVersion)) = undefined;
+var scanned_region: [1 << 20]u8 align(@alignOf(DB.StorageVersion)) = undefined;
 var bare_region: [1 << 20]u8 align(@alignOf(Bare.StorageVersion)) = undefined;
 
 fn check(ok: bool) !void {
@@ -314,15 +315,24 @@ fn layout() !void {
     try bind(&odd, &copy_region, 33, 67);
     try check(odd_bare.tables[3].index_slots.len == 0 and odd.tables[3].index_slots.len == 2 * 256);
     // Caller memory is not zeroed: nothing may read it before writing it.
-    for ([_][]u8{ &primary_region, &replica_region, &copy_region, &recovered_region, &bare_region }) |region| @memset(region, 0xaa);
+    for ([_][]u8{ &primary_region, &replica_region, &copy_region, &recovered_region, &scanned_region, &bare_region }) |region| @memset(region, 0xaa);
     try bind(&db, &primary_region, rows_budget, versions_budget);
     try bind(&replica, &replica_region, rows_budget, versions_budget);
-    try bind(&copy, &copy_region, rows_budget, versions_budget);
-    try bind(&recovered, &recovered_region, 48, 128);
+    var scan_plan = budgets(DB, rows_budget, versions_budget);
+    scan_plan[0].secondary_hashes = 3;
+    try check(DB.backingBytesFor(scan_plan, refs_count) == error.InvalidParameterValue);
+    for (&scan_plan) |*budget| budget.secondary_hashes = 0;
+    const scan_bytes = try DB.backingBytesFor(scan_plan, refs_count);
+    try check(required - scan_bytes == 4 * 2 * 128 * @sizeOf(u32));
+    try copy.bindMemoryFor(copy_region[0..scan_bytes], scan_plan, refs_count);
+    try scanned.bindMemoryFor(scanned_region[0..scan_bytes], scan_plan, refs_count);
+    var recover_plan = budgets(DB, 48, 128);
+    for (&recover_plan, 0..) |*budget, index| budget.secondary_hashes = if (index % 2 == 0) 1 else 0;
+    try recovered.bindMemoryFor(&recovered_region, recover_plan, refs_count);
     try bind(&bare, &bare_region, 48, 128);
-    for (&db.tables, &recovered.tables, &bare.tables) |*table, *large, *unbound| {
+    for (&db.tables, &recovered.tables, &bare.tables, recover_plan) |*table, *large, *unbound, budget| {
         try check(table.key_index.len == 128 and table.index_slots.len == 2 * 128);
-        try check(large.key_index.len == 256 and large.index_slots.len == 2 * 256);
+        try check(large.key_index.len == 256 and large.index_slots.len == budget.secondary_hashes.? * 256 and large.scan_index_limit == 2);
         try check(unbound.index_slots.len == 0);
     }
     // Index slots sit inside the region, after their table's key index.
@@ -568,8 +578,8 @@ fn truncation() !void {
 // ---- replay -----------------------------------------------------------------
 
 fn replay() !void {
-    // Recovery: the whole log into a fresh external database whose tables
-    // have twice the version budget (and so twice the index slots).
+    // Recovery with twice the version budget and at most one hash per table.
+    // The same WAL still installs and checks both logical indexes.
     for (0..log_count) |position| try recovered.applyChangeRecord(logged(position), &recovery);
     const state = [_][]const u8{ probes[0], probes[1], "SELECT id, g, v, w FROM t ORDER BY id", "SELECT id, k FROM u ORDER BY id" };
     try sameAs(&recovered, &state);
@@ -604,7 +614,7 @@ fn replay() !void {
 }
 
 fn copies() !void {
-    // copyFromInto rehashes every index for the destination's masks.
+    // Copy from hashed tables into scan-only backing.
     try copy.copyFromInto(&db);
     try indexAgrees(&copy, "t", "t_v", &v_keys);
     try indexAgrees(&copy, "u", "u_k", &.{ 0, 1, 2 });
@@ -612,6 +622,61 @@ fn copies() !void {
     var result: DB.Result = .{};
     try check(copy.execute("INSERT INTO t (id, g, v) VALUES (71, 0, 10)", &result) == error.PrimaryKeyViolation);
     try check(copy.indexConsistent("t").?);
+}
+
+fn scannedIndexes() !void {
+    for (&scanned.tables) |*table| try check(table.index_slots.len == 0 and table.scan_index_limit == 2);
+    var result: DB.Result = .{};
+    try scanned.execute("CREATE TABLE s (id INT PRIMARY KEY, v INT, g INT)", &result);
+    try scanned.execute("INSERT INTO s VALUES (1,10,1),(2,10,-1),(3,NULL,3)", &result);
+    const oids = scanned.oid_counter;
+    try check(scanned.execute("CREATE UNIQUE INDEX s_v ON s (v) NULLS NOT DISTINCT", &result) == error.PrimaryKeyViolation);
+    try check(scanned.oid_counter == oids);
+    try scanned.execute("UPDATE s SET v=20 WHERE id=2", &result);
+    try scanned.execute("CREATE UNIQUE INDEX s_v ON s (v) NULLS NOT DISTINCT", &result);
+    try scanned.execute("CREATE INDEX s_expr ON s ((g + 1)) WHERE g > 0", &result);
+    try same(try query(&scanned, "SELECT indexname FROM pg_indexes WHERE tablename = 's' ORDER BY indexname"), "s_expr;s_pkey;s_v");
+    try indexAgrees(&scanned, "s", "s_v", &.{ 10, 20, 30 });
+    try check(scanned.execute("CREATE INDEX s_third ON s (g)", &result) == error.IndexCapacity);
+    try check(scanned.execute("INSERT INTO s VALUES (4,NULL,4)", &result) == error.PrimaryKeyViolation);
+    try check(scanned.execute("UPDATE s SET v=20 WHERE id=1", &result) == error.PrimaryKeyViolation);
+    try scanned.execute("INSERT INTO s VALUES (4,10,4) ON CONFLICT (v) DO UPDATE SET g=EXCLUDED.g RETURNING id,g", &result);
+    try same(try render(DB, &result), "1|4");
+
+    const writer = try scanned.begin();
+    const waiter = try scanned.begin();
+    try scanned.statement(writer, "INSERT INTO s VALUES (5,50,5)", &result, .{});
+    try check(scanned.statement(waiter, "INSERT INTO s VALUES (6,50,6)", &result, .{}) == error.WouldBlock);
+    try check(scanned.parked(waiter));
+    scanned.abort(writer);
+    try scanned.statement(waiter, "INSERT INTO s VALUES (6,50,6)", &result, .{ .@"resume" = true });
+    scanned.publishCommit(waiter);
+    try check(try hits(&scanned, "s", "s_v", 50) == 1);
+
+    const reader = try scanned.begin();
+    try scanned.statement(reader, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &result, .{});
+    try scanned.statement(reader, "SELECT v FROM s WHERE id=1", &result, .{});
+    try same(try render(DB, &result), "10");
+    try scanned.execute("UPDATE s SET v=40 WHERE id=1", &result);
+    try scanned.execute("INSERT INTO s VALUES (7,10,7)", &result);
+    try scanned.statement(reader, "SELECT id FROM s WHERE v=10 ORDER BY id", &result, .{});
+    try same(try render(DB, &result), "1");
+    scanned.abort(reader);
+    try same(try query(&scanned, "SELECT id FROM s WHERE v=10 ORDER BY id"), "7");
+
+    try scanned.execute("CREATE TABLE anchor (id INT PRIMARY KEY)", &result);
+    const catalog_reader = try scanned.begin();
+    try scanned.statement(catalog_reader, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &result, .{});
+    try scanned.statement(catalog_reader, "SELECT id FROM anchor", &result, .{});
+    try scanned.execute("DROP INDEX s_v", &result);
+    const listed = "SELECT indexname FROM pg_indexes WHERE tablename='s' ORDER BY indexname";
+    try scanned.statement(catalog_reader, listed, &result, .{});
+    try same(try render(DB, &result), "s_expr;s_pkey;s_v");
+    scanned.abort(catalog_reader);
+    try same(try query(&scanned, listed), "s_expr;s_pkey");
+    try scanned.execute("UPDATE s SET v=10 WHERE id=1", &result);
+    try same(try query(&scanned, "SELECT id FROM s WHERE v=10 ORDER BY id"), "1;7");
+    try clean(&scanned);
 }
 
 // ---- per-slot bindings (bindStorage) ----------------------------------------
@@ -728,6 +793,7 @@ pub fn main() !void {
     try truncation();
     try replay();
     try copies();
+    try scannedIndexes();
     try perSlot();
     var buffer: [512]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-index-external\",\"pass\":true,\"assertions\":{d},\"log_records\":{d},\"index_bytes_per_table_per_index\":{{\"versions_1024\":{d},\"versions_8192\":{d},\"versions_1048576\":{d}}},\"ramsql_version_bytes\":{d},\"ramsql_plan_bytes_4_indexes\":{d}}}\n", .{ assertions, log_count, report_1k, report_8k, report_1m, ram_version_bytes, ram_plan_bytes });

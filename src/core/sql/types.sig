@@ -146,7 +146,10 @@ pub const Config = struct {
     /// table's runtime versions) u32, so its entries cover every version
     /// (no cap below the version arena). 0 binds none: CREATE INDEX is
     /// IndexCapacity (54000) and memory plans are unchanged. bindStorage
-    /// callers bind any count per table through Backing.index_slots.
+    /// callers bind hash runs through Backing.index_slots and may admit scan
+    /// fallback with Backing.scan_index_limit. A smaller
+    /// TableBudget.secondary_hashes trades hash allocation for scans of the
+    /// MVCC version arena.
     external_indexes: usize = 0,
     /// Tx-session lane (session.sig). Every limit below is SessionCapacity
     /// (54000) when exceeded, with nothing changed.
