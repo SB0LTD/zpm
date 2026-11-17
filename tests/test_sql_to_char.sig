@@ -17,6 +17,28 @@ fn reject(query:[]const u8,expected:sql.Error) !void {
     try check(result.row_count==saved.row_count and result.column_count==saved.column_count);
     for(result.rows[0..result.row_count],saved.rows[0..saved.row_count]) |a,b| for(0..result.column_count) |i| try check(Db.compareCells(&a.cells[i],&b.cells[i])==0);
 }
+
+fn groupedDateKeys() !void {
+    try db.execute("CREATE TABLE stores(id INTEGER PRIMARY KEY, region TEXT)",&result);
+    try db.execute("INSERT INTO stores VALUES(1,'west')",&result);
+    try db.execute("INSERT INTO sales VALUES(5,'2024-01-01',60),(6,'2026-10-21',70),(7,'2024-01-01',80),(8,'infinity',90),(9,'-infinity',100),(10,'2024-01-01',110)",&result);
+    try db.execute("SELECT st.region,to_char(s.d,'YYYY-MM'),COUNT(*),SUM(s.amount) FROM sales s JOIN stores st ON st.id=1 GROUP BY st.region,to_char(s.d,'YYYY-MM') ORDER BY 1,2 NULLS LAST",&result);
+    const cached = result;
+    try check(cached.row_count == 4 and db.workspace.query.stream_stats.date_key_memo_hits == 2);
+    try check(db.workspace.query.stream_stats.date_key_memo_misses == 8);
+    // Dates 1024 days apart share a cache slot. A computed format takes the
+    // ordinary evaluator so exact values and counts can be compared.
+    try db.execute("SELECT st.region,to_char(s.d,'YYYY-'||'MM'),COUNT(*),SUM(s.amount) FROM sales s JOIN stores st ON st.id=1 GROUP BY st.region,to_char(s.d,'YYYY-'||'MM') ORDER BY 1,2 NULLS LAST",&result);
+    try check(result.row_count == cached.row_count and db.workspace.query.stream_stats.date_key_memo_hits == 0);
+    for (0..result.row_count) |row| for (0..result.column_count) |column| {
+        try check(Db.compareCells(&result.rows[row].cells[column], &cached.rows[row].cells[column]) == 0);
+    };
+    try db.execute("SELECT to_char(d,'YYYY-MM-DD') AS day,COUNT(*) FROM sales GROUP BY to_char(d,'YYYY-MM-DD') ORDER BY 1 NULLS LAST",&result);
+    try check(result.row_count == 5 and result.rows[0].cells[1].integer == 4);
+    try check(std.mem.eql(u8,result.rows[0].cells[0].text.slice(),"2024-01-01"));
+    try reject("SELECT to_char(d,'IYYY-IW'),COUNT(*) FROM sales GROUP BY to_char(d,'IYYY-IW')",error.UnsupportedStatement);
+}
+
 pub fn main() !void {
     var fixtures=std.mem.splitScalar(u8,@embedFile("evidence/to-char-pg16.tsv"),'\n');
     while(fixtures.next()) |line| {
@@ -49,6 +71,7 @@ pub fn main() !void {
     try db.execute("SELECT to_char(d,'YYYY-MM'),COUNT(*),SUM(amount) FROM sales GROUP BY to_char(d,'YYYY-MM') ORDER BY 1 NULLS LAST",&result);
     try check(result.row_count==3 and result.rows[0].cells[1].integer==2 and result.rows[0].cells[2].integer==30);
     try check(result.rows[1].cells[2].integer==40 and result.rows[2].cells[0]==.null_value);
+    try groupedDateKeys();
     // Output is expanded per token; bounded value storage must fail atomically.
     var query:[256]u8=undefined;var pattern:[128]u8=undefined;
     for(0..32) |i| @memcpy(pattern[i*4..][0..4],"YYYY");
