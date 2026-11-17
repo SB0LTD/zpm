@@ -95,9 +95,9 @@ def native_server(executable, work):
 
 
 @contextmanager
-def ramsql_server(executable, work, case_id):
+def ramsql_server(executable, work, case_id, storage=("--memory",)):
     with (work / f"{case_id}-ramsql.log").open("wb") as output:
-        process = subprocess.Popen([str(executable), "--serve", "--memory", "--insecure-local",
+        process = subprocess.Popen([str(executable), "--serve", *storage, "--insecure-local",
                                     "--protocol", "mysql", "--port", "0", "--max-clients", "2"],
                                    stdout=subprocess.PIPE, stderr=output)
         try:
