@@ -54,8 +54,128 @@ const Replay = struct {
         return error.InjectedReplayFailure;
     }
 };
+
+const positioned_payloads = [_][]const u8{ "ordinary change", "pending writes", "intervening change", "resolve", "next change" };
+const positioned_kinds = [_]u16{ 3, 4, 3, 4, 3 };
+const accepted_positioned = (@as(u32, 1) << 3) | (@as(u32, 1) << 4);
+
+const PositionedReplay = struct {
+    file: *Mock,
+    scratch: []u8,
+    seen: usize = 0,
+    next_offset: u64 = 0,
+    pending: ?log.Frame = null,
+    reread: bool = false,
+
+    fn apply(self: *PositionedReplay, frame: log.Frame, payload: []const u8) !void {
+        try check(frame.sequence == self.seen + 1 and frame.offset == self.next_offset);
+        try check(frame.kind == positioned_kinds[self.seen] and frame.payload_len == positioned_payloads[self.seen].len);
+        try check(std.mem.eql(u8, payload, positioned_payloads[self.seen]));
+        if (self.seen == 1) self.pending = frame;
+        if (self.seen == 3) {
+            const previous = try log.readFrame(self.file, self.scratch, self.pending.?);
+            try check(previous.ptr == self.scratch.ptr and std.mem.eql(u8, previous, positioned_payloads[1]));
+            self.reread = true;
+        }
+        self.next_offset += log.overhead + frame.payload_len;
+        self.seen += 1;
+    }
+
+    fn applyKinds(self: *PositionedReplay, kind: u16, sequence: u64, payload: []const u8) !void {
+        try check(sequence == self.seen + 1 and kind == positioned_kinds[self.seen]);
+        try check(std.mem.eql(u8, payload, positioned_payloads[self.seen]));
+        self.seen += 1;
+    }
+};
+
+fn rejectFrame(file: *Mock, scratch: []u8, expected: log.Frame, wanted: anyerror) !void {
+    const length = file.len;
+    const stable = file.stable;
+    if (log.readFrame(file, scratch, expected)) |_| return error.InvalidFrameAccepted else |err| try check(err == wanted);
+    try check(file.len == length and file.stable == stable);
+}
+
+const EndOfAddressSpace = struct {
+    header: [log.header_size]u8,
+    const offset = std.math.maxInt(u64) - log.header_size;
+
+    pub fn length(_: *EndOfAddressSpace) !u64 {
+        return std.math.maxInt(u64);
+    }
+
+    pub fn readAt(self: *EndOfAddressSpace, at: u64, out: []u8) !usize {
+        if (at != offset or out.len != self.header.len) return error.UnexpectedPayloadRead;
+        @memcpy(out, &self.header);
+        return self.header.len;
+    }
+};
+
+fn testPositionedFrames() !void {
+    var original: Mock = .{};
+    for (positioned_payloads, positioned_kinds, 1..) |payload, kind, seq| try log.appendKind(&original, seq, payload, kind);
+    var file = original;
+    file.read_chunk = 1;
+    var scratch: [64]u8 = undefined;
+    var replay: PositionedReplay = .{ .file = &file, .scratch = &scratch };
+    const recovered = try log.recoverFrames(&file, &scratch, &replay, PositionedReplay.apply, accepted_positioned);
+    try check(replay.reread and replay.seen == 5 and replay.next_offset == original.len);
+    try check(recovered.sequence == 5 and recovered.valid_bytes == original.len and !recovered.truncated_tail);
+    const pending = replay.pending.?;
+
+    replay.seen = 0;
+    const mixed = try log.recoverKinds(&file, &scratch, &replay, PositionedReplay.applyKinds, accepted_positioned);
+    try check(mixed.sequence == 5 and replay.seen == 5);
+    try check(std.mem.eql(u8, try log.readFrame(&file, &scratch, pending), positioned_payloads[1]));
+
+    var wrong = pending;
+    wrong.kind = 3;
+    try rejectFrame(&file, &scratch, wrong, error.UnsupportedLogVersion);
+    wrong.kind = 32;
+    try rejectFrame(&file, &scratch, wrong, error.UnsupportedLogVersion);
+    wrong = pending;
+    wrong.sequence += 1;
+    try rejectFrame(&file, &scratch, wrong, error.InvalidSequence);
+    wrong = pending;
+    wrong.payload_len += 1;
+    try rejectFrame(&file, &scratch, wrong, error.InvalidPayloadLength);
+    wrong = pending;
+    wrong.offset = std.math.maxInt(u64);
+    try rejectFrame(&file, &scratch, wrong, error.UnexpectedEndOfLog);
+    try rejectFrame(&file, scratch[0..1], pending, error.LogPayloadCapacity);
+
+    const at: usize = @intCast(pending.offset);
+    const frame_end = at + log.overhead + pending.payload_len;
+    for (at..frame_end) |cut| {
+        file = original;
+        file.len = cut;
+        try rejectFrame(&file, &scratch, pending, error.UnexpectedEndOfLog);
+    }
+    file = original;
+    file.bytes[at + 10] ^= 1;
+    try rejectFrame(&file, &scratch, pending, error.CorruptLogHeader);
+    file = original;
+    file.bytes[at + log.header_size] ^= 1;
+    try rejectFrame(&file, &scratch, pending, error.CorruptLogRecord);
+    file = original;
+    file.bytes[frame_end - 1] ^= 1;
+    try rejectFrame(&file, &scratch, pending, error.CorruptLogRecord);
+
+    var near_end: EndOfAddressSpace = .{ .header = original.bytes[at..][0..log.header_size].* };
+    wrong = pending;
+    wrong.offset = EndOfAddressSpace.offset;
+    if (log.readFrame(&near_end, &scratch, wrong)) |_| return error.OverflowingFrameAccepted else |err| try check(err == error.UnexpectedEndOfLog);
+
+    file = original;
+    file.len -= 1;
+    replay = .{ .file = &file, .scratch = &scratch };
+    const repaired = try log.recoverFrames(&file, &scratch, &replay, PositionedReplay.apply, accepted_positioned);
+    try check(repaired.truncated_tail and repaired.sequence == 4 and replay.reread);
+    try check(file.len == original.len - log.overhead - positioned_payloads[4].len and file.stable == file.len);
+}
+
 pub fn main(init: std.process.Init) !void {
     try check(log.checksum("123456789") == 0xcbf43926);
+    try testPositionedFrames();
     // Exact staging boundary and streaming fallback retain identical framing,
     // CRCs, replay payloads and stable-storage acknowledgement.
     var staged_payload: [4096]u8 = @splat('a');
