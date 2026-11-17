@@ -7,6 +7,12 @@ It may run a batch inline when its worker team is busy. The embedding holds
 the same publication guard as for detached reads until the statement ends.
 The SQL layer owns no worker threads.
 
+The optional platform `task_team.Team` gives a host persistent bounded native
+helpers. It reserves one member of a batch for the caller and reports whether
+it accepted the batch. A host can execute a declined batch inline. The host
+owns the team, reserves the helper stack budget, and stops all helpers before
+releasing the team's backing.
+
 The initial path uses the narrow typed GROUP BY executor. It requires a dense
 committed projection, one integral grouping key, at most two distinct
 integral measures, and non-NULL inputs. The existing proof requires the

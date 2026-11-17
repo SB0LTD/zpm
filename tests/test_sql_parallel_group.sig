@@ -1,7 +1,8 @@
 //! Fold real committed integral columns using caller-owned joined scan tasks.
 const std = @import("std");
 const sql = @import("sql");
-const workers = @import("worker_thread");
+const native = @import("task_team");
+const NativeTeam = native.Team(sql.ExecutionControl.ScanTask, 3);
 
 const rows = 65536 + 13;
 const key_count = 11;
@@ -26,41 +27,23 @@ fn check(ok: bool) !void {
 }
 
 const Team = struct {
+    native_team: *NativeTeam,
     batches: usize = 0,
     native_tasks: usize = 0,
     cancel: bool = false,
 
-    fn taskEntry(raw: ?*anyopaque) void {
-        const task: *const sql.ExecutionControl.ScanTask = @ptrCast(@alignCast(raw.?));
-        task.run(task.context);
-    }
-
     fn dispatch(raw: ?*anyopaque, tasks: []const sql.ExecutionControl.ScanTask) sql.Error!void {
         const team: *Team = @ptrCast(@alignCast(raw.?));
         team.batches += 1;
-        // The last tile is partial. Deliberately run one task on the
-        // coordinator in reverse slot order and join every started peer.
-        var peers: [3]workers.Thread = @splat(.{});
-        var started: usize = 0;
-        defer for (peers[0..started]) |*peer| peer.join() catch @panic("test scan worker did not join");
-        if (workers.available) {
-            for (tasks[0 .. tasks.len - 1], 0..) |task, index| {
-                peers[started].start(&taskEntry, @constCast(&tasks[index])) catch {
-                    task.run(task.context);
-                    continue;
-                };
-                started += 1;
-                team.native_tasks += 1;
-            }
-            const task = tasks[tasks.len - 1];
+        if (team.native_team.tryDispatch(tasks)) {
+            team.native_tasks += tasks.len - 1;
+            return;
+        }
+        var index = tasks.len;
+        while (index != 0) {
+            index -= 1;
+            const task = tasks[index];
             task.run(task.context);
-        } else {
-            var index = tasks.len;
-            while (index != 0) {
-                index -= 1;
-                const task = tasks[index];
-                task.run(task.context);
-            }
         }
     }
 
@@ -98,7 +81,10 @@ pub fn main() !void {
     try check(db.workspace.query.stream_stats.narrow_typed_group_plans == 1);
     try check(db.workspace.query.stream_stats.parallel_typed_group_plans == 0);
     const exact_work = control.used;
-    var team: Team = .{};
+    var pool: NativeTeam = .{};
+    if (native.available) try pool.start(3);
+    defer pool.stop() catch @panic("test scan workers did not join");
+    var team: Team = .{ .native_team = &pool };
     control = .{
         .context = &team, .poll = &Team.poll,
         .parallel_scan = .{ .context = &team, .participants = 4, .dispatch = &Team.dispatch },
@@ -109,7 +95,7 @@ pub fn main() !void {
     try check(result.row_count == key_count);
     try check(team.batches == 5 and db.workspace.query.stream_stats.parallel_typed_group_batches == 5);
     try check(db.workspace.query.stream_stats.parallel_typed_group_plans == 1);
-    if (workers.available) try check(team.native_tasks == 15);
+    if (native.available) try check(team.native_tasks == 15);
 
     var counts: [key_count]i64 = @splat(0);
     var first: [key_count]i64 = @splat(0);
@@ -127,13 +113,13 @@ pub fn main() !void {
         try check(row.cells[4].integer == second[key]);
     }
 
-    team = .{ .cancel = true };
+    team = .{ .native_team = &pool, .cancel = true };
     control.reset(0);
     if (db.execute(query, &result)) |_| return error.ExpectedCancellation else |err| try check(err == error.QueryCanceled);
     try check(team.batches == 1);
     try same();
 
-    team = .{};
+    team = .{ .native_team = &pool };
     control.reset(1);
     if (db.execute(query, &result)) |_| return error.ExpectedWorkLimit else |err| try check(err == error.QueryWorkLimit);
     try check(team.batches == 0 and control.used == 1);
@@ -153,6 +139,20 @@ pub fn main() !void {
     try db.execute(one_measure, &result);
     try same();
     try check(team.batches == 5 and db.workspace.query.stream_stats.parallel_typed_group_plans == 1);
+
+    if (native.available) {
+        try pool.stop();
+        try pool.start(1);
+        team = .{ .native_team = &pool };
+        control.parallel_scan.?.participants = 4;
+        try db.execute(one_measure, &result);
+        try same();
+        try check(team.batches == 5 and team.native_tasks == 0);
+        control.parallel_scan.?.participants = 2;
+        try db.execute(one_measure, &result);
+        try same();
+        try check(team.batches == 10 and team.native_tasks == 5);
+    }
 
     std.debug.print("PASS partitioned integral grouping: {d} assertions\n", .{assertions});
 }

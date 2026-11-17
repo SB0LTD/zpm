@@ -141,7 +141,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-wide-dense", "tests/test_sql_wide_dense.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-typed-multi-group", "tests/test_sql_typed_multi_group.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-parallel-group", "tests/test_sql_parallel_group.sig", &.{
-        importEntry("sql", "src/core/sql.sig"), importEntry("worker_thread", "src/platform/worker_thread.sig"),
+        importEntry("sql", "src/core/sql.sig"), importEntry("task_team", "src/platform/task_team.sig"),
     });
     _ = try addContract(ctx, test_sql, "contract-sql-dimension-group-ids", "tests/test_sql_dimension_group_ids.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-to-char", "tests/test_sql_to_char.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -200,6 +200,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_packed_large = try ctx.addStep("test-packed-integer-100m", "Qualify 100M real packed values, with and without NULLs", &noopStep);
     _ = try addContract(ctx, test_packed_large, "contract-packed-integer-100m", "tests/test_packed_integer_100m.sig", &.{importEntry("packed_integer", "src/core/packed_integer.sig"), importEntry("page_region", "src/platform/page_region.sig")});
     _ = try ctx.addModule("worker_thread", "src/platform/worker_thread.sig");
+    _ = try ctx.addModule("task_team", "src/platform/task_team.sig");
     _ = try ctx.addModule("resource_budget", "src/core/resource_budget.sig");
     const test_resources = try ctx.addStep("test-resource-budget", "Execute machine-budget arithmetic and owned grant contracts", &noopStep);
     try ctx.addDependency(test_all, test_resources);

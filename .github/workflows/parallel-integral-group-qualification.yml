@@ -35,9 +35,9 @@ jobs:
           mkdir evidence
           "$SIG" version | tee evidence/sig-version.log
           "$SIG" build-exe --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe --stack 16777216 \
-            -femit-bin="$RUNNER_TEMP/parallel-group" --dep sql --dep worker_thread \
+            -femit-bin="$RUNNER_TEMP/parallel-group" --dep sql --dep task_team \
             -Mroot=tests/test_sql_parallel_group.sig -Msql=src/core/sql.sig \
-            -Mworker_thread=src/platform/worker_thread.sig 2>&1 | tee evidence/build-parallel.log
+            -Mtask_team=src/platform/task_team.sig 2>&1 | tee evidence/build-parallel.log
           "$RUNNER_TEMP/parallel-group" 2>&1 | tee evidence/parallel.log
           "$SIG" build-exe --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe --stack 16777216 \
             -femit-bin="$RUNNER_TEMP/typed-group" --dep sql \
