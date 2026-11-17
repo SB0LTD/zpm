@@ -127,6 +127,8 @@ pub fn Binder(comptime config: types.Config) type {
             names: [config.columns]V.Name,
             types: [config.columns]types.DataType,
             typmods: [config.columns]i32 = @splat(-1),
+            has_nominal_types: bool = false,
+            nominal_types: [config.columns]types.NominalColumnType = undefined,
             count: usize,
             where: u16,
             /// Constant expression equal to the primary key (index probe), or none.
@@ -312,7 +314,7 @@ pub fn Binder(comptime config: types.Config) type {
             tables: *const [config.tables]S.Table,
             catalog: *const K,
             /// Present only when binding an independent top-level SQL read.
-            domain_catalog: ?*const catalog_objects.Objects(config) = null,
+            user_type_catalog: ?*const catalog_objects.Objects(config) = null,
             /// Statement snapshot: every name lookup reads the catalog under it.
             snapshot: storage.Snapshot,
             pool: *Ast.Pool,
@@ -4136,7 +4138,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .cast => blk: {
                     const inner = figure(context, n.a, buffer);
                     if (inner.strength > 1) break :blk inner;
-                    if (n.domain_cast) {
+                    if (n.domain_cast or n.enum_cast) {
                         buffer.* = toName(context, n.name);
                         break :blk .{ .name = buffer.slice(), .strength = 1 };
                     }
@@ -4529,23 +4531,41 @@ pub fn Binder(comptime config: types.Config) type {
             out.plan = root;
         }
 
-        fn bindDomainCast(context: *const Context, target: u16) Error!void {
+        fn bindUserTypeCast(context: *const Context, target: u16) Error!?types.NominalColumnType {
             const n = context.node(target);
-            if (n.kind != .cast or n.cast_type != .unknown) return;
+            if (n.kind != .cast or n.cast_type != .unknown) return null;
             if (context.dialect != .postgres) return error.UnsupportedStatement;
-            const domains = context.domain_catalog orelse return error.UnsupportedStatement;
+            const user_types = context.user_type_catalog orelse return error.UnsupportedStatement;
             const namespace = try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
             const name = toName(context, n.name);
-            const index = domains.byName(.domain, namespace, name.slice(), context.snapshot) orelse {
-                if (domains.userTypeNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
-                return error.UndefinedObject;
-            };
-            const info = domains.items[index].domain;
-            n.cast_type = info.base;
-            n.domain_cast = true;
-            n.domain_not_null = info.not_null;
-            n.domain_comparison = info.comparison;
-            n.integer = info.bound;
+            if (user_types.byName(.domain, namespace, name.slice(), context.snapshot)) |index| {
+                const info = user_types.items[index].domain;
+                n.cast_type = info.base;
+                n.domain_cast = true;
+                n.domain_not_null = info.not_null;
+                n.domain_comparison = info.comparison;
+                n.integer = info.bound;
+                return null;
+            }
+            if (user_types.byName(.enum_type, namespace, name.slice(), context.snapshot)) |index| {
+                const object = &user_types.items[index];
+                const literal = context.node(n.a);
+                if (literal.kind == .text_literal) {
+                    const label = E.literalText(context.source, literal.text);
+                    var labels = object.enumLabels();
+                    while (labels.next()) |declared_label| {
+                        if (types.same(declared_label, label.slice())) break;
+                    } else return error.InvalidTextRepresentation;
+                } else if (literal.kind != .null_literal) return error.UnsupportedStatement;
+                // PostgreSQL's enum send function emits the exact label.
+                // Only the admitted root projection may use this storage
+                // representation; nested casts stay unresolved and fail.
+                n.cast_type = .text;
+                n.enum_cast = true;
+                return .{ .oid = object.oid, .len = 4 };
+            }
+            if (user_types.userTypeNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
+            return error.UndefinedObject;
         }
 
         fn bindSelect(context: *const Context, select: *const Ast.Select) Error!Select {
@@ -4575,7 +4595,11 @@ pub fn Binder(comptime config: types.Config) type {
                 }
                 if (out.count == config.columns) return error.ColumnCapacity;
                 if (select.from == null and select.where == none and select.order_count == 0 and !select.limit_present) {
-                    try bindDomainCast(context, target.expr);
+                    if (try bindUserTypeCast(context, target.expr)) |nominal| {
+                        if (!out.has_nominal_types) @memset(&out.nominal_types, .{});
+                        out.has_nominal_types = true;
+                        out.nominal_types[out.count] = nominal;
+                    }
                 }
                 try valueExpr(context, &scope, target.expr);
                 out.targets[out.count] = target.expr;

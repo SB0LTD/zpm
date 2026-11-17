@@ -370,6 +370,8 @@ pub const Node = struct {
     date_bound: bool = false,
     /// A bound, root-projection domain cast. `integer` holds the CHECK bound.
     domain_cast: bool = false,
+    /// A root literal cast whose decoded text labels were validated by binding.
+    enum_cast: bool = false,
     domain_not_null: bool = false,
     domain_comparison: catalog_objects.DomainComparison = .none,
     ty: Type = .unknown,

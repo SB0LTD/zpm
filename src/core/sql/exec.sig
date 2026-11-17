@@ -4760,6 +4760,7 @@ pub fn Exec(comptime config: types.Config) type {
             result.clear(0);
             result.command = .select;
             result.column_count = query.count;
+            if (query.has_nominal_types) result.setNominalTypes(query.nominal_types[0..query.count]);
             for (0..query.count) |index| {
                 result.column_names[index] = query.names[index];
                 result.column_types[index] = query.types[index];

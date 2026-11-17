@@ -18,10 +18,11 @@
 //! table are `relation` / `acl` objects keyed by the table OID, and a DROP
 //! TABLE drops them in the same record.
 //!
-//! Enums currently support catalog CREATE/DROP and expose pg_type and
-//! pg_enum. A type, its generated array and all ordered labels have one
-//! MVCC lifetime and one contiguous OID range. ALTER TYPE, enum expressions,
-//! enum storage and composite types require separate type-system support.
+//! Enums support catalog CREATE/DROP, pg_type and pg_enum, and standalone
+//! literal casts with nominal result metadata. A type, its generated array
+//! and all ordered labels have one MVCC lifetime and contiguous OID range.
+//! ALTER TYPE, general enum expressions, enum storage and composite types
+//! require separate type-system support.
 //! The packed array name and exact enum labels share Config.object_text_bytes.
 //!
 //!   70 object_create kind u8, oid u32, target u32, grantee u32, sub i32,

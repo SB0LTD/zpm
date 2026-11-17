@@ -729,6 +729,10 @@ pub fn typeOfData(data_type: DataType) Type {
 /// array type OID (arrays are reported for catalog fidelity only).
 pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8, array: u32 };
 
+/// Catalog identity of a projected nominal type, separate from its value
+/// representation. A zero OID denotes ordinary built-in metadata.
+pub const NominalColumnType = struct { oid: u32 = 0, len: i16 = 0 };
+
 pub fn typeInfo(data_type: DataType) TypeInfo {
     if (elementData(data_type)) |element| {
         const base = baseInfo(element);

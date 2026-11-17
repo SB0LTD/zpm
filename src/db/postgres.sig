@@ -1442,8 +1442,9 @@ pub fn Session(comptime DB: type) type {
                 try w.u32be(0);
                 try w.u16be(0);
                 const data_type = self.result.column_types[i];
-                try w.u32be(T.oid(data_type));
-                try w.u16be(@bitCast(T.length(data_type)));
+                const nominal = if (@hasDecl(DB.Result, "nominalColumnType")) self.result.nominalColumnType(i) else null;
+                try w.u32be(if (nominal) |identity| identity.oid else T.oid(data_type));
+                try w.u16be(@bitCast(if (nominal) |identity| identity.len else T.length(data_type)));
                 const typmod: i32 = if (@hasField(DB.Result, "column_typmods")) self.result.column_typmods[i] else -1;
                 try w.u32be(@bitCast(typmod));
                 if (portal_value) |v| {

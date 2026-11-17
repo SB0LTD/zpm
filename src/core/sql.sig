@@ -295,6 +295,10 @@ pub fn Database(comptime config: Config) type {
             column_types: [config.columns]DataType = @splat(.integer),
             /// PostgreSQL atttypmod of each column (-1 when none).
             column_typmods: [config.columns]i32 = @splat(-1),
+            /// Advanced catalog types can share the built-in value storage
+            /// of a built-in type while keeping their nominal wire identity.
+            has_nominal_types: bool = false,
+            nominal_types: [config.columns]types.NominalColumnType = undefined,
             rows: if (config.external_results) []Row else [types.resultRows(config)]Row = if (config.external_results) &.{} else @splat(.{}),
             pub const default_row_capacity = types.resultRows(config);
             pub const external_rows = config.external_results;
@@ -346,6 +350,7 @@ pub fn Database(comptime config: Config) type {
                     self.column_types[column] = .text;
                     self.column_typmods[column] = -1;
                 }
+                self.has_nominal_types = false;
             }
 
             /// Only active ranges are observable; avoid clearing unused row capacity.
@@ -355,6 +360,19 @@ pub fn Database(comptime config: Config) type {
                 self.affected_rows = affected;
                 self.command = .none;
                 self.create_query_data = false;
+                self.has_nominal_types = false;
+            }
+
+            pub fn setNominalTypes(self: *Result, columns: []const types.NominalColumnType) void {
+                if (columns.len != self.column_count) unreachable;
+                @memcpy(self.nominal_types[0..columns.len], columns);
+                self.has_nominal_types = true;
+            }
+
+            pub fn nominalColumnType(self: *const Result, column: usize) ?types.NominalColumnType {
+                if (!self.has_nominal_types or column >= self.column_count) return null;
+                const identity = self.nominal_types[column];
+                return if (identity.oid != 0) identity else null;
             }
 
             /// Copy the observable result, without touching unused capacity.
@@ -372,6 +390,8 @@ pub fn Database(comptime config: Config) type {
                 self.affected_rows = source.affected_rows;
                 self.command = source.command;
                 self.create_query_data = source.create_query_data;
+                self.has_nominal_types = false;
+                if (source.has_nominal_types) self.setNominalTypes(source.nominal_types[0..source.column_count]);
                 @memcpy(self.column_names[0..source.column_count], source.column_names[0..source.column_count]);
                 @memcpy(self.column_types[0..source.column_count], source.column_types[0..source.column_count]);
                 @memcpy(self.column_typmods[0..source.column_count], source.column_typmods[0..source.column_count]);
@@ -983,7 +1003,7 @@ pub fn Database(comptime config: Config) type {
                 }
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
                     .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,
-                    .domain_catalog=&db.catalog_objects};
+                    .user_type_catalog=&db.catalog_objects};
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
@@ -1131,6 +1151,7 @@ pub fn Database(comptime config: Config) type {
                         @memcpy(result.column_names[0..select.count],select.names[0..select.count]);
                         @memcpy(result.column_types[0..select.count],select.types[0..select.count]);
                         @memcpy(result.column_typmods[0..select.count],select.typmods[0..select.count]);
+                        if (select.has_nominal_types) result.setNominalTypes(select.nominal_types[0..select.count]);
                     },
                     .general=>|root| {
                         const query=&self.workspace.plans.items[root];
@@ -2033,7 +2054,7 @@ pub fn Database(comptime config: Config) type {
             const source = try self.secureTarget(&statement_copy, expanded, original, snap);
             var context = self.bindContext(source, mode, snap);
             if (explain) |options| context.describe_only = !options.analyze;
-            if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.domain_catalog = &self.catalog_objects;
+            if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
             const bound = try B.bind(&context, &statement_copy);
             if (self.txs[slot].read_only and (explain == null or explain.?.analyze)) try readOnlyCheck(&bound, &self.workspace.plans);
             try self.checkPrivileges(&bound, snap);
@@ -7331,6 +7352,8 @@ pub fn Database(comptime config: Config) type {
             @memcpy(cursor.names[0..columns], result.column_names[0..columns]);
             @memcpy(cursor.column_types[0..columns], result.column_types[0..columns]);
             @memcpy(cursor.typmods[0..columns], result.column_typmods[0..columns]);
+            cursor.has_nominal_types = result.has_nominal_types;
+            if (result.has_nominal_types) @memcpy(cursor.nominal_types[0..columns], result.nominal_types[0..columns]);
             for (0..rows) |row| @memcpy(self.cursors.rows[cursor.base + row].cells[0..columns], result.rows[row].cells[0..columns]);
             self.cursors.used_rows += rows;
             result.clear(0);
@@ -7373,6 +7396,7 @@ pub fn Database(comptime config: Config) type {
             @memcpy(result.column_names[0..columns], cursor.names[0..columns]);
             @memcpy(result.column_types[0..columns], cursor.column_types[0..columns]);
             @memcpy(result.column_typmods[0..columns], cursor.typmods[0..columns]);
+            if (cursor.has_nominal_types) result.setNominalTypes(cursor.nominal_types[0..columns]);
             for (0..step.rows) |row| {
                 const at = if (step.backward) step.first - row else step.first + row;
                 @memcpy(result.rows[row].cells[0..columns], self.cursors.rows[cursor.base + at - 1].cells[0..columns]);
@@ -8918,7 +8942,7 @@ pub fn Database(comptime config: Config) type {
             const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role);
             var context = self.bindContext(expanded, .standard, snap);
             context.describe_only=true;
-            if (parsed == .select) context.domain_catalog = &self.catalog_objects;
+            if (parsed == .select) context.user_type_catalog = &self.catalog_objects;
             const bound = try B.bind(&context, &statement_copy);
             if (top.explain != null) {
                 try self.validateExplain(&bound);
@@ -8941,6 +8965,7 @@ pub fn Database(comptime config: Config) type {
             }
             if (bound == .select) {
                 result.column_count = bound.select.count;
+                if (bound.select.has_nominal_types) result.setNominalTypes(bound.select.nominal_types[0..bound.select.count]);
                 for (0..bound.select.count) |index| {
                     result.column_names[index] = bound.select.names[index];
                     result.column_types[index] = bound.select.types[index];

@@ -10,6 +10,8 @@ var primary: DB = .{};
 var restored: DB = .{};
 var scratch: DB.ReplayScratch = .{};
 var result: DB.Result = .{};
+var copied: DB.Result = .{};
+var reader: DB.ReadContext = .{};
 var store: Store = .{};
 var response: [Session.responseCapacity()]u8 = undefined;
 var assertions: usize = 0;
@@ -95,6 +97,33 @@ fn corruptRecords(existing_label_oid: u32) !void {
     try durable("DROP TYPE second");
 }
 
+fn casts(oid: u32, db: *DB) !void {
+    const query = "SELECT 'z'::enums.\"Mood\", CAST(NULL AS enums.\"Mood\"), 'plain'::TEXT, E'\\t'::enums.\"Mood\" AS tab";
+    try db.execute(query, &result);
+    try check(result.row_count == 1 and result.column_count == 4 and equal(result.column_names[0].slice(), "Mood"));
+    try check(result.nominalColumnType(0).?.oid == oid and result.nominalColumnType(0).?.len == 4);
+    try check(result.nominalColumnType(1).?.oid == oid and result.rows[0].cells[1] == .null_value);
+    try check(result.nominalColumnType(2) == null and result.column_types[2] == .text);
+    try check(result.nominalColumnType(3).?.oid == oid and equal(result.rows[0].cells[3].text.slice(), "\t"));
+    copied.copyFrom(&result);
+    try check(copied.nominalColumnType(0).?.oid == oid and copied.nominalColumnType(2) == null);
+    try db.execute("SELECT 123", &result);
+    try check(result.nominalColumnType(0) == null and result.column_types[0] == .integer32);
+    copied.copyFrom(&result);
+    try check(copied.nominalColumnType(0) == null);
+    try db.describe(query, &result);
+    try check(result.row_count == 0 and result.nominalColumnType(0).?.oid == oid and result.nominalColumnType(2) == null);
+    try reader.prepare(db, query, .{ .csn = db.csn });
+    try reader.describeResult(&result);
+    try check(result.row_count == 0 and result.nominalColumnType(1).?.oid == oid);
+    try reader.execute(db, query, .{ .csn = db.csn }, &result);
+    try check(result.row_count == 1 and result.nominalColumnType(0).?.oid == oid and result.rows[0].cells[1] == .null_value);
+    try db.execute("DECLARE typed_value CURSOR WITH HOLD FOR SELECT 'z'::enums.\"Mood\"", &result);
+    try db.execute("FETCH NEXT FROM typed_value", &result);
+    try check(result.row_count == 1 and result.nominalColumnType(0).?.oid == oid and equal(result.rows[0].cells[0].text.slice(), "z"));
+    try db.execute("CLOSE typed_value", &result);
+}
+
 fn sqlContracts() !void {
     try durable("CREATE SCHEMA enums");
     try durable("CREATE ROLE enumowner SUPERUSER");
@@ -107,6 +136,8 @@ fn sqlContracts() !void {
     const replayed = try catalog(&restored);
     try check(std.mem.eql(i64, &original, &replayed));
     try check(primary.oid_counter == restored.oid_counter);
+    try casts(@intCast(original[0]), &primary);
+    try casts(@intCast(replayed[0]), &restored);
     try corruptRecords(@intCast(original[1] + 2));
     try check(std.mem.eql(i64, &original, &(try catalog(&restored))));
 
@@ -117,7 +148,9 @@ fn sqlContracts() !void {
     try rejects(&primary, "CREATE TYPE old_domain AS ENUM ('q')", error.DuplicateObject);
     try rejects(&primary, "CREATE TABLE enums.\"Mood\" (i INTEGER)", error.DuplicateObject);
     try rejects(&primary, "CREATE TABLE unsupported (e enums.\"Mood\")", error.UnsupportedStatement);
-    try rejects(&primary, "SELECT 'z'::enums.\"Mood\"", error.UnsupportedStatement);
+    try rejects(&primary, "SELECT 'Z'::enums.\"Mood\"", error.InvalidTextRepresentation);
+    try rejects(&primary, "SELECT 'z'::enums.\"Mood\" = 'z'::enums.\"Mood\"", error.UnsupportedStatement);
+    try rejects(&primary, "SELECT CAST('z'::text AS enums.\"Mood\")", error.UnsupportedStatement);
     try rejects(&primary, "ALTER TYPE enums.\"Mood\" ADD VALUE 'q'", error.UnsupportedStatement);
     try rejects(&primary, "CREATE TYPE composites AS (a integer)", error.UnsupportedStatement);
     try rejects(&primary, "DROP DOMAIN enums.\"Mood\"", error.WrongObjectType);
@@ -171,16 +204,26 @@ fn frame(bytes: []const u8, tag: u8) ![]const u8 {
     return error.MissingEnumFrame;
 }
 
-fn wireQuery(session: *Session, connection: *Store.Connection, command: []const u8) ![]const u8 {
+fn wireMessage(session: *Session, connection: *Store.Connection, tag: u8, body: []const u8) ![]const u8 {
     var packet: [256]u8 = undefined;
-    packet[0] = 'Q';
-    const length = command.len + 5;
+    packet[0] = tag;
+    const length = body.len + 4;
     packet[1..5].* = .{ 0, 0, 0, @intCast(length) };
-    @memcpy(packet[5..][0..command.len], command);
-    packet[length] = 0;
+    @memcpy(packet[5..][0..body.len], body);
     const reply = try session.handle(connection, packet[0..length+1], &response);
     try check(reply.consumed == length+1 and !reply.close and !reply.blocked);
     return response[0..reply.written];
+}
+
+fn wireQuery(session: *Session, connection: *Store.Connection, comptime command: []const u8) ![]const u8 {
+    return wireMessage(session, connection, 'Q', command ++ "\x00");
+}
+
+fn enumDescription(packet: []const u8, oid: u32, format: u8) !void {
+    const fields = try frame(packet, 'T');
+    try check(equal(fields[0..7], "\x00\x01mood\x00"));
+    try check(read32(fields[13..17]) == oid and equal(fields[17..19], "\x00\x04"));
+    try check(read32(fields[19..23]) == 0xffffffff and fields[23] == 0 and fields[24] == format);
 }
 
 fn wireContracts() !void {
@@ -195,6 +238,25 @@ fn wireContracts() !void {
     const description = try frame(labels, 'T');
     try check(equal(description[0..12], "\x00\x01enumlabel\x00") and read32(description[18..22]) == 19);
     try check(equal(try frame(labels, 'D'), "\x00\x01\x00\x00\x00\x02UP"));
+    const enum_oid = try wireQuery(&session, &connection, "SELECT oid FROM pg_type WHERE typname='mood' AND typtype='e'");
+    const oid_row = try frame(enum_oid, 'D');
+    const oid = try std.fmt.parseInt(u32, oid_row[6..], 10);
+    try check(oid >= sql.change_records.first_oid);
+    const selected = try wireQuery(&session, &connection, "SELECT 'UP'::mood");
+    try enumDescription(selected, oid, 0);
+    try check(equal(try frame(selected, 'D'), "\x00\x01\x00\x00\x00\x02UP"));
+    const null_value = try wireQuery(&session, &connection, "SELECT NULL::mood");
+    try enumDescription(null_value, oid, 0);
+    try check(equal(try frame(null_value, 'D'), "\x00\x01\xff\xff\xff\xff"));
+    const parsed = try wireMessage(&session, &connection, 'P', "\x00SELECT 'UP'::mood\x00\x00\x00");
+    _ = try frame(parsed, '1');
+    const bound = try wireMessage(&session, &connection, 'B', "\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01");
+    _ = try frame(bound, '2');
+    const described = try wireMessage(&session, &connection, 'D', "P\x00");
+    try enumDescription(described, oid, 1);
+    const executed = try wireMessage(&session, &connection, 'E', "\x00\x00\x00\x00\x00");
+    try check(equal(try frame(executed, 'D'), "\x00\x01\x00\x00\x00\x02UP"));
+    _ = try wireMessage(&session, &connection, 'S', "");
     const duplicate = try wireQuery(&session, &connection, "CREATE TYPE bad AS ENUM ('x', 'x')");
     try check(std.mem.indexOf(u8, try frame(duplicate, 'E'), "C23505\x00") != null);
     const dropped = try wireQuery(&session, &connection, "DROP TYPE mood");
