@@ -940,6 +940,11 @@ pub fn Database(comptime config: Config) type {
             /// this many u64 words per version, including the null bitmap.
             /// CREATE uses the first compatible free bank in caller order.
             integral_row_words: usize = 0,
+            /// Hashes provisioned for this table. Null uses the configured
+            /// default. An explicit smaller count keeps the same logical
+            /// index capacity and scans MVCC versions for the other indexes,
+            /// including when enforcing uniqueness.
+            secondary_hashes: ?usize = null,
         };
 
         fn appendLayout(cursor: *usize, comptime T: type, count: usize) Error!usize {
@@ -978,9 +983,11 @@ pub fn Database(comptime config: Config) type {
                 offsets[5] = try appendLayout(&cursor, u64, scan_rows);
                 offsets[6] = try appendLayout(&cursor, u8, scan_rows);
                 offsets[7] = if(S.presence_enabled) try appendLayout(&cursor,u64,try S.presenceWords(rows)) else cursor;
-                const index_slots = @mulWithOverflow(ki, S.bound_indexes);
+                const hashes = budget.secondary_hashes orelse S.bound_indexes;
+                if (hashes > S.bound_indexes) return error.InvalidParameterValue;
+                const index_slots = @mulWithOverflow(ki, hashes);
                 if (index_slots[1] != 0) return error.InvalidParameterValue;
-                offsets[8] = if (S.bound_indexes != 0) try appendLayout(&cursor, u32, index_slots[0]) else cursor;
+                offsets[8] = if (hashes != 0) try appendLayout(&cursor, u32, index_slots[0]) else cursor;
                 if (!S.integral_enabled and budget.integral_row_words != 0) return error.InvalidParameterValue;
                 if (comptime S.split_versions) offsets[9] = try appendLayout(&cursor, S.VersionRow, if (budget.integral_row_words == 0) versions else 0);
                 if (comptime S.integral_enabled) {
@@ -1060,20 +1067,24 @@ pub fn Database(comptime config: Config) type {
             const layout = try backingLayoutFor(budgets, refs);
             if (bytes.len < layout.bytes) return error.WorkspaceCapacity;
             var backings: [config.tables]StorageBacking = undefined;
-            for (&backings, layout.offsets, layout.row_index, layout.key_index, budgets) |*backing, offsets, ri, ki, budget| backing.* = .{
-                .rows = try storageView(S.RowSlot, bytes, offsets[0], budget.rows),
-                .versions = try storageView(S.Version, bytes, offsets[1], budget.versions),
-                .version_rows = if (comptime S.split_versions) try storageView(S.VersionRow, bytes, offsets[9], if (budget.integral_row_words == 0) budget.versions else 0) else {},
-                .integral_rows = if (comptime S.integral_enabled) try storageView(u64, bytes, offsets[10], budget.versions * budget.integral_row_words) else {},
-                .integral_row_words = if (S.integral_enabled) budget.integral_row_words else {},
-                .row_index = try storageView(u32, bytes, offsets[2], ri),
-                .key_index = try storageView(u32, bytes, offsets[3], ki),
-                .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) budget.rows * config.columns else 0),
-                .scan_nonnull = try storageView(u64, bytes, offsets[5], if (S.compact_enabled) budget.rows else 0),
-                .scan_live = try storageView(u8, bytes, offsets[6], if (S.compact_enabled) budget.rows else 0),
-                .scan_presence = if(S.presence_enabled) try storageView(u64,bytes,offsets[7],try S.presenceWords(budget.rows)) else &.{},
-                .index_slots = if (S.bound_indexes != 0) try storageView(u32, bytes, offsets[8], ki * S.bound_indexes) else &.{},
-            };
+            for (&backings, layout.offsets, layout.row_index, layout.key_index, budgets) |*backing, offsets, ri, ki, budget| {
+                const hashes = budget.secondary_hashes orelse S.bound_indexes;
+                backing.* = .{
+                    .rows = try storageView(S.RowSlot, bytes, offsets[0], budget.rows),
+                    .versions = try storageView(S.Version, bytes, offsets[1], budget.versions),
+                    .version_rows = if (comptime S.split_versions) try storageView(S.VersionRow, bytes, offsets[9], if (budget.integral_row_words == 0) budget.versions else 0) else {},
+                    .integral_rows = if (comptime S.integral_enabled) try storageView(u64, bytes, offsets[10], budget.versions * budget.integral_row_words) else {},
+                    .integral_row_words = if (S.integral_enabled) budget.integral_row_words else {},
+                    .row_index = try storageView(u32, bytes, offsets[2], ri),
+                    .key_index = try storageView(u32, bytes, offsets[3], ki),
+                    .scan_values = try storageView(i64, bytes, offsets[4], if (S.compact_enabled) budget.rows * config.columns else 0),
+                    .scan_nonnull = try storageView(u64, bytes, offsets[5], if (S.compact_enabled) budget.rows else 0),
+                    .scan_live = try storageView(u8, bytes, offsets[6], if (S.compact_enabled) budget.rows else 0),
+                    .scan_presence = if(S.presence_enabled) try storageView(u64,bytes,offsets[7],try S.presenceWords(budget.rows)) else &.{},
+                    .index_slots = if (hashes != 0) try storageView(u32, bytes, offsets[8], ki * hashes) else &.{},
+                    .scan_index_limit = if (hashes < S.bound_indexes) S.bound_indexes else 0,
+                };
+            }
             try self.bindStorage(backings, try storageView(u32, bytes, layout.refs, refs));
         }
 
@@ -1128,6 +1139,7 @@ pub fn Database(comptime config: Config) type {
                 table.scan_live = backing.scan_live;
                 table.scan_presence = backing.scan_presence;
                 table.index_slots = backing.index_slots;
+                table.scan_index_limit = backing.scan_index_limit;
             }
             self.workspace.query.refs = refs;
             self.workspace.query.ref_high = refs.len;
@@ -4489,7 +4501,7 @@ pub fn Database(comptime config: Config) type {
                         },
                     }
                 }
-                if (alter.check_index) |which| switch (S.indexUniqueCheck(table, which, cells, @intCast(row), snap)) {
+                if (alter.check_index) |which| switch (try S.indexUniqueCheck(table, which, cells, @intCast(row), snap, self.session.control)) {
                     .free => {},
                     .taken => return error.PrimaryKeyViolation,
                     .wait => |owner| {
@@ -5123,7 +5135,7 @@ pub fn Database(comptime config: Config) type {
                     break :blk S.primaryKeyCheck(table, &cells[column], 0xffffffff, snap);
                 },
                 .constraint => |index| S.uniqueCheck(table, &table.constraints[index], cells, 0xffffffff, snap),
-                .index => |which| S.indexUniqueCheck(table, which, cells, 0xffffffff, snap),
+                .index => |which| try S.indexUniqueCheck(table, which, cells, 0xffffffff, snap, self.session.control),
             };
             switch (state) {
                 .free => {},
@@ -5174,7 +5186,7 @@ pub fn Database(comptime config: Config) type {
                     }
                     if (!changed) continue;
                 }
-                switch (S.indexUniqueCheck(table, which, cells, own_slot, snap)) {
+                switch (try S.indexUniqueCheck(table, which, cells, own_slot, snap, self.session.control)) {
                     .free => {},
                     .taken => |version| return version,
                     .wait => |owner| {
@@ -5210,12 +5222,12 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
-        /// Index entries of every secondary index of a table, and whether
-        /// each equals the table's allocated versions (no stale entry).
+        /// Whether every backed secondary hash covers the allocated versions.
         pub fn indexConsistent(self: *const Self, table_name: []const u8) ?bool {
             const index = self.committedIndex(table_name) orelse return null;
             const table = &self.tables[index];
             for (0..table.index_count) |which| {
+                if (!S.hasIndexHash(table, which)) continue;
                 if (S.indexEntries(table, which) != table.version_used) return false;
             }
             return true;
