@@ -248,6 +248,7 @@ pub fn Session(comptime DB: type) type {
         oversize_tag: u8 = 0,
         authentication: ?scram.Server = null,
         role_authentication: bool = false,
+        role_credentials: ?*const scram.Credentials = null,
         statements: [statement_capacity]Statement = @splat(.{}),
         portals: [portal_capacity]Portal = @splat(.{}),
         result: DB.Result = .{},
@@ -271,6 +272,19 @@ pub fn Session(comptime DB: type) type {
         pub fn configureRoleAuthentication(self: *Self, verifier: *const scram.Verifier, server_nonce: []const u8) scram.Error!void {
             if (comptime !@hasDecl(DB, "bindAuthenticatedRole")) return error.AuthenticationFailed;
             try self.configureAuthentication(verifier, server_nonce);
+            self.role_authentication = true;
+        }
+
+        /// Borrow a validated credential set until StartupMessage is read.
+        /// As with single-verifier authentication, the application supplies a
+        /// fresh CSPRNG nonce. Configuration errors close the connection.
+        pub fn configureRoleCredentials(self: *Self, credentials: *const scram.Credentials, server_nonce: []const u8) scram.Error!void {
+            if (self.startup or self.authentication != null) return error.AuthenticationState;
+            self.authentication = .{ .state = .failed };
+            if (comptime !@hasDecl(DB, "bindAuthenticatedRole")) return error.AuthenticationFailed;
+            if (credentials.verifiers.len == 0) return error.InvalidVerifier;
+            self.authentication = try scram.Server.initUnselected(server_nonce);
+            self.role_credentials = credentials;
             self.role_authentication = true;
         }
 
@@ -438,7 +452,10 @@ pub fn Session(comptime DB: type) type {
             try r.done();
             if (user == null or user.?.len == 0) return error.UserRequired;
             if (self.authentication) |*auth| {
-                auth.setUsername(user.?);
+                if (self.role_credentials) |credentials| {
+                    try auth.selectCredentials(credentials, user.?);
+                    self.role_credentials = null;
+                } else auth.setUsername(user.?);
                 const p = try w.begin('R');
                 try w.u32be(10);
                 try w.string(scram.mechanism);
@@ -469,7 +486,7 @@ pub fn Session(comptime DB: type) type {
                 const final = try auth.finish(payload, &message);
                 if (self.role_authentication) {
                     if (comptime @hasDecl(DB, "bindAuthenticatedRole")) {
-                        try db.bindAuthenticatedRole(auth.verifier.username[0..auth.verifier.username_len]);
+                        try db.bindAuthenticatedRole(auth.verifier.identity());
                     } else return error.AuthenticationFailed;
                 }
                 const p = try w.begin('R');
