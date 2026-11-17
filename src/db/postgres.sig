@@ -167,7 +167,7 @@ pub const StartupAdmission = struct {
 };
 
 pub const StartupParameters = struct {
-    const Parameter = struct { key: []const u8, value: []const u8 };
+    pub const Parameter = struct { key: []const u8, value: []const u8 };
     reader: Reader,
     ended: bool = false,
 

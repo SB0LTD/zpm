@@ -15,7 +15,9 @@ checks database CONNECT rights, acquires the lease, configures the database
 session and publishes that binding together. It releases the provisional lease
 on failure and the accepted lease after all connection work has stopped.
 Startup option slices borrow the frame or the session's fixed buffer and must
-be consumed synchronously. SSL, GSS and cancellation requests follow their
+be consumed synchronously. `SessionWithAdmission(DB, true)` accepts an
+embedding-owned callback and a scratch slice of `routed_startup_capacity`
+bytes as an alternative to extending the adapter type. SSL, GSS and cancellation requests follow their
 existing transport paths. Adapters without the hook use the single-database
 path.
 
@@ -24,6 +26,10 @@ The cluster utility parser recognizes standalone `CREATE DATABASE name` and
 requires an explicit cluster command path, transaction-block checks and
 ownership checks. The normal database executor remains responsible for
 database-local SQL and WAL.
+
+`Database.setDatabaseCatalog` optionally exposes the embedding's live OID,
+name and owner rows through `pg_database`. The provider remains stable and
+keeps a consistent view of its backing for the duration of SQL execution.
 
 ## Durable integration
 
@@ -50,5 +56,5 @@ the name from the bound lease.
    worker and background use has quiesced. Recycled Store addresses must
    invalidate database-specific cached state.
 
-The product still needs the durable journal, per-database Store provisioning,
-router, catalogue and crash/restart tests before offering database lifecycle SQL.
+The product owns durable journaling, per-database Store provisioning,
+identity policy, transport integration and crash/restart validation.
