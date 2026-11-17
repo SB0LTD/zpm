@@ -629,6 +629,11 @@ pub fn Store(comptime Raw: type) type {
             pub fn takeNotification(self: *Connection, out: *NotificationType) bool {
                 if (comptime !has_engine_session) return false;
                 if (self.id == 0 or self.in_transaction or self.pending.active) return false;
+                if (comptime @hasField(@TypeOf(self.engine_session), "listener")) {
+                    // Most connections never LISTEN. Leave the shared SQL
+                    // session untouched when ReadyForQuery runs under a read grant.
+                    if (self.engine_session.listener == null) return false;
+                }
                 return self.db().takeNotification(out);
             }
 
@@ -717,6 +722,11 @@ pub fn Store(comptime Raw: type) type {
             pub fn detachedReadEligible(self:*const Connection) bool {
                 // Detached reads run as the bootstrap superuser: a session
                 // after SET ROLE keeps the serialized (privilege-checked) path.
+                if (comptime has_engine_session and @hasField(@TypeOf(self.engine_session), "listener")) {
+                    // ReadyForQuery drains a listener's committed queue. The
+                    // listener cursor belongs to the serialized SQL path.
+                    if (self.engine_session.listener != null) return false;
+                }
                 return self.detachedIdentity() and self.id!=0 and !self.failed and self.autocommit and !self.in_transaction and self.tx==null and
                     !self.pending.active and !self.running_statement and self.read_context==null;
             }

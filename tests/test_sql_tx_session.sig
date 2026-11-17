@@ -961,6 +961,7 @@ fn notifications() !void {
     wire.configureBackendKey(5, 99);
     try startupWire();
     _ = try wireQuery("LISTEN wire_channel");
+    try check(!conn_c.detachedReadEligible());
     try exec(&conn_b, "NOTIFY wire_channel, 'hello'");
     const reply = try wireQuery("SELECT 1");
     try check(wireHas(reply, 'A', "wire_channel"));
@@ -973,6 +974,11 @@ fn notifications() !void {
     try check(commandTag(try wireQuery("PREPARE wp AS SELECT 1"), "PREPARE"));
     try check(commandTag(try wireQuery("DEALLOCATE ALL"), "DEALLOCATE ALL"));
     try check(commandTag(try wireQuery("UNLISTEN *"), "UNLISTEN"));
+    try check(conn_c.detachedReadEligible());
+    store.database.session_state = &conn_b.engine_session;
+    var detached_note: Store.Connection.Notification = undefined;
+    try check(!conn_c.takeNotification(&detached_note));
+    try check(store.database.session_state == &conn_b.engine_session);
     try check(commandTag(try wireQuery("NOTIFY wire_channel"), "NOTIFY"));
     _ = try wireQuery("BEGIN");
     try check(commandTag(try wireQuery("LOCK TABLE tdd_t IN SHARE MODE"), "LOCK TABLE"));
