@@ -42,7 +42,10 @@ test {
     _ = elf;
     _ = link;
     _ = fixture;
-    if (@import("builtin").cpu.arch == .x86_64) {
+    // (x86-64, and where a symbol is linked under its own name: the
+    // runtime's assembly calls one of its Sig functions by it)
+    const native = @import("builtin");
+    if (native.cpu.arch == .x86_64 and (native.os.tag == .linux or native.os.tag == .freestanding)) {
         _ = libkernel;
         _ = runtime;
     }

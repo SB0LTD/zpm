@@ -86,21 +86,26 @@ try linker.link();
 - **An import** is looked up by NID and library name, in this order:
   1. the loaded modules' exports (a game's own copy of a library wins);
   2. the host's own libraries (`Host.builtin`: system libraries written natively);
-  3. `Host.missing`, which may return a stand-in (a stub that reports the call). If it returns nothing, the link fails.
+  3. `Host.missing`, which is told the library, module, NID, whether it is a function or an object, and its size, and may return a stand-in (a stub that reports the call, or zeroed storage for an object). If it returns nothing, the link fails.
+- **A symbol the module defines itself**, or a local one, is the module's own address and is never looked up.
+- **A symbol with a plain name** (no `NID#library#module`) is looked up by the NID its name hashes to.
 - **A weak import** nobody has is 0.
 - **Binding is eager**: all of it happens in `link`, none on a first call.
-- **Thread storage** is x86-64's (variant II). Each module with thread-local data gets an index and a place below the thread pointer; `staticTls()` says how much a thread needs and `initTls(tp)` fills one thread's.
+- **Thread storage** is x86-64's (variant II). Each module with thread-local data gets an index and a place below the thread pointer, at an address that agrees with the segment's own alignment; `staticTls()` says how much a thread needs and `initTls(tp)` fills one thread's.
+- **The part a file marks read-only after relocation** (`PT_GNU_RELRO`, `PT_SCE_RELRO`) is made so once the relocations are in.
+- **A load that fails** gives its addresses back (`Host.release`) and leaves the tables as they were.
 
-The host supplies four functions: `reserve` (zeroed writable memory at a multiple of 16 KiB), `protect`, `builtin` and `missing`. The linker writes into the address space it runs in.
+The host supplies five functions: `reserve` (zeroed writable memory at a multiple of 16 KiB), `release`, `protect`, `builtin` and `missing`. The linker writes into the address space it runs in.
 
 ## The runtime and libkernel
 
 `runtime.start(ap)` is a PS5 process's whole start. A host gives it FreeBSD's argument block; `argv[1]` is the executable.
 
 1. It maps the file and runs the linker with libkernel as `builtin`.
-2. For an import nothing provides, `missing` writes a **stand-in**: 16 bytes of code that load the import's number and jump to one routine, which prints `not implemented: library:NID was called` once and returns 0. A game that only passes through such a call carries on, and the log lists what it wanted.
+2. For a function nothing provides, `missing` writes a **stand-in**: 16 bytes of code that load the import's number and jump to one routine, which prints `not implemented: library:NID was called` once and returns 0. A game that only passes through such a call carries on, and the log lists what it wanted. For an object nothing provides it hands out zeroed storage of the object's size (code there would be read as data), and names it in the log.
 3. It maps the first thread's storage, with FreeBSD's control block at the thread pointer (`fs:0` is its own address), and sets FS.
-4. It switches to a 2 MiB stack and jumps to the entry with `rdi` the argument block and `rsi` a clean-up function.
+4. It maps the game's stack: the size the executable's process parameters ask for (2 MiB if they do not say), with a page below it that faults. The arguments are copied onto it as FreeBSD lays them out (`argc`, `argv`, an empty environment).
+5. It jumps to the entry with `rdi` the argument block and `rsi` a clean-up function.
 
 libkernel's functions are ordinary Sig functions with the C calling convention, listed in one comptime table keyed by NID. POSIX names answer -1 and `errno`; `sceKernel` names answer `0x80020000 + errno`. Both `libkernel` and `libScePosix` resolve to the same table. A game's `/app0` is the folder its executable is in.
 

@@ -255,6 +255,11 @@ pub const MAX_SEGMENTS = 8;
 /// The PS5's (and PS4's) page: segments are aligned to it.
 pub const PAGE: u64 = 0x4000;
 
+/// The most thread storage one module may ask for. (Real titles' are tens
+/// of kilobytes; a file that says more than this is not believed, so that
+/// no sum of them can overflow and no thread's storage is absurd.)
+pub const TLS_MAX: u64 = 256 << 20;
+
 pub const Image = struct {
     bytes: []const u8,
     dialect: Dialect,
@@ -306,8 +311,9 @@ pub const Image = struct {
         if (rd(u16, bytes, 18) != 62) return error.NotElf; // EM_X86_64
         if (bytes[7] != 9) return error.NotSce; // ELFOSABI_FREEBSD
         const kind: Kind = switch (rd(u16, bytes, 16)) {
-            0xfe00, 0xfe04 => .exec,
-            0xfe10 => .dynexec,
+            0xfe00 => .exec,
+            // (0xFE04: the older name for an executable that is relocated)
+            0xfe04, 0xfe10 => .dynexec,
             0xfe18 => .module,
             else => return error.NotSce,
         };
@@ -345,26 +351,34 @@ pub const Image = struct {
             .preinit_array = .{ .vaddr = 0, .size = 0 },
         };
 
-        // The load segments first: the others are placed against them.
+        // What is mapped first: the others are placed against it, whatever
+        // order the headers come in. The load segments; then, on the PS4, a
+        // read-only-after-relocation part that is a segment of its own (its
+        // GOT lives there). Inside a load segment it is only a range.
         for (phdrs) |ph| {
             if (ph.type == PT.LOAD) try im.addSegment(ph);
+        }
+        for (phdrs) |ph| {
+            if (ph.type != PT.SCE_RELRO or ph.memsz == 0) continue;
+            if (ph.vaddr +% ph.memsz < ph.vaddr) return error.BadSegment;
+            if (!im.covered(ph.vaddr, ph.memsz)) try im.addSegment(ph);
         }
         var dyn_ph: ?Phdr = null;
         var dynlib: ?Phdr = null;
         for (phdrs) |ph| switch (ph.type) {
             PT.SCE_RELRO, PT.GNU_RELRO => {
                 if (ph.memsz == 0) continue;
-                if (ph.vaddr +% ph.memsz < ph.vaddr) return error.BadSegment;
-                // On the PS4 it is a segment of its own, to be mapped (its
-                // GOT lives there); inside a load segment it is a range.
-                if (ph.type == PT.SCE_RELRO and !im.covered(ph.vaddr, ph.memsz)) try im.addSegment(ph);
-                if (!im.covered(ph.vaddr, ph.memsz)) return error.BadSegment;
+                if (ph.vaddr +% ph.memsz < ph.vaddr or !im.covered(ph.vaddr, ph.memsz)) return error.BadSegment;
                 im.relro = .{ .vaddr = ph.vaddr, .size = ph.memsz };
             },
-            PT.DYNAMIC => dyn_ph = ph,
+            // (one of each: a second would silently replace the first)
+            PT.DYNAMIC => {
+                if (dyn_ph != null) return error.BadSegment;
+                dyn_ph = ph;
+            },
             PT.SCE_DYNLIBDATA => dynlib = ph,
             PT.TLS => {
-                if (ph.filesz > ph.memsz) return error.BadSegment;
+                if (im.tls != null or ph.filesz > ph.memsz or ph.memsz > TLS_MAX) return error.BadSegment;
                 if (ph.memsz != 0) {
                     if (!im.covered(ph.vaddr, ph.filesz)) return error.BadSegment;
                     const a = if (ph.@"align" == 0) 1 else ph.@"align";
@@ -402,14 +416,18 @@ pub const Image = struct {
         if (ph.vaddr +% ph.memsz < ph.vaddr or ph.vaddr + ph.memsz > (1 << 47)) return error.BadSegment;
         if (ph.offset > im.bytes.len or ph.filesz > im.bytes.len - ph.offset) return error.Truncated;
         if (im.segment_count == MAX_SEGMENTS) return error.BadSegment;
+        // (a segment with no flags at all, as some PS5 files have: memory
+        // to read and write, as open loaders treat it; a page nothing can
+        // touch is no use to a program)
+        const bare = ph.flags & 7 == 0;
         im.segments_buf[im.segment_count] = .{
             .vaddr = ph.vaddr,
             .memsz = ph.memsz,
             .filesz = ph.filesz,
             .offset = ph.offset,
             .exec = ph.flags & 1 != 0,
-            .write = ph.flags & 2 != 0,
-            .read = ph.flags & 4 != 0,
+            .write = bare or ph.flags & 2 != 0,
+            .read = bare or ph.flags & 4 != 0,
         };
         im.segment_count += 1;
     }
@@ -636,6 +654,71 @@ pub const Image = struct {
     }
 };
 
+/// The modules and libraries an image names, read from its dynamic
+/// section once. A linker asks for one by id for every symbol it binds;
+/// `Image.linked` walks the whole section each time, and a section can be
+/// made very long.
+pub const Names = struct {
+    pub const MAX_LIBRARIES = 256;
+    pub const MAX_MODULES = 128;
+
+    imports: [MAX_LIBRARIES]Named = undefined,
+    import_count: u16 = 0,
+    exports: [MAX_LIBRARIES]Named = undefined,
+    export_count: u16 = 0,
+    /// The file's own module and the ones it needs.
+    modules: [MAX_MODULES]Named = undefined,
+    module_count: u16 = 0,
+
+    /// BadDynamic for a file that names more than any real one does.
+    pub fn init(im: *const Image) Error!Names {
+        var t = Names{};
+        const ps4 = im.dialect == .ps4;
+        const tag_module: u64 = if (ps4) DT.SCE_MODULE_INFO else DT.SCE_MODULE_INFO_1;
+        const tag_needed: u64 = if (ps4) DT.SCE_NEEDED_MODULE else DT.SCE_NEEDED_MODULE_1;
+        const tag_export: u64 = if (ps4) DT.SCE_EXPORT_LIB else DT.SCE_EXPORT_LIB_1;
+        const tag_import: u64 = if (ps4) DT.SCE_IMPORT_LIB else DT.SCE_IMPORT_LIB_1;
+        for (im.dynamic) |d| {
+            const is_module = d.tag == tag_module or d.tag == tag_needed;
+            if (!is_module and d.tag != tag_export and d.tag != tag_import) continue;
+            // (an entry whose name is not in the string table is skipped)
+            const name = im.string(d.val & 0xffff_ffff) orelse continue;
+            const n = Named{ .id = @truncate(d.val >> 48), .version = @truncate(d.val >> 32), .name = name };
+            if (is_module) {
+                if (t.module_count == MAX_MODULES) return error.BadDynamic;
+                t.modules[t.module_count] = n;
+                t.module_count += 1;
+            } else if (d.tag == tag_import) {
+                if (t.import_count == MAX_LIBRARIES) return error.BadDynamic;
+                t.imports[t.import_count] = n;
+                t.import_count += 1;
+            } else {
+                if (t.export_count == MAX_LIBRARIES) return error.BadDynamic;
+                t.exports[t.export_count] = n;
+                t.export_count += 1;
+            }
+        }
+        return t;
+    }
+
+    fn find(list: []const Named, id: u32) ?Named {
+        for (list) |n| {
+            if (n.id == id) return n;
+        }
+        return null;
+    }
+
+    /// As `Image.linked`, from the table.
+    pub fn linked(t: *const Names, im: *const Image, s: Sym) ?Image.Linked {
+        const name = im.symbolName(s) orelse return null;
+        const parts = nid.Symbol.parse(name) orelse return null;
+        const libs = if (s.defined()) t.exports[0..t.export_count] else t.imports[0..t.import_count];
+        const lib = find(libs, parts.library) orelse return null;
+        const mod = find(t.modules[0..t.module_count], parts.module) orelse return null;
+        return .{ .nid = parts.nid, .library = lib.name, .module = mod.name };
+    }
+};
+
 fn rd(comptime T: type, b: []const u8, off: usize) T {
     return std.mem.readInt(T, b[off..][0..@sizeOf(T)], .little);
 }
@@ -742,9 +825,10 @@ test "files that are not what they say are refused, not read past" {
     std.mem.writeInt(u16, bad[16..18], 3, .little); // ET_DYN
     try std.testing.expectError(error.NotSce, Image.parse(bad));
 
-    // Every prefix of the file: an error or a parse, never a fault.
+    // The file cut off at every length. What this looks for is a read past
+    // the bytes given (the test would stop there): either answer is fine.
     var n: usize = 0;
-    while (n < file.len) : (n += 97) {
+    while (n < file.len) : (n += 1) {
         _ = Image.parse(file[0..n]) catch continue;
     }
 
@@ -764,4 +848,69 @@ test "files that are not what they say are refused, not read past" {
         if (std.mem.readInt(u64, bad[i..][0..8], .little) == DT.SCE_IMPORT_LIB_1) std.mem.writeInt(u64, bad[i..][0..8], DT.SCE_IMPORT_LIB, .little);
     }
     try std.testing.expectError(error.MixedDialect, Image.parse(bad));
+}
+
+test "thread storage a file cannot mean is refused" {
+    var buf: [fixture.SIZE]u8 = undefined;
+    // More than any program's (and enough to overflow a sum of them).
+    for ([_]u64{ TLS_MAX + 1, 1 << 40, std.math.maxInt(u64), std.math.maxInt(u64) - 63 }) |memsz| {
+        var b = fixture.Builder.init(&buf, .module);
+        b.selfModule("libTest", 0);
+        b.tls(fixture.DATA + 0x100, 0, memsz, 16);
+        try std.testing.expectError(error.BadSegment, Image.parse(b.finish()));
+    }
+    // An alignment that is no power of two, and one past a page.
+    for ([_]u64{ 24, PAGE * 2 }) |alignment| {
+        var b = fixture.Builder.init(&buf, .module);
+        b.selfModule("libTest", 0);
+        b.tls(fixture.DATA + 0x100, 8, 16, alignment);
+        try std.testing.expectError(error.BadSegment, Image.parse(b.finish()));
+    }
+    // The most it may be is taken.
+    var b = fixture.Builder.init(&buf, .module);
+    b.selfModule("libTest", 0);
+    b.tls(fixture.DATA + 0x100, 8, TLS_MAX, 16);
+    try std.testing.expectEqual(TLS_MAX, (try Image.parse(b.finish())).tls.?.memsz);
+}
+
+test "without Sony's size tag the symbols are counted from the hash table" {
+    var buf: [fixture.SIZE]u8 = undefined;
+    var b = fixture.Builder.init(&buf, .module);
+    b.selfModule("libTest", 0);
+    const lib = b.exportLibrary("libTest", 1);
+    _ = b.exportSymbol(nid.of("one"), lib, 0, fixture.TEXT, STT_FUNC);
+    _ = b.exportSymbol(nid.of("two"), lib, 0, fixture.TEXT + 8, STT_FUNC);
+    b.symtab_size_tag = false;
+    const im = try Image.parse(b.finish());
+    try std.testing.expectEqual(@as(usize, 3), im.symtab.len); // the null symbol and the two
+    try std.testing.expectEqual(nid.of("two"), im.linked(im.symtab[2]).?.nid);
+}
+
+test "the names table answers as the file does, and a file with too many is refused" {
+    var buf: [fixture.SIZE]u8 = undefined;
+    var b = fixture.Builder.init(&buf, .dynexec);
+    b.selfModule("eboot", 0);
+    const m = b.neededModule("libkernel", 1);
+    const l = b.importLibrary("libkernel", 1);
+    const s = b.importSymbol(nid.of("write"), l, m, STT_FUNC);
+    const im = try Image.parse(b.finish());
+    const names = try Names.init(&im);
+    try std.testing.expectEqual(@as(u16, 1), names.import_count);
+    try std.testing.expectEqual(@as(u16, 2), names.module_count); // itself and the one it needs
+    const a = names.linked(&im, im.symtab[s]).?;
+    const c = im.linked(im.symtab[s]).?;
+    try std.testing.expectEqual(c.nid, a.nid);
+    try std.testing.expectEqualStrings(c.library, a.library);
+    try std.testing.expectEqualStrings(c.module, a.module);
+}
+
+test "an executable called relocatable by its older type is one" {
+    var buf: [fixture.SIZE]u8 = undefined;
+    var b = fixture.Builder.init(&buf, .dynexec);
+    b.selfModule("eboot", 0);
+    const file = b.finish();
+    var copy: [fixture.SIZE]u8 = undefined;
+    @memcpy(copy[0..file.len], file);
+    std.mem.writeInt(u16, copy[16..18], 0xfe04, .little);
+    try std.testing.expectEqual(Kind.dynexec, (try Image.parse(copy[0..file.len])).kind);
 }

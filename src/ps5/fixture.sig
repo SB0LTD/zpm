@@ -50,6 +50,11 @@ pub const Builder = struct {
     names: [MAX_DYN]elf.Dyn = undefined,
     name_count: u32 = 0,
     tls_seg: ?elf.Tls = null,
+    /// A part to be read-only once relocated (address, size), if any.
+    relro: ?elf.Range = null,
+    /// Whether the file says its symbol table's size (Sony's tag). Without
+    /// it a reader counts the symbols from the hash table.
+    symtab_size_tag: bool = true,
 
     pub fn init(buf: []u8, kind: elf.Kind) Builder {
         std.debug.assert(buf.len >= SIZE);
@@ -216,7 +221,7 @@ pub const Builder = struct {
         d.put(elf.DT.STRSZ, b.strings_len);
         d.put(elf.DT.SYMTAB, symtab);
         d.put(elf.DT.SYMENT, @sizeOf(elf.Sym));
-        d.put(elf.DT.SCE_SYMTABSZ, sym_bytes.len);
+        if (b.symtab_size_tag) d.put(elf.DT.SCE_SYMTABSZ, sym_bytes.len);
         if (b.rela_count != 0) {
             d.put(elf.DT.RELA, rela_at);
             d.put(elf.DT.RELASZ, rela_bytes.len);
@@ -259,6 +264,7 @@ pub const Builder = struct {
         ph.put(elf.PT.DYNAMIC, 4, dynamic, dynamic_size, dynamic_size, 8);
         ph.put(if (exe) elf.PT.SCE_PROCPARAM else elf.PT.SCE_MODULE_PARAM, 4, PARAM, 0x40, 0x40, 8);
         if (b.tls_seg) |t| ph.put(elf.PT.TLS, 4, t.vaddr, t.filesz, t.memsz, t.alignment);
+        if (b.relro) |r| ph.put(elf.PT.GNU_RELRO, 4, r.vaddr, r.size, r.size, 1);
         std.mem.writeInt(u16, out[56..58], ph.count, .little);
         return out;
     }

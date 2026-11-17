@@ -47,23 +47,42 @@ pub const Error = elf.Error || error{
     Protect,
 };
 
+/// An import nobody provides, as the host is asked about it.
+pub const Missing = struct {
+    /// The library and module its name says ("" for a symbol that is not
+    /// named Sony's way: a plain name, hashed to `nid`).
+    library: []const u8,
+    module: []const u8,
+    nid: nid.Nid,
+    /// What it is: a stand-in for a function is code to call, one for an
+    /// object is memory to read and write. They cannot be the same thing.
+    kind: Kind,
+    /// An object's size, when the symbol says (else 0).
+    size: u64,
+
+    pub const Kind = enum { function, object, other };
+};
+
 /// What the linker asks of where it runs.
 pub const Host = struct {
     ctx: ?*anyopaque = null,
     /// `size` bytes of zeroed, writable memory at a multiple of the page
     /// (at `want` when not 0: a fixed-address executable); null to refuse.
     reserve: *const fn (ctx: ?*anyopaque, want: u64, size: u64) ?u64,
+    /// Gives a reservation back (a module that then could not be loaded).
+    release: *const fn (ctx: ?*anyopaque, addr: u64, size: u64) void = noRelease,
     /// The final protection of whole pages of a module.
     protect: *const fn (ctx: ?*anyopaque, addr: u64, size: u64, read: bool, write: bool, exec: bool) bool,
     /// A symbol of one of the host's own libraries, or null.
     builtin: *const fn (ctx: ?*anyopaque, library: []const u8, n: nid.Nid) ?u64 = noBuiltin,
     /// What to bind an import nobody has to, or null to fail the link.
-    missing: *const fn (ctx: ?*anyopaque, library: []const u8, module: []const u8, n: nid.Nid) ?u64 = noStandIn,
+    missing: *const fn (ctx: ?*anyopaque, what: Missing) ?u64 = noStandIn,
 
+    fn noRelease(_: ?*anyopaque, _: u64, _: u64) void {}
     fn noBuiltin(_: ?*anyopaque, _: []const u8, _: nid.Nid) ?u64 {
         return null;
     }
-    fn noStandIn(_: ?*anyopaque, _: []const u8, _: []const u8, _: nid.Nid) ?u64 {
+    pub fn noStandIn(_: ?*anyopaque, _: Missing) ?u64 {
         return null;
     }
 };
@@ -100,6 +119,8 @@ pub const Module = struct {
     init: u64 = 0,
     fini: u64 = 0,
     proc_param: u64 = 0,
+    /// (how much of it the file vouches for)
+    proc_param_size: u64 = 0,
     module_param: u64 = 0,
     eh_frame_hdr: u64 = 0,
     eh_frame_hdr_size: u64 = 0,
@@ -181,8 +202,21 @@ pub const Linker = struct {
         if (l.module_count == l.modules.len) return error.TableFull;
         const im = try elf.Image.parse(bytes);
         const fixed = im.kind == .exec;
+        // Where its thread storage goes, before anything is taken: below
+        // the thread pointer, under the modules' before it, at an address
+        // that agrees with the one the file gives it (a static linker
+        // counts on the block's address being its own, modulo its
+        // alignment, when it computes offsets from the thread pointer).
+        var tls_offset: u64 = 0;
+        if (im.tls) |t| {
+            const end = std.math.add(u64, l.tls_size, t.memsz) catch return error.BadSegment;
+            tls_offset = std.math.add(u64, end, (0 -% t.vaddr -% end) & (t.alignment - 1)) catch return error.BadSegment;
+        }
         const start = l.host.reserve(l.host.ctx, if (fixed) im.lo else 0, im.span()) orelse return error.NoSpace;
-        if (start % elf.PAGE != 0 or (fixed and start != im.lo)) return error.NoSpace;
+        if (start % elf.PAGE != 0 or (fixed and start != im.lo)) {
+            l.host.release(l.host.ctx, start, im.span());
+            return error.NoSpace;
+        }
         const base = start -% im.lo;
         for (im.segments()) |s| {
             const dst: [*]u8 = @ptrFromInt(@as(usize, @intCast(base +% s.vaddr)));
@@ -200,25 +234,31 @@ pub const Linker = struct {
             .init = if (im.init != 0) base +% im.init else 0,
             .fini = if (im.fini != 0) base +% im.fini else 0,
             .proc_param = if (im.proc_param) |r| base +% r.vaddr else 0,
+            .proc_param_size = if (im.proc_param) |r| r.size else 0,
             .module_param = if (im.module_param) |r| base +% r.vaddr else 0,
             .eh_frame_hdr = if (im.eh_frame_hdr) |r| base +% r.vaddr else 0,
             .eh_frame_hdr_size = if (im.eh_frame_hdr) |r| r.size else 0,
             .image = im,
         };
         if (im.tls) |t| {
-            // (FreeBSD's layout: each block ends where the one before
-            // began, aligned; the offset is from the thread pointer down)
-            l.tls_size = std.mem.alignForward(u64, l.tls_size + t.memsz, t.alignment);
-            l.tls_align = @max(l.tls_align, t.alignment);
             m.tls_index = l.nextTlsIndex();
             m.tls_image = base +% t.vaddr;
             m.tls_filesz = t.filesz;
             m.tls_memsz = t.memsz;
-            m.tls_offset = l.tls_size;
+            m.tls_offset = tls_offset;
         }
         l.module_count += 1;
-        errdefer l.module_count -= 1;
-        try l.enterExports(index);
+        // (a module whose exports do not fit is not loaded at all: nothing
+        // of it stays, its addresses and its thread storage's place go back)
+        l.enterExports(index) catch |e| {
+            l.module_count -= 1;
+            l.host.release(l.host.ctx, start, im.span());
+            return e;
+        };
+        if (im.tls) |t| {
+            l.tls_size = tls_offset;
+            l.tls_align = @max(l.tls_align, t.alignment);
+        }
         return index;
     }
 
@@ -250,27 +290,29 @@ pub const Linker = struct {
     }
 
     /// Whether a symbol of `im` is one other modules may import.
-    fn exported(im: *const elf.Image, s: elf.Sym) ?elf.Image.Linked {
+    fn exported(im: *const elf.Image, names: *const elf.Names, s: elf.Sym) ?elf.Image.Linked {
         if (!s.defined() or s.bind() == elf.STB_LOCAL or !s.visible()) return null;
         // (a definition outside the module is not one)
         if (s.kind() != elf.STT_TLS and !im.covered(s.value, 0)) return null;
-        return im.linked(s);
+        return names.linked(im, s);
     }
 
     fn enterExports(l: *Linker, index: u16) Error!void {
         const m = &l.modules[index];
         const im = &m.image;
+        const names = try elf.Names.init(im);
         // Room for all of them first (and their libraries' names): a
         // module's exports go in whole or not at all.
-        var libs = im.names(.export_library);
-        while (libs.next()) |n| _ = try l.library(n.name);
+        const libraries_before = l.library_count;
+        errdefer l.library_count = libraries_before;
+        for (names.exports[0..names.export_count]) |n| _ = try l.library(n.name);
         var count: usize = 0;
         for (im.symtab) |s| {
-            if (exported(im, s) != null) count += 1;
+            if (exported(im, &names, s) != null) count += 1;
         }
         if ((l.export_count + count) * 4 > l.exports.len * 3) return error.TableFull;
         for (im.symtab) |s| {
-            const info = exported(im, s) orelse continue;
+            const info = exported(im, &names, s) orelse continue;
             const is_tls = s.kind() == elf.STT_TLS;
             const lib = l.knownLibrary(info.library);
             const mask = l.exports.len - 1;
@@ -312,37 +354,45 @@ pub const Linker = struct {
     pub fn link(l: *Linker) Error!void {
         for (l.modules[0..l.module_count], 0..) |*m, i| {
             if (m.linked) continue;
-            try l.relocate(@intCast(i), m.image.rela);
-            try l.relocate(@intCast(i), m.image.jmprel);
+            const names = try elf.Names.init(&m.image);
+            try l.relocate(@intCast(i), &names, m.image.rela);
+            try l.relocate(@intCast(i), &names, m.image.jmprel);
         }
         for (l.modules[0..l.module_count]) |*m| {
             if (m.linked) continue;
             try l.protect(m);
             m.linked = true;
-            m.image.bytes = &.{}; // (the file may go now)
+            // The file may go now: nothing of the module points into it.
+            m.image.bytes = &.{};
+            m.image.dynamic = &.{};
+            m.image.strtab = &.{};
+            m.image.symtab = &.{};
+            m.image.rela = &.{};
+            m.image.jmprel = &.{};
         }
     }
 
     const Target = struct { value: u64, module: u16, tls: bool };
 
-    fn relocate(l: *Linker, index: u16, relas: []align(1) const elf.Rela) Error!void {
+    fn relocate(l: *Linker, index: u16, names: *const elf.Names, relas: []align(1) const elf.Rela) Error!void {
         const m = &l.modules[index];
         const im = &m.image;
         for (relas) |r| {
+            // (a relocation that does nothing may name any place)
+            if (r.kind() == elf.R.NONE) continue;
             if (!im.covered(r.offset, 8)) return error.BadRelocation;
             const where: *align(1) u64 = @ptrFromInt(@as(usize, @intCast(m.base +% r.offset)));
             const addend: u64 = @bitCast(r.addend);
             switch (r.kind()) {
-                elf.R.NONE => {},
                 elf.R.RELATIVE => where.* = m.base +% addend,
-                elf.R.@"64" => where.* = (try l.resolve(index, r.sym())).value +% addend,
-                elf.R.GLOB_DAT, elf.R.JUMP_SLOT => where.* = (try l.resolve(index, r.sym())).value,
-                elf.R.DTPMOD64 => where.* = if (r.sym() == 0) m.tls_index else l.modules[(try l.resolve(index, r.sym())).module].tls_index,
-                elf.R.DTPOFF64 => where.* = (if (r.sym() == 0) 0 else (try l.resolveTls(index, r.sym())).value) +% addend,
+                elf.R.@"64" => where.* = (try l.resolve(index, names, r.sym())).value +% addend,
+                elf.R.GLOB_DAT, elf.R.JUMP_SLOT => where.* = (try l.resolve(index, names, r.sym())).value,
+                elf.R.DTPMOD64 => where.* = if (r.sym() == 0) m.tls_index else l.modules[(try l.resolve(index, names, r.sym())).module].tls_index,
+                elf.R.DTPOFF64 => where.* = (if (r.sym() == 0) 0 else (try l.resolveTls(index, names, r.sym())).value) +% addend,
                 elf.R.TPOFF64 => {
                     // (below the thread pointer: the symbol's place in its
                     // module's block, less where that block starts)
-                    const t: Target = if (r.sym() == 0) .{ .value = 0, .module = index, .tls = true } else try l.resolveTls(index, r.sym());
+                    const t: Target = if (r.sym() == 0) .{ .value = 0, .module = index, .tls = true } else try l.resolveTls(index, names, r.sym());
                     where.* = t.value +% addend -% l.modules[t.module].tls_offset;
                 },
                 else => return error.BadRelocation,
@@ -351,32 +401,50 @@ pub const Linker = struct {
         }
     }
 
-    fn resolveTls(l: *Linker, index: u16, sym_index: u32) Error!Target {
-        const t = try l.resolve(index, sym_index);
+    fn resolveTls(l: *Linker, index: u16, names: *const elf.Names, sym_index: u32) Error!Target {
+        const t = try l.resolve(index, names, sym_index);
         if (!t.tls) return error.BadRelocation;
         return t;
     }
 
     /// What a symbol of module `index` stands for: its own definition, or
     /// whoever provides the import.
-    fn resolve(l: *Linker, index: u16, sym_index: u32) Error!Target {
+    fn resolve(l: *Linker, index: u16, names: *const elf.Names, sym_index: u32) Error!Target {
         const m = &l.modules[index];
         const im = &m.image;
         if (sym_index >= im.symtab.len) return error.BadRelocation;
         const s = im.symtab[sym_index];
         const is_tls = s.kind() == elf.STT_TLS;
-        if (s.defined()) return .{ .value = if (is_tls) s.value else m.base +% s.value, .module = index, .tls = is_tls };
-        const weak = s.bind() == elf.STB_WEAK;
-        const info = im.linked(s) orelse {
-            if (!weak) return error.Unresolved;
-            l.stats.weak_absent += 1;
-            return .{ .value = 0, .module = index, .tls = false };
-        };
-        if (l.lookup(info.library, info.nid)) |e| {
-            l.stats.from_modules += 1;
-            return .{ .value = e.addr, .module = e.module, .tls = e.tls };
+        // Its own: a definition, or a local symbol whatever it says of
+        // itself (the null symbol among them: the module's own address 0),
+        // as FreeBSD's linker takes them.
+        if (s.defined() or s.bind() == elf.STB_LOCAL) {
+            return .{ .value = if (is_tls) s.value else m.base +% s.value, .module = index, .tls = is_tls };
         }
-        if (l.host.builtin(l.host.ctx, info.library, info.nid)) |addr| {
+        const weak = s.bind() == elf.STB_WEAK;
+        // An import by NID and library. A symbol not named Sony's way (a
+        // plain name, a NID alone) is asked for by its NID in any library.
+        var lib_name: []const u8 = "";
+        var mod_name: []const u8 = "";
+        var n: nid.Nid = 0;
+        if (names.linked(im, s)) |info| {
+            lib_name = info.library;
+            mod_name = info.module;
+            n = info.nid;
+            if (l.lookup(lib_name, n)) |e| {
+                l.stats.from_modules += 1;
+                return .{ .value = e.addr, .module = e.module, .tls = e.tls };
+            }
+        } else {
+            const name = im.symbolName(s) orelse "";
+            if (name.len == 0) {
+                if (!weak) return error.Unresolved;
+                l.stats.weak_absent += 1;
+                return .{ .value = 0, .module = index, .tls = false };
+            }
+            n = nid.parse(name) orelse nid.of(name);
+        }
+        if (l.host.builtin(l.host.ctx, lib_name, n)) |addr| {
             l.stats.from_host += 1;
             return .{ .value = addr, .module = index, .tls = false };
         }
@@ -384,14 +452,27 @@ pub const Linker = struct {
             l.stats.weak_absent += 1;
             return .{ .value = 0, .module = index, .tls = false };
         }
-        const addr = l.host.missing(l.host.ctx, info.library, info.module, info.nid) orelse return error.Unresolved;
+        const addr = l.host.missing(l.host.ctx, .{
+            .library = lib_name,
+            .module = mod_name,
+            .nid = n,
+            .kind = switch (s.kind()) {
+                elf.STT_FUNC => .function,
+                elf.STT_OBJECT => .object,
+                else => .other,
+            },
+            .size = s.size,
+        }) orelse return error.Unresolved;
         l.stats.stand_ins += 1;
         return .{ .value = addr, .module = index, .tls = false };
     }
 
     /// Each segment as its file asks, and the relocated read-only part
-    /// read-only (whole pages of it: what shares a page with writable data
-    /// stays writable).
+    /// read-only. Protection is by whole pages, and no two segments share
+    /// one (the reader refuses a file where they do), so that part's first
+    /// and last pages are its own when it starts or ends with its segment,
+    /// as linkers lay it out; an end in the middle of a segment keeps its
+    /// page writable, for the data that shares it.
     fn protect(l: *Linker, m: *const Module) Error!void {
         const im = &m.image;
         for (im.segments()) |s| {
@@ -400,9 +481,14 @@ pub const Linker = struct {
             if (!l.host.protect(l.host.ctx, m.base +% lo, hi - lo, s.read or s.exec, s.write, s.exec)) return error.Protect;
         }
         if (im.relro) |r| {
-            const lo = std.mem.alignForward(u64, r.vaddr, elf.PAGE);
-            const hi = std.mem.alignBackward(u64, r.vaddr + r.size, elf.PAGE);
-            if (hi > lo and !l.host.protect(l.host.ctx, m.base +% lo, hi - lo, true, false, false)) return error.Protect;
+            const end = r.vaddr + r.size;
+            for (im.segments()) |s| {
+                if (r.vaddr < s.vaddr or end > s.end()) continue;
+                const lo = if (r.vaddr == s.vaddr) std.mem.alignBackward(u64, r.vaddr, elf.PAGE) else std.mem.alignForward(u64, r.vaddr, elf.PAGE);
+                const hi = if (end == s.end()) std.mem.alignForward(u64, end, elf.PAGE) else std.mem.alignBackward(u64, end, elf.PAGE);
+                if (hi > lo and !l.host.protect(l.host.ctx, m.base +% lo, hi - lo, true, false, false)) return error.Protect;
+                break;
+            }
         }
     }
 
@@ -449,14 +535,23 @@ const TestHost = struct {
     used: usize = 0,
     protects: u32 = 0,
     read_only: u32 = 0,
+    /// The last range made read-only (address, size).
+    read_only_range: [2]u64 = .{ 0, 0 },
     executable: u32 = 0,
     missing_asked: u32 = 0,
+    objects_missing: u32 = 0,
+    released: u32 = 0,
 
     const USLEEP: u64 = 0x1111_0000;
     const STAND_IN: u64 = 0x2222_0000;
+    const OBJECT_STAND_IN: u64 = 0x3333_0000;
 
     fn host(t: *TestHost) Host {
-        return .{ .ctx = t, .reserve = reserve, .protect = protect, .builtin = builtin, .missing = missing };
+        return .{ .ctx = t, .reserve = reserve, .release = release, .protect = protect, .builtin = builtin, .missing = missing };
+    }
+    fn release(ctx: ?*anyopaque, _: u64, _: u64) void {
+        const t: *TestHost = @ptrCast(@alignCast(ctx.?));
+        t.released += 1;
     }
     fn reserve(ctx: ?*anyopaque, want: u64, size: u64) ?u64 {
         const t: *TestHost = @ptrCast(@alignCast(ctx.?));
@@ -470,7 +565,10 @@ const TestHost = struct {
         const t: *TestHost = @ptrCast(@alignCast(ctx.?));
         if (addr % elf.PAGE != 0 or size % elf.PAGE != 0) return false;
         t.protects += 1;
-        if (read and !write and !exec) t.read_only += 1;
+        if (read and !write and !exec) {
+            t.read_only += 1;
+            t.read_only_range = .{ addr, size };
+        }
         if (exec) t.executable += 1;
         return true;
     }
@@ -478,9 +576,13 @@ const TestHost = struct {
         if (std.mem.eql(u8, lib, "libkernel") and n == nid.of("sceKernelUsleep")) return USLEEP;
         return null;
     }
-    fn missing(ctx: ?*anyopaque, _: []const u8, _: []const u8, _: nid.Nid) ?u64 {
+    fn missing(ctx: ?*anyopaque, what: Missing) ?u64 {
         const t: *TestHost = @ptrCast(@alignCast(ctx.?));
         t.missing_asked += 1;
+        if (what.kind == .object) {
+            t.objects_missing += 1;
+            return OBJECT_STAND_IN;
+        }
         return STAND_IN;
     }
 };
@@ -631,6 +733,7 @@ test "tables that are full say so" {
     _ = b.exportSymbol(nid.of("b"), lt, 0, fixture.TEXT, elf.STT_FUNC);
     _ = b.exportSymbol(nid.of("c"), lt, 0, fixture.TEXT, elf.STT_FUNC);
     _ = b.exportSymbol(nid.of("d"), lt, 0, fixture.TEXT, elf.STT_FUNC);
+    b.tls(fixture.DATA + 0x100, 8, 24, 16);
     const file = b.finish();
 
     var th = TestHost{};
@@ -640,9 +743,151 @@ test "tables that are full say so" {
     var l = Linker.init(th.host(), .{ .modules = &modules, .libraries = &libraries, .exports = &exports });
     try std.testing.expectError(error.TableFull, l.load("libTest.prx", file));
     try std.testing.expectEqual(@as(usize, 0), l.loaded().len);
-    // (and none of its exports went in)
+    // (and nothing of it stays: no export, no library name, no place in a
+    // thread's storage, and its addresses went back to the host)
     try std.testing.expectEqual(@as(u32, 0), l.export_count);
+    try std.testing.expectEqual(@as(u16, 0), l.library_count);
     try std.testing.expect(l.lookup("libTest", nid.of("a")) == null);
+    try std.testing.expectEqual(@as(u64, 0), l.staticTls().size);
+    try std.testing.expectEqual(@as(u32, 1), th.released);
+}
+
+test "the part to be read-only once relocated: whole pages of it, when they are its own" {
+    var buf: [fixture.SIZE]u8 = undefined;
+    // All of the data segment: every page of it.
+    {
+        var b = fixture.Builder.init(&buf, .dynexec);
+        b.selfModule("eboot", 0);
+        b.relative(fixture.DATA, fixture.TEXT);
+        b.relro = .{ .vaddr = fixture.DATA, .size = fixture.DATA_SIZE };
+        var th = TestHost{};
+        var modules: [1]Module = undefined;
+        var libraries: [2]Name = undefined;
+        var exports: [8]Export = undefined;
+        var l = Linker.init(th.host(), .{ .modules = &modules, .libraries = &libraries, .exports = &exports });
+        const exe = try l.load("eboot.bin", b.finish());
+        try l.link();
+        const base = l.loaded()[exe].base;
+        try std.testing.expectEqual(@as(u32, 1), th.read_only);
+        try std.testing.expectEqual([2]u64{ base + fixture.DATA, fixture.DATA_SIZE }, th.read_only_range);
+        // (and the relocation was written before it closed)
+        try std.testing.expectEqual(base + fixture.TEXT, word(base + fixture.DATA));
+    }
+    // Its first quarter page only: the page has writable data too, and
+    // stays as it is.
+    {
+        var b = fixture.Builder.init(&buf, .dynexec);
+        b.selfModule("eboot", 0);
+        b.relro = .{ .vaddr = fixture.DATA, .size = 0x1000 };
+        var th = TestHost{};
+        var modules: [1]Module = undefined;
+        var libraries: [2]Name = undefined;
+        var exports: [8]Export = undefined;
+        var l = Linker.init(th.host(), .{ .modules = &modules, .libraries = &libraries, .exports = &exports });
+        _ = try l.load("eboot.bin", b.finish());
+        try l.link();
+        try std.testing.expectEqual(@as(u32, 0), th.read_only);
+    }
+}
+
+test "a module's own symbols, a missing object, and relocations that say nothing" {
+    var buf: [fixture.SIZE]u8 = undefined;
+    var b = fixture.Builder.init(&buf, .dynexec);
+    b.selfModule("eboot", 0);
+    const m = b.neededModule("libkernel", 1);
+    const k = b.importLibrary("libkernel", 1);
+    const object = b.importSymbol(nid.of("environ"), k, m, elf.STT_OBJECT);
+    const function = b.importSymbol(nid.of("sceKernelNobodyHasThis"), k, m, elf.STT_FUNC);
+    // The null symbol is the module's own address 0: with an addend, a
+    // place in the module.
+    b.absolute(fixture.DATA + 0x00, 0, 0x1234);
+    b.globDat(fixture.DATA + 0x08, object);
+    b.jumpSlot(fixture.DATA + 0x10, function);
+    // (a relocation of no kind may name any place, even none of the file's)
+    b.absolute(0xffff_ffff_0000, 0, 0);
+    b.relas[b.rela_count - 1].info = elf.R.NONE;
+    const file = b.finish();
+
+    var th = TestHost{};
+    var modules: [1]Module = undefined;
+    var libraries: [2]Name = undefined;
+    var exports: [8]Export = undefined;
+    var l = Linker.init(th.host(), .{ .modules = &modules, .libraries = &libraries, .exports = &exports });
+    const exe = try l.load("eboot.bin", file);
+    try l.link();
+    const base = l.loaded()[exe].base;
+    try std.testing.expectEqual(base + 0x1234, word(base + fixture.DATA + 0x00));
+    // An object's stand-in is not a function's: the host is told which.
+    try std.testing.expectEqual(TestHost.OBJECT_STAND_IN, word(base + fixture.DATA + 0x08));
+    try std.testing.expectEqual(TestHost.STAND_IN, word(base + fixture.DATA + 0x10));
+    try std.testing.expectEqual(@as(u32, 1), th.objects_missing);
+    try std.testing.expectEqual(@as(u32, 2), th.missing_asked);
+}
+
+test "a relocation that names a symbol the file does not have is refused" {
+    var buf: [fixture.SIZE]u8 = undefined;
+    var b = fixture.Builder.init(&buf, .dynexec);
+    b.selfModule("eboot", 0);
+    b.globDat(fixture.DATA, 999);
+    var th = TestHost{};
+    var modules: [1]Module = undefined;
+    var libraries: [2]Name = undefined;
+    var exports: [8]Export = undefined;
+    var l = Linker.init(th.host(), .{ .modules = &modules, .libraries = &libraries, .exports = &exports });
+    _ = try l.load("eboot.bin", b.finish());
+    try std.testing.expectError(error.BadRelocation, l.link());
+}
+
+test "two modules with thread storage: each its own place below the thread pointer" {
+    var exe_buf: [fixture.SIZE]u8 = undefined;
+    var eb = fixture.Builder.init(&exe_buf, .dynexec);
+    eb.selfModule("eboot", 0);
+    eb.data = &([_]u8{0} ** 0x100 ++ [_]u8{ 1, 2, 3, 4 });
+    eb.tls(fixture.DATA + 0x100, 4, 16, 16);
+    // (no symbol: 4 bytes into this module's own block, from the thread pointer)
+    eb.threadPointerOffset(fixture.DATA + 0x00, 0, 4);
+    eb.tlsModule(fixture.DATA + 0x08);
+    var lib_buf: [fixture.SIZE]u8 = undefined;
+    var lb = fixture.Builder.init(&lib_buf, .module);
+    lb.selfModule("libTest", 0);
+    lb.data = &([_]u8{0} ** 0x108 ++ [_]u8{ 9, 9 });
+    // (its first bytes are 8 past a multiple of its 32: so is its block)
+    lb.tls(fixture.DATA + 0x108, 2, 40, 32);
+    lb.tlsModule(fixture.DATA + 0x08);
+
+    var th = TestHost{};
+    var modules: [2]Module = undefined;
+    var libraries: [2]Name = undefined;
+    var exports: [8]Export = undefined;
+    var l = Linker.init(th.host(), .{ .modules = &modules, .libraries = &libraries, .exports = &exports });
+    const exe = try l.load("eboot.bin", eb.finish());
+    const lib = try l.load("libTest.prx", lb.finish());
+    try l.link();
+    const e = l.loaded()[exe];
+    const t = l.loaded()[lib];
+    // The executable is first: its 16 bytes end at the thread pointer.
+    try std.testing.expectEqual(@as(u64, 16), e.tls_offset);
+    try std.testing.expectEqual(@as(u16, 1), e.tls_index);
+    // The module's 40 bytes go under them, and down to where its block's
+    // address is 8 past a multiple of 32, as its file's is: 16 + 40 = 56,
+    // then 56 past a multiple of 32 is 24 short of 8 past one.
+    try std.testing.expectEqual(@as(u16, 2), t.tls_index);
+    try std.testing.expectEqual(@as(u64, 56), t.tls_offset);
+    try std.testing.expectEqual(@as(u64, 8), (0 -% t.tls_offset) % 32);
+    try std.testing.expectEqual(@as(u64, 64), l.staticTls().size);
+    try std.testing.expectEqual(@as(u64, 32), l.staticTls().alignment);
+    try std.testing.expectEqual(@as(i64, 4 - 16), @as(i64, @bitCast(word(e.base + fixture.DATA + 0x00))));
+    try std.testing.expectEqual(@as(u64, 1), word(e.base + fixture.DATA + 0x08));
+    try std.testing.expectEqual(@as(u64, 2), word(t.base + fixture.DATA + 0x08));
+
+    var thread: [128]u8 align(32) = [_]u8{0x55} ** 128;
+    const tp = @intFromPtr(&thread) + 96;
+    l.initTls(tp);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, thread[80..84]); // the executable's, at tp - 16
+    try std.testing.expect(std.mem.allEqual(u8, thread[84..96], 0));
+    try std.testing.expectEqualSlices(u8, &.{ 9, 9 }, thread[40..42]); // the module's, at tp - 56
+    try std.testing.expect(std.mem.allEqual(u8, thread[42..80], 0));
+    try std.testing.expect(std.mem.allEqual(u8, thread[0..40], 0x55)); // (below them: nobody's)
 }
 
 // A whole program run for real: the hello fixture's code is the CPU's own,
@@ -688,7 +933,7 @@ const Ran = struct {
         if (n == nid.of("_exit")) return @intFromPtr(&exit);
         return null;
     }
-    fn missing(_: ?*anyopaque, _: []const u8, _: []const u8, _: nid.Nid) ?u64 {
+    fn missing(_: ?*anyopaque, _: Missing) ?u64 {
         return @intFromPtr(&standIn);
     }
 };

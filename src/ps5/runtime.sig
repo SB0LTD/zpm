@@ -112,11 +112,44 @@ pub const Stubs = struct {
         return page + SIZE * (@as(u64, index) + 1);
     }
 
-    /// The stand-ins become code (no longer writable).
-    fn seal() void {
-        if (page == 0) return;
+    /// The stand-ins become code (no longer writable). False when the
+    /// kernel would not allow it: they could then not be called at all.
+    fn seal() bool {
+        if (page == 0) return true;
         const bytes = std.mem.alignForward(u64, (MAX + 1) * SIZE, abi.PAGE);
-        _ = sys.call(S.mprotect, page, bytes, abi.PROT.READ | abi.PROT.EXEC, 0, 0, 0);
+        return sys.call(S.mprotect, page, bytes, abi.PROT.READ | abi.PROT.EXEC, 0, 0, 0) == 0;
+    }
+};
+
+/// Memory for an imported object nothing provides. A stand-in for a
+/// function is code; a program reads and writes an object, so its stand-in
+/// is zeroed memory of its own, and the log says so when it is bound
+/// (nothing calls it, so nothing could say so later).
+const Objects = struct {
+    const BYTES: u64 = 1 << 20;
+    /// One object's most; a bigger one fails the link.
+    const ONE_MAX: u64 = 64 << 10;
+    /// Lines the log gets before only the count goes on.
+    const SAID_MAX = 16;
+
+    var base: u64 = 0;
+    var used: u64 = 0;
+    var count: u32 = 0;
+
+    fn make(what: link.Missing) ?u64 {
+        if (what.size > ONE_MAX) return null;
+        if (base == 0) {
+            const r = sys.call(S.mmap, 0, BYTES, RW, abi.MAP.ANON | abi.MAP.PRIVATE, NO_FD, 0);
+            if (r < 0) return null;
+            base = @intCast(r);
+        }
+        const size = std.mem.alignForward(u64, @max(what.size, 8), 16);
+        if (size > BYTES - used) return null;
+        const at = base + used;
+        used += size;
+        count += 1;
+        if (count <= SAID_MAX) say("not provided: the object {s}:{s} ({d} bytes): it reads as zeroes", .{ what.library, nid.text(what.nid), what.size });
+        return at;
     }
 };
 
@@ -171,8 +204,15 @@ fn builtin(_: ?*anyopaque, library: []const u8, n: nid.Nid) ?u64 {
     return libkernel.find(library, n);
 }
 
-fn missing(_: ?*anyopaque, library: []const u8, _: []const u8, n: nid.Nid) ?u64 {
-    return Stubs.make(library, n);
+fn release(_: ?*anyopaque, addr: u64, size: u64) void {
+    _ = sys.call(S.munmap, addr, size, 0, 0, 0, 0);
+}
+
+fn missing(_: ?*anyopaque, what: link.Missing) ?u64 {
+    return switch (what.kind) {
+        .function, .other => Stubs.make(what.library, what.nid),
+        .object => Objects.make(what),
+    };
 }
 
 fn tlsAddress(module: u64, offset: u64) callconv(.c) usize {
@@ -223,16 +263,65 @@ fn firstThread() ?u64 {
 
 // ── Starting the game ───────────────────────────────────────────────────────
 
-/// The game's first thread's stack (the console gives 2 MiB by default).
+/// The game's first thread's stack when its file does not say (the
+/// console's default), and the least and most one is given.
 const STACK_BYTES: u64 = 2 << 20;
+const STACK_MIN: u64 = 64 << 10;
+const STACK_MAX: u64 = 1 << 30;
 const MAX_ARGS = 62;
-
-/// argc, argv, the terminating null: what a game's entry gets in rdi.
-var start_block: [1 + MAX_ARGS + 1]u64 = undefined;
+/// The most the arguments' text may take of the stack.
+const ARG_BYTES_MAX: usize = 32 << 10;
 
 /// What a game's start code registers to run at exit. The runtime has
 /// nothing to undo.
 fn cleanup() callconv(.c) void {}
+
+/// The stack size a program asks for its first thread: its process
+/// parameter's seventh word points at it (a 32-bit number). The file is
+/// not trusted: the parameter must be long enough to have the word, and
+/// the pointer must lead into the program's own memory.
+fn stackBytes(exe: *const link.Module) u64 {
+    const FIELD = 0x30;
+    if (exe.proc_param == 0 or exe.proc_param_size < FIELD + 8) return STACK_BYTES;
+    const param: [*]align(1) const u64 = @ptrFromInt(@as(usize, @intCast(exe.proc_param)));
+    if (param[0] < FIELD + 8) return STACK_BYTES; // (its own word for its size)
+    const at = param[FIELD / 8];
+    if (at < exe.start or at > exe.start + exe.size - 4) return STACK_BYTES;
+    const asked: u64 = @as(*align(1) const u32, @ptrFromInt(@as(usize, @intCast(at)))).*;
+    if (asked == 0) return STACK_BYTES;
+    return std.mem.alignForward(u64, std.math.clamp(asked, STACK_MIN, STACK_MAX), abi.PAGE);
+}
+
+/// The game's arguments at the top of its stack, as a kernel leaves them
+/// for a new program: the text, then (lower) the block its entry gets in
+/// rdi: argc, the argv pointers, a null, and a null for an environment of
+/// nothing. Returns the block's address, a multiple of 16.
+fn pushArguments(top: u64, ap: [*]const u64, count: usize) u64 {
+    var at = top;
+    var pointers: [MAX_ARGS]u64 = undefined;
+    var n: usize = 0;
+    var text: usize = 0;
+    while (n < count) : (n += 1) {
+        const arg = std.mem.span(@as([*:0]const u8, @ptrFromInt(ap[2 + n])));
+        if (text + arg.len + 1 > ARG_BYTES_MAX) break; // (the rest are left out)
+        text += arg.len + 1;
+        at -= arg.len + 1;
+        const dst: [*]u8 = @ptrFromInt(@as(usize, @intCast(at)));
+        @memcpy(dst[0..arg.len], arg);
+        dst[arg.len] = 0;
+        pointers[n] = at;
+    }
+    at &= ~@as(u64, 15);
+    // argc, argv[0..n], null, the environment's null, and two words of
+    // nothing after it (where FreeBSD's vector of extras would end).
+    const words = 1 + n + 1 + 1 + 2;
+    at = (at - words * 8) & ~@as(u64, 15);
+    const block: [*]u64 = @ptrFromInt(@as(usize, @intCast(at)));
+    block[0] = n;
+    for (0..n) |i| block[1 + i] = pointers[i];
+    @memset(block[1 + n .. words], 0);
+    return at;
+}
 
 fn basename(path: []const u8) []const u8 {
     const i = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
@@ -256,16 +345,18 @@ pub fn start(ap: [*]const u64) noreturn {
     libkernel.init();
     libkernel.app0 = dirname(path_text);
     libkernel.tls_address = tlsAddress;
+    // (the name is the end of the path's own text, so it ends with its 0)
+    libkernel.progname = @ptrCast(name.ptr);
 
     const file = mapFile(path) orelse die(127, "{s}: cannot be read", .{path_text});
-    linker = link.Linker.init(.{ .reserve = reserve, .protect = protect, .builtin = builtin, .missing = missing }, .{
+    linker = link.Linker.init(.{ .reserve = reserve, .release = release, .protect = protect, .builtin = builtin, .missing = missing }, .{
         .modules = &modules,
         .libraries = &libraries,
         .exports = &exports,
     });
     const index = linker.load(name, file) catch |e| die(126, "{s}: not loaded: {s}", .{ name, @errorName(e) });
     linker.link() catch |e| die(126, "{s}: not linked: {s}", .{ name, @errorName(e) });
-    Stubs.seal();
+    if (!Stubs.seal()) die(126, "{s}: the stand-ins for what nothing provides could not be made code", .{name});
     _ = sys.call(S.munmap, @intFromPtr(file.ptr), file.len, 0, 0, 0, 0);
 
     const exe = &linker.loaded()[index];
@@ -274,19 +365,21 @@ pub fn start(ap: [*]const u64) noreturn {
     say("{s}: loaded at 0x{x}, {d} relocations; imports: {d} from libkernel, {d} from modules, {d} that nothing provides yet", .{
         name, exe.base, st.relocations, st.from_host, st.from_modules, st.stand_ins,
     });
+    if (Objects.count > Objects.SAID_MAX) say("{s}: {d} objects in all that nothing provides (they read as zeroes)", .{ name, Objects.count });
 
     _ = firstThread() orelse die(126, "{s}: no memory for its first thread", .{name});
 
-    // The game's arguments: its own path, then what followed it.
-    const n: usize = @intCast(@min(argc - 1, MAX_ARGS));
-    start_block[0] = n;
-    for (0..n) |i| start_block[1 + i] = ap[2 + i];
-    start_block[1 + n] = 0;
-
-    const stack = sys.call(S.mmap, 0, STACK_BYTES, RW, abi.MAP.STACK, NO_FD, 0);
+    // Its stack: the size its file asks for, with a page below that
+    // nothing may touch, so that running off its end is a fault and not a
+    // quiet write into whatever was mapped next.
+    const bytes = stackBytes(exe);
+    const stack = sys.call(S.mmap, 0, bytes + abi.PAGE, RW, abi.MAP.STACK, NO_FD, 0);
     if (stack < 0) die(126, "{s}: no memory for its stack", .{name});
-    const top: u64 = @as(u64, @intCast(stack)) + STACK_BYTES;
-    enter(exe.entry, @intFromPtr(&start_block), @intFromPtr(&cleanup), top);
+    const bottom: u64 = @intCast(stack);
+    if (sys.call(S.mprotect, bottom, abi.PAGE, 0, 0, 0, 0) != 0) die(126, "{s}: its stack's guard could not be set", .{name});
+    // The game's arguments: its own path, then what followed it.
+    const block = pushArguments(bottom + abi.PAGE + bytes, ap, @intCast(@min(argc - 1, MAX_ARGS)));
+    enter(exe.entry, block, @intFromPtr(&cleanup), block);
 }
 
 /// Onto the game's stack and into its entry: rdi the argument block, rsi

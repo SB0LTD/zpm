@@ -70,6 +70,13 @@ pub var started_us: u64 = 0;
 /// thread storage is.
 pub var tls_address: ?*const fn (module: u64, offset: u64) callconv(.c) usize = null;
 
+/// Two objects a program's start code reads straight from libkernel (it
+/// imports the variables themselves, not functions): the program's name,
+/// and its environment, which is empty here.
+pub var progname: [*:0]const u8 = "eboot.bin";
+var no_environment = [_]?[*:0]u8{null};
+pub var environ: [*]?[*:0]u8 = &no_environment;
+
 /// Call once, before the game runs.
 pub fn init() void {
     started_us = monotonicUs();
@@ -338,6 +345,8 @@ pub const exports = nid.Table(*const anyopaque, &.{
     entry("__stack_chk_guard", &stack_chk_guard),
     entry("__stack_chk_fail", &__stack_chk_fail),
     entry("__tls_get_addr", &__tls_get_addr),
+    entry("__progname", &progname),
+    entry("environ", &environ),
     entry("usleep", &usleep),
     entry("sceKernelUsleep", &sceKernelUsleep),
     entry("sceKernelSleep", &sceKernelSleep),
