@@ -287,6 +287,10 @@ fn datetimeRank(ty: Type) u8 {
 pub fn castable(from: Type, to: Type, context: Context) bool {
     if (from == to) return true;
     if (from == .unknown) return true;
+    if (to == .mysql_bigint_unsigned)
+        return context == .assignment and (integral(from) or from == .numeric);
+    if (from == .mysql_bigint_unsigned)
+        return context == .explicit and (to == .numeric or stringType(to));
     if (types.elementType(from)) |element| {
         // array_coerce: an element cast in the same context; to strings by
         // I/O conversion (assignment).
@@ -532,6 +536,18 @@ pub fn Io(comptime config: types.Config) type {
         }
 
         /// Input function of `ty` (typmod applied).
+        fn checkedUnsigned(input: numeric.Numeric) Error!V.Cell {
+            var value = input;
+            if (value.special != .finite or value.negative) return error.IntegerOverflow;
+            if (value.dscale != 0) {
+                const exact = try N.round(&value, 0);
+                if (numeric.compareValues(&value, &exact) != 0) return error.UnsupportedStatement;
+                value = exact;
+            }
+            if (types.mysqlUnsignedValue(&value) == null) return error.IntegerOverflow;
+            return .{ .numeric = value };
+        }
+
         pub fn parse(ty: Type, typmod: i32, input: []const u8, session: *const Session) Error!V.Cell {
             const cell: V.Cell = switch (ty) {
                 .int2, .int4, .int8 => .{ .integer = blk: {
@@ -552,6 +568,7 @@ pub fn Io(comptime config: types.Config) type {
                 },
                 .name => try textCell(input[0..@min(input.len, 63)]),
                 .numeric => .{ .numeric = try N.parse(input) },
+                .mysql_bigint_unsigned => try checkedUnsigned(try N.parse(input)),
                 .float4 => .{ .float4 = try float_text.parse(f32, input) },
                 .float8 => .{ .float8 = try float_text.parse(f64, input) },
                 .date => .{ .date = try temporal.parseDate(input) },
@@ -812,6 +829,12 @@ pub fn Io(comptime config: types.Config) type {
                     .integer => |value| V.Cell{ .boolean = value != 0 },
                     .boolean => cell,
                     .text => |*value| V.Cell{ .boolean = try expr.parseBoolean(value.slice()) },
+                    else => return error.CannotCoerce,
+                },
+                .mysql_bigint_unsigned => switch (cell) {
+                    .integer => |value| try checkedUnsigned(N.fromInt(value)),
+                    .numeric => |value| try checkedUnsigned(value),
+                    .text => |*value| try parse(.mysql_bigint_unsigned, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
                 .numeric => switch (cell) {

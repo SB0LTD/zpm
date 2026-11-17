@@ -555,12 +555,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -570,7 +570,7 @@ const type_count = @typeInfo(Type).@"enum".field_names.len;
 /// The array type of a named element type (null for an array).
 pub fn arrayData(element: DataType) ?DataType {
     const raw = @intFromEnum(element);
-    if (raw >= data_type_count) return null;
+    if (element == .mysql_bigint_unsigned or raw >= data_type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -578,19 +578,21 @@ pub fn arrayData(element: DataType) ?DataType {
 pub fn elementData(data_type: DataType) ?DataType {
     const raw = @intFromEnum(data_type);
     if (raw < array_bit or raw & ~array_bit >= data_type_count) return null;
-    return @enumFromInt(raw & ~array_bit);
+    const element: DataType = @enumFromInt(raw & ~array_bit);
+    return if (element == .mysql_bigint_unsigned) null else element;
 }
 
 pub fn arrayType(element: Type) ?Type {
     const raw = @intFromEnum(element);
-    if (element == .unknown or raw >= type_count) return null;
+    if (element == .unknown or element == .mysql_bigint_unsigned or raw >= type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
 pub fn elementType(ty: Type) ?Type {
     const raw = @intFromEnum(ty);
     if (raw < array_bit or raw & ~array_bit >= type_count or raw & ~array_bit == 0) return null;
-    return @enumFromInt(raw & ~array_bit);
+    const element: Type = @enumFromInt(raw & ~array_bit);
+    return if (element == .mysql_bigint_unsigned) null else element;
 }
 
 pub fn isArray(ty: Type) bool {
@@ -633,6 +635,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .int4 => .integer32,
         .int8 => .integer,
         .numeric => .numeric,
+        .mysql_bigint_unsigned => .mysql_bigint_unsigned,
         .float4 => .real,
         .float8 => .double,
         .boolean => .boolean,
@@ -682,6 +685,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .integer32 => .int4,
         .integer => .int8,
         .numeric => .numeric,
+        .mysql_bigint_unsigned => .mysql_bigint_unsigned,
         .real => .float4,
         .double => .float8,
         .boolean => .boolean,
@@ -741,6 +745,7 @@ pub const NominalColumnType = struct {
 /// An array's typmod belongs to its element type.
 pub fn validTypeTypmod(comptime config: Config, data_type: DataType, typmod: i32) bool {
     return switch (elementData(data_type) orelse data_type) {
+        .mysql_bigint_unsigned => typmod == -1 and config.numeric_digits >= 20,
         .numeric => typmod == -1 or blk: {
             const decoded = numeric.Ops(config.numeric_digits).decodeTypmod(typmod) orelse break :blk false;
             break :blk decoded.precision >= 1 and decoded.precision <= config.numeric_digits and decoded.scale >= -1000 and decoded.scale <= 1000;
@@ -793,6 +798,9 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .timestamptz => .{ .oid = 1184, .name = "timestamptz", .len = 8, .category = 'D', .array = 1185 },
         .interval => .{ .oid = 1186, .name = "interval", .len = 16, .category = 'T', .array = 1187 },
         .numeric => .{ .oid = 1700, .name = "numeric", .len = -1, .category = 'N', .array = 1231 },
+        // PostgreSQL wire and catalog columns expose the exact NUMERIC
+        // representation. The change log encodes the unsigned type separately.
+        .mysql_bigint_unsigned => .{ .oid = 1700, .name = "numeric", .len = -1, .category = 'N', .array = 0 },
         .jsonb => .{ .oid = 3802, .name = "jsonb", .len = -1, .category = 'U', .array = 3807 },
         .bpchar => .{ .oid = 1042, .name = "bpchar", .len = -1, .category = 'S', .array = 1014 },
         .varchar => .{ .oid = 1043, .name = "varchar", .len = -1, .category = 'S', .array = 1015 },
@@ -830,6 +838,15 @@ pub fn typeOid(data_type: DataType) u32 {
     return typeInfo(data_type).oid;
 }
 
+/// BIGINT UNSIGNED deliberately reuses the exact Numeric cell format.
+/// A zero-scale finite value in the u64 range is its canonical representation.
+pub fn mysqlUnsignedValue(value: *const numeric.Numeric) ?u64 {
+    if (value.special != .finite or value.negative or value.dscale != 0) return null;
+    const magnitude = value.coef();
+    if (magnitude > 18446744073709551615) return null;
+    return @intCast(magnitude);
+}
+
 /// SQL spelling of a type (format_type with no typmod, regtype output,
 /// information_schema.columns.data_type).
 pub fn sqlTypeName(data_type: DataType) []const u8 {
@@ -844,7 +861,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .smallint => "smallint",
         .boolean => "boolean",
         .text => "text",
-        .numeric => "numeric",
+        .numeric, .mysql_bigint_unsigned => "numeric",
         .real => "real",
         .double => "double precision",
         .name => "name",
@@ -894,7 +911,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .smallint => "int2in",
         .boolean => "boolin",
         .text => "textin",
-        .numeric => "numeric_in",
+        .numeric, .mysql_bigint_unsigned => "numeric_in",
         .real => "float4in",
         .double => "float8in",
         .name => "namein",
@@ -1189,7 +1206,7 @@ pub fn Values(comptime config: Config) type {
                 .text, .name, .json, .varchar, .jsonpath => .text,
                 .real => .float4,
                 .double => .float8,
-                .numeric => .numeric,
+                .numeric, .mysql_bigint_unsigned => .numeric,
                 .date => .date,
                 .timestamp => .timestamp,
                 .timestamptz => .timestamptz,
@@ -1409,6 +1426,7 @@ pub fn Values(comptime config: Config) type {
                 return;
             }
             switch (column.data_type) {
+                .mysql_bigint_unsigned => if (mysqlUnsignedValue(&value.numeric) == null) return error.IntegerOverflow,
                 .varchar => if (!character.fits(value.text.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bpchar => if (!character.fits(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bit, .varbit => {
