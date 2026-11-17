@@ -2043,7 +2043,7 @@ pub fn Database(comptime config: Config) type {
                 const old = if (tag == .insert) &.{} else S.versionValues(table, entry.old, &old_scratch);
                 var new_scratch: S.VersionRowScratch = undefined;
                 const new = if (tag == .delete) &.{} else S.versionValues(table, entry.new, &new_scratch);
-                try C.encodePreparedRow(&writer, tag, table.oid, table.rows[version.row - 1].rowid, old, new);
+                try C.encodePreparedRow(&writer, tag, table.oid, table.rows[version.rowSlot()].rowid, old, new);
             }
             return envelope.finish(try writer.finish());
         }
@@ -5265,7 +5265,7 @@ pub fn Database(comptime config: Config) type {
                     if (snap.own(deletion.tx)) return if (deletion.cid == snap.cid) .authored else .skip;
                     waits.add(deletion.tx.slot);
                 }
-                self.locks.rowHolders(table_index, table.rows[entry.row - 1].rowid, slot, mode, waits);
+                self.locks.rowHolders(table_index, table.rows[entry.rowSlot()].rowid, slot, mode, waits);
                 if (waits.any()) return .wait;
                 return .{ .ready = current };
             }
@@ -5292,7 +5292,7 @@ pub fn Database(comptime config: Config) type {
                     },
                     .ready => |newest| {
                         const table = &db.tables[table_index];
-                        const rowid = table.rows[table.versions[newest].row - 1].rowid;
+                        const rowid = table.rows[table.versions[newest].rowSlot()].rowid;
                         if (try db.locks.grantRow(table_index, rowid, self.slot, self.mode)) |granted| try M.recordLock(db, self.slot, granted);
                         return newest;
                     },
@@ -5806,7 +5806,7 @@ pub fn Database(comptime config: Config) type {
             // REPEATABLE READ: the conflicting row must be visible to the
             // snapshot (ExecCheckTupleVisible).
             if (transactionSnapshot(self.txs[slot].isolation) and table.versions[goal].creationAfter(snap)) return error.SerializationFailure;
-            const row = table.versions[goal].row - 1;
+            const row = table.versions[goal].rowSlot();
             const previous_row = ctx.row;
             defer ctx.row = previous_row;
             var row_scratch: S.VersionRowScratch = undefined;
@@ -5952,7 +5952,7 @@ pub fn Database(comptime config: Config) type {
             for (constraint.keyColumns()) |column| if (cells[column] == .null_value) return .free;
             var waiting: ?u16 = null;
             for (table.versions[0..table.version_high], 0..) |*version, index| {
-                if (version.row == 0 or version.row - 1 == own_slot) continue;
+                if (version.rowLink() == 0 or version.rowSlot() == own_slot) continue;
                 var all = true;
                 for (constraint.keyColumns(), constraint.operators[0..constraint.column_count]) |column, operator| {
                     if (!all) break;
@@ -5997,7 +5997,7 @@ pub fn Database(comptime config: Config) type {
         fn liveKey(table: *const S.Table, columns: []const u8, key: *const E.Row, key_columns: []const u8, snap: Snapshot) KeyLookup {
             var waiting: ?u16 = null;
             for (table.versions[0..table.version_high], 0..) |*version, index| {
-                if (version.row == 0) continue;
+                if (version.rowLink() == 0) continue;
                 var equal = true;
                 for (columns, key_columns) |column, source| {
                     var temporary: V.Cell = undefined;
@@ -6060,7 +6060,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .found => |version| {
                     if (parent.versions[version].creationCsn() == 0) return;
-                    const rowid = parent.rows[parent.versions[version].row - 1].rowid;
+                    const rowid = parent.rows[parent.versions[version].rowSlot()].rowid;
                     var waits: L.Set = .{};
                     self.locks.rowHolders(parent_index, rowid, slot, .share, &waits);
                     if (waits.any()) return self.park(slot, waits);
@@ -6113,7 +6113,7 @@ pub fn Database(comptime config: Config) type {
             var version: u32 = 0;
             while (version < child.version_high) : (version += 1) {
                 const entry = &child.versions[version];
-                if (entry.row == 0) continue;
+                if (entry.rowLink() == 0) continue;
                 var equal = true;
                 for (constraint.keyColumns(), constraint.refColumns()) |column, key| {
                     var temporary: V.Cell = undefined;
@@ -6197,7 +6197,7 @@ pub fn Database(comptime config: Config) type {
             try B.bindFlaggedChecks(&context, table_index, &flags, &checks);
             var ctx = self.evalContext("");
             try D.checkRow(&ctx, table, &checks, cells);
-            const row = table.versions[old].row - 1;
+            const row = table.versions[old].rowSlot();
             if (table.primary_column) |column| if (!S.versionCellEquals(table, old, column, &cells[column])) switch (S.primaryKeyCheck(table, &cells[column], row, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
@@ -6287,7 +6287,7 @@ pub fn Database(comptime config: Config) type {
                 if (!table.live or table.pending_drop) continue;
                 if (entry.kind != .delete) {
                     const version = &table.versions[entry.new];
-                    if (version.row != 0 and !version.hasDeletion()) try self.deferredRow(slot, table, S.borrowVersionRow(table, entry.new, &row_scratch), version.row - 1, immediate_only, snap);
+                    if (version.rowLink() != 0 and !version.hasDeletion()) try self.deferredRow(slot, table, S.borrowVersionRow(table, entry.new, &row_scratch), version.rowSlot(), immediate_only, snap);
                 }
                 if (entry.kind != .insert) try self.deferredParent(slot, table, S.borrowVersionRow(table, entry.old, &row_scratch), immediate_only, snap);
             }
@@ -7226,11 +7226,11 @@ pub fn Database(comptime config: Config) type {
                         const table = &self.tables[entry.table];
                         const version = &table.versions[entry.new];
                         const tag: change_log.Op = if (entry.kind == .insert) .insert else .update;
-                        try C.encodeRow(writer, tag, table.oid, table.rows[version.row - 1].rowid, S.versionValues(table, entry.new, &row_scratch));
+                        try C.encodeRow(writer, tag, table.oid, table.rows[version.rowSlot()].rowid, S.versionValues(table, entry.new, &row_scratch));
                     },
                     .delete => {
                         const table = &self.tables[entry.table];
-                        try C.encodeDelete(writer, table.oid, table.rows[table.versions[entry.old].row - 1].rowid);
+                        try C.encodeDelete(writer, table.oid, table.rows[table.versions[entry.old].rowSlot()].rowid);
                     },
                     .create_table => try C.encodeCreate(writer, &self.tables[entry.table]),
                     .drop_table => try C.encodeDrop(writer, self.tables[entry.table].oid),

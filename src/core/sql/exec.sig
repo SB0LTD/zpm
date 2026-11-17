@@ -4825,7 +4825,7 @@ pub fn Exec(comptime config: types.Config) type {
             const value = try E.eval(ctx, key);
             if (value == .null_value) return .empty;
             const version = S.lookupVersionAt(table, &value, snap) orelse return .empty;
-            return .{ .slot = .{ .row = table.versions[version].row - 1, .version = version } };
+            return .{ .slot = .{ .row = table.versions[version].rowSlot(), .version = version } };
         }
 
         /// Plain SELECT: candidates are emitted as read.
@@ -4912,8 +4912,8 @@ pub fn Exec(comptime config: types.Config) type {
             pub fn order(self: *const StableSorter, left: u32, right: u32) Error!i8 {
                 const result = try self.base.order(left, right);
                 if (result != 0) return result;
-                const a = self.base.table.versions[left].row;
-                const b = self.base.table.versions[right].row;
+                const a = self.base.table.versions[left].rowLink();
+                const b = self.base.table.versions[right].rowLink();
                 return if (a < b) -1 else if (a > b) 1 else 0;
             }
         };
@@ -4978,7 +4978,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const candidate: u32 = if (used < count) @intCast(used) else spare;
                 const entry = &entries[candidate];
                 entry.version = version;
-                entry.ordinal = table.versions[version].row;
+                entry.ordinal = table.versions[version].rowLink();
                 const full = used == count;
                 var relation: i8 = 0;
                 for (keys[0..query.order_count], 0..) |key, column| {

@@ -169,7 +169,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                 switch (entry.kind) {
                     .insert => {
                         const table = &db.tables[entry.table];
-                        const rowid = table.rows[table.versions[entry.new].row - 1].rowid;
+                        const rowid = table.rows[table.versions[entry.new].rowSlot()].rowid;
                         S.reclaimVersion(table, entry.new);
                         // Keep rowids dense when nothing allocated after this one.
                         if (table.next_rowid == rowid + 1) table.next_rowid = rowid;
@@ -253,7 +253,7 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// A version this transaction's TRUNCATE (command `cid`) marked and
         /// has not published.
         pub fn truncated(version: *const S.Version, tx: *const Tx, slot: usize, cid: u32) bool {
-            if (version.row == 0) return false;
+            if (version.rowLink() == 0) return false;
             const deletion = version.pendingDeletion() orelse return false;
             return deletion.tx.epoch == tx.epoch and deletion.tx.slot == slot and deletion.cid == cid;
         }
@@ -339,7 +339,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                         const copy = &db.tables[entry.table];
                         copy.pending_create = false;
                         for (copy.versions[0..copy.version_high]) |*version| {
-                            if (version.row == 0) continue;
+                            if (version.rowLink() == 0) continue;
                             if (version.pendingCreation()) |creation| {
                                 if (creation.tx.epoch == tx.epoch and creation.tx.slot == slot and creation.cid < entry.new) version.publishCreation(csn);
                             }
@@ -386,7 +386,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                 if (!table.live or table.dead_csn != 0) continue;
                 const version = &table.versions[entry.old];
                 const deletion_csn = version.deletionCsn();
-                if (version.row == 0 or deletion_csn == 0 or deletion_csn > horizon) continue;
+                if (version.rowLink() == 0 or deletion_csn == 0 or deletion_csn > horizon) continue;
                 S.reclaimVersion(table, entry.old);
                 budget -= 1;
             }
