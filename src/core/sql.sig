@@ -4902,7 +4902,7 @@ pub fn Database(comptime config: Config) type {
 
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
             if (view == .pg_database) {
-                const provider = self.catalog.databases orelse return error.UndefinedTable;
+                const provider = self.catalog.databases orelse return error.TableNotFound;
                 for (0..provider.capacity) |index| {
                     const entry = provider.row(provider.context, index) orelse continue;
                     try sink.add(&.{ intCell(entry.oid), nameCell(entry.name), intCell(entry.owner) });
