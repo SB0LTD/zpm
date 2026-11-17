@@ -659,6 +659,17 @@ pub fn Database(comptime config: Config) type {
                 snapshot: Snapshot,
             };
             const Plan=union(enum){simple:B.Select,general:u16,primary_key:PrimaryKeyPlan};
+            pub const primary_key_source_capacity = 256;
+            /// The retained plan's projected columns and result metadata are
+            /// independent of the AST workspace and own their template bytes.
+            const CachedPrimaryKey = struct {
+                source: [primary_key_source_capacity]u8 = undefined,
+                len: usize,
+                database: *const Self,
+                plan: PrimaryKeyPlan,
+            };
+            cached_primary_key: ?CachedPrimaryKey = null,
+            primary_key_cache_hits: usize = 0,
             workspace:Workspace=.{},
             session:value_module.Session=.{},
             dialect:Dialect=.postgres,
@@ -787,6 +798,22 @@ pub fn Database(comptime config: Config) type {
                     .smallint, .integer32, .integer => {},
                     else => return false,
                 }
+                if (self.cached_primary_key) |*cached| {
+                    if (cached.database == db and snapshotMatches(cached.plan.snapshot, snapshot) and
+                        self.primaryKeyTableCurrent(db, &cached.plan) and cached.plan.data_type == parameter and
+                        types.same(cached.source[0..cached.len], source))
+                    {
+                        try self.validate(db, source, null);
+                        try self.session.checkpoint();
+                        self.database = db;
+                        self.source = source;
+                        self.effective = source;
+                        self.snapshot = snapshot;
+                        self.prepared = .{ .primary_key = cached.plan };
+                        self.primary_key_cache_hits +%= 1;
+                        return true;
+                    }
+                }
                 var params: B.Parameters = .{ .count = 1 };
                 params.types[0] = types.typeOfData(parameter);
                 // As with SQL PREPARE, bind types before runtime values exist.
@@ -818,7 +845,7 @@ pub fn Database(comptime config: Config) type {
                     if (!directColumn(item, table.column_count)) return false;
                     projection[position] = item.column;
                 }
-                self.prepared = .{ .primary_key = .{
+                const plan: PrimaryKeyPlan = .{
                     .select = select,
                     .projection = projection,
                     .column = primary,
@@ -827,13 +854,33 @@ pub fn Database(comptime config: Config) type {
                     .role = self.session.role,
                     .prepared_csn = db.csn,
                     .snapshot = snapshot,
-                } };
+                };
+                self.prepared = .{ .primary_key = plan };
+                if (source.len <= primary_key_source_capacity) {
+                    self.cached_primary_key = .{ .len=source.len, .database=db, .plan=plan };
+                    @memcpy(self.cached_primary_key.?.source[0..source.len], source);
+                }
                 return true;
             }
 
+            /// An installed plan must match the owned template and parameter
+            /// supplied by the current portal, before checking the snapshot.
+            pub fn primaryKeyMatches(self: *const Context, source: []const u8, parameter: DataType) bool {
+                const plan = if (self.prepared) |*prepared| prepared else return false;
+                return plan.* == .primary_key and plan.primary_key.data_type == parameter and types.same(self.source, source);
+            }
+
+            fn snapshotMatches(cached: Snapshot, current: Snapshot) bool {
+                return current.epoch == 0 and cached.epoch == 0 and cached.csn == current.csn and
+                    cached.slot == current.slot and cached.cid == current.cid;
+            }
+
             fn primaryKeyCurrent(self: *const Context, db: *const Self, snapshot: Snapshot, plan: *const PrimaryKeyPlan) bool {
-                if (self.database != db or plan.prepared_csn != db.csn or self.session.role != plan.role or self.dialect != .postgres) return false;
-                if (snapshot.epoch != 0 or snapshot.csn != plan.snapshot.csn or snapshot.slot != plan.snapshot.slot or snapshot.cid != plan.snapshot.cid) return false;
+                return self.database == db and snapshotMatches(plan.snapshot, snapshot) and self.primaryKeyTableCurrent(db, plan);
+            }
+
+            fn primaryKeyTableCurrent(self: *const Context, db: *const Self, plan: *const PrimaryKeyPlan) bool {
+                if (plan.prepared_csn != db.csn or self.session.role != plan.role or self.dialect != .postgres) return false;
                 const table = &db.tables[plan.select.table.?];
                 return table.live and table.oid == plan.oid and table.primary_column == plan.column and
                     table.columns[plan.column].data_type == plan.data_type;

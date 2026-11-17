@@ -3,6 +3,7 @@
 //! Configure SCRAM before startup for credential authentication. Trust mode is
 //! intended only for a caller that explicitly binds to a trusted interface.
 //! SQL semantics are those provided by DB; unsupported features return SQLSTATE.
+const std = @import("std");
 const scram = @import("scram");
 const sql = @import("sql");
 const pg_types = @import("pg_types.sig");
@@ -162,6 +163,9 @@ const Writer = struct {
 pub fn Session(comptime DB: type) type {
     const T = pg_types.Types(DB.Result);
     const has_copy = @hasDecl(DB, "copyBegin");
+    const has_primary_key = @hasDecl(DB, "executeDetachedPrimaryKey") and
+        (if (@hasDecl(DB, "detached_primary_key")) DB.detached_primary_key else true);
+    const primary_key_sql_capacity = 256;
     const CopyInfo = if (has_copy) DB.CopyInfo else struct {};
     const line_bytes: usize = if (has_copy) DB.copy_line_bytes else 1;
     const field_capacity: usize = if (has_copy) (CopyInfo{}).types.len else 1;
@@ -220,7 +224,21 @@ pub fn Session(comptime DB: type) type {
                 return self.sql[0..self.len];
             }
         };
+        pub const DetachedPrimaryKey = struct { source: []const u8, oid: u32, key: ?i64 };
+        const PrimaryKeyInput = struct {
+            // One small additional buffer per portal. Larger templates keep
+            // the existing rendered-SQL execution path.
+            sql: [primary_key_sql_capacity]u8 = undefined,
+            len: usize,
+            oid: u32,
+            key: ?i64,
+
+            fn proposal(self: *const PrimaryKeyInput) DetachedPrimaryKey {
+                return .{ .source = self.sql[0..self.len], .oid = self.oid, .key = self.key };
+            }
+        };
         const Portal = struct {
+            primary_key: if (has_primary_key) ?PrimaryKeyInput else void = if (has_primary_key) null else {},
             live: bool = false,
             name: Name = .{},
             sql: [sql_capacity]u8 = @splat(0),
@@ -298,10 +316,36 @@ pub fn Session(comptime DB: type) type {
         /// an independent read-only context and reject unsupported plans first.
         /// Session ownership, database immutability, private Describe support,
         /// idle autocommit state and output capacity remain caller obligations.
+        fn detachedReady(self: *const Self) bool {
+            return self.startup and !self.failed and self.copy.mode==.none and self.active_portal==null and
+                self.oversize_remaining==0 and (self.authentication==null or self.authentication.?.state==.complete);
+        }
         pub fn detachedCandidate(self:*Self,input:[]const u8) ?DetachedCandidate {
-            if(!self.startup or self.failed or self.copy.mode!=.none or self.active_portal!=null or self.oversize_remaining!=0 or
-                (self.authentication!=null and self.authentication.?.state!=.complete)) return null;
+            if(!self.detachedReady()) return null;
             return self.detachedFrame(input) catch null;
+        }
+
+        /// Additional scheduling hint for unlimited Execute. Portal storage
+        /// owns the template through the complete handler call. It does not
+        /// authorize execution or replace the rendered-SQL fallback.
+        pub fn detachedPrimaryKey(self: *Self, input: []const u8) ?DetachedPrimaryKey {
+            if (comptime !has_primary_key) return null;
+            if (!self.detachedReady() or input.len < 5 or input[0] != 'E') return null;
+            const size = read32(input[1..5]);
+            if (size < 4 or size > max_packet or @as(usize,size)+1 > input.len) return null;
+            var r: Reader = .{.bytes=input[5..@as(usize,size)+1]};
+            const frame = self.executeFrame(&r) catch return null;
+            if (frame.limit != 0 or frame.portal.complete) return null;
+            if (frame.portal.primary_key) |*key| return key.proposal();
+            return null;
+        }
+
+        fn executeFrame(self: *Self, r: *Reader) !struct { portal: *Portal, limit: u32 } {
+            const name = try r.string();
+            const limit = try r.u32be();
+            try r.done();
+            if (limit > 0x7fffffff) return error.ProtocolViolation;
+            return .{ .portal = try self.portal(name), .limit = limit };
         }
         fn detachedFrame(self:*Self,input:[]const u8) !?DetachedCandidate {
             if(input.len<5) return null;
@@ -329,9 +373,9 @@ pub fn Session(comptime DB: type) type {
                     return null;
                 },
                 'E'=>{
-                    const name=try r.string();const limit=try r.u32be();try r.done();
-                    if(limit!=0) return null; // suspended portals retain their owner
-                    const portal_value=try self.portal(name);
+                    const frame=try self.executeFrame(&r);
+                    if(frame.limit!=0) return null; // suspended portals retain their owner
+                    const portal_value=frame.portal;
                     if(portal_value.complete) return .metadata;
                     return .{.execute=portal_value.source()};
                 },
@@ -613,11 +657,9 @@ pub fn Session(comptime DB: type) type {
                     } else return error.ProtocolViolation;
                 },
                 'E' => {
-                    const name = try r.string();
-                    const limit = try r.u32be();
-                    try r.done();
-                    if (limit > 0x7fffffff) return error.ProtocolViolation;
-                    const p = try self.portal(name);
+                    const frame = try self.executeFrame(&r);
+                    const limit = frame.limit;
+                    const p = frame.portal;
 
                     const index = (@intFromPtr(p) - @intFromPtr(&self.portals[0])) / @sizeOf(Portal);
                     if (self.active_portal) |active| {
@@ -628,7 +670,7 @@ pub fn Session(comptime DB: type) type {
                         return false;
                     }
                     if (self.active_portal == null) {
-                        try self.execute(db, p.source());
+                        try self.executePortal(db, p, limit);
                         self.active_portal = index;
                         p.row = 0;
                         p.result_rows = self.result.row_count;
@@ -682,6 +724,18 @@ pub fn Session(comptime DB: type) type {
             }
             return false;
         }
+        fn executePortal(self: *Self, db: *DB, portal_value: *const Portal, limit: u32) !void {
+            if (comptime has_primary_key) if (limit == 0) {
+                if (portal_value.primary_key) |*key| {
+                    if (try db.executeDetachedPrimaryKey(key.proposal().source, key.oid, key.key, portal_value.source(), &self.result)) {
+                        self.commit_rolled_back = false;
+                        return;
+                    }
+                }
+            };
+            return self.execute(db, portal_value.source());
+        }
+
         fn execute(self: *Self, db: *DB, source: []const u8) !void {
             self.result.column_count = 0;
             self.result.row_count = 0;
@@ -1313,6 +1367,8 @@ pub fn Session(comptime DB: type) type {
             var literals: [sql_capacity]u8 = undefined;
             var values: [parameter_capacity][]const u8 = undefined;
             var l: Writer = .{ .bytes = &literals };
+            var key: ?i64 = null;
+            var key_candidate = has_primary_key and count == 1 and integralParameter(s.oids[0]) and s.len <= primary_key_sql_capacity;
             for (0..count) |i| {
                 const begin = l.at;
                 const size = try r.u32be();
@@ -1322,6 +1378,9 @@ pub fn Session(comptime DB: type) type {
                     if (T.handles(s.oids[i])) {
                         l.at += T.literal(bytes, s.oids[i], fmt, l.bytes[l.at..]) catch |err| return if (err == error.BufferTooSmall) error.StatementCapacity else err;
                     } else try literal(&l, bytes, s.oids[i], fmt);
+                    if (key_candidate) {
+                        if (primaryKeyNumber(bytes, s.oids[i], fmt)) |number| key = number else key_candidate = false;
+                    }
                 }
                 values[i] = l.bytes[begin..l.at];
             }
@@ -1358,6 +1417,10 @@ pub fn Session(comptime DB: type) type {
             p.name=next.name;p.len=next.len;p.format_count=next.format_count;p.level=next.level;
             @memcpy(p.sql[0..next.len],next.sql[0..next.len]);
             @memcpy(p.formats[0..next.format_count],next.formats[0..next.format_count]);
+            if (comptime has_primary_key) {
+                p.primary_key = if (key_candidate) .{ .len = s.len, .oid = s.oids[0], .key = key } else null;
+                if (p.primary_key) |*bound_key| @memcpy(bound_key.sql[0..s.len], s.source());
+            }
             p.row=0;p.complete=false;p.result_rows=0;p.affected=0;p.rolled_back=false;p.command="";p.live=true;
             try w.empty('2');
         }
@@ -1857,17 +1920,35 @@ fn quoted(w: *Writer, bytes: []const u8) !void {
     }
     try w.byte('\'');
 }
+fn integralParameter(oid: u32) bool {
+    return oid == 20 or oid == 21 or oid == 23;
+}
+
+fn binaryInteger(bytes: []const u8, oid: u32) !i64 {
+    const count: usize = if (oid == 20) 8 else if (oid == 21) 2 else 4;
+    if (bytes.len != count) return error.ProtocolViolation;
+    var bits: u64 = if (bytes[0] & 128 != 0) 0xffffffffffffffff else 0;
+    for (bytes) |b| bits = (bits << 8) | b;
+    return @bitCast(bits);
+}
+
+fn primaryKeyNumber(bytes: []const u8, oid: u32, format: u16) ?i64 {
+    if (format == 1) return binaryInteger(bytes, oid) catch null;
+    // The ordinary literal path already enforces integerText. Only values
+    // that fit their declared SQL type are eligible for the typed route.
+    const value = std.fmt.parseInt(i64, bytes, 10) catch return null;
+    if (oid == 21 and (value < -32768 or value > 32767)) return null;
+    if (oid == 23 and (value < -2147483648 or value > 2147483647)) return null;
+    return value;
+}
+
 fn literal(w: *Writer, bytes: []const u8, oid: u32, format: u16) !void {
     if (format == 1) {
         if (oid == 16) {
             if (bytes.len != 1 or bytes[0] > 1) return error.ProtocolViolation;
             try w.append(if (bytes[0] == 1) "TRUE" else "FALSE");
-        } else if (oid == 20 or oid == 21 or oid == 23) {
-            const count: usize = if (oid == 20) 8 else if (oid == 21) 2 else 4;
-            if (bytes.len != count) return error.ProtocolViolation;
-            var bits: u64 = if (bytes[0] & 128 != 0) 0xffffffffffffffff else 0;
-            for (bytes) |b| bits = (bits << 8) | b;
-            const value: i64 = @bitCast(bits);
+        } else if (integralParameter(oid)) {
+            const value = try binaryInteger(bytes, oid);
             // NET-01: a negative is `(-5)`, so `x-$1` never becomes `x--5`
             // (a comment) and `$1::text` casts the whole value.
             if (value < 0) try w.byte('(');
