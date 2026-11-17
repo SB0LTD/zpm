@@ -1091,7 +1091,7 @@ pub const SettingValue = struct {
 /// Transaction control and session commands; executed by the store, never
 /// by a single statement.
 pub const Control = union(enum) {
-    vacuum: struct { schema: ?Ident, name: Ident },
+    maintenance: struct { operation: enum { vacuum, analyze }, schema: ?Ident, name: Ident },
     begin: Characteristics,
     commit: void,
     rollback: void,
