@@ -1,0 +1,95 @@
+name: TLS record qualification (Sig 0.6.5)
+
+on:
+  push:
+    branches: [ci/tls-record-main-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASELINE: 4568cb00ac5e1b309142d4a5dd88ec75e8da818a
+      CANDIDATE: bc6cbb7924dbbabbfdb16e26a0e66964e9393c6d
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 8
+          persist-credentials: false
+      - name: Install checksum-verified Sig compiler and standard library
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/sdk" evidence
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-x86_64-linux.tar.xz"
+          url="https://github.com/SB0LTD/sig/releases/download/$tag/$asset"
+          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/$asset"
+          echo "179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a  $RUNNER_TEMP/$asset" | sha256sum -c | tee evidence/sdk-checksum.log
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig -print -quit)
+          standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' -print -quit)
+          test -x "$compiler"
+          test -f "$standard"
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+          { printf 'sdk=%s\n' "$url"; "$compiler" version; sha256sum "$compiler"; } | tee evidence/sdk.log
+      - name: Run the existing TLS protocol suite and the exact record tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$CANDIDATE" HEAD
+          test "$(git rev-parse "$CANDIDATE~2")" = "$BASELINE"
+          printf 'workflow=%s\nbaseline=%s\ncandidate=%s\n' "$GITHUB_SHA" "$BASELINE" "$CANDIDATE" | tee evidence/source.log
+          git worktree add --detach "$RUNNER_TEMP/baseline" "$BASELINE"
+          git worktree add --detach "$RUNNER_TEMP/candidate" "$CANDIDATE"
+          for test_suite in baseline candidate record; do
+            revision="$test_suite"
+            entry=tls
+            if [[ "$test_suite" == record ]]; then
+              revision=candidate
+              entry=record
+            fi
+            core="$RUNNER_TEMP/$revision/src/core"
+            crypto="$core/crypto"
+            "$SIG" test -OReleaseSafe --Sig-lib-dir "$SIG_LIB_DIR" \
+              --cache-dir "$RUNNER_TEMP/cache-$test_suite" \
+              --global-cache-dir "$RUNNER_TEMP/global-cache" \
+              --dep sha256 --dep p256 --dep p384 --dep hkdf --dep gcm \
+              --dep chacha20poly1305 --dep x25519 --dep tls13_keys \
+              "-Mroot=$crypto/tls/$entry.sig" \
+              --dep sig_mem --dep sig_testing "-Msha256=$core/sha256.sig" \
+              --dep sha256 --dep hmac "-Mp256=$crypto/p256.sig" \
+              "-Mp384=$crypto/p384.sig" \
+              --dep hmac "-Mhkdf=$crypto/hkdf.sig" \
+              --dep aes "-Mgcm=$crypto/gcm.sig" \
+              "-Mchacha20poly1305=$crypto/chacha20poly1305.sig" \
+              "-Mx25519=$crypto/x25519.sig" \
+              --dep sha256 --dep hkdf --dep hmac "-Mtls13_keys=$crypto/tls13_keys.sig" \
+              "-Msig_mem=$core/sig_mem.sig" "-Msig_testing=$core/sig_testing.sig" \
+              --dep sha256 "-Mhmac=$crypto/hmac.sig" "-Maes=$crypto/aes.sig" \
+              2>&1 | tee "evidence/$test_suite.log"
+            grep -E '^All [1-9][0-9]* tests passed\.$' "evidence/$test_suite.log"
+          done
+          for revision in baseline candidate; do
+            grep -F 'a server choosing secp256r1 completes the handshake' "evidence/$revision.log"
+            sed -nE 's/^[0-9]+\/[0-9]+ (.*)\.\.\.OK$/\1/p' "evidence/$revision.log" | sort > "evidence/$revision-tests.log"
+            test -s "evidence/$revision-tests.log"
+          done
+          comm -23 evidence/baseline-tests.log evidence/candidate-tests.log | tee evidence/missing-tests.log
+          test ! -s evidence/missing-tests.log
+          for expected in \
+            'record framing reports every partial prefix and the first coalesced record' \
+            'RFC 8448 simple 1-RTT application records match in both directions' \
+            'protected records authenticate before exposing padded application bytes' \
+            'protected records enforce the exact frame and authenticated content shape' \
+            'record lengths, secrets and key-use boundaries fail before sealing'; do
+            grep -F "$expected...OK" evidence/record.log
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: tls-record-qualification
+          path: evidence/
