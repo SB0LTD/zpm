@@ -975,7 +975,7 @@ fn authStartup(s: anytype, db: anytype, username: []const u8) !void {
     try check((try frames.next()) == null);
     try check(s.authentication.?.state == .initial);
 }
-fn authFirst(s: anytype, db: anytype) !void {
+fn authChallenge(s: anytype, db: anytype) ![]const u8 {
     var p = Packet.init('p');
     p.string(scram.mechanism);
     p.number32(scram_first.len);
@@ -990,8 +990,11 @@ fn authFirst(s: anytype, db: anytype) !void {
     var frames: Frames = .{ .bytes = output[0..reply.written] };
     const challenge = (try frames.next()) orelse return error.MissingChallenge;
     try check(challenge.tag == 'R' and u32be(challenge.body[0..4]) == 11);
-    try check(equal(challenge.body[4..], "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"));
     try check((try frames.next()) == null);
+    return challenge.body[4..];
+}
+fn authFirst(s: anytype, db: anytype) !void {
+    try check(equal(try authChallenge(s, db), "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"));
 }
 fn authenticationContracts() !void {
     var db: DB = .{};
@@ -1241,6 +1244,77 @@ fn roleAuthenticationContracts() !void {
     admin.disconnect();
 }
 
+fn multiRoleAuthenticationContracts() !void {
+    // RFC transcript mechanics with a different test password and salt for the
+    // second verifiable role. Both use the same intentionally fixed nonce.
+    const other_verifier = "SCRAM-SHA-256$4096:MDEyMzQ1Njc4OWFiY2RlZg==$GMpbT//rWKObQbSawPqvfUW4OmH321xfwSWfNehMw/Y=:5IIYX4OfSJA40uDIkR6wxPZaiTGxtpp9DmOzzZ+mWvU=";
+    const other_challenge = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=MDEyMzQ1Njc4OWFiY2RlZg==,i=4096";
+    const other_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=uWcRpP4Hd5GzkYzar749UqtUeVO8SfcFOV/MQSJVRfc=";
+    const verifiers = [_]scram.Verifier{
+        try scram.Verifier.parse("wire_reader", scram_verifier),
+        try scram.Verifier.parse("WireOther", other_verifier),
+    };
+    const credentials = try scram.Credentials.init(&verifiers, @splat(0x67));
+    var store: Store = .{};
+    var admin: Store.Connection = .{ .store = &store, .id = 1 };
+    defer admin.disconnect();
+    var result: Raw.Result = .{};
+    try admin.execute("CREATE ROLE wire_reader LOGIN", &result);
+    try admin.execute("CREATE ROLE \"WireOther\" LOGIN", &result);
+    try admin.execute("CREATE TABLE auth_rows (id INT PRIMARY KEY)", &result);
+    try admin.execute("INSERT INTO auth_rows VALUES (7)", &result);
+    try admin.execute("GRANT SELECT ON auth_rows TO wire_reader", &result);
+
+    for (&verifiers, [_][]const u8{ scram_final, other_final }, 0..) |*verifier, proof, index| {
+        var conn: Store.Connection = .{ .store = &store, .id = 2 };
+        defer conn.disconnect();
+        var session: StoreSession = .{};
+        try session.configureRoleCredentials(&credentials, scram_nonce);
+        try authStartup(&session, &conn, verifier.identity());
+        if (index == 0) try authFirst(&session, &conn) else try check(equal(try authChallenge(&session, &conn), other_challenge));
+        var final = Packet.init('p');
+        final.append(proof);
+        const reply = try storeSend(&session, &conn, &final);
+        try check(!reply.close and session.authentication.?.state == .complete);
+        try tags(store_output[0..reply.written], "RRSSSSSSSSSKZ");
+        try tags(try storeQuery(&session, &conn, "SELECT current_user,session_user"), "TDCZ");
+        try check(equal(session.result.rows[0].cells[0].text.slice(), verifier.identity()));
+        try check(equal(session.result.rows[0].cells[1].text.slice(), verifier.identity()));
+        const read = try storeQuery(&session, &conn, "SELECT id FROM auth_rows");
+        if (index == 0) try tags(read, "TDCZ") else try state(read, "42501");
+    }
+
+    var wrong: [128]u8 = undefined;
+    var wrong_len: usize = 0;
+    for ([_][]const u8{ "wire_reader", "wireother", "WireOther" }, 0..) |username, index| {
+        var conn: Store.Connection = .{ .store = &store, .id = 2 };
+        defer conn.disconnect();
+        var session: StoreSession = .{};
+        try session.configureRoleCredentials(&credentials, scram_nonce);
+        try authStartup(&session, &conn, username);
+        const challenge = try authChallenge(&session, &conn);
+        try check(challenge.len == other_challenge.len and std.mem.endsWith(u8, challenge, ",i=4096"));
+        if (index == 1) try check(!equal(challenge, other_challenge));
+        if (index == 2) try admin.execute("ALTER ROLE \"WireOther\" NOLOGIN", &result);
+        var final = Packet.init('p');
+        final.append(other_final);
+        const reply = try storeSend(&session, &conn, &final);
+        const bytes = store_output[0..reply.written];
+        try check(reply.close and session.authentication.?.state == .failed);
+        try state(bytes, "28P01");
+        try tags(bytes, "E");
+        if (index == 0) {
+            wrong_len = bytes.len;
+            @memcpy(wrong[0..wrong_len], bytes);
+        } else try check(equal(wrong[0..wrong_len], bytes));
+    }
+
+    var invalid: StoreSession = .{};
+    if (invalid.configureRoleCredentials(&credentials, "short")) |_| return error.InvalidNonceAccepted else |err| try check(err == error.InvalidNonce);
+    const closed = try invalid.handle(&admin, "", &store_output);
+    try check(closed.close and closed.written == 0);
+}
+
 // READ COMMITTED wire behavior over the real store: BackendKeyData,
 // CancelRequest keys, startup options, control-command tags, SHOW rows, a
 // parked Execute reported as blocked, and ROLLBACK TO closing newer portals.
@@ -1463,6 +1537,7 @@ pub fn main(init: std.process.Init) !void {
     try detachedCandidates();
     try oversizedFrames();
     try roleAuthenticationContracts();
+    try multiRoleAuthenticationContracts();
     try storeContracts();
     try returningOnce();
     try characterDescriptions();

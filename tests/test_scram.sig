@@ -103,6 +103,71 @@ fn positiveVariants() !void {
     try check((try server.finish(response, &output)).len == 46 and server.state == .complete);
 }
 
+fn credentialLists() !void {
+    const second = try scram.Verifier.fromPassword("\xc3\xa9diteur", "second password", "0123456789abcdef", 4096);
+    var encoded: [512]u8 = undefined;
+    var source: [1024]u8 = undefined;
+    var storage: [2]scram.Verifier = undefined;
+    const record = "user\t" ++ native_verifier;
+    for ([_][]const u8{ "", "\n", "\r\n" }) |ending| {
+        const text = try std.fmt.bufPrint(&source, "{s}\r\n{s}\t{s}{s}", .{ record, second.identity(), try second.format(&encoded), ending });
+        const parsed = try scram.parseVerifierList(text, &storage);
+        try check(parsed.len == 2 and eq(parsed[0].identity(), "user") and eq(parsed[1].identity(), second.identity()));
+        try check(eq(&parsed[1].stored_key, &second.stored_key));
+        try rejects(error.BufferTooSmall, scram.parseVerifierList(text, storage[0..1]));
+    }
+    for ([_][]const u8{
+        "", "\n", "user", "user " ++ native_verifier, "\t" ++ native_verifier,
+        "bad\x00user\t" ++ native_verifier, "bad\ruser\t" ++ native_verifier,
+        "\xc3\xff\t" ++ native_verifier, record ++ "\r", record ++ "\n\n",
+        record ++ "\t", record ++ "\ntrailing",
+    }) |text| try rejects(error.InvalidVerifier, scram.parseVerifierList(text, &storage));
+
+    storage = .{ try verifier(), second };
+    const secret: [32]u8 = @splat(0x65);
+    try rejects(error.InvalidVerifier, scram.Credentials.init(storage[0..0], secret));
+    try rejects(error.InvalidVerifier, scram.Credentials.init(&storage, @splat(0)));
+    try rejects(error.InvalidVerifier, scram.Credentials.init(&.{ storage[0], storage[0] }, secret));
+    var mixed = second;
+    mixed.iterations += 1;
+    try rejects(error.InvalidVerifier, scram.Credentials.init(&.{ storage[0], mixed }, secret));
+    mixed = second;
+    mixed.salt_len += 1;
+    try rejects(error.InvalidVerifier, scram.Credentials.init(&.{ storage[0], mixed }, secret));
+
+    const credentials = try scram.Credentials.init(&storage, secret);
+    const replica = try scram.Credentials.init(&storage, secret);
+    const rotated = try scram.Credentials.init(&storage, @splat(0x66));
+    var server = try scram.Server.initUnselected(nonce);
+    var output: [512]u8 = undefined;
+    try rejects(error.AuthenticationState, server.start(first, &output));
+    server = try scram.Server.initUnselected(nonce);
+    try server.selectCredentials(&credentials, second.identity());
+    try rejects(error.AuthenticationState, server.selectCredentials(&credentials, "user"));
+    const server_first = try server.start(first, &output);
+    var final_buffer: [1024]u8 = undefined;
+    const response = try clientFinal(&second, "second password", first[3..], server_first, "biws", server.combined_nonce[0..server.combined_nonce_len], "", &final_buffer);
+    try check((try server.finish(response, &output)).len == 46 and server.state == .complete);
+
+    var last_salt: [64]u8 = undefined;
+    for ([_]*const scram.Credentials{ &credentials, &replica, &rotated }, 0..) |configured, index| {
+        const fresh_nonce = if (index == 0) nonce else "different-valid-server-nonce";
+        server = try scram.Server.initUnselected(fresh_nonce);
+        try server.selectCredentials(configured, "User");
+        try check(!server.identity_matches and server.verifier.salt_len == second.salt_len and server.verifier.iterations == second.iterations);
+        if (index == 0) last_salt = server.verifier.salt else try check(eq(&last_salt, &server.verifier.salt) == (index == 1));
+        try check(!eq(&server.verifier.salt, &storage[0].salt) and !eq(&server.verifier.salt, &second.salt));
+        const mock = server.verifier;
+        const mock_first = try server.start(first, &output);
+        const mock_response = try clientFinal(&mock, "guessed password", first[3..], mock_first, "biws", server.combined_nonce[0..server.combined_nonce_len], "", &final_buffer);
+        try rejects(error.AuthenticationFailed, server.finish(mock_response, &output));
+        try check(server.state == .failed);
+    }
+    server = try scram.Server.initUnselected(nonce);
+    try server.selectCredentials(&credentials, "AnotherUser");
+    try check(!eq(&last_salt, &server.verifier.salt));
+}
+
 fn credentialFailures() !void {
     const v = try verifier();
     var output: [512]u8 = undefined;
@@ -207,6 +272,7 @@ fn fuzz() !void {
 pub fn main(init: std.process.Init) !void {
     try rfcVector();
     try positiveVariants();
+    try credentialLists();
     try credentialFailures();
     try invalidConfiguration();
     try malformed();
