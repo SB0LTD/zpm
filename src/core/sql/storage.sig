@@ -964,7 +964,7 @@ pub fn Storage(comptime config: types.Config) type {
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
             for (source.versions[0..source.version_high], destination.versions[0..source.version_high], 0..) |*from, *to, version| {
                 to.* = from.*;
-                if (from.row != 0) relayoutVersion(destination, source, version, sources, fills);
+                if (from.rowLink() != 0) relayoutVersion(destination, source, version, sources, fills);
             }
             rebuildIndexes(destination);
             rebuildHints(destination);
