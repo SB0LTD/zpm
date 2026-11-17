@@ -1025,20 +1025,28 @@ pub fn Database(comptime config: Config) type {
             fn overlaps(a:StorageSpan,b:StorageSpan) bool {
                 return a.start<a.end and b.start<b.end and a.start<b.end and b.start<a.end;
             }
-            fn disjointParts(parts: []const StorageSpan, backing_span: StorageSpan) Error!void {
-                if (backing_span.start == backing_span.end) return;
+            fn disjointParts(parts: []const StorageSpan, bounds: StorageSpan, backing_span: StorageSpan) Error!void {
+                if (!overlaps(bounds, backing_span)) return;
                 for (parts) |part| if (overlaps(part, backing_span)) return error.InvalidParameterValue;
             }
             fn disjointDatabase(db: *const Self, parts: []const StorageSpan) Error!void {
-                try disjointParts(parts, try objectSpan(db));
+                // A backing range outside the bounds misses every caller range.
+                // An intersection with the bounds still needs the exact check.
+                var bounds: StorageSpan = .{ .start = ~@as(usize, 0), .end = 0 };
+                for (parts) |part| {
+                    if (part.start == part.end) continue;
+                    bounds.start = @min(bounds.start, part.start);
+                    bounds.end = @max(bounds.end, part.end);
+                }
+                try disjointParts(parts, bounds, try objectSpan(db));
                 if (comptime config.external_workspace) {
-                    try disjointParts(parts, try StorageSpan.of(db.workspace.query.cells[0..]));
+                    try disjointParts(parts, bounds, try StorageSpan.of(db.workspace.query.cells[0..]));
                 }
                 if (comptime config.external_storage) {
-                    try disjointParts(parts, try StorageSpan.of(db.workspace.query.refs[0..]));
+                    try disjointParts(parts, bounds, try StorageSpan.of(db.workspace.query.refs[0..]));
                 }
                 for (&db.tables) |*table| inline for (storage_fields) |name| {
-                    try disjointParts(parts, try StorageSpan.of(@field(table, name)[0..]));
+                    try disjointParts(parts, bounds, try StorageSpan.of(@field(table, name)[0..]));
                 };
             }
             fn validate(self:*Context,db:*const Self,source:[]const u8,result:?*Result) Error!void {
