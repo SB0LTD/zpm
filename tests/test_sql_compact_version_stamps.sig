@@ -26,11 +26,15 @@ const refs = 64;
 
 var live: Compact = .{};
 var replay: Standard = .{};
+var packed_replay: Compact = .{};
 var live_memory: [8192]u8 align(64) = undefined;
 var replay_memory: [8192]u8 align(64) = undefined;
+var packed_replay_memory: [8192]u8 align(64) = undefined;
 var live_result: Compact.Result = .{};
 var replay_result: Standard.Result = .{};
 var replay_scratch: Standard.ReplayScratch = .{};
+var packed_replay_result: Compact.Result = .{};
+var packed_replay_scratch: Compact.ReplayScratch = .{};
 var changes: [8192]u8 = undefined;
 var assertions: usize = 0;
 
@@ -46,17 +50,27 @@ fn change(statement: []const u8) !void {
     var used: usize = 0;
     try live.executeChanges(statement, &live_result, &changes, &used, null, null);
     try replay.applyChangeRecord(changes[0..used], &replay_scratch);
+    const previous_csn = packed_replay.csn;
+    const previous_slots = packed_replay.tables[0].row_used;
+    if (packed_replay.applyChangeRecord(changes[0 .. used - 1], &packed_replay_scratch)) |_|
+        return error.TruncatedChangeAccepted
+    else |err| try check(err == error.InvalidChangeRecord);
+    try check(packed_replay.csn == previous_csn and packed_replay.tables[0].row_used == previous_slots);
+    try packed_replay.applyChangeRecord(changes[0..used], &packed_replay_scratch);
 }
 
 fn exactRows() !void {
     const source = "SELECT id,amount FROM ledger ORDER BY id";
     try live.execute(source, &live_result);
     try replay.execute(source, &replay_result);
-    try check(live_result.row_count == replay_result.row_count);
-    for (live_result.rows[0..live_result.row_count], replay_result.rows[0..replay_result.row_count]) |left, right| {
-        try check(left.cells[0].integer == right.cells[0].integer);
-        try check((left.cells[1] == .null_value and right.cells[1] == .null_value) or
-            (left.cells[1] == .integer and right.cells[1] == .integer and left.cells[1].integer == right.cells[1].integer));
+    try packed_replay.execute(source, &packed_replay_result);
+    inline for (.{ &replay_result, &packed_replay_result }) |other| {
+        try check(live_result.row_count == other.row_count);
+        for (live_result.rows[0..live_result.row_count], other.rows[0..other.row_count]) |left, right| {
+            try check(left.cells[0].integer == right.cells[0].integer);
+            try check((left.cells[1] == .null_value and right.cells[1] == .null_value) or
+                (left.cells[1] == .integer and right.cells[1] == .integer and left.cells[1].integer == right.cells[1].integer));
+        }
     }
 }
 
@@ -102,8 +116,10 @@ pub fn main() !void {
     try check(standard_size - compact_size == 16 * 12);
     @memset(&live_memory, 0xa5);
     @memset(&replay_memory, 0x5a);
+    @memset(&packed_replay_memory, 0xcc);
     try live.bindMemoryFor(live_memory[0..compact_size], compact_banks, refs);
     try replay.bindMemoryFor(replay_memory[0..standard_size], standard_banks, refs);
+    try packed_replay.bindMemoryFor(packed_replay_memory[0..compact_size], compact_banks, refs);
 
     try change("CREATE TABLE ledger(id INT PRIMARY KEY, amount BIGINT)");
     try change("INSERT INTO ledger VALUES (1,10),(2,20),(4,NULL)");
