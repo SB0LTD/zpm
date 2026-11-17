@@ -1379,17 +1379,37 @@ pub fn Database(comptime config: Config) type {
                 const db=context.database orelse return error.InvalidParameterValue;
                 return db.fillViewRows(&context.session,context.snapshot,&context.workspace.nodes,view,sink);
             }
-            /// Conservative routing hint for callers with a mutable named-zone
-            /// cache. Typed temporal values use the immutable session zone;
-            /// dynamic zone names/text timestamp input may require a resolver.
-            pub fn needsZoneResolver(self:*const Context) bool {
-                for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| {
-                    if(node.kind==.at_zone) return true;
-                    if(node.kind==.cast and (node.ty==.timestamp or node.ty==.timestamptz)) {
-                        if(node.a==ast.none) return true;
-                        switch(self.workspace.nodes.nodes[node.a].ty){.unknown,.text,.name=>return true,else=>{}}
-                    }
+            fn inputNeedsZoneResolver(ty: types.Type) bool {
+                const element = types.elementType(ty) orelse ty;
+                return switch (types.rangeSubtype(element) orelse element) {
+                    .timestamp, .timestamptz, .time, .timetz => true,
+                    else => false,
+                };
+            }
+
+            fn castNeedsZoneResolver(from: types.Type, to: types.Type) bool {
+                if (types.elementType(from)) |element| {
+                    const target_element = types.elementType(to) orelse return false;
+                    return value_module.characterType(element) and inputNeedsZoneResolver(target_element);
                 }
+                return (from == .unknown or value_module.characterType(from)) and inputNeedsZoneResolver(to);
+            }
+
+            /// Typed datetime conversions use the frozen zone. Named-zone
+            /// input parsing can call the embedding's mutable resolver.
+            pub fn needsZoneResolver(self:*const Context) bool {
+                const nodes = self.workspace.nodes.nodes[0..self.workspace.nodes.len];
+                for (nodes) |node| switch (node.kind) {
+                    .at_zone => return true,
+                    .text_literal => if (inputNeedsZoneResolver(node.ty)) return true,
+                    .function => if (node.func == .json_table_column and inputNeedsZoneResolver(node.cast_type)) return true,
+                    .cast => {
+                        if (node.a == ast.none) {
+                            if (inputNeedsZoneResolver(node.cast_type)) return true;
+                        } else if (castNeedsZoneResolver(nodes[node.a].ty, node.cast_type)) return true;
+                    },
+                    else => {},
+                };
                 return false;
             }
             pub fn execute(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,result:*Result) Error!void {
