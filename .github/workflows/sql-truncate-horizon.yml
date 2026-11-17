@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  ZPM_SOURCE_REVISION: 145361dac8faac04deb9824ad7e904fcd356d69b
+  ZPM_SOURCE_REVISION: a187e39774188b2b86a9a227b3a0e71432cae75a
   SIG_TAG: sig-0.6.5-zig0.17.0.3c72687
   SIG_ASSET: sig-0.6.5-zig0.17.0.3c72687-x86_64-linux.tar.xz
   SIG_SHA256: 179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a
