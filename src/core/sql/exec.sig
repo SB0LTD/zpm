@@ -2593,7 +2593,8 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.stream_stats.dimension_group_rows += 1;
                         for (input.channels, factorStatesFor(Aggregate, state, input.channels.len), 0..) |item, *channel, index| {
                             if (!all_nonnull and !scan.channel_nonnull[index] and flags & (@as(u64, 1) << @intCast(item.column)) == 0) continue;
-                            channel.count += 1;
+                            // Every channel counts exactly the group's rows when its inputs are present.
+                            if (!all_nonnull) channel.count += 1;
                             if (item.kind == .sum_integer or item.kind == .sum_wide) channel.total += table.scan_values[@as(usize, item.column) * table.rows.len + slot];
                         }
                     }
@@ -2712,6 +2713,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var records:List=.{};
                 const bucket_count = if (format_dates) formatted_keys.count else fact_span;
                 var grand:[if(rollup) config.columns else 0]Aggregate=@splat(.{});
+                var grand_rows: i64 = 0;
                 // Use separate bucket tags for the two synthetic levels.
                 if (rollup) try self.appendDimensionGroup(p, &records, dimension_position, .null_value, .null_value, 0, fact_span + 1);
                 for(self.work.refs[map.dictionary..][0..map.groups]) |record| {
@@ -2723,16 +2725,19 @@ pub fn Exec(comptime config: types.Config) type {
                         for(0..fact_span) |bucket| {
                             try self.session.checkpoint();
                             const leaf=partial+bucket*stride;
-                            if(factorRows(leaf).*==0) continue;
+                            const leaf_rows = factorRows(leaf).*;
+                            if (leaf_rows == 0) continue;
+                            if (all_nonnull) factorRows(subtotal).* += leaf_rows;
                             for(subtotal_channels,factorStatesFor(Aggregate,leaf,channel_count)) |*channel,delta| {
-                                channel.count+=delta.count;
+                                if (!all_nonnull) channel.count += delta.count;
                                 channel.total+=delta.total;
                             }
                             leaves+=1;
                         }
                         if(leaves==0) continue;
+                        if (all_nonnull) grand_rows += factorRows(subtotal).*;
                         for(grand[0..channel_count],subtotal_channels) |*channel,delta| {
-                            channel.count+=delta.count;
+                            if (!all_nonnull) channel.count += delta.count;
                             channel.total+=delta.total;
                         }
                         self.work.stream_stats.rollup_folded_leaves+=leaves;
@@ -2756,13 +2761,16 @@ pub fn Exec(comptime config: types.Config) type {
                 for(self.handles(records)) |at| {
                     const record:u32=@intCast(self.work.cells[at+2+p.agg_count].integer);const bucket:usize=@intCast(self.work.cells[at+3+p.agg_count].integer);
                     const mask:u64=if(!rollup or bucket<fact_span) 0 else if(bucket==fact_span) 1 else 3;
-                    const channels=if(rollup and mask==3) grand[0..channel_count] else factorStatesFor(Aggregate,
-                        @as([*]u8,@ptrCast(&self.work.cells[record+1]))+bucket*stride,channel_count);
+                    const state: ?[*]u8 = if (rollup and mask == 3) null else
+                        @as([*]u8, @ptrCast(&self.work.cells[record + 1])) + bucket * stride;
+                    const channels = if (state) |bytes| factorStatesFor(Aggregate, bytes, channel_count) else grand[0..channel_count];
+                    const group_rows = if (state) |bytes| factorRows(bytes).* else grand_rows;
                     var values:[config.columns]Accumulator=undefined;
                     for (input.aggregate_channels, values[0..p.agg_count]) |channel_index, *value| {
                         const channel = channels[channel_index];
                         const item = input.channels[channel_index];
-                        value.*=.{.count=channel.count,.wide=channel.total,.integer=if(item.kind==.sum_integer) @intCast(channel.total) else 0};
+                        value.* = .{ .count = if (all_nonnull) group_rows else channel.count, .wide = channel.total,
+                            .integer = if (item.kind == .sum_integer) @intCast(channel.total) else 0 };
                     }
                     try self.projectGroupMask(p,at,values[0..p.agg_count],outer,&out,mask);
                 }
