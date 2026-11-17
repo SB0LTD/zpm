@@ -1045,12 +1045,77 @@ fn capacities() !void {
     try smallFails("DROP ROLE IF EXISTS n1, n2, n3, n4, n5, n6, n7, n8, n9", error.ProgramLimitExceeded);
 }
 
+/// PostgreSQL exposes tables and columns according to distinct sets of
+/// privileges (REL_18_3 src/backend/catalog/information_schema.sql).
+fn relationDiscovery() !void {
+    try reset();
+    const tables = "SELECT table_name FROM information_schema.tables WHERE table_name IN ('tdd_a', 'tdd_b') ORDER BY table_name";
+    const columns = "SELECT table_name, column_name FROM information_schema.columns WHERE table_name IN ('tdd_a', 'tdd_b') ORDER BY table_name, ordinal_position";
+    const constraints = "SELECT table_name FROM information_schema.table_constraints WHERE table_name IN ('tdd_a', 'tdd_b') AND constraint_type = 'PRIMARY KEY' ORDER BY table_name";
+    const keys = "SELECT table_name, column_name FROM information_schema.key_column_usage WHERE table_name IN ('tdd_a', 'tdd_b') ORDER BY table_name, ordinal_position";
+    const catalog = "SELECT relname FROM pg_class WHERE relname IN ('tdd_a', 'tdd_b') ORDER BY relname";
+    try run("CREATE ROLE discover_group");
+    try run("CREATE ROLE discover_reader IN ROLE discover_group");
+    try expect(tables, "tdd_a;tdd_b");
+    try expect(columns, "tdd_a|id;tdd_a|g;tdd_a|v;tdd_b|id;tdd_b|v");
+    try expect(constraints, "tdd_a;tdd_b");
+    try expect(keys, "tdd_a|id;tdd_b|id");
+
+    try as("discover_reader");
+    try expect(tables, "");
+    try expect(columns, "");
+    try expect(constraints, "");
+    try expect(keys, "");
+    try expect(catalog, "tdd_a;tdd_b");
+    try as("ramsql");
+    try run("GRANT SELECT ON tdd_a TO discover_group");
+    try run("GRANT DELETE ON tdd_b TO discover_reader");
+    try as("discover_reader");
+    try expect(tables, "tdd_a;tdd_b");
+    try expect(columns, "tdd_a|id;tdd_a|g;tdd_a|v");
+    try expect(constraints, "tdd_b");
+    try expect(keys, "tdd_a|id");
+
+    try as("ramsql");
+    try run("REVOKE SELECT ON tdd_a FROM discover_group");
+    try run("REVOKE DELETE ON tdd_b FROM discover_reader");
+    try run("GRANT MAINTAIN ON tdd_a TO discover_reader");
+    try run("GRANT REFERENCES ON tdd_b TO PUBLIC");
+    try as("discover_reader");
+    try expect(tables, "tdd_b");
+    try expect(columns, "tdd_b|id;tdd_b|v");
+    try expect(constraints, "tdd_b");
+    try expect(keys, "tdd_b|id");
+    try expect(catalog, "tdd_a;tdd_b");
+
+    try as("ramsql");
+    try run("REVOKE REFERENCES ON tdd_b FROM PUBLIC");
+    try run("ALTER TABLE tdd_b OWNER TO discover_reader");
+    try as("discover_reader");
+    try expect(tables, "tdd_b");
+    try expect(columns, "tdd_b|id;tdd_b|v");
+    try expect(constraints, "tdd_b");
+    try expect(keys, "tdd_b|id");
+    try as("ramsql");
+
+    try run("CREATE VIEW discover_view AS SELECT id FROM tdd_a");
+    try run("CREATE MATERIALIZED VIEW discover_matview AS SELECT id FROM tdd_a");
+    try expect("SELECT table_name FROM information_schema.tables WHERE table_name IN ('discover_view', 'discover_matview') ORDER BY table_name", "discover_view");
+    try expect("SELECT table_name, column_name FROM information_schema.columns WHERE table_name IN ('discover_view', 'discover_matview') ORDER BY table_name", "discover_view|id");
+    try as("discover_reader");
+    try expect("SELECT relname, relkind FROM pg_class WHERE relname IN ('discover_view', 'discover_matview') ORDER BY relname", "discover_matview|m;discover_view|v");
+    try expect("SELECT attname FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname = 'discover_matview' AND a.attnum > 0 ORDER BY a.attnum", "id");
+    try as("ramsql");
+    try sameState();
+}
+
 pub fn main() !void {
     try oraclePrograms();
     try namespacesAndExtensions();
     try comments();
     try roles();
     try privileges();
+    try relationDiscovery();
     try rowSecurity();
     try foreignAndPublications();
     try changeRecords();
