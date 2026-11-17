@@ -5319,7 +5319,12 @@ pub fn Database(comptime config: Config) type {
                     if (field != 0) try appendText(select, &used, ", ");
                     try appendQuoted(select, &used, table.columns[column].name.slice());
                 }
-                try appendText(select, &used, " FROM ");
+                try appendText(select, &used, " FROM ONLY ");
+                if (copy.table.schema) |qualifier| {
+                    const namespace = identName(source, qualifier);
+                    try appendQuoted(select, &used, namespace.slice());
+                    try appendText(select, &used, ".");
+                }
                 try appendQuoted(select, &used, table.name.slice());
                 info.select_len = used;
             }
