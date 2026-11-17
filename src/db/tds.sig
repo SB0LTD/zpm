@@ -438,12 +438,21 @@ pub fn Session(comptime DB: type) type {
         }
 
 
-        /// New types (NUMERIC, REAL/DOUBLE, temporal, JSON) travel as TEXT
-        /// columns here: native metadata is not implemented (flag F-M).
-        fn textify(db: *DB, result: *DB.Result) anyerror!void {
+        fn textify(self: *const Self, db: *DB, result: *DB.Result) anyerror!void {
             if (!@hasDecl(DB.Result, "textify")) return;
             const session = if (@hasDecl(DB, "valueSession")) db.valueSession() else DB.Result.default_session;
+            if (@hasDecl(DB.Result, "textifyWithDate")) {
+                if (self.version >= 0x730a0003) return result.textifyWithDate(session);
+            }
             try result.textify(session);
+        }
+
+        /// MS-TDS DATE uses Gregorian days after 0001-01-01. SQL's DATE
+        /// field uses signed days after 2000-01-01 and includes infinities.
+        fn dateDays(days: i32) Error!u32 {
+            const ordinal = @as(i64, days) + 730119;
+            if (ordinal < 0 or ordinal > 3652058) return error.UnsupportedValue;
+            return @intCast(ordinal);
         }
 
         fn results(self: *Self, writer: *Writer, completion: u8) Error!void {
@@ -454,6 +463,7 @@ pub fn Session(comptime DB: type) type {
             }
             for (self.result.rows[0..self.result.row_count]) |*row| for (row.cells[0..self.result.column_count]) |*cell| switch (cell.*) {
                 .text => |*value| if (try utf16Length(value.slice()) > 32767) return error.UnsupportedValue,
+                .date => |value| { _ = try dateDays(value); },
                 else => {},
             };
             if (self.result.column_count != 0) {
@@ -475,6 +485,7 @@ pub fn Session(comptime DB: type) type {
                             try writer.byte(0x68);
                             try writer.byte(1);
                         }, // BITN
+                        .date => try writer.byte(0x28), // DATENTYPE has no metadata length
                         else => {
                             try writer.byte(0xe7); // NVARCHAR
                             try writer.number(65534, 2);
@@ -489,7 +500,7 @@ pub fn Session(comptime DB: type) type {
                     try writer.byte(0xd1);
                     for (row.cells[0..self.result.column_count], 0..) |*cell, column| switch (cell.*) {
                         .null_value => switch (self.result.column_types[column]) {
-                            .integer, .integer32, .boolean => try writer.byte(0),
+                            .integer, .integer32, .boolean, .date => try writer.byte(0),
                             else => try writer.number(0xffff, 2),
                         },
                         .integer => |value| {
@@ -504,6 +515,10 @@ pub fn Session(comptime DB: type) type {
                         .boolean => |value| {
                             try writer.byte(1);
                             try writer.byte(if (value) 1 else 0);
+                        },
+                        .date => |value| {
+                            try writer.byte(3);
+                            try writer.number(try dateDays(value), 3);
                         },
                         .text => |*value| {
                             try writer.number((try utf16Length(value.slice())) * 2, 2);
@@ -526,7 +541,7 @@ pub fn Session(comptime DB: type) type {
             const before = txStatus(db);
             if (db.execute(query, &self.result)) |_| {
                 try notifyTransaction(writer, before, txStatus(db), isRollback(query));
-                textify(db, &self.result) catch |err| return writer.failure(245, @errorName(err));
+                self.textify(db, &self.result) catch |err| return writer.failure(245, @errorName(err));
                 self.results(writer, 0xfd) catch |err| {
                     if (err == error.BufferTooSmall) return err;
                     try writer.failure(245, @errorName(err));
@@ -865,7 +880,7 @@ pub fn Session(comptime DB: type) type {
             const before = txStatus(db);
             if (db.execute(query, &self.result)) |_| {
                 try notifyTransaction(writer, before, txStatus(db), isRollback(query));
-                textify(db, &self.result) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
+                self.textify(db, &self.result) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
                 self.results(writer, 0xff) catch |err| return writer.failureToken(245, @errorName(err), 0xfe);
                 try writer.byte(0x79); // RETURNSTATUS
                 try writer.number(0, 4);
