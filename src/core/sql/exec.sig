@@ -1701,7 +1701,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if(comptime S.compact_enabled) {
                     // Exactly the committed projection guard used by compact
                     // aggregates: old snapshots and own writes retain MVCC.
-                    if(!self.committed_only or !table.summary.valid or table.summary.csn>self.snap.csn) return;
+                    if (!S.hasCompactScan(table) or !self.committed_only or !table.summary.valid or table.summary.csn > self.snap.csn) return;
                     cursor.all_live=table.summary.rows>=0 and @as(u64,@intCast(table.summary.rows))==table.scan_high and table.scan_high==table.row_high;
                     // A typed/computed residual need not prevent a safe first
                     // conjunct from rejecting fact rows before inner probes.
@@ -2051,7 +2051,7 @@ pub fn Exec(comptime config: types.Config) type {
                     producer.where!=none or producer.having!=none or producer.key_count!=1 or producer.agg_count!=2 or producer.order_count!=0 or
                     producer.distinct!=.none or producer.limit!=0xffffffffffffffff or producer.offset!=0) return null;
                 const table=&self.tables[producer.sources[0].table.?];
-                if(!table.summary.valid or table.summary.rows<0 or table.summary.csn>self.snap.csn or table.scan_high!=table.row_high) return null;
+                if (!S.hasCompactScan(table) or !table.summary.valid or table.summary.rows < 0 or table.summary.csn > self.snap.csn or table.scan_high != table.row_high) return null;
                 const key=self.pool.nodes[producer.keys[0]];
                 if(key.kind!=.column or key.level!=0 or key.relation!=0 or !value_module.integral(key.ty)) return null;
                 var transitions:[2]Transition=undefined;if(!self.prepareTransitionsMode(producer,&transitions,false,true)) return null;
@@ -2953,18 +2953,21 @@ pub fn Exec(comptime config: types.Config) type {
             /// ordinary query publication step succeeds.
             fn streamGroup(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
                 const table = &self.tables[p.sources[0].table.?];
-                if(comptime config.dimension_distinct_groups and S.compact_enabled) {
-                    const at=self.mark();const stats=self.work.stream_stats;
-                    if(self.dimensionDistinctGroup(p,outer,table)) |result| {if(result) |rows| return rows;} else |err| {
-                        if(err!=error.WorkspaceCapacity) return err;
-                        self.release(at);self.work.stream_stats=stats;
+                const compact_scan = S.hasCompactScan(table);
+                if (compact_scan) {
+                    if(comptime config.dimension_distinct_groups and S.compact_enabled) {
+                        const at=self.mark();const stats=self.work.stream_stats;
+                        if(self.dimensionDistinctGroup(p,outer,table)) |result| {if(result) |rows| return rows;} else |err| {
+                            if(err!=error.WorkspaceCapacity) return err;
+                            self.release(at);self.work.stream_stats=stats;
+                        }
                     }
+                    if(comptime config.dimension_group_ids and S.compact_enabled) {
+                        if (try self.tryDimensionGroup(.numeric, p, outer, table)) |rows| return rows;
+                        if (try self.tryDimensionGroup(.date_format, p, outer, table)) |rows| return rows;
+                    }
+                   if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(try self.factorGroup(p,outer,table)) |rows| return rows;
                 }
-                if(comptime config.dimension_group_ids and S.compact_enabled) {
-                    if (try self.tryDimensionGroup(.numeric, p, outer, table)) |rows| return rows;
-                    if (try self.tryDimensionGroup(.date_format, p, outer, table)) |rows| return rows;
-                }
-                if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(try self.factorGroup(p,outer,table)) |rows| return rows;
                 const distinct=self.distinctLayout(p) orelse return error.WorkspaceCapacity;
                 var ctx = self.context(outer);
                 var out: List = .{};
@@ -2977,7 +2980,7 @@ pub fn Exec(comptime config: types.Config) type {
                         }
                     }
                 }
-                if (comptime S.compact_enabled) {
+                if (compact_scan) {
                     if(p.source_count==1) if(try self.wideDenseGroup(p,outer,table)) |rows| return rows;
                     if (p.source_count==1 and (p.key_count != 0 or !self.summaryEligible(p, table))) {
                         if (try self.compactGroup(p, outer, table)) |rows| return rows;
@@ -5083,7 +5086,7 @@ pub fn Exec(comptime config: types.Config) type {
         noinline fn projectedFilterScan(ctx:*E.Context,table:*const S.Table,query:*const B.Select,snap:storage.Snapshot,
             indices:[]u32,committed_only:bool,stats:*ReadStats) Error!?usize {
             if(comptime !S.compact_enabled) return null;
-            if(!committed_only or !table.summary.valid or table.summary.csn>snap.csn or table.scan_high!=table.row_high or
+            if(!S.hasCompactScan(table) or !committed_only or !table.summary.valid or table.summary.csn>snap.csn or table.scan_high!=table.row_high or
                 query.where==none or query.order_count!=0 or query.limit!=0xffffffffffffffff) return null;
             var predicates:[config.predicates]Query.CompactPredicate=undefined;
             var used:usize=0;

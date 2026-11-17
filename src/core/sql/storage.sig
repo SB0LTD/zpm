@@ -169,6 +169,8 @@ pub fn Storage(comptime config: types.Config) type {
             scan_nonnull: []u64 = &.{},
             scan_live: []u8 = &.{},
             scan_presence: []u64 = &.{},
+            /// Explicitly request MVCC scan fallback with all scan spans empty.
+            omit_compact_scan: bool = false,
             /// Secondary index entry hashes: one run of key_index.len slots
             /// per bound index (at most table_indexes runs; empty binds none).
             index_slots: []u32 = &.{},
@@ -177,8 +179,15 @@ pub fn Storage(comptime config: types.Config) type {
             scan_index_limit: usize = 0,
 
             pub fn valid(self: Backing) bool {
-                const scan_cells=@mulWithOverflow(self.rows.len,config.columns);
-                if(compact_enabled and scan_cells[1]!=0) return false;
+                if (self.omit_compact_scan) {
+                    if (self.scan_values.len != 0 or self.scan_nonnull.len != 0 or
+                        self.scan_live.len != 0 or self.scan_presence.len != 0) return false;
+                } else if (comptime compact_enabled) {
+                    const scan_cells = @mulWithOverflow(self.rows.len, config.columns);
+                    if (scan_cells[1] != 0 or self.scan_values.len < scan_cells[0] or
+                        self.scan_nonnull.len < self.rows.len or self.scan_live.len < self.rows.len) return false;
+                    if (comptime presence_enabled) if (self.scan_presence.len < (presenceWords(self.rows.len) catch return false)) return false;
+                }
                 if (comptime integral_enabled) {
                     if (self.integral_row_words != 0) {
                         const required = @mulWithOverflow(self.integral_row_words, self.versions.len);
@@ -192,9 +201,7 @@ pub fn Storage(comptime config: types.Config) type {
                     self.row_index.len >= self.rows.len * 2 and powerOfTwo(self.row_index.len) and
                     self.key_index.len >= self.versions.len * 2 and powerOfTwo(self.key_index.len) and
                     self.index_slots.len % self.key_index.len == 0 and self.index_slots.len / self.key_index.len <= index_capacity and
-                    self.scan_index_limit <= index_capacity and
-                    (!compact_enabled or (self.scan_values.len >= scan_cells[0] and self.scan_nonnull.len >= self.rows.len and self.scan_live.len >= self.rows.len)) and
-                    (!presence_enabled or self.scan_presence.len >= (presenceWords(self.rows.len) catch return false));
+                    self.scan_index_limit <= index_capacity;
             }
         };
 
@@ -848,7 +855,7 @@ pub fn Storage(comptime config: types.Config) type {
         /// from the committed view (publication or replay of a relayout).
         pub fn rebuildCommitted(table: *Table, csn: u64) void {
             initSummary(table, csn);
-            if (comptime compact_enabled) table.scan_high = 0;
+            table.scan_high = 0;
             for (0..table.row_high) |slot| {
                 if (table.rows[slot].newest == 0) continue;
                 if (visible(table, slot)) |version| {
@@ -981,7 +988,9 @@ pub fn Storage(comptime config: types.Config) type {
             destination.version_high = source.version_high;
             destination.version_used = source.version_used;
             destination.version_free = source.version_free;
-            if (comptime compact_enabled) {
+            const copy_projection = hasCompactScan(destination) and hasCompactScan(source);
+            destination.scan_high = 0;
+            if (copy_projection) {
                 destination.scan_high = source.scan_high;
                 @memcpy(destination.scan_live[0..source.scan_high], source.scan_live[0..source.scan_high]);
                 @memcpy(destination.scan_nonnull[0..source.scan_high], source.scan_nonnull[0..source.scan_high]);
@@ -1016,6 +1025,20 @@ pub fn Storage(comptime config: types.Config) type {
                 destination.row_index = source.row_index;
                 if (source.primary_column != null) destination.key_index = source.key_index;
             }
+            if (!copy_projection and hasCompactScan(destination)) rebuildScanFromVersions(destination);
+        }
+
+        pub inline fn hasCompactScan(table: *const Table) bool {
+            return compact_enabled and table.scan_values.len != 0;
+        }
+
+        /// The copy has no active writers. Build the optional projection from
+        /// committed versions, initializing holes and trailing deleted slots.
+        fn rebuildScanFromVersions(table: *Table) void {
+            scanEnsure(table, table.row_high);
+            for (0..table.row_high) |slot| {
+                if (visible(table, slot)) |version| scanPublish(table, version, true);
+            }
         }
 
         fn scanEnsure(table: *Table, high: usize) void {
@@ -1041,12 +1064,14 @@ pub fn Storage(comptime config: types.Config) type {
         /// retained old/deleted value. Call only on a snapshot-safe projection.
         pub fn blockMayContain(table:*const Table,column:usize,start:usize,count:usize,value:i64) bool {
             if(comptime !presence_enabled) return true;
+            if (table.scan_presence.len == 0) return true;
             if(start%64!=0 or count>64 or start>=table.scan_high or count>table.scan_high-start) return true;
             const residue:u8=@truncate(@as(u64,@bitCast(value)));
             return table.scan_presence[presenceAt(table,column,start/64)+residue/64]&(@as(u64,1)<<@as(u6,@truncate(residue)))!=0;
         }
         fn rebuildPresence(table:*Table) void {
             if(comptime presence_enabled) {
+                if (table.scan_presence.len == 0) return;
                 const blocks=(table.scan_high+63)/64;
                 for(0..config.columns) |column| @memset(table.scan_presence[presenceAt(table,column,0)..][0..blocks*4],0);
                 for(0..table.scan_high) |slot| {
@@ -1065,6 +1090,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn scanPublish(table: *Table, version: u32, live: bool) void {
             var row_scratch: VersionRowScratch = undefined;
             if (comptime compact_enabled) {
+                if (!hasCompactScan(table)) return;
                 const entry = &table.versions[version];
                 const slot = entry.row - 1;
                 scanEnsure(table, @as(usize, slot) + 1);
@@ -1629,10 +1655,11 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         fn compact(table: *Table) void {
+            const maintain_projection = hasCompactScan(table);
             var write: usize = 0;
             for (0..table.row_high) |read| {
                 if (table.rows[read].newest == 0) continue;
-                if (comptime compact_enabled) {
+                if (maintain_projection) {
                     if (read == write and read >= table.scan_high) {
                         table.scan_live[write] = 0;
                         table.scan_nonnull[write] = 0;
@@ -1641,7 +1668,7 @@ pub fn Storage(comptime config: types.Config) type {
                 }
                 if (read != write) {
                     table.primary_directory.state = .disabled;
-                    if (comptime compact_enabled) {
+                    if (maintain_projection) {
                         if (read < table.scan_high) {
                             table.scan_live[write] = table.scan_live[read];
                             table.scan_nonnull[write] = table.scan_nonnull[read];
@@ -1662,7 +1689,10 @@ pub fn Storage(comptime config: types.Config) type {
                 write += 1;
             }
             table.row_high = write;
-            if (comptime compact_enabled) {table.scan_high = write;rebuildPresence(table);}
+            if (maintain_projection) {
+                table.scan_high = write;
+                rebuildPresence(table);
+            }
             @memset(table.row_index[0..], 0);
             for (0..write) |slot| indexRow(table, @intCast(slot));
         }
