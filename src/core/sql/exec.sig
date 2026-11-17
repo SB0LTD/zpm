@@ -76,6 +76,7 @@ pub fn Exec(comptime config: types.Config) type {
             dimension_group_rows:usize=0,
             dimension_group_channels: usize = 0,
             narrow_dimension_group_plans: usize = 0,
+            nonnull_dimension_group_plans: usize = 0,
             dimension_rollup_plans:usize=0,
             dimension_distinct_plans:usize=0,
             nested_factor_plans: usize = 0,
@@ -2501,6 +2502,16 @@ pub fn Exec(comptime config: types.Config) type {
                 channels: []const Transition,
                 aggregate_channels: []const u16,
             };
+            const DimensionScan = struct {
+                mapping: u32,
+                join_low: i64,
+                fact_low: i64,
+                fact_span: usize,
+                stride: usize,
+                join_nonnull: bool,
+                fact_nonnull: bool,
+                channel_nonnull: []const bool,
+            };
 
             fn sumPrefixesFitI64(table: *const S.Table, column: u16) bool {
                 if (table.summary.columns[column].nonnull == 0) return true;
@@ -2542,6 +2553,51 @@ pub fn Exec(comptime config: types.Config) type {
                 self.work.cells[at + 2 + p.agg_count] = .{ .integer = record };
                 self.work.cells[at + 3 + p.agg_count] = .{ .integer = @intCast(bucket) };
                 try self.push(records, at);
+            }
+
+            noinline fn scanDimensionGroups(self: *Query, comptime format_dates: bool, comptime Aggregate: type,
+                comptime all_nonnull: bool, table: *const S.Table, input: *const DimensionTransitions, scan: DimensionScan,
+                formatted_keys: *DateKeys) Error!void {
+                const join_column = input.join_column;
+                const fact_key = &input.fact_key;
+                const dense = table.summary.rows == @as(i64, @intCast(table.scan_high));
+                var date_values: [config.columns]V.Cell = undefined;
+                var date_context = self.context(null);
+                var start: usize = 0;
+                while (start < table.scan_high) : (start += 64) {
+                    const count = @min(@as(usize, 64), table.scan_high - start);
+                    try self.session.checkpoints(count);
+                    var selected = liveMask(table, start, count, dense);
+                    self.work.stream_stats.rows += @popCount(selected);
+                    while (selected != 0) {
+                        const bit = @ctz(selected);
+                        selected &= selected - 1;
+                        const slot = start + bit;
+                        const flags = if (all_nonnull) 0 else table.scan_nonnull[slot];
+                        if (!all_nonnull and !scan.join_nonnull and flags & (@as(u64, 1) << @intCast(join_column)) == 0) continue;
+                        const key: usize = @intCast(@as(i128, table.scan_values[@as(usize, join_column) * table.rows.len + slot]) - scan.join_low);
+                        const record = self.work.refs[scan.mapping + key];
+                        if (record == absent) continue;
+                        const partial: [*]u8 = @ptrCast(&self.work.cells[record + 1]);
+                        const has_key = all_nonnull or scan.fact_nonnull or flags & (@as(u64, 1) << @intCast(fact_key.column)) != 0;
+                        const scalar = if (has_key) table.scan_values[@as(usize, fact_key.column) * table.rows.len + slot] else 0;
+                        const fact_index: usize = if (has_key) @intCast(@as(i128, scalar) - scan.fact_low) else scan.fact_span - 1;
+                        const value = if (format_dates) blk: {
+                            const cached = self.work.refs[formatted_keys.days + fact_index];
+                            if (cached != absent) break :blk @as(usize, cached);
+                            break :blk try self.dateGroupIndex(formatted_keys, fact_index,
+                                if (has_key) .{ .date = @intCast(scalar) } else .null_value, input.fact_key_id, fact_key, &date_context, &date_values);
+                        } else fact_index;
+                        const state = partial + value * scan.stride;
+                        factorRows(state).* += 1;
+                        self.work.stream_stats.dimension_group_rows += 1;
+                        for (input.channels, factorStatesFor(Aggregate, state, input.channels.len), 0..) |item, *channel, index| {
+                            if (!all_nonnull and !scan.channel_nonnull[index] and flags & (@as(u64, 1) << @intCast(item.column)) == 0) continue;
+                            channel.count += 1;
+                            if (item.kind == .sum_integer or item.kind == .sum_wide) channel.total += table.scan_values[@as(usize, item.column) * table.rows.len + slot];
+                        }
+                    }
+                }
             }
 
             /// Map unique joins to dimension group IDs once and scan compact
@@ -2629,44 +2685,29 @@ pub fn Exec(comptime config: types.Config) type {
                 const cell_start=self.work.cell_low;const ref_start=self.work.ref_low;
                 const map=try self.dimensionMap(p,p.keys[dimension_position],join_column,keys,key_span,capacity,1+state_cells);
                 var formatted_keys: DateKeys = undefined;
-                var date_values: [config.columns]V.Cell = undefined;
-                var date_context = self.context(null);
                 if (format_dates) {
                     formatted_keys = .{ .days = try self.refs(fact_span), .values = try self.cells(fact_span), .buckets = try self.refs(date_slots), .slots = date_slots };
                     @memset(self.work.refs[formatted_keys.days..][0..fact_span], absent);
                     @memset(self.work.refs[formatted_keys.buckets..][0..date_slots], absent);
                 }
-                const key_nonnull=table.summary.columns[join_column].nonnull==table.summary.rows;
-                const fact_nonnull=table.summary.columns[fact_key.column].nonnull==table.summary.rows;
-                const dense=table.summary.rows==@as(i64,@intCast(table.scan_high));
-                var nonnull:[config.columns]bool=undefined;
-                for(input.channels,0..) |item,index| nonnull[index]=item.kind==.count_star or table.summary.columns[item.column].nonnull==table.summary.rows;
-                var start:usize=0;
-                while(start<table.scan_high):(start+=64) {
-                    const count=@min(@as(usize,64),table.scan_high-start);try self.session.checkpoints(count);
-                    var selected=liveMask(table,start,count,dense);self.work.stream_stats.rows+=@popCount(selected);
-                    while(selected!=0) {
-                        const bit=@ctz(selected);selected&=selected-1;const slot=start+bit;const flags=table.scan_nonnull[slot];
-                        if(!key_nonnull and flags&(@as(u64,1)<<@intCast(join_column))==0) continue;
-                        const key:usize=@intCast(@as(i128,table.scan_values[@as(usize,join_column)*table.rows.len+slot])-keys.low);
-                        const record=self.work.refs[map.mapping+key];if(record==absent) continue;
-                        const partial:[*]u8=@ptrCast(&self.work.cells[record+1]);
-                        const has_key = fact_nonnull or flags&(@as(u64,1)<<@intCast(fact_key.column))!=0;
-                        const scalar = if (has_key) table.scan_values[@as(usize,fact_key.column)*table.rows.len+slot] else 0;
-                        const fact_index: usize = if (has_key) @intCast(@as(i128,scalar)-facts.low) else fact_span-1;
-                        const value = if (format_dates) blk: {
-                            const cached = self.work.refs[formatted_keys.days + fact_index];
-                            if (cached != absent) break :blk @as(usize, cached);
-                            break :blk try self.dateGroupIndex(&formatted_keys, fact_index,
-                                if (has_key) .{.date=@intCast(scalar)} else .null_value, input.fact_key_id, fact_key, &date_context, &date_values);
-                        } else fact_index;
-                        const state=partial+value*stride;factorRows(state).*+=1;self.work.stream_stats.dimension_group_rows+=1;
-                        for(input.channels,factorStatesFor(Aggregate,state,channel_count),0..) |item,*channel,index| {
-                            if(item.kind!=.count_star and !nonnull[index] and flags&(@as(u64,1)<<@intCast(item.column))==0) continue;
-                            channel.count+=1;
-                            if(item.kind==.sum_integer or item.kind==.sum_wide) channel.total+=table.scan_values[@as(usize,item.column)*table.rows.len+slot];
-                        }
-                    }
+                const join_nonnull = table.summary.columns[join_column].nonnull == table.summary.rows;
+                const fact_nonnull = table.summary.columns[fact_key.column].nonnull == table.summary.rows;
+                var all_nonnull = join_nonnull and fact_nonnull;
+                var nonnull: [config.columns]bool = undefined;
+                for (input.channels, nonnull[0..channel_count]) |item, *present| {
+                    present.* = item.kind == .count_star or table.summary.columns[item.column].nonnull == table.summary.rows;
+                    all_nonnull = all_nonnull and present.*;
+                }
+                // The same committed snapshot guards the summary and compact
+                // columns. Row holes still require the ordinary live mask.
+                const scan: DimensionScan = .{
+                    .mapping = map.mapping, .join_low = keys.low, .fact_low = facts.low, .fact_span = fact_span, .stride = stride,
+                    .join_nonnull = join_nonnull, .fact_nonnull = fact_nonnull, .channel_nonnull = nonnull[0..channel_count],
+                };
+                if (all_nonnull) {
+                    try self.scanDimensionGroups(format_dates, Aggregate, true, table, input, scan, &formatted_keys);
+                } else {
+                    try self.scanDimensionGroups(format_dates, Aggregate, false, table, input, scan, &formatted_keys);
                 }
                 var records:List=.{};
                 const bucket_count = if (format_dates) formatted_keys.count else fact_span;
@@ -2729,6 +2770,7 @@ pub fn Exec(comptime config: types.Config) type {
                 self.work.stream_stats.dimension_group_plans+=1;self.work.stream_stats.dimension_group_ids+=map.groups;
                 self.work.stream_stats.dimension_group_channels += channel_count;
                 self.work.stream_stats.narrow_dimension_group_plans += @intFromBool(Aggregate == NarrowFactorAggregate);
+                self.work.stream_stats.nonnull_dimension_group_plans += @intFromBool(all_nonnull);
                 if (format_dates) self.work.stream_stats.dimension_date_group_plans += 1;
                 if(rollup) self.work.stream_stats.dimension_rollup_plans+=1;
                 self.work.stream_stats.groups+=records.count;

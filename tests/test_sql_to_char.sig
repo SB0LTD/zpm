@@ -94,6 +94,7 @@ fn compactDateGroups() !void {
     try check(date_fast.workspace.query.stream_stats.dimension_date_group_plans == 1);
     try check(date_fast.workspace.query.stream_stats.dimension_group_channels == 2);
     try check(date_fast.workspace.query.stream_stats.narrow_dimension_group_plans == 1);
+    try check(date_fast.workspace.query.stream_stats.nonnull_dimension_group_plans == 0);
     try check(date_fast.workspace.query.stream_stats.dimension_date_keys == 4);
     const unsupported = "SELECT r.name,to_char(f.day,'IYYY-IW'),COUNT(*)" ++ source ++
         "GROUP BY r.name,to_char(f.day,'IYYY-IW')";
@@ -101,6 +102,15 @@ fn compactDateGroups() !void {
         try check(err == error.UnsupportedStatement);
     }
     try check(fast_result.row_count == 3 and fast_result.rows[0].cells[2].integer == 3);
+    // Non-null join and date keys alone must not hide nullable SUM/AVG input.
+    try executeDateJoin("UPDATE fact SET day='2024-03-01' WHERE id=5");
+    try executeDateJoin(query);
+    try check(date_fast.workspace.query.stream_stats.dimension_date_group_plans == 1);
+    try check(date_fast.workspace.query.stream_stats.nonnull_dimension_group_plans == 0);
+    try executeDateJoin("UPDATE fact SET value=12 WHERE id=3");
+    try executeDateJoin(query);
+    try check(date_fast.workspace.query.stream_stats.nonnull_dimension_group_plans == 1);
+    try check(date_fast.workspace.query.stream_stats.narrow_dimension_group_plans == 1);
     // A same-bucket prefix exceeds i64 before the negative input is added.
     // A final-value-only check would select the wrong transition width.
     try executeDateJoin("INSERT INTO fact VALUES (8,1,'2024-01-01',9223372036854775807),(9,1,'2024-01-01',-9223372036854775808)");
@@ -108,6 +118,14 @@ fn compactDateGroups() !void {
     try check(fast_result.row_count == 3 and fast_result.rows[0].cells[2].integer == 5);
     try check(date_fast.workspace.query.stream_stats.dimension_date_group_plans == 1);
     try check(date_fast.workspace.query.stream_stats.narrow_dimension_group_plans == 0);
+    try check(date_fast.workspace.query.stream_stats.nonnull_dimension_group_plans == 1);
+    try check(date_fast.workspace.query.stream_stats.dimension_group_rows == 7);
+    // A deleted middle row leaves a hole even though every live input is present.
+    try executeDateJoin("DELETE FROM fact WHERE id=2");
+    try check(date_fast.tables[0].scan_live[1] == 0 and date_fast.tables[0].scan_high > 2);
+    try executeDateJoin(query);
+    try check(date_fast.workspace.query.stream_stats.nonnull_dimension_group_plans == 1);
+    try check(date_fast.workspace.query.stream_stats.dimension_group_rows == 6);
     try executeDateJoin("UPDATE fact SET store=9");
     try executeDateJoin(unsupported);
     try check(fast_result.row_count == 0 and date_fast.workspace.query.stream_stats.dimension_date_keys == 0);
