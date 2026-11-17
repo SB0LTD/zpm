@@ -86,6 +86,11 @@ pub fn Storage(comptime config: types.Config) type {
             if (versions_capacity > 0x7fffffff or config.rows_per_table > 0x7fffffff) @compileError("storage capacity exceeds u32 references");
         }
 
+        const Truncation = struct {
+            owner: TxRef = .{},
+            cid: u32 = 0,
+        };
+
         pub const RowSlot = struct {
             rowid: u64 = 0,
             generation: u32 = 0,
@@ -389,6 +394,10 @@ pub fn Storage(comptime config: types.Config) type {
             /// Conservative bounds on integer cells and DATE day numbers.
             integer_bounds: [config.columns]IntegerBounds = @splat(.{}),
             rollups: [config.columns]Rollup = @splat(.{}),
+            // TRUNCATE replaces the relation's contents even for older
+            // snapshots that did not already lock the table.
+            truncate_csn: u64 = 0,
+            pending_truncate: Truncation = .{},
             next_rowid: u64 = 0,
             row_generation: u32 = 0,
             row_high: usize = 0,
@@ -816,6 +825,8 @@ pub fn Storage(comptime config: types.Config) type {
         /// sources[i], or fills[i] when sources[i] is 0xff. The caller checked
         /// capacity. Committed summaries are rebuilt at publication.
         pub fn copyRelayout(destination: *Table, source: *const Table, sources: []const u8, fills: []const V.Cell) void {
+            destination.truncate_csn = source.truncate_csn;
+            destination.pending_truncate = source.pending_truncate;
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
@@ -941,6 +952,8 @@ pub fn Storage(comptime config: types.Config) type {
             table.namespace = 2200;
             table.constraint_count = 0;
             setExtras(table, &.{});
+            table.truncate_csn = 0;
+            table.pending_truncate = .{};
             table.next_rowid = 1;
             table.dead_csn = 0;
             table.pending_drop = false;
@@ -981,6 +994,8 @@ pub fn Storage(comptime config: types.Config) type {
             destination.summary = source.summary;
             destination.integer_bounds = source.integer_bounds;
             destination.rollups = source.rollups;
+            destination.truncate_csn = source.truncate_csn;
+            destination.pending_truncate = source.pending_truncate;
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
@@ -1118,12 +1133,25 @@ pub fn Storage(comptime config: types.Config) type {
             return snap.own(version.xmax) and version.xmax_cid < snap.cid;
         }
 
+        pub fn publishTruncate(table: *Table, csn: u64) void {
+            table.truncate_csn = csn;
+            table.pending_truncate = .{};
+            if (table.summary.valid) table.summary.csn = csn;
+        }
+
         /// The version of `slot` visible to `snap`, if any.
         pub fn visibleAt(table: *const Table, slot: usize, snap: Snapshot) ?u32 {
             var ref = table.rows[slot].newest;
             while (ref != 0) {
                 const version = &table.versions[ref - 1];
-                if (created(version, snap)) return if (deleted(version, snap)) null else ref - 1;
+                if (created(version, snap)) {
+                    if (deleted(version, snap)) return null;
+                    if (version.xmin_csn != 0 and table.truncate_csn > snap.csn) return null;
+                    const truncated = &table.pending_truncate;
+                    if (snap.own(truncated.owner) and truncated.cid < snap.cid and
+                        (version.xmin_csn != 0 or version.xmin_cid < truncated.cid)) return null;
+                    return ref - 1;
+                }
                 ref = version.older;
             }
             return null;
