@@ -2191,7 +2191,7 @@ pub fn Database(comptime config: Config) type {
             }
             if (change.tag != .delete) {
                 try validatePreparedImage(table, new_image[0..change.new_count]);
-                if (table.primary_column) |column| switch (D.keyCheck(table, &new_image[column], row orelse 0xffffffff, snap)) {
+                if (table.primary_column) |column| switch (S.primaryKeyCheck(table, &new_image[column], row orelse 0xffffffff, snap)) {
                     .free => {},
                     else => return error.ChangeRecordConflict,
                 };
