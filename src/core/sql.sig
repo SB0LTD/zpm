@@ -2507,15 +2507,15 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
-            var domain_count: usize = 0;
+            var type_count: usize = 0;
             var latest = snap;
             latest.csn = self.csn;
             for (&self.catalog_objects.items) |*o| {
-                if (o.kind != .domain or o.target != drop.oid) continue;
+                if (!CO.userType(o.kind) or o.target != drop.oid) continue;
                 if (O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                 if (!O.visible(o, snap)) continue;
                 if (!drop.cascade) return error.DependentObjects;
-                domain_count += 1;
+                type_count += 1;
             }
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snap, &relations);
@@ -2524,9 +2524,9 @@ pub fn Database(comptime config: Config) type {
                 if (!drop.cascade) return error.DependentObjects;
                 _ = try self.dropTable(slot, found.slot, true, snap);
             }
-            try self.reserveWrites(slot, 2 + domain_count);
+            try self.reserveWrites(slot, 2 + type_count);
             for (&self.catalog_objects.items, 0..) |*o, index| {
-                if (o.kind == .domain and o.target == drop.oid and O.visible(o, snap)) self.objectDelete(slot, index, snap);
+                if (CO.userType(o.kind) and o.target == drop.oid and O.visible(o, snap)) self.objectDelete(slot, index, snap);
             }
             schema.pending_drop = true;
             schema.creator = slot;
@@ -2705,12 +2705,22 @@ pub fn Database(comptime config: Config) type {
         fn catalogObject(self: *Self, slot: u16, source: []const u8, object_statement: *const CO.Statement, snap: Snapshot) Error!void {
             const command: CommandTag = switch (object_statement.*) {
                 .create_domain => |*domain| blk: {
-                    try self.createDomain(slot, source, domain, snap);
+                    var object: O.Object = .{ .kind = .domain, .domain = domain.spec };
+                    try self.createUserType(slot, source, domain.name, &object, null, snap);
                     break :blk .create_domain;
                 },
                 .drop_domain => |*drop| blk: {
-                    try self.dropDomains(slot, source, drop, snap);
+                    try self.dropTypes(slot, source, drop, true, snap);
                     break :blk .drop_domain;
+                },
+                .create_enum => |*enumeration| blk: {
+                    var object: O.Object = .{ .kind = .enum_type };
+                    try self.createUserType(slot, source, enumeration.name, &object, enumeration.labels, snap);
+                    break :blk .create_type;
+                },
+                .drop_type => |*drop| blk: {
+                    try self.dropTypes(slot, source, drop, false, snap);
+                    break :blk .drop_type;
                 },
                 .create_role => |*spec| blk: {
                     try self.createRole(slot, source, spec, snap);
@@ -2786,32 +2796,32 @@ pub fn Database(comptime config: Config) type {
             self.outcome = .{ .affected = 0, .command = command };
         }
 
-        fn domainNamespace(self: *const Self, source: []const u8, name: CO.Qualified, snap: Snapshot) Error!u32 {
+        fn typeNamespace(self: *const Self, source: []const u8, name: CO.Qualified, snap: Snapshot) Error!u32 {
             const schema = if (name.has_schema) objectName(source, name.schema) else Name{};
             return namespaceFor(&self.catalog, if (name.has_schema) schema.slice() else null, snap) orelse error.UndefinedSchema;
         }
 
-        fn domainNameOccupied(self: *const Self, namespace: u32, name: []const u8, snap: Snapshot) bool {
-            if (self.catalog_objects.domainNameTaken(namespace, name, snap)) return true;
+        fn typeNameOccupied(self: *const Self, namespace: u32, name: []const u8, snap: Snapshot) bool {
+            if (self.catalog_objects.userTypeNameTaken(namespace, name, snap)) return true;
             const relation = self.catalog.findIn(namespace, name, snap) orelse return false;
             return relation.kind != 'S';
         }
 
         fn pendingTypeName(self: *const Self, namespace: u32, name: []const u8, snap: Snapshot) ?u16 {
-            return self.catalog.creator(name, snap) orelse self.catalog_objects.pendingDomainName(namespace, name, snap);
+            return self.catalog.creator(name, snap) orelse self.catalog_objects.pendingUserTypeName(namespace, name, snap);
         }
 
         fn checkRelationTypeName(self: *Self, slot: u16, namespace: u32, name: []const u8, snap: Snapshot) Error!void {
-            if (self.catalog_objects.pendingDomainName(namespace, name, snap)) |other| return self.objectPark(slot, other);
+            if (self.catalog_objects.pendingUserTypeName(namespace, name, snap)) |other| return self.objectPark(slot, other);
             var latest = snap;
             latest.csn = self.csn;
-            if (self.catalog_objects.domainNameTaken(namespace, name, latest)) return error.DuplicateObject;
+            if (self.catalog_objects.userTypeNameTaken(namespace, name, latest)) return error.DuplicateObject;
         }
 
-        fn createDomain(self: *Self, slot: u16, source: []const u8, create: *const CO.CreateDomain, snap: Snapshot) Error!void {
+        fn createUserType(self: *Self, slot: u16, source: []const u8, qualified: CO.Qualified, object: *O.Object, labels: ?CO.Span, snap: Snapshot) Error!void {
             if (self.dialect != .postgres or self.routine_frame != null) return error.UnsupportedStatement;
             if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
-            const namespace = try self.domainNamespace(source, create.name, snap);
+            const namespace = try self.typeNamespace(source, qualified, snap);
             if (namespace != catalog_module.public_namespace and namespace < change_log.first_oid) return error.InsufficientPrivilege;
             for (&self.schemas) |*schema| {
                 if (schema.live and schema.oid == namespace and schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
@@ -2820,53 +2830,65 @@ pub fn Database(comptime config: Config) type {
             if (self.catalog_objects.pendingReference(owner, snap)) |other| return self.objectPark(slot, other);
             var latest = snap;
             latest.csn = self.csn;
-            if (try self.domainNamespace(source, create.name, latest) != namespace) return error.SerializationFailure;
+            if (try self.typeNamespace(source, qualified, latest) != namespace) return error.SerializationFailure;
             if (owner != CO.bootstrap_role and self.catalog_objects.byOid(.role, owner, latest) == null) return error.SerializationFailure;
-            const name = objectName(source, create.name.name);
+            const name = objectName(source, qualified.name);
             if (name.len == 0) return error.Syntax;
             if (self.pendingTypeName(namespace, name.slice(), snap)) |other| return self.objectPark(slot, other);
-            if (self.domainNameOccupied(namespace, name.slice(), latest)) return error.DuplicateObject;
-            var domain: O.Object = .{ .kind = .domain, .target = namespace, .owner = owner, .name = name, .domain = create.spec };
+            if (self.typeNameOccupied(namespace, name.slice(), latest)) return error.DuplicateObject;
+            object.target = namespace;
+            object.owner = owner;
+            object.name = name;
             const limit: usize = @min(config.name_bytes, O.text_capacity);
             var found = false;
             var prefix: usize = 1;
             while (prefix <= limit) : (prefix += 1) {
                 const length = @min(@as(usize, name.len), limit - prefix);
-                @memset(domain.text[0..prefix], '_');
-                @memcpy(domain.text[prefix..][0..length], name.slice()[0..length]);
-                domain.text_len = @intCast(prefix + length);
-                const candidate = domain.textSlice();
+                @memset(object.text[0..prefix], '_');
+                @memcpy(object.text[prefix..][0..length], name.slice()[0..length]);
+                object.text_len = @intCast(prefix + length);
+                const candidate = object.textSlice();
                 if (types.same(name.slice(), candidate)) continue;
                 if (self.pendingTypeName(namespace, candidate, snap)) |other| return self.objectPark(slot, other);
-                if (self.domainNameOccupied(namespace, candidate, latest)) continue;
+                if (self.typeNameOccupied(namespace, candidate, latest)) continue;
                 found = true;
                 break;
             }
             if (!found) return error.NameCapacity;
+            if (labels) |label_span| {
+                object.split = object.text_len;
+                const labels_source = source[label_span.start..][0..label_span.len];
+                const encoded = try CO.encodeEnumLabels(labels_source, object.text[object.split..], @min(config.name_bytes, config.text_bytes));
+                object.enum_label_count = encoded.count;
+                object.text_len = @intCast(@as(usize, object.split) + encoded.bytes);
+            }
             try self.reserveWrites(slot, 1);
-            const width = CO.oidWidth(.domain);
+            const width = object.oidWidth();
             if (self.oid_counter > 0xffffffff - change_log.first_oid - width) return error.TableCapacity;
-            domain.oid = change_log.first_oid + self.oid_counter;
-            _ = try self.objectInsert(slot, &domain, false, snap);
+            object.oid = change_log.first_oid + self.oid_counter;
+            _ = try self.objectInsert(slot, object, false, snap);
             self.oid_counter += width;
         }
 
-        fn dropDomains(self: *Self, slot: u16, source: []const u8, drop: *const CO.DropDomains, snap: Snapshot) Error!void {
+        fn dropTypes(self: *Self, slot: u16, source: []const u8, drop: *const CO.DropTypes, domain_only: bool, snap: Snapshot) Error!void {
             if (self.dialect != .postgres or self.routine_frame != null) return error.UnsupportedStatement;
             var found: [CO.list_capacity]usize = undefined;
             var count: usize = 0;
             for (drop.names[0..drop.count]) |name| {
-                const namespace = self.domainNamespace(source, name, snap) catch |err| {
+                const namespace = self.typeNamespace(source, name, snap) catch |err| {
                     if (err == error.UndefinedSchema and drop.if_exists) continue;
                     return err;
                 };
                 const wanted = objectName(source, name.name);
-                if (self.catalog_objects.pendingDomainName(namespace, wanted.slice(), snap)) |other| return self.objectPark(slot, other);
-                const index = self.catalog_objects.byName(.domain, namespace, wanted.slice(), snap) orelse {
+                if (self.catalog_objects.pendingUserTypeName(namespace, wanted.slice(), snap)) |other| return self.objectPark(slot, other);
+                const index = self.catalog_objects.byName(.domain, namespace, wanted.slice(), snap) orelse
+                    self.catalog_objects.byName(.enum_type, namespace, wanted.slice(), snap) orelse {
+                    if (self.catalog_objects.userTypeNameTaken(namespace, wanted.slice(), snap)) return error.UnsupportedStatement;
                     if (drop.if_exists) continue;
                     return error.UndefinedObject;
                 };
                 const object = &self.catalog_objects.items[index];
+                if (domain_only and object.kind != .domain) return error.WrongObjectType;
                 if (object.xmax_csn > snap.csn) return error.SerializationFailure;
                 if (!self.privilegedRole(snap) and !self.catalog_objects.memberOf(self.session.role, object.owner, true, snap)) return error.InsufficientPrivilege;
                 for (found[0..count]) |previous| {
@@ -2966,7 +2988,7 @@ pub fn Database(comptime config: Config) type {
                 var latest = snap;
                 latest.csn = self.csn;
                 for (&self.catalog_objects.items) |*o| {
-                    if (o.kind == .domain and o.owner == oid and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                    if (CO.userType(o.kind) and o.owner == oid and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
                     switch (o.kind) {
                         .member => {
@@ -2983,7 +3005,7 @@ pub fn Database(comptime config: Config) type {
                                 if (listed == oid) return error.DependentObjects;
                             }
                         },
-                        .relation, .fdw, .server, .publication, .domain => if (o.owner == oid) return error.DependentObjects,
+                        .relation, .fdw, .server, .publication, .domain, .enum_type => if (o.owner == oid) return error.DependentObjects,
                         else => {},
                     }
                 }
@@ -4278,11 +4300,23 @@ pub fn Database(comptime config: Config) type {
                             try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false) });
                         }
                     }
-                    for (&self.catalog_objects.items) |*domain| {
-                        if (domain.kind != .domain or !O.visible(domain, snapshot)) continue;
-                        const info = types.typeInfo(types.dataTypeOf(domain.domain.base));
-                        try sink.add(&.{ intCell(domain.oid), nameCell(domain.name.slice()), intCell(domain.target), intCell(info.len), nameCell("d"), nameCell("N"), intCell(domain.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(domain.owner), intCell(-1), boolCell(domain.domain.not_null) });
-                        try sink.add(&.{ intCell(domain.oid + 1), nameCell(domain.textSlice()), intCell(domain.target), intCell(-1), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(domain.oid), intCell(domain.owner), intCell(-1), boolCell(false) });
+                    for (&self.catalog_objects.items) |*object| {
+                        if (!CO.userType(object.kind) or !O.visible(object, snapshot)) continue;
+                        if (object.kind == .domain) {
+                            const info = types.typeInfo(types.dataTypeOf(object.domain.base));
+                            try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), nameCell("d"), nameCell("N"), intCell(object.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null) });
+                        } else {
+                            try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), nameCell("e"), nameCell("E"), intCell(object.oid + 1), nameCell(","), nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false) });
+                        }
+                        try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false) });
+                    }
+                },
+                .pg_enum => for (&self.catalog_objects.items) |*object| {
+                    if (object.kind != .enum_type or !O.visible(object, snapshot)) continue;
+                    var labels = object.enumLabels();
+                    var order: u32 = 1;
+                    while (labels.next()) |label| : (order += 1) {
+                        try sink.add(&.{ intCell(object.oid + 1 + order), intCell(object.oid), .{ .float4 = @floatFromInt(order) }, nameCell(label) });
                     }
                 },
                 .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),

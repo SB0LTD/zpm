@@ -4537,7 +4537,7 @@ pub fn Binder(comptime config: types.Config) type {
             const namespace = try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
             const name = toName(context, n.name);
             const index = domains.byName(.domain, namespace, name.slice(), context.snapshot) orelse {
-                if (domains.domainNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
+                if (domains.userTypeNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
                 return error.UndefinedObject;
             };
             const info = domains.items[index].domain;

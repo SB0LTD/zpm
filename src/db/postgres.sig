@@ -1516,6 +1516,8 @@ pub fn Session(comptime DB: type) type {
                 .create_extension => "CREATE EXTENSION",
                 .create_domain => "CREATE DOMAIN",
                 .drop_domain => "DROP DOMAIN",
+                .create_type => "CREATE TYPE",
+                .drop_type => "DROP TYPE",
                 else => null,
             };
         }
@@ -1738,6 +1740,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "WrongObjectType")) return "42809";
     if (equal(name, "DependentObjects")) return "2BP01";
     if (equal(name, "UndefinedObject")) return "42704";
+    if (equal(name, "InvalidName")) return "42602";
     if (equal(name, "BadCopyFormat")) return "22P04";
     if (equal(name, "InvalidBinaryRepresentation")) return "22P03";
     if (equal(name, "StringDataRightTruncation")) return "22001";

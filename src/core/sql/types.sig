@@ -262,6 +262,7 @@ pub const Error = error{
     CannotCoerce,
     /// SQLSTATE 22P02: text is not valid input for the target type.
     InvalidTextRepresentation,
+    InvalidName,
     /// SQLSTATE 22012.
     DivisionByZero,
     /// SQLSTATE2201F: square root/power domain error.
@@ -1019,7 +1020,7 @@ pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, i
 pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as, lock_table, declare_cursor, fetch, move, close_cursor, prepare, deallocate, listen, notify, unlisten, create_function, drop_function, create_procedure, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule,
     // Catalog objects (B11 wave 3).
     create_role, alter_role, drop_role, grant, revoke, grant_role, revoke_role, create_policy, alter_policy, drop_policy, comment,
-    create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension, explain, create_domain, drop_domain, vacuum, analyze };
+    create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension, explain, create_domain, drop_domain, vacuum, analyze, create_type, drop_type };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
