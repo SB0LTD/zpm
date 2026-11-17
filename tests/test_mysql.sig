@@ -509,6 +509,71 @@ fn nativeReplace() !void {
         try check(err == error.UnsupportedStatement);
 }
 
+fn nativeAutoIncrement() !void {
+    store = .{};
+    var first: DB = .{ .store = &store, .id = 1 };
+    var second: DB = .{ .store = &store, .id = 2 };
+    var a: Session = .{};
+    var b: Session = .{};
+    try connect(&a, &first);
+    try connect(&b, &second);
+    _ = try command(&a, &first, "CREATE TABLE autos(id INT AUTO_INCREMENT PRIMARY KEY,v INT NOT NULL)");
+    try check(output[4] == 0);
+    _ = try command(&a, &first, "INSERT INTO autos(v) VALUES(11)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 1);
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(10,22)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 10);
+    _ = try command(&a, &first, "SELECT LAST_INSERT_ID()");
+    try check(a.result.row_count == 1 and a.result.rows[0].cells[0].integer == 1);
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(NULL,33),(0,44)");
+    try check(output[4] == 0 and output[5] == 2 and output[6] == 11);
+    _ = try command(&a, &first, "SELECT id FROM autos ORDER BY v");
+    try check(a.result.row_count == 4 and a.result.rows[2].cells[0].integer == 11 and a.result.rows[3].cells[0].integer == 12);
+    _ = try command(&b, &second, "SELECT LAST_INSERT_ID()");
+    try check(b.result.row_count == 1 and b.result.rows[0].cells[0].integer == 0);
+
+    _ = try command(&a, &first, "UPDATE autos SET id=300 WHERE v=22");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 0);
+    _ = try command(&a, &first, "DELETE FROM autos WHERE id=1");
+    try check(output[4] == 0 and output[5] == 1);
+    _ = try command(&a, &first, "BEGIN");
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(DEFAULT,55)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 0xfc and output[7] == 45 and output[8] == 1);
+    _ = try command(&a, &first, "ROLLBACK");
+    _ = try command(&a, &first, "SELECT LAST_INSERT_ID()");
+    try check(a.result.row_count == 1 and a.result.rows[0].cells[0].integer == 301);
+    _ = try command(&a, &first, "INSERT INTO autos(v) VALUES(66)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 0xfc and output[7] == 46 and output[8] == 1);
+    _ = try command(&a, &first, "TRUNCATE TABLE autos");
+    try check(output[4] == 0 and output[5] == 0 and output[6] == 0);
+    _ = try command(&a, &first, "SET SESSION sql_mode='NO_AUTO_VALUE_ON_ZERO'");
+    try check(output[4] == 0);
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(0,77)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 0);
+    _ = try command(&a, &first, "INSERT INTO autos VALUES(NULL,88)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 1);
+
+    store = .{};
+    store.database.dialect = .mysql;
+    syntax_recovered = .{};
+    var record: [8192]u8 = undefined;
+    var result: Raw.Result = .{};
+    for ([_][]const u8{
+        "CREATE TABLE autos(id INT AUTO_INCREMENT PRIMARY KEY,v INT NOT NULL)",
+        "INSERT INTO autos(v) VALUES(19)",
+        "INSERT INTO autos VALUES(77,20)",
+    }) |source| {
+        var used: usize = 0;
+        try store.database.executeChanges(source, &result, &record, &used, null, null);
+        try syntax_recovered.applyChangeRecord(record[0..used], &syntax_replay);
+    }
+    try syntax_recovered.execute("SELECT id FROM autos WHERE v=19", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 1);
+    syntax_recovered.dialect = .mysql;
+    try syntax_recovered.execute("INSERT INTO autos(v) VALUES(21)", &result);
+    try check(result.mysql_insert_id == 78 and result.mysql_generated_id == 78);
+}
+
 pub fn main(init: std.process.Init) !void {
     try handshakeAndFragmentation();
     try typedResultsAndErrors();
@@ -517,6 +582,7 @@ pub fn main(init: std.process.Init) !void {
     try nativeSignedIntegerLiterals();
     try nativeIfnullAndDateAdd();
     try nativeReplace();
+    try nativeAutoIncrement();
     try transactionsAndOutputPreflight();
     try concurrentCommittedVisibility();
     try malformedAndFuzz();

@@ -2010,7 +2010,10 @@ pub fn Parser(comptime config: types.Config) type {
             while (true) {
                 var name: ?ast.Ident = null;
                 if (self.mode == .standard and try self.takeWord("CONSTRAINT")) name = try self.identifier();
-                if (self.mode == .standard and try self.takeWord("DEFAULT")) {
+                if (self.mode == .standard and self.tokens.dialect == .mysql and try self.takeRaw("auto_increment")) {
+                    if (name != null or column.default_kind != .none or column.serial != 0) return error.Syntax;
+                    column.default_kind = .mysql_auto_increment;
+                } else if (self.mode == .standard and try self.takeWord("DEFAULT")) {
                     if (column.default_kind != .none) {if(if_not_exists) invalid.*=true else return error.Syntax;}
                     column.default_kind = .default;
                     const start = self.tokenStart();
@@ -3834,6 +3837,13 @@ pub fn Parser(comptime config: types.Config) type {
             // evaluates every projection exactly once per row.
             const raw_name = name.span.slice(self.source);
             if (self.tokens.dialect == .tds and !name.quoted and types.keyword(raw_name, "dateadd")) return self.tdsDateAdd(name);
+            if (self.tokens.dialect == .mysql and !name.quoted and types.keyword(raw_name, "last_insert_id")) {
+                self.last_native_syntax = name.span.start;
+                const end = self.current.end;
+                try self.expectSymbol(.rparen);
+                return self.pool.add(.{ .kind = .function, .name = name, .func = .mysql_last_insert_id,
+                    .text = .{ .start = name.span.start, .end = end, .len = end - name.span.start } });
+            }
             if (!name.quoted and (types.keyword(raw_name, "nextval") or types.keyword(raw_name, "setval"))) self.pool.complex = true;
             var call: ast.Node = .{ .kind = .function, .name = name };
             if (self.tokens.dialect == .tds and !name.quoted and types.keyword(raw_name, "isnull")) {

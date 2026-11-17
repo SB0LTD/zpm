@@ -45,6 +45,8 @@ pub const Session = struct {
     sequences: ?*const SequenceHook = null,
     /// current_database(): the session's startup database.
     database: []const u8 = "postgres",
+    mysql_keep_zero: bool = false,
+    mysql_last_insert_id: u64 = 0,
     control: ?*types.ExecutionControl = null,
     /// Values of $1..$n while an EXECUTEd SQL prepared statement runs
     /// ([Config.statement_parameters]Cell of the Database; tx-session lane).

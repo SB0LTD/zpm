@@ -80,7 +80,7 @@ const Writer = struct {
         for (0..count) |index| try self.byte(@truncate(value >> @intCast(index * 8)));
     }
 
-    fn length(self: *Writer, value: usize) Error!void {
+    fn length(self: *Writer, value: u64) Error!void {
         if (value < 0xfb) return self.byte(@intCast(value));
         if (value <= 0xffff) {
             try self.byte(0xfc);
@@ -113,11 +113,11 @@ const Writer = struct {
         for (0..3) |index| self.output[start + index] = @truncate(len >> @intCast(index * 8));
     }
 
-    fn ok(self: *Writer, affected: usize, status: u16) Error!void {
+    fn ok(self: *Writer, affected: usize, insert_id: u64, status: u16) Error!void {
         const start = try self.packet();
         try self.byte(0);
         try self.length(affected);
-        try self.byte(0); // last_insert_id
+        try self.length(insert_id);
         try self.number(status, 2);
         try self.number(0, 2); // warnings
         try self.finish(start);
@@ -272,7 +272,7 @@ pub fn Session(comptime DB: type) type {
                 }
             }
             if (position != payload.len) return error.MalformedPacket;
-            try writer.ok(0, 2);
+            try writer.ok(0, 0, 2);
             self.authenticated = true;
             return true;
         }
@@ -301,7 +301,8 @@ pub fn Session(comptime DB: type) type {
         }
 
         fn results(self: *Self, writer: *Writer, flags: u16) Error!void {
-            if (self.result.column_count == 0) return writer.ok(self.result.affected_rows, flags);
+            const insert_id = if (@hasField(DB.Result, "mysql_insert_id")) self.result.mysql_insert_id else 0;
+            if (self.result.column_count == 0) return writer.ok(self.result.affected_rows, insert_id, flags);
             var start = try writer.packet();
             try writer.length(self.result.column_count);
             try writer.finish(start);
@@ -375,7 +376,7 @@ pub fn Session(comptime DB: type) type {
                         reply.close = true;
                     },
                     2 => {
-                        if (equal(payload[1..], "ramsql")) try writer.ok(0, self.status(db)) else try writer.failure(1049, "42000", "Unknown database; use ramsql");
+                        if (equal(payload[1..], "ramsql")) try writer.ok(0, 0, self.status(db)) else try writer.failure(1049, "42000", "Unknown database; use ramsql");
                     },
                     3 => {
                         if (db.execute(payload[1..], &self.result)) |_| {
@@ -392,7 +393,7 @@ pub fn Session(comptime DB: type) type {
                     },
                     14 => {
                         if (payload.len != 1) return error.MalformedPacket;
-                        try writer.ok(0, self.status(db));
+                        try writer.ok(0, 0, self.status(db));
                     },
                     else => try writer.failure(1047, "08S01", "Unsupported MySQL command"),
                 }

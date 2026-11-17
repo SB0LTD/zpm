@@ -1346,7 +1346,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     column.virtual = flags & 0x20 != 0;
                     flags &= 0x1f;
                 }
-                if (flags >> 2 > 4) return error.InvalidChangeRecord;
+                if (flags >> 2 > @intFromEnum(types.DefaultKind.mysql_auto_increment)) return error.InvalidChangeRecord;
                 column.not_null = flags & 1 != 0;
                 column.primary_key = flags & 2 != 0;
                 column.default_kind = @enumFromInt(flags >> 2);
@@ -1364,6 +1364,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 if ((column.default_kind == .identity_always or column.default_kind == .identity_by_default) and
                     (!column.not_null or (column.data_type != .smallint and column.data_type != .integer32 and column.data_type != .integer)))
                     return error.InvalidChangeRecord;
+                if (column.default_kind == .mysql_auto_increment and (!column.primary_key or
+                    (column.data_type != .integer32 and column.data_type != .integer))) return error.InvalidChangeRecord;
                 out.columns[index] = column;
             }
             for (out.columns[0..out.count]) |*column| if (column.virtual and column.default_kind != .generated) return error.InvalidChangeRecord;

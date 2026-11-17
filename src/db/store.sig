@@ -480,6 +480,8 @@ pub fn Store(comptime Raw: type) type {
             sequences: SequenceSession = .{},
             /// Startup `database` (current_database(); information_schema catalogs).
             database_name: [64]u8 = @splat(0),
+            mysql_keep_zero: bool = false,
+            mysql_last_insert_id: u64 = 0,
             database_len: u8 = 0,
             /// The open COPY FROM runs in an implicit transaction.
             copy_implicit: bool = false,
@@ -658,6 +660,8 @@ pub fn Store(comptime Raw: type) type {
                     .statement_us = self.statement_us,
                     .clock = self.store.wall_clock,
                     .database = if (self.database_len == 0) "postgres" else self.database_name[0..self.database_len],
+                    .mysql_keep_zero = self.mysql_keep_zero,
+                    .mysql_last_insert_id = self.mysql_last_insert_id,
                 };
                 if (comptime has_control) raw.session.control = if (self.running_statement) &self.execution else null;
                 if (comptime has_engine_session) {
@@ -1160,10 +1164,14 @@ pub fn Store(comptime Raw: type) type {
             fn finish(self: *Connection, slot: u16, implicit: bool, result: *Result) !void {
                 self.pending = .{};
                 self.cancel_requested = false;
-                if (!implicit) return;
-                self.tx = null;
-                try self.store.commit(slot);
-                self.store.database.lastOutcomeInto(result);
+                if (implicit) {
+                    self.tx = null;
+                    try self.store.commit(slot);
+                    self.store.database.lastOutcomeInto(result);
+                }
+                if (comptime @hasField(Result, "mysql_generated_id")) {
+                    if (self.dialect == .mysql and result.mysql_generated_id != 0) self.mysql_last_insert_id = result.mysql_generated_id;
+                }
             }
 
             fn run(self: *Connection, source: []const u8, result: *Result, slot: u16, implicit: bool, resuming: bool) !void {
@@ -1437,6 +1445,21 @@ pub fn Store(comptime Raw: type) type {
                 }
                 if (count != 0 and command[count - 1] == ';') count -= 1;
                 const cmd = if (long_command) "" else command[0..count];
+                if (self.dialect == .mysql) {
+                    for ([_][]const u8{ "SET SESSION SQL_MODE", "SET SQL_MODE" }) |prefix| {
+                        if (cmd.len <= prefix.len or !same(prefix, cmd[0..prefix.len])) continue;
+                        var assignment = cmd[prefix.len..];
+                        while (assignment.len != 0 and assignment[0] == ' ') assignment = assignment[1..];
+                        if (assignment.len == 0 or assignment[0] != '=') continue;
+                        assignment = assignment[1..];
+                        while (assignment.len != 0 and assignment[0] == ' ') assignment = assignment[1..];
+                        if (self.failed) return error.TransactionFailed;
+                        if (same(assignment, "'NO_AUTO_VALUE_ON_ZERO'")) self.mysql_keep_zero = true
+                        else if (same(assignment, "''")) self.mysql_keep_zero = false else return error.UnsupportedStatement;
+                        result.clear(0);
+                        return;
+                    }
+                }
                 if (same(cmd, "SET AUTOCOMMIT = 0") or same(cmd, "SET AUTOCOMMIT=0") or same(cmd, "SET AUTOCOMMIT = 1") or same(cmd, "SET AUTOCOMMIT=1")) {
                     if (self.failed) return error.TransactionFailed;
                     try self.setAutocommit(cmd[cmd.len - 1] == '1');

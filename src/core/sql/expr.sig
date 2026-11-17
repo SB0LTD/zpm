@@ -1211,6 +1211,7 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .function => switch (n.func) {
                     .mysql_date_add => return mysqlDateAdd(ctx, n),
+                    .mysql_last_insert_id => return .{ .integer = @intCast(ctx.session.mysql_last_insert_id) },
                     .grouping => {
                         var value:i64=0;var item=n.b;
                         while(item!=none):(item=node(ctx,item).next) {

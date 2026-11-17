@@ -2067,6 +2067,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .window_call => unreachable,
                 .mysql_ifnull => unreachable, // Parsed directly as COALESCE.
+                .mysql_last_insert_id => n.ty = .int8,
                 .mysql_date_add => {
                     if (count != 2) return error.UndefinedFunction;
                     const date = context.node(n.b);
@@ -3274,7 +3275,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn bindDefaults(context: *const Context, index: usize, entry: *const S.Table, needed: *const [config.columns]bool, defaults: *[config.columns]u16, generated: *[config.columns]u16) Error!void {
             for (entry.columns[0..entry.column_count], 0..) |*column, position| switch (column.default_kind) {
-                .none => {},
+                .none, .mysql_auto_increment => {},
                 .identity_always, .identity_by_default => defaults[position] = try context.pool.add(.{ .kind = .function, .func = .identity_next, .integer = @intCast(index), .column = @intCast(position), .ty = types.typeOfData(column.data_type) }),
                 .default => if (needed[position]) { defaults[position] = try bindExpressionText(context, column, null, storedSource(index, position)); },
                 .generated => generated[position] = try bindExpressionText(context, column, index, storedSource(index, position)),
@@ -4208,7 +4209,7 @@ pub fn Binder(comptime config: types.Config) type {
             const n = context.node(id);
             if (context.dialect == .tds and (n.kind == .cast or (n.kind == .function and
                 (n.func == .tds_isnull or n.func == .tds_dateadd)))) return .{};
-            if (n.func == .mysql_ifnull or n.func == .mysql_date_add)
+            if (n.func == .mysql_ifnull or n.func == .mysql_date_add or n.func == .mysql_last_insert_id)
                 return literalName(context.source[n.text.start..n.text.end]);
             const result = figure(context, id, &buffer);
             return literalName(result.name);
@@ -7439,7 +7440,8 @@ pub fn Binder(comptime config: types.Config) type {
                     // Owned sequences live in public: identity and SERIAL
                     // columns stay outside other schemas (0A000).
                     if (namespace != catalog.public_namespace) for (create.columns[0..create.count]) |*definition| {
-                        if (definition.serial != 0 or definition.default_kind == .identity_always or definition.default_kind == .identity_by_default) return error.UnsupportedStatement;
+                        if (definition.serial != 0 or definition.default_kind == .identity_always or definition.default_kind == .identity_by_default or
+                            definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
                     };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind, .virtual = definition.virtual };
@@ -7462,9 +7464,12 @@ pub fn Binder(comptime config: types.Config) type {
                             out.serial_count += 1;
                         }
                         switch (definition.default_kind) {
-                            .identity_always, .identity_by_default => {
+                            .identity_always, .identity_by_default, .mysql_auto_increment => {
                                 if (!integerColumn(column.data_type)) return error.TypeMismatch;
                                 if (out.identity != null) return error.UnsupportedStatement;
+                                if (definition.default_kind == .mysql_auto_increment and
+                                    (create.inherits != null or create.like != null or create.partition_by != .none or
+                                    (column.data_type != .integer32 and column.data_type != .integer))) return error.UnsupportedStatement;
                                 column.not_null = true;
                                 var options = definition.sequence;
                                 if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
@@ -7490,6 +7495,11 @@ pub fn Binder(comptime config: types.Config) type {
                         out.extras.parent = context.tables[parent_index].oid;
                     }
                     try bindTableConstraints(context, create.constraints[0..create.constraint_count], &out);
+                    if (out.identity) |identity| {
+                        const key = &out.columns[identity.column];
+                        if (key.default_kind == .mysql_auto_increment and (!key.primary_key or out.serial_count != 0))
+                            return error.InvalidTableDefinition;
+                    }
                     if (create.partition_by != .none) {
                         // Rows live in the partitions: keys and references
                         // on the partitioned table are outside the subset.
@@ -7932,6 +7942,8 @@ pub fn Binder(comptime config: types.Config) type {
             const index = found.slot;
             const entry = &context.tables[index];
             if (entry.relkind != 'r') return error.WrongObjectType;
+            for (entry.columns[0..entry.column_count]) |column| if (column.default_kind == .mysql_auto_increment)
+                return error.UnsupportedStatement;
             var out = alterOf(context, index, .alter_table);
             // Inheritance and partition definitions keep their column lists.
             if (entry.parent != 0 or hasChildren(context, entry.oid)) for (alter.actions[0..alter.count]) |*action| switch (action.*) {
@@ -7958,7 +7970,7 @@ pub fn Binder(comptime config: types.Config) type {
                     switch (definition.default_kind) {
                         // Identity and stored generation need per-row values
                         // (a table rewrite); a new primary key needs an index.
-                        .identity_always, .identity_by_default, .generated => return error.UnsupportedStatement,
+                        .identity_always, .identity_by_default, .generated, .mysql_auto_increment => return error.UnsupportedStatement,
                         else => {},
                     }
                     if (definition.primary_key) return error.UnsupportedStatement;
@@ -8617,6 +8629,7 @@ pub fn Binder(comptime config: types.Config) type {
                 var copy = column;
                 copy.primary_key = column.primary_key and like.indexes;
                 switch (column.default_kind) {
+                    .mysql_auto_increment => return error.UnsupportedStatement,
                     .default => if (!like.defaults) {
                         copy.default_kind = .none;
                         copy.expression = .{};
@@ -8691,6 +8704,8 @@ pub fn Binder(comptime config: types.Config) type {
         fn bindMerge(context: *const Context, merge: *const Ast.Merge) Error!Bound {
             const index = try writableTable(context, try resolveQualified(context, merge.table.schema, merge.table.name), false);
             const entry = &context.tables[index];
+            if (entry.primary_column) |key| if (entry.columns[key].default_kind == .mysql_auto_increment)
+                return error.UnsupportedStatement;
             var scope = tableScope(context, index);
             if (merge.table.alias) |alias| scope.rels[0].name = toName(context, alias);
             var out: Merge = .{ .table = index, .source = none, .on = none };
@@ -8925,6 +8940,8 @@ pub fn Binder(comptime config: types.Config) type {
         pub fn bindCopy(context: *const Context, copy: *const Ast.Copy, with_defaults: bool) Error!Copy {
             const index = try writableTable(context, try resolveQualified(context, copy.table.schema, copy.table.name), false);
             const entry = &context.tables[index];
+            if (entry.primary_column) |key| if (copy.direction == .from and entry.columns[key].default_kind == .mysql_auto_increment)
+                return error.UnsupportedStatement;
             var out: Copy = .{ .table = index };
             if (copy.explicit_columns) {
                 var mapped: [config.columns]bool = @splat(false);
