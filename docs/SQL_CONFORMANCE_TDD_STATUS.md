@@ -16,7 +16,12 @@ Server 2022 CU28 each matched all six.
 
 The broader PostgreSQL 18 durable SCRAM suite matched 327 of 331 cases on the
 same revision. Four catalog queries using `regclass` failed on the detached
-read lane. Follow the replacement release matrix for closure of that regression.
+read lane. The replacement `5a51a6e1f5304a4c6228210d7538440d77f177df` and ZPM
+`c17529d836bc94336e29aef959b06f91974a4e11` matched all 331 cases against native
+PostgreSQL 18.3 on Windows. RAMSQL used durable SCRAM and the reference
+restarted in immediate mode. The Windows differential report SHA-256 is
+`b7b36be202bc8af3fb63753fc9dcb56906a8822c0572e1039a53e0026160af75`.
+Hosted matrix qualification for the replacement is pending.
 [SQL Server comparison](https://github.com/benor1470/dbMeter/actions/runs/44185665967) ·
 [PostgreSQL qualification](https://github.com/SB0LTD/ramsql/actions/runs/44185459464) ·
 [Replacement matrix](https://github.com/SB0LTD/ramsql/actions/runs/44189642358)

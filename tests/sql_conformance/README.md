@@ -12,8 +12,8 @@ require their own versioned native oracles. See the
 On 18 November 2026, the combined RAMSQL candidate matched all 106 native
 PostgreSQL 18.3 probes with durable cluster mode and prepared transactions
 enabled, six of six native MySQL 8.4.13 probes and six of six native SQL Server
-2022 CU28 probes. The separately tracked durable SCRAM suite still had four
-catalog mismatches on that revision. See the
+2022 CU28 probes. A follow-up candidate matched all 331 cases in the separate
+PostgreSQL durable SCRAM suite on Windows. See the
 [native wire checkpoint](../../docs/SQL_CONFORMANCE_TDD_STATUS.md#native-wire-checkpoint--18-november-2026).
 
 ## What this inventory proves
