@@ -1,0 +1,129 @@
+name: Native SQL Server smoke comparison
+
+on:
+  push:
+    branches: [bench/tsql-native-oracle-20261117]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RAMSQL_REVISION: e692402ec3aaeee616c0e53d57fd948c90a6e383
+      RAMSQL_ARCHIVE_SHA256: 3384824febe9841326287fa620919d4a6ad2137ae0fba08b5a9ce9444b4f43cd
+      ORACLE_IMAGE: mcr.microsoft.com/mssql/server@sha256:e10cd49443c94dbdcb7a050987db22ff4d8c87052ac53768abe1ed848d3fcef6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify the candidate source and install its compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p evidence
+          candidate="$RUNNER_TEMP/ramsql"
+          source_archive="$RUNNER_TEMP/ramsql-$RAMSQL_REVISION.tar.gz"
+          curl --fail --location --retry 3 "https://github.com/SB0LTD/ramsql/archive/$RAMSQL_REVISION.tar.gz" --output "$source_archive"
+          printf '%s  %s\n' "$RAMSQL_ARCHIVE_SHA256" "$source_archive" | sha256sum --check --strict -
+          mkdir -p "$candidate"
+          tar -xf "$source_archive" -C "$candidate" --strip-components=1
+          python "$candidate/tools/release_matrix.py" --compiler-host "$RUNNER_OS/$RUNNER_ARCH" > evidence/compiler-release.json
+          read -r tag asset expected < <(python -c 'import json; p=json.load(open("evidence/compiler-release.json")); print(p["tag"], p["asset"], p["sha256"])')
+          archive="$RUNNER_TEMP/$asset"
+          destination="$RUNNER_TEMP/sig-toolchain"
+          curl --fail --location --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" --output "$archive"
+          printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --strict -
+          mkdir -p "$destination"
+          tar -xf "$archive" -C "$destination"
+          compiler="$(find "$destination" -type f -name sig -print -quit)"
+          marker="$(find "$destination" -type f -path '*/lib/std/std.sig' -print -quit)"
+          test -n "$compiler" && test -n "$marker"
+          chmod +x "$compiler"
+          echo "RAMSQL_SOURCE=$candidate" >> "$GITHUB_ENV"
+          echo "SIG=$compiler" >> "$GITHUB_ENV"
+          echo "SIG_LIB_DIR=$(dirname "$(dirname "$marker")")" >> "$GITHUB_ENV"
+      - name: Prepare the verified matching runtime
+        run: python "$RAMSQL_SOURCE/tools/prepare_sig_runtime.py" --installed-lib "$SIG_LIB_DIR" --output "$RUNNER_TEMP/sig-runtime" --github-env "$GITHUB_ENV"
+      - name: Build the exact candidate and record provenance
+        run: |
+          set -euo pipefail
+          "$SIG" version | tee evidence/sig-version.txt
+          (cd "$RAMSQL_SOURCE"; "$SIG" build -Doptimize=ReleaseSafe) 2>&1 | tee evidence/build.txt
+          install -m 755 "$RAMSQL_SOURCE/sig-out/bin/ramsql" evidence/ramsql
+          sha256sum evidence/ramsql > evidence/SHA256SUMS
+          evidence/ramsql --version | tee evidence/ramsql-version.txt
+          cp "$SIG_RUNTIME_PREPARATION" evidence/runtime-preparation.json
+          PYTHONPATH="$RAMSQL_SOURCE/tools" python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from package_release import dependency_provenance
+
+          path = Path("evidence")
+          with (path / "ramsql").open("rb") as binary:
+              digest = hashlib.file_digest(binary, "sha256").hexdigest()
+          proof = {
+              "candidate_revision": os.environ["RAMSQL_REVISION"],
+              "candidate_source_sha256": os.environ["RAMSQL_ARCHIVE_SHA256"],
+              "candidate_binary_sha256": digest,
+              "candidate_zpm": dependency_provenance(),
+              "candidate_build": ["-Doptimize=ReleaseSafe"],
+              "oracle_image": os.environ["ORACLE_IMAGE"],
+              "harness_revision": os.environ["GITHUB_SHA"],
+              "workflow_run": os.environ["GITHUB_RUN_ID"],
+          }
+          (path / "provenance.json").write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
+          PY
+      - name: Execute the original T-SQL probes over both native wire listeners
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check python-tds==1.17.1
+          python -m unittest discover -s tests/sql_conformance -p test_audit_tsql.py
+          export MSSQL_SA_PASSWORD="$(python -c 'import secrets; print("ZpmSql!1" + secrets.token_urlsafe(24))')"
+          echo "::add-mask::$MSSQL_SA_PASSWORD"
+          export ZPM_SQLSERVER_ORACLE_PASSWORD="$MSSQL_SA_PASSWORD"
+          docker pull "$ORACLE_IMAGE"
+          docker image inspect "$ORACLE_IMAGE" > evidence/sqlserver-image.json
+          container="$(docker run --detach --rm --publish 127.0.0.1::1433 \
+            --env ACCEPT_EULA=Y --env MSSQL_PID=Developer --env MSSQL_SA_PASSWORD "$ORACLE_IMAGE")"
+          cleanup() {
+            docker logs "$container" > evidence/sqlserver-service.log 2>&1 || true
+            docker stop "$container" >/dev/null || true
+          }
+          trap cleanup EXIT
+          oracle="$(docker port "$container" 1433/tcp)"
+          export ORACLE_PORT="${oracle##*:}"
+          sha256sum --check --strict evidence/SHA256SUMS
+          PYTHONPATH="$RAMSQL_SOURCE/tools" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          from test_clients import running_server
+
+          path = Path("evidence")
+          proof = json.loads((path / "provenance.json").read_text(encoding="utf-8"))
+          with running_server((path / "ramsql").resolve()) as ports:
+              result = subprocess.run([
+                  sys.executable, "tests/sql_conformance/audit_tsql.py",
+                  "--port", os.environ["ORACLE_PORT"], "--wait-seconds", "180",
+                  "--candidate-port", str(ports["mssql"]),
+                  "--candidate-revision", proof["candidate_revision"],
+                  "--candidate-binary-sha256", proof["candidate_binary_sha256"],
+                  "--report", str(path / "tsql-native.json"),
+              ], check=False)
+          raise SystemExit(result.returncode)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tsql-native-oracle-evidence
+          path: evidence/
+          if-no-files-found: warn
