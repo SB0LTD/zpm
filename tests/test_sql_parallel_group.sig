@@ -15,7 +15,7 @@ const DB = sql.Database(.{
 var db: DB = .{};
 var serial: DB.Result = .{};
 var result: DB.Result = .{};
-var storage: [128 * 1024 * 1024]u8 align(64) = undefined;
+var storage: [DB.backingBytes(rows + 2, (rows + 2) * 2, 4096) catch unreachable]u8 align(64) = undefined;
 var assertions: usize = 0;
 
 fn check(ok: bool) !void {
