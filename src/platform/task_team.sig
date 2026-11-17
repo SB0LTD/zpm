@@ -1,6 +1,6 @@
 //! Bounded joined task dispatch over caller-owned native worker handles.
 const std = @import("std");
-const workers = @import("worker_thread.sig");
+const workers = @import("worker_thread");
 
 pub const available = workers.available;
 pub const stack_bytes_per_helper = workers.stack_bytes;

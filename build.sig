@@ -200,7 +200,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_packed_large = try ctx.addStep("test-packed-integer-100m", "Qualify 100M real packed values, with and without NULLs", &noopStep);
     _ = try addContract(ctx, test_packed_large, "contract-packed-integer-100m", "tests/test_packed_integer_100m.sig", &.{importEntry("packed_integer", "src/core/packed_integer.sig"), importEntry("page_region", "src/platform/page_region.sig")});
     _ = try ctx.addModule("worker_thread", "src/platform/worker_thread.sig");
-    _ = try ctx.addModule("task_team", "src/platform/task_team.sig");
+    const task_team = try ctx.addModule("task_team", "src/platform/task_team.sig");
+    try wire(ctx, task_team, "worker_thread", "src/platform/worker_thread.sig");
     _ = try ctx.addModule("resource_budget", "src/core/resource_budget.sig");
     const test_resources = try ctx.addStep("test-resource-budget", "Execute machine-budget arithmetic and owned grant contracts", &noopStep);
     try ctx.addDependency(test_all, test_resources);
