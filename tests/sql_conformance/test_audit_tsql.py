@@ -57,6 +57,16 @@ class NativeTsqlHarnessTests(unittest.TestCase):
         self.assertEqual(result["error"], {"number": 102, "severity": 15, "state": 1, "line": 2, "message": "Invalid SQL"})
         self.assertFalse(audit.calibrate(self.cases[key], [result]))
 
+    def test_candidate_failure_phase_and_exact_metadata(self):
+        key = "TSQL.IDENTIFIERS"
+        oracle = {"status": "completed", "statements": self.result(key, [metadata("value")], [[1]])}
+        self.assertEqual(audit.compare(oracle, oracle, True), ("smoke_pass", None))
+        candidate = {"status": "completed", "statements": self.result(key, [metadata("value", 127)], [[1]])}
+        self.assertEqual(audit.compare(oracle, candidate, True), ("fail", "Column metadata differs"))
+        for status, expected in (("harness_error", "candidate_unavailable"),
+                                 ("setup_error", "candidate_setup_fail"), ("sql_error", "fail")):
+            self.assertEqual(audit.compare(oracle, {"status": status}, True)[0], expected)
+
 
 if __name__ == "__main__":
     unittest.main()

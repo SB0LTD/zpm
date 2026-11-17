@@ -36,6 +36,10 @@ per case in `tempdb`, captures the TDS client's column metadata, rows, row count
 and errors, and checks the returned values independently. A failed connection,
 wrong server build, invalid fixture or incorrect result exits nonzero.
 The result is limited to the six native smoke cases.
+For a live RamSQL comparison, pass the isolated listener's `--candidate-port`,
+`--candidate-revision` and `--candidate-binary-sha256`. The audit compares only
+cases that reached a valid native result and reports setup and transport
+failures separately from SQL mismatches.
 
 ```sh
 python -m pip install python-tds==1.17.1
