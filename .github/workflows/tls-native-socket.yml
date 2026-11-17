@@ -1,0 +1,127 @@
+name: Native TLS socket qualification
+
+on:
+  push:
+    branches: [ci/tls-native-socket-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  socket-contract:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            suffix: x86_64-linux.tar.xz
+            sha256: 179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a
+          - runner: windows-latest
+            suffix: x86_64-windows.zip
+            sha256: 291a3225ff33c32e8c479471c44be6db0d811d6023d759c64e0a7d5bf810576c
+    env:
+      BASELINE: 2201854883403a6316e7459fc78fd06efa89fd86
+      CANDIDATE: 5b2a19946d17f5cda7172e1748c36dfe010e5aa2
+      SIG_ASSET_SUFFIX: ${{ matrix.suffix }}
+      SIG_ASSET_SHA256: ${{ matrix.sha256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+      - name: Compile and run exact native transport tests
+        shell: python
+        run: |
+          import hashlib, os, shutil, subprocess, tarfile, urllib.request, zipfile
+          from pathlib import Path
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          evidence = Path("evidence")
+          evidence.mkdir()
+          temp = Path(os.environ["RUNNER_TEMP"])
+          baseline, candidate = os.environ["BASELINE"], os.environ["CANDIDATE"]
+          assert git("rev-parse", "HEAD^") == candidate
+          assert git("rev-parse", candidate + "^") == baseline
+          (evidence / "source.log").write_text(f"workflow={git('rev-parse', 'HEAD')}\nbaseline={baseline}\ncandidate={candidate}\n")
+
+          tag = "sig-0.6.5-zig0.17.0.3c72687"
+          archive = temp / f"{tag}-{os.environ['SIG_ASSET_SUFFIX']}"
+          url = f"https://github.com/SB0LTD/sig/releases/download/{tag}/{archive.name}"
+          with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as output:
+              shutil.copyfileobj(response, output)
+          with archive.open("rb") as source:
+              digest = hashlib.file_digest(source, "sha256").hexdigest()
+          assert digest == os.environ["SIG_ASSET_SHA256"], digest
+          sdk = temp / "tls-sig-sdk"
+          sdk.mkdir()
+          windows = os.name == "nt"
+          if windows:
+              with zipfile.ZipFile(archive) as package:
+                  package.extractall(sdk)
+          else:
+              with tarfile.open(archive, "r:xz") as package:
+                  package.extractall(sdk, filter="data")
+          executable = "sig.exe" if windows else "sig"
+          [compiler] = sdk.glob(f"**/bin/{executable}")
+          standard = compiler.parent.parent / "lib"
+          assert (standard / "std/std.sig").is_file()
+          sdk_version = subprocess.check_output([compiler, "version"], text=True).strip()
+          with compiler.open("rb") as source:
+              compiler_digest = hashlib.file_digest(source, "sha256").hexdigest()
+          (evidence / "sdk.log").write_text(f"{url}\n{digest}\n{sdk_version}\n{compiler_digest}\n")
+
+          def qualify(name, revision):
+              workspace = temp / ("tls-socket-" + name)
+              git("worktree", "add", "--detach", str(workspace), revision)
+              core = workspace / "src/core"
+              crypto = core / "crypto"
+              command = [
+                  str(compiler), "test", "-OReleaseSafe", "--Sig-lib-dir", str(standard),
+                  "--cache-dir", str(temp / ("tls-cache-" + name)),
+                  "--global-cache-dir", str(temp / "tls-global-cache"),
+              ]
+              if windows:
+                  command.extend(["-lws2_32", "-lbcrypt"])
+              for module in ("sha256", "p256", "p384", "hkdf", "gcm", "chacha20poly1305", "x25519", "tls13_keys", "win32"):
+                  command.extend(["--dep", module])
+              command.extend([
+                  f"-Mroot={crypto / 'tls/winsock.sig'}",
+                  "--dep", "sig_mem", "--dep", "sig_testing", f"-Msha256={core / 'sha256.sig'}",
+                  "--dep", "sha256", "--dep", "hmac", f"-Mp256={crypto / 'p256.sig'}",
+                  f"-Mp384={crypto / 'p384.sig'}",
+                  "--dep", "hmac", f"-Mhkdf={crypto / 'hkdf.sig'}",
+                  "--dep", "aes", f"-Mgcm={crypto / 'gcm.sig'}",
+                  f"-Mchacha20poly1305={crypto / 'chacha20poly1305.sig'}",
+                  f"-Mx25519={crypto / 'x25519.sig'}",
+                  "--dep", "sha256", "--dep", "hkdf", "--dep", "hmac", f"-Mtls13_keys={crypto / 'tls13_keys.sig'}",
+                  f"-Mwin32={workspace / 'src/platform/win32.sig'}",
+                  f"-Msig_mem={core / 'sig_mem.sig'}", f"-Msig_testing={core / 'sig_testing.sig'}",
+                  "--dep", "sha256", f"-Mhmac={crypto / 'hmac.sig'}", f"-Maes={crypto / 'aes.sig'}",
+              ])
+              report = subprocess.run(command, capture_output=True, timeout=240)
+              output = (report.stdout + report.stderr).decode("utf-8", errors="replace")
+              (evidence / f"{name}.log").write_text(output, encoding="utf-8")
+              print(output)
+              return report.returncode, output
+
+          status, output = qualify("baseline", baseline)
+          if windows:
+              assert status == 0
+          else:
+              assert status != 0 and "expected type 'i32', found 'usize'" in output
+          status, output = qualify("candidate", candidate)
+          assert status == 0
+          test_name = (
+              "TLS transport buffers a native Windows loopback TCP exchange" if windows else
+              "TLS transport buffers native Linux socket IO without a Winsock shim"
+          )
+          assert test_name + "...OK" in output
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: tls-socket-${{ matrix.runner }}
+          path: evidence/
