@@ -210,6 +210,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try ctx.addDependency(test_all,test_parallel);
     _=try addContract(ctx,test_parallel,"contract-parallel-read","tests/test_sql_parallel_read.sig",&.{
         importEntry("sql","src/core/sql.sig"),importEntry("worker_thread","src/platform/worker_thread.sig"),importEntry("db_store","src/db/store.sig")});
+    _ = try addContract(ctx, test_parallel, "contract-detached-temporal-zone", "tests/test_sql_detached_temporal_zone.sig", &.{
+        importEntry("sql", "src/core/sql.sig"),
+    });
     const test_db = try ctx.addStep("test-db", "Execute database wire, transaction and TCP contracts", &noopStep);
     try ctx.addDependency(test_all, test_db);
     _ = try addContract(ctx, test_db, "contract-db-registry", "tests/test_db_registry.sig", &.{
