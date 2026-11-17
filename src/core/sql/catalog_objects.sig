@@ -22,12 +22,15 @@
 //!                    owner u32, flags u32, grant_flags u32, name (len u8 +
 //!                    bytes, may be empty), role_count u8 + role OIDs u32,
 //!                    text_len u16 + bytes, split u16 (<= text_len)
+//!                    domain only: version u8, base u8, not_null u8,
+//!                    comparison u8, signed CHECK bound i64
 //!   71 object_drop   kind u8, oid u32, target u32, grantee u32, sub i32
 //!
 //! Kinds and keys: 1 role (oid), 2 member (target role, grantee member),
 //! 3 acl (target table, grantee role or 0 PUBLIC), 4 relation (target
 //! table), 5 policy (oid), 6 comment (grantee classoid, target object, sub
-//! column), 7 fdw (oid), 8 server (oid), 9 publication (oid).
+//! column), 7 fdw (oid), 8 server (oid), 9 publication (oid), 10 domain
+//! (oid, namespace). Domain creates append a versioned typed payload.
 //!
 //! Roles are SQL-level: the bootstrap superuser (OID 10, `ramsql`) is the
 //! role every wire session runs as (RAMSQL authenticates one SCRAM user and
@@ -58,7 +61,37 @@ pub const class_policy: u32 = 3256;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, _ };
+
+pub const DomainComparison = enum(u8) {
+    none = 0, eq = 1, ne = 2, lt = 3, le = 4, gt = 5, ge = 6,
+
+    fn reverse(self: DomainComparison) DomainComparison {
+        return switch (self) { .lt => .gt, .le => .ge, .gt => .lt, .ge => .le, else => self };
+    }
+
+    pub fn accepts(self: DomainComparison, value: i64, bound: i64) bool {
+        return switch (self) {
+            .none => true, .eq => value == bound, .ne => value != bound,
+            .lt => value < bound, .le => value <= bound, .gt => value > bound, .ge => value >= bound,
+        };
+    }
+};
+
+pub const Domain = struct {
+    base: types.Type = .unknown,
+    not_null: bool = false,
+    comparison: DomainComparison = .none,
+    bound: i64 = 0,
+};
+
+pub fn domainBase(base: types.Type) bool {
+    return base == .int2 or base == .int4 or base == .int8;
+}
+
+pub fn oidWidth(kind: Kind) u32 {
+    return if (kind == .domain) 2 else if (ownsOid(kind)) 1 else 0;
+}
 
 /// Role attributes (pg_authid booleans).
 pub const role_superuser: u32 = 1;
@@ -206,6 +239,8 @@ pub const Server = struct {
 };
 
 pub const Publication = struct { name: Ident = .{}, flags: u32 = pub_default };
+pub const CreateDomain = struct { name: Qualified, spec: Domain };
+pub const DropDomains = struct { names: [list_capacity]Qualified = @splat(.{}), count: usize = 0, if_exists: bool = false };
 
 pub const Statement = union(enum) {
     create_role: RoleSpec,
@@ -225,6 +260,8 @@ pub const Statement = union(enum) {
     create_publication: Publication,
     drop_publication: Drop,
     create_extension: Named,
+    create_domain: CreateDomain,
+    drop_domain: DropDomains,
 };
 
 // ---- parser -------------------------------------------------------------------
@@ -236,6 +273,7 @@ pub fn parse(source: []const u8, comptime name_bytes: usize, comptime text_bytes
     var p: Parser = .{ .tokens = .{ .source = source, .text_limit = text_bytes }, .source = source, .name_bytes = name_bytes };
     try p.advance();
     if (try p.take("create")) {
+        if (try p.take("domain")) return .{ .create_domain = try p.createDomain() };
         if (try p.take("role")) return .{ .create_role = try p.roleSpec(.role, true) };
         if (p.word("user")) {
             try p.advance();
@@ -264,12 +302,14 @@ pub fn parse(source: []const u8, comptime name_bytes: usize, comptime text_bytes
         return null;
     }
     if (try p.take("alter")) {
+        if (p.word("domain")) return error.UnsupportedStatement;
         if (try p.take("role") or try p.take("user") or try p.take("group")) return .{ .alter_role = try p.roleSpec(.role, false) };
         if (try p.take("policy")) return .{ .alter_policy = try p.policy(.alter) };
         if (try p.take("table")) return p.tableSecurity();
         return null;
     }
     if (try p.take("drop")) {
+        if (try p.take("domain")) return .{ .drop_domain = try p.dropDomains() };
         if (try p.take("role") or try p.take("user") or try p.take("group")) return .{ .drop_role = try p.dropList() };
         if (try p.take("policy")) return .{ .drop_policy = try p.policy(.drop) };
         if (try p.take("foreign")) {
@@ -389,6 +429,77 @@ const Parser = struct {
         if (try self.take("cascade")) return true;
         _ = try self.take("restrict");
         return false;
+    }
+
+    fn domainInteger(self: *Parser) Error!i64 {
+        const negative = try self.takeSymbol(.minus);
+        if (!negative) _ = try self.takeSymbol(.plus);
+        if (self.current.kind != .integer) return error.UnsupportedStatement;
+        const magnitude = self.current.integer;
+        const limit: u64 = if (negative) 0x8000000000000000 else 0x7fffffffffffffff;
+        if (magnitude > limit) return error.NumericValueOutOfRange;
+        try self.advance();
+        return if (negative) @bitCast(0 -% magnitude) else @intCast(magnitude);
+    }
+
+    fn domainComparison(self: *Parser) Error!DomainComparison {
+        if (self.current.kind != .symbol) return error.UnsupportedStatement;
+        const op: DomainComparison = switch (self.current.symbol) {
+            .eq => .eq, .ne => .ne, .lt => .lt, .le => .le, .gt => .gt, .ge => .ge,
+            else => return error.UnsupportedStatement,
+        };
+        try self.advance();
+        return op;
+    }
+
+    fn createDomain(self: *Parser) Error!CreateDomain {
+        const name = try self.qualified();
+        _ = try self.take("as");
+        var spec: Domain = .{};
+        if (try self.take("smallint") or try self.take("int2")) {
+            spec.base = .int2;
+        } else if (try self.take("integer") or try self.take("int") or try self.take("int4")) {
+            spec.base = .int4;
+        } else if (try self.take("bigint") or try self.take("int8")) {
+            spec.base = .int8;
+        } else return error.UnsupportedStatement;
+        var null_seen = false;
+        while (!self.atEnd()) {
+            if (!null_seen and (self.word("null") or self.word("not"))) {
+                spec.not_null = try self.take("not");
+                try self.expect("null");
+                null_seen = true;
+            } else if (spec.comparison == .none and try self.take("check")) {
+                try self.expectSymbol(.lparen);
+                const value_first = try self.take("value");
+                if (!value_first) spec.bound = try self.domainInteger();
+                spec.comparison = try self.domainComparison();
+                if (value_first) {
+                    spec.bound = try self.domainInteger();
+                } else {
+                    try self.expect("value");
+                    spec.comparison = spec.comparison.reverse();
+                }
+                if (!try self.takeSymbol(.rparen)) return error.UnsupportedStatement;
+            } else return error.UnsupportedStatement;
+        }
+        try self.finish();
+        return .{ .name = name, .spec = spec };
+    }
+
+    fn dropDomains(self: *Parser) Error!DropDomains {
+        var drop: DropDomains = .{ .if_exists = try self.ifExists() };
+        while (true) {
+            if (drop.count == list_capacity) return error.ProgramLimitExceeded;
+            drop.names[drop.count] = try self.qualified();
+            drop.count += 1;
+            if (!try self.takeSymbol(.comma)) break;
+        }
+        // Domain columns and domain-on-domain dependencies are unsupported,
+        // so both drop behaviors delete the same objects.
+        _ = try self.dropBehavior();
+        try self.finish();
+        return drop;
     }
 
     fn dropList(self: *Parser) Error!Drop {
@@ -907,6 +1018,7 @@ pub const Cursor = struct {
             1 => u8,
             2 => u16,
             4 => u32,
+            8 => u64,
             else => @compileError("unsupported object field"),
         };
         const raw = try self.take(@sizeOf(T));
@@ -918,12 +1030,16 @@ pub const Cursor = struct {
 
 /// Kinds whose objects own an OID (allocated from the database counter).
 pub fn ownsOid(kind: Kind) bool {
-    return kind == .role or kind == .member or kind == .policy or kind == .fdw or kind == .server or kind == .publication;
+    return kind == .role or kind == .member or kind == .policy or kind == .fdw or kind == .server or kind == .publication or kind == .domain;
 }
 
 /// Kinds whose objects carry a unique name.
 fn named(kind: Kind) bool {
-    return kind == .role or kind == .policy or kind == .fdw or kind == .server or kind == .publication;
+    return kind == .role or kind == .policy or kind == .fdw or kind == .server or kind == .publication or kind == .domain;
+}
+
+fn scoped(kind: Kind) bool {
+    return kind == .policy or kind == .domain;
 }
 
 pub fn Objects(comptime config: types.Config) type {
@@ -959,6 +1075,8 @@ pub fn Objects(comptime config: types.Config) type {
             text: [text_capacity]u8 = @splat(0),
             text_len: u16 = 0,
             split: u16 = 0,
+            /// Domains store their generated array name in the text payload.
+            domain: Domain = .{},
 
             pub fn textSlice(self: *const Object) []const u8 {
                 return self.text[0..self.text_len];
@@ -1013,6 +1131,7 @@ pub fn Objects(comptime config: types.Config) type {
             if (a.kind != b.kind) return false;
             return switch (a.kind) {
                 .role, .policy, .fdw, .server, .publication => a.oid == b.oid,
+                .domain => a.oid == b.oid and a.target == b.target,
                 .member, .acl => a.target == b.target and a.grantee == b.grantee,
                 .relation => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
@@ -1035,8 +1154,23 @@ pub fn Objects(comptime config: types.Config) type {
         pub fn byName(self: *const Self, kind: Kind, target: u32, name: []const u8, snap: storage.Snapshot) ?usize {
             for (&self.items, 0..) |*o, index| {
                 if (o.kind != kind or !visible(o, snap) or !types.same(o.name.slice(), name)) continue;
-                if (kind == .policy and o.target != target) continue;
+                if (scoped(kind) and o.target != target) continue;
                 return index;
+            }
+            return null;
+        }
+
+        pub fn domainNameTaken(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) bool {
+            for (&self.items) |*o| if (o.kind == .domain and o.target == namespace and visible(o, snap)) {
+                if (types.same(o.name.slice(), name) or types.same(o.textSlice(), name)) return true;
+            };
+            return false;
+        }
+
+        pub fn pendingDomainName(self: *const Self, namespace: u32, name: []const u8, snap: storage.Snapshot) ?u16 {
+            for (&self.items) |*o| {
+                const other = pendingOf(o, snap) orelse continue;
+                if (o.kind == .domain and o.target == namespace and (types.same(o.name.slice(), name) or types.same(o.textSlice(), name))) return other;
             }
             return null;
         }
@@ -1056,7 +1190,7 @@ pub fn Objects(comptime config: types.Config) type {
             for (&self.items) |*o| {
                 const other = pendingOf(o, snap) orelse continue;
                 if (sameKey(o, key)) return other;
-                if (named(key.kind) and o.kind == key.kind and types.same(o.name.slice(), key.name.slice()) and (key.kind != .policy or o.target == key.target)) return other;
+                if (named(key.kind) and o.kind == key.kind and types.same(o.name.slice(), key.name.slice()) and (!scoped(key.kind) or o.target == key.target)) return other;
             }
             return null;
         }
@@ -1323,6 +1457,13 @@ pub fn Objects(comptime config: types.Config) type {
             try writer.int(u16, o.text_len);
             try writer.bytes(o.textSlice());
             try writer.int(u16, o.split);
+            if (o.kind == .domain) {
+                try writer.int(u8, 1);
+                try writer.int(u8, @intFromEnum(o.domain.base));
+                try writer.int(u8, @intFromBool(o.domain.not_null));
+                try writer.int(u8, @intFromEnum(o.domain.comparison));
+                try writer.int(i64, o.domain.bound);
+            }
         }
 
         pub fn encodeDrop(writer: anytype, o: *const Object) Error!void {
@@ -1335,7 +1476,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > 9) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > 10) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1355,6 +1496,7 @@ pub fn Objects(comptime config: types.Config) type {
             const ok = switch (o.kind) {
                 .role, .fdw, .publication => o.oid != 0 and o.target == 0 and o.grantee == 0 and o.sub == 0,
                 .policy, .server => o.oid != 0 and o.grantee == 0 and o.sub == 0,
+                .domain => o.oid != 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .acl => o.oid == 0 and o.target != 0 and o.sub == 0,
                 .relation => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
@@ -1410,9 +1552,21 @@ pub fn Objects(comptime config: types.Config) type {
                 .server => has_name and o.target != 0 and o.flags & ~(server_type | server_version) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.owner != 0 and
                     (o.flags & server_type != 0 or o.split == 0) and (o.flags & server_version != 0 or o.split == o.text_len),
                 .publication => has_name and o.flags & ~@as(u32, 63) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
+                .domain => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.split == 0 and
+                    o.text_len != 0 and o.text_len <= config.name_bytes and o.text[0] == '_' and !types.same(o.name.slice(), o.textSlice()),
                 _ => false,
             };
             if (!valid) return error.InvalidChangeRecord;
+            if (o.kind == .domain) {
+                for (o.textSlice()) |byte| if (byte == 0) return error.InvalidChangeRecord;
+                if (try cursor.int(u8) != 1) return error.UnsupportedLogVersion;
+                const base: types.Type = @enumFromInt(try cursor.int(u8));
+                const not_null = try cursor.int(u8);
+                const comparison = try cursor.int(u8);
+                const bound = try cursor.int(i64);
+                if (!domainBase(base) or not_null > 1 or comparison > 6 or (comparison == 0 and bound != 0)) return error.InvalidChangeRecord;
+                o.domain = .{ .base = base, .not_null = not_null != 0, .comparison = @enumFromInt(comparison), .bound = bound };
+            }
             return o;
         }
 
@@ -1448,13 +1602,19 @@ pub fn Objects(comptime config: types.Config) type {
             roles: [role_capacity]u32 = @splat(0),
             role_count: u8 = 0,
             name: V.Name = .{},
+            array_name: V.Name = .{},
         };
 
         pub const Overlay = struct {
             items: [capacity]VObject = @splat(.{}),
 
             fn project(o: *const Object, live: bool) VObject {
-                return .{ .used = o.used, .live = live, .kind = o.kind, .oid = o.oid, .target = o.target, .grantee = o.grantee, .sub = o.sub, .owner = o.owner, .roles = o.roles, .role_count = o.role_count, .name = o.name };
+                var out: VObject = .{ .used = o.used, .live = live, .kind = o.kind, .oid = o.oid, .target = o.target, .grantee = o.grantee, .sub = o.sub, .owner = o.owner, .roles = o.roles, .role_count = o.role_count, .name = o.name };
+                if (o.kind == .domain) {
+                    out.array_name.len = @intCast(o.text_len);
+                    @memcpy(out.array_name.bytes[0..o.text_len], o.textSlice());
+                }
+                return out;
             }
 
             /// A replayable entry is committed and never marked: apply only
@@ -1475,6 +1635,7 @@ pub fn Objects(comptime config: types.Config) type {
                 for (&self.items) |*v| {
                     if (!v.used or !ownsOid(v.kind)) continue;
                     if (v.oid >= oid and v.oid - oid < width) return true;
+                    if (v.kind == .domain and v.oid + 1 >= oid and v.oid + 1 - oid < width) return true;
                 }
                 return false;
             }
@@ -1482,6 +1643,13 @@ pub fn Objects(comptime config: types.Config) type {
             pub fn roleExists(self: *const Overlay, oid: u32) bool {
                 if (oid == bootstrap_role) return true;
                 return self.liveOid(.role, oid);
+            }
+
+            pub fn domainNameTaken(self: *const Overlay, namespace: u32, name: []const u8) bool {
+                for (&self.items) |*v| if (v.live and v.kind == .domain and v.target == namespace) {
+                    if (types.same(v.name.slice(), name) or types.same(v.array_name.slice(), name)) return true;
+                };
+                return false;
             }
 
             fn liveOid(self: *const Overlay, kind: Kind, oid: u32) bool {
@@ -1494,22 +1662,30 @@ pub fn Objects(comptime config: types.Config) type {
             /// objectOidTaken for the record so far, and notes allocated OIDs
             /// (noteObjectOid).
             pub fn create(self: *Overlay, o: *const Object, ctx: anytype) Error!void {
-                if (ownsOid(o.kind)) {
-                    if (o.oid < first_oid or o.oid == 0xffffffff or ctx.objectOidTaken(o.oid)) return error.ChangeRecordConflict;
+                const width = oidWidth(o.kind);
+                if (width != 0) {
+                    if (o.oid < first_oid or o.oid > 0xffffffff - width) return error.ChangeRecordConflict;
+                    for (0..width) |offset| if (ctx.objectOidTaken(o.oid + @as(u32, @intCast(offset)))) return error.ChangeRecordConflict;
                 }
                 for (&self.items) |*v| {
                     if (!v.live) continue;
                     const existing = asObject(v);
                     if (sameKey(&existing, o)) return error.ChangeRecordConflict;
-                    if (named(o.kind) and v.kind == o.kind and types.same(v.name.slice(), o.name.slice()) and (o.kind != .policy or v.target == o.target)) return error.ChangeRecordConflict;
+                    if (named(o.kind) and v.kind == o.kind and (!scoped(o.kind) or v.target == o.target)) {
+                        if (types.same(v.name.slice(), o.name.slice())) return error.ChangeRecordConflict;
+                        if (o.kind == .domain and (types.same(v.array_name.slice(), o.name.slice()) or
+                            types.same(v.name.slice(), o.textSlice()) or types.same(v.array_name.slice(), o.textSlice()))) return error.ChangeRecordConflict;
+                    }
                 }
                 if (o.kind == .role and (types.same(o.name.slice(), bootstrap_name) or reservedRoleName(o.name.slice()))) return error.ChangeRecordConflict;
+                if (o.kind == .domain and (ctx.objectRelationNameTaken(o.target, o.name.slice()) or
+                    ctx.objectRelationNameTaken(o.target, o.textSlice()))) return error.ChangeRecordConflict;
                 try self.references(o.kind, o.target, o.grantee, o.sub, o.owner, o.roles[0..o.role_count], ctx);
                 for (&self.items) |*v| if (!v.used) {
                     v.* = project(o, true);
                     // A decoded version is not yet an entry: mark it taken.
                     v.used = true;
-                    if (ownsOid(o.kind)) ctx.noteObjectOid(o.oid);
+                    if (width != 0) ctx.noteObjectOid(o.oid + width - 1);
                     return;
                 };
                 return error.ChangeRecordConflict;
@@ -1557,6 +1733,9 @@ pub fn Objects(comptime config: types.Config) type {
                     },
                     .server => {
                         if (!self.liveOid(.fdw, target)) return error.ChangeRecordConflict;
+                    },
+                    .domain => {
+                        if ((target != 2200 and target < first_oid) or !ctx.objectSchemaLive(target)) return error.ChangeRecordConflict;
                     },
                     .comment => {
                         const exists = switch (grantee) {

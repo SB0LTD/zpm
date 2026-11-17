@@ -746,7 +746,8 @@ pub fn Database(comptime config: Config) type {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
-                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects};
+                    .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,
+                    .domain_catalog=&db.catalog_objects};
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
@@ -1685,7 +1686,8 @@ pub fn Database(comptime config: Config) type {
             var statement_copy = parsed.*;
             const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role);
             const source = try self.secureTarget(&statement_copy, expanded, original, snap);
-            const context = self.bindContext(source, mode, snap);
+            var context = self.bindContext(source, mode, snap);
+            if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.domain_catalog = &self.catalog_objects;
             const bound = try B.bind(&context, &statement_copy);
             if (self.txs[slot].read_only) try readOnlyCheck(&bound, &self.workspace.plans);
             try self.checkPrivileges(&bound, snap);
@@ -2060,6 +2062,16 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
+            var domain_count: usize = 0;
+            var latest = snap;
+            latest.csn = self.csn;
+            for (&self.catalog_objects.items) |*o| {
+                if (o.kind != .domain or o.target != drop.oid) continue;
+                if (O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                if (!O.visible(o, snap)) continue;
+                if (!drop.cascade) return error.DependentObjects;
+                domain_count += 1;
+            }
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snap, &relations);
             for (relations[0..count]) |found| {
@@ -2067,7 +2079,10 @@ pub fn Database(comptime config: Config) type {
                 if (!drop.cascade) return error.DependentObjects;
                 _ = try self.dropTable(slot, found.slot, true, snap);
             }
-            try self.reserveWrites(slot, 2);
+            try self.reserveWrites(slot, 2 + domain_count);
+            for (&self.catalog_objects.items, 0..) |*o, index| {
+                if (o.kind == .domain and o.target == drop.oid and O.visible(o, snap)) self.objectDelete(slot, index, snap);
+            }
             schema.pending_drop = true;
             schema.creator = slot;
             tx.push(.{ .kind = .drop_schema, .table = @intCast(drop.slot) }) catch unreachable;
@@ -2244,6 +2259,14 @@ pub fn Database(comptime config: Config) type {
 
         fn catalogObject(self: *Self, slot: u16, source: []const u8, object_statement: *const CO.Statement, snap: Snapshot) Error!void {
             const command: CommandTag = switch (object_statement.*) {
+                .create_domain => |*domain| blk: {
+                    try self.createDomain(slot, source, domain, snap);
+                    break :blk .create_domain;
+                },
+                .drop_domain => |*drop| blk: {
+                    try self.dropDomains(slot, source, drop, snap);
+                    break :blk .drop_domain;
+                },
                 .create_role => |*spec| blk: {
                     try self.createRole(slot, source, spec, snap);
                     break :blk .create_role;
@@ -2316,6 +2339,99 @@ pub fn Database(comptime config: Config) type {
                 },
             };
             self.outcome = .{ .affected = 0, .command = command };
+        }
+
+        fn domainNamespace(self: *const Self, source: []const u8, name: CO.Qualified, snap: Snapshot) Error!u32 {
+            const schema = if (name.has_schema) objectName(source, name.schema) else Name{};
+            return namespaceFor(&self.catalog, if (name.has_schema) schema.slice() else null, snap) orelse error.UndefinedSchema;
+        }
+
+        fn domainNameOccupied(self: *const Self, namespace: u32, name: []const u8, snap: Snapshot) bool {
+            if (self.catalog_objects.domainNameTaken(namespace, name, snap)) return true;
+            const relation = self.catalog.findIn(namespace, name, snap) orelse return false;
+            return relation.kind != 'S';
+        }
+
+        fn pendingTypeName(self: *const Self, namespace: u32, name: []const u8, snap: Snapshot) ?u16 {
+            return self.catalog.creator(name, snap) orelse self.catalog_objects.pendingDomainName(namespace, name, snap);
+        }
+
+        fn checkRelationTypeName(self: *Self, slot: u16, namespace: u32, name: []const u8, snap: Snapshot) Error!void {
+            if (self.catalog_objects.pendingDomainName(namespace, name, snap)) |other| return self.objectPark(slot, other);
+            var latest = snap;
+            latest.csn = self.csn;
+            if (self.catalog_objects.domainNameTaken(namespace, name, latest)) return error.DuplicateObject;
+        }
+
+        fn createDomain(self: *Self, slot: u16, source: []const u8, create: *const CO.CreateDomain, snap: Snapshot) Error!void {
+            if (self.dialect != .postgres or self.routine_frame != null) return error.UnsupportedStatement;
+            if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
+            const namespace = try self.domainNamespace(source, create.name, snap);
+            if (namespace != catalog_module.public_namespace and namespace < change_log.first_oid) return error.InsufficientPrivilege;
+            for (&self.schemas) |*schema| {
+                if (schema.live and schema.oid == namespace and schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
+            }
+            const owner = self.session.role;
+            if (self.catalog_objects.pendingReference(owner, snap)) |other| return self.objectPark(slot, other);
+            var latest = snap;
+            latest.csn = self.csn;
+            if (try self.domainNamespace(source, create.name, latest) != namespace) return error.SerializationFailure;
+            if (owner != CO.bootstrap_role and self.catalog_objects.byOid(.role, owner, latest) == null) return error.SerializationFailure;
+            const name = objectName(source, create.name.name);
+            if (name.len == 0) return error.Syntax;
+            if (self.pendingTypeName(namespace, name.slice(), snap)) |other| return self.objectPark(slot, other);
+            if (self.domainNameOccupied(namespace, name.slice(), latest)) return error.DuplicateObject;
+            var domain: O.Object = .{ .kind = .domain, .target = namespace, .owner = owner, .name = name, .domain = create.spec };
+            const limit = @min(config.name_bytes, O.text_capacity);
+            var found = false;
+            for (1..limit + 1) |prefix| {
+                const length = @min(name.len, limit - prefix);
+                @memset(domain.text[0..prefix], '_');
+                @memcpy(domain.text[prefix..][0..length], name.slice()[0..length]);
+                domain.text_len = @intCast(prefix + length);
+                const candidate = domain.textSlice();
+                if (types.same(name.slice(), candidate)) continue;
+                if (self.pendingTypeName(namespace, candidate, snap)) |other| return self.objectPark(slot, other);
+                if (self.domainNameOccupied(namespace, candidate, latest)) continue;
+                found = true;
+                break;
+            }
+            if (!found) return error.NameCapacity;
+            try self.reserveWrites(slot, 1);
+            const width = CO.oidWidth(.domain);
+            if (self.oid_counter > 0xffffffff - change_log.first_oid - width) return error.TableCapacity;
+            domain.oid = change_log.first_oid + self.oid_counter;
+            _ = try self.objectInsert(slot, &domain, false, snap);
+            self.oid_counter += width;
+        }
+
+        fn dropDomains(self: *Self, slot: u16, source: []const u8, drop: *const CO.DropDomains, snap: Snapshot) Error!void {
+            if (self.dialect != .postgres or self.routine_frame != null) return error.UnsupportedStatement;
+            var found: [CO.list_capacity]usize = undefined;
+            var count: usize = 0;
+            for (drop.names[0..drop.count]) |name| {
+                const namespace = self.domainNamespace(source, name, snap) catch |err| {
+                    if (err == error.UndefinedSchema and drop.if_exists) continue;
+                    return err;
+                };
+                const wanted = objectName(source, name.name);
+                if (self.catalog_objects.pendingDomainName(namespace, wanted.slice(), snap)) |other| return self.objectPark(slot, other);
+                const index = self.catalog_objects.byName(.domain, namespace, wanted.slice(), snap) orelse {
+                    if (drop.if_exists) continue;
+                    return error.UndefinedObject;
+                };
+                const object = &self.catalog_objects.items[index];
+                if (object.xmax_csn > snap.csn) return error.SerializationFailure;
+                if (!self.privilegedRole(snap) and !self.catalog_objects.memberOf(self.session.role, object.owner, true, snap)) return error.InsufficientPrivilege;
+                for (found[0..count]) |previous| {
+                    if (previous == index) break;
+                } else {
+                    found[count] = index;
+                    count += 1;
+                }
+            }
+            try self.reserveWrites(slot, count);
+            for (found[0..count]) |index| self.objectDelete(slot, index, snap);
         }
 
         // -- roles ---------------------------------------------------------
@@ -2401,7 +2517,10 @@ pub fn Database(comptime config: Config) type {
                 for (roles[0..count]) |seen| known = known or seen == oid;
                 if (known) continue;
                 if (self.catalog_objects.pendingReference(oid, snap)) |other| return self.objectPark(slot, other);
+                var latest = snap;
+                latest.csn = self.csn;
                 for (&self.catalog_objects.items) |*o| {
+                    if (o.kind == .domain and o.owner == oid and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
                     switch (o.kind) {
                         .member => {
@@ -2418,7 +2537,7 @@ pub fn Database(comptime config: Config) type {
                                 if (listed == oid) return error.DependentObjects;
                             }
                         },
-                        .relation, .fdw, .server, .publication => if (o.owner == oid) return error.DependentObjects,
+                        .relation, .fdw, .server, .publication, .domain => if (o.owner == oid) return error.DependentObjects,
                         else => {},
                     }
                 }
@@ -3702,15 +3821,22 @@ pub fn Database(comptime config: Config) type {
             const public: i64 = catalog_module.public_namespace;
             switch (view) {
                 .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
-                .pg_type => inline for (@typeInfo(DataType).@"enum".field_names) |field| {
-                    const data_type = @field(DataType, field);
-                    const info = types.typeInfo(data_type);
-                    var category: [1]u8 = .{info.category};
-                    try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)) });
-                    // The type's array type (`_name`, category A).
-                    if (types.arrayData(data_type)) |array_type| {
-                        const array_info = types.typeInfo(array_type);
-                        try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)) });
+                .pg_type => {
+                    inline for (@typeInfo(DataType).@"enum".field_names) |field| {
+                        const data_type = @field(DataType, field);
+                        const info = types.typeInfo(data_type);
+                        const category: [1]u8 = .{info.category};
+                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false) });
+                        if (types.arrayData(data_type)) |array_type| {
+                            const array_info = types.typeInfo(array_type);
+                            try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false) });
+                        }
+                    }
+                    for (&self.catalog_objects.items) |*domain| {
+                        if (domain.kind != .domain or !O.visible(domain, snapshot)) continue;
+                        const info = types.typeInfo(types.dataTypeOf(domain.domain.base));
+                        try sink.add(&.{ intCell(domain.oid), nameCell(domain.name.slice()), intCell(domain.target), intCell(info.len), nameCell("d"), nameCell("N"), intCell(domain.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(domain.owner), intCell(-1), boolCell(domain.domain.not_null) });
+                        try sink.add(&.{ intCell(domain.oid + 1), nameCell(domain.textSlice()), intCell(domain.target), intCell(-1), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(domain.oid), intCell(domain.owner), intCell(-1), boolCell(false) });
                     }
                 },
                 .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
@@ -4089,6 +4215,7 @@ pub fn Database(comptime config: Config) type {
             // CREATE TABLE AS / MATERIALIZED VIEW read their sources first,
             // so a lock wait parks before anything is written.
             if (create.plan != ast.none) try self.lockSources(slot);
+            try self.checkRelationTypeName(slot, create.namespace, create.name.slice(), snap);
             if (self.catalog.creator(create.name.slice(), snap)) |owner| {
                 var waits: L.Set = .{};
                 waits.add(owner);
@@ -4335,6 +4462,10 @@ pub fn Database(comptime config: Config) type {
         /// free table slot (TableCapacity, 54000) until the old one is
         /// reclaimed after commit.
         fn alterTable(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            const source = &self.tables[alter.table];
+            if (!types.same(alter.name.slice(), source.name.slice())) {
+                try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);
+            }
             try self.lockTable(slot, alter.table, .access_exclusive);
             const tx = &self.txs[slot];
             try self.reserveWrites(slot, 3 + 2 * config.columns);
@@ -4348,7 +4479,6 @@ pub fn Database(comptime config: Config) type {
                 self.reclaimTables(self.horizon());
             }
             const index = destination orelse return error.TableCapacity;
-            const source = &self.tables[alter.table];
             // Owned sequences (identity, SERIAL) record their column: it must
             // keep its position (dropping or shifting it is 0A000).
             for (&self.seqs) |*seq| {
@@ -8207,6 +8337,7 @@ pub fn Database(comptime config: Config) type {
             const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role);
             var context = self.bindContext(expanded, .standard, snap);
             context.describe_only=true;
+            if (parsed == .select) context.domain_catalog = &self.catalog_objects;
             const bound = try B.bind(&context, &statement_copy);
             result.clear(0);
             result.command = B.command(&bound);

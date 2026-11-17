@@ -686,6 +686,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     return oidTaken(self.db, self.scratch, oid, 1);
                 }
 
+                pub fn objectRelationNameTaken(self: *const @This(), namespace: u32, name: []const u8) bool {
+                    return tableNameTaken(self.scratch, name, namespace);
+                }
+
                 pub fn noteObjectOid(self: *const @This(), oid: u32) void {
                     self.next_oid.* = @max(self.next_oid.*, oid + 1);
                 }
@@ -768,10 +772,19 @@ pub fn ChangeLog(comptime config: types.Config) type {
         }
 
         /// Relation names are unique per schema; sequences live in public.
-        fn nameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
+        fn tableNameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
             for (&scratch.tables) |*vt| if (vt.live and vt.namespace == namespace and types.same(vt.name.slice(), name)) return true;
+            return false;
+        }
+
+        fn relationNameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
+            if (tableNameTaken(scratch, name, namespace)) return true;
             if (namespace == public_namespace) for (&scratch.seqs) |*seq| if (seq.live and types.same(seq.name.slice(), name)) return true;
             return false;
+        }
+
+        fn nameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
+            return relationNameTaken(scratch, name, namespace) or scratch.object_overlay.domainNameTaken(namespace, name);
         }
 
         fn findVSchema(scratch: *Scratch, oid: u32) Error!usize {
@@ -1662,7 +1675,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             if (definition.spec.cache <= 1) return error.InvalidChangeRecord;
                         }
                         if (definition.oid < first_oid or definition.oid == 0xffffffff or oidTaken(db, scratch, definition.oid, 1)) return error.ChangeRecordConflict;
-                        if (nameTaken(scratch, definition.name.slice(), public_namespace)) return error.ChangeRecordConflict;
+                        if (relationNameTaken(scratch, definition.name.slice(), public_namespace)) return error.ChangeRecordConflict;
                         if (definition.owner != 0) {
                             const owner = try findVTable(scratch, definition.owner);
                             if (definition.owner_column >= scratch.tables[owner].column_count) return error.ChangeRecordConflict;
@@ -1920,7 +1933,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.object_create) => {
                         const object = try O.decodeCreate(record, &reader.position);
                         db.catalog_objects.applyCreate(&object, db.epoch, db.cid, csn);
-                        if (catalog_objects.ownsOid(object.kind)) db.oid_counter = @max(db.oid_counter, object.oid + 1 - first_oid);
+                        const width = catalog_objects.oidWidth(object.kind);
+                        if (width != 0) db.oid_counter = @max(db.oid_counter, object.oid + width - first_oid);
                     },
                     @intFromEnum(Op.object_drop) => {
                         const key = try O.decodeDrop(record, &reader.position);

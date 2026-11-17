@@ -1499,6 +1499,8 @@ pub fn Session(comptime DB: type) type {
                 .create_publication => "CREATE PUBLICATION",
                 .drop_publication => "DROP PUBLICATION",
                 .create_extension => "CREATE EXTENSION",
+                .create_domain => "CREATE DOMAIN",
+                .drop_domain => "DROP DOMAIN",
                 else => null,
             };
         }

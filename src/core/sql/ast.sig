@@ -368,6 +368,10 @@ pub const Node = struct {
     planned_null: bool = false,
     /// Binder-validated DATE literal: integer stores its exact day count.
     date_bound: bool = false,
+    /// A bound, root-projection domain cast. `integer` holds the CHECK bound.
+    domain_cast: bool = false,
+    domain_not_null: bool = false,
+    domain_comparison: catalog_objects.DomainComparison = .none,
     ty: Type = .unknown,
     cast_type: TypeName = .int4,
     /// Cast target typmod (-1 none).

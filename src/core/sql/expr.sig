@@ -1147,7 +1147,13 @@ pub fn Eval(comptime config: types.Config) type {
                         try ctx.session.checkpoint();return .{.date=@intCast(n.integer)};
                     }
                     const value = try eval(ctx, n.a);
-                    return cast(value, node(ctx, n.a).ty, n.cast_type, n.typmod, ctx.session);
+                    const converted = try cast(value, node(ctx, n.a).ty, n.cast_type, n.typmod, ctx.session);
+                    if (n.domain_cast) {
+                        if (converted == .null_value) {
+                            if (n.domain_not_null) return error.NotNullViolation;
+                        } else if (!n.domain_comparison.accepts(converted.integer, n.integer)) return error.CheckViolation;
+                    }
+                    return converted;
                 },
                 .at_zone => {
                     const value = try eval(ctx, n.a);
