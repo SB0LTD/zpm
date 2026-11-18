@@ -1,8 +1,8 @@
-name: Linux timed TCP completion contract
+name: Linux completion wake contract
 
 on:
   push:
-    branches: [perf/linux-tcp-timed-enter-20261118]
+    branches: [perf/linux-tcp-linked-turn-20261118]
 
 permissions:
   contents: read
