@@ -654,6 +654,51 @@ fn alterConstraints() !void {
     try sameState(&.{ "SELECT * FROM a ORDER BY id, q", "SELECT oid, relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY oid", "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'a' ORDER BY constraint_name" });
 }
 
+fn alterPrimaryKey() !void {
+    reset();
+    try run("CREATE SCHEMA restore_keys");
+    try run("CREATE TABLE restore_keys.parent (id INT, label TEXT)");
+    try run("INSERT INTO restore_keys.parent VALUES (1,'north'),(1,'south'),(NULL,'east')");
+    const rows_sql = "SELECT id, label FROM restore_keys.parent ORDER BY label";
+    const add_key = "ALTER TABLE ONLY restore_keys.parent ADD CONSTRAINT parent_pkey PRIMARY KEY (id)";
+    try run("UPDATE restore_keys.parent SET id=3 WHERE label='east'");
+    try rejects(add_key, error.PrimaryKeyViolation, rows_sql, "3|east;1|north;1|south");
+    try run("UPDATE restore_keys.parent SET id=2 WHERE label='south'");
+    try run("UPDATE restore_keys.parent SET id=NULL WHERE label='east'");
+    try rejects(add_key, error.NotNullViolation, rows_sql, "NULL|east;1|north;2|south");
+    try run("UPDATE restore_keys.parent SET id=3 WHERE label='east'");
+
+    const older = try db.begin();
+    try db.beginModes(older, .{ .isolation = .repeatable_read });
+    try same(try rows(older, "SELECT COUNT(*) FROM restore_keys.parent"), "3");
+    try run("INSERT INTO restore_keys.parent VALUES (NULL,'west')");
+    try statementFails(older, add_key, error.NotNullViolation);
+    db.abort(older);
+    try run("DELETE FROM restore_keys.parent WHERE label='west'");
+    try run(add_key);
+    try expect("SELECT label FROM restore_keys.parent WHERE id = 2", "south");
+    try rejects("ALTER TABLE restore_keys.parent ADD PRIMARY KEY (label)", error.InvalidTableDefinition, rows_sql, "3|east;1|north;2|south");
+    try rejects("INSERT INTO restore_keys.parent VALUES (1,'west')", error.PrimaryKeyViolation, rows_sql, "3|east;1|north;2|south");
+    try rejects("INSERT INTO restore_keys.parent VALUES (NULL,'west')", error.NotNullViolation, rows_sql, "3|east;1|north;2|south");
+    const metadata = "SELECT constraint_name FROM information_schema.table_constraints WHERE table_schema='restore_keys' AND table_name='parent' AND constraint_type='PRIMARY KEY'";
+    try expect(metadata, "parent_pkey");
+    try run("CREATE TABLE restore_keys.child (id INT, parent_id INT)");
+    try run("INSERT INTO restore_keys.child VALUES (11,2),(12,1)");
+    try run("ALTER TABLE ONLY restore_keys.child ADD PRIMARY KEY (id)");
+    try run("ALTER TABLE ONLY restore_keys.child ADD CONSTRAINT child_parent_fk FOREIGN KEY (parent_id) REFERENCES restore_keys.parent(id)");
+    const joined = "SELECT c.id,p.label FROM restore_keys.child c JOIN restore_keys.parent p ON p.id=c.parent_id ORDER BY c.id";
+    try rejects("INSERT INTO restore_keys.child VALUES (13,99)", error.ForeignKeyViolation, joined, "11|south;12|north");
+    try sameState(&.{ rows_sql, metadata, joined });
+
+    try run("CREATE TABLE pairs (a INT, b INT)");
+    try run("INSERT INTO pairs VALUES (1,1),(1,2),(2,1)");
+    try run("ALTER TABLE pairs ADD PRIMARY KEY (a,b)");
+    const pair_query = "SELECT a,b FROM pairs ORDER BY a,b";
+    try rejects("INSERT INTO pairs VALUES (1,2)", error.PrimaryKeyViolation, pair_query, "1|1;1|2;2|1");
+    try rejects("INSERT INTO pairs VALUES (1,NULL)", error.NotNullViolation, pair_query, "1|1;1|2;2|1");
+    try sameState(&.{pair_query});
+}
+
 fn alterErrors() !void {
     reset();
     try run("CREATE TABLE a (id INT PRIMARY KEY, v INT)");
@@ -1268,6 +1313,7 @@ pub fn main(init: std.process.Init) !void {
     try compositeKeys();
     try alterValues();
     try alterConstraints();
+    try alterPrimaryKey();
     try alterErrors();
     try alterTransactions();
     try alterIsolation();

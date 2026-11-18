@@ -6504,7 +6504,11 @@ pub fn Database(comptime config: Config) type {
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
             count = try self.catalog.create(index, copy, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
-            try self.validateAltered(slot, index, alter, snap);
+            // A rewrite changes every row's definition. Include writes that
+            // committed before the exclusive lock, even for an older snapshot.
+            var validation_snap = snap;
+            validation_snap.csn = self.csn;
+            try self.validateAltered(slot, index, alter, validation_snap);
             // CREATE INDEX: OIDs are taken last, so a failed statement
             // leaves the counter as it was (abort restores a tail OID).
             for (copy.indexes[0..copy.index_count]) |*created| if (created.oid == 0) {
@@ -6553,8 +6557,14 @@ pub fn Database(comptime config: Config) type {
                     if (!has_null) try self.referencedRow(slot, index, constraint, cells, snap);
                 }
                 for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
-                    if (!alter.check_constraint[position] or !S.scannedUnique(table, constraint)) continue;
-                    switch (S.uniqueCheck(table, constraint, cells, @intCast(row), snap)) {
+                    if (!alter.check_constraint[position]) continue;
+                    const status = if (constraint.kind == .primary and table.primary_column != null)
+                        S.primaryKeyCheck(table, &cells[table.primary_column.?], @intCast(row), snap)
+                    else if (S.scannedUnique(table, constraint))
+                        S.uniqueCheck(table, constraint, cells, @intCast(row), snap)
+                    else
+                        continue;
+                    switch (status) {
                         .free => {},
                         .taken => return error.PrimaryKeyViolation,
                         .wait => |owner| {
