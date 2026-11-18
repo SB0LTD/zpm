@@ -845,15 +845,6 @@ pub fn Io(comptime config: types.Config) type {
                 var buffer: [4]u8 = undefined;
                 return cast(try textCell(try format(&cell, true, session, &buffer)), .text, to, typmod, session);
             }
-            if (to == .pg_internal_char) return switch (cell) {
-                .integer => |value| blk: {
-                    if (value < -128 or value > 127) return error.NumericValueOutOfRange;
-                    break :blk .{ .pg_internal_char = @bitCast(@as(i8, @intCast(value))) };
-                },
-                .text => |*value| .{ .pg_internal_char = parseInternalChar(value.slice()) },
-                .bpchar => |*value| .{ .pg_internal_char = parseInternalChar(value.slice()) },
-                else => error.CannotCoerce,
-            };
             if (cell == .xml and to != .xml) {
                 // xml -> text is binary coercible: the stored text.
                 if (!characterType(to)) return error.CannotCoerce;
@@ -887,6 +878,15 @@ pub fn Io(comptime config: types.Config) type {
                 return cast(text, .text, to, typmod, session);
             }
             const out: V.Cell = switch (to) {
+                .pg_internal_char => switch (cell) {
+                    .integer => |value| blk: {
+                        if (value < -128 or value > 127) return error.NumericValueOutOfRange;
+                        break :blk .{ .pg_internal_char = @bitCast(@as(i8, @intCast(value))) };
+                    },
+                    .text => |*value| .{ .pg_internal_char = parseInternalChar(value.slice()) },
+                    .bpchar => |*value| .{ .pg_internal_char = parseInternalChar(value.slice()) },
+                    else => return error.CannotCoerce,
+                },
                 .int2, .int4, .int8 => switch (cell) {
                     .integer => |value| blk: {
                         if (from == .oid and to == .int4) break :blk V.Cell{ .integer = if (value > 2147483647) value - 4294967296 else value };
