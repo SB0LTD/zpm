@@ -1,0 +1,120 @@
+name: Qualify native WAL batch
+
+on:
+  push:
+    branches: [ci/wal-contiguous-batch-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: Exact WAL contracts (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            suffix: x86_64-linux.tar.xz
+            sha256: 179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a
+          - runner: windows-latest
+            suffix: x86_64-windows.zip
+            sha256: 291a3225ff33c32e8c479471c44be6db0d811d6023d759c64e0a7d5bf810576c
+          - runner: macos-15
+            suffix: aarch64-macos.tar.xz
+            sha256: a936b163c87b471b603caa78aa84d4542c28b9ce3885f502d6901d68a3d716ae
+    env:
+      PYTHONUTF8: '1'
+      SIG_ASSET_SUFFIX: ${{ matrix.suffix }}
+      SIG_ASSET_SHA256: ${{ matrix.sha256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+      - name: Execute baseline and candidate durability assertions with a verified compiler
+        shell: python
+        run: |
+          import hashlib, json, os, platform, shutil, subprocess, tarfile, urllib.request, zipfile
+          from pathlib import Path
+
+          def git(*arguments):
+              return subprocess.check_output(["git", *arguments], text=True).strip()
+
+          evidence = Path("evidence")
+          evidence.mkdir()
+          temp = Path(os.environ["RUNNER_TEMP"])
+          candidate = git("rev-parse", "HEAD^")
+          baseline = git("rev-parse", candidate + "^")
+          assert git("diff", "--name-only", candidate, "HEAD") == ".github/workflows/wal-contiguous-batch.yml"
+          assert set(git("diff", "--name-only", baseline, candidate).splitlines()) == {
+              "src/db/durable_log.sig", "src/platform/db_file.sig", "tests/test_durable_log.sig", "tests/test_db_file.sig",
+          }
+          tag = "sig-0.6.5-zig0.17.0.3c72687"
+          archive = temp / f"{tag}-{os.environ['SIG_ASSET_SUFFIX']}"
+          url = f"https://github.com/SB0LTD/sig/releases/download/{tag}/{archive.name}"
+          with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as out:
+              shutil.copyfileobj(response, out)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          assert digest == os.environ["SIG_ASSET_SHA256"], digest
+          sdk = temp / "sig-sdk"
+          sdk.mkdir()
+          windows = os.name == "nt"
+          if windows:
+              with zipfile.ZipFile(archive) as package:
+                  package.extractall(sdk)
+          else:
+              with tarfile.open(archive, "r:xz") as package:
+                  package.extractall(sdk, filter="data")
+          executable = "sig.exe" if windows else "sig"
+          [compiler] = sdk.glob(f"**/bin/{executable}")
+          standard = compiler.parent.parent / "lib"
+          assert (standard / "std/std.sig").is_file()
+          provenance = {"baseline": baseline, "candidate": candidate, "workflow": git("rev-parse", "HEAD"),
+                        "platform": platform.platform(), "architecture": platform.machine(), "sdk_url": url,
+                        "sdk_sha256": digest, "compiler_version": subprocess.check_output([compiler, "version"], text=True).strip(),
+                        "compiler_sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(), "contracts": {}}
+          (evidence / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+          for state, revision in (("baseline", baseline), ("candidate", candidate)):
+              workspace = temp / f"wal-{state}"
+              git("worktree", "add", "--detach", str(workspace), revision)
+              (workspace / "sig-out").mkdir()
+              for suite in ("durable_log", "db_file"):
+                  binary = workspace / f"contract-{suite}{'.exe' if windows else ''}"
+                  command = [str(compiler), "build-exe", "-OReleaseSafe", "--Sig-lib-dir", str(standard),
+                             "--cache-dir", str(temp / f"sig-cache-{state}"),
+                             "--global-cache-dir", str(temp / "sig-global-cache"), f"-femit-bin={binary}"]
+                  if platform.system() == "Darwin":
+                      command.append("-lc")
+                  if windows:
+                      command.append("-lkernel32")
+                  command.extend(["--dep", "durable_log"])
+                  if suite == "db_file":
+                      command.extend(["--dep", "db_file"])
+                  command.extend([f"-Mroot={workspace / 'tests' / ('test_' + suite + '.sig')}",
+                                  f"-Mdurable_log={workspace / 'src/db/durable_log.sig'}"])
+                  if suite == "db_file":
+                      command.append(f"-Mdb_file={workspace / 'src/platform/db_file.sig'}")
+                  compiled = subprocess.run(command, cwd=workspace, capture_output=True, text=True, timeout=180)
+                  (evidence / f"{state}-{suite}-build.log").write_text(compiled.stdout + compiled.stderr)
+                  if compiled.returncode:
+                      raise RuntimeError(compiled.stdout + compiled.stderr)
+                  run = subprocess.run([binary], cwd=workspace, capture_output=True, text=True, timeout=60)
+                  (evidence / f"{state}-{suite}-run.log").write_text(run.stdout + run.stderr)
+                  if run.returncode:
+                      raise RuntimeError(run.stdout + run.stderr)
+                  result = json.loads(run.stdout)
+                  assert result["suite"] == suite and result["pass"] is True and result["assertions"] > 0, result
+                  print(state, result)
+                  provenance["contracts"].setdefault(state, {})[suite] = result
+                  (evidence / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+          for suite in ("durable_log", "db_file"):
+              assert provenance["contracts"]["candidate"][suite]["assertions"] > provenance["contracts"]["baseline"][suite]["assertions"]
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: wal-batch-${{ matrix.runner }}
+          path: evidence/
+          if-no-files-found: error
