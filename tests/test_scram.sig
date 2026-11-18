@@ -269,7 +269,42 @@ fn fuzz() !void {
     }
 }
 
+fn channelBinding() !void {
+    const v = try verifier();
+    const endpoint = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
+    const first_plus = "p=tls-server-end-point,,n=user,r=rOprNGfwEbeRWgbNEkqO";
+    const final_plus = "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=nY1Wus9a+gM2DrbQ1msXFgyhW6KM5ktOxWiU+/P/EGY=";
+    const wrong_binding = "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsHx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=TkrYLyZRx5vvXT58wSDsPw8PDJ6ElWOrU3s3Ur5v1Nc=";
+    const expected = "v=RwppMGddhz/J0lFYaRReBjXcQeNUFP5Qc76Lo5Exrig=";
+    var output: [512]u8 = undefined;
+    var bound = try scram.Server.init(&v, nonce);
+    try check(!bound.offersEndpoint() and bound.offersUnbound());
+    try rejects(error.InvalidBinding, bound.configureEndpoint(endpoint[0..31], false));
+    try bound.configureEndpoint(&endpoint, false);
+    try check(bound.offersEndpoint() and bound.offersUnbound());
+    try rejects(error.AuthenticationState, bound.configureEndpoint(&endpoint, true));
+    var severed = bound;
+    try check(eq(try bound.startNegotiated(.endpoint, first_plus, &output), challenge));
+    try check(eq(try bound.finish(final_plus, &output), expected) and bound.state == .complete);
+    _ = try severed.startNegotiated(.endpoint, first_plus, &output);
+    try rejects(error.AuthenticationFailed, severed.finish(wrong_binding, &output));
+    try check(severed.state == .failed);
+    var unbound = try scram.Server.init(&v, nonce);
+    try rejects(error.AuthenticationFailed, unbound.startNegotiated(.endpoint, first_plus, &output));
+    unbound = try scram.Server.init(&v, nonce);
+    try unbound.configureEndpoint(&endpoint, false);
+    var downgrade = unbound;
+    try rejects(error.AuthenticationFailed, downgrade.start("y,,n=user,r=client", &output));
+    try check(eq(try unbound.start(first, &output), challenge));
+    try check(eq(try unbound.finish(final, &output), signature));
+    var required = try scram.Server.init(&v, nonce);
+    try required.configureEndpoint(&endpoint, true);
+    try check(required.offersEndpoint() and !required.offersUnbound());
+    try rejects(error.AuthenticationFailed, required.start(first, &output));
+}
+
 pub fn main(init: std.process.Init) !void {
+    try channelBinding();
     try rfcVector();
     try positiveVariants();
     try credentialLists();
