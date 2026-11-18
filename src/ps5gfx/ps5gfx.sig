@@ -13,17 +13,23 @@
 //!   from the bottom, its blend factors are linear forms).
 //! - target: the pictures a game draws into, kept as the engine's images
 //!   by the address a game names them by, and read back for the display.
+//! - render: the renderer itself. A draw from the driver's queue is read,
+//!   converted and handed to the engine; what it cannot carry out is left
+//!   out and said. `render.install` puts it in place.
 //!
-//! Not yet: the shaders' machine code recompiled, and anything drawn.
+//! Not yet: the shaders' machine code recompiled (`render.shade` is
+//! where that plugs in), so no game's draw is drawn.
 //!
 //! Allocation-free.
 
 pub const state = @import("state.sig");
 pub const draw = @import("draw.sig");
 pub const target = @import("target.sig");
+pub const render = @import("render.sig");
 
 test {
     _ = state;
     _ = draw;
     _ = target;
+    _ = render;
 }

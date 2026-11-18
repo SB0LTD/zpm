@@ -433,14 +433,15 @@ test "a buffer written with these calls, carried out by the driver: state, draws
     const D = agcdriver.Draw;
     const want = [_]D{
         .{ .count = 3, .instances = 1, .base_vertex = 7 },
-        .{ .count = 6, .instances = 2, .index_address = @intFromPtr(&idx32), .index_size = 4 },
-        .{ .count = 6, .instances = 2, .index_address = @intFromPtr(&idx16), .index_size = 2 },
+        // (with indices, the same register is added to each of them)
+        .{ .count = 6, .instances = 2, .index_address = @intFromPtr(&idx32), .index_size = 4, .base_vertex = 7 },
+        .{ .count = 6, .instances = 2, .index_address = @intFromPtr(&idx16), .index_size = 2, .base_vertex = 7 },
         .{ .count = 4, .instances = 1 },
         .{ .count = 5, .instances = 2, .base_vertex = 7 },
         .{ .count = 6, .instances = 2, .base_vertex = 7 },
         .{ .count = 7, .instances = 2, .base_vertex = 7 },
         .{ .count = 9, .instances = 2, .base_vertex = 7 },
-        .{ .count = 6, .instances = 2, .index_address = @intFromPtr(&idx32), .index_size = 4 },
+        .{ .count = 6, .instances = 2, .index_address = @intFromPtr(&idx32), .index_size = 4, .base_vertex = 7 },
     };
     for (want, Seen.drawn[0..want.len]) |w, d| try testing.expectEqual(w, d);
     // The register a draw saw: set, cleared with the context, brought back.

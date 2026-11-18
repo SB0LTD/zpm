@@ -566,11 +566,14 @@ fn packet(s: *State, p: pm4.Packet) void {
             .instances = s.instances,
             .base_vertex = @bitCast(s.uc[UC.INDEX_OFFSET]),
         }) else skip(p),
+        // (the register that is a plain draw's first vertex is what the
+        // GPU adds to every index of an indexed one)
         OP.DRAW_INDEX_2 => if (b.len == 5) draw(s, .{
             .count = @min(b[3], b[0]),
             .instances = s.instances,
             .index_address = p.pair(1),
             .index_size = s.index_size,
+            .base_vertex = @bitCast(s.uc[UC.INDEX_OFFSET]),
         }) else skip(p),
         // (the first word is the most indices the draw may take, as this
         // project's graphics library writes it: the count itself)
@@ -579,6 +582,7 @@ fn packet(s: *State, p: pm4.Packet) void {
             .instances = s.instances,
             .index_address = s.index_base + @as(u64, b[1]) * s.index_size,
             .index_size = s.index_size,
+            .base_vertex = @bitCast(s.uc[UC.INDEX_OFFSET]),
         }) else skip(p),
         OP.DRAW_INDIRECT, OP.DRAW_INDEX_INDIRECT => {
             if (b.len != 4) return skip(p);
@@ -1183,11 +1187,12 @@ test "registers reach the draws that follow them; index and instance state" {
     try std.testing.expectEqual(Draw{ .count = 3, .instances = 1, .base_vertex = 7 }, Testing.drawn[0]);
     try std.testing.expectEqual(@as(u32, 0x11), Testing.seen_cx[0]);
     // With 32-bit indices at an address, four instances; the register as
-    // the masked write left it.
-    try std.testing.expectEqual(Draw{ .count = 6, .instances = 4, .index_address = @intFromPtr(&indices), .index_size = 4 }, Testing.drawn[1]);
+    // the masked write left it. The same register that was the first
+    // vertex is now added to every index.
+    try std.testing.expectEqual(Draw{ .count = 6, .instances = 4, .index_address = @intFromPtr(&indices), .index_size = 4, .base_vertex = 7 }, Testing.drawn[1]);
     try std.testing.expectEqual(@as(u32, 0xF1), Testing.seen_cx[1]);
     // From the fourth 16-bit index of the index buffer.
-    try std.testing.expectEqual(Draw{ .count = 3, .instances = 4, .index_address = @intFromPtr(&indices) + 6, .index_size = 2 }, Testing.drawn[2]);
+    try std.testing.expectEqual(Draw{ .count = 3, .instances = 4, .index_address = @intFromPtr(&indices) + 6, .index_size = 2, .base_vertex = 7 }, Testing.drawn[2]);
     try std.testing.expectEqual(@as(u32, 0), Testing.seen_cx[3]);
     try std.testing.expectEqual(@as(u32, 0xF1), Testing.seen_cx[4]);
     try std.testing.expectEqual(@as(u32, 0), queue.state.uc[pm4.UC_TAG]);
