@@ -849,11 +849,11 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         fn resetSimpleQuery(self: *Self) void {
             self.active_portal = null;
-            for (&self.statements) |*statement| if (statement.name.len == 0) {
-                statement.live = false;
+            for (&self.statements) |*statement_slot| if (statement_slot.name.len == 0) {
+                statement_slot.live = false;
             };
-            for (&self.portals) |*portal| if (portal.name.len == 0) {
-                portal.live = false;
+            for (&self.portals) |*portal_slot| if (portal_slot.name.len == 0) {
+                portal_slot.live = false;
             };
         }
 
