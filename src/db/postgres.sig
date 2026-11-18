@@ -481,6 +481,39 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return self.detachedFrame(input) catch null;
         }
 
+        /// A complete simple-query COMMIT frame, suitable for caller-managed
+        /// scheduling. The caller still validates live transaction ownership
+        /// and retains the original input through completion.
+        pub fn scheduledCommitCandidate(self: *const Self, input: []const u8) ?usize {
+            if (comptime !@hasDecl(DB, "transactionStatus")) return null;
+            if (!self.detachedReady() or input.len < 5 or input[0] != 'Q') return null;
+            const size = read32(input[1..5]);
+            if (size < 4 or size > max_packet or @as(usize, size) + 1 > input.len) return null;
+            const total = @as(usize, size) + 1;
+            var reader: Reader = .{ .bytes = input[5..total] };
+            const source = reader.string() catch return null;
+            reader.done() catch return null;
+            return if (keyword(trim(source), "commit")) total else null;
+        }
+
+        /// Complete a retained simple-query frame after the caller has
+        /// established its transaction outcome. Success uses the usual codec
+        /// path once the database reports an already-idle transaction.
+        pub fn completeScheduledCommit(self: *Self, db: *DB, input: []const u8, output: []u8, outcome: ?anyerror) !Reply {
+            const consumed = self.scheduledCommitCandidate(input) orelse return error.InvalidScheduledCommit;
+            if (outcome) |err| {
+                if (output.len < try self.requiredCapacity()) return error.BufferTooSmall;
+                self.resetSimpleQuery();
+                var writer: Writer = .{ .bytes = output };
+                try failure(&writer, sqlstate(err), @errorName(err));
+                try self.ready(db, &writer);
+                return .{ .consumed = consumed, .written = writer.at };
+            }
+            if (comptime !@hasDecl(DB, "transactionStatus")) return error.InvalidScheduledCommit;
+            if (db.transactionStatus() != 'I') return error.InvalidScheduledCommit;
+            return self.handle(db, input, output);
+        }
+
         /// Additional scheduling hint for unlimited Execute. Portal storage
         /// owns the template through the complete handler call. It does not
         /// authorize execution or replace the rendered-SQL fallback.
@@ -814,6 +847,16 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return w.at;
         }
 
+        fn resetSimpleQuery(self: *Self) void {
+            self.active_portal = null;
+            for (&self.statements) |*statement| if (statement.name.len == 0) {
+                statement.live = false;
+            };
+            for (&self.portals) |*portal| if (portal.name.len == 0) {
+                portal.live = false;
+            };
+        }
+
         fn dispatch(self: *Self, db: *DB, tag: u8, body: []const u8, w: *Writer) !bool {
             var r: Reader = .{ .bytes = body };
             switch (tag) {
@@ -821,13 +864,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     const source = try r.string();
                     try r.done();
                     if (self.active_portal != null and !word(source, "commit") and !word(source, "rollback") and !word(source, "end") and !word(source, "abort")) return error.PortalBusy;
-                    self.active_portal = null;
-                    for (&self.statements) |*s| if (s.name.len == 0) {
-                        s.live = false;
-                    };
-                    for (&self.portals) |*p| if (p.name.len == 0) {
-                        p.live = false;
-                    };
+                    self.resetSimpleQuery();
                     if (trim(source).len == 0) try w.empty('I') else if (has_copy and word(source, "copy")) {
                         try self.startCopy(db, source, w);
                         // COPY FROM: ReadyForQuery follows CopyDone/CopyFail.
