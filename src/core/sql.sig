@@ -1101,6 +1101,13 @@ pub fn Database(comptime config: Config) type {
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
+                // A settings scan observes the installed connection state.
+                // Describe only needs the static relation schema.
+                if (!describe_only) for (self.workspace.plans.items[0..self.workspace.plans.len]) |*block| {
+                    for (block.sources[0..block.source_count]) |*item| {
+                        if (item.view == .pg_settings) return error.UnsupportedStatement;
+                    }
+                };
                 // Metadata-only Describe does not call evaluation hooks.
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
@@ -5279,6 +5286,7 @@ pub fn Database(comptime config: Config) type {
 
         fn viewRows(ptr: *anyopaque, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            if (view == .pg_settings) return settingRows(self.sessionState(), sink);
             return self.fillViewRows(&self.session,self.seq_snap,&self.workspace.nodes,view,sink);
         }
 
@@ -5369,6 +5377,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
+            if (view == .pg_settings) return error.UnsupportedStatement;
             if (view == .pg_am) {
                 try sink.add(&.{ intCell(catalog_module.heap_access_method), nameCell("heap"), nameCell("heap_tableam_handler"), nameCell("t") });
                 try sink.add(&.{ intCell(catalog_module.btree_access_method), nameCell("btree"), nameCell("bthandler"), nameCell("i") });
@@ -8342,6 +8351,72 @@ pub fn Database(comptime config: Config) type {
 
         const SettingKind = enum { search_path, check_function_bodies, restrict_nonsystem_relation_kind, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
 
+        const SettingDescriptor = struct {
+            kind: SettingKind,
+            vartype: []const u8,
+            description: []const u8,
+        };
+
+        const setting_descriptors = [_]SettingDescriptor{
+            .{ .kind = .check_function_bodies, .vartype = "bool", .description = "Validate routine bodies during CREATE FUNCTION and CREATE PROCEDURE." },
+            .{ .kind = .default_transaction_deferrable, .vartype = "bool", .description = "Default deferrable mode for new transactions." },
+            .{ .kind = .default_transaction_isolation, .vartype = "enum", .description = "Default isolation level for new transactions." },
+            .{ .kind = .default_transaction_read_only, .vartype = "bool", .description = "Default read-only mode for new transactions." },
+            .{ .kind = .restrict_nonsystem_relation_kind, .vartype = "string", .description = "Disallow access to selected kinds of non-system relations." },
+            .{ .kind = .search_path, .vartype = "string", .description = "Schema search order for unqualified names." },
+        };
+
+        fn settingOriginBit(kind: SettingKind) u8 {
+            for (setting_descriptors, 0..) |descriptor, index| {
+                if (descriptor.kind == kind) return @as(u8, 1) << @as(u3, @intCast(index));
+            }
+            return 0;
+        }
+
+        fn engineSettingValue(values: *const Sess.Values, kind: SettingKind) ?[]const u8 {
+            return switch (kind) {
+                .search_path => values.search_path.slice(),
+                .check_function_bodies => onOff(values.check_function_bodies),
+                .restrict_nonsystem_relation_kind => values.restriction_text.slice(),
+                .default_transaction_isolation => levelName(values.isolation),
+                .default_transaction_read_only => onOff(values.read_only),
+                .default_transaction_deferrable => onOff(values.deferrable),
+                else => null,
+            };
+        }
+
+        fn isolationNames() Error!Cell {
+            const levels = [_]M.Level{ .serializable, .repeatable_read, .read_committed, .read_uncommitted };
+            var out: Text = .{};
+            var shape: array_module.Shape = .{ .element = .text, .ndim = 1 };
+            shape.dims[0] = levels.len;
+            var writer = try V.Arrays.Writer.begin(&out, &shape);
+            for (levels) |level| {
+                const cell = nameCell(levelName(level));
+                try writer.append(&cell);
+            }
+            return .{ .array = out };
+        }
+
+        fn settingRows(state: *const Sess.State, sink: *X.RowSink) Error!void {
+            const boot: Sess.Values = .{};
+            // A projection can run set_config. The scan exposes a consistent
+            // initial image even if a row changes its session while projecting.
+            const values = state.values;
+            for (setting_descriptors, 0..) |descriptor, index| {
+                const bit = @as(u8, 1) << @as(u3, @intCast(index));
+                const source: []const u8 = if (values.session_settings & bit != 0) "session" else if (values.client_settings & bit != 0) "client" else "default";
+                const enumvals: Cell = if (descriptor.kind == .default_transaction_isolation) try isolationNames() else .null_value;
+                try sink.add(&.{
+                    try objectTextCell(@tagName(descriptor.kind)), try objectTextCell(engineSettingValue(&values, descriptor.kind).?), .null_value,
+                    try objectTextCell("Client Connection Defaults / Statement Behavior"), try objectTextCell(descriptor.description), .null_value,
+                    nameCell("user"), nameCell(descriptor.vartype), nameCell(source), .null_value, .null_value, enumvals,
+                    try objectTextCell(engineSettingValue(&boot, descriptor.kind).?), try objectTextCell(engineSettingValue(&state.startup, descriptor.kind).?),
+                    .null_value, .null_value, boolCell(false),
+                });
+            }
+        }
+
         fn settingKind(name: []const u8) ?SettingKind {
             inline for (@typeInfo(SettingKind).@"enum".field_names) |field| {
                 if (!types.same(field, "custom") and Sess.sameInsensitive(name, field)) return @field(SettingKind, field);
@@ -8555,6 +8630,9 @@ pub fn Database(comptime config: Config) type {
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => {},
                 .role => into.role = source.role,
             }
+            const bit = settingOriginBit(which);
+            into.client_settings = (into.client_settings & ~bit) | (source.client_settings & bit);
+            into.session_settings = (into.session_settings & ~bit) | (source.session_settings & bit);
         }
 
         /// SET [LOCAL] name {TO|=} value | DEFAULT, and set_config. `slot`
@@ -8594,7 +8672,12 @@ pub fn Database(comptime config: Config) type {
                 try copySetting(&next, &state.startup, which, name);
             } else if (which == .role) {
                 next.role = try self.roleSetting(slot, kind, value);
-            } else try assignSetting(&next, which, name, kind, value);
+            } else {
+                try assignSetting(&next, which, name, kind, value);
+                const bit = settingOriginBit(which);
+                next.client_settings &= ~bit;
+                next.session_settings |= bit;
+            }
             if (slot != null) try state.preserve();
             if (local) {
                 if (slot != null) state.values = next;
@@ -8678,13 +8761,7 @@ pub fn Database(comptime config: Config) type {
             };
             const state = self.sessionState();
             const tx: ?*const M.Tx = if (slot) |owner| (if (self.active(owner)) &self.txs[owner] else null) else null;
-            const text: []const u8 = switch (which) {
-                .search_path => state.values.search_path.slice(),
-                .check_function_bodies => onOff(state.values.check_function_bodies),
-                .restrict_nonsystem_relation_kind => state.values.restriction_text.slice(),
-                .default_transaction_isolation => levelName(state.values.isolation),
-                .default_transaction_read_only => onOff(state.values.read_only),
-                .default_transaction_deferrable => onOff(state.values.deferrable),
+            const text: []const u8 = engineSettingValue(&state.values, which) orelse switch (which) {
                 .transaction_isolation => levelName(if (tx) |t| t.isolation else state.values.isolation),
                 .transaction_read_only => onOff(if (tx) |t| t.read_only else state.values.read_only),
                 .transaction_deferrable => onOff(if (tx) |t| t.deferrable else state.values.deferrable),
@@ -8693,6 +8770,7 @@ pub fn Database(comptime config: Config) type {
                     break :blk state.values.custom[index].value.slice();
                 },
                 .role => if (state.values.role == 0) "none" else self.catalog_objects.roleName(state.values.role, self.settingSnapshot(slot)) orelse "none",
+                else => unreachable,
             };
             if (text.len > out.len) return error.TextCapacity;
             @memcpy(out[0..text.len], text);
@@ -8746,6 +8824,10 @@ pub fn Database(comptime config: Config) type {
             if (setting != .check_function_bodies and setting != .restrict_nonsystem_relation_kind) return false;
             try self.setSetting(null, false, name, .string, value);
             const state = self.sessionState();
+            const bit = settingOriginBit(setting);
+            state.values.session_settings &= ~bit;
+            state.values.client_settings |= bit;
+            state.base = state.values;
             state.startup = state.values;
             return true;
         }

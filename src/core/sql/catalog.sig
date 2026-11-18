@@ -54,7 +54,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     pg_proc, pg_trigger, pg_rewrite, pg_rules,
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
-    pg_publication_rel, pg_publication_namespace };
+    pg_publication_rel, pg_publication_namespace, pg_settings };
 
 pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
 pub const DatabaseCatalogProvider = struct {
@@ -145,6 +145,13 @@ const pg_extension_columns = [_]ViewColumn{ col("oid", .oid), col("extname", .na
 const pg_tables_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("tableowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("hasrules", .boolean), col("hastriggers", .boolean), col("rowsecurity", .boolean) };
 const table_privileges_columns = [_]ViewColumn{ col("grantor", .name), col("grantee", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("privilege_type", .text), col("is_grantable", .text), col("with_hierarchy", .text) };
 
+const pg_settings_columns = [_]ViewColumn{
+    col("name", .text), col("setting", .text), col("unit", .text), col("category", .text), col("short_desc", .text),
+    col("extra_desc", .text), col("context", .text), col("vartype", .text), col("source", .text), col("min_val", .text),
+    col("max_val", .text), col("enumvals", text_array), col("boot_val", .text), col("reset_val", .text),
+    col("sourcefile", .text), col("sourceline", .int4), col("pending_restart", .boolean),
+};
+
 pub fn viewColumns(view: View) []const ViewColumn {
     return switch (view) {
         .pg_type => &pg_type_columns,
@@ -154,6 +161,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_am => &pg_am_columns,
         .pg_collation => &pg_collation_columns,
         .pg_class => &pg_class_columns,
+        .pg_settings => &pg_settings_columns,
         .pg_attribute => &pg_attribute_columns,
         .pg_index => &pg_index_columns,
         .pg_constraint => &pg_constraint_columns,
@@ -194,7 +202,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 /// pg_catalog views resolve unqualified (pg_catalog is searched first);
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
-    const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_attribute, .pg_index, .pg_constraint, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
+    const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {

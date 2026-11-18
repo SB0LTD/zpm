@@ -85,6 +85,9 @@ pub fn Sessions(comptime config: types.Config) type {
             restricted_relation_kinds: RelationKinds = .{},
             restriction_text: SettingText = .{},
             search_path: SettingText = SettingText.literal("\"$user\", public"),
+            /// Origin bits for the named engine settings in pg_settings.
+            client_settings: u8 = 0,
+            session_settings: u8 = 0,
             custom: [config.custom_settings]Custom = @splat(.{}),
             /// SET ROLE (catalog-security lane): the role OID, 0 for NONE
             /// (current_user is then the session user).
