@@ -28,6 +28,56 @@ pub const Error = error{
     AddressFailed,
 };
 
+/// A coalescing readiness notification for a Linux poll owner. Keep the
+/// descriptor live until all notifying workers have joined. It can occupy the
+/// first readable slot in waitMasked, and only its poll owner drains it.
+pub const PollWake = struct {
+    pub const available = builtin.os.tag == .linux;
+    descriptor: Socket = invalid_socket,
+
+    pub fn open() Error!PollWake {
+        if (comptime !available) return error.UnsupportedPlatform;
+        const fd = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+        if (linux.errno(fd) != .SUCCESS) return error.SocketFailed;
+        return .{ .descriptor = @intCast(fd) };
+    }
+
+    pub fn notify(self: *const PollWake) Error!void {
+        if (comptime !available) return error.UnsupportedPlatform;
+        const one: u64 = 1;
+        while (true) {
+            const result = linux.write(self.descriptor, @ptrCast(&one), @sizeOf(u64));
+            switch (linux.errno(result)) {
+                .SUCCESS => if (result == @sizeOf(u64)) return else return error.SendFailed,
+                .AGAIN => return, // A full counter already makes the descriptor readable.
+                .INTR => continue,
+                else => return error.SendFailed,
+            }
+        }
+    }
+
+    pub fn drain(self: *const PollWake) Error!void {
+        if (comptime !available) return error.UnsupportedPlatform;
+        var count: u64 = undefined;
+        while (true) {
+            const result = linux.read(self.descriptor, @ptrCast(&count), @sizeOf(u64));
+            switch (linux.errno(result)) {
+                .SUCCESS => if (result == @sizeOf(u64)) return else return error.ReceiveFailed,
+                .AGAIN => return,
+                .INTR => continue,
+                else => return error.ReceiveFailed,
+            }
+        }
+    }
+
+    pub fn close(self: *PollWake) void {
+        if (comptime available) if (self.descriptor != invalid_socket) {
+            _ = linux.close(self.descriptor);
+            self.descriptor = invalid_socket;
+        };
+    }
+};
+
 /// Pair each successful init with deinit; Winsock maintains its own refcount.
 pub fn init() Error!void {
     if (is_windows) {
@@ -239,6 +289,7 @@ pub fn wait(listener: Socket, clients: []const Socket, readable: []bool, writabl
 /// interest while a connection has a pending response to apply TCP backpressure
 /// without a busy loop on its already-buffered next request. Error/hangup events
 /// may still mark a socket readable so a disconnected client can be released.
+/// On Linux, `listener` also accepts a PollWake descriptor for readiness only.
 pub fn waitMasked(listener: Socket, clients: []const Socket, readable: []bool, writable: []bool, timeout_ms: u32) Error!bool {
     if (clients.len > max_clients or clients.len != readable.len or clients.len != writable.len) return error.InvalidSet;
     if (is_windows) {

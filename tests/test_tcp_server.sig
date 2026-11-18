@@ -164,10 +164,32 @@ fn backpressure(listener: tcp.Socket, port: u16) !void {
     try check((try tcp.recv(other, &buf)) == 1 and buf[0] == 'x');
 }
 
+fn pollWakeContracts() !void {
+    if (comptime !tcp.PollWake.available) return;
+    phase = "coalescing wake before poll";
+    var wake = try tcp.PollWake.open();
+    defer wake.close();
+    var readable: [0]bool = .{};
+    var writable: [0]bool = .{};
+    try check(!try tcp.waitMasked(wake.descriptor, &.{}, &readable, &writable, 0));
+    try wake.notify();
+    try wake.notify();
+    try check(try tcp.waitMasked(wake.descriptor, &.{}, &readable, &writable, 0));
+    try wake.drain();
+    try check(!try tcp.waitMasked(wake.descriptor, &.{}, &readable, &writable, 0));
+    try wake.notify();
+    try check(try tcp.waitMasked(wake.descriptor, &.{}, &readable, &writable, 100));
+    try wake.drain();
+    try wake.drain();
+    try check(!try tcp.waitMasked(wake.descriptor, &.{}, &readable, &writable, 0));
+    phase = "startup";
+}
+
 pub fn main(init: std.process.Init) !void {
     report_io = init.io;
     try tcp.init();
     defer tcp.deinit();
+    try pollWakeContracts();
     const listener = try tcp.listen(.{ 127, 0, 0, 1 }, 0);
     defer tcp.close(listener);
     const port = try tcp.localPort(listener);

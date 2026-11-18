@@ -2030,13 +2030,13 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// Candidate table for a synchronous batch of independent ordinary
-        /// commits. The caller must select this transaction's session, keep
-        /// exclusive mutation ownership, and compare candidate tables across
-        /// members. This classification neither prepares nor commits a slot.
-        pub fn ordinaryBatchCommitTable(self: *Self, slot: u16) ?u32 {
+        /// commits. The caller keeps exclusive mutation ownership and compares
+        /// candidate tables across members. The session identity is checked
+        /// without changing the installed SQL execution context.
+        pub fn ordinaryBatchCommitTable(self: *const Self, slot: u16, owner: *const Sess.State) ?u32 {
             if (!self.active(slot) or self.seq_carried.any()) return null;
             const tx = &self.txs[slot];
-            const owner = self.ownSession(slot) orelse return null;
+            if (owner.id == 0 or owner.id != tx.session or owner.tx_epoch != tx.epoch) return null;
             if (tx.isolation != .read_committed or tx.ssi != null or tx.read_only or tx.prepared or
                 tx.copy_table != null or tx.pin != null or tx.running_snap != null or tx.table_wait != null or
                 tx.waiting_for.any() or tx.sub_len != 0 or tx.deferred_checks or tx.seq_dirty.any() or

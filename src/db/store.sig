@@ -891,11 +891,11 @@ pub fn Store(comptime Raw: type) type {
             /// Inspect an idle explicit PostgreSQL write transaction under
             /// the store's exclusive mutation gate. The returned table OID is
             /// an eligibility hint for the current call, not a frozen ticket.
-            pub fn ordinaryBatchCommitTable(self: *Connection) ?u32 {
-                if (comptime !@hasDecl(Raw, "ordinaryBatchCommitTable")) return null;
+            pub fn ordinaryBatchCommitTable(self: *const Connection) ?u32 {
+                if (comptime !has_engine_session or !@hasDecl(Raw, "ordinaryBatchCommitTable")) return null;
                 if (self.id == 0 or self.dialect != .postgres or !self.in_transaction or self.failed or
                     self.pending.active or self.saved_len != 0 or self.running_statement or self.cancel_requested) return null;
-                return self.db().ordinaryBatchCommitTable(self.tx orelse return null);
+                return self.store.database.ordinaryBatchCommitTable(self.tx orelse return null, &self.engine_session);
             }
 
             pub fn commitTransaction(self: *Connection) !void {
