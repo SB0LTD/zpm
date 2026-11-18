@@ -1093,7 +1093,8 @@ pub fn Database(comptime config: Config) type {
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
                     // These catalog lookups use the serialized database hook.
-                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_partition_ancestors=>return error.UnsupportedStatement,
+                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_partition_ancestors,
+                    .to_regnamespace,.regnamespace_in,.regnamespace_out=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                     .current_setting,.set_config,.pg_backend_pid,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
@@ -4641,16 +4642,20 @@ pub fn Database(comptime config: Config) type {
             return name;
         }
 
+        fn numericRegOid(text: []const u8) Error!?u32 {
+            if (text.len == 1 and text[0] == '-') return 0;
+            if (text.len == 0) return null;
+            for (text) |byte| {
+                if (byte < '0' or byte > '9') return null;
+            }
+            return std.fmt.parseInt(u32, text, 10) catch error.NumericValueOutOfRange;
+        }
+
         /// regclass input: a visible table, its primary-key index
         /// (`<table>_pkey`) or a sequence; -1 (or 42P01) when missing.
         fn regclassOid(self: *const Self, text: []const u8, strict: bool) Error!i64 {
             const missing: Error!i64 = if (strict) error.TableNotFound else -1;
-            if (text.len == 1 and text[0] == '-') return 0;
-            if (text.len != 0) {
-                for (text) |byte| {
-                    if (byte < '0' or byte > '9') break;
-                } else return std.fmt.parseInt(u32, text, 10) catch error.NumericValueOutOfRange;
-            }
+            if (try numericRegOid(text)) |oid| return oid;
             // `schema.name` of a user schema (unquoted parts fold to lower case).
             if (std_dot(text)) |dot| {
                 const schema = regclassName(text[0..dot]) orelse return missing;
@@ -4677,6 +4682,65 @@ pub fn Database(comptime config: Config) type {
                 if (types.same(index_name.slice(), name.slice())) return table.oid + 1;
             }
             return missing;
+        }
+
+        fn namespaceIdentifier(raw: []const u8) Error!Name {
+            if (raw.len == 0) return error.InvalidName;
+            var result: Name = .{};
+            if (raw[0] == '"') {
+                if (raw.len < 3 or raw[raw.len - 1] != '"') return error.InvalidName;
+                const name = raw[1 .. raw.len - 1];
+                var index: usize = 0;
+                while (index < name.len) : (index += 1) {
+                    const byte = name[index];
+                    if (byte == '"') {
+                        index += 1;
+                        if (index == name.len or name[index] != '"') return error.InvalidName;
+                    }
+                    if (byte == 0) return error.InvalidName;
+                    if (result.len == result.bytes.len) return error.NameCapacity;
+                    result.bytes[result.len] = byte;
+                    result.len += 1;
+                }
+                return result;
+            }
+            if (raw.len > result.bytes.len) return error.NameCapacity;
+            for (raw, 0..) |byte, index| {
+                switch (byte) { '.', '"', ' ', '\t', '\r', '\n', 0 => return error.InvalidName, else => {} }
+                result.bytes[index] = types.lower(byte);
+            }
+            result.len = raw.len;
+            return result;
+        }
+
+        fn postgresNamespaceLookup(ptr: *anyopaque, text: []const u8, strict: bool) Error!?u32 {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const raw = std.mem.trim(u8, text, " \t\r\n");
+            if (try numericRegOid(raw)) |oid| return oid;
+            const name = try namespaceIdentifier(raw);
+            if (namespaceFor(&self.catalog, name.slice(), self.seq_snap)) |oid| return oid;
+            if (strict) return error.UndefinedSchema;
+            return null;
+        }
+
+        fn postgresNamespaceName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            for (catalog_module.namespaces) |known| {
+                if (oid == known.oid) return try writeNamespaceName(known.name, out);
+            }
+            var schemas: [K.relation_rows]K.SchemaFound = undefined;
+            const count = self.catalog.visibleSchemas(self.seq_snap, &schemas);
+            for (schemas[0..count]) |found| {
+                if (oid == found.oid) return try writeNamespaceName(self.schemas[found.slot].name.slice(), out);
+            }
+            return null;
+        }
+
+        fn writeNamespaceName(name: []const u8, out: []u8) Error!usize {
+            var text: CatalogTextWriter = .{ .out = out };
+            text.ident(name);
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
         }
 
         /// The primary-key index (and constraint) name: CONSTRAINT name, else
@@ -7259,7 +7323,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .partition_ancestors = &postgresPartitionAncestors };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;

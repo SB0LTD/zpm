@@ -130,6 +130,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // Discovery (B11 text lane): pg_typeof (the argument's type OID in
     // `integer`, set by the binder) and pg_get_serial_sequence.
     pg_typeof, pg_get_serial_sequence, pg_table_is_visible, pg_get_indexdef, pg_get_constraintdef, pg_partition_ancestors,
+    to_regnamespace, regnamespace_in, regnamespace_out,
     // Regular expressions (B11 text lane, regex.sig).
     regexp_like, similar_to_escape,
     // Full text search (B11 text lane, text_search.sig): the first argument
@@ -229,7 +230,7 @@ pub fn strictFunction(func: Func) bool {
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
         .current_timestamp, .current_date, .current_database, .current_schema,
         .to_regtype, .to_regclass, .pg_get_expr,
-        .regclass_in, .regtype_in, .regclass_out, .regtype_out => true,
+        .regclass_in, .regtype_in, .regclass_out, .regtype_out, .to_regnamespace, .regnamespace_in, .regnamespace_out => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
@@ -254,9 +255,14 @@ pub const regclass_typmod: i32 = -2;
 pub const regtype_typmod: i32 = -3;
 /// Wire metadata for MySQL DATE_ADD returning its fixed date string.
 pub const mysql_date_text_typmod: i32 = -4;
+pub const regnamespace_typmod: i32 = -5;
 
 /// Node.reg: an OID-valued expression known to be a regclass / regtype.
-pub const Reg = enum(u8) { none, regclass, regtype };
+pub const Reg = enum(u8) { none, regclass, regtype, regnamespace };
+
+pub fn regKind(typmod: i32) Reg {
+    return switch (typmod) { regclass_typmod => .regclass, regtype_typmod => .regtype, regnamespace_typmod => .regnamespace, else => .none };
+}
 
 pub const Test = enum { is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
 

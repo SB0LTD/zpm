@@ -1574,7 +1574,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
-                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
+                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
                 else => false,
@@ -1647,7 +1647,7 @@ pub fn Parser(comptime config: types.Config) type {
                 array = true;
             }
             if (array) {
-                if (spec.typmod == ast.regclass_typmod or spec.typmod == ast.regtype_typmod) return error.UnsupportedStatement;
+                if (ast.regKind(spec.typmod) != .none) return error.UnsupportedStatement;
                 spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
             }
             return spec;
@@ -1705,6 +1705,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .json => .{ .ty = .json },
                 .jsonb => .{ .ty = .jsonb },
                 .regclass => .{ .ty = .oid, .typmod = ast.regclass_typmod },
+                .regnamespace => .{ .ty = .oid, .typmod = ast.regnamespace_typmod },
                 .regtype => .{ .ty = .oid, .typmod = ast.regtype_typmod },
                 .varchar => .{ .ty = .varchar, .typmod = try self.characterLength(false) },
                 .bpchar => .{ .ty = .bpchar, .typmod = try self.characterLength(false) },
@@ -3891,6 +3892,7 @@ pub fn Parser(comptime config: types.Config) type {
                         if (types.same(name, "text")) .{ .ty = .text }
                         else if (types.same(name, "oid")) .{ .ty = .oid }
                         else if (types.same(name, "regclass")) .{ .ty = .oid, .typmod = ast.regclass_typmod }
+                        else if (types.same(name, "regnamespace")) .{ .ty = .oid, .typmod = ast.regnamespace_typmod }
                         else if (types.same(name, "regtype")) .{ .ty = .oid, .typmod = ast.regtype_typmod }
                         else null;
                     if (scalar) |type_spec| {

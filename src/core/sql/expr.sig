@@ -491,6 +491,12 @@ pub fn Eval(comptime config: types.Config) type {
                     if (oid < 0) return .null_value;
                     return .{ .integer = oid };
                 },
+                .to_regnamespace, .regnamespace_in => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const lookup = hook.namespace_lookup orelse return error.UnsupportedStatement;
+                    const oid = try lookup(hook.ptr, first.text.slice(), n.func == .regnamespace_in) orelse return .null_value;
+                    return .{ .integer = oid };
+                },
                 .regtype_out => {
                     const data_type = if (first.integer >= 0 and first.integer <= 0xffffffff) types.typeFromOid(@intCast(first.integer)) else null;
                     if (data_type) |known| return textCell(types.sqlTypeName(known));
@@ -503,6 +509,14 @@ pub fn Eval(comptime config: types.Config) type {
                         if (hook.relation_name(hook.ptr, @intCast(first.integer), &buffer)) |length| return textCell(buffer[0..length]);
                     }
                     return digitsCell(first.integer);
+                },
+                .regnamespace_out => {
+                    if (first.integer == 0) return textCell("-");
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const name = hook.namespace_name orelse return error.UnsupportedStatement;
+                    var buffer: [config.text_bytes]u8 = undefined;
+                    const length = try name(hook.ptr, @intCast(first.integer), &buffer) orelse return digitsCell(first.integer);
+                    return textCell(buffer[0..length]);
                 },
                 .format_type => {
                     const second = try eval(ctx, ctx.pool.nodes[n.b].next);
@@ -1317,6 +1331,7 @@ pub fn Eval(comptime config: types.Config) type {
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
+                    .to_regnamespace, .regnamespace_in, .regnamespace_out,
                     .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef => return catalogValue(ctx, n),
                     .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
