@@ -4902,7 +4902,7 @@ pub fn Database(comptime config: Config) type {
                 if (table.namespace != namespace) continue;
                 if (S.keyed(table)) {
                     const primary = indexName(table) catch Name{};
-                    if (types.same(primary.slice(), name)) return table.oid + 1;
+                    if (types.same(primary.slice(), name)) return S.primaryIndexOid(table);
                 }
                 for (table.indexes[0..table.index_count]) |*index| {
                     if (index.oid != 0 and types.same(index.name.slice(), name)) return index.oid;
@@ -5000,7 +5000,7 @@ pub fn Database(comptime config: Config) type {
                 }
                 const table = &self.tables[found.slot];
                 if (table.oid == oid) return .{ .name = table.name.slice(), .namespace = table.namespace };
-                if (S.keyed(table) and table.oid + 1 == oid) {
+                if (oid != 0 and S.primaryIndexOid(table) == oid) {
                     primary_name.* = indexName(table) catch return null;
                     return .{ .name = primary_name.slice(), .namespace = table.namespace };
                 }
@@ -5081,7 +5081,7 @@ pub fn Database(comptime config: Config) type {
                     owner = table;
                     break;
                 }
-                if (S.keyed(table) and table.oid + 1 == oid) {
+                if (oid != 0 and S.primaryIndexOid(table) == oid) {
                     // The primary-key index: its attributes are the key columns.
                     var key_columns: [config.columns]u8 = undefined;
                     for (primaryColumns(table, &key_columns)) |index| if (types.same(table.columns[index].name.slice(), column)) return null;
@@ -5473,7 +5473,7 @@ pub fn Database(comptime config: Config) type {
                     switch (view) {
                         .pg_class => {
                             try classRow(sink, table.oid, name, table.namespace, table.relkind, table.column_count, try self.tableClass(table, snapshot, relations[0..count], session_values));
-                            if (S.keyed(table)) try classRow(sink, table.oid + 1, pkey.slice(), table.namespace, 'i', primary_columns.len, .{});
+                            if (S.keyed(table)) try classRow(sink, S.primaryIndexOid(table), pkey.slice(), table.namespace, 'i', primary_columns.len, .{});
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
                                 try classRow(sink, index.oid, index.name.slice(), table.namespace, 'i', index.key_count + index.include_count, .{});
@@ -5489,7 +5489,7 @@ pub fn Database(comptime config: Config) type {
                         },
                         .pg_index => {
                             var key: [4 * config.columns]u8 = undefined;
-                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)), boolCell(true), boolCell(false), boolCell(false) });
+                            if (S.keyed(table)) try sink.add(&.{ intCell(S.primaryIndexOid(table)), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)), boolCell(true), boolCell(false), boolCell(false) });
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
                                 try sink.add(&.{ intCell(index.oid), intCell(oid), boolCell(false), boolCell(index.unique), nameCell(indexKey(index.keyColumns(), &key)), boolCell(true), boolCell(false), boolCell(false) });
@@ -5675,7 +5675,7 @@ pub fn Database(comptime config: Config) type {
             for (relations[0..count]) |found| {
                 if (found.kind == 'S') continue;
                 const table = &self.tables[found.slot];
-                if (table.oid +% 1 == oid and S.keyed(table)) {
+                if (oid != 0 and S.primaryIndexOid(table) == oid) {
                     var columns: [config.columns]u8 = undefined;
                     const name = try indexName(table);
                     return try self.renderIndex(table, name.slice(), true, primaryColumns(table, &columns), null, column, pretty, out);
@@ -5702,7 +5702,7 @@ pub fn Database(comptime config: Config) type {
             const deferrable = if (constraint) |item| item.deferrable else false;
             const deferred = if (constraint) |item| item.initially_deferred else false;
             const foreign = if (kind == .foreign) constraint else null;
-            const index = if (kind == .primary) table.oid + 1 else if (foreign) |item| self.referencedConstraintIndex(item, snapshot) else 0;
+            const index = if (kind == .primary) S.primaryIndexOid(table) else if (foreign) |item| self.referencedConstraintIndex(item, snapshot) else 0;
             try sink.add(&.{
                 intCell(oid), nameCell(name), intCell(table.namespace), nameCell(label),
                 boolCell(deferrable), boolCell(deferred), boolCell(true), boolCell(true),
@@ -5726,7 +5726,7 @@ pub fn Database(comptime config: Config) type {
             const slot = self.visibleTableSlot(constraint.ref_oid, snapshot) orelse return 0;
             const parent = &self.tables[slot];
             var keys: [config.columns]u8 = undefined;
-            if (sameIndexKeys(constraint.refColumns(), primaryColumns(parent, &keys))) return parent.oid + 1;
+            if (sameIndexKeys(constraint.refColumns(), primaryColumns(parent, &keys))) return S.primaryIndexOid(parent);
             for (parent.indexes[0..parent.index_count]) |*index| {
                 if (index.unique and index.predicate.len == 0 and sameIndexKeys(constraint.refColumns(), index.keyColumns())) return index.oid;
             }
@@ -6492,6 +6492,7 @@ pub fn Database(comptime config: Config) type {
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
             S.setExtras(copy, &alter.extras);
+            if (S.keyed(copy)) copy.primary_index_oid = source.primary_index_oid;
             try self.assignConstraintOids(copy, source);
             S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
             copy.live = true;

@@ -806,6 +806,71 @@ fn truncateCurrentHorizon() !void {
     try check(try integer(&primary, "SELECT id FROM t") == 5);
 }
 
+fn explicitPrimaryIdentity() !void {
+    var legacy: DB = .{};
+    var result: DB.Result = .{};
+    var encoded: [4096]u8 = undefined;
+    var used: usize = 0;
+    try legacy.executeChanges("CREATE TABLE a(id INT PRIMARY KEY)", &result, &encoded, &used, null, null);
+    const alias = oid + 121;
+    const create_alias = "SELECT to_regclass('a_pkey')::oid";
+    try check(try integer(&legacy, create_alias) == oid + 1);
+    // Header, op, table OID and the one-byte name precede the definition version.
+    const version_at = 8 + 1 + 4 + 1 + 1;
+    try check(std.mem.readInt(u16, encoded[version_at..][0..2], .little) == 4);
+    std.mem.writeInt(u16, encoded[version_at..][0..2], 5, .little);
+    std.mem.writeInt(u32, encoded[used..][0..4], alias, .little);
+    const explicit = encoded[0 .. used + 4];
+    var fresh: DB = .{};
+    var restored: DB = .{};
+    var forged: Builder = .{};
+    for ([_]u32{ 0, oid, 0xffffffff }) |invalid| {
+        std.mem.writeInt(u32, encoded[used..][0..4], invalid, .little);
+        if (fresh.applyChangeRecord(explicit, &scratch)) |_| return error.InvalidPrimaryAliasAccepted else |err| try check(err == error.InvalidChangeRecord);
+        try check(fresh.csn == 0 and fresh.oid_counter == 0 and fresh.tableCount() == 0);
+    }
+    std.mem.writeInt(u32, encoded[used..][0..4], alias, .little);
+    if (fresh.applyChangeRecord(explicit[0 .. explicit.len - 1], &scratch)) |_| return error.ShortPrimaryAliasAccepted else |err| try check(err == error.InvalidChangeRecord);
+    forged.createTable(alias, "existing", false);
+    try restored.applyChangeRecord(forged.record(), &scratch);
+    if (restored.applyChangeRecord(explicit, &scratch)) |_| return error.PrimaryAliasCollisionAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try check(restored.csn == 1 and restored.tableCount() == 1 and restored.oid_counter == alias + 1 - oid);
+    restored = .{};
+    try fresh.applyChangeRecord(explicit, &scratch);
+    try restored.applyChangeRecord(explicit, &scratch);
+    legacy = .{};
+    try legacy.applyChangeRecord(explicit, &scratch);
+    try check(fresh.oid_counter == alias + 1 - oid);
+    try check(try integer(&fresh, create_alias) == alias);
+    try check(try integer(&fresh, "SELECT oid FROM pg_class WHERE relname='a_pkey'") == alias);
+    try check(try integer(&fresh, "SELECT indexrelid FROM pg_index WHERE indisprimary") == alias);
+    try check(try integer(&fresh, "SELECT conindid FROM pg_constraint WHERE contype='p'") == alias);
+    try fresh.execute("SELECT pg_get_indexdef(indexrelid, 1, false) FROM pg_index WHERE indisprimary", &result);
+    try check(result.row_count == 1 and std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "id"));
+
+    forged = .{};
+    forged.createTable(alias, "taken", false);
+    if (fresh.applyChangeRecord(forged.record(), &scratch)) |_| return error.PrimaryAliasCollisionAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try check(fresh.csn == 1 and fresh.tableCount() == 1 and fresh.oid_counter == alias + 1 - oid);
+    // An explicit alias leaves the historical neighboring OID free.
+    forged = .{};
+    forged.createTable(oid + 1, "neighbor", false);
+    try fresh.applyChangeRecord(forged.record(), &scratch);
+    try check(try integer(&fresh, "SELECT oid FROM pg_class WHERE relname='neighbor'") == oid + 1);
+    try check(try integer(&fresh, create_alias) == alias);
+
+    used = 0;
+    try restored.executeChanges("ALTER TABLE a ADD COLUMN n INT", &result, &encoded, &used, null, null);
+    try check(std.mem.readInt(u16, encoded[version_at..][0..2], .little) == 5);
+    // The explicit identity survives COW and replay of ALTER.
+    try legacy.applyChangeRecord(encoded[0..used], &scratch);
+    try check(try integer(&restored, create_alias) == alias and try integer(&legacy, create_alias) == alias);
+    fresh = .{};
+    try fresh.execute("CREATE TABLE a(id INT)", &result);
+    if (fresh.applyChangeRecord(encoded[0..used], &scratch)) |_| return error.NewPrimaryKeyReplayAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try check(fresh.csn == 1 and fresh.oid_counter == 1 and fresh.tableCount() == 1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try roundTrips();
     try constraintIdentityRoundTrip();
@@ -815,6 +880,7 @@ pub fn main(init: std.process.Init) !void {
     try outOfOrderSequences();
     try oidConflicts();
     try keyedIndexCollision();
+    try explicitPrimaryIdentity();
     try rewoundOidReplay();
     try replayCardinality();
     try truncateCurrentHorizon();
