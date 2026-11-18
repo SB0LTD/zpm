@@ -302,6 +302,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             remaining: usize = 0,
             info: CopyInfo = .{},
             sql: [sql_capacity]u8 = undefined,
+            sql_start: usize = 0,
             sql_len: usize = 0,
             carry: [line_bytes]u8 = undefined,
             carry_len: usize = 0,
@@ -319,6 +320,13 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             position: usize = 0,
             remaining: usize = 0,
             source_length: usize = 0,
+            /// COPY takes ownership of the complete Query in CopyState.sql.
+            owned: bool = false,
+        };
+
+        const SimpleCopySource = struct {
+            source: []const u8,
+            command_start: usize,
         };
 
         fn valueSession(db: *DB) *const T.Session {
@@ -502,7 +510,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         }
 
         pub fn continuingSimpleQuery(self: *const Self) bool {
-            return self.simple_batch.remaining != 0;
+            return self.simple_batch.source_length != 0;
+        }
+
+        /// A completed COPY can leave SQL work runnable without socket input.
+        pub fn queuedSimpleQuery(self: *const Self) bool {
+            return self.simple_batch.owned and self.copy.mode == .none;
         }
 
         pub const DetachedCandidate=union(enum) {metadata,describe:[]const u8,execute:[]const u8};
@@ -605,6 +618,9 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             if (self.authentication) |*auth| if (auth.state == .failed) return .{ .close = true };
             if (has_copy and self.copy.mode != .none) return self.copyHandle(db, input, output);
             if (!self.startup) return self.handleStartup(db, input, output);
+            if (self.queuedSimpleQuery()) {
+                return self.dispatchFrame(db, 'Q', self.copy.sql[0 .. self.simple_batch.source_length + 1], output, 0);
+            }
             const prefix: usize = 1;
             if (input.len < prefix + 4) return .{};
             const size = read32(input[prefix..][0..4]);
@@ -625,19 +641,23 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             const total: usize = @as(usize, size) + prefix;
             if (input.len < total) return .{};
+            return self.dispatchFrame(db, input[0], input[5..total], output, total);
+        }
+
+        fn dispatchFrame(self: *Self, db: *DB, tag: u8, body: []const u8, output: []u8, total: usize) error{BufferTooSmall}!Reply {
             self.waiting_for_command = false;
+            var w: Writer = .{ .bytes = output };
             var close = false;
             if (self.authentication != null and self.authentication.?.state != .complete) {
-                close = self.authenticate(db, input[0], input[5..total], &w) catch blk: {
+                close = self.authenticate(db, tag, body, &w) catch blk: {
                     self.authentication.?.state = .failed;
                     w.at = 0;
                     try authenticationFailure(&w);
                     break :blk true;
                 };
             } else {
-                const tag = input[0];
                 if (self.failed and tag != 'S' and tag != 'X') return .{ .consumed = total };
-                close = self.dispatch(db, tag, input[5..total], &w) catch |err| blk: {
+                close = self.dispatch(db, tag, body, &w) catch |err| blk: {
                     const any: anyerror = err;
                     // Parked statement: nothing consumed or written.
                     if (any == error.WouldBlock) return .{ .blocked = true };
@@ -648,10 +668,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     w.at = 0;
                     try writeNotice(db, &w);
                     try failure(&w, sqlstate(err), diagnosticMessage(err));
-                    if (comptime has_simple_batch) if (tag == 'Q' and self.continuingSimpleQuery()) {
-                        self.simple_batch = .{};
-                        db.finishSimpleQueryBatch(false) catch return error.BufferTooSmall;
-                    };
+                    if (tag == 'Q') try self.abortSimpleBatch(db);
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
                     if (tag == 'Q' or tag == 'S') {
                         if (comptime @hasDecl(DB, "abortExtended")) db.abortExtended();
@@ -662,7 +679,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     break :blk false;
                 };
             }
-            return .{ .consumed = if (self.continuingSimpleQuery()) 0 else total, .written = w.at, .close = close };
+            return .{ .consumed = if (self.continuingSimpleQuery() and !self.simple_batch.owned) 0 else total, .written = w.at, .close = close };
         }
 
         fn handleStartup(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
@@ -897,6 +914,14 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             };
         }
 
+        fn abortSimpleBatch(self: *Self, db: *DB) error{BufferTooSmall}!void {
+            if (comptime has_simple_batch) {
+                if (!self.continuingSimpleQuery()) return;
+                self.simple_batch = .{};
+                db.finishSimpleQueryBatch(false) catch return error.BufferTooSmall;
+            }
+        }
+
         fn beginSimpleBatch(self: *Self, db: *DB, source: []const u8) !void {
             const count = try db.preflightSimpleQueryBatch(source);
             try db.beginSimpleQueryBatch();
@@ -920,20 +945,19 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const command_source = span.slice(source);
             try db.beginSimpleQueryStep();
             try DB.checkSimpleQueryUtility(command_source);
-            const copying_out = has_copy and word(command_source, "copy");
-            if (copying_out) {
-                // Preflight checked the grammar and excluded COPY FROM.
-                // The complete CopyOut response is buffered before commit.
-                try self.startCopy(db, command_source, w, null);
+            const copying = has_copy and word(command_source, "copy");
+            if (copying) {
+                try self.startCopy(db, command_source, w, null, .{ .source = source, .command_start = span.start });
             } else {
                 try self.execute(db, command_source);
                 try self.simpleResult(db, w);
             }
-            const final = self.simple_batch.remaining == 1;
-            if (final) try db.finishSimpleQueryBatch(true);
-            if (!copying_out) try self.command(w, command_source);
             self.simple_batch.position = boundaries.position;
             self.simple_batch.remaining -= 1;
+            if (self.copy.mode == .in) return;
+            const final = self.simple_batch.remaining == 0;
+            if (final) try db.finishSimpleQueryBatch(true);
+            if (!copying) try self.command(w, command_source);
             if (final) {
                 self.simple_batch = .{};
                 self.closeIdlePortals(db);
@@ -964,7 +988,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         } else source = "";
                     };
                     if (trim(source).len == 0) try w.empty('I') else if (has_copy and word(source, "copy")) {
-                        try self.startCopy(db, source, w, null);
+                        try self.startCopy(db, source, w, null, null);
                         // COPY FROM: ReadyForQuery follows CopyDone/CopyFail.
                         if (self.copy.mode == .in) return false;
                     } else if (try self.clusterCommand(db, source)) |command_tag| {
@@ -1031,7 +1055,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     }
                     if (comptime has_copy and @hasDecl(DB, "beginExtendedGroup")) if (word(p.source(), "copy")) {
                         try db.beginExtendedGroup();
-                        try self.startCopy(db, p.source(), w, index);
+                        try self.startCopy(db, p.source(), w, index, null);
                         return false;
                     };
                     if (self.active_portal == null) {
@@ -1191,7 +1215,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         /// COPY TO STDOUT runs its SELECT and streams CopyData; COPY FROM
         /// STDIN opens the store's COPY and sends CopyInResponse.
-        fn startCopy(self: *Self, db: *DB, source: []const u8, w: *Writer, portal_index: ?usize) !void {
+        fn startCopy(self: *Self, db: *DB, source: []const u8, w: *Writer, portal_index: ?usize, batch: ?SimpleCopySource) !void {
             var select: [sql_capacity + 1024]u8 = undefined;
             var info = try db.copyDescribe(source, &select);
             if (info.direction == .to) {
@@ -1203,12 +1227,23 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 return;
             }
             if (source.len > sql_capacity) return error.StatementCapacity;
+            if (batch) |frame| if (frame.source.len >= sql_capacity) return error.StatementCapacity;
             const begun = try db.copyBegin(source);
             self.copy.mode = .in;
             self.copy.portal = portal_index;
             self.copy.remaining = 0;
             self.copy.info = begun;
-            @memcpy(self.copy.sql[0..source.len], source);
+            if (batch) |frame| {
+                if (!self.simple_batch.owned) {
+                    @memcpy(self.copy.sql[0..frame.source.len], frame.source);
+                    self.copy.sql[frame.source.len] = 0;
+                    self.simple_batch.owned = true;
+                }
+                self.copy.sql_start = frame.command_start;
+            } else {
+                @memcpy(self.copy.sql[0..source.len], source);
+                self.copy.sql_start = 0;
+            }
             self.copy.sql_len = source.len;
             self.copy.carry_len = 0;
             self.copy.carry_rows = false;
@@ -1448,6 +1483,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         fn terminateTransaction(self: *Self, db: *DB, w: *Writer) error{BufferTooSmall}!void {
             self.copy.mode = .none;
+            self.simple_batch = .{};
             self.waiting_for_command = false;
             if (comptime @hasDecl(DB, "terminateTimedOut")) db.terminateTimedOut();
             w.at = 0;
@@ -1458,6 +1494,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             if (self.copy.portal != null) {
                 self.failed = true;
             } else {
+                try self.abortSimpleBatch(db);
                 if (comptime @hasDecl(DB, "abortExtended")) db.abortExtended();
                 self.closeIdlePortals(db);
                 try self.ready(db, w);
@@ -1582,7 +1619,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         }
 
         fn copyInsert(self: *Self, db: *DB, fields: []const ?[]const u8) !bool {
-            db.copyRow(self.copy.sql[0..self.copy.sql_len], fields) catch |err| {
+            db.copyRow(self.copy.sql[self.copy.sql_start..][0..self.copy.sql_len], fields) catch |err| {
                 if (err == error.WouldBlock) return true;
                 return err;
             };
@@ -1603,10 +1640,17 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             if (self.copy.binary_header) return error.BadCopyFormat;
             const copied = try db.copyEnd();
+            if (comptime has_simple_batch) {
+                if (self.continuingSimpleQuery() and self.simple_batch.remaining == 0) {
+                    try db.finishSimpleQueryBatch(true);
+                    self.simple_batch = .{};
+                    self.closeIdlePortals(db);
+                }
+            }
             try copyCommand(w, copied);
             if (self.copy.portal) |index| {
                 self.completeCopyPortal(index, copied);
-            } else try self.ready(db, w);
+            } else if (!self.continuingSimpleQuery()) try self.ready(db, w);
         }
 
 
