@@ -902,9 +902,9 @@ pub fn Store(comptime Raw: type) type {
                 if (self.id == 0) return error.InvalidConnection;
                 if (!self.in_transaction) return;
                 const slot = self.tx.?;
-                const db = self.db();
+                const raw = self.db();
                 if (self.failed) {
-                    db.abort(slot);
+                    raw.abort(slot);
                     self.endTransaction(false);
                     return;
                 }
