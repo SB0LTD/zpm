@@ -22,7 +22,7 @@ pub fn main() !void {
     var one: Store.Connection = .{ .store = &store, .id = 1 };
     var two: Store.Connection = .{ .store = &store, .id = 2 };
     var result: Raw.Result = .{};
-    try one.startupParameter("restrict_nonsystem_relation_kind", "view");
+    try one.startupParameter("options", "-c restrict_nonsystem_relation_kind=view");
     try state(&one, &result, "view", "client", "view");
     try state(&two, &result, "", "default", "");
     try one.execute("SELECT * FROM pg_settings WHERE name = 'restrict_nonsystem_relation_kind'", &result);
