@@ -656,13 +656,27 @@ fn timers() !void {
     try check(equal(out.rows[0].cells[0].text.slice(), "read committed"));
     try check(b.transactionStatus() == 'I');
     var startup: Store.Connection = .{ .store = &store, .id = 9 };
-    try startup.startupParameter("options", "-c statement_timeout=1000 -c lock_timeout=2s");
+    try startup.startupParameter("options", "-c statement_timeout=1000 -c lock_timeout=2s -c check_function_bodies=off");
     try startup.execute("SHOW statement_timeout", &out);
     try check(equal(out.rows[0].cells[0].text.slice(), "1s"));
     try startup.execute("SET statement_timeout = 5", &out);
     try startup.execute("RESET ALL", &out);
     try startup.execute("SHOW lock_timeout", &out);
     try check(equal(out.rows[0].cells[0].text.slice(), "2s"));
+    try startup.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "off"));
+    try startup.execute("BEGIN", &out);
+    try startup.execute("SET LOCAL check_function_bodies = on", &out);
+    try startup.execute("SAVEPOINT settings", &out);
+    try startup.execute("SET check_function_bodies = off", &out);
+    try startup.execute("ROLLBACK TO settings", &out);
+    try startup.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "on"));
+    try startup.execute("COMMIT", &out);
+    try startup.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "off"));
+    try b.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "on"));
 }
 
 fn savepoints() !void {

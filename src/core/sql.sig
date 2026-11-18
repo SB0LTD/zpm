@@ -7609,7 +7609,7 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
+        const SettingKind = enum { search_path, check_function_bodies, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
 
         fn settingKind(name: []const u8) ?SettingKind {
             inline for (@typeInfo(SettingKind).@"enum".field_names) |field| {
@@ -7738,6 +7738,7 @@ pub fn Database(comptime config: Config) type {
         fn assignSetting(into: *Sess.Values, which: SettingKind, name: []const u8, kind: SettingValueKind, value: []const u8) Error!void {
             switch (which) {
                 .search_path => try searchPath(value, kind, &into.search_path),
+                .check_function_bodies => into.check_function_bodies = parseBool(value) orelse return error.InvalidSettingValue,
                 .default_transaction_isolation => into.isolation = parseLevel(value) orelse return error.InvalidSettingValue,
                 .default_transaction_read_only => into.read_only = parseBool(value) orelse return error.InvalidSettingValue,
                 .default_transaction_deferrable => into.deferrable = parseBool(value) orelse return error.InvalidSettingValue,
@@ -7762,6 +7763,7 @@ pub fn Database(comptime config: Config) type {
         fn copySetting(into: *Sess.Values, source: *const Sess.Values, which: SettingKind, name: []const u8) Error!void {
             switch (which) {
                 .search_path => into.search_path = source.search_path,
+                .check_function_bodies => into.check_function_bodies = source.check_function_bodies,
                 .default_transaction_isolation => into.isolation = source.isolation,
                 .default_transaction_read_only => into.read_only = source.read_only,
                 .default_transaction_deferrable => into.deferrable = source.deferrable,
@@ -7899,6 +7901,7 @@ pub fn Database(comptime config: Config) type {
             const tx: ?*const M.Tx = if (slot) |owner| (if (self.active(owner)) &self.txs[owner] else null) else null;
             const text: []const u8 = switch (which) {
                 .search_path => state.values.search_path.slice(),
+                .check_function_bodies => onOff(state.values.check_function_bodies),
                 .default_transaction_isolation => levelName(state.values.isolation),
                 .default_transaction_read_only => onOff(state.values.read_only),
                 .default_transaction_deferrable => onOff(state.values.deferrable),
@@ -7955,6 +7958,16 @@ pub fn Database(comptime config: Config) type {
         /// SET of an engine setting; `slot` is the open transaction block.
         pub fn sessionSet(self: *Self, slot: ?u16, local: bool, name: []const u8, kind: SettingValueKind, value: []const u8) Error!void {
             return self.setSetting(slot, local, name, kind, value);
+        }
+
+        /// Engine settings safe to configure before a connection authenticates.
+        pub fn sessionStartupSetting(self: *Self, name: []const u8, value: []const u8) Error!bool {
+            const setting = settingKind(name) orelse return false;
+            if (setting != .check_function_bodies) return false;
+            try self.setSetting(null, false, name, .string, value);
+            const state = self.sessionState();
+            state.startup = state.values;
+            return true;
         }
 
         pub fn sessionShow(self: *Self, slot: ?u16, name: []const u8, result: *Result) Error!void {
@@ -8762,10 +8775,8 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
-        /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the body
-        /// (SQL: every statement parsed, analyzable ones bound and the final
-        /// result checked; PL/pgSQL: syntax of every statement), then writes
-        /// a new version (the replaced one is marked deleted, same OID).
+        /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the signature
+        /// and optionally analyzes the quoted body before writing its version.
         fn createRoutine(self: *Self, slot: u16, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
             var oid_buffer: [config.routine_args]u32 = undefined;
             const args = definition.argOids(&oid_buffer);
@@ -8784,7 +8795,7 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             if (definition.return_oid == tg.trigger_oid and (definition.language == 0 or definition.arg_count != 0)) return error.InvalidFunctionDefinition;
-            try self.validateRoutine(definition, snap);
+            if (self.sessionState().values.check_function_bodies) try self.validateRoutine(definition, snap);
             try self.reserveWrites(slot, 2);
             const index = try self.objectSlot(.routine);
             const oid = if (existing) |old| self.objects.routines[old].oid else try self.takeOid();
