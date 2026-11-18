@@ -551,6 +551,61 @@ fn namespaceGrants() !void {
     try sameState();
 }
 
+fn aclState(target: *const DB, snap: DB.Snapshot) !bool {
+    const scope = target.catalog.findSchema("acl_state", snap) orelse return error.NamespaceMissing;
+    return target.catalog_objects.findKey(&.{ .kind = .schema_acl_state, .target = scope.oid }, snap) != null;
+}
+
+fn expectAclState(label: []const u8, expected: bool) !void {
+    const actual = try aclState(&db, .{ .csn = db.csn });
+    try check(actual == expected);
+    try check(try aclState(&replica, .{ .csn = replica.csn }) == actual);
+    std.debug.print("acl state {s}={d}\n", .{ label, @intFromBool(actual) });
+}
+
+fn namespaceAclMaterialization() !void {
+    try reset();
+    try run("CREATE ROLE acl_guest");
+    try run("CREATE SCHEMA acl_state");
+    try expectAclState("fresh", false);
+    const noop_revoke = "REVOKE USAGE ON SCHEMA acl_state FROM acl_guest";
+    const original: DB.Snapshot = .{ .csn = db.csn };
+    const pending = try db.begin();
+    try statement(pending, noop_revoke);
+    const own: DB.Snapshot = .{ .csn = db.csn, .slot = pending, .epoch = db.txs[pending].epoch, .cid = db.cid + 1 };
+    const own_state = try aclState(&db, own);
+    try check(own_state);
+    std.debug.print("acl state own={d}\n", .{@intFromBool(own_state)});
+    try expectAclState("other", false);
+    db.abort(pending);
+    try expectAclState("rollback", false);
+
+    const records_before = records_applied;
+    try run(noop_revoke);
+    try check(records_applied == records_before + 1);
+    try check(record[8] == 70 and record[9] == 17);
+    try check(!try aclState(&db, original));
+    try expectAclState("committed_noop", true);
+    try run("GRANT USAGE ON SCHEMA acl_state TO acl_guest");
+    try run(noop_revoke);
+    try expectAclState("returned_default", true);
+    try run("DROP ROLE acl_guest");
+
+    const scope = db.catalog.findSchema("acl_state", .{ .csn = db.csn }) orelse return error.NamespaceMissing;
+    const state_tail = [_]u8{ 10, 0, 0, 0 } ++ [_]u8{0} ** 13;
+    var invalid: [256]u8 = undefined;
+    try replayFails(objectRecord(&invalid, 70, 17, 0, scope.oid, 0, 0, &state_tail), error.ChangeRecordConflict);
+    try replayFails(objectRecord(&invalid, 70, 17, 0, 99999, 0, 0, &state_tail), error.ChangeRecordConflict);
+    try replayFails(objectRecord(&invalid, 70, 17, 0, scope.oid, 1, 0, &state_tail), error.InvalidChangeRecord);
+    try expectAclState("replayed", true);
+
+    try run("DROP SCHEMA acl_state");
+    try check(db.catalog_objects.findKey(&.{ .kind = .schema_acl_state, .target = scope.oid }, .{ .csn = db.csn }) == null);
+    try check(replica.catalog_objects.findKey(&.{ .kind = .schema_acl_state, .target = scope.oid }, .{ .csn = replica.csn }) == null);
+    try run("CREATE SCHEMA acl_state");
+    try expectAclState("recreated", false);
+}
+
 fn comments() !void {
     try reset();
     const probe = "SELECT objoid = 'tdd_a'::regclass, classoid, objsubid, description FROM pg_description ORDER BY objoid, objsubid";
@@ -1360,6 +1415,7 @@ pub fn main() !void {
     try namespaceOwners();
     try namespaceUsage();
     try namespaceGrants();
+    try namespaceAclMaterialization();
     try comments();
     try roles();
     try privileges();

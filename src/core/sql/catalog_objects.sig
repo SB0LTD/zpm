@@ -78,7 +78,7 @@ pub const class_policy: u32 = 3256;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, _ };
 
 pub fn publicationMembership(kind: Kind) bool {
     return kind == .publication_table or kind == .publication_schema;
@@ -1438,7 +1438,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
                 .member, .acl, .schema_acl => a.target == b.target and a.grantee == b.grantee,
-                .relation => a.target == b.target,
+                .relation, .schema_acl_state => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
                 _ => false,
             };
@@ -1820,7 +1820,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.schema_acl)) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.schema_acl_state)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1845,7 +1845,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .publication_table, .publication_schema => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .acl, .schema_acl => o.oid == 0 and o.target != 0 and o.sub == 0,
-                .relation => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
+                .relation, .schema_acl_state => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .comment => o.oid == 0 and o.target != 0 and o.sub >= 0 and switch (o.grantee) {
                     class_relation => true,
                     class_namespace, class_authid, class_fdw, class_server, class_publication, class_policy => o.sub == 0,
@@ -1893,6 +1893,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .acl => !has_name and o.flags != 0 and o.flags & ~table_privileges == 0 and o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
                     (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
+                .schema_acl_state => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
                 .relation => !has_name and o.flags & ~(rls_enabled | rls_forced) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .policy => has_name and o.flags & ~@as(u32, 0x7ff) == 0 and (o.flags & 0xff) <= 4 and o.grant_flags == 0 and o.role_count != 0 and o.owner == 0 and using_ok and check_ok,
                 .comment => !has_name and o.owner == 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len != 0 and o.split == 0,
@@ -2148,6 +2149,9 @@ pub fn Objects(comptime config: types.Config) type {
                     .schema_acl => {
                         if (ctx.objectPrivateSchemaOwner(target) != v.owner) return error.ChangeRecordConflict;
                         if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
+                    },
+                    .schema_acl_state => {
+                        if (ctx.objectPrivateSchemaOwner(target) != v.owner) return error.ChangeRecordConflict;
                     },
                     .relation => {
                         if (!ctx.objectTableLive(target)) return error.ChangeRecordConflict;

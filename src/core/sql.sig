@@ -3312,7 +3312,7 @@ pub fn Database(comptime config: Config) type {
         /// transaction's uncommitted object naming it is waited for.
         fn objectDependent(o: *const O.Object, oid: u32) bool {
             return switch (o.kind) {
-                .acl, .schema_acl, .relation, .policy => o.target == oid,
+                .acl, .schema_acl, .schema_acl_state, .relation, .policy => o.target == oid,
                 .statistics => o.target == oid or o.grantee == oid,
                 .publication_table, .publication_schema => o.grantee == oid,
                 .comment => o.target == oid,
@@ -3326,7 +3326,7 @@ pub fn Database(comptime config: Config) type {
             latest.csn = self.csn;
             var count: usize = 0;
             for (&self.catalog_objects.items) |*o| {
-                if ((o.kind == .statistics or o.kind == .schema_acl or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                if ((o.kind == .statistics or o.kind == .schema_acl or o.kind == .schema_acl_state or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                 if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
                 if (objectDependent(o, oid)) count += 1;
                 // Comments on the table's policies go with them.
@@ -3965,7 +3965,12 @@ pub fn Database(comptime config: Config) type {
                 grantees[count] = role;
                 count += 1;
             }
-            try self.reserveWrites(slot, 2 * count);
+            // The first authorized GRANT or REVOKE materializes the ACL,
+            // even if its effective privileges are exactly the default.
+            var state: O.Object = .{ .kind = .schema_acl_state, .target = schema.oid, .owner = schema.owner };
+            const first_acl = self.catalog_objects.findKey(&state, latest) == null;
+            try self.reserveWrites(slot, 2 * count + @intFromBool(first_acl));
+            if (first_acl) _ = try self.objectInsert(slot, &state, false, snap);
             for (grantees[0..count]) |role| {
                 var acl: O.Object = .{ .kind = .schema_acl, .target = schema.oid, .grantee = role, .owner = schema.owner };
                 const before = self.catalog_objects.findKey(&acl, latest);
