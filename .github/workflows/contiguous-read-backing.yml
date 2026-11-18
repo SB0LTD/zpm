@@ -1,0 +1,41 @@
+name: Detached contiguous backing qualification
+
+on:
+  push:
+    branches: [ci/contiguous-read-backing-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install checksum-verified Sig 0.6.5
+        shell: bash
+        run: |
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-x86_64-linux.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" -o "$RUNNER_TEMP/$asset"
+          echo "179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a  $RUNNER_TEMP/$asset" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sdk"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig | head -n 1)
+          standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' | head -n 1)
+          test -x "$compiler"
+          test -f "$standard"
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+      - name: Run detached storage ownership and prepared lookup contracts
+        shell: bash
+        run: |
+          mkdir evidence
+          "$SIG" version | tee evidence/sig-version.log
+          "$SIG" build run-contract-parallel-read run-contract-sql-parameterized-lookup \
+            --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contiguous-read-backing-contracts
+          path: evidence/
