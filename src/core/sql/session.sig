@@ -86,6 +86,11 @@ pub fn Sessions(comptime config: types.Config) type {
             /// (current_user is then the session user).
             role: u32 = 0,
 
+            pub fn publicSchemaOnPath(self: *const Values) bool {
+                const path = self.search_path.slice();
+                return path.len != 0 and !types.same(path, "\"\"");
+            }
+
             pub fn findCustom(self: *const Values, name: []const u8) ?usize {
                 for (&self.custom, 0..) |*entry, index| {
                     if (entry.used and sameInsensitive(entry.name.slice(), name)) return index;

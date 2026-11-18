@@ -469,7 +469,7 @@ pub fn Eval(comptime config: types.Config) type {
         fn catalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             switch (n.func) {
                 .current_database => return textCell(ctx.session.database),
-                .current_schema => return textCell("public"),
+                .current_schema => return if (ctx.session.public_schema_on_path) textCell("public") else .null_value,
                 else => {},
             }
             const first = try eval(ctx, n.b);

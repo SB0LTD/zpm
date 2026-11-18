@@ -330,6 +330,9 @@ pub fn Binder(comptime config: types.Config) type {
             dialect: types.Dialect,
             /// Time zone and resolver for datetime literals parsed at bind time.
             session: *const value.Session = &value.default_session,
+            /// Start of stored source appended by view and policy expansion.
+            /// Existing stored references use their original public path.
+            stored_source_start: usize = 0,
             /// Plan storage for general queries; null rejects subqueries.
             plans: ?*Plans = null,
             planning_plan:?*const Plan=null,
@@ -726,6 +729,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn resolveTable(context: *const Context, ident: ast.Ident) Error!usize {
+            if (!publicLookup(context, ident)) return error.TableNotFound;
             const wanted = toName(context, ident);
             return tableIndex(context.catalog, wanted.slice(), context.snapshot);
         }
@@ -4326,15 +4330,22 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn qualifierNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
-            const qualifier = schema orelse return catalog.public_namespace;
+            const qualifier = schema orelse return if (context.session.public_schema_on_path) catalog.public_namespace else error.UndefinedSchema;
             return namespaceOf(context, toName(context, qualifier).slice());
+        }
+
+        fn publicLookup(context: *const Context, ident: ast.Ident) bool {
+            return context.session.public_schema_on_path or
+                (context.stored_source_start != 0 and ident.span.start >= context.stored_source_start);
         }
 
         /// A user table, optionally schema-qualified (public by default,
         /// as the default search_path).
         pub fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
             // PostgreSQL reports a relation in a missing schema as 42P01.
-            const namespace = qualifierNamespace(context, schema) catch |err| return if (err == error.UndefinedSchema) error.TableNotFound else err;
+            const namespace = if (schema != null) qualifierNamespace(context, schema) catch |err| {
+                return if (err == error.UndefinedSchema) error.TableNotFound else err;
+            } else if (publicLookup(context, name)) catalog.public_namespace else return error.TableNotFound;
             const wanted = toName(context, name);
             const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.TableNotFound;
@@ -5024,7 +5035,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// evaluates the body when the call runs.
         fn bindRoutineCall(context: *const Context, n: *ast.Node, count: usize) Error!void {
             // A pg_catalog-qualified call can never resolve a public routine.
-            if (n.qualifier.len != 0) return error.UndefinedFunction;
+            if (n.qualifier.len != 0 or !publicLookup(context, n.name)) return error.UndefinedFunction;
             const set = context.routines orelse return error.UndefinedFunction;
             const name = toName(context, n.name);
             var best: ?usize = null;
@@ -7685,6 +7696,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .drop_table = found.slot };
                 },
                 .create_sequence => |*create| {
+                    if (!context.session.public_schema_on_path) return error.UndefinedSchema;
                     const name = toName(context, create.name);
                     if (context.catalog.find(name.slice(), context.snapshot) != null) {
                         if (create.if_not_exists) return .{ .noop = .create_sequence };
@@ -7694,7 +7706,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .drop_sequence => |drop| {
                     const wanted = toName(context, drop.name);
-                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse {
+                    const found = (if (publicLookup(context, drop.name)) context.catalog.find(wanted.slice(), context.snapshot) else null) orelse {
                         if (drop.if_exists) return .{ .noop = .drop_sequence };
                         return error.TableNotFound;
                     };
@@ -7856,7 +7868,7 @@ pub fn Binder(comptime config: types.Config) type {
                         if (!types.same(toName(context, qualifier).slice(), "public")) return error.TableNotFound;
                     }
                     const wanted = toName(context, alter.name.name);
-                    const found = context.catalog.find(wanted.slice(), context.snapshot) orelse {
+                    const found = (if (alter.name.schema != null or publicLookup(context, alter.name.name)) context.catalog.find(wanted.slice(), context.snapshot) else null) orelse {
                         if (alter.if_exists) return .{ .noop = .alter_sequence };
                         return error.TableNotFound;
                     };
@@ -9045,6 +9057,7 @@ pub fn Binder(comptime config: types.Config) type {
                 return slot;
             }
             const wanted = toName(context, reference.name);
+            if (!publicLookup(context, reference.name)) return error.TableNotFound;
             const found = context.catalog.find(wanted.slice(), context.snapshot) orelse return error.TableNotFound;
             if (found.kind != 'r' and found.kind != 'p') return error.WrongObjectType;
             return found.slot;

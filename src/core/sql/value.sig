@@ -45,6 +45,9 @@ pub const Session = struct {
     sequences: ?*const SequenceHook = null,
     /// current_database(): the session's startup database.
     database: []const u8 = "postgres",
+    /// The implicit catalog remains visible when a PostgreSQL session
+    /// installs an empty explicit schema path.
+    public_schema_on_path: bool = true,
     mysql_keep_zero: bool = false,
     mysql_last_insert_id: u64 = 0,
     control: ?*types.ExecutionControl = null,
