@@ -5386,6 +5386,61 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        fn dependencyRow(sink: *X.RowSink, class: u32, object: u32, referenced_class: u32, referenced_object: u32, referenced_subobject: i64, kind: []const u8) Error!void {
+            try sink.add(&.{
+                intCell(class), intCell(object), intCell(0), intCell(referenced_class),
+                intCell(referenced_object), intCell(referenced_subobject), nameCell(kind),
+            });
+        }
+
+        /// Derive only dependencies represented by visible stored definitions.
+        /// No additional catalog identities or independently versioned rows are needed.
+        fn dependencyRows(self: *const Self, snapshot: Snapshot, relations: []const K.Found, sink: *X.RowSink) Error!void {
+            const relation = CO.class_relation;
+            const namespace = CO.class_namespace;
+            const constraint_class = catalog_module.constraint_catalog;
+            for (relations) |found| {
+                if (found.kind == 'S') {
+                    const seq = &self.seqs[found.slot];
+                    try dependencyRow(sink, relation, seq.oid, namespace, catalog_module.public_namespace, 0, "n");
+                    if (seq.owner == 0) continue;
+                    const slot = self.visibleTableSlot(seq.owner, snapshot) orelse continue;
+                    const owner = &self.tables[slot];
+                    if (seq.owner_column >= owner.column_count) continue;
+                    const kind = switch (owner.columns[seq.owner_column].default_kind) {
+                        .identity_always, .identity_by_default => "i",
+                        .default => "a",
+                        else => continue,
+                    };
+                    try dependencyRow(sink, relation, seq.oid, relation, owner.oid, @as(i64, seq.owner_column) + 1, kind);
+                    continue;
+                }
+                const table = &self.tables[found.slot];
+                try dependencyRow(sink, relation, table.oid, namespace, table.namespace, 0, "n");
+                if (S.keyed(table) and table.primary_constraint_oid != 0) {
+                    const primary_index = S.primaryIndexOid(table);
+                    try dependencyRow(sink, relation, primary_index, constraint_class, table.primary_constraint_oid, 0, "i");
+                    var keys: [config.columns]u8 = undefined;
+                    for (primaryColumns(table, &keys)) |column| {
+                        try dependencyRow(sink, constraint_class, table.primary_constraint_oid, relation, table.oid, @as(i64, column) + 1, "a");
+                    }
+                }
+                for (table.constraints[0..table.constraint_count]) |*item| {
+                    if (item.kind != .foreign or item.oid == 0) continue;
+                    if (self.visibleTableSlot(item.ref_oid, snapshot) == null) continue;
+                    for (item.keyColumns()) |column| {
+                        try dependencyRow(sink, constraint_class, item.oid, relation, table.oid, @as(i64, column) + 1, "a");
+                    }
+                    for (item.refColumns()) |column| {
+                        if (table.oid == item.ref_oid and std.mem.indexOfScalar(u8, item.keyColumns(), column) != null) continue;
+                        try dependencyRow(sink, constraint_class, item.oid, relation, item.ref_oid, @as(i64, column) + 1, "n");
+                    }
+                    const index = self.referencedConstraintIndex(item, snapshot);
+                    if (index != 0) try dependencyRow(sink, constraint_class, item.oid, relation, index, 0, "n");
+                }
+            }
+        }
+
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
             if (view == .pg_settings) return error.UnsupportedStatement;
             if (view == .pg_am) {
@@ -5415,6 +5470,7 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
             switch (view) {
                 .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
+                .pg_depend => return self.dependencyRows(snapshot, relations[0..count], sink),
                 .pg_type => {
                     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
                         const data_type = @field(DataType, field);

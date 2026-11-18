@@ -1340,6 +1340,40 @@ fn walFormats() !void {
     try check(try int(&replica, "SELECT nextval('four_cache')") == 5);
 }
 
+fn catalogDependencies() !void {
+    reset();
+    try expect("SELECT 'pg_catalog.pg_depend'::regclass::oid", "2608");
+    try expect("SELECT classid, objid, refobjid FROM pg_depend WHERE refclassid = 'pg_extension'::regclass AND deptype = 'e' ORDER BY 3", "");
+    try run("CREATE SCHEMA dep");
+    try run("CREATE TABLE dep.p (id INT NOT NULL)");
+    try run("CREATE TABLE dep.c (id INT, parent_id INT)");
+    try run("CREATE TABLE dep.owned (s SERIAL, i INT GENERATED ALWAYS AS IDENTITY)");
+    try run("INSERT INTO dep.p VALUES (2)");
+    try run("ALTER TABLE dep.p ADD CONSTRAINT p_pkey PRIMARY KEY (id)");
+    try run("ALTER TABLE dep.c ADD CONSTRAINT fk FOREIGN KEY (parent_id) REFERENCES dep.p(id)");
+    const names = "SELECT c.relname, d.deptype FROM pg_depend d JOIN pg_class c ON c.oid = d.objid JOIN pg_namespace n ON n.oid = d.refobjid WHERE d.classid = 1259 AND d.refclassid = 2615 AND n.nspname = 'dep' ORDER BY 1";
+    const primary_index = "SELECT d.objsubid, d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.refobjid WHERE d.classid = 1259 AND d.refclassid = 2606 AND c.conname = 'p_pkey' AND d.objid = c.conindid";
+    const primary_column = "SELECT d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.objid WHERE d.classid = 2606 AND d.refclassid = 1259 AND c.conname = 'p_pkey' AND d.refobjid = c.conrelid";
+    const foreign = "SELECT r.relname, d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.objid JOIN pg_class r ON r.oid = d.refobjid WHERE d.classid = 2606 AND d.refclassid = 1259 AND c.conname = 'fk' ORDER BY 1, 2, 3";
+    const owned = "SELECT d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_class r ON r.oid = d.objid WHERE d.classid = 1259 AND d.refclassid = 1259 AND r.relkind = 'S' AND d.refobjid = 'dep.owned'::regclass ORDER BY d.refobjsubid";
+    try expect(names, "c|n;owned|n;p|n");
+    try expect(primary_index, "0|0|i");
+    try expect(primary_column, "1|a");
+    try expect(foreign, "c|2|a;p|1|n;p_pkey|0|n");
+    try expect(owned, "1|a;2|i");
+    try sameState(&.{ names, primary_index, primary_column, foreign, owned });
+
+    const tx = try db.begin();
+    try statement(tx, "ALTER TABLE dep.c DROP CONSTRAINT fk");
+    try same(try rows(tx, foreign), "");
+    try expect(foreign, "c|2|a;p|1|n;p_pkey|0|n");
+    db.abort(tx);
+    try expect(foreign, "c|2|a;p|1|n;p_pkey|0|n");
+    try run("ALTER TABLE dep.c DROP CONSTRAINT fk");
+    try expect(foreign, "");
+    try sameState(&.{ names, primary_index, primary_column, foreign, owned });
+}
+
 /// The types lane's column types under this lane's DDL and constraints.
 fn newTypes() !void {
     reset();
@@ -1381,6 +1415,7 @@ pub fn main(init: std.process.Init) !void {
     try schemaTransactions();
     try walFormats();
     try newTypes();
+    try catalogDependencies();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
