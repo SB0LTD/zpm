@@ -190,6 +190,32 @@ fn placementFences() !void {
     db.abort(reader);
 }
 
+fn fixedCharacterVersions() !void {
+    try reject("CREATE TABLE unbounded_label (n VARCHAR)", error.TableCapacity);
+    try change("CREATE TABLE labels_bounded (id INT PRIMARY KEY, label VARCHAR(5), mark CHAR(3))");
+    try check(db.tables[0].live and db.tables[0].version_rows.len == 0);
+    try check(DB.integralRowWords(db.tables[0].columns[0..3]) == 5);
+    try change("INSERT INTO labels_bounded VALUES (1,'',''),(2,'\xf0\x9f\x8e\xb5Q','\xc3\xb6'),(3,NULL,NULL)");
+    try reject("INSERT INTO labels_bounded VALUES (4,'123456','abc')", error.StringDataRightTruncation);
+    try change("UPDATE labels_bounded SET label='12345  ' WHERE id=1");
+    try copied.copyFromInto(&db);
+    try dense_copy.copyFromInto(&db);
+    try copied.copyFromInto(&dense_copy);
+    for ([_]*DB{ &db, &recovered, &copied, &dense_copy }) |database| {
+        try execute(database, "SELECT label,mark FROM labels_bounded ORDER BY id");
+        try check(result.row_count == 3);
+        const first = &result.rows[0].cells;
+        const second = &result.rows[1].cells;
+        const nulls = &result.rows[2].cells;
+        try check(std.mem.eql(u8, first[0].text.slice(), "12345") and std.mem.eql(u8, first[1].bpchar.slice(), "   "));
+        try check(std.mem.eql(u8, second[0].text.slice(), "\xf0\x9f\x8e\xb5Q") and std.mem.eql(u8, second[1].bpchar.slice(), "\xc3\xb6  "));
+        try check(nulls[0] == .null_value and nulls[1] == .null_value);
+        try execute(database, "SELECT id FROM labels_bounded WHERE mark = '\xc3\xb6'::char(1)");
+        try check(result.row_count == 1 and result.rows[0].cells[0].integer == 2);
+    }
+    try change("DROP TABLE labels_bounded");
+}
+
 pub fn main() !void {
     const dense_bytes = try DB.backingBytesFor(dense, refs);
     const mixed_bytes = try DB.backingBytesFor(mixed, refs);
@@ -211,6 +237,7 @@ pub fn main() !void {
     try reject("CREATE TABLE oversized (a BIGINT,b BIGINT,c BIGINT,d BIGINT,e BIGINT,f BIGINT,g BIGINT)", error.TableCapacity);
     try reject("CREATE TABLE unsupported (x NUMERIC)", error.TableCapacity);
     try replayReject("CREATE TABLE unsupported (x NUMERIC)");
+    try fixedCharacterVersions();
 
     try change("CREATE TABLE facts (id BIGINT PRIMARY KEY, grp INT, item INT, store OID, day DATE, qty INT, discount INT, amount BIGINT, UNIQUE(item,qty))");
     try check(db.tables[0].live and recovered.tables[0].live);
