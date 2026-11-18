@@ -1357,11 +1357,13 @@ fn catalogDependencies() !void {
     const foreign = "SELECT r.relname, d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.objid JOIN pg_class r ON r.oid = d.refobjid WHERE d.classid = 2606 AND d.refclassid = 1259 AND c.conname = 'fk' ORDER BY 1, 2, 3";
     const owned = "SELECT d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_class r ON r.oid = d.objid WHERE d.classid = 1259 AND d.refclassid = 1259 AND r.relkind = 'S' AND d.refobjid = 'owned'::regclass ORDER BY d.refobjsubid";
     try expect(names, "c|n;p|n");
+    const relation_oid = "SELECT DISTINCT d.tableoid FROM pg_catalog.pg_depend d WHERE d.classid = 1259 AND d.refclassid = 2615 AND d.objid = 'dep.p'::regclass";
+    try expect(relation_oid, "2608");
     try expect(primary_index, "0|0|i");
     try expect(primary_column, "1|a");
     try expect(foreign, "c|2|a;p|1|n;p_pkey|0|n");
     try expect(owned, "1|a;2|i");
-    try sameState(&.{ names, primary_index, primary_column, foreign, owned });
+    try sameState(&.{ names, primary_index, primary_column, foreign, owned, relation_oid });
 
     const tx = try db.begin();
     try statement(tx, "ALTER TABLE dep.c DROP CONSTRAINT fk");
@@ -1371,7 +1373,7 @@ fn catalogDependencies() !void {
     try expect(foreign, "c|2|a;p|1|n;p_pkey|0|n");
     try run("ALTER TABLE dep.c DROP CONSTRAINT fk");
     try expect(foreign, "");
-    try sameState(&.{ names, primary_index, primary_column, foreign, owned });
+    try sameState(&.{ names, primary_index, primary_column, foreign, owned, relation_oid });
     try run("CREATE TABLE dep.selflinked (id INT PRIMARY KEY CONSTRAINT self_fk REFERENCES dep.selflinked(id))");
     const self_foreign = "SELECT d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.objid WHERE d.classid = 2606 AND d.refclassid = 1259 AND c.conname = 'self_fk' ORDER BY 1, 2";
     try expect(self_foreign, "0|n;1|a;1|n");
