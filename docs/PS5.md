@@ -2,7 +2,7 @@
 
 `src/ps5/` is what a kernel and a libkernel need to run a decrypted PS5 executable natively on an x86-64 computer: no emulator, no relinking step, no translation of the program's code. A PS5 is an x86-64 machine, so the code runs as it is. What has to be supplied is what the code talks to: a kernel that answers its system calls, and libraries bound by Sony's hashed names.
 
-What is here: the names, the kernel's ABI, a loader that reads PS5 files and binds them, a first libkernel with threads, their locks and event queues, the display library, the GPU's command packets with a first driver for them, and the runtime that puts them together. A small program in the PS5's format loads, prints and exits; one with a module of its own starts that module and calls into it; one shows frames it drew itself in a window, paced by the screen. All of that runs in tests here and on Galaxy's kernel. Not here: a renderer (draw commands are read and counted, and nothing draws them yet), shaders, the graphics library that writes the command packets, sound, the controller, and the console's other system modules. No real game runs.
+What is here: the names, the kernel's ABI, a loader that reads PS5 files and binds them, a first libkernel with threads, their locks and event queues, the display library, the GPU's command packets with a first driver for them, the graphics library that writes those packets, and the runtime that puts them together. A small program in the PS5's format loads, prints and exits; one with a module of its own starts that module and calls into it; one shows frames it drew itself in a window, paced by the screen. All of that runs in tests here and on Galaxy's kernel. Not here: a renderer (draw commands are written, read and counted, and nothing draws them yet), shaders, sound, the controller, and the console's other system modules. No real game runs.
 
 Galaxy's kernel uses `abi.sig` for its PS5 personality (`src/kernel/galaxy_ps5.sig` there), and its PS5 runtime binary is `runtime.sig` with a `_start`.
 
@@ -23,6 +23,7 @@ Everything is allocation-free: plain values, comptime tables, caller-provided bu
 | `equeue.sig` | libkernel's event queues: what a game waits on to hear of a flip, a GPU interrupt, a timer, or a word from another of its threads. Kept in the process. |
 | `videoout.sig` | The display library (libSceVideoOut): buffers, flips paced by a clock thread that stands in for the screen's refresh, flip and vblank events, the PS4's and the PS5's calls. Where frames go is the host's (`display`). |
 | `pm4.sig` | The PS5 GPU's command packets as data (AMD's PM4): headers, opcodes, the three register banks, a reader that checks every length, a writer. |
+| `agc.sig`, `agc_*.sig` | The graphics library (libSceAgc), the part that writes packets: 196 names. A game's calls for registers, draws, flow, memory and sync, flips and markers each write their packet into the game's command buffer; the patch calls and size queries go with them. Not its register-default tables, and nothing about shaders yet. |
 | `agcdriver.sig` | The graphics driver library (libSceAgcDriver), a first part: a game's submitted command buffers are carried out in order by a worker thread. Registers, labels, interrupts, waits, skips, calls and flips happen; draws are handed to a renderer that is not here yet. |
 | `runtime.sig` | The program a kernel starts for a PS5 executable. It loads and links the game and the modules it brought in its own process, binds imports to libkernel or to a stand-in that names what is missing, makes the first thread's storage, runs the modules' start functions and jumps to the game. |
 | `ps5.sig` | The module root. |
@@ -163,7 +164,10 @@ On the console an event queue is the kernel's kqueue. Here it is kept in the pro
 
 ## The GPU's commands
 
-A game does not write GPU commands itself. It calls the graphics library (libSceAgc), which writes AMD PM4 packets into a buffer the game owns, and hands the buffer to the driver (libSceAgcDriver). Both are console system modules, so both are this module's to provide. `pm4.sig` is the format; `agcdriver.sig` is a first part of the driver. The library that writes the packets is not here yet.
+A game does not write GPU commands itself. It calls the graphics library (libSceAgc), which writes AMD PM4 packets into a buffer the game owns, and hands the buffer to the driver (libSceAgcDriver). Both are console system modules, so both are this module's to provide. `pm4.sig` is the format; `agc.sig` is the library, as far as writing packets goes; `agcdriver.sig` is a first part of the driver.
+
+- **The library writes into the game's own buffer** (`CommandBuffer`: a bottom, a top, a cursor that climbs), asks the game's callback for room when it runs out, and writes nothing when there is none. Each call's packet is the one the driver reads: the tests build buffers with the library's functions, found by NID, and run them through the driver.
+- **Missing from the library:** the tables of register defaults a game asks for at start (`sceAgcGetRegisterDefaults` and its kin), and every shader call (`sceAgcCreateShader`, linking, interpolant mappings).
 
 - **A submit call returns at once.** A worker thread stands in for the GPU's command processor and reads the buffer packet by packet, straight from the game's memory, as the GPU would.
 - **Registers** are kept in three banks (shader, context, user configuration) with the values a queue starts with; the context registers can be cleared, put aside and brought back.

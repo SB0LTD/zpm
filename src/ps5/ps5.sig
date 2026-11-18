@@ -42,6 +42,7 @@ pub const equeue = @import("equeue.sig");
 pub const videoout = @import("videoout.sig");
 pub const pm4 = @import("pm4.sig");
 pub const agcdriver = @import("agcdriver.sig");
+pub const agc = @import("agc.sig");
 pub const runtime = @import("runtime.sig");
 
 test {
@@ -60,6 +61,7 @@ test {
         _ = equeue;
         _ = videoout;
         _ = agcdriver;
+        _ = agc;
         _ = runtime;
     }
 }

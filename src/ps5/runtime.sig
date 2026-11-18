@@ -42,6 +42,7 @@ const libkernel = @import("libkernel.sig");
 const pthread = @import("pthread.sig");
 const videoout = @import("videoout.sig");
 const agcdriver = @import("agcdriver.sig");
+const agc = @import("agc.sig");
 
 const S = abi.Sys;
 const RW = abi.PROT.READ | abi.PROT.WRITE;
@@ -272,6 +273,7 @@ fn builtin(_: ?*anyopaque, library: []const u8, n: nid.Nid) ?u64 {
     if (libkernel.find(library, n)) |addr| return addr;
     if (videoout.find(library, n)) |addr| return addr;
     if (agcdriver.find(library, n)) |addr| return addr;
+    if (agc.find(library, n)) |addr| return addr;
     for (providers[0..provider_count]) |f| {
         if (f(library, n)) |addr| return addr;
     }

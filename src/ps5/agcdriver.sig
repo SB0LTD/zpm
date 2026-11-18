@@ -571,8 +571,10 @@ fn packet(s: *State, p: pm4.Packet) void {
             .index_address = p.pair(1),
             .index_size = s.index_size,
         }) else skip(p),
+        // (the first word is the most indices the draw may take, as this
+        // project's graphics library writes it: the count itself)
         OP.DRAW_INDEX_OFFSET_2 => if (b.len == 4) draw(s, .{
-            .count = @min(b[2], b[0] -| b[1]),
+            .count = @min(b[2], b[0]),
             .instances = s.instances,
             .index_address = s.index_base + @as(u64, b[1]) * s.index_size,
             .index_size = s.index_size,
@@ -1337,7 +1339,7 @@ test "indirect draws: the record read after the renderer finished, its numbers g
     // An index type set as a plain register is the draws' index size too,
     // and a draw from an offset cannot run past what the buffer holds.
     _ = w.setRegisters(.uc, UC.INDEX_TYPE, &.{1});
-    _ = w.put(OP.DRAW_INDEX_OFFSET_2, 0, &.{ 4, 3, 100, 0 });
+    _ = w.put(OP.DRAW_INDEX_OFFSET_2, 0, &.{ 1, 3, 100, 0 });
     try std.testing.expect(!w.full);
     try Testing.run(w.written());
 

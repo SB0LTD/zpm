@@ -6,14 +6,18 @@
 //! CPU. No ROCm, LLVM, Mesa or vendor driver at build or run time: AMD's
 //! public GCN3 ISA guide is the source, LLVM's assembler output is the test
 //! data (gcn3_vectors.txt), Mesa and LLVM were read as documentation only.
+//! gfx10 decodes the gfx10 encodings (the PS5's GPU, gfx1013) into the same
+//! kind of instruction structure, for its shaders.
 
 pub const gcn3 = @import("gcn3.sig");
+pub const gfx10 = @import("gfx10.sig");
 pub const gcn3_asm = @import("gcn3_asm.sig");
 pub const gcn3_emu = @import("gcn3_emu.sig");
 pub const dispatch = @import("dispatch.sig");
 
 test {
     _ = gcn3;
+    _ = gfx10;
     _ = gcn3_asm;
     _ = gcn3_emu;
     _ = dispatch;
