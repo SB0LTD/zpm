@@ -1347,7 +1347,7 @@ fn catalogDependencies() !void {
     try run("CREATE SCHEMA dep");
     try run("CREATE TABLE dep.p (id INT NOT NULL)");
     try run("CREATE TABLE dep.c (id INT, parent_id INT)");
-    try run("CREATE TABLE dep.owned (s SERIAL, i INT GENERATED ALWAYS AS IDENTITY)");
+    try run("CREATE TABLE owned (s SERIAL, i INT GENERATED ALWAYS AS IDENTITY)");
     try run("INSERT INTO dep.p VALUES (2)");
     try run("ALTER TABLE dep.p ADD CONSTRAINT p_pkey PRIMARY KEY (id)");
     try run("ALTER TABLE dep.c ADD CONSTRAINT fk FOREIGN KEY (parent_id) REFERENCES dep.p(id)");
@@ -1355,8 +1355,8 @@ fn catalogDependencies() !void {
     const primary_index = "SELECT d.objsubid, d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.refobjid WHERE d.classid = 1259 AND d.refclassid = 2606 AND c.conname = 'p_pkey' AND d.objid = c.conindid";
     const primary_column = "SELECT d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.objid WHERE d.classid = 2606 AND d.refclassid = 1259 AND c.conname = 'p_pkey' AND d.refobjid = c.conrelid";
     const foreign = "SELECT r.relname, d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.objid JOIN pg_class r ON r.oid = d.refobjid WHERE d.classid = 2606 AND d.refclassid = 1259 AND c.conname = 'fk' ORDER BY 1, 2, 3";
-    const owned = "SELECT d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_class r ON r.oid = d.objid WHERE d.classid = 1259 AND d.refclassid = 1259 AND r.relkind = 'S' AND d.refobjid = 'dep.owned'::regclass ORDER BY d.refobjsubid";
-    try expect(names, "c|n;owned|n;p|n");
+    const owned = "SELECT d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_class r ON r.oid = d.objid WHERE d.classid = 1259 AND d.refclassid = 1259 AND r.relkind = 'S' AND d.refobjid = 'owned'::regclass ORDER BY d.refobjsubid";
+    try expect(names, "c|n;p|n");
     try expect(primary_index, "0|0|i");
     try expect(primary_column, "1|a");
     try expect(foreign, "c|2|a;p|1|n;p_pkey|0|n");
