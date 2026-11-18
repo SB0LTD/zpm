@@ -692,11 +692,42 @@ fn alterPrimaryKey() !void {
 
     try run("CREATE TABLE pairs (a INT, b INT)");
     try run("INSERT INTO pairs VALUES (1,1),(1,2),(2,1)");
-    try run("ALTER TABLE pairs ADD PRIMARY KEY (a,b)");
     const pair_query = "SELECT a,b FROM pairs ORDER BY a,b";
-    try rejects("INSERT INTO pairs VALUES (1,2)", error.PrimaryKeyViolation, pair_query, "1|1;1|2;2|1");
-    try rejects("INSERT INTO pairs VALUES (1,NULL)", error.NotNullViolation, pair_query, "1|1;1|2;2|1");
+    try rejects("ALTER TABLE pairs ADD PRIMARY KEY (a,b)", error.UnsupportedStatement, pair_query, "1|1;1|2;2|1");
     try sameState(&.{pair_query});
+}
+
+fn latePrimaryRecordFence() !void {
+    reset();
+    try run("CREATE TABLE mixed (id INT)");
+    try run("INSERT INTO mixed VALUES (1)");
+    const late = "ALTER TABLE mixed ADD PRIMARY KEY (id)";
+    const first = try db.begin();
+    try statement(first, "INSERT INTO mixed VALUES (2)");
+    try statementFails(first, late, error.UnsupportedStatement);
+    db.abort(first);
+    const second = try db.begin();
+    try statement(second, late);
+    try statementFails(second, "INSERT INTO mixed VALUES (2)", error.UnsupportedStatement);
+    db.abort(second);
+    try rejects("ALTER TABLE mixed ADD PRIMARY KEY (id), ADD COLUMN another INT", error.UnsupportedStatement,
+        "SELECT id FROM mixed", "1");
+
+    var late_bytes: [4096]u8 = undefined;
+    const late_record = try recordOf(late, &late_bytes);
+    const prior = replica.csn;
+    var out: DB.Result = .{};
+    try replica.execute("INSERT INTO mixed VALUES (1)", &out);
+    if (replica.applyChangeRecord(late_record, &scratch)) |_| return error.DuplicateReplayPrimaryKeyAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try check(replica.csn == prior + 1);
+    try same(try query(&replica, "SELECT COUNT(*) FROM mixed"), "2");
+    // A failed borrow must leave an empty bank available for a retry.
+    try replica.execute("DELETE FROM mixed", &out);
+    try replica.execute("INSERT INTO mixed VALUES (NULL)", &out);
+    if (replica.applyChangeRecord(late_record, &scratch)) |_| return error.NullReplayPrimaryKeyAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try replica.execute("UPDATE mixed SET id=1", &out);
+    try replica.applyChangeRecord(late_record, &scratch);
+    try same(try query(&replica, "SELECT id FROM mixed"), "1");
 }
 
 fn alterErrors() !void {
@@ -1317,6 +1348,7 @@ pub fn main(init: std.process.Init) !void {
     try alterValues();
     try alterConstraints();
     try alterPrimaryKey();
+    try latePrimaryRecordFence();
     try alterErrors();
     try alterTransactions();
     try alterIsolation();

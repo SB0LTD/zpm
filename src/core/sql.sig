@@ -6313,10 +6313,15 @@ pub fn Database(comptime config: Config) type {
 
         /// AccessExclusive already stabilizes the table. Retire its latest
         /// committed rows and our earlier writes, as logical WAL replay does.
+        fn checkPendingLatePrimary(table: *const S.Table) Error!void {
+            if (table.pending_create and table.pending_late_primary) return error.UnsupportedStatement;
+        }
+
         fn truncateSlot(self: *Self, slot: u16, index: usize, snap: Snapshot, comptime kind: M.WriteKind) Error!void {
             try self.reserveWrites(slot, 1);
             const tx = &self.txs[slot];
             const table = &self.tables[index];
+            try checkPendingLatePrimary(table);
             var current = snap;
             current.csn = self.csn;
             for (0..table.row_high) |row| {
@@ -6332,6 +6337,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {
+            try checkPendingLatePrimary(&self.tables[index]);
             try self.fenceBankPlacement(slot, false);
             try self.lockTable(slot, index, .access_exclusive);
             const tx = &self.txs[slot];
@@ -6456,6 +6462,20 @@ pub fn Database(comptime config: Config) type {
             // dense bank move can change later heterogeneous CREATE choices.
             if (S.anyIntegralBank(&self.tables)) return error.UnsupportedStatement;
             const source = &self.tables[alter.table];
+            try checkPendingLatePrimary(source);
+            var late_primary = false;
+            if (!S.keyed(source)) for (alter.columns[0..alter.count]) |*column| {
+                late_primary = late_primary or column.primary_key;
+            };
+            if (late_primary) {
+                const tx = &self.txs[slot];
+                for (tx.writes[0..tx.write_len]) |entry| switch (entry.kind) {
+                    .insert, .update, .delete, .truncate, .refresh_rows, .create_table, .alter_table, .drop_table => {
+                        if (self.tables[entry.table].oid == source.oid) return error.UnsupportedStatement;
+                    },
+                    else => {},
+                };
+            }
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);
             }
@@ -6517,6 +6537,10 @@ pub fn Database(comptime config: Config) type {
                 created.oid = change_log.first_oid + self.oid_counter;
                 self.oid_counter += 1;
             };
+            if (late_primary) {
+                copy.primary_index_oid = try self.takeOid();
+                copy.pending_late_primary = true;
+            }
             try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
             try self.remapStatistics(slot, source.oid, alter.sources[0..alter.count], snap);
         }
@@ -7107,6 +7131,7 @@ pub fn Database(comptime config: Config) type {
         fn placeUpdate(self: *Self, slot: u16, table_index: usize, row: u32, old: u32, cells: *const E.Row, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[table_index];
+            try checkPendingLatePrimary(table);
             try self.reserveWrites(slot, 1);
             try S.ensureVersions(table, 1, self.horizon());
             const version = S.createVersion(table, .{ .row = row, .xmin = tx.ref(slot), .cid = snap.cid, .older = old + 1 }, cells);
@@ -7418,6 +7443,7 @@ pub fn Database(comptime config: Config) type {
         fn placeInsert(self: *Self, slot: u16, table_index: usize, rowid: u64, cells: *const E.Row, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[table_index];
+            try checkPendingLatePrimary(table);
             try self.reserveWrites(slot, 1);
             const at = self.horizon();
             try S.ensureVersions(table, 1, at);
@@ -8098,6 +8124,7 @@ pub fn Database(comptime config: Config) type {
         fn placeDelete(self: *Self, slot: u16, table_index: usize, goal: u32, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[table_index];
+            try checkPendingLatePrimary(table);
             try self.reserveWrites(slot, 1);
             table.versions[goal].xmax = tx.ref(slot);
             table.versions[goal].xmax_cid = snap.cid;
@@ -10707,6 +10734,11 @@ pub fn Database(comptime config: Config) type {
             try C.apply(self, record, scratch);
             self.reclaimTables(self.csn);
             self.wake_epoch +%= 1;
+        }
+
+        pub fn replayQuiescent(self: *const Self) bool {
+            for (&self.txs) |*tx| if (tx.active) return false;
+            return true;
         }
 
         /// Replay hook: committed catalog rows for a table slot just reset.

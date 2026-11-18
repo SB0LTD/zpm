@@ -699,6 +699,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             live: bool = false,
             /// Rows of this slot still come from the database (not recreated).
             base: bool = false,
+            mutated: bool = false,
+            late_primary: bool = false,
             /// A primary key, with an optional explicit index identity.
             keyed: bool = false,
             primary_index_oid: u32 = 0,
@@ -1625,6 +1627,45 @@ pub fn ChangeLog(comptime config: types.Config) type {
             return false;
         }
 
+        fn noteMutation(table: *VTable) Error!void {
+            if (table.late_primary) return error.ChangeRecordConflict;
+            table.mutated = true;
+        }
+
+        fn rangesOverlap(a: usize, a_len: usize, b: usize, b_len: usize) bool {
+            if (a_len == 0 or b_len == 0) return false;
+            return if (a <= b) b - a < a_len else a - b < b_len;
+        }
+
+        fn validateLatePrimary(db: anytype, scratch: *Scratch, record: []const u8, index: usize, column: usize, target: *const V.Column) Error!void {
+            if (!db.replayQuiescent()) return error.ChangeRecordConflict;
+            const table = &db.tables[index];
+            const bank = table.key_index[0..];
+            if (bank.len == 0 or bank.len & (bank.len - 1) != 0 or table.version_used > bank.len / 2) return error.ChangeRecordConflict;
+            const bank_start = @intFromPtr(bank.ptr);
+            const bank_bytes = bank.len * @sizeOf(u32);
+            if (rangesOverlap(bank_start, bank_bytes, @intFromPtr(record.ptr), record.len) or
+                rangesOverlap(bank_start, bank_bytes, @intFromPtr(scratch), @sizeOf(Scratch))) return error.InvalidParameterValue;
+            // The caller exclusively owns replay. A keyless table's verified
+            // empty bank can lend capacity for its committed rows, independent
+            // of the transaction record's smaller touched-row overlay.
+            for (bank) |entry| if (entry != 0) return error.ChangeRecordConflict;
+            defer @memset(bank, 0);
+            for (0..table.row_high) |row| {
+                const version = S.visible(table, row) orelse continue;
+                var cell: V.Cell = undefined;
+                const key = S.borrowVersionCell(table, version, column, &cell);
+                if (key.* == .null_value) return error.ChangeRecordConflict;
+                V.validate(target, key) catch return error.ChangeRecordConflict;
+                var position = V.hash(key) & (bank.len - 1);
+                while (bank[position] != 0) : (position = (position + 1) & (bank.len - 1)) {
+                    var earlier: V.Cell = undefined;
+                    if (sameValue(key, S.borrowVersionCell(table, bank[position] - 1, column, &earlier))) return error.ChangeRecordConflict;
+                }
+                bank[position] = version + 1;
+            }
+        }
+
         fn validate(db: anytype, record: []const u8, scratch: *Scratch) Error!void {
             const count = try opCount(record);
             scratch.epoch +%= 1;
@@ -1700,7 +1741,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         try validateConstraintOids(scratch, &definition, &.{});
                         purge(scratch, @intCast(index));
                         const vt = &scratch.tables[index];
-                        vt.* = .{ .live = true, .keyed = definition.keyed(), .primary_index_oid = definition.primary_index_oid, .namespace = definition.namespace, .oid = definition.oid, .name = definition.name, .column_count = definition.count, .columns = definition.columns, .next_rowid = 1, .relkind = definition.extras.relkind };
+                        vt.* = .{ .live = true, .mutated = true, .keyed = definition.keyed(), .primary_index_oid = definition.primary_index_oid, .namespace = definition.namespace, .oid = definition.oid, .name = definition.name, .column_count = definition.count, .columns = definition.columns, .next_rowid = 1, .relkind = definition.extras.relkind };
                         for (definition.columns[0..definition.count], 0..) |column, position| if (column.primary_key) {
                             vt.primary = position;
                         };
@@ -1710,6 +1751,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.drop_table) => {
                         const index = try findVTable(scratch, try reader.int(u32));
+                        try noteMutation(&scratch.tables[index]);
                         scratch.tables[index].live = false;
                         scratch.tables[index].base = false;
                         purge(scratch, index);
@@ -1745,11 +1787,25 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         for (definition.columns[0..definition.count], 0..) |*column, position| if (column.primary_key) {
                             primary = position;
                         };
-                        if (primary) |column| {
-                            const old = vt.primary orelse return error.ChangeRecordConflict;
-                            if (sources[column] != old) return error.ChangeRecordConflict;
+                        const late = definition.keyed() and !vt.keyed;
+                        if (late) {
+                            if (vt.mutated or !vt.base or definition.primary_index_oid == 0 or primary == null or
+                                definition.count != vt.column_count or !types.same(definition.name.slice(), vt.name.slice()) or
+                                oidTaken(db, scratch, definition.primary_index_oid, 1)) return error.ChangeRecordConflict;
+                            for (sources[0..definition.count], 0..) |source, column| {
+                                if (source != column or !types.same(vt.columns[column].name.slice(), definition.columns[column].name.slice())) return error.ChangeRecordConflict;
+                            }
+                            try validateLatePrimary(db, scratch, record, index, primary.?, &definition.columns[primary.?]);
+                            vt.late_primary = true;
+                            next_oid = @max(next_oid, definition.primary_index_oid + 1);
+                        } else {
+                            try noteMutation(vt);
+                            if (primary) |column| {
+                                const old = vt.primary orelse return error.ChangeRecordConflict;
+                                if (sources[column] != old) return error.ChangeRecordConflict;
+                            }
+                            if (definition.keyed() and definition.primary_index_oid != vt.primary_index_oid) return error.ChangeRecordConflict;
                         }
-                        if (definition.keyed() and (!vt.keyed or definition.primary_index_oid != vt.primary_index_oid)) return error.ChangeRecordConflict;
                         if (definition.extras.relkind != vt.relkind) return error.ChangeRecordConflict;
                         if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         try validateExtras(db, scratch, &definition, vt);
@@ -1774,6 +1830,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         // this record is gone; later inserts may reuse keys.
                         const index = try findVTable(scratch, try reader.int(u32));
                         const vt = &scratch.tables[index];
+                        try noteMutation(vt);
                         purge(scratch, index);
                         vt.base = false;
                         vt.live_rows = 0;
@@ -1781,6 +1838,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.insert) => {
                         const index = try findVTable(scratch, try reader.int(u32));
                         const vt = &scratch.tables[index];
+                        try noteMutation(vt);
                         const rowid = try reader.int(u64);
                         // Concurrent transactions commit in any order, so rowids
                         // need only be unused, not ascending.
@@ -1800,6 +1858,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.update) => {
                         const index = try findVTable(scratch, try reader.int(u32));
                         const vt = &scratch.tables[index];
+                        try noteMutation(vt);
                         const rowid = try reader.int(u64);
                         if (!rowExists(db, scratch, index, rowid)) return error.ChangeRecordConflict;
                         var key_offset: u32 = 0;
@@ -1819,6 +1878,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.delete) => {
                         const index = try findVTable(scratch, try reader.int(u32));
                         const vt = &scratch.tables[index];
+                        try noteMutation(vt);
                         const rowid = try reader.int(u64);
                         if (!rowExists(db, scratch, index, rowid)) return error.ChangeRecordConflict;
                         const created = !vt.base or rowid >= vt.base_next_rowid;

@@ -360,6 +360,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub const Table = struct {
             live: bool = false,
             pending_create: bool = false,
+            pending_late_primary: bool = false,
             pending_drop: bool = false,
             dead_csn: u64 = 0,
             oid: u32 = 0,
@@ -968,6 +969,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.namespace = 2200;
             table.primary_constraint_oid = 0;
             table.primary_index_oid = 0;
+            table.pending_late_primary = false;
             table.constraint_count = 0;
             setExtras(table, &.{});
             table.truncate_csn = 0;
