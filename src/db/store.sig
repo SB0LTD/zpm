@@ -900,7 +900,7 @@ pub fn Store(comptime Raw: type) type {
                 self.endTransaction(true);
             }
 
-            /// Sync or a simple Query ends an implicit extended group.
+            /// Sync ends an implicit extended group.
             pub fn finishExtended(self: *Connection) !void {
                 if (self.postgres_extended_implicit) try self.commitTransaction();
             }
@@ -952,6 +952,8 @@ pub fn Store(comptime Raw: type) type {
 
             pub fn beginSimpleQueryBatch(self: *Connection) !void {
                 if (self.id == 0 or self.simple_query_batch != null or self.pending.active) return error.ProtocolViolation;
+                // PostgreSQL ends an implicit pipeline transaction at a
+                // multi-command Query boundary. A single command keeps it.
                 self.simple_query_batch = .{
                     .statement_us = self.store.wallNow(),
                     .implicit = self.postgres_extended_implicit,
