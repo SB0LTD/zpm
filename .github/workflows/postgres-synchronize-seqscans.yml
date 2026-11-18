@@ -32,7 +32,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir evidence
-          git rev-parse HEAD^ >evidence/source.txt
+          git rev-parse HEAD >evidence/source.txt
           "$SIG" version | tee evidence/sig-version.log
           "$SIG" build run-contract-sql-projected-filter run-contract-sql-tx-session \
             --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
