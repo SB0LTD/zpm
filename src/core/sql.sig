@@ -1617,7 +1617,7 @@ pub fn Database(comptime config: Config) type {
                         if (source.table) |index| {
                             const table = &db.tables[index];
                             if (table.relkind != 'r' or table.namespace != catalog_module.public_namespace) return false;
-                            if (session.synchronize_seqscans and X.synchronizedProjection(block) and S.supportsSynchronizedScan(table)) return false;
+                            if (self.session.synchronize_seqscans and X.synchronizedProjection(block) and S.supportsSynchronizedScan(table)) return false;
                         }
                     }
                     for (block.aggs[0..block.agg_count]) |aggregate| if (!cacheableAggregate(aggregate.kind)) return false;

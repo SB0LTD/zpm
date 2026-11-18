@@ -76,7 +76,10 @@ same relation. A scan visits each physical slot once under its own snapshot,
 wrapping around the end. `off` starts at slot zero and leaves the shared
 position alone. `Config.synchronized_scan_rows` is the minimum span to consider
 for cache locality. Ordered queries, joins, aggregates, sampling and locking retain their
-existing paths. The shared result cache skips plans whose output can rotate.
+existing paths. The aggregate cache skips plans whose output can rotate. The
+optional projection cache can serve an already materialized unordered result
+with synchronization on. With synchronization off, projected filters scan
+from physical slot zero on each read.
 
 ## Errors (SQLSTATE)
 
