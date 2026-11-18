@@ -49,6 +49,13 @@ documentation and source and is pending native verification.
 | SQL PREPARE | PREPARE name [(types)] AS SELECT/VALUES/INSERT/UPDATE/DELETE/MERGE, parse analysis at PREPARE; EXECUTE with arguments coerced to the declared types in assignment context ($n are real parameters: `SELECT $1` is ?column?); DEALLOCATE [PREPARE] name/ALL; not transactional; 42P05, 26000, 42601 (argument count), 42804; the wire's DEALLOCATE reaches both namespaces | type inference for undeclared parameters (42P18 here); plan caching (each EXECUTE re-binds) |
 | LISTEN / NOTIFY | LISTEN / UNLISTEN [*] take effect at commit (dropped with the (sub)transaction); NOTIFY channel [, 'payload'] queued per transaction, folded duplicates, dropped by ROLLBACK / ROLLBACK TO / a failed statement, published at commit in order; a listener reads from its own position (own notifications included); the codec sends NotificationResponse ('A': pid, channel, payload) before ReadyForQuery and through `Session.notifications()` while idle | pg_notify() (void result); pg_listening_channels(); payloads beyond Config.notify_payload_bytes (54000; PostgreSQL's limit is 8000 bytes, 22023 here at 8000) |
 
+`PostgresStatements` iterates nonempty command spans in a PostgreSQL Query
+message. It keeps quoted text, nested comments and SQL routine bodies intact.
+`Database.preflightPostgresBatch` checks boundaries and the supported raw
+grammar for the entire message before execution. Catalog resolution and
+execution errors are checked when each command runs. PostgreSQL grammar outside
+the supported SQL subset still requires additional parser coverage.
+
 ## Errors (SQLSTATE)
 
 40001 SerializationFailure (concurrent update/delete, SSI), 25001
