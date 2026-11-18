@@ -886,6 +886,22 @@ fn ordinaryBatchAdmission() !void {
     try quiescent(&store);
 }
 
+fn interleavedCommitOwner() !void {
+    var store: Store = .{};
+    var listener: Store.Connection = .{ .store = &store, .id = 1 };
+    var sender: Store.Connection = .{ .store = &store, .id = 2 };
+    var result: DB.Result = .{};
+    try listener.beginTransaction();
+    try listener.execute("LISTEN owner_channel", &result);
+    try sender.execute("SELECT 1", &result);
+    try listener.commitTransaction();
+    try sender.execute("NOTIFY owner_channel, 'actual owner'", &result);
+    var notification: Store.Connection.Notification = undefined;
+    try check(listener.takeNotification(&notification));
+    try check(equal(notification.payloadSlice(), "actual owner"));
+    try check(!sender.takeNotification(&notification));
+}
+
 const BatchProbe = struct {
     store: *const Store,
     before: u64,
@@ -978,6 +994,7 @@ pub fn main() !void {
     try savepoints();
     try runningControl();
     try ordinaryBatchAdmission();
+    try interleavedCommitOwner();
     try serializedBatchCommit();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
