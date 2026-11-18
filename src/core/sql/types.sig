@@ -574,12 +574,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -694,6 +694,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .regtype => .regtype,
         .tsvector => .tsvector,
         .tsquery => .tsquery,
+        .pg_internal_char => .pg_internal_char,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -744,13 +745,15 @@ pub fn typeOfData(data_type: DataType) Type {
         .regtype => .regtype,
         .tsvector => .tsvector,
         .tsquery => .tsquery,
+        .pg_internal_char => .pg_internal_char,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
 
 /// Static type table (pg_type subset): OID, typname, typlen, typcategory,
 /// array type OID (arrays are reported for catalog fidelity only).
-pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8, array: u32 };
+/// PostgreSQL type ABI metadata. Alignment does not describe the Cell layout.
+pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8, array: u32, alignment: u8 = 'i' };
 
 /// Catalog identity of a projected nominal type, separate from its value
 /// representation. A zero OID denotes ordinary built-in metadata.
@@ -779,7 +782,7 @@ pub fn validTypeTypmod(comptime config: Config, data_type: DataType, typmod: i32
 pub fn typeInfo(data_type: DataType) TypeInfo {
     if (elementData(data_type)) |element| {
         const base = baseInfo(element);
-        return .{ .oid = base.array, .name = array_names[@intFromEnum(element)], .len = -1, .category = 'A', .array = 0 };
+        return .{ .oid = base.array, .name = array_names[@intFromEnum(element)], .len = -1, .category = 'A', .array = 0, .alignment = if (base.alignment == 'd') 'd' else 'i' };
     }
     return baseInfo(data_type);
 }
@@ -802,20 +805,21 @@ const array_sql_names = blk: {
 
 fn baseInfo(data_type: DataType) TypeInfo {
     return switch (data_type) {
-        .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000 },
-        .name => .{ .oid = 19, .name = "name", .len = 64, .category = 'S', .array = 1003 },
-        .integer => .{ .oid = 20, .name = "int8", .len = 8, .category = 'N', .array = 1016 },
-        .smallint => .{ .oid = 21, .name = "int2", .len = 2, .category = 'N', .array = 1005 },
+        .pg_internal_char => .{ .oid = 18, .name = "char", .len = 1, .category = 'Z', .array = 1002, .alignment = 'c' },
+        .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000, .alignment = 'c' },
+        .name => .{ .oid = 19, .name = "name", .len = 64, .category = 'S', .array = 1003, .alignment = 'c' },
+        .integer => .{ .oid = 20, .name = "int8", .len = 8, .category = 'N', .array = 1016, .alignment = 'd' },
+        .smallint => .{ .oid = 21, .name = "int2", .len = 2, .category = 'N', .array = 1005, .alignment = 's' },
         .integer32 => .{ .oid = 23, .name = "int4", .len = 4, .category = 'N', .array = 1007 },
         .text => .{ .oid = 25, .name = "text", .len = -1, .category = 'S', .array = 1009 },
         .oid => .{ .oid = 26, .name = "oid", .len = 4, .category = 'N', .array = 1028 },
         .json => .{ .oid = 114, .name = "json", .len = -1, .category = 'U', .array = 199 },
         .real => .{ .oid = 700, .name = "float4", .len = 4, .category = 'N', .array = 1021 },
-        .double => .{ .oid = 701, .name = "float8", .len = 8, .category = 'N', .array = 1022 },
+        .double => .{ .oid = 701, .name = "float8", .len = 8, .category = 'N', .array = 1022, .alignment = 'd' },
         .date => .{ .oid = 1082, .name = "date", .len = 4, .category = 'D', .array = 1182 },
-        .timestamp => .{ .oid = 1114, .name = "timestamp", .len = 8, .category = 'D', .array = 1115 },
-        .timestamptz => .{ .oid = 1184, .name = "timestamptz", .len = 8, .category = 'D', .array = 1185 },
-        .interval => .{ .oid = 1186, .name = "interval", .len = 16, .category = 'T', .array = 1187 },
+        .timestamp => .{ .oid = 1114, .name = "timestamp", .len = 8, .category = 'D', .array = 1115, .alignment = 'd' },
+        .timestamptz => .{ .oid = 1184, .name = "timestamptz", .len = 8, .category = 'D', .array = 1185, .alignment = 'd' },
+        .interval => .{ .oid = 1186, .name = "interval", .len = 16, .category = 'T', .array = 1187, .alignment = 'd' },
         .numeric => .{ .oid = 1700, .name = "numeric", .len = -1, .category = 'N', .array = 1231 },
         // PostgreSQL wire and catalog columns expose the exact NUMERIC
         // representation. The change log encodes the unsigned type separately.
@@ -823,26 +827,26 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .jsonb => .{ .oid = 3802, .name = "jsonb", .len = -1, .category = 'U', .array = 3807 },
         .bpchar => .{ .oid = 1042, .name = "bpchar", .len = -1, .category = 'S', .array = 1014 },
         .varchar => .{ .oid = 1043, .name = "varchar", .len = -1, .category = 'S', .array = 1015 },
-        .uuid => .{ .oid = 2950, .name = "uuid", .len = 16, .category = 'U', .array = 2951 },
+        .uuid => .{ .oid = 2950, .name = "uuid", .len = 16, .category = 'U', .array = 2951, .alignment = 'c' },
         .bytea => .{ .oid = 17, .name = "bytea", .len = -1, .category = 'U', .array = 1001 },
-        .time => .{ .oid = 1083, .name = "time", .len = 8, .category = 'D', .array = 1183 },
-        .timetz => .{ .oid = 1266, .name = "timetz", .len = 12, .category = 'D', .array = 1270 },
+        .time => .{ .oid = 1083, .name = "time", .len = 8, .category = 'D', .array = 1183, .alignment = 'd' },
+        .timetz => .{ .oid = 1266, .name = "timetz", .len = 12, .category = 'D', .array = 1270, .alignment = 'd' },
         .bit => .{ .oid = 1560, .name = "bit", .len = -1, .category = 'V', .array = 1561 },
         .varbit => .{ .oid = 1562, .name = "varbit", .len = -1, .category = 'V', .array = 1563 },
-        .money => .{ .oid = 790, .name = "money", .len = 8, .category = 'N', .array = 791 },
-        .pg_lsn => .{ .oid = 3220, .name = "pg_lsn", .len = 8, .category = 'U', .array = 3221 },
-        .xid8 => .{ .oid = 5069, .name = "xid8", .len = 8, .category = 'U', .array = 271 },
+        .money => .{ .oid = 790, .name = "money", .len = 8, .category = 'N', .array = 791, .alignment = 'd' },
+        .pg_lsn => .{ .oid = 3220, .name = "pg_lsn", .len = 8, .category = 'U', .array = 3221, .alignment = 'd' },
+        .xid8 => .{ .oid = 5069, .name = "xid8", .len = 8, .category = 'U', .array = 271, .alignment = 'd' },
         .int4range => .{ .oid = 3904, .name = "int4range", .len = -1, .category = 'R', .array = 3905 },
-        .int8range => .{ .oid = 3926, .name = "int8range", .len = -1, .category = 'R', .array = 3927 },
+        .int8range => .{ .oid = 3926, .name = "int8range", .len = -1, .category = 'R', .array = 3927, .alignment = 'd' },
         .numrange => .{ .oid = 3906, .name = "numrange", .len = -1, .category = 'R', .array = 3907 },
         .daterange => .{ .oid = 3912, .name = "daterange", .len = -1, .category = 'R', .array = 3913 },
-        .tsrange => .{ .oid = 3908, .name = "tsrange", .len = -1, .category = 'R', .array = 3909 },
-        .tstzrange => .{ .oid = 3910, .name = "tstzrange", .len = -1, .category = 'R', .array = 3911 },
+        .tsrange => .{ .oid = 3908, .name = "tsrange", .len = -1, .category = 'R', .array = 3909, .alignment = 'd' },
+        .tstzrange => .{ .oid = 3910, .name = "tstzrange", .len = -1, .category = 'R', .array = 3911, .alignment = 'd' },
         .inet => .{ .oid = 869, .name = "inet", .len = -1, .category = 'I', .array = 1041 },
         .cidr => .{ .oid = 650, .name = "cidr", .len = -1, .category = 'I', .array = 651 },
         .macaddr => .{ .oid = 829, .name = "macaddr", .len = 6, .category = 'U', .array = 1040 },
-        .point => .{ .oid = 600, .name = "point", .len = 16, .category = 'G', .array = 1017 },
-        .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020 },
+        .point => .{ .oid = 600, .name = "point", .len = 16, .category = 'G', .array = 1017, .alignment = 'd' },
+        .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020, .alignment = 'd' },
         .xml => .{ .oid = 142, .name = "xml", .len = -1, .category = 'U', .array = 143 },
         .jsonpath => .{ .oid = 4072, .name = "jsonpath", .len = -1, .category = 'U', .array = 4073 },
         .regtype => .{ .oid = 2206, .name = "regtype", .len = 4, .category = 'N', .array = 2211 },
@@ -918,6 +922,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .regtype => "regtype",
         .tsvector => "tsvector",
         .tsquery => "tsquery",
+        .pg_internal_char => "\"char\"",
         _ => "",
     };
 }
@@ -963,6 +968,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .regtype => "regtypein",
         .tsvector => "tsvectorin",
         .tsquery => "tsqueryin",
+        .pg_internal_char => "charin",
         _ => "array_in",
     };
 }
@@ -1007,7 +1013,8 @@ fn scalarByName(input: []const u8) ?DataType {
     var text = input;
     while (text.len != 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
     while (text.len != 0 and (text[text.len - 1] == ' ' or text[text.len - 1] == '\t')) text = text[0 .. text.len - 1];
-    if (text.len > 11 and keyword(text[0..11], "pg_catalog.")) text = text[11..];
+    const catalog_qualified = text.len > 11 and keyword(text[0..11], "pg_catalog.");
+    if (catalog_qualified) text = text[11..];
     var buffer: [40]u8 = undefined;
     var length: usize = 0;
     var quoted = false;
@@ -1015,6 +1022,7 @@ fn scalarByName(input: []const u8) ?DataType {
         quoted = true;
         text = text[1 .. text.len - 1];
     }
+    if ((quoted and same(text, "char")) or (catalog_qualified and !quoted and keyword(text, "char"))) return .pg_internal_char;
     for (text) |byte| {
         if (byte == '(' and !quoted) break;
         if (length == buffer.len) return null;
@@ -1158,7 +1166,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1205,6 +1213,7 @@ pub fn Values(comptime config: Config) type {
             /// (text_search.sig).
             tsvector: Text,
             tsquery: Text,
+            pg_internal_char: u8,
         };
 
         /// Range values of these cells (range.sig).
@@ -1266,6 +1275,7 @@ pub fn Values(comptime config: Config) type {
                 .regtype => .regtype,
                 .tsvector => .tsvector,
                 .tsquery => .tsquery,
+                .pg_internal_char => .pg_internal_char,
                 _ => .array,
             };
         }
@@ -1314,6 +1324,7 @@ pub fn Values(comptime config: Config) type {
                 // text keeps internal order and equality consistent.
                 .tsvector => |*value| bytesOrder(value.slice(), right.tsvector.slice()),
                 .tsquery => |*value| bytesOrder(value.slice(), right.tsquery.slice()),
+                .pg_internal_char => |value| order(u8, value, right.pg_internal_char),
             };
         }
 
@@ -1359,6 +1370,7 @@ pub fn Values(comptime config: Config) type {
             // Variable/composite representations retain their canonical hashing.
             switch (value.*) {
                 .integer => |integer| return wordHash(@bitCast(integer), tag),
+                .pg_internal_char => |byte| return wordHash(byte, tag),
                 .text, .bytea, .xml, .tsvector, .tsquery => |*text| {
                     mix(&code, tag);
                     for (text.slice()) |byte| code = (code ^ byte) *% 1099511628211;
@@ -1464,7 +1476,7 @@ pub fn Values(comptime config: Config) type {
             switch (column.data_type) {
                 .mysql_bigint_unsigned => if (mysqlUnsignedValue(&value.numeric) == null) return error.IntegerOverflow,
                 .varchar => if (!character.fits(value.text.slice(), column.typmod)) return error.StringDataRightTruncation,
-                .bpchar => if (!character.fits(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,
+                .bpchar => if (!character.fitsBpchar(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bit, .varbit => {
                     _ = try bit_string.coercedLength(value.bits.len, column.typmod, column.data_type == .bit, .implicit);
                 },
