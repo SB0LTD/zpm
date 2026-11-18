@@ -985,6 +985,21 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        fn bindNamespaceCreate(pointer: *const anyopaque, role: u32, namespace: u32, snap: Snapshot, plain: bool) Error!void {
+            const self: *const Self = @ptrCast(@alignCast(pointer));
+            var authority = snap;
+            authority.csn = self.csn;
+            if (self.catalog_objects.superuser(role, authority)) return;
+            if (!plain or namespace < change_log.first_oid) return error.InsufficientPrivilege;
+            for (&self.schemas) |*schema| {
+                if (!schema.live or schema.oid != namespace) continue;
+                if (schema.dead_csn != 0) return error.UndefinedSchema;
+                if (schema.private_usage and self.catalog_objects.memberOf(role, schema.owner, true, authority)) return;
+                break;
+            }
+            return error.InsufficientPrivilege;
+        }
+
         fn bindNamespaceUsage(pointer: *const anyopaque, role: u32, namespace: u32, snap: Snapshot) Error!void {
             const self: *const Self = @ptrCast(@alignCast(pointer));
             return self.checkNamespaceUsage(role, namespace, snap);
@@ -2894,7 +2909,8 @@ pub fn Database(comptime config: Config) type {
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
             return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
                 .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null,
-                .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage } };
+                .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage },
+                .namespace_create = .{ .ptr = self, .check = &bindNamespaceCreate } };
         }
 
         fn evalContext(self: *const Self, source: []const u8) E.Context {
@@ -4094,7 +4110,7 @@ pub fn Database(comptime config: Config) type {
                     if (owned_before) return error.DependentObjects;
                 }
                 for (&self.catalog_objects.items) |*o| {
-                    const affected = (CO.userType(o.kind) or o.kind == .statistics) and o.owner == oid or
+                    const affected = (CO.userType(o.kind) or o.kind == .statistics or o.kind == .relation) and o.owner == oid or
                         o.kind == .schema_acl and (o.owner == oid or o.grantee == oid);
                     if (affected and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
@@ -4823,9 +4839,9 @@ pub fn Database(comptime config: Config) type {
 
         /// Table privileges of a bound statement for a role that is not a
         /// superuser (FROM items were checked while expanding relations).
-        /// Creating objects needs CREATE on a schema, which only superusers
-        /// hold here (PostgreSQL 15+ public schema); altering or dropping a
-        /// relation needs its ownership.
+        /// Creation of a plain table was authorized against its destination
+        /// namespace at bind time. Other creation paths still require a
+        /// superuser. Altering or dropping a relation needs its ownership.
         fn checkPrivileges(self: *const Self, bound: *const B.Bound, snap: Snapshot) Error!void {
             if (self.privilegedRole(snap)) return;
             switch (bound.*) {
@@ -4857,7 +4873,8 @@ pub fn Database(comptime config: Config) type {
                 .drop_relation => |*drop| try self.needOwner(drop.slot, snap),
                 .alter_table => |*alter| try self.needOwner(alter.table, snap),
                 .refresh_view => |*refresh| try self.needOwner(refresh.slot, snap),
-                .create_table, .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,
+                .create_table => |*create| if (self.dialect != .postgres or !create.plain_definition) return error.InsufficientPrivilege,
+                .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,
                 else => {},
             }
         }
@@ -6694,7 +6711,15 @@ pub fn Database(comptime config: Config) type {
                 if (schema.dead_csn != 0) return error.UndefinedSchema;
                 break;
             }
-            try self.reserveWrites(slot, 2 + create.count);
+            const creator = self.session.role;
+            const write_owner = self.dialect == .postgres and create.plain_definition and creator != CO.bootstrap_role;
+            if (write_owner) {
+                if (self.catalog_objects.pendingReference(creator, snap)) |other| return self.objectPark(slot, other);
+                var authority = snap;
+                authority.csn = self.csn;
+                if (self.catalog_objects.roleName(creator, authority) == null) return error.InsufficientPrivilege;
+            }
+            try self.reserveWrites(slot, 2 + create.count + @intFromBool(write_owner));
             const columns = create.columns[0..create.count];
             var destination: ?usize = null;
             for (0..2) |attempt| {
@@ -6726,6 +6751,10 @@ pub fn Database(comptime config: Config) type {
             var changes: [K.max_changes]K.Change = undefined;
             const count = try self.catalog.create(index, table, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+            if (write_owner) {
+                var ownership: O.Object = .{ .kind = .relation, .target = table.oid, .owner = creator };
+                _ = try self.objectInsert(slot, &ownership, false, snap);
+            }
             if (create.identity) |identity| try self.createSequence(slot, identity.name, identity.spec, table.oid, identity.column, snap);
             for (create.serials[0..create.serial_count]) |serial| try self.createSequence(slot, serial.name, serial.spec, table.oid, serial.column, snap);
             const generated_context = self.bindContext("", .standard, snap);

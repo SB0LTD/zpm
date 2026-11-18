@@ -170,6 +170,24 @@ or JSONB types, with NOT NULL and one single-column PRIMARY KEY. The primary
 key is also non-null. Omitted INSERT columns take their DEFAULT (NULL without
 one).
 
+### Private PostgreSQL schema creation
+
+The owner of a private PostgreSQL schema, and roles inheriting that owner's
+privileges, can create plain permanent tables in it. This scope covers column
+types, NOT NULL, PRIMARY KEY and UNIQUE definitions. A qualified table name
+requires CREATE authority. An inline PRIMARY KEY or UNIQUE index also requires
+schema USAGE for its generated relation lookup. CREATE TABLE IF NOT EXISTS
+checks CREATE authority before the existing-relation return.
+
+The new table belongs to the effective role that creates it. Ownership is
+transactional and uses the existing relation catalog WAL record, so recovery
+preserves table privileges and role-drop dependencies.
+
+Delegated CREATE grants, public and legacy schema CREATE policy, and
+non-superuser CREATE TABLE AS, temporary tables, LIKE, inheritance, partitions,
+default expressions, generated columns, CHECK and foreign-key definitions remain
+open. Namespace ACL rendering and acldefault remain separate work.
+
 ### DML, defaults, identity and sequences (Q09/Q10, design §4.11, §5.10-§5.13)
 
 RETURNING rows are the statement's write slice in order (new versions for
