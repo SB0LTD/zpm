@@ -53,7 +53,8 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Routines, triggers and rules (B11 wave 3).
     pg_proc, pg_trigger, pg_rewrite, pg_rules,
     // Catalog objects (B11 wave 3, catalog_objects.sig).
-    pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext };
+    pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
+    pg_publication_rel, pg_publication_namespace };
 
 pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
 pub const DatabaseCatalogProvider = struct {
@@ -136,6 +137,10 @@ const pg_shdescription_columns = [_]ViewColumn{ col("objoid", .oid), col("classo
 const pg_foreign_data_wrapper_columns = [_]ViewColumn{ col("oid", .oid), col("fdwname", .name), col("fdwowner", .oid), col("fdwhandler", .oid), col("fdwvalidator", .oid), col("fdwacl", text_array), col("fdwoptions", text_array) };
 const pg_foreign_server_columns = [_]ViewColumn{ col("oid", .oid), col("srvname", .name), col("srvowner", .oid), col("srvfdw", .oid), col("srvtype", .text), col("srvversion", .text), col("srvacl", text_array), col("srvoptions", text_array) };
 const pg_publication_columns = [_]ViewColumn{ col("oid", .oid), col("pubname", .name), col("pubowner", .oid), col("puballtables", .boolean), col("pubinsert", .boolean), col("pubupdate", .boolean), col("pubdelete", .boolean), col("pubtruncate", .boolean), col("pubviaroot", .boolean), col("pubgencols", .text) };
+const pg_publication_rel_columns = [_]ViewColumn{
+    col("oid", .oid), col("prpubid", .oid), col("prrelid", .oid), col("prqual", .text), col("prattrs", types.arrayType(.int2).?),
+};
+const pg_publication_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("pnpubid", .oid), col("pnnspid", .oid) };
 const pg_extension_columns = [_]ViewColumn{ col("oid", .oid), col("extname", .name), col("extowner", .oid), col("extnamespace", .oid), col("extrelocatable", .boolean), col("extversion", .text), col("extconfig", oid_array), col("extcondition", text_array) };
 const pg_tables_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("tableowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("hasrules", .boolean), col("hastriggers", .boolean), col("rowsecurity", .boolean) };
 const table_privileges_columns = [_]ViewColumn{ col("grantor", .name), col("grantee", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("privilege_type", .text), col("is_grantable", .text), col("with_hierarchy", .text) };
@@ -178,6 +183,8 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_foreign_data_wrapper => &pg_foreign_data_wrapper_columns,
         .pg_foreign_server => &pg_foreign_server_columns,
         .pg_publication => &pg_publication_columns,
+        .pg_publication_rel => &pg_publication_rel_columns,
+        .pg_publication_namespace => &pg_publication_namespace_columns,
         .pg_extension => &pg_extension_columns,
         .pg_tables => &pg_tables_columns,
         .table_privileges => &table_privileges_columns,
@@ -188,7 +195,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_attribute, .pg_index, .pg_constraint, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
-        .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_extension, .pg_tables };
+        .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;

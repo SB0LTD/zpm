@@ -1429,6 +1429,51 @@ fn statisticsDefinitions() !void {
     try sameState(&.{empty});
 }
 
+fn publicationMembership() !void {
+    reset();
+    try run("CREATE SCHEMA archive");
+    try run("CREATE TABLE a(id INT PRIMARY KEY)");
+    try run("CREATE TABLE b(child_value INT) INHERITS(a)");
+    try run("CREATE TABLE archive.t(id INT)");
+    try run("CREATE VIEW av AS SELECT * FROM a");
+    try run("CREATE PUBLICATION mixed FOR TABLE ONLY a,b, TABLES IN SCHEMA archive");
+    try run("CREATE PUBLICATION inherited FOR TABLE a");
+    try run("CREATE PUBLICATION duplicate FOR TABLE a,a");
+    try run("CREATE PUBLICATION one_table FOR TABLE ONLY a");
+    try run("CREATE PUBLICATION all_pub FOR ALL TABLES");
+    const table_members = "SELECT pubname, prrelid::regclass::text, prqual, prattrs::text FROM pg_publication" ++
+        " JOIN pg_publication_rel ON prpubid=pg_publication.oid ORDER BY 1,2";
+    const schema_members = "SELECT pubname, pnnspid::regnamespace::text FROM pg_publication" ++
+        " JOIN pg_publication_namespace ON pnpubid=pg_publication.oid ORDER BY 1,2";
+    const populated = "duplicate|a|NULL|NULL;duplicate|b|NULL|NULL;inherited|a|NULL|NULL;inherited|b|NULL|NULL;" ++
+        "mixed|a|NULL|NULL;mixed|b|NULL|NULL;one_table|a|NULL|NULL";
+    try expect(table_members, populated);
+    try expect(schema_members, "mixed|archive");
+    const publishability = "SELECT pg_relation_is_publishable('a'::regclass), pg_relation_is_publishable('av'::regclass)," ++
+        " pg_relation_is_publishable(1259), pg_relation_is_publishable(0)";
+    try expect(publishability, "t|f|f|NULL");
+    try sameState(&.{ table_members, schema_members, publishability });
+    try rejects("CREATE PUBLICATION missing FOR TABLE a,nonexistent", error.TableNotFound, table_members, populated);
+    try rejects("CREATE PUBLICATION dv FOR TABLE av", error.InvalidParameterValue, table_members, populated);
+    try rejects("CREATE PUBLICATION invalid FOR TABLES IN SCHEMA pg_catalog", error.InvalidParameterValue, schema_members, "mixed|archive");
+    try rejects("CREATE PUBLICATION missing FOR TABLES IN SCHEMA missing", error.UndefinedSchema, schema_members, "mixed|archive");
+    try rejects("CREATE PUBLICATION attributes FOR TABLE a(id)", error.UnsupportedStatement, table_members, populated);
+    const slot = try db.begin();
+    try statement(slot, "DROP PUBLICATION mixed");
+    db.abort(slot);
+    try expect(table_members, populated);
+    try expect(schema_members, "mixed|archive");
+
+    try run("DROP SCHEMA archive CASCADE");
+    try expect(schema_members, "");
+    try run("DROP VIEW av");
+    try run("DROP TABLE b");
+    try expect(table_members, "duplicate|a|NULL|NULL;inherited|a|NULL|NULL;mixed|a|NULL|NULL;one_table|a|NULL|NULL");
+    try run("DROP PUBLICATION mixed, inherited");
+    try expect(table_members, "duplicate|a|NULL|NULL;one_table|a|NULL|NULL");
+    try sameState(&.{ table_members, schema_members });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1452,5 +1497,6 @@ pub fn main() !void {
     try policyDiscovery();
     try namespaceAliases();
     try statisticsDefinitions();
+    try publicationMembership();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

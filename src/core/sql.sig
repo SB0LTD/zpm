@@ -1095,7 +1095,7 @@ pub fn Database(comptime config: Config) type {
                     // These catalog lookups use the serialized database hook.
                     .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_partition_ancestors,
                     .to_regnamespace,.regnamespace_in,.regnamespace_out=>return error.UnsupportedStatement,
-                    .pg_get_statisticsobjdef_columns=>return error.UnsupportedStatement,
+                    .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                     .current_setting,.set_config,.pg_backend_pid,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
@@ -3232,6 +3232,7 @@ pub fn Database(comptime config: Config) type {
             return switch (o.kind) {
                 .acl, .relation, .policy => o.target == oid,
                 .statistics => o.target == oid or o.grantee == oid,
+                .publication_table, .publication_schema => o.grantee == oid,
                 .comment => o.target == oid,
                 else => false,
             };
@@ -3243,7 +3244,7 @@ pub fn Database(comptime config: Config) type {
             latest.csn = self.csn;
             var count: usize = 0;
             for (&self.catalog_objects.items) |*o| {
-                if (o.kind == .statistics and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                if ((o.kind == .statistics or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                 if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
                 if (objectDependent(o, oid)) count += 1;
                 // Comments on the table's policies go with them.
@@ -4122,10 +4123,81 @@ pub fn Database(comptime config: Config) type {
             if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
             var object: O.Object = .{ .kind = .publication, .owner = self.session.role, .flags = publication.flags };
             try object.setName(objectName(source, publication.name).slice());
-            if (self.catalog_objects.byName(.publication, 0, object.name.slice(), snap) != null) return error.DuplicateObject;
             if (self.catalog_objects.pendingConflict(&object, snap)) |other| return self.objectPark(slot, other);
-            try self.reserveWrites(slot, 1);
-            _ = try self.objectInsert(slot, &object, true, snap);
+            var latest = snap;
+            latest.csn = self.csn;
+            if (self.catalog_objects.byName(.publication, 0, object.name.slice(), latest) != null) return error.DuplicateObject;
+            if (self.catalog_objects.pendingReference(object.owner, snap)) |other| return self.objectPark(slot, other);
+            var members: PublicationMembers = .{};
+            for (publication.members[0..publication.count]) |member| {
+                switch (member) {
+                    .schema => |ident| {
+                        const name = objectName(source, ident);
+                        const namespace = namespaceFor(&self.catalog, name.slice(), snap) orelse return error.UndefinedSchema;
+                        if (namespace != catalog_module.public_namespace and namespace < change_log.first_oid) return error.InvalidParameterValue;
+                        for (&self.schemas) |*schema| {
+                            if (schema.live and schema.oid == namespace and schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
+                        }
+                        if (namespaceFor(&self.catalog, name.slice(), latest) != namespace) return error.SerializationFailure;
+                        members.add(.publication_schema, namespace);
+                    },
+                    .table => |table| {
+                        const index = self.objectTable(slot, source, table.name, .access_share, snap) catch |err| {
+                            if (err == error.WrongObjectType) return error.InvalidParameterValue;
+                            return err;
+                        };
+                        const relation = &self.tables[index];
+                        if (!CO.publicationRelationKind(relation.relkind)) return error.InvalidParameterValue;
+                        if (self.visibleTableSlot(relation.oid, latest) != index) return error.SerializationFailure;
+                        members.add(.publication_table, relation.oid);
+                        if (!table.only and relation.relkind != 'p') try self.addPublicationDescendants(slot, relation.oid, snap, &members);
+                    },
+                }
+            }
+            try self.reserveWrites(slot, 1 + members.count);
+            const index = try self.objectInsert(slot, &object, true, snap);
+            const oid = self.catalog_objects.items[index].oid;
+            for (members.items[0..members.count]) |member| {
+                var entry: O.Object = .{ .kind = member.kind, .target = oid, .grantee = member.oid };
+                _ = try self.objectInsert(slot, &entry, true, snap);
+            }
+        }
+
+        const PublicationMembers = struct {
+            const Member = struct { kind: CO.Kind, oid: u32 };
+            items: [config.tables + config.schemas + 1]Member = undefined,
+            count: usize = 0,
+
+            fn add(self: *PublicationMembers, kind: CO.Kind, oid: u32) void {
+                for (self.items[0..self.count]) |member| {
+                    if (member.kind == kind and member.oid == oid) return;
+                }
+                self.items[self.count] = .{ .kind = kind, .oid = oid };
+                self.count += 1;
+            }
+        };
+
+        fn addPublicationDescendants(self: *Self, slot: u16, root: u32, snap: Snapshot, members: *PublicationMembers) Error!void {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const table = &self.tables[found.slot];
+                if (!CO.publicationRelationKind(table.relkind) or table.partition.bound != .none) continue;
+                var parent = table.parent;
+                while (parent != 0) {
+                    if (parent == root) {
+                        try self.lockTable(slot, found.slot, .access_share);
+                        var latest = snap;
+                        latest.csn = self.csn;
+                        if (self.visibleTableSlot(table.oid, latest) != found.slot) return error.SerializationFailure;
+                        members.add(.publication_table, table.oid);
+                        break;
+                    }
+                    const index = self.visibleTableSlot(parent, snap) orelse return error.SerializationFailure;
+                    parent = self.tables[index].parent;
+                }
+            }
         }
 
         fn createStatistics(self: *Self, slot: u16, source: []const u8, spec: *const CO.Statistics, snap: Snapshot) Error!void {
@@ -4216,6 +4288,7 @@ pub fn Database(comptime config: Config) type {
                 for (&self.catalog_objects.items) |*other| {
                     if (!O.visible(other, snap)) continue;
                     if (other.kind == .comment and other.target == o.oid) writes += 1;
+                    if (kind == .publication and CO.publicationMembership(other.kind) and other.target == o.oid) writes += 1;
                     if (kind == .fdw and other.kind == .server and other.target == o.oid) {
                         if (!drop.cascade) return error.DependentObjects;
                         if (self.catalog_objects.pendingReference(other.oid, snap)) |waiter| return self.objectPark(slot, waiter);
@@ -4231,6 +4304,7 @@ pub fn Database(comptime config: Config) type {
                 const oid = self.catalog_objects.items[index].oid;
                 for (&self.catalog_objects.items, 0..) |*other, position| {
                     if (!O.visible(other, snap) or other.xmax.epoch != 0) continue;
+                    if (kind == .publication and CO.publicationMembership(other.kind) and other.target == oid) self.objectDelete(slot, position, snap);
                     if (kind == .fdw and other.kind == .server and other.target == oid) {
                         const server_oid = other.oid;
                         self.objectDelete(slot, position, snap);
@@ -4513,6 +4587,12 @@ pub fn Database(comptime config: Config) type {
                 .pg_publication => for (&self.catalog_objects.items) |*o| if (o.kind == .publication and O.visible(o, snapshot)) {
                     const flags = o.flags;
                     try sink.add(&.{ intCell(o.oid), nameCell(o.name.slice()), intCell(o.owner), boolCell(flags & CO.pub_all_tables != 0), boolCell(flags & CO.pub_insert != 0), boolCell(flags & CO.pub_update != 0), boolCell(flags & CO.pub_delete != 0), boolCell(flags & CO.pub_truncate != 0), boolCell(flags & CO.pub_via_root != 0), nameCell("n") });
+                },
+                .pg_publication_rel => for (&self.catalog_objects.items) |*o| if (o.kind == .publication_table and O.visible(o, snapshot)) {
+                    try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee), .null_value, .null_value });
+                },
+                .pg_publication_namespace => for (&self.catalog_objects.items) |*o| if (o.kind == .publication_schema and O.visible(o, snapshot)) {
+                    try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee) });
                 },
                 .pg_statistic_ext => for (&self.catalog_objects.items) |*o| if (o.kind == .statistics and O.visible(o, snapshot)) {
                     var buffer: [4 * CO.statistics_columns]u8 = undefined;
@@ -4966,6 +5046,13 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
+        fn relationPublishable(ptr: *anyopaque, oid: u32) ?bool {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            if (self.visibleTableSlot(oid, self.seq_snap)) |index| return CO.publicationRelationKind(self.tables[index].relkind);
+            if (relationVisible(ptr, oid) != null) return false;
+            return null;
+        }
+
         /// pg_get_serial_sequence: the table is regclass text (42P01), the
         /// column an exact attribute name (42703); the result names the
         /// SERIAL or identity sequence the column owns (sequences live in
@@ -5327,7 +5414,7 @@ pub fn Database(comptime config: Config) type {
                         try sink.add(&.{ intCell(object.oid + 1 + order), intCell(object.oid), .{ .float4 = @floatFromInt(order) }, nameCell(label) });
                     }
                 },
-                .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
+                .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
                 .pg_namespace, .schemata => {
                     for (catalog_module.namespaces) |namespace| {
                         if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
@@ -7480,7 +7567,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .statistics_columns = &postgresStatisticsColumns, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;

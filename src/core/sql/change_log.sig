@@ -808,6 +808,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     return self.objectTableColumns(oid) != null;
                 }
 
+                pub fn objectTablePublishable(self: *const @This(), oid: u32) bool {
+                    for (&self.scratch.tables) |*table| {
+                        if (table.live and table.oid == oid) return catalog_objects.publicationRelationKind(table.relkind);
+                    }
+                    return false;
+                }
+
                 pub fn objectTableColumns(self: *const @This(), oid: u32) ?usize {
                     for (&self.scratch.tables) |*vt| if (vt.live and vt.oid == oid) return vt.column_count;
                     return null;
