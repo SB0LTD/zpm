@@ -1,5 +1,51 @@
 # SQL conformance TDD checkpoint
 
+## Native conformance checkpoint — 18 November 2026
+
+The unchanged 118-program smoke inventory passed against PostgreSQL 18.3,
+MySQL 8.4.13 and SQL Server 2022 CU28 on the qualified beta candidate. This
+inventory exercises 106 PostgreSQL, six MySQL and six SQL Server programs.
+The separate PostgreSQL feature inventory contains 755 records. Full
+coverage of that inventory and complete MySQL and SQL Server dialects remain
+open.
+[Native inventory results](https://github.com/benor1470/dbMeter/actions/runs/44203962081) ·
+[RAMSQL scope and open gaps](https://github.com/SB0LTD/ramsql/blob/main/compatibility/GAP_CLOSING_PLAN.md)
+
+The ordinary COMMIT fix landed in ZPM and RAMSQL and shipped in beta.3 CI
+prerelease `44252147423.1` after the full hosted and SB0X/SB0K matrix. The exact
+packaged Linux binary passed the four PostgreSQL 16 and 18 memory and durable
+SCRAM lanes. An independent audit verified all 29 release assets and all 28
+listed checksums. The published Windows executable passed 4,602 and 5,246
+wire assertions at one and four workers, independent client drivers, 8,598
+SCRAM assertions and 83 persistence cases with five process crash cycles.
+[ZPM COMMIT fix](https://github.com/SB0LTD/zpm/pull/253) ·
+[Published beta.3](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.3-run.44252147423.1)
+
+The combined simple and extended query draft passed 58 simple-query
+comparisons, 15 extended checks and seven extended COPY cases with memory
+and synchronous WAL at one and four workers. Both durable WALs were
+successfully reopened. Native SB0X passed 966 boot assertions and SB0K
+passed 952. The original COMMIT regression ran in the same exact candidate.
+Multi-command simple COPY remains unsupported and fails before executing
+any part of the batch. PostgreSQL 18.3's bare Sync behavior after a simple
+query within an extended group diverges on one observed schedule. RAMSQL
+commits that group before reporting idle and keeps the connection usable.
+[Core draft](https://github.com/SB0LTD/zpm/pull/261) ·
+[Product replay](https://github.com/SB0LTD/ramsql/actions/runs/44264474861)
+
+Stock PostgreSQL 18.3 plain restore now passes for an ordinary two-table
+fixture, in memory and through forced stop and WAL reopen at one and four
+workers. Both primary keys, the foreign key, CHECK, NOT NULL and the omitted
+default were verified after replay. Export advances through settings, the
+relation guard, catalog `tableoid`, and real `pg_depend`, then stops in the
+namespace ACL query. Existing stock export still needs `nspacl`, `acldefault`,
+and later catalog projections. Separate native comparisons proved durable
+schema owner identity and private schema usage checks. General late keys,
+single-transaction restore and full outbound round trips remain open.
+[Exact tooling trace](https://github.com/SB0LTD/ramsql/actions/runs/44255933360) ·
+[Schema ownership](https://github.com/SB0LTD/ramsql/actions/runs/44258009287) ·
+[Private schema usage](https://github.com/SB0LTD/ramsql/actions/runs/44260004999)
+
 ## Catalog and security candidate (lane B11, wave 3) - 5 November 2026
 
 Branch `b11/catalog-security` (rebased on 4c028a6) closes seven smoke programs
