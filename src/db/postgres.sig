@@ -592,6 +592,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     // Parked statement: nothing consumed or written.
                     if (any == error.WouldBlock) return .{ .blocked = true };
                     w.at = 0;
+                    try writeNotice(db, &w);
                     try failure(&w, sqlstate(err), @errorName(err));
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
                     if (tag == 'Q') try self.ready(db, &w) else self.failed = true;
@@ -803,6 +804,14 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
         }
 
+        fn writeNotice(db: *DB, w: *Writer) !void {
+            if (comptime @hasDecl(DB, "takeNotice")) {
+                if (db.takeNotice()) |notice| {
+                    try diagnostic(w, 'N', notice.level.label(), notice.state, notice.message);
+                }
+            }
+        }
+
         /// Notifications committed while the client is idle (PostgreSQL
         /// sends them asynchronously): call when the connection has no
         /// pending input. Returns the bytes written.
@@ -838,6 +847,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         w.end(completion);
                     } else {
                         try self.execute(db, source);
+                        try writeNotice(db, w);
                         if (self.result.column_count != 0) {
                             try self.description(w, null);
                             try self.rows(db, w, null, 0, self.result.row_count);
@@ -897,6 +907,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     }
                     if (self.active_portal == null) {
                         try self.executePortal(db, p, limit);
+                        try writeNotice(db, w);
                         self.active_portal = index;
                         p.row = 0;
                         p.result_rows = self.result.row_count;
@@ -1911,11 +1922,15 @@ fn parameter(w: *Writer, key: []const u8, value: []const u8) !void {
     w.end(p);
 }
 fn failure(w: *Writer, state: []const u8, message: []const u8) !void {
-    const p = try w.begin('E');
+    return diagnostic(w, 'E', "ERROR", state, message);
+}
+
+fn diagnostic(w: *Writer, tag: u8, severity: []const u8, state: []const u8, message: []const u8) !void {
+    const p = try w.begin(tag);
     try w.byte('S');
-    try w.string("ERROR");
+    try w.string(severity);
     try w.byte('V');
-    try w.string("ERROR");
+    try w.string(severity);
     try w.byte('C');
     try w.string(state);
     try w.byte('M');
@@ -1939,17 +1954,7 @@ pub fn memoryLimitError(output: []u8) error{BufferTooSmall}!usize {
 }
 
 fn fatal(w: *Writer, state: []const u8, message: []const u8) !void {
-    const p = try w.begin('E');
-    try w.byte('S');
-    try w.string("FATAL");
-    try w.byte('V');
-    try w.string("FATAL");
-    try w.byte('C');
-    try w.string(state);
-    try w.byte('M');
-    try w.string(message);
-    try w.byte(0);
-    w.end(p);
+    return diagnostic(w, 'E', "FATAL", state, message);
 }
 fn sqlstate(err: anyerror) []const u8 {
     return knownSqlstate(err) orelse "54000";

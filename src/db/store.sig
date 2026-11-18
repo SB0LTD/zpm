@@ -106,12 +106,49 @@ pub const BatchIterator = struct {
 
 pub const DateOrder = enum { mdy, dmy, ymd };
 
+/// PostgreSQL client order, with INFO independently visible to the client.
+pub const ClientMessageLevel = enum {
+    debug5, debug4, debug3, debug2, debug1, log, info, notice, warning, @"error", fatal, panic,
+
+    pub fn visibleAt(level: ClientMessageLevel, minimum: ClientMessageLevel) bool {
+        return level == .info or @intFromEnum(level) >= @intFromEnum(minimum);
+    }
+
+    pub fn label(level: ClientMessageLevel) []const u8 {
+        return switch (level) {
+            .debug5, .debug4, .debug3, .debug2, .debug1 => "DEBUG",
+            .log => "LOG",
+            .info => "INFO",
+            .notice => "NOTICE",
+            .warning => "WARNING",
+            .@"error" => "ERROR",
+            .fatal => "FATAL",
+            .panic => "PANIC",
+        };
+    }
+
+    fn threshold(value: []const u8) ?ClientMessageLevel {
+        inline for (@typeInfo(ClientMessageLevel).@"enum".field_names) |name| {
+            const level = @field(ClientMessageLevel, name);
+            if (level != .info and level != .fatal and level != .panic and sameInsensitive(value, name)) return level;
+        }
+        return null;
+    }
+};
+
+pub const ClientNotice = struct {
+    level: ClientMessageLevel = .warning,
+    state: []const u8,
+    message: []const u8,
+};
+
 /// Session settings this store implements. Times are milliseconds.
 pub fn SettingsOf(comptime Zone: type) type {
     return struct {
         const Self = @This();
         lock_timeout_ms: u32 = 0,
         statement_timeout_ms: u32 = 0,
+        client_min_messages: ClientMessageLevel = .notice,
         application_name: [64]u8 = @splat(0),
         application_name_len: u8 = 0,
         /// TimeZone as SHOW reports it, and the resolved zone.
@@ -221,7 +258,7 @@ pub const deadlock_timeout_ms: u32 = 1000;
 
 /// Settings this store implements; the engine owns the others it knows
 /// (transaction_*, default_transaction_*, search_path, placeholders).
-const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
+const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, client_min_messages, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -591,6 +628,7 @@ pub fn Store(comptime Raw: type) type {
             running_statement: bool = false,
             execution: ExecutionControl = .{},
             execution_deadline_ns: ?i64 = null,
+            pending_notice: ?ClientNotice = null,
             /// Savepoint depth of the last ROLLBACK TO, for the codec's portals.
             rolled_back_to: ?usize = null,
             /// Wall-clock start of the open (or implicit) transaction and of
@@ -885,6 +923,19 @@ pub fn Store(comptime Raw: type) type {
                 return if (self.failed) 'E' else 'T';
             }
 
+            /// A bounded diagnostic for the command just executed. Error,
+            /// fatal, and asynchronous notifications have separate wire paths.
+            pub fn takeNotice(self: *Connection) ?ClientNotice {
+                const notice = self.pending_notice orelse return null;
+                self.pending_notice = null;
+                return if (notice.level.visibleAt(self.settings.client_min_messages)) notice else null;
+            }
+
+            fn warn(self: *Connection, state: []const u8, message: []const u8) void {
+                if (self.dialect != .postgres) return;
+                self.pending_notice = .{ .state = state, .message = message };
+            }
+
             pub fn isAutocommit(self: *const Connection) bool {
                 return self.autocommit;
             }
@@ -988,6 +1039,8 @@ pub fn Store(comptime Raw: type) type {
                     },
                     .timezone => try self.assignZone(target, value),
                     .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
+                    .client_min_messages => target.client_min_messages = if (is_default and value.len == 0) .notice else
+                        ClientMessageLevel.threshold(value) orelse return error.InvalidSettingValue,
                     .standard_conforming_strings => if (!(value.len == 0 or sameInsensitive(value, "on") or sameInsensitive(value, "true"))) return error.InvalidSettingValue,
                     .datestyle => target.date_order = try dateOrder(value, target.date_order),
                     .intervalstyle => if (!(value.len == 0 or sameInsensitive(value, "postgres"))) return error.InvalidSettingValue,
@@ -1057,6 +1110,7 @@ pub fn Store(comptime Raw: type) type {
                     .application_name => self.settings.applicationName(),
                     .timezone => self.settings.timeZone(),
                     .client_encoding, .server_encoding => "UTF8",
+                    .client_min_messages => @tagName(self.settings.client_min_messages),
                     .standard_conforming_strings, .integer_datetimes => "on",
                     .datestyle => self.settings.dateStyle(),
                     .intervalstyle => "postgres",
@@ -1126,8 +1180,8 @@ pub fn Store(comptime Raw: type) type {
                 switch (command) {
                     .none => unreachable,
                     .begin => |modes| {
+                        const fresh = !self.in_transaction;
                         if (comptime has_engine_session) {
-                            const fresh = !self.in_transaction;
                             try self.beginTransaction();
                             // BEGIN inside a block only warns (its modes are ignored).
                             if (fresh) try self.db().beginModes(self.tx.?, modes);
@@ -1135,16 +1189,21 @@ pub fn Store(comptime Raw: type) type {
                             if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
                             try self.beginTransaction();
                         }
+                        if (!fresh) self.warn("25001", "there is already a transaction in progress");
                         result.clear(0);
                         result.command = .begin;
                     },
                     .commit => {
+                        const was_open = self.in_transaction;
                         try self.commitTransaction();
+                        if (!was_open) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .commit;
                     },
                     .rollback => {
+                        const was_open = self.in_transaction;
                         try self.rollbackTransaction();
+                        if (!was_open) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .rollback;
                     },
@@ -1212,6 +1271,7 @@ pub fn Store(comptime Raw: type) type {
                     },
                     .set => |set| {
                         if (self.failed) return error.TransactionFailed;
+                        if (set.local and !self.in_transaction) self.warn("25P01", "SET LOCAL can only be used in transaction blocks");
                         const which = parameter(set.name.slice()) orelse {
                             if (comptime !has_engine_session) return error.UndefinedSetting;
                             try self.db().sessionSet(self.blockSlot(), set.local, set.name.slice(), set.kind, set.value.slice());
@@ -1229,6 +1289,7 @@ pub fn Store(comptime Raw: type) type {
                             // Outside a block SET TRANSACTION only warns.
                             if (self.in_transaction) try self.db().setTransaction(self.tx.?, modes);
                         } else if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
+                        if (!self.in_transaction) self.warn("25P01", "SET TRANSACTION can only be used in transaction blocks");
                         result.clear(0);
                         result.command = .set;
                     },
@@ -1272,6 +1333,7 @@ pub fn Store(comptime Raw: type) type {
                 switch (which) {
                     .lock_timeout => target.lock_timeout_ms = source.lock_timeout_ms,
                     .statement_timeout => target.statement_timeout_ms = source.statement_timeout_ms,
+                    .client_min_messages => target.client_min_messages = source.client_min_messages,
                     .application_name => {
                         target.application_name = source.application_name;
                         target.application_name_len = source.application_name_len;
@@ -1593,6 +1655,7 @@ pub fn Store(comptime Raw: type) type {
             }
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
+                self.pending_notice = null;
                 if (self.id == 0) return error.InvalidConnection;
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
                 if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| {
