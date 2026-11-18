@@ -15,6 +15,7 @@ const aggregate_stats = @import("aggregates_stat.sig");
 const numeric_module = @import("numeric.sig");
 const tablesample = @import("tablesample.sig");
 const collect_module = @import("aggregates_collect.sig");
+const array_module = @import("array.sig");
 const json_eval = @import("json_eval.sig");
 const temporal = @import("temporal.sig");
 const builtin = @import("builtin");
@@ -110,6 +111,7 @@ pub fn Exec(comptime config: types.Config) type {
         pub const ReadStats = struct {
             projected_filter_scans: usize = 0,
             projected_filter_rows: usize = 0,
+            projected_topk_scans: usize = 0,
             key_probes: usize = 0,
             key_walks: usize = 0,
             key_fallbacks: usize = 0,
@@ -165,10 +167,25 @@ pub fn Exec(comptime config: types.Config) type {
             query: *Query,
             list: List,
             width: usize,
+            projection: ?*CatalogProjection = null,
+
+            const CatalogProjection = struct {
+                plan: *const B.Plan,
+                context: E.Context,
+                wanted: u64,
+            };
 
             pub fn add(self: *RowSink, cells: []const V.Cell) Error!void {
                 try self.query.session.checkpoint();
                 std_assert(cells.len == self.width);
+                if (self.projection) |projection| {
+                    if (self.list.count >= projection.wanted) return;
+                    projection.context.tuple[0] = cells.ptr;
+                    if (try keep(&projection.context, projection.plan.where, null)) {
+                        try self.query.projectRow(projection.plan, &projection.context, &self.list);
+                    }
+                    return;
+                }
                 const at = try self.query.cells(self.width);
                 for (cells, 0..) |cell, index| self.query.work.cells[at + index] = cell;
                 try self.query.push(&self.list, at);
@@ -285,6 +302,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var ctx = self.context(outer);
                 var out: List = .{ .start = @intCast(self.work.ref_low) };
                 if (p.series == .json_table) return self.jsonTableRows(p, outer);
+                if (p.series == .partition_ancestors) return self.partitionAncestorRows(p, &ctx);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -318,7 +336,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none, .json_table => unreachable,
+                    .none, .json_table, .partition_ancestors => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -342,6 +360,23 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 return self.finish(p, out);
+            }
+
+            fn partitionAncestorRows(self: *Query, p: *const B.Plan, ctx: *E.Context) Error!List {
+                var rows: List = .{ .start = @intCast(self.work.ref_low) };
+                const value = try E.eval(ctx, self.pool.nodes[p.function].b);
+                if (value == .null_value) return rows;
+                const hook = self.session.sequences orelse return error.UnsupportedStatement;
+                const lookup = hook.partition_ancestors orelse return error.UnsupportedStatement;
+                var ancestors: [config.tables]u32 = undefined;
+                const count = try lookup(hook.ptr, @intCast(value.integer), &ancestors);
+                for (ancestors[0..count], 1..) |oid, position| {
+                    const at = try self.cells(p.width);
+                    self.work.cells[at] = .{ .integer = oid };
+                    if (p.ordinality) self.work.cells[at + 1] = .{ .integer = @intCast(position) };
+                    try self.push(&rows, at);
+                }
+                return self.finish(p, rows);
             }
 
             /// JSON_TABLE rows (B11 json-agg lane, json_eval.sig): each row's
@@ -415,15 +450,18 @@ pub fn Exec(comptime config: types.Config) type {
 
             // ---- FROM items and joins ----------------------------------
 
-            fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context) Error!List {
+            fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context, synchronize_scan: bool) Error!List {
                 if (source.sample_method != 0) return self.sampledRows(source, outer);
                 if (source.table) |index| {
                     const table = &self.tables[index];
                     var list: List = .{ .start = @intCast(self.work.ref_low) };
-                    for (0..table.row_high) |slot| {
-                        try self.session.checkpoint();
-                        const version = S.visibleAt(table, slot, self.snap) orelse continue;
-                        try self.push(&list, version);
+                    var scan = S.PhysicalScan.init(table, synchronize_scan and self.session.synchronize_seqscans);
+                    while (scan.next(table, table.row_high)) |range| {
+                        for (range.start..range.end) |slot| {
+                            try self.session.checkpoint();
+                            const version = S.visibleAt(table, slot, self.snap) orelse continue;
+                            try self.push(&list, version);
+                        }
                     }
                     return list;
                 }
@@ -519,7 +557,7 @@ pub fn Exec(comptime config: types.Config) type {
                         while (item != none) : (item = self.pool.nodes[item].next) if (!self.availableAtStage(item, stage, require_infallible)) break :blk false;
                         break :blk true;
                     },
-                    .column => n.level == 0 and n.relation <= stage,
+                    .column, .catalog_tableoid => n.level == 0 and n.relation <= stage,
                     .param => require_infallible and self.session.params != null and n.integer >= 1 and n.integer <= config.statement_parameters,
                     .null_literal, .bool_literal, .int_literal => true,
                     .text_literal => !require_infallible or n.ty == .unknown or n.ty == .text or (n.ty == .date and n.date_bound),
@@ -562,7 +600,7 @@ pub fn Exec(comptime config: types.Config) type {
                 for (p.sources[0..p.source_count], 0..) |*source, stage| {
                     const last = stage + 1 == p.source_count;
                     const probing = source.probe != none and stage != 0;
-                    const rows: List = if (probing) .{} else try self.sourceRows(source, outer);
+                    const rows: List = if (probing) .{} else try self.sourceRows(source, outer, synchronizedProjection(p));
                     const outer_join = source.join == .left or source.join == .full;
                     const tracks = source.join == .right or source.join == .full;
                     var matched: u32 = 0;
@@ -638,7 +676,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// Items first..last joined left-deep; each later operand is one
             /// item or a parenthesized group (Source.group_end).
             fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, tuple_rows: *TupleRows, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
-                var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer));
+                var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer, false));
                 var next = first + 1;
                 while (next <= last) {
                     const end: usize = if (p.sources[next].group_end != none) p.sources[next].group_end else next;
@@ -705,7 +743,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.refs[lists + index * 2 + 1] = rows.count;
                     }
                 } else if (end == j) {
-                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer));
+                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer, false));
                 } else right = try self.joinRange(p, ctx, tuple_rows, outer, j, end);
                 const tracks = source.join == .right or source.join == .full;
                 if (lateral and tracks) return error.InvalidColumnReference;
@@ -774,6 +812,30 @@ pub fn Exec(comptime config: types.Config) type {
                     try self.projectRow(p, &ctx, &out);
                 }
                 return out;
+            }
+
+            /// Keep the selected cells of simple catalog scans. The candidate
+            /// view row belongs to the caller and only lives for one sink call.
+            fn projectCatalog(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!?List {
+                if (p.source_count != 1 or p.grouped or p.general_join) return null;
+                const view = p.sources[0].view orelse return null;
+                if (!self.availableAtStage(p.where, 0, true)) return null;
+                for (p.targets[0..p.width], 0..) |target, column| {
+                    if (!p.required[column]) continue;
+                    const kind = self.pool.nodes[target].kind;
+                    if (kind != .column and kind != .catalog_tableoid) return null;
+                }
+                const hook = self.work.views orelse return error.UnsupportedStatement;
+                const wanted = if (p.order_count == 0 and p.distinct == .none) p.offset +| p.limit else 0xffffffffffffffff;
+                var projection: RowSink.CatalogProjection = .{ .plan = p, .context = self.context(outer), .wanted = wanted };
+                var sink: RowSink = .{
+                    .query = self,
+                    .list = .{ .start = @intCast(self.work.ref_low) },
+                    .width = catalog.viewColumns(view).len,
+                    .projection = &projection,
+                };
+                try hook.rows(hook.ptr, view, &sink);
+                return try self.finish(p, sink.list);
             }
 
             const KeySorter = struct {
@@ -1374,21 +1436,25 @@ pub fn Exec(comptime config: types.Config) type {
                 return mask;
             }
 
+            fn sparseComparisonMask(table: *const S.Table, start: usize, selected_mask: u64, predicate: CompactPredicate) u64 {
+                const single = [_]CompactPredicate{predicate};
+                var remaining = selected_mask;
+                var matched: u64 = 0;
+                while (remaining != 0) {
+                    const bit = @ctz(remaining);
+                    remaining &= remaining - 1;
+                    if (compactKeep(table, start + bit, &single)) matched |= @as(u64, 1) << @intCast(bit);
+                }
+                return matched;
+            }
+
             fn refineFactorMask(self: *Query, table: *const S.Table, start: usize, count: usize,
                 selected_mask: u64, predicate: CompactPredicate) u64 {
                 // A prior selective predicate can leave fewer rows than one
                 // vector. Read only those rows of the next fact column.
                 if (@popCount(selected_mask) <= 4) {
                     self.work.stream_stats.factor_sparse_predicates += 1;
-                    const single = [_]CompactPredicate{predicate};
-                    var remaining = selected_mask;
-                    var matched: u64 = 0;
-                    while (remaining != 0) {
-                        const bit = @ctz(remaining);
-                        remaining &= remaining - 1;
-                        if (compactKeep(table, start + bit, &single)) matched |= @as(u64, 1) << @intCast(bit);
-                    }
-                    return matched;
+                    return sparseComparisonMask(table, start, selected_mask, predicate);
                 }
                 const stats = &self.work.stream_stats;
                 return selected_mask & switch (predicate.op) {
@@ -3120,6 +3186,13 @@ pub fn Exec(comptime config: types.Config) type {
                 switch (agg.kind) {
                     .count, .count_star => {},
                     .sum, .avg => {
+                        if (agg.arg_ty == .mysql_bigint_unsigned) {
+                            if (agg.kind != .sum or input.* != .numeric) return error.TypeMismatch;
+                            const magnitude = types.mysqlUnsignedValue(&input.numeric) orelse return error.TypeMismatch;
+                            // i64.max rows times u64.max fits a signed i128.
+                            acc.wide += @as(i128, magnitude);
+                            return;
+                        }
                         if (value_module.integral(agg.arg_ty)) {
                             if (agg.kind == .sum and agg.ty == .int8) {
                                 const sum = @addWithOverflow(acc.integer, input.integer);
@@ -3287,6 +3360,8 @@ pub fn Exec(comptime config: types.Config) type {
                     else => {},
                 }
                 if (acc.count == 0) return .null_value;
+                if (agg.kind == .sum and agg.arg_ty == .mysql_bigint_unsigned)
+                    return self.numericOf(acc.wide);
                 if (value_module.integral(agg.arg_ty)) {
                     if (agg.kind == .sum and agg.ty == .int8) return .{ .integer = acc.integer };
                     const total = try self.numericOf(acc.wide);
@@ -4392,6 +4467,7 @@ pub fn Exec(comptime config: types.Config) type {
                         // hash work; retry must not bypass cancellation/budgets.
                     }
                 }
+                if (try self.projectCatalog(p, outer)) |rows| return rows;
                 const tuples = try self.join(p, outer);
                 const rows = if (p.grouped) try self.group(p, tuples, outer) else try self.project(p, tuples, outer);
                 return self.finish(p, rows);
@@ -4700,6 +4776,47 @@ pub fn Exec(comptime config: types.Config) type {
 
             // ---- subqueries --------------------------------------------
 
+            fn arrayFromSubquery(self: *Query, list: List, element_type: types.Type) Error!V.Cell {
+                const nested = types.elementType(element_type);
+                const offsets = self.handles(list);
+                var layout: array_module.Shape = .{ .element = types.dataTypeOf(nested orelse element_type) };
+                var inner: array_module.Shape = .{};
+                if (offsets.len != 0) {
+                    layout.ndim = 1;
+                    layout.dims[0] = @intCast(offsets.len);
+                    if (nested != null) {
+                        const first = &self.work.cells[offsets[0]];
+                        if (first.* == .null_value) return error.NullValueNotAllowed;
+                        inner = V.Arrays.shape(first.array.slice());
+                        if (inner.ndim == 0) return error.ArraySubscriptError;
+                        if (inner.ndim == array_module.max_dims) return error.ProgramLimitExceeded;
+                        layout.ndim += inner.ndim;
+                        @memcpy(layout.dims[1..layout.ndim], inner.dims[0..inner.ndim]);
+                        @memcpy(layout.lbounds[1..layout.ndim], inner.lbounds[0..inner.ndim]);
+                    }
+                }
+                var result: V.Text = .{};
+                var writer = try V.Arrays.Writer.begin(&result, &layout);
+                for (offsets) |offset| {
+                    try self.session.checkpoint();
+                    const cell = &self.work.cells[offset];
+                    if (nested == null) {
+                        try writer.append(cell);
+                    } else {
+                        if (cell.* == .null_value) return error.NullValueNotAllowed;
+                        const shape = V.Arrays.shape(cell.array.slice());
+                        if (shape.ndim != inner.ndim) return error.ArraySubscriptError;
+                        for (0..shape.ndim) |dim| {
+                            if (shape.dims[dim] != inner.dims[dim] or shape.lbounds[dim] != inner.lbounds[dim]) return error.ArraySubscriptError;
+                        }
+                        var reader = V.Arrays.Reader.init(cell.array.slice());
+                        var value: V.Cell = undefined;
+                        while (reader.next(&value)) try writer.append(&value);
+                    }
+                }
+                return .{ .array = result };
+            }
+
             fn subquery(ptr: *anyopaque, ctx: *const E.Context, id: u16) Error!V.Cell {
                 const self: *Query = @ptrCast(@alignCast(ptr));
                 const n = &self.pool.nodes[id];
@@ -4721,6 +4838,7 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 switch (n.kind) {
                     .scalar_subquery => {
+                        if (n.func == .array_subquery) return self.arrayFromSubquery(list, p.tys[0]);
                         if (list.count > 1) return error.CardinalityViolation;
                         if (list.count == 0) return .null_value;
                         return self.row(self.handles(list)[0])[0];
@@ -4810,6 +4928,13 @@ pub fn Exec(comptime config: types.Config) type {
 
         pub const Candidates = union(enum) { scan, empty, slot: struct { row: u32, version: u32 } };
 
+        /// Restrict rotation to physical projections over one source. Joins,
+        /// grouping, DISTINCT, windows and explicit ordering keep their paths.
+        pub fn synchronizedProjection(plan: *const B.Plan) bool {
+            return plan.source_count == 1 and !plan.general_join and !plan.correlated and !plan.grouped and
+                plan.order_count == 0 and plan.window_count == 0 and plan.distinct == .none and plan.sources[0].sample_method == 0;
+        }
+
         /// WHERE keeps a row only when the predicate is TRUE.
         pub fn keep(ctx: *E.Context, where: u16, row: ?*const E.Row) Error!bool {
             if (where == none) return true;
@@ -4825,7 +4950,7 @@ pub fn Exec(comptime config: types.Config) type {
             const value = try E.eval(ctx, key);
             if (value == .null_value) return .empty;
             const version = S.lookupVersionAt(table, &value, snap) orelse return .empty;
-            return .{ .slot = .{ .row = table.versions[version].row - 1, .version = version } };
+            return .{ .slot = .{ .row = table.versions[version].rowSlot(), .version = version } };
         }
 
         /// Plain SELECT: candidates are emitted as read.
@@ -4912,8 +5037,8 @@ pub fn Exec(comptime config: types.Config) type {
             pub fn order(self: *const StableSorter, left: u32, right: u32) Error!i8 {
                 const result = try self.base.order(left, right);
                 if (result != 0) return result;
-                const a = self.base.table.versions[left].row;
-                const b = self.base.table.versions[right].row;
+                const a = self.base.table.versions[left].rowLink();
+                const b = self.base.table.versions[right].rowLink();
                 return if (a < b) -1 else if (a > b) 1 else 0;
             }
         };
@@ -4955,7 +5080,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// cached ranks. The heap moves only slot IDs; one spare key slot is
         /// recycled on rejection/replacement. NULL placement and stable row-slot
         /// order match Sorter/StableSorter. Keep this stack frame off point reads.
-        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!usize {
+        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats, comptime projected: bool) Error!usize {
             var entries: [integer_topk_capacity + 1]IntegerEntry = undefined;
             var keys: [config.columns]IntegerOrder = undefined;
             const current = committed_only and table.summary.valid and table.summary.csn <= snap.csn;
@@ -4971,17 +5096,35 @@ pub fn Exec(comptime config: types.Config) type {
             var used: usize = 0;
             var spare: u32 = @intCast(count);
             const sorter: IntegerSorter = .{ .entries = &entries, .count = query.order_count, .session = ctx.session };
+            const projected_values = if (projected)
+                table.scan_values[keys[0].column * table.rows.len ..][0..table.row_high]
+            else &.{};
+            if (projected) stats.projected_topk_scans += 1;
             rows: for (0..table.row_high) |slot| {
                 try ctx.session.checkpoint();
-                const version = S.visibleAt(table, slot, snap) orelse continue;
-                if (!try keep(ctx, query.where, S.borrowVersionRow(table, version, row_scratch))) continue;
+                const full = used == count;
+                var projected_rank: u64 = undefined;
+                const version: u32 = if (projected) blk: {
+                    if (table.scan_live[slot] == 0) continue;
+                    projected_rank = @as(u64, @bitCast(projected_values[slot])) ^ 0x8000000000000000;
+                    if (keys[0].descending) projected_rank = ~projected_rank;
+                    // Slot order breaks ties in both paths. A later slot
+                    // matching the heap root cannot displace it.
+                    if (full and projected_rank >= entries[indices[0]].keys[0].rank) continue;
+                    break :blk @intCast(slot);
+                } else blk: {
+                    const visible = S.visibleAt(table, slot, snap) orelse continue;
+                    if (!try keep(ctx, query.where, S.borrowVersionRow(table, visible, row_scratch))) continue;
+                    break :blk visible;
+                };
                 const candidate: u32 = if (used < count) @intCast(used) else spare;
                 const entry = &entries[candidate];
                 entry.version = version;
-                entry.ordinal = table.versions[version].row;
-                const full = used == count;
+                entry.ordinal = if (projected) @intCast(slot + 1) else table.versions[version].rowLink();
                 var relation: i8 = 0;
-                for (keys[0..query.order_count], 0..) |key, column| {
+                if (projected) {
+                    entry.keys[0] = .{ .rank = projected_rank, .null_rank = keys[0].nulls_first };
+                } else for (keys[0..query.order_count], 0..) |key, column| {
                     var temporary: V.Cell = undefined;
                     const value = S.borrowVersionCell(table, version, key.column, &temporary);
                     const is_null = !key.nonnull and value.* == .null_value;
@@ -5000,12 +5143,28 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                     entry.keys[column] = normalized;
                 }
-                if (full and relation == 0 and entry.ordinal >= entries[indices[0]].ordinal) continue;
+                if (!projected and full and relation == 0 and entry.ordinal >= entries[indices[0]].ordinal) continue;
                 const removed = try sort_module.offerTopKSlot(indices[0..count], &used, candidate, &sorter);
                 if (full) spare = removed;
             }
-            for (indices[0..used]) |*id| id.* = entries[id.*].version;
+            for (indices[0..used]) |*id| {
+                const selected = entries[id.*].version;
+                id.* = if (projected) S.visibleAt(table, selected, snap) orelse unreachable else selected;
+            }
             return used;
+        }
+
+        fn canProjectIntegerTopK(table: *const S.Table, pool: *const Ast.Pool, query: *const B.Select,
+            snap: storage.Snapshot, committed_only: bool) bool {
+            if (comptime !S.compact_enabled) return false;
+            // The published live map agrees with visibility at this
+            // snapshot. Resolve versions only for the retained slots.
+            if (!S.hasCompactScan(table) or !committed_only or !table.summary.valid or
+                table.summary.csn > snap.csn or table.scan_high != table.row_high or
+                table.truncate_csn > snap.csn or snap.own(table.pending_truncate.owner) or
+                query.where != none or query.order_count != 1) return false;
+            const column = pool.nodes[query.order[0].expr].column;
+            return table.columns[column].not_null or table.summary.columns[column].nonnull == table.summary.rows;
         }
 
         const KeyInterval = struct { low: i128, high: i128, exact: bool = true };
@@ -5079,24 +5238,50 @@ pub fn Exec(comptime config: types.Config) type {
             return found;
         }
 
+        fn projectedFilterInputs(pool: *const Ast.Pool, table: *const S.Table, query: *const B.Select,
+            snap: storage.Snapshot, committed_only: bool, predicates: []Query.CompactPredicate) ?usize {
+            if (comptime !S.compact_enabled) return null;
+            if (!S.hasCompactScan(table) or !committed_only or !table.summary.valid or table.summary.csn > snap.csn or
+                table.scan_high != table.row_high or query.where == none or query.order_count != 0 or
+                query.limit != 0xffffffffffffffff) return null;
+            var count: usize = 0;
+            if (!Query.compactPredicates(pool, query.where, table, predicates, &count) or count == 0) return null;
+            for (predicates[0..count]) |predicate| if (!predicate.nonnull) return null;
+            return count;
+        }
+
+        pub const projected_cache_columns: usize = @min(config.columns, 4);
+
+        pub fn cacheableProjectedFilter(pool: *const Ast.Pool, table: *const S.Table, query: *const B.Select,
+            snapshot: storage.Snapshot, min_scan_rows: usize) bool {
+            if (query.key != none or query.lock.strength != .none or query.has_nominal_types or
+                query.count == 0 or query.count > projected_cache_columns or table.row_high < min_scan_rows) return false;
+            var predicates: [config.predicates]Query.CompactPredicate = undefined;
+            _ = projectedFilterInputs(pool, table, query, snapshot, true, &predicates) orelse return false;
+            for (query.targets[0..query.count]) |id| {
+                const node = &pool.nodes[id];
+                if (node.kind != .column or node.level != 0 or node.relation != 0 or
+                    !value_module.integral(node.ty) or
+                    table.summary.columns[node.column].nonnull != table.summary.rows) return false;
+            }
+            return true;
+        }
+
         /// Filter narrow committed integer columns first; resolve full MVCC
         /// versions only for survivors. Non-null proofs preserve AND's exact
         /// left-to-right short-circuit checkpoint count. Nullable/computed
         /// predicates and old/own-write snapshots keep the canonical path.
         noinline fn projectedFilterScan(ctx:*E.Context,table:*const S.Table,query:*const B.Select,snap:storage.Snapshot,
-            indices:[]u32,committed_only:bool,stats:*ReadStats) Error!?usize {
-            if(comptime !S.compact_enabled) return null;
-            if(!S.hasCompactScan(table) or !committed_only or !table.summary.valid or table.summary.csn>snap.csn or table.scan_high!=table.row_high or
-                query.where==none or query.order_count!=0 or query.limit!=0xffffffffffffffff) return null;
+            indices:[]u32,committed_only:bool,synchronize_scan:bool,stats:*ReadStats) Error!?usize {
             var predicates:[config.predicates]Query.CompactPredicate=undefined;
-            var used:usize=0;
-            if(!Query.compactPredicates(ctx.pool,query.where,table,&predicates,&used) or used==0) return null;
-            for(predicates[0..used]) |predicate| if(!predicate.nonnull) return null;
+            const used = projectedFilterInputs(ctx.pool, table, query, snap, committed_only, &predicates) orelse return null;
             stats.projected_filter_scans+=1;
             const dense=table.summary.rows>=0 and @as(u64,@intCast(table.summary.rows))==table.scan_high;
-            var found:usize=0;var start:usize=0;
-            while(start<table.scan_high):(start+=64) {
-                const count=@min(@as(usize,64),table.scan_high-start);
+            var found:usize=0;
+            var scan = S.PhysicalScan.init(table, synchronize_scan);
+            while (scan.next(table, 64)) |range| {
+                const start = range.start;
+                const count = range.end - start;
                 // Charge dead slots too, exactly as the canonical scan does.
                 try ctx.session.checkpoints(count);
                 var mask=Query.liveMask(table,start,count,dense);
@@ -5104,8 +5289,9 @@ pub fn Exec(comptime config: types.Config) type {
                 for(predicates[0..used]) |predicate| {
                     // Comparisons borrow their column and evaluate one literal;
                     // subsequent AND terms run only for preceding TRUE rows.
-                    try ctx.session.checkpoints(@popCount(mask));
-                    mask &= switch(predicate.op) {
+                    const selected = @popCount(mask);
+                    try ctx.session.checkpoints(selected);
+                    mask = if (selected <= 8) Query.sparseComparisonMask(table, start, mask, predicate) else mask & switch(predicate.op) {
                         .eq=>Query.comparisonMask(.eq,table,start,count,predicate,null),
                         .ne=>Query.comparisonMask(.ne,table,start,count,predicate,null),
                         .lt=>Query.comparisonMask(.lt,table,start,count,predicate,null),
@@ -5242,25 +5428,34 @@ pub fn Exec(comptime config: types.Config) type {
                         found = count;ordered = true;break :scan;
                     }
                   }
-                  if(!locking and !top_k) if(try projectedFilterScan(&ctx,table,query,snap,indices,committed_only,stats)) |count| {
+                   const synchronize_scan = !observing and !locking and query.order_count == 0 and session.synchronize_seqscans;
+                   if(!locking and !top_k) if(try projectedFilterScan(&ctx,table,query,snap,indices,committed_only,synchronize_scan,stats)) |count| {
                     if (comptime observing) observation.operation = .compact_filter;
                     found=count;break :scan;
                   };
                   if (top_k and query.limit <= integer_topk_capacity and integerOrder(pool, query)) {
                     if (comptime observing) observation.operation = .integer_top_k;
-                    found = try integerTopK(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats);
-                  } else for (0..table.row_high) |slot| {
-                    try session.checkpoint();
-                    const version = S.visibleAt(table, slot, snap) orelse continue;
-                    if (!try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) continue;
-                    if (top_k) {
-                        try sort_module.offerTopK(indices[0..@intCast(query.limit)], &found, version, &stable);
-                    } else {
-                        if (found == indices.len) return error.WorkspaceCapacity;
-                        indices[found] = version;
-                        found += 1;
+                    found = if (canProjectIntegerTopK(table, pool, query, snap, committed_only))
+                        try integerTopK(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats, true)
+                    else
+                        try integerTopK(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats, false);
+                  } else {
+                    var physical = S.PhysicalScan.init(table, synchronize_scan);
+                    ranges: while (physical.next(table, table.row_high)) |range| {
+                        for (range.start..range.end) |slot| {
+                            try session.checkpoint();
+                            const version = S.visibleAt(table, slot, snap) orelse continue;
+                            if (!try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) continue;
+                            if (top_k) {
+                                try sort_module.offerTopK(indices[0..@intCast(query.limit)], &found, version, &stable);
+                            } else {
+                                if (found == indices.len) return error.WorkspaceCapacity;
+                                indices[found] = version;
+                                found += 1;
+                            }
+                            if (!locking and query.order_count == 0 and found >= query.limit) break :ranges;
+                        }
                     }
-                    if (!locking and query.order_count == 0 and found >= query.limit) break;
                   }
                 },
             };

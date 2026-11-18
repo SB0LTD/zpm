@@ -1,0 +1,31 @@
+CREATE TEMP TABLE samples(r REAL, d DOUBLE PRECISION);
+INSERT INTO samples VALUES ('1.2345678', '1.2345678901234567'), ('999999.5', '999999999999999.5'),
+    ('1.125', '1.015'), ('-0', '-0'), ('NaN', 'Infinity'),
+    ('1.401298464324817e-45', '4.9406564584124654e-324');
+SHOW extra_float_digits;
+SET extra_float_digits TO 3;
+SELECT * FROM samples;
+SET extra_float_digits TO 0;
+SELECT * FROM samples;
+SELECT 1.2345678::REAL::TEXT, 1.2345678901234567::DOUBLE PRECISION::TEXT;
+SELECT point(1.2345678901234567, 0);
+BEGIN;
+SET LOCAL extra_float_digits TO -3;
+SHOW extra_float_digits;
+SELECT * FROM samples;
+ROLLBACK;
+SHOW extra_float_digits;
+SET extra_float_digits = -15;
+SELECT 1.5::REAL, 2.5::DOUBLE PRECISION, 9.5::REAL, 0.000095::DOUBLE PRECISION;
+RESET extra_float_digits;
+SHOW extra_float_digits;
+SET extra_float_digits = +3;
+SHOW extra_float_digits;
+SET extra_float_digits TO - /*gap*/ 013;
+SHOW extra_float_digits;
+SELECT set_config('extra_float_digits', '-013', false);
+SET extra_float_digits = 2.5;
+SHOW extra_float_digits;
+SELECT set_config('extra_float_digits', '0', false), 1.2345678901234567::DOUBLE PRECISION::TEXT;
+SET extra_float_digits = 1;
+SELECT set_config('extra_float_digits', '0', false), d::TEXT, d FROM samples WHERE r = 1.2345678::REAL;

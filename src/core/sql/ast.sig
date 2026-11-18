@@ -83,7 +83,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // base[...]... with its subscript layout in `integer` (array_eval.sig);
     // array_any is `a op ANY/ALL (array)` encoded like in_subquery (op,
     // negated for ALL).
-    array_constructor, array_subscript, array_any, array_length, cardinality, array_ndims, array_dims, array_lower, array_upper,
+    array_constructor, array_subquery, array_subscript, array_any, array_length, cardinality, array_ndims, array_dims, array_lower, array_upper,
     array_append, array_prepend, array_cat, array_to_string,
     // Ranges (B11 advanced types, range_eval.sig): int4range(...) and the
     // other constructors (result type in the node), lower/upper of a range,
@@ -99,7 +99,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     xmlparse, xmlserialize, xml_is_well_formed, xml_is_well_formed_document, xml_is_well_formed_content,
     // Session functions (tx-session lane, Database session hook; volatile).
     current_setting, set_config, pg_try_advisory_lock, pg_try_advisory_lock_shared, pg_try_advisory_xact_lock, pg_try_advisory_xact_lock_shared,
-    pg_advisory_unlock, pg_advisory_unlock_shared, pg_backend_pid,
+    pg_advisory_unlock, pg_advisory_unlock_shared, pg_backend_pid, pg_is_in_recovery,
     // Routines (B11 wave 3, routine_catalog.sig): a call of a user function
     // (`integer` its routine slot; arguments `b` -> next, converted to the
     // parameter types) and a bound routine variable (`relation` 0 a
@@ -129,7 +129,8 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     obj_description, col_description, shobj_description, current_user, session_user,
     // Discovery (B11 text lane): pg_typeof (the argument's type OID in
     // `integer`, set by the binder) and pg_get_serial_sequence.
-    pg_typeof, pg_get_serial_sequence,
+    pg_typeof, pg_get_serial_sequence, pg_table_is_visible, pg_get_indexdef, pg_get_constraintdef, pg_get_triggerdef, pg_partition_ancestors,
+    to_regnamespace, regnamespace_in, regnamespace_out, pg_get_statisticsobjdef_columns, pg_relation_is_publishable, pg_get_partkeydef,
     // Regular expressions (B11 text lane, regex.sig).
     regexp_like, similar_to_escape,
     // Full text search (B11 text lane, text_search.sig): the first argument
@@ -229,7 +230,7 @@ pub fn strictFunction(func: Func) bool {
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
         .current_timestamp, .current_date, .current_database, .current_schema,
         .to_regtype, .to_regclass, .pg_get_expr,
-        .regclass_in, .regtype_in, .regclass_out, .regtype_out => true,
+        .regclass_in, .regtype_in, .regclass_out, .regtype_out, .to_regnamespace, .regnamespace_in, .regnamespace_out => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
@@ -242,7 +243,7 @@ pub fn strictFunction(func: Func) bool {
         .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
         // jsonb_set_lax reads NULL arguments itself.
         .jsonb_set_lax => false,
-        .pg_get_serial_sequence => true,
+        .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => true,
         .regexp_like, .similar_to_escape => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
@@ -254,9 +255,18 @@ pub const regclass_typmod: i32 = -2;
 pub const regtype_typmod: i32 = -3;
 /// Wire metadata for MySQL DATE_ADD returning its fixed date string.
 pub const mysql_date_text_typmod: i32 = -4;
+pub const regnamespace_typmod: i32 = -5;
+/// Result metadata for MySQL's scale-zero unsigned integer SUM.
+pub const mysql_unsigned_sum_typmod: i32 = -7;
+/// Contextual MySQL CAST(... AS SIGNED/UNSIGNED), distinct from assignment.
+pub const mysql_integer_cast_typmod: i32 = -6;
 
 /// Node.reg: an OID-valued expression known to be a regclass / regtype.
-pub const Reg = enum(u8) { none, regclass, regtype };
+pub const Reg = enum(u8) { none, regclass, regtype, regnamespace };
+
+pub fn regKind(typmod: i32) Reg {
+    return switch (typmod) { regclass_typmod => .regclass, regtype_typmod => .regtype, regnamespace_typmod => .regnamespace, else => .none };
+}
 
 pub const Test = enum { is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
 
@@ -303,6 +313,9 @@ pub const NodeKind = enum {
     text_literal,
     decimal_literal,
     column,
+    /// A bootstrap catalog's hidden tableoid. Its OID is in `integer`,
+    /// and `relation` and `level` locate the row required to expose it.
+    catalog_tableoid,
     param,
     unary,
     binary,
@@ -775,6 +788,8 @@ pub fn Ast(comptime config: types.Config) type {
             alias: ?Ident = null,
             query: u16 = none,
             join: JoinKind = .first,
+            /// A separate FROM operand, rather than SQL CROSS JOIN.
+            comma_separated: bool = false,
             on: u16 = none,
             using: [config.columns]Ident = undefined,
             using_count: usize = 0,
@@ -1087,10 +1102,10 @@ pub const Characteristics = struct {
 };
 
 /// A configuration parameter name: an identifier, or the special SQL forms
-/// TIME ZONE and TRANSACTION ISOLATION LEVEL.
+/// TIME ZONE, XML OPTION and TRANSACTION ISOLATION LEVEL.
 pub const SettingName = struct {
     ident: Ident = .{},
-    special: enum { none, time_zone, transaction_isolation } = .none,
+    special: enum { none, time_zone, xml_option, transaction_isolation } = .none,
 };
 
 /// SET value: DEFAULT, LOCAL (TIME ZONE LOCAL), a word, a string literal or
@@ -1098,6 +1113,9 @@ pub const SettingName = struct {
 pub const SettingValue = struct {
     kind: enum { default, word, string, number } = .default,
     span: Span = .{},
+    // Sign of a numeric token, separate from whitespace or comments.
+    number_sign: u8 = 0,
+    integer: bool = false,
     quoted: lexer.Quoted = .{ .start = 0, .end = 0, .len = 0 },
     /// A comma list (`SET search_path TO a, b`): its raw source bytes
     /// [list_start, list_end); 0 when the value is a single item.

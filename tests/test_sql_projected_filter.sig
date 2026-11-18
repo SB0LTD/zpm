@@ -2,7 +2,7 @@
 const std=@import("std");
 const sql=@import("sql");
 const cfg:sql.Config=.{.external_storage=true,.external_workspace=true,.tables=1,.columns=4,.rows_per_table=4,
-    .work_rows=256,.result_rows=128,.text_bytes=24,.compact_integral_scans=true};
+    .work_rows=256,.result_rows=128,.text_bytes=24,.compact_integral_scans=true,.synchronized_scan_rows=512};
 const DB=sql.Database(cfg);
 const Scalar=sql.Database(.{.external_storage=true,.external_workspace=true,.tables=1,.columns=4,.rows_per_table=4,
     .work_rows=256,.result_rows=128,.text_bytes=24,.compact_integral_scans=false});
@@ -34,6 +34,7 @@ pub fn main() !void {
     try db.bindMemory(&bytes,n,n*3,8192);try scalar.bindMemory(&scalar_bytes,n,n*3,8192);
     try db.bindWorkspace(&cells);try scalar.bindWorkspace(&scalar_cells);
     try both("CREATE TABLE data(id INT PRIMARY KEY,g INT NOT NULL,n BIGINT NOT NULL,label TEXT)");
+    try both("SET synchronize_seqscans TO off");
     var text:[160]u8=undefined;
     for(0..n) |i| try both(try std.fmt.bufPrint(&text,"INSERT INTO data VALUES({d},{d},{d},'row-{d}')",.{i,i%16,i,i}));
     try same("SELECT id,n,label FROM data WHERE g=3 AND n>511",32);
@@ -53,6 +54,37 @@ pub fn main() !void {
     try same("SELECT id FROM data WHERE g=3 LIMIT 2",2);
     try check(db.workspace.query.read_stats.projected_filter_scans==0);
     try same("SELECT id FROM data WHERE g=3 ORDER BY id DESC LIMIT 3",3);
+    try db.execute("SET synchronize_seqscans TO on", &result);
+    try db.execute("SELECT id FROM data WHERE n=602 LIMIT 1", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 602);
+    try db.execute("SELECT id FROM data WHERE g=3", &result);
+    try check(result.row_count == 64 and db.workspace.query.read_stats.projected_filter_scans == 1);
+    for (0..64) |index| {
+        const expected: i64 = @intCast((515 + index * 16) % n);
+        try check(result.rows[index].cells[0].integer == expected);
+    }
+    try db.execute("SELECT id FROM ONLY data WHERE g=3 OFFSET 0", &result);
+    try check(result.row_count == 64 and result.rows[0].cells[0].integer == 515 and result.rows[63].cells[0].integer == 499);
+    try db.execute("SELECT id FROM data ORDER BY id LIMIT 1", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 0);
+    try db.execute("SELECT id FROM data LIMIT 1", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 512);
+    try db.execute("SET synchronize_seqscans TO off", &result);
+    try same("SELECT id FROM data WHERE g=3", 64);
+    const top = "SELECT id,g,label FROM data ORDER BY g DESC LIMIT 7";
+    try same(top,7);
+    try check(db.workspace.query.read_stats.projected_topk_scans==1);
+    try check(result.rows[0].cells[0].integer==15 and result.rows[1].cells[0].integer==31);
+    try same("SELECT id,g FROM data ORDER BY g ASC LIMIT 5",5);
+    try check(db.workspace.query.read_stats.projected_topk_scans==1 and result.rows[0].cells[0].integer==0);
+    try same("SELECT id FROM data ORDER BY g ASC,n DESC LIMIT 5",5);
+    try check(db.workspace.query.read_stats.projected_topk_scans==0);
+    try both("DELETE FROM data WHERE id=15");
+    try same(top,7);
+    try check(db.workspace.query.read_stats.projected_topk_scans==1 and result.rows[0].cells[0].integer==31);
+    try both("UPDATE data SET g=100 WHERE id=10");
+    try same(top,7);
+    try check(db.workspace.query.read_stats.projected_topk_scans==1 and result.rows[0].cells[0].integer==10);
     try both("DELETE FROM data WHERE id=515");
     try same("SELECT id FROM data WHERE g=3 AND n>511",31);
     try both("UPDATE data SET g=3 WHERE id=516");
@@ -64,7 +96,12 @@ pub fn main() !void {
     try db.statement(owner,"UPDATE data SET g=4 WHERE id=516",&result,.{});
     try db.statement(owner,"SELECT id FROM data WHERE g=3 AND n>511",&result,.{});
     try check(result.row_count==32 and db.workspace.query.read_stats.projected_filter_scans==0);
+    try db.statement(owner,"UPDATE data SET g=110 WHERE id=11",&result,.{});
+    try db.statement(owner,top,&result,.{});
+    try check(db.workspace.query.read_stats.projected_topk_scans==0 and result.rows[0].cells[0].integer==11);
     db.abort(owner);
+    try same(top,7);
+    try check(db.workspace.query.read_stats.projected_topk_scans==1 and result.rows[0].cells[0].integer==10);
     // An old snapshot uses the original versions, never the current projection.
     const ContextDB=DB;
     var context:ContextDB.ReadContext=.{};
@@ -72,17 +109,37 @@ pub fn main() !void {
     try context.bindMemory(&scratch,256);
     try context.execute(&db,"SELECT id FROM data WHERE g=3 AND n>511",.{.csn=before},&result);
     try check(result.row_count==32 and context.workspace.query.read_stats.projected_filter_scans==0);
+    try context.execute(&db,top,.{.csn=before},&result);
+    try check(context.workspace.query.read_stats.projected_topk_scans==0 and result.rows[0].cells[0].integer==10);
+    const old_top_csn=db.csn;
+    const old_reader=try db.begin();
+    try db.beginModes(old_reader,.{.isolation=.repeatable_read});
+    try db.statement(old_reader,top,&result,.{});
+    try both("UPDATE data SET g=200 WHERE id=11");
+    try same(top,7);
+    try check(db.workspace.query.read_stats.projected_topk_scans==1 and result.rows[0].cells[0].integer==11);
+    try context.execute(&db,top,.{.csn=old_top_csn},&result);
+    try check(context.workspace.query.read_stats.projected_topk_scans==0 and result.rows[0].cells[0].integer==10);
+    db.abort(old_reader);
     try db.execute("SELECT 777",&result);
     var control:sql.ExecutionControl=.{.max_work=100};db.session.control=&control;
     if(db.execute("SELECT id FROM data WHERE g=3 AND n>511",&result)) |_| return error.LimitIgnored else |err| try check(err==error.QueryWorkLimit);
     try check(result.row_count==1 and result.rows[0].cells[0].integer==777);
     control=.{.poll=canceled};
     if(db.execute("SELECT id FROM data WHERE g=3 AND n>511",&result)) |_| return error.CancelIgnored else |err| try check(err==error.QueryCanceled);
+    control=.{.max_work=100};
+    if(db.execute(top,&result)) |_| return error.LimitIgnored else |err| try check(err==error.QueryWorkLimit);
+    try check(result.row_count==1 and result.rows[0].cells[0].integer==777);
+    control=.{.poll=canceled};
+    if(db.execute(top,&result)) |_| return error.CancelIgnored else |err| try check(err==error.QueryCanceled);
     db.session.control=null;
     try both("DROP TABLE data");
     try both("CREATE TABLE data(id INT PRIMARY KEY,g INT,n INT,label TEXT)");
     try both("INSERT INTO data VALUES(1,NULL,5,'a'),(2,3,NULL,'b'),(3,3,10,'c')");
     try same("SELECT id FROM data WHERE g=3 AND n>0",1);
     try check(db.workspace.query.read_stats.projected_filter_scans==0);
-    std.debug.print("PASS projected filter: {d} assertions, independent scalar executor and row models\n",.{assertions});
+    try both("INSERT INTO data VALUES(4,2,10,'d'),(5,4,10,'e')");
+    try same("SELECT id,g FROM data ORDER BY g ASC NULLS FIRST LIMIT 1",1);
+    try check(db.workspace.query.read_stats.projected_topk_scans==0 and result.rows[0].cells[0].integer==1);
+    std.debug.print("PASS projected filter and top-N: {d} assertions, independent scalar executor and row models\n",.{assertions});
 }

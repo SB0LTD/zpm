@@ -470,6 +470,10 @@ fn settings() !void {
     try fails(tx, "SHOW nosuch", error.UndefinedSetting);
     try fails(tx, "SET nosuch = 1", error.UndefinedSetting);
     try expectMeta(tx, "SELECT set_config('tdd.level', '3', false)", "3", "set_config:25:-1");
+    try expectMeta(tx, "SELECT PG_CATALOG.set_config('tdd.level', '3', false)", "3", "set_config:25:-1");
+    try expect(tx, "SELECT \"pg_catalog\".\"current_setting\"('tdd.level')", "3");
+    try expect(tx, "SELECT 2 OPERATOR(pg_catalog.*) 3 + 4", "14");
+    try expect(tx, "SELECT 'tooling' OPERATOR(pg_catalog.~) '^tooling$' COLLATE pg_catalog.default", "t");
     try expect(tx, "SELECT current_setting('search_path'), current_setting('transaction_isolation')", "public|read committed");
     try commit(tx);
     tx = try db.begin();
@@ -818,6 +822,33 @@ fn exec(connection: *Store.Connection, source: []const u8) !void {
     };
 }
 
+fn synchronizeSeqscansSettings() !void {
+    var first: Store.Connection = .{ .store = &store, .id = 100 };
+    var peer: Store.Connection = .{ .store = &store, .id = 101 };
+    try first.startupParameter("options", "-c synchronize_seqscans=off");
+    try exec(&first, "SHOW synchronize_seqscans");
+    try check(same(try render(&result), "off"));
+    try exec(&peer, "SHOW synchronize_seqscans");
+    try check(same(try render(&result), "on"));
+    try exec(&first, "BEGIN");
+    try exec(&first, "SAVEPOINT scan_setting");
+    try exec(&first, "SELECT set_config('synchronize_seqscans', 'on', true)");
+    try check(same(try render(&result), "on"));
+    try exec(&first, "ROLLBACK TO scan_setting");
+    try exec(&first, "SELECT current_setting('synchronize_seqscans')");
+    try check(same(try render(&result), "off"));
+    try exec(&first, "SET LOCAL synchronize_seqscans = on");
+    try exec(&peer, "SELECT 1");
+    try exec(&first, "COMMIT");
+    try exec(&first, "SHOW synchronize_seqscans");
+    try check(same(try render(&result), "off"));
+    try exec(&first, "SET synchronize_seqscans TO on");
+    var control: sql.ExecutionControl = .{};
+    try check(first.detachedReadSession(&control, null).synchronize_seqscans);
+    try exec(&first, "RESET synchronize_seqscans");
+    try check(!first.detachedReadSession(&control, null).synchronize_seqscans);
+}
+
 var conn_a: Store.Connection = undefined;
 var conn_b: Store.Connection = undefined;
 var conn_c: Store.Connection = undefined;
@@ -1131,6 +1162,119 @@ fn sqlstate(bytes: []const u8, wanted: []const u8) bool {
     return false;
 }
 
+fn recoveryStatus() !void {
+    db = .{};
+    const source = "SELECT pg_catalog.pg_is_in_recovery()";
+    const tx = try db.begin();
+    try db.beginModes(tx, .{ .read_only = true });
+    try expectMeta(tx, source, "f", "pg_is_in_recovery:16:-1");
+    db.abort(tx);
+
+    db.setStartupRecovery(true);
+    const replay = try db.begin();
+    try expect(replay, "SELECT pg_is_in_recovery()", "t");
+    db.abort(replay);
+    db.setStartupRecovery(false);
+    const primary = try db.begin();
+    defer db.abort(primary);
+    try expect(primary, source, "f");
+    try fails(primary, "SELECT pg_is_in_recovery(true)", error.UndefinedFunction);
+}
+
+fn expectTextRow(source: []const u8, expected: []const []const u8) !void {
+    const bytes = try wireQuery(source);
+    var at: usize = 0;
+    while (at + 5 <= bytes.len) {
+        const length = get32(bytes[at + 1 ..][0..4]);
+        if (bytes[at] == 'D') {
+            const body = bytes[at + 5 .. at + 1 + length];
+            try check(body[0] == 0 and body[1] == expected.len);
+            var field: usize = 2;
+            for (expected) |text| {
+                const size = get32(body[field..][0..4]);
+                field += 4;
+                try check(same(body[field..][0..size], text));
+                field += size;
+            }
+            try check(field == body.len);
+            return;
+        }
+        at += 1 + length;
+    }
+    std.debug.print("no wire DataRow for {s}, 0A000={any} 42704={any} 22023={any}\n", .{ source, sqlstate(bytes,"0A000"), sqlstate(bytes,"42704"), sqlstate(bytes,"22023") });
+    return error.TxSessionContractFailed;
+}
+
+fn floatOutputSetting() !void {
+    conn_c = .{ .store = &store, .id = 3 };
+    wire = .{};
+    try startupWire();
+    defer conn_c.disconnect();
+    const sample = "SELECT 1.2345678::REAL, 1.2345678901234567::DOUBLE PRECISION";
+    try expectTextRow("SHOW extra_float_digits", &.{"1"});
+    try check(commandTag(try wireQuery("SET extra_float_digits TO 3"), "SET"));
+    try expectTextRow(sample, &.{ "1.2345678", "1.2345678901234567" });
+    try check(commandTag(try wireQuery("SET extra_float_digits = 0"), "SET"));
+    try expectTextRow(sample, &.{ "1.23457", "1.23456789012346" });
+    try expectTextRow(sample ++ "::TEXT", &.{ "1.23457", "1.23456789012346" });
+    try expectTextRow("SELECT point(1.2345678901234567, 0)", &.{"(1.23456789012346,0)"});
+    try expectTextRow("SELECT 999999.5::REAL, 999999999999999.5::DOUBLE PRECISION", &.{ "1e+06", "1e+15" });
+    try expectTextRow("SELECT '1.401298464324817e-45'::REAL, '4.9406564584124654e-324'::DOUBLE PRECISION", &.{ "1.4013e-45", "4.94065645841247e-324" });
+    try check(commandTag(try wireQuery("BEGIN"), "BEGIN"));
+    try check(commandTag(try wireQuery("SET LOCAL extra_float_digits = -3"), "SET"));
+    try expectTextRow("SELECT current_setting('extra_float_digits')", &.{"-3"});
+    try expectTextRow(sample, &.{ "1.23", "1.23456789012" });
+    try expectTextRow("SELECT 1.125::REAL, 1.015::DOUBLE PRECISION", &.{ "1.12", "1.015" });
+    try check(commandTag(try wireQuery("ROLLBACK"), "ROLLBACK"));
+    try expectTextRow("SHOW extra_float_digits", &.{"0"});
+    try check(commandTag(try wireQuery("SET extra_float_digits TO -15"), "SET"));
+    try expectTextRow("SELECT 1.5::REAL, 2.5::DOUBLE PRECISION, 9.5::REAL, 0.000095::DOUBLE PRECISION", &.{ "2", "2", "1e+01", "0.0001" });
+    try expectTextRow("SELECT '-0'::REAL, '-Infinity'::DOUBLE PRECISION, 'NaN'::REAL", &.{ "-0", "-Infinity", "NaN" });
+    try check(sqlstate(try wireQuery("SET extra_float_digits TO 4"), "22023"));
+    try check(sqlstate(try wireQuery("SET extra_float_digits TO -16"), "22023"));
+    try check(commandTag(try wireQuery("SET extra_float_digits TO +3"), "SET"));
+    try expectTextRow("SHOW extra_float_digits", &.{"3"});
+    try check(commandTag(try wireQuery("SET extra_float_digits TO - /*gap*/ 013"), "SET"));
+    try expectTextRow("SHOW extra_float_digits", &.{"-13"});
+    try expectTextRow("SELECT set_config('extra_float_digits', '-013', false)", &.{"-11"});
+    try check(commandTag(try wireQuery("SET extra_float_digits = 2.5"), "SET"));
+    try expectTextRow("SHOW extra_float_digits", &.{"2"});
+    _ = try wireQuery("CREATE TABLE configured_float (d DOUBLE PRECISION)");
+    _ = try wireQuery("INSERT INTO configured_float VALUES (1.2345678901234567)");
+    try expectTextRow("SELECT set_config('extra_float_digits', '0', false), d::TEXT, d FROM configured_float", &.{ "0", "1.23456789012346", "1.23456789012346" });
+    try check(commandTag(try wireQuery("RESET extra_float_digits"), "RESET"));
+    try expectTextRow("SHOW extra_float_digits", &.{"1"});
+}
+
+fn defaultPlacementSettings() !void {
+    conn_c = .{ .store = &store, .id = 3 };
+    wire = .{};
+    try startupWire();
+    defer conn_c.disconnect();
+    try expectTextRow("SHOW default_table_access_method", &.{"heap"});
+    try expectTextRow("SHOW default_tablespace", &.{""});
+    try check(commandTag(try wireQuery("SET default_table_access_method = HEAP"), "SET"));
+    try check(commandTag(try wireQuery("SET default_table_access_method = \"heap\""), "SET"));
+    try check(sqlstate(try wireQuery("SET default_table_access_method = 'Heap'"), "22023"));
+    try check(sqlstate(try wireQuery("SET default_table_access_method = fake"), "22023"));
+    try check(sqlstate(try wireQuery("SET default_table_access_method = btree"), "55000"));
+    try check(sqlstate(try wireQuery("SELECT set_config('default_table_access_method', 'btree', false)"), "55000"));
+    try expectTextRow("SELECT set_config('default_tablespace', 'pg_default', false)", &.{"pg_default"});
+    try check(commandTag(try wireQuery("CREATE TABLE placement_probe (id INT PRIMARY KEY)"), "CREATE TABLE"));
+    try expectTextRow("SELECT a.amname, c.reltablespace FROM pg_class c JOIN pg_am a ON c.relam = a.oid WHERE c.relname = 'placement_probe'", &.{ "heap", "0" });
+    try check(commandTag(try wireQuery("BEGIN"), "BEGIN"));
+    try check(commandTag(try wireQuery("SET LOCAL default_tablespace = ''"), "SET"));
+    try expectTextRow("SHOW default_tablespace", &.{""});
+    try check(commandTag(try wireQuery("ROLLBACK"), "ROLLBACK"));
+    try expectTextRow("SHOW default_tablespace", &.{"pg_default"});
+    try check(sqlstate(try wireQuery("SET default_tablespace = pg_global"), "0A000"));
+    try check(sqlstate(try wireQuery("SET default_tablespace = fake"), "22023"));
+    try check(sqlstate(try wireQuery("SET default_tablespace = 'PG_DEFAULT'"), "22023"));
+    try expectTextRow("SHOW default_tablespace", &.{"pg_default"});
+    try check(commandTag(try wireQuery("RESET default_tablespace"), "RESET"));
+    try expectTextRow("SHOW default_tablespace", &.{""});
+}
+
 pub fn main(init: std.process.Init) !void {
     try oraclePrograms();
     try transactionModes();
@@ -1140,6 +1284,10 @@ pub fn main(init: std.process.Init) !void {
     try prepared();
     try locking();
     try notifications();
+    try synchronizeSeqscansSettings();
+    try recoveryStatus();
+    try floatOutputSetting();
+    try defaultPlacementSettings();
     var buffer: [128]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-tx-session\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

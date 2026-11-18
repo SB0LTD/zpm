@@ -1267,6 +1267,301 @@ fn exclusionConstraints() !void {
     try sameState(&[_][]const u8{ exclusion_probes[0], exclusion_probes[1], "SELECT r FROM later", "SELECT k, r FROM plain" });
 }
 
+fn indexDefinitionCatalog() !void {
+    db = .{};
+    replica = .{};
+    try run("CREATE TABLE \"Case Table\" (\"Select\" INT PRIMARY KEY, qty INT, label TEXT)");
+    try run("CREATE INDEX \"ix Weird\" ON \"Case Table\" (qty DESC NULLS LAST) INCLUDE (label) WHERE qty > 1");
+    const flags = "SELECT c.relname,i.indisprimary,i.indisvalid,i.indisclustered,i.indisreplident FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid ORDER BY c.relname";
+    try expect(flags, "Case Table_pkey|t|t|f|f;ix Weird|f|t|f|f");
+    const primary = "SELECT pg_catalog.pg_get_indexdef(oid), pg_catalog.pg_get_indexdef(oid,0,true), pg_get_indexdef(oid,1,true), pg_get_indexdef(oid,2,true) FROM pg_class WHERE relname='Case Table_pkey'";
+    try expect(primary, "CREATE UNIQUE INDEX \"Case Table_pkey\" ON public.\"Case Table\" USING btree (\"Select\")|CREATE UNIQUE INDEX \"Case Table_pkey\" ON \"Case Table\" USING btree (\"Select\")|\"Select\"|");
+    const secondary = "SELECT pg_get_indexdef(oid),pg_get_indexdef(oid,0,true),pg_get_indexdef(oid,1,true),pg_get_indexdef(oid,2,true),pg_get_indexdef(oid,-1,true) FROM pg_class WHERE relname='ix Weird'";
+    try expect(secondary, "CREATE INDEX \"ix Weird\" ON public.\"Case Table\" USING btree (qty DESC NULLS LAST) INCLUDE (label) WHERE (qty > 1)|CREATE INDEX \"ix Weird\" ON \"Case Table\" USING btree (qty DESC NULLS LAST) INCLUDE (label) WHERE qty > 1|qty|label|");
+    try expect("SELECT pg_get_indexdef(0),pg_get_indexdef(NULL),pg_get_indexdef(0,0,true)", "NULL|NULL|NULL");
+    try sameState(&.{ flags, primary, secondary });
+    try run("DROP INDEX \"ix Weird\"");
+    try expect(flags, "Case Table_pkey|t|t|f|f");
+    try sameState(&.{ flags, primary, secondary });
+}
+
+fn constraintDefinitionCatalog() !void {
+    reset();
+    try run("CREATE TABLE tooling(id INT PRIMARY KEY, label TEXT)");
+    try run("CREATE INDEX tooling_label ON tooling (label)");
+    try run("CREATE TABLE catalog_child(id INT PRIMARY KEY, parent INT, score INT, CONSTRAINT uq UNIQUE NULLS NOT DISTINCT(score) DEFERRABLE INITIALLY DEFERRED, CONSTRAINT min_score CHECK (score > 0), CONSTRAINT fk_parent FOREIGN KEY (parent) REFERENCES tooling(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE)");
+    const definitions = "SELECT conname,contype,condeferrable,condeferred,pg_catalog.pg_get_constraintdef(oid,true) FROM pg_catalog.pg_constraint ORDER BY conname";
+    try expect(definitions,
+        "catalog_child_pkey|p|f|f|PRIMARY KEY (id);" ++
+        "fk_parent|f|t|f|FOREIGN KEY (parent) REFERENCES tooling(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE;" ++
+        "min_score|c|f|f|CHECK (score > 0);" ++
+        "tooling_pkey|p|f|f|PRIMARY KEY (id);" ++
+        "uq|u|t|t|UNIQUE NULLS NOT DISTINCT (score) DEFERRABLE INITIALLY DEFERRED");
+    const references = "SELECT conname,confupdtype,confdeltype,confmatchtype,conindid FROM pg_constraint WHERE contype='f'";
+    const identities = "SELECT conname,oid,conindid FROM pg_constraint ORDER BY conname";
+    try expect(references, "fk_parent|c|n|s|16385");
+    try expect("SELECT pg_get_constraintdef(0),pg_get_constraintdef(NULL),pg_get_constraintdef(0,true)", "NULL|NULL|NULL");
+    try expect("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='min_score'", "CHECK ((score > 0))");
+    try sameState(&.{ definitions, references, identities });
+    try run("ALTER TABLE catalog_child DROP CONSTRAINT min_score");
+    try expect("SELECT conname FROM pg_constraint WHERE conname='min_score'", "");
+    try sameState(&.{ definitions, references, identities });
+}
+
+fn partitionAncestorCatalog() !void {
+    reset();
+    try run("CREATE TABLE whole (id INTEGER) PARTITION BY RANGE (id)");
+    try run("CREATE TABLE leaf PARTITION OF whole FOR VALUES FROM (0) TO (10)");
+    try run("CREATE TABLE solo (id INTEGER)");
+    const targets = "SELECT pg_catalog.pg_partition_ancestors('leaf')";
+    const names = "SELECT pg_partition_ancestors('leaf')::pg_catalog.text";
+    const ordinality = "SELECT c.relname,a.position FROM pg_catalog.pg_partition_ancestors('leaf') WITH ORDINALITY AS a(relid,position) JOIN pg_class c ON c.oid=a.relid ORDER BY a.position";
+    const incoming_form = "SELECT relname FROM pg_class WHERE oid IN (SELECT pg_catalog.pg_partition_ancestors('16385') UNION ALL VALUES ('16385'::pg_catalog.regclass)) ORDER BY oid";
+    try expect(targets, "16385;16384");
+    try expect(names, "leaf;whole");
+    try expect(ordinality, "leaf|1;whole|2");
+    try expect(incoming_form, "whole;leaf");
+    try expect("SELECT pg_partition_ancestors('whole')", "16384");
+    try expect("SELECT pg_partition_ancestors('solo')", "");
+    try expect("SELECT pg_partition_ancestors(NULL)", "");
+    try expect("SELECT pg_partition_ancestors('99999')", "");
+    try expect("SELECT '99999'::regclass, '-'::regclass, '16384'::regclass::text", "99999|0|whole");
+    try expect("SELECT '0001'::regclass::oid", "1");
+    try rejects("SELECT '4294967296'::regclass::oid", error.NumericValueOutOfRange, names, "leaf;whole");
+    try sameState(&.{ targets, names, ordinality, incoming_form });
+}
+
+fn arraySubqueries() !void {
+    reset();
+    try expect("SELECT ARRAY(SELECT 7 WHERE false)::text", "{}");
+    try expect("SELECT ARRAY(VALUES ('label'), (NULL))::text", "{label,NULL}");
+    try expect("SELECT ARRAY(VALUES (ARRAY[1,2]), (ARRAY[3,NULL]))::text", "{{1,2},{3,NULL}}");
+    try rejects("SELECT ARRAY(VALUES (NULL::int[]))", error.NullValueNotAllowed, "SELECT ARRAY(VALUES (1))::text", "{1}");
+    try rejects("SELECT ARRAY(VALUES (ARRAY[1]), (ARRAY[2,3]))", error.ArraySubscriptError, "SELECT ARRAY(VALUES (2))::text", "{2}");
+    try rejects("SELECT ARRAY(SELECT 1,2)", error.Syntax, "SELECT ARRAY(VALUES (3))::text", "{3}");
+    try run("CREATE TABLE g (id INT PRIMARY KEY)");
+    try run("CREATE TABLE entries (group_id INT, value INT)");
+    try run("INSERT INTO g VALUES (1), (2), (3)");
+    try run("INSERT INTO entries VALUES (1,30), (1,10), (2,NULL), (2,20)");
+    const correlated = "SELECT id, ARRAY(SELECT value FROM entries e WHERE e.group_id = g.id ORDER BY value)::text FROM g ORDER BY id";
+    try expect(correlated, "1|{10,30};2|{20,NULL};3|{}");
+    try sameState(&.{correlated});
+}
+
+fn policyDiscovery() !void {
+    reset();
+    try run("CREATE TABLE tooling(id INT PRIMARY KEY, label TEXT)");
+    try run("CREATE ROLE tool_reader");
+    try run("CREATE POLICY active ON tooling FOR SELECT TO tool_reader USING (id > 0)");
+    try run("CREATE POLICY open_write ON tooling FOR INSERT WITH CHECK (id > 1)");
+    const policies = "SELECT pol.polname, pol.polpermissive," ++
+        " CASE WHEN pol.polroles = '{0}' THEN NULL ELSE pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles where oid = any (pol.polroles) order by 1),',') END," ++
+        " pg_catalog.pg_get_expr(pol.polqual, pol.polrelid), pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid)," ++
+        " CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT' WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE' END AS cmd" ++
+        " FROM pg_catalog.pg_policy pol WHERE pol.polrelid = '16384' ORDER BY 1";
+    try expect(policies, "active|t|tool_reader|(id > 0)|NULL|SELECT;open_write|t|NULL|NULL|(id > 1)|INSERT");
+    try sameState(&.{policies});
+}
+
+fn namespaceAliases() !void {
+    reset();
+    try run("CREATE SCHEMA \"MiX\"\"ed\"");
+    const lookup = "SELECT pg_catalog.to_regnamespace('  \"MiX\"\"ed\"  ')::text, pg_catalog.to_regnamespace('PG_CATALOG')::oid, pg_catalog.to_regnamespace('missing') IS NULL";
+    try expect(lookup, "\"MiX\"\"ed\"|11|t");
+    const identity = "SELECT ns.oid::pg_catalog.regnamespace::pg_catalog.text, pg_typeof(ns.oid::regnamespace)::text FROM pg_namespace ns WHERE nspname='MiX\"ed'";
+    try expect(identity, "\"MiX\"\"ed\"|regnamespace");
+    try expect("SELECT '2200'::regnamespace::text, '99999'::regnamespace::text, '-'::regnamespace::text", "public|99999|-");
+    try rejects("SELECT 'missing'::regnamespace", error.UndefinedSchema, lookup, "\"MiX\"\"ed\"|11|t");
+    try rejects("SELECT 'public.pg_catalog'::regnamespace", error.InvalidName, identity, "\"MiX\"\"ed\"|regnamespace");
+    try sameState(&.{ lookup, identity });
+    try run("DROP SCHEMA \"MiX\"\"ed\"");
+    try expect("SELECT to_regnamespace('\"MiX\"\"ed\"') IS NULL", "t");
+}
+
+fn statisticsDefinitions() !void {
+    reset();
+    try run("CREATE SCHEMA handoff");
+    try run("CREATE TABLE stats_tbl (lead INT, a INT, \"B Col\" INT, c INT)");
+    const discovery = "SELECT stxnamespace::pg_catalog.regnamespace::pg_catalog.text AS nsp, stxname," ++
+        " pg_catalog.pg_get_statisticsobjdef_columns(oid) AS columns, 'd' = any(stxkind) AS ndist_enabled," ++
+        " 'f' = any(stxkind) AS deps_enabled, 'm' = any(stxkind) AS mcv_enabled, stxstattarget" ++
+        " FROM pg_catalog.pg_statistic_ext WHERE stxrelid = 'stats_tbl'::regclass ORDER BY nsp, stxname";
+    try expect(discovery, "");
+    try check((try replicate("CREATE STATISTICS s (mcv,ndistinct) ON \"B Col\", a FROM stats_tbl")).command == .create_statistics);
+    try run("CREATE STATISTICS handoff.s ON c, \"B Col\" FROM stats_tbl");
+    try check((try replicate("ALTER STATISTICS handoff.s SET STATISTICS 300")).command == .alter_statistics);
+    const original = "handoff|s|\"B Col\", c|t|t|t|300;public|s|a, \"B Col\"|t|f|t|NULL";
+    try expect(discovery, original);
+    const ordinal = "SELECT stxnamespace::regnamespace::text, stxkeys, stxkind::text FROM pg_statistic_ext ORDER BY 1";
+    try expect(ordinal, "handoff|3 4|{d,f,m};public|2 3|{d,m}");
+    try sameState(&.{ discovery, ordinal });
+    try run("CREATE STATISTICS IF NOT EXISTS s ON a,c FROM stats_tbl");
+    try rejects("CREATE STATISTICS s ON a,c FROM stats_tbl", error.DuplicateObject, discovery, original);
+    try rejects("CREATE STATISTICS dup ON a,a FROM stats_tbl", error.DuplicateColumn, discovery, original);
+    try rejects("CREATE STATISTICS single ON a FROM stats_tbl", error.InvalidObjectDefinition, discovery, original);
+    try rejects("CREATE STATISTICS wrong ON absent,c FROM stats_tbl", error.ColumnNotFound, discovery, original);
+    try rejects("CREATE STATISTICS expr ON (a + 1), c FROM stats_tbl", error.UnsupportedStatement, discovery, original);
+    try rejects("ALTER STATISTICS s SET STATISTICS -2", error.InvalidParameterValue, discovery, original);
+    try rejects("DROP SCHEMA handoff RESTRICT", error.DependentObjects, discovery, original);
+    try rejects("DROP STATISTICS s, no_such_stats", error.UndefinedObject, discovery, original);
+
+    const slot = try db.begin();
+    try statement(slot, "DROP STATISTICS s, handoff.s");
+    db.abort(slot);
+    try expect(discovery, original);
+    try run("ALTER STATISTICS s SET STATISTICS 10001");
+    try run("ALTER TABLE stats_tbl RENAME COLUMN \"B Col\" TO renamed");
+    try run("ALTER TABLE stats_tbl DROP COLUMN lead");
+    try expect(discovery, "handoff|s|renamed, c|t|t|t|300;public|s|a, renamed|t|f|t|10000");
+    try sameState(&.{discovery});
+    try run("ALTER TABLE stats_tbl DROP COLUMN a");
+    try expect(discovery, "handoff|s|renamed, c|t|t|t|300");
+    try expect("SELECT pg_get_statisticsobjdef_columns(0) IS NULL", "t");
+    try sameState(&.{discovery});
+    try run("DROP SCHEMA handoff CASCADE");
+    try expect(discovery, "");
+    try run("CREATE STATISTICS s ON renamed,c FROM stats_tbl");
+    try check((try replicate("DROP STATISTICS IF EXISTS s, nonexistent")).command == .drop_statistics);
+    try run("CREATE STATISTICS s ON renamed,c FROM stats_tbl");
+    try run("DROP TABLE stats_tbl");
+    const empty = "SELECT stxname FROM pg_statistic_ext";
+    try expect(empty, "");
+    try sameState(&.{empty});
+}
+
+fn publicationMembership() !void {
+    reset();
+    try run("CREATE SCHEMA archive");
+    try run("CREATE TABLE a(id INT PRIMARY KEY)");
+    try run("CREATE TABLE b(child_value INT) INHERITS(a)");
+    try run("CREATE TABLE archive.t(id INT)");
+    try run("CREATE VIEW av AS SELECT * FROM a");
+    try run("CREATE PUBLICATION mixed FOR TABLE ONLY a,b, TABLES IN SCHEMA archive");
+    try run("CREATE PUBLICATION inherited FOR TABLE a");
+    try run("CREATE PUBLICATION duplicate FOR TABLE a,a");
+    try run("CREATE PUBLICATION one_table FOR TABLE ONLY a");
+    try run("CREATE PUBLICATION all_pub FOR ALL TABLES");
+    const table_members = "SELECT pubname, prrelid::regclass::text, prqual, prattrs::text FROM pg_publication" ++
+        " JOIN pg_publication_rel ON prpubid=pg_publication.oid ORDER BY 1,2";
+    const schema_members = "SELECT pubname, pnnspid::regnamespace::text FROM pg_publication" ++
+        " JOIN pg_publication_namespace ON pnpubid=pg_publication.oid ORDER BY 1,2";
+    const populated = "duplicate|a|NULL|NULL;duplicate|b|NULL|NULL;inherited|a|NULL|NULL;inherited|b|NULL|NULL;" ++
+        "mixed|a|NULL|NULL;mixed|b|NULL|NULL;one_table|a|NULL|NULL";
+    try expect(table_members, populated);
+    try expect(schema_members, "mixed|archive");
+    const publishability = "SELECT pg_relation_is_publishable('a'::regclass), pg_relation_is_publishable('av'::regclass)," ++
+        " pg_relation_is_publishable(1259), pg_relation_is_publishable(0)";
+    try expect(publishability, "t|f|f|NULL");
+    try sameState(&.{ table_members, schema_members, publishability });
+    try rejects("CREATE PUBLICATION missing FOR TABLE a,nonexistent", error.TableNotFound, table_members, populated);
+    try rejects("CREATE PUBLICATION dv FOR TABLE av", error.InvalidParameterValue, table_members, populated);
+    try rejects("CREATE PUBLICATION invalid FOR TABLES IN SCHEMA pg_catalog", error.InvalidParameterValue, schema_members, "mixed|archive");
+    try rejects("CREATE PUBLICATION missing FOR TABLES IN SCHEMA missing", error.UndefinedSchema, schema_members, "mixed|archive");
+    try rejects("CREATE PUBLICATION attributes FOR TABLE a(id)", error.UnsupportedStatement, table_members, populated);
+    const slot = try db.begin();
+    try statement(slot, "DROP PUBLICATION mixed");
+    db.abort(slot);
+    try expect(table_members, populated);
+    try expect(schema_members, "mixed|archive");
+
+    try run("DROP SCHEMA archive CASCADE");
+    try expect(schema_members, "");
+    try run("DROP VIEW av");
+    try run("DROP TABLE b");
+    try expect(table_members, "duplicate|a|NULL|NULL;inherited|a|NULL|NULL;mixed|a|NULL|NULL;one_table|a|NULL|NULL");
+    try run("DROP PUBLICATION mixed, inherited");
+    try expect(table_members, "duplicate|a|NULL|NULL;one_table|a|NULL|NULL");
+    try sameState(&.{ table_members, schema_members });
+}
+
+fn partitionDefinitions() !void {
+    reset();
+    try run("CREATE TABLE r(x INT) PARTITION BY RANGE(x)");
+    try run("CREATE TABLE r1 PARTITION OF r FOR VALUES FROM (MINVALUE) TO (-5)");
+    try run("CREATE TABLE r2 PARTITION OF r FOR VALUES FROM (-5) TO (MAXVALUE)");
+    try run("CREATE TABLE d(x DATE) PARTITION BY RANGE(x)");
+    try run("CREATE TABLE d1 PARTITION OF d FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')");
+    try run("CREATE TABLE dd PARTITION OF d DEFAULT");
+    try run("CREATE TABLE l(\"select\" TEXT) PARTITION BY LIST(\"select\")");
+    try run("CREATE TABLE l1 PARTITION OF l FOR VALUES IN ('z''o','z\\z')");
+    const definitions = "SELECT relname, pg_catalog.pg_get_expr(relpartbound,oid), pg_catalog.pg_get_partkeydef(oid) FROM pg_class ORDER BY 1";
+    try expect(definitions, "d|NULL|RANGE (x);d1|FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')|NULL;" ++
+        "dd|DEFAULT|NULL;l|NULL|LIST (\"select\");l1|FOR VALUES IN ('z''o', 'z\\z')|NULL;" ++
+        "r|NULL|RANGE (x);r1|FOR VALUES FROM (MINVALUE) TO ('-5')|NULL;r2|FOR VALUES FROM ('-5') TO (MAXVALUE)|NULL");
+    const children = "SELECT c.oid::pg_catalog.regclass::pg_catalog.text, c.relkind, inhdetachpending, pg_catalog.pg_get_expr(c.relpartbound,c.oid)" ++
+        " FROM pg_catalog.pg_class c, pg_catalog.pg_inherits i WHERE c.oid=i.inhrelid AND i.inhparent='d'::regclass" ++
+        " ORDER BY pg_catalog.pg_get_expr(c.relpartbound,c.oid) = 'DEFAULT', c.oid::pg_catalog.regclass::pg_catalog.text";
+    try expect(children, "d1|r|f|FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');dd|r|f|DEFAULT");
+    try sameState(&.{ definitions, children });
+    try run("ALTER TABLE d1 RENAME TO \"Date Segment\"");
+    const renamed = "SELECT pg_get_expr(relpartbound,oid) FROM pg_class WHERE relname='Date Segment'";
+    try expect(renamed, "FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')");
+    try sameState(&.{ renamed, children });
+}
+
+fn qualifiedCatalogCasts() !void {
+    reset();
+    try expect("SELECT NULL::pg_catalog.int2[] IS NULL, pg_typeof(CAST(ARRAY[1,2] AS pg_catalog.int2[]))::text", "t|smallint[]");
+    try expect("SELECT '{1,2}'::pg_catalog.\"_int2\"::text, 42::pg_catalog.int4", "{1,2}|42");
+    try expect("SELECT s FROM pg_catalog.generate_series(0,pg_catalog.array_upper(ARRAY[8,2]::pg_catalog.int2[],1)) s ORDER BY s", "0;1;2");
+    try rejects("SELECT 1::pg_catalog.integer", error.UndefinedObject, "SELECT 1::pg_catalog.int4", "1");
+    try rejects("SELECT 1::pg_catalog.\"Int4\"", error.UndefinedObject, "SELECT 1::pg_catalog.int4", "1");
+}
+
+fn regclassIdentities() !void {
+    reset();
+    try run("CREATE SCHEMA \"A.B\"");
+    try run("CREATE TABLE \"A.B\".\"X\"\"Y\"(id INT PRIMARY KEY)");
+    try run("CREATE INDEX \"IX Dots\" ON \"A.B\".\"X\"\"Y\"(id)");
+    try run("CREATE TABLE public.\"pg_class\"(id INT)");
+    const resolution = "SELECT to_regclass('pg_class')::oid, to_regclass('PG_CATALOG . pg_class')::text, " ++
+        "to_regclass(' public . pg_class ')::text, to_regclass('missing')::text, '-'::regclass::text";
+    try expect(resolution, "1259|pg_class|public.pg_class|NULL|-");
+    const names = "SELECT to_regclass('\"A.B\".\"X\"\"Y\"')::text, to_regclass('\"A.B\".\"IX Dots\"')::text, " ++
+        "to_regclass('\"A.B\".\"X\"\"Y_pkey\"')::text";
+    try expect(names, "\"A.B\".\"X\"\"Y\"|\"A.B\".\"IX Dots\"|\"A.B\".\"X\"\"Y_pkey\"");
+    try expect("SELECT to_regclass('') IS NULL, to_regclass('pg_class other') IS NULL, to_regclass('pg_catalog.missing') IS NULL", "t|t|t");
+    try expect("SELECT pg_table_is_visible('pg_class'::regclass), pg_table_is_visible('public.pg_class'::regclass), pg_relation_is_publishable('pg_class'::regclass)", "t|f|f");
+    try rejects("SELECT ' 1259 '::regclass::text", error.TableNotFound, resolution, "1259|pg_class|public.pg_class|NULL|-");
+    try rejects("SELECT to_regclass('pg_catalog.pg_class.foo')", error.UnsupportedStatement, resolution, "1259|pg_class|public.pg_class|NULL|-");
+    try sameState(&.{ resolution, names });
+}
+
+fn emptySearchPath() !void {
+    reset();
+    try run("CREATE TABLE base_path(id INT PRIMARY KEY)");
+    try run("INSERT INTO base_path VALUES (1)");
+    try run("CREATE VIEW stored_path AS SELECT id FROM base_path");
+    try run("CREATE SEQUENCE seq_path");
+    const public_source = "SELECT id FROM public.stored_path ORDER BY id";
+    const scope = "SELECT current_setting('search_path'), current_schema()::text, to_regclass('base_path') IS NULL, to_regclass('pg_class')::oid";
+    try expect(scope, "\"$user\", public|public|f|1259");
+    try expect("SELECT pg_catalog.set_config('search_path','',false)", "");
+    try expect(scope, "|NULL|t|1259");
+    try expect(public_source, "1");
+    try expect("SELECT pg_table_is_visible('public.base_path'::regclass), 'public.base_path'::regclass::text", "f|public.base_path");
+    try expect("WITH mock AS (SELECT 7 AS id) SELECT id FROM mock", "7");
+    try expect("SELECT nextval('public.seq_path')", "1");
+    try expect("SELECT relname FROM pg_class WHERE relname='base_path'", "base_path");
+    try rejects("SELECT id FROM base_path", error.TableNotFound, public_source, "1");
+    try rejects("INSERT INTO base_path VALUES (3)", error.TableNotFound, public_source, "1");
+    try rejects("CREATE TABLE missing_schema(id INT)", error.UndefinedSchema, public_source, "1");
+    try rejects("SELECT nextval('seq_path')", error.TableNotFound, public_source, "1");
+    try run("INSERT INTO public.base_path VALUES (2)");
+    try expect(public_source, "1;2");
+    try expect("SELECT pg_catalog.set_config('search_path','public',false)", "public");
+    try expect("SELECT id FROM base_path ORDER BY id", "1;2");
+    const slot = try db.begin();
+    try statement(slot, "SET LOCAL search_path TO ''");
+    var inner: DB.Result = .{};
+    try db.statement(slot, scope, &inner, .{});
+    try same(try render(&inner), "\"\"|NULL|t|1259");
+    db.abort(slot);
+    try expect(scope, "public|public|f|1259");
+    try expect("RESET search_path", "");
+    try expect(scope, "\"$user\", public|public|f|1259");
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1283,5 +1578,17 @@ pub fn main() !void {
     try exclusionConstraints();
     try advancedIndexes();
     try virtualColumns();
+    try indexDefinitionCatalog();
+    try constraintDefinitionCatalog();
+    try partitionAncestorCatalog();
+    try arraySubqueries();
+    try policyDiscovery();
+    try namespaceAliases();
+    try statisticsDefinitions();
+    try publicationMembership();
+    try partitionDefinitions();
+    try qualifiedCatalogCasts();
+    try regclassIdentities();
+    try emptySearchPath();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

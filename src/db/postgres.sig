@@ -72,6 +72,8 @@ pub fn parseCancel(input: []const u8) ?Cancel {
 /// store: `consumed` then covers the input through that row (written = 0);
 /// keep the rest buffered and call handle() again on wake (with or without
 /// new input) - the parked row is re-checked before anything is read.
+/// A simple Query batch can write one result with `consumed = 0`. Keep the
+/// identical input frame at the head of the buffer for the next call.
 /// `cancel`: the connection carried a CancelRequest (close it afterwards).
 pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false, blocked: bool = false, cancel: ?Cancel = null };
 
@@ -106,6 +108,16 @@ fn trim(s: []const u8) []const u8 {
     while (b > a and (s[b - 1] == ' ' or s[b - 1] == '\n' or s[b - 1] == '\r' or s[b - 1] == '\t' or s[b - 1] == ';')) : (b -= 1) {}
     return s[a..b];
 }
+
+fn needsQueryScan(source: []const u8) bool {
+    const text = std.mem.trim(u8, source, " \t\r\n\x0b\x0c");
+    if (text.len == 0) return false;
+    if (std.mem.startsWith(u8, text, "--") or std.mem.startsWith(u8, text, "/*")) return true;
+    // A single terminal semicolon is already handled by the ordinary parser.
+    const end = if (text[text.len - 1] == ';') text.len - 1 else text.len;
+    return std.mem.indexOfScalar(u8, text[0..end], ';') != null;
+}
+
 fn read32(s: []const u8) u32 {
     return (@as(u32, s[0]) << 24) | (@as(u32, s[1]) << 16) | (@as(u32, s[2]) << 8) | s[3];
 }
@@ -265,6 +277,7 @@ pub fn Session(comptime DB: type) type {
 pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool) type {
     const T = pg_types.Types(DB.Result);
     const has_copy = @hasDecl(DB, "copyBegin");
+    const has_simple_batch = @hasDecl(DB, "simple_query_batches") and DB.simple_query_batches;
     const detects_admission = @hasDecl(DB, "admitPostgresStartup");
     const has_admission = detects_admission or external_admission;
     const has_primary_key = @hasDecl(DB, "executeDetachedPrimaryKey") and
@@ -285,6 +298,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// CopyFail after an error, as PostgreSQL does.
         const CopyState = struct {
             mode: enum { none, in, discard } = .none,
+            portal: ?usize = null,
             remaining: usize = 0,
             info: CopyInfo = .{},
             sql: [sql_capacity]u8 = undefined,
@@ -300,6 +314,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             eol: pg_copy.Eol = .unknown,
         };
         const Fed = struct { used: usize = 0, blocked: bool = false };
+
+        const SimpleBatch = struct {
+            position: usize = 0,
+            remaining: usize = 0,
+            source_length: usize = 0,
+        };
 
         fn valueSession(db: *DB) *const T.Session {
             if (@hasDecl(DB, "valueSession")) return db.valueSession();
@@ -402,6 +422,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         startup: bool = false,
         failed: bool = false,
+        waiting_for_command: bool = false,
         oversize_remaining: usize = 0,
         oversize_tag: u8 = 0,
         authentication: ?scram.Server = null,
@@ -416,6 +437,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         backend_pid: u32 = 1,
         backend_secret: u32 = 0,
         copy: CopyState = .{},
+        simple_batch: SimpleBatch = .{},
 
         /// Copy a verifier and a fresh CSPRNG nonce before any startup bytes.
         /// Every accepted connection needs its own unpredictable nonce; the
@@ -466,6 +488,23 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return responseCapacityFor(self.result.rows.len);
         }
 
+        /// A ReadyForQuery boundary in an open block can arm the reactor's
+        /// monotonic idle timer. A partial command leaves the state intact.
+        pub fn idleTransactionTimeout(self: *const Self, db: *const DB) u32 {
+            if (comptime @hasDecl(DB, "idleTransactionTimeout")) {
+                if (self.waiting_for_command) return db.idleTransactionTimeout();
+            }
+            return 0;
+        }
+
+        pub fn waitingForCopyInput(self: *const Self) bool {
+            return self.copy.mode == .in;
+        }
+
+        pub fn continuingSimpleQuery(self: *const Self) bool {
+            return self.simple_batch.remaining != 0;
+        }
+
         pub const DetachedCandidate=union(enum) {metadata,describe:[]const u8,execute:[]const u8};
         /// A scheduling proposal, never authorization to execute arbitrary SQL
         /// under a read lock. The caller must bind execute/describe sources in
@@ -473,7 +512,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// Session ownership, database immutability, private Describe support,
         /// idle autocommit state and output capacity remain caller obligations.
         fn detachedReady(self: *const Self) bool {
-            return self.startup and !self.failed and self.copy.mode==.none and self.active_portal==null and
+            return self.startup and !self.failed and !self.continuingSimpleQuery() and self.copy.mode==.none and self.active_portal==null and
                 self.oversize_remaining==0 and (self.authentication==null or self.authentication.?.state==.complete);
         }
         pub fn detachedCandidate(self:*Self,input:[]const u8) ?DetachedCandidate {
@@ -533,6 +572,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     if(frame.limit!=0) return null; // suspended portals retain their owner
                     const portal_value=frame.portal;
                     if(portal_value.complete) return .metadata;
+                    if (comptime @hasDecl(DB, "finishExtended")) {
+                        // A detached read can finish without opening a store
+                        // transaction only once its Sync boundary is known.
+                        const following = input[@as(usize, size) + 1..];
+                        if (following.len < 5 or following[0] != 'S' or read32(following[1..5]) != 4) return null;
+                    }
                     return .{.execute=portal_value.source()};
                 },
                 else=>return null,
@@ -546,7 +591,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             var writer: Writer = .{ .bytes = output };
             try failure(&writer, "54000", "SQL message exceeds the configured packet capacity");
             if (@hasDecl(DB, "failTransaction")) db.failTransaction();
-            if (self.oversize_tag == 'Q') try self.ready(db, &writer) else self.failed = true;
+            if (self.oversize_tag == 'Q') {
+                if (comptime @hasDecl(DB, "abortExtended")) db.abortExtended();
+                try self.ready(db, &writer);
+            } else self.failed = true;
             return .{ .consumed = prefix + consumed, .written = writer.at };
         }
 
@@ -562,6 +610,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const size = read32(input[prefix..][0..4]);
             var w: Writer = .{ .bytes = output };
             if (size < 4 or size > max_packet) {
+                self.waiting_for_command = false;
                 // Drain a bounded oversized SQL frame without retaining it.
                 // A valid query that exceeds our budget gets a SQL error and
                 // remains synchronized, rather than an unread-body TCP reset.
@@ -576,6 +625,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             const total: usize = @as(usize, size) + prefix;
             if (input.len < total) return .{};
+            self.waiting_for_command = false;
             var close = false;
             if (self.authentication != null and self.authentication.?.state != .complete) {
                 close = self.authenticate(db, input[0], input[5..total], &w) catch blk: {
@@ -591,14 +641,28 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     const any: anyerror = err;
                     // Parked statement: nothing consumed or written.
                     if (any == error.WouldBlock) return .{ .blocked = true };
+                    if (any == error.TransactionTimeout) {
+                        try self.terminateTransaction(db, &w);
+                        return .{ .consumed = total, .written = w.at, .close = true };
+                    }
                     w.at = 0;
-                    try failure(&w, sqlstate(err), @errorName(err));
+                    try writeNotice(db, &w);
+                    try failure(&w, sqlstate(err), diagnosticMessage(err));
+                    if (comptime has_simple_batch) if (tag == 'Q' and self.continuingSimpleQuery()) {
+                        self.simple_batch = .{};
+                        db.finishSimpleQueryBatch(false) catch return error.BufferTooSmall;
+                    };
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
-                    if (tag == 'Q') try self.ready(db, &w) else self.failed = true;
+                    if (tag == 'Q' or tag == 'S') {
+                        if (comptime @hasDecl(DB, "abortExtended")) db.abortExtended();
+                        self.failed = false;
+                        self.closeIdlePortals(db);
+                        try self.ready(db, &w);
+                    } else self.failed = true;
                     break :blk false;
                 };
             }
-            return .{ .consumed = total, .written = w.at, .close = close };
+            return .{ .consumed = if (self.continuingSimpleQuery()) 0 else total, .written = w.at, .close = close };
         }
 
         fn handleStartup(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
@@ -780,7 +844,6 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
         }
         fn ready(self: *Self, db: *DB, w: *Writer) !void {
-            _ = self;
             // Committed notifications for this session (between transactions,
             // as PostgreSQL's ProcessCompletedNotifies), then changed reported
             // settings, before ReadyForQuery.
@@ -789,6 +852,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const p = try w.begin('Z');
             try w.byte(if (@hasDecl(DB, "transactionStatus")) db.transactionStatus() else 'I');
             w.end(p);
+            self.waiting_for_command = true;
         }
         /// NotificationResponse ('A'): sender pid, channel, payload.
         fn writeNotifications(db: *DB, w: *Writer) !void {
@@ -803,6 +867,14 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
         }
 
+        fn writeNotice(db: *DB, w: *Writer) !void {
+            if (comptime @hasDecl(DB, "takeNotice")) {
+                if (db.takeNotice()) |notice| {
+                    try diagnostic(w, 'N', notice.level.label(), notice.state, notice.message);
+                }
+            }
+        }
+
         /// Notifications committed while the client is idle (PostgreSQL
         /// sends them asynchronously): call when the connection has no
         /// pending input. Returns the bytes written.
@@ -814,22 +886,87 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return w.at;
         }
 
+        fn beginSimpleFrame(self: *Self, source: []const u8) !void {
+            if (self.active_portal != null and !word(source, "commit") and !word(source, "rollback") and !word(source, "end") and !word(source, "abort")) return error.PortalBusy;
+            self.active_portal = null;
+            for (&self.statements) |*s| if (s.name.len == 0) {
+                s.live = false;
+            };
+            for (&self.portals) |*p| if (p.name.len == 0) {
+                p.live = false;
+            };
+        }
+
+        fn beginSimpleBatch(self: *Self, db: *DB, source: []const u8) !void {
+            const count = try db.preflightSimpleQueryBatch(source);
+            var boundaries: sql.PostgresStatements = .{ .source = source };
+            while (try boundaries.next()) |span| {
+                const command_source = span.slice(source);
+                var tokens: sql.Tokenizer = .{ .source = command_source, .text_limit = command_source.len };
+                const token = try tokens.next();
+                // COPY FROM takes over the input stream. Its tail must be
+                // handed off to the COPY state before permitting it in a batch.
+                if (token.kind == .word and keyword(token.raw(command_source), "copy")) return error.UnsupportedStatement;
+            }
+            try db.beginSimpleQueryBatch();
+            self.simple_batch = .{ .remaining = count, .source_length = source.len };
+        }
+
+        fn simpleResult(self: *Self, db: *DB, w: *Writer) !void {
+            try writeNotice(db, w);
+            if (self.result.column_count == 0) return;
+            try self.description(w, null);
+            try self.rows(db, w, null, 0, self.result.row_count);
+        }
+
+        /// Produce one complete command's responses using the same result and
+        /// output capacities as a single query. Advance only after execution;
+        /// parked statements are redelivered without rerunning prior commands.
+        fn simpleBatchStep(self: *Self, db: *DB, source: []const u8, w: *Writer) !void {
+            if (source.len != self.simple_batch.source_length) return error.ProtocolViolation;
+            var boundaries: sql.PostgresStatements = .{ .source = source, .position = self.simple_batch.position };
+            const span = (try boundaries.next()) orelse return error.ProtocolViolation;
+            const command_source = span.slice(source);
+            try db.beginSimpleQueryStep();
+            try DB.checkSimpleQueryUtility(command_source);
+            try self.execute(db, command_source);
+            try self.simpleResult(db, w);
+            const final = self.simple_batch.remaining == 1;
+            if (final) try db.finishSimpleQueryBatch(true);
+            try self.command(w, command_source);
+            self.simple_batch.position = boundaries.position;
+            self.simple_batch.remaining -= 1;
+            if (final) {
+                self.simple_batch = .{};
+                self.closeIdlePortals(db);
+                try self.ready(db, w);
+            }
+        }
+
         fn dispatch(self: *Self, db: *DB, tag: u8, body: []const u8, w: *Writer) !bool {
             var r: Reader = .{ .bytes = body };
             switch (tag) {
                 'Q' => {
-                    const source = try r.string();
+                    var source = try r.string();
                     try r.done();
-                    if (self.active_portal != null and !word(source, "commit") and !word(source, "rollback") and !word(source, "end") and !word(source, "abort")) return error.PortalBusy;
-                    self.active_portal = null;
-                    for (&self.statements) |*s| if (s.name.len == 0) {
-                        s.live = false;
+                    if (comptime has_simple_batch) if (self.continuingSimpleQuery()) {
+                        try self.simpleBatchStep(db, source, w);
+                        return false;
                     };
-                    for (&self.portals) |*p| if (p.name.len == 0) {
-                        p.live = false;
+                    try self.beginSimpleFrame(source);
+                    if (comptime has_simple_batch) if (db.simpleQueryBatchAvailable() and needsQueryScan(source)) {
+                        var boundaries: sql.PostgresStatements = .{ .source = source };
+                        if (try boundaries.next()) |first| {
+                            if (try boundaries.next() != null) {
+                                try self.beginSimpleBatch(db, source);
+                                try self.simpleBatchStep(db, source, w);
+                                return false;
+                            }
+                            source = first.slice(source);
+                        } else source = "";
                     };
                     if (trim(source).len == 0) try w.empty('I') else if (has_copy and word(source, "copy")) {
-                        try self.startCopy(db, source, w);
+                        try self.startCopy(db, source, w, null);
                         // COPY FROM: ReadyForQuery follows CopyDone/CopyFail.
                         if (self.copy.mode == .in) return false;
                     } else if (try self.clusterCommand(db, source)) |command_tag| {
@@ -838,10 +975,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         w.end(completion);
                     } else {
                         try self.execute(db, source);
-                        if (self.result.column_count != 0) {
-                            try self.description(w, null);
-                            try self.rows(db, w, null, 0, self.result.row_count);
-                        }
+                        try self.simpleResult(db, w);
                         try self.command(w, source);
                     }
                     try self.ready(db, w);
@@ -892,11 +1026,19 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         if (active != index) return error.PortalBusy;
                     }
                     if (p.complete) {
-                        try commandFor(w, p.source(), p.command, p.result_rows, p.affected, p.rolled_back);
+                        if (equal(p.command, "COPY")) {
+                            try copyCommand(w, p.affected);
+                        } else try commandFor(w, p.source(), p.command, p.result_rows, p.affected, p.rolled_back);
                         return false;
                     }
+                    if (comptime has_copy and @hasDecl(DB, "beginExtendedGroup")) if (word(p.source(), "copy")) {
+                        try db.beginExtendedGroup();
+                        try self.startCopy(db, p.source(), w, index);
+                        return false;
+                    };
                     if (self.active_portal == null) {
                         try self.executePortal(db, p, limit);
+                        try writeNotice(db, w);
                         self.active_portal = index;
                         p.row = 0;
                         p.result_rows = self.result.row_count;
@@ -933,10 +1075,11 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 'S' => {
                     try r.done();
                     self.failed = false;
-                    if (!@hasDecl(DB, "transactionStatus") or db.transactionStatus() == 'I') {
-                        for (&self.portals) |*p| p.live = false;
-                        self.active_portal = null;
-                    }
+                    if (comptime @hasDecl(DB, "finishExtended")) db.finishExtended() catch |err| {
+                        if (@as(anyerror, err) == error.TransactionTimeout) return err;
+                        try failure(w, sqlstate(err), @errorName(err));
+                    };
+                    self.closeIdlePortals(db);
                     try self.ready(db, w);
                 },
                 'H' => {
@@ -950,6 +1093,13 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             return false;
         }
+        fn closeIdlePortals(self: *Self, db: *DB) void {
+            if (!@hasDecl(DB, "transactionStatus") or db.transactionStatus() == 'I') {
+                for (&self.portals) |*p| p.live = false;
+                self.active_portal = null;
+            }
+        }
+
         fn executePortal(self: *Self, db: *DB, portal_value: *const Portal, limit: u32) !void {
             if (comptime has_primary_key) if (limit == 0) {
                 if (portal_value.primary_key) |*key| {
@@ -959,10 +1109,14 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     }
                 }
             };
-            return self.execute(db, portal_value.source());
+            return self.executeMode(db, portal_value.source(), true);
         }
 
         fn execute(self: *Self, db: *DB, source: []const u8) !void {
+            return self.executeMode(db, source, false);
+        }
+
+        fn executeMode(self: *Self, db: *DB, source: []const u8, extended: bool) !void {
             self.result.column_count = 0;
             self.result.row_count = 0;
             self.result.affected_rows = 0;
@@ -972,12 +1126,18 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const command_source = trim(source);
             if (keyword(command_source, "begin") or keyword(command_source, "begin work") or keyword(command_source, "begin transaction") or keyword(command_source, "start transaction")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
-                if (@hasDecl(DB, "beginTransaction")) try db.beginTransaction() else return error.UnsupportedStatement;
+                if (comptime @hasDecl(DB, "sql_transaction_controls") and DB.sql_transaction_controls) {
+                    try db.execute(source, &self.result);
+                } else if (@hasDecl(DB, "beginTransaction")) try db.beginTransaction() else return error.UnsupportedStatement;
             } else if (keyword(command_source, "commit") or keyword(command_source, "commit work") or keyword(command_source, "commit transaction") or keyword(command_source, "end")) {
                 if (@hasDecl(DB, "transactionStatus")) self.commit_rolled_back = db.transactionStatus() == 'E';
-                if (@hasDecl(DB, "commitTransaction")) try db.commitTransaction() else return error.UnsupportedStatement;
+                if (comptime @hasDecl(DB, "sql_transaction_controls") and DB.sql_transaction_controls) {
+                    try db.execute(source, &self.result);
+                } else if (@hasDecl(DB, "commitTransaction")) try db.commitTransaction() else return error.UnsupportedStatement;
             } else if (keyword(command_source, "rollback") or keyword(command_source, "rollback work") or keyword(command_source, "rollback transaction") or keyword(command_source, "abort")) {
-                if (@hasDecl(DB, "rollbackTransaction")) try db.rollbackTransaction() else return error.UnsupportedStatement;
+                if (comptime @hasDecl(DB, "sql_transaction_controls") and DB.sql_transaction_controls) {
+                    try db.execute(source, &self.result);
+                } else if (@hasDecl(DB, "rollbackTransaction")) try db.rollbackTransaction() else return error.UnsupportedStatement;
             } else if (word(source, "deallocate")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
                 // Protocol-level statements first; SQL PREPARE names (and
@@ -988,7 +1148,9 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 };
                 if (forward and @hasDecl(DB, "takeNotification")) try db.execute(source, &self.result);
             } else {
-                try db.execute(source, &self.result);
+                if (extended and @hasDecl(DB, "executeExtended")) {
+                    try db.executeExtended(source, &self.result);
+                } else try db.execute(source, &self.result);
                 // ROLLBACK TO closes portals created after the savepoint.
                 if (@hasDecl(DB, "takeRollbackTo")) if (db.takeRollbackTo()) |depth| {
                     for (&self.portals, 0..) |*p, index| {
@@ -1031,18 +1193,21 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         /// COPY TO STDOUT runs its SELECT and streams CopyData; COPY FROM
         /// STDIN opens the store's COPY and sends CopyInResponse.
-        fn startCopy(self: *Self, db: *DB, source: []const u8, w: *Writer) !void {
+        fn startCopy(self: *Self, db: *DB, source: []const u8, w: *Writer, portal_index: ?usize) !void {
             var select: [sql_capacity + 1024]u8 = undefined;
             var info = try db.copyDescribe(source, &select);
             if (info.direction == .to) {
                 const query = select[0..info.select_len];
                 try self.resolveCopyQuoteColumns(db, query, &info);
                 try self.execute(db, query);
-                return self.copyOut(db, &info, w);
+                try self.copyOut(db, &info, w);
+                if (portal_index) |index| self.completeCopyPortal(index, self.result.row_count);
+                return;
             }
             if (source.len > sql_capacity) return error.StatementCapacity;
             const begun = try db.copyBegin(source);
             self.copy.mode = .in;
+            self.copy.portal = portal_index;
             self.copy.remaining = 0;
             self.copy.info = begun;
             @memcpy(self.copy.sql[0..source.len], source);
@@ -1133,11 +1298,22 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 w.end(p);
             }
             try w.empty('c');
+            try copyCommand(w, self.result.row_count);
+        }
+
+        fn copyCommand(w: *Writer, rows_copied: usize) error{BufferTooSmall}!void {
             const c = try w.begin('C');
             try w.append("COPY ");
-            try w.number(@intCast(self.result.row_count));
+            try w.number(@intCast(rows_copied));
             try w.byte(0);
             w.end(c);
+        }
+
+        fn completeCopyPortal(self: *Self, index: usize, rows_copied: usize) void {
+            const bound = &self.portals[index];
+            bound.complete = true;
+            bound.command = "COPY";
+            bound.affected = rows_copied;
         }
 
         fn copyHandle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
@@ -1147,14 +1323,14 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 if (db.copyBlocked()) {
                     db.copyResume() catch |err| {
                         if (err == error.WouldBlock) return .{ .blocked = true };
-                        try self.copyError(db, &w, err);
-                        return .{ .written = w.at };
+                        const close = try self.copyError(db, &w, err);
+                        return .{ .written = w.at, .close = close };
                     };
                 }
                 if (self.copy.carry_rows) {
                     const fed = self.copyRows(db, self.copy.carry[0..self.copy.carry_len]) catch |err| {
-                        try self.copyError(db, &w, err);
-                        return .{ .written = w.at };
+                        const close = try self.copyError(db, &w, err);
+                        return .{ .written = w.at, .close = close };
                     };
                     self.shiftCarry(fed.used);
                     if (fed.blocked) return .{ .blocked = true };
@@ -1185,31 +1361,45 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const total: usize = @as(usize, size) + 1;
             if (input.len < total) return .{};
             const discarding = self.copy.mode == .discard;
+            if (comptime @hasDecl(DB, "checkTransactionTimeout")) if (!discarding) {
+                db.checkTransactionTimeout() catch {
+                    try self.terminateTransaction(db, &w);
+                    return .{ .consumed = total, .written = w.at, .close = true };
+                };
+            };
             switch (tag) {
                 'c' => {
                     if (discarding) {
                         self.copy.mode = .none;
                         return .{ .consumed = total };
                     }
+                    var close = false;
                     self.copyFinish(db, &w) catch |err| {
                         if (err == error.WouldBlock) return .{ .blocked = true };
                         w.at = 0;
-                        try self.copyError(db, &w, err);
+                        close = try self.copyError(db, &w, err);
                         self.copy.mode = .none;
                     };
                     self.copy.mode = .none;
-                    return .{ .consumed = total, .written = w.at };
+                    return .{ .consumed = total, .written = w.at, .close = close };
                 },
                 'f' => {
                     self.copy.mode = .none;
                     if (discarding) return .{ .consumed = total };
                     db.copyFail();
                     try failure(&w, "57014", "COPY from stdin failed");
-                    try self.ready(db, &w);
+                    try self.copyErrorBoundary(db, &w);
                     return .{ .consumed = total, .written = w.at };
                 },
                 // Flush and Sync are ignored in copy-in mode.
-                'H', 'S' => return .{ .consumed = total },
+                'H' => return .{ .consumed = total },
+                'S' => {
+                    if (discarding and self.copy.portal != null) {
+                        self.copy.mode = .none;
+                        return self.handle(db, input, output);
+                    }
+                    return .{ .consumed = total };
+                },
                 else => {
                     if (discarding) {
                         self.copy.mode = .none;
@@ -1218,7 +1408,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     self.copy.mode = .none;
                     db.copyFail();
                     try failure(&w, "08P01", "unexpected message type during COPY from stdin");
-                    try self.ready(db, &w);
+                    try self.copyErrorBoundary(db, &w);
                     return .{ .consumed = total, .written = w.at };
                 },
             }
@@ -1235,8 +1425,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             const fed = self.copyFeed(db, input[offset..][0..n]) catch |err| {
                 self.copy.remaining -= n;
-                try self.copyError(db, w, err);
-                return .{ .consumed = offset + n, .written = w.at };
+                const close = try self.copyError(db, w, err);
+                return .{ .consumed = offset + n, .written = w.at, .close = close };
             };
             self.copy.remaining -= fed.used;
             return .{ .consumed = offset + fed.used, .blocked = fed.blocked };
@@ -1244,13 +1434,36 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         /// A terminal COPY error: roll back, report, then discard the rest
         /// of the copy stream.
-        fn copyError(self: *Self, db: *DB, w: *Writer, err: anyerror) error{BufferTooSmall}!void {
+        fn copyError(self: *Self, db: *DB, w: *Writer, err: anyerror) error{BufferTooSmall}!bool {
+            if (err == error.TransactionTimeout) {
+                try self.terminateTransaction(db, w);
+                return true;
+            }
             db.copyFail();
             try failure(w, sqlstate(err), @errorName(err));
-            try self.ready(db, w);
+            try self.copyErrorBoundary(db, w);
             self.copy.mode = .discard;
             self.copy.carry_len = 0;
             self.copy.carry_rows = false;
+            return false;
+        }
+
+        fn terminateTransaction(self: *Self, db: *DB, w: *Writer) error{BufferTooSmall}!void {
+            self.copy.mode = .none;
+            self.waiting_for_command = false;
+            if (comptime @hasDecl(DB, "terminateTimedOut")) db.terminateTimedOut();
+            w.at = 0;
+            try transactionTimeoutFatal(w);
+        }
+
+        fn copyErrorBoundary(self: *Self, db: *DB, w: *Writer) error{BufferTooSmall}!void {
+            if (self.copy.portal != null) {
+                self.failed = true;
+            } else {
+                if (comptime @hasDecl(DB, "abortExtended")) db.abortExtended();
+                self.closeIdlePortals(db);
+                try self.ready(db, w);
+            }
         }
 
         fn shiftCarry(self: *Self, used: usize) void {
@@ -1392,12 +1605,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             if (self.copy.binary_header) return error.BadCopyFormat;
             const copied = try db.copyEnd();
-            const c = try w.begin('C');
-            try w.append("COPY ");
-            try w.number(@intCast(copied));
-            try w.byte(0);
-            w.end(c);
-            try self.ready(db, w);
+            try copyCommand(w, copied);
+            if (self.copy.portal) |index| {
+                self.completeCopyPortal(index, copied);
+            } else try self.ready(db, w);
         }
 
 
@@ -1407,7 +1618,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const command_source = trim(source);
             if (word(command_source, "begin") or word(command_source, "commit") or word(command_source, "rollback") or
                 word(command_source, "end") or word(command_source, "abort") or word(command_source, "deallocate") or
-                word(command_source, "start")) return;
+                word(command_source, "start") or word(command_source, "copy")) return;
             try db.describe(source, &self.result);
         }
 
@@ -1761,6 +1972,9 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .drop_server => "DROP SERVER",
                 .create_publication => "CREATE PUBLICATION",
                 .drop_publication => "DROP PUBLICATION",
+                .create_statistics => "CREATE STATISTICS",
+                .alter_statistics => "ALTER STATISTICS",
+                .drop_statistics => "DROP STATISTICS",
                 .create_extension => "CREATE EXTENSION",
                 .create_domain => "CREATE DOMAIN",
                 .drop_domain => "DROP DOMAIN",
@@ -1911,11 +2125,15 @@ fn parameter(w: *Writer, key: []const u8, value: []const u8) !void {
     w.end(p);
 }
 fn failure(w: *Writer, state: []const u8, message: []const u8) !void {
-    const p = try w.begin('E');
+    return diagnostic(w, 'E', "ERROR", state, message);
+}
+
+fn diagnostic(w: *Writer, tag: u8, severity: []const u8, state: []const u8, message: []const u8) !void {
+    const p = try w.begin(tag);
     try w.byte('S');
-    try w.string("ERROR");
+    try w.string(severity);
     try w.byte('V');
-    try w.string("ERROR");
+    try w.string(severity);
     try w.byte('C');
     try w.string(state);
     try w.byte('M');
@@ -1938,27 +2156,43 @@ pub fn memoryLimitError(output: []u8) error{BufferTooSmall}!usize {
     return writer.at;
 }
 
+/// PostgreSQL terminates the session after sending this fatal response.
+pub fn idleTransactionTimeoutError(output: []u8) error{BufferTooSmall}!usize {
+    var writer: Writer = .{ .bytes = output };
+    try fatal(&writer, "25P03", "terminating connection due to idle-in-transaction timeout");
+    return writer.at;
+}
+
+pub fn transactionTimeoutError(output: []u8) error{BufferTooSmall}!usize {
+    var writer: Writer = .{ .bytes = output };
+    try transactionTimeoutFatal(&writer);
+    return writer.at;
+}
+
+fn transactionTimeoutFatal(writer: *Writer) error{BufferTooSmall}!void {
+    try fatal(writer, "25P04", "terminating connection due to transaction timeout");
+}
+
 fn fatal(w: *Writer, state: []const u8, message: []const u8) !void {
-    const p = try w.begin('E');
-    try w.byte('S');
-    try w.string("FATAL");
-    try w.byte('V');
-    try w.string("FATAL");
-    try w.byte('C');
-    try w.string(state);
-    try w.byte('M');
-    try w.string(message);
-    try w.byte(0);
-    w.end(p);
+    return diagnostic(w, 'E', "FATAL", state, message);
 }
 fn sqlstate(err: anyerror) []const u8 {
     return knownSqlstate(err) orelse "54000";
+}
+
+fn diagnosticMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.RestrictedNonSystemView => "access to non-system view is restricted",
+        error.RestrictedNonSystemForeignTable => "access to non-system foreign table is restricted",
+        else => @errorName(err),
+    };
 }
 
 /// SQLSTATE for every engine, store and protocol error this codec knows;
 /// null means the error would fall back to 54000 (program_limit_exceeded).
 pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     const name = @errorName(err);
+    if (equal(name, "TransactionTimeout")) return "25P04";
     if (equal(name, "DatabaseNotFound")) return "3D000";
     if (equal(name, "DuplicateDatabase")) return "42P04";
     if (equal(name, "InvalidDatabaseName")) return "42602";
@@ -2028,7 +2262,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "ExclusionViolation")) return "23P01";
     if (equal(name, "IndexCapacity")) return "54000";
     if (equal(name, "InvalidForeignKey")) return "42830";
-    if (equal(name, "ObjectNotInPrerequisiteState")) return "55000";
+    if (equal(name, "ObjectNotInPrerequisiteState") or equal(name, "RestrictedNonSystemView") or equal(name, "RestrictedNonSystemForeignTable")) return "55000";
     if (equal(name, "DuplicateObject")) return "42710";
     if (equal(name, "InvalidTableDefinition")) return "42P16";
     if (equal(name, "UndefinedSchema")) return "3F000";

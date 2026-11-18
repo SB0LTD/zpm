@@ -358,10 +358,15 @@ pub fn Eval(comptime config: types.Config) type {
 
         const null_cell: V.Cell = .null_value;
 
-        pub fn columnRef(ctx: *const Context, n: *const ast.Node) *const V.Cell {
+        inline fn columnOwner(ctx: *const Context, n: *const ast.Node) *const Context {
             var owner = ctx;
             var level = n.level;
             while (level != 0) : (level -= 1) owner = owner.outer.?;
+            return owner;
+        }
+
+        pub fn columnRef(ctx: *const Context, n: *const ast.Node) *const V.Cell {
+            const owner = columnOwner(ctx, n);
             if (owner.row) |row| if (n.relation == 0) return &row[n.column];
             const base = owner.tuple[n.relation] orelse return &null_cell;
             return &base[n.column];
@@ -469,12 +474,17 @@ pub fn Eval(comptime config: types.Config) type {
         fn catalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             switch (n.func) {
                 .current_database => return textCell(ctx.session.database),
-                .current_schema => return textCell("public"),
+                .current_schema => return if (ctx.session.public_schema_on_path) textCell("public") else .null_value,
                 else => {},
             }
             const first = try eval(ctx, n.b);
             if (first == .null_value) return .null_value;
             switch (n.func) {
+                .pg_table_is_visible => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const visible = hook.relation_visible orelse return error.UnsupportedStatement;
+                    return if (visible(hook.ptr, @intCast(first.integer))) |found| boolCell(found) else .null_value;
+                },
                 .to_regtype, .regtype_in => {
                     if (types.typeByName(first.text.slice())) |data_type| return .{ .integer = types.typeOid(data_type) };
                     if (n.func == .to_regtype) return .null_value;
@@ -486,24 +496,85 @@ pub fn Eval(comptime config: types.Config) type {
                     if (oid < 0) return .null_value;
                     return .{ .integer = oid };
                 },
+                .to_regnamespace, .regnamespace_in => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const lookup = hook.namespace_lookup orelse return error.UnsupportedStatement;
+                    const oid = try lookup(hook.ptr, first.text.slice(), n.func == .regnamespace_in) orelse return .null_value;
+                    return .{ .integer = oid };
+                },
                 .regtype_out => {
                     const data_type = if (first.integer >= 0 and first.integer <= 0xffffffff) types.typeFromOid(@intCast(first.integer)) else null;
                     if (data_type) |known| return textCell(types.sqlTypeName(known));
                     return digitsCell(first.integer);
                 },
                 .regclass_out => {
+                    if (first.integer == 0) return textCell("-");
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
-                    var buffer: [64]u8 = undefined;
                     if (first.integer >= 0 and first.integer <= 0xffffffff) {
-                        if (hook.relation_name(hook.ptr, @intCast(first.integer), &buffer)) |length| return textCell(buffer[0..length]);
+                        const oid: u32 = @intCast(first.integer);
+                        if (hook.relation_display_name) |display_name| {
+                            var buffer: [config.text_bytes]u8 = undefined;
+                            if (try display_name(hook.ptr, oid, &buffer)) |length| return textCell(buffer[0..length]);
+                        } else {
+                            var buffer: [64]u8 = undefined;
+                            if (hook.relation_name(hook.ptr, oid, &buffer)) |length| return textCell(buffer[0..length]);
+                        }
                     }
                     return digitsCell(first.integer);
+                },
+                .regnamespace_out => {
+                    if (first.integer == 0) return textCell("-");
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const name = hook.namespace_name orelse return error.UnsupportedStatement;
+                    var buffer: [config.text_bytes]u8 = undefined;
+                    const length = try name(hook.ptr, @intCast(first.integer), &buffer) orelse return digitsCell(first.integer);
+                    return textCell(buffer[0..length]);
                 },
                 .format_type => {
                     const second = try eval(ctx, ctx.pool.nodes[n.b].next);
                     return formatType(first.integer, if (second == .null_value) -1 else second.integer);
                 },
                 .pg_get_expr => return first,
+                .pg_get_indexdef => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const definition = hook.index_definition orelse return error.UnsupportedStatement;
+                    const second = node(ctx, n.b).next;
+                    var column: i32 = 0;
+                    var pretty = false;
+                    if (second != none) {
+                        const column_value = try eval(ctx, second);
+                        const pretty_value = try eval(ctx, node(ctx, second).next);
+                        if (column_value == .null_value or pretty_value == .null_value) return .null_value;
+                        column = @intCast(column_value.integer);
+                        pretty = pretty_value.boolean;
+                    }
+                    var buffer: [config.text_bytes]u8 = undefined;
+                    const length = try definition(hook.ptr, @intCast(first.integer), column, pretty, &buffer) orelse return .null_value;
+                    return textCell(buffer[0..length]);
+                },
+                .pg_get_constraintdef, .pg_get_triggerdef => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const definition = (if (n.func == .pg_get_triggerdef) hook.trigger_definition else hook.constraint_definition) orelse return error.UnsupportedStatement;
+                    const second = node(ctx, n.b).next;
+                    const pretty = if (second == none) V.Cell{ .boolean = false } else try eval(ctx, second);
+                    if (pretty == .null_value) return .null_value;
+                    var buffer: [config.text_bytes]u8 = undefined;
+                    const length = try definition(hook.ptr, @intCast(first.integer), pretty.boolean, &buffer) orelse return .null_value;
+                    return textCell(buffer[0..length]);
+                },
+                .pg_get_statisticsobjdef_columns, .pg_get_partkeydef => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const render = if (n.func == .pg_get_partkeydef) hook.partition_key_definition else hook.statistics_columns;
+                    const definition = render orelse return error.UnsupportedStatement;
+                    var buffer: [config.text_bytes]u8 = undefined;
+                    const length = try definition(hook.ptr, @intCast(first.integer), &buffer) orelse return .null_value;
+                    return textCell(buffer[0..length]);
+                },
+                .pg_relation_is_publishable => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const publishable = hook.relation_publishable orelse return error.UnsupportedStatement;
+                    return .{ .boolean = publishable(hook.ptr, @intCast(first.integer)) orelse return .null_value };
+                },
                 else => unreachable,
             }
         }
@@ -633,6 +704,10 @@ pub fn Eval(comptime config: types.Config) type {
             }
             var out: V.Text = .{};
             switch (n.func) {
+                .pg_is_in_recovery => {
+                    const reply = try hook.call(hook.ptr, .recovery_status, "", "", 0, 0, 0, &out.bytes);
+                    return .{ .boolean = reply.integer != 0 };
+                },
                 .pg_backend_pid => {
                     const reply = try hook.call(hook.ptr, .backend_pid, "", "", 0, 0, 0, &out.bytes);
                     return .{ .integer = reply.integer };
@@ -1022,6 +1097,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return if (n.ty == .numeric or n.ty == .unknown) number else Io.cast(number, .numeric, n.ty, -1, ctx.session);
                 },
                 .column => return columnRef(ctx, n).*,
+                .catalog_tableoid => return if (columnOwner(ctx, n).tuple[n.relation] != null) .{ .integer = n.integer } else .null_value,
                 .scalar_subquery, .exists_subquery, .in_subquery => {
                     const hook = ctx.hook orelse return error.UnsupportedStatement;
                     return hook.run(hook.ptr, ctx, id);
@@ -1196,6 +1272,7 @@ pub fn Eval(comptime config: types.Config) type {
                         try ctx.session.checkpoint();return .{.date=@intCast(n.integer)};
                     }
                     const value = try eval(ctx, n.a);
+                    if (n.typmod == ast.mysql_integer_cast_typmod) return Io.mysqlIntegerCast(value, n.cast_type);
                     const converted = try cast(value, node(ctx, n.a).ty, n.cast_type, n.typmod, ctx.session);
                     if (n.domain_cast) {
                         if (converted == .null_value) {
@@ -1284,7 +1361,10 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
-                    .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out => return catalogValue(ctx, n),
+                    .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
+                    .to_regnamespace, .regnamespace_in, .regnamespace_out,
+                    .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                    .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
                         const config_cell = try eval(ctx, n.b);
@@ -1377,7 +1457,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
                     .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
                     .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
-                    .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid => return sessionFunction(ctx, n),
+                    .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),
                     .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
                         const argument = try eval(ctx, n.b);
                         if (argument == .null_value) return .null_value;

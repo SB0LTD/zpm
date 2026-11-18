@@ -1183,6 +1183,14 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
                 }
+                if (self.rawWord("xml") and wordIs(self.source, try self.peek(), "option")) {
+                    try self.advance();
+                    try self.advance();
+                    if (!self.rawWord("document") and !self.rawWord("content")) return error.Syntax;
+                    const value = try self.settingValue();
+                    try self.finish();
+                    return .{ .set = .{ .local = local, .name = .{ .special = .xml_option }, .value = value } };
+                }
                 // SET [LOCAL | SESSION] ROLE { name | NONE } (gram.y; the
                 // catalog-security lane resolves it as the `role` setting).
                 if (self.rawWord("role")) {
@@ -1280,14 +1288,14 @@ pub fn Parser(comptime config: types.Config) type {
                 },
                 .integer, .decimal => {
                     try self.advance();
-                    return .{ .kind = .number, .span = .{ .start = token.start, .len = token.end - token.start } };
+                    return .{ .kind = .number, .span = .{ .start = token.start, .len = token.end - token.start }, .integer = token.kind == .integer };
                 },
-                .symbol => if (token.symbol == .minus) {
+                .symbol => if (token.symbol == .minus or token.symbol == .plus) {
                     try self.advance();
                     const number = self.current;
                     if (number.kind != .integer and number.kind != .decimal) return error.Syntax;
                     try self.advance();
-                    return .{ .kind = .number, .span = .{ .start = token.start, .len = number.end - token.start } };
+                    return .{ .kind = .number, .span = .{ .start = number.start, .len = number.end - number.start }, .number_sign = if (token.symbol == .minus) '-' else '+', .integer = number.kind == .integer };
                 },
                 else => {},
             }
@@ -1574,7 +1582,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
-                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
+                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
                 else => false,
@@ -1625,7 +1633,11 @@ pub fn Parser(comptime config: types.Config) type {
         /// A type name with an optional array suffix: `[]`, `[n]` (repeated;
         /// sizes and dimensions are ignored) or `ARRAY [n]`.
         fn typeName(self: *Self) Error!TypeSpec {
-            var spec = try self.scalarTypeName();
+            return self.typeArraySuffix(try self.scalarTypeName());
+        }
+
+        fn typeArraySuffix(self: *Self, scalar: TypeSpec) Error!TypeSpec {
+            var spec = scalar;
             var array = false;
             while (self.isSymbol(.lbracket)) {
                 try self.advance();
@@ -1643,7 +1655,7 @@ pub fn Parser(comptime config: types.Config) type {
                 array = true;
             }
             if (array) {
-                if (spec.typmod == ast.regclass_typmod or spec.typmod == ast.regtype_typmod) return error.UnsupportedStatement;
+                if (ast.regKind(spec.typmod) != .none) return error.UnsupportedStatement;
                 spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
             }
             return spec;
@@ -1701,6 +1713,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .json => .{ .ty = .json },
                 .jsonb => .{ .ty = .jsonb },
                 .regclass => .{ .ty = .oid, .typmod = ast.regclass_typmod },
+                .regnamespace => .{ .ty = .oid, .typmod = ast.regnamespace_typmod },
                 .regtype => .{ .ty = .oid, .typmod = ast.regtype_typmod },
                 .varchar => .{ .ty = .varchar, .typmod = try self.characterLength(false) },
                 .bpchar => .{ .ty = .bpchar, .typmod = try self.characterLength(false) },
@@ -3058,7 +3071,9 @@ pub fn Parser(comptime config: types.Config) type {
             try self.fromItem(out, .first);
             while (self.mode == .standard) {
                 if (try self.takeSymbol(.comma)) {
+                    const start = out.item_count;
                     try self.fromItem(out, .cross);
+                    out.items[start].comma_separated = true;
                     continue;
                 }
                 if (!try self.joinClause(out)) break;
@@ -3441,7 +3456,8 @@ pub fn Parser(comptime config: types.Config) type {
             if ((self.current.kind == .word and !lexer.reserved(self.current.keyword) and !niladic) or self.current.kind == .quoted_word) {
                 const after = try self.peek();
                 // COLLATE and SIMILAR (not lexer keywords) continue the expression.
-                if (ends(after) and !wordIs(self.source, after, "collate") and !wordIs(self.source, after, "similar") and !(typeWord(self.current) and multiwordType(self.current, after))) {
+                if (ends(after) and !wordIs(self.source, after, "collate") and !wordIs(self.source, after, "similar") and
+                    !wordIs(self.source, after, "operator") and !(typeWord(self.current) and multiwordType(self.current, after))) {
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .column, .name = name });
                 }
@@ -3653,8 +3669,18 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn otherTail(self: *Self, initial: u16) Error!u16 {
             var left = initial;
-            while (self.current.kind == .symbol) {
-                const op: ast.Op = switch (self.current.symbol) {
+            while (true) {
+                const qualified = self.mode == .standard and self.tokens.dialect == .postgres and
+                    self.rawWord("operator") and lparenNext(try self.peek());
+                if (qualified) {
+                    try self.advance();
+                    try self.expectSymbol(.lparen);
+                    try self.requireCatalogQualifier(try self.identifier());
+                    try self.expectSymbol(.dot);
+                    if (self.current.kind != .symbol) return error.Syntax;
+                } else if (self.current.kind != .symbol) break;
+                const symbol = self.current.symbol;
+                const op: ast.Op = switch (symbol) {
                     .concat => .concat,
                     .arrow => .arrow,
                     .arrow_text => .arrow_text,
@@ -3682,10 +3708,17 @@ pub fn Parser(comptime config: types.Config) type {
                     .at_question => .path_exists,
                     .at_at => .path_match,
                     .tilde, .regex_icase, .not_regex, .not_regex_icase => .regex_match,
-                    else => break,
+                    else => if (qualified) switch (symbol) {
+                        .plus => .add,
+                        .minus => .sub,
+                        .star => .mul,
+                        .slash => .div,
+                        .percent => .mod,
+                        else => self.comparisonOp() orelse return error.UndefinedFunction,
+                    } else break,
                 };
-                const symbol = self.current.symbol;
                 try self.advance();
+                if (qualified) try self.expectSymbol(.rparen);
                 const right = try self.additive();
                 left = try self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right,
                     .insensitive = symbol == .regex_icase or symbol == .not_regex_icase, .negated = symbol == .not_regex or symbol == .not_regex_icase });
@@ -3757,7 +3790,7 @@ pub fn Parser(comptime config: types.Config) type {
             var schema: ?ast.Ident = null;
             if (try self.takeSymbol(.dot)) {
                 schema = first;
-                name = try self.identifier();
+                name = if (self.tokens.dialect == .postgres) try self.label() else try self.identifier();
             }
             var buffer: [64]u8 = undefined;
             if (schema) |qualifier| {
@@ -3777,6 +3810,12 @@ pub fn Parser(comptime config: types.Config) type {
             if (ident.len > out.len) return null;
             identBytes(source, ident, out);
             return out[0..ident.len];
+        }
+
+        fn requireCatalogQualifier(self: *const Self, name: ast.Ident) Error!void {
+            var schema: [64]u8 = undefined;
+            const spelling = identText(self.source, name, &schema) orelse return error.UndefinedSchema;
+            if (!types.same(spelling, "pg_catalog")) return error.UnsupportedStatement;
         }
 
         fn identBytes(source: []const u8, ident: ast.Ident, out: []u8) void {
@@ -3853,6 +3892,21 @@ pub fn Parser(comptime config: types.Config) type {
                 }
             }
             const named = try self.qualifiedName();
+            if (self.tokens.dialect == .postgres) if (named.schema) |qualifier| {
+                var schema_buffer: [64]u8 = undefined;
+                var name_buffer: [64]u8 = undefined;
+                const schema = identText(self.source, qualifier, &schema_buffer) orelse "";
+                const name = identText(self.source, named.name, &name_buffer) orelse "";
+                if (types.same(schema, "pg_catalog")) {
+                    const scalar: TypeSpec =
+                        if (types.same(name, "regclass")) .{ .ty = .oid, .typmod = ast.regclass_typmod }
+                        else if (types.same(name, "regnamespace")) .{ .ty = .oid, .typmod = ast.regnamespace_typmod }
+                        else if (types.same(name, "regtype")) .{ .ty = .oid, .typmod = ast.regtype_typmod }
+                        else .{ .ty = types.typeOfData(types.typeByCatalogName(name) orelse return error.UndefinedObject) };
+                    const target = try self.typeArraySuffix(scalar);
+                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                }
+            };
             if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
             return self.pool.add(.{ .kind = .cast, .cast_type = .unknown, .a = inner, .name = named.name, .qualifier = named.schema orelse .{} });
         }
@@ -3912,8 +3966,10 @@ pub fn Parser(comptime config: types.Config) type {
                 call.func = .tds_isnull;
             }
             var first: u16 = none;
+            var close_end = self.current.end;
             if (try self.takeSymbol(.star)) {
                 call.star = true;
+                close_end = self.current.end;
                 try self.expectSymbol(.rparen);
             } else if (!try self.takeSymbol(.rparen)) {
                 if (self.mode == .standard and try self.takeWord("DISTINCT")) {
@@ -3933,6 +3989,7 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 // Aggregate ORDER BY inside the call (B11).
                 if (self.mode == .standard and self.isWord("ORDER")) self.pool.nodes[node].order = try self.aggregateOrder(node);
+                close_end = self.current.end;
                 try self.expectSymbol(.rparen);
             }
             // WITHIN GROUP (ORDER BY ...) of an ordered-set aggregate (B11).
@@ -3960,6 +4017,13 @@ pub fn Parser(comptime config: types.Config) type {
                 self.pool.nodes[node].window=try self.windowSpec(node,true);
             }
             const n = &self.pool.nodes[node];
+            if (self.tokens.dialect == .mysql and !name.quoted and
+                (types.keyword(raw_name, "count") or types.keyword(raw_name, "min") or
+                    types.keyword(raw_name, "max") or types.keyword(raw_name, "sum")))
+            {
+                const start = name.span.start;
+                n.text = .{ .start = start, .end = close_end, .len = close_end - start };
+            }
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
             return node;
         }
@@ -4530,6 +4594,20 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.lparen);
                     const inner = try self.expression();
                     try self.expectWord("AS");
+                    if (self.mode == .standard and self.tokens.dialect == .mysql and
+                        (self.rawWord("signed") or self.rawWord("unsigned")))
+                    {
+                        const target: ast.Type = if (self.rawWord("unsigned")) .mysql_bigint_unsigned else .int8;
+                        try self.advance();
+                        _ = try self.takeWord("INTEGER");
+                        const end = self.current.end;
+                        try self.expectSymbol(.rparen);
+                        self.last_native_syntax = token.start;
+                        return self.pool.add(.{
+                            .kind = .cast, .cast_type = target, .typmod = ast.mysql_integer_cast_typmod, .a = inner,
+                            .text = .{ .start = token.start, .end = end, .len = end - token.start },
+                        });
+                    }
                     const target = try self.castTarget(inner);
                     try self.expectSymbol(.rparen);
                     return target;
@@ -4582,12 +4660,22 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.rparen);
                     return self.pool.add(call);
                 }
-                // ARRAY[...] constructors.
+                // Array literals and PostgreSQL's ARRAY(query) constructor.
                 if (self.mode == .standard and wordIs(self.source, token, "array")) {
                     const after = try self.peek();
                     if (after.kind == .symbol and after.symbol == .lbracket) {
                         const name = try self.identifier();
                         return self.arrayConstructor(name);
+                    }
+                    if (self.tokens.dialect == .postgres and lparenNext(after)) {
+                        try self.advance();
+                        try self.expectSymbol(.lparen);
+                        if (!self.queryWord()) return error.Syntax;
+                        const query_index = try self.query();
+                        try self.expectSymbol(.rparen);
+                        self.pool.complex = true;
+                        const node = try self.pool.add(.{ .kind = .scalar_subquery, .func = .array_subquery, .integer = query_index });
+                        return self.subscriptTail(node);
                     }
                 }
                 // SQL-standard niladic functions.
@@ -4648,6 +4736,12 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeSymbol(.dot)) {
                 if (self.mode == .standard and try self.takeSymbol(.star)) return self.pool.add(.{ .kind = .column, .star = true, .qualifier = name });
                 const column = try self.identifier();
+                if (self.mode == .standard and self.tokens.dialect == .postgres and self.isSymbol(.lparen)) {
+                    try self.requireCatalogQualifier(name);
+                    const call = try self.functionCall(column);
+                    self.pool.nodes[call].qualifier = name;
+                    return call;
+                }
                 return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = column, .qualifier = name }));
             }
             return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = name }));

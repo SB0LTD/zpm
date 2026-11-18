@@ -193,6 +193,7 @@ pub const Keyword = enum {
     user,
     value,
     regclass,
+    regnamespace,
     regtype,
     greatest,
     least,
@@ -379,6 +380,16 @@ fn space(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n' or byte == 0x0b or byte == 0x0c;
 }
 
+fn lineBreak(byte: u8) bool {
+    return byte == '\r' or byte == '\n';
+}
+
+fn lineCommentEnd(source: []const u8, first: usize) usize {
+    var at = first;
+    while (at < source.len and !lineBreak(source[at])) at += 1;
+    return at;
+}
+
 pub const Tokenizer = struct {
     source: []const u8,
     position: usize = 0,
@@ -393,8 +404,12 @@ pub const Tokenizer = struct {
             if (space(byte)) {
                 self.position += 1;
             } else if (byte == '-' and self.position + 1 < source.len and source[self.position + 1] == '-') {
-                self.position += 2;
-                while (self.position < source.len and source[self.position] != '\n') self.position += 1;
+                if (self.dialect == .postgres) {
+                    self.position = lineCommentEnd(source, self.position + 2);
+                } else {
+                    self.position += 2;
+                    while (self.position < source.len and source[self.position] != '\n') self.position += 1;
+                }
             } else if (byte == '/' and self.position + 1 < source.len and source[self.position + 1] == '*') {
                 // PostgreSQL block comments nest.
                 self.position += 2;
@@ -474,15 +489,7 @@ pub const Tokenizer = struct {
     fn escapeString(self: *Tokenizer) Error!Token {
         const source = self.source;
         const start = self.position + 2;
-        var at = start;
-        while (true) {
-            if (at >= source.len) return error.Syntax;
-            if (source[at] == '\\') {
-                at += 2;
-            } else if (source[at] == '\'') {
-                if (at + 1 < source.len and source[at + 1] == '\'') at += 2 else break;
-            } else at += 1;
-        }
+        const at = try escapedQuoteEnd(source, start);
         const len = try self.sized(try decodeEscape(source[start..at], null));
         self.position = at + 1;
         return .{ .kind = .string, .form = .escape, .start = start, .end = at, .len = len, .prefix = 2, .suffix = 1 };
@@ -696,6 +703,168 @@ pub const Tokenizer = struct {
         };
         self.position += width;
         return .{ .kind = .symbol, .symbol = symbol, .start = start, .end = self.position, .len = width };
+    }
+};
+
+fn escapedQuoteEnd(source: []const u8, start: usize) Error!usize {
+    var at = start;
+    while (at < source.len) {
+        if (source[at] == '\\') {
+            at += 2;
+        } else if (source[at] == '\'') {
+            if (at + 1 == source.len or source[at + 1] != '\'') return at;
+            at += 2;
+        } else at += 1;
+    }
+    return error.Syntax;
+}
+
+/// Separate nonempty PostgreSQL raw statements without decoding or copying them.
+/// The immutable source and current byte position are sufficient to resume a
+/// batch after a command suspends. The parser validates each resulting span.
+pub const PostgresStatements = struct {
+    source: []const u8,
+    position: usize = 0,
+    standard_conforming_strings: bool = true,
+
+    pub const Span = struct {
+        start: usize,
+        end: usize,
+
+        pub fn slice(span: Span, source: []const u8) []const u8 {
+            return source[span.start..span.end];
+        }
+    };
+
+    const Head = enum { first, create, create_or, create_replace, routine, other };
+
+    fn routineWord(value: []const u8) bool {
+        return types.keyword(value, "function") or types.keyword(value, "procedure");
+    }
+
+    fn extendHead(current: Head, value: []const u8) Head {
+        return switch (current) {
+            .first => if (types.keyword(value, "create")) .create else .other,
+            .create => if (types.keyword(value, "or")) .create_or else if (routineWord(value)) .routine else .other,
+            .create_or => if (types.keyword(value, "replace")) .create_replace else .other,
+            .create_replace => if (routineWord(value)) .routine else .other,
+            .routine, .other => current,
+        };
+    }
+
+    /// A newline through whitespace or -- comments continues a string in its
+    /// original quoting mode. Block comments do not participate in that rule.
+    fn continuedQuote(source: []const u8, after: usize) ?usize {
+        var at = after;
+        var newline = false;
+        while (at < source.len) {
+            const byte = source[at];
+            if (space(byte)) {
+                newline = newline or lineBreak(byte);
+                at += 1;
+            } else if (byte == '-' and at + 1 < source.len and source[at + 1] == '-') {
+                at = lineCommentEnd(source, at + 2);
+            } else break;
+        }
+        if (newline and at < source.len and source[at] == '\'') return at;
+        return null;
+    }
+
+    fn skipQuote(tokens: *Tokenizer, quote: u8, escapes: bool) Error!void {
+        while (true) {
+            tokens.position += 1;
+            if (escapes) {
+                tokens.position = (try escapedQuoteEnd(tokens.source, tokens.position)) + 1;
+            } else {
+                _ = try tokens.quotedForm(quote, tokens.source.len, error.TextCapacity);
+            }
+            if (quote != '\'') return;
+            tokens.position = continuedQuote(tokens.source, tokens.position) orelse return;
+        }
+    }
+
+    pub fn next(self: *PostgresStatements) Error!?Span {
+        const source = self.source;
+        if (self.position > source.len) return error.Syntax;
+        var tokens: Tokenizer = .{ .source = source, .text_limit = source.len, .position = self.position };
+        var first: ?usize = null;
+        var parentheses: usize = 0;
+        var brackets: usize = 0;
+        var atomic: usize = 0;
+        var head: Head = .first;
+        var begin_word = false;
+        while (true) {
+            try tokens.skip();
+            const at = tokens.position;
+            if (at == source.len) {
+                if (parentheses != 0 or brackets != 0 or atomic != 0) return error.Syntax;
+                self.position = at;
+                return if (first) |start| .{ .start = start, .end = at } else null;
+            }
+            const byte = source[at];
+            if (byte == ';' and parentheses == 0 and brackets == 0) {
+                tokens.position += 1;
+                if (atomic == 0) {
+                    if (first) |start| {
+                        self.position = tokens.position;
+                        return .{ .start = start, .end = at };
+                    }
+                }
+                head = .first;
+                begin_word = false;
+                continue;
+            }
+            if (first == null) first = at;
+            const nested = parentheses != 0 or brackets != 0;
+            if ((byte == 'e' or byte == 'E') and at + 1 < source.len and source[at + 1] == '\'') {
+                tokens.position += 1;
+                try skipQuote(&tokens, '\'', true);
+            } else if (byte == '\'' or byte == '"') {
+                try skipQuote(&tokens, byte, byte == '\'' and !self.standard_conforming_strings);
+            } else if (byte == '$' and at + 1 < source.len and (source[at + 1] == '$' or dollarStart(source[at + 1]))) {
+                _ = try tokens.dollarString();
+            } else if (dollarStart(byte)) {
+                tokens.position += 1;
+                while (tokens.position < source.len) : (tokens.position += 1) {
+                    const following = source[tokens.position];
+                    if (!dollarStart(following) and !types.digit(following) and following != '$') break;
+                }
+                if (!nested) {
+                    const word = source[at..tokens.position];
+                    if (head == .routine and begin_word and types.keyword(word, "atomic")) {
+                        atomic += 1;
+                        head = .first;
+                        begin_word = false;
+                    } else if (atomic != 0 and head == .first and types.keyword(word, "end")) {
+                        atomic -= 1;
+                        head = .other;
+                        begin_word = false;
+                    } else {
+                        head = extendHead(head, word);
+                        begin_word = head == .routine and types.keyword(word, "begin");
+                    }
+                }
+                continue;
+            } else {
+                switch (byte) {
+                    0 => return error.Syntax,
+                    '(' => parentheses += 1,
+                    ')' => {
+                        if (parentheses == 0) return error.Syntax;
+                        parentheses -= 1;
+                    },
+                    '[' => brackets += 1,
+                    ']' => {
+                        if (brackets == 0) return error.Syntax;
+                        brackets -= 1;
+                    },
+                    else => {},
+                }
+                tokens.position += 1;
+            }
+            if (!nested and head != .routine) head = .other;
+            begin_word = false;
+        }
     }
 };
 

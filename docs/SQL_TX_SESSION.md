@@ -18,6 +18,27 @@ documentation and source and is pending native verification.
 
 ## Design
 
+`default_table_access_method` selects `heap`, the supported table access
+method. `default_tablespace` accepts the empty database default and
+`pg_default`, which both use RAMSQL's single store. The setting preserves
+the chosen spelling in SHOW and follows SET LOCAL and RESET. A request for
+`pg_global` fails at SET because the server has no shared-relation store.
+
+`pg_catalog.pg_is_in_recovery()` returns the database's owner-controlled
+startup replay state. A startup owner sets it while replay and durable-log
+repair are in progress and clears it after successful completion. RAMSQL
+opens its PostgreSQL listener after this phase, so admitted connections see
+the primary state even inside read-only transactions.
+
+The PostgreSQL `extra_float_digits` session setting defaults to `1` and accepts
+values from `-15` through `3`. Positive values use shortest round-trip text.
+Zero and negative values reduce the precision from six significant digits for
+`real` and fifteen for `double precision`, with a minimum of one digit.
+Formatting rounds the original binary value once. The setting applies to text
+output for scalar floats, float arrays, points, boxes, and their text casts.
+Binary results keep their original representation. The setting follows the
+store's SET, SET LOCAL and RESET transaction rules.
+
 - Transaction modes live in the transaction (mvcc.sig `Tx`): isolation,
   READ ONLY, DEFERRABLE, the transaction snapshot and the SERIALIZABLE
   record. `begin()` copies the session's default_transaction_* settings.
@@ -48,6 +69,27 @@ documentation and source and is pending native verification.
 | Cursors | DECLARE [BINARY] [ASENSITIVE/INSENSITIVE] [[NO] SCROLL] CURSOR [WITH/WITHOUT HOLD] FOR query; FETCH/MOVE NEXT, PRIOR, FIRST, LAST, ABSOLUTE, RELATIVE, n, ALL, FORWARD, BACKWARD with PostgreSQL's positions and counts; NO SCROLL never moves back (55000); CLOSE [ALL]; per-session names (42P03, 34000); WITH HOLD survives COMMIT; cursors of a rolled-back (sub)transaction are dropped | rows are materialized at DECLARE (PostgreSQL runs lazily): volatile functions, errors and FOR UPDATE locks happen at DECLARE for every row; BINARY cursors (0A000); unspecified SCROLL allows backward moves for every plan |
 | SQL PREPARE | PREPARE name [(types)] AS SELECT/VALUES/INSERT/UPDATE/DELETE/MERGE, parse analysis at PREPARE; EXECUTE with arguments coerced to the declared types in assignment context ($n are real parameters: `SELECT $1` is ?column?); DEALLOCATE [PREPARE] name/ALL; not transactional; 42P05, 26000, 42601 (argument count), 42804; the wire's DEALLOCATE reaches both namespaces | type inference for undeclared parameters (42P18 here); plan caching (each EXECUTE re-binds) |
 | LISTEN / NOTIFY | LISTEN / UNLISTEN [*] take effect at commit (dropped with the (sub)transaction); NOTIFY channel [, 'payload'] queued per transaction, folded duplicates, dropped by ROLLBACK / ROLLBACK TO / a failed statement, published at commit in order; a listener reads from its own position (own notifications included); the codec sends NotificationResponse ('A': pid, channel, payload) before ReadyForQuery and through `Session.notifications()` while idle | pg_notify() (void result); pg_listening_channels(); payloads beyond Config.notify_payload_bytes (54000; PostgreSQL's limit is 8000 bytes, 22023 here at 8000) |
+
+`synchronize_seqscans` defaults to `on`. Eligible unordered, single-table
+PostgreSQL reads can start at a position recently shared by another scan of the
+same relation. A scan visits each physical slot once under its own snapshot,
+wrapping around the end. `off` starts at slot zero and leaves the shared
+position alone. `Config.synchronized_scan_rows` is the minimum span to consider
+for cache locality. Ordered queries, joins, aggregates, sampling and locking retain their
+existing paths. The aggregate cache skips plans whose output can rotate. The
+optional projection cache can serve an already materialized unordered result
+with synchronization on. With synchronization off, projected filters scan
+from physical slot zero on each read.
+
+`PostgresStatements` iterates nonempty command spans in a PostgreSQL Query
+message. It keeps quoted text, nested comments and SQL routine bodies intact.
+`Database.preflightPostgresBatch` checks boundaries and the supported raw
+grammar for the entire message before execution. Catalog resolution and
+execution errors are checked when each command runs. RAMSQL rejects a whole
+batch containing raw syntax outside its supported grammar before running the
+first command. A syntax error in a later recognized command takes precedence.
+This restricts batches that PostgreSQL can parse with commands outside the
+RAMSQL SQL subset.
 
 ## Errors (SQLSTATE)
 

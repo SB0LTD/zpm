@@ -112,30 +112,30 @@ pub fn fromCorners(a: Point, b: Point) Box {
     return .{ .high = .{ .x = @max(a.x, b.x), .y = @max(a.y, b.y) }, .low = .{ .x = @min(a.x, b.x), .y = @min(a.y, b.y) } };
 }
 
-fn pairText(point: Point, buffer: []u8) []const u8 {
+fn pairText(point: Point, extra_float_digits: i8, buffer: []u8) []const u8 {
     var at: usize = 0;
     buffer[at] = '(';
     at += 1;
-    at += float_text.format(f64, point.x, buffer[at..]).len;
+    at += float_text.format(f64, point.x, extra_float_digits, buffer[at..]).len;
     buffer[at] = ',';
     at += 1;
-    at += float_text.format(f64, point.y, buffer[at..]).len;
+    at += float_text.format(f64, point.y, extra_float_digits, buffer[at..]).len;
     buffer[at] = ')';
     at += 1;
     return buffer[0..at];
 }
 
 /// point_out (at most 2 x 24 + 3 bytes).
-pub fn formatPoint(point: Point, buffer: []u8) []const u8 {
-    return pairText(point, buffer);
+pub fn formatPoint(point: Point, extra_float_digits: i8, buffer: []u8) []const u8 {
+    return pairText(point, extra_float_digits, buffer);
 }
 
 /// box_out: the high corner first.
-pub fn formatBox(box: Box, buffer: []u8) []const u8 {
-    var at = pairText(box.high, buffer).len;
+pub fn formatBox(box: Box, extra_float_digits: i8, buffer: []u8) []const u8 {
+    var at = pairText(box.high, extra_float_digits, buffer).len;
     buffer[at] = ',';
     at += 1;
-    at += pairText(box.low, buffer[at..]).len;
+    at += pairText(box.low, extra_float_digits, buffer[at..]).len;
     return buffer[0..at];
 }
 

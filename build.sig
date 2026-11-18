@@ -130,9 +130,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-query", "tests/test_sql_query.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-dml", "tests/test_sql_dml.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-catalog", "tests/test_sql_catalog.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-pg-table-visibility", "tests/test_pg_table_visibility.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-pg-query-boundaries", "tests/test_pg_query_boundaries.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-external", "tests/test_sql_external.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-split-versions", "tests/test_sql_split_versions.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-integral-versions", "tests/test_sql_integral_versions.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-compact-version-stamps", "tests/test_sql_compact_version_stamps.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-stream-group", "tests/test_sql_stream_group.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-stream-prefix", "tests/test_sql_stream_prefix.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-factor-algebra", "tests/test_sql_factor_algebra.sig", &.{});
@@ -160,6 +163,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-datetime-format", "tests/test_datetime_format.sig", &.{importEntry("datetime_format", "src/core/sql/datetime_format.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-dimension-distinct", "tests/test_sql_dimension_distinct.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-projected-filter", "tests/test_sql_projected_filter.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-projected-cache", "tests/test_sql_projected_cache.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-work-control", "tests/test_sql_work_control.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-integer-topk", "tests/test_sql_integer_topk.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-layout-order", "tests/test_sql_layout_order.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -217,6 +221,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try ctx.addDependency(test_all, test_db);
     _ = try addContract(ctx, test_db, "contract-db-registry", "tests/test_db_registry.sig", &.{
         importEntry("sql", "src/core/sql.sig"), importEntry("database_registry", "src/db/database_registry.sig"),
+    });
+    _ = try addContract(ctx, test_db, "contract-pg-settings", "tests/test_db_pg_settings.sig", &.{
+        importEntry("sql", "src/core/sql.sig"), importEntry("db_store", "src/db/store.sig"),
     });
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
     inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock", "pg_copy", "pg_explain", "page_region" }) |name| {

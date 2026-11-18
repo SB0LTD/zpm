@@ -301,6 +301,7 @@ pub fn Deparse(comptime config: types.Config) type {
                     // ::regclass / ::regtype are OID casts marked by typmod.
                     if (n.cast_type == .oid and n.typmod == ast.regclass_typmod) try w.bytes("regclass")
                     else if (n.cast_type == .oid and n.typmod == ast.regtype_typmod) try w.bytes("regtype")
+                    else if (n.cast_type == .oid and n.typmod == ast.regnamespace_typmod) try w.bytes("regnamespace")
                     else try w.bytes(types.sqlTypeName(types.dataTypeOf(n.cast_type)));
                 },
                 else => return error.UnsupportedStatement,

@@ -161,12 +161,6 @@ pub fn Mvcc(comptime config: types.Config) type {
             }
         };
 
-        fn clearMark(version: *S.Version) void {
-            version.xmax = .{};
-            version.xmax_cid = 0;
-            version.xmax_csn = 0;
-        }
-
         /// Undoes writes[start..] newest first and releases locks[lock_start..].
         pub fn abortSlice(db: anytype, slot: usize, start: usize, lock_start: usize) void {
             const tx = &db.txs[slot];
@@ -177,7 +171,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                 switch (entry.kind) {
                     .insert => {
                         const table = &db.tables[entry.table];
-                        const rowid = table.rows[table.versions[entry.new].row - 1].rowid;
+                        const rowid = table.rows[table.versions[entry.new].rowSlot()].rowid;
                         S.reclaimVersion(table, entry.new);
                         // Keep rowids dense when nothing allocated after this one.
                         if (table.next_rowid == rowid + 1) table.next_rowid = rowid;
@@ -185,9 +179,9 @@ pub fn Mvcc(comptime config: types.Config) type {
                     .update => {
                         const table = &db.tables[entry.table];
                         S.reclaimVersion(table, entry.new);
-                        clearMark(&table.versions[entry.old]);
+                        table.versions[entry.old].clearDeletion();
                     },
-                    .delete => clearMark(&db.tables[entry.table].versions[entry.old]),
+                    .delete => db.tables[entry.table].versions[entry.old].clearDeletion(),
                     .create_table => {
                         const table = &db.tables[entry.table];
                         table.pending_create = false;
@@ -209,7 +203,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                     .truncate, .refresh_rows => {
                         const table = &db.tables[entry.table];
                         for (table.versions[0..table.version_high]) |*version| {
-                            if (truncated(version, tx, slot, entry.old)) clearMark(version);
+                            if (truncated(version, tx, slot, entry.old)) version.clearDeletion();
                         }
                         if (entry.kind == .truncate) {
                             table.pending_truncate = if (entry.new != 0) .{ .owner = tx.ref(slot), .cid = entry.new } else .{};
@@ -217,6 +211,8 @@ pub fn Mvcc(comptime config: types.Config) type {
                     },
                     .alter_table => {
                         const copy = &db.tables[entry.table];
+                        if (copy.pending_late_primary and copy.primary_index_oid != 0 and
+                            db.oid_counter + types_first_oid == copy.primary_index_oid + 1) db.oid_counter -= 1;
                         // Index OIDs this ALTER took, when still the tail.
                         var position = copy.index_count;
                         while (position > 0) {
@@ -264,8 +260,9 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// A version this transaction's TRUNCATE (command `cid`) marked and
         /// has not published.
         pub fn truncated(version: *const S.Version, tx: *const Tx, slot: usize, cid: u32) bool {
-            return version.row != 0 and version.xmax.epoch == tx.epoch and version.xmax.slot == slot and
-                version.xmax_cid == cid and version.xmax_csn == 0;
+            if (version.rowLink() == 0) return false;
+            const deletion = version.pendingDeletion() orelse return false;
+            return deletion.tx.epoch == tx.epoch and deletion.tx.slot == slot and deletion.cid == cid;
         }
 
         /// Lists a lock just granted to `slot`. When the list is full the
@@ -298,20 +295,20 @@ pub fn Mvcc(comptime config: types.Config) type {
                         const table = &db.tables[entry.table];
                         S.summarize(table, entry.new, true, csn);
                         S.scanPublish(table, entry.new, true);
-                        table.versions[entry.new].xmin_csn = csn;
+                        table.versions[entry.new].publishCreation(csn);
                     },
                     .update => {
                         const table = &db.tables[entry.table];
                         S.summarizeUpdate(table, entry.old, entry.new, csn);
                         S.scanPublish(table, entry.new, true);
-                        table.versions[entry.new].xmin_csn = csn;
-                        table.versions[entry.old].xmax_csn = csn;
+                        table.versions[entry.new].publishCreation(csn);
+                        table.versions[entry.old].publishDeletion(csn);
                     },
                     .delete => {
                         const table = &db.tables[entry.table];
                         S.summarize(table, entry.old, false, csn);
                         S.scanPublish(table, entry.old, false);
-                        table.versions[entry.old].xmax_csn = csn;
+                        table.versions[entry.old].publishDeletion(csn);
                     },
                     .create_table => {
                         db.tables[entry.table].pending_create = false;
@@ -336,7 +333,7 @@ pub fn Mvcc(comptime config: types.Config) type {
                             if (!truncated(version, tx, slot, entry.old)) continue;
                             S.summarize(table, @intCast(index), false, csn);
                             S.scanPublish(table, @intCast(index), false);
-                            version.xmax_csn = csn;
+                            version.publishDeletion(csn);
                         }
                         if (entry.kind == .truncate) S.publishTruncate(table, csn);
                     },
@@ -350,9 +347,13 @@ pub fn Mvcc(comptime config: types.Config) type {
                         const copy = &db.tables[entry.table];
                         copy.pending_create = false;
                         for (copy.versions[0..copy.version_high]) |*version| {
-                            if (version.row == 0) continue;
-                            if (version.xmin_csn == 0 and version.xmin.epoch == tx.epoch and version.xmin.slot == slot and version.xmin_cid < entry.new) version.xmin_csn = csn;
-                            if (version.xmax_csn == 0 and version.xmax.epoch == tx.epoch and version.xmax.slot == slot and version.xmax_cid < entry.new) version.xmax_csn = csn;
+                            if (version.rowLink() == 0) continue;
+                            if (version.pendingCreation()) |creation| {
+                                if (creation.tx.epoch == tx.epoch and creation.tx.slot == slot and creation.cid < entry.new) version.publishCreation(csn);
+                            }
+                            if (version.pendingDeletion()) |deletion| {
+                                if (deletion.tx.epoch == tx.epoch and deletion.tx.slot == slot and deletion.cid < entry.new) version.publishDeletion(csn);
+                            }
                         }
                         const inherited = copy.pending_truncate;
                         if (inherited.owner.epoch == tx.epoch and inherited.owner.slot == slot and inherited.cid < entry.new)
@@ -395,7 +396,8 @@ pub fn Mvcc(comptime config: types.Config) type {
                 const table = &db.tables[entry.table];
                 if (!table.live or table.dead_csn != 0) continue;
                 const version = &table.versions[entry.old];
-                if (version.row == 0 or version.xmax_csn == 0 or version.xmax_csn > horizon) continue;
+                const deletion_csn = version.deletionCsn();
+                if (version.rowLink() == 0 or deletion_csn == 0 or deletion_csn > horizon) continue;
                 S.reclaimVersion(table, entry.old);
                 budget -= 1;
             }

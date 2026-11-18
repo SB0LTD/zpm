@@ -275,7 +275,7 @@ pub fn Routines(comptime config: types.Config) type {
         /// type grammar), as OID and typmod; regclass/regtype are 0A000.
         fn typeAt(cursor: *Cursor, pool: anytype) Error!Arg {
             const at = try P.parseTypeAt(cursor.source, cursor.start(), pool);
-            if (at.spec.typmod == ast.regclass_typmod or at.spec.typmod == ast.regtype_typmod) return error.UnsupportedStatement;
+            if (ast.regKind(at.spec.typmod) != .none) return error.UnsupportedStatement;
             cursor.* = try Cursor.init(cursor.source, at.end);
             return .{ .oid = types.typeOid(types.dataTypeOf(at.spec.ty)), .typmod = at.spec.typmod };
         }

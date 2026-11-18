@@ -30,6 +30,7 @@ pub const available = builtin.os.tag == .windows;
 /// Socket is stored inline in a pinned owner (wss.WssClient), so `ctx = self`
 /// in the vtable stays valid.
 pub const Socket = struct {
+    /// Native Winsock handle on Windows, widened connected descriptor on Linux.
     fd: w32.SOCKET = w32.INVALID_SOCKET,
     rbuf: [16384]u8 = undefined,
     r_off: usize = 0,
@@ -45,7 +46,7 @@ pub const Socket = struct {
                 _ = w32.shutdown(self.fd, w32.SD_BOTH);
                 _ = w32.closesocket(self.fd);
             } else if (builtin.os.tag == .linux) {
-                _ = std.os.linux.close(self.fd);
+                if (std.math.cast(std.os.linux.fd_t, self.fd)) |fd| _ = std.os.linux.close(fd);
             }
             self.fd = w32.INVALID_SOCKET;
         }
@@ -92,8 +93,9 @@ fn readSocket(fd: w32.SOCKET, output: []u8) tls.Error!usize {
         return @intCast(n);
     }
     if (builtin.os.tag == .linux) {
+        const native_fd = std.math.cast(std.os.linux.fd_t, fd) orelse return error.Io;
         while (true) {
-            const rc = std.os.linux.recvfrom(fd, output.ptr, output.len, 0, null, null);
+            const rc = std.os.linux.recvfrom(native_fd, output.ptr, output.len, 0, null, null);
             switch (std.os.linux.errno(rc)) {
                 .SUCCESS => return rc,
                 .INTR => continue,
@@ -111,8 +113,9 @@ fn writeSocket(fd: w32.SOCKET, input: []const u8) tls.Error!usize {
         return @intCast(n);
     }
     if (builtin.os.tag == .linux) {
+        const native_fd = std.math.cast(std.os.linux.fd_t, fd) orelse return error.Io;
         while (true) {
-            const rc = std.os.linux.sendto(fd, input.ptr, input.len, std.os.linux.MSG.NOSIGNAL, null, 0);
+            const rc = std.os.linux.sendto(native_fd, input.ptr, input.len, std.os.linux.MSG.NOSIGNAL, null, 0);
             switch (std.os.linux.errno(rc)) {
                 .SUCCESS => return rc,
                 .INTR => continue,
@@ -234,23 +237,63 @@ test "TLS transport buffers native Linux socket IO without a Winsock shim" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var pair: [2]i32 = undefined;
     if (std.os.linux.errno(std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &pair)) != .SUCCESS) return error.SocketPairFailed;
-    var left: Socket = .{ .fd = pair[0] };
-    var right: Socket = .{ .fd = pair[1] };
+    var left: Socket = .{ .fd = @intCast(pair[0]) };
+    var right: Socket = .{ .fd = @intCast(pair[1]) };
     defer left.close();
     defer right.close();
+    try expectSocketExchange(&left, &right);
+    const io = left.transport();
+    try std.testing.expectError(error.Io, io.writeFn(io.ctx, "closed"));
+
+    var oversized: Socket = .{ .fd = w32.INVALID_SOCKET - 1 };
+    const invalid = oversized.transport();
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(error.Io, invalid.readFn(invalid.ctx, &byte));
+    try std.testing.expectError(error.Io, invalid.writeFn(invalid.ctx, "invalid"));
+    oversized.close();
+    try std.testing.expectEqual(w32.INVALID_SOCKET, oversized.fd);
+}
+
+test "TLS transport buffers a native Windows loopback TCP exchange" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    ensureWsa();
+    const listener = w32.socket(w32.AF_INET, w32.SOCK_STREAM, w32.IPPROTO_TCP);
+    try std.testing.expect(listener != w32.INVALID_SOCKET);
+    defer _ = w32.closesocket(listener);
+    var addr: w32.sockaddr_in = .{ .sin_addr = 0x0100007f };
+    var addr_len: c_int = @sizeOf(w32.sockaddr_in);
+    try std.testing.expectEqual(@as(c_int, 0), w32.bind(listener, &addr, addr_len));
+    try std.testing.expectEqual(@as(c_int, 0), w32.listen(listener, 1));
+    try std.testing.expectEqual(@as(c_int, 0), w32.getsockname(listener, &addr, &addr_len));
+    try std.testing.expect(addr.sin_port != 0);
+    var left = try connectHost("127.0.0.1", w32.ntohs(addr.sin_port));
+    defer left.close();
+    var right: Socket = .{ .fd = w32.accept(listener, null, null) };
+    try std.testing.expect(right.fd != w32.INVALID_SOCKET);
+    defer right.close();
+    try expectSocketExchange(&left, &right);
+}
+
+fn expectSocketExchange(left: *Socket, right: *Socket) !void {
     const a = left.transport();
     const b = right.transport();
     try a.writeFn(a.ctx, "record-header-and-body");
-    var header: [6]u8 = undefined;
-    var body: [32]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 6), try b.readFn(b.ctx, &header));
-    try std.testing.expectEqualSlices(u8, "record", &header);
-    const count = try b.readFn(b.ctx, &body);
-    try std.testing.expectEqualSlices(u8, "-header-and-body", body[0..count]);
+    try expectSocketBytes(b, "record");
+    try expectSocketBytes(b, "-header-and-body");
     try b.writeFn(b.ctx, "reply");
-    const reply_count = try a.readFn(a.ctx, &body);
-    try std.testing.expectEqualSlices(u8, "reply", body[0..reply_count]);
+    try expectSocketBytes(a, "reply");
     right.close();
-    try std.testing.expectEqual(@as(usize, 0), try a.readFn(a.ctx, &body));
-    try std.testing.expectError(error.Io, a.writeFn(a.ctx, "closed"));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try a.readFn(a.ctx, &byte));
+}
+
+fn expectSocketBytes(io: tls.Transport, comptime expected: []const u8) !void {
+    var received: [expected.len]u8 = undefined;
+    var count: usize = 0;
+    while (count < received.len) {
+        const read = try io.readFn(io.ctx, received[count..]);
+        if (read == 0) return error.UnexpectedEof;
+        count += read;
+    }
+    try std.testing.expectEqualSlices(u8, expected, &received);
 }

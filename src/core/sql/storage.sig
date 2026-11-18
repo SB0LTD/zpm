@@ -73,6 +73,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub const presence_enabled = compact_enabled and config.block_presence_filters;
         pub const split_versions = config.split_external_versions and config.external_storage;
         pub const integral_enabled = split_versions and config.integral_external_versions;
+        const compact_stamps = config.compact_external_version_stamps;
         pub const VersionRow = [config.columns]V.Cell;
 
         pub fn presenceWords(rows:usize) Error!usize {
@@ -82,6 +83,7 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         comptime {
+            if (compact_stamps and !split_versions) @compileError("compact version stamps require split external storage");
             if (versions_capacity <= config.rows_per_table) @compileError("versions_per_table must exceed rows_per_table");
             if (versions_capacity > 0x7fffffff or config.rows_per_table > 0x7fffffff) @compileError("storage capacity exceeds u32 references");
         }
@@ -100,16 +102,151 @@ pub fn Storage(comptime config: types.Config) type {
 
         pub const Version = struct {
             /// Directory slot + 1; 0 marks a free arena slot.
-            row: u32 = 0,
-            xmin: TxRef = .{},
+            row_link: u32 = 0,
+            xmin: if (compact_stamps) void else TxRef = if (compact_stamps) {} else .{},
             xmin_cid: u32 = 0,
-            xmin_csn: u64 = 0,
-            xmax: TxRef = .{},
+            xmin_csn: if (compact_stamps) void else u64 = if (compact_stamps) {} else 0,
+            xmax: if (compact_stamps) void else TxRef = if (compact_stamps) {} else .{},
             xmax_cid: u32 = 0,
-            xmax_csn: u64 = 0,
+            xmax_csn: if (compact_stamps) void else u64 = if (compact_stamps) {} else 0,
+            creation_stamp: if (compact_stamps) u64 else void = if (compact_stamps) 0 else {},
+            deletion_stamp: if (compact_stamps) u64 else void = if (compact_stamps) 0 else {},
             /// Older version index + 1, or the next free slot + 1 while free.
-            older: u32 = 0,
+            older_link: u32 = 0,
             cells: if (split_versions) void else VersionRow = if (split_versions) {} else @splat(.null_value),
+
+            // Both links admit at most 31 bits. Steal no bits from the CSN,
+            // pending owner or command, including their maximum values.
+            const committed_flag: u32 = 0x80000000;
+            const link_mask: u32 = ~committed_flag;
+            const PendingStamp = packed struct(u64) {
+                sub: u16,
+                slot: u16,
+                epoch: u32,
+
+                inline fn encode(tx: TxRef) u64 {
+                    return @bitCast(PendingStamp{ .sub = tx.sub, .slot = tx.slot, .epoch = tx.epoch });
+                }
+
+                inline fn decode(word: u64) TxRef {
+                    const stamp: PendingStamp = @bitCast(word);
+                    return .{ .sub = stamp.sub, .slot = stamp.slot, .epoch = stamp.epoch };
+                }
+            };
+
+            /// One-based links use zero for an unused version or no older version.
+            pub inline fn rowLink(self: *const Version) u32 {
+                return if (comptime compact_stamps) self.row_link & link_mask else self.row_link;
+            }
+
+            pub inline fn rowSlot(self: *const Version) u32 {
+                return self.rowLink() - 1;
+            }
+
+            inline fn setRowLink(self: *Version, link: u32) void {
+                const state = if (comptime compact_stamps) self.row_link & committed_flag else 0;
+                self.row_link = state | link;
+            }
+
+            inline fn olderLink(self: *const Version) u32 {
+                return if (comptime compact_stamps) self.older_link & link_mask else self.older_link;
+            }
+
+            inline fn setOlderLink(self: *Version, link: u32) void {
+                const state = if (comptime compact_stamps) self.older_link & committed_flag else 0;
+                self.older_link = state | link;
+            }
+
+            pub const PendingChange = struct { tx: TxRef, cid: u32 };
+
+            pub inline fn creationCsn(self: *const Version) u64 {
+                if (comptime compact_stamps) return if (self.row_link & committed_flag != 0) self.creation_stamp else 0;
+                return self.xmin_csn;
+            }
+
+            pub inline fn deletionCsn(self: *const Version) u64 {
+                if (comptime compact_stamps) return if (self.older_link & committed_flag != 0) self.deletion_stamp else 0;
+                return self.xmax_csn;
+            }
+
+            pub inline fn pendingCreation(self: *const Version) ?PendingChange {
+                if (self.creationCsn() != 0) return null;
+                const tx = if (comptime compact_stamps) PendingStamp.decode(self.creation_stamp) else self.xmin;
+                return .{ .tx = tx, .cid = self.xmin_cid };
+            }
+
+            pub inline fn pendingDeletion(self: *const Version) ?PendingChange {
+                if (self.deletionCsn() != 0 or !self.hasDeletion()) return null;
+                const tx = if (comptime compact_stamps) PendingStamp.decode(self.deletion_stamp) else self.xmax;
+                return .{ .tx = tx, .cid = self.xmax_cid };
+            }
+
+            pub inline fn hasDeletion(self: *const Version) bool {
+                if (comptime compact_stamps) return self.deletion_stamp != 0;
+                return self.xmax.epoch != 0;
+            }
+
+            pub inline fn creationAfter(self: *const Version, snap: Snapshot) bool {
+                // A live transaction's own creations are still pending.
+                if (comptime compact_stamps) return self.creationCsn() > snap.csn;
+                return self.creationCsn() > snap.csn and !snap.own(self.xmin);
+            }
+
+            pub inline fn deletionOwnedBy(self: *const Version, snap: Snapshot) bool {
+                if (comptime compact_stamps) {
+                    const change = self.pendingDeletion() orelse return false;
+                    return snap.own(change.tx);
+                }
+                return snap.own(self.xmax);
+            }
+
+            /// Set the mutation owner and command. Publication sets its CSN.
+            pub inline fn markDeletion(self: *Version, tx: TxRef, cid: u32) void {
+                if (comptime compact_stamps) {
+                    // TRUNCATE can walk an old snapshot. A newer committed
+                    // deletion stays committed and cannot become ours.
+                    if (self.older_link & committed_flag != 0) return;
+                    self.deletion_stamp = if (tx.epoch == 0) 0 else PendingStamp.encode(tx);
+                } else self.xmax = tx;
+                self.xmax_cid = cid;
+            }
+
+            pub inline fn clearDeletion(self: *Version) void {
+                if (comptime compact_stamps) {
+                    self.older_link &= link_mask;
+                    self.deletion_stamp = 0;
+                } else {
+                    self.xmax = .{};
+                    self.xmax_csn = 0;
+                }
+                self.xmax_cid = 0;
+            }
+
+            pub inline fn publishCreation(self: *Version, csn: u64) void {
+                if (comptime compact_stamps) {
+                    self.row_link |= committed_flag;
+                    self.creation_stamp = csn;
+                } else self.xmin_csn = csn;
+            }
+
+            pub inline fn publishDeletion(self: *Version, csn: u64) void {
+                if (comptime compact_stamps) {
+                    self.older_link |= committed_flag;
+                    self.deletion_stamp = csn;
+                } else self.xmax_csn = csn;
+            }
+
+            inline fn initCreation(self: *Version, origin: VersionOrigin) void {
+                self.xmin_cid = origin.cid;
+                if (comptime compact_stamps) {
+                    if (origin.csn == 0) {
+                        self.creation_stamp = PendingStamp.encode(origin.xmin);
+                    } else self.publishCreation(origin.csn);
+                } else {
+                    self.xmin = origin.xmin;
+                    self.xmin_csn = origin.csn;
+                }
+            }
         };
 
         pub const VersionOrigin = struct {
@@ -263,6 +400,9 @@ pub fn Storage(comptime config: types.Config) type {
         pub const Constraint = struct {
             kind: ConstraintKind = .check,
             name: V.Name = .{},
+            /// Primary constraints use Table.primary_constraint_oid, including
+            /// an implicit single-column primary key with no Constraint entry.
+            oid: u32 = 0,
             nulls_not_distinct: bool = false,
             column_count: u8 = 0,
             columns: [config.columns]u8 = @splat(0),
@@ -354,9 +494,12 @@ pub fn Storage(comptime config: types.Config) type {
             values: [partition_values]V.Cell = @splat(.null_value),
         };
 
+        const ScanHint = struct { slot: u32 align(64) = 0 };
+
         pub const Table = struct {
             live: bool = false,
             pending_create: bool = false,
+            pending_late_primary: bool = false,
             pending_drop: bool = false,
             dead_csn: u64 = 0,
             oid: u32 = 0,
@@ -365,6 +508,9 @@ pub fn Storage(comptime config: types.Config) type {
             columns: [config.columns]V.Column = @splat(.{}),
             /// Schema OID (cat_namespaces); public unless created in a schema.
             namespace: u32 = 2200,
+            primary_constraint_oid: u32 = 0,
+            /// Zero retains the legacy table OID + 1 identity.
+            primary_index_oid: u32 = 0,
             constraint_count: usize = 0,
             constraints: [constraint_capacity]Constraint = @splat(.{}),
             /// pg_class relkind: 'r' table, 'v' view, 'm' materialized view,
@@ -422,6 +568,61 @@ pub fn Storage(comptime config: types.Config) type {
             integral_layout: if (integral_enabled) IntegralLayout else void = if (integral_enabled) .{} else {},
             row_index: if (config.external_storage) []u32 else [row_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
             key_index: if (config.external_storage) []u32 else [key_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
+            /// Advisory position on its own cache line, outside the row directory.
+            seqscan_hint: ScanHint = .{},
+        };
+
+        const seqscan_grain: usize = 256;
+
+        pub fn supportsSynchronizedScan(table: *const Table) bool {
+            return config.synchronized_scan_rows != 0 and table.row_high >= config.synchronized_scan_rows and
+                table.row_high > seqscan_grain and table.row_high <= 0xffffffff and
+                (table.relkind == 'r' or table.relkind == 'm') and !table.pending_create and table.pending_truncate.owner.epoch == 0;
+        }
+
+        /// Each cursor fixes its own physical range and wraps at most once.
+        /// Readers share only an advisory location through relaxed atomics.
+        pub const PhysicalScan = struct {
+            high: usize,
+            start: usize,
+            next_slot: usize,
+            left: usize,
+            shared: bool,
+
+            pub const Range = struct { start: usize, end: usize };
+
+            pub fn init(table: *const Table, enabled: bool) PhysicalScan {
+                const shared = enabled and supportsSynchronizedScan(table);
+                const hint = if (shared) @atomicLoad(u32, &table.seqscan_hint.slot, .monotonic) else 0;
+                const start = if (hint < table.row_high) hint else 0;
+                return .{ .high = table.row_high, .start = start, .next_slot = start, .left = table.row_high, .shared = shared };
+            }
+
+            fn report(table: *const Table, slot: usize) void {
+                const writable: *Table = @constCast(table);
+                const next_hint: u32 = @intCast(slot);
+                if (@atomicLoad(u32, &writable.seqscan_hint.slot, .monotonic) != next_hint) {
+                    @atomicStore(u32, &writable.seqscan_hint.slot, next_hint, .monotonic);
+                }
+            }
+
+            pub fn next(self: *PhysicalScan, table: *const Table, max_rows: usize) ?Range {
+                if (self.left == 0) {
+                    if (self.shared) {
+                        report(table, self.start);
+                        self.shared = false;
+                    }
+                    return null;
+                }
+                const start = self.next_slot;
+                const limit = if (self.shared) @min(max_rows, seqscan_grain - start % seqscan_grain) else max_rows;
+                const count = @min(@min(self.left, self.high - start), limit);
+                if (self.shared and start % seqscan_grain == 0) report(table, start);
+                self.left -= count;
+                const end = start + count;
+                self.next_slot = if (end == self.high) 0 else end;
+                return .{ .start = start, .end = end };
+            }
         };
 
         /// A table every committed reader can see (created and not dropped).
@@ -443,8 +644,18 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         /// OIDs a table definition owns: itself and its primary-key index.
+        pub fn primaryIndexAlias(table_oid: u32, has_key: bool, explicit_oid: u32) u32 {
+            if (!has_key) return 0;
+            return if (explicit_oid == 0) table_oid + 1 else explicit_oid;
+        }
+
+        pub fn primaryIndexOid(table: *const Table) u32 {
+            return primaryIndexAlias(table.oid, keyed(table), table.primary_index_oid);
+        }
+
+        /// Contiguous allocation width. An explicit primary alias is separate.
         pub fn oidWidth(table: *const Table) u32 {
-            return 1 + @as(u32, @intFromBool(keyed(table)));
+            return 1 + @as(u32, @intFromBool(keyed(table) and table.primary_index_oid == 0));
         }
 
         fn observeBounds(bounds: *IntegerBounds, cell: *const V.Cell) void {
@@ -467,7 +678,7 @@ pub fn Storage(comptime config: types.Config) type {
             var row_scratch: VersionRowScratch = undefined;
             table.integer_bounds = @splat(.{});
             for (table.versions[0..table.version_high], 0..) |*version, index| {
-                if (version.row == 0) continue;
+                if (version.rowLink() == 0) continue;
                 for (versionValues(table, index, &row_scratch), table.integer_bounds[0..table.column_count]) |*cell, *bounds| {
                     observeBounds(bounds, cell);
                 }
@@ -483,7 +694,7 @@ pub fn Storage(comptime config: types.Config) type {
             if (table.primary_column != null) {
                 @memset(table.key_index[0..], 0);
                 for (0..table.version_high) |version| {
-                    if (table.versions[version].row != 0) indexKeyOnly(table, @intCast(version));
+                    if (table.versions[version].rowLink() != 0) indexKeyOnly(table, @intCast(version));
                 }
             }
             rebuildSecondary(table);
@@ -693,7 +904,7 @@ pub fn Storage(comptime config: types.Config) type {
             if (hashes == 0) return;
             for (0..hashes) |which| @memset(slotsOf(table, which), 0);
             for (0..table.version_high) |version| {
-                if (table.versions[version].row != 0) indexSecondary(table, @intCast(version));
+                if (table.versions[version].rowLink() != 0) indexSecondary(table, @intCast(version));
             }
         }
 
@@ -737,7 +948,7 @@ pub fn Storage(comptime config: types.Config) type {
                 const entry = slots[position] - 1;
                 const version = &table.versions[entry];
                 if (!plainKeyEqual(index, borrowVersionRow(table, entry, &row_scratch), cells)) continue;
-                if (visibleAt(table, version.row - 1, snap) != entry) continue;
+                if (visibleAt(table, version.rowSlot(), snap) != entry) continue;
                 if (count < out.len) out[count] = entry;
                 count += 1;
             }
@@ -785,7 +996,7 @@ pub fn Storage(comptime config: types.Config) type {
             while (slots[position] != 0) : (position = (position + 1) & mask) {
                 const entry = slots[position] - 1;
                 const version = &table.versions[entry];
-                if (version.row - 1 == own_slot) continue;
+                if (version.rowSlot() == own_slot) continue;
                 if (!sameColumns(index.keyColumns(), borrowVersionRow(table, entry, &row_scratch), cells)) continue;
                 if (classify(version, entry, snap, &waiting)) |state| return state;
             }
@@ -796,18 +1007,19 @@ pub fn Storage(comptime config: types.Config) type {
         /// a committed live row or a version this transaction still holds
         /// takes the key; another live transaction's version means waiting.
         pub fn classify(version: *const Version, index: usize, snap: Snapshot, waiting: *?u16) ?KeyState {
-            const marked = version.xmax.epoch != 0;
-            if (version.xmin_csn == 0) {
-                if (snap.own(version.xmin)) {
-                    if (marked and snap.own(version.xmax)) return null;
+            const marked = version.hasDeletion();
+            if (version.pendingCreation()) |creation| {
+                if (snap.own(creation.tx)) {
+                    if (marked and version.deletionOwnedBy(snap)) return null;
                     return .{ .taken = @intCast(index) };
                 }
-                if (!marked and waiting.* == null) waiting.* = version.xmin.slot;
+                if (!marked and waiting.* == null) waiting.* = creation.tx.slot;
                 return null;
             }
             if (!marked) return .{ .taken = @intCast(index) };
-            if (version.xmax_csn != 0 or snap.own(version.xmax)) return null;
-            if (waiting.* == null) waiting.* = version.xmax.slot;
+            const deletion = version.pendingDeletion() orelse return null;
+            if (snap.own(deletion.tx)) return null;
+            if (waiting.* == null) waiting.* = deletion.tx.slot;
             return null;
         }
 
@@ -827,6 +1039,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn copyRelayout(destination: *Table, source: *const Table, sources: []const u8, fills: []const V.Cell) void {
             destination.truncate_csn = source.truncate_csn;
             destination.pending_truncate = source.pending_truncate;
+            destination.seqscan_hint.slot = 0;
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
@@ -837,7 +1050,7 @@ pub fn Storage(comptime config: types.Config) type {
             @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
             for (source.versions[0..source.version_high], destination.versions[0..source.version_high], 0..) |*from, *to, version| {
                 to.* = from.*;
-                if (from.row != 0) relayoutVersion(destination, source, version, sources, fills);
+                if (from.rowLink() != 0) relayoutVersion(destination, source, version, sources, fills);
             }
             rebuildIndexes(destination);
             rebuildHints(destination);
@@ -847,7 +1060,7 @@ pub fn Storage(comptime config: types.Config) type {
         /// relayout every version, install the definition, rebuild indexes.
         pub fn redefine(table: *Table, name: V.Name, columns: []const V.Column, constraints: []const Constraint, extras: *const Extras, sources: []const u8, fills: []const V.Cell) void {
             for (table.versions[0..table.version_high], 0..) |*entry, version| {
-                if (entry.row != 0) relayoutVersion(table, table, version, sources, fills);
+                if (entry.rowLink() != 0) relayoutVersion(table, table, version, sources, fills);
             }
             table.name = name;
             table.column_count = columns.len;
@@ -928,7 +1141,7 @@ pub fn Storage(comptime config: types.Config) type {
             var waiting: ?u16 = null;
             for (table.versions[0..table.version_high], 0..) |*version, entry| {
                 if (comptime @TypeOf(control) != @TypeOf(null)) if (control) |accounting| try accounting.checkpoint();
-                if (version.row == 0 or version.row - 1 == own_slot) continue;
+                if (version.rowLink() == 0 or version.rowSlot() == own_slot) continue;
                 if (!sameColumns(columns, borrowVersionRow(table, entry, &row_scratch), cells)) continue;
                 if (classify(version, entry, snap, &waiting)) |state| return state;
             }
@@ -950,6 +1163,9 @@ pub fn Storage(comptime config: types.Config) type {
                 table.primary_column = index;
             };
             table.namespace = 2200;
+            table.primary_constraint_oid = 0;
+            table.primary_index_oid = 0;
+            table.pending_late_primary = false;
             table.constraint_count = 0;
             setExtras(table, &.{});
             table.truncate_csn = 0;
@@ -958,6 +1174,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.dead_csn = 0;
             table.pending_drop = false;
             table.row_high = 0;
+            table.seqscan_hint.slot = 0;
             table.row_used = 0;
             table.version_high = 0;
             table.version_used = 0;
@@ -982,6 +1199,8 @@ pub fn Storage(comptime config: types.Config) type {
                 destination.integral_layout = IntegralLayout.forColumns(destination.columns[0..destination.column_count]).?;
             };
             destination.namespace = source.namespace;
+            destination.primary_constraint_oid = source.primary_constraint_oid;
+            destination.primary_index_oid = source.primary_index_oid;
             destination.constraint_count = source.constraint_count;
             @memcpy(destination.constraints[0..source.constraint_count], source.constraints[0..source.constraint_count]);
             setExtras(destination, &extrasOf(source));
@@ -999,6 +1218,7 @@ pub fn Storage(comptime config: types.Config) type {
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
+            destination.seqscan_hint.slot = 0;
             destination.row_used = source.row_used;
             destination.version_high = source.version_high;
             destination.version_used = source.version_used;
@@ -1019,7 +1239,7 @@ pub fn Storage(comptime config: types.Config) type {
             @memcpy(destination.versions[0..source.version_high], source.versions[0..source.version_high]);
             if (comptime split_versions) {
                 for (source.versions[0..source.version_high], 0..) |*entry, version| {
-                    if (entry.row == 0) continue;
+                    if (entry.rowLink() == 0) continue;
                     if (comptime integral_enabled) if (integralBank(destination)) {
                         var row_scratch: VersionRowScratch = undefined;
                         writeIntegral(destination, version, borrowVersionRow(source, version, &row_scratch));
@@ -1033,7 +1253,7 @@ pub fn Storage(comptime config: types.Config) type {
                 @memset(destination.key_index, 0);
                 for (0..destination.row_high) |slot| if (destination.rows[slot].newest != 0) indexRow(destination, @intCast(slot));
                 if (destination.primary_column != null) for (0..destination.version_high) |version| {
-                    if (destination.versions[version].row != 0) indexKeyOnly(destination, @intCast(version));
+                    if (destination.versions[version].rowLink() != 0) indexKeyOnly(destination, @intCast(version));
                 };
                 rebuildSecondary(destination);
             } else {
@@ -1107,7 +1327,7 @@ pub fn Storage(comptime config: types.Config) type {
             if (comptime compact_enabled) {
                 if (!hasCompactScan(table)) return;
                 const entry = &table.versions[version];
-                const slot = entry.row - 1;
+                const slot = entry.rowSlot();
                 scanEnsure(table, @as(usize, slot) + 1);
                 table.scan_live[slot] = @intFromBool(live);
                 var mask: u64 = 0;
@@ -1123,19 +1343,20 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         pub fn created(version: *const Version, snap: Snapshot) bool {
-            if (version.xmin_csn != 0) return version.xmin_csn <= snap.csn;
-            return snap.own(version.xmin) and version.xmin_cid < snap.cid;
+            if (version.pendingCreation()) |creation| return snap.own(creation.tx) and creation.cid < snap.cid;
+            return version.creationCsn() <= snap.csn;
         }
 
         pub fn deleted(version: *const Version, snap: Snapshot) bool {
-            if (version.xmax.epoch == 0) return false;
-            if (version.xmax_csn != 0) return version.xmax_csn <= snap.csn;
-            return snap.own(version.xmax) and version.xmax_cid < snap.cid;
+            if (!version.hasDeletion()) return false;
+            if (version.pendingDeletion()) |deletion| return snap.own(deletion.tx) and deletion.cid < snap.cid;
+            return version.deletionCsn() <= snap.csn;
         }
 
         pub fn publishTruncate(table: *Table, csn: u64) void {
             table.truncate_csn = csn;
             table.pending_truncate = .{};
+            table.seqscan_hint.slot = 0;
             if (table.summary.valid) table.summary.csn = csn;
         }
 
@@ -1146,13 +1367,15 @@ pub fn Storage(comptime config: types.Config) type {
                 const version = &table.versions[ref - 1];
                 if (created(version, snap)) {
                     if (deleted(version, snap)) return null;
-                    if (version.xmin_csn != 0 and table.truncate_csn > snap.csn) return null;
+                    if (table.truncate_csn > snap.csn and version.creationCsn() != 0) return null;
                     const truncated = &table.pending_truncate;
-                    if (snap.own(truncated.owner) and truncated.cid < snap.cid and
-                        (version.xmin_csn != 0 or version.xmin_cid < truncated.cid)) return null;
+                    if (snap.own(truncated.owner) and truncated.cid < snap.cid) {
+                        const creation = version.pendingCreation() orelse return null;
+                        if (creation.cid < truncated.cid) return null;
+                    }
                     return ref - 1;
                 }
-                ref = version.older;
+                ref = version.olderLink();
             }
             return null;
         }
@@ -1164,11 +1387,11 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// The version created right after `version` in its row's chain.
         pub fn successor(table: *const Table, version: u32) ?u32 {
-            var ref = table.rows[table.versions[version].row - 1].newest;
+            var ref = table.rows[table.versions[version].rowSlot()].newest;
             while (ref != 0) {
                 const entry = &table.versions[ref - 1];
-                if (entry.older == version + 1) return ref - 1;
-                ref = entry.older;
+                if (entry.olderLink() == version + 1) return ref - 1;
+                ref = entry.olderLink();
             }
             return null;
         }
@@ -1294,9 +1517,20 @@ pub fn Storage(comptime config: types.Config) type {
             return V.compare(borrowVersionCell(table, version, column, &scratch), value) == 0;
         }
 
-        fn keyHome(table: *const Table, entry: u32) usize {
+        fn keyPosition(table: *const Table, version: u32) ?usize {
+            const column = table.primary_column orelse return null;
             var scratch: V.Cell = undefined;
-            return V.hash(borrowVersionCell(table, entry - 1, table.primary_column.?, &scratch)) & (table.key_index.len - 1);
+            const key = borrowVersionCell(table, version, column, &scratch);
+            // A historical version can predate a new primary key. The new
+            // index only contains non-null keys, and validation rejects any
+            // null visible under the DDL's validation snapshot.
+            if (key.* == .null_value) return null;
+            return V.hash(key) & (table.key_index.len - 1);
+        }
+
+        fn keyHome(table: *const Table, entry: u32) usize {
+            // Deletion visits only entries inserted by indexKeyOnly.
+            return keyPosition(table, entry - 1).?;
         }
 
         /// Backward-shift deletion keeps linear probing tombstone-free.
@@ -1459,12 +1693,12 @@ pub fn Storage(comptime config: types.Config) type {
             const key = borrowVersionCell(table, version, column, &scratch);
             if (key.* != .integer) { hint.state = .disabled; return; }
             if (hint.state == .empty) {
-                if (entry.row != 1 or entry.older != 0) { hint.state = .disabled; return; }
+                if (entry.rowLink() != 1 or entry.olderLink() != 0) { hint.state = .disabled; return; }
                 hint.* = .{ .state = .candidate, .base = key.integer };
             }
             // Dense key-to-slot mappings are stronger eligibility evidence
             // than monotonic order: sparse ordered keys disable speculation.
-            if (@as(i128, key.integer) != @as(i128, hint.base) + entry.row - 1)
+            if (@as(i128, key.integer) != @as(i128, hint.base) + entry.rowSlot())
                 hint.state = .disabled;
         }
 
@@ -1473,24 +1707,24 @@ pub fn Storage(comptime config: types.Config) type {
             for (table.column_order[0..table.column_count], 0..) |*proof, column| {
                 var scratch: V.Cell = undefined;
                 const value = borrowVersionCell(table, version, column, &scratch);
-                if (entry.older != 0) {
-                    if (entry.older == version + 1 or table.versions[entry.older - 1].row == 0) {
+                if (entry.olderLink() != 0) {
+                    if (entry.olderLink() == version + 1 or table.versions[entry.olderLink() - 1].rowLink() == 0) {
                         proof.state = .unordered;
                     } else if (proof.state != .unordered) {
                         var previous: V.Cell = undefined;
-                        const old = borrowVersionCell(table, entry.older - 1, column, &previous);
+                        const old = borrowVersionCell(table, entry.olderLink() - 1, column, &previous);
                         if (V.compare(value, old) != 0) proof.state = .unordered;
                     }
                     continue;
                 }
                 // The first row after reset/full reclamation can start a new
                 // proof. Other inserts must be appended to the directory.
-                if (entry.row == 1 and table.row_high == 1) {
+                if (entry.rowLink() == 1 and table.row_high == 1) {
                     proof.* = .{ .state = if (value.* == .null_value) .unordered else .one, .last = value.* };
                     continue;
                 }
                 if (proof.state == .unordered) continue;
-                if (entry.row != table.row_high or value.* == .null_value) { proof.state = .unordered; continue; }
+                if (entry.rowLink() != table.row_high or value.* == .null_value) { proof.state = .unordered; continue; }
                 const compared = V.compare(value, &proof.last);
                 proof.state = switch (proof.state) {
                     .one => if (compared > 0) .increasing else if (compared < 0) .decreasing else .unordered,
@@ -1503,15 +1737,13 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         fn indexKeyOnly(table: *Table, version: u32) void {
-            if (table.primary_column == null) return;
-            var position = keyHome(table, version + 1);
+            var position = keyPosition(table, version) orelse return;
             while (table.key_index[position] != 0) position = (position + 1) & (table.key_index.len - 1);
             table.key_index[position] = version + 1;
         }
 
         fn unindexKey(table: *Table, version: u32) void {
-            if (table.primary_column == null) return;
-            var position = keyHome(table, version + 1);
+            var position = keyPosition(table, version) orelse return;
             while (table.key_index[position] != version + 1) {
                 if (table.key_index[position] == 0) return;
                 position = (position + 1) & (table.key_index.len - 1);
@@ -1533,7 +1765,7 @@ pub fn Storage(comptime config: types.Config) type {
                 const index = entry - 1;
                 if (!versionCellEquals(table, index, column, key)) continue;
                 const version = &table.versions[index];
-                if (version.row - 1 == own_slot) continue;
+                if (version.rowSlot() == own_slot) continue;
                 if (classify(version, index, snap, &waiting)) |state| return state;
             }
             return if (waiting) |slot| .{ .wait = slot } else .free;
@@ -1563,7 +1795,7 @@ pub fn Storage(comptime config: types.Config) type {
                 const entry = table.key_index[position];
                 if (entry == 0) return null;
                 if (versionCellEquals(table, entry - 1, column, value)) {
-                    const slot = table.versions[entry - 1].row - 1;
+                    const slot = table.versions[entry - 1].rowSlot();
                     if (visibleAt(table, slot, snap) == entry - 1) return entry - 1;
                 }
                 position = (position + 1) & (table.key_index.len - 1);
@@ -1573,7 +1805,7 @@ pub fn Storage(comptime config: types.Config) type {
         /// Directory slot of the row visible to `snap` whose key equals value.
         pub fn lookupKeyAt(table: *const Table, value: *const V.Cell, snap: Snapshot) ?u32 {
             const version = lookupVersionAt(table, value, snap) orelse return null;
-            return table.versions[version].row - 1;
+            return table.versions[version].rowSlot();
         }
 
         /// Directory slot of the committed row whose key equals value.
@@ -1592,13 +1824,11 @@ pub fn Storage(comptime config: types.Config) type {
             const version = allocVersion(table);
             const full_width = cells.len == config.columns;
             table.versions[version] = .{
-                .row = origin.row + 1,
-                .xmin = origin.xmin,
-                .xmin_cid = origin.cid,
-                .xmin_csn = origin.csn,
-                .older = origin.older,
+                .row_link = origin.row + 1,
+                .older_link = origin.older,
                 .cells = if (comptime split_versions) {} else if (full_width) cells[0..config.columns].* else @splat(.null_value),
             };
+            table.versions[version].initCreation(origin);
             if (comptime integral_enabled) if (integralBank(table)) {
                 writeIntegral(table, version, cells);
                 table.rows[origin.row].newest = version + 1;
@@ -1616,7 +1846,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.version_used += 1;
             if (table.version_free != 0) {
                 const version = table.version_free - 1;
-                table.version_free = table.versions[version].older;
+                table.version_free = table.versions[version].olderLink();
                 return version;
             }
             table.version_high += 1;
@@ -1624,8 +1854,8 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         fn freeVersion(table: *Table, version: u32) void {
-            table.versions[version].row = 0;
-            table.versions[version].older = table.version_free;
+            table.versions[version].setRowLink(0);
+            table.versions[version].setOlderLink(table.version_free);
             table.version_free = version + 1;
             table.version_used -= 1;
         }
@@ -1651,14 +1881,14 @@ pub fn Storage(comptime config: types.Config) type {
 
         /// Unlink, unindex and free one version; frees its row if empty.
         pub fn reclaimVersion(table: *Table, version: u32) void {
-            const slot = table.versions[version].row - 1;
+            const slot = table.versions[version].rowSlot();
             const row = &table.rows[slot];
             if (row.newest == version + 1) {
-                row.newest = table.versions[version].older;
+                row.newest = table.versions[version].olderLink();
             } else {
                 var previous = row.newest - 1;
-                while (table.versions[previous].older != version + 1) previous = table.versions[previous].older - 1;
-                table.versions[previous].older = table.versions[version].older;
+                while (table.versions[previous].olderLink() != version + 1) previous = table.versions[previous].olderLink() - 1;
+                table.versions[previous].setOlderLink(table.versions[version].olderLink());
             }
             unindexKey(table, version);
             unindexSecondary(table, version);
@@ -1675,7 +1905,8 @@ pub fn Storage(comptime config: types.Config) type {
             var freed: usize = 0;
             for (first..end) |index| {
                 const version = &table.versions[index];
-                if (version.row == 0 or version.xmax_csn == 0 or version.xmax_csn > horizon) continue;
+                const deletion_csn = version.deletionCsn();
+                if (version.rowLink() == 0 or deletion_csn == 0 or deletion_csn > horizon) continue;
                 reclaimVersion(table, @intCast(index));
                 freed += 1;
             }
@@ -1712,7 +1943,7 @@ pub fn Storage(comptime config: types.Config) type {
                     table.row_generation +%= 1;
                     table.rows[write].generation = table.row_generation;
                     var ref = table.rows[write].newest;
-                    while (ref != 0) : (ref = table.versions[ref - 1].older) table.versions[ref - 1].row = @intCast(write + 1);
+                    while (ref != 0) : (ref = table.versions[ref - 1].olderLink()) table.versions[ref - 1].setRowLink(@intCast(write + 1));
                 }
                 write += 1;
             }
@@ -1752,8 +1983,8 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn stats(table: *const Table) Stats {
             var out: Stats = .{ .live_rows = liveRows(table), .row_slots = table.row_used, .row_high = table.row_high, .versions = table.version_used, .next_rowid = table.next_rowid };
             for (table.versions[0..table.version_high]) |*version| {
-                if (version.row == 0) continue;
-                if (version.xmin_csn == 0 or (version.xmax.epoch != 0 and version.xmax_csn == 0)) out.pending += 1;
+                if (version.rowLink() == 0) continue;
+                if (version.creationCsn() == 0 or version.pendingDeletion() != null) out.pending += 1;
             }
             return out;
         }
