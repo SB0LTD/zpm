@@ -2,7 +2,7 @@
 
 `src/ps5/` is what a kernel and a libkernel need to run a decrypted PS5 executable natively on an x86-64 computer: no emulator, no relinking step, no translation of the program's code. A PS5 is an x86-64 machine, so the code runs as it is. What has to be supplied is what the code talks to: a kernel that answers its system calls, and libraries bound by Sony's hashed names.
 
-What is here: the names, the kernel's ABI, a loader that reads PS5 files and binds them, a first libkernel with threads and their locks, and the runtime that puts them together. A small program in the PS5's format loads, prints and exits, and one with a module of its own starts that module and calls into it, both in tests here and on Galaxy's kernel. Not here: every library but libkernel, the console's own system modules, graphics and sound. No real game runs.
+What is here: the names, the kernel's ABI, a loader that reads PS5 files and binds them, a first libkernel with threads, their locks and event queues, the display library, the GPU's command packets with a first driver for them, and the runtime that puts them together. A small program in the PS5's format loads, prints and exits; one with a module of its own starts that module and calls into it; one shows frames it drew itself in a window, paced by the screen. All of that runs in tests here and on Galaxy's kernel. Not here: a renderer (draw commands are read and counted, and nothing draws them yet), shaders, the graphics library that writes the command packets, sound, the controller, and the console's other system modules. No real game runs.
 
 Galaxy's kernel uses `abi.sig` for its PS5 personality (`src/kernel/galaxy_ps5.sig` there), and its PS5 runtime binary is `runtime.sig` with a `_start`.
 
@@ -18,8 +18,12 @@ Everything is allocation-free: plain values, comptime tables, caller-provided bu
 | `link.sig` | The linker: modules given addresses, copied in, their exports entered in one table keyed by NID, their relocations applied and imports bound, thread storage laid out. |
 | `fixture.sig` | Small PS5 files made in memory, for the tests. `hello()` is a whole program with real code: it prints through an imported `write`, calls a library a host may not have, and exits. `game()` and `gameModule()` are an executable and the module it brings: the module has a start function and a thread-local variable, and the executable exits with what the module's function returns. |
 | `sys.sig` | The system calls as a program makes them: the number in `rax`, the carry flag folded into a negative errno. x86-64 only. |
-| `libkernel.sig` | The PS5's kernel library in Sig, a first set: files, sleeps, clocks, memory, the process, the stack protector's canary, `__tls_get_addr`, and modules loaded by path (`sceKernelLoadStartModule`, `sceKernelDlsym`). With `pthread.sig`, 197 names. |
+| `libkernel.sig` | The PS5's kernel library in Sig, a first set: files, sleeps, clocks, memory, the process, the stack protector's canary, `__tls_get_addr`, and modules loaded by path (`sceKernelLoadStartModule`, `sceKernelDlsym`). With `pthread.sig` and `equeue.sig`, 214 names. |
 | `pthread.sig` | libkernel's threads and what they wait on: threads and their attributes, mutexes, condition variables, read-write locks, thread-specific keys, once. Each under its POSIX name and Sony's. |
+| `equeue.sig` | libkernel's event queues: what a game waits on to hear of a flip, a GPU interrupt, a timer, or a word from another of its threads. Kept in the process. |
+| `videoout.sig` | The display library (libSceVideoOut): buffers, flips paced by a clock thread that stands in for the screen's refresh, flip and vblank events, the PS4's and the PS5's calls. Where frames go is the host's (`display`). |
+| `pm4.sig` | The PS5 GPU's command packets as data (AMD's PM4): headers, opcodes, the three register banks, a reader that checks every length, a writer. |
+| `agcdriver.sig` | The graphics driver library (libSceAgcDriver), a first part: a game's submitted command buffers are carried out in order by a worker thread. Registers, labels, interrupts, waits, skips, calls and flips happen; draws are handed to a renderer that is not here yet. |
 | `runtime.sig` | The program a kernel starts for a PS5 executable. It loads and links the game and the modules it brought in its own process, binds imports to libkernel or to a stand-in that names what is missing, makes the first thread's storage, runs the modules' start functions and jumps to the game. |
 | `ps5.sig` | The module root. |
 
@@ -123,6 +127,7 @@ These files make system calls, so they run only under a kernel that speaks the P
 - **A thread** is one mapping: a guard page, its stack, its thread storage, its control block and state. A joined thread's goes back when the kernel says the thread is gone; a detached one's when later threads are made.
 - **A handle of a thread is looked up, never read through**: one that names a thread long gone answers ESRCH, as FreeBSD's does.
 - **Not here:** cancelling a thread (its state and type are kept; nothing cancels), signals to a thread, priority inheritance and ceilings (the attributes are kept and read back), process-shared objects, semaphores, Sony's event flags.
+- **A library's own threads** (the display's clock, the GPU's worker) are not counted among the program's: the process ends when the program's last thread does.
 
 A kernel whose wake wakes every waiter (Galaxy's does) makes a contended lock cost more than it should; the code is correct either way.
 
@@ -133,12 +138,51 @@ A kernel whose wake wakes every waiter (Galaxy's does) makes a contended lock co
 Stand-ins made after the first ones became code go in a page of their own, so no page a thread may be running in is ever writable again.
 
 
+## Event queues
+
+On the console an event queue is the kernel's kqueue. Here it is kept in the process (`equeue.sig`), because everything that posts to one is in the process too: the display, the GPU's queue, the game's own threads, timers.
+
+- **A queue** is one mapping with room for about a thousand events. A game's handle is its address, looked up among the queues there are before anything is read through it. A deleted queue's memory goes back when the last thread inside it has left; a thread waiting on it comes back with `EBADF`.
+- **A post** is a few instructions under a lock, and enters the kernel only when a thread is asleep on the queue. A wait that finds an event ready does not enter it at all (71 ns for a post and a read in Galaxy's twin).
+- **User events** are FreeBSD's: one added plain stays ready for every reader until it is deleted, one added "edge" is read once per post.
+- **Timers:** a repeating one counts the times it ran out since it was read; a one-time one is gone once read. No thread runs them: the wait itself looks at the clock.
+- **Other libraries post** through `add`, `post` and `remove` (the display's flips and vblanks, the GPU's interrupts).
+- **Not here:** events on files and sockets, which need the kernel's own queue.
+
+## The display
+
+`videoout.sig` is libSceVideoOut. A game opens the display, registers buffers (the PS4's way with 32-bit format codes, or the PS5's with 64-bit ones and groups it names), submits flips, and waits on an event queue for each.
+
+- **A clock thread stands in for the screen's refresh** (59.94 Hz). At each tick it counts a vblank and takes the oldest waiting flip, at the rate the game set. So a game that waits for its flips runs at the screen's rate: 60 frames took 0.994 to 0.999 s in the twin.
+- **Where a frame goes** is the host's: `display` (open, a place to write the frame, show, close). With none, flips and their events still happen.
+- **Where a frame comes from:** the buffer's own memory when the game's code drew it (rows of pixels, each of the six formats converted to 8 bits a colour), or `source` when the GPU path did.
+- **A buffer's memory is read only while its flip is shown.** `sceVideoOutUnregisterBuffers` and `sceVideoOutClose` wait for a flip in progress to finish, so that when they return the memory is the game's to unmap. Flips of those buffers still waiting become flips of no picture: they happen, with their events, and show nothing.
+- **The flip status** is written as the game's console lays it out: 128 bytes for a PS5 game, 64 for one that registered its buffers the PS4's way.
+- **Events** carry 12 bits of time, a count of how often they happened since they were read (stopping at 15), and 48 bits of their own: a flip's argument, a vblank's number.
+- **Not here:** stereo, the cursor, HDR output (10-bit and float buffers are shown as 8-bit), the other outputs, flips triggered by the GPU's end of pipe. The event's identity in the queue is this library's own choice (a game asks `sceVideoOutGetEventId`); what a console puts there is not established. Giving back the group of buffers that is on the screen succeeds here; one open project answers "busy" for it.
+
+## The GPU's commands
+
+A game does not write GPU commands itself. It calls the graphics library (libSceAgc), which writes AMD PM4 packets into a buffer the game owns, and hands the buffer to the driver (libSceAgcDriver). Both are console system modules, so both are this module's to provide. `pm4.sig` is the format; `agcdriver.sig` is a first part of the driver. The library that writes the packets is not here yet.
+
+- **A submit call returns at once.** A worker thread stands in for the GPU's command processor and reads the buffer packet by packet, straight from the game's memory, as the GPU would.
+- **Registers** are kept in three banks (shader, context, user configuration) with the values a queue starts with; the context registers can be cleared, put aside and brought back.
+- **Draws** (plain, indexed, from an offset, indirect) are handed to `renderer` with the state before them. With no renderer they are counted and said once.
+- **Labels and interrupts:** what the GPU writes to memory in passing (`RELEASE_MEM`, `WRITE_DATA`, `COPY_DATA`, `DMA_DATA`) is written in the buffer's order, after the renderer has finished what came before. An interrupt reaches the game through an event queue (`sceAgcDriverAddEqEvent`), with the number the game gave it.
+- **Flow:** the queue stands still at `WAIT_REG_MEM` until memory compares as asked, skips what `COND_EXEC` says, calls into other buffers (`INDIRECT_BUFFER`, sixteen deep), waits at `REWIND` for the game to finish the buffer, and honours a predicate read from memory.
+- **A flip in a command buffer** is one of two packets that are this library pair's own (a NOP with a sub-type): it goes to the display after what was drawn before it. It counts as pending from the moment its buffer is submitted, and a flip the game's own code asks for (`sceVideoOutSubmitFlip`) goes behind the buffers already waiting.
+- **A buffer that calls or follows itself without end** is left after 2^26 words of packets, as a GPU would hang on it; the queue goes on to the next submission.
+- **A packet this does not carry out** is named once in the log and stepped over; a word that is no packet ends its buffer.
+- **Not here:** compute queues, draws of several records at once, stream-out, the GDS and constant RAM, occlusion predicates, semaphores, flips at the end of pipe.
+
 ## Sources
 
 - FreeBSD 11.0's sources (BSD licence): the convention, the base numbers, the structures.
 - The file format: the ELF and System V ABI documents. Sony's types and tags come from open loaders and tools, cross-checked against each other (shadPS4, Kyty, RPCSX, sce-elf, the OpenOrbis toolchain's notes, AnyPS5's docs).
 - Sony's call numbers: two independent open reimplementations of the kernel (RPCSX and fpPS4) list the same numbers from 99 to 676. The PS5's additions (677 to 722) come from RPCSX alone.
 - The NID algorithm and salt are public and carried by every open tool for these files. The test vectors are names whose NIDs are widely published.
+
+- The display library's calls, numbers and structures: shadPS4 and AnyPS5, which agree except where the text above says so. The GPU's packets: AMD's PM4 as the Linux kernel's and Mesa's headers give it, and the PS5's use of it as AnyPS5's driver documents it.
 
 Open projects were read as documentation only. There is no Sony code, key or firmware here, and nothing decrypts anything: the input is a program its owner dumped and decrypted themselves.
 
@@ -149,5 +193,7 @@ sig build test-ps5
 ```
 
 The tests hash published names to their NIDs, check the structures' sizes and offsets against FreeBSD 11's, and check each conversion. For the loader they build an executable and a module in memory, load and link them, and check every bound word and the thread storage. On an x86-64 Linux host one test goes further: it loads the hello program into executable memory, binds its imports to functions in the test, and calls its entry, so a file in the PS5's format really runs. Galaxy's twin test (`galaxy/bench/test-ps5.sh` there) runs a program that makes the system calls for real.
+
+The event queues, the display and the driver are tested here with no kernel under them: a queue in the test's own memory, the display's clock turned by hand, the test as the GPU's worker. What needs threads that sleep and a real clock (a wait woken by a post, flips at the screen's rate, the queue standing still at a wait) is in Galaxy's twin test.
 
 What the tests cannot show: that a real game's files load. The reader and linker follow what open loaders document, and no retail file has been through them.

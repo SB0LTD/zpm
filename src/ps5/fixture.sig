@@ -296,13 +296,18 @@ fn w32(out: []u8, at: u64, v: u32) void {
     std.mem.writeInt(u32, out[at..][0..4], v, .little);
 }
 
+/// The import of `hello` that nothing provides: a library and a function
+/// there are not (its NID as text: 3rrCqd5kad0).
+pub const ABSENT_LIBRARY = "libSceAbsent";
+pub const ABSENT_SYMBOL = "sceAbsentCall";
+
 /// A whole small program in the PS5's format, with real code: it prints
 /// `message` and exits, the way a game would.
 ///
 ///   write(1, message, len)      libkernel
-///   sceVideoOutOpen()           libSceVideoOut (a library a loader's host
-///                               may well not have: what happens then is
-///                               the host's to show)
+///   sceAbsentCall()             libSceAbsent (a library there is not, so
+///                               that no loader's host has it: what
+///                               happens then is the host's to show)
 ///   _exit(0)                    libkernel
 ///
 /// Its three imports are bound through jump slots, and the message is
@@ -316,7 +321,7 @@ fn w32(out: []u8, at: u64, v: u32) void {
 ///   09  48 8B 35 ..        mov  rsi, [rip + ptr]  ; -> the message
 ///   10  BA ..              mov  edx, len
 ///   15  FF 15 ..           call [rip + write]
-///   1B  FF 15 ..           call [rip + sceVideoOutOpen]
+///   1B  FF 15 ..           call [rip + sceAbsentCall]
 ///   21  31 FF              xor  edi, edi
 ///   23  FF 15 ..           call [rip + _exit]
 ///   29  48 83 C4 08        add  rsp, 8
@@ -324,7 +329,7 @@ fn w32(out: []u8, at: u64, v: u32) void {
 pub fn hello(buf: []u8, message: []const u8) []const u8 {
     const SLOT_WRITE = DATA + 0x00;
     const SLOT_EXIT = DATA + 0x08;
-    const SLOT_VIDEO = DATA + 0x10;
+    const SLOT_ABSENT = DATA + 0x10;
     const POINTER = DATA + 0x18;
     const MESSAGE = DATA + 0x40;
     std.debug.assert(message.len <= 512);
@@ -333,11 +338,11 @@ pub fn hello(buf: []u8, message: []const u8) []const u8 {
     b.selfModule("eboot", 0);
     const kernel_module = b.neededModule("libkernel", 1);
     const kernel = b.importLibrary("libkernel", 1);
-    const video_module = b.neededModule("libSceVideoOut", 2);
-    const video = b.importLibrary("libSceVideoOut", 2);
+    const absent_module = b.neededModule(ABSENT_LIBRARY, 2);
+    const absent = b.importLibrary(ABSENT_LIBRARY, 2);
     b.jumpSlot(SLOT_WRITE, b.importSymbol(nid.of("write"), kernel, kernel_module, elf.STT_FUNC));
     b.jumpSlot(SLOT_EXIT, b.importSymbol(nid.of("_exit"), kernel, kernel_module, elf.STT_FUNC));
-    b.jumpSlot(SLOT_VIDEO, b.importSymbol(nid.of("sceVideoOutOpen"), video, video_module, elf.STT_FUNC));
+    b.jumpSlot(SLOT_ABSENT, b.importSymbol(nid.of(ABSENT_SYMBOL), absent, absent_module, elf.STT_FUNC));
     b.relative(POINTER, MESSAGE);
 
     var code = [_]u8{
@@ -356,7 +361,7 @@ pub fn hello(buf: []u8, message: []const u8) []const u8 {
     w32(&code, 0x0c, @intCast(POINTER - (TEXT + 0x10)));
     w32(&code, 0x11, @intCast(message.len));
     w32(&code, 0x17, @intCast(SLOT_WRITE - (TEXT + 0x1b)));
-    w32(&code, 0x1d, @intCast(SLOT_VIDEO - (TEXT + 0x21)));
+    w32(&code, 0x1d, @intCast(SLOT_ABSENT - (TEXT + 0x21)));
     w32(&code, 0x25, @intCast(SLOT_EXIT - (TEXT + 0x29)));
 
     var data = [_]u8{0} ** (0x40 + 512);

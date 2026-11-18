@@ -38,6 +38,10 @@ pub const fixture = @import("fixture.sig");
 pub const sys = @import("sys.sig");
 pub const libkernel = @import("libkernel.sig");
 pub const pthread = @import("pthread.sig");
+pub const equeue = @import("equeue.sig");
+pub const videoout = @import("videoout.sig");
+pub const pm4 = @import("pm4.sig");
+pub const agcdriver = @import("agcdriver.sig");
 pub const runtime = @import("runtime.sig");
 
 test {
@@ -46,12 +50,16 @@ test {
     _ = elf;
     _ = link;
     _ = fixture;
+    _ = pm4;
     // (x86-64, and where a symbol is linked under its own name: the
     // runtime's assembly calls one of its Sig functions by it)
     const native = @import("builtin");
     if (native.cpu.arch == .x86_64 and (native.os.tag == .linux or native.os.tag == .freestanding)) {
         _ = libkernel;
         _ = pthread;
+        _ = equeue;
+        _ = videoout;
+        _ = agcdriver;
         _ = runtime;
     }
 }

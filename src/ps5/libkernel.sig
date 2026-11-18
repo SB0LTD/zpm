@@ -24,6 +24,7 @@ const sys = @import("sys.sig");
 const abi = @import("abi.sig");
 const nid = @import("nid.sig");
 pub const pthread = @import("pthread.sig");
+pub const equeue = @import("equeue.sig");
 
 const S = abi.Sys;
 const E = abi.E;
@@ -332,7 +333,7 @@ fn entry(comptime name: []const u8, comptime f: anytype) struct { []const u8, *c
 }
 
 /// Every name this libkernel answers, by NID.
-pub const exports = nid.Table(*const anyopaque, &(own ++ pthread.exports));
+pub const exports = nid.Table(*const anyopaque, &(own ++ pthread.exports ++ equeue.exports));
 
 const own = [_]struct { []const u8, *const anyopaque }{
     entry("sceKernelLoadStartModule", &sceKernelLoadStartModule),

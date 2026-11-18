@@ -62,6 +62,25 @@ pub fn wakeAll(word: *const u32) void {
     wakeWord(word, EVERYONE);
 }
 
+/// The time on the clock that does not jump, in nanoseconds.
+pub fn nowNs() u64 {
+    var now: abi.Timespec = .{};
+    _ = sys.call(S.clock_gettime, abi.CLOCK.MONOTONIC, @intFromPtr(&now), 0, 0, 0, 0);
+    return @as(u64, @intCast(now.sec)) * 1_000_000_000 + @as(u64, @intCast(now.nsec));
+}
+
+/// Sleeps while `word` holds `value`: until woken, or until `until_ns` on
+/// that clock when one is given. (It may come back early: look again.)
+pub fn waitWhileUntil(word: *const u32, value: u32, until_ns: ?u64) void {
+    const ns = until_ns orelse return waitWhile(word, value);
+    const t = abi.UmtxTime{
+        .timeout = .{ .sec = @intCast(ns / 1_000_000_000), .nsec = @intCast(ns % 1_000_000_000) },
+        .flags = abi.UmtxTime.ABSTIME,
+        .clockid = abi.CLOCK.MONOTONIC,
+    };
+    _ = waitWord(word, value, &t);
+}
+
 /// A lock in one word: 0 free, 1 held, 2 held and someone may be asleep on
 /// it. Taking a free one and giving back an uncontended one never enter
 /// the kernel.
@@ -280,6 +299,9 @@ pub const Thread = extern struct {
     detached: bool = false,
     done: bool = false,
     joined: bool = false,
+    /// One of the libraries' own threads (the display's clock), not the
+    /// program's: the program has ended when its own threads have.
+    service: bool = false,
     /// Read locks it holds (a reader that holds one is not made to stand
     /// behind a waiting writer: it would wait for itself).
     rdlocks: u32 = 0,
@@ -473,8 +495,8 @@ fn exitThread(result: ?*anyopaque) noreturn {
     threads.lock.lock();
     t.result = result;
     t.done = true;
-    threads.active -= 1;
-    const last = threads.active == 0;
+    if (!t.service) threads.active -= 1;
+    const last = !t.service and threads.active == 0;
     if (t.detached and t.mapping != 0) {
         t.next_dead = threads.dead;
         @atomicStore(?*Thread, &threads.dead, t, .release);
@@ -499,6 +521,20 @@ const AttrValues = struct {
 };
 
 fn create(out: ?*?*Thread, attr: ?*const usize, entry: ?Entry, arg: ?*anyopaque, name: ?[*:0]const u8) c_int {
+    return createAs(out, attr, entry, arg, name, false);
+}
+
+/// A thread of a library's own (the display's clock): detached, and not
+/// counted among the program's, so the program's last thread ending still
+/// ends the process. False when it could not be made.
+pub fn spawnService(entry: Entry, arg: ?*anyopaque, name: [*:0]const u8) bool {
+    var t: ?*Thread = null;
+    if (createAs(&t, null, entry, arg, name, true) != 0) return false;
+    _ = detach(t);
+    return true;
+}
+
+fn createAs(out: ?*?*Thread, attr: ?*const usize, entry: ?Entry, arg: ?*anyopaque, name: ?[*:0]const u8, service: bool) c_int {
     const o = out orelse return E.INVAL;
     const f = entry orelse return E.INVAL;
     var a = AttrValues{};
@@ -541,6 +577,7 @@ fn create(out: ?*?*Thread, attr: ?*const usize, entry: ?Entry, arg: ?*anyopaque,
     t.prio = a.prio;
     t.affinity = if (a.affinity != 0) a.affinity else allCores();
     setName(t, name);
+    t.service = service;
 
     // Its storage is filled and the thread listed in one step: a module
     // loaded meanwhile either is among those filled here, or finds this
@@ -549,7 +586,7 @@ fn create(out: ?*?*Thread, attr: ?*const usize, entry: ?Entry, arg: ?*anyopaque,
     if (tls_init) |fill| fill(tp);
     t.next = threads.all;
     threads.all = t;
-    threads.active += 1;
+    if (!service) threads.active += 1;
     threads.lock.unlock();
     // (before it runs: a new thread may read its own handle from there)
     o.* = t;
@@ -569,7 +606,7 @@ fn create(out: ?*?*Thread, attr: ?*const usize, entry: ?Entry, arg: ?*anyopaque,
     if (k < 0) {
         threads.lock.lock();
         unlink(t);
-        threads.active -= 1;
+        if (!service) threads.active -= 1;
         threads.lock.unlock();
         o.* = null;
         unmap(t);

@@ -40,6 +40,8 @@ const elf = @import("elf.sig");
 const link = @import("link.sig");
 const libkernel = @import("libkernel.sig");
 const pthread = @import("pthread.sig");
+const videoout = @import("videoout.sig");
+const agcdriver = @import("agcdriver.sig");
 
 const S = abi.Sys;
 const RW = abi.PROT.READ | abi.PROT.WRITE;
@@ -267,7 +269,28 @@ fn protect(_: ?*anyopaque, addr: u64, size: u64, read: bool, write: bool, exec: 
 }
 
 fn builtin(_: ?*anyopaque, library: []const u8, n: nid.Nid) ?u64 {
-    return libkernel.find(library, n);
+    if (libkernel.find(library, n)) |addr| return addr;
+    if (videoout.find(library, n)) |addr| return addr;
+    if (agcdriver.find(library, n)) |addr| return addr;
+    for (providers[0..provider_count]) |f| {
+        if (f(library, n)) |addr| return addr;
+    }
+    return null;
+}
+
+/// A library the runtime's host brings besides the ones here (the GPU
+/// path, which needs the host's own graphics code): a library's name and
+/// a NID in, the function's address out, or null.
+pub const Provider = *const fn (library: []const u8, n: nid.Nid) ?u64;
+
+var providers: [8]Provider = undefined;
+var provider_count: usize = 0;
+
+/// Adds a library provider. Call before `start` or `standalone`.
+pub fn provide(f: Provider) void {
+    if (provider_count == providers.len) return;
+    providers[provider_count] = f;
+    provider_count += 1;
 }
 
 fn release(_: ?*anyopaque, addr: u64, size: u64) void {
