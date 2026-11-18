@@ -5409,7 +5409,7 @@ pub fn Database(comptime config: Config) type {
                     const slot = self.visibleTableSlot(seq.owner, snapshot) orelse continue;
                     const owner = &self.tables[slot];
                     if (seq.owner_column >= owner.column_count) continue;
-                    const kind = switch (owner.columns[seq.owner_column].default_kind) {
+                    const kind: u8 = switch (owner.columns[seq.owner_column].default_kind) {
                         .identity_always, .identity_by_default => 'i',
                         .default => 'a',
                         else => continue,
