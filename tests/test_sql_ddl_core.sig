@@ -1384,8 +1384,8 @@ fn attributeLayout() !void {
     reset();
     try run("CREATE TABLE layout (b bool, s smallint, n name, t text, u uuid, m macaddr, a bigint[], r int8range)");
     try run("CREATE TYPE layout_composite AS (d numeric(8,2), a text[], b bigint[], t timetz)");
-    const table = "SELECT attname, attlen, attalign FROM pg_attribute WHERE attrelid = 'layout'::regclass ORDER BY attnum";
-    const composite = "SELECT attname, attlen, attalign FROM pg_attribute WHERE attrelid = 'layout_composite'::regclass ORDER BY attnum";
+    const table = "SELECT attname, attlen, attalign FROM pg_attribute WHERE attrelid = 'layout'::regclass AND attnum > 0 ORDER BY attnum";
+    const composite = "SELECT attname, attlen, attalign FROM pg_attribute WHERE attrelid = 'layout_composite'::regclass AND attnum > 0 ORDER BY attnum";
     try expect(table, "b|1|c;s|2|s;n|64|c;t|-1|i;u|16|c;m|6|i;a|-1|d;r|-1|d");
     try expect(composite, "d|-1|i;a|-1|i;b|-1|d;t|12|d");
     try sameState(&.{ table, composite });
