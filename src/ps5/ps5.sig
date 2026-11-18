@@ -15,9 +15,12 @@
 //!   fixture — small PS5 files made in memory, for tests;
 //!   sys — the system calls as a program makes them (x86-64);
 //!   libkernel — the PS5's kernel library in Sig: files, memory, time, the
-//!         process (a first set);
+//!         process, modules loaded by path (a first set);
+//!   pthread — libkernel's threads and what they wait on: mutexes,
+//!         conditions, read-write locks, keys, once;
 //!   runtime — the program a kernel starts for a PS5 executable: it loads
-//!         and links the game in its own process and jumps to it.
+//!         and links the game and its modules in its own process, starts
+//!         the modules and jumps to it.
 //!
 //! No Sony code, keys or firmware: the formats are documented in public
 //! (FreeBSD's sources, open loaders), and the input is a program its owner
@@ -34,6 +37,7 @@ pub const fixture = @import("fixture.sig");
 // (x86-64 only: they are that CPU's instructions. Nothing above needs them.)
 pub const sys = @import("sys.sig");
 pub const libkernel = @import("libkernel.sig");
+pub const pthread = @import("pthread.sig");
 pub const runtime = @import("runtime.sig");
 
 test {
@@ -47,6 +51,7 @@ test {
     const native = @import("builtin");
     if (native.cpu.arch == .x86_64 and (native.os.tag == .linux or native.os.tag == .freestanding)) {
         _ = libkernel;
+        _ = pthread;
         _ = runtime;
     }
 }

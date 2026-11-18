@@ -9,7 +9,8 @@
 //!          provides it;
 //!   after  the segments get the protections the file asks for (the
 //!          relocated read-only part included), and the caller runs the
-//!          modules' start functions and jumps to the executable.
+//!          modules' start functions (`startOrder` says in what order: a
+//!          module after the modules it needs) and jumps to the executable.
 //!
 //! An import is `NID#library#module`. It is looked up by its NID and its
 //! library's name: first among the loaded modules' exports (a game's own
@@ -107,7 +108,9 @@ pub const Name = struct {
 
 /// A loaded module.
 pub const Module = struct {
+    /// Its own name (the file says; else the file's), and the file's.
     name: Name = .{},
+    file: Name = .{},
     kind: elf.Kind = .module,
     /// Where address 0 of the file is in memory.
     base: u64 = 0,
@@ -132,10 +135,20 @@ pub const Module = struct {
     tls_filesz: u64 = 0,
     tls_memsz: u64 = 0,
     tls_offset: u64 = 0,
+    /// The loaded modules it names as needed, by index: one bit each (set
+    /// by `link`; modules past the 64th are not recorded).
+    needs: u64 = 0,
     /// The file, until the module is linked (the caller keeps its bytes
     /// until then).
     image: elf.Image = undefined,
     linked: bool = false,
+    /// `startOrder` has handed it out: its start function is the caller's
+    /// to run, once.
+    started: bool = false,
+    /// It could not be linked (`abandon`): nothing is bound to it any
+    /// more, and it is as if it had never been loaded, but for the
+    /// addresses it keeps.
+    abandoned: bool = false,
 };
 
 /// One exported symbol.
@@ -167,8 +180,16 @@ pub const Linker = struct {
     /// The bytes below the thread pointer the modules' thread storage takes.
     tls_size: u64 = 0,
     tls_align: u64 = 16,
+    /// The most it may take: threads already running have that much and no
+    /// more, so a module whose storage would not fit is not loaded.
+    tls_limit: u64 = std.math.maxInt(u64),
+    /// The module the last `link` failed on (NO_MODULE: none): the caller
+    /// may `abandon` it and link the rest again.
+    failed: u16 = NO_MODULE,
     /// How much was bound where (for a log line).
     stats: Stats = .{},
+
+    pub const NO_MODULE: u16 = std.math.maxInt(u16);
 
     pub const Stats = struct {
         relocations: u64 = 0,
@@ -211,6 +232,7 @@ pub const Linker = struct {
         if (im.tls) |t| {
             const end = std.math.add(u64, l.tls_size, t.memsz) catch return error.BadSegment;
             tls_offset = std.math.add(u64, end, (0 -% t.vaddr -% end) & (t.alignment - 1)) catch return error.BadSegment;
+            if (tls_offset > l.tls_limit) return error.NoSpace;
         }
         const start = l.host.reserve(l.host.ctx, if (fixed) im.lo else 0, im.span()) orelse return error.NoSpace;
         if (start % elf.PAGE != 0 or (fixed and start != im.lo)) {
@@ -226,6 +248,7 @@ pub const Linker = struct {
         const m = &l.modules[index];
         m.* = .{
             .name = Name.of(im.moduleName() orelse name),
+            .file = Name.of(name),
             .kind = im.kind,
             .base = base,
             .start = start,
@@ -247,14 +270,16 @@ pub const Linker = struct {
             m.tls_memsz = t.memsz;
             m.tls_offset = tls_offset;
         }
-        l.module_count += 1;
         // (a module whose exports do not fit is not loaded at all: nothing
-        // of it stays, its addresses and its thread storage's place go back)
+        // of it stays, its addresses and its thread storage's place go
+        // back. It is counted only once they are in: a thread being made
+        // meanwhile reads the table up to the count, and must not find a
+        // module whose memory is about to go.)
         l.enterExports(index) catch |e| {
-            l.module_count -= 1;
             l.host.release(l.host.ctx, start, im.span());
             return e;
         };
+        l.module_count += 1;
         if (im.tls) |t| {
             l.tls_size = tls_offset;
             l.tls_align = @max(l.tls_align, t.alignment);
@@ -317,15 +342,12 @@ pub const Linker = struct {
             const lib = l.knownLibrary(info.library);
             const mask = l.exports.len - 1;
             var at: usize = @as(usize, @truncate(info.nid)) & mask;
-            var taken = false;
-            while (l.exports[at].library != 0) : (at = (at + 1) & mask) {
-                // (the first module to export a name keeps it)
-                if (l.exports[at].nid == info.nid and l.exports[at].library == lib) {
-                    taken = true;
-                    break;
-                }
-            }
-            if (taken) continue;
+            // Every export is entered, after any earlier one of the same
+            // name: a lookup finds the first module's (the first to export
+            // a name keeps it), and a module can still be asked for its
+            // own, or take the first one's place should that one be
+            // abandoned.
+            while (l.exports[at].library != 0) at = (at + 1) & mask;
             l.exports[at] = .{
                 .nid = info.nid,
                 .addr = if (is_tls) s.value else m.base +% s.value,
@@ -337,6 +359,18 @@ pub const Linker = struct {
         }
     }
 
+    /// What module `index` exports under a NID, whatever its library (a
+    /// program asking one module for a symbol by name).
+    pub fn lookupIn(l: *const Linker, index: u16, n: nid.Nid) ?Export {
+        if (index >= l.module_count or l.modules[index].abandoned) return null;
+        const mask = l.exports.len - 1;
+        var at: usize = @as(usize, @truncate(n)) & mask;
+        while (l.exports[at].library != 0) : (at = (at + 1) & mask) {
+            if (l.exports[at].nid == n and l.exports[at].module == index) return l.exports[at];
+        }
+        return null;
+    }
+
     /// A loaded module's export, by its library's name and NID.
     pub fn lookup(l: *const Linker, lib_name: []const u8, n: nid.Nid) ?Export {
         const lib = l.knownLibrary(lib_name);
@@ -344,7 +378,9 @@ pub const Linker = struct {
         const mask = l.exports.len - 1;
         var at: usize = @as(usize, @truncate(n)) & mask;
         while (l.exports[at].library != 0) : (at = (at + 1) & mask) {
-            if (l.exports[at].nid == n and l.exports[at].library == lib) return l.exports[at];
+            const e = l.exports[at];
+            // (an abandoned module provides nothing)
+            if (e.nid == n and e.library == lib and !l.modules[e.module].abandoned) return e;
         }
         return null;
     }
@@ -352,14 +388,27 @@ pub const Linker = struct {
     /// Binds every module loaded since the last link, then gives each its
     /// final protections.
     pub fn link(l: *Linker) Error!void {
+        l.failed = NO_MODULE;
         for (l.modules[0..l.module_count], 0..) |*m, i| {
             if (m.linked) continue;
+            // (a relocation applied twice writes the same word twice: a
+            // link that failed further on may be run again)
+            errdefer l.failed = @intCast(i);
             const names = try elf.Names.init(&m.image);
             try l.relocate(@intCast(i), &names, m.image.rela);
             try l.relocate(@intCast(i), &names, m.image.jmprel);
+            // Which loaded modules it says it needs (for the order they
+            // are started in). A name nobody loaded is not an error here:
+            // its imports were bound, or stood in for, one by one.
+            var needed = m.image.names(.needed_module);
+            while (needed.next()) |n| {
+                const other = l.indexOf(n.name) orelse continue;
+                if (other < 64 and other != i and !l.modules[other].abandoned) m.needs |= @as(u64, 1) << @intCast(other);
+            }
         }
-        for (l.modules[0..l.module_count]) |*m| {
+        for (l.modules[0..l.module_count], 0..) |*m, i| {
             if (m.linked) continue;
+            errdefer l.failed = @intCast(i);
             try l.protect(m);
             m.linked = true;
             // The file may go now: nothing of the module points into it.
@@ -370,6 +419,65 @@ pub const Linker = struct {
             m.image.rela = &.{};
             m.image.jmprel = &.{};
         }
+    }
+
+    /// A module that could not be linked (or, linked, could not be made
+    /// usable) is given up: it keeps its addresses, but from here on it
+    /// exports nothing, is never linked again nor started, and later
+    /// links go on without it. Modules not yet linked that were bound to
+    /// it are bound again by the next `link`, to whoever else provides
+    /// the name or to the host's stand-in.
+    pub fn abandon(l: *Linker, index: u16) void {
+        if (index >= l.module_count) return;
+        const m = &l.modules[index];
+        m.abandoned = true;
+        m.linked = true;
+        m.started = true;
+        m.image.bytes = &.{};
+        m.image.dynamic = &.{};
+        m.image.strtab = &.{};
+        m.image.symtab = &.{};
+        m.image.rela = &.{};
+        m.image.jmprel = &.{};
+    }
+
+    fn indexOf(l: *const Linker, name: []const u8) ?usize {
+        for (l.loaded(), 0..) |*m, i| {
+            if (std.mem.eql(u8, m.name.slice(), name[0..@min(name.len, NAME_MAX)])) return i;
+        }
+        return null;
+    }
+
+    /// The linked modules whose start functions have not been handed out
+    /// yet, in the order to run them: a module after every module it
+    /// needs (modules that need each other: in the order they were
+    /// loaded). Executables are not among them: a program starts itself.
+    /// Fills `out` and returns the part filled; call again for the rest
+    /// when `out` was too small.
+    pub fn startOrder(l: *Linker, out: []u16) []u16 {
+        var n: usize = 0;
+        var visiting: u64 = 0;
+        for (0..l.module_count) |i| l.visit(@intCast(i), &visiting, out, &n);
+        return out[0..n];
+    }
+
+    fn visit(l: *Linker, index: u16, visiting: *u64, out: []u16, n: *usize) void {
+        const m = &l.modules[index];
+        if (!m.linked or m.started or m.kind.isExecutable()) return;
+        const bit: u64 = if (index < 64) @as(u64, 1) << @intCast(index) else 0;
+        if (visiting.* & bit != 0) return; // (it needs itself, by a way round)
+        visiting.* |= bit;
+        var needs = m.needs;
+        while (needs != 0) {
+            const other: u16 = @intCast(@ctz(needs));
+            needs &= needs - 1;
+            if (other < l.module_count) l.visit(other, visiting, out, n);
+        }
+        visiting.* &= ~bit;
+        if (m.started or n.* == out.len) return;
+        m.started = true;
+        out[n.*] = index;
+        n.* += 1;
     }
 
     const Target = struct { value: u64, module: u16, tls: bool };
@@ -506,13 +614,17 @@ pub const Linker = struct {
     /// `staticTls().size` bytes of memory below it. Each module's initial
     /// bytes, then zeroes.
     pub fn initTls(l: *const Linker, tp: u64) void {
-        for (l.loaded()) |m| {
-            if (m.tls_index == 0) continue;
-            const block: [*]u8 = @ptrFromInt(@as(usize, @intCast(tp - m.tls_offset)));
-            const src: [*]const u8 = @ptrFromInt(@as(usize, @intCast(m.tls_image)));
-            @memcpy(block[0..@intCast(m.tls_filesz)], src[0..@intCast(m.tls_filesz)]);
-            @memset(block[@intCast(m.tls_filesz)..@intCast(m.tls_memsz)], 0);
-        }
+        for (l.loaded()) |*m| initTlsOf(m, tp);
+    }
+
+    /// One module's part of a thread's storage (a module loaded while
+    /// threads run: its block is filled in each of them).
+    pub fn initTlsOf(m: *const Module, tp: u64) void {
+        if (m.tls_index == 0) return;
+        const block: [*]u8 = @ptrFromInt(@as(usize, @intCast(tp - m.tls_offset)));
+        const src: [*]const u8 = @ptrFromInt(@as(usize, @intCast(m.tls_image)));
+        @memcpy(block[0..@intCast(m.tls_filesz)], src[0..@intCast(m.tls_filesz)]);
+        @memset(block[@intCast(m.tls_filesz)..@intCast(m.tls_memsz)], 0);
     }
 
     /// The module with this thread storage index.
@@ -541,6 +653,8 @@ const TestHost = struct {
     missing_asked: u32 = 0,
     objects_missing: u32 = 0,
     released: u32 = 0,
+    /// Whether an import nobody has gets no stand-in (the link then fails).
+    refuse_missing: bool = false,
 
     const USLEEP: u64 = 0x1111_0000;
     const STAND_IN: u64 = 0x2222_0000;
@@ -579,6 +693,7 @@ const TestHost = struct {
     fn missing(ctx: ?*anyopaque, what: Missing) ?u64 {
         const t: *TestHost = @ptrCast(@alignCast(ctx.?));
         t.missing_asked += 1;
+        if (t.refuse_missing) return null;
         if (what.kind == .object) {
             t.objects_missing += 1;
             return OBJECT_STAND_IN;
@@ -937,6 +1052,163 @@ const Ran = struct {
         return @intFromPtr(&standIn);
     }
 };
+
+test "a game and the module it brought: bound to each other, the module's start first" {
+    const native = @import("builtin");
+    if (native.cpu.arch != .x86_64 or native.os.tag != .linux) return error.SkipZigTest;
+    Ran.text_len = 0;
+    var exe_buf: [fixture.SIZE]u8 = undefined;
+    var mod_buf: [fixture.SIZE]u8 = undefined;
+    var modules: [4]Module = undefined;
+    var names: [8]Name = undefined;
+    var table: [64]Export = undefined;
+    var l = Linker.init(.{ .reserve = Ran.reserve, .protect = Ran.protect, .builtin = Ran.builtin, .missing = Ran.missing }, .{ .modules = &modules, .libraries = &names, .exports = &table });
+    const exe = try l.load("eboot.bin", fixture.game(&exe_buf, "the game\n"));
+    const mod = try l.load("libGame.prx", fixture.gameModule(&mod_buf, "its module\n"));
+    try l.link();
+    try std.testing.expectEqualStrings("libGame", l.loaded()[mod].name.slice());
+    try std.testing.expectEqualStrings("libGame.prx", l.loaded()[mod].file.slice());
+    // The executable says it needs the module, and found it.
+    try std.testing.expectEqual(@as(u64, 1) << @intCast(mod), l.loaded()[exe].needs);
+    try std.testing.expectEqual(@as(u32, 1), l.stats.from_modules);
+    try std.testing.expectEqual(@as(u32, 0), l.stats.stand_ins);
+    const m = l.loaded()[mod];
+    // Its call into the module goes to the module's function.
+    try std.testing.expectEqual(m.base + fixture.GAME_ANSWER_AT, word(l.loaded()[exe].base + fixture.DATA + 0x10));
+    // The module's variable is found from the thread pointer.
+    try std.testing.expectEqual(0 -% m.tls_offset, word(m.base + fixture.GAME_TPOFF_AT));
+    try std.testing.expectEqual(m.base + fixture.GAME_ANSWER_AT, l.lookupIn(mod, nid.of(fixture.GAME_SYMBOL)).?.addr);
+    try std.testing.expect(l.lookupIn(exe, nid.of(fixture.GAME_SYMBOL)) == null);
+
+    // What is to be started: the module, not the program; and once.
+    var order: [4]u16 = undefined;
+    const todo = l.startOrder(&order);
+    try std.testing.expectEqualSlices(u16, &.{mod}, todo);
+    try std.testing.expectEqual(@as(usize, 0), l.startOrder(&order).len);
+    // Its start function, run: it prints through its own import and
+    // leaves its mark where its other function reads it.
+    const start: *const fn (usize, ?*const anyopaque, ?*anyopaque) callconv(.c) c_int = @ptrFromInt(@as(usize, @intCast(m.init)));
+    try std.testing.expectEqual(@as(c_int, 0), start(0, null, null));
+    try std.testing.expectEqualStrings("its module\n", Ran.text[0..Ran.text_len]);
+    // (it answers with the argument it was given)
+    try std.testing.expectEqual(@as(c_int, 7), start(7, null, null));
+    try std.testing.expectEqual(fixture.GAME_STARTED, @as(*const u32, @ptrFromInt(@as(usize, @intCast(m.base + fixture.GAME_STARTED_AT)))).*);
+}
+
+test "modules are started after the modules they need" {
+    var t = TestHost{};
+    var bufs: [3][fixture.SIZE]u8 = undefined;
+    var modules: [4]Module = undefined;
+    var names: [8]Name = undefined;
+    var table: [64]Export = undefined;
+    var l = Linker.init(t.host(), .{ .modules = &modules, .libraries = &names, .exports = &table });
+    // Loaded in the order a, b, c; a needs c, c needs b, and b needs a
+    // back (a ring a real set of modules can have).
+    const needs = [3][]const u8{ "libC", "libA", "libB" };
+    const own = [3][]const u8{ "libA", "libB", "libC" };
+    for (0..3) |i| {
+        var b = fixture.Builder.init(&bufs[i], .module);
+        b.selfModule(own[i], 0);
+        _ = b.neededModule(needs[i], 1);
+        b.init_at = fixture.TEXT;
+        _ = try l.load(own[i], b.finish());
+    }
+    try l.link();
+    var order: [4]u16 = undefined;
+    // a wants c first, c wants b first, b wants a, which is already being
+    // placed: so b, then c, then a.
+    try std.testing.expectEqualSlices(u16, &.{ 1, 2, 0 }, l.startOrder(&order));
+    try std.testing.expectEqual(@as(usize, 0), l.startOrder(&order).len);
+}
+
+test "a module whose thread storage would not fit the threads there are is not loaded" {
+    var t = TestHost{};
+    var buf: [fixture.SIZE]u8 = undefined;
+    var modules: [2]Module = undefined;
+    var names: [4]Name = undefined;
+    var table: [16]Export = undefined;
+    var l = Linker.init(t.host(), .{ .modules = &modules, .libraries = &names, .exports = &table });
+    l.tls_limit = 32;
+    var b = fixture.Builder.init(&buf, .module);
+    b.selfModule("libBig", 0);
+    b.tls(fixture.DATA + 0x100, 0, 64, 8);
+    try std.testing.expectError(error.NoSpace, l.load("libBig.prx", b.finish()));
+    try std.testing.expectEqual(@as(usize, 0), l.loaded().len);
+    // (nothing was reserved for it)
+    try std.testing.expectEqual(@as(u32, 0), t.released);
+    l.tls_limit = 64;
+    _ = try l.load("libBig.prx", b.finish());
+}
+
+test "a module whose link failed is left out of every later one" {
+    var t = TestHost{};
+    t.refuse_missing = true;
+    var bufs: [2][fixture.SIZE]u8 = undefined;
+    var modules: [2]Module = undefined;
+    var names: [4]Name = undefined;
+    var table: [16]Export = undefined;
+    var l = Linker.init(t.host(), .{ .modules = &modules, .libraries = &names, .exports = &table });
+    // It exports a function, and wants one nobody has.
+    var bad = fixture.Builder.init(&bufs[0], .module);
+    bad.selfModule("libBad", 0);
+    const own = bad.exportLibrary("libBad", 1);
+    _ = bad.exportSymbol(nid.of("badThing"), own, 0, fixture.TEXT + 0x10, elf.STT_FUNC);
+    const nm = bad.neededModule("libNone", 1);
+    const nl = bad.importLibrary("libNone", 2);
+    bad.jumpSlot(fixture.DATA, bad.importSymbol(nid.of("nothingHasThis"), nl, nm, elf.STT_FUNC));
+    bad.init_at = fixture.TEXT;
+    const index = try l.load("libBad.prx", bad.finish());
+    try std.testing.expect(l.lookup("libBad", nid.of("badThing")) != null);
+    try std.testing.expectError(error.Unresolved, l.link());
+    try std.testing.expectEqual(index, l.failed);
+    l.abandon(index);
+    // Abandoned, it provides nothing: not by its library, not when asked itself.
+    try std.testing.expect(l.lookup("libBad", nid.of("badThing")) == null);
+    try std.testing.expect(l.lookupIn(index, nid.of("badThing")) == null);
+    // A good one after it, which imports what the bad one exported: it
+    // links, to a stand-in and not into the abandoned module; and only
+    // the good one is started.
+    t.refuse_missing = false;
+    var good = fixture.Builder.init(&bufs[1], .module);
+    good.selfModule("libGood", 0);
+    const bm = good.neededModule("libBad", 1);
+    const bl = good.importLibrary("libBad", 1);
+    good.jumpSlot(fixture.DATA, good.importSymbol(nid.of("badThing"), bl, bm, elf.STT_FUNC));
+    good.init_at = fixture.TEXT;
+    const second = try l.load("libGood.prx", good.finish());
+    try l.link();
+    try std.testing.expectEqual(Linker.NO_MODULE, l.failed);
+    try std.testing.expectEqual(TestHost.STAND_IN, word(l.loaded()[second].base + fixture.DATA));
+    try std.testing.expectEqual(@as(u64, 0), l.loaded()[second].needs);
+    var order: [2]u16 = undefined;
+    try std.testing.expectEqualSlices(u16, &.{second}, l.startOrder(&order));
+}
+
+test "two modules export one name: the first one's is found, and each can be asked for its own" {
+    var t = TestHost{};
+    var bufs: [3][fixture.SIZE]u8 = undefined;
+    var modules: [3]Module = undefined;
+    var names: [4]Name = undefined;
+    var table: [16]Export = undefined;
+    var l = Linker.init(t.host(), .{ .modules = &modules, .libraries = &names, .exports = &table });
+    var index: [2]u16 = undefined;
+    for (0..2) |i| {
+        var b = fixture.Builder.init(&bufs[i], .module);
+        b.selfModule(if (i == 0) "libFirst" else "libSecond", 0);
+        const lib = b.exportLibrary("libShared", 1);
+        _ = b.exportSymbol(nid.of("sharedName"), lib, 0, fixture.TEXT + 0x10 * (@as(u64, i) + 1), elf.STT_FUNC);
+        index[i] = try l.load(if (i == 0) "first.prx" else "second.prx", b.finish());
+    }
+    try l.link();
+    const first = l.loaded()[index[0]];
+    const second = l.loaded()[index[1]];
+    try std.testing.expectEqual(first.base + fixture.TEXT + 0x10, l.lookup("libShared", nid.of("sharedName")).?.addr);
+    try std.testing.expectEqual(first.base + fixture.TEXT + 0x10, l.lookupIn(index[0], nid.of("sharedName")).?.addr);
+    try std.testing.expectEqual(second.base + fixture.TEXT + 0x20, l.lookupIn(index[1], nid.of("sharedName")).?.addr);
+    // With the first given up, the second one's is what there is.
+    l.abandon(index[0]);
+    try std.testing.expectEqual(second.base + fixture.TEXT + 0x20, l.lookup("libShared", nid.of("sharedName")).?.addr);
+}
 
 test "the hello program, loaded and run: it prints through its imports and exits" {
     const native = @import("builtin");

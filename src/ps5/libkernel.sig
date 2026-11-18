@@ -23,42 +23,18 @@ const std = @import("std");
 const sys = @import("sys.sig");
 const abi = @import("abi.sig");
 const nid = @import("nid.sig");
+pub const pthread = @import("pthread.sig");
 
 const S = abi.Sys;
 const E = abi.E;
 
 // ── A thread's own state ────────────────────────────────────────────────────
 
-/// What libkernel keeps for each thread; the thread's control block (FS)
-/// points at it from its third word.
-pub const Thread = extern struct {
-    errno: c_int = 0,
-    _pad: c_int = 0,
-    /// The kernel's id for it.
-    tid: i64 = 0,
-};
-
-/// The control block FS points at: itself, the thread's storage vector,
-/// its Thread (FreeBSD's layout, which a game's own code reads: `fs:0`).
-pub const Tcb = extern struct {
-    self: u64,
-    dtv: u64 = 0,
-    thread: u64,
-};
-
-var early: Thread = .{};
-
-/// Set by the runtime once the first thread has its control block: from
-/// then on every thread has one before it runs a game's code.
-pub var threads_ready: bool = false;
-
-/// The calling thread's state (before the first control block exists: one
-/// shared block, for the code that runs first).
-pub fn thread() *Thread {
-    if (!threads_ready) return &early;
-    const t = sys.fs16();
-    return if (t == 0) &early else @ptrFromInt(t);
-}
+/// Threads and their locks are pthread.sig's; a thread's state (its errno
+/// among it) is what its control block points at.
+pub const Thread = pthread.Thread;
+pub const Tcb = pthread.Tcb;
+pub const thread = pthread.thread;
 
 // ── What the runtime tells it ───────────────────────────────────────────────
 
@@ -69,6 +45,14 @@ pub var started_us: u64 = 0;
 /// `__tls_get_addr`'s answer: the runtime knows where each module's
 /// thread storage is.
 pub var tls_address: ?*const fn (module: u64, offset: u64) callconv(.c) usize = null;
+
+/// Modules loaded while the game runs: the runtime's (it has the linker).
+/// `load`: a path as the game says it, and the arguments its start
+/// function gets; the module's handle and (through `result`) what that
+/// function returned, or a negated errno. `symbol`: an address a module
+/// exports under a name, or 0.
+pub var module_load: ?*const fn (path: [*:0]const u8, args: usize, argp: ?*const anyopaque, result: ?*c_int) i64 = null;
+pub var module_symbol: ?*const fn (handle: c_int, name: [*:0]const u8) u64 = null;
 
 /// Two objects a program's start code reads straight from libkernel (it
 /// imports the variables themselves, not functions): the program's name,
@@ -219,6 +203,28 @@ fn __tls_get_addr(ti: *const TlsIndex) callconv(.c) usize {
     return f(ti.module, ti.offset);
 }
 
+// ── Modules ─────────────────────────────────────────────────────────────────
+
+/// Loads a module and runs its start function. The handle, or an error.
+fn sceKernelLoadStartModule(path: ?[*:0]const u8, args: usize, argp: ?*const anyopaque, flags: u32, opt: ?*const anyopaque, result: ?*c_int) callconv(.c) c_int {
+    _ = flags;
+    _ = opt;
+    const p = path orelse return @intCast(sceError(E.INVAL));
+    const load = module_load orelse return @intCast(sceError(E.NOSYS));
+    return @intCast(sce(load(p, args, argp, result)));
+}
+
+/// The address module `handle` exports under `name`, through `out`.
+fn sceKernelDlsym(handle: c_int, name: ?[*:0]const u8, out: ?*u64) callconv(.c) c_int {
+    const n = name orelse return @intCast(sceError(E.INVAL));
+    const o = out orelse return @intCast(sceError(E.INVAL));
+    const find_symbol = module_symbol orelse return @intCast(sceError(E.NOSYS));
+    const addr = find_symbol(handle, n);
+    if (addr == 0) return @intCast(sceError(E.SRCH));
+    o.* = addr;
+    return 0;
+}
+
 // ── Time ────────────────────────────────────────────────────────────────────
 
 fn sleepUs(us: u64) i64 {
@@ -326,7 +332,11 @@ fn entry(comptime name: []const u8, comptime f: anytype) struct { []const u8, *c
 }
 
 /// Every name this libkernel answers, by NID.
-pub const exports = nid.Table(*const anyopaque, &.{
+pub const exports = nid.Table(*const anyopaque, &(own ++ pthread.exports));
+
+const own = [_]struct { []const u8, *const anyopaque }{
+    entry("sceKernelLoadStartModule", &sceKernelLoadStartModule),
+    entry("sceKernelDlsym", &sceKernelDlsym),
     entry("open", &open),
     entry("sceKernelOpen", &sceKernelOpen),
     entry("close", &close),
@@ -363,7 +373,7 @@ pub const exports = nid.Table(*const anyopaque, &.{
     entry("munmap", &munmap),
     entry("sceKernelMunmap", &sceKernelMunmap),
     entry("sceKernelMapFlexibleMemory", &sceKernelMapFlexibleMemory),
-});
+};
 
 /// Whether a library name is one of libkernel's: its own, its POSIX face,
 /// or one of the variants a game may name (`libkernel_unity` and the like).

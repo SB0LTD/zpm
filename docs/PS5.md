@@ -2,7 +2,7 @@
 
 `src/ps5/` is what a kernel and a libkernel need to run a decrypted PS5 executable natively on an x86-64 computer: no emulator, no relinking step, no translation of the program's code. A PS5 is an x86-64 machine, so the code runs as it is. What has to be supplied is what the code talks to: a kernel that answers its system calls, and libraries bound by Sony's hashed names.
 
-What is here: the names, the kernel's ABI, a loader that reads PS5 files and binds them, a first libkernel, and the runtime that puts them together. A small program in the PS5's format loads, prints and exits, both in a test here and on Galaxy's kernel. Not here: every library but libkernel, the modules a game bundles, a game's own threads, and anything about graphics. The loader has been run only on files made for its tests, never on a real game.
+What is here: the names, the kernel's ABI, a loader that reads PS5 files and binds them, a first libkernel with threads and their locks, and the runtime that puts them together. A small program in the PS5's format loads, prints and exits, and one with a module of its own starts that module and calls into it, both in tests here and on Galaxy's kernel. Not here: every library but libkernel, the console's own system modules, graphics and sound. No real game runs.
 
 Galaxy's kernel uses `abi.sig` for its PS5 personality (`src/kernel/galaxy_ps5.sig` there), and its PS5 runtime binary is `runtime.sig` with a `_start`.
 
@@ -16,10 +16,11 @@ Everything is allocation-free: plain values, comptime tables, caller-provided bu
 | `abi.sig` | The PS5 kernel's system call ABI as data: the convention, every call's number and name, FreeBSD's errno values, open and mmap flags, clock ids, the structures (`struct stat`, directory entries, `thr_param`, `_umtx_time`), and the conversions to the values a Linux-shaped kernel service takes. |
 | `elf.sig` | A PS5 (or PS4) executable or module read as a file: segments, thread storage, the dynamic tables, and the modules and libraries it names. A view of the file's bytes with every offset checked. |
 | `link.sig` | The linker: modules given addresses, copied in, their exports entered in one table keyed by NID, their relocations applied and imports bound, thread storage laid out. |
-| `fixture.sig` | Small PS5 files made in memory, for the tests. `hello()` is a whole program with real code: it prints through an imported `write`, calls a library a host may not have, and exits. |
+| `fixture.sig` | Small PS5 files made in memory, for the tests. `hello()` is a whole program with real code: it prints through an imported `write`, calls a library a host may not have, and exits. `game()` and `gameModule()` are an executable and the module it brings: the module has a start function and a thread-local variable, and the executable exits with what the module's function returns. |
 | `sys.sig` | The system calls as a program makes them: the number in `rax`, the carry flag folded into a negative errno. x86-64 only. |
-| `libkernel.sig` | The PS5's kernel library in Sig, a first set of 34 functions: files, sleeps, clocks, memory, the process, the stack protector's canary, `__tls_get_addr`. |
-| `runtime.sig` | The program a kernel starts for a PS5 executable. It loads and links the game in its own process, binds imports to libkernel or to a stand-in that names what is missing, makes the first thread's storage, and jumps to the game. |
+| `libkernel.sig` | The PS5's kernel library in Sig, a first set: files, sleeps, clocks, memory, the process, the stack protector's canary, `__tls_get_addr`, and modules loaded by path (`sceKernelLoadStartModule`, `sceKernelDlsym`). With `pthread.sig`, 197 names. |
+| `pthread.sig` | libkernel's threads and what they wait on: threads and their attributes, mutexes, condition variables, read-write locks, thread-specific keys, once. Each under its POSIX name and Sony's. |
+| `runtime.sig` | The program a kernel starts for a PS5 executable. It loads and links the game and the modules it brought in its own process, binds imports to libkernel or to a stand-in that names what is missing, makes the first thread's storage, runs the modules' start functions and jumps to the game. |
 | `ps5.sig` | The module root. |
 
 ## NIDs
@@ -101,15 +102,36 @@ The host supplies five functions: `reserve` (zeroed writable memory at a multipl
 
 `runtime.start(ap)` is a PS5 process's whole start. A host gives it FreeBSD's argument block; `argv[1]` is the executable.
 
-1. It maps the file and runs the linker with libkernel as `builtin`.
+1. It maps the executable and every `.prx` in `sce_module` beside it (in name order), and runs the linker with libkernel as `builtin`. A file still encrypted as the console stores it is named and left out. A module that cannot be linked is named and left out; the executable that cannot be is the end.
 2. For a function nothing provides, `missing` writes a **stand-in**: 16 bytes of code that load the import's number and jump to one routine, which prints `not implemented: library:NID was called` once and returns 0. A game that only passes through such a call carries on, and the log lists what it wanted. For an object nothing provides it hands out zeroed storage of the object's size (code there would be read as data), and names it in the log.
-3. It maps the first thread's storage, with FreeBSD's control block at the thread pointer (`fs:0` is its own address), and sets FS.
+3. It maps the first thread's storage, with FreeBSD's control block at the thread pointer (`fs:0` is its own address), and sets FS. Every thread's storage has 1 MiB to spare, so a module loaded later finds its place in threads already running.
 4. It maps the game's stack: the size the executable's process parameters ask for (2 MiB if they do not say), with a page below it that faults. The arguments are copied onto it as FreeBSD lays them out (`argc`, `argv`, an empty environment).
-5. It jumps to the entry with `rdi` the argument block and `rsi` a clean-up function.
+5. On that stack it runs each module's start function (the file's `DT_INIT`, called with no arguments), a module after the modules it says it needs, then jumps to the entry with `rdi` the argument block and `rsi` a clean-up function.
 
 libkernel's functions are ordinary Sig functions with the C calling convention, listed in one comptime table keyed by NID. POSIX names answer -1 and `errno`; `sceKernel` names answer `0x80020000 + errno`. Both `libkernel` and `libScePosix` resolve to the same table. A game's `/app0` is the folder its executable is in.
 
-Both files make system calls, so they run only under a kernel that speaks the PS5's ABI. Their tests here cover what does not: the export table, error encoding, path mapping, and a stand-in's bytes.
+These files make system calls, so they run only under a kernel that speaks the PS5's ABI. Their tests here cover what does not: the export table, error encoding, path mapping, a stand-in's bytes, the layouts, and a lock's word when nobody else wants it. Galaxy's twin test runs the rest for real.
+
+## Threads and locks
+
+`pthread.sig` is FreeBSD's thread library as a PS5 program sees it, on three things a kernel gives: `thr_new`, `thr_exit`, and `_umtx_op`'s plain wait and wake.
+
+- **A lock lives in user memory.** One nobody else holds is taken and given back with a compare-and-swap and no system call (about 15 ns for the pair in Galaxy's twin). A thread enters the kernel only to sleep, or to wake one that does.
+- **A handle is a pointer the library fills in**, as on the console: 0 is a static initialiser, and the object is made on first use. Objects come from a pool of 64-byte slots mapped 64 KiB at a time; a slot given back is used again.
+- **Two faces for each call:** `pthread_*` answers 0 or an errno, `scePthread*` answers 0 or `0x80020000 + errno`.
+- **Mutexes:** FreeBSD's four types, checked for their owner as FreeBSD's are (the default is the error-checking one). An adaptive one is watched for a moment before its waiter sleeps.
+- **A thread** is one mapping: a guard page, its stack, its thread storage, its control block and state. A joined thread's goes back when the kernel says the thread is gone; a detached one's when later threads are made.
+- **A handle of a thread is looked up, never read through**: one that names a thread long gone answers ESRCH, as FreeBSD's does.
+- **Not here:** cancelling a thread (its state and type are kept; nothing cancels), signals to a thread, priority inheritance and ceilings (the attributes are kept and read back), process-shared objects, semaphores, Sony's event flags.
+
+A kernel whose wake wakes every waiter (Galaxy's does) makes a contended lock cost more than it should; the code is correct either way.
+
+## Modules loaded while the game runs
+
+`sceKernelLoadStartModule(path, args, argp, ...)` maps the file, loads and links it, fills its thread storage in every thread there is, and calls its start function with the arguments. The handle is the module's index (the same one when the file is loaded already). A bare name is looked for in the game's `sce_module`. `sceKernelDlsym(handle, name, &address)` finds what a module exports under a plain name.
+
+Stand-ins made after the first ones became code go in a page of their own, so no page a thread may be running in is ever writable again.
+
 
 ## Sources
 

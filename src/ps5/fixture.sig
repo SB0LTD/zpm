@@ -367,6 +367,171 @@ pub fn hello(buf: []u8, message: []const u8) []const u8 {
     return b.finish();
 }
 
+/// A game with a module of its own, as two files: `game` is the
+/// executable, `gameModule` the module it brings (a loader finds it in
+/// `sce_module` beside the executable). Together they exercise what a real
+/// game's start does: the module's start function runs first, the
+/// executable calls into the module, and the module reads a thread-local
+/// variable.
+///
+/// The executable prints `message`, calls the module's `gameAnswer` and
+/// exits with what it returned: GAME_ANSWER when the module's start
+/// function ran (it stores GAME_STARTED) and its thread storage holds its
+/// initial value (GAME_TLS).
+///
+/// The code, at TEXT (rdi: the argument block, not used):
+///   00  48 83 EC 08        sub  rsp, 8
+///   04  BF 01 00 00 00     mov  edi, 1
+///   09  48 8B 35 ..        mov  rsi, [rip + ptr]  ; -> the message
+///   10  BA ..              mov  edx, len
+///   15  FF 15 ..           call [rip + write]
+///   1B  FF 15 ..           call [rip + gameAnswer]
+///   21  89 C7              mov  edi, eax
+///   23  FF 15 ..           call [rip + _exit]
+///   29  48 83 C4 08        add  rsp, 8
+///   2D  C3                 ret
+pub fn game(buf: []u8, message: []const u8) []const u8 {
+    const SLOT_WRITE = DATA + 0x00;
+    const SLOT_EXIT = DATA + 0x08;
+    const SLOT_ANSWER = DATA + 0x10;
+    const POINTER = DATA + 0x18;
+    const MESSAGE = DATA + 0x40;
+    std.debug.assert(message.len <= 512);
+
+    var b = Builder.init(buf, .dynexec);
+    b.selfModule("eboot", 0);
+    const kernel_module = b.neededModule("libkernel", 1);
+    const kernel = b.importLibrary("libkernel", 1);
+    const game_module = b.neededModule(GAME_MODULE, 2);
+    const game_library = b.importLibrary(GAME_MODULE, 2);
+    b.jumpSlot(SLOT_WRITE, b.importSymbol(nid.of("write"), kernel, kernel_module, elf.STT_FUNC));
+    b.jumpSlot(SLOT_EXIT, b.importSymbol(nid.of("_exit"), kernel, kernel_module, elf.STT_FUNC));
+    b.jumpSlot(SLOT_ANSWER, b.importSymbol(nid.of(GAME_SYMBOL), game_library, game_module, elf.STT_FUNC));
+    b.relative(POINTER, MESSAGE);
+
+    var code = [_]u8{
+        0x48, 0x83, 0xec, 0x08,
+        0xbf, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x8b, 0x35, 0, 0, 0, 0,
+        0xba, 0, 0, 0, 0,
+        0xff, 0x15, 0, 0, 0, 0,
+        0xff, 0x15, 0, 0, 0, 0,
+        0x89, 0xc7,
+        0xff, 0x15, 0, 0, 0, 0,
+        0x48, 0x83, 0xc4, 0x08,
+        0xc3,
+    };
+    w32(&code, 0x0c, @intCast(POINTER - (TEXT + 0x10)));
+    w32(&code, 0x11, @intCast(message.len));
+    w32(&code, 0x17, @intCast(SLOT_WRITE - (TEXT + 0x1b)));
+    w32(&code, 0x1d, @intCast(SLOT_ANSWER - (TEXT + 0x21)));
+    w32(&code, 0x25, @intCast(SLOT_EXIT - (TEXT + 0x29)));
+
+    var data = [_]u8{0} ** (0x40 + 512);
+    @memcpy(data[0x40..][0..message.len], message);
+    b.code = &code;
+    b.data = data[0 .. 0x40 + message.len];
+    b.entry = TEXT;
+    return b.finish();
+}
+
+/// The module's name, the name it exports its function under, and what
+/// that function returns when everything a loader owes it was done.
+pub const GAME_MODULE = "libGame";
+pub const GAME_SYMBOL = "gameAnswer";
+pub const GAME_TLS: u32 = 7;
+pub const GAME_STARTED: u32 = 5;
+pub const GAME_ANSWER: u32 = GAME_TLS + GAME_STARTED;
+/// Where the module's two functions are in it, and the word its start
+/// function stores GAME_STARTED in.
+pub const GAME_START_AT: u64 = TEXT;
+pub const GAME_ANSWER_AT: u64 = TEXT + 0x30;
+pub const GAME_STARTED_AT: u64 = DATA + 0x18;
+/// The word a loader fills with the module's thread storage's place
+/// (an offset from the thread pointer).
+pub const GAME_TPOFF_AT: u64 = DATA + 0x10;
+
+/// The module of `game`. Its start function (what the file's DT_INIT
+/// names) prints `message` through its own import of `write`, stores
+/// GAME_STARTED, and returns the first argument it was given (so a
+/// loader's caller can tell its arguments arrived); `gameAnswer` adds the
+/// stored number to the module's thread-local variable.
+///
+/// The start function, at TEXT (rdi: its first argument):
+///   00  53                       push rbx                    ; (and the stack as a caller's)
+///   01  89 FB                    mov  ebx, edi
+///   03  BF 01 00 00 00           mov  edi, 1
+///   08  48 8B 35 ..              mov  rsi, [rip + ptr]       ; -> the message
+///   0F  BA ..                    mov  edx, len
+///   14  FF 15 ..                 call [rip + write]
+///   1A  C7 05 .. 05 00 00 00     mov  dword [rip + started], 5
+///   24  89 D8                    mov  eax, ebx
+///   26  5B                       pop  rbx
+///   27  C3                       ret
+/// gameAnswer, at TEXT + 0x30:
+///   30  48 8B 05 ..              mov  rax, [rip + tpoff]     ; the variable, from the thread pointer
+///   37  64 8B 00                 mov  eax, fs:[rax]
+///   3A  03 05 ..                 add  eax, [rip + started]
+///   40  C3                       ret
+pub fn gameModule(buf: []u8, message: []const u8) []const u8 {
+    return gameModuleNamed(buf, GAME_MODULE, message);
+}
+
+/// The same module under another name (several of them loaded side by
+/// side: each has its own start function, variable and export).
+pub fn gameModuleNamed(buf: []u8, name: []const u8, message: []const u8) []const u8 {
+    const SLOT_WRITE = DATA + 0x00;
+    const POINTER = DATA + 0x08;
+    const MESSAGE = DATA + 0x40;
+    const TLS_IMAGE = DATA + 0x400;
+    std.debug.assert(message.len <= 512);
+
+    var b = Builder.init(buf, .module);
+    b.selfModule(name, 0);
+    const kernel_module = b.neededModule("libkernel", 1);
+    const kernel = b.importLibrary("libkernel", 2);
+    const own = b.exportLibrary(name, 1);
+    b.jumpSlot(SLOT_WRITE, b.importSymbol(nid.of("write"), kernel, kernel_module, elf.STT_FUNC));
+    _ = b.exportSymbol(nid.of(GAME_SYMBOL), own, 0, GAME_ANSWER_AT, elf.STT_FUNC);
+    b.relative(POINTER, MESSAGE);
+    b.threadPointerOffset(GAME_TPOFF_AT, 0, 0);
+    b.tls(TLS_IMAGE, 4, 8, 8);
+    b.init_at = GAME_START_AT;
+
+    var code = [_]u8{
+        0x53,
+        0x89, 0xfb,
+        0xbf, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x8b, 0x35, 0, 0, 0, 0,
+        0xba, 0, 0, 0, 0,
+        0xff, 0x15, 0, 0, 0, 0,
+        0xc7, 0x05, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x89, 0xd8,
+        0x5b,
+        0xc3,
+        0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+        0x48, 0x8b, 0x05, 0, 0, 0, 0,
+        0x64, 0x8b, 0x00,
+        0x03, 0x05, 0, 0, 0, 0,
+        0xc3,
+    };
+    comptime std.debug.assert(code.len == 0x41);
+    w32(&code, 0x0b, @intCast(POINTER - (TEXT + 0x0f)));
+    w32(&code, 0x10, @intCast(message.len));
+    w32(&code, 0x16, @intCast(SLOT_WRITE - (TEXT + 0x1a)));
+    w32(&code, 0x1c, @intCast(GAME_STARTED_AT - (TEXT + 0x24)));
+    w32(&code, 0x20, GAME_STARTED);
+    w32(&code, 0x33, @intCast(GAME_TPOFF_AT - (TEXT + 0x37)));
+    w32(&code, 0x3c, @intCast(GAME_STARTED_AT - (TEXT + 0x40)));
+
+    var data = [_]u8{0} ** 0x408;
+    @memcpy(data[0x40..][0..message.len], message);
+    std.mem.writeInt(u32, data[0x400..0x404], GAME_TLS, .little);
+    b.code = &code;
+    b.data = &data;
+    return b.finish();
+}
+
 /// Where a built file's dynamic section is (for tests that damage it).
 pub fn dynamicOffset(file: []const u8) usize {
     const phnum = std.mem.readInt(u16, file[56..58], .little);
