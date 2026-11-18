@@ -1003,12 +1003,18 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const command_source = trim(source);
             if (keyword(command_source, "begin") or keyword(command_source, "begin work") or keyword(command_source, "begin transaction") or keyword(command_source, "start transaction")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
-                if (@hasDecl(DB, "beginTransaction")) try db.beginTransaction() else return error.UnsupportedStatement;
+                if (comptime @hasDecl(DB, "sql_transaction_controls") and DB.sql_transaction_controls) {
+                    try db.execute(source, &self.result);
+                } else if (@hasDecl(DB, "beginTransaction")) try db.beginTransaction() else return error.UnsupportedStatement;
             } else if (keyword(command_source, "commit") or keyword(command_source, "commit work") or keyword(command_source, "commit transaction") or keyword(command_source, "end")) {
                 if (@hasDecl(DB, "transactionStatus")) self.commit_rolled_back = db.transactionStatus() == 'E';
-                if (@hasDecl(DB, "commitTransaction")) try db.commitTransaction() else return error.UnsupportedStatement;
+                if (comptime @hasDecl(DB, "sql_transaction_controls") and DB.sql_transaction_controls) {
+                    try db.execute(source, &self.result);
+                } else if (@hasDecl(DB, "commitTransaction")) try db.commitTransaction() else return error.UnsupportedStatement;
             } else if (keyword(command_source, "rollback") or keyword(command_source, "rollback work") or keyword(command_source, "rollback transaction") or keyword(command_source, "abort")) {
-                if (@hasDecl(DB, "rollbackTransaction")) try db.rollbackTransaction() else return error.UnsupportedStatement;
+                if (comptime @hasDecl(DB, "sql_transaction_controls") and DB.sql_transaction_controls) {
+                    try db.execute(source, &self.result);
+                } else if (@hasDecl(DB, "rollbackTransaction")) try db.rollbackTransaction() else return error.UnsupportedStatement;
             } else if (word(source, "deallocate")) {
                 if (@hasDecl(DB, "transactionStatus") and db.transactionStatus() == 'E') return error.TransactionFailed;
                 // Protocol-level statements first; SQL PREPARE names (and

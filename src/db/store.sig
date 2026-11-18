@@ -825,6 +825,7 @@ pub fn Store(comptime Raw: type) type {
 
             pub const CopyInfo = Raw.CopyInfo;
             pub const copy_line_bytes = Raw.copy_line_bytes;
+            pub const sql_transaction_controls = true;
 
             pub fn reportedParameters() []const []const u8 {
                 return &reported_parameters;
