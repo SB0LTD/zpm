@@ -433,6 +433,8 @@ pub fn Binder(comptime config: types.Config) type {
             cte: u8 = no_cte,
             /// A system view (catalog.sig) computed at scan time.
             view: ?catalog.View = null,
+            /// Hidden identity also retained by a catalog column-alias wrapper.
+            catalog_oid: u32 = 0,
         };
 
         /// USING column merged from the relations joined before `right`.
@@ -3820,6 +3822,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (n.star) return error.Syntax;
                     try resolveColumn(context, scope, n);
                 },
+                .catalog_tableoid => n.constant = false,
                 // Already typed (a shared subtree typed twice).
                 .aggregate => n.constant = false,
                 .scalar_subquery, .exists_subquery, .in_subquery => try typeSubquery(context, scope, n),
@@ -4240,7 +4243,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn figure(context: *const Context, id: u16, buffer: *V.Name) Strength {
             const n = context.node(id);
             return switch (n.kind) {
-                .column => blk: {
+                .column, .catalog_tableoid => blk: {
                     buffer.* = toName(context, n.name);
                     break :blk .{ .name = buffer.slice(), .strength = 2 };
                 },
@@ -4971,6 +4974,14 @@ pub fn Binder(comptime config: types.Config) type {
             return null;
         }
 
+        // SQL-visible by name, but excluded from * and NATURAL / USING.
+        const table_oid_column: u16 = 65535;
+
+        fn selectableColumn(context: *const Context, rel: *const Relation, wanted: []const u8) ?usize {
+            if (findColumn(context, rel, wanted)) |column| return column;
+            return if (rel.catalog_oid != 0 and types.same(wanted, "tableoid")) table_oid_column else null;
+        }
+
         /// Marks every plan between `scope` and the scope `level` blocks up
         /// as correlated (re-executed per outer row).
         fn markCorrelated(context: *const Context, scope: *const Scope, level: u8) void {
@@ -4985,13 +4996,20 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn bindColumn(context: *const Context, scope: *const Scope, n: *ast.Node, owner: *const Scope, level: u8, relation: usize, column: usize) void {
             const rel = &owner.rels[relation];
-            n.kind = .column;
             n.relation = @intCast(relation);
             n.column = @intCast(column);
             n.level = level;
-            n.ty = relationColumnType(context, rel, column);
-            n.typmod = relationColumnTypmod(context, rel, column);
             n.constant = false;
+            if (column == table_oid_column) {
+                n.kind = .catalog_tableoid;
+                n.integer = rel.catalog_oid;
+                n.ty = .oid;
+                n.typmod = -1;
+            } else {
+                n.kind = .column;
+                n.ty = relationColumnType(context, rel, column);
+                n.typmod = relationColumnTypmod(context, rel, column);
+            }
             markCorrelated(context, scope, level);
         }
 
@@ -5181,7 +5199,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn columnVisible(context: *const Context, scope: *const Scope, name: []const u8) bool {
             var current: ?*const Scope = scope;
             while (current) |s| : (current = s.parent) {
-                for (s.rels[s.rel_first..s.rel_count]) |*rel| if (findColumn(context, rel, name) != null) return true;
+                for (s.rels[s.rel_first..s.rel_count]) |*rel| if (selectableColumn(context, rel, name) != null) return true;
                 for (s.using[0..s.using_count]) |*entry| if (types.same(entry.name.slice(), name)) return true;
             }
             return false;
@@ -5221,7 +5239,7 @@ pub fn Binder(comptime config: types.Config) type {
                 if (qualifier) |q| {
                     for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
                         if (!types.same(rel.name.slice(), q.slice())) continue;
-                        const column = findColumn(context, rel, wanted.slice()) orelse return error.ColumnNotFound;
+                        const column = selectableColumn(context, rel, wanted.slice()) orelse return error.ColumnNotFound;
                         try opaqueColumn(context, scope, rel, column);
                         return bindColumn(context, scope, n, s, level, index, column);
                     }
@@ -5236,7 +5254,7 @@ pub fn Binder(comptime config: types.Config) type {
                 }
                 var found: ?[2]usize = null;
                 for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
-                    const column = findColumn(context, rel, wanted.slice()) orelse continue;
+                    const column = selectableColumn(context, rel, wanted.slice()) orelse continue;
                     if (found != null) return error.AmbiguousColumn;
                     found = .{ index, column };
                 }
@@ -5854,7 +5872,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn referencesLevel(context: *const Context, id: u16, level: u8) bool {
             if (id == none) return false;
             const n = context.node(id);
-            if (n.kind == .column) return n.level == level;
+            if (n.kind == .column or n.kind == .catalog_tableoid) return n.level == level;
             if (referencesLevel(context, n.a, level) or referencesLevel(context, n.c, level)) return true;
             if (listOwner(n.kind)) {
                 var item = n.b;
@@ -5979,7 +5997,7 @@ pub fn Binder(comptime config: types.Config) type {
             for (scope.using[0..scope.using_count]) |*entry| {
                 if (types.same(entry.name.slice(), wanted)) return true;
             }
-            for (scope.rels[0..scope.rel_count]) |*rel| if (findColumn(context, rel, wanted) != null) return true;
+            for (scope.rels[0..scope.rel_count]) |*rel| if (selectableColumn(context, rel, wanted) != null) return true;
             return false;
         }
 
@@ -6050,7 +6068,7 @@ pub fn Binder(comptime config: types.Config) type {
             const y = context.node(b);
             if (x.kind != y.kind or x.ty != y.ty or x.window!=none or y.window!=none) return false;
             switch (x.kind) {
-                .column => return x.relation == y.relation and x.column == y.column and x.level == y.level,
+                .column, .catalog_tableoid => return x.relation == y.relation and x.column == y.column and x.level == y.level,
                 .int_literal => return x.integer == y.integer,
                 .bool_literal => return x.boolean == y.boolean,
                 .null_literal => return true,
@@ -6123,7 +6141,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // Binding already validated aggregate arguments and nesting.
                 // An aggregate eliminated by strict NULL must not execute.
                 .aggregate, .scalar_subquery, .exists_subquery => return,
-                .column => if (n.level == 0) return error.GroupingError else return,
+                .column, .catalog_tableoid => if (n.level == 0) return error.GroupingError else return,
                 else => {},
             }
             try validateDiscardedGroup(context, p, n.a);
@@ -6151,7 +6169,7 @@ pub fn Binder(comptime config: types.Config) type {
             for (p.keys[0..p.key_count]) |key| if (sameExpr(context, id, key)) return true;
             const n = context.node(id);
             switch (n.kind) {
-                .column => return n.level != 0,
+                .column, .catalog_tableoid => return n.level != 0,
                 .aggregate, .scalar_subquery, .exists_subquery => return true,
                 else => {},
             }
@@ -6198,7 +6216,7 @@ pub fn Binder(comptime config: types.Config) type {
                     const index = try registerAgg(context, p, id);
                     return groupColumn(n, p.key_count + index, -1);
                 },
-                .column => if (n.level == 0) return error.GroupingError else return,
+                .column, .catalog_tableoid => if (n.level == 0) return error.GroupingError else return,
                 .scalar_subquery, .exists_subquery => return,
                 .in_subquery => return groupify(context, p, n.a),
                 else => {},
@@ -6420,7 +6438,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (id == none) return true;
             const n = context.node(id);
             switch (n.kind) {
-                .column => return n.level != 0 or n.relation < index,
+                .column, .catalog_tableoid => return n.level != 0 or n.relation < index,
                 .scalar_subquery, .exists_subquery, .in_subquery, .aggregate => return false,
                 else => {},
             }
@@ -6681,7 +6699,7 @@ pub fn Binder(comptime config: types.Config) type {
             const plans = plansOf(context);
             if (rel.plan == none or rel.cte != no_cte) {
                 const wrapper = try wrapRelation(context, rel, source.*);
-                rel.* = .{ .name = rel.name, .plan = wrapper };
+                rel.* = .{ .name = rel.name, .plan = wrapper, .catalog_oid = rel.catalog_oid };
                 source.* = .{ .join = source.join, .plan = wrapper, .group_end = source.group_end };
             }
             const p = &plans.items[rel.plan];
@@ -6851,6 +6869,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
                 } else if (viewOf(context, item.schema, item.name)) |view| {
                     rel.view = view;
+                    if (context.dialect == .postgres) rel.catalog_oid = catalog.bootstrapRelationOid(view) orelse 0;
                     rel.name = literalName(@tagName(view));
                     source.view = view;
                 } else {

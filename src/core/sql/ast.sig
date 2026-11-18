@@ -309,6 +309,9 @@ pub const NodeKind = enum {
     text_literal,
     decimal_literal,
     column,
+    /// A bootstrap catalog's hidden tableoid. Its OID is in `integer`,
+    /// and `relation` and `level` locate the row required to expose it.
+    catalog_tableoid,
     param,
     unary,
     binary,

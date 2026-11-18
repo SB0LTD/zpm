@@ -350,6 +350,18 @@ fn namespacesAndExtensions() !void {
     // plpgsql: catalog-only (extension lifecycle is not provided).
     try expect("SELECT extname, extowner, extnamespace, extrelocatable, extversion, extconfig, extcondition FROM pg_extension", "plpgsql|10|11|f|1.0|NULL|NULL");
     try metadata("SELECT oid, extname, extconfig FROM pg_extension", &.{ "oid", "extname", "extconfig" }, &.{ 26, 19, 1028 });
+    const extension_query = "SELECT x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable, x.extversion, x.extconfig, x.extcondition FROM pg_extension x JOIN pg_namespace n ON n.oid = x.extnamespace";
+    try expect(extension_query, "3079|13001|plpgsql|pg_catalog|f|1.0|NULL|NULL");
+    try metadata(extension_query, &.{ "tableoid", "oid", "extname", "nspname", "extrelocatable", "extversion", "extconfig", "extcondition" }, &.{ 26, 26, 19, 19, 16, 25, 1028, 1009 });
+    try expect("SELECT n.tableoid, x.tableoid FROM pg_namespace n LEFT JOIN pg_extension x ON x.extnamespace = n.oid WHERE n.nspname = 'public'", "2615|NULL");
+    try expect("SELECT x.tableoid, x.extension_id FROM pg_extension AS x(extension_id)", "3079|13001");
+    try expect("SELECT (SELECT x.tableoid) FROM pg_extension x", "3079");
+    try expect("SELECT tableoid, count(*) FROM pg_extension GROUP BY tableoid ORDER BY tableoid", "3079|1");
+    try metadata("SELECT x.* FROM pg_extension x", &.{ "oid", "extname", "extowner", "extnamespace", "extrelocatable", "extversion", "extconfig", "extcondition" }, &.{ 26, 19, 26, 26, 16, 25, 1028, 1009 });
+    try fails("SELECT tableoid FROM pg_extension x CROSS JOIN pg_namespace n", error.AmbiguousColumn);
+    try fails("SELECT tableoid, count(*) FROM pg_extension", error.GroupingError);
+    try fails("SELECT tableoid FROM pg_settings", error.ColumnNotFound);
+    try fails("SELECT v.tableoid FROM (SELECT oid FROM pg_extension) v", error.ColumnNotFound);
     try rejects("CREATE EXTENSION plpgsql", error.DuplicateObject, "SELECT COUNT(*) FROM pg_extension", "1");
     const noop = try replicate("CREATE EXTENSION IF NOT EXISTS plpgsql");
     try check(noop.command == .create_extension);

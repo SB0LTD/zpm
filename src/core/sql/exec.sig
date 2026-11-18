@@ -556,7 +556,7 @@ pub fn Exec(comptime config: types.Config) type {
                         while (item != none) : (item = self.pool.nodes[item].next) if (!self.availableAtStage(item, stage, require_infallible)) break :blk false;
                         break :blk true;
                     },
-                    .column => n.level == 0 and n.relation <= stage,
+                    .column, .catalog_tableoid => n.level == 0 and n.relation <= stage,
                     .param => require_infallible and self.session.params != null and n.integer >= 1 and n.integer <= config.statement_parameters,
                     .null_literal, .bool_literal, .int_literal => true,
                     .text_literal => !require_infallible or n.ty == .unknown or n.ty == .text or (n.ty == .date and n.date_bound),
@@ -821,7 +821,8 @@ pub fn Exec(comptime config: types.Config) type {
                 if (!self.availableAtStage(p.where, 0, true)) return null;
                 for (p.targets[0..p.width], 0..) |target, column| {
                     if (!p.required[column]) continue;
-                    if (self.pool.nodes[target].kind != .column) return null;
+                    const kind = self.pool.nodes[target].kind;
+                    if (kind != .column and kind != .catalog_tableoid) return null;
                 }
                 const hook = self.work.views orelse return error.UnsupportedStatement;
                 const wanted = if (p.order_count == 0 and p.distinct == .none) p.offset +| p.limit else 0xffffffffffffffff;
