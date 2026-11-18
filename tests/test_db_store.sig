@@ -880,6 +880,38 @@ fn runningTransactionTimeout() !void {
     for (0..8) |row| try check(result.rows[row].cells[1].integer == @as(i64, @intCast((row + 1) * 10)));
 }
 
+fn xmlInputSetting() !void {
+    var store: Store = .{};
+    var document: Store.Connection = .{ .store = &store, .id = 1 };
+    var content: Store.Connection = .{ .store = &store, .id = 2 };
+    var out: DB.Result = .{};
+    const fragment = "SELECT 'before<r/>after'::xml";
+    try document.execute("SHOW xmloption", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "content"));
+    try document.execute("BEGIN", &out);
+    try document.execute("SET LOCAL XML OPTION DOCUMENT", &out);
+    try document.execute("SELECT current_setting('xmloption')", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "document"));
+    try document.execute("SELECT XMLPARSE(CONTENT 'before<r/>after')", &out);
+    try check(equal(out.rows[0].cells[0].xml.slice(), "before<r/>after"));
+    if (document.execute(fragment, &out)) |_| return error.FragmentAcceptedAsDocument else |err| try check(err == error.InvalidXmlDocument);
+    try document.execute("ROLLBACK", &out);
+    try document.execute(fragment, &out);
+    try check(equal(out.rows[0].cells[0].xml.slice(), "before<r/>after"));
+    try document.startupParameter("options", "-c xmloption=document");
+    try document.execute("SET xmloption = content", &out);
+    try document.execute("RESET xmloption", &out);
+    try document.execute("SHOW xmloption", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "document"));
+    try content.execute(fragment, &out);
+    try check(equal(out.rows[0].cells[0].xml.slice(), "before<r/>after"));
+    try document.execute("CREATE TABLE markup (payload XML)", &out);
+    _ = try document.copyBegin("COPY markup FROM STDIN");
+    const fields = [_]?[]const u8{"<a/><b/>"};
+    if (document.copyRow("COPY markup FROM STDIN", &fields)) |_| return error.InvalidCopyDocumentAccepted else |err| try check(err == error.InvalidXmlDocument);
+    try quiescent(&store);
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
@@ -891,6 +923,7 @@ pub fn main() !void {
     try savepoints();
     try runningControl();
     try runningTransactionTimeout();
+    try xmlInputSetting();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }
