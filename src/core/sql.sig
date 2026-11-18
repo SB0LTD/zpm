@@ -5382,17 +5382,16 @@ pub fn Database(comptime config: Config) type {
                 while (fields.next()) |field| : (ordinal += 1) {
                     const data_type = types.typeFromOid(field.oid) orelse return error.UndefinedObject;
                     const info = types.typeInfo(data_type);
-                    const alignment_label = [1]u8{info.alignment};
                     const collation_oid = collation.typeCollation(types.typeOfData(data_type));
-                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), nameCell(""), nameCell(""), boolCell(false), intCell(collation_oid), intCell(info.len), nameCell(&alignment_label) });
+                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), .{ .pg_internal_char = 0 }, .{ .pg_internal_char = 0 }, boolCell(false), intCell(collation_oid), intCell(info.len), .{ .pg_internal_char = info.alignment } });
                 }
             }
         }
 
-        fn dependencyRow(sink: *X.RowSink, class: u32, object: u32, referenced_class: u32, referenced_object: u32, referenced_subobject: i64, kind: []const u8) Error!void {
+        fn dependencyRow(sink: *X.RowSink, class: u32, object: u32, referenced_class: u32, referenced_object: u32, referenced_subobject: i64, kind: u8) Error!void {
             try sink.add(&.{
                 intCell(class), intCell(object), intCell(0), intCell(referenced_class),
-                intCell(referenced_object), intCell(referenced_subobject), nameCell(kind),
+                intCell(referenced_object), intCell(referenced_subobject), .{ .pg_internal_char = kind },
             });
         }
 
@@ -5405,40 +5404,40 @@ pub fn Database(comptime config: Config) type {
             for (relations) |found| {
                 if (found.kind == 'S') {
                     const seq = &self.seqs[found.slot];
-                    try dependencyRow(sink, relation, seq.oid, namespace, catalog_module.public_namespace, 0, "n");
+                    try dependencyRow(sink, relation, seq.oid, namespace, catalog_module.public_namespace, 0, 'n');
                     if (seq.owner == 0) continue;
                     const slot = self.visibleTableSlot(seq.owner, snapshot) orelse continue;
                     const owner = &self.tables[slot];
                     if (seq.owner_column >= owner.column_count) continue;
                     const kind = switch (owner.columns[seq.owner_column].default_kind) {
-                        .identity_always, .identity_by_default => "i",
-                        .default => "a",
+                        .identity_always, .identity_by_default => 'i',
+                        .default => 'a',
                         else => continue,
                     };
                     try dependencyRow(sink, relation, seq.oid, relation, owner.oid, @as(i64, seq.owner_column) + 1, kind);
                     continue;
                 }
                 const table = &self.tables[found.slot];
-                try dependencyRow(sink, relation, table.oid, namespace, table.namespace, 0, "n");
+                try dependencyRow(sink, relation, table.oid, namespace, table.namespace, 0, 'n');
                 if (S.keyed(table) and table.primary_constraint_oid != 0) {
                     const primary_index = S.primaryIndexOid(table);
-                    try dependencyRow(sink, relation, primary_index, constraint_class, table.primary_constraint_oid, 0, "i");
+                    try dependencyRow(sink, relation, primary_index, constraint_class, table.primary_constraint_oid, 0, 'i');
                     var keys: [config.columns]u8 = undefined;
                     for (primaryColumns(table, &keys)) |column| {
-                        try dependencyRow(sink, constraint_class, table.primary_constraint_oid, relation, table.oid, @as(i64, column) + 1, "a");
+                        try dependencyRow(sink, constraint_class, table.primary_constraint_oid, relation, table.oid, @as(i64, column) + 1, 'a');
                     }
                 }
                 for (table.constraints[0..table.constraint_count]) |*item| {
                     if (item.kind != .foreign or item.oid == 0) continue;
                     if (self.visibleTableSlot(item.ref_oid, snapshot) == null) continue;
                     for (item.keyColumns()) |column| {
-                        try dependencyRow(sink, constraint_class, item.oid, relation, table.oid, @as(i64, column) + 1, "a");
+                        try dependencyRow(sink, constraint_class, item.oid, relation, table.oid, @as(i64, column) + 1, 'a');
                     }
                     for (item.refColumns()) |column| {
-                        try dependencyRow(sink, constraint_class, item.oid, relation, item.ref_oid, @as(i64, column) + 1, "n");
+                        try dependencyRow(sink, constraint_class, item.oid, relation, item.ref_oid, @as(i64, column) + 1, 'n');
                     }
                     const index = self.referencedConstraintIndex(item, snapshot);
-                    if (index != 0) try dependencyRow(sink, constraint_class, item.oid, relation, index, 0, "n");
+                    if (index != 0) try dependencyRow(sink, constraint_class, item.oid, relation, index, 0, 'n');
                 }
             }
         }
@@ -5655,17 +5654,16 @@ pub fn Database(comptime config: Config) type {
                         .pg_attribute, .pg_attrdef, .columns => for (table.columns[0..table.column_count], 0..) |*column, index| {
                             const attnum: i64 = @intCast(index + 1);
                             const kind = column.default_kind;
-                            const identity: []const u8 = switch (kind) {
-                                .identity_always => "a",
-                                .identity_by_default => "d",
-                                else => "",
+                            const identity: u8 = switch (kind) {
+                                .identity_always => 'a',
+                                .identity_by_default => 'd',
+                                else => 0,
                             };
                             const has_expression = kind == .default or kind == .generated;
                             switch (view) {
                                 .pg_attribute => {
                                     const info = types.typeInfo(column.data_type);
-                                    const alignment_label = [1]u8{info.alignment};
-                                    try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(info.oid), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind != .generated) "" else if (column.virtual) "v" else "s"), boolCell(has_expression), intCell(collation.typeCollation(types.typeOfData(column.data_type))), intCell(info.len), nameCell(&alignment_label) });
+                                    try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(info.oid), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), .{ .pg_internal_char = identity }, .{ .pg_internal_char = if (kind != .generated) 0 else if (column.virtual) 'v' else 's' }, boolCell(has_expression), intCell(collation.typeCollation(types.typeOfData(column.data_type))), intCell(info.len), .{ .pg_internal_char = info.alignment } });
                                 },
                                 .pg_attrdef => if (has_expression) {
                                     try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column) });
@@ -5676,7 +5674,7 @@ pub fn Database(comptime config: Config) type {
                                         nameCell(database),                                       nameCell(schema_name),                          nameCell(name),            nameCell(column.name.slice()),
                                         intCell(attnum),                                          if (kind == .default) expressionTextWithPool(pool,column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(if (types.elementData(column.data_type) != null) "ARRAY" else types.sqlTypeName(column.data_type)),
                                         optionalInt(characterMaximumLength(column)),              optionalInt(numeric[0]),                     optionalInt(numeric[1]),   optionalInt(numeric[2]),
-                                        optionalInt(datetimePrecision(column)),                   nameCell(if (identity.len != 0) "YES" else "NO"), if (identity.len == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
+                                        optionalInt(datetimePrecision(column)),                   nameCell(if (identity != 0) "YES" else "NO"), if (identity == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
                                         if (kind == .generated) expressionTextWithPool(pool,column) else .null_value,
                                     });
                                 },

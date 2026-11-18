@@ -92,7 +92,7 @@ const pg_class_columns = [_]ViewColumn{
     col("reltablespace", .oid), col("reloftype", .oid), col("relpersistence", .text), col("relreplident", .text),
     col("reltoastrelid", .oid), col("relam", .oid), col("relispopulated", .boolean), col("relpartbound", .text),
 };
-const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .text), col("attgenerated", .text), col("atthasdef", .boolean), col("attcollation", .oid), col("attlen", .int2), col("attalign", .text) };
+const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .pg_internal_char), col("attgenerated", .pg_internal_char), col("atthasdef", .boolean), col("attcollation", .oid), col("attlen", .int2), col("attalign", .pg_internal_char) };
 const pg_index_columns = [_]ViewColumn{
     col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text),
     col("indisvalid", .boolean), col("indisclustered", .boolean), col("indisreplident", .boolean),
@@ -106,7 +106,7 @@ const pg_constraint_columns = [_]ViewColumn{
 };
 const pg_depend_columns = [_]ViewColumn{
     col("classid", .oid), col("objid", .oid), col("objsubid", .int4),
-    col("refclassid", .oid), col("refobjid", .oid), col("refobjsubid", .int4), col("deptype", .text),
+    col("refclassid", .oid), col("refobjid", .oid), col("refobjsubid", .int4), col("deptype", .pg_internal_char),
 };
 const pg_statistic_ext_columns = [_]ViewColumn{
     col("oid", .oid), col("stxrelid", .oid), col("stxname", .name), col("stxnamespace", .oid),
