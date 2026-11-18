@@ -4628,12 +4628,22 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.rparen);
                     return self.pool.add(call);
                 }
-                // ARRAY[...] constructors.
+                // Array literals and PostgreSQL's ARRAY(query) constructor.
                 if (self.mode == .standard and wordIs(self.source, token, "array")) {
                     const after = try self.peek();
                     if (after.kind == .symbol and after.symbol == .lbracket) {
                         const name = try self.identifier();
                         return self.arrayConstructor(name);
+                    }
+                    if (self.tokens.dialect == .postgres and lparenNext(after)) {
+                        try self.advance();
+                        try self.expectSymbol(.lparen);
+                        if (!self.queryWord()) return error.Syntax;
+                        const query_index = try self.query();
+                        try self.expectSymbol(.rparen);
+                        self.pool.complex = true;
+                        const node = try self.pool.add(.{ .kind = .scalar_subquery, .func = .array_subquery, .integer = query_index });
+                        return self.subscriptTail(node);
                     }
                 }
                 // SQL-standard niladic functions.

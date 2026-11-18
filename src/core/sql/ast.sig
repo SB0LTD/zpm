@@ -83,7 +83,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // base[...]... with its subscript layout in `integer` (array_eval.sig);
     // array_any is `a op ANY/ALL (array)` encoded like in_subquery (op,
     // negated for ALL).
-    array_constructor, array_subscript, array_any, array_length, cardinality, array_ndims, array_dims, array_lower, array_upper,
+    array_constructor, array_subquery, array_subscript, array_any, array_length, cardinality, array_ndims, array_dims, array_lower, array_upper,
     array_append, array_prepend, array_cat, array_to_string,
     // Ranges (B11 advanced types, range_eval.sig): int4range(...) and the
     // other constructors (result type in the node), lower/upper of a range,

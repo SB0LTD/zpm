@@ -2253,7 +2253,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                 },
                 .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out => unreachable,
-                .pg_partition_ancestors => return error.UnsupportedStatement,
+                .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
                 .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
@@ -4260,6 +4260,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 // PostgreSQL names a scalar subquery after its only column.
                 .scalar_subquery => blk: {
+                    if (n.func == .array_subquery) break :blk .{ .name = "array", .strength = 2 };
                     buffer.* = context.plans.?.items[@intCast(n.integer)].names[0];
                     break :blk .{ .name = buffer.slice(), .strength = 2 };
                 },
@@ -5232,8 +5233,13 @@ pub fn Binder(comptime config: types.Config) type {
             if (n.kind != .exists_subquery and plan.count != 1) return error.Syntax;
             switch (n.kind) {
                 .scalar_subquery => {
-                    n.ty = plan.tys[0];
-                    n.typmod = plan.typmods[0];
+                    if (n.func == .array_subquery) {
+                        if (plan.tys[0] == .unknown) try castColumn(context, plan_id, 0, .text);
+                        n.ty = if (types.isArray(plan.tys[0])) plan.tys[0] else types.arrayType(plan.tys[0]) orelse return error.UndefinedObject;
+                    } else {
+                        n.ty = plan.tys[0];
+                        n.typmod = plan.typmods[0];
+                    }
                 },
                 .exists_subquery => n.ty = .boolean,
                 .in_subquery => {
