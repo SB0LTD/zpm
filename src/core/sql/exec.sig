@@ -3121,6 +3121,13 @@ pub fn Exec(comptime config: types.Config) type {
                 switch (agg.kind) {
                     .count, .count_star => {},
                     .sum, .avg => {
+                        if (agg.arg_ty == .mysql_bigint_unsigned) {
+                            if (agg.kind != .sum or input.* != .numeric) return error.TypeMismatch;
+                            const magnitude = types.mysqlUnsignedValue(&input.numeric) orelse return error.TypeMismatch;
+                            // i64.max rows times u64.max fits a signed i128.
+                            acc.wide += @as(i128, magnitude);
+                            return;
+                        }
                         if (value_module.integral(agg.arg_ty)) {
                             if (agg.kind == .sum and agg.ty == .int8) {
                                 const sum = @addWithOverflow(acc.integer, input.integer);
@@ -3288,6 +3295,8 @@ pub fn Exec(comptime config: types.Config) type {
                     else => {},
                 }
                 if (acc.count == 0) return .null_value;
+                if (agg.kind == .sum and agg.arg_ty == .mysql_bigint_unsigned)
+                    return self.numericOf(acc.wide);
                 if (value_module.integral(agg.arg_ty)) {
                     if (agg.kind == .sum and agg.ty == .int8) return .{ .integer = acc.integer };
                     const total = try self.numericOf(acc.wide);

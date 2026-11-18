@@ -1714,7 +1714,7 @@ pub fn Binder(comptime config: types.Config) type {
             n.a = n.b;
             n.b = none;
             n.ty = result;
-            n.typmod = -1;
+            n.typmod = if (kind == .sum and arg_ty == .mysql_bigint_unsigned) ast.mysql_unsigned_sum_typmod else -1;
             n.constant = false;
             if (scope.saw_aggregate) |flag| flag.* = true;
         }
@@ -1748,7 +1748,7 @@ pub fn Binder(comptime config: types.Config) type {
                     .int2, .int4 => .int8,
                     .int8, .numeric => .numeric,
                     .float4, .float8, .interval, .money => arg_ty,
-                    .mysql_bigint_unsigned => return error.UnsupportedStatement,
+                    .mysql_bigint_unsigned => if (n.window != none or n.order != none) return error.UnsupportedStatement else .numeric,
                     else => return error.UndefinedFunction,
                 },
                 .avg => switch (arg_ty) {
@@ -4045,6 +4045,17 @@ pub fn Binder(comptime config: types.Config) type {
                     if (n.flat_record_cast) return;
                     if (n.cast_type == .unknown) return error.UnsupportedStatement;
                     if (n.typmod == ast.regclass_typmod or n.typmod == ast.regtype_typmod) return regCast(context, scope, n);
+                    if (n.typmod == ast.mysql_integer_cast_typmod) {
+                        if (context.dialect != .mysql or (n.cast_type == .mysql_bigint_unsigned and config.numeric_digits < 20))
+                            return error.UnsupportedStatement;
+                        try typeExpr(context, scope, n.a);
+                        const input = context.node(n.a).ty;
+                        if (!value.integral(input) and input != .mysql_bigint_unsigned and !knownNull(context, n.a))
+                            return error.UnsupportedStatement;
+                        n.ty = n.cast_type;
+                        n.constant = isConstant(context, n.a);
+                        return;
+                    }
                     const target = n.cast_type;
                     const inner = context.node(n.a);
                     if (inner.kind == .function and inner.func == .array_constructor and inner.b == none and types.isArray(target)) {
@@ -4268,6 +4279,9 @@ pub fn Binder(comptime config: types.Config) type {
             const n = context.node(id);
             if (context.dialect == .tds and (n.kind == .cast or (n.kind == .function and
                 (n.func == .tds_isnull or n.func == .tds_dateadd)))) return .{};
+            if (context.dialect == .mysql and n.text.len != 0 and
+                (n.kind == .aggregate or (n.kind == .cast and n.typmod == ast.mysql_integer_cast_typmod)))
+                return literalName(context.source[n.text.start..n.text.end]);
             if (n.func == .mysql_ifnull or n.func == .mysql_date_add or n.func == .mysql_last_insert_id)
                 return literalName(context.source[n.text.start..n.text.end]);
             const result = figure(context, id, &buffer);
@@ -4555,7 +4569,8 @@ pub fn Binder(comptime config: types.Config) type {
         fn outputTypmod(context: *const Context, id: u16) i32 {
             const n = context.node(id);
             return switch (n.kind) {
-                .column, .cast => n.typmod,
+                .column, .aggregate => n.typmod,
+                .cast => if (n.typmod == ast.mysql_integer_cast_typmod) -1 else n.typmod,
                 // A subscript keeps the array's typmod (reftypmod).
                 .function => if (n.func == .array_subscript or n.func == .xmlserialize or n.func == .mysql_date_add) n.typmod else -1,
                 else => -1,
@@ -6133,7 +6148,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .aggregate => {
                     if (ast.orderedSetAggregate(n.agg)) try groupedDirectArguments(context, p, n.a);
                     const index = try registerAgg(context, p, id);
-                    return groupColumn(n, p.key_count + index, -1);
+                    return groupColumn(n, p.key_count + index, n.typmod);
                 },
                 .column => if (n.level == 0) return error.GroupingError else return,
                 .scalar_subquery, .exists_subquery => return,
@@ -8589,7 +8604,8 @@ pub fn Binder(comptime config: types.Config) type {
             var out: Create = .{ .name = name, .columns = @splat(.{}), .count = plan.count, .namespace = namespace, .command = tag };
             if (plan.count > config.columns) return error.ColumnCapacity;
             for (0..plan.count) |index| {
-                var column: V.Column = .{ .name = plan.names[index], .data_type = dataType(plan.tys[index]), .typmod = plan.typmods[index] };
+                const typmod = if (plan.typmods[index] == ast.mysql_unsigned_sum_typmod) -1 else plan.typmods[index];
+                var column: V.Column = .{ .name = plan.names[index], .data_type = dataType(plan.tys[index]), .typmod = typmod };
                 if (index < create.column_count) column.name = toName(context, create.columns[index]);
                 for (out.columns[0..index]) |*previous| if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
                 out.columns[index] = column;
@@ -8663,7 +8679,8 @@ pub fn Binder(comptime config: types.Config) type {
             if (plan.count > config.columns) return error.ColumnCapacity;
             var out: Create = .{ .name = name, .columns = @splat(.{}), .count = plan.count, .namespace = namespace, .command = .create_table_as };
             for (0..plan.count) |index| {
-                var column: V.Column = .{ .name = plan.names[index], .data_type = dataType(plan.tys[index]), .typmod = plan.typmods[index] };
+                const typmod = if (plan.typmods[index] == ast.mysql_unsigned_sum_typmod) -1 else plan.typmods[index];
+                var column: V.Column = .{ .name = plan.names[index], .data_type = dataType(plan.tys[index]), .typmod = typmod };
                 if (index < create.as_column_count) column.name = toName(context, create.as_columns[index]);
                 for (out.columns[0..index]) |*previous| if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
                 out.columns[index] = column;
