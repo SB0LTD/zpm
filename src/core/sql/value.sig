@@ -85,6 +85,7 @@ pub const SequenceHook = struct {
     call: *const fn (ptr: *anyopaque, kind: SequenceCall, name: []const u8, oid: u32, value: i64, called: bool) Error!i64,
     /// regclass output: the relation named by `oid`, if any.
     relation_name: *const fn (ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize,
+    relation_display_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
     /// Catalog-object text (B11 wave 3): a comment (obj_description,
     /// col_description, shobj_description) or a role name, written to `out`.
     catalog_text: ?*const fn (ptr: *anyopaque, kind: CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize = null,

@@ -4828,19 +4828,12 @@ pub fn Database(comptime config: Config) type {
             return error.TableNotFound;
         }
 
-        /// The dot separating `schema.name` in regclass text outside double
-        /// quotes, unless the schema is public (regclassName strips that).
-        fn std_dot(text: []const u8) ?usize {
+        /// The first qualifier separator outside double quotes.
+        fn regclassSeparator(text: []const u8) ?usize {
             var quoted = false;
             for (text, 0..) |byte, index| {
                 if (byte == '"') quoted = !quoted;
-                if (byte == '.' and !quoted) {
-                    const head = text[0..index];
-                    var trimmed = head;
-                    while (trimmed.len != 0 and (trimmed[0] == ' ' or trimmed[0] == '\t')) trimmed = trimmed[1..];
-                    if (types.keyword(trimmed, "public")) return null;
-                    return index;
-                }
+                if (byte == '.' and !quoted) return index;
             }
             return null;
         }
@@ -4872,37 +4865,53 @@ pub fn Database(comptime config: Config) type {
             return std.fmt.parseInt(u32, text, 10) catch error.NumericValueOutOfRange;
         }
 
-        /// regclass input: a visible table, its primary-key index
-        /// (`<table>_pkey`) or a sequence; -1 (or 42P01) when missing.
+        /// Resolve real catalog, table, sequence, index and composite OIDs.
         fn regclassOid(self: *const Self, text: []const u8, strict: bool) Error!i64 {
             const missing: Error!i64 = if (strict) error.TableNotFound else -1;
             if (try numericRegOid(text)) |oid| return oid;
-            // `schema.name` of a user schema (unquoted parts fold to lower case).
-            if (std_dot(text)) |dot| {
-                const schema = regclassName(text[0..dot]) orelse return missing;
-                const relation = regclassName(text[dot + 1 ..]) orelse return missing;
-                var schemas: [K.relation_rows]K.SchemaFound = undefined;
-                const count = self.catalog.visibleSchemas(self.seq_snap, &schemas);
-                for (schemas[0..count]) |found| {
-                    if (!types.same(self.schemas[found.slot].name.slice(), schema.slice())) continue;
-                    const hit = self.catalog.findIn(found.oid, relation.slice(), self.seq_snap) orelse return missing;
-                    return if (hit.kind == 'S') self.seqs[hit.slot].oid else self.tables[hit.slot].oid;
-                }
+            const whitespace = " \t\r\n";
+            if (regclassSeparator(text)) |dot| {
+                const tail = text[dot + 1 ..];
+                if (regclassSeparator(tail) != null) return error.UnsupportedStatement;
+                const schema = namespaceIdentifier(std.mem.trim(u8, text[0..dot], whitespace)) catch return missing;
+                const name = namespaceIdentifier(std.mem.trim(u8, tail, whitespace)) catch return missing;
+                const namespace = namespaceFor(&self.catalog, schema.slice(), self.seq_snap) orelse return missing;
+                return if (self.regclassIn(namespace, name.slice())) |oid| oid else missing;
             }
-            const name = regclassName(text) orelse return missing;
-            if (self.catalog.find(name.slice(), self.seq_snap)) |found| {
+            const name = namespaceIdentifier(std.mem.trim(u8, text, whitespace)) catch return missing;
+            if (self.regclassIn(catalog_module.catalog_namespace, name.slice())) |oid| return oid;
+            return if (self.regclassIn(catalog_module.public_namespace, name.slice())) |oid| oid else missing;
+        }
+
+        fn regclassIn(self: *const Self, namespace: u32, name: []const u8) ?u32 {
+            if (namespace == catalog_module.catalog_namespace) {
+                const view = self.catalog.findSystemView("pg_catalog", name) orelse return null;
+                for (catalog_module.bootstrap_relations) |relation| {
+                    if (relation.view == view) return relation.oid;
+                }
+                return null;
+            }
+            if (self.catalog.findIn(namespace, name, self.seq_snap)) |found| {
                 return if (found.kind == 'S') self.seqs[found.slot].oid else self.tables[found.slot].oid;
+            }
+            if (self.catalog_objects.byName(.composite_type, namespace, name, self.seq_snap)) |index| {
+                return self.catalog_objects.items[index].compositeRelationOid();
             }
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(self.seq_snap, &relations);
             for (relations[0..count]) |found| {
-                if (found.kind != 'r') continue;
+                if (found.kind == 'S') continue;
                 const table = &self.tables[found.slot];
-                if (!S.keyed(table)) continue;
-                const index_name = indexName(table) catch continue;
-                if (types.same(index_name.slice(), name.slice())) return table.oid + 1;
+                if (table.namespace != namespace) continue;
+                if (S.keyed(table)) {
+                    const primary = indexName(table) catch Name{};
+                    if (types.same(primary.slice(), name)) return table.oid + 1;
+                }
+                for (table.indexes[0..table.index_count]) |*index| {
+                    if (index.oid != 0 and types.same(index.name.slice(), name)) return index.oid;
+                }
             }
-            return missing;
+            return null;
         }
 
         fn namespaceIdentifier(raw: []const u8) Error!Name {
@@ -4977,28 +4986,60 @@ pub fn Database(comptime config: Config) type {
             return out;
         }
 
-        fn relationName(ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize {
-            const self: *Self = @ptrCast(@alignCast(ptr));
+        const RelationIdentity = struct { name: []const u8, namespace: u32 };
+
+        fn relationIdentity(self: *const Self, oid: u32, primary_name: *Name) ?RelationIdentity {
+            for (catalog_module.bootstrap_relations) |relation| {
+                if (relation.oid != oid or (relation.view == .pg_database and self.catalog.databases == null)) continue;
+                return .{ .name = @tagName(relation.view), .namespace = catalog_module.catalog_namespace };
+            }
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(self.seq_snap, &relations);
             for (relations[0..count]) |found| {
-                var name: Name = undefined;
                 if (found.kind == 'S') {
-                    if (self.seqs[found.slot].oid != oid) continue;
-                    name = self.seqs[found.slot].name;
-                } else {
-                    const table = &self.tables[found.slot];
-                    if (table.oid == oid) {
-                        name = table.name;
-                    } else if (S.keyed(table) and table.oid + 1 == oid) {
-                        name = indexName(table) catch return null;
-                    } else continue;
+                    const seq = &self.seqs[found.slot];
+                    if (seq.oid == oid) return .{ .name = seq.name.slice(), .namespace = catalog_module.public_namespace };
+                    continue;
                 }
-                if (name.len > out.len) return null;
-                @memcpy(out[0..name.len], name.slice());
-                return name.len;
+                const table = &self.tables[found.slot];
+                if (table.oid == oid) return .{ .name = table.name.slice(), .namespace = table.namespace };
+                if (S.keyed(table) and table.oid + 1 == oid) {
+                    primary_name.* = indexName(table) catch return null;
+                    return .{ .name = primary_name.slice(), .namespace = table.namespace };
+                }
+                for (table.indexes[0..table.index_count]) |*index| {
+                    if (index.oid != 0 and index.oid == oid) return .{ .name = index.name.slice(), .namespace = table.namespace };
+                }
+            }
+            for (&self.catalog_objects.items) |*object| {
+                if (object.kind == .composite_type and O.visible(object, self.seq_snap) and object.compositeRelationOid() == oid) {
+                    return .{ .name = object.name.slice(), .namespace = object.target };
+                }
             }
             return null;
+        }
+
+        fn relationName(ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var primary: Name = undefined;
+            const identity = self.relationIdentity(oid, &primary) orelse return null;
+            if (identity.name.len > out.len) return null;
+            @memcpy(out[0..identity.name.len], identity.name);
+            return identity.name.len;
+        }
+
+        fn relationDisplayName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var primary: Name = undefined;
+            const identity = self.relationIdentity(oid, &primary) orelse return null;
+            var output: CatalogTextWriter = .{ .out = out };
+            if (!self.inRelationSearchPath(identity.namespace, identity.name)) {
+                output.ident(self.namespaceName(identity.namespace));
+                output.add(".");
+            }
+            output.ident(identity.name);
+            if (output.shortened) return error.TextCapacity;
+            return output.len;
         }
 
         fn inRelationSearchPath(self: *const Self, namespace: u32, name: []const u8) bool {
@@ -5009,41 +5050,9 @@ pub fn Database(comptime config: Config) type {
 
         fn relationVisible(ptr: *anyopaque, oid: u32) ?bool {
             const self: *const Self = @ptrCast(@alignCast(ptr));
-            switch (oid) {
-                // PostgreSQL's fixed OIDs for the catalog relations we expose.
-                1247, 1249, 1255, 1259, 1260, 1261, 1417, 2224, 2328, 2396,
-                2604, 2609, 2610, 2611, 2615, 2618, 2620, 3079, 3256, 3501, 6104,
-                => return true,
-                1262 => return if (self.catalog.databases != null) true else null,
-                else => {},
-            }
-            const snap = self.seq_snap;
-            var relations: [K.relation_rows]K.Found = undefined;
-            const count = self.catalog.visibleRelations(snap, &relations);
-            for (relations[0..count]) |found| {
-                if (found.kind == 'S') {
-                    const seq = &self.seqs[found.slot];
-                    if (seq.oid == oid) return self.inRelationSearchPath(catalog_module.public_namespace, seq.name.slice());
-                    continue;
-                }
-                const table = &self.tables[found.slot];
-                if (table.oid == oid) return self.inRelationSearchPath(table.namespace, table.name.slice());
-                if (table.oid +% 1 == oid and S.keyed(table)) {
-                    const name = indexName(table) catch return null;
-                    return self.inRelationSearchPath(table.namespace, name.slice());
-                }
-                for (table.indexes[0..table.index_count]) |*index| {
-                    if (index.oid != 0 and index.oid == oid) {
-                        return self.inRelationSearchPath(table.namespace, index.name.slice());
-                    }
-                }
-            }
-            for (&self.catalog_objects.items) |*object| {
-                if (object.kind == .composite_type and O.visible(object, snap) and object.compositeRelationOid() == oid) {
-                    return self.inRelationSearchPath(object.target, object.name.slice());
-                }
-            }
-            return null;
+            var primary: Name = undefined;
+            const identity = self.relationIdentity(oid, &primary) orelse return null;
+            return self.inRelationSearchPath(identity.namespace, identity.name);
         }
 
         fn relationPublishable(ptr: *anyopaque, oid: u32) ?bool {
@@ -7636,7 +7645,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;

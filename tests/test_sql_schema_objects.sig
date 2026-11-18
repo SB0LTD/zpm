@@ -1508,6 +1508,25 @@ fn qualifiedCatalogCasts() !void {
     try rejects("SELECT 1::pg_catalog.\"Int4\"", error.UndefinedObject, "SELECT 1::pg_catalog.int4", "1");
 }
 
+fn regclassIdentities() !void {
+    reset();
+    try run("CREATE SCHEMA \"A.B\"");
+    try run("CREATE TABLE \"A.B\".\"X\"\"Y\"(id INT PRIMARY KEY)");
+    try run("CREATE INDEX \"IX Dots\" ON \"A.B\".\"X\"\"Y\"(id)");
+    try run("CREATE TABLE public.\"pg_class\"(id INT)");
+    const resolution = "SELECT to_regclass('pg_class')::oid, to_regclass('PG_CATALOG . pg_class')::text, " ++
+        "to_regclass(' public . pg_class ')::text, to_regclass('missing')::text, '-'::regclass::text";
+    try expect(resolution, "1259|pg_class|public.pg_class|NULL|-");
+    const names = "SELECT to_regclass('\"A.B\".\"X\"\"Y\"')::text, to_regclass('\"A.B\".\"IX Dots\"')::text, " ++
+        "to_regclass('\"A.B\".\"X\"\"Y_pkey\"')::text";
+    try expect(names, "\"A.B\".\"X\"\"Y\"|\"A.B\".\"IX Dots\"|\"A.B\".\"X\"\"Y_pkey\"");
+    try expect("SELECT to_regclass('') IS NULL, to_regclass('pg_class other') IS NULL, to_regclass('pg_catalog.missing') IS NULL", "t|t|t");
+    try expect("SELECT pg_table_is_visible('pg_class'::regclass), pg_table_is_visible('public.pg_class'::regclass), pg_relation_is_publishable('pg_class'::regclass)", "t|f|f");
+    try rejects("SELECT ' 1259 '::regclass::text", error.TableNotFound, resolution, "1259|pg_class|public.pg_class|NULL|-");
+    try rejects("SELECT to_regclass('pg_catalog.pg_class.foo')", error.UnsupportedStatement, resolution, "1259|pg_class|public.pg_class|NULL|-");
+    try sameState(&.{ resolution, names });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1534,5 +1553,6 @@ pub fn main() !void {
     try publicationMembership();
     try partitionDefinitions();
     try qualifiedCatalogCasts();
+    try regclassIdentities();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }
