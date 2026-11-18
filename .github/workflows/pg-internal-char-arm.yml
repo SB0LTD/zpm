@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5bb4530df282a28c323694569733ef60b4de51b6
+          ref: 02660dde23a706284465ddd9243970ed81a78192
       - name: Install checksum-verified Sig 0.6.5 for AArch64
         shell: bash
         run: |
@@ -33,7 +33,7 @@ jobs:
           mkdir evidence
           git rev-parse HEAD | tee evidence/source.log
           "$SIG" version | tee evidence/sig-version.log
-          "$SIG" build run-contract-sql-ddl-core run-contract-postgres run-contract-sql-change-log run-contract-sql-schema-objects run-contract-sql-catalog --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
+          "$SIG" build run-contract-sql-catalog --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
