@@ -1341,6 +1341,11 @@ fn detachedPrimaryKeys() !void {
     try check(s.detachedPrimaryKey(frame[0..frame.len-1]) == null);
     const hint = s.detachedPrimaryKey(frame) orelse return error.MissingPrimaryKeyHint;
     try check(equal(hint.source, template) and hint.oid == 20 and hint.key == -9);
+    var scheduled_key: ?StoreSession.DetachedPrimaryKey = null;
+    const scheduled = s.detachedCandidateWithKey(frame, &scheduled_key) orelse return error.MissingReadCandidate;
+    try check(scheduled == .execute and equal(scheduled.execute, "SELECT id FROM pk WHERE id=(-9)"));
+    try check(scheduled_key != null and equal(scheduled_key.?.source, hint.source) and scheduled_key.?.oid == hint.oid and scheduled_key.?.key == hint.key);
+    try check(s.detachedCandidateWithKey(frame[0..frame.len-1], &scheduled_key) == null and scheduled_key == null);
     const snap: Raw.Snapshot = .{.csn=store.database.csn};
     try check(db.detachedReadEligible());
     try check(try context.preparePrimaryKey(&store.database, hint.source, snap, .integer));
@@ -1354,6 +1359,8 @@ fn detachedPrimaryKeys() !void {
     const row = (try frames.next()).?;
     try check(u32be(row.body[2..6]) == 8 and equal(row.body[6..14], "\xff\xff\xff\xff\xff\xff\xff\xf7"));
     try check(s.detachedPrimaryKey(frame) == null);
+    scheduled_key = hint;
+    try check(s.detachedCandidateWithKey(frame, &scheduled_key).? == .metadata and scheduled_key == null);
 
     // NULL and signed text use the same owned candidate record. If no
     // matching read plan is installed, Execute continues through plain SQL.

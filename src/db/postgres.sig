@@ -477,8 +477,15 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 self.oversize_remaining==0 and (self.authentication==null or self.authentication.?.state==.complete);
         }
         pub fn detachedCandidate(self:*Self,input:[]const u8) ?DetachedCandidate {
-            if(!self.detachedReady()) return null;
-            return self.detachedFrame(input) catch null;
+            return self.detachedCandidateWithKey(input, null);
+        }
+
+        /// Return the optional primary-key hint from the same validated frame.
+        /// Both sources borrow the portal storage until the handler runs.
+        pub fn detachedCandidateWithKey(self: *Self, input: []const u8, key_hint: ?*?DetachedPrimaryKey) ?DetachedCandidate {
+            if (key_hint) |hint| hint.* = null;
+            if (!self.detachedReady()) return null;
+            return self.detachedFrame(input, key_hint) catch null;
         }
 
         /// Additional scheduling hint for unlimited Execute. Portal storage
@@ -486,14 +493,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// authorize execution or replace the rendered-SQL fallback.
         pub fn detachedPrimaryKey(self: *Self, input: []const u8) ?DetachedPrimaryKey {
             if (comptime !has_primary_key) return null;
-            if (!self.detachedReady() or input.len < 5 or input[0] != 'E') return null;
-            const size = read32(input[1..5]);
-            if (size < 4 or size > max_packet or @as(usize,size)+1 > input.len) return null;
-            var r: Reader = .{.bytes=input[5..@as(usize,size)+1]};
-            const frame = self.executeFrame(&r) catch return null;
-            if (frame.limit != 0 or frame.portal.complete) return null;
-            if (frame.portal.primary_key) |*key| return key.proposal();
-            return null;
+            if (input.len == 0 or input[0] != 'E') return null;
+            var hint: ?DetachedPrimaryKey = null;
+            _ = self.detachedCandidateWithKey(input, &hint);
+            return hint;
         }
 
         fn executeFrame(self: *Self, r: *Reader) !struct { portal: *Portal, limit: u32 } {
@@ -503,7 +506,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             if (limit > 0x7fffffff) return error.ProtocolViolation;
             return .{ .portal = try self.portal(name), .limit = limit };
         }
-        fn detachedFrame(self:*Self,input:[]const u8) !?DetachedCandidate {
+        fn detachedFrame(self:*Self,input:[]const u8,key_hint:?*?DetachedPrimaryKey) !?DetachedCandidate {
             if(input.len<5) return null;
             const size=read32(input[1..5]);
             if(size<4 or size>max_packet or @as(usize,size)+1>input.len) return null;
@@ -533,6 +536,9 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     if(frame.limit!=0) return null; // suspended portals retain their owner
                     const portal_value=frame.portal;
                     if(portal_value.complete) return .metadata;
+                    if (comptime has_primary_key) if (key_hint) |hint| {
+                        if (portal_value.primary_key) |*key| hint.* = key.proposal();
+                    };
                     return .{.execute=portal_value.source()};
                 },
                 else=>return null,
