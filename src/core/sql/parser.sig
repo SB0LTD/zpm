@@ -3071,7 +3071,9 @@ pub fn Parser(comptime config: types.Config) type {
             try self.fromItem(out, .first);
             while (self.mode == .standard) {
                 if (try self.takeSymbol(.comma)) {
+                    const start = out.item_count;
                     try self.fromItem(out, .cross);
+                    out.items[start].comma_separated = true;
                     continue;
                 }
                 if (!try self.joinClause(out)) break;

@@ -358,7 +358,10 @@ fn namespacesAndExtensions() !void {
     try expect("SELECT (SELECT x.tableoid) FROM pg_extension x", "3079");
     try expect("SELECT tableoid, count(*) FROM pg_extension GROUP BY tableoid ORDER BY tableoid", "3079|1");
     try metadata("SELECT x.* FROM pg_extension x", &.{ "oid", "extname", "extowner", "extnamespace", "extrelocatable", "extversion", "extconfig", "extcondition" }, &.{ 26, 19, 26, 26, 16, 25, 1028, 1009 });
-    try fails("SELECT tableoid FROM pg_extension x CROSS JOIN pg_namespace n", error.AmbiguousColumn);
+    try fails("SELECT tableoid FROM pg_extension x CROSS JOIN pg_namespace n", error.ColumnNotFound);
+    try fails("SELECT tableoid FROM pg_extension x, pg_namespace n", error.AmbiguousColumn);
+    try expect("SELECT x.tableoid FROM pg_extension x JOIN (SELECT 1) q ON tableoid = 3079::oid", "3079");
+    try expect("SELECT tableoid FROM pg_extension x, (SELECT 1) a CROSS JOIN (SELECT 2) b", "3079");
     try fails("SELECT tableoid, count(*) FROM pg_extension", error.GroupingError);
     try fails("SELECT tableoid FROM pg_settings", error.ColumnNotFound);
     try fails("SELECT v.tableoid FROM (SELECT oid FROM pg_extension) v", error.ColumnNotFound);

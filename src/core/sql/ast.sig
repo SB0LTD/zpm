@@ -784,6 +784,8 @@ pub fn Ast(comptime config: types.Config) type {
             alias: ?Ident = null,
             query: u16 = none,
             join: JoinKind = .first,
+            /// A separate FROM operand, rather than SQL CROSS JOIN.
+            comma_separated: bool = false,
             on: u16 = none,
             using: [config.columns]Ident = undefined,
             using_count: usize = 0,

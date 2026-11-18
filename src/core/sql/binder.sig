@@ -435,6 +435,7 @@ pub fn Binder(comptime config: types.Config) type {
             view: ?catalog.View = null,
             /// Hidden identity also retained by a catalog column-alias wrapper.
             catalog_oid: u32 = 0,
+            catalog_qualified_only: bool = false,
         };
 
         /// USING column merged from the relations joined before `right`.
@@ -4977,9 +4978,9 @@ pub fn Binder(comptime config: types.Config) type {
         // SQL-visible by name, but excluded from * and NATURAL / USING.
         const table_oid_column: u16 = 65535;
 
-        fn selectableColumn(context: *const Context, rel: *const Relation, wanted: []const u8) ?usize {
+        fn selectableColumn(context: *const Context, rel: *const Relation, wanted: []const u8, qualified: bool) ?usize {
             if (findColumn(context, rel, wanted)) |column| return column;
-            return if (rel.catalog_oid != 0 and types.same(wanted, "tableoid")) table_oid_column else null;
+            return if (rel.catalog_oid != 0 and (qualified or !rel.catalog_qualified_only) and types.same(wanted, "tableoid")) table_oid_column else null;
         }
 
         /// Marks every plan between `scope` and the scope `level` blocks up
@@ -5199,7 +5200,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn columnVisible(context: *const Context, scope: *const Scope, name: []const u8) bool {
             var current: ?*const Scope = scope;
             while (current) |s| : (current = s.parent) {
-                for (s.rels[s.rel_first..s.rel_count]) |*rel| if (selectableColumn(context, rel, name) != null) return true;
+                for (s.rels[s.rel_first..s.rel_count]) |*rel| if (selectableColumn(context, rel, name, false) != null) return true;
                 for (s.using[0..s.using_count]) |*entry| if (types.same(entry.name.slice(), name)) return true;
             }
             return false;
@@ -5239,7 +5240,7 @@ pub fn Binder(comptime config: types.Config) type {
                 if (qualifier) |q| {
                     for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
                         if (!types.same(rel.name.slice(), q.slice())) continue;
-                        const column = selectableColumn(context, rel, wanted.slice()) orelse return error.ColumnNotFound;
+                        const column = selectableColumn(context, rel, wanted.slice(), true) orelse return error.ColumnNotFound;
                         try opaqueColumn(context, scope, rel, column);
                         return bindColumn(context, scope, n, s, level, index, column);
                     }
@@ -5254,7 +5255,7 @@ pub fn Binder(comptime config: types.Config) type {
                 }
                 var found: ?[2]usize = null;
                 for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
-                    const column = selectableColumn(context, rel, wanted.slice()) orelse continue;
+                    const column = selectableColumn(context, rel, wanted.slice(), false) orelse continue;
                     if (found != null) return error.AmbiguousColumn;
                     found = .{ index, column };
                 }
@@ -5997,7 +5998,7 @@ pub fn Binder(comptime config: types.Config) type {
             for (scope.using[0..scope.using_count]) |*entry| {
                 if (types.same(entry.name.slice(), wanted)) return true;
             }
-            for (scope.rels[0..scope.rel_count]) |*rel| if (selectableColumn(context, rel, wanted) != null) return true;
+            for (scope.rels[0..scope.rel_count]) |*rel| if (selectableColumn(context, rel, wanted, false) != null) return true;
             return false;
         }
 
@@ -6789,7 +6790,13 @@ pub fn Binder(comptime config: types.Config) type {
             const item = &q.items[k];
             const p = &plansOf(context).items[plan_id];
             const saved = scope.rel_first;
-            scope.rel_first = enclosingGroup(q, k);
+            const floor = enclosingGroup(q, k);
+            var first = k;
+            while (first > floor) {
+                first -= 1;
+                if (q.items[first].comma_separated) break;
+            }
+            scope.rel_first = first;
             defer scope.rel_first = saved;
             var on: u16 = none;
             if (item.natural) {
@@ -6801,6 +6808,11 @@ pub fn Binder(comptime config: types.Config) type {
             if (p.sources[k].table) |table| if ((item.join == .inner or item.join == .left) and last == k and !p.general_join) {
                 p.sources[k].probe = joinProbe(context, table, on, k);
             };
+            // A SQL JOIN exposes only ordinary output columns unqualified.
+            // Its constituent relation names still qualify their tableoid.
+            if (item.join != .first and !item.comma_separated) {
+                for (scope.rels[first .. last + 1]) |*relation| relation.catalog_qualified_only = true;
+            }
         }
 
         fn bindCore(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv, branch: bool) Error!u16 {
