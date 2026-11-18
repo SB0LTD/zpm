@@ -1308,6 +1308,29 @@ fn constraintDefinitionCatalog() !void {
     try sameState(&.{ definitions, references, identities });
 }
 
+fn partitionAncestorCatalog() !void {
+    reset();
+    try run("CREATE TABLE whole (id INTEGER) PARTITION BY RANGE (id)");
+    try run("CREATE TABLE leaf PARTITION OF whole FOR VALUES FROM (0) TO (10)");
+    try run("CREATE TABLE solo (id INTEGER)");
+    const targets = "SELECT pg_catalog.pg_partition_ancestors('leaf')";
+    const names = "SELECT pg_partition_ancestors('leaf')::pg_catalog.text";
+    const ordinality = "SELECT c.relname,a.position FROM pg_catalog.pg_partition_ancestors('leaf') WITH ORDINALITY AS a(relid,position) JOIN pg_class c ON c.oid=a.relid ORDER BY a.position";
+    const incoming_form = "SELECT relname FROM pg_class WHERE oid IN (SELECT pg_catalog.pg_partition_ancestors('16385') UNION ALL VALUES ('16385'::pg_catalog.regclass)) ORDER BY oid";
+    try expect(targets, "16385;16384");
+    try expect(names, "leaf;whole");
+    try expect(ordinality, "leaf|1;whole|2");
+    try expect(incoming_form, "whole;leaf");
+    try expect("SELECT pg_partition_ancestors('whole')", "16384");
+    try expect("SELECT pg_partition_ancestors('solo')", "");
+    try expect("SELECT pg_partition_ancestors(NULL)", "");
+    try expect("SELECT pg_partition_ancestors('99999')", "");
+    try expect("SELECT '99999'::regclass, '-'::regclass, '16384'::regclass::text", "99999|0|whole");
+    try expect("SELECT '0001'::regclass::oid", "1");
+    try rejects("SELECT '4294967296'::regclass::oid", error.NumericValueOutOfRange, names, "leaf;whole");
+    try sameState(&.{ targets, names, ordinality, incoming_form });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1326,5 +1349,6 @@ pub fn main() !void {
     try virtualColumns();
     try indexDefinitionCatalog();
     try constraintDefinitionCatalog();
+    try partitionAncestorCatalog();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

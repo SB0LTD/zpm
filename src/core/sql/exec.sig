@@ -300,6 +300,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var ctx = self.context(outer);
                 var out: List = .{ .start = @intCast(self.work.ref_low) };
                 if (p.series == .json_table) return self.jsonTableRows(p, outer);
+                if (p.series == .partition_ancestors) return self.partitionAncestorRows(p, &ctx);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -333,7 +334,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none, .json_table => unreachable,
+                    .none, .json_table, .partition_ancestors => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -357,6 +358,23 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 return self.finish(p, out);
+            }
+
+            fn partitionAncestorRows(self: *Query, p: *const B.Plan, ctx: *E.Context) Error!List {
+                var rows: List = .{ .start = @intCast(self.work.ref_low) };
+                const value = try E.eval(ctx, self.pool.nodes[p.function].b);
+                if (value == .null_value) return rows;
+                const hook = self.session.sequences orelse return error.UnsupportedStatement;
+                const lookup = hook.partition_ancestors orelse return error.UnsupportedStatement;
+                var ancestors: [config.tables]u32 = undefined;
+                const count = try lookup(hook.ptr, @intCast(value.integer), &ancestors);
+                for (ancestors[0..count], 1..) |oid, position| {
+                    const at = try self.cells(p.width);
+                    self.work.cells[at] = .{ .integer = oid };
+                    if (p.ordinality) self.work.cells[at + 1] = .{ .integer = @intCast(position) };
+                    try self.push(&rows, at);
+                }
+                return self.finish(p, rows);
             }
 
             /// JSON_TABLE rows (B11 json-agg lane, json_eval.sig): each row's

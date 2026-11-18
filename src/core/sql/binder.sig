@@ -513,7 +513,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// FROM (one row).
         pub const Series = enum { none, integer, numeric, timestamp,
             // JSON_TABLE (B11 json-agg lane): `function` is the table node.
-            json_table };
+            json_table, partition_ancestors };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -2253,6 +2253,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                 },
                 .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out => unreachable,
+                .pg_partition_ancestors => return error.UnsupportedStatement,
                 .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
                 .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
@@ -6497,6 +6498,31 @@ pub fn Binder(comptime config: types.Config) type {
             return id;
         }
 
+        fn partitionAncestorsName(context: *const Context, name: ast.Ident, schema: ?ast.Ident) bool {
+            if (context.dialect != .postgres or !types.same(toName(context, name).slice(), "pg_partition_ancestors")) return false;
+            return if (schema) |namespace| types.same(toName(context, namespace).slice(), "pg_catalog") else true;
+        }
+
+        fn partitionAncestorsTarget(context: *const Context, select: *const Ast.Select) ?u16 {
+            if (select.item_count != 0 or select.count != 1 or select.targets[0].star) return null;
+            var expression = select.targets[0].expr;
+            while (context.node(expression).kind == .cast) expression = context.node(expression).a;
+            const node = context.node(expression);
+            if (node.kind != .function or !partitionAncestorsName(context, node.name, functionSchema(node))) return null;
+            return expression;
+        }
+
+        fn functionSchema(call: *const ast.Node) ?ast.Ident {
+            return if (call.qualifier.span.len == 0) null else call.qualifier;
+        }
+
+        fn replacePartitionAncestorTarget(context: *const Context, expression: u16, function: u16, column: u16) Error!u16 {
+            if (expression == function) return column;
+            var cast = context.node(expression).*;
+            cast.a = try replacePartitionAncestorTarget(context, cast.a, function, column);
+            return context.pool.add(cast);
+        }
+
         /// A function in FROM (B11) as a plan of its own: generate_series
         /// over int4/int8/numeric (optional step) or timestamp[tz] with an
         /// interval step, otherwise any scalar function (one row). Arguments
@@ -6565,6 +6591,15 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                 }
                 ty = target;
+            } else if (partitionAncestorsName(context, item.name, item.schema)) {
+                if (call.star or call.distinct or call.c != none or call.order != none or call.b == none or context.node(call.b).next != none) return error.UndefinedFunction;
+                const converted = try context.pool.add(.{ .kind = .cast, .cast_type = .oid, .typmod = ast.regclass_typmod, .a = call.b });
+                try typeExpr(context, &inner, converted);
+                call.b = converted;
+                call.func = .pg_partition_ancestors;
+                call.ty = .oid;
+                series = .partition_ancestors;
+                ty = .oid;
             } else {
                 try typeExpr(context, &inner, item.function);
                 ty = context.node(item.function).ty;
@@ -6710,6 +6745,18 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn bindCore(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv, branch: bool) Error!u16 {
+            // One set-returning target and no FROM is equivalent to scanning
+            // that function. The normal projection still owns WHERE and ORDER.
+            if (partitionAncestorsTarget(context, q)) |function| {
+                if (q.where != none or q.having != none or q.group_count != 0 or q.grouping_sets != none) return error.UnsupportedStatement;
+                const call = context.node(function);
+                var lifted = q.*;
+                lifted.items[0] = .{ .function = function, .name = call.name, .schema = functionSchema(call) };
+                lifted.item_count = 1;
+                const column = try context.pool.add(.{ .kind = .column, .name = call.name, .reg = .regclass });
+                lifted.targets[0].expr = try replacePartitionAncestorTarget(context, q.targets[0].expr, function, column);
+                return bindCore(context, &lifted, parent, env, branch);
+            }
             const plans = plansOf(context);
             const id = try plans.add();
             var scope: Scope = .{ .parent = parent, .plan = id, .ctes = env, .window_defs=q.window_defs };
@@ -7683,6 +7730,13 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .select => |index| {
                     const q = &context.pool.queries[index];
+                    if (partitionAncestorsTarget(context, q) != null) {
+                        const plans = context.plans orelse return error.UnsupportedStatement;
+                        plans.reset();
+                        const root = try bindPlan(context, index, null, null, false);
+                        try resolveUnknown(context, root);
+                        return .{ .query = root };
+                    }
                     // A system view runs on the general engine (scan-time rows).
                     if (q.from) |reference| if (viewOf(context, reference.schema, reference.name) != null) {
                         if (context.plans == null) return error.UnsupportedStatement;
