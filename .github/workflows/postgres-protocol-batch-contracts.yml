@@ -34,7 +34,7 @@ jobs:
           mkdir evidence
           git rev-parse HEAD >evidence/source.txt
           "$SIG" version | tee evidence/sig-version.log
-          "$SIG" build run-contract-pg_query_boundaries run-contract-db_store run-contract-postgres run-contract-pg_stream run-contract-db_stream \
+          "$SIG" build run-contract-pg-query-boundaries run-contract-db_store run-contract-postgres run-contract-pg_stream run-contract-db_stream \
             --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
       - uses: actions/upload-artifact@v4
         if: always()
