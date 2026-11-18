@@ -43,6 +43,26 @@ fn narrowPath(path: []const u8, out: *[path_capacity]u8) Error![:0]const u8 {
     return out[0..path.len :0];
 }
 
+/// A database-wide writer lock independent of its WAL and snapshot handles.
+/// Take it at the same dedicated path for every open of the database, before
+/// selecting a generation. All writers must leave that lock path in place,
+/// even when changing generations or closing the database. Like File, this
+/// owns one native handle and must not be copied while held.
+pub const WriterLock = struct {
+    file: File = .{},
+
+    /// Create the lock file if needed, or reacquire the existing lock file.
+    /// An unsuccessful acquisition leaves this instance unchanged.
+    pub fn acquire(self: *WriterLock, path: []const u8) Error!void {
+        if (self.file.handle != invalid) return error.DataDirectoryBusy;
+        self.file = try File.open(path);
+    }
+
+    pub fn close(self: *WriterLock) void {
+        self.file.close();
+    }
+};
+
 pub const File = struct {
     handle: Handle = invalid,
     poisoned: bool = false,
