@@ -29,7 +29,7 @@ const x25519 = @import("x25519");
 const p256 = @import("p256");
 const keysched = @import("tls13_keys");
 const keysched384 = @import("keysched384.sig");
-const chacha = @import("chacha20poly1305");
+const records = @import("record.sig");
 const x509 = @import("x509.sig");
 const verify = @import("x509_verify.sig");
 // NOTE: ca_bundle.sig (the embedded Mozilla trust store plus ca_roots_web.sig,
@@ -69,9 +69,9 @@ const HS_MESSAGE_HASH: u8 = 254;
 
 const TLS12: u16 = 0x0303;
 const TLS13: u16 = 0x0304;
-const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
-const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
-const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+const TLS_AES_128_GCM_SHA256 = SUITE_AES128.id;
+const TLS_AES_256_GCM_SHA384 = SUITE_AES256.id;
+const TLS_CHACHA20_POLY1305_SHA256 = SUITE_CHACHA.id;
 const GROUP_X25519: u16 = 0x001d;
 const GROUP_SECP256R1: u16 = 0x0017;
 // SHA-256("HelloRetryRequest") — a ServerHello carrying this random IS an HRR.
@@ -90,7 +90,7 @@ const SIG_RSA_PSS_SHA512: u16 = 0x0806;
 const SIG_ECDSA_SHA256: u16 = 0x0403;
 const SIG_ECDSA_SHA384: u16 = 0x0503;
 
-const MAX_RECORD: usize = 16384 + 256; // TLSPlaintext max + AEAD expansion
+const MAX_RECORD = records.max_ciphertext_bytes;
 const MAX_CERTS: usize = verify.MAX_CHAIN;
 // Largest handshake message accepted (in practice the Certificate message: a
 // leaf plus intermediates, which may span several records).
@@ -199,127 +199,13 @@ const Transcript = struct {
     }
 };
 
-/// AEAD algorithm negotiated for the session.
-const Aead = enum { aes128_gcm, aes256_gcm, chacha20_poly1305 };
-const HashId = enum { sha256, sha384 };
-
-/// Cipher-suite descriptor. The server selects one of these in ServerHello.
-const Suite = struct {
-    id: u16,
-    hash: HashId,
-    aead: Aead,
-    key_len: usize,
-    hash_len: usize,
-};
-
-const SUITE_AES128: Suite = .{ .id = TLS_AES_128_GCM_SHA256, .hash = .sha256, .aead = .aes128_gcm, .key_len = 16, .hash_len = 32 };
-const SUITE_AES256: Suite = .{ .id = TLS_AES_256_GCM_SHA384, .hash = .sha384, .aead = .aes256_gcm, .key_len = 32, .hash_len = 48 };
-const SUITE_CHACHA: Suite = .{ .id = TLS_CHACHA20_POLY1305_SHA256, .hash = .sha256, .aead = .chacha20_poly1305, .key_len = 32, .hash_len = 32 };
-
-fn suiteById(id: u16) ?Suite {
-    if (id == SUITE_AES128.id) return SUITE_AES128;
-    if (id == SUITE_AES256.id) return SUITE_AES256;
-    if (id == SUITE_CHACHA.id) return SUITE_CHACHA;
-    return null;
-}
-
-/// AEAD record protection state for one direction. Holds whichever AEAD the
-/// negotiated suite selected; the per-record nonce construction is identical
-/// across all three (RFC 8446 Section 5.3).
-const RecordKeys = struct {
-    aead: Aead = .aes128_gcm,
-    gcm128: gcm.Gcm = undefined,
-    gcm256: gcm.Gcm256 = undefined,
-    chacha_key: [32]u8 = undefined,
-    iv: [12]u8 = @splat(0),
-    seq: u64 = 0,
-
-    /// AES-128-GCM-SHA256: derive the 16-byte key + 12-byte iv via the
-    /// SHA-256 schedule and build AES-128-GCM.
-    fn init(secret: *const [32]u8) RecordKeys {
-        var key: [16]u8 = undefined;
-        var iv: [12]u8 = undefined;
-        keysched.deriveTrafficKeys(secret, &key, &iv);
-        const rk: RecordKeys = .{ .aead = .aes128_gcm, .gcm128 = gcm.Gcm.init(&key), .iv = iv };
-        std.crypto.secureZero(u8, &key);
-        return rk;
-    }
-
-    /// Build record keys for an arbitrary suite from its traffic secret.
-    /// `secret` is hash_len bytes (32 for SHA-256 suites, 48 for SHA-384).
-    fn initSuite(suite: Suite, secret: []const u8) RecordKeys {
-        var rk = RecordKeys{ .aead = suite.aead };
-        switch (suite.hash) {
-            .sha256 => {
-                const s32 = secret[0..32];
-                switch (suite.aead) {
-                    .aes128_gcm => {
-                        var key: [16]u8 = undefined;
-                        keysched.deriveTrafficKeys(s32, &key, &rk.iv);
-                        rk.gcm128 = gcm.Gcm.init(&key);
-                        std.crypto.secureZero(u8, &key);
-                    },
-                    .chacha20_poly1305 => {
-                        _ = hkdf.expandLabel(s32, "key", "", &rk.chacha_key, 32);
-                        _ = hkdf.expandLabel(s32, "iv", "", &rk.iv, 12);
-                    },
-                    .aes256_gcm => unreachable, // AES-256 pairs with SHA-384
-                }
-            },
-            .sha384 => {
-                var key: [32]u8 = undefined;
-                keysched384.deriveTrafficKeys(secret[0..48], &key, &rk.iv);
-                rk.gcm256 = gcm.Gcm256.init(&key);
-                std.crypto.secureZero(u8, &key);
-            },
-        }
-        return rk;
-    }
-
-    /// Per-record nonce (RFC 8446 §5.3): the 64-bit sequence number, big-endian,
-    /// is left-padded to the IV length and XORed with the static IV. So the
-    /// sequence occupies the LAST 8 bytes: its LSB lands at n[11].
-    fn nonce(self: *const RecordKeys) [12]u8 {
-        var n = self.iv;
-        var i: usize = 0;
-        while (i < 8) : (i += 1) {
-            const shift: u6 = @intCast(i * 8); // i=0 → LSB
-            n[11 - i] ^= @truncate(self.seq >> shift);
-        }
-        return n;
-    }
-
-    /// Seal plaintext in place and write the tag (dispatch on AEAD).
-    fn seal(self: *const RecordKeys, n: *const [12]u8, pt: []u8, aad: []const u8, tag: *[16]u8) void {
-        switch (self.aead) {
-            .aes128_gcm => self.gcm128.seal(n, pt, aad, tag),
-            .aes256_gcm => self.gcm256.seal(n, pt, aad, tag),
-            .chacha20_poly1305 => chacha.seal(&self.chacha_key, n, pt, aad, tag),
-        }
-    }
-
-    /// Open ciphertext in place; returns false on auth failure (dispatch on AEAD).
-    fn open(self: *const RecordKeys, n: *const [12]u8, ct: []u8, aad: []const u8, tag: *const [16]u8) bool {
-        return switch (self.aead) {
-            .aes128_gcm => self.gcm128.open(n, ct, aad, tag),
-            .aes256_gcm => self.gcm256.open(n, ct, aad, tag),
-            .chacha20_poly1305 => chacha.open(&self.chacha_key, n, ct, aad, tag),
-        };
-    }
-};
-
-/// secret_{N+1} = HKDF-Expand-Label(secret_N, "traffic upd", "", Hash.length)
-/// (RFC 8446 §7.2), in place over the suite's hash_len bytes of `secret`.
-fn nextTrafficSecret(suite: Suite, secret: *[48]u8) void {
-    var next: [48]u8 = undefined;
-    if (suite.hash == .sha384) {
-        keysched384.expandLabel(secret, "traffic upd", "", next[0..48]);
-    } else {
-        _ = hkdf.expandLabel(secret[0..32], "traffic upd", "", next[0..32], 32);
-    }
-    @memcpy(secret[0..suite.hash_len], next[0..suite.hash_len]);
-    std.crypto.secureZero(u8, &next);
-}
+const Suite = records.Suite;
+const SUITE_AES128 = records.SUITE_AES128;
+const SUITE_AES256 = records.SUITE_AES256;
+const SUITE_CHACHA = records.SUITE_CHACHA;
+const suiteById = records.suiteById;
+const RecordKeys = records.RecordKeys;
+const nextTrafficSecret = records.nextTrafficSecret;
 
 /// An established TLS connection. After handshake, use read()/write() for
 /// application data; they transparently AEAD-protect TLS records.
@@ -479,8 +365,7 @@ pub const Conn = struct {
     fn readAndDecrypt(self: *Conn) Error!DecRec {
         var hdr: [5]u8 = undefined;
         try self.transport.readExact(&hdr);
-        const rec_len = (@as(usize, hdr[3]) << 8) | hdr[4];
-        if (rec_len == 0 or rec_len > MAX_RECORD) return Error.BadRecord;
+        const rec_len = records.bodyLength(&hdr) catch return Error.BadRecord;
 
         // Decrypt in place: read the full ciphertext record straight into inbuf.
         try self.transport.readExact(self.inbuf[0..rec_len]);
@@ -501,12 +386,8 @@ pub const Conn = struct {
         // Strip trailing zero padding, then the 1-byte inner content type. The
         // plaintext already lives in inbuf (decrypted in place), so there is no
         // further copy — read() serves the caller straight from inbuf.
-        var end = body_len;
-        while (end > 0 and self.inbuf[end - 1] == 0) end -= 1;
-        if (end == 0) return Error.BadRecord;
-        const inner_type = self.inbuf[end - 1];
-        const data_len = end - 1;
-        return .{ .content_type = inner_type, .len = data_len };
+        const inner = try records.decodeInner(self.inbuf[0..body_len]);
+        return .{ .content_type = inner.content_type, .len = inner.content.len };
     }
 };
 
@@ -1040,8 +921,7 @@ const Handshaker = struct {
         while (true) {
             var hdr: [5]u8 = undefined;
             try self.transport.readExact(&hdr);
-            const len = (@as(usize, hdr[3]) << 8) | hdr[4];
-            if (len == 0 or len > MAX_RECORD) return Error.BadRecord;
+            const len = records.bodyLength(&hdr) catch return Error.BadRecord;
             try self.transport.readExact(self.hsbuf[0..len]);
             if (hdr[0] == REC_CHANGE_CIPHER_SPEC and self.hrr_done) continue;
             if (hdr[0] == REC_ALERT) return Error.HandshakeFailed;
@@ -1072,8 +952,7 @@ const Handshaker = struct {
             }
             var hdr: [5]u8 = undefined;
             try self.transport.readExact(&hdr);
-            const len = (@as(usize, hdr[3]) << 8) | hdr[4];
-            if (len == 0 or len > MAX_RECORD) return Error.BadRecord;
+            const len = records.bodyLength(&hdr) catch return Error.BadRecord;
             if (self.hs_end + len > self.hsbuf.len) return Error.BufferTooSmall;
             const rec = self.hsbuf[self.hs_end..][0..len];
             try self.transport.readExact(rec);
@@ -1086,11 +965,9 @@ const Handshaker = struct {
             const nc = self.hs_server.nonce();
             if (!self.hs_server.open(&nc, rec[0..body_len], &hdr, &tag)) return Error.DecryptFailed;
             self.hs_server.seq += 1;
-            var end = body_len;
-            while (end > 0 and rec[end - 1] == 0) end -= 1; // strip padding
-            if (end == 0) return Error.BadRecord;
-            switch (rec[end - 1]) {
-                REC_HANDSHAKE => self.hs_end += end - 1,
+            const inner = try records.decodeInner(rec[0..body_len]);
+            switch (inner.content_type) {
+                REC_HANDSHAKE => self.hs_end += inner.content.len,
                 REC_ALERT => return Error.HandshakeFailed,
                 else => return Error.UnexpectedMessage,
             }

@@ -53,5 +53,6 @@ test {
     @import("std").testing.refAllDecls(ca_bundle);
     @import("std").testing.refAllDecls(sha512);
     @import("std").testing.refAllDecls(tls);
+    @import("std").testing.refAllDecls(@import("record.sig"));
     @import("std").testing.refAllDecls(winsock);
 }
