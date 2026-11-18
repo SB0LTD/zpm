@@ -54,7 +54,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     pg_proc, pg_trigger, pg_rewrite, pg_rules,
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
-    pg_publication_rel, pg_publication_namespace, pg_settings };
+    pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend };
 
 pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
 pub const DatabaseCatalogProvider = struct {
@@ -77,6 +77,7 @@ const pg_type_columns = [_]ViewColumn{
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name) };
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
 const pg_database_columns = [_]ViewColumn{ col("oid", .oid), col("datname", .name), col("datdba", .oid) };
+pub const constraint_catalog: u32 = 2606;
 pub const heap_access_method: u32 = 2;
 pub const btree_access_method: u32 = 403;
 const pg_am_columns = [_]ViewColumn{ col("oid", .oid), col("amname", .name), col("amhandler", .text), col("amtype", .text) };
@@ -102,6 +103,10 @@ const pg_constraint_columns = [_]ViewColumn{
     col("conrelid", .oid), col("contypid", .oid), col("conindid", .oid), col("conparentid", .oid),
     col("confrelid", .oid), col("confupdtype", .text), col("confdeltype", .text), col("confmatchtype", .text),
     col("conperiod", .boolean),
+};
+const pg_depend_columns = [_]ViewColumn{
+    col("classid", .oid), col("objid", .oid), col("objsubid", .int4),
+    col("refclassid", .oid), col("refobjid", .oid), col("refobjsubid", .int4), col("deptype", .text),
 };
 const pg_statistic_ext_columns = [_]ViewColumn{
     col("oid", .oid), col("stxrelid", .oid), col("stxname", .name), col("stxnamespace", .oid),
@@ -165,6 +170,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_attribute => &pg_attribute_columns,
         .pg_index => &pg_index_columns,
         .pg_constraint => &pg_constraint_columns,
+        .pg_depend => &pg_depend_columns,
         .pg_statistic_ext => &pg_statistic_ext_columns,
         .pg_attrdef => &pg_attrdef_columns,
         .pg_sequence => &pg_sequence_columns,
@@ -202,7 +208,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 /// pg_catalog views resolve unqualified (pg_catalog is searched first);
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
-    const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
+    const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
@@ -226,8 +232,8 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_database, .oid = 1262 }, .{ .view = .pg_foreign_server, .oid = 1417 },
     .{ .view = .pg_sequence, .oid = 2224 }, .{ .view = .pg_foreign_data_wrapper, .oid = 2328 },
     .{ .view = .pg_shdescription, .oid = 2396 }, .{ .view = .pg_am, .oid = 2601 },
-    .{ .view = .pg_attrdef, .oid = 2604 }, .{ .view = .pg_constraint, .oid = 2606 },
-    .{ .view = .pg_description, .oid = 2609 }, .{ .view = .pg_index, .oid = 2610 },
+    .{ .view = .pg_attrdef, .oid = 2604 }, .{ .view = .pg_constraint, .oid = constraint_catalog },
+    .{ .view = .pg_depend, .oid = 2608 }, .{ .view = .pg_description, .oid = 2609 }, .{ .view = .pg_index, .oid = 2610 },
     .{ .view = .pg_inherits, .oid = 2611 }, .{ .view = .pg_namespace, .oid = 2615 },
     .{ .view = .pg_rewrite, .oid = 2618 }, .{ .view = .pg_trigger, .oid = 2620 },
     .{ .view = .pg_extension, .oid = 3079 }, .{ .view = .pg_policy, .oid = 3256 },
