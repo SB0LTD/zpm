@@ -7671,7 +7671,7 @@ pub fn Binder(comptime config: types.Config) type {
                         try bindLike(context, &like, &out);
                         out.extras.parent = context.tables[parent_index].oid;
                     }
-                    try bindTableConstraints(context, create.constraints[0..create.constraint_count], &out);
+                    try bindTableConstraints(context, create.constraints[0..create.constraint_count], &out, false);
                     if (out.identity) |identity| {
                         const key = &out.columns[identity.column];
                         if (key.default_kind == .mysql_auto_increment and (!key.primary_key or out.serial_count != 0))
@@ -8302,14 +8302,21 @@ pub fn Binder(comptime config: types.Config) type {
                     out.check_not_null[position] = false;
                 },
                 .add_constraint => |*definition| {
-                    if (definition.kind == .primary) return error.UnsupportedStatement;
+                    if (definition.kind == .primary) {
+                        for (out.columns[0..out.count]) |*column| if (column.primary_key) return error.InvalidTableDefinition;
+                        for (out.constraints[0..out.constraint_count]) |*constraint| if (constraint.kind == .primary) return error.InvalidTableDefinition;
+                    }
                     if (definition.name) |ident| {
                         const name = toName(context, ident);
                         for (out.constraints[0..out.constraint_count]) |*constraint| if (types.same(constraint.name.slice(), name.slice())) return error.DuplicateObject;
                     }
-                    var staged: Create = .{ .name = out.name, .columns = out.columns, .count = out.count, .constraints = out.constraints, .constraint_count = out.constraint_count };
-                    try bindTableConstraints(context, (definition)[0..1], &staged);
+                    var staged: Create = .{ .name = out.name, .namespace = entry.namespace, .columns = out.columns, .count = out.count,
+                        .constraints = out.constraints, .constraint_count = out.constraint_count };
+                    try bindTableConstraints(context, (definition)[0..1], &staged, true);
                     if (staged.constraint_count != out.constraint_count + 1) return error.UnsupportedStatement;
+                    for (staged.columns[0..staged.count], out.columns[0..out.count], 0..) |*after, *before, column| {
+                        if (after.not_null and !before.not_null) out.check_not_null[column] = true;
+                    }
                     out.columns = staged.columns;
                     out.constraints = staged.constraints;
                     out.check_constraint[out.constraint_count] = true;
@@ -8458,7 +8465,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// key columns become NOT NULL. Explicit duplicate names are 42710,
         /// index names already used by a relation 42P07, more than
         /// Config.table_constraints entries ColumnCapacity (54000).
-        fn bindTableConstraints(context: *const Context, definitions: []const Ast.ConstraintDef, out: *Create) Error!void {
+        fn bindTableConstraints(context: *const Context, definitions: []const Ast.ConstraintDef, out: *Create, retain_single_primary: bool) Error!void {
             const columns = out.columns[0..out.count];
             // Explicit names first, so generated names avoid them.
             for (definitions, 0..) |*definition, position| if (definition.name) |ident| {
@@ -8466,7 +8473,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for (definitions[0..position]) |*earlier| if (earlier.name) |other| {
                     if (types.same(toName(context, other).slice(), name.slice())) return error.DuplicateObject;
                 };
-                if (definition.kind != .check and definition.kind != .foreign and (types.same(name.slice(), out.name.slice()) or context.catalog.find(name.slice(), context.snapshot) != null)) return error.TableExists;
+                if (definition.kind != .check and definition.kind != .foreign and (types.same(name.slice(), out.name.slice()) or context.catalog.findIn(out.namespace, name.slice(), context.snapshot) != null)) return error.TableExists;
             };
             var named: [config.table_constraints]S.Constraint = undefined;
             var named_count: usize = 0;
@@ -8530,7 +8537,7 @@ pub fn Binder(comptime config: types.Config) type {
                         if (entry.column_count == 1) {
                             for (columns, 0..) |*column, index| if (column.primary_key and index != entry.columns[0]) return error.InvalidTableDefinition;
                             out.columns[entry.columns[0]].primary_key = true;
-                            if (definition.name == null) continue;
+                            if (definition.name == null and !retain_single_primary) continue;
                         } else for (columns) |*column| if (column.primary_key) return error.InvalidTableDefinition;
                     },
                 }
