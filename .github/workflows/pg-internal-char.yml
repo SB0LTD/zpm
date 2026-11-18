@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: f5dea78cbea7992a746c86a4cec4c57138fecb11
+          ref: 5bb4530df282a28c323694569733ef60b4de51b6
       - name: Install checksum-verified Sig 0.6.5
         shell: bash
         run: |
