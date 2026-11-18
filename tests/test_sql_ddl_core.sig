@@ -1206,13 +1206,16 @@ fn prefixesRejected(bytes: []const u8, probe: []const u8) !void {
 fn walFormats() !void {
     reset();
     var buffer: [4096]u8 = undefined;
-    // Tables without constraints keep the version-1 definition bytes and
-    // op 7 for CACHE 1 sequences: older readers and logs are unaffected.
-    var bytes = try recordOf("CREATE TABLE plain (id INT PRIMARY KEY, v TEXT)", &buffer);
+    // Plain tables still use v1. Persisted primary and CHECK constraint
+    // identities use v4, including keys with the legacy index alias.
+    var bytes = try recordOf("CREATE TABLE loose (id INT)", &buffer);
     try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 1 and bytes[20] == 0);
     try replica.applyChangeRecord(bytes, &scratch);
+    bytes = try recordOf("CREATE TABLE plain (id INT PRIMARY KEY, v TEXT)", &buffer);
+    try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 4 and bytes[20] == 0);
+    try replica.applyChangeRecord(bytes, &scratch);
     bytes = try recordOf("CREATE TABLE chk_t (id INT CHECK (id > 0))", &buffer);
-    try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 2 and bytes[20] == 0);
+    try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 4 and bytes[20] == 0);
     try replica.applyChangeRecord(bytes, &scratch);
     bytes = try recordOf("CREATE SEQUENCE one_cache", &buffer);
     try check(bytes[8] == 7);
