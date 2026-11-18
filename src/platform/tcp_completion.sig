@@ -76,31 +76,60 @@ pub fn Queue(comptime capacity: usize) type {
             return index < capacity and self.slots[index].operation == null and !self.slots[index].canceling;
         }
 
-        fn queue(self: *Self, index: usize, fd: linux.fd_t, comptime operation: Operation, buffer: anytype) !void {
-            const ring = if (self.ring) |*ring| ring else return error.SocketRingClosed;
-            if (index >= capacity or fd < 0 or buffer.len == 0 or buffer.len > 0x7fffffff) return error.InvalidSocketOperation;
+        fn validateSubmission(self: *const Self, index: usize, fd: linux.fd_t, length: usize) !void {
+            if (index >= capacity or fd < 0 or length == 0 or length > 0x7fffffff) return error.InvalidSocketOperation;
             if (!self.reusable(index)) return error.SocketSlotBusy;
+        }
+
+        fn queue(self: *Self, index: usize, fd: linux.fd_t, comptime operation: Operation, buffer: anytype) !*linux.io_uring_sqe {
+            const ring = if (self.ring) |*ring| ring else return error.SocketRingClosed;
+            try self.validateSubmission(index, fd, buffer.len);
             const slot = &self.slots[index];
             const generation = (slot.generation + 1) & generation_mask;
             const token = (generation << 15) | @as(u64, @intCast(index));
-            switch (operation) {
-                .receive => _ = try ring.recv(token, fd, .{ .buffer = buffer }, 0),
-                .send => _ = try ring.send(token, fd, buffer, linux.MSG.NOSIGNAL),
+            const sqe = switch (operation) {
+                .receive => try ring.recv(token, fd, .{ .buffer = buffer }, 0),
+                .send => try ring.send(token, fd, buffer, linux.MSG.NOSIGNAL),
                 .cancel, .wake => unreachable,
-            }
+            };
             slot.generation = generation;
             slot.operation = operation;
             slot.length = buffer.len;
+            return sqe;
         }
 
         pub fn receive(self: *Self, index: usize, fd: linux.fd_t, buffer: []u8) !void {
-            try self.queue(index, fd, .receive, buffer);
+            _ = try self.queue(index, fd, .receive, buffer);
         }
 
         /// On a partial completion the caller can submit the unwritten
         /// suffix with the same slot once all outstanding CQEs are consumed.
         pub fn send(self: *Self, index: usize, fd: linux.fd_t, buffer: []const u8) !void {
-            try self.queue(index, fd, .send, buffer);
+            _ = try self.queue(index, fd, .send, buffer);
+        }
+
+        /// Queue the reply and next input in one soft-linked submission,
+        /// retaining a distinct CQE and lease for each buffer. A short send
+        /// may still start the receive. The caller must finish all reply
+        /// bytes before acting on the next input, even if RX completes first.
+        pub fn sendAndReceive(self: *Self, tx: usize, rx: usize, fd: linux.fd_t,
+            output: []const u8, input: []u8) !void {
+            const ring = if (self.ring) |*ring| ring else return error.SocketRingClosed;
+            try self.validateSubmission(tx, fd, output.len);
+            try self.validateSubmission(rx, fd, input.len);
+            if (tx == rx) return error.InvalidSocketOperation;
+            const out_start = @intFromPtr(output.ptr);
+            const in_start = @intFromPtr(input.ptr);
+            const out_end = @addWithOverflow(out_start, output.len);
+            const in_end = @addWithOverflow(in_start, input.len);
+            if (out_end[1] != 0 or in_end[1] != 0 or
+                (out_start < in_end[0] and in_start < out_end[0])) return error.InvalidSocketOperation;
+            // Only this owner queues SQEs. The kernel can only free entries
+            // between the capacity proof and these two reservations.
+            if (ring.sq.sqes.len - ring.sq_ready() < 2) return error.SubmissionQueueFull;
+            const first = try self.queue(tx, fd, .send, output);
+            _ = self.queue(rx, fd, .receive, input) catch unreachable;
+            first.flags |= linux.IOSQE_IO_LINK;
         }
 
         /// True means a cancellation request was queued. Its CQE never

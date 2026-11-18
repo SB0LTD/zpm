@@ -54,7 +54,7 @@ fn loopback(q: *Queue) !void {
     try check(try tcp.wait(q.descriptor(), &.{}, &ready, &ready, 1000));
     const received_request = try next(q);
     try check(received_request.outcome == .bytes and received_request.outcome.bytes == 6 and std.mem.eql(u8,buf[0..6],"native"));
-    try q.send(0, server, "completed");
+    try q.sendAndReceive(0, 1, server, "completed", &buf);
     _ = try q.submit();
     const sent_reply = try next(q);
     try check(sent_reply.outcome == .bytes and sent_reply.outcome.bytes == 9);
@@ -66,6 +66,11 @@ fn loopback(q: *Queue) !void {
         at += got;
     }
     try check(std.mem.eql(u8,&reply,"completed"));
+    try check(!q.reusable(1));
+    try check((try tcp.send(peer,"next")) == 4);
+    const next_request = try next(q);
+    try check(next_request.slot == 1 and next_request.operation == .receive and next_request.outcome == .bytes and
+        next_request.outcome.bytes == 4 and std.mem.eql(u8,buf[0..4],"next"));
 }
 
 pub fn main() !void {
@@ -78,8 +83,29 @@ pub fn main() !void {
     try check(linux.errno(linux.setsockopt(sockets[0], linux.SOL.SOCKET, linux.SO.SNDBUF, @ptrCast(&send_budget), @sizeOf(c_int))) == .SUCCESS);
 
     for (&sent, 0..) |*byte, i| byte.* = @truncate(i);
+    var input: [16]u8 = undefined;
+    if (q.sendAndReceive(0, 0, sockets[0], &sent, &input)) |_| return error.AliasedSlots
+    else |err| try check(err == error.InvalidSocketOperation and q.reusable(0) and q.reusable(1));
+    if (q.sendAndReceive(0, 1, sockets[0], input[0..8], input[4..])) |_| return error.AliasedBuffers
+    else |err| try check(err == error.InvalidSocketOperation and q.reusable(0) and q.reusable(1));
+    try check(linux.write(sockets[1],"early",5) == 5);
+    try q.sendAndReceive(0, 1, sockets[0], &sent, &input);
+    _ = try q.submit();
+    const first_short = try next(&q);
+    const second_short = try next(&q);
+    const partial_send = if (first_short.operation == .send) first_short else second_short;
+    const early_read = if (first_short.operation == .receive) first_short else second_short;
+    try check(partial_send.operation == .send and partial_send.outcome == .bytes and partial_send.outcome.bytes < sent.len);
+    try check(early_read.operation == .receive and
+        (early_read.outcome == .canceled or (early_read.outcome == .bytes and early_read.outcome.bytes == 5 and
+        std.mem.eql(u8,input[0..5],"early"))));
+    const prefix = partial_send.outcome.bytes;
     var offset: usize = 0;
-    var partial = false;
+    while (offset < prefix) {
+        const got = linux.read(sockets[1],received[offset..prefix].ptr,prefix-offset);
+        try check(linux.errno(got) == .SUCCESS and got != 0);
+        offset += got;
+    }
     while (offset < sent.len) {
         try q.send(0, sockets[0], sent[offset..]);
         try check(!q.reusable(0) and q.reusable(1));
@@ -89,7 +115,6 @@ pub fn main() !void {
         const event = try next(&q);
         try check(event.operation == .send and event.slot == 0 and event.outcome == .bytes);
         const n = event.outcome.bytes;
-        partial = partial or n < sent.len - offset;
         const end = offset + n;
         while (offset < end) {
             const got = linux.read(sockets[1], received[offset..end].ptr, end - offset);
@@ -98,7 +123,7 @@ pub fn main() !void {
         }
         try check(q.reusable(0));
     }
-    try check(partial and std.mem.eql(u8, &sent, &received));
+    try check(std.mem.eql(u8, &sent, &received));
 
     var recv_buf: [32]u8 = undefined;
     try q.receive(1, sockets[1], &recv_buf);
@@ -111,8 +136,10 @@ pub fn main() !void {
     const cancel_pair = try pair(false);
     defer _ = linux.close(cancel_pair[0]);
     defer _ = linux.close(cancel_pair[1]);
-    try q.receive(1, cancel_pair[1], &recv_buf);
+    try q.sendAndReceive(0, 1, cancel_pair[1], "outbound", &recv_buf);
     _ = try q.submit();
+    const linked_tx = try next(&q);
+    try check(linked_tx.operation == .send and linked_tx.outcome == .bytes);
     try check(try q.complete(&raw, &events, false) == 0);
     try check(try q.cancel(1));
     try check(!try q.cancel(1) and !q.reusable(1));
@@ -144,14 +171,22 @@ pub fn main() !void {
         (cancel_result == .cancel_accepted and send_result == .canceled));
 
     try check(linux.errno(linux.shutdown(sockets[0], linux.SHUT.WR)) == .SUCCESS);
-    try q.receive(1, sockets[1], &recv_buf);
+    try q.sendAndReceive(0, 1, sockets[1], "half", &recv_buf);
     _ = try q.submit();
-    const eof = try next(&q);
+    const half_first = try next(&q);
+    const half_second = try next(&q);
+    const eof = if (half_first.operation == .receive) half_first else half_second;
+    const half_reply = if (half_first.operation == .send) half_first else half_second;
     try check(eof.slot == 1 and eof.operation == .receive and eof.outcome == .eof);
-    try q.send(0, sockets[0], "closed");
+    try check(half_reply.operation == .send and half_reply.outcome == .bytes and half_reply.outcome.bytes == 4);
+    try q.sendAndReceive(0, 1, sockets[0], "closed", &input);
     _ = try q.submit();
-    const failed = try next(&q);
+    const fail_first = try next(&q);
+    const fail_second = try next(&q);
+    const failed = if (fail_first.operation == .send) fail_first else fail_second;
+    const dependent = if (fail_first.operation == .receive) fail_first else fail_second;
     try check(failed.slot == 0 and failed.operation == .send and failed.outcome == .failed and failed.outcome.failed == .PIPE);
+    try check(dependent.slot == 1 and dependent.operation == .receive and dependent.outcome == .canceled);
     const wait_pair = try pair(false);
     defer _ = linux.close(wait_pair[0]);
     defer _ = linux.close(wait_pair[1]);
