@@ -222,6 +222,11 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_db, "contract-snapshot-envelope", "tests/test_snapshot_envelope.sig", &.{
         importEntry("db_file", "src/platform/db_file.sig"), importEntry("snapshot_envelope", "src/db/snapshot_envelope.sig"),
     });
+    _ = try addContract(ctx, test_db, "contract-native-store-checkpoint", "tests/test_native_store_checkpoint.sig", &.{
+        importEntry("db_file", "src/platform/db_file.sig"), importEntry("durable_log", "src/db/durable_log.sig"),
+        importEntry("snapshot_envelope", "src/db/snapshot_envelope.sig"), importEntry("sql", "src/core/sql.sig"),
+        importEntry("db_store", "src/db/store.sig"),
+    });
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
     inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock", "pg_copy", "pg_explain", "page_region" }) |name| {
         _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{
