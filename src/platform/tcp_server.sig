@@ -159,13 +159,7 @@ pub fn recv(fd: Socket, buf: []u8) Error!?usize {
             if (code == 10004) continue;
             return error.ReceiveFailed;
         } else if (builtin.os.tag == .linux) {
-            const rc = linux.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
-            switch (linux.errno(rc)) {
-                .SUCCESS => return rc,
-                .AGAIN => return null,
-                .INTR => continue,
-                else => return error.ReceiveFailed,
-            }
+            return linuxReceive(fd, buf, 0, true);
         } else if (builtin.os.tag == .macos) {
             const rc = darwin.recv(fd, buf.ptr, buf.len, 0);
             if (rc >= 0) return @intCast(rc);
@@ -192,13 +186,7 @@ pub fn send(fd: Socket, buf: []const u8) Error!?usize {
             if (code == 10004) continue;
             return error.SendFailed;
         } else if (builtin.os.tag == .linux) {
-            const rc = linux.sendto(fd, buf.ptr, buf.len, linux.MSG.NOSIGNAL, null, 0);
-            switch (linux.errno(rc)) {
-                .SUCCESS => return rc,
-                .AGAIN => return null,
-                .INTR => continue,
-                else => return error.SendFailed,
-            }
+            return linuxSend(fd, buf, linux.MSG.NOSIGNAL);
         } else if (builtin.os.tag == .macos) {
             const rc = darwin.send(fd, buf.ptr, buf.len, 0);
             if (rc >= 0) return @intCast(rc);
@@ -208,6 +196,67 @@ pub fn send(fd: Socket, buf: []const u8) Error!?usize {
                 else => return error.SendFailed,
             }
         } else return error.UnsupportedPlatform;
+    }
+}
+
+/// Configure an exclusively owned, already nonblocking Linux socket for a
+/// finite blocking receive. Ordinary reads and writes then use the explicit
+/// per-call nonblocking operations below. A configuration error leaves the
+/// descriptor nonblocking.
+pub fn enableTimedReceive(fd: Socket, timeout_ms: u32) Error!void {
+    if (comptime builtin.os.tag != .linux or @sizeOf(usize) != 8) return error.UnsupportedPlatform;
+    if (timeout_ms == 0) return error.ConfigureFailed;
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS) return error.ConfigureFailed;
+    const nonblock: u32 = @bitCast(@as(linux.O, .{ .NONBLOCK = true }));
+    if (flags & nonblock == 0) return error.ConfigureFailed;
+    const timeout: linux.timeval = .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @as(i64, timeout_ms % 1000) * 1000,
+    };
+    if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO,
+        @ptrCast(&timeout), @sizeOf(linux.timeval))) != .SUCCESS) return error.ConfigureFailed;
+    if (linux.errno(linux.fcntl(fd, linux.F.SETFL, flags & ~@as(usize, nonblock))) != .SUCCESS)
+        return error.ConfigureFailed;
+}
+
+/// A finite read on a configured socket, or a nonblocking read after poll.
+/// On an interrupt, a waiting caller returns promptly to its own event loop.
+pub fn recvTimed(fd: Socket, buf: []u8, wait_for_data: bool) Error!?usize {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    if (buf.len == 0) return 0;
+    if (wait_for_data) return linuxReceive(fd, buf, 0, false);
+    return linuxReceive(fd, buf, linux.MSG.DONTWAIT, true);
+}
+
+/// Keep backpressure nonblocking even on a socket configured to wait in recv.
+pub fn sendNonblocking(fd: Socket, buf: []const u8) Error!?usize {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    if (buf.len == 0) return 0;
+    return linuxSend(fd, buf, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT);
+}
+
+inline fn linuxReceive(fd: Socket, buf: []u8, flags: u32, comptime retry_interrupt: bool) Error!?usize {
+    while (true) {
+        const rc = linux.recvfrom(fd, buf.ptr, buf.len, flags, null, null);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return rc,
+            .AGAIN => return null,
+            .INTR => if (retry_interrupt) continue else return null,
+            else => return error.ReceiveFailed,
+        }
+    }
+}
+
+inline fn linuxSend(fd: Socket, buf: []const u8, flags: u32) Error!?usize {
+    while (true) {
+        const rc = linux.sendto(fd, buf.ptr, buf.len, flags, null, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return rc,
+            .AGAIN => return null,
+            .INTR => continue,
+            else => return error.SendFailed,
+        }
     }
 }
 

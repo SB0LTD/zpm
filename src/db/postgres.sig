@@ -472,12 +472,14 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// an independent read-only context and reject unsupported plans first.
         /// Session ownership, database immutability, private Describe support,
         /// idle autocommit state and output capacity remain caller obligations.
-        fn detachedReady(self: *const Self) bool {
+        /// Quiet authenticated wire state. Callers still own the input/output
+        /// boundary and the store's transaction and lock state.
+        pub fn quiescent(self: *const Self) bool {
             return self.startup and !self.failed and self.copy.mode==.none and self.active_portal==null and
                 self.oversize_remaining==0 and (self.authentication==null or self.authentication.?.state==.complete);
         }
         pub fn detachedCandidate(self:*Self,input:[]const u8) ?DetachedCandidate {
-            if(!self.detachedReady()) return null;
+            if(!self.quiescent()) return null;
             return self.detachedFrame(input) catch null;
         }
 
@@ -486,7 +488,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// authorize execution or replace the rendered-SQL fallback.
         pub fn detachedPrimaryKey(self: *Self, input: []const u8) ?DetachedPrimaryKey {
             if (comptime !has_primary_key) return null;
-            if (!self.detachedReady() or input.len < 5 or input[0] != 'E') return null;
+            if (!self.quiescent() or input.len < 5 or input[0] != 'E') return null;
             const size = read32(input[1..5]);
             if (size < 4 or size > max_packet or @as(usize,size)+1 > input.len) return null;
             var r: Reader = .{.bytes=input[5..@as(usize,size)+1]};
