@@ -125,6 +125,7 @@ const array_module = @import("sql/array.sig");
 /// The canonical SQL tokenizer, also used by wire parameter binding.
 /// Source and token spans remain caller-owned; tokenization allocates nothing.
 pub const Tokenizer = lexer.Tokenizer;
+pub const PostgresStatements = lexer.PostgresStatements;
 pub const Config = types.Config;
 /// Per-statement session values (TimeZone, zone resolver, clocks).
 pub const Session = value_module.Session;
@@ -2448,6 +2449,33 @@ pub fn Database(comptime config: Config) type {
         }
 
         // ---- statements ---------------------------------------------------
+
+        /// Raw grammar pass for an entire PostgreSQL Query message. Reuses the
+        /// statement parser's scratch without binding, starting a transaction
+        /// or executing commands. Unsupported grammar remains an execution
+        /// error so it cannot mask a syntax error in a later supported command.
+        pub fn preflightPostgresBatch(self: *Self, source: []const u8) Error!usize {
+            for (source) |byte| if (byte == 0) return error.Syntax;
+            var statements: PostgresStatements = .{ .source = source };
+            var count: usize = 0;
+            while (try statements.next()) |part| {
+                count += 1;
+                self.parsePostgresEnvelope(part.slice(source)) catch |err| {
+                    if (err != error.UnsupportedStatement) return err;
+                };
+            }
+            return count;
+        }
+
+        fn parsePostgresEnvelope(self: *Self, source: []const u8) Error!void {
+            const options: P.Options = .{ .dialect = .postgres };
+            if (try P.parseDatabaseCommand(source, options)) |_| return;
+            if (R.classify(source) != null) {
+                var routine: R.Statement = undefined;
+                return R.parse(source, &self.workspace.nodes, &routine);
+            }
+            _ = try P.parseTopWithOptions(source, &self.workspace.nodes, options);
+        }
 
         /// Runs one statement in transaction `slot` as a statement
         /// subtransaction. Success merges it; a terminal error undoes it
