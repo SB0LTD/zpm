@@ -17,13 +17,15 @@
 //! length and the subtype's binary form}. inet/cidr use inet_send
 //! {family 2 (IPv4) or 3 (IPv6), bits, is_cidr, address size, address};
 //! macaddr is six bytes. point is two float8 and box four (high corner
-//! first). xml is its output text.
+//! first). xml is its output text. PostgreSQL internal "char" is one byte.
 //! Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
-//! is a protocol violation (08P01).
+//! is reported by the type codec.
 
-pub const Error = error{ BufferTooSmall, ProtocolViolation, InvalidBinaryRepresentation, UnsupportedBinaryType };
+const std = @import("std");
+
+pub const Error = error{ BufferTooSmall, ProtocolViolation, InvalidBinaryRepresentation, CharacterNotInRepertoire, UnsupportedBinaryType };
 
 fn put(out: []u8, at: *usize, bytes: []const u8) Error!void {
     if (bytes.len > out.len - at.*) return error.BufferTooSmall;
@@ -240,7 +242,15 @@ pub fn Types(comptime Result: type) type {
             const name = castName(type_oid) orelse return error.UnsupportedBinaryType;
             var at: usize = 0;
             if (format == 0) {
-                try quote(out, &at, bytes);
+                const input = if (type_oid == 18) blk: {
+                    // charin consumes a C string; conversion validates its
+                    // prefix before the first zero. Binary is a raw byte.
+                    const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+                    const prefix = bytes[0..end];
+                    if (!std.unicode.utf8ValidateSlice(prefix)) return error.CharacterNotInRepertoire;
+                    break :blk prefix;
+                } else bytes;
+                try quote(out, &at, input);
             } else {
                 var text: [Io.format_bytes]u8 = undefined;
                 const cell = try decodeBinary(bytes, Io.typeFromOid(type_oid).?);

@@ -364,6 +364,7 @@ fn internalCharWire() !void {
     const examples = [_]struct { format: u16, input: []const u8, output: []const u8 }{
         .{ .format = 0, .input = "", .output = "" },
         .{ .format = 0, .input = "abc", .output = "a" },
+        .{ .format = 0, .input = "a\x00\xff", .output = "a" },
         .{ .format = 0, .input = "é", .output = "\\303" },
         .{ .format = 1, .input = "\x00", .output = "\x00" },
         .{ .format = 1, .input = "\xff", .output = "\xff" },
@@ -377,6 +378,8 @@ fn internalCharWire() !void {
         try check(u32be(row.body[2..6]) == example.output.len and equal(row.body[6..], example.output));
         try sync(&session, &db);
     }
+    try state(try bind(&session, &db, "", "internal_char", &.{"\xff"}, 0, 0), "22021");
+    try sync(&session, &db);
     try state(try bind(&session, &db, "", "internal_char", &.{""}, 1, 1), "08P01");
     try sync(&session, &db);
     try state(try bind(&session, &db, "", "internal_char", &.{"ab"}, 1, 1), "22P03");
