@@ -2518,7 +2518,7 @@ pub fn Database(comptime config: Config) type {
             const parsed = try P.parseTopWithOptions(source, &self.workspace.nodes, options);
             // COPY FROM STDIN hands off the frontend stream. The codec
             // needs a separately owned query tail before it can resume a batch.
-            if (parsed == .copy and parsed.copy.direction == .from) return error.UnsupportedStatement;
+            if (parsed.command == .copy and parsed.command.copy.direction == .from) return error.UnsupportedStatement;
         }
 
         /// Runs one statement in transaction `slot` as a statement
