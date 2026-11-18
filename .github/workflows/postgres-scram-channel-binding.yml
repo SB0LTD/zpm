@@ -36,7 +36,7 @@ jobs:
           mkdir evidence
           source=f35195eb5539bbb1621a30959ffa5cee70fe5c5f
           git merge-base --is-ancestor "$source" HEAD
-          git diff --exit-code "$source" -- src tests build.sig
+          git diff --exit-code "$source" HEAD -- src tests build.sig
           printf "%s\n" "$source" >evidence/source.txt
           "$SIG" version | tee evidence/sig-version.log
           "$SIG" build run-contract-scram run-contract-postgres \
