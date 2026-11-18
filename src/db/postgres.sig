@@ -72,6 +72,8 @@ pub fn parseCancel(input: []const u8) ?Cancel {
 /// store: `consumed` then covers the input through that row (written = 0);
 /// keep the rest buffered and call handle() again on wake (with or without
 /// new input) - the parked row is re-checked before anything is read.
+/// A simple Query batch can write one result with `consumed = 0`. Keep the
+/// identical input frame at the head of the buffer for the next call.
 /// `cancel`: the connection carried a CancelRequest (close it afterwards).
 pub const Reply = struct { consumed: usize = 0, written: usize = 0, close: bool = false, blocked: bool = false, cancel: ?Cancel = null };
 
@@ -106,6 +108,16 @@ fn trim(s: []const u8) []const u8 {
     while (b > a and (s[b - 1] == ' ' or s[b - 1] == '\n' or s[b - 1] == '\r' or s[b - 1] == '\t' or s[b - 1] == ';')) : (b -= 1) {}
     return s[a..b];
 }
+
+fn needsQueryScan(source: []const u8) bool {
+    const text = std.mem.trim(u8, source, " \t\r\n\x0b\x0c");
+    if (text.len == 0) return false;
+    if (std.mem.startsWith(u8, text, "--") or std.mem.startsWith(u8, text, "/*")) return true;
+    // A single terminal semicolon is already handled by the ordinary parser.
+    const end = if (text[text.len - 1] == ';') text.len - 1 else text.len;
+    return std.mem.indexOfScalar(u8, text[0..end], ';') != null;
+}
+
 fn read32(s: []const u8) u32 {
     return (@as(u32, s[0]) << 24) | (@as(u32, s[1]) << 16) | (@as(u32, s[2]) << 8) | s[3];
 }
@@ -265,6 +277,7 @@ pub fn Session(comptime DB: type) type {
 pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool) type {
     const T = pg_types.Types(DB.Result);
     const has_copy = @hasDecl(DB, "copyBegin");
+    const has_simple_batch = @hasDecl(DB, "simple_query_batches") and DB.simple_query_batches;
     const detects_admission = @hasDecl(DB, "admitPostgresStartup");
     const has_admission = detects_admission or external_admission;
     const has_primary_key = @hasDecl(DB, "executeDetachedPrimaryKey") and
@@ -300,6 +313,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             eol: pg_copy.Eol = .unknown,
         };
         const Fed = struct { used: usize = 0, blocked: bool = false };
+
+        const SimpleBatch = struct {
+            position: usize = 0,
+            remaining: usize = 0,
+            source_length: usize = 0,
+        };
 
         fn valueSession(db: *DB) *const T.Session {
             if (@hasDecl(DB, "valueSession")) return db.valueSession();
@@ -416,6 +435,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         backend_pid: u32 = 1,
         backend_secret: u32 = 0,
         copy: CopyState = .{},
+        simple_batch: SimpleBatch = .{},
 
         /// Copy a verifier and a fresh CSPRNG nonce before any startup bytes.
         /// Every accepted connection needs its own unpredictable nonce; the
@@ -466,6 +486,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return responseCapacityFor(self.result.rows.len);
         }
 
+        pub fn continuingSimpleQuery(self: *const Self) bool {
+            return self.simple_batch.remaining != 0;
+        }
+
         pub const DetachedCandidate=union(enum) {metadata,describe:[]const u8,execute:[]const u8};
         /// A scheduling proposal, never authorization to execute arbitrary SQL
         /// under a read lock. The caller must bind execute/describe sources in
@@ -473,7 +497,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// Session ownership, database immutability, private Describe support,
         /// idle autocommit state and output capacity remain caller obligations.
         fn detachedReady(self: *const Self) bool {
-            return self.startup and !self.failed and self.copy.mode==.none and self.active_portal==null and
+            return self.startup and !self.failed and !self.continuingSimpleQuery() and self.copy.mode==.none and self.active_portal==null and
                 self.oversize_remaining==0 and (self.authentication==null or self.authentication.?.state==.complete);
         }
         pub fn detachedCandidate(self:*Self,input:[]const u8) ?DetachedCandidate {
@@ -594,12 +618,16 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     w.at = 0;
                     try writeNotice(db, &w);
                     try failure(&w, sqlstate(err), @errorName(err));
+                    if (comptime has_simple_batch) if (tag == 'Q' and self.continuingSimpleQuery()) {
+                        self.simple_batch = .{};
+                        db.finishSimpleQueryBatch(false) catch return error.BufferTooSmall;
+                    };
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
                     if (tag == 'Q') try self.ready(db, &w) else self.failed = true;
                     break :blk false;
                 };
             }
-            return .{ .consumed = total, .written = w.at, .close = close };
+            return .{ .consumed = if (self.continuingSimpleQuery()) 0 else total, .written = w.at, .close = close };
         }
 
         fn handleStartup(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
@@ -823,19 +851,83 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return w.at;
         }
 
+        fn beginSimpleFrame(self: *Self, source: []const u8) !void {
+            if (self.active_portal != null and !word(source, "commit") and !word(source, "rollback") and !word(source, "end") and !word(source, "abort")) return error.PortalBusy;
+            self.active_portal = null;
+            for (&self.statements) |*s| if (s.name.len == 0) {
+                s.live = false;
+            };
+            for (&self.portals) |*p| if (p.name.len == 0) {
+                p.live = false;
+            };
+        }
+
+        fn beginSimpleBatch(self: *Self, db: *DB, source: []const u8) !void {
+            const count = try db.preflightSimpleQueryBatch(source);
+            var scan: sql.PostgresStatements = .{ .source = source };
+            while (try scan.next()) |span| {
+                const command_source = span.slice(source);
+                var tokens: sql.Tokenizer = .{ .source = command_source, .text_limit = command_source.len };
+                const token = try tokens.next();
+                // COPY FROM takes over the input stream. Its tail must be
+                // handed off to the COPY state before permitting it in a batch.
+                if (token.kind == .word and keyword(token.raw(command_source), "copy")) return error.UnsupportedStatement;
+            }
+            try db.beginSimpleQueryBatch();
+            self.simple_batch = .{ .remaining = count, .source_length = source.len };
+        }
+
+        fn simpleResult(self: *Self, db: *DB, w: *Writer) !void {
+            try writeNotice(db, w);
+            if (self.result.column_count == 0) return;
+            try self.description(w, null);
+            try self.rows(db, w, null, 0, self.result.row_count);
+        }
+
+        /// Produce one complete command's responses using the same result and
+        /// output capacities as a single query. Advance only after execution;
+        /// parked statements are redelivered without rerunning prior commands.
+        fn simpleBatchStep(self: *Self, db: *DB, source: []const u8, w: *Writer) !void {
+            if (source.len != self.simple_batch.source_length) return error.ProtocolViolation;
+            var scan: sql.PostgresStatements = .{ .source = source, .position = self.simple_batch.position };
+            const span = (try scan.next()) orelse return error.ProtocolViolation;
+            const command_source = span.slice(source);
+            try db.beginSimpleQueryStep();
+            try DB.checkSimpleQueryUtility(command_source);
+            try self.execute(db, command_source);
+            try self.simpleResult(db, w);
+            const final = self.simple_batch.remaining == 1;
+            if (final) try db.finishSimpleQueryBatch(true);
+            try self.command(w, command_source);
+            self.simple_batch.position = scan.position;
+            self.simple_batch.remaining -= 1;
+            if (final) {
+                self.simple_batch = .{};
+                try self.ready(db, w);
+            }
+        }
+
         fn dispatch(self: *Self, db: *DB, tag: u8, body: []const u8, w: *Writer) !bool {
             var r: Reader = .{ .bytes = body };
             switch (tag) {
                 'Q' => {
-                    const source = try r.string();
+                    var source = try r.string();
                     try r.done();
-                    if (self.active_portal != null and !word(source, "commit") and !word(source, "rollback") and !word(source, "end") and !word(source, "abort")) return error.PortalBusy;
-                    self.active_portal = null;
-                    for (&self.statements) |*s| if (s.name.len == 0) {
-                        s.live = false;
+                    if (comptime has_simple_batch) if (self.continuingSimpleQuery()) {
+                        try self.simpleBatchStep(db, source, w);
+                        return false;
                     };
-                    for (&self.portals) |*p| if (p.name.len == 0) {
-                        p.live = false;
+                    try self.beginSimpleFrame(source);
+                    if (comptime has_simple_batch) if (db.simpleQueryBatchAvailable() and needsQueryScan(source)) {
+                        var scan: sql.PostgresStatements = .{ .source = source };
+                        if (try scan.next()) |first| {
+                            if (try scan.next() != null) {
+                                try self.beginSimpleBatch(db, source);
+                                try self.simpleBatchStep(db, source, w);
+                                return false;
+                            }
+                            source = first.slice(source);
+                        } else source = "";
                     };
                     if (trim(source).len == 0) try w.empty('I') else if (has_copy and word(source, "copy")) {
                         try self.startCopy(db, source, w);
@@ -847,11 +939,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         w.end(completion);
                     } else {
                         try self.execute(db, source);
-                        try writeNotice(db, w);
-                        if (self.result.column_count != 0) {
-                            try self.description(w, null);
-                            try self.rows(db, w, null, 0, self.result.row_count);
-                        }
+                        try self.simpleResult(db, w);
                         try self.command(w, source);
                     }
                     try self.ready(db, w);
