@@ -42,6 +42,8 @@
 //! exposed to the PostgreSQL codec through takeParameterChanges() so it can
 //! send ParameterStatus before ReadyForQuery.
 
+const std = @import("std");
+
 pub const max_statement_bytes = 65536;
 
 /// Per-session SQL dialect (design §4.2). MySQL and TDS sessions set it on
