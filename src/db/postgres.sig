@@ -476,6 +476,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return 0;
         }
 
+        pub fn waitingForCopyInput(self: *const Self) bool {
+            return self.copy.mode == .in;
+        }
+
         pub const DetachedCandidate=union(enum) {metadata,describe:[]const u8,execute:[]const u8};
         /// A scheduling proposal, never authorization to execute arbitrary SQL
         /// under a read lock. The caller must bind execute/describe sources in
@@ -1201,6 +1205,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const total: usize = @as(usize, size) + 1;
             if (input.len < total) return .{};
             const discarding = self.copy.mode == .discard;
+            if (comptime @hasDecl(DB, "checkTransactionTimeout")) if (!discarding) {
+                db.checkTransactionTimeout() catch {
+                    try self.terminateTransaction(db, &w);
+                    return .{ .consumed = total, .written = w.at, .close = true };
+                };
+            };
             switch (tag) {
                 'c' => {
                     if (discarding) {

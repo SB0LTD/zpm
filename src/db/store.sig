@@ -1498,7 +1498,7 @@ pub fn Store(comptime Raw: type) type {
                     // transaction's own refusal stays 25006.
                     return if (err == error.ReadOnlyTransaction and !writes) error.StorageUnavailable else err;
                 };
-                self.checkTransactionTimeout() catch |err| {
+                self.checkExecutionTimeout() catch |err| {
                     self.terminal(implicit);
                     return err;
                 };
@@ -1509,6 +1509,10 @@ pub fn Store(comptime Raw: type) type {
                 const self: *Connection = @ptrCast(@alignCast(context.?));
                 if (self.store.interrupt_poll) |poll| poll(self.store.interrupt_context, self.id);
                 if (self.cancel_requested) return error.QueryCanceled;
+                return self.checkExecutionTimeout();
+            }
+
+            fn checkExecutionTimeout(self: *const Connection) error{QueryCanceled, TransactionTimeout}!void {
                 if (self.execution_deadline_ns == null and self.transaction_deadline_ns == null) return;
                 const now = self.monotonicNow();
                 const transaction = self.transaction_deadline_ns orelse std.math.maxInt(i64);
