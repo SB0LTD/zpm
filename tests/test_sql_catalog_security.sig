@@ -492,6 +492,65 @@ fn namespaceUsage() !void {
     try sameState();
 }
 
+fn namespaceGrants() !void {
+    try reset();
+    try run("CREATE ROLE usage_owner SUPERUSER");
+    try run("CREATE ROLE usage_admin");
+    try run("CREATE ROLE usage_guest");
+    try as("usage_owner");
+    try run("CREATE SCHEMA usage_ns");
+    try run("CREATE TABLE usage_ns.data (id INT PRIMARY KEY)");
+    try run("INSERT INTO usage_ns.data VALUES (77)");
+    try run("GRANT SELECT ON usage_ns.data TO usage_owner, usage_admin, usage_guest");
+    try as("ramsql");
+    try run("ALTER ROLE usage_owner NOSUPERUSER");
+    try run("GRANT usage_owner TO usage_admin");
+    try as("usage_guest");
+    const read = "SELECT id FROM usage_ns.data";
+    try fails(read, error.InsufficientPrivilege);
+    try fails("GRANT USAGE ON SCHEMA usage_ns TO CURRENT_ROLE", error.InsufficientPrivilege);
+
+    try as("usage_admin");
+    try expect(read, "77");
+    try run("GRANT USAGE ON SCHEMA usage_ns TO usage_guest, usage_guest");
+    try run("GRANT USAGE ON SCHEMA usage_ns TO usage_guest");
+    try as("usage_guest");
+    try expect(read, "77");
+    const guest = try roleOid("usage_guest");
+    replica.default_session_state.values.role = guest;
+    replica.default_session_state.base.role = guest;
+    try same(try query(&replica, read), "77");
+    replica.default_session_state.values.role = 0;
+    replica.default_session_state.base.role = 0;
+
+    try as("ramsql");
+    try fails("DROP ROLE usage_guest", error.DependentObjects);
+    try as("usage_owner");
+    try run("REVOKE USAGE ON SCHEMA usage_ns FROM usage_guest");
+    try run("REVOKE USAGE ON SCHEMA usage_ns FROM CURRENT_ROLE");
+    try fails(read, error.InsufficientPrivilege);
+    try run("GRANT USAGE ON SCHEMA usage_ns TO CURRENT_ROLE");
+    try expect(read, "77");
+    try run("GRANT USAGE ON SCHEMA usage_ns TO PUBLIC");
+    try as("usage_guest");
+    try expect(read, "77");
+    try as("usage_owner");
+    try run("REVOKE USAGE ON SCHEMA usage_ns FROM PUBLIC");
+    try fails("GRANT CREATE ON SCHEMA usage_ns TO usage_guest", error.UnsupportedStatement);
+    try fails("GRANT USAGE ON SCHEMA usage_ns TO usage_guest WITH GRANT OPTION", error.UnsupportedStatement);
+    try fails("REVOKE USAGE ON SCHEMA usage_ns FROM usage_guest CASCADE", error.UnsupportedStatement);
+    try as("usage_guest");
+    try fails(read, error.InsufficientPrivilege);
+    replica.default_session_state.values.role = guest;
+    replica.default_session_state.base.role = guest;
+    var out: DB.Result = .{};
+    if (replica.execute(read, &out)) |_| return error.ReplayNamespacePrivilegeLost else |err| try check(err == error.InsufficientPrivilege);
+    replica.default_session_state.values.role = 0;
+    replica.default_session_state.base.role = 0;
+    try as("ramsql");
+    try sameState();
+}
+
 fn comments() !void {
     try reset();
     const probe = "SELECT objoid = 'tdd_a'::regclass, classoid, objsubid, description FROM pg_description ORDER BY objoid, objsubid";
@@ -1300,6 +1359,7 @@ pub fn main() !void {
     try namespacesAndExtensions();
     try namespaceOwners();
     try namespaceUsage();
+    try namespaceGrants();
     try comments();
     try roles();
     try privileges();

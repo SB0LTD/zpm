@@ -768,8 +768,12 @@ pub fn Database(comptime config: Config) type {
             if (namespace < change_log.first_oid or role == CO.bootstrap_role) return;
             for (&self.schemas) |*schema| {
                 if (!schema.live or schema.oid != namespace) continue;
-                if (!schema.private_usage or role == schema.owner) return;
-                if (self.catalog_objects.superuser(role, snap) or self.catalog_objects.memberOf(role, schema.owner, true, snap)) return;
+                if (!schema.private_usage) return;
+                // Privilege changes follow the current catalog, even if the
+                // query still reads user rows at an older transaction CSN.
+                var authority = snap;
+                authority.csn = self.csn;
+                if (self.catalog_objects.schemaUsage(role, namespace, schema.owner, authority)) return;
                 return error.InsufficientPrivilege;
             }
         }
@@ -3308,7 +3312,7 @@ pub fn Database(comptime config: Config) type {
         /// transaction's uncommitted object naming it is waited for.
         fn objectDependent(o: *const O.Object, oid: u32) bool {
             return switch (o.kind) {
-                .acl, .relation, .policy => o.target == oid,
+                .acl, .schema_acl, .relation, .policy => o.target == oid,
                 .statistics => o.target == oid or o.grantee == oid,
                 .publication_table, .publication_schema => o.grantee == oid,
                 .comment => o.target == oid,
@@ -3322,7 +3326,7 @@ pub fn Database(comptime config: Config) type {
             latest.csn = self.csn;
             var count: usize = 0;
             for (&self.catalog_objects.items) |*o| {
-                if ((o.kind == .statistics or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                if ((o.kind == .statistics or o.kind == .schema_acl or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                 if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
                 if (objectDependent(o, oid)) count += 1;
                 // Comments on the table's policies go with them.
@@ -3452,11 +3456,19 @@ pub fn Database(comptime config: Config) type {
                     break :blk .drop_role;
                 },
                 .grant => |*grant| blk: {
-                    if (grant.membership) try self.grantMembership(slot, source, grant, false, snap) else try self.grantTables(slot, source, grant, false, snap);
+                    if (grant.membership) {
+                        try self.grantMembership(slot, source, grant, false, snap);
+                    } else if (grant.schema) {
+                        try self.grantSchemaUsage(slot, source, grant, false, snap);
+                    } else try self.grantTables(slot, source, grant, false, snap);
                     break :blk if (grant.membership) .grant_role else .grant;
                 },
                 .revoke => |*grant| blk: {
-                    if (grant.membership) try self.grantMembership(slot, source, grant, true, snap) else try self.grantTables(slot, source, grant, true, snap);
+                    if (grant.membership) {
+                        try self.grantMembership(slot, source, grant, true, snap);
+                    } else if (grant.schema) {
+                        try self.grantSchemaUsage(slot, source, grant, true, snap);
+                    } else try self.grantTables(slot, source, grant, true, snap);
                     break :blk if (grant.membership) .revoke_role else .revoke;
                 },
                 .create_policy => |*policy| blk: {
@@ -3771,7 +3783,9 @@ pub fn Database(comptime config: Config) type {
                     if (owned_before) return error.DependentObjects;
                 }
                 for (&self.catalog_objects.items) |*o| {
-                    if ((CO.userType(o.kind) or o.kind == .statistics) and o.owner == oid and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                    const affected = (CO.userType(o.kind) or o.kind == .statistics) and o.owner == oid or
+                        o.kind == .schema_acl and (o.owner == oid or o.grantee == oid);
+                    if (affected and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
                     switch (o.kind) {
                         .member => {
@@ -3782,7 +3796,7 @@ pub fn Database(comptime config: Config) type {
                         .comment => if (o.grantee == CO.class_authid and o.target == oid) {
                             writes += 1;
                         },
-                        .acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
+                        .acl, .schema_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
                         .policy => {
                             for (o.roleList()) |listed| {
                                 if (listed == oid) return error.DependentObjects;
@@ -3912,6 +3926,60 @@ pub fn Database(comptime config: Config) type {
                     self.objectDelete(slot, index, snap);
                 } else if (next.flags == 0) continue;
                 if (next.flags != 0) _ = try self.objectInsert(slot, &next, false, snap);
+            }
+        }
+
+        /// Schema grants use the owning role as grantor. This scope has no
+        /// delegated grant chain, CREATE privilege, or built-in schema ACL.
+        fn grantSchemaUsage(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
+            if (self.dialect != .postgres or grant.option or grant.cascade or grant.table_count != 1) return error.UnsupportedStatement;
+            const target = grant.tables[0];
+            if (target.has_schema) return error.Syntax;
+            const name = objectName(source, target.name);
+            if (namespaceFor(&self.catalog, name.slice(), snap)) |oid| {
+                if (oid < change_log.first_oid) return error.UnsupportedStatement;
+            }
+            const visible = self.catalog.findSchema(name.slice(), snap) orelse return error.UndefinedSchema;
+            const schema = &self.schemas[visible.slot];
+            if (!schema.private_usage) return error.UnsupportedStatement;
+            if (schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
+            if (self.catalog_objects.pendingReference(schema.oid, snap)) |other| return self.objectPark(slot, other);
+
+            var latest = snap;
+            latest.csn = self.csn;
+            const active = self.catalog.findSchema(name.slice(), latest) orelse return error.SerializationFailure;
+            if (visible.oid != active.oid) return error.SerializationFailure;
+            if (!self.ownsNamespace(schema.oid, latest)) return error.InsufficientPrivilege;
+
+            var grantees: [CO.list_capacity]u32 = undefined;
+            var count: usize = 0;
+            for (grant.grantees[0..grant.grantee_count]) |grantee| {
+                const role = try self.objectRole(source, grantee, latest);
+                if (role != CO.public_role) {
+                    if (self.catalog_objects.pendingReference(role, snap)) |other| return self.objectPark(slot, other);
+                    if (self.catalog_objects.roleName(role, latest) == null) return error.UndefinedObject;
+                }
+                var duplicate = false;
+                for (grantees[0..count]) |prior| duplicate = duplicate or prior == role;
+                if (duplicate) continue;
+                grantees[count] = role;
+                count += 1;
+            }
+            try self.reserveWrites(slot, 2 * count);
+            for (grantees[0..count]) |role| {
+                var acl: O.Object = .{ .kind = .schema_acl, .target = schema.oid, .grantee = role, .owner = schema.owner };
+                const before = self.catalog_objects.findKey(&acl, latest);
+                const old: ?u32 = if (before) |index| self.catalog_objects.items[index].flags else null;
+                const next: ?u32 = if (role == schema.owner)
+                    (if (revoke) 0 else null)
+                else
+                    (if (revoke) null else CO.priv_schema_usage);
+                if (old == next) continue;
+                if (before) |index| self.objectDelete(slot, index, snap);
+                if (next) |flags| {
+                    acl.flags = flags;
+                    _ = try self.objectInsert(slot, &acl, false, snap);
+                }
             }
         }
 

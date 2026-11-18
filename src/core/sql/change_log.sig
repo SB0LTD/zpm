@@ -755,7 +755,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         };
 
         const VSeq = struct { live: bool = false, oid: u32 = 0, name: V.Name = .{} };
-        const VSchema = struct { live: bool = false, oid: u32 = 0, owner: u32 = catalog_objects.bootstrap_role, name: V.Name = .{} };
+        const VSchema = struct { live: bool = false, oid: u32 = 0, owner: u32 = catalog_objects.bootstrap_role, private_usage: bool = false, name: V.Name = .{} };
 
         /// Caller-owned replay overlay. Bounded by 2 x rows x tables live
         /// entries (rows touched from the database plus rows created by the
@@ -836,6 +836,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 pub fn objectSequenceLive(self: *const @This(), oid: u32) bool {
                     for (&self.scratch.seqs) |*vs| if (vs.live and vs.oid == oid) return true;
                     return false;
+                }
+
+                pub fn objectPrivateSchemaOwner(self: *const @This(), oid: u32) ?u32 {
+                    for (&self.scratch.schemas) |*schema| {
+                        if (schema.live and schema.private_usage and schema.oid == oid) return schema.owner;
+                    }
+                    return null;
                 }
 
                 pub fn objectSchemaLive(self: *const @This(), oid: u32) bool {
@@ -1710,7 +1717,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 vs.* = .{ .live = seq.live and !seq.pending_create and seq.dead_csn == 0, .oid = seq.oid, .name = seq.name };
             }
             for (&scratch.schemas, &db.schemas) |*vs, *schema| {
-                vs.* = .{ .live = schema.live and !schema.pending_create and schema.dead_csn == 0, .oid = schema.oid, .owner = schema.owner, .name = schema.name };
+                vs.* = .{ .live = schema.live and !schema.pending_create and schema.dead_csn == 0, .oid = schema.oid, .owner = schema.owner, .private_usage = schema.private_usage, .name = schema.name };
             }
             RC.beginOverlay(&scratch.objects, &db.objects);
             scratch.object_overlay.init(&db.catalog_objects);
@@ -1939,7 +1946,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             free = index;
                         };
                         const index = free orelse return error.ChangeRecordConflict;
-                        scratch.schemas[index] = .{ .live = true, .oid = oid, .owner = owner, .name = .{ .len = schema_name.len } };
+                        scratch.schemas[index] = .{ .live = true, .oid = oid, .owner = owner, .private_usage = tag == @intFromEnum(Op.create_private_schema), .name = .{ .len = schema_name.len } };
                         @memcpy(scratch.schemas[index].name.bytes[0..schema_name.len], schema_name);
                         next_oid = @max(next_oid, oid + 1);
                     },
