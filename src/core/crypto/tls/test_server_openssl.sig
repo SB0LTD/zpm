@@ -1,49 +1,40 @@
-//! Linux test adapter. The harness attaches one loopback TCP connection to
-//! stdin and stdout. The TLS library has no dependency on this adapter.
+//! Linux wire adapter for the caller-buffered TLS stream contract.
 const std = @import("std");
 const fixture = @import("fixture");
-const record = @import("record.sig");
 const tls = @import("server.sig");
+const transport = @import("stream.sig");
 
 const expected = "ZPM TLS request\n";
 const response = "ZPM TLS response\n";
+const fragment_bytes = 7;
 
-const Input = struct {
-    bytes: [record.header_bytes + record.max_ciphertext_bytes]u8 = undefined,
-    used: usize = 0,
-
-    fn readNext(self: *Input) !void {
-        const space = self.bytes[self.used..];
-        if (space.len == 0) return error.TestInputTooLarge;
-        while (true) {
-            // Force short stream fragments through the real server entry point.
-            const rc = std.os.linux.read(0, space.ptr, @min(space.len, 7));
-            switch (std.os.linux.errno(rc)) {
-                .SUCCESS => {
-                    if (rc == 0) return error.TestUnexpectedEof;
-                    self.used += rc;
-                    return;
-                },
-                .INTR => continue,
-                else => return error.TestReadFailed,
-            }
+fn appendInput(stream: *transport.Stream) !void {
+    const space = stream.input();
+    if (space.len == 0) return error.TestInputTooLarge;
+    while (true) {
+        const rc = std.os.linux.read(0, space.ptr, @min(space.len, fragment_bytes));
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) {
+                    try stream.eof();
+                    return error.TestUnexpectedEof;
+                }
+                return stream.received(rc);
+            },
+            .INTR => continue,
+            else => return error.TestReadFailed,
         }
     }
+}
 
-    fn consume(self: *Input, count: usize) void {
-        std.mem.copyForwards(u8, self.bytes[0 .. self.used - count], self.bytes[count..self.used]);
-        self.used -= count;
-    }
-};
-
-fn writeAll(bytes: []const u8) !void {
-    var remaining = bytes;
-    while (remaining.len != 0) {
-        const rc = std.os.linux.write(1, remaining.ptr, remaining.len);
+fn drain(stream: *transport.Stream) !void {
+    while (stream.output().len != 0) {
+        const pending = stream.output();
+        const rc = std.os.linux.write(1, pending.ptr, @min(pending.len, fragment_bytes));
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return error.TestWriteFailed;
-                remaining = remaining[rc..];
+                try stream.sent(rc);
             },
             .INTR => continue,
             else => return error.TestWriteFailed,
@@ -54,43 +45,37 @@ fn writeAll(bytes: []const u8) !void {
 pub fn main() !void {
     var identity = try tls.Identity.init(&.{fixture.certificate}, &fixture.private_key);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&identity.key_pair));
+    var receive: [transport.record_capacity]u8 = undefined;
+    var send: [transport.record_capacity]u8 = undefined;
     var hello_buffer: [4096]u8 = undefined;
     var flight: [8192]u8 = undefined;
-    var output: [9216]u8 = undefined;
-    var server = tls.Server.init(&identity, &hello_buffer);
-    defer server.close();
-    var input: Input = .{};
-    while (server.phase != .established) {
-        switch (try server.receive(input.bytes[0..input.used])) {
-            .need => try input.readNext(),
-            .consumed => |count| input.consume(count),
-        }
-        if (server.phase == .server_flight) try writeAll(try server.emitFlight(&flight, &output));
-    }
-    var application = try server.takeApplication();
-    defer application.close();
+    var stream = try transport.Stream.init(&identity, .{
+        .receive = &receive, .send = &send, .hello = &hello_buffer, .flight = &flight,
+    });
+    defer stream.close();
     var observed: [expected.len]u8 = undefined;
     var length: usize = 0;
-    while (length < expected.len) {
-        switch (try record.frame(input.bytes[0..input.used])) {
-            .incomplete => try input.readNext(),
-            .complete => |count| {
-                switch (try application.open(input.bytes[0..count])) {
-                    .data => |bytes| {
-                        if (bytes.len > expected.len - length) return error.TestWrongPayload;
-                        @memcpy(observed[length..][0..bytes.len], bytes);
-                        length += bytes.len;
-                    },
-                    .handshake_fragment, .key_update, .user_canceled => {},
-                    .close_notify => return error.TestWrongRecord,
-                }
-                input.consume(count);
+    while (length < observed.len) {
+        switch (try stream.next()) {
+            .need_input => try appendInput(&stream),
+            .need_output => try drain(&stream),
+            .progress, .established => {},
+            .data => |bytes| {
+                if (bytes.len > observed.len - length) return error.TestWrongPayload;
+                @memcpy(observed[length..][0..bytes.len], bytes);
+                length += bytes.len;
             },
+            .close_notify => return error.TestUnexpectedEof,
         }
     }
     if (!std.mem.eql(u8, expected, &observed)) return error.TestWrongPayload;
-    try writeAll(try application.sealUpdate(&output, false));
-    @memcpy(output[record.header_bytes..][0..response.len], response);
-    try writeAll(try application.sealData(&output, response.len));
-    try writeAll(try application.sealAlert(&output, 0));
+    try stream.queueKeyUpdate(false);
+    if (stream.queueData(response)) |_| {
+        return error.TestMissingBackpressure;
+    } else |err| if (err != error.OutputPending) return err;
+    try drain(&stream);
+    if (try stream.queueData(response) != response.len) return error.TestWrongPayload;
+    try drain(&stream);
+    try stream.queueAlert(0);
+    try drain(&stream);
 }

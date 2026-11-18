@@ -152,6 +152,7 @@ def main():
         "openssl": capture([args.openssl, "version"]).decode().strip(),
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "received_after_key_update": received,
+        "max_transport_io_fragment_bytes": 7,
     }
     (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report))
