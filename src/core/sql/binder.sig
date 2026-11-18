@@ -316,6 +316,11 @@ pub fn Binder(comptime config: types.Config) type {
         /// TRUNCATE targets: distinct table slots in statement order.
         pub const Truncate = struct { tables: [config.tables]u8 = undefined, count: usize = 0, restart_identity: bool = false };
 
+        pub const NamespaceUsage = struct {
+            ptr: *const anyopaque,
+            check: *const fn (*const anyopaque, u32, u32, storage.Snapshot) Error!void,
+        };
+
         pub const Context = struct {
             source: []const u8,
             tables: *const [config.tables]S.Table,
@@ -330,6 +335,7 @@ pub fn Binder(comptime config: types.Config) type {
             dialect: types.Dialect,
             /// Time zone and resolver for datetime literals parsed at bind time.
             session: *const value.Session = &value.default_session,
+            namespace_usage: ?NamespaceUsage = null,
             /// Start of stored source appended by view and policy expansion.
             /// Existing stored references use their original public path.
             stored_source_start: usize = 0,
@@ -4343,7 +4349,12 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn qualifierNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
             const qualifier = schema orelse return if (context.session.public_schema_on_path) catalog.public_namespace else error.UndefinedSchema;
-            return namespaceOf(context, toName(context, qualifier).slice());
+            const namespace = try namespaceOf(context, toName(context, qualifier).slice());
+            const direct = context.stored_source_start == 0 or qualifier.span.start < context.stored_source_start;
+            if (direct) if (context.namespace_usage) |usage| {
+                try usage.check(usage.ptr, context.session.role, namespace, context.snapshot);
+            };
+            return namespace;
         }
 
         fn publicLookup(context: *const Context, ident: ast.Ident) bool {

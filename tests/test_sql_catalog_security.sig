@@ -380,7 +380,7 @@ fn namespacesAndExtensions() !void {
 fn namespaceOwners() !void {
     try reset();
     try run("CREATE SCHEMA legacy_owner");
-    try check(record[8] == 15);
+    try check(record[8] == 19);
     try expect("SELECT nspowner FROM pg_namespace WHERE nspname='legacy_owner'", "10");
     try metadata("SELECT nspowner FROM pg_namespace", &.{"nspowner"}, &.{26});
     try run("CREATE ROLE schema_owner SUPERUSER");
@@ -394,7 +394,7 @@ fn namespaceOwners() !void {
     var out: DB.Result = .{};
     var used: usize = 0;
     try db.executeChanges("CREATE SCHEMA owned_namespace", &out, &record, &used, null, null);
-    try check(record[8] == 18);
+    try check(record[8] == 19);
     const owner_offset: usize = 14 + @as(usize, record[13]);
     try check(owner_offset + 4 == used);
     try check(std.mem.readInt(u32, record[owner_offset..][0..4], .little) == owner_oid);
@@ -436,6 +436,61 @@ fn namespaceOwners() !void {
 }
 
 // ---- comments -------------------------------------------------------------------
+
+fn namespaceUsage() !void {
+    try reset();
+    try run("CREATE ROLE guest");
+    try run("CREATE SCHEMA protected_ns");
+    try run("CREATE TABLE protected_ns.items (id INT PRIMARY KEY)");
+    try run("INSERT INTO protected_ns.items VALUES (31)");
+    try run("GRANT SELECT, INSERT, UPDATE, DELETE ON protected_ns.items TO guest");
+    try run("CREATE VIEW gate_view AS SELECT id FROM protected_ns.items");
+    try run("GRANT SELECT ON gate_view TO guest");
+
+    // Old op 15 and op 18 have no private-usage policy. Replay both
+    // historical encodings without changing their owner or grants.
+    var out: DB.Result = .{};
+    var used: usize = 0;
+    try db.executeChanges("CREATE SCHEMA legacy_boot", &out, &record, &used, null, null);
+    try check(record[8] == 19);
+    record[8] = 15;
+    try replica.applyChangeRecord(record[0 .. used - 4], &scratch);
+    records_applied += 1;
+    try run("CREATE ROLE schema_super SUPERUSER");
+    try as("schema_super");
+    used = 0;
+    try db.executeChanges("CREATE SCHEMA legacy_owned", &out, &record, &used, null, null);
+    try check(record[8] == 19);
+    record[8] = 18;
+    try replica.applyChangeRecord(record[0..used], &scratch);
+    records_applied += 1;
+    try as("ramsql");
+    try run("CREATE TABLE legacy_boot.items (id INT PRIMARY KEY)");
+    try run("CREATE TABLE legacy_owned.items (id INT PRIMARY KEY)");
+    try run("INSERT INTO legacy_boot.items VALUES (11)");
+    try run("INSERT INTO legacy_owned.items VALUES (12)");
+    try run("GRANT SELECT ON legacy_boot.items, legacy_owned.items TO guest");
+
+    try as("guest");
+    try fails("SELECT id FROM protected_ns.items", error.InsufficientPrivilege);
+    try fails("SELECT id FROM protected_ns.missing", error.InsufficientPrivilege);
+    try fails("INSERT INTO protected_ns.items VALUES (32)", error.InsufficientPrivilege);
+    try fails("UPDATE protected_ns.items SET id=32", error.InsufficientPrivilege);
+    try fails("DELETE FROM protected_ns.items", error.InsufficientPrivilege);
+    try fails("CREATE TABLE protected_ns.no_access(id INT)", error.InsufficientPrivilege);
+    try fails("SELECT to_regclass('protected_ns.items')", error.InsufficientPrivilege);
+    try expect("SELECT id FROM gate_view", "31");
+    const guest = try roleOid("guest");
+    replica.default_session_state.values.role = guest;
+    replica.default_session_state.base.role = guest;
+    try same(try query(&replica, "SELECT id FROM legacy_boot.items"), "11");
+    try same(try query(&replica, "SELECT id FROM legacy_owned.items"), "12");
+    if (replica.execute("SELECT id FROM protected_ns.items", &out)) |_| return error.ReplayNamespacePrivilegeLost else |err| try check(err == error.InsufficientPrivilege);
+    replica.default_session_state.values.role = 0;
+    replica.default_session_state.base.role = 0;
+    try as("ramsql");
+    try sameState();
+}
 
 fn comments() !void {
     try reset();
@@ -1244,6 +1299,7 @@ pub fn main() !void {
     try oraclePrograms();
     try namespacesAndExtensions();
     try namespaceOwners();
+    try namespaceUsage();
     try comments();
     try roles();
     try privileges();

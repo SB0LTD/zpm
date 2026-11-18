@@ -710,6 +710,7 @@ pub fn Database(comptime config: Config) type {
             dead_csn: u64 = 0,
             oid: u32 = 0,
             owner: u32 = CO.bootstrap_role,
+            private_usage: bool = false,
             name: Name = .{},
         };
 
@@ -753,6 +754,29 @@ pub fn Database(comptime config: Config) type {
             const wanted = schema orelse return catalog_module.public_namespace;
             for (catalog_module.namespaces) |known| if (types.same(known.name, wanted)) return known.oid;
             return if (catalog.findSchema(wanted, snap)) |found| found.oid else null;
+        }
+
+        /// Resolve direct access separately from catalog discovery and
+        /// previously analyzed references inside a stored view.
+        fn namespaceForUsage(self: *const Self, role: u32, schema: ?[]const u8, snap: Snapshot) Error!?u32 {
+            const namespace = namespaceFor(&self.catalog, schema, snap) orelse return null;
+            try self.checkNamespaceUsage(role, namespace, snap);
+            return namespace;
+        }
+
+        fn checkNamespaceUsage(self: *const Self, role: u32, namespace: u32, snap: Snapshot) Error!void {
+            if (namespace < change_log.first_oid or role == CO.bootstrap_role) return;
+            for (&self.schemas) |*schema| {
+                if (!schema.live or schema.oid != namespace) continue;
+                if (!schema.private_usage or role == schema.owner) return;
+                if (self.catalog_objects.superuser(role, snap) or self.catalog_objects.memberOf(role, schema.owner, true, snap)) return;
+                return error.InsufficientPrivilege;
+            }
+        }
+
+        fn bindNamespaceUsage(pointer: *const anyopaque, role: u32, namespace: u32, snap: Snapshot) Error!void {
+            const self: *const Self = @ptrCast(@alignCast(pointer));
+            return self.checkNamespaceUsage(role, namespace, snap);
         }
 
         /// Appends a stored query text to the workspace copy of the statement
@@ -874,7 +898,7 @@ pub fn Database(comptime config: Config) type {
             if (bound_statement.* == .refresh_view) {
                 const refresh = &bound_statement.refresh_view;
                 const schema_name = if (refresh.name.schema) |qualifier| identName(source, qualifier) else Name{};
-                const namespace_oid = if (refresh.name.schema != null or public_schema_on_path) namespaceFor(catalog, if (refresh.name.schema != null) schema_name.slice() else null, snap) else null;
+                const namespace_oid = if (refresh.name.schema != null or public_schema_on_path) try db.namespaceForUsage(session.role, if (refresh.name.schema != null) schema_name.slice() else null, snap) else null;
                 if (namespace_oid) |namespace| {
                     if (catalog.findIn(namespace, identName(source, refresh.name.name).slice(), snap)) |found| {
                         if (found.kind == 'm') refresh.query = try appendQuery(workspace, &length, source, tables[found.slot].query.slice());
@@ -901,8 +925,12 @@ pub fn Database(comptime config: Config) type {
                         continue;
                     }
                     if (item.schema == null and !public_schema_on_path and item.name.span.start < source.len) continue;
-                    const namespace = namespaceFor(catalog, if (item.schema != null) schema_name.slice() else null, snap) orelse continue;
-                    const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
+                    const qualified = if (item.schema != null) schema_name.slice() else null;
+                    const namespace = if (item.name.span.start < source.len)
+                        try db.namespaceForUsage(session.role, qualified, snap)
+                    else
+                        namespaceFor(catalog, qualified, snap);
+                    const found = catalog.findIn(namespace orelse continue, name.slice(), snap) orelse continue;
                     if (executes_query) try session.restricted_relation_kinds.check(found.kind);
                     // Items the statement names (not view or expansion texts).
                     if (!privileged and item.name.span.start < source.len) {
@@ -1098,7 +1126,7 @@ pub fn Database(comptime config: Config) type {
                 }
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
                     .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,.params=params,
-                    .user_type_catalog=&db.catalog_objects,.stored_source_start=source.len};
+                    .user_type_catalog=&db.catalog_objects,.stored_source_start=source.len,.namespace_usage=.{.ptr=db,.check=&Self.bindNamespaceUsage}};
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
@@ -2573,7 +2601,8 @@ pub fn Database(comptime config: Config) type {
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
             return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
-                .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null };
+                .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null,
+                .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage } };
         }
 
         fn evalContext(self: *const Self, source: []const u8) E.Context {
@@ -3126,7 +3155,7 @@ pub fn Database(comptime config: Config) type {
             const index = destination orelse return error.TableCapacity;
             if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
             const schema = &self.schemas[index];
-            schema.* = .{ .live = true, .pending_create = true, .creator = slot, .oid = change_log.first_oid + self.oid_counter, .owner = owner, .name = name };
+            schema.* = .{ .live = true, .pending_create = true, .creator = slot, .oid = change_log.first_oid + self.oid_counter, .owner = owner, .private_usage = self.dialect == .postgres, .name = name };
             self.oid_counter += 1;
             tx.push(.{ .kind = .create_schema, .table = @intCast(index) }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
@@ -3378,7 +3407,7 @@ pub fn Database(comptime config: Config) type {
         fn objectTable(self: *Self, slot: u16, source: []const u8, name: CO.Qualified, mode: locks_module.TableMode, snap: Snapshot) Error!usize {
             if (!name.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
             const schema_name = if (name.has_schema) objectName(source, name.schema) else Name{};
-            const namespace = namespaceFor(&self.catalog, if (name.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
+            const namespace = (try self.namespaceForUsage(self.session.role, if (name.has_schema) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
             const found = self.catalog.findIn(namespace, objectName(source, name.name).slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
             try self.lockTable(slot, found.slot, mode);
@@ -3510,7 +3539,7 @@ pub fn Database(comptime config: Config) type {
         fn typeNamespace(self: *const Self, source: []const u8, name: CO.Qualified, snap: Snapshot) Error!u32 {
             if (!name.has_schema and !self.session.public_schema_on_path) return error.UndefinedSchema;
             const schema = if (name.has_schema) objectName(source, name.schema) else Name{};
-            return namespaceFor(&self.catalog, if (name.has_schema) schema.slice() else null, snap) orelse error.UndefinedSchema;
+            return (try self.namespaceForUsage(self.session.role, if (name.has_schema) schema.slice() else null, snap)) orelse error.UndefinedSchema;
         }
 
         fn typeNameOccupied(self: *const Self, namespace: u32, name: []const u8, snap: Snapshot) bool {
@@ -4079,7 +4108,7 @@ pub fn Database(comptime config: Config) type {
                 .sequence => {
                     if (!comment.object.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
                     const schema_name = if (comment.object.has_schema) objectName(source, comment.object.schema) else Name{};
-                    const namespace = namespaceFor(&self.catalog, if (comment.object.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
+                    const namespace = (try self.namespaceForUsage(self.session.role, if (comment.object.has_schema) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
                     const found = self.catalog.findIn(namespace, objectName(source, comment.object.name).slice(), snap) orelse return error.TableNotFound;
                     if (found.kind != 'S') return error.WrongObjectType;
                     if (!privileged) return error.InsufficientPrivilege;
@@ -4475,7 +4504,7 @@ pub fn Database(comptime config: Config) type {
             };
             if (goal.schema == null and !self.session.public_schema_on_path) return source;
             const schema_name = if (goal.schema) |qualifier| identName(source, qualifier) else Name{};
-            const namespace = namespaceFor(&self.catalog, if (goal.schema != null) schema_name.slice() else null, snap) orelse return source;
+            const namespace = (try self.namespaceForUsage(role, if (goal.schema != null) schema_name.slice() else null, snap)) orelse return source;
             const found = self.catalog.findIn(namespace, identName(source, goal.table).slice(), snap) orelse return source;
             if (found.kind != 'r' and found.kind != 'p') return source;
             const table = &self.tables[found.slot];
@@ -4925,7 +4954,7 @@ pub fn Database(comptime config: Config) type {
                 if (regclassSeparator(tail) != null) return error.UnsupportedStatement;
                 const schema = namespaceIdentifier(std.mem.trim(u8, text[0..dot], whitespace)) catch return missing;
                 const name = namespaceIdentifier(std.mem.trim(u8, tail, whitespace)) catch return missing;
-                const namespace = namespaceFor(&self.catalog, schema.slice(), self.seq_snap) orelse return missing;
+                const namespace = (try self.namespaceForUsage(self.session.role, schema.slice(), self.seq_snap)) orelse return missing;
                 return if (self.regclassIn(namespace, name.slice())) |oid| oid else missing;
             }
             const name = namespaceIdentifier(std.mem.trim(u8, text, whitespace)) catch return missing;
@@ -7671,6 +7700,7 @@ pub fn Database(comptime config: Config) type {
         /// `select` (`(query)` verbatim; a table lists its non-generated
         /// columns or the given ones).
         pub fn copyInfo(self: *Self, slot: ?u16, source: []const u8, select: []u8) Error!CopyInfo {
+            self.installRole();
             const copy = try self.parseCopy(source);
             var info: CopyInfo = .{ .direction = copy.direction, .options = try copyOptions(&copy) };
             if (copy.force_quote_all) info.force_quote = .all;
@@ -9166,7 +9196,7 @@ pub fn Database(comptime config: Config) type {
             for (lock.tables[0..lock.count], lock.only[0..lock.count]) |reference, only| {
                 if (reference.schema == null and !self.session.public_schema_on_path) return error.TableNotFound;
                 const schema_name = if (reference.schema) |qualifier| identName(source, qualifier) else Name{};
-                const namespace = namespaceFor(&self.catalog, if (reference.schema != null) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
+                const namespace = (try self.namespaceForUsage(self.session.role, if (reference.schema != null) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
                 const found = self.catalog.findIn(namespace, identName(source, reference.name).slice(), snap) orelse return error.TableNotFound;
                 switch (found.kind) {
                     'r', 'p' => {},
@@ -10357,7 +10387,7 @@ pub fn Database(comptime config: Config) type {
         /// A table or view named by a trigger / rule statement.
         fn namedTable(self: *Self, name: *const R.TableName, snap: Snapshot) Error!usize {
             if (name.schema.len == 0 and !self.session.public_schema_on_path) return error.TableNotFound;
-            const namespace = namespaceFor(&self.catalog, if (name.schema.len != 0) name.schema.slice() else null, snap) orelse return error.UndefinedSchema;
+            const namespace = (try self.namespaceForUsage(self.session.role, if (name.schema.len != 0) name.schema.slice() else null, snap)) orelse return error.UndefinedSchema;
             const found = self.catalog.findIn(namespace, name.name.slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
             return found.slot;
@@ -10840,6 +10870,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         pub fn describeIn(self: *Self, slot: ?u16, source: []const u8, result: *Result) Error!void {
+            self.installRole();
             if (R.classify(source)) |kind| {
                 var routine: R.Statement = undefined;
                 try R.parse(source, &self.workspace.nodes, &routine);
