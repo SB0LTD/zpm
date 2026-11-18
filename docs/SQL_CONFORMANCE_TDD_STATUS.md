@@ -9,18 +9,20 @@ binary and supported semantics covered by the suites.
 [Beta.3 prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.3-run.44202780430.1) ·
 [Exact release matrix](https://github.com/SB0LTD/ramsql/actions/runs/44202780430)
 
-The separate 16-column catalog build completed all eleven stock `psql \d`
-queries for the regular table fixture. Native PostgreSQL 18.3 comparisons
-also exercised named-role and `PUBLIC` policies, named statistics, real
-schema and explicit publication membership, and dated/default partitions.
-The Windows Sig schema suite passed 1,315 assertions and replayed 261 WAL
-records. Expression statistics, collection, planner application, stable
-attribute numbers across column drops, nominal `regclass` wire output, and
-populated trigger discovery remain open. Stock `pg_dump` stopped on empty
-search-path configuration. The native-to-RAMSQL restore stopped on the first
-idle transaction timeout setting. Both directions remain release gates.
-[Stock describe proof](https://github.com/SB0LTD/ramsql/actions/runs/44235209311) ·
-[Dump and restore audit](https://github.com/SB0LTD/ramsql/actions/runs/44235375832)
+The separate 16-column catalog build completed all twelve stock `psql \d`
+queries for the populated table fixture. It matched the native user-trigger
+definition, real foreign keys, policies, named statistics and publications.
+The Windows Sig schema suite passed 1,368 assertions and replayed 270 WAL
+records, including qualified relation identities and actual lookup under an
+empty search path. The pre-existing transaction and session contract also
+passed 510 assertions. Expression statistics, collection, planner application,
+stable attribute numbers across column drops, and nominal `regclass` wire
+output remain open. Stock `pg_dump` passes the empty search path and stops
+at `pg_is_in_recovery()`. Separately, the qualified idle timeout product
+passes the first timeout setting in the native restore and stops at
+`transaction_timeout`.
+[Populated describe and dump audit](https://github.com/SB0LTD/ramsql/actions/runs/44238734316) ·
+[Native idle timeout proof](https://github.com/SB0LTD/ramsql/actions/runs/44238347427)
 
 The draft versioned WAL assigns durable table-constraint identities while
 replaying the older definition formats. Checkpoint generation images must
