@@ -229,6 +229,7 @@ fn largeWait(listener: tcp.Socket, port: u16) !void {
     var stale = sockets;
     stale[high] = closed;
     @memset(&read, false);
+    read[high] = true;
     try check(!try tcp.waitMaskedWithScratch(listener, &stale, &read, &write, 1000, &scratch));
     try check(read[high] and !read[0] and !read[active + 1]);
 }
