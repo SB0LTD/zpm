@@ -1238,8 +1238,8 @@ pub fn Store(comptime Raw: type) type {
                             if (fresh) {
                                 try self.db().beginModes(self.tx.?, modes);
                             } else if (promote) {
-                                self.simple_query_batch.?.implicit = false;
                                 try self.db().setTransaction(self.tx.?, modes);
+                                self.simple_query_batch.?.implicit = false;
                             }
                         } else {
                             if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
