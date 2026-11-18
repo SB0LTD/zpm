@@ -98,6 +98,7 @@ pub const SequenceHook = struct {
     index_definition: ?*const fn (ptr: *anyopaque, oid: u32, column: i32, pretty: bool, out: []u8) Error!?usize = null,
     constraint_definition: ?*const fn (ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize = null,
     statistics_columns: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
+    relation_publishable: ?*const fn (ptr: *anyopaque, oid: u32) ?bool = null,
     partition_ancestors: ?*const fn (ptr: *anyopaque, oid: u32, out: []u32) Error!usize = null,
     namespace_lookup: ?*const fn (ptr: *anyopaque, name: []const u8, strict: bool) Error!?u32 = null,
     namespace_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,

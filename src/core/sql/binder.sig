@@ -1291,6 +1291,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_get_indexdef", .func = .pg_get_indexdef },
                 .{ .name = "pg_get_constraintdef", .func = .pg_get_constraintdef },
                 .{ .name = "pg_get_statisticsobjdef_columns", .func = .pg_get_statisticsobjdef_columns },
+                .{ .name = "pg_relation_is_publishable", .func = .pg_relation_is_publishable },
                 // String functions (B11).
                 .{ .name = "lower", .func = .lower },               .{ .name = "upper", .func = .upper },
                 .{ .name = "initcap", .func = .initcap },           .{ .name = "length", .func = .char_length },
@@ -2254,9 +2255,9 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindSignature(context, n, signature, .text, true);
                     n.constant = false;
                 },
-                .pg_get_statisticsobjdef_columns => {
+                .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable => {
                     if (context.dialect != .postgres) return error.UndefinedFunction;
-                    try bindSignature(context, n, &.{.oid}, .text, true);
+                    try bindSignature(context, n, &.{.oid}, if (n.func == .pg_relation_is_publishable) .boolean else .text, true);
                     n.constant = false;
                 },
                 .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out, .regnamespace_in, .regnamespace_out => unreachable,

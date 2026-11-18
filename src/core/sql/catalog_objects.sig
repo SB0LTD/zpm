@@ -78,7 +78,15 @@ pub const class_policy: u32 = 3256;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, _ };
+
+pub fn publicationMembership(kind: Kind) bool {
+    return kind == .publication_table or kind == .publication_schema;
+}
+
+pub fn publicationRelationKind(kind: u8) bool {
+    return kind == 'r' or kind == 'p';
+}
 
 pub fn userType(kind: Kind) bool {
     return kind == .domain or kind == .enum_type or kind == .composite_type;
@@ -344,7 +352,17 @@ pub const Server = struct {
     version: lexer.Quoted = .{ .start = 0, .end = 0, .len = 0 },
 };
 
-pub const Publication = struct { name: Ident = .{}, flags: u32 = pub_default };
+pub const Publication = struct {
+    pub const Member = union(enum) {
+        table: struct { name: Qualified, only: bool },
+        schema: Ident,
+    };
+
+    name: Ident = .{},
+    flags: u32 = pub_default,
+    members: [list_capacity]Member = undefined,
+    count: usize = 0,
+};
 pub const statistics_kinds = [_][]const u8{ "d", "f", "m" };
 const all_statistics_kinds: u32 = (1 << statistics_kinds.len) - 1;
 pub const statistics_columns = 8;
@@ -1149,10 +1167,10 @@ const Parser = struct {
     fn publication(self: *Parser) Error!Publication {
         var out: Publication = .{ .name = try self.ident() };
         if (try self.take("for")) {
-            if (!try self.take("all")) return error.UnsupportedStatement;
-            // FOR ALL TABLES; FOR TABLE / TABLES IN SCHEMA are outside the subset.
-            if (!try self.take("tables")) return error.Syntax;
-            out.flags |= pub_all_tables;
+            if (try self.take("all")) {
+                try self.expect("tables");
+                out.flags |= pub_all_tables;
+            } else try self.publicationMembers(&out);
         }
         if (try self.take("with")) {
             try self.expectSymbol(.lparen);
@@ -1188,6 +1206,34 @@ const Parser = struct {
         }
         try self.finish();
         return out;
+    }
+
+    fn publicationMembers(self: *Parser, publication_spec: *Publication) Error!void {
+        var schemas = false;
+        while (true) {
+            if (try self.take("tables")) {
+                try self.expect("in");
+                try self.expect("schema");
+                schemas = true;
+            } else if (try self.take("table")) {
+                schemas = false;
+            } else if (publication_spec.count == 0) return error.Syntax;
+            if (publication_spec.count == list_capacity) return error.ProgramLimitExceeded;
+            const member: Publication.Member = if (schemas) blk: {
+                if (self.word("current_schema")) return error.UnsupportedStatement;
+                break :blk .{ .schema = try self.ident() };
+            } else blk: {
+                const only = try self.take("only");
+                const table = try self.qualified();
+                const include_descendants = try self.takeSymbol(.star);
+                if (only and include_descendants) return error.Syntax;
+                if (self.symbol(.lparen) or self.word("where")) return error.UnsupportedStatement;
+                break :blk .{ .table = .{ .name = table, .only = only } };
+            };
+            publication_spec.members[publication_spec.count] = member;
+            publication_spec.count += 1;
+            if (!try self.takeSymbol(.comma)) break;
+        }
     }
 };
 
@@ -1252,7 +1298,7 @@ pub const Cursor = struct {
 
 /// Kinds whose objects own an OID (allocated from the database counter).
 pub fn ownsOid(kind: Kind) bool {
-    return kind == .role or kind == .member or kind == .policy or kind == .fdw or kind == .server or kind == .publication or kind == .statistics or userType(kind);
+    return kind == .role or kind == .member or kind == .policy or kind == .fdw or kind == .server or kind == .publication or kind == .statistics or publicationMembership(kind) or userType(kind);
 }
 
 /// Kinds whose objects carry a unique name.
@@ -1378,6 +1424,7 @@ pub fn Objects(comptime config: types.Config) type {
             if (a.kind != b.kind) return false;
             return switch (a.kind) {
                 .role, .policy, .fdw, .server, .publication, .statistics => a.oid == b.oid,
+                .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
                 .member, .acl => a.target == b.target and a.grantee == b.grantee,
                 .relation => a.target == b.target,
@@ -1745,7 +1792,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.statistics)) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.publication_schema)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1767,6 +1814,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .policy, .server => o.oid != 0 and o.grantee == 0 and o.sub == 0,
                 .domain, .enum_type, .composite_type => o.oid != 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .statistics => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub >= -1 and o.sub <= 10000,
+                .publication_table, .publication_schema => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .acl => o.oid == 0 and o.target != 0 and o.sub == 0,
                 .relation => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
@@ -1824,6 +1872,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .publication => has_name and o.flags & ~@as(u32, 63) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .statistics => has_name and o.flags != 0 and o.flags & ~all_statistics_kinds == 0 and o.grant_flags == 0 and o.role_count == 0 and
                     o.owner != 0 and o.split == o.text_len and o.text_len >= 2 and o.text_len <= statistics_columns,
+                .publication_table, .publication_schema => !has_name and o.owner == 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
                 .domain => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.split == 0 and
                     o.text_len != 0 and o.text_len <= config.name_bytes and o.text[0] == '_' and !types.same(o.name.slice(), o.textSlice()),
                 .enum_type, .composite_type => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and
@@ -1924,6 +1973,7 @@ pub fn Objects(comptime config: types.Config) type {
             grantee: u32 = 0,
             sub: i32 = 0,
             owner: u32 = 0,
+            publication_all_tables: bool = false,
             roles: [role_capacity]u32 = @splat(0),
             role_count: u8 = 0,
             name: V.Name = .{},
@@ -1938,6 +1988,7 @@ pub fn Objects(comptime config: types.Config) type {
             fn project(o: *const Object, live: bool) VObject {
                 var out: VObject = .{ .used = o.used, .live = live, .kind = o.kind, .oid = o.oid, .target = o.target, .grantee = o.grantee, .sub = o.sub, .owner = o.owner, .roles = o.roles, .role_count = o.role_count, .name = o.name };
                 out.oid_width = o.oidWidth();
+                out.publication_all_tables = o.kind == .publication and o.flags & pub_all_tables != 0;
                 if (o.kind == .statistics) out.last_statistics_column = o.text[o.text_len - 1];
                 if (userType(o.kind)) {
                     const name = o.arrayName();
@@ -2007,6 +2058,7 @@ pub fn Objects(comptime config: types.Config) type {
                     if (!v.live) continue;
                     const existing = asObject(v);
                     if (sameKey(&existing, o)) return error.ChangeRecordConflict;
+                    if (publicationMembership(o.kind) and v.kind == o.kind and v.target == o.target and v.grantee == o.grantee) return error.ChangeRecordConflict;
                     if (!userType(o.kind) and named(o.kind) and v.kind == o.kind and (!scoped(o.kind) or v.target == o.target) and
                         types.same(v.name.slice(), o.name.slice())) return error.ChangeRecordConflict;
                 }
@@ -2043,6 +2095,12 @@ pub fn Objects(comptime config: types.Config) type {
                     .statistics => {
                         const columns = ctx.objectTableColumns(grantee) orelse return error.ChangeRecordConflict;
                         if (v.last_statistics_column >= columns or !ctx.objectSchemaLive(target)) return error.ChangeRecordConflict;
+                    },
+                    .publication_table => {
+                        if (!self.explicitPublication(target) or !ctx.objectTablePublishable(grantee)) return error.ChangeRecordConflict;
+                    },
+                    .publication_schema => {
+                        if (!self.explicitPublication(target) or (grantee != 2200 and grantee < first_oid) or !ctx.objectSchemaLive(grantee)) return error.ChangeRecordConflict;
                     },
                     .member => {
                         const group_live = self.roleExists(target);
@@ -2088,6 +2146,13 @@ pub fn Objects(comptime config: types.Config) type {
                     },
                     else => {},
                 }
+            }
+
+            fn explicitPublication(self: *const Overlay, oid: u32) bool {
+                for (&self.items) |*v| {
+                    if (v.live and v.kind == .publication and v.oid == oid) return !v.publication_all_tables;
+                }
+                return false;
             }
 
             /// After the whole record: every live object still names live

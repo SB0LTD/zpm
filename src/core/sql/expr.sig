@@ -557,6 +557,11 @@ pub fn Eval(comptime config: types.Config) type {
                     const length = try columns(hook.ptr, @intCast(first.integer), &buffer) orelse return .null_value;
                     return textCell(buffer[0..length]);
                 },
+                .pg_relation_is_publishable => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const publishable = hook.relation_publishable orelse return error.UnsupportedStatement;
+                    return .{ .boolean = publishable(hook.ptr, @intCast(first.integer)) orelse return .null_value };
+                },
                 else => unreachable,
             }
         }
@@ -1339,7 +1344,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                     .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                    .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_statisticsobjdef_columns => return catalogValue(ctx, n),
+                    .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable => return catalogValue(ctx, n),
                     .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {

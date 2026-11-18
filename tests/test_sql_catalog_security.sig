@@ -885,7 +885,7 @@ fn foreignAndPublications() !void {
     try metadata("SELECT pubname, puballtables FROM pg_publication", &.{ "pubname", "puballtables" }, &.{ 19, 16 });
     const publications = "SELECT pubname FROM pg_publication ORDER BY pubname";
     try rejects("CREATE PUBLICATION all_pub", error.DuplicateObject, publications, "all_pub;plain_pub;some_pub");
-    try rejects("CREATE PUBLICATION p FOR TABLE tdd_a", error.UnsupportedStatement, publications, "all_pub;plain_pub;some_pub");
+    try rejects("CREATE PUBLICATION p FOR TABLE tdd_a WHERE (id > 0)", error.UnsupportedStatement, publications, "all_pub;plain_pub;some_pub");
     try rejects("CREATE PUBLICATION p WITH (publish = 'insert, merge')", error.InvalidParameterValue, publications, "all_pub;plain_pub;some_pub");
     try rejects("CREATE SUBSCRIPTION s CONNECTION 'host=x' PUBLICATION all_pub", error.UnsupportedStatement, publications, "all_pub;plain_pub;some_pub");
     try rejects("DROP PUBLICATION nosuch", error.UndefinedObject, publications, "all_pub;plain_pub;some_pub");
