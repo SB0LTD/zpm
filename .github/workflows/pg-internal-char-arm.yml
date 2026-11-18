@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 462717db26f95989c99e6b736a602610301c9155
+          ref: f5dea78cbea7992a746c86a4cec4c57138fecb11
       - name: Install checksum-verified Sig 0.6.5 for AArch64
         shell: bash
         run: |
@@ -29,6 +29,7 @@ jobs:
       - name: Run allocator-free contracts
         shell: bash
         run: |
+          set -euo pipefail
           mkdir evidence
           git rev-parse HEAD | tee evidence/source.log
           "$SIG" version | tee evidence/sig-version.log
