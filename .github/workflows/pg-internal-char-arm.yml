@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 0f204c9c045e477f4d9b4f9c65351eca13c395c4
+          ref: e7bf47b82e16379741d2daf458a9a2b3d46e30bd
       - name: Install checksum-verified Sig 0.6.5 for AArch64
         shell: bash
         run: |
