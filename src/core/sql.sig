@@ -5432,7 +5432,6 @@ pub fn Database(comptime config: Config) type {
                         try dependencyRow(sink, constraint_class, item.oid, relation, table.oid, @as(i64, column) + 1, "a");
                     }
                     for (item.refColumns()) |column| {
-                        if (table.oid == item.ref_oid and std.mem.indexOfScalar(u8, item.keyColumns(), column) != null) continue;
                         try dependencyRow(sink, constraint_class, item.oid, relation, item.ref_oid, @as(i64, column) + 1, "n");
                     }
                     const index = self.referencedConstraintIndex(item, snapshot);
