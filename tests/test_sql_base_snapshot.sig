@@ -95,7 +95,8 @@ fn exercise(integral: bool) !void {
     if (DB.BaseSnapshot.restore(&restored, &image, csn + 1, &scratch, &replay)) |_| return error.WrongCsnAccepted else |err| try check(err == error.InvalidSnapshotImage);
     try check(restored.csn == 0 and restored.tableCount() == 0);
     var wrong_bank = image;
-    wrong_bank.bytes[16] = @intCast((bank + 1) % budgets.len);
+    // Both candidate banks have room so this exercises the placement check.
+    wrong_bank.bytes[16] = if (integral) 1 else 0;
     if (DB.BaseSnapshot.restore(&restored, &wrong_bank, csn, &scratch, &replay)) |_| return error.WrongBankAccepted else |err| try check(err == error.ChangeRecordConflict);
     try check(restored.csn == 0 and restored.tableCount() == 0);
     var trailing = image;
@@ -105,6 +106,7 @@ fn exercise(integral: bool) !void {
     try DB.BaseSnapshot.restore(&restored, &image, csn, &scratch, &replay);
     try check(restored.csn == csn and restored.oid_counter == live.oid_counter);
     try check(restored.tables[bank].oid == live.tables[bank].oid and restored.tables[bank].next_rowid == 7);
+    try check((restored.tables[bank].integral_rows.len != 0) == integral);
     try check(restored.tables[bank].version_used == 5 and restored.tables[bank].summary.rows == 5);
     try restored.execute("SELECT id,amount,CAST(detail AS TEXT) FROM ledger ORDER BY id", &result);
     try check(result.row_count == 5 and result.rows[4].cells[0].integer == 8);
