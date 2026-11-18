@@ -92,6 +92,8 @@ pub const SequenceHook = struct {
     /// sequence a column owns (SERIAL or identity) into `out`, null when it
     /// owns none (42P01 / 42703 for a missing table / column).
     serial_sequence: ?*const fn (ptr: *anyopaque, table: []const u8, column: []const u8, out: *[serial_name_bytes]u8) Error!?usize = null,
+    /// Visibility of an existing relation in the owning catalog snapshot.
+    relation_visible: ?*const fn (ptr: *anyopaque, oid: u32) ?bool = null,
 };
 
 pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid };

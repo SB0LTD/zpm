@@ -1101,7 +1101,7 @@ pub fn Database(comptime config: Config) type {
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
                     // These catalog lookups use the serialized database hook.
-                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence=>return error.UnsupportedStatement,
+                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                     .current_setting,.set_config,.pg_backend_pid,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
@@ -4715,6 +4715,51 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
+        fn inRelationSearchPath(self: *const Self, namespace: u32, name: []const u8) bool {
+            // The supported relation path resolves pg_catalog before public.
+            return namespace == catalog_module.catalog_namespace or
+                (namespace == catalog_module.public_namespace and self.catalog.findSystemView(null, name) == null);
+        }
+
+        fn relationVisible(ptr: *anyopaque, oid: u32) ?bool {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            switch (oid) {
+                // PostgreSQL's fixed OIDs for the catalog relations we expose.
+                1247, 1249, 1255, 1259, 1260, 1261, 1417, 2224, 2328, 2396,
+                2604, 2609, 2610, 2611, 2615, 2618, 2620, 3079, 3256, 3501, 6104,
+                => return true,
+                1262 => return if (self.catalog.databases != null) true else null,
+                else => {},
+            }
+            const snap = self.seq_snap;
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') {
+                    const seq = &self.seqs[found.slot];
+                    if (seq.oid == oid) return self.inRelationSearchPath(catalog_module.public_namespace, seq.name.slice());
+                    continue;
+                }
+                const table = &self.tables[found.slot];
+                if (table.oid == oid) return self.inRelationSearchPath(table.namespace, table.name.slice());
+                if (table.oid +% 1 == oid and S.keyed(table)) {
+                    const name = indexName(table) catch return null;
+                    return self.inRelationSearchPath(table.namespace, name.slice());
+                }
+                for (table.indexes[0..table.index_count]) |*index| {
+                    if (index.oid != 0 and index.oid == oid) {
+                        return self.inRelationSearchPath(table.namespace, index.name.slice());
+                    }
+                }
+            }
+            for (&self.catalog_objects.items) |*object| {
+                if (object.kind == .composite_type and O.visible(object, snap) and object.compositeRelationOid() == oid) {
+                    return self.inRelationSearchPath(object.target, object.name.slice());
+                }
+            }
+            return null;
+        }
+
         /// pg_get_serial_sequence: the table is regclass text (42P01), the
         /// column an exact attribute name (42703); the result names the
         /// SERIAL or identity sequence the column owns (sequences live in
@@ -6919,7 +6964,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;

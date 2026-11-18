@@ -283,6 +283,7 @@ fn sqlFunctions() !void {
     try base();
     try run("CREATE FUNCTION add1(x INT) RETURNS INT LANGUAGE SQL IMMUTABLE AS 'SELECT x+1'");
     try expectColumn("SELECT add1(v) FROM tdd_a ORDER BY id", "add1", 23, "11;21;31;NULL");
+    try rejects("SELECT pg_catalog.add1(1)", error.UndefinedFunction, "SELECT add1(1)", "2");
     try expect("SELECT id, add1(add1(id)) FROM tdd_a WHERE add1(g) = 2 ORDER BY id", "1|3;2|4");
     try run("CREATE FUNCTION twice(INT) RETURNS INT LANGUAGE SQL AS 'SELECT $1 * 2'");
     try expectColumn("SELECT twice(21)", "twice", 23, "42");
