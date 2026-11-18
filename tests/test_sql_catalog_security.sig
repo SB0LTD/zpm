@@ -200,6 +200,7 @@ fn commit(slot: u16) !void {
 }
 
 const state_probes = [_][]const u8{
+    "SELECT oid, nspname, nspowner FROM pg_namespace ORDER BY oid",
     "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolconnlimit, rolbypassrls, oid FROM pg_roles ORDER BY oid",
     "SELECT oid, roleid, member, grantor, admin_option FROM pg_auth_members ORDER BY oid",
     "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges ORDER BY table_name, grantee, privilege_type",
@@ -373,6 +374,64 @@ fn namespacesAndExtensions() !void {
     try rejects("CREATE EXTENSION pg_trgm", error.UnsupportedStatement, "SELECT COUNT(*) FROM pg_extension", "1");
     try rejects("DROP EXTENSION plpgsql", error.UnsupportedStatement, "SELECT COUNT(*) FROM pg_extension", "1");
     try rejects("COMMENT ON EXTENSION plpgsql IS 'x'", error.UnsupportedStatement, "SELECT COUNT(*) FROM pg_description", "0");
+    try sameState();
+}
+
+fn namespaceOwners() !void {
+    try reset();
+    try run("CREATE SCHEMA legacy_owner");
+    try check(record[8] == 15);
+    try expect("SELECT nspowner FROM pg_namespace WHERE nspname='legacy_owner'", "10");
+    try metadata("SELECT nspowner FROM pg_namespace", &.{"nspowner"}, &.{26});
+    try run("CREATE ROLE schema_owner SUPERUSER");
+    const owner_oid = try roleOid("schema_owner");
+    try as("schema_owner");
+    const abandoned = try db.begin();
+    try statement(abandoned, "CREATE SCHEMA abandoned_owner");
+    db.abort(abandoned);
+    try expect("SELECT nspowner FROM pg_namespace WHERE nspname='abandoned_owner'", "");
+
+    var out: DB.Result = .{};
+    var used: usize = 0;
+    try db.executeChanges("CREATE SCHEMA owned_namespace", &out, &record, &used, null, null);
+    try check(record[8] == 18);
+    const owner_offset: usize = 14 + @as(usize, record[13]);
+    try check(owner_offset + 4 == used);
+    try check(std.mem.readInt(u32, record[owner_offset..][0..4], .little) == owner_oid);
+    const before = replica.csn;
+    try replayFails(record[0 .. used - 1], error.InvalidChangeRecord);
+    std.mem.writeInt(u32, record[owner_offset..][0..4], 0, .little);
+    try replayFails(record[0..used], error.ChangeRecordConflict);
+    try check(replica.csn == before);
+    std.mem.writeInt(u32, record[owner_offset..][0..4], owner_oid, .little);
+    try replica.applyChangeRecord(record[0..used], &scratch);
+    records_applied += 1;
+    try sameState();
+
+    try as("ramsql");
+    const owner_query = "SELECT r.rolname FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner WHERE n.nspname = 'owned_namespace'";
+    try rejects("DROP ROLE schema_owner", error.DependentObjects, owner_query, "schema_owner");
+    try run("ALTER ROLE schema_owner RENAME TO renamed_owner");
+    try run("ALTER ROLE renamed_owner NOSUPERUSER");
+    try expect(owner_query, "renamed_owner");
+    try as("renamed_owner");
+    try run("COMMENT ON SCHEMA owned_namespace IS 'owner comment'");
+    try as("ramsql");
+    try run("CREATE ROLE unrelated_user");
+    try as("unrelated_user");
+    try fails("DROP SCHEMA owned_namespace", error.InsufficientPrivilege);
+    try as("renamed_owner");
+    var dropped_schema: [4096]u8 = undefined;
+    var drop_len: usize = 0;
+    try db.executeChanges("DROP SCHEMA owned_namespace", &out, &dropped_schema, &drop_len, null, null);
+    try as("ramsql");
+    used = 0;
+    try db.executeChanges("DROP ROLE renamed_owner", &out, &record, &used, null, null);
+    try replayFails(record[0..used], error.ChangeRecordConflict);
+    try same(try query(&replica, owner_query), "renamed_owner");
+    try replica.applyChangeRecord(dropped_schema[0..drop_len], &scratch);
+    try replica.applyChangeRecord(record[0..used], &scratch);
+    records_applied += 2;
     try sameState();
 }
 
@@ -1184,6 +1243,7 @@ fn rowSecuritySetting() !void {
 pub fn main() !void {
     try oraclePrograms();
     try namespacesAndExtensions();
+    try namespaceOwners();
     try comments();
     try roles();
     try privileges();

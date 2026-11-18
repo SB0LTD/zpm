@@ -709,6 +709,7 @@ pub fn Database(comptime config: Config) type {
             creator: u16 = 0,
             dead_csn: u64 = 0,
             oid: u32 = 0,
+            owner: u32 = CO.bootstrap_role,
             name: Name = .{},
         };
 
@@ -3105,6 +3106,13 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
+            const owner = self.session.role;
+            if (owner != CO.bootstrap_role) {
+                if (self.catalog_objects.pendingReference(owner, snap)) |other| return self.objectPark(slot, other);
+                var latest = snap;
+                latest.csn = self.csn;
+                if (self.catalog_objects.byOid(.role, owner, latest) == null) return error.SerializationFailure;
+            }
             try self.reserveWrites(slot, 2);
             var destination: ?usize = null;
             for (0..2) |attempt| {
@@ -3118,7 +3126,7 @@ pub fn Database(comptime config: Config) type {
             const index = destination orelse return error.TableCapacity;
             if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
             const schema = &self.schemas[index];
-            schema.* = .{ .live = true, .pending_create = true, .creator = slot, .oid = change_log.first_oid + self.oid_counter, .name = name };
+            schema.* = .{ .live = true, .pending_create = true, .creator = slot, .oid = change_log.first_oid + self.oid_counter, .owner = owner, .name = name };
             self.oid_counter += 1;
             tx.push(.{ .kind = .create_schema, .table = @intCast(index) }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
@@ -3175,6 +3183,14 @@ pub fn Database(comptime config: Config) type {
             for (catalog_module.namespaces) |namespace| if (namespace.oid == oid) return namespace.name;
             for (&self.schemas) |*schema| if (schema.live and schema.oid == oid) return schema.name.slice();
             return "";
+        }
+
+        fn ownsNamespace(self: *const Self, oid: u32, snap: Snapshot) bool {
+            if (self.privilegedRole(snap)) return true;
+            for (&self.schemas) |*schema| {
+                if (schema.live and schema.oid == oid) return self.catalog_objects.memberOf(self.session.role, schema.owner, true, snap);
+            }
+            return false;
         }
 
         // ---- catalog objects (B11 wave 3, catalog_objects.sig) --------------
@@ -3715,6 +3731,16 @@ pub fn Database(comptime config: Config) type {
                 if (self.catalog_objects.pendingReference(oid, snap)) |other| return self.objectPark(slot, other);
                 var latest = snap;
                 latest.csn = self.csn;
+                for (&self.schemas) |*schema| {
+                    if (!schema.live or schema.owner != oid) continue;
+                    if ((schema.pending_create or schema.pending_drop) and schema.creator != slot) return self.objectPark(slot, schema.creator);
+                    const old = self.catalog.findSchema(schema.name.slice(), snap);
+                    const now = self.catalog.findSchema(schema.name.slice(), latest);
+                    const owned_before = old != null and old.?.oid == schema.oid;
+                    const owned_now = now != null and now.?.oid == schema.oid;
+                    if (owned_before != owned_now) return error.SerializationFailure;
+                    if (owned_before) return error.DependentObjects;
+                }
                 for (&self.catalog_objects.items) |*o| {
                     if ((CO.userType(o.kind) or o.kind == .statistics) and o.owner == oid and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
@@ -4065,7 +4091,7 @@ pub fn Database(comptime config: Config) type {
                 .schema => {
                     key.grantee = CO.class_namespace;
                     key.target = namespaceFor(&self.catalog, objectName(source, comment.object.name).slice(), snap) orelse return error.UndefinedSchema;
-                    if (!privileged) return error.InsufficientPrivilege;
+                    if (!self.ownsNamespace(key.target, snap)) return error.InsufficientPrivilege;
                 },
                 .role => {
                     key.grantee = CO.class_authid;
@@ -4418,7 +4444,8 @@ pub fn Database(comptime config: Config) type {
                 .drop_relation => |*drop| try self.needOwner(drop.slot, snap),
                 .alter_table => |*alter| try self.needOwner(alter.table, snap),
                 .refresh_view => |*refresh| try self.needOwner(refresh.slot, snap),
-                .create_table, .create_sequence, .drop_sequence, .alter_sequence, .create_schema, .drop_schema => return error.InsufficientPrivilege,
+                .drop_schema => |*drop| if (!self.ownsNamespace(drop.oid, snap)) return error.InsufficientPrivilege,
+                .create_table, .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,
                 else => {},
             }
         }
@@ -5454,13 +5481,13 @@ pub fn Database(comptime config: Config) type {
                 .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
                 .pg_namespace, .schemata => {
                     for (catalog_module.namespaces) |namespace| {
-                        if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
+                        if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name), intCell(CO.bootstrap_role) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
                     }
                     var schemas: [K.relation_rows]K.SchemaFound = undefined;
                     const schema_count = self.catalog.visibleSchemas(snapshot, &schemas);
                     for (schemas[0..schema_count]) |found| {
-                        const schema_name = self.schemas[found.slot].name.slice();
-                        if (view == .pg_namespace) try sink.add(&.{ intCell(found.oid), nameCell(schema_name) }) else try sink.add(&.{ nameCell(database), nameCell(schema_name) });
+                        const schema = &self.schemas[found.slot];
+                        if (view == .pg_namespace) try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(schema.owner) }) else try sink.add(&.{ nameCell(database), nameCell(schema.name.slice()) });
                     }
                 },
                 else => for (relations[0..count]) |found| {
@@ -8183,7 +8210,7 @@ pub fn Database(comptime config: Config) type {
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
                     .truncate, .refresh_rows => try C.encodeTruncate(writer, self.tables[entry.table].oid),
                     .alter_sequence => try C.encodeAlterSequence(writer, &self.seqs[entry.table]),
-                    .create_schema => try C.encodeCreateSchema(writer, self.schemas[entry.table].oid, self.schemas[entry.table].name.slice()),
+                    .create_schema => try C.encodeCreateSchema(writer, &self.schemas[entry.table]),
                     .drop_schema => try C.encodeDropSchema(writer, self.schemas[entry.table].oid),
                     .alter_table => {
                         const table = &self.tables[entry.table];
