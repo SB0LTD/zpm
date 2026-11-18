@@ -1378,6 +1378,57 @@ fn namespaceAliases() !void {
     try expect("SELECT to_regnamespace('\"MiX\"\"ed\"') IS NULL", "t");
 }
 
+fn statisticsDefinitions() !void {
+    reset();
+    try run("CREATE SCHEMA handoff");
+    try run("CREATE TABLE stats_tbl (lead INT, a INT, \"B Col\" INT, c INT)");
+    const discovery = "SELECT stxnamespace::pg_catalog.regnamespace::pg_catalog.text AS nsp, stxname," ++
+        " pg_catalog.pg_get_statisticsobjdef_columns(oid) AS columns, 'd' = any(stxkind) AS ndist_enabled," ++
+        " 'f' = any(stxkind) AS deps_enabled, 'm' = any(stxkind) AS mcv_enabled, stxstattarget" ++
+        " FROM pg_catalog.pg_statistic_ext WHERE stxrelid = 'stats_tbl'::regclass ORDER BY nsp, stxname";
+    try expect(discovery, "");
+    try check((try replicate("CREATE STATISTICS s (mcv,ndistinct) ON \"B Col\", a FROM stats_tbl")).command == .create_statistics);
+    try run("CREATE STATISTICS handoff.s ON c, \"B Col\" FROM stats_tbl");
+    try check((try replicate("ALTER STATISTICS handoff.s SET STATISTICS 300")).command == .alter_statistics);
+    const original = "handoff|s|\"B Col\", c|t|t|t|300;public|s|a, \"B Col\"|t|f|t|NULL";
+    try expect(discovery, original);
+    const ordinal = "SELECT stxnamespace::regnamespace::text, stxkeys, stxkind::text FROM pg_statistic_ext ORDER BY 1";
+    try expect(ordinal, "handoff|3 4|{d,f,m};public|2 3|{d,m}");
+    try sameState(&.{ discovery, ordinal });
+    try run("CREATE STATISTICS IF NOT EXISTS s ON a,c FROM stats_tbl");
+    try rejects("CREATE STATISTICS s ON a,c FROM stats_tbl", error.DuplicateObject, discovery, original);
+    try rejects("CREATE STATISTICS dup ON a,a FROM stats_tbl", error.DuplicateColumn, discovery, original);
+    try rejects("CREATE STATISTICS single ON a FROM stats_tbl", error.InvalidObjectDefinition, discovery, original);
+    try rejects("CREATE STATISTICS wrong ON absent,c FROM stats_tbl", error.ColumnNotFound, discovery, original);
+    try rejects("CREATE STATISTICS expr ON (a + 1), c FROM stats_tbl", error.UnsupportedStatement, discovery, original);
+    try rejects("ALTER STATISTICS s SET STATISTICS -2", error.InvalidParameterValue, discovery, original);
+    try rejects("DROP SCHEMA handoff RESTRICT", error.DependentObjects, discovery, original);
+    try rejects("DROP STATISTICS s, no_such_stats", error.UndefinedObject, discovery, original);
+
+    const slot = try db.begin();
+    try statement(slot, "DROP STATISTICS s, handoff.s");
+    db.abort(slot);
+    try expect(discovery, original);
+    try run("ALTER STATISTICS s SET STATISTICS 10001");
+    try run("ALTER TABLE stats_tbl RENAME COLUMN \"B Col\" TO renamed");
+    try run("ALTER TABLE stats_tbl DROP COLUMN lead");
+    try expect(discovery, "handoff|s|renamed, c|t|t|t|300;public|s|a, renamed|t|f|t|10000");
+    try sameState(&.{discovery});
+    try run("ALTER TABLE stats_tbl DROP COLUMN a");
+    try expect(discovery, "handoff|s|renamed, c|t|t|t|300");
+    try expect("SELECT pg_get_statisticsobjdef_columns(0) IS NULL", "t");
+    try sameState(&.{discovery});
+    try run("DROP SCHEMA handoff CASCADE");
+    try expect(discovery, "");
+    try run("CREATE STATISTICS s ON renamed,c FROM stats_tbl");
+    try check((try replicate("DROP STATISTICS IF EXISTS s, nonexistent")).command == .drop_statistics);
+    try run("CREATE STATISTICS s ON renamed,c FROM stats_tbl");
+    try run("DROP TABLE stats_tbl");
+    const empty = "SELECT stxname FROM pg_statistic_ext";
+    try expect(empty, "");
+    try sameState(&.{empty});
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1400,5 +1451,6 @@ pub fn main() !void {
     try arraySubqueries();
     try policyDiscovery();
     try namespaceAliases();
+    try statisticsDefinitions();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

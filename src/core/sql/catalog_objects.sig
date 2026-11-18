@@ -78,7 +78,7 @@ pub const class_policy: u32 = 3256;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, _ };
 
 pub fn userType(kind: Kind) bool {
     return kind == .domain or kind == .enum_type or kind == .composite_type;
@@ -345,6 +345,18 @@ pub const Server = struct {
 };
 
 pub const Publication = struct { name: Ident = .{}, flags: u32 = pub_default };
+pub const statistics_kinds = [_][]const u8{ "d", "f", "m" };
+const all_statistics_kinds: u32 = (1 << statistics_kinds.len) - 1;
+pub const statistics_columns = 8;
+pub const Statistics = struct {
+    name: Qualified,
+    table: Qualified = .{},
+    columns: [statistics_columns]Ident = @splat(.{}),
+    count: usize = 0,
+    flags: u32 = all_statistics_kinds,
+    if_not_exists: bool,
+};
+pub const AlterStatistics = struct { name: Qualified, if_exists: bool, target: i32 };
 pub const CreateDomain = struct { name: Qualified, spec: Domain };
 pub const CreateEnum = struct { name: Qualified, labels: Span };
 pub const CreateComposite = struct { name: Qualified, fields: Span };
@@ -367,6 +379,9 @@ pub const Statement = union(enum) {
     drop_server: Drop,
     create_publication: Publication,
     drop_publication: Drop,
+    create_statistics: Statistics,
+    alter_statistics: AlterStatistics,
+    drop_statistics: DropTypes,
     create_extension: Named,
     create_domain: CreateDomain,
     drop_domain: DropTypes,
@@ -413,6 +428,7 @@ pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime
         }
         if (try p.take("server")) return .{ .create_server = try p.server() };
         if (try p.take("publication")) return .{ .create_publication = try p.publication() };
+        if (dialect == .postgres and try p.take("statistics")) return .{ .create_statistics = try p.statistics() };
         if (p.word("subscription")) return error.UnsupportedStatement;
         if (try p.take("extension")) {
             var out: Named = .{ .if_not_exists = try p.ifNotExists() };
@@ -423,6 +439,7 @@ pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime
         return null;
     }
     if (try p.take("alter")) {
+        if (dialect == .postgres and try p.take("statistics")) return .{ .alter_statistics = try p.alterStatistics() };
         if (p.word("domain") or p.word("type")) return error.UnsupportedStatement;
         if (try p.take("role") or try p.take("user") or try p.take("group")) return .{ .alter_role = try p.roleSpec(.role, false) };
         if (try p.take("policy")) return .{ .alter_policy = try p.policy(.alter) };
@@ -430,8 +447,9 @@ pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime
         return null;
     }
     if (try p.take("drop")) {
-        if (try p.take("domain")) return .{ .drop_domain = try p.dropTypes() };
-        if (try p.take("type")) return .{ .drop_type = try p.dropTypes() };
+        if (dialect == .postgres and try p.take("statistics")) return .{ .drop_statistics = try p.dropQualifiedList() };
+        if (try p.take("domain")) return .{ .drop_domain = try p.dropQualifiedList() };
+        if (try p.take("type")) return .{ .drop_type = try p.dropQualifiedList() };
         if (try p.take("role") or try p.take("user") or try p.take("group")) return .{ .drop_role = try p.dropList() };
         if (try p.take("policy")) return .{ .drop_policy = try p.policy(.drop) };
         if (try p.take("foreign")) {
@@ -652,7 +670,7 @@ const Parser = struct {
         return .{ .start = start, .len = end - start };
     }
 
-    fn dropTypes(self: *Parser) Error!DropTypes {
+    fn dropQualifiedList(self: *Parser) Error!DropTypes {
         var drop: DropTypes = .{ .if_exists = try self.ifExists() };
         while (true) {
             if (drop.count == list_capacity) return error.ProgramLimitExceeded;
@@ -660,11 +678,49 @@ const Parser = struct {
             drop.count += 1;
             if (!try self.takeSymbol(.comma)) break;
         }
-        // Catalog-only types have no stored dependents. Their generated
-        // array and enum labels always follow the owning type.
+        // These objects have no optional dependents. Type arrays and enum
+        // labels always follow the owning type.
         _ = try self.dropBehavior();
         try self.finish();
         return drop;
+    }
+
+    fn statistics(self: *Parser) Error!Statistics {
+        const conditional = try self.ifNotExists();
+        if (self.word("on") or self.symbol(.lparen)) return error.UnsupportedStatement;
+        var out: Statistics = .{ .name = try self.qualified(), .if_not_exists = conditional };
+        if (try self.takeSymbol(.lparen)) {
+            out.flags = 0;
+            while (true) {
+                const flag: u32 = if (try self.take("ndistinct")) 1 else if (try self.take("dependencies")) 2 else if (try self.take("mcv")) 4 else return error.Syntax;
+                out.flags |= flag;
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rparen);
+        }
+        try self.expect("on");
+        while (true) {
+            if (out.count == statistics_columns) return error.ProgramLimitExceeded;
+            if (self.symbol(.lparen)) return error.UnsupportedStatement;
+            out.columns[out.count] = try self.ident();
+            out.count += 1;
+            if (!try self.takeSymbol(.comma)) break;
+        }
+        if (!try self.take("from")) return error.UnsupportedStatement;
+        out.table = try self.qualified();
+        if (!self.atEnd()) return error.UnsupportedStatement;
+        try self.finish();
+        return out;
+    }
+
+    fn alterStatistics(self: *Parser) Error!AlterStatistics {
+        const conditional = try self.ifExists();
+        const name = try self.qualified();
+        if (!try self.take("set") or !try self.take("statistics")) return error.UnsupportedStatement;
+        const target = try self.domainInteger();
+        if (target < -1) return error.InvalidParameterValue;
+        try self.finish();
+        return .{ .name = name, .if_exists = conditional, .target = @intCast(@min(target, 10000)) };
     }
 
     fn dropList(self: *Parser) Error!Drop {
@@ -1196,16 +1252,16 @@ pub const Cursor = struct {
 
 /// Kinds whose objects own an OID (allocated from the database counter).
 pub fn ownsOid(kind: Kind) bool {
-    return kind == .role or kind == .member or kind == .policy or kind == .fdw or kind == .server or kind == .publication or userType(kind);
+    return kind == .role or kind == .member or kind == .policy or kind == .fdw or kind == .server or kind == .publication or kind == .statistics or userType(kind);
 }
 
 /// Kinds whose objects carry a unique name.
 fn named(kind: Kind) bool {
-    return kind == .role or kind == .policy or kind == .fdw or kind == .server or kind == .publication or userType(kind);
+    return kind == .role or kind == .policy or kind == .fdw or kind == .server or kind == .publication or kind == .statistics or userType(kind);
 }
 
 fn scoped(kind: Kind) bool {
-    return kind == .policy or userType(kind);
+    return kind == .policy or kind == .statistics or userType(kind);
 }
 
 pub fn Objects(comptime config: types.Config) type {
@@ -1321,7 +1377,7 @@ pub fn Objects(comptime config: types.Config) type {
         pub fn sameKey(a: *const Object, b: *const Object) bool {
             if (a.kind != b.kind) return false;
             return switch (a.kind) {
-                .role, .policy, .fdw, .server, .publication => a.oid == b.oid,
+                .role, .policy, .fdw, .server, .publication, .statistics => a.oid == b.oid,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
                 .member, .acl => a.target == b.target and a.grantee == b.grantee,
                 .relation => a.target == b.target,
@@ -1689,7 +1745,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > 12) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.statistics)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1710,6 +1766,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .role, .fdw, .publication => o.oid != 0 and o.target == 0 and o.grantee == 0 and o.sub == 0,
                 .policy, .server => o.oid != 0 and o.grantee == 0 and o.sub == 0,
                 .domain, .enum_type, .composite_type => o.oid != 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
+                .statistics => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub >= -1 and o.sub <= 10000,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .acl => o.oid == 0 and o.target != 0 and o.sub == 0,
                 .relation => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
@@ -1765,6 +1822,8 @@ pub fn Objects(comptime config: types.Config) type {
                 .server => has_name and o.target != 0 and o.flags & ~(server_type | server_version) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.owner != 0 and
                     (o.flags & server_type != 0 or o.split == 0) and (o.flags & server_version != 0 or o.split == o.text_len),
                 .publication => has_name and o.flags & ~@as(u32, 63) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
+                .statistics => has_name and o.flags != 0 and o.flags & ~all_statistics_kinds == 0 and o.grant_flags == 0 and o.role_count == 0 and
+                    o.owner != 0 and o.split == o.text_len and o.text_len >= 2 and o.text_len <= statistics_columns,
                 .domain => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.split == 0 and
                     o.text_len != 0 and o.text_len <= config.name_bytes and o.text[0] == '_' and !types.same(o.name.slice(), o.textSlice()),
                 .enum_type, .composite_type => has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and
@@ -1791,6 +1850,10 @@ pub fn Objects(comptime config: types.Config) type {
                 if (try cursor.int(u8) != 1) return error.UnsupportedLogVersion;
                 o.composite_field_count = try cursor.int(u16);
                 try validateCompositeFields(o.text[o.split..o.text_len], o.composite_field_count);
+            } else if (o.kind == .statistics) {
+                for (o.textSlice()[1..], o.textSlice()[0..o.text_len - 1]) |next, prior| {
+                    if (next <= prior) return error.InvalidChangeRecord;
+                }
             }
             return o;
         }
@@ -1866,6 +1929,7 @@ pub fn Objects(comptime config: types.Config) type {
             name: V.Name = .{},
             array_name: V.Name = .{},
             oid_width: u32 = 0,
+            last_statistics_column: u8 = 0,
         };
 
         pub const Overlay = struct {
@@ -1874,6 +1938,7 @@ pub fn Objects(comptime config: types.Config) type {
             fn project(o: *const Object, live: bool) VObject {
                 var out: VObject = .{ .used = o.used, .live = live, .kind = o.kind, .oid = o.oid, .target = o.target, .grantee = o.grantee, .sub = o.sub, .owner = o.owner, .roles = o.roles, .role_count = o.role_count, .name = o.name };
                 out.oid_width = o.oidWidth();
+                if (o.kind == .statistics) out.last_statistics_column = o.text[o.text_len - 1];
                 if (userType(o.kind)) {
                     const name = o.arrayName();
                     out.array_name.len = name.len;
@@ -1946,9 +2011,10 @@ pub fn Objects(comptime config: types.Config) type {
                         types.same(v.name.slice(), o.name.slice())) return error.ChangeRecordConflict;
                 }
                 if (o.kind == .role and (types.same(o.name.slice(), bootstrap_name) or reservedRoleName(o.name.slice()))) return error.ChangeRecordConflict;
-                try self.references(o.kind, o.target, o.grantee, o.sub, o.owner, o.roles[0..o.role_count], ctx);
+                const projected = project(o, true);
+                try self.references(&projected, ctx);
                 for (&self.items) |*v| if (!v.used) {
-                    v.* = project(o, true);
+                    v.* = projected;
                     // A decoded version is not yet an entry: mark it taken.
                     v.used = true;
                     if (width != 0) ctx.noteObjectOid(o.oid + width - 1);
@@ -1969,11 +2035,15 @@ pub fn Objects(comptime config: types.Config) type {
                 return error.ChangeRecordConflict;
             }
 
-            fn references(self: *const Overlay, kind: Kind, target: u32, grantee: u32, sub: i32, owner_oid: u32, roles: []const u32, ctx: anytype) Error!void {
-                if (owner_oid != 0) {
-                    if (!self.roleExists(owner_oid)) return error.ChangeRecordConflict;
-                }
-                switch (kind) {
+            fn references(self: *const Overlay, v: *const VObject, ctx: anytype) Error!void {
+                const target = v.target;
+                const grantee = v.grantee;
+                if (v.owner != 0 and !self.roleExists(v.owner)) return error.ChangeRecordConflict;
+                switch (v.kind) {
+                    .statistics => {
+                        const columns = ctx.objectTableColumns(grantee) orelse return error.ChangeRecordConflict;
+                        if (v.last_statistics_column >= columns or !ctx.objectSchemaLive(target)) return error.ChangeRecordConflict;
+                    },
                     .member => {
                         const group_live = self.roleExists(target);
                         const member_live = self.roleExists(grantee);
@@ -1992,7 +2062,7 @@ pub fn Objects(comptime config: types.Config) type {
                     },
                     .policy => {
                         if (!ctx.objectTableLive(target)) return error.ChangeRecordConflict;
-                        for (roles) |role| {
+                        for (v.roles[0..v.role_count]) |role| {
                             if (role == public_role) continue;
                             if (!self.roleExists(role)) return error.ChangeRecordConflict;
                         }
@@ -2005,7 +2075,7 @@ pub fn Objects(comptime config: types.Config) type {
                     },
                     .comment => {
                         const exists = switch (grantee) {
-                            class_relation => if (ctx.objectTableColumns(target)) |columns| sub <= columns else sub == 0 and ctx.objectSequenceLive(target),
+                            class_relation => if (ctx.objectTableColumns(target)) |columns| v.sub <= columns else v.sub == 0 and ctx.objectSequenceLive(target),
                             class_namespace => ctx.objectSchemaLive(target),
                             class_authid => self.roleExists(target),
                             class_fdw => self.liveOid(.fdw, target),
@@ -2026,7 +2096,7 @@ pub fn Objects(comptime config: types.Config) type {
             pub fn finish(self: *const Overlay, ctx: anytype) Error!void {
                 for (&self.items) |*v| {
                     if (!v.live) continue;
-                    try self.references(v.kind, v.target, v.grantee, v.sub, v.owner, v.roles[0..v.role_count], ctx);
+                    try self.references(v, ctx);
                 }
             }
         };
