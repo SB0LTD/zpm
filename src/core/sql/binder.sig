@@ -7681,6 +7681,17 @@ pub fn Binder(comptime config: types.Config) type {
                         if (create.if_not_exists) return .{ .noop = if (create.as_query != none) .create_table_as else .create_table };
                         return error.TableExists;
                     }
+                    // PRIMARY KEY and UNIQUE create an index through a lookup
+                    // of the newly created relation. PostgreSQL requires USAGE
+                    // for that lookup, after an IF NOT EXISTS early return.
+                    if (postgres_acl) {
+                        var index_lookup = false;
+                        for (create.columns[0..create.count]) |*column| index_lookup = index_lookup or column.primary_key;
+                        for (create.constraints[0..create.constraint_count]) |*constraint| {
+                            index_lookup = index_lookup or constraint.kind == .primary or constraint.kind == .unique;
+                        }
+                        if (index_lookup) _ = try qualifierNamespace(context, create.schema);
+                    }
                     if (create.invalid_definition) return error.Syntax;
                     if (create.as_query != none) return bindCreateAs(context, create, table_name, namespace);
                     if (create.partition_of) |parent| return bindPartitionOf(context, create, table_name, namespace, parent);

@@ -628,7 +628,10 @@ fn namespaceCreateAuthority() !void {
 
     try as("create_owner");
     try run("REVOKE USAGE ON SCHEMA create_space FROM CURRENT_ROLE");
-    try run("CREATE TABLE create_space.owner_data (id INT PRIMARY KEY)");
+    try run("CREATE TABLE create_space.owner_data (id INT NOT NULL)");
+    try run("CREATE TABLE IF NOT EXISTS create_space.owner_data (id INT PRIMARY KEY)");
+    try fails("CREATE TABLE create_space.denied_pk (id INT PRIMARY KEY)", error.InsufficientPrivilege);
+    try fails("CREATE TABLE create_space.denied_unique (id INT UNIQUE)", error.InsufficientPrivilege);
     try fails("SELECT id FROM create_space.owner_data", error.InsufficientPrivilege);
     try run("GRANT USAGE ON SCHEMA create_space TO CURRENT_ROLE");
     try run("INSERT INTO create_space.owner_data VALUES (5)");
