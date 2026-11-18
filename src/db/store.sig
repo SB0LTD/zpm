@@ -700,6 +700,7 @@ pub fn Store(comptime Raw: type) type {
             /// Transaction slot (explicit block or a parked implicit statement).
             tx: ?u16 = null,
             in_transaction: bool = false,
+            postgres_extended_implicit: bool = false,
             /// Opt-in immutable autocommit SELECT route. The caller owns the
             /// context and excludes ALL storage mutations for the entire codec
             /// call, including result formatting. Never set for transaction,
@@ -973,6 +974,7 @@ pub fn Store(comptime Raw: type) type {
                 self.base = self.settings;
                 self.tx = null;
                 self.in_transaction = false;
+                self.postgres_extended_implicit = false;
                 self.failed = false;
                 self.saved_len = 0;
                 self.pending = .{};
@@ -1000,6 +1002,11 @@ pub fn Store(comptime Raw: type) type {
                     return err;
                 };
                 self.endTransaction(true);
+            }
+
+            /// Sync ends an implicit extended-protocol transaction.
+            pub fn finishExtended(self: *Connection) !void {
+                if (self.postgres_extended_implicit) try self.commitTransaction();
             }
 
             pub fn rollbackTransaction(self: *Connection) !void {
@@ -1356,7 +1363,8 @@ pub fn Store(comptime Raw: type) type {
                 switch (command) {
                     .none => unreachable,
                     .begin => |modes| {
-                        const fresh = !self.in_transaction;
+                        const fresh = !self.in_transaction or self.postgres_extended_implicit;
+                        self.postgres_extended_implicit = false;
                         if (comptime has_engine_session) {
                             try self.beginTransaction();
                             // BEGIN inside a block only warns (its modes are ignored).
@@ -1370,14 +1378,14 @@ pub fn Store(comptime Raw: type) type {
                         result.command = .begin;
                     },
                     .commit => {
-                        const was_open = self.in_transaction;
+                        const was_open = self.in_transaction and !self.postgres_extended_implicit;
                         try self.commitTransaction();
                         if (!was_open) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .commit;
                     },
                     .rollback => {
-                        const was_open = self.in_transaction;
+                        const was_open = self.in_transaction and !self.postgres_extended_implicit;
                         try self.rollbackTransaction();
                         if (!was_open) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
@@ -1387,7 +1395,7 @@ pub fn Store(comptime Raw: type) type {
                         if (comptime PreparedWal == void) return error.UnsupportedStatement;
                         switch (prepared.action) {
                             .prepare => {
-                                if (!self.in_transaction) return error.NoActiveTransaction;
+                                if (!self.in_transaction or self.postgres_extended_implicit) return error.NoActiveTransaction;
                                 const slot = self.tx.?;
                                 if (self.failed) {
                                     self.db().abort(slot);
@@ -1419,7 +1427,7 @@ pub fn Store(comptime Raw: type) type {
                         }
                     },
                     .savepoint => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.postgres_extended_implicit) return error.NoActiveTransaction;
                         if (self.failed) return error.TransactionFailed;
                         try self.db().savepoint(self.tx.?, name.slice());
                         self.saved[self.saved_len] = .{ .current = self.settings, .base = self.base };
@@ -1428,14 +1436,14 @@ pub fn Store(comptime Raw: type) type {
                         result.command = .savepoint;
                     },
                     .release => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.postgres_extended_implicit) return error.NoActiveTransaction;
                         if (self.failed) return error.TransactionFailed;
                         self.saved_len = try self.db().release(self.tx.?, name.slice());
                         result.clear(0);
                         result.command = .release;
                     },
                     .rollback_to => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.postgres_extended_implicit) return error.NoActiveTransaction;
                         const depth = try self.db().rollbackTo(self.tx.?, name.slice());
                         self.rolled_back_to = depth;
                         self.settings = self.saved[depth].current;
@@ -1878,6 +1886,14 @@ pub fn Store(comptime Raw: type) type {
             }
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
+                return self.executeMode(source, result, false);
+            }
+
+            pub fn executeExtended(self: *Connection, source: []const u8, result: *Result) !void {
+                return self.executeMode(source, result, true);
+            }
+
+            fn executeMode(self: *Connection, source: []const u8, result: *Result, extended: bool) !void {
                 self.pending_notice = null;
                 if (self.id == 0) return error.InvalidConnection;
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
@@ -1953,6 +1969,13 @@ pub fn Store(comptime Raw: type) type {
                 const command_kind = self.db().control(source) catch |err| {
                     self.failTransaction();
                     return err;
+                };
+                if (extended and !self.in_transaction) switch (command_kind) {
+                    .none, .set, .reset, .set_session_characteristics, .show => {
+                        try self.beginTransaction();
+                        self.postgres_extended_implicit = true;
+                    },
+                    else => {},
                 };
                 if (command_kind != .none) {
                     const was_block = self.in_transaction;
