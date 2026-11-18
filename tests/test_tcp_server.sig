@@ -164,6 +164,76 @@ fn backpressure(listener: tcp.Socket, port: u16) !void {
     try check((try tcp.recv(other, &buf)) == 1 and buf[0] == 'x');
 }
 
+fn largeWait(listener: tcp.Socket, port: u16) !void {
+    const active = 70;
+    const high = active;
+    var sockets: [active + 2]tcp.Socket = @splat(tcp.invalid_socket);
+    defer for (&sockets) |fd| tcp.close(fd);
+    var peers: [active]tcp.Socket = @splat(tcp.invalid_socket);
+    defer for (&peers) |fd| tcp.close(fd);
+    var empty: [0]bool = .{};
+    phase = "large poll accept";
+    for (&peers, sockets[1 .. active + 1]) |*peer, *accepted| {
+        peer.* = try connect(port);
+        if (!try ready(listener, &.{}, &empty, &empty)) return error.AcceptNotReady;
+        accepted.* = (try tcp.accept(listener)) orelse return error.AcceptNotReady;
+    }
+    var scratch: [sockets.len + 1]tcp.WaitDescriptor = undefined;
+    var read: [sockets.len]bool = @splat(true);
+    var write: [sockets.len]bool = @splat(false);
+
+    phase = "large poll insufficient scratch";
+    if (tcp.waitMaskedWithScratch(listener, &sockets, &read, &write, 0, scratch[0..sockets.len])) |_|
+        return error.InvalidSetAccepted
+    else |err| try check(err == error.InvalidSet);
+    try check(read[high] and !write[high]);
+
+    phase = "large poll timeout";
+    const start = std.Io.Timestamp.now(report_io, .awake).toMilliseconds();
+    try check(!try tcp.waitMaskedWithScratch(listener, &sockets, &read, &write, 15, &scratch));
+    try check(std.Io.Timestamp.now(report_io, .awake).toMilliseconds() - start >= 5);
+    for (read, write) |r, w| try check(!r and !w);
+
+    phase = "large poll masked input and high write";
+    try check((try tcp.send(peers[active - 1], "z")) == 1);
+    write[high] = true;
+    try check(!try tcp.waitMaskedWithScratch(listener, &sockets, &read, &write, 1000, &scratch));
+    try check(!read[high] and write[high]);
+    @memset(&read, true);
+    @memset(&write, false);
+    phase = "large poll high read";
+    try check(!try tcp.waitMaskedWithScratch(listener, &sockets, &read, &write, 1000, &scratch));
+    for (read, write, 0..) |r, w, index| try check(r == (index == high) and !w);
+    var bytes: [1]u8 = undefined;
+    try check((try tcp.recv(sockets[high], &bytes)) == 1 and bytes[0] == 'z');
+
+    phase = "large poll listener readiness";
+    const joining = try connect(port);
+    defer tcp.close(joining);
+    @memset(&read, false);
+    try check(try tcp.waitMaskedWithScratch(listener, &sockets, &read, &write, 1000, &scratch));
+    const joined = (try tcp.accept(listener)) orelse return error.AcceptNotReady;
+    tcp.close(joined);
+
+    phase = "large poll high peer EOF";
+    tcp.close(peers[active - 1]);
+    peers[active - 1] = tcp.invalid_socket;
+    read[high] = true;
+    try check(!try tcp.waitMaskedWithScratch(listener, &sockets, &read, &write, 1000, &scratch));
+    try check(read[high] and (try tcp.recv(sockets[high], &bytes)) == 0);
+
+    phase = "large poll high invalid descriptor event";
+    const closed = sockets[high];
+    tcp.close(closed);
+    sockets[high] = tcp.invalid_socket;
+    var stale = sockets;
+    stale[high] = closed;
+    @memset(&read, false);
+    read[high] = true;
+    try check(!try tcp.waitMaskedWithScratch(listener, &stale, &read, &write, 1000, &scratch));
+    try check(read[high] and !read[0] and !read[active + 1]);
+}
+
 pub fn main(init: std.process.Init) !void {
     report_io = init.io;
     try tcp.init();
@@ -235,6 +305,7 @@ pub fn main(init: std.process.Init) !void {
     try check((try tcp.recv(accepted, &buf)) == 0);
     tcp.close(tcp.invalid_socket);
     try backpressure(listener, port);
+    try largeWait(listener, port);
     var report_buf: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&report_buf, "{{\"suite\":\"tcp_server\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

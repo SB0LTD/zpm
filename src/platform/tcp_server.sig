@@ -1,7 +1,7 @@
 //! Bounded nonblocking IPv4 TCP sockets for single-threaded servers (Layer 1).
 //! Caller-owned receive/send buffers; no allocator and no background threads.
-//! Windows uses Winsock select; Linux uses direct syscalls; macOS uses Darwin
-//! libSystem socket/poll calls. Every backend uses only caller-owned storage.
+//! The small wait wrapper uses Winsock select or native POSIX poll.
+//! The caller-backed wait uses WSAPoll, Linux syscalls or Darwin libSystem.
 const std = @import("std");
 const builtin = @import("builtin");
 const win = @import("win32.sig");
@@ -11,8 +11,10 @@ const is_windows = builtin.os.tag == .windows;
 
 pub const Socket = if (is_windows) win.SOCKET else linux.fd_t;
 pub const invalid_socket: Socket = if (is_windows) win.INVALID_SOCKET else -1;
-/// One additional descriptor is reserved for the listener in Winsock fd_set.
+/// Capacity of the legacy stack-backed wait wrapper. Winsock select reserves
+/// one additional descriptor for the listener.
 pub const max_clients: usize = 63;
+pub const WaitDescriptor = if (is_windows) win.WSAPOLLFD else if (builtin.os.tag == .macos) darwin.pollfd else linux.pollfd;
 pub const Error = error{
     UnsupportedPlatform,
     StartupFailed,
@@ -267,46 +269,57 @@ pub fn waitMasked(listener: Socket, clients: []const Socket, readable: []bool, w
             w.* = contains(&writes, fd);
         }
         return listener != invalid_socket and contains(&reads, listener);
-    } else if (builtin.os.tag == .linux) {
-        var descriptors: [max_clients + 1]linux.pollfd = undefined;
-        descriptors[0] = .{ .fd = listener, .events = linux.POLL.IN, .revents = 0 };
-        for (clients, readable, writable, 0..) |fd, wants_read, wants_write, i| {
-            descriptors[i + 1] = .{ .fd = fd, .events = @as(i16, if (wants_read) linux.POLL.IN else 0) | @as(i16, if (wants_write) linux.POLL.OUT else 0), .revents = 0 };
+    }
+    var descriptors: [max_clients + 1]WaitDescriptor = undefined;
+    return waitMaskedWithScratch(listener, clients, readable, writable, timeout_ms, &descriptors);
+}
+
+/// The caller supplies at least clients.len + 1 native descriptors, including
+/// a slot for the listener. Interest and readiness follow waitMasked. Socket,
+/// mask and scratch memory must be disjoint. The caller owns the socket set
+/// throughout the wait. Hosted Windows needs at least one valid descriptor.
+pub fn waitMaskedWithScratch(listener: Socket, clients: []const Socket, readable: []bool, writable: []bool, timeout_ms: u32, scratch: []WaitDescriptor) Error!bool {
+    if (clients.len != readable.len or clients.len != writable.len or
+        clients.len >= std.math.maxInt(u32) or scratch.len <= clients.len) return error.InvalidSet;
+    if (comptime !is_windows and builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedPlatform;
+    const Poll = if (is_windows) win.SOCKET_POLL else if (builtin.os.tag == .macos) darwin.POLL else linux.POLL;
+    // Winsock's priority band is the exceptional condition monitored by the
+    // small select wrapper. It also supplies interest on write-blocked sockets.
+    const priority: i16 = if (is_windows) win.SOCKET_POLL.RDBAND else 0;
+    const descriptors = scratch[0 .. clients.len + 1];
+    descriptors[0] = .{ .fd = listener, .events = Poll.IN, .revents = 0 };
+    var has_socket = listener != invalid_socket;
+    for (clients, readable, writable, descriptors[1..]) |fd, wants_read, wants_write, *item| {
+        has_socket = has_socket or fd != invalid_socket;
+        const events = @as(i16, if (wants_read) Poll.IN else 0) | @as(i16, if (wants_write) Poll.OUT else 0) | priority;
+        item.* = .{ .fd = fd, .events = events, .revents = 0 };
+    }
+    @memset(readable, false);
+    @memset(writable, false);
+    const timeout: i32 = @intCast(@min(timeout_ms, 0x7fffffff));
+    if (is_windows) {
+        if (!has_socket) return error.InvalidSet;
+        if (win.WSAPoll(descriptors.ptr, @intCast(descriptors.len), timeout) == win.SOCKET_ERROR) {
+            if (win.WSAGetLastError() == 10004) return false;
+            return error.WaitFailed;
         }
-        @memset(readable, false);
-        @memset(writable, false);
-        const rc = linux.poll(&descriptors, clients.len + 1, @intCast(@min(timeout_ms, 0x7fffffff)));
+    } else if (builtin.os.tag == .linux) {
+        const rc = linux.poll(descriptors.ptr, descriptors.len, timeout);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => return false,
             else => return error.WaitFailed,
         }
-        for (readable, writable, 0..) |*r, *w, i| {
-            const events = descriptors[i + 1].revents;
-            r.* = events & (linux.POLL.IN | linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0;
-            w.* = events & linux.POLL.OUT != 0;
-        }
-        return descriptors[0].revents & linux.POLL.IN != 0;
-    } else if (builtin.os.tag == .macos) {
-        var descriptors: [max_clients + 1]darwin.pollfd = undefined;
-        descriptors[0] = .{ .fd = listener, .events = darwin.POLL.IN, .revents = 0 };
-        for (clients, readable, writable, 0..) |fd, wants_read, wants_write, i| {
-            descriptors[i + 1] = .{ .fd = fd, .events = @as(i16, if (wants_read) darwin.POLL.IN else 0) | @as(i16, if (wants_write) darwin.POLL.OUT else 0), .revents = 0 };
-        }
-        @memset(readable, false);
-        @memset(writable, false);
-        const rc = darwin.poll(&descriptors, @intCast(clients.len + 1), @intCast(@min(timeout_ms, 0x7fffffff)));
-        if (rc < 0) {
-            if (darwin.errno(rc) == .INTR) return false;
-            return error.WaitFailed;
-        }
-        for (readable, writable, 0..) |*r, *w, i| {
-            const events = descriptors[i + 1].revents;
-            r.* = events & (darwin.POLL.IN | darwin.POLL.ERR | darwin.POLL.HUP | darwin.POLL.NVAL) != 0;
-            w.* = events & darwin.POLL.OUT != 0;
-        }
-        return descriptors[0].revents & darwin.POLL.IN != 0;
-    } else return error.UnsupportedPlatform;
+    } else if (darwin.poll(descriptors.ptr, @intCast(descriptors.len), timeout) < 0) {
+        if (darwin.errno(@as(c_int, -1)) == .INTR) return false;
+        return error.WaitFailed;
+    }
+    for (readable, writable, descriptors[1..]) |*r, *w, descriptor| {
+        if (descriptor.fd == invalid_socket) continue;
+        r.* = descriptor.revents & (Poll.IN | Poll.ERR | Poll.HUP | Poll.NVAL | priority) != 0;
+        w.* = descriptor.revents & Poll.OUT != 0;
+    }
+    return listener != invalid_socket and descriptors[0].revents & Poll.IN != 0;
 }
 
 fn nonblocking(fd: Socket) Error!void {
