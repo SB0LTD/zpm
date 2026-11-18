@@ -17,20 +17,38 @@ records, including qualified relation identities and actual lookup under an
 empty search path. The pre-existing transaction and session contract also
 passed 510 assertions. Expression statistics, collection, planner application,
 stable attribute numbers across column drops, and nominal `regclass` wire
-output remain open. In a later combined Windows build, stock `pg_dump`
-passes the empty search path and recovery query, then stops at
-`extra_float_digits`. The unmodified native dump applies the opening
-timeouts, empty path, routine validation mode and XML mode. It next stops at
-`client_min_messages`. The routine differential exposed incorrect session
-ownership during interleaved COMMIT. The corrected Windows Store suite passed
-3,159 assertions, including `SET LOCAL` and `LISTEN` during interleaved
-COMMIT, and the stock routine-setting differential passed. Both timeout
-suites matched native PostgreSQL 18.3 with one and four workers.
-Extended-protocol autocommit still needs the native transaction boundary at Sync.
-[Populated describe and dump audit](https://github.com/SB0LTD/ramsql/actions/runs/44238734316) ·
-[Native idle timeout proof](https://github.com/SB0LTD/ramsql/actions/runs/44238347427) ·
-[Exact combined migration source](https://github.com/SB0LTD/ramsql/commit/a45febfbe08c6fa1214069edb62e4d6375fc215c) ·
-[COMMIT session fix](https://github.com/SB0LTD/zpm/pull/253)
+output remain open. The combined native build now passes float output,
+recovery status, transaction timeouts, routine-body checking, XML input,
+client notices, row security, default storage placement and synchronized
+scans on the covered cases. Forty live row-security observations matched
+PostgreSQL 18.3 at one and four workers. The unchanged native dump creates
+both tables and copies their rows before reaching its first late primary key.
+A scoped late-key candidate validates both existing and replayed rows and
+preserves its separate index OID in a versioned definition. It restricts the
+key addition to a standalone alteration of an ordinary single-column key.
+The combined stock restore is qualifying separately.
+
+Stock `pg_dump` passes the real `pg_settings` relation guard, starts its
+read-only transaction and reaches extension discovery. The next missing
+expression is the catalogs' `tableoid`. The native fixture capture recorded
+67 emitted SQL statements, including dependency, privilege, constraint and
+COPY queries. That capture describes the fixture's workflow and gives no
+all-catalog pass count. Whole-message preflight for simple-query batching
+passed 118 assertions in ZPM. Wire transaction and COPY continuation remain
+separate from that parser proof.
+
+The ordinary interleaved COMMIT ownership fix is merged in ZPM. A separate
+extended Sync candidate matches native commit, rollback, explicit-block,
+disconnect and durable reopen behavior in the live Linux and Windows
+fixtures at one and four workers. The full codec contract and extended COPY
+boundary are additional acceptance checks before merge.
+[Populated describe](https://github.com/SB0LTD/ramsql/actions/runs/44238734316) ·
+[Native row-security and restore](https://github.com/SB0LTD/ramsql/actions/runs/44246856923) ·
+[Latest stock export](https://github.com/SB0LTD/ramsql/actions/runs/44251368662) ·
+[Late primary-index replay](https://github.com/SB0LTD/zpm/actions/runs/44252615860) ·
+[Simple-query preflight](https://github.com/SB0LTD/zpm/actions/runs/44251110539) ·
+[COMMIT ownership fix](https://github.com/SB0LTD/zpm/pull/253) ·
+[Extended Sync](https://github.com/SB0LTD/ramsql/actions/runs/44248130314)
 
 The draft versioned WAL assigns durable table-constraint identities while
 replaying the older definition formats. Checkpoint generation images must
