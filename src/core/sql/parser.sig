@@ -1183,10 +1183,10 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
                 }
-                if (self.rawWord("xml") and (try self.peek()).isWord("OPTION")) {
+                if (self.rawWord("xml") and wordIs(self.source, try self.peek(), "option")) {
                     try self.advance();
                     try self.advance();
-                    if (!self.isWord("DOCUMENT") and !self.isWord("CONTENT")) return error.Syntax;
+                    if (!self.rawWord("document") and !self.rawWord("content")) return error.Syntax;
                     const value = try self.settingValue();
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .xml_option }, .value = value } };
