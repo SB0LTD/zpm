@@ -852,11 +852,12 @@ pub fn Database(comptime config: Config) type {
             return false;
         }
 
-        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement, role: u32, public_schema_on_path: bool) Error![]const u8 {
+        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement, role: u32, session: *const value_module.Session) Error![]const u8 {
             // Privileges and row security apply to roles other than superusers (B11 wave 3).
             const privileged = role == CO.bootstrap_role or db.catalog_objects.superuser(role, snap);
             const tables = &db.tables;
             const catalog = &db.catalog;
+            const public_schema_on_path = session.public_schema_on_path;
             workspace.expanded_count = 0;
             const pool = &workspace.nodes;
             var length: usize = 0;
@@ -895,7 +896,7 @@ pub fn Database(comptime config: Config) type {
                     const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
                     // Items the statement names (not view or expansion texts).
                     if (!privileged and item.name.span.start < source.len) {
-                        const secured = try secureItem(db, workspace, &length, source, role, found, snap);
+                        const secured = try secureItem(db, workspace, &length, source, role, session.row_security, found, snap);
                         if (secured != ast.none) {
                             item.query = secured;
                             item.view = true;
@@ -1080,7 +1081,7 @@ pub fn Database(comptime config: Config) type {
                 self.session.sequences=null;
                 var parsed=try P.parseWithOptions(source,&self.workspace.nodes,.{.dialect=self.dialect});
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
-                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role,self.session.public_schema_on_path);
+                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role,&self.session);
                 try self.session.checkpoint();
                 for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
@@ -2582,7 +2583,7 @@ pub fn Database(comptime config: Config) type {
                 return self.catalogObject(slot, original, &parsed.catalog_object, snap);
             }
             var statement_copy = parsed.*;
-            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, self.session.public_schema_on_path);
+            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
             const source = try self.secureTarget(&statement_copy, expanded, original, snap);
             var context = self.bindContext(source, mode, snap);
             context.stored_source_start = original.len;
@@ -4434,7 +4435,7 @@ pub fn Database(comptime config: Config) type {
             const found = self.catalog.findIn(namespace, identName(source, goal.table).slice(), snap) orelse return source;
             if (found.kind != 'r' and found.kind != 'p') return source;
             const table = &self.tables[found.slot];
-            if (!self.catalog_objects.rowSecurity(role, table.oid, snap)) return source;
+            if (!try self.checkRowSecurity(role, table.oid, self.session.row_security, snap)) return source;
             if (table.relkind == 'p' or self.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
             var length: usize = 0;
             try self.securedSource(source, original, &length);
@@ -4462,7 +4463,7 @@ pub fn Database(comptime config: Config) type {
                 .insert => |*insert| .{ .table = insert.table, .command = .insert },
                 .update => |*update| .{ .table = update.table, .command = .update },
                 .merge => |*merge| {
-                    if (self.catalog_objects.rowSecurity(role, self.tables[merge.table].oid, snap)) return error.UnsupportedStatement;
+                    if (try self.checkRowSecurity(role, self.tables[merge.table].oid, self.session.row_security, snap)) return error.UnsupportedStatement;
                     return;
                 },
                 .query => {
@@ -4473,14 +4474,14 @@ pub fn Database(comptime config: Config) type {
                             .update => |*update| update.table,
                             .delete => |*delete| delete.table,
                         };
-                        if (self.catalog_objects.rowSecurity(role, self.tables[table_slot].oid, snap)) return error.UnsupportedStatement;
+                        if (try self.checkRowSecurity(role, self.tables[table_slot].oid, self.session.row_security, snap)) return error.UnsupportedStatement;
                     }
                     return;
                 },
                 else => return,
             };
             const oid = self.tables[goal.table].oid;
-            if (!self.catalog_objects.rowSecurity(role, oid, snap)) return;
+            if (!try self.checkRowSecurity(role, oid, self.session.row_security, snap)) return;
             if (bound.* == .insert and bound.insert.conflict.action != .none) return error.UnsupportedStatement;
             var length: usize = 0;
             try self.securedSource(source, source, &length);
@@ -4506,16 +4507,25 @@ pub fn Database(comptime config: Config) type {
             if (verdict != .boolean or !verdict.boolean) return error.InsufficientPrivilege;
         }
 
+        /// With row_security disabled, access requiring any policy errors,
+        /// including the default-deny case. Owners and bypass roles still
+        /// use the ordinary catalog eligibility check.
+        fn checkRowSecurity(self: *const Self, role: u32, table: u32, enabled: bool, snap: Snapshot) Error!bool {
+            const applies = self.catalog_objects.rowSecurity(role, table, snap);
+            if (applies and !enabled) return error.InsufficientPrivilege;
+            return applies;
+        }
+
         /// SELECT privilege and row security of one FROM item the statement
         /// names (not one a view or an expansion introduced: those run with
         /// the view owner's rights, the bootstrap superuser). Returns the
         /// derived query replacing it under row security, or none.
-        fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, found: K.Found, snap: Snapshot) Error!u16 {
+        fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, row_security: bool, found: K.Found, snap: Snapshot) Error!u16 {
             if (found.kind == 'S') return error.InsufficientPrivilege;
             const table = &db.tables[found.slot];
             if (!db.catalog_objects.tablePrivileges(role, table.oid, CO.priv_select, snap)) return error.InsufficientPrivilege;
             if (table.relkind != 'r' and table.relkind != 'p') return ast.none;
-            if (!db.catalog_objects.rowSecurity(role, table.oid, snap)) return ast.none;
+            if (!try db.checkRowSecurity(role, table.oid, row_security, snap)) return ast.none;
             if (table.relkind == 'p' or db.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
             if (length.* == 0) {
                 if (source.len > workspace.expansion.len) return error.TextCapacity;
@@ -7679,7 +7689,7 @@ pub fn Database(comptime config: Config) type {
             if (!self.privilegedRole(snap)) {
                 try self.needTable(bound.table, CO.priv_insert, snap);
                 // COPY FROM is not supported with row-level security (0A000).
-                if (self.catalog_objects.rowSecurity(self.session.role, self.tables[bound.table].oid, snap)) return error.UnsupportedStatement;
+                if (try self.checkRowSecurity(self.session.role, self.tables[bound.table].oid, self.session.row_security, snap)) return error.UnsupportedStatement;
             }
             var info: CopyInfo = .{ .direction = .from, .options = try copyOptions(&copy), .count = bound.count };
             const table = &self.tables[bound.table];
@@ -8330,7 +8340,7 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, check_function_bodies, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
+        const SettingKind = enum { search_path, check_function_bodies, row_security, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
 
         fn settingKind(name: []const u8) ?SettingKind {
             inline for (@typeInfo(SettingKind).@"enum".field_names) |field| {
@@ -8461,6 +8471,7 @@ pub fn Database(comptime config: Config) type {
             switch (which) {
                 .search_path => try searchPath(value, kind, &into.search_path),
                 .check_function_bodies => into.check_function_bodies = parseBool(value) orelse return error.InvalidSettingValue,
+                .row_security => into.row_security = parseBool(value) orelse return error.InvalidSettingValue,
                 .default_transaction_isolation => into.isolation = parseLevel(value) orelse return error.InvalidSettingValue,
                 .default_transaction_read_only => into.read_only = parseBool(value) orelse return error.InvalidSettingValue,
                 .default_transaction_deferrable => into.deferrable = parseBool(value) orelse return error.InvalidSettingValue,
@@ -8486,6 +8497,7 @@ pub fn Database(comptime config: Config) type {
             switch (which) {
                 .search_path => into.search_path = source.search_path,
                 .check_function_bodies => into.check_function_bodies = source.check_function_bodies,
+                .row_security => into.row_security = source.row_security,
                 .default_transaction_isolation => into.isolation = source.isolation,
                 .default_transaction_read_only => into.read_only = source.read_only,
                 .default_transaction_deferrable => into.deferrable = source.deferrable,
@@ -8602,6 +8614,7 @@ pub fn Database(comptime config: Config) type {
             self.session.session_role = state.session_role;
             self.session.role = if (state.values.role != 0) state.values.role else state.session_role;
             self.session.public_schema_on_path = state.values.publicSchemaOnPath();
+            self.session.row_security = state.values.row_security;
         }
 
         /// RESET ALL of the engine settings (transaction modes excepted).
@@ -8625,6 +8638,7 @@ pub fn Database(comptime config: Config) type {
             const text: []const u8 = switch (which) {
                 .search_path => state.values.search_path.slice(),
                 .check_function_bodies => onOff(state.values.check_function_bodies),
+                .row_security => onOff(state.values.row_security),
                 .default_transaction_isolation => levelName(state.values.isolation),
                 .default_transaction_read_only => onOff(state.values.read_only),
                 .default_transaction_deferrable => onOff(state.values.deferrable),
@@ -8686,7 +8700,10 @@ pub fn Database(comptime config: Config) type {
         /// Engine settings safe to configure before a connection authenticates.
         pub fn sessionStartupSetting(self: *Self, name: []const u8, value: []const u8) Error!bool {
             const setting = settingKind(name) orelse return false;
-            if (setting != .check_function_bodies) return false;
+            switch (setting) {
+                .check_function_bodies, .row_security => {},
+                else => return false,
+            }
             try self.setSetting(null, false, name, .string, value);
             const state = self.sessionState();
             state.startup = state.values;
@@ -9076,7 +9093,7 @@ pub fn Database(comptime config: Config) type {
             defer self.active_params = null;
             var copy = inner;
             // Parse analysis checks no privileges (EXECUTE does).
-            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy, CO.bootstrap_role, self.session.public_schema_on_path);
+            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy, CO.bootstrap_role, &self.session);
             var context = self.bindContext(expanded, mode, snap);
             context.stored_source_start = text.len;
             context.describe_only = true;
@@ -9352,7 +9369,7 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
             // Routine statements run with the invoker's privileges (SECURITY INVOKER).
-            const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role, self.session.public_schema_on_path);
+            const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role, &self.session);
             var context = self.bindContext(source, .standard, snap);
             context.stored_source_start = text.len;
             const bound = try B.bind(&context, parsed);
@@ -9369,6 +9386,7 @@ pub fn Database(comptime config: Config) type {
                 self.workspace.query.pinned_refs = 0;
             }
             if (plans.dml_len != 0) {
+                try self.secureNewRows(&bound, source, snap);
                 try self.modifyingCtes(slot, source, snap);
                 try self.afterTriggers(slot, self.statement_start, null, snap);
             }
@@ -9620,7 +9638,7 @@ pub fn Database(comptime config: Config) type {
                 frame.variables.node_high = self.workspace.nodes.len;
                 self.routine_frame = frame;
                 // Body analysis checks no privileges (calls do).
-                const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role, self.session.public_schema_on_path);
+                const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role, &self.session);
                 var context = self.bindContext(source, .standard, snap);
                 context.stored_source_start = text.len;
                 const bound = try B.bind(&context, &parsed);
@@ -10634,7 +10652,7 @@ pub fn Database(comptime config: Config) type {
             }
             var statement_copy = parsed;
             // Describing checks no privileges (execution does), as parse analysis.
-            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role, self.session.public_schema_on_path);
+            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role, &self.session);
             var context = self.bindContext(expanded, .standard, snap);
             context.stored_source_start = source.len;
             context.describe_only=true;

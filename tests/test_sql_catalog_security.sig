@@ -1109,6 +1109,61 @@ fn relationDiscovery() !void {
     try sameState();
 }
 
+fn rowSecuritySetting() !void {
+    try reset();
+    try run("CREATE ROLE rls_reader");
+    try run("CREATE ROLE rls_bypass BYPASSRLS");
+    try run("GRANT SELECT, INSERT, UPDATE, DELETE ON tdd_a TO rls_reader, rls_bypass");
+    try run("GRANT SELECT ON tdd_b TO rls_reader");
+    try run("ALTER TABLE tdd_a ENABLE ROW LEVEL SECURITY");
+    try expect("SHOW row_security", "on");
+    try run("SET row_security = off");
+    try expect("SELECT current_setting('row_security')", "off");
+    try expect("SELECT COUNT(*) FROM tdd_a", "4");
+    try as("rls_bypass");
+    try expect("SELECT COUNT(*) FROM tdd_a", "4");
+    try as("rls_reader");
+    try expect("SELECT COUNT(*) FROM tdd_b", "3");
+    try fails("SELECT id FROM tdd_a WHERE false", error.InsufficientPrivilege);
+    try fails("SELECT a.id FROM tdd_b b JOIN tdd_a a ON a.id=b.id", error.InsufficientPrivilege);
+    try fails("INSERT INTO tdd_a VALUES (9, 9, 9)", error.InsufficientPrivilege);
+    try fails("UPDATE tdd_a SET v=0 WHERE false", error.InsufficientPrivilege);
+    try fails("DELETE FROM tdd_a WHERE false", error.InsufficientPrivilege);
+    try fails("WITH changed AS (DELETE FROM tdd_a RETURNING id) SELECT * FROM changed", error.InsufficientPrivilege);
+    const copy_tx = try db.begin();
+    if (db.copyBegin(copy_tx, "COPY tdd_a FROM STDIN", false)) |_| {
+        return error.InvalidStatementAccepted;
+    } else |err| try check(err == error.InsufficientPrivilege);
+    db.abort(copy_tx);
+    try run("RESET row_security");
+    try expect("SELECT COUNT(*) FROM tdd_a", "0");
+
+    try as("ramsql");
+    try run("CREATE POLICY visible_ids ON tdd_a USING (id > 1)");
+    try run("ALTER TABLE tdd_a OWNER TO rls_reader");
+    try as("rls_reader");
+    try run("SET row_security = off");
+    try expect("SELECT COUNT(*) FROM tdd_a", "4");
+    try run("ALTER TABLE tdd_a FORCE ROW LEVEL SECURITY");
+    try fails("SELECT COUNT(*) FROM tdd_a", error.InsufficientPrivilege);
+    try expect("SELECT set_config('row_security','on',false)", "on");
+    try expect("SELECT id FROM tdd_a ORDER BY id", "2;3;4");
+    try run("SET row_security = off");
+    const local = try db.begin();
+    try statement(local, "SET LOCAL row_security = on");
+    try same(try rows(local, "SELECT COUNT(*) FROM tdd_a"), "3");
+    try commit(local);
+    try expect("SHOW row_security", "off");
+    try fails("SELECT COUNT(*) FROM tdd_a", error.InsufficientPrivilege);
+    try fails("SET row_security = bogus", error.InvalidSettingValue);
+    try expect("SHOW row_security", "off");
+    try run("RESET row_security");
+    try expect("SHOW row_security", "on");
+    try expect("SELECT COUNT(*) FROM tdd_a", "3");
+    try as("ramsql");
+    try sameState();
+}
+
 pub fn main() !void {
     try oraclePrograms();
     try namespacesAndExtensions();
@@ -1117,6 +1172,7 @@ pub fn main() !void {
     try privileges();
     try relationDiscovery();
     try rowSecurity();
+    try rowSecuritySetting();
     try foreignAndPublications();
     try changeRecords();
     try capacities();

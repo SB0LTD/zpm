@@ -855,6 +855,9 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "public_schema_on_path")) {
                     session.public_schema_on_path = self.engine_session.values.publicSchemaOnPath();
                 }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "row_security")) {
+                    session.row_security = self.engine_session.values.row_security;
+                }
                 return session;
             }
 
