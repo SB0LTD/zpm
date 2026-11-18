@@ -17,6 +17,68 @@ const Replay = struct {
         self.sequence = sequence;
     }
 };
+
+fn expectWriterBusy(lock: *disk.WriterLock, path: []const u8) !void {
+    if (lock.acquire(path)) |_| return error.ConcurrentWriterAccepted else |err| try check(err == error.DataDirectoryBusy);
+}
+
+fn testWriterLock(pid: u32, first_generation: []const u8, manifest: []const u8, temporary: []const u8) !void {
+    var lock_buffer: [256]u8 = undefined;
+    const lock_path = try std.fmt.bufPrint(&lock_buffer, "sig-out/db-file-contract-{d}.writer-lock", .{pid});
+    var generation_buffer: [256]u8 = undefined;
+    const second_generation = try std.fmt.bufPrint(&generation_buffer, "sig-out/db-file-contract-{d}.wal.2", .{pid});
+
+    var seed = try disk.File.createExclusive(lock_path);
+    defer disk.remove(lock_path) catch {};
+    seed.close();
+    var owner: disk.WriterLock = .{};
+    defer owner.close();
+    var contender: disk.WriterLock = .{};
+    defer contender.close();
+    if (owner.acquire("")) |_| return error.EmptyLockPathAccepted else |err| try check(err == error.InvalidPath);
+    try owner.acquire(lock_path);
+    try expectWriterBusy(&owner, second_generation);
+    try expectWriterBusy(&contender, lock_path);
+
+    var old = try disk.File.openExisting(first_generation);
+    old.close();
+    try expectWriterBusy(&contender, lock_path);
+
+    var next = try disk.File.createExclusive(second_generation);
+    defer disk.remove(second_generation) catch {};
+    defer next.close();
+    try log.append(&next, 1, "durable transaction");
+    next.close();
+    var pointer = try disk.File.createExclusive(temporary);
+    defer disk.remove(temporary) catch {};
+    defer pointer.close();
+    try pointer.appendAll(second_generation);
+    try pointer.sync();
+    pointer.close();
+    try disk.replaceAtomic(temporary, manifest);
+    try expectWriterBusy(&contender, lock_path);
+
+    var scratch: [128]u8 = undefined;
+    pointer = try disk.File.openReadOnly(manifest);
+    const selected = try pointer.readAt(0, &scratch);
+    try check(std.mem.eql(u8, scratch[0..selected], second_generation));
+    pointer.close();
+    next = try disk.File.openExisting(scratch[0..selected]);
+    var replay: Replay = .{};
+    const recovered = try log.recover(&next, &scratch, &replay, Replay.apply);
+    try check(recovered.sequence == 1 and !recovered.truncated_tail);
+    try expectWriterBusy(&contender, lock_path);
+    next.close();
+    owner.close();
+    seed = try disk.File.openExisting(lock_path);
+    seed.close();
+    try contender.acquire(lock_path);
+    try expectWriterBusy(&owner, lock_path);
+    contender.close();
+    owner.close();
+    try owner.acquire(lock_path);
+}
+
 pub fn main(init: std.process.Init) !void {
     const pid: u32 = if (builtin.os.tag == .windows) Win.GetCurrentProcessId() else if (builtin.os.tag == .macos) @intCast(std.c.getpid()) else @intCast(std.os.linux.getpid());
     var path_buffer: [256]u8 = undefined;
@@ -187,6 +249,10 @@ pub fn main(init: std.process.Init) !void {
     if (invalid_file.sync()) |_| return error.InvalidNativeSyncAccepted else |err| try check(err == error.WriterPoisoned);
     invalid_file = .{};
     if (invalid_file.sync()) |_| return error.InvalidNativeFlushAccepted else |_| try check(invalid_file.poisoned);
+    snapshot.close();
+    file.close();
+    open = false;
+    try testWriterLock(pid, path, snapshot_path, temporary_path);
     var report_buf: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&report_buf, "{{\"suite\":\"db_file\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
