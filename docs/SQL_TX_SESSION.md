@@ -24,6 +24,15 @@ repair are in progress and clears it after successful completion. RAMSQL
 opens its PostgreSQL listener after this phase, so admitted connections see
 the primary state even inside read-only transactions.
 
+The PostgreSQL `extra_float_digits` session setting defaults to `1` and accepts
+values from `-15` through `3`. Positive values use shortest round-trip text.
+Zero and negative values reduce the precision from six significant digits for
+`real` and fifteen for `double precision`, with a minimum of one digit.
+Formatting rounds the original binary value once. The setting applies to text
+output for scalar floats, float arrays, points, boxes, and their text casts.
+Binary results keep their original representation. The setting follows the
+store's SET, SET LOCAL and RESET transaction rules.
+
 - Transaction modes live in the transaction (mvcc.sig `Tx`): isolation,
   READ ONLY, DEFERRABLE, the transaction snapshot and the SERIALIZABLE
   record. `begin()` copies the session's default_transaction_* settings.

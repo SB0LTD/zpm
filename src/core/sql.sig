@@ -8349,7 +8349,7 @@ pub fn Database(comptime config: Config) type {
 
         /// Settings PostgreSQL has that the caller (Store) implements.
         fn callerSetting(name: []const u8) bool {
-            for ([_][]const u8{ "timezone", "datestyle", "intervalstyle", "xmloption", "application_name", "client_encoding", "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "transaction_timeout", "deadlock_timeout", "standard_conforming_strings", "server_version", "server_encoding", "integer_datetimes" }) |known| {
+            for ([_][]const u8{ "timezone", "datestyle", "intervalstyle", "xmloption", "application_name", "client_encoding", "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "transaction_timeout", "deadlock_timeout", "standard_conforming_strings", "server_version", "server_encoding", "integer_datetimes", "extra_float_digits" }) |known| {
                 if (Sess.sameInsensitive(name, known)) return true;
             }
             return false;
@@ -10494,11 +10494,22 @@ pub fn Database(comptime config: Config) type {
             }
             switch (value.kind) {
                 .default => out.len = 0,
-                .word, .number => {
+                .word => {
                     const raw = value.span.slice(source);
                     if (raw.len > out.bytes.len) return error.InvalidSettingValue;
                     out.len = raw.len;
                     @memcpy(out.bytes[0..raw.len], raw);
+                },
+                .number => {
+                    var raw = value.span.slice(source);
+                    if (value.integer) {
+                        while (raw.len > 1 and raw[0] == '0' and types.digit(raw[1])) raw = raw[1..];
+                    }
+                    const prefix: usize = @intFromBool(value.number_sign != 0);
+                    if (raw.len + prefix > out.bytes.len) return error.InvalidSettingValue;
+                    if (prefix != 0) out.bytes[0] = value.number_sign;
+                    @memcpy(out.bytes[prefix..][0..raw.len], raw);
+                    out.len = raw.len + prefix;
                 },
                 .string => {
                     if (value.quoted.len > out.bytes.len) return error.InvalidSettingValue;
