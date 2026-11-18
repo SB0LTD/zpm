@@ -557,6 +557,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     if(frame.limit!=0) return null; // suspended portals retain their owner
                     const portal_value=frame.portal;
                     if(portal_value.complete) return .metadata;
+                    if (comptime @hasDecl(DB, "finishExtended")) {
+                        // A detached read can finish without opening a store
+                        // transaction only once its Sync boundary is known.
+                        const following = input[@as(usize, size) + 1..];
+                        if (following.len < 5 or following[0] != 'S' or read32(following[1..5]) != 4) return null;
+                    }
                     return .{.execute=portal_value.source()};
                 },
                 else=>return null,
@@ -1032,6 +1038,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 'S' => {
                     try r.done();
                     self.failed = false;
+                    if (comptime @hasDecl(DB, "finishExtended")) db.finishExtended() catch |err| {
+                        if (@as(anyerror, err) == error.TransactionTimeout) return err;
+                        try failure(w, sqlstate(err), @errorName(err));
+                    };
                     if (!@hasDecl(DB, "transactionStatus") or db.transactionStatus() == 'I') {
                         for (&self.portals) |*p| p.live = false;
                         self.active_portal = null;
@@ -1058,10 +1068,14 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     }
                 }
             };
-            return self.execute(db, portal_value.source());
+            return self.executeMode(db, portal_value.source(), true);
         }
 
         fn execute(self: *Self, db: *DB, source: []const u8) !void {
+            return self.executeMode(db, source, false);
+        }
+
+        fn executeMode(self: *Self, db: *DB, source: []const u8, extended: bool) !void {
             self.result.column_count = 0;
             self.result.row_count = 0;
             self.result.affected_rows = 0;
@@ -1093,7 +1107,9 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 };
                 if (forward and @hasDecl(DB, "takeNotification")) try db.execute(source, &self.result);
             } else {
-                try db.execute(source, &self.result);
+                if (extended and @hasDecl(DB, "executeExtended")) {
+                    try db.executeExtended(source, &self.result);
+                } else try db.execute(source, &self.result);
                 // ROLLBACK TO closes portals created after the savepoint.
                 if (@hasDecl(DB, "takeRollbackTo")) if (db.takeRollbackTo()) |depth| {
                     for (&self.portals, 0..) |*p, index| {
