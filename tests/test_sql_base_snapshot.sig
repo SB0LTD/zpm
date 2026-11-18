@@ -91,7 +91,7 @@ fn exercise(integral: bool) !void {
     live.abort(active);
     try check(image.used == 0);
     try DB.BaseSnapshot.write(&live, &image, &scratch);
-    try check(image.used > scratch.len);
+    try check(image.used > scratch.len and std.mem.eql(u8, image.bytes[0..8], "RSBASE01"));
     if (DB.BaseSnapshot.restore(&restored, &image, csn + 1, &scratch, &replay)) |_| return error.WrongCsnAccepted else |err| try check(err == error.InvalidSnapshotImage);
     try check(restored.csn == 0 and restored.tableCount() == 0);
     var wrong_bank = image;
@@ -136,9 +136,129 @@ fn exercise(integral: bool) !void {
     if (DB.BaseSnapshot.restore(&restored, &truncated, csn, &scratch, &replay)) |_| return error.TruncatedImageAccepted else |err| try check(err == error.InvalidSnapshotImage);
 }
 
+fn takePart(image: *const Image, offset: *usize, tag: u8) ![]const u8 {
+    const part = image.bytes[offset.*..][0..5];
+    if (part[0] != tag) return error.UnexpectedFixturePart;
+    const len = std.mem.readInt(u32, part[1..5], .little);
+    offset.* += part.len;
+    const record = image.bytes[offset.*..][0..len];
+    offset.* += len;
+    return record;
+}
+
+fn exerciseMultiple() !void {
+    try reset(&live, 0);
+    try reset(&restored, 1);
+    try live.execute("CREATE TABLE old (id INT)", &result);
+    try live.execute("DROP TABLE old", &result);
+    try live.execute("CREATE TABLE amounts (id INT PRIMARY KEY, value BIGINT)", &result);
+    try live.execute("CREATE TABLE mirror (id INT PRIMARY KEY, value BIGINT)", &result);
+    try live.execute("CREATE TABLE tiny (id SMALLINT PRIMARY KEY)", &result);
+    try live.execute("INSERT INTO amounts VALUES (8,8),(9,9),(10,100),(30,NULL)", &result);
+    try live.execute("DELETE FROM amounts WHERE id < 10", &result);
+    try live.execute("INSERT INTO mirror VALUES (1,11),(2,22)", &result);
+    try live.execute("INSERT INTO tiny VALUES (5)", &result);
+    try live.execute("DELETE FROM tiny", &result);
+    try check(live.tables[0].integral_rows.len != 0 and live.tables[1].integral_rows.len == 0 and live.tables[2].integral_rows.len != 0);
+    const csn = live.csn;
+    var scratch: [96]u8 = undefined;
+    var image: Image = .{};
+    try DB.BaseSnapshot.write(&live, &image, &scratch);
+    try check(std.mem.eql(u8, image.bytes[0..8], "RSBASE02"));
+    try check(std.mem.readInt(u32, image.bytes[16..20], .little) == 3);
+
+    var offset: usize = 24;
+    var second_header: usize = undefined;
+    var second_insert: usize = undefined;
+    for (0..3) |bank| {
+        if (bank == 1) second_header = offset;
+        try check(std.mem.readInt(u32, image.bytes[offset..][0..4], .little) == bank);
+        var rows = std.mem.readInt(u32, image.bytes[offset + 4 ..][0..4], .little);
+        try check(rows == if (bank == 2) @as(u32, 0) else 2);
+        offset += 8;
+        _ = try takePart(&image, &offset, 1);
+        if (bank == 1) second_insert = offset + 5;
+        while (rows != 0) {
+            const record = try takePart(&image, &offset, 3);
+            const count = std.mem.readInt(u32, record[4..8], .little);
+            if (count == 0 or count > rows) return error.UnexpectedFixturePart;
+            rows -= count;
+        }
+    }
+    const counter_record = offset + 5;
+    _ = try takePart(&image, &offset, 6);
+    try check(offset == image.used and image.bytes[counter_record + 13] == 3);
+
+    var bad = image;
+    bad.bytes[20] = 1;
+    if (DB.BaseSnapshot.restore(&restored, &bad, csn, &scratch, &replay)) |_| return error.ReservedHeaderAccepted else |err| try check(err == error.InvalidSnapshotImage);
+    try check(restored.csn == 0);
+
+    bad = image;
+    bad.bytes[second_header] = 0;
+    if (DB.BaseSnapshot.restore(&restored, &bad, csn, &scratch, &replay)) |_| return error.DuplicateBankAccepted else |err| try check(err == error.InvalidSnapshotImage);
+    try reset(&restored, 1);
+
+    bad = image;
+    // Both tables accept the encoded row and its RowID is free in amounts.
+    // Changing the first mirror row's OID still breaks section ownership.
+    std.mem.writeInt(u32, bad.bytes[second_insert + 9 ..][0..4], live.tables[0].oid, .little);
+    if (DB.BaseSnapshot.restore(&restored, &bad, csn, &scratch, &replay)) |_| return error.CrossTableRowAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try reset(&restored, 1);
+
+    bad = image;
+    std.mem.writeInt(u32, bad.bytes[counter_record + 26 ..][0..4], live.tables[0].oid, .little);
+    if (DB.BaseSnapshot.restore(&restored, &bad, csn, &scratch, &replay)) |_| return error.DuplicateCounterAccepted else |err| try check(err == error.InvalidChangeRecord);
+    try reset(&restored, 1);
+
+    bad = image;
+    bad.used = second_header + 4;
+    if (DB.BaseSnapshot.restore(&restored, &bad, csn, &scratch, &replay)) |_| return error.TruncatedTableHeaderAccepted else |err| try check(err == error.InvalidSnapshotImage);
+    try reset(&restored, 1);
+
+    try DB.BaseSnapshot.restore(&restored, &image, csn, &scratch, &replay);
+    try check(restored.tableCount() == 3 and restored.csn == csn and restored.oid_counter == live.oid_counter);
+    for (&live.tables, &restored.tables, 0..) |*source, *target, bank| {
+        try check(target.oid == source.oid and target.next_rowid == source.next_rowid);
+        try check((target.integral_rows.len != 0) == (bank != 1));
+        try check(target.summary.rows == source.summary.rows and target.version_used == target.row_used);
+    }
+    try check(restored.tables[2].next_rowid == 2 and restored.tables[2].row_used == 0);
+    try restored.execute("SELECT id,value FROM amounts ORDER BY id", &result);
+    try check(result.row_count == 2 and result.rows[0].cells[0].integer == 10 and result.rows[1].cells[1] == .null_value);
+    try restored.execute("SELECT id,value FROM mirror ORDER BY id", &result);
+    try check(result.row_count == 2 and result.rows[0].cells[1].integer == 11 and result.rows[1].cells[1].integer == 22);
+
+    var record: [2048]u8 = undefined;
+    const slot = try live.begin();
+    try live.statement(slot, "UPDATE amounts SET value=101 WHERE id=10", &result, .{});
+    try live.statement(slot, "DELETE FROM mirror WHERE id=1", &result, .{});
+    try live.statement(slot, "INSERT INTO mirror VALUES (3,NULL)", &result, .{});
+    try live.statement(slot, "INSERT INTO tiny VALUES (7)", &result, .{});
+    const changes = try live.prepareCommit(slot, &record);
+    live.publishCommit(slot);
+    try restored.applyChangeRecord(changes, &replay);
+    try check(restored.csn == live.csn);
+    for ([_]*DB{ &live, &restored }) |db| {
+        try db.execute("SELECT value FROM amounts WHERE id=10", &result);
+        try check(result.row_count == 1 and result.rows[0].cells[0].integer == 101);
+        try db.execute("SELECT id,value FROM mirror ORDER BY id", &result);
+        try check(result.row_count == 2 and result.rows[0].cells[0].integer == 2 and result.rows[1].cells[1] == .null_value);
+        try db.execute("SELECT id FROM tiny", &result);
+        try check(result.row_count == 1 and result.rows[0].cells[0].integer == 7 and db.tables[2].next_rowid == 3);
+    }
+
+    // A vacant earlier compatible bank would shift mirror during recovery.
+    try live.execute("DROP TABLE amounts", &result);
+    image.used = 0;
+    if (DB.BaseSnapshot.write(&live, &image, &scratch)) |_| return error.UnstablePlacementAccepted else |err| try check(err == error.SnapshotUnsupportedState);
+    try check(image.used == 0);
+}
+
 pub fn main() !void {
     try exercise(true);
     try exercise(false);
+    try exerciseMultiple();
     try live.execute("CREATE ROLE image_reader", &result);
     var image: Image = .{};
     var scratch: [96]u8 = undefined;
