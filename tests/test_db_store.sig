@@ -949,6 +949,8 @@ fn clientNotices() !void {
     try connection.execute("SET client_min_messages = 'error'", &out);
     try connection.execute("ROLLBACK", &out);
     try check(connection.takeNotice() == null);
+    try connection.execute("SHOW client_min_messages", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "error"));
     try connection.execute("RESET client_min_messages", &out);
     try connection.execute("SET LOCAL check_function_bodies = off", &out);
     try check(connection.takeNotice() != null);
