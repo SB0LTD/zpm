@@ -1767,8 +1767,8 @@ pub fn Database(comptime config: Config) type {
         /// The startup owner holds exclusive access across replay, including
         /// validation and durable-log repair. A failed replay remains active
         /// until startup is abandoned or a subsequent attempt completes.
-        pub fn setStartupRecovery(self: *Self, active: bool) void {
-            self.startup_recovery_active = active;
+        pub fn setStartupRecovery(self: *Self, recovering: bool) void {
+            self.startup_recovery_active = recovering;
         }
 
         pub fn startupRecoveryActive(self: *const Self) bool {
