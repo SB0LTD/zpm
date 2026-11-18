@@ -606,6 +606,21 @@ pub const fd_set = extern struct {
     fd_array: [64]SOCKET = @as([64]SOCKET, @splat(0)),
 };
 
+pub const WSAPOLLFD = extern struct {
+    fd: SOCKET,
+    events: i16,
+    revents: i16,
+};
+
+pub const SOCKET_POLL = struct {
+    pub const IN: i16 = 0x0100;
+    pub const RDBAND: i16 = 0x0200;
+    pub const OUT: i16 = 0x0010;
+    pub const ERR: i16 = 0x0001;
+    pub const HUP: i16 = 0x0002;
+    pub const NVAL: i16 = 0x0004;
+};
+
 pub const timeval = extern struct {
     tv_sec: c_long = 0,
     tv_usec: c_long = 0,
@@ -640,6 +655,7 @@ pub extern "ws2_32" fn setsockopt(SOCKET, c_int, c_int, *const anyopaque, c_int)
 pub extern "ws2_32" fn getsockopt(SOCKET, c_int, c_int, *anyopaque, *c_int) callconv(.c) c_int;
 pub extern "ws2_32" fn ioctlsocket(SOCKET, c_long, *c_ulong) callconv(.c) c_int;
 pub extern "ws2_32" fn select(c_int, ?*fd_set, ?*fd_set, ?*fd_set, ?*const timeval) callconv(.c) c_int;
+pub extern "ws2_32" fn WSAPoll([*]WSAPOLLFD, c_ulong, c_int) callconv(.c) c_int;
 pub extern "ws2_32" fn WSAGetLastError() callconv(.c) c_int;
 
 // UDP-specific constants and externs (QUIC transport)

@@ -76,7 +76,20 @@ same relation. A scan visits each physical slot once under its own snapshot,
 wrapping around the end. `off` starts at slot zero and leaves the shared
 position alone. `Config.synchronized_scan_rows` is the minimum span to consider
 for cache locality. Ordered queries, joins, aggregates, sampling and locking retain their
-existing paths. The shared result cache skips plans whose output can rotate.
+existing paths. The aggregate cache skips plans whose output can rotate. The
+optional projection cache can serve an already materialized unordered result
+with synchronization on. With synchronization off, projected filters scan
+from physical slot zero on each read.
+
+`PostgresStatements` iterates nonempty command spans in a PostgreSQL Query
+message. It keeps quoted text, nested comments and SQL routine bodies intact.
+`Database.preflightPostgresBatch` checks boundaries and the supported raw
+grammar for the entire message before execution. Catalog resolution and
+execution errors are checked when each command runs. RAMSQL rejects a whole
+batch containing raw syntax outside its supported grammar before running the
+first command. A syntax error in a later recognized command takes precedence.
+This restricts batches that PostgreSQL can parse with commands outside the
+RAMSQL SQL subset.
 
 ## Errors (SQLSTATE)
 
