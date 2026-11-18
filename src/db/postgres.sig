@@ -613,7 +613,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     }
                     w.at = 0;
                     try writeNotice(db, &w);
-                    try failure(&w, sqlstate(err), @errorName(err));
+                    try failure(&w, sqlstate(err), diagnosticMessage(err));
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
                     if (tag == 'Q') try self.ready(db, &w) else self.failed = true;
                     break :blk false;
@@ -2026,6 +2026,14 @@ fn sqlstate(err: anyerror) []const u8 {
     return knownSqlstate(err) orelse "54000";
 }
 
+fn diagnosticMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.RestrictedNonSystemView => "access to non-system view is restricted",
+        error.RestrictedNonSystemForeignTable => "access to non-system foreign table is restricted",
+        else => @errorName(err),
+    };
+}
+
 /// SQLSTATE for every engine, store and protocol error this codec knows;
 /// null means the error would fall back to 54000 (program_limit_exceeded).
 pub fn knownSqlstate(err: anyerror) ?[]const u8 {
@@ -2100,7 +2108,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "ExclusionViolation")) return "23P01";
     if (equal(name, "IndexCapacity")) return "54000";
     if (equal(name, "InvalidForeignKey")) return "42830";
-    if (equal(name, "ObjectNotInPrerequisiteState")) return "55000";
+    if (equal(name, "ObjectNotInPrerequisiteState") or equal(name, "RestrictedNonSystemView") or equal(name, "RestrictedNonSystemForeignTable")) return "55000";
     if (equal(name, "DuplicateObject")) return "42710";
     if (equal(name, "InvalidTableDefinition")) return "42P16";
     if (equal(name, "UndefinedSchema")) return "3F000";

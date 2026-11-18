@@ -4362,6 +4362,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// A FROM table: views, partitioned tables and inheritance parents
         /// were expanded before binding (Database.expandRelations).
         fn readableTable(context: *const Context, index: usize) Error!usize {
+            try context.session.restricted_relation_kinds.check(context.tables[index].relkind);
             switch (context.tables[index].relkind) {
                 // A partitioned table holds no rows of its own (FROM ONLY).
                 'r', 'm', 'p' => {},
@@ -4381,6 +4382,11 @@ pub fn Binder(comptime config: types.Config) type {
                 else => return error.UnsupportedStatement,
             }
             return index;
+        }
+
+        fn modifyingTable(context: *const Context, index: usize, routed: bool) Error!usize {
+            try context.session.restricted_relation_kinds.check(context.tables[index].relkind);
+            return writableTable(context, index, routed);
         }
 
         /// Visible table slots (every relation kind but sequences).
@@ -7721,7 +7727,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .drop_sequence = found.slot };
                 },
                 .insert => |*insert| {
-                    const index = try writableTable(context, try resolveQualified(context, insert.schema, insert.table), true);
+                    const index = try modifyingTable(context, try resolveQualified(context, insert.schema, insert.table), true);
                     const entry = &context.tables[index];
                     var mapping: [config.columns]usize = @splat(0);
                     var mapped: [config.columns]bool = @splat(false);
@@ -7790,7 +7796,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .query = root };
                 },
                 .update => |*update| {
-                    const index = try writableTable(context, try resolveQualified(context, update.schema, update.table), false);
+                    const index = try modifyingTable(context, try resolveQualified(context, update.schema, update.table), false);
                     const entry = &context.tables[index];
                     var scope = tableScope(context, index);
                     if (update.alias) |alias| scope.rels[0].name = toName(context, alias);
@@ -7823,7 +7829,7 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .update = out };
                 },
                 .delete => |*delete| {
-                    const index = try writableTable(context, try resolveQualified(context, delete.schema, delete.table), false);
+                    const index = try modifyingTable(context, try resolveQualified(context, delete.schema, delete.table), false);
                     var scope = tableScope(context, index);
                     if (delete.alias) |alias| scope.rels[0].name = toName(context, alias);
                     if (!delete.only and hasChildren(context, context.tables[index].oid)) return error.UnsupportedStatement;
@@ -8883,7 +8889,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// `SELECT * FROM source` plan, like UPDATE FROM); ON and every WHEN
         /// condition, SET and INSERT value bind over both.
         fn bindMerge(context: *const Context, merge: *const Ast.Merge) Error!Bound {
-            const index = try writableTable(context, try resolveQualified(context, merge.table.schema, merge.table.name), false);
+            const index = try modifyingTable(context, try resolveQualified(context, merge.table.schema, merge.table.name), false);
             const entry = &context.tables[index];
             if (entry.primary_column) |key| if (entry.columns[key].default_kind == .mysql_auto_increment)
                 return error.UnsupportedStatement;

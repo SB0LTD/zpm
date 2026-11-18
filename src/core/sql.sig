@@ -852,9 +852,18 @@ pub fn Database(comptime config: Config) type {
             return false;
         }
 
-        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement, role: u32, public_schema_on_path: bool) Error![]const u8 {
+        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement, role: u32, session_values: *const Session) Error![]const u8 {
             // Privileges and row security apply to roles other than superusers (B11 wave 3).
             const privileged = role == CO.bootstrap_role or db.catalog_objects.superuser(role, snap);
+            const public_schema_on_path = session_values.public_schema_on_path;
+            // Analyzing a view definition or an unpopulated materialized
+            // view does not execute the stored query.
+            const executes_query = switch (bound_statement.*) {
+                .create_view => |view| view.materialized and view.with_data,
+                .refresh_view => |view| view.with_data,
+                .create_table => |table| table.with_data,
+                else => true,
+            };
             const tables = &db.tables;
             const catalog = &db.catalog;
             workspace.expanded_count = 0;
@@ -893,6 +902,7 @@ pub fn Database(comptime config: Config) type {
                     if (item.schema == null and !public_schema_on_path and item.name.span.start < source.len) continue;
                     const namespace = namespaceFor(catalog, if (item.schema != null) schema_name.slice() else null, snap) orelse continue;
                     const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
+                    if (executes_query) try session_values.restricted_relation_kinds.check(found.kind);
                     // Items the statement names (not view or expansion texts).
                     if (!privileged and item.name.span.start < source.len) {
                         const secured = try secureItem(db, workspace, &length, source, role, found, snap);
@@ -1080,7 +1090,7 @@ pub fn Database(comptime config: Config) type {
                 self.session.sequences=null;
                 var parsed=try P.parseWithOptions(source,&self.workspace.nodes,.{.dialect=self.dialect});
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
-                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role,self.session.public_schema_on_path);
+                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role,&self.session);
                 try self.session.checkpoint();
                 for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
@@ -2582,7 +2592,7 @@ pub fn Database(comptime config: Config) type {
                 return self.catalogObject(slot, original, &parsed.catalog_object, snap);
             }
             var statement_copy = parsed.*;
-            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, self.session.public_schema_on_path);
+            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
             const source = try self.secureTarget(&statement_copy, expanded, original, snap);
             var context = self.bindContext(source, mode, snap);
             context.stored_source_start = original.len;
@@ -8330,7 +8340,7 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, check_function_bodies, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
+        const SettingKind = enum { search_path, check_function_bodies, restrict_nonsystem_relation_kind, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
 
         fn settingKind(name: []const u8) ?SettingKind {
             inline for (@typeInfo(SettingKind).@"enum".field_names) |field| {
@@ -8457,10 +8467,51 @@ pub fn Database(comptime config: Config) type {
             elements.* += 1;
         }
 
+        fn assignRelationRestrictions(into: *Sess.Values, value_kind: SettingValueKind, value: []const u8) Error!void {
+            const spaces = " \t\n\r\x0b\x0c";
+            const separators = spaces ++ ",";
+            var remainder = std.mem.trim(u8, value, spaces);
+            var kinds: value_module.RestrictedRelationKinds = .{};
+            var display: Sess.SettingText = .{};
+            while (remainder.len != 0) {
+                const quote = remainder[0];
+                const quoted = quote == '"' or (quote == '\'' and value_kind == .word);
+                const end = if (quoted)
+                    (std.mem.indexOfScalar(u8, remainder[1..], quote) orelse return error.InvalidSettingValue) + 1
+                else
+                    std.mem.indexOfAny(u8, remainder, separators) orelse remainder.len;
+                const token = remainder[@intFromBool(quoted)..end];
+                const canonical: []const u8 = if (Sess.sameInsensitive(token, "view")) name: {
+                    kinds.view = true;
+                    break :name "view";
+                } else if (Sess.sameInsensitive(token, "foreign-table")) name: {
+                    kinds.foreign_table = true;
+                    break :name "foreign-table";
+                } else return error.InvalidSettingValue;
+                if (value_kind == .word) {
+                    const prefix: []const u8 = if (display.len == 0) "" else ", ";
+                    const length: usize = display.len;
+                    if (prefix.len + canonical.len > display.bytes.len - length) return error.SessionCapacity;
+                    @memcpy(display.bytes[length..][0..prefix.len], prefix);
+                    @memcpy(display.bytes[length + prefix.len ..][0..canonical.len], canonical);
+                    display.len = @intCast(length + prefix.len + canonical.len);
+                }
+                remainder = std.mem.trimStart(u8, remainder[end + @intFromBool(quoted) ..], spaces);
+                if (remainder.len == 0) break;
+                if (remainder[0] != ',') return error.InvalidSettingValue;
+                remainder = std.mem.trimStart(u8, remainder[1..], spaces);
+                if (remainder.len == 0) return error.InvalidSettingValue;
+            }
+            if (value_kind != .word) try display.set(value);
+            into.restricted_relation_kinds = kinds;
+            into.restriction_text = display;
+        }
+
         fn assignSetting(into: *Sess.Values, which: SettingKind, name: []const u8, kind: SettingValueKind, value: []const u8) Error!void {
             switch (which) {
                 .search_path => try searchPath(value, kind, &into.search_path),
                 .check_function_bodies => into.check_function_bodies = parseBool(value) orelse return error.InvalidSettingValue,
+                .restrict_nonsystem_relation_kind => try assignRelationRestrictions(into, kind, value),
                 .default_transaction_isolation => into.isolation = parseLevel(value) orelse return error.InvalidSettingValue,
                 .default_transaction_read_only => into.read_only = parseBool(value) orelse return error.InvalidSettingValue,
                 .default_transaction_deferrable => into.deferrable = parseBool(value) orelse return error.InvalidSettingValue,
@@ -8486,6 +8537,10 @@ pub fn Database(comptime config: Config) type {
             switch (which) {
                 .search_path => into.search_path = source.search_path,
                 .check_function_bodies => into.check_function_bodies = source.check_function_bodies,
+                .restrict_nonsystem_relation_kind => {
+                    into.restricted_relation_kinds = source.restricted_relation_kinds;
+                    into.restriction_text = source.restriction_text;
+                },
                 .default_transaction_isolation => into.isolation = source.isolation,
                 .default_transaction_read_only => into.read_only = source.read_only,
                 .default_transaction_deferrable => into.deferrable = source.deferrable,
@@ -8602,6 +8657,7 @@ pub fn Database(comptime config: Config) type {
             self.session.session_role = state.session_role;
             self.session.role = if (state.values.role != 0) state.values.role else state.session_role;
             self.session.public_schema_on_path = state.values.publicSchemaOnPath();
+            self.session.restricted_relation_kinds = state.values.restricted_relation_kinds;
         }
 
         /// RESET ALL of the engine settings (transaction modes excepted).
@@ -8625,6 +8681,7 @@ pub fn Database(comptime config: Config) type {
             const text: []const u8 = switch (which) {
                 .search_path => state.values.search_path.slice(),
                 .check_function_bodies => onOff(state.values.check_function_bodies),
+                .restrict_nonsystem_relation_kind => state.values.restriction_text.slice(),
                 .default_transaction_isolation => levelName(state.values.isolation),
                 .default_transaction_read_only => onOff(state.values.read_only),
                 .default_transaction_deferrable => onOff(state.values.deferrable),
@@ -8686,7 +8743,7 @@ pub fn Database(comptime config: Config) type {
         /// Engine settings safe to configure before a connection authenticates.
         pub fn sessionStartupSetting(self: *Self, name: []const u8, value: []const u8) Error!bool {
             const setting = settingKind(name) orelse return false;
-            if (setting != .check_function_bodies) return false;
+            if (setting != .check_function_bodies and setting != .restrict_nonsystem_relation_kind) return false;
             try self.setSetting(null, false, name, .string, value);
             const state = self.sessionState();
             state.startup = state.values;
@@ -9076,7 +9133,7 @@ pub fn Database(comptime config: Config) type {
             defer self.active_params = null;
             var copy = inner;
             // Parse analysis checks no privileges (EXECUTE does).
-            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy, CO.bootstrap_role, self.session.public_schema_on_path);
+            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy, CO.bootstrap_role, &self.session);
             var context = self.bindContext(expanded, mode, snap);
             context.stored_source_start = text.len;
             context.describe_only = true;
@@ -9352,7 +9409,7 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
             // Routine statements run with the invoker's privileges (SECURITY INVOKER).
-            const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role, self.session.public_schema_on_path);
+            const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role, &self.session);
             var context = self.bindContext(source, .standard, snap);
             context.stored_source_start = text.len;
             const bound = try B.bind(&context, parsed);
@@ -9620,7 +9677,7 @@ pub fn Database(comptime config: Config) type {
                 frame.variables.node_high = self.workspace.nodes.len;
                 self.routine_frame = frame;
                 // Body analysis checks no privileges (calls do).
-                const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role, self.session.public_schema_on_path);
+                const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role, &self.session);
                 var context = self.bindContext(source, .standard, snap);
                 context.stored_source_start = text.len;
                 const bound = try B.bind(&context, &parsed);
@@ -10634,7 +10691,7 @@ pub fn Database(comptime config: Config) type {
             }
             var statement_copy = parsed;
             // Describing checks no privileges (execution does), as parse analysis.
-            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role, self.session.public_schema_on_path);
+            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role, &self.session);
             var context = self.bindContext(expanded, .standard, snap);
             context.stored_source_start = source.len;
             context.describe_only=true;

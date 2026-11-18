@@ -894,6 +894,9 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "public_schema_on_path")) {
                     session.public_schema_on_path = self.engine_session.values.publicSchemaOnPath();
                 }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
+                    session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
+                }
                 return session;
             }
 
@@ -944,6 +947,9 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session) {
                     raw.session_state = &self.engine_session;
                     raw.settings_provider = .{ .context = @ptrCast(self), .show = &providerShow, .set = &providerSet };
+                    if (comptime has_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
+                        raw.session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
+                    }
                 }
                 return raw;
             }
