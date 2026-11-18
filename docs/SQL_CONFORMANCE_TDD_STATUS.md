@@ -9,20 +9,18 @@ binary and supported semantics covered by the suites.
 [Beta.3 prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.3-run.44202780430.1) ·
 [Exact release matrix](https://github.com/SB0LTD/ramsql/actions/runs/44202780430)
 
-The separate 16-column catalog build matches the first eight stock `psql \d`
-queries for relation lookup, properties, attributes, index and constraint
-metadata, foreign keys, row policies and extended statistics. The native
-PostgreSQL 18.3 comparison exercised named-role and `PUBLIC` policies and
-real named statistics before creation, after creation and after drop.
-The Windows Sig schema suite passed 1,249 assertions and replayed 238 WAL
-records. Standalone statistics definitions cover ordinary columns and a
-per-object target. Expression statistics, collection, planner application,
-stable attribute numbers across column drops and native `regclass` wire
-output still need coverage. The next stock `psql \d` query, publication
-discovery, returned `UnsupportedStatement`. Trigger discovery and a full
-`pg_dump` restore remain open.
-[Native PostgreSQL tooling](https://github.com/SB0LTD/ramsql/actions/runs/44232400898) ·
-[Extended statistics draft](https://github.com/SB0LTD/zpm/pull/246)
+The separate 16-column catalog build completed all eleven stock `psql \d`
+queries for the regular table fixture. Native PostgreSQL 18.3 comparisons
+also exercised named-role and `PUBLIC` policies, named statistics, real
+schema and explicit publication membership, and dated/default partitions.
+The Windows Sig schema suite passed 1,315 assertions and replayed 261 WAL
+records. Expression statistics, collection, planner application, stable
+attribute numbers across column drops, nominal `regclass` wire output, and
+populated trigger discovery remain open. Stock `pg_dump` stopped on empty
+search-path configuration. The native-to-RAMSQL restore stopped on the first
+idle transaction timeout setting. Both directions remain release gates.
+[Stock describe proof](https://github.com/SB0LTD/ramsql/actions/runs/44235209311) ·
+[Dump and restore audit](https://github.com/SB0LTD/ramsql/actions/runs/44235375832)
 
 The draft versioned WAL assigns durable table-constraint identities while
 replaying the older definition formats. Checkpoint generation images must
