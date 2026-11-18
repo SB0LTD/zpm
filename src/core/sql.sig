@@ -2467,7 +2467,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn parsePostgresEnvelope(self: *Self, source: []const u8) Error!void {
-            const options: P.Options = .{ .dialect = .postgres };
+            const options: parser_module.Options = .{ .dialect = .postgres };
             if (try P.parseDatabaseCommand(source, options)) |_| return;
             if (R.classify(source) != null) {
                 var routine: R.Statement = undefined;
