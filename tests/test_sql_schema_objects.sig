@@ -1363,6 +1363,21 @@ fn policyDiscovery() !void {
     try sameState(&.{policies});
 }
 
+fn namespaceAliases() !void {
+    reset();
+    try run("CREATE SCHEMA \"MiX\"\"ed\"");
+    const lookup = "SELECT pg_catalog.to_regnamespace('  \"MiX\"\"ed\"  ')::text, pg_catalog.to_regnamespace('PG_CATALOG')::oid, pg_catalog.to_regnamespace('missing') IS NULL";
+    try expect(lookup, "\"MiX\"\"ed\"|11|t");
+    const identity = "SELECT ns.oid::pg_catalog.regnamespace::pg_catalog.text, pg_typeof(ns.oid::regnamespace)::text FROM pg_namespace ns WHERE nspname='MiX\"ed'";
+    try expect(identity, "\"MiX\"\"ed\"|regnamespace");
+    try expect("SELECT '2200'::regnamespace::text, '99999'::regnamespace::text, '-'::regnamespace::text", "public|99999|-");
+    try rejects("SELECT 'missing'::regnamespace", error.UndefinedSchema, lookup, "\"MiX\"\"ed\"|11|t");
+    try rejects("SELECT 'public.pg_catalog'::regnamespace", error.InvalidName, identity, "\"MiX\"\"ed\"|regnamespace");
+    try sameState(&.{ lookup, identity });
+    try run("DROP SCHEMA \"MiX\"\"ed\"");
+    try expect("SELECT to_regnamespace('\"MiX\"\"ed\"') IS NULL", "t");
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1384,5 +1399,6 @@ pub fn main() !void {
     try partitionAncestorCatalog();
     try arraySubqueries();
     try policyDiscovery();
+    try namespaceAliases();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

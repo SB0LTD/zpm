@@ -1027,6 +1027,7 @@ pub fn regtypeName(oid: u32) ?[]const u8 {
         0 => return "-",
         705 => return "unknown",
         2205 => return "regclass",
+        4089 => return "regnamespace",
         else => {},
     }
     const data_type = typeFromOid(oid) orelse return null;
@@ -1048,6 +1049,7 @@ pub fn regtypeInput(input: []const u8) error{ UndefinedObject, NumericValueOutOf
     if (input.len == 1 and input[0] == '-') return 0;
     if (keyword(input, "unknown")) return 705;
     if (keyword(input, "regclass")) return 2205;
+    if (keyword(input, "regnamespace")) return 4089;
     const data_type = typeByName(input) orelse return error.UndefinedObject;
     return typeOid(data_type);
 }

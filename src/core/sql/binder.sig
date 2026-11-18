@@ -1285,6 +1285,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "current_schema", .func = .current_schema },
                 .{ .name = "to_regtype", .func = .to_regtype },
                 .{ .name = "to_regclass", .func = .to_regclass },
+                .{ .name = "to_regnamespace", .func = .to_regnamespace },
                 .{ .name = "format_type", .func = .format_type },
                 .{ .name = "pg_get_expr", .func = .pg_get_expr },
                 .{ .name = "pg_get_indexdef", .func = .pg_get_indexdef },
@@ -2057,7 +2058,7 @@ pub fn Binder(comptime config: types.Config) type {
             if(types.same(window_name.slice(),"ntile")) {try typeNtileArgument(context,scope,n);return error.WrongObjectType;}
             switch (n.func) {
                 // Bound internally (identity defaults, reg casts): already typed.
-                .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out => {
+                .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out, .regnamespace_in, .regnamespace_out => {
                     n.constant = false;
                     return;
                 },
@@ -2213,13 +2214,13 @@ pub fn Binder(comptime config: types.Config) type {
                     if (count != 0) return error.UndefinedFunction;
                     n.ty = .name;
                 },
-                .to_regtype, .to_regclass => {
+                .to_regtype, .to_regclass, .to_regnamespace => {
                     if (count != 1) return error.UndefinedFunction;
                     const ty = context.node(n.b).ty;
                     if (ty == .unknown) try coerce(context, n.b, .text) else if (ty != .text and ty != .name) return error.UndefinedFunction;
                     n.ty = .oid;
                     // PostgreSQL returns regtype / regclass: `::text` prints the name.
-                    n.reg = if (n.func == .to_regtype) .regtype else .regclass;
+                    n.reg = switch (n.func) { .to_regtype => .regtype, .to_regclass => .regclass, .to_regnamespace => .regnamespace, else => unreachable };
                     n.constant = false;
                 },
                 .format_type => {
@@ -2252,7 +2253,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindSignature(context, n, signature, .text, true);
                     n.constant = false;
                 },
-                .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out => unreachable,
+                .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out, .regnamespace_in, .regnamespace_out => unreachable,
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
                 .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
@@ -2354,6 +2355,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.integer = switch (argument.reg) {
                         .regclass => 2205,
                         .regtype => 2206,
+                        .regnamespace => 4089,
                         .none => if (argument.ty == .unknown) 705 else types.typeOid(types.dataTypeOf(argument.ty)),
                     };
                     n.ty = .regtype;
@@ -2958,13 +2960,13 @@ pub fn Binder(comptime config: types.Config) type {
         /// 42704 when missing); an integer or OID keeps its value. The result
         /// is an OID tagged with its reg type, so `::text` prints the name.
         fn regCast(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
-            const reg: ast.Reg = if (n.typmod == ast.regclass_typmod) .regclass else .regtype;
+            const reg = ast.regKind(n.typmod);
             try typeExpr(context, scope, n.a);
             const from = context.node(n.a).ty;
             if (from == .unknown or from == .text or from == .name) {
                 if (from == .unknown) try coerce(context, n.a, .text);
                 n.kind = .function;
-                n.func = if (reg == .regclass) .regclass_in else .regtype_in;
+                n.func = switch (reg) { .regclass => .regclass_in, .regtype => .regtype_in, .regnamespace => .regnamespace_in, .none => unreachable };
                 n.b = n.a;
                 n.a = none;
                 n.ty = .oid;
@@ -4064,7 +4066,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.date_bound=false;
                     if (n.flat_record_cast) return;
                     if (n.cast_type == .unknown) return error.UnsupportedStatement;
-                    if (n.typmod == ast.regclass_typmod or n.typmod == ast.regtype_typmod) return regCast(context, scope, n);
+                    if (ast.regKind(n.typmod) != .none) return regCast(context, scope, n);
                     const target = n.cast_type;
                     const inner = context.node(n.a);
                     if (inner.kind == .function and inner.func == .array_constructor and inner.b == none and types.isArray(target)) {
@@ -4083,7 +4085,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (target == .text and reg != .none) {
                         // regclass/regtype output: the relation or type name.
                         n.kind = .function;
-                        n.func = if (reg == .regclass) .regclass_out else .regtype_out;
+                        n.func = switch (reg) { .regclass => .regclass_out, .regtype => .regtype_out, .regnamespace => .regnamespace_out, .none => unreachable };
                         n.b = n.a;
                         n.a = none;
                         n.ty = .text;
@@ -4226,15 +4228,16 @@ pub fn Binder(comptime config: types.Config) type {
                 .function => blk: {
                     switch (n.func) {
                         // Converted casts: `x::regclass::text` is named like a cast.
-                        .regclass_out, .regtype_out => {
+                        .regclass_out, .regtype_out, .regnamespace_out => {
                             const inner = figure(context, n.b, buffer);
                             if (inner.strength > 1) break :blk inner;
                             break :blk .{ .name = "text", .strength = 1 };
                         },
-                        .regclass_in, .regtype_in => {
+                        .regclass_in, .regtype_in, .regnamespace_in => {
                             const inner = figure(context, n.b, buffer);
                             if (inner.strength > 1) break :blk inner;
-                            break :blk .{ .name = if (n.func == .regclass_in) "regclass" else "regtype", .strength = 1 };
+                            const label = switch (n.func) { .regclass_in => "regclass", .regtype_in => "regtype", .regnamespace_in => "regnamespace", else => unreachable };
+                            break :blk .{ .name = label, .strength = 1 };
                         },
                         // TRIM(...) calls btrim/ltrim/rtrim, named after them.
                         // IS [form] NORMALIZED calls is_normalized.
