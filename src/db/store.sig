@@ -699,6 +699,13 @@ pub fn Store(comptime Raw: type) type {
             pub const detached_primary_key = if (@hasDecl(Raw, "ReadContext")) @hasDecl(Raw.ReadContext, "primaryKeyMatches") else false;
 
             pub const Result = Raw.Result;
+            pub const simple_query_batches = @hasDecl(Raw, "preflightPostgresBatch");
+
+            const SimpleQueryBatch = struct {
+                statement_us: ?i64,
+                implicit: bool = false,
+            };
+
             store: *Self,
             id: u64,
             dialect: Dialect = .postgres,
@@ -707,6 +714,8 @@ pub fn Store(comptime Raw: type) type {
             /// Transaction slot (explicit block or a parked implicit statement).
             tx: ?u16 = null,
             in_transaction: bool = false,
+            simple_query_batch: ?SimpleQueryBatch = null,
+            postgres_extended_implicit: bool = false,
             /// Opt-in immutable autocommit SELECT route. The caller owns the
             /// context and excludes ALL storage mutations for the entire codec
             /// call, including result formatting. Never set for transaction,
@@ -977,7 +986,7 @@ pub fn Store(comptime Raw: type) type {
                 self.refreshTransactionTimeout();
                 self.in_transaction = true;
                 self.failed = false;
-                self.transaction_us = self.store.wallNow();
+                self.transaction_us = if (self.simple_query_batch) |batch| batch.statement_us else self.store.wallNow();
                 self.tx_start = self.settings;
                 self.base = self.settings;
                 self.saved_len = 0;
@@ -990,6 +999,8 @@ pub fn Store(comptime Raw: type) type {
                 self.base = self.settings;
                 self.tx = null;
                 self.in_transaction = false;
+                if (self.simple_query_batch) |*batch| batch.implicit = false;
+                self.postgres_extended_implicit = false;
                 self.failed = false;
                 self.saved_len = 0;
                 self.pending = .{};
@@ -1019,10 +1030,36 @@ pub fn Store(comptime Raw: type) type {
                 self.endTransaction(true);
             }
 
+            /// Sync ends an implicit extended group.
+            pub fn finishExtended(self: *Connection) !void {
+                if (self.postgres_extended_implicit) try self.commitTransaction();
+            }
+
+            pub fn beginExtendedGroup(self: *Connection) !void {
+                if (self.in_transaction) return;
+                try self.beginTransaction();
+                self.postgres_extended_implicit = true;
+            }
+
+            /// Errors at a simple Query or Sync boundary abort the open
+            /// implicit group immediately, even if Flush exposed earlier
+            /// statement results to the client.
+            pub fn abortExtended(self: *Connection) void {
+                if (!self.postgres_extended_implicit) return;
+                if (self.tx) |slot| self.db().abort(slot);
+                self.endTransaction(false);
+            }
+
             pub fn rollbackTransaction(self: *Connection) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (self.tx) |slot| self.db().abort(slot);
+                const was = self.in_transaction;
+                const before = self.settings;
                 self.endTransaction(false);
+                if (!was) {
+                    self.settings = before;
+                    self.base = before;
+                }
             }
 
             /// A codec-level error inside a block fails it like a statement error.
@@ -1032,6 +1069,51 @@ pub fn Store(comptime Raw: type) type {
                 self.failed = true;
                 self.pending = .{};
                 self.revertSettings();
+            }
+
+            pub fn simpleQueryBatchAvailable(self: *const Connection) bool {
+                return simple_query_batches and self.dialect == .postgres and self.read_context == null;
+            }
+
+            pub fn preflightSimpleQueryBatch(self: *Connection, source: []const u8) !usize {
+                if (comptime !simple_query_batches) return error.UnsupportedStatement;
+                return self.db().preflightPostgresBatch(source);
+            }
+
+            pub fn beginSimpleQueryBatch(self: *Connection) !void {
+                if (self.id == 0 or self.simple_query_batch != null or self.pending.active) return error.ProtocolViolation;
+                // PostgreSQL ends an implicit pipeline transaction at a
+                // multi-command Query boundary. A single command keeps it.
+                self.simple_query_batch = .{
+                    .statement_us = self.store.wallNow(),
+                    .implicit = self.postgres_extended_implicit,
+                };
+                self.postgres_extended_implicit = false;
+            }
+
+            pub fn beginSimpleQueryStep(self: *Connection) !void {
+                if (self.simple_query_batch == null) return error.ProtocolViolation;
+                if (self.in_transaction) return;
+                try self.beginTransaction();
+                self.simple_query_batch.?.implicit = true;
+            }
+
+            pub fn checkSimpleQueryUtility(source: []const u8) !void {
+                if (comptime @hasDecl(Raw, "parseDatabaseCommand")) {
+                    if (try Raw.parseDatabaseCommand(source, .{})) |_| return error.ActiveSqlTransaction;
+                }
+            }
+
+            fn implicitSimpleQueryBlock(self: *const Connection) bool {
+                return if (self.simple_query_batch) |batch| batch.implicit else false;
+            }
+
+            pub fn finishSimpleQueryBatch(self: *Connection, success: bool) !void {
+                const batch = self.simple_query_batch orelse return;
+                defer self.simple_query_batch = null;
+                if (batch.implicit) {
+                    if (success) try self.commitTransaction() else try self.rollbackTransaction();
+                } else if (!success) self.failTransaction();
             }
 
             /// An error inside a block reverts settings made since the
@@ -1112,6 +1194,7 @@ pub fn Store(comptime Raw: type) type {
             pub fn disconnect(self: *Connection) void {
                 if (self.id == 0) return;
                 self.rollbackTransaction() catch {};
+                self.simple_query_batch = null;
                 self.pending = .{};
                 if (comptime has_engine_session) self.db().endSession();
             }
@@ -1387,29 +1470,38 @@ pub fn Store(comptime Raw: type) type {
                     .none => unreachable,
                     .begin => |modes| {
                         const fresh = !self.in_transaction;
+                        const promote = self.postgres_extended_implicit or self.implicitSimpleQueryBlock();
                         if (comptime has_engine_session) {
                             try self.beginTransaction();
                             // BEGIN inside a block only warns (its modes are ignored).
-                            if (fresh) try self.db().beginModes(self.tx.?, modes);
+                            if (fresh) {
+                                try self.db().beginModes(self.tx.?, modes);
+                            } else if (promote) {
+                                try self.db().setTransaction(self.tx.?, modes);
+                            }
                         } else {
                             if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
                             try self.beginTransaction();
                         }
-                        if (!fresh) self.warn("25001", "there is already a transaction in progress");
+                        if (promote) {
+                            self.postgres_extended_implicit = false;
+                            if (self.simple_query_batch) |*batch| batch.implicit = false;
+                        }
+                        if (!fresh and !promote) self.warn("25001", "there is already a transaction in progress");
                         result.clear(0);
                         result.command = .begin;
                     },
                     .commit => {
-                        const was_open = self.in_transaction;
+                        const explicit = self.in_transaction and !self.postgres_extended_implicit and !self.implicitSimpleQueryBlock();
                         try self.commitTransaction();
-                        if (!was_open) self.warn("25P01", "there is no transaction in progress");
+                        if (!explicit) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .commit;
                     },
                     .rollback => {
-                        const was_open = self.in_transaction;
+                        const explicit = self.in_transaction and !self.postgres_extended_implicit and !self.implicitSimpleQueryBlock();
                         try self.rollbackTransaction();
-                        if (!was_open) self.warn("25P01", "there is no transaction in progress");
+                        if (!explicit) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .rollback;
                     },
@@ -1417,7 +1509,7 @@ pub fn Store(comptime Raw: type) type {
                         if (comptime PreparedWal == void) return error.UnsupportedStatement;
                         switch (prepared.action) {
                             .prepare => {
-                                if (!self.in_transaction) return error.NoActiveTransaction;
+                                if (!self.in_transaction or self.postgres_extended_implicit or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                                 const slot = self.tx.?;
                                 if (self.failed) {
                                     self.db().abort(slot);
@@ -1449,7 +1541,7 @@ pub fn Store(comptime Raw: type) type {
                         }
                     },
                     .savepoint => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.postgres_extended_implicit or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                         if (self.failed) return error.TransactionFailed;
                         try self.db().savepoint(self.tx.?, name.slice());
                         self.saved[self.saved_len] = .{ .current = self.settings, .base = self.base };
@@ -1458,14 +1550,14 @@ pub fn Store(comptime Raw: type) type {
                         result.command = .savepoint;
                     },
                     .release => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.postgres_extended_implicit or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                         if (self.failed) return error.TransactionFailed;
                         self.saved_len = try self.db().release(self.tx.?, name.slice());
                         result.clear(0);
                         result.command = .release;
                     },
                     .rollback_to => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.postgres_extended_implicit or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                         const depth = try self.db().rollbackTo(self.tx.?, name.slice());
                         self.rolled_back_to = depth;
                         self.settings = self.saved[depth].current;
@@ -1478,7 +1570,7 @@ pub fn Store(comptime Raw: type) type {
                     },
                     .set => |set| {
                         if (self.failed) return error.TransactionFailed;
-                        if (set.local and !self.in_transaction) self.warn("25P01", "SET LOCAL can only be used in transaction blocks");
+                        if (set.local and (!self.in_transaction or self.postgres_extended_implicit)) self.warn("25P01", "SET LOCAL can only be used in transaction blocks");
                         const which = parameter(set.name.slice()) orelse {
                             if (comptime !has_engine_session) return error.UndefinedSetting;
                             try self.db().sessionSet(self.blockSlot(), set.local, set.name.slice(), set.kind, set.value.slice());
@@ -1500,7 +1592,7 @@ pub fn Store(comptime Raw: type) type {
                             // Outside a block SET TRANSACTION only warns.
                             if (self.in_transaction) try self.db().setTransaction(self.tx.?, modes);
                         } else if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
-                        if (!self.in_transaction) self.warn("25P01", "SET TRANSACTION can only be used in transaction blocks");
+                        if (!self.in_transaction or self.postgres_extended_implicit) self.warn("25P01", "SET TRANSACTION can only be used in transaction blocks");
                         result.clear(0);
                         result.command = .set;
                     },
@@ -1913,6 +2005,14 @@ pub fn Store(comptime Raw: type) type {
             }
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
+                return self.executeMode(source, result, false);
+            }
+
+            pub fn executeExtended(self: *Connection, source: []const u8, result: *Result) !void {
+                return self.executeMode(source, result, true);
+            }
+
+            fn executeMode(self: *Connection, source: []const u8, result: *Result, extended: bool) !void {
                 self.pending_notice = null;
                 if (self.id == 0) return error.InvalidConnection;
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
@@ -1989,6 +2089,12 @@ pub fn Store(comptime Raw: type) type {
                     self.failTransaction();
                     return err;
                 };
+                if (extended and !self.in_transaction) switch (command_kind) {
+                    .none, .set, .reset, .set_transaction, .set_session_characteristics, .show => {
+                        try self.beginExtendedGroup();
+                    },
+                    else => {},
+                };
                 if (command_kind != .none) {
                     const was_block = self.in_transaction;
                     self.control(command_kind, result) catch |err| {
@@ -1999,7 +2105,7 @@ pub fn Store(comptime Raw: type) type {
                 }
                 if (self.failed) return error.TransactionFailed;
                 if (!self.autocommit and !self.in_transaction) try self.beginTransaction();
-                self.statement_us = self.store.wallNow();
+                self.statement_us = if (self.simple_query_batch) |batch| batch.statement_us else self.store.wallNow();
                 const implicit = !self.in_transaction;
                 const slot = if (self.tx) |slot| slot else blk: {
                     const slot = try self.db().begin();

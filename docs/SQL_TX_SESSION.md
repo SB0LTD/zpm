@@ -78,6 +78,16 @@ position alone. `Config.synchronized_scan_rows` is the minimum span to consider
 for cache locality. Ordered queries, joins, aggregates, sampling and locking retain their
 existing paths. The shared result cache skips plans whose output can rotate.
 
+`PostgresStatements` iterates nonempty command spans in a PostgreSQL Query
+message. It keeps quoted text, nested comments and SQL routine bodies intact.
+`Database.preflightPostgresBatch` checks boundaries and the supported raw
+grammar for the entire message before execution. Catalog resolution and
+execution errors are checked when each command runs. RAMSQL rejects a whole
+batch containing raw syntax outside its supported grammar before running the
+first command. A syntax error in a later recognized command takes precedence.
+This restricts batches that PostgreSQL can parse with commands outside the
+RAMSQL SQL subset.
+
 ## Errors (SQLSTATE)
 
 40001 SerializationFailure (concurrent update/delete, SSI), 25001

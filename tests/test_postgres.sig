@@ -48,7 +48,11 @@ var packets: usize = 0;
 var fuzz_inputs: usize = 0;
 fn check(value: bool) !void {
     assertions += 1;
-    if (!value) return error.PostgresContractFailed;
+    if (!value) {
+        std.debug.print("PostgreSQL contract assertion {d}\n", .{assertions});
+        std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
+        return error.PostgresContractFailed;
+    }
 }
 fn equal(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
@@ -1372,6 +1376,8 @@ fn detachedPrimaryKeys() !void {
     const null_hint = s.detachedPrimaryKey(p.slice()) orelse return error.MissingPrimaryKeyHint;
     try check(null_hint.key == null and equal(null_hint.source, replacement));
     try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "C");
+    var sync_packet = Packet.init('S');
+    try tags(store_output[0..(try storeSend(&s, &db, &sync_packet)).written], "Z");
 
     p = Packet.init('B');
     p.string("text");
@@ -1387,6 +1393,7 @@ fn detachedPrimaryKeys() !void {
     p.number32(0);
     try check((s.detachedPrimaryKey(p.slice()) orelse return error.MissingPrimaryKeyHint).key == 7);
     try tags(store_output[0..(try storeSend(&s, &db, &p)).written], "C");
+    try tags(store_output[0..(try storeSend(&s, &db, &sync_packet)).written], "Z");
 
     // Describe uses the same worker AST workspace. A second Bind with the
     // original template can still hit the independent owned plan.
@@ -1764,8 +1771,14 @@ fn storeContracts() !void {
     try commandTag(store_output[0..resumed.written], "UPDATE 1");
     try commandTag(try storeQuery(&sa, &a, "RELEASE SAVEPOINT s"), "RELEASE");
     try commandTag(try storeQuery(&sa, &a, "COMMIT"), "COMMIT");
-    _ = try storeQuery(&sb, &b, "SELECT v FROM w");
-    try check(sb.result.rows[0].cells[0].integer == 2);
+    _ = try storeQuery(&sa, &a, "SELECT v FROM w");
+    try check(sa.result.rows[0].cells[0].integer == 0);
+    try check(store.database.usage().pending_versions != 0);
+    var sync_packet = Packet.init('S');
+    try tags(store_output[0..(try storeSend(&sb, &b, &sync_packet)).written], "Z");
+    try check(b.transactionStatus() == 'I');
+    _ = try storeQuery(&sa, &a, "SELECT v FROM w");
+    try check(sa.result.rows[0].cells[0].integer == 2);
     // Transaction modes are engine state now (tx-session lane).
     try commandTag(try storeQuery(&sa, &a, "BEGIN ISOLATION LEVEL SERIALIZABLE"), "BEGIN");
     _ = try storeQuery(&sa, &a, "SHOW transaction_isolation");
@@ -1883,11 +1896,19 @@ fn detachedCandidates() !void {
     description=Packet.init('D');description.byte('S');description.string("lookup");
     try check(session.detachedCandidate(description.slice())==null);
     var execution=Packet.init('E');execution.string("bound");execution.number32(0);
-    const executed=session.detachedCandidate(execution.slice()).?;
-    try check(executed==.execute and equal(executed.execute,"SELECT 7::int"));
-    execution.bytes[execution.len-1]=1;
-    try check(session.detachedCandidate(execution.slice())==null);
+    const frame = execution.slice();
+    try check(session.detachedCandidate(frame) == null);
     var synchronization=Packet.init('S');
+    const sync_frame = synchronization.slice();
+    var pair: [64]u8 = undefined;
+    @memcpy(pair[0..frame.len], frame);
+    @memcpy(pair[frame.len..][0..sync_frame.len], sync_frame);
+    const frames = pair[0..frame.len + sync_frame.len];
+    for (frame.len..frames.len) |n| try check(session.detachedCandidate(frames[0..n]) == null);
+    const executed=session.detachedCandidate(frames) orelse return error.MissingSynchronizedReadCandidate;
+    try check(executed==.execute and equal(executed.execute,"SELECT 7::int"));
+    pair[frame.len-1]=1;
+    try check(session.detachedCandidate(frames)==null);
     try check(session.detachedCandidate(synchronization.slice()).?==.metadata);
     session.failed=true;try check(session.detachedCandidate(synchronization.slice())==null);session.failed=false;
     session.active_portal=0;try check(session.detachedCandidate(message.slice())==null);session.active_portal=null;
