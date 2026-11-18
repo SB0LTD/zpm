@@ -1367,7 +1367,7 @@ pub fn Values(comptime config: Config) type {
             // Variable/composite representations retain their canonical hashing.
             switch (value.*) {
                 .integer => |integer| return wordHash(@bitCast(integer), tag),
-                .pg_internal_char => |value| return wordHash(value, tag),
+                .pg_internal_char => |byte| return wordHash(byte, tag),
                 .text, .bytea, .xml, .tsvector, .tsquery => |*text| {
                     mix(&code, tag);
                     for (text.slice()) |byte| code = (code ^ byte) *% 1099511628211;
