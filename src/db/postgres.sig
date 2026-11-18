@@ -486,6 +486,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// and retains the original input through completion.
         pub fn scheduledCommitCandidate(self: *const Self, input: []const u8) ?usize {
             if (comptime !@hasDecl(DB, "transactionStatus")) return null;
+            if (comptime has_admission) if (self.admission.rejected) return null;
             if (!self.detachedReady() or input.len < 5 or input[0] != 'Q') return null;
             const size = read32(input[1..5]);
             if (size < 4 or size > max_packet or @as(usize, size) + 1 > input.len) return null;
@@ -500,8 +501,11 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// established its transaction outcome. Success uses the usual codec
         /// path once the database reports an already-idle transaction.
         pub fn completeScheduledCommit(self: *Self, db: *DB, input: []const u8, output: []u8, outcome: ?anyerror) !Reply {
+            if (comptime !@hasDecl(DB, "transactionStatus")) return error.InvalidScheduledCommit;
             const consumed = self.scheduledCommitCandidate(input) orelse return error.InvalidScheduledCommit;
+            const status = db.transactionStatus();
             if (outcome) |err| {
+                if (status != 'I' and status != 'E') return error.InvalidScheduledCommit;
                 if (output.len < try self.requiredCapacity()) return error.BufferTooSmall;
                 self.resetSimpleQuery();
                 var writer: Writer = .{ .bytes = output };
@@ -509,8 +513,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 try self.ready(db, &writer);
                 return .{ .consumed = consumed, .written = writer.at };
             }
-            if (comptime !@hasDecl(DB, "transactionStatus")) return error.InvalidScheduledCommit;
-            if (db.transactionStatus() != 'I') return error.InvalidScheduledCommit;
+            if (status != 'I') return error.InvalidScheduledCommit;
             return self.handle(db, input, output);
         }
 

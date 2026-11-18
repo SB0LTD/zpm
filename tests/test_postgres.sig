@@ -1929,10 +1929,42 @@ fn initializedProtocolPrefixes() !void {
     try sync(&session,&db);
 }
 
+fn scheduledCommitLifecycle() !void {
+    var session: Session = .{};
+    var db: DB = .{};
+    var packet = Packet.init('Q');
+    packet.string(" COMMIT; ");
+    const frame = packet.slice();
+    try check(session.scheduledCommitCandidate(frame) == null);
+    try startup(&session, &db);
+    try check(session.scheduledCommitCandidate(frame) == frame.len);
+    try check(session.scheduledCommitCandidate(frame[0 .. frame.len - 1]) == null);
+    var multi = Packet.init('Q');
+    multi.string("COMMIT; SELECT 1");
+    try check(session.scheduledCommitCandidate(multi.slice()) == null);
+    _ = try query(&session, &db, "BEGIN");
+    for ([_]?anyerror{ null, error.FileSyncFailed }) |outcome| {
+        if (session.completeScheduledCommit(&db, frame, &output, outcome)) |_| {
+            return error.ActiveCommitCompletionAccepted;
+        } else |err| try check(err == error.InvalidScheduledCommit);
+    }
+    db.failTransaction();
+    const cancelled = try session.completeScheduledCommit(&db, frame, &output, error.QueryCanceled);
+    try check(cancelled.consumed == frame.len and !cancelled.close and db.transactionStatus() == 'E');
+    try tags(output[0..cancelled.written], "EZ");
+    try state(output[0..cancelled.written], "57014");
+    try check(output[cancelled.written - 1] == 'E');
+    _ = try query(&session, &db, "ROLLBACK");
+    const durable = try session.completeScheduledCommit(&db, frame, &output, null);
+    try tags(output[0..durable.written], "CZ");
+    try check(durable.consumed == frame.len and db.transactionStatus() == 'I');
+}
+
 pub fn main(init: std.process.Init) !void {
     try startupFraming();
     try initializedProtocolPrefixes();
     try detachedCandidates();
+    try scheduledCommitLifecycle();
     try detachedPrimaryKeys();
     try oversizedFrames();
     try roleAuthenticationContracts();
