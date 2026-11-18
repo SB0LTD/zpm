@@ -32,10 +32,24 @@ const text_search = @import("text_search.sig");
 const Error = types.Error;
 const Type = types.Type;
 
+/// The two relation kinds supported by PostgreSQL's session access guard.
+pub const RestrictedRelationKinds = packed struct {
+    view: bool = false,
+    foreign_table: bool = false,
+
+    /// Only call for a relation in the user catalog. Built-in system views
+    /// resolve separately and have no entries in caller-owned table storage.
+    pub fn check(self: RestrictedRelationKinds, kind: u8) Error!void {
+        if (kind == 'v' and self.view) return error.RestrictedNonSystemView;
+        if (kind == 'f' and self.foreign_table) return error.RestrictedNonSystemForeignTable;
+    }
+};
+
 pub const Session = struct {
     zone: temporal.Zone = .{},
     resolver: temporal.Resolver = .{},
     xml_document: bool = false,
+    restricted_relation_kinds: RestrictedRelationKinds = .{},
     /// PostgreSQL-epoch microseconds (2000-01-01 UTC); null without a clock.
     transaction_us: ?i64 = null,
     statement_us: ?i64 = null,

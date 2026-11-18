@@ -429,6 +429,8 @@ pub const Error = error{
     InvalidForeignKey,
     /// SQLSTATE 55000: a materialized view that has not been populated.
     ObjectNotInPrerequisiteState,
+    RestrictedNonSystemView,
+    RestrictedNonSystemForeignTable,
     /// SQLSTATE 2202H: invalid TABLESAMPLE argument (B11).
     InvalidTablesampleArgument,
     /// SQLSTATE 2202G: NULL TABLESAMPLE REPEATABLE seed (B11).

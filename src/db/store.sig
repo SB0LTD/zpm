@@ -908,6 +908,9 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "synchronize_seqscans")) {
                     session.synchronize_seqscans = self.dialect == .postgres and self.engine_session.values.synchronize_seqscans;
                 }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
+                    session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
+                }
                 return session;
             }
 
@@ -958,6 +961,9 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session) {
                     raw.session_state = &self.engine_session;
                     raw.settings_provider = .{ .context = @ptrCast(self), .show = &providerShow, .set = &providerSet };
+                    if (comptime has_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
+                        raw.session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
+                    }
                 }
                 return raw;
             }
@@ -980,7 +986,7 @@ pub fn Store(comptime Raw: type) type {
             fn endTransaction(self: *Connection, committed: bool) void {
                 self.transaction_us = null;
                 self.transaction_deadline_ns = null;
-                self.settings = if (committed) self.base else self.tx_start;
+                self.settings = if (committed or !self.in_transaction) self.base else self.tx_start;
                 self.base = self.settings;
                 self.tx = null;
                 self.in_transaction = false;
@@ -1016,9 +1022,7 @@ pub fn Store(comptime Raw: type) type {
             pub fn rollbackTransaction(self: *Connection) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (self.tx) |slot| self.db().abort(slot);
-                const was = self.in_transaction;
                 self.endTransaction(false);
-                if (!was) self.settings = self.base;
             }
 
             /// A codec-level error inside a block fails it like a statement error.

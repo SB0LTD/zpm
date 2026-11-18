@@ -949,11 +949,45 @@ fn clientNotices() !void {
     try connection.execute("SET client_min_messages = 'error'", &out);
     try connection.execute("ROLLBACK", &out);
     try check(connection.takeNotice() == null);
+    try connection.execute("SHOW client_min_messages", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "error"));
     try connection.execute("RESET client_min_messages", &out);
     try connection.execute("SET LOCAL check_function_bodies = off", &out);
     try check(connection.takeNotice() != null);
     try connection.execute("SHOW check_function_bodies", &out);
     try check(equal(out.rows[0].cells[0].text.slice(), "on"));
+}
+
+fn relationRestrictions() !void {
+    var store: Store = .{};
+    var limited: Store.Connection = .{ .store = &store, .id = 1 };
+    var other: Store.Connection = .{ .store = &store, .id = 2 };
+    var out: DB.Result = .{};
+    const scan = "SELECT id FROM public.restricted_v";
+    try limited.execute("CREATE TABLE restriction_base (id INT PRIMARY KEY)", &out);
+    try limited.execute("INSERT INTO restriction_base VALUES (31)", &out);
+    try limited.execute("CREATE VIEW restricted_v AS SELECT id FROM restriction_base", &out);
+    try limited.execute("SHOW restrict_nonsystem_relation_kind", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), ""));
+    try limited.execute("BEGIN", &out);
+    try limited.execute("SET LOCAL restrict_nonsystem_relation_kind = 'VIEW, foreign-table'", &out);
+    try limited.describe("SELECT id FROM restriction_base", &out);
+    if (limited.describe(scan, &out)) |_| return error.UnsafeViewDescribe else |err| try check(err == error.RestrictedNonSystemView);
+    if (limited.execute(scan, &out)) |_| return error.UnsafeViewRead else |err| try check(err == error.RestrictedNonSystemView);
+    try other.execute(scan, &out);
+    try check(out.row_count == 1 and out.rows[0].cells[0].integer == 31);
+    try limited.execute("ROLLBACK", &out);
+    try limited.execute(scan, &out);
+    try check(out.row_count == 1 and out.rows[0].cells[0].integer == 31);
+    try limited.execute("SET restrict_nonsystem_relation_kind TO view, 'foreign-table'", &out);
+    try limited.execute("SHOW restrict_nonsystem_relation_kind", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "view, foreign-table"));
+    if (limited.execute("SET restrict_nonsystem_relation_kind = 'view, bogus'", &out)) |_| return error.UnknownRelationKindAccepted else |err| try check(err == error.InvalidSettingValue);
+    if (limited.execute("INSERT INTO restricted_v VALUES (32)", &out)) |_| return error.UnsafeViewWrite else |err| try check(err == error.RestrictedNonSystemView);
+    try limited.execute("SELECT count(*) FROM pg_catalog.pg_views WHERE viewname = 'restricted_v'", &out);
+    try check(out.row_count == 1 and out.rows[0].cells[0].integer == 1);
+    try limited.execute("DROP VIEW restricted_v", &out);
+    try quiescent(&store);
 }
 
 pub fn main() !void {
@@ -970,6 +1004,7 @@ pub fn main() !void {
     try interleavedCommitOwner();
     try xmlInputSetting();
     try clientNotices();
+    try relationRestrictions();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }

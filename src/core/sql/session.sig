@@ -38,6 +38,7 @@
 const types = @import("types.sig");
 const mvcc = @import("mvcc.sig");
 const Error = types.Error;
+const RelationKinds = @import("value.sig").RestrictedRelationKinds;
 
 pub fn Sessions(comptime config: types.Config) type {
     if (config.setting_bytes < 16 or config.setting_bytes > 0xffff) @compileError("setting_bytes must be 16..65535");
@@ -83,7 +84,12 @@ pub fn Sessions(comptime config: types.Config) type {
             check_function_bodies: bool = true,
             row_security: bool = true,
             synchronize_seqscans: bool = true,
+            restricted_relation_kinds: RelationKinds = .{},
+            restriction_text: SettingText = .{},
             search_path: SettingText = SettingText.literal("\"$user\", public"),
+            /// Origin bits for the named engine settings in pg_settings.
+            client_settings: u8 = 0,
+            session_settings: u8 = 0,
             custom: [config.custom_settings]Custom = @splat(.{}),
             /// SET ROLE (catalog-security lane): the role OID, 0 for NONE
             /// (current_user is then the session user).
