@@ -49,7 +49,12 @@ pub fn Queue(comptime capacity: usize) type {
         /// ring. PermissionDenied or SystemOutdated can retain poll transport.
         pub fn init() !Self {
             const entries = try std.math.ceilPowerOfTwo(u16, @intCast(capacity * 2));
-            return .{ .ring = try linux.IoUring.init(entries, 0) };
+            var ring = try linux.IoUring.init(entries, 0);
+            errdefer ring.deinit();
+            const probe = try ring.get_probe();
+            if (!probe.is_supported(.RECV) or !probe.is_supported(.SEND) or !probe.is_supported(.ASYNC_CANCEL))
+                return error.SocketOperationsUnsupported;
+            return .{ .ring = ring };
         }
 
         /// Closing with pending operations would cut short the caller's

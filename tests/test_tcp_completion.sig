@@ -21,7 +21,7 @@ fn check(ok: bool) !void {
 
 fn pair(nonblocking: bool) ![2]linux.fd_t {
     var sockets: [2]linux.fd_t = undefined;
-    const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | (if (nonblocking) linux.SOCK.NONBLOCK else 0);
+    const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | (if (nonblocking) @as(u32, linux.SOCK.NONBLOCK) else 0);
     if (linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &sockets)) != .SUCCESS)
         return error.SocketPair;
     return sockets;
