@@ -1092,7 +1092,7 @@ pub fn Database(comptime config: Config) type {
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
                     // These catalog lookups use the serialized database hook.
-                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef=>return error.UnsupportedStatement,
+                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_partition_ancestors=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                     .current_setting,.set_config,.pg_backend_pid,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
@@ -4642,6 +4642,12 @@ pub fn Database(comptime config: Config) type {
         /// (`<table>_pkey`) or a sequence; -1 (or 42P01) when missing.
         fn regclassOid(self: *const Self, text: []const u8, strict: bool) Error!i64 {
             const missing: Error!i64 = if (strict) error.TableNotFound else -1;
+            if (text.len == 1 and text[0] == '-') return 0;
+            if (text.len != 0) {
+                for (text) |byte| {
+                    if (byte < '0' or byte > '9') break;
+                } else return std.fmt.parseInt(u32, text, 10) catch error.NumericValueOutOfRange;
+            }
             // `schema.name` of a user schema (unquoted parts fold to lower case).
             if (std_dot(text)) |dot| {
                 const schema = regclassName(text[0..dot]) orelse return missing;
@@ -5451,6 +5457,23 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             return null;
+        }
+
+        fn postgresPartitionAncestors(ptr: *anyopaque, oid: u32, out: []u32) Error!usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const snapshot = self.seq_snap;
+            var slot = self.visibleTableSlot(oid, snapshot) orelse return 0;
+            const first = &self.tables[slot];
+            if (first.relkind != 'p' and first.partition.bound == .none) return 0;
+            var count: usize = 0;
+            while (true) {
+                if (count == out.len) return error.InvalidChangeRecord;
+                const table = &self.tables[slot];
+                out[count] = table.oid;
+                count += 1;
+                if (table.partition.bound == .none) return count;
+                slot = self.visibleTableSlot(table.parent, snapshot) orelse return error.InvalidChangeRecord;
+            }
         }
 
         fn renderConstraint(self: *const Self, table: *const S.Table, constraint: ?*const S.Constraint, kind: S.ConstraintKind, pretty: bool, out: []u8) Error!usize {
@@ -7217,7 +7240,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .partition_ancestors = &postgresPartitionAncestors };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
