@@ -822,6 +822,27 @@ fn runningControl() !void {
     try quiescent(&store);
 }
 
+fn interleavedCommitOwner() !void {
+    var store: Store = .{};
+    var owner: Store.Connection = .{ .store = &store, .id = 1 };
+    var peer: Store.Connection = .{ .store = &store, .id = 2 };
+    var result: DB.Result = .{};
+    try owner.beginTransaction();
+    try owner.execute("SET LOCAL search_path TO public", &result);
+    try owner.execute("LISTEN owner_channel", &result);
+    try peer.execute("SELECT 1", &result);
+    try owner.commitTransaction();
+
+    try owner.execute("SHOW search_path", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0] == .text);
+    try check(equal(result.rows[0].cells[0].text.slice(), "\"$user\", public"));
+    try peer.execute("NOTIFY owner_channel, 'actual owner'", &result);
+    var message: Store.Connection.Notification = undefined;
+    try check(owner.takeNotification(&message));
+    try check(equal(message.payloadSlice(), "actual owner"));
+    try check(!peer.takeNotification(&message));
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
@@ -832,6 +853,7 @@ pub fn main() !void {
     try timers();
     try savepoints();
     try runningControl();
+    try interleavedCommitOwner();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }
