@@ -402,6 +402,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         startup: bool = false,
         failed: bool = false,
+        waiting_for_command: bool = false,
         oversize_remaining: usize = 0,
         oversize_tag: u8 = 0,
         authentication: ?scram.Server = null,
@@ -464,6 +465,15 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         pub fn requiredCapacity(self: *const Self) error{BufferTooSmall}!usize {
             return responseCapacityFor(self.result.rows.len);
+        }
+
+        /// A ReadyForQuery boundary in an open block can arm the reactor's
+        /// monotonic idle timer. A partial command leaves the state intact.
+        pub fn idleTransactionTimeout(self: *const Self, db: *const DB) u32 {
+            if (comptime @hasDecl(DB, "idleTransactionTimeout")) {
+                if (self.waiting_for_command) return db.idleTransactionTimeout();
+            }
+            return 0;
         }
 
         pub const DetachedCandidate=union(enum) {metadata,describe:[]const u8,execute:[]const u8};
@@ -562,6 +572,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const size = read32(input[prefix..][0..4]);
             var w: Writer = .{ .bytes = output };
             if (size < 4 or size > max_packet) {
+                self.waiting_for_command = false;
                 // Drain a bounded oversized SQL frame without retaining it.
                 // A valid query that exceeds our budget gets a SQL error and
                 // remains synchronized, rather than an unread-body TCP reset.
@@ -576,6 +587,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             const total: usize = @as(usize, size) + prefix;
             if (input.len < total) return .{};
+            self.waiting_for_command = false;
             var close = false;
             if (self.authentication != null and self.authentication.?.state != .complete) {
                 close = self.authenticate(db, input[0], input[5..total], &w) catch blk: {
@@ -780,7 +792,6 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
         }
         fn ready(self: *Self, db: *DB, w: *Writer) !void {
-            _ = self;
             // Committed notifications for this session (between transactions,
             // as PostgreSQL's ProcessCompletedNotifies), then changed reported
             // settings, before ReadyForQuery.
@@ -789,6 +800,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const p = try w.begin('Z');
             try w.byte(if (@hasDecl(DB, "transactionStatus")) db.transactionStatus() else 'I');
             w.end(p);
+            self.waiting_for_command = true;
         }
         /// NotificationResponse ('A'): sender pid, channel, payload.
         fn writeNotifications(db: *DB, w: *Writer) !void {
@@ -1935,6 +1947,13 @@ pub fn connectionLimitError(output: []u8) error{BufferTooSmall}!usize {
 pub fn memoryLimitError(output: []u8) error{BufferTooSmall}!usize {
     var writer: Writer = .{ .bytes = output };
     try fatal(&writer, "53200", "database memory budget exhausted");
+    return writer.at;
+}
+
+/// PostgreSQL terminates the session after sending this fatal response.
+pub fn idleTransactionTimeoutError(output: []u8) error{BufferTooSmall}!usize {
+    var writer: Writer = .{ .bytes = output };
+    try fatal(&writer, "25P03", "terminating connection due to idle-in-transaction timeout");
     return writer.at;
 }
 

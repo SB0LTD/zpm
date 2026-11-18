@@ -112,6 +112,7 @@ pub fn SettingsOf(comptime Zone: type) type {
         const Self = @This();
         lock_timeout_ms: u32 = 0,
         statement_timeout_ms: u32 = 0,
+        idle_in_transaction_session_timeout_ms: u32 = 0,
         application_name: [64]u8 = @splat(0),
         application_name_len: u8 = 0,
         /// TimeZone as SHOW reports it, and the resolved zone.
@@ -221,7 +222,7 @@ pub const deadlock_timeout_ms: u32 = 1000;
 
 /// Settings this store implements; the engine owns the others it knows
 /// (transaction_*, default_transaction_*, search_path, placeholders).
-const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
+const Parameter = enum { lock_timeout, statement_timeout, idle_in_transaction_session_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -256,6 +257,61 @@ fn parseMilliseconds(text: []const u8) !u32 {
     const total = value * scale;
     if (total > 0x7fffffff) return error.InvalidSettingValue;
     return @intCast(total);
+}
+
+const idle_timeout_units = [_]struct { name: []const u8, milliseconds: f64 }{
+    .{ .name = "d", .milliseconds = 86400000 },
+    .{ .name = "h", .milliseconds = 3600000 },
+    .{ .name = "min", .milliseconds = 60000 },
+    .{ .name = "s", .milliseconds = 1000 },
+    .{ .name = "ms", .milliseconds = 1 },
+    .{ .name = "us", .milliseconds = 0.001 },
+};
+
+fn timeoutNumber(text: []const u8) ?f64 {
+    if (text.len == 0 or std.mem.indexOfScalar(u8, text, '_') != null) return null;
+    const offset: usize = if (text[0] == '-' or text[0] == '+') 1 else 0;
+    const unsigned = text[offset..];
+    if (unsigned.len == 0) return null;
+    if (std.mem.startsWith(u8, unsigned, "0x") or std.mem.startsWith(u8, unsigned, "0X")) {
+        if (std.fmt.parseInt(i64, text, 0)) |number| return @floatFromInt(number) else |_| {}
+    } else if (std.mem.indexOfAny(u8, text, ".eE") == null) {
+        const base: u8 = if (unsigned.len > 1 and unsigned[0] == '0') 8 else 10;
+        const number = std.fmt.parseInt(i64, text, base) catch return null;
+        return @floatFromInt(number);
+    }
+    const number = std.fmt.parseFloat(f64, text) catch return null;
+    if (!std.math.isFinite(number)) return null;
+    return number;
+}
+
+fn nearestEven(number: f64) f64 {
+    const lower = @floor(number);
+    const fraction = number - lower;
+    return if (fraction > 0.5 or (fraction == 0.5 and @rem(lower, 2.0) != 0.0)) lower + 1.0 else lower;
+}
+
+fn parseIdleTransactionTimeout(text: []const u8) !u32 {
+    const spaces = " \t\n\r\x0b\x0c";
+    const source = std.mem.trim(u8, text, spaces);
+    const milliseconds = timeoutNumber(source) orelse converted: {
+        // Match longer suffixes first, including ms/us before s.
+        var index = idle_timeout_units.len;
+        while (index != 0) {
+            index -= 1;
+            const unit = idle_timeout_units[index];
+            if (!std.mem.endsWith(u8, source, unit.name)) continue;
+            const value = timeoutNumber(std.mem.trimEnd(u8, source[0 .. source.len - unit.name.len], spaces)) orelse return error.InvalidSettingValue;
+            const scaled = value * unit.milliseconds;
+            if (index + 1 == idle_timeout_units.len) break :converted scaled;
+            const next_smaller = idle_timeout_units[index + 1].milliseconds;
+            break :converted nearestEven(scaled / next_smaller) * next_smaller;
+        }
+        return error.InvalidSettingValue;
+    };
+    const rounded = nearestEven(milliseconds);
+    if (!std.math.isFinite(rounded) or rounded < 0 or rounded > 0x7fffffff) return error.InvalidSettingValue;
+    return @intFromFloat(rounded);
 }
 
 /// PostgreSQL's display: the largest unit that divides the value evenly.
@@ -882,6 +938,13 @@ pub fn Store(comptime Raw: type) type {
                 return if (self.failed) 'E' else 'T';
             }
 
+            /// Current PostgreSQL idle limit in an open or failed block.
+            /// The protocol and reactor own the command-read boundary and clock.
+            pub fn idleTransactionTimeout(self: *const Connection) u32 {
+                if (self.id == 0 or !self.in_transaction or self.pending.active) return 0;
+                return self.settings.idle_in_transaction_session_timeout_ms;
+            }
+
             pub fn isAutocommit(self: *const Connection) bool {
                 return self.autocommit;
             }
@@ -978,6 +1041,7 @@ pub fn Store(comptime Raw: type) type {
                 switch (which) {
                     .lock_timeout => target.lock_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
                     .statement_timeout => target.statement_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
+                    .idle_in_transaction_session_timeout => target.idle_in_transaction_session_timeout_ms = if (is_default and value.len == 0) 0 else try parseIdleTransactionTimeout(value),
                     .application_name => {
                         const length = @min(value.len, 63);
                         @memcpy(target.application_name[0..length], value[0..length]);
@@ -1050,6 +1114,7 @@ pub fn Store(comptime Raw: type) type {
                 const value: []const u8 = switch (which) {
                     .lock_timeout => return formatMilliseconds(self.settings.lock_timeout_ms, out),
                     .statement_timeout => return formatMilliseconds(self.settings.statement_timeout_ms, out),
+                    .idle_in_transaction_session_timeout => return formatMilliseconds(self.settings.idle_in_transaction_session_timeout_ms, out),
                     .deadlock_timeout => return formatMilliseconds(deadlock_timeout_ms, out),
                     .application_name => self.settings.applicationName(),
                     .timezone => self.settings.timeZone(),
@@ -1269,6 +1334,7 @@ pub fn Store(comptime Raw: type) type {
                 switch (which) {
                     .lock_timeout => target.lock_timeout_ms = source.lock_timeout_ms,
                     .statement_timeout => target.statement_timeout_ms = source.statement_timeout_ms,
+                    .idle_in_transaction_session_timeout => target.idle_in_transaction_session_timeout_ms = source.idle_in_transaction_session_timeout_ms,
                     .application_name => {
                         target.application_name = source.application_name;
                         target.application_name_len = source.application_name_len;
