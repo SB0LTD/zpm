@@ -1,0 +1,55 @@
+name: Private TLS server exchange
+
+on:
+  push:
+    branches: [ci/qualified-main-tls-server-arm64-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  openssl:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    env:
+      SOURCE: c426897765b2719ddade224c2acf9cd4e32a06a6
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+      - name: Verify SDK and run the exact exchange
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$SOURCE"
+          tree="$RUNNER_TEMP/source"
+          git worktree add --detach "$tree" "$SOURCE"
+          evidence="$GITHUB_WORKSPACE/evidence"
+          mkdir "$RUNNER_TEMP/sdk" "$evidence"
+          printf 'workflow=%s\nsource=%s\n' "$GITHUB_SHA" "$SOURCE" > "$evidence/source.log"
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-aarch64-linux.tar.xz"
+          url="https://github.com/SB0LTD/sig/releases/download/$tag/$asset"
+          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/$asset"
+          echo "ef890f870f3215e60d25588742b74fa9d2808addbc0112b7c37818a73dfb0643  $RUNNER_TEMP/$asset" | sha256sum -c > "$evidence/sdk.log"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig -print -quit)
+          stdlib=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' -print -quit)
+          test -x "$compiler"
+          test -f "$stdlib"
+          { printf 'sdk=%s\n' "$url"; "$compiler" version; openssl version; sha256sum "$compiler"; } >> "$evidence/sdk.log"
+          python3 "$tree/tools/test_tls_server_openssl.py" --sig "$compiler" --sig-lib-dir "${stdlib%/std/std.sig}" \
+            --work-dir "$evidence" | tee "$evidence/result.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: tls-server-openssl-evidence
+          path: |
+            evidence/source.log
+            evidence/sdk.log
+            evidence/result.log
+            evidence/**/report.json
+            evidence/**/unit.log
+            evidence/**/openssl-client.log
+            evidence/**/server.log
