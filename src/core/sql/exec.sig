@@ -5127,19 +5127,43 @@ pub fn Exec(comptime config: types.Config) type {
             return found;
         }
 
+        fn projectedFilterInputs(pool: *const Ast.Pool, table: *const S.Table, query: *const B.Select,
+            snap: storage.Snapshot, committed_only: bool, predicates: []Query.CompactPredicate) ?usize {
+            if (comptime !S.compact_enabled) return null;
+            if (!S.hasCompactScan(table) or !committed_only or !table.summary.valid or table.summary.csn > snap.csn or
+                table.scan_high != table.row_high or query.where == none or query.order_count != 0 or
+                query.limit != 0xffffffffffffffff) return null;
+            var count: usize = 0;
+            if (!Query.compactPredicates(pool, query.where, table, predicates, &count) or count == 0) return null;
+            for (predicates[0..count]) |predicate| if (!predicate.nonnull) return null;
+            return count;
+        }
+
+        pub const projected_cache_columns: usize = @min(config.columns, 4);
+
+        pub fn cacheableProjectedFilter(pool: *const Ast.Pool, table: *const S.Table, query: *const B.Select,
+            snapshot: storage.Snapshot, min_scan_rows: usize) bool {
+            if (query.key != none or query.lock.strength != .none or query.has_nominal_types or
+                query.count == 0 or query.count > projected_cache_columns or table.row_high < min_scan_rows) return false;
+            var predicates: [config.predicates]Query.CompactPredicate = undefined;
+            _ = projectedFilterInputs(pool, table, query, snapshot, true, &predicates) orelse return false;
+            for (query.targets[0..query.count]) |id| {
+                const node = &pool.nodes[id];
+                if (node.kind != .column or node.level != 0 or node.relation != 0 or
+                    !value_module.integral(node.ty) or
+                    table.summary.columns[node.column].nonnull != table.summary.rows) return false;
+            }
+            return true;
+        }
+
         /// Filter narrow committed integer columns first; resolve full MVCC
         /// versions only for survivors. Non-null proofs preserve AND's exact
         /// left-to-right short-circuit checkpoint count. Nullable/computed
         /// predicates and old/own-write snapshots keep the canonical path.
         noinline fn projectedFilterScan(ctx:*E.Context,table:*const S.Table,query:*const B.Select,snap:storage.Snapshot,
             indices:[]u32,committed_only:bool,stats:*ReadStats) Error!?usize {
-            if(comptime !S.compact_enabled) return null;
-            if(!S.hasCompactScan(table) or !committed_only or !table.summary.valid or table.summary.csn>snap.csn or table.scan_high!=table.row_high or
-                query.where==none or query.order_count!=0 or query.limit!=0xffffffffffffffff) return null;
             var predicates:[config.predicates]Query.CompactPredicate=undefined;
-            var used:usize=0;
-            if(!Query.compactPredicates(ctx.pool,query.where,table,&predicates,&used) or used==0) return null;
-            for(predicates[0..used]) |predicate| if(!predicate.nonnull) return null;
+            const used = projectedFilterInputs(ctx.pool, table, query, snap, committed_only, &predicates) orelse return null;
             stats.projected_filter_scans+=1;
             const dense=table.summary.rows>=0 and @as(u64,@intCast(table.summary.rows))==table.scan_high;
             var found:usize=0;var start:usize=0;
