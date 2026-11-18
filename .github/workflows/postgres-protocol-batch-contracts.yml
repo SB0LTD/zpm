@@ -37,7 +37,7 @@ jobs:
           test "$(git rev-parse HEAD^)" = "fc122d139a4f93f7722dc29add21e4e856f298ee"
           git rev-parse HEAD^ >evidence/source.txt
           "$SIG" version | tee evidence/sig-version.log
-          "$SIG" build run-contract-sql-integral-versions run-contract-sql-numeric run-contract-sql-change-log \
+          "$SIG" build run-contract-sql-integral-versions run-contract-sql-types run-contract-sql-numeric-functions run-contract-sql-change-log \
             --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
       - uses: actions/upload-artifact@v4
         if: always()
