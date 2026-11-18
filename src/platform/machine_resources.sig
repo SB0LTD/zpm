@@ -171,6 +171,57 @@ fn linuxRead(_: ?*anyopaque,path:[]const u8,output:[]u8) Error!?[]const u8 {
         used+=count;
     }
 }
+/// Linux identifies a physical core by its least-numbered hardware thread.
+pub const Processor = struct { cpu: u32, core: u32 };
+pub const linux_processor_capacity = @bitSizeOf(std.os.linux.cpu_set_t);
+
+/// Enumerate the current thread's effective allowed CPUs in caller storage.
+/// Affinity covers only the returned CPUs, even if a core has other siblings.
+pub fn linuxProcessors(output: []Processor) Error![]const Processor {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const linux = std.os.linux;
+    var mask: linux.cpu_set_t = @splat(0);
+    if (linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &mask)) != .SUCCESS)
+        return error.ProbeFailed;
+    var used: usize = 0;
+    for (mask, 0..) |word, index| {
+        var bits = word;
+        while (bits != 0) {
+            if (used == output.len) return error.BufferTooSmall;
+            const cpu: u32 = @intCast(index * @bitSizeOf(usize) + @ctz(bits));
+            output[used] = .{ .cpu = cpu, .core = try linuxCore(cpu) };
+            used += 1;
+            bits &= bits - 1;
+        }
+    }
+    if (used == 0) return error.InvalidObservation;
+    return output[0..used];
+}
+
+fn linuxCore(cpu: u32) Error!u32 {
+    var path: [96]u8 = undefined;
+    const name = std.fmt.bufPrint(&path, "/sys/devices/system/cpu/cpu{d}/topology/thread_siblings_list", .{cpu})
+        catch return error.BufferTooSmall;
+    var input: [256]u8 = undefined;
+    const siblings = (try linuxRead(null, name, &input)) orelse return error.ProbeFailed;
+    var ranges = std.mem.splitScalar(u8, facts.trim(siblings), ',');
+    var first_cpu: ?u32 = null;
+    var previous: ?u64 = null;
+    var member = false;
+    while (ranges.next()) |range| {
+        var parts = std.mem.splitScalar(u8, range, '-');
+        const first = try facts.number(parts.next().?);
+        const last = if (parts.next()) |end| try facts.number(end) else first;
+        if (parts.next() != null or first > last or last > std.math.maxInt(u32) or
+            (previous != null and first <= previous.?)) return error.InvalidObservation;
+        if (first_cpu == null) first_cpu = @intCast(first);
+        member = member or (first <= cpu and cpu <= last);
+        previous = last;
+    }
+    if (!member) return error.InvalidObservation;
+    return first_cpu.?;
+}
+
 pub fn observe(b:Buffers,owned_commit_bytes:u64) Error!Observation {
     if(builtin.os.tag==.linux) {
         var result=try collectLinux(.{.read=linuxRead},b,owned_commit_bytes);

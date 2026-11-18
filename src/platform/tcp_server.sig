@@ -146,6 +146,16 @@ pub fn accept(listener: Socket) Error!?Socket {
     }
 }
 
+/// Advisory Linux socket receive CPU. Unknown or unsupported hints return null.
+pub fn incomingCpu(fd: Socket) ?u32 {
+    if (comptime builtin.os.tag != .linux) return null;
+    var value: c_int = -1;
+    var size: linux.socklen_t = @sizeOf(c_int);
+    const result = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.INCOMING_CPU, @ptrCast(&value), &size);
+    if (linux.errno(result) != .SUCCESS or size != @sizeOf(c_int) or value < 0) return null;
+    return @intCast(value);
+}
+
 /// null means would-block; zero means an orderly peer shutdown when buf is
 /// nonempty. Empty buffers return zero without probing the connection.
 pub fn recv(fd: Socket, buf: []u8) Error!?usize {

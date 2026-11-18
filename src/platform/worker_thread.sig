@@ -53,6 +53,24 @@ pub const Thread = struct {
             self.handle = std.Thread.spawn(.{ .stack_size = stack_bytes }, run, .{self}) catch return error.ThreadCreationFailed;
         }
     }
+    /// Pin an owned Linux worker to one already-allowed CPU before admission.
+    pub fn pinToCpu(self: *const Thread, cpu: u32) error{UnsupportedPlatform, WorkerAffinityUnavailable}!void {
+        if (comptime builtin.os.tag != .linux or builtin.link_libc) return error.UnsupportedPlatform;
+        const linux = std.os.linux;
+        const worker = self.handle orelse return error.WorkerAffinityUnavailable;
+        if (cpu >= @bitSizeOf(linux.cpu_set_t)) return error.WorkerAffinityUnavailable;
+        const tid: linux.pid_t = @intCast(worker.getHandle());
+        var mask: linux.cpu_set_t = @splat(0);
+        if (linux.errno(linux.sched_getaffinity(tid, @sizeOf(linux.cpu_set_t), &mask)) != .SUCCESS)
+            return error.WorkerAffinityUnavailable;
+        const word = cpu / @bitSizeOf(usize);
+        const bit = @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
+        if (mask[word] & bit == 0) return error.WorkerAffinityUnavailable;
+        mask = @splat(0);
+        mask[word] = bit;
+        linux.sched_setaffinity(tid, &mask) catch return error.WorkerAffinityUnavailable;
+    }
+
     /// A failed native wait retains ownership. Never close a live thread handle.
     pub fn join(self: *Thread) Error!void {
         if (self.handle) |handle| {
