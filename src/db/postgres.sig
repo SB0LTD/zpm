@@ -864,8 +864,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         fn beginSimpleBatch(self: *Self, db: *DB, source: []const u8) !void {
             const count = try db.preflightSimpleQueryBatch(source);
-            var scan: sql.PostgresStatements = .{ .source = source };
-            while (try scan.next()) |span| {
+            var boundaries: sql.PostgresStatements = .{ .source = source };
+            while (try boundaries.next()) |span| {
                 const command_source = span.slice(source);
                 var tokens: sql.Tokenizer = .{ .source = command_source, .text_limit = command_source.len };
                 const token = try tokens.next();
@@ -889,8 +889,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// parked statements are redelivered without rerunning prior commands.
         fn simpleBatchStep(self: *Self, db: *DB, source: []const u8, w: *Writer) !void {
             if (source.len != self.simple_batch.source_length) return error.ProtocolViolation;
-            var scan: sql.PostgresStatements = .{ .source = source, .position = self.simple_batch.position };
-            const span = (try scan.next()) orelse return error.ProtocolViolation;
+            var boundaries: sql.PostgresStatements = .{ .source = source, .position = self.simple_batch.position };
+            const span = (try boundaries.next()) orelse return error.ProtocolViolation;
             const command_source = span.slice(source);
             try db.beginSimpleQueryStep();
             try DB.checkSimpleQueryUtility(command_source);
@@ -899,7 +899,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const final = self.simple_batch.remaining == 1;
             if (final) try db.finishSimpleQueryBatch(true);
             try self.command(w, command_source);
-            self.simple_batch.position = scan.position;
+            self.simple_batch.position = boundaries.position;
             self.simple_batch.remaining -= 1;
             if (final) {
                 self.simple_batch = .{};
@@ -919,9 +919,9 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     };
                     try self.beginSimpleFrame(source);
                     if (comptime has_simple_batch) if (db.simpleQueryBatchAvailable() and needsQueryScan(source)) {
-                        var scan: sql.PostgresStatements = .{ .source = source };
-                        if (try scan.next()) |first| {
-                            if (try scan.next() != null) {
+                        var boundaries: sql.PostgresStatements = .{ .source = source };
+                        if (try boundaries.next()) |first| {
+                            if (try boundaries.next() != null) {
                                 try self.beginSimpleBatch(db, source);
                                 try self.simpleBatchStep(db, source, w);
                                 return false;
