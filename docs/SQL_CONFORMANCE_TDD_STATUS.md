@@ -9,8 +9,22 @@ AccessExclusive locks and RAMSQL `da0b68f1` routes reads through the existing
 table lock queue. The replacement matched all 46 unchanged native PostgreSQL
 18.3 durable isolation schedules on Windows. The focused ZPM contract ran
 2,400 queries on eight threads and passed 133 assertions.
+[The exact hosted replacement](https://github.com/SB0LTD/ramsql/actions/runs/44202780245)
+passed all four PostgreSQL 16/18 lanes. Each matched 37 gate probes, all 46
+isolation schedules and the 11 COPY cases. Semantic counts were 313 per
+memory lane and 331 per durable SCRAM lane. Both durable lanes matched four
+crash schedules. The one classified COPY divergence uses an explicitly
+configured 512-row budget and verifies the table remains unchanged.
 [Hosted differential evidence](https://github.com/SB0LTD/ramsql/actions/runs/44195561145) ·
 [Replacement matrix](https://github.com/SB0LTD/ramsql/actions/runs/44202780430)
+
+The exact replacement also repeats 118 of 118 native smoke matches across
+PostgreSQL 18.3, MySQL 8.4.13 and SQL Server 2022 CU28. This completes that
+inventory run. The broader SQL, operational tooling and dialect tasks remain
+in the conformance inventory. The combined projected-read candidate
+`bbaca18` also matched all 331 durable SCRAM semantic cases on Windows.
+[Replacement scope](https://github.com/SB0LTD/ramsql/pull/70) ·
+[SQL Server evidence](https://github.com/benor1470/dbMeter/actions/runs/44203962081)
 
 RAMSQL `0af167b420edd605597bf5bb7c25dc0fc9483136` with ZPM
 `aa0250509ebb1befb9d9864bd98581f7e695f970` matched all 118 original smoke
