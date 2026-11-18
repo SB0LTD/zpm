@@ -1314,9 +1314,20 @@ pub fn Storage(comptime config: types.Config) type {
             return V.compare(borrowVersionCell(table, version, column, &scratch), value) == 0;
         }
 
-        fn keyHome(table: *const Table, entry: u32) usize {
+        fn keyPosition(table: *const Table, version: u32) ?usize {
+            const column = table.primary_column orelse return null;
             var scratch: V.Cell = undefined;
-            return V.hash(borrowVersionCell(table, entry - 1, table.primary_column.?, &scratch)) & (table.key_index.len - 1);
+            const key = borrowVersionCell(table, version, column, &scratch);
+            // A historical version can predate a new primary key. The new
+            // index only contains non-null keys, and validation rejects any
+            // null visible under the DDL's validation snapshot.
+            if (key.* == .null_value) return null;
+            return V.hash(key) & (table.key_index.len - 1);
+        }
+
+        fn keyHome(table: *const Table, entry: u32) usize {
+            // Deletion visits only entries inserted by indexKeyOnly.
+            return keyPosition(table, entry - 1).?;
         }
 
         /// Backward-shift deletion keeps linear probing tombstone-free.
@@ -1523,15 +1534,13 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         fn indexKeyOnly(table: *Table, version: u32) void {
-            if (table.primary_column == null) return;
-            var position = keyHome(table, version + 1);
+            var position = keyPosition(table, version) orelse return;
             while (table.key_index[position] != 0) position = (position + 1) & (table.key_index.len - 1);
             table.key_index[position] = version + 1;
         }
 
         fn unindexKey(table: *Table, version: u32) void {
-            if (table.primary_column == null) return;
-            var position = keyHome(table, version + 1);
+            var position = keyPosition(table, version) orelse return;
             while (table.key_index[position] != version + 1) {
                 if (table.key_index[position] == 0) return;
                 position = (position + 1) & (table.key_index.len - 1);
