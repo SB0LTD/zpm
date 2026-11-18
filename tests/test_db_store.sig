@@ -933,6 +933,29 @@ fn xmlInputSetting() !void {
     try quiescent(&store);
 }
 
+fn clientNotices() !void {
+    const Level = store_module.ClientMessageLevel;
+    try check(Level.info.visibleAt(.@"error"));
+    try check(Level.@"error".visibleAt(.@"error") and Level.fatal.visibleAt(.@"error"));
+    try check(!Level.warning.visibleAt(.@"error") and Level.warning.visibleAt(.warning));
+    try check(Level.log.visibleAt(.debug1) and !Level.log.visibleAt(.notice));
+    var store: Store = .{};
+    var connection: Store.Connection = .{ .store = &store, .id = 1 };
+    var out: DB.Result = .{};
+    try connection.execute("COMMIT", &out);
+    const warning = connection.takeNotice() orelse return error.MissingCommitWarning;
+    try check(warning.level == .warning and equal(warning.state, "25P01"));
+    try check(connection.takeNotice() == null);
+    try connection.execute("SET client_min_messages = 'error'", &out);
+    try connection.execute("ROLLBACK", &out);
+    try check(connection.takeNotice() == null);
+    try connection.execute("RESET client_min_messages", &out);
+    try connection.execute("SET LOCAL check_function_bodies = off", &out);
+    try check(connection.takeNotice() != null);
+    try connection.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "on"));
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
@@ -946,6 +969,7 @@ pub fn main() !void {
     try runningTransactionTimeout();
     try interleavedCommitOwner();
     try xmlInputSetting();
+    try clientNotices();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }
