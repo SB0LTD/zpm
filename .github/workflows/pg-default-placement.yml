@@ -1,0 +1,57 @@
+name: PostgreSQL default relation placement qualification
+
+on:
+  push:
+    branches: [ci/pg-default-placement-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  placement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    services:
+      postgres:
+        image: postgres:18.3-bookworm@sha256:80630f83606d8db77d30b3851b16a9f78be2d0d4dda6f7b82a1fdca5ebe3acba
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the stock PostgreSQL placement defaults
+        env:
+          POSTGRES_ID: ${{ job.services.postgres.id }}
+        run: |
+          mkdir evidence
+          docker exec "$POSTGRES_ID" psql -XAtq -U postgres -c 'SHOW server_version' | tee evidence/postgres-version.txt
+          docker exec -i "$POSTGRES_ID" psql -XqAt -U postgres -F '|' -v ON_ERROR_STOP=1 \
+            <tests/sql_conformance/pg_default_placement.sql >evidence/native.txt
+          diff -u tests/sql_conformance/pg_default_placement.expected evidence/native.txt
+      - name: Install checksum-verified Sig 0.6.5
+        shell: bash
+        run: |
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-x86_64-linux.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" -o "$RUNNER_TEMP/$asset"
+          echo "179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a  $RUNNER_TEMP/$asset" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sdk"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig | head -n 1)
+          standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' | head -n 1)
+          test -x "$compiler"
+          test -f "$standard"
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+      - name: Run default placement and session settings contracts
+        shell: bash
+        run: |
+          "$SIG" version | tee evidence/sig-version.log
+          "$SIG" build run-contract-sql-tx-session \
+            --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postgres-default-placement
+          path: evidence/
