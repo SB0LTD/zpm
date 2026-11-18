@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  ZPM_SOURCE_REVISION: 787c905b5b96bae72b05af5b5eaf621bdca08aaa
+  ZPM_SOURCE_REVISION: d5f11843ed57ded08f888681afd43254a8e7287a
   SIG_TAG: sig-0.6.5-zig0.17.0.3c72687
 
 jobs:
