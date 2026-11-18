@@ -215,12 +215,23 @@ fn relationMetadata() !void {
     try expect(security, "t|f");
 }
 
+fn collationMetadata() !void {
+    db = .{};
+    try run("CREATE DOMAIN shown_int AS INT");
+    try run("CREATE TABLE t(a TEXT,b VARCHAR(3),c NAME,d NAME[],e TEXT[],f INT)");
+    try expect("SELECT oid,collname,collnamespace,collprovider,collisdeterministic,collencoding FROM pg_catalog.pg_collation ORDER BY oid", "100|default|11|d|t|-1;950|C|11|c|t|-1;951|POSIX|11|c|t|-1;962|ucs_basic|11|b|t|6");
+    try expect("SELECT typname,typcollation FROM pg_type WHERE typname IN ('name','_name','text','_text','int4','_int4','shown_int','_shown_int') ORDER BY typname", "_int4|0;_name|950;_shown_int|0;_text|100;int4|0;name|950;shown_int|0;text|100");
+    try expect("SELECT attname,attcollation FROM pg_attribute WHERE attrelid='t'::regclass AND attnum>0 ORDER BY attnum", "a|100;b|100;c|950;d|950;e|100;f|0");
+    try expect("SELECT a.attname,(SELECT c.collname FROM pg_catalog.pg_collation c,pg_catalog.pg_type t WHERE c.oid=a.attcollation AND t.oid=a.atttypid AND a.attcollation<>t.typcollation) FROM pg_catalog.pg_attribute a WHERE a.attrelid='t'::regclass AND a.attnum>0 ORDER BY a.attnum", "a|NULL;b|NULL;c|NULL;d|NULL;e|NULL;f|NULL");
+}
+
 pub fn main(init: std.process.Init) !void {
     try types();
     try lifecycle();
     try replay();
     try characterMetadata();
     try relationMetadata();
+    try collationMetadata();
     var buffer: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-catalog\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d}}}\n", .{ assertions, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
