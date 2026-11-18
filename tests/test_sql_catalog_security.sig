@@ -572,7 +572,7 @@ fn namespaceAclMaterialization() !void {
     const original: DB.Snapshot = .{ .csn = db.csn };
     const pending = try db.begin();
     try statement(pending, noop_revoke);
-    const own: DB.Snapshot = .{ .csn = db.csn, .slot = pending, .epoch = db.txs[pending].epoch, .cid = db.cid + 1 };
+    const own: DB.Snapshot = .{ .csn = db.csn, .slot = pending, .epoch = db.txs[pending].epoch, .cid = db.txs[pending].cid +% 1 };
     const own_state = try aclState(&db, own);
     try check(own_state);
     std.debug.print("acl state own={d}\n", .{@intFromBool(own_state)});
