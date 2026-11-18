@@ -200,6 +200,7 @@ fn commit(slot: u16) !void {
 }
 
 const state_probes = [_][]const u8{
+    "SELECT oid, nspname, nspowner FROM pg_namespace ORDER BY oid",
     "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolconnlimit, rolbypassrls, oid FROM pg_roles ORDER BY oid",
     "SELECT oid, roleid, member, grantor, admin_option FROM pg_auth_members ORDER BY oid",
     "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges ORDER BY table_name, grantee, privilege_type",
@@ -376,7 +377,299 @@ fn namespacesAndExtensions() !void {
     try sameState();
 }
 
+fn namespaceOwners() !void {
+    try reset();
+    try run("CREATE SCHEMA legacy_owner");
+    try check(record[8] == 19);
+    try expect("SELECT nspowner FROM pg_namespace WHERE nspname='legacy_owner'", "10");
+    try metadata("SELECT nspowner FROM pg_namespace", &.{"nspowner"}, &.{26});
+    try run("CREATE ROLE schema_owner SUPERUSER");
+    const owner_oid = try roleOid("schema_owner");
+    try as("schema_owner");
+    const abandoned = try db.begin();
+    try statement(abandoned, "CREATE SCHEMA abandoned_owner");
+    db.abort(abandoned);
+    try expect("SELECT nspowner FROM pg_namespace WHERE nspname='abandoned_owner'", "");
+
+    var out: DB.Result = .{};
+    var used: usize = 0;
+    try db.executeChanges("CREATE SCHEMA owned_namespace", &out, &record, &used, null, null);
+    try check(record[8] == 19);
+    const owner_offset: usize = 14 + @as(usize, record[13]);
+    try check(owner_offset + 4 == used);
+    try check(std.mem.readInt(u32, record[owner_offset..][0..4], .little) == owner_oid);
+    const before = replica.csn;
+    try replayFails(record[0 .. used - 1], error.InvalidChangeRecord);
+    std.mem.writeInt(u32, record[owner_offset..][0..4], 0, .little);
+    try replayFails(record[0..used], error.ChangeRecordConflict);
+    try check(replica.csn == before);
+    std.mem.writeInt(u32, record[owner_offset..][0..4], owner_oid, .little);
+    try replica.applyChangeRecord(record[0..used], &scratch);
+    records_applied += 1;
+    try sameState();
+
+    try as("ramsql");
+    const owner_query = "SELECT r.rolname FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner WHERE n.nspname = 'owned_namespace'";
+    try rejects("DROP ROLE schema_owner", error.DependentObjects, owner_query, "schema_owner");
+    try run("ALTER ROLE schema_owner RENAME TO renamed_owner");
+    try run("ALTER ROLE renamed_owner NOSUPERUSER");
+    try expect(owner_query, "renamed_owner");
+    try as("renamed_owner");
+    try run("COMMENT ON SCHEMA owned_namespace IS 'owner comment'");
+    try as("ramsql");
+    try run("CREATE ROLE unrelated_user");
+    try as("unrelated_user");
+    try fails("DROP SCHEMA owned_namespace", error.InsufficientPrivilege);
+    try as("renamed_owner");
+    var dropped_schema: [4096]u8 = undefined;
+    var drop_len: usize = 0;
+    try db.executeChanges("DROP SCHEMA owned_namespace", &out, &dropped_schema, &drop_len, null, null);
+    try as("ramsql");
+    used = 0;
+    try db.executeChanges("DROP ROLE renamed_owner", &out, &record, &used, null, null);
+    try replayFails(record[0..used], error.ChangeRecordConflict);
+    try same(try query(&replica, owner_query), "renamed_owner");
+    try replica.applyChangeRecord(dropped_schema[0..drop_len], &scratch);
+    try replica.applyChangeRecord(record[0..used], &scratch);
+    records_applied += 2;
+    try sameState();
+}
+
 // ---- comments -------------------------------------------------------------------
+
+fn namespaceUsage() !void {
+    try reset();
+    try run("CREATE ROLE guest");
+    try run("CREATE SCHEMA protected_ns");
+    try run("CREATE TABLE protected_ns.items (id INT PRIMARY KEY)");
+    try run("INSERT INTO protected_ns.items VALUES (31)");
+    try run("GRANT SELECT, INSERT, UPDATE, DELETE ON protected_ns.items TO guest");
+    try run("CREATE VIEW gate_view AS SELECT id FROM protected_ns.items");
+    try run("GRANT SELECT ON gate_view TO guest");
+
+    // Old op 15 and op 18 have no private-usage policy. Replay both
+    // historical encodings without changing their owner or grants.
+    var out: DB.Result = .{};
+    var used: usize = 0;
+    try db.executeChanges("CREATE SCHEMA legacy_boot", &out, &record, &used, null, null);
+    try check(record[8] == 19);
+    record[8] = 15;
+    try replica.applyChangeRecord(record[0 .. used - 4], &scratch);
+    records_applied += 1;
+    try run("CREATE ROLE schema_super SUPERUSER");
+    try as("schema_super");
+    used = 0;
+    try db.executeChanges("CREATE SCHEMA legacy_owned", &out, &record, &used, null, null);
+    try check(record[8] == 19);
+    record[8] = 18;
+    try replica.applyChangeRecord(record[0..used], &scratch);
+    records_applied += 1;
+    try as("ramsql");
+    try run("CREATE TABLE legacy_boot.items (id INT PRIMARY KEY)");
+    try run("CREATE TABLE legacy_owned.items (id INT PRIMARY KEY)");
+    try run("INSERT INTO legacy_boot.items VALUES (11)");
+    try run("INSERT INTO legacy_owned.items VALUES (12)");
+    try run("GRANT SELECT ON legacy_boot.items, legacy_owned.items TO guest");
+
+    try as("guest");
+    try fails("SELECT id FROM protected_ns.items", error.InsufficientPrivilege);
+    try fails("SELECT id FROM protected_ns.missing", error.InsufficientPrivilege);
+    try fails("INSERT INTO protected_ns.items VALUES (32)", error.InsufficientPrivilege);
+    try fails("UPDATE protected_ns.items SET id=32", error.InsufficientPrivilege);
+    try fails("DELETE FROM protected_ns.items", error.InsufficientPrivilege);
+    try fails("CREATE TABLE protected_ns.no_access(id INT)", error.InsufficientPrivilege);
+    try fails("SELECT to_regclass('protected_ns.items')", error.InsufficientPrivilege);
+    try expect("SELECT id FROM gate_view", "31");
+    const guest = try roleOid("guest");
+    replica.default_session_state.values.role = guest;
+    replica.default_session_state.base.role = guest;
+    try same(try query(&replica, "SELECT id FROM legacy_boot.items"), "11");
+    try same(try query(&replica, "SELECT id FROM legacy_owned.items"), "12");
+    if (replica.execute("SELECT id FROM protected_ns.items", &out)) |_| return error.ReplayNamespacePrivilegeLost else |err| try check(err == error.InsufficientPrivilege);
+    replica.default_session_state.values.role = 0;
+    replica.default_session_state.base.role = 0;
+    try as("ramsql");
+    try sameState();
+}
+
+fn namespaceGrants() !void {
+    try reset();
+    try run("CREATE ROLE usage_owner SUPERUSER");
+    try run("CREATE ROLE usage_admin");
+    try run("CREATE ROLE usage_guest");
+    try as("usage_owner");
+    try run("CREATE SCHEMA usage_ns");
+    try run("CREATE TABLE usage_ns.data (id INT PRIMARY KEY)");
+    try run("INSERT INTO usage_ns.data VALUES (77)");
+    try run("GRANT SELECT ON usage_ns.data TO usage_owner, usage_admin, usage_guest");
+    try as("ramsql");
+    try run("ALTER ROLE usage_owner NOSUPERUSER");
+    try run("GRANT usage_owner TO usage_admin");
+    try as("usage_guest");
+    const read = "SELECT id FROM usage_ns.data";
+    try fails(read, error.InsufficientPrivilege);
+    try fails("GRANT USAGE ON SCHEMA usage_ns TO CURRENT_ROLE", error.InsufficientPrivilege);
+
+    try as("usage_admin");
+    try expect(read, "77");
+    try run("GRANT USAGE ON SCHEMA usage_ns TO usage_guest, usage_guest");
+    try run("GRANT USAGE ON SCHEMA usage_ns TO usage_guest");
+    try as("usage_guest");
+    try expect(read, "77");
+    const guest = try roleOid("usage_guest");
+    replica.default_session_state.values.role = guest;
+    replica.default_session_state.base.role = guest;
+    try same(try query(&replica, read), "77");
+    replica.default_session_state.values.role = 0;
+    replica.default_session_state.base.role = 0;
+
+    try as("ramsql");
+    try fails("DROP ROLE usage_guest", error.DependentObjects);
+    try as("usage_owner");
+    try run("REVOKE USAGE ON SCHEMA usage_ns FROM usage_guest");
+    try run("REVOKE USAGE ON SCHEMA usage_ns FROM CURRENT_ROLE");
+    try fails(read, error.InsufficientPrivilege);
+    try run("GRANT USAGE ON SCHEMA usage_ns TO CURRENT_ROLE");
+    try expect(read, "77");
+    try run("GRANT USAGE ON SCHEMA usage_ns TO PUBLIC");
+    try as("usage_guest");
+    try expect(read, "77");
+    try as("usage_owner");
+    try run("REVOKE USAGE ON SCHEMA usage_ns FROM PUBLIC");
+    try fails("GRANT CREATE ON SCHEMA usage_ns TO usage_guest", error.UnsupportedStatement);
+    try fails("GRANT USAGE ON SCHEMA usage_ns TO usage_guest WITH GRANT OPTION", error.UnsupportedStatement);
+    try fails("REVOKE USAGE ON SCHEMA usage_ns FROM usage_guest CASCADE", error.UnsupportedStatement);
+    try as("usage_guest");
+    try fails(read, error.InsufficientPrivilege);
+    replica.default_session_state.values.role = guest;
+    replica.default_session_state.base.role = guest;
+    var out: DB.Result = .{};
+    if (replica.execute(read, &out)) |_| return error.ReplayNamespacePrivilegeLost else |err| try check(err == error.InsufficientPrivilege);
+    replica.default_session_state.values.role = 0;
+    replica.default_session_state.base.role = 0;
+    try as("ramsql");
+    try sameState();
+}
+
+fn aclState(target: *const DB, snap: DB.Snapshot) !bool {
+    const scope = target.catalog.findSchema("acl_state", snap) orelse return error.NamespaceMissing;
+    return target.catalog_objects.findKey(&.{ .kind = .schema_acl_state, .target = scope.oid }, snap) != null;
+}
+
+fn expectAclState(label: []const u8, expected: bool) !void {
+    const actual = try aclState(&db, .{ .csn = db.csn });
+    try check(actual == expected);
+    try check(try aclState(&replica, .{ .csn = replica.csn }) == actual);
+    std.debug.print("acl state {s}={d}\n", .{ label, @intFromBool(actual) });
+}
+
+fn namespaceAclMaterialization() !void {
+    try reset();
+    try run("CREATE ROLE acl_guest");
+    try run("CREATE SCHEMA acl_state");
+    try expectAclState("fresh", false);
+    const noop_revoke = "REVOKE USAGE ON SCHEMA acl_state FROM acl_guest";
+    const original: DB.Snapshot = .{ .csn = db.csn };
+    const pending = try db.begin();
+    try statement(pending, noop_revoke);
+    const own: DB.Snapshot = .{ .csn = db.csn, .slot = pending, .epoch = db.txs[pending].epoch, .cid = db.txs[pending].cid +% 1 };
+    const own_state = try aclState(&db, own);
+    try check(own_state);
+    std.debug.print("acl state own={d}\n", .{@intFromBool(own_state)});
+    try expectAclState("other", false);
+    db.abort(pending);
+    try expectAclState("rollback", false);
+
+    const records_before = records_applied;
+    try run(noop_revoke);
+    try check(records_applied == records_before + 1);
+    try check(record[8] == 70 and record[9] == 17);
+    try check(!try aclState(&db, original));
+    try expectAclState("committed_noop", true);
+    try run("GRANT USAGE ON SCHEMA acl_state TO acl_guest");
+    try run(noop_revoke);
+    try expectAclState("returned_default", true);
+    try run("DROP ROLE acl_guest");
+
+    const scope = db.catalog.findSchema("acl_state", .{ .csn = db.csn }) orelse return error.NamespaceMissing;
+    // owner, flags, grant flags, name count, role count, text length and split.
+    const state_tail = [_]u8{ 10, 0, 0, 0 } ++ [_]u8{0} ** 14;
+    var invalid: [256]u8 = undefined;
+    try replayFails(objectRecord(&invalid, 70, 17, 0, scope.oid, 0, 0, state_tail[0 .. state_tail.len - 1]), error.InvalidChangeRecord);
+    try replayFails(objectRecord(&invalid, 70, 17, 0, scope.oid, 0, 0, &state_tail), error.ChangeRecordConflict);
+    try replayFails(objectRecord(&invalid, 70, 17, 0, 99999, 0, 0, &state_tail), error.ChangeRecordConflict);
+    try replayFails(objectRecord(&invalid, 70, 17, 0, scope.oid, 1, 0, &state_tail), error.InvalidChangeRecord);
+    try expectAclState("replayed", true);
+
+    try run("DROP SCHEMA acl_state");
+    try check(db.catalog_objects.findKey(&.{ .kind = .schema_acl_state, .target = scope.oid }, .{ .csn = db.csn }) == null);
+    try check(replica.catalog_objects.findKey(&.{ .kind = .schema_acl_state, .target = scope.oid }, .{ .csn = replica.csn }) == null);
+    try run("CREATE SCHEMA acl_state");
+    try expectAclState("recreated", false);
+}
+
+fn schemaDependencies() !void {
+    try reset();
+    try run("CREATE SCHEMA view_space");
+    try run("CREATE VIEW view_space.drop_view_probe AS SELECT id FROM tdd_a");
+    try rejects("DROP SCHEMA view_space", error.DependentObjects, "SELECT COUNT(*) FROM view_space.drop_view_probe", "4");
+    try run("CREATE MATERIALIZED VIEW view_space.drop_mat_probe AS SELECT id FROM tdd_b");
+    const schema_rows = "SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'view_space'";
+    const view_rows = "SELECT COUNT(*) FROM pg_class WHERE relname IN ('drop_view_probe','drop_mat_probe')";
+    const aborting = try db.begin();
+    try statement(aborting, "DROP SCHEMA view_space CASCADE");
+    try same(try rows(aborting, schema_rows), "0");
+    try same(try rows(aborting, view_rows), "0");
+    db.abort(aborting);
+    try expect(schema_rows, "1");
+    try expect(view_rows, "2");
+    try run("DROP SCHEMA view_space CASCADE");
+    try expect(schema_rows, "0");
+    try expect(view_rows, "0");
+    try same(try query(&replica, schema_rows), "0");
+    try same(try query(&replica, view_rows), "0");
+
+    try run("CREATE SCHEMA late_space");
+    const older = try db.begin();
+    try db.beginModes(older, .{ .isolation = .repeatable_read });
+    const base_rows = "SELECT COUNT(*) FROM tdd_a";
+    try same(try rows(older, base_rows), "4");
+    try run("CREATE TABLE late_space.new_table(id INT)");
+    try statementFails(older, "DROP SCHEMA late_space", error.DependentObjects);
+    db.abort(older);
+    try expect("SELECT COUNT(*) FROM late_space.new_table", "0");
+
+    const cascading = try db.begin();
+    try db.beginModes(cascading, .{ .isolation = .repeatable_read });
+    try same(try rows(cascading, base_rows), "4");
+    try run("CREATE VIEW late_space.new_view AS SELECT id FROM tdd_a");
+    try statement(cascading, "DROP SCHEMA late_space CASCADE");
+    try commit(cascading);
+    const late_rows = "SELECT COUNT(*) FROM pg_class WHERE relname IN ('new_table','new_view')";
+    try expect(late_rows, "0");
+    try same(try query(&replica, late_rows), "0");
+
+    try run("CREATE SCHEMA old_space");
+    const stale_creator = try db.begin();
+    try db.beginModes(stale_creator, .{ .isolation = .repeatable_read });
+    try same(try rows(stale_creator, base_rows), "4");
+    try run("DROP SCHEMA old_space");
+    try statementFails(stale_creator, "CREATE TABLE old_space.stranded (id INT)", error.UndefinedSchema);
+    db.abort(stale_creator);
+
+    // An in-namespace foreign-key rewrite can move a child to a slot
+    // outside the original cascade. Refuse this unsupported shape before
+    // publishing an orphan, and roll the tentative drops back atomically.
+    try run("CREATE SCHEMA fk_space");
+    try run("CREATE TABLE fk_space.father (id INT PRIMARY KEY)");
+    try run("CREATE TABLE fk_space.child (id INT REFERENCES fk_space.father(id))");
+    const fk_rows = "SELECT COUNT(*) FROM pg_class WHERE relname IN ('father','child')";
+    try rejects("DROP SCHEMA fk_space CASCADE", error.UnsupportedStatement, fk_rows, "2");
+    try run("INSERT INTO fk_space.father VALUES (7)");
+    try run("INSERT INTO fk_space.child VALUES (7)");
+    try fails("INSERT INTO fk_space.child VALUES (8)", error.ForeignKeyViolation);
+    try sameState();
+}
 
 fn comments() !void {
     try reset();
@@ -1184,6 +1477,11 @@ fn rowSecuritySetting() !void {
 pub fn main() !void {
     try oraclePrograms();
     try namespacesAndExtensions();
+    try namespaceOwners();
+    try namespaceUsage();
+    try namespaceGrants();
+    try namespaceAclMaterialization();
+    try schemaDependencies();
     try comments();
     try roles();
     try privileges();

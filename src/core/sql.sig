@@ -718,6 +718,8 @@ pub fn Database(comptime config: Config) type {
             creator: u16 = 0,
             dead_csn: u64 = 0,
             oid: u32 = 0,
+            owner: u32 = CO.bootstrap_role,
+            private_usage: bool = false,
             name: Name = .{},
         };
 
@@ -761,6 +763,33 @@ pub fn Database(comptime config: Config) type {
             const wanted = schema orelse return catalog_module.public_namespace;
             for (catalog_module.namespaces) |known| if (types.same(known.name, wanted)) return known.oid;
             return if (catalog.findSchema(wanted, snap)) |found| found.oid else null;
+        }
+
+        /// Resolve direct access separately from catalog discovery and
+        /// previously analyzed references inside a stored view.
+        fn namespaceForUsage(self: *const Self, role: u32, schema: ?[]const u8, snap: Snapshot) Error!?u32 {
+            const namespace = namespaceFor(&self.catalog, schema, snap) orelse return null;
+            try self.checkNamespaceUsage(role, namespace, snap);
+            return namespace;
+        }
+
+        fn checkNamespaceUsage(self: *const Self, role: u32, namespace: u32, snap: Snapshot) Error!void {
+            if (namespace < change_log.first_oid or role == CO.bootstrap_role) return;
+            for (&self.schemas) |*schema| {
+                if (!schema.live or schema.oid != namespace) continue;
+                if (!schema.private_usage) return;
+                // Privilege changes follow the current catalog, even if the
+                // query still reads user rows at an older transaction CSN.
+                var authority = snap;
+                authority.csn = self.csn;
+                if (self.catalog_objects.schemaUsage(role, namespace, schema.owner, authority)) return;
+                return error.InsufficientPrivilege;
+            }
+        }
+
+        fn bindNamespaceUsage(pointer: *const anyopaque, role: u32, namespace: u32, snap: Snapshot) Error!void {
+            const self: *const Self = @ptrCast(@alignCast(pointer));
+            return self.checkNamespaceUsage(role, namespace, snap);
         }
 
         /// Appends a stored query text to the workspace copy of the statement
@@ -882,7 +911,7 @@ pub fn Database(comptime config: Config) type {
             if (bound_statement.* == .refresh_view) {
                 const refresh = &bound_statement.refresh_view;
                 const schema_name = if (refresh.name.schema) |qualifier| identName(source, qualifier) else Name{};
-                const namespace_oid = if (refresh.name.schema != null or public_schema_on_path) namespaceFor(catalog, if (refresh.name.schema != null) schema_name.slice() else null, snap) else null;
+                const namespace_oid = if (refresh.name.schema != null or public_schema_on_path) try db.namespaceForUsage(session.role, if (refresh.name.schema != null) schema_name.slice() else null, snap) else null;
                 if (namespace_oid) |namespace| {
                     if (catalog.findIn(namespace, identName(source, refresh.name.name).slice(), snap)) |found| {
                         if (found.kind == 'm') refresh.query = try appendQuery(workspace, &length, source, tables[found.slot].query.slice());
@@ -909,8 +938,12 @@ pub fn Database(comptime config: Config) type {
                         continue;
                     }
                     if (item.schema == null and !public_schema_on_path and item.name.span.start < source.len) continue;
-                    const namespace = namespaceFor(catalog, if (item.schema != null) schema_name.slice() else null, snap) orelse continue;
-                    const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
+                    const qualified = if (item.schema != null) schema_name.slice() else null;
+                    const namespace = if (item.name.span.start < source.len)
+                        try db.namespaceForUsage(session.role, qualified, snap)
+                    else
+                        namespaceFor(catalog, qualified, snap);
+                    const found = catalog.findIn(namespace orelse continue, name.slice(), snap) orelse continue;
                     if (executes_query) try session.restricted_relation_kinds.check(found.kind);
                     // Items the statement names (not view or expansion texts).
                     if (!privileged and item.name.span.start < source.len) {
@@ -1118,7 +1151,7 @@ pub fn Database(comptime config: Config) type {
                 }
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
                     .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,.params=params,
-                    .user_type_catalog=&db.catalog_objects,.stored_source_start=source.len};
+                    .user_type_catalog=&db.catalog_objects,.stored_source_start=source.len,.namespace_usage=.{.ptr=db,.check=&Self.bindNamespaceUsage}};
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
@@ -2593,7 +2626,8 @@ pub fn Database(comptime config: Config) type {
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
             return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
-                .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null };
+                .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null,
+                .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage } };
         }
 
         fn evalContext(self: *const Self, source: []const u8) E.Context {
@@ -3126,6 +3160,13 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
+            const owner = self.session.role;
+            if (owner != CO.bootstrap_role) {
+                if (self.catalog_objects.pendingReference(owner, snap)) |other| return self.objectPark(slot, other);
+                var latest = snap;
+                latest.csn = self.csn;
+                if (self.catalog_objects.byOid(.role, owner, latest) == null) return error.SerializationFailure;
+            }
             try self.reserveWrites(slot, 2);
             var destination: ?usize = null;
             for (0..2) |attempt| {
@@ -3139,7 +3180,7 @@ pub fn Database(comptime config: Config) type {
             const index = destination orelse return error.TableCapacity;
             if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
             const schema = &self.schemas[index];
-            schema.* = .{ .live = true, .pending_create = true, .creator = slot, .oid = change_log.first_oid + self.oid_counter, .name = name };
+            schema.* = .{ .live = true, .pending_create = true, .creator = slot, .oid = change_log.first_oid + self.oid_counter, .owner = owner, .private_usage = self.dialect == .postgres, .name = name };
             self.oid_counter += 1;
             tx.push(.{ .kind = .create_schema, .table = @intCast(index) }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
@@ -3153,6 +3194,13 @@ pub fn Database(comptime config: Config) type {
         fn dropSchema(self: *Self, slot: u16, drop: *const B.DropSchema, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const schema = &self.schemas[drop.slot];
+            // DDL must account for dependencies that are committed now,
+            // including catalog rows newer than the user's data snapshot.
+            var current = snap;
+            current.csn = self.csn;
+            const namespace = self.catalog.findSchema(schema.name.slice(), current) orelse return error.UndefinedSchema;
+            if (namespace.oid != drop.oid or namespace.slot != drop.slot) return error.SerializationFailure;
+            if (!self.ownsNamespace(drop.oid, current)) return error.InsufficientPrivilege;
             var waits: L.Set = .{};
             if (schema.pending_drop and schema.creator != slot) waits.add(schema.creator);
             if (self.catalog.namespaceCreator(drop.oid, snap)) |other| waits.add(other);
@@ -3162,33 +3210,49 @@ pub fn Database(comptime config: Config) type {
                 return self.park(slot, waits);
             }
             var type_count: usize = 0;
-            var latest = snap;
-            latest.csn = self.csn;
             for (&self.catalog_objects.items) |*o| {
-                if ((!CO.userType(o.kind) and o.kind != .statistics) or o.target != drop.oid) continue;
-                if (O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
-                if (!O.visible(o, snap)) continue;
+                if ((!CO.userType(o.kind) and o.kind != .statistics) or o.target != drop.oid or !O.visible(o, current)) continue;
                 if (!drop.cascade) return error.DependentObjects;
                 type_count += 1;
             }
             var relations: [K.relation_rows]K.Found = undefined;
-            const count = self.catalog.visibleRelations(snap, &relations);
+            const count = self.catalog.visibleRelations(current, &relations);
             for (relations[0..count]) |found| {
-                if (found.kind != 'r' or self.tables[found.slot].namespace != drop.oid) continue;
+                if (found.kind == 'S' or self.tables[found.slot].namespace != drop.oid) continue;
                 if (!drop.cascade) return error.DependentObjects;
-                _ = try self.dropTable(slot, found.slot, true, snap);
+                _ = try self.dropTable(slot, found.slot, true, current);
+            }
+            if (drop.cascade) {
+                // A CASCADE can copy a relation to a different slot while
+                // removing a foreign key. Prove this statement left neither
+                // a schema member nor a surviving reference to a table it
+                // dropped before it can publish the namespace removal.
+                var after = current;
+                after.cid +%= 1;
+                var remaining: [K.relation_rows]K.Found = undefined;
+                const remaining_count = self.catalog.visibleRelations(after, &remaining);
+                for (remaining[0..remaining_count]) |found| {
+                    if (found.kind == 'S') continue;
+                    const survivor = &self.tables[found.slot];
+                    if (survivor.namespace == drop.oid) return error.UnsupportedStatement;
+                    for (survivor.constraints[0..survivor.constraint_count]) |*constraint| {
+                        if (constraint.kind != .foreign or constraint.ref_oid == survivor.oid) continue;
+                        if (self.visibleTableSlot(constraint.ref_oid, current) != null and
+                            self.visibleTableSlot(constraint.ref_oid, after) == null) return error.UnsupportedStatement;
+                    }
+                }
             }
             try self.reserveWrites(slot, 2 + type_count);
             for (&self.catalog_objects.items, 0..) |*o, index| {
-                if (CO.userType(o.kind) and o.target == drop.oid and O.visible(o, snap)) self.objectDelete(slot, index, snap);
+                if (CO.userType(o.kind) and o.target == drop.oid and O.visible(o, current)) self.objectDelete(slot, index, current);
             }
             schema.pending_drop = true;
             schema.creator = slot;
             tx.push(.{ .kind = .drop_schema, .table = @intCast(drop.slot) }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
-            const changed = self.catalog.dropSchema(drop.slot, snap, tx.ref(slot), snap.cid, 0, &changes);
+            const changed = self.catalog.dropSchema(drop.slot, current, tx.ref(slot), current.cid, 0, &changes);
             for (changes[0..changed]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
-            try self.dropObjectsOf(slot, drop.oid, snap);
+            try self.dropObjectsOf(slot, drop.oid, current);
         }
 
         /// Schema name of a namespace OID for the system views.
@@ -3196,6 +3260,14 @@ pub fn Database(comptime config: Config) type {
             for (catalog_module.namespaces) |namespace| if (namespace.oid == oid) return namespace.name;
             for (&self.schemas) |*schema| if (schema.live and schema.oid == oid) return schema.name.slice();
             return "";
+        }
+
+        fn ownsNamespace(self: *const Self, oid: u32, snap: Snapshot) bool {
+            if (self.privilegedRole(snap)) return true;
+            for (&self.schemas) |*schema| {
+                if (schema.live and schema.oid == oid) return self.catalog_objects.memberOf(self.session.role, schema.owner, true, snap);
+            }
+            return false;
         }
 
         // ---- catalog objects (B11 wave 3, catalog_objects.sig) --------------
@@ -3284,7 +3356,7 @@ pub fn Database(comptime config: Config) type {
         /// transaction's uncommitted object naming it is waited for.
         fn objectDependent(o: *const O.Object, oid: u32) bool {
             return switch (o.kind) {
-                .acl, .relation, .policy => o.target == oid,
+                .acl, .schema_acl, .schema_acl_state, .relation, .policy => o.target == oid,
                 .statistics => o.target == oid or o.grantee == oid,
                 .publication_table, .publication_schema => o.grantee == oid,
                 .comment => o.target == oid,
@@ -3298,7 +3370,7 @@ pub fn Database(comptime config: Config) type {
             latest.csn = self.csn;
             var count: usize = 0;
             for (&self.catalog_objects.items) |*o| {
-                if ((o.kind == .statistics or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                if ((o.kind == .statistics or o.kind == .schema_acl or o.kind == .schema_acl_state or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                 if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
                 if (objectDependent(o, oid)) count += 1;
                 // Comments on the table's policies go with them.
@@ -3383,7 +3455,7 @@ pub fn Database(comptime config: Config) type {
         fn objectTable(self: *Self, slot: u16, source: []const u8, name: CO.Qualified, mode: locks_module.TableMode, snap: Snapshot) Error!usize {
             if (!name.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
             const schema_name = if (name.has_schema) objectName(source, name.schema) else Name{};
-            const namespace = namespaceFor(&self.catalog, if (name.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
+            const namespace = (try self.namespaceForUsage(self.session.role, if (name.has_schema) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
             const found = self.catalog.findIn(namespace, objectName(source, name.name).slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
             try self.lockTable(slot, found.slot, mode);
@@ -3428,11 +3500,19 @@ pub fn Database(comptime config: Config) type {
                     break :blk .drop_role;
                 },
                 .grant => |*grant| blk: {
-                    if (grant.membership) try self.grantMembership(slot, source, grant, false, snap) else try self.grantTables(slot, source, grant, false, snap);
+                    if (grant.membership) {
+                        try self.grantMembership(slot, source, grant, false, snap);
+                    } else if (grant.schema) {
+                        try self.grantSchemaUsage(slot, source, grant, false, snap);
+                    } else try self.grantTables(slot, source, grant, false, snap);
                     break :blk if (grant.membership) .grant_role else .grant;
                 },
                 .revoke => |*grant| blk: {
-                    if (grant.membership) try self.grantMembership(slot, source, grant, true, snap) else try self.grantTables(slot, source, grant, true, snap);
+                    if (grant.membership) {
+                        try self.grantMembership(slot, source, grant, true, snap);
+                    } else if (grant.schema) {
+                        try self.grantSchemaUsage(slot, source, grant, true, snap);
+                    } else try self.grantTables(slot, source, grant, true, snap);
                     break :blk if (grant.membership) .revoke_role else .revoke;
                 },
                 .create_policy => |*policy| blk: {
@@ -3515,7 +3595,7 @@ pub fn Database(comptime config: Config) type {
         fn typeNamespace(self: *const Self, source: []const u8, name: CO.Qualified, snap: Snapshot) Error!u32 {
             if (!name.has_schema and !self.session.public_schema_on_path) return error.UndefinedSchema;
             const schema = if (name.has_schema) objectName(source, name.schema) else Name{};
-            return namespaceFor(&self.catalog, if (name.has_schema) schema.slice() else null, snap) orelse error.UndefinedSchema;
+            return (try self.namespaceForUsage(self.session.role, if (name.has_schema) schema.slice() else null, snap)) orelse error.UndefinedSchema;
         }
 
         fn typeNameOccupied(self: *const Self, namespace: u32, name: []const u8, snap: Snapshot) bool {
@@ -3736,8 +3816,20 @@ pub fn Database(comptime config: Config) type {
                 if (self.catalog_objects.pendingReference(oid, snap)) |other| return self.objectPark(slot, other);
                 var latest = snap;
                 latest.csn = self.csn;
+                for (&self.schemas) |*schema| {
+                    if (!schema.live or schema.owner != oid) continue;
+                    if ((schema.pending_create or schema.pending_drop) and schema.creator != slot) return self.objectPark(slot, schema.creator);
+                    const old = self.catalog.findSchema(schema.name.slice(), snap);
+                    const now = self.catalog.findSchema(schema.name.slice(), latest);
+                    const owned_before = old != null and old.?.oid == schema.oid;
+                    const owned_now = now != null and now.?.oid == schema.oid;
+                    if (owned_before != owned_now) return error.SerializationFailure;
+                    if (owned_before) return error.DependentObjects;
+                }
                 for (&self.catalog_objects.items) |*o| {
-                    if ((CO.userType(o.kind) or o.kind == .statistics) and o.owner == oid and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                    const affected = (CO.userType(o.kind) or o.kind == .statistics) and o.owner == oid or
+                        o.kind == .schema_acl and (o.owner == oid or o.grantee == oid);
+                    if (affected and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
                     switch (o.kind) {
                         .member => {
@@ -3748,7 +3840,7 @@ pub fn Database(comptime config: Config) type {
                         .comment => if (o.grantee == CO.class_authid and o.target == oid) {
                             writes += 1;
                         },
-                        .acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
+                        .acl, .schema_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
                         .policy => {
                             for (o.roleList()) |listed| {
                                 if (listed == oid) return error.DependentObjects;
@@ -3878,6 +3970,65 @@ pub fn Database(comptime config: Config) type {
                     self.objectDelete(slot, index, snap);
                 } else if (next.flags == 0) continue;
                 if (next.flags != 0) _ = try self.objectInsert(slot, &next, false, snap);
+            }
+        }
+
+        /// Schema grants use the owning role as grantor. This scope has no
+        /// delegated grant chain, CREATE privilege, or built-in schema ACL.
+        fn grantSchemaUsage(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
+            if (self.dialect != .postgres or grant.option or grant.cascade or grant.table_count != 1) return error.UnsupportedStatement;
+            const schema_target = grant.tables[0];
+            if (schema_target.has_schema) return error.Syntax;
+            const name = objectName(source, schema_target.name);
+            if (namespaceFor(&self.catalog, name.slice(), snap)) |oid| {
+                if (oid < change_log.first_oid) return error.UnsupportedStatement;
+            }
+            const visible = self.catalog.findSchema(name.slice(), snap) orelse return error.UndefinedSchema;
+            const schema = &self.schemas[visible.slot];
+            if (!schema.private_usage) return error.UnsupportedStatement;
+            if (schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
+            if (self.catalog_objects.pendingReference(schema.oid, snap)) |other| return self.objectPark(slot, other);
+
+            var latest = snap;
+            latest.csn = self.csn;
+            const current_schema = self.catalog.findSchema(name.slice(), latest) orelse return error.SerializationFailure;
+            if (visible.oid != current_schema.oid) return error.SerializationFailure;
+            if (!self.ownsNamespace(schema.oid, latest)) return error.InsufficientPrivilege;
+
+            var grantees: [CO.list_capacity]u32 = undefined;
+            var count: usize = 0;
+            for (grant.grantees[0..grant.grantee_count]) |grantee| {
+                const role = try self.objectRole(source, grantee, latest);
+                if (role != CO.public_role) {
+                    if (self.catalog_objects.pendingReference(role, snap)) |other| return self.objectPark(slot, other);
+                    if (self.catalog_objects.roleName(role, latest) == null) return error.UndefinedObject;
+                }
+                var duplicate = false;
+                for (grantees[0..count]) |prior| duplicate = duplicate or prior == role;
+                if (duplicate) continue;
+                grantees[count] = role;
+                count += 1;
+            }
+            // The first authorized GRANT or REVOKE materializes the ACL,
+            // even if its effective privileges are exactly the default.
+            var state: O.Object = .{ .kind = .schema_acl_state, .target = schema.oid, .owner = schema.owner };
+            const first_acl = self.catalog_objects.findKey(&state, latest) == null;
+            try self.reserveWrites(slot, 2 * count + @intFromBool(first_acl));
+            if (first_acl) _ = try self.objectInsert(slot, &state, false, snap);
+            for (grantees[0..count]) |role| {
+                var acl: O.Object = .{ .kind = .schema_acl, .target = schema.oid, .grantee = role, .owner = schema.owner };
+                const before = self.catalog_objects.findKey(&acl, latest);
+                const old: ?u32 = if (before) |index| self.catalog_objects.items[index].flags else null;
+                const next: ?u32 = if (role == schema.owner)
+                    (if (revoke) 0 else null)
+                else
+                    (if (revoke) null else CO.priv_schema_usage);
+                if (old == next) continue;
+                if (before) |index| self.objectDelete(slot, index, snap);
+                if (next) |flags| {
+                    acl.flags = flags;
+                    _ = try self.objectInsert(slot, &acl, false, snap);
+                }
             }
         }
 
@@ -4074,7 +4225,7 @@ pub fn Database(comptime config: Config) type {
                 .sequence => {
                     if (!comment.object.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
                     const schema_name = if (comment.object.has_schema) objectName(source, comment.object.schema) else Name{};
-                    const namespace = namespaceFor(&self.catalog, if (comment.object.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
+                    const namespace = (try self.namespaceForUsage(self.session.role, if (comment.object.has_schema) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
                     const found = self.catalog.findIn(namespace, objectName(source, comment.object.name).slice(), snap) orelse return error.TableNotFound;
                     if (found.kind != 'S') return error.WrongObjectType;
                     if (!privileged) return error.InsufficientPrivilege;
@@ -4086,7 +4237,7 @@ pub fn Database(comptime config: Config) type {
                 .schema => {
                     key.grantee = CO.class_namespace;
                     key.target = namespaceFor(&self.catalog, objectName(source, comment.object.name).slice(), snap) orelse return error.UndefinedSchema;
-                    if (!privileged) return error.InsufficientPrivilege;
+                    if (!self.ownsNamespace(key.target, snap)) return error.InsufficientPrivilege;
                 },
                 .role => {
                     key.grantee = CO.class_authid;
@@ -4439,7 +4590,7 @@ pub fn Database(comptime config: Config) type {
                 .drop_relation => |*drop| try self.needOwner(drop.slot, snap),
                 .alter_table => |*alter| try self.needOwner(alter.table, snap),
                 .refresh_view => |*refresh| try self.needOwner(refresh.slot, snap),
-                .create_table, .create_sequence, .drop_sequence, .alter_sequence, .create_schema, .drop_schema => return error.InsufficientPrivilege,
+                .create_table, .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,
                 else => {},
             }
         }
@@ -4469,7 +4620,7 @@ pub fn Database(comptime config: Config) type {
             };
             if (goal.schema == null and !self.session.public_schema_on_path) return source;
             const schema_name = if (goal.schema) |qualifier| identName(source, qualifier) else Name{};
-            const namespace = namespaceFor(&self.catalog, if (goal.schema != null) schema_name.slice() else null, snap) orelse return source;
+            const namespace = (try self.namespaceForUsage(role, if (goal.schema != null) schema_name.slice() else null, snap)) orelse return source;
             const found = self.catalog.findIn(namespace, identName(source, goal.table).slice(), snap) orelse return source;
             if (found.kind != 'r' and found.kind != 'p') return source;
             const table = &self.tables[found.slot];
@@ -4919,7 +5070,7 @@ pub fn Database(comptime config: Config) type {
                 if (regclassSeparator(tail) != null) return error.UnsupportedStatement;
                 const schema = namespaceIdentifier(std.mem.trim(u8, text[0..dot], whitespace)) catch return missing;
                 const name = namespaceIdentifier(std.mem.trim(u8, tail, whitespace)) catch return missing;
-                const namespace = namespaceFor(&self.catalog, schema.slice(), self.seq_snap) orelse return missing;
+                const namespace = (try self.namespaceForUsage(self.session.role, schema.slice(), self.seq_snap)) orelse return missing;
                 return if (self.regclassIn(namespace, name.slice())) |oid| oid else missing;
             }
             const name = namespaceIdentifier(std.mem.trim(u8, text, whitespace)) catch return missing;
@@ -5475,13 +5626,13 @@ pub fn Database(comptime config: Config) type {
                 .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
                 .pg_namespace, .schemata => {
                     for (catalog_module.namespaces) |namespace| {
-                        if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
+                        if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name), intCell(CO.bootstrap_role) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
                     }
                     var schemas: [K.relation_rows]K.SchemaFound = undefined;
                     const schema_count = self.catalog.visibleSchemas(snapshot, &schemas);
                     for (schemas[0..schema_count]) |found| {
-                        const schema_name = self.schemas[found.slot].name.slice();
-                        if (view == .pg_namespace) try sink.add(&.{ intCell(found.oid), nameCell(schema_name) }) else try sink.add(&.{ nameCell(database), nameCell(schema_name) });
+                        const schema = &self.schemas[found.slot];
+                        if (view == .pg_namespace) try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(schema.owner) }) else try sink.add(&.{ nameCell(database), nameCell(schema.name.slice()) });
                     }
                 },
                 else => for (relations[0..count]) |found| {
@@ -6265,12 +6416,17 @@ pub fn Database(comptime config: Config) type {
                 return self.park(slot, waits);
             }
             // A schema another transaction is dropping: wait for it.
-            for (&self.schemas) |*schema| if (schema.live and schema.oid == create.namespace and schema.pending_drop and schema.creator != slot) {
-                var waits: L.Set = .{};
-                waits.add(schema.creator);
-                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
-                return self.park(slot, waits);
-            };
+            for (&self.schemas) |*schema| {
+                if (!schema.live or schema.oid != create.namespace) continue;
+                if (schema.pending_drop and schema.creator != slot) {
+                    var waits: L.Set = .{};
+                    waits.add(schema.creator);
+                    tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                    return self.park(slot, waits);
+                }
+                if (schema.dead_csn != 0) return error.UndefinedSchema;
+                break;
+            }
             try self.reserveWrites(slot, 2 + create.count);
             const columns = create.columns[0..create.count];
             var destination: ?usize = null;
@@ -7665,6 +7821,7 @@ pub fn Database(comptime config: Config) type {
         /// `select` (`(query)` verbatim; a table lists its non-generated
         /// columns or the given ones).
         pub fn copyInfo(self: *Self, slot: ?u16, source: []const u8, select: []u8) Error!CopyInfo {
+            self.installRole();
             const copy = try self.parseCopy(source);
             var info: CopyInfo = .{ .direction = copy.direction, .options = try copyOptions(&copy) };
             if (copy.force_quote_all) info.force_quote = .all;
@@ -8202,7 +8359,7 @@ pub fn Database(comptime config: Config) type {
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
                     .truncate, .refresh_rows => try C.encodeTruncate(writer, self.tables[entry.table].oid),
                     .alter_sequence => try C.encodeAlterSequence(writer, &self.seqs[entry.table]),
-                    .create_schema => try C.encodeCreateSchema(writer, self.schemas[entry.table].oid, self.schemas[entry.table].name.slice()),
+                    .create_schema => try C.encodeCreateSchema(writer, &self.schemas[entry.table]),
                     .drop_schema => try C.encodeDropSchema(writer, self.schemas[entry.table].oid),
                     .alter_table => {
                         const table = &self.tables[entry.table];
@@ -9158,7 +9315,7 @@ pub fn Database(comptime config: Config) type {
             for (lock.tables[0..lock.count], lock.only[0..lock.count]) |reference, only| {
                 if (reference.schema == null and !self.session.public_schema_on_path) return error.TableNotFound;
                 const schema_name = if (reference.schema) |qualifier| identName(source, qualifier) else Name{};
-                const namespace = namespaceFor(&self.catalog, if (reference.schema != null) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
+                const namespace = (try self.namespaceForUsage(self.session.role, if (reference.schema != null) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
                 const found = self.catalog.findIn(namespace, identName(source, reference.name).slice(), snap) orelse return error.TableNotFound;
                 switch (found.kind) {
                     'r', 'p' => {},
@@ -10349,7 +10506,7 @@ pub fn Database(comptime config: Config) type {
         /// A table or view named by a trigger / rule statement.
         fn namedTable(self: *Self, name: *const R.TableName, snap: Snapshot) Error!usize {
             if (name.schema.len == 0 and !self.session.public_schema_on_path) return error.TableNotFound;
-            const namespace = namespaceFor(&self.catalog, if (name.schema.len != 0) name.schema.slice() else null, snap) orelse return error.UndefinedSchema;
+            const namespace = (try self.namespaceForUsage(self.session.role, if (name.schema.len != 0) name.schema.slice() else null, snap)) orelse return error.UndefinedSchema;
             const found = self.catalog.findIn(namespace, name.name.slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
             return found.slot;
@@ -10832,6 +10989,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         pub fn describeIn(self: *Self, slot: ?u16, source: []const u8, result: *Result) Error!void {
+            self.installRole();
             if (R.classify(source)) |kind| {
                 var routine: R.Statement = undefined;
                 try R.parse(source, &self.workspace.nodes, &routine);

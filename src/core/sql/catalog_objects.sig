@@ -78,7 +78,7 @@ pub const class_policy: u32 = 3256;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, _ };
 
 pub fn publicationMembership(kind: Kind) bool {
     return kind == .publication_table or kind == .publication_schema;
@@ -225,6 +225,8 @@ pub const priv_delete: u32 = 1 << 3;
 pub const priv_truncate: u32 = 1 << 4;
 pub const priv_references: u32 = 1 << 5;
 pub const priv_trigger: u32 = 1 << 6;
+pub const priv_schema_usage: u32 = 1 << 8;
+const priv_schema_create: u32 = 1 << 9;
 pub const priv_maintain: u32 = 1 << 14;
 pub const table_privileges: u32 = priv_insert | priv_select | priv_update | priv_delete | priv_truncate | priv_references | priv_trigger | priv_maintain;
 
@@ -290,6 +292,7 @@ pub const Grantee = struct { kind: GranteeKind = .name, name: Ident = .{} };
 pub const Grant = struct {
     /// GRANT role TO role (membership) instead of table privileges.
     membership: bool = false,
+    schema: bool = false,
     privileges: u32 = 0,
     tables: [list_capacity]Qualified = @splat(.{}),
     table_count: usize = 0,
@@ -968,6 +971,8 @@ const Parser = struct {
     }
 
     fn privilegeWord(raw: []const u8) ?u32 {
+        if (types.keyword(raw, "usage")) return priv_schema_usage;
+        if (types.keyword(raw, "create")) return priv_schema_create;
         for (privilege_words, privilege_bits) |spelled, bit| if (types.keyword(raw, spelled)) return bit;
         return null;
     }
@@ -1013,13 +1018,19 @@ const Parser = struct {
             if (!try self.takeSymbol(.comma)) break;
         }
         if (try self.take("on")) {
+            out.schema = try self.take("schema");
             // Privileges on other object kinds are outside the subset.
-            if (self.word("sequence") or self.word("schema") or self.word("database") or self.word("function") or self.word("procedure") or
+            if (!out.schema and (self.word("sequence") or self.word("database") or self.word("function") or self.word("procedure") or
                 self.word("routine") or self.word("language") or self.word("type") or self.word("domain") or self.word("foreign") or
-                self.word("large") or self.word("tablespace") or self.word("parameter") or self.word("all")) return error.UnsupportedStatement;
+                self.word("large") or self.word("tablespace") or self.word("parameter") or self.word("all"))) return error.UnsupportedStatement;
             if (!only_privileges and !all) return error.Syntax;
+            if (out.schema) {
+                if (all or privileges != priv_schema_usage) return error.UnsupportedStatement;
+            } else {
+                if (privileges & ~table_privileges != 0) return error.UnsupportedStatement;
+                _ = try self.take("table");
+            }
             out.privileges = if (all) table_privileges else privileges;
-            _ = try self.take("table");
             while (true) {
                 if (out.table_count == list_capacity) return error.ProgramLimitExceeded;
                 out.tables[out.table_count] = try self.qualified();
@@ -1426,8 +1437,8 @@ pub fn Objects(comptime config: types.Config) type {
                 .role, .policy, .fdw, .server, .publication, .statistics => a.oid == b.oid,
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
-                .member, .acl => a.target == b.target and a.grantee == b.grantee,
-                .relation => a.target == b.target,
+                .member, .acl, .schema_acl => a.target == b.target and a.grantee == b.grantee,
+                .relation, .schema_acl_state => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
                 _ => false,
             };
@@ -1650,6 +1661,23 @@ pub fn Objects(comptime config: types.Config) type {
             return self.superuser(role, snap) or self.memberOf(role, self.owner(table, snap), true, snap);
         }
 
+        /// A private schema's implicit owner USAGE and explicit additions.
+        /// The owner can revoke its ordinary privilege without losing the
+        /// authority to grant it again.
+        pub fn schemaUsage(self: *const Self, role: u32, namespace: u32, owner_role: u32, snap: storage.Snapshot) bool {
+            if (self.superuser(role, snap)) return true;
+            var owner_usage = true;
+            for (&self.items) |*o| {
+                if (o.kind != .schema_acl or o.target != namespace or !visible(o, snap)) continue;
+                if (o.grantee == owner_role) {
+                    owner_usage = o.flags == priv_schema_usage;
+                    continue;
+                }
+                if (o.grantee == public_role or self.memberOf(role, o.grantee, true, snap)) return true;
+            }
+            return owner_usage and self.memberOf(role, owner_role, true, snap);
+        }
+
         /// The privileges held through ownership and table-wide grants.
         fn tablePrivilegeMask(self: *const Self, role: u32, table: u32, snap: storage.Snapshot) u32 {
             if (self.ownsTable(role, table, snap)) return ~@as(u32, 0);
@@ -1792,7 +1820,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.publication_schema)) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.schema_acl_state)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1816,8 +1844,8 @@ pub fn Objects(comptime config: types.Config) type {
                 .statistics => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub >= -1 and o.sub <= 10000,
                 .publication_table, .publication_schema => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
-                .acl => o.oid == 0 and o.target != 0 and o.sub == 0,
-                .relation => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
+                .acl, .schema_acl => o.oid == 0 and o.target != 0 and o.sub == 0,
+                .relation, .schema_acl_state => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .comment => o.oid == 0 and o.target != 0 and o.sub >= 0 and switch (o.grantee) {
                     class_relation => true,
                     class_namespace, class_authid, class_fdw, class_server, class_publication, class_policy => o.sub == 0,
@@ -1863,6 +1891,9 @@ pub fn Objects(comptime config: types.Config) type {
                 .role => has_name and o.owner == 0 and o.flags & ~role_attributes == 0 and o.role_count == 0 and o.text_len == 0,
                 .member => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags <= 1 and o.role_count == 0 and o.text_len == 0 and o.target != o.grantee,
                 .acl => !has_name and o.flags != 0 and o.flags & ~table_privileges == 0 and o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
+                .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
+                    (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
+                .schema_acl_state => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
                 .relation => !has_name and o.flags & ~(rls_enabled | rls_forced) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .policy => has_name and o.flags & ~@as(u32, 0x7ff) == 0 and (o.flags & 0xff) <= 4 and o.grant_flags == 0 and o.role_count != 0 and o.owner == 0 and using_ok and check_ok,
                 .comment => !has_name and o.owner == 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len != 0 and o.split == 0,
@@ -2114,6 +2145,13 @@ pub fn Objects(comptime config: types.Config) type {
                         if (grantee != public_role) {
                             if (!self.roleExists(grantee)) return error.ChangeRecordConflict;
                         }
+                    },
+                    .schema_acl => {
+                        if (ctx.objectPrivateSchemaOwner(target) != v.owner) return error.ChangeRecordConflict;
+                        if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
+                    },
+                    .schema_acl_state => {
+                        if (ctx.objectPrivateSchemaOwner(target) != v.owner) return error.ChangeRecordConflict;
                     },
                     .relation => {
                         if (!ctx.objectTableLive(target)) return error.ChangeRecordConflict;

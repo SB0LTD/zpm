@@ -74,7 +74,7 @@ const pg_type_columns = [_]ViewColumn{
     col("typarray", .oid), col("typdelim", .text), col("typinput", .text), col("typbasetype", .oid), col("typelem", .oid),
     col("typowner", .oid), col("typtypmod", .int4), col("typnotnull", .boolean), col("typrelid", .oid), col("typcollation", .oid),
 };
-const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name) };
+const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name), col("nspowner", .oid) };
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
 const pg_database_columns = [_]ViewColumn{ col("oid", .oid), col("datname", .name), col("datdba", .oid) };
 pub const heap_access_method: u32 = 2;
