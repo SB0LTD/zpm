@@ -1099,7 +1099,7 @@ pub fn Database(comptime config: Config) type {
                     .to_regnamespace,.regnamespace_in,.regnamespace_out=>return error.UnsupportedStatement,
                     .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
-                    .current_setting,.set_config,.pg_backend_pid,
+                    .current_setting,.set_config,.pg_backend_pid,.pg_is_in_recovery,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
                     .pg_try_advisory_xact_lock,.pg_try_advisory_xact_lock_shared,
                     .pg_advisory_unlock,.pg_advisory_unlock_shared,
@@ -1479,6 +1479,7 @@ pub fn Database(comptime config: Config) type {
         /// call like `dialect`. Not database state.
         session: value_module.Session = .{},
         workspace: Workspace = .{},
+        startup_recovery_active: bool = false,
         /// Tx-session lane: the caller's session state for the next call
         /// (null: default_session_state), cursors and notifications of every
         /// session, SERIALIZABLE records and EXECUTE parameter values.
@@ -1761,6 +1762,17 @@ pub fn Database(comptime config: Config) type {
             }
             self.workspace.query.refs = refs;
             self.workspace.query.ref_high = refs.len;
+        }
+
+        /// The startup owner holds exclusive access across replay, including
+        /// validation and durable-log repair. A failed replay remains active
+        /// until startup is abandoned or a subsequent attempt completes.
+        pub fn setStartupRecovery(self: *Self, active: bool) void {
+            self.startup_recovery_active = active;
+        }
+
+        pub fn startupRecoveryActive(self: *const Self) bool {
+            return self.startup_recovery_active;
         }
 
         /// Inline object bytes. With external_storage this excludes the bound
@@ -9113,6 +9125,7 @@ pub fn Database(comptime config: Config) type {
             const slot = self.seq_slot;
             switch (kind) {
                 .backend_pid => return .{ .integer = self.sessionState().pid },
+                .recovery_status => return .{ .integer = @intFromBool(self.startupRecoveryActive()) },
                 .current_setting => {
                     const length = self.settingText(slot, a, out) catch |err| {
                         if (err == error.UndefinedSetting and flags & 1 != 0) return .{ .null_value = true };

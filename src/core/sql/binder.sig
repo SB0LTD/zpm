@@ -1375,6 +1375,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_advisory_unlock", .func = .pg_advisory_unlock },
                 .{ .name = "pg_advisory_unlock_shared", .func = .pg_advisory_unlock_shared },
                 .{ .name = "pg_backend_pid", .func = .pg_backend_pid },
+                .{ .name = "pg_is_in_recovery", .func = .pg_is_in_recovery },
                 // JSONB and SQL/JSON path functions (B11 json-agg lane).
                 .{ .name = "jsonb_set", .func = .jsonb_set },       .{ .name = "jsonb_set_lax", .func = .jsonb_set_lax },
                 .{ .name = "jsonb_insert", .func = .jsonb_insert }, .{ .name = "jsonb_delete_path", .func = .jsonb_delete_path },
@@ -2334,6 +2335,11 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared => {
                     if (count == 2) try bindSignature(context, n, &[_]ast.Type{ .int4, .int4 }, .boolean, true) else try bindSignature(context, n, &[_]ast.Type{.int8}, .boolean, true);
+                    n.constant = false;
+                },
+                .pg_is_in_recovery => {
+                    if (context.dialect != .postgres) return error.UndefinedFunction;
+                    try bindSignature(context, n, &.{}, .boolean, true);
                     n.constant = false;
                 },
                 .pg_backend_pid => {

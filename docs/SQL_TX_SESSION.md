@@ -18,6 +18,12 @@ documentation and source and is pending native verification.
 
 ## Design
 
+`pg_catalog.pg_is_in_recovery()` returns the database's owner-controlled
+startup replay state. A startup owner sets it while replay and durable-log
+repair are in progress and clears it after successful completion. RAMSQL
+opens its PostgreSQL listener after this phase, so admitted connections see
+the primary state even inside read-only transactions.
+
 - Transaction modes live in the transaction (mvcc.sig `Tx`): isolation,
   READ ONLY, DEFERRABLE, the transaction snapshot and the SERIALIZABLE
   record. `begin()` copies the session's default_transaction_* settings.

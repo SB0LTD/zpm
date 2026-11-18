@@ -1135,6 +1135,25 @@ fn sqlstate(bytes: []const u8, wanted: []const u8) bool {
     return false;
 }
 
+fn recoveryStatus() !void {
+    db = .{};
+    const source = "SELECT pg_catalog.pg_is_in_recovery()";
+    const tx = try db.begin();
+    try db.beginModes(tx, .{ .read_only = true });
+    try expectMeta(tx, source, "f", "pg_is_in_recovery:16:-1");
+    db.abort(tx);
+
+    db.setStartupRecovery(true);
+    const replay = try db.begin();
+    try expect(replay, "SELECT pg_is_in_recovery()", "t");
+    db.abort(replay);
+    db.setStartupRecovery(false);
+    const primary = try db.begin();
+    defer db.abort(primary);
+    try expect(primary, source, "f");
+    try fails(primary, "SELECT pg_is_in_recovery(true)", error.UndefinedFunction);
+}
+
 pub fn main(init: std.process.Init) !void {
     try oraclePrograms();
     try transactionModes();
@@ -1144,6 +1163,7 @@ pub fn main(init: std.process.Init) !void {
     try prepared();
     try locking();
     try notifications();
+    try recoveryStatus();
     var buffer: [128]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-tx-session\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

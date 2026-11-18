@@ -699,6 +699,10 @@ pub fn Eval(comptime config: types.Config) type {
             }
             var out: V.Text = .{};
             switch (n.func) {
+                .pg_is_in_recovery => {
+                    const reply = try hook.call(hook.ptr, .recovery_status, "", "", 0, 0, 0, &out.bytes);
+                    return .{ .boolean = reply.integer != 0 };
+                },
                 .pg_backend_pid => {
                     const reply = try hook.call(hook.ptr, .backend_pid, "", "", 0, 0, 0, &out.bytes);
                     return .{ .integer = reply.integer };
@@ -1446,7 +1450,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
                     .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
                     .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
-                    .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid => return sessionFunction(ctx, n),
+                    .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),
                     .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
                         const argument = try eval(ctx, n.b);
                         if (argument == .null_value) return .null_value;
