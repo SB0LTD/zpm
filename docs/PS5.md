@@ -23,7 +23,7 @@ Everything is allocation-free: plain values, comptime tables, caller-provided bu
 | `equeue.sig` | libkernel's event queues: what a game waits on to hear of a flip, a GPU interrupt, a timer, or a word from another of its threads. Kept in the process. |
 | `videoout.sig` | The display library (libSceVideoOut): buffers, flips paced by a clock thread that stands in for the screen's refresh, flip and vblank events, the PS4's and the PS5's calls. Where frames go is the host's (`display`). |
 | `pm4.sig` | The PS5 GPU's command packets as data (AMD's PM4): headers, opcodes, the three register banks, a reader that checks every length, a writer. |
-| `agc.sig`, `agc_*.sig` | The graphics library (libSceAgc), the part that writes packets: 196 names. A game's calls for registers, draws, flow, memory and sync, flips and markers each write their packet into the game's command buffer; the patch calls and size queries go with them. Not its register-default tables, and nothing about shaders yet. |
+| `agc.sig`, `agc_*.sig` | The graphics library (libSceAgc): 203 names. A game's calls for registers, draws, flow, memory and sync, flips and markers each write their packet into the game's command buffer; the patch calls and size queries go with them. `agc_shader.sig` is a shader object as a game holds it: the call that makes one usable, the list of those made, and the calls that link a vertex-side shader to a pixel shader. Not its register-default tables. |
 | `agcdriver.sig` | The graphics driver library (libSceAgcDriver), a first part: a game's submitted command buffers are carried out in order by a worker thread. Registers, labels, interrupts, waits, skips, calls and flips happen; draws are handed to a renderer that is not here yet. |
 | `runtime.sig` | The program a kernel starts for a PS5 executable. It loads and links the game and the modules it brought in its own process, binds imports to libkernel or to a stand-in that names what is missing, makes the first thread's storage, runs the modules' start functions and jumps to the game. |
 | `ps5.sig` | The module root. |
@@ -167,7 +167,29 @@ On the console an event queue is the kernel's kqueue. Here it is kept in the pro
 A game does not write GPU commands itself. It calls the graphics library (libSceAgc), which writes AMD PM4 packets into a buffer the game owns, and hands the buffer to the driver (libSceAgcDriver). Both are console system modules, so both are this module's to provide. `pm4.sig` is the format; `agc.sig` is the library, as far as writing packets goes; `agcdriver.sig` is a first part of the driver.
 
 - **The library writes into the game's own buffer** (`CommandBuffer`: a bottom, a top, a cursor that climbs), asks the game's callback for room when it runs out, and writes nothing when there is none. Data a call points at inside that same buffer is read before the packet is written over it. Each call's packet is the one the driver reads: the tests build buffers with the library's functions, found by NID, and run them through the driver.
-- **Missing from the library:** the tables of register defaults a game asks for at start (`sceAgcGetRegisterDefaults` and its kin), and every shader call (`sceAgcCreateShader`, linking, interpolant mappings).
+- **Missing from the library:** the tables of register defaults a game asks for at start (`sceAgcGetRegisterDefaults` and its kin), and joining two halves of a shader (`sceAgcFuseShaderHalves`).
+
+### Shaders
+
+A game's shader is two things it loaded itself: a header with tables after it (`agc.shader.Shader`: registers to set, what the shader reads and writes, where its resources are), and the machine code, which is AMD's (LLVM's `gfx1013`; `src/amdgpu/gfx10.sig` decodes it).
+
+- **`sceAgcCreateShader`** turns the header's pointers, which in a file are offsets from their own fields, into addresses; writes the code's address into the header's own register list (the pair of program registers a game later puts in a command buffer); and lists the shader under that address. A renderer finds a draw's shaders by what the program registers hold (`agc.shader.byCode`).
+  - Everything that can refuse comes before the first write: a refused header is left as it was.
+  - A shader made again with its code somewhere else keeps its tables, has its program registers moved by as much as the code moved, and is found at the new address only.
+  - The list holds 12,288 shaders. Past that a shader is still created, and not found.
+- **`sceAgcCreatePrimState`, `sceAgcUpdatePrimState`:** the registers that say which stages run and what they hand the rasteriser, from the shaders' own special registers and the kind of primitive.
+- **`sceAgcCreateInterpolantMapping`, `sceAgcUpdateInterpolantMapping`, `sceAgcLinkShaders`:** the thirty-two registers that say which output of the vertex side each input of the pixel shader reads, matched by semantic; an input nothing writes reads its default.
+- **`sceAgcGetGsOversubscription`** answers the most room for any budget but 0. A console works the amount out; nothing here reads the two registers.
+- The header stays the game's memory and is read whenever its shader is looked up, as the GPU reads the register lists in it.
+- What these calls write was checked against an open implementation bit by bit (33 million combinations for the pixel-input registers, by the independent reviewer).
+
+## Drawing (`src/ps5gfx/`, begun)
+
+The driver hands each draw to a renderer. That renderer is to be `src/ps5gfx/`, a module above `ps5` and zpm's 3D engine (`gfxapi`): the same engine on a PC's GPU, a phone's, or the CPU. So far it has one part:
+
+- **`state.sig`** reads a draw's registers as values a renderer can use: each colour target (address, size, the layout of a pixel, its tiling), the depth target and test, blending, the viewport and every scissor, the rasteriser's mode, where the vertex-side and pixel shaders are and the words a game gave them, where each pixel-shader input comes from, and the registers a pixel shader's built-in values arrive in. It guesses nothing: a state it cannot make sense of is null, or kept as its raw code for the renderer to refuse and name.
+
+Not yet: the shaders' machine code recompiled, and anything drawn. `sig build test-ps5gfx` runs its tests.
 
 - **A submit call returns at once.** A worker thread stands in for the GPU's command processor and reads the buffer packet by packet, straight from the game's memory, as the GPU would.
 - **Registers** are kept in three banks (shader, context, user configuration) with the values a queue starts with; the context registers can be cleared, put aside and brought back.

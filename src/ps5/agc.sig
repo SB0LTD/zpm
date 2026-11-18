@@ -23,11 +23,11 @@
 //! This file is the library's table and its end-to-end tests; the calls
 //! are in agc_buffer.sig (the buffer, NOPs, registers), agc_draw.sig
 //! (draws, dispatches), agc_sync.sig (flow, memory, sync, display,
-//! markers, workloads) and agc_patch.sig (patches, reading packets, what
-//! is not a packet).
+//! markers, workloads), agc_patch.sig (patches, reading packets, what is
+//! not a packet) and agc_shader.sig (shader objects and linking them).
 //!
-//! Not here: the register defaults (a large table), shaders, the SDMA
-//! engine's calls.
+//! Not here: the register defaults (a large table), joining the halves
+//! of a shader, the SDMA engine's calls.
 //!
 //! No Sony code: the calls, their arguments and the packets' words are as
 //! open projects document them. x86-64 only. Allocation-free.
@@ -40,6 +40,8 @@ const core = @import("agc_buffer.sig");
 const draw = @import("agc_draw.sig");
 const sync = @import("agc_sync.sig");
 const patch = @import("agc_patch.sig");
+/// Shader objects: their header, the list of those a game created.
+pub const shader = @import("agc_shader.sig");
 
 pub const ERROR = core.ERROR;
 pub const CommandBuffer = core.CommandBuffer;
@@ -91,6 +93,14 @@ pub const exports = nid.Table(*const anyopaque, &[_]struct { []const u8, *const 
     entry("sceAgcCbSetUcRegisterRangeDirectGetSize", &core.sceAgcCbSetRegisterRangeDirectGetSize),
     entry("sceAgcCbSetShRegistersDirectGetSize", &core.sceAgcCbSetRegistersDirectGetSize),
     entry("sceAgcCbSetUcRegistersDirectGetSize", &core.sceAgcCbSetRegistersDirectGetSize),
+
+    entry("sceAgcCreateShader", &shader.sceAgcCreateShader),
+    entry("sceAgcCreatePrimState", &shader.sceAgcCreatePrimState),
+    entry("sceAgcUpdatePrimState", &shader.sceAgcUpdatePrimState),
+    entry("sceAgcCreateInterpolantMapping", &shader.sceAgcCreateInterpolantMapping),
+    entry("sceAgcUpdateInterpolantMapping", &shader.sceAgcUpdateInterpolantMapping),
+    entry("sceAgcLinkShaders", &shader.sceAgcLinkShaders),
+    entry("sceAgcGetGsOversubscription", &shader.sceAgcGetGsOversubscription),
 
     entry("sceAgcDcbDrawIndex", &draw.sceAgcDcbDrawIndex),
     entry("sceAgcDcbDrawIndexAuto", &draw.sceAgcDcbDrawIndexAuto),

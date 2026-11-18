@@ -1294,6 +1294,24 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("nvidia", "src/nvidia/nvidia.sig"),
         importEntry("adreno", "src/adreno/adreno.sig"),
     });
+    // ── ps5gfx: a PS5 game's draws on gfxapi's engine: the GPU's state
+    //    registers read as a draw, a shader's machine code recompiled to KIR,
+    //    on the CPU (KIR's interpreter) in the tests ──
+    const ps5gfx_module = try ctx.addModule("ps5gfx", "src/ps5gfx/ps5gfx.sig");
+    try wire(ctx, ps5gfx_module, "ps5", "src/ps5/ps5.sig");
+    try wire(ctx, ps5gfx_module, "amdgpu", "src/amdgpu/amdgpu.sig");
+    try wire(ctx, ps5gfx_module, "gfxapi", "src/gfxapi/gfxapi.sig");
+    try wire(ctx, ps5gfx_module, "gpu", "src/gpu/gpu.sig");
+    const test_ps5gfx = try ctx.addStep("test-ps5gfx", "Read a PS5 draw's state from its registers, recompile gfx10 shaders to KIR and draw with them on the CPU engine", &noopStep);
+    try ctx.addDependency(test_all, test_ps5gfx);
+    _ = try addTest(ctx, test_ps5gfx, "test-ps5gfx-module", "src/ps5gfx/ps5gfx.sig", &.{
+        importEntry("ps5", "src/ps5/ps5.sig"),
+        importEntry("amdgpu", "src/amdgpu/amdgpu.sig"),
+        importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        importEntry("gpu", "src/gpu/gpu.sig"),
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+        importEntry("adreno", "src/adreno/adreno.sig"),
+    });
     // ── hlsl: the HLSL compiler (HLSL to DXBC, as d3dcompiler_47 does), its
     //    own tests, and the oracle comparison with Microsoft's compiler
     //    (Windows hosts only: skipped elsewhere) ──
