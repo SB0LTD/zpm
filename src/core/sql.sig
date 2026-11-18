@@ -4960,12 +4960,80 @@ pub fn Database(comptime config: Config) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return self.fillViewRows(&self.session,self.seq_snap,&self.workspace.nodes,view,sink);
         }
+
+        const ClassProperties = struct {
+            checks: i64 = 0,
+            has_index: bool = false,
+            has_rule: bool = false,
+            has_trigger: bool = false,
+            security: u32 = 0,
+            partition: bool = false,
+            populated: bool = true,
+        };
+
+        fn classRow(sink: *X.RowSink, oid: u32, name: []const u8, namespace: u32, kind: u8, columns: usize, properties: ClassProperties) Error!void {
+            const access: u32 = switch (kind) {
+                'r', 'm' => catalog_module.heap_access_method,
+                'i', 'I' => catalog_module.btree_access_method,
+                else => 0,
+            };
+            const identity = switch (kind) { 'r', 'p', 'm' => "d", else => "n" };
+            const label = [1]u8{kind};
+            // Relations use the database's tablespace and inline value
+            // storage. The current engine has no typed table definitions.
+            try sink.add(&.{
+                intCell(oid), nameCell(name), intCell(namespace), nameCell(&label), intCell(@intCast(columns)),
+                intCell(properties.checks), boolCell(properties.has_index), boolCell(properties.has_rule), boolCell(properties.has_trigger),
+                boolCell(properties.security & CO.rls_enabled != 0), boolCell(properties.security & CO.rls_forced != 0), boolCell(properties.partition),
+                intCell(0), intCell(0), nameCell("p"), nameCell(identity), intCell(0), intCell(access), boolCell(properties.populated),
+            });
+        }
+
+        fn tableClass(self: *const Self, table: *const S.Table, snapshot: Snapshot, relations: []const K.Found) ClassProperties {
+            var properties: ClassProperties = .{
+                .has_index = S.keyed(table) or table.index_count != 0,
+                .has_rule = table.relkind == 'v' or table.relkind == 'm',
+                .security = self.catalog_objects.securityFlags(table.oid, snapshot),
+                .partition = table.parent != 0 and table.partition.bound != .none,
+                .populated = table.populated,
+            };
+            for (table.constraints[0..table.constraint_count]) |*constraint| switch (constraint.kind) {
+                .check => properties.checks += 1,
+                .unique, .exclusion => properties.has_index = true,
+                .foreign => properties.has_trigger = true,
+                .primary => {},
+            };
+            for (&self.objects.rules) |*rule| {
+                if (rule.live and rule.table_oid == table.oid and rule.stamp.visible(snapshot)) {
+                    properties.has_rule = true;
+                    break;
+                }
+            }
+            for (&self.objects.triggers) |*trigger| {
+                if (trigger.live and trigger.table_oid == table.oid and trigger.stamp.visible(snapshot)) {
+                    properties.has_trigger = true;
+                    break;
+                }
+            }
+            if (!properties.has_trigger) referenced: for (relations) |relation| {
+                if (relation.kind == 'S') continue;
+                const child = &self.tables[relation.slot];
+                for (child.constraints[0..child.constraint_count]) |*constraint| {
+                    if (constraint.kind == .foreign and constraint.ref_oid == table.oid) {
+                        properties.has_trigger = true;
+                        break :referenced;
+                    }
+                }
+            };
+            return properties;
+        }
+
         fn compositeCatalogRows(self: *const Self, view: catalog_module.View, snapshot: Snapshot, sink: *X.RowSink) Error!void {
             for (&self.catalog_objects.items) |*object| {
                 if (object.kind != .composite_type or !O.visible(object, snapshot)) continue;
                 const relation = object.compositeRelationOid();
                 if (view == .pg_class) {
-                    try sink.add(&.{ intCell(relation), nameCell(object.name.slice()), intCell(object.target), nameCell("c"), intCell(object.composite_field_count) });
+                    try classRow(sink, relation, object.name.slice(), object.target, 'c', object.composite_field_count, .{});
                     continue;
                 }
                 var fields = object.compositeFields();
@@ -4977,6 +5045,11 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
+            if (view == .pg_am) {
+                try sink.add(&.{ intCell(catalog_module.heap_access_method), nameCell("heap"), nameCell("heap_tableam_handler"), nameCell("t") });
+                try sink.add(&.{ intCell(catalog_module.btree_access_method), nameCell("btree"), nameCell("bthandler"), nameCell("i") });
+                return;
+            }
             if (view == .pg_database) {
                 const provider = self.catalog.databases orelse return error.TableNotFound;
                 for (0..provider.capacity) |index| {
@@ -4988,7 +5061,6 @@ pub fn Database(comptime config: Config) type {
             const database = session_values.database;
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snapshot, &relations);
-            const public: i64 = catalog_module.public_namespace;
             if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
             switch (view) {
                 .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
@@ -5042,7 +5114,7 @@ pub fn Database(comptime config: Config) type {
                     if (found.kind == 'S') {
                         const seq = &self.seqs[found.slot];
                         switch (view) {
-                            .pg_class => try sink.add(&.{ intCell(seq.oid), nameCell(seq.name.slice()), intCell(public), nameCell("S"), intCell(3) }),
+                            .pg_class => try classRow(sink, seq.oid, seq.name.slice(), catalog_module.public_namespace, 'S', 3, .{}),
                             .pg_sequence => try sink.add(&.{ intCell(seq.oid), intCell(seq.spec.type_oid), intCell(seq.spec.start), intCell(seq.spec.increment), intCell(seq.spec.max), intCell(seq.spec.min), intCell(seq.spec.cache), boolCell(seq.spec.cycle) }),
                             else => {},
                         }
@@ -5074,14 +5146,13 @@ pub fn Database(comptime config: Config) type {
                     const pkey = indexName(table) catch Name{};
                     var key_columns: [config.columns]u8 = undefined;
                     const primary_columns = primaryColumns(table, &key_columns);
-                    const relkind = [1]u8{table.relkind};
                     switch (view) {
                         .pg_class => {
-                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(table.namespace), nameCell(&relkind), intCell(@intCast(table.column_count)) });
-                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(primary_columns.len)) });
+                            try classRow(sink, table.oid, name, table.namespace, table.relkind, table.column_count, self.tableClass(table, snapshot, relations[0..count]));
+                            if (S.keyed(table)) try classRow(sink, table.oid + 1, pkey.slice(), table.namespace, 'i', primary_columns.len, .{});
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
-                                try sink.add(&.{ intCell(index.oid), nameCell(index.name.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(index.key_count + index.include_count)) });
+                                try classRow(sink, index.oid, index.name.slice(), table.namespace, 'i', index.key_count + index.include_count, .{});
                             }
                         },
                         .tables => {

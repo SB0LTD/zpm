@@ -189,11 +189,35 @@ fn characterMetadata() !void {
     try check(std.mem.eql(u8, try render(&result), "id|integer|NULL;v|character varying|3"));
 }
 
+fn relationMetadata() !void {
+    db = .{};
+    try run("CREATE TABLE t(id INT PRIMARY KEY, amount INT CHECK (amount >= 0))");
+    try run("CREATE INDEX t_amount ON t (amount)");
+    try run("CREATE VIEW v AS SELECT id FROM t");
+    try expect("SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid", "2|heap|heap_tableam_handler|t;403|btree|bthandler|i");
+    try expect("SELECT c.relname,c.relkind,c.relchecks,c.relhasindex,c.relhasrules,a.amname FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_am a ON c.relam=a.oid ORDER BY c.relname", "t|r|1|t|f|heap;t_amount|i|0|f|f|btree;t_pkey|i|0|f|f|btree;v|v|0|f|t|NULL");
+    try expect("SELECT relname,relpersistence,relreplident,reltablespace,reloftype,reltoastrelid FROM pg_class ORDER BY relname", "t|p|d|0|0|0;t_amount|p|n|0|0|0;t_pkey|p|n|0|0|0;v|p|n|0|0|0");
+    try expect("SELECT relhastriggers,relrowsecurity,relforcerowsecurity,relispartition,relispopulated FROM pg_class WHERE relname='t'", "f|f|f|f|t");
+    const writer = try db.begin();
+    var result: DB.Result = .{};
+    try db.statement(writer, "ALTER TABLE t ENABLE ROW LEVEL SECURITY", &result, .{});
+    try db.statement(writer, "ALTER TABLE t FORCE ROW LEVEL SECURITY", &result, .{});
+    const security = "SELECT relrowsecurity,relforcerowsecurity FROM pg_class WHERE relname='t'";
+    try db.statement(writer, security, &result, .{});
+    try check(std.mem.eql(u8, try render(&result), "t|t"));
+    try expect(security, "f|f");
+    db.abort(writer);
+    try expect(security, "f|f");
+    try run("ALTER TABLE t ENABLE ROW LEVEL SECURITY");
+    try expect(security, "t|f");
+}
+
 pub fn main(init: std.process.Init) !void {
     try types();
     try lifecycle();
     try replay();
     try characterMetadata();
+    try relationMetadata();
     var buffer: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-catalog\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d}}}\n", .{ assertions, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

@@ -53,7 +53,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Routines, triggers and rules (B11 wave 3).
     pg_proc, pg_trigger, pg_rewrite, pg_rules,
     // Catalog objects (B11 wave 3, catalog_objects.sig).
-    pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database };
+    pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am };
 
 pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
 pub const DatabaseCatalogProvider = struct {
@@ -76,7 +76,16 @@ const pg_type_columns = [_]ViewColumn{
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name) };
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
 const pg_database_columns = [_]ViewColumn{ col("oid", .oid), col("datname", .name), col("datdba", .oid) };
-const pg_class_columns = [_]ViewColumn{ col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .text), col("relnatts", .int2) };
+pub const heap_access_method: u32 = 2;
+pub const btree_access_method: u32 = 403;
+const pg_am_columns = [_]ViewColumn{ col("oid", .oid), col("amname", .name), col("amhandler", .text), col("amtype", .text) };
+const pg_class_columns = [_]ViewColumn{
+    col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .text), col("relnatts", .int2),
+    col("relchecks", .int2), col("relhasindex", .boolean), col("relhasrules", .boolean), col("relhastriggers", .boolean),
+    col("relrowsecurity", .boolean), col("relforcerowsecurity", .boolean), col("relispartition", .boolean),
+    col("reltablespace", .oid), col("reloftype", .oid), col("relpersistence", .text), col("relreplident", .text),
+    col("reltoastrelid", .oid), col("relam", .oid), col("relispopulated", .boolean),
+};
 const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .text), col("attgenerated", .text), col("atthasdef", .boolean) };
 const pg_index_columns = [_]ViewColumn{ col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text) };
 const pg_attrdef_columns = [_]ViewColumn{ col("adrelid", .oid), col("adnum", .int2), col("adbin", .text) };
@@ -119,6 +128,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_enum => &pg_enum_columns,
         .pg_database => &pg_database_columns,
         .pg_namespace => &pg_namespace_columns,
+        .pg_am => &pg_am_columns,
         .pg_class => &pg_class_columns,
         .pg_attribute => &pg_attribute_columns,
         .pg_index => &pg_index_columns,
@@ -156,7 +166,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 /// pg_catalog views resolve unqualified (pg_catalog is searched first);
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
-    const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
+    const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_class, .pg_attribute, .pg_index, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_extension, .pg_tables };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
