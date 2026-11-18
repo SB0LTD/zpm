@@ -358,10 +358,15 @@ pub fn Eval(comptime config: types.Config) type {
 
         const null_cell: V.Cell = .null_value;
 
-        pub fn columnRef(ctx: *const Context, n: *const ast.Node) *const V.Cell {
+        inline fn columnOwner(ctx: *const Context, n: *const ast.Node) *const Context {
             var owner = ctx;
             var level = n.level;
             while (level != 0) : (level -= 1) owner = owner.outer.?;
+            return owner;
+        }
+
+        pub fn columnRef(ctx: *const Context, n: *const ast.Node) *const V.Cell {
+            const owner = columnOwner(ctx, n);
             if (owner.row) |row| if (n.relation == 0) return &row[n.column];
             const base = owner.tuple[n.relation] orelse return &null_cell;
             return &base[n.column];
@@ -1092,6 +1097,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return if (n.ty == .numeric or n.ty == .unknown) number else Io.cast(number, .numeric, n.ty, -1, ctx.session);
                 },
                 .column => return columnRef(ctx, n).*,
+                .catalog_tableoid => return if (columnOwner(ctx, n).tuple[n.relation] != null) .{ .integer = n.integer } else .null_value,
                 .scalar_subquery, .exists_subquery, .in_subquery => {
                     const hook = ctx.hook orelse return error.UnsupportedStatement;
                     return hook.run(hook.ptr, ctx, id);

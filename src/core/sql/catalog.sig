@@ -236,6 +236,13 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_publication_rel, .oid = 6106 }, .{ .view = .pg_publication_namespace, .oid = 6237 },
 };
 
+pub fn bootstrapRelationOid(view: View) ?u32 {
+    for (bootstrap_relations) |relation| {
+        if (relation.view == view) return relation.oid;
+    }
+    return null;
+}
+
 pub fn Catalog(comptime config: types.Config) type {
     const rows = @max(config.tables * config.columns, config.tables + config.sequences + config.schemas);
     const cat_config: types.Config = .{
