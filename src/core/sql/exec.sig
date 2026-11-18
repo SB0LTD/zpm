@@ -1375,21 +1375,25 @@ pub fn Exec(comptime config: types.Config) type {
                 return mask;
             }
 
+            fn sparseComparisonMask(table: *const S.Table, start: usize, selected_mask: u64, predicate: CompactPredicate) u64 {
+                const single = [_]CompactPredicate{predicate};
+                var remaining = selected_mask;
+                var matched: u64 = 0;
+                while (remaining != 0) {
+                    const bit = @ctz(remaining);
+                    remaining &= remaining - 1;
+                    if (compactKeep(table, start + bit, &single)) matched |= @as(u64, 1) << @intCast(bit);
+                }
+                return matched;
+            }
+
             fn refineFactorMask(self: *Query, table: *const S.Table, start: usize, count: usize,
                 selected_mask: u64, predicate: CompactPredicate) u64 {
                 // A prior selective predicate can leave fewer rows than one
                 // vector. Read only those rows of the next fact column.
                 if (@popCount(selected_mask) <= 4) {
                     self.work.stream_stats.factor_sparse_predicates += 1;
-                    const single = [_]CompactPredicate{predicate};
-                    var remaining = selected_mask;
-                    var matched: u64 = 0;
-                    while (remaining != 0) {
-                        const bit = @ctz(remaining);
-                        remaining &= remaining - 1;
-                        if (compactKeep(table, start + bit, &single)) matched |= @as(u64, 1) << @intCast(bit);
-                    }
-                    return matched;
+                    return sparseComparisonMask(table, start, selected_mask, predicate);
                 }
                 const stats = &self.work.stream_stats;
                 return selected_mask & switch (predicate.op) {
@@ -5148,8 +5152,9 @@ pub fn Exec(comptime config: types.Config) type {
                 for(predicates[0..used]) |predicate| {
                     // Comparisons borrow their column and evaluate one literal;
                     // subsequent AND terms run only for preceding TRUE rows.
-                    try ctx.session.checkpoints(@popCount(mask));
-                    mask &= switch(predicate.op) {
+                    const selected = @popCount(mask);
+                    try ctx.session.checkpoints(selected);
+                    mask = if (selected <= 8) Query.sparseComparisonMask(table, start, mask, predicate) else mask & switch(predicate.op) {
                         .eq=>Query.comparisonMask(.eq,table,start,count,predicate,null),
                         .ne=>Query.comparisonMask(.ne,table,start,count,predicate,null),
                         .lt=>Query.comparisonMask(.lt,table,start,count,predicate,null),
