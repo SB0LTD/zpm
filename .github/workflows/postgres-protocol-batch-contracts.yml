@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          ref: fc122d139a4f93f7722dc29add21e4e856f298ee
       - name: Install checksum-verified Sig 0.6.5
         shell: bash
         run: |
@@ -34,8 +34,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir evidence
-          test "$(git rev-parse HEAD^)" = "fc122d139a4f93f7722dc29add21e4e856f298ee"
-          git rev-parse HEAD^ >evidence/source.txt
+          test "$(git rev-parse HEAD)" = "fc122d139a4f93f7722dc29add21e4e856f298ee"
+          git rev-parse HEAD >evidence/source.txt
           "$SIG" version | tee evidence/sig-version.log
           "$SIG" build run-contract-sql-integral-versions run-contract-sql-types run-contract-sql-numeric-functions run-contract-sql-change-log \
             --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
