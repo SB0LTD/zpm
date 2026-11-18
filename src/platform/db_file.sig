@@ -47,6 +47,11 @@ pub const File = struct {
     handle: Handle = invalid,
     poisoned: bool = false,
 
+    /// Refuse writes for the remaining lifetime of this writer lease.
+    pub fn poison(self: *File) void {
+        self.poisoned = true;
+    }
+
     /// Creates if absent, preserving existing bytes. Hold until server shutdown.
     pub fn open(path: []const u8) Error!File {
         return openImpl(path, false, true);
