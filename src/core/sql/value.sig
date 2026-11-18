@@ -185,6 +185,17 @@ pub fn bitType(ty: Type) bool {
 
 /// pg_cast entries of the B11 types; null when the pair is not one of them.
 fn extendedCast(from: Type, to: Type, context: Context) ?bool {
+    if (to == .pg_internal_char) return switch (from) {
+        .int4 => context == .explicit,
+        .text, .varchar, .bpchar => context != .implicit,
+        else => false,
+    };
+    if (from == .pg_internal_char) return switch (to) {
+        .text => true,
+        .varchar, .bpchar => context != .implicit,
+        .int4 => context == .explicit,
+        else => false,
+    };
     if (from == .bpchar or to == .bpchar) {
         // text/varchar <-> bpchar and bpchar -> name are implicit; name ->
         // bpchar is an assignment cast.
@@ -366,6 +377,10 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
     if (a == .point or b == .point or a == .box or b == .box) return null;
     // xml and jsonpath have no comparison operators; tsvector/tsquery have none here.
     if (a == .xml or b == .xml or a == .jsonpath or b == .jsonpath or a == .tsvector or b == .tsvector or a == .tsquery or b == .tsquery) return null;
+    if (a != b and (a == .pg_internal_char or b == .pg_internal_char)) {
+        const other = if (a == .pg_internal_char) b else a;
+        return if (characterType(other)) .text else null;
+    }
     // anyarray operators need the same array type on both sides.
     if (a != b and (types.isArray(a) or types.isArray(b))) return null;
     if (a != b and numericCategory(a) and numericCategory(b) and (a == .float4 or b == .float4)) return .float8;
@@ -519,6 +534,12 @@ pub fn Io(comptime config: types.Config) type {
                 .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
                 // Stored as their canonical output text.
                 .tsvector, .tsquery => |*value| copy(buffer, value.slice()),
+                .pg_internal_char => |value| if (value == 0)
+                    buffer[0..0]
+                else if (value < 128)
+                    copy(buffer, &.{value})
+                else
+                    copy(buffer, &.{ '\\', '0' + (value >> 6), '0' + ((value >> 3) & 7), '0' + (value & 7) }),
             };
         }
 
@@ -641,6 +662,7 @@ pub fn Io(comptime config: types.Config) type {
                     break :blk try textCell(try jsonpath.Engine(config).canonical(input, &buffer, session.control));
                 },
                 .regtype => .{ .regtype = try types.regtypeInput(input) },
+                .pg_internal_char => .{ .pg_internal_char = parseInternalChar(input) },
                 .tsvector, .tsquery => blk: {
                     var out: TS.Out = .{};
                     if (ty == .tsvector) try TS.vectorIn(input, &out) else try TS.queryIn(input, &out);
@@ -659,6 +681,19 @@ pub fn Io(comptime config: types.Config) type {
             const now = session.transaction_us orelse session.statement_us orelse 0;
             const today = @divFloor(temporal.toLocal(zone, now), temporal.usecs_per_day);
             return time_of_day.zoneWest(zone, today * temporal.usecs_per_day + us);
+        }
+
+        fn parseInternalChar(input: []const u8) u8 {
+            if (input.len == 0) return 0;
+            if (input.len == 4 and input[0] == '\\') {
+                var byte: u8 = 0;
+                for (input[1..]) |digit| {
+                    if (digit < '0' or digit > '7') return input[0];
+                    byte = (byte << 3) | (digit - '0');
+                }
+                return byte;
+            }
+            return input[0];
         }
 
         fn parseTime(ty: Type, input: []const u8, session: *const Session) Error!V.Cell {
@@ -800,6 +835,21 @@ pub fn Io(comptime config: types.Config) type {
         pub fn cast(cell: V.Cell, from: Type, to: Type, typmod: i32, session: *const Session) Error!V.Cell {
             if (cell == .null_value) return .null_value;
             if (from == to and typmod < 0) return cell;
+            if (cell == .pg_internal_char) {
+                if (to == .int4) return .{ .integer = @as(i8, @bitCast(cell.pg_internal_char)) };
+                if (!characterType(to)) return error.CannotCoerce;
+                var buffer: [4]u8 = undefined;
+                return cast(try textCell(try format(&cell, true, session, &buffer)), .text, to, typmod, session);
+            }
+            if (to == .pg_internal_char) return switch (cell) {
+                .integer => |value| blk: {
+                    if (value < -128 or value > 127) return error.NumericValueOutOfRange;
+                    break :blk .{ .pg_internal_char = @bitCast(@as(i8, @intCast(value))) };
+                },
+                .text => |*value| .{ .pg_internal_char = parseInternalChar(value.slice()) },
+                .bpchar => |*value| .{ .pg_internal_char = parseInternalChar(value.slice()) },
+                else => error.CannotCoerce,
+            };
             if (cell == .xml and to != .xml) {
                 // xml -> text is binary coercible: the stored text.
                 if (!characterType(to)) return error.CannotCoerce;

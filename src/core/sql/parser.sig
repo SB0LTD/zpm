@@ -1632,7 +1632,31 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// A type name with an optional array suffix: `[]`, `[n]` (repeated;
         /// sizes and dimensions are ignored) or `ARRAY [n]`.
+        fn internalCharName(self: *const Self) bool {
+            return self.mode == .standard and self.tokens.dialect == .postgres and
+                self.current.kind == .quoted_word and types.same(
+                    self.source[self.current.start..self.current.end], "char",
+                );
+        }
+
+        fn internalCharQualifier(self: *Self) Error!bool {
+            if (self.mode != .standard or self.tokens.dialect != .postgres or !self.rawWord("pg_catalog")) return false;
+            const next = try self.peek();
+            return next.kind == .symbol and next.symbol == .dot;
+        }
+
         fn typeName(self: *Self) Error!TypeSpec {
+            if (try self.internalCharQualifier()) {
+                try self.advance();
+                try self.expectSymbol(.dot);
+                if (!self.internalCharName() and !self.rawWord("char")) return error.UndefinedObject;
+                try self.advance();
+                return self.typeArraySuffix(.{ .ty = .pg_internal_char });
+            }
+            if (self.internalCharName()) {
+                try self.advance();
+                return self.typeArraySuffix(.{ .ty = .pg_internal_char });
+            }
             return self.typeArraySuffix(try self.scalarTypeName());
         }
 
@@ -2069,7 +2093,7 @@ pub fn Parser(comptime config: types.Config) type {
                     break;
                 }
             } else {
-                if (self.mode == .standard and !typeWord(self.current) and
+                if (self.mode == .standard and !typeWord(self.current) and !self.internalCharName() and !(try self.internalCharQualifier()) and
                     (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
                     return error.UnsupportedStatement;
                 }
@@ -3884,7 +3908,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn castTarget(self: *Self, inner: u16) Error!u16 {
-            if (typeWord(self.current)) {
+            if (typeWord(self.current) or self.internalCharName()) {
                 const next = try self.peek();
                 if (next.kind != .symbol or next.symbol != .dot) {
                     const target = try self.typeName();
@@ -4564,6 +4588,13 @@ pub fn Parser(comptime config: types.Config) type {
                 },
                 .end => return error.Syntax,
                 .word, .quoted_word => {},
+            }
+            if (self.internalCharName() and (try self.peek()).kind == .string) {
+                try self.advance();
+                const literal = self.current;
+                try self.advance();
+                const inner = try self.pool.add(.{ .kind = .text_literal, .text = literal.quoted() });
+                return self.pool.add(.{ .kind = .cast, .cast_type = .pg_internal_char, .a = inner, .typmod = -1 });
             }
             if (token.kind == .word) {
                 if (try self.takeWord("NULL")) return self.pool.add(.{ .kind = .null_literal });

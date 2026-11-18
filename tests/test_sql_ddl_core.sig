@@ -1393,6 +1393,25 @@ fn attributeLayout() !void {
     try sameState(&.{ table, composite });
 }
 
+fn internalChar() !void {
+    reset();
+    try run("CREATE TABLE chars (v pg_catalog.\"char\" PRIMARY KEY)");
+    try run("INSERT INTO chars VALUES ((-128)::\"char\"),((-1)::\"char\"),(''),('abc'),(127::\"char\")");
+    const ordered = "SELECT v::int, rank() OVER (ORDER BY v) FROM chars ORDER BY chars.v";
+    try expect(ordered, "0|1;97|2;127|3;-128|4;-1|5");
+    const codecs = "SELECT ''::\"char\"::text, 'abc'::pg_catalog.\"char\"::text, 'é'::\"char\"::text, (-1)::\"char\"::text, CHAR 'x', \"char\" 'b'";
+    try expect(codecs, "|a|\\303|\\377|x|b");
+    const type_oid = "SELECT atttypid, attlen FROM pg_attribute WHERE attrelid = 'chars'::regclass AND attnum > 0";
+    try expect(type_oid, "18|1");
+    const arrays = "SELECT a[1]::int, a[2]::int FROM (SELECT ARRAY[(-1)::\"char\",65::\"char\"] AS a) q";
+    try expect(arrays, "-1|65");
+    try expect("SELECT pg_typeof(ARRAY['a'::\"char\"])::oid", "1002");
+    try expect("SELECT (-1)::\"char\" > 'a', ('a'::\"char\" = 'a'::text)", "t|t");
+    try rejects("INSERT INTO chars VALUES (128::\"char\")", error.NumericValueOutOfRange, ordered, "0|1;97|2;127|3;-128|4;-1|5");
+    try rejects("INSERT INTO chars VALUES (1)", error.TypeMismatch, ordered, "0|1;97|2;127|3;-128|4;-1|5");
+    try sameState(&.{ ordered, codecs, type_oid, arrays });
+}
+
 /// The types lane's column types under this lane's DDL and constraints.
 fn newTypes() !void {
     reset();
@@ -1436,6 +1455,7 @@ pub fn main(init: std.process.Init) !void {
     try newTypes();
     try catalogDependencies();
     try attributeLayout();
+    try internalChar();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

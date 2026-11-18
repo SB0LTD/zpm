@@ -350,6 +350,35 @@ fn characterDescriptions() !void {
     }
 }
 
+fn internalCharWire() !void {
+    var db: DB = .{};
+    var session: Session = .{};
+    try startup(&session, &db);
+    try tags(try parse(&session, &db, "internal_char", "SELECT $1::pg_catalog.\"char\" AS c", &.{18}), "1");
+    const description = try describe(&session, &db, 'S', "internal_char");
+    try tags(description, "tT");
+    var frames: Frames = .{ .bytes = description };
+    _ = try frames.next();
+    const descriptor = (try frames.next()).?;
+    try check(u32be(descriptor.body[10..14]) == 18 and equal(descriptor.body[14..16], "\x00\x01"));
+    const examples = [_]struct { format: u16, input: []const u8, output: []const u8 }{
+        .{ .format = 0, .input = "", .output = "" },
+        .{ .format = 0, .input = "abc", .output = "a" },
+        .{ .format = 0, .input = "é", .output = "\\303" },
+        .{ .format = 1, .input = "\x00", .output = "\x00" },
+        .{ .format = 1, .input = "\xff", .output = "\xff" },
+    };
+    for (examples) |example| {
+        try tags(try bind(&session, &db, "", "internal_char", &.{example.input}, example.format, example.format), "2");
+        const bytes = try execute(&session, &db, "", 0);
+        try tags(bytes, "DC");
+        frames = .{ .bytes = bytes };
+        const row = (try frames.next()).?;
+        try check(u32be(row.body[2..6]) == example.output.len and equal(row.body[6..], example.output));
+        try sync(&session, &db);
+    }
+}
+
 fn commandText(bytes: []const u8, wanted: []const u8) !void {
     var frames: Frames = .{ .bytes = bytes };
     while (try frames.next()) |f| if (f.tag == 'C') {
@@ -1943,6 +1972,7 @@ pub fn main(init: std.process.Init) !void {
     try vacuumContracts();
     try returningOnce();
     try characterDescriptions();
+    try internalCharWire();
     try normal();
     try extended();
     try parameterLexicalRegions();

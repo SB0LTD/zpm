@@ -571,12 +571,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -691,6 +691,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .regtype => .regtype,
         .tsvector => .tsvector,
         .tsquery => .tsquery,
+        .pg_internal_char => .pg_internal_char,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -741,6 +742,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .regtype => .regtype,
         .tsvector => .tsvector,
         .tsquery => .tsquery,
+        .pg_internal_char => .pg_internal_char,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -800,6 +802,7 @@ const array_sql_names = blk: {
 
 fn baseInfo(data_type: DataType) TypeInfo {
     return switch (data_type) {
+        .pg_internal_char => .{ .oid = 18, .name = "char", .len = 1, .category = 'Z', .array = 1002, .alignment = 'c' },
         .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000, .alignment = 'c' },
         .name => .{ .oid = 19, .name = "name", .len = 64, .category = 'S', .array = 1003, .alignment = 'c' },
         .integer => .{ .oid = 20, .name = "int8", .len = 8, .category = 'N', .array = 1016, .alignment = 'd' },
@@ -916,6 +919,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .regtype => "regtype",
         .tsvector => "tsvector",
         .tsquery => "tsquery",
+        .pg_internal_char => "\"char\"",
         _ => "",
     };
 }
@@ -961,6 +965,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .regtype => "regtypein",
         .tsvector => "tsvectorin",
         .tsquery => "tsqueryin",
+        .pg_internal_char => "charin",
         _ => "array_in",
     };
 }
@@ -1005,7 +1010,8 @@ fn scalarByName(input: []const u8) ?DataType {
     var text = input;
     while (text.len != 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
     while (text.len != 0 and (text[text.len - 1] == ' ' or text[text.len - 1] == '\t')) text = text[0 .. text.len - 1];
-    if (text.len > 11 and keyword(text[0..11], "pg_catalog.")) text = text[11..];
+    const catalog_qualified = text.len > 11 and keyword(text[0..11], "pg_catalog.");
+    if (catalog_qualified) text = text[11..];
     var buffer: [40]u8 = undefined;
     var length: usize = 0;
     var quoted = false;
@@ -1013,6 +1019,7 @@ fn scalarByName(input: []const u8) ?DataType {
         quoted = true;
         text = text[1 .. text.len - 1];
     }
+    if ((quoted and same(text, "char")) or (catalog_qualified and !quoted and keyword(text, "char"))) return .pg_internal_char;
     for (text) |byte| {
         if (byte == '(' and !quoted) break;
         if (length == buffer.len) return null;
@@ -1156,7 +1163,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1203,6 +1210,7 @@ pub fn Values(comptime config: Config) type {
             /// (text_search.sig).
             tsvector: Text,
             tsquery: Text,
+            pg_internal_char: u8,
         };
 
         /// Range values of these cells (range.sig).
@@ -1264,6 +1272,7 @@ pub fn Values(comptime config: Config) type {
                 .regtype => .regtype,
                 .tsvector => .tsvector,
                 .tsquery => .tsquery,
+                .pg_internal_char => .pg_internal_char,
                 _ => .array,
             };
         }
@@ -1312,6 +1321,7 @@ pub fn Values(comptime config: Config) type {
                 // text keeps internal order and equality consistent.
                 .tsvector => |*value| bytesOrder(value.slice(), right.tsvector.slice()),
                 .tsquery => |*value| bytesOrder(value.slice(), right.tsquery.slice()),
+                .pg_internal_char => |value| order(u8, value, right.pg_internal_char),
             };
         }
 
@@ -1357,6 +1367,7 @@ pub fn Values(comptime config: Config) type {
             // Variable/composite representations retain their canonical hashing.
             switch (value.*) {
                 .integer => |integer| return wordHash(@bitCast(integer), tag),
+                .pg_internal_char => |value| return wordHash(value, tag),
                 .text, .bytea, .xml, .tsvector, .tsquery => |*text| {
                     mix(&code, tag);
                     for (text.slice()) |byte| code = (code ^ byte) *% 1099511628211;

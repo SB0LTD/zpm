@@ -148,6 +148,7 @@ pub fn Types(comptime Result: type) type {
                 .xml => at += try sendText(cell, session, out),
                 // regtypesend is oidsend.
                 .regtype => |value| try putInt(u32, out, &at, value),
+                .pg_internal_char => |value| try put(out, &at, &.{value}),
                 // tsvectorsend / tsquerysend binary forms are not provided.
                 .tsvector, .tsquery => return error.UnsupportedBinaryType,
                 .point => |value| {
@@ -199,7 +200,7 @@ pub fn Types(comptime Result: type) type {
             var names: [fields.len][]const u8 = undefined;
             for (fields, 0..) |field, index| {
                 const element = @field(DataType, field);
-                names[index] = (if (element == .bit) "varbit" else Io.typeInfo(element).name) ++ "[]";
+                names[index] = (if (element == .bit) "varbit" else if (element == .pg_internal_char) "\"char\"" else Io.typeInfo(element).name) ++ "[]";
             }
             break :blk names;
         };
@@ -213,6 +214,7 @@ pub fn Types(comptime Result: type) type {
                 // `::bit` would mean BIT(1); varbit keeps every bit and is
                 // implicitly castable to BIT(n).
                 .bit => "varbit",
+                .pg_internal_char => "\"char\"",
                 else => Io.typeInfo(data_type).name,
             };
         }
@@ -381,6 +383,10 @@ pub fn Types(comptime Result: type) type {
                 .macaddr => {
                     if (bytes.len != 6) return error.ProtocolViolation;
                     return .{ .macaddr = bytes[0..6].* };
+                },
+                .pg_internal_char => {
+                    if (bytes.len != 1) return error.ProtocolViolation;
+                    return .{ .pg_internal_char = bytes[0] };
                 },
                 .regtype => {
                     if (bytes.len != 4) return error.ProtocolViolation;
