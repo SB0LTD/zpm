@@ -834,8 +834,11 @@ pub fn Store(comptime Raw: type) type {
                 if (self.id == 0) return error.InvalidConnection;
                 if (!self.in_transaction) return;
                 const slot = self.tx.?;
+                // COMMIT finalizes session state as well as row versions.
+                // An intervening request may have installed a different session.
+                const raw = self.db();
                 if (self.failed) {
-                    self.db().abort(slot);
+                    raw.abort(slot);
                     self.endTransaction(false);
                     return;
                 }
