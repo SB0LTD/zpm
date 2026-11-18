@@ -25,6 +25,7 @@
 //! capacity, dead versions are reclaimed and live slots are compacted; moved
 //! slots get a fresh generation, so a stale RowRef never resolves.
 const types = @import("types.sig");
+const character = @import("character.sig");
 const mem = @import("std").mem;
 const Error = types.Error;
 
@@ -273,6 +274,12 @@ pub fn Storage(comptime config: types.Config) type {
                         .smallint => @as(usize, 2),
                         .integer32, .oid, .date => 4,
                         .integer => 8,
+                        .varchar, .bpchar => text: {
+                            const length = character.declared(column.typmod) orelse return null;
+                            const bytes = @min(config.text_bytes, length * 4);
+                            if (bytes > 255) return null;
+                            break :text 1 + bytes;
+                        },
                         else => return null,
                     };
                 }
@@ -1453,6 +1460,11 @@ pub fn Storage(comptime config: types.Config) type {
                 .oid => .{ .integer = mem.readInt(u32, bytes[at..][0..4], .little) },
                 .date => .{ .date = mem.readInt(i32, bytes[at..][0..4], .little) },
                 .integer => .{ .integer = mem.readInt(i64, bytes[at..][0..8], .little) },
+                .varchar, .bpchar => text: {
+                    var value: V.Text = .{ .len = bytes[at] };
+                    @memcpy(value.bytes[0..value.len], bytes[at + 1 ..][0..value.len]);
+                    break :text if (table.columns[column].data_type == .varchar) .{ .text = value } else .{ .bpchar = value };
+                },
                 else => unreachable,
             };
         }
@@ -1473,6 +1485,11 @@ pub fn Storage(comptime config: types.Config) type {
                     .oid => mem.writeInt(u32, bytes[at..][0..4], @intCast(cell.integer), .little),
                     .date => mem.writeInt(i32, bytes[at..][0..4], cell.date, .little),
                     .integer => mem.writeInt(i64, bytes[at..][0..8], cell.integer, .little),
+                    .varchar, .bpchar => {
+                        const value = if (cell.* == .text) cell.text.slice() else cell.bpchar.slice();
+                        bytes[at] = @intCast(value.len);
+                        @memcpy(bytes[at + 1 ..][0..value.len], value);
+                    },
                     else => unreachable,
                 }
             }
