@@ -112,6 +112,7 @@ pub fn SettingsOf(comptime Zone: type) type {
         const Self = @This();
         lock_timeout_ms: u32 = 0,
         statement_timeout_ms: u32 = 0,
+        xml_document: bool = false,
         application_name: [64]u8 = @splat(0),
         application_name_len: u8 = 0,
         /// TimeZone as SHOW reports it, and the resolved zone.
@@ -221,7 +222,7 @@ pub const deadlock_timeout_ms: u32 = 1000;
 
 /// Settings this store implements; the engine owns the others it knows
 /// (transaction_*, default_transaction_*, search_path, placeholders).
-const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
+const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, xmloption, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -685,6 +686,9 @@ pub fn Store(comptime Raw: type) type {
                     self.settings = next;
                     restore(&self.base, &next, which);
                 }
+                if (comptime has_session) if (which == .xmloption) {
+                    self.store.database.session.xml_document = self.settings.xml_document;
+                };
             }
 
             pub const CopyInfo = Raw.CopyInfo;
@@ -751,7 +755,7 @@ pub fn Store(comptime Raw: type) type {
             /// A caller using named-zone operations must provide a read-safe
             /// resolver or keep those operations on the serialized path.
             pub fn detachedReadSession(self:*const Connection,execution_control:*ExecutionControl,statement_us:?i64) Raw.SessionValues {
-                return .{.zone=self.settings.zone,.transaction_us=statement_us,.statement_us=statement_us,
+                return .{.zone=self.settings.zone,.xml_document=self.settings.xml_document,.transaction_us=statement_us,.statement_us=statement_us,
                     .clock=self.store.wall_clock,.database=if(self.database_len==0) "postgres" else self.database_name[0..self.database_len],.control=execution_control};
             }
 
@@ -759,7 +763,7 @@ pub fn Store(comptime Raw: type) type {
                 const settings = &self.engine_session.values;
                 if (self.dialect != .postgres or
                     self.store.max_query_work != 0 or self.settings.statement_timeout_ms != 0 or
-                    self.settings.lock_timeout_ms != 0 or self.settings.date_order != .mdy or
+                    self.settings.lock_timeout_ms != 0 or self.settings.xml_document or self.settings.date_order != .mdy or
                     !same(self.settings.timeZone(), "UTC") or settings.isolation != .read_committed or
                     settings.read_only or settings.deferrable or !same(settings.search_path.slice(), "\"$user\", public")) return false;
                 for (&settings.custom) |*entry| if (entry.used) return false;
@@ -788,6 +792,7 @@ pub fn Store(comptime Raw: type) type {
                 };
                 if (comptime has_session) raw.session = .{
                     .zone = self.settings.zone,
+                    .xml_document = self.settings.xml_document,
                     .resolver = .{ .context = @ptrCast(self.store), .lookup = &resolverLookup },
                     .transaction_us = self.transaction_us orelse self.statement_us,
                     .statement_us = self.statement_us,
@@ -992,6 +997,13 @@ pub fn Store(comptime Raw: type) type {
                         target.application_name_len = @intCast(length);
                     },
                     .timezone => try self.assignZone(target, value),
+                    .xmloption => {
+                        if ((is_default and value.len == 0) or sameInsensitive(value, "content")) {
+                            target.xml_document = false;
+                        } else if (sameInsensitive(value, "document")) {
+                            target.xml_document = true;
+                        } else return error.InvalidSettingValue;
+                    },
                     .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
                     .standard_conforming_strings => if (!(value.len == 0 or sameInsensitive(value, "on") or sameInsensitive(value, "true"))) return error.InvalidSettingValue,
                     .datestyle => target.date_order = try dateOrder(value, target.date_order),
@@ -1061,6 +1073,7 @@ pub fn Store(comptime Raw: type) type {
                     .deadlock_timeout => return formatMilliseconds(deadlock_timeout_ms, out),
                     .application_name => self.settings.applicationName(),
                     .timezone => self.settings.timeZone(),
+                    .xmloption => if (self.settings.xml_document) "document" else "content",
                     .client_encoding, .server_encoding => "UTF8",
                     .standard_conforming_strings, .integer_datetimes => "on",
                     .datestyle => self.settings.dateStyle(),
@@ -1277,6 +1290,7 @@ pub fn Store(comptime Raw: type) type {
                 switch (which) {
                     .lock_timeout => target.lock_timeout_ms = source.lock_timeout_ms,
                     .statement_timeout => target.statement_timeout_ms = source.statement_timeout_ms,
+                    .xmloption => target.xml_document = source.xml_document,
                     .application_name => {
                         target.application_name = source.application_name;
                         target.application_name_len = source.application_name_len;

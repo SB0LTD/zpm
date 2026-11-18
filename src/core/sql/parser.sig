@@ -1183,6 +1183,14 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
                 }
+                if (self.rawWord("xml") and (try self.peek()).isWord("OPTION")) {
+                    try self.advance();
+                    try self.advance();
+                    if (!self.isWord("DOCUMENT") and !self.isWord("CONTENT")) return error.Syntax;
+                    const value = try self.settingValue();
+                    try self.finish();
+                    return .{ .set = .{ .local = local, .name = .{ .special = .xml_option }, .value = value } };
+                }
                 // SET [LOCAL | SESSION] ROLE { name | NONE } (gram.y; the
                 // catalog-security lane resolves it as the `role` setting).
                 if (self.rawWord("role")) {
