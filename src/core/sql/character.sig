@@ -15,6 +15,7 @@
 //! PostgreSQL, up to 10485760) but every non-NULL value then raises
 //! TextCapacity (54000).
 const types = @import("types.sig");
+const std = @import("std");
 const Error = types.Error;
 
 /// PostgreSQL MaxAttrSize: the largest declarable length.
@@ -87,8 +88,15 @@ fn clipped(bytes: []const u8, length: usize, mode: Mode) Error!usize {
     return keep;
 }
 
+/// PostgreSQL character values use UTF-8 and reject embedded NUL.
+pub fn validateText(bytes: []const u8) Error!void {
+    if (std.mem.indexOfScalar(u8, bytes, 0) != null or !std.unicode.utf8ValidateSlice(bytes))
+        return error.CharacterNotInRepertoire;
+}
+
 /// varchar(): the bytes a VARCHAR(n) value keeps.
 pub fn varchar(bytes: []const u8, typmod: i32, mode: Mode) Error!Shape {
+    try validateText(bytes);
     const length = declared(typmod) orelse return .{ .keep = bytes.len };
     if (bytes.len <= length) return .{ .keep = bytes.len };
     return .{ .keep = try clipped(bytes, length, mode) };
@@ -96,6 +104,7 @@ pub fn varchar(bytes: []const u8, typmod: i32, mode: Mode) Error!Shape {
 
 /// bpchar(): the bytes a CHAR(n) value keeps and the spaces it gains.
 pub fn bpchar(bytes: []const u8, typmod: i32, mode: Mode) Error!Shape {
+    try validateText(bytes);
     const length = declared(typmod) orelse return .{ .keep = bytes.len };
     const count = characters(bytes);
     if (count > length) return .{ .keep = try clipped(bytes, length, mode) };
