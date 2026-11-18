@@ -22,7 +22,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$SOURCE"
+          git merge-base --is-ancestor "$SOURCE" HEAD
+          git diff --exit-code "$SOURCE" HEAD -- src tools
           tree="$RUNNER_TEMP/source"
           git worktree add --detach "$tree" "$SOURCE"
           evidence="$GITHUB_WORKSPACE/evidence"
