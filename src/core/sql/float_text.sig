@@ -144,7 +144,8 @@ fn roundedSignificant(value: anytype, precision: usize) Significant {
     const bits: u64 = @bitCast(@as(f64, value));
     const biased: i32 = @intCast((bits >> 52) & 0x7ff);
     const significand = (bits & 0xfffffffffffff) | (if (biased == 0) @as(u64, 0) else @as(u64, 1) << 52);
-    var binary_exponent = @max(biased, 1) - 1075;
+    const normalized_exponent: i32 = if (biased == 0) 1 else biased;
+    var binary_exponent: i32 = normalized_exponent - 1075;
     const trailing: i32 = @intCast(@ctz(significand));
     const reduced = significand >> @intCast(trailing);
     binary_exponent += trailing;
