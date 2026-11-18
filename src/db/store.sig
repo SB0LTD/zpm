@@ -304,6 +304,14 @@ pub fn Store(comptime Raw: type) type {
     return struct {
         const Self = @This();
         pub const CommitFn = *const fn (?*anyopaque, []const u8) anyerror!void;
+        /// True means all records reached stable storage. False means no I/O
+        /// was attempted. Any error leaves durability uncertain for the group.
+        pub const BatchCommitFn = *const fn (?*anyopaque, []const []const u8) anyerror!bool;
+        pub const CommitBatchWorkspace = struct {
+            table_oids: []u32,
+            payloads: [][]const u8,
+            encoded: []u8,
+        };
         pub const PrepareFn = *const fn (?*anyopaque, []const u8) anyerror!u64;
         pub const PreparedOperation = enum { prepare, resolve };
         pub const PreparedCheck = if (PreparedWal != void)
@@ -438,6 +446,56 @@ pub fn Store(comptime Raw: type) type {
                 };
             }
             db.publishCommit(slot);
+        }
+
+        /// Commit pre-existing explicit row transactions on distinct tables
+        /// with one synchronous durability callback. The caller must hold the
+        /// store's exclusive mutation gate through the entire call, retain the
+        /// selected connections and supply disjoint scratch. The callback must
+        /// persist to this store's WAL and must not reenter the store.
+        ///
+        /// False leaves all transactions open for ordinary serial COMMIT.
+        /// An I/O error from the callback ends all selected transactions and
+        /// fails the store closed. Nothing is published before a successful
+        /// callback, and the return value is the only commit acknowledgement.
+        pub fn commitOrdinaryBatch(self: *Self, connections: []const *Connection, scratch: CommitBatchWorkspace,
+                                   context: ?*anyopaque, persist: BatchCommitFn) !bool {
+            if (comptime !@hasDecl(Raw, "ordinaryBatchCommitTable")) return false;
+            const count = connections.len;
+            if (count < 2 or count > scratch.table_oids.len or count > scratch.payloads.len or
+                self.commit_fn == null or self.encode_buffer.len == 0) return false;
+            if (count > 0xffffffffffffffff - self.database.csn) return false;
+            for (connections, 0..) |connection, index| {
+                if (connection.store != self) return false;
+                const oid = connection.ordinaryBatchCommitTable() orelse return false;
+                for (scratch.table_oids[0..index]) |prior| if (prior == oid) return false;
+                scratch.table_oids[index] = oid;
+            }
+            try self.storageReady();
+            var used: usize = 0;
+            for (connections, scratch.payloads[0..count]) |connection, *payload| {
+                const remaining = scratch.encoded[used..];
+                const limit = @min(self.encode_buffer.len, remaining.len);
+                payload.* = connection.db().prepareCommit(connection.tx.?, remaining[0..limit]) catch |err| switch (err) {
+                    error.TransactionLogCapacity => return false,
+                    else => return err,
+                };
+                used += payload.len;
+            }
+            const stable = persist(context, scratch.payloads[0..count]) catch |err| {
+                self.storage_failed = true;
+                for (connections) |connection| {
+                    connection.db().abort(connection.tx.?);
+                    connection.endTransaction(false);
+                }
+                return err;
+            };
+            if (!stable) return false;
+            for (connections) |connection| {
+                connection.db().publishCommit(connection.tx.?);
+                connection.endTransaction(true);
+            }
+            return true;
         }
 
         fn preparedIndex(self: *const Self, gid: *const PreparedWal.Gid) ?usize {

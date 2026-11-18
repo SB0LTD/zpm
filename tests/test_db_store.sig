@@ -886,6 +886,87 @@ fn ordinaryBatchAdmission() !void {
     try quiescent(&store);
 }
 
+const BatchProbe = struct {
+    store: *const Store,
+    before: u64,
+    calls: usize = 0,
+    outcome: enum { decline, stable, failed } = .decline,
+
+    fn individual(_: ?*anyopaque, _: []const u8) !void {
+        return error.UnexpectedIndividualCommit;
+    }
+
+    fn persist(context: ?*anyopaque, payloads: []const []const u8) !bool {
+        const self: *BatchProbe = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        try check(self.store.database.csn == self.before and self.store.database.usage().transactions == 2);
+        try check(payloads.len == 2);
+        for (payloads) |payload| try check(try DB.changeRecordOps(payload) == 1);
+        return switch (self.outcome) {
+            .decline => false,
+            .stable => true,
+            .failed => error.InjectedBatchFlushFailure,
+        };
+    }
+};
+
+fn serializedBatchCommit() !void {
+    var store: Store = .{};
+    var a: Store.Connection = .{ .store = &store, .id = 1 };
+    var b: Store.Connection = .{ .store = &store, .id = 2 };
+    var reader: Store.Connection = .{ .store = &store, .id = 3 };
+    var out: DB.Result = .{};
+    try a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)", &out);
+    try a.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)", &out);
+    var single_record: [256]u8 = undefined;
+    store.durability_required = true;
+    store.encode_buffer = &single_record;
+    store.commit_fn = BatchProbe.individual;
+    const before = store.database.csn;
+    var probe: BatchProbe = .{ .store = &store, .before = before };
+    var oids: [2]u32 = undefined;
+    var payloads: [2][]const u8 = undefined;
+    var encoded: [256]u8 = undefined;
+    var scratch: Store.CommitBatchWorkspace = .{ .table_oids = &oids, .payloads = &payloads, .encoded = &encoded };
+    const members = [_]*Store.Connection{ &a, &b };
+    try a.beginTransaction();
+    try b.beginTransaction();
+    try a.execute("INSERT INTO t VALUES (1, 'published')", &out);
+    try b.execute("INSERT INTO other VALUES (2)", &out);
+    try check(!try store.commitOrdinaryBatch(&.{ &a, &a }, scratch, &probe, BatchProbe.persist));
+    scratch.encoded = encoded[0..1];
+    try check(!try store.commitOrdinaryBatch(&members, scratch, &probe, BatchProbe.persist));
+    try check(probe.calls == 0);
+    scratch.encoded = &encoded;
+    try check(!try store.commitOrdinaryBatch(&members, scratch, &probe, BatchProbe.persist));
+    try check(probe.calls == 1 and a.transactionStatus() == 'T' and b.transactionStatus() == 'T');
+    try count(&reader, 0);
+    probe.outcome = .stable;
+    try check(try store.commitOrdinaryBatch(&members, scratch, &probe, BatchProbe.persist));
+    try check(probe.calls == 2 and store.database.csn == before + 2);
+    try check(a.transactionStatus() == 'I' and b.transactionStatus() == 'I');
+    try label(&reader, "SELECT * FROM t WHERE id = 1", "published");
+    try reader.execute("SELECT * FROM other", &out);
+    try check(out.row_count == 1 and out.rows[0].cells[0].integer == 2);
+    try quiescent(&store);
+
+    probe.before = store.database.csn;
+    probe.outcome = .failed;
+    try a.beginTransaction();
+    try b.beginTransaction();
+    try a.execute("DELETE FROM t WHERE id = 1", &out);
+    try b.execute("DELETE FROM other WHERE id = 2", &out);
+    if (store.commitOrdinaryBatch(&members, scratch, &probe, BatchProbe.persist)) |_| {
+        return error.BatchFlushFailureIgnored;
+    } else |err| try check(err == error.InjectedBatchFlushFailure);
+    try check(probe.calls == 3 and store.storage_failed and store.database.csn == probe.before);
+    try check(a.transactionStatus() == 'I' and b.transactionStatus() == 'I');
+    try quiescent(&store);
+    try count(&reader, 1);
+    try reader.execute("SELECT * FROM other", &out);
+    try check(out.row_count == 1);
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
@@ -897,6 +978,7 @@ pub fn main() !void {
     try savepoints();
     try runningControl();
     try ordinaryBatchAdmission();
+    try serializedBatchCommit();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }
