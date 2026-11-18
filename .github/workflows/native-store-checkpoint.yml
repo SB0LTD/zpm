@@ -1,15 +1,15 @@
-name: Native sealed SQL checkpoint composition
+name: Native checkpoint manifest publication
 
 on:
   push:
-    branches: [ci/native-store-checkpoint-roundtrip-20261118]
+    branches: [ci/native-checkpoint-manifest-20261118]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  ZPM_SOURCE_REVISION: 553315d9ab5f09fd2078c7f428b93cf3e3d08a59
+  ZPM_SOURCE_REVISION: 539da73f9815bcc14566f46a4911753092db795a
   SIG_TAG: sig-0.6.5-zig0.17.0.3c72687
 
 jobs:
@@ -68,23 +68,23 @@ jobs:
           "SIG_LIB_DIR=$lib" >> $env:GITHUB_ENV
           & $compiler[0].FullName version | Tee-Object evidence/sig-version.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify sealed SQL state and recover the WAL suffix
+      - name: Verify atomic manifest selection and recover the WAL suffix
         run: |
           $name = if ($env:RUNNER_OS -eq 'Windows') { 'native-store-checkpoint.exe' } else { 'native-store-checkpoint' }
           $binary = Join-Path $env:RUNNER_TEMP $name
           $flags = @('-OReleaseSafe')
           if ($env:RUNNER_OS -eq 'macOS') { $flags += '-lc' }
           & $env:SIG build-exe --Sig-lib-dir $env:SIG_LIB_DIR @flags `
-            --dep db_file --dep durable_log --dep snapshot_envelope --dep sql --dep db_store `
+            --dep db_file --dep durable_log --dep snapshot_envelope --dep sql --dep db_store --dep checkpoint_manifest `
             '-Mroot=tests/test_native_store_checkpoint.sig' '-Mdb_file=src/platform/db_file.sig' `
             '-Mdurable_log=src/db/durable_log.sig' '-Msnapshot_envelope=src/db/snapshot_envelope.sig' `
-            '-Msql=src/core/sql.sig' '-Mdb_store=src/db/store.sig' `
+            '-Msql=src/core/sql.sig' '-Mdb_store=src/db/store.sig' '-Mcheckpoint_manifest=src/db/checkpoint_manifest.sig' `
             "-femit-bin=$binary" 2>&1 | Tee-Object evidence/checkpoint-build.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $binary 2>&1 | Tee-Object evidence/checkpoint-result.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $report = Get-Content evidence/checkpoint-result.json -Raw | ConvertFrom-Json
-          if ($report.suite -ne 'native_store_checkpoint' -or $report.pass -ne $true -or $report.assertions -ne 47) {
+          if ($report.suite -ne 'native_store_checkpoint' -or $report.pass -ne $true -or $report.assertions -ne 68) {
             throw 'Native assertions did not execute'
           }
           (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() > evidence/contract-binary-sha256.txt
