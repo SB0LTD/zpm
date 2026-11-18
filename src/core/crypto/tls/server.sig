@@ -7,6 +7,7 @@ const x25519 = @import("x25519");
 const key_schedule = @import("tls13_keys").KeySchedule;
 const hello = @import("client_hello.sig");
 const record = @import("record.sig");
+const application = @import("application.sig");
 const x509 = @import("x509.sig");
 
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
@@ -22,13 +23,16 @@ const record_overhead = record.header_bytes + 1 + 16;
 const compatibility_ccs = [_]u8{ 20, 3, 3, 0, 1, 1 };
 const certificate_verify_prefix = ([_]u8{0x20} ** 64) ++ "TLS 1.3, server CertificateVerify\x00";
 
-pub const Error = hello.Error || record.Error || error{
+pub const Error = hello.Error || application.Error || error{
     InvalidCertificate,
     InvalidPrivateKey,
     EntropyUnavailable,
     InvalidPeerKey,
     SigningFailed,
     BadFinished,
+    InvalidAlpnProtocol,
+    NoApplicationProtocol,
+    MissingAlpnExtension,
 };
 
 /// Borrow immutable DER leaf-first chain bytes for all referencing exchanges.
@@ -64,26 +68,35 @@ pub const Identity = struct {
     }
 
     pub fn flightOutputBytes(self: *const Identity) usize {
-        const server_hello = record.header_bytes + handshake_header_bytes + server_hello_body_bytes + max_session_id;
-        const protected = self.flightScratchBytes();
-        const chunks = (protected + record.max_plaintext_bytes - 1) / record.max_plaintext_bytes;
-        return server_hello + compatibility_ccs.len + protected + chunks * record_overhead;
+        return flightOutputCapacity(self.flightScratchBytes());
     }
 };
+
+fn flightOutputCapacity(protected: usize) usize {
+    const server_hello = record.header_bytes + handshake_header_bytes + server_hello_body_bytes + max_session_id;
+    const chunks = (protected + record.max_plaintext_bytes - 1) / record.max_plaintext_bytes;
+    return server_hello + compatibility_ccs.len + protected + chunks * record_overhead;
+}
+
+/// One configured opaque protocol, borrowed immutably until the exchange ends.
+pub const Alpn = struct { protocol: []const u8, required: bool = false };
+
+/// A fatal alert sent before ServerHello and before record protection is active.
+pub const no_application_protocol_alert = [_]u8{ 21, 3, 3, 0, 2, 2, 120 };
+pub const missing_alpn_extension_alert = [_]u8{ 21, 3, 3, 0, 2, 2, 109 };
 
 pub const Phase = enum { client_hello, server_flight, client_finished, established, transferred, failed };
 pub const FrameRead = union(enum) {
     need: usize,
     consumed: usize,
 };
-pub const Application = struct {
-    send: record.RecordKeys,
-    receive: record.RecordKeys,
-};
+pub const Application = application.Application;
 
 pub const Server = struct {
     identity: *const Identity,
     hello_buffer: []u8,
+    alpn: ?Alpn = null,
+    alpn_matched: bool = false,
     hello_len: usize = 0,
     parsed: ?hello.Hello = null,
     phase: Phase = .client_hello,
@@ -98,12 +111,41 @@ pub const Server = struct {
         return .{ .identity = identity, .hello_buffer = hello_buffer };
     }
 
+    pub fn initWithAlpn(identity: *const Identity, hello_buffer: []u8, alpn: ?Alpn) Error!Server {
+        if (alpn) |policy| {
+            if (policy.protocol.len == 0 or policy.protocol.len > 255) return error.InvalidAlpnProtocol;
+            if (overlaps(policy.protocol, hello_buffer)) return error.BadRecord;
+        }
+        var server = init(identity, hello_buffer);
+        server.alpn = alpn;
+        return server;
+    }
+
+    pub fn flightScratchBytes(self: *const Server) usize {
+        return self.identity.flightScratchBytes() + if (self.alpn) |policy| alpnBytes(policy.protocol) else 0;
+    }
+
+    pub fn flightOutputBytes(self: *const Server) usize {
+        return flightOutputCapacity(self.flightScratchBytes());
+    }
+
+    fn alpnBytes(protocol: []const u8) usize {
+        return 2 + 2 + 2 + 1 + protocol.len;
+    }
+
+    /// The successful selection is exposed after Finished authentication.
+    pub fn selectedAlpn(self: *const Server) ?[]const u8 {
+        if (self.phase != .established and self.phase != .transferred) return null;
+        return if (self.alpn_matched) self.alpn.?.protocol else null;
+    }
+
     /// Consume only the first complete record. On .need, keep the input prefix
     /// and append bytes until the required total is available.
     pub fn receive(self: *Server, input: []u8) Error!FrameRead {
         errdefer self.close();
         if (self.phase != .client_hello and self.phase != .client_finished) return error.UnexpectedMessage;
         if (overlaps(input, self.hello_buffer)) return error.BadRecord;
+        if (self.alpn) |policy| if (overlaps(input, policy.protocol)) return error.BadRecord;
         const total = switch (try record.frame(input)) {
             .incomplete => |need| return .{ .need = need },
             .complete => |length| length,
@@ -130,7 +172,15 @@ pub const Server = struct {
         if (length > self.hello_buffer.len) return error.BufferTooSmall;
         if (self.hello_len < length) return;
         if (self.hello_len != length) return error.UnexpectedMessage;
-        self.parsed = try hello.parse(self.hello_buffer[handshake_header_bytes..length]);
+        const parsed = try hello.parseWithAlpn(self.hello_buffer[handshake_header_bytes..length],
+            if (self.alpn) |policy| policy.protocol else null);
+        if (self.alpn) |policy| {
+            if (parsed.alpn_match) |matched| {
+                if (!matched) return error.NoApplicationProtocol;
+                self.alpn_matched = true;
+            } else if (policy.required) return error.MissingAlpnExtension;
+        }
+        self.parsed = parsed;
         self.phase = .server_flight;
     }
 
@@ -139,8 +189,11 @@ pub const Server = struct {
     pub fn emitFlight(self: *Server, scratch: []u8, output: []u8) Error![]const u8 {
         errdefer self.close();
         if (self.phase != .server_flight) return error.UnexpectedMessage;
-        if (scratch.len < self.identity.flightScratchBytes() or output.len < self.identity.flightOutputBytes()) return error.BufferTooSmall;
+        if (scratch.len < self.flightScratchBytes() or output.len < self.flightOutputBytes()) return error.BufferTooSmall;
         if (overlaps(scratch, output) or overlaps(scratch, self.hello_buffer) or overlaps(output, self.hello_buffer)) return error.BadRecord;
+        if (self.alpn) |policy| {
+            if (overlaps(scratch, policy.protocol) or overlaps(output, policy.protocol)) return error.BadRecord;
+        }
         var random: [64 + Ecdsa.noise_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &random);
         entropy.fill(&random) catch return error.EntropyUnavailable;
@@ -174,8 +227,7 @@ pub const Server = struct {
         self.client_handshake = try record.keysForSuite(suite, &client_secret);
 
         var flight: Writer = .{ .bytes = scratch };
-        try flight.handshake(8, 2);
-        try flight.uint(u16, 0);
+        try self.writeEncryptedExtensions(&flight);
         try self.writeCertificate(&flight);
         transcript.update(flight.written());
         try self.writeCertificateVerify(&flight, &transcript, random[64..][0..Ecdsa.noise_length].*);
@@ -189,10 +241,7 @@ pub const Server = struct {
         const application_hash = digest(transcript);
         self.expected_finished = key_schedule.computeFinished(&client_secret, &application_hash);
         schedule.deriveApplicationSecrets(&application_hash, &client_secret, &server_secret);
-        self.application = .{
-            .send = try record.keysForSuite(suite, &server_secret),
-            .receive = try record.keysForSuite(suite, &client_secret),
-        };
+        self.application = try Application.init(suite, &server_secret, &client_secret);
 
         var body = flight.written();
         while (body.len != 0) {
@@ -207,6 +256,19 @@ pub const Server = struct {
         self.parsed = null;
         self.phase = .client_finished;
         return outgoing.written();
+    }
+
+    fn writeEncryptedExtensions(self: *const Server, flight: *Writer) Error!void {
+        const protocol = if (self.alpn_matched) self.alpn.?.protocol else "";
+        const extensions = if (protocol.len != 0) alpnBytes(protocol) else 0;
+        try flight.handshake(8, 2 + extensions);
+        try flight.uint(u16, @intCast(extensions));
+        if (protocol.len == 0) return;
+        try flight.uint(u16, hello.alpn_extension);
+        try flight.uint(u16, @intCast(3 + protocol.len));
+        try flight.uint(u16, @intCast(1 + protocol.len));
+        try flight.uint(u8, @intCast(protocol.len));
+        try flight.put(protocol);
     }
 
     fn writeCertificate(self: *const Server, flight: *Writer) Error!void {
@@ -272,7 +334,7 @@ pub const Server = struct {
     }
 
     fn clearApplication(self: *Server) void {
-        if (self.application) |*keys| std.crypto.secureZero(u8, std.mem.asBytes(keys));
+        if (self.application) |*keys| keys.close();
         self.application = null;
     }
 
@@ -280,6 +342,7 @@ pub const Server = struct {
         self.clearHandshake();
         self.clearApplication();
         self.parsed = null;
+        self.alpn_matched = false;
         self.phase = .failed;
     }
 };
@@ -345,6 +408,29 @@ fn writeServerHello(writer: *Writer, session_id: []const u8, random: *const [32]
     try writer.uint(u16, 0x0304);
 }
 
+test "ALPN accounts for an opaque selected protocol in its protected flight" {
+    const testing = std.testing;
+    var identity: Identity = undefined;
+    identity.certificate_list_bytes = record.max_plaintext_bytes;
+    var hello_buffer: [16]u8 = undefined;
+    try testing.expectError(error.InvalidAlpnProtocol, Server.initWithAlpn(&identity, &hello_buffer, .{ .protocol = "" }));
+    const oversized = [_]u8{1} ** 256;
+    try testing.expectError(error.InvalidAlpnProtocol, Server.initWithAlpn(&identity, &hello_buffer, .{ .protocol = &oversized }));
+    try testing.expectError(error.BadRecord, Server.initWithAlpn(&identity, &hello_buffer, .{ .protocol = hello_buffer[0..1] }));
+    var server = try Server.initWithAlpn(&identity, &hello_buffer, .{ .protocol = "a\x00b" });
+    try testing.expectEqual(identity.flightScratchBytes() + 10, server.flightScratchBytes());
+    try testing.expect(server.flightOutputBytes() >= identity.flightOutputBytes() + 10);
+    try testing.expect(server.selectedAlpn() == null);
+    server.alpn_matched = true;
+    var bytes: [16]u8 = undefined;
+    var writer: Writer = .{ .bytes = &bytes };
+    try server.writeEncryptedExtensions(&writer);
+    try testing.expectEqualSlices(u8, &.{ 8, 0, 0, 12, 0, 10, 0, 16, 0, 6, 0, 4, 3, 'a', 0, 'b' }, writer.written());
+    try testing.expect(server.selectedAlpn() == null);
+    server.phase = .established;
+    try testing.expectEqualSlices(u8, "a\x00b", server.selectedAlpn().?);
+}
+
 test "fragmented RFC 8448 ClientHello produces the published ServerHello and traffic secret" {
     const testing = std.testing;
     var client_message: [196]u8 = undefined;
@@ -404,10 +490,7 @@ test "an authenticated record with wrong Finished closes the exchange" {
     server.phase = .client_finished;
     server.client_handshake = try record.keysForSuite(suite, &secret);
     server.expected_finished = @splat(0x19);
-    server.application = .{
-        .send = try record.keysForSuite(suite, &secret),
-        .receive = try record.keysForSuite(suite, &secret),
-    };
+    server.application = try Application.init(suite, &secret, &secret);
     try testing.expectError(error.UnexpectedMessage, server.takeApplication());
     var compat = compatibility_ccs;
     try testing.expectEqual(FrameRead{ .consumed = compatibility_ccs.len }, try server.receive(&compat));

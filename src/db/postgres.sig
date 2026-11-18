@@ -427,6 +427,13 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             self.authentication = try scram.Server.init(verifier, server_nonce);
         }
 
+        /// The transport calls this after verified TLS and before StartupMessage.
+        pub fn configureChannelBinding(self: *Self, digest: []const u8, require: bool) scram.Error!void {
+            if (self.startup) return error.AuthenticationState;
+            if (self.authentication) |*auth| return auth.configureEndpoint(digest, require);
+            return error.AuthenticationState;
+        }
+
         /// Authenticate using a verifier and require its exact username to
         /// resolve to a SQL login role. Callers opt in before startup. The
         /// default SCRAM configuration retains the embedding's session role.
@@ -702,7 +709,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             } else auth.setUsername(user);
             const p = try w.begin('R');
             try w.u32be(10);
-            try w.string(scram.mechanism);
+            if (auth.offersEndpoint()) try w.string(scram.mechanism_plus);
+            if (auth.offersUnbound()) try w.string(scram.mechanism);
             try w.byte(0);
             w.end(p);
             self.startup = true;
@@ -737,12 +745,18 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             var message: [512]u8 = undefined;
             if (auth.state == .initial) {
                 var r: Reader = .{ .bytes = payload };
-                if (!equal(try r.string(), scram.mechanism)) return error.AuthenticationFailed;
+                const name = try r.string();
+                const mode: scram.Mode = if (equal(name, scram.mechanism_plus) and auth.offersEndpoint())
+                    .endpoint
+                else if (equal(name, scram.mechanism) and auth.offersUnbound())
+                    .unbound
+                else
+                    return error.AuthenticationFailed;
                 const length = try r.u32be();
                 if (length > scram.max_message) return error.AuthenticationFailed;
                 const first = try r.take(length);
                 try r.done();
-                const challenge = try auth.start(first, &message);
+                const challenge = try auth.startNegotiated(mode, first, &message);
                 const p = try w.begin('R');
                 try w.u32be(11);
                 try w.append(challenge);

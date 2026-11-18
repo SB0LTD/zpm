@@ -25,6 +25,7 @@
 //     subject, subjectPublicKeyInfo, ...optional..., [3] extensions }
 
 const asn1 = @import("asn1.sig");
+const endpoint_sha2 = @import("std").crypto.hash.sha2;
 
 pub const Error = asn1.Error || error{
     Malformed,
@@ -141,6 +142,28 @@ fn sigAlgFromOid(el: asn1.Element) SigAlg {
     if (asn1.oidEquals(el, &OID_ECDSA_SHA256)) return .ecdsa_sha256;
     if (asn1.oidEquals(el, &OID_ECDSA_SHA384)) return .ecdsa_sha384;
     return .unsupported;
+}
+
+/// Hash the exact certificate DER using its signature hash for RFC 5929.
+pub fn serverEndpointDigest(der: []const u8, out: *[64]u8) Error![]const u8 {
+    var cursor = asn1.Cursor.init(der);
+    if ((try cursor.expect(asn1.TAG_SEQUENCE)).raw.len != der.len) return error.Malformed;
+    const cert = try parse(der);
+    switch (cert.sig_alg) {
+        .rsa_pkcs1_sha256, .ecdsa_sha256 => {
+            endpoint_sha2.Sha256.hash(der, out[0..32], .{});
+            return out[0..32];
+        },
+        .rsa_pkcs1_sha384, .ecdsa_sha384 => {
+            endpoint_sha2.Sha384.hash(der, out[0..48], .{});
+            return out[0..48];
+        },
+        .rsa_pkcs1_sha512 => {
+            endpoint_sha2.Sha512.hash(der, out, .{});
+            return out;
+        },
+        .unsupported => return error.UnsupportedSigAlg,
+    }
 }
 
 /// Parse a DER-encoded certificate.
@@ -528,4 +551,12 @@ test "x509: parse a real Binance leaf certificate" {
     // The signature bits and TBS were captured.
     try testing.expect(cert.signature.len >= 128);
     try testing.expect(cert.tbs_raw.len > 100);
+}
+
+test "x509: TLS endpoint hashes the full DER with the certificate signature hash" {
+    const fixture = @import("testvec.sig").binance_leaf_der;
+    var output: [64]u8 = undefined;
+    const expected = [_]u8{ 0xb4, 0xfc, 0x8d, 0x3d, 0xab, 0xbe, 0x3e, 0x3b, 0xa7, 0x86, 0x50, 0xb8, 0x92, 0x3b, 0x52, 0x62, 0x7c, 0xfe, 0x48, 0xa9, 0x1f, 0x28, 0xf2, 0x45, 0xab, 0xcc, 0xde, 0xf7, 0x68, 0x0c, 0x44, 0xbb };
+    try testing.expectEqualSlices(u8, &expected, try serverEndpointDigest(&fixture, &output));
+    try testing.expectError(error.Malformed, serverEndpointDigest(&(fixture ++ [_]u8{0}), &output));
 }

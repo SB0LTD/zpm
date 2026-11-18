@@ -20,6 +20,7 @@ pub const Error = error{
 pub const Hello = struct {
     session_id: []const u8,
     key_share: [32]u8,
+    alpn_match: ?bool = null,
 };
 
 const Cursor = struct {
@@ -81,9 +82,29 @@ fn keyShare(input: []const u8) Error!?[32]u8 {
     return share;
 }
 
+pub const alpn_extension: u16 = 16;
+
+fn alpnMatches(input: []const u8, protocol: ?[]const u8) Error!bool {
+    if (input.len == 0) return error.DecodeError;
+    var list: Cursor = .{ .remaining = input };
+    var matched = false;
+    while (list.remaining.len != 0) {
+        const offer = try list.vector(u8);
+        if (offer.len == 0) return error.DecodeError;
+        if (protocol) |wanted| if (std.mem.eql(u8, offer, wanted)) {
+            matched = true;
+        };
+    }
+    return matched;
+}
+
 /// Parse one exact ClientHello body, excluding its handshake header.
 /// Unselected extensions can be ignored after validating their framing.
 pub fn parse(body: []const u8) Error!Hello {
+    return parseWithAlpn(body, null);
+}
+
+pub fn parseWithAlpn(body: []const u8, protocol: ?[]const u8) Error!Hello {
     var hello: Cursor = .{ .remaining = body };
     if (try hello.read(u16) != 0x0303) return error.UnsupportedVersion;
     _ = try hello.take(32);
@@ -100,6 +121,7 @@ pub fn parse(body: []const u8) Error!Hello {
     var x25519 = false;
     var ecdsa = false;
     var share: ?[32]u8 = null;
+    var alpn_match: ?bool = null;
     while (extensions.remaining.len != 0) {
         const id = try extensions.read(u16);
         try mark(&seen, id);
@@ -107,6 +129,7 @@ pub fn parse(body: []const u8) Error!Hello {
         switch (id) {
             10 => x25519 = try offered(try data.vector(u16), x25519_group),
             13 => ecdsa = try offered(try data.vector(u16), ecdsa_p256_sha256),
+            alpn_extension => alpn_match = try alpnMatches(try data.vector(u16), protocol),
             41 => {
                 if (extensions.remaining.len != 0) return error.IllegalParameter;
                 continue;
@@ -124,5 +147,14 @@ pub fn parse(body: []const u8) Error!Hello {
     if (!seen.isSet(10) or !seen.isSet(13) or !seen.isSet(51)) return error.MissingExtension;
     if (!ecdsa) return error.NoCommonSignature;
     if (!x25519) return error.NoUsableKeyShare;
-    return .{ .session_id = session_id, .key_share = share orelse return error.NoUsableKeyShare };
+    return .{ .session_id = session_id, .key_share = share orelse return error.NoUsableKeyShare, .alpn_match = alpn_match };
+}
+
+test "ALPN validates opaque offers to the end of the vector" {
+    const testing = std.testing;
+    try testing.expect(try alpnMatches("\x03foo\x03a\x00b", "a\x00b"));
+    try testing.expect(!(try alpnMatches("\x03Foo", "foo")));
+    try testing.expectError(error.DecodeError, alpnMatches("", "foo"));
+    try testing.expectError(error.DecodeError, alpnMatches("\x03foo\x00", "foo"));
+    try testing.expectError(error.DecodeError, alpnMatches("\x03foo\x02x", "foo"));
 }

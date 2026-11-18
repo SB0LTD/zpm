@@ -1,16 +1,18 @@
 //! Bounded SCRAM-SHA-256 server authentication (RFC 5802 / RFC 7677).
 //! Caller supplies a fresh, unpredictable server nonce for every connection.
-//! This authenticates credentials; transport encryption and channel binding
-//! belong to the caller. SCRAM-SHA-256-PLUS is deliberately not advertised.
+//! The caller supplies channel-binding bytes only after authenticated TLS.
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 const b64 = std.base64.standard;
 pub const mechanism = "SCRAM-SHA-256";
+pub const mechanism_plus = "SCRAM-SHA-256-PLUS";
+const endpoint_header = "p=tls-server-end-point,,";
+pub const Mode = enum { unbound, endpoint };
 pub const max_message: usize = 1024;
 pub const min_iterations: u32 = 4096;
 pub const max_iterations: u32 = 10_000_000;
-pub const Error = error{ InvalidVerifier, InvalidNonce, AuthenticationFailed, AuthenticationState, BufferTooSmall, PasswordNormalizationUnsupported };
+pub const Error = error{ InvalidVerifier, InvalidNonce, AuthenticationFailed, AuthenticationState, BufferTooSmall, PasswordNormalizationUnsupported, InvalidBinding };
 
 pub const Verifier = struct {
     username: [64]u8 = @splat(0),
@@ -196,6 +198,12 @@ const Fields = struct {
     }
 };
 
+const Binding = struct {
+    digest: [64]u8 = @splat(0),
+    length: usize,
+    require: bool,
+};
+
 pub const Server = struct {
     pub const State = enum { initial, challenge, complete, failed };
     state: State = .initial,
@@ -210,6 +218,7 @@ pub const Server = struct {
     server_first: [512]u8 = @splat(0),
     server_first_len: usize = 0,
     gs2_flag: u8 = 'n',
+    endpoint: ?Binding = null,
 
     /// nonce must come from the application's CSPRNG and never be reused.
     /// The lower bound requires >=144 bits when using base64 random bytes.
@@ -244,13 +253,48 @@ pub const Server = struct {
         self.identity_matches = self.verifier.username_len != 0 and std.mem.eql(u8, username, self.verifier.identity());
     }
 
+    /// Install the verified TLS certificate digest before reading StartupMessage.
+    pub fn configureEndpoint(self: *Server, digest: []const u8, require: bool) Error!void {
+        if (self.state != .initial or self.endpoint != null) return error.AuthenticationState;
+        if (digest.len != 28 and digest.len != 32 and digest.len != 48 and digest.len != 64)
+            return error.InvalidBinding;
+        var binding: Binding = .{ .length = digest.len, .require = require };
+        @memcpy(binding.digest[0..digest.len], digest);
+        self.endpoint = binding;
+    }
+
+    pub fn offersEndpoint(self: *const Server) bool {
+        return self.endpoint != null;
+    }
+
+    pub fn offersUnbound(self: *const Server) bool {
+        return if (self.endpoint) |binding| !binding.require else true;
+    }
+
     pub fn start(self: *Server, client_first: []const u8, output: []u8) Error![]const u8 {
+        return self.startNegotiated(.unbound, client_first, output);
+    }
+
+    pub fn startNegotiated(self: *Server, mode: Mode, client_first: []const u8, output: []u8) Error![]const u8 {
         if (output.len < self.server_first.len) return error.BufferTooSmall;
         if (self.state != .initial) return error.AuthenticationState;
         errdefer self.state = .failed;
         if (self.verifier.salt_len == 0) return error.AuthenticationState;
-        if (client_first.len < 7 or client_first.len > self.client_first_bare.len + 3 or (client_first[0] != 'n' and client_first[0] != 'y') or client_first[1] != ',' or client_first[2] != ',') return error.AuthenticationFailed;
-        const bare = client_first[3..];
+        const prefix = switch (mode) {
+            .endpoint => if (self.offersEndpoint() and std.mem.startsWith(u8, client_first, endpoint_header))
+                endpoint_header.len
+            else
+                return error.AuthenticationFailed,
+            .unbound => block: {
+                if (!self.offersUnbound() or client_first.len < 3 or
+                    (client_first[0] != 'n' and client_first[0] != 'y') or client_first[1] != ',' or client_first[2] != ',')
+                    return error.AuthenticationFailed;
+                if (client_first[0] == 'y' and self.offersEndpoint()) return error.AuthenticationFailed;
+                break :block 3;
+            },
+        };
+        const bare = client_first[prefix..];
+        if (bare.len > self.client_first_bare.len) return error.AuthenticationFailed;
         const fields = try Fields.parse(bare);
         if (fields.count < 2 or fields.fields[0].tag != 'n' or fields.fields[1].tag != 'r') return error.AuthenticationFailed;
         // Validate SASL-name escapes even though PostgreSQL ignores this name.
@@ -286,7 +330,14 @@ pub const Server = struct {
         errdefer self.state = .failed;
         const fields = try Fields.parse(client_final);
         if (fields.count < 3 or fields.fields[0].tag != 'c' or fields.fields[1].tag != 'r' or fields.fields[fields.count - 1].tag != 'p') return error.AuthenticationFailed;
-        const channel = if (self.gs2_flag == 'n') "biws" else "eSws";
+        var channel_bytes: [endpoint_header.len + 64]u8 = undefined;
+        var encoded_channel: [b64.Encoder.calcSize(endpoint_header.len + 64)]u8 = undefined;
+        const channel = if (self.gs2_flag == 'p') bound: {
+            const binding = self.endpoint orelse return error.AuthenticationState;
+            @memcpy(channel_bytes[0..endpoint_header.len], endpoint_header);
+            @memcpy(channel_bytes[endpoint_header.len..][0..binding.length], binding.digest[0..binding.length]);
+            break :bound b64.Encoder.encode(&encoded_channel, channel_bytes[0 .. endpoint_header.len + binding.length]);
+        } else if (self.gs2_flag == 'n') "biws" else "eSws";
         if (!std.mem.eql(u8, fields.fields[0].value, channel) or !std.mem.eql(u8, fields.fields[1].value, self.combined_nonce[0..self.combined_nonce_len])) return error.AuthenticationFailed;
         const proof_field = fields.fields[fields.count - 1];
         var proof: [32]u8 = undefined;
