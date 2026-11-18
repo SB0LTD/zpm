@@ -6,7 +6,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 
 pub const available = builtin.os.tag == .linux;
-pub const Operation = enum { receive, send, cancel };
+pub const Operation = enum { receive, send, cancel, wake };
 pub const TimedWait = enum { ready, yielded, unsupported };
 pub const Outcome = union(enum) {
     bytes: usize,
@@ -15,6 +15,7 @@ pub const Outcome = union(enum) {
     retry,
     cancel_accepted,
     cancel_raced,
+    notified,
     failed: linux.E,
 };
 pub const Completion = struct {
@@ -25,12 +26,13 @@ pub const Completion = struct {
 
 pub fn Queue(comptime capacity: usize) type {
     if (!available) @compileError("TCP completions require Linux");
-    if (capacity == 0 or capacity > 16384) @compileError("invalid TCP completion capacity");
+    if (capacity == 0 or capacity > 16383) @compileError("invalid TCP completion capacity");
 
     return struct {
         const Self = @This();
         const cancel_tag: u64 = 1 << 63;
         const slot_mask: u64 = 0x7fff;
+        const wake_token = slot_mask;
         const generation_mask: u64 = (cancel_tag - 1) >> 15;
         const Slot = struct {
             operation: ?Operation = null,
@@ -45,22 +47,26 @@ pub fn Queue(comptime capacity: usize) type {
 
         ring: ?linux.IoUring = null,
         slots: [capacity]Slot = @splat(.{}),
+        wake_supported: bool = false,
+        wake_armed: bool = false,
+        wake_canceling: bool = false,
 
         /// Probe setup on the current kernel before routing sockets to the
         /// ring. PermissionDenied or SystemOutdated can retain poll transport.
         pub fn init() !Self {
-            const entries = try std.math.ceilPowerOfTwo(u16, @intCast(capacity * 2));
+            const entries = try std.math.ceilPowerOfTwo(u16, @intCast(capacity * 2 + 1));
             var ring = try linux.IoUring.init(entries, 0);
             errdefer ring.deinit();
             const probe = try ring.get_probe();
             if (!probe.is_supported(.RECV) or !probe.is_supported(.SEND) or !probe.is_supported(.ASYNC_CANCEL))
                 return error.SocketOperationsUnsupported;
-            return .{ .ring = ring };
+            return .{ .ring = ring, .wake_supported = probe.is_supported(.POLL_ADD) };
         }
 
         /// Closing with pending operations would cut short the caller's
         /// buffer ownership contract. Cancel, submit and collect first.
         pub fn deinit(self: *Self) !void {
+            if (self.wakePending()) return error.PendingSocketOperations;
             for (&self.slots) |*slot| if (slot.operation != null or slot.canceling) return error.PendingSocketOperations;
             if (self.ring) |*ring| ring.deinit();
             self.ring = null;
@@ -80,7 +86,7 @@ pub fn Queue(comptime capacity: usize) type {
             switch (operation) {
                 .receive => _ = try ring.recv(token, fd, .{ .buffer = buffer }, 0),
                 .send => _ = try ring.send(token, fd, buffer, linux.MSG.NOSIGNAL),
-                .cancel => unreachable,
+                .cancel, .wake => unreachable,
             }
             slot.generation = generation;
             slot.operation = operation;
@@ -108,6 +114,54 @@ pub fn Queue(comptime capacity: usize) type {
             _ = try ring.cancel(token | cancel_tag, token, 0);
             slot.canceling = true;
             return true;
+        }
+
+        /// Arm one external wake descriptor. The reactor consumes the signal
+        /// and rearms the descriptor after its terminal completion.
+        pub fn armWake(self: *Self, fd: linux.fd_t) !bool {
+            const ring = if (self.ring) |*ring| ring else return error.SocketRingClosed;
+            if (!self.wake_supported) return false;
+            if (fd < 0 or self.wakePending()) return error.InvalidSocketOperation;
+            _ = try ring.poll_add(wake_token, fd, linux.POLL.IN);
+            self.wake_armed = true;
+            return true;
+        }
+
+        pub fn cancelWake(self: *Self) !bool {
+            const ring = if (self.ring) |*ring| ring else return error.SocketRingClosed;
+            if (!self.wake_armed or self.wake_canceling) return false;
+            _ = try ring.cancel(wake_token | cancel_tag, wake_token, 0);
+            self.wake_canceling = true;
+            return true;
+        }
+
+        pub fn wakePending(self: *const Self) bool {
+            return self.wake_armed or self.wake_canceling;
+        }
+
+        fn cancelOutcome(event: linux.io_uring_cqe) Outcome {
+            return switch (event.err()) {
+                .SUCCESS => .cancel_accepted,
+                .NOENT, .ALREADY => .cancel_raced,
+                else => |code| .{ .failed = code },
+            };
+        }
+
+        fn convertWake(self: *Self, event: linux.io_uring_cqe) !Completion {
+            if (event.user_data & cancel_tag != 0) {
+                if (!self.wake_canceling) return error.InvalidSocketCompletion;
+                self.wake_canceling = false;
+                return .{ .slot=capacity, .operation=.wake, .outcome=cancelOutcome(event) };
+            }
+            if (!self.wake_armed) return error.InvalidSocketCompletion;
+            const outcome: Outcome = if (event.res >= 0)
+                (if (event.res & linux.POLL.IN != 0) .notified else .{.failed=.IO})
+            else switch (event.err()) {
+                .CANCELED => .canceled,
+                else => |code| .{.failed=code},
+            };
+            self.wake_armed = false;
+            return .{.slot=capacity,.operation=.wake,.outcome=outcome};
         }
 
         /// Pollable completion descriptor. The queue keeps ownership of it.
@@ -156,6 +210,7 @@ pub fn Queue(comptime capacity: usize) type {
 
         fn convert(self: *Self, event: linux.io_uring_cqe) !Completion {
             if (event.flags & linux.IORING_CQE_F_MORE != 0) return error.InvalidSocketCompletion;
+            if (event.user_data & ~cancel_tag == wake_token) return self.convertWake(event);
             const index: usize = @intCast(event.user_data & slot_mask);
             if (index >= capacity) return error.InvalidSocketCompletion;
             const slot = &self.slots[index];
@@ -163,12 +218,7 @@ pub fn Queue(comptime capacity: usize) type {
             if (event.user_data & cancel_tag != 0) {
                 if (!slot.canceling) return error.InvalidSocketCompletion;
                 slot.canceling = false;
-                const outcome: Outcome = switch (event.err()) {
-                    .SUCCESS => .cancel_accepted,
-                    .NOENT, .ALREADY => .cancel_raced,
-                    else => |code| .{ .failed = code },
-                };
-                return .{ .slot = index, .operation = .cancel, .outcome = outcome };
+                return .{ .slot = index, .operation = .cancel, .outcome = cancelOutcome(event) };
             }
             const operation = slot.operation orelse return error.InvalidSocketCompletion;
             const outcome: Outcome = if (event.res > 0) positive: {

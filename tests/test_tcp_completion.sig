@@ -162,6 +162,29 @@ pub fn main() !void {
     const woke = try next(&q);
     try check(woke.operation == .receive and woke.outcome == .bytes and woke.outcome.bytes == 4 and
         std.mem.eql(u8, recv_buf[0..4], "wake"));
+    const raw_fd = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+    try check(linux.errno(raw_fd) == .SUCCESS);
+    const wake_fd: linux.fd_t = @intCast(raw_fd);
+    defer _ = linux.close(wake_fd);
+    try check(try q.armWake(wake_fd));
+    try check(try q.submitAndWait(1000000) == .yielded and q.wakePending());
+    const one: u64 = 1;
+    try check(linux.write(wake_fd, @ptrCast(&one), @sizeOf(u64)) == @sizeOf(u64));
+    try check(try q.submitAndWait(100000000) == .ready);
+    const wake = try next(&q);
+    try check(wake.operation == .wake and wake.outcome == .notified and !q.wakePending());
+    var wake_count: u64 = 0;
+    try check(linux.read(wake_fd, @ptrCast(&wake_count), @sizeOf(u64)) == @sizeOf(u64) and wake_count == 1);
+    try check(try q.armWake(wake_fd));
+    _ = try q.submit();
+    try check(try q.cancelWake());
+    _ = try q.submit();
+    const wake_first = try next(&q);
+    try check(q.wakePending());
+    const wake_second = try next(&q);
+    try check(wake_first.operation == .wake and wake_second.operation == .wake and !q.wakePending());
+    try check((wake_first.outcome == .canceled and wake_second.outcome == .cancel_accepted) or
+        (wake_second.outcome == .canceled and wake_first.outcome == .cancel_accepted));
     try q.deinit();
     std.debug.print("PASS Linux TCP completions: {d} assertions\n", .{assertions});
 }
