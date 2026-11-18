@@ -3933,9 +3933,9 @@ pub fn Database(comptime config: Config) type {
         /// delegated grant chain, CREATE privilege, or built-in schema ACL.
         fn grantSchemaUsage(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
             if (self.dialect != .postgres or grant.option or grant.cascade or grant.table_count != 1) return error.UnsupportedStatement;
-            const target = grant.tables[0];
-            if (target.has_schema) return error.Syntax;
-            const name = objectName(source, target.name);
+            const schema_target = grant.tables[0];
+            if (schema_target.has_schema) return error.Syntax;
+            const name = objectName(source, schema_target.name);
             if (namespaceFor(&self.catalog, name.slice(), snap)) |oid| {
                 if (oid < change_log.first_oid) return error.UnsupportedStatement;
             }
@@ -3947,8 +3947,8 @@ pub fn Database(comptime config: Config) type {
 
             var latest = snap;
             latest.csn = self.csn;
-            const active = self.catalog.findSchema(name.slice(), latest) orelse return error.SerializationFailure;
-            if (visible.oid != active.oid) return error.SerializationFailure;
+            const current_schema = self.catalog.findSchema(name.slice(), latest) orelse return error.SerializationFailure;
+            if (visible.oid != current_schema.oid) return error.SerializationFailure;
             if (!self.ownsNamespace(schema.oid, latest)) return error.InsufficientPrivilege;
 
             var grantees: [CO.list_capacity]u32 = undefined;
