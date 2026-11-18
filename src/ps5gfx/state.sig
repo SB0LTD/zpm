@@ -137,10 +137,15 @@ pub const COLOR = struct {
     pub const RG8 = 3;
     pub const R32 = 4;
     pub const RG16 = 5;
-    pub const R10G11B11 = 6;
-    pub const R11G11B10 = 7;
-    pub const R10G10B10A2 = 8;
-    pub const A2B10G10R10 = 9;
+    // Several fields in one word are named as AMD names them: the sizes
+    // from the top bit down, so the FIRST channel is the last number. The
+    // usual float target (eleven bits of red and of green, ten of blue)
+    // is `C10_11_11`; ten bits a colour and two of alpha is
+    // `C2_10_10_10`.
+    pub const C10_11_11 = 6;
+    pub const C11_11_10 = 7;
+    pub const C10_10_10_2 = 8;
+    pub const C2_10_10_10 = 9;
     pub const RGBA8 = 10;
     pub const RG32 = 11;
     pub const RGBA16 = 12;
@@ -386,13 +391,20 @@ pub const Viewport = struct {
     zmax: f32,
     /// Clip space's depth runs 0 to 1 (else -1 to 1).
     zero_to_one: bool,
-    /// Depth outside the range is clamped, not clipped away.
+    /// Depth outside the range is clamped at one end at least, not
+    /// clipped away (`clip_near` and `clip_far` say at which).
     depth_clamp: bool,
+    /// What is nearer than the range, and what is farther, is clipped
+    /// away.
+    clip_near: bool = true,
+    clip_far: bool = true,
 };
 
 /// Viewport `v`. Null when the transform is switched off in part (all of
 /// it on, or all of it off, are the two a game sets): with all of it off
-/// the position is already in pixels, and the answer is scale 1, offset 0.
+/// the position is taken as already in pixels, and the answer is scale 1,
+/// offset 0. (What the hardware makes of a position's w then is not
+/// established here.)
 pub fn viewport(s: *const State, v: u4) ?Viewport {
     const i: usize = v;
     const clip = s.cx[CX.CLIP_CNTL];
@@ -403,8 +415,12 @@ pub fn viewport(s: *const State, v: u4) ?Viewport {
         .zmax = float(s.cx[CX.VPORT_ZMIN_0 + 2 * i + 1]),
         .zero_to_one = bits(clip, 19, 1) != 0,
         .depth_clamp = bits(clip, 26, 2) != 0,
+        .clip_near = bits(clip, 26, 1) == 0,
+        .clip_far = bits(clip, 27, 1) == 0,
     };
-    switch (s.cx[CX.VTE_CNTL]) {
+    // (the six scale and offset switches and the three that say what a
+    // position's parts are; the register's other bits are not about this)
+    switch (s.cx[CX.VTE_CNTL] & 0x73F) {
         0 => {},
         0x43F => {
             const r = s.cx[CX.VPORT_XSCALE_0 + 6 * i ..][0..6];
@@ -416,14 +432,36 @@ pub fn viewport(s: *const State, v: u4) ?Viewport {
     return out;
 }
 
-fn corner(word: u32) [2]i32 {
-    return .{ @intCast(bits(word, 0, 15)), @intCast(bits(word, 16, 15)) };
+/// The window's offset: what a scissor not marked otherwise is moved by.
+/// (The rasteriser can be told to move vertices by it too:
+/// `Raster.vertices_offset`.)
+pub fn windowOffset(s: *const State) [2]i32 {
+    const w = s.cx[CX.WINDOW_OFFSET];
+    return .{ @as(i16, @bitCast(@as(u16, @truncate(w)))), @as(i16, @bitCast(@as(u16, @truncate(w >> 16)))) };
 }
 
-fn pair(s: *const State, tl: usize) Rect {
-    const a = corner(s.cx[tl]);
-    const b = corner(s.cx[tl + 1]);
-    return .{ .x0 = a[0], .y0 = a[1], .x1 = b[0], .y1 = b[1] };
+/// A scissor's two registers as a rectangle. `screen`: the screen
+/// scissor, whose fields are sixteen bits and which nothing moves. The
+/// others have fifteen, and are moved by the window's offset unless the
+/// top bit of their first word says not.
+fn pair(s: *const State, tl: usize, screen: bool) Rect {
+    const n: u6 = if (screen) 16 else 15;
+    const a = s.cx[tl];
+    const b = s.cx[tl + 1];
+    var r: Rect = .{
+        .x0 = @intCast(bits(a, 0, n)),
+        .y0 = @intCast(bits(a, 16, n)),
+        .x1 = @intCast(bits(b, 0, n)),
+        .y1 = @intCast(bits(b, 16, n)),
+    };
+    if (!screen and bits(a, 31, 1) == 0) {
+        const by = windowOffset(s);
+        r.x0 += by[0];
+        r.x1 += by[0];
+        r.y0 += by[1];
+        r.y1 += by[1];
+    }
+    return r;
 }
 
 /// The pixels a draw may touch in a target `width` by `height`: the
@@ -431,10 +469,10 @@ fn pair(s: *const State, tl: usize) Rect {
 /// whose own scissor counts when viewport scissors are on.
 pub fn scissor(s: *const State, width: u32, height: u32, v: u4) Rect {
     var r: Rect = .{ .x0 = 0, .y0 = 0, .x1 = @intCast(width), .y1 = @intCast(height) };
-    r = r.meet(pair(s, CX.SCREEN_SCISSOR_TL));
-    r = r.meet(pair(s, CX.WINDOW_SCISSOR_TL));
-    r = r.meet(pair(s, CX.GENERIC_SCISSOR_TL));
-    if (bits(s.cx[CX.SC_MODE_CNTL_0], 1, 1) != 0) r = r.meet(pair(s, CX.VPORT_SCISSOR_0_TL + 2 * @as(usize, v)));
+    r = r.meet(pair(s, CX.SCREEN_SCISSOR_TL, true));
+    r = r.meet(pair(s, CX.WINDOW_SCISSOR_TL, false));
+    r = r.meet(pair(s, CX.GENERIC_SCISSOR_TL, false));
+    if (bits(s.cx[CX.SC_MODE_CNTL_0], 1, 1) != 0) r = r.meet(pair(s, CX.VPORT_SCISSOR_0_TL + 2 * @as(usize, v), false));
     return if (r.empty()) .{} else r;
 }
 
@@ -445,12 +483,17 @@ pub const Raster = struct {
     /// A front triangle's corners go round clockwise on the screen (y
     /// down), else the other way.
     front_clockwise: bool,
-    /// Triangles are filled (else drawn as lines or points: `fill` false).
+    /// Triangles are filled, front and back (else one side at least is
+    /// drawn as lines or points).
     fill: bool,
     /// The last vertex of a primitive gives its flat values, else the
     /// first.
     provoke_last: bool,
     samples_log2: u8,
+    /// Nothing reaches the rasteriser: the draw is for its other effects.
+    kill: bool = false,
+    /// Vertices are moved by the window's offset (`windowOffset`).
+    vertices_offset: bool = false,
 };
 
 pub fn raster(s: *const State) Raster {
@@ -459,9 +502,12 @@ pub fn raster(s: *const State) Raster {
         .cull_front = bits(m, 0, 1) != 0,
         .cull_back = bits(m, 1, 1) != 0,
         .front_clockwise = bits(m, 2, 1) != 0,
-        .fill = bits(m, 3, 2) == 0,
+        // (the mode off, or on with both sides' kind "triangles")
+        .fill = bits(m, 3, 2) == 0 or (bits(m, 5, 3) == 2 and bits(m, 8, 3) == 2),
         .provoke_last = bits(m, 19, 1) != 0,
         .samples_log2 = @intCast(bits(s.cx[CX.AA_CONFIG], 0, 3)),
+        .kill = bits(s.cx[CX.CLIP_CNTL], 22, 1) != 0,
+        .vertices_offset = bits(m, 16, 1) != 0,
     };
 }
 
@@ -482,7 +528,9 @@ pub const Stages = struct {
     pub fn hull(st: Stages) bool {
         return (st.word & shader.STAGES.HULL) != 0;
     }
-    /// Lanes the vertex side's code runs at once.
+    /// Lanes the vertex side's code runs at once (in a draw with no hull
+    /// shader: with one, the vertex code is the hull side's and as wide
+    /// as it).
     pub fn vertexLanes(st: Stages) u8 {
         return if ((st.word & shader.STAGES.VERTEX_WAVE32) != 0) 32 else 64;
     }
@@ -499,8 +547,9 @@ pub const Program = struct {
     user: *const [SH.USER_DATA_WORDS]u32,
 };
 
-/// The vertex side (the merged shader every PS5 draw's vertices go
-/// through).
+/// The vertex side of a draw with no hull shader: the merged shader its
+/// vertices go through. (With a hull shader the vertex code is the hull
+/// side's first half, in other registers: not read here.)
 pub fn vertexProgram(s: *const State) Program {
     return .{
         .address = shader.programAddress(s.sh[SH.PGM_LO_ES], s.sh[SH.PGM_LO_ES + 1]),
@@ -517,7 +566,8 @@ pub fn pixelProgram(s: *const State) Program {
 
 /// Where one input of the pixel shader comes from (`PS_INPUT_CNTL`).
 pub const PixelInput = struct {
-    /// The vertex side's output slot; null: the default value.
+    /// The vertex side's output slot; null: nothing is read from one (the
+    /// default value: for both halves, where there are two).
     slot: ?u5,
     /// One vertex's value for the whole primitive.
     flat: bool,
@@ -525,6 +575,15 @@ pub const PixelInput = struct {
     default: u2,
     /// Two 16-bit halves in each word.
     halves: bool,
+    /// Each vertex's own value reaches the shader, none interpolated (the
+    /// register's "default" bit together with `flat`: it still reads its
+    /// slot).
+    each_vertex: bool = false,
+    /// With halves: the low half reads `default`, the high half
+    /// `default_high`.
+    low_default: bool = false,
+    high_default: bool = false,
+    default_high: u2 = 0,
 
     pub fn defaultValue(p: PixelInput) [4]f32 {
         const xyz: f32 = if ((p.default & 2) != 0) 1 else 0;
@@ -536,11 +595,22 @@ pub const PixelInput = struct {
 pub fn pixelInput(s: *const State, n: u5) PixelInput {
     const c = s.cx[CX.PS_INPUT_CNTL_0 + @as(usize, n)];
     const I = shader.INPUT;
+    const default = (c & I.DEFAULT) != 0;
+    const flat = (c & I.FLAT) != 0;
+    const halves = (c & I.HALVES) != 0;
+    const high = (c & I.DEFAULT_HIGH) != 0;
+    // Nothing comes from a slot when the one value reads the default, or
+    // both halves do. (The default bit beside `flat` is not that.)
+    const none = if (halves) default and high else default and !flat;
     return .{
-        .slot = if ((c & I.DEFAULT) != 0) null else @intCast(c & I.SLOT),
-        .flat = (c & I.FLAT) != 0,
+        .slot = if (none) null else @intCast(c & I.SLOT),
+        .flat = flat,
         .default = @intCast(bits(c, I.DEFAULT_VALUE_SHIFT, 2)),
-        .halves = (c & I.HALVES) != 0,
+        .halves = halves,
+        .each_vertex = !halves and default and flat,
+        .low_default = halves and default,
+        .high_default = halves and high,
+        .default_high = @intCast(bits(c, I.DEFAULT_HIGH_VALUE_SHIFT, 2)),
     };
 }
 
@@ -898,4 +968,84 @@ test "a pixel shader's inputs and its built-in values' registers" {
     try testing.expectEqual(@as(?u8, null), builtinRegister(p, BUILTIN.PERSP_PULL_MODEL));
     try testing.expectEqual(@as(?u8, 7), builtinRegister(p, BUILTIN.POS_X));
     try testing.expectEqual(@as(?u8, 8), builtinRegister(p, BUILTIN.POS_Y));
+}
+
+test "what an independent review found: the details that were read too simply" {
+    const s = Fresh.get();
+
+    // A flat input written by the graphics library has the default bit
+    // and the flat bit both: it reads its slot, each vertex's own value.
+    s.cx[CX.PS_INPUT_CNTL_0 + 0] = 5 | 0x420;
+    var in = pixelInput(s, 0);
+    try testing.expectEqual(@as(?u5, 5), in.slot);
+    try testing.expect(in.flat and in.each_vertex);
+    // The default bit alone: no slot.
+    s.cx[CX.PS_INPUT_CNTL_0 + 0] = 5 | 0x20;
+    in = pixelInput(s, 0);
+    try testing.expectEqual(@as(?u5, null), in.slot);
+    try testing.expect(!in.each_vertex);
+    // Halves: the low half's default alone leaves the slot (the high half
+    // reads it); both halves' defaults leave none.
+    s.cx[CX.PS_INPUT_CNTL_0 + 0] = 7 | 0x20 | (1 << 19) | (2 << 8) | (1 << 21);
+    in = pixelInput(s, 0);
+    try testing.expectEqual(@as(?u5, 7), in.slot);
+    try testing.expect(in.halves and in.low_default and !in.high_default and !in.each_vertex);
+    try testing.expectEqual(@as(u2, 2), in.default);
+    try testing.expectEqual(@as(u2, 1), in.default_high);
+    s.cx[CX.PS_INPUT_CNTL_0 + 0] |= 1 << 20;
+    in = pixelInput(s, 0);
+    try testing.expectEqual(@as(?u5, null), in.slot);
+    try testing.expect(in.low_default and in.high_default);
+    // (the library's own word for a flat input, read back)
+    s.cx[CX.PS_INPUT_CNTL_0 + 0] = shader.INPUT.DEFAULT | shader.INPUT.FLAT | 9;
+    try testing.expectEqual(@as(?u5, 9), pixelInput(s, 0).slot);
+
+    // The polygon mode on with both sides "triangles" still fills; one
+    // side as lines does not.
+    s.cx[CX.SU_SC_MODE_CNTL] = (1 << 3) | (2 << 5) | (2 << 8);
+    try testing.expect(raster(s).fill);
+    s.cx[CX.SU_SC_MODE_CNTL] = (1 << 3) | (2 << 5) | (1 << 8);
+    try testing.expect(!raster(s).fill);
+    try testing.expect(!raster(s).kill and !raster(s).vertices_offset);
+    s.cx[CX.SU_SC_MODE_CNTL] = 1 << 16;
+    s.cx[CX.CLIP_CNTL] = 1 << 22;
+    try testing.expect(raster(s).kill and raster(s).vertices_offset);
+
+    // Near and far are clipped apart.
+    s.cx[CX.CLIP_CNTL] = 1 << 26;
+    var v = viewport(s, 0).?;
+    try testing.expect(v.depth_clamp and !v.clip_near and v.clip_far);
+    s.cx[CX.CLIP_CNTL] = 1 << 27;
+    v = viewport(s, 0).?;
+    try testing.expect(v.depth_clamp and v.clip_near and !v.clip_far);
+    s.cx[CX.CLIP_CNTL] = 0;
+    v = viewport(s, 0).?;
+    try testing.expect(!v.depth_clamp and v.clip_near and v.clip_far);
+
+    // The transform on, with a bit of the register that is not about it.
+    s.cx[CX.VTE_CNTL] = 0x43F | (1 << 11);
+    s.cx[CX.VPORT_XSCALE_0] = f(320);
+    try testing.expectEqual(@as(f32, 320), viewport(s, 0).?.scale[0]);
+    s.cx[CX.VTE_CNTL] = 1 << 11;
+    try testing.expectEqual(@as(f32, 1), viewport(s, 0).?.scale[0]);
+    s.cx[CX.VTE_CNTL] = 0x03F;
+    try testing.expect(viewport(s, 0) == null);
+
+    // The screen scissor's fields are sixteen bits: its far corner at
+    // 40000 does not cut a 16384-wide target (fifteen bits would read
+    // 7232).
+    s.cx[CX.SCREEN_SCISSOR_BR] = 40000 | (40000 << 16);
+    try testing.expectEqual(Rect{ .x0 = 0, .y0 = 0, .x1 = 16384, .y1 = 16384 }, scissor(s, 16384, 16384, 0));
+    s.cx[CX.SCREEN_SCISSOR_BR] = 0x4000_4000;
+
+    // The window's offset moves the scissors not marked otherwise: the
+    // generic one here (its first word's top bit cleared), not the
+    // window's (set, as a queue starts), and never the screen's.
+    s.cx[CX.WINDOW_OFFSET] = 10 | (@as(u32, @as(u16, @bitCast(@as(i16, -5)))) << 16);
+    try testing.expectEqual([2]i32{ 10, -5 }, windowOffset(s));
+    s.cx[CX.GENERIC_SCISSOR_TL] = 100 | (100 << 16);
+    s.cx[CX.GENERIC_SCISSOR_BR] = 200 | (200 << 16);
+    try testing.expectEqual(Rect{ .x0 = 110, .y0 = 95, .x1 = 210, .y1 = 195 }, scissor(s, 1280, 720, 0));
+    s.cx[CX.GENERIC_SCISSOR_TL] |= 0x8000_0000;
+    try testing.expectEqual(Rect{ .x0 = 100, .y0 = 100, .x1 = 200, .y1 = 200 }, scissor(s, 1280, 720, 0));
 }

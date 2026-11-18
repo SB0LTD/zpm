@@ -9,13 +9,21 @@
 //! So far:
 //! - state: a draw's registers read as targets, viewport, scissor,
 //!   depth, blending, and where the shaders and their words are.
+//! - draw: those values in the engine's terms (its window counts rows
+//!   from the bottom, its blend factors are linear forms).
+//! - target: the pictures a game draws into, kept as the engine's images
+//!   by the address a game names them by, and read back for the display.
 //!
 //! Not yet: the shaders' machine code recompiled, and anything drawn.
 //!
 //! Allocation-free.
 
 pub const state = @import("state.sig");
+pub const draw = @import("draw.sig");
+pub const target = @import("target.sig");
 
 test {
     _ = state;
+    _ = draw;
+    _ = target;
 }
