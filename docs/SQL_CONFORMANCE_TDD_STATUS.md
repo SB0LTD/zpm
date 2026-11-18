@@ -10,17 +10,17 @@ binary and supported semantics covered by the suites.
 [Exact release matrix](https://github.com/SB0LTD/ramsql/actions/runs/44202780430)
 
 The separate 16-column catalog build matches the first stock `psql \d`
-queries for relation lookup, properties, attributes, and index/constraint
-metadata. The Windows native comparison also matches the outgoing foreign-key
-probe and five scoped constraint definitions. The changelog and schema
+queries for relation lookup, properties, attributes, index/constraint
+metadata and incoming/outgoing foreign keys. The Windows native comparison
+also matches five scoped constraint definitions. The change-log and schema
 contracts passed 1,048 and 1,119 assertions, with 210 schema WAL records
-replayed. Retain explicit gates for incoming partition-aware foreign keys,
-policy/statistics/publication/trigger discovery and full `pg_dump` restore.
+replayed. Retain explicit gates for policy, statistics, publication and
+trigger discovery, plus full `pg_dump` restore and regclass wire output.
 The draft versioned WAL assigns durable table-constraint identities while
 replaying the older definition formats. Checkpoint generation images must
 preserve those identities and the counter before the storage work is combined.
 [Constraint catalog draft](https://github.com/SB0LTD/zpm/pull/240) ·
-[Native PostgreSQL tooling](https://github.com/SB0LTD/ramsql/actions/runs/44223618408)
+[Native PostgreSQL tooling](https://github.com/SB0LTD/ramsql/actions/runs/44225975198)
 
 Both native major versions in hosted CI passed the complete semantic suites
 on consolidated RAMSQL `1b1a3e7`. The four isolation lanes exposed two
