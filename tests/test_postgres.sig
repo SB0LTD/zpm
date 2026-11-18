@@ -384,6 +384,14 @@ fn internalCharWire() !void {
     try sync(&session, &db);
     try state(try bind(&session, &db, "", "internal_char", &.{"ab"}, 1, 1), "22P03");
     try sync(&session, &db);
+    try tags(try parse(&session, &db, "char_bpchar", "SELECT (-1)::\"char\"::CHAR(2), 0::\"char\"::CHAR(2)", &.{}), "1");
+    try tags(try bind(&session, &db, "", "char_bpchar", &.{}, 0, 1), "2");
+    const cast_bytes = try execute(&session, &db, "", 0);
+    try tags(cast_bytes, "DC");
+    frames = .{ .bytes = cast_bytes };
+    const cast_row = (try frames.next()).?;
+    try check(equal(cast_row.body, "\x00\x02\x00\x00\x00\x02\xff \x00\x00\x00\x03\x00  "));
+    try sync(&session, &db);
 }
 
 fn commandText(bytes: []const u8, wanted: []const u8) !void {

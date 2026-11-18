@@ -1401,6 +1401,8 @@ fn internalChar() !void {
     try expect(ordered, "0|1;97|2;127|3;-128|4;-1|5");
     const codecs = "SELECT ''::\"char\"::text, 'abc'::pg_catalog.\"char\"::text, 'é'::\"char\"::text, (-1)::\"char\"::text, CHAR 'x', \"char\" 'b'";
     try expect(codecs, "|a|\\303|\\377|x|b");
+    try expect("SELECT pg_catalog.\"char\" 'a', 'a'::name::\"char\"::int, 'a'::\"char\"::name", "a|97|a");
+    try expect("SELECT (' '::CHAR(2)::\"char\")::int, ('\\377'::CHAR(6)::\"char\")::int", "32|92");
     const type_oid = "SELECT atttypid, attlen FROM pg_attribute WHERE attrelid = 'chars'::regclass AND attnum > 0";
     try expect(type_oid, "18|1");
     const arrays = "SELECT a[1]::int, a[2]::int FROM (SELECT ARRAY[(-1)::\"char\",65::\"char\"] AS a) q";
