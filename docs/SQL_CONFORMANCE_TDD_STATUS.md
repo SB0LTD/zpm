@@ -2,6 +2,16 @@
 
 ## Native wire checkpoint — 18 November 2026
 
+Both native major versions in hosted CI passed the complete semantic suites
+on consolidated RAMSQL `1b1a3e7`. The four isolation lanes exposed two
+DROP TABLE cases on the detached path. ZPM `2906651c` records held and queued
+AccessExclusive locks and RAMSQL `da0b68f1` routes reads through the existing
+table lock queue. The replacement matched all 46 unchanged native PostgreSQL
+18.3 durable isolation schedules on Windows. The focused ZPM contract ran
+2,400 queries on eight threads and passed 133 assertions.
+[Hosted differential evidence](https://github.com/SB0LTD/ramsql/actions/runs/44195561145) ·
+[Replacement matrix](https://github.com/SB0LTD/ramsql/actions/runs/44202780430)
+
 RAMSQL `0af167b420edd605597bf5bb7c25dc0fc9483136` with ZPM
 `aa0250509ebb1befb9d9864bd98581f7e695f970` matched all 118 original smoke
 programs. The PostgreSQL 18.3 run used durable cluster mode with prepared
