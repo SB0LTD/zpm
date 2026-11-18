@@ -147,6 +147,7 @@ pub fn Locks(comptime config: types.Config) type {
 
         /// Table locks: one mode mask per (table, transaction slot).
         modes: [config.tables][config.transactions]u8 = @splat(@splat(0)),
+        access_exclusive_count: usize = 0,
         rows: [config.row_locks]RowLock = @splat(.{}),
         advisory: [config.advisory_locks]Advisory = @splat(.{}),
 
@@ -174,10 +175,12 @@ pub fn Locks(comptime config: types.Config) type {
         pub fn grantTable(self: *Self, table: usize, slot: usize, mode: TableMode) bool {
             if (self.holdsTableMode(table, slot, mode)) return false;
             self.modes[table][slot] |= @intFromEnum(mode);
+            self.access_exclusive_count += @intFromBool(mode == .access_exclusive);
             return true;
         }
 
         pub fn releaseTable(self: *Self, table: usize, slot: usize, mode: u8) void {
+            self.access_exclusive_count -= @intFromBool(self.modes[table][slot] & mode & @intFromEnum(TableMode.access_exclusive) != 0);
             self.modes[table][slot] &= ~mode;
         }
 

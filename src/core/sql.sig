@@ -1073,6 +1073,7 @@ pub fn Database(comptime config: Config) type {
                 self.prepareBody(db,source,snapshot,describe_only,params) catch |err| {self.preparation_error=err;return err;};
             }
             fn prepareBody(self:*Context,db:*const Self,source:[]const u8,snapshot:Snapshot,describe_only:bool,params:?*const B.Parameters) Error!void {
+                if (db.detachedReadsBlocked()) return error.UnsupportedStatement;
                 self.session.sequences=null;
                 var parsed=try P.parseWithOptions(source,&self.workspace.nodes,.{.dialect=self.dialect});
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
@@ -1117,7 +1118,7 @@ pub fn Database(comptime config: Config) type {
                 self.prepared = null;
                 self.preparation_error = null;
                 if (comptime config.statement_parameters == 0) return false;
-                if (self.dialect != .postgres or snapshot.epoch != 0 or snapshot.csn > db.csn) return false;
+                if (self.dialect != .postgres or snapshot.epoch != 0 or snapshot.csn > db.csn or db.detachedReadsBlocked()) return false;
                 switch (parameter) {
                     .smallint, .integer32, .integer => {},
                     else => return false,
@@ -1457,6 +1458,7 @@ pub fn Database(comptime config: Config) type {
         wake_epoch: u64 = 0,
         /// FIFO order of table-lock waiters.
         wait_counter: u64 = 0,
+        exclusive_table_waiters: L.Set = .{},
         /// Outcome of the last completed statement (written to the caller's
         /// result after the statement, or after commit for autocommit).
         outcome: Outcome = .{},
@@ -1813,6 +1815,7 @@ pub fn Database(comptime config: Config) type {
             self.seq_snap = .{ .csn = 0 };
             self.wake_epoch = 0;
             self.wait_counter = 0;
+            self.exclusive_table_waiters = .{};
             self.outcome = .{};
             self.dialect = .postgres;
             self.session = .{};
@@ -1995,7 +1998,7 @@ pub fn Database(comptime config: Config) type {
                 tx.running_snap = null;
                 tx.fresh = false;
                 tx.waiting_for = .{};
-                tx.table_wait = null;
+                self.setTableWait(slot, null);
                 tx.seq_dirty = .{};
                 tx.copy_table = null;
                 tx.copy_rows = 0;
@@ -2287,7 +2290,7 @@ pub fn Database(comptime config: Config) type {
             tx.pin = null;
             tx.fresh = false;
             tx.waiting_for = .{};
-            tx.table_wait = null;
+            self.setTableWait(slot, null);
             for (&self.txs) |*other| other.waiting_for.remove(slot);
             self.wake_epoch +%= 1;
         }
@@ -2343,7 +2346,7 @@ pub fn Database(comptime config: Config) type {
             tx.pin = null;
             tx.fresh = false;
             tx.waiting_for = .{};
-            tx.table_wait = null;
+            self.setTableWait(slot, null);
         }
 
         pub fn parked(self: *const Self, slot: u16) bool {
@@ -2509,7 +2512,7 @@ pub fn Database(comptime config: Config) type {
             }
             tx.sub_len -= 1;
             tx.waiting_for = .{};
-            tx.table_wait = null;
+            self.setTableWait(slot, null);
             if (!options.hold_result) self.writeOutcome(result);
         }
 
@@ -5276,6 +5279,22 @@ pub fn Database(comptime config: Config) type {
             return locks_module.tableConflicts(a) & @intFromEnum(b) != 0;
         }
 
+        /// Detached statements hold the caller's immutable read grant, but do
+        /// not acquire AccessShare. Use the lock-taking path while an
+        /// AccessExclusive owner or an earlier conflicting waiter exists.
+        pub fn detachedReadsBlocked(self: *const Self) bool {
+            return self.locks.access_exclusive_count != 0 or self.exclusive_table_waiters.any();
+        }
+
+        fn setTableWait(self: *Self, slot: usize, waiting: ?M.TableWait) void {
+            self.txs[slot].table_wait = waiting;
+            if (waiting != null and waiting.?.mode == .access_exclusive) {
+                self.exclusive_table_waiters.add(slot);
+            } else {
+                self.exclusive_table_waiters.remove(slot);
+            }
+        }
+
         /// Table lock held to transaction end; conflicts and FIFO waiters
         /// ahead of us park the statement (fresh snapshot on resume).
         /// SERIALIZABLE records the read (AccessShare, RowShare) or write.
@@ -5306,13 +5325,13 @@ pub fn Database(comptime config: Config) type {
                 if (nowait) return error.LockNotAvailable;
                 if (tx.table_wait == null) {
                     self.wait_counter += 1;
-                    tx.table_wait = .{ .table = @intCast(table), .mode = mode, .seq = self.wait_counter };
+                    self.setTableWait(slot, .{ .table = @intCast(table), .mode = mode, .seq = self.wait_counter });
                 }
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
             if (self.locks.grantTable(table, slot, mode)) try M.recordLock(self, slot, .{ .kind = .table, .table = @intCast(table), .mode = @intFromEnum(mode) });
-            tx.table_wait = null;
+            self.setTableWait(slot, null);
         }
 
         const Target = union(enum) { skip, authored, wait, ready: u32 };
@@ -6883,7 +6902,7 @@ pub fn Database(comptime config: Config) type {
                 info.typmods[field] = table.columns[column].typmod;
             }
             tx.waiting_for = .{};
-            tx.table_wait = null;
+            self.setTableWait(slot, null);
             tx.copy_table = @intCast(bound.table);
             tx.copy_snap = snap;
             tx.copy_rows = 0;
@@ -6989,7 +7008,7 @@ pub fn Database(comptime config: Config) type {
             tx.pin = null;
             tx.sub_len -= 1;
             tx.waiting_for = .{};
-            tx.table_wait = null;
+            self.setTableWait(slot, null);
             self.outcome = .{ .affected = rows, .command = .copy };
             return rows;
         }
