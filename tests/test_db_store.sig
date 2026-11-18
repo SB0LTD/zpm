@@ -822,6 +822,70 @@ fn runningControl() !void {
     try quiescent(&store);
 }
 
+fn ordinaryBatchAdmission() !void {
+    var store: Store = .{};
+    var a: Store.Connection = .{ .store = &store, .id = 1 };
+    var b: Store.Connection = .{ .store = &store, .id = 2 };
+    var out: DB.Result = .{};
+    try a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)", &out);
+    try a.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)", &out);
+    try a.execute("CREATE SEQUENCE batch_seq", &out);
+    try check(a.ordinaryBatchCommitTable() == null);
+    const before = store.database.csn;
+    try a.beginTransaction();
+    try check(a.ordinaryBatchCommitTable() == null);
+    try a.execute("INSERT INTO t VALUES (1, 'staged')", &out);
+    const table = a.ordinaryBatchCommitTable() orelse return error.ValidRowCommitRejected;
+    var wrong: Store.Connection = .{ .store = &store, .id = 3, .in_transaction = true, .tx = a.tx };
+    try check(wrong.ordinaryBatchCommitTable() == null);
+    try count(&b, 0);
+    try check(store.database.csn == before and a.transactionStatus() == 'T');
+    try b.beginTransaction();
+    try b.execute("INSERT INTO other VALUES (2)", &out);
+    const other = b.ordinaryBatchCommitTable() orelse return error.ValidRowCommitRejected;
+    try check(a.ordinaryBatchCommitTable() == table and table != other);
+    try b.rollbackTransaction();
+    try a.execute("INSERT INTO other VALUES (3)", &out);
+    try check(a.ordinaryBatchCommitTable() == null);
+    try a.rollbackTransaction();
+    try quiescent(&store);
+
+    try a.execute("BEGIN ISOLATION LEVEL SERIALIZABLE", &out);
+    try a.execute("INSERT INTO t VALUES (1, 'serializable')", &out);
+    try check(a.ordinaryBatchCommitTable() == null);
+    try a.rollbackTransaction();
+    try a.beginTransaction();
+    try a.execute("INSERT INTO t VALUES (1, 'savepoint')", &out);
+    try a.execute("SAVEPOINT batch_sp", &out);
+    try check(a.ordinaryBatchCommitTable() == null);
+    try a.rollbackTransaction();
+    try a.beginTransaction();
+    try a.execute("INSERT INTO t VALUES (1, 'copy')", &out);
+    _ = try a.copyBegin("COPY t FROM STDIN");
+    try check(a.ordinaryBatchCommitTable() == null);
+    try a.rollbackTransaction();
+    try a.beginTransaction();
+    try a.execute("DROP TABLE other", &out);
+    try check(a.ordinaryBatchCommitTable() == null);
+    try a.rollbackTransaction();
+
+    for ([_][]const u8{ "LISTEN batch_channel", "NOTIFY batch_channel, 'x'", "SELECT nextval('batch_seq')" }) |statement| {
+        try a.beginTransaction();
+        try a.execute("INSERT INTO t VALUES (1, 'session action')", &out);
+        try check(a.ordinaryBatchCommitTable() == table);
+        try a.execute(statement, &out);
+        try check(a.ordinaryBatchCommitTable() == null);
+        try a.rollbackTransaction();
+    }
+    // Aborted NEXTVAL still contributes log-ahead to the next durable write.
+    try b.beginTransaction();
+    try b.execute("INSERT INTO t VALUES (2, 'carried')", &out);
+    try check(b.ordinaryBatchCommitTable() == null);
+    try b.execute("COMMIT", &out);
+    try label(&a, "SELECT * FROM t WHERE id = 2", "carried");
+    try quiescent(&store);
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
@@ -832,6 +896,7 @@ pub fn main() !void {
     try timers();
     try savepoints();
     try runningControl();
+    try ordinaryBatchAdmission();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }

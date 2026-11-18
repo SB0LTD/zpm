@@ -2029,6 +2029,39 @@ pub fn Database(comptime config: Config) type {
             return tx.write_len == 0 and !tx.seq_dirty.any() and !self.seq_carried.any();
         }
 
+        /// Candidate table for a synchronous batch of independent ordinary
+        /// commits. The caller must select this transaction's session, keep
+        /// exclusive mutation ownership, and compare candidate tables across
+        /// members. This classification neither prepares nor commits a slot.
+        pub fn ordinaryBatchCommitTable(self: *Self, slot: u16) ?u32 {
+            if (!self.active(slot) or self.seq_carried.any()) return null;
+            const tx = &self.txs[slot];
+            const owner = self.ownSession(slot) orelse return null;
+            if (tx.isolation != .read_committed or tx.ssi != null or tx.read_only or tx.prepared or
+                tx.copy_table != null or tx.pin != null or tx.running_snap != null or tx.table_wait != null or
+                tx.waiting_for.any() or tx.sub_len != 0 or tx.deferred_checks or tx.seq_dirty.any() or
+                tx.write_len == 0 or owner.listen_action_count != 0) return null;
+            for (self.notify.pending) |entry| {
+                if (entry.used and entry.slot == slot and entry.epoch == tx.epoch) return null;
+            }
+            for (self.cursors.slots) |cursor| {
+                if (cursor.used and cursor.slot == slot and cursor.epoch == tx.epoch) return null;
+            }
+            for (tx.lock_list[0..tx.lock_len]) |lock| {
+                if (lock.kind == .advisory) return null;
+            }
+            const table_index = tx.writes[0].table;
+            for (tx.writes[0..tx.write_len]) |write| {
+                switch (write.kind) {
+                    .insert, .update, .delete => if (write.table != table_index) return null,
+                    else => return null,
+                }
+            }
+            const table = &self.tables[table_index];
+            if (table.relkind != 'r' or !S.committedTable(table)) return null;
+            return table.oid;
+        }
+
         /// Encodes the transaction's change record into `buffer`. Fallible,
         /// changes nothing (overflow is TransactionLogCapacity).
         pub fn prepareCommit(self: *const Self, slot: u16, buffer: []u8) Error![]const u8 {
