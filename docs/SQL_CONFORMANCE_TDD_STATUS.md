@@ -2,6 +2,26 @@
 
 ## Native wire checkpoint — 18 November 2026
 
+RAMSQL beta.3 published after all eight package targets and the exact-binary
+qualification passed. The durable PostgreSQL modes each matched 331 semantic
+cases and four crash schedules. These counts refer to the shipped Linux
+binary and supported semantics covered by the suites.
+[Beta.3 prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.3-run.44202780430.1) ·
+[Exact release matrix](https://github.com/SB0LTD/ramsql/actions/runs/44202780430)
+
+The separate 16-column catalog build matches the first stock `psql \d`
+queries for relation lookup, properties, attributes, and index/constraint
+metadata. The Windows native comparison also matches the outgoing foreign-key
+probe and five scoped constraint definitions. The changelog and schema
+contracts passed 1,048 and 1,119 assertions, with 210 schema WAL records
+replayed. Retain explicit gates for incoming partition-aware foreign keys,
+policy/statistics/publication/trigger discovery and full `pg_dump` restore.
+The draft versioned WAL assigns durable table-constraint identities while
+replaying the older definition formats. Checkpoint generation images must
+preserve those identities and the counter before the storage work is combined.
+[Constraint catalog draft](https://github.com/SB0LTD/zpm/pull/240) ·
+[Native PostgreSQL tooling](https://github.com/SB0LTD/ramsql/actions/runs/44223618408)
+
 Both native major versions in hosted CI passed the complete semantic suites
 on consolidated RAMSQL `1b1a3e7`. The four isolation lanes exposed two
 DROP TABLE cases on the detached path. ZPM `2906651c` records held and queued
