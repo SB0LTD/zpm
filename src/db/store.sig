@@ -125,6 +125,7 @@ pub fn SettingsOf(comptime Zone: type) type {
         zone: Zone = .{},
         date_order: DateOrder = .mdy,
         extra_float_digits: i8 = 1,
+        explicit_default_tablespace: bool = false,
 
         pub fn applicationName(self: *const Self) []const u8 {
             return self.application_name[0..self.application_name_len];
@@ -227,7 +228,7 @@ pub const deadlock_timeout_ms: u32 = 1000;
 
 /// Settings this store implements; the engine owns the others it knows
 /// (transaction_*, default_transaction_*, search_path, placeholders).
-const Parameter = enum { lock_timeout, statement_timeout, idle_in_transaction_session_timeout, transaction_timeout, deadlock_timeout, timezone, xmloption, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, extra_float_digits, server_version, server_encoding, integer_datetimes };
+const Parameter = enum { lock_timeout, statement_timeout, idle_in_transaction_session_timeout, transaction_timeout, deadlock_timeout, timezone, xmloption, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, extra_float_digits, default_table_access_method, default_tablespace, server_version, server_encoding, integer_datetimes };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -244,6 +245,12 @@ fn canonical(which: Parameter) []const u8 {
         .intervalstyle => "IntervalStyle",
         else => @tagName(which),
     };
+}
+
+fn placementName(raw: []const u8, out: []u8) []const u8 {
+    if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') return raw[1 .. raw.len - 1];
+    for (raw, 0..) |byte, index| out[index] = lowerByte(byte);
+    return out[0..raw.len];
 }
 
 fn parseExtraFloatDigits(raw: []const u8) !i8 {
@@ -757,6 +764,7 @@ pub fn Store(comptime Raw: type) type {
                 self.applySet(which, local, reset, value) catch |err| return switch (err) {
                     error.UnsupportedStatement => error.UnsupportedStatement,
                     error.UndefinedSetting => error.UndefinedSetting,
+                    error.ObjectNotInPrerequisiteState => error.ObjectNotInPrerequisiteState,
                     else => error.InvalidSettingValue,
                 };
                 if (comptime has_session and @hasField(Raw.SessionValues, "extra_float_digits")) {
@@ -1157,6 +1165,19 @@ pub fn Store(comptime Raw: type) type {
                     .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
                     .standard_conforming_strings => if (!(value.len == 0 or sameInsensitive(value, "on") or sameInsensitive(value, "true"))) return error.InvalidSettingValue,
                     .datestyle => target.date_order = try dateOrder(value, target.date_order),
+                    .default_table_access_method => {
+                        if (is_default and value.len == 0) return;
+                        if (same(value, "heap")) return;
+                        for ([_][]const u8{ "btree", "hash", "gist", "spgist", "gin", "brin" }) |index_method| {
+                            if (same(value, index_method)) return error.ObjectNotInPrerequisiteState;
+                        }
+                        return error.InvalidSettingValue;
+                    },
+                    .default_tablespace => {
+                        if (same(value, "pg_global")) return error.UnsupportedStatement;
+                        if (value.len != 0 and !same(value, "pg_default")) return error.InvalidSettingValue;
+                        target.explicit_default_tablespace = value.len != 0;
+                    },
                     .extra_float_digits => target.extra_float_digits = if (is_default and value.len == 0) 1 else try parseExtraFloatDigits(value),
                     .intervalstyle => if (!(value.len == 0 or sameInsensitive(value, "postgres"))) return error.InvalidSettingValue,
                     .deadlock_timeout, .server_version, .server_encoding, .integer_datetimes => return error.InvalidSettingValue,
@@ -1231,6 +1252,8 @@ pub fn Store(comptime Raw: type) type {
                     .standard_conforming_strings, .integer_datetimes => "on",
                     .datestyle => self.settings.dateStyle(),
                     .intervalstyle => "postgres",
+                    .default_table_access_method => "heap",
+                    .default_tablespace => if (self.settings.explicit_default_tablespace) "pg_default" else "",
                     .extra_float_digits => return std.fmt.bufPrint(out, "{d}", .{self.settings.extra_float_digits}) catch unreachable,
                     .server_version => "16.0",
                 };
@@ -1392,7 +1415,11 @@ pub fn Store(comptime Raw: type) type {
                             result.command = .set;
                             return;
                         };
-                        try self.applySet(which, set.local, set.kind == .default, if (set.kind == .default) "" else set.value.slice());
+                        var placement_word: @TypeOf(set.value.bytes) = undefined;
+                        const value = if (set.kind == .default) "" else if (set.kind == .word and
+                            (which == .default_table_access_method or which == .default_tablespace))
+                            placementName(set.value.slice(), &placement_word) else set.value.slice();
+                        try self.applySet(which, set.local, set.kind == .default, value);
                         result.clear(0);
                         result.command = .set;
                     },
@@ -1460,6 +1487,7 @@ pub fn Store(comptime Raw: type) type {
                     },
                     .datestyle => target.date_order = source.date_order,
                     .extra_float_digits => target.extra_float_digits = source.extra_float_digits,
+                    .default_tablespace => target.explicit_default_tablespace = source.explicit_default_tablespace,
                     else => {},
                 }
             }

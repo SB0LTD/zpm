@@ -18,6 +18,12 @@ documentation and source and is pending native verification.
 
 ## Design
 
+`default_table_access_method` selects `heap`, the supported table access
+method. `default_tablespace` accepts the empty database default and
+`pg_default`, which both use RAMSQL's single store. The setting preserves
+the chosen spelling in SHOW and follows SET LOCAL and RESET. A request for
+`pg_global` fails at SET because the server has no shared-relation store.
+
 `pg_catalog.pg_is_in_recovery()` returns the database's owner-controlled
 startup replay state. A startup owner sets it while replay and durable-log
 repair are in progress and clears it after successful completion. RAMSQL
