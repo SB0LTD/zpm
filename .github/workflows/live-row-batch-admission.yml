@@ -14,13 +14,14 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          fetch-depth: 2
+          fetch-depth: 4
           persist-credentials: false
       - name: Prove live transaction scope with canonical Sig
         run: |
           set -euo pipefail
           mkdir -p evidence "$RUNNER_TEMP/sig-sdk"
-          candidate="$(git rev-parse HEAD^)"
+          candidate=706fde9489c0556a90badc140b29eb7c498406b5
+          git merge-base --is-ancestor "$candidate" HEAD
           git diff --exit-code "$candidate" -- src/core/sql.sig src/db/store.sig tests/test_db_store.sig
           git rev-parse HEAD "$candidate" > evidence/source.log
           tag=sig-0.6.5-zig0.17.0.3c72687
@@ -39,7 +40,7 @@ jobs:
             "-femit-bin=$RUNNER_TEMP/store-contract" --dep sql --dep db_store \
             -Mroot=tests/test_db_store.sig -Msql=src/core/sql.sig -Mdb_store=src/db/store.sig 2>&1 | tee evidence/build.log
           "$RUNNER_TEMP/store-contract" 2>&1 | tee evidence/store-contract.log
-          rg '^store: [1-9][0-9]+ assertions passed$' evidence/store-contract.log
+          grep -E '^store: [1-9][0-9]+ assertions passed$' evidence/store-contract.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
