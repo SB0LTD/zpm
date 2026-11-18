@@ -1,10 +1,11 @@
-//! Native checkpoint composition contract. The supplied seal and frame
-//! coordinates represent trusted manifest inputs in this fixture.
+//! Native checkpoint composition contract, including atomic generation
+//! selection under a database-wide lock.
 const std = @import("std");
 const builtin = @import("builtin");
 const disk = @import("db_file");
 const log = @import("durable_log");
 const snapshot = @import("snapshot_envelope");
+const manifest = @import("checkpoint_manifest");
 const sql = @import("sql");
 const Raw = sql.Database(.{
     .external_storage = true,
@@ -33,18 +34,11 @@ const change_kind = 3;
 const marker_kind = 24;
 const identity_len = 36;
 const marker_len = identity_len + 8 * 4 + 32;
-const Identity = struct {
-    database: [16]u8 = "fixture-database".*,
-    namespace: [16]u8 = "fixture-nspace-1".*,
-    oid: u32 = 16397,
-
-    fn encode(self: Identity) [identity_len]u8 {
-        var bytes: [identity_len]u8 = undefined;
-        bytes[0..16].* = self.database;
-        bytes[16..32].* = self.namespace;
-        std.mem.writeInt(u32, bytes[32..36], self.oid, .little);
-        return bytes;
-    }
+const Identity = manifest.DatabaseIdentity;
+const fixture_identity: Identity = .{
+    .database = "fixture-database".*,
+    .namespace = "fixture-nspace-1".*,
+    .oid = 16397,
 };
 var live: Store = .{};
 var staged: Store = .{};
@@ -112,12 +106,20 @@ const ImageSource = struct {
 
 fn encodeMarker(identity: Identity, seal: snapshot.Seal) [marker_len]u8 {
     var bytes: [marker_len]u8 = undefined;
-    bytes[0..identity_len].* = identity.encode();
+    bytes[0..identity_len].* = identityPayload(identity);
     std.mem.writeInt(u64, bytes[36..44], seal.identity.generation, .little);
     std.mem.writeInt(u64, bytes[44..52], seal.identity.wal_sequence, .little);
     std.mem.writeInt(u64, bytes[52..60], seal.identity.sql_csn, .little);
     std.mem.writeInt(u64, bytes[60..68], seal.payload_bytes, .little);
     bytes[68..100].* = seal.digest;
+    return bytes;
+}
+
+fn identityPayload(identity: Identity) [identity_len]u8 {
+    var bytes: [identity_len]u8 = undefined;
+    bytes[0..16].* = identity.database;
+    bytes[16..32].* = identity.namespace;
+    std.mem.writeInt(u32, bytes[32..36], identity.oid, .little);
     return bytes;
 }
 
@@ -138,7 +140,7 @@ const Recovery = struct {
     fn restore(self: *Recovery, wal: *disk.File, image: *disk.File, marker: log.Frame) !log.Recovery {
         var scratch: [2048]u8 = undefined;
         const encoded = try log.readFrame(wal, &scratch, .{ .offset = 0, .sequence = 1, .kind = identity_kind, .payload_len = identity_len });
-        if (!std.mem.eql(u8, encoded, &self.identity.encode()) or
+        if (!std.mem.eql(u8, encoded, &identityPayload(self.identity)) or
             !std.mem.eql(u8, &self.identity.database, &self.seal.identity.database_id)) return error.CheckpointDatabaseMismatch;
         try snapshot.verify(image, scratch[0..53], self.seal);
         const source: ImageSource = .{ .file = image, .payload_len = self.seal.payload_bytes };
@@ -177,15 +179,203 @@ fn copyImage(source: *disk.File, target: *disk.File, length: u64, damage_at: ?u6
     try target.sync();
 }
 
+fn generationPath(out: []u8, pid: u32, generation: u64, extension: []const u8) ![]u8 {
+    return std.fmt.bufPrint(out, "sig-out/native-checkpoint-{d}-{d}.{s}", .{ pid, generation, extension });
+}
+
+fn selectionFor(id: Identity, seal: snapshot.Seal, anchor: log.Frame) manifest.Selection {
+    return .{
+        .identity = id, .generation = seal.identity.generation, .base_sequence = seal.identity.wal_sequence,
+        .sql_csn = seal.identity.sql_csn, .image_bytes = seal.payload_bytes, .image_digest = seal.digest,
+        .anchor_offset = anchor.offset, .anchor_kind = anchor.kind, .anchor_length = anchor.payload_len,
+    };
+}
+
+fn manifestContract(record: manifest.Selection) !void {
+    const bytes = try record.encode();
+    const decoded = try manifest.Selection.decode(&bytes);
+    try check(std.meta.eql(record, decoded) and try decoded.anchorSequence() == record.base_sequence + 1);
+    if (manifest.Selection.decode(bytes[0 .. bytes.len - 1])) |_| return error.ShortManifestAccepted else |err| try check(err == error.InvalidCheckpointManifest);
+    var bad = bytes;
+    bad[0] ^= 1;
+    if (manifest.Selection.decode(&bad)) |_| return error.UnknownManifestAccepted else |err| try check(err == error.UnsupportedCheckpointManifest);
+    bad = bytes;
+    bad[112] ^= 1;
+    if (manifest.Selection.decode(&bad)) |_| return error.ManifestChecksumIgnored else |err| try check(err == error.CheckpointManifestDigestMismatch);
+    bad = bytes;
+    bad[47] = 1;
+    std.crypto.hash.Blake3.hash(bad[0..128], bad[128..], .{});
+    if (manifest.Selection.decode(&bad)) |_| return error.ReservedManifestAccepted else |err| try check(err == error.InvalidCheckpointManifest);
+    var invalid = record;
+    invalid.base_sequence = std.math.maxInt(u64);
+    if (invalid.encode()) |_| return error.ManifestCounterOverflowAccepted else |err| try check(err == error.InvalidCheckpointManifest);
+    if (invalid.anchorSequence()) |_| return error.ManifestAnchorOverflowAccepted else |err| try check(err == error.InvalidCheckpointManifest);
+}
+
+const SelectionCut = enum { none, during_temp_write, after_temp_sync };
+
+fn publishSelection(selected_path: []const u8, temp_path: []const u8, record: manifest.Selection, cut: SelectionCut) !void {
+    var temp = try disk.File.createExclusive(temp_path);
+    defer temp.close();
+    if (cut == .during_temp_write) {
+        const bytes = try record.encode();
+        try temp.appendAll(bytes[0 .. bytes.len / 2]);
+        return error.SelectionInterrupted;
+    }
+    try record.write(&temp);
+    if (cut == .after_temp_sync) return error.SelectionInterrupted;
+    temp.close();
+    try disk.replaceAtomic(temp_path, selected_path);
+}
+
+const SelectedRecovery = struct { generation: u64, wal: log.Recovery };
+
+fn recoverSelected(pid: u32, path: []const u8, id: Identity, published: *bool) !SelectedRecovery {
+    var selected_file = try disk.File.openExisting(path);
+    defer selected_file.close();
+    const selected = try manifest.Selection.read(&selected_file, id);
+    var image_name: [128]u8 = undefined;
+    var wal_name: [128]u8 = undefined;
+    var image = try disk.File.openExisting(try generationPath(&image_name, pid, selected.generation, "image"));
+    defer image.close();
+    var wal = try disk.File.openExisting(try generationPath(&wal_name, pid, selected.generation, "wal"));
+    defer wal.close();
+    try bind(&staged, 1, id);
+    var recovery: Recovery = .{
+        .identity = id,
+        .seal = .{
+            .identity = .{ .database_id = id.database, .generation = selected.generation, .wal_sequence = selected.base_sequence, .sql_csn = selected.sql_csn },
+            .payload_bytes = selected.image_bytes, .digest = selected.image_digest,
+        },
+    };
+    const anchor: log.Frame = .{
+        .offset = selected.anchor_offset, .sequence = try selected.anchorSequence(),
+        .kind = selected.anchor_kind, .payload_len = selected.anchor_length,
+    };
+    const recovered = try recovery.restore(&wal, &image, anchor);
+    published.* = recovery.published;
+    return .{ .generation = selected.generation, .wal = recovered };
+}
+
+fn exerciseSelection(pid: u32, writer: *Store.Connection, first: manifest.Selection, first_end: log.Recovery) !void {
+    const id = first.identity;
+    const generation = first.generation + 1;
+    var manifest_name: [128]u8 = undefined;
+    var temp_name: [128]u8 = undefined;
+    var partial_name: [128]u8 = undefined;
+    var delayed_name: [128]u8 = undefined;
+    var image_name: [128]u8 = undefined;
+    var wal_name: [128]u8 = undefined;
+    var image_temp_name: [128]u8 = undefined;
+    var wal_temp_name: [128]u8 = undefined;
+    var hidden_name: [128]u8 = undefined;
+    const selected_path = try generationPath(&manifest_name, pid, 0, "manifest");
+    const temp_path = try generationPath(&temp_name, pid, 0, "manifest-new");
+    const partial_path = try generationPath(&partial_name, pid, 0, "manifest-partial");
+    const delayed_path = try generationPath(&delayed_name, pid, 0, "manifest-synced");
+    const image_path = try generationPath(&image_name, pid, generation, "image");
+    const wal_path = try generationPath(&wal_name, pid, generation, "wal");
+    const image_temp = try generationPath(&image_temp_name, pid, generation, "image-pending");
+    const wal_temp = try generationPath(&wal_temp_name, pid, generation, "wal-pending");
+    const hidden_path = try generationPath(&hidden_name, pid, generation, "image-hidden");
+
+    try manifestContract(first);
+    try publishSelection(selected_path, temp_path, first, .none);
+    defer disk.remove(selected_path) catch {};
+    defer disk.remove(temp_path) catch {};
+    var published = false;
+    const initial = try recoverSelected(pid, selected_path, id, &published);
+    try check(published and initial.generation == first.generation and initial.wal.sequence == first_end.sequence);
+
+    var image = try disk.File.createExclusive(image_temp);
+    defer disk.remove(image_temp) catch {};
+    defer image.close();
+    var wal: Journal = .{ .file = try disk.File.createExclusive(wal_temp), .sequence = first_end.sequence };
+    defer disk.remove(wal_temp) catch {};
+    defer wal.file.close();
+    // The previous generation is untouched. The fresh WAL contains the same
+    // database identity followed by an independently positioned anchor.
+    try log.appendKind(&wal.file, 1, &identityPayload(id), identity_kind);
+    const snapshot_id: snapshot.Identity = .{
+        .database_id = id.database, .generation = generation, .wal_sequence = first_end.sequence, .sql_csn = live.database.csn,
+    };
+    var envelope = try EnvelopeWriter.begin(&image, snapshot_id);
+    var scratch: [96]u8 = undefined;
+    try Raw.BaseSnapshot.write(&live.database, ImageSink{ .writer = &envelope }, &scratch);
+    const seal = try envelope.finish();
+    const anchor: log.Frame = .{
+        .offset = try wal.file.length(), .sequence = wal.sequence + 1, .kind = marker_kind, .payload_len = marker_len,
+    };
+    try wal.append(marker_kind, &encodeMarker(id, seal));
+    const next = selectionFor(id, seal, anchor);
+    image.close();
+    wal.file.close();
+    // Persist both generation names before changing the selected manifest.
+    try disk.publishNew(image_temp, image_path);
+    defer disk.remove(image_path) catch {};
+    try disk.publishNew(wal_temp, wal_path);
+    defer disk.remove(wal_path) catch {};
+
+    defer disk.remove(partial_path) catch {};
+    defer disk.remove(delayed_path) catch {};
+    if (publishSelection(selected_path, partial_path, next, .during_temp_write)) |_| return error.PartialManifestPublished else |err| try check(err == error.SelectionInterrupted);
+    if (publishSelection(selected_path, delayed_path, next, .after_temp_sync)) |_| return error.UnselectedManifestPublished else |err| try check(err == error.SelectionInterrupted);
+    var partial = try disk.File.openExisting(partial_path);
+    defer partial.close();
+    if (manifest.Selection.read(&partial, id)) |_| return error.PartialManifestValid else |err| try check(err == error.InvalidCheckpointManifest);
+    var complete = try disk.File.openExisting(delayed_path);
+    defer complete.close();
+    try check(std.meta.eql(try manifest.Selection.read(&complete, id), next));
+    var foreign = id;
+    foreign.oid += 1;
+    if (manifest.Selection.read(&complete, foreign)) |_| return error.ForeignManifestAccepted else |err| try check(err == error.CheckpointDatabaseMismatch);
+    published = false;
+    const still_first = try recoverSelected(pid, selected_path, id, &published);
+    try check(published and still_first.generation == first.generation and still_first.wal.sequence == first_end.sequence);
+
+    try publishSelection(selected_path, temp_path, next, .none);
+    wal.file = try disk.File.openExisting(wal_path);
+    live.commit_ctx = &wal;
+    defer live.commit_ctx = null;
+    try writer.execute("INSERT INTO ledger VALUES (9,90)", &result);
+    const sequence = wal.sequence;
+    wal.file.close();
+    published = false;
+    const after = try recoverSelected(pid, selected_path, id, &published);
+    try check(published and after.generation == generation and after.wal.sequence == sequence);
+    try check(staged.database.csn == live.database.csn);
+    var reader: Store.Connection = .{ .store = &staged, .id = 2 };
+    try reader.execute("SELECT cents FROM ledger WHERE id=9", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 90);
+
+    try disk.publishNew(image_path, hidden_path);
+    defer disk.remove(hidden_path) catch {};
+    published = false;
+    if (recoverSelected(pid, selected_path, id, &published)) |_| return error.MissingSelectedImageIgnored else |err| try check(err == error.FileNotFound);
+    try check(!published);
+    var intact = try disk.File.openExisting(hidden_path);
+    defer intact.close();
+    image = try disk.File.createExclusive(image_path);
+    try copyImage(&intact, &image, try intact.length(), snapshot.header_size + 27);
+    image.close();
+    if (recoverSelected(pid, selected_path, id, &published)) |_| return error.CorruptSelectedImageIgnored else |err| try check(err == error.SnapshotDigestMismatch);
+    try check(!published);
+}
+
 pub fn main() !void {
     const pid: u32 = if (builtin.os.tag == .windows) Win.GetCurrentProcessId() else if (builtin.os.tag == .macos) @intCast(std.c.getpid()) else @intCast(std.os.linux.getpid());
     var lock_name: [128]u8 = undefined;
     var wal_name: [128]u8 = undefined;
     var image_name: [128]u8 = undefined;
+    var published_wal_name: [128]u8 = undefined;
+    var published_image_name: [128]u8 = undefined;
     var bad_name: [128]u8 = undefined;
     const lock_path = try std.fmt.bufPrint(&lock_name, "sig-out/native-checkpoint-{d}.lock", .{pid});
-    const wal_path = try std.fmt.bufPrint(&wal_name, "sig-out/native-checkpoint-{d}.wal", .{pid});
-    const image_path = try std.fmt.bufPrint(&image_name, "sig-out/native-checkpoint-{d}.image", .{pid});
+    const generation = 2;
+    const wal_path = try generationPath(&wal_name, pid, generation, "wal-pending");
+    const image_path = try generationPath(&image_name, pid, generation, "image-pending");
+    const published_wal = try generationPath(&published_wal_name, pid, generation, "wal");
+    const published_image = try generationPath(&published_image_name, pid, generation, "image");
     const bad_path = try std.fmt.bufPrint(&bad_name, "sig-out/native-checkpoint-{d}.bad", .{pid});
     var lock: disk.WriterLock = .{};
     try lock.acquire(lock_path);
@@ -201,8 +391,8 @@ pub fn main() !void {
     defer disk.remove(bad_path) catch {};
     defer broken.close();
 
-    const id: Identity = .{};
-    try wal.append(identity_kind, &id.encode());
+    const id = fixture_identity;
+    try wal.append(identity_kind, &identityPayload(id));
     try bind(&live, 0, id);
     var commits: [2048]u8 = undefined;
     live.durability_required = true;
@@ -214,7 +404,7 @@ pub fn main() !void {
     try writer.execute("CREATE TABLE labels (id INT PRIMARY KEY, name TEXT)", &result);
     try writer.execute("INSERT INTO ledger VALUES (1,10),(4,NULL)", &result);
     try writer.execute("INSERT INTO labels VALUES (1,'old'),(2,'keep')", &result);
-    const envelope_id: snapshot.Identity = .{ .database_id = id.database, .generation = 2, .wal_sequence = wal.sequence, .sql_csn = live.database.csn };
+    const envelope_id: snapshot.Identity = .{ .database_id = id.database, .generation = generation, .wal_sequence = wal.sequence, .sql_csn = live.database.csn };
     try check(envelope_id.wal_sequence == envelope_id.sql_csn + 1);
     var envelope = try EnvelopeWriter.begin(&image, envelope_id);
     var image_scratch: [96]u8 = undefined;
@@ -301,5 +491,12 @@ pub fn main() !void {
     try bind(&staged, 1, id);
     const reopened = try recovery.restore(&wal.file, &image, marker);
     try check(recovery.published and !reopened.truncated_tail and reopened.sequence == suffix_sequence and reopened.valid_bytes == suffix_end);
+    wal.file.close();
+    image.close();
+    try disk.publishNew(wal_path, published_wal);
+    defer disk.remove(published_wal) catch {};
+    try disk.publishNew(image_path, published_image);
+    defer disk.remove(published_image) catch {};
+    try exerciseSelection(pid, &writer, selectionFor(id, seal, marker), reopened);
     std.debug.print("{{\"suite\":\"native_store_checkpoint\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
 }
