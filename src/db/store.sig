@@ -699,6 +699,13 @@ pub fn Store(comptime Raw: type) type {
             pub const detached_primary_key = if (@hasDecl(Raw, "ReadContext")) @hasDecl(Raw.ReadContext, "primaryKeyMatches") else false;
 
             pub const Result = Raw.Result;
+            pub const simple_query_batches = @hasDecl(Raw, "preflightPostgresBatch");
+
+            const SimpleQueryBatch = struct {
+                statement_us: ?i64,
+                implicit: bool = false,
+            };
+
             store: *Self,
             id: u64,
             dialect: Dialect = .postgres,
@@ -707,6 +714,7 @@ pub fn Store(comptime Raw: type) type {
             /// Transaction slot (explicit block or a parked implicit statement).
             tx: ?u16 = null,
             in_transaction: bool = false,
+            simple_query_batch: ?SimpleQueryBatch = null,
             /// Opt-in immutable autocommit SELECT route. The caller owns the
             /// context and excludes ALL storage mutations for the entire codec
             /// call, including result formatting. Never set for transaction,
@@ -971,7 +979,7 @@ pub fn Store(comptime Raw: type) type {
                 self.refreshTransactionTimeout();
                 self.in_transaction = true;
                 self.failed = false;
-                self.transaction_us = self.store.wallNow();
+                self.transaction_us = if (self.simple_query_batch) |batch| batch.statement_us else self.store.wallNow();
                 self.tx_start = self.settings;
                 self.base = self.settings;
                 self.saved_len = 0;
@@ -984,6 +992,7 @@ pub fn Store(comptime Raw: type) type {
                 self.base = self.settings;
                 self.tx = null;
                 self.in_transaction = false;
+                if (self.simple_query_batch) |*batch| batch.implicit = false;
                 self.failed = false;
                 self.saved_len = 0;
                 self.pending = .{};
@@ -1028,6 +1037,45 @@ pub fn Store(comptime Raw: type) type {
                 self.failed = true;
                 self.pending = .{};
                 self.revertSettings();
+            }
+
+            pub fn simpleQueryBatchAvailable(self: *const Connection) bool {
+                return simple_query_batches and self.dialect == .postgres and self.read_context == null;
+            }
+
+            pub fn preflightSimpleQueryBatch(self: *Connection, source: []const u8) !usize {
+                if (comptime !simple_query_batches) return error.UnsupportedStatement;
+                return self.db().preflightPostgresBatch(source);
+            }
+
+            pub fn beginSimpleQueryBatch(self: *Connection) !void {
+                if (self.id == 0 or self.simple_query_batch != null or self.pending.active) return error.ProtocolViolation;
+                self.simple_query_batch = .{ .statement_us = self.store.wallNow() };
+            }
+
+            pub fn beginSimpleQueryStep(self: *Connection) !void {
+                if (self.simple_query_batch == null) return error.ProtocolViolation;
+                if (self.in_transaction) return;
+                try self.beginTransaction();
+                self.simple_query_batch.?.implicit = true;
+            }
+
+            pub fn checkSimpleQueryUtility(source: []const u8) !void {
+                if (comptime @hasDecl(Raw, "parseDatabaseCommand")) {
+                    if (try Raw.parseDatabaseCommand(source, .{})) |_| return error.ActiveSqlTransaction;
+                }
+            }
+
+            fn implicitSimpleQueryBlock(self: *const Connection) bool {
+                return if (self.simple_query_batch) |batch| batch.implicit else false;
+            }
+
+            pub fn finishSimpleQueryBatch(self: *Connection, success: bool) !void {
+                const batch = self.simple_query_batch orelse return;
+                defer self.simple_query_batch = null;
+                if (batch.implicit) {
+                    if (success) try self.commitTransaction() else try self.rollbackTransaction();
+                } else if (!success) self.failTransaction();
             }
 
             /// An error inside a block reverts settings made since the
@@ -1108,6 +1156,7 @@ pub fn Store(comptime Raw: type) type {
             pub fn disconnect(self: *Connection) void {
                 if (self.id == 0) return;
                 self.rollbackTransaction() catch {};
+                self.simple_query_batch = null;
                 self.pending = .{};
                 if (comptime has_engine_session) self.db().endSession();
             }
@@ -1383,29 +1432,36 @@ pub fn Store(comptime Raw: type) type {
                     .none => unreachable,
                     .begin => |modes| {
                         const fresh = !self.in_transaction;
+                        const promote = self.implicitSimpleQueryBlock();
                         if (comptime has_engine_session) {
                             try self.beginTransaction();
                             // BEGIN inside a block only warns (its modes are ignored).
-                            if (fresh) try self.db().beginModes(self.tx.?, modes);
+                            if (fresh) {
+                                try self.db().beginModes(self.tx.?, modes);
+                            } else if (promote) {
+                                self.simple_query_batch.?.implicit = false;
+                                try self.db().setTransaction(self.tx.?, modes);
+                            }
                         } else {
                             if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
                             try self.beginTransaction();
+                            if (promote) self.simple_query_batch.?.implicit = false;
                         }
-                        if (!fresh) self.warn("25001", "there is already a transaction in progress");
+                        if (!fresh and !promote) self.warn("25001", "there is already a transaction in progress");
                         result.clear(0);
                         result.command = .begin;
                     },
                     .commit => {
-                        const was_open = self.in_transaction;
+                        const explicit = self.in_transaction and !self.implicitSimpleQueryBlock();
                         try self.commitTransaction();
-                        if (!was_open) self.warn("25P01", "there is no transaction in progress");
+                        if (!explicit) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .commit;
                     },
                     .rollback => {
-                        const was_open = self.in_transaction;
+                        const explicit = self.in_transaction and !self.implicitSimpleQueryBlock();
                         try self.rollbackTransaction();
-                        if (!was_open) self.warn("25P01", "there is no transaction in progress");
+                        if (!explicit) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .rollback;
                     },
@@ -1413,7 +1469,7 @@ pub fn Store(comptime Raw: type) type {
                         if (comptime PreparedWal == void) return error.UnsupportedStatement;
                         switch (prepared.action) {
                             .prepare => {
-                                if (!self.in_transaction) return error.NoActiveTransaction;
+                                if (!self.in_transaction or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                                 const slot = self.tx.?;
                                 if (self.failed) {
                                     self.db().abort(slot);
@@ -1445,7 +1501,7 @@ pub fn Store(comptime Raw: type) type {
                         }
                     },
                     .savepoint => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                         if (self.failed) return error.TransactionFailed;
                         try self.db().savepoint(self.tx.?, name.slice());
                         self.saved[self.saved_len] = .{ .current = self.settings, .base = self.base };
@@ -1454,14 +1510,14 @@ pub fn Store(comptime Raw: type) type {
                         result.command = .savepoint;
                     },
                     .release => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                         if (self.failed) return error.TransactionFailed;
                         self.saved_len = try self.db().release(self.tx.?, name.slice());
                         result.clear(0);
                         result.command = .release;
                     },
                     .rollback_to => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                         const depth = try self.db().rollbackTo(self.tx.?, name.slice());
                         self.rolled_back_to = depth;
                         self.settings = self.saved[depth].current;
@@ -1995,7 +2051,7 @@ pub fn Store(comptime Raw: type) type {
                 }
                 if (self.failed) return error.TransactionFailed;
                 if (!self.autocommit and !self.in_transaction) try self.beginTransaction();
-                self.statement_us = self.store.wallNow();
+                self.statement_us = if (self.simple_query_batch) |batch| batch.statement_us else self.store.wallNow();
                 const implicit = !self.in_transaction;
                 const slot = if (self.tx) |slot| slot else blk: {
                     const slot = try self.db().begin();
