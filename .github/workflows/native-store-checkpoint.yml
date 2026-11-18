@@ -1,20 +1,20 @@
-name: Native caller-owned TCP readiness contracts
+name: Native sealed SQL checkpoint composition
 
 on:
   push:
-    branches: [ci/hosted-tcp-poll-scratch-20261118]
+    branches: [ci/native-store-checkpoint-roundtrip-20261118]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  ZPM_SOURCE_REVISION: d5f11843ed57ded08f888681afd43254a8e7287a
+  ZPM_SOURCE_REVISION: 553315d9ab5f09fd2078c7f428b93cf3e3d08a59
   SIG_TAG: sig-0.6.5-zig0.17.0.3c72687
 
 jobs:
   contracts:
-    name: Hosted TCP readiness (${{ matrix.os }})
+    name: Native checkpoint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -68,26 +68,29 @@ jobs:
           "SIG_LIB_DIR=$lib" >> $env:GITHUB_ENV
           & $compiler[0].FullName version | Tee-Object evidence/sig-version.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Exercise 70 live sockets and error readiness
+      - name: Verify sealed SQL state and recover the WAL suffix
         run: |
-          $name = if ($env:RUNNER_OS -eq 'Windows') { 'tcp-server.exe' } else { 'tcp-server' }
+          $name = if ($env:RUNNER_OS -eq 'Windows') { 'native-store-checkpoint.exe' } else { 'native-store-checkpoint' }
           $binary = Join-Path $env:RUNNER_TEMP $name
           $flags = @('-OReleaseSafe')
           if ($env:RUNNER_OS -eq 'macOS') { $flags += '-lc' }
-          & $env:SIG build-exe --Sig-lib-dir $env:SIG_LIB_DIR @flags --dep tcp_server `
-            '-Mroot=tests/test_tcp_server.sig' '-Mtcp_server=src/platform/tcp_server.sig' `
-            "-femit-bin=$binary" 2>&1 | Tee-Object evidence/tcp-build.txt
+          & $env:SIG build-exe --Sig-lib-dir $env:SIG_LIB_DIR @flags `
+            --dep db_file --dep durable_log --dep snapshot_envelope --dep sql --dep db_store `
+            '-Mroot=tests/test_native_store_checkpoint.sig' '-Mdb_file=src/platform/db_file.sig' `
+            '-Mdurable_log=src/db/durable_log.sig' '-Msnapshot_envelope=src/db/snapshot_envelope.sig' `
+            '-Msql=src/core/sql.sig' '-Mdb_store=src/db/store.sig' `
+            "-femit-bin=$binary" 2>&1 | Tee-Object evidence/checkpoint-build.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $binary 2>&1 | Tee-Object evidence/tcp-result.json
+          & $binary 2>&1 | Tee-Object evidence/checkpoint-result.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $report = Get-Content evidence/tcp-result.json -Raw | ConvertFrom-Json
-          if ($report.suite -ne 'tcp_server' -or $report.pass -ne $true -or $report.assertions -lt 150) {
+          $report = Get-Content evidence/checkpoint-result.json -Raw | ConvertFrom-Json
+          if ($report.suite -ne 'native_store_checkpoint' -or $report.pass -ne $true -or $report.assertions -ne 47) {
             throw 'Native assertions did not execute'
           }
           (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() > evidence/contract-binary-sha256.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: tcp-readiness-${{ matrix.os }}
+          name: native-checkpoint-${{ matrix.os }}
           path: evidence/
           if-no-files-found: error
