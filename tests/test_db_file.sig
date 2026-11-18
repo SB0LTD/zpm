@@ -28,15 +28,18 @@ fn testWriterLock(pid: u32, first_generation: []const u8, manifest: []const u8, 
     var generation_buffer: [256]u8 = undefined;
     const second_generation = try std.fmt.bufPrint(&generation_buffer, "sig-out/db-file-contract-{d}.wal.2", .{pid});
 
+    var owner: disk.WriterLock = .{};
+    var contender: disk.WriterLock = .{};
+    if (owner.acquireExisting(lock_path)) |_| return error.MissingWriterLockCreated else |err| try check(err == error.FileNotFound);
     var seed = try disk.File.createExclusive(lock_path);
     defer disk.remove(lock_path) catch {};
     seed.close();
-    var owner: disk.WriterLock = .{};
     defer owner.close();
-    var contender: disk.WriterLock = .{};
     defer contender.close();
     if (owner.acquire("")) |_| return error.EmptyLockPathAccepted else |err| try check(err == error.InvalidPath);
-    try owner.acquire(lock_path);
+    try owner.acquireExisting(lock_path);
+    if (owner.acquireExisting(second_generation)) |_| return error.HeldWriterReplaced else |err| try check(err == error.DataDirectoryBusy);
+    if (contender.acquireExisting(lock_path)) |_| return error.ConcurrentWriterAccepted else |err| try check(err == error.DataDirectoryBusy);
     try expectWriterBusy(&owner, second_generation);
     try expectWriterBusy(&contender, lock_path);
 

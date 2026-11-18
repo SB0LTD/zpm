@@ -58,6 +58,14 @@ pub const WriterLock = struct {
         self.file = try File.open(path);
     }
 
+    /// Reacquire a previously installed database lock without creating it.
+    /// Recovery must fail if the lock name is missing. Creating a replacement
+    /// could select a different inode while a writer still holds the old one.
+    pub fn acquireExisting(self: *WriterLock, path: []const u8) Error!void {
+        if (self.file.handle != invalid) return error.DataDirectoryBusy;
+        self.file = try File.openExisting(path);
+    }
+
     pub fn close(self: *WriterLock) void {
         self.file.close();
     }
