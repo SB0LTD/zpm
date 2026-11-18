@@ -67,6 +67,7 @@ pub fn main() !void {
     query("SELECT * FROM events");
     query("INSERT INTO events VALUES (8,'committed')");
     query("SELECT * FROM events");
+    query("SELECT * FROM events; SELECT * FROM events");
     append("X\x00\x00\x00\x04");
     for ([_]usize{ 1, 2, 3, 7, 31, 128, 2048 }) |chunk| {
         store = .{};
@@ -96,7 +97,7 @@ pub fn main() !void {
             if (tag == 'C') commands += 1;
             offset += length + 1;
         }
-        try check(ready == 9 and commands == 8 and rows == 2);
+        try check(ready == 10 and commands == 10 and rows == 4);
         var result: Raw.Result = .{};
         try store.database.execute("SELECT * FROM events", &result);
         try check(result.row_count == 1 and result.rows[0].cells[0].integer == 8);
