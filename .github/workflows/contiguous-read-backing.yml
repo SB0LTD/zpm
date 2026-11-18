@@ -33,7 +33,8 @@ jobs:
           mkdir evidence
           "$SIG" version | tee evidence/sig-version.log
           "$SIG" build run-contract-parallel-read run-contract-sql-parameterized-lookup \
-            --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
+            --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -Dlink-libc=false -j1 2>&1 | tee evidence/contracts.log
+          grep -q 'native_threads=8' evidence/contracts.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
