@@ -371,6 +371,8 @@ pub fn Storage(comptime config: types.Config) type {
             /// Schema OID (cat_namespaces); public unless created in a schema.
             namespace: u32 = 2200,
             primary_constraint_oid: u32 = 0,
+            /// Zero retains the legacy table OID + 1 identity.
+            primary_index_oid: u32 = 0,
             constraint_count: usize = 0,
             constraints: [constraint_capacity]Constraint = @splat(.{}),
             /// pg_class relkind: 'r' table, 'v' view, 'm' materialized view,
@@ -504,8 +506,18 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         /// OIDs a table definition owns: itself and its primary-key index.
+        pub fn primaryIndexAlias(table_oid: u32, has_key: bool, explicit_oid: u32) u32 {
+            if (!has_key) return 0;
+            return if (explicit_oid == 0) table_oid + 1 else explicit_oid;
+        }
+
+        pub fn primaryIndexOid(table: *const Table) u32 {
+            return primaryIndexAlias(table.oid, keyed(table), table.primary_index_oid);
+        }
+
+        /// Contiguous allocation width. An explicit primary alias is separate.
         pub fn oidWidth(table: *const Table) u32 {
-            return 1 + @as(u32, @intFromBool(keyed(table)));
+            return 1 + @as(u32, @intFromBool(keyed(table) and table.primary_index_oid == 0));
         }
 
         fn observeBounds(bounds: *IntegerBounds, cell: *const V.Cell) void {
@@ -1013,6 +1025,7 @@ pub fn Storage(comptime config: types.Config) type {
             };
             table.namespace = 2200;
             table.primary_constraint_oid = 0;
+            table.primary_index_oid = 0;
             table.constraint_count = 0;
             setExtras(table, &.{});
             table.truncate_csn = 0;
@@ -1047,6 +1060,7 @@ pub fn Storage(comptime config: types.Config) type {
             };
             destination.namespace = source.namespace;
             destination.primary_constraint_oid = source.primary_constraint_oid;
+            destination.primary_index_oid = source.primary_index_oid;
             destination.constraint_count = source.constraint_count;
             @memcpy(destination.constraints[0..source.constraint_count], source.constraints[0..source.constraint_count]);
             setExtras(destination, &extrasOf(source));

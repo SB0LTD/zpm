@@ -69,6 +69,9 @@
 //!   unkeyed relation), then one OID for each nonprimary constraint in
 //!   definition order. Replaying versions 1-3 assigns these identities in
 //!   record order and preserves them through legacy ALTER TABLE records.
+//!   Definition version 5 adds one nonzero primary-index OID immediately
+//!   after the version-4 identity fields. Versions 1-4 retain the implicit
+//!   table OID + 1 alias for a primary key. Version 5 requires a primary key.
 //!   name: len u8 + bytes. value: 0 null | 1 i64 | 2 bool u8 | 3 len u32 + bytes
 //!   | 4 f32 bits u32 | 5 f64 bits u64 | 6 numeric {special u8, negative u8,
 //!   dscale u16, coefficient 4 x u64} | 7 date i32 | 8 timestamp i64
@@ -138,6 +141,7 @@ pub const definition_format_version: u16 = 2;
 /// definitions keep versions 1 and 2 byte for byte).
 pub const extensions_format_version: u16 = 3;
 pub const constraint_identity_format_version: u16 = 4;
+pub const primary_index_identity_format_version: u16 = 5;
 
 pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71 };
 
@@ -428,11 +432,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
         /// Name, format version, columns and (version 2) namespace and
         /// constraints of a table definition.
         pub fn encodeDefinition(writer: *Writer, table: *const S.Table) Error!void {
-            const v4 = table.primary_constraint_oid != 0 or table.constraint_count != 0;
+            const v5 = table.primary_index_oid != 0;
+            const v4 = v5 or table.primary_constraint_oid != 0 or table.constraint_count != 0;
             const v3 = v4 or S.extended(table);
             const extended = v3 or table.namespace != public_namespace or table.constraint_count != 0;
             try writer.name(table.name.slice());
-            try writer.int(u16, if (v4) constraint_identity_format_version else if (v3) extensions_format_version else if (extended) definition_format_version else expr_format_version);
+            try writer.int(u16, if (v5) primary_index_identity_format_version else if (v4) constraint_identity_format_version else if (v3) extensions_format_version else if (extended) definition_format_version else expr_format_version);
             try writer.int(u8, @intCast(table.column_count));
             for (table.columns[0..table.column_count]) |*column| {
                 try writer.name(column.name.slice());
@@ -503,6 +508,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (constraint.kind != .primary) try writer.int(u32, constraint.oid);
                 }
             }
+            if (v5) try writer.int(u32, table.primary_index_oid);
         }
 
         pub fn encodeCreateSequence(writer: *Writer, seq: anytype) Error!void {
@@ -693,8 +699,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
             live: bool = false,
             /// Rows of this slot still come from the database (not recreated).
             base: bool = false,
-            /// A primary key (its index owns oid + 1).
+            /// A primary key, with an optional explicit index identity.
             keyed: bool = false,
+            primary_index_oid: u32 = 0,
             namespace: u32 = 2200,
             oid: u32 = 0,
             name: V.Name = .{},
@@ -917,7 +924,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         }
 
         /// Whether [oid, oid + width) meets an OID the record or the database
-        /// still holds: a table and its primary-key index (oid + 1), or a
+        /// still holds: a table and its primary-key index, or a
         /// sequence. Database slots count until reclaimed, even uncommitted.
         fn oidTaken(db: anytype, scratch: *const Scratch, oid: u32, width: u32) bool {
             for (&scratch.objects.objects) |*object| if (object.live and overlaps(object.oid, 1, oid, width)) return true;
@@ -926,14 +933,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         fn oidTakenIn(db: anytype, scratch: *const Scratch, oid: u32, width: u32) bool {
             for (&scratch.tables) |*vt| if (vt.live) {
-                if (overlaps(vt.oid, 1 + @as(u32, @intFromBool(vt.keyed)), oid, width)) return true;
+                if (overlaps(vt.oid, 1, oid, width) or overlaps(S.primaryIndexAlias(vt.oid, vt.keyed, vt.primary_index_oid), 1, oid, width)) return true;
                 for (vt.index_oids[0..vt.index_count]) |index_oid| if (overlaps(index_oid, 1, oid, width)) return true;
             };
             for (&db.tables) |*table| if (table.live) for (table.indexes[0..table.index_count]) |*index| {
                 if (overlaps(index.oid, 1, oid, width)) return true;
             };
             for (&scratch.seqs) |*vs| if (vs.live and overlaps(vs.oid, 1, oid, width)) return true;
-            for (&db.tables) |*table| if (table.live and overlaps(table.oid, S.oidWidth(table), oid, width)) return true;
+            for (&db.tables) |*table| if (table.live) {
+                if (overlaps(table.oid, 1, oid, width) or overlaps(S.primaryIndexOid(table), 1, oid, width)) return true;
+            };
             for (&db.seqs) |*seq| if (seq.live and overlaps(seq.oid, 1, oid, width)) return true;
             for (&scratch.schemas) |*vs| if (vs.live and overlaps(vs.oid, 1, oid, width)) return true;
             for (&db.schemas) |*schema| if (schema.live and overlaps(schema.oid, 1, oid, width)) return true;
@@ -1247,6 +1256,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             constraint_count: usize = 0,
             has_constraint_ids: bool = false,
             primary_constraint_oid: u32 = 0,
+            primary_index_oid: u32 = 0,
             extras: S.Extras = .{},
 
             fn keyed(self: *const Definition) bool {
@@ -1442,7 +1452,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             out.name.len = table_name.len;
             @memcpy(out.name.bytes[0..table_name.len], table_name);
             const version = try reader.int(u16);
-            if (version < expr_format_version or version > constraint_identity_format_version) return error.UnsupportedLogVersion;
+            if (version < expr_format_version or version > primary_index_identity_format_version) return error.UnsupportedLogVersion;
             out.count = try reader.int(u8);
             if (out.count == 0) return error.InvalidChangeRecord;
             if (out.count > config.columns) return error.ChangeRecordConflict;
@@ -1491,7 +1501,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             for (out.columns[0..out.count]) |*column| if (column.virtual and column.default_kind != .generated) return error.InvalidChangeRecord;
             if (version != expr_format_version) try decodeConstraints(reader, out, version);
             if (version >= extensions_format_version) try decodeExtras(reader, out);
-            if (version == constraint_identity_format_version) {
+            if (version >= constraint_identity_format_version) {
                 out.has_constraint_ids = true;
                 out.primary_constraint_oid = try reader.int(u32);
                 if (out.keyed()) {
@@ -1503,6 +1513,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (!validConstraintOid(constraint.oid) or constraint.oid == out.primary_constraint_oid) return error.InvalidChangeRecord;
                     for (out.constraints[0..i]) |*previous| if (constraint.oid == previous.oid) return error.InvalidChangeRecord;
                 }
+            }
+            if (version == primary_index_identity_format_version) {
+                out.primary_index_oid = try reader.int(u32);
+                if (!out.keyed() or !validConstraintOid(out.primary_index_oid) or out.primary_index_oid == out.oid) return error.InvalidChangeRecord;
             }
         }
 
@@ -1625,6 +1639,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 if (!committed) continue;
                 vt.oid = table.oid;
                 vt.keyed = S.keyed(table);
+                vt.primary_index_oid = table.primary_index_oid;
                 vt.namespace = table.namespace;
                 vt.name = table.name;
                 vt.column_count = table.column_count;
@@ -1668,9 +1683,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         // commits in any OID order (STO-01): an OID need only
                         // be unused, not ascending. A primary key's index owns
                         // the next OID.
-                        const width: u32 = 1 + @as(u32, @intFromBool(definition.keyed()));
+                        const width: u32 = 1 + @as(u32, @intFromBool(definition.keyed() and definition.primary_index_oid == 0));
                         if (!knownNamespace(scratch, definition.namespace)) return error.ChangeRecordConflict;
                         if (definition.oid < first_oid or definition.oid >= 0xfffffffe or oidTaken(db, scratch, definition.oid, width)) return error.ChangeRecordConflict;
+                        if (definition.primary_index_oid != 0 and oidTaken(db, scratch, definition.primary_index_oid, 1)) return error.ChangeRecordConflict;
                         if (nameTaken(scratch, definition.name.slice(), definition.namespace)) return error.ChangeRecordConflict;
                         const columns = definition.columns[0..definition.count];
                         var free: ?usize = null;
@@ -1684,11 +1700,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         try validateConstraintOids(scratch, &definition, &.{});
                         purge(scratch, @intCast(index));
                         const vt = &scratch.tables[index];
-                        vt.* = .{ .live = true, .keyed = definition.keyed(), .namespace = definition.namespace, .oid = definition.oid, .name = definition.name, .column_count = definition.count, .columns = definition.columns, .next_rowid = 1, .relkind = definition.extras.relkind };
+                        vt.* = .{ .live = true, .keyed = definition.keyed(), .primary_index_oid = definition.primary_index_oid, .namespace = definition.namespace, .oid = definition.oid, .name = definition.name, .column_count = definition.count, .columns = definition.columns, .next_rowid = 1, .relkind = definition.extras.relkind };
                         for (definition.columns[0..definition.count], 0..) |column, position| if (column.primary_key) {
                             vt.primary = position;
                         };
-                        next_oid = @max(next_oid, definition.oid + width);
+                        next_oid = @max(next_oid, definition.oid + width, definition.primary_index_oid + 1);
                         noteIndexes(vt, &definition, &next_oid);
                         vt.constraint_ids = ConstraintIdentities.from(definition.primary_constraint_oid, definition.constraints[0..definition.constraint_count]);
                     },
@@ -1733,7 +1749,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             const old = vt.primary orelse return error.ChangeRecordConflict;
                             if (sources[column] != old) return error.ChangeRecordConflict;
                         }
-                        if (definition.keyed() and !vt.keyed) return error.ChangeRecordConflict;
+                        if (definition.keyed() and (!vt.keyed or definition.primary_index_oid != vt.primary_index_oid)) return error.ChangeRecordConflict;
                         if (definition.extras.relkind != vt.relkind) return error.ChangeRecordConflict;
                         if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         try validateExtras(db, scratch, &definition, vt);
@@ -1750,6 +1766,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         vt.columns = definition.columns;
                         vt.column_count = definition.count;
                         vt.primary = primary;
+                        vt.keyed = definition.keyed();
+                        vt.primary_index_oid = definition.primary_index_oid;
                     },
                     @intFromEnum(Op.truncate) => {
                         // Every database row and every row created so far by
@@ -1912,7 +1930,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
         /// index OIDs unused (`previous` keeps its own), referenced and parent
         /// tables live (or the definition itself).
         fn validateExtras(db: anytype, scratch: *Scratch, definition: *const Definition, previous: ?*const VTable) Error!void {
+            const primary_alias = S.primaryIndexAlias(definition.oid, definition.keyed(), definition.primary_index_oid);
             for (definition.extras.indexes[0..definition.extras.index_count]) |*index| {
+                if (index.oid == primary_alias) return error.ChangeRecordConflict;
                 if (previous) |vt| {
                     var kept = false;
                     for (vt.index_oids[0..vt.index_count]) |oid| kept = kept or oid == index.oid;
@@ -1934,6 +1954,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 vt.index_oids[position] = index.oid;
                 next_oid.* = @max(next_oid.*, index.oid + 1);
             }
+        }
+
+        fn explicitPrimaryHighWater(definition: *const Definition) u32 {
+            return if (definition.primary_index_oid == 0) 0 else definition.primary_index_oid + 1 - first_oid;
         }
 
         fn indexOidWidth(extras: *const S.Extras) u32 {
@@ -1996,12 +2020,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             S.reset(table, definition.oid, definition.name, columns);
                             table.namespace = definition.namespace;
                             table.primary_constraint_oid = definition.primary_constraint_oid;
+                            table.primary_index_oid = definition.primary_index_oid;
                             S.setConstraints(table, definition.constraints[0..definition.constraint_count]);
                             S.setExtras(table, &definition.extras);
                             S.initSummary(table, csn);
                             try db.replayCreate(index, csn);
                             // Creates arrive in any OID order: keep the maximum.
-                            db.oid_counter = @max(db.oid_counter, definition.oid + S.oidWidth(table) - first_oid, indexOidWidth(&definition.extras));
+                            db.oid_counter = @max(db.oid_counter, definition.oid + S.oidWidth(table) - first_oid, indexOidWidth(&definition.extras), explicitPrimaryHighWater(&definition));
                             break;
                         };
                     },
@@ -2021,7 +2046,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         S.redefine(table, definition.name, definition.columns[0..definition.count], definition.constraints[0..definition.constraint_count], &definition.extras, sources[0..definition.count], fills[0..definition.count]);
                         table.primary_constraint_oid = definition.primary_constraint_oid;
-                        db.oid_counter = @max(db.oid_counter, indexOidWidth(&definition.extras));
+                        table.primary_index_oid = definition.primary_index_oid;
+                        db.oid_counter = @max(db.oid_counter, indexOidWidth(&definition.extras), explicitPrimaryHighWater(&definition));
                         S.rebuildCommitted(table, csn);
                         try db.replayAlter((@intFromPtr(table) - @intFromPtr(&db.tables[0])) / @sizeOf(S.Table), old_count, csn);
                     },
