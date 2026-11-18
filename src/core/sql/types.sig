@@ -1473,7 +1473,7 @@ pub fn Values(comptime config: Config) type {
             switch (column.data_type) {
                 .mysql_bigint_unsigned => if (mysqlUnsignedValue(&value.numeric) == null) return error.IntegerOverflow,
                 .varchar => if (!character.fits(value.text.slice(), column.typmod)) return error.StringDataRightTruncation,
-                .bpchar => if (!character.fits(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,
+                .bpchar => if (!character.fitsBpchar(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bit, .varbit => {
                     _ = try bit_string.coercedLength(value.bits.len, column.typmod, column.data_type == .bit, .implicit);
                 },

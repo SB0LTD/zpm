@@ -351,7 +351,7 @@ pub fn Parser(comptime config: types.Config) type {
             try self.advance();
             if (self.current.kind == .end) return null;
             const name = try self.identifier();
-            if (!typeWord(self.current)) {
+            if (!typeWord(self.current) and !self.internalCharName() and !(try self.internalCharQualifier())) {
                 if (self.current.kind == .word or self.current.kind == .quoted_word) return error.UnsupportedStatement;
                 return error.Syntax;
             }
@@ -1647,6 +1647,14 @@ pub fn Parser(comptime config: types.Config) type {
             const type_name = try lookahead.next();
             return wordIs(self.source, type_name, "char") or
                 (type_name.kind == .quoted_word and types.same(type_name.raw(self.source), "char"));
+        }
+
+        fn internalCharLiteral(self: *Self) Error!bool {
+            if (self.internalCharName()) return (try self.peek()).kind == .string;
+            if (!(try self.internalCharQualifier())) return false;
+            var lookahead = self.after_peek;
+            _ = try lookahead.next();
+            return (try lookahead.next()).kind == .string;
         }
 
         fn typeName(self: *Self) Error!TypeSpec {
@@ -4592,8 +4600,8 @@ pub fn Parser(comptime config: types.Config) type {
                 .end => return error.Syntax,
                 .word, .quoted_word => {},
             }
-            if (self.internalCharName() and (try self.peek()).kind == .string) {
-                try self.advance();
+            if (try self.internalCharLiteral()) {
+                _ = try self.typeName();
                 const literal = self.current;
                 try self.advance();
                 const inner = try self.pool.add(.{ .kind = .text_literal, .text = literal.quoted() });

@@ -186,13 +186,13 @@ pub fn bitType(ty: Type) bool {
 /// pg_cast entries of the B11 types; null when the pair is not one of them.
 fn extendedCast(from: Type, to: Type, context: Context) ?bool {
     if (to == .pg_internal_char) return switch (from) {
-        .int4 => context == .explicit,
+        .int4, .name => context == .explicit,
         .text, .varchar, .bpchar => context != .implicit,
         else => false,
     };
     if (from == .pg_internal_char) return switch (to) {
         .text => true,
-        .varchar, .bpchar => context != .implicit,
+        .varchar, .bpchar, .name => context != .implicit,
         .int4 => context == .explicit,
         else => false,
     };
@@ -513,7 +513,10 @@ pub fn Io(comptime config: types.Config) type {
                     try J.render(value.slice(), 0, &out);
                     break :blk buffer[0..out.len];
                 },
-                .bpchar => |*value| copy(buffer, value.slice()),
+                .bpchar => |*value| if (value.len != 0 and value.bytes[0] == 0)
+                    buffer[0..0]
+                else
+                    copy(buffer, value.slice()),
                 .uuid => |*value| uuid.format(value, buffer),
                 .bytea => |*value| bytea.format(value.slice(), buffer),
                 .time => |value| time_of_day.format(value, buffer),
@@ -837,6 +840,7 @@ pub fn Io(comptime config: types.Config) type {
             if (from == to and typmod < 0) return cell;
             if (cell == .pg_internal_char) {
                 if (to == .int4) return .{ .integer = @as(i8, @bitCast(cell.pg_internal_char)) };
+                if (to == .bpchar) return characterCell(&.{cell.pg_internal_char}, .bpchar, typmod, .explicit);
                 if (!characterType(to)) return error.CannotCoerce;
                 var buffer: [4]u8 = undefined;
                 return cast(try textCell(try format(&cell, true, session, &buffer)), .text, to, typmod, session);
