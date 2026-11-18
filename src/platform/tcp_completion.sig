@@ -109,6 +109,11 @@ pub fn Queue(comptime capacity: usize) type {
             return true;
         }
 
+        /// Pollable completion descriptor. The queue keeps ownership of it.
+        pub fn descriptor(self: *const Self) linux.fd_t {
+            return if (self.ring) |*ring| ring.fd else -1;
+        }
+
         pub fn submit(self: *Self) !u32 {
             const ring = if (self.ring) |*ring| ring else return error.SocketRingClosed;
             return ring.submit();

@@ -51,6 +51,7 @@ fn loopback(q: *Queue) !void {
     try q.receive(0, server, &buf);
     _ = try q.submit();
     try check((try tcp.send(peer,"native")) == 6);
+    try check(try tcp.wait(q.descriptor(), &.{}, &ready, &ready, 1000));
     const received_request = try next(q);
     try check(received_request.outcome == .bytes and received_request.outcome.bytes == 6 and std.mem.eql(u8,buf[0..6],"native"));
     try q.send(0, server, "completed");
