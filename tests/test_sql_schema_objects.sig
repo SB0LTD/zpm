@@ -1331,6 +1331,38 @@ fn partitionAncestorCatalog() !void {
     try sameState(&.{ targets, names, ordinality, incoming_form });
 }
 
+fn arraySubqueries() !void {
+    reset();
+    try expect("SELECT ARRAY(SELECT 7 WHERE false)::text", "{}");
+    try expect("SELECT ARRAY(VALUES ('label'), (NULL))::text", "{label,NULL}");
+    try expect("SELECT ARRAY(VALUES (ARRAY[1,2]), (ARRAY[3,NULL]))::text", "{{1,2},{3,NULL}}");
+    try rejects("SELECT ARRAY(VALUES (NULL::int[]))", error.NullValueNotAllowed, "SELECT ARRAY(VALUES (1))::text", "{1}");
+    try rejects("SELECT ARRAY(VALUES (ARRAY[1]), (ARRAY[2,3]))", error.ArraySubscriptError, "SELECT ARRAY(VALUES (2))::text", "{2}");
+    try rejects("SELECT ARRAY(SELECT 1,2)", error.Syntax, "SELECT ARRAY(VALUES (3))::text", "{3}");
+    try run("CREATE TABLE g (id INT PRIMARY KEY)");
+    try run("CREATE TABLE entries (group_id INT, value INT)");
+    try run("INSERT INTO g VALUES (1), (2), (3)");
+    try run("INSERT INTO entries VALUES (1,30), (1,10), (2,NULL), (2,20)");
+    const correlated = "SELECT id, ARRAY(SELECT value FROM entries e WHERE e.group_id = g.id ORDER BY value)::text FROM g ORDER BY id";
+    try expect(correlated, "1|{10,30};2|{20,NULL};3|{}");
+    try sameState(&.{correlated});
+}
+
+fn policyDiscovery() !void {
+    reset();
+    try run("CREATE TABLE tooling(id INT PRIMARY KEY, label TEXT)");
+    try run("CREATE ROLE tool_reader");
+    try run("CREATE POLICY active ON tooling FOR SELECT TO tool_reader USING (id > 0)");
+    try run("CREATE POLICY open_write ON tooling FOR INSERT WITH CHECK (id > 1)");
+    const policies = "SELECT pol.polname, pol.polpermissive," ++
+        " CASE WHEN pol.polroles = '{0}' THEN NULL ELSE pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles where oid = any (pol.polroles) order by 1),',') END," ++
+        " pg_catalog.pg_get_expr(pol.polqual, pol.polrelid), pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid)," ++
+        " CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT' WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE' END AS cmd" ++
+        " FROM pg_catalog.pg_policy pol WHERE pol.polrelid = '16384' ORDER BY 1";
+    try expect(policies, "active|t|tool_reader|(id > 0)|NULL|SELECT;open_write|t|NULL|NULL|(id > 1)|INSERT");
+    try sameState(&.{policies});
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1350,5 +1382,7 @@ pub fn main() !void {
     try indexDefinitionCatalog();
     try constraintDefinitionCatalog();
     try partitionAncestorCatalog();
+    try arraySubqueries();
+    try policyDiscovery();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

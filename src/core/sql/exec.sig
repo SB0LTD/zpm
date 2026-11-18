@@ -15,6 +15,7 @@ const aggregate_stats = @import("aggregates_stat.sig");
 const numeric_module = @import("numeric.sig");
 const tablesample = @import("tablesample.sig");
 const collect_module = @import("aggregates_collect.sig");
+const array_module = @import("array.sig");
 const json_eval = @import("json_eval.sig");
 const temporal = @import("temporal.sig");
 const builtin = @import("builtin");
@@ -4757,6 +4758,47 @@ pub fn Exec(comptime config: types.Config) type {
 
             // ---- subqueries --------------------------------------------
 
+            fn arrayFromSubquery(self: *Query, list: List, element_type: types.Type) Error!V.Cell {
+                const nested = types.elementType(element_type);
+                const offsets = self.handles(list);
+                var layout: array_module.Shape = .{ .element = types.dataTypeOf(nested orelse element_type) };
+                var inner: array_module.Shape = .{};
+                if (offsets.len != 0) {
+                    layout.ndim = 1;
+                    layout.dims[0] = @intCast(offsets.len);
+                    if (nested != null) {
+                        const first = &self.work.cells[offsets[0]];
+                        if (first.* == .null_value) return error.NullValueNotAllowed;
+                        inner = V.Arrays.shape(first.array.slice());
+                        if (inner.ndim == 0) return error.ArraySubscriptError;
+                        if (inner.ndim == array_module.max_dims) return error.ProgramLimitExceeded;
+                        layout.ndim += inner.ndim;
+                        @memcpy(layout.dims[1..layout.ndim], inner.dims[0..inner.ndim]);
+                        @memcpy(layout.lbounds[1..layout.ndim], inner.lbounds[0..inner.ndim]);
+                    }
+                }
+                var result: V.Text = .{};
+                var writer = try V.Arrays.Writer.begin(&result, &layout);
+                for (offsets) |offset| {
+                    try self.session.checkpoint();
+                    const cell = &self.work.cells[offset];
+                    if (nested == null) {
+                        try writer.append(cell);
+                    } else {
+                        if (cell.* == .null_value) return error.NullValueNotAllowed;
+                        const shape = V.Arrays.shape(cell.array.slice());
+                        if (shape.ndim != inner.ndim) return error.ArraySubscriptError;
+                        for (0..shape.ndim) |dim| {
+                            if (shape.dims[dim] != inner.dims[dim] or shape.lbounds[dim] != inner.lbounds[dim]) return error.ArraySubscriptError;
+                        }
+                        var reader = V.Arrays.Reader.init(cell.array.slice());
+                        var value: V.Cell = undefined;
+                        while (reader.next(&value)) try writer.append(&value);
+                    }
+                }
+                return .{ .array = result };
+            }
+
             fn subquery(ptr: *anyopaque, ctx: *const E.Context, id: u16) Error!V.Cell {
                 const self: *Query = @ptrCast(@alignCast(ptr));
                 const n = &self.pool.nodes[id];
@@ -4778,6 +4820,7 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 switch (n.kind) {
                     .scalar_subquery => {
+                        if (n.func == .array_subquery) return self.arrayFromSubquery(list, p.tys[0]);
                         if (list.count > 1) return error.CardinalityViolation;
                         if (list.count == 0) return .null_value;
                         return self.row(self.handles(list)[0])[0];
