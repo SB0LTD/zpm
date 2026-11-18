@@ -16,9 +16,12 @@
 //! - render: the renderer itself. A draw from the driver's queue is read,
 //!   converted and handed to the engine; what it cannot carry out is left
 //!   out and said. `render.install` puts it in place.
+//! - recompile: a game's shader machine code (AMD gfx10) turned into the
+//!   engine's shader IR (KIR). A first cut: straight-line code, no
+//!   branches. This is the `render.shade` seam's answer, once wired.
 //!
-//! Not yet: the shaders' machine code recompiled (`render.shade` is
-//! where that plugs in), so no game's draw is drawn.
+//! Not yet: `recompile` is not wired to `render.shade`, so no game's
+//! draw is drawn yet; and shaders with branches or loops are refused.
 //!
 //! Allocation-free.
 
@@ -26,10 +29,12 @@ pub const state = @import("state.sig");
 pub const draw = @import("draw.sig");
 pub const target = @import("target.sig");
 pub const render = @import("render.sig");
+pub const recompile = @import("recompile.sig");
 
 test {
     _ = state;
     _ = draw;
     _ = target;
     _ = render;
+    _ = recompile;
 }
