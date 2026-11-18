@@ -832,6 +832,12 @@ fn explicitPrimaryIdentity() !void {
     std.mem.writeInt(u32, encoded[used..][0..4], alias, .little);
     if (fresh.applyChangeRecord(explicit[0 .. explicit.len - 1], &scratch)) |_| return error.ShortPrimaryAliasAccepted else |err| try check(err == error.InvalidChangeRecord);
     forged.createTable(alias, "existing", false);
+    const collision = forged.record()[8..];
+    @memcpy(encoded[explicit.len..][0..collision.len], collision);
+    std.mem.writeInt(u32, encoded[4..8], 2, .little);
+    if (fresh.applyChangeRecord(encoded[0 .. explicit.len + collision.len], &scratch)) |_| return error.PrimaryAliasCollisionAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try check(fresh.csn == 0 and fresh.oid_counter == 0 and fresh.tableCount() == 0);
+    std.mem.writeInt(u32, encoded[4..8], 1, .little);
     try restored.applyChangeRecord(forged.record(), &scratch);
     if (restored.applyChangeRecord(explicit, &scratch)) |_| return error.PrimaryAliasCollisionAccepted else |err| try check(err == error.ChangeRecordConflict);
     try check(restored.csn == 1 and restored.tableCount() == 1 and restored.oid_counter == alias + 1 - oid);
