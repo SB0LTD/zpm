@@ -8,9 +8,9 @@
 //! path is keyed on query text. The assertion counter proves this suite ran.
 const std = @import("std");
 const sql = @import("sql");
-// Catalog views are materialized in the query workspace before filtering;
-// work_rows must hold every built-in pg_type row (more than rows_per_table).
-const DB = sql.Database(.{ .tables = 2, .columns = 6, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .work_rows = 128 });
+// Catalog views share the query workspace with the correlated collation
+// lookup. Provision both sources and the nested join in this fixture.
+const DB = sql.Database(.{ .tables = 2, .columns = 6, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .work_rows = 512 });
 var assertions: usize = 0;
 var db: DB = .{};
 
