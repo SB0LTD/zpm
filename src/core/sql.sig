@@ -178,7 +178,7 @@ pub const ControlText = struct {
     }
 };
 
-pub const SettingValueKind = enum { default, word, string, number };
+pub const SettingValueKind = enum { default, word, string, number, configuration_text };
 
 /// A decoded transaction-control or session command (store-executed).
 pub const Control = union(enum) {
@@ -852,7 +852,7 @@ pub fn Database(comptime config: Config) type {
             return false;
         }
 
-        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement, role: u32) Error![]const u8 {
+        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement, role: u32, public_schema_on_path: bool) Error![]const u8 {
             // Privileges and row security apply to roles other than superusers (B11 wave 3).
             const privileged = role == CO.bootstrap_role or db.catalog_objects.superuser(role, snap);
             const tables = &db.tables;
@@ -864,7 +864,8 @@ pub fn Database(comptime config: Config) type {
             if (bound_statement.* == .refresh_view) {
                 const refresh = &bound_statement.refresh_view;
                 const schema_name = if (refresh.name.schema) |qualifier| identName(source, qualifier) else Name{};
-                if (namespaceFor(catalog, if (refresh.name.schema != null) schema_name.slice() else null, snap)) |namespace| {
+                const namespace_oid = if (refresh.name.schema != null or public_schema_on_path) namespaceFor(catalog, if (refresh.name.schema != null) schema_name.slice() else null, snap) else null;
+                if (namespace_oid) |namespace| {
                     if (catalog.findIn(namespace, identName(source, refresh.name.name).slice(), snap)) |found| {
                         if (found.kind == 'm') refresh.query = try appendQuery(workspace, &length, source, tables[found.slot].query.slice());
                     }
@@ -889,6 +890,7 @@ pub fn Database(comptime config: Config) type {
                         if (view == .pg_authid and !privileged) return error.InsufficientPrivilege;
                         continue;
                     }
+                    if (item.schema == null and !public_schema_on_path and item.name.span.start < source.len) continue;
                     const namespace = namespaceFor(catalog, if (item.schema != null) schema_name.slice() else null, snap) orelse continue;
                     const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
                     // Items the statement names (not view or expansion texts).
@@ -1078,14 +1080,14 @@ pub fn Database(comptime config: Config) type {
                 self.session.sequences=null;
                 var parsed=try P.parseWithOptions(source,&self.workspace.nodes,.{.dialect=self.dialect});
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
-                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role);
+                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role,self.session.public_schema_on_path);
                 try self.session.checkpoint();
                 for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
                     .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,.params=params,
-                    .user_type_catalog=&db.catalog_objects};
+                    .user_type_catalog=&db.catalog_objects,.stored_source_start=source.len};
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
@@ -2568,9 +2570,10 @@ pub fn Database(comptime config: Config) type {
                 return self.catalogObject(slot, original, &parsed.catalog_object, snap);
             }
             var statement_copy = parsed.*;
-            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role);
+            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, self.session.public_schema_on_path);
             const source = try self.secureTarget(&statement_copy, expanded, original, snap);
             var context = self.bindContext(source, mode, snap);
+            context.stored_source_start = original.len;
             if (explain) |options| context.describe_only = !options.analyze;
             if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
             const bound = try B.bind(&context, &statement_copy);
@@ -3327,6 +3330,7 @@ pub fn Database(comptime config: Config) type {
         /// A table, view or materialized view named by a catalog-object
         /// statement (42P01), locked in `mode`; null with IF EXISTS.
         fn objectTable(self: *Self, slot: u16, source: []const u8, name: CO.Qualified, mode: locks_module.TableMode, snap: Snapshot) Error!usize {
+            if (!name.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
             const schema_name = if (name.has_schema) objectName(source, name.schema) else Name{};
             const namespace = namespaceFor(&self.catalog, if (name.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
             const found = self.catalog.findIn(namespace, objectName(source, name.name).slice(), snap) orelse return error.TableNotFound;
@@ -3458,6 +3462,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn typeNamespace(self: *const Self, source: []const u8, name: CO.Qualified, snap: Snapshot) Error!u32 {
+            if (!name.has_schema and !self.session.public_schema_on_path) return error.UndefinedSchema;
             const schema = if (name.has_schema) objectName(source, name.schema) else Name{};
             return namespaceFor(&self.catalog, if (name.has_schema) schema.slice() else null, snap) orelse error.UndefinedSchema;
         }
@@ -4016,6 +4021,7 @@ pub fn Database(comptime config: Config) type {
                     }
                 },
                 .sequence => {
+                    if (!comment.object.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
                     const schema_name = if (comment.object.has_schema) objectName(source, comment.object.schema) else Name{};
                     const namespace = namespaceFor(&self.catalog, if (comment.object.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
                     const found = self.catalog.findIn(namespace, objectName(source, comment.object.name).slice(), snap) orelse return error.TableNotFound;
@@ -4410,6 +4416,7 @@ pub fn Database(comptime config: Config) type {
                 .delete => |*delete| .{ .schema = delete.schema, .table = delete.table, .where = &delete.where, .command = .delete, .reads = delete.where != ast.none or delete.returning.count != 0 },
                 else => return source,
             };
+            if (goal.schema == null and !self.session.public_schema_on_path) return source;
             const schema_name = if (goal.schema) |qualifier| identName(source, qualifier) else Name{};
             const namespace = namespaceFor(&self.catalog, if (goal.schema != null) schema_name.slice() else null, snap) orelse return source;
             const found = self.catalog.findIn(namespace, identName(source, goal.table).slice(), snap) orelse return source;
@@ -4809,13 +4816,8 @@ pub fn Database(comptime config: Config) type {
             session.forget(copy.oid);
         }
 
-        /// regclass text input: optional `public.` qualifier, quoted names
-        /// keep case, unquoted names fold to lower case.
         fn sequenceByName(self: *const Self, text: []const u8) Error!usize {
-            const name = regclassName(text) orelse return error.TableNotFound;
-            const found = self.catalog.find(name.slice(), self.seq_snap) orelse return error.TableNotFound;
-            if (found.kind != 'S') return error.WrongObjectType;
-            return found.slot;
+            return self.sequenceByOid(@intCast(try self.regclassOid(text, true)));
         }
 
         fn sequenceByOid(self: *const Self, oid: u32) Error!usize {
@@ -4836,24 +4838,6 @@ pub fn Database(comptime config: Config) type {
                 if (byte == '.' and !quoted) return index;
             }
             return null;
-        }
-
-        fn regclassName(text: []const u8) ?Name {
-            var raw = text;
-            while (raw.len != 0 and (raw[0] == ' ' or raw[0] == '\t')) raw = raw[1..];
-            while (raw.len != 0 and (raw[raw.len - 1] == ' ' or raw[raw.len - 1] == '\t')) raw = raw[0 .. raw.len - 1];
-            if (raw.len > 7 and types.keyword(raw[0..7], "public.")) raw = raw[7..];
-            var name: Name = .{};
-            if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') {
-                raw = raw[1 .. raw.len - 1];
-                if (raw.len > config.name_bytes) return null;
-                @memcpy(name.bytes[0..raw.len], raw);
-            } else {
-                if (raw.len > config.name_bytes) return null;
-                for (raw, 0..) |byte, position| name.bytes[position] = types.lower(byte);
-            }
-            name.len = raw.len;
-            return name;
         }
 
         fn numericRegOid(text: []const u8) Error!?u32 {
@@ -4880,6 +4864,7 @@ pub fn Database(comptime config: Config) type {
             }
             const name = namespaceIdentifier(std.mem.trim(u8, text, whitespace)) catch return missing;
             if (self.regclassIn(catalog_module.catalog_namespace, name.slice())) |oid| return oid;
+            if (!self.session.public_schema_on_path) return missing;
             return if (self.regclassIn(catalog_module.public_namespace, name.slice())) |oid| oid else missing;
         }
 
@@ -5045,7 +5030,7 @@ pub fn Database(comptime config: Config) type {
         fn inRelationSearchPath(self: *const Self, namespace: u32, name: []const u8) bool {
             // The supported relation path resolves pg_catalog before public.
             return namespace == catalog_module.catalog_namespace or
-                (namespace == catalog_module.public_namespace and self.catalog.findSystemView(null, name) == null);
+                (self.session.public_schema_on_path and namespace == catalog_module.public_namespace and self.catalog.findSystemView(null, name) == null);
         }
 
         fn relationVisible(ptr: *anyopaque, oid: u32) ?bool {
@@ -8348,10 +8333,11 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// search_path as PostgreSQL flattens it (GUC_LIST_QUOTE). Name
-        /// resolution here is fixed (pg_catalog, then public), so only lists
-        /// that resolve the same way are accepted: `public` plus any of
-        /// "$user", pg_catalog and pg_temp (0A000 otherwise).
+        /// resolution supports the default public path and an empty explicit
+        /// path. Additional schema orderings require resolver support.
         fn searchPath(raw: []const u8, kind: SettingValueKind, out: *Sess.SettingText) Error!void {
+            if (kind == .configuration_text and std.mem.trim(u8, raw, " \t\r\n").len == 0) return out.set("");
+            if (kind == .string and raw.len == 0) return out.set("\"\"");
             var buffer: [config.setting_bytes]u8 = undefined;
             var used: usize = 0;
             var public = false;
@@ -8546,6 +8532,7 @@ pub fn Database(comptime config: Config) type {
             const state = self.session_state orelse &self.default_session_state;
             self.session.session_role = state.session_role;
             self.session.role = if (state.values.role != 0) state.values.role else state.session_role;
+            self.session.public_schema_on_path = state.values.publicSchemaOnPath();
         }
 
         /// RESET ALL of the engine settings (transaction modes excepted).
@@ -8872,6 +8859,7 @@ pub fn Database(comptime config: Config) type {
                 .access_exclusive => .access_exclusive,
             };
             for (lock.tables[0..lock.count], lock.only[0..lock.count]) |reference, only| {
+                if (reference.schema == null and !self.session.public_schema_on_path) return error.TableNotFound;
                 const schema_name = if (reference.schema) |qualifier| identName(source, qualifier) else Name{};
                 const namespace = namespaceFor(&self.catalog, if (reference.schema != null) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
                 const found = self.catalog.findIn(namespace, identName(source, reference.name).slice(), snap) orelse return error.TableNotFound;
@@ -9008,8 +8996,9 @@ pub fn Database(comptime config: Config) type {
             defer self.active_params = null;
             var copy = inner;
             // Parse analysis checks no privileges (EXECUTE does).
-            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy, CO.bootstrap_role);
+            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy, CO.bootstrap_role, self.session.public_schema_on_path);
             var context = self.bindContext(expanded, mode, snap);
+            context.stored_source_start = text.len;
             context.describe_only = true;
             _ = try B.bind(&context, &copy);
             const entry = &state.prepared[index];
@@ -9079,7 +9068,9 @@ pub fn Database(comptime config: Config) type {
                 .set_config => {
                     if (a.len == 0) return error.InvalidParameterValue;
                     self.saveStatementSettings(slot);
-                    try self.setSetting(slot, flags & 1 != 0, a, if (flags & 2 != 0) .default else .string, b);
+                    const form: SettingValueKind = if (flags & 2 != 0) .default else if (Sess.sameInsensitive(a, "search_path")) .configuration_text else .string;
+                    try self.setSetting(slot, flags & 1 != 0, a, form, b);
+                    self.installRole();
                     return .{ .len = try self.settingText(slot, a, out) };
                 },
                 .advisory_try_lock, .advisory_unlock => {
@@ -9280,8 +9271,9 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
             // Routine statements run with the invoker's privileges (SECURITY INVOKER).
-            const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role);
-            const context = self.bindContext(source, .standard, snap);
+            const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role, self.session.public_schema_on_path);
+            var context = self.bindContext(source, .standard, snap);
+            context.stored_source_start = text.len;
             const bound = try B.bind(&context, parsed);
             const root = switch (bound) {
                 .query => |root| root,
@@ -9549,8 +9541,9 @@ pub fn Database(comptime config: Config) type {
                 frame.variables.node_high = self.workspace.nodes.len;
                 self.routine_frame = frame;
                 // Body analysis checks no privileges (calls do).
-                const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role);
-                const context = self.bindContext(source, .standard, snap);
+                const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role, self.session.public_schema_on_path);
+                var context = self.bindContext(source, .standard, snap);
+                context.stored_source_start = text.len;
                 const bound = try B.bind(&context, &parsed);
                 self.routine_frame = saved_frame;
                 switch (bound) {
@@ -10058,6 +10051,7 @@ pub fn Database(comptime config: Config) type {
 
         /// A table or view named by a trigger / rule statement.
         fn namedTable(self: *Self, name: *const R.TableName, snap: Snapshot) Error!usize {
+            if (name.schema.len == 0 and !self.session.public_schema_on_path) return error.TableNotFound;
             const namespace = namespaceFor(&self.catalog, if (name.schema.len != 0) name.schema.slice() else null, snap) orelse return error.UndefinedSchema;
             const found = self.catalog.findIn(namespace, name.name.slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
@@ -10549,8 +10543,9 @@ pub fn Database(comptime config: Config) type {
             }
             var statement_copy = parsed;
             // Describing checks no privileges (execution does), as parse analysis.
-            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role);
+            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role, self.session.public_schema_on_path);
             var context = self.bindContext(expanded, .standard, snap);
+            context.stored_source_start = source.len;
             context.describe_only=true;
             if (parsed == .select) context.user_type_catalog = &self.catalog_objects;
             const bound = try B.bind(&context, &statement_copy);

@@ -1527,6 +1527,41 @@ fn regclassIdentities() !void {
     try sameState(&.{ resolution, names });
 }
 
+fn emptySearchPath() !void {
+    reset();
+    try run("CREATE TABLE base_path(id INT PRIMARY KEY)");
+    try run("INSERT INTO base_path VALUES (1)");
+    try run("CREATE VIEW stored_path AS SELECT id FROM base_path");
+    try run("CREATE SEQUENCE seq_path");
+    const public_source = "SELECT id FROM public.stored_path ORDER BY id";
+    const scope = "SELECT current_setting('search_path'), current_schema()::text, to_regclass('base_path') IS NULL, to_regclass('pg_class')::oid";
+    try expect(scope, "\"$user\", public|public|f|1259");
+    try expect("SELECT pg_catalog.set_config('search_path','',false)", "");
+    try expect(scope, "|NULL|t|1259");
+    try expect(public_source, "1");
+    try expect("SELECT pg_table_is_visible('public.base_path'::regclass), 'public.base_path'::regclass::text", "f|public.base_path");
+    try expect("WITH mock AS (SELECT 7 AS id) SELECT id FROM mock", "7");
+    try expect("SELECT nextval('public.seq_path')", "1");
+    try expect("SELECT relname FROM pg_class WHERE relname='base_path'", "base_path");
+    try rejects("SELECT id FROM base_path", error.TableNotFound, public_source, "1");
+    try rejects("INSERT INTO base_path VALUES (3)", error.TableNotFound, public_source, "1");
+    try rejects("CREATE TABLE missing_schema(id INT)", error.UndefinedSchema, public_source, "1");
+    try rejects("SELECT nextval('seq_path')", error.TableNotFound, public_source, "1");
+    try run("INSERT INTO public.base_path VALUES (2)");
+    try expect(public_source, "1;2");
+    try expect("SELECT pg_catalog.set_config('search_path','public',false)", "public");
+    try expect("SELECT id FROM base_path ORDER BY id", "1;2");
+    const slot = try db.begin();
+    try statement(slot, "SET LOCAL search_path TO ''");
+    var inner: DB.Result = .{};
+    try db.statement(slot, scope, &inner, .{});
+    try same(try render(&inner), "\"\"|NULL|t|1259");
+    db.abort(slot);
+    try expect(scope, "public|public|f|1259");
+    try expect("RESET search_path", "");
+    try expect(scope, "\"$user\", public|public|f|1259");
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1554,5 +1589,6 @@ pub fn main() !void {
     try partitionDefinitions();
     try qualifiedCatalogCasts();
     try regclassIdentities();
+    try emptySearchPath();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

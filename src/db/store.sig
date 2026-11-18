@@ -751,8 +751,12 @@ pub fn Store(comptime Raw: type) type {
             /// A caller using named-zone operations must provide a read-safe
             /// resolver or keep those operations on the serialized path.
             pub fn detachedReadSession(self:*const Connection,execution_control:*ExecutionControl,statement_us:?i64) Raw.SessionValues {
-                return .{.zone=self.settings.zone,.transaction_us=statement_us,.statement_us=statement_us,
+                var session: Raw.SessionValues = .{.zone=self.settings.zone,.transaction_us=statement_us,.statement_us=statement_us,
                     .clock=self.store.wall_clock,.database=if(self.database_len==0) "postgres" else self.database_name[0..self.database_len],.control=execution_control};
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "public_schema_on_path")) {
+                    session.public_schema_on_path = self.engine_session.values.publicSchemaOnPath();
+                }
+                return session;
             }
 
             fn detachedCacheProfile(self: *const Connection) bool {
