@@ -1093,10 +1093,10 @@ pub const Characteristics = struct {
 };
 
 /// A configuration parameter name: an identifier, or the special SQL forms
-/// TIME ZONE and TRANSACTION ISOLATION LEVEL.
+/// TIME ZONE, XML OPTION and TRANSACTION ISOLATION LEVEL.
 pub const SettingName = struct {
     ident: Ident = .{},
-    special: enum { none, time_zone, transaction_isolation } = .none,
+    special: enum { none, time_zone, xml_option, transaction_isolation } = .none,
 };
 
 /// SET value: DEFAULT, LOCAL (TIME ZONE LOCAL), a word, a string literal or

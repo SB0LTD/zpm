@@ -35,6 +35,7 @@ const Type = types.Type;
 pub const Session = struct {
     zone: temporal.Zone = .{},
     resolver: temporal.Resolver = .{},
+    xml_document: bool = false,
     /// PostgreSQL-epoch microseconds (2000-01-01 UTC); null without a clock.
     transaction_us: ?i64 = null,
     statement_us: ?i64 = null,
@@ -610,9 +611,11 @@ pub fn Io(comptime config: types.Config) type {
                 .macaddr => .{ .macaddr = try network.parseMac(input) },
                 .point => .{ .point = try geometric.parsePoint(input) },
                 .box => .{ .box = try geometric.parseBox(input) },
-                // xml_in with xmloption CONTENT.
+                // xml_in: casts and textual input honor the session XML mode.
                 .xml => blk: {
-                    if (!xml.validContent(input)) return error.InvalidXmlContent;
+                    if (session.xml_document) {
+                        if (!xml.validDocument(input)) return error.InvalidXmlDocument;
+                    } else if (!xml.validContent(input)) return error.InvalidXmlContent;
                     break :blk .{ .xml = (try textCell(input)).text };
                 },
                 // jsonpath_in: the canonical text of the parsed path (B11).
