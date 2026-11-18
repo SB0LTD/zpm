@@ -572,7 +572,7 @@ pub fn Database(comptime config: Config) type {
                     for (first..@min(first + stripe_width, self.slots.len)) |index| {
                         const slot = &self.slots[index];
                         if (slot.state != .published or !matches(slot, context, hash, result)) continue;
-                        if (context.session.control) |control| if (control.poll) |poll| try poll(control.context);
+                        if (context.session.control) |execution_control| if (execution_control.poll) |poll| try poll(execution_control.context);
                         const packed_values = self.cells(index);
                         X.writeHeader(select, result);
                         for (result.rows[0..slot.row_count], 0..) |*row, row_index| {

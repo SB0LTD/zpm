@@ -5130,7 +5130,7 @@ pub fn Exec(comptime config: types.Config) type {
             return count;
         }
 
-        pub const projected_cache_columns = @min(config.columns, 4);
+        pub const projected_cache_columns: usize = @min(config.columns, 4);
 
         pub fn cacheableProjectedFilter(pool: *const Ast.Pool, table: *const S.Table, query: *const B.Select,
             snapshot: storage.Snapshot, min_scan_rows: usize) bool {
