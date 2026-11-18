@@ -17,12 +17,20 @@ records, including qualified relation identities and actual lookup under an
 empty search path. The pre-existing transaction and session contract also
 passed 510 assertions. Expression statistics, collection, planner application,
 stable attribute numbers across column drops, and nominal `regclass` wire
-output remain open. Stock `pg_dump` passes the empty search path and stops
-at `pg_is_in_recovery()`. Separately, the qualified idle timeout product
-passes the first timeout setting in the native restore and stops at
-`transaction_timeout`.
+output remain open. In a later combined Windows build, stock `pg_dump`
+passes the empty search path and recovery query, then stops at
+`extra_float_digits`. The unmodified native dump applies the opening
+timeouts, empty path, routine validation mode and XML mode. It next stops at
+`client_min_messages`. The routine differential exposed incorrect session
+ownership during interleaved COMMIT. The corrected Windows Store suite passed
+3,159 assertions, including `SET LOCAL` and `LISTEN` during interleaved
+COMMIT, and the stock routine-setting differential passed. Both timeout
+suites matched native PostgreSQL 18.3 with one and four workers.
+Extended-protocol autocommit still needs the native transaction boundary at Sync.
 [Populated describe and dump audit](https://github.com/SB0LTD/ramsql/actions/runs/44238734316) ·
-[Native idle timeout proof](https://github.com/SB0LTD/ramsql/actions/runs/44238347427)
+[Native idle timeout proof](https://github.com/SB0LTD/ramsql/actions/runs/44238347427) ·
+[Exact combined migration source](https://github.com/SB0LTD/ramsql/commit/a45febfbe08c6fa1214069edb62e4d6375fc215c) ·
+[COMMIT session fix](https://github.com/SB0LTD/zpm/pull/253)
 
 The draft versioned WAL assigns durable table-constraint identities while
 replaying the older definition formats. Checkpoint generation images must
