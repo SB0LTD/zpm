@@ -3512,6 +3512,7 @@ pub fn Binder(comptime config: types.Config) type {
             if(id==none) return true;
             const n=context.node(id);
             if(n.planned_null) return false;
+            if(n.kind==.catalog_tableoid) return false;
             if(n.kind==.column) return (try constantColumn(context,n));
             if(n.kind==.case_expr) {
                 if(n.a!=none and !(try foldableScalar(context,n.a))) return false;
@@ -7219,8 +7220,8 @@ pub fn Binder(comptime config: types.Config) type {
                 n.*=.{.kind=.column,.relation=0,.ty=ty,.next=next};
                 p.windows[p.window_count]=win;p.window_count+=1;return;
             }
-            if(n.kind==.column and n.level==0) {
-                const column=try windowInput(context,input,id);n.relation=0;n.column=column;return;
+            if((n.kind==.column or n.kind==.catalog_tableoid) and n.level==0) {
+                const column=try windowInput(context,input,id);n.kind=.column;n.relation=0;n.column=column;return;
             }
             if(n.kind==.scalar_subquery or n.kind==.exists_subquery or n.kind==.in_subquery) {
                 if(plansOf(context).items[@intCast(n.integer)].correlated) return error.UnsupportedStatement;
