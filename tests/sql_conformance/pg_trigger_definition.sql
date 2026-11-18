@@ -1,6 +1,6 @@
-CREATE TABLE hits(id INT PRIMARY KEY, v INT, "Value Label" INT);
+CREATE TABLE hits(id INT PRIMARY KEY, v INT, "Val L" INT);
 CREATE FUNCTION bump() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.v := NEW.v + 1; RETURN NEW; END$$;
-CREATE TRIGGER "watch""list" BEFORE UPDATE OF "Value Label" OR INSERT ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '');
+CREATE TRIGGER "watch""list" BEFORE UPDATE OF "Val L" OR INSERT ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '');
 SELECT tgname, tgrelid <> 0, tgfoid <> 0, tgtype, tgenabled, tgisinternal, tgnargs, tgparentid
 FROM pg_catalog.pg_trigger WHERE tgname = 'watch"list';
 SELECT pg_catalog.pg_get_triggerdef(oid, true) FROM pg_catalog.pg_trigger WHERE tgname = 'watch"list';
