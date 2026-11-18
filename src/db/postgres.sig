@@ -899,15 +899,6 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         fn beginSimpleBatch(self: *Self, db: *DB, source: []const u8) !void {
             const count = try db.preflightSimpleQueryBatch(source);
-            var boundaries: sql.PostgresStatements = .{ .source = source };
-            while (try boundaries.next()) |span| {
-                const command_source = span.slice(source);
-                var tokens: sql.Tokenizer = .{ .source = command_source, .text_limit = command_source.len };
-                const token = try tokens.next();
-                // COPY FROM takes over the input stream. Its tail must be
-                // handed off to the COPY state before permitting it in a batch.
-                if (token.kind == .word and keyword(token.raw(command_source), "copy")) return error.UnsupportedStatement;
-            }
             try db.beginSimpleQueryBatch();
             self.simple_batch = .{ .remaining = count, .source_length = source.len };
         }
@@ -929,11 +920,18 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const command_source = span.slice(source);
             try db.beginSimpleQueryStep();
             try DB.checkSimpleQueryUtility(command_source);
-            try self.execute(db, command_source);
-            try self.simpleResult(db, w);
+            const copying_out = has_copy and word(command_source, "copy");
+            if (copying_out) {
+                // Preflight checked the grammar and excluded COPY FROM.
+                // The complete CopyOut response is buffered before commit.
+                try self.startCopy(db, command_source, w, null);
+            } else {
+                try self.execute(db, command_source);
+                try self.simpleResult(db, w);
+            }
             const final = self.simple_batch.remaining == 1;
             if (final) try db.finishSimpleQueryBatch(true);
-            try self.command(w, command_source);
+            if (!copying_out) try self.command(w, command_source);
             self.simple_batch.position = boundaries.position;
             self.simple_batch.remaining -= 1;
             if (final) {

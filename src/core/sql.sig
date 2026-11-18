@@ -2515,7 +2515,10 @@ pub fn Database(comptime config: Config) type {
                 var routine: R.Statement = undefined;
                 return R.parse(source, &self.workspace.nodes, &routine);
             }
-            _ = try P.parseTopWithOptions(source, &self.workspace.nodes, options);
+            const parsed = try P.parseTopWithOptions(source, &self.workspace.nodes, options);
+            // COPY FROM STDIN hands off the frontend stream. The codec
+            // needs a separately owned query tail before it can resume a batch.
+            if (parsed == .copy and parsed.copy.direction == .from) return error.UnsupportedStatement;
         }
 
         /// Runs one statement in transaction `slot` as a statement
