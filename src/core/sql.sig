@@ -2451,18 +2451,21 @@ pub fn Database(comptime config: Config) type {
 
         /// Raw grammar pass for an entire PostgreSQL Query message. Reuses the
         /// statement parser's scratch without binding, starting a transaction
-        /// or executing commands. Unsupported grammar remains an execution
-        /// error so it cannot mask a syntax error in a later supported command.
+        /// or executing commands. A statement outside the supported grammar
+        /// fails the batch after checking later statements for syntax errors.
         pub fn preflightPostgresBatch(self: *Self, source: []const u8) Error!usize {
             for (source) |byte| if (byte == 0) return error.Syntax;
             var statements: PostgresStatements = .{ .source = source };
             var count: usize = 0;
+            var unsupported = false;
             while (try statements.next()) |part| {
                 count += 1;
                 self.parsePostgresEnvelope(part.slice(source)) catch |err| {
                     if (err != error.UnsupportedStatement) return err;
+                    unsupported = true;
                 };
             }
+            if (unsupported) return error.UnsupportedStatement;
             return count;
         }
 
@@ -2470,6 +2473,7 @@ pub fn Database(comptime config: Config) type {
             const options: parser_module.Options = .{ .dialect = .postgres };
             if (try P.parseDatabaseCommand(source, options)) |_| return;
             if (R.classify(source) != null) {
+                self.workspace.nodes.reset();
                 var routine: R.Statement = undefined;
                 return R.parse(source, &self.workspace.nodes, &routine);
             }

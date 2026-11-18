@@ -53,8 +53,11 @@ documentation and source and is pending native verification.
 message. It keeps quoted text, nested comments and SQL routine bodies intact.
 `Database.preflightPostgresBatch` checks boundaries and the supported raw
 grammar for the entire message before execution. Catalog resolution and
-execution errors are checked when each command runs. PostgreSQL grammar outside
-the supported SQL subset still requires additional parser coverage.
+execution errors are checked when each command runs. RAMSQL rejects a whole
+batch containing raw syntax outside its supported grammar before running the
+first command. A syntax error in a later recognized command takes precedence.
+This restricts batches that PostgreSQL can parse with commands outside the
+RAMSQL SQL subset.
 
 ## Errors (SQLSTATE)
 
