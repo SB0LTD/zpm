@@ -27,9 +27,10 @@
 //! indirect draw's record, a copy's source. Lists of registers and index
 //! tables are read as the game's CPU wrote them.
 //!
-//! Not here yet: compute queues (the graphics queue is the only one),
-//! draws of several records at once, stream-out, the GDS and constant RAM,
-//! occlusion predicates, semaphores. A packet this does not carry out is
+//! Not here yet: compute queues and dispatches (the graphics queue is the
+//! only one), the draw of several instanced records, the two-target
+//! branch, stream-out, the GDS and constant RAM, occlusion predicates,
+//! semaphores, atomics, copies to or from the GPU's registers. A packet this does not carry out is
 //! named once in the log and stepped over.
 //!
 //! No Sony code: the calls, their arguments and the packets are as open
@@ -585,25 +586,27 @@ fn packet(s: *State, p: pm4.Packet) void {
             if (s.indirect_base == 0 or at & 3 != 0) return refuse();
             // (the record may be one the GPU's own work wrote)
             sync();
-            const rec: [*]align(1) const u32 = @ptrFromInt(at);
-            if (p.op() == OP.DRAW_INDIRECT) {
-                // (vertices, instances, the first vertex, the first instance)
-                toShader(s, b[1], rec[2]);
-                toShader(s, b[2], rec[3]);
-                draw(s, .{ .count = rec[0], .instances = rec[1], .base_vertex = @bitCast(rec[2]), .first_instance = rec[3] });
-            } else {
-                // (indices, instances, the first index, added to each
-                // index, the first instance)
-                toShader(s, b[1], rec[3]);
-                toShader(s, b[2], rec[4]);
-                draw(s, .{
-                    .count = @min(rec[0], s.index_limit -| rec[2]),
-                    .instances = rec[1],
-                    .index_address = s.index_base + @as(u64, rec[2]) * s.index_size,
-                    .index_size = s.index_size,
-                    .base_vertex = @bitCast(rec[3]),
-                    .first_instance = rec[4],
-                });
+            indirectDraw(s, p.op() == OP.DRAW_INDEX_INDIRECT, at, b[1], b[2]);
+        },
+        OP.DRAW_INDIRECT_MULTI, OP.DRAW_INDEX_INDIRECT_MULTI => {
+            // Several records in a row, `stride` bytes apart: a draw each.
+            // The count is the packet's, or less when memory says so.
+            if (b.len != 9) return skip(p);
+            const indexed = p.op() == OP.DRAW_INDEX_INDIRECT_MULTI;
+            const first = s.indirect_base + b[0];
+            const stride = b[7];
+            if (s.indirect_base == 0 or first & 3 != 0 or stride & 3 != 0 or stride < @as(u32, if (indexed) 20 else 16)) return refuse();
+            sync();
+            var count = b[4];
+            if (b[3] & (1 << 30) != 0) {
+                const counted = p.pair(5);
+                if (counted == 0 or counted & 3 != 0) return refuse();
+                count = @min(count, word(counted).*);
+            }
+            for (0..@min(count, MULTI_MOST)) |i| {
+                // (the draw's number, to the shader register that wants it)
+                if (b[3] >> 31 != 0) toShader(s, b[3], @intCast(i));
+                indirectDraw(s, indexed, first + i * stride, b[1], b[2]);
             }
         },
 
@@ -612,6 +615,7 @@ fn packet(s: *State, p: pm4.Packet) void {
         OP.WAIT_REG_MEM => if (b.len == 6) waitMemory(b[0], p.pair(1), b[3], b[4], false) else skip(p),
         OP.WAIT_REG_MEM_64 => if (b.len == 8) waitMemory(b[0], p.pair(1), p.pair(3), p.pair(5), true) else skip(p),
         OP.COPY_DATA => copyData(s, p),
+        OP.COND_WRITE => condWrite(p),
         OP.DMA_DATA => dmaData(p),
         OP.SET_PREDICATION => predication(s, p),
         else => skip(p),
@@ -620,6 +624,51 @@ fn packet(s: *State, p: pm4.Packet) void {
 
 fn refuse() void {
     stats.refused += 1;
+}
+
+/// Draws one packet may make (a count read from memory that is garbage
+/// does not hold the queue for ever).
+const MULTI_MOST = 1 << 20;
+
+/// One indirect draw: its record at `at`, its base vertex and first
+/// instance given to the shader registers the packet names.
+fn indirectDraw(s: *State, indexed: bool, at: u64, vertex_register: u32, instance_register: u32) void {
+    const rec: [*]align(1) const u32 = @ptrFromInt(at);
+    if (!indexed) {
+        // (vertices, instances, the first vertex, the first instance)
+        toShader(s, vertex_register, rec[2]);
+        toShader(s, instance_register, rec[3]);
+        draw(s, .{ .count = rec[0], .instances = rec[1], .base_vertex = @bitCast(rec[2]), .first_instance = rec[3] });
+    } else {
+        // (indices, instances, the first index, added to each index, the
+        // first instance)
+        toShader(s, vertex_register, rec[3]);
+        toShader(s, instance_register, rec[4]);
+        draw(s, .{
+            .count = @min(rec[0], s.index_limit -| rec[2]),
+            .instances = rec[1],
+            .index_address = s.index_base + @as(u64, rec[2]) * s.index_size,
+            .index_size = s.index_size,
+            .base_vertex = @bitCast(rec[3]),
+            .first_instance = rec[4],
+        });
+    }
+}
+
+/// COND_WRITE: a word written to memory if another word of memory, masked,
+/// compares as asked with a reference. (Registers, on either side: not
+/// carried out.)
+fn condWrite(p: pm4.Packet) void {
+    const b = p.body;
+    if (b.len != 8) return skip(p);
+    if (b[0] & (1 << 4) == 0 or b[0] >> 8 & 3 != 1) return skip(p);
+    const look = p.pair(1) & ~@as(u64, 3);
+    const to = p.pair(5);
+    if (look == 0 or to == 0 or to & 3 != 0) return refuse();
+    sync();
+    if (!compare(b[0], word(look).* & b[4], b[3])) return;
+    word(to).* = b[7];
+    stats.labels += 1;
 }
 
 fn setRegisters(s: *State, bk: pm4.Bank, offset: u32, values: []const u32) void {
@@ -708,7 +757,9 @@ fn writeData(s: *State, p: pm4.Packet) void {
         if (reg.bank != .uc or reg.offset < 0x340 or reg.offset > 0x347) return refuse();
         return setRegisters(s, .uc, reg.offset, data[0..@min(data.len, 0x348 - reg.offset)]);
     }
-    if (destination == 4 or destination > 5) return skip(p);
+    // (3 is the GDS, where the packet's address is an offset into a store
+    // this driver does not have: not a place in memory)
+    if (destination == 3 or destination == 4 or destination > 5) return skip(p);
     const address = p.pair(1);
     if (address == 0 or address & 3 != 0) return refuse();
     sync();
@@ -837,6 +888,10 @@ fn dmaData(p: pm4.Packet) void {
     // (nowhere: the GPU is only asked to bring the bytes near)
     if (destination == 2) return;
     if (destination == 1 or source == 1) return skip(p);
+    // (bits 26 and 27: the source or the destination is the GPU's
+    // registers, and its "address" a register's; 28 and 29: an address
+    // that does not move on. None of the four is carried out)
+    if (b[5] >> 26 & 0xF != 0) return skip(p);
     const to = p.pair(3);
     if (to == 0) return refuse();
     sync();
@@ -1326,7 +1381,7 @@ test "indirect draws: the record read after the renderer finished, its numbers g
     Testing.reset();
     var records = [_]u32{ 0, 0, 30, 2, 5, 9, 12, 3, 1, -%@as(u32, 4), 6 };
     var indices = [_]u16{0} ** 16;
-    var words: [64]u32 = undefined;
+    var words: [96]u32 = undefined;
     var w = pm4.Writer{ .words = &words };
     _ = w.put(OP.SET_BASE, 0, &.{ 1, lo(&records), hi(&records) });
     // Vertices: the record at byte 8; the base vertex into shader
@@ -1340,19 +1395,40 @@ test "indirect draws: the record read after the renderer finished, its numbers g
     // and a draw from an offset cannot run past what the buffer holds.
     _ = w.setRegisters(.uc, UC.INDEX_TYPE, &.{1});
     _ = w.put(OP.DRAW_INDEX_OFFSET_2, 0, &.{ 1, 3, 100, 0 });
+    // Several records by one packet: three of them 16 bytes apart from
+    // byte 8 (of which memory says only two), each draw's number given to
+    // shader register 0x8E.
+    var only: u32 = 2;
+    _ = w.put(OP.DRAW_INDIRECT_MULTI, 0, &.{ 8, 0x8C, 0x8D, 0x8E | 1 << 30 | 1 << 31, 3, lo(&only), hi(&only), 16, 2 });
+    // What is not carried out is said, not misread: a copy from the GPU's
+    // registers, words for the GDS.
+    var sink = [_]u32{0} ** 2;
+    _ = w.put(OP.DMA_DATA, 0, &.{ 0, 0xC148, 0, lo(&sink), hi(&sink), 4 | 1 << 26 });
+    _ = w.put(OP.WRITE_DATA, 0, &.{ 3 << 8, 0x40, 0, 7 });
+    // A word written when another compares as asked, and not otherwise.
+    var flag: u32 = 0x10;
+    _ = w.put(OP.COND_WRITE, 0, &.{ 3 | 1 << 4 | 1 << 8, lo(&flag), hi(&flag), 0x10, 0xF0, lo(&sink[0]), hi(&sink[0]), 0xAA });
+    _ = w.put(OP.COND_WRITE, 0, &.{ 3 | 1 << 4 | 1 << 8, lo(&flag), hi(&flag), 0x20, 0xF0, lo(&sink[1]), hi(&sink[1]), 0xBB });
     try std.testing.expect(!w.full);
     try Testing.run(w.written());
 
-    try std.testing.expectEqual(@as(usize, 3), Testing.draws);
+    try std.testing.expectEqual(@as(usize, 5), Testing.draws);
     try std.testing.expectEqual(Draw{ .count = 30, .instances = 2, .base_vertex = 5, .first_instance = 9 }, Testing.drawn[0]);
-    try std.testing.expectEqual(@as(u32, 5), queue.state.sh[0x8C]);
-    try std.testing.expectEqual(@as(u32, 9), queue.state.sh[0x8D]);
     try std.testing.expectEqual(Draw{ .count = 12, .instances = 3, .index_address = @intFromPtr(&indices) + 2, .index_size = 2, .base_vertex = -4, .first_instance = 6 }, Testing.drawn[1]);
     try std.testing.expectEqual(-%@as(u32, 4), queue.state.sh[0x10C]);
     try std.testing.expectEqual(Draw{ .count = 1, .instances = 1, .index_address = @intFromPtr(&indices) + 12, .index_size = 4 }, Testing.drawn[2]);
-    // (told to finish before each record was read)
-    try std.testing.expectEqual(@as(usize, 2), Testing.syncs);
-    try std.testing.expectEqual(@as(u64, 0), stats.skipped + stats.refused);
+    // The packet of several: the record at byte 8, then the one 16 bytes on.
+    try std.testing.expectEqual(Draw{ .count = 30, .instances = 2, .base_vertex = 5, .first_instance = 9 }, Testing.drawn[3]);
+    try std.testing.expectEqual(Draw{ .count = 12, .instances = 3, .base_vertex = 1, .first_instance = -%@as(u32, 4) }, Testing.drawn[4]);
+    // (the shader's registers hold what the last draw gave them)
+    try std.testing.expectEqual(@as(u32, 1), queue.state.sh[0x8C]);
+    try std.testing.expectEqual(-%@as(u32, 4), queue.state.sh[0x8D]);
+    try std.testing.expectEqual(@as(u32, 1), queue.state.sh[0x8E]);
+    try std.testing.expectEqualSlices(u32, &.{ 0xAA, 0 }, &sink);
+    // (told to finish before each record and each condition was read)
+    try std.testing.expectEqual(@as(usize, 5), Testing.syncs);
+    try std.testing.expectEqual(@as(u64, 2), stats.skipped);
+    try std.testing.expectEqual(@as(u64, 0), stats.refused);
 }
 
 var rewind_at: *u32 = undefined;

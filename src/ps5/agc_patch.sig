@@ -307,8 +307,10 @@ pub fn sceAgcGetPacketSize(packet: ?[*]const u32) callconv(.c) u32 {
 /// Where a packet's payload starts: past a data packet's control word
 /// (`kind` not 0), or past the header (none for a one-word NOP).
 fn payload(c: [*]u32, kind: i32) ?[*]u32 {
-    if (kind != 0) return c + 2;
-    return if (c[0] >> 16 & 0x3FFF == 0x3FFF) null else c + 1;
+    // (a one-word packet has none; a data packet's needs three words)
+    const n = pm4.lengthOf(c[0]) orelse return null;
+    if (kind != 0) return if (n >= 3) c + 2 else null;
+    return if (n >= 2) c + 1 else null;
 }
 pub fn sceAgcGetDataPacketPayloadAddress(out: ?*align(1) ?[*]u32, cmd: Cmd, kind: i32) callconv(.c) i32 {
     const o = out orelse return ERROR.INVALID;
@@ -567,6 +569,26 @@ test "reading packets: sizes and payloads" {
 const SemaphoreArea = struct {
     var bytes: [0x8000]u8 align(0x4000) = undefined;
 };
+
+test "a packet too short to have a payload has none" {
+    // A one-word filler asked for its data: no address, and no bytes (not
+    // the 64 KB its length field would read as).
+    var filler = [_]u32{pm4.FILLER};
+    var at: ?[*]u32 = @ptrFromInt(8);
+    try testing.expectEqual(@as(i32, 0), sceAgcGetDataPacketPayloadAddress(&at, &filler, 1));
+    try testing.expectEqual(@as(?[*]u32, null), at);
+    var range = MemoryRange{ .base = @ptrFromInt(8), .size = 99 };
+    try testing.expectEqual(@as(i32, 0), sceAgcGetDataPacketPayloadRange(&range, &filler, 1));
+    try testing.expectEqual(@as(?*anyopaque, null), range.base);
+    try testing.expectEqual(@as(u64, 0), range.size);
+    // A two-word packet has a word after its header, and no data past a
+    // control word.
+    var two = [_]u32{ header(OP.NOP, 2, 0), 0 };
+    try testing.expectEqual(@as(i32, 0), sceAgcGetDataPacketPayloadRange(&range, &two, 0));
+    try testing.expectEqual(@as(u64, 4), range.size);
+    try testing.expectEqual(@as(i32, 0), sceAgcGetDataPacketPayloadRange(&range, &two, 1));
+    try testing.expectEqual(@as(u64, 0), range.size);
+}
 
 test "static buffers, the semaphore area, the calls with nothing to do" {
     try testing.expectEqual(@as(i32, 0), sceAgcInit());

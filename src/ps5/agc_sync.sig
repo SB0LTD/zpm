@@ -163,14 +163,16 @@ fn writeData(buf: Buf, dst: u8, cache: u8, at: u64, data: ?*const anyopaque, n: 
     if (!compute and at & 3 != 0) return null;
     if (dst == 0 and confirm != 0) return null;
     const where: u32 = if (compute) w32(dst) << 8 else ((w32(dst) & 1) << 30) | ((w32(dst) & 0x1E) << 7);
-    // (The open implementation copies the data before the buffer may grow,
-    // in case it is in the buffer; here it is copied after.)
-    const out = reserve(buf, n + 4) orelse return null;
+    // (the data may be in the buffer itself: it is copied before the
+    // packet's first words are written, and kept if the buffer is changed)
+    const s = core.reserveFor(buf, n + 4, @ptrCast(from), 4 * @as(usize, n), false) orelse return null;
+    core.move(@ptrCast(s.out[4..].ptr), s.from, 4 * @as(usize, n));
+    s.release();
+    const out = s.out;
     out[0] = header(OP.WRITE_DATA, n + 4, 0);
     out[1] = where | (w32(increment) << 16) | (w32(confirm) << 20) | (w32(cache) << 25);
     out[2] = lo32(at);
     out[3] = hi32(at);
-    for (out[4..], from[0..n]) |*o, x| o.* = x;
     return out.ptr;
 }
 pub fn sceAgcDcbWriteData(buf: Buf, dst: u8, cache: u8, at: u64, data: ?*const anyopaque, n: u32, increment: u8, confirm: u8) callconv(.c) Out {
@@ -511,10 +513,22 @@ const MARKER_MOST = 0xFFFB;
 fn marker(buf: Buf, text: ?[*]const u8, len: usize, and_pop: bool) Out {
     if (len > MARKER_MOST or (text == null and len != 0)) return null;
     const p = (len + 4) / 4;
-    const out = reserve(buf, 1 + p + @as(usize, if (and_pop) 2 else 0)) orelse return null;
+    const words = 1 + p + @as(usize, if (and_pop) 2 else 0);
+    var out: []u32 = undefined;
+    if (len != 0) {
+        // (the text may be in the buffer itself: moved before the header
+        // is written, then the padding after it)
+        const s = core.reserveFor(buf, words, text.?, len, false) orelse return null;
+        out = s.out;
+        const bytes = std.mem.sliceAsBytes(out[1..][0..p]);
+        core.move(bytes.ptr, s.from, len);
+        s.release();
+        @memset(bytes[len..], 0);
+    } else {
+        out = reserve(buf, words) orelse return null;
+        @memset(out[1..][0..p], 0);
+    }
     out[0] = pm4.nop(SUB.PUSH_MARKER, @intCast(1 + p));
-    @memset(out[1..][0..p], 0);
-    if (len != 0) @memcpy(std.mem.sliceAsBytes(out[1..][0..p])[0..len], text.?[0..len]);
     if (and_pop) {
         out[1 + p] = pm4.nop(SUB.POP_MARKER, 2);
         out[2 + p] = 0;
@@ -918,4 +932,26 @@ test "the flip, the rendering wait, markers, workloads" {
     try testing.expectEqual(@as(Out, null), sceAgcDcbSetWorkloadsActive(&cb, 1, null, 1));
     try testing.expectEqual(@as(Out, null), sceAgcDcbSetWorkloadsActive(&cb, 1, &[_]u32{1}, 0));
     try testing.expectEqual(@as(Out, null), sceAgcDcbSetWorkloadComplete(&cb, 1, 64));
+}
+
+test "write data and a marker whose bytes lie at the cursor carry them unchanged" {
+    var words: [16]u32 = undefined;
+    var cb = CommandBuffer.over(&words);
+    words[0..3].* = .{ 0xA1, 0xB2, 0xC3 };
+    // (four words of the packet land on the data before it is copied,
+    // were it copied last)
+    try testing.expect(sceAgcDcbWriteData(&cb, 5, 0, 0x1000, &words, 3, 0, 0) != null);
+    const made = cb.written();
+    try testing.expectEqual(@as(usize, 7), made.len);
+    try testing.expectEqual(header(OP.WRITE_DATA, 7, 0), made[0]);
+    try testing.expectEqualSlices(u32, &.{ 0xA1, 0xB2, 0xC3 }, made[4..7]);
+
+    // A marker's text staged in the buffer, one byte past the cursor.
+    cb = CommandBuffer.over(&words);
+    const bytes = std.mem.sliceAsBytes(words[0..]);
+    @memcpy(bytes[1..6], "frame");
+    try testing.expect(sceAgcDcbPushMarkerSpan(&cb, bytes.ptr + 1, 5, 0) != null);
+    const text = std.mem.sliceAsBytes(cb.written()[1..]);
+    try testing.expectEqualStrings("frame", text[0..5]);
+    try testing.expectEqual(@as(u8, 0), text[5]);
 }

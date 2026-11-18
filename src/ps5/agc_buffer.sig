@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const pm4 = @import("pm4.sig");
+const pthread = @import("pthread.sig");
 
 const OP = pm4.OP;
 const header = pm4.header;
@@ -109,6 +110,71 @@ pub fn reserve(buf: Buf, n: usize) ?[]u32 {
     return at[0..n];
 }
 
+// A builder that copies from memory the game points at has two things to
+// mind, for that memory may be in the command buffer itself (a game may
+// stage data just past the cursor):
+//   - the packet's own words may lie over the data: the copy is made as a
+//     move, and before the header is written;
+//   - when the buffer has no room and the game's callback brings another,
+//     the data may go with the old one: it is put aside first.
+
+/// Where data is kept while a buffer is changed for a bigger one (one
+/// packet's worth; one builder at a time).
+const aside = struct {
+    var lock: pthread.Lock = .{};
+    var bytes: [pm4.MAX_WORDS * 4]u8 align(8) = undefined;
+};
+
+fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) bool {
+    return a < b +| b_len and b < a +| a_len;
+}
+
+/// Room for a packet that copies the game's memory, and where to copy
+/// from now. `release` it after the copy.
+pub const Space = struct {
+    out: []u32,
+    from: [*]const u8,
+    held: bool,
+
+    pub fn release(s: Space) void {
+        if (s.held) aside.lock.unlock();
+    }
+};
+
+/// `n` words at the cursor for a packet that copies `bytes` of the game's
+/// memory at `from`. `reordered`: the packet does not hold the data as it
+/// lies (a list turned into packets), so it cannot be copied over itself.
+/// Null, and nothing moved: no room, or data in the way that is too much
+/// to put aside.
+pub fn reserveFor(buf: Buf, n: usize, from: [*]const u8, bytes: usize, reordered: bool) ?Space {
+    const cb = buf orelse return null;
+    const free = room(cb) orelse return null;
+    const at = @intFromPtr(from);
+    const in_buffer = overlaps(at, bytes, cb.bottom, cb.top - cb.bottom);
+    const under_packet = overlaps(at, bytes, cb.cursor_up, 4 * n);
+    if (!((free < n and in_buffer) or (reordered and under_packet))) {
+        const out = reserve(cb, n) orelse return null;
+        return .{ .out = out, .from = from, .held = false };
+    }
+    if (bytes > aside.bytes.len) return null;
+    aside.lock.lock();
+    @memcpy(aside.bytes[0..bytes], from[0..bytes]);
+    const out = reserve(cb, n) orelse {
+        aside.lock.unlock();
+        return null;
+    };
+    return .{ .out = out, .from = &aside.bytes, .held = true };
+}
+
+/// Bytes to a place that may overlap where they are.
+pub fn move(to: [*]u8, from: [*]const u8, n: usize) void {
+    if (@intFromPtr(to) <= @intFromPtr(from)) {
+        std.mem.copyForwards(u8, to[0..n], from[0..n]);
+    } else {
+        std.mem.copyBackwards(u8, to[0..n], from[0..n]);
+    }
+}
+
 /// Words as they are, at the cursor.
 pub fn put(buf: Buf, words: []const u32) Out {
     const out = reserve(buf, words.len) orelse return null;
@@ -119,19 +185,20 @@ pub fn put(buf: Buf, words: []const u32) Out {
 /// A NOP over all of `out` (one word: the filler).
 pub fn fillNop(out: []u32) void {
     var o = out;
-    // (a NOP of the most words would have the filler's header: a filler,
-    // then a NOP of the rest)
-    if (o.len == pm4.MAX_WORDS) {
-        o[0] = pm4.FILLER;
-        o = o[1..];
+    // (as many NOPs as it takes: one may be a word short of the most a
+    // packet has, for a NOP of the most words would have the filler's
+    // header)
+    while (o.len != 0) {
+        // (exactly the most words: the filler goes first)
+        const n: usize = if (o.len == pm4.MAX_WORDS) 1 else @min(o.len, pm4.MAX_WORDS - 1);
+        if (n == 1) {
+            o[0] = pm4.FILLER;
+        } else {
+            o[0] = header(OP.NOP, @intCast(n), 0);
+            @memset(o[1..n], 0);
+        }
+        o = o[n..];
     }
-    if (o.len == 0) return;
-    if (o.len == 1) {
-        o[0] = pm4.FILLER;
-        return;
-    }
-    o[0] = header(OP.NOP, @intCast(o.len), 0);
-    @memset(o[1..], 0);
 }
 
 // ── NOPs ────────────────────────────────────────────────────────────────────
@@ -168,13 +235,18 @@ pub fn sceAgcCbNopGetSize(words: u32) callconv(.c) u32 {
 /// left for the game to write.
 fn direct(buf: Buf, op: u8, first: u32, values: ?[*]align(1) const u32, n: u32) Out {
     if (first > 0xFFFF or n == 0 or n > 0x3FFF or first + n > 0x10000) return null;
-    const out = reserve(buf, n + 2) orelse return null;
-    out[0] = header(op, n + 2, 0);
-    out[1] = first;
-    if (values) |v| {
-        for (out[2..], v[0..n]) |*o, x| o.* = x;
-    }
-    return out.ptr;
+    const v = values orelse {
+        const out = reserve(buf, n + 2) orelse return null;
+        out[0] = header(op, n + 2, 0);
+        out[1] = first;
+        return out.ptr;
+    };
+    const s = reserveFor(buf, n + 2, @ptrCast(v), 4 * @as(usize, n), false) orelse return null;
+    move(@ptrCast(s.out[2..].ptr), s.from, 4 * @as(usize, n));
+    s.release();
+    s.out[0] = header(op, n + 2, 0);
+    s.out[1] = first;
+    return s.out.ptr;
 }
 
 fn one(buf: Buf, op: u8, reg: ShaderRegister) Out {
@@ -216,7 +288,8 @@ fn runOf(regs: [*]align(1) const ShaderRegister, i: usize, n: usize) usize {
 fn listed(buf: Buf, op: u8, regs: ?[*]align(1) const ShaderRegister, n: u32) Out {
     const cb = buf orelse return null;
     if (n == 0) return if (room(cb) != null) cursor(cb) else null;
-    const r = regs orelse return null;
+    const given = regs orelse return null;
+    var r = given;
     var total: usize = 0;
     var i: usize = 0;
     while (i < n) {
@@ -225,13 +298,18 @@ fn listed(buf: Buf, op: u8, regs: ?[*]align(1) const ShaderRegister, n: u32) Out
         total += run + 2;
         i += run;
     }
-    const out = reserve(cb, total) orelse return null;
+    // (a list in the buffer, where its own packets would be written over
+    // it, is read from a copy)
+    const s = reserveFor(cb, total, @ptrCast(given), 8 * @as(usize, n), true) orelse return null;
+    defer s.release();
+    r = @ptrCast(s.from);
+    const out = s.out;
     var at: usize = 0;
     i = 0;
     while (i < n) {
         const run = runOf(r, i, n);
         // (a list the game changes meanwhile cannot take this past the
-        // words reserved)
+        // words reserved: what is left is filled with NOPs)
         if (run + 2 > out.len - at) break;
         out[at] = header(op, @intCast(run + 2), 0);
         out[at + 1] = r[i].offset;
@@ -430,4 +508,79 @@ test "registers: one, a range, a list in runs, the indirect forms" {
     try testing.expectEqual(@as(u32, 20), sceAgcCbSetRegisterRangeDirectGetSize(3));
     try testing.expectEqual(@as(u32, 36), sceAgcCbSetRegistersDirectGetSize(3));
     try testing.expectEqual(@as(u32, 0), sceAgcCbSetRegistersDirectGetSize(0x1555_5556));
+}
+
+/// A second buffer a full one is changed for, as a game's callback may do
+/// it: the old one's words are wiped first, as memory given back is.
+const Swap = struct {
+    var first: [4]u32 = undefined;
+    var second: [32]u32 = undefined;
+    var calls: u32 = 0;
+
+    fn grow(cb: *CommandBuffer, words: u32, user: ?*anyopaque) callconv(.c) bool {
+        _ = words;
+        _ = user;
+        calls += 1;
+        @memset(&first, 0xDEAD_DEAD);
+        cb.* = CommandBuffer.over(&second);
+        cb.grow = grow;
+        return true;
+    }
+};
+
+test "data a game points at inside its own buffer is copied before anything is written over it" {
+    // Values staged at the cursor: the packet's first two words land on
+    // them, and the values must still be what the packet carries.
+    var words: [16]u32 = undefined;
+    var cb = CommandBuffer.over(&words);
+    words[0..3].* = .{ 11, 22, 33 };
+    try testing.expect(sceAgcCbSetShRegisterRangeDirect(&cb, 0x40, @ptrCast(&words), 3) != null);
+    try expectWords(&cb, &.{ header(OP.SET_SH_REG, 5, 0), 0x40, 11, 22, 33 });
+
+    // A list staged at the cursor: three pairs, the last two in a row. Its
+    // packets take more words than the list does, so they would run over
+    // pairs not read yet: read from a copy.
+    cb = CommandBuffer.over(&words);
+    words[0..6].* = .{ 0x10, 1, 0x20, 2, 0x21, 3 };
+    try testing.expect(sceAgcCbSetShRegistersDirect(&cb, @ptrCast(&words), 3) != null);
+    try expectWords(&cb, &.{ header(OP.SET_SH_REG, 3, 0), 0x10, 1, header(OP.SET_SH_REG, 4, 0), 0x20, 2, 3 });
+
+    // No room, and the game's callback brings another buffer and gives
+    // the old one back, with the values in it: they were put aside.
+    Swap.calls = 0;
+    Swap.first[0..3].* = .{ 44, 55, 66 };
+    cb = CommandBuffer.over(&Swap.first);
+    cb.grow = Swap.grow;
+    try testing.expect(sceAgcCbSetShRegisterRangeDirect(&cb, 0x50, @ptrCast(&Swap.first), 3) != null);
+    try testing.expectEqual(@as(u32, 1), Swap.calls);
+    try expectWords(&cb, &.{ header(OP.SET_SH_REG, 5, 0), 0x50, 44, 55, 66 });
+    // (data elsewhere needs no putting aside: the same call, the values in
+    // the test's own memory)
+    Swap.calls = 0;
+    const apart = [_]u32{ 7, 8, 9 };
+    cb = CommandBuffer.over(&Swap.first);
+    cb.grow = Swap.grow;
+    try testing.expect(sceAgcCbSetShRegisterRangeDirect(&cb, 0x50, &apart, 3) != null);
+    try testing.expectEqual(@as(u32, 1), Swap.calls);
+    try expectWords(&cb, &.{ header(OP.SET_SH_REG, 5, 0), 0x50, 7, 8, 9 });
+}
+
+test "a stretch of any length is filled with NOPs a reader can walk" {
+    const Long = struct {
+        var words: [2 * pm4.MAX_WORDS + 3]u32 = undefined;
+    };
+    for ([_]usize{ 1, 2, pm4.MAX_WORDS - 1, pm4.MAX_WORDS, pm4.MAX_WORDS + 1, 2 * pm4.MAX_WORDS - 1, 2 * pm4.MAX_WORDS + 3 }) |n| {
+        @memset(&Long.words, 0x1234_5678);
+        fillNop(Long.words[0..n]);
+        var r = pm4.Reader{ .words = Long.words[0..n] };
+        var covered: usize = 0;
+        while (try r.next()) |p| {
+            try testing.expectEqual(@as(u8, OP.NOP), p.op());
+            covered += p.words();
+        }
+        // (the reader ends exactly at the end: every word is a NOP's or a
+        // filler, none left over and none past it)
+        try testing.expectEqual(n, r.at);
+        try testing.expect(covered <= n);
+    }
 }

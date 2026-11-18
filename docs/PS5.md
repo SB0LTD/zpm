@@ -166,18 +166,18 @@ On the console an event queue is the kernel's kqueue. Here it is kept in the pro
 
 A game does not write GPU commands itself. It calls the graphics library (libSceAgc), which writes AMD PM4 packets into a buffer the game owns, and hands the buffer to the driver (libSceAgcDriver). Both are console system modules, so both are this module's to provide. `pm4.sig` is the format; `agc.sig` is the library, as far as writing packets goes; `agcdriver.sig` is a first part of the driver.
 
-- **The library writes into the game's own buffer** (`CommandBuffer`: a bottom, a top, a cursor that climbs), asks the game's callback for room when it runs out, and writes nothing when there is none. Each call's packet is the one the driver reads: the tests build buffers with the library's functions, found by NID, and run them through the driver.
+- **The library writes into the game's own buffer** (`CommandBuffer`: a bottom, a top, a cursor that climbs), asks the game's callback for room when it runs out, and writes nothing when there is none. Data a call points at inside that same buffer is read before the packet is written over it. Each call's packet is the one the driver reads: the tests build buffers with the library's functions, found by NID, and run them through the driver.
 - **Missing from the library:** the tables of register defaults a game asks for at start (`sceAgcGetRegisterDefaults` and its kin), and every shader call (`sceAgcCreateShader`, linking, interpolant mappings).
 
 - **A submit call returns at once.** A worker thread stands in for the GPU's command processor and reads the buffer packet by packet, straight from the game's memory, as the GPU would.
 - **Registers** are kept in three banks (shader, context, user configuration) with the values a queue starts with; the context registers can be cleared, put aside and brought back.
-- **Draws** (plain, indexed, from an offset, indirect) are handed to `renderer` with the state before them. With no renderer they are counted and said once.
+- **Draws** (plain, indexed, from an offset, indirect, several indirect records in one packet) are handed to `renderer` with the state before them. With no renderer they are counted and said once.
 - **Labels and interrupts:** what the GPU writes to memory in passing (`RELEASE_MEM`, `WRITE_DATA`, `COPY_DATA`, `DMA_DATA`) is written in the buffer's order, after the renderer has finished what came before. An interrupt reaches the game through an event queue (`sceAgcDriverAddEqEvent`), with the number the game gave it.
-- **Flow:** the queue stands still at `WAIT_REG_MEM` until memory compares as asked, skips what `COND_EXEC` says, calls into other buffers (`INDIRECT_BUFFER`, sixteen deep), waits at `REWIND` for the game to finish the buffer, and honours a predicate read from memory.
+- **Flow:** the queue stands still at `WAIT_REG_MEM` until memory compares as asked, skips what `COND_EXEC` says, calls into other buffers (`INDIRECT_BUFFER`, sixteen deep), waits at `REWIND` for the game to finish the buffer, and honours a predicate read from memory. `COND_WRITE` writes its word when memory compares as asked.
 - **A flip in a command buffer** is one of two packets that are this library pair's own (a NOP with a sub-type): it goes to the display after what was drawn before it. It counts as pending from the moment its buffer is submitted, and a flip the game's own code asks for (`sceVideoOutSubmitFlip`) goes behind the buffers already waiting.
 - **A buffer that calls or follows itself without end** is left after 2^26 words of packets, as a GPU would hang on it; the queue goes on to the next submission.
 - **A packet this does not carry out** is named once in the log and stepped over; a word that is no packet ends its buffer.
-- **Not here:** compute queues, draws of several records at once, stream-out, the GDS and constant RAM, occlusion predicates, semaphores, flips at the end of pipe.
+- **Not here:** compute queues, `DRAW_INDEX_MULTI_INST`, the fourteen-word conditional branch, stream-out, the GDS and constant RAM, occlusion predicates, semaphores, flips at the end of pipe.
 
 ## Sources
 

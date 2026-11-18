@@ -434,6 +434,9 @@ fn b(x: bool) u32 {
 
 /// Encode into `out`; returns the number of dwords.
 pub fn encode(in: *const Instr, out: []u32) Error!usize {
+    // (an instruction built by hand, not decoded: checked before any of
+    // its fields is used as an index)
+    try sane(in);
     const df = in.d();
     const n = in.dwords();
     if (out.len < n) return error.BufferTooSmall;
@@ -638,6 +641,14 @@ fn regOk(code: u16, n_in: u8) bool {
 
 /// Decode the instruction at the start of `words`. Returns the number of
 /// dwords it takes. Wave-independent: the lane-mask operands are SGPR codes.
+/// Whether an instruction's fields are ones this file can encode or
+/// print without reading outside its own tables: decoded ones always are.
+fn sane(in: *const Instr) Error!void {
+    if (in.op >= defs.len) return error.NoMatch;
+    if (in.naddr > in.addr.len) return error.NoMatch;
+    try checkOperands(in);
+}
+
 pub fn decode(words: []const u32, in: *Instr) Error!usize {
     const n = try decodeFields(words, in);
     try checkOperands(in);
@@ -896,14 +907,26 @@ fn checkOperands(in: *const Instr) Error!void {
                 if (df.shape == .smem_store and in.dst == NULL) return error.NoMatch;
                 if (in.dst == M0 and df.d.dwords() == 1 and df.shape == .smem_load) return error.NoMatch;
             },
-            .smem_time => if (!regOk(in.dst, df.d.dwords()) or in.dst == NULL) return error.NoMatch,
-            else => {},
+            // (these take no cache bits: LLVM refuses them, and the printer
+            // has no text for them)
+            .smem_time => if (in.glc or in.dlc or !regOk(in.dst, df.d.dwords()) or in.dst == NULL) return error.NoMatch,
+            else => if (in.glc or in.dlc) return error.NoMatch,
         },
         .vop1, .vop2, .vopc, .vop3 => try checkValu(in, ns),
-        .vintrp => {},
+        // (attr0 to attr32 are all there are; a constant's parameter is
+        // one of three)
+        .vintrp => {
+            if (in.attr > 32) return error.NoMatch;
+            if (df.shape == .vintrp_mov and in.src[0] > 2) return error.NoMatch;
+        },
         .exp => try checkExp(in),
         .mubuf, .mtbuf => {
-            if (df.shape == .buf_none) return;
+            // (an invalidate takes no operand and no flag: LLVM refuses
+            // them, and the printer has no text for them)
+            if (df.shape == .buf_none) {
+                if (in.imm != 0 or in.offen or in.idxen or in.glc or in.dlc or in.slc or in.tfe) return error.NoMatch;
+                return;
+            }
             const dn = df.d.dwords() + @intFromBool(in.tfe);
             if (!regOk(in.dst, dn)) return error.NoMatch;
             const an: u8 = if (in.offen and in.idxen) 2 else 1;
@@ -1298,6 +1321,7 @@ fn maskOk(code: u16, wave: Wave) bool {
 }
 
 pub fn formatInto(t: *Text, in: *const Instr, wave: Wave) Error!void {
+    try sane(in);
     const df = in.d();
     mnemonic(t, in);
     const sp = " ";
@@ -1841,4 +1865,30 @@ test "hand-checked decodes of graphics instructions" {
     try std.testing.expectError(error.NoMatch, decode(&.{ 0x7e0202f9, 0x00060606 }, &in));
     try std.testing.expectError(error.NoMatch, decode(&.{ 0x7e0202fa, 0xff00e402 }, &in));
     try std.testing.expectError(error.NoMatch, decode(&.{ 0xf80000af, 0x07060504 }, &in));
+}
+
+test "gfx10: what LLVM refuses is refused; an instruction built by hand cannot index past the tables" {
+    var in: Instr = .{};
+    // v_interp_p1_f32 v1, v0, attr0.x is c8040000; attribute 33 is none.
+    try std.testing.expectEqual(@as(usize, 1), try decode(&.{0xc804_0000}, &in));
+    try std.testing.expectEqual(@as(u8, 0), in.attr);
+    try std.testing.expectError(error.NoMatch, decode(&.{0xc804_0000 | 33 << 10}, &in));
+    try std.testing.expectEqual(@as(usize, 1), try decode(&.{0xc804_0000 | 32 << 10}, &in));
+    try std.testing.expectEqual(@as(u8, 32), in.attr);
+
+    // Decoded instructions print and encode; the same ones with a field
+    // set out of range answer an error, not a read outside a table.
+    var words = [_]u32{0} ** 8;
+    var buf: [128]u8 = undefined;
+    _ = try decode(&.{0xc804_0000}, &in);
+    var bad = in;
+    bad.op = @intCast(defs.len);
+    try std.testing.expectError(error.NoMatch, encode(&bad, &words));
+    try std.testing.expectError(error.NoMatch, format(&bad, &buf));
+    bad = in;
+    bad.naddr = 14;
+    try std.testing.expectError(error.NoMatch, encode(&bad, &words));
+    bad = in;
+    bad.attr = 40;
+    try std.testing.expectError(error.NoMatch, format(&bad, &buf));
 }

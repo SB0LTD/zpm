@@ -172,9 +172,11 @@ pub fn sceAgcDcbSetIndexIndirectArgs(buf: Buf, table: u64, index: u32) callconv(
 }
 
 /// Where indirect draws' (or, `kind` 1, dispatches') records are. The
-/// kind goes into the header's flags as it is, all 32 bits of it.
+/// kind is one bit of the header's flags. (The open implementation puts
+/// all 32 bits of it there, which for 2 and up makes a header of another
+/// length: refused here.)
 pub fn sceAgcDcbSetBaseIndirectArgs(buf: Buf, kind: u32, base: u64) callconv(.c) Out {
-    if (base & 1 != 0) return null;
+    if (base & 1 != 0 or kind > 1) return null;
     return put(buf, &.{ header(OP.SET_BASE, 4, 0) | (kind << 1), 1, lo32(base) & ~@as(u32, 6), hi32(base) });
 }
 
@@ -300,9 +302,12 @@ test "index and instance state" {
         0xC002_9100, 0x2222_2220, 0x1111_1111, 0x4444,
     });
     cb = CommandBuffer.over(&mem);
-    _ = sceAgcDcbSetBaseIndirectArgs(&cb, 0x1111_1111, 0x2222_2222);
-    _ = sceAgcDcbSetBaseIndirectArgs(&cb, 0x2222_2222, 0x3333_3333_4444_4444);
-    try expectWords(&cb, &.{ 0xE222_3322, 1, 0x2222_2220, 0, 0xC446_5544, 1, 0x4444_4440, 0x3333_3333 });
+    _ = sceAgcDcbSetBaseIndirectArgs(&cb, 0, 0x2222_2222);
+    _ = sceAgcDcbSetBaseIndirectArgs(&cb, 1, 0x3333_3333_4444_4444);
+    try expectWords(&cb, &.{ 0xC002_1100, 1, 0x2222_2220, 0, 0xC002_1102, 1, 0x4444_4440, 0x3333_3333 });
+    // (a kind of 2 or more would be a header of another opcode and length,
+    // as the open implementation writes it, 0xE2223322: refused)
+    try testing.expectEqual(@as(Out, null), sceAgcDcbSetBaseIndirectArgs(&cb, 0x1111_1111, 0x2222_2222));
     try testing.expectEqual(@as(Out, null), sceAgcDcbSetIndexSize(&cb, 3, 0));
     try testing.expectEqual(@as(Out, null), sceAgcDcbSetIndexSize(&cb, 0, 4));
     try testing.expectEqual(@as(Out, null), sceAgcDcbSetIndexBuffer(&cb, 1));
