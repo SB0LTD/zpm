@@ -130,7 +130,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // Discovery (B11 text lane): pg_typeof (the argument's type OID in
     // `integer`, set by the binder) and pg_get_serial_sequence.
     pg_typeof, pg_get_serial_sequence, pg_table_is_visible, pg_get_indexdef, pg_get_constraintdef, pg_partition_ancestors,
-    to_regnamespace, regnamespace_in, regnamespace_out,
+    to_regnamespace, regnamespace_in, regnamespace_out, pg_get_statisticsobjdef_columns,
     // Regular expressions (B11 text lane, regex.sig).
     regexp_like, similar_to_escape,
     // Full text search (B11 text lane, text_search.sig): the first argument
@@ -243,7 +243,7 @@ pub fn strictFunction(func: Func) bool {
         .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
         // jsonb_set_lax reads NULL arguments itself.
         .jsonb_set_lax => false,
-        .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_partition_ancestors => true,
+        .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns => true,
         .regexp_like, .similar_to_escape => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
