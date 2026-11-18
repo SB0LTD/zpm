@@ -9,18 +9,25 @@ binary and supported semantics covered by the suites.
 [Beta.3 prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.3-run.44202780430.1) ·
 [Exact release matrix](https://github.com/SB0LTD/ramsql/actions/runs/44202780430)
 
-The separate 16-column catalog build matches the first stock `psql \d`
-queries for relation lookup, properties, attributes, index/constraint
-metadata and incoming/outgoing foreign keys. The Windows native comparison
-also matches five scoped constraint definitions. The change-log and schema
-contracts passed 1,048 and 1,119 assertions, with 210 schema WAL records
-replayed. Retain explicit gates for policy, statistics, publication and
-trigger discovery, plus full `pg_dump` restore and regclass wire output.
+The separate 16-column catalog build matches the first eight stock `psql \d`
+queries for relation lookup, properties, attributes, index and constraint
+metadata, foreign keys, row policies and extended statistics. The native
+PostgreSQL 18.3 comparison exercised named-role and `PUBLIC` policies and
+real named statistics before creation, after creation and after drop.
+The Windows Sig schema suite passed 1,249 assertions and replayed 238 WAL
+records. Standalone statistics definitions cover ordinary columns and a
+per-object target. Expression statistics, collection, planner application,
+stable attribute numbers across column drops and native `regclass` wire
+output still need coverage. The next stock `psql \d` query, publication
+discovery, returned `UnsupportedStatement`. Trigger discovery and a full
+`pg_dump` restore remain open.
+[Native PostgreSQL tooling](https://github.com/SB0LTD/ramsql/actions/runs/44232400898) ·
+[Extended statistics draft](https://github.com/SB0LTD/zpm/pull/246)
+
 The draft versioned WAL assigns durable table-constraint identities while
 replaying the older definition formats. Checkpoint generation images must
 preserve those identities and the counter before the storage work is combined.
-[Constraint catalog draft](https://github.com/SB0LTD/zpm/pull/240) ·
-[Native PostgreSQL tooling](https://github.com/SB0LTD/ramsql/actions/runs/44225975198)
+[Constraint catalog draft](https://github.com/SB0LTD/zpm/pull/240)
 
 Both native major versions in hosted CI passed the complete semantic suites
 on consolidated RAMSQL `1b1a3e7`. The four isolation lanes exposed two
