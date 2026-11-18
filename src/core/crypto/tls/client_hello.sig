@@ -66,7 +66,7 @@ fn offered(input: []const u8, id: u16) Error!bool {
 
 fn keyShare(input: []const u8) Error!?[32]u8 {
     var list: Cursor = .{ .remaining = input };
-    var seen = Seen.initEmpty();
+    var seen: Seen = .empty;
     var share: ?[32]u8 = null;
     while (list.remaining.len != 0) {
         const group = try list.read(u16);
@@ -95,7 +95,7 @@ pub fn parse(body: []const u8) Error!Hello {
     var extensions: Cursor = .{ .remaining = try hello.vector(u16) };
     try hello.end();
 
-    var seen = Seen.initEmpty();
+    var seen: Seen = .empty;
     var tls13 = false;
     var x25519 = false;
     var ecdsa = false;
