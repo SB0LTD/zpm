@@ -67,11 +67,30 @@ fn insensitive(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+fn digitEstimate(bits: usize) usize {
+    return (bits * 1233) >> 12;
+}
+
 /// Decimal digits of a value (0 has zero digits).
 pub fn digitCount(value: u512) usize {
-    var count: usize = 0;
-    while (count < pow10.len and value >= pow10[count]) count += 1;
-    return count;
+    if (value == 0) return 0;
+    const bits = @bitSizeOf(u512) - @as(usize, @clz(value));
+    const estimate = digitEstimate(bits);
+    return estimate + @as(usize, @intFromBool(value >= pow10[estimate]));
+}
+
+comptime {
+    @setEvalBranchQuota(20000);
+    for (1..@bitSizeOf(u512) + 1) |bits| {
+        const estimate = digitEstimate(bits);
+        const smallest = @as(u1024, 1) << @as(u10, @intCast(bits - 1));
+        const exclusive_end = @as(u1024, 1) << @as(u10, @intCast(bits));
+        // Every nonzero value of this width lies in the two candidate
+        // decimal digit lengths. One exact power comparison selects it.
+        if ((estimate != 0 and smallest < pow10_wide[estimate - 1]) or
+            exclusive_end > pow10_wide[estimate + 1] or estimate >= pow10.len)
+            @compileError("binary digit estimate failed");
+    }
 }
 
 pub fn nan() Numeric {
@@ -300,7 +319,8 @@ pub fn Ops(comptime digits: usize) type {
             const shift = scale - value.dscale;
             if (shift >= pow10.len) return error.NumericCapacity;
             const raw: u512 = value.coef();
-            if (raw != 0 and digitCount(raw) + shift > 150) return error.NumericCapacity;
+            if (shift == 0 or raw == 0) return raw;
+            if (digitCount(raw) + shift > 150) return error.NumericCapacity;
             return raw * pow10[shift];
         }
 
