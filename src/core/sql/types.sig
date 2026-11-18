@@ -303,6 +303,8 @@ pub const Error = error{
     LockNotAvailable,
     /// SQLSTATE 57014: cancel request or statement_timeout.
     QueryCanceled,
+    /// SQLSTATE 25P04: session termination at the transaction deadline.
+    TransactionTimeout,
     /// SQLSTATE 53200: the transaction table is full.
     TransactionCapacity,
     /// SQLSTATE 53200: a transaction's write set (Config.tx_writes) is full.
