@@ -833,15 +833,15 @@ fn changeRecords() !void {
 
 fn triggerDefinitions() !void {
     reset();
-    try run("CREATE TABLE hits(id INT PRIMARY KEY, v INT, \"Value Label\" INT)");
+    try run("CREATE TABLE hits(id INT PRIMARY KEY, v INT, \"Val L\" INT)");
     try run("CREATE FUNCTION bump() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.v := NEW.v + 1; RETURN NEW; END$$");
-    const create = "CREATE TRIGGER \"watch\"\"list\" BEFORE UPDATE OF \"Value Label\" OR INSERT ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')";
+    const create = "CREATE TRIGGER \"watch\"\"list\" BEFORE UPDATE OF \"Val L\" OR INSERT ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')";
     const metadata = "SELECT tgname, tgrelid <> 0, tgfoid <> 0, tgtype, tgenabled, tgisinternal, tgnargs, tgparentid FROM pg_catalog.pg_trigger WHERE tgname = 'watch\"list'";
     const pretty = "SELECT pg_catalog.pg_get_triggerdef(oid, true) FROM pg_catalog.pg_trigger WHERE tgname = 'watch\"list'";
     const full = "SELECT pg_catalog.pg_get_triggerdef(oid) FROM pg_catalog.pg_trigger WHERE tgname = 'watch\"list'";
     const count = "SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgname = 'watch\"list'";
-    const readable = "CREATE TRIGGER \"watch\"\"list\" BEFORE INSERT OR UPDATE OF \"Value Label\" ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')";
-    const qualified = "CREATE TRIGGER \"watch\"\"list\" BEFORE INSERT OR UPDATE OF \"Value Label\" ON public.hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')";
+    const readable = "CREATE TRIGGER \"watch\"\"list\" BEFORE INSERT OR UPDATE OF \"Val L\" ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')";
+    const qualified = "CREATE TRIGGER \"watch\"\"list\" BEFORE INSERT OR UPDATE OF \"Val L\" ON public.hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')";
     const pending = try db.begin();
     try statement(pending, create);
     try same(try rows(pending, pretty), readable);
@@ -875,9 +875,14 @@ fn triggerDefinitions() !void {
     try expect("SELECT v FROM hits", "3");
     try sameState(&.{metadata, pretty, full, tooling, condition, "SELECT v FROM hits"});
 
+    const reader = try db.begin();
+    try db.beginModes(reader, .{ .isolation = .repeatable_read });
+    try same(try rows(reader, pretty), readable);
     const drop = "DROP TRIGGER \"watch\"\"list\" ON hits";
     try run(drop);
     try expect(count, "0");
+    try same(try rows(reader, pretty), readable);
+    db.abort(reader);
     try sameState(&.{metadata, pretty, full, count});
 }
 
