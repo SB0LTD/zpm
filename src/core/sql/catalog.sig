@@ -356,7 +356,7 @@ pub fn Catalog(comptime config: types.Config) type {
             const relations = self.relationConst(.relations);
             var row_scratch: SC.VersionRowScratch = undefined;
             for (relations.versions[0..relations.version_high], 0..) |*version, index| {
-                if (version.row == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
+                if (version.rowLink() == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
                 if (version.xmax.epoch != 0) continue;
                 const cells = SC.borrowVersionRow(relations, index, &row_scratch);
                 if (cells[3] == .integer and cells[3].integer == namespace and cells[2].text.bytes[0] != 'n') return version.xmin.slot;
@@ -508,7 +508,7 @@ pub fn Catalog(comptime config: types.Config) type {
         pub fn creator(self: *const Self, name: []const u8, snap: storage.Snapshot) ?u16 {
             const relations = self.relationConst(.relations);
             for (relations.versions[0..relations.version_high], 0..) |*version, index| {
-                if (version.row == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
+                if (version.rowLink() == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
                 if (version.xmax.epoch != 0) continue;
                 var temporary: CV.Cell = undefined;
                 if (sameName(SC.borrowVersionCell(relations, index, 1, &temporary), name)) return version.xmin.slot;
