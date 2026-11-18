@@ -843,6 +843,77 @@ fn interleavedCommitOwner() !void {
     try check(!peer.takeNotification(&message));
 }
 
+fn clientNotices() !void {
+    const Level = store_module.ClientMessageLevel;
+    try check(Level.info.visibleAt(.@"error"));
+    try check(Level.@"error".visibleAt(.@"error") and Level.fatal.visibleAt(.@"error"));
+    try check(!Level.warning.visibleAt(.@"error") and Level.warning.visibleAt(.warning));
+    try check(Level.log.visibleAt(.debug1) and !Level.log.visibleAt(.notice));
+    var store: Store = .{};
+    var connection: Store.Connection = .{ .store = &store, .id = 1 };
+    var out: DB.Result = .{};
+    try connection.execute("COMMIT", &out);
+    const warning = connection.takeNotice() orelse return error.MissingCommitWarning;
+    try check(warning.level == .warning and equal(warning.state, "25P01"));
+    try check(connection.takeNotice() == null);
+    try connection.execute("SET client_min_messages = 'error'", &out);
+    try connection.execute("ROLLBACK", &out);
+    try check(connection.takeNotice() == null);
+    try connection.execute("RESET client_min_messages", &out);
+    try connection.execute("SET LOCAL application_name = 'not-persisted'", &out);
+    try check(connection.takeNotice() != null);
+    try connection.execute("SHOW application_name", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), ""));
+}
+
+fn extendedSync() !void {
+    var encoding: [4096]u8 = undefined;
+    var store: Store = .{ .durability_required = true, .encode_buffer = &encoding };
+    var probe: Probe = .{ .store = &store };
+    store.commit_fn = Probe.commit;
+    store.commit_ctx = &probe;
+    var writer: Store.Connection = .{ .store = &store, .id = 1 };
+    var observer: Store.Connection = .{ .store = &store, .id = 2 };
+    var out: DB.Result = .{};
+    try writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)", &out);
+    try writer.executeExtended("INSERT INTO t VALUES (1,'first')", &out);
+    try writer.executeExtended("INSERT INTO t VALUES (2,'second')", &out);
+    try count(&observer, 0);
+    try check(probe.calls == 1);
+    try writer.finishExtended();
+    try check(probe.calls == 2 and try DB.changeRecordOps(probe.last_batch[0..probe.last_length]) == 2);
+    try count(&observer, 2);
+
+    try writer.executeExtended("INSERT INTO t VALUES (3,'failed group')", &out);
+    if (writer.executeExtended("INSERT INTO t VALUES (1,'duplicate')", &out)) |_| return error.DuplicateAccepted else |err| try check(err == error.PrimaryKeyViolation);
+    try writer.finishExtended();
+    try count(&observer, 2);
+    try check(probe.calls == 2);
+
+    try writer.executeExtended("INSERT INTO t VALUES (3,'disconnected')", &out);
+    writer.disconnect();
+    try count(&observer, 2);
+    try check(probe.calls == 2);
+    try quiescent(&store);
+
+    try writer.execute("BEGIN", &out);
+    try writer.executeExtended("INSERT INTO t VALUES (3,'explicit')", &out);
+    try writer.finishExtended();
+    try check(writer.transactionStatus() == 'T');
+    try count(&observer, 2);
+    try writer.execute("COMMIT", &out);
+    try count(&observer, 3);
+    try check(probe.calls == 3);
+
+    probe.fail_after = 0;
+    try writer.executeExtended("INSERT INTO t VALUES (4,'storage failure')", &out);
+    try check(probe.calls == 3);
+    if (writer.finishExtended()) |_| return error.FailedWriteAcknowledged else |err| try check(err == error.InjectedStorageFailure);
+    try check(probe.calls == 4 and store.storage_failed and writer.transactionStatus() == 'I');
+    try count(&observer, 3);
+    try quiescent(&store);
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
@@ -854,6 +925,8 @@ pub fn main() !void {
     try savepoints();
     try runningControl();
     try interleavedCommitOwner();
+    try clientNotices();
+    try extendedSync();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }

@@ -106,12 +106,49 @@ pub const BatchIterator = struct {
 
 pub const DateOrder = enum { mdy, dmy, ymd };
 
+/// PostgreSQL client order, with INFO independently visible to the client.
+pub const ClientMessageLevel = enum {
+    debug5, debug4, debug3, debug2, debug1, log, info, notice, warning, @"error", fatal, panic,
+
+    pub fn visibleAt(level: ClientMessageLevel, minimum: ClientMessageLevel) bool {
+        return level == .info or @intFromEnum(level) >= @intFromEnum(minimum);
+    }
+
+    pub fn label(level: ClientMessageLevel) []const u8 {
+        return switch (level) {
+            .debug5, .debug4, .debug3, .debug2, .debug1 => "DEBUG",
+            .log => "LOG",
+            .info => "INFO",
+            .notice => "NOTICE",
+            .warning => "WARNING",
+            .@"error" => "ERROR",
+            .fatal => "FATAL",
+            .panic => "PANIC",
+        };
+    }
+
+    fn threshold(value: []const u8) ?ClientMessageLevel {
+        inline for (@typeInfo(ClientMessageLevel).@"enum".field_names) |name| {
+            const level = @field(ClientMessageLevel, name);
+            if (level != .info and level != .fatal and level != .panic and sameInsensitive(value, name)) return level;
+        }
+        return null;
+    }
+};
+
+pub const ClientNotice = struct {
+    level: ClientMessageLevel = .warning,
+    state: []const u8,
+    message: []const u8,
+};
+
 /// Session settings this store implements. Times are milliseconds.
 pub fn SettingsOf(comptime Zone: type) type {
     return struct {
         const Self = @This();
         lock_timeout_ms: u32 = 0,
         statement_timeout_ms: u32 = 0,
+        client_min_messages: ClientMessageLevel = .notice,
         application_name: [64]u8 = @splat(0),
         application_name_len: u8 = 0,
         /// TimeZone as SHOW reports it, and the resolved zone.
@@ -221,7 +258,7 @@ pub const deadlock_timeout_ms: u32 = 1000;
 
 /// Settings this store implements; the engine owns the others it knows
 /// (transaction_*, default_transaction_*, search_path, placeholders).
-const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
+const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, client_min_messages, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -565,6 +602,13 @@ pub fn Store(comptime Raw: type) type {
             pub const detached_primary_key = if (@hasDecl(Raw, "ReadContext")) @hasDecl(Raw.ReadContext, "primaryKeyMatches") else false;
 
             pub const Result = Raw.Result;
+            pub const simple_query_batches = @hasDecl(Raw, "preflightPostgresBatch");
+
+            const SimpleQueryBatch = struct {
+                statement_us: ?i64,
+                implicit: bool = false,
+            };
+
             store: *Self,
             id: u64,
             dialect: Dialect = .postgres,
@@ -573,6 +617,8 @@ pub fn Store(comptime Raw: type) type {
             /// Transaction slot (explicit block or a parked implicit statement).
             tx: ?u16 = null,
             in_transaction: bool = false,
+            simple_query_batch: ?SimpleQueryBatch = null,
+            postgres_extended_implicit: bool = false,
             /// Opt-in immutable autocommit SELECT route. The caller owns the
             /// context and excludes ALL storage mutations for the entire codec
             /// call, including result formatting. Never set for transaction,
@@ -591,6 +637,7 @@ pub fn Store(comptime Raw: type) type {
             running_statement: bool = false,
             execution: ExecutionControl = .{},
             execution_deadline_ns: ?i64 = null,
+            pending_notice: ?ClientNotice = null,
             /// Savepoint depth of the last ROLLBACK TO, for the codec's portals.
             rolled_back_to: ?usize = null,
             /// Wall-clock start of the open (or implicit) transaction and of
@@ -689,6 +736,7 @@ pub fn Store(comptime Raw: type) type {
 
             pub const CopyInfo = Raw.CopyInfo;
             pub const copy_line_bytes = Raw.copy_line_bytes;
+            pub const sql_transaction_controls = true;
 
             pub fn reportedParameters() []const []const u8 {
                 return &reported_parameters;
@@ -812,7 +860,7 @@ pub fn Store(comptime Raw: type) type {
                 self.tx = try self.db().begin();
                 self.in_transaction = true;
                 self.failed = false;
-                self.transaction_us = self.store.wallNow();
+                self.transaction_us = if (self.simple_query_batch) |batch| batch.statement_us else self.store.wallNow();
                 self.tx_start = self.settings;
                 self.base = self.settings;
                 self.saved_len = 0;
@@ -824,6 +872,8 @@ pub fn Store(comptime Raw: type) type {
                 self.base = self.settings;
                 self.tx = null;
                 self.in_transaction = false;
+                if (self.simple_query_batch) |*batch| batch.implicit = false;
+                self.postgres_extended_implicit = false;
                 self.failed = false;
                 self.saved_len = 0;
                 self.pending = .{};
@@ -850,12 +900,36 @@ pub fn Store(comptime Raw: type) type {
                 self.endTransaction(true);
             }
 
+            /// Sync or a simple Query ends an implicit extended group.
+            pub fn finishExtended(self: *Connection) !void {
+                if (self.postgres_extended_implicit) try self.commitTransaction();
+            }
+
+            pub fn beginExtendedGroup(self: *Connection) !void {
+                if (self.in_transaction) return;
+                try self.beginTransaction();
+                self.postgres_extended_implicit = true;
+            }
+
+            /// Errors at a simple Query or Sync boundary abort the open
+            /// implicit group immediately, even if Flush exposed earlier
+            /// statement results to the client.
+            pub fn abortExtended(self: *Connection) void {
+                if (!self.postgres_extended_implicit) return;
+                if (self.tx) |slot| self.db().abort(slot);
+                self.endTransaction(false);
+            }
+
             pub fn rollbackTransaction(self: *Connection) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (self.tx) |slot| self.db().abort(slot);
                 const was = self.in_transaction;
+                const before = self.settings;
                 self.endTransaction(false);
-                if (!was) self.settings = self.base;
+                if (!was) {
+                    self.settings = before;
+                    self.base = before;
+                }
             }
 
             /// A codec-level error inside a block fails it like a statement error.
@@ -865,6 +939,49 @@ pub fn Store(comptime Raw: type) type {
                 self.failed = true;
                 self.pending = .{};
                 self.revertSettings();
+            }
+
+            pub fn simpleQueryBatchAvailable(self: *const Connection) bool {
+                return simple_query_batches and self.dialect == .postgres and self.read_context == null;
+            }
+
+            pub fn preflightSimpleQueryBatch(self: *Connection, source: []const u8) !usize {
+                if (comptime !simple_query_batches) return error.UnsupportedStatement;
+                return self.db().preflightPostgresBatch(source);
+            }
+
+            pub fn beginSimpleQueryBatch(self: *Connection) !void {
+                if (self.id == 0 or self.simple_query_batch != null or self.pending.active) return error.ProtocolViolation;
+                self.simple_query_batch = .{
+                    .statement_us = self.store.wallNow(),
+                    .implicit = self.postgres_extended_implicit,
+                };
+                self.postgres_extended_implicit = false;
+            }
+
+            pub fn beginSimpleQueryStep(self: *Connection) !void {
+                if (self.simple_query_batch == null) return error.ProtocolViolation;
+                if (self.in_transaction) return;
+                try self.beginTransaction();
+                self.simple_query_batch.?.implicit = true;
+            }
+
+            pub fn checkSimpleQueryUtility(source: []const u8) !void {
+                if (comptime @hasDecl(Raw, "parseDatabaseCommand")) {
+                    if (try Raw.parseDatabaseCommand(source, .{})) |_| return error.ActiveSqlTransaction;
+                }
+            }
+
+            fn implicitSimpleQueryBlock(self: *const Connection) bool {
+                return if (self.simple_query_batch) |batch| batch.implicit else false;
+            }
+
+            pub fn finishSimpleQueryBatch(self: *Connection, success: bool) !void {
+                const batch = self.simple_query_batch orelse return;
+                defer self.simple_query_batch = null;
+                if (batch.implicit) {
+                    if (success) try self.commitTransaction() else try self.rollbackTransaction();
+                } else if (!success) self.failTransaction();
             }
 
             /// An error inside a block reverts settings made since the
@@ -885,6 +1002,19 @@ pub fn Store(comptime Raw: type) type {
                 return if (self.failed) 'E' else 'T';
             }
 
+            /// A bounded diagnostic for the command just executed. Error,
+            /// fatal, and asynchronous notifications have separate wire paths.
+            pub fn takeNotice(self: *Connection) ?ClientNotice {
+                const notice = self.pending_notice orelse return null;
+                self.pending_notice = null;
+                return if (notice.level.visibleAt(self.settings.client_min_messages)) notice else null;
+            }
+
+            fn warn(self: *Connection, state: []const u8, message: []const u8) void {
+                if (self.dialect != .postgres) return;
+                self.pending_notice = .{ .state = state, .message = message };
+            }
+
             pub fn isAutocommit(self: *const Connection) bool {
                 return self.autocommit;
             }
@@ -898,6 +1028,7 @@ pub fn Store(comptime Raw: type) type {
             pub fn disconnect(self: *Connection) void {
                 if (self.id == 0) return;
                 self.rollbackTransaction() catch {};
+                self.simple_query_batch = null;
                 self.pending = .{};
                 if (comptime has_engine_session) self.db().endSession();
             }
@@ -988,6 +1119,8 @@ pub fn Store(comptime Raw: type) type {
                     },
                     .timezone => try self.assignZone(target, value),
                     .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
+                    .client_min_messages => target.client_min_messages = if (is_default and value.len == 0) .notice else
+                        ClientMessageLevel.threshold(value) orelse return error.InvalidSettingValue,
                     .standard_conforming_strings => if (!(value.len == 0 or sameInsensitive(value, "on") or sameInsensitive(value, "true"))) return error.InvalidSettingValue,
                     .datestyle => target.date_order = try dateOrder(value, target.date_order),
                     .intervalstyle => if (!(value.len == 0 or sameInsensitive(value, "postgres"))) return error.InvalidSettingValue,
@@ -1057,6 +1190,7 @@ pub fn Store(comptime Raw: type) type {
                     .application_name => self.settings.applicationName(),
                     .timezone => self.settings.timeZone(),
                     .client_encoding, .server_encoding => "UTF8",
+                    .client_min_messages => @tagName(self.settings.client_min_messages),
                     .standard_conforming_strings, .integer_datetimes => "on",
                     .datestyle => self.settings.dateStyle(),
                     .intervalstyle => "postgres",
@@ -1126,25 +1260,39 @@ pub fn Store(comptime Raw: type) type {
                 switch (command) {
                     .none => unreachable,
                     .begin => |modes| {
+                        const fresh = !self.in_transaction;
+                        const promote = self.postgres_extended_implicit or self.implicitSimpleQueryBlock();
                         if (comptime has_engine_session) {
-                            const fresh = !self.in_transaction;
                             try self.beginTransaction();
                             // BEGIN inside a block only warns (its modes are ignored).
-                            if (fresh) try self.db().beginModes(self.tx.?, modes);
+                            if (fresh) {
+                                try self.db().beginModes(self.tx.?, modes);
+                            } else if (promote) {
+                                try self.db().setTransaction(self.tx.?, modes);
+                            }
                         } else {
                             if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
                             try self.beginTransaction();
                         }
+                        if (promote) {
+                            self.postgres_extended_implicit = false;
+                            if (self.simple_query_batch) |*batch| batch.implicit = false;
+                        }
+                        if (!fresh and !promote) self.warn("25001", "there is already a transaction in progress");
                         result.clear(0);
                         result.command = .begin;
                     },
                     .commit => {
+                        const explicit = self.in_transaction and !self.postgres_extended_implicit and !self.implicitSimpleQueryBlock();
                         try self.commitTransaction();
+                        if (!explicit) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .commit;
                     },
                     .rollback => {
+                        const explicit = self.in_transaction and !self.postgres_extended_implicit and !self.implicitSimpleQueryBlock();
                         try self.rollbackTransaction();
+                        if (!explicit) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .rollback;
                     },
@@ -1152,7 +1300,7 @@ pub fn Store(comptime Raw: type) type {
                         if (comptime PreparedWal == void) return error.UnsupportedStatement;
                         switch (prepared.action) {
                             .prepare => {
-                                if (!self.in_transaction) return error.NoActiveTransaction;
+                                if (!self.in_transaction or self.postgres_extended_implicit or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                                 const slot = self.tx.?;
                                 if (self.failed) {
                                     self.db().abort(slot);
@@ -1184,7 +1332,7 @@ pub fn Store(comptime Raw: type) type {
                         }
                     },
                     .savepoint => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.postgres_extended_implicit or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                         if (self.failed) return error.TransactionFailed;
                         try self.db().savepoint(self.tx.?, name.slice());
                         self.saved[self.saved_len] = .{ .current = self.settings, .base = self.base };
@@ -1193,14 +1341,14 @@ pub fn Store(comptime Raw: type) type {
                         result.command = .savepoint;
                     },
                     .release => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.postgres_extended_implicit or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                         if (self.failed) return error.TransactionFailed;
                         self.saved_len = try self.db().release(self.tx.?, name.slice());
                         result.clear(0);
                         result.command = .release;
                     },
                     .rollback_to => |name| {
-                        if (!self.in_transaction) return error.NoActiveTransaction;
+                        if (!self.in_transaction or self.postgres_extended_implicit or self.implicitSimpleQueryBlock()) return error.NoActiveTransaction;
                         const depth = try self.db().rollbackTo(self.tx.?, name.slice());
                         self.rolled_back_to = depth;
                         self.settings = self.saved[depth].current;
@@ -1212,6 +1360,7 @@ pub fn Store(comptime Raw: type) type {
                     },
                     .set => |set| {
                         if (self.failed) return error.TransactionFailed;
+                        if (set.local and (!self.in_transaction or self.postgres_extended_implicit)) self.warn("25P01", "SET LOCAL can only be used in transaction blocks");
                         const which = parameter(set.name.slice()) orelse {
                             if (comptime !has_engine_session) return error.UndefinedSetting;
                             try self.db().sessionSet(self.blockSlot(), set.local, set.name.slice(), set.kind, set.value.slice());
@@ -1229,6 +1378,7 @@ pub fn Store(comptime Raw: type) type {
                             // Outside a block SET TRANSACTION only warns.
                             if (self.in_transaction) try self.db().setTransaction(self.tx.?, modes);
                         } else if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
+                        if (!self.in_transaction or self.postgres_extended_implicit) self.warn("25P01", "SET TRANSACTION can only be used in transaction blocks");
                         result.clear(0);
                         result.command = .set;
                     },
@@ -1272,6 +1422,7 @@ pub fn Store(comptime Raw: type) type {
                 switch (which) {
                     .lock_timeout => target.lock_timeout_ms = source.lock_timeout_ms,
                     .statement_timeout => target.statement_timeout_ms = source.statement_timeout_ms,
+                    .client_min_messages => target.client_min_messages = source.client_min_messages,
                     .application_name => {
                         target.application_name = source.application_name;
                         target.application_name_len = source.application_name_len;
@@ -1593,6 +1744,15 @@ pub fn Store(comptime Raw: type) type {
             }
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
+                return self.executeMode(source, result, false);
+            }
+
+            pub fn executeExtended(self: *Connection, source: []const u8, result: *Result) !void {
+                return self.executeMode(source, result, true);
+            }
+
+            fn executeMode(self: *Connection, source: []const u8, result: *Result, extended: bool) !void {
+                self.pending_notice = null;
                 if (self.id == 0) return error.InvalidConnection;
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
                 if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| {
@@ -1667,6 +1827,12 @@ pub fn Store(comptime Raw: type) type {
                     self.failTransaction();
                     return err;
                 };
+                if (extended and !self.in_transaction) switch (command_kind) {
+                    .none, .set, .reset, .set_transaction, .set_session_characteristics, .show => {
+                        try self.beginExtendedGroup();
+                    },
+                    else => {},
+                };
                 if (command_kind != .none) {
                     const was_block = self.in_transaction;
                     self.control(command_kind, result) catch |err| {
@@ -1677,7 +1843,7 @@ pub fn Store(comptime Raw: type) type {
                 }
                 if (self.failed) return error.TransactionFailed;
                 if (!self.autocommit and !self.in_transaction) try self.beginTransaction();
-                self.statement_us = self.store.wallNow();
+                self.statement_us = if (self.simple_query_batch) |batch| batch.statement_us else self.store.wallNow();
                 const implicit = !self.in_transaction;
                 const slot = if (self.tx) |slot| slot else blk: {
                     const slot = try self.db().begin();
