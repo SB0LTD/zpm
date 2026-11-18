@@ -95,21 +95,56 @@ fn rankOf(value: *const Numeric) i8 {
     };
 }
 
+fn magnitudeOrder(a: anytype, b: @TypeOf(a)) i8 {
+    return if (a < b) -1 else if (a > b) 1 else 0;
+}
+
+/// Compare a coefficient with fewer fractional digits to a more precise one.
+/// At most (2^64 - 1) * 10^19 fits in u128. The wide path covers every
+/// remaining supported scale and coefficient without dropping precision.
+fn compareScaled(a: u256, b: u256, padding: usize) i8 {
+    if (padding <= 19 and a <= std.math.maxInt(u64) and b <= std.math.maxInt(u128)) {
+        const aligned: u128 = @as(u128, @intCast(a)) * @as(u128, @intCast(pow10[padding]));
+        return magnitudeOrder(aligned, @as(u128, @intCast(b)));
+    }
+    return magnitudeOrder(@as(u1024, a) * pow10_wide[padding], @as(u1024, b));
+}
+
 /// btree order: -Infinity < finite < Infinity < NaN; NaN = NaN.
 pub fn compareValues(a: *const Numeric, b: *const Numeric) i8 {
     const ra = rankOf(a);
     const rb = rankOf(b);
     if (ra != rb) return if (ra < rb) -1 else 1;
     if (a.special != .finite) return 0;
-    const scale = @max(a.dscale, b.dscale);
-    const left: u1024 = @as(u1024, a.coef()) * pow10_wide[scale - a.dscale];
-    const right: u1024 = @as(u1024, b.coef()) * pow10_wide[scale - b.dscale];
+    const left = a.coef();
+    const right = b.coef();
     const sa: i8 = if (left == 0) 0 else if (a.negative) -1 else 1;
     const sb: i8 = if (right == 0) 0 else if (b.negative) -1 else 1;
     if (sa != sb) return if (sa < sb) -1 else 1;
-    if (left == right) return 0;
-    const greater = left > right;
-    return if (greater == (sa > 0)) 1 else -1;
+    if (sa == 0) return 0;
+    const magnitude = if (a.dscale == b.dscale)
+        magnitudeOrder(left, right)
+    else if (a.dscale < b.dscale)
+        compareScaled(left, right, b.dscale - a.dscale)
+    else
+        -compareScaled(right, left, a.dscale - b.dscale);
+    return sa * magnitude;
+}
+
+fn hashCoefficient(coefficient: *u256, scale: *u64) void {
+    if (coefficient.* <= std.math.maxInt(u64)) {
+        var narrow: u64 = @intCast(coefficient.*);
+        while (scale.* != 0 and narrow != 0 and narrow % 10 == 0) {
+            narrow /= 10;
+            scale.* -= 1;
+        }
+        coefficient.* = narrow;
+        return;
+    }
+    while (scale.* != 0 and coefficient.* % 10 == 0) {
+        coefficient.* /= 10;
+        scale.* -= 1;
+    }
 }
 
 /// Hash key consistent with compareValues (trailing fractional zeros ignored).
@@ -117,10 +152,7 @@ pub fn numeric_hash(value: *const Numeric) [5]u64 {
     if (value.special != .finite) return .{ @intFromEnum(value.special), 0, 0, 0, 0 };
     var raw = value.coef();
     var scale: u64 = value.dscale;
-    while (scale > 0 and raw != 0 and raw % 10 == 0) {
-        raw /= 10;
-        scale -= 1;
-    }
+    hashCoefficient(&raw, &scale);
     if (raw == 0) scale = 0;
     const limbs: [4]u64 = @bitCast(raw);
     return .{ scale | (@as(u64, @intFromBool(value.negative and raw != 0)) << 32), limbs[0], limbs[1], limbs[2], limbs[3] };

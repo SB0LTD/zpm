@@ -51,10 +51,58 @@ fn matrix() !void {
         }
     }
 }
+const Numerics = DB.Io.Numerics;
+const Number = @TypeOf(Numerics.fromInt(0));
+
+fn referenceMagnitude(number: *const Number, scale: u16) u1024 {
+    var value: u1024 = number.coef();
+    for (number.dscale..scale) |_| value *= 10;
+    return value;
+}
+
+fn referenceNumericOrder(a: *const Number, b: *const Number) i8 {
+    const scale = @max(a.dscale, b.dscale);
+    const left: i1024 = @intCast(referenceMagnitude(a, scale));
+    const right: i1024 = @intCast(referenceMagnitude(b, scale));
+    const signed_left = if (a.negative) -left else left;
+    const signed_right = if (b.negative) -right else right;
+    return if (signed_left < signed_right) -1 else if (signed_left > signed_right) 1 else 0;
+}
+
+fn numericComparisonLanes() !void {
+    const literal = [_][]const u8{
+        "-18446744073709551615", "-999999999999999999999999999999999999999.11120",
+        "-12", "-12.0000000000000000000", "-12.00000000000000000001",
+        "-0.0000000000000000000000000000000000000000000000000000001",
+        "-0.000", "0", "0.000000000000000000000000000000000000000000000000000001",
+        "1e-19", "1e-20", "0.00011", "7.125000", "7.125", "12",
+        "12.0000000000000000000", "18446744073709551615", "18446744073709551616",
+        "999999999999999999999999999999999999999.1112",
+        "999999999999999999999999999999999999999.11120",
+    };
+    var values: [literal.len]Number = undefined;
+    for (literal, &values) |text, *value| value.* = try Numerics.parse(text);
+    for (&values) |*left| for (&values) |*right| {
+        const wanted = referenceNumericOrder(left, right);
+        try check(Numerics.compare(left, right) == wanted);
+        if (wanted == 0) try check(std.mem.eql(u64, &Numerics.hashKey(left), &Numerics.hashKey(right)));
+    };
+    try row("SELECT '-Infinity'::numeric < -1e-20::numeric", 16, "t");
+    try row("SELECT 'Infinity'::numeric < 'NaN'::numeric", 16, "t");
+    try row("SELECT 'NaN'::numeric = 'NaN'::numeric", 16, "t");
+    try db.execute("CREATE TABLE numeric_keys (id NUMERIC PRIMARY KEY)", &r);
+    try db.execute("INSERT INTO numeric_keys VALUES (7.125000),(999999999999999999999999999999999999999.1112)", &r);
+    try rejects("INSERT INTO numeric_keys VALUES (7.125)", error.PrimaryKeyViolation);
+    try rejects("INSERT INTO numeric_keys VALUES (999999999999999999999999999999999999999.11120)", error.PrimaryKeyViolation);
+    try row("SELECT COUNT(*) FROM numeric_keys WHERE id = 7.125", 20, "1");
+    try db.execute("DROP TABLE numeric_keys", &r);
+}
+
 pub fn main(init:std.process.Init) !void {
     errdefer std.debug.print("numeric-function assertions={d}\n",.{assertions});
     try row("SELECT abs(-17)",23,"17");
     try matrix();
+    try numericComparisonLanes();
     try row("SELECT abs('-32767'::int2)",21,"32767");
     try row("SELECT abs('-2147483647'::int4)",23,"2147483647");
     try row("SELECT abs('-9223372036854775807'::int8)",20,"9223372036854775807");
