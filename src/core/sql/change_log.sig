@@ -1789,9 +1789,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         };
                         const late = definition.keyed() and !vt.keyed;
                         if (late) {
+                            const base = &db.tables[index];
                             if (vt.mutated or !vt.base or definition.primary_index_oid == 0 or primary == null or
+                                base.relkind != 'r' or base.parent != 0 or definition.extras.parent != 0 or
+                                definition.constraint_count != base.constraint_count + 1 or definition.extras.index_count != vt.index_count or
                                 definition.count != vt.column_count or !types.same(definition.name.slice(), vt.name.slice()) or
                                 oidTaken(db, scratch, definition.primary_index_oid, 1)) return error.ChangeRecordConflict;
+                            for (definition.extras.indexes[0..vt.index_count], vt.index_oids[0..vt.index_count]) |*new, old| {
+                                if (new.oid != old) return error.ChangeRecordConflict;
+                            }
                             for (sources[0..definition.count], 0..) |source, column| {
                                 if (source != column or !types.same(vt.columns[column].name.slice(), definition.columns[column].name.slice())) return error.ChangeRecordConflict;
                             }
@@ -2059,6 +2065,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         /// `db` provides tables, catalog OID counters, csn, cid and epoch.
         pub fn apply(db: anytype, record: []const u8, scratch: *Scratch) Error!void {
+            const scratch_start = @intFromPtr(scratch);
+            if (rangesOverlap(scratch_start, @sizeOf(Scratch), @intFromPtr(db), @sizeOf(@TypeOf(db.*))) or
+                rangesOverlap(scratch_start, @sizeOf(Scratch), @intFromPtr(record.ptr), record.len)) return error.InvalidParameterValue;
+            if (comptime config.external_storage) for (&db.tables) |*table| {
+                const bank = table.key_index;
+                if (rangesOverlap(scratch_start, @sizeOf(Scratch), @intFromPtr(bank.ptr), bank.len * @sizeOf(u32))) return error.InvalidParameterValue;
+            };
             try validate(db, record, scratch);
             // Validated: the remaining errors are unreachable invariants.
             const csn = db.csn + 1;

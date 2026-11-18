@@ -717,6 +717,24 @@ fn latePrimaryRecordFence() !void {
     const late_record = try recordOf(late, &late_bytes);
     const prior = replica.csn;
     var out: DB.Result = .{};
+    const table_oid: u32 = @intCast(try int(&replica, "SELECT oid FROM pg_class WHERE relname='mixed'"));
+    const op_count = std.mem.readInt(u32, late_record[4..8], .little);
+    var malformed: [4096]u8 = undefined;
+    for ([_]bool{ false, true }) |truncate_first| {
+        @memcpy(malformed[0..8], late_record[0..8]);
+        std.mem.writeInt(u32, malformed[4..8], op_count + 1, .little);
+        const at = if (truncate_first) @as(usize, 8) else late_record.len;
+        malformed[at] = 11;
+        std.mem.writeInt(u32, malformed[at + 1 ..][0..4], table_oid, .little);
+        const payload = if (truncate_first) @as(usize, 13) else 8;
+        @memcpy(malformed[payload..][0 .. late_record.len - 8], late_record[8..]);
+        if (replica.applyChangeRecord(malformed[0 .. late_record.len + 5], &scratch)) |_| return error.MixedLatePrimaryReplayAccepted else |err| try check(err == error.ChangeRecordConflict);
+        try check(replica.csn == prior);
+        try same(try query(&replica, "SELECT id FROM mixed"), "1");
+    }
+    const active = try replica.begin();
+    if (replica.applyChangeRecord(late_record, &scratch)) |_| return error.ConcurrentLatePrimaryReplayAccepted else |err| try check(err == error.ChangeRecordConflict);
+    replica.abort(active);
     try replica.execute("INSERT INTO mixed VALUES (1)", &out);
     if (replica.applyChangeRecord(late_record, &scratch)) |_| return error.DuplicateReplayPrimaryKeyAccepted else |err| try check(err == error.ChangeRecordConflict);
     try check(replica.csn == prior + 1);
