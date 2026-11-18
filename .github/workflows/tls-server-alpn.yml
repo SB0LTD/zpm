@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     env:
-      SOURCE: cf7546dd1cafc16f302af5f82f848720415cc3ff
+      SOURCE: 845bda6410d3834b328f4ff1e115796293259ca6
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -22,7 +22,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor "$SOURCE" HEAD
+          git fetch --no-tags origin "$SOURCE"
           git diff --exit-code "$SOURCE" HEAD -- src tools
           tree="$RUNNER_TEMP/source"
           git worktree add --detach "$tree" "$SOURCE"
