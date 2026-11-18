@@ -747,7 +747,8 @@ pub fn typeOfData(data_type: DataType) Type {
 
 /// Static type table (pg_type subset): OID, typname, typlen, typcategory,
 /// array type OID (arrays are reported for catalog fidelity only).
-pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8, array: u32 };
+/// PostgreSQL type ABI metadata. Alignment does not describe the Cell layout.
+pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8, array: u32, alignment: u8 = 'i' };
 
 /// Catalog identity of a projected nominal type, separate from its value
 /// representation. A zero OID denotes ordinary built-in metadata.
@@ -776,7 +777,7 @@ pub fn validTypeTypmod(comptime config: Config, data_type: DataType, typmod: i32
 pub fn typeInfo(data_type: DataType) TypeInfo {
     if (elementData(data_type)) |element| {
         const base = baseInfo(element);
-        return .{ .oid = base.array, .name = array_names[@intFromEnum(element)], .len = -1, .category = 'A', .array = 0 };
+        return .{ .oid = base.array, .name = array_names[@intFromEnum(element)], .len = -1, .category = 'A', .array = 0, .alignment = if (base.alignment == 'd') 'd' else 'i' };
     }
     return baseInfo(data_type);
 }
@@ -799,20 +800,20 @@ const array_sql_names = blk: {
 
 fn baseInfo(data_type: DataType) TypeInfo {
     return switch (data_type) {
-        .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000 },
-        .name => .{ .oid = 19, .name = "name", .len = 64, .category = 'S', .array = 1003 },
-        .integer => .{ .oid = 20, .name = "int8", .len = 8, .category = 'N', .array = 1016 },
-        .smallint => .{ .oid = 21, .name = "int2", .len = 2, .category = 'N', .array = 1005 },
+        .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000, .alignment = 'c' },
+        .name => .{ .oid = 19, .name = "name", .len = 64, .category = 'S', .array = 1003, .alignment = 'c' },
+        .integer => .{ .oid = 20, .name = "int8", .len = 8, .category = 'N', .array = 1016, .alignment = 'd' },
+        .smallint => .{ .oid = 21, .name = "int2", .len = 2, .category = 'N', .array = 1005, .alignment = 's' },
         .integer32 => .{ .oid = 23, .name = "int4", .len = 4, .category = 'N', .array = 1007 },
         .text => .{ .oid = 25, .name = "text", .len = -1, .category = 'S', .array = 1009 },
         .oid => .{ .oid = 26, .name = "oid", .len = 4, .category = 'N', .array = 1028 },
         .json => .{ .oid = 114, .name = "json", .len = -1, .category = 'U', .array = 199 },
         .real => .{ .oid = 700, .name = "float4", .len = 4, .category = 'N', .array = 1021 },
-        .double => .{ .oid = 701, .name = "float8", .len = 8, .category = 'N', .array = 1022 },
+        .double => .{ .oid = 701, .name = "float8", .len = 8, .category = 'N', .array = 1022, .alignment = 'd' },
         .date => .{ .oid = 1082, .name = "date", .len = 4, .category = 'D', .array = 1182 },
-        .timestamp => .{ .oid = 1114, .name = "timestamp", .len = 8, .category = 'D', .array = 1115 },
-        .timestamptz => .{ .oid = 1184, .name = "timestamptz", .len = 8, .category = 'D', .array = 1185 },
-        .interval => .{ .oid = 1186, .name = "interval", .len = 16, .category = 'T', .array = 1187 },
+        .timestamp => .{ .oid = 1114, .name = "timestamp", .len = 8, .category = 'D', .array = 1115, .alignment = 'd' },
+        .timestamptz => .{ .oid = 1184, .name = "timestamptz", .len = 8, .category = 'D', .array = 1185, .alignment = 'd' },
+        .interval => .{ .oid = 1186, .name = "interval", .len = 16, .category = 'T', .array = 1187, .alignment = 'd' },
         .numeric => .{ .oid = 1700, .name = "numeric", .len = -1, .category = 'N', .array = 1231 },
         // PostgreSQL wire and catalog columns expose the exact NUMERIC
         // representation. The change log encodes the unsigned type separately.
@@ -820,26 +821,26 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .jsonb => .{ .oid = 3802, .name = "jsonb", .len = -1, .category = 'U', .array = 3807 },
         .bpchar => .{ .oid = 1042, .name = "bpchar", .len = -1, .category = 'S', .array = 1014 },
         .varchar => .{ .oid = 1043, .name = "varchar", .len = -1, .category = 'S', .array = 1015 },
-        .uuid => .{ .oid = 2950, .name = "uuid", .len = 16, .category = 'U', .array = 2951 },
+        .uuid => .{ .oid = 2950, .name = "uuid", .len = 16, .category = 'U', .array = 2951, .alignment = 'c' },
         .bytea => .{ .oid = 17, .name = "bytea", .len = -1, .category = 'U', .array = 1001 },
-        .time => .{ .oid = 1083, .name = "time", .len = 8, .category = 'D', .array = 1183 },
-        .timetz => .{ .oid = 1266, .name = "timetz", .len = 12, .category = 'D', .array = 1270 },
+        .time => .{ .oid = 1083, .name = "time", .len = 8, .category = 'D', .array = 1183, .alignment = 'd' },
+        .timetz => .{ .oid = 1266, .name = "timetz", .len = 12, .category = 'D', .array = 1270, .alignment = 'd' },
         .bit => .{ .oid = 1560, .name = "bit", .len = -1, .category = 'V', .array = 1561 },
         .varbit => .{ .oid = 1562, .name = "varbit", .len = -1, .category = 'V', .array = 1563 },
-        .money => .{ .oid = 790, .name = "money", .len = 8, .category = 'N', .array = 791 },
-        .pg_lsn => .{ .oid = 3220, .name = "pg_lsn", .len = 8, .category = 'U', .array = 3221 },
-        .xid8 => .{ .oid = 5069, .name = "xid8", .len = 8, .category = 'U', .array = 271 },
+        .money => .{ .oid = 790, .name = "money", .len = 8, .category = 'N', .array = 791, .alignment = 'd' },
+        .pg_lsn => .{ .oid = 3220, .name = "pg_lsn", .len = 8, .category = 'U', .array = 3221, .alignment = 'd' },
+        .xid8 => .{ .oid = 5069, .name = "xid8", .len = 8, .category = 'U', .array = 271, .alignment = 'd' },
         .int4range => .{ .oid = 3904, .name = "int4range", .len = -1, .category = 'R', .array = 3905 },
-        .int8range => .{ .oid = 3926, .name = "int8range", .len = -1, .category = 'R', .array = 3927 },
+        .int8range => .{ .oid = 3926, .name = "int8range", .len = -1, .category = 'R', .array = 3927, .alignment = 'd' },
         .numrange => .{ .oid = 3906, .name = "numrange", .len = -1, .category = 'R', .array = 3907 },
         .daterange => .{ .oid = 3912, .name = "daterange", .len = -1, .category = 'R', .array = 3913 },
-        .tsrange => .{ .oid = 3908, .name = "tsrange", .len = -1, .category = 'R', .array = 3909 },
-        .tstzrange => .{ .oid = 3910, .name = "tstzrange", .len = -1, .category = 'R', .array = 3911 },
+        .tsrange => .{ .oid = 3908, .name = "tsrange", .len = -1, .category = 'R', .array = 3909, .alignment = 'd' },
+        .tstzrange => .{ .oid = 3910, .name = "tstzrange", .len = -1, .category = 'R', .array = 3911, .alignment = 'd' },
         .inet => .{ .oid = 869, .name = "inet", .len = -1, .category = 'I', .array = 1041 },
         .cidr => .{ .oid = 650, .name = "cidr", .len = -1, .category = 'I', .array = 651 },
         .macaddr => .{ .oid = 829, .name = "macaddr", .len = 6, .category = 'U', .array = 1040 },
-        .point => .{ .oid = 600, .name = "point", .len = 16, .category = 'G', .array = 1017 },
-        .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020 },
+        .point => .{ .oid = 600, .name = "point", .len = 16, .category = 'G', .array = 1017, .alignment = 'd' },
+        .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020, .alignment = 'd' },
         .xml => .{ .oid = 142, .name = "xml", .len = -1, .category = 'U', .array = 143 },
         .jsonpath => .{ .oid = 4072, .name = "jsonpath", .len = -1, .category = 'U', .array = 4073 },
         .regtype => .{ .oid = 2206, .name = "regtype", .len = 4, .category = 'N', .array = 2211 },

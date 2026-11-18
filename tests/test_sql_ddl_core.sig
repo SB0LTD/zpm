@@ -1380,6 +1380,19 @@ fn catalogDependencies() !void {
     try sameState(&.{ self_foreign });
 }
 
+fn attributeLayout() !void {
+    reset();
+    try run("CREATE TABLE layout (b bool, s smallint, n name, t text, u uuid, m macaddr, a bigint[], r int8range)");
+    try run("CREATE TYPE layout_composite AS (d numeric(8,2), a text[], b bigint[], t timetz)");
+    const table = "SELECT attname, attlen, attalign FROM pg_attribute WHERE attrelid = 'layout'::regclass ORDER BY attnum";
+    const composite = "SELECT attname, attlen, attalign FROM pg_attribute WHERE attrelid = 'layout_composite'::regclass ORDER BY attnum";
+    try expect(table, "b|1|c;s|2|s;n|64|c;t|-1|i;u|16|c;m|6|i;a|-1|d;r|-1|d");
+    try expect(composite, "d|-1|i;a|-1|i;b|-1|d;t|12|d");
+    try sameState(&.{ table, composite });
+    try run("ALTER TABLE layout DROP COLUMN r, ADD COLUMN extra TIMESTAMPTZ(3)");
+    try sameState(&.{ table, composite });
+}
+
 /// The types lane's column types under this lane's DDL and constraints.
 fn newTypes() !void {
     reset();
@@ -1422,6 +1435,7 @@ pub fn main(init: std.process.Init) !void {
     try walFormats();
     try newTypes();
     try catalogDependencies();
+    try attributeLayout();
     var buffer: [200]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-ddl-core\",\"pass\":true,\"assertions\":{d},\"records\":{d},\"database_bytes\":{d}}}\n", .{ assertions, records_applied, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

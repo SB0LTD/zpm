@@ -92,7 +92,7 @@ const pg_class_columns = [_]ViewColumn{
     col("reltablespace", .oid), col("reloftype", .oid), col("relpersistence", .text), col("relreplident", .text),
     col("reltoastrelid", .oid), col("relam", .oid), col("relispopulated", .boolean), col("relpartbound", .text),
 };
-const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .text), col("attgenerated", .text), col("atthasdef", .boolean), col("attcollation", .oid) };
+const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .text), col("attgenerated", .text), col("atthasdef", .boolean), col("attcollation", .oid), col("attlen", .int2), col("attalign", .text) };
 const pg_index_columns = [_]ViewColumn{
     col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text),
     col("indisvalid", .boolean), col("indisclustered", .boolean), col("indisreplident", .boolean),
