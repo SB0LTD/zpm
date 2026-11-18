@@ -67,6 +67,22 @@ pub fn viewport(v: state.Viewport, height: u32) Viewport {
     };
 }
 
+/// The pixels a viewport covers, as the console counts them. Null when
+/// the transform is off: the viewport is then no part of the target.
+/// (The engine draws inside the viewport alone; the console goes on past
+/// it as far as its guard band, which is not modelled here.)
+pub fn box(v: state.Viewport) ?state.Rect {
+    if (!v.transform) return null;
+    // (kept to what a target can be before a float becomes an integer)
+    const lim: f32 = 32768;
+    const x0 = @floor(std.math.clamp(v.offset[0] - @abs(v.scale[0]), -lim, lim));
+    const x1 = @ceil(std.math.clamp(v.offset[0] + @abs(v.scale[0]), -lim, lim));
+    const y0 = @floor(std.math.clamp(v.offset[1] - @abs(v.scale[1]), -lim, lim));
+    const y1 = @ceil(std.math.clamp(v.offset[1] + @abs(v.scale[1]), -lim, lim));
+    if (!(x1 > x0) or !(y1 > y0)) return .{};
+    return .{ .x0 = @intFromFloat(x0), .y0 = @intFromFloat(y0), .x1 = @intFromFloat(x1), .y1 = @intFromFloat(y1) };
+}
+
 /// A rectangle of the console's pixels (y down) as the engine's (rows
 /// from the bottom of a target `height` tall). Null when it holds no
 /// pixel of the target.
@@ -353,4 +369,26 @@ test "blending: each factor as the engine's form gives the factor's own value" {
     try testing.expect(blend(.{ .color_src = F.ONE, .color_dst = F.SRC_ALPHA_SATURATE, .color_op = 0, .alpha_src = F.ONE, .alpha_dst = F.ZERO, .alpha_op = 0, .constant = c }) == null);
     try testing.expect(blend(.{ .color_src = 11, .color_dst = F.ZERO, .color_op = 0, .alpha_src = F.ONE, .alpha_dst = F.ZERO, .alpha_op = 0, .constant = c }) == null);
     try testing.expect(blend(.{ .color_src = F.ONE, .color_dst = F.ZERO, .color_op = 5, .alpha_src = F.ONE, .alpha_dst = F.ZERO, .alpha_op = 0, .constant = c }) == null);
+}
+
+test "the pixels a viewport covers" {
+    const whole: state.Viewport = .{ .scale = .{ 640, -360, 1 }, .offset = .{ 640, 360, 0 }, .zmin = 0, .zmax = 1, .zero_to_one = true, .depth_clamp = false };
+    try testing.expectEqual(state.Rect{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 }, box(whole).?);
+    // A tile of an atlas, y down in clip space, on half pixels.
+    const tile: state.Viewport = .{ .scale = .{ 50.5, 25, 1 }, .offset = .{ 300, 200, 0 }, .zmin = 0, .zmax = 1, .zero_to_one = true, .depth_clamp = false };
+    try testing.expectEqual(state.Rect{ .x0 = 249, .y0 = 175, .x1 = 351, .y1 = 225 }, box(tile).?);
+    // The transform off: no rectangle. A scale that is not a number, or
+    // none at all: no pixels.
+    var off = whole;
+    off.transform = false;
+    try testing.expect(box(off) == null);
+    var bad = whole;
+    bad.scale[0] = std.math.nan(f32);
+    try testing.expect(box(bad).?.empty());
+    bad.scale[0] = 0;
+    try testing.expect(box(bad).?.empty());
+    // Far outside what a target can be: kept in range, no overflow.
+    var far = whole;
+    far.offset = .{ 1e30, -1e30, 0 };
+    try testing.expect(box(far).?.empty() or box(far).?.x0 >= 32768 - 1);
 }

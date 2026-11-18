@@ -251,9 +251,12 @@ pub fn target(s: *const State, n: u3) ?Target {
 pub const ColorMode = enum { off, normal, other };
 
 pub fn colorMode(s: *const State) ColorMode {
-    return switch (bits(s.cx[CX.CB_COLOR_CONTROL], 4, 3)) {
+    const c = s.cx[CX.CB_COLOR_CONTROL];
+    return switch (bits(c, 4, 3)) {
         0 => .off,
-        1 => .normal,
+        // (drawing, with the shader's colour copied as it is: the other
+        // ways of combining it with the target bit by bit are not that)
+        1 => if (bits(c, 16, 8) == 0xCC) .normal else .other,
         else => .other,
     };
 }
@@ -354,6 +357,9 @@ pub const Depth = struct {
     clears: bool,
     clear: f32,
     stencil_on: bool,
+    /// A pixel is also kept only while the depth already there lies
+    /// between two bounds.
+    bounds_on: bool = false,
 };
 
 pub fn depth(s: *const State) Depth {
@@ -377,6 +383,7 @@ pub fn depth(s: *const State) Depth {
         .clears = bits(s.cx[CX.DB_RENDER_CONTROL], 0, 1) != 0,
         .clear = float(s.cx[0x00B]),
         .stencil_on = bits(control, 0, 1) != 0 and bits(s.cx[CX.DB_STENCIL_INFO], 0, 1) != 0,
+        .bounds_on = format != 0 and bits(control, 3, 1) != 0,
     };
 }
 
@@ -398,6 +405,9 @@ pub const Viewport = struct {
     /// away.
     clip_near: bool = true,
     clip_far: bool = true,
+    /// The transform is on (off: positions are taken as pixels already,
+    /// and the viewport is no rectangle of the target).
+    transform: bool = true,
 };
 
 /// Viewport `v`. Null when the transform is switched off in part (all of
@@ -421,7 +431,7 @@ pub fn viewport(s: *const State, v: u4) ?Viewport {
     // (the six scale and offset switches and the three that say what a
     // position's parts are; the register's other bits are not about this)
     switch (s.cx[CX.VTE_CNTL] & 0x73F) {
-        0 => {},
+        0 => out.transform = false,
         0x43F => {
             const r = s.cx[CX.VPORT_XSCALE_0 + 6 * i ..][0..6];
             out.scale = .{ float(r[0]), float(r[2]), float(r[4]) };
@@ -494,6 +504,8 @@ pub const Raster = struct {
     kill: bool = false,
     /// Vertices are moved by the window's offset (`windowOffset`).
     vertices_offset: bool = false,
+    /// Front or back triangles have their depth moved (a bias).
+    depth_bias: bool = false,
 };
 
 pub fn raster(s: *const State) Raster {
@@ -508,7 +520,14 @@ pub fn raster(s: *const State) Raster {
         .samples_log2 = @intCast(bits(s.cx[CX.AA_CONFIG], 0, 3)),
         .kill = bits(s.cx[CX.CLIP_CNTL], 22, 1) != 0,
         .vertices_offset = bits(m, 16, 1) != 0,
+        .depth_bias = bits(m, 11, 2) != 0,
     };
+}
+
+/// An index that is all ones ends a strip and starts another (user
+/// configuration register 0x24B).
+pub fn restart(s: *const State) bool {
+    return s.uc[0x24B] != 0;
 }
 
 /// What a draw's vertices make (`ps5.agc.shader.PRIMITIVE`).
@@ -1048,4 +1067,36 @@ test "what an independent review found: the details that were read too simply" {
     try testing.expectEqual(Rect{ .x0 = 110, .y0 = 95, .x1 = 210, .y1 = 195 }, scissor(s, 1280, 720, 0));
     s.cx[CX.GENERIC_SCISSOR_TL] |= 0x8000_0000;
     try testing.expectEqual(Rect{ .x0 = 100, .y0 = 100, .x1 = 200, .y1 = 200 }, scissor(s, 1280, 720, 0));
+}
+
+test "what the renderer's review asked for: copying, bounds, bias, restart, the transform off" {
+    const s = Fresh.get();
+    // Drawing means copying the shader's colour: another way of combining
+    // it with the target is another mode.
+    try testing.expectEqual(ColorMode.normal, colorMode(s));
+    s.cx[CX.CB_COLOR_CONTROL] = 0x0066_0010;
+    try testing.expectEqual(ColorMode.other, colorMode(s));
+    s.cx[CX.CB_COLOR_CONTROL] = 0x0066_0000;
+    try testing.expectEqual(ColorMode.off, colorMode(s));
+
+    try testing.expect(!depth(s).bounds_on);
+    s.cx[CX.DB_Z_INFO] = 3;
+    s.cx[CX.DB_DEPTH_CONTROL] = 1 << 3;
+    try testing.expect(depth(s).bounds_on);
+    s.cx[CX.DB_Z_INFO] = 0;
+    try testing.expect(!depth(s).bounds_on);
+
+    try testing.expect(!raster(s).depth_bias);
+    s.cx[CX.SU_SC_MODE_CNTL] = 1 << 11;
+    try testing.expect(raster(s).depth_bias);
+    s.cx[CX.SU_SC_MODE_CNTL] = 1 << 12;
+    try testing.expect(raster(s).depth_bias);
+
+    try testing.expect(!restart(s));
+    s.uc[0x24B] = 1;
+    try testing.expect(restart(s));
+
+    try testing.expect(!viewport(s, 0).?.transform);
+    s.cx[CX.VTE_CNTL] = 0x43F;
+    try testing.expect(viewport(s, 0).?.transform);
 }

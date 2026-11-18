@@ -38,6 +38,11 @@ const Slot = struct {
     address: u64 = 0,
     image: engine.Image = undefined,
     used: u64 = 0,
+    /// A depth target: what it holds is what the game's draws made of it
+    /// (false from the start, and after a draw that was to write it could
+    /// not be carried out: until the game clears it, a test against it
+    /// would be against something else).
+    known: bool = false,
 };
 
 pub const Targets = struct {
@@ -97,8 +102,9 @@ pub const Targets = struct {
     }
 
     /// The image a depth target's tests and writes go to. Null: none set,
-    /// or no memory. A new one holds the farthest depth, 1 (what a
-    /// console's memory holds before a game clears it is anything).
+    /// or no memory. A new one holds the farthest depth, 1, and is not
+    /// `trusted` (what a console's memory holds before a game clears it
+    /// is anything).
     pub fn depth(ts: *Targets, e: *Engine, d: state.Depth) ?*engine.Image {
         if (d.format == 0 or d.address == 0) return null;
         if (ts.find(.depth, d.address)) |s| {
@@ -109,8 +115,22 @@ pub const Targets = struct {
         const s = ts.room(e);
         s.image = e.newDepthImage(d.width, d.height) orelse return null;
         e.fillDepth(&s.image, .{ .x0 = 0, .y0 = 0, .x1 = d.width, .y1 = d.height }, 1.0, 0, 0xFF);
+        s.known = false;
         ts.made += 1;
         return ts.keepSlot(s, .depth, d.address);
+    }
+
+    /// Says whether the depth target at `address` holds what the game's
+    /// draws made of it. Nothing to say it of: nothing happens.
+    pub fn trust(ts: *Targets, address: u64, known: bool) void {
+        if (ts.find(.depth, address)) |s| s.known = known;
+    }
+
+    /// Whether a depth test against the target at `address` would be
+    /// against what the game drew. False for one never made.
+    pub fn trusted(ts: *Targets, address: u64) bool {
+        const s = ts.find(.depth, address) orelse return false;
+        return s.known;
     }
 
     /// The frame at `address` for the display: `width` x `height` words,
@@ -278,10 +298,25 @@ test "a depth target by its address; too many targets and the one unused longest
     defer ts.release(e);
 
     var d: state.Depth = .{ .address = 0x50_0000, .width = 16, .height = 8, .format = 3, .tiling = 0, .samples_log2 = 0, .test_on = true, .func = 1, .write = true, .clears = false, .clear = 0, .stencil_on = false };
+    try testing.expect(!ts.trusted(0x50_0000));
+    ts.trust(0x50_0000, true);
+    try testing.expect(!ts.trusted(0x50_0000));
     const z = ts.depth(e, d).?;
     try testing.expectEqual(@as(u32, 16), z.width);
+    // (new: not what a game made of it yet; said to be, it is; found
+    // again, it still is; made anew at another size, it is not)
+    try testing.expect(!ts.trusted(0x50_0000));
+    ts.trust(0x50_0000, true);
     try testing.expectEqual(z, ts.depth(e, d).?);
+    try testing.expect(ts.trusted(0x50_0000));
     try testing.expectEqual(@as(u64, 1), ts.made);
+    d.width = 8;
+    _ = ts.depth(e, d).?;
+    try testing.expect(!ts.trusted(0x50_0000));
+    try testing.expectEqual(@as(u64, 2), ts.made);
+    d.width = 16;
+    _ = ts.depth(e, d).?;
+    try testing.expectEqual(@as(u64, 3), ts.made);
     // (a colour target at the same address is another thing)
     try testing.expect(!ts.has(0x50_0000));
     d.format = 0;
