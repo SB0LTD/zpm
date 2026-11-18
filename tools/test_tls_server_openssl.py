@@ -91,7 +91,8 @@ def run_logged(command, path):
     return result.stdout
 
 
-def exchange(openssl, binary, ca, directory):
+def exchange(openssl, binary, ca, directory, *, mode, expected, offer=None):
+    directory.mkdir()
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
@@ -100,11 +101,15 @@ def exchange(openssl, binary, ca, directory):
                    "-tls1_3", "-groups", "X25519", "-ciphersuites", "TLS_AES_128_GCM_SHA256",
                    "-sigalgs", "ecdsa_secp256r1_sha256", "-servername", "localhost",
                    "-CAfile", ca, "-verify_hostname", "localhost", "-verify_return_error"]
+        if offer is not None:
+            command.extend(("-alpn", offer))
+        if expected == "selected":
+            command.extend(("-msg", "-msgfile", directory / "openssl-handshake.log"))
         with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as client:
             try:
                 connection, _ = listener.accept()
                 with connection:
-                    server = subprocess.Popen([binary], stdin=connection, stdout=connection, stderr=subprocess.PIPE)
+                    server = subprocess.Popen([binary, mode, expected], stdin=connection, stdout=connection, stderr=subprocess.PIPE)
                 with server:
                     try:
                         output, client_error = client.communicate(b"ZPM TLS request\n", timeout=15)
@@ -117,9 +122,22 @@ def exchange(openssl, binary, ca, directory):
                     client.kill()
         (directory / "openssl-client.log").write_bytes(client_error)
         (directory / "server.log").write_bytes(server_error)
-        if client.returncode != 0 or server.returncode != 0 or output != b"ZPM TLS response\n":
+        if expected == "rejected":
+            passed = client.returncode != 0 and server.returncode == 0 and output == b"" and b"alert number 120" in client_error
+        elif expected == "selected":
+            transcript = (directory / "openssl-handshake.log").read_bytes()
+            encrypted_extensions = re.search(rb"^<<< [^\n]*, EncryptedExtensions\r?\n((?:[ \t]+[0-9a-f ]+\r?\n)+)",
+                                             transcript, re.M | re.I)
+            alpn = bytes.fromhex("08 00 00 13 00 11 00 10 00 0d 00 0b 0a") + b"postgresql"
+            passed = (client.returncode == 0 and server.returncode == 0 and output == b"ZPM TLS response\n"
+                      and encrypted_extensions is not None and bytes.fromhex(encrypted_extensions[1].decode()) == alpn)
+        else:
+            passed = client.returncode == 0 and server.returncode == 0 and output == b"ZPM TLS response\n"
+        (directory / "openssl-stdout.log").write_bytes(output)
+        if not passed:
             raise RuntimeError(f"TLS exchange failed. Client {client.returncode}, server {server.returncode}. See {directory}")
-        return output.decode("ascii")
+        return {"policy": mode, "offer": offer, "expected": expected, "client_exit": client.returncode,
+                "server_exit": server.returncode, "after_key_update": None if expected == "rejected" else "ZPM TLS response\n"}
 
 
 def main():
@@ -138,20 +156,34 @@ def main():
     for name in (b"fragmented RFC 8448 ClientHello", b"an authenticated record with wrong Finished",
                  b"application rekeys only after the complete old-key message",
                  b"application rejects invalid key updates",
-                 b"application reserves the last send record"):
+                 b"application reserves the last send record",
+                 b"ALPN validates opaque offers to the end of the vector",
+                 b"ALPN accounts for an opaque selected protocol in its protected flight"):
         if not any(name in line and line.endswith(b"...OK") for line in tests.splitlines()):
             raise RuntimeError(f"Sig did not execute and pass {name!r}. See {directory / 'unit.log'}")
     ca, fixture = identity(args.openssl, directory)
     run_logged(sig_command(args, "build-exe", "test_server_openssl.sig", directory, fixture), directory / "build.log")
     binary = directory / "server-test"
-    received = exchange(args.openssl, binary, ca, directory)
+    cases = (
+        ("default-no-offer", "disabled", "fallback", None),
+        ("default-ignores-offer", "disabled", "fallback", "h2"),
+        ("optional-no-offer", "optional", "fallback", None),
+        ("optional-matches-list", "optional", "selected", "h2,postgresql"),
+        ("optional-mismatch", "optional", "rejected", "h2"),
+        ("required-matches", "required", "selected", "postgresql"),
+        ("required-no-offer", "required", "rejected", None),
+        ("required-mismatch", "required", "rejected", "postgresqlx"),
+    )
+    results = {name: exchange(args.openssl, binary, ca, directory / name, mode=mode, expected=expected, offer=offer)
+               for name, mode, expected, offer in cases}
     report = {
         "passed": True,
         "source": capture(["git", "-C", ROOT, "rev-parse", "HEAD"]).decode().strip(),
         "sig": capture([args.sig, "version"]).decode().strip(),
         "openssl": capture([args.openssl, "version"]).decode().strip(),
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        "received_after_key_update": received,
+        "received_after_key_update": results["default-no-offer"]["after_key_update"],
+        "alpn_cases": results,
         "max_transport_io_fragment_bytes": 7,
     }
     (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

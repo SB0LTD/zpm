@@ -42,24 +42,53 @@ fn drain(stream: *transport.Stream) !void {
     }
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
+    if (init.args.vector.len != 3) return error.TestArguments;
+    const mode = std.mem.span(init.args.vector[1]);
+    const expectation = std.mem.span(init.args.vector[2]);
+    const alpn: ?tls.Alpn = if (std.mem.eql(u8, mode, "disabled"))
+        null
+    else if (std.mem.eql(u8, mode, "optional"))
+        .{ .protocol = "postgresql" }
+    else if (std.mem.eql(u8, mode, "required"))
+        .{ .protocol = "postgresql", .required = true }
+    else
+        return error.TestArguments;
+    const expect_alarm = std.mem.eql(u8, expectation, "rejected");
+    const expect_selection = std.mem.eql(u8, expectation, "selected");
     var identity = try tls.Identity.init(&.{fixture.certificate}, &fixture.private_key);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&identity.key_pair));
     var receive: [transport.record_capacity]u8 = undefined;
     var send: [transport.record_capacity]u8 = undefined;
     var hello_buffer: [4096]u8 = undefined;
     var flight: [8192]u8 = undefined;
-    var stream = try transport.Stream.init(&identity, .{
+    var stream = try transport.Stream.initWithAlpn(&identity, .{
         .receive = &receive, .send = &send, .hello = &hello_buffer, .flight = &flight,
-    });
+    }, alpn);
     defer stream.close();
     var observed: [expected.len]u8 = undefined;
     var length: usize = 0;
     while (length < observed.len) {
         switch (try stream.next()) {
             .need_input => try appendInput(&stream),
-            .need_output => try drain(&stream),
-            .progress, .established => {},
+            .need_output => {
+                if (expect_alarm) {
+                    if (!std.mem.eql(u8, stream.output(), &tls.no_application_protocol_alert)) return error.TestWrongAlert;
+                    if (try stream.next() != .need_output or stream.selectedAlpn() != null) return error.TestWrongAlert;
+                    try drain(&stream);
+                    if (stream.next()) |_| {
+                        return error.TestWrongAlert;
+                    } else |err| if (err != error.Closed) return err;
+                    return;
+                }
+                try drain(&stream);
+            },
+            .progress => {},
+            .established => {
+                const chosen = stream.selectedAlpn();
+                if (expect_alarm or (chosen != null) != expect_selection) return error.TestWrongSelection;
+                if (chosen) |protocol| if (!std.mem.eql(u8, protocol, "postgresql")) return error.TestWrongSelection;
+            },
             .data => |bytes| {
                 if (bytes.len > observed.len - length) return error.TestWrongPayload;
                 @memcpy(observed[length..][0..bytes.len], bytes);

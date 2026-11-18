@@ -34,9 +34,14 @@ pub const Stream = struct {
     failed: bool = false,
 
     pub fn init(identity: *const tls.Identity, buffers: Buffers) Error!Stream {
+        return initWithAlpn(identity, buffers, null);
+    }
+
+    pub fn initWithAlpn(identity: *const tls.Identity, buffers: Buffers, alpn: ?tls.Alpn) Error!Stream {
+        const handshake = try tls.Server.initWithAlpn(identity, buffers.hello, alpn);
         if (buffers.receive.len < record_capacity or
-            buffers.send.len < @max(record_capacity, identity.flightOutputBytes()) or
-            buffers.hello.len < 4 or buffers.flight.len < identity.flightScratchBytes())
+            buffers.send.len < @max(record_capacity, handshake.flightOutputBytes()) or
+            buffers.hello.len < 4 or buffers.flight.len < handshake.flightScratchBytes())
             return error.BufferTooSmall;
         const spans = [_][]u8{ buffers.receive, buffers.send, buffers.hello, buffers.flight };
         for (spans, 0..) |span, index| {
@@ -46,10 +51,15 @@ pub const Stream = struct {
             if (overlaps(span, std.mem.asBytes(identity)) or
                 overlaps(span, std.mem.sliceAsBytes(identity.chain))) return error.BadRecord;
             for (identity.chain) |der| if (overlaps(span, der)) return error.BadRecord;
+            if (alpn) |policy| if (overlaps(span, policy.protocol)) return error.BadRecord;
         }
         var bounded = buffers;
         bounded.receive = buffers.receive[0..record_capacity];
-        return .{ .handshake = tls.Server.init(identity, bounded.hello), .buffers = bounded };
+        return .{ .handshake = handshake, .buffers = bounded };
+    }
+
+    pub fn selectedAlpn(self: *const Stream) ?[]const u8 {
+        return self.handshake.selectedAlpn();
     }
 
     /// The transport writes into this tail, then reports the exact byte count.
@@ -93,8 +103,8 @@ pub const Stream = struct {
 
     /// Advance one TLS record. Data borrows the input until the next mutation.
     pub fn next(self: *Stream) Error!Event {
-        if (self.failed) return error.Closed;
         if (self.output().len != 0) return .need_output;
+        if (self.failed) return error.Closed;
         if (self.read_closed) return .close_notify;
         errdefer self.failed = true;
         const bytes = self.buffers.receive[self.receive_start..self.receive_end];
@@ -116,7 +126,15 @@ pub const Stream = struct {
                 },
             };
         }
-        switch (try self.handshake.receive(bytes)) {
+        const frame_read = self.handshake.receive(bytes) catch |err| {
+            if (err != error.NoApplicationProtocol) return err;
+            const alert = &tls.no_application_protocol_alert;
+            @memcpy(self.buffers.send[0..alert.len], alert);
+            self.send_end = alert.len;
+            self.failed = true;
+            return .need_output;
+        };
+        switch (frame_read) {
             .need => return .need_input,
             .consumed => |count| self.consumed(count),
         }
