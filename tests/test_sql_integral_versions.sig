@@ -190,6 +190,37 @@ fn placementFences() !void {
     db.abort(reader);
 }
 
+fn fixedNumericVersions() !void {
+    try reject("CREATE TABLE wide_decimal (n NUMERIC(19,2))", error.TableCapacity);
+    try reject("CREATE TABLE rounded_hundreds (n NUMERIC(6,-2))", error.TableCapacity);
+    try change("CREATE TABLE charges (id INT PRIMARY KEY, p NUMERIC(2,1), c NUMERIC(4,2), r NUMERIC(9,6), total NUMERIC(18,2))");
+    try check(db.tables[0].live and db.tables[0].version_rows.len == 0);
+    try check(DB.integralRowWords(db.tables[0].columns[0..5]) == 3);
+    try change("INSERT INTO charges VALUES (1,-9.85,-12.345,1.00000049,9999999999999999.99),(2,NULL,'NaN',-0.123456,-9999999999999999.98),(3,0,0,0,0)");
+    try reject("INSERT INTO charges VALUES (4,9.95,0,0,0)", error.NumericValueOutOfRange);
+    try reject("INSERT INTO charges VALUES (4,0,0,0,'Infinity')", error.NumericValueOutOfRange);
+    try change("UPDATE charges SET c=-42.00 WHERE id=3 RETURNING c");
+    try check(result.row_count == 1 and result.rows[0].cells[0] == .numeric);
+    try copied.copyFromInto(&db);
+    try dense_copy.copyFromInto(&db);
+    try copied.copyFromInto(&dense_copy);
+    for ([_]*DB{ &db, &recovered, &copied, &dense_copy }) |database| {
+        try execute(database, "SELECT p::text,c::text,r::text,total::text FROM charges ORDER BY id");
+        try check(result.row_count == 3);
+        const first = &result.rows[0].cells;
+        try check(std.mem.eql(u8, first[0].text.slice(), "-9.9") and std.mem.eql(u8, first[1].text.slice(), "-12.35"));
+        try check(std.mem.eql(u8, first[2].text.slice(), "1.000000") and std.mem.eql(u8, first[3].text.slice(), "9999999999999999.99"));
+        const second = &result.rows[1].cells;
+        try check(second[0] == .null_value and std.mem.eql(u8, second[1].text.slice(), "NaN"));
+        try check(std.mem.eql(u8, second[2].text.slice(), "-0.123456") and std.mem.eql(u8, second[3].text.slice(), "-9999999999999999.98"));
+        const third = &result.rows[2].cells;
+        try check(std.mem.eql(u8, third[0].text.slice(), "0.0") and std.mem.eql(u8, third[1].text.slice(), "-42.00"));
+        try execute(database, "SELECT SUM(total)::text, COUNT(*) FROM charges");
+        try check(result.row_count == 1 and std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "0.01") and result.rows[0].cells[1].integer == 3);
+    }
+    try change("DROP TABLE charges");
+}
+
 pub fn main() !void {
     const dense_bytes = try DB.backingBytesFor(dense, refs);
     const mixed_bytes = try DB.backingBytesFor(mixed, refs);
@@ -211,6 +242,7 @@ pub fn main() !void {
     try reject("CREATE TABLE oversized (a BIGINT,b BIGINT,c BIGINT,d BIGINT,e BIGINT,f BIGINT,g BIGINT)", error.TableCapacity);
     try reject("CREATE TABLE unsupported (x NUMERIC)", error.TableCapacity);
     try replayReject("CREATE TABLE unsupported (x NUMERIC)");
+    try fixedNumericVersions();
 
     try change("CREATE TABLE facts (id BIGINT PRIMARY KEY, grp INT, item INT, store OID, day DATE, qty INT, discount INT, amount BIGINT, UNIQUE(item,qty))");
     try check(db.tables[0].live and recovered.tables[0].live);

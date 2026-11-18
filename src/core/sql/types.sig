@@ -1462,6 +1462,9 @@ pub fn Values(comptime config: Config) type {
                 return;
             }
             switch (column.data_type) {
+                .numeric => if (numeric.Fixed.ofTypmod(column.typmod)) |format| {
+                    _ = try format.encode(&value.numeric);
+                },
                 .mysql_bigint_unsigned => if (mysqlUnsignedValue(&value.numeric) == null) return error.IntegerOverflow,
                 .varchar => if (!character.fits(value.text.slice(), column.typmod)) return error.StringDataRightTruncation,
                 .bpchar => if (!character.fits(value.bpchar.slice(), column.typmod)) return error.StringDataRightTruncation,

@@ -46,6 +46,40 @@ pub const Numeric = struct {
     }
 };
 
+/// Fixed storage for a typed NUMERIC value. The column owns its scale, so
+/// the row keeps only the signed coefficient. One excluded coefficient
+/// represents NaN. Infinity is already invalid for a bounded typmod.
+pub const Fixed = struct {
+    pub const Width = enum(u8) { one = 1, two = 2, four = 4, eight = 8 };
+
+    width: Width,
+    scale: u16,
+    limit: i64,
+
+    pub fn ofTypmod(typmod: i32) ?Fixed {
+        const spec = Ops(76).decodeTypmod(typmod) orelse return null;
+        if (spec.precision < 1 or spec.precision > 18 or spec.scale < 0 or spec.scale > max_scale) return null;
+        const width: Width = if (spec.precision <= 2) .one else if (spec.precision <= 4) .two else if (spec.precision <= 9) .four else .eight;
+        return .{ .width = width, .scale = @intCast(spec.scale), .limit = @intCast(pow10[@intCast(spec.precision)]) };
+    }
+
+    pub fn encode(self: Fixed, value: *const Numeric) Error!i64 {
+        if (value.special == .nan) return -self.limit;
+        if (value.special != .finite or value.dscale != self.scale) return error.NumericValueOutOfRange;
+        const magnitude = value.coef();
+        if (magnitude >= @as(u256, @intCast(self.limit))) return error.NumericValueOutOfRange;
+        const coefficient: i64 = @intCast(magnitude);
+        return if (value.negative) -coefficient else coefficient;
+    }
+
+    pub fn decode(self: Fixed, coefficient: i64) Numeric {
+        if (coefficient == -self.limit) return nan();
+        var value = Ops(76).fromInt(coefficient);
+        value.dscale = self.scale;
+        return value;
+    }
+};
+
 pub const pow10 = blk: {
     var table: [155]u512 = undefined;
     table[0] = 1;

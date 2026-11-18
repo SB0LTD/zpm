@@ -25,6 +25,7 @@
 //! capacity, dead versions are reclaimed and live slots are compacted; moved
 //! slots get a fresh generation, so a stale RowRef never resolves.
 const types = @import("types.sig");
+const numeric = @import("numeric.sig");
 const mem = @import("std").mem;
 const Error = types.Error;
 
@@ -263,6 +264,7 @@ pub fn Storage(comptime config: types.Config) type {
 
         const IntegralLayout = struct {
             offsets: [config.columns]usize = undefined,
+            decimals: [config.columns]numeric.Fixed = undefined,
             bytes: usize = 0,
 
             fn forColumns(columns: []const V.Column) ?IntegralLayout {
@@ -273,6 +275,11 @@ pub fn Storage(comptime config: types.Config) type {
                         .smallint => @as(usize, 2),
                         .integer32, .oid, .date => 4,
                         .integer => 8,
+                        .numeric => decimal: {
+                            const format = numeric.Fixed.ofTypmod(column.typmod) orelse return null;
+                            layout.decimals[i] = format;
+                            break :decimal @intFromEnum(format.width);
+                        },
                         else => return null,
                     };
                 }
@@ -1453,6 +1460,16 @@ pub fn Storage(comptime config: types.Config) type {
                 .oid => .{ .integer = mem.readInt(u32, bytes[at..][0..4], .little) },
                 .date => .{ .date = mem.readInt(i32, bytes[at..][0..4], .little) },
                 .integer => .{ .integer = mem.readInt(i64, bytes[at..][0..8], .little) },
+                .numeric => decimal: {
+                    const format = table.integral_layout.decimals[column];
+                    const coefficient: i64 = switch (format.width) {
+                        .one => @as(i8, @bitCast(bytes[at])),
+                        .two => mem.readInt(i16, bytes[at..][0..2], .little),
+                        .four => mem.readInt(i32, bytes[at..][0..4], .little),
+                        .eight => mem.readInt(i64, bytes[at..][0..8], .little),
+                    };
+                    break :decimal .{ .numeric = format.decode(coefficient) };
+                },
                 else => unreachable,
             };
         }
@@ -1473,6 +1490,16 @@ pub fn Storage(comptime config: types.Config) type {
                     .oid => mem.writeInt(u32, bytes[at..][0..4], @intCast(cell.integer), .little),
                     .date => mem.writeInt(i32, bytes[at..][0..4], cell.date, .little),
                     .integer => mem.writeInt(i64, bytes[at..][0..8], cell.integer, .little),
+                    .numeric => {
+                        const format = table.integral_layout.decimals[column];
+                        const coefficient = format.encode(&cell.numeric) catch unreachable;
+                        switch (format.width) {
+                            .one => bytes[at] = @bitCast(@as(i8, @intCast(coefficient))),
+                            .two => mem.writeInt(i16, bytes[at..][0..2], @intCast(coefficient), .little),
+                            .four => mem.writeInt(i32, bytes[at..][0..4], @intCast(coefficient), .little),
+                            .eight => mem.writeInt(i64, bytes[at..][0..8], coefficient, .little),
+                        }
+                    },
                     else => unreachable,
                 }
             }
