@@ -509,6 +509,23 @@ pub fn Eval(comptime config: types.Config) type {
                     return formatType(first.integer, if (second == .null_value) -1 else second.integer);
                 },
                 .pg_get_expr => return first,
+                .pg_get_indexdef => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const definition = hook.index_definition orelse return error.UnsupportedStatement;
+                    const second = node(ctx, n.b).next;
+                    var column: i32 = 0;
+                    var pretty = false;
+                    if (second != none) {
+                        const column_value = try eval(ctx, second);
+                        const pretty_value = try eval(ctx, node(ctx, second).next);
+                        if (column_value == .null_value or pretty_value == .null_value) return .null_value;
+                        column = @intCast(column_value.integer);
+                        pretty = pretty_value.boolean;
+                    }
+                    var buffer: [config.text_bytes]u8 = undefined;
+                    const length = try definition(hook.ptr, @intCast(first.integer), column, pretty, &buffer) orelse return .null_value;
+                    return textCell(buffer[0..length]);
+                },
                 else => unreachable,
             }
         }
@@ -1290,7 +1307,7 @@ pub fn Eval(comptime config: types.Config) type {
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
-                    .pg_table_is_visible => return catalogValue(ctx, n),
+                    .pg_table_is_visible, .pg_get_indexdef => return catalogValue(ctx, n),
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
                         const config_cell = try eval(ctx, n.b);

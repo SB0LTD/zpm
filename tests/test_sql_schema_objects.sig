@@ -1267,6 +1267,24 @@ fn exclusionConstraints() !void {
     try sameState(&[_][]const u8{ exclusion_probes[0], exclusion_probes[1], "SELECT r FROM later", "SELECT k, r FROM plain" });
 }
 
+fn indexDefinitionCatalog() !void {
+    db = .{};
+    replica = .{};
+    try run("CREATE TABLE \"Case Table\" (\"Select\" INT PRIMARY KEY, qty INT, label TEXT)");
+    try run("CREATE INDEX \"ix Weird\" ON \"Case Table\" (qty DESC NULLS LAST) INCLUDE (label) WHERE qty > 1");
+    const flags = "SELECT c.relname,i.indisprimary,i.indisvalid,i.indisclustered,i.indisreplident FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid ORDER BY c.relname";
+    try expect(flags, "Case Table_pkey|t|t|f|f;ix Weird|f|t|f|f");
+    const primary = "SELECT pg_catalog.pg_get_indexdef(oid), pg_catalog.pg_get_indexdef(oid,0,true), pg_get_indexdef(oid,1,true), pg_get_indexdef(oid,2,true) FROM pg_class WHERE relname='Case Table_pkey'";
+    try expect(primary, "CREATE UNIQUE INDEX \"Case Table_pkey\" ON public.\"Case Table\" USING btree (\"Select\")|CREATE UNIQUE INDEX \"Case Table_pkey\" ON \"Case Table\" USING btree (\"Select\")|\"Select\"|");
+    const secondary = "SELECT pg_get_indexdef(oid),pg_get_indexdef(oid,0,true),pg_get_indexdef(oid,1,true),pg_get_indexdef(oid,2,true),pg_get_indexdef(oid,-1,true) FROM pg_class WHERE relname='ix Weird'";
+    try expect(secondary, "CREATE INDEX \"ix Weird\" ON public.\"Case Table\" USING btree (qty DESC NULLS LAST) INCLUDE (label) WHERE (qty > 1)|CREATE INDEX \"ix Weird\" ON \"Case Table\" USING btree (qty DESC NULLS LAST) INCLUDE (label) WHERE qty > 1|qty|label|");
+    try expect("SELECT pg_get_indexdef(0),pg_get_indexdef(NULL),pg_get_indexdef(0,0,true)", "NULL|NULL|NULL");
+    try sameState(&.{ flags, primary, secondary });
+    try run("DROP INDEX \"ix Weird\"");
+    try expect(flags, "Case Table_pkey|t|t|f|f");
+    try sameState(&.{ flags, primary, secondary });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1283,5 +1301,6 @@ pub fn main() !void {
     try exclusionConstraints();
     try advancedIndexes();
     try virtualColumns();
+    try indexDefinitionCatalog();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

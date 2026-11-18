@@ -94,6 +94,8 @@ pub const SequenceHook = struct {
     serial_sequence: ?*const fn (ptr: *anyopaque, table: []const u8, column: []const u8, out: *[serial_name_bytes]u8) Error!?usize = null,
     /// Visibility of an existing relation in the owning catalog snapshot.
     relation_visible: ?*const fn (ptr: *anyopaque, oid: u32) ?bool = null,
+    /// Index definition or one index attribute in the owning snapshot.
+    index_definition: ?*const fn (ptr: *anyopaque, oid: u32, column: i32, pretty: bool, out: []u8) Error!?usize = null,
 };
 
 pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid };

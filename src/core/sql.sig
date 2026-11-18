@@ -1092,7 +1092,7 @@ pub fn Database(comptime config: Config) type {
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
                     // These catalog lookups use the serialized database hook.
-                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible=>return error.UnsupportedStatement,
+                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                     .current_setting,.set_config,.pg_backend_pid,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
@@ -2813,7 +2813,7 @@ pub fn Database(comptime config: Config) type {
                 else => unreachable,
             }
             var buffer: [512]u8 = undefined;
-            var text: Writer512 = .{ .out = &buffer };
+            var text: CatalogTextWriter = .{ .out = &buffer };
             text.add(prefix);
             text.add(observation.operation.name());
             text.add("\"");
@@ -4804,7 +4804,7 @@ pub fn Database(comptime config: Config) type {
         /// digits and underscores not starting with a digit. `out` holds at
         /// least 2 * name.len + 2 bytes.
         fn quoteIdentifier(name: []const u8, out: []u8) usize {
-            var safe = name.len != 0 and !types.digit(name[0]);
+            var safe = name.len != 0 and !types.digit(name[0]) and !lexer.reserved(lexer.classify(name));
             for (name) |byte| {
                 if (!((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_')) safe = false;
             }
@@ -5177,10 +5177,10 @@ pub fn Database(comptime config: Config) type {
                         },
                         .pg_index => {
                             var key: [4 * config.columns]u8 = undefined;
-                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)) });
+                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)), boolCell(true), boolCell(false), boolCell(false) });
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
-                                try sink.add(&.{ intCell(index.oid), intCell(oid), boolCell(false), boolCell(index.unique), nameCell(indexKey(index.keyColumns(), &key)) });
+                                try sink.add(&.{ intCell(index.oid), intCell(oid), boolCell(false), boolCell(index.unique), nameCell(indexKey(index.keyColumns(), &key)), boolCell(true), boolCell(false), boolCell(false) });
                             }
                         },
                         .pg_indexes => {
@@ -5195,7 +5195,7 @@ pub fn Database(comptime config: Config) type {
                             }
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
                                 if (constraint.kind != .exclusion) continue;
-                                var definition: Writer512 = .{ .out = &text };
+                                var definition: CatalogTextWriter = .{ .out = &text };
                                 definition.add("CREATE INDEX ");
                                 definition.add(constraint.name.slice());
                                 definition.add(" ON ");
@@ -5278,79 +5278,136 @@ pub fn Database(comptime config: Config) type {
 
         /// pg_indexes.indexdef of a primary key or UNIQUE constraint index.
         fn indexDefinition(table: *const S.Table, schema_name: []const u8, index_name: []const u8, unique: bool, columns: []const u8, out: *[512]u8) []const u8 {
-            var text: Writer512 = .{ .out = out };
-            text.add(if (unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
-            text.add(index_name);
-            text.add(" ON ");
-            text.add(schema_name);
-            text.add(".");
-            text.add(table.name.slice());
-            text.add(" USING btree (");
-            for (columns, 0..) |column, position| {
-                if (position != 0) text.add(", ");
-                text.add(table.columns[column].name.slice());
-            }
-            text.add(")");
+            var text: CatalogTextWriter = .{ .out = out };
+            writeIndexDefinition(table, schema_name, index_name, unique, columns, null, false, &text);
             return text.slice();
         }
 
         /// pg_indexes.indexdef of a secondary index (expression elements and
         /// the predicate are their stored source texts).
         fn secondaryDefinition(table: *const S.Table, schema_name: []const u8, index: *const S.Index, out: *[512]u8) []const u8 {
-            var text: Writer512 = .{ .out = out };
-            text.add(if (index.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
-            text.add(index.name.slice());
-            text.add(" ON ");
-            text.add(schema_name);
-            text.add(".");
-            text.add(table.name.slice());
-            text.add(" USING btree (");
-            var at: usize = 0;
-            const expressions = index.expressions.slice();
-            for (index.keyColumns(), 0..) |column, position| {
-                if (position != 0) text.add(", ");
-                if (column == S.expression_key) {
-                    var end = at;
-                    while (end < expressions.len and expressions[end] != 0) end += 1;
-                    text.add("(");
-                    text.add(expressions[at..end]);
-                    text.add(")");
-                    at = end + 1;
-                } else text.add(table.columns[column].name.slice());
-                const descending = index.options[position] & 1 != 0;
-                const nulls_first = index.options[position] & 2 != 0;
-                if (descending) text.add(" DESC");
-                if (nulls_first and !descending) text.add(" NULLS FIRST");
-                if (!nulls_first and descending) text.add(" NULLS LAST");
-            }
-            text.add(")");
-            if (index.include_count != 0) {
-                text.add(" INCLUDE (");
-                for (index.includes[0..index.include_count], 0..) |column, position| {
-                    if (position != 0) text.add(", ");
-                    text.add(table.columns[column].name.slice());
-                }
-                text.add(")");
-            }
-            if (index.nulls_not_distinct) text.add(" NULLS NOT DISTINCT");
-            if (index.predicate.len != 0) {
-                text.add(" WHERE (");
-                text.add(index.predicate.slice());
-                text.add(")");
-            }
+            var text: CatalogTextWriter = .{ .out = out };
+            writeIndexDefinition(table, schema_name, index.name.slice(), index.unique, index.keyColumns(), index, false, &text);
             return text.slice();
         }
 
-        /// Bounded text assembly (truncates at 512 bytes).
-        const Writer512 = struct {
-            out: *[512]u8,
+        fn writeIndexDefinition(table: *const S.Table, schema: ?[]const u8, index_name: []const u8, unique: bool, keys: []const u8, index: ?*const S.Index, pretty: bool, text: *CatalogTextWriter) void {
+            text.add(if (unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
+            text.ident(index_name);
+            text.add(" ON ");
+            if (schema) |name| {
+                text.ident(name);
+                text.add(".");
+            }
+            text.ident(table.name.slice());
+            text.add(" USING btree (");
+            var expressions = if (index) |secondary| secondary.expressions.slice() else &.{};
+            for (keys, 0..) |column, position| {
+                if (position != 0) text.add(", ");
+                writeIndexKey(table, column, &expressions, text);
+                if (index) |secondary| {
+                    const descending = secondary.options[position] & 1 != 0;
+                    const nulls_first = secondary.options[position] & 2 != 0;
+                    if (descending) text.add(" DESC");
+                    if (nulls_first and !descending) text.add(" NULLS FIRST");
+                    if (!nulls_first and descending) text.add(" NULLS LAST");
+                }
+            }
+            text.add(")");
+            const secondary = index orelse return;
+            if (secondary.include_count != 0) {
+                text.add(" INCLUDE (");
+                for (secondary.includes[0..secondary.include_count], 0..) |column, position| {
+                    if (position != 0) text.add(", ");
+                    text.ident(table.columns[column].name.slice());
+                }
+                text.add(")");
+            }
+            if (secondary.nulls_not_distinct) text.add(" NULLS NOT DISTINCT");
+            if (secondary.predicate.len != 0) {
+                text.add(if (pretty) " WHERE " else " WHERE (");
+                text.add(secondary.predicate.slice());
+                if (!pretty) text.add(")");
+            }
+        }
+
+        fn takeIndexExpression(expressions: *[]const u8) []const u8 {
+            const source = expressions.*;
+            const end = std.mem.indexOfScalar(u8, source, 0) orelse source.len;
+            expressions.* = if (end == source.len) &.{} else source[end + 1 ..];
+            return source[0..end];
+        }
+
+        fn writeIndexKey(table: *const S.Table, column: u8, expressions: *[]const u8, text: *CatalogTextWriter) void {
+            if (column == S.expression_key) {
+                text.add("(");
+                text.add(takeIndexExpression(expressions));
+                text.add(")");
+            } else text.ident(table.columns[column].name.slice());
+        }
+
+        fn postgresIndexDefinition(ptr: *anyopaque, oid: u32, column: i32, pretty: bool, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const table = &self.tables[found.slot];
+                if (table.oid +% 1 == oid and S.keyed(table)) {
+                    var columns: [config.columns]u8 = undefined;
+                    const name = try indexName(table);
+                    return try self.renderIndex(table, name.slice(), true, primaryColumns(table, &columns), null, column, pretty, out);
+                }
+                for (table.indexes[0..table.index_count]) |*index| {
+                    if (index.oid != 0 and index.oid == oid) {
+                        return try self.renderIndex(table, index.name.slice(), index.unique, index.keyColumns(), index, column, pretty, out);
+                    }
+                }
+            }
+            return null;
+        }
+
+        fn renderIndex(self: *const Self, table: *const S.Table, name: []const u8, unique: bool, keys: []const u8, index: ?*const S.Index, column: i32, pretty: bool, out: []u8) Error!usize {
+            var text: CatalogTextWriter = .{ .out = out };
+            if (column == 0) {
+                const schema = if (pretty and self.inRelationSearchPath(table.namespace, table.name.slice())) null else self.namespaceName(table.namespace);
+                writeIndexDefinition(table, schema, name, unique, keys, index, pretty, &text);
+            } else if (column > 0) {
+                const position: usize = @intCast(column - 1);
+                if (position < keys.len) {
+                    var expressions = if (index) |secondary| secondary.expressions.slice() else &.{};
+                    for (keys[0..position]) |key| if (key == S.expression_key) {
+                        _ = takeIndexExpression(&expressions);
+                    };
+                    writeIndexKey(table, keys[position], &expressions, &text);
+                } else if (index) |secondary| {
+                    const included = position - keys.len;
+                    if (included < secondary.include_count) text.ident(table.columns[secondary.includes[included]].name.slice());
+                }
+            }
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
+        }
+
+        const CatalogTextWriter = struct {
+            out: []u8,
             len: usize = 0,
-            fn add(self: *Writer512, bytes: []const u8) void {
+            shortened: bool = false,
+
+            fn add(self: *CatalogTextWriter, bytes: []const u8) void {
                 const take = @min(bytes.len, self.out.len - self.len);
                 @memcpy(self.out[self.len..][0..take], bytes[0..take]);
                 self.len += take;
+                self.shortened = self.shortened or take != bytes.len;
             }
-            fn slice(self: *const Writer512) []const u8 {
+
+            fn ident(self: *CatalogTextWriter, name: []const u8) void {
+                // The catalog limits stored identifiers to 255 bytes.
+                var quoted: [512]u8 = undefined;
+                self.add(quoted[0..quoteIdentifier(name, &quoted)]);
+            }
+
+            fn slice(self: *const CatalogTextWriter) []const u8 {
                 return self.out[0..self.len];
             }
         };
@@ -7019,7 +7076,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
@@ -9717,7 +9774,7 @@ pub fn Database(comptime config: Config) type {
                     const table = &self.tables[table_index];
                     const schema_name = self.namespaceName(table.namespace);
                     var text: [512]u8 = undefined;
-                    var definition: Writer512 = .{ .out = &text };
+                    var definition: CatalogTextWriter = .{ .out = &text };
                     definition.add("CREATE RULE ");
                     definition.add(rule.name.slice());
                     definition.add(" AS\n    ON ");
