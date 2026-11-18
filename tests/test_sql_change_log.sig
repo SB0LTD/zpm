@@ -4,7 +4,7 @@
 const std = @import("std");
 const sql = @import("sql");
 
-const DB = sql.Database(.{ .tables = 2, .columns = 3, .rows_per_table = 8, .name_bytes = 16, .text_bytes = 24, .integer_bits = 32 });
+const DB = sql.Database(.{ .tables = 2, .columns = 3, .rows_per_table = 8, .work_rows = 64, .name_bytes = 16, .text_bytes = 24, .integer_bits = 32 });
 
 var assertions: usize = 0;
 var rejected_flips: usize = 0;
@@ -40,7 +40,7 @@ fn sameResult(a: *const DB.Result, b: *const DB.Result) bool {
 /// Logical equality over every table name that either side might hold,
 /// including unordered scan (rowid) order, next rowids and OIDs.
 fn sameDatabase(a: *DB, b: *DB) !bool {
-    if (a.tableCount() != b.tableCount() or a.oid_counter != b.oid_counter) return false;
+    if (a.tableCount() != b.tableCount() or a.oid_counter != b.oid_counter or a.next_constraint_oid != b.next_constraint_oid) return false;
     for ([_][]const u8{ "t", "u", "v" }) |name| {
         const left = a.storageStats(name);
         const right = b.storageStats(name);
@@ -266,6 +266,49 @@ const Builder = struct {
         return self.bytes[0..self.len];
     }
 };
+
+fn constraintIdentityRoundTrip() !void {
+    var primary: DB = .{};
+    var restored: DB = .{};
+    // A real version-1 definition has only the inline primary-key flag.
+    var legacy: Builder = .{};
+    legacy.createTable(oid, "t", true);
+    try primary.applyChangeRecord(legacy.record(), &scratch);
+    try restored.applyChangeRecord(legacy.record(), &scratch);
+    try check(primary.tables[0].primary_constraint_oid == oid);
+    try check(restored.next_constraint_oid == oid + 1);
+
+    var record: [1024]u8 = undefined;
+    var result: DB.Result = .{};
+    for ([_][]const u8{
+        "ALTER TABLE t ADD CONSTRAINT ck CHECK (k > 0)",
+        "ALTER TABLE t RENAME TO v",
+    }) |statement| {
+        var used: usize = 0;
+        try primary.executeChanges(statement, &result, &record, &used, null, null);
+        try restored.applyChangeRecord(record[0..used], &scratch);
+        try check(try sameDatabase(&primary, &restored));
+    }
+    var active: usize = 0;
+    for (&primary.tables, 0..) |*table, i| {
+        if (table.live and table.dead_csn == 0) active = i;
+    }
+    try check(primary.tables[active].primary_constraint_oid == oid and restored.tables[0].primary_constraint_oid == oid);
+    try check(primary.tables[active].constraints[0].oid == oid + 1 and restored.tables[0].constraints[0].oid == oid + 1);
+
+    var used: usize = 0;
+    try primary.executeChanges("CREATE TABLE u (k INT PRIMARY KEY)", &result, &record, &used, null, null);
+    var bad: [1024]u8 = undefined;
+    @memcpy(bad[0..used], record[0..used]);
+    std.mem.writeInt(u32, bad[used - 4 ..][0..4], oid + 1, .little);
+    if (restored.applyChangeRecord(bad[0..used], &scratch)) |_|
+        return error.CollidingConstraintIdentityAccepted
+    else |err| try check(err == error.ChangeRecordConflict);
+    try check(restored.tableCount() == 1 and restored.next_constraint_oid == oid + 2);
+    try restored.applyChangeRecord(record[0..used], &scratch);
+    try check(restored.tables[1].primary_constraint_oid == oid + 2);
+    try check(try sameDatabase(&primary, &restored));
+}
 
 fn atomicity() !void {
     var db: DB = .{};
@@ -765,6 +808,7 @@ fn truncateCurrentHorizon() !void {
 
 pub fn main(init: std.process.Init) !void {
     try roundTrips();
+    try constraintIdentityRoundTrip();
     try corruption();
     try atomicity();
     try outOfOrderTables();

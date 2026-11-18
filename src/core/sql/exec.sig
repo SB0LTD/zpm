@@ -165,10 +165,25 @@ pub fn Exec(comptime config: types.Config) type {
             query: *Query,
             list: List,
             width: usize,
+            projection: ?*CatalogProjection = null,
+
+            const CatalogProjection = struct {
+                plan: *const B.Plan,
+                context: E.Context,
+                wanted: u64,
+            };
 
             pub fn add(self: *RowSink, cells: []const V.Cell) Error!void {
                 try self.query.session.checkpoint();
                 std_assert(cells.len == self.width);
+                if (self.projection) |projection| {
+                    if (self.list.count >= projection.wanted) return;
+                    projection.context.tuple[0] = cells.ptr;
+                    if (try keep(&projection.context, projection.plan.where, null)) {
+                        try self.query.projectRow(projection.plan, &projection.context, &self.list);
+                    }
+                    return;
+                }
                 const at = try self.query.cells(self.width);
                 for (cells, 0..) |cell, index| self.query.work.cells[at + index] = cell;
                 try self.query.push(&self.list, at);
@@ -774,6 +789,29 @@ pub fn Exec(comptime config: types.Config) type {
                     try self.projectRow(p, &ctx, &out);
                 }
                 return out;
+            }
+
+            /// Keep the selected cells of simple catalog scans. The candidate
+            /// view row belongs to the caller and only lives for one sink call.
+            fn projectCatalog(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!?List {
+                if (p.source_count != 1 or p.grouped or p.general_join) return null;
+                const view = p.sources[0].view orelse return null;
+                if (!self.availableAtStage(p.where, 0, true)) return null;
+                for (p.targets[0..p.width], 0..) |target, column| {
+                    if (!p.required[column]) continue;
+                    if (self.pool.nodes[target].kind != .column) return null;
+                }
+                const hook = self.work.views orelse return error.UnsupportedStatement;
+                const wanted = if (p.order_count == 0 and p.distinct == .none) p.offset +| p.limit else 0xffffffffffffffff;
+                var projection: RowSink.CatalogProjection = .{ .plan = p, .context = self.context(outer), .wanted = wanted };
+                var sink: RowSink = .{
+                    .query = self,
+                    .list = .{ .start = @intCast(self.work.ref_low) },
+                    .width = catalog.viewColumns(view).len,
+                    .projection = &projection,
+                };
+                try hook.rows(hook.ptr, view, &sink);
+                return try self.finish(p, sink.list);
             }
 
             const KeySorter = struct {
@@ -4392,6 +4430,7 @@ pub fn Exec(comptime config: types.Config) type {
                         // hash work; retry must not bypass cancellation/budgets.
                     }
                 }
+                if (try self.projectCatalog(p, outer)) |rows| return rows;
                 const tuples = try self.join(p, outer);
                 const rows = if (p.grouped) try self.group(p, tuples, outer) else try self.project(p, tuples, outer);
                 return self.finish(p, rows);

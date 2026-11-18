@@ -1288,6 +1288,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "format_type", .func = .format_type },
                 .{ .name = "pg_get_expr", .func = .pg_get_expr },
                 .{ .name = "pg_get_indexdef", .func = .pg_get_indexdef },
+                .{ .name = "pg_get_constraintdef", .func = .pg_get_constraintdef },
                 // String functions (B11).
                 .{ .name = "lower", .func = .lower },               .{ .name = "upper", .func = .upper },
                 .{ .name = "initcap", .func = .initcap },           .{ .name = "length", .func = .char_length },
@@ -2242,6 +2243,12 @@ pub fn Binder(comptime config: types.Config) type {
                 .pg_get_indexdef => {
                     if (context.dialect != .postgres) return error.UndefinedFunction;
                     const signature: []const ast.Type = if (count == 1) &.{.oid} else &.{ .oid, .int4, .boolean };
+                    try bindSignature(context, n, signature, .text, true);
+                    n.constant = false;
+                },
+                .pg_get_constraintdef => {
+                    if (context.dialect != .postgres) return error.UndefinedFunction;
+                    const signature: []const ast.Type = if (count == 1) &.{.oid} else &.{ .oid, .boolean };
                     try bindSignature(context, n, signature, .text, true);
                     n.constant = false;
                 },

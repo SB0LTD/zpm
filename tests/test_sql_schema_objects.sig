@@ -1285,6 +1285,29 @@ fn indexDefinitionCatalog() !void {
     try sameState(&.{ flags, primary, secondary });
 }
 
+fn constraintDefinitionCatalog() !void {
+    reset();
+    try run("CREATE TABLE tooling(id INT PRIMARY KEY, label TEXT)");
+    try run("CREATE INDEX tooling_label ON tooling (label)");
+    try run("CREATE TABLE catalog_child(id INT PRIMARY KEY, parent INT, score INT, CONSTRAINT uq UNIQUE NULLS NOT DISTINCT(score) DEFERRABLE INITIALLY DEFERRED, CONSTRAINT min_score CHECK (score > 0), CONSTRAINT fk_parent FOREIGN KEY (parent) REFERENCES tooling(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE)");
+    const definitions = "SELECT conname,contype,condeferrable,condeferred,pg_catalog.pg_get_constraintdef(oid,true) FROM pg_catalog.pg_constraint ORDER BY conname";
+    try expect(definitions,
+        "catalog_child_pkey|p|f|f|PRIMARY KEY (id);" ++
+        "fk_parent|f|t|f|FOREIGN KEY (parent) REFERENCES tooling(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE;" ++
+        "min_score|c|f|f|CHECK (score > 0);" ++
+        "tooling_pkey|p|f|f|PRIMARY KEY (id);" ++
+        "uq|u|t|t|UNIQUE NULLS NOT DISTINCT (score) DEFERRABLE INITIALLY DEFERRED");
+    const references = "SELECT conname,confupdtype,confdeltype,confmatchtype,conindid FROM pg_constraint WHERE contype='f'";
+    const identities = "SELECT conname,oid,conindid FROM pg_constraint ORDER BY conname";
+    try expect(references, "fk_parent|c|n|s|16385");
+    try expect("SELECT pg_get_constraintdef(0),pg_get_constraintdef(NULL),pg_get_constraintdef(0,true)", "NULL|NULL|NULL");
+    try expect("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='min_score'", "CHECK ((score > 0))");
+    try sameState(&.{ definitions, references, identities });
+    try run("ALTER TABLE catalog_child DROP CONSTRAINT min_score");
+    try expect("SELECT conname FROM pg_constraint WHERE conname='min_score'", "");
+    try sameState(&.{ definitions, references, identities });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1302,5 +1325,6 @@ pub fn main() !void {
     try advancedIndexes();
     try virtualColumns();
     try indexDefinitionCatalog();
+    try constraintDefinitionCatalog();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

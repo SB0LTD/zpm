@@ -1093,7 +1093,7 @@ pub fn Database(comptime config: Config) type {
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
                     // These catalog lookups use the serialized database hook.
-                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef=>return error.UnsupportedStatement,
+                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                     .current_setting,.set_config,.pg_backend_pid,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
@@ -1448,6 +1448,8 @@ pub fn Database(comptime config: Config) type {
         locks: L = .{},
         /// Table OIDs are first_oid + counter; never reused while committed.
         oid_counter: u32 = 0,
+        /// Constraint OIDs have their own catalog namespace.
+        next_constraint_oid: u32 = change_log.first_oid,
         /// Global commit sequence number, advanced only at publish.
         csn: u64 = 0,
         /// Command id used by change-record replay.
@@ -1788,6 +1790,7 @@ pub fn Database(comptime config: Config) type {
         fn copyState(self: *Self, source: *const Self) void {
             if (self == source) return;
             self.oid_counter = source.oid_counter;
+            self.next_constraint_oid = source.next_constraint_oid;
             self.csn = source.csn;
             self.cid = source.cid;
             self.epoch = source.epoch;
@@ -5186,6 +5189,16 @@ pub fn Database(comptime config: Config) type {
                                 try sink.add(&.{ intCell(index.oid), intCell(oid), boolCell(false), boolCell(index.unique), nameCell(indexKey(index.keyColumns(), &key)), boolCell(true), boolCell(false), boolCell(false) });
                             }
                         },
+                        .pg_constraint => {
+                            const primary = if (S.primaryConstraint(table)) |position| &table.constraints[position] else null;
+                            if (table.primary_constraint_oid != 0) {
+                                try self.constraintRow(sink, table, table.primary_constraint_oid, pkey.slice(), primary, .primary, snapshot);
+                            }
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind == .primary) continue;
+                                try self.constraintRow(sink, table, constraint.oid, constraint.name.slice(), constraint, constraint.kind, snapshot);
+                            }
+                        },
                         .pg_indexes => {
                             var text: [512]u8 = undefined;
                             if (S.keyed(table)) try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(pkey.slice()), .null_value, nameCell(indexDefinition(table, schema_name, pkey.slice(), true, primary_columns, &text)) });
@@ -5368,6 +5381,132 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             return null;
+        }
+
+        fn foreignActionCode(action: S.ForeignAction) []const u8 {
+            return switch (action) { .no_action => "a", .restrict => "r", .cascade => "c", .set_null => "n", .set_default => "d" };
+        }
+
+        fn foreignActionText(action: S.ForeignAction) []const u8 {
+            return switch (action) { .no_action => "NO ACTION", .restrict => "RESTRICT", .cascade => "CASCADE", .set_null => "SET NULL", .set_default => "SET DEFAULT" };
+        }
+
+        fn constraintRow(self: *const Self, sink: *X.RowSink, table: *const S.Table, oid: u32, name: []const u8, constraint: ?*const S.Constraint, kind: S.ConstraintKind, snapshot: Snapshot) Error!void {
+            const label = switch (kind) { .check => "c", .unique => "u", .primary => "p", .foreign => "f", .exclusion => "x" };
+            const deferrable = if (constraint) |item| item.deferrable else false;
+            const deferred = if (constraint) |item| item.initially_deferred else false;
+            const foreign = if (kind == .foreign) constraint else null;
+            const index = if (kind == .primary) table.oid + 1 else if (foreign) |item| self.referencedConstraintIndex(item, snapshot) else 0;
+            try sink.add(&.{
+                intCell(oid), nameCell(name), intCell(table.namespace), nameCell(label),
+                boolCell(deferrable), boolCell(deferred), boolCell(true), boolCell(true),
+                intCell(table.oid), intCell(0), intCell(index), intCell(0),
+                intCell(if (foreign) |item| item.ref_oid else 0),
+                nameCell(if (foreign) |item| foreignActionCode(item.on_update) else " "),
+                nameCell(if (foreign) |item| foreignActionCode(item.on_delete) else " "),
+                nameCell(if (foreign != null) "s" else " "), boolCell(false),
+            });
+        }
+
+        fn sameIndexKeys(expected: []const u8, actual: []const u8) bool {
+            if (expected.len != actual.len) return false;
+            for (expected) |column| {
+                if (std.mem.indexOfScalar(u8, actual, column) == null) return false;
+            }
+            return true;
+        }
+
+        fn referencedConstraintIndex(self: *const Self, constraint: *const S.Constraint, snapshot: Snapshot) u32 {
+            const slot = self.visibleTableSlot(constraint.ref_oid, snapshot) orelse return 0;
+            const parent = &self.tables[slot];
+            var keys: [config.columns]u8 = undefined;
+            if (sameIndexKeys(constraint.refColumns(), primaryColumns(parent, &keys))) return parent.oid + 1;
+            for (parent.indexes[0..parent.index_count]) |*index| {
+                if (index.unique and index.predicate.len == 0 and sameIndexKeys(constraint.refColumns(), index.keyColumns())) return index.oid;
+            }
+            return 0;
+        }
+
+        fn writeConstraintColumns(table: *const S.Table, columns: []const u8, text: *CatalogTextWriter) void {
+            text.add("(");
+            for (columns, 0..) |column, position| {
+                if (position != 0) text.add(", ");
+                text.ident(table.columns[column].name.slice());
+            }
+            text.add(")");
+        }
+
+        fn postgresConstraintDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const table = &self.tables[found.slot];
+                if (oid != 0 and table.primary_constraint_oid == oid) {
+                    const primary = if (S.primaryConstraint(table)) |position| &table.constraints[position] else null;
+                    return try self.renderConstraint(table, primary, .primary, pretty, out);
+                }
+                for (table.constraints[0..table.constraint_count]) |*constraint| {
+                    if (oid != 0 and constraint.oid == oid) {
+                        return try self.renderConstraint(table, constraint, constraint.kind, pretty, out);
+                    }
+                }
+            }
+            return null;
+        }
+
+        fn renderConstraint(self: *const Self, table: *const S.Table, constraint: ?*const S.Constraint, kind: S.ConstraintKind, pretty: bool, out: []u8) Error!usize {
+            var text: CatalogTextWriter = .{ .out = out };
+            switch (kind) {
+                .primary => {
+                    var keys: [config.columns]u8 = undefined;
+                    text.add("PRIMARY KEY ");
+                    writeConstraintColumns(table, primaryColumns(table, &keys), &text);
+                },
+                .unique => {
+                    const item = constraint.?;
+                    text.add(if (item.nulls_not_distinct) "UNIQUE NULLS NOT DISTINCT " else "UNIQUE ");
+                    writeConstraintColumns(table, item.keyColumns(), &text);
+                },
+                .check => {
+                    const expression = constraint.?.expression.slice();
+                    text.add(if (pretty) "CHECK (" else "CHECK ((");
+                    text.add(expression);
+                    text.add(if (pretty) ")" else "))");
+                },
+                .foreign => {
+                    const item = constraint.?;
+                    const slot = self.visibleTableSlot(item.ref_oid, self.seq_snap) orelse return error.TableNotFound;
+                    const parent = &self.tables[slot];
+                    text.add("FOREIGN KEY ");
+                    writeConstraintColumns(table, item.keyColumns(), &text);
+                    text.add(" REFERENCES ");
+                    if (!self.inRelationSearchPath(parent.namespace, parent.name.slice())) {
+                        text.ident(self.namespaceName(parent.namespace));
+                        text.add(".");
+                    }
+                    text.ident(parent.name.slice());
+                    writeConstraintColumns(parent, item.refColumns(), &text);
+                    if (item.on_update != .no_action) {
+                        text.add(" ON UPDATE ");
+                        text.add(foreignActionText(item.on_update));
+                    }
+                    if (item.on_delete != .no_action) {
+                        text.add(" ON DELETE ");
+                        text.add(foreignActionText(item.on_delete));
+                    }
+                },
+                // The original exclusion definition does not retain the
+                // chosen access method, so it cannot be reconstructed yet.
+                .exclusion => return error.UnsupportedStatement,
+            }
+            if (constraint) |item| {
+                if (item.deferrable) text.add(" DEFERRABLE");
+                if (item.initially_deferred) text.add(" INITIALLY DEFERRED");
+            }
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
         }
 
         fn renderIndex(self: *const Self, table: *const S.Table, name: []const u8, unique: bool, keys: []const u8, index: ?*const S.Index, column: i32, pretty: bool, out: []u8) Error!usize {
@@ -5639,6 +5778,7 @@ pub fn Database(comptime config: Config) type {
             table.namespace = create.namespace;
             S.setConstraints(table, create.constraints[0..create.constraint_count]);
             S.setExtras(table, &create.extras);
+            try self.assignConstraintOids(table, null);
             // A foreign key to the table itself takes its OID now.
             for (table.constraints[0..table.constraint_count]) |*constraint| {
                 if (constraint.kind == .foreign and constraint.ref_oid == 0) constraint.ref_oid = table.oid;
@@ -5892,6 +6032,7 @@ pub fn Database(comptime config: Config) type {
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
             S.setExtras(copy, &alter.extras);
+            try self.assignConstraintOids(copy, source);
             S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
             copy.live = true;
             copy.pending_create = true;
@@ -7095,7 +7236,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
@@ -8815,6 +8956,24 @@ pub fn Database(comptime config: Config) type {
             return oid;
         }
 
+        fn takeConstraintOid(self: *Self) Error!u32 {
+            if (self.next_constraint_oid == 0xffffffff) return error.TableCapacity;
+            const oid = self.next_constraint_oid;
+            self.next_constraint_oid += 1;
+            return oid;
+        }
+
+        fn assignConstraintOids(self: *Self, table: *S.Table, previous: ?*const S.Table) Error!void {
+            if (S.keyed(table)) {
+                const saved = if (previous) |old| old.primary_constraint_oid else 0;
+                table.primary_constraint_oid = if (saved == 0) try self.takeConstraintOid() else saved;
+            }
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind == .primary) continue;
+                if (previous == null or constraint.oid == 0) constraint.oid = try self.takeConstraintOid();
+            }
+        }
+
         fn objectSlot(self: *Self, class: tg.Class) Error!usize {
             for (0..2) |attempt| {
                 switch (class) {
@@ -10099,10 +10258,10 @@ pub fn Database(comptime config: Config) type {
             return change_log.opCount(record);
         }
 
-        /// Appends a catalog_counters op (next OID and every live table's next rowid).
+        /// Appends catalog OID counters and every live table's next row ID.
         pub fn encodeCatalogCounters(self: *const Self, record: []u8, used: *usize) Error!void {
             var writer = try change_log.Writer.init(record, used.*);
-            try C.encodeCounters(&writer, change_log.first_oid + self.oid_counter, &self.tables);
+            try C.encodeCounters(&writer, change_log.first_oid + self.oid_counter, self.next_constraint_oid, &self.tables);
             used.* = try writer.finish();
         }
 

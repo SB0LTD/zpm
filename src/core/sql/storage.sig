@@ -263,6 +263,9 @@ pub fn Storage(comptime config: types.Config) type {
         pub const Constraint = struct {
             kind: ConstraintKind = .check,
             name: V.Name = .{},
+            /// Primary constraints use Table.primary_constraint_oid, including
+            /// an implicit single-column primary key with no Constraint entry.
+            oid: u32 = 0,
             nulls_not_distinct: bool = false,
             column_count: u8 = 0,
             columns: [config.columns]u8 = @splat(0),
@@ -365,6 +368,7 @@ pub fn Storage(comptime config: types.Config) type {
             columns: [config.columns]V.Column = @splat(.{}),
             /// Schema OID (cat_namespaces); public unless created in a schema.
             namespace: u32 = 2200,
+            primary_constraint_oid: u32 = 0,
             constraint_count: usize = 0,
             constraints: [constraint_capacity]Constraint = @splat(.{}),
             /// pg_class relkind: 'r' table, 'v' view, 'm' materialized view,
@@ -950,6 +954,7 @@ pub fn Storage(comptime config: types.Config) type {
                 table.primary_column = index;
             };
             table.namespace = 2200;
+            table.primary_constraint_oid = 0;
             table.constraint_count = 0;
             setExtras(table, &.{});
             table.truncate_csn = 0;
@@ -982,6 +987,7 @@ pub fn Storage(comptime config: types.Config) type {
                 destination.integral_layout = IntegralLayout.forColumns(destination.columns[0..destination.column_count]).?;
             };
             destination.namespace = source.namespace;
+            destination.primary_constraint_oid = source.primary_constraint_oid;
             destination.constraint_count = source.constraint_count;
             @memcpy(destination.constraints[0..source.constraint_count], source.constraints[0..source.constraint_count]);
             setExtras(destination, &extrasOf(source));
