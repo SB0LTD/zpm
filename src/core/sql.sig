@@ -5382,9 +5382,9 @@ pub fn Database(comptime config: Config) type {
                 while (fields.next()) |field| : (ordinal += 1) {
                     const data_type = types.typeFromOid(field.oid) orelse return error.UndefinedObject;
                     const info = types.typeInfo(data_type);
-                    const align = [1]u8{info.alignment};
+                    const alignment_label = [1]u8{info.alignment};
                     const collation_oid = collation.typeCollation(types.typeOfData(data_type));
-                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), nameCell(""), nameCell(""), boolCell(false), intCell(collation_oid), intCell(info.len), nameCell(&align) });
+                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), nameCell(""), nameCell(""), boolCell(false), intCell(collation_oid), intCell(info.len), nameCell(&alignment_label) });
                 }
             }
         }
@@ -5664,8 +5664,8 @@ pub fn Database(comptime config: Config) type {
                             switch (view) {
                                 .pg_attribute => {
                                     const info = types.typeInfo(column.data_type);
-                                    const align = [1]u8{info.alignment};
-                                    try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(info.oid), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind != .generated) "" else if (column.virtual) "v" else "s"), boolCell(has_expression), intCell(collation.typeCollation(types.typeOfData(column.data_type))), intCell(info.len), nameCell(&align) });
+                                    const alignment_label = [1]u8{info.alignment};
+                                    try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(info.oid), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind != .generated) "" else if (column.virtual) "v" else "s"), boolCell(has_expression), intCell(collation.typeCollation(types.typeOfData(column.data_type))), intCell(info.len), nameCell(&alignment_label) });
                                 },
                                 .pg_attrdef => if (has_expression) {
                                     try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column) });
