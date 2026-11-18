@@ -1,0 +1,46 @@
+name: Packed projected cache correctness
+
+on:
+  push:
+    branches: [ci/pg-migration-packed-cache-arm64-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Install checksum-verified Sig 0.6.5
+        shell: bash
+        run: |
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-aarch64-linux.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" -o "$RUNNER_TEMP/$asset"
+          echo "ef890f870f3215e60d25588742b74fa9d2808addbc0112b7c37818a73dfb0643  $RUNNER_TEMP/$asset" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sdk"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig | head -n 1)
+          standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' | head -n 1)
+          test -x "$compiler"
+          test -f "$standard"
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+      - name: Run compact projection and integer Top-N contracts
+        shell: bash
+        run: |
+          set -eo pipefail
+          mkdir evidence
+          test "$(git rev-parse HEAD^)" = "c4c867f2990ee382f7961d028cea9c2122b50eeb"
+          git rev-parse HEAD^ >evidence/source.txt
+          "$SIG" version | tee evidence/sig-version.log
+          "$SIG" build run-contract-sql-projected-cache run-contract-sql-projected-filter run-contract-parallel-read run-contract-sql-tx-session \
+            --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: packed-projected-cache-contracts
+          path: evidence/
