@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 462717db26f95989c99e6b736a602610301c9155
+          ref: f5dea78cbea7992a746c86a4cec4c57138fecb11
       - name: Install checksum-verified Sig 0.6.5
         shell: bash
         run: |
@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -d --name catalog-char-postgres -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18.3
+          docker run --rm -d --name catalog-char-postgres -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18.3-bookworm@sha256:80630f83606d8db77d30b3851b16a9f78be2d0d4dda6f7b82a1fdca5ebe3acba
           trap 'docker rm -f catalog-char-postgres >/dev/null' EXIT
           for i in $(seq 1 90); do
             if docker exec catalog-char-postgres pg_isready -h localhost -U postgres; then break; fi
