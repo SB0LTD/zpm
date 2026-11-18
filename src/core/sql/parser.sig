@@ -1642,14 +1642,17 @@ pub fn Parser(comptime config: types.Config) type {
         fn internalCharQualifier(self: *Self) Error!bool {
             if (self.mode != .standard or self.tokens.dialect != .postgres or !self.rawWord("pg_catalog")) return false;
             const next = try self.peek();
-            return next.kind == .symbol and next.symbol == .dot;
+            if (next.kind != .symbol or next.symbol != .dot) return false;
+            var lookahead = self.after_peek;
+            const type_name = try lookahead.next();
+            return wordIs(self.source, type_name, "char") or
+                (type_name.kind == .quoted_word and types.same(type_name.raw(self.source), "char"));
         }
 
         fn typeName(self: *Self) Error!TypeSpec {
             if (try self.internalCharQualifier()) {
                 try self.advance();
                 try self.expectSymbol(.dot);
-                if (!self.internalCharName() and !self.rawWord("char")) return error.UndefinedObject;
                 try self.advance();
                 return self.typeArraySuffix(.{ .ty = .pg_internal_char });
             }
