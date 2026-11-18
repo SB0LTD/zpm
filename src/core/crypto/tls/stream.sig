@@ -6,6 +6,9 @@ const tls = @import("server.sig");
 pub const Error = tls.Error || error{ InvalidProgress, OutputPending, TruncatedStream };
 pub const record_capacity = record.header_bytes + record.max_ciphertext_bytes;
 
+/// Derives the SCRAM tls-server-end-point binding from the configured DER leaf.
+pub const serverEndpointDigest = @import("x509.sig").serverEndpointDigest;
+
 pub const Buffers = struct {
     receive: []u8,
     send: []u8,
