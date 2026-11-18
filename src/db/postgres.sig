@@ -285,6 +285,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// CopyFail after an error, as PostgreSQL does.
         const CopyState = struct {
             mode: enum { none, in, discard } = .none,
+            portal: ?usize = null,
             remaining: usize = 0,
             info: CopyInfo = .{},
             sql: [sql_capacity]u8 = undefined,
@@ -872,7 +873,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         p.live = false;
                     };
                     if (trim(source).len == 0) try w.empty('I') else if (has_copy and word(source, "copy")) {
-                        try self.startCopy(db, source, w);
+                        try self.startCopy(db, source, w, null);
                         // COPY FROM: ReadyForQuery follows CopyDone/CopyFail.
                         if (self.copy.mode == .in) return false;
                     } else if (try self.clusterCommand(db, source)) |command_tag| {
@@ -936,9 +937,16 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         if (active != index) return error.PortalBusy;
                     }
                     if (p.complete) {
-                        try commandFor(w, p.source(), p.command, p.result_rows, p.affected, p.rolled_back);
+                        if (equal(p.command, "COPY")) {
+                            try copyCommand(w, p.affected);
+                        } else try commandFor(w, p.source(), p.command, p.result_rows, p.affected, p.rolled_back);
                         return false;
                     }
+                    if (comptime has_copy and @hasDecl(DB, "beginExtendedGroup")) if (word(p.source(), "copy")) {
+                        try db.beginExtendedGroup();
+                        try self.startCopy(db, p.source(), w, index);
+                        return false;
+                    };
                     if (self.active_portal == null) {
                         try self.executePortal(db, p, limit);
                         try writeNotice(db, w);
@@ -1096,18 +1104,21 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         /// COPY TO STDOUT runs its SELECT and streams CopyData; COPY FROM
         /// STDIN opens the store's COPY and sends CopyInResponse.
-        fn startCopy(self: *Self, db: *DB, source: []const u8, w: *Writer) !void {
+        fn startCopy(self: *Self, db: *DB, source: []const u8, w: *Writer, portal_index: ?usize) !void {
             var select: [sql_capacity + 1024]u8 = undefined;
             var info = try db.copyDescribe(source, &select);
             if (info.direction == .to) {
                 const query = select[0..info.select_len];
                 try self.resolveCopyQuoteColumns(db, query, &info);
                 try self.execute(db, query);
-                return self.copyOut(db, &info, w);
+                try self.copyOut(db, &info, w);
+                if (portal_index) |index| self.completeCopyPortal(index, self.result.row_count);
+                return;
             }
             if (source.len > sql_capacity) return error.StatementCapacity;
             const begun = try db.copyBegin(source);
             self.copy.mode = .in;
+            self.copy.portal = portal_index;
             self.copy.remaining = 0;
             self.copy.info = begun;
             @memcpy(self.copy.sql[0..source.len], source);
@@ -1198,11 +1209,22 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 w.end(p);
             }
             try w.empty('c');
+            try copyCommand(w, self.result.row_count);
+        }
+
+        fn copyCommand(w: *Writer, rows_copied: usize) error{BufferTooSmall}!void {
             const c = try w.begin('C');
             try w.append("COPY ");
-            try w.number(@intCast(self.result.row_count));
+            try w.number(@intCast(rows_copied));
             try w.byte(0);
             w.end(c);
+        }
+
+        fn completeCopyPortal(self: *Self, index: usize, rows_copied: usize) void {
+            const bound = &self.portals[index];
+            bound.complete = true;
+            bound.command = "COPY";
+            bound.affected = rows_copied;
         }
 
         fn copyHandle(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
@@ -1277,11 +1299,18 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     if (discarding) return .{ .consumed = total };
                     db.copyFail();
                     try failure(&w, "57014", "COPY from stdin failed");
-                    try self.ready(db, &w);
+                    try self.copyErrorBoundary(db, &w);
                     return .{ .consumed = total, .written = w.at };
                 },
                 // Flush and Sync are ignored in copy-in mode.
-                'H', 'S' => return .{ .consumed = total },
+                'H' => return .{ .consumed = total },
+                'S' => {
+                    if (discarding and self.copy.portal != null) {
+                        self.copy.mode = .none;
+                        return self.handle(db, input, output);
+                    }
+                    return .{ .consumed = total };
+                },
                 else => {
                     if (discarding) {
                         self.copy.mode = .none;
@@ -1290,7 +1319,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     self.copy.mode = .none;
                     db.copyFail();
                     try failure(&w, "08P01", "unexpected message type during COPY from stdin");
-                    try self.ready(db, &w);
+                    try self.copyErrorBoundary(db, &w);
                     return .{ .consumed = total, .written = w.at };
                 },
             }
@@ -1323,11 +1352,17 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             db.copyFail();
             try failure(w, sqlstate(err), @errorName(err));
-            try self.ready(db, w);
+            try self.copyErrorBoundary(db, w);
             self.copy.mode = .discard;
             self.copy.carry_len = 0;
             self.copy.carry_rows = false;
             return false;
+        }
+
+        fn copyErrorBoundary(self: *Self, db: *DB, w: *Writer) error{BufferTooSmall}!void {
+            if (self.copy.portal != null) {
+                self.failed = true;
+            } else try self.ready(db, w);
         }
 
         fn terminateTransaction(self: *Self, db: *DB, w: *Writer) error{BufferTooSmall}!void {
@@ -1477,12 +1512,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             if (self.copy.binary_header) return error.BadCopyFormat;
             const copied = try db.copyEnd();
-            const c = try w.begin('C');
-            try w.append("COPY ");
-            try w.number(@intCast(copied));
-            try w.byte(0);
-            w.end(c);
-            try self.ready(db, w);
+            try copyCommand(w, copied);
+            if (self.copy.portal) |index| {
+                self.completeCopyPortal(index, copied);
+            } else try self.ready(db, w);
         }
 
 
@@ -1492,7 +1525,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const command_source = trim(source);
             if (word(command_source, "begin") or word(command_source, "commit") or word(command_source, "rollback") or
                 word(command_source, "end") or word(command_source, "abort") or word(command_source, "deallocate") or
-                word(command_source, "start")) return;
+                word(command_source, "start") or word(command_source, "copy")) return;
             try db.describe(source, &self.result);
         }
 

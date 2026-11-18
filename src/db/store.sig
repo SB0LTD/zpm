@@ -1009,6 +1009,12 @@ pub fn Store(comptime Raw: type) type {
                 if (self.postgres_extended_implicit) try self.commitTransaction();
             }
 
+            pub fn beginExtendedGroup(self: *Connection) !void {
+                if (self.in_transaction) return;
+                try self.beginTransaction();
+                self.postgres_extended_implicit = true;
+            }
+
             /// Errors at a simple Query or Sync boundary abort the open
             /// implicit group immediately, even if Flush exposed earlier
             /// statement results to the client.
@@ -1988,8 +1994,7 @@ pub fn Store(comptime Raw: type) type {
                 };
                 if (extended and !self.in_transaction) switch (command_kind) {
                     .none, .set, .reset, .set_transaction, .set_session_characteristics, .show => {
-                        try self.beginTransaction();
-                        self.postgres_extended_implicit = true;
+                        try self.beginExtendedGroup();
                     },
                     else => {},
                 };
