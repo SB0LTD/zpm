@@ -996,7 +996,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             return false;
         }
-        fn closeIdlePortals(self: *Self, db: *const DB) void {
+        fn closeIdlePortals(self: *Self, db: *DB) void {
             if (!@hasDecl(DB, "transactionStatus") or db.transactionStatus() == 'I') {
                 for (&self.portals) |*p| p.live = false;
                 self.active_portal = null;
