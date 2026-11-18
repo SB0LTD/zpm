@@ -1502,8 +1502,28 @@ pub fn ChangeLog(comptime config: types.Config) type {
             return false;
         }
 
-        fn validate(db: anytype, record: []const u8, scratch: *Scratch) Error!void {
+        const BaseImageRecord = struct {
+            csn: u64,
+            bank: usize,
+            op: Op,
+        };
+
+        fn baseImageSchema(namespace: u32, relkind: u8, indexes: usize, parent: u32, dependencies: usize, constraints: usize, columns: []const V.Column) bool {
+            if (namespace != public_namespace or relkind != 'r' or indexes != 0 or parent != 0 or dependencies != 0 or constraints != 0) return false;
+            for (columns) |column| if (column.default_kind != .none or column.virtual) return false;
+            return true;
+        }
+
+        pub fn supportsBaseImage(table: *const S.Table) bool {
+            return baseImageSchema(table.namespace, table.relkind, table.index_count, table.parent, table.depend_count, table.constraint_count, table.columns[0..table.column_count]);
+        }
+
+        fn validate(db: anytype, record: []const u8, scratch: *Scratch, image: anytype) Error!void {
+            const base_image = @TypeOf(image) == BaseImageRecord;
             const count = try opCount(record);
+            if (comptime base_image) {
+                if (count == 0 or count > config.tx_writes or (image.op != .insert and count != 1)) return error.InvalidChangeRecord;
+            }
             scratch.epoch +%= 1;
             if (scratch.epoch == 0) {
                 @memset(&scratch.rows, .{});
@@ -1550,6 +1570,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             var row: V.Row = .{};
             for (0..count) |_| {
                 const tag = try reader.int(u8);
+                if (comptime base_image) if (tag != @intFromEnum(image.op)) return error.InvalidChangeRecord;
                 switch (tag) {
                     @intFromEnum(Op.create_table) => {
                         const definition = try decodeCreate(&reader);
@@ -1567,6 +1588,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             if (!vt.live and free == null and S.createBankFits(&db.tables[index], columns, definition.extras.index_count)) free = index;
                         }
                         const index = free orelse return error.ChangeRecordConflict;
+                        if (comptime base_image) {
+                            const extras = &definition.extras;
+                            if (index != image.bank or !baseImageSchema(definition.namespace, extras.relkind, extras.index_count,
+                                extras.parent, extras.depend_count, definition.constraint_count, columns)) return error.ChangeRecordConflict;
+                        }
                         if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         try validateExtras(db, scratch, &definition, null);
                         purge(scratch, @intCast(index));
@@ -1703,6 +1729,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (counter < next_oid) return error.ChangeRecordConflict;
                         next_oid = counter;
                         const tables = try reader.int(u8);
+                        if (comptime base_image) if (tables != 1) return error.InvalidChangeRecord;
                         if (tables > config.tables) return error.ChangeRecordConflict;
                         for (0..tables) |_| {
                             const index = try findVTable(scratch, try reader.int(u32));
@@ -1853,9 +1880,21 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         /// `db` provides tables, oid_counter, csn, cid and epoch.
         pub fn apply(db: anytype, record: []const u8, scratch: *Scratch) Error!void {
-            try validate(db, record, scratch);
+            return applyRecord(db, record, scratch, null);
+        }
+
+        /// Restore one checked image part into an unpublished startup store.
+        /// All image parts share the original committed SQL CSN.
+        pub fn applyBaseImageRecord(db: anytype, record: []const u8, scratch: *Scratch, csn: u64, bank: usize, op: Op) Error!void {
+            if (csn == 0 or (db.csn != 0 and db.csn != csn)) return error.InvalidParameterValue;
+            if (op != .create_table and op != .insert and op != .catalog_counters) return error.InvalidChangeRecord;
+            return applyRecord(db, record, scratch, BaseImageRecord{ .csn = csn, .bank = bank, .op = op });
+        }
+
+        fn applyRecord(db: anytype, record: []const u8, scratch: *Scratch, image: anytype) Error!void {
+            try validate(db, record, scratch, image);
             // Validated: the remaining errors are unreachable invariants.
-            const csn = db.csn + 1;
+            const csn = if (comptime @TypeOf(image) == BaseImageRecord) image.csn else db.csn + 1;
             db.epoch +%= 1;
             if (db.epoch == 0) db.epoch = 1;
             db.cid +%= 1;
