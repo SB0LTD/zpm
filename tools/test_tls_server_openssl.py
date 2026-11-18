@@ -122,8 +122,10 @@ def exchange(openssl, binary, ca, directory, *, mode, expected, offer=None):
                     client.kill()
         (directory / "openssl-client.log").write_bytes(client_error)
         (directory / "server.log").write_bytes(server_error)
-        if expected == "rejected":
-            passed = client.returncode != 0 and server.returncode == 0 and output == b"" and b"alert number 120" in client_error
+        alert = {"mismatch": 120, "missing": 109}.get(expected)
+        if alert is not None:
+            passed = (client.returncode != 0 and server.returncode == 0 and output == b""
+                      and f"alert number {alert}".encode("ascii") in client_error)
         elif expected == "selected":
             transcript = (directory / "openssl-handshake.log").read_bytes()
             encrypted_extensions = re.search(rb"^<<< [^\n]*, EncryptedExtensions\r?\n((?:[ \t]+[0-9a-f ]+\r?\n)+)",
@@ -137,7 +139,8 @@ def exchange(openssl, binary, ca, directory, *, mode, expected, offer=None):
         if not passed:
             raise RuntimeError(f"TLS exchange failed. Client {client.returncode}, server {server.returncode}. See {directory}")
         return {"policy": mode, "offer": offer, "expected": expected, "client_exit": client.returncode,
-                "server_exit": server.returncode, "after_key_update": None if expected == "rejected" else "ZPM TLS response\n"}
+                "server_exit": server.returncode, "fatal_alert": alert,
+                "after_key_update": None if alert is not None else "ZPM TLS response\n"}
 
 
 def main():
@@ -169,10 +172,10 @@ def main():
         ("default-ignores-offer", "disabled", "fallback", "h2"),
         ("optional-no-offer", "optional", "fallback", None),
         ("optional-matches-list", "optional", "selected", "h2,postgresql"),
-        ("optional-mismatch", "optional", "rejected", "h2"),
+        ("optional-mismatch", "optional", "mismatch", "h2"),
         ("required-matches", "required", "selected", "postgresql"),
-        ("required-no-offer", "required", "rejected", None),
-        ("required-mismatch", "required", "rejected", "postgresqlx"),
+        ("required-no-offer", "required", "missing", None),
+        ("required-mismatch", "required", "mismatch", "postgresqlx"),
     )
     results = {name: exchange(args.openssl, binary, ca, directory / name, mode=mode, expected=expected, offer=offer)
                for name, mode, expected, offer in cases}

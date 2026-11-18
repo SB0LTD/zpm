@@ -127,8 +127,11 @@ pub const Stream = struct {
             };
         }
         const frame_read = self.handshake.receive(bytes) catch |err| {
-            if (err != error.NoApplicationProtocol) return err;
-            const alert = &tls.no_application_protocol_alert;
+            const alert = switch (err) {
+                error.NoApplicationProtocol => &tls.no_application_protocol_alert,
+                error.MissingAlpnExtension => &tls.missing_alpn_extension_alert,
+                else => return err,
+            };
             @memcpy(self.buffers.send[0..alert.len], alert);
             self.send_end = alert.len;
             self.failed = true;

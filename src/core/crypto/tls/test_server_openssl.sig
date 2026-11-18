@@ -54,7 +54,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ .protocol = "postgresql", .required = true }
     else
         return error.TestArguments;
-    const expect_alarm = std.mem.eql(u8, expectation, "rejected");
+    const expected_alert: ?[]const u8 = if (std.mem.eql(u8, expectation, "mismatch"))
+        &tls.no_application_protocol_alert
+    else if (std.mem.eql(u8, expectation, "missing"))
+        &tls.missing_alpn_extension_alert
+    else
+        null;
     const expect_selection = std.mem.eql(u8, expectation, "selected");
     var identity = try tls.Identity.init(&.{fixture.certificate}, &fixture.private_key);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&identity.key_pair));
@@ -72,8 +77,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         switch (try stream.next()) {
             .need_input => try appendInput(&stream),
             .need_output => {
-                if (expect_alarm) {
-                    if (!std.mem.eql(u8, stream.output(), &tls.no_application_protocol_alert)) return error.TestWrongAlert;
+                if (expected_alert) |alert| {
+                    if (!std.mem.eql(u8, stream.output(), alert)) return error.TestWrongAlert;
                     if (try stream.next() != .need_output or stream.selectedAlpn() != null) return error.TestWrongAlert;
                     try drain(&stream);
                     if (stream.next()) |_| {
@@ -86,7 +91,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .progress => {},
             .established => {
                 const chosen = stream.selectedAlpn();
-                if (expect_alarm or (chosen != null) != expect_selection) return error.TestWrongSelection;
+                if (expected_alert != null or (chosen != null) != expect_selection) return error.TestWrongSelection;
                 if (chosen) |protocol| if (!std.mem.eql(u8, protocol, "postgresql")) return error.TestWrongSelection;
             },
             .data => |bytes| {

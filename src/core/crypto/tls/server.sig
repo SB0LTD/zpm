@@ -32,6 +32,7 @@ pub const Error = hello.Error || application.Error || error{
     BadFinished,
     InvalidAlpnProtocol,
     NoApplicationProtocol,
+    MissingAlpnExtension,
 };
 
 /// Borrow immutable DER leaf-first chain bytes for all referencing exchanges.
@@ -82,6 +83,7 @@ pub const Alpn = struct { protocol: []const u8, required: bool = false };
 
 /// A fatal alert sent before ServerHello and before record protection is active.
 pub const no_application_protocol_alert = [_]u8{ 21, 3, 3, 0, 2, 2, 120 };
+pub const missing_alpn_extension_alert = [_]u8{ 21, 3, 3, 0, 2, 2, 109 };
 
 pub const Phase = enum { client_hello, server_flight, client_finished, established, transferred, failed };
 pub const FrameRead = union(enum) {
@@ -173,9 +175,10 @@ pub const Server = struct {
         const parsed = try hello.parseWithAlpn(self.hello_buffer[handshake_header_bytes..length],
             if (self.alpn) |policy| policy.protocol else null);
         if (self.alpn) |policy| {
-            self.alpn_matched = parsed.alpn_match orelse false;
-            if (!self.alpn_matched and (parsed.alpn_match != null or policy.required))
-                return error.NoApplicationProtocol;
+            if (parsed.alpn_match) |matched| {
+                if (!matched) return error.NoApplicationProtocol;
+                self.alpn_matched = true;
+            } else if (policy.required) return error.MissingAlpnExtension;
         }
         self.parsed = parsed;
         self.phase = .server_flight;
