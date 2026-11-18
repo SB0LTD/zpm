@@ -1280,14 +1280,14 @@ pub fn Parser(comptime config: types.Config) type {
                 },
                 .integer, .decimal => {
                     try self.advance();
-                    return .{ .kind = .number, .span = .{ .start = token.start, .len = token.end - token.start } };
+                    return .{ .kind = .number, .span = .{ .start = token.start, .len = token.end - token.start }, .integer = token.kind == .integer };
                 },
-                .symbol => if (token.symbol == .minus) {
+                .symbol => if (token.symbol == .minus or token.symbol == .plus) {
                     try self.advance();
                     const number = self.current;
                     if (number.kind != .integer and number.kind != .decimal) return error.Syntax;
                     try self.advance();
-                    return .{ .kind = .number, .span = .{ .start = token.start, .len = number.end - token.start } };
+                    return .{ .kind = .number, .span = .{ .start = number.start, .len = number.end - number.start }, .number_sign = if (token.symbol == .minus) '-' else '+', .integer = number.kind == .integer };
                 },
                 else => {},
             }

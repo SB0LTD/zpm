@@ -1135,6 +1135,71 @@ fn sqlstate(bytes: []const u8, wanted: []const u8) bool {
     return false;
 }
 
+fn expectFloatRow(source: []const u8, expected: []const []const u8) !void {
+    const bytes = try wireQuery(source);
+    var at: usize = 0;
+    while (at + 5 <= bytes.len) {
+        const length = get32(bytes[at + 1 ..][0..4]);
+        if (bytes[at] == 'D') {
+            const body = bytes[at + 5 .. at + 1 + length];
+            try check(body[0] == 0 and body[1] == expected.len);
+            var field: usize = 2;
+            for (expected) |text| {
+                const size = get32(body[field..][0..4]);
+                field += 4;
+                try check(same(body[field..][0..size], text));
+                field += size;
+            }
+            try check(field == body.len);
+            return;
+        }
+        at += 1 + length;
+    }
+    std.debug.print("no float wire DataRow for {s}, 0A000={any} 42704={any} 22023={any}\n", .{ source, sqlstate(bytes,"0A000"), sqlstate(bytes,"42704"), sqlstate(bytes,"22023") });
+    return error.TxSessionContractFailed;
+}
+
+fn floatOutputSetting() !void {
+    conn_c = .{ .store = &store, .id = 3 };
+    wire = .{};
+    try startupWire();
+    defer conn_c.disconnect();
+    const sample = "SELECT 1.2345678::REAL, 1.2345678901234567::DOUBLE PRECISION";
+    try expectFloatRow("SHOW extra_float_digits", &.{"1"});
+    try check(commandTag(try wireQuery("SET extra_float_digits TO 3"), "SET"));
+    try expectFloatRow(sample, &.{ "1.2345678", "1.2345678901234567" });
+    try check(commandTag(try wireQuery("SET extra_float_digits = 0"), "SET"));
+    try expectFloatRow(sample, &.{ "1.23457", "1.23456789012346" });
+    try expectFloatRow(sample ++ "::TEXT", &.{ "1.23457", "1.23456789012346" });
+    try expectFloatRow("SELECT point(1.2345678901234567, 0)", &.{"(1.23456789012346,0)"});
+    try expectFloatRow("SELECT 999999.5::REAL, 999999999999999.5::DOUBLE PRECISION", &.{ "1e+06", "1e+15" });
+    try expectFloatRow("SELECT '1.401298464324817e-45'::REAL, '4.9406564584124654e-324'::DOUBLE PRECISION", &.{ "1.4013e-45", "4.94065645841247e-324" });
+    try check(commandTag(try wireQuery("BEGIN"), "BEGIN"));
+    try check(commandTag(try wireQuery("SET LOCAL extra_float_digits = -3"), "SET"));
+    try expectFloatRow("SELECT current_setting('extra_float_digits')", &.{"-3"});
+    try expectFloatRow(sample, &.{ "1.23", "1.23456789012" });
+    try expectFloatRow("SELECT 1.125::REAL, 1.015::DOUBLE PRECISION", &.{ "1.12", "1.015" });
+    try check(commandTag(try wireQuery("ROLLBACK"), "ROLLBACK"));
+    try expectFloatRow("SHOW extra_float_digits", &.{"0"});
+    try check(commandTag(try wireQuery("SET extra_float_digits TO -15"), "SET"));
+    try expectFloatRow("SELECT 1.5::REAL, 2.5::DOUBLE PRECISION, 9.5::REAL, 0.000095::DOUBLE PRECISION", &.{ "2", "2", "1e+01", "0.0001" });
+    try expectFloatRow("SELECT '-0'::REAL, '-Infinity'::DOUBLE PRECISION, 'NaN'::REAL", &.{ "-0", "-Infinity", "NaN" });
+    try check(sqlstate(try wireQuery("SET extra_float_digits TO 4"), "22023"));
+    try check(sqlstate(try wireQuery("SET extra_float_digits TO -16"), "22023"));
+    try check(commandTag(try wireQuery("SET extra_float_digits TO +3"), "SET"));
+    try expectFloatRow("SHOW extra_float_digits", &.{"3"});
+    try check(commandTag(try wireQuery("SET extra_float_digits TO - /*gap*/ 013"), "SET"));
+    try expectFloatRow("SHOW extra_float_digits", &.{"-13"});
+    try expectFloatRow("SELECT set_config('extra_float_digits', '-013', false)", &.{"-11"});
+    try check(commandTag(try wireQuery("SET extra_float_digits = 2.5"), "SET"));
+    try expectFloatRow("SHOW extra_float_digits", &.{"2"});
+    _ = try wireQuery("CREATE TABLE configured_float (d DOUBLE PRECISION)");
+    _ = try wireQuery("INSERT INTO configured_float VALUES (1.2345678901234567)");
+    try expectFloatRow("SELECT set_config('extra_float_digits', '0', false), d::TEXT, d FROM configured_float", &.{ "0", "1.23456789012346", "1.23456789012346" });
+    try check(commandTag(try wireQuery("RESET extra_float_digits"), "RESET"));
+    try expectFloatRow("SHOW extra_float_digits", &.{"1"});
+}
+
 pub fn main(init: std.process.Init) !void {
     try oraclePrograms();
     try transactionModes();
@@ -1144,6 +1209,7 @@ pub fn main(init: std.process.Init) !void {
     try prepared();
     try locking();
     try notifications();
+    try floatOutputSetting();
     var buffer: [128]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-tx-session\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

@@ -119,6 +119,7 @@ pub fn SettingsOf(comptime Zone: type) type {
         timezone_len: u8 = 3,
         zone: Zone = .{},
         date_order: DateOrder = .mdy,
+        extra_float_digits: i8 = 1,
 
         pub fn applicationName(self: *const Self) []const u8 {
             return self.application_name[0..self.application_name_len];
@@ -221,7 +222,7 @@ pub const deadlock_timeout_ms: u32 = 1000;
 
 /// Settings this store implements; the engine owns the others it knows
 /// (transaction_*, default_transaction_*, search_path, placeholders).
-const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
+const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, extra_float_digits, server_version, server_encoding, integer_datetimes };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -238,6 +239,35 @@ fn canonical(which: Parameter) []const u8 {
         .intervalstyle => "IntervalStyle",
         else => @tagName(which),
     };
+}
+
+fn parseExtraFloatDigits(raw: []const u8) !i8 {
+    const text = std.mem.trim(u8, raw, " \t\r\n\x0b\x0c");
+    if (text.len == 0 or std.mem.indexOfScalar(u8, text, '_') != null) return error.InvalidSettingValue;
+    const digits = if (text[0] == '+' or text[0] == '-') text[1..] else text;
+    const base: u8 = if (digits.len > 1 and digits[0] == '0')
+        (if (digits[1] == 'x' or digits[1] == 'X') 0 else 8)
+    else 10;
+    const value = std.fmt.parseInt(i8, text, base) catch rounded: {
+        // PostgreSQL retries a configuration integer as a double after a
+        // decimal point or exponent, then rounds to the nearest even integer.
+        var end: usize = if (base == 0) 2 else 0;
+        while (end < digits.len) : (end += 1) {
+            const byte = digits[end];
+            const numeric = if (base == 8) byte >= '0' and byte <= '7' else digitByte(byte);
+            const hex_letter = base == 0 and ((byte >= 'a' and byte <= 'f') or (byte >= 'A' and byte <= 'F'));
+            if (!numeric and !hex_letter) break;
+        }
+        if (end == digits.len or (digits[end] != '.' and digits[end] != 'e' and digits[end] != 'E')) return error.InvalidSettingValue;
+        const number = std.fmt.parseFloat(f64, text) catch return error.InvalidSettingValue;
+        if (!(number > -16 and number < 4)) return error.InvalidSettingValue;
+        const floor = @floor(number);
+        const fraction = number - floor;
+        const below: i8 = @intFromFloat(floor);
+        break :rounded if (fraction > 0.5 or (fraction == 0.5 and below & 1 != 0)) below + 1 else below;
+    };
+    if (value < -15 or value > 3) return error.InvalidSettingValue;
+    return value;
 }
 
 fn parseMilliseconds(text: []const u8) !u32 {
@@ -668,6 +698,9 @@ pub fn Store(comptime Raw: type) type {
                     error.UndefinedSetting => error.UndefinedSetting,
                     else => error.InvalidSettingValue,
                 };
+                if (comptime has_session and @hasField(Raw.SessionValues, "extra_float_digits")) {
+                    if (which == .extra_float_digits) self.store.database.session.extra_float_digits = self.settings.extra_float_digits;
+                }
                 return true;
             }
 
@@ -753,6 +786,7 @@ pub fn Store(comptime Raw: type) type {
             pub fn detachedReadSession(self:*const Connection,execution_control:*ExecutionControl,statement_us:?i64) Raw.SessionValues {
                 var session: Raw.SessionValues = .{.zone=self.settings.zone,.transaction_us=statement_us,.statement_us=statement_us,
                     .clock=self.store.wall_clock,.database=if(self.database_len==0) "postgres" else self.database_name[0..self.database_len],.control=execution_control};
+                if (comptime @hasField(Raw.SessionValues, "extra_float_digits")) session.extra_float_digits = self.settings.extra_float_digits;
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "public_schema_on_path")) {
                     session.public_schema_on_path = self.engine_session.values.publicSchemaOnPath();
                 }
@@ -800,6 +834,7 @@ pub fn Store(comptime Raw: type) type {
                     .mysql_keep_zero = self.mysql_keep_zero,
                     .mysql_last_insert_id = self.mysql_last_insert_id,
                 };
+                if (comptime has_session and @hasField(@TypeOf(raw.session), "extra_float_digits")) raw.session.extra_float_digits = self.settings.extra_float_digits;
                 if (comptime has_control) raw.session.control = if (self.running_statement) &self.execution else null;
                 if (comptime has_engine_session) {
                     raw.session_state = &self.engine_session;
@@ -991,6 +1026,7 @@ pub fn Store(comptime Raw: type) type {
                     .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
                     .standard_conforming_strings => if (!(value.len == 0 or sameInsensitive(value, "on") or sameInsensitive(value, "true"))) return error.InvalidSettingValue,
                     .datestyle => target.date_order = try dateOrder(value, target.date_order),
+                    .extra_float_digits => target.extra_float_digits = if (is_default and value.len == 0) 1 else try parseExtraFloatDigits(value),
                     .intervalstyle => if (!(value.len == 0 or sameInsensitive(value, "postgres"))) return error.InvalidSettingValue,
                     .deadlock_timeout, .server_version, .server_encoding, .integer_datetimes => return error.InvalidSettingValue,
                 }
@@ -1061,6 +1097,7 @@ pub fn Store(comptime Raw: type) type {
                     .standard_conforming_strings, .integer_datetimes => "on",
                     .datestyle => self.settings.dateStyle(),
                     .intervalstyle => "postgres",
+                    .extra_float_digits => return std.fmt.bufPrint(out, "{d}", .{self.settings.extra_float_digits}) catch unreachable,
                     .server_version => "16.0",
                 };
                 @memcpy(out[0..value.len], value);
@@ -1283,6 +1320,7 @@ pub fn Store(comptime Raw: type) type {
                         target.zone = source.zone;
                     },
                     .datestyle => target.date_order = source.date_order,
+                    .extra_float_digits => target.extra_float_digits = source.extra_float_digits,
                     else => {},
                 }
             }

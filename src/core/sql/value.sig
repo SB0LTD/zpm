@@ -48,6 +48,7 @@ pub const Session = struct {
     /// The implicit catalog remains visible when a PostgreSQL session
     /// installs an empty explicit schema path.
     public_schema_on_path: bool = true,
+    extra_float_digits: i8 = 1,
     mysql_keep_zero: bool = false,
     mysql_last_insert_id: u64 = 0,
     control: ?*types.ExecutionControl = null,
@@ -468,8 +469,8 @@ pub fn Io(comptime config: types.Config) type {
                 .integer => |value| integerText(value, buffer),
                 .boolean => |value| copy(buffer, if (verbose) (if (value) "true" else "false") else (if (value) "t" else "f")),
                 .text => |*value| copy(buffer, value.slice()),
-                .float4 => |value| float_text.format(f32, value, buffer),
-                .float8 => |value| float_text.format(f64, value, buffer),
+                .float4 => |value| float_text.format(f32, value, session.extra_float_digits, buffer),
+                .float8 => |value| float_text.format(f64, value, session.extra_float_digits, buffer),
                 .numeric => |*value| N.format(value, buffer),
                 .date => |value| temporal.formatDate(value, buffer),
                 .timestamp => |value| temporal.formatTimestamp(value, null, buffer),
@@ -494,8 +495,8 @@ pub fn Io(comptime config: types.Config) type {
                 // inet hides a full-length netmask except in its text cast.
                 .inet => |*value| network.format(value, value.cidr or verbose, buffer),
                 .macaddr => |*value| network.formatMac(value, buffer),
-                .point => |value| geometric.formatPoint(value, buffer),
-                .box => |value| geometric.formatBox(value, buffer),
+                .point => |value| geometric.formatPoint(value, session.extra_float_digits, buffer),
+                .box => |value| geometric.formatBox(value, session.extra_float_digits, buffer),
                 .xml => |*value| xml.output(value.slice(), buffer),
                 // regtypeout: the type's SQL name, or the number.
                 .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),

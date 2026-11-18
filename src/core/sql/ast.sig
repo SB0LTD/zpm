@@ -1104,6 +1104,9 @@ pub const SettingName = struct {
 pub const SettingValue = struct {
     kind: enum { default, word, string, number } = .default,
     span: Span = .{},
+    // Sign of a numeric token, separate from whitespace or comments.
+    number_sign: u8 = 0,
+    integer: bool = false,
     quoted: lexer.Quoted = .{ .start = 0, .end = 0, .len = 0 },
     /// A comma list (`SET search_path TO a, b`): its raw source bytes
     /// [list_start, list_end); 0 when the value is a single item.
