@@ -905,6 +905,9 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "row_security")) {
                     session.row_security = self.engine_session.values.row_security;
                 }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "synchronize_seqscans")) {
+                    session.synchronize_seqscans = self.dialect == .postgres and self.engine_session.values.synchronize_seqscans;
+                }
                 return session;
             }
 

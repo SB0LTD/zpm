@@ -357,6 +357,8 @@ pub fn Storage(comptime config: types.Config) type {
             values: [partition_values]V.Cell = @splat(.null_value),
         };
 
+        const ScanHint = struct { slot: u32 align(64) = 0 };
+
         pub const Table = struct {
             live: bool = false,
             pending_create: bool = false,
@@ -426,6 +428,61 @@ pub fn Storage(comptime config: types.Config) type {
             integral_layout: if (integral_enabled) IntegralLayout else void = if (integral_enabled) .{} else {},
             row_index: if (config.external_storage) []u32 else [row_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
             key_index: if (config.external_storage) []u32 else [key_index_capacity]u32 = if (config.external_storage) &.{} else @splat(0),
+            /// Advisory position on its own cache line, outside the row directory.
+            seqscan_hint: ScanHint = .{},
+        };
+
+        const seqscan_grain: usize = 256;
+
+        pub fn supportsSynchronizedScan(table: *const Table) bool {
+            return config.synchronized_scan_rows != 0 and table.row_high >= config.synchronized_scan_rows and
+                table.row_high > seqscan_grain and table.row_high <= 0xffffffff and
+                (table.relkind == 'r' or table.relkind == 'm') and !table.pending_create and table.pending_truncate.owner.epoch == 0;
+        }
+
+        /// Each cursor fixes its own physical range and wraps at most once.
+        /// Readers share only an advisory location through relaxed atomics.
+        pub const PhysicalScan = struct {
+            high: usize,
+            start: usize,
+            next_slot: usize,
+            left: usize,
+            shared: bool,
+
+            pub const Range = struct { start: usize, end: usize };
+
+            pub fn init(table: *const Table, enabled: bool) PhysicalScan {
+                const shared = enabled and supportsSynchronizedScan(table);
+                const hint = if (shared) @atomicLoad(u32, &table.seqscan_hint.slot, .monotonic) else 0;
+                const start = if (hint < table.row_high) hint else 0;
+                return .{ .high = table.row_high, .start = start, .next_slot = start, .left = table.row_high, .shared = shared };
+            }
+
+            fn report(table: *const Table, slot: usize) void {
+                const writable: *Table = @constCast(table);
+                const next_hint: u32 = @intCast(slot);
+                if (@atomicLoad(u32, &writable.seqscan_hint.slot, .monotonic) != next_hint) {
+                    @atomicStore(u32, &writable.seqscan_hint.slot, next_hint, .monotonic);
+                }
+            }
+
+            pub fn next(self: *PhysicalScan, table: *const Table, max_rows: usize) ?Range {
+                if (self.left == 0) {
+                    if (self.shared) {
+                        report(table, self.start);
+                        self.shared = false;
+                    }
+                    return null;
+                }
+                const start = self.next_slot;
+                const limit = if (self.shared) @min(max_rows, seqscan_grain - start % seqscan_grain) else max_rows;
+                const count = @min(@min(self.left, self.high - start), limit);
+                if (self.shared and start % seqscan_grain == 0) report(table, start);
+                self.left -= count;
+                const end = start + count;
+                self.next_slot = if (end == self.high) 0 else end;
+                return .{ .start = start, .end = end };
+            }
         };
 
         /// A table every committed reader can see (created and not dropped).
@@ -831,6 +888,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn copyRelayout(destination: *Table, source: *const Table, sources: []const u8, fills: []const V.Cell) void {
             destination.truncate_csn = source.truncate_csn;
             destination.pending_truncate = source.pending_truncate;
+            destination.seqscan_hint.slot = 0;
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
@@ -963,6 +1021,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.dead_csn = 0;
             table.pending_drop = false;
             table.row_high = 0;
+            table.seqscan_hint.slot = 0;
             table.row_used = 0;
             table.version_high = 0;
             table.version_used = 0;
@@ -1005,6 +1064,7 @@ pub fn Storage(comptime config: types.Config) type {
             destination.next_rowid = source.next_rowid;
             destination.row_generation = source.row_generation;
             destination.row_high = source.row_high;
+            destination.seqscan_hint.slot = 0;
             destination.row_used = source.row_used;
             destination.version_high = source.version_high;
             destination.version_used = source.version_used;
@@ -1142,6 +1202,7 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn publishTruncate(table: *Table, csn: u64) void {
             table.truncate_csn = csn;
             table.pending_truncate = .{};
+            table.seqscan_hint.slot = 0;
             if (table.summary.valid) table.summary.csn = csn;
         }
 

@@ -53,6 +53,9 @@ pub const Config = struct {
     /// Speculative ordered hash probes on a proven dense integer primary-key
     /// domain. Budget exhaustion restarts the ordinary scan; 0 disables it.
     ordered_probe_rows: usize = 8192,
+    /// Minimum row-directory span for synchronized PostgreSQL heap scans.
+    /// This tunes locality without limiting the size or results of a scan.
+    synchronized_scan_rows: usize = 16384,
     tables: usize = 4,
     columns: usize = 8,
     rows_per_table: usize = 128,

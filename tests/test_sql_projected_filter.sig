@@ -2,7 +2,7 @@
 const std=@import("std");
 const sql=@import("sql");
 const cfg:sql.Config=.{.external_storage=true,.external_workspace=true,.tables=1,.columns=4,.rows_per_table=4,
-    .work_rows=256,.result_rows=128,.text_bytes=24,.compact_integral_scans=true};
+    .work_rows=256,.result_rows=128,.text_bytes=24,.compact_integral_scans=true,.synchronized_scan_rows=512};
 const DB=sql.Database(cfg);
 const Scalar=sql.Database(.{.external_storage=true,.external_workspace=true,.tables=1,.columns=4,.rows_per_table=4,
     .work_rows=256,.result_rows=128,.text_bytes=24,.compact_integral_scans=false});
@@ -34,6 +34,7 @@ pub fn main() !void {
     try db.bindMemory(&bytes,n,n*3,8192);try scalar.bindMemory(&scalar_bytes,n,n*3,8192);
     try db.bindWorkspace(&cells);try scalar.bindWorkspace(&scalar_cells);
     try both("CREATE TABLE data(id INT PRIMARY KEY,g INT NOT NULL,n BIGINT NOT NULL,label TEXT)");
+    try both("SET synchronize_seqscans TO off");
     var text:[160]u8=undefined;
     for(0..n) |i| try both(try std.fmt.bufPrint(&text,"INSERT INTO data VALUES({d},{d},{d},'row-{d}')",.{i,i%16,i,i}));
     try same("SELECT id,n,label FROM data WHERE g=3 AND n>511",32);
@@ -53,6 +54,20 @@ pub fn main() !void {
     try same("SELECT id FROM data WHERE g=3 LIMIT 2",2);
     try check(db.workspace.query.read_stats.projected_filter_scans==0);
     try same("SELECT id FROM data WHERE g=3 ORDER BY id DESC LIMIT 3",3);
+    try db.execute("SET synchronize_seqscans TO on", &result);
+    try db.execute("SELECT id FROM data WHERE n=602 LIMIT 1", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 602);
+    try db.execute("SELECT id FROM data WHERE g=3", &result);
+    try check(result.row_count == 64 and db.workspace.query.read_stats.projected_filter_scans == 1);
+    for (0..64) |index| try check(result.rows[index].cells[0].integer == (515 + @as(i64, @intCast(index)) * 16) % n);
+    try db.execute("SELECT id FROM ONLY data WHERE g=3 OFFSET 0", &result);
+    try check(result.row_count == 64 and result.rows[0].cells[0].integer == 515 and result.rows[63].cells[0].integer == 499);
+    try db.execute("SELECT id FROM data ORDER BY id LIMIT 1", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 0);
+    try db.execute("SELECT id FROM data LIMIT 1", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 512);
+    try db.execute("SET synchronize_seqscans TO off", &result);
+    try same("SELECT id FROM data WHERE g=3", 64);
     try both("DELETE FROM data WHERE id=515");
     try same("SELECT id FROM data WHERE g=3 AND n>511",31);
     try both("UPDATE data SET g=3 WHERE id=516");

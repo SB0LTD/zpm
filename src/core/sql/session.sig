@@ -82,6 +82,7 @@ pub fn Sessions(comptime config: types.Config) type {
             deferrable: bool = false,
             check_function_bodies: bool = true,
             row_security: bool = true,
+            synchronize_seqscans: bool = true,
             search_path: SettingText = SettingText.literal("\"$user\", public"),
             custom: [config.custom_settings]Custom = @splat(.{}),
             /// SET ROLE (catalog-security lane): the role OID, 0 for NONE

@@ -70,6 +70,14 @@ store's SET, SET LOCAL and RESET transaction rules.
 | SQL PREPARE | PREPARE name [(types)] AS SELECT/VALUES/INSERT/UPDATE/DELETE/MERGE, parse analysis at PREPARE; EXECUTE with arguments coerced to the declared types in assignment context ($n are real parameters: `SELECT $1` is ?column?); DEALLOCATE [PREPARE] name/ALL; not transactional; 42P05, 26000, 42601 (argument count), 42804; the wire's DEALLOCATE reaches both namespaces | type inference for undeclared parameters (42P18 here); plan caching (each EXECUTE re-binds) |
 | LISTEN / NOTIFY | LISTEN / UNLISTEN [*] take effect at commit (dropped with the (sub)transaction); NOTIFY channel [, 'payload'] queued per transaction, folded duplicates, dropped by ROLLBACK / ROLLBACK TO / a failed statement, published at commit in order; a listener reads from its own position (own notifications included); the codec sends NotificationResponse ('A': pid, channel, payload) before ReadyForQuery and through `Session.notifications()` while idle | pg_notify() (void result); pg_listening_channels(); payloads beyond Config.notify_payload_bytes (54000; PostgreSQL's limit is 8000 bytes, 22023 here at 8000) |
 
+`synchronize_seqscans` defaults to `on`. Eligible unordered, single-table
+PostgreSQL reads can start at a position recently shared by another scan of the
+same relation. A scan visits each physical slot once under its own snapshot,
+wrapping around the end. `off` starts at slot zero and leaves the shared
+position alone. `Config.synchronized_scan_rows` is the minimum span to consider
+for cache locality. Ordered queries, joins, aggregates, sampling and locking retain their
+existing paths. The shared result cache skips plans whose output can rotate.
+
 ## Errors (SQLSTATE)
 
 40001 SerializationFailure (concurrent update/delete, SSI), 25001

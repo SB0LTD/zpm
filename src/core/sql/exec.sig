@@ -449,15 +449,18 @@ pub fn Exec(comptime config: types.Config) type {
 
             // ---- FROM items and joins ----------------------------------
 
-            fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context) Error!List {
+            fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context, synchronize_scan: bool) Error!List {
                 if (source.sample_method != 0) return self.sampledRows(source, outer);
                 if (source.table) |index| {
                     const table = &self.tables[index];
                     var list: List = .{ .start = @intCast(self.work.ref_low) };
-                    for (0..table.row_high) |slot| {
-                        try self.session.checkpoint();
-                        const version = S.visibleAt(table, slot, self.snap) orelse continue;
-                        try self.push(&list, version);
+                    var scan = S.PhysicalScan.init(table, synchronize_scan and self.session.synchronize_seqscans);
+                    while (scan.next(table, table.row_high)) |range| {
+                        for (range.start..range.end) |slot| {
+                            try self.session.checkpoint();
+                            const version = S.visibleAt(table, slot, self.snap) orelse continue;
+                            try self.push(&list, version);
+                        }
                     }
                     return list;
                 }
@@ -596,7 +599,7 @@ pub fn Exec(comptime config: types.Config) type {
                 for (p.sources[0..p.source_count], 0..) |*source, stage| {
                     const last = stage + 1 == p.source_count;
                     const probing = source.probe != none and stage != 0;
-                    const rows: List = if (probing) .{} else try self.sourceRows(source, outer);
+                    const rows: List = if (probing) .{} else try self.sourceRows(source, outer, synchronizedProjection(p));
                     const outer_join = source.join == .left or source.join == .full;
                     const tracks = source.join == .right or source.join == .full;
                     var matched: u32 = 0;
@@ -672,7 +675,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// Items first..last joined left-deep; each later operand is one
             /// item or a parenthesized group (Source.group_end).
             fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, tuple_rows: *TupleRows, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
-                var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer));
+                var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer, false));
                 var next = first + 1;
                 while (next <= last) {
                     const end: usize = if (p.sources[next].group_end != none) p.sources[next].group_end else next;
@@ -739,7 +742,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.refs[lists + index * 2 + 1] = rows.count;
                     }
                 } else if (end == j) {
-                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer));
+                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer, false));
                 } else right = try self.joinRange(p, ctx, tuple_rows, outer, j, end);
                 const tracks = source.join == .right or source.join == .full;
                 if (lateral and tracks) return error.InvalidColumnReference;
@@ -4910,6 +4913,13 @@ pub fn Exec(comptime config: types.Config) type {
 
         pub const Candidates = union(enum) { scan, empty, slot: struct { row: u32, version: u32 } };
 
+        /// Restrict rotation to physical projections over one source. Joins,
+        /// grouping, DISTINCT, windows and explicit ordering keep their paths.
+        pub fn synchronizedProjection(plan: *const B.Plan) bool {
+            return plan.source_count == 1 and !plan.general_join and !plan.correlated and !plan.grouped and
+                plan.order_count == 0 and plan.window_count == 0 and plan.distinct == .none and plan.sources[0].sample_method == 0;
+        }
+
         /// WHERE keeps a row only when the predicate is TRUE.
         pub fn keep(ctx: *E.Context, where: u16, row: ?*const E.Row) Error!bool {
             if (where == none) return true;
@@ -5184,7 +5194,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// left-to-right short-circuit checkpoint count. Nullable/computed
         /// predicates and old/own-write snapshots keep the canonical path.
         noinline fn projectedFilterScan(ctx:*E.Context,table:*const S.Table,query:*const B.Select,snap:storage.Snapshot,
-            indices:[]u32,committed_only:bool,stats:*ReadStats) Error!?usize {
+            indices:[]u32,committed_only:bool,synchronize_scan:bool,stats:*ReadStats) Error!?usize {
             if(comptime !S.compact_enabled) return null;
             if(!S.hasCompactScan(table) or !committed_only or !table.summary.valid or table.summary.csn>snap.csn or table.scan_high!=table.row_high or
                 query.where==none or query.order_count!=0 or query.limit!=0xffffffffffffffff) return null;
@@ -5194,9 +5204,11 @@ pub fn Exec(comptime config: types.Config) type {
             for(predicates[0..used]) |predicate| if(!predicate.nonnull) return null;
             stats.projected_filter_scans+=1;
             const dense=table.summary.rows>=0 and @as(u64,@intCast(table.summary.rows))==table.scan_high;
-            var found:usize=0;var start:usize=0;
-            while(start<table.scan_high):(start+=64) {
-                const count=@min(@as(usize,64),table.scan_high-start);
+            var found:usize=0;
+            var scan = S.PhysicalScan.init(table, synchronize_scan);
+            while (scan.next(table, 64)) |range| {
+                const start = range.start;
+                const count = range.end - start;
                 // Charge dead slots too, exactly as the canonical scan does.
                 try ctx.session.checkpoints(count);
                 var mask=Query.liveMask(table,start,count,dense);
@@ -5342,25 +5354,31 @@ pub fn Exec(comptime config: types.Config) type {
                         found = count;ordered = true;break :scan;
                     }
                   }
-                  if(!locking and !top_k) if(try projectedFilterScan(&ctx,table,query,snap,indices,committed_only,stats)) |count| {
+                   const synchronize_scan = !observing and !locking and query.order_count == 0 and session.synchronize_seqscans;
+                   if(!locking and !top_k) if(try projectedFilterScan(&ctx,table,query,snap,indices,committed_only,synchronize_scan,stats)) |count| {
                     if (comptime observing) observation.operation = .compact_filter;
                     found=count;break :scan;
                   };
                   if (top_k and query.limit <= integer_topk_capacity and integerOrder(pool, query)) {
                     if (comptime observing) observation.operation = .integer_top_k;
                     found = try integerTopK(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats);
-                  } else for (0..table.row_high) |slot| {
-                    try session.checkpoint();
-                    const version = S.visibleAt(table, slot, snap) orelse continue;
-                    if (!try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) continue;
-                    if (top_k) {
-                        try sort_module.offerTopK(indices[0..@intCast(query.limit)], &found, version, &stable);
-                    } else {
-                        if (found == indices.len) return error.WorkspaceCapacity;
-                        indices[found] = version;
-                        found += 1;
+                   } else {
+                     var physical = S.PhysicalScan.init(table, synchronize_scan);
+                     ranges: while (physical.next(table, table.row_high)) |range| {
+                       for (range.start..range.end) |slot| {
+                         try session.checkpoint();
+                         const version = S.visibleAt(table, slot, snap) orelse continue;
+                         if (!try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) continue;
+                         if (top_k) {
+                             try sort_module.offerTopK(indices[0..@intCast(query.limit)], &found, version, &stable);
+                         } else {
+                             if (found == indices.len) return error.WorkspaceCapacity;
+                             indices[found] = version;
+                             found += 1;
+                         }
+                         if (!locking and query.order_count == 0 and found >= query.limit) break :ranges;
+                       }
                     }
-                    if (!locking and query.order_count == 0 and found >= query.limit) break;
                   }
                 },
             };

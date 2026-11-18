@@ -50,6 +50,7 @@ pub const Session = struct {
     /// installs an empty explicit schema path.
     public_schema_on_path: bool = true,
     row_security: bool = true,
+    synchronize_seqscans: bool = true,
     extra_float_digits: i8 = 1,
     mysql_keep_zero: bool = false,
     mysql_last_insert_id: u64 = 0,
