@@ -21,34 +21,44 @@ output remain open. The combined native build now passes float output,
 recovery status, transaction timeouts, routine-body checking, XML input,
 client notices, row security, default storage placement and synchronized
 scans on the covered cases. Forty live row-security observations matched
-PostgreSQL 18.3 at one and four workers. The unchanged native dump creates
-both tables and copies their rows before reaching its first late primary key.
-A scoped late-key candidate validates both existing and replayed rows and
-preserves its separate index OID in a versioned definition. It restricts the
-key addition to a standalone alteration of an ordinary single-column key.
-The combined stock restore is qualifying separately.
+PostgreSQL 18.3 at one and four workers. The unchanged PostgreSQL 18.3 plain dump restores the fixture's original rows
+in RAMSQL in memory and with synchronous WAL at one and four workers. After
+forcing each durable server to stop and reopening its WAL, both primary keys,
+the foreign key, the check constraint, the NOT NULL column and the omitted
+default still behave as they do in PostgreSQL. The separate Windows fixture
+repeats the forced reopen. Scope covers the tested plain dump, ordinary
+single-column late primary keys and the fixture's supported table schema.
+Single-transaction restore and arbitrary PostgreSQL schemas still need proof.
 
-Stock `pg_dump` passes the real `pg_settings` relation guard, starts its
-read-only transaction and reaches extension discovery. The next missing
-expression is the catalogs' `tableoid`. The native fixture capture recorded
-67 emitted SQL statements, including dependency, privilege, constraint and
-COPY queries. That capture describes the fixture's workflow and gives no
-all-catalog pass count. Whole-message preflight for simple-query batching
-passed 118 assertions in ZPM. Wire transaction and COPY continuation remain
-separate from that parser proof.
+Stock `pg_dump` now passes the settings and relation guard, extension discovery
+with the real catalog `tableoid`, and its `pg_depend` query. It stops in the
+schema query, which selects `pg_namespace.nspowner`, `nspacl`, and
+`acldefault`. The fixture capture contains 67 native statements. That count is
+the tooling workload captured in the trace. The scoped `pg_depend` matrix
+tested real table constraint, schema and owned sequence edges including WAL
+replay. Catalog ACLs, nominal PostgreSQL types, and later stock export phases
+remain open.
+[Stock restore and export traces](https://github.com/SB0LTD/ramsql/actions/runs/44255933360) ·
+[Integrated catalog contracts](https://github.com/SB0LTD/zpm/actions/runs/44255868781)
 
-The ordinary interleaved COMMIT ownership fix is merged in ZPM. A separate
-extended Sync candidate matches native commit, rollback, explicit-block,
-disconnect and durable reopen behavior in the live Linux and Windows
-fixtures at one and four workers. The full codec contract and extended COPY
-boundary are additional acceptance checks before merge.
-[Populated describe](https://github.com/SB0LTD/ramsql/actions/runs/44238734316) ·
-[Native row-security and restore](https://github.com/SB0LTD/ramsql/actions/runs/44246856923) ·
-[Latest stock export](https://github.com/SB0LTD/ramsql/actions/runs/44251368662) ·
-[Late primary-index replay](https://github.com/SB0LTD/zpm/actions/runs/44252615860) ·
-[Simple-query preflight](https://github.com/SB0LTD/zpm/actions/runs/44251110539) ·
-[COMMIT ownership fix](https://github.com/SB0LTD/zpm/pull/253) ·
-[Extended Sync](https://github.com/SB0LTD/ramsql/actions/runs/44248130314)
+The interleaved ordinary COMMIT ownership fix landed in ZPM and RAMSQL. Product verification passed the complete
+release matrix, including both native SB0 images. The release publisher
+published the prerelease with the production gate false.
+[ZPM ownership fix](https://github.com/SB0LTD/zpm/pull/253) ·
+[RAMSQL integration](https://github.com/SB0LTD/ramsql/pull/79) ·
+[Published prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.3-run.44252147423.1)
+
+The separate extended Sync and COPY candidate passed 23,416 codec assertions
+and matched ten transaction and five COPY observations against PostgreSQL
+18.3. The Linux wire suites exercised memory and synchronous WAL at one and
+four workers, including forced reopen. The simple-query batch draft matched 58
+native wire observations, streamed 23,800 rows and verified recovery after a
+forced stop. Actual SB0X and SB0K boots passed 913 and 899 assertions,
+respectively, for the same draft. Simple COPY within multi-command messages
+remains open. Both protocol changes still require joint qualification before
+release.
+[Extended Sync and COPY](https://github.com/SB0LTD/ramsql/actions/runs/44256400851) ·
+[Simple-query batches and native boots](https://github.com/SB0LTD/ramsql/actions/runs/44256475598)
 
 The draft versioned WAL assigns durable table-constraint identities while
 replaying the older definition formats. Checkpoint generation images must
