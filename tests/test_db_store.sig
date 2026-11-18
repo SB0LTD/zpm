@@ -822,6 +822,50 @@ fn runningControl() !void {
     try quiescent(&store);
 }
 
+const RunningTransactionDeadline = struct {
+    store: *Store,
+    calls: usize = 0,
+    saw_private_changes: bool = false,
+
+    fn poll(context: ?*anyopaque, _: u64) void {
+        const self: *RunningTransactionDeadline = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        if (self.calls == 16) {
+            self.saw_private_changes = self.store.database.usage().pending_versions != 0;
+            self.store.now_ns += 10000000;
+        }
+    }
+};
+
+fn runningTransactionTimeout() !void {
+    var store: Store = .{};
+    var connection: Store.Connection = .{ .store = &store, .id = 1 };
+    var result: DB.Result = .{};
+    try connection.execute("CREATE TABLE t (id INT PRIMARY KEY, value INT)", &result);
+    try connection.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80)", &result);
+    try connection.execute("SET statement_timeout = 1", &result);
+    try connection.execute("SET transaction_timeout = 2", &result);
+    connection.execution.poll_interval = 1;
+    var advance: RunningTransactionDeadline = .{ .store = &store };
+    store.interrupt_context = &advance;
+    store.interrupt_poll = RunningTransactionDeadline.poll;
+    if (connection.execute("UPDATE t SET value = value + 100", &result)) |_| return error.RunningDeadlineIgnored else |err| try check(err == error.QueryCanceled);
+    try check(advance.calls == 16 and advance.saw_private_changes and connection.transactionDeadline() == null);
+    try quiescent(&store);
+    try connection.execute("SET transaction_timeout = 1", &result);
+    try connection.beginTransaction();
+    try check(connection.transactionDeadline() == store.now_ns + 1000000);
+    advance.calls = 0;
+    if (connection.execute("UPDATE t SET value = value + 100", &result)) |_| return error.RunningTransactionDeadlineIgnored else |err| try check(err == error.TransactionTimeout);
+    connection.terminateTimedOut();
+    try quiescent(&store);
+    try check(connection.id == 0);
+    store.interrupt_poll = null;
+    var witness: Store.Connection = .{ .store = &store, .id = 2 };
+    try witness.execute("SELECT * FROM t ORDER BY id", &result);
+    for (0..8) |row| try check(result.rows[row].cells[1].integer == @as(i64, @intCast((row + 1) * 10)));
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
@@ -832,6 +876,7 @@ pub fn main() !void {
     try timers();
     try savepoints();
     try runningControl();
+    try runningTransactionTimeout();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }

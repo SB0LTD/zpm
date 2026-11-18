@@ -603,6 +603,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     const any: anyerror = err;
                     // Parked statement: nothing consumed or written.
                     if (any == error.WouldBlock) return .{ .blocked = true };
+                    if (any == error.TransactionTimeout) {
+                        try self.terminateTransaction(db, &w);
+                        return .{ .consumed = total, .written = w.at, .close = true };
+                    }
                     w.at = 0;
                     try failure(&w, sqlstate(err), @errorName(err));
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
@@ -1159,14 +1163,14 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 if (db.copyBlocked()) {
                     db.copyResume() catch |err| {
                         if (err == error.WouldBlock) return .{ .blocked = true };
-                        try self.copyError(db, &w, err);
-                        return .{ .written = w.at };
+                        const close = try self.copyError(db, &w, err);
+                        return .{ .written = w.at, .close = close };
                     };
                 }
                 if (self.copy.carry_rows) {
                     const fed = self.copyRows(db, self.copy.carry[0..self.copy.carry_len]) catch |err| {
-                        try self.copyError(db, &w, err);
-                        return .{ .written = w.at };
+                        const close = try self.copyError(db, &w, err);
+                        return .{ .written = w.at, .close = close };
                     };
                     self.shiftCarry(fed.used);
                     if (fed.blocked) return .{ .blocked = true };
@@ -1203,14 +1207,15 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         self.copy.mode = .none;
                         return .{ .consumed = total };
                     }
+                    var close = false;
                     self.copyFinish(db, &w) catch |err| {
                         if (err == error.WouldBlock) return .{ .blocked = true };
                         w.at = 0;
-                        try self.copyError(db, &w, err);
+                        close = try self.copyError(db, &w, err);
                         self.copy.mode = .none;
                     };
                     self.copy.mode = .none;
-                    return .{ .consumed = total, .written = w.at };
+                    return .{ .consumed = total, .written = w.at, .close = close };
                 },
                 'f' => {
                     self.copy.mode = .none;
@@ -1247,8 +1252,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             const fed = self.copyFeed(db, input[offset..][0..n]) catch |err| {
                 self.copy.remaining -= n;
-                try self.copyError(db, w, err);
-                return .{ .consumed = offset + n, .written = w.at };
+                const close = try self.copyError(db, w, err);
+                return .{ .consumed = offset + n, .written = w.at, .close = close };
             };
             self.copy.remaining -= fed.used;
             return .{ .consumed = offset + fed.used, .blocked = fed.blocked };
@@ -1256,13 +1261,26 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         /// A terminal COPY error: roll back, report, then discard the rest
         /// of the copy stream.
-        fn copyError(self: *Self, db: *DB, w: *Writer, err: anyerror) error{BufferTooSmall}!void {
+        fn copyError(self: *Self, db: *DB, w: *Writer, err: anyerror) error{BufferTooSmall}!bool {
+            if (err == error.TransactionTimeout) {
+                try self.terminateTransaction(db, w);
+                return true;
+            }
             db.copyFail();
             try failure(w, sqlstate(err), @errorName(err));
             try self.ready(db, w);
             self.copy.mode = .discard;
             self.copy.carry_len = 0;
             self.copy.carry_rows = false;
+            return false;
+        }
+
+        fn terminateTransaction(self: *Self, db: *DB, w: *Writer) error{BufferTooSmall}!void {
+            self.copy.mode = .none;
+            self.waiting_for_command = false;
+            if (comptime @hasDecl(DB, "terminateTimedOut")) db.terminateTimedOut();
+            w.at = 0;
+            try transactionTimeoutFatal(w);
         }
 
         fn shiftCarry(self: *Self, used: usize) void {
@@ -1957,6 +1975,16 @@ pub fn idleTransactionTimeoutError(output: []u8) error{BufferTooSmall}!usize {
     return writer.at;
 }
 
+pub fn transactionTimeoutError(output: []u8) error{BufferTooSmall}!usize {
+    var writer: Writer = .{ .bytes = output };
+    try transactionTimeoutFatal(&writer);
+    return writer.at;
+}
+
+fn transactionTimeoutFatal(writer: *Writer) error{BufferTooSmall}!void {
+    try fatal(writer, "25P04", "terminating connection due to transaction timeout");
+}
+
 fn fatal(w: *Writer, state: []const u8, message: []const u8) !void {
     const p = try w.begin('E');
     try w.byte('S');
@@ -1978,6 +2006,7 @@ fn sqlstate(err: anyerror) []const u8 {
 /// null means the error would fall back to 54000 (program_limit_exceeded).
 pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     const name = @errorName(err);
+    if (equal(name, "TransactionTimeout")) return "25P04";
     if (equal(name, "DatabaseNotFound")) return "3D000";
     if (equal(name, "DuplicateDatabase")) return "42P04";
     if (equal(name, "InvalidDatabaseName")) return "42602";
