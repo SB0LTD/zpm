@@ -503,10 +503,17 @@ pub fn Eval(comptime config: types.Config) type {
                     return digitsCell(first.integer);
                 },
                 .regclass_out => {
+                    if (first.integer == 0) return textCell("-");
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
-                    var buffer: [64]u8 = undefined;
                     if (first.integer >= 0 and first.integer <= 0xffffffff) {
-                        if (hook.relation_name(hook.ptr, @intCast(first.integer), &buffer)) |length| return textCell(buffer[0..length]);
+                        const oid: u32 = @intCast(first.integer);
+                        if (hook.relation_display_name) |display_name| {
+                            var buffer: [config.text_bytes]u8 = undefined;
+                            if (try display_name(hook.ptr, oid, &buffer)) |length| return textCell(buffer[0..length]);
+                        } else {
+                            var buffer: [64]u8 = undefined;
+                            if (hook.relation_name(hook.ptr, oid, &buffer)) |length| return textCell(buffer[0..length]);
+                        }
                     }
                     return digitsCell(first.integer);
                 },

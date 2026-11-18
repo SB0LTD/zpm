@@ -209,6 +209,25 @@ pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     return null;
 }
 
+/// PostgreSQL bootstrap identities for implemented pg_catalog relations.
+/// These are catalog constants, unlike initdb-assigned ordinary view OIDs.
+pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
+    .{ .view = .pg_type, .oid = 1247 }, .{ .view = .pg_attribute, .oid = 1249 },
+    .{ .view = .pg_proc, .oid = 1255 }, .{ .view = .pg_class, .oid = 1259 },
+    .{ .view = .pg_authid, .oid = 1260 }, .{ .view = .pg_auth_members, .oid = 1261 },
+    .{ .view = .pg_database, .oid = 1262 }, .{ .view = .pg_foreign_server, .oid = 1417 },
+    .{ .view = .pg_sequence, .oid = 2224 }, .{ .view = .pg_foreign_data_wrapper, .oid = 2328 },
+    .{ .view = .pg_shdescription, .oid = 2396 }, .{ .view = .pg_am, .oid = 2601 },
+    .{ .view = .pg_attrdef, .oid = 2604 }, .{ .view = .pg_constraint, .oid = 2606 },
+    .{ .view = .pg_description, .oid = 2609 }, .{ .view = .pg_index, .oid = 2610 },
+    .{ .view = .pg_inherits, .oid = 2611 }, .{ .view = .pg_namespace, .oid = 2615 },
+    .{ .view = .pg_rewrite, .oid = 2618 }, .{ .view = .pg_trigger, .oid = 2620 },
+    .{ .view = .pg_extension, .oid = 3079 }, .{ .view = .pg_policy, .oid = 3256 },
+    .{ .view = .pg_statistic_ext, .oid = 3381 }, .{ .view = .pg_enum, .oid = 3501 },
+    .{ .view = .pg_collation, .oid = 3456 }, .{ .view = .pg_publication, .oid = 6104 },
+    .{ .view = .pg_publication_rel, .oid = 6106 }, .{ .view = .pg_publication_namespace, .oid = 6237 },
+};
+
 pub fn Catalog(comptime config: types.Config) type {
     const rows = @max(config.tables * config.columns, config.tables + config.sequences + config.schemas);
     const cat_config: types.Config = .{
