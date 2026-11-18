@@ -7,6 +7,7 @@ const linux = std.os.linux;
 
 pub const available = builtin.os.tag == .linux;
 pub const Operation = enum { receive, send, cancel };
+pub const TimedWait = enum { ready, yielded, unsupported };
 pub const Outcome = union(enum) {
     bytes: usize,
     eof,
@@ -112,6 +113,29 @@ pub fn Queue(comptime capacity: usize) type {
         /// Pollable completion descriptor. The queue keeps ownership of it.
         pub fn descriptor(self: *const Self) linux.fd_t {
             return if (self.ring) |*ring| ring.fd else -1;
+        }
+
+        /// Submit and wait in one syscall when the kernel has EXT_ARG.
+        /// Yielded includes expiry and interruption. User buffers remain
+        /// owned by pending requests until their terminal CQEs.
+        pub fn submitAndWait(self: *Self, duration_ns: u64) !TimedWait {
+            const ring = if (self.ring) |*ring| ring else return error.SocketRingClosed;
+            if (duration_ns == 0) return error.InvalidSocketOperation;
+            if (ring.features & linux.IORING_FEAT_EXT_ARG == 0) return .unsupported;
+            const remaining = ring.flush_sq();
+            if (remaining == 0 and ring.cq_ready() != 0) return .ready;
+            const duration: linux.kernel_timespec = .{ .sec = @intCast(duration_ns / 1000000000),
+                .nsec = @intCast(duration_ns % 1000000000) };
+            const extended: linux.io_uring_getevents_arg = .{ .sigmask = 0, .sigmask_sz = 0,
+                .pad = 0, .ts = @intFromPtr(&duration) };
+            // The pinned standard enter wrapper only accepts a signal mask.
+            const result = linux.syscall6(.io_uring_enter, @intCast(ring.fd), remaining, 1,
+                linux.IORING_ENTER_GETEVENTS | linux.IORING_ENTER_EXT_ARG, @intFromPtr(&extended), @sizeOf(@TypeOf(extended)));
+            switch (linux.errno(result)) {
+                .SUCCESS, .TIME, .INTR => return if (ring.cq_ready() != 0) .ready else .yielded,
+                .INVAL, .OPNOTSUPP, .PERM, .NOSYS => return .unsupported,
+                else => return error.TimedSocketWaitFailed,
+            }
         }
 
         pub fn submit(self: *Self) !u32 {
