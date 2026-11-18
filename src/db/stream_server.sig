@@ -22,7 +22,12 @@ pub fn Server(comptime Database: type, comptime Protocol: type, comptime input_c
                     // One stream is one session: nothing else could release a
                     // lock it waits for, so a parked statement ends the session.
                     if (@hasField(@TypeOf(reply), "blocked") and reply.blocked) return error.StatementBlocked;
-                    if (reply.consumed == 0 and reply.written != 0) return error.InvalidProtocolReply;
+                    const partial = reply.consumed == 0 and reply.written != 0;
+                    if (partial) {
+                        if (comptime @hasDecl(Protocol, "continuingSimpleQuery")) {
+                            if (!session.continuingSimpleQuery()) return error.InvalidProtocolReply;
+                        } else return error.InvalidProtocolReply;
+                    }
                     if (reply.written != 0) try io.writeAll(self.output[0..reply.written]);
                     if (reply.close) return;
                     if (reply.consumed != 0) {
@@ -32,6 +37,9 @@ pub fn Server(comptime Database: type, comptime Protocol: type, comptime input_c
                         self.used = remaining;
                         continue;
                     }
+                    // A simple Query batch keeps its original frame until
+                    // the last step. Drain each reply before running the next.
+                    if (partial) continue;
                 }
                 if (self.used == self.input.len) return error.RequestTooLarge;
                 const count = try io.read(self.input[self.used..]);
