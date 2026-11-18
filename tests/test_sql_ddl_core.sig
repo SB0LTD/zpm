@@ -1372,6 +1372,10 @@ fn catalogDependencies() !void {
     try run("ALTER TABLE dep.c DROP CONSTRAINT fk");
     try expect(foreign, "");
     try sameState(&.{ names, primary_index, primary_column, foreign, owned });
+    try run("CREATE TABLE dep.selflinked (id INT PRIMARY KEY CONSTRAINT self_fk REFERENCES dep.selflinked(id))");
+    const self_foreign = "SELECT d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.objid WHERE d.classid = 2606 AND d.refclassid = 1259 AND c.conname = 'self_fk' ORDER BY 1, 2";
+    try expect(self_foreign, "0|n;1|a;1|n");
+    try sameState(&.{ self_foreign });
 }
 
 /// The types lane's column types under this lane's DDL and constraints.
