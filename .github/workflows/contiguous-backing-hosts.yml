@@ -1,0 +1,76 @@
+name: Detached backing contracts on native hosts
+
+on:
+  push:
+    branches: [ci/detached-contiguous-backing-hosts-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  ownership:
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: ubuntu-24.04
+            suffix: x86_64-linux.tar.xz
+            sha256: 179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a
+          - host: windows-latest
+            suffix: x86_64-windows.zip
+            sha256: 291a3225ff33c32e8c479471c44be6db0d811d6023d759c64e0a7d5bf810576c
+          - host: macos-latest
+            suffix: aarch64-macos.tar.xz
+            sha256: a936b163c87b471b603caa78aa84d4542c28b9ce3885f502d6901d68a3d716ae
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      SIG_RELEASE_TAG: sig-0.6.5-zig0.17.0.3c72687
+      SIG_ASSET_SUFFIX: ${{ matrix.suffix }}
+      SIG_ASSET_SHA256: ${{ matrix.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned Sig SDK
+        run: |
+          $asset = "$env:SIG_RELEASE_TAG-$env:SIG_ASSET_SUFFIX"
+          $archive = Join-Path $env:RUNNER_TEMP $asset
+          $sdk = Join-Path $env:RUNNER_TEMP 'sig-sdk'
+          Invoke-WebRequest -Uri "https://github.com/SB0LTD/sig/releases/download/$env:SIG_RELEASE_TAG/$asset" -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $env:SIG_ASSET_SHA256) { throw 'Sig SDK checksum mismatch' }
+          New-Item -ItemType Directory -Path $sdk | Out-Null
+          if ($env:RUNNER_OS -eq 'Windows') {
+            Expand-Archive -LiteralPath $archive -DestinationPath $sdk
+            $binaryName = 'sig.exe'
+          } else {
+            tar -xf $archive -C $sdk
+            if ($LASTEXITCODE -ne 0) { throw 'Sig SDK extraction failed' }
+            $binaryName = 'sig'
+          }
+          $compiler = Get-ChildItem -LiteralPath $sdk -File -Recurse | Where-Object Name -eq $binaryName | Select-Object -First 1
+          $library = Get-ChildItem -LiteralPath $sdk -Directory -Recurse |
+            Where-Object { $_.Name -eq 'lib' -and (Test-Path (Join-Path $_.FullName 'std/std.sig')) } | Select-Object -First 1
+          if (!$compiler -or !$library) { throw 'Sig SDK lacks the compiler or standard library' }
+          "SIG=$($compiler.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SIG_LIB_DIR=$($library.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Exercise storage ownership and the prepared lookup API
+        run: |
+          New-Item -ItemType Directory evidence | Out-Null
+          & $env:SIG version | Tee-Object -FilePath evidence/sig-version.log
+          if ($LASTEXITCODE -ne 0) { throw 'Sig did not start' }
+          $arguments = @('build', 'run-contract-parallel-read', 'run-contract-sql-parameterized-lookup',
+            'run-contract-sql-split-versions', 'run-contract-sql-integral-versions',
+            '-Doptimize=ReleaseSafe', '-j1', '--Sig-lib-dir', $env:SIG_LIB_DIR)
+          if ($env:RUNNER_OS -eq 'Linux') { $arguments += '-Dlink-libc=false' }
+          & $env:SIG @arguments 2>&1 | Tee-Object -FilePath evidence/contracts.log
+          if ($LASTEXITCODE -ne 0) { throw 'Detached read contracts failed' }
+          if ($env:RUNNER_OS -in @('Linux', 'Windows') -and !(Select-String -Quiet -Path evidence/contracts.log -Pattern 'native_threads=8')) {
+            throw 'Native reader concurrency was not exercised'
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: detached-backing-${{ matrix.host }}
+          path: evidence/
