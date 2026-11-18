@@ -956,14 +956,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     } else {
                         try self.execute(db, source);
                         try self.simpleResult(db, w);
-                        if (comptime @hasDecl(DB, "finishExtended")) try db.finishExtended();
                         try self.command(w, source);
-                        self.closeIdlePortals(db);
-                        try self.ready(db, w);
-                        return false;
                     }
-                    if (comptime @hasDecl(DB, "finishExtended")) try db.finishExtended();
-                    self.closeIdlePortals(db);
                     try self.ready(db, w);
                 },
                 'P' => try self.parse(db, &r, w),
@@ -1186,9 +1180,6 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 const query = select[0..info.select_len];
                 try self.resolveCopyQuoteColumns(db, query, &info);
                 try self.execute(db, query);
-                if (portal_index == null) {
-                    if (comptime @hasDecl(DB, "finishExtended")) try db.finishExtended();
-                }
                 try self.copyOut(db, &info, w);
                 if (portal_index) |index| self.completeCopyPortal(index, self.result.row_count);
                 return;
@@ -1574,15 +1565,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             if (self.copy.binary_header) return error.BadCopyFormat;
             const copied = try db.copyEnd();
+            try copyCommand(w, copied);
             if (self.copy.portal) |index| {
-                try copyCommand(w, copied);
                 self.completeCopyPortal(index, copied);
-            } else {
-                if (comptime @hasDecl(DB, "finishExtended")) try db.finishExtended();
-                try copyCommand(w, copied);
-                self.closeIdlePortals(db);
-                try self.ready(db, w);
-            }
+            } else try self.ready(db, w);
         }
 
 
