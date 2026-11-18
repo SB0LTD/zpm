@@ -1009,12 +1009,25 @@ pub fn Store(comptime Raw: type) type {
                 if (self.postgres_extended_implicit) try self.commitTransaction();
             }
 
+            /// Errors at a simple Query or Sync boundary abort the open
+            /// implicit group immediately, even if Flush exposed earlier
+            /// statement results to the client.
+            pub fn abortExtended(self: *Connection) void {
+                if (!self.postgres_extended_implicit) return;
+                if (self.tx) |slot| self.db().abort(slot);
+                self.endTransaction(false);
+            }
+
             pub fn rollbackTransaction(self: *Connection) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (self.tx) |slot| self.db().abort(slot);
                 const was = self.in_transaction;
+                const before = self.settings;
                 self.endTransaction(false);
-                if (!was) self.settings = self.base;
+                if (!was) {
+                    self.settings = before;
+                    self.base = before;
+                }
             }
 
             /// A codec-level error inside a block fails it like a statement error.
@@ -1363,16 +1376,19 @@ pub fn Store(comptime Raw: type) type {
                 switch (command) {
                     .none => unreachable,
                     .begin => |modes| {
-                        const fresh = !self.in_transaction or self.postgres_extended_implicit;
-                        self.postgres_extended_implicit = false;
+                        const promoting = self.postgres_extended_implicit;
+                        const fresh = !self.in_transaction or promoting;
                         if (comptime has_engine_session) {
                             try self.beginTransaction();
                             // BEGIN inside a block only warns (its modes are ignored).
-                            if (fresh) try self.db().beginModes(self.tx.?, modes);
+                            if (promoting) {
+                                try self.db().setTransaction(self.tx.?, modes);
+                            } else if (fresh) try self.db().beginModes(self.tx.?, modes);
                         } else {
                             if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
                             try self.beginTransaction();
                         }
+                        self.postgres_extended_implicit = false;
                         if (!fresh) self.warn("25001", "there is already a transaction in progress");
                         result.clear(0);
                         result.command = .begin;
@@ -1456,7 +1472,7 @@ pub fn Store(comptime Raw: type) type {
                     },
                     .set => |set| {
                         if (self.failed) return error.TransactionFailed;
-                        if (set.local and !self.in_transaction) self.warn("25P01", "SET LOCAL can only be used in transaction blocks");
+                        if (set.local and (!self.in_transaction or self.postgres_extended_implicit)) self.warn("25P01", "SET LOCAL can only be used in transaction blocks");
                         const which = parameter(set.name.slice()) orelse {
                             if (comptime !has_engine_session) return error.UndefinedSetting;
                             try self.db().sessionSet(self.blockSlot(), set.local, set.name.slice(), set.kind, set.value.slice());
@@ -1474,7 +1490,7 @@ pub fn Store(comptime Raw: type) type {
                             // Outside a block SET TRANSACTION only warns.
                             if (self.in_transaction) try self.db().setTransaction(self.tx.?, modes);
                         } else if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
-                        if (!self.in_transaction) self.warn("25P01", "SET TRANSACTION can only be used in transaction blocks");
+                        if (!self.in_transaction or self.postgres_extended_implicit) self.warn("25P01", "SET TRANSACTION can only be used in transaction blocks");
                         result.clear(0);
                         result.command = .set;
                     },
@@ -1971,7 +1987,7 @@ pub fn Store(comptime Raw: type) type {
                     return err;
                 };
                 if (extended and !self.in_transaction) switch (command_kind) {
-                    .none, .set, .reset, .set_session_characteristics, .show => {
+                    .none, .set, .reset, .set_transaction, .set_session_characteristics, .show => {
                         try self.beginTransaction();
                         self.postgres_extended_implicit = true;
                     },
