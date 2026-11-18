@@ -592,8 +592,10 @@ fn namespaceAclMaterialization() !void {
     try run("DROP ROLE acl_guest");
 
     const scope = db.catalog.findSchema("acl_state", .{ .csn = db.csn }) orelse return error.NamespaceMissing;
-    const state_tail = [_]u8{ 10, 0, 0, 0 } ++ [_]u8{0} ** 13;
+    // owner, flags, grant flags, name count, role count, text length and split.
+    const state_tail = [_]u8{ 10, 0, 0, 0 } ++ [_]u8{0} ** 14;
     var invalid: [256]u8 = undefined;
+    try replayFails(objectRecord(&invalid, 70, 17, 0, scope.oid, 0, 0, state_tail[0 .. state_tail.len - 1]), error.InvalidChangeRecord);
     try replayFails(objectRecord(&invalid, 70, 17, 0, scope.oid, 0, 0, &state_tail), error.ChangeRecordConflict);
     try replayFails(objectRecord(&invalid, 70, 17, 0, 99999, 0, 0, &state_tail), error.ChangeRecordConflict);
     try replayFails(objectRecord(&invalid, 70, 17, 0, scope.oid, 1, 0, &state_tail), error.InvalidChangeRecord);
