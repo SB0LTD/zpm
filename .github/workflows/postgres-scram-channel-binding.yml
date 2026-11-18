@@ -1,0 +1,45 @@
+name: PostgreSQL SCRAM channel binding
+
+on:
+  push:
+    branches: [ci/postgres-scram-binding-x64-20261118, ci/postgres-scram-binding-arm64-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  simple-query-stream:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install checksum-verified Sig 0.6.5
+        shell: bash
+        run: |
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-x86_64-linux.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" -o "$RUNNER_TEMP/$asset"
+          echo "179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a  $RUNNER_TEMP/$asset" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sdk"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig | head -n 1)
+          standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' | head -n 1)
+          test -x "$compiler"
+          test -f "$standard"
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+      - name: Run SCRAM binding, PostgreSQL frames and TLS certificate hash contracts
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir evidence
+          test "$(git rev-parse HEAD^)" = "f35195eb5539bbb1621a30959ffa5cee70fe5c5f"
+          git rev-parse HEAD^ >evidence/source.txt
+          "$SIG" version | tee evidence/sig-version.log
+          "$SIG" build run-contract-scram run-contract-postgres \
+            --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
+          "$SIG" test src/core/crypto/tls/x509.sig --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe 2>&1 | tee evidence/x509.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postgres-scram-channel-binding
+          path: evidence/
