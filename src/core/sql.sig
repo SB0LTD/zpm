@@ -521,6 +521,199 @@ pub fn Database(comptime config: Config) type {
             busy: u8 = 0,
             victim: usize = 0,
             counters: Stats = .{},
+            projected: ?Projected = null,
+
+            // Medium results hold only their integral values. Each stripe
+            // has independent ownership while hashing or copying a result.
+            const Projected = struct {
+                const key_bytes = 1024;
+                const stripe_width = 4;
+                const Slot = struct {
+                    state: enum { empty, observed, published } = .empty,
+                    busy: u8 = 0,
+                    csn: u64 = 0,
+                    hash: u64 = 0,
+                    key: [key_bytes]u8 = undefined,
+                    key_length: usize = 0,
+                    database: [64]u8 = undefined,
+                    database_length: usize = 0,
+                    workspace_cells: usize = 0,
+                    workspace_refs: usize = 0,
+                    output_rows: usize = 0,
+                    row_count: usize = 0,
+                };
+
+                slots: []Slot,
+                values: []i64,
+                spans: [2]StorageSpan,
+                rows_per_entry: usize,
+                min_scan_rows: usize,
+                counters: Stats = .{},
+
+                fn stripe(self: *const Projected, hash: u64) usize {
+                    return @as(usize, @intCast(hash % ((self.slots.len - 1) / stripe_width + 1))) * stripe_width;
+                }
+
+                fn lock(self: *Projected, first: usize) bool {
+                    if (@cmpxchgStrong(u8, &self.slots[first].busy, 0, 1, .acquire, .monotonic) == null) return true;
+                    _ = @atomicRmw(u64, &self.counters.contention, .Add, 1, .monotonic);
+                    return false;
+                }
+
+                fn unlock(self: *Projected, first: usize) void {
+                    @atomicStore(u8, &self.slots[first].busy, 0, .release);
+                }
+
+                fn matches(slot: *const Slot, context: *const ReadContext, hash: u64, result: *const Result) bool {
+                    return slot.state != .empty and slot.csn == context.snapshot.csn and slot.hash == hash and
+                        slot.workspace_cells == context.workspace.query.cells.len and slot.workspace_refs == context.workspace.query.refs.len and
+                        slot.output_rows == result.rows.len and types.same(slot.key[0..slot.key_length], context.source) and
+                        types.same(slot.database[0..slot.database_length], context.session.database);
+                }
+
+                fn cells(self: *const Projected, index: usize) []i64 {
+                    const span = self.rows_per_entry * X.projected_cache_columns;
+                    return self.values[index * span ..][0..span];
+                }
+
+                fn get(self: *Projected, context: *const ReadContext, hash: u64, select: *const B.Select, result: *Result) Error!bool {
+                    const first = self.stripe(hash);
+                    if (!self.lock(first)) return false;
+                    defer self.unlock(first);
+                    for (first..@min(first + stripe_width, self.slots.len)) |index| {
+                        const slot = &self.slots[index];
+                        if (slot.state != .published or !matches(slot, context, hash, result)) continue;
+                        if (context.session.control) |execution_control| if (execution_control.poll) |poll| try poll(execution_control.context);
+                        const packed_values = self.cells(index);
+                        X.writeHeader(select, result);
+                        for (result.rows[0..slot.row_count], 0..) |*row, row_index| {
+                            const packed_row = packed_values[row_index * select.count ..][0..select.count];
+                            for (row.cells[0..select.count], packed_row) |*cell, value| cell.* = .{ .integer = value };
+                        }
+                        result.row_count = slot.row_count;
+                        _ = @atomicRmw(u64, &self.counters.hits, .Add, 1, .monotonic);
+                        return true;
+                    }
+                    _ = @atomicRmw(u64, &self.counters.misses, .Add, 1, .monotonic);
+                    return false;
+                }
+
+                fn put(self: *Projected, context: *const ReadContext, hash: u64, result: *const Result) void {
+                    if (result.command != .select or result.row_count <= 128 or result.row_count > self.rows_per_entry or
+                        context.workspace.query.read_stats.projected_filter_scans != 1) return;
+                    const first = self.stripe(hash);
+                    if (!self.lock(first)) return;
+                    defer self.unlock(first);
+                    var empty: ?usize = null;
+                    for (first..@min(first + stripe_width, self.slots.len)) |index| {
+                        const slot = &self.slots[index];
+                        if (matches(slot, context, hash, result)) {
+                            if (slot.state == .published) return;
+                            const packed_values = self.cells(index);
+                            for (result.rows[0..result.row_count], 0..) |*row, row_index| {
+                                const packed_row = packed_values[row_index * result.column_count ..][0..result.column_count];
+                                for (row.cells[0..result.column_count], packed_row) |*cell, *value| {
+                                    if (cell.* != .integer) return;
+                                    value.* = cell.integer;
+                                }
+                            }
+                            slot.row_count = result.row_count;
+                            slot.state = .published;
+                            _ = @atomicRmw(u64, &self.counters.publications, .Add, 1, .monotonic);
+                            return;
+                        }
+                        if (slot.state == .empty or slot.csn != context.snapshot.csn) empty = index;
+                    }
+                    // Churn may consume observations but never evicts a
+                    // repeated result within the same committed snapshot.
+                    const slot = &self.slots[empty orelse return];
+                    slot.csn = context.snapshot.csn;
+                    slot.hash = hash;
+                    slot.key_length = context.source.len;
+                    @memcpy(slot.key[0..slot.key_length], context.source);
+                    slot.database_length = context.session.database.len;
+                    @memcpy(slot.database[0..slot.database_length], context.session.database);
+                    slot.workspace_cells = context.workspace.query.cells.len;
+                    slot.workspace_refs = context.workspace.query.refs.len;
+                    slot.output_rows = result.rows.len;
+                    slot.state = .observed;
+                }
+            };
+
+            pub const ProjectedLayout = struct {
+                bytes: usize,
+                entries: usize,
+                slots_offset: usize,
+                values_offset: usize,
+                value_count: usize,
+            };
+
+            pub fn projectedLayoutForBytes(byte_budget: usize, rows_per_entry: usize) Error!ProjectedLayout {
+                if (rows_per_entry <= 128) return error.InvalidParameterValue;
+                const per_entry = @mulWithOverflow(rows_per_entry, X.projected_cache_columns * @sizeOf(i64));
+                if (per_entry[1] != 0) return error.InvalidParameterValue;
+                const footprint = @addWithOverflow(per_entry[0], @sizeOf(Projected.Slot));
+                if (footprint[1] != 0) return error.InvalidParameterValue;
+                const stripes = byte_budget / footprint[0] / Projected.stripe_width;
+                if (stripes == 0) return error.WorkspaceCapacity;
+                const entries = stripes * Projected.stripe_width;
+                const value_count = entries * (per_entry[0] / @sizeOf(i64));
+                var bytes: usize = 0;
+                const slots_offset = try appendLayout(&bytes, Projected.Slot, entries);
+                const values_offset = try appendLayout(&bytes, i64, value_count);
+                if (bytes > byte_budget) return error.WorkspaceCapacity;
+                return .{.bytes=bytes,.entries=entries,.slots_offset=slots_offset,.values_offset=values_offset,.value_count=value_count};
+            }
+
+            pub const TieredLayout = struct {
+                small: Layout,
+                small_offset: usize,
+                projected: ?ProjectedLayout,
+                bytes: usize,
+            };
+
+            /// Partition one caller budget. Keep at least seven eighths for
+            /// small entries and decline the optional tier below two stripes.
+            pub fn tieredLayoutForBytes(byte_budget: usize, key_bytes_per_entry: usize,
+                small_rows: usize, projected_rows: usize) Error!TieredLayout {
+                if (projected_rows > 128 and S.compact_enabled) {
+                    const projected_budget = @min(byte_budget / 8, 16 * 1024 * 1024);
+                    if (projectedLayoutForBytes(projected_budget, projected_rows)) |medium| {
+                        if (medium.entries >= 2 * Projected.stripe_width) {
+                            var aligned = medium.bytes;
+                            const small_offset = try appendLayout(&aligned, Entry, 0);
+                            const small = try layoutForBytes(byte_budget - small_offset, key_bytes_per_entry, small_rows);
+                            return .{ .small=small, .small_offset=small_offset, .projected=medium, .bytes=small_offset+small.bytes };
+                        }
+                    } else |_| {}
+                }
+                const small = try layoutForBytes(byte_budget, key_bytes_per_entry, small_rows);
+                return .{.small=small,.small_offset=0,.projected=null,.bytes=small.bytes};
+            }
+
+            /// Bind the optional integral tier after the small result cache.
+            /// Keep both regions stable and disjoint for the cache lifetime.
+            pub fn bindProjectedMemory(cache: *Cache, bytes: []u8, rows_per_entry: usize, min_scan_rows: usize) Error!void {
+                if (cache.projected != null or min_scan_rows == 0) return error.InvalidParameterValue;
+                const layout_value = try projectedLayoutForBytes(bytes.len, rows_per_entry);
+                const slots = try storageView(Projected.Slot, bytes, layout_value.slots_offset, layout_value.entries);
+                const values = try storageView(i64, bytes, layout_value.values_offset, layout_value.value_count);
+                const spans = [_]StorageSpan{ try StorageSpan.of(slots), try StorageSpan.of(values) };
+                try ReadContext.disjointDatabase(cache.database, &spans);
+                for (spans) |span| for (cache.storage_spans) |other| {
+                    if (ReadContext.overlaps(span, other)) return error.InvalidParameterValue;
+                };
+                for (slots) |*slot| {
+                    slot.state = .empty;
+                    slot.busy = 0;
+                }
+                cache.projected = .{.slots=slots,.values=values,.spans=spans,.rows_per_entry=rows_per_entry,.min_scan_rows=min_scan_rows};
+            }
+
+            pub fn projectedStats(cache: *const Cache) Stats {
+                const projected = if (cache.projected) |*tier| tier else return .{};
+                return readStats(&projected.counters);
+            }
 
             /// Byte layout for one aligned caller-owned cache region.
             pub fn layout(entries: usize, key_bytes_per_entry: usize, rows_per_entry: usize) Error!Layout {
@@ -566,11 +759,15 @@ pub fn Database(comptime config: Config) type {
             /// Snapshot of completed cache activity. Ineligible reads bypass
             /// the cache, and a contended access is counted separately.
             pub fn stats(cache: *const Cache) Stats {
+                return readStats(&cache.counters);
+            }
+
+            fn readStats(counters: *const Stats) Stats {
                 return .{
-                    .hits = @atomicLoad(u64, &cache.counters.hits, .monotonic),
-                    .misses = @atomicLoad(u64, &cache.counters.misses, .monotonic),
-                    .publications = @atomicLoad(u64, &cache.counters.publications, .monotonic),
-                    .contention = @atomicLoad(u64, &cache.counters.contention, .monotonic),
+                    .hits = @atomicLoad(u64, &counters.hits, .monotonic),
+                    .misses = @atomicLoad(u64, &counters.misses, .monotonic),
+                    .publications = @atomicLoad(u64, &counters.publications, .monotonic),
+                    .contention = @atomicLoad(u64, &counters.contention, .monotonic),
                 };
             }
 
@@ -595,11 +792,11 @@ pub fn Database(comptime config: Config) type {
                 }
             }
 
-            fn validateContext(cache: *const Cache, context: *const ReadContext, result: *const Result) Error!void {
+            fn validateContext(storage_spans: []const StorageSpan, context: *const ReadContext, result: *const Result) Error!void {
                 const spans = [_]StorageSpan{ try ReadContext.objectSpan(context), try ReadContext.objectSpan(result),
                     try StorageSpan.of(context.source), try StorageSpan.of(context.session.database), try StorageSpan.of(context.workspace.query.cells[0..]),
                     try StorageSpan.of(context.workspace.query.refs[0..]), try StorageSpan.of(result.rows[0..]) };
-                for (cache.storage_spans) |part| {
+                for (storage_spans) |part| {
                     for (spans) |other| if (ReadContext.overlaps(part, other)) return error.InvalidParameterValue;
                 }
             }
@@ -1289,19 +1486,42 @@ pub fn Database(comptime config: Config) type {
                 if(self.preparation_error) |err| return err;
                 const plan=self.prepared orelse return error.InvalidParameterValue;
                 if(config.external_results and result.rows.len==0) return error.InvalidParameterValue;
-                const cache_hash: ?u64 = if (cache) |candidate| cache_key: {
-                    if (candidate.database != db or self.source.len > candidate.key_capacity or
-                        self.session.database.len > 64 or !self.cacheable(db, plan)) break :cache_key null;
-                    try candidate.validateContext(self, result);
-                    const hash = ReadResultCache.hashSource(self.source);
-                    if (try candidate.get(self, hash, result)) {
-                        self.last_result_reused = true;
-                        self.workspace.query.read_stats = .{};
-                        self.workspace.query.stream_stats = .{};
-                        return;
+                var projected_cache: ?*ReadResultCache.Projected = null;
+                var cache_hash: ?u64 = null;
+                const hit = if (cache) |candidate| cache_key: {
+                    // A bound tier must stay disjoint even when this plan
+                    // bypasses caching and writes its own Result.
+                    const tier: ?*ReadResultCache.Projected = if (candidate.projected) |*tier| tier else null;
+                    if (tier) |medium| try ReadResultCache.validateContext(&medium.spans, self, result);
+                    if (candidate.database != db or self.session.database.len > 64 or
+                        !self.cacheableProfile(db)) break :cache_key false;
+                    switch (plan) {
+                        .general => {
+                            if (self.source.len > candidate.key_capacity or !self.cacheable(db, plan)) break :cache_key false;
+                            try ReadResultCache.validateContext(&candidate.storage_spans, self, result);
+                            const hash = ReadResultCache.hashSource(self.source);
+                            cache_hash = hash;
+                            break :cache_key try candidate.get(self, hash, result);
+                        },
+                        .simple => |*select| {
+                            const medium = tier orelse break :cache_key false;
+                            if (self.source.len > ReadResultCache.Projected.key_bytes or
+                                !self.cacheableProjected(db, select, medium.min_scan_rows)) break :cache_key false;
+                            try ReadResultCache.validateContext(&candidate.storage_spans, self, result);
+                            const hash = ReadResultCache.hashSource(self.source);
+                            cache_hash = hash;
+                            projected_cache = medium;
+                            break :cache_key try medium.get(self, hash, select, result);
+                        },
+                        .primary_key => break :cache_key false,
                     }
-                    break :cache_key hash;
-                } else null;
+                } else false;
+                if (hit) {
+                    self.last_result_reused = true;
+                    self.workspace.query.read_stats = .{};
+                    self.workspace.query.stream_stats = .{};
+                    return;
+                }
                 self.workspace.query.views=.{.ptr=self,.rows=readViewRows};
                 self.workspace.query.read_stats=.{};
                 switch(plan) {
@@ -1311,7 +1531,10 @@ pub fn Database(comptime config: Config) type {
                         &self.session,&self.workspace.query,self.snapshot.epoch==0),
                     .primary_key => return error.UndefinedParameter,
                 }
-                if (cache_hash) |hash| try cache.?.put(self, hash, result);
+                if (cache_hash) |hash| {
+                    if (projected_cache) |tier| tier.put(self, hash, result)
+                    else try cache.?.put(self, hash, result);
+                }
             }
 
             fn cacheableType(ty: ast.Type) bool {
@@ -1329,14 +1552,26 @@ pub fn Database(comptime config: Config) type {
                 };
             }
 
-            fn cacheable(self: *const Context, db: *const Self, plan: Plan) bool {
+            fn cacheableProfile(self: *const Context, db: *const Self) bool {
                 const session = &self.session;
-                if (plan != .general or self.dialect != .postgres or self.snapshot.epoch != 0 or
-                    self.snapshot.csn != db.csn or self.effective.ptr != self.source.ptr or
-                    session.role != CO.bootstrap_role or session.session_role != CO.bootstrap_role or
-                    session.zone.kind != .utc or session.xml_document or session.resolver.lookup != null or session.params != null or
-                    session.engine != null or session.routines != null or session.routine_frame != null or
-                    (session.control != null and session.control.?.max_work != 0)) return false;
+                return self.dialect == .postgres and self.snapshot.epoch == 0 and
+                    self.snapshot.csn == db.csn and self.effective.ptr == self.source.ptr and
+                    session.role == CO.bootstrap_role and session.session_role == CO.bootstrap_role and
+                    session.zone.kind == .utc and !session.xml_document and session.resolver.lookup == null and session.params == null and
+                    session.engine == null and session.routines == null and session.routine_frame == null and
+                    (session.control == null or session.control.?.max_work == 0);
+            }
+
+            fn cacheableProjected(self: *const Context, db: *const Self, select: *const B.Select, min_scan_rows: usize) bool {
+                if (!self.session.synchronize_seqscans) return false;
+                const table = &db.tables[select.table orelse return false];
+                if (table.relkind != 'r' or table.namespace != catalog_module.public_namespace or table.parent != 0 or
+                    db.hasChildren(table.oid, self.snapshot) or db.detachedReadsBlocked()) return false;
+                return X.cacheableProjectedFilter(&self.workspace.nodes, table, select, self.snapshot, min_scan_rows);
+            }
+
+            fn cacheable(self: *const Context, db: *const Self, plan: Plan) bool {
+                if (plan != .general) return false;
 
                 // Positive allowlist: unknown functions, user routines,
                 // clocks, session/sequence state, sampling and catalog scans
@@ -1383,7 +1618,7 @@ pub fn Database(comptime config: Config) type {
                         if (source.table) |index| {
                             const table = &db.tables[index];
                             if (table.relkind != 'r' or table.namespace != catalog_module.public_namespace) return false;
-                            if (session.synchronize_seqscans and X.synchronizedProjection(block) and S.supportsSynchronizedScan(table)) return false;
+                            if (self.session.synchronize_seqscans and X.synchronizedProjection(block) and S.supportsSynchronizedScan(table)) return false;
                         }
                     }
                     for (block.aggs[0..block.agg_count]) |aggregate| if (!cacheableAggregate(aggregate.kind)) return false;
