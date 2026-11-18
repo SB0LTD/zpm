@@ -965,6 +965,10 @@ const scram_nonce = "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
 const scram_first = "n,,n=user,r=rOprNGfwEbeRWgbNEkqO";
 const scram_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
 fn authStartup(s: anytype, db: anytype, username: []const u8) !void {
+    try authStartupMechanisms(s, db, username, "SCRAM-SHA-256\x00\x00");
+}
+
+fn authStartupMechanisms(s: anytype, db: anytype, username: []const u8, mechanisms: []const u8) !void {
     var p = Packet.init(0);
     p.len = 4;
     p.number32(196608);
@@ -977,7 +981,7 @@ fn authStartup(s: anytype, db: anytype, username: []const u8) !void {
     var frames: Frames = .{ .bytes = output[0..reply.written] };
     const request = (try frames.next()) orelse return error.MissingAuthenticationRequest;
     try check(request.tag == 'R' and u32be(request.body[0..4]) == 10);
-    try check(equal(request.body[4..], "SCRAM-SHA-256\x00\x00"));
+    try check(equal(request.body[4..], mechanisms));
     try check((try frames.next()) == null);
     try check(s.authentication.?.state == .initial);
 }
@@ -1112,6 +1116,53 @@ fn routedStartupContracts() !void {
     try check(rejected.close and db.calls == 1);
     try state(output[0..rejected.written], "08P01");
     try check((try invalid_startup.handle(&db, startup_packet.bytes[0..startup_packet.len], &output)).close and db.calls == 1);
+}
+
+fn channelBindingContracts() !void {
+    var db: DB = .{};
+    var session: Session = .{};
+    const verifier = try scram.Verifier.parse("user", scram_verifier);
+    var digest: [32]u8 = undefined;
+    for (&digest, 0..) |*byte, index| byte.* = @intCast(index);
+    const first_plus = "p=tls-server-end-point,,n=user,r=rOprNGfwEbeRWgbNEkqO";
+    const final_plus = "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=nY1Wus9a+gM2DrbQ1msXFgyhW6KM5ktOxWiU+/P/EGY=";
+    const wrong_binding = "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsHx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=TkrYLyZRx5vvXT58wSDsPw8PDJ6ElWOrU3s3Ur5v1Nc=";
+    for ([_]bool{ false, true }) |required| {
+        session = .{};
+        try session.configureAuthentication(&verifier, scram_nonce);
+        try session.configureChannelBinding(&digest, required);
+        try authStartupMechanisms(&session, &db, "user", if (required)
+            "SCRAM-SHA-256-PLUS\x00\x00"
+        else
+            "SCRAM-SHA-256-PLUS\x00SCRAM-SHA-256\x00\x00");
+        var initial = Packet.init('p');
+        initial.string(scram.mechanism_plus);
+        initial.number32(first_plus.len);
+        initial.append(first_plus);
+        try tags(try send(&session, &db, &initial), "R");
+        var final = Packet.init('p');
+        final.append(if (required) wrong_binding else final_plus);
+        const reply = try session.handle(&db, final.slice(), &output);
+        if (required) {
+            try check(reply.close and session.authentication.?.state == .failed);
+            try state(output[0..reply.written], "28P01");
+        } else {
+            try check(!reply.close and session.authentication.?.state == .complete);
+            try tags(output[0..reply.written], "RRSSSSSSSKZ");
+        }
+    }
+
+    session = .{};
+    try session.configureAuthentication(&verifier, scram_nonce);
+    try session.configureChannelBinding(&digest, true);
+    try authStartupMechanisms(&session, &db, "user", "SCRAM-SHA-256-PLUS\x00\x00");
+    var initial = Packet.init('p');
+    initial.string(scram.mechanism);
+    initial.number32(scram_first.len);
+    initial.append(scram_first);
+    const rejected = try session.handle(&db, initial.slice(), &output);
+    try check(rejected.close and session.authentication.?.state == .failed);
+    try state(output[0..rejected.written], "28P01");
 }
 
 fn authenticationContracts() !void {
@@ -1976,6 +2027,7 @@ pub fn main(init: std.process.Init) !void {
     try statementLifecycle();
     try malformed();
     try authenticationContracts();
+    try channelBindingContracts();
     try routedStartupContracts();
     try backendErrorStates();
     try fuzz();
