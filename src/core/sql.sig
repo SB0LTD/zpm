@@ -8349,7 +8349,7 @@ pub fn Database(comptime config: Config) type {
 
         /// Settings PostgreSQL has that the caller (Store) implements.
         fn callerSetting(name: []const u8) bool {
-            for ([_][]const u8{ "timezone", "datestyle", "intervalstyle", "application_name", "client_encoding", "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "deadlock_timeout", "standard_conforming_strings", "server_version", "server_encoding", "integer_datetimes" }) |known| {
+            for ([_][]const u8{ "timezone", "datestyle", "intervalstyle", "application_name", "client_encoding", "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "transaction_timeout", "deadlock_timeout", "standard_conforming_strings", "server_version", "server_encoding", "integer_datetimes" }) |known| {
                 if (Sess.sameInsensitive(name, known)) return true;
             }
             return false;

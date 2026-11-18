@@ -115,6 +115,7 @@ pub fn SettingsOf(comptime Zone: type) type {
         lock_timeout_ms: u32 = 0,
         statement_timeout_ms: u32 = 0,
         idle_in_transaction_session_timeout_ms: u32 = 0,
+        transaction_timeout_ms: u32 = 0,
         application_name: [64]u8 = @splat(0),
         application_name_len: u8 = 0,
         /// TimeZone as SHOW reports it, and the resolved zone.
@@ -224,7 +225,7 @@ pub const deadlock_timeout_ms: u32 = 1000;
 
 /// Settings this store implements; the engine owns the others it knows
 /// (transaction_*, default_transaction_*, search_path, placeholders).
-const Parameter = enum { lock_timeout, statement_timeout, idle_in_transaction_session_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
+const Parameter = enum { lock_timeout, statement_timeout, idle_in_transaction_session_timeout, transaction_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -261,7 +262,7 @@ fn parseMilliseconds(text: []const u8) !u32 {
     return @intCast(total);
 }
 
-const idle_timeout_units = [_]struct { name: []const u8, milliseconds: f64 }{
+const guc_timeout_units = [_]struct { name: []const u8, milliseconds: f64 }{
     .{ .name = "d", .milliseconds = 86400000 },
     .{ .name = "h", .milliseconds = 3600000 },
     .{ .name = "min", .milliseconds = 60000 },
@@ -293,20 +294,20 @@ fn nearestEven(number: f64) f64 {
     return if (fraction > 0.5 or (fraction == 0.5 and @rem(lower, 2.0) != 0.0)) lower + 1.0 else lower;
 }
 
-fn parseIdleTransactionTimeout(text: []const u8) !u32 {
+fn parseGucTimeout(text: []const u8) !u32 {
     const spaces = " \t\n\r\x0b\x0c";
     const source = std.mem.trim(u8, text, spaces);
     const milliseconds = timeoutNumber(source) orelse converted: {
         // Match longer suffixes first, including ms/us before s.
-        var index = idle_timeout_units.len;
+        var index = guc_timeout_units.len;
         while (index != 0) {
             index -= 1;
-            const unit = idle_timeout_units[index];
+            const unit = guc_timeout_units[index];
             if (!std.mem.endsWith(u8, source, unit.name)) continue;
             const value = timeoutNumber(std.mem.trimEnd(u8, source[0 .. source.len - unit.name.len], spaces)) orelse return error.InvalidSettingValue;
             const scaled = value * unit.milliseconds;
-            if (index + 1 == idle_timeout_units.len) break :converted scaled;
-            const next_smaller = idle_timeout_units[index + 1].milliseconds;
+            if (index + 1 == guc_timeout_units.len) break :converted scaled;
+            const next_smaller = guc_timeout_units[index + 1].milliseconds;
             break :converted nearestEven(scaled / next_smaller) * next_smaller;
         }
         return error.InvalidSettingValue;
@@ -649,6 +650,7 @@ pub fn Store(comptime Raw: type) type {
             running_statement: bool = false,
             execution: ExecutionControl = .{},
             execution_deadline_ns: ?i64 = null,
+            transaction_deadline_ns: ?i64 = null,
             /// Savepoint depth of the last ROLLBACK TO, for the codec's portals.
             rolled_back_to: ?usize = null,
             /// Wall-clock start of the open (or implicit) transaction and of
@@ -743,6 +745,7 @@ pub fn Store(comptime Raw: type) type {
                     self.settings = next;
                     restore(&self.base, &next, which);
                 }
+                if (which == .transaction_timeout) self.refreshTransactionTimeout();
             }
 
             pub const CopyInfo = Raw.CopyInfo;
@@ -799,7 +802,7 @@ pub fn Store(comptime Raw: type) type {
                     if (self.engine_session.listener != null) return false;
                 }
                 return self.detachedIdentity() and self.id!=0 and !self.failed and self.autocommit and !self.in_transaction and self.tx==null and
-                    !self.pending.active and !self.running_statement and self.read_context==null;
+                    self.settings.transaction_timeout_ms == 0 and !self.pending.active and !self.running_statement and self.read_context==null;
             }
             fn detachedIdentity(self: *const Connection) bool {
                 if (comptime has_engine_session) return self.engine_session.values.role == 0 and self.engine_session.session_role == 10;
@@ -872,6 +875,7 @@ pub fn Store(comptime Raw: type) type {
                 if (self.in_transaction) return;
                 if (self.pending.active) return error.TransactionFailed;
                 self.tx = try self.db().begin();
+                self.refreshTransactionTimeout();
                 self.in_transaction = true;
                 self.failed = false;
                 self.transaction_us = self.store.wallNow();
@@ -882,6 +886,7 @@ pub fn Store(comptime Raw: type) type {
 
             fn endTransaction(self: *Connection, committed: bool) void {
                 self.transaction_us = null;
+                self.transaction_deadline_ns = null;
                 self.settings = if (committed) self.base else self.tx_start;
                 self.base = self.settings;
                 self.tx = null;
@@ -901,6 +906,9 @@ pub fn Store(comptime Raw: type) type {
                     self.endTransaction(false);
                     return;
                 }
+                try self.checkTransactionTimeout();
+                // Once durable commit begins, finish its atomic publication.
+                self.transaction_deadline_ns = null;
                 self.store.commit(slot) catch |err| {
                     // The transaction is gone either way, as in PostgreSQL.
                     self.endTransaction(false);
@@ -933,9 +941,11 @@ pub fn Store(comptime Raw: type) type {
                 if (self.saved_len > 0) {
                     self.settings = self.saved[self.saved_len - 1].current;
                     self.base = self.saved[self.saved_len - 1].base;
+                    self.refreshTransactionTimeout();
                 } else {
                     self.settings = self.tx_start;
                     self.base = self.tx_start;
+                    self.transaction_deadline_ns = null;
                 }
             }
 
@@ -948,7 +958,32 @@ pub fn Store(comptime Raw: type) type {
             /// The protocol and reactor own the command-read boundary and clock.
             pub fn idleTransactionTimeout(self: *const Connection) u32 {
                 if (self.id == 0 or !self.in_transaction or self.pending.active) return 0;
-                return self.settings.idle_in_transaction_session_timeout_ms;
+                const idle = self.settings.idle_in_transaction_session_timeout_ms;
+                const transaction = self.settings.transaction_timeout_ms;
+                return if (transaction == 0 or idle < transaction) idle else 0;
+            }
+
+            fn monotonicNow(self: *const Connection) i64 {
+                return if (self.store.monotonic_clock) |clock| clock() else self.store.now_ns;
+            }
+
+            pub fn transactionDeadline(self: *const Connection) ?i64 {
+                return self.transaction_deadline_ns;
+            }
+
+            pub fn checkTransactionTimeout(self: *const Connection) error{TransactionTimeout}!void {
+                if (self.transaction_deadline_ns) |due| {
+                    if (self.monotonicNow() >= due) return error.TransactionTimeout;
+                }
+            }
+
+            fn refreshTransactionTimeout(self: *Connection) void {
+                const timeout = self.settings.transaction_timeout_ms;
+                if (timeout == 0 or self.dialect != .postgres or self.tx == null) {
+                    self.transaction_deadline_ns = null;
+                } else if (self.transaction_deadline_ns == null) {
+                    self.transaction_deadline_ns = self.monotonicNow() +| (@as(i64, timeout) * 1000000);
+                }
             }
 
             pub fn isAutocommit(self: *const Connection) bool {
@@ -968,6 +1003,12 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session) self.db().endSession();
             }
 
+            /// The session owner uses this before draining a fatal timeout.
+            pub fn terminateTimedOut(self: *Connection) void {
+                self.disconnect();
+                self.id = 0;
+            }
+
             pub fn blocked(self: *const Connection) bool {
                 return self.pending.active;
             }
@@ -984,7 +1025,7 @@ pub fn Store(comptime Raw: type) type {
                 if (!self.pending.active) return null;
                 var out: ?i64 = null;
                 if (!self.pending.deadlock_checked) out = self.pending.deadlock_check_ns;
-                for ([_]?i64{ self.pending.lock_deadline_ns, self.pending.statement_deadline_ns }) |candidate| {
+                for ([_]?i64{ self.pending.lock_deadline_ns, self.pending.statement_deadline_ns, self.transaction_deadline_ns }) |candidate| {
                     if (candidate) |at| out = if (out) |current| @min(current, at) else at;
                 }
                 return out;
@@ -1047,7 +1088,8 @@ pub fn Store(comptime Raw: type) type {
                 switch (which) {
                     .lock_timeout => target.lock_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
                     .statement_timeout => target.statement_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
-                    .idle_in_transaction_session_timeout => target.idle_in_transaction_session_timeout_ms = if (is_default and value.len == 0) 0 else try parseIdleTransactionTimeout(value),
+                    .idle_in_transaction_session_timeout => target.idle_in_transaction_session_timeout_ms = if (is_default and value.len == 0) 0 else try parseGucTimeout(value),
+                    .transaction_timeout => target.transaction_timeout_ms = if (is_default and value.len == 0) 0 else try parseGucTimeout(value),
                     .application_name => {
                         const length = @min(value.len, 63);
                         @memcpy(target.application_name[0..length], value[0..length]);
@@ -1121,6 +1163,7 @@ pub fn Store(comptime Raw: type) type {
                     .lock_timeout => return formatMilliseconds(self.settings.lock_timeout_ms, out),
                     .statement_timeout => return formatMilliseconds(self.settings.statement_timeout_ms, out),
                     .idle_in_transaction_session_timeout => return formatMilliseconds(self.settings.idle_in_transaction_session_timeout_ms, out),
+                    .transaction_timeout => return formatMilliseconds(self.settings.transaction_timeout_ms, out),
                     .deadlock_timeout => return formatMilliseconds(deadlock_timeout_ms, out),
                     .application_name => self.settings.applicationName(),
                     .timezone => self.settings.timeZone(),
@@ -1275,6 +1318,7 @@ pub fn Store(comptime Raw: type) type {
                         self.base = self.saved[depth].base;
                         self.saved_len = depth + 1;
                         self.failed = false;
+                        self.refreshTransactionTimeout();
                         result.clear(0);
                         result.command = .rollback;
                     },
@@ -1330,6 +1374,7 @@ pub fn Store(comptime Raw: type) type {
                             self.settings = self.startup;
                             self.base = self.startup;
                         }
+                        self.refreshTransactionTimeout();
                         result.clear(0);
                         result.command = .reset;
                     },
@@ -1341,6 +1386,7 @@ pub fn Store(comptime Raw: type) type {
                     .lock_timeout => target.lock_timeout_ms = source.lock_timeout_ms,
                     .statement_timeout => target.statement_timeout_ms = source.statement_timeout_ms,
                     .idle_in_transaction_session_timeout => target.idle_in_transaction_session_timeout_ms = source.idle_in_transaction_session_timeout_ms,
+                    .transaction_timeout => target.transaction_timeout_ms = source.transaction_timeout_ms,
                     .application_name => {
                         target.application_name = source.application_name;
                         target.application_name_len = source.application_name_len;
@@ -1363,6 +1409,7 @@ pub fn Store(comptime Raw: type) type {
                 if (implicit) {
                     self.db().abort(slot);
                     self.tx = null;
+                    self.transaction_deadline_ns = null;
                 } else {
                     self.db().failScope(slot);
                     self.failed = true;
@@ -1406,6 +1453,7 @@ pub fn Store(comptime Raw: type) type {
                 self.cancel_requested = false;
                 if (implicit) {
                     self.tx = null;
+                    self.transaction_deadline_ns = null;
                     try self.store.commit(slot);
                     self.store.database.lastOutcomeInto(result);
                 }
@@ -1420,8 +1468,10 @@ pub fn Store(comptime Raw: type) type {
                         self.execution.reset(self.store.max_query_work);
                         self.execution.context = self;
                         self.execution.poll = &pollExecution;
-                        const now = if (self.store.monotonic_clock) |clock| clock() else self.store.now_ns;
-                        self.execution_deadline_ns = if (self.settings.statement_timeout_ms != 0) now + @as(i64, self.settings.statement_timeout_ms) * 1000000 else null;
+                        const statement = self.settings.statement_timeout_ms;
+                        const transaction = self.settings.transaction_timeout_ms;
+                        self.execution_deadline_ns = if (statement != 0 and (transaction == 0 or statement < transaction))
+                            self.monotonicNow() +| (@as(i64, statement) * 1000000) else null;
                         self.cancel_requested = false;
                     }
                 }
@@ -1448,6 +1498,10 @@ pub fn Store(comptime Raw: type) type {
                     // transaction's own refusal stays 25006.
                     return if (err == error.ReadOnlyTransaction and !writes) error.StorageUnavailable else err;
                 };
+                self.checkTransactionTimeout() catch |err| {
+                    self.terminal(implicit);
+                    return err;
+                };
                 return self.finish(slot, implicit, result);
             }
 
@@ -1455,23 +1509,19 @@ pub fn Store(comptime Raw: type) type {
                 const self: *Connection = @ptrCast(@alignCast(context.?));
                 if (self.store.interrupt_poll) |poll| poll(self.store.interrupt_context, self.id);
                 if (self.cancel_requested) return error.QueryCanceled;
-                if (self.execution_deadline_ns) |deadline| {
-                    const now = if (self.store.monotonic_clock) |clock| clock() else self.store.now_ns;
-                    if (now >= deadline) return error.QueryCanceled;
-                }
+                if (self.execution_deadline_ns == null and self.transaction_deadline_ns == null) return;
+                const now = self.monotonicNow();
+                const transaction = self.transaction_deadline_ns orelse std.math.maxInt(i64);
+                const statement = self.execution_deadline_ns orelse std.math.maxInt(i64);
+                if (self.transaction_deadline_ns != null and transaction <= statement and now >= transaction) return error.TransactionTimeout;
+                if (self.execution_deadline_ns != null and now >= statement) return error.QueryCanceled;
             }
 
             /// A re-delivered statement is still waiting: apply its timers.
             fn stillBlocked(self: *Connection, slot: u16, implicit: bool) !void {
                 self.rewait(slot);
                 const now = self.store.now_ns;
-                var outcome: ?anyerror = null;
-                if (self.pending.statement_deadline_ns) |at| {
-                    if (now >= at) outcome = error.QueryCanceled;
-                }
-                if (outcome == null) if (self.pending.lock_deadline_ns) |at| {
-                    if (now >= at) outcome = error.LockNotAvailable;
-                };
+                var outcome = self.pendingTimeout();
                 if (outcome == null and !self.pending.deadlock_checked and now >= self.pending.deadlock_check_ns) {
                     self.pending.deadlock_checked = true;
                     if (self.store.database.deadlocked(slot)) outcome = error.DeadlockDetected;
@@ -1485,9 +1535,35 @@ pub fn Store(comptime Raw: type) type {
                 return error.WouldBlock;
             }
 
+            fn pendingTimeout(self: *Connection) ?anyerror {
+                const now = self.monotonicNow();
+                var outcome: ?anyerror = null;
+                var earliest: i64 = std.math.maxInt(i64);
+                if (self.transaction_deadline_ns) |at| if (at <= now) {
+                    outcome = error.TransactionTimeout;
+                    earliest = at;
+                };
+                if (self.pending.lock_deadline_ns) |at| if (at <= now and at < earliest) {
+                    outcome = error.LockNotAvailable;
+                    earliest = at;
+                };
+                if (self.pending.statement_deadline_ns) |at| if (at <= now and at < earliest) {
+                    outcome = error.QueryCanceled;
+                };
+                return outcome;
+            }
+
+            fn checkPendingTimeout(self: *Connection, slot: u16, implicit: bool) !void {
+                const timeout = self.pendingTimeout() orelse return;
+                self.db().abortStatement(slot);
+                self.terminal(implicit);
+                return timeout;
+            }
+
             fn resumeStatement(self: *Connection, source: []const u8, result: *Result) !void {
                 const slot = self.tx.?;
                 const implicit = self.pending.implicit;
+                try self.checkPendingTimeout(slot, implicit);
                 if (fingerprint(source) != self.pending.fingerprint or self.cancel_requested) {
                     // A different statement while one is parked is an
                     // internal invariant failure; either way it is canceled.
@@ -1504,6 +1580,7 @@ pub fn Store(comptime Raw: type) type {
             /// (never executes). COPY TO writes its SELECT into `select`.
             pub fn copyDescribe(self: *Connection, source: []const u8, select: []u8) !Raw.CopyInfo {
                 if (self.id == 0) return error.InvalidConnection;
+                if (!self.pending.active) try self.checkTransactionTimeout();
                 if (self.failed) return error.TransactionFailed;
                 if (self.pending.active and self.pending.copy) return error.QueryCanceled;
                 return self.db().copyInfo(self.tx, source, select);
@@ -1519,6 +1596,7 @@ pub fn Store(comptime Raw: type) type {
                 if (self.pending.active) {
                     const slot = self.tx.?;
                     const implicit = self.pending.implicit;
+                    try self.checkPendingTimeout(slot, implicit);
                     if (self.pending.copy or fingerprint(source) != self.pending.fingerprint or self.cancel_requested) {
                         self.db().abortStatement(slot);
                         self.terminal(implicit);
@@ -1545,6 +1623,7 @@ pub fn Store(comptime Raw: type) type {
                 const slot = if (self.tx) |slot| slot else blk: {
                     const slot = try self.db().begin();
                     self.tx = slot;
+                    self.refreshTransactionTimeout();
                     break :blk slot;
                 };
                 self.store.storageReady() catch |err| {
@@ -1571,6 +1650,7 @@ pub fn Store(comptime Raw: type) type {
             pub fn copyRow(self: *Connection, source: []const u8, fields: []const ?[]const u8) !void {
                 const slot = self.tx orelse return error.NoActiveTransaction;
                 if (self.pending.active) return error.QueryCanceled;
+                try self.checkTransactionTimeout();
                 self.db().copyBuild(slot, source, fields, &self.copy_row) catch |err| {
                     self.terminal(self.copy_implicit);
                     return err;
@@ -1605,6 +1685,7 @@ pub fn Store(comptime Raw: type) type {
                 if (!self.copyBlocked()) return;
                 const slot = self.tx.?;
                 const implicit = self.pending.implicit;
+                try self.checkPendingTimeout(slot, implicit);
                 if (self.cancel_requested) {
                     self.db().abortStatement(slot);
                     self.terminal(implicit);
@@ -1625,9 +1706,11 @@ pub fn Store(comptime Raw: type) type {
             pub fn copyEnd(self: *Connection) !usize {
                 const slot = self.tx orelse return error.NoActiveTransaction;
                 if (self.pending.active) return error.QueryCanceled;
+                try self.checkTransactionTimeout();
                 const rows = try self.db().copyEnd(slot);
                 if (self.copy_implicit) {
                     self.tx = null;
+                    self.transaction_deadline_ns = null;
                     try self.store.commit(slot);
                 }
                 return rows;
@@ -1665,7 +1748,7 @@ pub fn Store(comptime Raw: type) type {
                 if (self.id == 0) return error.InvalidConnection;
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
                 if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| {
-                    if(!self.detachedIdentity() or self.failed or self.in_transaction or self.tx!=null or !self.autocommit or self.pending.active or
+                    if(!self.detachedIdentity() or self.failed or self.in_transaction or self.tx!=null or !self.autocommit or self.pending.active or self.settings.transaction_timeout_ms != 0 or
                         context.database==null or context.database.?!=&self.store.database or !same(source,context.source)) return error.InvalidParameterValue;
                     // Metadata-only Describe invalidates executable preparation.
                     // Rebind under the same caller-held read snapshot before run.
@@ -1677,6 +1760,7 @@ pub fn Store(comptime Raw: type) type {
                     return context.run(result);
                 };
                 if (self.pending.active) return self.resumeStatement(source, result);
+                try self.checkTransactionTimeout();
                 // Bounded MySQL/TDS session commands. Long SQL still goes
                 // intact to the strict parser without a second SQL-sized copy.
                 var command: [256]u8 = undefined;
@@ -1751,6 +1835,7 @@ pub fn Store(comptime Raw: type) type {
                 const slot = if (self.tx) |slot| slot else blk: {
                     const slot = try self.db().begin();
                     self.tx = slot;
+                    self.refreshTransactionTimeout();
                     break :blk slot;
                 };
                 return self.run(source, result, slot, implicit, false);
