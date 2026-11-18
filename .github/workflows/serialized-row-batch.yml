@@ -1,0 +1,49 @@
+name: Qualify serialized durable commit batch
+
+on:
+  push:
+    branches: [ci/serialized-row-batch-20261118]
+
+permissions:
+  contents: read
+
+jobs:
+  admission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+      - name: Verify stable batch publication with canonical Sig
+        run: |
+          set -euo pipefail
+          mkdir -p evidence "$RUNNER_TEMP/sig-sdk"
+          candidate=0aeef3bfb8573c89e2bcf8a8b47070d47932cf48
+          git merge-base --is-ancestor "$candidate" HEAD
+          git diff --exit-code "$candidate" -- src/core/sql.sig src/db/store.sig tests/test_db_store.sig
+          git rev-parse HEAD "$candidate" > evidence/source.log
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          archive="$RUNNER_TEMP/$tag-x86_64-linux.tar.xz"
+          curl --fail --location --silent --show-error \
+            "https://github.com/SB0LTD/sig/releases/download/$tag/$(basename "$archive")" -o "$archive"
+          printf '%s  %s\n' 179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a "$archive" \
+            | sha256sum -c - | tee evidence/sdk.log
+          tar -xJf "$archive" -C "$RUNNER_TEMP/sig-sdk"
+          compiler="$(find "$RUNNER_TEMP/sig-sdk" -type f -path '*/bin/sig' -print -quit)"
+          test -x "$compiler"
+          sha256sum "$compiler" >> evidence/sdk.log
+          "$compiler" version | tee -a evidence/sdk.log
+          std="$(dirname "$(dirname "$compiler")")/lib"
+          "$compiler" build-exe -OReleaseSafe --Sig-lib-dir "$std" \
+            "-femit-bin=$RUNNER_TEMP/store-contract" --dep sql --dep db_store \
+            -Mroot=tests/test_db_store.sig -Msql=src/core/sql.sig -Mdb_store=src/db/store.sig 2>&1 | tee evidence/build.log
+          "$RUNNER_TEMP/store-contract" 2>&1 | tee evidence/store-contract.log
+          grep -E '^store: [1-9][0-9]+ assertions passed$' evidence/store-contract.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: serialized-row-batch
+          path: evidence/
+          if-no-files-found: error
