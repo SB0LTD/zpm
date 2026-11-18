@@ -42,6 +42,8 @@
 //!    15 create_schema oid u32, name
 //!    16 drop_schema   oid u32 (the schema holds no table at that point)
 //!    17 catalog_counters_with_constraints: op 6 plus next constraint OID u32
+//!    18 create_owned_schema: op 15 plus nonzero owner role OID u32
+//!    19 create_private_schema: op 18 with owner-only USAGE
 //!    60-65 routines, triggers and rules (B11 wave 3): payload_len u32 +
 //!                     payload, decoded by routine_catalog.sig: 60
 //!                     create_routine, 61 drop_routine, 62 create_trigger,
@@ -143,7 +145,7 @@ pub const extensions_format_version: u16 = 3;
 pub const constraint_identity_format_version: u16 = 4;
 pub const primary_index_identity_format_version: u16 = 5;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -526,10 +528,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
             if (seq.spec.cache != 1) try writer.int(i64, seq.spec.cache);
         }
 
-        pub fn encodeCreateSchema(writer: *Writer, oid: u32, schema_name: []const u8) Error!void {
-            try writer.op(.create_schema);
-            try writer.int(u32, oid);
-            try writer.name(schema_name);
+        pub fn encodeCreateSchema(writer: *Writer, schema: anytype) Error!void {
+            const owner_field = schema.private_usage or schema.owner != catalog_objects.bootstrap_role;
+            try writer.op(if (schema.private_usage) .create_private_schema else if (owner_field) .create_owned_schema else .create_schema);
+            try writer.int(u32, schema.oid);
+            try writer.name(schema.name.slice());
+            if (owner_field) try writer.int(u32, schema.owner);
         }
 
         pub fn encodeDropSchema(writer: *Writer, oid: u32) Error!void {
@@ -751,7 +755,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         };
 
         const VSeq = struct { live: bool = false, oid: u32 = 0, name: V.Name = .{} };
-        const VSchema = struct { live: bool = false, oid: u32 = 0, name: V.Name = .{} };
+        const VSchema = struct { live: bool = false, oid: u32 = 0, owner: u32 = catalog_objects.bootstrap_role, private_usage: bool = false, name: V.Name = .{} };
 
         /// Caller-owned replay overlay. Bounded by 2 x rows x tables live
         /// entries (rows touched from the database plus rows created by the
@@ -832,6 +836,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 pub fn objectSequenceLive(self: *const @This(), oid: u32) bool {
                     for (&self.scratch.seqs) |*vs| if (vs.live and vs.oid == oid) return true;
                     return false;
+                }
+
+                pub fn objectPrivateSchemaOwner(self: *const @This(), oid: u32) ?u32 {
+                    for (&self.scratch.schemas) |*schema| {
+                        if (schema.live and schema.private_usage and schema.oid == oid) return schema.owner;
+                    }
+                    return null;
                 }
 
                 pub fn objectSchemaLive(self: *const @This(), oid: u32) bool {
@@ -1706,7 +1717,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 vs.* = .{ .live = seq.live and !seq.pending_create and seq.dead_csn == 0, .oid = seq.oid, .name = seq.name };
             }
             for (&scratch.schemas, &db.schemas) |*vs, *schema| {
-                vs.* = .{ .live = schema.live and !schema.pending_create and schema.dead_csn == 0, .oid = schema.oid, .name = schema.name };
+                vs.* = .{ .live = schema.live and !schema.pending_create and schema.dead_csn == 0, .oid = schema.oid, .owner = schema.owner, .private_usage = schema.private_usage, .name = schema.name };
             }
             RC.beginOverlay(&scratch.objects, &db.objects);
             scratch.object_overlay.init(&db.catalog_objects);
@@ -1715,6 +1726,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             const object_check: ObjectCheck(@TypeOf(db)) = .{ .db = db, .scratch = scratch, .next_oid = &next_oid };
             var reader = Reader{ .bytes = record };
             var row: V.Row = .{};
+            var check_schema_owners = false;
             for (0..count) |_| {
                 const tag = try reader.int(u8);
                 switch (tag) {
@@ -1921,18 +1933,20 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         _ = try findVSeq(scratch, try reader.int(u32));
                         _ = try decodeSequenceState(&reader);
                     },
-                    @intFromEnum(Op.create_schema) => {
+                    @intFromEnum(Op.create_schema), @intFromEnum(Op.create_owned_schema), @intFromEnum(Op.create_private_schema) => {
                         const oid = try reader.int(u32);
                         const schema_name = try reader.name();
+                        const owner = if (tag != @intFromEnum(Op.create_schema)) try reader.int(u32) else catalog_objects.bootstrap_role;
                         if (!validName(schema_name)) return error.InvalidChangeRecord;
                         if (oid < first_oid or oid == 0xffffffff or oidTaken(db, scratch, oid, 1)) return error.ChangeRecordConflict;
+                        if (!scratch.object_overlay.roleExists(owner)) return error.ChangeRecordConflict;
                         for (&scratch.schemas) |*vs| if (vs.live and types.same(vs.name.slice(), schema_name)) return error.ChangeRecordConflict;
                         var free: ?usize = null;
                         for (&scratch.schemas, 0..) |*vs, index| if (!vs.live and free == null) {
                             free = index;
                         };
                         const index = free orelse return error.ChangeRecordConflict;
-                        scratch.schemas[index] = .{ .live = true, .oid = oid, .name = .{ .len = schema_name.len } };
+                        scratch.schemas[index] = .{ .live = true, .oid = oid, .owner = owner, .private_usage = tag == @intFromEnum(Op.create_private_schema), .name = .{ .len = schema_name.len } };
                         @memcpy(scratch.schemas[index].name.bytes[0..schema_name.len], schema_name);
                         next_oid = @max(next_oid, oid + 1);
                     },
@@ -1983,6 +1997,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.object_drop) => {
                         const key = try O.decodeDrop(record, &reader.position);
                         try scratch.object_overlay.drop(&key);
+                        check_schema_owners = check_schema_owners or key.kind == .role;
                     },
                     else => return error.UnsupportedLogVersion,
                 }
@@ -1990,6 +2005,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
             if (reader.position != record.len) return error.InvalidChangeRecord;
             // Objects never outlive the tables, roles and objects they name.
             try scratch.object_overlay.finish(&object_check);
+            if (check_schema_owners) for (&scratch.schemas) |*schema| {
+                if (schema.live and !scratch.object_overlay.roleExists(schema.owner)) return error.ChangeRecordConflict;
+            };
         }
 
         /// Version-3 definition parts against the overlay: new secondary
@@ -2185,11 +2203,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         db.seqs[index].spec = state.spec;
                         sequence.Sequences(config).restore(&db.seqs[index], state.last_value, state.is_called);
                     },
-                    @intFromEnum(Op.create_schema) => {
+                    @intFromEnum(Op.create_schema), @intFromEnum(Op.create_owned_schema), @intFromEnum(Op.create_private_schema) => {
                         const oid = try reader.int(u32);
                         const schema_name = try reader.name();
+                        const owner = if (tag != @intFromEnum(Op.create_schema)) try reader.int(u32) else catalog_objects.bootstrap_role;
                         for (&db.schemas, 0..) |*schema, index| if (!schema.live) {
-                            schema.* = .{ .live = true, .oid = oid, .name = .{ .len = schema_name.len } };
+                            schema.* = .{ .live = true, .oid = oid, .owner = owner, .private_usage = tag == @intFromEnum(Op.create_private_schema), .name = .{ .len = schema_name.len } };
                             @memcpy(schema.name.bytes[0..schema_name.len], schema_name);
                             try db.replayCreateSchema(index, csn);
                             break;
