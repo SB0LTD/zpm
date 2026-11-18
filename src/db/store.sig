@@ -931,7 +931,7 @@ pub fn Store(comptime Raw: type) type {
             fn endTransaction(self: *Connection, committed: bool) void {
                 self.transaction_us = null;
                 self.transaction_deadline_ns = null;
-                self.settings = if (committed) self.base else self.tx_start;
+                self.settings = if (committed or !self.in_transaction) self.base else self.tx_start;
                 self.base = self.settings;
                 self.tx = null;
                 self.in_transaction = false;
@@ -967,9 +967,7 @@ pub fn Store(comptime Raw: type) type {
             pub fn rollbackTransaction(self: *Connection) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (self.tx) |slot| self.db().abort(slot);
-                const was = self.in_transaction;
                 self.endTransaction(false);
-                if (!was) self.settings = self.base;
             }
 
             /// A codec-level error inside a block fails it like a statement error.
