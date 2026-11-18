@@ -23,7 +23,7 @@
 //! so binary input is decoded and re-encoded as text; malformed binary input
 //! is a protocol violation (08P01).
 
-pub const Error = error{ BufferTooSmall, ProtocolViolation, UnsupportedBinaryType };
+pub const Error = error{ BufferTooSmall, ProtocolViolation, InvalidBinaryRepresentation, UnsupportedBinaryType };
 
 fn put(out: []u8, at: *usize, bytes: []const u8) Error!void {
     if (bytes.len > out.len - at.*) return error.BufferTooSmall;
@@ -385,7 +385,8 @@ pub fn Types(comptime Result: type) type {
                     return .{ .macaddr = bytes[0..6].* };
                 },
                 .pg_internal_char => {
-                    if (bytes.len != 1) return error.ProtocolViolation;
+                    if (bytes.len == 0) return error.ProtocolViolation;
+                    if (bytes.len > 1) return error.InvalidBinaryRepresentation;
                     return .{ .pg_internal_char = bytes[0] };
                 },
                 .regtype => {
