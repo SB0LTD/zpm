@@ -91,6 +91,7 @@ fn rejects(source: []const u8, wanted: anyerror) !void {
 fn sqlstate(err: anyerror, wanted: []const u8) !void {
     const table = [_]struct { name: []const u8, state: []const u8 }{
         .{ .name = "StringDataRightTruncation", .state = "22001" },
+        .{ .name = "CharacterNotInRepertoire", .state = "22021" },
         .{ .name = "StringDataLengthMismatch", .state = "22026" },
         .{ .name = "InvalidTimeZoneDisplacement", .state = "22009" },
         .{ .name = "InvalidTextRepresentation", .state = "22P02" },
