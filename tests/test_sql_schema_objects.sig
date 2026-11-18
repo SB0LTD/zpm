@@ -1474,6 +1474,31 @@ fn publicationMembership() !void {
     try sameState(&.{ table_members, schema_members });
 }
 
+fn partitionDefinitions() !void {
+    reset();
+    try run("CREATE TABLE r(x INT) PARTITION BY RANGE(x)");
+    try run("CREATE TABLE r1 PARTITION OF r FOR VALUES FROM (MINVALUE) TO (-5)");
+    try run("CREATE TABLE r2 PARTITION OF r FOR VALUES FROM (-5) TO (MAXVALUE)");
+    try run("CREATE TABLE d(x DATE) PARTITION BY RANGE(x)");
+    try run("CREATE TABLE d1 PARTITION OF d FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')");
+    try run("CREATE TABLE dd PARTITION OF d DEFAULT");
+    try run("CREATE TABLE l(\"select\" TEXT) PARTITION BY LIST(\"select\")");
+    try run("CREATE TABLE l1 PARTITION OF l FOR VALUES IN ('z''o','z\\z')");
+    const definitions = "SELECT relname, pg_catalog.pg_get_expr(relpartbound,oid), pg_catalog.pg_get_partkeydef(oid) FROM pg_class ORDER BY 1";
+    try expect(definitions, "d|NULL|RANGE (x);d1|FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')|NULL;" ++
+        "dd|DEFAULT|NULL;l|NULL|LIST (\"select\");l1|FOR VALUES IN ('z''o', 'z\\z')|NULL;" ++
+        "r|NULL|RANGE (x);r1|FOR VALUES FROM (MINVALUE) TO ('-5')|NULL;r2|FOR VALUES FROM ('-5') TO (MAXVALUE)|NULL");
+    const children = "SELECT c.oid::pg_catalog.regclass::pg_catalog.text, c.relkind, inhdetachpending, pg_catalog.pg_get_expr(c.relpartbound,c.oid)" ++
+        " FROM pg_catalog.pg_class c, pg_catalog.pg_inherits i WHERE c.oid=i.inhrelid AND i.inhparent='d'::regclass" ++
+        " ORDER BY pg_catalog.pg_get_expr(c.relpartbound,c.oid) = 'DEFAULT', c.oid::pg_catalog.regclass::pg_catalog.text";
+    try expect(children, "d1|r|f|FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');dd|r|f|DEFAULT");
+    try sameState(&.{ definitions, children });
+    try run("ALTER TABLE d1 RENAME TO \"Date Segment\"");
+    const renamed = "SELECT pg_get_expr(relpartbound,oid) FROM pg_class WHERE relname='Date Segment'";
+    try expect(renamed, "FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')");
+    try sameState(&.{ renamed, children });
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1498,5 +1523,6 @@ pub fn main() !void {
     try namespaceAliases();
     try statisticsDefinitions();
     try publicationMembership();
+    try partitionDefinitions();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

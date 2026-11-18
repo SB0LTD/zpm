@@ -1095,7 +1095,7 @@ pub fn Database(comptime config: Config) type {
                     // These catalog lookups use the serialized database hook.
                     .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_partition_ancestors,
                     .to_regnamespace,.regnamespace_in,.regnamespace_out=>return error.UnsupportedStatement,
-                    .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable=>return error.UnsupportedStatement,
+                    .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                     .current_setting,.set_config,.pg_backend_pid,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
@@ -5274,6 +5274,7 @@ pub fn Database(comptime config: Config) type {
             security: u32 = 0,
             partition: bool = false,
             populated: bool = true,
+            partition_bound: Cell = .null_value,
         };
 
         fn classRow(sink: *X.RowSink, oid: u32, name: []const u8, namespace: u32, kind: u8, columns: usize, properties: ClassProperties) Error!void {
@@ -5290,11 +5291,11 @@ pub fn Database(comptime config: Config) type {
                 intCell(oid), nameCell(name), intCell(namespace), nameCell(&label), intCell(@intCast(columns)),
                 intCell(properties.checks), boolCell(properties.has_index), boolCell(properties.has_rule), boolCell(properties.has_trigger),
                 boolCell(properties.security & CO.rls_enabled != 0), boolCell(properties.security & CO.rls_forced != 0), boolCell(properties.partition),
-                intCell(0), intCell(0), nameCell("p"), nameCell(identity), intCell(0), intCell(access), boolCell(properties.populated),
+                intCell(0), intCell(0), nameCell("p"), nameCell(identity), intCell(0), intCell(access), boolCell(properties.populated), properties.partition_bound,
             });
         }
 
-        fn tableClass(self: *const Self, table: *const S.Table, snapshot: Snapshot, relations: []const K.Found) ClassProperties {
+        fn tableClass(self: *const Self, table: *const S.Table, snapshot: Snapshot, relations: []const K.Found, session_values: *const value_module.Session) Error!ClassProperties {
             var properties: ClassProperties = .{
                 .has_index = S.keyed(table) or table.index_count != 0,
                 .has_rule = table.relkind == 'v' or table.relkind == 'm',
@@ -5302,6 +5303,7 @@ pub fn Database(comptime config: Config) type {
                 .partition = table.parent != 0 and table.partition.bound != .none,
                 .populated = table.populated,
             };
+            if (properties.partition) properties.partition_bound = try self.partitionBoundText(table, snapshot, session_values);
             for (table.constraints[0..table.constraint_count]) |*constraint| switch (constraint.kind) {
                 .check => properties.checks += 1,
                 .unique, .exclusion => properties.has_index = true,
@@ -5464,7 +5466,7 @@ pub fn Database(comptime config: Config) type {
                     const primary_columns = primaryColumns(table, &key_columns);
                     switch (view) {
                         .pg_class => {
-                            try classRow(sink, table.oid, name, table.namespace, table.relkind, table.column_count, self.tableClass(table, snapshot, relations[0..count]));
+                            try classRow(sink, table.oid, name, table.namespace, table.relkind, table.column_count, try self.tableClass(table, snapshot, relations[0..count], session_values));
                             if (S.keyed(table)) try classRow(sink, table.oid + 1, pkey.slice(), table.namespace, 'i', primary_columns.len, .{});
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
@@ -5749,6 +5751,23 @@ pub fn Database(comptime config: Config) type {
             return text.len;
         }
 
+        fn postgresPartitionKey(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const index = self.visibleTableSlot(oid, self.seq_snap) orelse return null;
+            const table = &self.tables[index];
+            const prefix = switch (table.partition.strategy) {
+                .none => return null,
+                .range => "RANGE (",
+                .list => "LIST (",
+            };
+            var text: CatalogTextWriter = .{ .out = out };
+            text.add(prefix);
+            text.ident(table.columns[table.partition.key].name.slice());
+            text.add(")");
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
+        }
+
         fn postgresConstraintDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             var relations: [K.relation_rows]K.Found = undefined;
@@ -5879,10 +5898,60 @@ pub fn Database(comptime config: Config) type {
                 self.add(quoted[0..quoteIdentifier(name, &quoted)]);
             }
 
+            fn literal(self: *CatalogTextWriter, value: []const u8) void {
+                self.add("'");
+                for (value, 0..) |byte, index| {
+                    if (byte == '\'') self.add("'");
+                    self.add(value[index..][0..1]);
+                }
+                self.add("'");
+            }
+
             fn slice(self: *const CatalogTextWriter) []const u8 {
                 return self.out[0..self.len];
             }
         };
+
+        fn partitionBoundText(self: *const Self, table: *const S.Table, snapshot: Snapshot, session_values: *const value_module.Session) Error!Cell {
+            if (table.partition.bound == .none) return .null_value;
+            if (table.partition.bound == .default) return nameCell("DEFAULT");
+            const parent_index = self.visibleTableSlot(table.parent, snapshot) orelse return error.TableNotFound;
+            const parent = &self.tables[parent_index];
+            const family = types.typeOfData(parent.columns[parent.partition.key].data_type);
+            const bound = &table.partition;
+            var buffer: [config.text_bytes]u8 = undefined;
+            var rendered: CatalogTextWriter = .{ .out = &buffer };
+            if (bound.bound == .range) {
+                rendered.add("FOR VALUES FROM (");
+                if (bound.unbounded & 1 != 0) rendered.add("MINVALUE") else try partitionLiteral(&rendered, &bound.values[0], family, session_values);
+                rendered.add(") TO (");
+                if (bound.unbounded & 2 != 0) rendered.add("MAXVALUE") else try partitionLiteral(&rendered, &bound.values[1], family, session_values);
+            } else {
+                rendered.add("FOR VALUES IN (");
+                for (bound.values[0..bound.count], 0..) |*cell, index| {
+                    if (index != 0) rendered.add(", ");
+                    try partitionLiteral(&rendered, cell, family, session_values);
+                }
+            }
+            rendered.add(")");
+            if (rendered.shortened) return error.TextCapacity;
+            return objectTextCell(rendered.slice());
+        }
+
+        fn partitionLiteral(rendered: *CatalogTextWriter, cell: *const Cell, family: types.Type, session_values: *const value_module.Session) Error!void {
+            if (cell.* == .null_value) {
+                rendered.add("NULL");
+                return;
+            }
+            var buffer: [Io.format_bytes]u8 = undefined;
+            const formatted = try Io.format(cell, family == .boolean, session_values, &buffer);
+            const unquoted = switch (family) {
+                .boolean => true,
+                .int4, .numeric => formatted.len != 0 and (formatted[0] >= '0' and formatted[0] <= '9'),
+                else => false,
+            };
+            if (unquoted) rendered.add(formatted) else rendered.literal(formatted);
+        }
 
         /// Primary-key columns in key order (empty without a primary key).
         fn primaryColumns(table: *const S.Table, out: *[config.columns]u8) []const u8 {
@@ -7567,7 +7636,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
