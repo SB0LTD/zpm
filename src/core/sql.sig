@@ -3173,6 +3173,13 @@ pub fn Database(comptime config: Config) type {
         fn dropSchema(self: *Self, slot: u16, drop: *const B.DropSchema, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const schema = &self.schemas[drop.slot];
+            // DDL must account for dependencies that are committed now,
+            // including catalog rows newer than the user's data snapshot.
+            var current = snap;
+            current.csn = self.csn;
+            const namespace = self.catalog.findSchema(schema.name.slice(), current) orelse return error.UndefinedSchema;
+            if (namespace.oid != drop.oid or namespace.slot != drop.slot) return error.SerializationFailure;
+            if (!self.ownsNamespace(drop.oid, current)) return error.InsufficientPrivilege;
             var waits: L.Set = .{};
             if (schema.pending_drop and schema.creator != slot) waits.add(schema.creator);
             if (self.catalog.namespaceCreator(drop.oid, snap)) |other| waits.add(other);
@@ -3182,33 +3189,49 @@ pub fn Database(comptime config: Config) type {
                 return self.park(slot, waits);
             }
             var type_count: usize = 0;
-            var latest = snap;
-            latest.csn = self.csn;
             for (&self.catalog_objects.items) |*o| {
-                if ((!CO.userType(o.kind) and o.kind != .statistics) or o.target != drop.oid) continue;
-                if (O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
-                if (!O.visible(o, snap)) continue;
+                if ((!CO.userType(o.kind) and o.kind != .statistics) or o.target != drop.oid or !O.visible(o, current)) continue;
                 if (!drop.cascade) return error.DependentObjects;
                 type_count += 1;
             }
             var relations: [K.relation_rows]K.Found = undefined;
-            const count = self.catalog.visibleRelations(snap, &relations);
+            const count = self.catalog.visibleRelations(current, &relations);
             for (relations[0..count]) |found| {
-                if (found.kind != 'r' or self.tables[found.slot].namespace != drop.oid) continue;
+                if (found.kind == 'S' or self.tables[found.slot].namespace != drop.oid) continue;
                 if (!drop.cascade) return error.DependentObjects;
-                _ = try self.dropTable(slot, found.slot, true, snap);
+                _ = try self.dropTable(slot, found.slot, true, current);
+            }
+            if (drop.cascade) {
+                // A CASCADE can copy a relation to a different slot while
+                // removing a foreign key. Prove this statement left neither
+                // a schema member nor a surviving reference to a table it
+                // dropped before it can publish the namespace removal.
+                var after = current;
+                after.cid +%= 1;
+                var remaining: [K.relation_rows]K.Found = undefined;
+                const remaining_count = self.catalog.visibleRelations(after, &remaining);
+                for (remaining[0..remaining_count]) |found| {
+                    if (found.kind == 'S') continue;
+                    const survivor = &self.tables[found.slot];
+                    if (survivor.namespace == drop.oid) return error.UnsupportedStatement;
+                    for (survivor.constraints[0..survivor.constraint_count]) |*constraint| {
+                        if (constraint.kind != .foreign or constraint.ref_oid == survivor.oid) continue;
+                        if (self.visibleTableSlot(constraint.ref_oid, current) != null and
+                            self.visibleTableSlot(constraint.ref_oid, after) == null) return error.UnsupportedStatement;
+                    }
+                }
             }
             try self.reserveWrites(slot, 2 + type_count);
             for (&self.catalog_objects.items, 0..) |*o, index| {
-                if (CO.userType(o.kind) and o.target == drop.oid and O.visible(o, snap)) self.objectDelete(slot, index, snap);
+                if (CO.userType(o.kind) and o.target == drop.oid and O.visible(o, current)) self.objectDelete(slot, index, current);
             }
             schema.pending_drop = true;
             schema.creator = slot;
             tx.push(.{ .kind = .drop_schema, .table = @intCast(drop.slot) }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
-            const changed = self.catalog.dropSchema(drop.slot, snap, tx.ref(slot), snap.cid, 0, &changes);
+            const changed = self.catalog.dropSchema(drop.slot, current, tx.ref(slot), current.cid, 0, &changes);
             for (changes[0..changed]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
-            try self.dropObjectsOf(slot, drop.oid, snap);
+            try self.dropObjectsOf(slot, drop.oid, current);
         }
 
         /// Schema name of a namespace OID for the system views.
@@ -4541,7 +4564,6 @@ pub fn Database(comptime config: Config) type {
                 .drop_relation => |*drop| try self.needOwner(drop.slot, snap),
                 .alter_table => |*alter| try self.needOwner(alter.table, snap),
                 .refresh_view => |*refresh| try self.needOwner(refresh.slot, snap),
-                .drop_schema => |*drop| if (!self.ownsNamespace(drop.oid, snap)) return error.InsufficientPrivilege,
                 .create_table, .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,
                 else => {},
             }
@@ -6366,12 +6388,17 @@ pub fn Database(comptime config: Config) type {
                 return self.park(slot, waits);
             }
             // A schema another transaction is dropping: wait for it.
-            for (&self.schemas) |*schema| if (schema.live and schema.oid == create.namespace and schema.pending_drop and schema.creator != slot) {
-                var waits: L.Set = .{};
-                waits.add(schema.creator);
-                tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
-                return self.park(slot, waits);
-            };
+            for (&self.schemas) |*schema| {
+                if (!schema.live or schema.oid != create.namespace) continue;
+                if (schema.pending_drop and schema.creator != slot) {
+                    var waits: L.Set = .{};
+                    waits.add(schema.creator);
+                    tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                    return self.park(slot, waits);
+                }
+                if (schema.dead_csn != 0) return error.UndefinedSchema;
+                break;
+            }
             try self.reserveWrites(slot, 2 + create.count);
             const columns = create.columns[0..create.count];
             var destination: ?usize = null;
