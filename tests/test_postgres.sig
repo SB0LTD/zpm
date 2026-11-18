@@ -733,6 +733,14 @@ fn negativeParameters() !void {
     try tags(try bind(&s,&db,"","",&.{"b","5","t","1"},0,0),"2");
     try check(equal(try portalText(&s),"SELECT 'b'/*$32*/,5--$32\n,TRUE,1"));
     try sync(&s,&db);
+    try tags(try parse(&s,&db,"","SELECT '$1', $1::text /* $2 */",&.{23}),"1");
+    try tags(try bind(&s,&db,"","",&.{"-5"},0,0),"2");
+    try check(equal(try portalText(&s),"SELECT '$1', (-5)::text /* $2 */"));
+    try sync(&s,&db);
+    try tags(try parse(&s,&db,"","SELECT $1, $1 + 1",&.{23}),"1");
+    try tags(try bind(&s,&db,"","",&.{"-5"},0,0),"2");
+    try check(equal(try portalText(&s),"SELECT (-5), (-5) + 1"));
+    try sync(&s,&db);
     // An exponent sign on the left: `1e-$1` is not the decimal token 1e-5.
     // Native PostgreSQL rejects this malformed template at Parse (42601).
     // The shared tokenizer now catches it before Bind, rather than constructing

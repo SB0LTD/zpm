@@ -323,9 +323,21 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             sql: [sql_capacity]u8 = @splat(0),
             len: usize = 0,
             count: usize = 0,
+            single_parameter: ?ParameterSpan = null,
             oids: [parameter_capacity]u32 = @splat(0),
             fn source(self: *const Statement) []const u8 {
                 return self.sql[0..self.len];
+            }
+
+            fn render(self: *const Statement, values: []const []const u8, writer: *Writer) !void {
+                const text = self.source();
+                if (self.count == 0) return writer.append(text);
+                if (self.single_parameter) |location| {
+                    try writer.append(text[0..location.start]);
+                    try splice(writer, values[0], text[location.end..]);
+                    return writer.append(text[location.end..]);
+                }
+                _ = try scan(text, values, writer, null);
             }
         };
         pub const DetachedPrimaryKey = struct { source: []const u8, oid: u32, key: ?i64 };
@@ -862,7 +874,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         var query: [sql_capacity]u8 = undefined;
                         var q: Writer = .{ .bytes = &query };
                         var nulls: [parameter_capacity][]const u8 = @splat("NULL");
-                        try interpolate(s.source(), nulls[0..s.count], &q);
+                        try s.render(nulls[0..s.count], &q);
                         if (@hasDecl(DB, "describe")) {
                             // Parse and bind only: never executes or locks.
                             try self.describeOnly(db, q.bytes[0..q.at]);
@@ -1468,7 +1480,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             if (count > parameter_capacity) return error.ParameterCapacity;
             for (0..count) |i| next.oids[i] = try r.u32be();
             try r.done();
-            next.count = try parameterCount(source);
+            next.count = try scan(source, null, null, &next.single_parameter);
             if (count != 0 and count != next.count) return error.ProtocolViolation;
             try self.infer(db, &next);
             var slot: ?*Statement = null;
@@ -1484,6 +1496,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             // SQL tails are never part of a live statement. Publish only the
             // initialized source and bounded metadata, not sql_capacity bytes.
             s.name=next.name;s.len=next.len;s.count=next.count;s.oids=next.oids;
+            s.single_parameter=next.single_parameter;
             @memcpy(s.sql[0..next.len],next.sql[0..next.len]);s.live=true;
             try w.empty('1');
         }
@@ -1637,7 +1650,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             try r.done();
             var q: Writer = .{ .bytes = &next.sql };
-            try interpolate(s.source(), values[0..count], &q);
+            try s.render(values[0..count], &q);
             next.len = q.at;
             if (@hasDecl(DB, "savepointLevel")) next.level = db.savepointLevel();
             var slot: ?*Portal = null;
@@ -2103,10 +2116,13 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
 // The engine tokenizer owns quote/comment/identifier boundaries. Counting and
 // interpolation visit precisely its parameter tokens; every untouched byte is
 // copied verbatim, including whitespace and nested comments.
-fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer) !usize {
+const ParameterSpan = struct { start: usize, end: usize };
+
+fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer, single: ?*?ParameterSpan) !usize {
     var tokenizer: sql.Tokenizer = .{ .source = source, .text_limit = source.len };
     var copied: usize = 0;
     var highest: usize = 0;
+    if (single) |out| out.* = null;
     while (true) {
         const token = try tokenizer.next();
         if (token.kind == .end) break;
@@ -2121,6 +2137,7 @@ fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer) !usize {
                 try splice(out, v[n - 1], source[token.end..]);
             }
         }
+        if (single) |out| out.* = if (copied == 0 and n == 1) .{ .start = token.start, .end = token.end } else null;
         copied = token.end;
     }
     if (w) |out| try out.append(source[copied..]);
@@ -2145,12 +2162,6 @@ fn splice(w: *Writer, value: []const u8, rest: []const u8) !void {
     if (w.at != 0 and (sign or joins(w.bytes[w.at - 1], value[0]))) try w.byte(' ');
     try w.append(value);
     if (rest.len != 0 and joins(value[value.len - 1], rest[0])) try w.byte(' ');
-}
-fn parameterCount(source: []const u8) !usize {
-    return scan(source, null, null);
-}
-fn interpolate(source: []const u8, values: []const []const u8, w: *Writer) !void {
-    _ = try scan(source, values, w);
 }
 /// `$n`: a dollar-quoted string (`$$x$$`, `$q$x$q$`) is not a parameter.
 fn parameterToken(token: []const u8) bool {
