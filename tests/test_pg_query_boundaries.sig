@@ -91,16 +91,25 @@ fn grammarWithoutEffects() !void {
     try check(try db.preflightPostgresBatch("COPY target (id) FROM STDIN; SELECT 9") == 2);
     const quoted_body = "CREATE FUNCTION deferred_body() RETURNS int LANGUAGE sql AS 'SELECT 1 +'; SELECT 1;";
     try check(try db.preflightPostgresBatch(quoted_body) == 2);
+    if (db.preflightPostgresBatch("INSERT INTO target VALUES (1); COMMIT; VACUUM")) |_| {
+        return error.UnsupportedBatchAccepted;
+    } else |err| try check(err == error.UnsupportedStatement);
     for ([_][]const u8{
         "INSERT INTO target VALUES (1); COMMIT; SELECT 1 +;",
         "SET statement_timeout=0; SELECT 1 +;",
         "SELECT 1; SELECT '\x00'",
+        "VACUUM; SELECT 1 +;",
     }) |input| {
         if (db.preflightPostgresBatch(input)) |_| return error.MalformedBatchAccepted else |err| try check(err == error.Syntax);
     }
     try check(db.csn == before);
     try db.execute("SELECT COUNT(*) FROM target", &result);
     try check(result.row_count == 1 and result.rows[0].cells[0].integer == 0);
+
+    const simple = "SELECT 1;";
+    var many: [600 * simple.len]u8 = undefined;
+    for (0..600) |index| @memcpy(many[index * simple.len ..][0..simple.len], simple);
+    try check(try db.preflightPostgresBatch(&many) == 600);
 }
 
 pub fn main(init: std.process.Init) !void {
