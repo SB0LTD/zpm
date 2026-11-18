@@ -152,15 +152,12 @@ pub fn main() !void {
     _ = try q.submit();
     const failed = try next(&q);
     try check(failed.slot == 0 and failed.operation == .send and failed.outcome == .failed and failed.outcome.failed == .PIPE);
-    try q.receive(1, cancel_pair[1], &recv_buf);
-    // The race above can leave its four payload bytes in the peer queue.
-    try check(try q.submitAndWait(1000000) != .unsupported);
-    if (try q.complete(&raw, &events, false) != 0) {
-        try check(events[0].operation == .receive and events[0].outcome == .bytes);
-        try q.receive(1, cancel_pair[1], &recv_buf);
-    }
+    const wait_pair = try pair(false);
+    defer _ = linux.close(wait_pair[0]);
+    defer _ = linux.close(wait_pair[1]);
+    try q.receive(1, wait_pair[1], &recv_buf);
     try check(try q.submitAndWait(1000000) == .yielded and !q.reusable(1));
-    try check(linux.write(cancel_pair[0], "wake", 4) == 4);
+    try check(linux.write(wait_pair[0], "wake", 4) == 4);
     try check(try q.submitAndWait(100000000) == .ready);
     const woke = try next(&q);
     try check(woke.operation == .receive and woke.outcome == .bytes and woke.outcome.bytes == 4 and
