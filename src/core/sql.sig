@@ -1344,6 +1344,7 @@ pub fn Database(comptime config: Config) type {
                         if (source.table) |index| {
                             const table = &db.tables[index];
                             if (table.relkind != 'r' or table.namespace != catalog_module.public_namespace) return false;
+                            if (session.synchronize_seqscans and X.synchronizedProjection(block) and S.supportsSynchronizedScan(table)) return false;
                         }
                     }
                     for (block.aggs[0..block.agg_count]) |aggregate| if (!cacheableAggregate(aggregate.kind)) return false;
@@ -8330,7 +8331,7 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, check_function_bodies, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
+        const SettingKind = enum { search_path, check_function_bodies, synchronize_seqscans, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
 
         fn settingKind(name: []const u8) ?SettingKind {
             inline for (@typeInfo(SettingKind).@"enum".field_names) |field| {
@@ -8461,6 +8462,7 @@ pub fn Database(comptime config: Config) type {
             switch (which) {
                 .search_path => try searchPath(value, kind, &into.search_path),
                 .check_function_bodies => into.check_function_bodies = parseBool(value) orelse return error.InvalidSettingValue,
+                .synchronize_seqscans => into.synchronize_seqscans = parseBool(value) orelse return error.InvalidSettingValue,
                 .default_transaction_isolation => into.isolation = parseLevel(value) orelse return error.InvalidSettingValue,
                 .default_transaction_read_only => into.read_only = parseBool(value) orelse return error.InvalidSettingValue,
                 .default_transaction_deferrable => into.deferrable = parseBool(value) orelse return error.InvalidSettingValue,
@@ -8486,6 +8488,7 @@ pub fn Database(comptime config: Config) type {
             switch (which) {
                 .search_path => into.search_path = source.search_path,
                 .check_function_bodies => into.check_function_bodies = source.check_function_bodies,
+                .synchronize_seqscans => into.synchronize_seqscans = source.synchronize_seqscans,
                 .default_transaction_isolation => into.isolation = source.isolation,
                 .default_transaction_read_only => into.read_only = source.read_only,
                 .default_transaction_deferrable => into.deferrable = source.deferrable,
@@ -8602,6 +8605,7 @@ pub fn Database(comptime config: Config) type {
             self.session.session_role = state.session_role;
             self.session.role = if (state.values.role != 0) state.values.role else state.session_role;
             self.session.public_schema_on_path = state.values.publicSchemaOnPath();
+            self.session.synchronize_seqscans = self.dialect == .postgres and state.values.synchronize_seqscans;
         }
 
         /// RESET ALL of the engine settings (transaction modes excepted).
@@ -8625,6 +8629,7 @@ pub fn Database(comptime config: Config) type {
             const text: []const u8 = switch (which) {
                 .search_path => state.values.search_path.slice(),
                 .check_function_bodies => onOff(state.values.check_function_bodies),
+                .synchronize_seqscans => onOff(state.values.synchronize_seqscans),
                 .default_transaction_isolation => levelName(state.values.isolation),
                 .default_transaction_read_only => onOff(state.values.read_only),
                 .default_transaction_deferrable => onOff(state.values.deferrable),
@@ -8686,7 +8691,10 @@ pub fn Database(comptime config: Config) type {
         /// Engine settings safe to configure before a connection authenticates.
         pub fn sessionStartupSetting(self: *Self, name: []const u8, value: []const u8) Error!bool {
             const setting = settingKind(name) orelse return false;
-            if (setting != .check_function_bodies) return false;
+            switch (setting) {
+                .check_function_bodies, .synchronize_seqscans => {},
+                else => return false,
+            }
             try self.setSetting(null, false, name, .string, value);
             const state = self.sessionState();
             state.startup = state.values;

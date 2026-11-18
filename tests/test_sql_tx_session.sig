@@ -822,6 +822,33 @@ fn exec(connection: *Store.Connection, source: []const u8) !void {
     };
 }
 
+fn synchronizeSeqscansSettings() !void {
+    var first: Store.Connection = .{ .store = &store, .id = 100 };
+    var peer: Store.Connection = .{ .store = &store, .id = 101 };
+    try first.startupParameter("options", "-c synchronize_seqscans=off");
+    try exec(&first, "SHOW synchronize_seqscans");
+    try check(same(try render(&result), "off"));
+    try exec(&peer, "SHOW synchronize_seqscans");
+    try check(same(try render(&result), "on"));
+    try exec(&first, "BEGIN");
+    try exec(&first, "SAVEPOINT scan_setting");
+    try exec(&first, "SELECT set_config('synchronize_seqscans', 'on', true)");
+    try check(same(try render(&result), "on"));
+    try exec(&first, "ROLLBACK TO scan_setting");
+    try exec(&first, "SELECT current_setting('synchronize_seqscans')");
+    try check(same(try render(&result), "off"));
+    try exec(&first, "SET LOCAL synchronize_seqscans = on");
+    try exec(&peer, "SELECT 1");
+    try exec(&first, "COMMIT");
+    try exec(&first, "SHOW synchronize_seqscans");
+    try check(same(try render(&result), "off"));
+    try exec(&first, "SET synchronize_seqscans TO on");
+    var control: sql.ExecutionControl = .{};
+    try check(first.detachedReadSession(&control, null).synchronize_seqscans);
+    try exec(&first, "RESET synchronize_seqscans");
+    try check(!first.detachedReadSession(&control, null).synchronize_seqscans);
+}
+
 var conn_a: Store.Connection = undefined;
 var conn_b: Store.Connection = undefined;
 var conn_c: Store.Connection = undefined;
@@ -1228,6 +1255,7 @@ pub fn main(init: std.process.Init) !void {
     try prepared();
     try locking();
     try notifications();
+    try synchronizeSeqscansSettings();
     try recoveryStatus();
     try floatOutputSetting();
     var buffer: [128]u8 = undefined;

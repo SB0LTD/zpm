@@ -855,6 +855,9 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "public_schema_on_path")) {
                     session.public_schema_on_path = self.engine_session.values.publicSchemaOnPath();
                 }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "synchronize_seqscans")) {
+                    session.synchronize_seqscans = self.dialect == .postgres and self.engine_session.values.synchronize_seqscans;
+                }
                 return session;
             }
 
