@@ -547,9 +547,9 @@ pub fn Eval(comptime config: types.Config) type {
                     const length = try definition(hook.ptr, @intCast(first.integer), column, pretty, &buffer) orelse return .null_value;
                     return textCell(buffer[0..length]);
                 },
-                .pg_get_constraintdef => {
+                .pg_get_constraintdef, .pg_get_triggerdef => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
-                    const definition = hook.constraint_definition orelse return error.UnsupportedStatement;
+                    const definition = (if (n.func == .pg_get_triggerdef) hook.trigger_definition else hook.constraint_definition) orelse return error.UnsupportedStatement;
                     const second = node(ctx, n.b).next;
                     const pretty = if (second == none) V.Cell{ .boolean = false } else try eval(ctx, second);
                     if (pretty == .null_value) return .null_value;
@@ -1352,7 +1352,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                     .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                    .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                    .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
                     .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {

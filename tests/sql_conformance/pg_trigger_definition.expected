@@ -1,0 +1,9 @@
+watch"list|t|t|23|O|f|2|0
+CREATE TRIGGER "watch""list" BEFORE INSERT OR UPDATE OF "Value Label" ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')
+CREATE TRIGGER "watch""list" BEFORE INSERT OR UPDATE OF "Value Label" ON public.hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')
+t|t
+t
+watch"list|CREATE TRIGGER "watch""list" BEFORE INSERT OR UPDATE OF "Value Label" ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')|O|f|NULL
+CREATE TRIGGER sample BEFORE UPDATE ON hits FOR EACH ROW WHEN (new.v > 0) EXECUTE FUNCTION bump()
+3
+0

@@ -119,7 +119,7 @@ const pg_matviews_columns = [_]ViewColumn{ col("schemaname", .name), col("matvie
 const pg_inherits_columns = [_]ViewColumn{ col("inhrelid", .oid), col("inhparent", .oid), col("inhseqno", .int4), col("inhdetachpending", .boolean) };
 // pg_proc.prolang is shown as the language name (its OID is per database).
 const pg_proc_columns = [_]ViewColumn{ col("oid", .oid), col("proname", .name), col("pronamespace", .oid), col("prokind", .text), col("prolang", .name), col("provolatile", .text), col("proisstrict", .boolean), col("pronargs", .int2), col("prorettype", .oid), col("proargtypes", .text), col("prosrc", .text) };
-const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid), col("tgname", .name), col("tgfoid", .oid), col("tgtype", .int2), col("tgenabled", .text), col("tgisinternal", .boolean), col("tgnargs", .int2) };
+const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid), col("tgname", .name), col("tgfoid", .oid), col("tgtype", .int2), col("tgenabled", .text), col("tgisinternal", .boolean), col("tgnargs", .int2), col("tgparentid", .oid) };
 const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .text), col("ev_enabled", .text), col("is_instead", .boolean) };
 const pg_rules_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("rulename", .name), col("definition", .text) };
 const key_column_usage_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4) };
