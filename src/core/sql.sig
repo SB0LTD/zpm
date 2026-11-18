@@ -1092,7 +1092,7 @@ pub fn Database(comptime config: Config) type {
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
                     // These catalog lookups use the serialized database hook.
-                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_partition_ancestors,
+                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_partition_ancestors,
                     .to_regnamespace,.regnamespace_in,.regnamespace_out=>return error.UnsupportedStatement,
                     .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
@@ -5785,6 +5785,61 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
+        fn postgresTriggerDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const snapshot = self.seq_snap;
+            for (&self.objects.triggers) |*trigger| {
+                if (!trigger.live or trigger.oid != oid or !trigger.stamp.visible(snapshot)) continue;
+                const slot = self.visibleTableSlot(trigger.table_oid, snapshot) orelse return null;
+                const table = &self.tables[slot];
+                const routine_slot = self.objects.routineByOid(trigger.function_oid, snapshot) orelse return null;
+                const routine = &self.objects.routines[routine_slot];
+                var text: CatalogTextWriter = .{ .out = out };
+                text.add("CREATE TRIGGER ");
+                text.ident(trigger.name.slice());
+                text.add(if (trigger.tgtype & tg.tg_before != 0) " BEFORE " else " AFTER ");
+                var preceding_event = false;
+                inline for (.{ .{ tg.tg_insert, "INSERT" }, .{ tg.tg_delete, "DELETE" }, .{ tg.tg_update, "UPDATE" }, .{ tg.tg_truncate, "TRUNCATE" } }) |event| {
+                    if (trigger.tgtype & event[0] != 0) {
+                        if (preceding_event) text.add(" OR ");
+                        text.add(event[1]);
+                        preceding_event = true;
+                        if (event[0] == tg.tg_update and trigger.column_count != 0) {
+                            text.add(" OF ");
+                            for (trigger.columns[0..trigger.column_count], 0..) |column, index| {
+                                if (column >= table.column_count) return error.ColumnNotFound;
+                                if (index != 0) text.add(", ");
+                                text.ident(table.columns[column].name.slice());
+                            }
+                        }
+                    }
+                }
+                text.add(" ON ");
+                if (!pretty or !self.inRelationSearchPath(table.namespace, table.name.slice())) {
+                    text.ident(self.namespaceName(table.namespace));
+                    text.add(".");
+                }
+                text.ident(table.name.slice());
+                text.add(if (trigger.tgtype & tg.tg_row != 0) " FOR EACH ROW " else " FOR EACH STATEMENT ");
+                if (trigger.when.len != 0) {
+                    text.add("WHEN (");
+                    text.add(trigger.when.slice());
+                    text.add(") ");
+                }
+                text.add("EXECUTE FUNCTION ");
+                text.ident(routine.name.slice());
+                text.add("(");
+                for (0..trigger.nargs) |index| {
+                    if (index != 0) text.add(", ");
+                    text.literal(trigger.argument(index));
+                }
+                text.add(")");
+                if (text.shortened) return error.TextCapacity;
+                return text.len;
+            }
+            return null;
+        }
+
         fn postgresPartitionAncestors(ptr: *anyopaque, oid: u32, out: []u32) Error!usize {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             const snapshot = self.seq_snap;
@@ -7617,7 +7672,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
@@ -10320,7 +10375,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {
                     if (!trigger.live or !trigger.stamp.visible(snapshot)) continue;
-                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), nameCell("O"), boolCell(false), intCell(@intCast(trigger.nargs)) });
+                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), nameCell("O"), boolCell(false), intCell(@intCast(trigger.nargs)), intCell(0) });
                 },
                 .pg_rewrite => for (&self.objects.rules) |*rule| {
                     if (!rule.live or !rule.stamp.visible(snapshot)) continue;

@@ -831,12 +831,63 @@ fn changeRecords() !void {
     try check(empty.tableCount() == 0 and empty.oid_counter == 0);
 }
 
+fn triggerDefinitions() !void {
+    reset();
+    try run("CREATE TABLE hits(id INT PRIMARY KEY, v INT, \"Value Label\" INT)");
+    try run("CREATE FUNCTION bump() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.v := NEW.v + 1; RETURN NEW; END$$");
+    const create = "CREATE TRIGGER \"watch\"\"list\" BEFORE UPDATE OF \"Value Label\" OR INSERT ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')";
+    const metadata = "SELECT tgname, tgrelid <> 0, tgfoid <> 0, tgtype, tgenabled, tgisinternal, tgnargs, tgparentid FROM pg_catalog.pg_trigger WHERE tgname = 'watch\"list'";
+    const pretty = "SELECT pg_catalog.pg_get_triggerdef(oid, true) FROM pg_catalog.pg_trigger WHERE tgname = 'watch\"list'";
+    const full = "SELECT pg_catalog.pg_get_triggerdef(oid) FROM pg_catalog.pg_trigger WHERE tgname = 'watch\"list'";
+    const count = "SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgname = 'watch\"list'";
+    const readable = "CREATE TRIGGER \"watch\"\"list\" BEFORE INSERT OR UPDATE OF \"Value Label\" ON hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')";
+    const qualified = "CREATE TRIGGER \"watch\"\"list\" BEFORE INSERT OR UPDATE OF \"Value Label\" ON public.hits FOR EACH ROW EXECUTE FUNCTION bump('it''s', '')";
+    const pending = try db.begin();
+    try statement(pending, create);
+    try same(try rows(pending, pretty), readable);
+    try expect(count, "0");
+    db.abort(pending);
+    try expect(count, "0");
+    try run(create);
+    try expect(metadata, "watch\"list|t|t|23|O|f|2|0");
+    try expectColumn(pretty, "pg_get_triggerdef", 25, readable);
+    try expect(full, qualified);
+    try expect("SELECT pg_catalog.pg_get_triggerdef(0::oid) IS NULL, pg_catalog.pg_get_triggerdef(NULL::oid) IS NULL", "t|t");
+    try expect("SELECT pg_catalog.pg_get_triggerdef(oid, NULL::boolean) IS NULL FROM pg_catalog.pg_trigger WHERE tgname = 'watch\"list'", "t");
+    const tooling =
+        \\SELECT t.tgname, pg_catalog.pg_get_triggerdef(t.oid, true), t.tgenabled, t.tgisinternal,
+        \\  CASE WHEN t.tgparentid != 0 THEN
+        \\    (SELECT u.tgrelid::pg_catalog.regclass
+        \\     FROM pg_catalog.pg_trigger AS u,
+        \\          pg_catalog.pg_partition_ancestors(t.tgrelid) WITH ORDINALITY AS a(relid, depth)
+        \\     WHERE u.tgname = t.tgname AND u.tgrelid = a.relid AND u.tgparentid = 0
+        \\     ORDER BY a.depth LIMIT 1)
+        \\  END AS parent
+        \\FROM pg_catalog.pg_trigger t
+        \\WHERE t.tgname = 'watch"list' AND (NOT t.tgisinternal OR (t.tgisinternal AND t.tgenabled = 'D'))
+        \\ORDER BY 1
+    ;
+    try expect(tooling, "watch\"list|" ++ readable ++ "|O|f|NULL");
+    try run("CREATE TRIGGER sample BEFORE UPDATE ON hits FOR EACH ROW WHEN (new.v > 0) EXECUTE FUNCTION bump()");
+    const condition = "SELECT pg_catalog.pg_get_triggerdef(oid, true) FROM pg_catalog.pg_trigger WHERE tgname = 'sample'";
+    try expect(condition, "CREATE TRIGGER sample BEFORE UPDATE ON hits FOR EACH ROW WHEN (new.v > 0) EXECUTE FUNCTION bump()");
+    try run("INSERT INTO hits VALUES (1, 2, 0)");
+    try expect("SELECT v FROM hits", "3");
+    try sameState(&.{metadata, pretty, full, tooling, condition, "SELECT v FROM hits"});
+
+    const drop = "DROP TRIGGER \"watch\"\"list\" ON hits";
+    try run(drop);
+    try expect(count, "0");
+    try sameState(&.{metadata, pretty, full, count});
+}
+
 pub fn main() !void {
     try oraclePrograms();
     try sqlFunctions();
     try plpgsqlFunctions();
     try proceduresAndDo();
     try triggers();
+    try triggerDefinitions();
     try rules();
     try concurrency();
     try workControl();
