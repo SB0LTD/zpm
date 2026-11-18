@@ -99,7 +99,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     xmlparse, xmlserialize, xml_is_well_formed, xml_is_well_formed_document, xml_is_well_formed_content,
     // Session functions (tx-session lane, Database session hook; volatile).
     current_setting, set_config, pg_try_advisory_lock, pg_try_advisory_lock_shared, pg_try_advisory_xact_lock, pg_try_advisory_xact_lock_shared,
-    pg_advisory_unlock, pg_advisory_unlock_shared, pg_backend_pid,
+    pg_advisory_unlock, pg_advisory_unlock_shared, pg_backend_pid, pg_is_in_recovery,
     // Routines (B11 wave 3, routine_catalog.sig): a call of a user function
     // (`integer` its routine slot; arguments `b` -> next, converted to the
     // parameter types) and a bound routine variable (`relation` 0 a

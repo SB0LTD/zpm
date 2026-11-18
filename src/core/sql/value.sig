@@ -110,7 +110,7 @@ pub const SequenceHook = struct {
     namespace_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
 };
 
-pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid };
+pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid, recovery_status };
 
 /// Advisory call flags: 1 shared, 2 transaction-level, 4 two int4 keys;
 /// current_setting / set_config: 1 missing_ok / is_local.
