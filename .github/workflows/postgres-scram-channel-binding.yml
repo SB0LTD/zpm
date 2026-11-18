@@ -13,6 +13,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install checksum-verified Sig 0.6.5
         shell: bash
         run: |
@@ -32,8 +34,10 @@ jobs:
         run: |
           set -o pipefail
           mkdir evidence
-          test "$(git rev-parse HEAD^)" = "f35195eb5539bbb1621a30959ffa5cee70fe5c5f"
-          git rev-parse HEAD^ >evidence/source.txt
+          source=f35195eb5539bbb1621a30959ffa5cee70fe5c5f
+          git merge-base --is-ancestor "$source" HEAD
+          git diff --exit-code "$source" -- src tests build.sig
+          printf "%s\n" "$source" >evidence/source.txt
           "$SIG" version | tee evidence/sig-version.log
           "$SIG" build run-contract-scram run-contract-postgres \
             --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
