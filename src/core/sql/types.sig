@@ -979,6 +979,20 @@ pub fn typeByName(input: []const u8) ?DataType {
     return scalarByName(trimmed);
 }
 
+/// An already decoded PostgreSQL catalog identifier. Qualified lookups use
+/// pg_type names, including `_int2`, without SQL aliases such as `smallint`.
+pub fn typeByCatalogName(name: []const u8) ?DataType {
+    const array = name.len > 0 and name[0] == '_';
+    const base = if (array) name[1..] else name;
+    inline for (@typeInfo(DataType).@"enum".field_names) |field| {
+        const data_type = @field(DataType, field);
+        if (data_type != .mysql_bigint_unsigned and same(base, typeInfo(data_type).name)) {
+            return if (array) arrayData(data_type) else data_type;
+        }
+    }
+    return null;
+}
+
 fn scalarByName(input: []const u8) ?DataType {
     var text = input;
     while (text.len != 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
