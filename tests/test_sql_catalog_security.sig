@@ -608,6 +608,69 @@ fn namespaceAclMaterialization() !void {
     try expectAclState("recreated", false);
 }
 
+fn schemaDependencies() !void {
+    try reset();
+    try run("CREATE SCHEMA view_space");
+    try run("CREATE VIEW view_space.drop_view_probe AS SELECT id FROM tdd_a");
+    try rejects("DROP SCHEMA view_space", error.DependentObjects, "SELECT COUNT(*) FROM view_space.drop_view_probe", "4");
+    try run("CREATE MATERIALIZED VIEW view_space.drop_mat_probe AS SELECT id FROM tdd_b");
+    const schema_rows = "SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'view_space'";
+    const view_rows = "SELECT COUNT(*) FROM pg_class WHERE relname IN ('drop_view_probe','drop_mat_probe')";
+    const aborting = try db.begin();
+    try statement(aborting, "DROP SCHEMA view_space CASCADE");
+    try same(try rows(aborting, schema_rows), "0");
+    try same(try rows(aborting, view_rows), "0");
+    db.abort(aborting);
+    try expect(schema_rows, "1");
+    try expect(view_rows, "2");
+    try run("DROP SCHEMA view_space CASCADE");
+    try expect(schema_rows, "0");
+    try expect(view_rows, "0");
+    try same(try query(&replica, schema_rows), "0");
+    try same(try query(&replica, view_rows), "0");
+
+    try run("CREATE SCHEMA late_space");
+    const older = try db.begin();
+    try db.beginModes(older, .{ .isolation = .repeatable_read });
+    const base_rows = "SELECT COUNT(*) FROM tdd_a";
+    try same(try rows(older, base_rows), "4");
+    try run("CREATE TABLE late_space.new_table(id INT)");
+    try statementFails(older, "DROP SCHEMA late_space", error.DependentObjects);
+    db.abort(older);
+    try expect("SELECT COUNT(*) FROM late_space.new_table", "0");
+
+    const cascading = try db.begin();
+    try db.beginModes(cascading, .{ .isolation = .repeatable_read });
+    try same(try rows(cascading, base_rows), "4");
+    try run("CREATE VIEW late_space.new_view AS SELECT id FROM tdd_a");
+    try statement(cascading, "DROP SCHEMA late_space CASCADE");
+    try commit(cascading);
+    const late_rows = "SELECT COUNT(*) FROM pg_class WHERE relname IN ('new_table','new_view')";
+    try expect(late_rows, "0");
+    try same(try query(&replica, late_rows), "0");
+
+    try run("CREATE SCHEMA old_space");
+    const stale_creator = try db.begin();
+    try db.beginModes(stale_creator, .{ .isolation = .repeatable_read });
+    try same(try rows(stale_creator, base_rows), "4");
+    try run("DROP SCHEMA old_space");
+    try statementFails(stale_creator, "CREATE TABLE old_space.stranded (id INT)", error.UndefinedSchema);
+    db.abort(stale_creator);
+
+    // An in-namespace foreign-key rewrite can move a child to a slot
+    // outside the original cascade. Refuse this unsupported shape before
+    // publishing an orphan, and roll the tentative drops back atomically.
+    try run("CREATE SCHEMA fk_space");
+    try run("CREATE TABLE fk_space.father (id INT PRIMARY KEY)");
+    try run("CREATE TABLE fk_space.child (id INT REFERENCES fk_space.father(id))");
+    const fk_rows = "SELECT COUNT(*) FROM pg_class WHERE relname IN ('father','child')";
+    try rejects("DROP SCHEMA fk_space CASCADE", error.UnsupportedStatement, fk_rows, "2");
+    try run("INSERT INTO fk_space.father VALUES (7)");
+    try run("INSERT INTO fk_space.child VALUES (7)");
+    try fails("INSERT INTO fk_space.child VALUES (8)", error.ForeignKeyViolation);
+    try sameState();
+}
+
 fn comments() !void {
     try reset();
     const probe = "SELECT objoid = 'tdd_a'::regclass, classoid, objsubid, description FROM pg_description ORDER BY objoid, objsubid";
@@ -1418,6 +1481,7 @@ pub fn main() !void {
     try namespaceUsage();
     try namespaceGrants();
     try namespaceAclMaterialization();
+    try schemaDependencies();
     try comments();
     try roles();
     try privileges();
