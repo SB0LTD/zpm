@@ -86,6 +86,8 @@ fn types() !void {
     try expect("SELECT typname, typlen, typcategory, typarray, typdelim, typinput FROM pg_type WHERE oid IN (16, 1700, 3802) ORDER BY oid", "bool|1|B|1000|,|boolin;numeric|-1|N|1231|,|numeric_in;jsonb|-1|U|3807|,|jsonb_in");
     try expect("SELECT typname, oid::regtype::text, format_type(oid, NULL) FROM pg_type WHERE typname IN ('int8', 'float8', 'timestamptz') ORDER BY typname", "float8|double precision|double precision;int8|bigint|bigint;timestamptz|timestamp with time zone|timestamp with time zone");
     try expect("SELECT typname FROM pg_type t WHERE t.oid = to_regtype('integer')", "int4");
+    try expect("SELECT 23::PG_CATALOG.regtype::pg_catalog.text, CAST('23' AS \"pg_catalog\".\"oid\"), ARRAY['x','y']::pg_catalog.text[]", "integer|23|{x,y}");
+    try rejects("SELECT 23::pg_catalog.\"TEXT\"", error.UndefinedObject);
     try expect("SELECT to_regtype('nope') IS NULL, to_regtype('pg_catalog.numeric(10,2)'), 'int8'::regtype = 20::oid", "t|1700|t");
     try expect("SELECT format_type(1700, 655366), format_type(1184, 3), format_type(23, -1), format_type(99999, NULL)", "numeric(10,2)|timestamp(3) with time zone|integer|???");
     try rejects("SELECT 'nope'::regtype", error.UndefinedObject);
@@ -194,6 +196,7 @@ fn relationMetadata() !void {
     try run("CREATE TABLE t(id INT PRIMARY KEY, amount INT CHECK (amount >= 0))");
     try run("CREATE INDEX t_amount ON t (amount)");
     try run("CREATE VIEW v AS SELECT id FROM t");
+    try expect("SELECT 't'::pg_catalog.regclass::pg_catalog.text", "t");
     try expect("SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid", "2|heap|heap_tableam_handler|t;403|btree|bthandler|i");
     try expect("SELECT c.relname,c.relkind,c.relchecks,c.relhasindex,c.relhasrules,a.amname FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_am a ON c.relam=a.oid ORDER BY c.relname", "t|r|1|t|f|heap;t_amount|i|0|f|f|btree;t_pkey|i|0|f|f|btree;v|v|0|f|t|NULL");
     try expect("SELECT relname,relpersistence,relreplident,reltablespace,reloftype,reltoastrelid FROM pg_class ORDER BY relname", "t|p|d|0|0|0;t_amount|p|n|0|0|0;t_pkey|p|n|0|0|0;v|p|n|0|0|0");

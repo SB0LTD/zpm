@@ -1625,7 +1625,11 @@ pub fn Parser(comptime config: types.Config) type {
         /// A type name with an optional array suffix: `[]`, `[n]` (repeated;
         /// sizes and dimensions are ignored) or `ARRAY [n]`.
         fn typeName(self: *Self) Error!TypeSpec {
-            var spec = try self.scalarTypeName();
+            return self.typeArraySuffix(try self.scalarTypeName());
+        }
+
+        fn typeArraySuffix(self: *Self, scalar: TypeSpec) Error!TypeSpec {
+            var spec = scalar;
             var array = false;
             while (self.isSymbol(.lbracket)) {
                 try self.advance();
@@ -3877,6 +3881,24 @@ pub fn Parser(comptime config: types.Config) type {
                 }
             }
             const named = try self.qualifiedName();
+            if (self.tokens.dialect == .postgres) if (named.schema) |qualifier| {
+                var schema_buffer: [64]u8 = undefined;
+                var name_buffer: [64]u8 = undefined;
+                const schema = identText(self.source, qualifier, &schema_buffer) orelse "";
+                const name = identText(self.source, named.name, &name_buffer) orelse "";
+                if (types.same(schema, "pg_catalog")) {
+                    const scalar: ?TypeSpec =
+                        if (types.same(name, "text")) .{ .ty = .text }
+                        else if (types.same(name, "oid")) .{ .ty = .oid }
+                        else if (types.same(name, "regclass")) .{ .ty = .oid, .typmod = ast.regclass_typmod }
+                        else if (types.same(name, "regtype")) .{ .ty = .oid, .typmod = ast.regtype_typmod }
+                        else null;
+                    if (scalar) |type_spec| {
+                        const target = try self.typeArraySuffix(type_spec);
+                        return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                    }
+                }
+            };
             if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
             return self.pool.add(.{ .kind = .cast, .cast_type = .unknown, .a = inner, .name = named.name, .qualifier = named.schema orelse .{} });
         }
