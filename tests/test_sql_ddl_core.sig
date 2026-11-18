@@ -1351,7 +1351,7 @@ fn catalogDependencies() !void {
     try run("INSERT INTO dep.p VALUES (2)");
     try run("ALTER TABLE dep.p ADD CONSTRAINT p_pkey PRIMARY KEY (id)");
     try run("ALTER TABLE dep.c ADD CONSTRAINT fk FOREIGN KEY (parent_id) REFERENCES dep.p(id)");
-    const names = "SELECT c.relname, d.deptype FROM pg_depend d JOIN pg_class c ON c.oid = d.objid JOIN pg_namespace n ON n.oid = d.refobjid WHERE d.classid = 1259 AND d.refclassid = 2615 AND n.nspname = 'dep' ORDER BY 1";
+    const names = "SELECT c.relname, d.deptype FROM pg_depend d JOIN pg_class c ON c.oid = d.objid JOIN pg_namespace n ON n.oid = d.refobjid WHERE d.classid = 1259 AND d.refclassid = 2615 AND n.nspname = 'dep' AND c.relkind = 'r' ORDER BY 1";
     const primary_index = "SELECT d.objsubid, d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.refobjid WHERE d.classid = 1259 AND d.refclassid = 2606 AND c.conname = 'p_pkey' AND d.objid = c.conindid";
     const primary_column = "SELECT d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.objid WHERE d.classid = 2606 AND d.refclassid = 1259 AND c.conname = 'p_pkey' AND d.refobjid = c.conrelid";
     const foreign = "SELECT r.relname, d.refobjsubid, d.deptype FROM pg_depend d JOIN pg_constraint c ON c.oid = d.objid JOIN pg_class r ON r.oid = d.refobjid WHERE d.classid = 2606 AND d.refclassid = 1259 AND c.conname = 'fk' ORDER BY 1, 2, 3";
