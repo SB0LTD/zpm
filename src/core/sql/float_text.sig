@@ -100,10 +100,16 @@ pub fn parse(comptime T: type, input: []const u8) Error!T {
 }
 
 /// float8out / float4out (extra_float_digits = 1: shortest exact digits).
-pub fn format(comptime T: type, value: T, out: []u8) []const u8 {
+pub fn format(comptime T: type, value: T, extra_digits: i8, out: []u8) []const u8 {
     if (isNan(value)) return copy(out, "NaN");
     if (isInf(value)) return copy(out, if (value < 0) "-Infinity" else "Infinity");
     if (value == 0) return copy(out, if (signbit(value)) "-0" else "0");
+    const standard: i32 = if (T == f32) 6 else 15;
+    if (extra_digits <= 0) {
+        const precision = @max(standard + @as(i32, extra_digits), 1);
+        const rounded = roundedSignificant(value, @intCast(precision));
+        return writeDigits(rounded.digits[0..rounded.len], rounded.exponent, precision, signbit(value), out);
+    }
     var buffer: [64]u8 = undefined;
     const scientific = std.fmt.float.render(&buffer, value, .{ .mode = .scientific }) catch unreachable;
     // scientific: [-]d[.ddd]e[-]x
@@ -126,7 +132,93 @@ pub fn format(comptime T: type, value: T, out: []u8) []const u8 {
     var exponent: i32 = 0;
     while (index < scientific.len) : (index += 1) exponent = exponent * 10 + (scientific[index] - '0');
     if (exponent_negative) exponent = -exponent;
-    const fixed_limit: i32 = if (T == f32) 6 else 15;
+    return writeDigits(digits[0..count], exponent, standard, negative, out);
+}
+
+const Significant = struct { digits: [16]u8 = undefined, len: usize = 0, exponent: i32 = 0 };
+const decimal_limb_base = 1000000000;
+
+/// Round the exact binary value once. Rounding the shortest decimal first
+/// loses the side of a decimal midpoint occupied by the original value.
+fn roundedSignificant(value: anytype, precision: usize) Significant {
+    const bits: u64 = @bitCast(@as(f64, value));
+    const biased: i32 = @intCast((bits >> 52) & 0x7ff);
+    const significand = (bits & 0xfffffffffffff) | (if (biased == 0) @as(u64, 0) else @as(u64, 1) << 52);
+    const normalized_exponent: i32 = if (biased == 0) 1 else biased;
+    var binary_exponent: i32 = normalized_exponent - 1075;
+    const trailing: i32 = @intCast(@ctz(significand));
+    const reduced = significand >> @intCast(trailing);
+    binary_exponent += trailing;
+    const decimal_places = @max(-binary_exponent, 0);
+
+    // The longest exact f64 coefficient has at most 767 decimal digits.
+    var limbs: [86]u32 = undefined;
+    limbs[0] = @intCast(reduced % decimal_limb_base);
+    const high: u32 = @intCast(reduced / decimal_limb_base);
+    limbs[1] = high;
+    var used: usize = if (high == 0) 1 else 2;
+    var exponent_left = @abs(binary_exponent);
+    const power_base: u32 = if (binary_exponent < 0) 5 else 2;
+    const chunk: u32 = if (binary_exponent < 0) 13 else 29;
+    while (exponent_left != 0) {
+        const steps = @min(chunk, exponent_left);
+        var factor: u32 = 1;
+        for (0..steps) |_| factor *= power_base;
+        var carry: u64 = 0;
+        for (limbs[0..used]) |*limb| {
+            const product = @as(u64, limb.*) * factor + carry;
+            limb.* = @intCast(product % decimal_limb_base);
+            carry = product / decimal_limb_base;
+        }
+        while (carry != 0) {
+            limbs[used] = @intCast(carry % decimal_limb_base);
+            used += 1;
+            carry /= decimal_limb_base;
+        }
+        exponent_left -= steps;
+    }
+
+    var leading_divisor: u32 = 100000000;
+    var leading_digits: i32 = 9;
+    while (limbs[used - 1] < leading_divisor) : (leading_digits -= 1) leading_divisor /= 10;
+    var result: Significant = .{ .exponent = @as(i32, @intCast((used - 1) * 9)) + leading_digits - 1 - decimal_places };
+    var position = used;
+    var guard: u8 = 0;
+    var sticky = false;
+    var divisor = leading_divisor;
+    while (position != 0) {
+        position -= 1;
+        var limb = limbs[position];
+        while (divisor != 0 and result.len < precision) : (divisor /= 10) {
+            result.digits[result.len] = @intCast('0' + limb / divisor);
+            result.len += 1;
+            limb %= divisor;
+        }
+        if (divisor != 0) {
+            guard = @intCast(limb / divisor);
+            sticky = limb % divisor != 0;
+            for (limbs[0..position]) |rest| sticky = sticky or rest != 0;
+            break;
+        }
+        divisor = 100000000;
+    }
+    if (guard > 5 or (guard == 5 and (sticky or result.digits[result.len - 1] & 1 != 0))) {
+        var digit = result.len;
+        while (digit != 0 and result.digits[digit - 1] == '9') {
+            digit -= 1;
+            result.digits[digit] = '0';
+        }
+        if (digit == 0) {
+            result.digits[0] = '1';
+            result.exponent += 1;
+        } else result.digits[digit - 1] += 1;
+    }
+    while (result.len > 1 and result.digits[result.len - 1] == '0') result.len -= 1;
+    return result;
+}
+
+fn writeDigits(digits: []const u8, exponent: i32, fixed_limit: i32, negative: bool, out: []u8) []const u8 {
+    const count = digits.len;
     var at: usize = 0;
     if (negative) {
         out[0] = '-';

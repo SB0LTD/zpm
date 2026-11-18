@@ -32,9 +32,24 @@ const text_search = @import("text_search.sig");
 const Error = types.Error;
 const Type = types.Type;
 
+/// The two relation kinds supported by PostgreSQL's session access guard.
+pub const RestrictedRelationKinds = packed struct {
+    view: bool = false,
+    foreign_table: bool = false,
+
+    /// Only call for a relation in the user catalog. Built-in system views
+    /// resolve separately and have no entries in caller-owned table storage.
+    pub fn check(self: RestrictedRelationKinds, kind: u8) Error!void {
+        if (kind == 'v' and self.view) return error.RestrictedNonSystemView;
+        if (kind == 'f' and self.foreign_table) return error.RestrictedNonSystemForeignTable;
+    }
+};
+
 pub const Session = struct {
     zone: temporal.Zone = .{},
     resolver: temporal.Resolver = .{},
+    xml_document: bool = false,
+    restricted_relation_kinds: RestrictedRelationKinds = .{},
     /// PostgreSQL-epoch microseconds (2000-01-01 UTC); null without a clock.
     transaction_us: ?i64 = null,
     statement_us: ?i64 = null,
@@ -45,6 +60,12 @@ pub const Session = struct {
     sequences: ?*const SequenceHook = null,
     /// current_database(): the session's startup database.
     database: []const u8 = "postgres",
+    /// The implicit catalog remains visible when a PostgreSQL session
+    /// installs an empty explicit schema path.
+    public_schema_on_path: bool = true,
+    row_security: bool = true,
+    synchronize_seqscans: bool = true,
+    extra_float_digits: i8 = 1,
     mysql_keep_zero: bool = false,
     mysql_last_insert_id: u64 = 0,
     control: ?*types.ExecutionControl = null,
@@ -85,6 +106,7 @@ pub const SequenceHook = struct {
     call: *const fn (ptr: *anyopaque, kind: SequenceCall, name: []const u8, oid: u32, value: i64, called: bool) Error!i64,
     /// regclass output: the relation named by `oid`, if any.
     relation_name: *const fn (ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize,
+    relation_display_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
     /// Catalog-object text (B11 wave 3): a comment (obj_description,
     /// col_description, shobj_description) or a role name, written to `out`.
     catalog_text: ?*const fn (ptr: *anyopaque, kind: CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize = null,
@@ -94,9 +116,19 @@ pub const SequenceHook = struct {
     serial_sequence: ?*const fn (ptr: *anyopaque, table: []const u8, column: []const u8, out: *[serial_name_bytes]u8) Error!?usize = null,
     /// Visibility of an existing relation in the owning catalog snapshot.
     relation_visible: ?*const fn (ptr: *anyopaque, oid: u32) ?bool = null,
+    /// Index definition or one index attribute in the owning snapshot.
+    index_definition: ?*const fn (ptr: *anyopaque, oid: u32, column: i32, pretty: bool, out: []u8) Error!?usize = null,
+    constraint_definition: ?*const fn (ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize = null,
+    statistics_columns: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
+    relation_publishable: ?*const fn (ptr: *anyopaque, oid: u32) ?bool = null,
+    partition_key_definition: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
+    trigger_definition: ?*const fn (ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize = null,
+    partition_ancestors: ?*const fn (ptr: *anyopaque, oid: u32, out: []u32) Error!usize = null,
+    namespace_lookup: ?*const fn (ptr: *anyopaque, name: []const u8, strict: bool) Error!?u32 = null,
+    namespace_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
 };
 
-pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid };
+pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid, recovery_status };
 
 /// Advisory call flags: 1 shared, 2 transaction-level, 4 two int4 keys;
 /// current_setting / set_config: 1 missing_ok / is_local.
@@ -454,8 +486,8 @@ pub fn Io(comptime config: types.Config) type {
                 .integer => |value| integerText(value, buffer),
                 .boolean => |value| copy(buffer, if (verbose) (if (value) "true" else "false") else (if (value) "t" else "f")),
                 .text => |*value| copy(buffer, value.slice()),
-                .float4 => |value| float_text.format(f32, value, buffer),
-                .float8 => |value| float_text.format(f64, value, buffer),
+                .float4 => |value| float_text.format(f32, value, session.extra_float_digits, buffer),
+                .float8 => |value| float_text.format(f64, value, session.extra_float_digits, buffer),
                 .numeric => |*value| N.format(value, buffer),
                 .date => |value| temporal.formatDate(value, buffer),
                 .timestamp => |value| temporal.formatTimestamp(value, null, buffer),
@@ -480,8 +512,8 @@ pub fn Io(comptime config: types.Config) type {
                 // inet hides a full-length netmask except in its text cast.
                 .inet => |*value| network.format(value, value.cidr or verbose, buffer),
                 .macaddr => |*value| network.formatMac(value, buffer),
-                .point => |value| geometric.formatPoint(value, buffer),
-                .box => |value| geometric.formatBox(value, buffer),
+                .point => |value| geometric.formatPoint(value, session.extra_float_digits, buffer),
+                .box => |value| geometric.formatBox(value, session.extra_float_digits, buffer),
                 .xml => |*value| xml.output(value.slice(), buffer),
                 // regtypeout: the type's SQL name, or the number.
                 .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
@@ -612,9 +644,11 @@ pub fn Io(comptime config: types.Config) type {
                 .macaddr => .{ .macaddr = try network.parseMac(input) },
                 .point => .{ .point = try geometric.parsePoint(input) },
                 .box => .{ .box = try geometric.parseBox(input) },
-                // xml_in with xmloption CONTENT.
+                // xml_in: casts and textual input honor the session XML mode.
                 .xml => blk: {
-                    if (!xml.validContent(input)) return error.InvalidXmlContent;
+                    if (session.xml_document) {
+                        if (!xml.validDocument(input)) return error.InvalidXmlDocument;
+                    } else if (!xml.validContent(input)) return error.InvalidXmlContent;
                     break :blk .{ .xml = (try textCell(input)).text };
                 },
                 // jsonpath_in: the canonical text of the parsed path (B11).

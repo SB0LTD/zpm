@@ -42,6 +42,8 @@
 //! exposed to the PostgreSQL codec through takeParameterChanges() so it can
 //! send ParameterStatus before ReadyForQuery.
 
+const std = @import("std");
+
 pub const max_statement_bytes = 65536;
 
 /// Per-session SQL dialect (design §4.2). MySQL and TDS sessions set it on
@@ -106,12 +108,52 @@ pub const BatchIterator = struct {
 
 pub const DateOrder = enum { mdy, dmy, ymd };
 
+/// PostgreSQL client order, with INFO independently visible to the client.
+pub const ClientMessageLevel = enum {
+    debug5, debug4, debug3, debug2, debug1, log, info, notice, warning, @"error", fatal, panic,
+
+    pub fn visibleAt(level: ClientMessageLevel, minimum: ClientMessageLevel) bool {
+        return level == .info or @intFromEnum(level) >= @intFromEnum(minimum);
+    }
+
+    pub fn label(level: ClientMessageLevel) []const u8 {
+        return switch (level) {
+            .debug5, .debug4, .debug3, .debug2, .debug1 => "DEBUG",
+            .log => "LOG",
+            .info => "INFO",
+            .notice => "NOTICE",
+            .warning => "WARNING",
+            .@"error" => "ERROR",
+            .fatal => "FATAL",
+            .panic => "PANIC",
+        };
+    }
+
+    fn threshold(value: []const u8) ?ClientMessageLevel {
+        inline for (@typeInfo(ClientMessageLevel).@"enum".field_names) |name| {
+            const level = @field(ClientMessageLevel, name);
+            if (level != .info and level != .fatal and level != .panic and sameInsensitive(value, name)) return level;
+        }
+        return null;
+    }
+};
+
+pub const ClientNotice = struct {
+    level: ClientMessageLevel = .warning,
+    state: []const u8,
+    message: []const u8,
+};
+
 /// Session settings this store implements. Times are milliseconds.
 pub fn SettingsOf(comptime Zone: type) type {
     return struct {
         const Self = @This();
         lock_timeout_ms: u32 = 0,
         statement_timeout_ms: u32 = 0,
+        idle_in_transaction_session_timeout_ms: u32 = 0,
+        transaction_timeout_ms: u32 = 0,
+        xml_document: bool = false,
+        client_min_messages: ClientMessageLevel = .notice,
         application_name: [64]u8 = @splat(0),
         application_name_len: u8 = 0,
         /// TimeZone as SHOW reports it, and the resolved zone.
@@ -119,6 +161,8 @@ pub fn SettingsOf(comptime Zone: type) type {
         timezone_len: u8 = 3,
         zone: Zone = .{},
         date_order: DateOrder = .mdy,
+        extra_float_digits: i8 = 1,
+        explicit_default_tablespace: bool = false,
 
         pub fn applicationName(self: *const Self) []const u8 {
             return self.application_name[0..self.application_name_len];
@@ -221,7 +265,7 @@ pub const deadlock_timeout_ms: u32 = 1000;
 
 /// Settings this store implements; the engine owns the others it knows
 /// (transaction_*, default_transaction_*, search_path, placeholders).
-const Parameter = enum { lock_timeout, statement_timeout, deadlock_timeout, timezone, application_name, client_encoding, standard_conforming_strings, datestyle, intervalstyle, server_version, server_encoding, integer_datetimes };
+const Parameter = enum { lock_timeout, statement_timeout, idle_in_transaction_session_timeout, transaction_timeout, deadlock_timeout, timezone, xmloption, application_name, client_encoding, client_min_messages, standard_conforming_strings, datestyle, intervalstyle, extra_float_digits, default_table_access_method, default_tablespace, server_version, server_encoding, integer_datetimes };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -240,6 +284,41 @@ fn canonical(which: Parameter) []const u8 {
     };
 }
 
+fn placementName(raw: []const u8, out: []u8) []const u8 {
+    if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') return raw[1 .. raw.len - 1];
+    for (raw, 0..) |byte, index| out[index] = lowerByte(byte);
+    return out[0..raw.len];
+}
+
+fn parseExtraFloatDigits(raw: []const u8) !i8 {
+    const text = std.mem.trim(u8, raw, " \t\r\n\x0b\x0c");
+    if (text.len == 0 or std.mem.indexOfScalar(u8, text, '_') != null) return error.InvalidSettingValue;
+    const digits = if (text[0] == '+' or text[0] == '-') text[1..] else text;
+    const base: u8 = if (digits.len > 1 and digits[0] == '0')
+        (if (digits[1] == 'x' or digits[1] == 'X') 0 else 8)
+    else 10;
+    const value = std.fmt.parseInt(i8, text, base) catch rounded: {
+        // PostgreSQL retries a configuration integer as a double after a
+        // decimal point or exponent, then rounds to the nearest even integer.
+        var end: usize = if (base == 0) 2 else 0;
+        while (end < digits.len) : (end += 1) {
+            const byte = digits[end];
+            const numeric = if (base == 8) byte >= '0' and byte <= '7' else digitByte(byte);
+            const hex_letter = base == 0 and ((byte >= 'a' and byte <= 'f') or (byte >= 'A' and byte <= 'F'));
+            if (!numeric and !hex_letter) break;
+        }
+        if (end == digits.len or (digits[end] != '.' and digits[end] != 'e' and digits[end] != 'E')) return error.InvalidSettingValue;
+        const number = std.fmt.parseFloat(f64, text) catch return error.InvalidSettingValue;
+        if (!(number > -16 and number < 4)) return error.InvalidSettingValue;
+        const floor = @floor(number);
+        const fraction = number - floor;
+        const below: i8 = @intFromFloat(floor);
+        break :rounded if (fraction > 0.5 or (fraction == 0.5 and below & 1 != 0)) below + 1 else below;
+    };
+    if (value < -15 or value > 3) return error.InvalidSettingValue;
+    return value;
+}
+
 fn parseMilliseconds(text: []const u8) !u32 {
     var index: usize = 0;
     while (index < text.len and whitespace(text[index])) index += 1;
@@ -256,6 +335,61 @@ fn parseMilliseconds(text: []const u8) !u32 {
     const total = value * scale;
     if (total > 0x7fffffff) return error.InvalidSettingValue;
     return @intCast(total);
+}
+
+const guc_timeout_units = [_]struct { name: []const u8, milliseconds: f64 }{
+    .{ .name = "d", .milliseconds = 86400000 },
+    .{ .name = "h", .milliseconds = 3600000 },
+    .{ .name = "min", .milliseconds = 60000 },
+    .{ .name = "s", .milliseconds = 1000 },
+    .{ .name = "ms", .milliseconds = 1 },
+    .{ .name = "us", .milliseconds = 0.001 },
+};
+
+fn timeoutNumber(text: []const u8) ?f64 {
+    if (text.len == 0 or std.mem.indexOfScalar(u8, text, '_') != null) return null;
+    const offset: usize = if (text[0] == '-' or text[0] == '+') 1 else 0;
+    const unsigned = text[offset..];
+    if (unsigned.len == 0) return null;
+    if (std.mem.startsWith(u8, unsigned, "0x") or std.mem.startsWith(u8, unsigned, "0X")) {
+        if (std.fmt.parseInt(i64, text, 0)) |number| return @floatFromInt(number) else |_| {}
+    } else if (std.mem.indexOfAny(u8, text, ".eE") == null) {
+        const base: u8 = if (unsigned.len > 1 and unsigned[0] == '0') 8 else 10;
+        const number = std.fmt.parseInt(i64, text, base) catch return null;
+        return @floatFromInt(number);
+    }
+    const number = std.fmt.parseFloat(f64, text) catch return null;
+    if (!std.math.isFinite(number)) return null;
+    return number;
+}
+
+fn nearestEven(number: f64) f64 {
+    const lower = @floor(number);
+    const fraction = number - lower;
+    return if (fraction > 0.5 or (fraction == 0.5 and @rem(lower, 2.0) != 0.0)) lower + 1.0 else lower;
+}
+
+fn parseGucTimeout(text: []const u8) !u32 {
+    const spaces = " \t\n\r\x0b\x0c";
+    const source = std.mem.trim(u8, text, spaces);
+    const milliseconds = timeoutNumber(source) orelse converted: {
+        // Match longer suffixes first, including ms/us before s.
+        var index = guc_timeout_units.len;
+        while (index != 0) {
+            index -= 1;
+            const unit = guc_timeout_units[index];
+            if (!std.mem.endsWith(u8, source, unit.name)) continue;
+            const value = timeoutNumber(std.mem.trimEnd(u8, source[0 .. source.len - unit.name.len], spaces)) orelse return error.InvalidSettingValue;
+            const scaled = value * unit.milliseconds;
+            if (index + 1 == guc_timeout_units.len) break :converted scaled;
+            const next_smaller = guc_timeout_units[index + 1].milliseconds;
+            break :converted nearestEven(scaled / next_smaller) * next_smaller;
+        }
+        return error.InvalidSettingValue;
+    };
+    const rounded = nearestEven(milliseconds);
+    if (!std.math.isFinite(rounded) or rounded < 0 or rounded > 0x7fffffff) return error.InvalidSettingValue;
+    return @intFromFloat(rounded);
 }
 
 /// PostgreSQL's display: the largest unit that divides the value evenly.
@@ -591,6 +725,8 @@ pub fn Store(comptime Raw: type) type {
             running_statement: bool = false,
             execution: ExecutionControl = .{},
             execution_deadline_ns: ?i64 = null,
+            transaction_deadline_ns: ?i64 = null,
+            pending_notice: ?ClientNotice = null,
             /// Savepoint depth of the last ROLLBACK TO, for the codec's portals.
             rolled_back_to: ?usize = null,
             /// Wall-clock start of the open (or implicit) transaction and of
@@ -666,8 +802,12 @@ pub fn Store(comptime Raw: type) type {
                 self.applySet(which, local, reset, value) catch |err| return switch (err) {
                     error.UnsupportedStatement => error.UnsupportedStatement,
                     error.UndefinedSetting => error.UndefinedSetting,
+                    error.ObjectNotInPrerequisiteState => error.ObjectNotInPrerequisiteState,
                     else => error.InvalidSettingValue,
                 };
+                if (comptime has_session and @hasField(Raw.SessionValues, "extra_float_digits")) {
+                    if (which == .extra_float_digits) self.store.database.session.extra_float_digits = self.settings.extra_float_digits;
+                }
                 return true;
             }
 
@@ -685,10 +825,15 @@ pub fn Store(comptime Raw: type) type {
                     self.settings = next;
                     restore(&self.base, &next, which);
                 }
+                if (which == .transaction_timeout) self.refreshTransactionTimeout();
+                if (comptime has_session) if (which == .xmloption) {
+                    self.store.database.session.xml_document = self.settings.xml_document;
+                };
             }
 
             pub const CopyInfo = Raw.CopyInfo;
             pub const copy_line_bytes = Raw.copy_line_bytes;
+            pub const sql_transaction_controls = true;
 
             pub fn reportedParameters() []const []const u8 {
                 return &reported_parameters;
@@ -741,7 +886,7 @@ pub fn Store(comptime Raw: type) type {
                     if (self.engine_session.listener != null) return false;
                 }
                 return self.detachedIdentity() and self.id!=0 and !self.failed and self.autocommit and !self.in_transaction and self.tx==null and
-                    !self.pending.active and !self.running_statement and self.read_context==null;
+                    self.settings.transaction_timeout_ms == 0 and !self.pending.active and !self.running_statement and self.read_context==null;
             }
             fn detachedIdentity(self: *const Connection) bool {
                 if (comptime has_engine_session) return self.engine_session.values.role == 0 and self.engine_session.session_role == 10;
@@ -751,15 +896,29 @@ pub fn Store(comptime Raw: type) type {
             /// A caller using named-zone operations must provide a read-safe
             /// resolver or keep those operations on the serialized path.
             pub fn detachedReadSession(self:*const Connection,execution_control:*ExecutionControl,statement_us:?i64) Raw.SessionValues {
-                return .{.zone=self.settings.zone,.transaction_us=statement_us,.statement_us=statement_us,
+                var session: Raw.SessionValues = .{.zone=self.settings.zone,.xml_document=self.settings.xml_document,.transaction_us=statement_us,.statement_us=statement_us,
                     .clock=self.store.wall_clock,.database=if(self.database_len==0) "postgres" else self.database_name[0..self.database_len],.control=execution_control};
+                if (comptime @hasField(Raw.SessionValues, "extra_float_digits")) session.extra_float_digits = self.settings.extra_float_digits;
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "public_schema_on_path")) {
+                    session.public_schema_on_path = self.engine_session.values.publicSchemaOnPath();
+                }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "row_security")) {
+                    session.row_security = self.engine_session.values.row_security;
+                }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "synchronize_seqscans")) {
+                    session.synchronize_seqscans = self.dialect == .postgres and self.engine_session.values.synchronize_seqscans;
+                }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
+                    session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
+                }
+                return session;
             }
 
             fn detachedCacheProfile(self: *const Connection) bool {
                 const settings = &self.engine_session.values;
                 if (self.dialect != .postgres or
                     self.store.max_query_work != 0 or self.settings.statement_timeout_ms != 0 or
-                    self.settings.lock_timeout_ms != 0 or self.settings.date_order != .mdy or
+                    self.settings.lock_timeout_ms != 0 or self.settings.xml_document or self.settings.date_order != .mdy or
                     !same(self.settings.timeZone(), "UTC") or settings.isolation != .read_committed or
                     settings.read_only or settings.deferrable or !same(settings.search_path.slice(), "\"$user\", public")) return false;
                 for (&settings.custom) |*entry| if (entry.used) return false;
@@ -788,6 +947,7 @@ pub fn Store(comptime Raw: type) type {
                 };
                 if (comptime has_session) raw.session = .{
                     .zone = self.settings.zone,
+                    .xml_document = self.settings.xml_document,
                     .resolver = .{ .context = @ptrCast(self.store), .lookup = &resolverLookup },
                     .transaction_us = self.transaction_us orelse self.statement_us,
                     .statement_us = self.statement_us,
@@ -796,10 +956,14 @@ pub fn Store(comptime Raw: type) type {
                     .mysql_keep_zero = self.mysql_keep_zero,
                     .mysql_last_insert_id = self.mysql_last_insert_id,
                 };
+                if (comptime has_session and @hasField(@TypeOf(raw.session), "extra_float_digits")) raw.session.extra_float_digits = self.settings.extra_float_digits;
                 if (comptime has_control) raw.session.control = if (self.running_statement) &self.execution else null;
                 if (comptime has_engine_session) {
                     raw.session_state = &self.engine_session;
                     raw.settings_provider = .{ .context = @ptrCast(self), .show = &providerShow, .set = &providerSet };
+                    if (comptime has_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
+                        raw.session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
+                    }
                 }
                 return raw;
             }
@@ -810,6 +974,7 @@ pub fn Store(comptime Raw: type) type {
                 if (self.in_transaction) return;
                 if (self.pending.active) return error.TransactionFailed;
                 self.tx = try self.db().begin();
+                self.refreshTransactionTimeout();
                 self.in_transaction = true;
                 self.failed = false;
                 self.transaction_us = self.store.wallNow();
@@ -820,7 +985,8 @@ pub fn Store(comptime Raw: type) type {
 
             fn endTransaction(self: *Connection, committed: bool) void {
                 self.transaction_us = null;
-                self.settings = if (committed) self.base else self.tx_start;
+                self.transaction_deadline_ns = null;
+                self.settings = if (committed or !self.in_transaction) self.base else self.tx_start;
                 self.base = self.settings;
                 self.tx = null;
                 self.in_transaction = false;
@@ -842,6 +1008,9 @@ pub fn Store(comptime Raw: type) type {
                     self.endTransaction(false);
                     return;
                 }
+                try self.checkTransactionTimeout();
+                // Once durable commit begins, finish its atomic publication.
+                self.transaction_deadline_ns = null;
                 self.store.commit(slot) catch |err| {
                     // The transaction is gone either way, as in PostgreSQL.
                     self.endTransaction(false);
@@ -853,9 +1022,7 @@ pub fn Store(comptime Raw: type) type {
             pub fn rollbackTransaction(self: *Connection) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (self.tx) |slot| self.db().abort(slot);
-                const was = self.in_transaction;
                 self.endTransaction(false);
-                if (!was) self.settings = self.base;
             }
 
             /// A codec-level error inside a block fails it like a statement error.
@@ -874,15 +1041,62 @@ pub fn Store(comptime Raw: type) type {
                 if (self.saved_len > 0) {
                     self.settings = self.saved[self.saved_len - 1].current;
                     self.base = self.saved[self.saved_len - 1].base;
+                    self.refreshTransactionTimeout();
                 } else {
                     self.settings = self.tx_start;
                     self.base = self.tx_start;
+                    self.transaction_deadline_ns = null;
                 }
             }
 
             pub fn transactionStatus(self: *const Connection) u8 {
                 if (self.id == 0 or !self.in_transaction) return 'I';
                 return if (self.failed) 'E' else 'T';
+            }
+
+            /// A bounded diagnostic for the command just executed. Error,
+            /// fatal, and asynchronous notifications have separate wire paths.
+            pub fn takeNotice(self: *Connection) ?ClientNotice {
+                const notice = self.pending_notice orelse return null;
+                self.pending_notice = null;
+                return if (notice.level.visibleAt(self.settings.client_min_messages)) notice else null;
+            }
+
+            fn warn(self: *Connection, state: []const u8, message: []const u8) void {
+                if (self.dialect != .postgres) return;
+                self.pending_notice = .{ .state = state, .message = message };
+            }
+
+            /// Current PostgreSQL idle limit in an open or failed block.
+            /// The protocol and reactor own the command-read boundary and clock.
+            pub fn idleTransactionTimeout(self: *const Connection) u32 {
+                if (self.id == 0 or !self.in_transaction or self.pending.active) return 0;
+                const idle = self.settings.idle_in_transaction_session_timeout_ms;
+                const transaction = self.settings.transaction_timeout_ms;
+                return if (transaction == 0 or idle < transaction) idle else 0;
+            }
+
+            fn monotonicNow(self: *const Connection) i64 {
+                return if (self.store.monotonic_clock) |clock| clock() else self.store.now_ns;
+            }
+
+            pub fn transactionDeadline(self: *const Connection) ?i64 {
+                return self.transaction_deadline_ns;
+            }
+
+            pub fn checkTransactionTimeout(self: *const Connection) error{TransactionTimeout}!void {
+                if (self.transaction_deadline_ns) |due| {
+                    if (self.monotonicNow() >= due) return error.TransactionTimeout;
+                }
+            }
+
+            fn refreshTransactionTimeout(self: *Connection) void {
+                const timeout = self.settings.transaction_timeout_ms;
+                if (timeout == 0 or self.dialect != .postgres or self.tx == null) {
+                    self.transaction_deadline_ns = null;
+                } else if (self.transaction_deadline_ns == null) {
+                    self.transaction_deadline_ns = self.monotonicNow() +| (@as(i64, timeout) * 1000000);
+                }
             }
 
             pub fn isAutocommit(self: *const Connection) bool {
@@ -902,6 +1116,12 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session) self.db().endSession();
             }
 
+            /// The session owner uses this before draining a fatal timeout.
+            pub fn terminateTimedOut(self: *Connection) void {
+                self.disconnect();
+                self.id = 0;
+            }
+
             pub fn blocked(self: *const Connection) bool {
                 return self.pending.active;
             }
@@ -918,7 +1138,7 @@ pub fn Store(comptime Raw: type) type {
                 if (!self.pending.active) return null;
                 var out: ?i64 = null;
                 if (!self.pending.deadlock_checked) out = self.pending.deadlock_check_ns;
-                for ([_]?i64{ self.pending.lock_deadline_ns, self.pending.statement_deadline_ns }) |candidate| {
+                for ([_]?i64{ self.pending.lock_deadline_ns, self.pending.statement_deadline_ns, self.transaction_deadline_ns }) |candidate| {
                     if (candidate) |at| out = if (out) |current| @min(current, at) else at;
                 }
                 return out;
@@ -969,8 +1189,16 @@ pub fn Store(comptime Raw: type) type {
                         var equals: usize = 0;
                         while (equals < item.len and item[equals] != '=') equals += 1;
                         if (equals == 0 or equals == item.len) return error.InvalidSettingValue;
-                        const which = parameter(item[0..equals]) orelse return error.UndefinedSetting;
-                        try self.assign(&self.settings, which, item[equals + 1 ..], true);
+                        const name = item[0..equals];
+                        const option = item[equals + 1 ..];
+                        if (parameter(name)) |which| {
+                            try self.assign(&self.settings, which, option, true);
+                        } else {
+                            if (comptime @hasDecl(Raw, "sessionStartupSetting")) {
+                                if (try self.db().sessionStartupSetting(name, option)) continue;
+                            }
+                            return error.UndefinedSetting;
+                        }
                     }
                 } else return;
                 self.base = self.settings;
@@ -981,15 +1209,40 @@ pub fn Store(comptime Raw: type) type {
                 switch (which) {
                     .lock_timeout => target.lock_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
                     .statement_timeout => target.statement_timeout_ms = if (is_default and value.len == 0) 0 else try parseMilliseconds(value),
+                    .idle_in_transaction_session_timeout => target.idle_in_transaction_session_timeout_ms = if (is_default and value.len == 0) 0 else try parseGucTimeout(value),
+                    .transaction_timeout => target.transaction_timeout_ms = if (is_default and value.len == 0) 0 else try parseGucTimeout(value),
                     .application_name => {
                         const length = @min(value.len, 63);
                         @memcpy(target.application_name[0..length], value[0..length]);
                         target.application_name_len = @intCast(length);
                     },
                     .timezone => try self.assignZone(target, value),
+                    .xmloption => {
+                        if ((is_default and value.len == 0) or sameInsensitive(value, "content")) {
+                            target.xml_document = false;
+                        } else if (sameInsensitive(value, "document")) {
+                            target.xml_document = true;
+                        } else return error.InvalidSettingValue;
+                    },
                     .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
+                    .client_min_messages => target.client_min_messages = if (is_default and value.len == 0) .notice else
+                        ClientMessageLevel.threshold(value) orelse return error.InvalidSettingValue,
                     .standard_conforming_strings => if (!(value.len == 0 or sameInsensitive(value, "on") or sameInsensitive(value, "true"))) return error.InvalidSettingValue,
                     .datestyle => target.date_order = try dateOrder(value, target.date_order),
+                    .default_table_access_method => {
+                        if (is_default and value.len == 0) return;
+                        if (same(value, "heap")) return;
+                        for ([_][]const u8{ "btree", "hash", "gist", "spgist", "gin", "brin" }) |index_method| {
+                            if (same(value, index_method)) return error.ObjectNotInPrerequisiteState;
+                        }
+                        return error.InvalidSettingValue;
+                    },
+                    .default_tablespace => {
+                        if (same(value, "pg_global")) return error.UnsupportedStatement;
+                        if (value.len != 0 and !same(value, "pg_default")) return error.InvalidSettingValue;
+                        target.explicit_default_tablespace = value.len != 0;
+                    },
+                    .extra_float_digits => target.extra_float_digits = if (is_default and value.len == 0) 1 else try parseExtraFloatDigits(value),
                     .intervalstyle => if (!(value.len == 0 or sameInsensitive(value, "postgres"))) return error.InvalidSettingValue,
                     .deadlock_timeout, .server_version, .server_encoding, .integer_datetimes => return error.InvalidSettingValue,
                 }
@@ -1053,13 +1306,20 @@ pub fn Store(comptime Raw: type) type {
                 const value: []const u8 = switch (which) {
                     .lock_timeout => return formatMilliseconds(self.settings.lock_timeout_ms, out),
                     .statement_timeout => return formatMilliseconds(self.settings.statement_timeout_ms, out),
+                    .idle_in_transaction_session_timeout => return formatMilliseconds(self.settings.idle_in_transaction_session_timeout_ms, out),
+                    .transaction_timeout => return formatMilliseconds(self.settings.transaction_timeout_ms, out),
                     .deadlock_timeout => return formatMilliseconds(deadlock_timeout_ms, out),
                     .application_name => self.settings.applicationName(),
                     .timezone => self.settings.timeZone(),
+                    .xmloption => if (self.settings.xml_document) "document" else "content",
                     .client_encoding, .server_encoding => "UTF8",
+                    .client_min_messages => @tagName(self.settings.client_min_messages),
                     .standard_conforming_strings, .integer_datetimes => "on",
                     .datestyle => self.settings.dateStyle(),
                     .intervalstyle => "postgres",
+                    .default_table_access_method => "heap",
+                    .default_tablespace => if (self.settings.explicit_default_tablespace) "pg_default" else "",
+                    .extra_float_digits => return std.fmt.bufPrint(out, "{d}", .{self.settings.extra_float_digits}) catch unreachable,
                     .server_version => "16.0",
                 };
                 @memcpy(out[0..value.len], value);
@@ -1126,8 +1386,8 @@ pub fn Store(comptime Raw: type) type {
                 switch (command) {
                     .none => unreachable,
                     .begin => |modes| {
+                        const fresh = !self.in_transaction;
                         if (comptime has_engine_session) {
-                            const fresh = !self.in_transaction;
                             try self.beginTransaction();
                             // BEGIN inside a block only warns (its modes are ignored).
                             if (fresh) try self.db().beginModes(self.tx.?, modes);
@@ -1135,16 +1395,21 @@ pub fn Store(comptime Raw: type) type {
                             if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
                             try self.beginTransaction();
                         }
+                        if (!fresh) self.warn("25001", "there is already a transaction in progress");
                         result.clear(0);
                         result.command = .begin;
                     },
                     .commit => {
+                        const was_open = self.in_transaction;
                         try self.commitTransaction();
+                        if (!was_open) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .commit;
                     },
                     .rollback => {
+                        const was_open = self.in_transaction;
                         try self.rollbackTransaction();
+                        if (!was_open) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .rollback;
                     },
@@ -1207,11 +1472,13 @@ pub fn Store(comptime Raw: type) type {
                         self.base = self.saved[depth].base;
                         self.saved_len = depth + 1;
                         self.failed = false;
+                        self.refreshTransactionTimeout();
                         result.clear(0);
                         result.command = .rollback;
                     },
                     .set => |set| {
                         if (self.failed) return error.TransactionFailed;
+                        if (set.local and !self.in_transaction) self.warn("25P01", "SET LOCAL can only be used in transaction blocks");
                         const which = parameter(set.name.slice()) orelse {
                             if (comptime !has_engine_session) return error.UndefinedSetting;
                             try self.db().sessionSet(self.blockSlot(), set.local, set.name.slice(), set.kind, set.value.slice());
@@ -1219,7 +1486,11 @@ pub fn Store(comptime Raw: type) type {
                             result.command = .set;
                             return;
                         };
-                        try self.applySet(which, set.local, set.kind == .default, if (set.kind == .default) "" else set.value.slice());
+                        var placement_word: @TypeOf(set.value.bytes) = undefined;
+                        const value = if (set.kind == .default) "" else if (set.kind == .word and
+                            (which == .default_table_access_method or which == .default_tablespace))
+                            placementName(set.value.slice(), &placement_word) else set.value.slice();
+                        try self.applySet(which, set.local, set.kind == .default, value);
                         result.clear(0);
                         result.command = .set;
                     },
@@ -1229,6 +1500,7 @@ pub fn Store(comptime Raw: type) type {
                             // Outside a block SET TRANSACTION only warns.
                             if (self.in_transaction) try self.db().setTransaction(self.tx.?, modes);
                         } else if (modes.isolation == .repeatable_read or modes.isolation == .serializable) return error.UnsupportedStatement;
+                        if (!self.in_transaction) self.warn("25P01", "SET TRANSACTION can only be used in transaction blocks");
                         result.clear(0);
                         result.command = .set;
                     },
@@ -1262,6 +1534,7 @@ pub fn Store(comptime Raw: type) type {
                             self.settings = self.startup;
                             self.base = self.startup;
                         }
+                        self.refreshTransactionTimeout();
                         result.clear(0);
                         result.command = .reset;
                     },
@@ -1272,6 +1545,10 @@ pub fn Store(comptime Raw: type) type {
                 switch (which) {
                     .lock_timeout => target.lock_timeout_ms = source.lock_timeout_ms,
                     .statement_timeout => target.statement_timeout_ms = source.statement_timeout_ms,
+                    .idle_in_transaction_session_timeout => target.idle_in_transaction_session_timeout_ms = source.idle_in_transaction_session_timeout_ms,
+                    .transaction_timeout => target.transaction_timeout_ms = source.transaction_timeout_ms,
+                    .xmloption => target.xml_document = source.xml_document,
+                    .client_min_messages => target.client_min_messages = source.client_min_messages,
                     .application_name => {
                         target.application_name = source.application_name;
                         target.application_name_len = source.application_name_len;
@@ -1282,6 +1559,8 @@ pub fn Store(comptime Raw: type) type {
                         target.zone = source.zone;
                     },
                     .datestyle => target.date_order = source.date_order,
+                    .extra_float_digits => target.extra_float_digits = source.extra_float_digits,
+                    .default_tablespace => target.explicit_default_tablespace = source.explicit_default_tablespace,
                     else => {},
                 }
             }
@@ -1294,6 +1573,7 @@ pub fn Store(comptime Raw: type) type {
                 if (implicit) {
                     self.db().abort(slot);
                     self.tx = null;
+                    self.transaction_deadline_ns = null;
                 } else {
                     self.db().failScope(slot);
                     self.failed = true;
@@ -1337,6 +1617,7 @@ pub fn Store(comptime Raw: type) type {
                 self.cancel_requested = false;
                 if (implicit) {
                     self.tx = null;
+                    self.transaction_deadline_ns = null;
                     try self.store.commit(slot);
                     self.store.database.lastOutcomeInto(result);
                 }
@@ -1351,8 +1632,10 @@ pub fn Store(comptime Raw: type) type {
                         self.execution.reset(self.store.max_query_work);
                         self.execution.context = self;
                         self.execution.poll = &pollExecution;
-                        const now = if (self.store.monotonic_clock) |clock| clock() else self.store.now_ns;
-                        self.execution_deadline_ns = if (self.settings.statement_timeout_ms != 0) now + @as(i64, self.settings.statement_timeout_ms) * 1000000 else null;
+                        const statement = self.settings.statement_timeout_ms;
+                        const transaction = self.settings.transaction_timeout_ms;
+                        self.execution_deadline_ns = if (statement != 0 and (transaction == 0 or statement < transaction))
+                            self.monotonicNow() +| (@as(i64, statement) * 1000000) else null;
                         self.cancel_requested = false;
                     }
                 }
@@ -1379,6 +1662,10 @@ pub fn Store(comptime Raw: type) type {
                     // transaction's own refusal stays 25006.
                     return if (err == error.ReadOnlyTransaction and !writes) error.StorageUnavailable else err;
                 };
+                self.checkExecutionTimeout() catch |err| {
+                    self.terminal(implicit);
+                    return err;
+                };
                 return self.finish(slot, implicit, result);
             }
 
@@ -1386,23 +1673,23 @@ pub fn Store(comptime Raw: type) type {
                 const self: *Connection = @ptrCast(@alignCast(context.?));
                 if (self.store.interrupt_poll) |poll| poll(self.store.interrupt_context, self.id);
                 if (self.cancel_requested) return error.QueryCanceled;
-                if (self.execution_deadline_ns) |deadline| {
-                    const now = if (self.store.monotonic_clock) |clock| clock() else self.store.now_ns;
-                    if (now >= deadline) return error.QueryCanceled;
-                }
+                return self.checkExecutionTimeout();
+            }
+
+            fn checkExecutionTimeout(self: *const Connection) error{QueryCanceled, TransactionTimeout}!void {
+                if (self.execution_deadline_ns == null and self.transaction_deadline_ns == null) return;
+                const now = self.monotonicNow();
+                const transaction = self.transaction_deadline_ns orelse std.math.maxInt(i64);
+                const statement = self.execution_deadline_ns orelse std.math.maxInt(i64);
+                if (self.transaction_deadline_ns != null and transaction <= statement and now >= transaction) return error.TransactionTimeout;
+                if (self.execution_deadline_ns != null and now >= statement) return error.QueryCanceled;
             }
 
             /// A re-delivered statement is still waiting: apply its timers.
             fn stillBlocked(self: *Connection, slot: u16, implicit: bool) !void {
                 self.rewait(slot);
                 const now = self.store.now_ns;
-                var outcome: ?anyerror = null;
-                if (self.pending.statement_deadline_ns) |at| {
-                    if (now >= at) outcome = error.QueryCanceled;
-                }
-                if (outcome == null) if (self.pending.lock_deadline_ns) |at| {
-                    if (now >= at) outcome = error.LockNotAvailable;
-                };
+                var outcome = self.pendingTimeout();
                 if (outcome == null and !self.pending.deadlock_checked and now >= self.pending.deadlock_check_ns) {
                     self.pending.deadlock_checked = true;
                     if (self.store.database.deadlocked(slot)) outcome = error.DeadlockDetected;
@@ -1416,9 +1703,35 @@ pub fn Store(comptime Raw: type) type {
                 return error.WouldBlock;
             }
 
+            fn pendingTimeout(self: *Connection) ?anyerror {
+                const now = self.monotonicNow();
+                var outcome: ?anyerror = null;
+                var earliest: i64 = std.math.maxInt(i64);
+                if (self.transaction_deadline_ns) |at| if (at <= now) {
+                    outcome = error.TransactionTimeout;
+                    earliest = at;
+                };
+                if (self.pending.lock_deadline_ns) |at| if (at <= now and at < earliest) {
+                    outcome = error.LockNotAvailable;
+                    earliest = at;
+                };
+                if (self.pending.statement_deadline_ns) |at| if (at <= now and at < earliest) {
+                    outcome = error.QueryCanceled;
+                };
+                return outcome;
+            }
+
+            fn checkPendingTimeout(self: *Connection, slot: u16, implicit: bool) !void {
+                const timeout = self.pendingTimeout() orelse return;
+                self.db().abortStatement(slot);
+                self.terminal(implicit);
+                return timeout;
+            }
+
             fn resumeStatement(self: *Connection, source: []const u8, result: *Result) !void {
                 const slot = self.tx.?;
                 const implicit = self.pending.implicit;
+                try self.checkPendingTimeout(slot, implicit);
                 if (fingerprint(source) != self.pending.fingerprint or self.cancel_requested) {
                     // A different statement while one is parked is an
                     // internal invariant failure; either way it is canceled.
@@ -1435,6 +1748,7 @@ pub fn Store(comptime Raw: type) type {
             /// (never executes). COPY TO writes its SELECT into `select`.
             pub fn copyDescribe(self: *Connection, source: []const u8, select: []u8) !Raw.CopyInfo {
                 if (self.id == 0) return error.InvalidConnection;
+                if (!self.pending.active) try self.checkTransactionTimeout();
                 if (self.failed) return error.TransactionFailed;
                 if (self.pending.active and self.pending.copy) return error.QueryCanceled;
                 return self.db().copyInfo(self.tx, source, select);
@@ -1450,6 +1764,7 @@ pub fn Store(comptime Raw: type) type {
                 if (self.pending.active) {
                     const slot = self.tx.?;
                     const implicit = self.pending.implicit;
+                    try self.checkPendingTimeout(slot, implicit);
                     if (self.pending.copy or fingerprint(source) != self.pending.fingerprint or self.cancel_requested) {
                         self.db().abortStatement(slot);
                         self.terminal(implicit);
@@ -1476,6 +1791,7 @@ pub fn Store(comptime Raw: type) type {
                 const slot = if (self.tx) |slot| slot else blk: {
                     const slot = try self.db().begin();
                     self.tx = slot;
+                    self.refreshTransactionTimeout();
                     break :blk slot;
                 };
                 self.store.storageReady() catch |err| {
@@ -1502,6 +1818,7 @@ pub fn Store(comptime Raw: type) type {
             pub fn copyRow(self: *Connection, source: []const u8, fields: []const ?[]const u8) !void {
                 const slot = self.tx orelse return error.NoActiveTransaction;
                 if (self.pending.active) return error.QueryCanceled;
+                try self.checkTransactionTimeout();
                 self.db().copyBuild(slot, source, fields, &self.copy_row) catch |err| {
                     self.terminal(self.copy_implicit);
                     return err;
@@ -1536,6 +1853,7 @@ pub fn Store(comptime Raw: type) type {
                 if (!self.copyBlocked()) return;
                 const slot = self.tx.?;
                 const implicit = self.pending.implicit;
+                try self.checkPendingTimeout(slot, implicit);
                 if (self.cancel_requested) {
                     self.db().abortStatement(slot);
                     self.terminal(implicit);
@@ -1556,9 +1874,11 @@ pub fn Store(comptime Raw: type) type {
             pub fn copyEnd(self: *Connection) !usize {
                 const slot = self.tx orelse return error.NoActiveTransaction;
                 if (self.pending.active) return error.QueryCanceled;
+                try self.checkTransactionTimeout();
                 const rows = try self.db().copyEnd(slot);
                 if (self.copy_implicit) {
                     self.tx = null;
+                    self.transaction_deadline_ns = null;
                     try self.store.commit(slot);
                 }
                 return rows;
@@ -1593,10 +1913,11 @@ pub fn Store(comptime Raw: type) type {
             }
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
+                self.pending_notice = null;
                 if (self.id == 0) return error.InvalidConnection;
                 if (source.len == 0 or source.len > max_statement_bytes) return error.Syntax;
                 if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| {
-                    if(!self.detachedIdentity() or self.failed or self.in_transaction or self.tx!=null or !self.autocommit or self.pending.active or
+                    if(!self.detachedIdentity() or self.failed or self.in_transaction or self.tx!=null or !self.autocommit or self.pending.active or self.settings.transaction_timeout_ms != 0 or
                         context.database==null or context.database.?!=&self.store.database or !same(source,context.source)) return error.InvalidParameterValue;
                     // Metadata-only Describe invalidates executable preparation.
                     // Rebind under the same caller-held read snapshot before run.
@@ -1608,6 +1929,7 @@ pub fn Store(comptime Raw: type) type {
                     return context.run(result);
                 };
                 if (self.pending.active) return self.resumeStatement(source, result);
+                try self.checkTransactionTimeout();
                 // Bounded MySQL/TDS session commands. Long SQL still goes
                 // intact to the strict parser without a second SQL-sized copy.
                 var command: [256]u8 = undefined;
@@ -1682,6 +2004,7 @@ pub fn Store(comptime Raw: type) type {
                 const slot = if (self.tx) |slot| slot else blk: {
                     const slot = try self.db().begin();
                     self.tx = slot;
+                    self.refreshTransactionTimeout();
                     break :blk slot;
                 };
                 return self.run(source, result, slot, implicit, false);

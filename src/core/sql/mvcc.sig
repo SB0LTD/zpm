@@ -217,6 +217,8 @@ pub fn Mvcc(comptime config: types.Config) type {
                     },
                     .alter_table => {
                         const copy = &db.tables[entry.table];
+                        if (copy.pending_late_primary and copy.primary_index_oid != 0 and
+                            db.oid_counter + types_first_oid == copy.primary_index_oid + 1) db.oid_counter -= 1;
                         // Index OIDs this ALTER took, when still the tail.
                         var position = copy.index_count;
                         while (position > 0) {

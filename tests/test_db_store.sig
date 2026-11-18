@@ -656,13 +656,27 @@ fn timers() !void {
     try check(equal(out.rows[0].cells[0].text.slice(), "read committed"));
     try check(b.transactionStatus() == 'I');
     var startup: Store.Connection = .{ .store = &store, .id = 9 };
-    try startup.startupParameter("options", "-c statement_timeout=1000 -c lock_timeout=2s");
+    try startup.startupParameter("options", "-c statement_timeout=1000 -c lock_timeout=2s -c check_function_bodies=off");
     try startup.execute("SHOW statement_timeout", &out);
     try check(equal(out.rows[0].cells[0].text.slice(), "1s"));
     try startup.execute("SET statement_timeout = 5", &out);
     try startup.execute("RESET ALL", &out);
     try startup.execute("SHOW lock_timeout", &out);
     try check(equal(out.rows[0].cells[0].text.slice(), "2s"));
+    try startup.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "off"));
+    try startup.execute("BEGIN", &out);
+    try startup.execute("SET LOCAL check_function_bodies = on", &out);
+    try startup.execute("SAVEPOINT settings", &out);
+    try startup.execute("SET check_function_bodies = off", &out);
+    try startup.execute("ROLLBACK TO settings", &out);
+    try startup.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "on"));
+    try startup.execute("COMMIT", &out);
+    try startup.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "off"));
+    try b.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "on"));
 }
 
 fn savepoints() !void {
@@ -822,6 +836,50 @@ fn runningControl() !void {
     try quiescent(&store);
 }
 
+const RunningTransactionDeadline = struct {
+    store: *Store,
+    calls: usize = 0,
+    saw_private_changes: bool = false,
+
+    fn poll(context: ?*anyopaque, _: u64) void {
+        const self: *RunningTransactionDeadline = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        if (self.calls == 16) {
+            self.saw_private_changes = self.store.database.usage().pending_versions != 0;
+            self.store.now_ns += 10000000;
+        }
+    }
+};
+
+fn runningTransactionTimeout() !void {
+    var store: Store = .{};
+    var connection: Store.Connection = .{ .store = &store, .id = 1 };
+    var result: DB.Result = .{};
+    try connection.execute("CREATE TABLE t (id INT PRIMARY KEY, value INT)", &result);
+    try connection.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80)", &result);
+    try connection.execute("SET statement_timeout = 1", &result);
+    try connection.execute("SET transaction_timeout = 2", &result);
+    connection.execution.poll_interval = 1;
+    var advance: RunningTransactionDeadline = .{ .store = &store };
+    store.interrupt_context = &advance;
+    store.interrupt_poll = RunningTransactionDeadline.poll;
+    if (connection.execute("UPDATE t SET value = value + 100", &result)) |_| return error.RunningDeadlineIgnored else |err| try check(err == error.QueryCanceled);
+    try check(advance.calls == 16 and advance.saw_private_changes and connection.transactionDeadline() == null);
+    try quiescent(&store);
+    try connection.execute("SET transaction_timeout = 1", &result);
+    try connection.beginTransaction();
+    try check(connection.transactionDeadline() == store.now_ns + 1000000);
+    advance.calls = 0;
+    if (connection.execute("UPDATE t SET value = value + 100", &result)) |_| return error.RunningTransactionDeadlineIgnored else |err| try check(err == error.TransactionTimeout);
+    connection.terminateTimedOut();
+    try quiescent(&store);
+    try check(connection.id == 0);
+    store.interrupt_poll = null;
+    var witness: Store.Connection = .{ .store = &store, .id = 2 };
+    try witness.execute("SELECT * FROM t ORDER BY id", &result);
+    for (0..8) |row| try check(result.rows[row].cells[1].integer == @as(i64, @intCast((row + 1) * 10)));
+}
+
 fn interleavedCommitOwner() !void {
     var store: Store = .{};
     var owner: Store.Connection = .{ .store = &store, .id = 1 };
@@ -843,6 +901,95 @@ fn interleavedCommitOwner() !void {
     try check(!peer.takeNotification(&message));
 }
 
+fn xmlInputSetting() !void {
+    var store: Store = .{};
+    var document: Store.Connection = .{ .store = &store, .id = 1 };
+    var content: Store.Connection = .{ .store = &store, .id = 2 };
+    var out: DB.Result = .{};
+    const fragment = "SELECT 'before<r/>after'::xml";
+    try document.execute("SHOW xmloption", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "content"));
+    try document.execute("BEGIN", &out);
+    try document.execute("SET LOCAL XML OPTION DOCUMENT", &out);
+    try document.execute("SELECT current_setting('xmloption')", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "document"));
+    try document.execute("SELECT XMLPARSE(CONTENT 'before<r/>after')", &out);
+    try check(equal(out.rows[0].cells[0].xml.slice(), "before<r/>after"));
+    if (document.execute(fragment, &out)) |_| return error.FragmentAcceptedAsDocument else |err| try check(err == error.InvalidXmlDocument);
+    try document.execute("ROLLBACK", &out);
+    try document.execute(fragment, &out);
+    try check(equal(out.rows[0].cells[0].xml.slice(), "before<r/>after"));
+    try document.startupParameter("options", "-c xmloption=document");
+    try document.execute("SET xmloption = content", &out);
+    try document.execute("RESET xmloption", &out);
+    try document.execute("SHOW xmloption", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "document"));
+    try content.execute(fragment, &out);
+    try check(equal(out.rows[0].cells[0].xml.slice(), "before<r/>after"));
+    try document.execute("CREATE TABLE markup (payload XML)", &out);
+    _ = try document.copyBegin("COPY markup FROM STDIN");
+    const fields = [_]?[]const u8{"<a/><b/>"};
+    if (document.copyRow("COPY markup FROM STDIN", &fields)) |_| return error.InvalidCopyDocumentAccepted else |err| try check(err == error.InvalidXmlDocument);
+    try quiescent(&store);
+}
+
+fn clientNotices() !void {
+    const Level = store_module.ClientMessageLevel;
+    try check(Level.info.visibleAt(.@"error"));
+    try check(Level.@"error".visibleAt(.@"error") and Level.fatal.visibleAt(.@"error"));
+    try check(!Level.warning.visibleAt(.@"error") and Level.warning.visibleAt(.warning));
+    try check(Level.log.visibleAt(.debug1) and !Level.log.visibleAt(.notice));
+    var store: Store = .{};
+    var connection: Store.Connection = .{ .store = &store, .id = 1 };
+    var out: DB.Result = .{};
+    try connection.execute("COMMIT", &out);
+    const warning = connection.takeNotice() orelse return error.MissingCommitWarning;
+    try check(warning.level == .warning and equal(warning.state, "25P01"));
+    try check(connection.takeNotice() == null);
+    try connection.execute("SET client_min_messages = 'error'", &out);
+    try connection.execute("ROLLBACK", &out);
+    try check(connection.takeNotice() == null);
+    try connection.execute("SHOW client_min_messages", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "error"));
+    try connection.execute("RESET client_min_messages", &out);
+    try connection.execute("SET LOCAL check_function_bodies = off", &out);
+    try check(connection.takeNotice() != null);
+    try connection.execute("SHOW check_function_bodies", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "on"));
+}
+
+fn relationRestrictions() !void {
+    var store: Store = .{};
+    var limited: Store.Connection = .{ .store = &store, .id = 1 };
+    var other: Store.Connection = .{ .store = &store, .id = 2 };
+    var out: DB.Result = .{};
+    const scan = "SELECT id FROM public.restricted_v";
+    try limited.execute("CREATE TABLE restriction_base (id INT PRIMARY KEY)", &out);
+    try limited.execute("INSERT INTO restriction_base VALUES (31)", &out);
+    try limited.execute("CREATE VIEW restricted_v AS SELECT id FROM restriction_base", &out);
+    try limited.execute("SHOW restrict_nonsystem_relation_kind", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), ""));
+    try limited.execute("BEGIN", &out);
+    try limited.execute("SET LOCAL restrict_nonsystem_relation_kind = 'VIEW, foreign-table'", &out);
+    try limited.describe("SELECT id FROM restriction_base", &out);
+    if (limited.describe(scan, &out)) |_| return error.UnsafeViewDescribe else |err| try check(err == error.RestrictedNonSystemView);
+    if (limited.execute(scan, &out)) |_| return error.UnsafeViewRead else |err| try check(err == error.RestrictedNonSystemView);
+    try other.execute(scan, &out);
+    try check(out.row_count == 1 and out.rows[0].cells[0].integer == 31);
+    try limited.execute("ROLLBACK", &out);
+    try limited.execute(scan, &out);
+    try check(out.row_count == 1 and out.rows[0].cells[0].integer == 31);
+    try limited.execute("SET restrict_nonsystem_relation_kind TO view, 'foreign-table'", &out);
+    try limited.execute("SHOW restrict_nonsystem_relation_kind", &out);
+    try check(equal(out.rows[0].cells[0].text.slice(), "view, foreign-table"));
+    if (limited.execute("SET restrict_nonsystem_relation_kind = 'view, bogus'", &out)) |_| return error.UnknownRelationKindAccepted else |err| try check(err == error.InvalidSettingValue);
+    if (limited.execute("INSERT INTO restricted_v VALUES (32)", &out)) |_| return error.UnsafeViewWrite else |err| try check(err == error.RestrictedNonSystemView);
+    try limited.execute("SELECT count(*) FROM pg_catalog.pg_views WHERE viewname = 'restricted_v'", &out);
+    try check(out.row_count == 1 and out.rows[0].cells[0].integer == 1);
+    try limited.execute("DROP VIEW restricted_v", &out);
+    try quiescent(&store);
+}
+
 pub fn main() !void {
     try transactions();
     try durability();
@@ -853,7 +1000,11 @@ pub fn main() !void {
     try timers();
     try savepoints();
     try runningControl();
+    try runningTransactionTimeout();
     try interleavedCommitOwner();
+    try xmlInputSetting();
+    try clientNotices();
+    try relationRestrictions();
     try check(assertions >= 2177);
     std.debug.print("store: {d} assertions passed\n", .{assertions});
 }

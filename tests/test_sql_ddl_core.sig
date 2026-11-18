@@ -654,6 +654,100 @@ fn alterConstraints() !void {
     try sameState(&.{ "SELECT * FROM a ORDER BY id, q", "SELECT oid, relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY oid", "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'a' ORDER BY constraint_name" });
 }
 
+fn alterPrimaryKey() !void {
+    reset();
+    try run("CREATE SCHEMA restore_keys");
+    try run("CREATE TABLE restore_keys.parent (id INT, label TEXT)");
+    try run("INSERT INTO restore_keys.parent VALUES (1,'north'),(1,'south'),(NULL,'east')");
+    const rows_sql = "SELECT id, label FROM restore_keys.parent ORDER BY label";
+    const add_key = "ALTER TABLE ONLY restore_keys.parent ADD CONSTRAINT parent_pkey PRIMARY KEY (id)";
+    try run("UPDATE restore_keys.parent SET id=3 WHERE label='east'");
+    try rejects(add_key, error.PrimaryKeyViolation, rows_sql, "3|east;1|north;1|south");
+    try run("UPDATE restore_keys.parent SET id=2 WHERE label='south'");
+    try run("UPDATE restore_keys.parent SET id=NULL WHERE label='east'");
+    try rejects(add_key, error.NotNullViolation, rows_sql, "NULL|east;1|north;2|south");
+    try run("UPDATE restore_keys.parent SET id=3 WHERE label='east'");
+
+    const older = try db.begin();
+    try db.beginModes(older, .{ .isolation = .repeatable_read });
+    try same(try rows(older, "SELECT COUNT(*) FROM restore_keys.parent"), "3");
+    try run("INSERT INTO restore_keys.parent VALUES (NULL,'west')");
+    try statementFails(older, add_key, error.NotNullViolation);
+    db.abort(older);
+    try run("DELETE FROM restore_keys.parent WHERE label='west'");
+    try run(add_key);
+    try expect("SELECT label FROM restore_keys.parent WHERE id = 2", "south");
+    try rejects("ALTER TABLE restore_keys.parent ADD PRIMARY KEY (label)", error.InvalidTableDefinition, rows_sql, "3|east;1|north;2|south");
+    try rejects("INSERT INTO restore_keys.parent VALUES (1,'west')", error.PrimaryKeyViolation, rows_sql, "3|east;1|north;2|south");
+    try rejects("INSERT INTO restore_keys.parent VALUES (NULL,'west')", error.NotNullViolation, rows_sql, "3|east;1|north;2|south");
+    const metadata = "SELECT constraint_name FROM information_schema.table_constraints WHERE table_schema='restore_keys' AND table_name='parent' AND constraint_type='PRIMARY KEY'";
+    try expect(metadata, "parent_pkey");
+    try run("CREATE TABLE restore_keys.child (id INT, parent_id INT)");
+    try run("INSERT INTO restore_keys.child VALUES (11,2),(12,1)");
+    try run("ALTER TABLE ONLY restore_keys.child ADD PRIMARY KEY (id)");
+    try run("ALTER TABLE ONLY restore_keys.child ADD CONSTRAINT child_parent_fk FOREIGN KEY (parent_id) REFERENCES restore_keys.parent(id)");
+    const joined = "SELECT c.id,p.label FROM restore_keys.child c JOIN restore_keys.parent p ON p.id=c.parent_id ORDER BY c.id";
+    try rejects("INSERT INTO restore_keys.child VALUES (13,99)", error.ForeignKeyViolation, joined, "11|south;12|north");
+    try sameState(&.{ rows_sql, metadata, joined });
+
+    try run("CREATE TABLE pairs (a INT, b INT)");
+    try run("INSERT INTO pairs VALUES (1,1),(1,2),(2,1)");
+    const pair_query = "SELECT a,b FROM pairs ORDER BY a,b";
+    try rejects("ALTER TABLE pairs ADD PRIMARY KEY (a,b)", error.UnsupportedStatement, pair_query, "1|1;1|2;2|1");
+    try sameState(&.{pair_query});
+}
+
+fn latePrimaryRecordFence() !void {
+    reset();
+    try run("CREATE TABLE mixed (id INT)");
+    try run("INSERT INTO mixed VALUES (1)");
+    const late = "ALTER TABLE mixed ADD PRIMARY KEY (id)";
+    const first = try db.begin();
+    try statement(first, "INSERT INTO mixed VALUES (2)");
+    try statementFails(first, late, error.UnsupportedStatement);
+    db.abort(first);
+    const second = try db.begin();
+    try statement(second, late);
+    try statementFails(second, "INSERT INTO mixed VALUES (2)", error.UnsupportedStatement);
+    db.abort(second);
+    try rejects("ALTER TABLE mixed ADD PRIMARY KEY (id), ADD COLUMN another INT", error.UnsupportedStatement,
+        "SELECT id FROM mixed", "1");
+
+    var late_bytes: [4096]u8 = undefined;
+    const late_record = try recordOf(late, &late_bytes);
+    const prior = replica.csn;
+    var out: DB.Result = .{};
+    const table_oid: u32 = @intCast(try int(&replica, "SELECT oid FROM pg_class WHERE relname='mixed'"));
+    const op_count = std.mem.readInt(u32, late_record[4..8], .little);
+    var malformed: [4096]u8 = undefined;
+    for ([_]bool{ false, true }) |truncate_first| {
+        @memcpy(malformed[0..8], late_record[0..8]);
+        std.mem.writeInt(u32, malformed[4..8], op_count + 1, .little);
+        const at = if (truncate_first) @as(usize, 8) else late_record.len;
+        malformed[at] = 11;
+        std.mem.writeInt(u32, malformed[at + 1 ..][0..4], table_oid, .little);
+        const payload = if (truncate_first) @as(usize, 13) else 8;
+        @memcpy(malformed[payload..][0 .. late_record.len - 8], late_record[8..]);
+        if (replica.applyChangeRecord(malformed[0 .. late_record.len + 5], &scratch)) |_| return error.MixedLatePrimaryReplayAccepted else |err| try check(err == error.ChangeRecordConflict);
+        try check(replica.csn == prior);
+        try same(try query(&replica, "SELECT id FROM mixed"), "1");
+    }
+    const active = try replica.begin();
+    if (replica.applyChangeRecord(late_record, &scratch)) |_| return error.ConcurrentLatePrimaryReplayAccepted else |err| try check(err == error.ChangeRecordConflict);
+    replica.abort(active);
+    try replica.execute("INSERT INTO mixed VALUES (1)", &out);
+    if (replica.applyChangeRecord(late_record, &scratch)) |_| return error.DuplicateReplayPrimaryKeyAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try check(replica.csn == prior + 1);
+    try same(try query(&replica, "SELECT COUNT(*) FROM mixed"), "2");
+    // A failed borrow must leave an empty bank available for a retry.
+    try replica.execute("DELETE FROM mixed", &out);
+    try replica.execute("INSERT INTO mixed VALUES (NULL)", &out);
+    if (replica.applyChangeRecord(late_record, &scratch)) |_| return error.NullReplayPrimaryKeyAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try replica.execute("UPDATE mixed SET id=1", &out);
+    try replica.applyChangeRecord(late_record, &scratch);
+    try same(try query(&replica, "SELECT id FROM mixed"), "1");
+}
+
 fn alterErrors() !void {
     reset();
     try run("CREATE TABLE a (id INT PRIMARY KEY, v INT)");
@@ -1206,13 +1300,16 @@ fn prefixesRejected(bytes: []const u8, probe: []const u8) !void {
 fn walFormats() !void {
     reset();
     var buffer: [4096]u8 = undefined;
-    // Tables without constraints keep the version-1 definition bytes and
-    // op 7 for CACHE 1 sequences: older readers and logs are unaffected.
-    var bytes = try recordOf("CREATE TABLE plain (id INT PRIMARY KEY, v TEXT)", &buffer);
+    // Plain tables still use v1. Persisted primary and CHECK constraint
+    // identities use v4, including keys with the legacy index alias.
+    var bytes = try recordOf("CREATE TABLE loose (id INT)", &buffer);
     try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 1 and bytes[20] == 0);
     try replica.applyChangeRecord(bytes, &scratch);
+    bytes = try recordOf("CREATE TABLE plain (id INT PRIMARY KEY, v TEXT)", &buffer);
+    try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 4 and bytes[20] == 0);
+    try replica.applyChangeRecord(bytes, &scratch);
     bytes = try recordOf("CREATE TABLE chk_t (id INT CHECK (id > 0))", &buffer);
-    try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 2 and bytes[20] == 0);
+    try check(bytes[8] == 1 and bytes[13] == 5 and bytes[19] == 4 and bytes[20] == 0);
     try replica.applyChangeRecord(bytes, &scratch);
     bytes = try recordOf("CREATE SEQUENCE one_cache", &buffer);
     try check(bytes[8] == 7);
@@ -1268,6 +1365,8 @@ pub fn main(init: std.process.Init) !void {
     try compositeKeys();
     try alterValues();
     try alterConstraints();
+    try alterPrimaryKey();
+    try latePrimaryRecordFence();
     try alterErrors();
     try alterTransactions();
     try alterIsolation();
