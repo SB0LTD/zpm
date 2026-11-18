@@ -7,6 +7,7 @@ const x25519 = @import("x25519");
 const key_schedule = @import("tls13_keys").KeySchedule;
 const hello = @import("client_hello.sig");
 const record = @import("record.sig");
+const application = @import("application.sig");
 const x509 = @import("x509.sig");
 
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
@@ -22,7 +23,7 @@ const record_overhead = record.header_bytes + 1 + 16;
 const compatibility_ccs = [_]u8{ 20, 3, 3, 0, 1, 1 };
 const certificate_verify_prefix = ([_]u8{0x20} ** 64) ++ "TLS 1.3, server CertificateVerify\x00";
 
-pub const Error = hello.Error || record.Error || error{
+pub const Error = hello.Error || application.Error || error{
     InvalidCertificate,
     InvalidPrivateKey,
     EntropyUnavailable,
@@ -76,10 +77,7 @@ pub const FrameRead = union(enum) {
     need: usize,
     consumed: usize,
 };
-pub const Application = struct {
-    send: record.RecordKeys,
-    receive: record.RecordKeys,
-};
+pub const Application = application.Application;
 
 pub const Server = struct {
     identity: *const Identity,
@@ -189,10 +187,7 @@ pub const Server = struct {
         const application_hash = digest(transcript);
         self.expected_finished = key_schedule.computeFinished(&client_secret, &application_hash);
         schedule.deriveApplicationSecrets(&application_hash, &client_secret, &server_secret);
-        self.application = .{
-            .send = try record.keysForSuite(suite, &server_secret),
-            .receive = try record.keysForSuite(suite, &client_secret),
-        };
+        self.application = try Application.init(suite, &server_secret, &client_secret);
 
         var body = flight.written();
         while (body.len != 0) {
@@ -272,7 +267,7 @@ pub const Server = struct {
     }
 
     fn clearApplication(self: *Server) void {
-        if (self.application) |*keys| std.crypto.secureZero(u8, std.mem.asBytes(keys));
+        if (self.application) |*keys| keys.close();
         self.application = null;
     }
 
@@ -404,10 +399,7 @@ test "an authenticated record with wrong Finished closes the exchange" {
     server.phase = .client_finished;
     server.client_handshake = try record.keysForSuite(suite, &secret);
     server.expected_finished = @splat(0x19);
-    server.application = .{
-        .send = try record.keysForSuite(suite, &secret),
-        .receive = try record.keysForSuite(suite, &secret),
-    };
+    server.application = try Application.init(suite, &secret, &secret);
     try testing.expectError(error.UnexpectedMessage, server.takeApplication());
     var compat = compatibility_ccs;
     try testing.expectEqual(FrameRead{ .consumed = compatibility_ccs.len }, try server.receive(&compat));

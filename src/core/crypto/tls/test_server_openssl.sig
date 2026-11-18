@@ -68,25 +68,29 @@ pub fn main() !void {
         if (server.phase == .server_flight) try writeAll(try server.emitFlight(&flight, &output));
     }
     var application = try server.takeApplication();
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&application));
+    defer application.close();
     var observed: [expected.len]u8 = undefined;
     var length: usize = 0;
     while (length < expected.len) {
         switch (try record.frame(input.bytes[0..input.used])) {
             .incomplete => try input.readNext(),
             .complete => |count| {
-                const decoded = try application.receive.openProtected(input.bytes[0..count]);
-                if (decoded.content_type != .application_data) return error.TestWrongRecord;
-                if (decoded.content.len > expected.len - length) return error.TestWrongPayload;
-                @memcpy(observed[length..][0..decoded.content.len], decoded.content);
-                length += decoded.content.len;
+                switch (try application.open(input.bytes[0..count])) {
+                    .data => |bytes| {
+                        if (bytes.len > expected.len - length) return error.TestWrongPayload;
+                        @memcpy(observed[length..][0..bytes.len], bytes);
+                        length += bytes.len;
+                    },
+                    .handshake_fragment, .key_update, .user_canceled => {},
+                    .close_notify => return error.TestWrongRecord,
+                }
                 input.consume(count);
             },
         }
     }
     if (!std.mem.eql(u8, expected, &observed)) return error.TestWrongPayload;
+    try writeAll(try application.sealUpdate(&output, false));
     @memcpy(output[record.header_bytes..][0..response.len], response);
-    try writeAll(try application.send.sealProtected(&output, .application_data, response.len, 0));
-    output[record.header_bytes..][0..2].* = .{ 1, 0 }; // close_notify
-    try writeAll(try application.send.sealProtected(&output, .alert, 2, 0));
+    try writeAll(try application.sealData(&output, response.len));
+    try writeAll(try application.sealAlert(&output, 0));
 }

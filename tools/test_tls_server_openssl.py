@@ -135,7 +135,10 @@ def main():
     directory = Path(tempfile.mkdtemp(prefix="tls-server-openssl-", dir=args.work_dir.resolve()))
 
     tests = run_logged(sig_command(args, "test", "server.sig", directory), directory / "unit.log")
-    for name in (b"fragmented RFC 8448 ClientHello", b"an authenticated record with wrong Finished"):
+    for name in (b"fragmented RFC 8448 ClientHello", b"an authenticated record with wrong Finished",
+                 b"application rekeys only after the complete old-key message",
+                 b"application rejects invalid key updates",
+                 b"application reserves the last send record"):
         if not any(name in line and line.endswith(b"...OK") for line in tests.splitlines()):
             raise RuntimeError(f"Sig did not execute and pass {name!r}. See {directory / 'unit.log'}")
     ca, fixture = identity(args.openssl, directory)
@@ -148,7 +151,7 @@ def main():
         "sig": capture([args.sig, "version"]).decode().strip(),
         "openssl": capture([args.openssl, "version"]).decode().strip(),
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        "received": received,
+        "received_after_key_update": received,
     }
     (directory / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report))
