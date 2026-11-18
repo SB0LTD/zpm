@@ -1076,8 +1076,16 @@ pub fn Store(comptime Raw: type) type {
                         var equals: usize = 0;
                         while (equals < item.len and item[equals] != '=') equals += 1;
                         if (equals == 0 or equals == item.len) return error.InvalidSettingValue;
-                        const which = parameter(item[0..equals]) orelse return error.UndefinedSetting;
-                        try self.assign(&self.settings, which, item[equals + 1 ..], true);
+                        const name = item[0..equals];
+                        const option = item[equals + 1 ..];
+                        if (parameter(name)) |which| {
+                            try self.assign(&self.settings, which, option, true);
+                        } else {
+                            if (comptime @hasDecl(Raw, "sessionStartupSetting")) {
+                                if (try self.db().sessionStartupSetting(name, option)) continue;
+                            }
+                            return error.UndefinedSetting;
+                        }
                     }
                 } else return;
                 self.base = self.settings;

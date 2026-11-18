@@ -886,7 +886,32 @@ fn triggerDefinitions() !void {
     try sameState(&.{metadata, pretty, full, count});
 }
 
+fn bodyValidationSetting() !void {
+    reset();
+    const create = "CREATE FUNCTION deferred_body() RETURNS integer LANGUAGE SQL AS $$SELECT body_helper()$$";
+    const procedure = "CREATE PROCEDURE deferred_proc() LANGUAGE SQL AS $$INSERT INTO body_dependency VALUES (31)$$";
+    try expect("SHOW check_function_bodies", "on");
+    try fails("SET check_function_bodies = 'perhaps'", error.InvalidSettingValue);
+    try fails(create, error.UndefinedFunction);
+    try fails(procedure, error.TableNotFound);
+    try expect("SELECT set_config('check_function_bodies', 'off', false)", "off");
+    try run(create);
+    try run(procedure);
+    try expect("RESET check_function_bodies", "");
+    try expect("SHOW check_function_bodies", "on");
+    try fails("SELECT deferred_body()", error.UndefinedFunction);
+    try fails("CALL deferred_proc()", error.TableNotFound);
+    try run("CREATE FUNCTION body_helper() RETURNS integer LANGUAGE SQL AS $$SELECT 31$$");
+    try run("CREATE TABLE body_dependency (value integer)");
+    try run("CALL deferred_proc()");
+    try expect("SELECT deferred_body()", "31");
+    try same(try query(&replica, "SELECT deferred_body()"), "31");
+    try expect("SELECT value FROM body_dependency", "31");
+    try same(try query(&replica, "SELECT value FROM body_dependency"), "31");
+}
+
 pub fn main() !void {
+    try bodyValidationSetting();
     try oraclePrograms();
     try sqlFunctions();
     try plpgsqlFunctions();
