@@ -1499,6 +1499,15 @@ fn partitionDefinitions() !void {
     try sameState(&.{ renamed, children });
 }
 
+fn qualifiedCatalogCasts() !void {
+    reset();
+    try expect("SELECT NULL::pg_catalog.int2[] IS NULL, pg_typeof(CAST(ARRAY[1,2] AS pg_catalog.int2[]))::text", "t|smallint[]");
+    try expect("SELECT '{1,2}'::pg_catalog.\"_int2\"::text, 42::pg_catalog.int4", "{1,2}|42");
+    try expect("SELECT s FROM pg_catalog.generate_series(0,pg_catalog.array_upper(ARRAY[8,2]::pg_catalog.int2[],1)) s ORDER BY s", "0;1;2");
+    try rejects("SELECT 1::pg_catalog.integer", error.UndefinedObject, "SELECT 1::pg_catalog.int4", "1");
+    try rejects("SELECT 1::pg_catalog.\"Int4\"", error.UndefinedObject, "SELECT 1::pg_catalog.int4", "1");
+}
+
 pub fn main() !void {
     try secondaryIndexes();
     try indexCapacity();
@@ -1524,5 +1533,6 @@ pub fn main() !void {
     try statisticsDefinitions();
     try publicationMembership();
     try partitionDefinitions();
+    try qualifiedCatalogCasts();
     std.debug.print("schema objects: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

@@ -3888,17 +3888,13 @@ pub fn Parser(comptime config: types.Config) type {
                 const schema = identText(self.source, qualifier, &schema_buffer) orelse "";
                 const name = identText(self.source, named.name, &name_buffer) orelse "";
                 if (types.same(schema, "pg_catalog")) {
-                    const scalar: ?TypeSpec =
-                        if (types.same(name, "text")) .{ .ty = .text }
-                        else if (types.same(name, "oid")) .{ .ty = .oid }
-                        else if (types.same(name, "regclass")) .{ .ty = .oid, .typmod = ast.regclass_typmod }
+                    const scalar: TypeSpec =
+                        if (types.same(name, "regclass")) .{ .ty = .oid, .typmod = ast.regclass_typmod }
                         else if (types.same(name, "regnamespace")) .{ .ty = .oid, .typmod = ast.regnamespace_typmod }
                         else if (types.same(name, "regtype")) .{ .ty = .oid, .typmod = ast.regtype_typmod }
-                        else null;
-                    if (scalar) |type_spec| {
-                        const target = try self.typeArraySuffix(type_spec);
-                        return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
-                    }
+                        else .{ .ty = types.typeOfData(types.typeByCatalogName(name) orelse return error.UndefinedObject) };
+                    const target = try self.typeArraySuffix(scalar);
+                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
                 }
             };
             if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
