@@ -1183,6 +1183,14 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
                 }
+                if (self.rawWord("xml") and wordIs(self.source, try self.peek(), "option")) {
+                    try self.advance();
+                    try self.advance();
+                    if (!self.rawWord("document") and !self.rawWord("content")) return error.Syntax;
+                    const value = try self.settingValue();
+                    try self.finish();
+                    return .{ .set = .{ .local = local, .name = .{ .special = .xml_option }, .value = value } };
+                }
                 // SET [LOCAL | SESSION] ROLE { name | NONE } (gram.y; the
                 // catalog-security lane resolves it as the `role` setting).
                 if (self.rawWord("role")) {
@@ -1280,14 +1288,14 @@ pub fn Parser(comptime config: types.Config) type {
                 },
                 .integer, .decimal => {
                     try self.advance();
-                    return .{ .kind = .number, .span = .{ .start = token.start, .len = token.end - token.start } };
+                    return .{ .kind = .number, .span = .{ .start = token.start, .len = token.end - token.start }, .integer = token.kind == .integer };
                 },
-                .symbol => if (token.symbol == .minus) {
+                .symbol => if (token.symbol == .minus or token.symbol == .plus) {
                     try self.advance();
                     const number = self.current;
                     if (number.kind != .integer and number.kind != .decimal) return error.Syntax;
                     try self.advance();
-                    return .{ .kind = .number, .span = .{ .start = token.start, .len = number.end - token.start } };
+                    return .{ .kind = .number, .span = .{ .start = number.start, .len = number.end - number.start }, .number_sign = if (token.symbol == .minus) '-' else '+', .integer = number.kind == .integer };
                 },
                 else => {},
             }
@@ -1574,7 +1582,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
-                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype => true,
+                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
                 else => false,
@@ -1625,7 +1633,11 @@ pub fn Parser(comptime config: types.Config) type {
         /// A type name with an optional array suffix: `[]`, `[n]` (repeated;
         /// sizes and dimensions are ignored) or `ARRAY [n]`.
         fn typeName(self: *Self) Error!TypeSpec {
-            var spec = try self.scalarTypeName();
+            return self.typeArraySuffix(try self.scalarTypeName());
+        }
+
+        fn typeArraySuffix(self: *Self, scalar: TypeSpec) Error!TypeSpec {
+            var spec = scalar;
             var array = false;
             while (self.isSymbol(.lbracket)) {
                 try self.advance();
@@ -1643,7 +1655,7 @@ pub fn Parser(comptime config: types.Config) type {
                 array = true;
             }
             if (array) {
-                if (spec.typmod == ast.regclass_typmod or spec.typmod == ast.regtype_typmod) return error.UnsupportedStatement;
+                if (ast.regKind(spec.typmod) != .none) return error.UnsupportedStatement;
                 spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
             }
             return spec;
@@ -1701,6 +1713,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .json => .{ .ty = .json },
                 .jsonb => .{ .ty = .jsonb },
                 .regclass => .{ .ty = .oid, .typmod = ast.regclass_typmod },
+                .regnamespace => .{ .ty = .oid, .typmod = ast.regnamespace_typmod },
                 .regtype => .{ .ty = .oid, .typmod = ast.regtype_typmod },
                 .varchar => .{ .ty = .varchar, .typmod = try self.characterLength(false) },
                 .bpchar => .{ .ty = .bpchar, .typmod = try self.characterLength(false) },
@@ -3058,7 +3071,9 @@ pub fn Parser(comptime config: types.Config) type {
             try self.fromItem(out, .first);
             while (self.mode == .standard) {
                 if (try self.takeSymbol(.comma)) {
+                    const start = out.item_count;
                     try self.fromItem(out, .cross);
+                    out.items[start].comma_separated = true;
                     continue;
                 }
                 if (!try self.joinClause(out)) break;
@@ -3877,6 +3892,21 @@ pub fn Parser(comptime config: types.Config) type {
                 }
             }
             const named = try self.qualifiedName();
+            if (self.tokens.dialect == .postgres) if (named.schema) |qualifier| {
+                var schema_buffer: [64]u8 = undefined;
+                var name_buffer: [64]u8 = undefined;
+                const schema = identText(self.source, qualifier, &schema_buffer) orelse "";
+                const name = identText(self.source, named.name, &name_buffer) orelse "";
+                if (types.same(schema, "pg_catalog")) {
+                    const scalar: TypeSpec =
+                        if (types.same(name, "regclass")) .{ .ty = .oid, .typmod = ast.regclass_typmod }
+                        else if (types.same(name, "regnamespace")) .{ .ty = .oid, .typmod = ast.regnamespace_typmod }
+                        else if (types.same(name, "regtype")) .{ .ty = .oid, .typmod = ast.regtype_typmod }
+                        else .{ .ty = types.typeOfData(types.typeByCatalogName(name) orelse return error.UndefinedObject) };
+                    const target = try self.typeArraySuffix(scalar);
+                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
+                }
+            };
             if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
             return self.pool.add(.{ .kind = .cast, .cast_type = .unknown, .a = inner, .name = named.name, .qualifier = named.schema orelse .{} });
         }
@@ -4630,12 +4660,22 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.rparen);
                     return self.pool.add(call);
                 }
-                // ARRAY[...] constructors.
+                // Array literals and PostgreSQL's ARRAY(query) constructor.
                 if (self.mode == .standard and wordIs(self.source, token, "array")) {
                     const after = try self.peek();
                     if (after.kind == .symbol and after.symbol == .lbracket) {
                         const name = try self.identifier();
                         return self.arrayConstructor(name);
+                    }
+                    if (self.tokens.dialect == .postgres and lparenNext(after)) {
+                        try self.advance();
+                        try self.expectSymbol(.lparen);
+                        if (!self.queryWord()) return error.Syntax;
+                        const query_index = try self.query();
+                        try self.expectSymbol(.rparen);
+                        self.pool.complex = true;
+                        const node = try self.pool.add(.{ .kind = .scalar_subquery, .func = .array_subquery, .integer = query_index });
+                        return self.subscriptTail(node);
                     }
                 }
                 // SQL-standard niladic functions.

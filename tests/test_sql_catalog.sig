@@ -86,6 +86,8 @@ fn types() !void {
     try expect("SELECT typname, typlen, typcategory, typarray, typdelim, typinput FROM pg_type WHERE oid IN (16, 1700, 3802) ORDER BY oid", "bool|1|B|1000|,|boolin;numeric|-1|N|1231|,|numeric_in;jsonb|-1|U|3807|,|jsonb_in");
     try expect("SELECT typname, oid::regtype::text, format_type(oid, NULL) FROM pg_type WHERE typname IN ('int8', 'float8', 'timestamptz') ORDER BY typname", "float8|double precision|double precision;int8|bigint|bigint;timestamptz|timestamp with time zone|timestamp with time zone");
     try expect("SELECT typname FROM pg_type t WHERE t.oid = to_regtype('integer')", "int4");
+    try expect("SELECT 23::PG_CATALOG.regtype::pg_catalog.text, CAST('23' AS \"pg_catalog\".\"oid\"), ARRAY['x','y']::pg_catalog.text[]", "integer|23|{x,y}");
+    try rejects("SELECT 23::pg_catalog.\"TEXT\"", error.UndefinedObject);
     try expect("SELECT to_regtype('nope') IS NULL, to_regtype('pg_catalog.numeric(10,2)'), 'int8'::regtype = 20::oid", "t|1700|t");
     try expect("SELECT format_type(1700, 655366), format_type(1184, 3), format_type(23, -1), format_type(99999, NULL)", "numeric(10,2)|timestamp(3) with time zone|integer|???");
     try rejects("SELECT 'nope'::regtype", error.UndefinedObject);
@@ -189,11 +191,47 @@ fn characterMetadata() !void {
     try check(std.mem.eql(u8, try render(&result), "id|integer|NULL;v|character varying|3"));
 }
 
+fn relationMetadata() !void {
+    db = .{};
+    try run("CREATE TABLE t(id INT PRIMARY KEY, amount INT CHECK (amount >= 0))");
+    try run("CREATE INDEX t_amount ON t (amount)");
+    try run("CREATE VIEW v AS SELECT id FROM t");
+    try expect("SELECT 't'::pg_catalog.regclass::pg_catalog.text", "t");
+    try expect("SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid", "2|heap|heap_tableam_handler|t;403|btree|bthandler|i");
+    try expect("SELECT c.relname,c.relkind,c.relchecks,c.relhasindex,c.relhasrules,a.amname FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_am a ON c.relam=a.oid ORDER BY c.relname", "t|r|1|t|f|heap;t_amount|i|0|f|f|btree;t_pkey|i|0|f|f|btree;v|v|0|f|t|NULL");
+    try expect("SELECT relname,relpersistence,relreplident,reltablespace,reloftype,reltoastrelid FROM pg_class ORDER BY relname", "t|p|d|0|0|0;t_amount|p|n|0|0|0;t_pkey|p|n|0|0|0;v|p|n|0|0|0");
+    try expect("SELECT relhastriggers,relrowsecurity,relforcerowsecurity,relispartition,relispopulated FROM pg_class WHERE relname='t'", "f|f|f|f|t");
+    const writer = try db.begin();
+    var result: DB.Result = .{};
+    try db.statement(writer, "ALTER TABLE t ENABLE ROW LEVEL SECURITY", &result, .{});
+    try db.statement(writer, "ALTER TABLE t FORCE ROW LEVEL SECURITY", &result, .{});
+    const security = "SELECT relrowsecurity,relforcerowsecurity FROM pg_class WHERE relname='t'";
+    try db.statement(writer, security, &result, .{});
+    try check(std.mem.eql(u8, try render(&result), "t|t"));
+    try expect(security, "f|f");
+    db.abort(writer);
+    try expect(security, "f|f");
+    try run("ALTER TABLE t ENABLE ROW LEVEL SECURITY");
+    try expect(security, "t|f");
+}
+
+fn collationMetadata() !void {
+    db = .{};
+    try run("CREATE DOMAIN shown_int AS INT");
+    try run("CREATE TABLE t(a TEXT,b VARCHAR(3),c NAME,d NAME[],e TEXT[],f INT)");
+    try expect("SELECT oid,collname,collnamespace,collprovider,collisdeterministic,collencoding FROM pg_catalog.pg_collation ORDER BY oid", "100|default|11|d|t|-1;950|C|11|c|t|-1;951|POSIX|11|c|t|-1;962|ucs_basic|11|b|t|6");
+    try expect("SELECT typname,typcollation FROM pg_type WHERE typname IN ('name','_name','text','_text','int4','_int4','shown_int','_shown_int') ORDER BY typname", "_int4|0;_name|950;_shown_int|0;_text|100;int4|0;name|950;shown_int|0;text|100");
+    try expect("SELECT attname,attcollation FROM pg_attribute WHERE attrelid='t'::regclass AND attnum>0 ORDER BY attnum", "a|100;b|100;c|950;d|950;e|100;f|0");
+    try expect("SELECT a.attname,(SELECT c.collname FROM pg_catalog.pg_collation c,pg_catalog.pg_type t WHERE c.oid=a.attcollation AND t.oid=a.atttypid AND a.attcollation<>t.typcollation) FROM pg_catalog.pg_attribute a WHERE a.attrelid='t'::regclass AND a.attnum>0 ORDER BY a.attnum", "a|NULL;b|NULL;c|NULL;d|NULL;e|NULL;f|NULL");
+}
+
 pub fn main(init: std.process.Init) !void {
     try types();
     try lifecycle();
     try replay();
     try characterMetadata();
+    try relationMetadata();
+    try collationMetadata();
     var buffer: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-catalog\",\"pass\":true,\"assertions\":{d},\"database_bytes\":{d}}}\n", .{ assertions, DB.storageBytes() });
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

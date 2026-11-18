@@ -66,3 +66,12 @@ pub fn collatable(ty: types.Type) bool {
         else => false,
     };
 }
+
+/// The implicit catalog collation of a stored SQL type and its array type.
+pub fn typeCollation(ty: types.Type) u32 {
+    return switch (types.elementType(ty) orelse ty) {
+        .name => oids[1],
+        .text, .varchar, .bpchar => oids[database_default - 1],
+        else => 0,
+    };
+}

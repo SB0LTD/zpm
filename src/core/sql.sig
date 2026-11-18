@@ -104,6 +104,7 @@ const dml_module = @import("sql/dml.sig");
 const mvcc_module = @import("sql/mvcc.sig");
 const locks_module = @import("sql/locks.sig");
 const catalog_module = @import("sql/catalog.sig");
+const collation = @import("sql/collation.sig");
 const value_module = @import("sql/value.sig");
 const flat_record = @import("sql/flat_record.sig");
 const numeric_module = @import("sql/numeric.sig");
@@ -177,7 +178,7 @@ pub const ControlText = struct {
     }
 };
 
-pub const SettingValueKind = enum { default, word, string, number };
+pub const SettingValueKind = enum { default, word, string, number, configuration_text };
 
 /// A decoded transaction-control or session command (store-executed).
 pub const Control = union(enum) {
@@ -860,11 +861,20 @@ pub fn Database(comptime config: Config) type {
             return false;
         }
 
-        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement, role: u32) Error![]const u8 {
+        fn expandRelations(db: *const Self, workspace: *Workspace, source: []const u8, snap: Snapshot, bound_statement: *A.Statement, role: u32, session: *const value_module.Session) Error![]const u8 {
             // Privileges and row security apply to roles other than superusers (B11 wave 3).
             const privileged = role == CO.bootstrap_role or db.catalog_objects.superuser(role, snap);
+            // Analyzing a view definition or an unpopulated materialized
+            // view does not execute the stored query.
+            const executes_query = switch (bound_statement.*) {
+                .create_view => |view| view.materialized and view.with_data,
+                .refresh_view => |view| view.with_data,
+                .create_table => |table| table.with_data,
+                else => true,
+            };
             const tables = &db.tables;
             const catalog = &db.catalog;
+            const public_schema_on_path = session.public_schema_on_path;
             workspace.expanded_count = 0;
             const pool = &workspace.nodes;
             var length: usize = 0;
@@ -872,7 +882,8 @@ pub fn Database(comptime config: Config) type {
             if (bound_statement.* == .refresh_view) {
                 const refresh = &bound_statement.refresh_view;
                 const schema_name = if (refresh.name.schema) |qualifier| identName(source, qualifier) else Name{};
-                if (namespaceFor(catalog, if (refresh.name.schema != null) schema_name.slice() else null, snap)) |namespace| {
+                const namespace_oid = if (refresh.name.schema != null or public_schema_on_path) namespaceFor(catalog, if (refresh.name.schema != null) schema_name.slice() else null, snap) else null;
+                if (namespace_oid) |namespace| {
                     if (catalog.findIn(namespace, identName(source, refresh.name.name).slice(), snap)) |found| {
                         if (found.kind == 'm') refresh.query = try appendQuery(workspace, &length, source, tables[found.slot].query.slice());
                     }
@@ -897,11 +908,13 @@ pub fn Database(comptime config: Config) type {
                         if (view == .pg_authid and !privileged) return error.InsufficientPrivilege;
                         continue;
                     }
+                    if (item.schema == null and !public_schema_on_path and item.name.span.start < source.len) continue;
                     const namespace = namespaceFor(catalog, if (item.schema != null) schema_name.slice() else null, snap) orelse continue;
                     const found = catalog.findIn(namespace, name.slice(), snap) orelse continue;
+                    if (executes_query) try session.restricted_relation_kinds.check(found.kind);
                     // Items the statement names (not view or expansion texts).
                     if (!privileged and item.name.span.start < source.len) {
-                        const secured = try secureItem(db, workspace, &length, source, role, found, snap);
+                        const secured = try secureItem(db, workspace, &length, source, role, session.row_security, found, snap);
                         if (secured != ast.none) {
                             item.query = secured;
                             item.view = true;
@@ -1098,24 +1111,33 @@ pub fn Database(comptime config: Config) type {
                 self.session.sequences=null;
                 var parsed=try P.parseWithOptions(source,&self.workspace.nodes,.{.dialect=self.dialect});
                 switch(parsed){.select,.query=>{},else=>return error.UnsupportedStatement}
-                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role);
+                const expanded=try Self.expandRelations(db,&self.workspace,source,snapshot,&parsed,self.session.role,&self.session);
                 try self.session.checkpoint();
                 for(self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |query| {
                     if(query.lock.strength!=.none) return error.UnsupportedStatement;
                 }
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
                     .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,.params=params,
-                    .user_type_catalog=&db.catalog_objects};
+                    .user_type_catalog=&db.catalog_objects,.stored_source_start=source.len};
                 const bound=try B.bind(&context,&parsed);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
+                // A settings scan observes the installed connection state.
+                // Describe only needs the static relation schema.
+                if (!describe_only) for (self.workspace.plans.items[0..self.workspace.plans.len]) |*block| {
+                    for (block.sources[0..block.source_count]) |*item| {
+                        if (item.view == .pg_settings) return error.UnsupportedStatement;
+                    }
+                };
                 // Metadata-only Describe does not call evaluation hooks.
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
                     .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
                     // These catalog lookups use the serialized database hook.
-                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible=>return error.UnsupportedStatement,
+                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_partition_ancestors,
+                    .to_regnamespace,.regnamespace_in,.regnamespace_out=>return error.UnsupportedStatement,
+                    .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
-                    .current_setting,.set_config,.pg_backend_pid,
+                    .current_setting,.set_config,.pg_backend_pid,.pg_is_in_recovery,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
                     .pg_try_advisory_xact_lock,.pg_try_advisory_xact_lock_shared,
                     .pg_advisory_unlock,.pg_advisory_unlock_shared,
@@ -1311,7 +1333,7 @@ pub fn Database(comptime config: Config) type {
                 if (plan != .general or self.dialect != .postgres or self.snapshot.epoch != 0 or
                     self.snapshot.csn != db.csn or self.effective.ptr != self.source.ptr or
                     session.role != CO.bootstrap_role or session.session_role != CO.bootstrap_role or
-                    session.zone.kind != .utc or session.resolver.lookup != null or session.params != null or
+                    session.zone.kind != .utc or session.xml_document or session.resolver.lookup != null or session.params != null or
                     session.engine != null or session.routines != null or session.routine_frame != null or
                     (session.control != null and session.control.?.max_work != 0)) return false;
 
@@ -1360,6 +1382,7 @@ pub fn Database(comptime config: Config) type {
                         if (source.table) |index| {
                             const table = &db.tables[index];
                             if (table.relkind != 'r' or table.namespace != catalog_module.public_namespace) return false;
+                            if (session.synchronize_seqscans and X.synchronizedProjection(block) and S.supportsSynchronizedScan(table)) return false;
                         }
                     }
                     for (block.aggs[0..block.agg_count]) |aggregate| if (!cacheableAggregate(aggregate.kind)) return false;
@@ -1468,6 +1491,8 @@ pub fn Database(comptime config: Config) type {
         locks: L = .{},
         /// Table OIDs are first_oid + counter; never reused while committed.
         oid_counter: u32 = 0,
+        /// Constraint OIDs have their own catalog namespace.
+        next_constraint_oid: u32 = change_log.first_oid,
         /// Global commit sequence number, advanced only at publish.
         csn: u64 = 0,
         /// Command id used by change-record replay.
@@ -1493,6 +1518,7 @@ pub fn Database(comptime config: Config) type {
         /// call like `dialect`. Not database state.
         session: value_module.Session = .{},
         workspace: Workspace = .{},
+        startup_recovery_active: bool = false,
         /// Tx-session lane: the caller's session state for the next call
         /// (null: default_session_state), cursors and notifications of every
         /// session, SERIALIZABLE records and EXECUTE parameter values.
@@ -1777,6 +1803,17 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.ref_high = refs.len;
         }
 
+        /// The startup owner holds exclusive access across replay, including
+        /// validation and durable-log repair. A failed replay remains active
+        /// until startup is abandoned or a subsequent attempt completes.
+        pub fn setStartupRecovery(self: *Self, recovering: bool) void {
+            self.startup_recovery_active = recovering;
+        }
+
+        pub fn startupRecoveryActive(self: *const Self) bool {
+            return self.startup_recovery_active;
+        }
+
         /// Inline object bytes. With external_storage this excludes the bound
         /// row/version/index/reference buffers; backingBytes reports their
         /// separate capacity budget. It is not total resident memory.
@@ -1808,6 +1845,7 @@ pub fn Database(comptime config: Config) type {
         fn copyState(self: *Self, source: *const Self) void {
             if (self == source) return;
             self.oid_counter = source.oid_counter;
+            self.next_constraint_oid = source.next_constraint_oid;
             self.csn = source.csn;
             self.cid = source.cid;
             self.epoch = source.epoch;
@@ -2583,9 +2621,10 @@ pub fn Database(comptime config: Config) type {
                 return self.catalogObject(slot, original, &parsed.catalog_object, snap);
             }
             var statement_copy = parsed.*;
-            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role);
+            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
             const source = try self.secureTarget(&statement_copy, expanded, original, snap);
             var context = self.bindContext(source, mode, snap);
+            context.stored_source_start = original.len;
             if (explain) |options| context.describe_only = !options.analyze;
             if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
             const bound = try B.bind(&context, &statement_copy);
@@ -2836,7 +2875,7 @@ pub fn Database(comptime config: Config) type {
                 else => unreachable,
             }
             var buffer: [512]u8 = undefined;
-            var text: Writer512 = .{ .out = &buffer };
+            var text: CatalogTextWriter = .{ .out = &buffer };
             text.add(prefix);
             text.add(observation.operation.name());
             text.add("\"");
@@ -3126,7 +3165,7 @@ pub fn Database(comptime config: Config) type {
             var latest = snap;
             latest.csn = self.csn;
             for (&self.catalog_objects.items) |*o| {
-                if (!CO.userType(o.kind) or o.target != drop.oid) continue;
+                if ((!CO.userType(o.kind) and o.kind != .statistics) or o.target != drop.oid) continue;
                 if (O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                 if (!O.visible(o, snap)) continue;
                 if (!drop.cascade) return error.DependentObjects;
@@ -3246,6 +3285,8 @@ pub fn Database(comptime config: Config) type {
         fn objectDependent(o: *const O.Object, oid: u32) bool {
             return switch (o.kind) {
                 .acl, .relation, .policy => o.target == oid,
+                .statistics => o.target == oid or o.grantee == oid,
+                .publication_table, .publication_schema => o.grantee == oid,
                 .comment => o.target == oid,
                 else => false,
             };
@@ -3253,8 +3294,11 @@ pub fn Database(comptime config: Config) type {
 
         fn dropObjectsOf(self: *Self, slot: u16, oid: u32, snap: Snapshot) Error!void {
             if (self.catalog_objects.pendingReference(oid, snap)) |other| return self.objectPark(slot, other);
+            var latest = snap;
+            latest.csn = self.csn;
             var count: usize = 0;
             for (&self.catalog_objects.items) |*o| {
+                if ((o.kind == .statistics or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                 if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
                 if (objectDependent(o, oid)) count += 1;
                 // Comments on the table's policies go with them.
@@ -3306,9 +3350,38 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        fn remapStatistics(self: *Self, slot: u16, oid: u32, sources: []const u8, snap: Snapshot) Error!void {
+            var latest = snap;
+            latest.csn = self.csn;
+            for (0..self.catalog_objects.items.len) |index| {
+                const o = &self.catalog_objects.items[index];
+                if (o.kind != .statistics or o.grantee != oid) continue;
+                if (O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                if (!O.visible(o, snap) or o.xmax.epoch != 0 or (o.xmin_csn == 0 and o.xmin_cid == snap.cid)) continue;
+                if (self.catalog_objects.pendingConflict(o, snap)) |other| return self.objectPark(slot, other);
+                var cols: [CO.statistics_columns]u8 = undefined;
+                var count: usize = 0;
+                for (sources, 0..) |old, position| {
+                    if (std.mem.indexOfScalar(u8, o.textSlice(), old) == null) continue;
+                    cols[count] = @intCast(position);
+                    count += 1;
+                }
+                const retained = count == o.text_len;
+                if (retained and types.same(o.textSlice(), cols[0..count])) continue;
+                try self.reserveWrites(slot, if (retained) 2 else 1);
+                var next = o.*;
+                self.objectDelete(slot, index, snap);
+                if (retained) {
+                    try next.setText(cols[0..count], "");
+                    _ = try self.objectInsert(slot, &next, false, snap);
+                }
+            }
+        }
+
         /// A table, view or materialized view named by a catalog-object
         /// statement (42P01), locked in `mode`; null with IF EXISTS.
         fn objectTable(self: *Self, slot: u16, source: []const u8, name: CO.Qualified, mode: locks_module.TableMode, snap: Snapshot) Error!usize {
+            if (!name.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
             const schema_name = if (name.has_schema) objectName(source, name.schema) else Name{};
             const namespace = namespaceFor(&self.catalog, if (name.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
             const found = self.catalog.findIn(namespace, objectName(source, name.name).slice(), snap) orelse return error.TableNotFound;
@@ -3406,6 +3479,29 @@ pub fn Database(comptime config: Config) type {
                     try self.dropNamed(slot, source, .publication, drop, snap);
                     break :blk .drop_publication;
                 },
+                .create_statistics => |*spec| blk: {
+                    try self.createStatistics(slot, source, spec, snap);
+                    break :blk .create_statistics;
+                },
+                .alter_statistics => |*spec| blk: {
+                    if (try self.findStatistics(slot, source, spec.name, spec.if_exists, snap)) |index| {
+                        var next = self.catalog_objects.items[index];
+                        next.sub = spec.target;
+                        try self.reserveWrites(slot, 2);
+                        self.objectDelete(slot, index, snap);
+                        _ = try self.objectInsert(slot, &next, false, snap);
+                    }
+                    break :blk .alter_statistics;
+                },
+                .drop_statistics => |*spec| blk: {
+                    for (spec.names[0..spec.count]) |name| {
+                        const index = (try self.findStatistics(slot, source, name, spec.if_exists, snap)) orelse continue;
+                        if (self.catalog_objects.items[index].xmax.epoch != 0) continue;
+                        try self.reserveWrites(slot, 1);
+                        self.objectDelete(slot, index, snap);
+                    }
+                    break :blk .drop_statistics;
+                },
                 .create_extension => |*named| blk: {
                     // plpgsql is the only extension, installed in every database.
                     if (!types.same(objectName(source, named.name).slice(), "plpgsql")) return error.UnsupportedStatement;
@@ -3417,6 +3513,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn typeNamespace(self: *const Self, source: []const u8, name: CO.Qualified, snap: Snapshot) Error!u32 {
+            if (!name.has_schema and !self.session.public_schema_on_path) return error.UndefinedSchema;
             const schema = if (name.has_schema) objectName(source, name.schema) else Name{};
             return namespaceFor(&self.catalog, if (name.has_schema) schema.slice() else null, snap) orelse error.UndefinedSchema;
         }
@@ -3640,7 +3737,7 @@ pub fn Database(comptime config: Config) type {
                 var latest = snap;
                 latest.csn = self.csn;
                 for (&self.catalog_objects.items) |*o| {
-                    if (CO.userType(o.kind) and o.owner == oid and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                    if ((CO.userType(o.kind) or o.kind == .statistics) and o.owner == oid and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
                     switch (o.kind) {
                         .member => {
@@ -3657,7 +3754,7 @@ pub fn Database(comptime config: Config) type {
                                 if (listed == oid) return error.DependentObjects;
                             }
                         },
-                        .relation, .fdw, .server, .publication, .domain, .enum_type, .composite_type => if (o.owner == oid) return error.DependentObjects,
+                        .relation, .fdw, .server, .publication, .domain, .enum_type, .composite_type, .statistics => if (o.owner == oid) return error.DependentObjects,
                         else => {},
                     }
                 }
@@ -3975,6 +4072,7 @@ pub fn Database(comptime config: Config) type {
                     }
                 },
                 .sequence => {
+                    if (!comment.object.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
                     const schema_name = if (comment.object.has_schema) objectName(source, comment.object.schema) else Name{};
                     const namespace = namespaceFor(&self.catalog, if (comment.object.has_schema) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
                     const found = self.catalog.findIn(namespace, objectName(source, comment.object.name).slice(), snap) orelse return error.TableNotFound;
@@ -4082,10 +4180,148 @@ pub fn Database(comptime config: Config) type {
             if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
             var object: O.Object = .{ .kind = .publication, .owner = self.session.role, .flags = publication.flags };
             try object.setName(objectName(source, publication.name).slice());
-            if (self.catalog_objects.byName(.publication, 0, object.name.slice(), snap) != null) return error.DuplicateObject;
             if (self.catalog_objects.pendingConflict(&object, snap)) |other| return self.objectPark(slot, other);
+            var latest = snap;
+            latest.csn = self.csn;
+            if (self.catalog_objects.byName(.publication, 0, object.name.slice(), latest) != null) return error.DuplicateObject;
+            if (self.catalog_objects.pendingReference(object.owner, snap)) |other| return self.objectPark(slot, other);
+            var members: PublicationMembers = .{};
+            for (publication.members[0..publication.count]) |member| {
+                switch (member) {
+                    .schema => |ident| {
+                        const name = objectName(source, ident);
+                        const namespace = namespaceFor(&self.catalog, name.slice(), snap) orelse return error.UndefinedSchema;
+                        if (namespace != catalog_module.public_namespace and namespace < change_log.first_oid) return error.InvalidParameterValue;
+                        for (&self.schemas) |*schema| {
+                            if (schema.live and schema.oid == namespace and schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
+                        }
+                        if (namespaceFor(&self.catalog, name.slice(), latest) != namespace) return error.SerializationFailure;
+                        members.add(.publication_schema, namespace);
+                    },
+                    .table => |table| {
+                        const index = self.objectTable(slot, source, table.name, .access_share, snap) catch |err| {
+                            if (err == error.WrongObjectType) return error.InvalidParameterValue;
+                            return err;
+                        };
+                        const relation = &self.tables[index];
+                        if (!CO.publicationRelationKind(relation.relkind)) return error.InvalidParameterValue;
+                        if (self.visibleTableSlot(relation.oid, latest) != index) return error.SerializationFailure;
+                        members.add(.publication_table, relation.oid);
+                        if (!table.only and relation.relkind != 'p') try self.addPublicationDescendants(slot, relation.oid, snap, &members);
+                    },
+                }
+            }
+            try self.reserveWrites(slot, 1 + members.count);
+            const index = try self.objectInsert(slot, &object, true, snap);
+            const oid = self.catalog_objects.items[index].oid;
+            for (members.items[0..members.count]) |member| {
+                var entry: O.Object = .{ .kind = member.kind, .target = oid, .grantee = member.oid };
+                _ = try self.objectInsert(slot, &entry, true, snap);
+            }
+        }
+
+        const PublicationMembers = struct {
+            const Member = struct { kind: CO.Kind, oid: u32 };
+            items: [config.tables + config.schemas + 1]Member = undefined,
+            count: usize = 0,
+
+            fn add(self: *PublicationMembers, kind: CO.Kind, oid: u32) void {
+                for (self.items[0..self.count]) |member| {
+                    if (member.kind == kind and member.oid == oid) return;
+                }
+                self.items[self.count] = .{ .kind = kind, .oid = oid };
+                self.count += 1;
+            }
+        };
+
+        fn addPublicationDescendants(self: *Self, slot: u16, root: u32, snap: Snapshot, members: *PublicationMembers) Error!void {
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const table = &self.tables[found.slot];
+                if (!CO.publicationRelationKind(table.relkind) or table.partition.bound != .none) continue;
+                var parent = table.parent;
+                while (parent != 0) {
+                    if (parent == root) {
+                        try self.lockTable(slot, found.slot, .access_share);
+                        var latest = snap;
+                        latest.csn = self.csn;
+                        if (self.visibleTableSlot(table.oid, latest) != found.slot) return error.SerializationFailure;
+                        members.add(.publication_table, table.oid);
+                        break;
+                    }
+                    const index = self.visibleTableSlot(parent, snap) orelse return error.SerializationFailure;
+                    parent = self.tables[index].parent;
+                }
+            }
+        }
+
+        fn createStatistics(self: *Self, slot: u16, source: []const u8, spec: *const CO.Statistics, snap: Snapshot) Error!void {
+            const table_slot = try self.objectTable(slot, source, spec.table, .share_update_exclusive, snap);
+            const table = &self.tables[table_slot];
+            if (table.relkind != 'r' and table.relkind != 'p' and table.relkind != 'm') return error.WrongObjectType;
+            if (!self.catalog_objects.ownsTable(self.session.role, table.oid, snap)) return error.InsufficientPrivilege;
+            const namespace = try self.typeNamespace(source, spec.name, snap);
+            if (namespace != catalog_module.public_namespace and namespace < change_log.first_oid) return error.InsufficientPrivilege;
+            for (&self.schemas) |*schema| {
+                if (schema.live and schema.oid == namespace and schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
+            }
+            var latest = snap;
+            latest.csn = self.csn;
+            if (!self.catalog_objects.ownsTable(self.session.role, table.oid, latest)) return error.SerializationFailure;
+            if (try self.typeNamespace(source, spec.name, latest) != namespace) return error.SerializationFailure;
+            var object: O.Object = .{ .kind = .statistics, .target = namespace, .grantee = table.oid, .sub = -1, .owner = self.session.role, .flags = spec.flags };
+            try object.setName(objectName(source, spec.name.name).slice());
+            if (self.catalog_objects.pendingConflict(&object, snap)) |other| return self.objectPark(slot, other);
+            if (self.catalog_objects.byName(.statistics, namespace, object.name.slice(), latest) != null) {
+                if (spec.if_not_exists) return;
+                return error.DuplicateObject;
+            }
+            if (spec.count < 2) return error.InvalidObjectDefinition;
+            var chosen: [config.columns]bool = @splat(false);
+            for (spec.columns[0..spec.count]) |column| {
+                const name = objectName(source, column);
+                for (table.columns[0..table.column_count], 0..) |*definition, position| {
+                    if (!types.same(definition.name.slice(), name.slice())) continue;
+                    if (chosen[position]) return error.DuplicateColumn;
+                    chosen[position] = true;
+                    break;
+                } else return error.ColumnNotFound;
+            }
+            var columns: [CO.statistics_columns]u8 = undefined;
+            var count: usize = 0;
+            for (chosen, 0..) |include, position| {
+                if (!include) continue;
+                columns[count] = @intCast(position);
+                count += 1;
+            }
+            try object.setText(columns[0..count], "");
+            if (self.catalog_objects.pendingReference(object.owner, snap)) |other| return self.objectPark(slot, other);
             try self.reserveWrites(slot, 1);
             _ = try self.objectInsert(slot, &object, true, snap);
+        }
+
+        fn findStatistics(self: *Self, slot: u16, source: []const u8, name: CO.Qualified, conditional: bool, snap: Snapshot) Error!?usize {
+            const namespace = self.typeNamespace(source, name, snap) catch |err| {
+                if (conditional and err == error.UndefinedSchema) return null;
+                return err;
+            };
+            const parsed = objectName(source, name.name);
+            const key: O.Object = .{ .kind = .statistics, .target = namespace, .name = parsed };
+            if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
+            const index = self.catalog_objects.byName(.statistics, namespace, parsed.slice(), snap) orelse {
+                if (conditional) return null;
+                return error.UndefinedObject;
+            };
+            const object = &self.catalog_objects.items[index];
+            const table_slot = self.visibleTableSlot(object.grantee, snap) orelse return error.TableNotFound;
+            try self.lockTable(slot, table_slot, .share_update_exclusive);
+            var latest = snap;
+            latest.csn = self.csn;
+            if (!O.visible(object, latest)) return error.SerializationFailure;
+            if (!self.privilegedRole(snap) and !self.catalog_objects.memberOf(self.session.role, object.owner, true, snap)) return error.InsufficientPrivilege;
+            return index;
         }
 
         /// DROP FOREIGN DATA WRAPPER / SERVER / PUBLICATION: the owner or a
@@ -4109,6 +4345,7 @@ pub fn Database(comptime config: Config) type {
                 for (&self.catalog_objects.items) |*other| {
                     if (!O.visible(other, snap)) continue;
                     if (other.kind == .comment and other.target == o.oid) writes += 1;
+                    if (kind == .publication and CO.publicationMembership(other.kind) and other.target == o.oid) writes += 1;
                     if (kind == .fdw and other.kind == .server and other.target == o.oid) {
                         if (!drop.cascade) return error.DependentObjects;
                         if (self.catalog_objects.pendingReference(other.oid, snap)) |waiter| return self.objectPark(slot, waiter);
@@ -4124,6 +4361,7 @@ pub fn Database(comptime config: Config) type {
                 const oid = self.catalog_objects.items[index].oid;
                 for (&self.catalog_objects.items, 0..) |*other, position| {
                     if (!O.visible(other, snap) or other.xmax.epoch != 0) continue;
+                    if (kind == .publication and CO.publicationMembership(other.kind) and other.target == oid) self.objectDelete(slot, position, snap);
                     if (kind == .fdw and other.kind == .server and other.target == oid) {
                         const server_oid = other.oid;
                         self.objectDelete(slot, position, snap);
@@ -4229,12 +4467,13 @@ pub fn Database(comptime config: Config) type {
                 .delete => |*delete| .{ .schema = delete.schema, .table = delete.table, .where = &delete.where, .command = .delete, .reads = delete.where != ast.none or delete.returning.count != 0 },
                 else => return source,
             };
+            if (goal.schema == null and !self.session.public_schema_on_path) return source;
             const schema_name = if (goal.schema) |qualifier| identName(source, qualifier) else Name{};
             const namespace = namespaceFor(&self.catalog, if (goal.schema != null) schema_name.slice() else null, snap) orelse return source;
             const found = self.catalog.findIn(namespace, identName(source, goal.table).slice(), snap) orelse return source;
             if (found.kind != 'r' and found.kind != 'p') return source;
             const table = &self.tables[found.slot];
-            if (!self.catalog_objects.rowSecurity(role, table.oid, snap)) return source;
+            if (!try self.checkRowSecurity(role, table.oid, self.session.row_security, snap)) return source;
             if (table.relkind == 'p' or self.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
             var length: usize = 0;
             try self.securedSource(source, original, &length);
@@ -4262,7 +4501,7 @@ pub fn Database(comptime config: Config) type {
                 .insert => |*insert| .{ .table = insert.table, .command = .insert },
                 .update => |*update| .{ .table = update.table, .command = .update },
                 .merge => |*merge| {
-                    if (self.catalog_objects.rowSecurity(role, self.tables[merge.table].oid, snap)) return error.UnsupportedStatement;
+                    if (try self.checkRowSecurity(role, self.tables[merge.table].oid, self.session.row_security, snap)) return error.UnsupportedStatement;
                     return;
                 },
                 .query => {
@@ -4273,14 +4512,14 @@ pub fn Database(comptime config: Config) type {
                             .update => |*update| update.table,
                             .delete => |*delete| delete.table,
                         };
-                        if (self.catalog_objects.rowSecurity(role, self.tables[table_slot].oid, snap)) return error.UnsupportedStatement;
+                        if (try self.checkRowSecurity(role, self.tables[table_slot].oid, self.session.row_security, snap)) return error.UnsupportedStatement;
                     }
                     return;
                 },
                 else => return,
             };
             const oid = self.tables[goal.table].oid;
-            if (!self.catalog_objects.rowSecurity(role, oid, snap)) return;
+            if (!try self.checkRowSecurity(role, oid, self.session.row_security, snap)) return;
             if (bound.* == .insert and bound.insert.conflict.action != .none) return error.UnsupportedStatement;
             var length: usize = 0;
             try self.securedSource(source, source, &length);
@@ -4306,16 +4545,25 @@ pub fn Database(comptime config: Config) type {
             if (verdict != .boolean or !verdict.boolean) return error.InsufficientPrivilege;
         }
 
+        /// With row_security disabled, access requiring any policy errors,
+        /// including the default-deny case. Owners and bypass roles still
+        /// use the ordinary catalog eligibility check.
+        fn checkRowSecurity(self: *const Self, role: u32, table: u32, enabled: bool, snap: Snapshot) Error!bool {
+            const applies = self.catalog_objects.rowSecurity(role, table, snap);
+            if (applies and !enabled) return error.InsufficientPrivilege;
+            return applies;
+        }
+
         /// SELECT privilege and row security of one FROM item the statement
         /// names (not one a view or an expansion introduced: those run with
         /// the view owner's rights, the bootstrap superuser). Returns the
         /// derived query replacing it under row security, or none.
-        fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, found: K.Found, snap: Snapshot) Error!u16 {
+        fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, row_security: bool, found: K.Found, snap: Snapshot) Error!u16 {
             if (found.kind == 'S') return error.InsufficientPrivilege;
             const table = &db.tables[found.slot];
             if (!db.catalog_objects.tablePrivileges(role, table.oid, CO.priv_select, snap)) return error.InsufficientPrivilege;
             if (table.relkind != 'r' and table.relkind != 'p') return ast.none;
-            if (!db.catalog_objects.rowSecurity(role, table.oid, snap)) return ast.none;
+            if (!try db.checkRowSecurity(role, table.oid, row_security, snap)) return ast.none;
             if (table.relkind == 'p' or db.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
             if (length.* == 0) {
                 if (source.len > workspace.expansion.len) return error.TextCapacity;
@@ -4406,6 +4654,30 @@ pub fn Database(comptime config: Config) type {
                 .pg_publication => for (&self.catalog_objects.items) |*o| if (o.kind == .publication and O.visible(o, snapshot)) {
                     const flags = o.flags;
                     try sink.add(&.{ intCell(o.oid), nameCell(o.name.slice()), intCell(o.owner), boolCell(flags & CO.pub_all_tables != 0), boolCell(flags & CO.pub_insert != 0), boolCell(flags & CO.pub_update != 0), boolCell(flags & CO.pub_delete != 0), boolCell(flags & CO.pub_truncate != 0), boolCell(flags & CO.pub_via_root != 0), nameCell("n") });
+                },
+                .pg_publication_rel => for (&self.catalog_objects.items) |*o| if (o.kind == .publication_table and O.visible(o, snapshot)) {
+                    try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee), .null_value, .null_value });
+                },
+                .pg_publication_namespace => for (&self.catalog_objects.items) |*o| if (o.kind == .publication_schema and O.visible(o, snapshot)) {
+                    try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee) });
+                },
+                .pg_statistic_ext => for (&self.catalog_objects.items) |*o| if (o.kind == .statistics and O.visible(o, snapshot)) {
+                    var buffer: [4 * CO.statistics_columns]u8 = undefined;
+                    var keys: CatalogTextWriter = .{ .out = &buffer };
+                    for (o.textSlice(), 0..) |column, index| {
+                        if (index != 0) keys.add(" ");
+                        var digits: [3]u8 = undefined;
+                        keys.add(std.fmt.bufPrint(&digits, "{d}", .{@as(usize, column) + 1}) catch unreachable);
+                    }
+                    var kinds: Text = .{};
+                    var shape: array_module.Shape = .{ .element = .text, .ndim = 1 };
+                    shape.dims[0] = @popCount(o.flags);
+                    var writer = try V.Arrays.Writer.begin(&kinds, &shape);
+                    for (CO.statistics_kinds, 0..) |kind, index| {
+                        if (o.flags & (@as(u32, 1) << @as(u5, @intCast(index))) != 0) try writer.append(&nameCell(kind));
+                    }
+                    try sink.add(&.{ intCell(o.oid), intCell(o.grantee), nameCell(o.name.slice()), intCell(o.target), intCell(o.owner),
+                        if (o.sub == -1) .null_value else intCell(o.sub), try objectTextCell(keys.slice()), .{ .array = kinds }, .null_value });
                 },
                 .pg_extension => try sink.add(&.{ intCell(CO.plpgsql_extension_oid), nameCell("plpgsql"), intCell(CO.bootstrap_role), intCell(catalog_module.catalog_namespace), boolCell(false), nameCell("1.0"), .null_value, .null_value }),
                 .pg_tables, .table_privileges => {
@@ -4604,13 +4876,8 @@ pub fn Database(comptime config: Config) type {
             session.forget(copy.oid);
         }
 
-        /// regclass text input: optional `public.` qualifier, quoted names
-        /// keep case, unquoted names fold to lower case.
         fn sequenceByName(self: *const Self, text: []const u8) Error!usize {
-            const name = regclassName(text) orelse return error.TableNotFound;
-            const found = self.catalog.find(name.slice(), self.seq_snap) orelse return error.TableNotFound;
-            if (found.kind != 'S') return error.WrongObjectType;
-            return found.slot;
+            return self.sequenceByOid(@intCast(try self.regclassOid(text, true)));
         }
 
         fn sequenceByOid(self: *const Self, oid: u32) Error!usize {
@@ -4623,71 +4890,132 @@ pub fn Database(comptime config: Config) type {
             return error.TableNotFound;
         }
 
-        /// The dot separating `schema.name` in regclass text outside double
-        /// quotes, unless the schema is public (regclassName strips that).
-        fn std_dot(text: []const u8) ?usize {
+        /// The first qualifier separator outside double quotes.
+        fn regclassSeparator(text: []const u8) ?usize {
             var quoted = false;
             for (text, 0..) |byte, index| {
                 if (byte == '"') quoted = !quoted;
-                if (byte == '.' and !quoted) {
-                    const head = text[0..index];
-                    var trimmed = head;
-                    while (trimmed.len != 0 and (trimmed[0] == ' ' or trimmed[0] == '\t')) trimmed = trimmed[1..];
-                    if (types.keyword(trimmed, "public")) return null;
-                    return index;
+                if (byte == '.' and !quoted) return index;
+            }
+            return null;
+        }
+
+        fn numericRegOid(text: []const u8) Error!?u32 {
+            if (text.len == 1 and text[0] == '-') return 0;
+            if (text.len == 0) return null;
+            for (text) |byte| {
+                if (byte < '0' or byte > '9') return null;
+            }
+            return std.fmt.parseInt(u32, text, 10) catch error.NumericValueOutOfRange;
+        }
+
+        /// Resolve real catalog, table, sequence, index and composite OIDs.
+        fn regclassOid(self: *const Self, text: []const u8, strict: bool) Error!i64 {
+            const missing: Error!i64 = if (strict) error.TableNotFound else -1;
+            if (try numericRegOid(text)) |oid| return oid;
+            const whitespace = " \t\r\n";
+            if (regclassSeparator(text)) |dot| {
+                const tail = text[dot + 1 ..];
+                if (regclassSeparator(tail) != null) return error.UnsupportedStatement;
+                const schema = namespaceIdentifier(std.mem.trim(u8, text[0..dot], whitespace)) catch return missing;
+                const name = namespaceIdentifier(std.mem.trim(u8, tail, whitespace)) catch return missing;
+                const namespace = namespaceFor(&self.catalog, schema.slice(), self.seq_snap) orelse return missing;
+                return if (self.regclassIn(namespace, name.slice())) |oid| oid else missing;
+            }
+            const name = namespaceIdentifier(std.mem.trim(u8, text, whitespace)) catch return missing;
+            if (self.regclassIn(catalog_module.catalog_namespace, name.slice())) |oid| return oid;
+            if (!self.session.public_schema_on_path) return missing;
+            return if (self.regclassIn(catalog_module.public_namespace, name.slice())) |oid| oid else missing;
+        }
+
+        fn regclassIn(self: *const Self, namespace: u32, name: []const u8) ?u32 {
+            if (namespace == catalog_module.catalog_namespace) {
+                const view = self.catalog.findSystemView("pg_catalog", name) orelse return null;
+                for (catalog_module.bootstrap_relations) |relation| {
+                    if (relation.view == view) return relation.oid;
+                }
+                return null;
+            }
+            if (self.catalog.findIn(namespace, name, self.seq_snap)) |found| {
+                return if (found.kind == 'S') self.seqs[found.slot].oid else self.tables[found.slot].oid;
+            }
+            if (self.catalog_objects.byName(.composite_type, namespace, name, self.seq_snap)) |index| {
+                return self.catalog_objects.items[index].compositeRelationOid();
+            }
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const table = &self.tables[found.slot];
+                if (table.namespace != namespace) continue;
+                if (S.keyed(table)) {
+                    const primary = indexName(table) catch Name{};
+                    if (types.same(primary.slice(), name)) return S.primaryIndexOid(table);
+                }
+                for (table.indexes[0..table.index_count]) |*index| {
+                    if (index.oid != 0 and types.same(index.name.slice(), name)) return index.oid;
                 }
             }
             return null;
         }
 
-        fn regclassName(text: []const u8) ?Name {
-            var raw = text;
-            while (raw.len != 0 and (raw[0] == ' ' or raw[0] == '\t')) raw = raw[1..];
-            while (raw.len != 0 and (raw[raw.len - 1] == ' ' or raw[raw.len - 1] == '\t')) raw = raw[0 .. raw.len - 1];
-            if (raw.len > 7 and types.keyword(raw[0..7], "public.")) raw = raw[7..];
-            var name: Name = .{};
-            if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') {
-                raw = raw[1 .. raw.len - 1];
-                if (raw.len > config.name_bytes) return null;
-                @memcpy(name.bytes[0..raw.len], raw);
-            } else {
-                if (raw.len > config.name_bytes) return null;
-                for (raw, 0..) |byte, position| name.bytes[position] = types.lower(byte);
+        fn namespaceIdentifier(raw: []const u8) Error!Name {
+            if (raw.len == 0) return error.InvalidName;
+            var result: Name = .{};
+            if (raw[0] == '"') {
+                if (raw.len < 3 or raw[raw.len - 1] != '"') return error.InvalidName;
+                const name = raw[1 .. raw.len - 1];
+                var index: usize = 0;
+                while (index < name.len) : (index += 1) {
+                    const byte = name[index];
+                    if (byte == '"') {
+                        index += 1;
+                        if (index == name.len or name[index] != '"') return error.InvalidName;
+                    }
+                    if (byte == 0) return error.InvalidName;
+                    if (result.len == result.bytes.len) return error.NameCapacity;
+                    result.bytes[result.len] = byte;
+                    result.len += 1;
+                }
+                return result;
             }
-            name.len = raw.len;
-            return name;
+            if (raw.len > result.bytes.len) return error.NameCapacity;
+            for (raw, 0..) |byte, index| {
+                switch (byte) { '.', '"', ' ', '\t', '\r', '\n', 0 => return error.InvalidName, else => {} }
+                result.bytes[index] = types.lower(byte);
+            }
+            result.len = raw.len;
+            return result;
         }
 
-        /// regclass input: a visible table, its primary-key index
-        /// (`<table>_pkey`) or a sequence; -1 (or 42P01) when missing.
-        fn regclassOid(self: *const Self, text: []const u8, strict: bool) Error!i64 {
-            const missing: Error!i64 = if (strict) error.TableNotFound else -1;
-            // `schema.name` of a user schema (unquoted parts fold to lower case).
-            if (std_dot(text)) |dot| {
-                const schema = regclassName(text[0..dot]) orelse return missing;
-                const relation = regclassName(text[dot + 1 ..]) orelse return missing;
-                var schemas: [K.relation_rows]K.SchemaFound = undefined;
-                const count = self.catalog.visibleSchemas(self.seq_snap, &schemas);
-                for (schemas[0..count]) |found| {
-                    if (!types.same(self.schemas[found.slot].name.slice(), schema.slice())) continue;
-                    const hit = self.catalog.findIn(found.oid, relation.slice(), self.seq_snap) orelse return missing;
-                    return if (hit.kind == 'S') self.seqs[hit.slot].oid else self.tables[hit.slot].oid;
-                }
+        fn postgresNamespaceLookup(ptr: *anyopaque, text: []const u8, strict: bool) Error!?u32 {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const raw = std.mem.trim(u8, text, " \t\r\n");
+            if (try numericRegOid(raw)) |oid| return oid;
+            const name = try namespaceIdentifier(raw);
+            if (namespaceFor(&self.catalog, name.slice(), self.seq_snap)) |oid| return oid;
+            if (strict) return error.UndefinedSchema;
+            return null;
+        }
+
+        fn postgresNamespaceName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            for (catalog_module.namespaces) |known| {
+                if (oid == known.oid) return try writeNamespaceName(known.name, out);
             }
-            const name = regclassName(text) orelse return missing;
-            if (self.catalog.find(name.slice(), self.seq_snap)) |found| {
-                return if (found.kind == 'S') self.seqs[found.slot].oid else self.tables[found.slot].oid;
+            var schemas: [K.relation_rows]K.SchemaFound = undefined;
+            const count = self.catalog.visibleSchemas(self.seq_snap, &schemas);
+            for (schemas[0..count]) |found| {
+                if (oid == found.oid) return try writeNamespaceName(self.schemas[found.slot].name.slice(), out);
             }
-            var relations: [K.relation_rows]K.Found = undefined;
-            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
-            for (relations[0..count]) |found| {
-                if (found.kind != 'r') continue;
-                const table = &self.tables[found.slot];
-                if (!S.keyed(table)) continue;
-                const index_name = indexName(table) catch continue;
-                if (types.same(index_name.slice(), name.slice())) return table.oid + 1;
-            }
-            return missing;
+            return null;
+        }
+
+        fn writeNamespaceName(name: []const u8, out: []u8) Error!usize {
+            var text: CatalogTextWriter = .{ .out = out };
+            text.ident(name);
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
         }
 
         /// The primary-key index (and constraint) name: CONSTRAINT name, else
@@ -4703,72 +5031,79 @@ pub fn Database(comptime config: Config) type {
             return out;
         }
 
-        fn relationName(ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize {
-            const self: *Self = @ptrCast(@alignCast(ptr));
+        const RelationIdentity = struct { name: []const u8, namespace: u32 };
+
+        fn relationIdentity(self: *const Self, oid: u32, primary_name: *Name) ?RelationIdentity {
+            for (catalog_module.bootstrap_relations) |relation| {
+                if (relation.oid != oid or (relation.view == .pg_database and self.catalog.databases == null)) continue;
+                return .{ .name = @tagName(relation.view), .namespace = catalog_module.catalog_namespace };
+            }
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(self.seq_snap, &relations);
             for (relations[0..count]) |found| {
-                var name: Name = undefined;
                 if (found.kind == 'S') {
-                    if (self.seqs[found.slot].oid != oid) continue;
-                    name = self.seqs[found.slot].name;
-                } else {
-                    const table = &self.tables[found.slot];
-                    if (table.oid == oid) {
-                        name = table.name;
-                    } else if (S.keyed(table) and table.oid + 1 == oid) {
-                        name = indexName(table) catch return null;
-                    } else continue;
+                    const seq = &self.seqs[found.slot];
+                    if (seq.oid == oid) return .{ .name = seq.name.slice(), .namespace = catalog_module.public_namespace };
+                    continue;
                 }
-                if (name.len > out.len) return null;
-                @memcpy(out[0..name.len], name.slice());
-                return name.len;
+                const table = &self.tables[found.slot];
+                if (table.oid == oid) return .{ .name = table.name.slice(), .namespace = table.namespace };
+                if (oid != 0 and S.primaryIndexOid(table) == oid) {
+                    primary_name.* = indexName(table) catch return null;
+                    return .{ .name = primary_name.slice(), .namespace = table.namespace };
+                }
+                for (table.indexes[0..table.index_count]) |*index| {
+                    if (index.oid != 0 and index.oid == oid) return .{ .name = index.name.slice(), .namespace = table.namespace };
+                }
+            }
+            for (&self.catalog_objects.items) |*object| {
+                if (object.kind == .composite_type and O.visible(object, self.seq_snap) and object.compositeRelationOid() == oid) {
+                    return .{ .name = object.name.slice(), .namespace = object.target };
+                }
             }
             return null;
+        }
+
+        fn relationName(ptr: *anyopaque, oid: u32, out: *[64]u8) ?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var primary: Name = undefined;
+            const identity = self.relationIdentity(oid, &primary) orelse return null;
+            if (identity.name.len > out.len) return null;
+            @memcpy(out[0..identity.name.len], identity.name);
+            return identity.name.len;
+        }
+
+        fn relationDisplayName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var primary: Name = undefined;
+            const identity = self.relationIdentity(oid, &primary) orelse return null;
+            var output: CatalogTextWriter = .{ .out = out };
+            if (!self.inRelationSearchPath(identity.namespace, identity.name)) {
+                output.ident(self.namespaceName(identity.namespace));
+                output.add(".");
+            }
+            output.ident(identity.name);
+            if (output.shortened) return error.TextCapacity;
+            return output.len;
         }
 
         fn inRelationSearchPath(self: *const Self, namespace: u32, name: []const u8) bool {
             // The supported relation path resolves pg_catalog before public.
             return namespace == catalog_module.catalog_namespace or
-                (namespace == catalog_module.public_namespace and self.catalog.findSystemView(null, name) == null);
+                (self.session.public_schema_on_path and namespace == catalog_module.public_namespace and self.catalog.findSystemView(null, name) == null);
         }
 
         fn relationVisible(ptr: *anyopaque, oid: u32) ?bool {
             const self: *const Self = @ptrCast(@alignCast(ptr));
-            switch (oid) {
-                // PostgreSQL's fixed OIDs for the catalog relations we expose.
-                1247, 1249, 1255, 1259, 1260, 1261, 1417, 2224, 2328, 2396,
-                2604, 2609, 2610, 2611, 2615, 2618, 2620, 3079, 3256, 3501, 6104,
-                => return true,
-                1262 => return if (self.catalog.databases != null) true else null,
-                else => {},
-            }
-            const snap = self.seq_snap;
-            var relations: [K.relation_rows]K.Found = undefined;
-            const count = self.catalog.visibleRelations(snap, &relations);
-            for (relations[0..count]) |found| {
-                if (found.kind == 'S') {
-                    const seq = &self.seqs[found.slot];
-                    if (seq.oid == oid) return self.inRelationSearchPath(catalog_module.public_namespace, seq.name.slice());
-                    continue;
-                }
-                const table = &self.tables[found.slot];
-                if (table.oid == oid) return self.inRelationSearchPath(table.namespace, table.name.slice());
-                if (table.oid +% 1 == oid and S.keyed(table)) {
-                    const name = indexName(table) catch return null;
-                    return self.inRelationSearchPath(table.namespace, name.slice());
-                }
-                for (table.indexes[0..table.index_count]) |*index| {
-                    if (index.oid != 0 and index.oid == oid) {
-                        return self.inRelationSearchPath(table.namespace, index.name.slice());
-                    }
-                }
-            }
-            for (&self.catalog_objects.items) |*object| {
-                if (object.kind == .composite_type and O.visible(object, snap) and object.compositeRelationOid() == oid) {
-                    return self.inRelationSearchPath(object.target, object.name.slice());
-                }
-            }
+            var primary: Name = undefined;
+            const identity = self.relationIdentity(oid, &primary) orelse return null;
+            return self.inRelationSearchPath(identity.namespace, identity.name);
+        }
+
+        fn relationPublishable(ptr: *anyopaque, oid: u32) ?bool {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            if (self.visibleTableSlot(oid, self.seq_snap)) |index| return CO.publicationRelationKind(self.tables[index].relkind);
+            if (relationVisible(ptr, oid) != null) return false;
             return null;
         }
 
@@ -4794,7 +5129,7 @@ pub fn Database(comptime config: Config) type {
                     owner = table;
                     break;
                 }
-                if (S.keyed(table) and table.oid + 1 == oid) {
+                if (oid != 0 and S.primaryIndexOid(table) == oid) {
                     // The primary-key index: its attributes are the key columns.
                     var key_columns: [config.columns]u8 = undefined;
                     for (primaryColumns(table, &key_columns)) |index| if (types.same(table.columns[index].name.slice(), column)) return null;
@@ -4827,7 +5162,7 @@ pub fn Database(comptime config: Config) type {
         /// digits and underscores not starting with a digit. `out` holds at
         /// least 2 * name.len + 2 bytes.
         fn quoteIdentifier(name: []const u8, out: []u8) usize {
-            var safe = name.len != 0 and !types.digit(name[0]);
+            var safe = name.len != 0 and !types.digit(name[0]) and !lexer.reserved(lexer.classify(name));
             for (name) |byte| {
                 if (!((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_')) safe = false;
             }
@@ -4982,25 +5317,111 @@ pub fn Database(comptime config: Config) type {
 
         fn viewRows(ptr: *anyopaque, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            if (view == .pg_settings) return settingRows(self.sessionState(), sink);
             return self.fillViewRows(&self.session,self.seq_snap,&self.workspace.nodes,view,sink);
         }
+
+        const ClassProperties = struct {
+            checks: i64 = 0,
+            has_index: bool = false,
+            has_rule: bool = false,
+            has_trigger: bool = false,
+            security: u32 = 0,
+            partition: bool = false,
+            populated: bool = true,
+            partition_bound: Cell = .null_value,
+        };
+
+        fn classRow(sink: *X.RowSink, oid: u32, name: []const u8, namespace: u32, kind: u8, columns: usize, properties: ClassProperties) Error!void {
+            const access: u32 = switch (kind) {
+                'r', 'm' => catalog_module.heap_access_method,
+                'i', 'I' => catalog_module.btree_access_method,
+                else => 0,
+            };
+            const identity = switch (kind) { 'r', 'p', 'm' => "d", else => "n" };
+            const label = [1]u8{kind};
+            // Relations use the database's tablespace and inline value
+            // storage. The current engine has no typed table definitions.
+            try sink.add(&.{
+                intCell(oid), nameCell(name), intCell(namespace), nameCell(&label), intCell(@intCast(columns)),
+                intCell(properties.checks), boolCell(properties.has_index), boolCell(properties.has_rule), boolCell(properties.has_trigger),
+                boolCell(properties.security & CO.rls_enabled != 0), boolCell(properties.security & CO.rls_forced != 0), boolCell(properties.partition),
+                intCell(0), intCell(0), nameCell("p"), nameCell(identity), intCell(0), intCell(access), boolCell(properties.populated), properties.partition_bound,
+            });
+        }
+
+        fn tableClass(self: *const Self, table: *const S.Table, snapshot: Snapshot, relations: []const K.Found, session_values: *const value_module.Session) Error!ClassProperties {
+            var properties: ClassProperties = .{
+                .has_index = S.keyed(table) or table.index_count != 0,
+                .has_rule = table.relkind == 'v' or table.relkind == 'm',
+                .security = self.catalog_objects.securityFlags(table.oid, snapshot),
+                .partition = table.parent != 0 and table.partition.bound != .none,
+                .populated = table.populated,
+            };
+            if (properties.partition) properties.partition_bound = try self.partitionBoundText(table, snapshot, session_values);
+            for (table.constraints[0..table.constraint_count]) |*constraint| switch (constraint.kind) {
+                .check => properties.checks += 1,
+                .unique, .exclusion => properties.has_index = true,
+                .foreign => properties.has_trigger = true,
+                .primary => {},
+            };
+            for (&self.objects.rules) |*rule| {
+                if (rule.live and rule.table_oid == table.oid and rule.stamp.visible(snapshot)) {
+                    properties.has_rule = true;
+                    break;
+                }
+            }
+            for (&self.objects.triggers) |*trigger| {
+                if (trigger.live and trigger.table_oid == table.oid and trigger.stamp.visible(snapshot)) {
+                    properties.has_trigger = true;
+                    break;
+                }
+            }
+            if (!properties.has_trigger) referenced: for (relations) |relation| {
+                if (relation.kind == 'S') continue;
+                const child = &self.tables[relation.slot];
+                for (child.constraints[0..child.constraint_count]) |*constraint| {
+                    if (constraint.kind == .foreign and constraint.ref_oid == table.oid) {
+                        properties.has_trigger = true;
+                        break :referenced;
+                    }
+                }
+            };
+            return properties;
+        }
+
         fn compositeCatalogRows(self: *const Self, view: catalog_module.View, snapshot: Snapshot, sink: *X.RowSink) Error!void {
             for (&self.catalog_objects.items) |*object| {
                 if (object.kind != .composite_type or !O.visible(object, snapshot)) continue;
                 const relation = object.compositeRelationOid();
                 if (view == .pg_class) {
-                    try sink.add(&.{ intCell(relation), nameCell(object.name.slice()), intCell(object.target), nameCell("c"), intCell(object.composite_field_count) });
+                    try classRow(sink, relation, object.name.slice(), object.target, 'c', object.composite_field_count, .{});
                     continue;
                 }
                 var fields = object.compositeFields();
                 var ordinal: i64 = 1;
                 while (fields.next()) |field| : (ordinal += 1) {
-                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), nameCell(""), nameCell(""), boolCell(false) });
+                    const collation_oid = if (types.typeFromOid(field.oid)) |ty| collation.typeCollation(types.typeOfData(ty)) else 0;
+                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), nameCell(""), nameCell(""), boolCell(false), intCell(collation_oid) });
                 }
             }
         }
 
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
+            if (view == .pg_settings) return error.UnsupportedStatement;
+            if (view == .pg_am) {
+                try sink.add(&.{ intCell(catalog_module.heap_access_method), nameCell("heap"), nameCell("heap_tableam_handler"), nameCell("t") });
+                try sink.add(&.{ intCell(catalog_module.btree_access_method), nameCell("btree"), nameCell("bthandler"), nameCell("i") });
+                return;
+            }
+            if (view == .pg_collation) {
+                for (collation.names, collation.oids) |name, oid| {
+                    const native_provider = switch (oid) { 100 => "d", 962 => "b", else => "c" };
+                    const encoding: i64 = if (oid == 962) 6 else -1;
+                    try sink.add(&.{ intCell(oid), nameCell(name), intCell(catalog_module.catalog_namespace), intCell(CO.bootstrap_role), nameCell(native_provider), boolCell(true), intCell(encoding) });
+                }
+                return;
+            }
             if (view == .pg_database) {
                 const provider = self.catalog.databases orelse return error.TableNotFound;
                 for (0..provider.capacity) |index| {
@@ -5012,7 +5433,6 @@ pub fn Database(comptime config: Config) type {
             const database = session_values.database;
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snapshot, &relations);
-            const public: i64 = catalog_module.public_namespace;
             if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
             switch (view) {
                 .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
@@ -5022,24 +5442,26 @@ pub fn Database(comptime config: Config) type {
                         if (data_type == .mysql_bigint_unsigned) continue;
                         const info = types.typeInfo(data_type);
                         const category: [1]u8 = .{info.category};
-                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0) });
+                        const type_collation = intCell(collation.typeCollation(types.typeOfData(data_type)));
+                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), nameCell("b"), nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation });
                         if (types.arrayData(data_type)) |array_type| {
                             const array_info = types.typeInfo(array_type);
-                            try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0) });
+                            try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation });
                         }
                     }
                     for (&self.catalog_objects.items) |*object| {
                         if (!CO.userType(object.kind) or !O.visible(object, snapshot)) continue;
+                        const type_collation = intCell(if (object.kind == .domain) collation.typeCollation(object.domain.base) else 0);
                         switch (object.kind) {
                             .domain => {
                                 const info = types.typeInfo(types.dataTypeOf(object.domain.base));
-                                try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), nameCell("d"), nameCell("N"), intCell(object.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null), intCell(0) });
+                                try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), nameCell("d"), nameCell("N"), intCell(object.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null), intCell(0), type_collation });
                             },
-                            .enum_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), nameCell("e"), nameCell("E"), intCell(object.oid + 1), nameCell(","), nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(0) }),
-                            .composite_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(-1), nameCell("c"), nameCell("C"), intCell(object.oid + 1), nameCell(","), nameCell("record_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(object.compositeRelationOid()) }),
+                            .enum_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), nameCell("e"), nameCell("E"), intCell(object.oid + 1), nameCell(","), nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation }),
+                            .composite_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(-1), nameCell("c"), nameCell("C"), intCell(object.oid + 1), nameCell(","), nameCell("record_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(object.compositeRelationOid()), type_collation }),
                             else => unreachable,
                         }
-                        try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false), intCell(0) });
+                        try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), nameCell("b"), nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation });
                     }
                 },
                 .pg_enum => for (&self.catalog_objects.items) |*object| {
@@ -5050,7 +5472,7 @@ pub fn Database(comptime config: Config) type {
                         try sink.add(&.{ intCell(object.oid + 1 + order), intCell(object.oid), .{ .float4 = @floatFromInt(order) }, nameCell(label) });
                     }
                 },
-                .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
+                .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
                 .pg_namespace, .schemata => {
                     for (catalog_module.namespaces) |namespace| {
                         if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
@@ -5066,7 +5488,7 @@ pub fn Database(comptime config: Config) type {
                     if (found.kind == 'S') {
                         const seq = &self.seqs[found.slot];
                         switch (view) {
-                            .pg_class => try sink.add(&.{ intCell(seq.oid), nameCell(seq.name.slice()), intCell(public), nameCell("S"), intCell(3) }),
+                            .pg_class => try classRow(sink, seq.oid, seq.name.slice(), catalog_module.public_namespace, 'S', 3, .{}),
                             .pg_sequence => try sink.add(&.{ intCell(seq.oid), intCell(seq.spec.type_oid), intCell(seq.spec.start), intCell(seq.spec.increment), intCell(seq.spec.max), intCell(seq.spec.min), intCell(seq.spec.cache), boolCell(seq.spec.cycle) }),
                             else => {},
                         }
@@ -5098,14 +5520,13 @@ pub fn Database(comptime config: Config) type {
                     const pkey = indexName(table) catch Name{};
                     var key_columns: [config.columns]u8 = undefined;
                     const primary_columns = primaryColumns(table, &key_columns);
-                    const relkind = [1]u8{table.relkind};
                     switch (view) {
                         .pg_class => {
-                            try sink.add(&.{ intCell(oid), nameCell(name), intCell(table.namespace), nameCell(&relkind), intCell(@intCast(table.column_count)) });
-                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), nameCell(pkey.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(primary_columns.len)) });
+                            try classRow(sink, table.oid, name, table.namespace, table.relkind, table.column_count, try self.tableClass(table, snapshot, relations[0..count], session_values));
+                            if (S.keyed(table)) try classRow(sink, S.primaryIndexOid(table), pkey.slice(), table.namespace, 'i', primary_columns.len, .{});
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
-                                try sink.add(&.{ intCell(index.oid), nameCell(index.name.slice()), intCell(table.namespace), nameCell("i"), intCell(@intCast(index.key_count + index.include_count)) });
+                                try classRow(sink, index.oid, index.name.slice(), table.namespace, 'i', index.key_count + index.include_count, .{});
                             }
                         },
                         .tables => {
@@ -5118,10 +5539,20 @@ pub fn Database(comptime config: Config) type {
                         },
                         .pg_index => {
                             var key: [4 * config.columns]u8 = undefined;
-                            if (S.keyed(table)) try sink.add(&.{ intCell(oid + 1), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)) });
+                            if (S.keyed(table)) try sink.add(&.{ intCell(S.primaryIndexOid(table)), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)), boolCell(true), boolCell(false), boolCell(false) });
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
-                                try sink.add(&.{ intCell(index.oid), intCell(oid), boolCell(false), boolCell(index.unique), nameCell(indexKey(index.keyColumns(), &key)) });
+                                try sink.add(&.{ intCell(index.oid), intCell(oid), boolCell(false), boolCell(index.unique), nameCell(indexKey(index.keyColumns(), &key)), boolCell(true), boolCell(false), boolCell(false) });
+                            }
+                        },
+                        .pg_constraint => {
+                            const primary = if (S.primaryConstraint(table)) |position| &table.constraints[position] else null;
+                            if (table.primary_constraint_oid != 0) {
+                                try self.constraintRow(sink, table, table.primary_constraint_oid, pkey.slice(), primary, .primary, snapshot);
+                            }
+                            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                                if (constraint.kind == .primary) continue;
+                                try self.constraintRow(sink, table, constraint.oid, constraint.name.slice(), constraint, constraint.kind, snapshot);
                             }
                         },
                         .pg_indexes => {
@@ -5136,7 +5567,7 @@ pub fn Database(comptime config: Config) type {
                             }
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
                                 if (constraint.kind != .exclusion) continue;
-                                var definition: Writer512 = .{ .out = &text };
+                                var definition: CatalogTextWriter = .{ .out = &text };
                                 definition.add("CREATE INDEX ");
                                 definition.add(constraint.name.slice());
                                 definition.add(" ON ");
@@ -5194,7 +5625,7 @@ pub fn Database(comptime config: Config) type {
                             };
                             const has_expression = kind == .default or kind == .generated;
                             switch (view) {
-                                .pg_attribute => try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(types.typeOid(column.data_type)), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind != .generated) "" else if (column.virtual) "v" else "s"), boolCell(has_expression) }),
+                                .pg_attribute => try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(types.typeOid(column.data_type)), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind != .generated) "" else if (column.virtual) "v" else "s"), boolCell(has_expression), intCell(collation.typeCollation(types.typeOfData(column.data_type))) }),
                                 .pg_attrdef => if (has_expression) {
                                     try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column) });
                                 },
@@ -5219,82 +5650,419 @@ pub fn Database(comptime config: Config) type {
 
         /// pg_indexes.indexdef of a primary key or UNIQUE constraint index.
         fn indexDefinition(table: *const S.Table, schema_name: []const u8, index_name: []const u8, unique: bool, columns: []const u8, out: *[512]u8) []const u8 {
-            var text: Writer512 = .{ .out = out };
-            text.add(if (unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
-            text.add(index_name);
-            text.add(" ON ");
-            text.add(schema_name);
-            text.add(".");
-            text.add(table.name.slice());
-            text.add(" USING btree (");
-            for (columns, 0..) |column, position| {
-                if (position != 0) text.add(", ");
-                text.add(table.columns[column].name.slice());
-            }
-            text.add(")");
+            var text: CatalogTextWriter = .{ .out = out };
+            writeIndexDefinition(table, schema_name, index_name, unique, columns, null, false, &text);
             return text.slice();
         }
 
         /// pg_indexes.indexdef of a secondary index (expression elements and
         /// the predicate are their stored source texts).
         fn secondaryDefinition(table: *const S.Table, schema_name: []const u8, index: *const S.Index, out: *[512]u8) []const u8 {
-            var text: Writer512 = .{ .out = out };
-            text.add(if (index.unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
-            text.add(index.name.slice());
-            text.add(" ON ");
-            text.add(schema_name);
-            text.add(".");
-            text.add(table.name.slice());
-            text.add(" USING btree (");
-            var at: usize = 0;
-            const expressions = index.expressions.slice();
-            for (index.keyColumns(), 0..) |column, position| {
-                if (position != 0) text.add(", ");
-                if (column == S.expression_key) {
-                    var end = at;
-                    while (end < expressions.len and expressions[end] != 0) end += 1;
-                    text.add("(");
-                    text.add(expressions[at..end]);
-                    text.add(")");
-                    at = end + 1;
-                } else text.add(table.columns[column].name.slice());
-                const descending = index.options[position] & 1 != 0;
-                const nulls_first = index.options[position] & 2 != 0;
-                if (descending) text.add(" DESC");
-                if (nulls_first and !descending) text.add(" NULLS FIRST");
-                if (!nulls_first and descending) text.add(" NULLS LAST");
-            }
-            text.add(")");
-            if (index.include_count != 0) {
-                text.add(" INCLUDE (");
-                for (index.includes[0..index.include_count], 0..) |column, position| {
-                    if (position != 0) text.add(", ");
-                    text.add(table.columns[column].name.slice());
-                }
-                text.add(")");
-            }
-            if (index.nulls_not_distinct) text.add(" NULLS NOT DISTINCT");
-            if (index.predicate.len != 0) {
-                text.add(" WHERE (");
-                text.add(index.predicate.slice());
-                text.add(")");
-            }
+            var text: CatalogTextWriter = .{ .out = out };
+            writeIndexDefinition(table, schema_name, index.name.slice(), index.unique, index.keyColumns(), index, false, &text);
             return text.slice();
         }
 
-        /// Bounded text assembly (truncates at 512 bytes).
-        const Writer512 = struct {
-            out: *[512]u8,
+        fn writeIndexDefinition(table: *const S.Table, schema: ?[]const u8, index_name: []const u8, unique: bool, keys: []const u8, index: ?*const S.Index, pretty: bool, text: *CatalogTextWriter) void {
+            text.add(if (unique) "CREATE UNIQUE INDEX " else "CREATE INDEX ");
+            text.ident(index_name);
+            text.add(" ON ");
+            if (schema) |name| {
+                text.ident(name);
+                text.add(".");
+            }
+            text.ident(table.name.slice());
+            text.add(" USING btree (");
+            var expressions = if (index) |secondary| secondary.expressions.slice() else &.{};
+            for (keys, 0..) |column, position| {
+                if (position != 0) text.add(", ");
+                writeIndexKey(table, column, &expressions, text);
+                if (index) |secondary| {
+                    const descending = secondary.options[position] & 1 != 0;
+                    const nulls_first = secondary.options[position] & 2 != 0;
+                    if (descending) text.add(" DESC");
+                    if (nulls_first and !descending) text.add(" NULLS FIRST");
+                    if (!nulls_first and descending) text.add(" NULLS LAST");
+                }
+            }
+            text.add(")");
+            const secondary = index orelse return;
+            if (secondary.include_count != 0) {
+                text.add(" INCLUDE (");
+                for (secondary.includes[0..secondary.include_count], 0..) |column, position| {
+                    if (position != 0) text.add(", ");
+                    text.ident(table.columns[column].name.slice());
+                }
+                text.add(")");
+            }
+            if (secondary.nulls_not_distinct) text.add(" NULLS NOT DISTINCT");
+            if (secondary.predicate.len != 0) {
+                text.add(if (pretty) " WHERE " else " WHERE (");
+                text.add(secondary.predicate.slice());
+                if (!pretty) text.add(")");
+            }
+        }
+
+        fn takeIndexExpression(expressions: *[]const u8) []const u8 {
+            const source = expressions.*;
+            const end = std.mem.indexOfScalar(u8, source, 0) orelse source.len;
+            expressions.* = if (end == source.len) &.{} else source[end + 1 ..];
+            return source[0..end];
+        }
+
+        fn writeIndexKey(table: *const S.Table, column: u8, expressions: *[]const u8, text: *CatalogTextWriter) void {
+            if (column == S.expression_key) {
+                text.add("(");
+                text.add(takeIndexExpression(expressions));
+                text.add(")");
+            } else text.ident(table.columns[column].name.slice());
+        }
+
+        fn postgresIndexDefinition(ptr: *anyopaque, oid: u32, column: i32, pretty: bool, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const table = &self.tables[found.slot];
+                if (oid != 0 and S.primaryIndexOid(table) == oid) {
+                    var columns: [config.columns]u8 = undefined;
+                    const name = try indexName(table);
+                    return try self.renderIndex(table, name.slice(), true, primaryColumns(table, &columns), null, column, pretty, out);
+                }
+                for (table.indexes[0..table.index_count]) |*index| {
+                    if (index.oid != 0 and index.oid == oid) {
+                        return try self.renderIndex(table, index.name.slice(), index.unique, index.keyColumns(), index, column, pretty, out);
+                    }
+                }
+            }
+            return null;
+        }
+
+        fn foreignActionCode(action: S.ForeignAction) []const u8 {
+            return switch (action) { .no_action => "a", .restrict => "r", .cascade => "c", .set_null => "n", .set_default => "d" };
+        }
+
+        fn foreignActionText(action: S.ForeignAction) []const u8 {
+            return switch (action) { .no_action => "NO ACTION", .restrict => "RESTRICT", .cascade => "CASCADE", .set_null => "SET NULL", .set_default => "SET DEFAULT" };
+        }
+
+        fn constraintRow(self: *const Self, sink: *X.RowSink, table: *const S.Table, oid: u32, name: []const u8, constraint: ?*const S.Constraint, kind: S.ConstraintKind, snapshot: Snapshot) Error!void {
+            const label = switch (kind) { .check => "c", .unique => "u", .primary => "p", .foreign => "f", .exclusion => "x" };
+            const deferrable = if (constraint) |item| item.deferrable else false;
+            const deferred = if (constraint) |item| item.initially_deferred else false;
+            const foreign = if (kind == .foreign) constraint else null;
+            const index = if (kind == .primary) S.primaryIndexOid(table) else if (foreign) |item| self.referencedConstraintIndex(item, snapshot) else 0;
+            try sink.add(&.{
+                intCell(oid), nameCell(name), intCell(table.namespace), nameCell(label),
+                boolCell(deferrable), boolCell(deferred), boolCell(true), boolCell(true),
+                intCell(table.oid), intCell(0), intCell(index), intCell(0),
+                intCell(if (foreign) |item| item.ref_oid else 0),
+                nameCell(if (foreign) |item| foreignActionCode(item.on_update) else " "),
+                nameCell(if (foreign) |item| foreignActionCode(item.on_delete) else " "),
+                nameCell(if (foreign != null) "s" else " "), boolCell(false),
+            });
+        }
+
+        fn sameIndexKeys(expected: []const u8, actual: []const u8) bool {
+            if (expected.len != actual.len) return false;
+            for (expected) |column| {
+                if (std.mem.indexOfScalar(u8, actual, column) == null) return false;
+            }
+            return true;
+        }
+
+        fn referencedConstraintIndex(self: *const Self, constraint: *const S.Constraint, snapshot: Snapshot) u32 {
+            const slot = self.visibleTableSlot(constraint.ref_oid, snapshot) orelse return 0;
+            const parent = &self.tables[slot];
+            var keys: [config.columns]u8 = undefined;
+            if (sameIndexKeys(constraint.refColumns(), primaryColumns(parent, &keys))) return S.primaryIndexOid(parent);
+            for (parent.indexes[0..parent.index_count]) |*index| {
+                if (index.unique and index.predicate.len == 0 and sameIndexKeys(constraint.refColumns(), index.keyColumns())) return index.oid;
+            }
+            return 0;
+        }
+
+        fn writeConstraintColumns(table: *const S.Table, columns: []const u8, text: *CatalogTextWriter) void {
+            text.add("(");
+            for (columns, 0..) |column, position| {
+                if (position != 0) text.add(", ");
+                text.ident(table.columns[column].name.slice());
+            }
+            text.add(")");
+        }
+
+        fn postgresStatisticsColumns(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const index = self.catalog_objects.byOid(.statistics, oid, self.seq_snap) orelse return null;
+            const object = &self.catalog_objects.items[index];
+            const slot = self.visibleTableSlot(object.grantee, self.seq_snap) orelse return null;
+            const table = &self.tables[slot];
+            var text: CatalogTextWriter = .{ .out = out };
+            for (object.textSlice(), 0..) |column, position| {
+                if (position != 0) text.add(", ");
+                text.ident(table.columns[column].name.slice());
+            }
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
+        }
+
+        fn postgresPartitionKey(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const index = self.visibleTableSlot(oid, self.seq_snap) orelse return null;
+            const table = &self.tables[index];
+            const prefix = switch (table.partition.strategy) {
+                .none => return null,
+                .range => "RANGE (",
+                .list => "LIST (",
+            };
+            var text: CatalogTextWriter = .{ .out = out };
+            text.add(prefix);
+            text.ident(table.columns[table.partition.key].name.slice());
+            text.add(")");
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
+        }
+
+        fn postgresConstraintDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(self.seq_snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                const table = &self.tables[found.slot];
+                if (oid != 0 and table.primary_constraint_oid == oid) {
+                    const primary = if (S.primaryConstraint(table)) |position| &table.constraints[position] else null;
+                    return try self.renderConstraint(table, primary, .primary, pretty, out);
+                }
+                for (table.constraints[0..table.constraint_count]) |*constraint| {
+                    if (oid != 0 and constraint.oid == oid) {
+                        return try self.renderConstraint(table, constraint, constraint.kind, pretty, out);
+                    }
+                }
+            }
+            return null;
+        }
+
+        fn postgresTriggerDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const snapshot = self.seq_snap;
+            for (&self.objects.triggers) |*trigger| {
+                if (!trigger.live or trigger.oid != oid or !trigger.stamp.visible(snapshot)) continue;
+                const slot = self.visibleTableSlot(trigger.table_oid, snapshot) orelse return null;
+                const table = &self.tables[slot];
+                const routine_slot = self.objects.routineByOid(trigger.function_oid, snapshot) orelse return null;
+                const routine = &self.objects.routines[routine_slot];
+                var text: CatalogTextWriter = .{ .out = out };
+                text.add("CREATE TRIGGER ");
+                text.ident(trigger.name.slice());
+                text.add(if (trigger.tgtype & tg.tg_before != 0) " BEFORE " else " AFTER ");
+                var preceding_event = false;
+                inline for (.{ .{ tg.tg_insert, "INSERT" }, .{ tg.tg_delete, "DELETE" }, .{ tg.tg_update, "UPDATE" }, .{ tg.tg_truncate, "TRUNCATE" } }) |event| {
+                    if (trigger.tgtype & event[0] != 0) {
+                        if (preceding_event) text.add(" OR ");
+                        text.add(event[1]);
+                        preceding_event = true;
+                        if (event[0] == tg.tg_update and trigger.column_count != 0) {
+                            text.add(" OF ");
+                            for (trigger.columns[0..trigger.column_count], 0..) |column, index| {
+                                if (column >= table.column_count) return error.ColumnNotFound;
+                                if (index != 0) text.add(", ");
+                                text.ident(table.columns[column].name.slice());
+                            }
+                        }
+                    }
+                }
+                text.add(" ON ");
+                if (!pretty or !self.inRelationSearchPath(table.namespace, table.name.slice())) {
+                    text.ident(self.namespaceName(table.namespace));
+                    text.add(".");
+                }
+                text.ident(table.name.slice());
+                text.add(if (trigger.tgtype & tg.tg_row != 0) " FOR EACH ROW " else " FOR EACH STATEMENT ");
+                if (trigger.when.len != 0) {
+                    text.add("WHEN (");
+                    text.add(trigger.when.slice());
+                    text.add(") ");
+                }
+                text.add("EXECUTE FUNCTION ");
+                text.ident(routine.name.slice());
+                text.add("(");
+                for (0..trigger.nargs) |index| {
+                    if (index != 0) text.add(", ");
+                    text.literal(trigger.argument(index));
+                }
+                text.add(")");
+                if (text.shortened) return error.TextCapacity;
+                return text.len;
+            }
+            return null;
+        }
+
+        fn postgresPartitionAncestors(ptr: *anyopaque, oid: u32, out: []u32) Error!usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const snapshot = self.seq_snap;
+            var slot = self.visibleTableSlot(oid, snapshot) orelse return 0;
+            const first = &self.tables[slot];
+            if (first.relkind != 'p' and first.partition.bound == .none) return 0;
+            var count: usize = 0;
+            while (true) {
+                if (count == out.len) return error.InvalidChangeRecord;
+                const table = &self.tables[slot];
+                out[count] = table.oid;
+                count += 1;
+                if (table.partition.bound == .none) return count;
+                slot = self.visibleTableSlot(table.parent, snapshot) orelse return error.InvalidChangeRecord;
+            }
+        }
+
+        fn renderConstraint(self: *const Self, table: *const S.Table, constraint: ?*const S.Constraint, kind: S.ConstraintKind, pretty: bool, out: []u8) Error!usize {
+            var text: CatalogTextWriter = .{ .out = out };
+            switch (kind) {
+                .primary => {
+                    var keys: [config.columns]u8 = undefined;
+                    text.add("PRIMARY KEY ");
+                    writeConstraintColumns(table, primaryColumns(table, &keys), &text);
+                },
+                .unique => {
+                    const item = constraint.?;
+                    text.add(if (item.nulls_not_distinct) "UNIQUE NULLS NOT DISTINCT " else "UNIQUE ");
+                    writeConstraintColumns(table, item.keyColumns(), &text);
+                },
+                .check => {
+                    const expression = constraint.?.expression.slice();
+                    text.add(if (pretty) "CHECK (" else "CHECK ((");
+                    text.add(expression);
+                    text.add(if (pretty) ")" else "))");
+                },
+                .foreign => {
+                    const item = constraint.?;
+                    const slot = self.visibleTableSlot(item.ref_oid, self.seq_snap) orelse return error.TableNotFound;
+                    const parent = &self.tables[slot];
+                    text.add("FOREIGN KEY ");
+                    writeConstraintColumns(table, item.keyColumns(), &text);
+                    text.add(" REFERENCES ");
+                    if (!self.inRelationSearchPath(parent.namespace, parent.name.slice())) {
+                        text.ident(self.namespaceName(parent.namespace));
+                        text.add(".");
+                    }
+                    text.ident(parent.name.slice());
+                    writeConstraintColumns(parent, item.refColumns(), &text);
+                    if (item.on_update != .no_action) {
+                        text.add(" ON UPDATE ");
+                        text.add(foreignActionText(item.on_update));
+                    }
+                    if (item.on_delete != .no_action) {
+                        text.add(" ON DELETE ");
+                        text.add(foreignActionText(item.on_delete));
+                    }
+                },
+                // The original exclusion definition does not retain the
+                // chosen access method, so it cannot be reconstructed yet.
+                .exclusion => return error.UnsupportedStatement,
+            }
+            if (constraint) |item| {
+                if (item.deferrable) text.add(" DEFERRABLE");
+                if (item.initially_deferred) text.add(" INITIALLY DEFERRED");
+            }
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
+        }
+
+        fn renderIndex(self: *const Self, table: *const S.Table, name: []const u8, unique: bool, keys: []const u8, index: ?*const S.Index, column: i32, pretty: bool, out: []u8) Error!usize {
+            var text: CatalogTextWriter = .{ .out = out };
+            if (column == 0) {
+                const schema = if (pretty and self.inRelationSearchPath(table.namespace, table.name.slice())) null else self.namespaceName(table.namespace);
+                writeIndexDefinition(table, schema, name, unique, keys, index, pretty, &text);
+            } else if (column > 0) {
+                const position: usize = @intCast(column - 1);
+                if (position < keys.len) {
+                    var expressions = if (index) |secondary| secondary.expressions.slice() else &.{};
+                    for (keys[0..position]) |key| if (key == S.expression_key) {
+                        _ = takeIndexExpression(&expressions);
+                    };
+                    writeIndexKey(table, keys[position], &expressions, &text);
+                } else if (index) |secondary| {
+                    const included = position - keys.len;
+                    if (included < secondary.include_count) text.ident(table.columns[secondary.includes[included]].name.slice());
+                }
+            }
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
+        }
+
+        const CatalogTextWriter = struct {
+            out: []u8,
             len: usize = 0,
-            fn add(self: *Writer512, bytes: []const u8) void {
+            shortened: bool = false,
+
+            fn add(self: *CatalogTextWriter, bytes: []const u8) void {
                 const take = @min(bytes.len, self.out.len - self.len);
                 @memcpy(self.out[self.len..][0..take], bytes[0..take]);
                 self.len += take;
+                self.shortened = self.shortened or take != bytes.len;
             }
-            fn slice(self: *const Writer512) []const u8 {
+
+            fn ident(self: *CatalogTextWriter, name: []const u8) void {
+                // The catalog limits stored identifiers to 255 bytes.
+                var quoted: [512]u8 = undefined;
+                self.add(quoted[0..quoteIdentifier(name, &quoted)]);
+            }
+
+            fn literal(self: *CatalogTextWriter, value: []const u8) void {
+                self.add("'");
+                for (value, 0..) |byte, index| {
+                    if (byte == '\'') self.add("'");
+                    self.add(value[index..][0..1]);
+                }
+                self.add("'");
+            }
+
+            fn slice(self: *const CatalogTextWriter) []const u8 {
                 return self.out[0..self.len];
             }
         };
+
+        fn partitionBoundText(self: *const Self, table: *const S.Table, snapshot: Snapshot, session_values: *const value_module.Session) Error!Cell {
+            if (table.partition.bound == .none) return .null_value;
+            if (table.partition.bound == .default) return nameCell("DEFAULT");
+            const parent_index = self.visibleTableSlot(table.parent, snapshot) orelse return error.TableNotFound;
+            const parent = &self.tables[parent_index];
+            const family = types.typeOfData(parent.columns[parent.partition.key].data_type);
+            const bound = &table.partition;
+            var buffer: [config.text_bytes]u8 = undefined;
+            var rendered: CatalogTextWriter = .{ .out = &buffer };
+            if (bound.bound == .range) {
+                rendered.add("FOR VALUES FROM (");
+                if (bound.unbounded & 1 != 0) rendered.add("MINVALUE") else try partitionLiteral(&rendered, &bound.values[0], family, session_values);
+                rendered.add(") TO (");
+                if (bound.unbounded & 2 != 0) rendered.add("MAXVALUE") else try partitionLiteral(&rendered, &bound.values[1], family, session_values);
+            } else {
+                rendered.add("FOR VALUES IN (");
+                for (bound.values[0..bound.count], 0..) |*cell, index| {
+                    if (index != 0) rendered.add(", ");
+                    try partitionLiteral(&rendered, cell, family, session_values);
+                }
+            }
+            rendered.add(")");
+            if (rendered.shortened) return error.TextCapacity;
+            return objectTextCell(rendered.slice());
+        }
+
+        fn partitionLiteral(rendered: *CatalogTextWriter, cell: *const Cell, family: types.Type, session_values: *const value_module.Session) Error!void {
+            if (cell.* == .null_value) {
+                rendered.add("NULL");
+                return;
+            }
+            var buffer: [Io.format_bytes]u8 = undefined;
+            const formatted = try Io.format(cell, family == .boolean, session_values, &buffer);
+            const unquoted = switch (family) {
+                .boolean => true,
+                .int4, .numeric => formatted.len != 0 and (formatted[0] >= '0' and formatted[0] <= '9'),
+                else => false,
+            };
+            if (unquoted) rendered.add(formatted) else rendered.literal(formatted);
+        }
 
         /// Primary-key columns in key order (empty without a primary key).
         fn primaryColumns(table: *const S.Table, out: *[config.columns]u8) []const u8 {
@@ -5520,6 +6288,7 @@ pub fn Database(comptime config: Config) type {
             table.namespace = create.namespace;
             S.setConstraints(table, create.constraints[0..create.constraint_count]);
             S.setExtras(table, &create.extras);
+            try self.assignConstraintOids(table, null);
             // A foreign key to the table itself takes its OID now.
             for (table.constraints[0..table.constraint_count]) |*constraint| {
                 if (constraint.kind == .foreign and constraint.ref_oid == 0) constraint.ref_oid = table.oid;
@@ -5594,10 +6363,15 @@ pub fn Database(comptime config: Config) type {
 
         /// AccessExclusive already stabilizes the table. Retire its latest
         /// committed rows and our earlier writes, as logical WAL replay does.
+        fn checkPendingLatePrimary(table: *const S.Table) Error!void {
+            if (table.pending_create and table.pending_late_primary) return error.UnsupportedStatement;
+        }
+
         fn truncateSlot(self: *Self, slot: u16, index: usize, snap: Snapshot, comptime kind: M.WriteKind) Error!void {
             try self.reserveWrites(slot, 1);
             const tx = &self.txs[slot];
             const table = &self.tables[index];
+            try checkPendingLatePrimary(table);
             var current = snap;
             current.csn = self.csn;
             for (0..table.row_high) |row| {
@@ -5613,6 +6387,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {
+            try checkPendingLatePrimary(&self.tables[index]);
             try self.fenceBankPlacement(slot, false);
             try self.lockTable(slot, index, .access_exclusive);
             const tx = &self.txs[slot];
@@ -5737,6 +6512,20 @@ pub fn Database(comptime config: Config) type {
             // dense bank move can change later heterogeneous CREATE choices.
             if (S.anyIntegralBank(&self.tables)) return error.UnsupportedStatement;
             const source = &self.tables[alter.table];
+            try checkPendingLatePrimary(source);
+            var late_primary = false;
+            if (!S.keyed(source)) for (alter.columns[0..alter.count]) |*column| {
+                late_primary = late_primary or column.primary_key;
+            };
+            if (late_primary) {
+                const tx = &self.txs[slot];
+                for (tx.writes[0..tx.write_len]) |entry| switch (entry.kind) {
+                    .insert, .update, .delete, .truncate, .refresh_rows, .create_table, .alter_table, .drop_table => {
+                        if (self.tables[entry.table].oid == source.oid) return error.UnsupportedStatement;
+                    },
+                    else => {},
+                };
+            }
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);
             }
@@ -5773,6 +6562,8 @@ pub fn Database(comptime config: Config) type {
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
             S.setExtras(copy, &alter.extras);
+            if (S.keyed(copy)) copy.primary_index_oid = source.primary_index_oid;
+            try self.assignConstraintOids(copy, source);
             S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
             copy.live = true;
             copy.pending_create = true;
@@ -5784,7 +6575,11 @@ pub fn Database(comptime config: Config) type {
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_delete, .table = @intFromEnum(change.relation), .old = change.version }) catch unreachable;
             count = try self.catalog.create(index, copy, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
-            try self.validateAltered(slot, index, alter, snap);
+            // A rewrite changes every row's definition. Include writes that
+            // committed before the exclusive lock, even for an older snapshot.
+            var validation_snap = snap;
+            validation_snap.csn = self.csn;
+            try self.validateAltered(slot, index, alter, validation_snap);
             // CREATE INDEX: OIDs are taken last, so a failed statement
             // leaves the counter as it was (abort restores a tail OID).
             for (copy.indexes[0..copy.index_count]) |*created| if (created.oid == 0) {
@@ -5792,7 +6587,12 @@ pub fn Database(comptime config: Config) type {
                 created.oid = change_log.first_oid + self.oid_counter;
                 self.oid_counter += 1;
             };
+            if (late_primary) {
+                copy.primary_index_oid = try self.takeOid();
+                copy.pending_late_primary = true;
+            }
             try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
+            try self.remapStatistics(slot, source.oid, alter.sources[0..alter.count], snap);
         }
 
         /// Existing rows against the constraints ALTER TABLE added or
@@ -5832,8 +6632,14 @@ pub fn Database(comptime config: Config) type {
                     if (!has_null) try self.referencedRow(slot, index, constraint, cells, snap);
                 }
                 for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
-                    if (!alter.check_constraint[position] or !S.scannedUnique(table, constraint)) continue;
-                    switch (S.uniqueCheck(table, constraint, cells, @intCast(row), snap)) {
+                    if (!alter.check_constraint[position]) continue;
+                    const status = if (constraint.kind == .primary and table.primary_column != null)
+                        S.primaryKeyCheck(table, &cells[table.primary_column.?], @intCast(row), snap)
+                    else if (S.scannedUnique(table, constraint))
+                        S.uniqueCheck(table, constraint, cells, @intCast(row), snap)
+                    else
+                        continue;
+                    switch (status) {
                         .free => {},
                         .taken => return error.PrimaryKeyViolation,
                         .wait => |owner| {
@@ -6375,6 +7181,7 @@ pub fn Database(comptime config: Config) type {
         fn placeUpdate(self: *Self, slot: u16, table_index: usize, row: u32, old: u32, cells: *const E.Row, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[table_index];
+            try checkPendingLatePrimary(table);
             try self.reserveWrites(slot, 1);
             try S.ensureVersions(table, 1, self.horizon());
             const version = S.createVersion(table, .{ .row = row, .xmin = tx.ref(slot), .cid = snap.cid, .older = old + 1 }, cells);
@@ -6686,6 +7493,7 @@ pub fn Database(comptime config: Config) type {
         fn placeInsert(self: *Self, slot: u16, table_index: usize, rowid: u64, cells: *const E.Row, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[table_index];
+            try checkPendingLatePrimary(table);
             try self.reserveWrites(slot, 1);
             const at = self.horizon();
             try S.ensureVersions(table, 1, at);
@@ -6958,7 +7766,7 @@ pub fn Database(comptime config: Config) type {
             if (!self.privilegedRole(snap)) {
                 try self.needTable(bound.table, CO.priv_insert, snap);
                 // COPY FROM is not supported with row-level security (0A000).
-                if (self.catalog_objects.rowSecurity(self.session.role, self.tables[bound.table].oid, snap)) return error.UnsupportedStatement;
+                if (try self.checkRowSecurity(self.session.role, self.tables[bound.table].oid, self.session.row_security, snap)) return error.UnsupportedStatement;
             }
             var info: CopyInfo = .{ .direction = .from, .options = try copyOptions(&copy), .count = bound.count };
             const table = &self.tables[bound.table];
@@ -6976,7 +7784,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
@@ -7366,6 +8174,7 @@ pub fn Database(comptime config: Config) type {
         fn placeDelete(self: *Self, slot: u16, table_index: usize, goal: u32, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const table = &self.tables[table_index];
+            try checkPendingLatePrimary(table);
             try self.reserveWrites(slot, 1);
             table.versions[goal].xmax = tx.ref(slot);
             table.versions[goal].xmax_cid = snap.cid;
@@ -7609,7 +8418,73 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
+        const SettingKind = enum { search_path, check_function_bodies, row_security, synchronize_seqscans, restrict_nonsystem_relation_kind, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
+
+        const SettingDescriptor = struct {
+            kind: SettingKind,
+            vartype: []const u8,
+            description: []const u8,
+        };
+
+        const setting_descriptors = [_]SettingDescriptor{
+            .{ .kind = .check_function_bodies, .vartype = "bool", .description = "Validate routine bodies during CREATE FUNCTION and CREATE PROCEDURE." },
+            .{ .kind = .default_transaction_deferrable, .vartype = "bool", .description = "Default deferrable mode for new transactions." },
+            .{ .kind = .default_transaction_isolation, .vartype = "enum", .description = "Default isolation level for new transactions." },
+            .{ .kind = .default_transaction_read_only, .vartype = "bool", .description = "Default read-only mode for new transactions." },
+            .{ .kind = .restrict_nonsystem_relation_kind, .vartype = "string", .description = "Disallow access to selected kinds of non-system relations." },
+            .{ .kind = .search_path, .vartype = "string", .description = "Schema search order for unqualified names." },
+        };
+
+        fn settingOriginBit(kind: SettingKind) u8 {
+            for (setting_descriptors, 0..) |descriptor, index| {
+                if (descriptor.kind == kind) return @as(u8, 1) << @as(u3, @intCast(index));
+            }
+            return 0;
+        }
+
+        fn engineSettingValue(values: *const Sess.Values, kind: SettingKind) ?[]const u8 {
+            return switch (kind) {
+                .search_path => values.search_path.slice(),
+                .check_function_bodies => onOff(values.check_function_bodies),
+                .restrict_nonsystem_relation_kind => values.restriction_text.slice(),
+                .default_transaction_isolation => levelName(values.isolation),
+                .default_transaction_read_only => onOff(values.read_only),
+                .default_transaction_deferrable => onOff(values.deferrable),
+                else => null,
+            };
+        }
+
+        fn isolationNames() Error!Cell {
+            const levels = [_]M.Level{ .serializable, .repeatable_read, .read_committed, .read_uncommitted };
+            var out: Text = .{};
+            var shape: array_module.Shape = .{ .element = .text, .ndim = 1 };
+            shape.dims[0] = levels.len;
+            var writer = try V.Arrays.Writer.begin(&out, &shape);
+            for (levels) |level| {
+                const cell = nameCell(levelName(level));
+                try writer.append(&cell);
+            }
+            return .{ .array = out };
+        }
+
+        fn settingRows(state: *const Sess.State, sink: *X.RowSink) Error!void {
+            const boot: Sess.Values = .{};
+            // A projection can run set_config. The scan exposes a consistent
+            // initial image even if a row changes its session while projecting.
+            const values = state.values;
+            for (setting_descriptors, 0..) |descriptor, index| {
+                const bit = @as(u8, 1) << @as(u3, @intCast(index));
+                const source: []const u8 = if (values.session_settings & bit != 0) "session" else if (values.client_settings & bit != 0) "client" else "default";
+                const enumvals: Cell = if (descriptor.kind == .default_transaction_isolation) try isolationNames() else .null_value;
+                try sink.add(&.{
+                    try objectTextCell(@tagName(descriptor.kind)), try objectTextCell(engineSettingValue(&values, descriptor.kind).?), .null_value,
+                    try objectTextCell("Client Connection Defaults / Statement Behavior"), try objectTextCell(descriptor.description), .null_value,
+                    nameCell("user"), nameCell(descriptor.vartype), nameCell(source), .null_value, .null_value, enumvals,
+                    try objectTextCell(engineSettingValue(&boot, descriptor.kind).?), try objectTextCell(engineSettingValue(&state.startup, descriptor.kind).?),
+                    .null_value, .null_value, boolCell(false),
+                });
+            }
+        }
 
         fn settingKind(name: []const u8) ?SettingKind {
             inline for (@typeInfo(SettingKind).@"enum".field_names) |field| {
@@ -7628,7 +8503,7 @@ pub fn Database(comptime config: Config) type {
 
         /// Settings PostgreSQL has that the caller (Store) implements.
         fn callerSetting(name: []const u8) bool {
-            for ([_][]const u8{ "timezone", "datestyle", "intervalstyle", "application_name", "client_encoding", "statement_timeout", "lock_timeout", "deadlock_timeout", "standard_conforming_strings", "server_version", "server_encoding", "integer_datetimes" }) |known| {
+            for ([_][]const u8{ "timezone", "datestyle", "intervalstyle", "xmloption", "application_name", "client_encoding", "client_min_messages", "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "transaction_timeout", "deadlock_timeout", "standard_conforming_strings", "server_version", "server_encoding", "integer_datetimes", "extra_float_digits", "default_table_access_method", "default_tablespace" }) |known| {
                 if (Sess.sameInsensitive(name, known)) return true;
             }
             return false;
@@ -7679,10 +8554,11 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// search_path as PostgreSQL flattens it (GUC_LIST_QUOTE). Name
-        /// resolution here is fixed (pg_catalog, then public), so only lists
-        /// that resolve the same way are accepted: `public` plus any of
-        /// "$user", pg_catalog and pg_temp (0A000 otherwise).
+        /// resolution supports the default public path and an empty explicit
+        /// path. Additional schema orderings require resolver support.
         fn searchPath(raw: []const u8, kind: SettingValueKind, out: *Sess.SettingText) Error!void {
+            if (kind == .configuration_text and std.mem.trim(u8, raw, " \t\r\n").len == 0) return out.set("");
+            if (kind == .string and raw.len == 0) return out.set("\"\"");
             var buffer: [config.setting_bytes]u8 = undefined;
             var used: usize = 0;
             var public = false;
@@ -7735,9 +8611,53 @@ pub fn Database(comptime config: Config) type {
             elements.* += 1;
         }
 
+        fn assignRelationRestrictions(into: *Sess.Values, value_kind: SettingValueKind, value: []const u8) Error!void {
+            const spaces = " \t\n\r\x0b\x0c";
+            const separators = spaces ++ ",";
+            var remainder = std.mem.trim(u8, value, spaces);
+            var kinds: value_module.RestrictedRelationKinds = .{};
+            var display: Sess.SettingText = .{};
+            while (remainder.len != 0) {
+                const quote = remainder[0];
+                const quoted = quote == '"' or (quote == '\'' and value_kind == .word);
+                const end = if (quoted)
+                    (std.mem.indexOfScalar(u8, remainder[1..], quote) orelse return error.InvalidSettingValue) + 1
+                else
+                    std.mem.indexOfAny(u8, remainder, separators) orelse remainder.len;
+                const token = remainder[@intFromBool(quoted)..end];
+                const canonical: []const u8 = if (Sess.sameInsensitive(token, "view")) name: {
+                    kinds.view = true;
+                    break :name "view";
+                } else if (Sess.sameInsensitive(token, "foreign-table")) name: {
+                    kinds.foreign_table = true;
+                    break :name "foreign-table";
+                } else return error.InvalidSettingValue;
+                if (value_kind == .word) {
+                    const prefix: []const u8 = if (display.len == 0) "" else ", ";
+                    const length: usize = display.len;
+                    if (prefix.len + canonical.len > display.bytes.len - length) return error.SessionCapacity;
+                    @memcpy(display.bytes[length..][0..prefix.len], prefix);
+                    @memcpy(display.bytes[length + prefix.len ..][0..canonical.len], canonical);
+                    display.len = @intCast(length + prefix.len + canonical.len);
+                }
+                remainder = std.mem.trimStart(u8, remainder[end + @intFromBool(quoted) ..], spaces);
+                if (remainder.len == 0) break;
+                if (remainder[0] != ',') return error.InvalidSettingValue;
+                remainder = std.mem.trimStart(u8, remainder[1..], spaces);
+                if (remainder.len == 0) return error.InvalidSettingValue;
+            }
+            if (value_kind != .word) try display.set(value);
+            into.restricted_relation_kinds = kinds;
+            into.restriction_text = display;
+        }
+
         fn assignSetting(into: *Sess.Values, which: SettingKind, name: []const u8, kind: SettingValueKind, value: []const u8) Error!void {
             switch (which) {
                 .search_path => try searchPath(value, kind, &into.search_path),
+                .check_function_bodies => into.check_function_bodies = parseBool(value) orelse return error.InvalidSettingValue,
+                .row_security => into.row_security = parseBool(value) orelse return error.InvalidSettingValue,
+                .synchronize_seqscans => into.synchronize_seqscans = parseBool(value) orelse return error.InvalidSettingValue,
+                .restrict_nonsystem_relation_kind => try assignRelationRestrictions(into, kind, value),
                 .default_transaction_isolation => into.isolation = parseLevel(value) orelse return error.InvalidSettingValue,
                 .default_transaction_read_only => into.read_only = parseBool(value) orelse return error.InvalidSettingValue,
                 .default_transaction_deferrable => into.deferrable = parseBool(value) orelse return error.InvalidSettingValue,
@@ -7762,6 +8682,13 @@ pub fn Database(comptime config: Config) type {
         fn copySetting(into: *Sess.Values, source: *const Sess.Values, which: SettingKind, name: []const u8) Error!void {
             switch (which) {
                 .search_path => into.search_path = source.search_path,
+                .check_function_bodies => into.check_function_bodies = source.check_function_bodies,
+                .row_security => into.row_security = source.row_security,
+                .synchronize_seqscans => into.synchronize_seqscans = source.synchronize_seqscans,
+                .restrict_nonsystem_relation_kind => {
+                    into.restricted_relation_kinds = source.restricted_relation_kinds;
+                    into.restriction_text = source.restriction_text;
+                },
                 .default_transaction_isolation => into.isolation = source.isolation,
                 .default_transaction_read_only => into.read_only = source.read_only,
                 .default_transaction_deferrable => into.deferrable = source.deferrable,
@@ -7776,6 +8703,9 @@ pub fn Database(comptime config: Config) type {
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => {},
                 .role => into.role = source.role,
             }
+            const bit = settingOriginBit(which);
+            into.client_settings = (into.client_settings & ~bit) | (source.client_settings & bit);
+            into.session_settings = (into.session_settings & ~bit) | (source.session_settings & bit);
         }
 
         /// SET [LOCAL] name {TO|=} value | DEFAULT, and set_config. `slot`
@@ -7815,7 +8745,12 @@ pub fn Database(comptime config: Config) type {
                 try copySetting(&next, &state.startup, which, name);
             } else if (which == .role) {
                 next.role = try self.roleSetting(slot, kind, value);
-            } else try assignSetting(&next, which, name, kind, value);
+            } else {
+                try assignSetting(&next, which, name, kind, value);
+                const bit = settingOriginBit(which);
+                next.client_settings &= ~bit;
+                next.session_settings |= bit;
+            }
             if (slot != null) try state.preserve();
             if (local) {
                 if (slot != null) state.values = next;
@@ -7877,6 +8812,10 @@ pub fn Database(comptime config: Config) type {
             const state = self.session_state orelse &self.default_session_state;
             self.session.session_role = state.session_role;
             self.session.role = if (state.values.role != 0) state.values.role else state.session_role;
+            self.session.public_schema_on_path = state.values.publicSchemaOnPath();
+            self.session.row_security = state.values.row_security;
+            self.session.synchronize_seqscans = self.dialect == .postgres and state.values.synchronize_seqscans;
+            self.session.restricted_relation_kinds = state.values.restricted_relation_kinds;
         }
 
         /// RESET ALL of the engine settings (transaction modes excepted).
@@ -7897,11 +8836,9 @@ pub fn Database(comptime config: Config) type {
             };
             const state = self.sessionState();
             const tx: ?*const M.Tx = if (slot) |owner| (if (self.active(owner)) &self.txs[owner] else null) else null;
-            const text: []const u8 = switch (which) {
-                .search_path => state.values.search_path.slice(),
-                .default_transaction_isolation => levelName(state.values.isolation),
-                .default_transaction_read_only => onOff(state.values.read_only),
-                .default_transaction_deferrable => onOff(state.values.deferrable),
+            const text: []const u8 = engineSettingValue(&state.values, which) orelse switch (which) {
+                .row_security => onOff(state.values.row_security),
+                .synchronize_seqscans => onOff(state.values.synchronize_seqscans),
                 .transaction_isolation => levelName(if (tx) |t| t.isolation else state.values.isolation),
                 .transaction_read_only => onOff(if (tx) |t| t.read_only else state.values.read_only),
                 .transaction_deferrable => onOff(if (tx) |t| t.deferrable else state.values.deferrable),
@@ -7910,6 +8847,7 @@ pub fn Database(comptime config: Config) type {
                     break :blk state.values.custom[index].value.slice();
                 },
                 .role => if (state.values.role == 0) "none" else self.catalog_objects.roleName(state.values.role, self.settingSnapshot(slot)) orelse "none",
+                else => unreachable,
             };
             if (text.len > out.len) return error.TextCapacity;
             @memcpy(out[0..text.len], text);
@@ -7955,6 +8893,23 @@ pub fn Database(comptime config: Config) type {
         /// SET of an engine setting; `slot` is the open transaction block.
         pub fn sessionSet(self: *Self, slot: ?u16, local: bool, name: []const u8, kind: SettingValueKind, value: []const u8) Error!void {
             return self.setSetting(slot, local, name, kind, value);
+        }
+
+        /// Engine settings safe to configure before a connection authenticates.
+        pub fn sessionStartupSetting(self: *Self, name: []const u8, value: []const u8) Error!bool {
+            const setting = settingKind(name) orelse return false;
+            switch (setting) {
+                .check_function_bodies, .row_security, .synchronize_seqscans, .restrict_nonsystem_relation_kind => {},
+                else => return false,
+            }
+            try self.setSetting(null, false, name, .string, value);
+            const state = self.sessionState();
+            const bit = settingOriginBit(setting);
+            state.values.session_settings &= ~bit;
+            state.values.client_settings |= bit;
+            state.base = state.values;
+            state.startup = state.values;
+            return true;
         }
 
         pub fn sessionShow(self: *Self, slot: ?u16, name: []const u8, result: *Result) Error!void {
@@ -8203,6 +9158,7 @@ pub fn Database(comptime config: Config) type {
                 .access_exclusive => .access_exclusive,
             };
             for (lock.tables[0..lock.count], lock.only[0..lock.count]) |reference, only| {
+                if (reference.schema == null and !self.session.public_schema_on_path) return error.TableNotFound;
                 const schema_name = if (reference.schema) |qualifier| identName(source, qualifier) else Name{};
                 const namespace = namespaceFor(&self.catalog, if (reference.schema != null) schema_name.slice() else null, snap) orelse return error.UndefinedSchema;
                 const found = self.catalog.findIn(namespace, identName(source, reference.name).slice(), snap) orelse return error.TableNotFound;
@@ -8339,8 +9295,9 @@ pub fn Database(comptime config: Config) type {
             defer self.active_params = null;
             var copy = inner;
             // Parse analysis checks no privileges (EXECUTE does).
-            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy, CO.bootstrap_role);
+            const expanded = try expandRelations(self, &self.workspace, text, snap, &copy, CO.bootstrap_role, &self.session);
             var context = self.bindContext(expanded, mode, snap);
+            context.stored_source_start = text.len;
             context.describe_only = true;
             _ = try B.bind(&context, &copy);
             const entry = &state.prepared[index];
@@ -8400,6 +9357,7 @@ pub fn Database(comptime config: Config) type {
             const slot = self.seq_slot;
             switch (kind) {
                 .backend_pid => return .{ .integer = self.sessionState().pid },
+                .recovery_status => return .{ .integer = @intFromBool(self.startupRecoveryActive()) },
                 .current_setting => {
                     const length = self.settingText(slot, a, out) catch |err| {
                         if (err == error.UndefinedSetting and flags & 1 != 0) return .{ .null_value = true };
@@ -8410,7 +9368,9 @@ pub fn Database(comptime config: Config) type {
                 .set_config => {
                     if (a.len == 0) return error.InvalidParameterValue;
                     self.saveStatementSettings(slot);
-                    try self.setSetting(slot, flags & 1 != 0, a, if (flags & 2 != 0) .default else .string, b);
+                    const form: SettingValueKind = if (flags & 2 != 0) .default else if (Sess.sameInsensitive(a, "search_path")) .configuration_text else .string;
+                    try self.setSetting(slot, flags & 1 != 0, a, form, b);
+                    self.installRole();
                     return .{ .len = try self.settingText(slot, a, out) };
                 },
                 .advisory_try_lock, .advisory_unlock => {
@@ -8611,8 +9571,9 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.read_stats = .{};
             try self.session.checkpoint();
             // Routine statements run with the invoker's privileges (SECURITY INVOKER).
-            const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role);
-            const context = self.bindContext(source, .standard, snap);
+            const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role, &self.session);
+            var context = self.bindContext(source, .standard, snap);
+            context.stored_source_start = text.len;
             const bound = try B.bind(&context, parsed);
             const root = switch (bound) {
                 .query => |root| root,
@@ -8627,6 +9588,7 @@ pub fn Database(comptime config: Config) type {
                 self.workspace.query.pinned_refs = 0;
             }
             if (plans.dml_len != 0) {
+                try self.secureNewRows(&bound, source, snap);
                 try self.modifyingCtes(slot, source, snap);
                 try self.afterTriggers(slot, self.statement_start, null, snap);
             }
@@ -8696,6 +9658,24 @@ pub fn Database(comptime config: Config) type {
             return oid;
         }
 
+        fn takeConstraintOid(self: *Self) Error!u32 {
+            if (self.next_constraint_oid == 0xffffffff) return error.TableCapacity;
+            const oid = self.next_constraint_oid;
+            self.next_constraint_oid += 1;
+            return oid;
+        }
+
+        fn assignConstraintOids(self: *Self, table: *S.Table, previous: ?*const S.Table) Error!void {
+            if (S.keyed(table)) {
+                const saved = if (previous) |old| old.primary_constraint_oid else 0;
+                table.primary_constraint_oid = if (saved == 0) try self.takeConstraintOid() else saved;
+            }
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if (constraint.kind == .primary) continue;
+                if (previous == null or constraint.oid == 0) constraint.oid = try self.takeConstraintOid();
+            }
+        }
+
         fn objectSlot(self: *Self, class: tg.Class) Error!usize {
             for (0..2) |attempt| {
                 switch (class) {
@@ -8762,10 +9742,8 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
-        /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the body
-        /// (SQL: every statement parsed, analyzable ones bound and the final
-        /// result checked; PL/pgSQL: syntax of every statement), then writes
-        /// a new version (the replaced one is marked deleted, same OID).
+        /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the signature
+        /// and optionally analyzes the quoted body before writing its version.
         fn createRoutine(self: *Self, slot: u16, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
             var oid_buffer: [config.routine_args]u32 = undefined;
             const args = definition.argOids(&oid_buffer);
@@ -8784,7 +9762,7 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             if (definition.return_oid == tg.trigger_oid and (definition.language == 0 or definition.arg_count != 0)) return error.InvalidFunctionDefinition;
-            try self.validateRoutine(definition, snap);
+            if (self.sessionState().values.check_function_bodies) try self.validateRoutine(definition, snap);
             try self.reserveWrites(slot, 2);
             const index = try self.objectSlot(.routine);
             const oid = if (existing) |old| self.objects.routines[old].oid else try self.takeOid();
@@ -8862,8 +9840,9 @@ pub fn Database(comptime config: Config) type {
                 frame.variables.node_high = self.workspace.nodes.len;
                 self.routine_frame = frame;
                 // Body analysis checks no privileges (calls do).
-                const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role);
-                const context = self.bindContext(source, .standard, snap);
+                const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role, &self.session);
+                var context = self.bindContext(source, .standard, snap);
+                context.stored_source_start = text.len;
                 const bound = try B.bind(&context, &parsed);
                 self.routine_frame = saved_frame;
                 switch (bound) {
@@ -9371,6 +10350,7 @@ pub fn Database(comptime config: Config) type {
 
         /// A table or view named by a trigger / rule statement.
         fn namedTable(self: *Self, name: *const R.TableName, snap: Snapshot) Error!usize {
+            if (name.schema.len == 0 and !self.session.public_schema_on_path) return error.TableNotFound;
             const namespace = namespaceFor(&self.catalog, if (name.schema.len != 0) name.schema.slice() else null, snap) orelse return error.UndefinedSchema;
             const found = self.catalog.findIn(namespace, name.name.slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
@@ -9661,7 +10641,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {
                     if (!trigger.live or !trigger.stamp.visible(snapshot)) continue;
-                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), nameCell("O"), boolCell(false), intCell(@intCast(trigger.nargs)) });
+                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), nameCell("O"), boolCell(false), intCell(@intCast(trigger.nargs)), intCell(0) });
                 },
                 .pg_rewrite => for (&self.objects.rules) |*rule| {
                     if (!rule.live or !rule.stamp.visible(snapshot)) continue;
@@ -9674,7 +10654,7 @@ pub fn Database(comptime config: Config) type {
                     const table = &self.tables[table_index];
                     const schema_name = self.namespaceName(table.namespace);
                     var text: [512]u8 = undefined;
-                    var definition: Writer512 = .{ .out = &text };
+                    var definition: CatalogTextWriter = .{ .out = &text };
                     definition.add("CREATE RULE ");
                     definition.add(rule.name.slice());
                     definition.add(" AS\n    ON ");
@@ -9716,6 +10696,7 @@ pub fn Database(comptime config: Config) type {
             const special: []const u8 = switch (name.special) {
                 .none => return decodeIdent(source, name.ident, out),
                 .time_zone => "timezone",
+                .xml_option => "xmloption",
                 .transaction_isolation => "transaction_isolation",
             };
             out.len = special.len;
@@ -9733,11 +10714,22 @@ pub fn Database(comptime config: Config) type {
             }
             switch (value.kind) {
                 .default => out.len = 0,
-                .word, .number => {
+                .word => {
                     const raw = value.span.slice(source);
                     if (raw.len > out.bytes.len) return error.InvalidSettingValue;
                     out.len = raw.len;
                     @memcpy(out.bytes[0..raw.len], raw);
+                },
+                .number => {
+                    var raw = value.span.slice(source);
+                    if (value.integer) {
+                        while (raw.len > 1 and raw[0] == '0' and types.digit(raw[1])) raw = raw[1..];
+                    }
+                    const prefix: usize = @intFromBool(value.number_sign != 0);
+                    if (raw.len + prefix > out.bytes.len) return error.InvalidSettingValue;
+                    if (prefix != 0) out.bytes[0] = value.number_sign;
+                    @memcpy(out.bytes[prefix..][0..raw.len], raw);
+                    out.len = raw.len + prefix;
                 },
                 .string => {
                     if (value.quoted.len > out.bytes.len) return error.InvalidSettingValue;
@@ -9862,8 +10854,9 @@ pub fn Database(comptime config: Config) type {
             }
             var statement_copy = parsed;
             // Describing checks no privileges (execution does), as parse analysis.
-            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role);
+            const expanded = try expandRelations(self, &self.workspace, source, snap, &statement_copy, CO.bootstrap_role, &self.session);
             var context = self.bindContext(expanded, .standard, snap);
+            context.stored_source_start = source.len;
             context.describe_only=true;
             if (parsed == .select) context.user_type_catalog = &self.catalog_objects;
             const bound = try B.bind(&context, &statement_copy);
@@ -9925,6 +10918,11 @@ pub fn Database(comptime config: Config) type {
             self.wake_epoch +%= 1;
         }
 
+        pub fn replayQuiescent(self: *const Self) bool {
+            for (&self.txs) |*tx| if (tx.active) return false;
+            return true;
+        }
+
         /// Replay hook: committed catalog rows for a table slot just reset.
         pub fn replayCreate(self: *Self, index: usize, csn: u64) Error!void {
             var changes: [K.max_changes]K.Change = undefined;
@@ -9980,10 +10978,10 @@ pub fn Database(comptime config: Config) type {
             return change_log.opCount(record);
         }
 
-        /// Appends a catalog_counters op (next OID and every live table's next rowid).
+        /// Appends catalog OID counters and every live table's next row ID.
         pub fn encodeCatalogCounters(self: *const Self, record: []u8, used: *usize) Error!void {
             var writer = try change_log.Writer.init(record, used.*);
-            try C.encodeCounters(&writer, change_log.first_oid + self.oid_counter, &self.tables);
+            try C.encodeCounters(&writer, change_log.first_oid + self.oid_counter, self.next_constraint_oid, &self.tables);
             used.* = try writer.finish();
         }
 

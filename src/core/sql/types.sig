@@ -53,6 +53,9 @@ pub const Config = struct {
     /// Speculative ordered hash probes on a proven dense integer primary-key
     /// domain. Budget exhaustion restarts the ordinary scan; 0 disables it.
     ordered_probe_rows: usize = 8192,
+    /// Minimum row-directory span for synchronized PostgreSQL heap scans.
+    /// This tunes locality without limiting the size or results of a scan.
+    synchronized_scan_rows: usize = 16384,
     tables: usize = 4,
     columns: usize = 8,
     rows_per_table: usize = 128,
@@ -303,6 +306,8 @@ pub const Error = error{
     LockNotAvailable,
     /// SQLSTATE 57014: cancel request or statement_timeout.
     QueryCanceled,
+    /// SQLSTATE 25P04: session termination at the transaction deadline.
+    TransactionTimeout,
     /// SQLSTATE 53200: the transaction table is full.
     TransactionCapacity,
     /// SQLSTATE 53200: a transaction's write set (Config.tx_writes) is full.
@@ -424,6 +429,8 @@ pub const Error = error{
     InvalidForeignKey,
     /// SQLSTATE 55000: a materialized view that has not been populated.
     ObjectNotInPrerequisiteState,
+    RestrictedNonSystemView,
+    RestrictedNonSystemForeignTable,
     /// SQLSTATE 2202H: invalid TABLESAMPLE argument (B11).
     InvalidTablesampleArgument,
     /// SQLSTATE 2202G: NULL TABLESAMPLE REPEATABLE seed (B11).
@@ -979,6 +986,20 @@ pub fn typeByName(input: []const u8) ?DataType {
     return scalarByName(trimmed);
 }
 
+/// An already decoded PostgreSQL catalog identifier. Qualified lookups use
+/// pg_type names, including `_int2`, without SQL aliases such as `smallint`.
+pub fn typeByCatalogName(name: []const u8) ?DataType {
+    const array = name.len > 0 and name[0] == '_';
+    const base = if (array) name[1..] else name;
+    inline for (@typeInfo(DataType).@"enum".field_names) |field| {
+        const data_type = @field(DataType, field);
+        if (data_type != .mysql_bigint_unsigned and same(base, typeInfo(data_type).name)) {
+            return if (array) arrayData(data_type) else data_type;
+        }
+    }
+    return null;
+}
+
 fn scalarByName(input: []const u8) ?DataType {
     var text = input;
     while (text.len != 0 and (text[0] == ' ' or text[0] == '\t')) text = text[1..];
@@ -1027,6 +1048,7 @@ pub fn regtypeName(oid: u32) ?[]const u8 {
         0 => return "-",
         705 => return "unknown",
         2205 => return "regclass",
+        4089 => return "regnamespace",
         else => {},
     }
     const data_type = typeFromOid(oid) orelse return null;
@@ -1048,6 +1070,7 @@ pub fn regtypeInput(input: []const u8) error{ UndefinedObject, NumericValueOutOf
     if (input.len == 1 and input[0] == '-') return 0;
     if (keyword(input, "unknown")) return 705;
     if (keyword(input, "regclass")) return 2205;
+    if (keyword(input, "regnamespace")) return 4089;
     const data_type = typeByName(input) orelse return error.UndefinedObject;
     return typeOid(data_type);
 }
@@ -1069,7 +1092,7 @@ pub const DefaultKind = enum(u8) { none = 0, default = 1, identity_always = 2, i
 pub const CommandTag = enum { none, select, insert, update, delete, create_table, drop_table, begin, commit, rollback, savepoint, release, set, show, reset, create_sequence, drop_sequence, copy, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_index, drop_index, create_view, drop_view, create_materialized_view, drop_materialized_view, refresh_materialized_view, merge, set_constraints, create_table_as, lock_table, declare_cursor, fetch, move, close_cursor, prepare, deallocate, listen, notify, unlisten, create_function, drop_function, create_procedure, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule,
     // Catalog objects (B11 wave 3).
     create_role, alter_role, drop_role, grant, revoke, grant_role, revoke_role, create_policy, alter_policy, drop_policy, comment,
-    create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension, explain, create_domain, drop_domain, vacuum, analyze, create_type, drop_type,
+    create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension, explain, create_domain, drop_domain, vacuum, analyze, create_type, drop_type, create_statistics, alter_statistics, drop_statistics,
     prepare_transaction, commit_prepared, rollback_prepared };
 
 pub fn lower(byte: u8) u8 {

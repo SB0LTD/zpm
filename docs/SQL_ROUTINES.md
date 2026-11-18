@@ -96,9 +96,17 @@ parser and the PL/pgSQL interpreter); the Database executes them in
 `pg_proc` (oid, proname, pronamespace, prokind, prolang as the language
 name, provolatile, proisstrict, pronargs, prorettype, proargtypes as text,
 prosrc), `pg_trigger` (oid, tgrelid, tgname, tgfoid, tgtype with
-PostgreSQL's bits, tgenabled, tgisinternal, tgnargs), `pg_rewrite` (oid,
+PostgreSQL's bits, tgenabled, tgisinternal, tgnargs, tgparentid), `pg_rewrite` (oid,
 rulename, ev_class, ev_type, ev_enabled, is_instead) and `pg_rules`
 (schemaname, tablename, rulename, definition in pg_get_ruledef's layout).
+
+`pg_get_triggerdef(oid [, pretty])` renders the stored trigger version visible
+to the statement, including decoded arguments and UPDATE OF column names.
+The default qualifies the target table schema. Pretty output elides it when
+the relation is visible through the supported catalog path. WHEN expressions
+retain their stored SQL spelling. Each supported trigger is user-created and
+enabled in origin mode, so its metadata reports `O`, `false` and a zero
+parent OID. Partition trigger dispatch reuses the stored parent trigger.
 
 ## Durability
 

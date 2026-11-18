@@ -219,6 +219,9 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_db, "contract-db-registry", "tests/test_db_registry.sig", &.{
         importEntry("sql", "src/core/sql.sig"), importEntry("database_registry", "src/db/database_registry.sig"),
     });
+    _ = try addContract(ctx, test_db, "contract-pg-settings", "tests/test_db_pg_settings.sig", &.{
+        importEntry("sql", "src/core/sql.sig"), importEntry("db_store", "src/db/store.sig"),
+    });
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
     inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock", "pg_copy", "pg_explain", "page_region" }) |name| {
         _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{
