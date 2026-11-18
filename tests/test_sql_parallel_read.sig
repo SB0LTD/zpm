@@ -25,6 +25,16 @@ var snapshot:DB.Snapshot=.{.csn=0};
 var assertions:usize=0;
 var arrivals:std.atomic.Value(u32)=.init(0);
 var controls:[8]DB.ExecutionControl=@splat(.{});
+var ownership_db: DB = .{};
+var ownership_main_scratch: [512 * 8]DB.Cell = undefined;
+var ownership_memory: extern struct {
+    read_context: [@sizeOf(DB.ReadContext)]u8 align(16),
+    result_metadata: [@sizeOf(DB.Result)]u8 align(16),
+    read_scratch: [scratch_bytes]u8 align(16),
+    refs: [8192]u32 align(16),
+    storage: [main_bytes]u8 align(16),
+    result: [@sizeOf(DB.Row)]u8 align(16),
+} = undefined;
 const Cache = DB.ReadResultCache;
 var cache: Cache = undefined;
 var cache_entries: [16]Cache.Entry = undefined;
@@ -253,6 +263,58 @@ fn resultCacheContracts() !void {
     try check(stats.hits == 1 and stats.misses == 3 and stats.publications == 3 and stats.contention == 0);
 }
 
+fn storageOwnershipContracts() !void {
+    const target = &ownership_db;
+    const memory = &ownership_memory;
+    const context: *DB.ReadContext = @ptrCast(&memory.read_context);
+    const result: *DB.Result = @ptrCast(&memory.result_metadata);
+    context.* = .{};
+    result.* = .{};
+    try target.bindMemory(&memory.storage, 512, 1024, 8192);
+    try target.bindWorkspace(&ownership_main_scratch);
+    try context.bindMemory(&memory.read_scratch, 512);
+    try result.bindMemory(&memory.result, 1);
+    const source = "SELECT 1";
+    const initial: DB.Snapshot = .{ .csn = 0 };
+    // The hull straddles storage, but the private spans miss it individually.
+    try context.execute(target, source, initial, result);
+    try check(result.rows[0].cells[0].integer == 1);
+
+    var custom: [cfg.tables]DB.StorageBacking = undefined;
+    for (&custom, &target.tables) |*bound, *table| {
+        bound.* = .{
+            .rows = table.rows, .versions = table.versions,
+            .row_index = table.row_index, .key_index = table.key_index,
+            .scan_values = table.scan_values, .scan_nonnull = table.scan_nonnull,
+            .scan_live = table.scan_live, .scan_presence = table.scan_presence,
+            .index_slots = table.index_slots,
+        };
+    }
+    try rejected(error.InvalidParameterValue, target.bindStorage(custom, custom[0].row_index));
+    try rejected(error.WorkspaceCapacity, target.bindMemory(memory.storage[0 .. main_bytes - 1], 512, 1024, 8192));
+    try result.bindMemory(&memory.storage, 1);
+    try rejected(error.InvalidParameterValue, context.execute(target, source, initial, result));
+    try result.bindMemory(std.mem.sliceAsBytes(memory.refs[0..]), 1);
+    try context.execute(target, source, initial, result);
+    try check(result.rows[0].cells[0].integer == 1);
+
+    try target.bindStorage(custom, &memory.refs);
+    try rejected(error.InvalidParameterValue, context.execute(target, source, initial, result));
+    try target.bindMemory(&memory.storage, 512, 1024, 8192);
+    try context.execute(target, source, initial, result);
+    try check(result.rows[0].cells[0].integer == 1);
+
+    try target.copyFromInto(db);
+    const copied: DB.Snapshot = .{ .csn = target.csn };
+    try result.bindMemory(&memory.storage, 1);
+    try rejected(error.InvalidParameterValue, context.execute(target, source, copied, result));
+    try result.bindMemory(std.mem.sliceAsBytes(ownership_main_scratch[0..]), 1);
+    try rejected(error.InvalidParameterValue, context.execute(target, source, copied, result));
+    try result.bindMemory(&memory.result, 1);
+    try context.execute(target, "SELECT COUNT(*) FROM points", copied, result);
+    try check(result.rows[0].cells[0].integer == 128);
+}
+
 pub fn main(init:std.process.Init) !void {
     inline for(.{"SELECT 1","\t\x0bselect 1","-- reviewer\r\n SELECT 1","/* outer /* nested */ tail */ WITH q AS(SELECT 1) SELECT * FROM q"}) |source| try check(DB.queryCandidate(source));
     inline for(.{"","-- only comment","/* unfinished","/* x */ UPDATE points SET amount=0","\"select\"","SELECTOR","BEGIN","'SELECT 1'"}) |source| try check(!DB.queryCandidate(source));
@@ -263,6 +325,7 @@ pub fn main(init:std.process.Init) !void {
     var text:[256]u8=undefined;
     for(0..128) |id| try db.execute(try std.fmt.bufPrint(&text,"INSERT INTO points VALUES({d},{d},{d})",.{id,id%8,@as(i64,@intCast(id))*7-23}),&main_result);
     for(0..8) |id| try db.execute(try std.fmt.bufPrint(&text,"INSERT INTO products VALUES({d},{d})",.{id,10+id}),&main_result);
+    try storageOwnershipContracts();
     for(&contexts,0..) |*context,index| {
         try context.bindMemory(&scratch[index],512);try results[index].bindMemory(&output[index],32);
         controls[index]=.{.context=@ptrFromInt(index+1),.poll=insideExecution};
