@@ -59,7 +59,10 @@ pub fn main() !void {
     try check(result.row_count == 1 and result.rows[0].cells[0].integer == 602);
     try db.execute("SELECT id FROM data WHERE g=3", &result);
     try check(result.row_count == 64 and db.workspace.query.read_stats.projected_filter_scans == 1);
-    for (0..64) |index| try check(result.rows[index].cells[0].integer == (515 + @as(i64, @intCast(index)) * 16) % n);
+    for (0..64) |index| {
+        const expected: i64 = @intCast((515 + index * 16) % n);
+        try check(result.rows[index].cells[0].integer == expected);
+    }
     try db.execute("SELECT id FROM ONLY data WHERE g=3 OFFSET 0", &result);
     try check(result.row_count == 64 and result.rows[0].cells[0].integer == 515 and result.rows[63].cells[0].integer == 499);
     try db.execute("SELECT id FROM data ORDER BY id LIMIT 1", &result);
