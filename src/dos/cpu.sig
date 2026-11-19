@@ -369,6 +369,8 @@ pub const Cpu = struct {
     seg_lo: [6]u32 = [_]u32{0} ** 6,
     seg_rhi: [6]i64 = [_]i64{0xFFFF} ** 6,
     seg_whi: [6]i64 = [_]i64{0xFFFF} ** 6,
+    /// Bit s: segment s is flat (0 to 4 GiB, read and write): no checks.
+    seg_flat: u8 = 0,
     /// ESP and EFLAGS at the instruction's start (a fault restores them).
     ins_esp: u32 = 0,
     ins_flags: u32 = 0,
@@ -569,6 +571,7 @@ pub const Cpu = struct {
     /// Segment s's limit and rights for `n` bytes at `off`: #GP(0), or
     /// #SS(0) for the stack. Two compares (a flat segment passes both).
     inline fn limit(self: *Cpu, s: u3, off: u32, comptime n: u32, comptime write: bool) Exc!void {
+        if (self.seg_flat & (@as(u8, 1) << s) != 0) return;
         const e: i64 = @as(i64, off) + (n - 1);
         const hi = if (write) self.seg_whi[s] else self.seg_rhi[s];
         if (e > hi or off < self.seg_lo[s]) return self.raise(if (s == SS) 12 else 13, 0);
@@ -617,7 +620,7 @@ pub const Cpu = struct {
     inline fn fetchPm(self: *Cpu, bus: anytype, comptime T: type, ip: u32) Exc!T {
         const n: u32 = @sizeOf(T);
         const d = ip -% self.tlb.fw_base;
-        if (d < self.tlb.fw_len and self.tlb.fw_len - d >= n) {
+        if (@as(u64, d) + n <= self.tlb.fw_len) {
             self.regs.eip = (ip +% n) & self.ip_wrap;
             return @as(*align(1) const T, @ptrFromInt(self.tlb.fw_host +% d)).*;
         }
@@ -676,15 +679,20 @@ pub const Cpu = struct {
         return self.modrmB(bus, p, try self.fetch8(bus));
     }
 
-    fn modrmB(self: *Cpu, bus: anytype, p: Pfx, b: u8) Er(@TypeOf(bus))!Mod {
-        var m = Mod{ .reg = @truncate(b >> 3), .rm = @truncate(b), .mem = b < 0xC0 };
-        if (!m.mem) return m;
+    /// (a register operand right here; memory operands out of line)
+    inline fn modrmB(self: *Cpu, bus: anytype, p: Pfx, b: u8) Er(@TypeOf(bus))!Mod {
+        if (b >= 0xC0) return Mod{ .reg = @truncate(b >> 3), .rm = @truncate(b), .mem = false };
+        return self.modrmMem(bus, p, b);
+    }
+
+    fn modrmMem(self: *Cpu, bus: anytype, p: Pfx, b: u8) Er(@TypeOf(bus))!Mod {
+        var m = Mod{ .reg = @truncate(b >> 3), .rm = @truncate(b), .mem = true };
         if (p.a32) try self.ea32(bus, &m, b >> 6) else try self.ea16(bus, &m, b >> 6);
         if (p.seg != NOSEG) m.seg = p.seg;
         return m;
     }
 
-    fn ea16(self: *Cpu, bus: anytype, m: *Mod, mode: u8) Er(@TypeOf(bus))!void {
+    inline fn ea16(self: *Cpu, bus: anytype, m: *Mod, mode: u8) Er(@TypeOf(bus))!void {
         const r = &self.regs.r;
         const bx: u16 = @truncate(r[EBX]);
         const bp: u16 = @truncate(r[EBP]);
@@ -711,7 +719,7 @@ pub const Cpu = struct {
         m.off = off;
     }
 
-    fn ea32(self: *Cpu, bus: anytype, m: *Mod, mode: u8) Er(@TypeOf(bus))!void {
+    inline fn ea32(self: *Cpu, bus: anytype, m: *Mod, mode: u8) Er(@TypeOf(bus))!void {
         const r = &self.regs.r;
         var off: u32 = 0;
         if (m.rm == 4) {
@@ -1604,7 +1612,7 @@ pub const Cpu = struct {
 
     // ── One instruction ─────────────────────────────────────────────────
 
-    fn step(self: *Cpu, bus: anytype, end: u64) Er(@TypeOf(bus))!?Exit {
+    inline fn step(self: *Cpu, bus: anytype, end: u64) Er(@TypeOf(bus))!?Exit {
         @setEvalBranchQuota(100_000);
         const P = comptime prot(@TypeOf(bus));
         self.ins_ip = self.regs.eip;

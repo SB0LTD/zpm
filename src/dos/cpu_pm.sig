@@ -132,6 +132,8 @@ pub fn syncSeg(c: *Cpu, s: u3) void {
     c.seg_lo[s] = b.lo;
     c.seg_rhi[s] = b.rhi;
     c.seg_whi[s] = b.whi;
+    const bit = @as(u8, 1) << s;
+    if (b.lo == 0 and b.rhi == 0xFFFF_FFFF and b.whi == 0xFFFF_FFFF) c.seg_flat |= bit else c.seg_flat &= ~bit;
     if (s == CS) {
         c.code32 = a & A_DB != 0;
         c.ip_wrap = if (c.code32) 0xFFFF_FFFF else 0xFFFF;
