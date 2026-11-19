@@ -60,6 +60,7 @@ test {
     _ = @import("host_linux.sig");
     _ = @import("cpu_test.sig");
     _ = @import("cpu_pm_test.sig");
+    _ = @import("cpu_fast_test.sig");
     _ = @import("vga_test.sig");
     _ = @import("vesa_test.sig");
     _ = @import("bios_test.sig");

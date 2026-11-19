@@ -105,6 +105,17 @@ const Bus = struct {
     pub fn irq(b: *Bus) bool {
         return b.pending;
     }
+    /// (the CPU's fast paths: the RAM's bytes below 0x380000; above it
+    /// every access comes to the bus, as a device's would)
+    pub fn page(b: *Bus, a: u32, write: bool) ?[*]u8 {
+        _ = write;
+        if (a < 0x380000) return b.ram[a..].ptr;
+        return null;
+    }
+    pub fn mapKey(b: *Bus) u32 {
+        _ = b;
+        return 0;
+    }
 };
 
 var bus: Bus = .{};
