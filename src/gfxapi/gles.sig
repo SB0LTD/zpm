@@ -628,16 +628,6 @@ fn getParam(p: *const TexParams, sampler: bool, pname: u32) ?i32 {
     return @bitCast(v);
 }
 
-/// GL's R, G, B, A border words in the texel's channel order (`order`:
-/// GL channel i is stored channel order[i]).
-fn borderIn(border: [4]u32, order: [4]u3) [4]u32 {
-    var out = [4]u32{ 0, 0, 0, 0 };
-    for (border, order) |w, o| {
-        if (o < 4) out[o] = w;
-    }
-    return out;
-}
-
 fn wrapOf(w: u32) texture.Wrap {
     return switch (w) {
         g.CLAMP_TO_EDGE => .clamp,
@@ -2995,10 +2985,9 @@ pub const Context = struct {
             layers = 6;
             last = gl_last - base;
         }
-        // GL's R, G, B, A as the stored channels: bgra8's bytes are B, G, R, A
-        const order: [4]u3 = if (base_image.img.format == .bgra8) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
-        var rgba: [4]u3 = undefined;
-        for (if (extra) |m| m.swizzle else t.fswz, 0..) |s, i| rgba[i] = if (s < 4) order[s] else s;
+        // (GL's R, G, B, A as the format's: where the image stores them,
+        // bgra8's B, G, R, A, is texture.descriptor's)
+        const rgba: [4]u3 = if (extra) |m| m.swizzle else t.fswz;
         var swz: [4]u3 = undefined;
         for (t.params.swizzle, 0..) |s, i| swz[i] = switch (s) {
             g.RED => rgba[0],
@@ -3024,7 +3013,7 @@ pub const Context = struct {
             .last = @intCast(last),
             .min_lod = @floatFromInt(p.min_lod),
             .max_lod = @floatFromInt(p.max_lod),
-            .border = borderIn(p.border, order),
+            .border = p.border,
         };
     }
 
