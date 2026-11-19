@@ -1226,6 +1226,7 @@ pub const Engine = struct {
     graphics: bool = false,
     /// Config.depth_float, where `graphics` is on.
     depth_float: bool = false,
+    graphics_depth: bool = true,
     /// Config.block_targets, where `graphics` is on.
     block_targets: bool = false,
     /// Draws kept on the compute kernels for now (tests: a frame split
@@ -1291,6 +1292,7 @@ pub const Engine = struct {
     pub fn init(e: *Engine, cfg: Config) void {
         e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
         if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
+        e.graphics_depth = cfg.graphics_depth;
         e.depth_float = e.graphics and cfg.depth_float and cfg.graphics_depth;
         e.block_targets = e.graphics and cfg.block_targets;
         if (cfg.dev) |d| e.vram_images = cfg.vram_images and d.caps.memory == .discrete and cfg.check.mem.len == 0;
@@ -1459,7 +1461,7 @@ pub const Engine = struct {
     /// A multisampled image (samples 2, 4 or 8; 1: newImage's): a pixel's
     /// samples side by side in its row.
     pub fn newImageSamples(e: *Engine, width: u32, height: u32, format: Format, samples: u8) ?Image {
-        if (samples <= 1 and format == .d24s8 and e.graphics) return e.newDepthImage(width, height);
+        if (samples <= 1 and format == .d24s8 and e.graphics and e.graphics_depth) return e.newDepthImage(width, height);
         if (samples <= 1) return e.newImage(width, height, format);
         var img = e.allocImage(width * samples, height, format, true) orelse return null;
         img.width = width;
