@@ -13,8 +13,12 @@ const Mock = struct {
     fail_sync: bool = false,
     fail_read: bool = false,
     read_chunk: usize = 8192,
+    write_chunk: usize = 8192,
     fail_truncate: bool = false,
     append_calls: usize = 0,
+    write_calls: usize = 0,
+    sync_calls: usize = 0,
+    poisoned: bool = false,
     pub fn length(self: *Mock) !u64 {
         return self.len;
     }
@@ -26,20 +30,31 @@ const Mock = struct {
         return n;
     }
     pub fn appendAll(self: *Mock, bytes: []const u8) !void {
+        if (self.poisoned) return error.WriterPoisoned;
         self.append_calls += 1;
-        for (bytes) |byte| {
-            if (self.len == self.fail_after or self.len == self.bytes.len) return error.InjectedDiskFull;
-            self.bytes[self.len] = byte;
-            self.len += 1;
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            self.write_calls += 1;
+            const available = @min(self.fail_after, self.bytes.len) -| self.len;
+            const n = @min(bytes.len - sent, available, self.write_chunk);
+            if (n == 0) return error.InjectedDiskFull;
+            @memcpy(self.bytes[self.len..][0..n], bytes[sent..][0..n]);
+            self.len += n;
+            sent += n;
         }
     }
     pub fn sync(self: *Mock) !void {
+        if (self.poisoned) return error.WriterPoisoned;
+        self.sync_calls += 1;
         if (self.fail_sync) return error.InjectedSyncFailure;
         self.stable = self.len;
     }
     pub fn truncate(self: *Mock, len: u64) !void {
         if (self.fail_truncate) return error.InjectedTruncateFailure;
         self.len = @intCast(len);
+    }
+    pub fn poison(self: *Mock) void {
+        self.poisoned = true;
     }
 };
 const Replay = struct {
@@ -173,9 +188,90 @@ fn testPositionedFrames() !void {
     try check(file.len == original.len - log.overhead - positioned_payloads[4].len and file.stable == file.len);
 }
 
+fn rejectBatch(file: *Mock, sequence: u64, payloads: []const []const u8, kind: u16, storage: []u8, wanted: anyerror) !void {
+    if (log.appendBatch(file, sequence, payloads, kind, storage)) |_| return error.InvalidBatchAccepted else |err| try check(err == wanted);
+}
+
+fn testAppendBatch() !void {
+    const payloads = [_][]const u8{ "alpha", "\x00beta", "gamma" };
+    var original: Mock = .{};
+    try log.appendKind(&original, 1, "prefix", 3);
+    const prefix = original.len;
+    const golden = "RAMSQLW1\x01\x00\x03\x00\x06\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x8d\x05\x33\xef\x00\x00\x00\x00prefix\x8e\x86\xb1\x93CMIT\x01\x00\x00\x00\x00\x00\x00\x00";
+    try check(std.mem.eql(u8, original.bytes[0..prefix], golden));
+    var sequential = original;
+    var boundaries: [4]usize = .{ prefix, 0, 0, 0 };
+    for (payloads, 2..) |payload, sequence| {
+        try log.appendKind(&sequential, sequence, payload, 3);
+        boundaries[sequence - 1] = sequential.len;
+    }
+    const needed = sequential.len - prefix;
+    var storage: [256]u8 = undefined;
+    var file = original;
+    file.write_chunk = 7;
+    try check(try log.appendBatch(&file, 1, &payloads, 3, storage[0..needed]) == 4);
+    try check(file.append_calls == original.append_calls + 1 and file.sync_calls == original.sync_calls + 1);
+    try check(file.write_calls > original.write_calls + 1);
+    try check(file.len == sequential.len and file.stable == file.len and !file.poisoned);
+    try check(std.mem.eql(u8, file.bytes[0..file.len], sequential.bytes[0..sequential.len]));
+    try log.appendKind(&file, 5, "after group", 3);
+    var scratch: [128]u8 = undefined;
+    var replay: Replay = .{};
+    const recovered = try log.recoverKind(&file, &scratch, &replay, Replay.apply, 3);
+    try check(recovered.sequence == 5 and !recovered.truncated_tail and replay.count == 5);
+
+    // Reject every preflight error without modifying a byte or entering I/O.
+    file = original;
+    try rejectBatch(&file, 1, &.{}, 3, &storage, error.EmptyLogBatch);
+    try rejectBatch(&file, 1, &payloads, 0, &storage, error.UnsupportedLogVersion);
+    try rejectBatch(&file, 1, &payloads, 32, &storage, error.UnsupportedLogVersion);
+    try rejectBatch(&file, 0xfffffffffffffffe, &payloads, 3, &storage, error.InvalidSequence);
+    try rejectBatch(&file, 1, &.{ "valid", "" }, 3, &storage, error.InvalidPayloadLength);
+    try rejectBatch(&file, 1, &payloads, 3, storage[0 .. needed - 1], error.BatchStorageCapacity);
+    try rejectBatch(&file, 1, &.{ "disjoint", storage[0..1] }, 3, &storage, error.AliasedBatchStorage);
+    var descriptors: [8][]const u8 = @splat("valid");
+    try rejectBatch(&file, 1, descriptors[0..1], 3, std.mem.asBytes(&descriptors), error.AliasedBatchStorage);
+    try check(file.append_calls == original.append_calls and file.sync_calls == original.sync_calls and !file.poisoned);
+    try check(file.len == prefix and std.mem.eql(u8, &file.bytes, &original.bytes));
+
+    // The old recovery path recovers only the complete prefix at every cut.
+    for (0..needed) |cut| {
+        file = original;
+        file.fail_after = prefix + cut;
+        file.write_chunk = 5;
+        try rejectBatch(&file, 1, &payloads, 3, &storage, error.InjectedDiskFull);
+        try check(file.poisoned and file.sync_calls == original.sync_calls and file.stable == prefix);
+        try rejectBatch(&file, 1, &payloads, 3, &storage, error.WriterPoisoned);
+        try check(file.len == prefix + cut and file.append_calls == original.append_calls + 1);
+        var reopened = file;
+        reopened.poisoned = false;
+        reopened.fail_after = reopened.bytes.len;
+        var complete: usize = 0;
+        for (boundaries, 0..) |end, index| if (end <= file.len) { complete = index; };
+        replay = .{};
+        const prefix_recovery = try log.recoverKind(&reopened, &scratch, &replay, Replay.apply, 3);
+        try check(prefix_recovery.sequence == complete + 1 and reopened.len == boundaries[complete]);
+        try check(prefix_recovery.truncated_tail == (file.len != reopened.len));
+    }
+    file = original;
+    file.fail_sync = true;
+    try rejectBatch(&file, 1, &payloads, 3, &storage, error.InjectedSyncFailure);
+    try check(file.poisoned and file.sync_calls == original.sync_calls + 1 and file.stable == prefix);
+    try rejectBatch(&file, 1, &payloads, 3, &storage, error.WriterPoisoned);
+    // A complete but unacknowledged group may have survived the flush error.
+    var reopened = file;
+    reopened.poisoned = false;
+    reopened.fail_sync = false;
+    replay = .{};
+    const uncertain = try log.recoverKind(&reopened, &scratch, &replay, Replay.apply, 3);
+    try check(uncertain.sequence == 4 and !uncertain.truncated_tail and replay.count == 4);
+}
+
 pub fn main(init: std.process.Init) !void {
     try check(log.checksum("123456789") == 0xcbf43926);
     try testPositionedFrames();
+    try testAppendBatch();
     // Exact staging boundary and streaming fallback retain identical framing,
     // CRCs, replay payloads and stable-storage acknowledgement.
     var staged_payload: [4096]u8 = @splat('a');

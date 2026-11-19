@@ -56,23 +56,32 @@ pub fn append(file: anytype, sequence: u64, payload: []const u8) !void {
     return appendKind(file, sequence, payload, 1);
 }
 
+fn encodeHeader(header: *[header_size]u8, sequence: u64, payload_len: u32, kind: u16) void {
+    @memset(header, 0);
+    @memcpy(header[0..8], magic);
+    put(u16, header[8..10], 1);
+    put(u16, header[10..12], kind);
+    put(u32, header[12..16], payload_len);
+    put(u64, header[16..24], sequence);
+    put(u32, header[24..28], checksum(header));
+}
+
+fn encodeTrailer(trailer: *[trailer_size]u8, sequence: u64, payload: []const u8) void {
+    put(u32, trailer[0..4], checksum(payload));
+    @memcpy(trailer[4..8], commit_magic);
+    put(u64, trailer[8..16], sequence);
+}
+
 /// Product-owned payload semantics are versioned independently from framing.
 /// A nonzero kind must be checked during recovery before replaying any SQL.
 pub fn appendKind(file: anytype, sequence: u64, payload: []const u8, kind: u16) !void {
     if (kind == 0) return error.UnsupportedLogVersion;
     if (sequence == 0) return error.InvalidSequence;
     if (payload.len == 0 or payload.len > 0xffffffff) return error.InvalidPayloadLength;
-    var header: [header_size]u8 = @splat(0);
-    @memcpy(header[0..8], magic);
-    put(u16, header[8..10], 1);
-    put(u16, header[10..12], kind);
-    put(u32, header[12..16], @intCast(payload.len));
-    put(u64, header[16..24], sequence);
-    put(u32, header[24..28], checksum(&header));
+    var header: [header_size]u8 = undefined;
     var trailer: [trailer_size]u8 = undefined;
-    put(u32, trailer[0..4], checksum(payload));
-    @memcpy(trailer[4..8], commit_magic);
-    put(u64, trailer[8..16], sequence);
+    encodeHeader(&header, sequence, @intCast(payload.len), kind);
+    encodeTrailer(&trailer, sequence, payload);
     // Ordinary SQL records fit one small, bounded staging buffer. Coalescing
     // their framing avoids three native write calls per synchronous commit.
     // Large transactions retain the streaming path and constant stack bound.
@@ -88,6 +97,53 @@ pub fn appendKind(file: anytype, sequence: u64, payload: []const u8, kind: u16) 
         try file.appendAll(&trailer);
     }
     try file.sync();
+}
+
+fn overlaps(first: usize, first_len: usize, second: usize, second_len: usize) bool {
+    return if (first <= second) second - first < first_len else first - second < second_len;
+}
+
+/// Append consecutive records of one replayable kind with one stable flush.
+/// The caller exclusively owns the writer and supplies the last sequence from
+/// recovery or a successful append (zero for an empty log). The used prefix of
+/// `storage` must be disjoint from payloads, descriptors and backend state.
+/// The records keep their independent framing and replay semantics.
+///
+/// The backend provides appendAll, sync and poison. appendAll must either
+/// write all requested bytes or report an error, and a poisoned backend must
+/// refuse further writes. Input errors leave the writer untouched. On an I/O
+/// error an unknown prefix may survive and no new sequence is returned. A
+/// poisoned writer requires close and recovery before any later write.
+pub fn appendBatch(file: anytype, last_sequence: u64, payloads: []const []const u8, kind: u16, storage: []u8) !u64 {
+    _ = try kindMask(kind);
+    if (payloads.len == 0) return error.EmptyLogBatch;
+    if (payloads.len > 0xffffffffffffffff - last_sequence) return error.InvalidSequence;
+    var total: usize = 0;
+    for (payloads) |payload| {
+        if (payload.len == 0 or payload.len > 0xffffffff) return error.InvalidPayloadLength;
+        const remaining = storage.len - total;
+        if (remaining < overhead or payload.len > remaining - overhead) return error.BatchStorageCapacity;
+        total += overhead + payload.len;
+    }
+    const scratch_start = @intFromPtr(storage.ptr);
+    if (overlaps(scratch_start, total, @intFromPtr(payloads.ptr), payloads.len * @sizeOf([]const u8))) return error.AliasedBatchStorage;
+    for (payloads) |payload| {
+        if (overlaps(scratch_start, total, @intFromPtr(payload.ptr), payload.len)) return error.AliasedBatchStorage;
+    }
+    var offset: usize = 0;
+    var sequence = last_sequence;
+    for (payloads) |payload| {
+        sequence += 1;
+        const end = offset + header_size + payload.len;
+        encodeHeader(storage[offset..][0..header_size], sequence, @intCast(payload.len), kind);
+        @memcpy(storage[offset + header_size .. end], payload);
+        encodeTrailer(storage[end..][0..trailer_size], sequence, payload);
+        offset = end + trailer_size;
+    }
+    errdefer file.poison();
+    try file.appendAll(storage[0..total]);
+    try file.sync();
+    return sequence;
 }
 
 fn readExact(file: anytype, offset: u64, bytes: []u8) !void {

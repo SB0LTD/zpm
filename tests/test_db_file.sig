@@ -181,6 +181,16 @@ pub fn main(init: std.process.Init) !void {
     var empty: [0]u8 = .{};
     try check(try file.readAt(0, &empty) == 0);
     try check(try file.readAt(try file.length(), &scratch) == 0);
+    var batch: [256]u8 = undefined;
+    const payloads = [_][]const u8{ "durable transaction", "durable transaction" };
+    try check(try log.appendBatch(&file, twice.sequence, &payloads, 1, &batch) == 4);
+    file.close();
+    open = false;
+    file = try disk.File.openExisting(path);
+    open = true;
+    replay = .{};
+    const grouped = try log.recover(&file, &scratch, &replay, Replay.apply);
+    try check(grouped.sequence == 4 and !grouped.truncated_tail and replay.sequence == 4);
     // Replacing a snapshot preserves old target until the new file is synced.
     var snapshot = try disk.File.createExclusive(snapshot_path);
     defer disk.remove(snapshot_path) catch {};
@@ -239,7 +249,7 @@ pub fn main(init: std.process.Init) !void {
     const published = try snapshot.readAt(0, &scratch);
     try check(std.mem.eql(u8, scratch[0..published], "new non-overwriting backup"));
     if (disk.File.open("bad\x00path")) |_| return error.InvalidPathAccepted else |err| try check(err == error.InvalidPath);
-    file.poisoned = true;
+    file.poison();
     if (file.appendAll("no")) |_| return error.PoisonedWriteAccepted else |err| try check(err == error.WriterPoisoned);
     if (file.sync()) |_| return error.PoisonedSyncAccepted else |err| try check(err == error.WriterPoisoned);
     if (file.truncate(0)) |_| return error.PoisonedTruncateAccepted else |err| try check(err == error.WriterPoisoned);
