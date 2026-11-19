@@ -47,7 +47,11 @@ pub const Op = enum(u32) {
     map = 3,
     /// a: the GPU address a `map` gave.
     unmap = 4,
-    /// Answer: chan = a new channel (the 3D engine and compute).
+    /// a: the engine (Engine: 0, the 3D engine and compute; 1 the video
+    /// decoder; 2 the video encoder). Answer: chan = a new channel. A
+    /// video channel runs a guest's NVDEC or NVENC pushbuffers as they are
+    /// (its SET_OBJECT of the class on subchannel 0 included); the host
+    /// writes its fence to the status page after each.
     open = 5,
     /// chan: a channel `open` gave.
     close = 6,
@@ -62,6 +66,14 @@ pub const Op = enum(u32) {
     /// (a frame drawn there and copied out, gfx_pipe's). Answer: a = a
     /// handle; `unmap` gives it back.
     map_video = 9,
+    _,
+};
+
+/// What a channel drives (`open`'s a).
+pub const Engine = enum(u64) {
+    graphics = 0,
+    decoder = 1,
+    encoder = 2,
     _,
 };
 

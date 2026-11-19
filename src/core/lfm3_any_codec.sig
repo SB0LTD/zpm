@@ -56,6 +56,10 @@ pub const Error = any.Error || gen.Error;
 pub const Options = struct {
     timeout_us: u64 = 10_000_000,
     import: bool = true,
+    /// The Q8_0 matrices' layout (null: kernels.Layout.wide, a row's
+    /// blocks side by side). Every layout gives the CPU's bits; a matrix
+    /// needs at least its `step` blocks a row.
+    matrix: ?kernels.Layout = null,
     /// Frames one decode call takes at most (the scratch's size).
     max_frames: u32 = gen.lfm3_audio_limits.frames,
     /// Dispatches one Device.run takes at most (a call sends more as
@@ -220,11 +224,16 @@ pub fn Codec(comptime tensor_capacity: usize) type {
             slot.* = try self.dev.load(&bin);
         }
 
+        /// The Q8_0 matrices' layout.
+        pub fn matrixLayout(self: *const Self) kernels.Layout {
+            return self.options.matrix orelse kernels.Layout.wide(self.caps);
+        }
+
         fn compileAll(self: *Self) Error!void {
             const caps = self.caps;
             const cs = &self.plan.codec;
             const s = kir.Storage{ .insts = &self.work.insts, .tys = &self.work.tys };
-            for (0..MATRIX_VARIANTS) |t| try self.build(&self.k.q80[t], kernels.matrix(s, caps, .q8_0, @intCast(t + 1)));
+            for (0..MATRIX_VARIANTS) |t| try self.build(&self.k.q80[t], kernels.matrixWith(s, caps, self.matrixLayout(), .q8_0, @intCast(t + 1)));
             try self.build(&self.k.quant, kernels.q80Quant(s, caps));
             try self.build(&self.k.norm, kernels.normRows(s, caps, false));
             try self.build(&self.k.glu, kernels.gluGgml(s, caps));
@@ -253,15 +262,9 @@ pub fn Codec(comptime tensor_capacity: usize) type {
                     }
                 }
             }
+            // (VRAM without a CPU view: through staging and the copy kernel)
             self.weights = try self.dev.alloc(std.mem.alignForward(u64, size, 16), .device);
-            if (self.weights.cpu.len < size) return error.Unsupported; // (VRAM without a view: as lfm3_any_audio, not yet here)
-            var at: u64 = 0;
-            while (at < size) {
-                const n: usize = @intCast(@min(size - at, 4 << 20));
-                if (!self.file.read(at, self.weights.cpu[@intCast(at)..][0..n])) return error.StorageNotMapped;
-                at += n;
-            }
-            self.dev.toDevice(self.weights, 0, size);
+            try any.fillWeights(self.dev, self.file, self.weights, if (self.k.copy) |*c| c else null, self.work);
         }
 
         /// The windows' sections (bytes): conv, keys, values.
@@ -336,6 +339,7 @@ pub fn Codec(comptime tensor_capacity: usize) type {
         /// out[t] = W . x[t] for `n` tokens of Q8_0 activations, from out
         /// byte `out_off`, rows `out_stride` bytes apart.
         fn linear(self: *Self, l: *any.List, m: Matrix, n: u32, out: Buffer, out_off: u32, out_stride: u32) Error!void {
+            if (m.blocks < self.matrixLayout().step()) return error.Unsupported;
             var first: u32 = 0;
             while (first < n) {
                 const tokens = @min(n - first, MATRIX_VARIANTS);
@@ -351,7 +355,7 @@ pub fn Codec(comptime tensor_capacity: usize) type {
                     .out = out_off + first * out_stride,
                 };
                 l.named("matrix q8_0", m.tensor, first, tokens);
-                try l.add(&self.k.q80[tokens - 1].?, kernels.matrixGroups(self.caps, m.rows), &.{ self.weights, self.act_q, self.act_d, self.act_d, out }, &p.words(.q8_0));
+                try l.add(&self.k.q80[tokens - 1].?, kernels.matrixGroupsWith(self.matrixLayout(), m.rows), &.{ self.weights, self.act_q, self.act_d, self.act_d, out }, &p.words(.q8_0));
                 first += tokens;
             }
         }

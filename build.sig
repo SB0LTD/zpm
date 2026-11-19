@@ -1621,6 +1621,43 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("page_region", "src/platform/page_region.sig"),
         },
     });
+    // brainbench: LFM3's brain on the real GPU behind /dev/dxg (WSL), its
+    // weights in VRAM without a CPU view: checked against the CPU, prompt
+    // reading and decode timed, a step and a prompt chunk profiled.
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/brainbench.sig",
+        .output_name = "brainbench",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("gpu", "src/gpu/gpu.sig"),
+            importEntry("dxg", "src/dxg/dxg.sig"),
+            importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+            importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+            importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+        },
+    });
+    // voicebench: LFM3-Audio's depthformer on the real GPU behind /dev/dxg
+    // (WSL), its weights in VRAM without a CPU view, timed and profiled.
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/voicebench.sig",
+        .output_name = "voicebench",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("gpu", "src/gpu/gpu.sig"),
+            importEntry("dxg", "src/dxg/dxg.sig"),
+            importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
+            importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+            importEntry("lfm3_any_audio", "src/core/lfm3_any_audio.sig"),
+        },
+    });
     // LFM3-Audio's hearing encoder on any GPU (lfm3_any_hear, its kernels in
     // lfm3_kir_hear) against lfm3_audio_encoder; the new kernels on the
     // emulated RTX and Adreno against the interpreter.
@@ -1689,6 +1726,30 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
         importEntry("lfm3_kir_codec", "src/core/lfm3_kir_codec.sig"),
         importEntry("lfm3_any_codec", "src/core/lfm3_any_codec.sig"),
+    });
+    // speechbench: LFM3-Audio speaking a line on the real GPU behind
+    // /dev/dxg (WSL), against the CPU frame by frame, each side's speech
+    // to a WAV.
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/speechbench.sig",
+        .output_name = "speechbench",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gguf", "src/core/gguf.sig"),
+            importEntry("gpu", "src/gpu/gpu.sig"),
+            importEntry("dxg", "src/dxg/dxg.sig"),
+            importEntry("lfm3_plan", "src/core/lfm3_plan.sig"),
+            importEntry("lfm3_executor", "src/core/lfm3_executor.sig"),
+            importEntry("lfm3_any", "src/core/lfm3_any.sig"),
+            importEntry("lfm3_any_audio", "src/core/lfm3_any_audio.sig"),
+            importEntry("lfm3_any_codec", "src/core/lfm3_any_codec.sig"),
+            importEntry("lfm3_audio_gen", "src/core/lfm3_audio_gen.sig"),
+            importEntry("lfm3_tokenizer", "src/core/lfm3_tokenizer.sig"),
+            importEntry("tokenizer_index", "src/core/tokenizer_index.sig"),
+        },
     });
     // The AMD backend: every KIR op through gcn3_emu against the interpreter.
     const test_gpu_gcn4 = try ctx.addStep("test-gpu-gcn4", "Compile KIR for GCN 4 (gfx803) and run it in gcn3_emu against kir_interp", &noopStep);

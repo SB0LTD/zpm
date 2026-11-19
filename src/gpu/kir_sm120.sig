@@ -285,6 +285,19 @@ pub const State = struct {
     text: [TEXT_BYTES]u8 = undefined,
     words: [2 * sm120_asm.MAX_INSTRS]u64 = undefined,
     asm_work: sm120_asm.Work = .{},
+    /// The scheduler's (schedule): a window's dependences, its order.
+    sched_succ: [SCHED_WINDOW][SCHED_WORDS]u64 = undefined,
+    sched_npred: [SCHED_WINDOW]u16 = undefined,
+    sched_ready: [SCHED_WINDOW]u32 = undefined,
+    sched_prio: [SCHED_WINDOW]u32 = undefined,
+    sched_done: [SCHED_WINDOW]bool = undefined,
+    sched_order: [SCHED_WINDOW]u16 = undefined,
+    sched_tmp: [SCHED_WINDOW]MI = undefined,
+    /// Reads of each unit in the kernel, and in the window, not yet placed;
+    /// its definitions.
+    use_total: [MAX_VREGS]u16 = undefined,
+    use_win: [MAX_VREGS]u16 = undefined,
+    def_count: [MAX_VREGS]u16 = undefined,
     /// What the last compile made (for tests and reports).
     stats: Stats = .{},
     /// A stage's: what its program loads and stores (Stage).
@@ -324,6 +337,11 @@ pub const Options = struct {
     /// A stage's attribute words and outputs: the binding its loads and
     /// stores name (one the kernel declares, never bound to memory).
     stage_io: u8 = 0xff,
+    /// A compute kernel's straight-line runs list-scheduled (see
+    /// Ctx.schedule); off, the machine instructions stay in KIR's order. A
+    /// kernel the registers cannot hold scheduled is compiled again
+    /// without.
+    schedule: bool = true,
 };
 
 /// A graphics stage's program (the 3D engine's; its header, sph.sig, is the
@@ -438,12 +456,23 @@ pub fn compileIn(k: *const kir.Kernel, caps: device.Caps, st: *State, out: []u8,
 /// The assembly text `compile` assembles (for reading and tests); it
 /// lives in `st`.
 pub fn compileText(k: *const kir.Kernel, caps: device.Caps, st: *State, opts: Options) Error![]const u8 {
+    return compileTextOnce(k, caps, st, opts) catch |e| {
+        // (scheduled, it needed more registers than there are: as written)
+        if (e != error.TooManyRegs or !opts.schedule or opts.stage != .compute) return e;
+        var o = opts;
+        o.schedule = false;
+        return compileTextOnce(k, caps, st, o);
+    };
+}
+
+fn compileTextOnce(k: *const kir.Kernel, caps: device.Caps, st: *State, opts: Options) Error![]const u8 {
     const gen = genOf(caps.target) orelse SM120;
     var c = Ctx{ .w = st, .caps = caps, .gen = gen, .k = k, .opts = opts };
     try c.expand();
     try c.analyze();
     try c.lower();
     c.dce();
+    if (opts.schedule and opts.stage == .compute) c.schedule();
     try c.liveness();
     c.stageLive();
     try c.allocate();
@@ -2250,6 +2279,123 @@ const Ctx = struct {
         }
     }
 
+    // ── 4b. Scheduling ──────────────────────────────────────────────────
+    //
+    // The hardware issues in order and waits for what an instruction
+    // reads (sm120_sched's stalls and scoreboards): a load used by the
+    // next instruction holds the warp for its whole round trip, and the
+    // load after it is not even issued until then. KIR's order is the
+    // source's (a value used where it is made), so each straight-line run
+    // of machine instructions is list-scheduled as kir_ir3 does it: by
+    // cycle, the earliest ready first, then the longest latency path to
+    // the run's end (loads, constant loads, special registers and MUFU
+    // first, their users last), and, past SCHED_PRESSURE values started
+    // in a window, what frees registers. The order of every register's
+    // writes and reads, of stores against all other memory accesses, and
+    // of everything against labels, branches, barriers, convergence,
+    // shuffles, votes, atomics and other effects is kept: the same
+    // operations on the same values in another order, so the same bits.
+
+    fn schedule(c: *Ctx) void {
+        const w = c.w;
+        const mis = w.mi[0..w.n_mi];
+        @memset(w.use_total[0..w.nv], 0);
+        @memset(w.use_win[0..w.nv], 0);
+        @memset(w.def_count[0..w.nv], 0);
+        for (mis) |*m| {
+            if (m.kind != .inst) continue;
+            schedUses(w, m, &w.use_total, 1);
+            var it = SchedOps{ .m = m, .w = w, .writes = true };
+            while (it.next()) |u| {
+                if (u < w.nv) w.def_count[u] +|= 1;
+            }
+        }
+        var start: usize = 0;
+        while (start < mis.len) {
+            if (schedFence(&mis[start])) {
+                start += 1;
+                continue;
+            }
+            var end = start;
+            while (end < mis.len and !schedFence(&mis[end])) end += 1;
+            var from = start;
+            while (from < end) {
+                const stop = @min(end, from + SCHED_WINDOW);
+                if (stop - from > 2) c.scheduleRun(from, stop);
+                from = stop;
+            }
+            start = end;
+        }
+    }
+
+    fn scheduleRun(c: *Ctx, start: usize, end: usize) void {
+        const w = c.w;
+        const n = end - start;
+        const blk = w.mi[start..end];
+        for (blk) |*m| schedUses(w, m, &w.use_win, 1);
+        for (0..n) |i| {
+            w.sched_succ[i] = @splat(0);
+            w.sched_npred[i] = 0;
+            w.sched_done[i] = false;
+            w.sched_ready[i] = 0;
+        }
+        for (0..n) |i| {
+            for (i + 1..n) |j| {
+                if (schedDepends(w, &blk[i], &blk[j])) {
+                    w.sched_succ[i][j >> 6] |= @as(u64, 1) << @intCast(j & 63);
+                    w.sched_npred[j] += 1;
+                }
+            }
+        }
+        // priorities: the longest latency path to the run's end
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            var best: u32 = 0;
+            var it = SchedSucc{ .bits = &w.sched_succ[i], .n = n };
+            while (it.next()) |j| best = @max(best, schedLatency(&blk[i]) + w.sched_prio[j]);
+            w.sched_prio[i] = best + 1;
+        }
+        var cycle: u32 = 0;
+        var placed: usize = 0;
+        var pressure: i32 = 0;
+        while (placed < n) {
+            var pick: ?usize = null;
+            var pick_ready: u32 = std.math.maxInt(u32);
+            var pick_delta: i32 = 0;
+            const tight = pressure >= SCHED_PRESSURE;
+            for (0..n) |k| {
+                if (w.sched_done[k] or w.sched_npred[k] != 0) continue;
+                const rdy = @max(w.sched_ready[k], cycle);
+                const dl = schedDelta(w, &blk[k]);
+                const better = if (pick == null) true else if (tight and dl != pick_delta)
+                    dl < pick_delta
+                else
+                    rdy < pick_ready or (rdy == pick_ready and (w.sched_prio[k] > w.sched_prio[pick.?] or (w.sched_prio[k] == w.sched_prio[pick.?] and k < pick.?)));
+                if (better) {
+                    pick = k;
+                    pick_ready = rdy;
+                    pick_delta = dl;
+                }
+            }
+            const sel = pick.?;
+            pressure += pick_delta;
+            schedUses(w, &blk[sel], &w.use_win, -1);
+            schedUses(w, &blk[sel], &w.use_total, -1);
+            w.sched_done[sel] = true;
+            w.sched_order[placed] = @intCast(sel);
+            var it = SchedSucc{ .bits = &w.sched_succ[sel], .n = n };
+            while (it.next()) |j| {
+                w.sched_npred[j] -= 1;
+                w.sched_ready[j] = @max(w.sched_ready[j], pick_ready + schedLatency(&blk[sel]));
+            }
+            cycle = pick_ready + 1;
+            placed += 1;
+        }
+        for (0..n) |k| w.sched_tmp[k] = blk[w.sched_order[k]];
+        @memcpy(blk, w.sched_tmp[0..n]);
+    }
+
     // ── 5. Liveness and allocation ──────────────────────────────────────
 
     fn liveness(c: *Ctx) Error!void {
@@ -2920,6 +3066,194 @@ fn atomKind(in: kir.Inst) kir.Atom {
 }
 
 /// The reads of a machine instruction counted into `w.uses` (by `d`).
+// ── The scheduler's helpers ─────────────────────────────────────────────────
+
+/// Machine instructions list-scheduled together at most (the work is
+/// quadratic in a window's length).
+pub const SCHED_WINDOW = 192;
+const SCHED_WORDS = (SCHED_WINDOW + 63) / 64;
+/// Registers started in a window past which the scheduler prefers what
+/// frees them (a predicate counts SCHED_PRED_COST: there are six).
+pub const SCHED_PRESSURE = 48;
+const SCHED_PRED_COST = 6;
+/// UR4 (the memory descriptor) as a unit of its own.
+const SCHED_UR4: u16 = NOV - 1;
+
+/// A run's end: what nothing moves across (labels, branches, convergence,
+/// barriers, shuffles, votes, atomics, every effect but a plain store).
+fn schedFence(m: *const MI) bool {
+    if (m.kind == .label) return true;
+    if (m.kind == .dead) return false;
+    if (m.effect == .effect) return !schedStore(m);
+    return std.mem.startsWith(u8, m.op, "SHFL") or std.mem.startsWith(u8, m.op, "VOTE");
+}
+
+fn schedStore(m: *const MI) bool {
+    return std.mem.startsWith(u8, m.op, "STG") or std.mem.startsWith(u8, m.op, "STS");
+}
+
+fn schedMem(m: *const MI) bool {
+    return std.mem.startsWith(u8, m.op, "LDG") or std.mem.startsWith(u8, m.op, "LDS") or schedStore(m);
+}
+
+/// Cycles from issuing `m` until its result may be read without waiting
+/// (NAK's figures, rounded; a global load a VRAM round trip).
+fn schedLatency(m: *const MI) u32 {
+    const op = m.op;
+    if (std.mem.startsWith(u8, op, "LDG")) return 400;
+    if (std.mem.startsWith(u8, op, "LDS")) return 30;
+    if (std.mem.startsWith(u8, op, "LDC")) return 20;
+    if (std.mem.startsWith(u8, op, "S2R")) return 20;
+    if (std.mem.startsWith(u8, op, "MUFU")) return 20;
+    if (std.mem.startsWith(u8, op, "F2I") or std.mem.startsWith(u8, op, "I2F") or std.mem.startsWith(u8, op, "F2F")) return 12;
+    return 6;
+}
+
+/// The units an instruction writes (`writes`), or reads: its sources, an
+/// address's pair, its guard.
+const SchedOps = struct {
+    m: *const MI,
+    w: *const State,
+    writes: bool,
+    i: usize = 0,
+    extra: u16 = NOV,
+    guard_done: bool = false,
+
+    fn unit(self: *const SchedOps, v: u16) u16 {
+        if (v == NOV) return NOV;
+        return self.w.lead[v];
+    }
+
+    fn next(self: *SchedOps) ?u16 {
+        if (self.extra != NOV) {
+            const e = self.extra;
+            self.extra = NOV;
+            return e;
+        }
+        const m = self.m;
+        if (m.kind != .inst) return null;
+        const lo: usize = if (self.writes) 0 else m.nd;
+        const hi: usize = if (self.writes) m.nd else m.n;
+        while (lo + self.i < hi) {
+            const o = m.o[lo + self.i];
+            self.i += 1;
+            switch (o) {
+                .reg => |r| if (r.v != NOV) return self.unit(r.v),
+                .pred => |p| if (p.v != NOV) return self.unit(p.v),
+                .mem => |x| if (x.base != NOV) {
+                    const a = self.unit(x.base);
+                    const b = self.unit(x.base + 1);
+                    if (b != a) self.extra = b;
+                    return a;
+                },
+                .ur4 => return SCHED_UR4,
+                else => {},
+            }
+        }
+        if (!self.writes and !self.guard_done) {
+            self.guard_done = true;
+            switch (m.guard) {
+                .pred => |p| if (p.v != NOV) return self.unit(p.v),
+                else => {},
+            }
+        }
+        return null;
+    }
+};
+
+fn schedHas(m: *const MI, w: *const State, writes: bool, u: u16) bool {
+    var it = SchedOps{ .m = m, .w = w, .writes = writes };
+    while (it.next()) |x| {
+        if (x == u) return true;
+    }
+    return false;
+}
+
+/// Must `b` stay after `a` (a before it in the run)? A guarded write keeps
+/// the old value where its guard is false, so it is ordered with the
+/// writes and reads around it as any write is.
+fn schedDepends(w: *const State, a: *const MI, b: *const MI) bool {
+    if (a.kind != .inst or b.kind != .inst) return false;
+    var wa = SchedOps{ .m = a, .w = w, .writes = true };
+    while (wa.next()) |u| {
+        if (schedHas(b, w, false, u) or schedHas(b, w, true, u)) return true;
+    }
+    var wb = SchedOps{ .m = b, .w = w, .writes = true };
+    while (wb.next()) |u| {
+        if (schedHas(a, w, false, u)) return true;
+    }
+    // memory: a store stays in order with every access
+    if (schedMem(a) and schedMem(b) and (schedStore(a) or schedStore(b))) return true;
+    return false;
+}
+
+fn schedUses(w: *State, m: *const MI, counts: []u16, d: i32) void {
+    var it = SchedOps{ .m = m, .w = w, .writes = false };
+    while (it.next()) |u| {
+        if (u >= w.nv) continue;
+        counts[u] = @intCast(@max(0, @as(i32, counts[u]) + d));
+    }
+}
+
+/// Registers placing `m` starts, less those it frees (its sources' last
+/// reads: every read of theirs in this window, and defined once).
+fn schedDelta(w: *const State, m: *const MI) i32 {
+    var d: i32 = 0;
+    var wr = SchedOps{ .m = m, .w = w, .writes = true };
+    while (wr.next()) |u| {
+        if (u >= w.nv) continue;
+        d += if (w.cls[u] == .p) SCHED_PRED_COST else w.size[u];
+    }
+    var rd = SchedOps{ .m = m, .w = w, .writes = false };
+    var seen: [16]u16 = undefined;
+    var ns: usize = 0;
+    outer: while (rd.next()) |u| {
+        if (u >= w.nv) continue;
+        for (seen[0..ns]) |x| {
+            if (x == u) continue :outer;
+        }
+        if (ns < seen.len) {
+            seen[ns] = u;
+            ns += 1;
+        }
+        var mine: u16 = 0;
+        var again = SchedOps{ .m = m, .w = w, .writes = false };
+        while (again.next()) |x| {
+            if (x == u) mine += 1;
+        }
+        if (w.use_total[u] == w.use_win[u] and w.use_win[u] == mine and w.def_count[u] <= 1)
+            d -= if (w.cls[u] == .p) SCHED_PRED_COST else w.size[u];
+    }
+    return d;
+}
+
+const SchedSucc = struct {
+    bits: *const [SCHED_WORDS]u64,
+    n: usize,
+    word: usize = 0,
+    cur: u64 = 0,
+    started: bool = false,
+
+    fn next(it: *SchedSucc) ?usize {
+        if (!it.started) {
+            it.started = true;
+            it.cur = it.bits[0];
+        }
+        while (true) {
+            if (it.cur != 0) {
+                const b: usize = @ctz(it.cur);
+                it.cur &= it.cur - 1;
+                const j = it.word * 64 + b;
+                if (j < it.n) return j;
+                continue;
+            }
+            it.word += 1;
+            if (it.word >= SCHED_WORDS) return null;
+            it.cur = it.bits[it.word];
+        }
+    }
+};
+
 fn visitReads(m: *const MI, w: *State, d: i32) void {
     if (m.kind != .inst) return;
     const S = struct {

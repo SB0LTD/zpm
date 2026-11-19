@@ -119,6 +119,66 @@ pub const DxgDevice = struct {
     }
 };
 
+/// The GPU's own memory behind /dev/dxg as an nvidia.device.Device with no
+/// CPU view (`cpu` empty): gpu.nvidia_device's Adapter.gpu_only, as the
+/// forwarded RTX's VRAM is in Galaxy's VM (G_VRAM | G_NOCPU). Each buffer
+/// its own allocation (rounded up to 64 KiB); submissions on the Channel.
+pub const VramDevice = struct {
+    gpu: *Gpu,
+    channel: *Channel,
+    lost: bool = false,
+
+    pub fn init(d: *VramDevice, g: *Gpu, c: *Channel) void {
+        d.* = .{ .gpu = g, .channel = c };
+    }
+
+    pub fn device(d: *VramDevice) nvd.Device {
+        return .{ .ctx = d, .vtable = &vtable };
+    }
+
+    const vtable = nvd.Device.VTable{
+        .alloc = alloc,
+        .free = free,
+        .submit = submit,
+        .wait = wait,
+        .toDevice = barrier,
+        .fromDevice = barrier,
+    };
+
+    fn of(ctx: *anyopaque) *VramDevice {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn alloc(ctx: *anyopaque, size: usize) ?nvd.Buffer {
+        const r = of(ctx).gpu.allocVideo(std.mem.alignForward(u64, @max(size, 1), UNIT)) catch return null;
+        return .{ .va = r.va, .cpu = &.{}, .handle = r.handle };
+    }
+
+    fn free(ctx: *anyopaque, buf: nvd.Buffer) void {
+        of(ctx).gpu.release(.{ .handle = buf.handle });
+    }
+
+    fn submit(ctx: *anyopaque, pb: nvd.Buffer, dwords: u32) nvd.Error!nvd.Fence {
+        const d = of(ctx);
+        if (d.lost) return error.DeviceLost;
+        barrierNow();
+        return d.channel.submit(pb.va, dwords) catch error.SubmitFailed;
+    }
+
+    fn wait(ctx: *anyopaque, f: nvd.Fence, timeout_us: u64) nvd.Error!void {
+        const d = of(ctx);
+        d.channel.wait(f, timeout_us) catch |e| {
+            if (e == error.DeviceLost) d.lost = true;
+            return if (e == error.DeviceLost) error.DeviceLost else error.Timeout;
+        };
+        barrierNow();
+    }
+
+    fn barrier(_: *anyopaque, _: nvd.Buffer, _: usize, _: usize) void {
+        barrierNow();
+    }
+};
+
 var fence_word: u32 = 0;
 fn barrierNow() void {
     _ = @atomicRmw(u32, &fence_word, .Add, 0, .seq_cst);

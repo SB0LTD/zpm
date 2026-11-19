@@ -43,6 +43,10 @@ pub const Error = any.Error || gen.Error;
 pub const Options = struct {
     timeout_us: u64 = 10_000_000,
     import: bool = true,
+    /// The Q8_0 matrices' layout (null: kernels.Layout.wide, a row's
+    /// blocks side by side). Every layout gives the CPU's bits; a matrix
+    /// needs at least its `step` blocks a row.
+    matrix: ?kernels.Layout = null,
 };
 
 /// lfm3_audio_gen's RoPE base (its ROPE_BASE).
@@ -62,6 +66,7 @@ const Programs = struct {
     input: ?Program = null,
     bias: ?Program = null,
     residual: ?Program = null,
+    copy: ?Program = null,
 };
 
 const Matrix = struct { offset: u32, row_bytes: u32, rows: u32, blocks: u32, tensor: u16 };
@@ -119,7 +124,7 @@ pub fn Depth(comptime tensor_capacity: usize) type {
             if (!self.imported and self.weights.bytes != 0) self.dev.free(self.weights);
             self.weights = .{};
             for (&self.k.q80) |*p| self.unload(p);
-            const progs = [_]*?Program{ &self.k.quant, &self.k.norm, &self.k.norm2, &self.k.head, &self.k.attend, &self.k.attend_gated, &self.k.glu, &self.k.input, &self.k.bias, &self.k.residual };
+            const progs = [_]*?Program{ &self.k.quant, &self.k.norm, &self.k.norm2, &self.k.head, &self.k.attend, &self.k.attend_gated, &self.k.glu, &self.k.input, &self.k.bias, &self.k.residual, &self.k.copy };
             for (progs) |p| self.unload(p);
         }
 
@@ -152,10 +157,15 @@ pub fn Depth(comptime tensor_capacity: usize) type {
             slot.* = try self.dev.load(&bin);
         }
 
+        /// The Q8_0 matrices' layout.
+        pub fn matrixLayout(self: *const Self) kernels.Layout {
+            return self.options.matrix orelse kernels.Layout.wide(self.caps);
+        }
+
         fn compileAll(self: *Self) Error!void {
             const caps = self.caps;
             const s = kir.Storage{ .insts = &self.work.insts, .tys = &self.work.tys };
-            for (0..MATRIX_VARIANTS) |t| try self.build(&self.k.q80[t], kernels.matrix(s, caps, .q8_0, @intCast(t + 1)));
+            for (0..MATRIX_VARIANTS) |t| try self.build(&self.k.q80[t], kernels.matrixWith(s, caps, self.matrixLayout(), .q8_0, @intCast(t + 1)));
             try self.build(&self.k.quant, kernels.q80Quant(s, caps));
             try self.build(&self.k.norm, kernels.normRows(s, caps, false));
             try self.build(&self.k.norm2, kernels.normRows(s, caps, true));
@@ -165,6 +175,7 @@ pub fn Depth(comptime tensor_capacity: usize) type {
             try self.build(&self.k.glu, kernels.gluGgml(s, caps));
             try self.build(&self.k.input, kernels.depthInput(s, caps));
             try self.build(&self.k.bias, kernels.addBias(s, caps));
+            try self.build(&self.k.copy, kernels.copy(s, caps));
             try self.build(&self.k.residual, kernels.residual(s, caps, false));
         }
 
@@ -179,15 +190,9 @@ pub fn Depth(comptime tensor_capacity: usize) type {
                     }
                 }
             }
+            // (VRAM without a CPU view: through staging and the copy kernel)
             self.weights = try self.dev.alloc(std.mem.alignForward(u64, size, 16), .device);
-            if (self.weights.cpu.len < size) return error.Unsupported; // (VRAM without a view: as lfm3_any, not yet here)
-            var at: u64 = 0;
-            while (at < size) {
-                const n: usize = @intCast(@min(size - at, 4 << 20));
-                if (!self.file.read(at, self.weights.cpu[@intCast(at)..][0..n])) return error.StorageNotMapped;
-                at += n;
-            }
-            self.dev.toDevice(self.weights, 0, size);
+            try any.fillWeights(self.dev, self.file, self.weights, if (self.k.copy) |*c| c else null, self.work);
         }
 
         fn allocBuffers(self: *Self) Error!void {
@@ -240,6 +245,7 @@ pub fn Depth(comptime tensor_capacity: usize) type {
         /// token `first_act`), `rows` rows from `row0` (the logits' slice of
         /// the tied table).
         fn linear(self: *Self, l: *any.List, m: Matrix, n: u32, out: Buffer, out_off: u32, out_stride: u32, row0: u32, rows: u32, first_act: u32) Error!void {
+            if (m.blocks < self.matrixLayout().step()) return error.Unsupported;
             var first: u32 = 0;
             while (first < n) {
                 const tokens = @min(n - first, MATRIX_VARIANTS);
@@ -255,7 +261,7 @@ pub fn Depth(comptime tensor_capacity: usize) type {
                     .out = out_off + first * out_stride,
                 };
                 l.named("matrix q8_0", m.tensor, first, tokens);
-                try l.add(&self.k.q80[tokens - 1].?, kernels.matrixGroups(self.caps, rows), &.{ self.weights, self.act_q, self.act_d, self.act_d, out }, &p.words(.q8_0));
+                try l.add(&self.k.q80[tokens - 1].?, kernels.matrixGroupsWith(self.matrixLayout(), rows), &.{ self.weights, self.act_q, self.act_d, self.act_d, out }, &p.words(.q8_0));
                 first += tokens;
             }
         }

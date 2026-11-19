@@ -402,6 +402,44 @@ pub const Desc = struct {
 };
 
 /// A call's dispatches as they are written (in the Work).
+/// The model file into `weights` (`.device`, the file's size rounded up
+/// to 16 bytes): through its CPU view, or (VRAM without one: a GPU the CPU
+/// cannot reach, the forwarded RTX's) through an `.upload` staging buffer,
+/// `copy` (kernels.copy) moving each piece on the GPU. For this layer and
+/// the audio ones (lfm3_any_audio, _codec, _hear).
+pub fn fillWeights(dev: Device, file: gguf.Source, weights: Buffer, copy: ?*const Program, work: *Work) Error!void {
+    const size = file.size;
+    if (weights.cpu.len >= size) {
+        var at: u64 = 0;
+        while (at < size) {
+            const n: usize = @intCast(@min(size - at, 4 << 20));
+            if (!file.read(at, weights.cpu[@intCast(at)..][0..n])) return error.StorageNotMapped;
+            at += n;
+        }
+        dev.toDevice(weights, 0, size);
+        return;
+    }
+    const prog = copy orelse return error.Unsupported;
+    if (weights.bytes < std.mem.alignForward(u64, size, 16) or size > std.math.maxInt(u32)) return error.Unsupported;
+    const staging = try dev.alloc(STAGING_BYTES, .upload);
+    defer dev.free(staging);
+    var at: u64 = 0;
+    while (at < size) {
+        const n: usize = @intCast(@min(size - at, STAGING_BYTES));
+        const padded = std.mem.alignForward(usize, n, 16);
+        if (!file.read(at, staging.cpu[0..n])) return error.StorageNotMapped;
+        @memset(staging.cpu[n..padded], 0);
+        dev.toDevice(staging, 0, padded);
+        const words: u32 = @intCast(padded / 16);
+        var l = List{ .work = work };
+        l.what = .{ .kernel = "copy" };
+        try l.add(prog, kernels.copyGroups(words), &.{ staging, weights }, &.{ words, 0, @as(u32, @intCast(at)) });
+        const fence = try dev.run(l.slice());
+        try dev.wait(fence, std.math.maxInt(u64));
+        at += n;
+    }
+}
+
 pub const List = struct {
     work: *Work,
     n: usize = 0,
@@ -657,31 +695,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             }
             // (whole 16-byte words: the staging path copies them)
             self.weights = try self.dev.alloc(std.mem.alignForward(u64, size, 16), .device);
-            if (self.weights.cpu.len >= size) {
-                var at: u64 = 0;
-                while (at < size) {
-                    const n: usize = @intCast(@min(size - at, 4 << 20));
-                    if (!self.file.read(at, self.weights.cpu[@intCast(at)..][0..n])) return error.StorageNotMapped;
-                    at += n;
-                }
-                self.dev.toDevice(self.weights, 0, size);
-                return;
-            }
-            // (VRAM without a CPU view: through a staging buffer)
-            const staging = try self.dev.alloc(STAGING_BYTES, .upload);
-            defer self.dev.free(staging);
-            var at: u64 = 0;
-            while (at < size) {
-                const n: usize = @intCast(@min(size - at, STAGING_BYTES));
-                const padded = std.mem.alignForward(usize, n, 16);
-                if (!self.file.read(at, staging.cpu[0..n])) return error.StorageNotMapped;
-                @memset(staging.cpu[n..padded], 0);
-                self.dev.toDevice(staging, 0, padded);
-                var l = List{ .work = self.work };
-                try self.copyInto(&l, staging, 0, self.weights, @intCast(at), @intCast(padded / 16));
-                try self.runNow(&l);
-                at += n;
-            }
+            try fillWeights(self.dev, self.file, self.weights, if (self.k.copy) |*c| c else null, self.work);
         }
 
         fn copyInto(self: *Self, l: *List, from: Buffer, from_off: u32, to: Buffer, to_off: u32, words: u32) Error!void {

@@ -104,6 +104,22 @@ pub const HEAD_SIZE = 128;
 pub const SCORE_CHUNK = 64;
 /// Positions one attnValues workgroup sums.
 pub const VALUE_CHUNK = 256;
+/// Positions attnValues loads before it adds them, at most (a divisor of
+/// VALUE_CHUNK): valueUnroll's for a tile of `rows`.
+pub const VALUE_UNROLL = 32;
+
+/// Positions an attnValues iteration loads for a tile of `rows` rows: as
+/// many as the target's budget of registers for loaded values and weights
+/// holds (each iteration waits out about one memory round trip). The RTX
+/// (255 registers a thread): about 96, 32 positions for a decode token's
+/// two heads. The Adreno (its registers shared by 64 threads a wave, the
+/// kernel refused past them): about 24.
+pub fn valueUnroll(caps: Caps, rows: usize) u32 {
+    const budget: u32 = if (caps.target == .ir3_a7xx) 24 else 96;
+    var u: u32 = VALUE_UNROLL;
+    while (u > 2 and u * (1 + @as(u32, @intCast(rows))) > budget) u /= 2;
+    return u;
+}
 /// Rows (heads x tokens) one attention workgroup takes at most.
 pub const MAX_ROWS = 8;
 /// Threads of the row kernels (norms, quantization, residual).
@@ -123,21 +139,33 @@ pub const Format = enum { q4_k, q6_k, q8_0 };
 pub const Layout = struct {
     lanes: u32,
     threads: u32 = 64,
-    /// Blocks a slot's threads take an iteration (1 to MAX_UNROLL; Q8_0:
-    /// 1): all their weights loaded before any is used, so a warp has that
-    /// many blocks' bytes in flight at once.
+    /// Blocks a slot's threads take an iteration (1 to MAX_UNROLL): all
+    /// their weights loaded before any is used, so a warp has that many
+    /// blocks' bytes in flight at once.
     unroll: u32 = 1,
-    /// Blocks a row takes side by side (1 to MAX_SLOTS, a power of two;
-    /// Q8_0: 1): each slot's 8 / lanes threads their own block, every
-    /// block's sums then added in the CPU's order by every slot (shuffled
-    /// across), so a few long rows (ffn_down: 2048 of 30 blocks) still
-    /// fill the GPU. A row's block count must be at least slots * unroll
+    /// Blocks a row takes side by side (1 to MAX_SLOTS, a power of two):
+    /// each slot's 8 / lanes threads their own block, every block's sums
+    /// then added in the CPU's order by every slot (shuffled across), so a
+    /// few long rows (ffn_down: 2048 of 30 blocks) still fill the GPU. A row's block count must be at least slots * unroll
     /// (`step`); any count above it is fine.
     slots: u32 = 1,
 
     pub fn of(caps: Caps) Layout {
         if (caps.target == .ir3_a7xx) return .{ .lanes = 1 };
         return .{ .lanes = 4 };
+    }
+
+    /// Q8_0 passes of a few rows and tokens (the voice parts': 32 to 2816
+    /// rows of 8 to 128 blocks): a row's blocks side by side, so a pass
+    /// has threads enough to keep its loads in flight (four slots of two
+    /// threads, eight rows a 64-thread group: rows of 4 blocks or more).
+    /// On the RTX the depthformer's pass took 2.9 ms against 3.5 with the
+    /// target's layout (8 slots 3.0, 16 slots 4.9; unrolled slower); the
+    /// target's layout where a subgroup is too narrow for it.
+    pub fn wide(caps: Caps) Layout {
+        const lay = Layout{ .lanes = 4, .slots = 4 };
+        if (caps.target == .ir3_a7xx or caps.subgroup < lay.threadsPerRow()) return of(caps);
+        return lay;
     }
 
     /// The threads that share one block (its eight lanes between them).
@@ -731,7 +759,6 @@ pub fn matrixWith(s: kir.Storage, caps: Caps, lay: Layout, format: Format, token
     if (lay.lanes != 1 and lay.lanes != 2 and lay.lanes != 4) return error.Unsupported;
     if (lay.unroll < 1 or lay.unroll > MAX_UNROLL) return error.Unsupported;
     if (lay.slots < 1 or lay.slots > MAX_SLOTS or !std.math.isPowerOfTwo(lay.slots)) return error.Unsupported;
-    if (format == .q8_0 and (lay.unroll != 1 or lay.slots != 1)) return error.Unsupported;
     if (caps.subgroup < lay.threadsPerRow() or lay.threads % lay.threadsPerRow() != 0) return error.Unsupported;
     var k = begin(s, switch (format) {
         .q4_k => "lfm3_q4k",
@@ -782,15 +809,11 @@ pub fn matrixWith(s: kir.Storage, caps: Caps, lay: Layout, format: Format, token
     };
     const blk = b.mov(.u32, U(0));
     const mb = MB{ .W = W, .AQ = AQ, .AD = AD, .AS = AS };
+    var bl = Blocks.init(&b, caps, lay, format, t, rt, wrow, blk, blocks);
     switch (format) {
-        .q8_0 => q80Body(&b, mb, lpt, tokens, l0x4, b.mov(.u32, R(wrow)), blk, blocks, &aq_t, &ad_t, &acc),
-        .q4_k, .q6_k => {
-            var bl = Blocks.init(&b, caps, lay, format, t, rt, wrow, blk, blocks);
-            if (format == .q4_k)
-                q4kBody(&b, mb, lpt, &bl, tokens, l0, l0x4, &aq_t, &ad_t, &as_t, &acc)
-            else
-                q6kBody(&b, mb, lpt, &bl, tokens, l0, l0x4, &aq_t, &ad_t, &as_t, &acc);
-        },
+        .q8_0 => q80Body(&b, mb, lpt, &bl, tokens, l0x4, &aq_t, &ad_t, &acc),
+        .q4_k => q4kBody(&b, mb, lpt, &bl, tokens, l0, l0x4, &aq_t, &ad_t, &as_t, &acc),
+        .q6_k => q6kBody(&b, mb, lpt, &bl, tokens, l0, l0x4, &aq_t, &ad_t, &as_t, &acc),
     }
 
     // Each token's lanes to the row's first thread (xor k from it is the
@@ -838,7 +861,7 @@ fn nextBlock(b: *Builder, boff: V, blk: V, blocks: V, block_bytes: u32, step: u3
 pub const MAX_UNROLL = 4;
 pub const MAX_SLOTS = 16;
 
-/// A Q4_K or Q6_K row's block loop (Layout.slots and unroll): unroll step
+/// A row's block loop (Layout.slots and unroll): unroll step
 /// u of slot s takes block base + u * slots + s, base the iteration's
 /// first block. The last iteration's base is moved back to blocks - step
 /// (a row needs at least `step` blocks), and the blocks it takes again
@@ -870,7 +893,11 @@ const Blocks = struct {
         var self = Blocks{
             .slots = lay.slots,
             .unroll = lay.unroll,
-            .block_bytes = if (format == .q4_k) Q4_K_BLOCK else Q6_K_BLOCK,
+            .block_bytes = switch (format) {
+                .q4_k => Q4_K_BLOCK,
+                .q6_k => Q6_K_BLOCK,
+                .q8_0 => Q8_0_BLOCK,
+            },
             .wrow = wrow,
             .slot = undefined,
             .blk = blk,
@@ -913,6 +940,23 @@ const Blocks = struct {
                 const sum = b.fadd(R(acc[ti][j]), R(v));
                 b.set(acc[ti][j], .sel, .f32, R(sum), R(acc[ti][j]), R(fresh));
             };
+        }
+    }
+
+    /// Q8_0's: unroll step u's integer sums `c` (as floats) and scales
+    /// `da` (this thread's block's) fused into `acc` in the CPU's order,
+    /// acc = da * c + acc a block at a time (its @mulAdd), as `add`.
+    fn addFma(self: *const Blocks, b: *Builder, u: usize, tokens: u32, lpt: u32, da: *const [MAX_TOKENS]V, c: *const [MAX_TOKENS][4]V, acc: *[MAX_TOKENS][4]V) void {
+        for (0..self.slots) |s| {
+            const fresh = b.icmp(.u32, .le, R(self.lag), U(@intCast(u * self.slots + s)));
+            for (0..tokens) |ti| {
+                const a = if (self.slots == 1) da[ti] else b.shfl(.idx, da[ti], R(self.src[s]));
+                for (0..lpt) |j| {
+                    const v = if (self.slots == 1) c[ti][j] else b.shfl(.idx, c[ti][j], R(self.src[s]));
+                    const sum = b.fma(R(a), R(v), R(acc[ti][j]));
+                    b.set(acc[ti][j], .sel, .f32, R(sum), R(acc[ti][j]), R(fresh));
+                }
+            }
         }
     }
 
@@ -1155,26 +1199,36 @@ fn q6kBody(b: *Builder, m: MB, lpt: u32, bl: *Blocks, tokens: u32, l0: V, l0x4: 
     bl.end(b);
 }
 
-fn q80Body(b: *Builder, m: MB, lpt: u32, tokens: u32, l0x4: V, boff: V, blk: V, blocks: V, aq_t: []const V, ad_t: []const V, acc: *[MAX_TOKENS][4]V) void {
-    b.loop();
+fn q80Body(b: *Builder, m: MB, lpt: u32, bl: *Blocks, tokens: u32, l0x4: V, aq_t: []const V, ad_t: []const V, acc: *[MAX_TOKENS][4]V) void {
+    const unroll = bl.unroll;
+    bl.begin(b);
+    // every block's weights of this iteration first, then each in turn
+    const boff = bl.boff;
     const qaddr = b.add(R(boff), R(l0x4));
-    var w: [4]V = undefined;
-    for (0..lpt) |j| w[j] = word16(b, m.W, qaddr, @intCast(2 + 4 * j));
-    const d = b.half(b.ld(m.W, .u32, R(boff), 0, 4), false);
-    const a_off = b.shl(R(blk), 5);
-    const d_off = b.shl(R(blk), 2);
-    for (0..tokens) |ti| {
-        const aw = b.ldv(m.AQ, .u32, R(b.add(R(aq_t[ti]), R(a_off))), 0, lpt);
-        const ad = b.ld(m.AD, .f32, R(b.add(R(ad_t[ti]), R(d_off))), 0, 5);
-        const da = b.fmul(R(d), R(ad));
-        for (0..lpt) |j| {
-            const dot = b.dot4(.s8s8, R(at(aw, j)), R(w[j]), I(0));
-            // the CPU's @mulAdd: fused where the GPU fuses
-            b.set(acc[ti][j], .mov, .f32, R(b.fma(R(da), R(b.i2f(dot)), R(acc[ti][j]))), NO, NO);
-        }
+    var w: [MAX_UNROLL][4]V = undefined;
+    var dw: [MAX_UNROLL]V = undefined;
+    for (0..unroll) |u| {
+        const ub: u32 = bl.ahead(u) * Q8_0_BLOCK;
+        dw[u] = b.ld(m.W, .u32, R(boff), ub, 4);
+        for (0..lpt) |j| w[u][j] = word16(b, m.W, qaddr, ub + @as(u32, @intCast(2 + 4 * j)));
     }
-    nextBlock(b, boff, blk, blocks, Q8_0_BLOCK, 1);
-    b.endloop();
+    const a_off = b.shl(R(bl.bslot), 5);
+    const d_off = b.shl(R(bl.bslot), 2);
+    for (0..unroll) |u| {
+        const d = b.half(dw[u], false);
+        const ua = bl.ahead(u);
+        var da: [MAX_TOKENS]V = undefined;
+        var c: [MAX_TOKENS][4]V = undefined;
+        for (0..tokens) |ti| {
+            const aw = b.ldv(m.AQ, .u32, R(b.add(R(aq_t[ti]), R(a_off))), ua * 32, lpt);
+            const ad = b.ld(m.AD, .f32, R(b.add(R(ad_t[ti]), R(d_off))), ua * 4, 5);
+            da[ti] = b.fmul(R(d), R(ad));
+            for (0..lpt) |j| c[ti][j] = b.i2f(b.dot4(.s8s8, R(at(aw, j)), R(w[u][j]), I(0)));
+        }
+        // the CPU's @mulAdd: fused where the GPU fuses
+        bl.addFma(b, u, tokens, lpt, &da, &c, acc);
+    }
+    bl.end(b);
 }
 
 // ── Q8_K quantization ───────────────────────────────────────────────────────
@@ -2082,9 +2136,10 @@ pub fn attnSoftmax(s: kir.Storage, caps: Caps) Error!kir.Kernel {
 
 /// Sums weight * f16 value in position order over one chunk of
 /// VALUE_CHUNK positions (aligned) for a tile of `hg` heads by `tt` tokens:
-/// thread j has elements j and j + 64 of every row. Each row's partial for
-/// the chunk goes to partial[row][chunk - first chunk]. Groups:
-/// valueGroups.
+/// thread j has elements 2j and 2j + 1 of every row (one 32-bit load a
+/// position: two 16-bit loads made the kernel three times slower on the
+/// RTX). Each row's partial for the chunk goes to partial[row][chunk -
+/// first chunk]. Groups: valueGroups.
 pub fn attnValues(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel {
     if (hg * tt == 0 or hg * tt > MAX_ROWS) return error.Unsupported;
     var k = begin(s, "lfm3_attn_values", 64);
@@ -2110,24 +2165,44 @@ pub fn attnValues(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel
     }
     b.if_(b.icmp(.u32, .le, R(cs), R(tile.end)));
     {
-        const vaddr = b.add(R(kvBlock(&b, true, tile.kvh)), R(b.shl(R(t), 1)));
+        const vaddr = b.add(R(kvBlock(&b, true, tile.kvh)), R(b.shl(R(t), 2)));
         const p = b.mov(.u32, R(cs));
+        // valueUnroll positions an iteration: every load of theirs first
+        // (positions past the chunk's end read its last one, and add
+        // nothing), then each added in position order, the CPU's: a
+        // backend's loop branch waits for every load in flight, so one
+        // position an iteration waited out a memory round trip each.
+        const unroll = valueUnroll(caps, n);
         b.loop();
         {
-            const vo = b.add(R(vaddr), R(b.shl(R(p), 8)));
-            const v0 = b.half(b.ld(KV, .u32, R(vo), 0, 4), false);
-            const v1 = b.half(b.ld(KV, .u32, R(vo), 128, 4), false);
-            // (a key in the hole adds nothing: left out, as the CPU leaves it)
-            const seen_p = attnSeen(&b, p);
-            for (0..n) |r| {
-                const row = tile.rows[r];
-                const in = b.pand(b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(p), R(row.first))), b.icmp(.u32, .le, R(p), R(row.last))), seen_p);
-                const rel = b.sel(.u32, in, R(b.sub(R(p), R(row.first))), U(0));
-                const w = b.ld(S, .f32, R(b.add(R(srow[r]), R(b.shl(R(rel), 2)))), 0, 5);
-                b.set(acc[r][0], .sel, .f32, R(b.fadd(R(acc[r][0]), R(b.fmul(R(w), R(v0))))), R(acc[r][0]), R(in));
-                b.set(acc[r][1], .sel, .f32, R(b.fadd(R(acc[r][1]), R(b.fmul(R(w), R(v1))))), R(acc[r][1]), R(in));
+            var v0: [VALUE_UNROLL]V = undefined;
+            var v1: [VALUE_UNROLL]V = undefined;
+            var w: [VALUE_UNROLL][MAX_ROWS]V = undefined;
+            var in: [VALUE_UNROLL][MAX_ROWS]V = undefined;
+            for (0..unroll) |u| {
+                const pu = if (u == 0) p else b.add(R(p), U(@intCast(u)));
+                const valid = b.icmp(.u32, .le, R(pu), R(ce));
+                const pc = b.umin(R(pu), R(ce));
+                const vo = b.add(R(vaddr), R(b.shl(R(pc), 8)));
+                const vw = b.ld(KV, .u32, R(vo), 0, 5);
+                v0[u] = b.half(vw, false);
+                v1[u] = b.half(vw, true);
+                // (a key in the hole adds nothing: left out, as the CPU leaves it)
+                const seen_p = b.pand(attnSeen(&b, pc), valid);
+                for (0..n) |r| {
+                    const row = tile.rows[r];
+                    in[u][r] = b.pand(b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(pc), R(row.first))), b.icmp(.u32, .le, R(pc), R(row.last))), seen_p);
+                    const rel = b.sel(.u32, in[u][r], R(b.sub(R(pc), R(row.first))), U(0));
+                    w[u][r] = b.ld(S, .f32, R(b.add(R(srow[r]), R(b.shl(R(rel), 2)))), 0, 5);
+                }
             }
-            b.set(p, .iadd, .u32, R(p), U(1), NO);
+            for (0..unroll) |u| {
+                for (0..n) |r| {
+                    b.set(acc[r][0], .sel, .f32, R(b.fadd(R(acc[r][0]), R(b.fmul(R(w[u][r]), R(v0[u]))))), R(acc[r][0]), R(in[u][r]));
+                    b.set(acc[r][1], .sel, .f32, R(b.fadd(R(acc[r][1]), R(b.fmul(R(w[u][r]), R(v1[u]))))), R(acc[r][1]), R(in[u][r]));
+                }
+            }
+            b.set(p, .iadd, .u32, R(p), U(unroll), NO);
             b.brk(b.icmp(.u32, .gt, R(p), R(ce)));
         }
         b.endloop();
@@ -2138,9 +2213,9 @@ pub fn attnValues(s: kir.Storage, caps: Caps, hg: u32, tt: u32) Error!kir.Kernel
             const first_chunk = b.shr(R(row.first), cshift);
             const meets = b.pand(b.pand(row.ok, b.icmp(.u32, .ge, R(chunk), R(first_chunk))), b.icmp(.u32, .le, R(cs), R(row.last)));
             b.if_(meets);
-            const po = b.add(R(b.add(R(rowOffset(&b, tile.token[r], tile.head[r], chunks_bytes)), R(b.shl(R(b.sub(R(chunk), R(first_chunk))), 9)))), R(b.shl(R(t), 2)));
+            const po = b.add(R(b.add(R(rowOffset(&b, tile.token[r], tile.head[r], chunks_bytes)), R(b.shl(R(b.sub(R(chunk), R(first_chunk))), 9)))), R(b.shl(R(t), 3)));
             b.st(P, R(po), 0, 5, acc[r][0]);
-            b.st(P, R(po), 256, 5, acc[r][1]);
+            b.st(P, R(po), 4, 5, acc[r][1]);
             b.endif();
         }
     }
@@ -2936,7 +3011,21 @@ test "Q8_0 x Q8_0: the CPU's fused bits, ffma where the GPU fuses, the exact emu
     for ([_]u32{ 1, 4 }) |lanes| {
         try testMatrix(caps32(true, 32), .{ .lanes = lanes }, .q8_0, 1, 21, 37);
         try testMatrix(caps32(false, 32), .{ .lanes = lanes }, .q8_0, 8, 16, 24);
+        // blocks side by side, unrolled, the last iteration moved back
+        try testMatrix(caps32(true, 32), .{ .lanes = lanes, .unroll = 2 }, .q8_0, 3, 13, 7);
+        try testMatrix(caps32(false, 32), .{ .lanes = lanes, .slots = 2 }, .q8_0, 2, 11, 9);
     }
+    // the voice parts' wide layout, and its widest kin
+    try testMatrix(caps32(true, 32), Layout.wide(caps32(true, 32)), .q8_0, 8, 9, 32);
+    try testMatrix(caps32(false, 32), Layout.wide(caps32(false, 32)), .q8_0, 4, 7, 37);
+    try testMatrix(caps32(true, 32), .{ .lanes = 4, .slots = 16, .unroll = 2 }, .q8_0, 5, 6, 88);
+    try testMatrix(caps32(true, 64), .{ .lanes = 1, .slots = 4, .unroll = 4 }, .q8_0, 8, 5, 30);
+}
+
+test "Q8_0 on the emulated RTX (kir_sm120 in sm120_emu): the CPU's bits in the wide layout" {
+    try testMatrixRtx(.{ .lanes = 4 }, .q8_0, 1, 21, 3);
+    try testMatrixRtx(.{ .lanes = 4, .slots = 8, .unroll = 2 }, .q8_0, 8, 9, 32);
+    try testMatrixRtx(.{ .lanes = 4, .slots = 4, .unroll = 4 }, .q8_0, 3, 7, 37);
 }
 
 fn quantInput(x: []f32, seed: *u32) void {

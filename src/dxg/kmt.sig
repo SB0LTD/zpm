@@ -26,6 +26,8 @@ pub const Nr = enum(u8) {
     make_resident = 0x0b,
     map_gpu_va = 0x0c,
     escape = 0x0d,
+    get_device_state = 0x0e,
+    submit_command = 0x0f,
     destroy_allocation2 = 0x13,
     close_adapter = 0x15,
     create_hw_queue = 0x18,
@@ -121,6 +123,26 @@ pub const CreateDevice = extern struct {
 };
 
 pub const DestroyDevice = extern struct { device: Handle };
+
+/// d3dkmt_getdevicestate; state_type 1 (execution: `seq` low word the
+/// state) or 5 (the page fault: where, from which stage, how).
+pub const GetDeviceState = extern struct {
+    device: Handle,
+    state_type: u32,
+    seq: u64 = 0,
+    stage: u32 = 0,
+    bind_entry: u32 = 0,
+    flags: u32 = 0,
+    error_code: u32 = 0,
+    va: u64 = 0,
+    rest: [16]u8 = [_]u8{0} ** 16,
+};
+pub const DEVICESTATE_EXECUTION: u32 = 1;
+pub const DEVICESTATE_PAGE_FAULT: u32 = 5;
+
+comptime {
+    if (@sizeOf(GetDeviceState) != 56) @compileError("d3dkmt_getdevicestate is 56 bytes");
+}
 
 /// D3DDDI_CREATECONTEXTFLAGS
 pub const CONTEXT_DISABLE_GPU_TIMEOUT: u32 = 1 << 2;
@@ -273,6 +295,26 @@ pub const CreateHwQueue = extern struct {
 
 pub const DestroyHwQueue = extern struct { queue: Handle };
 
+/// A legacy context's submission (d3dkmt_submitcommand): NVIDIA's video
+/// engines' contexts take their work so (no hardware queue): the command
+/// buffer, and NVIDIA's private data naming it as a GPFIFO entry.
+pub const SubmitCommand = extern struct {
+    command_buffer: u64 = 0,
+    command_length: u32 = 0,
+    flags: u32 = 0,
+    present_history_token: u64 = 0,
+    broadcast_context_count: u32 = 0,
+    broadcast_context: [64]Handle = @splat(0),
+    reserved: u32 = 0,
+    priv: u64 = 0,
+    priv_size: u32 = 0,
+    num_primaries: u32 = 0,
+    written_primaries: [16]Handle = @splat(0),
+    num_history_buffers: u32 = 0,
+    reserved1: u32 = 0,
+    history_buffer_array: u64 = 0,
+};
+
 pub const SubmitToHwQueue = extern struct {
     queue: Handle,
     reserved: u32 = 0,
@@ -294,6 +336,7 @@ comptime {
         .{ ReserveGpuVa, 72 },        .{ AllocationInfo2, 96 }, .{ CreateAllocation, 72 },
         .{ DestroyAllocation2, 24 },  .{ MakeResident, 48 },    .{ MapGpuVa, 104 },
         .{ Escape, 32 },              .{ CreateHwQueue, 48 },   .{ SubmitToHwQueue, 56 },
+        .{ SubmitCommand, 384 },
         .{ PciIds, 28 },
     };
     for (sizes) |s| {
@@ -304,6 +347,7 @@ comptime {
         @offsetOf(MapGpuVa, "protection") != 56 or @offsetOf(MapGpuVa, "va") != 88 or
         @offsetOf(MapGpuVa, "paging_fence") != 96) @compileError("MapGpuVa offsets");
     if (@offsetOf(MakeResident, "paging_fence") != 32) @compileError("MakeResident offsets");
+    if (@offsetOf(SubmitCommand, "broadcast_context") != 28 or @offsetOf(SubmitCommand, "priv") != 288 or @offsetOf(SubmitCommand, "priv_size") != 296) @compileError("SubmitCommand offsets");
     if (@offsetOf(CreateAllocation, "info") != 48 or @offsetOf(CreateAllocation, "flags") != 56) @compileError("CreateAllocation offsets");
     if (@offsetOf(AllocationInfo2, "gpu_va") != 40 or @offsetOf(AllocationInfo2, "priority") != 48) @compileError("AllocationInfo2 offsets");
     if (@offsetOf(CreateHwQueue, "priv") != 16 or @offsetOf(CreateHwQueue, "progress_gpu") != 40) @compileError("CreateHwQueue offsets");

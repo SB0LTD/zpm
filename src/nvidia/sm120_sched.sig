@@ -27,8 +27,11 @@
 //!   of hazard). Where a pair needs a scoreboard, the first instruction
 //!   releases one and the second waits on it, at least two cycles after
 //!   it was set.
-//! - Six scoreboards: a free one when there is one, else the one the most
-//!   recent instruction holds is shared (waiting on it then waits on both).
+//! - Six scoreboards: the last for every read-release (a source read late,
+//!   given back in tens of cycles), so a write after a read never waits
+//!   for a result; for results a free one of the other five when there is
+//!   one, else the one the most recent result holds is shared (waiting on
+//!   it then waits on both).
 //! - Branches (BRA, BRA.U, CALL, RET) and EXIT end a block (an EXIT
 //!   too: the warp's other lanes go on after it): a branch waits on
 //!   every scoreboard in flight and stalls until every fixed-latency result
@@ -552,6 +555,10 @@ pub const Work = struct {
 /// stall over 15 cycles: each NOP has its own stall).
 pub const Slot = struct { control: sm120.Control, nops: [2]u4 = .{ 0, 0 }, n_nops: u2 = 0 };
 
+/// The scoreboard every read-release takes (see Bars.take); results take
+/// the others.
+const READ_BAR: usize = BARS - 1;
+
 const Bars = struct {
     gen: [BARS]u32 = .{0} ** BARS,
     /// Producers on it since it was last waited.
@@ -564,19 +571,29 @@ const Bars = struct {
         return bar != sm120.Control.NONE and b.gen[bar] == gen and b.count[bar] > 0;
     }
 
-    fn take(b: *Bars, j: u32, cycle: u32) struct { bar: u3, gen: u32 } {
+    fn take(b: *Bars, j: u32, cycle: u32, read: bool) struct { bar: u3, gen: u32 } {
+        // A read's scoreboard (an instruction's sources read late, given
+        // back within tens of cycles) is READ_BAR, shared by every read
+        // and never by a result: on a shared one, a write after a read
+        // (a load's address register reused) waited for every load's data,
+        // and a stream of loads ran one at a time (the attention values'
+        // 32 loads an iteration, the RTX at ~1 us a load).
         var pick: usize = BARS;
-        for (0..BARS) |k| {
-            if (b.count[k] == 0) {
-                pick = k;
-                break;
+        if (read) {
+            pick = READ_BAR;
+        } else {
+            for (0..READ_BAR) |k| {
+                if (b.count[k] == 0) {
+                    pick = k;
+                    break;
+                }
             }
-        }
-        if (pick == BARS) {
-            // all held: share the most recent producer's
-            pick = 0;
-            for (1..BARS) |k| {
-                if (b.last[k] > b.last[pick]) pick = k;
+            if (pick == BARS) {
+                // all held: share the most recent producer's
+                pick = 0;
+                for (1..READ_BAR) |k| {
+                    if (b.last[k] > b.last[pick]) pick = k;
+                }
             }
         }
         b.count[pick] += 1;
@@ -659,13 +676,13 @@ pub fn schedule(ins: []const sm120.Instr, out: []Slot, w: *Work) Error!void {
         }
         var c = sm120.Control{ .wait = wait };
         if (w.need_rd[j]) {
-            const t = bars.take(@intCast(j), min);
+            const t = bars.take(@intCast(j), min, true);
             w.rd_bar[j] = t.bar;
             w.rd_gen[j] = t.gen;
             c.read = t.bar;
         }
         if (w.need_wr[j]) {
-            const t = bars.take(@intCast(j), min);
+            const t = bars.take(@intCast(j), min, false);
             w.wr_bar[j] = t.bar;
             w.wr_gen[j] = t.gen;
             c.write = t.bar;
@@ -1042,12 +1059,14 @@ test "a vertex program: loads through scoreboards, the stores' reads drained by 
     try testing.expectEqual(@as(u6, 0b10), out[4].control.wait);
     // the first store reads the multiply's result: 5 cycles and the padding
     try testing.expectEqual(@as(u4, 6), out[2].control.stall);
-    // each store releases a read scoreboard, and EXIT waits on both, at
-    // least two cycles after the last was set
+    // each store releases the reads' scoreboard (one for every read, apart
+    // from the results'), and EXIT waits on it, at least two cycles after
+    // the last was set
     const first = out[3].control.read;
     const second = out[4].control.read;
-    try testing.expect(first != sm120.Control.NONE and second != sm120.Control.NONE and first != second);
-    try testing.expectEqual(@as(u6, 1) << first | @as(u6, 1) << second, out[5].control.wait);
+    try testing.expectEqual(@as(u3, READ_BAR), first);
+    try testing.expectEqual(@as(u3, READ_BAR), second);
+    try testing.expectEqual(@as(u6, 1) << READ_BAR, out[5].control.wait);
     try testing.expect(out[4].control.stall >= SB_SET);
 }
 

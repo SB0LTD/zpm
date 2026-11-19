@@ -95,6 +95,10 @@ pub const Dispatch = struct {
     group_stride: u32 = 1,
     /// A vertex or fragment program's run: what the pipeline gives it.
     stage: ?*const Stage = null,
+    /// f32 subnormals flushed to zero of their sign, in every float op's
+    /// sources and results (an unfused mad's product too), as the X1-45
+    /// measured (its probes: flush-to-zero for f32 arithmetic). Off: kept.
+    ftz: bool = false,
 };
 
 /// Varying components a fragment program may read.
@@ -268,9 +272,16 @@ fn fsrc(c: *const Ctx, f: u32, s: Src, i: u32) f32 {
     const b = srcBits(c, f, s, i);
     var v: f32 = if (s.half) @floatCast(f16of(b)) else f32of(b);
     if (s.kind == .imm and !s.half) v = f32of(b);
+    if (!s.half) v = ftz(c, v);
     if (s.abs) v = @abs(v);
     if (s.neg) v = -v;
     return v;
+}
+
+/// `v`, or zero of its sign where the dispatch flushes and it is subnormal.
+fn ftz(c: *const Ctx, v: f32) f32 {
+    if (!c.d.ftz or v == 0 or !std.math.isFinite(v) or @abs(v) >= std.math.floatMin(f32)) return v;
+    return std.math.copysign(@as(f32, 0), v);
 }
 
 /// An integer source with its modifiers: (abs)/(neg) as signed, (not) bitwise.
@@ -316,7 +327,7 @@ fn minMax(a: f32, b: f32, max: bool) f32 {
 }
 
 fn putF(c: *Ctx, f: u32, dst: u16, half: bool, v: f32, sat: bool) void {
-    const x = if (sat) std.math.clamp(v, 0.0, 1.0) else v;
+    const x = if (sat) std.math.clamp(v, 0.0, 1.0) else if (half) v else ftz(c, v);
     if (half) writeReg(c, f, dst, true, @as(u16, @bitCast(@as(f16, @floatCast(x))))) else writeReg(c, f, dst, false, @bitCast(x));
 }
 
@@ -376,9 +387,11 @@ fn movValue(c: *const Ctx, f: u32, in: *const Instr, i: u32) u32 {
             break :blk bits;
         },
         .f16 => blk: {
-            // f32 -> f16: (even) rounds to nearest, otherwise toward zero.
-            if (in.round == .even) break :blk @as(u16, @bitCast(@as(f16, @floatCast(x))));
-            break :blk @as(u16, @bitCast(f16TowardZero(@floatCast(x))));
+            // f32 -> f16: (even) rounds to nearest, otherwise toward zero;
+            // a subnormal half comes out as zero of its sign, as the X1-45's
+            // does (its self-test: 2^-24 gave 0).
+            const h: u16 = if (in.round == .even) @bitCast(@as(f16, @floatCast(x))) else @bitCast(f16TowardZero(@floatCast(x)));
+            break :blk if (h & 0x7c00 == 0) h & 0x8000 else h;
         },
         .u32 => @intFromFloat(std.math.clamp(roundI(x, in.round), 0, 4294967295.0)),
         .s32 => @bitCast(@as(i32, @intFromFloat(std.math.clamp(roundI(x, in.round), -2147483648.0, 2147483647.0)))),
@@ -729,7 +742,7 @@ fn execCat3(c: *Ctx, in: *const Instr, fibers: []const u32, slot0: u64) Error!vo
             const s2 = in.src[2];
             switch (in.op) {
                 .mad_f32, .mad_f16 => {
-                    const v = fsrc(c, f, s0, i) * fsrc(c, f, s1, i) + fsrc(c, f, s2, i);
+                    const v = ftz(c, fsrc(c, f, s0, i) * fsrc(c, f, s1, i)) + fsrc(c, f, s2, i);
                     putF(c, f, dst, dhalf, v, in.sat);
                     continue;
                 },
