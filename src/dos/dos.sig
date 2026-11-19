@@ -16,7 +16,9 @@
 //!   kbd.sig         the 8042 keyboard controller
 //!   dma.sig         the two 8237 DMA controllers
 //!   vga.sig         the VGA
+//!   vesa.sig        its SVGA: 4 MiB, the VESA modes and their picture
 //!   video_bios.sig  int 10h
+//!   vesa_bios.sig   int 10h's VESA BIOS Extensions 2.0 (AH=4Fh)
 //!   sb.sig          the Sound Blaster 16's DSP and mixer
 //!   opl.sig         its OPL3 (and the AdLib's OPL2)
 //!   bios.sig        the BIOS's data area and its services
@@ -46,6 +48,8 @@ test {
     _ = @import("dma.sig");
     _ = @import("vga.sig");
     _ = @import("video_bios.sig");
+    _ = @import("vesa.sig");
+    _ = @import("vesa_bios.sig");
     _ = @import("sb.sig");
     _ = @import("opl.sig");
     _ = @import("bios.sig");
@@ -57,6 +61,7 @@ test {
     _ = @import("cpu_test.sig");
     _ = @import("cpu_pm_test.sig");
     _ = @import("vga_test.sig");
+    _ = @import("vesa_test.sig");
     _ = @import("bios_test.sig");
     _ = @import("xms_test.sig");
     _ = @import("mouse_test.sig");

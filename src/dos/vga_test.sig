@@ -470,8 +470,13 @@ test "video bios: set mode, teletype, scrolling, the BDA and info calls" {
     try t.expectEqual(vb.FONT16, r.bp());
     try t.expectEqual(@as(u16, 16), r.cx());
     try t.expectEqual(font.font16['A' * 16 + 5], mem.rd8(Memory.lin(vb.ROM_SEG, vb.FONT16) + 'A' * 16 + 5));
-    r = int10(0x4F00, 0, 0, 0);
-    try t.expectEqual(@as(u16, 0x014F), r.ax());
+    // VESA is there (vesa_test.sig has the rest).
+    var rv = regs.Regs{};
+    rv.setAx(0x4F00);
+    rv.setSeg(regs.ES, 0x0800);
+    vb.int10(&rv, &mem, &v);
+    try t.expectEqual(@as(u16, 0x004F), rv.ax());
+    try t.expectEqualStrings("VESA", mem.ram[0x8000..][0..4]);
     // The state (AH=1Bh): the static table's pointer, mode, columns.
     var rq = regs.Regs{};
     rq.setAx(0x1B00);
