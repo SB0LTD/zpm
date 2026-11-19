@@ -910,4 +910,5 @@ fn moveRegion(st: *State, r: *Regs, mem: *Memory, bus: anytype) void {
 
 test {
     _ = @import("xms_test.sig");
+    std.testing.refAllDecls(@This());
 }

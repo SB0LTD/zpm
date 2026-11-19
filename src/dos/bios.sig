@@ -518,8 +518,10 @@ pub fn int13(r: *Regs, mem: *Memory) void {
     r.fail(0x0100);
 }
 
-/// int 15h (see int15Wait; this form cannot make 86h wait).
+/// int 15h (see int15Wait; this form cannot make 86h wait: it returns at
+/// once, and 87h moves through RAM alone).
 pub fn int15(st: *State, r: *Regs, mem: *Memory, a20: *bool) void {
+    if (r.ah() == 0x86) return r.ok();
     _ = int15Wait(st, r, mem, a20, bus_mod.MemBus{ .mem = mem });
 }
 
@@ -733,4 +735,6 @@ pub fn int1a(st: *State, r: *Regs, mem: *Memory, host: host_mod.Host) void {
 
 test {
     _ = @import("bios_test.sig");
+    std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(bus_mod);
 }

@@ -24,7 +24,8 @@ pub const MemBus = struct {
 const ADAPTER_LO: u32 = mem_mod.CONVENTIONAL;
 const ADAPTER_HI: u32 = mem_mod.MEG;
 
-fn touchesAdapter(a: u32, n: u32) bool {
+/// Whether [a, a + n) reaches into the adapter area.
+pub fn touchesAdapter(a: u32, n: u32) bool {
     const end = a +| n;
     return a < ADAPTER_HI and end > ADAPTER_LO;
 }

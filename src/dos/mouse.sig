@@ -373,4 +373,5 @@ pub fn int33(st: *State, r: *Regs, mem: *Memory) void {
 
 test {
     _ = @import("mouse_test.sig");
+    std.testing.refAllDecls(@This());
 }
