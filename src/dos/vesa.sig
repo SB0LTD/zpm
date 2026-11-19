@@ -108,6 +108,17 @@ pub fn modeOf(n: u16) ?*const ModeDesc {
 pub const MAX_W: u32 = 1600;
 pub const MAX_H: u32 = 1200;
 
+/// Every field of `self` to its default, but arrays larger than 4 KiB,
+/// which are left for the caller to clear: `self.* = .{}` would keep the
+/// whole default struct, video memory and all, in the program's file.
+pub fn resetFields(comptime T: type, self: *T) void {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, FT, attrs| {
+        if (comptime @sizeOf(FT) > 4096) continue;
+        @field(self, name) = comptime attrs.defaultValue(FT) orelse @compileError("no default: " ++ name);
+    }
+}
+
 pub const Svga = struct {
     mem: [VRAM]u8 align(4096) = undefined,
     /// A VESA mode is set (the VGA's own picture and window are off).
@@ -131,7 +142,7 @@ pub const Svga = struct {
     pal2: [256]u32 = @splat(0),
 
     pub fn reset(self: *Svga) void {
-        self.* = .{};
+        resetFields(Svga, self);
         @memset(&self.mem, 0);
     }
 

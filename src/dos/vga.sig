@@ -197,11 +197,14 @@ pub const Vga = struct {
     svga: vesa.Svga = .{},
 
     pub fn reset(self: *Vga) void {
-        // (written in place: the planes and the SVGA's memory are not
-        // copied through the stack)
-        self.* = .{};
-        @memset(&self.vram, 0);
-        @memset(&self.svga.mem, 0);
+        // (field by field: the planes, their snapshot and the SVGA's memory
+        // are cleared here, not copied from a default kept in the file)
+        vesa.resetFields(Vga, self);
+        const info = @typeInfo(Vga).@"struct";
+        inline for (info.field_names, info.field_types) |name, FT| {
+            if (comptime @sizeOf(FT) > 4096 and FT != vesa.Svga) @memset(std.mem.asBytes(&@field(self, name)), 0);
+        }
+        self.svga.reset();
     }
 
     // ── Time ─────────────────────────────────────────────────────────────
