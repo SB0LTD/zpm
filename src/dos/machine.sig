@@ -83,9 +83,14 @@ pub const Machine = struct {
     /// The last fault's reason, for the host's log.
     fault_why: []const u8 = "",
 
+    /// (Every field is set here: a host may keep its Machine `undefined`
+    /// in .bss, so 16 MiB of RAM costs nothing in its file.)
     pub fn init(m: *Machine, host: Host, c_root: []const u8) void {
         m.mem.clear();
         m.host = host;
+        m.ips = 25_000_000;
+        m.cmos_index = 0;
+        m.fault_why = "";
         m.cpu.reset();
         m.pic.reset();
         m.pit.reset();
