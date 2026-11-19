@@ -1,5 +1,66 @@
 # SQL conformance TDD checkpoint
 
+## Current integration checkpoint - 19 November 2026
+
+The current ZPM main includes ordinary simple-query batches and extended
+Sync/COPY handling (#264), TLS stream and SCRAM channel-binding primitives
+(#265), exact decimal comparisons/hashing (#267), schema ACLs (#268),
+PostgreSQL internal byte-valued `"char"` (#269), and owner/inherited-owner
+CREATE authority for private schemas (#271). Each change passed its required
+ZPM checks. These merged engine features do not establish full PostgreSQL
+application compatibility.
+[Current core integration](https://github.com/SB0LTD/zpm/pull/264) |
+[Schema CREATE and ownership](https://github.com/SB0LTD/zpm/pull/271) |
+[Native schema differential](https://github.com/SB0LTD/ramsql/actions/runs/44347345269)
+
+RAMSQL PR #87 combines the hosted features with explicit TLS workers, compact
+storage and optional 128-client admission. Its exact candidate passed the
+Linux x86-64 and ARM64 integration: wire assertions, idle/absolute transaction
+timeouts, synchronous WAL/crash recovery, and independent libpq TLS checks
+with two and four workers. The full release attempt passed its hosted build,
+runtime and PostgreSQL lanes, but failed native SB0 compilation on a wide
+leading-zero-count operation. The candidate is not released or merged.
+Portable scalar numeric and UTF-8 fixes are being qualified against the
+unchanged native toolchain. Successful hosted checks do not substitute for
+SB0X/SB0K execution.
+[Combined hosted proof](https://github.com/SB0LTD/ramsql/actions/runs/44346300626) |
+[Pending product integration](https://github.com/SB0LTD/ramsql/pull/87) |
+[Release blocker](https://github.com/SB0LTD/ramsql/actions/runs/44346305282)
+
+The latest unchanged dbMeter comparison passed all original correctness and
+capacity checks and scored all 16 cases. RAMSQL led median throughput in every
+case, but only 12 passed the complete significant-advantage criteria. All four
+prepared primary-key cases remain below the required 2x lead; the 100K/eight-
+client case also misses the tail-latency requirement. These results use an
+explicit 256 MiB read cache. The overall performance gate remains closed and
+the dbMeter publication PR remains unmerged.
+[Full comparison and raw trials](https://github.com/benor1470/dbMeter/actions/runs/44347340190)
+
+Next executable gaps, in order of the current work:
+
+1. Finish portable native qualification and publish the consolidated product
+   only after the complete release matrix passes.
+2. Qualify interactive COPY inside multi-command simple frames, including
+   blocked output, queued input, transaction rollback and native stream
+   execution. Main still rejects unsupported COPY batches before side effects.
+3. Finish bounded VARCHAR/CHAR storage and UTF-8 composition while preserving
+   PostgreSQL internal-char raw-byte casts; PR #270 is not merged.
+4. Port the qualified isolated checkpoint stack onto current SQL counters and
+   table/constraint/index identities, then qualify real startup and WAL suffix
+   replay. Online checkpoint publication/rotation remains open.
+5. Continue stock pg_dump/pg_restore and upstream/application differential
+   coverage. Namespace ACL projections, full outbound round trips,
+   single-transaction restore and general late/composite keys remain gaps.
+6. Close the four prepared-key performance cases through CI profiles and
+   unchanged workloads. Large wide-schema capacity, sustained mixed writes,
+   MySQL/TDS production semantics, upgrade/HA and physical power-loss evidence
+   remain separate production gates.
+
+The last recorded cross-engine smoke inventory has 118 programs
+(106 PostgreSQL, six MySQL, six SQL Server). It does not close the separate
+755-record PostgreSQL feature inventory. Historical sections below retain
+their original evidence and scope; they are not additional current passes.
+
 ## Native conformance checkpoint — 18 November 2026
 
 The unchanged 118-program smoke inventory passed against PostgreSQL 18.3,
