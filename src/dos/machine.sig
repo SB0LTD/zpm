@@ -36,6 +36,7 @@ const xms_mod = @import("xms.sig");
 const mouse_mod = @import("mouse.sig");
 const vesa = @import("vesa.sig");
 const vesa_bios = @import("vesa_bios.sig");
+const jit = @import("jit.sig");
 
 pub const Memory = mem_mod.Memory;
 pub const Cpu = cpu_mod.Cpu;
@@ -96,6 +97,12 @@ pub const Machine = struct {
     io_count: u32 = 0,
     /// The program's state while the mouse's user handler runs.
     mouse_saved: ?struct { regs: regs.Regs, halted: bool } = null,
+    /// The translator's (jit.sig) marks: nonzero for a RAM page that holds
+    /// translated code (its writes are seen: `codeWrite`).
+    jit_pages: [jit.PAGES]u8 = [_]u8{0} ** jit.PAGES,
+    /// Lockstep checking (dosrun --jit-check): a second PC, interpreted,
+    /// that runs every block the translator ran and must end up the same.
+    twin: ?*Machine = null,
 
     /// (Every field is set here: a host may keep its Machine `undefined`
     /// in .bss, so 16 MiB of RAM costs nothing in its file.)
@@ -109,6 +116,9 @@ pub const Machine = struct {
         m.io_count = 0;
         m.mouse_saved = null;
         m.trace = false;
+        @memset(&m.jit_pages, 0);
+        m.twin = null;
+        m.cpu.jit = null;
         m.cpu.reset();
         m.pic.reset();
         m.pit.reset();
@@ -282,7 +292,11 @@ pub const Machine = struct {
     /// changes (the A20 gate moves RAM around).
     pub fn page(m: *Machine, a0: u32, write: bool) ?[*]u8 {
         const a = m.phys(a0);
-        if (a < 0xA0000 or (a >= mem_mod.MEG and a < mem_mod.RAM)) return m.mem.ram[a..].ptr;
+        if (a < 0xA0000 or (a >= mem_mod.MEG and a < mem_mod.RAM)) {
+            // (a page with translated code: its writes go the slow way)
+            if (write and m.jit_pages[a >> 12] != 0) return null;
+            return m.mem.ram[a..].ptr;
+        }
         const lo = a -% vesa.LFB_BASE;
         if (lo < vesa.VRAM) return m.vga.svga.mem[lo..].ptr;
         if (!write and ((a >= 0xC0000 and a < 0xE0000) or (a >= 0xF0000 and a < mem_mod.MEG))) return m.mem.ram[a..].ptr;
@@ -291,6 +305,30 @@ pub const Machine = struct {
 
     pub inline fn mapKey(m: *const Machine) u32 {
         return @intFromBool(m.mem.a20);
+    }
+
+    // ── The translator's hooks ───────────────────────────────────────────
+
+    /// The RAM the translator may translate code from (and its marks).
+    pub fn jitRam(m: *Machine) []u8 {
+        return &m.mem.ram;
+    }
+    pub fn jitPages(m: *Machine) *[jit.PAGES]u8 {
+        return &m.jit_pages;
+    }
+    /// A write of `n` bytes at RAM address `a` on a page with code.
+    fn codeWrite(m: *Machine, a: u32, n: u32) void {
+        if (m.cpu.jit) |j| j.written(a, n);
+    }
+    /// The translator on (the host's code memory), or false.
+    pub fn jitEnable(m: *Machine) bool {
+        return jit.attach(&m.cpu, m.host, &m.jit_pages, &m.mem.ram);
+    }
+    /// After each stretch of translated (or single-stepped) code in
+    /// lockstep: the twin runs the same, and the two must agree.
+    pub fn jitCheck(m: *Machine, info: *const jit.CheckInfo) bool {
+        const t = m.twin orelse return true;
+        return @import("jit_check.sig").check(m, t, info);
     }
 
     pub inline fn rd8(m: *Machine, a0: u32) u8 {
@@ -319,6 +357,7 @@ pub const Machine = struct {
         const a = m.phys(a0);
         if (a < 0xA0000 or (a >= mem_mod.MEG and a < mem_mod.RAM)) {
             m.mem.ram[a] = v;
+            if (m.jit_pages[a >> 12] != 0) m.codeWrite(a, 1);
             return;
         }
         m.wrHigh(a, v);
@@ -334,7 +373,10 @@ pub const Machine = struct {
             return m.vga.write(a - 0xA0000, v);
         }
         if (a >= 0xE0000 and a < 0xF0000) {
-            if (m.xms.emsWindow(a - 0xE0000)) |r| m.mem.ram[r] = v;
+            if (m.xms.emsWindow(a - 0xE0000)) |r| {
+                m.mem.ram[r] = v;
+                if (m.jit_pages[r >> 12] != 0) m.codeWrite(r, 1);
+            }
             return;
         }
         // (the ROMs: read only; 0xC8000-0xDFFFF: nothing there)
@@ -353,7 +395,11 @@ pub const Machine = struct {
     }
     pub inline fn wr16(m: *Machine, a: u32, v: u16) void {
         const w = m.phys(a);
-        if (w < 0x9FFFF or (w >= mem_mod.MEG and w < mem_mod.RAM - 1)) return std.mem.writeInt(u16, m.mem.ram[w..][0..2], v, .little);
+        if (w < 0x9FFFF or (w >= mem_mod.MEG and w < mem_mod.RAM - 1)) {
+            std.mem.writeInt(u16, m.mem.ram[w..][0..2], v, .little);
+            if (m.jit_pages[w >> 12] | m.jit_pages[(w + 1) >> 12] != 0) m.codeWrite(w, 2);
+            return;
+        }
         m.wr16Slow(a, w, v);
     }
     fn wr16Slow(m: *Machine, a: u32, w: u32, v: u16) void {
@@ -372,7 +418,11 @@ pub const Machine = struct {
     }
     pub inline fn wr32(m: *Machine, a: u32, v: u32) void {
         const w = m.phys(a);
-        if (w < 0x9FFFD or (w >= mem_mod.MEG and w < mem_mod.RAM - 3)) return std.mem.writeInt(u32, m.mem.ram[w..][0..4], v, .little);
+        if (w < 0x9FFFD or (w >= mem_mod.MEG and w < mem_mod.RAM - 3)) {
+            std.mem.writeInt(u32, m.mem.ram[w..][0..4], v, .little);
+            if (m.jit_pages[w >> 12] | m.jit_pages[(w + 3) >> 12] != 0) m.codeWrite(w, 4);
+            return;
+        }
         m.wr32Slow(a, w, v);
     }
     fn wr32Slow(m: *Machine, a: u32, w: u32, v: u32) void {
@@ -479,6 +529,14 @@ pub const Machine = struct {
     /// A trap in the ROM: the service it names. False: the service waits
     /// (the trap runs again once time has gone on).
     pub fn hle(m: *Machine, c: *Cpu, id: u16) bool {
+        const done = m.hleRun(c, id);
+        // (a service writes memory past the CPU's view of it: translated
+        // code it may have overwritten is checked)
+        if (c.jit) |j| j.afterService(id);
+        return done;
+    }
+
+    fn hleRun(m: *Machine, c: *Cpu, id: u16) bool {
         const r = &c.regs;
         var done = true;
         if (m.trace and id != 0x08 and id != 0x09 and !(id >= 0x0A and id <= 0x0F) and !(id >= 0x70 and id <= 0x77)) {
@@ -580,6 +638,10 @@ pub const Machine = struct {
             left -= slice;
             m.devices(slice);
             m.mouseCall();
+            if (m.twin) |t| {
+                t.devices(slice);
+                t.mouseCall();
+            }
             var budget: u32 = @intCast(@as(u64, m.ips) * slice / 1_000_000);
             while (budget > 0) {
                 const before = m.cpu.executed;
@@ -600,7 +662,11 @@ pub const Machine = struct {
                     .irq => {
                         // (no vector after all: the rest of the slice idles
                         // rather than spinning on .irq)
-                        if (m.pic.acknowledge()) |vec| m.cpu.interrupt(m, vec) else break;
+                        const ack = m.pic.acknowledge();
+                        if (m.twin) |t| {
+                            if (t.pic.acknowledge()) |tv| t.cpu.interrupt(t, tv);
+                        }
+                        if (ack) |vec| m.cpu.interrupt(m, vec) else break;
                     },
                     // Idle until the next slice's interrupts.
                     .halt, .wait => break,

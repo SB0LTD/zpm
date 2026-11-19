@@ -835,9 +835,13 @@ pub const Tlb = struct {
     fw_idx: u32 = 0,
     /// The bus's map key (its A20 gate) the entries were made under.
     key: u32 = 0,
+    /// Counts flushes (whole or a page's): the translator's code ends
+    /// its block when a mapping it may have used can have changed.
+    gen: u32 = 0,
 
     pub fn flush(t: *Tlb) void {
         if (cpu_mod.count_ops) stats[0] += 1;
+        t.gen +%= 1;
         @memset(&t.tag, 0);
         inline for (0..2) |u| {
             @memset(&t.rtag[u], 0);
@@ -847,6 +851,7 @@ pub const Tlb = struct {
     }
 
     pub fn flushPage(t: *Tlb, lin: u32) void {
+        t.gen +%= 1;
         const i = (lin >> 12) & (TLB_N - 1);
         if (t.tag[i] == (lin & 0xFFFF_F000) | 1) {
             t.tag[i] = 0;
@@ -856,6 +861,18 @@ pub const Tlb = struct {
             }
         }
         t.fw_len = 0;
+    }
+
+    /// The translator's: no entry may write the host's page at `host`
+    /// directly any more (it holds translated code: writes take the slow
+    /// path, which sees them).
+    pub fn dropWrite(t: *Tlb, host: usize) void {
+        for (0..TLB_N) |i| {
+            if (t.tag[i] & 1 == 0 or t.perm[i] & D_W == 0) continue;
+            if (t.hoff[i] +% (t.tag[i] & 0xFFFF_F000) != host) continue;
+            t.perm[i] &= ~D_W;
+            inline for (0..2) |u| t.wtag[u][i] = 0;
+        }
     }
 };
 

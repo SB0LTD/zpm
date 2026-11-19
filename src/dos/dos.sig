@@ -11,6 +11,9 @@
 //!   host_linux.sig  that host on Linux system calls (no libc)
 //!   cpu.sig         the 386 in real and protected mode, and the x87
 //!   cpu_pm.sig      protected mode: descriptors, gates, the IDT, paging
+//!   jit.sig         the translator to host code (jit_dec.sig decodes,
+//!                   jit_x64.sig / jit_a64.sig generate, jit_check.sig
+//!                   checks it against the interpreter in lockstep)
 //!   pic.sig         the two 8259 interrupt controllers
 //!   pit.sig         the 8254 timer, the PC speaker
 //!   kbd.sig         the 8042 keyboard controller
@@ -35,6 +38,9 @@ pub const regs = @import("regs.sig");
 pub const cpu = @import("cpu.sig");
 /// The host on Linux system calls (galaxy-dos, tools/dosrun.sig).
 pub const host_linux = @import("host_linux.sig");
+/// The CPU's translator, and its lockstep check (dosrun --jit-check).
+pub const jit = @import("jit.sig");
+pub const jit_check = @import("jit_check.sig");
 
 test {
     _ = @import("regs.sig");
@@ -67,4 +73,5 @@ test {
     _ = @import("xms_test.sig");
     _ = @import("mouse_test.sig");
     _ = @import("sb_ring.sig");
+    _ = @import("jit_test.sig");
 }

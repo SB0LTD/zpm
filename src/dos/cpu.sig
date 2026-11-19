@@ -72,6 +72,7 @@ const std = @import("std");
 const regs_mod = @import("regs.sig");
 const x87 = @import("cpu_x87.sig");
 const pm = @import("cpu_pm.sig");
+const jit_mod = @import("jit.sig");
 pub const Regs = regs_mod.Regs;
 pub const Fpu = x87.Fpu;
 
@@ -406,9 +407,14 @@ pub const Cpu = struct {
     /// machine asked for): run returns .fault.
     dead: bool = false,
     tlb: pm.Tlb = .{},
+    /// The translator (jit.sig), when the host gave it code memory: `run`
+    /// goes through it; null, everything is interpreted.
+    jit: ?*jit_mod.Jit = null,
 
     pub fn reset(self: *Cpu) void {
+        const j = self.jit;
         self.* = .{};
+        self.jit = j;
         self.regs.setSeg(CS, 0xF000);
         self.regs.eip = 0xFFF0;
         self.regs.r[EDX] = SIGNATURE;
@@ -416,6 +422,14 @@ pub const Cpu = struct {
 
     /// Runs at most `budget` instructions.
     pub fn run(self: *Cpu, bus: anytype, budget: u32) Exit {
+        if (comptime jit_mod.supports(@TypeOf(bus))) {
+            if (self.jit) |j| if (j.on) return jit_mod.run(self, bus, budget);
+        }
+        return self.interp(bus, budget);
+    }
+
+    /// `run` without the translator.
+    pub fn interp(self: *Cpu, bus: anytype, budget: u32) Exit {
         self.poll = true;
         if (self.dead) return .fault;
         if (self.halted) {
@@ -489,6 +503,40 @@ pub const Cpu = struct {
             }
         }
         return .budget;
+    }
+
+    /// The translator's: one instruction as `loop` runs it (counted unless
+    /// the block it is part of counted it already; a fault delivered; the
+    /// trace trap after it with `trace`), with `poll`, interrupts and the
+    /// mode left to the caller. `bus` is the mode's (PmBus in protected
+    /// mode).
+    pub fn stepJit(self: *Cpu, bus: anytype, end: u64, comptime count: bool, trace: bool) ?Exit {
+        if (count) self.executed += 1;
+        if (comptime prot(@TypeOf(bus))) {
+            self.ins_esp = self.regs.r[ESP];
+            self.ins_flags = self.regs.flags;
+            const res = self.step(bus, end) catch |e| blk: {
+                if (!self.keep) {
+                    self.regs.eip = self.ins_ip;
+                    self.regs.r[ESP] = self.ins_esp;
+                    self.regs.flags = self.ins_flags;
+                }
+                self.keep = false;
+                if (e == error.Stop) break :blk Exit.fault;
+                self.poll = true;
+                break :blk pm.exception(self, bus.b);
+            };
+            if (res) |why| return why;
+        } else {
+            const res = self.step(bus, end) catch unreachable;
+            if (res) |why| return why;
+        }
+        if (trace) {
+            self.interrupt(bus, 1);
+            self.poll = true;
+            if (self.dead) return .fault;
+        }
+        return null;
     }
 
     /// Delivers interrupt `vec` now. In real mode as INT does: pushes

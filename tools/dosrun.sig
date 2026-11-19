@@ -6,6 +6,7 @@
 //!   dosrun PROGRAM.EXE [ARGS...] [--secs N] [--shot OUT.ppm] [--every S]
 //!          [--key T=CODE[,CODE...]]... [--mouse T=DX,DY,BUTTONS]...
 //!          [--ips N] [--trace] [--wav OUT.wav] [--profile OUT.txt]
+//!          [--jit | --no-jit | --jit-check]
 //!
 //! --secs N: emulated seconds to run (default 10); --shot: the picture at
 //! the end as a PPM (--every S: also OUT-<t>.ppm every S seconds); --key
@@ -18,6 +19,10 @@
 //! --profile: the host's own profile (x86-64): every 250 us of the
 //! process's CPU time (SIGPROF) the interrupted instruction's address,
 //! one hex number a line, for addr2line -f -i on an unstripped build.
+//! --jit: the CPU's translator (jit.sig) runs the program; --no-jit: the
+//! interpreter alone; --jit-check: the translator, in lockstep with a
+//! second, interpreted PC that must agree after every block (slow; the
+//! first difference is logged and the run stops).
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -29,6 +34,9 @@ pub const dos_cpu_ops = false;
 
 var machine: dos.Machine = undefined;
 var host: dos.host_linux.LinuxHost = .{ .prefix = "[dos] " };
+/// --jit-check's interpreted twin.
+var twin: dos.Machine = undefined;
+var twin_host: dos.host_linux.LinuxHost = .{ .prefix = "[twin] ", .jit = false };
 /// The largest picture: VESA's 1600x1200.
 const MAX_W = 1600;
 const MAX_H = 1200;
@@ -165,6 +173,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var trace = false;
     var wav_path: ?[]const u8 = null;
     var prof_path: ?[]const u8 = null;
+    const JitMode = enum { off, on, check };
+    var jit_mode: JitMode = .off;
 
     var it = init.args.iterate();
     _ = it.next();
@@ -179,6 +189,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             wav_path = it.next();
         } else if (std.mem.eql(u8, a, "--profile")) {
             prof_path = it.next();
+        } else if (std.mem.eql(u8, a, "--jit")) {
+            jit_mode = .on;
+        } else if (std.mem.eql(u8, a, "--no-jit")) {
+            jit_mode = .off;
+        } else if (std.mem.eql(u8, a, "--jit-check")) {
+            jit_mode = .check;
         } else if (std.mem.eql(u8, a, "--trace")) {
             trace = true;
         } else if (std.mem.eql(u8, a, "--ips")) {
@@ -235,6 +251,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     machine.ips = ips;
     machine.trace = trace;
     if (!machine.start(p.dos_path, tail[0..tl])) return 1;
+    if (jit_mode != .off) {
+        if (!machine.jitEnable()) {
+            out("dosrun: no translator here (no code memory): interpreting", .{});
+        } else if (jit_mode == .check) {
+            twin.init(twin_host.host(), p.dir);
+            twin.ips = ips;
+            if (!twin.start(p.dos_path, tail[0..tl])) return 1;
+            machine.twin = &twin;
+            machine.cpu.jit.?.check = true;
+            machine.cpu.jit.?.flush();
+            out("dosrun: the translator, checked in lockstep with the interpreter", .{});
+        } else out("dosrun: the translator runs the program", .{});
+    }
     out("dosrun: {s}, C: = {s}, {d} s at {d} M instructions/s", .{ p.dos_path, p.dir, secs, ips / 1_000_000 });
     {
         const r = &machine.cpu.regs;
@@ -281,12 +310,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var status: dos.Status = .ran;
     while (t_us < secs * 1_000_000) : (t_us += step_us) {
         for (keys[0..nk]) |*k| if (!k.done and t_us >= k.at_us) {
-            for (k.codes[0..k.n]) |c| machine.key(c);
+            for (k.codes[0..k.n]) |c| {
+                machine.key(c);
+                if (machine.twin) |tw| tw.key(c);
+            }
             k.done = true;
         };
         for (mice[0..nm]) |*mo| if (!mo.done and t_us >= mo.at_us) {
             machine.mouseMove(mo.dx, mo.dy);
             machine.mouseButtons(mo.b);
+            if (machine.twin) |tw| {
+                tw.mouseMove(mo.dx, mo.dy);
+                tw.mouseButtons(mo.b);
+            }
             mo.done = true;
         };
         status = machine.run(step_us);
@@ -322,6 +358,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         @tagName(status), emu, wall, emu / @max(wall, 1e-6), machine.cpu.executed / 1_000_000,
     });
     if (status == .exited) out("dosrun: exit code {d}", .{machine.dos.exit_code});
+    if (machine.cpu.jit) |j| {
+        const st = j.stats;
+        out("dosrun: jit: {d} blocks made, {d} dropped, {d} flushes, {d} entered, {d} chained, {d} interpreted steps, {d} checked by bytes, {d} KiB code", .{ st.blocks, st.invalidated, st.flushes, st.entered, st.chained, st.interp, st.verified, j.used / 1024 });
+        if (machine.twin) |tw| {
+            if (status != .fault) {
+                const same = dos.jit_check.memEql(&machine, tw);
+                out("dosrun: jit-check: {s}", .{if (same) "the interpreter agrees to the end" else "memory differs at the end"});
+            }
+        }
+    }
     if (samples > 0) out("dosrun: sound peak {d}, rms {d:.0}", .{ peak, @sqrt(sum_sq / @as(f64, @floatFromInt(samples))) });
     if (wav_fd >= 0) {
         var hdr: [44]u8 = undefined;
